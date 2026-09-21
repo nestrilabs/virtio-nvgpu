@@ -2020,6 +2020,16 @@ mod tests {
             (ir.shm_offset, ir.shm_length, linear)
         }
 
+        /// Close a device handle, as a guest does when its fd goes away.
+        fn close_dev(&mut self, handle: u64) {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Close, self.cookie);
+            append(&mut req, &CloseReq { guest_handle: handle });
+            let mut resp = vec![0u8; 128];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "close handle {handle}");
+        }
+
         /// NV_ESC_RM_FREE of one object.
         fn free_obj(&mut self, root: u32, parent: u32, object: u32) {
             let mut p = vec![0u8; 16];
@@ -2040,6 +2050,11 @@ mod tests {
             req.extend_from_slice(&p);
             let mut resp = vec![0u8; 512];
             self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(rh.status, Status::Ok as u32, "free: transport status, errno {}", rh.errno_host);
+            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let rm = u32::from_le_bytes(resp[body + 12..body + 16].try_into().unwrap());
+            assert_eq!(rm, 0, "free of {object:#x}: RM status {rm:#x}");
         }
 
         /// NV_ESC_RM_UNMAP_MEMORY, keyed by the pLinearAddress the map returned.
@@ -2102,34 +2117,27 @@ mod tests {
         c.be.teardown();
     }
 
-    /// Mapping twice fails: `NV_ESC_RM_UNMAP_MEMORY` reports NV_OK without
-    /// releasing the mapping, so the second map of the same aperture is refused
-    /// with NV_ERR_STATE_IN_USE (0x63).
+    /// A hundred map/unmap cycles against the real aperture, asserting the SHM
+    /// zones end exactly as full as they started.
     ///
-    /// Ignored because it fails, and it should keep failing until the unmap
-    /// path is right. What is known so far, all measured on a T4 / 580.178.04:
+    /// **A file descriptor that has carried a mapping cannot carry another.**
+    /// Reusing one gives NV_ERR_STATE_IN_USE (0x63) on the second
+    /// NV_ESC_RM_MAP_MEMORY even though the preceding NV_ESC_RM_UNMAP_MEMORY
+    /// and NV_ESC_RM_FREE both returned NV_OK. The captured driver behaves the
+    /// same way: it opens a fresh /dev/nvidia0 fd per mapping.
     ///
-    /// - Cycle 0 maps and reads the aperture correctly; cycle 1's map returns
-    ///   NV_ERR_STATE_IN_USE, so nothing was released.
-    /// - `NVOS34.PLinearAddress` is documented as "address of application
-    ///   mapping". Sending RM's own returned value gives NV_OK and releases
-    ///   nothing. Sending the address we actually mapped at
-    ///   (`shm.base_ptr() + shm_offset`) gives NV_ERR_OBJECT_NOT_FOUND (0x57),
-    ///   so RM has no record at that address either.
-    /// - Issuing the unmap on the `/dev/nvidia0` fd that carried the mapping,
-    ///   rather than on `/dev/nvidiactl`, fails with EINVAL, so it does belong
-    ///   on the control node.
-    /// - The allocator reuses the freed extent, so cycle 1 maps at the same
-    ///   host address as cycle 0. That is consistent with RM still holding a
-    ///   record for that address, and is the next thing to test: map cycle 1
-    ///   at a deliberately different offset and see whether STATE_IN_USE goes
-    ///   away. If it does, the bug is purely that RM never learns the mapping
-    ///   is gone.
+    /// Ruled out along the way, all on a T4 running 580.178.04: it is not the
+    /// unmap address (the driver passes back exactly the cookie the map
+    /// returned, which is what the device does, and passing our own mapping
+    /// address instead gives NV_ERR_OBJECT_NOT_FOUND); not the node the unmap
+    /// is issued on (the GPU node returns EINVAL, so the control node is
+    /// right); and not a leaked RM object (RM_FREE succeeds).
     ///
-    /// This only bites a guest that maps, unmaps and maps again -- which is
-    /// every guest that runs a second workload.
+    /// The consequence for the device is a lifetime rule, not a bug fix: a host
+    /// fd is single-use for mapping, so one must be opened per mapping and
+    /// closed when the guest closes its own. This test closes each fd to prove
+    /// no handle is leaked in the process.
     #[test]
-    #[ignore = "known bug: RM_UNMAP_MEMORY reports success without releasing"]
     fn repeated_map_unmap_does_not_exhaust_the_zone() {
         if !nvidiactl_present() {
             return;
@@ -2139,25 +2147,32 @@ mod tests {
         // The usermode aperture allows one live mapping, so the object built
         // during setup has to go before the loop makes its own.
         c.free_obj(client, sub, first);
-        let fd = c.map_fd();
 
         // TURING_USERMODE_A permits one mapping per object -- a second map of
         // a still-mapped object is refused with NV_ERR_STATE_IN_USE -- so each
         // cycle allocates its own.
         let before = c.be.shm_free_bytes();
+        let handles_before = c.be.handle_count();
         let cycles = 100;
         for i in 0..cycles {
             let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
-            eprintln!("cycle {i}: mem={mem:#x}");
+            let fd = c.map_fd();
+            eprintln!("cycle {i}: mem={mem:#x} fd={fd}");
             let (off, _len, linear) = c.map(client, sub, mem, 65536, fd);
             assert_ne!(off, 0, "iteration {i}: no SHM offset");
             c.unmap(client, sub, mem, linear);
             c.free_obj(client, sub, mem);
+            c.close_dev(fd);
         }
         let after = c.be.shm_free_bytes();
         assert_eq!(
             before, after,
             "{cycles} map/unmap cycles did not return every byte to the zones"
+        );
+        assert_eq!(
+            handles_before,
+            c.be.handle_count(),
+            "{cycles} cycles leaked host file descriptors"
         );
         c.be.teardown();
     }
