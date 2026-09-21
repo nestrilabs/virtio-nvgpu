@@ -1,0 +1,283 @@
+# Mapping lifetime replay fixture, NVIDIA 580.178.04, Tesla T4.
+#
+# Extracted from nvidia_sniffer traces: every successful NV_ESC_RM_MAP_MEMORY
+# and the NV_ESC_RM_UNMAP_MEMORY that released it, paired by pLinearAddress,
+# in the order the driver issued them. Lengths and zones are the real ones.
+#
+# M<TAB>id<TAB>length<TAB>zone   map
+# U<TAB>id                       unmap of that id
+# --- vulkaninfo: 58 maps, 51 paired unmaps, 7 still live at exit
+W	vulkaninfo
+M	1	65536	wc
+M	2	2608	wc
+M	3	131072	wc
+M	4	262144	wc
+M	5	524288	wc
+M	6	131072	wc
+M	7	262144	wc
+M	8	131072	wc
+M	9	262144	wc
+M	10	4096	wc
+M	11	16384	wc
+M	12	8192	wc
+M	13	4096	wc
+M	14	77824	wc
+M	15	524288	wc
+M	16	1048576	wc
+M	17	524288	wc
+M	18	16384	wc
+M	19	4096	wc
+M	20	4096	wc
+M	21	12288	wc
+M	22	131072	wc
+M	23	262144	wc
+M	24	131072	wc
+M	25	262144	wc
+M	26	131072	wc
+M	27	262144	wc
+M	28	4096	wc
+M	29	8192	wc
+M	30	4096	wc
+M	31	77824	wc
+M	32	1048576	wc
+M	33	524288	wc
+M	34	16384	wc
+M	35	16384	wc
+M	36	524288	wc
+M	37	131072	wc
+M	38	262144	wc
+M	39	4096	wc
+M	40	8192	wc
+M	41	4096	wc
+M	42	77824	wc
+M	43	1048576	wc
+M	44	524288	wc
+M	45	131072	wc
+M	46	262144	wc
+M	47	131072	wc
+M	48	262144	wc
+M	49	4096	wc
+M	50	8192	wc
+M	51	4096	wc
+M	52	77824	wc
+M	53	1048576	wc
+M	54	524288	wc
+M	55	16384	wc
+M	56	4194304	wc
+M	57	4096	wc
+M	58	524288	wc
+U	57
+U	42
+U	40
+U	39
+U	43
+U	37
+U	38
+U	52
+U	50
+U	49
+U	53
+U	55
+U	54
+U	46
+U	47
+U	48
+U	35
+U	45
+U	31
+U	29
+U	28
+U	32
+U	34
+U	33
+U	22
+U	23
+U	24
+U	25
+U	26
+U	27
+U	21
+U	19
+U	14
+U	12
+U	10
+U	16
+U	18
+U	17
+U	4
+U	6
+U	7
+U	8
+U	9
+U	3
+U	20
+U	11
+U	56
+U	44
+U	36
+U	15
+U	58
+# --- cuda-kernel: 29 maps, 0 paired unmaps, 29 still live at exit
+W	cuda-kernel
+M	1	65536	wc
+M	2	2608	wc
+M	3	2097152	wc
+M	4	58720256	wc
+M	5	4096	wc
+M	6	2097152	wc
+M	7	4096	wc
+M	8	4096	wc
+M	9	4096	wc
+M	10	4096	wc
+M	11	4096	wc
+M	12	4096	wc
+M	13	4096	wc
+M	14	4096	wc
+M	15	4096	wc
+M	16	4096	wc
+M	17	4096	wc
+M	18	4096	wc
+M	19	4096	wc
+M	20	4096	wc
+M	21	4096	wc
+M	22	4096	wc
+M	23	4096	wc
+M	24	4096	wc
+M	25	4096	wc
+M	26	2097152	wc
+M	27	2097152	wc
+M	28	2097152	wc
+M	29	1534480	wc
+# --- nvenc-h264: 68 maps, 63 paired unmaps, 4 still live at exit
+W	nvenc-h264
+M	1	65536	wc
+M	2	2608	wc
+M	3	2097152	wc
+M	4	58720256	wc
+M	5	4096	wc
+M	6	2097152	wc
+M	7	4096	wc
+M	8	4096	wc
+M	9	4096	wc
+M	10	4096	wc
+M	11	4096	wc
+M	12	4096	wc
+M	13	4096	wc
+M	14	4096	wc
+M	15	4096	wc
+M	16	4096	wc
+M	17	4096	wc
+M	18	4096	wc
+M	19	4096	wc
+M	20	4096	wc
+M	21	4096	wc
+M	22	4096	wc
+M	23	4096	wc
+M	24	4096	wc
+M	25	4096	wc
+M	26	2097152	wc
+M	27	2097152	wc
+M	28	2097152	wc
+M	29	1534480	wc
+M	30	65536	wc
+M	31	163840	wc
+M	32	12288	wc
+M	33	512	wc
+M	34	12288	wc
+M	35	12288	wc
+M	36	12288	wc
+M	37	12288	wc
+M	38	12288	wc
+M	39	12288	wc
+M	40	12288	wc
+M	41	12288	wc
+M	42	12288	wc
+M	43	12288	wc
+M	44	12288	wc
+M	45	12288	wc
+M	46	12288	wc
+M	47	12288	wc
+M	48	12288	wc
+M	49	12288	wc
+M	50	512	wc
+M	51	4096	wc
+M	52	4096	wc
+M	53	6328320	wc
+M	54	6328320	wc
+M	55	4096	wc
+M	56	20480	wc
+M	57	6328320	wc
+M	58	6328320	wc
+M	59	4096	wc
+M	60	20480	wc
+M	61	6328320	wc
+M	62	6328320	wc
+M	63	4096	wc
+M	64	20480	wc
+M	65	6328320	wc
+M	66	6328320	wc
+M	67	4096	wc
+M	68	20480	wc
+U	53
+U	54
+U	55
+U	56
+U	57
+U	58
+U	59
+U	60
+U	61
+U	62
+U	63
+U	64
+U	65
+U	66
+U	67
+U	68
+U	32
+U	34
+U	35
+U	36
+U	37
+U	38
+U	39
+U	40
+U	41
+U	42
+U	43
+U	44
+U	45
+U	46
+U	47
+U	48
+U	49
+U	51
+U	52
+U	30
+U	31
+U	29
+U	28
+U	27
+U	5
+U	7
+U	8
+U	9
+U	10
+U	11
+U	12
+U	13
+U	14
+U	15
+U	16
+U	17
+U	18
+U	19
+U	20
+U	21
+U	22
+U	23
+U	24
+U	25
+U	4
+U	26
+U	6

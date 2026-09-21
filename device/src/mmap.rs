@@ -1,53 +1,72 @@
-// crates/device/src/mmap.rs
-//
-// Tracks active GPU→SHM mappings so the backend can unmap them when the
-// guest calls NV_ESC_RM_UNMAP_MEMORY or closes the file.
-//
-// Phase 2: data structure only, no entries are created yet.
-// Phase 3: mapping ioctls populate this table.
+//! Active guest mappings.
+//!
+//! One entry per live `NV_ESC_RM_MAP_MEMORY`, keyed by the SHM offset that was
+//! written back into `pLinearAddress`. The guest library stores that value and
+//! echoes it in `NV_ESC_RM_UNMAP_MEMORY`, which gives an unambiguous lookup key
+//! without handing the guest a host address.
+//!
+//! The entry owns the `ShmRegion`, because releasing a mapping means two things
+//! that must not come apart: restoring the SHM backing, and returning the
+//! extent to its zone. Doing only the first is what made the allocator leak.
 
 use std::collections::HashMap;
 
-/// One active mmap region in the SHM BAR.
-#[derive(Debug)]
+use crate::shm::ShmRegion;
+
+/// One live mapping.
+#[derive(Debug, Clone, Copy)]
 pub struct MmapEntry {
-    /// Byte offset from the start of the SHM BAR (what the guest sees).
-    pub shm_offset: u64,
-    /// Length of the mapped region in bytes.
-    pub length: u64,
-    /// Host virtual address where the mapping lives (for munmap on teardown).
-    pub host_va: usize,
-    /// Page-protection kind: 0=WB, 1=WC, 2=UC.
-    pub pgprot: u8,
+    /// The host's `pLinearAddress`, substituted back in on unmap.
+    pub host_p_linear_address: u64,
+    /// Length the guest asked for, before page rounding.
+    pub shm_length: u64,
+    pub h_client: u32,
+    pub h_memory: u32,
+    /// What to hand back to the SHM allocator when this mapping goes away.
+    pub region: ShmRegion,
 }
 
-/// Indexed by the guest handle of the file on which the mapping was created.
+/// Live mappings, indexed by SHM offset.
+#[derive(Default)]
 pub struct MmapContext {
-    entries: HashMap<u64 /* shm_offset */, MmapEntry>,
+    entries: HashMap<u64, MmapEntry>,
 }
 
 impl MmapContext {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+        Self::default()
     }
 
-    pub fn insert(&mut self, entry: MmapEntry) {
-        self.entries.insert(entry.shm_offset, entry);
+    pub fn insert(&mut self, shm_offset: u64, entry: MmapEntry) {
+        self.entries.insert(shm_offset, entry);
     }
 
     pub fn remove(&mut self, shm_offset: u64) -> Option<MmapEntry> {
         self.entries.remove(&shm_offset)
     }
 
+    /// Take every mapping, leaving the table empty. Used at teardown, where a
+    /// guest process that exited without unmapping is the normal case.
+    pub fn drain(&mut self) -> Vec<MmapEntry> {
+        self.entries.drain().map(|(_, e)| e).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-}
 
-impl Default for MmapContext {
-    fn default() -> Self {
-        Self::new()
+    /// Find the mapping for a given client/memory pair.
+    ///
+    /// `NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO` sends an address the guest knows,
+    /// which never matches a host address, so the host `pLinearAddress` has to
+    /// be recovered by identity instead.
+    pub fn find_by_object(&self, h_client: u32, h_memory: u32) -> Option<&MmapEntry> {
+        self.entries
+            .values()
+            .find(|e| e.h_client == h_client && e.h_memory == h_memory)
     }
 }

@@ -1,5 +1,6 @@
 // crates/device/src/shm.rs
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
@@ -25,40 +26,108 @@ impl PgprotKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ShmRegion {
     pub offset: u64,
     pub length: u64,
     pub pgprot: PgprotKind,
 }
 
+/// One page-protection zone, with a free list.
+///
+/// This was a bump allocator: `alloc` advanced a cursor and nothing ever gave
+/// space back. Captured traces make the consequence concrete -- a single
+/// 3-second 1080p `h264_nvenc` encode maps ~116 MiB into the write-combine
+/// zone across 68 mappings, and unmaps 66 of them at teardown. Without a free
+/// path the cursor keeps that 116 MiB forever, so the *second* encode in the
+/// same guest fails with ENOMEM on a 128 MiB zone.
 struct Zone {
     base: u64,
     size: u64,
-    cursor: u64,
+    /// Free extents as `offset -> length`, offsets relative to `base`, kept
+    /// disjoint and coalesced.
+    free: BTreeMap<u64, u64>,
 }
 
 impl Zone {
     fn new(base: u64, size: u64) -> Self {
-        Self {
-            base,
-            size,
-            cursor: 0,
+        let mut free = BTreeMap::new();
+        if size > 0 {
+            free.insert(0, size);
         }
+        Self { base, size, free }
     }
 
+    /// First-fit. Returns an absolute offset, or `None` if no extent fits.
     fn alloc(&mut self, length: u64) -> Option<u64> {
-        let aligned = align_up(length, 4096);
-        if self.cursor + aligned > self.size {
+        let want = align_up(length, PAGE_SIZE);
+        if want == 0 {
             return None;
         }
-        let offset = self.base + self.cursor;
-        self.cursor += aligned;
-        Some(offset)
+        let (&start, &len) = self.free.iter().find(|&(_, &len)| len >= want)?;
+        self.free.remove(&start);
+        if len > want {
+            self.free.insert(start + want, len - want);
+        }
+        Some(self.base + start)
+    }
+
+    /// Return an extent to the zone, coalescing with either neighbour.
+    ///
+    /// Returns false if the extent is not inside this zone or overlaps a range
+    /// already free, which would mean a double free.
+    fn free_extent(&mut self, offset: u64, length: u64) -> bool {
+        let want = align_up(length, PAGE_SIZE);
+        if want == 0 || offset < self.base {
+            return false;
+        }
+        let start = offset - self.base;
+        if start + want > self.size {
+            return false;
+        }
+
+        // Overlap with an existing free extent means this was freed already.
+        if let Some((&ps, &pl)) = self.free.range(..=start).next_back() {
+            if ps + pl > start {
+                return false;
+            }
+        }
+        if let Some((&ns, _)) = self.free.range(start..).next() {
+            if start + want > ns {
+                return false;
+            }
+        }
+
+        let mut s = start;
+        let mut l = want;
+
+        // Coalesce with the extent below, if it ends exactly here.
+        if let Some((&ps, &pl)) = self.free.range(..s).next_back() {
+            if ps + pl == s {
+                self.free.remove(&ps);
+                s = ps;
+                l += pl;
+            }
+        }
+        // Coalesce with the extent above, if it starts exactly at our end.
+        if let Some((&ns, &nl)) = self.free.range(s + l..).next() {
+            if s + l == ns {
+                self.free.remove(&ns);
+                l += nl;
+            }
+        }
+
+        self.free.insert(s, l);
+        true
     }
 
     fn free_bytes(&self) -> u64 {
-        self.size - self.cursor
+        self.free.values().sum()
+    }
+
+    /// The largest single allocation this zone could still satisfy.
+    fn largest_free(&self) -> u64 {
+        self.free.values().copied().max().unwrap_or(0)
     }
 }
 
@@ -69,6 +138,38 @@ pub struct ZoneConfig {
 }
 
 impl ZoneConfig {
+    /// Zone sizes chosen from measured driver behaviour, not guessed.
+    ///
+    /// Captured traces on a Tesla T4 (580.178.04) show every mapping these
+    /// workloads make landing in the **write-combine** zone; uncached and
+    /// write-back were never touched at all. Peak concurrent write-combine
+    /// use, with unmaps honoured:
+    ///
+    /// | workload | peak WC | largest single mapping |
+    /// | --- | --- | --- |
+    /// | `vulkaninfo` | 15.9 MiB | 4 MiB |
+    /// | CUDA kernel launch | 67.6 MiB | 56 MiB |
+    /// | `h264_nvenc` encode | 116.4 MiB | 56 MiB |
+    /// | all three at once | 184.6 MiB | 56 MiB |
+    ///
+    /// The previous split gave write-combine 128 MiB, which one encode fills
+    /// to 91% and three concurrent workloads overrun outright. This gives it
+    /// roughly 4x the observed concurrent peak, and keeps the other two zones
+    /// small but present -- they are unused by these workloads, which is not
+    /// the same as unused in general.
+    ///
+    /// The window is a memfd, so pages are only committed when touched; the
+    /// size is address space, not resident memory.
+    pub fn default_1gib() -> Self {
+        Self {
+            uc_size: 32 * 1024 * 1024,
+            wc_size: 768 * 1024 * 1024,
+            wb_size: 224 * 1024 * 1024,
+        }
+    }
+
+    /// The original 256 MiB split. Too small for a single encode with any
+    /// margin; kept only for tests that want a zone they can exhaust.
     pub fn default_256mib() -> Self {
         Self {
             uc_size: 4 * 1024 * 1024,
@@ -166,7 +267,7 @@ impl ShmAllocator {
     }
 
     pub fn with_default_zones() -> Self {
-        Self::new(ZoneConfig::default_256mib())
+        Self::new(ZoneConfig::default_1gib())
     }
 
     /// Override the base pointer used for MAP_FIXED operations.
@@ -195,16 +296,60 @@ impl ShmAllocator {
             None => Err(DeviceError::Io(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 format!(
-                    "SHM {:?} zone full ({} bytes free, {} requested)",
+                    "SHM {:?} zone cannot satisfy {} bytes: {} free in total but \
+                     largest contiguous extent is {} ({} free extents)",
                     pgprot,
+                    length,
                     zone.free_bytes(),
-                    length
+                    zone.largest_free(),
+                    zone.free.len()
                 ),
             ))),
         }
     }
 
     /// mmap a host fd into the SHM region at the given offset.
+    /// Return a region to its zone and restore its SHM backing.
+    ///
+    /// Restoring the backing and reclaiming the extent must happen together.
+    /// Doing only the first leaks the address range -- which is what the bump
+    /// allocator did, and why a second NVENC encode in one guest ran the
+    /// write-combine zone out of space.
+    pub fn free(&mut self, region: &ShmRegion) -> Result<()> {
+        let len = align_up(region.length, PAGE_SIZE);
+
+        // Put the memfd back under this range before the extent can be handed
+        // to another mapping; the guest keeps the whole window mapped, so the
+        // range must never be left without backing.
+        unsafe { self.unmap_host_fd(region.offset, len)? };
+
+        let zone = match region.pgprot {
+            PgprotKind::Uncached => &mut self.uc,
+            PgprotKind::WriteCombine => &mut self.wc,
+            PgprotKind::WriteBack => &mut self.wb,
+        };
+        if !zone.free_extent(region.offset, len) {
+            return Err(DeviceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "SHM free of {:?} region at {:#x}+{:#x} is out of range or already free",
+                    region.pgprot, region.offset, len
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Free bytes remaining in each zone, as `(uc, wc, wb)`.
+    pub fn free_bytes(&self) -> (u64, u64, u64) {
+        (self.uc.free_bytes(), self.wc.free_bytes(), self.wb.free_bytes())
+    }
+
+    /// Largest single allocation each zone could still satisfy.
+    pub fn largest_free(&self) -> (u64, u64, u64) {
+        (self.uc.largest_free(), self.wc.largest_free(), self.wb.largest_free())
+    }
+
     pub fn map_host_fd(&self, shm_offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
         let target = unsafe { self.base_ptr.add(shm_offset as usize) as *mut libc::c_void };
 
@@ -322,6 +467,8 @@ impl Drop for ShmAllocator {
         // OwnedFd drops the memfd automatically.
     }
 }
+
+const PAGE_SIZE: u64 = 4096;
 
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)

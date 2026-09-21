@@ -36,8 +36,13 @@
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
 
-/* module_kset is exported from kernel/module/sysfs.c */
+/*
+ * module_kset lives in kernel/module/sysfs.c and is NOT exported to modules,
+ * so it can only be named directly in an in-tree build.
+ */
+#ifndef MODULE
 extern struct kset *module_kset;
+#endif
 
 /* ───────── virtio device identity ───────── */
 
@@ -1388,10 +1393,15 @@ struct nvidia_modeset_outer {
   __le64 pData;    /* ← userspace pointer to nested params */
 };
 
-static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
-                                unsigned long arg) {
-  struct nvgpu_fd *nfd = filp->private_data;
-  void __user *uarg = (void __user *)arg;
+/*
+ * Forward one nvidia-modeset ioctl. The parameter block is an outer struct
+ * holding a userspace pointer to the real payload, so both have to be copied.
+ *
+ * Called only from nvgpu_modeset_ioctl(), which has already checked the ioctl
+ * type and size.
+ */
+static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
+                                void __user *uarg, u32 sz) {
   struct nvidia_modeset_outer outer;
   void __user *user_nested;
   u32 nested_size;
@@ -2351,18 +2361,45 @@ static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute initstate_attr = __ATTR_RO(initstate);
 
+/*
+ * The kset behind /sys/module/.
+ *
+ * Built in-tree we can just name module_kset. Built as a loadable module we
+ * cannot -- but this module is itself registered under /sys/module, and its
+ * kobject's parent *is* module_kset's kobject, so the same kset is reachable
+ * without the unexported symbol.
+ */
+static struct kset *nvgpu_module_kset(void) {
+#ifdef MODULE
+  struct kobject *parent = THIS_MODULE->mkobj.kobj.parent;
+
+  if (!parent)
+    return NULL;
+  return container_of(parent, struct kset, kobj);
+#else
+  return module_kset;
+#endif
+}
+
 static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
   struct kobject *modules_kobj;
+  struct kset *mkset = nvgpu_module_kset();
+
+  if (!mkset) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: cannot reach /sys/module, skipping nvidia stubs\n");
+    return;
+  }
 
   /* /sys/module/ is the parent of all module kobjects */
-  modules_kobj = kset_find_obj(module_kset, "nvidia");
+  modules_kobj = kset_find_obj(mkset, "nvidia");
   if (modules_kobj) {
     /* nvidia.ko already loaded somehow — don't duplicate */
     kobject_put(modules_kobj);
     return;
   }
 
-  nvgpu_module_kobj = kobject_create_and_add("nvidia", &module_kset->kobj);
+  nvgpu_module_kobj = kobject_create_and_add("nvidia", &mkset->kobj);
   if (!nvgpu_module_kobj) {
     dev_warn(&dev->vdev->dev,
              "virtio-gpu-nv: failed to create /sys/module/nvidia\n");
@@ -2372,7 +2409,7 @@ static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
     dev_warn(&dev->vdev->dev, "virtio-gpu-nv: failed initstate under nvidia\n");
 
   nvgpu_uvm_module_kobj =
-      kobject_create_and_add("nvidia_uvm", &module_kset->kobj);
+      kobject_create_and_add("nvidia_uvm", &mkset->kobj);
   if (!nvgpu_uvm_module_kobj) {
     dev_warn(&dev->vdev->dev,
              "virtio-gpu-nv: failed to create /sys/module/nvidia_uvm\n");

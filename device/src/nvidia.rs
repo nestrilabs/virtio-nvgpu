@@ -34,13 +34,6 @@ fn device_path(kind: u8, index: u8) -> Result<CString> {
 // NvidiaBackend
 // ============================================================
 
-#[derive(Debug, Clone)]
-struct MapMemoryEntry {
-    host_p_linear_address: u64,
-    shm_length: u64,
-    h_client: u32,
-    h_memory: u32,
-}
 
 pub struct NvidiaBackend {
     handles: HandleTable,
@@ -50,7 +43,7 @@ pub struct NvidiaBackend {
     /// The SHM offset is written into pLinearAddress in the response to the
     /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
     /// This gives us a unique, unambiguous lookup key without leaking host VAs.
-    active_maps: HashMap<u64, MapMemoryEntry>,
+    active_maps: crate::mmap::MmapContext,
     /// Host driver version, learned from the first successful
     /// `NV_ESC_CHECK_VERSION_STR`.
     driver: Option<abi::version::DriverVersion>,
@@ -78,7 +71,7 @@ impl NvidiaBackend {
         Self {
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
-            active_maps: HashMap::new(),
+            active_maps: crate::mmap::MmapContext::new(),
             driver: None,
             abi: None,
         }
@@ -86,7 +79,7 @@ impl NvidiaBackend {
 
     /// Create a backend with the default 256 MiB zone split.
     pub fn with_default_zones() -> Self {
-        Self::new(ZoneConfig::default_256mib())
+        Self::new(ZoneConfig::default_1gib())
     }
 
     /// Total SHM BAR size (for VMM config space).
@@ -137,15 +130,19 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
-        // Tear down SHM overlays before closing host fds
-        for (shm_offset, entry) in self.active_maps.drain() {
-            log::debug!(
-                "teardown: unmapping SHM offset={:#x} len={:#x}",
-                shm_offset,
-                entry.shm_length
-            );
-            unsafe {
-                let _ = self.shm.unmap_host_fd(shm_offset, entry.shm_length);
+        // Restore SHM backing and reclaim every extent before closing host
+        // fds. A guest process that exits without unmapping is the normal
+        // case, not an error -- most of the mappings in a captured trace are
+        // still live when the process ends.
+        let leftovers: Vec<_> = self.active_maps.drain().into_iter().map(|e| e.region).collect();
+        for region in leftovers {
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!(
+                    "teardown: SHM free of {:#x}+{:#x} failed: {}",
+                    region.offset,
+                    region.length,
+                    e
+                );
             }
         }
         self.handles.drain_all();
@@ -884,16 +881,13 @@ impl NvidiaBackend {
         // Look up the mapping by scanning active_maps for matching hMemory,
         // since the guest's "old" address won't match any host address.
         let mut host_old = old_cpu_addr;
-        for (_shm_off, entry) in &self.active_maps {
-            if entry.h_client == h_client && entry.h_memory == h_memory {
-                host_old = entry.host_p_linear_address;
-                log::info!(
-                    "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
-                    old_cpu_addr,
-                    host_old
-                );
-                break;
-            }
+        if let Some(entry) = self.active_maps.find_by_object(h_client, h_memory) {
+            host_old = entry.host_p_linear_address;
+            log::info!(
+                "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
+                old_cpu_addr,
+                host_old
+            );
         }
 
         let mut param_buf = param_in.to_vec();
@@ -1080,13 +1074,15 @@ impl NvidiaBackend {
             h_memory
         );
 
+        let region_offset = region.offset;
         self.active_maps.insert(
-            region.offset,
-            MapMemoryEntry {
+            region_offset,
+            crate::mmap::MmapEntry {
                 host_p_linear_address: host_p_linear,
                 shm_length: length,
                 h_client,
                 h_memory,
+                region,
             },
         );
 
@@ -1094,7 +1090,7 @@ impl NvidiaBackend {
         // the guest sees. It's not a real pointer; the guest driver uses the
         // SHM metadata (shm_offset/shm_length/pgprot in IoctlResp) for mmap,
         // and the library stores this value to pass back at unmap time.
-        param_buf[32..40].copy_from_slice(&region.offset.to_le_bytes());
+        param_buf[32..40].copy_from_slice(&region_offset.to_le_bytes());
 
         // --- Step 7: Build response with SHM metadata ---
 
@@ -1106,7 +1102,7 @@ impl NvidiaBackend {
         let iresp = IoctlResp {
             param_size: param_buf.len() as u32,
             _pad: 0,
-            shm_offset: region.offset,
+            shm_offset: region_offset,
             shm_length: length,
             pgprot: pgprot as u8,
             _pad2: [0; 7],
@@ -1142,7 +1138,7 @@ impl NvidiaBackend {
 
         // guest_linear is the SHM offset we wrote into pLinearAddress during map.
         // Use it as the lookup key.
-        let entry = match self.active_maps.remove(&guest_linear) {
+        let entry = match self.active_maps.remove(guest_linear) {
             Some(e) => e,
             None => {
                 log::warn!(
@@ -1190,11 +1186,10 @@ impl NvidiaBackend {
         log::info!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
-            // Host unmap succeeded — tear down the SHM overlay
-            unsafe {
-                if let Err(e) = self.shm.unmap_host_fd(guest_linear, entry.shm_length) {
-                    log::warn!("UNMAP_MEMORY: SHM unmap_host_fd failed: {} (non-fatal)", e);
-                }
+            // Host unmap succeeded -- restore the SHM backing and return the
+            // extent to its zone, so the space can serve a later mapping.
+            if let Err(e) = self.shm.free(&entry.region) {
+                log::warn!("UNMAP_MEMORY: SHM free failed: {} (non-fatal)", e);
             }
         } else {
             // Host returned RM error — put the entry back
