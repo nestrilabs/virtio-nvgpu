@@ -1,0 +1,5 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+license = "BSD-3-Clause OR GPL-2.0-or-later"

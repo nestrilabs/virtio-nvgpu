@@ -1,5 +1,6 @@
 # Rust
 /target
+/target/
 **/*.rs.bk
 Cargo.lock.bak
 
@@ -16,8 +17,9 @@ modules.order
 # ABI generator
 **__pycache__
 ***.pyc
-***~
 
 # Editors / OS
 ***~
 .DS_Store
+.vscode/
+.idea/
