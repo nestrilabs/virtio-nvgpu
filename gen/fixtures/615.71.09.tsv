@@ -1,0 +1,37 @@
+# Observed ioctl parameter sizes, NVIDIA driver 615.71.09, RTX A2000 (Ampere).
+#
+# Captured with nvidia_sniffer under LD_PRELOAD from nvidia-smi, vulkaninfo, a
+# CUDA driver-API probe (libcuda via dlopen -- no toolkit installed) and an
+# h264_nvenc encode. These are measurements, not a specification.
+#
+# This fixture exists to check a claim the 580 fixture alone could not: that
+# one table serves a driver 35 releases newer on a different architecture.
+# 615.71.09 has no profile of its own and resolves to the 595.71.05 table by
+# range selection, so this file is what makes that selection an observation
+# rather than an assumption. Every size here is identical to the T4's under
+# 580.178.04 -- the frontend ioctl ABI did not move between Turing and Ampere,
+# nor across those releases.
+#
+# escape<TAB>observed_size<TAB>call_count   (size -1 = varies between calls)
+NV_ESC_ALLOC_OS_EVENT	16	40
+NV_ESC_ATTACH_GPUS_TO_FD	128	3
+NV_ESC_CARD_INFO	2304	8
+NV_ESC_CHECK_VERSION_STR	72	4
+NV_ESC_FREE_OS_EVENT	16	38
+NV_ESC_NUMA_INFO	560	6
+NV_ESC_REGISTER_FD	4	54
+NV_ESC_RM_ALLOC	48	463
+NV_ESC_RM_ALLOC_CONTEXT_DMA2	56	7
+NV_ESC_RM_ALLOC_MEMORY	56	33
+NV_ESC_RM_CONTROL	32	1452
+NV_ESC_RM_DUP_OBJECT	28	29
+NV_ESC_RM_FREE	16	709
+NV_ESC_RM_IDLE_CHANNELS	56	2
+NV_ESC_RM_MAP_MEMORY	56	231
+NV_ESC_RM_MAP_MEMORY_DMA	64	264
+NV_ESC_RM_UNMAP_MEMORY	32	224
+NV_ESC_RM_UNMAP_MEMORY_DMA	48	260
+NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO	40	12
+NV_ESC_RM_VID_HEAP_CONTROL	184	272
+NV_ESC_SYS_PARAMS	8	8
+NV_ESC_WAIT_OPEN_COMPLETE	8	1
