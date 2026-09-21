@@ -1,0 +1,30 @@
+# Observed ioctl parameter sizes, NVIDIA driver 580.178.04, Tesla T4 (Turing).
+#
+# Captured with nvidia_sniffer under LD_PRELOAD from nvidia-smi, vulkaninfo,
+# a CUDA driver-API probe and an h264_nvenc encode. These are measurements,
+# not a specification: they exist so a generated table can be checked against
+# a real driver rather than trusted.
+#
+# escape<TAB>observed_size<TAB>call_count   (size -1 = varies between calls)
+NV_ESC_ALLOC_OS_EVENT	16	27
+NV_ESC_ATTACH_GPUS_TO_FD	128	2
+NV_ESC_CARD_INFO	2304	8
+NV_ESC_CHECK_VERSION_STR	72	4
+NV_ESC_FREE_OS_EVENT	16	27
+NV_ESC_NUMA_INFO	560	6
+NV_ESC_REGISTER_FD	4	41
+NV_ESC_RM_ALLOC	48	384
+NV_ESC_RM_ALLOC_CONTEXT_DMA2	56	4
+NV_ESC_RM_ALLOC_MEMORY	56	23
+NV_ESC_RM_CONTROL	32	1074
+NV_ESC_RM_DUP_OBJECT	28	14
+NV_ESC_RM_FREE	16	513
+NV_ESC_RM_IDLE_CHANNELS	56	2
+NV_ESC_RM_MAP_MEMORY	56	155
+NV_ESC_RM_MAP_MEMORY_DMA	64	146
+NV_ESC_RM_UNMAP_MEMORY	32	149
+NV_ESC_RM_UNMAP_MEMORY_DMA	48	138
+NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO	40	9
+NV_ESC_RM_VID_HEAP_CONTROL	184	169
+NV_ESC_SYS_PARAMS	8	8
+NV_ESC_WAIT_OPEN_COMPLETE	8	1
