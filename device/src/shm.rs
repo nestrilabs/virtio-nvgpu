@@ -160,6 +160,14 @@ impl ZoneConfig {
     ///
     /// The window is a memfd, so pages are only committed when touched; the
     /// size is address space, not resident memory.
+    ///
+    /// **These numbers come from three workloads on one GPU, and are a floor
+    /// rather than a bound.** `vulkaninfo` enumerates; it does not render. A
+    /// game drawing at 4K will map more than any workload measured here, and
+    /// the largest single mapping may grow past the 56 MiB seen so far -- which
+    /// matters more than the totals, because a zone with enough free bytes can
+    /// still refuse one large request if it has fragmented. Re-measure against
+    /// a real render trace before treating this split as settled.
     pub fn default_1gib() -> Self {
         Self {
             uc_size: 32 * 1024 * 1024,
