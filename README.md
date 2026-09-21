@@ -19,12 +19,12 @@ remote display. The VM has no physical monitor, and the host keeps the card.
 
 ## Repository layout
 
-Four components, three licence zones. The split is deliberate: the guest half
+Four components, three license zones. The split is deliberate: the guest half
 must be GPL to touch kernel symbols, the host half should be permissive so that
 other people can build on it, and the definitions both halves share must be
 includable from both.
 
-| directory | licence | what it is |
+| directory | license | what it is |
 | --- | --- | --- |
 | [`driver/`](driver/) | **GPL-2.0** | Guest kernel module. Registers `/dev/nvidia*`, forwards ioctl and mmap over the virtqueue. Deliberately not ABI-aware. |
 | [`device/`](device/) | **Apache-2.0** | The virtio device, as a Rust crate with **no VMM in its dependency list**. Every VMM concern is a trait. |
@@ -264,7 +264,7 @@ for NVIDIA, where no native context exists.
 
 ---
 
-## Licence
+## License
 
 Three zones, listed in [Repository layout](#repository-layout).
 Full texts: [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0),

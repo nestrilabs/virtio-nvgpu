@@ -1,6 +1,6 @@
 # `isolate/` — per-guest-process host helper
 
-**Licence: Apache-2.0** (`LICENSE-APACHE-2.0`).
+**License: Apache-2.0** (`LICENSE-APACHE-2.0`).
 
 A sandboxed helper process, one per guest process, launched from a memfd. It
 holds the real host `/dev/nvidia*` file descriptors and performs the forwarded

@@ -1,6 +1,6 @@
 # `device/` — VMM-agnostic device crate
 
-**Licence: Apache-2.0** (`LICENSE-APACHE-2.0`).
+**License: Apache-2.0** (`LICENSE-APACHE-2.0`).
 
 The virtio device implementation, as a Rust library with **no VMM in its
 dependency list**. Every VMM-specific concern is a trait that the embedding

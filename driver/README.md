@@ -1,6 +1,6 @@
 # `driver/` — guest kernel module
 
-**Licence: GPL-2.0** (`LICENSE-GPL-2.0`), required for kernel symbol access.
+**License: GPL-2.0** (`LICENSE-GPL-2.0`), required for kernel symbol access.
 
 A Linux kernel module for the guest. It registers the NVIDIA character
 devices — `/dev/nvidiactl`, `/dev/nvidia0`…`/dev/nvidiaN`, `/dev/nvidia-uvm` —
