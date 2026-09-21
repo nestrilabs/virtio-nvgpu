@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::shm::{PgprotKind, ShmAllocator, ShmRegion, ZoneConfig};
+    use crate::shm::{PgprotKind, ShmAllocator, ShmRegion};
     use std::collections::HashMap;
 
     #[derive(Debug)]

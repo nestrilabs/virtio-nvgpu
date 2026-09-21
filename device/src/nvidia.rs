@@ -91,6 +91,12 @@ impl NvidiaBackend {
         self.shm.memfd_raw()
     }
 
+    /// Free bytes per SHM zone, as `(uc, wc, wb)`. For tests that assert a
+    /// mapping cycle gives back exactly what it took.
+    pub fn shm_free_bytes(&self) -> (u64, u64, u64) {
+        self.shm.free_bytes()
+    }
+
     pub fn shm_base_ptr(&self) -> *mut u8 {
         self.shm.base_ptr()
     }
@@ -1061,6 +1067,10 @@ impl NvidiaBackend {
         // the SHM offset. The guest library will store this and echo it
         // back in RM_UNMAP_MEMORY, giving us a unique lookup key.
 
+        // NVOS34.pLinearAddress is documented as "address of application
+        // mapping". We send back what RM_MAP_MEMORY left in the field, which
+        // makes NV_ESC_RM_UNMAP_MEMORY return NV_OK -- but does not release the
+        // mapping: see repeated_map_unmap_does_not_exhaust_the_zone.
         let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
         let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
         let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
@@ -1761,4 +1771,395 @@ mod tests {
             "FD translation should have succeeded"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Real mapping round-trip
+    //
+    // Everything above stops at the host ioctl and expects it to fail, because
+    // building a mappable RM object takes a chain of allocations. That left the
+    // SHM allocate / mmap / free path never actually executed against a driver.
+    //
+    // The chain below is the shortest one a Tesla T4 was observed using before
+    // its first successful NV_ESC_RM_MAP_MEMORY, taken from a captured trace:
+    //
+    //   NV01_ROOT_CLIENT (0x41)   -> hClient
+    //   NV01_DEVICE_0    (0x80)   -> hDevice
+    //   NV20_SUBDEVICE_0 (0x2080) -> hSubdevice
+    //   TURING_USERMODE_A(0xc461) -> hMemory, mapped at 64 KiB
+    //
+    // TURING_USERMODE_A is the usermode doorbell aperture, so this maps real
+    // GPU registers, not system memory.
+    // ------------------------------------------------------------------
+
+    const NV01_ROOT_CLIENT: u32 = 0x41;
+    const NV01_DEVICE_0: u32 = 0x80;
+    const NV20_SUBDEVICE_0: u32 = 0x2080;
+    const TURING_USERMODE_A: u32 = 0xc461;
+
+    /// NVOS64_PARAMETERS field offsets.
+    const A_ROOT: usize = 0;
+    const A_PARENT: usize = 4;
+    const A_NEW: usize = 8;
+    const A_CLASS: usize = 12;
+    const A_PARAMS_SIZE: usize = 32;
+    const A_STATUS: usize = 40;
+    const ALLOC_OUTER: usize = 48;
+
+    struct Chain {
+        be: NvidiaBackend,
+        ctl: u64,
+        gpu: u64,
+        cookie: u64,
+    }
+
+    impl Chain {
+        fn new() -> Self {
+            // Not for_test(): its write-combine zone is 16 KiB, and the
+            // smallest real mapping here is 64 KiB.
+            let mut be = NvidiaBackend::with_default_zones();
+            let mut req = hdr(MsgType::Open, 1);
+            append(
+                &mut req,
+                &OpenReq { kind: DeviceKind::Ctl as u8, index: 0, _pad: [0; 6] },
+            );
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "open /dev/nvidiactl");
+            let ctl = parse_open_resp(&resp).guest_handle;
+            let mut c = Self { be, ctl, gpu: 0, cookie: 2 };
+            // The driver always issues these two before allocating a client.
+            // Without them the device allocation is refused with
+            // NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
+            c.simple(abi::ioctl::NV_ESC_SYS_PARAMS, 8);
+            c.simple(abi::ioctl::NV_ESC_CARD_INFO, 2304);
+            // The driver opens /dev/nvidia0 and registers the control fd
+            // against it before allocating a device. Skipping this is refused
+            // with NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
+            c.gpu = c.open_dev(DeviceKind::Gpu);
+            c.register_fd(c.gpu, c.ctl);
+            c
+        }
+
+        /// Open one of the character devices and return its guest handle.
+        fn open_dev(&mut self, kind: DeviceKind) -> u64 {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Open, self.cookie);
+            append(&mut req, &OpenReq { kind: kind as u8, index: 0, _pad: [0; 6] });
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "open {kind:?}");
+            parse_open_resp(&resp).guest_handle
+        }
+
+        /// NV_ESC_REGISTER_FD: attach `fd_handle` to the device `on`.
+        fn register_fd(&mut self, on: u64, fd_handle: u64) {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: on,
+                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_REGISTER_FD, 4),
+                    param_size: 4,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&(fd_handle as u32).to_le_bytes());
+            let mut resp = vec![0u8; 256];
+            self.be.dispatch(&req, &mut resp);
+        }
+
+        /// Issue a parameterless escape whose payload is just a zeroed buffer.
+        fn simple(&mut self, escape: u32, size: u32) {
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: self.ctl,
+                    request: abi::ioctl::_IOWR(escape, size),
+                    param_size: size,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&vec![0u8; size as usize]);
+            let mut resp = vec![0u8; size as usize + 256];
+            self.be.dispatch(&req, &mut resp);
+        }
+
+        /// Issue an RM_ALLOC and return the handle RM assigned.
+        fn alloc(&mut self, root: u32, parent: u32, class: u32, params: &[u8]) -> u32 {
+            let declared = params.len() as u32;
+            self.alloc_with(root, parent, class, params, declared)
+        }
+
+        /// Same, but with an explicit `paramsSize` field.
+        ///
+        /// The captured driver sends the parameter block with `paramsSize` set
+        /// to 0 and lets RM use the size the class defines. Passing the byte
+        /// count instead is rejected with NV_ERR_INVALID_ARGUMENT.
+        fn alloc_with(
+            &mut self,
+            root: u32,
+            parent: u32,
+            class: u32,
+            params: &[u8],
+            declared: u32,
+        ) -> u32 {
+            let mut outer = vec![0u8; ALLOC_OUTER];
+            outer[A_ROOT..A_ROOT + 4].copy_from_slice(&root.to_le_bytes());
+            outer[A_PARENT..A_PARENT + 4].copy_from_slice(&parent.to_le_bytes());
+            outer[A_CLASS..A_CLASS + 4].copy_from_slice(&class.to_le_bytes());
+            outer[A_PARAMS_SIZE..A_PARAMS_SIZE + 4].copy_from_slice(&declared.to_le_bytes());
+
+            let param_size = (ALLOC_OUTER + params.len()) as u32;
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: self.ctl,
+                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, ALLOC_OUTER as u32),
+                    param_size,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&outer);
+            req.extend_from_slice(params);
+
+            let mut resp = vec![0u8; 4096];
+            let n = self.be.dispatch(&req, &mut resp);
+            assert!(n > 0, "alloc class {class:#x}: empty response");
+            assert_eq!(
+                parse_resp(&resp).status,
+                Status::Ok as u32,
+                "alloc class {class:#x}: transport status"
+            );
+            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let out = &resp[body..body + ALLOC_OUTER];
+            let status = u32::from_le_bytes(out[A_STATUS..A_STATUS + 4].try_into().unwrap());
+            assert_eq!(status, 0, "alloc class {class:#x}: RM status {status:#x}");
+            u32::from_le_bytes(out[A_NEW..A_NEW + 4].try_into().unwrap())
+        }
+
+        /// Build the object chain and return (hClient, hSubdevice, hMemory).
+        fn usermode_object(&mut self) -> (u32, u32, u32) {
+            let client = self.alloc(0, 0, NV01_ROOT_CLIENT, &[]);
+            assert_ne!(client, 0, "RM assigned no client handle");
+
+            // The captured driver passes paramsSize 0 for all of these; RM
+            // uses the class's own parameter size rather than trusting the
+            // caller, so sending none is what the real sequence does.
+            // NV0080_ALLOC_PARAMETERS, zeroed apart from hClientShare.
+            let mut dev_params = vec![0u8; 56];
+            dev_params[4..8].copy_from_slice(&client.to_le_bytes());
+            let device = self.alloc(client, client, NV01_DEVICE_0, &dev_params);
+
+            // NV2080_ALLOC_PARAMETERS is a single subDeviceID.
+            let subdevice = self.alloc(client, device, NV20_SUBDEVICE_0, &0u32.to_le_bytes());
+
+            let memory = self.alloc(client, subdevice, TURING_USERMODE_A, &[]);
+            (client, subdevice, memory)
+        }
+
+        /// A dedicated fd to carry the mapping.
+        ///
+        /// This is a **/dev/nvidia0** fd, not /dev/nvidiactl: the trace shows
+        /// the mmap landing on the per-GPU node even though the
+        /// NV_ESC_RM_MAP_MEMORY that defines it is issued on the control node.
+        /// The fd is registered against the control fd first, as the driver
+        /// does for every fd it maps on.
+        fn map_fd(&mut self) -> u64 {
+            let h = self.open_dev(DeviceKind::Gpu);
+            self.register_fd(h, self.ctl);
+            h
+        }
+
+        /// NV_ESC_RM_MAP_MEMORY. Returns (shm_offset, shm_length, pLinearAddress).
+        fn map(&mut self, client: u32, dev: u32, mem: u32, len: u64, fd: u64) -> (u64, u64, u64) {
+            let mut p = vec![0u8; 56];
+            p[0..4].copy_from_slice(&client.to_le_bytes());
+            p[4..8].copy_from_slice(&dev.to_le_bytes());
+            p[8..12].copy_from_slice(&mem.to_le_bytes());
+            p[24..32].copy_from_slice(&len.to_le_bytes());
+            // The flags the driver sends for this mapping. Zero is rejected
+            // with NV_ERR_INVALID_ARGUMENT; bits 23-25 are the caching type,
+            // here 6 (default), which the device resolves to write-combine.
+            p[44..48].copy_from_slice(&0x0308_0002u32.to_le_bytes());
+            p[48..52].copy_from_slice(&(fd as u32).to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: self.ctl,
+                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, 56),
+                    param_size: 56,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+
+            let mut resp = vec![0u8; 4096];
+            self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(
+                rh.status,
+                Status::Ok as u32,
+                "map: transport status {} errno {}",
+                rh.status,
+                rh.errno_host
+            );
+            let ir = read_struct::<IoctlResp>(&resp, size_of::<RespHeader>());
+            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let out = &resp[body..body + 56];
+            let rm = u32::from_le_bytes(out[40..44].try_into().unwrap());
+            assert_eq!(rm, 0, "map: RM status {rm:#x}");
+            let linear = u64::from_le_bytes(out[32..40].try_into().unwrap());
+            (ir.shm_offset, ir.shm_length, linear)
+        }
+
+        /// NV_ESC_RM_FREE of one object.
+        fn free_obj(&mut self, root: u32, parent: u32, object: u32) {
+            let mut p = vec![0u8; 16];
+            p[0..4].copy_from_slice(&root.to_le_bytes());
+            p[4..8].copy_from_slice(&parent.to_le_bytes());
+            p[8..12].copy_from_slice(&object.to_le_bytes());
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: self.ctl,
+                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16),
+                    param_size: 16,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+            let mut resp = vec![0u8; 512];
+            self.be.dispatch(&req, &mut resp);
+        }
+
+        /// NV_ESC_RM_UNMAP_MEMORY, keyed by the pLinearAddress the map returned.
+        fn unmap(&mut self, client: u32, dev: u32, mem: u32, linear: u64) {
+            let mut p = vec![0u8; 32];
+            p[0..4].copy_from_slice(&client.to_le_bytes());
+            p[4..8].copy_from_slice(&dev.to_le_bytes());
+            p[8..12].copy_from_slice(&mem.to_le_bytes());
+            p[16..24].copy_from_slice(&linear.to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            append(
+                &mut req,
+                &IoctlReq {
+                    guest_handle: self.ctl,
+                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, 32),
+                    param_size: 32,
+                    _pad: 0,
+                },
+            );
+            req.extend_from_slice(&p);
+            let mut resp = vec![0u8; 4096];
+            self.be.dispatch(&req, &mut resp);
+            let rh = parse_resp(&resp);
+            assert_eq!(
+                rh.status,
+                Status::Ok as u32,
+                "unmap: transport status {} errno {}",
+                rh.status,
+                rh.errno_host
+            );
+            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let rm = u32::from_le_bytes(resp[body + 24..body + 28].try_into().unwrap());
+            assert_eq!(rm, 0, "unmap: RM status {rm:#x}");
+        }
+    }
+
+    #[test]
+    fn maps_turing_usermode_aperture_for_real() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, mem) = c.usermode_object();
+        let fd = c.map_fd();
+
+        let (off, len, linear) = c.map(client, sub, mem, 65536, fd);
+        assert_eq!(len, 65536, "mapped length");
+        assert_ne!(linear, 0, "pLinearAddress should be the SHM offset");
+        assert_eq!(linear, off, "pLinearAddress must be the SHM offset the guest sees");
+
+        // The SHM window now aliases GPU registers. Reading must not fault.
+        let base = c.be.shm_base_ptr();
+        assert!(!base.is_null(), "SHM base");
+        let first = unsafe { std::ptr::read_volatile(base.add(off as usize) as *const u32) };
+        eprintln!("TURING_USERMODE_A first dword through SHM: {first:#010x}");
+
+        c.unmap(client, sub, mem, linear);
+        c.be.teardown();
+    }
+
+    /// Mapping twice fails: `NV_ESC_RM_UNMAP_MEMORY` reports NV_OK without
+    /// releasing the mapping, so the second map of the same aperture is refused
+    /// with NV_ERR_STATE_IN_USE (0x63).
+    ///
+    /// Ignored because it fails, and it should keep failing until the unmap
+    /// path is right. What is known so far, all measured on a T4 / 580.178.04:
+    ///
+    /// - Cycle 0 maps and reads the aperture correctly; cycle 1's map returns
+    ///   NV_ERR_STATE_IN_USE, so nothing was released.
+    /// - `NVOS34.PLinearAddress` is documented as "address of application
+    ///   mapping". Sending RM's own returned value gives NV_OK and releases
+    ///   nothing. Sending the address we actually mapped at
+    ///   (`shm.base_ptr() + shm_offset`) gives NV_ERR_OBJECT_NOT_FOUND (0x57),
+    ///   so RM has no record at that address either.
+    /// - Issuing the unmap on the `/dev/nvidia0` fd that carried the mapping,
+    ///   rather than on `/dev/nvidiactl`, fails with EINVAL, so it does belong
+    ///   on the control node.
+    /// - The allocator reuses the freed extent, so cycle 1 maps at the same
+    ///   host address as cycle 0. That is consistent with RM still holding a
+    ///   record for that address, and is the next thing to test: map cycle 1
+    ///   at a deliberately different offset and see whether STATE_IN_USE goes
+    ///   away. If it does, the bug is purely that RM never learns the mapping
+    ///   is gone.
+    ///
+    /// This only bites a guest that maps, unmaps and maps again -- which is
+    /// every guest that runs a second workload.
+    #[test]
+    #[ignore = "known bug: RM_UNMAP_MEMORY reports success without releasing"]
+    fn repeated_map_unmap_does_not_exhaust_the_zone() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, first) = c.usermode_object();
+        // The usermode aperture allows one live mapping, so the object built
+        // during setup has to go before the loop makes its own.
+        c.free_obj(client, sub, first);
+        let fd = c.map_fd();
+
+        // TURING_USERMODE_A permits one mapping per object -- a second map of
+        // a still-mapped object is refused with NV_ERR_STATE_IN_USE -- so each
+        // cycle allocates its own.
+        let before = c.be.shm_free_bytes();
+        let cycles = 100;
+        for i in 0..cycles {
+            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            eprintln!("cycle {i}: mem={mem:#x}");
+            let (off, _len, linear) = c.map(client, sub, mem, 65536, fd);
+            assert_ne!(off, 0, "iteration {i}: no SHM offset");
+            c.unmap(client, sub, mem, linear);
+            c.free_obj(client, sub, mem);
+        }
+        let after = c.be.shm_free_bytes();
+        assert_eq!(
+            before, after,
+            "{cycles} map/unmap cycles did not return every byte to the zones"
+        );
+        c.be.teardown();
+    }
+
 }
