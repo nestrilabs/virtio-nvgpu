@@ -51,6 +51,26 @@ pub struct NvidiaBackend {
     /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
     /// This gives us a unique, unambiguous lookup key without leaking host VAs.
     active_maps: HashMap<u64, MapMemoryEntry>,
+    /// Host driver version, learned from the first successful
+    /// `NV_ESC_CHECK_VERSION_STR`.
+    driver: Option<abi::version::DriverVersion>,
+    /// ABI profile selected for `driver`, if one exists.
+    abi: Option<&'static [abi::versions::IoctlEntry]>,
+}
+
+/// The result of checking one guest ioctl against the host's ABI profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiCheck {
+    /// The escape is known and the guest's parameter size matches.
+    Ok,
+    /// No profile yet -- CHECK_VERSION_STR has not been seen.
+    NoProfile,
+    /// The escape is not in this driver's table.
+    UnknownEscape,
+    /// The escape is variable length; there is no size to check.
+    VariableLength,
+    /// The guest disagrees with the host ABI about this struct's size.
+    SizeMismatch { expected: u32, actual: u32 },
 }
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
@@ -59,6 +79,8 @@ impl NvidiaBackend {
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: HashMap::new(),
+            driver: None,
+            abi: None,
         }
     }
 
@@ -221,6 +243,57 @@ impl NvidiaBackend {
     // IOCTL — top-level
     // ------------------------------------------------------------------
 
+    /// Learn the host driver version from a successful `NV_ESC_CHECK_VERSION_STR`
+    /// reply and select the ABI profile for it.
+    ///
+    /// Layout is `nv_ioctl_rm_api_version_t`: cmd (4), reply (4), then a
+    /// NUL-terminated 64-byte version string.
+    fn learn_driver_version(&mut self, param_buf: &[u8]) {
+        if self.driver.is_some() || param_buf.len() < 12 {
+            return;
+        }
+        let tail = &param_buf[8..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        let Ok(text) = std::str::from_utf8(&tail[..end]) else {
+            return;
+        };
+        let Some(v) = abi::version::DriverVersion::parse(text) else {
+            return;
+        };
+        self.driver = Some(v);
+        self.abi = abi::versions::table_for(v);
+        match self.abi {
+            Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
+            None => log::warn!(
+                "host driver {v} is older than every ABI profile; ioctls will be \
+                 forwarded without size checking"
+            ),
+        }
+    }
+
+    /// Check one guest ioctl against the host's ABI profile.
+    ///
+    /// A size mismatch is the failure this is for: the guest and host disagree
+    /// about a struct layout, so the host reads or writes the wrong number of
+    /// bytes. Without a check it surfaces as corrupt GPU state rather than an
+    /// error.
+    pub fn check_abi(&self, escape: u32, param_size: u32) -> AbiCheck {
+        let Some(table) = self.abi else {
+            return AbiCheck::NoProfile;
+        };
+        let Some(entry) = abi::versions::lookup(table, escape) else {
+            return AbiCheck::UnknownEscape;
+        };
+        match entry.param_size {
+            None => AbiCheck::VariableLength,
+            Some(expected) if expected == param_size => AbiCheck::Ok,
+            Some(expected) => AbiCheck::SizeMismatch {
+                expected,
+                actual: param_size,
+            },
+        }
+    }
+
     fn handle_ioctl(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         if payload.len() < size_of::<IoctlReq>() {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
@@ -236,6 +309,22 @@ impl NvidiaBackend {
 
         let escape = (ireq.request & 0xFF) as u32;
         let ioc_type = ((ireq.request >> 8) & 0xFF) as u32;
+
+        // Only NVIDIA's own magic is described by the ABI tables; modeset and
+        // uvm use different namespaces.
+        if ioc_type == b'F' as u32 {
+            match self.check_abi(escape, ireq.param_size) {
+                AbiCheck::SizeMismatch { expected, actual } => log::warn!(
+                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects {expected}",
+                    self.driver.expect("a profile implies a known version")
+                ),
+                AbiCheck::UnknownEscape => log::warn!(
+                    "escape {escape:#04x} is not in the ABI profile for host driver {}",
+                    self.driver.expect("a profile implies a known version")
+                ),
+                AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => {}
+            }
+        }
 
         // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
         if ioc_type == 0x6d {
@@ -528,7 +617,7 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     fn dispatch_simple(
-        &self,
+        &mut self,
         cookie: u64,
         host_fd: RawFd,
         request: u64,
@@ -622,6 +711,9 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
         } else {
+            if escape == 0xd2 {
+                self.learn_driver_version(&param_buf);
+            }
             if log_response {
                 let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
                 match escape {
@@ -1228,6 +1320,98 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 // ============================================================
 // Tests
 // ============================================================
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use abi::ioctl::*;
+
+    /// The exact reply the Tesla T4 gave to NV_ESC_CHECK_VERSION_STR on driver
+    /// 580.178.04, taken from gen/fixtures. Using the captured bytes rather
+    /// than a hand-built buffer keeps the parser honest about real padding.
+    fn t4_version_reply() -> Vec<u8> {
+        let mut b = vec![0u8; 72];
+        b[4] = 1; // reply = 1
+        b[8..18].copy_from_slice(b"580.178.04");
+        b
+    }
+
+    fn backend() -> NvidiaBackend {
+        NvidiaBackend::with_default_zones()
+    }
+
+    #[test]
+    fn no_profile_before_the_version_is_known() {
+        let b = backend();
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
+    }
+
+    #[test]
+    fn learns_the_driver_version_from_a_real_reply() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert_eq!(b.driver, Some(abi::version::DriverVersion::new(580, 178, 4)));
+        assert!(b.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    #[test]
+    fn accepts_the_sizes_the_t4_actually_sent() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        for (escape, size) in [
+            (NV_ESC_RM_CONTROL, 32),
+            (NV_ESC_RM_ALLOC, 48),
+            (NV_ESC_RM_FREE, 16),
+            (NV_ESC_RM_MAP_MEMORY, 56),
+            (NV_ESC_RM_MAP_MEMORY_DMA, 64),
+            (NV_ESC_RM_UNMAP_MEMORY_DMA, 48),
+            (NV_ESC_RM_VID_HEAP_CONTROL, 184),
+        ] {
+            assert_eq!(
+                b.check_abi(escape, size),
+                AbiCheck::Ok,
+                "escape {escape:#04x} at {size} bytes was captured from hardware"
+            );
+        }
+    }
+
+    #[test]
+    fn catches_the_stale_map_memory_dma_size() {
+        // The hand-written table had this at 48; 580 uses NVOS46_PARAMETERS_V580,
+        // which is 64. This is the bug the ABI check exists to catch.
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert_eq!(
+            b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
+            AbiCheck::SizeMismatch { expected: 64, actual: 48 }
+        );
+    }
+
+    #[test]
+    fn variable_length_escapes_are_not_size_checked() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
+        assert_eq!(b.check_abi(NV_ESC_CARD_INFO, 2304), AbiCheck::VariableLength);
+    }
+
+    #[test]
+    fn a_garbled_version_string_leaves_the_backend_unconfigured() {
+        let mut b = backend();
+        let mut junk = vec![0u8; 72];
+        junk[8..12].copy_from_slice(b"oops");
+        b.learn_driver_version(&junk);
+        assert!(b.driver.is_none());
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
+    }
+
+    #[test]
+    fn a_short_reply_is_ignored_rather_than_panicking() {
+        let mut b = backend();
+        b.learn_driver_version(&[0u8; 4]);
+        assert!(b.driver.is_none());
+    }
+}
 
 #[cfg(test)]
 mod tests {
