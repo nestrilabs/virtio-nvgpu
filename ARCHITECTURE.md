@@ -22,8 +22,9 @@ Concrete assumptions:
   A custom `virtio-gpu-nv` kernel module replaces the real NVIDIA kernel
   modules inside the guest.
 - **Hypervisor**: KVM.
-- **VMM**: libkrun (Rust). The virtio-gpu-nv backend runs inside the VMM
-  process.
+- **VMM**: any KVM-based VMM. The device crate is VMM-agnostic — every
+  VMM-specific concern is a trait the embedding VMM implements — and it runs
+  inside the VMM process.
 
 From the guest's perspective, it looks like a normal NVIDIA driver stack.
 All real hardware access happens on the host.
@@ -104,8 +105,7 @@ monitor from the VM), DRM and modeset are not needed.
 
 ### 3.1 Virtio Device
 
-A custom virtio device exposed to the guest via MMIO transport (libkrun's
-standard approach).
+A custom virtio device exposed to the guest via MMIO transport.
 
 **Virtqueues:**
 
@@ -139,7 +139,7 @@ backend.
 
 ### 3.3 VMM Backend
 
-A Rust component inside libkrun that:
+A Rust crate (`device/`) embedded in the VMM that:
 
 1. Holds real host file descriptors for `/dev/nvidia*` devices.
 2. Receives requests from the control virtqueue.

@@ -1,8 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# ABI generator
 **__pycache__
 ***.pyc
 ***~
-**libkrunfw.so*
-**kernel.c
-**vmlinux
-**/tarballs
-**/linux-*
+
+# Editors / OS
+***~
+.DS_Store

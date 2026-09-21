@@ -1,24 +1,61 @@
-# virtio-gpu-nv
+# virtio-nvgpu
 
 **A virtio device for near-native NVIDIA GPU access in KVM virtual machines.**
 
-virtio-gpu-nv forwards NVIDIA kernel driver ioctls between a Linux guest
-and the host at the **driver ABI level**, bypassing API-level translation
-entirely. The guest runs NVIDIA's own user-mode drivers unmodified.
+`virtio-nvgpu` forwards NVIDIA kernel driver ioctls between a Linux guest and
+the host at the **driver ABI level**, bypassing API-level translation entirely.
+The guest runs NVIDIA's own user-mode drivers, unmodified.
 
-The primary target is **headless cloud gaming**: a compositor inside the
-VM renders, composites, and encodes frames via the GPU, then streams
-compressed video to a remote display. The VM has no physical monitor.
+The primary target is **headless streaming**: a compositor inside the VM renders,
+composites, and encodes frames on the GPU, then sends compressed video to a
+remote display. The VM has no physical monitor, and the host keeps the card.
 
-> **This is a design document and proposal.** Nothing here is implemented
-> yet. The design is speculative and subject to change at any time as
-> understanding deepens and prototyping reveals new constraints.
+> **Status: design settled, implementation in progress.** The architecture below
+> is stable and the repository is being restructured onto the layout in
+> [Repository layout](#repository-layout). Existing work lives on feature
+> branches and is moving into this tree. Interfaces will change.
+
+---
+
+## Repository layout
+
+Four components, three licence zones. The split is deliberate: the guest half
+must be GPL to touch kernel symbols, the host half should be permissive so that
+other people can build on it, and the definitions both halves share must be
+includable from both.
+
+| directory | licence | what it is |
+| --- | --- | --- |
+| [`driver/`](driver/) | **GPL-2.0** | Guest kernel module. Registers `/dev/nvidia*`, forwards ioctl and mmap over the virtqueue. Deliberately not ABI-aware. |
+| [`device/`](device/) | **Apache-2.0** | The virtio device, as a Rust crate with **no VMM in its dependency list**. Every VMM concern is a trait. |
+| [`isolate/`](isolate/) | **Apache-2.0** | Per-guest-process sandboxed host helper, launched from a memfd, holding the real device FDs. Unprivileged. |
+| [`gen/`](gen/) | — | Generated ABI tables. Checked in *and* reproducible. |
+| [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0+** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
+
+The layout follows [`chromeos/virtio-media`](https://chromium.googlesource.com/chromiumos/platform/virtio-media/),
+which solves the same problem — one repository holding a GPL guest driver beside
+a permissively licensed, VMM-agnostic device crate.
+
+### Using it from a VMM
+
+`device/` depends on no virtual machine monitor. A VMM adopts the device by
+implementing a small set of traits — descriptor chains as `Read`/`Write`, an
+event queue, guest memory mapping, host memory mapping — and gets the whole
+device without patching the crate. Optional capabilities degrade rather than
+fail to build, so a VMM can adopt it before supporting every feature.
+
+Buffer and window bookkeeping lives in `device/`. The VMM supplies raw map and
+unmap and nothing more.
+
+One thing that is **not** a trait: the isolate. `virtio-nvgpu` runs one sandboxed
+helper process per guest process, so integrating it means inheriting a **process
+model**, not just a library dependency. See [`isolate/`](isolate/).
 
 ---
 
 ## Why
 
-### The Streaming Pipeline We Want
+### The streaming pipeline we want
 
 ```text
 Guest VM (headless, no physical display)
@@ -37,71 +74,50 @@ Guest VM (headless, no physical display)
   Stream to remote client
 ```
 
-The entire render → composite → encode pipeline runs **on the GPU,
-inside the guest**. Only the compressed bitstream leaves. This requires
-the guest to have **real, driver-level access** to GPU resources: buffer
-handles, fences, CUDA device pointers, NVENC sessions.
+The entire render → composite → encode pipeline runs **on the GPU, inside the
+guest**. Only the compressed bitstream leaves. This requires the guest to have
+**real, driver-level access** to GPU resources: buffer handles, fences, CUDA
+device pointers, NVENC sessions.
 
-### Why Existing Solutions Fall Short
+### Why existing approaches fall short
 
-**virtio-gpu + Venus (API-level translation)**
+**virtio-gpu + Venus (API-level translation).** Venus serializes every Vulkan or
+OpenGL call in the guest, transports it over virtio, and replays it host-side.
+Three problems for this use case:
 
-Venus works by serializing every Vulkan or OpenGL API call in the guest,
-transporting it over virtio, deserializing it on the host, and replaying
-it against the host driver. This has three problems for our use case:
+1. **Latency compounds on draw-call-heavy workloads.** Games issue 1,000–5,000
+   draw calls per frame plus binds, descriptor updates and render pass
+   transitions, each serialized and replayed individually. At 60 fps the frame
+   budget is 16.6 ms; 1–3 ms of serialization is 6–18% gone before any GPU work.
+2. **CPU overhead is significant.** Serialization, transport and replay burn host
+   CPU the application needs. Where compute is billed and finite, that waste is
+   the product.
+3. **Guest-side encoding is not viable.** GPU buffers are owned by the *host*.
+   The guest compositor cannot see or import them, so there is no practical path
+   to a `CUdeviceptr` in the guest pointing at a Venus-managed buffer — which
+   means no NVENC without a full CPU readback and copy.
 
-1. **Latency compounds on draw-call-heavy workloads.**
-   Games routinely issue 1,000–5,000 draw calls per frame, plus
-   pipeline binds, descriptor updates, and render pass transitions.
-   Each one is serialized and replayed individually. At 60 fps with a
-   16.6 ms frame budget, even 1–3 ms of serialization overhead per
-   frame is 6–18% of the budget gone before any GPU work happens.
+**DRM native context (Intel / AMD).** The guest runs the real Mesa driver, builds
+command buffers locally, and only submissions cross the boundary. Guest-side
+buffer ownership and encoding work correctly. **This does not exist for NVIDIA.**
 
-2. **CPU overhead is significant.**
-   Serialization, transport, and replay all burn host CPU cycles that
-   the game itself needs. In a cloud gaming context where compute
-   resources are billed and finite, this waste matters. Venus can
-   reduce draw-call-heavy workloads to 65–85% of bare-metal
-   performance, with the gap being almost entirely CPU-side overhead.
+**VFIO passthrough.** Native performance and a complete driver stack in the
+guest, but it dedicates the whole GPU to one VM. In multi-tenant environments
+that is often not an option.
 
-3. **Guest-side encoding is not viable.**
-   With Venus, GPU buffers are owned by the **host**. The guest
-   compositor cannot see or import them. OpenGL buffer tracking is
-   particularly broken: GL's implicit synchronization model does not
-   survive API-level serialization and host-side replay. There is no
-   practical path to get a `CUdeviceptr` in the guest that points to a
-   Venus-managed buffer, which means the guest cannot feed frames to
-   NVENC without a full CPU-side readback and copy.
+### What virtio-nvgpu does differently
 
-**DRM native context (Intel / AMD)**
-
-For Intel and AMD, virtio-gpu supports "native context" mode: the guest
-runs the real Mesa driver, builds GPU command buffers locally, and only
-queue submissions cross the VM boundary. This gives 95–99% of bare-metal
-performance. Guest-side buffer ownership and encoding work correctly.
-
-This does not exist for NVIDIA on Linux.
-
-**VFIO passthrough**
-
-Full GPU passthrough gives native performance and a complete driver stack
-in the guest, but dedicates the entire GPU to one VM. In multi-tenant or
-cloud environments, this is often not an option.
-
-### What virtio-gpu-nv Does Differently
-
-Instead of translating at the **graphics API** level (Vulkan/GL calls),
-virtio-gpu-nv translates at the **kernel driver** level (ioctls to
-`/dev/nvidia*`). The guest runs NVIDIA's real user-mode libraries, which
-build GPU command buffers **locally in the guest** — no serialization of
-individual draw calls:
+Translation happens at the **kernel driver** level (ioctls to `/dev/nvidia*`),
+not the **graphics API** level. The guest runs NVIDIA's real user-mode libraries,
+which build GPU command buffers **locally in the guest** — individual draw calls
+are never serialized:
 
 ```text
-                    Venus                  virtio-gpu-nv
+                    Venus                  virtio-nvgpu
                     ──────────────         ──────────────────────
 
 Per draw call:      serialize +            local function call
-                    transport +            (~10 ns, no VM exit)
+                    transport +            (no VM exit)
                     deserialize +
                     replay
 
@@ -124,223 +140,140 @@ Guest NVENC         not viable             works (real CUDA interop)
 
 ---
 
-## How It Works
+## How it works
 
-Three components:
+**Guest kernel driver.** Registers `/dev/nvidiactl`, `/dev/nvidia0…N` and
+`/dev/nvidia-uvm`. On `ioctl()` it serializes the request onto a control
+virtqueue. On `mmap()` it maps the appropriate shared-memory region into the
+calling process with the correct caching attributes. It copies raw bytes and
+makes no ABI decisions.
 
-### 1. Virtio Device (in the VMM)
+**Device crate.** Receives requests, maps guest handles to host device file
+descriptors, performs ABI-aware translation of ioctl parameters — rewriting
+embedded pointers and file descriptors — and drives the isolate. Buffer and
+window bookkeeping lives here.
 
-A custom virtio device with:
-
-- A **control virtqueue** for request/response messages (open, close,
-  ioctl, mmap setup).
-- A **shared memory (SHM) BAR** — a contiguous memory region accessible
-  to both guest and host, used for GPU buffer mappings.
-
-### 2. Guest Kernel Driver (`virtio_gpu_nv.ko`)
-
-A Linux kernel module that registers:
-
-- `/dev/nvidiactl` — driver control
-- `/dev/nvidia0`, `/dev/nvidia1`, … — per-GPU devices
-- `/dev/nvidia-uvm` — CUDA memory management
-
-When an application calls `ioctl()` or `mmap()` on these devices, the
-driver serializes the request and sends it over the virtqueue. For
-`mmap()`, it maps the appropriate SHM BAR range into the process's
-address space with correct caching attributes.
-
-The guest driver is **not ABI-aware**. It copies raw bytes. All
-ABI-specific logic lives in the backend.
-
-### 3. VMM Backend (Rust, in libkrun)
-
-Receives requests from the virtqueue and:
-
-- Maps guest handles to real host `/dev/nvidia*` file descriptors.
-- Performs ABI-aware translation of ioctl parameters (pointer and FD
-  translation), ported from gVisor nvproxy's logic.
-- Calls `ioctl(2)` on the host device FDs.
-- For GPU memory mappings, `mmap()`s the host device FD into the SHM
-  region so the guest can access it directly.
+**Isolate.** Holds the real host device FDs and issues the `ioctl(2)` calls,
+unprivileged and sandboxed, one per guest process. For GPU memory it maps the
+host device FD into the shared region so the guest can reach it directly.
 
 ```text
 ┌─ Guest ─────────────────────────────────────────────────┐
+│  Application → NVIDIA Vulkan / GL / CUDA                │
+│                     │ ioctl(/dev/nvidia*)               │
+│  driver/ (GPL)      ▼                                   │
+│    serialize → virtqueue                                │
+│    mmap → shared region                                 │
+└───────────────────────────┬─────────────────────────────┘
+                            │ VM exit
+┌───────────────────────────▼─────────────────────────────┐
+│  VMM  (implements the device traits)                    │
 │                                                         │
-│  Game → NVIDIA Vulkan/GL/CUDA → ioctl(/dev/nvidia*)     │
-│                                       │                 │
-│  virtio_gpu_nv.ko                     │                 │
-│    serialize → virtqueue              │                 │
-│    mmap → SHM BAR (remap_pfn_range)   │                 │
-└───────────────────────────────────────┼─────────────────┘
-                                        │ VM exit
-┌───────────────────────────────────────▼─────────────────┐
-│  libkrun VMM                                            │
+│  device/ (Apache-2.0)                                   │
+│    ├─ guest handles → host FDs                          │
+│    ├─ translate embedded FDs and pointers               │
+│    └─ buffer + window bookkeeping                       │
+│                     │                                   │
+│  isolate/ ──────────▼── unprivileged, per guest process │
+│    └─ ioctl(host /dev/nvidia*) · mmap → shared region   │
 │                                                         │
-│  virtio-gpu-nv backend                                  │
-│    ├─ translate handles → host FDs                      │
-│    ├─ translate embedded FDs/pointers in ioctl params   │
-│    ├─ ioctl(host /dev/nvidia*, ...)                     │
-│    └─ mmap(host FD) → SHM region (guest-accessible)    │
-│                                                         │
-│  Host NVIDIA driver → GPU hardware                      │
+│  Host NVIDIA driver → GPU                               │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## What Works, What Doesn't
+## Scope
 
-### Supported (Target)
+**Targeted**
 
-- Vulkan rendering (all extensions that work without `/dev/nvidia-drm`)
-- OpenGL rendering (headless EGL, GLX fallback via X11 proxy)
-- CUDA device memory allocations
-- CUDA ↔ Vulkan/GL interop (zero-copy, GPU-side pointers)
-- NVENC hardware encoding from CUDA device pointers
-- NVDEC hardware decoding
+- Vulkan rendering (everything that works without `/dev/nvidia-drm`)
+- OpenGL rendering (headless EGL)
+- CUDA device memory allocation
+- CUDA ↔ Vulkan/GL interop, zero-copy, GPU-side pointers
+- NVENC encoding from CUDA device pointers; NVDEC decoding
 
-### Not Supported
+**Out of scope**
 
 - `cudaMallocManaged()` / full unified virtual memory
-  (known flaky even in gVisor KVM; not needed for NVENC pipeline)
-- `/dev/nvidia-drm` and `/dev/nvidia-modeset`
-  (physical display output; not needed for headless streaming)
-- Multi-GPU, MIG, SR-IOV
-- Arbitrary NVIDIA driver versions
-  (each version must be explicitly supported, same as nvproxy)
+- `/dev/nvidia-drm` and `/dev/nvidia-modeset` — physical display output is not
+  needed for headless streaming
+- MIG, SR-IOV
+- Arbitrary NVIDIA driver versions — each supported range is explicit, as with
+  `nvproxy`
 
 ---
 
-## Performance Expectations
+## Performance targets
 
-These are design targets, not measurements. No code exists yet.
+Design targets, not measurements. Nothing here has been benchmarked.
 
-|                             | Venus                   | virtio-gpu-nv (target) | Bare metal |
-| --------------------------- | ----------------------- | ---------------------- | ---------- |
-| GPU-bound (heavy shaders)   | 90–97%                  | 97–100%                | 100%       |
-| CPU-bound (many draw calls) | 65–85%                  | 95–99%                 | 100%       |
-| Shader compilation stutter  | +10–50 ms per shader    | <1 ms overhead         | 0          |
-| Frame latency overhead      | +1–3 ms                 | +0.05–0.1 ms           | 0          |
-| CPU overhead for rendering  | High (serialize/replay) | Near zero              | Zero       |
-| Guest-side NVENC            | Not viable              | Works (zero-copy)      | Works      |
+| | Venus | virtio-nvgpu (target) | Bare metal |
+| --- | --- | --- | --- |
+| GPU-bound (heavy shaders) | 90–97% | 97–100% | 100% |
+| CPU-bound (many draw calls) | 65–85% | 95–99% | 100% |
+| Shader compilation stutter | +10–50 ms per shader | <1 ms overhead | 0 |
+| Frame latency overhead | +1–3 ms | +0.05–0.1 ms | 0 |
+| CPU overhead for rendering | high (serialize/replay) | near zero | zero |
+| Guest-side NVENC | not viable | works (zero-copy) | works |
 
-The fundamental difference: Venus crosses the VM boundary **per API
-call** (thousands per frame). virtio-gpu-nv crosses it **per ioctl**
-(tens per frame). Games do many small, consecutive GPU tasks where
-per-call latency adds up. Eliminating that overhead is the point.
-
----
-
-## NVIDIA ABI and Driver Versions
-
-NVIDIA's kernel driver ABI is **not stable**. Ioctl struct layouts can
-change between releases. virtio-gpu-nv handles this the same way gVisor
-nvproxy does: each supported driver version has an explicit ABI
-definition mapping ioctl numbers to handler functions and struct layouts.
-
-When a new NVIDIA driver ships, adding support means:
-
-1. Diff the open kernel modules repo for struct changes.
-2. Update ABI definitions.
-3. Test.
-
-This is a maintenance burden, but it is bounded (a few hours per release)
-and can directly follow nvproxy's upstream changes.
+The difference is structural: Venus crosses the VM boundary **per API call**,
+thousands of times a frame. `virtio-nvgpu` crosses it **per ioctl**, tens of
+times a frame.
 
 ---
 
-## Intended Use Case
+## Driver ABI versioning
 
-A headless KVM virtual machine running on a host with an NVIDIA GPU:
+NVIDIA's kernel driver ABI is not stable; ioctl struct layouts change between
+releases. Support is explicit per version range, handled the way gVisor's
+`nvproxy` handles it.
 
-- The VM runs a game or graphical application.
-- A Wayland compositor inside the VM manages windows and composites
-  frames.
-- The compositor encodes frames with NVENC via CUDA zero-copy and
-  streams the compressed bitstream to a remote client.
-- The host has no monitor connected to the GPU.
-- Compute resources (CPU, GPU, memory) are constrained and billed;
-  overhead must be minimized.
+The cost is bounded, for three reasons. Profiles key off **ranges, not points**,
+so a release between two known versions selects the lower profile. The struct
+half is **derived mechanically** from NVIDIA's published `open-gpu-kernel-modules`
+at each tag — compile a probe per field, read back `sizeof` and `offsetof` —
+rather than transcribed by hand. And the judgement half, which commands exist and
+which are safe, tracks `nvproxy` upstream.
 
-This is the architecture used by cloud gaming platforms, remote desktop
-solutions, and GPU-accelerated development environments that stream to
-thin clients.
+See [`gen/`](gen/).
 
 ---
 
-## Status
+## Prior art
 
-**Stage**: Design and proposal. No implementation exists.
+**gVisor `nvproxy`** — the direct inspiration. It forwards NVIDIA ioctls from
+sandboxed containers to the host driver, handling ABI versioning, pointer and FD
+translation, and GPU mmap management, and it supports Vulkan, OpenGL, CUDA and
+NVENC in production today. Its ABI definitions (`pkg/abi/nvgpu`) and handler
+logic (`pkg/sentry/devices/nvproxy`) are the primary reference. `nvproxy` also
+demonstrates that Vulkan and NVENC work **without** `/dev/nvidia-drm` or
+`/dev/nvidia-modeset`.
 
-The repository will eventually contain:
+**`chromeos/virtio-media`** — the layout template. A GPL guest driver beside a
+VMM-agnostic Rust device crate, with every VMM concern behind a trait.
 
-- The virtio device backend (Rust, targeting libkrun).
-- The Linux guest kernel driver.
-- ABI definitions for supported NVIDIA driver versions.
+**WSL2 `/dev/dxg`** — a production driver-level GPU proxy across a real
+virtualization boundary, proving the general approach at scale. Different
+problem: it targets a Windows host and a Microsoft-defined kernel abstraction.
 
----
-
-## Prior Art and Acknowledgements
-
-This project builds on ideas and code from several existing systems:
-
-### gVisor nvproxy
-
-[gVisor](https://github.com/google/gvisor)'s `nvproxy` is the direct
-inspiration for virtio-gpu-nv. nvproxy forwards NVIDIA ioctls from
-sandboxed containers to the host driver, handling ABI versioning,
-pointer/FD translation, and GPU mmap management. It supports Vulkan,
-OpenGL, CUDA, and NVENC in production today.
-
-virtio-gpu-nv adapts nvproxy's approach — ioctl categorization, ABI
-version tables, handler dispatch — for a full VM context with virtio
-transport. nvproxy's Go ABI definitions (in `pkg/abi/nvgpu`) and handler
-logic (in `pkg/sentry/devices/nvproxy`) are the primary reference for
-the backend implementation.
-
-nvproxy also proves that Vulkan and NVENC work **without**
-`/dev/nvidia-drm` or `/dev/nvidia-modeset` — only `/dev/nvidiactl`,
-`/dev/nvidia#`, and `/dev/nvidia-uvm` are needed.
-
-When gVisor runs on its KVM platform, the architecture is structurally
-the same as what virtio-gpu-nv proposes: application code runs in KVM
-guest mode, ioctls cause VM exits, and the sentry (a host process)
-forwards them to host NVIDIA devices. The difference is that gVisor has
-no guest kernel; virtio-gpu-nv adds a guest kernel module with virtio
-transport.
-
-### WSL2 /dev/dxg
-
-Microsoft and NVIDIA built `/dev/dxg` (`dxgkrnl`) for WSL2: a guest
-kernel module that forwards GPU operations to the Windows host over
-Hyper-V VMBus. This is a production system (~30K lines of C) that proves
-driver-level GPU proxying works across a real virtualization boundary. It
-supports CUDA and DirectX compute, though not display.
-
-virtio-gpu-nv targets a smaller scope (Linux-to-Linux, open ecosystem,
-no DirectX) but shares the same core architecture.
-
-### DRM Native Context (Intel / AMD)
-
-virtio-gpu's native context mode for Intel and AMD achieves the same goal
-as virtio-gpu-nv: the guest runs the real GPU driver and builds command
-buffers locally; only submissions cross the VM boundary. This delivers
-95–99% of bare-metal performance. virtio-gpu-nv aims to provide
-equivalent capabilities for NVIDIA GPUs where no DRM native context
-exists.
-
-### libkrun
-
-[libkrun](https://github.com/containers/libkrun) is the target VMM.
-virtio-gpu-nv's backend will integrate as a virtio device alongside
-libkrun's existing device implementations (virtio-gpu, virtio-net,
-virtio-vsock, etc.).
+**DRM native context (Intel / AMD)** — the same goal, achieved for other vendors:
+the guest runs the real driver and builds command buffers locally, with only
+submissions crossing the boundary. `virtio-nvgpu` aims at equivalent capability
+for NVIDIA, where no native context exists.
 
 ---
 
-## See Also
+## Licence
 
-- [Architecture.md](Architecture.md) — detailed technical design:
-  guest driver, backend, virtio protocol, memory model, ABI handling,
-  CUDA/NVENC integration.
+Three zones, listed in [Repository layout](#repository-layout).
+Full texts: [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0),
+[`LICENSE-GPL-2.0`](LICENSE-GPL-2.0),
+[`LICENSE-BSD-3-Clause`](LICENSE-BSD-3-Clause).
+
+Code ported from other projects keeps its original terms.
+
+## See also
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — guest driver, device, virtio protocol,
+  memory model, ABI handling, CUDA and NVENC integration.
