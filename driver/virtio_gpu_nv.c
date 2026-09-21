@@ -2756,6 +2756,21 @@ static struct virtio_device_id id_table[] = {
 };
 MODULE_DEVICE_TABLE(virtio, id_table);
 
+/*
+ * The virtio device ID to bind.
+ *
+ * VIRTIO_ID_GPU_NV is 45, which is what libkrun assigns. QEMU cannot express
+ * it: its virtio_device_names table stops at 41, and a higher id trips an
+ * assertion in virtio_id_to_name() before the device is even realised. Making
+ * this a parameter lets the same module be tested under QEMU without changing
+ * the identity it uses in production.
+ *
+ *     insmod virtio_gpu_nv.ko virtio_id=41
+ */
+static unsigned int virtio_id = VIRTIO_ID_GPU_NV;
+module_param(virtio_id, uint, 0444);
+MODULE_PARM_DESC(virtio_id, "virtio device ID to bind (default 45)");
+
 static unsigned int features[] = {
     VIRTIO_F_VERSION_1,
     VIRTIO_GPU_NV_F_UVM,
@@ -2773,7 +2788,23 @@ static struct virtio_driver nvgpu_driver = {
     .remove = nvgpu_remove,
 };
 
-module_virtio_driver(nvgpu_driver);
+static int __init nvgpu_init(void)
+{
+    if (virtio_id != VIRTIO_ID_GPU_NV) {
+        id_table[0].device = virtio_id;
+        pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
+                virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
+    }
+    return register_virtio_driver(&nvgpu_driver);
+}
+
+static void __exit nvgpu_exit(void)
+{
+    unregister_virtio_driver(&nvgpu_driver);
+}
+
+module_init(nvgpu_init);
+module_exit(nvgpu_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("libkrun-nv contributors");
