@@ -22,6 +22,15 @@ pub struct MmapEntry {
     pub shm_length: u64,
     pub h_client: u32,
     pub h_memory: u32,
+    /// The guest handle whose host fd carries this mapping.
+    ///
+    /// A host fd is single-use for mapping: once it has carried one,
+    /// `NV_ESC_RM_MAP_MEMORY` on it again is refused with NV_ERR_STATE_IN_USE,
+    /// even after the unmap and free both succeed. The mapping therefore
+    /// belongs to the fd for the fd's whole life, and closing the fd is a
+    /// perfectly normal way to release it -- CUDA never unmaps at all, it just
+    /// exits.
+    pub map_fd_handle: u64,
     /// What to hand back to the SHM allocator when this mapping goes away.
     pub region: ShmRegion,
 }
@@ -57,6 +66,29 @@ impl MmapContext {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Take every mapping carried by one guest handle.
+    ///
+    /// Closing a device fd releases its mappings, and for some clients that is
+    /// the only way they are ever released: a CUDA run makes 29 mappings and
+    /// issues no unmap at all. Without this the extents survive until VM
+    /// teardown, so each run permanently costs the write-combine zone ~68 MiB.
+    pub fn take_for_fd(&mut self, fd_handle: u64) -> Vec<MmapEntry> {
+        let keys: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.map_fd_handle == fd_handle)
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| self.entries.remove(&k))
+            .collect()
+    }
+
+    /// Whether this handle already carries a mapping.
+    pub fn fd_has_mapping(&self, fd_handle: u64) -> bool {
+        self.entries.values().any(|e| e.map_fd_handle == fd_handle)
     }
 
     /// Find the mapping for a given client/memory pair.

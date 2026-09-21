@@ -232,6 +232,23 @@ impl NvidiaBackend {
         }
         let req = read_struct::<CloseReq>(payload, 0);
 
+        // Closing a device fd releases whatever it was mapping. For some
+        // clients this is the only release there is -- a CUDA run maps 29
+        // times and never unmaps once -- so leaving it to teardown means every
+        // run costs the write-combine zone tens of megabytes for the life of
+        // the VM.
+        for entry in self.active_maps.take_for_fd(req.guest_handle) {
+            log::debug!(
+                "close handle={}: releasing mapping at SHM {:#x}+{:#x}",
+                req.guest_handle,
+                entry.region.offset,
+                entry.region.length
+            );
+            if let Err(e) = self.shm.free(&entry.region) {
+                log::warn!("close handle={}: SHM free failed: {e}", req.guest_handle);
+            }
+        }
+
         match self.handles.remove(req.guest_handle) {
             Ok(()) => {
                 log::debug!("close handle={}", req.guest_handle);
@@ -970,6 +987,16 @@ impl NvidiaBackend {
             }
         };
 
+        // A host fd is single-use for mapping. The host will refuse this with
+        // NV_ERR_STATE_IN_USE; say so here, because that status on its own
+        // sends you looking at the unmap path, which is not the problem.
+        if self.active_maps.fd_has_mapping(guest_fd_handle) {
+            log::warn!(
+                "NV_ESC_RM_MAP_MEMORY: handle {guest_fd_handle} already carries a mapping; \
+                 a host fd cannot carry two, so the host will return NV_ERR_STATE_IN_USE"
+            );
+        }
+
         let mut param_buf = param_in.to_vec();
         param_buf[FD_OFFSET..FD_OFFSET + 4].copy_from_slice(&(host_map_fd as i32).to_le_bytes());
 
@@ -1091,6 +1118,7 @@ impl NvidiaBackend {
                 shm_length: length,
                 h_client,
                 h_memory,
+                map_fd_handle: guest_fd_handle,
                 region,
             },
         );
@@ -2114,6 +2142,43 @@ mod tests {
         eprintln!("TURING_USERMODE_A first dword through SHM: {first:#010x}");
 
         c.unmap(client, sub, mem, linear);
+        c.be.teardown();
+    }
+
+    /// Closing a device fd must release whatever it was mapping.
+    ///
+    /// This is the shape of a real CUDA client, which maps 29 times in a run
+    /// and issues no NV_ESC_RM_UNMAP_MEMORY at all -- the mappings go away
+    /// because the process exits and its fds close. Releasing only on unmap
+    /// leaves ~68 MiB of write-combine spent per run for the life of the VM,
+    /// so a third run has nowhere to map.
+    #[test]
+    fn closing_the_fd_releases_its_mapping_without_any_unmap() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut c = Chain::new();
+        let (client, sub, first) = c.usermode_object();
+        c.free_obj(client, sub, first);
+
+        let before = c.be.shm_free_bytes();
+        for i in 0..50 {
+            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            let fd = c.map_fd();
+            let (off, _len, _linear) = c.map(client, sub, mem, 65536, fd);
+            assert_ne!(off, 0, "run {i}: no SHM offset");
+
+            // Exit the way CUDA does: free the object and drop the fd, with no
+            // unmap anywhere.
+            c.free_obj(client, sub, mem);
+            c.close_dev(fd);
+
+            assert_eq!(
+                before,
+                c.be.shm_free_bytes(),
+                "run {i}: closing the fd did not release its mapping"
+            );
+        }
         c.be.teardown();
     }
 
