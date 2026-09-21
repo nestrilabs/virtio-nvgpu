@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 // crates/device/src/nvidia.rs
 use protocol::messages::*;
 use std::ffi::CString;
@@ -449,8 +448,8 @@ impl NvidiaBackend {
             );
         }
         if escape == 0x2B && outer.len() >= 16 {
-            let hClass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-            log::info!("RM_ALLOC hClass=0x{:x}", hClass);
+            let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
+            log::info!("RM_ALLOC hClass=0x{:x}", h_class);
         }
 
         if !nested_in.is_empty() {
@@ -519,7 +518,7 @@ impl NvidiaBackend {
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
 
             // Extract the RM control command for special handling
-            let ctrl_cmd = if escape == 0x2A && outer.len() >= 12 {
+            let _ctrl_cmd = if escape == 0x2A && outer.len() >= 12 {
                 Some(u32::from_le_bytes(outer[8..12].try_into().unwrap()))
             } else {
                 None
