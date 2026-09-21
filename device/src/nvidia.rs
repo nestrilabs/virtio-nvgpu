@@ -1443,8 +1443,22 @@ mod tests {
         read_struct::<OpenResp>(buf, size_of::<RespHeader>())
     }
 
+    /// Whether the GPU-backed tests can run here.
+    ///
+    /// These tests return early without a GPU, which means they report as
+    /// passes on a machine that never exercised a line of the code they cover.
+    /// Say so on stderr, so that `cargo test -- --nocapture` distinguishes
+    /// "verified against a driver" from "skipped, and green either way".
+    #[track_caller]
     fn nvidiactl_present() -> bool {
-        std::path::Path::new("/dev/nvidiactl").exists()
+        let present = std::path::Path::new("/dev/nvidiactl").exists();
+        if !present {
+            eprintln!(
+                "SKIP {}: needs /dev/nvidiactl; this test passes without testing anything",
+                std::panic::Location::caller()
+            );
+        }
+        present
     }
 
     // ---- error paths (no GPU required) ----
