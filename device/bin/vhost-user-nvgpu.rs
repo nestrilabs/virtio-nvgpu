@@ -16,11 +16,13 @@
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
+use device::host;
 use device::nvidia::NvidiaBackend;
-use device::virtio::{NvGpuConfig, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
+use device::virtio::{VirtioGpuNvConfig, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
@@ -28,7 +30,9 @@ use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueOwnedT;
 use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
 
-const QUEUE_COUNT: usize = 1;
+/// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
+/// error from that call, so offering fewer is fatal before config is read.
+const QUEUE_COUNT: usize = NUM_QUEUES;
 /// Largest response we will build for one request.
 const RESP_MAX: usize = 64 * 1024;
 
@@ -39,33 +43,48 @@ struct Args {
     #[arg(long, default_value = "/tmp/nvgpu.sock")]
     socket: String,
 
-    /// Number of GPUs to advertise in the config space.
-    #[arg(long, default_value_t = 1)]
-    num_gpus: u32,
+    /// Where the host driver publishes itself. Overridable for testing
+    /// against a fixture tree rather than a live driver.
+    #[arg(long, default_value = host::PROC_NVIDIA)]
+    proc_nvidia: PathBuf,
 }
 
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     event_idx: bool,
-    config: NvGpuConfig,
+    config: VirtioGpuNvConfig,
 }
 
 impl NvGpuBackend {
-    fn new(num_gpus: u32) -> Self {
-        Self {
+    /// Build a backend describing the GPUs this host actually has.
+    ///
+    /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
+    /// module loaded is refused here, where the reason can be stated, rather
+    /// than in a guest as a bare -EINVAL from probe.
+    fn new(proc_nvidia: &Path) -> anyhow::Result<Self> {
+        let version = host::driver_version(proc_nvidia).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no NVIDIA driver version at {} -- is the kernel module loaded?",
+                proc_nvidia.display()
+            )
+        })?;
+        let gpus = host::gpu_slots(proc_nvidia);
+        anyhow::ensure!(
+            !gpus.is_empty(),
+            "driver {version} is loaded but owns no GPUs; the guest driver rejects an empty table"
+        );
+        log::info!("host driver {version}, {} GPU(s)", gpus.len());
+
+        Ok(Self {
             nvidia: Arc::new(Mutex::new(NvidiaBackend::with_default_zones())),
             mem: None,
             event_idx: false,
-            config: NvGpuConfig {
-                num_gpus,
-                // Phase A forwards ioctls only. nvidia-smi needs no mapping at
-                // all -- 87 ioctls and zero mmaps in the captured trace -- so a
-                // guest can enumerate the GPU before the shared window exists.
-                shm_bar_gpa: 0,
-                shm_bar_size: 0,
-            },
-        }
+            // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
+            // -- 100 ioctls and one mmap in the captured trace -- so a guest
+            // can enumerate the GPU before the shared window exists.
+            config: VirtioGpuNvConfig::new(&version, &gpus),
+        })
     }
 
     /// Drain one virtqueue, dispatching every chain.
@@ -154,15 +173,7 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &self.config as *const NvGpuConfig as *const u8,
-                std::mem::size_of::<NvGpuConfig>(),
-            )
-        };
-        let start = std::cmp::min(offset as usize, bytes.len());
-        let end = std::cmp::min(start + size as usize, bytes.len());
-        bytes[start..end].to_vec()
+        self.config.read(offset, size)
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
@@ -222,7 +233,7 @@ fn main() -> anyhow::Result<()> {
         args.socket
     );
 
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(args.num_gpus)));
+    let backend = Arc::new(RwLock::new(NvGpuBackend::new(&args.proc_nvidia)?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(

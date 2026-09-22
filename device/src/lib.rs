@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod handle_table;
+pub mod host;
 pub mod mmap;
 pub mod nvidia;
 pub mod replay;
