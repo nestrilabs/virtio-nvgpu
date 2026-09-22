@@ -1131,6 +1131,36 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             let mut saved_nested_handle: Option<(usize, i32)> = None; // (offset, guest_handle_as_i32)
 
+            // An event object names the file its notifications arrive on, in
+            // `NV0005_ALLOC_PARAMETERS.data` at offset 16. The guest driver has
+            // already turned the caller's descriptor into one of our handles;
+            // this turns that handle into the descriptor this process holds,
+            // and puts the guest's value back before replying.
+            if escape == 0x2B && outer.len() >= 16 {
+                let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
+                const NV0005_DATA: usize = 16;
+                if matches!(h_class, 0x05 | 0x79) && host_buf.len() >= NV0005_DATA + 4 {
+                    let guest_handle_val =
+                        i32::from_le_bytes(host_buf[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
+                    match self.handles.get_raw(guest_handle_val as u64) {
+                        Ok(real_fd) => {
+                            saved_nested_handle = Some((NV0005_DATA, guest_handle_val));
+                            host_buf[NV0005_DATA..NV0005_DATA + 4]
+                                .copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        }
+                        Err(_) => {
+                            // Worth naming rather than forwarding: RM answers
+                            // NV_ERR_OBJECT_NOT_FOUND, which reads as a missing
+                            // object rather than an untranslated descriptor.
+                            log::warn!(
+                                "event class {h_class:#x}: no handle {guest_handle_val} for \
+                                 the file this event is to be delivered on"
+                            );
+                        }
+                    }
+                }
+            }
+
             if escape == 0x2A && outer.len() >= 12 {
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
 

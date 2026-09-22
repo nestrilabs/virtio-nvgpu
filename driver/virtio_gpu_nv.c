@@ -126,6 +126,13 @@ struct nvgpu_open_resp {
 /* Largest second-level buffer we will carry for one call. */
 #define NVGPU_DEEP_MAX (64 * 1024)
 
+/* Event classes whose allocation parameters name a file of the caller's.
+ * NV0005_ALLOC_PARAMETERS is {hParentClient, hSrcResource, hClass,
+ * notifyIndex, data}, with `data` 8-byte aligned at 16. */
+#define NVGPU_CLASS_EVENT 0x05
+#define NVGPU_CLASS_EVENT_OS_EVENT 0x79
+#define NVGPU_NV0005_DATA_OFFSET 16
+
 struct nvgpu_ioctl_req {
   struct nvgpu_msg_hdr hdr;
   __le32 cmd;
@@ -996,6 +1003,49 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
     if (copy_from_user(nested, user_alloc, nested_size)) {
       ret = -EFAULT;
       goto out;
+    }
+
+    /*
+     * An event object names the file the event will be delivered on, and it
+     * names it inside these parameters rather than at a fixed place in the
+     * ioctl -- so the translation the device publishes for whole ioctls never
+     * sees it, and the backend was handed a descriptor number that means
+     * nothing in its process. RM looks it up, finds no event registered under
+     * it, and answers NV_ERR_OBJECT_NOT_FOUND.
+     *
+     * Userspace reports that as "Failed to allocate semaphore event" and
+     * abandons the device, which is what ended every run here after
+     * enumeration started working: four allocations of these two classes fail,
+     * and nothing else in the run does.
+     *
+     * NV0005_ALLOC_PARAMETERS keeps the descriptor in `data` at offset 16.
+     * Rewrite it the way the fixed-position path does: to the handle the
+     * backend issued for that file, which the backend turns back into one of
+     * its own descriptors.
+     */
+    {
+      u32 hclass = le32_to_cpu(params.hClass);
+
+      if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
+          nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
+        int event_fd;
+
+        memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
+        if (event_fd >= 0) {
+          struct file *ev_file = fget(event_fd);
+
+          if (ev_file) {
+            struct nvgpu_fd *ev_nfd = ev_file->private_data;
+
+            if (ev_nfd) {
+              u32 handle = ev_nfd->handle;
+
+              memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
+            }
+            fput(ev_file);
+          }
+        }
+      }
     }
   }
 
