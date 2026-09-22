@@ -18,7 +18,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
-    load_manifest, resolve, Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS,
+    load_manifest, loaded_driver_version, resolve, staged_driver_version, Capability,
+    DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH,
 };
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,12 @@ struct Args {
     /// List every file, not just the totals.
     #[arg(long)]
     verbose: bool,
+
+    /// Stage even when the files found are from a different driver than the
+    /// kernel module that is loaded. Almost always the wrong thing: see the
+    /// refusal this suppresses.
+    #[arg(long)]
+    allow_version_mismatch: bool,
 }
 
 fn capability(name: &str) -> Result<Capability> {
@@ -126,10 +133,42 @@ fn main() -> Result<()> {
         }
     }
 
+    // What the manifest led us to, and what is actually loaded. These agree on
+    // a host with one driver install and can differ on a host with two -- and
+    // only the loaded module's own userspace can speak to it.
+    let staged_version = staged_driver_version(&found);
+    let loaded_version = loaded_driver_version(Path::new(LOADED_VERSION_PATH));
+    match (&staged_version, &loaded_version) {
+        (Some(s), Some(l)) if s == l => println!("driver {s}, matching the loaded module"),
+        (Some(s), Some(l)) => println!("manifest describes driver {s}; the loaded module is {l}"),
+        (Some(s), None) => println!("driver {s}; no module loaded to check it against"),
+        _ => {}
+    }
+
     let Some(root) = args.stage else {
         println!("\nNothing written. Pass --stage <dir> to build the share.");
         return Ok(());
     };
+
+    // Refuse before writing, not after. A share built from the wrong driver is
+    // the one failure here that does not look like one: it mounts, every
+    // forwarded ioctl returns 0, and the caller gives up deep inside a library
+    // that is a different build from the kernel module it is talking to.
+    if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version) {
+        if staged != loaded && !args.allow_version_mismatch {
+            anyhow::bail!(
+                "refusing to stage: the manifest at {} describes driver {staged}, but the \n\
+                 loaded kernel module is {loaded}. The guest runs these libraries against \n\
+                 that module, and the forwarded ioctls are a private contract between one \n\
+                 build of each -- so this share would fail deep inside the guest instead of \n\
+                 here.\n\n\
+                 This host has two driver userspaces installed. Point --manifest at the one \n\
+                 describing {loaded}, or remove the {staged} install. --allow-version-mismatch \n\
+                 overrides this if you are deliberately testing the mismatch.",
+                args.manifest.display()
+            );
+        }
+    }
 
     // A stale share is worse than no share: it would hold libraries from a
     // driver that is no longer loaded, which fails deep inside the guest rather

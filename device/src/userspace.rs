@@ -25,6 +25,24 @@
 //! distinguishes a library the guest needs from one only the host does, and it
 //! says which capability each file serves.
 //!
+//! # The manifest is not always the loaded driver
+//!
+//! "versioned with the driver that installed it" is true of the manifest and
+//! says nothing about which driver is *running*. A host can carry two driver
+//! userspaces at once -- distribution packages for one version and a `.run`
+//! installer or a Flatpak runtime for another -- and then the manifest
+//! describes whichever install wrote it last, while `libcuda.so.1` points at
+//! the other and `nvidia.ko` is the other again.
+//!
+//! Staging the wrong one is the worst failure this module has, because it does
+//! not look like one: the share builds, the guest mounts it, every forwarded
+//! ioctl returns 0, and the caller gives up somewhere deep in a driver whose
+//! userspace is a different build from the kernel module it is talking to. So
+//! [`loaded_driver_version`] reads the version of the module actually loaded
+//! and callers compare it against [`staged_driver_version`] before writing a
+//! share. Measured on a host with 595.91.07 packages and a 595.99.02 module
+//! loaded, where the stager silently picked the packages.
+//!
 //! # What is deliberately left out
 //!
 //! Not every entry belongs in a guest, and two kinds actively should not go:
@@ -39,12 +57,85 @@
 //! Both are filtered by [`Capability`] rather than by name, so a driver that
 //! adds a new firmware file does not need a change here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The driver's own manifest, on a host where one is installed.
 pub const DEFAULT_MANIFEST: &str = "/usr/share/nvidia/files.d/sandboxutils-filelist.json";
+
+/// Where the running kernel module reports its own version.
+pub const LOADED_VERSION_PATH: &str = "/proc/driver/nvidia/version";
+
+/// The version of the NVIDIA kernel module currently loaded, from the text
+/// `/proc/driver/nvidia/version` exposes:
+///
+/// ```text
+/// NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.99.02  Wed Aug 26 ...
+/// ```
+///
+/// `None` when the file is absent (no driver loaded) or holds nothing
+/// version-shaped. The caller decides what that means: it is normal when
+/// planning a share on a machine with no GPU, and a reason to stop when about
+/// to stage one for a guest.
+pub fn loaded_driver_version(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // Deliberately not anchored to "NVRM version:" -- the line has been
+    // reworded across releases, while the dotted version on it has not.
+    text.lines().find_map(version_in)
+}
+
+/// The driver version the resolved files belong to, taken from the library
+/// names themselves (`libcuda.so.595.91.07`) rather than from the manifest,
+/// which does not state one.
+///
+/// Files are named individually, so this returns the version the *most* of
+/// them carry: a stray file from another install should not decide the answer
+/// for the share as a whole.
+pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for r in found {
+        if let Some(v) = r.host_path.file_name().and_then(|n| version_in(&n.to_string_lossy())) {
+            *counts.entry(v).or_default() += 1;
+        }
+    }
+    // Ties broken by the higher version, so the answer is stable rather than
+    // whichever the map happened to yield first.
+    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|(v, _)| v)
+}
+
+/// The first `N.N.N` (or longer) dotted number in `s`, where every component
+/// is digits. Written out rather than pulled from a regex crate: this crate
+/// carries no such dependency, and the shape is fixed.
+fn version_in(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut dots = 0;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            if bytes[i] == b'.' {
+                // "595.99.02." or "1..2" is not a version; stop before the dot.
+                if i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_digit() {
+                    break;
+                }
+                dots += 1;
+            }
+            i += 1;
+        }
+        if dots >= 2 {
+            return Some(s[start..i].to_string());
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    None
+}
 
 /// Directories a manifest entry's bare name is resolved against, in order.
 ///
@@ -599,6 +690,64 @@ pub fn soname(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{loaded_driver_version, staged_driver_version, version_in, Entry, FileKind, Resolved};
+    use std::collections::BTreeSet as TestSet;
+
+    fn resolved(host_name: &str) -> Resolved {
+        Resolved {
+            entry: Entry {
+                name: host_name.to_string(),
+                kind: FileKind::Lib,
+                categories: TestSet::new(),
+            },
+            host_path: std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu").join(host_name),
+            guest_path: std::path::PathBuf::from("lib").join(host_name),
+        }
+    }
+
+    #[test]
+    fn version_is_read_from_the_proc_line_the_module_writes() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("version");
+        std::fs::write(
+            &p,
+            "NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.99.02  Wed Aug 26 05:24:08 UTC 2026\n\
+             GCC version:  gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1)\n",
+        )
+        .unwrap();
+        assert_eq!(loaded_driver_version(&p).as_deref(), Some("595.99.02"));
+        // A host with no driver loaded has no such file, and that is not an
+        // error here -- planning a share off-box is a legitimate use.
+        assert_eq!(loaded_driver_version(&dir.join("absent")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gcc_version_on_the_second_line_is_not_mistaken_for_the_driver() {
+        // "gcc version 15.2.0" is dotted and comes second; the driver version
+        // is on the first line, so a find_map over lines must take that one.
+        assert_eq!(version_in("GCC version:  gcc version 15.2.0 (Ubuntu)"), Some("15.2.0".into()));
+        assert_eq!(version_in("libcuda.so.1"), None, "so.1 is not a driver version");
+        assert_eq!(version_in("libcuda.so.595.99.02"), Some("595.99.02".into()));
+        assert_eq!(version_in("no digits here"), None);
+    }
+
+    #[test]
+    fn the_staged_version_is_the_one_most_files_carry() {
+        // The shape that caused this check to exist: a host carrying two
+        // driver userspaces, where the manifest described the packaged one.
+        let found = vec![
+            resolved("libcuda.so.595.91.07"),
+            resolved("libnvidia-glcore.so.595.91.07"),
+            resolved("libnvidia-eglcore.so.595.91.07"),
+            resolved("libnvidia-sandboxutils.so.595.99.02"),
+            resolved("libnvidia-egl-wayland.so.1.1.21"),
+        ];
+        assert_eq!(staged_driver_version(&found).as_deref(), Some("595.91.07"));
+        assert_eq!(staged_driver_version(&[]), None);
+    }
+
     use super::*;
 
     /// A sample in the driver's format, written here rather than copied from a
