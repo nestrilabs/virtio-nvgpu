@@ -54,6 +54,14 @@ impl MmapContext {
         self.entries.remove(&shm_offset)
     }
 
+    /// The mapping at a window offset.
+    ///
+    /// That offset is the cookie written into `pLinearAddress`, which the guest
+    /// quotes back when it maps, so this is the lookup the mmap path needs.
+    pub fn find_by_offset(&self, shm_offset: u64) -> Option<&MmapEntry> {
+        self.entries.get(&shm_offset)
+    }
+
     /// Take every mapping, leaving the table empty. Used at teardown, where a
     /// guest process that exited without unmapping is the normal case.
     pub fn drain(&mut self) -> Vec<MmapEntry> {

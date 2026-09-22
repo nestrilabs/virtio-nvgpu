@@ -163,14 +163,23 @@ struct nvgpu_proc_file_entry {
    *              content_len bytes of content          */
 } __packed;
 
-/* Per-GPU slot in VMM config space — 1088 bytes */
+/* Per-GPU slot in VMM config space — 476 bytes.
+ *
+ * info_text was 1060, which made this struct 1088 and the whole config 8912.
+ * That cannot be delivered: virtio_pci_modern_dev.c maps the device config
+ * capability with PAGE_SIZE as its maximum and silently truncates anything
+ * longer ("length > size" -> "length = size"), so every field past 4096 read
+ * back out of range and BUG'd in virtio_cread_bytes. The whole config must fit
+ * in one page, and 448 bytes leaves room for the ~278 these files actually
+ * contain while keeping all eight slots.
+ */
 struct virtio_gpu_nv_gpu_slot {
   char pci_addr[16];    /*    0.. 16  directory name          */
   __le32 minor;         /*   16.. 20  /dev/nvidia<minor>      */
   __le32 info_len;      /*   20.. 24  valid bytes in info_text */
   __le32 padding[1];    /*   24.. 28                          */
-  char info_text[1060]; /*   28..1088 raw information content  */
-} __packed;             /* 1088 bytes */
+  char info_text[448];  /*   28.. 476 raw information content  */
+} __packed;             /* 476 bytes */
 
 struct nvgpu_fd_translation_entry {
   __le32 nr;
@@ -189,13 +198,19 @@ struct virtio_gpu_nv_config {
   struct nvgpu_fd_translation_entry fd_translations[16];
 } __packed;
 
-static_assert(sizeof(struct virtio_gpu_nv_gpu_slot) == 1088,
+static_assert(sizeof(struct virtio_gpu_nv_gpu_slot) == 476,
               "gpu_slot size mismatch");
-static_assert(sizeof(struct virtio_gpu_nv_config) == 8912,
+static_assert(sizeof(struct virtio_gpu_nv_config) == 4016,
               "virtio_gpu_nv_config size mismatch with VMM");
 static_assert(offsetof(struct virtio_gpu_nv_config, num_fd_translations) ==
-                  8776,
+                  3880,
               "fd_translations offset mismatch with VMM");
+
+/* The reason every number above is what it is. A guest cannot see past one
+ * page of device config, so a layout that does not fit is not a tight fit --
+ * it is unreadable. */
+static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
+              "config space must fit in one page; see virtio_pci_modern_dev.c");
 
 /* ───────── NVIDIA ioctl parameter structs ───────── */
 

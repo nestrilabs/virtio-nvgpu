@@ -13,20 +13,148 @@ use crate::shm::{ShmAllocator, ZoneConfig};
 
 const MAX_GPU: u8 = 8;
 
-fn device_path(kind: u8, index: u8) -> Result<CString> {
+/// The host path an `Open` refers to.
+///
+/// The wire encoding is one flat `u32`: a GPU is its own minor number and the
+/// singleton devices take values above every possible minor. This previously
+/// decoded a `{kind, index}` pair that the driver never sent, so every open of
+/// the control device arrived as kind 255 and was refused.
+fn device_path(device_type: u32) -> Result<CString> {
+    let kind = DeviceKind::from_device_type(device_type)
+        .ok_or(DeviceError::InvalidDeviceKind(device_type))?;
     let path = match kind {
-        k if k == DeviceKind::Ctl as u8 => "/dev/nvidiactl".to_string(),
-        k if k == DeviceKind::Gpu as u8 => {
-            if index >= MAX_GPU {
-                return Err(DeviceError::GpuIndexOutOfRange(index));
+        DeviceKind::Gpu(n) => {
+            if n >= MAX_GPU as u32 {
+                return Err(DeviceError::GpuIndexOutOfRange(n));
             }
-            format!("/dev/nvidia{}", index)
+            format!("/dev/nvidia{n}")
         }
-        k if k == DeviceKind::Uvm as u8 => "/dev/nvidia-uvm".to_string(),
-        k if k == DeviceKind::Modeset as u8 => "/dev/nvidia-modeset".to_string(),
-        other => return Err(DeviceError::InvalidDeviceKind(other)),
+        DeviceKind::Ctl => "/dev/nvidiactl".to_string(),
+        DeviceKind::Uvm => "/dev/nvidia-uvm".to_string(),
+        DeviceKind::UvmTools => "/dev/nvidia-uvm-tools".to_string(),
+        DeviceKind::Modeset => "/dev/nvidia-modeset".to_string(),
     };
-    Ok(CString::new(path).unwrap())
+    Ok(CString::new(path).expect("a device path has no interior NUL"))
+}
+
+/// Backend-side result codes, mapped to the errno the guest driver sees.
+///
+/// The driver has no status vocabulary of its own: it tests `(s32)status < 0`
+/// and returns that value from the syscall, so every one of these has to become
+/// a plausible errno or userspace gets a nonsense failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    InvalidMsgType,
+    InvalidDevice,
+    OpenFailed,
+    BadHandle,
+    IoctlFailed,
+    BufferTooSmall,
+}
+
+impl Status {
+    fn errno(self) -> i32 {
+        match self {
+            Self::Ok => 0,
+            Self::InvalidMsgType => libc::EPROTO,
+            Self::InvalidDevice => libc::ENODEV,
+            Self::OpenFailed => libc::EIO,
+            Self::BadHandle => libc::EBADF,
+            Self::IoctlFailed => libc::EIO,
+            Self::BufferTooSmall => libc::ENOSPC,
+        }
+    }
+}
+
+/// Which host tree a `GetProcFiles`/`GetSysFiles` request refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTree {
+    /// `/proc/driver/nvidia`, which NVML reads before it will talk to a device.
+    Proc,
+    /// The sysfs attributes the userspace driver looks for on each card.
+    Sys,
+}
+
+impl FileTree {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Proc => "GET_PROC_FILES",
+            Self::Sys => "GET_SYS_FILES",
+        }
+    }
+
+    fn root(self) -> &'static str {
+        match self {
+            Self::Proc => "/proc/driver/nvidia",
+            Self::Sys => "/sys/bus/pci/drivers/nvidia",
+        }
+    }
+
+    /// Read the tree, returning `(path relative to the root, contents)`.
+    ///
+    /// Only regular files, and only small ones: these trees are descriptive
+    /// text, and anything large is either not one of them or not something a
+    /// guest should be handed through a single response buffer.
+    fn collect(self) -> Vec<(String, Vec<u8>)> {
+        const MAX_FILE: u64 = 64 * 1024;
+        let mut out = Vec::new();
+        let root = std::path::Path::new(self.root());
+        collect_into(root, root, &mut out, MAX_FILE, 0);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+/// Walk `dir`, appending every readable regular file under it.
+///
+/// Depth-limited because these trees contain symlinks back into the rest of
+/// sysfs, and following them turns a handful of files into a walk of the whole
+/// device model.
+fn collect_into(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+    max_file: u64,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // symlink_metadata, not metadata: a symlink here leads out of the tree.
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.is_symlink() {
+            continue;
+        }
+        if md.is_dir() {
+            collect_into(root, &path, out, max_file, depth + 1);
+            continue;
+        }
+        if !md.is_file() {
+            continue;
+        }
+        // procfs reports zero length for files with real content, so size is
+        // only usable as an upper bound when it is non-zero.
+        if md.len() > max_file {
+            continue;
+        }
+        let Ok(content) = std::fs::read(&path) else {
+            continue;
+        };
+        if content.len() as u64 > max_file {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            out.push((rel.to_string_lossy().into_owned(), content));
+        }
+    }
 }
 
 // ============================================================
@@ -35,6 +163,13 @@ fn device_path(kind: u8, index: u8) -> Result<CString> {
 
 
 pub struct NvidiaBackend {
+    /// The message being served, so a response can echo its type, and the
+    /// handle it named, so handlers need not thread either through.
+    current_msg: MsgType,
+    current_handle: u32,
+    /// Top-level parameter length of the ioctl being served. The response has
+    /// to split the bytes the same way the request did.
+    current_data_len: u32,
     handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
@@ -68,6 +203,9 @@ impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
         Self {
+            current_msg: MsgType::Ioctl,
+            current_handle: 0,
+            current_data_len: 0,
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
@@ -89,6 +227,11 @@ impl NvidiaBackend {
     /// Raw memfd fd (for KVM memslot creation).
     pub fn shm_memfd_raw(&self) -> i32 {
         self.shm.memfd_raw()
+    }
+
+    /// How many host descriptors the guest currently holds open.
+    pub fn handle_count(&self) -> usize {
+        self.handles.len()
     }
 
     /// Free bytes per SHM zone, as `(uc, wc, wb)`. For tests that assert a
@@ -162,23 +305,26 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0);
         }
         let hdr = read_struct::<MsgHeader>(req_buf, 0);
-        let cookie = hdr.cookie;
 
-        let msg_type = match hdr.msg_type {
-            t if t == MsgType::Open as u32 => MsgType::Open,
-            t if t == MsgType::Close as u32 => MsgType::Close,
-            t if t == MsgType::Ioctl as u32 => MsgType::Ioctl,
-            other => {
-                log::warn!("unknown msg_type {}", other);
-                return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
-            }
+        let Some(msg_type) = MsgType::from_u32(hdr.msg_type) else {
+            log::warn!("unknown msg_type {}", hdr.msg_type);
+            self.current_msg = MsgType::Ioctl;
+            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0);
         };
+        self.current_msg = msg_type;
+        // The handle travels in the header, not the payload -- every message
+        // after Open acts on one, and Open's response returns one the same way.
+        self.current_handle = hdr.handle;
 
         let payload = &req_buf[size_of::<MsgHeader>()..];
         match msg_type {
-            MsgType::Open => self.handle_open(cookie, payload, resp_buf),
-            MsgType::Close => self.handle_close(cookie, payload, resp_buf),
-            MsgType::Ioctl => self.handle_ioctl(cookie, payload, resp_buf),
+            MsgType::Open => self.handle_open(0, payload, resp_buf),
+            MsgType::Close => self.handle_close(0, payload, resp_buf),
+            MsgType::Ioctl => self.handle_ioctl(0, payload, resp_buf),
+            MsgType::Mmap => self.handle_mmap(payload, resp_buf),
+            MsgType::Munmap => self.handle_munmap(payload, resp_buf),
+            MsgType::GetProcFiles => self.handle_get_files(FileTree::Proc, resp_buf),
+            MsgType::GetSysFiles => self.handle_get_files(FileTree::Sys, resp_buf),
         }
     }
 
@@ -192,7 +338,7 @@ impl NvidiaBackend {
         }
         let req = read_struct::<OpenReq>(payload, 0);
 
-        let path = match device_path(req.kind, req.index) {
+        let path = match device_path(req.device_type) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("handle_open: {}", e);
@@ -200,10 +346,7 @@ impl NvidiaBackend {
             }
         };
 
-        log::info!("handle_open: opening {:?}", path);
-
         let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-
         if raw_fd < 0 {
             let err = std::io::Error::last_os_error();
             let errno = err.raw_os_error().unwrap_or(0);
@@ -212,14 +355,108 @@ impl NvidiaBackend {
         }
 
         let guest_handle = self.handles.insert(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        log::info!(
-            "handle_open: {:?} → handle={} (fd={})",
-            path,
-            guest_handle,
-            raw_fd
-        );
+        log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
 
-        write_ok(resp_buf, cookie, &OpenResp { guest_handle })
+        // The handle is returned in the header. The driver reads it from there
+        // and there is no response payload at all.
+        self.write_hdr(resp_buf, guest_handle as u32, 0)
+    }
+
+    // ------------------------------------------------------------------
+    // MMAP / MUNMAP
+    // ------------------------------------------------------------------
+
+    /// Place a mapping the guest asked for into the shared window.
+    ///
+    /// The guest quotes the cookie a previous `RM_MAP_MEMORY` wrote into
+    /// pLinearAddress, which is the offset within the shared window, so this
+    /// only has to find the region that cookie belongs to and hand back where
+    /// it sits.
+    fn handle_mmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
+        if payload.len() < size_of::<MmapReq>() {
+            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);
+        }
+        let req = read_struct::<MmapReq>(payload, 0);
+
+        let Some(entry) = self.active_maps.find_by_offset(req.offset) else {
+            log::warn!(
+                "mmap: no mapping at window offset {:#x} (size {:#x})",
+                req.offset,
+                req.size
+            );
+            return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT);
+        };
+
+        // The window is not placed in guest physical address space yet, so
+        // there is no address to hand back. Refusing here is the honest answer:
+        // a zero would be taken as a valid address and mapped.
+        log::warn!(
+            "mmap: mapping at {:#x}+{:#x} exists, but no shared window is exposed to \
+             the guest yet, so it cannot be addressed",
+            entry.region.offset,
+            entry.region.length
+        );
+        self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP)
+    }
+
+    fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
+        if payload.len() < size_of::<MunmapReq>() {
+            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);
+        }
+        // Nothing was ever handed out by handle_mmap, so there is nothing to
+        // take back. Reported as success so a guest tearing down does not log
+        // a failure for a mapping it never received.
+        self.write_hdr(resp_buf, 0, 0)
+    }
+
+    // ------------------------------------------------------------------
+    // GET_PROC_FILES / GET_SYS_FILES
+    // ------------------------------------------------------------------
+
+    /// Collect a tree of small files and stream them to the guest.
+    ///
+    /// The guest republishes these under its own `/proc/driver/nvidia`, which
+    /// is where the userspace driver and NVML look before they will talk to a
+    /// device at all. Without them a guest with working ioctls still reports
+    /// that it cannot find a GPU.
+    ///
+    /// The response is a bare stream of entries with **no message header** --
+    /// the driver reads from the first byte of the buffer.
+    fn handle_get_files(&mut self, tree: FileTree, resp_buf: &mut [u8]) -> usize {
+        let files = tree.collect();
+        log::info!("{}: {} file(s)", tree.name(), files.len());
+
+        let mut off = 0usize;
+        for (path, content) in &files {
+            let need = size_of::<FileEntry>() + path.len() + content.len();
+            // Leave room for the terminator, or a guest reads past the last
+            // entry into whatever the buffer held before.
+            if off + need + size_of::<FileEntry>() > resp_buf.len() {
+                log::warn!(
+                    "{}: response buffer holds {} of {} files",
+                    tree.name(),
+                    files.iter().position(|(p, _)| p == path).unwrap_or(0),
+                    files.len()
+                );
+                break;
+            }
+            off += write_struct(
+                &mut resp_buf[off..],
+                &FileEntry {
+                    path_len: path.len() as u32,
+                    content_len: content.len() as u32,
+                },
+            );
+            resp_buf[off..off + path.len()].copy_from_slice(path.as_bytes());
+            off += path.len();
+            resp_buf[off..off + content.len()].copy_from_slice(content);
+            off += content.len();
+        }
+
+        if off + size_of::<FileEntry>() <= resp_buf.len() {
+            off += write_struct(&mut resp_buf[off..], &FileEntry::default());
+        }
+        off
     }
 
     // ------------------------------------------------------------------
@@ -227,32 +464,30 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     fn handle_close(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
-        if payload.len() < size_of::<CloseReq>() {
-            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
-        }
-        let req = read_struct::<CloseReq>(payload, 0);
+        let _ = payload;
+        let handle = self.current_handle as u64;
 
         // Closing a device fd releases whatever it was mapping. For some
         // clients this is the only release there is -- a CUDA run maps 29
         // times and never unmaps once -- so leaving it to teardown means every
         // run costs the write-combine zone tens of megabytes for the life of
         // the VM.
-        for entry in self.active_maps.take_for_fd(req.guest_handle) {
+        for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
                 "close handle={}: releasing mapping at SHM {:#x}+{:#x}",
-                req.guest_handle,
+                handle,
                 entry.region.offset,
                 entry.region.length
             );
             if let Err(e) = self.shm.free(&entry.region) {
-                log::warn!("close handle={}: SHM free failed: {e}", req.guest_handle);
+                log::warn!("close handle={handle}: SHM free failed: {e}");
             }
         }
 
-        match self.handles.remove(req.guest_handle) {
+        match self.handles.remove(handle) {
             Ok(()) => {
-                log::debug!("close handle={}", req.guest_handle);
-                write_ok(resp_buf, cookie, &CloseResp { _pad: 0 })
+                log::debug!("close handle={handle}");
+                self.write_hdr(resp_buf, 0, 0)
             }
             Err(_) => self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
         }
@@ -318,21 +553,40 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
         }
         let ireq = read_struct::<IoctlReq>(payload, 0);
-        let param_in =
-            &payload[size_of::<IoctlReq>()..size_of::<IoctlReq>() + ireq.param_size as usize];
 
-        let host_fd = match self.handles.get_raw(ireq.guest_handle) {
+        // The guest sends the top-level struct and the block any pointer in it
+        // refers to, back to back. The handlers below already expect that
+        // layout, so the two lengths only need adding up here.
+        let body = &payload[size_of::<IoctlReq>()..];
+        let want = ireq.data_len as usize + ireq.nested_len as usize;
+        if body.len() < want {
+            log::warn!(
+                "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
+                ireq.cmd,
+                body.len()
+            );
+            return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, libc::EINVAL);
+        }
+        let param_in = &body[..want];
+
+        // How much of the response is the top-level struct. The driver copies
+        // exactly this much back to userspace and reads any nested block after
+        // it, so a wrong split corrupts one or the other.
+        self.current_data_len = ireq.data_len;
+
+        let request = ireq.cmd as u64;
+        let host_fd = match self.handles.get_raw(self.current_handle as u64) {
             Ok(fd) => fd,
             Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
         };
 
-        let escape = (ireq.request & 0xFF) as u32;
-        let ioc_type = ((ireq.request >> 8) & 0xFF) as u32;
+        let escape = (request & 0xFF) as u32;
+        let ioc_type = ((request >> 8) & 0xFF) as u32;
 
         // Only NVIDIA's own magic is described by the ABI tables; modeset and
         // uvm use different namespaces.
         if ioc_type == b'F' as u32 {
-            match self.check_abi(escape, ireq.param_size) {
+            match self.check_abi(escape, ireq.data_len) {
                 AbiCheck::SizeMismatch { expected, actual } => log::warn!(
                     "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects {expected}",
                     self.driver.expect("a profile implies a known version")
@@ -350,7 +604,7 @@ impl NvidiaBackend {
             return self.dispatch_nested(
                 cookie,
                 host_fd,
-                ireq.request,
+                request,
                 param_in,
                 resp_buf,
                 16, // outer_size
@@ -365,25 +619,25 @@ impl NvidiaBackend {
             // FD-carrying ioctls — need handle translation
             // ---------------------------------------------------------------
             NV_ESC_REGISTER_FD | NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
-                self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
+                self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
 
             NV_ESC_RM_ALLOC_MEMORY => {
-                self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
+                self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
             }
 
             NV_ESC_RM_MAP_MEMORY => {
-                self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
+                self.dispatch_map_memory(cookie, host_fd, request, param_in, resp_buf)
             }
 
             NV_ESC_RM_UNMAP_MEMORY => {
-                self.dispatch_unmap_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
+                self.dispatch_unmap_memory(cookie, host_fd, request, param_in, resp_buf)
             }
 
             NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self.dispatch_update_device_mapping_info(
                 cookie,
                 host_fd,
-                ireq.request,
+                request,
                 param_in,
                 resp_buf,
             ),
@@ -394,7 +648,7 @@ impl NvidiaBackend {
             NV_ESC_RM_CONTROL => self.dispatch_nested(
                 cookie,
                 host_fd,
-                ireq.request,
+                request,
                 param_in,
                 resp_buf,
                 32,
@@ -408,7 +662,7 @@ impl NvidiaBackend {
             NV_ESC_RM_ALLOC => self.dispatch_nested(
                 cookie,
                 host_fd,
-                ireq.request,
+                request,
                 param_in,
                 resp_buf,
                 48,
@@ -426,12 +680,12 @@ impl NvidiaBackend {
                 if _other == 0x00 {
                     log::debug!(
                         "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
-                        ireq.guest_handle,
-                        ireq.request,
+                        self.current_handle,
+                        request,
                         &param_in[..std::cmp::min(param_in.len(), 16)]
                     );
                 }
-                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
+                self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf)
             }
         }
     }
@@ -1129,32 +1383,19 @@ impl NvidiaBackend {
         // and the library stores this value to pass back at unmap time.
         param_buf[32..40].copy_from_slice(&region_offset.to_le_bytes());
 
-        // --- Step 7: Build response with SHM metadata ---
-
-        let hdr = RespHeader {
-            status: Status::Ok as u32,
-            cookie,
-            errno_host: 0,
-        };
-        let iresp = IoctlResp {
-            param_size: param_buf.len() as u32,
-            _pad: 0,
-            shm_offset: region_offset,
-            shm_length: length,
-            pgprot: pgprot as u8,
-            _pad2: [0; 7],
-        };
-
-        let need = size_of::<RespHeader>() + size_of::<IoctlResp>() + param_buf.len();
-        if resp_buf.len() < need {
-            return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
-        }
-
-        let mut off = 0;
-        off += write_struct(&mut resp_buf[off..], &hdr);
-        off += write_struct(&mut resp_buf[off..], &iresp);
-        resp_buf[off..off + param_buf.len()].copy_from_slice(&param_buf);
-        off + param_buf.len()
+        // --- Step 7: Respond ---
+        //
+        // Only the parameter buffer goes back. The SHM offset and length do not
+        // ride along on the ioctl reply: the guest maps by issuing a separate
+        // Mmap message quoting the cookie just written into pLinearAddress, and
+        // that is where the placement and caching are decided. An earlier reply
+        // struct carried them here, which the guest driver never read.
+        log::debug!(
+            "map_memory: SHM {:#x}+{:#x}, pgprot {pgprot:?}",
+            region_offset,
+            length
+        );
+        self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
     fn dispatch_unmap_memory(
@@ -1246,66 +1487,78 @@ impl NvidiaBackend {
     // Response helpers
     // ------------------------------------------------------------------
 
-    fn write_ioctl_resp(&self, resp_buf: &mut [u8], cookie: u64, param_out: &[u8]) -> usize {
-        let hdr = RespHeader {
-            status: Status::Ok as u32,
-            cookie,
-            errno_host: 0,
+    /// Write a bare response header.
+    fn write_hdr(&self, resp_buf: &mut [u8], handle: u32, status: i32) -> usize {
+        if resp_buf.len() < size_of::<MsgHeader>() {
+            return 0;
+        }
+        let hdr = MsgHeader {
+            msg_type: self.current_msg as u32,
+            handle,
+            status,
+            padding: 0,
         };
-        let payload = IoctlResp {
-            param_size: param_out.len() as u32,
-            _pad: 0,
-            shm_offset: 0,
-            shm_length: 0,
-            pgprot: 0,
-            _pad2: [0; 7],
-        };
+        write_struct(resp_buf, &hdr)
+    }
 
-        let need = size_of::<RespHeader>() + size_of::<IoctlResp>() + param_out.len();
+    /// Write a successful ioctl response: header, lengths, then the bytes.
+    ///
+    /// The split between the top-level struct and the nested block is taken
+    /// from the request, because the guest copies exactly `data_len` bytes back
+    /// to the caller's struct and reads any nested block after it.
+    fn write_ioctl_resp(&self, resp_buf: &mut [u8], cookie: u64, param_out: &[u8]) -> usize {
+        let data_len = (self.current_data_len as usize).min(param_out.len());
+        let nested_len = param_out.len() - data_len;
+
+        let need = size_of::<MsgHeader>() + size_of::<IoctlResp>() + param_out.len();
         if resp_buf.len() < need {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
         }
 
         let mut off = 0;
-        off += write_struct(&mut resp_buf[off..], &hdr);
-        off += write_struct(&mut resp_buf[off..], &payload);
+        off += write_struct(
+            &mut resp_buf[off..],
+            &MsgHeader {
+                msg_type: self.current_msg as u32,
+                handle: self.current_handle,
+                status: 0,
+                padding: 0,
+            },
+        );
+        off += write_struct(
+            &mut resp_buf[off..],
+            &IoctlResp {
+                data_len: data_len as u32,
+                nested_len: nested_len as u32,
+            },
+        );
         resp_buf[off..off + param_out.len()].copy_from_slice(param_out);
         off + param_out.len()
     }
 
+    /// Write a failure.
+    ///
+    /// `status` is negative in the response because the driver tests
+    /// `(s32)status < 0` and returns it straight out of the syscall. A positive
+    /// value here reads as success and userspace proceeds on a failed call.
     fn write_error_resp(
         &self,
         resp_buf: &mut [u8],
         status: Status,
-        cookie: u64,
+        _cookie: u64,
         errno: i32,
     ) -> usize {
-        let hdr = RespHeader {
-            status: status as u32,
-            cookie,
-            errno_host: errno,
-        };
-        if resp_buf.len() < size_of::<RespHeader>() {
-            return 0;
-        }
-        write_struct(resp_buf, &hdr);
-        size_of::<RespHeader>()
+        let e = if errno != 0 { errno.abs() } else { status.errno() };
+        self.write_hdr(resp_buf, 0, -e)
     }
 
-    // ------------------------------------------------------------------
-    // Test helpers
-    // ------------------------------------------------------------------
-
-    #[cfg(test)]
-    pub fn handle_count(&self) -> usize {
-        self.handles.len()
-    }
 }
 
-// ------------------------------------------------------------------
-// Drop: ensure host fds are closed even if teardown() is not called
-// ------------------------------------------------------------------
-
+/// Close whatever the guest left open.
+///
+/// This was an inherent method named `drop` rather than a `Drop` impl, so it
+/// never ran: a backend that went out of scope without `teardown()` leaked
+/// every host fd it held. `cargo` reported it only as an unused-method warning.
 impl Drop for NvidiaBackend {
     fn drop(&mut self) {
         if !self.handles.is_empty() {
@@ -1323,19 +1576,6 @@ impl Drop for NvidiaBackend {
 // Serialisation helpers
 // ============================================================
 
-fn write_ok<P: Copy>(buf: &mut [u8], cookie: u64, payload: &P) -> usize {
-    let hdr = RespHeader {
-        status: Status::Ok as u32,
-        cookie,
-        errno_host: 0,
-    };
-    let sh = size_of::<RespHeader>();
-    let sp = size_of::<P>();
-    assert!(buf.len() >= sh + sp);
-    write_struct(buf, &hdr);
-    write_struct(&mut buf[sh..], payload);
-    sh + sp
-}
 
 fn read_struct<T: Copy>(buf: &[u8], offset: usize) -> T {
     assert!(buf.len() >= offset + size_of::<T>());
@@ -1449,16 +1689,65 @@ mod abi_tests {
 mod tests {
     use super::*;
 
-    fn hdr(msg_type: MsgType, cookie: u64) -> Vec<u8> {
+    /// A request header. The handle travels here now, not in the payload.
+    fn hdr(msg_type: MsgType, handle: u64) -> Vec<u8> {
         let mut v = vec![0u8; size_of::<MsgHeader>()];
         write_struct(
             &mut v,
             &MsgHeader {
                 msg_type: msg_type as u32,
-                cookie,
-                _pad: 0,
+                handle: handle as u32,
+                status: 0,
+                padding: 0,
             },
         );
+        v
+    }
+
+    /// `device_type` for an `OpenReq`, as the driver encodes it: a GPU is its
+    /// own minor number and the singletons take values above every minor.
+    fn dev_type(kind: DeviceKind) -> u32 {
+        match kind {
+            DeviceKind::Gpu(n) => n,
+            DeviceKind::Ctl => DEV_CTL,
+            DeviceKind::Uvm => DEV_UVM,
+            DeviceKind::UvmTools => DEV_UVM_TOOLS,
+            DeviceKind::Modeset => DEV_MODESET,
+        }
+    }
+
+    /// A complete `Open` message.
+    fn open_msg(kind: DeviceKind) -> Vec<u8> {
+        let mut v = hdr(MsgType::Open, 0);
+        append(
+            &mut v,
+            &OpenReq {
+                device_type: dev_type(kind),
+                flags: 0,
+            },
+        );
+        v
+    }
+
+    /// A complete `Close` message. The handle is the header's.
+    fn close_msg(handle: u64) -> Vec<u8> {
+        hdr(MsgType::Close, handle)
+    }
+
+    /// A complete `Ioctl` message with no nested block.
+    #[allow(dead_code)]
+    fn ioctl_msg(handle: u64, escape: u32, params: &[u8]) -> Vec<u8> {
+        let mut v = hdr(MsgType::Ioctl, handle);
+        append(
+            &mut v,
+            &IoctlReq {
+                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
+                data_len: params.len() as u32,
+                nested_offset: 0,
+                nested_len: 0,
+            },
+        );
+        v.extend_from_slice(params);
         v
     }
 
@@ -1468,12 +1757,24 @@ mod tests {
         write_struct(&mut v[start..], val);
     }
 
-    fn parse_resp(buf: &[u8]) -> RespHeader {
-        read_struct::<RespHeader>(buf, 0)
+    /// The response header. `status` is signed: zero on success, negative
+    /// errno on failure -- there is no separate status vocabulary on the wire.
+    fn parse_resp(buf: &[u8]) -> MsgHeader {
+        read_struct::<MsgHeader>(buf, 0)
     }
-    fn parse_open_resp(buf: &[u8]) -> OpenResp {
-        read_struct::<OpenResp>(buf, size_of::<RespHeader>())
+
+    /// Whether a response reports the errno `want` maps to.
+    fn is_err(buf: &[u8], want: Status) -> bool {
+        parse_resp(buf).status == -want.errno()
     }
+
+    /// The handle an `Open` returned, which now arrives in the header.
+    fn opened_handle(buf: &[u8]) -> u64 {
+        parse_resp(buf).handle as u64
+    }
+
+    /// Offset of an ioctl response's parameter block.
+    const IOCTL_BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
 
     /// Whether the GPU-backed tests can run here.
     ///
@@ -1498,33 +1799,19 @@ mod tests {
     #[test]
     fn open_invalid_gpu_index() {
         let mut be = NvidiaBackend::for_test();
-        let mut req = hdr(MsgType::Open, 1);
-        append(
-            &mut req,
-            &OpenReq {
-                kind: DeviceKind::Gpu as u8,
-                index: 200,
-                _pad: [0; 6],
-            },
-        );
+        let req = open_msg(DeviceKind::Gpu(200));
         let mut resp = vec![0u8; 64];
         be.dispatch(&req, &mut resp);
-        assert_eq!(parse_resp(&resp).status, Status::InvalidDevice as u32);
+        assert!(is_err(&resp, Status::InvalidDevice));
     }
 
     #[test]
     fn close_unknown_handle() {
         let mut be = NvidiaBackend::for_test();
-        let mut req = hdr(MsgType::Close, 7);
-        append(
-            &mut req,
-            &CloseReq {
-                guest_handle: 0xCAFE,
-            },
-        );
+        let req = close_msg(0xCAFE);
         let mut resp = vec![0u8; 32];
         be.dispatch(&req, &mut resp);
-        assert_eq!(parse_resp(&resp).status, Status::BadHandle as u32);
+        assert!(is_err(&resp, Status::BadHandle));
     }
 
     #[test]
@@ -1545,15 +1832,7 @@ mod tests {
 
         // Open two fds
         for _ in 0..2 {
-            let mut req = hdr(MsgType::Open, 1);
-            append(
-                &mut req,
-                &OpenReq {
-                    kind: DeviceKind::Ctl as u8,
-                    index: 0,
-                    _pad: [0; 6],
-                },
-            );
+            let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
             be.dispatch(&req, &mut resp);
         }
@@ -1571,15 +1850,7 @@ mod tests {
         // Open a handle, then drop the backend without calling teardown().
         // The Drop impl should drain the table and not panic.
         let mut be = NvidiaBackend::for_test();
-        let mut req = hdr(MsgType::Open, 1);
-        append(
-            &mut req,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let req = open_msg(DeviceKind::Ctl);
         let mut resp = vec![0u8; 64];
         be.dispatch(&req, &mut resp);
         assert_eq!(be.handle_count(), 1);
@@ -1595,28 +1866,19 @@ mod tests {
         }
         let mut be = NvidiaBackend::for_test();
 
-        let mut req = hdr(MsgType::Open, 42);
-        append(
-            &mut req,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let req = open_msg(DeviceKind::Ctl);
         let mut resp = vec![0u8; 64];
         be.dispatch(&req, &mut resp);
         let r = parse_resp(&resp);
-        assert_eq!(r.status, Status::Ok as u32);
+        assert_eq!(r.status, 0);
 
-        let h = parse_open_resp(&resp).guest_handle;
+        let h = opened_handle(&resp);
         assert!(h > 0);
 
-        let mut req2 = hdr(MsgType::Close, 43);
-        append(&mut req2, &CloseReq { guest_handle: h });
+        let req2 = close_msg(h);
         let mut resp2 = vec![0u8; 32];
         be.dispatch(&req2, &mut resp2);
-        assert_eq!(parse_resp(&resp2).status, Status::Ok as u32);
+        assert_eq!(parse_resp(&resp2).status, 0);
         assert_eq!(be.handle_count(), 0);
     }
 
@@ -1627,32 +1889,22 @@ mod tests {
         }
         let mut be = NvidiaBackend::for_test();
 
-        let mut oreq = hdr(MsgType::Open, 1);
-        append(
-            &mut oreq,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let oreq = open_msg(DeviceKind::Ctl);
         let mut oresp = vec![0u8; 64];
         be.dispatch(&oreq, &mut oresp);
-        let gh = parse_open_resp(&oresp).guest_handle;
+        let gh = opened_handle(&oresp);
         assert!(gh > 0);
 
         // nv_ioctl_rm_api_version_t: cmd(4) + reply(4) + versionString(64) = 72 bytes
         let param_size: u32 = 72;
-        let mut ireq = hdr(MsgType::Ioctl, 2);
-        // NV_ESC_CHECK_VERSION_STR = NV_IOCTL_BASE + 10 = 210
-        // _IOWR('F', 210, 72) = (3 << 30) | (72 << 16) | (0x46 << 8) | 210
+        let mut ireq = hdr(MsgType::Ioctl, gh);
         append(
             &mut ireq,
             &IoctlReq {
-                guest_handle: gh,
-                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_CHECK_VERSION_STR, param_size),
-                param_size,
-                _pad: 0,
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_CHECK_VERSION_STR, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
             },
         );
         // First 4 bytes = cmd field. Set to '2' (0x32) for query mode.
@@ -1664,7 +1916,7 @@ mod tests {
         be.dispatch(&ireq, &mut iresp);
         let r = parse_resp(&iresp);
         assert!(
-            r.status == Status::Ok as u32 || r.status == Status::IoctlFailed as u32,
+            r.status == -0 || r.status == -Status::IoctlFailed.errno(),
             "unexpected status {}",
             r.status
         );
@@ -1688,31 +1940,23 @@ mod tests {
         }
 
         // Open nvidiactl.
-        let mut oreq = hdr(MsgType::Open, 1);
-        append(
-            &mut oreq,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let oreq = open_msg(DeviceKind::Ctl);
         let mut oresp = vec![0u8; 64];
         be.dispatch(&oreq, &mut oresp);
-        let gh = parse_open_resp(&oresp).guest_handle;
+        let gh = opened_handle(&oresp);
         assert!(gh > 0);
 
         // Build a NV_ESC_RM_MAP_MEMORY ioctl with a bogus embedded FD handle.
         // IoctlNVOS33ParametersWithFD = 56 bytes.
         let param_size: u32 = 56;
-        let mut ireq = hdr(MsgType::Ioctl, 2);
+        let mut ireq = hdr(MsgType::Ioctl, gh);
         append(
             &mut ireq,
             &IoctlReq {
-                guest_handle: gh,
-                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size),
-                param_size,
-                _pad: 0,
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
             },
         );
 
@@ -1725,10 +1969,8 @@ mod tests {
 
         let mut iresp = vec![0u8; 512];
         be.dispatch(&ireq, &mut iresp);
-        let r = parse_resp(&iresp);
-
         // Should fail with BadHandle since 0xDEAD is not in the handle table.
-        assert_eq!(r.status, Status::BadHandle as u32);
+        assert!(is_err(&iresp, Status::BadHandle));
     }
 
     #[test]
@@ -1740,43 +1982,27 @@ mod tests {
         let mut be = NvidiaBackend::for_test();
 
         // Open nvidiactl — this is both the "outer" fd and the "map" fd.
-        let mut oreq = hdr(MsgType::Open, 1);
-        append(
-            &mut oreq,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let oreq = open_msg(DeviceKind::Ctl);
         let mut oresp = vec![0u8; 64];
         be.dispatch(&oreq, &mut oresp);
-        let ctl_handle = parse_open_resp(&oresp).guest_handle;
+        let ctl_handle = opened_handle(&oresp);
 
         // Open a second nvidiactl fd to use as the embedded map FD.
-        let mut oreq2 = hdr(MsgType::Open, 2);
-        append(
-            &mut oreq2,
-            &OpenReq {
-                kind: DeviceKind::Ctl as u8,
-                index: 0,
-                _pad: [0; 6],
-            },
-        );
+        let oreq2 = open_msg(DeviceKind::Ctl);
         let mut oresp2 = vec![0u8; 64];
         be.dispatch(&oreq2, &mut oresp2);
-        let map_handle = parse_open_resp(&oresp2).guest_handle;
+        let map_handle = opened_handle(&oresp2);
 
         // Build IoctlNVOS33ParametersWithFD with the map_handle as embedded FD.
         let param_size: u32 = 56;
-        let mut ireq = hdr(MsgType::Ioctl, 3);
+        let mut ireq = hdr(MsgType::Ioctl, ctl_handle);
         append(
             &mut ireq,
             &IoctlReq {
-                guest_handle: ctl_handle,
-                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size),
-                param_size,
-                _pad: 0,
+                cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size) as u32,
+                data_len: param_size,
+                nested_offset: 0,
+                nested_len: 0,
             },
         );
 
@@ -1793,9 +2019,7 @@ mod tests {
         // dispatch path should reach the host ioctl — so we expect either
         // IoctlFailed (host rejected it) or Ok (unlikely without valid handles).
         // The key thing: it should NOT be BadHandle, proving FD translation worked.
-        assert_ne!(
-            r.status,
-            Status::BadHandle as u32,
+        assert_ne!(r.status, -Status::BadHandle.errno(),
             "FD translation should have succeeded"
         );
     }
@@ -1845,15 +2069,11 @@ mod tests {
             // Not for_test(): its write-combine zone is 16 KiB, and the
             // smallest real mapping here is 64 KiB.
             let mut be = NvidiaBackend::with_default_zones();
-            let mut req = hdr(MsgType::Open, 1);
-            append(
-                &mut req,
-                &OpenReq { kind: DeviceKind::Ctl as u8, index: 0, _pad: [0; 6] },
-            );
+            let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
             be.dispatch(&req, &mut resp);
-            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "open /dev/nvidiactl");
-            let ctl = parse_open_resp(&resp).guest_handle;
+            assert_eq!(parse_resp(&resp).status, 0, "open /dev/nvidiactl");
+            let ctl = opened_handle(&resp);
             let mut c = Self { be, ctl, gpu: 0, cookie: 2 };
             // The driver always issues these two before allocating a client.
             // Without them the device allocation is refused with
@@ -1863,7 +2083,7 @@ mod tests {
             // The driver opens /dev/nvidia0 and registers the control fd
             // against it before allocating a device. Skipping this is refused
             // with NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
-            c.gpu = c.open_dev(DeviceKind::Gpu);
+            c.gpu = c.open_dev(DeviceKind::Gpu(0));
             c.register_fd(c.gpu, c.ctl);
             c
         }
@@ -1871,25 +2091,24 @@ mod tests {
         /// Open one of the character devices and return its guest handle.
         fn open_dev(&mut self, kind: DeviceKind) -> u64 {
             self.cookie += 1;
-            let mut req = hdr(MsgType::Open, self.cookie);
-            append(&mut req, &OpenReq { kind: kind as u8, index: 0, _pad: [0; 6] });
+            let req = open_msg(kind);
             let mut resp = vec![0u8; 64];
             self.be.dispatch(&req, &mut resp);
-            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "open {kind:?}");
-            parse_open_resp(&resp).guest_handle
+            assert_eq!(parse_resp(&resp).status, 0, "open {kind:?}");
+            opened_handle(&resp)
         }
 
         /// NV_ESC_REGISTER_FD: attach `fd_handle` to the device `on`.
         fn register_fd(&mut self, on: u64, fd_handle: u64) {
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, on);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: on,
-                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_REGISTER_FD, 4),
-                    param_size: 4,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_REGISTER_FD, 4) as u32,
+                    data_len: 4,
+                    nested_offset: 0,
+                    nested_len: 0,
                 },
             );
             req.extend_from_slice(&(fd_handle as u32).to_le_bytes());
@@ -1900,14 +2119,14 @@ mod tests {
         /// Issue a parameterless escape whose payload is just a zeroed buffer.
         fn simple(&mut self, escape: u32, size: u32) {
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: self.ctl,
-                    request: abi::ioctl::_IOWR(escape, size),
-                    param_size: size,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(escape, size) as u32,
+                    data_len: size,
+                    nested_offset: 0,
+                    nested_len: 0,
                 },
             );
             req.extend_from_slice(&vec![0u8; size as usize]);
@@ -1940,16 +2159,17 @@ mod tests {
             outer[A_CLASS..A_CLASS + 4].copy_from_slice(&class.to_le_bytes());
             outer[A_PARAMS_SIZE..A_PARAMS_SIZE + 4].copy_from_slice(&declared.to_le_bytes());
 
-            let param_size = (ALLOC_OUTER + params.len()) as u32;
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: self.ctl,
-                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, ALLOC_OUTER as u32),
-                    param_size,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_ALLOC, ALLOC_OUTER as u32) as u32,
+                    data_len: ALLOC_OUTER as u32,
+                    // The class parameters follow the top-level struct, which
+                    // is where the driver puts them.
+                    nested_offset: ALLOC_OUTER as u32,
+                    nested_len: params.len() as u32,
                 },
             );
             req.extend_from_slice(&outer);
@@ -1958,12 +2178,10 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             let n = self.be.dispatch(&req, &mut resp);
             assert!(n > 0, "alloc class {class:#x}: empty response");
-            assert_eq!(
-                parse_resp(&resp).status,
-                Status::Ok as u32,
+            assert_eq!(parse_resp(&resp).status, 0,
                 "alloc class {class:#x}: transport status"
             );
-            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let body = IOCTL_BODY;
             let out = &resp[body..body + ALLOC_OUTER];
             let status = u32::from_le_bytes(out[A_STATUS..A_STATUS + 4].try_into().unwrap());
             assert_eq!(status, 0, "alloc class {class:#x}: RM status {status:#x}");
@@ -1998,7 +2216,7 @@ mod tests {
         /// The fd is registered against the control fd first, as the driver
         /// does for every fd it maps on.
         fn map_fd(&mut self) -> u64 {
-            let h = self.open_dev(DeviceKind::Gpu);
+            let h = self.open_dev(DeviceKind::Gpu(0));
             self.register_fd(h, self.ctl);
             h
         }
@@ -2017,14 +2235,14 @@ mod tests {
             p[48..52].copy_from_slice(&(fd as u32).to_le_bytes());
 
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: self.ctl,
-                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, 56),
-                    param_size: 56,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, 56) as u32,
+                    data_len: 56,
+                    nested_offset: 0,
+                    nested_len: 0,
                 },
             );
             req.extend_from_slice(&p);
@@ -2032,30 +2250,26 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(
-                rh.status,
-                Status::Ok as u32,
-                "map: transport status {} errno {}",
-                rh.status,
-                rh.errno_host
+            assert_eq!(rh.status, 0,
             );
-            let ir = read_struct::<IoctlResp>(&resp, size_of::<RespHeader>());
-            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let body = IOCTL_BODY;
             let out = &resp[body..body + 56];
             let rm = u32::from_le_bytes(out[40..44].try_into().unwrap());
             assert_eq!(rm, 0, "map: RM status {rm:#x}");
+            // The SHM offset comes back in pLinearAddress, not in a reply
+            // struct: the guest quotes it in a separate Mmap message, and that
+            // is where placement and caching are decided.
             let linear = u64::from_le_bytes(out[32..40].try_into().unwrap());
-            (ir.shm_offset, ir.shm_length, linear)
+            (linear, len, linear)
         }
 
         /// Close a device handle, as a guest does when its fd goes away.
         fn close_dev(&mut self, handle: u64) {
             self.cookie += 1;
-            let mut req = hdr(MsgType::Close, self.cookie);
-            append(&mut req, &CloseReq { guest_handle: handle });
+            let req = close_msg(handle);
             let mut resp = vec![0u8; 128];
             self.be.dispatch(&req, &mut resp);
-            assert_eq!(parse_resp(&resp).status, Status::Ok as u32, "close handle {handle}");
+            assert_eq!(parse_resp(&resp).status, 0, "close handle {handle}");
         }
 
         /// NV_ESC_RM_FREE of one object.
@@ -2065,22 +2279,22 @@ mod tests {
             p[4..8].copy_from_slice(&parent.to_le_bytes());
             p[8..12].copy_from_slice(&object.to_le_bytes());
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: self.ctl,
-                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16),
-                    param_size: 16,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16) as u32,
+                    data_len: 16,
+                    nested_offset: 0,
+                    nested_len: 0,
                 },
             );
             req.extend_from_slice(&p);
             let mut resp = vec![0u8; 512];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(rh.status, Status::Ok as u32, "free: transport status, errno {}", rh.errno_host);
-            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            assert_eq!(rh.status, 0, "free: transport status, ",);
+            let body = IOCTL_BODY;
             let rm = u32::from_le_bytes(resp[body + 12..body + 16].try_into().unwrap());
             assert_eq!(rm, 0, "free of {object:#x}: RM status {rm:#x}");
         }
@@ -2094,28 +2308,23 @@ mod tests {
             p[16..24].copy_from_slice(&linear.to_le_bytes());
 
             self.cookie += 1;
-            let mut req = hdr(MsgType::Ioctl, self.cookie);
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
             append(
                 &mut req,
                 &IoctlReq {
-                    guest_handle: self.ctl,
-                    request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, 32),
-                    param_size: 32,
-                    _pad: 0,
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, 32) as u32,
+                    data_len: 32,
+                    nested_offset: 0,
+                    nested_len: 0,
                 },
             );
             req.extend_from_slice(&p);
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(
-                rh.status,
-                Status::Ok as u32,
-                "unmap: transport status {} errno {}",
-                rh.status,
-                rh.errno_host
+            assert_eq!(rh.status, 0,
             );
-            let body = size_of::<RespHeader>() + size_of::<IoctlResp>();
+            let body = IOCTL_BODY;
             let rm = u32::from_le_bytes(resp[body + 24..body + 28].try_into().unwrap());
             assert_eq!(rm, 0, "unmap: RM status {rm:#x}");
         }

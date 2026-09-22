@@ -17,10 +17,10 @@ pub enum DeviceError {
     UnknownMsgType(u32),
 
     #[error("invalid device kind {0}")]
-    InvalidDeviceKind(u8),
+    InvalidDeviceKind(u32),
 
     #[error("GPU index {0} out of range")]
-    GpuIndexOutOfRange(u8),
+    GpuIndexOutOfRange(u32),
 }
 
 pub type Result<T> = std::result::Result<T, DeviceError>;

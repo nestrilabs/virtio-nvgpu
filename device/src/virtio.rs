@@ -31,7 +31,13 @@ pub const QUEUE_SIZE: u16 = 256;
 /// Longest PCI address the driver will store, including its NUL.
 pub const PCI_ADDR_LEN: usize = 16;
 /// Bytes of `/proc/driver/nvidia/gpus/<addr>/information` carried per GPU.
-pub const INFO_TEXT_LEN: usize = 1060;
+///
+/// 448, not the 1060 this began as. A guest maps the virtio-pci device config
+/// capability with PAGE_SIZE as its maximum and silently truncates anything
+/// longer, so a config larger than one page is not a tight fit but an
+/// unreadable one: every field past 4096 read out of range and took the guest
+/// driver down inside `virtio_cread_bytes`. These files hold about 278 bytes.
+pub const INFO_TEXT_LEN: usize = 448;
 /// Driver version string length in config space, including its NUL.
 pub const DRIVER_VERSION_LEN: usize = 32;
 /// GPU slots in config space. The driver reads at most this many.
@@ -41,7 +47,7 @@ pub const MAX_FD_TRANSLATIONS: usize = 16;
 
 /// One GPU, as the guest driver reads it.
 ///
-/// Mirrors `struct virtio_gpu_nv_gpu_slot`, which the driver asserts is 1088
+/// Mirrors `struct virtio_gpu_nv_gpu_slot`, which the driver asserts is 476
 /// bytes.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
@@ -105,8 +111,9 @@ pub struct FdTranslation {
 
 /// Device configuration space.
 ///
-/// Mirrors `struct virtio_gpu_nv_config`, which the driver asserts is 8912
-/// bytes with `num_fd_translations` at offset 8776.
+/// Mirrors `struct virtio_gpu_nv_config`, which the driver asserts is 4016
+/// bytes with `num_fd_translations` at offset 3880, and which must fit in one
+/// page.
 ///
 /// This replaced a 24-byte struct whose first field was `num_gpus`. The driver
 /// reads `num_gpus` from offset 32 and rejects zero, so it read past the end of
@@ -196,12 +203,25 @@ mod tests {
     /// stops probing and nothing else says why.
     #[test]
     fn layout_matches_the_guest_driver() {
-        assert_eq!(size_of::<GpuSlot>(), 1088, "gpu_slot size mismatch");
-        assert_eq!(size_of::<VirtioGpuNvConfig>(), 8912, "config size mismatch");
+        assert_eq!(size_of::<GpuSlot>(), 476, "gpu_slot size mismatch");
+        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4016, "config size mismatch");
         assert_eq!(
             offset_of!(VirtioGpuNvConfig, num_fd_translations),
-            8776,
+            3880,
             "fd_translations offset mismatch"
+        );
+    }
+
+    /// The constraint behind every number above: a guest maps device config
+    /// with PAGE_SIZE as its maximum and truncates the rest without saying so,
+    /// so anything past 4096 is not slow or wasteful -- it is unreadable, and
+    /// reading it takes the guest driver down.
+    #[test]
+    fn config_fits_in_one_page() {
+        assert!(
+            size_of::<VirtioGpuNvConfig>() <= 4096,
+            "config is {} bytes; a guest cannot read past 4096",
+            size_of::<VirtioGpuNvConfig>()
         );
     }
 
@@ -267,8 +287,8 @@ mod tests {
     #[test]
     fn a_read_past_the_end_is_clamped_rather_than_panicking() {
         let cfg = VirtioGpuNvConfig::default();
-        assert_eq!(cfg.read(8900, 64).len(), 12);
+        assert_eq!(cfg.read(4004, 64).len(), 12);
         assert!(cfg.read(99_999, 16).is_empty());
-        assert_eq!(cfg.read(0, 8912).len(), 8912);
+        assert_eq!(cfg.read(0, 4016).len(), 4016);
     }
 }
