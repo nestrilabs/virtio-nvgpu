@@ -87,7 +87,12 @@ impl FileTree {
     fn root(self) -> &'static str {
         match self {
             Self::Proc => "/proc/driver/nvidia",
-            Self::Sys => "/sys/bus/pci/drivers/nvidia",
+            // Paths in this stream are relative to /sys, because that is what
+            // the driver matches on: it looks for "bus/pci/devices/<addr>/
+            // config" and ignores everything else. Rooting the walk at
+            // /sys/bus/pci/drivers/nvidia instead produced paths that matched
+            // nothing, which is not distinguishable from an empty tree.
+            Self::Sys => "/sys",
         }
     }
 
@@ -98,11 +103,39 @@ impl FileTree {
     /// guest should be handed through a single response buffer.
     fn collect(self) -> Vec<(String, Vec<u8>)> {
         const MAX_FILE: u64 = 64 * 1024;
-        let mut out = Vec::new();
-        let root = std::path::Path::new(self.root());
-        collect_into(root, root, &mut out, MAX_FILE, 0);
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        match self {
+            Self::Proc => {
+                let mut out = Vec::new();
+                let root = std::path::Path::new(self.root());
+                collect_into(root, root, &mut out, MAX_FILE, 0);
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                out
+            }
+            // Not a walk. /sys is enormous, most of it is irrelevant, and some
+            // of it blocks on read. The driver wants one file per GPU -- the
+            // PCI config space -- and says so: everything else it needs the
+            // kernel synthesises once the pci_dev is registered.
+            Self::Sys => crate::host::gpu_slots(std::path::Path::new(Self::Proc.root()))
+                .iter()
+                .filter_map(|slot| {
+                    let end = slot
+                        .pci_addr
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(slot.pci_addr.len());
+                    let addr = String::from_utf8_lossy(&slot.pci_addr[..end]);
+                    let rel = format!("bus/pci/devices/{addr}/config");
+                    let abs = std::path::Path::new("/sys").join(&rel);
+                    match std::fs::read(&abs) {
+                        Ok(content) => Some((rel, content)),
+                        Err(e) => {
+                            log::warn!("sys: cannot read {}: {}", abs.display(), e);
+                            None
+                        }
+                    }
+                })
+                .collect(),
+        }
     }
 }
 
@@ -455,6 +488,20 @@ impl NvidiaBackend {
 
         if off + size_of::<FileEntry>() <= resp_buf.len() {
             off += write_struct(&mut resp_buf[off..], &FileEntry::default());
+        }
+
+        // GET_SYS_FILES carries a second section the file stream does not
+        // announce: a u32 count of DRI devices, then that many records of
+        // {name_len, major, minor, gpu_id} and the name. Omitting it does not
+        // fail cleanly -- the driver reads whatever bytes follow the
+        // terminator as the count, which is why a run with no second section
+        // still logged "no DRI devices reported by VMM" and looked correct.
+        //
+        // Headless forwarding hands out no render node, so the count is zero
+        // and it still has to be written.
+        if tree == FileTree::Sys && off + size_of::<u32>() <= resp_buf.len() {
+            resp_buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+            off += 4;
         }
         off
     }

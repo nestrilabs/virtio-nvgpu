@@ -234,7 +234,19 @@ struct NVOS64_PARAMETERS {
   __le32 paramsSize;
   __le32 flags;
   __le32 status;
+  /*
+   * Tail padding, and it is part of the ABI rather than an artefact.
+   * NVIDIA's NVOS64_PARAMETERS is naturally aligned, and its NvP64 members
+   * give the struct 8-byte alignment, so the compiler rounds 44 up to 48.
+   * __packed here removed that, and the guest sent 44-byte RM_ALLOCs to a
+   * host driver expecting 48 -- confirmed against a capture of 463 calls on
+   * 615.71.09, every one of them 48 bytes.
+   */
+  __le32 reserved;
 } __packed;
+
+static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
+              "RM_ALLOC parameter struct must match the host driver ABI");
 
 /* ───────── Driver state ───────── */
 

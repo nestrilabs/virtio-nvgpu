@@ -99,6 +99,26 @@ impl GpuSlot {
     }
 }
 
+use abi::ioctl::{
+    NV_ESC_ALLOC_OS_EVENT, NV_ESC_FREE_OS_EVENT, NV_ESC_REGISTER_FD, NV_ESC_RM_ALLOC_MEMORY,
+};
+
+/// The ioctls that carry a file descriptor, and the byte offset it sits at.
+///
+/// Offsets are into the top-level parameter struct:
+///
+///   * `NV_ESC_REGISTER_FD` -- `nv_ioctl_register_fd_t` is the descriptor
+///     alone, so offset 0.
+///   * `NV_ESC_ALLOC_OS_EVENT` / `NV_ESC_FREE_OS_EVENT` --
+///     `hClient(4) + hDevice(4)` precede it.
+///   * `NV_ESC_RM_ALLOC_MEMORY` -- offset 48.
+pub const FD_CARRYING_IOCTLS: &[(u32, u32)] = &[
+    (NV_ESC_REGISTER_FD, 0),
+    (NV_ESC_ALLOC_OS_EVENT, 8),
+    (NV_ESC_FREE_OS_EVENT, 8),
+    (NV_ESC_RM_ALLOC_MEMORY, 48),
+];
+
 /// One ioctl the device wants the driver to rewrite file descriptors in.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, packed)]
@@ -167,6 +187,27 @@ impl VirtioGpuNvConfig {
         let n = gpus.len().min(MAX_GPUS);
         cfg.gpus[..n].copy_from_slice(&gpus[..n]);
         cfg.num_gpus = n as u32;
+
+        // Tell the driver which ioctls carry a file descriptor, and where.
+        //
+        // The driver rewrites a descriptor only when the device names its
+        // ioctl here; otherwise it forwards the guest's own fd number, which
+        // means nothing on the host. Publishing none of these is not a
+        // degraded mode -- the backend then sees a raw guest fd where it
+        // expects one of its handles and refuses the call ("bad embedded
+        // handle 9", nvidia-smi reporting "Unable to determine the device
+        // handle for GPU0").
+        //
+        // The list has to agree with the backend's own, in
+        // `nvidia.rs::dispatch_fd_ioctl`, since that is what reads the
+        // rewritten field back out.
+        for (i, (nr, off)) in FD_CARRYING_IOCTLS.iter().enumerate() {
+            cfg.fd_translations[i] = FdTranslation {
+                nr: *nr,
+                payload_offset: *off,
+            };
+        }
+        cfg.num_fd_translations = FD_CARRYING_IOCTLS.len() as u32;
         cfg
     }
 
