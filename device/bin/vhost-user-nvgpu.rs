@@ -23,7 +23,12 @@ use clap::Parser;
 use device::host;
 use device::nvidia::NvidiaBackend;
 use device::virtio::{VirtioGpuNvConfig, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
-use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use device::shm::WindowPlacer;
+use std::os::fd::{BorrowedFd, RawFd};
+use vhost::vhost_user::message::{
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+};
+use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -48,6 +53,56 @@ struct Args {
     #[arg(long, default_value = host::PROC_NVIDIA)]
     proc_nvidia: PathBuf,
 }
+
+/// Places device memory through the vhost-user backend request channel.
+///
+/// The VMM owns the window's address space and the memory slot that describes
+/// it, so it is the only process whose `MAP_FIXED` the guest can see. This
+/// hands the descriptor over and lets it do the placement.
+struct VhostWindow(Backend);
+
+impl WindowPlacer for VhostWindow {
+    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, writable: bool) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset,
+            len,
+            flags: if writable {
+                VhostUserMMapFlags::WRITABLE.bits()
+            } else {
+                0
+            },
+        };
+        // SAFETY: the descriptor is owned by the handle table for the whole of
+        // this call, and is only borrowed to be sent.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    fn withdraw(&self, shm_offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: NV_SHM_ID,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset,
+            len,
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+}
+
+/// The shared-memory id the guest driver looks the window up by, which must
+/// match the capability the VMM publishes.
+const NV_SHM_ID: u8 = 1;
 
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
@@ -169,7 +224,20 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
-        VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG
+        VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::CONFIG
+            // The channel mapping requests travel up on, and the feature that
+            // gates the request itself. Device memory has to be placed by the
+            // VMM: `MAP_FIXED` here would rewrite only this process's page
+            // tables, and the memory slot the guest reads through describes
+            // the VMM's address space, not ours.
+            | VhostUserProtocolFeatures::BACKEND_REQ
+            | VhostUserProtocolFeatures::SHMEM
+    }
+
+    fn set_backend_req_fd(&mut self, backend: Backend) {
+        log::info!("window: request channel open; device memory is now mappable");
+        self.nvidia.lock().unwrap().set_window(Box::new(VhostWindow(backend)));
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {

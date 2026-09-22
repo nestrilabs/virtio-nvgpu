@@ -585,3 +585,27 @@ mod tests {
         unsafe { libc::close(host_fd) };
     }
 }
+
+// ============================================================
+// The shared window
+// ============================================================
+
+/// Places device memory where the guest can reach it.
+///
+/// This exists because the backend cannot do the placement itself. `MAP_FIXED`
+/// rewrites the calling process's page tables and nothing else, so a mapping
+/// made here would never appear in the memory slot the VMM registered -- the
+/// guest would read the window's own empty pages and find no device. The
+/// descriptor has to travel up to whoever owns that address space.
+///
+/// It is a trait for the reason every VMM concern in this crate is one: the
+/// crate names no VMM. A transport implements it, and a backend without one
+/// keeps its mappings to itself and says so.
+pub trait WindowPlacer: Send {
+    /// Put `len` bytes of `fd` at `shm_offset` within the window.
+    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, writable: bool) -> Result<()>;
+
+    /// Return a range to empty. Not an unmap: leaving a hole would let a later
+    /// access reach no mapping at all in a range the memory slot still covers.
+    fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
+}

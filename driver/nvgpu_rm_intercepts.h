@@ -158,10 +158,28 @@ static inline long nvgpu_intercept_os_get_caps(struct nvgpu_fd *nfd,
   memcpy(&caps_tbl_size, &params[0], sizeof(u32));
   memcpy(&caps_tbl_ptr, &params[8], sizeof(u64));
 
-  /* If pointer is non-NULL, zero out the userspace caps buffer */
-  if (caps_tbl_ptr && caps_tbl_size > 0) {
+  /*
+   * Clear the caps table only when the guest really gave us one.
+   *
+   * The 16-byte layout above is not the only one in use: a 24-byte form
+   * appears in practice whose bytes at these offsets are not a size and a
+   * pointer at all -- observed as size=1, ptr=0xcaf00000fade0001, which is a
+   * poison value rather than an address. Writing to it fails, and failing the
+   * ioctl for that reason took Vulkan down: the ICD gets EFAULT from
+   * RM_CONTROL, abandons initialisation, and the loader reports only "Found
+   * no drivers", naming nothing.
+   *
+   * Nothing is owed to the caller here. The answer this intercept exists to
+   * give is "no special OS capabilities", and a table left untouched says
+   * that as well as a table zeroed. So check the address is writable and, if
+   * it is not, answer NV_OK without touching it.
+   */
+  if (caps_tbl_ptr && caps_tbl_size > 0 &&
+      access_ok((void __user *)caps_tbl_ptr, caps_tbl_size)) {
     if (clear_user((void __user *)caps_tbl_ptr, caps_tbl_size))
-      return -EFAULT;
+      pr_warn_ratelimited(
+          "virtio-gpu-nv: OS_GET_CAPS: could not clear %u bytes at 0x%llx\n",
+          caps_tbl_size, caps_tbl_ptr);
   }
 
   return nvgpu_set_nvos54_status(uarg, 0); /* NV_OK */

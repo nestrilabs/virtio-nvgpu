@@ -109,6 +109,16 @@ impl FileTree {
                 let root = std::path::Path::new(self.root());
                 collect_into(root, root, &mut out, MAX_FILE, 0);
                 out.sort_by(|a, b| a.0.cmp(&b.0));
+                // Paths in this stream are relative to /proc, not to the
+                // driver's own directory: the guest walks each component from
+                // the root of procfs to create the parents. Sending "version"
+                // rather than "driver/nvidia/version" asks it to create
+                // /proc/version, which already exists, so every file was
+                // dropped and the directory came out empty. That is invisible
+                // from here -- the backend counted 16 files and sent them.
+                for (path, _) in &mut out {
+                    *path = format!("driver/nvidia/{path}");
+                }
                 out
             }
             // Not a walk. /sys is enormous, most of it is irrelevant, and some
@@ -216,6 +226,10 @@ pub struct NvidiaBackend {
     driver: Option<abi::version::DriverVersion>,
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
+    /// Where device memory is placed so the guest can address it. `None` until
+    /// the transport supplies one, and without it a mapping can be made on the
+    /// host but never reached from the guest.
+    window: Option<Box<dyn crate::shm::WindowPlacer>>,
 }
 
 /// The result of checking one guest ioctl against the host's ABI profile.
@@ -236,6 +250,7 @@ impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
         Self {
+            window: None,
             current_msg: MsgType::Ioctl,
             current_handle: 0,
             current_data_len: 0,
@@ -260,6 +275,15 @@ impl NvidiaBackend {
     /// Raw memfd fd (for KVM memslot creation).
     pub fn shm_memfd_raw(&self) -> i32 {
         self.shm.memfd_raw()
+    }
+
+    /// Give the backend somewhere to place device memory.
+    ///
+    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
+    /// the mapping is real -- but the `mmap` that follows is refused, because
+    /// there is no address in the guest that names it.
+    pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
+        self.window = Some(placer);
     }
 
     /// How many host descriptors the guest currently holds open.
@@ -421,16 +445,43 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT);
         };
 
-        // The window is not placed in guest physical address space yet, so
-        // there is no address to hand back. Refusing here is the honest answer:
-        // a zero would be taken as a valid address and mapped.
-        log::warn!(
-            "mmap: mapping at {:#x}+{:#x} exists, but no shared window is exposed to \
-             the guest yet, so it cannot be addressed",
-            entry.region.offset,
-            entry.region.length
+        // What goes back is the offset within the window, not a guest physical
+        // address. The backend does not know where the window sits -- the bus
+        // assigns that, and this crate names no VMM -- but the guest driver
+        // does, because it reads the window's address out of its own device.
+        // It adds the two.
+        let (offset, length) = (entry.region.offset, entry.region.length);
+        // A mapping is rarely a whole number of pages -- the usermode aperture
+        // is 0xc70 bytes -- and mmap always covers whole pages, so the guest
+        // asking for more than the mapping holds is the normal case and not an
+        // overrun. What must not happen is a request past the page the mapping
+        // ends in.
+        let page = 4096u64;
+        let mapped_pages = length.div_ceil(page) * page;
+        if req.size > mapped_pages {
+            log::warn!(
+                "mmap: guest asked for {:#x} bytes of a {length:#x}-byte mapping at {offset:#x}",
+                req.size
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
+
+        let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
+        if resp_buf.len() < need {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+        }
+        let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
+        off += write_struct(
+            &mut resp_buf[off..],
+            &MmapResp {
+                guest_phys_addr: offset,
+                size: mapped_pages,
+                mapping_id: 0,
+                padding: 0,
+            },
         );
-        self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP)
+        log::debug!("mmap: window offset {offset:#x}+{length:#x}");
+        off
     }
 
     fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
@@ -1376,9 +1427,21 @@ impl NvidiaBackend {
             }
         };
 
-        // --- Step 6: mmap the host fd into the SHM region ---
-        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd) {
-            log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
+        // --- Step 6: place the device fd in the window ---
+        //
+        // Placed by the transport, not here: see `WindowPlacer`. Without one
+        // the mapping exists on the host and is unreachable from the guest, so
+        // the honest answer is to fail the call rather than return an address
+        // that names nothing.
+        let Some(window) = self.window.as_ref() else {
+            log::warn!(
+                "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
+                 addressed by the guest"
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
+        };
+        if let Err(e) = window.place(region.offset, length, host_map_fd, true) {
+            log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 

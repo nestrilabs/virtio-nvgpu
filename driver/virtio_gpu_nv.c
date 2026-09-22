@@ -252,6 +252,9 @@ static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
 
 struct nvgpu_device;
 
+/* The shared memory region device memory is placed in, id 1. */
+#define NVGPU_SHM_ID 1
+
 struct nvgpu_dri_dev {
   char name[32];
   u32 major;
@@ -294,6 +297,12 @@ struct nvgpu_pci_root {
 };
 
 struct nvgpu_device {
+  /*
+   * Where the VMM placed the window, read out of this device's own shared
+   * memory region. Zero-length when the VMM offers none, in which case device
+   * memory can be mapped on the host but never reached from here.
+   */
+  struct virtio_shm_region window;
   struct virtio_device *vdev;
   struct virtqueue *ctrl_vq;
   struct virtqueue *event_vq;
@@ -1248,6 +1257,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   struct nvgpu_fd *nfd = filp->private_data;
   u64 size = vma->vm_end - vma->vm_start;
   u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+  u64 window_off;
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
   int ret;
@@ -1277,9 +1287,34 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
   vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
+  /*
+   * What the backend returns is an offset within the shared window, not a
+   * guest physical address. It cannot return an address: the bus decides
+   * where the window sits, and the backend is a separate process that is
+   * never told. This side knows, because the window is a region of this
+   * device and the address came out of its own PCI configuration.
+   */
+  if (!nfd->dev->window.len) {
+    dev_warn_once(&nfd->dev->vdev->dev,
+                  "virtio-gpu-nv: no shared memory region, so device memory "
+                  "cannot be mapped\n");
+    ret = -ENOTSUPP;
+    goto out;
+  }
+
+  window_off = le64_to_cpu(resp->guest_phys_addr);
+  if (window_off + size > nfd->dev->window.len) {
+    dev_warn(&nfd->dev->vdev->dev,
+             "virtio-gpu-nv: mapping at %llu+%llu runs past the %llu-byte "
+             "window\n",
+             window_off, size, nfd->dev->window.len);
+    ret = -ERANGE;
+    goto out;
+  }
+
   ret = remap_pfn_range(vma, vma->vm_start,
-                        le64_to_cpu(resp->guest_phys_addr) >> PAGE_SHIFT, size,
-                        vma->vm_page_prot);
+                        (nfd->dev->window.addr + window_off) >> PAGE_SHIFT,
+                        size, vma->vm_page_prot);
   if (ret)
     goto out;
 
@@ -2684,6 +2719,21 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   ret = nvgpu_proc_init(dev);
   if (ret)
     goto err_uvm_cdev;
+
+  /*
+   * Where device memory will appear. The VMM publishes it as a virtio shared
+   * memory region on this device, which is the only way this side can learn
+   * an address the bus assigned after the backend was started.
+   */
+  if (virtio_get_shm_region(vdev, &dev->window, NVGPU_SHM_ID)) {
+    dev_info(&vdev->dev, "virtio-gpu-nv: window at %pa, %llu bytes\n",
+             &dev->window.addr, dev->window.len);
+  } else {
+    dev->window.len = 0;
+    dev_warn(&vdev->dev,
+             "virtio-gpu-nv: no shared memory region; device memory will not "
+             "be mappable\n");
+  }
 
   /* Fetch host sysfs content + DRI device list from the VMM */
   ret = nvgpu_fetch_sys_files(dev);
