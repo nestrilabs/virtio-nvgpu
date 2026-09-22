@@ -478,6 +478,125 @@ pub fn resolve(
     (found, missing)
 }
 
+/// The `SONAME` a shared library records for itself, if it has one.
+///
+/// A driver manifest names the real files -- `libnvidia-ml.so.615.71.09` --
+/// and not the `libnvidia-ml.so.1` symlink a caller actually dlopens, because
+/// that link is made by packaging rather than shipped. A share built from the
+/// manifest alone therefore contains every library and resolves none of them,
+/// which surfaces as "couldn't find libnvidia-ml.so" from a tool that is
+/// staring right at it.
+///
+/// The major version cannot be guessed: across one driver it is `.so.1` for
+/// libcuda, `.so.0` for libGLX_nvidia and `.so.4` for libnvidia-nvvm70. So it
+/// is read from the ELF, which is where the loader reads it from too.
+///
+/// Returns `None` for anything that is not an ELF64 little-endian shared
+/// object with a `DT_SONAME`, which includes every non-library in the
+/// manifest. That is not an error: a binary or a JSON file simply has none.
+pub fn soname(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const DT_NULL: i64 = 0;
+    const DT_STRTAB: i64 = 5;
+    const DT_SONAME: i64 = 14;
+
+    let mut f = std::fs::File::open(path).ok()?;
+
+    let mut ehdr = [0u8; 64];
+    f.read_exact(&mut ehdr).ok()?;
+    // Only ELF64 little-endian is in scope; this project is x86_64 host and
+    // guest, and a wrong-width parse would read garbage rather than fail.
+    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 || ehdr[5] != 1 {
+        return None;
+    }
+    // Infallible by construction: every caller below indexes into a buffer it
+    // has already read to an exact, known size.
+    let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32at = |b: &[u8], o: usize| {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    };
+    let u64at = |b: &[u8], o: usize| {
+        u64::from_le_bytes([
+            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        ])
+    };
+
+    let phoff = u64at(&ehdr, 0x20);
+    let phentsize = u16at(&ehdr, 0x36) as usize;
+    let phnum = u16at(&ehdr, 0x38) as usize;
+    if phentsize < 56 || phnum == 0 {
+        return None;
+    }
+
+    let mut phdrs = vec![0u8; phentsize * phnum];
+    f.seek(SeekFrom::Start(phoff)).ok()?;
+    f.read_exact(&mut phdrs).ok()?;
+
+    // DT_STRTAB is a virtual address, so it has to be translated back to a file
+    // offset through the PT_LOAD segments. Skipping this and treating it as an
+    // offset happens to work for some libraries and silently reads the wrong
+    // bytes for others.
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for i in 0..phnum {
+        let p = &phdrs[i * phentsize..][..56];
+        let p_type = u32at(p, 0);
+        let p_offset = u64at(p, 8);
+        let p_vaddr = u64at(p, 16);
+        let p_filesz = u64at(p, 32);
+        match p_type {
+            PT_LOAD => loads.push((p_vaddr, p_offset, p_filesz)),
+            PT_DYNAMIC => dynamic = Some((p_offset, p_filesz)),
+            _ => {}
+        }
+    }
+    let (dyn_off, dyn_size) = dynamic?;
+    let vaddr_to_off = |v: u64| -> Option<u64> {
+        loads
+            .iter()
+            .find(|(va, _, sz)| v >= *va && v < va + sz)
+            .map(|(va, off, _)| off + (v - va))
+    };
+
+    let mut dynbuf = vec![0u8; dyn_size as usize];
+    f.seek(SeekFrom::Start(dyn_off)).ok()?;
+    f.read_exact(&mut dynbuf).ok()?;
+
+    let mut soname_off = None;
+    let mut strtab = None;
+    for e in dynbuf.chunks_exact(16) {
+        let tag = i64::from_le_bytes(e[0..8].try_into().expect("16-byte chunk"));
+        let val = u64::from_le_bytes(e[8..16].try_into().expect("16-byte chunk"));
+        match tag {
+            DT_NULL => break,
+            DT_SONAME => soname_off = Some(val),
+            DT_STRTAB => strtab = Some(val),
+            _ => {}
+        }
+    }
+
+    let strtab_file = vaddr_to_off(strtab?)?;
+    let mut name = Vec::new();
+    f.seek(SeekFrom::Start(strtab_file + soname_off?)).ok()?;
+    // A SONAME is short; read a bounded window and stop at the NUL rather than
+    // trusting a length from the file.
+    let mut window = [0u8; 256];
+    let n = f.read(&mut window).ok()?;
+    for &b in &window[..n] {
+        if b == 0 {
+            break;
+        }
+        name.push(b);
+    }
+    if name.is_empty() {
+        return None;
+    }
+    String::from_utf8(name).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +760,83 @@ mod tests {
         );
     }
 
+    /// A minimal but structurally valid ELF64 shared object carrying one
+    /// SONAME. Built here rather than read from the system so the test says
+    /// the same thing on a machine with no NVIDIA driver, and so the PT_LOAD
+    /// below can give vaddr and file offset *different* values -- treating
+    /// DT_STRTAB as a file offset works by accident when they coincide, which
+    /// is exactly the bug this guards.
+    fn synthetic_so(soname: &str) -> Vec<u8> {
+        const VADDR_BASE: u64 = 0x1000;
+        let ehdr_len = 64usize;
+        let phdr_len = 56usize;
+        let dyn_off = (ehdr_len + phdr_len * 2) as u64;
+        let dyn_len = 48u64; // three 16-byte entries
+        let strtab_off = dyn_off + dyn_len;
+        // index 0 is the customary empty string
+        let strtab = {
+            let mut v = vec![0u8];
+            v.extend_from_slice(soname.as_bytes());
+            v.push(0);
+            v
+        };
+
+        let mut f = vec![0u8; (strtab_off as usize) + strtab.len()];
+        f[0..4].copy_from_slice(b"\x7fELF");
+        f[4] = 2; // ELF64
+        f[5] = 1; // little endian
+        f[6] = 1; // version
+        f[0x20..0x28].copy_from_slice(&(ehdr_len as u64).to_le_bytes()); // e_phoff
+        f[0x36..0x38].copy_from_slice(&(phdr_len as u16).to_le_bytes()); // e_phentsize
+        f[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+
+        let total = f.len() as u64;
+        // PT_LOAD covering the whole file, mapped at VADDR_BASE.
+        let p0 = ehdr_len;
+        f[p0..p0 + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        f[p0 + 8..p0 + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+        f[p0 + 16..p0 + 24].copy_from_slice(&VADDR_BASE.to_le_bytes()); // p_vaddr
+        f[p0 + 32..p0 + 40].copy_from_slice(&total.to_le_bytes()); // p_filesz
+
+        // PT_DYNAMIC
+        let p1 = ehdr_len + phdr_len;
+        f[p1..p1 + 4].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        f[p1 + 8..p1 + 16].copy_from_slice(&dyn_off.to_le_bytes());
+        f[p1 + 32..p1 + 40].copy_from_slice(&dyn_len.to_le_bytes());
+
+        let mut put = |i: usize, tag: i64, val: u64| {
+            let o = dyn_off as usize + i * 16;
+            f[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            f[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        };
+        put(0, 14, 1); // DT_SONAME -> strtab index 1
+        put(1, 5, VADDR_BASE + strtab_off); // DT_STRTAB, as a vaddr
+        put(2, 0, 0); // DT_NULL
+
+        f[strtab_off as usize..].copy_from_slice(&strtab);
+        f
+    }
+
+    #[test]
+    fn soname_is_read_from_the_elf_not_guessed_from_the_filename() {
+        let dir = TempTree::new(&[]);
+        let path = dir.path().join("libnvidia-nvvm70.so.615.71.09");
+        std::fs::create_dir_all(dir.path()).expect("mkdir");
+        std::fs::write(&path, synthetic_so("libnvidia-nvvm70.so.4")).expect("write");
+
+        // The filename says 615.71.09 and the SONAME says 4. Any scheme that
+        // derives the link from the filename gets this wrong, and the loader
+        // then fails to find a library that is present.
+        assert_eq!(soname(&path).as_deref(), Some("libnvidia-nvvm70.so.4"));
+    }
+
+    #[test]
+    fn a_file_with_no_soname_is_not_an_error() {
+        let dir = TempTree::new(&["notelf"]);
+        assert_eq!(soname(&dir.path().join("notelf")), None);
+        assert_eq!(soname(Path::new("/nonexistent/at/all")), None);
+    }
+
     #[test]
     fn a_manifest_that_is_not_an_array_is_rejected() {
         assert!(parse_manifest("{}").is_err());
@@ -658,6 +854,7 @@ mod tests {
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("mkdir base");
             for f in files {
                 let p = base.join(f);
                 std::fs::create_dir_all(p.parent().expect("a parent")).expect("mkdir");

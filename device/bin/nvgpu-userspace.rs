@@ -168,8 +168,36 @@ fn main() -> Result<()> {
         }
     }
 
+    // The manifest names real files; the soname links a caller dlopens are made
+    // by packaging and are not in it. Without them the share holds every
+    // library and resolves none, which a guest reports as the library being
+    // absent while it is sitting in the mount.
+    //
+    // These are relative links on purpose: an absolute one would point at a
+    // host path the guest cannot follow.
+    let mut linked = 0usize;
+    for r in &found {
+        let staged = root.join(&r.guest_path);
+        let Some(soname) = device::userspace::soname(&staged) else {
+            continue;
+        };
+        let Some(real) = r.guest_path.file_name() else {
+            continue;
+        };
+        if soname.as_str() == real {
+            continue;
+        }
+        let link = staged.with_file_name(&soname);
+        if link.exists() {
+            continue;
+        }
+        std::os::unix::fs::symlink(real, &link)
+            .with_context(|| format!("linking {} -> {:?}", link.display(), real))?;
+        linked += 1;
+    }
+
     println!(
-        "\nStaged {} files at {} ({hard} hard linked, {copied} copied).",
+        "\nStaged {} files at {} ({hard} hard linked, {copied} copied, {linked} soname links).",
         found.len(),
         root.display()
     );
