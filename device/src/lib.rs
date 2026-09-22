@@ -12,4 +12,5 @@ pub mod mmap;
 pub mod nvidia;
 pub mod replay;
 pub mod shm;
+pub mod userspace;
 pub mod virtio;

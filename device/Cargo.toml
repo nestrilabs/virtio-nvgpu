@@ -49,6 +49,10 @@ path = "bin/vhost-user-nvgpu.rs"
 required-features = ["vhost-user"]
 
 [[bin]]
+name = "nvgpu-userspace"
+path = "bin/nvgpu-userspace.rs"
+
+[[bin]]
 name = "test-harness"
 path = "bin/test-harness.rs"
 
