@@ -17,6 +17,12 @@ const MAX_GPU: u8 = 8;
 ///
 /// `status` is the one that matters and the one that is easy to miss: it is
 /// written by RM on the way out and is independent of the ioctl return value.
+/// The floor a second-level buffer is sized to, whatever length the guest
+/// derived for it. See where it is used: the length is read at a table-supplied
+/// offset, the table was generated from a different driver release, and the
+/// cost of it being wrong must not be heap corruption in this process.
+const DEEP_BUF_FLOOR: usize = 64 * 1024;
+
 const NVOS54_CMD: usize = 8;
 const NVOS54_PARAMS_SIZE: usize = 24;
 const NVOS54_STATUS: usize = 28;
@@ -257,6 +263,8 @@ pub struct NvidiaBackend {
     /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
     /// This gives us a unique, unambiguous lookup key without leaking host VAs.
     active_maps: crate::mmap::MmapContext,
+    /// Which device each open handle names, for mappings made without one.
+    handle_kinds: std::collections::HashMap<u64, DeviceKind>,
     /// Host driver version, learned from the first successful
     /// `NV_ESC_CHECK_VERSION_STR`.
     driver: Option<abi::version::DriverVersion>,
@@ -293,6 +301,7 @@ impl NvidiaBackend {
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
+            handle_kinds: std::collections::HashMap::new(),
             driver: None,
             abi: None,
         }
@@ -448,6 +457,11 @@ impl NvidiaBackend {
         }
 
         let guest_handle = self.handles.insert(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        // Kept because caching depends on which device a mapping came from, and
+        // by the time an mmap arrives only the handle is in hand.
+        if let Some(kind) = DeviceKind::from_device_type(req.device_type) {
+            self.handle_kinds.insert(guest_handle, kind);
+        }
         log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
 
         // The handle is returned in the header. The driver reads it from there
@@ -471,14 +485,24 @@ impl NvidiaBackend {
         }
         let req = read_struct::<MmapReq>(payload, 0);
 
-        let Some(entry) = self.active_maps.find_by_fd_handle(self.current_handle as u64) else {
-            log::warn!(
-                "mmap: no mapping on handle {} (offset {:#x}, size {:#x})",
-                self.current_handle,
-                req.offset,
-                req.size
-            );
-            return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT);
+        let entry = match self.active_maps.find_by_fd_handle(self.current_handle as u64) {
+            Some(e) => e,
+            None => {
+                // Bookkeeping here records what RM_MAP_MEMORY armed, and that
+                // is not the only ioctl that arms a mapping: NV_ESC_RM_ALLOC_MEMORY
+                // names a file in the same way and arms it too, which is what
+                // the descriptor at the end of its parameters is for. Measured
+                // against a host run, the second 4 KiB mapping of the control
+                // device is armed that way, and refusing it here is the guest
+                // seeing a failed mmap where the host sees a mapping.
+                //
+                // Which ioctl armed it is the driver's business, not ours. The
+                // file either has a mapping waiting on it, in which case
+                // mapping it into the window succeeds, or it has not, in which
+                // case the kernel says so -- and that answer is better than our
+                // records, because the driver is the one keeping them.
+                return self.map_unrecorded(req.size, resp_buf);
+            }
         };
 
         // What goes back is the offset within the window, not a guest physical
@@ -517,6 +541,84 @@ impl NvidiaBackend {
             },
         );
         log::debug!("mmap: window offset {offset:#x}+{length:#x}");
+        off
+    }
+
+    /// Serve an mmap on a file this backend has no record of arming.
+    ///
+    /// The window placement and the reply are the same as the recorded path;
+    /// only the source of the length differs — the guest's request, since there
+    /// is no stored region to take it from.
+    fn map_unrecorded(&mut self, size: u64, resp_buf: &mut [u8]) -> usize {
+        let handle = self.current_handle as u64;
+        let host_fd = match self.handles.get_raw(handle) {
+            Ok(fd) => fd,
+            Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT),
+        };
+
+        // Caching follows the device, which is the same rule the recorded path
+        // reaches through the flags RM returns: the control device carries
+        // system memory, and a GPU device carries the card's own.
+        let pgprot = match self.handle_kinds.get(&handle) {
+            Some(DeviceKind::Gpu(_)) => crate::shm::PgprotKind::WriteCombine,
+            _ => crate::shm::PgprotKind::WriteBack,
+        };
+
+        let length = size.max(4096);
+        let region = match self.shm.alloc(length, pgprot) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("mmap on handle {handle}: window has no room: {e}");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
+            }
+        };
+
+        let Some(window) = self.window.as_ref() else {
+            log::warn!("mmap on handle {handle}: no shared window to place it in");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
+        };
+        if let Err(e) = window.place(region.offset, length, host_fd, true) {
+            log::warn!(
+                "mmap on handle {handle}: nothing armed on this file, or it could \
+                 not be placed: {e}"
+            );
+            self.shm.free(&region);
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
+
+        log::info!(
+            "mmap on handle {handle}: placed {length:#x} bytes at window offset {:#x} \
+             with no arming recorded here",
+            region.offset
+        );
+
+        let offset = region.offset;
+        self.active_maps.insert(
+            offset,
+            crate::mmap::MmapEntry {
+                host_p_linear_address: 0,
+                shm_length: length,
+                h_client: 0,
+                h_memory: 0,
+                map_fd_handle: handle,
+                region,
+            },
+        );
+
+        let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
+        if resp_buf.len() < need {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+        }
+        let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
+        off += write_struct(
+            &mut resp_buf[off..],
+            &MmapResp {
+                guest_phys_addr: offset,
+                size: length.div_ceil(4096) * 4096,
+                mapping_id: 0,
+                padding: 0,
+            },
+        );
         off
     }
 
@@ -976,6 +1078,17 @@ impl NvidiaBackend {
         let mut outer = param_in[..outer_size].to_vec();
         let nested_in = &param_in[outer_size..];
 
+        // What the caller had in the pointer field, to put back before the
+        // reply goes out. This used to be zeroed instead, on the reasoning that
+        // a host address must not leak -- which is right -- but zero is not the
+        // caller's value either. The host driver leaves the field alone, so a
+        // caller there reads back the pointer it passed; through here it read
+        // back null, and anything that dereferences what it gets back finds
+        // nothing there.
+        let caller_ptr: [u8; 8] = param_in[ptr_offset..ptr_offset + 8]
+            .try_into()
+            .expect("outer_size covers the pointer field");
+
         let escape = (request & 0xFF) as u32;
 
         // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
@@ -996,8 +1109,18 @@ impl NvidiaBackend {
         if !nested_in.is_empty() {
             // Guest sent nested params — allocate host buffer, point struct at it
             let nested_size = nested_in.len();
-            let mut host_buf = vec![0u8; nested_size];
-            host_buf.copy_from_slice(nested_in);
+            // Guarded rather than heap-allocated: the driver writes its answer
+            // here, and if it writes more than the caller's size field claimed,
+            // the fault should land on that write rather than on someone else's
+            // allocation later.
+            let mut host_guard = match crate::guarded::GuardedBuf::new(nested_size) {
+                Some(b) => b,
+                None => {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM)
+                }
+            };
+            host_guard.as_mut_slice().copy_from_slice(nested_in);
+            let host_buf = host_guard.as_mut_slice();
 
             // ---------------------------------------------------------------
             // Translate guest_handle → host fd for fd-carrying RM_CONTROLs
@@ -1095,7 +1218,29 @@ impl NvidiaBackend {
                         libc::EINVAL,
                     );
                 }
+                // The buffer is padded well past what the guest said it holds.
+                //
+                // The length comes from a field inside the caller's own
+                // parameters, read with an offset out of a table generated from
+                // one driver release. When that offset is wrong for the release
+                // in use -- which it demonstrably is for some commands -- the
+                // length read is not the buffer's length, while the driver
+                // still writes as much as the command really produces. Writing
+                // past a Vec sized to the wrong number corrupts this process's
+                // heap, and it is detected later, at some unrelated free, as
+                // "corrupted size vs. prev_size": a crash that points nowhere
+                // near the call that caused it.
+                //
+                // Only the bytes the guest asked for are sent back, so the pad
+                // costs a page and changes nothing the guest sees.
                 deep_buf = bytes.to_vec();
+                deep_buf.resize(bytes.len().max(DEEP_BUF_FLOOR), 0);
+                let _ = DEEP_BUF_FLOOR;
+                log::debug!(
+                    "deep pointer at {ptr_off}: guest says {} bytes, buffer {} bytes",
+                    bytes.len(),
+                    deep_buf.len()
+                );
                 let mut guest_ptr = [0u8; 8];
                 guest_ptr.copy_from_slice(&host_buf[ptr_off..ptr_off + 8]);
                 deep_saved = Some((ptr_off, guest_ptr));
@@ -1165,18 +1310,20 @@ impl NvidiaBackend {
                 host_buf[offset..offset + 4].copy_from_slice(&handle_val.to_le_bytes());
             }
 
-            // Zero pointer before sending back to guest
-            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+            // The caller's own pointer value goes back, not ours and not zero.
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
 
             // Build response: outer + updated nested params + what the
             // pointer inside them addresses.
             if let Some((ptr_off, guest_ptr)) = deep_saved {
                 host_buf[ptr_off..ptr_off + 8].copy_from_slice(&guest_ptr);
             }
+            // Only what the guest allocated room for goes back, not the pad.
+            let deep_reply = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
             let mut combined = outer;
             combined.extend_from_slice(&host_buf);
-            combined.extend_from_slice(&deep_buf);
-            self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_buf.len())
+            combined.extend_from_slice(&deep_buf[..deep_reply]);
+            self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
         } else {
             // No nested params — straightforward passthrough
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
@@ -1204,8 +1351,9 @@ impl NvidiaBackend {
                 );
             }
 
-            // Zero pointer field in case host wrote something there
-            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+            // Same here: restore what the caller passed, in case the host
+            // driver wrote to the field.
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
             self.write_ioctl_resp(resp_buf, cookie, &outer)
         }
     }
@@ -1710,8 +1858,12 @@ impl NvidiaBackend {
         let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
         let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
 
+        // The handle is the key the mmap that follows will be found by, so it
+        // is the one field worth naming in the log: a mapping that is armed
+        // against one file and consumed on another is the whole failure mode.
         log::info!(
-            "MAP_MEMORY: saving (shm_off={:#x}) → host_va={:#x} client={:#x} mem={:#x}",
+            "MAP_MEMORY: armed on handle {} (shm_off={:#x}) → host_va={:#x} client={:#x} mem={:#x}",
+            guest_fd_handle,
             region.offset,
             host_p_linear,
             h_client,

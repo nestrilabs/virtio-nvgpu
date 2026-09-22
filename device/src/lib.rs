@@ -7,6 +7,7 @@
 // received from the guest driver over virtqueues.
 
 pub mod error;
+pub mod guarded;
 pub mod handle_table;
 pub mod host;
 pub mod mmap;
