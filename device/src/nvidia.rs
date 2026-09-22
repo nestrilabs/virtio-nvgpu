@@ -13,6 +13,18 @@ use crate::shm::{ShmAllocator, ZoneConfig};
 
 const MAX_GPU: u8 = 8;
 
+/// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
+///
+/// `status` is the one that matters and the one that is easy to miss: it is
+/// written by RM on the way out and is independent of the ioctl return value.
+const NVOS54_CMD: usize = 8;
+const NVOS54_PARAMS_SIZE: usize = 24;
+const NVOS54_STATUS: usize = 28;
+const NVOS54_TOTAL: usize = 32;
+
+/// `NV_OK`. Every other value is a refusal of some kind.
+const NV_OK: u32 = 0;
+
 /// The host path an `Open` refers to.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
@@ -20,6 +32,15 @@ const MAX_GPU: u8 = 8;
 /// decoded a `{kind, index}` pair that the driver never sent, so every open of
 /// the control device arrived as kind 255 and was refused.
 fn device_path(device_type: u32) -> Result<CString> {
+    device_path_with(device_type, &[])
+}
+
+/// As [`device_path`], but able to resolve a render node.
+///
+/// A render node's name is not derivable from its index: the host numbers them
+/// per DRM device, so the guest's index has to be looked up in the same list
+/// the guest was given.
+fn device_path_with(device_type: u32, dri: &[DriDevice]) -> Result<CString> {
     let kind = DeviceKind::from_device_type(device_type)
         .ok_or(DeviceError::InvalidDeviceKind(device_type))?;
     let path = match kind {
@@ -33,6 +54,12 @@ fn device_path(device_type: u32) -> Result<CString> {
         DeviceKind::Uvm => "/dev/nvidia-uvm".to_string(),
         DeviceKind::UvmTools => "/dev/nvidia-uvm-tools".to_string(),
         DeviceKind::Modeset => "/dev/nvidia-modeset".to_string(),
+        DeviceKind::Dri(n) => {
+            let d = dri
+                .get(n as usize)
+                .ok_or(DeviceError::InvalidDeviceKind(device_type))?;
+            format!("/dev/dri/{}", d.name)
+        }
     };
     Ok(CString::new(path).expect("a device path has no interior NUL"))
 }
@@ -65,6 +92,15 @@ impl Status {
             Self::BufferTooSmall => libc::ENOSPC,
         }
     }
+}
+
+/// A DRM render node the host owns, as the guest is told about it.
+struct DriDevice {
+    name: String,
+    major: u32,
+    minor: u32,
+    /// Which GPU slot it belongs to.
+    gpu_id: u32,
 }
 
 /// Which host tree a `GetProcFiles`/`GetSysFiles` request refers to.
@@ -395,7 +431,7 @@ impl NvidiaBackend {
         }
         let req = read_struct::<OpenReq>(payload, 0);
 
-        let path = match device_path(req.device_type) {
+        let path = match device_path_with(req.device_type, &self.dri_devices()) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("handle_open: {}", e);
@@ -551,11 +587,115 @@ impl NvidiaBackend {
         //
         // Headless forwarding hands out no render node, so the count is zero
         // and it still has to be written.
-        if tree == FileTree::Sys && off + size_of::<u32>() <= resp_buf.len() {
-            resp_buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-            off += 4;
+        if tree == FileTree::Sys {
+            off += self.write_dri_section(&mut resp_buf[off..]);
         }
         off
+    }
+
+    /// The DRI section of a `GetSysFiles` response.
+    ///
+    /// A count, then one `{name_len, major, minor, gpu_id}` record and name per
+    /// device. The guest uses these to register render nodes at the host's own
+    /// major and minor and to build the sysfs tree beneath them.
+    ///
+    /// This is not decoration for a headless guest. NVIDIA's Vulkan and EGL
+    /// userspace enumerates the GPU through the DRM render node and not through
+    /// `/dev/nvidia*`, which carry compute: the ICD stats the node, takes its
+    /// major, and requires `/sys/dev/char/<major>:<minor>/device/drm` to exist
+    /// before it will open it. Reporting none is why `vulkaninfo` found a
+    /// driver it could load and then declined to create an instance, with no
+    /// ioctl refused and nothing logged anywhere.
+    fn write_dri_section(&self, buf: &mut [u8]) -> usize {
+        let devices = self.dri_devices();
+        log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
+
+        if buf.len() < 4 {
+            return 0;
+        }
+        let mut off = 0;
+        buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
+        off += 4;
+
+        for d in &devices {
+            let need = 16 + d.name.len();
+            if off + need > buf.len() {
+                log::warn!("DRI section truncated at {}", d.name);
+                break;
+            }
+            for v in [d.name.len() as u32, d.major, d.minor, d.gpu_id] {
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                off += 4;
+            }
+            buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
+            off += d.name.len();
+        }
+        off
+    }
+
+    /// The render nodes the host's GPUs own.
+    ///
+    /// Taken from `/sys/bus/pci/devices/<addr>/drm`, which is the kernel's own
+    /// statement of which DRI nodes belong to which card -- rather than from
+    /// the numbering of `/dev/dri`, where a node's index says nothing about
+    /// which device it is.
+    ///
+    /// Only render nodes are offered. A card node is a display device and this
+    /// device forwards compute and render; handing one out would be a
+    /// different kind of access than the guest asked for.
+    fn dri_devices(&self) -> Vec<DriDevice> {
+        let mut out = Vec::new();
+        for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
+            .iter()
+            .enumerate()
+        {
+            let end = slot
+                .pci_addr
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(slot.pci_addr.len());
+            let addr = String::from_utf8_lossy(&slot.pci_addr[..end]).into_owned();
+            let dir = format!("/sys/bus/pci/devices/{addr}/drm");
+
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                log::warn!("no DRI nodes under {dir}");
+                continue;
+            };
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("renderD"))
+                .collect();
+            names.sort();
+
+            for name in names {
+                // The kernel prints "major:minor" here. A node listed under the
+                // PCI device with no `dev` file is not one we can reproduce.
+                let Ok(text) = std::fs::read_to_string(format!("/sys/class/drm/{name}/dev")) else {
+                    log::warn!("DRI node {name} has no dev file");
+                    continue;
+                };
+                let text = text.trim();
+                let Some((maj, min)) = text.split_once(':') else {
+                    log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
+                    continue;
+                };
+                let (Ok(major), Ok(minor)) = (maj.parse::<u32>(), min.parse::<u32>()) else {
+                    log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
+                    continue;
+                };
+                log::info!("DRI {name} at {major}:{minor} on {addr} (gpu {index})");
+                out.push(DriDevice {
+                    name,
+                    major,
+                    minor,
+                    // The guest matches this against the GPU's minor, which is
+                    // the index the slots were built in.
+                    gpu_id: index as u32,
+                });
+            }
+        }
+        out
     }
 
     // ------------------------------------------------------------------
@@ -917,16 +1057,43 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            // Log RM status
-            if escape == 0x2a && param_in.len() >= 32 {
-                let cmd = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
-                let params_size = u32::from_le_bytes(param_in[24..28].try_into().unwrap());
-                log::info!(
-                    "RM_CONTROL ENTER: cmd=0x{:08x} paramsSize={} (nested_bytes={})",
-                    cmd,
-                    params_size,
-                    param_in.len() - 32
+            // RM reports two different things in two different places, and only
+            // one of them is the ioctl return value. A control call routinely
+            // comes back rc=0 with a failure in the NVOS54 status word, and the
+            // caller believes the status, not the rc. Counting non-zero rc told
+            // us every call succeeded while the ICD was reading refusals.
+            if escape == 0x2a && outer.len() >= NVOS54_TOTAL {
+                let cmd = u32::from_le_bytes(outer[NVOS54_CMD..NVOS54_CMD + 4].try_into().unwrap());
+                let params_size = u32::from_le_bytes(
+                    outer[NVOS54_PARAMS_SIZE..NVOS54_PARAMS_SIZE + 4]
+                        .try_into()
+                        .unwrap(),
                 );
+                let status = u32::from_le_bytes(
+                    outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap(),
+                );
+                if status == NV_OK {
+                    log::info!(
+                        "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",
+                        cmd,
+                        params_size
+                    );
+                } else {
+                    // A refusal tells us nothing on its own; the argument RM
+                    // objected to is in the params. Show the head of them.
+                    let head: Vec<String> = host_buf
+                        .iter()
+                        .take(64)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    log::warn!(
+                        "RM_CONTROL cmd=0x{:08x} paramsSize={} -> status=0x{:08x}\n  params[0..64]: {}",
+                        cmd,
+                        params_size,
+                        status,
+                        head.join(" ")
+                    );
+                }
             }
             if escape == 0x2b && param_in.len() >= 48 {
                 let hclass = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
@@ -1824,6 +1991,7 @@ mod tests {
             DeviceKind::Uvm => DEV_UVM,
             DeviceKind::UvmTools => DEV_UVM_TOOLS,
             DeviceKind::Modeset => DEV_MODESET,
+            DeviceKind::Dri(n) => DEV_DRI_BASE + n,
         }
     }
 

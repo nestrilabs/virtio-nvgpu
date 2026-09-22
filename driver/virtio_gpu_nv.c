@@ -32,6 +32,11 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
 
+#include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
+#include <drm/drm_ioctl.h>
+
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
@@ -261,6 +266,8 @@ struct nvgpu_dri_dev {
   u32 minor;
   u32 gpu_id;
   struct cdev cdev;
+  /* The registered DRM device, which owns the node and its sysfs tree. */
+  struct drm_device *drm;
   bool registered;
   u32 index;
   struct nvgpu_device *dev;
@@ -278,7 +285,18 @@ struct nvgpu_numa_attr {
 /* ── Fake PCI device state ── */
 struct nvgpu_pci_slot {
   char pci_addr[16]; /* "0000:08:00.0"      */
-  u8 config[256];    /* raw config space    */
+  /*
+   * Raw config space, the full extended 4 KiB of it and not the first 256
+   * bytes.
+   *
+   * PCIe puts the extended capabilities above 256, and NVIDIA's userspace
+   * reads them: with a 256-byte window nvidia-smi reports the PCIe link width
+   * as an error while every neighbouring field is right, because the
+   * capability it comes from is past the end of what this serves. The host
+   * sends all 4096 bytes; there is no reason to keep only the first
+   * sixteenth.
+   */
+  u8 config[4096];   /* raw config space    */
   bool config_valid;
   u16 domain;
   u8 bus_nr;
@@ -778,6 +796,29 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
 
     kfree(v1_buf);
+
+    /*
+     * A GET_INFO list is not an output buffer. Each entry arrives with the
+     * index the caller wants filled in, and RM answers by writing `data`
+     * beside it. Copying only the result back left the list we sent full of
+     * zeros, so every request read as "index 0", and RM refused the call with
+     * NV_ERR_INVALID_ARGUMENT rather than answering a question nobody asked.
+     *
+     * The caps-style commands are genuinely output-only, so they keep the
+     * zeroed buffer.
+     */
+    if (rw->info_style && saved_user_data_size > 0 &&
+        rw->v2_data_offset < nested_size) {
+      u32 room = nested_size - rw->v2_data_offset;
+      u32 copy_in = min_t(u32, saved_user_data_size, room);
+
+      if (copy_from_user(req_buf + sizeof(struct nvgpu_ioctl_req) +
+                             sizeof(params) + rw->v2_data_offset,
+                         (const void __user *)saved_user_ptr, copy_in)) {
+        ret = -EFAULT;
+        goto out;
+      }
+    }
 
     /* Patch outer: replace cmd with V2, update paramsSize */
     params.cmd = cpu_to_le32(rw->v2_cmd);
@@ -1869,6 +1910,109 @@ static const struct file_operations nvgpu_dri_fops = {
     .mmap = nvgpu_mmap,
 };
 
+/*
+ * The DRM side of a render node.
+ *
+ * The guest's node exists so NVIDIA's Vulkan and EGL userspace can find the
+ * GPU the way it insists on finding it. Only the pieces that enumeration
+ * touches are here: the core answers DRM_IOCTL_VERSION out of the fields
+ * below, and the driver-private range is forwarded like any other ioctl.
+ *
+ * `name` is what the ICD compares against, so it is the host driver's name and
+ * not this module's.
+ */
+static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
+  struct nvgpu_dri_dev *dri = drm->dev_private;
+  struct nvgpu_device *dev;
+  struct nvgpu_fd *nfd = NULL;
+  struct nvgpu_open_req *req = NULL;
+  struct nvgpu_open_resp *resp = NULL;
+  int ret;
+
+  if (!dri || !dri->dev)
+    return -ENODEV;
+  dev = dri->dev;
+
+  nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
+  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+  if (!nfd || !req || !resp) {
+    ret = -ENOMEM;
+    goto err;
+  }
+
+  nfd->dev = dev;
+  nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
+
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
+  req->device_type = cpu_to_le32(nfd->device_type);
+  req->flags = cpu_to_le32(O_RDWR);
+
+  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp, sizeof(*resp));
+  if (ret < 0)
+    goto err;
+
+  if ((s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
+    ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+    goto err;
+  }
+
+  nfd->handle = le32_to_cpu(resp->hdr.handle);
+  file->driver_priv = nfd;
+  kfree(req);
+  kfree(resp);
+  return 0;
+
+err:
+  kfree(nfd);
+  kfree(req);
+  kfree(resp);
+  return ret;
+}
+
+static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
+  struct nvgpu_fd *nfd = file->driver_priv;
+  struct nvgpu_msg_hdr *req, *resp;
+
+  if (!nfd)
+    return;
+
+  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+  if (req && resp) {
+    req->msg_type = cpu_to_le32(NVGPU_MSG_CLOSE);
+    req->handle = cpu_to_le32(nfd->handle);
+    nvgpu_send_recv(nfd->dev, req, sizeof(*req), resp, sizeof(*resp));
+  }
+  kfree(req);
+  kfree(resp);
+  kfree(nfd);
+  file->driver_priv = NULL;
+}
+
+static const struct file_operations nvgpu_drm_fops = {
+    .owner = THIS_MODULE,
+    .open = drm_open,
+    .release = drm_release,
+    .unlocked_ioctl = drm_ioctl,
+    .compat_ioctl = drm_compat_ioctl,
+    .poll = drm_poll,
+    .read = drm_read,
+    .llseek = noop_llseek,
+};
+
+static const struct drm_driver nvgpu_drm_driver = {
+    .driver_features = DRIVER_RENDER,
+    .open = nvgpu_drm_open,
+    .postclose = nvgpu_drm_postclose,
+    .fops = &nvgpu_drm_fops,
+    .name = "nvidia-drm",
+    .desc = "NVIDIA DRM driver",
+    .major = 0,
+    .minor = 0,
+    .patchlevel = 0,
+};
+
 static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
   if (mode)
     *mode = 0666;
@@ -1903,7 +2047,6 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
 
   for (i = 0; i < dev->num_dri_devs; i++) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
-    dev_t devno = MKDEV(dri->major, dri->minor);
 
     /*
      * Find the pci_dev that owns this DRI device so we can:
@@ -1918,6 +2061,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
      */
     struct device *pci_parent = &dev->vdev->dev; /* fallback */
     struct kobject *pci_kobj = NULL;
+    struct drm_device *drm;
     int gi;
 
     for (gi = 0; gi < dev->num_pci_roots; gi++) {
@@ -1942,83 +2086,58 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     }
 
     /*
-     * Create /sys/devices/pci.../0000:08:00.0/drm/<name> so the Vulkan ICD
-     * can traverse: /sys/dev/char/226:N/device/drm/<name>
+     * No sysfs is built by hand here any more.
      *
-     * We create a "drm" kobject under the PCI device's kobject (if we found
-     * the pdev), then a child kobject named after the DRI node (renderD128,
-     * card1, etc.).  These are bare kobjects — no attributes needed; just the
-     * directory entries are enough for stat() calls from Vulkan.
+     * This used to create a `drm` kobject under the PCI device and a child
+     * named after the node, because a character device gets no such tree and
+     * the Vulkan ICD insists on walking one. Registering a real DRM device
+     * makes the same tree properly -- and makes the hand-made one fatal: the
+     * core tries to create `drm` under the same PCI device, finds the name
+     * taken, and drm_dev_register() fails with -EEXIST.
      */
-    if (pci_kobj) {
-      /* "drm" dir — reuse if multiple DRI nodes share the same GPU */
-      struct kobject *drm_parent = NULL;
-      int j;
-
-      for (j = 0; j < i; j++) {
-        if (dev->dri_devs[j].drm_kobj &&
-            dev->dri_devs[j].drm_kobj->parent == pci_kobj) {
-          drm_parent = dev->dri_devs[j].drm_kobj;
-          break;
-        }
-      }
-
-      if (!drm_parent) {
-        drm_parent = kobject_create_and_add("drm", pci_kobj);
-        if (!drm_parent)
-          dev_warn(&dev->vdev->dev,
-                   "virtio-gpu-nv: failed to create drm kobj for %s\n",
-                   dri->name);
-      }
-
-      dri->drm_kobj = drm_parent;
-
-      if (drm_parent) {
-        dri->drm_node_kobj = kobject_create_and_add(dri->name, drm_parent);
-        if (!dri->drm_node_kobj)
-          dev_warn(&dev->vdev->dev,
-                   "virtio-gpu-nv: failed to create drm/%s kobj\n", dri->name);
-        else
-          dev_info(&dev->vdev->dev,
-                   "virtio-gpu-nv: created sysfs drm/%s under PCI device\n",
-                   dri->name);
-      }
-    }
 
     dri->index = (u32)i;
     dri->dev = dev;
 
-    /* ── Register the cdev at host major:minor ── */
-    if (register_chrdev_region(devno, 1, dri->name) != 0) {
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: cannot reserve %s (%u:%u)\n",
-               dri->name, dri->major, dri->minor);
-      continue;
-    }
-
-    cdev_init(&dri->cdev, &nvgpu_dri_fops);
-    dri->cdev.owner = THIS_MODULE;
-
-    if (cdev_add(&dri->cdev, devno, 1) != 0) {
-      unregister_chrdev_region(devno, 1);
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: cdev_add %s failed\n",
-               dri->name);
-      continue;
-    }
-
     /*
-     * Use the PCI device as the parent.  This causes udev to create:
-     *   /sys/class/nvgpu_dri/<name>/device  → <pci_dev sysfs path>
-     * and the kernel to create:
-     *   /sys/dev/char/M:N                   → ../../class/nvgpu_dri/<name>
+     * Register a real DRM device rather than a character device at the
+     * host's numbers.
      *
-     * The Vulkan ICD then resolves:
-     *   /sys/dev/char/M:N/device/drm/<name> → the kobject we made above.
+     * A raw cdev cannot have them: major 226 belongs to the DRM core, which
+     * claims it whenever CONFIG_DRM is built in, so register_chrdev_region()
+     * on 226:129 fails with the node never appearing. That failure is quiet
+     * -- /sys/bus/pci/.../drm/<name> still gets made, so the tree looks
+     * half-right -- and it is fatal to Vulkan, because NVIDIA's userspace
+     * enumerates the GPU through the render node and not through
+     * /dev/nvidia*, which carry compute. The ICD stats the node, takes its
+     * major, and wants /sys/dev/char/<major>:<minor>/device/drm to exist
+     * before it will open it. With no node it declines to create an instance
+     * and reports only that it found no drivers.
+     *
+     * The DRM core owns the minor it hands out, so the guest's node is not
+     * necessarily the host's number. Nothing requires it to be: the ICD reads
+     * whichever node exists.
      */
-    device_create(nvgpu_dri_class, pci_parent, devno, NULL, "%s", dri->name);
+    drm = drm_dev_alloc(&nvgpu_drm_driver, pci_parent);
+    if (IS_ERR(drm)) {
+      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_alloc %s failed: %ld\n",
+               dri->name, PTR_ERR(drm));
+      continue;
+    }
+    drm->dev_private = dri;
 
+    if (drm_dev_register(drm, 0) != 0) {
+      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_register %s failed\n",
+               dri->name);
+      drm_dev_put(drm);
+      continue;
+    }
+
+    dri->drm = drm;
     dri->registered = true;
     dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: registered /dev/dri/%s (%u:%u) gpu_id=0x%x\n",
+             "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
+             "gpu_id=0x%x\n",
              dri->name, dri->major, dri->minor, dri->gpu_id);
   }
 
@@ -2031,32 +2150,14 @@ static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
   for (i = 0; i < dev->num_dri_devs; i++) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
 
-    /* Tear down sysfs drm kobjects first */
-    if (dri->drm_node_kobj) {
-      kobject_put(dri->drm_node_kobj);
-      dri->drm_node_kobj = NULL;
-    }
-    /* Only put the shared drm_kobj from the first node that created it */
-    if (dri->drm_kobj) {
-      int j;
-      bool is_owner = true;
-      for (j = 0; j < i; j++) {
-        if (dev->dri_devs[j].drm_kobj == dri->drm_kobj) {
-          is_owner = false;
-          break;
-        }
-      }
-      if (is_owner)
-        kobject_put(dri->drm_kobj);
-      dri->drm_kobj = NULL;
-    }
-
     if (!dri->registered)
       continue;
 
-    device_destroy(nvgpu_dri_class, MKDEV(dri->major, dri->minor));
-    cdev_del(&dri->cdev);
-    unregister_chrdev_region(MKDEV(dri->major, dri->minor), 1);
+    /* The core owns the node and everything under it, including the sysfs
+     * tree this used to build by hand. */
+    drm_dev_unregister(dri->drm);
+    drm_dev_put(dri->drm);
+    dri->drm = NULL;
     dri->registered = false;
   }
 
@@ -2080,7 +2181,7 @@ static int nvgpu_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
     return PCIBIOS_DEVICE_NOT_FOUND;
   }
 
-  if (!root->slot.config_valid || where + size > 256) {
+  if (!root->slot.config_valid || where + size > (int)sizeof(root->slot.config)) {
     *val = ~0u;
     return PCIBIOS_BAD_REGISTER_NUMBER;
   }
@@ -2415,6 +2516,16 @@ out:
 
 static struct kobject *nvgpu_module_kobj;     /* /sys/module/nvidia     */
 static struct kobject *nvgpu_uvm_module_kobj; /* /sys/module/nvidia_uvm */
+/*
+ * /sys/module/nvidia_modeset
+ *
+ * This is a gate, not decoration. NVIDIA's userspace reads
+ * /sys/module/nvidia_modeset/initstate before it will go near
+ * /dev/nvidia-modeset, and with the file absent it never opens the device and
+ * never issues an NVKMS call. Nothing fails visibly when that happens: the
+ * Vulkan ICD simply stops short and reports that it found no driver.
+ */
+static struct kobject *nvgpu_modeset_module_kobj;
 
 static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *attr,
                               char *buf) {
@@ -2481,11 +2592,27 @@ static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
     dev_warn(&dev->vdev->dev,
              "virtio-gpu-nv: failed initstate under nvidia_uvm\n");
 
+  nvgpu_modeset_module_kobj =
+      kobject_create_and_add("nvidia_modeset", &mkset->kobj);
+  if (!nvgpu_modeset_module_kobj) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: failed to create nvidia_modeset module kobj\n");
+  } else if (sysfs_create_file(nvgpu_modeset_module_kobj,
+                               &initstate_attr.attr)) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: failed initstate under nvidia_modeset\n");
+  }
+
   dev_info(&dev->vdev->dev,
-           "virtio-gpu-nv: created /sys/module/nvidia{,_uvm}/initstate\n");
+           "virtio-gpu-nv: created /sys/module/nvidia{,_uvm,_modeset}/initstate\n");
 }
 
 static void nvgpu_module_sysfs_cleanup(void) {
+  if (nvgpu_modeset_module_kobj) {
+    sysfs_remove_file(nvgpu_modeset_module_kobj, &initstate_attr.attr);
+    kobject_put(nvgpu_modeset_module_kobj);
+    nvgpu_modeset_module_kobj = NULL;
+  }
   if (nvgpu_uvm_module_kobj) {
     sysfs_remove_file(nvgpu_uvm_module_kobj, &initstate_attr.attr);
     kobject_put(nvgpu_uvm_module_kobj);

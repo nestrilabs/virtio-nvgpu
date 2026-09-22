@@ -148,15 +148,20 @@ pub enum DeviceKind {
     Uvm,
     UvmTools,
     Modeset,
+    /// A DRM render node, by its index in the list the device reported.
+    Dri(u32),
 }
 
 impl DeviceKind {
     /// Decode the `device_type` field of an `OpenReq`.
     ///
-    /// Returns `None` for render nodes and anything unrecognised. A render node
-    /// is deliberately not openable here: this device forwards the compute and
-    /// control path, and handing out `/dev/dri/*` would be a different kind of
-    /// access than the guest asked for.
+    /// Returns `None` for anything unrecognised.
+    ///
+    /// Render nodes are openable, and have to be: NVIDIA's Vulkan and EGL
+    /// userspace enumerates the GPU through the DRM render node rather than
+    /// through `/dev/nvidia*`, which carry compute. Refusing them here is what
+    /// a guest sees as a Vulkan loader that finds a driver, loads it, and is
+    /// then told there are none.
     pub fn from_device_type(v: u32) -> Option<Self> {
         Some(match v {
             0..=MAX_GPU_INDEX => Self::Gpu(v),
@@ -164,10 +169,10 @@ impl DeviceKind {
             DEV_UVM => Self::Uvm,
             DEV_UVM_TOOLS => Self::UvmTools,
             DEV_MODESET => Self::Modeset,
+            _ if v >= DEV_DRI_BASE => Self::Dri(v - DEV_DRI_BASE),
             _ => return None,
         })
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -310,11 +315,19 @@ mod tests {
         assert_eq!(DeviceKind::from_device_type(258), Some(DeviceKind::Modeset));
     }
 
-    /// A render node is a different kind of access and is not served here.
+    /// A render node is how NVIDIA's Vulkan userspace finds the GPU, so it is
+    /// addressable; the gap between the singletons and the render nodes is not.
     #[test]
-    fn render_nodes_and_nonsense_are_refused() {
-        assert_eq!(DeviceKind::from_device_type(DEV_DRI_BASE), None);
-        assert_eq!(DeviceKind::from_device_type(9999), None);
+    fn render_nodes_are_addressable_and_nonsense_is_not() {
+        assert_eq!(
+            DeviceKind::from_device_type(DEV_DRI_BASE),
+            Some(DeviceKind::Dri(0))
+        );
+        assert_eq!(
+            DeviceKind::from_device_type(DEV_DRI_BASE + 3),
+            Some(DeviceKind::Dri(3))
+        );
+        assert_eq!(DeviceKind::from_device_type(300), None);
     }
 
     /// The driver tests `(s32)status < 0`. An unsigned error code stored here
