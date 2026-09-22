@@ -297,3 +297,57 @@ The ioctl hit a Phase 3/4 stub in the backend. Same as above.
 The host NVIDIA driver version does not match the ABI table in
 `gen/src/versions/`. Add support for the installed version
 by following the pattern in `v535_129_03.rs`.
+
+---
+
+## 8. Finding out why a caller gave up
+
+A forwarded ioctl that returns `NV_OK` can still be wrong, and the caller that
+reads the answer does not report what it disliked — it releases its objects and
+exits. Nothing is logged on either side, so the only way through is to run the
+same program twice, once against the host driver and once through the guest,
+and compare what each call was **asked** and what it **answered**.
+
+A backend log is not enough for this. It sees the request the guest sent, not
+the parameter block the command points at, and it cannot see a call the guest
+driver refused before sending — which is exactly the shape of failure that
+leaves no trace anywhere.
+
+### Capture
+
+An `LD_PRELOAD` shim on `ioctl(2)` records, per call: the top-level struct, and
+for `RM_CONTROL` and `RM_ALLOC` the block behind the parameter pointer, read
+**before** the call and again after. The two together separate "the driver
+answered something unexpected" from "nobody asked the question".
+
+Two details the shim must get right, both learned by losing runs to them:
+
+- **Read the parameter block through `write(2)` into a pipe**, not by
+  dereferencing the pointer. Across a forwarding boundary the field can come
+  back null or holding an address from another address space, and a direct read
+  takes the traced program down with SIGSEGV — destroying the run that was
+  supposed to explain it. `process_vm_readv` has the same property but needs
+  `CROSS_MEMORY_ATTACH`, which a guest kernel may not have.
+- **Snapshot before the call.** The driver writes its answer over the request,
+  so afterwards there is no record of what was asked.
+
+Run it against the host driver, then inside the guest with the same binary and
+the same libraries, writing to the root filesystem so the file survives
+shutdown.
+
+### Compare
+
+Walk both traces in lockstep, keying each record on the escape and, for
+`RM_CONTROL`, the command. Report the first index where the keys differ. Before
+that index, compare the parameter blocks: equal inputs with different outputs
+is a wrong answer, and equal everything with a different return value is a call
+one side refused.
+
+Two things this makes cheap that were previously guesswork:
+
+- A theory about what the caller needs can be **disproved in one command**.
+  Counting the device paths a working run touches settles whether a node is on
+  the path at all, and costs a line of Python rather than a day of implementing.
+- The first genuinely different call is named, with both parameter blocks in
+  hand. A run that ends in teardown with no error stops being a mystery and
+  becomes a diff.
