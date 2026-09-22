@@ -198,7 +198,8 @@ pub struct OpenReq {
 
 /// Request payload for `MsgType::Ioctl`, following a `MsgHeader`.
 ///
-/// Layout: `MsgHeader` | `IoctlReq` | `data_len` bytes | `nested_len` bytes.
+/// Layout: `MsgHeader` | `IoctlReq` | `data_len` bytes | `nested_len` bytes |
+/// `deep_len` bytes.
 ///
 /// The nested block is data an ioctl parameter points at. The guest cannot pass
 /// a pointer that means anything on the host, so it sends the pointed-to bytes
@@ -219,16 +220,31 @@ pub struct IoctlReq {
     pub nested_offset: u32,
     /// Bytes of nested data following the top-level struct.
     pub nested_len: u32,
+    /// Where, inside the nested block, a further pointer sits, when the nested
+    /// block carries one. Only meaningful when `deep_len` is non-zero.
+    pub deep_ptr_offset: u32,
+    /// Bytes of a second-level block following the nested block: what the
+    /// pointer at `deep_ptr_offset` points at in the guest.
+    ///
+    /// Some parameter blocks hold a pointer of their own. The guest cannot
+    /// send an address that means anything here, so it sends those bytes too
+    /// and the backend gives them a host address before the call. Zero when
+    /// the nested block carries no pointer.
+    pub deep_len: u32,
 }
 
 /// Response payload for `MsgType::Ioctl`, following a `MsgHeader`.
 ///
-/// Layout: `MsgHeader` | `IoctlResp` | `data_len` bytes | `nested_len` bytes.
+/// Layout: `MsgHeader` | `IoctlResp` | `data_len` bytes | `nested_len` bytes |
+/// `deep_len` bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoctlResp {
     pub data_len: u32,
     pub nested_len: u32,
+    /// Bytes of second-level block following the nested block, for the guest
+    /// to copy back to where its own pointer points.
+    pub deep_len: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,8 +309,8 @@ pub struct FileEntry {
 const _: () = {
     assert!(size_of::<MsgHeader>() == 16);
     assert!(size_of::<OpenReq>() == 8);
-    assert!(size_of::<IoctlReq>() == 16);
-    assert!(size_of::<IoctlResp>() == 8);
+    assert!(size_of::<IoctlReq>() == 24);
+    assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapResp>() == 24);
     assert!(size_of::<MunmapReq>() == 8);

@@ -797,7 +797,8 @@ impl NvidiaBackend {
         // refers to, back to back. The handlers below already expect that
         // layout, so the two lengths only need adding up here.
         let body = &payload[size_of::<IoctlReq>()..];
-        let want = ireq.data_len as usize + ireq.nested_len as usize;
+        let want =
+            ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
         if body.len() < want {
             log::warn!(
                 "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
@@ -806,7 +807,18 @@ impl NvidiaBackend {
             );
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, libc::EINVAL);
         }
-        let param_in = &body[..want];
+        let nested_end = ireq.data_len as usize + ireq.nested_len as usize;
+        let param_in = &body[..nested_end];
+
+        // What a pointer inside the nested block refers to. The guest cannot
+        // send an address that means anything here, so it sends the bytes and
+        // says where the pointer sits; the call below gives them a host
+        // address, and the reply carries them back.
+        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 {
+            Some((ireq.deep_ptr_offset as usize, &body[nested_end..want]))
+        } else {
+            None
+        };
 
         // How much of the response is the top-level struct. The driver copies
         // exactly this much back to userspace and reads any nested block after
@@ -849,6 +861,7 @@ impl NvidiaBackend {
                 16, // outer_size
                 8,  // ptr_offset
                 4,  // size_offset
+                deep_in,
             );
         }
 
@@ -893,6 +906,7 @@ impl NvidiaBackend {
                 32,
                 16,
                 24,
+                deep_in,
             ),
 
             // ---------------------------------------------------------------
@@ -907,6 +921,7 @@ impl NvidiaBackend {
                 48,
                 16,
                 32,
+                deep_in,
             ),
 
             // ---------------------------------------------------------------
@@ -943,6 +958,7 @@ impl NvidiaBackend {
         outer_size: usize,
         ptr_offset: usize,
         _size_offset: usize,
+        deep_in: Option<(usize, &[u8])>,
     ) -> usize {
         if param_in.len() < outer_size {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
@@ -1049,6 +1065,35 @@ impl NvidiaBackend {
             // separate mmap operations.
             // ---------------------------------------------------------------
 
+            // Give the pointer inside the nested block a host address.
+            //
+            // The buffer has to outlive the call, and the guest's own pointer
+            // value has to go back in afterwards: userspace compares what it
+            // gets back with what it sent, and a host address there is both
+            // meaningless and a leak of our layout.
+            let mut deep_buf: Vec<u8> = Vec::new();
+            let mut deep_saved: Option<(usize, [u8; 8])> = None;
+            if let Some((ptr_off, bytes)) = deep_in {
+                if ptr_off + 8 > host_buf.len() {
+                    log::warn!(
+                        "ioctl {request:#x}: pointer at {ptr_off} is outside {} nested bytes",
+                        host_buf.len()
+                    );
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::InvalidMsgType,
+                        cookie,
+                        libc::EINVAL,
+                    );
+                }
+                deep_buf = bytes.to_vec();
+                let mut guest_ptr = [0u8; 8];
+                guest_ptr.copy_from_slice(&host_buf[ptr_off..ptr_off + 8]);
+                deep_saved = Some((ptr_off, guest_ptr));
+                let host_ptr = deep_buf.as_mut_ptr() as u64;
+                host_buf[ptr_off..ptr_off + 8].copy_from_slice(&host_ptr.to_le_bytes());
+            }
+
             // Call host ioctl — paramsSize field is untouched (may be 0)
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
@@ -1114,10 +1159,15 @@ impl NvidiaBackend {
             // Zero pointer before sending back to guest
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
 
-            // Build response: outer + updated nested params
+            // Build response: outer + updated nested params + what the
+            // pointer inside them addresses.
+            if let Some((ptr_off, guest_ptr)) = deep_saved {
+                host_buf[ptr_off..ptr_off + 8].copy_from_slice(&guest_ptr);
+            }
             let mut combined = outer;
             combined.extend_from_slice(&host_buf);
-            self.write_ioctl_resp(resp_buf, cookie, &combined)
+            combined.extend_from_slice(&deep_buf);
+            self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_buf.len())
         } else {
             // No nested params — straightforward passthrough
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
@@ -1785,8 +1835,22 @@ impl NvidiaBackend {
     /// from the request, because the guest copies exactly `data_len` bytes back
     /// to the caller's struct and reads any nested block after it.
     fn write_ioctl_resp(&self, resp_buf: &mut [u8], cookie: u64, param_out: &[u8]) -> usize {
+        self.write_ioctl_resp_deep(resp_buf, cookie, param_out, 0)
+    }
+
+    /// As `write_ioctl_resp`, where the last `deep_len` bytes of `param_out`
+    /// are what a pointer inside the nested block addresses, and are declared
+    /// separately so the guest knows to copy them somewhere else.
+    fn write_ioctl_resp_deep(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_out: &[u8],
+        deep_len: usize,
+    ) -> usize {
         let data_len = (self.current_data_len as usize).min(param_out.len());
-        let nested_len = param_out.len() - data_len;
+        let deep_len = deep_len.min(param_out.len() - data_len);
+        let nested_len = param_out.len() - data_len - deep_len;
 
         let need = size_of::<MsgHeader>() + size_of::<IoctlResp>() + param_out.len();
         if resp_buf.len() < need {
@@ -1808,6 +1872,7 @@ impl NvidiaBackend {
             &IoctlResp {
                 data_len: data_len as u32,
                 nested_len: nested_len as u32,
+                deep_len: deep_len as u32,
             },
         );
         resp_buf[off..off + param_out.len()].copy_from_slice(param_out);
@@ -2024,6 +2089,8 @@ mod tests {
                 data_len: params.len() as u32,
                 nested_offset: 0,
                 nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
             },
         );
         v.extend_from_slice(params);
@@ -2184,6 +2251,8 @@ mod tests {
                 data_len: param_size,
                 nested_offset: 0,
                 nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
             },
         );
         // First 4 bytes = cmd field. Set to '2' (0x32) for query mode.
@@ -2236,6 +2305,8 @@ mod tests {
                 data_len: param_size,
                 nested_offset: 0,
                 nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
             },
         );
 
@@ -2282,6 +2353,8 @@ mod tests {
                 data_len: param_size,
                 nested_offset: 0,
                 nested_len: 0,
+                deep_ptr_offset: 0,
+                deep_len: 0,
             },
         );
 
@@ -2388,6 +2461,8 @@ mod tests {
                     data_len: 4,
                     nested_offset: 0,
                     nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&(fd_handle as u32).to_le_bytes());
@@ -2406,6 +2481,8 @@ mod tests {
                     data_len: size,
                     nested_offset: 0,
                     nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&vec![0u8; size as usize]);
@@ -2449,6 +2526,8 @@ mod tests {
                     // is where the driver puts them.
                     nested_offset: ALLOC_OUTER as u32,
                     nested_len: params.len() as u32,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&outer);
@@ -2522,6 +2601,8 @@ mod tests {
                     data_len: 56,
                     nested_offset: 0,
                     nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&p);
@@ -2566,6 +2647,8 @@ mod tests {
                     data_len: 16,
                     nested_offset: 0,
                     nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&p);
@@ -2595,6 +2678,8 @@ mod tests {
                     data_len: 32,
                     nested_offset: 0,
                     nested_len: 0,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
                 },
             );
             req.extend_from_slice(&p);

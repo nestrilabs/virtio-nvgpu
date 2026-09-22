@@ -115,22 +115,39 @@ struct nvgpu_open_resp {
   struct nvgpu_msg_hdr hdr;
 } __packed;
 
+/*
+ * RM control commands that name an open file by descriptor inside their
+ * parameters. The export form carries it after the 16-byte object it names.
+ */
+#define NVGPU_RM_EXPORT_OBJECT_TO_FD 0x00003d05
+#define NVGPU_RM_IMPORT_OBJECT_FROM_FD 0x00003d06
+#define NVGPU_RM_EXPORT_FD_OFFSET 16
+
+/* Largest second-level buffer we will carry for one call. */
+#define NVGPU_DEEP_MAX (64 * 1024)
+
 struct nvgpu_ioctl_req {
   struct nvgpu_msg_hdr hdr;
   __le32 cmd;
   __le32 data_len;
   __le32 nested_offset;
   __le32 nested_len;
+  __le32 deep_ptr_offset;
+  __le32 deep_len;
   /* followed by: data_len bytes top-level struct,
-   *              nested_len bytes nested data       */
+   *              nested_len bytes nested data,
+   *              deep_len bytes of what a pointer inside the nested data
+   *                  points at, at deep_ptr_offset within it       */
 } __packed;
 
 struct nvgpu_ioctl_resp {
   struct nvgpu_msg_hdr hdr;
   __le32 data_len;
   __le32 nested_len;
+  __le32 deep_len;
   /* followed by: data_len bytes modified top-level,
-   *              nested_len bytes modified nested   */
+   *              nested_len bytes modified nested,
+   *              deep_len bytes modified second-level data   */
 } __packed;
 
 struct nvgpu_mmap_req {
@@ -637,6 +654,8 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   req->data_len = cpu_to_le32(sz);
   req->nested_offset = 0;
   req->nested_len = 0;
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
 
   if (sz > 0) {
     if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
@@ -665,12 +684,40 @@ out:
 }
 
 /*
+ * nvgpu_handle_for_fd — the backend's handle for another of our open files.
+ *
+ * A guest descriptor means nothing on the other side. Anything that names an
+ * open file has to name it by the handle the backend issued when we opened it.
+ */
+static int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
+  struct file *f;
+  struct nvgpu_fd *other;
+
+  if (guest_fd < 0)
+    return -EBADF;
+
+  f = fget(guest_fd);
+  if (!f)
+    return -EBADF;
+
+  other = f->private_data;
+  if (!other) {
+    fput(f);
+    return -EINVAL;
+  }
+
+  *handle = other->handle;
+  fput(f);
+  return 0;
+}
+
+/*
  * nvgpu_ioctl_rm_control — NV_ESC_RM_CONTROL with nested params buffer.
  *
  * Handles three cases:
  *   1. Normal: nested params are flat data → marshal and forward
- *   2. V1→V2 rewrite: nested params contain a second userspace pointer
- *      that we can't forward → rewrite to V2 inline variant
+ *   2. Nested params hold a pointer of their own → send what it points at
+ *      alongside, and let the backend give it a host address
  *   3. paramsSize == 0 or params == NULL → forward outer struct only
  */
 static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
@@ -681,11 +728,14 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   u32 ctl_cmd;
   const struct nvgpu_v1v2_entry *rw;
 
-  /* V1→V2 rewrite state */
-  u64 saved_user_ptr = 0;
-  u32 saved_user_data_size = 0;
-  u32 saved_v1_cmd = 0;
-  u32 saved_v1_params_size = 0;
+  /* A descriptor named inside the nested block, and where it sits. */
+  int nested_fd = -1;
+  u32 nested_fd_offset = 0;
+
+  /* Second-level pointer carried alongside the nested block. */
+  u64 deep_user_ptr = 0;
+  u32 deep_ptr_offset = 0;
+  u32 deep_len = 0;
 
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
@@ -715,181 +765,62 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   /*
-   * Check for V1→V2 rewrite.  Only when we have nested params that
-   * contain a second-level userspace pointer we can't forward.
+   * A second-level pointer, carried rather than rewritten.
+   *
+   * Some parameter blocks hold an NvP64 pointing at a buffer of the caller's.
+   * This used to be handled by swapping the command for an inline "V2"
+   * variant that has no pointer. That bound us to the struct layouts of one
+   * driver release: against any other it sent requests of the wrong size and
+   * shape, and some V2 variants are not served at all, which is what ended
+   * every Vulkan run here -- RM answered NV_ERR_INVALID_ARGUMENT to a command
+   * userspace had never asked for.
+   *
+   * The backend already solves this one level up: it allocates a host buffer
+   * for the top-level pointer, copies the guest's bytes in, points the struct
+   * at it, and copies the result back. Doing the same one level deeper sends
+   * the caller's own command through untouched, and needs to know only where
+   * the pointer sits and how much it addresses. Both are properties of the
+   * layout that carries the pointer, which is the stable one.
    */
   rw = (user_nested && nested_size > 0) ? nvgpu_find_v1v2_rewrite(ctl_cmd)
                                         : NULL;
 
-  if (rw) {
-    void *v1_buf;
-    u32 min_v1_size;
+  if (rw && nested_size >= rw->v1_userptr_offset + 8) {
+    void *pbuf = kmalloc(nested_size, GFP_KERNEL);
+    u32 count;
 
-    /* Read V1 nested params from guest userspace */
-    min_v1_size = rw->v1_userptr_offset + 8;
-    if (nested_size < min_v1_size) {
-      pr_warn(
-          "virtio-gpu-nv: v1v2: V1 nested too small (%u < %u) for cmd 0x%x\n",
-          nested_size, min_v1_size, ctl_cmd);
-      rw = NULL;
-      goto do_normal;
-    }
-
-    v1_buf = kmalloc(nested_size, GFP_KERNEL);
-    if (!v1_buf)
+    if (!pbuf)
       return -ENOMEM;
 
-    if (copy_from_user(v1_buf, user_nested, nested_size)) {
-      kfree(v1_buf);
+    if (copy_from_user(pbuf, user_nested, nested_size)) {
+      kfree(pbuf);
       return -EFAULT;
     }
 
-    /* Extract the userspace data pointer from V1 nested params */
-    memcpy(&saved_user_ptr, v1_buf + rw->v1_userptr_offset, sizeof(u64));
-
-    if (!saved_user_ptr) {
-      pr_debug("virtio-gpu-nv: v1v2: data pointer is NULL for cmd 0x%x, normal "
-               "path\n",
-               ctl_cmd);
-      kfree(v1_buf);
-      rw = NULL;
-      goto do_normal;
-    }
-
-    /* Compute how many bytes of result data guest expects back */
-    if (rw->info_style && rw->v1_copy_prefix >= 4) {
-      u32 list_size;
-      memcpy(&list_size, v1_buf, sizeof(u32));
-      saved_user_data_size = min_t(u32, list_size * 8, rw->v2_data_size);
-    } else {
-      u32 caps_tbl_size;
-      memcpy(&caps_tbl_size, v1_buf, sizeof(u32));
-      saved_user_data_size = min_t(u32, caps_tbl_size, rw->v2_data_size);
-    }
-
-    saved_v1_cmd = ctl_cmd;
-    saved_v1_params_size = nested_size;
-
-    pr_debug("virtio-gpu-nv: v1v2: rewriting cmd 0x%x → 0x%x (V2 %u bytes, "
-             "data_back %u)\n",
-             ctl_cmd, rw->v2_cmd, rw->v2_size, saved_user_data_size);
-
-    /* Build V2 nested buffer (zeroed) */
-    nested_size = rw->v2_size;
-
-    req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size;
-    resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
-
-    req_buf = kzalloc(req_total, GFP_KERNEL);
-    resp_buf = kzalloc(resp_max, GFP_KERNEL);
-    if (!req_buf || !resp_buf) {
-      kfree(v1_buf);
-      ret = -ENOMEM;
-      goto out;
-    }
-
-    /* Copy prefix from V1 into V2 (e.g. listSize or ceEngineType) */
-    if (rw->v1_copy_prefix > 0) {
-      u32 pfx = min_t(u32, rw->v1_copy_prefix, (u32)(nested_size));
-      memcpy(req_buf + sizeof(struct nvgpu_ioctl_req) + sizeof(params), v1_buf,
-             pfx);
-    }
-
-    kfree(v1_buf);
+    memcpy(&deep_user_ptr, pbuf + rw->v1_userptr_offset, sizeof(u64));
+    memcpy(&count, pbuf, sizeof(u32));
+    kfree(pbuf);
 
     /*
-     * A GET_INFO list is not an output buffer. Each entry arrives with the
-     * index the caller wants filled in, and RM answers by writing `data`
-     * beside it. Copying only the result back left the list we sent full of
-     * zeros, so every request read as "index 0", and RM refused the call with
-     * NV_ERR_INVALID_ARGUMENT rather than answering a question nobody asked.
-     *
-     * The caps-style commands are genuinely output-only, so they keep the
-     * zeroed buffer.
+     * The leading field says how much the buffer holds: entries of eight
+     * bytes for the list-style commands, plain bytes for the caps tables.
      */
-    if (rw->info_style && saved_user_data_size > 0 &&
-        rw->v2_data_offset < nested_size) {
-      u32 room = nested_size - rw->v2_data_offset;
-      u32 copy_in = min_t(u32, saved_user_data_size, room);
+    deep_len = rw->info_style ? count * 8 : count;
+    deep_ptr_offset = rw->v1_userptr_offset;
 
-      if (copy_from_user(req_buf + sizeof(struct nvgpu_ioctl_req) +
-                             sizeof(params) + rw->v2_data_offset,
-                         (const void __user *)saved_user_ptr, copy_in)) {
-        ret = -EFAULT;
-        goto out;
-      }
+    if (!deep_user_ptr || deep_len == 0 || deep_len > NVGPU_DEEP_MAX) {
+      deep_user_ptr = 0;
+      deep_ptr_offset = 0;
+      deep_len = 0;
     }
-
-    /* Patch outer: replace cmd with V2, update paramsSize */
-    params.cmd = cpu_to_le32(rw->v2_cmd);
-    params.paramsSize = cpu_to_le32(nested_size);
-
-    /* Fill request header */
-    req = (struct nvgpu_ioctl_req *)req_buf;
-    req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-    req->hdr.handle = cpu_to_le32(nfd->handle);
-    req->hdr.status = 0;
-    req->hdr.padding = 0;
-    req->cmd = cpu_to_le32(cmd);
-    req->data_len = cpu_to_le32(sizeof(params));
-    req->nested_offset = cpu_to_le32(sizeof(params));
-    req->nested_len = cpu_to_le32(nested_size);
-
-    memcpy(req_buf + sizeof(*req), &params, sizeof(params));
-
-    ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
-    if (ret < 0)
-      goto out;
-
-    resp = (struct nvgpu_ioctl_resp *)resp_buf;
-    ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
-
-    /* ── V1→V2 response path ── */
-
-    /* Copy V2 inline result data back to guest's original userspace pointer */
-    if (le32_to_cpu(resp->nested_len) > 0 && saved_user_ptr &&
-        saved_user_data_size > 0) {
-      u32 resp_nested = le32_to_cpu(resp->nested_len);
-      u32 avail = 0;
-
-      if (resp_nested > rw->v2_data_offset)
-        avail = resp_nested - rw->v2_data_offset;
-
-      if (avail > 0) {
-        u32 copy_back = min_t(u32, saved_user_data_size, avail);
-        if (copy_to_user((void __user *)saved_user_ptr,
-                         resp_buf + sizeof(*resp) + sizeof(params) +
-                             rw->v2_data_offset,
-                         copy_back)) {
-          ret = -EFAULT;
-          goto out;
-        }
-      }
-    }
-
-    /* Restore V1 outer fields before copying back to userspace:
-     * cmd → original V1 cmd, paramsSize → original, params ptr → original */
-    {
-      struct NVOS54_PARAMETERS *resp_params =
-          (struct NVOS54_PARAMETERS *)(resp_buf + sizeof(*resp));
-      resp_params->cmd = cpu_to_le32(saved_v1_cmd);
-      resp_params->paramsSize = cpu_to_le32(saved_v1_params_size);
-      resp_params->params = cpu_to_le64((u64)(unsigned long)user_nested);
-    }
-
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
-      ret = -EFAULT;
-      goto out;
-    }
-
-    goto out;
   }
 
-do_normal:
   /* ── Normal path (no V1→V2 rewrite) ── */
 
-  req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size;
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
+  req_total =
+      sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size + deep_len;
+  resp_max =
+      sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size + deep_len;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
   resp_buf = kmalloc(resp_max, GFP_KERNEL);
@@ -907,12 +838,49 @@ do_normal:
   req->data_len = cpu_to_le32(sizeof(params));
   req->nested_offset = cpu_to_le32(sizeof(params));
   req->nested_len = cpu_to_le32(nested_size);
+  req->deep_ptr_offset = cpu_to_le32(deep_ptr_offset);
+  req->deep_len = cpu_to_le32(deep_len);
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
   if (user_nested && nested_size > 0) {
     if (copy_from_user(req_buf + sizeof(*req) + sizeof(params), user_nested,
                        nested_size)) {
+      ret = -EFAULT;
+      goto out;
+    }
+
+    /*
+     * Exporting an object to a descriptor, and importing one back, name
+     * another of our open files inside the nested parameters. The backend
+     * knows that file by the handle it issued, not by our descriptor number,
+     * so swap one for the other here and swap it back on the way out --
+     * userspace gets its own descriptor returned, which is what it passed in.
+     */
+    if (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD ||
+        ctl_cmd == NVGPU_RM_IMPORT_OBJECT_FROM_FD) {
+      u32 off = (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD)
+                    ? NVGPU_RM_EXPORT_FD_OFFSET
+                    : 0;
+
+      if (nested_size >= off + sizeof(u32)) {
+        void *slot = req_buf + sizeof(*req) + sizeof(params) + off;
+        u32 handle;
+
+        memcpy(&nested_fd, slot, sizeof(nested_fd));
+        if (nvgpu_handle_for_fd(nested_fd, &handle) == 0) {
+          memcpy(slot, &handle, sizeof(handle));
+          nested_fd_offset = off;
+        } else {
+          nested_fd = -1;
+        }
+      }
+    }
+  }
+
+  if (deep_len > 0) {
+    if (copy_from_user(req_buf + sizeof(*req) + sizeof(params) + nested_size,
+                       (const void __user *)deep_user_ptr, deep_len)) {
       ret = -EFAULT;
       goto out;
     }
@@ -932,7 +900,21 @@ do_normal:
 
   if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+
+    if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
+      memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
+             &nested_fd, sizeof(nested_fd));
+
     if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
+                     copy_back))
+      ret = -EFAULT;
+  }
+
+  if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
+    u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
+    if (copy_to_user((void __user *)deep_user_ptr,
+                     resp_buf + sizeof(*resp) + sizeof(params) +
+                         le32_to_cpu(resp->nested_len),
                      copy_back))
       ret = -EFAULT;
   }
@@ -1004,6 +986,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->data_len = cpu_to_le32(sizeof(params));
   req->nested_offset = cpu_to_le32(sizeof(params));
   req->nested_len = cpu_to_le32(nested_size);
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
@@ -1113,6 +1097,8 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   req->data_len = cpu_to_le32(sz);
   req->nested_offset = 0;
   req->nested_len = 0;
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
 
   ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
   if (ret < 0)
@@ -1541,6 +1527,8 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   req->data_len = cpu_to_le32(sizeof(outer));
   req->nested_offset = cpu_to_le32(sizeof(outer));
   req->nested_len = cpu_to_le32(nested_size);
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
 
   memcpy(req_buf + sizeof(*req), &outer, sizeof(outer));
 

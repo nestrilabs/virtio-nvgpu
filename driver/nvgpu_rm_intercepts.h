@@ -26,6 +26,13 @@
  * 0x20810107  VGPU_MGR_GET_PGPU_INFO       2 ptrs           → TODO (MIG)
  * 0x90960103  SWINTR_GET_INFO              1 array ptr       → TODO
  *
+ * 0x00003d05 was once handled here as OS_GET_CAPS. There is no such command.
+ * 0x00003d05 is OS_UNIX_EXPORT_OBJECT_TO_FD, whose parameters are an object
+ * handle, a file descriptor and flags -- not a size and a caps pointer. Reading
+ * them the other way made an object handle look like a wild address, and
+ * answering NV_OK meant the export never happened. It is forwarded now, and the
+ * backend translates the descriptor it carries.
+ *
  * Most of the TODO commands are only used by advanced tools (MIG manager,
  * nvenc session queries, VBIOS extraction).  nvidia-smi + basic CUDA
  * only needs BUILD_VERSION.
@@ -130,61 +137,6 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
   return nvgpu_set_nvos54_status(uarg, 0);
 }
 
-/* ─── 0x00003d05: NV0000_CTRL_CMD_OS_GET_CAPS ─────────────────────
- *
- * Platform-specific caps query. V1 nested params (16 bytes):
- *   offset  0: capsTblSize  (u32) — size of caps buffer
- *   offset  4: pad          (u32)
- *   offset  8: capsTbl      (u64) — userspace pointer to caps buffer
- *
- * The host RM can't dereference the guest's capsTbl pointer.
- * Return a zeroed caps table = "no special OS capabilities",
- * which is correct for a VM environment.
- */
-static inline long nvgpu_intercept_os_get_caps(struct nvgpu_fd *nfd,
-                                               void __user *uarg,
-                                               void __user *user_nested,
-                                               u32 nested_size) {
-  u8 params[16];
-  u32 caps_tbl_size;
-  u64 caps_tbl_ptr;
-
-  if (!user_nested || nested_size < 16)
-    return -EINVAL;
-
-  if (copy_from_user(params, user_nested, 16))
-    return -EFAULT;
-
-  memcpy(&caps_tbl_size, &params[0], sizeof(u32));
-  memcpy(&caps_tbl_ptr, &params[8], sizeof(u64));
-
-  /*
-   * Clear the caps table only when the guest really gave us one.
-   *
-   * The 16-byte layout above is not the only one in use: a 24-byte form
-   * appears in practice whose bytes at these offsets are not a size and a
-   * pointer at all -- observed as size=1, ptr=0xcaf00000fade0001, which is a
-   * poison value rather than an address. Writing to it fails, and failing the
-   * ioctl for that reason took Vulkan down: the ICD gets EFAULT from
-   * RM_CONTROL, abandons initialisation, and the loader reports only "Found
-   * no drivers", naming nothing.
-   *
-   * Nothing is owed to the caller here. The answer this intercept exists to
-   * give is "no special OS capabilities", and a table left untouched says
-   * that as well as a table zeroed. So check the address is writable and, if
-   * it is not, answer NV_OK without touching it.
-   */
-  if (caps_tbl_ptr && caps_tbl_size > 0 &&
-      access_ok((void __user *)caps_tbl_ptr, caps_tbl_size)) {
-    if (clear_user((void __user *)caps_tbl_ptr, caps_tbl_size))
-      pr_warn_ratelimited(
-          "virtio-gpu-nv: OS_GET_CAPS: could not clear %u bytes at 0x%llx\n",
-          caps_tbl_size, caps_tbl_ptr);
-  }
-
-  return nvgpu_set_nvos54_status(uarg, 0); /* NV_OK */
-}
-
 /* ─── Dispatch table ──────────────────────────────────────────────── */
 
 /*
@@ -212,10 +164,6 @@ nvgpu_try_intercept_rm_control(struct nvgpu_fd *nfd, u32 ctl_cmd,
      * case 0x20801210: GR_GET_CTX_BUFFER_INFO
      * case 0x90960103: SWINTR_GET_INFO
      */
-
-  case 0x00003d05: /* NV0000_CTRL_CMD_OS_GET_CAPS */
-    *ret = nvgpu_intercept_os_get_caps(nfd, uarg, user_nested, nested_size);
-    return true;
 
   default:
     return false;
