@@ -18,7 +18,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
-    load_manifest, loaded_driver_version, resolve, staged_driver_version, Capability,
+    load_manifest, loaded_driver_version, resolve, retarget, staged_driver_version, Capability,
     DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH,
 };
 use std::path::{Path, PathBuf};
@@ -42,9 +42,14 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
-    /// Stage even when the files found are from a different driver than the
-    /// kernel module that is loaded. Almost always the wrong thing: see the
-    /// refusal this suppresses.
+    /// Which driver build to stage. Defaults to the kernel module that is
+    /// loaded, which is the only version a guest's libraries will actually be
+    /// talking to. An explicit value pins the share and is recorded in it.
+    #[arg(long)]
+    driver_version: Option<String>,
+
+    /// Stage the manifest's own build even when a different module is loaded.
+    /// Kept for deliberately reproducing a mismatch; see decision 0070.
     #[arg(long)]
     allow_version_mismatch: bool,
 }
@@ -133,14 +138,47 @@ fn main() -> Result<()> {
         }
     }
 
-    // What the manifest led us to, and what is actually loaded. These agree on
-    // a host with one driver install and can differ on a host with two -- and
-    // only the loaded module's own userspace can speak to it.
-    let staged_version = staged_driver_version(&found);
+    // The manifest says which files a guest needs. It does not say which build
+    // is loaded, and on a host with two driver userspaces it is wrong about
+    // that. So take the build from the module itself and retarget onto it --
+    // no operator judgement, which is the point: in production nobody is here.
+    let manifest_version = staged_driver_version(&found);
     let loaded_version = loaded_driver_version(Path::new(LOADED_VERSION_PATH));
+    let target = args
+        .driver_version
+        .clone()
+        .or_else(|| loaded_version.clone())
+        .or_else(|| manifest_version.clone());
+
+    let mut found = found;
+    let mut missing = missing;
+    let mut retargeted_from = None;
+
+    if let (Some(m), Some(t)) = (&manifest_version, &target) {
+        if m != t && !args.allow_version_mismatch {
+            let swapped = retarget(&entries, m, t);
+            let (f2, m2) = resolve(&swapped, &caps, &search);
+            // Only accept the swap if that build is really installed. A
+            // target with nothing on disk must fail loudly below, not quietly
+            // produce a share with three files in it.
+            if f2.len() * 10 >= found.len() * 9 {
+                println!(
+                    "manifest describes driver {m}; the loaded module is {t} -- \
+                     retargeted onto {t} ({} of {} entries found)",
+                    f2.len(),
+                    found.len()
+                );
+                retargeted_from = Some(m.clone());
+                found = f2;
+                missing = m2;
+            }
+        }
+    }
+
+    let staged_version = staged_driver_version(&found);
     match (&staged_version, &loaded_version) {
         (Some(s), Some(l)) if s == l => println!("driver {s}, matching the loaded module"),
-        (Some(s), Some(l)) => println!("manifest describes driver {s}; the loaded module is {l}"),
+        (Some(s), Some(l)) => println!("staging driver {s}; the loaded module is {l}"),
         (Some(s), None) => println!("driver {s}; no module loaded to check it against"),
         _ => {}
     }
@@ -157,14 +195,14 @@ fn main() -> Result<()> {
     if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version) {
         if staged != loaded && !args.allow_version_mismatch {
             anyhow::bail!(
-                "refusing to stage: the manifest at {} describes driver {staged}, but the \n\
-                 loaded kernel module is {loaded}. The guest runs these libraries against \n\
-                 that module, and the forwarded ioctls are a private contract between one \n\
-                 build of each -- so this share would fail deep inside the guest instead of \n\
-                 here.\n\n\
-                 This host has two driver userspaces installed. Point --manifest at the one \n\
-                 describing {loaded}, or remove the {staged} install. --allow-version-mismatch \n\
-                 overrides this if you are deliberately testing the mismatch.",
+                "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
+                 The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
+                 find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
+                 or not where this looks for it.\n\n\
+                 Install the userspace matching the loaded module, or pass \n\
+                 --driver-version to name a build that is present. \n\
+                 --allow-version-mismatch stages the manifest's own build anyway; see \n\
+                 decision 0070 for why that is not the default.",
                 args.manifest.display()
             );
         }

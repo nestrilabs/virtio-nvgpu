@@ -452,6 +452,33 @@ fn read_string(b: &[u8], i: &mut usize) -> Result<String, String> {
     }
 }
 
+/// Rewrite a manifest's entries to name a different driver build.
+///
+/// The manifest conflates two things this module needs to keep apart: *which*
+/// files a guest needs, with what capability each serves, and *which build* of
+/// them this host has. Only the first is hard to work out, and only the second
+/// goes stale. A host carrying two driver userspaces has a manifest that is
+/// still right about the first and wrong about the second.
+///
+/// So keep the categories and swap the version. NVIDIA versions its payload
+/// files by filename suffix (`libcuda.so.595.99.02`), which is the contract
+/// that makes this sound: an entry naming `from` has a `to` counterpart iff
+/// that build is installed, and [`resolve`] will simply not find the ones that
+/// are not.
+///
+/// Entries with no version in their name -- `nvidia_icd.json`, `nvidia-smi` --
+/// are returned unchanged, which is correct: they are not versioned on disk.
+pub fn retarget(entries: &[Entry], from: &str, to: &str) -> Vec<Entry> {
+    entries
+        .iter()
+        .map(|e| Entry {
+            name: e.name.replace(from, to),
+            kind: e.kind.clone(),
+            categories: e.categories.clone(),
+        })
+        .collect()
+}
+
 /// Read the manifest this host's driver installed.
 pub fn load_manifest(path: &Path) -> Result<Vec<Entry>, UserspaceError> {
     if !path.exists() {
@@ -703,6 +730,21 @@ mod tests {
             host_path: std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu").join(host_name),
             guest_path: std::path::PathBuf::from("lib").join(host_name),
         }
+    }
+
+    #[test]
+    fn retargeting_swaps_the_build_and_keeps_the_categories() {
+        let mut cats = TestSet::new();
+        cats.insert("compute".to_string());
+        let entries = vec![
+            Entry { name: "libcuda.so.595.91.07".into(), kind: FileKind::Lib, categories: cats.clone() },
+            // Unversioned on disk, so it must survive untouched.
+            Entry { name: "nvidia_icd.json".into(), kind: FileKind::Json, categories: cats.clone() },
+        ];
+        let out = super::retarget(&entries, "595.91.07", "595.99.02");
+        assert_eq!(out[0].name, "libcuda.so.595.99.02");
+        assert_eq!(out[0].categories, cats, "capability must survive the swap");
+        assert_eq!(out[1].name, "nvidia_icd.json", "an unversioned name is not rewritten");
     }
 
     #[test]
