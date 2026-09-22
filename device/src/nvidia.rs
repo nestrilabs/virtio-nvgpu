@@ -865,6 +865,15 @@ impl NvidiaBackend {
             );
         }
 
+        // Escape numbers below are NVIDIA's, and they are only NVIDIA's inside
+        // type 'F'. Other namespaces reuse the same numbers for their own
+        // commands -- nvidia-drm's DMABUF_SUPPORTED is nr 0x4f, which is
+        // NV_ESC_RM_UNMAP_MEMORY here -- so anything that is not RM is handed
+        // to the host as it arrived rather than matched against this table.
+        if ioc_type != b'F' as u32 {
+            return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
+        }
+
         use abi::ioctl::*;
         match escape {
             // ---------------------------------------------------------------
@@ -1406,12 +1415,29 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
 
-        let guest_embedded: u64 = {
+        let embedded = {
             let mut b = [0u8; 4];
             b.copy_from_slice(&param_in[fd_offset..fd_offset + 4]);
-            u32::from_le_bytes(b) as u64
+            i32::from_le_bytes(b)
         };
 
+        // The field is a descriptor only when the caller put one there. -1 is
+        // the caller saying it has none, which several of these ioctls allow --
+        // NV_ESC_RM_ALLOC_MEMORY carries it for every allocation not being made
+        // on another open file. It is forwarded as it stands, because that is
+        // what the host driver is being asked to read.
+        if embedded < 0 {
+            let mut param_buf = param_in.to_vec();
+            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+            if rc < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
+            return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
+        }
+
+        let guest_embedded = embedded as u64;
         let host_embedded = match self.handles.get_raw(guest_embedded) {
             Ok(fd) => fd,
             Err(_) => {

@@ -1066,26 +1066,39 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   /* Extract guest fd from its position in the payload */
   memcpy(&guest_fd, req_buf + sizeof(*req) + payload_offset, sizeof(guest_fd));
 
-  /* Resolve guest fd → nvgpu_fd → VMM handle */
-  other_file = fget(guest_fd);
-  if (!other_file) {
-    ret = -EBADF;
-    goto out;
-  }
+  /*
+   * A descriptor in these parameters is optional, and -1 is how a caller says
+   * it is not using one.  NV_ESC_RM_ALLOC_MEMORY carries -1 for every ordinary
+   * allocation -- only one that is to be mapped through another open file names
+   * that file -- and the driver on the other side accepts it and allocates.
+   *
+   * Resolving it is meaningless and refusing it is worse: this path returned
+   * -EBADF from fget(-1) before the request was ever sent, so the call failed
+   * with nothing recorded anywhere on the far side.  The value only keeps its
+   * meaning if it is forwarded unchanged.
+   */
+  if (guest_fd >= 0) {
+    /* Resolve guest fd → nvgpu_fd → VMM handle */
+    other_file = fget(guest_fd);
+    if (!other_file) {
+      ret = -EBADF;
+      goto out;
+    }
 
-  other_nfd = other_file->private_data;
-  if (!other_nfd) {
+    other_nfd = other_file->private_data;
+    if (!other_nfd) {
+      fput(other_file);
+      ret = -EINVAL;
+      goto out;
+    }
+
+    host_handle = other_nfd->handle;
     fput(other_file);
-    ret = -EINVAL;
-    goto out;
+
+    /* Patch payload: replace raw guest fd with VMM handle */
+    memcpy(req_buf + sizeof(*req) + payload_offset, &host_handle,
+           sizeof(host_handle));
   }
-
-  host_handle = other_nfd->handle;
-  fput(other_file);
-
-  /* Patch payload: replace raw guest fd with VMM handle */
-  memcpy(req_buf + sizeof(*req) + payload_offset, &host_handle,
-         sizeof(host_handle));
 
   /* Build request header */
   req = (struct nvgpu_ioctl_req *)req_buf;
