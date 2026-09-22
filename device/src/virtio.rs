@@ -101,6 +101,7 @@ impl GpuSlot {
 
 use abi::ioctl::{
     NV_ESC_ALLOC_OS_EVENT, NV_ESC_FREE_OS_EVENT, NV_ESC_REGISTER_FD, NV_ESC_RM_ALLOC_MEMORY,
+    NV_ESC_RM_MAP_MEMORY,
 };
 
 /// The ioctls that carry a file descriptor, and the byte offset it sits at.
@@ -112,11 +113,17 @@ use abi::ioctl::{
 ///   * `NV_ESC_ALLOC_OS_EVENT` / `NV_ESC_FREE_OS_EVENT` --
 ///     `hClient(4) + hDevice(4)` precede it.
 ///   * `NV_ESC_RM_ALLOC_MEMORY` -- offset 48.
+///   * `NV_ESC_RM_MAP_MEMORY` -- `NVOS33` carries the descriptor the mapping
+///     is made on, at offset 48. Leaving it out cost the power readings:
+///     nvidia-smi reported "GPU access blocked by the operating system" for
+///     draw while every power *limit* came back correctly, which reads like a
+///     permissions problem rather than an untranslated descriptor.
 pub const FD_CARRYING_IOCTLS: &[(u32, u32)] = &[
     (NV_ESC_REGISTER_FD, 0),
     (NV_ESC_ALLOC_OS_EVENT, 8),
     (NV_ESC_FREE_OS_EVENT, 8),
     (NV_ESC_RM_ALLOC_MEMORY, 48),
+    (NV_ESC_RM_MAP_MEMORY, 48),
 ];
 
 /// One ioctl the device wants the driver to rewrite file descriptors in.

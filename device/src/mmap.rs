@@ -55,11 +55,22 @@ impl MmapContext {
     }
 
     /// The mapping at a window offset.
-    ///
-    /// That offset is the cookie written into `pLinearAddress`, which the guest
-    /// quotes back when it maps, so this is the lookup the mmap path needs.
     pub fn find_by_offset(&self, shm_offset: u64) -> Option<&MmapEntry> {
         self.entries.get(&shm_offset)
+    }
+
+    /// The mapping made on a given descriptor.
+    ///
+    /// This is the lookup the mmap path needs, and not `find_by_offset`. The
+    /// guest driver sends `vma->vm_pgoff` as the offset, and the userspace
+    /// library maps at offset 0 -- it does not quote the cookie written into
+    /// pLinearAddress. What identifies the mapping is the descriptor the mmap
+    /// arrives on, which works because a host fd is single-use for mapping, so
+    /// at most one mapping exists per fd.
+    pub fn find_by_fd_handle(&self, fd_handle: u64) -> Option<&MmapEntry> {
+        self.entries
+            .values()
+            .find(|e| e.map_fd_handle == fd_handle)
     }
 
     /// Take every mapping, leaving the table empty. Used at teardown, where a

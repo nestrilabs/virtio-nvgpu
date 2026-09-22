@@ -411,9 +411,10 @@ impl NvidiaBackend {
         }
         let req = read_struct::<MmapReq>(payload, 0);
 
-        let Some(entry) = self.active_maps.find_by_offset(req.offset) else {
+        let Some(entry) = self.active_maps.find_by_fd_handle(self.current_handle as u64) else {
             log::warn!(
-                "mmap: no mapping at window offset {:#x} (size {:#x})",
+                "mmap: no mapping on handle {} (offset {:#x}, size {:#x})",
+                self.current_handle,
                 req.offset,
                 req.size
             );
