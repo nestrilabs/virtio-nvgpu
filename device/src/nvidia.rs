@@ -1043,7 +1043,48 @@ impl NvidiaBackend {
                 8,  // ptr_offset
                 4,  // size_offset
                 deep_in,
+                None,
             );
+        }
+
+        // nvidia-drm's GEM ioctls: type 'd' (0x64), and `escape` is the
+        // absolute DRM ioctl number, not an offset from DRM_COMMAND_BASE.
+        //
+        // Two of the five carry a userspace pointer to an NVKMS parameter
+        // block, in the same shape nvidia-modeset uses, so they take the same
+        // path; the other three are flat and fall through to the passthrough
+        // below. Nothing here translates the GEM handles in these structs: a
+        // handle is per drm_file, and the guest's open of its render node
+        // holds exactly one open of ours, so the handle the host driver issues
+        // is already scoped to the file that will use it.
+        //
+        // Sizes and offsets are from NVIDIA's
+        // kernel-open/nvidia-drm/nv_drm_common_ioctl.h, and the guest driver
+        // holds the same numbers in nvgpu_gem_import_nvkms /
+        // nvgpu_gem_export_dmabuf. Both halves have to be changed together.
+        if ioc_type == b'd' as u32 {
+            // (outer_size, ptr_offset, size_offset)
+            let nested = match escape {
+                0x41 => Some((32usize, 8usize, 16usize)), // GEM_IMPORT_NVKMS_MEMORY
+                0x4d => Some((24usize, 8usize, 16usize)), // GEM_EXPORT_DMABUF_MEMORY
+                _ => None,
+            };
+            log::debug!("drm ioctl nr={escape:#04x} ({} bytes in)", param_in.len());
+            if let Some((outer_size, ptr_offset, size_offset)) = nested {
+                return self.dispatch_nested(
+                    cookie,
+                    host_fd,
+                    request,
+                    param_in,
+                    resp_buf,
+                    outer_size,
+                    ptr_offset,
+                    size_offset,
+                    deep_in,
+                    // Both NVKMS blocks begin with `int memFd`.
+                    Some(0),
+                );
+            }
         }
 
         // Escape numbers below are NVIDIA's, and they are only NVIDIA's inside
@@ -1097,6 +1138,7 @@ impl NvidiaBackend {
                 16,
                 24,
                 deep_in,
+                None,
             ),
 
             // ---------------------------------------------------------------
@@ -1112,6 +1154,7 @@ impl NvidiaBackend {
                 16,
                 32,
                 deep_in,
+                None,
             ),
 
             // ---------------------------------------------------------------
@@ -1149,6 +1192,11 @@ impl NvidiaBackend {
         ptr_offset: usize,
         _size_offset: usize,
         deep_in: Option<(usize, &[u8])>,
+        // Byte offset, inside the nested block, of a descriptor the guest
+        // sent as one of our handles and the host must see as one of our
+        // descriptors. `None` for the RM paths, which name their descriptors
+        // by command rather than by position.
+        nested_fd_offset: Option<usize>,
     ) -> usize {
         if param_in.len() < outer_size {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
@@ -1282,6 +1330,45 @@ impl NvidiaBackend {
                             log::warn!("IMPORT_FROM_FD: bad guest_handle {}", guest_handle_val);
                             return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
                         }
+                    }
+                }
+            }
+
+            // A descriptor named by position rather than by command: NVKMS's
+            // import and export blocks both begin with the `memFd` naming the
+            // memory. The guest driver has already turned its own descriptor
+            // into one of our handles; this turns that handle into the
+            // descriptor this process holds, and the restore below puts the
+            // guest's value back before we answer.
+            if let Some(off) = nested_fd_offset {
+                if host_buf.len() < off + 4 {
+                    log::warn!(
+                        "ioctl {request:#x}: fd at {off} is outside {} nested bytes",
+                        host_buf.len()
+                    );
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::InvalidMsgType,
+                        cookie,
+                        libc::EINVAL,
+                    );
+                }
+                let guest_handle_val =
+                    i32::from_le_bytes(host_buf[off..off + 4].try_into().unwrap());
+                match self.handles.get_raw(guest_handle_val as u64) {
+                    Ok(real_fd) => {
+                        log::debug!(
+                            "nvkms memFd: handle {guest_handle_val} → host fd {real_fd}"
+                        );
+                        saved_nested_handle = Some((off, guest_handle_val));
+                        host_buf[off..off + 4]
+                            .copy_from_slice(&(real_fd as i32).to_le_bytes());
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "nvkms memFd: no handle {guest_handle_val}; the memory to                              import names a file we did not open"
+                        );
+                        return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
                     }
                 }
             }

@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/topology.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
@@ -126,6 +127,16 @@ struct nvgpu_open_resp {
 
 /* Largest second-level buffer we will carry for one call. */
 #define NVGPU_DEEP_MAX (64 * 1024)
+
+/*
+ * The largest nvidia-drm GEM parameter struct this driver forwards, and the
+ * largest NVKMS block one of them may point at. The first is a stack buffer's
+ * size, so it is small on purpose and BUILD_BUG_ON'd against the descriptors
+ * that use it; the second only has to refuse a length field that is garbage,
+ * since a real NVKMS memory-import block is a few hundred bytes.
+ */
+#define NVGPU_GEM_OUTER_MAX 32
+#define NVGPU_GEM_NESTED_MAX (64 * 1024)
 
 /* Event classes whose allocation parameters name a file of the caller's.
  * NV0005_ALLOC_PARAMETERS is {hParentClient, hSrcResource, hClass,
@@ -462,6 +473,35 @@ static struct class *nvgpu_class;
 static long nvgpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                            unsigned long arg);
+static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
+                               void __user *uarg, unsigned int sz);
+
+/*
+ * A GEM parameter struct that carries a userspace pointer, described well
+ * enough to forward: where the pointer sits and where the length beside it
+ * does. Both are u64. A struct with no pointer is not described here at all --
+ * it goes through nvgpu_ioctl_simple(), which copies the whole thing.
+ */
+struct nvgpu_gem_nested_desc {
+  u32 size;        /* sizeof the parameter struct */
+  u32 ptr_offset;  /* byte offset of the u64 userspace pointer */
+  u32 size_offset; /* byte offset of the u64 length beside it */
+  /*
+   * Byte offset, inside the *nested* block, of an `int` file descriptor, or
+   * NVGPU_GEM_NO_FD. NVKMS names the memory to import or export by an open
+   * file rather than by a handle, and a descriptor number means nothing in the
+   * backend's process -- forwarded verbatim it picks out whatever that process
+   * happens to have open at that number, which is how this arrived as an
+   * NVKMS import that simply refused.
+   */
+  s32 fd_offset;
+};
+
+#define NVGPU_GEM_NO_FD (-1)
+
+static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
+                                       void __user *uarg,
+                                       const struct nvgpu_gem_nested_desc *d);
 
 /*
  * The nvidia-drm ioctls, answered here rather than through a drm_ioctl_desc
@@ -482,6 +522,48 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
 #define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
 #define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
 #define DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID 0x18 /* abs nr 0x58 */
+
+/*
+ * The GEM ioctls, which are what a swapchain is made of: allocate or import
+ * memory, give it a fake mmap offset, hand it out as a dma-buf. They are
+ * forwarded to the host's render node rather than answered here -- the memory
+ * is the host's and so is the object that names it.
+ *
+ * Nothing translates the handles in these structs. A GEM handle is per
+ * drm_file, and each open of this node holds exactly one open of the host's
+ * node (nvgpu_drm_open), so the handle the host issues is already scoped to
+ * the file that will use it and means the same thing on both sides.
+ */
+#define DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY 0x01  /* abs nr 0x41 */
+#define DRM_NVIDIA_GEM_MAP_OFFSET 0x0a           /* abs nr 0x4a */
+#define DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY 0x0b   /* abs nr 0x4b */
+#define DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY 0x0d /* abs nr 0x4d */
+#define DRM_NVIDIA_GEM_IDENTIFY_OBJECT 0x0e      /* abs nr 0x4e */
+
+/*
+ * struct drm_nvidia_gem_import_nvkms_memory_params:
+ *   u64 mem_size; u64 nvkms_params_ptr; u64 nvkms_params_size;
+ *   u32 handle; u32 __pad;
+ */
+static const struct nvgpu_gem_nested_desc nvgpu_gem_import_nvkms = {
+    .size = 32,
+    .ptr_offset = 8,
+    .size_offset = 16,
+    /* struct NvKmsKapiPrivImportMemoryParams { int memFd; ... } */
+    .fd_offset = 0,
+};
+
+/*
+ * struct drm_nvidia_gem_export_dmabuf_memory_params:
+ *   u32 handle; u32 __pad; u64 nvkms_params_ptr; u64 nvkms_params_size;
+ */
+static const struct nvgpu_gem_nested_desc nvgpu_gem_export_dmabuf = {
+    .size = 24,
+    .ptr_offset = 8,
+    .size_offset = 16,
+    /* struct NvKmsKapiPrivExportMemoryParams { int memFd; } */
+    .fd_offset = 0,
+};
 
 /*
  * struct drm_version — UAPI, stable since DRM was upstreamed.
@@ -638,6 +720,30 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
   case DRM_NVIDIA_DMABUF_SUPPORTED:
     return 0; /* not supported, no payload */
+
+  /*
+   * ── GEM: forwarded to the host's render node ──
+   *
+   * These three are flat -- every field is a value -- so the whole struct
+   * goes across and the answer comes back into it.
+   */
+  case DRM_NVIDIA_GEM_MAP_OFFSET:
+  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY:
+  case DRM_NVIDIA_GEM_IDENTIFY_OBJECT:
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, _IOC_SIZE(cmd));
+
+  /*
+   * These two carry a pointer to an NVKMS parameter block. The guest's
+   * address means nothing on the host, so the bytes travel alongside and the
+   * backend gives them a host address before the call -- the same shape as
+   * nvidia-modeset, which is why both go through one forwarder.
+   */
+  case DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY:
+    return nvgpu_ioctl_drm_gem_nested(nfd, cmd, uarg, &nvgpu_gem_import_nvkms);
+
+  case DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY:
+    return nvgpu_ioctl_drm_gem_nested(nfd, cmd, uarg,
+                                      &nvgpu_gem_export_dmabuf);
 
   default:
     /*
@@ -1751,6 +1857,160 @@ out:
   return ret;
 }
 
+/* ───────── nvidia-drm GEM ioctls with a nested parameter block ─────────
+ *
+ * GEM_IMPORT_NVKMS_MEMORY and GEM_EXPORT_DMABUF_MEMORY both hold a userspace
+ * pointer to an NVKMS parameter block and the block's length beside it. That
+ * is the same shape as nvidia-modeset's outer struct, so the wire format is
+ * the same one: the outer struct, then the pointed-to bytes, with the backend
+ * putting a host address in the pointer field before it makes the call and the
+ * caller's own value back in it before it answers.
+ *
+ * The two differ from modeset only in where the pointer and the length sit and
+ * in the length being a u64, which is why they are described by a
+ * nvgpu_gem_nested_desc rather than hard-coded.
+ */
+static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
+                                       void __user *uarg,
+                                       const struct nvgpu_gem_nested_desc *d) {
+  u8 outer[NVGPU_GEM_OUTER_MAX];
+  void __user *user_nested;
+  u64 nested_size64;
+  u32 nested_size;
+  unsigned int sz = _IOC_SIZE(cmd);
+  void *req_buf = NULL, *resp_buf = NULL;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  int req_total, resp_max, ret;
+
+  /*
+   * The caller's struct has to be the one this descriptor describes, or the
+   * pointer is not where we are about to read it from. Named rather than
+   * clamped: a size that is not the expected one means the guest's userspace
+   * driver and this table disagree about a UAPI struct, and reading a pointer
+   * out of the wrong offset would forward a plausible-looking address.
+   */
+  if (sz != d->size) {
+    dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                         "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
+                         "bytes, this driver knows it as %u\n",
+                         _IOC_NR(cmd), sz, d->size);
+    return -EINVAL;
+  }
+
+  /*
+   * `outer` is on the stack, so a descriptor larger than it would be a buffer
+   * overflow rather than a wrong answer. Checked here rather than at the call
+   * sites because the descriptors are data, and data is what gets edited.
+   */
+  if (d->size > NVGPU_GEM_OUTER_MAX ||
+      d->ptr_offset + 8 > d->size || d->size_offset + 8 > d->size)
+    return -EINVAL;
+
+  if (copy_from_user(outer, uarg, d->size))
+    return -EFAULT;
+
+  user_nested = (void __user *)(unsigned long)get_unaligned_le64(
+      outer + d->ptr_offset);
+  nested_size64 = get_unaligned_le64(outer + d->size_offset);
+
+  if (nested_size64 > NVGPU_GEM_NESTED_MAX)
+    return -EINVAL;
+  nested_size = (u32)nested_size64;
+
+  req_total = sizeof(*req) + d->size + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + d->size + nested_size;
+
+  req_buf = kmalloc(req_total, GFP_KERNEL);
+  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->hdr.status = 0;
+  req->hdr.padding = 0;
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(d->size);
+  req->nested_offset = cpu_to_le32(d->size);
+  req->nested_len = cpu_to_le32(nested_size);
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
+
+  memcpy(req_buf + sizeof(*req), outer, d->size);
+
+  if (user_nested && nested_size > 0) {
+    if (copy_from_user(req_buf + sizeof(*req) + d->size, user_nested,
+                       nested_size)) {
+      ret = -EFAULT;
+      goto out;
+    }
+
+    /*
+     * NVKMS names the memory by an open file. Our descriptor is not the
+     * backend's, so it goes across as the handle the backend issued when we
+     * opened that file, and the backend turns it back into one of its own
+     * descriptors before making the call -- the same round trip
+     * EXPORT_OBJECT_TO_FD already makes for RM.
+     *
+     * The guest's own value is put back by the backend before it answers, so
+     * userspace reads back the descriptor it passed.
+     */
+    if (d->fd_offset != NVGPU_GEM_NO_FD &&
+        nested_size >= (u32)d->fd_offset + 4) {
+      void *nested = req_buf + sizeof(*req) + d->size;
+      int guest_fd = (int)get_unaligned_le32(nested + d->fd_offset);
+      u32 handle;
+
+      ret = nvgpu_handle_for_fd(guest_fd, &handle);
+      if (ret) {
+        dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                             "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
+                             "fd %d, which is not one of our devices\n",
+                             _IOC_NR(cmd), guest_fd);
+        goto out;
+      }
+      put_unaligned_le32(handle, nested + d->fd_offset);
+    }
+  }
+
+  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  if (ret < 0)
+    goto out;
+
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+
+  /*
+   * The outer struct carries the answer: GEM_IMPORT writes the new handle
+   * into it. Copied back even when the call failed, because the host's
+   * failure may have written a field too, and the caller reads what the host
+   * driver would have left it.
+   */
+  if (le32_to_cpu(resp->data_len) &&
+      le32_to_cpu(resp->data_len) <= d->size) {
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
+                     le32_to_cpu(resp->data_len)))
+      ret = -EFAULT;
+  }
+
+  if (user_nested && nested_size > 0 && le32_to_cpu(resp->nested_len) > 0) {
+    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+
+    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + d->size,
+                     copy_back))
+      ret = -EFAULT;
+  }
+
+out:
+  kfree(req_buf);
+  kfree(resp_buf);
+  return ret;
+}
+
 static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
                                 unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
@@ -2210,7 +2470,27 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
         return -ENODEV;
       return nvgpu_drm_handle_ioctl(nfd, dri, cmd, arg);
     }
-    return drm_ioctl(filp, cmd, arg);
+
+    /*
+     * Core DRM, answered by the core against this node's own state. That is
+     * right for VERSION and GET_UNIQUE and wrong for anything that names a GEM
+     * object: the objects live in the host's drm_file, so the core looks them
+     * up here, finds nothing, and refuses.
+     *
+     * Named for the same reason the driver range is (see below): a refusal
+     * from the core carries no hint that it came from the wrong side of the
+     * boundary, and turns up much later as a client that stopped asking.
+     */
+    {
+      long ret = drm_ioctl(filp, cmd, arg);
+
+      if (ret < 0)
+        dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                             "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
+                             "locally with %ld\n",
+                             nr, ret);
+      return ret;
+    }
   }
 
   return nvgpu_ioctl_fd(nfd, cmd, arg);
