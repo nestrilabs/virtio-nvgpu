@@ -105,8 +105,65 @@ struct DriDevice {
     name: String,
     major: u32,
     minor: u32,
-    /// Which GPU slot it belongs to.
-    gpu_id: u32,
+    /// Which GPU slot it belongs to. The guest matches this against the GPU's
+    /// minor to decide which card the node hangs off; it is ours, not NVIDIA's.
+    slot_index: u32,
+    /// `DRM_NVIDIA_GET_DEV_INFO` as the host's own node answers it, passed
+    /// through rather than reconstructed.
+    ///
+    /// The guest used to answer this ioctl from constants -- gpu_id from the
+    /// slot index, and page kind 6 / generation 2 / sector layout 1 under a
+    /// comment reading "Turing/Ampere". The gpu_id was simply wrong: the ICD
+    /// matches its RM device to a DRM node by it, the host answers 0x100 for a
+    /// card at 0000:01:00.0 and the guest answered 0, so no node was ever
+    /// matched and VkPhysicalDeviceDrmPropertiesEXT reported hasRender =
+    /// false. The tiling fields were right for the two cards they name and
+    /// silently wrong elsewhere, which is the kind of wrong that produces a
+    /// scrambled frame rather than an error.
+    dev_info: [u32; NV_DEV_INFO_WORDS],
+}
+
+/// `struct drm_nvidia_get_dev_info_params` is nine `u32`s. Carried as words
+/// because nothing here needs to interpret them -- only the guest does.
+const NV_DEV_INFO_WORDS: usize = 9;
+
+/// `_IOWR('d', DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO, params)`, i.e.
+/// direction read|write, 36 bytes, type 'd', nr 0x43.
+const DRM_IOCTL_NVIDIA_GET_DEV_INFO: libc::c_ulong = 0xC024_6443;
+
+/// Ask a host render node what it is.
+///
+/// `None` when the node cannot be opened or refuses the ioctl, which leaves
+/// the guest on its own constants -- wrong, but no worse than before, and
+/// said out loud rather than discovered later in a frame.
+fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
+    let c_path = CString::new(path).ok()?;
+    // SAFETY: a NUL-terminated path, and the fd is closed below.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        log::warn!(
+            "{path}: cannot open to ask what it is ({})",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    let mut params = [0u32; NV_DEV_INFO_WORDS];
+    // SAFETY: `params` is exactly the 36 bytes the ioctl's size field declares.
+    let rc = unsafe {
+        libc::ioctl(
+            fd,
+            DRM_IOCTL_NVIDIA_GET_DEV_INFO,
+            params.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: fd came from open() above and is not used again.
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        log::warn!("{path}: GET_DEV_INFO refused ({err})");
+        return None;
+    }
+    Some(params)
 }
 
 /// Which host tree a `GetProcFiles`/`GetSysFiles` request refers to.
@@ -682,7 +739,7 @@ impl NvidiaBackend {
 
         // GET_SYS_FILES carries a second section the file stream does not
         // announce: a u32 count of DRI devices, then that many records of
-        // {name_len, major, minor, gpu_id} and the name. Omitting it does not
+        // {name_len, major, minor, slot_index, dev_info[9]} and the name. Omitting it does not
         // fail cleanly -- the driver reads whatever bytes follow the
         // terminator as the count, which is why a run with no second section
         // still logged "no DRI devices reported by VMM" and looked correct.
@@ -697,8 +754,8 @@ impl NvidiaBackend {
 
     /// The DRI section of a `GetSysFiles` response.
     ///
-    /// A count, then one `{name_len, major, minor, gpu_id}` record and name per
-    /// device. The guest uses these to register render nodes at the host's own
+    /// A count, then one `{name_len, major, minor, slot_index, dev_info[9]}`
+    /// record and name per device. The guest uses these to register render nodes at the host's own
     /// major and minor and to build the sysfs tree beneath them.
     ///
     /// This is not decoration for a headless guest. NVIDIA's Vulkan and EGL
@@ -720,12 +777,16 @@ impl NvidiaBackend {
         off += 4;
 
         for d in &devices {
-            let need = 16 + d.name.len();
+            // name_len, major, minor, slot_index, then the nine dev_info words.
+            let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
             if off + need > buf.len() {
                 log::warn!("DRI section truncated at {}", d.name);
                 break;
             }
-            for v in [d.name.len() as u32, d.major, d.minor, d.gpu_id] {
+            for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
+                .into_iter()
+                .chain(d.dev_info)
+            {
                 buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
                 off += 4;
             }
@@ -786,14 +847,32 @@ impl NvidiaBackend {
                     log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
                     continue;
                 };
-                log::info!("DRI {name} at {major}:{minor} on {addr} (gpu {index})");
+                let dev_info = host_dev_info(&format!("/dev/dri/{name}")).unwrap_or_else(|| {
+                    // Same shape the guest used to invent, so a refusal is no
+                    // worse than the old behaviour -- but it is logged above.
+                    let mut fallback = [0u32; NV_DEV_INFO_WORDS];
+                    fallback[3] = 1; // supports_alloc
+                    fallback[4] = 6; // generic_page_kind
+                    fallback[5] = 2; // page_kind_generation
+                    fallback[6] = 1; // sector_layout
+                    fallback[7] = 1; // supports_sync_fd
+                    fallback[8] = 1; // supports_semsurf
+                    fallback
+                });
+                log::info!(
+                    "DRI {name} at {major}:{minor} on {addr} (slot {index}, \
+                     nvidia gpu_id {:#x}, page kind {}/{}, sector layout {})",
+                    dev_info[0],
+                    dev_info[4],
+                    dev_info[5],
+                    dev_info[6],
+                );
                 out.push(DriDevice {
                     name,
                     major,
                     minor,
-                    // The guest matches this against the GPU's minor, which is
-                    // the index the slots were built in.
-                    gpu_id: index as u32,
+                    slot_index: index as u32,
+                    dev_info,
                 });
             }
         }

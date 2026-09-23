@@ -285,11 +285,36 @@ struct nvgpu_device;
 /* The shared memory region device memory is placed in, id 1. */
 #define NVGPU_SHM_ID 1
 
+/*
+ * Which capability bits GET_DEV_INFO claims. Parameters rather than constants
+ * because what the ICD asks for next depends on them, and the cost of being
+ * wrong is a device that will not initialise -- cheaper to sweep than to
+ * rebuild. Both default off: the ioctls behind them are not forwarded.
+ */
+static int nvgpu_claim_alloc;
+module_param_named(claim_alloc, nvgpu_claim_alloc, int, 0444);
+MODULE_PARM_DESC(claim_alloc, "GET_DEV_INFO reports supports_alloc");
+static int nvgpu_claim_sync_fd;
+module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
+MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
+
+/* struct drm_nvidia_get_dev_info_params is nine u32s. */
+#define NVGPU_DEV_INFO_WORDS 9
+/* name_len, major, minor, slot_index, then the dev_info words. */
+#define NVGPU_DRI_RECORD_BYTES (16 + 4 * NVGPU_DEV_INFO_WORDS)
+
 struct nvgpu_dri_dev {
   char name[32];
   u32 major;
   u32 minor;
-  u32 gpu_id;
+  /* Which GPU slot this node hangs off. Ours, not NVIDIA's -- it is matched
+   * against the GPU's minor, and is not the gpu_id GET_DEV_INFO reports. */
+  u32 slot_index;
+  /* GET_DEV_INFO as the host's own node answered it. Passed through rather
+   * than reconstructed here: the gpu_id in it is what the ICD matches a DRM
+   * node to an RM device by, and the page-kind and sector-layout fields are
+   * per-architecture and were previously hardcoded for Ampere. */
+  u32 dev_info[NVGPU_DEV_INFO_WORDS];
   struct cdev cdev;
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
@@ -424,6 +449,9 @@ struct nvgpu_fd {
   struct nvgpu_device *dev;
   u32 handle;      /* VMM-assigned handle from OPEN response */
   u32 device_type; /* NVGPU_DEV_*                            */
+  /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
+   * "not yet asked", which is why the counter starts at one. */
+  u64 drm_unique_id;
 };
 
 /* class for device_create() */
@@ -453,6 +481,7 @@ static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
 #define DRM_NVIDIA_GET_DEV_INFO 0x03     /* abs nr 0x43 */
 #define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
 #define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
+#define DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID 0x18 /* abs nr 0x58 */
 
 /*
  * struct drm_version — UAPI, stable since DRM was upstreamed.
@@ -539,20 +568,67 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
   switch (nr - DRM_COMMAND_BASE) {
 
   case DRM_NVIDIA_GET_DEV_INFO: {
-    struct drm_nvidia_get_dev_info_params p;
+    /*
+     * Straight from the host's own node. These fields describe how the card
+     * lays memory out, and the ICD matches a DRM node to an RM device by the
+     * gpu_id among them, so none of them is ours to invent -- the constants
+     * that used to be here reported gpu_id 0 where the host says 0x100, and a
+     * page kind correct only on the two architectures the comment named.
+     */
+    u32 info[NVGPU_DEV_INFO_WORDS];
 
-    memset(&p, 0, sizeof(p));
-    p.gpu_id = dri->gpu_id;
-    p.mig_device = 0;
-    p.primary_index = 0;
-    p.supports_alloc = 1;
-    p.generic_page_kind = 6; /* Turing/Ampere */
-    p.page_kind_generation = 2;
-    p.sector_layout = 1;
-    p.supports_sync_fd = 1;
-    p.supports_semsurf = 1;
+    BUILD_BUG_ON(sizeof(struct drm_nvidia_get_dev_info_params) !=
+                 NVGPU_DEV_INFO_WORDS * sizeof(u32));
 
-    if (copy_to_user(uarg, &p, sizeof(p)))
+    memcpy(info, dri->dev_info, sizeof(info));
+
+    /*
+     * The three capability bits are the host's answer about the host's node,
+     * and this node is not that node: it answers four ioctls and forwards
+     * nothing else. Passing them through unchanged is a promise this stub
+     * cannot keep -- with supports_semsurf set, the ICD asks for
+     * SEMSURF_FENCE_CTX_CREATE (nr 0x54) on every device creation, gets
+     * -ENOTTY, and fails the whole vkCreateDevice with
+     * ERROR_INITIALIZATION_FAILED.
+     *
+     * Each stays zero until the ioctls behind it are forwarded:
+     *
+     *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
+     *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d)
+     *   supports_sync_fd   PRIME_FENCE_CONTEXT_CREATE, GEM_PRIME_FENCE_ATTACH
+     *                      (0x05, 0x06)
+     *   supports_semsurf   SEMSURF_FENCE_CTX_CREATE and the three that follow
+     *                      it (0x14..0x17)
+     *
+     * gpu_id, primary_index and the page-kind and sector-layout fields stay
+     * as the host reported them: they describe the card, which is genuinely
+     * the host's, and the ICD matches a DRM node to an RM device by gpu_id.
+     */
+    info[3] = nvgpu_claim_alloc;   /* supports_alloc */
+    info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
+    info[8] = 0;                   /* supports_semsurf */
+
+    if (copy_to_user(uarg, info, sizeof(info)))
+      return -EFAULT;
+    return 0;
+  }
+
+  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID: {
+    /*
+     * A number that tells one open of this node from another. The ICD asks
+     * for it once a device has been created and uses it to recognise its own
+     * file; nothing outside this guest ever sees it, so a counter is a real
+     * answer rather than a stub, and it must not restart while the module is
+     * loaded or two live files would claim the same id.
+     */
+    static atomic64_t next_unique_id = ATOMIC64_INIT(1);
+    u64 id;
+
+    if (!nfd->drm_unique_id)
+      nfd->drm_unique_id = (u64)atomic64_inc_return(&next_unique_id);
+    id = nfd->drm_unique_id;
+
+    if (copy_to_user(uarg, &id, sizeof(id)))
       return -EFAULT;
     return 0;
   }
@@ -564,6 +640,16 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     return 0; /* not supported, no payload */
 
   default:
+    /*
+     * Named rather than silently refused. An ioctl this stub does not answer
+     * is the ICD asking for something the node cannot do yet, and -ENOTTY on
+     * its own turns up much later as a device that would not initialise.
+     */
+    dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                         "virtio-gpu-nv: unhandled nvidia-drm ioctl "
+                         "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
+                         nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
+                         _IOC_DIR(cmd));
     return -ENOTTY;
   }
 }
@@ -2219,7 +2305,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
        * but we stored minor there from the VMM side — see device.rs. */
       {
         u32 slot_minor = le32_to_cpu(dev->gpu_slots[gi].minor);
-        if (slot_minor != dri->gpu_id && gi != 0)
+        if (slot_minor != dri->slot_index && gi != 0)
           continue; /* only fall through for GPU 0 as a last resort */
       }
 
@@ -2281,7 +2367,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
     dev_info(&dev->vdev->dev,
              "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
              "gpu_id=0x%x\n",
-             dri->name, dri->major, dri->minor, dri->gpu_id);
+             dri->name, dri->major, dri->minor, dri->dev_info[0]);
   }
 
   return 0;
@@ -2610,12 +2696,13 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     dev->num_dri_devs = 0;
 
     for (i = 0; i < num_dri; i++) {
-      __le32 raw_name_len, raw_major, raw_minor, raw_gpu_id;
-      u32 name_len, major, minor, gpu_id, nl;
-      int idx;
+      __le32 raw_name_len, raw_major, raw_minor, raw_slot, raw_info;
+      u32 name_len, major, minor, slot_index, nl;
+      u32 info[NVGPU_DEV_INFO_WORDS];
+      int idx, w;
 
-      /* 16 bytes: name_len + major + minor + gpu_id */
-      if (p + 16 > end) {
+      /* name_len + major + minor + slot_index, then the dev_info words */
+      if (p + NVGPU_DRI_RECORD_BYTES > end) {
         dev_warn(&dev->vdev->dev,
                  "virtio-gpu-nv: DRI section truncated at entry %u\n", i);
         break;
@@ -2624,12 +2711,16 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       memcpy(&raw_name_len, p, sizeof(__le32));
       memcpy(&raw_major, p + 4, sizeof(__le32));
       memcpy(&raw_minor, p + 8, sizeof(__le32));
-      memcpy(&raw_gpu_id, p + 12, sizeof(__le32)); /* ← new */
+      memcpy(&raw_slot, p + 12, sizeof(__le32));
       name_len = le32_to_cpu(raw_name_len);
       major = le32_to_cpu(raw_major);
       minor = le32_to_cpu(raw_minor);
-      gpu_id = le32_to_cpu(raw_gpu_id); /* ← new */
-      p += 16;                          /* was 12 */
+      slot_index = le32_to_cpu(raw_slot);
+      for (w = 0; w < NVGPU_DEV_INFO_WORDS; w++) {
+        memcpy(&raw_info, p + 16 + 4 * w, sizeof(__le32));
+        info[w] = le32_to_cpu(raw_info);
+      }
+      p += NVGPU_DRI_RECORD_BYTES;
 
       if (name_len == 0 || p + name_len > end) {
         dev_warn(&dev->vdev->dev,
@@ -2643,12 +2734,15 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       memcpy(dev->dri_devs[idx].name, p, nl);
       dev->dri_devs[idx].major = major;
       dev->dri_devs[idx].minor = minor;
-      dev->dri_devs[idx].gpu_id = gpu_id; /* ← new */
+      dev->dri_devs[idx].slot_index = slot_index;
+      memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
       dev->num_dri_devs++;
 
       dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: DRI %s (%u:%u) gpu_id=0x%x from host\n",
-               dev->dri_devs[idx].name, major, minor, gpu_id);
+               "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
+               "page kind %u/%u, sector layout %u\n",
+               dev->dri_devs[idx].name, major, minor, slot_index, info[0],
+               info[4], info[5], info[6]);
       p += name_len;
     }
   }
