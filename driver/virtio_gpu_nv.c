@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci-ecam.h>
+#include <linux/numa.h>
 #include <linux/pci.h>
 #include <linux/proc_fs.h>
 #include <linux/scatterlist.h>
@@ -328,9 +329,30 @@ struct nvgpu_pci_slot {
   u8 func;
 };
 
+/*
+ * The PCI core reads a bus's sysdata as the architecture's own type. On x86
+ * that is `struct pci_sysdata`, and the fields below have to line up with the
+ * front of it:
+ *
+ *     struct pci_sysdata { int domain; int node; ... };
+ *
+ * `domain` was mirrored here from the start, for pci_domain_nr(). `node` was
+ * not, and everything after `domain` in this struct was therefore read as the
+ * bus's NUMA node -- that is, the first four bytes of the PCI address string,
+ * "0000", or 0x30303030. It went unnoticed because it is only ever read under
+ * CONFIG_NUMA, which the guest kernel did not have; turn it on and the first
+ * allocation the DRM core makes against this device oopses in ___slab_alloc,
+ * indexing a node array a billion entries past its end.
+ *
+ * Mirrored rather than embedded so the struct stays buildable where
+ * `struct pci_sysdata` is not the arch's sysdata type; the layout is what
+ * matters, and a wrong one is silent.
+ */
 struct nvgpu_pci_root {
   int domain; /* MUST be first — x86 pci_domain_nr()
                * reads domain from sysdata offset 0 */
+  int node;   /* MUST be second — x86 pcibus_to_node()
+               * reads the NUMA node from sysdata offset 4 */
   struct nvgpu_pci_slot slot;
   struct nvgpu_device *nvdev; /* back pointer        */
   struct pci_host_bridge *bridge;
@@ -410,11 +432,15 @@ static struct class *nvgpu_class;
 /* ───────── nvidia-drm stub — no DRM subsystem headers needed ───────── */
 
 static long nvgpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
+                           unsigned long arg);
 
 /*
- * We handle DRM ioctls without involving drm_ioctl() because that function
- * immediately casts filp->private_data to struct drm_file * and dereferences
- * ->minor->dev — our private_data is struct nvgpu_fd *, not struct drm_file *.
+ * The nvidia-drm ioctls, answered here rather than through a drm_ioctl_desc
+ * table. drm_ioctl() serves the core ones (VERSION and friends) and answers
+ * -EINVAL for anything in the driver range, since this driver registers no
+ * table of its own; nvgpu_drm_unlocked_ioctl() takes that range first and
+ * leaves the rest to the core.
  *
  * All types used below are stable UAPI structs; we define only what we use.
  */
@@ -1193,9 +1219,13 @@ nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int nr) {
 }
 
 /* Main ioctl dispatcher */
-static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
-                        unsigned long arg) {
-  struct nvgpu_fd *nfd = filp->private_data;
+/*
+ * Split from nvgpu_ioctl so a DRM node can reach it. On a real DRM node
+ * filp->private_data is a `struct drm_file *`, and ours hangs off its
+ * driver_priv -- so the caller supplies the fd rather than this deriving it.
+ */
+static long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
+                           unsigned long arg) {
   unsigned int nr = _IOC_NR(cmd);
   unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
@@ -1223,6 +1253,11 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
 }
 
 /* ───────── UVM ioctl ───────── */
+
+static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
+                        unsigned long arg) {
+  return nvgpu_ioctl_fd(filp->private_data, cmd, arg);
+}
 
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg) {
@@ -2056,6 +2091,45 @@ static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
  * Guarded because the flag postdates the kernels this module still builds
  * against; on those the check does not exist either.
  */
+/*
+ * The DRM node's ioctl entry point.
+ *
+ * Three kinds of ioctl arrive on /dev/dri/renderD128:
+ *
+ *   driver range (DRM_COMMAND_BASE..END)  nvidia-drm's own -- GET_DEV_INFO and
+ *                                         the two SUPPORTED probes. drm_ioctl()
+ *                                         answers -EINVAL for these because we
+ *                                         register no drm_ioctl_desc table, so
+ *                                         they are taken here first.
+ *   other type 'd'                        core DRM: VERSION, GET_UNIQUE, ...
+ *                                         left to drm_ioctl().
+ *   type 'F'                              NVIDIA RM, proxied to the host like
+ *                                         on any other node.
+ */
+static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
+                                     unsigned long arg) {
+  struct drm_file *file = filp->private_data;
+  struct nvgpu_fd *nfd;
+  unsigned int nr = _IOC_NR(cmd);
+
+  if (!file || !file->driver_priv)
+    return -ENODEV;
+  nfd = file->driver_priv;
+
+  if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE) {
+    if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
+      struct nvgpu_dri_dev *dri = file->minor->dev->dev_private;
+
+      if (!dri)
+        return -ENODEV;
+      return nvgpu_drm_handle_ioctl(nfd, dri, cmd, arg);
+    }
+    return drm_ioctl(filp, cmd, arg);
+  }
+
+  return nvgpu_ioctl_fd(nfd, cmd, arg);
+}
+
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
 #if defined(FOP_UNSIGNED_OFFSET)
@@ -2063,8 +2137,8 @@ static const struct file_operations nvgpu_drm_fops = {
 #endif
     .open = drm_open,
     .release = drm_release,
-    .unlocked_ioctl = drm_ioctl,
-    .compat_ioctl = drm_compat_ioctl,
+    .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
+    .compat_ioctl = nvgpu_drm_unlocked_ioctl,
     .poll = drm_poll,
     .read = drm_read,
     .llseek = noop_llseek,
@@ -2337,6 +2411,10 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
 
     bridge->dev.parent = &dev->vdev->dev;
     root->domain = (int)root->slot.domain;
+    /* No node to claim: the GPU is the host's, and the guest's idea of
+     * distance to it means nothing. NUMA_NO_NODE lets every allocation made
+     * against this device fall back to the caller's node. */
+    root->node = NUMA_NO_NODE;
     bridge->sysdata = root;
     bridge->ops = &nvgpu_pci_ops;
     bridge->busnr = root->slot.bus_nr;
