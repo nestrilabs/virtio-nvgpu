@@ -339,6 +339,12 @@ pub struct NvidiaBackend {
     /// mapped more than once -- the guest maps it, exports it, an importer maps
     /// it again -- and each placement costs a slice of a finite window.
     dri_maps: std::collections::HashMap<(u64, u64), u32>,
+    /// Every message this backend has served, by kind.
+    ///
+    /// Kept because "how often does the guest have to ask the host anything"
+    /// is the question a benchmark of this design turns on, and counting log
+    /// lines answers a different one -- what the log level happened to print.
+    msg_counts: std::collections::BTreeMap<&'static str, u64>,
     /// Every live placement, by the id the guest quotes to take it back.
     live_maps: std::collections::HashMap<u32, LiveMap>,
     next_mapping_id: u32,
@@ -371,6 +377,7 @@ impl NvidiaBackend {
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
+            msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             next_mapping_id: 1,
             current_msg: MsgType::Ioctl,
@@ -458,6 +465,15 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
+        let total: u64 = self.msg_counts.values().sum();
+        log::info!(
+            "NvidiaBackend::teardown: served {total} message(s): {}",
+            self.msg_counts
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         // Restore SHM backing and reclaim every extent before closing host
         // fds. A guest process that exits without unmapping is the normal
         // case, not an error -- most of the mappings in a captured trace are
@@ -492,6 +508,18 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0);
         };
         self.current_msg = msg_type;
+        *self
+            .msg_counts
+            .entry(match msg_type {
+                MsgType::Open => "open",
+                MsgType::Close => "close",
+                MsgType::Ioctl => "ioctl",
+                MsgType::Mmap => "mmap",
+                MsgType::Munmap => "munmap",
+                MsgType::GetProcFiles => "get_proc_files",
+                MsgType::GetSysFiles => "get_sys_files",
+            })
+            .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
         // after Open acts on one, and Open's response returns one the same way.
         self.current_handle = hdr.handle;
