@@ -602,8 +602,16 @@ mod tests {
 /// crate names no VMM. A transport implements it, and a backend without one
 /// keeps its mappings to itself and says so.
 pub trait WindowPlacer: Send {
-    /// Put `len` bytes of `fd` at `shm_offset` within the window.
-    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, writable: bool) -> Result<()>;
+    /// Put `len` bytes of `fd`, starting `fd_offset` bytes into it, at
+    /// `shm_offset` within the window.
+    ///
+    /// `fd_offset` is zero for every RM mapping -- the descriptor names the
+    /// mapping already, and the offset is a cookie RM chose rather than a
+    /// position in a file. A DRM object is the exception: GEM_MAP_OFFSET hands
+    /// out a file offset and the memory is only reachable by mapping the node
+    /// there.
+    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, fd_offset: u64, writable: bool)
+        -> Result<()>;
 
     /// Return a range to empty. Not an unmap: leaving a hole would let a later
     /// access reach no mapping at all in a range the memory slot still covers.

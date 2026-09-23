@@ -14,6 +14,10 @@
 #include <drm/drm.h>
 #include <linux/cdev.h>
 #include <linux/completion.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/io.h>
+#include <linux/iosys-map.h>
 #include <linux/cpu.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -567,16 +571,25 @@ struct nvgpu_gem_object {
   u32 host_handle;  /* the GEM handle in the host's drm_file */
   u32 obj_type;     /* what GEM_IDENTIFY_OBJECT answers */
   /*
-   * Pages, allocated only if something actually maps this buffer's dma-buf.
-   * The real memory is on the host; these exist because
-   * dma_buf_map_attachment() asks for an sg_table and fails the import
-   * without one. Most buffers are never mapped and never pay for this.
+   * Where the host's memory for this object sits in the shared window, and
+   * whether it has been put there yet. Placed on the first map and not before:
+   * most buffers are only ever touched by the GPU, and a placement costs a
+   * round trip and a slice of a window that is finite.
+   *
+   * These are the buffer. Everything that hands the memory out -- the node's
+   * mmap, the dma-buf's, its vmap, and the addresses an importer gets -- comes
+   * from this one placement, so they all name the same bytes on the host.
    */
-  struct page **import_pages;
-  unsigned long import_npages;
+  struct mutex map_lock;
+  u64 window_off;
+  u32 mapping_id; /* what the backend takes back in MUNMAP */
+  bool window_valid;
 };
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
+
+/* Defined below; named here because the ioctls that test it come first. */
+static const struct drm_gem_object_funcs nvgpu_gem_funcs;
 
 static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
                                   u32 host_handle, size_t size,
@@ -831,14 +844,24 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     return nvgpu_gem_identify(file, uarg);
 
   case DRM_NVIDIA_GEM_MAP_OFFSET: {
-    /* u32 handle IN, u32 pad, u64 offset OUT */
+    /*
+     * u32 handle IN, u32 pad, u64 offset OUT -- answered here, not forwarded.
+     *
+     * The offset a caller gets has to be one it can mmap, and it will mmap
+     * *this* node. The host's offset names a position in the host's node and
+     * would land on whatever this node happens to have at that offset, which
+     * is nothing. So the proxy gets an offset of its own, the core's mmap
+     * finds it, and nvgpu_gem_object_mmap() maps the host's memory through the
+     * shared window. The host's offset is still needed, but only inside the
+     * driver, and it is fetched at placement time.
+     */
     struct {
       __u32 handle;
       __u32 pad;
       __u64 offset;
     } p;
-    u32 host_handle, owner_handle, caller_handle;
-    long ret;
+    struct drm_gem_object *obj;
+    int ret;
 
     if (!file)
       return -ENOTTY;
@@ -847,17 +870,24 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     if (copy_from_user(&p, uarg, sizeof(p)))
       return -EFAULT;
 
-    caller_handle = p.handle;
-    ret = nvgpu_gem_to_host(file, caller_handle, &host_handle, &owner_handle);
+    obj = drm_gem_object_lookup(file, p.handle);
+    if (!obj)
+      return -ENOENT;
+    if (obj->funcs != &nvgpu_gem_funcs) {
+      drm_gem_object_put(obj);
+      return -ENOENT;
+    }
+
+    ret = drm_gem_create_mmap_offset(obj);
+    if (!ret)
+      p.offset = drm_vma_node_offset_addr(&obj->vma_node);
+    drm_gem_object_put(obj);
     if (ret)
       return ret;
 
-    p.handle = host_handle;
-    ret = nvgpu_ioctl_flat_h(nfd->dev, owner_handle, cmd, &p, sizeof(p));
-    p.handle = caller_handle; /* the caller reads back its own handle */
     if (copy_to_user(uarg, &p, sizeof(p)))
       return -EFAULT;
-    return ret;
+    return 0;
   }
 
   case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: {
@@ -2101,13 +2131,24 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
                        sizeof(close));
   }
 
-  if (ng->import_pages) {
-    unsigned long i;
+  /*
+   * Give the window space back. The window is a gigabyte and a swapchain is
+   * megabytes at a time, so a guest that allocates and frees buffers for an
+   * hour exhausts it otherwise -- and the failure lands on whichever mapping
+   * happens to be next, not on the one that leaked.
+   */
+  if (ng->window_valid && ng->mapping_id) {
+    struct nvgpu_munmap_req *req = kzalloc(sizeof(*req), GFP_KERNEL);
+    struct nvgpu_munmap_resp *resp = kzalloc(sizeof(*resp), GFP_KERNEL);
 
-    for (i = 0; i < ng->import_npages; i++)
-      if (ng->import_pages[i])
-        __free_page(ng->import_pages[i]);
-    kvfree(ng->import_pages);
+    if (req && resp) {
+      req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_MUNMAP);
+      req->hdr.handle = cpu_to_le32(ng->owner_handle);
+      req->mapping_id = cpu_to_le32(ng->mapping_id);
+      nvgpu_send_recv(ng->dev, req, sizeof(*req), resp, sizeof(*resp));
+    }
+    kfree(req);
+    kfree(resp);
   }
 
   drm_gem_object_release(obj);
@@ -2115,44 +2156,282 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
 }
 
 /*
- * The backing pages a dma-buf import asks for.
+ * ───────── the host's memory, reached through the shared window ─────────
  *
- * The real memory is on the host, so there is nothing here to point at.
- * dma_buf_map_attachment() still demands an sg_table and refuses the import
- * without one, so pages are allocated on the first map and never before --
- * most buffers are only ever touched by the GPU and never mapped at all.
+ * The object's memory is the host's and cannot be copied here: a swapchain
+ * image is written by the host's GPU. What can travel is the *address*. The
+ * backend maps the host's DRM node at the object's own mmap offset and places
+ * that mapping in the shared window -- the same window that already carries
+ * every RM mapping -- and the guest reaches it at a physical address it works
+ * out from its own PCI configuration.
  *
- * These pages are not the buffer. Anything that reads them sees zeroes. They
- * exist to get the import accepted; making the host's memory reachable through
- * them is the step after this one.
+ * Until this existed, the sg_table handed to an importer described freshly
+ * allocated zeroed pages, which got the import accepted and made anything that
+ * read the buffer read zeroes.
  */
-static struct sg_table *nvgpu_gem_get_sg_table(struct drm_gem_object *obj) {
-  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
-  unsigned long n = obj->size >> PAGE_SHIFT, i;
 
-  if (!ng->import_pages) {
-    ng->import_pages =
-        kvmalloc_array(n, sizeof(struct page *), GFP_KERNEL | __GFP_ZERO);
-    if (!ng->import_pages)
-      return ERR_PTR(-ENOMEM);
-    for (i = 0; i < n; i++) {
-      ng->import_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
-      if (!ng->import_pages[i]) {
-        while (i--)
-          __free_page(ng->import_pages[i]);
-        kvfree(ng->import_pages);
-        ng->import_pages = NULL;
-        return ERR_PTR(-ENOMEM);
-      }
-    }
-    ng->import_npages = n;
+/* drm_nvidia_gem_map_offset_params, as the host's nvidia-drm defines it. */
+struct nvgpu_gem_map_offset_params {
+  __u32 handle;
+  __u32 pad;
+  __u64 offset;
+};
+
+#define NVGPU_IOCTL_GEM_MAP_OFFSET                                             \
+  _IOWR(DRM_IOCTL_BASE, DRM_COMMAND_BASE + DRM_NVIDIA_GEM_MAP_OFFSET,          \
+        struct nvgpu_gem_map_offset_params)
+
+/*
+ * Put this object's memory in the window, once.
+ *
+ * Two steps, both on the *owner's* handle: ask the host for the mmap offset of
+ * its GEM object, then ask the backend to map the node there and place it. The
+ * offset is the host's and never reaches guest userspace -- what a client gets
+ * from GEM_MAP_OFFSET is an offset into this node, answered below.
+ */
+static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
+  struct drm_gem_object *obj = &ng->base;
+  struct nvgpu_gem_map_offset_params mo = {};
+  struct nvgpu_mmap_req *req;
+  struct nvgpu_mmap_resp *resp;
+  u64 window_off;
+  long ret;
+
+  if (READ_ONCE(ng->window_valid))
+    return 0;
+
+  if (!ng->dev->window.len) {
+    dev_warn_once(&ng->dev->vdev->dev,
+                  "virtio-gpu-nv: no shared memory region, so a buffer's "
+                  "memory cannot be reached from the guest\n");
+    return -ENOTSUPP;
   }
-  return drm_prime_pages_to_sg(obj->dev, ng->import_pages, n);
+
+  mutex_lock(&ng->map_lock);
+  if (ng->window_valid) {
+    mutex_unlock(&ng->map_lock);
+    return 0;
+  }
+
+  mo.handle = ng->host_handle;
+  ret = nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle,
+                           NVGPU_IOCTL_GEM_MAP_OFFSET, &mo, sizeof(mo));
+  if (ret < 0) {
+    dev_warn(&ng->dev->vdev->dev,
+             "virtio-gpu-nv: the host would not give object %u an mmap "
+             "offset: %ld\n",
+             ng->host_handle, ret);
+    goto out;
+  }
+
+  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+  if (!req || !resp) {
+    ret = -ENOMEM;
+    goto out_free;
+  }
+
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_MMAP);
+  req->hdr.handle = cpu_to_le32(ng->owner_handle);
+  req->size = cpu_to_le64(obj->size);
+  req->offset = cpu_to_le64(mo.offset);
+  req->prot = cpu_to_le32(3); /* read-write: the host's GPU writes it */
+
+  ret = nvgpu_send_recv(ng->dev, req, sizeof(*req), resp, sizeof(*resp));
+  if (ret < 0)
+    goto out_free;
+  ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+  if (ret < 0)
+    goto out_free;
+
+  window_off = le64_to_cpu(resp->guest_phys_addr);
+  if (window_off + obj->size > ng->dev->window.len) {
+    dev_warn(&ng->dev->vdev->dev,
+             "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "
+             "window\n",
+             window_off, obj->size, ng->dev->window.len);
+    ret = -ERANGE;
+    goto out_free;
+  }
+
+  ng->window_off = window_off;
+  ng->mapping_id = le32_to_cpu(resp->mapping_id);
+  smp_wmb(); /* the offset is readable before the flag says it is */
+  WRITE_ONCE(ng->window_valid, true);
+  ret = 0;
+
+out_free:
+  kfree(req);
+  kfree(resp);
+out:
+  mutex_unlock(&ng->map_lock);
+  return (int)ret;
 }
+
+/* Guest physical address of the object's memory. Valid only after placement. */
+static phys_addr_t nvgpu_gem_phys(struct nvgpu_gem_object *ng) {
+  return (phys_addr_t)(ng->dev->window.addr + ng->window_off);
+}
+
+/*
+ * Map the object into a process, for the node's own mmap and for an importer
+ * that maps the dma-buf. Write-combining, because it is device memory across a
+ * PCI window and a client writing a buffer streams it.
+ */
+static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
+                                 struct vm_area_struct *vma) {
+  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+  unsigned long size = vma->vm_end - vma->vm_start;
+  unsigned long node_start = drm_vma_node_start(&obj->vma_node);
+  u64 within;
+  int ret;
+
+  /*
+   * vm_pgoff arrives absolute -- it still carries the object's fake offset,
+   * whether it came through the node's mmap or the dma-buf's, which adds the
+   * offset back before calling this. Neither subtracts it, so this does.
+   */
+  if (vma->vm_pgoff < node_start)
+    return -EINVAL;
+  within = (u64)(vma->vm_pgoff - node_start) << PAGE_SHIFT;
+  if (within + size > obj->size)
+    return -EINVAL;
+
+  ret = nvgpu_gem_place_in_window(ng);
+  if (ret)
+    return ret;
+
+  vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+  vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+
+  return io_remap_pfn_range(vma, vma->vm_start,
+                            (nvgpu_gem_phys(ng) + within) >> PAGE_SHIFT, size,
+                            vma->vm_page_prot);
+}
+
+/*
+ * A kernel mapping of the buffer, which is what a CPU consumer of a dma-buf
+ * asks for. It is iomem -- there is no struct page behind a PCI window -- so
+ * it goes into the iosys_map as such and a caller that cannot handle iomem
+ * will say so rather than dereference it.
+ */
+static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
+  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+  void __iomem *vaddr;
+  int ret;
+
+  ret = nvgpu_gem_place_in_window(ng);
+  if (ret)
+    return ret;
+
+  vaddr = ioremap_wc(nvgpu_gem_phys(ng), obj->size);
+  if (!vaddr)
+    return -ENOMEM;
+
+  iosys_map_set_vaddr_iomem(map, vaddr);
+  return 0;
+}
+
+static void nvgpu_gem_vunmap(struct drm_gem_object *obj,
+                             struct iosys_map *map) {
+  if (map->is_iomem && map->vaddr_iomem)
+    iounmap(map->vaddr_iomem);
+  iosys_map_clear(map);
+}
+
+/*
+ * The dma-buf an importer gets.
+ *
+ * Not the core's exporter: drm_gem_map_dma_buf() asks for an sg_table of
+ * struct pages and then dma-maps it, and there are no pages here. What an
+ * importer needs is a DMA address for the window, which dma_map_resource()
+ * gives for exactly this case -- memory that is addressable but not backed by
+ * pages.
+ */
+static struct sg_table *nvgpu_dmabuf_map(struct dma_buf_attachment *attach,
+                                         enum dma_data_direction dir) {
+  struct drm_gem_object *obj = attach->dmabuf->priv;
+  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+  struct sg_table *sgt;
+  dma_addr_t addr;
+  int ret;
+
+  ret = nvgpu_gem_place_in_window(ng);
+  if (ret)
+    return ERR_PTR(ret);
+
+  sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+  if (!sgt)
+    return ERR_PTR(-ENOMEM);
+  if (sg_alloc_table(sgt, 1, GFP_KERNEL)) {
+    kfree(sgt);
+    return ERR_PTR(-ENOMEM);
+  }
+
+  addr = dma_map_resource(attach->dev, nvgpu_gem_phys(ng), obj->size, dir,
+                          DMA_ATTR_SKIP_CPU_SYNC);
+  if (dma_mapping_error(attach->dev, addr)) {
+    sg_free_table(sgt);
+    kfree(sgt);
+    return ERR_PTR(-EIO);
+  }
+
+  sg_dma_address(sgt->sgl) = addr;
+  sg_dma_len(sgt->sgl) = obj->size;
+  sgt->nents = 1;
+  return sgt;
+}
+
+static void nvgpu_dmabuf_unmap(struct dma_buf_attachment *attach,
+                               struct sg_table *sgt,
+                               enum dma_data_direction dir) {
+  dma_unmap_resource(attach->dev, sg_dma_address(sgt->sgl), sg_dma_len(sgt->sgl),
+                     dir, DMA_ATTR_SKIP_CPU_SYNC);
+  sg_free_table(sgt);
+  kfree(sgt);
+}
+
+static const struct dma_buf_ops nvgpu_dmabuf_ops = {
+    .map_dma_buf = nvgpu_dmabuf_map,
+    .unmap_dma_buf = nvgpu_dmabuf_unmap,
+    .release = drm_gem_dmabuf_release,
+    .mmap = drm_gem_dmabuf_mmap,
+    .vmap = drm_gem_dmabuf_vmap,
+    .vunmap = drm_gem_dmabuf_vunmap,
+};
+
+static struct dma_buf *nvgpu_gem_export(struct drm_gem_object *obj, int flags) {
+  DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+
+  exp_info.ops = &nvgpu_dmabuf_ops;
+  exp_info.size = obj->size;
+  exp_info.flags = flags;
+  exp_info.priv = obj;
+  exp_info.resv = obj->resv;
+
+  return drm_gem_dmabuf_export(obj->dev, &exp_info);
+}
+
+/*
+ * Both mmap paths take a reference on the object for the vma and leave it to
+ * the vma to give back, through the vm_ops they copy out of the object's funcs.
+ * Without these the reference is never dropped: the object outlives its last
+ * handle, its free never runs, and the window placement it holds is never
+ * returned -- which showed up as a guest exhausting a gigabyte of window in 191
+ * buffers it had already closed.
+ */
+static const struct vm_operations_struct nvgpu_gem_vm_ops = {
+    .open = drm_gem_vm_open,
+    .close = drm_gem_vm_close,
+};
 
 static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
     .free = nvgpu_gem_free,
-    .get_sg_table = nvgpu_gem_get_sg_table,
+    .vm_ops = &nvgpu_gem_vm_ops,
+    .export = nvgpu_gem_export,
+    .mmap = nvgpu_gem_object_mmap,
+    .vmap = nvgpu_gem_vmap,
+    .vunmap = nvgpu_gem_vunmap,
 };
 
 /*
@@ -2176,6 +2455,7 @@ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
   if (!ng)
     return -ENOMEM;
 
+  mutex_init(&ng->map_lock);
   drm_gem_private_object_init(file->minor->dev, &ng->base, size);
   ng->base.funcs = &nvgpu_gem_funcs;
   ng->dev = nfd->dev;
@@ -2947,6 +3227,7 @@ static const struct file_operations nvgpu_drm_fops = {
     .release = drm_release,
     .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
     .compat_ioctl = nvgpu_drm_unlocked_ioctl,
+    .mmap = drm_gem_mmap,
     .poll = drm_poll,
     .read = drm_read,
     .llseek = noop_llseek,

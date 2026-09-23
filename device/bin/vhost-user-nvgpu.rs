@@ -62,11 +62,18 @@ struct Args {
 struct VhostWindow(Backend);
 
 impl WindowPlacer for VhostWindow {
-    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, writable: bool) -> device::error::Result<()> {
+    fn place(
+        &self,
+        shm_offset: u64,
+        len: u64,
+        fd: RawFd,
+        fd_offset: u64,
+        writable: bool,
+    ) -> device::error::Result<()> {
         let req = VhostUserMMap {
             shmid: NV_SHM_ID,
             padding: [0; 7],
-            fd_offset: 0,
+            fd_offset,
             shm_offset,
             len,
             flags: if writable {
