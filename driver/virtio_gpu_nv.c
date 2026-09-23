@@ -37,7 +37,9 @@
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_prime.h>
 
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
@@ -302,9 +304,22 @@ struct nvgpu_device;
  * wrong is a device that will not initialise -- cheaper to sweep than to
  * rebuild. Both default off: the ioctls behind them are not forwarded.
  */
-static int nvgpu_claim_alloc;
+/*
+ * supports_alloc is on by default now, because the ioctls behind it work: a
+ * Wayland client presents and 616 frames were encoded and decoded clean with
+ * it set. It stays a parameter so it can be turned off to tell a GEM problem
+ * from everything else in one boot.
+ */
+static int nvgpu_claim_alloc = 1;
 module_param_named(claim_alloc, nvgpu_claim_alloc, int, 0444);
 MODULE_PARM_DESC(claim_alloc, "GET_DEV_INFO reports supports_alloc");
+/*
+ * supports_sync_fd stays off: PRIME_FENCE_CONTEXT_CREATE and
+ * GEM_PRIME_FENCE_ATTACH (0x05, 0x06) are still not forwarded. Nothing has
+ * asked for them -- no unhandled-ioctl line names either -- so the encode path
+ * does not need them, and claiming a capability nothing serves is what rung 5
+ * cost us.
+ */
 static int nvgpu_claim_sync_fd;
 module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
 MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
@@ -495,13 +510,88 @@ struct nvgpu_gem_nested_desc {
    * NVKMS import that simply refused.
    */
   s32 fd_offset;
+  /*
+   * Where the GEM handle sits in the outer struct, and which way it travels.
+   * `handle_is_out` means the host creates the object and we stand a proxy in
+   * front of it before the caller ever sees a number; otherwise the caller
+   * names a proxy and we translate it to the host's handle on the way in.
+   */
+  s32 handle_offset;
+  bool handle_is_out;
+  /* Offset of the u64 buffer size, used to size the proxy. -1 if none. */
+  s32 size_field_offset;
 };
 
 #define NVGPU_GEM_NO_FD (-1)
+#define NVGPU_GEM_NO_FIELD (-1)
 
-static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
+static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
+                                       struct drm_file *file, unsigned int cmd,
                                        void __user *uarg,
                                        const struct nvgpu_gem_nested_desc *d);
+
+/*
+ * ───────── GEM objects, proxied ─────────
+ *
+ * The host owns the memory and the object that names it. The guest needs an
+ * object too, because the ioctls that make a swapchain usable are *core* DRM:
+ * PRIME_HANDLE_TO_FD, PRIME_FD_TO_HANDLE and GEM_CLOSE are served by
+ * drm_ioctl() out of this node's own object space, and that space was empty.
+ * Forwarding those to the host cannot work either -- the dma-buf the host
+ * would hand back is a file in the *backend's* process, and a Wayland client
+ * has to pass its buffer to a compositor as a descriptor in this guest.
+ *
+ * So each host GEM object gets a guest object standing in front of it, and the
+ * core's own PRIME and handle machinery does the work. Only three things cross
+ * the boundary: creating the host object, closing it, and the GEM ioctls that
+ * act on it -- each translated from the guest handle to the host one.
+ *
+ * `owner_handle` is the backend handle of the drm_file the host object belongs
+ * to, not of whichever file is asking now. A GEM handle is per drm_file on the
+ * host, so an op on this object has to go back to the file that created it,
+ * whatever guest process is holding the proxy. That is what lets a compositor
+ * PRIME-import a client's buffer and have the forwarded ops still land on the
+ * right host object.
+ */
+
+/* drm_nvidia_gem_object_type, as GEM_IDENTIFY_OBJECT reports it. */
+#define NVGPU_GEM_OBJECT_NVKMS 0
+#define NVGPU_GEM_OBJECT_DMABUF 1
+#define NVGPU_GEM_OBJECT_USERMEMORY 2
+#define NVGPU_GEM_OBJECT_UNKNOWN 0x7fffffff
+
+struct nvgpu_gem_object {
+  struct drm_gem_object base;
+  struct nvgpu_device *dev;
+  u32 owner_handle; /* backend handle of the drm_file owning the host object */
+  u32 host_handle;  /* the GEM handle in the host's drm_file */
+  u32 obj_type;     /* what GEM_IDENTIFY_OBJECT answers */
+  /*
+   * Pages, allocated only if something actually maps this buffer's dma-buf.
+   * The real memory is on the host; these exist because
+   * dma_buf_map_attachment() asks for an sg_table and fails the import
+   * without one. Most buffers are never mapped and never pay for this.
+   */
+  struct page **import_pages;
+  unsigned long import_npages;
+};
+
+#define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
+
+static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
+                                  u32 host_handle, size_t size,
+                                  u32 *guest_handle);
+static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
+                             u32 *host_handle, u32 *owner_handle);
+static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
+static long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
+                               unsigned int cmd, void *kbuf, u32 sz);
+
+/* struct drm_gem_close — UAPI, include/uapi/drm/drm.h */
+struct nvgpu_drm_gem_close {
+  __u32 handle;
+  __u32 pad;
+};
 
 /*
  * The nvidia-drm ioctls, answered here rather than through a drm_ioctl_desc
@@ -551,6 +641,9 @@ static const struct nvgpu_gem_nested_desc nvgpu_gem_import_nvkms = {
     .size_offset = 16,
     /* struct NvKmsKapiPrivImportMemoryParams { int memFd; ... } */
     .fd_offset = 0,
+    .handle_offset = 24,
+    .handle_is_out = true,
+    .size_field_offset = 0, /* mem_size */
 };
 
 /*
@@ -563,6 +656,9 @@ static const struct nvgpu_gem_nested_desc nvgpu_gem_export_dmabuf = {
     .size_offset = 16,
     /* struct NvKmsKapiPrivExportMemoryParams { int memFd; } */
     .fd_offset = 0,
+    .handle_offset = 0,
+    .handle_is_out = false,
+    .size_field_offset = NVGPU_GEM_NO_FIELD,
 };
 
 /*
@@ -606,7 +702,8 @@ struct drm_nvidia_get_dev_info_params {
  * Everything else → -ENOTTY.
  */
 static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
-                                   struct nvgpu_dri_dev *dri, unsigned int cmd,
+                                   struct nvgpu_dri_dev *dri,
+                                   struct drm_file *file, unsigned int cmd,
                                    unsigned long arg) {
   unsigned int nr = _IOC_NR(cmd);
   void __user *uarg = (void __user *)arg;
@@ -727,10 +824,86 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
    * These three are flat -- every field is a value -- so the whole struct
    * goes across and the answer comes back into it.
    */
-  case DRM_NVIDIA_GEM_MAP_OFFSET:
-  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY:
   case DRM_NVIDIA_GEM_IDENTIFY_OBJECT:
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, _IOC_SIZE(cmd));
+    /* Answered from the proxy; see nvgpu_gem_identify(). */
+    if (!file)
+      return -ENOTTY;
+    return nvgpu_gem_identify(file, uarg);
+
+  case DRM_NVIDIA_GEM_MAP_OFFSET: {
+    /* u32 handle IN, u32 pad, u64 offset OUT */
+    struct {
+      __u32 handle;
+      __u32 pad;
+      __u64 offset;
+    } p;
+    u32 host_handle, owner_handle, caller_handle;
+    long ret;
+
+    if (!file)
+      return -ENOTTY;
+    if (_IOC_SIZE(cmd) != sizeof(p))
+      return -EINVAL;
+    if (copy_from_user(&p, uarg, sizeof(p)))
+      return -EFAULT;
+
+    caller_handle = p.handle;
+    ret = nvgpu_gem_to_host(file, caller_handle, &host_handle, &owner_handle);
+    if (ret)
+      return ret;
+
+    p.handle = host_handle;
+    ret = nvgpu_ioctl_flat_h(nfd->dev, owner_handle, cmd, &p, sizeof(p));
+    p.handle = caller_handle; /* the caller reads back its own handle */
+    if (copy_to_user(uarg, &p, sizeof(p)))
+      return -EFAULT;
+    return ret;
+  }
+
+  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: {
+    /*
+     * u32 handle OUT, u8 block_linear, u8 compressible, u16 pad,
+     * u64 memory_size IN, u32 flags, u32 pad
+     */
+    struct {
+      __u32 handle;
+      __u8 block_linear;
+      __u8 compressible;
+      __u16 pad0;
+      __u64 memory_size;
+      __u32 flags;
+      __u32 pad1;
+    } p;
+    u32 guest_handle;
+    long ret;
+
+    if (!file)
+      return -ENOTTY;
+    if (_IOC_SIZE(cmd) != sizeof(p))
+      return -EINVAL;
+    if (copy_from_user(&p, uarg, sizeof(p)))
+      return -EFAULT;
+
+    ret = nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, cmd, &p, sizeof(p));
+    if (ret < 0)
+      return ret;
+
+    /* The host's handle never reaches userspace; a proxy stands in for it. */
+    ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size,
+                                 &guest_handle);
+    if (ret) {
+      struct nvgpu_drm_gem_close close = {.handle = p.handle};
+
+      nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, DRM_IOCTL_GEM_CLOSE, &close,
+                         sizeof(close));
+      return ret;
+    }
+
+    p.handle = guest_handle;
+    if (copy_to_user(uarg, &p, sizeof(p)))
+      return -EFAULT;
+    return 0;
+  }
 
   /*
    * These two carry a pointer to an NVKMS parameter block. The guest's
@@ -739,10 +912,15 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
    * nvidia-modeset, which is why both go through one forwarder.
    */
   case DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY:
-    return nvgpu_ioctl_drm_gem_nested(nfd, cmd, uarg, &nvgpu_gem_import_nvkms);
+    if (!file)
+      return -ENOTTY;
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+                                      &nvgpu_gem_import_nvkms);
 
   case DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY:
-    return nvgpu_ioctl_drm_gem_nested(nfd, cmd, uarg,
+    if (!file)
+      return -ENOTTY;
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
                                       &nvgpu_gem_export_dmabuf);
 
   default:
@@ -783,7 +961,7 @@ static long nvgpu_dri_ioctl(struct file *filp, unsigned int cmd,
     if (!dri)
       return -ENODEV;
 
-    return nvgpu_drm_handle_ioctl(nfd, dri, cmd, arg);
+    return nvgpu_drm_handle_ioctl(nfd, dri, NULL, cmd, arg);
   }
 
   /* NVIDIA-type and everything else → proxy to host */
@@ -1857,6 +2035,217 @@ out:
   return ret;
 }
 
+/*
+ * One flat ioctl round trip on a named backend handle, in and out of a kernel
+ * buffer. `handle` rather than an nvgpu_fd because a GEM op forwards on the
+ * handle of the file that owns the object, which is not always the caller's.
+ */
+static long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
+                               unsigned int cmd, void *kbuf, u32 sz) {
+  int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
+  int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
+  void *req_buf = NULL, *resp_buf = NULL;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  long ret;
+
+  req_buf = kmalloc(req_total, GFP_KERNEL);
+  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(handle);
+  req->hdr.status = 0;
+  req->hdr.padding = 0;
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(sz);
+  req->nested_offset = 0;
+  req->nested_len = 0;
+  req->deep_ptr_offset = 0;
+  req->deep_len = 0;
+  memcpy(req_buf + sizeof(*req), kbuf, sz);
+
+  ret = nvgpu_send_recv(dev, req_buf, req_total, resp_buf, resp_max);
+  if (ret < 0)
+    goto out;
+
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (long)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  if (le32_to_cpu(resp->data_len) >= sz)
+    memcpy(kbuf, resp_buf + sizeof(*resp), sz);
+
+out:
+  kfree(req_buf);
+  kfree(resp_buf);
+  return ret;
+}
+
+/*
+ * The last reference to a proxy is gone, so the host's object can go too.
+ *
+ * Forwarded on the owner's handle rather than the caller's: the host object
+ * belongs to the drm_file that created it, and that file may well have closed
+ * first -- a compositor can outlive the client whose buffer it imported.
+ */
+static void nvgpu_gem_free(struct drm_gem_object *obj) {
+  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+
+  if (ng->dev && ng->host_handle) {
+    struct nvgpu_drm_gem_close close = {.handle = ng->host_handle};
+
+    nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle, DRM_IOCTL_GEM_CLOSE, &close,
+                       sizeof(close));
+  }
+
+  if (ng->import_pages) {
+    unsigned long i;
+
+    for (i = 0; i < ng->import_npages; i++)
+      if (ng->import_pages[i])
+        __free_page(ng->import_pages[i]);
+    kvfree(ng->import_pages);
+  }
+
+  drm_gem_object_release(obj);
+  kfree(ng);
+}
+
+/*
+ * The backing pages a dma-buf import asks for.
+ *
+ * The real memory is on the host, so there is nothing here to point at.
+ * dma_buf_map_attachment() still demands an sg_table and refuses the import
+ * without one, so pages are allocated on the first map and never before --
+ * most buffers are only ever touched by the GPU and never mapped at all.
+ *
+ * These pages are not the buffer. Anything that reads them sees zeroes. They
+ * exist to get the import accepted; making the host's memory reachable through
+ * them is the step after this one.
+ */
+static struct sg_table *nvgpu_gem_get_sg_table(struct drm_gem_object *obj) {
+  struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+  unsigned long n = obj->size >> PAGE_SHIFT, i;
+
+  if (!ng->import_pages) {
+    ng->import_pages =
+        kvmalloc_array(n, sizeof(struct page *), GFP_KERNEL | __GFP_ZERO);
+    if (!ng->import_pages)
+      return ERR_PTR(-ENOMEM);
+    for (i = 0; i < n; i++) {
+      ng->import_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+      if (!ng->import_pages[i]) {
+        while (i--)
+          __free_page(ng->import_pages[i]);
+        kvfree(ng->import_pages);
+        ng->import_pages = NULL;
+        return ERR_PTR(-ENOMEM);
+      }
+    }
+    ng->import_npages = n;
+  }
+  return drm_prime_pages_to_sg(obj->dev, ng->import_pages, n);
+}
+
+static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
+    .free = nvgpu_gem_free,
+    .get_sg_table = nvgpu_gem_get_sg_table,
+};
+
+/*
+ * Stand a guest object in front of a host one and return the guest handle.
+ *
+ * `size` is what the core reports for the object and what it validates
+ * framebuffer dimensions against, so it has to be at least the real buffer.
+ * Page-aligned because the core rejects an object smaller than a page.
+ */
+static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
+                                  u32 host_handle, size_t size,
+                                  u32 *guest_handle) {
+  struct nvgpu_gem_object *ng;
+  int ret;
+
+  size = PAGE_ALIGN(size);
+  if (!size)
+    size = PAGE_SIZE;
+
+  ng = kzalloc(sizeof(*ng), GFP_KERNEL);
+  if (!ng)
+    return -ENOMEM;
+
+  drm_gem_private_object_init(file->minor->dev, &ng->base, size);
+  ng->base.funcs = &nvgpu_gem_funcs;
+  ng->dev = nfd->dev;
+  ng->owner_handle = nfd->handle;
+  ng->host_handle = host_handle;
+  ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
+
+  ret = drm_gem_handle_create(file, &ng->base, guest_handle);
+  /* The handle holds the only reference now, or nothing does and it is freed. */
+  drm_gem_object_put(&ng->base);
+  return ret;
+}
+
+/*
+ * Guest handle → the host handle it stands for, and the backend handle to
+ * forward on. Fails for anything that is not one of our proxies rather than
+ * forwarding a number that would name some unrelated host object.
+ */
+static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
+                             u32 *host_handle, u32 *owner_handle) {
+  struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
+  int ret = -ENOENT;
+
+  if (!obj)
+    return -ENOENT;
+
+  if (obj->funcs == &nvgpu_gem_funcs) {
+    struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+
+    *host_handle = ng->host_handle;
+    if (owner_handle)
+      *owner_handle = ng->owner_handle;
+    ret = 0;
+  }
+
+  drm_gem_object_put(obj);
+  return ret;
+}
+
+/*
+ * GEM_IDENTIFY_OBJECT, answered here.
+ *
+ * NVIDIA's userspace asks this straight after a PRIME import, to learn what
+ * kind of object it just took. The proxy already knows, and the host's answer
+ * would be about a handle the importing file does not hold. Unknown for
+ * anything that is not ours, which is what the host driver reports too.
+ */
+static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg) {
+  struct {
+    __u32 handle;
+    __u32 object_type;
+  } p;
+  struct drm_gem_object *obj;
+
+  if (copy_from_user(&p, uarg, sizeof(p)))
+    return -EFAULT;
+
+  obj = drm_gem_object_lookup(file, p.handle);
+  if (obj && obj->funcs == &nvgpu_gem_funcs)
+    p.object_type = to_nvgpu_gem(obj)->obj_type;
+  else
+    p.object_type = NVGPU_GEM_OBJECT_UNKNOWN;
+  if (obj)
+    drm_gem_object_put(obj);
+
+  if (copy_to_user(uarg, &p, sizeof(p)))
+    return -EFAULT;
+  return 0;
+}
+
 /* ───────── nvidia-drm GEM ioctls with a nested parameter block ─────────
  *
  * GEM_IMPORT_NVKMS_MEMORY and GEM_EXPORT_DMABUF_MEMORY both hold a userspace
@@ -1870,7 +2259,8 @@ out:
  * in the length being a u64, which is why they are described by a
  * nvgpu_gem_nested_desc rather than hard-coded.
  */
-static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
+static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
+                                       struct drm_file *file, unsigned int cmd,
                                        void __user *uarg,
                                        const struct nvgpu_gem_nested_desc *d) {
   u8 outer[NVGPU_GEM_OUTER_MAX];
@@ -1882,6 +2272,8 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  u32 fwd_handle = nfd->handle;
+  u32 caller_handle = 0;
 
   /*
    * The caller's struct has to be the one this descriptor describes, or the
@@ -1918,6 +2310,22 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
     return -EINVAL;
   nested_size = (u32)nested_size64;
 
+  /*
+   * A handle the caller supplies names one of our proxies. Swap in the host's
+   * handle and forward on the file that owns it, which is not necessarily the
+   * one asking -- a compositor acting on a client's imported buffer is the
+   * case that matters.
+   */
+  if (d->handle_offset != NVGPU_GEM_NO_FIELD && !d->handle_is_out) {
+    u32 host_handle;
+
+    caller_handle = get_unaligned_le32(outer + d->handle_offset);
+    ret = nvgpu_gem_to_host(file, caller_handle, &host_handle, &fwd_handle);
+    if (ret)
+      return ret;
+    put_unaligned_le32(host_handle, outer + d->handle_offset);
+  }
+
   req_total = sizeof(*req) + d->size + nested_size;
   resp_max = sizeof(struct nvgpu_ioctl_resp) + d->size + nested_size;
 
@@ -1930,7 +2338,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
 
   req = (struct nvgpu_ioctl_req *)req_buf;
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->hdr.handle = cpu_to_le32(fwd_handle);
   req->hdr.status = 0;
   req->hdr.padding = 0;
   req->cmd = cpu_to_le32(cmd);
@@ -1992,8 +2400,42 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd, unsigned int cmd,
    */
   if (le32_to_cpu(resp->data_len) &&
       le32_to_cpu(resp->data_len) <= d->size) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
-                     le32_to_cpu(resp->data_len)))
+    u8 *out = resp_buf + sizeof(*resp);
+
+    if (d->handle_offset != NVGPU_GEM_NO_FIELD && ret >= 0) {
+      if (d->handle_is_out) {
+        /*
+         * The host made an object. Stand a proxy in front of it before the
+         * caller sees anything: the host's handle means nothing in this
+         * guest, and the core's PRIME and GEM_CLOSE paths need an object of
+         * ours to work on.
+         */
+        u32 host_handle = get_unaligned_le32(out + d->handle_offset);
+        u64 obj_size = 0;
+        u32 guest_handle;
+        int cret;
+
+        if (d->size_field_offset != NVGPU_GEM_NO_FIELD)
+          obj_size = get_unaligned_le64(out + d->size_field_offset);
+
+        cret = nvgpu_gem_proxy_create(file, nfd, host_handle, (size_t)obj_size,
+                                      &guest_handle);
+        if (cret) {
+          struct nvgpu_drm_gem_close close = {.handle = host_handle};
+
+          nvgpu_ioctl_flat_h(nfd->dev, fwd_handle, DRM_IOCTL_GEM_CLOSE, &close,
+                             sizeof(close));
+          ret = cret;
+          goto out;
+        }
+        put_unaligned_le32(guest_handle, out + d->handle_offset);
+      } else {
+        /* The caller reads back the handle it passed, not the host's. */
+        put_unaligned_le32(caller_handle, out + d->handle_offset);
+      }
+    }
+
+    if (copy_to_user(uarg, out, le32_to_cpu(resp->data_len)))
       ret = -EFAULT;
   }
 
@@ -2468,7 +2910,7 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
 
       if (!dri)
         return -ENODEV;
-      return nvgpu_drm_handle_ioctl(nfd, dri, cmd, arg);
+      return nvgpu_drm_handle_ioctl(nfd, dri, file, cmd, arg);
     }
 
     /*
@@ -2511,7 +2953,7 @@ static const struct file_operations nvgpu_drm_fops = {
 };
 
 static const struct drm_driver nvgpu_drm_driver = {
-    .driver_features = DRIVER_RENDER,
+    .driver_features = DRIVER_GEM | DRIVER_RENDER,
     .open = nvgpu_drm_open,
     .postclose = nvgpu_drm_postclose,
     .fops = &nvgpu_drm_fops,
