@@ -2041,8 +2041,26 @@ static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
   file->driver_priv = NULL;
 }
 
+/*
+ * The DRM core refuses to open a node whose fops do not declare
+ * FOP_UNSIGNED_OFFSET:
+ *
+ *   if (WARN_ON_ONCE(!(filp->f_op->fop_flags & FOP_UNSIGNED_OFFSET)))
+ *           return -EINVAL;            -- drm_open_helper(), drm_file.c
+ *
+ * DRM offsets are a mmap address space and are unsigned, so the core makes
+ * every driver say so. Drivers that build their fops with DEFINE_DRM_GEM_FOPS
+ * get it for free; ours are written out by hand and so must set it, or every
+ * open of /dev/dri/renderD128 fails with EINVAL before .open is ever reached.
+ *
+ * Guarded because the flag postdates the kernels this module still builds
+ * against; on those the check does not exist either.
+ */
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
+#if defined(FOP_UNSIGNED_OFFSET)
+    .fop_flags = FOP_UNSIGNED_OFFSET,
+#endif
     .open = drm_open,
     .release = drm_release,
     .unlocked_ioctl = drm_ioctl,
