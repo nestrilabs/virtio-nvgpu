@@ -351,6 +351,6 @@ Code ported from other projects keeps its original terms.
 
 - [`BENCHMARKS.md`](BENCHMARKS.md) — what it costs against bare metal, how that
   was measured, and what the numbers do not support.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — guest driver, device, virtio protocol,
-  memory model, ABI handling. Part design document, part description; it opens
-  by saying which part is which.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — how it works, in prose: what crosses
+  the VM boundary and what does not, how memory is shared, how a buffer becomes
+  shareable, how a guest waits, and what the design cannot do.
