@@ -844,6 +844,20 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     memcpy(info, dri->dev_info, sizeof(info));
 
     /*
+     * The ICD's idea of this struct's size, against ours. A newer driver can
+     * grow it, and this handler answers the user pointer directly rather than
+     * through drm_ioctl's buffer -- so a larger struct is filled to 36 bytes
+     * and the rest is left as whatever the caller had there. The ICD then
+     * reads rubbish for the fields it added, and the symptom is not an error:
+     * it is a device that associates with no DRM node at all.
+     */
+    if (_IOC_SIZE(cmd) != sizeof(info))
+      dev_warn(&nfd->dev->vdev->dev,
+               "virtio-gpu-nv: GET_DEV_INFO size mismatch: caller wants %u "
+               "bytes, this build answers %zu\n",
+               _IOC_SIZE(cmd), sizeof(info));
+
+    /*
      * The three capability bits are the host's answer about the host's node,
      * and this node is not that node: it answers four ioctls and forwards
      * nothing else. Passing them through unchanged is a promise this stub
@@ -868,6 +882,28 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     info[3] = nvgpu_claim_alloc;   /* supports_alloc */
     info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
     info[8] = 0;                   /* supports_semsurf */
+
+    /*
+     * primary_index is the number of the DRM node this device is, and it has
+     * to be *ours*. The host's number describes the host's /dev/dri, and the
+     * ICD uses it to find the node in the guest's: it looks for card<N>,
+     * does not find it, associates the device with no DRM node at all, and
+     * then reports no dma-buf support -- so a compositor's only buffer path
+     * is gone and nothing can present. The symptom is three steps from the
+     * cause and names none of it:
+     *
+     *   drm props: hasPrimary=0 0:0  hasRender=0 0:0
+     *   VK_EXT_external_memory_dma_buf absent
+     *   vkcube: "Could not find both graphics and present queues"
+     *
+     * This was invisible for as long as there was one test box, because its
+     * NVIDIA card was card0 on the host and card0 in the guest, and passing
+     * the host's number through was indistinguishable from getting it right.
+     * The second box has an integrated GPU, so its NVIDIA node is card1 --
+     * and nothing presented.
+     */
+    if (file && file->minor && file->minor->dev && file->minor->dev->primary)
+      info[2] = file->minor->dev->primary->index;
 
     if (copy_to_user(uarg, info, sizeof(info)))
       return -EFAULT;
