@@ -360,6 +360,15 @@ pub struct NvidiaBackend {
     /// says what the set really is.
     rm_classes: std::collections::BTreeMap<u32, u64>,
     rm_controls: std::collections::BTreeMap<u32, u64>,
+    /// Every ioctl forwarded, by namespace and number.
+    ///
+    /// There are three namespaces, not one, and that is the point of counting
+    /// this way: NVIDIA's own escapes (`F`), the DRM node's (`d`) and
+    /// modeset's (`m`). Only the first has an ABI table. A buffer-sharing run
+    /// measured 1212 forwarded ioctls with *zero* RM allocations or controls
+    /// among them -- so an allowlist written against RM alone would leave the
+    /// path a compositor actually uses completely unfiltered.
+    ioctls_by_ns: std::collections::BTreeMap<(char, u32), u64>,
     /// Escapes that failed the check, and how often, so a run can say what a
     /// workload actually needed. Reported at teardown.
     abi_refused: std::collections::BTreeMap<u32, u64>,
@@ -425,6 +434,7 @@ impl NvidiaBackend {
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
+            ioctls_by_ns: std::collections::BTreeMap::new(),
             watch_added: Vec::new(),
             watch_removed: Vec::new(),
             next_mapping_id: 1,
@@ -553,6 +563,30 @@ impl NvidiaBackend {
                     .join(" ")
             );
         }
+        // The whole forwarded surface, by namespace. A filter has to cover all
+        // of these, and today only 'F' has a table to check against at all.
+        if !self.ioctls_by_ns.is_empty() {
+            let mut by_ns: std::collections::BTreeMap<char, Vec<String>> = Default::default();
+            for ((ns, nr), n) in &self.ioctls_by_ns {
+                by_ns.entry(*ns).or_default().push(format!("{nr:#04x}={n}"));
+            }
+            for (ns, entries) in by_ns {
+                let what = match ns {
+                    'F' => "nvidia escapes",
+                    'd' => "DRM ioctls",
+                    'm' => "modeset ioctls",
+                    'u' => "UVM ioctls",
+                    _ => "unknown namespace",
+                };
+                log::info!(
+                    "NvidiaBackend::teardown: {} {what} ({}): {}",
+                    entries.len(),
+                    ns,
+                    entries.join(" ")
+                );
+            }
+        }
+
         // The two sets a filter would be written from. Printed whole rather
         // than summarised: the long tail is the interesting part, because that
         // is where something a pipeline needs exactly once hides.
@@ -1271,6 +1305,17 @@ impl NvidiaBackend {
 
         let escape = (request & 0xFF) as u32;
         let ioc_type = ((request >> 8) & 0xFF) as u32;
+
+        // Counted before anything decides whether to serve it, so a refusal
+        // still shows up as something the workload asked for.
+        let ns = match ioc_type {
+            x if x == b'F' as u32 => 'F',
+            x if x == b'd' as u32 => 'd',
+            x if x == b'm' as u32 => 'm',
+            0 => 'u', // UVM: type 0, and it has no table either
+            _ => '?',
+        };
+        *self.ioctls_by_ns.entry((ns, escape)).or_insert(0) += 1;
 
         // Only NVIDIA's own magic is described by the ABI tables; modeset and
         // uvm use different namespaces.
@@ -1997,7 +2042,12 @@ impl NvidiaBackend {
                     &param_buf[..std::cmp::min(param_buf.len(), 64)]
                 );
             }
-            if escape == 0x4a {
+            // Only on NVIDIA's own magic. 0x4a is VID_HEAP_CONTROL there and
+            // GEM_MAP_OFFSET on the DRM node, and logging the second under the
+            // first's name makes a buffer-sharing run look like an allocator
+            // storm -- which it did, for as long as it took to count the
+            // namespaces separately.
+            if escape == 0x4a && ((request >> 8) & 0xFF) as u32 == b'F' as u32 {
                 log::info!(
                     "VID_HEAP_CONTROL: response[{}]={:02x?}",
                     param_buf.len(),
