@@ -2220,6 +2220,11 @@ static const struct file_operations nvgpu_uvm_fops = {
  * The VMM side already handles pointer patching at offset 8 (see handler.rs).
  */
 
+/* NvKmsIoctlCommand: the one that names memory by a descriptor. */
+#define NVGPU_NVKMS_REGISTER_SURFACE 16
+/* Byte offset of planes[0].u inside NvKmsRegisterSurfaceRequest. */
+#define NVGPU_NVKMS_SURFACE_FD_OFFSET 16
+
 struct nvidia_modeset_outer {
   __le32 cmd;
   __le32 dataSize; /* ← the nested buffer size! */
@@ -2281,6 +2286,56 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
                        nested_size)) {
       ret = -EFAULT;
       goto out;
+    }
+
+    /*
+     * NVKMS_IOCTL_REGISTER_SURFACE names the memory it registers by a *file
+     * descriptor* when useFd is set, and a descriptor number means nothing in
+     * the backend's process -- forwarded verbatim it picks out whatever that
+     * process happens to have open at that number. NVKMS answers EPERM, the
+     * ICD concludes it cannot share buffers, drops
+     * VK_EXT_external_memory_dma_buf, and a client is left unable to present
+     * with no error anywhere that names the cause.
+     *
+     * This is rung 8 on a second path. The GEM import was translated when it
+     * was found; this one is reached instead on driver 615, where the ICD
+     * registers the surface with NVKMS directly rather than through the DRM
+     * node, which is why one box presented and the other did not.
+     *
+     * struct NvKmsRegisterSurfaceRequest:
+     *   0  NvKmsDeviceHandle deviceHandle
+     *   4  NvBool            useFd
+     *   8  NvU32             rmClient
+     *  16  planes[0].u       union { NvU64 rmHandle; NvS32 fd; }
+     *
+     * The handle goes in where the descriptor was; the backend puts its own
+     * descriptor back before the call.
+     */
+    if (le32_to_cpu(outer.cmd) == NVGPU_NVKMS_REGISTER_SURFACE &&
+        nested_size >= NVGPU_NVKMS_SURFACE_FD_OFFSET + sizeof(u64)) {
+      u8 *nested = req_buf + sizeof(*req) + sizeof(outer);
+      u32 use_fd;
+
+      memcpy(&use_fd, nested + 4, sizeof(use_fd));
+      if (le32_to_cpu((__le32)use_fd)) {
+        s32 guest_fd;
+        u32 handle;
+
+        memcpy(&guest_fd, nested + NVGPU_NVKMS_SURFACE_FD_OFFSET,
+               sizeof(guest_fd));
+        if (nvgpu_handle_for_fd(guest_fd, &handle) == 0) {
+          u64 as_u64 = handle;
+
+          memcpy(nested + NVGPU_NVKMS_SURFACE_FD_OFFSET, &as_u64,
+                 sizeof(as_u64));
+        } else {
+          dev_warn_ratelimited(
+              &nfd->dev->vdev->dev,
+              "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
+              "of ours; forwarding it unchanged\n",
+              guest_fd);
+        }
+      }
     }
   }
 

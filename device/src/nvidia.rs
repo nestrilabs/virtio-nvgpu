@@ -408,6 +408,12 @@ pub enum AbiPolicy {
     Permissive,
 }
 
+/// `NvKmsIoctlCommand::NVKMS_IOCTL_REGISTER_SURFACE`, the one that names the
+/// memory it registers by a file descriptor.
+const NVKMS_REGISTER_SURFACE: u32 = 16;
+/// Byte offset of `planes[0].u` inside `NvKmsRegisterSurfaceRequest`.
+const NVKMS_SURFACE_FD_OFFSET: usize = 16;
+
 /// The result of checking one guest ioctl against the host's ABI profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbiCheck {
@@ -1361,6 +1367,29 @@ impl NvidiaBackend {
 
         // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
         if ioc_type == 0x6d {
+            // NVKMS multiplexes every operation through one ioctl number, so
+            // the number says nothing and the command inside says everything.
+            // Logged because two of them came back EPERM in a guest while the
+            // same client on the host got zero for all of them, and an ioctl
+            // number alone cannot say which two.
+            if param_in.len() >= 4 {
+                let nvkms_cmd = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
+                log::debug!("NVKMS cmd={nvkms_cmd} (0x{nvkms_cmd:x})");
+
+            }
+            // REGISTER_SURFACE carries one of our handles where NVKMS expects a
+            // descriptor, because a guest's descriptor number means nothing
+            // here. Told where it sits, the forwarder puts our own descriptor
+            // back. See the driver's side of this, which explains why it only
+            // shows up on some driver versions.
+            let nvkms_fd_offset = if param_in.len() >= 4
+                && u32::from_le_bytes(param_in[0..4].try_into().unwrap()) == NVKMS_REGISTER_SURFACE
+            {
+                Some(NVKMS_SURFACE_FD_OFFSET)
+            } else {
+                None
+            };
+
             return self.dispatch_nested(
                 cookie,
                 host_fd,
@@ -1371,7 +1400,7 @@ impl NvidiaBackend {
                 8,  // ptr_offset
                 4,  // size_offset
                 deep_in,
-                None,
+                nvkms_fd_offset,
             );
         }
 
