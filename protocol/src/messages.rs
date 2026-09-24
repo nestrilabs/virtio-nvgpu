@@ -54,6 +54,19 @@ pub enum MsgType {
     /// Guest → host: the same for the sysfs attributes the userspace driver
     /// looks for.
     GetSysFiles = 7,
+    /// **Host → guest**, on the event queue: the descriptor named by
+    /// `MsgHeader::handle` has something to report.
+    ///
+    /// The only message that travels this way. NVIDIA's user-mode driver waits
+    /// for the GPU by polling the descriptor an RM event is delivered on; the
+    /// host driver takes the interrupt and makes *its* descriptor readable, and
+    /// this carries that edge across so the guest's can do the same. Without
+    /// it a guest cannot wait at all: a `file_operations` with no `.poll` is
+    /// reported ready by the VFS every time it is asked, and a driver that
+    /// meant to sleep spins instead.
+    ///
+    /// No payload. The handle in the header is the whole message.
+    EventReady = 8,
 }
 
 impl MsgType {
@@ -67,6 +80,7 @@ impl MsgType {
             5 => Self::Munmap,
             6 => Self::GetProcFiles,
             7 => Self::GetSysFiles,
+            8 => Self::EventReady,
             _ => return None,
         })
     }

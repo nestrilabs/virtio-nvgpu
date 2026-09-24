@@ -27,6 +27,7 @@
 #include <linux/pci-ecam.h>
 #include <linux/numa.h>
 #include <linux/pci.h>
+#include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
@@ -82,6 +83,8 @@ extern struct kset *module_kset;
 #define NVGPU_MSG_MUNMAP 5
 #define NVGPU_MSG_GET_PROC_FILES 6
 #define NVGPU_MSG_GET_SYS_FILES 7
+/* Host → guest, on the event queue: this handle's descriptor is readable. */
+#define NVGPU_MSG_EVENT_READY 8
 
 /* device_type values for OPEN */
 #define NVGPU_DEV_CTL 255
@@ -328,6 +331,25 @@ static int nvgpu_claim_sync_fd;
 module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
 MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
 
+/*
+ * Whether a wait on one of these descriptors can wait.
+ *
+ * On, `.poll` reports nothing until the host says a descriptor is readable, so
+ * NVIDIA's user-mode driver sleeps between frames the way it does on bare
+ * metal. Off, there is no `.poll` state to consult and the VFS reports every
+ * descriptor ready -- the old behaviour, which spun.
+ *
+ * Measured on an RTX 3060, unpaced at ~100 fps: a guest cost 12.26 s of CPU
+ * over a 12 s run with this off, and 0.64 s with it on, for the same frame
+ * rate. The host itself costs 0.40 s. It is a parameter because the trade is
+ * not free -- a paced encode run gives up ~11% of its frames to the wake, see
+ * the write-up -- and because a switch is how the next person re-takes both
+ * numbers without a rebuild.
+ */
+static int nvgpu_poll_events = 1;
+module_param_named(poll_events, nvgpu_poll_events, int, 0444);
+MODULE_PARM_DESC(poll_events, "a wait on a device descriptor really waits");
+
 /* struct drm_nvidia_get_dev_info_params is nine u32s. */
 #define NVGPU_DEV_INFO_WORDS 9
 /* name_len, major, minor, slot_index, then the dev_info words. */
@@ -456,6 +478,11 @@ struct nvgpu_device {
   struct nvgpu_fd_translation_entry fd_translations[16];
   u32 num_fd_translations;
 
+  /* Every open descriptor, so an event naming a handle can find its file. */
+  struct list_head fds;
+  spinlock_t fds_lock;
+  struct nvgpu_event_buf *event_bufs; /* defined with the event queue below */
+
   /* ── DRI device nodes ── */
 #define NVGPU_MAX_DRI_DEVS 8
   struct nvgpu_dri_dev dri_devs[NVGPU_MAX_DRI_DEVS];
@@ -479,10 +506,30 @@ struct nvgpu_fd {
   struct nvgpu_device *dev;
   u32 handle;      /* VMM-assigned handle from OPEN response */
   u32 device_type; /* NVGPU_DEV_*                            */
+  /*
+   * Waiting for the GPU.
+   *
+   * NVIDIA's user-mode driver blocks on an RM event by polling the descriptor
+   * the event is delivered on. The interrupt is the host's and so is the
+   * descriptor that becomes readable, so the host tells us on the event queue
+   * and this is where that lands: `pending` is set, `wq` is woken, and a
+   * waiter in nvgpu_poll() returns.
+   *
+   * Before this existed there was no `.poll` at all, and a file_operations
+   * with a NULL `.poll` is reported ready by the VFS every single time. The
+   * driver's wait returned instantly, forever, so it spun -- a whole core per
+   * guest at 100 frames a second.
+   */
+  wait_queue_head_t wq;
+  atomic_t pending;
+  struct list_head node; /* dev->fds, for finding this by handle */
   /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
    * "not yet asked", which is why the counter starts at one. */
   u64 drm_unique_id;
 };
+
+/* Posted on the event queue for the host to fill; see NVGPU_EVENT_BUFS. */
+struct nvgpu_event_buf;
 
 /* class for device_create() */
 static struct class *nvgpu_class;
@@ -1050,13 +1097,108 @@ static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
   }
 }
 
-/* event virtqueue callback — not used yet, just drain */
+/* ───────── Events from the host ───────── */
+
+/*
+ * Buffers posted on the event queue for the host to fill.
+ *
+ * The queue carries one message type and it is fixed-size, so the buffers are
+ * allocated once at probe and handed straight back after each event. A guest
+ * that posts none simply never hears about a readable descriptor, which is
+ * what every build before this one did.
+ */
+#define NVGPU_EVENT_BUFS 16
+
+struct nvgpu_event_buf {
+  struct nvgpu_msg_hdr hdr;
+};
+
+static void nvgpu_event_post(struct nvgpu_device *dev,
+                             struct nvgpu_event_buf *buf) {
+  struct scatterlist sg;
+  int ret;
+
+  sg_init_one(&sg, buf, sizeof(*buf));
+  ret = virtqueue_add_inbuf(dev->event_vq, &sg, 1, buf, GFP_ATOMIC);
+  if (ret < 0)
+    dev_warn_ratelimited(&dev->vdev->dev,
+                         "virtio-gpu-nv: event queue would not take a buffer: %d\n",
+                         ret);
+}
+
+/*
+ * The host says a descriptor has something to report. Wake whoever is waiting
+ * on it.
+ *
+ * `pending` is a flag rather than a count: what the waiter does on waking is
+ * ask the hardware's own semaphore, so two events and one event mean the same
+ * thing to it. A wake with nothing behind it costs a wasted poll, and the host
+ * re-sends while the descriptor stays readable, so a lost one costs a
+ * millisecond rather than a hang.
+ */
+static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle) {
+  struct nvgpu_fd *nfd;
+  unsigned long flags;
+
+  spin_lock_irqsave(&dev->fds_lock, flags);
+  list_for_each_entry(nfd, &dev->fds, node) {
+    if (nfd->handle == handle) {
+      atomic_set(&nfd->pending, 1);
+      wake_up_interruptible(&nfd->wq);
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&dev->fds_lock, flags);
+}
+
 static void nvgpu_event_vq_cb(struct virtqueue *vq) {
-  void *buf;
+  struct nvgpu_device *dev = vq->vdev->priv;
+  struct nvgpu_event_buf *buf;
   unsigned int len;
 
-  while ((buf = virtqueue_get_buf(vq, &len)) != NULL)
-    /* TODO: deliver to waiting guest processes */;
+  while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
+    if (len >= sizeof(buf->hdr) &&
+        le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_EVENT_READY)
+      nvgpu_event_deliver(dev, le32_to_cpu(buf->hdr.handle));
+    else if (len)
+      dev_warn_ratelimited(&dev->vdev->dev,
+                           "virtio-gpu-nv: event queue carried msg_type %u\n",
+                           len >= sizeof(buf->hdr)
+                               ? le32_to_cpu(buf->hdr.msg_type)
+                               : 0);
+    nvgpu_event_post(dev, buf);
+  }
+  virtqueue_kick(dev->event_vq);
+}
+
+/*
+ * poll() on a device descriptor.
+ *
+ * Reports nothing until the host says otherwise, which is the whole point:
+ * without this the VFS reported every one of these descriptors as permanently
+ * ready and the user-mode driver's wait never waited.
+ */
+static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
+  struct nvgpu_fd *nfd = filp->private_data;
+
+  if (!nfd)
+    return EPOLLERR;
+
+  /* Off: no state to consult, so say what the VFS said before this existed. */
+  if (!nvgpu_poll_events)
+    return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
+
+  poll_wait(filp, &nfd->wq, wait);
+
+  /*
+   * Taken, not read. Leaving it set until an ioctl consumed it was tried and
+   * measured: a caller that polls without consuming then finds it ready every
+   * time, which is the spin this whole path exists to end -- CPU went straight
+   * back to a full core. One report per event it is.
+   */
+  if (atomic_xchg(&nfd->pending, 0))
+    return EPOLLIN | EPOLLRDNORM;
+  return 0;
 }
 
 /* ───────── Ioctl forwarding ───────── */
@@ -1854,6 +1996,28 @@ out:
 
 /* ───────── open / release ───────── */
 
+/* Make a new descriptor waitable, and findable by the handle an event names. */
+static void nvgpu_fd_register(struct nvgpu_device *dev, struct nvgpu_fd *nfd) {
+  unsigned long flags;
+
+  init_waitqueue_head(&nfd->wq);
+  atomic_set(&nfd->pending, 0);
+  spin_lock_irqsave(&dev->fds_lock, flags);
+  list_add(&nfd->node, &dev->fds);
+  spin_unlock_irqrestore(&dev->fds_lock, flags);
+}
+
+static void nvgpu_fd_unregister(struct nvgpu_device *dev,
+                                struct nvgpu_fd *nfd) {
+  unsigned long flags;
+
+  spin_lock_irqsave(&dev->fds_lock, flags);
+  list_del(&nfd->node);
+  spin_unlock_irqrestore(&dev->fds_lock, flags);
+  /* Anyone still in poll_wait() is woken so they can see the file go. */
+  wake_up_interruptible_all(&nfd->wq);
+}
+
 static int nvgpu_open_common(struct inode *inode, struct file *filp,
                              u32 device_type) {
   struct nvgpu_device *dev;
@@ -1901,6 +2065,7 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
+  nvgpu_fd_register(nfd->dev, nfd);
   filp->private_data = nfd;
   kfree(req);
   kfree(resp);
@@ -1933,6 +2098,7 @@ static int nvgpu_release(struct inode *inode, struct file *filp) {
   }
   kfree(req);
   kfree(resp);
+  nvgpu_fd_unregister(nfd->dev, nfd);
   kfree(nfd);
   return 0;
 }
@@ -1945,6 +2111,7 @@ static const struct file_operations nvgpu_gpu_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
     .mmap = nvgpu_mmap,
+    .poll = nvgpu_poll,
 };
 
 static const struct file_operations nvgpu_ctl_fops = {
@@ -1953,6 +2120,7 @@ static const struct file_operations nvgpu_ctl_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
     .mmap = nvgpu_mmap,
+    .poll = nvgpu_poll,
 };
 
 static const struct file_operations nvgpu_uvm_fops = {
@@ -1961,6 +2129,7 @@ static const struct file_operations nvgpu_uvm_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_uvm_ioctl,
     .mmap = nvgpu_mmap,
+    .poll = nvgpu_poll,
 };
 
 /* ───────── nvidia-modeset ioctl (/dev/nvidia-modeset, ioc_type 0x6d) ───────
@@ -2761,6 +2930,7 @@ static const struct file_operations nvgpu_modeset_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_modeset_ioctl,
     .mmap = nvgpu_mmap,
+    .poll = nvgpu_poll,
 };
 
 /* ───────── /proc/driver/nvidia ───────── */
@@ -3044,6 +3214,7 @@ static int nvgpu_dri_open(struct inode *inode, struct file *filp) {
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
+  nvgpu_fd_register(nfd->dev, nfd);
   filp->private_data = nfd;
   kfree(req);
   kfree(resp);
@@ -3062,6 +3233,7 @@ static const struct file_operations nvgpu_dri_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_dri_ioctl,
     .mmap = nvgpu_mmap,
+    .poll = nvgpu_poll,
 };
 
 /*
@@ -3112,6 +3284,7 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
+  nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
   kfree(req);
   kfree(resp);
@@ -3140,6 +3313,7 @@ static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
   }
   kfree(req);
   kfree(resp);
+  nvgpu_fd_unregister(nfd->dev, nfd);
   kfree(nfd);
   file->driver_priv = NULL;
 }
@@ -3927,6 +4101,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   vdev->priv = dev;
   mutex_init(&dev->vq_lock);
   init_completion(&dev->req_done);
+  INIT_LIST_HEAD(&dev->fds);
+  spin_lock_init(&dev->fds_lock);
 
   /* Find virtqueues */
   ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
@@ -3935,6 +4111,24 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   dev->ctrl_vq = vqs[0];
   dev->event_vq = vqs[1];
+
+  /*
+   * Give the host somewhere to put an event. Until this existed the queue was
+   * negotiated and empty, so the host had no way to say a descriptor had
+   * become readable and the guest's poll() had nothing to report.
+   */
+  dev->event_bufs =
+      kcalloc(NVGPU_EVENT_BUFS, sizeof(*dev->event_bufs), GFP_KERNEL);
+  if (dev->event_bufs) {
+    int i;
+
+    for (i = 0; i < NVGPU_EVENT_BUFS; i++)
+      nvgpu_event_post(dev, &dev->event_bufs[i]);
+    virtqueue_kick(dev->event_vq);
+  } else {
+    dev_warn(&vdev->dev,
+             "virtio-gpu-nv: no event buffers; waits will not be woken\n");
+  }
 
   /* Read config space written by the VMM at device creation */
   virtio_cread_bytes(vdev, 0, dev->driver_version, 32);
@@ -4152,6 +4346,9 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   int i;
 
   vdev->config->reset(vdev);
+  /* After the reset: the queue is quiet, so the buffers cannot be in use. */
+  kfree(dev->event_bufs);
+  dev->event_bufs = NULL;
 
   nvgpu_dri_cleanup(dev);
   nvgpu_module_sysfs_cleanup();

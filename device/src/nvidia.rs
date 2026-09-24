@@ -347,6 +347,14 @@ pub struct NvidiaBackend {
     msg_counts: std::collections::BTreeMap<&'static str, u64>,
     /// Every live placement, by the id the guest quotes to take it back.
     live_maps: std::collections::HashMap<u32, LiveMap>,
+    /// Descriptors opened and closed since a transport last asked, so it can
+    /// keep a poll set in step with them.
+    ///
+    /// The backend cannot watch them itself: it holds no queue to deliver a
+    /// notification on, and this crate names no VMM. It says what is
+    /// watchable; the transport decides how to watch it.
+    watch_added: Vec<(u32, RawFd)>,
+    watch_removed: Vec<u32>,
     next_mapping_id: u32,
 }
 
@@ -379,6 +387,8 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
+            watch_added: Vec::new(),
+            watch_removed: Vec::new(),
             next_mapping_id: 1,
             current_msg: MsgType::Ioctl,
             current_handle: 0,
@@ -412,6 +422,18 @@ impl NvidiaBackend {
     /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
     /// the mapping is real -- but the `mmap` that follows is refused, because
     /// there is no address in the guest that names it.
+    /// Descriptors opened and closed since this was last called.
+    ///
+    /// A transport calls it after serving messages and keeps its poll set in
+    /// step. Draining rather than reading, so two transports cannot both think
+    /// they own a watch.
+    pub fn take_watch_updates(&mut self) -> (Vec<(u32, RawFd)>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.watch_added),
+            std::mem::take(&mut self.watch_removed),
+        )
+    }
+
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
     }
@@ -518,6 +540,7 @@ impl NvidiaBackend {
                 MsgType::Munmap => "munmap",
                 MsgType::GetProcFiles => "get_proc_files",
                 MsgType::GetSysFiles => "get_sys_files",
+                MsgType::EventReady => "event_ready",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -533,6 +556,12 @@ impl NvidiaBackend {
             MsgType::Munmap => self.handle_munmap(payload, resp_buf),
             MsgType::GetProcFiles => self.handle_get_files(FileTree::Proc, resp_buf),
             MsgType::GetSysFiles => self.handle_get_files(FileTree::Sys, resp_buf),
+            // Host to guest only. A guest that sends one is confused about the
+            // direction of the queue, and saying so beats serving it.
+            MsgType::EventReady => {
+                log::warn!("EventReady arrived from the guest; that message only travels outward");
+                self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
+            }
         }
     }
 
@@ -568,6 +597,10 @@ impl NvidiaBackend {
         if let Some(kind) = DeviceKind::from_device_type(req.device_type) {
             self.handle_kinds.insert(guest_handle, kind);
         }
+        // The guest may wait on this descriptor, and only the host's copy ever
+        // becomes readable. Offered to the transport as watchable; duplicated
+        // there rather than here, so the watch cannot outlive this table's fd.
+        self.watch_added.push((guest_handle as u32, raw_fd));
         log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
 
         // The handle is returned in the header. The driver reads it from there
@@ -1039,6 +1072,7 @@ impl NvidiaBackend {
         match self.handles.remove(handle) {
             Ok(()) => {
                 log::debug!("close handle={handle}");
+                self.watch_removed.push(handle as u32);
                 self.write_hdr(resp_buf, 0, 0)
             }
             Err(_) => self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),

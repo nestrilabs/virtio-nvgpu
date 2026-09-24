@@ -16,12 +16,17 @@
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
 
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use device::host;
 use device::nvidia::NvidiaBackend;
+use protocol::messages::{MsgHeader, MsgType};
 use device::virtio::{VirtioGpuNvConfig, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
 use device::shm::WindowPlacer;
 use std::os::fd::{BorrowedFd, RawFd};
@@ -107,6 +112,176 @@ impl WindowPlacer for VhostWindow {
     }
 }
 
+/// What the event thread is told to start and stop watching.
+enum Watch {
+    Add(u32, OwnedFd),
+    Remove(u32),
+}
+
+/// One `EventReady` message: a bare header naming the descriptor.
+fn event_ready_bytes(handle: u32) -> Vec<u8> {
+    let hdr = MsgHeader::ok(MsgType::EventReady, handle);
+    // The wire form is the struct's bytes, which is what the driver reads.
+    let p = &hdr as *const MsgHeader as *const u8;
+    unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }.to_vec()
+}
+
+/// Put one message on the event queue, into a buffer the guest posted there.
+///
+/// Returns false when the guest has posted none, which is the normal state of
+/// a guest whose driver predates this queue having a use -- and a reason to
+/// drop the notification rather than to fail.
+fn push_event(
+    vring: &VringRwLock,
+    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+    handle: u32,
+) -> bool {
+    let guard = mem.memory();
+    let mut vr = vring.get_mut();
+    let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
+        return false;
+    };
+    let Some(chain) = avail.next() else { return false };
+    let head = chain.head_index();
+    drop(vr);
+
+    let bytes = event_ready_bytes(handle);
+    let mut written = 0usize;
+    for desc in chain {
+        if desc.is_write_only() {
+            let n = std::cmp::min(desc.len() as usize, bytes.len());
+            if guard.write_slice(&bytes[..n], desc.addr()).is_ok() {
+                written = n;
+            }
+            break;
+        }
+    }
+
+    if vring.add_used(head, written as u32).is_err() {
+        return false;
+    }
+    let _ = vring.signal_used_queue();
+    written > 0
+}
+
+/// Watch the host's descriptors and tell the guest when one has something to
+/// say.
+///
+/// This exists because the guest cannot find out any other way. NVIDIA's
+/// user-mode driver waits for the GPU by polling the descriptor its RM event
+/// is delivered on; the interrupt is the host's, and so is the descriptor that
+/// becomes readable. Without this relay the guest's `poll` has nothing to
+/// report and the driver spins -- measured at a whole core per guest at 100
+/// frames a second.
+///
+/// A descriptor is dropped from the set after it is reported and put back a
+/// millisecond later. Level-triggered polling would otherwise spin here
+/// instead: the descriptor stays readable until the *guest* consumes the
+/// event, which happens through an ioctl this thread never sees. Re-arming on
+/// a timer costs a duplicate notification at worst, and the guest answers one
+/// by waking, finding nothing, and waiting again.
+fn event_pump(
+    rx: Receiver<Watch>,
+    vring: VringRwLock,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+) {
+    // How often to re-check a descriptor that is still readable. See the
+    // sweep below; this is a safety net, not the notification path.
+    const SWEEP: Duration = Duration::from_millis(1);
+
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        log::error!("event pump: epoll_create1: {}", std::io::Error::last_os_error());
+        return;
+    }
+    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
+
+    let mut watched: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut last_sweep = Instant::now();
+
+    // Edge-triggered. Level-triggered would report a descriptor as readable
+    // until the *guest* consumes the event, which happens through an ioctl
+    // this thread never sees -- so the pump would spin between notifying and
+    // being believed. Parking the descriptor for a millisecond instead cost
+    // 11% of the frames in an encode run, and parking it for 100 us cost more
+    // than that, because then the pump spun on the host's CPU and took it from
+    // the guest. An edge costs neither.
+    let ctl = |op: i32, fd: i32, handle: u32| {
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+            u64: handle as u64,
+        };
+        unsafe { libc::epoll_ctl(epfd.as_raw_fd(), op, fd, &mut ev) }
+    };
+
+    loop {
+        // Drain the control channel first: a descriptor closed on the other
+        // thread must leave the set before it can be reported again.
+        loop {
+            match rx.try_recv() {
+                Ok(Watch::Add(handle, fd)) => {
+                    if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
+                        watched.insert(handle as u64, fd);
+                    }
+                }
+                Ok(Watch::Remove(handle)) => {
+                    if let Some(fd) = watched.remove(&(handle as u64)) {
+                        ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+
+        // The safety net: an edge can be missed if a descriptor was already
+        // readable when it was added, or if a notification found no buffer
+        // posted. Every 10 ms, ask the descriptors directly and re-notify the
+        // ones that still have something to say. A lost wake costs a tenth of
+        // a frame at 60 Hz rather than a hang.
+        if last_sweep.elapsed() >= SWEEP {
+            last_sweep = Instant::now();
+            for (&handle, fd) in watched.iter() {
+                let mut pfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
+                    push_event(&vring, &mem, handle as u32);
+                }
+            }
+        }
+
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+        let n = unsafe {
+            libc::epoll_wait(
+                epfd.as_raw_fd(),
+                events.as_mut_ptr(),
+                events.len() as i32,
+                SWEEP.as_millis() as i32,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            log::error!("event pump: epoll_wait: {err}");
+            return;
+        }
+
+        for ev in events.iter().take(n as usize) {
+            // Copied out first: epoll_event is packed, so its field cannot be
+            // borrowed.
+            let handle = { ev.u64 } as u32;
+            if !push_event(&vring, &mem, handle) {
+                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
+            }
+        }
+    }
+}
+
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
@@ -116,6 +291,9 @@ struct NvGpuBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     event_idx: bool,
     config: VirtioGpuNvConfig,
+    /// Started on the first message, because the event queue and guest memory
+    /// are not known before then.
+    watches: Option<Sender<Watch>>,
 }
 
 impl NvGpuBackend {
@@ -146,7 +324,52 @@ impl NvGpuBackend {
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
             config: VirtioGpuNvConfig::new(&version, &gpus),
+            watches: None,
         })
+    }
+
+    /// Keep the event thread's poll set in step with the descriptors the
+    /// backend has open, starting the thread on first use.
+    ///
+    /// Each descriptor is duplicated before it is handed over. The handle table
+    /// owns the original and may close it at any time; a watch holding the same
+    /// number would then be watching whatever opened next.
+    fn sync_watches(&mut self, vrings: &[VringRwLock]) {
+        let (added, removed) = self
+            .nvidia
+            .lock()
+            .expect("backend mutex")
+            .take_watch_updates();
+        if added.is_empty() && removed.is_empty() && self.watches.is_some() {
+            return;
+        }
+
+        if self.watches.is_none() {
+            let (Some(mem), Some(vring)) = (self.mem.clone(), vrings.get(1).cloned()) else {
+                return;
+            };
+            let (tx, rx) = channel();
+            std::thread::Builder::new()
+                .name("nvgpu-events".into())
+                .spawn(move || event_pump(rx, vring, mem))
+                .map(|_| self.watches = Some(tx))
+                .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
+        }
+        let Some(tx) = self.watches.as_ref() else {
+            return;
+        };
+
+        for (handle, fd) in added {
+            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if dup < 0 {
+                log::warn!("watch on handle {handle}: dup: {}", std::io::Error::last_os_error());
+                continue;
+            }
+            let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
+        }
+        for handle in removed {
+            let _ = tx.send(Watch::Remove(handle));
+        }
     }
 
     /// Drain one virtqueue, dispatching every chain.
@@ -292,6 +515,9 @@ impl VhostUserBackendMut for NvGpuBackend {
         } else {
             self.process(vring, &mem)?;
         }
+        // After serving, not before: a message that opened a descriptor has to
+        // have been served for the backend to know about it.
+        self.sync_watches(vrings);
         vring
             .signal_used_queue()
             .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
