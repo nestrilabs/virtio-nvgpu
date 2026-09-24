@@ -1,19 +1,75 @@
 # virtio-nvgpu
 
-**A virtio device for near-native NVIDIA GPU access in KVM virtual machines.**
+**Near-native NVIDIA GPU access inside a KVM guest. A guest renders within 2% of
+the machine it is running on, and costs the same CPU.**
 
 `virtio-nvgpu` forwards NVIDIA kernel driver ioctls between a Linux guest and
 the host at the **driver ABI level**, bypassing API-level translation entirely.
-The guest runs NVIDIA's own user-mode drivers, unmodified.
+The guest runs NVIDIA's own user-mode drivers, unmodified — the same libraries,
+the same Vulkan and NVENC, talking to the same card.
 
-The primary target is **headless streaming**: a compositor inside the VM renders,
-composites, and encodes frames on the GPU, then sends compressed video to a
-remote display. The VM has no physical monitor, and the host keeps the card.
+The target is **headless streaming**: a compositor inside the VM renders,
+composites and encodes frames on the GPU, then sends compressed video out. The
+VM has no monitor, and the host keeps the card.
 
-> **Status: design settled, implementation in progress.** The architecture below
-> is stable and the repository is being restructured onto the layout in
-> [Repository layout](#repository-layout). Existing work lives on feature
-> branches and is moving into this tree. Interfaces will change.
+## Where it stands
+
+**It works, and it has been measured.** A Wayland client presents inside a
+guest, the capture layer encodes on the game's own device, and the H.264 comes
+out the other side — 618 frames that `ffmpeg` decodes without an error.
+
+Measured on an RTX 3060 (driver 595.99.02), guest against **the same host, bare
+metal**, with an identical headless Vulkan load:
+
+| what the host takes for one frame | guest frame time | |
+|---|---|---|
+| 39 ms | **−0.3%** | faster than bare metal, within noise |
+| 9.9 ms | **−0.8%** | |
+| 2.0 ms | **+1.9%** | |
+| 0.5 ms | +120% | a wake costs ~0.35 ms, and the frame is 0.5 |
+| 0.05 ms | +727% | |
+
+**Above about 2 ms a frame — which is every frame a game draws — a guest is
+within 2% of bare metal.** Below that, the cost of waiting for the GPU starts to
+dominate a frame that barely exists.
+
+CPU is the other half of it, because a shared GPU is only worth sharing if the
+guests are cheap. Unpaced at ~100 fps for 12 s, one guest:
+
+| | CPU used |
+|---|---|
+| host, bare metal | 0.40 s |
+| **guest** | **0.39 s** |
+
+**A guest costs what the host costs.** Nothing is spent on forwarding in a
+render loop, because nothing is forwarded: NVIDIA's user-mode driver submits
+through memory it has mapped, and that memory is the host's. Over 813,691
+frames the backend served 13,792 messages — one crossing per 59 frames, nearly
+all of it device setup.
+
+Full method, raw runs and the things these numbers do **not** support:
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+### What is known to work
+
+- a guest enumerates the card — `nvidia-smi` reports real power and memory, and
+  the `deviceUUID` is the host's
+- Vulkan renders: `vulkaninfo` exits 0, offscreen draws are pixel-correct
+- a Wayland client presents through a compositor in the guest
+- NVENC through Vulkan Video, encoding on the client's own device
+- imported buffers are the host's memory, mapped through a shared window
+
+### What is not done
+
+- **one guest at a time.** Two guests have never shared a card in any
+  measurement here.
+- **two cards, two driver versions.** RTX 3060 / 595.99.02 is where the numbers
+  come from; an RTX A2000 / 615.71.09 has rendered but is not benchmarked.
+- **jitter.** Frames arriving more than 25 ms apart in a 60 Hz encode run: 53
+  out of ~600. Nothing is dropped and the mean is exactly 60 Hz, but the tail
+  is real and unexplained.
+- CUDA is forwarded but untested beyond enumeration; the jailer, per-version
+  driver shares and the multi-tenant envelope are unbuilt.
 
 ---
 
@@ -28,7 +84,7 @@ includable from both.
 | --- | --- | --- |
 | [`driver/`](driver/) | **GPL-2.0** | Guest kernel module. Registers `/dev/nvidia*`, forwards ioctl and mmap over the virtqueue. Deliberately not ABI-aware. |
 | [`device/`](device/) | **Apache-2.0** | The virtio device, as a Rust crate with **no VMM in its dependency list**. Every VMM concern is a trait. |
-| [`isolate/`](isolate/) | **Apache-2.0** | Per-guest-process sandboxed host helper, launched from a memfd, holding the real device FDs. Unprivileged. |
+| [`isolate/`](isolate/) | **Apache-2.0** | **A design note, not code yet.** The sandboxed per-guest helper that will hold the real device FDs. Today the backend holds them itself, in the VMM's own process. |
 | [`gen/`](gen/) | — | Generated ABI tables. Checked in *and* reproducible. |
 | [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0+** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
 
@@ -47,9 +103,11 @@ fail to build, so a VMM can adopt it before supporting every feature.
 Buffer and window bookkeeping lives in `device/`. The VMM supplies raw map and
 unmap and nothing more.
 
-One thing that is **not** a trait: the isolate. `virtio-nvgpu` runs one sandboxed
-helper process per guest process, so integrating it means inheriting a **process
-model**, not just a library dependency. See [`isolate/`](isolate/).
+One thing that will **not** be a trait: the isolate. The intended design runs
+one sandboxed helper process per guest process, so adopting it eventually means
+inheriting a **process model**, not just a library dependency. That helper is
+not written — the backend holds the device descriptors itself today — and
+[`isolate/`](isolate/) is where the design lives until it is.
 
 ---
 
@@ -150,12 +208,18 @@ makes no ABI decisions.
 
 **Device crate.** Receives requests, maps guest handles to host device file
 descriptors, performs ABI-aware translation of ioctl parameters — rewriting
-embedded pointers and file descriptors — and drives the isolate. Buffer and
-window bookkeeping lives here.
+embedded pointers and file descriptors — and issues them against the host's
+devices. Buffer and window bookkeeping lives here.
 
-**Isolate.** Holds the real host device FDs and issues the `ioctl(2)` calls,
-unprivileged and sandboxed, one per guest process. For GPU memory it maps the
-host device FD into the shared region so the guest can reach it directly.
+**Events.** A second virtqueue runs the other way. The host watches each
+descriptor it has opened and says when one becomes readable, which is how a
+guest waiting for the GPU is woken. Without it the guest cannot wait at all —
+it polls a descriptor the kernel reports as permanently ready, and spins.
+
+**Isolate — not built yet.** The plan is a sandboxed helper per guest process,
+holding the real device FDs and issuing the `ioctl(2)` calls unprivileged.
+Today the backend does that itself, inside the VMM's process.
+[`isolate/`](isolate/) holds the design and no code.
 
 ```text
 ┌─ Guest ─────────────────────────────────────────────────┐
@@ -174,8 +238,9 @@ host device FD into the shared region so the guest can reach it directly.
 │    ├─ translate embedded FDs and pointers               │
 │    └─ buffer + window bookkeeping                       │
 │                     │                                   │
-│  isolate/ ──────────▼── unprivileged, per guest process │
-│    └─ ioctl(host /dev/nvidia*) · mmap → shared region   │
+│    └─ ioctl(host /dev/nvidia*) · mmap → shared window   │
+│       (an unprivileged per-guest isolate is planned,     │
+│        and is not what runs today)                       │
 │                                                         │
 │  Host NVIDIA driver → GPU                               │
 └─────────────────────────────────────────────────────────┘
@@ -187,7 +252,10 @@ host device FD into the shared region so the guest can reach it directly.
 
 **Targeted**
 
-- Vulkan rendering (everything that works without `/dev/nvidia-drm`)
+- Vulkan rendering, including presentation to a compositor inside the guest —
+  which needs `/dev/nvidia-drm` and `/dev/nvidia-modeset`, both of which are
+  implemented and neither of which is a display: they are how a buffer becomes
+  shareable
 - OpenGL rendering (headless EGL)
 - CUDA device memory allocation
 - CUDA ↔ Vulkan/GL interop, zero-copy, GPU-side pointers
@@ -196,30 +264,36 @@ host device FD into the shared region so the guest can reach it directly.
 **Out of scope**
 
 - `cudaMallocManaged()` / full unified virtual memory
-- `/dev/nvidia-drm` and `/dev/nvidia-modeset` — physical display output is not
-  needed for headless streaming
+- **scanout.** No physical display output: there is no monitor on a streaming
+  box, and the frame leaves as video rather than as pixels on a wire
 - MIG, SR-IOV
 - Arbitrary NVIDIA driver versions — each supported range is explicit, as with
   `nvproxy`
 
 ---
 
-## Performance targets
+## Performance
 
-Design targets, not measurements. Nothing here has been benchmarked.
+Measured, on one card, by one synthetic load — see [`BENCHMARKS.md`](BENCHMARKS.md)
+for the method and the raw runs, and for what this does not support (it does not
+support a comparison with any other hypervisor, because none was run).
 
-| | Venus | virtio-nvgpu (target) | Bare metal |
-| --- | --- | --- | --- |
-| GPU-bound (heavy shaders) | 90–97% | 97–100% | 100% |
-| CPU-bound (many draw calls) | 65–85% | 95–99% | 100% |
-| Shader compilation stutter | +10–50 ms per shader | <1 ms overhead | 0 |
-| Frame latency overhead | +1–3 ms | +0.05–0.1 ms | 0 |
-| CPU overhead for rendering | high (serialize/replay) | near zero | zero |
-| Guest-side NVENC | not viable | works (zero-copy) | works |
+| | virtio-nvgpu, measured | Venus, by design |
+| --- | --- | --- |
+| GPU-bound (≥2 ms a frame) | **98–100% of bare metal** | 90–97% |
+| Very light frames (≤0.5 ms) | 45–14% of bare metal | — |
+| CPU cost of a rendering guest | **same as bare metal** | high (serialize and replay) |
+| Host crossings per frame | **~0.02** | thousands |
+| Guest-side NVENC | works, zero-copy | not viable |
 
 The difference is structural: Venus crosses the VM boundary **per API call**,
-thousands of times a frame. `virtio-nvgpu` crosses it **per ioctl**, tens of
-times a frame.
+thousands of times a frame. `virtio-nvgpu` crosses it **per ioctl** — and a
+render loop issues none, because submission is a write to mapped memory. What
+is left at very light frames is not forwarding but *waiting*: the guest sleeps
+for the GPU, and the wake costs ~0.35 ms however small the frame was.
+
+The Venus column is that project's design envelope, not something measured
+here.
 
 ---
 
@@ -275,5 +349,8 @@ Code ported from other projects keeps its original terms.
 
 ## See also
 
+- [`BENCHMARKS.md`](BENCHMARKS.md) — what it costs against bare metal, how that
+  was measured, and what the numbers do not support.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — guest driver, device, virtio protocol,
-  memory model, ABI handling, CUDA and NVENC integration.
+  memory model, ABI handling. Part design document, part description; it opens
+  by saying which part is which.

@@ -1,10 +1,31 @@
-# virtio-gpu-nv Architecture
+# virtio-nvgpu Architecture
 
-This document describes the architecture of `virtio-gpu-nv`: a virtio device
-and guest kernel driver that forward NVIDIA kernel driver ioctls between a KVM
-guest and the host, giving the guest driver-level control over GPU resources.
+This document describes the architecture of `virtio-nvgpu` (the guest module is
+`virtio_gpu_nv`): a virtio device and guest kernel driver that forward NVIDIA
+kernel driver ioctls between a KVM guest and the host, giving the guest
+driver-level control over GPU resources.
 
-Everything described here follows directly from the design discussions that
+> ### What is built, as of 2026-09-24
+>
+> This began as a design document and parts of it still are one. What runs:
+>
+> - **the forwarding path** — ioctls, mmap into a shared window, and the DRM
+>   render node. A guest enumerates the card, renders, presents to a compositor
+>   inside the guest, and encodes H.264 on the client's own device.
+> - **an event queue**, host to guest, which is how a guest waiting for the GPU
+>   is woken. §5 does not describe it yet; the README does.
+> - **`/dev/nvidia-drm` and `/dev/nvidia-modeset`**, which §9 below still lists
+>   as out of scope. They are not a display — they are how a buffer becomes
+>   shareable between a client and a compositor — and presentation needs them.
+>
+> What does not: the **isolate** (`isolate/` is a design note; the backend holds
+> the host descriptors itself), **CUDA beyond enumeration**, MIG, SR-IOV, and
+> anything to do with several guests on one card.
+>
+> Performance is measured rather than projected now:
+> [`BENCHMARKS.md`](BENCHMARKS.md).
+
+Everything else described here follows from the design discussions that
 motivated this project. If something is speculative or unresolved, it is
 marked as such.
 
@@ -767,6 +788,13 @@ followed directly.
 
 ## 7. CUDA and NVENC Integration
 
+> **Measured note.** The encode path described below is the CUDA one, and it is
+> not the path that runs today. What runs is **Vulkan Video**: the capture layer
+> encodes on the client's own `VkDevice`, with no CUDA in the pipeline at all,
+> and it produces a 60 Hz H.264 stream that `ffmpeg` decodes without an error.
+> CUDA is forwarded but untested past enumeration, so this section is a design
+> for a second path rather than a description of the working one.
+
 ### 7.1 Why CUDA Is Needed
 
 The target use case includes a streaming pipeline:
@@ -906,8 +934,12 @@ These are known, accepted limitations of the initial design:
 - **No cudaMallocManaged**: full unified virtual memory is not supported.
   CUDA device memory allocations and graphics interop work.
 
-- **No /dev/nvidia-drm or /dev/nvidia-modeset**: no physical display
-  output from the guest. Design targets offscreen rendering + streaming.
+- **No scanout**: no physical display output from the guest, which is what a
+  streaming box wants — the frame leaves as video, not as pixels on a wire.
+  `/dev/nvidia-drm` and `/dev/nvidia-modeset` *are* implemented, because a
+  buffer cannot be shared between a client and a compositor without them; an
+  earlier version of this list said they were out of scope, and that was
+  written before presentation worked.
 
 - **Single GPU**: initial design assumes one NVIDIA GPU on the host. No
   MIG or SR-IOV support.
