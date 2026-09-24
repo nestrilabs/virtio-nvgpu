@@ -1407,10 +1407,15 @@ impl NvidiaBackend {
         // nvidia-drm's GEM ioctls: type 'd' (0x64), and `escape` is the
         // absolute DRM ioctl number, not an offset from DRM_COMMAND_BASE.
         //
-        // Two of the five carry a userspace pointer to an NVKMS parameter
-        // block, in the same shape nvidia-modeset uses, so they take the same
-        // path; the other three are flat and fall through to the passthrough
-        // below. Nothing here translates the GEM handles in these structs: a
+        // Three of them carry a userspace pointer to an NVKMS parameter block,
+        // in the same shape nvidia-modeset uses, so they take the same path;
+        // the flat ones fall through to the passthrough below.
+        //
+        // A missing entry here does not refuse anything: the ioctl is
+        // forwarded with the guest's own pointer still in it and a memFd that
+        // means nothing in this process, and the host answers EINVAL from
+        // somewhere far away. 0x49 was absent for exactly that reason and cost
+        // a round of chasing the host's own dmesg to find. Nothing here translates the GEM handles in these structs: a
         // handle is per drm_file, and the guest's open of its render node
         // holds exactly one open of ours, so the handle the host driver issues
         // is already scoped to the file that will use it.
@@ -1423,6 +1428,7 @@ impl NvidiaBackend {
             // (outer_size, ptr_offset, size_offset)
             let nested = match escape {
                 0x41 => Some((32usize, 8usize, 16usize)), // GEM_IMPORT_NVKMS_MEMORY
+                0x49 => Some((24usize, 8usize, 16usize)), // GEM_EXPORT_NVKMS_MEMORY
                 0x4d => Some((24usize, 8usize, 16usize)), // GEM_EXPORT_DMABUF_MEMORY
                 _ => None,
             };

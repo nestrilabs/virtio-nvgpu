@@ -707,6 +707,7 @@ struct nvgpu_drm_gem_close {
  * the file that will use it and means the same thing on both sides.
  */
 #define DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY 0x01  /* abs nr 0x41 */
+#define DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY 0x09  /* abs nr 0x49 */
 #define DRM_NVIDIA_GEM_MAP_OFFSET 0x0a           /* abs nr 0x4a */
 #define DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY 0x0b   /* abs nr 0x4b */
 #define DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY 0x0d /* abs nr 0x4d */
@@ -1058,6 +1059,24 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
                                       &nvgpu_gem_export_dmabuf);
 
+  /*
+   * Byte-identical to the one above -- u32 handle, pad, ptr, size, with an
+   * NvKmsKapiPrivExportMemoryParams { int memFd; } on the end of the pointer
+   * -- so it takes the same descriptor and the same fd swap.
+   *
+   * This is what the ICD asks after re-importing a descriptor the node itself
+   * exported, to learn that the memory behind it is NVKMS memory it can use.
+   * Refused, vkGetMemoryFdPropertiesKHR answers memoryTypeBits=0, and the
+   * capture layer drops every frame for want of a memory type. It is the
+   * paired half of PRIME_FD_TO_HANDLE: the import gives the handle back, this
+   * says what is behind it, and neither is any use without the other.
+   */
+  case DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY:
+    if (!file)
+      return -ENOTTY;
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+                                      &nvgpu_gem_export_dmabuf);
+
   default:
     /*
      * Named rather than silently refused. An ioctl this stub does not answer
@@ -1372,6 +1391,46 @@ static int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
  *      alongside, and let the backend give it a host address
  *   3. paramsSize == 0 or params == NULL → forward outer struct only
  */
+/*
+ * Commands that carry a second-level pointer and have no V2 twin.
+ *
+ * The generated table is built by pairing a V1 command with a V2 one in
+ * NVIDIA's headers, because that is what the old rewrite needed. Carrying the
+ * pointer instead of rewriting the command made that criterion wrong: what
+ * matters now is only whether a parameter block holds an NvP64, and a command
+ * with no V2 variant holds one just the same. Those are invisible to the
+ * generator, so they are listed here by hand.
+ *
+ * Only `v1_cmd`, `v1_userptr_offset` and `info_style` are read; the V2 fields
+ * are dead and left zero.
+ */
+static const struct nvgpu_v1v2_entry nvgpu_deep_only_table[] = {
+    /*
+     * NV0041_CTRL_CMD_GET_SURFACE_INFO — {u32 surfaceInfoListSize, pad,
+     * NvP64 surfaceInfoList}, entries of NVXXXX_CTRL_XXX_INFO {index, data},
+     * eight bytes each.
+     *
+     * The ICD asks this straight after exporting NVKMS memory, to learn the
+     * surface's attributes. Forwarded with the guest's own pointer still in
+     * it, RM answers NV_ERR_INVALID_ADDRESS (0x1e), and the only thing the
+     * caller reports is vkGetMemoryFdPropertiesKHR returning VK_ERROR_UNKNOWN
+     * several layers up.
+     */
+    {0x00410110, 0, 0, 8, 0, 0, 0, true},
+};
+
+static const struct nvgpu_v1v2_entry *nvgpu_find_deep_rewrite(u32 cmd) {
+  const struct nvgpu_v1v2_entry *rw = nvgpu_find_v1v2_rewrite(cmd);
+  int i;
+
+  if (rw)
+    return rw;
+  for (i = 0; i < (int)ARRAY_SIZE(nvgpu_deep_only_table); i++)
+    if (nvgpu_deep_only_table[i].v1_cmd == cmd)
+      return &nvgpu_deep_only_table[i];
+  return NULL;
+}
+
 static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
                                    void __user *uarg, unsigned int sz) {
   struct NVOS54_PARAMETERS params;
@@ -1434,7 +1493,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * the pointer sits and how much it addresses. Both are properties of the
    * layout that carries the pointer, which is the stable one.
    */
-  rw = (user_nested && nested_size > 0) ? nvgpu_find_v1v2_rewrite(ctl_cmd)
+  rw = (user_nested && nested_size > 0) ? nvgpu_find_deep_rewrite(ctl_cmd)
                                         : NULL;
 
   if (rw && nested_size >= rw->v1_userptr_offset + 8) {
@@ -2714,6 +2773,42 @@ static struct dma_buf *nvgpu_gem_export(struct drm_gem_object *obj, int flags) {
 }
 
 /*
+ * The other half of the export, and the one that is easy to forget: a buffer
+ * this node exported, coming back in through PRIME_FD_TO_HANDLE.
+ *
+ * The core's default importer (drm_gem_prime_import_dev) has a fast path for
+ * exactly this round trip, but it recognises a dma-buf by
+ * `ops == &drm_gem_prime_dmabuf_ops`. Ours carries nvgpu_dmabuf_ops, because
+ * the memory is the host's and reached through the shared window, so the fast
+ * path misses -- and with no gem_prime_import_sg_table the core then answers
+ * -EINVAL for a buffer it is holding a reference to.
+ *
+ * What that costs is not obvious from the refusal. vkGetMemoryFdPropertiesKHR
+ * asks the node whether it owns a descriptor; refused, the ICD reports
+ * memoryTypeBits=0, the importer finds no memory type in common with the
+ * image's, and the capture layer drops every frame with "No suitable memory
+ * type for DMA-BUF import". The encoder is fine; nothing ever reaches it.
+ *
+ * So do what the core would do, against our own ops. A foreign dma-buf still
+ * gets -EINVAL: importing memory this node does not own would mean giving the
+ * host GPU a mapping of it, which is the one thing the proxy must not invent.
+ */
+static struct drm_gem_object *nvgpu_gem_prime_import(struct drm_device *dev,
+                                                     struct dma_buf *dma_buf) {
+  struct drm_gem_object *obj;
+
+  if (dma_buf->ops != &nvgpu_dmabuf_ops)
+    return ERR_PTR(-EINVAL);
+
+  obj = dma_buf->priv;
+  if (!obj || obj->dev != dev)
+    return ERR_PTR(-EINVAL);
+
+  drm_gem_object_get(obj);
+  return obj;
+}
+
+/*
  * Both mmap paths take a reference on the object for the vma and leave it to
  * the vma to give back, through the vm_ops they copy out of the object's funcs.
  * Without these the reference is never dropped: the object outlives its last
@@ -3541,6 +3636,8 @@ static const struct file_operations nvgpu_drm_fops = {
 
 static const struct drm_driver nvgpu_drm_driver = {
     .driver_features = DRIVER_GEM | DRIVER_RENDER,
+    /* Without this, a buffer this node exported cannot be imported back. */
+    .gem_prime_import = nvgpu_gem_prime_import,
     .open = nvgpu_drm_open,
     .postclose = nvgpu_drm_postclose,
     .fops = &nvgpu_drm_fops,
