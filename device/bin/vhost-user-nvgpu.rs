@@ -282,6 +282,10 @@ fn event_pump(
     }
 }
 
+/// The queue the host posts events on. The guest posts empty buffers here and
+/// the event pump fills them; nothing the guest sends on it is a request.
+const EVENT_QUEUE: usize = 1;
+
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
@@ -495,6 +499,16 @@ impl VhostUserBackendMut for NvGpuBackend {
                 "event for unknown queue {device_event}"
             )));
         }
+        // The event queue carries buffers the guest posted for *us* to fill, not
+        // requests. Serving them as requests is a loop with no bottom: each one
+        // is dispatched, answered with "unknown message", handed back filled,
+        // re-posted by the guest, and kicked again -- 7.4 million times in five
+        // seconds, measured, the first time two guests ran at once. The pump
+        // thread owns this queue; a kick on it needs no work here.
+        if device_event as usize == EVENT_QUEUE {
+            return Ok(());
+        }
+
         let mem = self
             .mem
             .as_ref()
