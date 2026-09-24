@@ -382,10 +382,11 @@ mod tests {
             MsgType::Munmap,
             MsgType::GetProcFiles,
             MsgType::GetSysFiles,
+            MsgType::EventReady,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
         assert_eq!(MsgType::from_u32(0), None);
-        assert_eq!(MsgType::from_u32(8), None);
+        assert_eq!(MsgType::from_u32(9), None);
     }
 }
