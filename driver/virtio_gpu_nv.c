@@ -350,6 +350,28 @@ static int nvgpu_poll_events = 1;
 module_param_named(poll_events, nvgpu_poll_events, int, 0444);
 MODULE_PARM_DESC(poll_events, "a wait on a device descriptor really waits");
 
+/*
+ * Microseconds to look for the event before sleeping for it.
+ *
+ * Sleeping is not cheap here. The wake has to travel the host's epoll, the
+ * event queue, an interrupt and a halted vCPU, and measured end to end that is
+ * ~0.35 ms -- against 0.049 ms for a whole frame at cost 0. So a guest that
+ * sleeps on every frame pays more in wake than it spends drawing, which is how
+ * an encode run lost ~11% of its frames.
+ *
+ * Spinning first is the usual answer to that, and it was measured here rather
+ * than assumed: **it does not help, and it is off.** At 80, 300 and 600 us the
+ * late-frame count in a paced encode run went 33, 49 and 62 out of ~550, against
+ * 53 with no spin at all -- noise, not a trend -- while CPU went from 0.39 s to
+ * 0.99 s over a 12 s run. The waits that hurt are not the short ones.
+ *
+ * Kept as a knob because it is the obvious thing to try, and a number beats
+ * trying it again.
+ */
+static int nvgpu_poll_spin_us;
+module_param_named(poll_spin_us, nvgpu_poll_spin_us, int, 0644);
+MODULE_PARM_DESC(poll_spin_us, "microseconds to spin before sleeping for an event");
+
 /* struct drm_nvidia_get_dev_info_params is nine u32s. */
 #define NVGPU_DEV_INFO_WORDS 9
 /* name_len, major, minor, slot_index, then the dev_info words. */
@@ -1187,6 +1209,25 @@ static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
   /* Off: no state to consult, so say what the VFS said before this existed. */
   if (!nvgpu_poll_events)
     return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
+
+  /*
+   * A caller that passed a poll_table means to sleep if this says nothing, and
+   * that sleep is what costs 0.35 ms. Look for the event first: an event that
+   * arrives inside the spin is reported without the guest ever leaving the
+   * CPU. A caller polling with no intention of sleeping passes no table and
+   * gets the plain answer.
+   */
+  if (wait && nvgpu_poll_spin_us > 0 && !atomic_read(&nfd->pending)) {
+    ktime_t deadline = ktime_add_us(ktime_get(), nvgpu_poll_spin_us);
+
+    while (!atomic_read(&nfd->pending)) {
+      if (ktime_after(ktime_get(), deadline))
+        break;
+      if (need_resched() || signal_pending(current))
+        break;
+      cpu_relax();
+    }
+  }
 
   poll_wait(filp, &nfd->wq, wait);
 
