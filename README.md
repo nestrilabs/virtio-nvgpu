@@ -62,6 +62,12 @@ once**, each paced at exactly 60 Hz, with no NVENC session limit reached.
 
 Four is what was run, not a limit found.
 
+### Driver versions
+
+Measured on **595.99.02**; an A2000 on **615.71.09** renders but is not
+benchmarked. ABI profiles shipped: 535.129.03, 580.178.04, 595.71.05, matched by
+range, with anything older than the first refused. Details below.
+
 ### What is known to work
 
 - a guest enumerates the card — `nvidia-smi` reports real power and memory, and
@@ -306,11 +312,40 @@ here.
 
 ---
 
-## Driver ABI versioning
+## Driver versions
 
 NVIDIA's kernel driver ABI is not stable; ioctl struct layouts change between
-releases. Support is explicit per version range, handled the way gVisor's
-`nvproxy` handles it.
+releases. Support is explicit, and this is the whole list.
+
+**ABI profiles shipped:**
+
+| profile | covers |
+|---|---|
+| `535.129.03` | 535.129.03 up to the next profile |
+| `580.178.04` | 580.178.04 up to the next profile |
+| `595.71.05` | 595.71.05 and newer |
+
+Profiles key off **ranges, not points**: a release between two profiles uses the
+lower one, and anything newer than the last profile uses the last profile.
+Anything **older than 535.129.03 is refused** rather than guessed at — forwarding
+an ioctl whose layout has never been seen is how you get a plausible wrong
+answer instead of an error.
+
+A driver much newer than the newest profile is therefore *accepted on the
+assumption that nothing it needs has changed*. That assumption is what a new
+profile exists to replace, and it is the first thing to suspect when a new
+driver misbehaves.
+
+**Driver versions actually run:**
+
+| version | card | how far it got |
+|---|---|---|
+| **595.99.02** | RTX 3060 | everything — renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
+| **615.71.09** | RTX A2000 | enumerates and renders; not benchmarked, and not re-tested since |
+
+Two cards, two versions, one of them thoroughly. Anything else is untested.
+
+### How a profile is built
 
 The cost is bounded, for three reasons. Profiles key off **ranges, not points**,
 so a release between two known versions selects the lower profile. The struct
@@ -319,7 +354,8 @@ at each tag — compile a probe per field, read back `sizeof` and `offsetof` —
 rather than transcribed by hand. And the judgement half, which commands exist and
 which are safe, tracks `nvproxy` upstream.
 
-See [`gen/`](gen/).
+See [`gen/`](gen/), and `supported_versions()` there for the list in code —
+that function, not this table, is the thing that decides.
 
 ---
 

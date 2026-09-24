@@ -160,5 +160,7 @@ slower each run — and that is how a harness bug here cost a full set of number
   has a guest doing something heavier than vkcube at 720p.
 - **No claim about a real game.** `nesprobe` is synthetic; the only real
   pipeline here is our own encode chain.
-- **One card, one driver.** RTX 3060 at 595.99.02. An RTX A2000 at 615.71.09
-  renders but has not been benchmarked.
+- **One card, one driver.** RTX 3060 at **595.99.02**, which resolves to the
+  `595.71.05` ABI profile. An RTX A2000 at **615.71.09** renders but has not
+  been benchmarked. The shipped profiles are 535.129.03, 580.178.04 and
+  595.71.05, and a version older than the first is refused — see the README.
