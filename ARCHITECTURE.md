@@ -276,10 +276,28 @@ and they are what an encode pipeline uses.
 
 - **NVIDIA only.** It proxies one vendor's kernel ABI. Nothing here generalises.
 - **Version-locked**, as §8 describes.
-- **A real security surface.** Forwarded ioctls reach the host's NVIDIA module,
-  so bugs in those paths are reachable from a guest. This is the same trade-off
-  `nvproxy` and VFIO passthrough make, and it is the reason the isolate is in
-  the design at all.
+- **A real security surface, and not the one VFIO gives you.** Forwarded ioctls
+  reach the host's NVIDIA module, so bugs in those paths are reachable from a
+  guest. There is **no IOMMU boundary between guest GPU work and the host**: the
+  card belongs to the host's driver and sits in the host's IOMMU domain, and the
+  guest gets the driver's interface rather than the device. What isolates one
+  guest from the host is the GPU's own MMU, with page tables RM programs on the
+  guest's behalf — so the host NVIDIA driver is in the TCB.
+
+  VFIO passthrough with an IOMMU is **strictly stronger**: there the hardware is
+  constrained to the guest's own memory. An earlier version of this document
+  called the two "the same trade-off", which was wrong. `nvproxy` is the right
+  comparison, and gVisor is explicit that it reduces attack surface rather than
+  providing an isolation boundary.
+
+  What narrows the surface here: ioctls the ABI profile does not describe are
+  **refused**, not forwarded. What does not, yet: `RM_ALLOC` classes and RM
+  control commands are unfiltered, UVM and modeset have no equivalent table, and
+  the backend holds the host descriptors in the VMM's own process — the isolate
+  is why that last one is in the design at all.
+
+  If you need mutually untrusted tenants isolated by hardware, this is not it:
+  one card per guest with an IOMMU, or vGPU.
 - **One guest, so far.** Nothing here prevents several guests sharing a card,
   and nothing here demonstrates it either.
 - **No unified memory**, and no MIG or SR-IOV.

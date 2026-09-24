@@ -347,6 +347,11 @@ pub struct NvidiaBackend {
     msg_counts: std::collections::BTreeMap<&'static str, u64>,
     /// Every live placement, by the id the guest quotes to take it back.
     live_maps: std::collections::HashMap<u32, LiveMap>,
+    /// Whether an ioctl the profile does not describe is refused or forwarded.
+    abi_policy: AbiPolicy,
+    /// Escapes that failed the check, and how often, so a run can say what a
+    /// workload actually needed. Reported at teardown.
+    abi_refused: std::collections::BTreeMap<u32, u64>,
     /// Descriptors opened and closed since a transport last asked, so it can
     /// keep a poll set in step with them.
     ///
@@ -363,6 +368,24 @@ struct LiveMap {
     key: (u64, u64),
     region: crate::shm::ShmRegion,
     length: u64,
+}
+
+/// What to do with an ioctl the ABI profile does not vouch for.
+///
+/// Refusing is the default, and the reason is the whole point of having tables:
+/// an escape that is not in them is one whose parameter layout we have never
+/// seen, and forwarding it means handing the host driver bytes that nobody has
+/// checked. `nvproxy`, whose tables these are derived from, has always refused;
+/// this crate logged and forwarded anyway until it was asked, in public, what
+/// exactly a guest can reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AbiPolicy {
+    /// Refuse anything the profile does not describe.
+    #[default]
+    Enforce,
+    /// Forward it anyway and count it. For finding out what a workload needs
+    /// that the tables lack -- never for running one.
+    Permissive,
 }
 
 /// The result of checking one guest ioctl against the host's ABI profile.
@@ -387,6 +410,8 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
+            abi_policy: AbiPolicy::default(),
+            abi_refused: std::collections::BTreeMap::new(),
             watch_added: Vec::new(),
             watch_removed: Vec::new(),
             next_mapping_id: 1,
@@ -422,6 +447,18 @@ impl NvidiaBackend {
     /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
     /// the mapping is real -- but the `mmap` that follows is refused, because
     /// there is no address in the guest that names it.
+    /// Forward ioctls the ABI profile does not describe, instead of refusing
+    /// them. Diagnostic only: it exists to find out what a workload needs.
+    pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
+        if policy == AbiPolicy::Permissive {
+            log::warn!(
+                "ABI enforcement off: ioctls this build cannot describe will be \
+                 forwarded to the host driver unchecked"
+            );
+        }
+        self.abi_policy = policy;
+    }
+
     /// Descriptors opened and closed since this was last called.
     ///
     /// A transport calls it after serving messages and keeps its poll set in
@@ -487,6 +524,22 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
+        if !self.abi_refused.is_empty() {
+            let verb = if self.abi_policy == AbiPolicy::Enforce {
+                "refused"
+            } else {
+                "forwarded unchecked"
+            };
+            log::warn!(
+                "NvidiaBackend::teardown: {verb} {} ioctl(s) the ABI profile does not describe: {}",
+                self.abi_refused.values().sum::<u64>(),
+                self.abi_refused
+                    .iter()
+                    .map(|(e, n)| format!("{e:#04x}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
         let total: u64 = self.msg_counts.values().sum();
         log::info!(
             "NvidiaBackend::teardown: served {total} message(s): {}",
@@ -1184,16 +1237,42 @@ impl NvidiaBackend {
         // Only NVIDIA's own magic is described by the ABI tables; modeset and
         // uvm use different namespaces.
         if ioc_type == b'F' as u32 {
-            match self.check_abi(escape, ireq.data_len) {
-                AbiCheck::SizeMismatch { expected, actual } => log::warn!(
-                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects {expected}",
-                    self.driver.expect("a profile implies a known version")
-                ),
-                AbiCheck::UnknownEscape => log::warn!(
-                    "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                    self.driver.expect("a profile implies a known version")
-                ),
-                AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => {}
+            // Only NVIDIA's own magic is described by the tables. UVM (type 0)
+            // and modeset ('m') are forwarded with no equivalent check, which
+            // is a gap and not a decision.
+            let refuse = match self.check_abi(escape, ireq.data_len) {
+                AbiCheck::SizeMismatch { expected, actual } => {
+                    log::warn!(
+                        "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
+                         {expected}",
+                        self.driver.expect("a profile implies a known version")
+                    );
+                    true
+                }
+                AbiCheck::UnknownEscape => {
+                    log::warn!(
+                        "escape {escape:#04x} is not in the ABI profile for host driver {}",
+                        self.driver.expect("a profile implies a known version")
+                    );
+                    true
+                }
+                // No profile yet means CHECK_VERSION_STR has not been answered,
+                // which is itself one of the first ioctls a client sends.
+                // Refusing here would refuse the call that makes checking
+                // possible at all.
+                AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
+            };
+
+            if refuse {
+                *self.abi_refused.entry(escape).or_insert(0) += 1;
+                if self.abi_policy == AbiPolicy::Enforce {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::EINVAL,
+                    );
+                }
             }
         }
 
@@ -2507,6 +2586,34 @@ mod abi_tests {
         b.learn_driver_version(&t4_version_reply());
         assert_eq!(b.driver, Some(abi::version::DriverVersion::new(580, 178, 4)));
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    /// The property the tables exist for: an escape nobody described does not
+    /// reach the host driver. This is the check that was a log line until the
+    /// question was asked in public.
+    #[test]
+    fn an_escape_outside_the_profile_is_refused() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert!(b.abi.is_some());
+
+        // 0x7f is not an NVIDIA escape and is in no profile.
+        assert_eq!(b.check_abi(0x7f, 16), AbiCheck::UnknownEscape);
+        assert_eq!(b.abi_policy, AbiPolicy::Enforce, "enforcing is the default");
+
+        // And a size the host does not agree with, on an escape that exists.
+        assert!(matches!(
+            b.check_abi(NV_ESC_RM_CONTROL, 31),
+            AbiCheck::SizeMismatch { .. }
+        ));
+    }
+
+    /// Before CHECK_VERSION_STR is answered there is no profile to check
+    /// against, and refusing then would refuse the call that establishes one.
+    #[test]
+    fn nothing_is_refused_before_the_version_is_known() {
+        let b = backend();
+        assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
     }
 
     #[test]

@@ -77,6 +77,35 @@ range, with anything older than the first refused. Details below.
 - NVENC through Vulkan Video, encoding on the client's own device
 - imported buffers are the host's memory, mapped through a shared window
 
+### What a guest can reach
+
+Worth stating plainly, because it is the first question a security person asks
+and the honest answer is not "nothing".
+
+There is **no IOMMU boundary** between guest GPU work and the host. The card
+belongs to the host's NVIDIA driver and sits in the host's IOMMU domain; the
+guest gets the driver's ioctl interface, not the device. What separates a guest
+from host memory is the GPU's own MMU, with page tables RM programs on the
+guest's behalf — so **the host NVIDIA driver is in the TCB**. The guest also
+authors its own command streams, which is exactly why there is no per-submission
+cost.
+
+What narrows that surface today:
+
+- ioctls the ABI profile does not describe are **refused**, not forwarded
+  (`--permissive-abi` turns that off for diagnosis, and says so loudly)
+
+What does not, yet:
+
+- `RM_ALLOC` classes and RM control commands are unfiltered
+- UVM and modeset ioctls have no equivalent table
+- the backend holds the host descriptors inside the VMM's process; the
+  unprivileged per-guest isolate is designed and unbuilt
+
+**This is attack-surface reduction, not hardware isolation.** VFIO passthrough
+with an IOMMU is strictly stronger — it constrains the device to the guest's own
+memory — and for mutually untrusted tenants that or vGPU is still the answer.
+
 ### What is not done
 
 - **more than four guests**, or guests doing anything heavier than vkcube at

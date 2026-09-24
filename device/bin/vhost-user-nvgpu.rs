@@ -57,6 +57,15 @@ struct Args {
     /// against a fixture tree rather than a live driver.
     #[arg(long, default_value = host::PROC_NVIDIA)]
     proc_nvidia: PathBuf,
+
+    /// Forward ioctls the ABI profile does not describe instead of refusing
+    /// them, and report what was forwarded at teardown.
+    ///
+    /// For finding out what a workload needs that the tables lack. It hands a
+    /// guest the parts of the host driver's interface nobody has checked, so it
+    /// is not a way to run one.
+    #[arg(long)]
+    permissive_abi: bool,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -306,7 +315,7 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(proc_nvidia: &Path) -> anyhow::Result<Self> {
+    fn new(proc_nvidia: &Path, abi_policy: device::nvidia::AbiPolicy) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -320,8 +329,11 @@ impl NvGpuBackend {
         );
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
 
+        let mut nvidia = NvidiaBackend::with_default_zones();
+        nvidia.set_abi_policy(abi_policy);
+
         Ok(Self {
-            nvidia: Arc::new(Mutex::new(NvidiaBackend::with_default_zones())),
+            nvidia: Arc::new(Mutex::new(nvidia)),
             mem: None,
             event_idx: false,
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
@@ -548,7 +560,12 @@ fn main() -> anyhow::Result<()> {
         args.socket
     );
 
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(&args.proc_nvidia)?));
+    let abi_policy = if args.permissive_abi {
+        device::nvidia::AbiPolicy::Permissive
+    } else {
+        device::nvidia::AbiPolicy::Enforce
+    };
+    let backend = Arc::new(RwLock::new(NvGpuBackend::new(&args.proc_nvidia, abi_policy)?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(
