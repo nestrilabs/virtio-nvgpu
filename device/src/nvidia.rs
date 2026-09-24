@@ -349,6 +349,17 @@ pub struct NvidiaBackend {
     live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
+    /// and how often.
+    ///
+    /// Narrowing these to what the pipeline uses is the step that actually
+    /// reduces what a guest can reach in the host driver -- an unprivileged
+    /// helper process contains a bug in *this* code, not one in NVIDIA's kernel
+    /// module, and only fewer reachable commands helps with the second. A
+    /// filter cannot be written from a guess, so this is the instrument that
+    /// says what the set really is.
+    rm_classes: std::collections::BTreeMap<u32, u64>,
+    rm_controls: std::collections::BTreeMap<u32, u64>,
     /// Escapes that failed the check, and how often, so a run can say what a
     /// workload actually needed. Reported at teardown.
     abi_refused: std::collections::BTreeMap<u32, u64>,
@@ -412,6 +423,8 @@ impl NvidiaBackend {
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
             abi_refused: std::collections::BTreeMap::new(),
+            rm_classes: std::collections::BTreeMap::new(),
+            rm_controls: std::collections::BTreeMap::new(),
             watch_added: Vec::new(),
             watch_removed: Vec::new(),
             next_mapping_id: 1,
@@ -536,6 +549,31 @@ impl NvidiaBackend {
                 self.abi_refused
                     .iter()
                     .map(|(e, n)| format!("{e:#04x}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        // The two sets a filter would be written from. Printed whole rather
+        // than summarised: the long tail is the interesting part, because that
+        // is where something a pipeline needs exactly once hides.
+        if !self.rm_classes.is_empty() {
+            log::info!(
+                "NvidiaBackend::teardown: {} RM_ALLOC class(es): {}",
+                self.rm_classes.len(),
+                self.rm_classes
+                    .iter()
+                    .map(|(c, n)| format!("{c:#06x}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        if !self.rm_controls.is_empty() {
+            log::info!(
+                "NvidiaBackend::teardown: {} RM_CONTROL command(s): {}",
+                self.rm_controls.len(),
+                self.rm_controls
+                    .iter()
+                    .map(|(c, n)| format!("{c:#010x}={n}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -1373,34 +1411,31 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // RM control requires nested handling
             // ---------------------------------------------------------------
-            NV_ESC_RM_CONTROL => self.dispatch_nested(
-                cookie,
-                host_fd,
-                request,
-                param_in,
-                resp_buf,
-                32,
-                16,
-                24,
-                deep_in,
-                None,
-            ),
+            NV_ESC_RM_CONTROL => {
+                // Counted here rather than in the forwarder, which holds only a
+                // shared borrow. NVOS54: hClient, hObject, cmd at byte 8.
+                if param_in.len() >= 12 {
+                    let cmd = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
+                    *self.rm_controls.entry(cmd).or_insert(0) += 1;
+                }
+                self.dispatch_nested(
+                    cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
+                )
+            }
 
             // ---------------------------------------------------------------
             // RM alloc as well..
             // ---------------------------------------------------------------
-            NV_ESC_RM_ALLOC => self.dispatch_nested(
-                cookie,
-                host_fd,
-                request,
-                param_in,
-                resp_buf,
-                48,
-                16,
-                32,
-                deep_in,
-                None,
-            ),
+            NV_ESC_RM_ALLOC => {
+                // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12.
+                if param_in.len() >= 16 {
+                    let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
+                    *self.rm_classes.entry(class).or_insert(0) += 1;
+                }
+                self.dispatch_nested(
+                    cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
+                )
+            }
 
             // ---------------------------------------------------------------
             // Everything else — simple passthrough to host
