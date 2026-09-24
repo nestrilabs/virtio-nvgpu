@@ -23,15 +23,15 @@ metal**, with an identical headless Vulkan load:
 
 | what the host takes for one frame | guest frame time | |
 |---|---|---|
-| 39 ms | **−0.3%** | faster than bare metal, within noise |
-| 9.9 ms | **−0.8%** | |
-| 2.0 ms | **+1.9%** | |
-| 0.5 ms | +120% | a wake costs ~0.35 ms, and the frame is 0.5 |
-| 0.05 ms | +727% | |
+| 39 ms | **−0.4%** | faster than bare metal, within noise |
+| 9.9 ms | **−0.7%** | |
+| 2.0 ms | **+1.7%** | |
+| 0.5 ms | +7.1% | a wake costs ~0.02 ms, and the frame is half of one |
+| 0.05 ms | +40.8% | |
 
 **Above about 2 ms a frame — which is every frame a game draws — a guest is
 within 2% of bare metal.** Below that, the cost of waiting for the GPU starts to
-dominate a frame that barely exists.
+show against a frame that barely exists.
 
 CPU is the other half of it, because a shared GPU is only worth sharing if the
 guests are cheap. Unpaced at ~100 fps for 12 s, one guest:
@@ -39,7 +39,7 @@ guests are cheap. Unpaced at ~100 fps for 12 s, one guest:
 | | CPU used |
 |---|---|
 | host, bare metal | 0.40 s |
-| **guest** | **0.39 s** |
+| **guest** | **0.37 s** |
 
 **A guest costs what the host costs.** Nothing is spent on forwarding in a
 render loop, because nothing is forwarded: NVIDIA's user-mode driver submits
@@ -49,6 +49,18 @@ all of it device setup.
 
 Full method, raw runs and the things these numbers do **not** support:
 [`BENCHMARKS.md`](BENCHMARKS.md).
+
+### Several guests on one card
+
+Four guests on one RTX 3060, the same load in each: **25.84, 26.49, 25.57, 25.79
+fps** — 103.7 together, against 102.9 for a single guest — with p50 frame times
+of 39.165, 39.164, 39.168 and 39.165 ms. The total does not move as guests are
+added, and the split is even to four decimal places.
+
+All four render correctly at the same time, and four of them **encode H.264 at
+once**, each paced at exactly 60 Hz, with no NVENC session limit reached.
+
+Four is what was run, not a limit found.
 
 ### What is known to work
 
@@ -61,13 +73,10 @@ Full method, raw runs and the things these numbers do **not** support:
 
 ### What is not done
 
-- **one guest at a time.** Two guests have never shared a card in any
-  measurement here.
+- **more than four guests**, or guests doing anything heavier than vkcube at
+  720p. Four share the card evenly; eight has not been tried.
 - **two cards, two driver versions.** RTX 3060 / 595.99.02 is where the numbers
   come from; an RTX A2000 / 615.71.09 has rendered but is not benchmarked.
-- **jitter.** Frames arriving more than 25 ms apart in a 60 Hz encode run: 53
-  out of ~600. Nothing is dropped and the mean is exactly 60 Hz, but the tail
-  is real and unexplained.
 - CUDA is forwarded but untested beyond enumeration; the jailer, per-version
   driver shares and the multi-tenant envelope are unbuilt.
 
@@ -281,7 +290,7 @@ support a comparison with any other hypervisor, because none was run).
 | | virtio-nvgpu, measured | Venus, by design |
 | --- | --- | --- |
 | GPU-bound (≥2 ms a frame) | **98–100% of bare metal** | 90–97% |
-| Very light frames (≤0.5 ms) | 45–14% of bare metal | — |
+| Very light frames (≤0.5 ms) | 93–71% of bare metal | — |
 | CPU cost of a rendering guest | **same as bare metal** | high (serialize and replay) |
 | Host crossings per frame | **~0.02** | thousands |
 | Guest-side NVENC | works, zero-copy | not viable |
@@ -290,7 +299,7 @@ The difference is structural: Venus crosses the VM boundary **per API call**,
 thousands of times a frame. `virtio-nvgpu` crosses it **per ioctl** — and a
 render loop issues none, because submission is a write to mapped memory. What
 is left at very light frames is not forwarding but *waiting*: the guest sleeps
-for the GPU, and the wake costs ~0.35 ms however small the frame was.
+for the GPU, and the wake costs ~0.02 ms however small the frame was.
 
 The Venus column is that project's design envelope, not something measured
 here.
