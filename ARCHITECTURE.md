@@ -230,6 +230,36 @@ a reserved range of its own from the memory-region fds. RM then pins the VMM's
 view of exactly the guest's pages. The guest must keep them pinned, and out of
 ballooning and migration, until the RM object is freed.
 
+### The UVM aperture
+
+One mapping cannot go in the window at all. Creating a CUDA context makes a
+UVM semaphore pool at an address the caller chose and then maps the UVM file
+there, at an offset equal to that address. UVM takes the mapping only at the
+host address equal to the offset, only for the pool's exact range, and — in
+its default mode — only from the process that initialised the file, which is
+the backend. The window is none of those: its host address is wherever the
+VMM happened to reserve it, and the VMM is not the backend.
+
+So each pool gets a slot of its own. The backend initialises every UVM file in
+multi-process sharing mode, which lifts the one-process rule (and also turns
+pageable memory access off on every release, which the backend wanted anyway).
+When the guest maps a pool, the backend checks it is one this very file was
+seen to create, asked for exactly, and hands the VMM the file with the
+existing SHMEM_MAP request on a second shared-memory region, the **UVM
+aperture** (region 2). The VMM maps the file at the pool's own address in its
+own address space, refusing to replace anything already there, checks the
+pages are really present, and gives that range a memory slot inside the
+aperture at an offset the backend chose. The guest maps its vma from there,
+write-back. Taking it out goes the other way round: the slot first, then the
+mapping, so the guest never has a slot over nothing.
+
+A second region rather than more window because the window is one slot over
+one reservation, and a pool's host address is not ours to choose. One slot
+per pool because the address is fixed per pool; a slot costs about 0.7 ms to
+add and 2 ms to remove, once per CUDA context. UVM itself keeps the pages
+alive: it refuses to free a pool that is still mapped, and the VMM's mapping
+counts.
+
 ---
 
 ## 6. How a buffer becomes shareable
@@ -878,6 +908,14 @@ host compositor really enters direct scanout for a guest window is stage 3 of
 - **A window that must be sized in advance.** It is fixed when the VM is
   created, and a workload that needs more mapped memory than was provisioned
   will fail to map it.
+- **One address space for every UVM pool of a VM.** Each pool the guest maps
+  sits at its own address in the VMM (§5), so two guest processes whose pools
+  overlap cannot both be mapped: the second CUDA context fails with EEXIST.
+  CUDA picks its addresses the same way in every process, so two CUDA
+  processes at once may meet this; how often is still to be measured. A pool
+  cannot be moved — its GPU address is the same number — so this needs a host
+  driver change to lift. Pools are also bounded (16 per process, 64 and
+  256 MiB per VM), and the aperture is 1 GiB.
 
 ---
 

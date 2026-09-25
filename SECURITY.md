@@ -145,17 +145,55 @@ each call is validated:
 | **RM_CONTROL** commands | 1,362 method ids | All, **raw** past the 32-byte outer check. One embedded pointer was relocated, at an offset the guest named, into a heap buffer sized from what the guest sent. Every other embedded pointer reached RM as a guest address, which RM dereferences in the backend. | Still all but 15, and **not allow-listed**. 3 are **refused** (pointers the table cannot name one by one). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. |
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | All, **raw**. | All but **12, refused** (OS-descriptor memory 0x71, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event. The rest reach RM **not allow-listed**. |
 | **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | **Raw**: RM pinned the backend's pages at a guest-chosen address and mapped them for the GPU. | **Refused**. `cuMemHostRegister` and `VK_EXT_external_memory_host` are therefore unsupported. |
-| **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | All, **raw**. The guest copied 12 KiB each way for every command but the two it knew the size of, and pointers and descriptors went as sent. | At most **33** (30 to 33 per release), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**. |
+| **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | All, **raw**. The guest copied 12 KiB each way for every command but the two it knew the size of, and pointers and descriptors went as sent. | At most **33** (30 to 33 per release), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages, and every file is put in multi-process sharing mode, which takes pageable access away on every release and ties the VA space to no process. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**. |
 | **nvidia-uvm tools**, `/dev/nvidia-uvm-tools` | 7 | All, **raw**. | **0**: the file opens, and every ioctl on it is **refused**. |
 | **NVKMS**, `/dev/nvidia-modeset` | one ioctl carrying 66 commands (610.57.04) | Every command, **raw**, with **no policy**. One descriptor, REGISTER_SURFACE's, was translated at a fixed offset. | 56 to 61 per release, **schema-authoritative** over IOCTL2. v1 carries only the commands with no pointer and no descriptor. 7 are **refused** by name, 3 run only with `--kms-card`, and 7 are gated on grants outside it. Everything else is in §5. At most 64 opens per VM. |
 | **nvidia-drm and DRM core on a host render node** | 24 nvidia-drm ioctls (21 render-allowed), plus the core's render-allowed ones | Any `d` ioctl. Three nested GEM calls translated `memFd`; the rest were **raw** in a buffer sized by the guest, while the host copies `_IOC_SIZE` back (a heap overflow in the backend). | v1: 6 full ioctl numbers. IOCTL2: 28 render-class entries (12 syncobj, 16 nvidia-drm), **schema-authoritative**. GEM_IMPORT_USERSPACE_MEMORY, GEM_FLINK and GEM_OPEN are **refused** on every handle. SEMSURF_FENCE_CTX_CREATE's index must lie inside the surface, and its client must be one this VM allocated, with at most 16 contexts per file and 256 per VM (`device/src/semsurf.rs`). Every argument buffer is at least `_IOC_SIZE` and guarded. |
 | **DRM KMS on a host card or lease file** | the KMS core | None: no such file existed. | 49 KMS-class entries, **schema-authoritative**, only on card handles (`--kms-card`) and lease handles. See §5. |
 | **HOST_OP** (backend-made host calls on the guest's behalf) | -- | None. | 10 ops, each argument checked against the handle kind it must be: PRIME export and import on render files, sync_file merge (at most 5), eventfd, a signalled sync_file (by `/dev/udmabuf` when needed), a syncobj wait registration (at most 1,024 per VM), fd kind, close-many, and OPEN_KMS and DROP_IF_MASTER, which are `--kms-card` only. |
-| **mmap** | per device | Any handle. | Device, render, card and lease handles only. Each placement carries the host's memory type and whether it is writable, so a read-only host page is mapped read-only in the guest. |
+| **mmap** | per device | Any handle. A UVM file went to the window, where the VMM's mmap of it failed and closed the window's request channel for the rest of the VM. | Device, render, card and lease handles only. Each placement carries the host's memory type and whether it is writable, so a read-only host page is mapped read-only in the guest. A UVM file maps only a semaphore pool the same file was seen to create, asked for exactly, into the UVM aperture (below); anything else on it is **refused** before the VMM is asked. |
 | **any other ioctl type** | -- | **Raw**, to whatever host file the handle was. | **Refused** (EPERM). |
 
 What the dev column shows is that a guest's reach into the host driver on dev
 was bounded mostly by what the guest's own libraries happened to send.
+
+### The UVM aperture: what the guest can put in the VMM's address space
+
+A CUDA context needs a UVM semaphore pool mapped at its own address, and UVM
+maps one nowhere else, so each pool the guest maps is mapped by the VMM at
+that address in the VMM's own address space and given a memory slot in a
+second guest-physical region (ARCHITECTURE.md §5). The address is the
+guest's choice. What bounds it:
+
+- **Only a pool, only this VM's, only exactly.** The backend records a pool
+  when UVM says ALLOC_SEMAPHORE_POOL succeeded on that UVM file, and asks the
+  VMM to map only that range of that file, read-write, when the guest asks for
+  exactly its base and length (`device/src/uvmmap.rs`). A UVM file not in
+  sharing mode, another file's pool, a sub-range and a read-only request are
+  refused. UVM checks the same range again when the VMM maps it.
+- **Never over the VMM's own memory.** The address must lie in [4 GiB,
+  64 TiB), where a 64-bit VMM has nothing (its executable, heap and mmap base
+  all sit above 85 TiB), and the VMM maps with `MAP_FIXED_NOREPLACE`, so a
+  collision fails rather than replacing anything. Two of the guest's own pools
+  at one address are refused by the backend before the VMM is asked, so a
+  failure never tells the guest anything about the VMM's layout.
+- **No descriptor kept.** The UVM file travels to the VMM on the vhost-user
+  request channel and its copy is closed when the request returns; the
+  mapping's own file reference is all the VMM holds, and it goes with the
+  mapping.
+- **No slot over nothing.** The VMM checks the pages are present before it
+  adds the slot, removes the slot before the mapping, and UVM refuses to free
+  a pool that is still mapped. An aperture address with no slot reads zeros
+  and ignores writes, in the VMM, never as a fault the host has to resolve.
+- **Bounded.** Each pool at most 64 MiB; 16 placements and 64 MiB per UVM
+  file; 64 placements and 256 MiB per VM; 256 recorded pools per file and
+  4,096 per VM; an aperture of at most 1 GiB. Every placement goes when its
+  last guest mapping does, when its file closes, and on a guest reboot or
+  device reset; if the backend goes away, the VMM drops them all itself.
+
+Sharing mode only takes things away (pageable access, the tie to the
+backend's mm), no host driver change is needed, and the VMM's seccomp filter
+already allows the calls involved (`mmap`, `mincore`, `ioctl`).
 
 ---
 
@@ -334,6 +372,8 @@ Which host surfaces each display mode turns on:
 - the NVKMS grants and gates, framebuffer ownership, KMS master, the CRC gate
   and the property rules in §5;
 - the semaphore-surface bounds, ownership and caps;
+- which UVM pools the VMM maps into the aperture, at what address, and how
+  many;
 - the host-PID answers;
 - the Wayland allowlist, descriptor classes and budgets;
 - every cap in §4;
@@ -514,6 +554,13 @@ In rough order of weight.
      rather than none.
    - **UVM_INITIALIZE.** The guest driver writes the forced flags back into the
      caller's memory: a difference from native, not a host exposure.
+   - **The UVM aperture.** Its safety rests on the VMM doing what §3 says:
+     `MAP_FIXED_NOREPLACE`, the page check, slot before mapping, and reading
+     an unslotted aperture address as nothing. The backend cannot see any of
+     it. Two guest processes whose pools overlap cannot both have one mapped,
+     so the second CUDA context fails. ALLOC_SEMAPHORE_POOL's length still
+     sizes a host kernel allocation with no cap of the backend's (a pool over
+     64 MiB is only never mapped).
    - **KMS.**
      - One executor lane per class per VM, and a lower ALLOC_DEVICE cap
        (S-8), are not done.

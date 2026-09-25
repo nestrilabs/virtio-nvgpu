@@ -527,9 +527,13 @@ impl NvidiaBackend {
         } else {
             0
         };
+        let mut backend_caps = self.config.caps();
+        if self.hello_uvm_aperture(&req) {
+            backend_caps |= BCAP_UVM_MAP;
+        }
         let resp = HelloResp {
             proto: PROTO_V2,
-            backend_caps: self.config.caps(),
+            backend_caps,
             max_req: self.max_req,
             max_resp: self.max_resp,
             num_cards,
@@ -542,6 +546,38 @@ impl NvidiaBackend {
             resp.max_resp
         );
         Ok(self.ok_reply(0, bytes_of(&resp)))
+    }
+
+    /// Whether this session maps UVM pools into the aperture the guest says
+    /// it has (uvmmap.rs): only when it has one, the VMM's request channel is
+    /// up to place into it, and the host's UVM takes multi-process sharing
+    /// mode, without which the VMM cannot map a UVM file at all. Otherwise
+    /// every MMAP of a UVM file is EINVAL, as it always was, and the VMM is
+    /// never asked.
+    fn hello_uvm_aperture(&mut self, req: &HelloReq) -> bool {
+        let sharing = self
+            .driver
+            .and_then(abi::schema::uvm_table)
+            .is_some_and(|t| {
+                t.init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE != 0
+            });
+        let len = if req.guest_caps & GCAP_UVM_APERTURE != 0 && self.has_window() && sharing {
+            u64::from(req.uvm_aperture_mib) << 20
+        } else {
+            0
+        };
+        // Placements outlive only a HELLO without FRESH, which keeps them
+        // where they are.
+        self.uvm_maps.set_aperture(len);
+        let have = self.uvm_maps.aperture_len();
+        if have > 0 {
+            log::info!(
+                "HELLO: UVM pools map into the guest's {} MiB aperture (using {} MiB)",
+                req.uvm_aperture_mib,
+                have >> 20
+            );
+        }
+        have >= crate::uvmmap::CHUNK
     }
 
     fn serve_watch(&mut self, payload: &[u8]) -> Result<Reply, i32> {
@@ -1010,7 +1046,7 @@ mod tests {
             proto: PROTO_V2,
             flags,
             guest_caps: 0,
-            reserved: 0,
+            uvm_aperture_mib: 0,
         };
         call(be, MsgType::Hello, 0, bytes_of(&req))
     }
@@ -1108,6 +1144,63 @@ mod tests {
         assert_eq!(
             status(&call(&mut be, MsgType::Hello, 0, bytes_of(&bad))),
             -libc::EPROTO
+        );
+    }
+
+    struct NoVmm;
+    impl crate::shm::WindowPlacer for NoVmm {
+        fn place(&self, _: u64, _: u64, _: RawFd, _: u64, _: bool) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The aperture is offered only when the guest has one, the VMM's
+    /// request channel is up, and the host's UVM takes sharing mode; and it
+    /// is what the guest said, capped.
+    #[test]
+    fn the_uvm_aperture_is_offered_only_with_all_three_halves() {
+        let caps = |be: &mut NvidiaBackend, gcap: u32, mib: u32| {
+            let req = HelloReq {
+                proto: PROTO_V2,
+                flags: HELLO_F_FRESH,
+                guest_caps: gcap,
+                uvm_aperture_mib: mib,
+            };
+            let r = call(be, MsgType::Hello, 0, bytes_of(&req));
+            assert_eq!(status(&r), 0);
+            read::<HelloResp>(&r[HDR..]).unwrap().backend_caps & BCAP_UVM_MAP
+        };
+        let mut be = backend();
+        be.set_host_driver_version("595.99.02");
+        assert_eq!(
+            caps(&mut be, GCAP_UVM_APERTURE, 1024),
+            0,
+            "no request channel"
+        );
+        be.set_window(Box::new(NoVmm));
+        assert_eq!(caps(&mut be, 0, 1024), 0, "the guest has none");
+        assert_eq!(be.uvm_maps.aperture_len(), 0);
+        assert_eq!(
+            caps(&mut be, GCAP_UVM_APERTURE, 1),
+            0,
+            "smaller than a chunk"
+        );
+        assert_ne!(caps(&mut be, GCAP_UVM_APERTURE, 1024), 0);
+        assert_eq!(be.uvm_maps.aperture_len(), 1 << 30);
+        assert_ne!(caps(&mut be, GCAP_UVM_APERTURE, 64 << 10), 0);
+        assert_eq!(be.uvm_maps.aperture_len(), crate::uvmmap::APERTURE_MAX);
+        assert_ne!(caps(&mut be, GCAP_UVM_APERTURE, 7), 0);
+        assert_eq!(be.uvm_maps.aperture_len(), 6 << 20);
+        // A host whose UVM this backend has no table for.
+        let mut be = backend();
+        be.set_window(Box::new(NoVmm));
+        assert_eq!(
+            caps(&mut be, GCAP_UVM_APERTURE, 1024),
+            0,
+            "no sharing mode known"
         );
     }
 

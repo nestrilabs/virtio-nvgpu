@@ -1627,30 +1627,57 @@ pgprot_t nvgpu_window_pgprot(struct nvgpu_device *dev, u8 caching,
  * of its own. Nothing is wrong then, only slower: reads of coherent GPU system
  * memory go uncached. Said once, here, rather than found by a benchmark.
  */
-static void nvgpu_window_check_wb(struct nvgpu_device *dev) {
+static void nvgpu_region_check_wb(struct nvgpu_device *dev,
+                                  const struct virtio_shm_region *r,
+                                  const char *what) {
 #ifdef CONFIG_X86
   void __iomem *p;
   unsigned int level;
   pte_t *pte;
 
-  p = ioremap_cache(dev->window.addr + dev->window.len - PAGE_SIZE, PAGE_SIZE);
+  p = ioremap_cache(r->addr + r->len - PAGE_SIZE, PAGE_SIZE);
   if (!p)
     return;
   pte = lookup_address((unsigned long)p, &level);
   if (pte && level == PG_LEVEL_4K && (pte_flags(*pte) & _PAGE_CACHE_MASK))
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: the window's write-back zone is not write-back "
-             "in this guest's MTRRs, so write-back mappings of GPU system "
-             "memory will be uncached (slower, not wrong); the VMM can cover "
-             "it with a write-back MTRR\n");
+             "virtio-gpu-nv: %s is not write-back in this guest's MTRRs, so "
+             "write-back mappings of GPU system memory will be uncached "
+             "(slower, not wrong); the VMM can cover it with a write-back "
+             "MTRR\n",
+             what);
   iounmap(p);
 #endif
+}
+
+/*
+ * A UVM file maps one thing: a semaphore pool, which UVM takes only at the
+ * address equal to the offset, only shared and read-write (uvm.c:792-806),
+ * and only for the pool's exact range (the backend checks that one, against
+ * the pools it saw this file make). Refused here as UVM would, and without
+ * the aperture at all, as it always was: before it, a UVM mapping sent to
+ * the window failed on the host and took the window with it.
+ */
+static int nvgpu_mmap_uvm_check(struct nvgpu_fd *nfd,
+                                struct vm_area_struct *vma, u64 offset) {
+  const vm_flags_t rw = VM_SHARED | VM_READ | VM_WRITE;
+  struct nvgpu_device *dev = nfd->dev;
+
+  if (!dev->v2 || !(dev->backend_caps & NVGPU_BCAP_UVM_MAP) ||
+      dev->uvm_aperture.len < PAGE_SIZE)
+    return -EINVAL;
+  if (vma->vm_start != offset || (vma->vm_flags & rw) != rw)
+    return -EINVAL;
+  return 0;
 }
 
 static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   struct nvgpu_fd *nfd = filp->private_data;
   u64 size = vma->vm_end - vma->vm_start;
   u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+  bool uvm = nfd->device_type == NVGPU_DEV_UVM ||
+             nfd->device_type == NVGPU_DEV_UVM_TOOLS;
+  const struct virtio_shm_region *region;
   u64 window_off;
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
@@ -1659,6 +1686,12 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   struct nvgpu_vma_map *m;
   u32 used, mapping_id = 0;
   int ret;
+
+  if (uvm) {
+    ret = nvgpu_mmap_uvm_check(nfd, vma, offset);
+    if (ret)
+      return ret;
+  }
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
@@ -1696,6 +1729,35 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   mapping_id = le32_to_cpu(resp->mapping_id);
 
   /*
+   * Which region the offset is in is the backend's to say, and only for a
+   * UVM file: an aperture reply to anything else, or a window reply to a
+   * UVM mapping, is a backend this side does not understand.
+   */
+  if (uvm != !!(resp->flags & NVGPU_MMAP_F_UVM_APERTURE)) {
+    dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                         "virtio-gpu-nv: MMAP reply flags 0x%x for a %s file\n",
+                         resp->flags, uvm ? "UVM" : "non-UVM");
+    ret = -EIO;
+    goto out;
+  }
+  region = uvm ? &nfd->dev->uvm_aperture : &nfd->dev->window;
+  if (uvm) {
+    /*
+     * The pool's own pages, write-back as the host maps them
+     * (uvm_mem_map_cpu_user), in a slot of their own. Not copied on fork,
+     * as UVM's are not (uvm.c:830). The reply must be the whole vma: a
+     * shorter placement would leave the rest of it reaching nothing.
+     */
+    if (le64_to_cpu(resp->size) != size) {
+      ret = -EIO;
+      goto out;
+    }
+    vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP |
+                          VM_DONTCOPY);
+    goto place;
+  }
+
+  /*
    * A mapping the host made read-only (the user-shared-data page; PTIMER and
    * MC for a non-admin) is read-only here too, by nvidia.ko's own rule for a
    * context without WRITEABLE (nv-mmap.c:756-761): the mmap succeeds, a write
@@ -1726,19 +1788,21 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
     goto out;
   }
 
+place:
   window_off = le64_to_cpu(resp->guest_phys_addr);
-  if (window_off + size > nfd->dev->window.len) {
+  if (window_off > region->len || size > region->len - window_off ||
+      !PAGE_ALIGNED(window_off)) {
     dev_warn(&nfd->dev->vdev->dev,
              "virtio-gpu-nv: mapping at %llu+%llu runs past the %llu-byte "
-             "window\n",
-             window_off, size, nfd->dev->window.len);
+             "%s\n",
+             window_off, size, region->len, uvm ? "UVM aperture" : "window");
     ret = -ERANGE;
     goto out;
   }
 
   ret = remap_pfn_range(vma, vma->vm_start,
-                        (nfd->dev->window.addr + window_off) >> PAGE_SHIFT,
-                        size, vma->vm_page_prot);
+                        (region->addr + window_off) >> PAGE_SHIFT, size,
+                        vma->vm_page_prot);
   if (ret)
     goto out;
 
@@ -3249,11 +3313,24 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   virtio_device_ready(vdev);
 
   /*
+   * The UVM aperture, before HELLO, which tells the backend how large it is.
+   * A VMM that offers none leaves UVM files unmappable, as they always were.
+   */
+  if (virtio_get_shm_region(vdev, &dev->uvm_aperture, NVGPU_SHM_ID_UVM))
+    dev_info(&vdev->dev, "virtio-gpu-nv: UVM aperture at %pa, %llu bytes\n",
+             &dev->uvm_aperture.addr, dev->uvm_aperture.len);
+  else
+    dev->uvm_aperture.len = 0;
+
+  /*
    * Which protocol, before anything else is said: the answer sizes every
    * request after it, and the DRM devices registered below advertise
    * features (syncobjs) only a v2 backend with the right caps can serve.
    */
   nvgpu_xfer_hello(dev);
+  if ((dev->backend_caps & NVGPU_BCAP_UVM_MAP) &&
+      dev->uvm_aperture.len >= PAGE_SIZE)
+    nvgpu_region_check_wb(dev, &dev->uvm_aperture, "the UVM aperture");
 
   /* Create device class once */
   nvgpu_class = class_create("nvidia");
@@ -3347,7 +3424,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
              &dev->window.addr, dev->window.len);
     /* Only a v2 backend ever asks for write-back. */
     if (dev->v2 && dev->window.len >= PAGE_SIZE)
-      nvgpu_window_check_wb(dev);
+      nvgpu_region_check_wb(dev, &dev->window, "the window's write-back zone");
   } else {
     dev->window.len = 0;
     dev_warn(&vdev->dev,

@@ -168,6 +168,15 @@ struct nvgpu_mmap_req {
  * VM_MAYWRITE). A guest write through the window would reach KVM as a write
  * fault it cannot resolve, which stops the VM; the guest refuses it instead. */
 #define NVGPU_MMAP_F_READ_ONLY (1u << 0)
+/* guest_phys_addr is an offset in the UVM aperture (shared memory region
+ * NVGPU_SHM_ID_UVM), not in the window: a UVM semaphore pool the VMM maps at
+ * the pool's own host address, as UVM requires, with a memory slot of its own.
+ * Only in reply to an MMAP of a UVM file, after NVGPU_BCAP_UVM_MAP; always
+ * write-back, never read-only. */
+#define NVGPU_MMAP_F_UVM_APERTURE (1u << 1)
+
+/* The shared memory region id of the UVM aperture. The window is id 1. */
+#define NVGPU_SHM_ID_UVM 2
 
 struct nvgpu_mmap_resp {
   struct nvgpu_msg_hdr hdr;
@@ -279,12 +288,17 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_NVKMS_TABLE (1u << 3) /* NVKMS schema for this host version  */
 #define NVGPU_BCAP_WL_EXPORT (1u << 4)   /* --wayland-export                    */
 #define NVGPU_BCAP_DEEP_SEGS (1u << 5)   /* NVGPU_DEEP_SEGMENTED deep blocks    */
+#define NVGPU_BCAP_UVM_MAP (1u << 6)     /* UVM pools map into the aperture     */
+
+/* HELLO guest_caps */
+#define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
 
 struct nvgpu_hello_req {
-  __le32 proto;      /* NVGPU_PROTO_V2 */
-  __le32 flags;      /* NVGPU_HELLO_F_* */
-  __le32 guest_caps; /* reserved, 0 */
-  __le32 reserved;
+  __le32 proto;            /* NVGPU_PROTO_V2 */
+  __le32 flags;            /* NVGPU_HELLO_F_* */
+  __le32 guest_caps;       /* NVGPU_GCAP_*; was reserved, 0 */
+  __le32 uvm_aperture_mib; /* the UVM aperture's length, 0 if none; was
+                              reserved, 0 */
 } __packed;
 
 struct nvgpu_hello_resp {

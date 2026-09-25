@@ -37,6 +37,7 @@ pub mod shm;
 pub mod tally;
 pub mod userspace;
 pub mod uvmfd;
+pub mod uvmmap;
 pub mod virtio;
 pub mod wl;
 pub mod xfer;

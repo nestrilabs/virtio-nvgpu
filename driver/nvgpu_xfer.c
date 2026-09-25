@@ -1464,6 +1464,13 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
   req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HELLO);
   req.body.proto = cpu_to_le32(NVGPU_PROTO_V2);
   req.body.flags = cpu_to_le32(NVGPU_HELLO_F_FRESH);
+  /* The backend hands out aperture offsets in 2 MiB granules, so a smaller
+   * aperture is none. */
+  if (dev->uvm_aperture.len >= SZ_2M) {
+    req.body.guest_caps = cpu_to_le32(NVGPU_GCAP_UVM_APERTURE);
+    req.body.uvm_aperture_mib =
+        cpu_to_le32(min_t(u64, dev->uvm_aperture.len >> 20, U32_MAX));
+  }
 
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, NULL);
