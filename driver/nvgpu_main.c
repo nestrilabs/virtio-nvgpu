@@ -81,11 +81,37 @@ extern struct kset *module_kset;
 
 /*
  * RM control commands that name an open file by descriptor inside their
- * parameters. The export form carries it after the 16-byte object it names.
+ * parameters (ctrl0000unix.h). RM looks the number up in the calling
+ * process -- the backend, which holds every guest process's control files
+ * -- so a number that is not translated names someone else's file there.
  */
 #define NVGPU_RM_EXPORT_OBJECT_TO_FD 0x00003d05
 #define NVGPU_RM_IMPORT_OBJECT_FROM_FD 0x00003d06
-#define NVGPU_RM_EXPORT_FD_OFFSET 16
+#define NVGPU_RM_GET_EXPORT_OBJECT_INFO 0x00003d08
+#define NVGPU_RM_CREATE_EXPORT_OBJECT_FD 0x00003d0a
+#define NVGPU_RM_EXPORT_OBJECTS_TO_FD 0x00003d0b
+#define NVGPU_RM_IMPORT_OBJECTS_FROM_FD 0x00003d0c
+
+/*
+ * Where one of those keeps its descriptor, or -1: after the 16-byte object
+ * for EXPORT_OBJECT_TO_FD, after hDevice, maxObjects and 64 bytes of
+ * metadata (aligned to 4) for CREATE_EXPORT_OBJECT_FD, first for the rest.
+ */
+static int nvgpu_rm_unix_fd_offset(u32 ctl_cmd) {
+  switch (ctl_cmd) {
+  case NVGPU_RM_EXPORT_OBJECT_TO_FD:
+    return 16;
+  case NVGPU_RM_CREATE_EXPORT_OBJECT_FD:
+    return 72;
+  case NVGPU_RM_IMPORT_OBJECT_FROM_FD:
+  case NVGPU_RM_GET_EXPORT_OBJECT_INFO:
+  case NVGPU_RM_EXPORT_OBJECTS_TO_FD:
+  case NVGPU_RM_IMPORT_OBJECTS_FROM_FD:
+    return 0;
+  default:
+    return -1;
+  }
+}
 
 /* Largest second-level buffer we will carry for one call. */
 #define NVGPU_DEEP_MAX (64 * 1024)
@@ -779,6 +805,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   /* A descriptor named inside the nested block, and where it sits. */
   int nested_fd = -1;
   u32 nested_fd_offset = 0;
+  int unix_fd_off;
 
   /* An OS event named inside it (nvgpu_rm_os_event_in), and where. */
   int os_event_off = -1;
@@ -938,29 +965,37 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
 
     /*
-     * Exporting an object to a descriptor, and importing one back, name
-     * another of our open files inside the nested parameters. The backend
-     * knows that file by the handle it issued, not by our descriptor number,
-     * so swap one for the other here and swap it back on the way out --
-     * userspace gets its own descriptor returned, which is what it passed in.
+     * Exporting objects to a descriptor, importing them back and asking
+     * about an export name another of our open files inside the nested
+     * parameters. The backend knows that file by the handle it issued, not
+     * by our descriptor number, so swap one for the other here and swap it
+     * back on the way out -- userspace gets its own descriptor returned,
+     * which is what it passed in.
+     *
+     * A number that is not one of our files is refused here, never sent as
+     * it is: the backend reads the field as one of its handles, and handles
+     * are issued in order, so a small number is likely another process's
+     * control file -- and RM would import that process's exported memory
+     * into the caller's client. -1, which RM refuses itself (os.c), is the
+     * one value that passes unchanged.
      */
-    if (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD ||
-        ctl_cmd == NVGPU_RM_IMPORT_OBJECT_FROM_FD) {
-      u32 off = (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD)
-                    ? NVGPU_RM_EXPORT_FD_OFFSET
-                    : 0;
+    unix_fd_off = nvgpu_rm_unix_fd_offset(ctl_cmd);
+    if (unix_fd_off >= 0 && nested_size >= unix_fd_off + sizeof(u32)) {
+      void *slot = req_buf + sizeof(*req) + sizeof(params) + unix_fd_off;
+      u32 handle;
 
-      if (nested_size >= off + sizeof(u32)) {
-        void *slot = req_buf + sizeof(*req) + sizeof(params) + off;
-        u32 handle;
-
-        memcpy(&nested_fd, slot, sizeof(nested_fd));
-        if (nvgpu_handle_for_fd(nested_fd, &handle) == 0) {
-          memcpy(slot, &handle, sizeof(handle));
-          nested_fd_offset = off;
-        } else {
-          nested_fd = -1;
+      memcpy(&nested_fd, slot, sizeof(nested_fd));
+      if (nested_fd != -1) {
+        if (nvgpu_handle_for_fd(nested_fd, &handle)) {
+          dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                               "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                               "which is not one of our devices\n",
+                               ctl_cmd, nested_fd);
+          ret = -EBADF;
+          goto out;
         }
+        memcpy(slot, &handle, sizeof(handle));
+        nested_fd_offset = unix_fd_off;
       }
     }
 
@@ -1270,6 +1305,11 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
           nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
         memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
+        /* -1 is "no descriptor"; any other negative is refused, as below. */
+        if (event_fd < -1) {
+          ret = -EBADF;
+          goto out;
+        }
         if (event_fd >= 0) {
           u32 handle;
 
@@ -1413,7 +1453,14 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
    * -EBADF from fget(-1) before the request was ever sent, so the call failed
    * with nothing recorded anywhere on the far side.  The value only keeps its
    * meaning if it is forwarded unchanged.
+   *
+   * -1 only: any other negative number is no descriptor either, and sent
+   * as it is the backend would read it as a handle of its own.
    */
+  if (guest_fd < -1) {
+    ret = -EBADF;
+    goto out;
+  }
   if (guest_fd >= 0) {
     /* Resolve guest fd → nvgpu_fd → VMM handle */
     ret = nvgpu_handle_for_fd(guest_fd, &host_handle);
@@ -2207,11 +2254,17 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
           memcpy(nested + NVGPU_NVKMS_SURFACE_FD_OFFSET, &as_u64,
                  sizeof(as_u64));
         } else {
+          /*
+           * Refused, not forwarded: the backend would read the caller's
+           * number as one of its handles -- another process's file.
+           */
           dev_warn_ratelimited(
               &nfd->dev->vdev->dev,
               "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
-              "of ours; forwarding it unchanged\n",
+              "of ours\n",
               guest_fd);
+          ret = -EBADF;
+          goto out;
         }
       }
     }

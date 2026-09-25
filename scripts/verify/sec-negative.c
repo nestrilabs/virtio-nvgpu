@@ -693,6 +693,65 @@ static void t_share_other_user(int ctl, uint32_t client, uint32_t mine)
 	close(down[1]);
 }
 
+/* T11: RM's import from an export descriptor (NV0000 OS_UNIX
+ * IMPORT_OBJECTS_FROM_FD, 0x3d0c) naming a number this process has not
+ * open, and a file that is not one of the device's. RM resolves the number
+ * in the backend, which holds every guest process's control files, so a
+ * number the guest driver did not translate would import another process's
+ * exported memory into this client. It must fail with EBADF before RM is
+ * asked: an ioctl that succeeds (whatever RM's status) reached the host. */
+#define NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD 0x3d0c
+
+typedef struct {
+	int32_t fd;
+	uint32_t hParent;
+	uint32_t objects[128];
+	uint8_t objectTypes[128];
+	uint16_t numObjects;
+	uint16_t index;
+} import_objects_params_t;
+
+static void t_import_foreign_fd(int ctl, uint32_t client)
+{
+	if (!client) {
+		skip("import from a foreign fd", "no RM client (alloc failed)");
+		return;
+	}
+	int probe = -1;
+	for (int n = 3; n < 256; n++)
+		if (fcntl(n, F_GETFD) < 0) {
+			probe = n;
+			break;
+		}
+	int other = open("/dev/null", O_RDWR | O_CLOEXEC);
+	int cands[2] = {probe, other};
+	const char *what[2] = {"a number not open here", "a file not the device's"};
+	for (int i = 0; i < 2; i++) {
+		if (cands[i] < 0)
+			continue;
+		import_objects_params_t p = {0};
+		p.fd = cands[i];
+		p.hParent = client;
+		p.numObjects = 1;
+		nvos54_t c = {0};
+		c.hClient = client;
+		c.hObject = client;
+		c.cmd = NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD;
+		c.params = (uint64_t)(uintptr_t)&p;
+		c.paramsSize = sizeof(p);
+		int r = ioctl(ctl, NV_IOWR(NV_ESC_RM_CONTROL, sizeof(c)), &c);
+		char how[96];
+		snprintf(how, sizeof(how), "%s: %s", what[i],
+			 r == 0 ? "reached RM" : strerror(errno));
+		if (r == 0 || errno != EBADF)
+			fail("import from a foreign fd", how);
+		else
+			pass("import from a foreign fd", how);
+	}
+	if (other >= 0)
+		close(other);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -780,6 +839,8 @@ int main(int argc, char **argv)
 	t_dup_other_process(ctl, mine, control_ok);
 	/* T10: a second client named in parameters, of another guest user. */
 	t_share_other_user(ctl, client, mine);
+	/* T11: an export descriptor that is not this process's own file. */
+	t_import_foreign_fd(ctl, client);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)
