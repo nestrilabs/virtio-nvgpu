@@ -508,6 +508,11 @@ impl Prepared {
         self.entry.cmd
     }
 
+    /// What the host call returned (non-negative, or -errno), once it ran.
+    pub fn result(&self) -> Option<i32> {
+        self.executed.then_some(self.ret)
+    }
+
     /// The schema entry's name, for logs.
     pub fn name(&self) -> &'static str {
         self.entry.name

@@ -41,7 +41,7 @@ use std::thread::JoinHandle;
 
 use protocol::messages::{EV_HOTPLUG_F_HOTPLUG, EV_HOTPLUG_F_LEASE};
 
-use crate::hostfd::CardNode;
+use crate::hostfd::{CardNode, HandleKind};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::PumpCmd;
@@ -346,11 +346,122 @@ fn listen(sock: PrivateFd, stop: PrivateFd, cards: Vec<CardNode>, sink: impl Fn(
     }
 }
 
+// ───────────────────────────── lease ends ─────────────────────────────
+//
+// NVKMS permissions granted through a lease (nvidia-drm GRANT_PERMISSIONS on
+// a `DrmLease` handle) are recorded by the NVKMS policy against that handle,
+// and let the guest reach per-head commands NVKMS itself does not check
+// (nvkms.rs). Closing the handle clears them; so must the lease ending while
+// the handle stays open, which the host tells nobody about directly:
+//
+// - the lessor revoking it (DRM_IOCTL_MODE_REVOKE_LEASE, drm_lease.c:725)
+//   empties the lessee's object idr (`_drm_lease_revoke`, :300-333) and sends
+//   no uevent at all -- only a lessee's destruction does (`LEASE=1`, :293);
+// - the lessor closing its file revokes the same way (drm_auth.c
+//   drm_master_release), also silently;
+// - the lessor dropping master (a VT switch) leaves the lease in place, but
+//   every DRM_MASTER call on the lessee fails -EACCES until it comes back
+//   (drm_is_current_master_locked, drm_auth.c), and nvidia-drm's permission
+//   grants go with master.
+//
+// All three show on the lessee's own file: DRM_IOCTL_MODE_GET_LEASE (a
+// DRM_MASTER ioctl, drm_ioctl.c:746) answers -EACCES in the last case and
+// counts zero objects in the others (:636-684). A lease holding nothing is
+// one nvidia-drm grants nothing through, however it got that way: the
+// grant finds the dpy's connector only if the lease holds it
+// (nvidia-drm-drv.c:1288-1294). So the backend asks, at the three moments it
+// can:
+//
+// 1. before every NVKMS call, for the handles that granted something still
+//    recorded -- the only moment the records matter, which closes the gap
+//    for all three cases;
+// 2. after a REVOKE_LEASE that a guest ran through one of our card handles
+//    (compositor-VM mode: the guest is the lessor);
+// 3. on a `LEASE=1` uevent for a card (a lessee went away).
+//
+// What cannot be seen this way: a connector being unplugged (NVKMS drops the
+// dpy's permissions, the lease keeps its objects) -- harmless, as NVKMS then
+// refuses the head itself -- and a lease that ends and is re-granted between
+// two NVKMS calls (the records are then of the old grant, which the host has
+// re-issued anyway). A transient master drop is taken for an end: the guest
+// must grant again, which over-clears rather than under.
+
+/// `DRM_IOCTL_MODE_GET_LEASE`: `_IOWR('d', 0xC8, struct drm_mode_get_lease)`,
+/// `{ u32 count_objects; u32 pad; u64 objects_ptr; }`.
+pub const DRM_IOCTL_MODE_GET_LEASE: u32 = 0xc010_64c8;
+
+/// Whether the lessee file `fd` still holds any object: `Ok(false)` once its
+/// lease was revoked or its lessor is no longer master, `Err` when the call
+/// could not say (a descriptor that is no DRM file, say).
+pub fn lease_holds_objects(sys: &dyn xfer::Sys, fd: RawFd) -> Result<bool, xfer::Errno> {
+    // count_objects 0: count only, nothing is written through objects_ptr.
+    let mut arg = [0u8; 16];
+    let r = sys.ioctl(fd, DRM_IOCTL_MODE_GET_LEASE, arg.as_mut_ptr());
+    match r {
+        0.. => Ok(u32::from_le_bytes(arg[..4].try_into().unwrap()) != 0),
+        _ if -r == libc::EACCES => Ok(false),
+        _ => Err(-r),
+    }
+}
+
 impl NvidiaBackend {
     /// The host card nodes offered to the guest, in the order its
     /// `EV_HOTPLUG` cookie indexes them (GET_SYS_FILES section 3).
     pub fn kms_cards(&mut self) -> Vec<CardNode> {
         self.host_nodes().cards.clone()
+    }
+
+    /// Ask every `DrmLease` handle (of card `card`, or of any) whether its
+    /// lease still holds objects, and end the NVKMS grants of each that no
+    /// longer does. Returns those handles.
+    pub fn check_leases(&mut self, card: Option<u32>) -> Vec<u32> {
+        let leases: Vec<u32> = self
+            .handles
+            .handles()
+            .into_iter()
+            .filter(|&h| match self.handles.kind(h) {
+                Some(HandleKind::DrmLease(c)) => card.is_none_or(|want| want == c),
+                _ => false,
+            })
+            .collect();
+        self.end_dead_leases(&leases)
+    }
+
+    /// Before an NVKMS call: the leases that granted something the NVKMS
+    /// policy still records, re-checked, so no per-head gate is opened by a
+    /// grant the host has since taken back.
+    pub(crate) fn recheck_granting_leases(&mut self) {
+        let granting: Vec<u32> = self
+            .nvkms
+            .granting_handles()
+            .into_iter()
+            .filter(|&h| matches!(self.handles.kind(h), Some(HandleKind::DrmLease(_))))
+            .collect();
+        if !granting.is_empty() {
+            self.end_dead_leases(&granting);
+        }
+    }
+
+    fn end_dead_leases(&mut self, leases: &[u32]) -> Vec<u32> {
+        let mut ended = Vec::new();
+        for &h in leases {
+            let Ok(fd) = self.handles.get_raw(h) else {
+                continue;
+            };
+            match lease_holds_objects(&*self.xfer_sys, fd) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::info!(
+                        "lease handle {h} holds nothing any more (revoked, or its lessor \
+                         dropped master); ending the NVKMS grants made through it"
+                    );
+                    self.nvkms.lease_ended(h);
+                    ended.push(h);
+                }
+                Err(e) => log::debug!("lease handle {h}: GET_LEASE failed ({e}); left as is"),
+            }
+        }
+        ended
     }
 }
 
@@ -603,5 +714,43 @@ mod tests {
             got = recv(rx.as_raw_fd(), &mut buf).unwrap();
         }
         assert_eq!(got, Recv::Foreign);
+    }
+
+    /// GET_LEASE as the kernel answers a lessee: a count, or -EACCES.
+    struct LeaseSys(Result<u32, i32>);
+
+    impl xfer::Sys for LeaseSys {
+        fn ioctl(&self, _: RawFd, cmd: u32, arg: *mut u8) -> i32 {
+            assert_eq!(cmd, DRM_IOCTL_MODE_GET_LEASE);
+            // SAFETY: lease_holds_objects passes its 16-byte argument.
+            let a = unsafe { std::slice::from_raw_parts_mut(arg, 16) };
+            assert!(a.iter().all(|&b| b == 0), "count only: no ids pointer");
+            match self.0 {
+                Ok(n) => {
+                    a[..4].copy_from_slice(&n.to_le_bytes());
+                    0
+                }
+                Err(e) => -e,
+            }
+        }
+        fn close(&self, _: RawFd) {}
+        fn size_of(&self, _: RawFd) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_lease_holds_objects_until_it_is_revoked_or_its_lessor_loses_master() {
+        assert_eq!(lease_holds_objects(&LeaseSys(Ok(3)), 0), Ok(true));
+        assert_eq!(lease_holds_objects(&LeaseSys(Ok(0)), 0), Ok(false));
+        assert_eq!(
+            lease_holds_objects(&LeaseSys(Err(libc::EACCES)), 0),
+            Ok(false)
+        );
+        // Not a DRM file, or not a lease: no answer, and no grant ended on it.
+        assert_eq!(
+            lease_holds_objects(&LeaseSys(Err(libc::ENOTTY)), 0),
+            Err(libc::ENOTTY)
+        );
     }
 }

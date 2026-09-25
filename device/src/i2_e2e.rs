@@ -700,6 +700,20 @@ struct Kernel {
     fbs: Vec<(u32, u32)>,
     /// The timeout_nsec a SYNCOBJ_WAIT reached the host with.
     wait_timeout: Option<i64>,
+    /// What "e2e-kms"'s lease looks like to GET_LEASE now.
+    lease: LeaseState,
+    /// GET_LEASE calls, kept out of `calls`.
+    lease_probes: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LeaseState {
+    #[default]
+    Held,
+    /// The lessor revoked it: the lessee's object idr is empty.
+    Revoked,
+    /// The lessor dropped master: DRM_MASTER calls on the lessee fail.
+    LessorNotMaster,
 }
 
 struct Fake(Mutex<Kernel>);
@@ -736,6 +750,8 @@ const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
 const SYNCOBJ_EVENTFD: u32 = 0xc018_64cf;
 const NVKMS: u32 = schema::NVKMS_IOCTL_IOWR;
 const LUT: usize = 6144;
+const GET_LEASE: u32 = crate::kms::DRM_IOCTL_MODE_GET_LEASE;
+const REVOKE_LEASE: u32 = 0xc004_64c9;
 const SET_MASTER: u32 = 0x0000_641e;
 const DROP_MASTER: u32 = 0x0000_641f;
 const GETPROPERTY: u32 = 0xc040_64aa;
@@ -782,6 +798,19 @@ impl Sys for Fake {
                 }
                 IDENTIFY => {
                     poke(arg, 4, 4, 0); // NV_GEM_OBJECT_NVKMS
+                    0
+                }
+                // drm_mode_get_lease_ioctl with count_objects 0: the count
+                // only (drm_lease.c:636-684). DRM_MASTER: -EACCES once the
+                // lessor is no longer master (drm_ioctl.c:746).
+                GET_LEASE if file == "e2e-kms" => {
+                    k.lease_probes += 1;
+                    assert_eq!(peek(arg, 0, 4), 0, "a count, never the ids");
+                    match k.lease {
+                        LeaseState::Held => poke(arg, 0, 4, 3),
+                        LeaseState::Revoked => poke(arg, 0, 4, 0),
+                        LeaseState::LessorNotMaster => return -libc::EACCES,
+                    }
                     0
                 }
                 _ => {
@@ -858,6 +887,13 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
             // drm_setmaster_ioctl / drm_dropmaster_ioctl on a card: no
             // argument at all, only the answer.
             ("e2e-card", SET_MASTER) | ("e2e-card", DROP_MASTER) => 0,
+            // drm_mode_revoke_lease_ioctl: the lessee's objects go
+            // (drm_lease.c:700-730); the lessee file stays open.
+            ("e2e-card", REVOKE_LEASE) => {
+                assert_eq!(peek(arg, 0, 4), 9, "the lessee id the guest named");
+                k.lease = LeaseState::Revoked;
+                0
+            }
             // drm_mode_getproperty with every count 0: name and flags only
             // (drm_property.c:458), which is how the guest classifies an id.
             (_, GETPROPERTY) => {
@@ -1413,26 +1449,29 @@ fn validate_mode_copies_back_only_the_bytes_nvkms_wrote() {
     assert_eq!(rd(w.mem.get(0x2000), 456, 4), 5);
 }
 
-#[test]
-fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes() {
-    let mut w = nvkms_world();
+/// MOVE_CURSOR on `head` of deviceHandle 1.
+fn cursor(head: u64) -> Vec<u8> {
+    let mut c = vec![0u8; 20];
+    wr(&mut c, 0, 4, 1);
+    wr(&mut c, 4, 4, 0x100);
+    wr(&mut c, 8, 4, head);
+    c
+}
+
+/// ALLOC_DEVICE, then nvidia-drm GRANT_PERMISSIONS of dpy 1<<3 through the
+/// lease on a fresh modeset file, and ACQUIRE_PERMISSIONS of it: head 1 is
+/// granted from then on. Checks each step on the way.
+fn grant_head_1(w: &mut World) {
     let grant = w.be.adopt_for_test(
         memfd(c"e2e-modeset-grant"),
         HandleKind::Dev(DeviceKind::Modeset),
     );
     let (kms, modeset) = (w.kms, w.modeset);
-    nvkms_call(&mut w, 0, &[0u8; 1440]);
+    nvkms_call(w, 0, &[0u8; 1440]);
     assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ALLOC_DEVICE");
 
     // Before any grant, MOVE_CURSOR on head 1 is refused by the backend.
-    let cursor = |head: u64| {
-        let mut c = vec![0u8; 20];
-        wr(&mut c, 0, 4, 1);
-        wr(&mut c, 4, 4, 0x100);
-        wr(&mut c, 8, 4, head);
-        c
-    };
-    nvkms_call(&mut w, 11, &cursor(1));
+    nvkms_call(w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
 
     // The modeset file, by now typed, is no grant file.
@@ -1449,18 +1488,84 @@ fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes(
 
     let mut acq = vec![0u8; 28];
     wr(&mut acq, 0, 4, 5);
-    nvkms_call(&mut w, 41, &acq);
+    nvkms_call(w, 41, &acq);
     assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ACQUIRE_PERMISSIONS");
-    nvkms_call(&mut w, 11, &cursor(1));
+    nvkms_call(w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "head 1 is granted");
-    nvkms_call(&mut w, 11, &cursor(0));
+    nvkms_call(w, 11, &cursor(0));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM), "head 0 is not");
+}
+
+#[test]
+fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes() {
+    let mut w = nvkms_world();
+    let (kms, modeset) = (w.kms, w.modeset);
+    grant_head_1(&mut w);
+    assert!(
+        w.fake.0.lock().unwrap().lease_probes > 0,
+        "the lease was asked"
+    );
 
     // The lease file closes: nvidia-drm revokes what it granted.
     w.be.close_handle(kms).unwrap();
     nvkms_call(&mut w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 41, 11]);
+}
+
+/// The host takes a lease back without a word to the lessee's file -- the
+/// lessor revokes it, or drops master -- and the file stays open. The
+/// backend asks the lease before the next NVKMS call and ends what was
+/// granted through it, so no per-head gate outlives the grant.
+#[test]
+fn a_grant_ends_with_its_lease_while_the_lease_file_stays_open() {
+    for gone in [LeaseState::Revoked, LeaseState::LessorNotMaster] {
+        let mut w = nvkms_world();
+        let (kms, modeset) = (w.kms, w.modeset);
+        grant_head_1(&mut w);
+        w.fake.0.lock().unwrap().lease = gone;
+        nvkms_call(&mut w, 11, &cursor(1));
+        assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM), "{gone:?}");
+        assert!(
+            w.be.handles.kind(kms).is_some(),
+            "the lease file is still open"
+        );
+        assert!(w.be.nvkms.granting_handles().is_empty());
+        // Nothing is left to ask about.
+        let probes = w.fake.0.lock().unwrap().lease_probes;
+        nvkms_call(&mut w, 11, &cursor(1));
+        assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
+        assert_eq!(w.fake.0.lock().unwrap().lease_probes, probes);
+    }
+}
+
+/// Compositor-VM mode: the guest is the lessor, and revokes a lease through
+/// its card. The grants made through the lessee end at once, before any
+/// NVKMS call asks.
+#[test]
+fn a_lease_the_guest_revokes_through_its_card_ends_the_grants_made_through_it() {
+    let mut w = nvkms_world();
+    let card =
+        w.be.adopt_for_test(memfd(c"e2e-card"), HandleKind::DrmCard(0));
+    grant_head_1(&mut w);
+    assert_eq!(w.be.nvkms.granting_handles(), vec![w.kms]);
+    let mut r = vec![0u8; 4];
+    wr(&mut r, 0, 4, 9);
+    w.mem.put(0x5000, &r);
+    assert_eq!(w.call(card, REVOKE_LEASE, 0x5000, 0), Ok(0));
+    assert!(w.be.nvkms.granting_handles().is_empty());
+}
+
+/// A LEASE uevent names a card; only that card's leases are asked.
+#[test]
+fn a_lease_uevent_asks_the_leases_of_its_card_only() {
+    let mut w = nvkms_world();
+    grant_head_1(&mut w);
+    w.fake.0.lock().unwrap().lease = LeaseState::Revoked;
+    assert!(w.be.check_leases(Some(1)).is_empty());
+    assert_eq!(w.be.nvkms.granting_handles(), vec![w.kms]);
+    assert_eq!(w.be.check_leases(Some(0)), vec![w.kms]);
+    assert!(w.be.nvkms.granting_handles().is_empty());
 }
 
 #[test]

@@ -607,6 +607,11 @@ impl NvidiaBackend {
         if class == SchemaClass::Kms {
             self.kms_states.entry(target).or_default();
         }
+        if class == SchemaClass::Modeset {
+            // A per-head gate may rest on a lease's grant; the host takes
+            // those back without telling anyone (kms.rs, "lease ends").
+            self.recheck_granting_leases();
+        }
         let prepared = xfer::prepare(&BackendEnv { backend: self }, class, target, kind, payload)?;
         // The whole reply must fit what the guest posted, and that is known
         // now: response_len() is exact up to descriptors and GEM handles the
@@ -654,6 +659,9 @@ impl NvidiaBackend {
         // Done with the host file; the handle table still has its own.
         drop(target_fd);
         let stale = generation != self.session.generation;
+        // A lease a guest lessor revoked through us: whatever the lessee's
+        // handle granted is gone on the host (kms.rs, "lease ends").
+        let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);
         let nodes = self.host_nodes();
         let mut fin = BackendFinisher {
             backend: self,
@@ -681,6 +689,9 @@ impl NvidiaBackend {
             );
             self.close_handles(&created);
             return self.error_reply(libc::EMSGSIZE);
+        }
+        if revoked_lease {
+            self.check_leases(None);
         }
         let mut bytes = hdr(MsgType::Ioctl2, target, 0, req_id);
         bytes.extend_from_slice(&body);

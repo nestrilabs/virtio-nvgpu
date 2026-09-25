@@ -290,9 +290,26 @@ impl NvkmsPolicy {
 
     /// A lease or card handle stopped holding what it held (the lessor
     /// revoked the lease, the master dropped): its grants go as if it had
-    /// closed. For whoever learns of that first; CLOSE does it anyway.
+    /// closed. The backend calls it when GET_LEASE on the handle says so
+    /// (kms.rs, "lease ends"); CLOSE does it anyway.
     pub fn lease_ended(&self, kms: u32) {
         self.lock().revoke_all_through(kms);
+    }
+
+    /// KMS handles that granted something still recorded (nvidia-drm
+    /// GRANT_PERMISSIONS): whose leases the backend re-checks before an
+    /// NVKMS call relies on them (kms.rs, "lease ends").
+    pub fn granting_handles(&self) -> Vec<u32> {
+        let st = self.lock();
+        let mut v: Vec<u32> = st.drm_grants.keys().copied().collect();
+        for s in st.grant_fds.values() {
+            if let Source::Drm { kms, .. } = *s {
+                v.push(kms);
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// A session reset: every handle is gone.

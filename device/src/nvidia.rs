@@ -1899,6 +1899,7 @@ impl NvidiaBackend {
                     && ireq.data_len == 16
                     && deep_in.is_none();
                 let checked = if ok {
+                    self.recheck_granting_leases();
                     self.nvkms.v1_before(self.current_handle, &mut msg)
                 } else {
                     Err(libc::EINVAL)

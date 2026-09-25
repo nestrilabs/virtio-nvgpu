@@ -1045,18 +1045,32 @@ fn main() -> anyhow::Result<()> {
         config,
         wayland,
     )?));
-    // Host connector and lease changes of the cards the guest drives, which
-    // arrive only as uevents (device::kms). Only in compositor-VM mode: the
-    // guest knows card indices (GET_SYS_FILES section 3) only then, and drops
-    // EV_HOTPLUG for cards it was never told about.
-    let _hotplug = if args.kms_card {
+    // Host connector and lease changes of the host's cards, which arrive only
+    // as uevents (device::kms). The guest hears of them only in
+    // compositor-VM mode: it can open card nodes (GET_SYS_FILES section 3
+    // records without the informational flag) only then, and drops
+    // EV_HOTPLUG for any other card. A lease change also makes the backend
+    // re-check the leases it holds (NVKMS grants made through one that ended
+    // must end too), which matters whenever the guest can hold a lease.
+    let _hotplug = if args.kms_card || args.wayland_lease {
         let shared = backend.read().expect("backend lock").shared.clone();
         let cards = shared.nvidia.lock().expect("nvidia lock").kms_cards();
         let sink = shared.clone();
-        match device::kms::HotplugListener::spawn(cards, move |c| sink.forward(vec![c])) {
+        let to_guest = args.kms_card;
+        let listener = device::kms::HotplugListener::spawn(cards, move |c| {
+            if let PumpCmd::Hotplug { card, flags } = c
+                && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
+            {
+                sink.nvidia.lock().unwrap().check_leases(Some(card));
+            }
+            if to_guest {
+                sink.forward(vec![c]);
+            }
+        });
+        match listener {
             Ok(l) => Some(l),
             Err(e) => {
-                log::warn!("no host hotplug events for the guest: uevent socket: {e}");
+                log::warn!("no host hotplug events: uevent socket: {e}");
                 None
             }
         }
