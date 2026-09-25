@@ -1239,6 +1239,45 @@ fn addfb2_takes_the_proxies_objects_into_the_lease_for_one_job_only() {
     // gets the same number owns no framebuffer of this one's.
     w.be.close_handle(kms).unwrap();
     assert!(!w.be.kms_states.contains_key(&kms));
+    assert!(
+        !w.be.vm_fbs.made_here(77),
+        "nor may anything of this VM name it as a scanout source any more"
+    );
+}
+
+/// A scanout source is a framebuffer this VM made (S-6): the host looks
+/// framebuffer ids up device-wide and a lease does not cover them, so an id
+/// the host compositor or another VM made would otherwise be shown -- and
+/// checksummed -- on the guest's CRTC. The refusal comes before the host
+/// sees the call; the VM's own framebuffer, from any of its files, passes.
+#[test]
+fn a_page_flip_to_a_framebuffer_this_vm_never_made_never_reaches_the_host() {
+    const PAGE_FLIP: u32 = 0xc018_64b0;
+    let mut w = world();
+    let kms = w.kms;
+    let other =
+        w.be.adopt_for_test(memfd(c"e2e-kms-2"), HandleKind::DrmLease(0));
+    // Any KMS call makes the file's state; the other file made fb 77.
+    let mut a = vec![0u8; 24];
+    wr(&mut a, 4, 4, 5);
+    w.mem.put(0x1000, &a);
+    assert_eq!(w.call(other, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
+    w.be.kms_states[&other].add_fb(77);
+    w.calls();
+
+    wr(&mut a, 4, 4, 5);
+    w.mem.put(0x1000, &a);
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
+    assert!(w.calls().is_empty(), "the host never saw it");
+
+    wr(&mut a, 4, 4, 77);
+    w.mem.put(0x1000, &a);
+    // The fake kernel has no PAGE_FLIP; reaching it is the point.
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::ENOTTY));
+    assert_eq!(w.calls(), vec![("e2e-kms".to_string(), PAGE_FLIP)]);
+
+    w.be.close_handle(other).unwrap();
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
 }
 
 /// A framebuffer is NVKMS memory or nothing: a proxy standing for a foreign

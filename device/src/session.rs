@@ -643,7 +643,10 @@ impl NvidiaBackend {
             }
         };
         if class == SchemaClass::Kms {
-            self.kms_states.entry(target).or_default();
+            let vm = self.vm_fbs.clone();
+            self.kms_states
+                .entry(target)
+                .or_insert_with(|| Arc::new(xfer::KmsFileState::in_vm(vm)));
             // Scanout checksums: our card or a lessee only (kms.rs).
             self.crc_gate(req.cmd, target, kind)?;
         }

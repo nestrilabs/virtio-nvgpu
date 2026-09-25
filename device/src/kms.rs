@@ -716,6 +716,9 @@ impl NvidiaBackend {
                 return;
             }
         };
+        // Its framebuffers stop being the VM's before the host file (and
+        // with it every id that file made) can go (S-6).
+        self.forget_kms_state(h);
         match self.handles.bury(h, stub) {
             Ok(old) => drop(old),
             Err(e) => {
@@ -723,7 +726,6 @@ impl NvidiaBackend {
                 return;
             }
         }
-        self.kms_states.remove(&h);
         self.nvkms.forget_handle(h);
         self.pump_cmds.push(PumpCmd::Unwatch { handle: h });
     }

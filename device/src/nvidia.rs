@@ -15,7 +15,7 @@ use crate::pump::{PumpCmd, WatchMode};
 use crate::semsurf::SemsurfPolicy;
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
-use crate::xfer::{Hooks, KmsFileState, Sys};
+use crate::xfer::{Hooks, KmsFileState, Sys, VmFbs};
 
 // ============================================================
 // Device path helpers
@@ -526,6 +526,9 @@ pub struct NvidiaBackend {
     /// call and dropped with the handle, so a later handle that happens to
     /// get the same number starts with nothing.
     pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
+    /// Every framebuffer those files made, VM-wide: the only ids a guest
+    /// may name as a scanout source (S-6, `xfer::KmsFileState`).
+    pub(crate) vm_fbs: Arc<VmFbs>,
     /// The policy every IOCTL2 is checked against (see `policy.rs`).
     pub(crate) hooks: Arc<dyn Hooks>,
     /// Shared syncobj wait registrations (HOST_OP SYNCOBJ_WATCH, fence.rs).
@@ -991,6 +994,7 @@ impl NvidiaBackend {
             nodes: None,
             signaled: None,
             kms_states: std::collections::HashMap::new(),
+            vm_fbs: Arc::default(),
             syncobj_regs: crate::fence::Registrations::default(),
             hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone()),
             nvkms,
@@ -1252,7 +1256,10 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.rmmem.clear();
-        self.kms_states.clear();
+        for (_, k) in self.kms_states.drain() {
+            k.retire();
+        }
+        self.vm_fbs.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
         self.nvkms.reset();
@@ -2063,13 +2070,22 @@ impl NvidiaBackend {
         let gone_clients = self.semsurf.forget_handle(handle);
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
-        self.kms_states.remove(&handle);
+        self.forget_kms_state(handle);
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);
         Ok(())
+    }
+
+    /// Drop KMS handle `handle`'s per-file state, and with it every
+    /// framebuffer it made from the VM's scanout sources: before the host
+    /// file closes and its ids can go to someone else (S-6).
+    pub(crate) fn forget_kms_state(&mut self, handle: u32) {
+        if let Some(k) = self.kms_states.remove(&handle) {
+            k.retire();
+        }
     }
 
     // ------------------------------------------------------------------
