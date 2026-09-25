@@ -3176,9 +3176,43 @@ impl NvidiaBackend {
             log::debug!("RM_ALLOC hClass=0x{:x}", h_class);
         }
 
+        // The size the host copies through the pointer: the outer struct's
+        // own field (u64 in nvidia-drm's blocks, u32 in RM's and NVKMS's).
+        let size_wide = hostfd::ioc_type(request as u32) == b'd';
+        let host_size = |outer: &[u8]| -> u64 {
+            if size_wide {
+                outer
+                    .get(size_offset..size_offset + 8)
+                    .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+            } else {
+                outer
+                    .get(size_offset..size_offset + 4)
+                    .map_or(0, |b| u64::from(u32::from_le_bytes(b.try_into().unwrap())))
+            }
+        };
+
         if !nested_in.is_empty() {
             // Guest sent nested params — allocate host buffer, point struct at it
             let nested_size = nested_in.len();
+
+            // Exactly as many bytes as the host will copy, or none said
+            // (RM_ALLOC's zero: RM takes the class's own size, and no class
+            // with a pointer in its parameters gets this far, guestptr.rs).
+            // Past what was sent the host reads the zeroed slack after our
+            // buffer (guarded.rs), so a pointer field the block cuts short
+            // reached RM as the guest's low bytes over our zeros: seven of
+            // eight bytes, any address in this process, which the scrub
+            // below -- reading only the bytes sent -- never saw, and RM
+            // copied in from and out to it (FIFO_GET_CHANNELLIST writes its
+            // channel list there). Found by the `backend_v2` fuzz target.
+            let size = host_size(outer);
+            if size != 0 && size != nested_size as u64 {
+                log::warn!(
+                    "ioctl {request:#x}: the host would copy {size} bytes of parameters and \
+                     {nested_size} were sent; refused"
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
             // Guarded rather than heap-allocated: the driver writes its answer
             // here, and if it writes more than the caller's size field claimed,
             // the fault should land on that write rather than on someone else's
@@ -3617,16 +3651,7 @@ impl NvidiaBackend {
             // pointer and a size of its choosing. A nonzero size with nothing
             // sent is refused rather than zeroed, so a caller that meant to
             // send parameters learns that none arrived.
-            let size_wide = hostfd::ioc_type(request as u32) == b'd';
-            let size = if size_wide {
-                outer
-                    .get(size_offset..size_offset + 8)
-                    .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
-            } else {
-                outer
-                    .get(size_offset..size_offset + 4)
-                    .map_or(0, |b| u64::from(u32::from_le_bytes(b.try_into().unwrap())))
-            };
+            let size = host_size(outer);
             if size != 0 {
                 log::warn!(
                     "ioctl {request:#x}: parameter size {size} but no parameters sent; refused \

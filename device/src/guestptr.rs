@@ -1254,6 +1254,50 @@ mod backend_tests {
         assert!(seen().is_empty());
     }
 
+    /// Fuzzing (`backend_v2`): FIFO_GET_CHANNELLIST's parameters sent 23
+    /// bytes long with paramsSize 24. The scrub read the 23 bytes, found no
+    /// room for the pointer at 16 and left it; RM reads 24, the last from our
+    /// buffer's zeroed slack, and followed seven bytes of the guest's as an
+    /// address here -- copying the handles in from it and the channel list
+    /// out to it. A size the host would copy that is not what was sent never
+    /// reaches the host, either way round.
+    #[test]
+    fn a_block_shorter_or_longer_than_the_size_rm_copies_never_reaches_rm() {
+        let (mut be, h) = ctl();
+        let mut nested = vec![0u8; 24];
+        nested[..4].copy_from_slice(&3u32.to_le_bytes());
+        nested[16..24].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        for (sent, size) in [(23, 24), (17, 24), (24, 23), (24, 32)] {
+            let (st, _) = v1(
+                &mut be,
+                h,
+                CONTROL,
+                &nvos54(CHANNELLIST, GUEST_PTR2, size),
+                &nested[..sent],
+                None,
+            );
+            assert_eq!(st, -libc::EINVAL, "{sent} bytes sent, paramsSize {size}");
+            assert!(seen().is_empty(), "{sent} bytes sent, paramsSize {size}");
+        }
+        // Sent whole, the pointer is RM's to follow only as a buffer of ours,
+        // or not at all.
+        let (st, _) = v1(
+            &mut be,
+            h,
+            CONTROL,
+            &nvos54(CHANNELLIST, GUEST_PTR2, 24),
+            &nested,
+            None,
+        );
+        assert_eq!(st, 0);
+        match seen().as_slice() {
+            [Seen::Lists { arrays, .. }] => {
+                assert!(arrays.iter().all(|(p, _)| *p != GUEST_PTR));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn an_alloc_sent_without_parameters_names_neither_guest_pointer() {
         let (mut be, h) = ctl();
