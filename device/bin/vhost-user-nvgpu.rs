@@ -1325,6 +1325,21 @@ fn main() -> anyhow::Result<()> {
     };
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
+    // What keeps one guest process, and one VM, from another's RM clients is
+    // RM's strict client validation, which a host registry key can turn off
+    // (device::semsurf::probe_strict_clients, R3). Asked before anything is
+    // served; a host that serves a client from another file is refused.
+    match device::semsurf::probe_strict_clients(&device::semsurf::HostRm) {
+        Ok(true) => log::info!("host RM keeps each client to the file it was made on"),
+        Ok(false) => anyhow::bail!(
+            "refusing to start: the host's RM serves a client from a file other than the one \
+             it was made on (RmValidateClientData turns strict client validation off). Every \
+             guest process, and every VM run as this user, could then use another's RM \
+             objects by handle. Remove the registry override (NVreg_RegistryDwords) and \
+             reload the driver"
+        ),
+        Err(e) => log::warn!("could not ask the host's RM whether it validates clients strictly: {e}"),
+    }
     // Every guest process's descriptors are this process's: take the whole
     // of the hard limit, and size the handle table from it (B1).
     match posture::raise_nofile() {

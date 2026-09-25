@@ -3676,6 +3676,8 @@ impl NvidiaBackend {
         };
         let cmd = request as u32;
         let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
+        self.osdesc
+            .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
         let prepared = od::describe(cmd, outer, nested).and_then(|call| {
             let runs = od::parse_runs(&call, list)?;
             let resolved = od::resolve(&ram, &runs)?;

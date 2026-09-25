@@ -594,6 +594,54 @@ pub fn query_layout(rm: &dyn Rm, gpu_minor: u32, gpu_id: u32) -> Result<Layout, 
     })
 }
 
+/// NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS (ctrl0000gpu.h:61-70): `{NvU32
+/// gpuIds[32];}`, answered on the root client, NON_PRIVILEGED.
+const NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS: u32 = 0x201;
+
+/// Whether the host's RM keeps a client to the file it was made on (R3).
+///
+/// Every guest process's RM files are the backend's, and every VM's backend
+/// may run as one user, so what keeps one guest process -- or one VM -- from
+/// using another's RM client by its handle is RM's strict client validation
+/// (PDB_PROP_SYS_VALIDATE_CLIENT_HANDLE_STRICT, rmclientValidate,
+/// client.c:774-784): a client is usable only through the file it was made
+/// on, or one registered to it. It is on by default, and a registry key
+/// (RmValidateClientData, system.c:715-754) turns it off; RM then falls back
+/// to comparing security tokens (the euid, or the PID), which every guest
+/// process and every backend of one user shares.
+///
+/// So this asks RM: a client made on one control file of the backend's
+/// own, used from a second. `Ok(true)` when RM refuses it (strict), and
+/// `Ok(false)` when RM serves it. `Err` when RM could not be asked at all,
+/// or would not answer on the client's own file either.
+pub fn probe_strict_clients(rm: &dyn Rm) -> Result<bool, String> {
+    let a = rm
+        .open("/dev/nvidiactl")
+        .map_err(|e| format!("/dev/nvidiactl: {e}"))?;
+    let b = rm
+        .open("/dev/nvidiactl")
+        .map_err(|e| format!("/dev/nvidiactl: {e}"))?;
+    let client = rm.alloc(a.as_raw_fd(), 0, 0, NV01_ROOT_CLIENT, None)?;
+    let mut ids = [0u8; 128];
+    rm.control(
+        a.as_raw_fd(),
+        client,
+        client,
+        NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS,
+        &mut ids,
+    )
+    .map_err(|e| format!("GET_ATTACHED_IDS on the client's own file: {e}"))?;
+    Ok(rm
+        .control(
+            b.as_raw_fd(),
+            client,
+            client,
+            NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS,
+            &mut ids,
+        )
+        .is_err())
+}
+
 /// The host's RM.
 pub struct HostRm;
 
@@ -1288,6 +1336,64 @@ mod tests {
                 _ => Err("RM status 0x56".into()),
             }
         }
+    }
+
+    /// RM, as far as the strict-client probe asks it: a client made on one
+    /// file, and a control that is served only there when `strict`.
+    struct ProbeRm {
+        strict: bool,
+        opened: RefCell<Vec<RawFd>>,
+    }
+
+    impl Rm for ProbeRm {
+        fn open(&self, _: &str) -> io::Result<PrivateFd> {
+            let f: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+            self.opened.borrow_mut().push(f.as_raw_fd());
+            Ok(PrivateFd::new(f))
+        }
+
+        fn alloc(
+            &self,
+            _: RawFd,
+            _: u32,
+            _: u32,
+            class: u32,
+            _: Option<&mut [u8]>,
+        ) -> Result<u32, String> {
+            assert_eq!(class, NV01_ROOT_CLIENT);
+            Ok(0xc1d0_0001)
+        }
+
+        fn control(
+            &self,
+            fd: RawFd,
+            _: u32,
+            _: u32,
+            cmd: u32,
+            params: &mut [u8],
+        ) -> Result<(), String> {
+            assert_eq!((cmd, params.len()), (0x201, 128));
+            if self.strict && fd != self.opened.borrow()[0] {
+                return Err("RM status 0x1a".into()); // NV_ERR_INVALID_CLIENT
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_host_whose_rm_serves_a_client_from_another_file_is_found_out() {
+        let strict = ProbeRm {
+            strict: true,
+            opened: RefCell::default(),
+        };
+        assert_eq!(probe_strict_clients(&strict), Ok(true));
+        let lax = ProbeRm {
+            strict: false,
+            opened: RefCell::default(),
+        };
+        assert_eq!(probe_strict_clients(&lax), Ok(false));
+        // A host that answers nothing is not called strict.
+        assert!(probe_strict_clients(&FakeRm::default()).is_err());
     }
 
     #[test]
