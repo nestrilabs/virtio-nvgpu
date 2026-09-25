@@ -399,7 +399,8 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
  * reference on `owner`. On failure the host handle has already been closed
  * (by the proxy's own free, where one was made): the caller must not close it
  * again -- except for -EEXIST, which means a proxy for that host handle
- * already exists and the handle is left alone, being that proxy's.
+ * already exists and the handle is left alone, being that proxy's, and
+ * -EAGAIN, which means one on its way out does (nvgpu_gem_dying()).
  */
 int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            u32 host_handle, size_t size, u32 *guest_handle);
@@ -415,6 +416,18 @@ int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
  */
 struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
                                             u32 host_handle);
+/*
+ * One proxy per host handle, until it is closed (S-11): a proxy whose last
+ * reference is gone stays in `owner`'s index until its GEM_CLOSE has gone
+ * out. A host handle it holds is neither found nor adoptable -- a PRIME
+ * import that returns it gets -EAGAIN -- and is nobody else's to close.
+ * Whoever meets one waits it out and asks the host again.
+ */
+bool nvgpu_gem_dying(struct nvgpu_fd *owner, u32 h);
+int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h);
+/* Whether a proxy, alive or dying, holds host GEM `gem` of backend handle
+ * `render` (for the reaper, which has only the numbers). */
+bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem);
 /* A proxy's fake mmap offset in this node (MAP_DUMB, GEM_MAP_OFFSET). */
 int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
                           u64 *offset);

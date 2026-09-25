@@ -1353,6 +1353,15 @@ static int nvgpu_kms_gem_out(struct nvgpu_i2_call *call, u32 buf, u32 off,
   } else {
     ret = nvgpu_gem_proxy_create(kc->file, kc->kf->nfd, gem, (size_t)size,
                                  guest_handle);
+    /*
+     * The re-home (a PRIME import on the host) found a handle the render
+     * file already had, and its proxy is closing it (S-11): adopting the
+     * number would leave the new proxy naming whatever the host gives it to
+     * next. The call fails -EAGAIN once that close is out, which libdrm's
+     * drmIoctl() retries, and the retry's re-home is really ours.
+     */
+    if (ret == -EAGAIN)
+      nvgpu_gem_wait_gone(kc->kf->nfd, gem);
   }
   if (ret) {
     *guest_handle = 0;

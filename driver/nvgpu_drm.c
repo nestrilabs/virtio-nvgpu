@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/wait.h>
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -55,6 +56,9 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs;
 static const struct file_operations nvgpu_drm_fops;
 
 static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
+static int nvgpu_gem_proxy_create_new(struct drm_file *file,
+                                      struct nvgpu_fd *owner, u32 host_handle,
+                                      size_t size, u32 *guest_handle);
 
 /*
  * The nvidia-drm ioctls, answered here rather than through a drm_ioctl_desc
@@ -495,8 +499,8 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
     /* The host's handle never reaches userspace; a proxy stands in for it.
      * On failure the proxy code has closed the host handle already. */
-    ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size,
-                                 &guest_handle);
+    ret = nvgpu_gem_proxy_create_new(file, nfd, p.handle, p.memory_size,
+                                     &guest_handle);
     if (ret)
       return ret;
 
@@ -557,6 +561,53 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
   }
 }
 
+/* Woken whenever a dying proxy leaves its owner's gem_index. */
+static DECLARE_WAIT_QUEUE_HEAD(nvgpu_gem_gone_wq);
+
+/*
+ * Whether @owner's host handle @h is a tombstone: indexed by a proxy whose
+ * last reference is gone and whose free has not yet closed it. The entry is
+ * erased under the xarray lock before the proxy's memory goes, so what is
+ * read here is still allocated.
+ */
+bool nvgpu_gem_dying(struct nvgpu_fd *owner, u32 h) {
+  struct nvgpu_gem_object *ng;
+  bool dying;
+
+  xa_lock(&owner->gem_index);
+  ng = xa_load(&owner->gem_index, h);
+  dying = ng && !kref_read(&ng->base.refcount);
+  xa_unlock(&owner->gem_index);
+  return dying;
+}
+
+/* Until @owner's host handle @h is no dying proxy's; -ERESTARTSYS if killed. */
+int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h) {
+  return wait_event_killable(nvgpu_gem_gone_wq, !nvgpu_gem_dying(owner, h));
+}
+
+/*
+ * Whether host GEM handle @gem of the file with backend handle @render is a
+ * proxy's, alive or dying: a number the host handed back for an object the
+ * file already had, which is that proxy's to close and nobody else's. For
+ * the reaper of abandoned replies, which knows only the numbers.
+ */
+bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem) {
+  struct nvgpu_fd *nfd;
+  unsigned long flags;
+  bool held = false;
+
+  spin_lock_irqsave(&dev->fds_lock, flags);
+  list_for_each_entry(nfd, &dev->fds, node) {
+    if (nfd->handle == render) {
+      held = xa_load(&nfd->gem_index, gem) != NULL;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&dev->fds_lock, flags);
+  return held;
+}
+
 /*
  * The last reference to a proxy is gone, so the host's object can go too.
  *
@@ -570,13 +621,17 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
 
   /*
-   * Out of the owner's index first, while the host handle is still open: the
-   * number cannot be handed to another object until the GEM_CLOSE below, so
-   * nothing can find this dying proxy under a number that already means
-   * something else. Only our own entry, never a successor's.
+   * The owner's index keeps this proxy until its host handle is really
+   * closed, as a tombstone: nvgpu_gem_proxy_find() refuses it (no
+   * references), and nvgpu_gem_proxy_new() answers -EAGAIN for its number.
+   * Taking it out first, as this once did, opened a window -- as long as
+   * nvgpu_fence_gem_free() waits on its global mutex, held across two
+   * HOST_OPs -- in which a PRIME import of the *same* object, which the host
+   * answers with the handle the file already has (drm_prime.c:306-310),
+   * found no proxy and made a second one; this free's GEM_CLOSE then left
+   * that one naming a number the host hands to the next object, and two
+   * clients' buffers were mixed up from there on (S-11).
    */
-  if (ng->owner && ng->host_handle)
-    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
 
   /* The handles SEMSURF_FENCE_ATTACH gave this object in other files go
    * first: each holds the host object too, and a reference on its file. */
@@ -596,6 +651,14 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
    */
   if (ng->window_valid && ng->mapping_id)
     nvgpu_munmap(ng->dev, ng->owner_handle, ng->mapping_id);
+
+  /* Closed: the number is the host's to give out again, and an importer
+   * waiting on it (nvgpu_gem_wait_gone()) may ask again. Only our own
+   * entry, never a successor's. */
+  if (ng->owner && ng->host_handle) {
+    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
+    wake_up_all(&nvgpu_gem_gone_wq);
+  }
 
   drm_gem_object_release(obj);
   if (ng->owner)
@@ -970,7 +1033,8 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
  * The proxy object itself, with one reference and no handle, indexed in
  * @owner's gem_index (nvgpu_gem_proxy_find()). Owns @host_handle the same way
  * nvgpu_gem_proxy_create() does, except on -EEXIST: a proxy already stands for
- * that host handle, which stays that proxy's.
+ * that host handle, which stays that proxy's; and on -EAGAIN: a proxy on its
+ * way out still does, and will close it (nvgpu_gem_free()).
  */
 static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
                                                     struct nvgpu_fd *owner,
@@ -1015,7 +1079,7 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
   if (ret) {
     if (ret == -EBUSY) {
       ng->host_handle = 0; /* the free below must not close it */
-      ret = -EEXIST;
+      ret = nvgpu_gem_dying(owner, host_handle) ? -EAGAIN : -EEXIST;
     }
     drm_gem_object_put(&ng->base);
     return ERR_PTR(ret);
@@ -1039,7 +1103,9 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
  *
  * The host handle is this function's from the moment it is called: every
  * failure closes it exactly once, except -EEXIST (a proxy of @owner already
- * stands for it, and the number is that proxy's). Callers used to close it
+ * stands for it, and the number is that proxy's) and -EAGAIN (a proxy on its
+ * way out does, and closes it; see nvgpu_gem_proxy_create_new() for a
+ * number the host has just made, and nvgpu_gem_wait_gone()). Callers used to close it
  * again after a failed drm_gem_handle_create(), whose put had already freed
  * the proxy and sent GEM_CLOSE -- and a second close of a number the host may
  * have reused for a newer object closes that one.
@@ -1065,6 +1131,30 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
    * freed -- which closes the host handle and drops the owner. */
   drm_gem_object_put(&ng->base);
   return ret;
+}
+
+/*
+ * nvgpu_gem_proxy_create() for a host handle the host has just made -- an
+ * allocation's, not an import's -- which is new whatever the index says: a
+ * tombstone under the same number has closed it already, or the host could
+ * not have given it out again. So the tombstone is waited out, not refused.
+ */
+static int nvgpu_gem_proxy_create_new(struct drm_file *file,
+                                      struct nvgpu_fd *owner, u32 host_handle,
+                                      size_t size, u32 *guest_handle) {
+  int ret;
+
+  for (;;) {
+    ret = nvgpu_gem_proxy_create(file, owner, host_handle, size,
+                                 guest_handle);
+    if (ret != -EAGAIN)
+      return ret;
+    ret = nvgpu_gem_wait_gone(owner, host_handle);
+    if (ret) {
+      nvgpu_gem_close(owner->dev, owner->handle, host_handle);
+      return ret;
+    }
+  }
 }
 
 /*
@@ -1113,7 +1203,10 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
  * @host_gem is this function's once @drm_filp is known to be ours: every later
  * failure closes it (or leaves it to the proxy already standing for it).
  * -EBADF for a file that is not one of our DRM files leaves it with the
- * caller.
+ * caller. -EAGAIN: a proxy on its way out stands for @host_gem and will close
+ * it, so the number may be about to name nothing, or something else; it is
+ * not the caller's to close either. Wait (nvgpu_gem_wait_gone()) and import
+ * again, which gives a handle that is really the caller's.
  */
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
                            u32 obj_type, int o_flags) {
@@ -1461,8 +1554,8 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
           obj_size = get_unaligned_le64(out + d->size_field_offset);
 
         /* A failure has closed the host handle already. */
-        cret = nvgpu_gem_proxy_create(file, nfd, host_handle, (size_t)obj_size,
-                                      &guest_handle);
+        cret = nvgpu_gem_proxy_create_new(file, nfd, host_handle,
+                                          (size_t)obj_size, &guest_handle);
         if (cret) {
           ret = cret;
           goto out;

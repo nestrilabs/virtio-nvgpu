@@ -1662,12 +1662,20 @@ static struct nvgpu_fence_ctx *nvgpu_fence_ctx_lookup(struct drm_file *file,
  * host handle) is counted across proxies and closed with the last (RV:rehome).
  * Each entry holds a reference on the target file, whose render handle the
  * host handle lives in.
+ *
+ * The same goes for a handle a *proxy* of the target file stands for: the
+ * import hands that back too, and it is the proxy's to close (S-11). Such an
+ * entry borrows it -- holds a reference on the proxy, so the number stays
+ * the object's for as long as the entry uses it, and never closes it. One
+ * whose proxy is on its way out (closing it) waits for the close and imports
+ * again.
  */
 struct nvgpu_rehome {
   struct hlist_node node; /* keyed by the proxy */
   struct nvgpu_gem_object *ng;
   struct nvgpu_fd *file;
   u32 gem; /* in file's host render file */
+  struct drm_gem_object *borrowed; /* the proxy of file that owns gem */
 };
 
 static DEFINE_MUTEX(nvgpu_rehome_lock);
@@ -1679,8 +1687,9 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   struct nvgpu_rehome *r;
   u64 args[2], res[2];
   u32 dmabuf;
-  int ret;
+  int ret, tries = 0;
 
+again:
   mutex_lock(&nvgpu_rehome_lock);
   hash_for_each_possible(nvgpu_rehomes, r, node, (unsigned long)ng) {
     if (r->ng == ng && r->file == file) {
@@ -1714,6 +1723,19 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   if (!res[0] || res[0] > U32_MAX) {
     ret = -EPROTO;
     goto out_free;
+  }
+  r->borrowed = nvgpu_gem_proxy_find(file, (u32)res[0]);
+  if (!r->borrowed && nvgpu_gem_dying(file, (u32)res[0])) {
+    /* Not ours to use or close: wait out the proxy's close, outside the
+     * lock its free takes (nvgpu_fence_gem_free()), and import again. */
+    kfree(r);
+    mutex_unlock(&nvgpu_rehome_lock);
+    if (++tries > 3)
+      return -EAGAIN;
+    ret = nvgpu_gem_wait_gone(file, (u32)res[0]);
+    if (ret)
+      return ret;
+    goto again;
   }
   r->ng = ng;
   nvgpu_fd_get(file);
@@ -1753,7 +1775,7 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
     hash_for_each(nvgpu_rehomes, bkt, o, node)
       if (o->file == r->file && o->gem == r->gem)
         shared = true;
-    if (shared)
+    if (shared || r->borrowed)
       r->gem = 0;
     hlist_add_head(&r->node, &gone);
   }
@@ -1762,6 +1784,10 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
   hlist_for_each_entry_safe(r, tmp, &gone, node) {
     if (r->gem)
       nvgpu_gem_close(r->file->dev, r->file->handle, r->gem);
+    /* Outside the lock: this may be that proxy's last reference, and its
+     * free comes back here. */
+    if (r->borrowed)
+      drm_gem_object_put(r->borrowed);
     nvgpu_fd_put(r->file);
     kfree(r);
   }

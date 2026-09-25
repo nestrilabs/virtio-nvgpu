@@ -990,6 +990,9 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
     if (!nvgpu_resp_has(used, at, sizeof(go)) ||
         nvgpu_tbuf_read(r->resp, at, &go, sizeof(go)))
       break;
+    /* A re-home can return a handle the file had: a proxy's (S-11). */
+    if (nvgpu_gem_handle_held(dev, render, le32_to_cpu(go.gem)))
+      continue;
     __nvgpu_gem_close(dev, render, le32_to_cpu(go.gem), true);
     n++;
   }
@@ -1019,7 +1022,11 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
     __nvgpu_close_handle(dev, (u32)res0, true);
     return 1;
   case NVGPU_OP_DMABUF_IMPORT:
-    /* A GEM handle in the render file named by the first argument. */
+    /* A GEM handle in the render file named by the first argument -- unless
+     * the file already had one for the buffer, which the host then returns
+     * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
+    if (nvgpu_gem_handle_held(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0))
+      return 0;
     __nvgpu_gem_close(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0, true);
     return 1;
   default:

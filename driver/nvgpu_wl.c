@@ -563,6 +563,7 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
   }
   args[0] = nfd->handle;
   args[1] = handle;
+again:
   ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 3);
   if (ret < 0)
     goto out;
@@ -576,7 +577,9 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
    * third word, which reads as 0, NVKMS: the old answer.
    */
   if (res[2] > NVGPU_GEM_OBJECT_USERMEMORY) {
-    nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    /* A handle the file already had is a proxy's to close, not ours. */
+    if (!xa_load(&nfd->gem_index, (u32)res[0]))
+      nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
     ret = -EPROTO;
     goto out;
   }
@@ -584,6 +587,18 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
    * proxy that already stands for it. */
   ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], (u32)res[2],
                                O_RDWR | O_CLOEXEC);
+  /*
+   * The host answered with a handle the file had for this buffer, and the
+   * proxy that stood for it is on its way out, about to close it (S-11): a
+   * client recreating a wl_buffer from the same dma-buf as the compositor
+   * drops the last. Once that close is out, the same import gives a handle
+   * that is really ours -- the backend's dma-buf is held until `out`.
+   */
+  if (ret == -EAGAIN) {
+    ret = nvgpu_gem_wait_gone(nfd, (u32)res[0]);
+    if (!ret)
+      goto again;
+  }
 out:
   if (rf)
     fput(rf);
