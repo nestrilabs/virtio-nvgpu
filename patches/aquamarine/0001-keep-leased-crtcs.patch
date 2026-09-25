@@ -1,0 +1,114 @@
+From 8c3b3f36ec426a394b1a9fba914db9b3cdda1df9 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Fri, 25 Sep 2026 03:37:34 +0000
+Subject: [PATCH] drm: keep leased CRTCs out of reassignment, VT restore and
+ head restating
+
+The kernel lets a lessor keep committing to objects it has leased out
+(drm_lease_held() is true for a master without a lessor), so aquamarine has to
+leave a leased connector's CRTC alone itself. Three paths did not:
+
+- recheckCRTCs releases the CRTC of every connected output that is disabled
+  on our side, then hands free CRTCs to connectors that need one. A leased
+  desktop output is disabled on our side (the compositor turns it off before
+  leasing it), so the first hotplug recheck after the lease, which applyCommit
+  schedules right away because enabledState changed, released the leased CRTC
+  and could give it to a newly connected or rule-enabled monitor, whose
+  modeset then takes the display from the lessee. It also leaves
+  connector->crtc pointing elsewhere, while CDRMLease::create builds leases
+  from it.
+- restoreAfterVT re-commits every output that has a CRTC and a mode,
+  disabled ones included, which modesets a leased CRTC off after a VT switch.
+- CDRMAtomicRequest::restateConnectors restates every head with enabledState
+  set whenever another head modesets. A non-desktop output the compositor
+  never committed still has the default enabledState = true, so a leased HMD
+  that the lessee lit gets a modeset under it.
+
+All three now skip connectors whose output has an active lease.
+
+When a lease ends the lessee may have left its own CTM on the CRTC. Gamma is
+re-sent on every modeset already; the CTM is only re-sent when its kernel
+state is unknown, so CDRMLease::destroy marks it unknown.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/backend/drm/DRM.cpp         | 26 ++++++++++++++++++++++++--
+ src/backend/drm/impl/Atomic.cpp |  5 +++++
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index 431247b..f683eb2 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -48,6 +48,12 @@ using namespace Hyprutils::Memory;
+ using namespace Hyprutils::Math;
+ #define SP CSharedPointer
+ 
++// A connector whose output is leased out. The kernel lets the lessor (us) keep committing to leased objects, so it is up to us to
++// neither reassign its CRTC to another connector nor commit to it until the lease is revoked or the lessee goes away.
++static bool isLeased(const SP<SDRMConnector>& connector) {
++    return connector->output && connector->output->lease && connector->output->lease->active;
++}
++
+ static bool shouldSubmitCTM(SP<SDRMConnector> connector, const COutputState::SInternalState& state, bool modeset) {
+     if (state.committed & COutputState::AQ_OUTPUT_STATE_CTM)
+         return true;
+@@ -625,6 +631,12 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
+         if (!c->crtc || !c->output)
+             continue;
+ 
++        // restoring our state would modeset the lessee's CRTC (a leased desktop output is disabled on our side, so off)
++        if (isLeased(c)) {
++            backend->log(AQ_LOG_DEBUG, std::format("drm: Not restoring leased connector {}", c->szName));
++            continue;
++        }
++
+         auto&                   STATE = c->output->state->state();
+ 
+         SDRMConnectorCommitData data = {
+@@ -976,8 +988,10 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
+             continue;
+         }
+ 
+-        // disabled outputs release their CRTCs so active outputs get priority
+-        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
++        // disabled outputs release their CRTCs so active outputs get priority. A leased output is disabled on our side but its CRTC
++        // is the lessee's: released, it would be handed to the next connector that needs one, and that one's modeset would take
++        // the display from the lessee. CDRMLease::create also needs connector->crtc to still be the leased one.
++        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState && !isLeased(c)) {
+             backend->log(AQ_LOG_DEBUG, std::format("drm: {} is disabled, releasing crtc {}", c->szName, c->crtc->id));
+             c->setCRTC(nullptr);
+         }
+@@ -3567,5 +3581,13 @@ void Aquamarine::CDRMLease::terminate() {
+ }
+ 
+ void Aquamarine::CDRMLease::destroy() {
++    // The lessee may have left its own CTM on the CRTC. Gamma is re-sent on every modeset anyway; the CTM is only re-sent when we
++    // don't know what the kernel holds, so forget it and the lessor's next modeset writes one.
++    for (auto const& o : outputs) {
++        const auto OUTPUT = o.lock();
++        if (OUTPUT && OUTPUT->connector->crtc)
++            OUTPUT->connector->crtc->atomic.ctmStateKnown = false;
++    }
++
+     events.destroy.emit();
+ }
+diff --git a/src/backend/drm/impl/Atomic.cpp b/src/backend/drm/impl/Atomic.cpp
+index e47781b..397025a 100644
+--- a/src/backend/drm/impl/Atomic.cpp
++++ b/src/backend/drm/impl/Atomic.cpp
+@@ -91,6 +91,11 @@ bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
+         if (!c->output->enabledState)
+             continue;
+ 
++        // the lessee owns that head. An HMD we never committed still reads enabledState = true, and restating it would modeset the
++        // lessee's CRTC under it.
++        if (c->output->lease && c->output->lease->active)
++            continue;
++
+         drmModeModeInfo* current = c->getCurrentMode();
+         if (!current)
+             continue;
+-- 
+2.55.0
+
