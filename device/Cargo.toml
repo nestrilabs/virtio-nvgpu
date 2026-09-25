@@ -7,6 +7,7 @@ license = "Apache-2.0"
 [dependencies]
 protocol = { workspace = true }
 abi      = { workspace = true }
+wlwire   = { workspace = true }
 
 libc      = "0.2"
 thiserror = "2"

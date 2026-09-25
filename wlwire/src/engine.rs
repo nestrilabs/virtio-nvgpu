@@ -1,0 +1,1086 @@
+//! One end of one proxied connection: everything between a local Wayland
+//! socket and the channel to the other side of the VM boundary.
+//!
+//! The same engine runs on both sides -- in the guest daemon, facing a guest
+//! client, and in the backend, facing the host compositor -- and, in export
+//! mode, with the roles of client and server swapped. What differs is
+//! configured ([`Side`], [`Local`]) or supplied per call ([`Platform`], for the
+//! two descriptor kinds only a kernel or the backend's handle table can make).
+//!
+//! Every message in either direction is parsed against the generated tables:
+//! the target object must exist and its opcode be known at the object's
+//! version, or the connection ends with a protocol error. That is not
+//! pedantry: descriptors travel beside the byte stream and are consumed by
+//! signature, so a message the proxy cannot parse is a message whose
+//! descriptors it cannot count. Parsing also drives the object table (see
+//! `objects.rs`), the registry filter (see `policy.rs`), the per-class
+//! descriptor translation, shm tracking, and the few value rewrites.
+//!
+//! Object ids are never translated and the proxy never creates objects: the
+//! only messages it originates are `wl_display.error` toward a local client
+//! that broke the rules, and `wp_drm_lease_device_v1.released`, which the
+//! protocol promises and Hyprland 0.56 never sends.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use crate::blob::Blobs;
+use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
+use crate::localout::LocalOut;
+use crate::objects::{ObjError, Objects};
+use crate::policy::Policy;
+use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
+use crate::shm::Shm;
+use crate::stream::{Interest, Streams};
+use crate::sys;
+use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
+
+/// `wl_display.error` codes.
+pub const ERR_INVALID_OBJECT: u32 = 0;
+pub const ERR_INVALID_METHOD: u32 = 1;
+pub const ERR_NO_MEMORY: u32 = 2;
+pub const ERR_IMPLEMENTATION: u32 = 3;
+
+const CLOCK_MONOTONIC: u32 = 1;
+const CLOCK_MONOTONIC_RAW: u32 = 4;
+
+/// A WAYLAND record is closed at this many bytes or descriptors.
+const WL_REC_BYTES: usize = 16 * 1024;
+const WL_REC_DESCS: usize = 28;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Guest,
+    Host,
+}
+
+/// What the local socket's peer is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Local {
+    /// A client (the guest daemon normally; the backend in export mode).
+    Client,
+    /// A compositor (the backend normally; the guest daemon in export mode).
+    Server,
+}
+
+/// Where a fatal error came from, which decides who is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blame {
+    /// The local peer broke the protocol.
+    Local,
+    /// The channel carried something malformed.
+    Channel,
+    /// The far side ended the connection with an ERROR record.
+    Remote,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fatal {
+    pub object: u32,
+    pub code: u32,
+    pub message: String,
+    pub blame: Blame,
+}
+
+impl Fatal {
+    fn new(blame: Blame, object: u32, code: u32, message: impl Into<String>) -> Self {
+        Self {
+            object,
+            code,
+            message: message.into(),
+            blame,
+        }
+    }
+
+    /// `wl_display.error` for a local client.
+    pub fn display_error(&self) -> Vec<u8> {
+        let object = if self.object == 0 { 1 } else { self.object };
+        MsgBuilder::new(1, op::wl_display::EVT_ERROR)
+            .object(object)
+            .uint(self.code)
+            .string(Some(&self.message))
+            .finish()
+    }
+
+    /// An ERROR record for the far side.
+    pub fn record(&self) -> Unit {
+        let mut m = self.message.as_bytes().to_vec();
+        m.truncate(1024);
+        Unit {
+            rec: record(frame::REC_ERROR, self.object, self.code, &m),
+            descs: Vec::new(),
+        }
+    }
+}
+
+/// One entry of the guest kernel's device map: the same DRM node as the host
+/// and the guest number it. `(major, minor)` pairs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevPair {
+    pub host: (u32, u32),
+    pub guest: (u32, u32),
+}
+
+/// glibc's `dev_t` encoding, which is what `st_rdev` is and what compositors
+/// put in the dev_t arrays.
+pub fn makedev(major: u32, minor: u32) -> u64 {
+    let (ma, mi) = (major as u64, minor as u64);
+    ((ma & 0xffff_f000) << 32) | ((ma & 0xfff) << 8) | ((mi & 0xffff_ff00) << 12) | (mi & 0xff)
+}
+
+pub fn major_minor(dev: u64) -> (u32, u32) {
+    let ma = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
+    let mi = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
+    (ma as u32, mi as u32)
+}
+
+/// Value translation, guest side only: the guest kernel knows both clocks and
+/// both device numberings.
+#[derive(Clone, Default)]
+pub struct Rewrites {
+    pub devmap: Vec<DevPair>,
+    /// host CLOCK_MONOTONIC minus guest CLOCK_MONOTONIC, in ns; shared so the
+    /// daemon can refresh it as the kernel's estimate slews.
+    pub clock_offset: Arc<AtomicI64>,
+}
+
+pub struct EngineConfig {
+    pub side: Side,
+    pub local: Local,
+    pub policy: Policy,
+    pub rewrites: Option<Rewrites>,
+    /// Send `wp_drm_lease_device_v1.released` to a local client when the
+    /// compositor destroyed the device without it.
+    pub synth_released: bool,
+}
+
+/// The descriptor kinds that need more than a syscall: the guest kernel
+/// (resolving a guest dma-buf, adopting a DRM file) or the backend's handle
+/// table (PRIME export on the owner's render file, classifying what the
+/// compositor sent). Per call, so the backend can pass one borrowing its
+/// locked state.
+pub trait Platform {
+    /// A dma-buf from the local peer, for the channel.
+    fn dmabuf_out(&mut self, fd: OwnedFd) -> DescOut;
+    /// A DMABUF desc from the channel (and the descriptor the transport made
+    /// for it, if any), for the local peer.
+    fn dmabuf_in(&mut self, desc: &Desc, fd: Option<OwnedFd>) -> std::io::Result<OwnedFd>;
+    /// A DRM file from the local peer, for the channel.
+    fn drm_file_out(&mut self, fd: OwnedFd) -> DescOut;
+    /// A DRM_FILE desc from the channel, for the local peer.
+    fn drm_file_in(&mut self, desc: &Desc, fd: Option<OwnedFd>) -> std::io::Result<OwnedFd>;
+}
+
+/// Counters, for logs and tests.
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub msgs_to_channel: u64,
+    pub msgs_to_local: u64,
+    pub globals_offered: u64,
+    pub globals_hidden: u64,
+    pub commits: u64,
+    pub dmabufs: u64,
+    pub drm_files: u64,
+    pub devt_rewrites: u64,
+    pub time_rewrites: u64,
+    pub released_synthesised: u64,
+    pub placeholders: u64,
+}
+
+#[derive(Default)]
+struct Registry {
+    /// Offered globals: name → (interface, version offered).
+    offered: HashMap<u32, (IfaceId, u32)>,
+    hidden: HashSet<u32>,
+}
+
+/// Where a message's descriptors come from.
+enum FdSrc<'a> {
+    Local(&'a mut VecDeque<OwnedFd>),
+    Channel(&'a mut VecDeque<(Desc, Option<OwnedFd>)>),
+}
+
+/// What to do with a message after looking at it.
+enum Verdict {
+    Forward,
+    Drop,
+}
+
+pub struct Engine {
+    cfg: EngineConfig,
+    objects: Objects,
+    registry: Registry,
+    shm: Shm,
+    blobs: Blobs,
+    streams: Streams,
+    out_channel: VecDeque<Unit>,
+    wl_bytes: Vec<u8>,
+    wl_descs: Vec<DescOut>,
+    out_local: LocalOut,
+    peer_caps: u32,
+    got_hello: bool,
+    presentation_clock: u32,
+    release_pending: HashSet<u32>,
+    released_seen: HashSet<u32>,
+    hangup: bool,
+    pub stats: Stats,
+}
+
+impl Engine {
+    pub fn new(cfg: EngineConfig) -> Self {
+        let host = cfg.side == Side::Host;
+        Self {
+            cfg,
+            objects: Objects::new(),
+            registry: Registry::default(),
+            shm: Shm::default(),
+            blobs: Blobs::new(host),
+            streams: Streams::new(host),
+            out_channel: VecDeque::new(),
+            wl_bytes: Vec::new(),
+            wl_descs: Vec::new(),
+            out_local: LocalOut::default(),
+            peer_caps: 0,
+            got_hello: false,
+            // Until wp_presentation.clock_id says otherwise: what every
+            // compositor we proxy uses, and what a commit-timing client that
+            // never bound wp_presentation is assuming too.
+            presentation_clock: CLOCK_MONOTONIC,
+            release_pending: HashSet::new(),
+            released_seen: HashSet::new(),
+            hangup: false,
+            stats: Stats::default(),
+        }
+    }
+
+    /// Queue this side's HELLO; the first record either way.
+    pub fn hello(&mut self, caps: u32) {
+        let h = Hello {
+            version: frame::WL_PROTO_VERSION,
+            caps,
+        };
+        self.push_unit(Unit {
+            rec: record(frame::REC_HELLO, 0, 0, &h.encode()),
+            descs: Vec::new(),
+        });
+    }
+
+    pub fn peer_caps(&self) -> Option<u32> {
+        self.got_hello.then_some(self.peer_caps)
+    }
+
+    pub fn policy_mut(&mut self) -> &mut Policy {
+        &mut self.cfg.policy
+    }
+
+    /// The far side has gone (HANGUP received).
+    pub fn hung_up(&self) -> bool {
+        self.hangup
+    }
+
+    pub fn local_out(&mut self) -> &mut LocalOut {
+        &mut self.out_local
+    }
+
+    pub fn local_is_client(&self) -> bool {
+        self.cfg.local == Local::Client
+    }
+
+    /// Bytes waiting for the local socket.
+    pub fn local_out_len(&self) -> usize {
+        self.out_local.len()
+    }
+
+    /// Everything queued for the channel, in order.
+    pub fn take_units(&mut self) -> VecDeque<Unit> {
+        self.flush_wayland();
+        std::mem::take(&mut self.out_channel)
+    }
+
+    pub fn has_channel_output(&self) -> bool {
+        !self.out_channel.is_empty() || !self.wl_bytes.is_empty()
+    }
+
+    pub fn objects(&self) -> &Objects {
+        &self.objects
+    }
+
+    pub fn shm_stats(&self) -> (u64, u64) {
+        (self.shm.syncs, self.shm.sync_bytes)
+    }
+
+    pub fn blob_stats(&self) -> (u64, u64) {
+        (self.blobs.sent, self.blobs.received)
+    }
+
+    pub fn stream_stats(&self) -> (u64, u64, u64) {
+        (
+            self.streams.opened,
+            self.streams.bytes_out,
+            self.streams.bytes_in,
+        )
+    }
+
+    pub fn stream_interest(&self) -> Vec<Interest> {
+        self.streams.interest()
+    }
+
+    pub fn stream_io(&mut self, id: u32, readable: bool, writable: bool) {
+        let mut out = Vec::new();
+        self.streams.io(id, readable, writable, &mut out);
+        for u in out {
+            self.push_unit(u);
+        }
+    }
+
+    fn push_unit(&mut self, u: Unit) {
+        self.flush_wayland();
+        self.out_channel.push_back(u);
+    }
+
+    fn flush_wayland(&mut self) {
+        if self.wl_bytes.is_empty() && self.wl_descs.is_empty() {
+            return;
+        }
+        let descs = std::mem::take(&mut self.wl_descs);
+        let rec = record(frame::REC_WAYLAND, 0, descs.len() as u32, &self.wl_bytes);
+        self.wl_bytes.clear();
+        self.out_channel.push_back(Unit { rec, descs });
+    }
+
+    fn push_wayland(&mut self, msg: &[u8], descs: Vec<DescOut>) {
+        if self.wl_bytes.len() + msg.len() > WL_REC_BYTES
+            || self.wl_descs.len() + descs.len() > WL_REC_DESCS
+        {
+            self.flush_wayland();
+        }
+        self.wl_bytes.extend_from_slice(msg);
+        self.wl_descs.extend(descs);
+        self.stats.msgs_to_channel += 1;
+    }
+
+    /// The direction of messages arriving from the local socket.
+    fn local_dir(&self) -> Dir {
+        match self.cfg.local {
+            Local::Client => Dir::Request,
+            Local::Server => Dir::Event,
+        }
+    }
+
+    /// Parse every complete message at the front of `data` (bytes read from
+    /// the local socket) with the descriptors received alongside, translate
+    /// them, and queue the result for the channel. A partial message is left
+    /// in `data` for the next read.
+    pub fn from_local(
+        &mut self,
+        data: &mut Vec<u8>,
+        fds: &mut VecDeque<OwnedFd>,
+        plat: &mut dyn Platform,
+    ) -> Result<(), Fatal> {
+        let dir = self.local_dir();
+        let mut off = 0;
+        let res = loop {
+            let Some(h) = peek_header(&data[off..]) else {
+                break Ok(());
+            };
+            let size = h.size as usize;
+            if size < 8 || size > MAX_MSG || size % 4 != 0 {
+                break Err(Fatal::new(
+                    Blame::Local,
+                    h.object,
+                    ERR_INVALID_METHOD,
+                    "bad message size",
+                ));
+            }
+            if data.len() - off < size {
+                break Ok(());
+            }
+            let msg = data[off..off + size].to_vec();
+            off += size;
+            if let Err(e) = self.message(dir, true, msg, &mut FdSrc::Local(fds), plat) {
+                break Err(e);
+            }
+        };
+        data.drain(..off);
+        res
+    }
+
+    /// Process one frame from the channel; output goes to the local socket
+    /// (and, for credits, back to the channel). `fds` is what the transport
+    /// materialised per descriptor (the guest kernel's installed descriptors;
+    /// nothing on the host).
+    pub fn from_channel(
+        &mut self,
+        bytes: &[u8],
+        fds: Vec<Option<OwnedFd>>,
+        plat: &mut dyn Platform,
+    ) -> Result<(), Fatal> {
+        let f = frame::decode(bytes).map_err(|e| {
+            Fatal::new(
+                Blame::Channel,
+                1,
+                ERR_IMPLEMENTATION,
+                format!("bad frame: {e:?}"),
+            )
+        })?;
+        let mut fds = fds.into_iter();
+        let mut descs: VecDeque<(Desc, Option<OwnedFd>)> =
+            f.descs.iter().map(|d| (*d, fds.next().flatten())).collect();
+        let dir = match self.local_dir() {
+            Dir::Request => Dir::Event,
+            Dir::Event => Dir::Request,
+        };
+        let chan = |m: &str| Fatal::new(Blame::Channel, 1, ERR_IMPLEMENTATION, m.to_string());
+        for r in f.records() {
+            match r.ty {
+                frame::REC_HELLO => {
+                    let h = Hello::decode(r.payload).ok_or_else(|| chan("short HELLO"))?;
+                    self.peer_caps = h.caps;
+                    self.got_hello = true;
+                    if self.cfg.side == Side::Host {
+                        self.cfg.policy.drm_file = h.caps & frame::HELLO_G_DRM_FILE != 0;
+                    }
+                }
+                frame::REC_WAYLAND => {
+                    let before = descs.len();
+                    let mut p = r.payload;
+                    while !p.is_empty() {
+                        let h = peek_header(p)
+                            .ok_or_else(|| chan("partial message in WAYLAND record"))?;
+                        let size = h.size as usize;
+                        if size < 8 || size > MAX_MSG || size % 4 != 0 || size > p.len() {
+                            return Err(chan("bad message size in WAYLAND record"));
+                        }
+                        self.message(
+                            dir,
+                            false,
+                            p[..size].to_vec(),
+                            &mut FdSrc::Channel(&mut descs),
+                            plat,
+                        )?;
+                        p = &p[size..];
+                    }
+                    if before - descs.len() != r.arg as usize {
+                        return Err(chan(
+                            "WAYLAND record descriptor count disagrees with its messages",
+                        ));
+                    }
+                }
+                frame::REC_STREAM_DATA => {
+                    let mut out = Vec::new();
+                    self.streams
+                        .data(r.id, r.payload, &mut out)
+                        .map_err(|e| chan(&format!("stream: {e:?}")))?;
+                    for u in out {
+                        self.push_unit(u);
+                    }
+                }
+                frame::REC_STREAM_EOF => {
+                    let mut out = Vec::new();
+                    self.streams.eof(r.id, &mut out);
+                    for u in out {
+                        self.push_unit(u);
+                    }
+                }
+                frame::REC_STREAM_CREDIT => self.streams.credit(r.id, r.arg),
+                frame::REC_SHM_SYNC => {
+                    if self.cfg.local != Local::Server {
+                        return Err(chan("SHM_SYNC toward a client"));
+                    }
+                    self.shm
+                        .sync(r.id, r.arg, r.payload)
+                        .map_err(|e| chan(&format!("shm: {e:?}")))?;
+                }
+                frame::REC_BLOB => {
+                    self.blobs
+                        .chunk(r.id, r.arg, r.payload)
+                        .map_err(|e| chan(&format!("blob: {e:?}")))?;
+                }
+                frame::REC_ERROR => {
+                    return Err(Fatal::new(
+                        Blame::Remote,
+                        r.id,
+                        r.arg,
+                        String::from_utf8_lossy(r.payload).into_owned(),
+                    ));
+                }
+                frame::REC_HANGUP => self.hangup = true,
+                t => return Err(chan(&format!("unknown record type {t}"))),
+            }
+        }
+        if !descs.is_empty() {
+            return Err(chan("descriptors left over after the frame's records"));
+        }
+        Ok(())
+    }
+
+    fn message(
+        &mut self,
+        dir: Dir,
+        from_local: bool,
+        mut msg: Vec<u8>,
+        src: &mut FdSrc<'_>,
+        plat: &mut dyn Platform,
+    ) -> Result<(), Fatal> {
+        let blame = if from_local {
+            Blame::Local
+        } else {
+            Blame::Channel
+        };
+        let h = peek_header(&msg).unwrap();
+        let err = |code: u32, m: String| Fatal::new(blame, h.object, code, m);
+
+        let obj = self
+            .objects
+            .get(h.object)
+            .ok_or_else(|| err(ERR_INVALID_OBJECT, format!("invalid object {}", h.object)))?;
+        let ifc = iface(obj.iface);
+        if obj.zombie && dir == Dir::Request {
+            return Err(err(
+                ERR_INVALID_OBJECT,
+                format!("request on destroyed object {}@{}", ifc.name, h.object),
+            ));
+        }
+        let desc = ifc.messages(dir).get(h.opcode as usize).ok_or_else(|| {
+            err(
+                ERR_INVALID_METHOD,
+                format!("{} has no {:?} opcode {}", ifc.name, dir, h.opcode),
+            )
+        })?;
+        if desc.since > obj.version {
+            return Err(err(
+                ERR_INVALID_METHOD,
+                format!(
+                    "{}.{} needs version {}, object has {}",
+                    ifc.name, desc.name, desc.since, obj.version
+                ),
+            ));
+        }
+        let args = wire::parse(desc, &msg).map_err(|e| {
+            err(
+                ERR_INVALID_METHOD,
+                format!("{}.{}: {e:?}", ifc.name, desc.name),
+            )
+        })?;
+
+        // Registry policy, on whichever side sees the message.
+        let mut edits: Vec<(usize, u32)> = Vec::new();
+        let mut verdict = Verdict::Forward;
+        let mut bind: Option<(IfaceId, u32)> = None;
+        if obj.iface == proto::WL_REGISTRY {
+            match (dir, h.opcode) {
+                (Dir::Event, op::wl_registry::EVT_GLOBAL) => {
+                    let (Val::Uint(name), Val::Str(Some(ifname)), Val::Uint(ver)) =
+                        (args[0].val, args[1].val, args[2].val)
+                    else {
+                        unreachable!()
+                    };
+                    match self.cfg.policy.offer(name, ifname, ver) {
+                        Some((id, v)) => {
+                            edits.push((args[2].off, v));
+                            self.registry.offered.insert(name, (id, v));
+                            self.registry.hidden.remove(&name);
+                            self.stats.globals_offered += 1;
+                        }
+                        None => {
+                            self.registry.hidden.insert(name);
+                            self.stats.globals_hidden += 1;
+                            verdict = Verdict::Drop;
+                        }
+                    }
+                }
+                (Dir::Event, op::wl_registry::EVT_GLOBAL_REMOVE) => {
+                    let Val::Uint(name) = args[0].val else {
+                        unreachable!()
+                    };
+                    if self.registry.hidden.contains(&name) {
+                        verdict = Verdict::Drop;
+                    }
+                }
+                (Dir::Request, op::wl_registry::REQ_BIND) => {
+                    let (
+                        Val::Uint(name),
+                        Val::NewId {
+                            iface: Some(ifname),
+                            version,
+                            ..
+                        },
+                    ) = (args[0].val, args[1].val)
+                    else {
+                        unreachable!()
+                    };
+                    let Some(&(id, max)) = self.registry.offered.get(&name) else {
+                        return Err(err(
+                            ERR_INVALID_OBJECT,
+                            format!("bind of global {name}, which was not offered"),
+                        ));
+                    };
+                    if iface(id).name.as_bytes() != ifname || version == 0 || version > max {
+                        return Err(err(
+                            ERR_INVALID_OBJECT,
+                            format!(
+                                "bind of global {name} as {} v{version}; offered {} v{max}",
+                                String::from_utf8_lossy(ifname),
+                                iface(id).name
+                            ),
+                        ));
+                    }
+                    bind = Some((id, version));
+                }
+                _ => {}
+            }
+        }
+        if matches!(verdict, Verdict::Drop) {
+            // A hidden global's event carries no descriptors or new objects.
+            return Ok(());
+        }
+
+        // New objects. Their side state (shm) is cleared first: the id may be
+        // a reused one.
+        for (a, at) in desc.args.iter().zip(args.iter()) {
+            if let Val::NewId { id, .. } = at.val {
+                let (ni, nv) = match (a.iface, bind) {
+                    (Some(i), _) => (i, obj.version),
+                    (None, Some(b)) => b,
+                    (None, None) => {
+                        return Err(err(
+                            ERR_INVALID_METHOD,
+                            "untyped new_id outside bind".into(),
+                        ));
+                    }
+                };
+                self.objects
+                    .create(id, ni, nv, dir == Dir::Request)
+                    .map_err(|e| {
+                        let m = match e {
+                            ObjError::InUse(i) => format!("new id {i} is in use"),
+                            ObjError::WrongRange(i) => {
+                                format!("new id {i} is in the other side's range")
+                            }
+                            ObjError::TooMany => "too many objects".to_string(),
+                        };
+                        err(
+                            if e == ObjError::TooMany {
+                                ERR_NO_MEMORY
+                            } else {
+                                ERR_INVALID_OBJECT
+                            },
+                            m,
+                        )
+                    })?;
+                self.shm.forget(id);
+            }
+        }
+
+        // Guest-side value rewrites.
+        if let (Some(rw), Some(kind)) = (&self.cfg.rewrites, desc.rewrite) {
+            let rw = rw.clone();
+            self.rewrite(&rw, kind, &args, from_local, &mut edits);
+        }
+
+        // Descriptors, by class.
+        let uint = |i: u8| match args[i as usize].val {
+            Val::Uint(v) => v,
+            _ => 0,
+        };
+        let new_id_at = |i: usize| match args.get(i).map(|a| a.val) {
+            Some(Val::NewId { id, .. }) => id,
+            _ => 0,
+        };
+        let mut out_descs: Vec<DescOut> = Vec::new();
+        let mut out_fds: Vec<OwnedFd> = Vec::new();
+        let mut pre_units: Vec<Unit> = Vec::new();
+        if desc.nfds > 0 {
+            let class = desc.fd.ok_or_else(|| {
+                err(
+                    ERR_IMPLEMENTATION,
+                    format!(
+                        "{}.{} carries a descriptor the proxy cannot handle",
+                        ifc.name, desc.name
+                    ),
+                )
+            })?;
+            match src {
+                FdSrc::Local(q) => {
+                    let fd = q.pop_front().ok_or_else(|| {
+                        err(
+                            ERR_INVALID_METHOD,
+                            format!("{}.{}: descriptor expected", ifc.name, desc.name),
+                        )
+                    })?;
+                    let d = match class {
+                        FdKind::ShmPool => {
+                            let size = match args[2].val {
+                                Val::Int(s) if s > 0 => s as u64,
+                                _ => {
+                                    return Err(err(
+                                        ERR_INVALID_METHOD,
+                                        "invalid shm pool size".into(),
+                                    ));
+                                }
+                            };
+                            self.shm.add_pool(new_id_at(0), fd, size);
+                            DescOut::plain(Desc {
+                                c: size,
+                                ..Desc::new(frame::DESC_SHM_POOL)
+                            })
+                        }
+                        FdKind::Dmabuf => {
+                            self.stats.dmabufs += 1;
+                            plat.dmabuf_out(fd)
+                        }
+                        FdKind::Blob {
+                            size_arg,
+                            offset_arg,
+                        } => {
+                            let len = uint(size_arg) as u64;
+                            let off = offset_arg.map(|o| uint(o) as u64).unwrap_or(0);
+                            if let Some(o) = offset_arg {
+                                edits.push((args[o as usize].off, 0));
+                            }
+                            match self.blobs.send(&fd, off, len, &mut pre_units) {
+                                Some(id) => DescOut::plain(Desc {
+                                    a: id,
+                                    c: len,
+                                    ..Desc::new(frame::DESC_BLOB)
+                                }),
+                                None => DescOut::plain(Desc::invalid(frame::DESC_BLOB)),
+                            }
+                        }
+                        FdKind::Stream => {
+                            if !sys::is_fifo(fd.as_raw_fd()) {
+                                return Err(err(
+                                    ERR_INVALID_METHOD,
+                                    format!("{}.{}: not a pipe", ifc.name, desc.name),
+                                ));
+                            }
+                            match self.streams.add_sink(fd) {
+                                Ok(id) => DescOut::plain(Desc {
+                                    a: id,
+                                    ..Desc::new(frame::DESC_STREAM)
+                                }),
+                                Err(_) => DescOut::plain(Desc::invalid(frame::DESC_STREAM)),
+                            }
+                        }
+                        FdKind::DrmFile => {
+                            self.stats.drm_files += 1;
+                            plat.drm_file_out(fd)
+                        }
+                        FdKind::Syncobj => {
+                            return Err(err(
+                                ERR_IMPLEMENTATION,
+                                "syncobj descriptors are not bridged".into(),
+                            ));
+                        }
+                    };
+                    out_descs.push(d);
+                }
+                FdSrc::Channel(q) => {
+                    let (d, tfd) = q.pop_front().ok_or_else(|| {
+                        err(
+                            ERR_IMPLEMENTATION,
+                            format!("{}.{}: no descriptor in the frame", ifc.name, desc.name),
+                        )
+                    })?;
+                    let want = match class {
+                        FdKind::ShmPool => frame::DESC_SHM_POOL,
+                        FdKind::Dmabuf => frame::DESC_DMABUF,
+                        FdKind::Blob { .. } => frame::DESC_BLOB,
+                        FdKind::Stream => frame::DESC_STREAM,
+                        FdKind::DrmFile => frame::DESC_DRM_FILE,
+                        FdKind::Syncobj => frame::DESC_SYNCOBJ,
+                    };
+                    if d.kind != want {
+                        return Err(err(
+                            ERR_IMPLEMENTATION,
+                            format!(
+                                "{}.{}: descriptor of kind {} where {want} belongs",
+                                ifc.name, desc.name, d.kind
+                            ),
+                        ));
+                    }
+                    let fd = if d.is_invalid() {
+                        None
+                    } else {
+                        match class {
+                            FdKind::ShmPool => {
+                                let size = match args[2].val {
+                                    Val::Int(s) if s > 0 && s as u64 == d.c => d.c,
+                                    _ => {
+                                        return Err(err(
+                                            ERR_IMPLEMENTATION,
+                                            "shm pool size disagrees".into(),
+                                        ));
+                                    }
+                                };
+                                if !self.shm.may_grow(size) {
+                                    return Err(err(
+                                        ERR_NO_MEMORY,
+                                        "too much shm for one connection".into(),
+                                    ));
+                                }
+                                let memfd = sys::memfd(c"nvgpu-wl-shm", size)
+                                    .map_err(|e| err(ERR_NO_MEMORY, format!("shm pool: {e}")))?;
+                                let give = memfd
+                                    .try_clone()
+                                    .map_err(|e| err(ERR_NO_MEMORY, format!("dup: {e}")))?;
+                                self.shm.add_pool(new_id_at(0), memfd, size);
+                                Some(give)
+                            }
+                            FdKind::Dmabuf => {
+                                self.stats.dmabufs += 1;
+                                plat.dmabuf_in(&d, tfd).ok()
+                            }
+                            FdKind::Blob { size_arg, .. } => {
+                                if d.c != uint(size_arg) as u64 {
+                                    return Err(err(
+                                        ERR_IMPLEMENTATION,
+                                        "blob size disagrees with message".into(),
+                                    ));
+                                }
+                                Some(
+                                    self.blobs.take(d.a, d.c).map_err(|e| {
+                                        err(ERR_IMPLEMENTATION, format!("blob: {e:?}"))
+                                    })?,
+                                )
+                            }
+                            FdKind::Stream => {
+                                Some(self.streams.add_source(d.a).map_err(|e| {
+                                    err(ERR_IMPLEMENTATION, format!("stream: {e:?}"))
+                                })?)
+                            }
+                            FdKind::DrmFile => {
+                                self.stats.drm_files += 1;
+                                plat.drm_file_in(&d, tfd).ok()
+                            }
+                            FdKind::Syncobj => None,
+                        }
+                    };
+                    let fd = match fd {
+                        Some(f) => f,
+                        None => {
+                            self.stats.placeholders += 1;
+                            sys::placeholder_fd()
+                                .map_err(|e| err(ERR_NO_MEMORY, format!("placeholder: {e}")))?
+                        }
+                    };
+                    out_fds.push(fd);
+                }
+            }
+        }
+
+        // shm bookkeeping, and the copy a commit needs, on the client's side;
+        // the pool geometry on both.
+        let client_side = self.cfg.local == Local::Client;
+        let server_side = !client_side;
+        let obj_id = h.object;
+        let mut commit_sync: Vec<Unit> = Vec::new();
+        if dir == Dir::Request {
+            match (obj.iface, h.opcode) {
+                (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_CREATE_BUFFER) => {
+                    let g = |i: usize| match args[i].val {
+                        Val::Int(v) => v,
+                        _ => 0,
+                    };
+                    self.shm.add_buffer(obj_id, new_id_at(0), g(1), g(3), g(4));
+                }
+                (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_RESIZE) => {
+                    if let Val::Int(s) = args[0].val {
+                        if s > 0 {
+                            self.shm
+                                .resize(obj_id, s as u64, server_side)
+                                .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
+                        }
+                    }
+                }
+                (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) if client_side => {
+                    if let Val::Object(b) = args[0].val {
+                        self.shm.attach(obj_id, b);
+                    }
+                }
+                (proto::WL_SURFACE, op::wl_surface::REQ_DAMAGE) if client_side => {
+                    self.shm.damage_surface(obj_id)
+                }
+                (proto::WL_SURFACE, op::wl_surface::REQ_DAMAGE_BUFFER) if client_side => {
+                    if let (Val::Int(y), Val::Int(hh)) = (args[1].val, args[3].val) {
+                        self.shm.damage_buffer(obj_id, y, hh);
+                    }
+                }
+                (proto::WL_SURFACE, op::wl_surface::REQ_COMMIT) => {
+                    self.stats.commits += 1;
+                    if client_side {
+                        self.shm.commit(obj_id, &mut commit_sync);
+                    }
+                }
+                (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {
+                    self.release_pending.insert(obj_id);
+                }
+                _ => {}
+            }
+        }
+
+        // A lease device destroyed without `released`: supply it before the
+        // delete_id that frees the id.
+        let mut synth: Option<Vec<u8>> = None;
+        if dir == Dir::Event
+            && obj.iface == proto::WL_DISPLAY
+            && h.opcode == op::wl_display::EVT_DELETE_ID
+        {
+            if let Val::Uint(id) = args[0].val {
+                if self.cfg.synth_released
+                    && !from_local
+                    && self.release_pending.remove(&id)
+                    && !self.released_seen.remove(&id)
+                    && self
+                        .objects
+                        .get(id)
+                        .is_some_and(|o| !o.zombie && o.iface == proto::WP_DRM_LEASE_DEVICE_V1)
+                {
+                    synth = Some(
+                        MsgBuilder::new(id, op::wp_drm_lease_device_v1::EVT_RELEASED).finish(),
+                    );
+                }
+            }
+        }
+        if dir == Dir::Event
+            && obj.iface == proto::WP_DRM_LEASE_DEVICE_V1
+            && h.opcode == op::wp_drm_lease_device_v1::EVT_RELEASED
+        {
+            self.release_pending.remove(&obj_id);
+            self.released_seen.insert(obj_id);
+        }
+        if let Some(s) = synth {
+            self.stats.released_synthesised += 1;
+            self.message(
+                Dir::Event,
+                false,
+                s,
+                &mut FdSrc::Channel(&mut VecDeque::new()),
+                plat,
+            )?;
+        }
+
+        // Lifetimes.
+        if desc.destructor {
+            match dir {
+                Dir::Request => self.objects.destroyed_by_request(obj_id),
+                Dir::Event => self.objects.destroyed_by_event(obj_id),
+            }
+            self.shm.forget(obj_id);
+        }
+        if dir == Dir::Event
+            && obj.iface == proto::WL_DISPLAY
+            && h.opcode == op::wl_display::EVT_DELETE_ID
+        {
+            if let Val::Uint(id) = args[0].val {
+                self.objects.delete_id(id);
+                self.shm.forget(id);
+                self.release_pending.remove(&id);
+                self.released_seen.remove(&id);
+            }
+        }
+
+        drop(args);
+        for (off, v) in edits {
+            put_word(&mut msg, off, v);
+        }
+
+        if from_local {
+            for u in pre_units {
+                self.push_unit(u);
+            }
+            for u in commit_sync {
+                self.push_unit(u);
+            }
+            self.push_wayland(&msg, out_descs);
+        } else {
+            self.out_local.push(&msg, out_fds);
+            self.stats.msgs_to_local += 1;
+        }
+        Ok(())
+    }
+
+    fn rewrite(
+        &mut self,
+        rw: &Rewrites,
+        kind: RewriteKind,
+        args: &[At<'_>],
+        from_local: bool,
+        edits: &mut Vec<(usize, u32)>,
+    ) {
+        // From the channel is host → guest; from the local peer, guest → host.
+        let to_guest = !from_local;
+        match kind {
+            RewriteKind::ClockId(i) => {
+                if let Val::Uint(c) = args[i as usize].val {
+                    self.presentation_clock = c;
+                }
+            }
+            RewriteKind::DevT(i) => {
+                let at = &args[i as usize];
+                if let Val::Array(a) = at.val {
+                    if a.len() == 8 {
+                        let dev = u64::from_ne_bytes(a.try_into().unwrap());
+                        let mm = major_minor(dev);
+                        let mapped = rw
+                            .devmap
+                            .iter()
+                            .find(|p| {
+                                if to_guest {
+                                    p.host == mm
+                                } else {
+                                    p.guest == mm
+                                }
+                            })
+                            .map(|p| if to_guest { p.guest } else { p.host });
+                        // A node with no counterpart (another GPU of the
+                        // host's, say) must not alias one of ours: 0 says
+                        // "unknown device" rather than naming the wrong one.
+                        let new = mapped.map(|(ma, mi)| makedev(ma, mi)).unwrap_or(0);
+                        let b = new.to_ne_bytes();
+                        edits.push((at.off + 4, u32::from_ne_bytes(b[0..4].try_into().unwrap())));
+                        edits.push((at.off + 8, u32::from_ne_bytes(b[4..8].try_into().unwrap())));
+                        self.stats.devt_rewrites += 1;
+                    }
+                }
+            }
+            RewriteKind::Timestamp {
+                sec_hi,
+                sec_lo,
+                nsec,
+            } => {
+                if self.presentation_clock != CLOCK_MONOTONIC
+                    && self.presentation_clock != CLOCK_MONOTONIC_RAW
+                {
+                    return;
+                }
+                let u = |i: u8| match args[i as usize].val {
+                    Val::Uint(v) => v as u64,
+                    _ => 0,
+                };
+                let t = ((u(sec_hi) << 32 | u(sec_lo)) as i128) * 1_000_000_000 + u(nsec) as i128;
+                if t == 0 {
+                    return;
+                }
+                let off = rw.clock_offset.load(Ordering::Relaxed) as i128;
+                let t = if to_guest { t - off } else { t + off }.max(0);
+                let secs = (t / 1_000_000_000) as u64;
+                let ns = (t % 1_000_000_000) as u32;
+                edits.push((args[sec_hi as usize].off, (secs >> 32) as u32));
+                edits.push((args[sec_lo as usize].off, secs as u32));
+                edits.push((args[nsec as usize].off, ns));
+                self.stats.time_rewrites += 1;
+            }
+        }
+    }
+
+    /// Whether `argkind` exists in the signature (used by tests).
+    pub fn signature_has(iface_id: IfaceId, dir: Dir, opcode: u16, kind: ArgKind) -> bool {
+        iface(iface_id)
+            .messages(dir)
+            .get(opcode as usize)
+            .is_some_and(|m| m.args.iter().any(|a| a.kind == kind))
+    }
+}
