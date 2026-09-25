@@ -2,9 +2,14 @@
 use protocol::messages::*;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 use crate::error::{DeviceError, Result};
+use crate::guarded::GuardedBuf;
 use crate::handle_table::HandleTable;
+use crate::hostfd::{self, CardNode, HandleKind};
+use crate::pump::{PumpCmd, WatchMode};
+use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
 
 // ============================================================
@@ -31,17 +36,13 @@ const NVOS54_TOTAL: usize = 32;
 /// `NV_OK`. Every other value is a refusal of some kind.
 const NV_OK: u32 = 0;
 
-/// The host path an `Open` refers to.
+/// The host path an `Open` refers to, resolving a render node through the DRI
+/// list the guest was given.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
 /// singleton devices take values above every possible minor. This previously
 /// decoded a `{kind, index}` pair that the driver never sent, so every open of
 /// the control device arrived as kind 255 and was refused.
-fn device_path(device_type: u32) -> Result<CString> {
-    device_path_with(device_type, &[])
-}
-
-/// As [`device_path`], but able to resolve a render node.
 ///
 /// A render node's name is not derivable from its index: the host numbers them
 /// per DRM device, so the guest's index has to be looked up in the same list
@@ -66,8 +67,9 @@ fn device_path_with(device_type: u32, dri: &[DriDevice]) -> Result<CString> {
                 .ok_or(DeviceError::InvalidDeviceKind(device_type))?;
             format!("/dev/dri/{}", d.name)
         }
-        // Not opened by path here: card nodes and Wayland channels arrive with
-        // protocol v2, which opens them through its own handlers.
+        // Not opened by path: card nodes only through HOST_OP OPEN_KMS, which
+        // ties the card to a guest file's render handle and to compositor-VM
+        // mode; Wayland channels through their own handler.
         DeviceKind::DriCard(_) | DeviceKind::Wayland => {
             return Err(DeviceError::InvalidDeviceKind(device_type));
         }
@@ -106,13 +108,14 @@ impl Status {
 }
 
 /// A DRM render node the host owns, as the guest is told about it.
-struct DriDevice {
-    name: String,
-    major: u32,
-    minor: u32,
+#[derive(Clone, Debug)]
+pub(crate) struct DriDevice {
+    pub(crate) name: String,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
     /// Which GPU slot it belongs to. The guest matches this against the GPU's
     /// minor to decide which card the node hangs off; it is ours, not NVIDIA's.
-    slot_index: u32,
+    pub(crate) slot_index: u32,
     /// `DRM_NVIDIA_GET_DEV_INFO` as the host's own node answers it, passed
     /// through rather than reconstructed.
     ///
@@ -125,7 +128,19 @@ struct DriDevice {
     /// false. The tiling fields were right for the two cards they name and
     /// silently wrong elsewhere, which is the kind of wrong that produces a
     /// scrambled frame rather than an error.
-    dev_info: [u32; NV_DEV_INFO_WORDS],
+    pub(crate) dev_info: [u32; NV_DEV_INFO_WORDS],
+}
+
+/// The host DRM nodes of our GPUs, enumerated once.
+///
+/// Every OPEN used to walk sysfs and open and close each host render node to
+/// ask it GET_DEV_INFO -- for an open of `nvidiactl` as much as for a render
+/// node. The answer does not change while the driver is loaded, so it is
+/// taken once, on first use, and kept.
+#[derive(Debug, Default)]
+pub(crate) struct HostNodes {
+    pub(crate) dri: Vec<DriDevice>,
+    pub(crate) cards: Vec<CardNode>,
 }
 
 /// `struct drm_nvidia_get_dev_info_params` is nine `u32`s. Carried as words
@@ -308,28 +323,33 @@ fn collect_into(
 // NvidiaBackend
 // ============================================================
 
-
 pub struct NvidiaBackend {
     /// The message being served, so a response can echo its type, and the
     /// handle it named, so handlers need not thread either through.
-    current_msg: MsgType,
-    current_handle: u32,
+    pub(crate) current_msg: MsgType,
+    pub(crate) current_handle: u32,
+    /// The request's id, echoed in every response header. A v2 guest puts a
+    /// unique one in each request; a v1 guest leaves it zero.
+    pub(crate) current_req_id: u32,
     /// Top-level parameter length of the ioctl being served. The response has
     /// to split the bytes the same way the request did.
     current_data_len: u32,
-    handles: HandleTable,
+    pub(crate) handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
     ///
     /// The SHM offset is written into pLinearAddress in the response to the
     /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
     /// This gives us a unique, unambiguous lookup key without leaking host VAs.
-    active_maps: crate::mmap::MmapContext,
-    /// Which device each open handle names, for mappings made without one.
-    handle_kinds: std::collections::HashMap<u64, DeviceKind>,
+    ///
+    /// Each entry owns its extent, and is the only record that does: the
+    /// extent is released when RM_UNMAP_MEMORY succeeds, when the handle that
+    /// carries the mapping closes, or when the session resets -- whichever
+    /// comes first, and exactly once.
+    pub(crate) active_maps: crate::mmap::MmapContext,
     /// Host driver version, learned from the first successful
     /// `NV_ESC_CHECK_VERSION_STR`.
-    driver: Option<abi::version::DriverVersion>,
+    pub(crate) driver: Option<abi::version::DriverVersion>,
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
     /// Where device memory is placed so the guest can address it. `None` until
@@ -343,15 +363,20 @@ pub struct NvidiaBackend {
     /// are told apart only by that offset. Keyed at all because a buffer is
     /// mapped more than once -- the guest maps it, exports it, an importer maps
     /// it again -- and each placement costs a slice of a finite window.
-    dri_maps: std::collections::HashMap<(u64, u64), u32>,
+    ///
+    /// Only a lookup: the placement itself is owned by `live_maps`. An entry
+    /// goes when its handle closes, so a later open that happens to reuse the
+    /// offset cannot be handed a placement of someone else's object.
+    dri_maps: std::collections::HashMap<(u32, u64), u32>,
     /// Every message this backend has served, by kind.
     ///
     /// Kept because "how often does the guest have to ask the host anything"
     /// is the question a benchmark of this design turns on, and counting log
     /// lines answers a different one -- what the log level happened to print.
     msg_counts: std::collections::BTreeMap<&'static str, u64>,
-    /// Every live placement, by the id the guest quotes to take it back.
-    live_maps: std::collections::HashMap<u32, LiveMap>,
+    /// Every live placement made without an RM record, by the id the guest
+    /// quotes to take it back. Owns its extent; see [`LiveMap`].
+    pub(crate) live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
@@ -377,22 +402,84 @@ pub struct NvidiaBackend {
     /// Escapes that failed the check, and how often, so a run can say what a
     /// workload actually needed. Reported at teardown.
     abi_refused: std::collections::BTreeMap<u32, u64>,
-    /// Descriptors opened and closed since a transport last asked, so it can
-    /// keep a poll set in step with them.
+    /// Instructions for the event pump, in the order they were made, until
+    /// the transport collects them.
     ///
-    /// The backend cannot watch them itself: it holds no queue to deliver a
-    /// notification on, and this crate names no VMM. It says what is
-    /// watchable; the transport decides how to watch it.
-    watch_added: Vec<(u32, RawFd)>,
-    watch_removed: Vec<u32>,
+    /// The backend cannot run the pump itself: it holds no queue to deliver
+    /// on, and this crate names no VMM. It says what to watch and when to
+    /// stop; the transport forwards that to whoever owns the event queue.
+    pub(crate) pump_cmds: Vec<PumpCmd>,
+    /// Handles the message being served created, for the reply to carry.
+    created: Vec<u32>,
     next_mapping_id: u32,
+    pub(crate) session: Session,
+    pub(crate) config: BackendConfig,
+    /// Transport limits: what one request and one response may carry. The
+    /// transport sets them once it knows whether indirect descriptors were
+    /// negotiated.
+    pub(crate) max_req: u32,
+    pub(crate) max_resp: u32,
+    nodes: Option<Arc<HostNodes>>,
+    /// An already-signalled sync_file, made once and duplicated for every
+    /// SIGNALED_SYNC_FILE.
+    pub(crate) signaled: Option<OwnedFd>,
+    /// The host ioctl entry point. `libc::ioctl`, except in tests that need to
+    /// see what the host driver would be handed.
+    host_ioctl: HostIoctl,
+}
+
+/// `ioctl(2)` as the forwarding paths call it.
+pub(crate) type HostIoctl = unsafe fn(RawFd, u64, *mut u8) -> i32;
+
+/// The real one.
+///
+/// # Safety
+/// `arg` must point to at least `_IOC_SIZE(request)` writable bytes, which is
+/// what every forwarding path allocates (see [`ioctl_arg_len`]).
+unsafe fn libc_ioctl(fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+    // SAFETY: the caller's contract above.
+    unsafe { libc::ioctl(fd, request as libc::Ioctl, arg) }
+}
+
+/// How many bytes an ioctl argument buffer must have.
+///
+/// Every host driver behind these paths copies `_IOC_SIZE(cmd)` bytes in and
+/// back out of the argument, whatever the caller allocated: drm_ioctl sizes
+/// its copies by the command (drm_ioctl.c, `drm_ioctl`: `in_size = out_size =
+/// _IOC_SIZE(cmd)`), and nvidia.ko's frontend does the same with `arg_size`.
+/// A buffer sized to the guest's `data_len` with a larger size encoded in the
+/// command let the host write past the end of our heap allocation -- a guest
+/// choosing both numbers chose how far. So the buffer is the larger of the
+/// two, zero-filled, and only `data_len` bytes of it go back.
+pub(crate) fn ioctl_arg_len(cmd: u64, data_len: usize) -> usize {
+    hostfd::ioc_size(cmd as u32).max(data_len).max(1)
+}
+
+/// A zero-filled guarded buffer of [`ioctl_arg_len`] bytes holding `bytes`.
+fn ioctl_arg(cmd: u64, bytes: &[u8]) -> Option<GuardedBuf> {
+    let mut b = GuardedBuf::new(ioctl_arg_len(cmd, bytes.len()))?;
+    b.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+    Some(b)
 }
 
 /// A placement the guest can hand back, and everything needed to undo it.
-struct LiveMap {
-    key: (u64, u64),
+///
+/// This record is the extent's only owner. It used to share it with an
+/// `active_maps` entry keyed to the handle that made it, and closing that
+/// handle freed the extent there -- without withdrawing it from the window and
+/// without removing this record. A GEM proxy that outlived its owner file (a
+/// compositor holding a client's buffer after the client exited) kept the old
+/// placement mapped while the extent went to someone else's object, and its
+/// eventual MUNMAP withdrew and freed the *new* placement: two objects on one
+/// extent, then none. Now a close leaves the placement alone, and the extent
+/// is withdrawn and freed exactly once, when the last reference goes: the last
+/// MUNMAP of its id, or a session reset.
+pub(crate) struct LiveMap {
+    key: (u32, u64),
     region: crate::shm::ShmRegion,
     length: u64,
+    /// MMAP replies that handed this id out and have not been taken back.
+    refs: u32,
 }
 
 /// What to do with an ioctl the ABI profile does not vouch for.
@@ -433,6 +520,290 @@ pub enum AbiCheck {
     /// The guest disagrees with the host ABI about this struct's size.
     SizeMismatch { expected: u32, actual: u32 },
 }
+/// Where a v1 IOCTL goes, once it is allowed at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V1Route {
+    /// NVIDIA's RM escapes, type 'F', checked against the ABI profile.
+    Rm,
+    /// nvidia-uvm, whose command numbers carry type 0.
+    Uvm,
+    /// nvidia-modeset, type 'm'.
+    Nvkms,
+    /// An nvidia-drm GEM ioctl with an NVKMS parameter block behind a pointer:
+    /// (size of the outer struct, offset of the pointer, offset of its size).
+    DrmNested {
+        outer_size: usize,
+        ptr_offset: usize,
+        size_offset: usize,
+    },
+    /// A flat, pointer-free, fd-free ioctl the v1 guest sends on its render
+    /// handle.
+    DrmFlat,
+}
+
+/// nvidia-drm and DRM core commands the v1 guest forwards on a render handle,
+/// by their full numbers (nv_drm_common_ioctl.h:71-133, drm.h:1104). A full
+/// number fixes the size the host will copy, so a guest cannot pair a known
+/// nr with a larger `_IOC_SIZE`.
+const DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x41, 32);
+const DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x49, 24);
+const DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4a, 16);
+const DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4b, 24);
+const DRM_IOCTL_NVIDIA_GEM_EXPORT_DMABUF_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4d, 24);
+
+/// Whether a v1 IOCTL may run on a handle of `kind`, and how.
+///
+/// The v1 message forwards the guest's command number with the guest's bytes
+/// and none of IOCTL2's schema checks, so it is limited, by the backend's own
+/// tables and by the handle's kind, to what a v1 guest actually sends: RM
+/// escapes on the NVIDIA devices, UVM on the UVM devices, NVKMS on
+/// nvidia-modeset, and on a render node the three nested nvidia-drm GEM calls
+/// and three flat ones. Everything else is -EPERM, and every new kind -- a
+/// card, a lease, a sync_file -- takes no v1 ioctl at all. Without this a
+/// hostile guest kernel could send ADDFB2 as a v1 IOCTL on a KMS handle and
+/// reach nvidia-drm's NULL dereference on a non-NVKMS GEM object
+/// (nvidia-drm-fb.c:158-167) past every IOCTL2 check.
+///
+/// Three commands are refused on every handle
+/// ([`hostfd::refused_everywhere`]).
+///
+/// -EINVAL for a known command whose size does not match what was sent.
+fn v1_route(kind: HandleKind, cmd: u32, data_len: u32) -> std::result::Result<V1Route, i32> {
+    let ty = hostfd::ioc_type(cmd);
+    if hostfd::refused_everywhere(cmd) {
+        return Err(libc::EPERM);
+    }
+    let sized = |n: usize, r: V1Route| {
+        if data_len as usize == n {
+            Ok(r)
+        } else {
+            Err(libc::EINVAL)
+        }
+    };
+    match kind {
+        HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) if ty == b'F' => Ok(V1Route::Rm),
+        HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) if ty == 0 => Ok(V1Route::Uvm),
+        HandleKind::Dev(DeviceKind::Modeset) if ty == b'm' => Ok(V1Route::Nvkms),
+        HandleKind::DriRender(_) => match cmd {
+            DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY => sized(
+                32,
+                V1Route::DrmNested {
+                    outer_size: 32,
+                    ptr_offset: 8,
+                    size_offset: 16,
+                },
+            ),
+            DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY
+            | DRM_IOCTL_NVIDIA_GEM_EXPORT_DMABUF_MEMORY => sized(
+                24,
+                V1Route::DrmNested {
+                    outer_size: 24,
+                    ptr_offset: 8,
+                    size_offset: 16,
+                },
+            ),
+            DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET
+            | DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY
+            | hostfd::DRM_IOCTL_GEM_CLOSE => sized(hostfd::ioc_size(cmd), V1Route::DrmFlat),
+            _ => Err(libc::EPERM),
+        },
+        _ => Err(libc::EPERM),
+    }
+}
+
+/// The DRI section of a `GetSysFiles` response.
+///
+/// A count, then one `{name_len, major, minor, slot_index, dev_info[9]}`
+/// record and name per device. The guest uses these to register render nodes at the host's own
+/// major and minor and to build the sysfs tree beneath them.
+///
+/// This is not decoration for a headless guest. NVIDIA's Vulkan and EGL
+/// userspace enumerates the GPU through the DRM render node and not through
+/// `/dev/nvidia*`, which carry compute: the ICD stats the node, takes its
+/// major, and requires `/sys/dev/char/<major>:<minor>/device/drm` to exist
+/// before it will open it. Reporting none is why `vulkaninfo` found a
+/// driver it could load and then declined to create an instance, with no
+/// ioctl refused and nothing logged anywhere.
+fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
+    log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
+
+    if buf.len() < 4 {
+        return 0;
+    }
+    let mut off = 0;
+    buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
+    off += 4;
+
+    for d in devices {
+        // name_len, major, minor, slot_index, then the nine dev_info words.
+        let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
+        if off + need > buf.len() {
+            log::warn!("DRI section truncated at {}", d.name);
+            break;
+        }
+        for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
+            .into_iter()
+            .chain(d.dev_info)
+        {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            off += 4;
+        }
+        buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
+        off += d.name.len();
+    }
+    off
+}
+
+/// GET_SYS_FILES section 3: the card nodes, for compositor-VM mode.
+///
+/// A count, then `CardRecord {name_len, major, minor, render_index}` and the
+/// name per card. `render_index` names the DRI record of the same PCI device,
+/// so the guest attaches its primary minor to the same `drm_device` as the
+/// render node rather than inventing a second GPU.
+///
+/// The count is only written when the whole section fits: a count promising
+/// records that were cut off would have the guest parse zeroes as cards.
+fn write_card_section(cards: &[CardNode], buf: &mut [u8]) -> usize {
+    let need: usize = 4 + cards
+        .iter()
+        .map(|c| size_of::<CardRecord>() + c.name.len())
+        .sum::<usize>();
+    if need > buf.len() {
+        log::warn!(
+            "GET_SYS_FILES: no room for the {} card record(s)",
+            cards.len()
+        );
+        return 0;
+    }
+    log::info!("GET_SYS_FILES: {} card node(s) offered", cards.len());
+    let mut off = 0;
+    buf[..4].copy_from_slice(&(cards.len() as u32).to_le_bytes());
+    off += 4;
+    for c in cards {
+        off += write_struct(
+            &mut buf[off..],
+            &CardRecord {
+                name_len: c.name.len() as u32,
+                major: c.major,
+                minor: c.minor,
+                render_index: c.render_index,
+            },
+        );
+        buf[off..off + c.name.len()].copy_from_slice(c.name.as_bytes());
+        off += c.name.len();
+    }
+    off
+}
+
+/// `major:minor` from `/sys/class/drm/<name>/dev`.
+fn node_dev(name: &str) -> Option<(u32, u32)> {
+    let Ok(text) = std::fs::read_to_string(format!("/sys/class/drm/{name}/dev")) else {
+        log::warn!("DRI node {name} has no dev file");
+        return None;
+    };
+    let text = text.trim();
+    let parsed = text
+        .split_once(':')
+        .and_then(|(maj, min)| Some((maj.parse().ok()?, min.parse().ok()?)));
+    if parsed.is_none() {
+        log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
+    }
+    parsed
+}
+
+/// The render and card nodes the host's GPUs own.
+///
+/// Taken from `/sys/bus/pci/devices/<addr>/drm`, which is the kernel's own
+/// statement of which DRI nodes belong to which card -- rather than from
+/// the numbering of `/dev/dri`, where a node's index says nothing about
+/// which device it is.
+///
+/// Render nodes are what the guest is given to open. Card nodes are
+/// enumerated too, but a card node is a display device, and handing one out
+/// is a different kind of access from render: it is offered only in
+/// compositor-VM mode (GET_SYS_FILES section 3, HOST_OP OPEN_KMS). The list is
+/// kept in every mode because classification needs it: a lease fd is ours
+/// only if it is one of these cards.
+fn enumerate_host_nodes() -> HostNodes {
+    let mut nodes = HostNodes::default();
+    for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
+        .iter()
+        .enumerate()
+    {
+        let end = slot
+            .pci_addr
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(slot.pci_addr.len());
+        let addr = String::from_utf8_lossy(&slot.pci_addr[..end]).into_owned();
+        let dir = format!("/sys/bus/pci/devices/{addr}/drm");
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            log::warn!("no DRI nodes under {dir}");
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
+        let first_render = nodes.dri.len() as u32;
+        for name in names.iter().filter(|n| n.starts_with("renderD")) {
+            // The kernel prints "major:minor" here. A node listed under the
+            // PCI device with no `dev` file is not one we can reproduce.
+            let Some((major, minor)) = node_dev(name) else {
+                continue;
+            };
+            let dev_info = host_dev_info(&format!("/dev/dri/{name}")).unwrap_or_else(|| {
+                // Same shape the guest used to invent, so a refusal is no
+                // worse than the old behaviour -- but it is logged above.
+                let mut fallback = [0u32; NV_DEV_INFO_WORDS];
+                fallback[3] = 1; // supports_alloc
+                fallback[4] = 6; // generic_page_kind
+                fallback[5] = 2; // page_kind_generation
+                fallback[6] = 1; // sector_layout
+                fallback[7] = 1; // supports_sync_fd
+                fallback[8] = 1; // supports_semsurf
+                fallback
+            });
+            log::info!(
+                "DRI {name} at {major}:{minor} on {addr} (slot {index}, \
+                 nvidia gpu_id {:#x}, page kind {}/{}, sector layout {})",
+                dev_info[0],
+                dev_info[4],
+                dev_info[5],
+                dev_info[6],
+            );
+            nodes.dri.push(DriDevice {
+                name: name.clone(),
+                major,
+                minor,
+                slot_index: index as u32,
+                dev_info,
+            });
+        }
+        if nodes.dri.len() as u32 == first_render {
+            // A card with no render node of its own cannot be attached to a
+            // guest drm_device, so it is not offered.
+            continue;
+        }
+        for name in names.iter().filter(|n| n.starts_with("card")) {
+            let Some((major, minor)) = node_dev(name) else {
+                continue;
+            };
+            log::info!("DRM card {name} at {major}:{minor} on {addr}");
+            nodes.cards.push(CardNode {
+                name: name.clone(),
+                major,
+                minor,
+                render_index: first_render,
+            });
+        }
+    }
+    nodes
+}
+
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
@@ -446,18 +817,25 @@ impl NvidiaBackend {
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
             ioctls_by_ns: std::collections::BTreeMap::new(),
-            watch_added: Vec::new(),
-            watch_removed: Vec::new(),
+            pump_cmds: Vec::new(),
+            created: Vec::new(),
             next_mapping_id: 1,
             current_msg: MsgType::Ioctl,
             current_handle: 0,
+            current_req_id: 0,
             current_data_len: 0,
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
-            handle_kinds: std::collections::HashMap::new(),
             driver: None,
             abi: None,
+            session: Session::default(),
+            config: BackendConfig::default(),
+            max_req: MAX_XFER_DIRECT,
+            max_resp: MAX_XFER_DIRECT,
+            nodes: None,
+            signaled: None,
+            host_ioctl: libc_ioctl,
         }
     }
 
@@ -476,11 +854,6 @@ impl NvidiaBackend {
         self.shm.memfd_raw()
     }
 
-    /// Give the backend somewhere to place device memory.
-    ///
-    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
-    /// the mapping is real -- but the `mmap` that follows is refused, because
-    /// there is no address in the guest that names it.
     /// Forward ioctls the ABI profile does not describe, instead of refusing
     /// them. Diagnostic only: it exists to find out what a workload needs.
     pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
@@ -493,18 +866,43 @@ impl NvidiaBackend {
         self.abi_policy = policy;
     }
 
-    /// Descriptors opened and closed since this was last called.
-    ///
-    /// A transport calls it after serving messages and keeps its poll set in
-    /// step. Draining rather than reading, so two transports cannot both think
-    /// they own a watch.
-    pub fn take_watch_updates(&mut self) -> (Vec<(u32, RawFd)>, Vec<u32>) {
-        (
-            std::mem::take(&mut self.watch_added),
-            std::mem::take(&mut self.watch_removed),
-        )
+    /// What the backend was started with: compositor-VM mode, the Wayland
+    /// sockets, which schemas exist.
+    pub fn set_config(&mut self, config: BackendConfig) {
+        self.config = config;
     }
 
+    pub fn config(&self) -> &BackendConfig {
+        &self.config
+    }
+
+    /// Mutable access, for code that learns a capability after start-up (the
+    /// fence schemas setting `fences`, say).
+    pub fn config_mut(&mut self) -> &mut BackendConfig {
+        &mut self.config
+    }
+
+    /// How much one request and one response may carry. HELLO reports these
+    /// to the guest, and the transport enforces them.
+    pub fn set_transport_limits(&mut self, max_req: u32, max_resp: u32) {
+        self.max_req = max_req;
+        self.max_resp = max_resp;
+    }
+
+    /// Instructions for the event pump made since this was last called.
+    ///
+    /// A transport calls it after serving messages and forwards them in
+    /// order. Draining rather than reading, so two transports cannot both
+    /// think they own a watch.
+    pub fn take_pump_cmds(&mut self) -> Vec<PumpCmd> {
+        std::mem::take(&mut self.pump_cmds)
+    }
+
+    /// Give the backend somewhere to place device memory.
+    ///
+    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
+    /// the mapping is real -- but the `mmap` that follows is refused, because
+    /// there is no address in the guest that names it.
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
     }
@@ -538,6 +936,25 @@ impl NvidiaBackend {
             wc_size: 4096 * 4,
             wb_size: 4096 * 2,
         })
+    }
+
+    /// Put a descriptor straight into the table, as if an OPEN or an fd out
+    /// had produced it.
+    #[cfg(test)]
+    pub(crate) fn adopt_for_test(&mut self, fd: OwnedFd, kind: HandleKind) -> u32 {
+        self.handles.insert(fd, kind).expect("test table has room")
+    }
+
+    /// Replace host node enumeration, which needs real hardware.
+    #[cfg(test)]
+    pub(crate) fn set_host_nodes_for_test(&mut self, dri: Vec<DriDevice>, cards: Vec<CardNode>) {
+        self.nodes = Some(Arc::new(HostNodes { dri, cards }));
+    }
+
+    /// Replace the host ioctl, to see what a forwarding path hands the driver.
+    #[cfg(test)]
+    pub(crate) fn set_host_ioctl_for_test(&mut self, f: HostIoctl) {
+        self.host_ioctl = f;
     }
 
     // ------------------------------------------------------------------
@@ -632,38 +1049,78 @@ impl NvidiaBackend {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        // Restore SHM backing and reclaim every extent before closing host
-        // fds. A guest process that exits without unmapping is the normal
-        // case, not an error -- most of the mappings in a captured trace are
-        // still live when the process ends.
-        let leftovers: Vec<_> = self.active_maps.drain().into_iter().map(|e| e.region).collect();
-        for region in leftovers {
-            if let Err(e) = self.shm.free(&region) {
+        self.release_all();
+    }
+
+    /// Give back every placement and close every handle.
+    ///
+    /// Placements go first, and each is withdrawn from the window as well as
+    /// freed: a guest process that exits without unmapping is the normal
+    /// case, not an error -- most of the mappings in a captured trace are
+    /// still live when the process ends -- and the window must not keep host
+    /// device memory mapped into a range the next session will be handed.
+    pub(crate) fn release_all(&mut self) {
+        let live: Vec<LiveMap> = self.live_maps.drain().map(|(_, m)| m).collect();
+        for m in live {
+            self.release_extent(&m.region, m.length, "session end");
+        }
+        self.dri_maps.clear();
+        for e in self.active_maps.drain() {
+            self.release_extent(&e.region, e.shm_length, "session end");
+        }
+        self.handles.drain_all();
+    }
+
+    /// Withdraw a placement from the window and return its extent. Called
+    /// exactly once per extent, by whichever record owns it.
+    fn release_extent(&mut self, region: &crate::shm::ShmRegion, length: u64, why: &str) {
+        // Emptied rather than unmapped: a hole would leave the memory slot
+        // covering a range that reaches no mapping at all, and a stray access
+        // there faults the VMM rather than the guest.
+        if let Some(window) = self.window.as_ref() {
+            if let Err(e) = window.withdraw(region.offset, length) {
                 log::warn!(
-                    "teardown: SHM free of {:#x}+{:#x} failed: {}",
-                    region.offset,
-                    region.length,
-                    e
+                    "{why}: the window would not give back {:#x}+{length:#x}: {e}",
+                    region.offset
                 );
             }
         }
-        self.handles.drain_all();
+        if let Err(e) = self.shm.free(region) {
+            log::warn!("{why}: freeing window region {:#x}: {e}", region.offset);
+        }
+    }
+
+    /// The host DRM nodes, enumerated on first use.
+    pub(crate) fn host_nodes(&mut self) -> Arc<HostNodes> {
+        self.nodes
+            .get_or_insert_with(|| Arc::new(enumerate_host_nodes()))
+            .clone()
     }
 
     // ------------------------------------------------------------------
     // Top-level dispatch
     // ------------------------------------------------------------------
 
-    pub fn dispatch(&mut self, req_buf: &[u8], resp_buf: &mut [u8]) -> usize {
+    /// Serve one request whose response buffer holds `cap` bytes.
+    ///
+    /// Most messages are answered here and now. An IOCTL2 comes back as
+    /// [`Outcome::Ioctl2`]: validated and holding everything it needs, to be
+    /// executed with no backend lock held and then handed to
+    /// [`NvidiaBackend::finish_ioctl2`].
+    pub fn serve(&mut self, req_buf: &[u8], cap: usize) -> Outcome {
+        self.created.clear();
         if req_buf.len() < size_of::<MsgHeader>() {
-            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0);
+            self.current_msg = MsgType::Ioctl;
+            self.current_req_id = 0;
+            return Outcome::Reply(self.error_reply(libc::EPROTO));
         }
         let hdr = read_struct::<MsgHeader>(req_buf, 0);
+        self.current_req_id = hdr.req_id;
 
         let Some(msg_type) = MsgType::from_u32(hdr.msg_type) else {
             log::warn!("unknown msg_type {}", hdr.msg_type);
             self.current_msg = MsgType::Ioctl;
-            return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0);
+            return Outcome::Reply(self.error_reply(libc::EPROTO));
         };
         self.current_msg = msg_type;
         *self
@@ -693,6 +1150,66 @@ impl NvidiaBackend {
         self.current_handle = hdr.handle;
 
         let payload = &req_buf[size_of::<MsgHeader>()..];
+        let mut reply = match msg_type {
+            MsgType::Hello
+            | MsgType::Ioctl2
+            | MsgType::TimeSync
+            | MsgType::Watch
+            | MsgType::Unwatch
+            | MsgType::HostOp => match self.serve_v2(msg_type, payload, cap) {
+                Outcome::Reply(r) => r,
+                pending => return pending,
+            },
+            // The Wayland channel is not served yet. -EPROTO is what an old
+            // backend answers to an unknown message.
+            MsgType::WlSend | MsgType::WlRecv => self.error_reply(libc::EPROTO),
+            _ => {
+                // The v1 handlers write into a buffer of the response's size.
+                // Zeroed, so nothing of an earlier response can reach the
+                // guest through a short write.
+                let mut buf = vec![0u8; cap.min(self.max_resp as usize)];
+                let n = self.dispatch_v1(msg_type, payload, &mut buf);
+                buf.truncate(n);
+                Reply {
+                    bytes: buf,
+                    stamp_at: None,
+                    created: std::mem::take(&mut self.created),
+                }
+            }
+        };
+        if reply.bytes.len() > cap {
+            // Nothing the guest could read: say why in a header, if even that
+            // fits, and take back whatever the message created.
+            let created = std::mem::take(&mut reply.created);
+            self.close_handles(&created);
+            reply = self.error_reply(libc::EMSGSIZE);
+            if reply.bytes.len() > cap {
+                reply.bytes.clear();
+            }
+        }
+        Outcome::Reply(reply)
+    }
+
+    /// Serve one request into a caller-supplied buffer, all the way through:
+    /// an IOCTL2 is executed inline, a TIME_SYNC stamped at once.
+    ///
+    /// For callers that have no executor and no ring -- tests, and the
+    /// socket harness. Returns the bytes written.
+    pub fn dispatch(&mut self, req_buf: &[u8], resp_buf: &mut [u8]) -> usize {
+        let mut reply = match self.serve(req_buf, resp_buf.len()) {
+            Outcome::Reply(r) => r,
+            Outcome::Ioctl2(mut p) => {
+                p.execute();
+                self.finish_ioctl2(p)
+            }
+        };
+        reply.stamp();
+        let n = reply.bytes.len().min(resp_buf.len());
+        resp_buf[..n].copy_from_slice(&reply.bytes[..n]);
+        n
+    }
+
+    fn dispatch_v1(&mut self, msg_type: MsgType, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         match msg_type {
             MsgType::Open => self.handle_open(0, payload, resp_buf),
             MsgType::Close => self.handle_close(0, payload, resp_buf),
@@ -703,25 +1220,13 @@ impl NvidiaBackend {
             MsgType::GetSysFiles => self.handle_get_files(FileTree::Sys, resp_buf),
             // Host to guest only. A guest that sends one is confused about the
             // direction of the queue, and saying so beats serving it.
-            MsgType::EventReady => {
-                log::warn!("EventReady arrived from the guest; that message only travels outward");
+            MsgType::EventReady | MsgType::EventData => {
+                log::warn!(
+                    "{msg_type:?} arrived from the guest; that message only travels outward"
+                );
                 self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
             }
-            MsgType::EventData => {
-                log::warn!("EventData arrived from the guest; that message only travels outward");
-                self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
-            }
-            // Protocol v2 is not served yet. -EPROTO is exactly what an old
-            // backend answers to an unknown message, so a v2 guest falls back
-            // to v1 cleanly.
-            MsgType::Hello
-            | MsgType::Ioctl2
-            | MsgType::TimeSync
-            | MsgType::Watch
-            | MsgType::Unwatch
-            | MsgType::HostOp
-            | MsgType::WlSend
-            | MsgType::WlRecv => self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0),
+            _ => self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0),
         }
     }
 
@@ -735,7 +1240,25 @@ impl NvidiaBackend {
         }
         let req = read_struct::<OpenReq>(payload, 0);
 
-        let path = match device_path_with(req.device_type, &self.dri_devices()) {
+        let kind = match DeviceKind::from_device_type(req.device_type) {
+            // Cards are reached only through HOST_OP OPEN_KMS, which ties the
+            // host card file to a guest file's render handle and exists only
+            // in compositor-VM mode. An OPEN of one would hand a guest a
+            // file that is DRM master of the host's display.
+            Some(DeviceKind::DriCard(n)) => {
+                log::warn!("OPEN of card {n} refused: cards are opened through HOST_OP OPEN_KMS");
+                return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, libc::EPERM);
+            }
+            Some(DeviceKind::Dri(n)) => HandleKind::DriRender(n),
+            Some(k) => HandleKind::Dev(k),
+            None => {
+                log::warn!("handle_open: invalid device type {}", req.device_type);
+                return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, 0);
+            }
+        };
+
+        let nodes = self.host_nodes();
+        let path = match device_path_with(req.device_type, &nodes.dri) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("handle_open: {}", e);
@@ -743,6 +1266,10 @@ impl NvidiaBackend {
             }
         };
 
+        // Never O_NONBLOCK, whatever the guest asked: nvidia-modeset skips
+        // poll_wait for a non-blocking file (nvidia-modeset-linux.c:2023-
+        // 2025), so the pump would never hear of its events. The guest keeps
+        // its own O_NONBLOCK and applies it locally.
         let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw_fd < 0 {
             let err = std::io::Error::last_os_error();
@@ -750,22 +1277,35 @@ impl NvidiaBackend {
             log::warn!("open({:?}) failed: {}", path, err);
             return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, errno);
         }
-
-        let guest_handle = self.handles.insert(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        // Kept because caching depends on which device a mapping came from, and
-        // by the time an mmap arrives only the handle is in hand.
-        if let Some(kind) = DeviceKind::from_device_type(req.device_type) {
-            self.handle_kinds.insert(guest_handle, kind);
-        }
+        // SAFETY: a descriptor open() just returned, owned from here on.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         // The guest may wait on this descriptor, and only the host's copy ever
-        // becomes readable. Offered to the transport as watchable; duplicated
-        // there rather than here, so the watch cannot outlive this table's fd.
-        self.watch_added.push((guest_handle as u32, raw_fd));
+        // becomes readable. The pump gets a duplicate of its own, so the watch
+        // cannot outlive this table's fd by watching a reused number.
+        let watch = match kind {
+            HandleKind::Dev(_) => fd.try_clone().ok(),
+            _ => None,
+        };
+        let guest_handle = match self.handles.insert(fd, kind) {
+            Ok(h) => h,
+            Err(full) => {
+                log::warn!("open {:?}: handle table full", path);
+                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, full.errno());
+            }
+        };
+        if let Some(fd) = watch {
+            self.pump_cmds.push(PumpCmd::Watch {
+                handle: guest_handle,
+                fd,
+                mode: WatchMode::Legacy,
+            });
+        }
+        self.created.push(guest_handle);
         log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
 
         // The handle is returned in the header. The driver reads it from there
         // and there is no response payload at all.
-        self.write_hdr(resp_buf, guest_handle as u32, 0)
+        self.write_hdr(resp_buf, guest_handle, 0)
     }
 
     // ------------------------------------------------------------------
@@ -784,19 +1324,34 @@ impl NvidiaBackend {
         }
         let req = read_struct::<MmapReq>(payload, 0);
 
+        // Only files that have device memory to place: the NVIDIA devices and
+        // DRM nodes. A sync_file, a dmabuf or a compositor's memfd reached
+        // through here would put host memory in the window by a path nobody
+        // designed for it.
+        match self.current_kind() {
+            Some(
+                HandleKind::Dev(_)
+                | HandleKind::DriRender(_)
+                | HandleKind::DrmCard(_)
+                | HandleKind::DrmLease(_),
+            )
+            | None => {}
+            Some(k) => {
+                log::warn!("mmap on handle {} ({k:?}) refused", self.current_handle);
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EPERM);
+            }
+        }
+
         // A DRM node never takes the recorded path. Its bookkeeping is keyed by
         // the file, and one open of a node holds every object a client ever
         // allocates -- so the second object's mmap would find the first one's
         // entry and hand back the first one's memory. The objects are told
         // apart by the offset, and that is what the path below keys on.
-        if matches!(
-            self.handle_kinds.get(&(self.current_handle as u64)),
-            Some(DeviceKind::Dri(_))
-        ) {
+        if self.current_kind().and_then(HandleKind::index).is_some() {
             return self.map_unrecorded(req.size, req.offset, resp_buf);
         }
 
-        let entry = match self.active_maps.find_by_fd_handle(self.current_handle as u64) {
+        let entry = match self.active_maps.find_by_fd_handle(self.current_handle) {
             Some(e) => e,
             None => {
                 // Bookkeeping here records what RM_MAP_MEMORY armed, and that
@@ -837,6 +1392,15 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
+        log::debug!("mmap: window offset {offset:#x}+{length:#x}");
+        self.write_mmap_resp(resp_buf, offset, mapped_pages, 0)
+    }
+
+    fn current_kind(&self) -> Option<HandleKind> {
+        self.handles.kind(self.current_handle)
+    }
+
+    fn write_mmap_resp(&self, resp_buf: &mut [u8], offset: u64, size: u64, id: u32) -> usize {
         let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
         if resp_buf.len() < need {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
@@ -846,12 +1410,11 @@ impl NvidiaBackend {
             &mut resp_buf[off..],
             &MmapResp {
                 guest_phys_addr: offset,
-                size: mapped_pages,
-                mapping_id: 0,
+                size,
+                mapping_id: id,
                 padding: 0,
             },
         );
-        log::debug!("mmap: window offset {offset:#x}+{length:#x}");
         off
     }
 
@@ -861,7 +1424,7 @@ impl NvidiaBackend {
     /// only the source of the length differs — the guest's request, since there
     /// is no stored region to take it from.
     fn map_unrecorded(&mut self, size: u64, offset: u64, resp_buf: &mut [u8]) -> usize {
-        let handle = self.current_handle as u64;
+        let handle = self.current_handle;
         let host_fd = match self.handles.get_raw(handle) {
             Ok(fd) => fd,
             Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT),
@@ -870,9 +1433,11 @@ impl NvidiaBackend {
         // Caching follows the device, which is the same rule the recorded path
         // reaches through the flags RM returns: the control device carries
         // system memory, and a GPU device carries the card's own.
-        let kind = self.handle_kinds.get(&handle).copied();
+        let kind = self.current_kind();
+        let drm = kind.and_then(HandleKind::index).is_some();
         let pgprot = match kind {
-            Some(DeviceKind::Gpu(_)) | Some(DeviceKind::Dri(_)) => crate::shm::PgprotKind::WriteCombine,
+            Some(HandleKind::Dev(DeviceKind::Gpu(_))) => crate::shm::PgprotKind::WriteCombine,
+            _ if drm => crate::shm::PgprotKind::WriteCombine,
             _ => crate::shm::PgprotKind::WriteBack,
         };
 
@@ -881,31 +1446,17 @@ impl NvidiaBackend {
         // memory is reachable nowhere else. Everywhere else the offset is a
         // cookie RM chose, which names no position at all, and mapping the file
         // there would either fail or land on unrelated memory.
-        let fd_offset = match kind {
-            Some(DeviceKind::Dri(_)) => offset,
-            _ => 0,
-        };
+        let fd_offset = if drm { offset } else { 0 };
 
         // The same object mapped twice is the same memory: hand back the
-        // placement that is already there rather than a second copy of it.
+        // placement that is already there rather than a second copy of it,
+        // and count the reference, so the first MUNMAP does not pull it from
+        // under the second user.
         if let Some(&id) = self.dri_maps.get(&(handle, fd_offset)) {
-            if let Some(live) = self.live_maps.get(&id) {
+            if let Some(live) = self.live_maps.get_mut(&id) {
+                live.refs += 1;
                 let (offset, length) = (live.region.offset, live.length);
-                let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
-                if resp_buf.len() < need {
-                    return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
-                }
-                let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
-                off += write_struct(
-                    &mut resp_buf[off..],
-                    &MmapResp {
-                        guest_phys_addr: offset,
-                        size: length.div_ceil(4096) * 4096,
-                        mapping_id: id,
-                        padding: 0,
-                    },
-                );
-                return off;
+                return self.write_mmap_resp(resp_buf, offset, length.div_ceil(4096) * 4096, id);
             }
         }
 
@@ -920,6 +1471,9 @@ impl NvidiaBackend {
 
         let Some(window) = self.window.as_ref() else {
             log::warn!("mmap on handle {handle}: no shared window to place it in");
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("mmap on handle {handle}: freeing the unused region: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
         };
         if let Err(e) = window.place(region.offset, length, host_fd, fd_offset, true) {
@@ -927,7 +1481,9 @@ impl NvidiaBackend {
                 "mmap on handle {handle}: nothing armed on this file, or it could \
                  not be placed: {e}"
             );
-            self.shm.free(&region);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("mmap on handle {handle}: freeing the unused region: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
@@ -938,8 +1494,7 @@ impl NvidiaBackend {
         );
 
         let offset = region.offset;
-        let id = self.next_mapping_id;
-        self.next_mapping_id = self.next_mapping_id.wrapping_add(1).max(1);
+        let id = self.next_mapping_id();
         self.dri_maps.insert((handle, fd_offset), id);
         self.live_maps.insert(
             id,
@@ -947,35 +1502,21 @@ impl NvidiaBackend {
                 key: (handle, fd_offset),
                 region,
                 length,
+                refs: 1,
             },
         );
-        self.active_maps.insert(
-            offset,
-            crate::mmap::MmapEntry {
-                host_p_linear_address: 0,
-                shm_length: length,
-                h_client: 0,
-                h_memory: 0,
-                map_fd_handle: handle,
-                region,
-            },
-        );
+        self.write_mmap_resp(resp_buf, offset, length.div_ceil(4096) * 4096, id)
+    }
 
-        let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
-        if resp_buf.len() < need {
-            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+    /// A mapping id no live placement has. Zero means "none" to the guest.
+    fn next_mapping_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_mapping_id;
+            self.next_mapping_id = self.next_mapping_id.wrapping_add(1).max(1);
+            if !self.live_maps.contains_key(&id) {
+                return id;
+            }
         }
-        let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
-        off += write_struct(
-            &mut resp_buf[off..],
-            &MmapResp {
-                guest_phys_addr: offset,
-                size: length.div_ceil(4096) * 4096,
-                mapping_id: id,
-                padding: 0,
-            },
-        );
-        off
     }
 
     fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
@@ -988,23 +1529,21 @@ impl NvidiaBackend {
         // taken back by RM_UNMAP_MEMORY, which names them by the address in
         // pLinearAddress. Reported as success so a guest tearing one down does
         // not log a failure for a mapping it never received an id for.
-        let Some(live) = self.live_maps.remove(&req.mapping_id) else {
+        let Some(live) = self.live_maps.get_mut(&req.mapping_id) else {
             return self.write_hdr(resp_buf, 0, 0);
         };
-        self.dri_maps.remove(&live.key);
-
-        // Emptied rather than unmapped: a hole would leave the memory slot
-        // covering a range that reaches no mapping at all, and a stray access
-        // there faults the VMM rather than the guest.
-        if let Some(window) = self.window.as_ref() {
-            if let Err(e) = window.withdraw(live.region.offset, live.length) {
-                log::warn!("munmap {}: the window would not give it back: {e}", req.mapping_id);
-            }
+        live.refs -= 1;
+        if live.refs > 0 {
+            return self.write_hdr(resp_buf, 0, 0);
         }
-        self.active_maps.remove(live.region.offset);
-        if let Err(e) = self.shm.free(&live.region) {
-            log::warn!("munmap {}: freeing the window region: {e}", req.mapping_id);
+        let live = self
+            .live_maps
+            .remove(&req.mapping_id)
+            .expect("looked up above");
+        if self.dri_maps.get(&live.key) == Some(&req.mapping_id) {
+            self.dri_maps.remove(&live.key);
         }
+        self.release_extent(&live.region, live.length, "munmap");
         log::debug!(
             "munmap {}: window offset {:#x}+{:#x} is free again",
             req.mapping_id,
@@ -1071,137 +1610,19 @@ impl NvidiaBackend {
         //
         // Headless forwarding hands out no render node, so the count is zero
         // and it still has to be written.
+        //
+        // In compositor-VM mode a third follows: the card nodes. Only then --
+        // an old guest stops parsing after the DRI section and a new one reads
+        // the zeroed rest of its buffer as "no cards", so leaving it out is
+        // how the other modes say there are none.
         if tree == FileTree::Sys {
-            off += self.write_dri_section(&mut resp_buf[off..]);
+            let nodes = self.host_nodes();
+            off += write_dri_section(&nodes.dri, &mut resp_buf[off..]);
+            if self.config.kms_card {
+                off += write_card_section(&nodes.cards, &mut resp_buf[off..]);
+            }
         }
         off
-    }
-
-    /// The DRI section of a `GetSysFiles` response.
-    ///
-    /// A count, then one `{name_len, major, minor, slot_index, dev_info[9]}`
-    /// record and name per device. The guest uses these to register render nodes at the host's own
-    /// major and minor and to build the sysfs tree beneath them.
-    ///
-    /// This is not decoration for a headless guest. NVIDIA's Vulkan and EGL
-    /// userspace enumerates the GPU through the DRM render node and not through
-    /// `/dev/nvidia*`, which carry compute: the ICD stats the node, takes its
-    /// major, and requires `/sys/dev/char/<major>:<minor>/device/drm` to exist
-    /// before it will open it. Reporting none is why `vulkaninfo` found a
-    /// driver it could load and then declined to create an instance, with no
-    /// ioctl refused and nothing logged anywhere.
-    fn write_dri_section(&self, buf: &mut [u8]) -> usize {
-        let devices = self.dri_devices();
-        log::info!("GET_SYS_FILES: {} DRI device(s)", devices.len());
-
-        if buf.len() < 4 {
-            return 0;
-        }
-        let mut off = 0;
-        buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
-        off += 4;
-
-        for d in &devices {
-            // name_len, major, minor, slot_index, then the nine dev_info words.
-            let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
-            if off + need > buf.len() {
-                log::warn!("DRI section truncated at {}", d.name);
-                break;
-            }
-            for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
-                .into_iter()
-                .chain(d.dev_info)
-            {
-                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-                off += 4;
-            }
-            buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
-            off += d.name.len();
-        }
-        off
-    }
-
-    /// The render nodes the host's GPUs own.
-    ///
-    /// Taken from `/sys/bus/pci/devices/<addr>/drm`, which is the kernel's own
-    /// statement of which DRI nodes belong to which card -- rather than from
-    /// the numbering of `/dev/dri`, where a node's index says nothing about
-    /// which device it is.
-    ///
-    /// Only render nodes are offered. A card node is a display device and this
-    /// device forwards compute and render; handing one out would be a
-    /// different kind of access than the guest asked for.
-    fn dri_devices(&self) -> Vec<DriDevice> {
-        let mut out = Vec::new();
-        for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
-            .iter()
-            .enumerate()
-        {
-            let end = slot
-                .pci_addr
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(slot.pci_addr.len());
-            let addr = String::from_utf8_lossy(&slot.pci_addr[..end]).into_owned();
-            let dir = format!("/sys/bus/pci/devices/{addr}/drm");
-
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                log::warn!("no DRI nodes under {dir}");
-                continue;
-            };
-            let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("renderD"))
-                .collect();
-            names.sort();
-
-            for name in names {
-                // The kernel prints "major:minor" here. A node listed under the
-                // PCI device with no `dev` file is not one we can reproduce.
-                let Ok(text) = std::fs::read_to_string(format!("/sys/class/drm/{name}/dev")) else {
-                    log::warn!("DRI node {name} has no dev file");
-                    continue;
-                };
-                let text = text.trim();
-                let Some((maj, min)) = text.split_once(':') else {
-                    log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
-                    continue;
-                };
-                let (Ok(major), Ok(minor)) = (maj.parse::<u32>(), min.parse::<u32>()) else {
-                    log::warn!("DRI node {name}: cannot read {text:?} as major:minor");
-                    continue;
-                };
-                let dev_info = host_dev_info(&format!("/dev/dri/{name}")).unwrap_or_else(|| {
-                    // Same shape the guest used to invent, so a refusal is no
-                    // worse than the old behaviour -- but it is logged above.
-                    let mut fallback = [0u32; NV_DEV_INFO_WORDS];
-                    fallback[3] = 1; // supports_alloc
-                    fallback[4] = 6; // generic_page_kind
-                    fallback[5] = 2; // page_kind_generation
-                    fallback[6] = 1; // sector_layout
-                    fallback[7] = 1; // supports_sync_fd
-                    fallback[8] = 1; // supports_semsurf
-                    fallback
-                });
-                log::info!(
-                    "DRI {name} at {major}:{minor} on {addr} (slot {index}, \
-                     nvidia gpu_id {:#x}, page kind {}/{}, sector layout {})",
-                    dev_info[0],
-                    dev_info[4],
-                    dev_info[5],
-                    dev_info[6],
-                );
-                out.push(DriDevice {
-                    name,
-                    major,
-                    minor,
-                    slot_index: index as u32,
-                    dev_info,
-                });
-            }
-        }
-        out
     }
 
     // ------------------------------------------------------------------
@@ -1210,33 +1631,37 @@ impl NvidiaBackend {
 
     fn handle_close(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         let _ = payload;
-        let handle = self.current_handle as u64;
+        match self.close_handle(self.current_handle) {
+            Ok(()) => self.write_hdr(resp_buf, 0, 0),
+            Err(_) => self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
+        }
+    }
 
-        // Closing a device fd releases whatever it was mapping. For some
-        // clients this is the only release there is -- a CUDA run maps 29
-        // times and never unmaps once -- so leaving it to teardown means every
-        // run costs the write-combine zone tens of megabytes for the life of
-        // the VM.
+    /// Close one handle, and everything that exists only because of it.
+    ///
+    /// RM mappings go with the file that carries them. For some clients that
+    /// is the only release there is -- a CUDA run maps 29 times and never
+    /// unmaps once -- so leaving them to teardown would cost the write-combine
+    /// zone tens of megabytes for the life of the VM.
+    ///
+    /// Window placements of DRM objects do *not* go: a GEM proxy in another
+    /// guest file may still have one mapped (see [`LiveMap`]). Only the lookup
+    /// that would hand the placement to a new mmap on this handle goes.
+    pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
+        let (fd, kind) = self.handles.remove(handle)?;
         for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
-                "close handle={}: releasing mapping at SHM {:#x}+{:#x}",
-                handle,
+                "close handle={handle}: releasing mapping at SHM {:#x}+{:#x}",
                 entry.region.offset,
                 entry.region.length
             );
-            if let Err(e) = self.shm.free(&entry.region) {
-                log::warn!("close handle={handle}: SHM free failed: {e}");
-            }
+            self.release_extent(&entry.region, entry.shm_length, "close");
         }
-
-        match self.handles.remove(handle) {
-            Ok(()) => {
-                log::debug!("close handle={handle}");
-                self.watch_removed.push(handle as u32);
-                self.write_hdr(resp_buf, 0, 0)
-            }
-            Err(_) => self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
-        }
+        self.dri_maps.retain(|(h, _), _| *h != handle);
+        self.pump_cmds.push(PumpCmd::Unwatch { handle });
+        log::debug!("close handle={handle} ({kind:?})");
+        drop(fd);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1304,8 +1729,7 @@ impl NvidiaBackend {
         // refers to, back to back. The handlers below already expect that
         // layout, so the two lengths only need adding up here.
         let body = &payload[size_of::<IoctlReq>()..];
-        let want =
-            ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
+        let want = ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
         if body.len() < want {
             log::warn!(
                 "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
@@ -1333,9 +1757,12 @@ impl NvidiaBackend {
         self.current_data_len = ireq.data_len;
 
         let request = ireq.cmd as u64;
-        let host_fd = match self.handles.get_raw(self.current_handle as u64) {
-            Ok(fd) => fd,
-            Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
+        let (host_fd, kind) = match (
+            self.handles.get_raw(self.current_handle),
+            self.current_kind(),
+        ) {
+            (Ok(fd), Some(kind)) => (fd, kind),
+            _ => return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
         };
 
         let escape = (request & 0xFF) as u32;
@@ -1352,117 +1779,66 @@ impl NvidiaBackend {
         };
         *self.ioctls_by_ns.entry((ns, escape)).or_insert(0) += 1;
 
-        // Only NVIDIA's own magic is described by the ABI tables; modeset and
-        // uvm use different namespaces.
-        if ioc_type == b'F' as u32 {
-            // Only NVIDIA's own magic is described by the tables. UVM (type 0)
-            // and modeset ('m') are forwarded with no equivalent check, which
-            // is a gap and not a decision.
-            let refuse = match self.check_abi(escape, ireq.data_len) {
-                AbiCheck::SizeMismatch { expected, actual } => {
-                    log::warn!(
-                        "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
-                         {expected}",
-                        self.driver.expect("a profile implies a known version")
-                    );
-                    true
-                }
-                AbiCheck::UnknownEscape => {
-                    log::warn!(
-                        "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                        self.driver.expect("a profile implies a known version")
-                    );
-                    true
-                }
-                // No profile yet means CHECK_VERSION_STR has not been answered,
-                // which is itself one of the first ioctls a client sends.
-                // Refusing here would refuse the call that makes checking
-                // possible at all.
-                AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
-            };
-
-            if refuse {
-                *self.abi_refused.entry(escape).or_insert(0) += 1;
-                if self.abi_policy == AbiPolicy::Enforce {
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::EINVAL,
-                    );
-                }
+        let route = match v1_route(kind, ireq.cmd, ireq.data_len) {
+            Ok(r) => r,
+            Err(errno) => {
+                log::warn!(
+                    "v1 ioctl {:#010x} ({} bytes) on handle {} ({kind:?}) refused: {}",
+                    ireq.cmd,
+                    ireq.data_len,
+                    self.current_handle,
+                    if errno == libc::EPERM {
+                        "not a call this kind of handle takes over v1"
+                    } else {
+                        "its size does not match the command"
+                    }
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
-        }
+        };
 
-        // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
-        if ioc_type == 0x6d {
-            // NVKMS multiplexes every operation through one ioctl number, so
-            // the number says nothing and the command inside says everything.
-            // Logged because two of them came back EPERM in a guest while the
-            // same client on the host got zero for all of them, and an ioctl
-            // number alone cannot say which two.
-            if param_in.len() >= 4 {
-                let nvkms_cmd = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
-                log::debug!("NVKMS cmd={nvkms_cmd} (0x{nvkms_cmd:x})");
-
+        match route {
+            V1Route::Rm => {}
+            V1Route::Uvm | V1Route::DrmFlat => {
+                return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
             }
-            // REGISTER_SURFACE carries one of our handles where NVKMS expects a
-            // descriptor, because a guest's descriptor number means nothing
-            // here. Told where it sits, the forwarder puts our own descriptor
-            // back. See the driver's side of this, which explains why it only
-            // shows up on some driver versions.
-            let nvkms_fd_offset = if param_in.len() >= 4
-                && u32::from_le_bytes(param_in[0..4].try_into().unwrap()) == NVKMS_REGISTER_SURFACE
-            {
-                Some(NVKMS_SURFACE_FD_OFFSET)
-            } else {
-                None
-            };
-
-            return self.dispatch_nested(
-                cookie,
-                host_fd,
-                request,
-                param_in,
-                resp_buf,
-                16, // outer_size
-                8,  // ptr_offset
-                4,  // size_offset
-                deep_in,
-                nvkms_fd_offset,
-            );
-        }
-
-        // nvidia-drm's GEM ioctls: type 'd' (0x64), and `escape` is the
-        // absolute DRM ioctl number, not an offset from DRM_COMMAND_BASE.
-        //
-        // Three of them carry a userspace pointer to an NVKMS parameter block,
-        // in the same shape nvidia-modeset uses, so they take the same path;
-        // the flat ones fall through to the passthrough below.
-        //
-        // A missing entry here does not refuse anything: the ioctl is
-        // forwarded with the guest's own pointer still in it and a memFd that
-        // means nothing in this process, and the host answers EINVAL from
-        // somewhere far away. 0x49 was absent for exactly that reason and cost
-        // a round of chasing the host's own dmesg to find. Nothing here translates the GEM handles in these structs: a
-        // handle is per drm_file, and the guest's open of its render node
-        // holds exactly one open of ours, so the handle the host driver issues
-        // is already scoped to the file that will use it.
-        //
-        // Sizes and offsets are from NVIDIA's
-        // kernel-open/nvidia-drm/nv_drm_common_ioctl.h, and the guest driver
-        // holds the same numbers in nvgpu_gem_import_nvkms /
-        // nvgpu_gem_export_dmabuf. Both halves have to be changed together.
-        if ioc_type == b'd' as u32 {
-            // (outer_size, ptr_offset, size_offset)
-            let nested = match escape {
-                0x41 => Some((32usize, 8usize, 16usize)), // GEM_IMPORT_NVKMS_MEMORY
-                0x49 => Some((24usize, 8usize, 16usize)), // GEM_EXPORT_NVKMS_MEMORY
-                0x4d => Some((24usize, 8usize, 16usize)), // GEM_EXPORT_DMABUF_MEMORY
-                _ => None,
-            };
-            log::debug!("drm ioctl nr={escape:#04x} ({} bytes in)", param_in.len());
-            if let Some((outer_size, ptr_offset, size_offset)) = nested {
+            V1Route::Nvkms => {
+                // NVKMS multiplexes every operation through one ioctl number,
+                // so the number says nothing and the command inside says
+                // everything. Logged because two of them came back EPERM in a
+                // guest while the same client on the host got zero for all of
+                // them, and an ioctl number alone cannot say which two.
+                let nvkms_cmd = (param_in.len() >= 4)
+                    .then(|| u32::from_le_bytes(param_in[0..4].try_into().unwrap()));
+                if let Some(c) = nvkms_cmd {
+                    log::debug!("NVKMS cmd={c} (0x{c:x})");
+                }
+                // REGISTER_SURFACE carries one of our handles where NVKMS
+                // expects a descriptor, because a guest's descriptor number
+                // means nothing here. Told where it sits, the forwarder puts
+                // our own descriptor back. See the driver's side of this,
+                // which explains why it only shows up on some driver versions.
+                let nvkms_fd_offset =
+                    (nvkms_cmd == Some(NVKMS_REGISTER_SURFACE)).then_some(NVKMS_SURFACE_FD_OFFSET);
+                return self.dispatch_nested(
+                    cookie,
+                    host_fd,
+                    request,
+                    param_in,
+                    resp_buf,
+                    16, // outer_size
+                    8,  // ptr_offset
+                    4,  // size_offset
+                    deep_in,
+                    nvkms_fd_offset,
+                );
+            }
+            V1Route::DrmNested {
+                outer_size,
+                ptr_offset,
+                size_offset,
+            } => {
+                log::debug!("drm ioctl nr={escape:#04x} ({} bytes in)", param_in.len());
                 return self.dispatch_nested(
                     cookie,
                     host_fd,
@@ -1479,13 +1855,33 @@ impl NvidiaBackend {
             }
         }
 
-        // Escape numbers below are NVIDIA's, and they are only NVIDIA's inside
-        // type 'F'. Other namespaces reuse the same numbers for their own
-        // commands -- nvidia-drm's DMABUF_SUPPORTED is nr 0x4f, which is
-        // NV_ESC_RM_UNMAP_MEMORY here -- so anything that is not RM is handed
-        // to the host as it arrived rather than matched against this table.
-        if ioc_type != b'F' as u32 {
-            return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
+        // Only NVIDIA's own magic is described by the ABI tables.
+        let refuse = match self.check_abi(escape, ireq.data_len) {
+            AbiCheck::SizeMismatch { expected, actual } => {
+                log::warn!(
+                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
+                     {expected}",
+                    self.driver.expect("a profile implies a known version")
+                );
+                true
+            }
+            AbiCheck::UnknownEscape => {
+                log::warn!(
+                    "escape {escape:#04x} is not in the ABI profile for host driver {}",
+                    self.driver.expect("a profile implies a known version")
+                );
+                true
+            }
+            // No profile yet means CHECK_VERSION_STR has not been answered,
+            // which is itself one of the first ioctls a client sends. Refusing
+            // here would refuse the call that makes checking possible at all.
+            AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
+        };
+        if refuse {
+            *self.abi_refused.entry(escape).or_insert(0) += 1;
+            if self.abi_policy == AbiPolicy::Enforce {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
         }
 
         use abi::ioctl::*;
@@ -1509,13 +1905,8 @@ impl NvidiaBackend {
                 self.dispatch_unmap_memory(cookie, host_fd, request, param_in, resp_buf)
             }
 
-            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self.dispatch_update_device_mapping_info(
-                cookie,
-                host_fd,
-                request,
-                param_in,
-                resp_buf,
-            ),
+            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self
+                .dispatch_update_device_mapping_info(cookie, host_fd, request, param_in, resp_buf),
 
             // ---------------------------------------------------------------
             // RM control requires nested handling
@@ -1591,7 +1982,12 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
 
-        let mut outer = param_in[..outer_size].to_vec();
+        // Sized for what the host copies, not for what the guest sent: see
+        // `ioctl_arg_len`.
+        let Some(mut outer_buf) = ioctl_arg(request, &param_in[..outer_size]) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let outer = &mut outer_buf.as_mut_slice()[..outer_size];
         let nested_in = &param_in[outer_size..];
 
         // What the caller had in the pointer field, to put back before the
@@ -1632,7 +2028,12 @@ impl NvidiaBackend {
             let mut host_guard = match crate::guarded::GuardedBuf::new(nested_size) {
                 Some(b) => b,
                 None => {
-                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM)
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOMEM,
+                    );
                 }
             };
             host_guard.as_mut_slice().copy_from_slice(nested_in);
@@ -1656,9 +2057,10 @@ impl NvidiaBackend {
                 let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
                 const NV0005_DATA: usize = 16;
                 if matches!(h_class, 0x05 | 0x79) && host_buf.len() >= NV0005_DATA + 4 {
-                    let guest_handle_val =
-                        i32::from_le_bytes(host_buf[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
-                    match self.handles.get_raw(guest_handle_val as u64) {
+                    let guest_handle_val = i32::from_le_bytes(
+                        host_buf[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap(),
+                    );
+                    match self.dev_fd(guest_handle_val as u32) {
                         Ok(real_fd) => {
                             saved_nested_handle = Some((NV0005_DATA, guest_handle_val));
                             host_buf[NV0005_DATA..NV0005_DATA + 4]
@@ -1684,7 +2086,7 @@ impl NvidiaBackend {
                     // EXPORT_OBJECT_TO_FD: guest_handle at offset 16 in nested
                     let guest_handle_val = i32::from_le_bytes(host_buf[16..20].try_into().unwrap());
 
-                    match self.handles.get_raw(guest_handle_val as u64) {
+                    match self.dev_fd(guest_handle_val as u32) {
                         Ok(real_fd) => {
                             log::debug!(
                                 "EXPORT_TO_FD: handle {} → host fd {}",
@@ -1705,7 +2107,7 @@ impl NvidiaBackend {
                     // IMPORT_OBJECT_FROM_FD: guest_handle at offset 0 in nested
                     let guest_handle_val = i32::from_le_bytes(host_buf[0..4].try_into().unwrap());
 
-                    match self.handles.get_raw(guest_handle_val as u64) {
+                    match self.dev_fd(guest_handle_val as u32) {
                         Ok(real_fd) => {
                             log::debug!(
                                 "IMPORT_FROM_FD: handle {} → host fd {}",
@@ -1744,14 +2146,11 @@ impl NvidiaBackend {
                 }
                 let guest_handle_val =
                     i32::from_le_bytes(host_buf[off..off + 4].try_into().unwrap());
-                match self.handles.get_raw(guest_handle_val as u64) {
+                match self.dev_fd(guest_handle_val as u32) {
                     Ok(real_fd) => {
-                        log::debug!(
-                            "nvkms memFd: handle {guest_handle_val} → host fd {real_fd}"
-                        );
+                        log::debug!("nvkms memFd: handle {guest_handle_val} → host fd {real_fd}");
                         saved_nested_handle = Some((off, guest_handle_val));
-                        host_buf[off..off + 4]
-                            .copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        host_buf[off..off + 4].copy_from_slice(&(real_fd as i32).to_le_bytes());
                     }
                     Err(_) => {
                         log::warn!(
@@ -1834,7 +2233,7 @@ impl NvidiaBackend {
             }
 
             // Call host ioctl — paramsSize field is untouched (may be 0)
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
+            let rc = unsafe { (self.host_ioctl)(host_fd, request, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
@@ -1853,9 +2252,8 @@ impl NvidiaBackend {
                         .try_into()
                         .unwrap(),
                 );
-                let status = u32::from_le_bytes(
-                    outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap(),
-                );
+                let status =
+                    u32::from_le_bytes(outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
                 if status == NV_OK {
                     log::info!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",
@@ -1905,13 +2303,13 @@ impl NvidiaBackend {
             }
             // Only what the guest allocated room for goes back, not the pad.
             let deep_reply = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
-            let mut combined = outer;
-            combined.extend_from_slice(&host_buf);
+            let mut combined = outer.to_vec();
+            combined.extend_from_slice(host_buf);
             combined.extend_from_slice(&deep_buf[..deep_reply]);
             self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
         } else {
             // No nested params — straightforward passthrough
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
+            let rc = unsafe { (self.host_ioctl)(host_fd, request, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!(
@@ -1939,7 +2337,7 @@ impl NvidiaBackend {
             // Same here: restore what the caller passed, in case the host
             // driver wrote to the field.
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
-            self.write_ioctl_resp(resp_buf, cookie, &outer)
+            self.write_ioctl_resp(resp_buf, cookie, outer)
         }
     }
 
@@ -1972,7 +2370,10 @@ impl NvidiaBackend {
             || escape == 0x2b // NV_ESC_RM_ALLOC (hClient)
             || escape == 0x2a; // NV_ESC_RM_CONTROL
 
-        let mut param_buf = param_in.to_vec();
+        let Some(mut arg) = ioctl_arg(request, param_in) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
 
         // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry with different Cmd on EBUSY
         // Some sysparams ioctls return EBUSY when the device is busy, especially
@@ -1990,10 +2391,10 @@ impl NvidiaBackend {
         if escape == 0xd2 && param_buf.len() >= 4 {
             // Try Cmd='2' first (query mode in newer drivers)
             param_buf[0] = b'2'; // Cmd = '2'
-                                 // Leave other fields as-is, call host
+            // Leave other fields as-is, call host
         }
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
 
@@ -2001,8 +2402,7 @@ impl NvidiaBackend {
             if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
                 log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
                 param_buf[0] = 2; // Try V2
-                let rc2 =
-                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+                let rc2 = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
                 if rc2 < 0 {
                     let errno2 = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     log::warn!(
@@ -2165,8 +2565,11 @@ impl NvidiaBackend {
         // on another open file. It is forwarded as it stands, because that is
         // what the host driver is being asked to read.
         if embedded < 0 {
-            let mut param_buf = param_in.to_vec();
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+            let Some(mut arg) = ioctl_arg(request, param_in) else {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+            };
+            let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
+            let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
@@ -2175,8 +2578,8 @@ impl NvidiaBackend {
             return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
         }
 
-        let guest_embedded = embedded as u64;
-        let host_embedded = match self.handles.get_raw(guest_embedded) {
+        let guest_embedded = embedded as u32;
+        let host_embedded = match self.dev_fd(guest_embedded) {
             Ok(fd) => fd,
             Err(_) => {
                 log::warn!("fd-carrying ioctl: bad embedded handle {}", guest_embedded);
@@ -2184,10 +2587,13 @@ impl NvidiaBackend {
             }
         };
 
-        let mut param_buf = param_in.to_vec();
+        let Some(mut arg) = ioctl_arg(request, param_in) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         param_buf[fd_offset..fd_offset + 4].copy_from_slice(&(host_embedded as i32).to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -2246,13 +2652,16 @@ impl NvidiaBackend {
             );
         }
 
-        let mut param_buf = param_in.to_vec();
+        let Some(mut arg) = ioctl_arg(request, param_in) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         // Set pOldCpuAddress to host VA
         param_buf[16..24].copy_from_slice(&host_old.to_le_bytes());
         // Set pNewCpuAddress to host VA too (the host mapping didn't move)
         param_buf[24..32].copy_from_slice(&host_old.to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             log::warn!(
@@ -2307,10 +2716,10 @@ impl NvidiaBackend {
         let guest_fd_handle = {
             let mut b = [0u8; 4];
             b.copy_from_slice(&param_in[FD_OFFSET..FD_OFFSET + 4]);
-            i32::from_le_bytes(b) as u64
+            i32::from_le_bytes(b) as u32
         };
 
-        let host_map_fd = match self.handles.get_raw(guest_fd_handle) {
+        let host_map_fd = match self.dev_fd(guest_fd_handle) {
             Ok(fd) => fd,
             Err(_) => {
                 log::warn!(
@@ -2331,12 +2740,15 @@ impl NvidiaBackend {
             );
         }
 
-        let mut param_buf = param_in.to_vec();
+        let Some(mut arg) = ioctl_arg(request, param_in) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         param_buf[FD_OFFSET..FD_OFFSET + 4].copy_from_slice(&(host_map_fd as i32).to_le_bytes());
 
         // --- Step 2: Call host ioctl ---
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -2419,10 +2831,16 @@ impl NvidiaBackend {
                 "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
                  addressed by the guest"
             );
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
         };
         if let Err(e) = window.place(region.offset, length, host_map_fd, 0, true) {
             log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
+            if let Err(e) = self.shm.free(&region) {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
+            }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 
@@ -2524,9 +2942,16 @@ impl NvidiaBackend {
                 );
                 // Forward with the guest value — host will reject but we
                 // report the error cleanly rather than crashing
-                let mut param_buf = param_in.to_vec();
-                let rc =
-                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+                let Some(mut arg) = ioctl_arg(request, param_in) else {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOMEM,
+                    );
+                };
+                let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
+                let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
                 if rc < 0 {
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
@@ -2544,10 +2969,13 @@ impl NvidiaBackend {
         );
 
         // Substitute the real host pLinearAddress for the host ioctl
-        let mut param_buf = param_in.to_vec();
+        let Some(mut arg) = ioctl_arg(request, param_in) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         param_buf[16..24].copy_from_slice(&entry.host_p_linear_address.to_le_bytes());
 
-        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             log::warn!("UNMAP_MEMORY: host ioctl failed: errno={}", errno);
@@ -2560,11 +2988,11 @@ impl NvidiaBackend {
         log::info!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
-            // Host unmap succeeded -- restore the SHM backing and return the
-            // extent to its zone, so the space can serve a later mapping.
-            if let Err(e) = self.shm.free(&entry.region) {
-                log::warn!("UNMAP_MEMORY: SHM free failed: {} (non-fatal)", e);
-            }
+            // Host unmap succeeded -- empty the window range and return the
+            // extent to its zone, so the space can serve a later mapping. The
+            // withdraw matters as much as the free: without it the VMM keeps
+            // the host device memory mapped there until the extent is reused.
+            self.release_extent(&entry.region, entry.shm_length, "UNMAP_MEMORY");
         } else {
             // Host returned RM error — put the entry back
             log::warn!(
@@ -2577,6 +3005,17 @@ impl NvidiaBackend {
         // Zero pLinearAddress in response — guest doesn't need it
         param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+    }
+
+    /// The descriptor behind a handle an RM parameter block names, if the
+    /// handle is one of the NVIDIA devices. RM and NVKMS only understand their
+    /// own files; a card, a lease or a sync_file has no business in one of
+    /// their parameter blocks.
+    fn dev_fd(&self, handle: u32) -> Result<RawFd> {
+        match self.handles.get(handle) {
+            Some((fd, HandleKind::Dev(_))) => Ok(std::os::fd::AsRawFd::as_raw_fd(&fd)),
+            _ => Err(DeviceError::BadHandle(handle as u64)),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2592,7 +3031,7 @@ impl NvidiaBackend {
             msg_type: self.current_msg as u32,
             handle,
             status,
-            req_id: 0,
+            req_id: self.current_req_id,
         };
         write_struct(resp_buf, &hdr)
     }
@@ -2632,7 +3071,7 @@ impl NvidiaBackend {
                 msg_type: self.current_msg as u32,
                 handle: self.current_handle,
                 status: 0,
-                req_id: 0,
+                req_id: self.current_req_id,
             },
         );
         off += write_struct(
@@ -2659,10 +3098,13 @@ impl NvidiaBackend {
         _cookie: u64,
         errno: i32,
     ) -> usize {
-        let e = if errno != 0 { errno.abs() } else { status.errno() };
+        let e = if errno != 0 {
+            errno.abs()
+        } else {
+            status.errno()
+        };
         self.write_hdr(resp_buf, 0, -e)
     }
-
 }
 
 /// Close whatever the guest left open.
@@ -2686,7 +3128,6 @@ impl Drop for NvidiaBackend {
 // ============================================================
 // Serialisation helpers
 // ============================================================
-
 
 fn read_struct<T: Copy>(buf: &[u8], offset: usize) -> T {
     assert!(buf.len() >= offset + size_of::<T>());
@@ -2733,7 +3174,10 @@ mod abi_tests {
     fn learns_the_driver_version_from_a_real_reply() {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
-        assert_eq!(b.driver, Some(abi::version::DriverVersion::new(580, 178, 4)));
+        assert_eq!(
+            b.driver,
+            Some(abi::version::DriverVersion::new(580, 178, 4))
+        );
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
     }
 
@@ -2794,7 +3238,10 @@ mod abi_tests {
         b.learn_driver_version(&t4_version_reply());
         assert_eq!(
             b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
-            AbiCheck::SizeMismatch { expected: 64, actual: 48 }
+            AbiCheck::SizeMismatch {
+                expected: 64,
+                actual: 48
+            }
         );
     }
 
@@ -2803,7 +3250,10 @@ mod abi_tests {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
         // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
-        assert_eq!(b.check_abi(NV_ESC_CARD_INFO, 2304), AbiCheck::VariableLength);
+        assert_eq!(
+            b.check_abi(NV_ESC_CARD_INFO, 2304),
+            AbiCheck::VariableLength
+        );
     }
 
     #[test]
@@ -3169,7 +3619,9 @@ mod tests {
         // dispatch path should reach the host ioctl — so we expect either
         // IoctlFailed (host rejected it) or Ok (unlikely without valid handles).
         // The key thing: it should NOT be BadHandle, proving FD translation worked.
-        assert_ne!(r.status, -Status::BadHandle.errno(),
+        assert_ne!(
+            r.status,
+            -Status::BadHandle.errno(),
             "FD translation should have succeeded"
         );
     }
@@ -3224,7 +3676,12 @@ mod tests {
             be.dispatch(&req, &mut resp);
             assert_eq!(parse_resp(&resp).status, 0, "open /dev/nvidiactl");
             let ctl = opened_handle(&resp);
-            let mut c = Self { be, ctl, gpu: 0, cookie: 2 };
+            let mut c = Self {
+                be,
+                ctl,
+                gpu: 0,
+                cookie: 2,
+            };
             // The driver always issues these two before allocating a client.
             // Without them the device allocation is refused with
             // NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
@@ -3334,7 +3791,9 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             let n = self.be.dispatch(&req, &mut resp);
             assert!(n > 0, "alloc class {class:#x}: empty response");
-            assert_eq!(parse_resp(&resp).status, 0,
+            assert_eq!(
+                parse_resp(&resp).status,
+                0,
                 "alloc class {class:#x}: transport status"
             );
             let body = IOCTL_BODY;
@@ -3408,8 +3867,7 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(rh.status, 0,
-            );
+            assert_eq!(rh.status, 0,);
             let body = IOCTL_BODY;
             let out = &resp[body..body + 56];
             let rm = u32::from_le_bytes(out[40..44].try_into().unwrap());
@@ -3484,8 +3942,7 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(rh.status, 0,
-            );
+            assert_eq!(rh.status, 0,);
             let body = IOCTL_BODY;
             let rm = u32::from_le_bytes(resp[body + 24..body + 28].try_into().unwrap());
             assert_eq!(rm, 0, "unmap: RM status {rm:#x}");
@@ -3504,7 +3961,10 @@ mod tests {
         let (off, len, linear) = c.map(client, sub, mem, 65536, fd);
         assert_eq!(len, 65536, "mapped length");
         assert_ne!(linear, 0, "pLinearAddress should be the SHM offset");
-        assert_eq!(linear, off, "pLinearAddress must be the SHM offset the guest sees");
+        assert_eq!(
+            linear, off,
+            "pLinearAddress must be the SHM offset the guest sees"
+        );
 
         // The SHM window now aliases GPU registers. Reading must not fault.
         let base = c.be.shm_base_ptr();
@@ -3613,4 +4073,362 @@ mod tests {
         c.be.teardown();
     }
 
+    // ------------------------------------------------------------------
+    // v1 gating, argument sizing and window ownership (no GPU required)
+    // ------------------------------------------------------------------
+
+    fn devnull() -> OwnedFd {
+        // SAFETY: a NUL-terminated path; ownership passes to the OwnedFd.
+        unsafe {
+            OwnedFd::from_raw_fd(libc::open(
+                c"/dev/null".as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC,
+            ))
+        }
+    }
+
+    std::thread_local! {
+        /// Commands the fake host driver was handed, on this test's thread.
+        static FORWARDED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A host driver that behaves like drm_ioctl and nvidia.ko: it writes
+    /// back `_IOC_SIZE(request)` bytes, whatever the caller allocated.
+    unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        FORWARDED.with(|f| f.borrow_mut().push(request));
+        // SAFETY: the contract of `HostIoctl` -- `arg` holds _IOC_SIZE bytes.
+        unsafe { std::ptr::write_bytes(arg, 0xaa, hostfd::ioc_size(request as u32)) };
+        0
+    }
+
+    fn forwarded() -> Vec<u64> {
+        FORWARDED.with(|f| std::mem::take(&mut *f.borrow_mut()))
+    }
+
+    fn v1_ioctl(be: &mut NvidiaBackend, handle: u32, cmd: u32, params: &[u8]) -> Vec<u8> {
+        let mut req = hdr(MsgType::Ioctl, handle as u64);
+        append(
+            &mut req,
+            &IoctlReq {
+                cmd,
+                data_len: params.len() as u32,
+                ..Default::default()
+            },
+        );
+        req.extend_from_slice(params);
+        let mut resp = vec![0u8; 256 + params.len()];
+        let n = be.dispatch(&req, &mut resp);
+        resp.truncate(n);
+        resp
+    }
+
+    fn gated_backend() -> NvidiaBackend {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_ioctl);
+        be
+    }
+
+    #[test]
+    fn ioctl_buffers_are_sized_for_what_the_host_copies() {
+        assert_eq!(
+            ioctl_arg_len(hostfd::ioc(hostfd::IOC_RW, b'd', 1, 4096) as u64, 8),
+            4096
+        );
+        assert_eq!(
+            ioctl_arg_len(hostfd::ioc(hostfd::IOC_RW, b'F', 1, 16) as u64, 72),
+            72
+        );
+        assert_eq!(
+            ioctl_arg_len(0x3000_0001, 0),
+            0x3000,
+            "UVM numbers carry a size field too"
+        );
+        assert_eq!(ioctl_arg_len(hostfd::ioc(0, b'd', 0x1f, 0) as u64, 0), 1);
+    }
+
+    /// The heap overflow the sizing fixes: a guest sends 8 bytes with a
+    /// command whose size field says 8 KiB, and the host writes 8 KiB back.
+    /// With the buffer sized to the command this is just a call.
+    #[test]
+    fn a_small_payload_with_a_large_command_size_cannot_overflow() {
+        let mut be = gated_backend();
+        let uvm = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
+        let cmd = hostfd::ioc(hostfd::IOC_RW, 0, 0x21, 8 * 1024);
+        let resp = v1_ioctl(&mut be, uvm, cmd, &[0u8; 8]);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(forwarded(), vec![cmd as u64]);
+        // Only what the guest sent comes back.
+        assert_eq!(&resp[IOCTL_BODY..], &[0xaa; 8]);
+    }
+
+    #[test]
+    fn v1_ioctls_are_refused_on_every_new_handle_kind() {
+        let mut be = gated_backend();
+        for kind in [
+            HandleKind::DrmCard(0),
+            HandleKind::DrmLease(0),
+            HandleKind::SyncFile,
+            HandleKind::Syncobj,
+            HandleKind::Dmabuf,
+            HandleKind::Eventfd,
+            HandleKind::Memfd,
+            HandleKind::Wayland,
+            HandleKind::Other,
+        ] {
+            let h = be.adopt_for_test(devnull(), kind);
+            // ADDFB2 as a v1 ioctl: the path around every IOCTL2 check.
+            let addfb2 = hostfd::ioc(hostfd::IOC_RW, b'd', 0xb8, 104);
+            let r = v1_ioctl(&mut be, h, addfb2, &[0u8; 104]);
+            assert_eq!(parse_resp(&r).status, -libc::EPERM, "{kind:?}");
+        }
+        assert!(forwarded().is_empty());
+    }
+
+    #[test]
+    fn a_render_handle_takes_only_the_v1_drm_calls_the_guest_sends() {
+        let mut be = gated_backend();
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let refused = [
+            // GEM_IMPORT_USERSPACE_MEMORY, GEM_FLINK, GEM_OPEN: never.
+            (hostfd::ioc(hostfd::IOC_RW, b'd', 0x42, 24), 24, libc::EPERM),
+            (hostfd::DRM_IOCTL_GEM_FLINK, 8, libc::EPERM),
+            (hostfd::DRM_IOCTL_GEM_OPEN, 16, libc::EPERM),
+            // An RM escape on a DRM file.
+            (hostfd::ioc(hostfd::IOC_RW, b'F', 0x2a, 32), 32, libc::EPERM),
+            // A core KMS ioctl.
+            (hostfd::ioc(hostfd::IOC_RW, b'd', 0xa0, 64), 64, libc::EPERM),
+            // A known command with a size that disagrees with it.
+            (DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET, 8, libc::EINVAL),
+        ];
+        for (cmd, len, errno) in refused {
+            let r = v1_ioctl(&mut be, render, cmd, &vec![0u8; len]);
+            assert_eq!(parse_resp(&r).status, -errno, "cmd {cmd:#x}");
+        }
+        assert!(forwarded().is_empty(), "nothing refused reached the host");
+
+        for cmd in [
+            hostfd::DRM_IOCTL_GEM_CLOSE,
+            DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET,
+            DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY,
+        ] {
+            let r = v1_ioctl(&mut be, render, cmd, &vec![0u8; hostfd::ioc_size(cmd)]);
+            assert_eq!(parse_resp(&r).status, 0, "cmd {cmd:#x}");
+        }
+        assert_eq!(forwarded().len(), 3);
+    }
+
+    #[test]
+    fn each_nvidia_device_takes_only_its_own_namespace() {
+        let mut be = gated_backend();
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let modeset = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Modeset));
+        let uvm = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
+        let d = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4b, 24);
+        let m = hostfd::ioc(hostfd::IOC_RW, b'm', 0, 16);
+        // RM's frontend and nvidia-modeset both dispatch on the number alone,
+        // so a foreign type byte would reach them as one of their own
+        // commands, unchecked.
+        for (h, cmd) in [
+            (ctl, d),
+            (ctl, m),
+            (modeset, d),
+            (uvm, m),
+            (ctl, 0x3000_0001),
+        ] {
+            let r = v1_ioctl(&mut be, h, cmd, &[0u8; 24]);
+            assert_eq!(
+                parse_resp(&r).status,
+                -libc::EPERM,
+                "handle {h} cmd {cmd:#x}"
+            );
+        }
+        assert!(forwarded().is_empty());
+    }
+
+    /// Records what the window was asked to do.
+    #[derive(Clone, Default)]
+    struct FakeWindow(Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>);
+
+    impl crate::shm::WindowPlacer for FakeWindow {
+        fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, _w: bool) -> Result<()> {
+            self.0.lock().unwrap().push(("place", off));
+            Ok(())
+        }
+        fn withdraw(&self, off: u64, _len: u64) -> Result<()> {
+            self.0.lock().unwrap().push(("withdraw", off));
+            Ok(())
+        }
+    }
+
+    fn mmap(be: &mut NvidiaBackend, handle: u32, offset: u64) -> MmapResp {
+        let mut req = hdr(MsgType::Mmap, handle as u64);
+        append(
+            &mut req,
+            &MmapReq {
+                size: 4096,
+                offset,
+                prot: 3,
+                padding: 0,
+            },
+        );
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "mmap");
+        read_struct::<MmapResp>(&resp, size_of::<MsgHeader>())
+    }
+
+    fn munmap(be: &mut NvidiaBackend, id: u32) {
+        let mut req = hdr(MsgType::Munmap, 0);
+        append(
+            &mut req,
+            &MunmapReq {
+                mapping_id: id,
+                padding: 0,
+            },
+        );
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(parse_resp(&resp).status, 0, "munmap");
+    }
+
+    /// R:internals §11.1: a proxy that outlives the file that placed it keeps
+    /// its placement; the extent is withdrawn and freed once, by the last
+    /// MUNMAP, and never handed to anyone else while it is mapped.
+    #[test]
+    fn a_placement_outlives_its_owner_and_is_freed_exactly_once() {
+        let mut be = gated_backend();
+        let window = FakeWindow::default();
+        be.set_window(Box::new(window.clone()));
+        let empty = be.shm_free_bytes();
+        let owner = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let placed = mmap(&mut be, owner, 0x10000);
+        assert_ne!(placed.mapping_id, 0);
+        let held = be.shm_free_bytes();
+        assert_ne!(held, empty);
+
+        // The client exits: its file closes, its buffer lives on elsewhere.
+        be.dispatch(&close_msg(owner as u64), &mut [0u8; 32]);
+        assert_eq!(
+            be.shm_free_bytes(),
+            held,
+            "closing the owner freed a mapped extent"
+        );
+        assert!(
+            !window
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(op, _)| *op == "withdraw")
+        );
+
+        // Someone else maps meanwhile: a different extent, not the live one.
+        let other = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let second = mmap(&mut be, other, 0x10000);
+        assert_ne!(second.guest_phys_addr, placed.guest_phys_addr);
+
+        // The proxy goes: one withdraw, one free, of its own extent only.
+        munmap(&mut be, placed.mapping_id);
+        munmap(&mut be, placed.mapping_id);
+        let withdrawn: Vec<u64> = window
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(op, _)| *op == "withdraw")
+            .map(|(_, off)| *off)
+            .collect();
+        assert_eq!(withdrawn, vec![placed.guest_phys_addr]);
+        munmap(&mut be, second.mapping_id);
+        assert_eq!(be.shm_free_bytes(), empty);
+    }
+
+    #[test]
+    fn the_same_object_mapped_twice_is_released_by_the_second_munmap() {
+        let mut be = gated_backend();
+        be.set_window(Box::new(FakeWindow::default()));
+        let empty = be.shm_free_bytes();
+        let h = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let a = mmap(&mut be, h, 0x2000);
+        let b = mmap(&mut be, h, 0x2000);
+        assert_eq!(a.mapping_id, b.mapping_id);
+        munmap(&mut be, a.mapping_id);
+        assert_ne!(be.shm_free_bytes(), empty, "still mapped once");
+        munmap(&mut be, b.mapping_id);
+        assert_eq!(be.shm_free_bytes(), empty);
+    }
+
+    #[test]
+    fn a_session_reset_releases_every_placement_and_handle() {
+        let mut be = gated_backend();
+        let window = FakeWindow::default();
+        be.set_window(Box::new(window.clone()));
+        let empty = be.shm_free_bytes();
+        let h = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        mmap(&mut be, h, 0x3000);
+        be.session_reset("test");
+        assert_eq!(be.shm_free_bytes(), empty);
+        assert_eq!(be.handle_count(), 0);
+        assert_eq!(window.0.lock().unwrap().last().unwrap().0, "withdraw");
+    }
+
+    #[test]
+    fn mmap_is_refused_on_handles_that_carry_no_device_memory() {
+        let mut be = gated_backend();
+        be.set_window(Box::new(FakeWindow::default()));
+        let memfd = be.adopt_for_test(devnull(), HandleKind::Memfd);
+        let mut req = hdr(MsgType::Mmap, memfd as u64);
+        append(
+            &mut req,
+            &MmapReq {
+                size: 4096,
+                offset: 0,
+                prot: 3,
+                padding: 0,
+            },
+        );
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(parse_resp(&resp).status, -libc::EPERM);
+    }
+
+    #[test]
+    fn opening_a_card_node_directly_is_refused() {
+        let mut be = gated_backend();
+        let mut resp = vec![0u8; 64];
+        be.dispatch(&open_msg(DeviceKind::DriCard(0)), &mut resp);
+        assert_eq!(parse_resp(&resp).status, -libc::EPERM);
+    }
+
+    #[test]
+    fn responses_echo_the_request_id() {
+        let mut be = gated_backend();
+        let mut req = close_msg(0xCAFE);
+        req[12..16].copy_from_slice(&0x1234u32.to_le_bytes());
+        let mut resp = vec![0u8; 32];
+        be.dispatch(&req, &mut resp);
+        assert_eq!(parse_resp(&resp).req_id, 0x1234);
+    }
+
+    #[test]
+    fn the_card_section_is_written_whole_or_not_at_all() {
+        let cards = vec![CardNode {
+            name: "card1".into(),
+            major: 226,
+            minor: 1,
+            render_index: 0,
+        }];
+        let mut buf = vec![0u8; 64];
+        let n = write_card_section(&cards, &mut buf);
+        assert_eq!(n, 4 + 16 + 5);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 1);
+        let rec = read_struct::<CardRecord>(&buf, 4);
+        assert_eq!(
+            (rec.name_len, rec.major, rec.minor, rec.render_index),
+            (5, 226, 1, 0)
+        );
+        assert_eq!(&buf[20..25], b"card1");
+        assert_eq!(write_card_section(&cards, &mut [0u8; 10]), 0);
+    }
 }

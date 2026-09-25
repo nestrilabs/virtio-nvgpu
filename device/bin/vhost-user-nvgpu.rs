@@ -1,50 +1,78 @@
 //! A vhost-user backend serving `NvidiaBackend` to a guest.
 //!
 //! The guest driver (`driver/nvgpu_main.c`) binds virtio device ID 45 and
-//! posts one descriptor chain per request: a readable descriptor holding the
-//! request, and a writable one for the response. That is the whole transport.
+//! posts one descriptor chain per request on the control queue: readable
+//! descriptors holding the request, then writable ones for the response. The
+//! event queue carries buffers the guest posts for the host to fill.
 //!
 //! Attach it to QEMU with the generic vhost-user device:
 //!
 //! ```text
 //! qemu-system-x86_64 \
 //!   -chardev socket,id=nv,path=/tmp/nvgpu.sock \
-//!   -device vhost-user-device-pci,virtio-id=45,num_vqs=1,chardev=nv \
+//!   -device vhost-user-device-pci,virtio-id=45,num_vqs=2,chardev=nv \
 //!   -object memory-backend-memfd,id=mem,size=2G,share=on -numa node,memdev=mem
 //! ```
 //!
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
+//!
+//! What the transport is responsible for, beyond moving bytes:
+//!
+//! - **Whole chains.** A request may span any number of readable descriptors
+//!   and a response any number of writable ones -- the guest builds large
+//!   buffers from page chunks -- so requests are gathered from all of them and
+//!   responses scattered over all of them. Sizes are summed from the
+//!   descriptors *before* anything is allocated: a guest-chosen length must
+//!   never size an allocation here unchecked.
+//! - **Completions after a reset.** Executor jobs finish whenever the host call
+//!   returns, possibly seconds after the guest reset the device and the rings
+//!   were reconfigured. Every ring carries an epoch, bumped by anything that
+//!   stops or moves it, and a completion from an older epoch is dropped
+//!   without touching guest memory -- its used-ring write would land in pages
+//!   the rebooted guest has reused, or in the new ring as a head it never
+//!   posted.
+//! - **Who waits.** The queue thread never waits on a host display call; those
+//!   run on per-file executors (`device::exec`), which complete their own
+//!   chains.
 
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::fs::File;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use clap::Parser;
+use device::exec::ExecPool;
 use device::host;
 use device::nvidia::NvidiaBackend;
-use protocol::messages::{MsgHeader, MsgType};
-use device::virtio::{VirtioGpuNvConfig, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
+use device::pump::{EventQueue, Fill, Pump, PumpCmd, PumpHandle};
+use device::session::{BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, Reply};
 use device::shm::WindowPlacer;
-use std::os::fd::{BorrowedFd, RawFd};
+use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use protocol::messages::{MsgHeader, MsgType};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
-use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
+use vhost_user_backend::{
+    VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringState, VringStateGuard,
+    VringStateMutGuard, VringT,
+};
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
-use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::QueueOwnedT;
-use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
+use virtio_bindings::bindings::virtio_ring::{
+    VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
+};
+use virtio_queue::{Error as VirtQueError, QueueOwnedT, QueueT};
+use vm_memory::{
+    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryMmap,
+};
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
 /// error from that call, so offering fewer is fatal before config is read.
 const QUEUE_COUNT: usize = NUM_QUEUES;
-/// Largest response we will build for one request.
-const RESP_MAX: usize = 64 * 1024;
+
+const HDR: usize = size_of::<MsgHeader>();
 
 #[derive(Parser, Debug)]
 #[command(version, about = "vhost-user backend for virtio-nvgpu")]
@@ -66,6 +94,24 @@ struct Args {
     /// is not a way to run one.
     #[arg(long)]
     permissive_abi: bool,
+
+    /// Compositor-VM mode: offer the host's card nodes to the guest, so a
+    /// guest compositor can drive the display.
+    ///
+    /// Only for a host with no compositor of its own. A guest file that
+    /// becomes guest DRM master makes its host card file host master, and a
+    /// host compositor holding the card first would simply see its commits
+    /// fail.
+    #[arg(long)]
+    kms_card: bool,
+
+    /// The host compositor's Wayland socket, for the Wayland proxy.
+    #[arg(long, value_name = "PATH")]
+    wayland_socket: Option<PathBuf>,
+
+    /// Accept host Wayland clients here and carry them to a guest compositor.
+    #[arg(long, value_name = "PATH")]
+    wayland_export: Option<PathBuf>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -121,192 +167,382 @@ impl WindowPlacer for VhostWindow {
     }
 }
 
-/// What the event thread is told to start and stop watching.
-enum Watch {
-    Add(u32, OwnedFd),
-    Remove(u32),
-}
-
-/// One `EventReady` message: a bare header naming the descriptor.
-fn event_ready_bytes(handle: u32) -> Vec<u8> {
-    let hdr = MsgHeader::ok(MsgType::EventReady, handle);
-    // The wire form is the struct's bytes, which is what the driver reads.
-    let p = &hdr as *const MsgHeader as *const u8;
-    unsafe { std::slice::from_raw_parts(p, size_of::<MsgHeader>()) }.to_vec()
-}
-
-/// Put one message on the event queue, into a buffer the guest posted there.
-///
-/// Returns false when the guest has posted none, which is the normal state of
-/// a guest whose driver predates this queue having a use -- and a reason to
-/// drop the notification rather than to fail.
-fn push_event(
-    vring: &VringRwLock,
-    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
-    handle: u32,
-) -> bool {
-    let guard = mem.memory();
-    let mut vr = vring.get_mut();
-    let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
-        return false;
-    };
-    let Some(chain) = avail.next() else { return false };
-    let head = chain.head_index();
-    drop(vr);
-
-    let bytes = event_ready_bytes(handle);
-    let mut written = 0usize;
-    for desc in chain {
-        if desc.is_write_only() {
-            let n = std::cmp::min(desc.len() as usize, bytes.len());
-            if guard.write_slice(&bytes[..n], desc.addr()).is_ok() {
-                written = n;
-            }
-            break;
-        }
-    }
-
-    if vring.add_used(head, written as u32).is_err() {
-        return false;
-    }
-    let _ = vring.signal_used_queue();
-    written > 0
-}
-
-/// Watch the host's descriptors and tell the guest when one has something to
-/// say.
-///
-/// This exists because the guest cannot find out any other way. NVIDIA's
-/// user-mode driver waits for the GPU by polling the descriptor its RM event
-/// is delivered on; the interrupt is the host's, and so is the descriptor that
-/// becomes readable. Without this relay the guest's `poll` has nothing to
-/// report and the driver spins -- measured at a whole core per guest at 100
-/// frames a second.
-///
-/// A descriptor is dropped from the set after it is reported and put back a
-/// millisecond later. Level-triggered polling would otherwise spin here
-/// instead: the descriptor stays readable until the *guest* consumes the
-/// event, which happens through an ioctl this thread never sees. Re-arming on
-/// a timer costs a duplicate notification at worst, and the guest answers one
-/// by waking, finding nothing, and waiting again.
-fn event_pump(
-    rx: Receiver<Watch>,
-    vring: VringRwLock,
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
-) {
-    // How often to re-check a descriptor that is still readable. See the
-    // sweep below; this is a safety net, not the notification path.
-    const SWEEP: Duration = Duration::from_millis(1);
-
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-        log::error!("event pump: epoll_create1: {}", std::io::Error::last_os_error());
-        return;
-    }
-    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
-
-    let mut watched: HashMap<u64, OwnedFd> = HashMap::new();
-    let mut last_sweep = Instant::now();
-
-    // Edge-triggered. Level-triggered would report a descriptor as readable
-    // until the *guest* consumes the event, which happens through an ioctl
-    // this thread never sees -- so the pump would spin between notifying and
-    // being believed. Parking the descriptor for a millisecond instead cost
-    // 11% of the frames in an encode run, and parking it for 100 us cost more
-    // than that, because then the pump spun on the host's CPU and took it from
-    // the guest. An edge costs neither.
-    let ctl = |op: i32, fd: i32, handle: u32| {
-        let mut ev = libc::epoll_event {
-            events: (libc::EPOLLIN | libc::EPOLLET) as u32,
-            u64: handle as u64,
-        };
-        unsafe { libc::epoll_ctl(epfd.as_raw_fd(), op, fd, &mut ev) }
-    };
-
-    loop {
-        // Drain the control channel first: a descriptor closed on the other
-        // thread must leave the set before it can be reported again.
-        loop {
-            match rx.try_recv() {
-                Ok(Watch::Add(handle, fd)) => {
-                    if ctl(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), handle) == 0 {
-                        watched.insert(handle as u64, fd);
-                    }
-                }
-                Ok(Watch::Remove(handle)) => {
-                    if let Some(fd) = watched.remove(&(handle as u64)) {
-                        ctl(libc::EPOLL_CTL_DEL, fd.as_raw_fd(), handle);
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-
-        // The safety net: an edge can be missed if a descriptor was already
-        // readable when it was added, or if a notification found no buffer
-        // posted. Every 10 ms, ask the descriptors directly and re-notify the
-        // ones that still have something to say. A lost wake costs a tenth of
-        // a frame at 60 Hz rather than a hang.
-        if last_sweep.elapsed() >= SWEEP {
-            last_sweep = Instant::now();
-            for (&handle, fd) in watched.iter() {
-                let mut pfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & libc::POLLIN != 0 {
-                    push_event(&vring, &mem, handle as u32);
-                }
-            }
-        }
-
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
-        let n = unsafe {
-            libc::epoll_wait(
-                epfd.as_raw_fd(),
-                events.as_mut_ptr(),
-                events.len() as i32,
-                SWEEP.as_millis() as i32,
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            log::error!("event pump: epoll_wait: {err}");
-            return;
-        }
-
-        for ev in events.iter().take(n as usize) {
-            // Copied out first: epoll_event is packed, so its field cannot be
-            // borrowed.
-            let handle = { ev.u64 } as u32;
-            if !push_event(&vring, &mem, handle) {
-                log::debug!("event pump: no buffer posted for handle {handle}; dropped");
-            }
-        }
-    }
-}
-
-/// The queue the host posts events on. The guest posts empty buffers here and
-/// the event pump fills them; nothing the guest sends on it is a request.
-const EVENT_QUEUE: usize = 1;
-
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
 
+// ---------------------------------------------------------------------------
+// Rings with an epoch
+// ---------------------------------------------------------------------------
+
+/// A vring that counts the times it was stopped or moved.
+///
+/// vhost-user stops a ring with GET_VRING_BASE, which only clears `ready`
+/// (vhost-user-backend handler.rs:446-465), and virtio-queue's `add_used`
+/// does not look at `ready` at all (queue.rs:441-477); after SET_VRING_ADDR
+/// the used index is reloaded from the guest (handler.rs:386-432). So a
+/// completion arriving late has nothing to stop it writing a stale head into
+/// whatever ring is there now. The epoch is that stop: every state change
+/// bumps it under the ring's own write lock, and a completion compares it
+/// under the same lock before writing anything.
+#[derive(Clone)]
+struct EpochVring<M: GuestAddressSpace = GuestMemoryAtomic<GuestMemoryMmap>> {
+    inner: VringRwLock<M>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl<M: GuestAddressSpace + 'static> EpochVring<M> {
+    /// The current epoch. Read it while holding the ring's lock to tie it to
+    /// the state the lock protects.
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Apply a state change and bump the epoch, both under the write lock.
+    fn change(&self, f: impl FnOnce(&mut VringState<M>)) {
+        let mut g = self.inner.get_mut();
+        f(&mut *g);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl<'a, M: 'a + GuestAddressSpace> VringStateGuard<'a, M> for EpochVring<M> {
+    type G = RwLockReadGuard<'a, VringState<M>>;
+}
+
+impl<'a, M: 'a + GuestAddressSpace> VringStateMutGuard<'a, M> for EpochVring<M> {
+    type G = RwLockWriteGuard<'a, VringState<M>>;
+}
+
+impl<M: 'static + GuestAddressSpace> VringT<M> for EpochVring<M> {
+    fn new(mem: M, max_queue_size: u16) -> Result<Self, VirtQueError> {
+        Ok(Self {
+            inner: VringRwLock::new(mem, max_queue_size)?,
+            epoch: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    fn get_ref(&self) -> <Self as VringStateGuard<'_, M>>::G {
+        self.inner.get_ref()
+    }
+
+    fn get_mut(&self) -> <Self as VringStateMutGuard<'_, M>>::G {
+        self.inner.get_mut()
+    }
+
+    fn add_used(&self, desc_index: u16, len: u32) -> Result<(), VirtQueError> {
+        self.inner.add_used(desc_index, len)
+    }
+
+    fn signal_used_queue(&self) -> std::io::Result<()> {
+        self.inner.signal_used_queue()
+    }
+
+    fn enable_notification(&self) -> Result<bool, VirtQueError> {
+        self.inner.enable_notification()
+    }
+
+    fn disable_notification(&self) -> Result<(), VirtQueError> {
+        self.inner.disable_notification()
+    }
+
+    fn needs_notification(&self) -> Result<bool, VirtQueError> {
+        self.inner.needs_notification()
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.change(|s| s.set_enabled(enabled));
+    }
+
+    fn set_queue_info(
+        &self,
+        desc_table: u64,
+        avail_ring: u64,
+        used_ring: u64,
+    ) -> Result<(), VirtQueError> {
+        let mut res = Ok(());
+        self.change(|s| res = s.set_queue_info(desc_table, avail_ring, used_ring));
+        res
+    }
+
+    fn queue_next_avail(&self) -> u16 {
+        self.inner.queue_next_avail()
+    }
+
+    fn set_queue_next_avail(&self, base: u16) {
+        self.change(|s| s.get_queue_mut().set_next_avail(base));
+    }
+
+    fn set_queue_next_used(&self, idx: u16) {
+        self.change(|s| s.get_queue_mut().set_next_used(idx));
+    }
+
+    fn queue_used_idx(&self) -> Result<u16, VirtQueError> {
+        self.inner.queue_used_idx()
+    }
+
+    fn set_queue_size(&self, num: u16) {
+        self.change(|s| s.get_queue_mut().set_size(num));
+    }
+
+    fn set_queue_event_idx(&self, enabled: bool) {
+        self.inner.set_queue_event_idx(enabled);
+    }
+
+    fn set_queue_ready(&self, ready: bool) {
+        self.change(|s| s.get_queue_mut().set_ready(ready));
+    }
+
+    fn set_kick(&self, file: Option<File>) {
+        self.inner.set_kick(file);
+    }
+
+    fn read_kick(&self) -> std::io::Result<bool> {
+        self.inner.read_kick()
+    }
+
+    fn set_call(&self, file: Option<File>) {
+        self.inner.set_call(file);
+    }
+
+    fn set_err(&self, file: Option<File>) {
+        self.inner.set_err(file);
+    }
+}
+
+type Vring = EpochVring<GuestMemoryAtomic<GuestMemoryMmap>>;
+
+// ---------------------------------------------------------------------------
+// Gather and scatter
+// ---------------------------------------------------------------------------
+
+/// A chain taken off the control queue, as much as completing it needs.
+struct Taken {
+    head: u16,
+    epoch: u64,
+    writable: Vec<(GuestAddress, u32)>,
+    /// Total writable bytes.
+    cap: usize,
+}
+
+/// What a chain's descriptors add up to, before anything is read.
+#[derive(Debug, PartialEq, Eq)]
+struct Layout {
+    readable: Vec<(GuestAddress, u32)>,
+    req_len: usize,
+    writable: Vec<(GuestAddress, u32)>,
+    cap: usize,
+}
+
+/// Sum a chain's descriptors: `(write_only, addr, len)` in chain order.
+///
+/// `Err(Layout)` -- with no readable descriptors kept -- when the request is
+/// larger than `max_req`, found before a byte of it is copied: the lengths are
+/// the guest's, and the old loop allocated each one as it came. Writable
+/// capacity is counted in full; the caller refuses a response it cannot hold.
+fn layout(
+    descs: impl Iterator<Item = (bool, GuestAddress, u32)>,
+    max_req: usize,
+) -> Result<Layout, Layout> {
+    let mut l = Layout {
+        readable: Vec::new(),
+        req_len: 0,
+        writable: Vec::new(),
+        cap: 0,
+    };
+    let mut too_big = false;
+    for (write_only, addr, len) in descs {
+        if write_only {
+            l.cap = l.cap.saturating_add(len as usize);
+            l.writable.push((addr, len));
+        } else if !too_big {
+            l.req_len = l.req_len.saturating_add(len as usize);
+            if l.req_len > max_req {
+                too_big = true;
+                l.readable.clear();
+            } else {
+                l.readable.push((addr, len));
+            }
+        }
+    }
+    if too_big { Err(l) } else { Ok(l) }
+}
+
+/// Copy `bytes` over the writable descriptors in order. Returns what was
+/// written, which is what the used ring reports.
+fn scatter<G: GuestMemory>(mem: &G, writable: &[(GuestAddress, u32)], bytes: &[u8]) -> usize {
+    let mut off = 0;
+    for &(addr, len) in writable {
+        if off == bytes.len() {
+            break;
+        }
+        let n = (len as usize).min(bytes.len() - off);
+        if let Err(e) = mem.write_slice(&bytes[off..off + n], addr) {
+            log::warn!("writing a response into guest memory at {:#x}: {e}", addr.0);
+            break;
+        }
+        off += n;
+    }
+    off
+}
+
+/// Read a request out of its readable descriptors.
+fn gather<G: GuestMemory>(
+    mem: &G,
+    readable: &[(GuestAddress, u32)],
+    len: usize,
+) -> Option<Vec<u8>> {
+    let mut req = vec![0u8; len];
+    let mut off = 0;
+    for &(addr, n) in readable {
+        let n = n as usize;
+        if let Err(e) = mem.read_slice(&mut req[off..off + n], addr) {
+            log::warn!("reading a request from guest memory at {:#x}: {e}", addr.0);
+            return None;
+        }
+        off += n;
+    }
+    Some(req)
+}
+
+/// A bare error header for a request the transport refuses on its own.
+fn transport_error(errno: i32) -> Reply {
+    let hdr = MsgHeader::err(MsgType::Ioctl, errno);
+    // The wire form is the struct's bytes, which is what the driver reads.
+    let p = &hdr as *const MsgHeader as *const u8;
+    // SAFETY: a plain-old-data header viewed as its 16 bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(p, HDR) }.to_vec();
+    Reply {
+        bytes,
+        ..Reply::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shared state jobs complete against
+// ---------------------------------------------------------------------------
+
+/// What an executor job needs to finish a chain from its own thread.
+struct Shared {
+    nvidia: Mutex<NvidiaBackend>,
+    mem: RwLock<Option<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    pool: ExecPool,
+    pump: Mutex<PumpState>,
+}
+
+/// The event pump once running, and what was said to it before it was.
+#[derive(Default)]
+struct PumpState {
+    handle: Option<PumpHandle>,
+    queued: Vec<PumpCmd>,
+}
+
+impl Shared {
+    /// Forward the backend's pump instructions, in order. Before the pump has
+    /// started they wait: it cannot start until guest memory and the event
+    /// queue are known, and a watch made by the first OPEN must not be lost.
+    fn forward(&self, cmds: Vec<PumpCmd>) {
+        if cmds.is_empty() {
+            return;
+        }
+        let mut p = self.pump.lock().unwrap();
+        match p.handle.as_ref() {
+            Some(h) => cmds.into_iter().for_each(|c| h.send(c)),
+            None => p.queued.extend(cmds),
+        }
+    }
+
+    /// Complete a chain, unless its ring has moved on since it was taken.
+    fn complete(&self, vring: &Vring, t: &Taken, mut reply: Reply) {
+        let Some(mem) = self.mem.read().unwrap().clone() else {
+            return;
+        };
+        let mem = mem.memory();
+        let mut ring = vring.get_mut();
+        if vring.epoch() != t.epoch {
+            drop(ring);
+            log::info!(
+                "a completion for chain {} arrived after its ring was reset; dropped",
+                t.head
+            );
+            if !reply.created.is_empty() {
+                let mut be = self.nvidia.lock().unwrap();
+                be.close_handles(&reply.created);
+                let cmds = be.take_pump_cmds();
+                drop(be);
+                self.forward(cmds);
+            }
+            return;
+        }
+        // As late as it can be: the guest's clock sample is taken in its
+        // virtqueue callback, so the closer this is to add_used the smaller
+        // the asymmetry in the round trip it measures.
+        reply.stamp();
+        let written = scatter(&*mem, &t.writable, &reply.bytes);
+        if let Err(e) = ring.add_used(t.head, written as u32) {
+            log::warn!("add_used for chain {}: {e}", t.head);
+        }
+        drop(ring);
+        if let Err(e) = vring.signal_used_queue() {
+            log::warn!("signal used queue: {e}");
+        }
+    }
+}
+
+/// The event queue, as the pump fills it.
+struct VringEventQueue {
+    vring: Vring,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+}
+
+impl EventQueue for VringEventQueue {
+    fn fill(&mut self, build: &mut dyn FnMut(usize) -> Vec<u8>) -> Fill {
+        let mem = self.mem.memory();
+        let mut ring = self.vring.get_mut();
+        let chain = {
+            let Ok(mut avail) = ring.get_queue_mut().iter(mem.clone()) else {
+                return Fill::NoBuffer;
+            };
+            let Some(chain) = avail.next() else {
+                return Fill::NoBuffer;
+            };
+            chain
+        };
+        let head = chain.head_index();
+        let writable: Vec<(GuestAddress, u32)> = chain
+            .filter(|d| d.is_write_only())
+            .map(|d| (d.addr(), d.len()))
+            .collect();
+        let cap = writable.iter().map(|&(_, l)| l as usize).sum();
+        let bytes = build(cap);
+        let written = scatter(&*mem, &writable, &bytes);
+        if let Err(e) = ring.add_used(head, written as u32) {
+            log::warn!("event queue add_used: {e}");
+        }
+        drop(ring);
+        let _ = self.vring.signal_used_queue();
+        if bytes.is_empty() {
+            Fill::Empty
+        } else {
+            Fill::Filled
+        }
+    }
+
+    fn want_kick(&mut self) -> bool {
+        self.vring.enable_notification().unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The backend
+// ---------------------------------------------------------------------------
+
 struct NvGpuBackend {
-    nvidia: Arc<Mutex<NvidiaBackend>>,
-    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    shared: Arc<Shared>,
     event_idx: bool,
     config: VirtioGpuNvConfig,
-    /// Started on the first message, because the event queue and guest memory
-    /// are not known before then.
-    watches: Option<Sender<Watch>>,
+    max_req: usize,
+    max_resp: usize,
 }
 
 impl NvGpuBackend {
@@ -315,7 +551,11 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(proc_nvidia: &Path, abi_policy: device::nvidia::AbiPolicy) -> anyhow::Result<Self> {
+    fn new(
+        proc_nvidia: &Path,
+        abi_policy: device::nvidia::AbiPolicy,
+        config: BackendConfig,
+    ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -331,120 +571,149 @@ impl NvGpuBackend {
 
         let mut nvidia = NvidiaBackend::with_default_zones();
         nvidia.set_abi_policy(abi_policy);
+        nvidia.set_config(config);
 
         Ok(Self {
-            nvidia: Arc::new(Mutex::new(nvidia)),
-            mem: None,
+            shared: Arc::new(Shared {
+                nvidia: Mutex::new(nvidia),
+                mem: RwLock::new(None),
+                pool: ExecPool::default(),
+                pump: Mutex::new(PumpState::default()),
+            }),
             event_idx: false,
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
             config: VirtioGpuNvConfig::new(&version, &gpus),
-            watches: None,
+            max_req: MAX_XFER_DIRECT as usize,
+            max_resp: MAX_XFER_DIRECT as usize,
         })
     }
 
-    /// Keep the event thread's poll set in step with the descriptors the
-    /// backend has open, starting the thread on first use.
-    ///
-    /// Each descriptor is duplicated before it is handed over. The handle table
-    /// owns the original and may close it at any time; a watch holding the same
-    /// number would then be watching whatever opened next.
-    fn sync_watches(&mut self, vrings: &[VringRwLock]) {
-        let (added, removed) = self
-            .nvidia
-            .lock()
-            .expect("backend mutex")
-            .take_watch_updates();
-        if added.is_empty() && removed.is_empty() && self.watches.is_some() {
+    /// Start the event pump on first use: it needs guest memory and the event
+    /// queue, neither of which exists before the guest drives the device.
+    fn ensure_pump(&self, vrings: &[Vring]) {
+        let mut p = self.shared.pump.lock().unwrap();
+        if p.handle.is_some() {
             return;
         }
-
-        if self.watches.is_none() {
-            let (Some(mem), Some(vring)) = (self.mem.clone(), vrings.get(1).cloned()) else {
-                return;
-            };
-            let (tx, rx) = channel();
-            std::thread::Builder::new()
-                .name("nvgpu-events".into())
-                .spawn(move || event_pump(rx, vring, mem))
-                .map(|_| self.watches = Some(tx))
-                .unwrap_or_else(|e| log::error!("event pump would not start: {e}"));
-        }
-        let Some(tx) = self.watches.as_ref() else {
+        let (Some(mem), Some(vring)) = (
+            self.shared.mem.read().unwrap().clone(),
+            vrings.get(EVENT_QUEUE).cloned(),
+        ) else {
             return;
         };
-
-        for (handle, fd) in added {
-            let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-            if dup < 0 {
-                log::warn!("watch on handle {handle}: dup: {}", std::io::Error::last_os_error());
-                continue;
+        match Pump::spawn(VringEventQueue { vring, mem }) {
+            Ok(h) => {
+                for c in std::mem::take(&mut p.queued) {
+                    h.send(c);
+                }
+                p.handle = Some(h);
             }
-            let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
-        }
-        for handle in removed {
-            let _ = tx.send(Watch::Remove(handle));
+            Err(e) => log::error!("event pump would not start: {e}"),
         }
     }
 
-    /// Drain one virtqueue, dispatching every chain.
-    fn process(
-        &mut self,
-        vring: &VringRwLock,
-        mem: &GuestMemoryLoadGuard<GuestMemoryMmap>,
-    ) -> std::io::Result<bool> {
+    /// Serve under the backend lock, forwarding what it tells the pump and
+    /// withdrawing queued executor jobs if it reset the session.
+    fn serve(&self, req: &[u8], cap: usize) -> Outcome {
+        let mut be = self.shared.nvidia.lock().unwrap();
+        let before = be.generation();
+        let outcome = be.serve(req, cap);
+        let reset = be.generation() != before;
+        let cmds = be.take_pump_cmds();
+        drop(be);
+        self.shared.forward(cmds);
+        if reset {
+            self.shared.pool.cancel_pending();
+        }
+        outcome
+    }
+
+    /// Drain the control queue.
+    fn process(&mut self, vring: &Vring) -> std::io::Result<bool> {
+        let Some(atomic) = self.shared.mem.read().unwrap().clone() else {
+            return Err(std::io::Error::other("guest memory not set"));
+        };
+        let mem = atomic.memory();
         let mut used = false;
         loop {
-            let mut guard = vring.get_mut();
-            let Ok(mut avail) = guard.get_queue_mut().iter(mem.clone()) else {
-                break;
+            let (chain, epoch) = {
+                let mut ring = vring.get_mut();
+                let Ok(mut avail) = ring.get_queue_mut().iter(mem.clone()) else {
+                    break;
+                };
+                let Some(chain) = avail.next() else { break };
+                (chain, vring.epoch())
             };
-            let Some(chain) = avail.next() else { break };
-            drop(guard);
-
-            let head = chain.head_index();
-            let mut req = Vec::new();
-            let mut resp_desc = None;
-
-            for desc in chain.clone() {
-                if desc.is_write_only() {
-                    resp_desc = Some(desc);
-                } else {
-                    let mut buf = vec![0u8; desc.len() as usize];
-                    mem.read_slice(&mut buf, desc.addr()).map_err(|e| {
-                        std::io::Error::other(format!("read request descriptor: {e}"))
-                    })?;
-                    req.extend_from_slice(&buf);
-                }
-            }
-
-            let written = match resp_desc {
-                Some(d) => {
-                    let cap = std::cmp::min(d.len() as usize, RESP_MAX);
-                    let mut resp = vec![0u8; cap];
-                    let n = self
-                        .nvidia
-                        .lock()
-                        .expect("backend mutex")
-                        .dispatch(&req, &mut resp);
-                    if n > 0 {
-                        mem.write_slice(&resp[..n], d.addr()).map_err(|e| {
-                            std::io::Error::other(format!("write response descriptor: {e}"))
-                        })?;
-                    }
-                    n
-                }
-                None => {
-                    log::warn!("chain {head} has no writable descriptor; dropping");
-                    0
-                }
-            };
-
-            vring
-                .add_used(head, written as u32)
-                .map_err(|e| std::io::Error::other(format!("add_used: {e}")))?;
             used = true;
+            let head = chain.head_index();
+            let descs = chain.map(|d| (d.is_write_only(), d.addr(), d.len()));
+            let (l, refused) = match layout(descs, self.max_req) {
+                Ok(l) => (l, None),
+                Err(l) => {
+                    log::warn!(
+                        "chain {head}: a request of more than {} bytes; refused",
+                        self.max_req
+                    );
+                    (l, Some(libc::E2BIG))
+                }
+            };
+            let taken = Taken {
+                head,
+                epoch,
+                writable: l.writable,
+                cap: l.cap,
+            };
+            if taken.cap < HDR {
+                // Nowhere to put even a header. Hand the chain back empty so
+                // the ring does not leak it.
+                log::warn!("chain {head} has {} writable bytes; dropping", taken.cap);
+                self.shared.complete(vring, &taken, Reply::default());
+                continue;
+            }
+            let req = match refused {
+                Some(e) => {
+                    self.shared.complete(vring, &taken, transport_error(e));
+                    continue;
+                }
+                None => match gather(&*mem, &l.readable, l.req_len) {
+                    Some(r) => r,
+                    None => {
+                        self.shared
+                            .complete(vring, &taken, transport_error(libc::EFAULT));
+                        continue;
+                    }
+                },
+            };
+
+            match self.serve(&req, taken.cap.min(self.max_resp)) {
+                Outcome::Reply(r) => self.shared.complete(vring, &taken, r),
+                Outcome::Ioctl2(mut p) => match p.executor_key() {
+                    Some(key) => {
+                        let (shared, vring) = (self.shared.clone(), vring.clone());
+                        self.shared.pool.submit(
+                            key,
+                            Box::new(move |cancelled| {
+                                let reply = if cancelled {
+                                    p.cancelled_reply()
+                                } else {
+                                    p.execute();
+                                    shared.nvidia.lock().unwrap().finish_ioctl2(p)
+                                };
+                                shared.complete(&vring, &taken, reply);
+                            }),
+                        );
+                    }
+                    None => {
+                        // Inline, but still without the backend lock: the
+                        // host call is made by nobody else's schedule.
+                        p.execute();
+                        let reply = self.shared.nvidia.lock().unwrap().finish_ioctl2(p);
+                        self.shared.complete(vring, &taken, reply);
+                    }
+                },
+            }
         }
         Ok(used)
     }
@@ -452,7 +721,7 @@ impl NvGpuBackend {
 
 impl VhostUserBackendMut for NvGpuBackend {
     type Bitmap = ();
-    type Vring = VringRwLock;
+    type Vring = Vring;
 
     fn num_queues(&self) -> usize {
         QUEUE_COUNT
@@ -463,10 +732,35 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn features(&self) -> u64 {
+        // INDIRECT_DESC lets one ring slot describe a whole table of
+        // descriptors (virtio-queue chain.rs:119-145 follows them), which is
+        // what makes 4 MiB requests possible on a 256-entry ring. Without it
+        // the guest keeps to 256 KiB.
         (1 << VIRTIO_F_VERSION_1)
             | (1 << VIRTIO_F_NOTIFY_ON_EMPTY)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
+            | (1 << VIRTIO_RING_F_INDIRECT_DESC)
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
+    }
+
+    fn acked_features(&mut self, features: u64) {
+        let indirect = features & (1 << VIRTIO_RING_F_INDIRECT_DESC) != 0;
+        let limit = if indirect {
+            MAX_XFER_INDIRECT
+        } else {
+            MAX_XFER_DIRECT
+        };
+        log::info!(
+            "features acked: indirect descriptors {}, requests and responses up to {limit} bytes",
+            if indirect { "on" } else { "off" }
+        );
+        self.max_req = limit as usize;
+        self.max_resp = limit as usize;
+        self.shared
+            .nvidia
+            .lock()
+            .unwrap()
+            .set_transport_limits(limit, limit);
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -481,9 +775,26 @@ impl VhostUserBackendMut for NvGpuBackend {
             | VhostUserProtocolFeatures::SHMEM
     }
 
+    /// The guest reset the device. The rings' epochs have already moved (the
+    /// handler disables every ring first, handler.rs:279-290); this ends the
+    /// session, so a rebooted guest does not find the old one's host files
+    /// still open -- DRM master still held, leases still granted.
+    fn reset_device(&mut self) {
+        let mut be = self.shared.nvidia.lock().unwrap();
+        be.session_reset("device reset");
+        let cmds = be.take_pump_cmds();
+        drop(be);
+        self.shared.forward(cmds);
+        self.shared.pool.cancel_pending();
+    }
+
     fn set_backend_req_fd(&mut self, backend: Backend) {
         log::info!("window: request channel open; device memory is now mappable");
-        self.nvidia.lock().unwrap().set_window(Box::new(VhostWindow(backend)));
+        self.shared
+            .nvidia
+            .lock()
+            .unwrap()
+            .set_window(Box::new(VhostWindow(backend)));
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -495,7 +806,7 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn update_memory(&mut self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> std::io::Result<()> {
-        self.mem = Some(mem);
+        *self.shared.mem.write().unwrap() = Some(mem);
         Ok(())
     }
 
@@ -503,7 +814,7 @@ impl VhostUserBackendMut for NvGpuBackend {
         &mut self,
         device_event: u16,
         _evset: vmm_sys_util::epoll::EventSet,
-        vrings: &[VringRwLock],
+        vrings: &[Vring],
         _thread_id: usize,
     ) -> std::io::Result<()> {
         if device_event as usize >= QUEUE_COUNT {
@@ -511,21 +822,22 @@ impl VhostUserBackendMut for NvGpuBackend {
                 "event for unknown queue {device_event}"
             )));
         }
-        // The event queue carries buffers the guest posted for *us* to fill, not
-        // requests. Serving them as requests is a loop with no bottom: each one
-        // is dispatched, answered with "unknown message", handed back filled,
-        // re-posted by the guest, and kicked again -- 7.4 million times in five
-        // seconds, measured, the first time two guests ran at once. The pump
-        // thread owns this queue; a kick on it needs no work here.
+        self.ensure_pump(vrings);
+
+        // The event queue carries buffers the guest posted for *us* to fill,
+        // not requests. Serving them as requests is a loop with no bottom:
+        // each one is dispatched, answered with "unknown message", handed back
+        // filled, re-posted by the guest, and kicked again -- 7.4 million
+        // times in five seconds, measured, the first time two guests ran at
+        // once. The pump owns this queue; a kick on it means buffers arrived,
+        // so it is told to flush what it holds now rather than at its next
+        // sweep.
         if device_event as usize == EVENT_QUEUE {
+            if let Some(h) = self.shared.pump.lock().unwrap().handle.as_ref() {
+                h.kick();
+            }
             return Ok(());
         }
-
-        let mem = self
-            .mem
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("guest memory not set"))?
-            .memory();
 
         let vring = &vrings[device_event as usize];
         if self.event_idx {
@@ -533,20 +845,14 @@ impl VhostUserBackendMut for NvGpuBackend {
             // drain again rather than waiting for a kick that will not come.
             loop {
                 vring.disable_notification().ok();
-                self.process(vring, &mem)?;
+                self.process(vring)?;
                 if !vring.enable_notification().unwrap_or(false) {
                     break;
                 }
             }
         } else {
-            self.process(vring, &mem)?;
+            self.process(vring)?;
         }
-        // After serving, not before: a message that opened a descriptor has to
-        // have been served for the backend to know about it.
-        self.sync_watches(vrings);
-        vring
-            .signal_used_queue()
-            .map_err(|e| std::io::Error::other(format!("signal used queue: {e}")))?;
         Ok(())
     }
 }
@@ -565,7 +871,23 @@ fn main() -> anyhow::Result<()> {
     } else {
         device::nvidia::AbiPolicy::Enforce
     };
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(&args.proc_nvidia, abi_policy)?));
+    let config = BackendConfig {
+        kms_card: args.kms_card,
+        wayland_socket: args.wayland_socket,
+        wayland_export: args.wayland_export,
+        ..BackendConfig::default()
+    };
+    if config.kms_card {
+        log::warn!(
+            "compositor-VM mode: the host card nodes are offered to the guest; \
+             run no compositor on this host"
+        );
+    }
+    let backend = Arc::new(RwLock::new(NvGpuBackend::new(
+        &args.proc_nvidia,
+        abi_policy,
+        config,
+    )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(
@@ -581,12 +903,112 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", args.socket))?;
 
     backend
-        .write()
+        .read()
         .expect("backend lock")
+        .shared
         .nvidia
         .lock()
         .expect("nvidia lock")
         .teardown();
     log::info!("backend exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(x: u64) -> GuestAddress {
+        GuestAddress(x)
+    }
+
+    #[test]
+    fn a_request_is_gathered_from_every_readable_descriptor() {
+        let l = layout(
+            [
+                (false, a(0), 16),
+                (false, a(100), 40),
+                (true, a(200), 64),
+                (true, a(400), 64),
+            ]
+            .into_iter(),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(l.req_len, 56);
+        assert_eq!(l.readable.len(), 2);
+        assert_eq!(l.cap, 128);
+        assert_eq!(l.writable, vec![(a(200), 64), (a(400), 64)]);
+    }
+
+    #[test]
+    fn a_request_over_the_limit_is_refused_before_it_is_read() {
+        let l = layout(
+            [
+                (false, a(0), 600),
+                (false, a(1000), 600),
+                (true, a(2000), 16),
+            ]
+            .into_iter(),
+            1024,
+        )
+        .unwrap_err();
+        assert!(l.readable.is_empty(), "nothing of it is kept to be read");
+        assert_eq!(l.cap, 16, "there is still somewhere to say so");
+    }
+
+    fn memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(a(0), 0x10000)]).unwrap()
+    }
+
+    #[test]
+    fn a_response_is_scattered_across_every_writable_descriptor() {
+        let mem = memory();
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let n = scatter(
+            &mem,
+            &[(a(0x1000), 30), (a(0x3000), 50), (a(0x5000), 50)],
+            &bytes,
+        );
+        assert_eq!(n, 100);
+        let mut back = vec![0u8; 100];
+        mem.read_slice(&mut back[..30], a(0x1000)).unwrap();
+        mem.read_slice(&mut back[30..80], a(0x3000)).unwrap();
+        mem.read_slice(&mut back[80..], a(0x5000)).unwrap();
+        assert_eq!(back, bytes);
+    }
+
+    #[test]
+    fn gather_reads_descriptors_in_order() {
+        let mem = memory();
+        mem.write_slice(b"hello ", a(0x100)).unwrap();
+        mem.write_slice(b"world", a(0x900)).unwrap();
+        let req = gather(&mem, &[(a(0x100), 6), (a(0x900), 5)], 11).unwrap();
+        assert_eq!(req, b"hello world");
+    }
+
+    /// Everything that stops or moves a ring must move its epoch, so a
+    /// completion taken before cannot land after.
+    #[test]
+    fn every_ring_reconfiguration_bumps_the_epoch() {
+        let v: Vring = VringT::new(GuestMemoryAtomic::new(memory()), 256).unwrap();
+        let mut last = v.epoch();
+        let mut bumped = |v: &Vring| {
+            let e = v.epoch();
+            assert!(e > last, "epoch did not move");
+            last = e;
+        };
+        v.set_queue_ready(false);
+        bumped(&v);
+        v.set_queue_info(0x1000, 0x2000, 0x3000).unwrap();
+        bumped(&v);
+        v.set_queue_next_avail(0);
+        bumped(&v);
+        v.set_queue_next_used(0);
+        bumped(&v);
+        v.set_enabled(false);
+        bumped(&v);
+        v.set_queue_size(128);
+        bumped(&v);
+    }
 }

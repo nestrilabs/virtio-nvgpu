@@ -30,7 +30,7 @@ pub struct MmapEntry {
     /// belongs to the fd for the fd's whole life, and closing the fd is a
     /// perfectly normal way to release it -- CUDA never unmaps at all, it just
     /// exits.
-    pub map_fd_handle: u64,
+    pub map_fd_handle: u32,
     /// What to hand back to the SHM allocator when this mapping goes away.
     pub region: ShmRegion,
 }
@@ -67,10 +67,8 @@ impl MmapContext {
     /// pLinearAddress. What identifies the mapping is the descriptor the mmap
     /// arrives on, which works because a host fd is single-use for mapping, so
     /// at most one mapping exists per fd.
-    pub fn find_by_fd_handle(&self, fd_handle: u64) -> Option<&MmapEntry> {
-        self.entries
-            .values()
-            .find(|e| e.map_fd_handle == fd_handle)
+    pub fn find_by_fd_handle(&self, fd_handle: u32) -> Option<&MmapEntry> {
+        self.entries.values().find(|e| e.map_fd_handle == fd_handle)
     }
 
     /// Take every mapping, leaving the table empty. Used at teardown, where a
@@ -93,7 +91,7 @@ impl MmapContext {
     /// the only way they are ever released: a CUDA run makes 29 mappings and
     /// issues no unmap at all. Without this the extents survive until VM
     /// teardown, so each run permanently costs the write-combine zone ~68 MiB.
-    pub fn take_for_fd(&mut self, fd_handle: u64) -> Vec<MmapEntry> {
+    pub fn take_for_fd(&mut self, fd_handle: u32) -> Vec<MmapEntry> {
         let keys: Vec<u64> = self
             .entries
             .iter()
@@ -106,7 +104,7 @@ impl MmapContext {
     }
 
     /// Whether this handle already carries a mapping.
-    pub fn fd_has_mapping(&self, fd_handle: u64) -> bool {
+    pub fn fd_has_mapping(&self, fd_handle: u32) -> bool {
         self.entries.values().any(|e| e.map_fd_handle == fd_handle)
     }
 
