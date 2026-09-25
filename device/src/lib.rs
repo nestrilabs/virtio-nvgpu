@@ -12,6 +12,8 @@ pub mod guarded;
 pub mod handle_table;
 pub mod host;
 pub mod hostfd;
+#[cfg(test)]
+mod i2_e2e;
 pub mod mmap;
 pub mod nvidia;
 pub mod policy;
