@@ -7,14 +7,17 @@
 // received from the guest driver over virtqueues.
 
 pub mod error;
+pub mod exec;
 pub mod guarded;
 pub mod handle_table;
 pub mod host;
 pub mod hostfd;
 pub mod mmap;
 pub mod nvidia;
+pub mod pump;
 pub mod replay;
 pub mod schema;
+pub mod session;
 pub mod shm;
 pub mod userspace;
 pub mod virtio;
