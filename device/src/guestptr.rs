@@ -204,6 +204,23 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
             );
             return Err(libc::EPERM);
         }
+        // The host installs the dma-buf it makes in the caller's table --
+        // ours -- and writes its number back, or with a number already set
+        // looks one up there (nv-dmabuf.c:1683-1697, 1738-1750). Nothing
+        // turns either into a guest descriptor, so the export leaked a
+        // descriptor pinning video memory in this process per call and
+        // handed the guest a number that meant nothing to it (S-15). Refused
+        // until there is a consumer to translate it for; NVIDIA's GBM and
+        // CUDA's dma-buf export take this path, and fail as on a driver
+        // without dma-buf support. Whatever the ABI policy: this check runs
+        // before any profile is known.
+        NV_ESC_EXPORT_TO_DMABUF_FD => {
+            log::warn!(
+                "EXPORT_TO_DMABUF_FD refused: the dma-buf it makes would be the \
+                 backend's, not the guest's"
+            );
+            return Err(libc::EOPNOTSUPP);
+        }
         NV_ESC_RM_ALLOC => {
             sized(OS64_SIZE)?;
             let class = rd32(params, OS64_CLASS).unwrap_or(0);
@@ -1091,6 +1108,18 @@ mod backend_tests {
         assert_eq!(v1(&mut be, h, vid_heap, &os32, &[], None).0, -libc::EPERM);
 
         assert!(seen().is_empty(), "none of them reached the host");
+    }
+
+    #[test]
+    fn a_dma_buf_export_never_reaches_the_host() {
+        let (mut be, h) = ctl();
+        let export = ioc(IOC_RW, b'F', NV_ESC_EXPORT_TO_DMABUF_FD, 2608);
+        let mut p = vec![0u8; 2608];
+        p[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(v1(&mut be, h, export, &p, &[], None).0, -libc::EOPNOTSUPP);
+        p[0..4].copy_from_slice(&3i32.to_le_bytes());
+        assert_eq!(v1(&mut be, h, export, &p, &[], None).0, -libc::EOPNOTSUPP);
+        assert!(seen().is_empty());
     }
 
     #[test]

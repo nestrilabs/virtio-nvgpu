@@ -2158,6 +2158,23 @@ impl NvidiaBackend {
         }
     }
 
+    /// Whether the host's ABI table marks `escape` as carrying a descriptor
+    /// and nothing here translates it: the virtio config's
+    /// FD_CARRYING_IOCTLS (the guest translates those) plus the arms of
+    /// `handle_ioctl` built on them. Today that is EXPORT_TO_DMABUF_FD alone;
+    /// the check is general so that the next such escape a profile adds is
+    /// refused rather than forwarded raw. Before the version is known there
+    /// is no table, and `guestptr::rm_escape` refuses the one there is by
+    /// number.
+    fn untranslated_fd_escape(&self, escape: u32) -> bool {
+        self.abi
+            .and_then(|t| abi::versions::lookup(t, escape))
+            .is_some_and(|e| e.kind == abi::versions::IoctlKind::FdCarrying)
+            && !crate::virtio::FD_CARRYING_IOCTLS
+                .iter()
+                .any(|&(nr, _)| nr == escape)
+    }
+
     fn handle_ioctl(&mut self, cookie: u64, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         if payload.len() < size_of::<IoctlReq>() {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
@@ -2363,6 +2380,18 @@ impl NvidiaBackend {
         }
 
         use abi::ioctl::*;
+
+        // An escape the host's table says carries a descriptor, with no
+        // translation here, would reach the host with the guest's number in
+        // it -- naming whatever this process has open under that number --
+        // and could leave a descriptor of the host's in our table that the
+        // guest never learns of (S-15). Whatever the ABI policy.
+        if self.untranslated_fd_escape(escape) {
+            log::warn!(
+                "escape {escape:#04x} carries a descriptor the backend does not translate; refused"
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EOPNOTSUPP);
+        }
 
         // No guest pointer reaches RM as a pointer (guestptr.rs), whatever
         // the ABI policy: the fields RM would dereference are zeroed or the
@@ -3871,6 +3900,24 @@ mod abi_tests {
             b.check_abi(NV_ESC_RM_CONTROL, 31),
             AbiCheck::SizeMismatch { .. }
         ));
+    }
+
+    /// S-15: an escape the table marks as carrying a descriptor that nothing
+    /// here translates is refused, not forwarded with the guest's number.
+    #[test]
+    fn a_descriptor_carrying_escape_with_no_translation_is_refused() {
+        let mut b = backend();
+        b.learn_driver_version(&t4_version_reply());
+        assert!(b.untranslated_fd_escape(NV_ESC_EXPORT_TO_DMABUF_FD));
+        for translated in [
+            NV_ESC_REGISTER_FD,
+            NV_ESC_ALLOC_OS_EVENT,
+            NV_ESC_FREE_OS_EVENT,
+            NV_ESC_RM_ALLOC_MEMORY,
+            NV_ESC_RM_CONTROL,
+        ] {
+            assert!(!b.untranslated_fd_escape(translated), "{translated:#x}");
+        }
     }
 
     /// Before CHECK_VERSION_STR is answered there is no profile to check
