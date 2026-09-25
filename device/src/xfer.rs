@@ -336,7 +336,22 @@ pub trait Hooks: Send + Sync {
     fn after(&self, p: &mut Prepared, ret: i32) {
         let _ = (p, ret);
     }
+
+    /// On the thread that runs the call, immediately before the host ioctl,
+    /// for a call `before` gave a run gate (`Prepared::set_run_gate`): a
+    /// decision made at prepare time that must still hold when the call
+    /// runs, which may be long after, behind other calls in its executor's
+    /// FIFO. Err refuses the call there; a guard returned is held until the
+    /// ioctl has returned, so whatever takes that decision back waits for
+    /// the call instead of racing it (S-14).
+    fn at_run<'a>(&'a self, p: &Prepared) -> Result<Option<RunGuard<'a>>, Errno> {
+        let _ = p;
+        Ok(None)
+    }
 }
+
+/// What `Hooks::at_run` holds across a host ioctl.
+pub type RunGuard<'a> = std::sync::RwLockReadGuard<'a, ()>;
 
 /// The hooks with nothing overridden.
 pub struct DefaultHooks;
@@ -450,6 +465,8 @@ pub struct Prepared {
     /// offsets in prop_values, with the s32 the kernel writes once executed.
     fence_outs: Vec<(usize, Option<GuardedBuf>)>,
     kms: Option<Arc<KmsFileState>>,
+    /// What `Hooks::before` asked `Hooks::at_run` to check again.
+    run_gate: Option<u64>,
     hooks: Arc<dyn Hooks>,
     sys: Arc<dyn Sys>,
     ret: i32,
@@ -513,6 +530,7 @@ pub fn prepare(
         render_fd: None,
         fence_outs: Vec::new(),
         kms: None,
+        run_gate: None,
         hooks: env.hooks(),
         sys: env.sys(),
         ret: -libc::ECANCELED,
@@ -641,6 +659,17 @@ impl Prepared {
     }
 
     /// The `schema::policy` bits of the entry.
+    /// Ask `Hooks::at_run` to check `revocations` again when the call runs (see
+    /// there). For `Hooks::before`.
+    pub fn set_run_gate(&mut self, revocations: u64) {
+        self.run_gate = Some(revocations);
+    }
+
+    /// What `set_run_gate` recorded.
+    pub fn run_gate(&self) -> Option<u64> {
+        self.run_gate
+    }
+
     pub fn policy(&self) -> u32 {
         self.entry.policy
     }
@@ -1206,10 +1235,16 @@ impl Prepared {
     fn run(&mut self, target_fd: RawFd) -> Result<i32, Errno> {
         self.check_fb_sources()?;
         self.check_props(target_fd)?;
+        let hooks = self.hooks.clone();
+        let gate = match self.run_gate {
+            Some(_) => hooks.at_run(self)?,
+            None => None,
+        };
         let temps = self.gems_in(target_fd)?;
         let removing = self.forget_removed_fb();
         let arg = self.bufs[0].addr() as *mut u8;
         let ret = self.sys.ioctl(target_fd, self.entry.cmd, arg);
+        drop(gate);
         for h in temps {
             self.gem_close(target_fd, h);
         }

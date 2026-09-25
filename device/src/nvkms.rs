@@ -77,11 +77,23 @@
 //! host whose nvidia-drm has that layout.
 //!
 //! Shared by the queue thread (`before`/`after` under the backend mutex) and
-//! nothing else; the lock is only for the `Arc` it lives in.
+//! the executors, which only ever read: a call's head and dpy gates are
+//! decided in `before`, but the call runs later, behind whatever its
+//! executor's FIFO holds, and NVKMS checks nothing itself for
+//! SET_DPY_ATTRIBUTE, SET_LAYER_POSITION, MOVE_CURSOR or SET_CURSOR_IMAGE
+//! (nvkms.c:3070-3085, 3361-3374, 2262-2285, 2230-2257). So every gated call
+//! carries the revocation generation it was decided under, `at_run` refuses
+//! it if a grant has been taken back since, and holds a read lock across the
+//! host ioctl that every revocation takes for writing: a revocation the
+//! guest starts (closing the granting lease, REVOKE_PERMISSIONS) is ordered
+//! strictly after a gated call already running and before any later one
+//! (S-14). A revocation only the host knows of (the lessor ending the
+//! lease) is seen when the backend next asks (kms.rs, "lease ends"), as
+//! before.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use abi::version::DriverVersion;
 
@@ -114,6 +126,19 @@ const REFUSED: &[&str] = &[
     "VRR_SIGNAL_SEMAPHORE",
     "GET_3DVISION_DONGLE_PARAM_BYTES",
     "SET_3DVISION_AEGIS_PARAMS",
+];
+
+/// Commands a grant gates outside `--kms-card` (`State::check`,
+/// `flip_heads`, `set_mode`): each carries a run gate (see the module
+/// comment).
+const GATED: &[&str] = &[
+    "SET_CURSOR_IMAGE",
+    "MOVE_CURSOR",
+    "SET_LUT",
+    "SET_DPY_ATTRIBUTE",
+    "SET_LAYER_POSITION",
+    "FLIP",
+    "SET_MODE",
 ];
 
 /// Only a guest that owns the display (`--kms-card`): device-wide state
@@ -206,6 +231,11 @@ pub struct NvkmsPolicy {
     /// ALLOC_DEVICE reply is left alone too.
     keep_display_coherency: AtomicBool,
     state: Mutex<State>,
+    /// Bumped by every revocation, under `revoking`'s write lock.
+    revocations: AtomicU64,
+    /// Read-held by a gated call across its host ioctl (`at_run`),
+    /// write-held by a revocation. Always taken before `state`.
+    run_lock: RwLock<()>,
 }
 
 /// Narrow ALLOC_DEVICE's reply to coherent display memory, where the device
@@ -338,6 +368,45 @@ impl NvkmsPolicy {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Take a grant back: after every gated call already running has
+    /// returned, and so that every one still queued is refused.
+    ///
+    /// Called on the queue thread under the backend mutex, which no executor
+    /// waits for while holding the read side, so this waits at most for the
+    /// calls in flight; and only when something is really taken back, so a
+    /// CLOSE of any other handle never waits on a flip.
+    fn revoking<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let _w = self.run_lock.write().unwrap_or_else(|e| e.into_inner());
+        let r = f(&mut self.lock());
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        r
+    }
+
+    /// `Hooks::at_run`: a gated call whose grant may have been taken back
+    /// since `before` let it through (see the module comment).
+    pub fn at_run(&self, p: &Prepared) -> Result<Option<crate::xfer::RunGuard<'_>>, Errno> {
+        let Some(seen) = p.run_gate() else {
+            return Ok(None);
+        };
+        self.hold_unless_revoked(seen).map(Some).map_err(|_| {
+            refuse(format_args!(
+                "{} on handle {}: a grant it relied on was taken back while it waited to run",
+                p.name(),
+                p.target()
+            ))
+        })
+    }
+
+    /// The read side of the run lock, if nothing was revoked since the
+    /// count was `seen`.
+    fn hold_unless_revoked(&self, seen: u64) -> Result<crate::xfer::RunGuard<'_>, Errno> {
+        let guard = self.run_lock.read().unwrap_or_else(|e| e.into_inner());
+        if self.revocations.load(Ordering::SeqCst) != seen {
+            return Err(libc::EPERM);
+        }
+        Ok(guard)
+    }
+
     /// The host driver version, which picks the layout every offset below
     /// comes from.
     pub fn set_version(&self, v: DriverVersion) {
@@ -360,15 +429,17 @@ impl NvkmsPolicy {
     /// (nvidia-drm-drv.c:1588-1600) and nvKmsClose frees a file's devices
     /// and permissions (nvkms.c:5254-5308).
     pub fn forget_handle(&self, h: u32) {
-        let mut st = self.lock();
-        st.typed.remove(&h);
-        st.grant_fds.remove(&h);
-        st.disps.retain(|&(m, _), _| m != h);
-        st.perms.retain(|&(m, _), _| m != h);
-        st.revoke_all_through(h);
-        st.ended.remove(&h);
-        if st.nvkms_granters.remove(&h) {
-            st.forget_nvkms_grants();
+        // Grants *through* h: its own records are its file's, which a call
+        // still queued on it keeps open on the host with the permissions it
+        // had.
+        let revokes = {
+            let st = self.lock();
+            st.granted_through(h) || st.nvkms_granters.contains(&h)
+        };
+        if revokes {
+            self.revoking(|st| st.forget_handle(h));
+        } else {
+            self.lock().forget_handle(h);
         }
     }
 
@@ -378,11 +449,13 @@ impl NvkmsPolicy {
     /// ends"), and a handle that had granted something stays on the list
     /// the backend keeps asking about. CLOSE forgets it anyway.
     pub fn lease_ended(&self, kms: u32) {
-        let mut st = self.lock();
-        if st.granted_through(kms) {
-            st.ended.insert(kms);
+        if !self.lock().granted_through(kms) {
+            return;
         }
-        st.revoke_all_through(kms);
+        self.revoking(|st| {
+            st.ended.insert(kms);
+            st.revoke_all_through(kms);
+        });
     }
 
     /// Whether nvidia-drm GRANT_PERMISSIONS ever succeeded through KMS
@@ -413,12 +486,13 @@ impl NvkmsPolicy {
 
     /// A session reset: every handle is gone.
     pub fn reset(&self) {
-        let mut st = self.lock();
-        let version = st.version;
-        *st = State {
-            version,
-            ..State::default()
-        };
+        self.revoking(|st| {
+            let version = st.version;
+            *st = State {
+                version,
+                ..State::default()
+            };
+        });
     }
 
     /// Whether `h` has had an NVKMS call (and so can never be a grant or
@@ -445,13 +519,29 @@ impl NvkmsPolicy {
             fds: &fds,
             kms_card: self.kms_card.load(Ordering::Relaxed),
         };
+        // Read before anything is decided: a revocation from here on is
+        // one the decision below did not see.
+        let seen = self.revocations.load(Ordering::SeqCst);
         let mut st = self.lock();
         let pol = p.policy();
         if pol & (policy::GRANT | policy::REVOKE) != 0 {
             let arg = p.buffer(0).unwrap_or(&[]);
-            return st.drm_check(p.name(), &call, arg);
+            st.drm_check(p.name(), &call, arg)?;
+            if pol & policy::REVOKE != 0 {
+                // Taken back now, not when the reply comes: the host revokes
+                // as the call runs, and a gated call on another executor
+                // must not slip in between. Should the host refuse, the
+                // records are stricter than it for a while, which only
+                // costs the guest its own calls.
+                drop(st);
+                self.revoking(|st| st.drm_record(p.name(), call.target, arg, &[]));
+            }
+            return Ok(());
         }
         let name = p.name().strip_prefix("NVKMS_").unwrap_or(p.name());
+        if !call.kms_card && GATED.contains(&name) {
+            p.set_run_gate(seen);
+        }
         let (lo, exact) = Self::layout(&st)?;
         if pol & policy::NVKMS_EXACT != 0 && !exact {
             return Err(refuse(format_args!(
@@ -471,7 +561,13 @@ impl NvkmsPolicy {
             }
         }
         let params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
-        st.check(lo, name, &call, params)
+        st.check(lo, name, &call, params)?;
+        if matches!(name, "REVOKE_PERMISSIONS" | "RELEASE_OWNERSHIP") {
+            // As for nvidia-drm's REVOKE above; `record` forgets them again.
+            drop(st);
+            self.revoking(State::forget_all_grants);
+        }
+        Ok(())
     }
 
     /// `Hooks::after`: what the host granted, allocated or revoked, and the
@@ -570,7 +666,8 @@ impl NvkmsPolicy {
         };
         st.check(lo, name, &call, &mut msg[16..])?;
         if matches!(name, "RELEASE_OWNERSHIP" | "REVOKE_PERMISSIONS") {
-            st.forget_all_grants();
+            drop(st);
+            self.revoking(State::forget_all_grants);
         }
         Ok(())
     }
@@ -1026,6 +1123,19 @@ impl State {
             .retain(|_, s| !matches!(s, Source::Drm { kms: k, .. } if *k == kms));
     }
 
+    /// `NvkmsPolicy::forget_handle`'s records.
+    fn forget_handle(&mut self, h: u32) {
+        self.typed.remove(&h);
+        self.grant_fds.remove(&h);
+        self.disps.retain(|&(m, _), _| m != h);
+        self.perms.retain(|&(m, _), _| m != h);
+        self.revoke_all_through(h);
+        self.ended.remove(&h);
+        if self.nvkms_granters.remove(&h) {
+            self.forget_nvkms_grants();
+        }
+    }
+
     fn forget_nvkms_grants(&mut self) {
         self.perms.retain(|_, p| !p.from_nvkms);
         self.grant_fds
@@ -1395,6 +1505,46 @@ mod tests {
             Err(libc::EPERM),
             "and it is not granted twice"
         );
+    }
+
+    #[test]
+    fn a_revocation_waits_for_the_gated_call_running_and_refuses_those_queued() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let p = Arc::new(granted(v610()));
+        let seen = p.revocations.load(Ordering::SeqCst);
+        let running = p.hold_unless_revoked(seen).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let closer = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                p.forget_handle(KMS);
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the lease's close waits for the call already on the host"
+        );
+        drop(running);
+        rx.recv().unwrap();
+        closer.join().unwrap();
+        assert_eq!(p.hold_unless_revoked(seen).err(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn a_close_or_lease_end_that_takes_nothing_back_leaves_queued_calls_alone() {
+        let p = granted(v610());
+        let seen = p.revocations.load(Ordering::SeqCst);
+        // M holds the grant, it did not make it; 99 is nobody.
+        p.forget_handle(M);
+        p.forget_handle(99);
+        p.lease_ended(99);
+        assert!(p.hold_unless_revoked(seen).is_ok());
+        let p = granted(v610());
+        let seen = p.revocations.load(Ordering::SeqCst);
+        p.lease_ended(KMS);
+        assert!(p.hold_unless_revoked(seen).is_err());
     }
 
     #[test]

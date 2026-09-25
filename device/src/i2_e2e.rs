@@ -1115,7 +1115,19 @@ impl World {
         self.send(g, 0)
     }
 
-    fn send(&mut self, mut g: Guest, short: usize) -> Result<i32, i32> {
+    fn send(&mut self, g: Guest, short: usize) -> Result<i32, i32> {
+        self.send_with(g, short, |_| {})
+    }
+
+    /// `send`, with `meanwhile` run on the backend after the call was
+    /// prepared and before it runs: what happens while it waits in its
+    /// executor's queue.
+    fn send_with(
+        &mut self,
+        mut g: Guest,
+        short: usize,
+        meanwhile: impl FnOnce(&mut NvidiaBackend),
+    ) -> Result<i32, i32> {
         g.translate(&self.hooks)?;
         let req = g.build();
         let cap = g.resp_len() - short;
@@ -1127,6 +1139,7 @@ impl World {
                     g.executor(),
                     "both halves agree on who waits"
                 );
+                meanwhile(&mut self.be);
                 p.execute();
                 self.be.finish_ioctl2(p)
             }
@@ -1722,6 +1735,57 @@ fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes(
     nvkms_call(&mut w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 41, 11]);
+}
+
+/// A gated call is decided when it is prepared and runs when its executor
+/// gets to it, and NVKMS checks nothing itself for MOVE_CURSOR
+/// (nvkms.c:2262-2285). A grant taken back in between -- here the lease
+/// file that granted it closes -- refuses the call where it runs, before
+/// the host sees it (S-14).
+#[test]
+fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() {
+    let mut w = nvkms_world();
+    let (kms, modeset) = (w.kms, w.modeset);
+    grant_head_1(&mut w);
+    let table = w.be.driver.and_then(schema::modeset_table);
+    nvkms_call(&mut w, 11, &cursor(1));
+    let g = Guest::gather_in(
+        &mut w.mem,
+        schema::Class::Modeset,
+        table,
+        modeset,
+        0,
+        NVKMS,
+        0x1000,
+    )
+    .unwrap();
+    let r = w.send_with(g, 0, |be| be.close_handle(kms).unwrap());
+    assert_eq!(r, Ok(-libc::EPERM));
+    assert_eq!(
+        w.fake.0.lock().unwrap().nvkms,
+        vec![0, 41, 11],
+        "the granted MOVE_CURSOR of grant_head_1, and nothing since"
+    );
+
+    // A revocation that concerns no grant costs a queued call nothing.
+    let mut w = nvkms_world();
+    let modeset = w.modeset;
+    grant_head_1(&mut w);
+    let table = w.be.driver.and_then(schema::modeset_table);
+    nvkms_call(&mut w, 11, &cursor(1));
+    let g = Guest::gather_in(
+        &mut w.mem,
+        schema::Class::Modeset,
+        table,
+        modeset,
+        0,
+        NVKMS,
+        0x1000,
+    )
+    .unwrap();
+    let render = w.render;
+    let r = w.send_with(g, 0, |be| be.close_handle(render).unwrap());
+    assert_eq!(r, Ok(0));
 }
 
 /// The host takes a lease back without a word to the lessee's file -- the
