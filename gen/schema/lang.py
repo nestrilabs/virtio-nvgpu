@@ -74,6 +74,7 @@ POL_FB_READ = 1 << 5        # GEM_OUT handles only for the file's own FBs
 POL_SETPROP = 1 << 6        # legacy property set: no fd/pointer properties
 POL_FB_PLANES = 1 << 7      # ADDFB2: plane count from pixel_format
 POL_NVKMS = 1 << 8          # NVKMS command; the NVKMS hook decides
+POL_MASTER = 1 << 9         # SET/DROP_MASTER: only on a host card, never a lease
 
 
 def ioc(d, t, nr, size):

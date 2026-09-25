@@ -237,6 +237,8 @@ pub mod policy {
     pub const FB_PLANES: u32 = 1 << 7;
     /// An NVKMS command: the NVKMS hook decides.
     pub const NVKMS: u32 = 1 << 8;
+    /// SET_MASTER / DROP_MASTER: only on a host card file, never a lease.
+    pub const MASTER: u32 = 1 << 9;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,8 +371,8 @@ mod tests {
             (Class::Kms, 0x0b),    // GEM_OPEN
             (Class::Kms, 0x2d),    // PRIME_HANDLE_TO_FD
             (Class::Kms, 0x2e),    // PRIME_FD_TO_HANDLE
-            (Class::Kms, 0x1e),    // SET_MASTER
-            (Class::Kms, 0x1f),    // DROP_MASTER
+            (Class::Render, 0x1e), // SET_MASTER
+            (Class::Render, 0x1f), // DROP_MASTER
             (Class::Kms, 0x11),    // AUTH_MAGIC
             (Class::Kms, 0xb3),    // MAP_DUMB
             (Class::Render, 0x09), // GEM_CLOSE
@@ -378,6 +380,22 @@ mod tests {
         for (class, nr) in refused {
             let cmd = (b'd' as u32) << 8 | nr;
             assert!(DRM_TABLE.lookup(class, cmd).is_none(), "{class:?} {nr:#x}");
+        }
+    }
+
+    /// The guest core arbitrates master; its hooks carry the outcome to the
+    /// host card file as these, on the file's executor (nvidia's master_set
+    /// and master_drop take nvkms_lock and blank heads, so never on the queue
+    /// thread), and the backend lets them reach cards only.
+    #[test]
+    fn master_calls_exist_only_for_cards_and_carry_nothing() {
+        for nr in [0x1e, 0x1f] {
+            let cmd = (b'd' as u32) << 8 | nr;
+            let e = DRM_TABLE.lookup(Class::Kms, cmd).expect("KMS entry");
+            assert_eq!((e.size, e.cmd >> 30), (0, 0), "{}: DRM_IO", e.name);
+            assert_eq!(e.policy, policy::MASTER, "{}", e.name);
+            assert_eq!(e.exec, Exec::Executor, "{}", e.name);
+            assert!(e.fields.len == 0, "{}", e.name);
         }
     }
 

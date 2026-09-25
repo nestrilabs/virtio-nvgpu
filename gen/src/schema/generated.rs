@@ -159,6 +159,8 @@ static DRM_FIELDS: &[Field] = &[
 static DRM_IOCTLS: &[Ioctl] = &[
     Ioctl { name: "GET_CAP", class: Class::Kms, cmd: 0xc010640c, nvkms_cmd: 0, size: 16, exec: Exec::Executor, special: Special::None, policy: 0x0, arg_in_only: false, fields: Span { first: 0, len: 0 } },
     Ioctl { name: "SET_CLIENT_CAP", class: Class::Kms, cmd: 0x4010640d, nvkms_cmd: 0, size: 16, exec: Exec::Executor, special: Special::None, policy: 0x0, arg_in_only: false, fields: Span { first: 0, len: 0 } },
+    Ioctl { name: "SET_MASTER", class: Class::Kms, cmd: 0x0000641e, nvkms_cmd: 0, size: 0, exec: Exec::Executor, special: Special::None, policy: 0x200, arg_in_only: false, fields: Span { first: 0, len: 0 } },
+    Ioctl { name: "DROP_MASTER", class: Class::Kms, cmd: 0x0000641f, nvkms_cmd: 0, size: 0, exec: Exec::Executor, special: Special::None, policy: 0x200, arg_in_only: false, fields: Span { first: 0, len: 0 } },
     Ioctl { name: "WAIT_VBLANK", class: Class::Kms, cmd: 0xc018643a, nvkms_cmd: 0, size: 24, exec: Exec::Executor, special: Special::None, policy: 0x0, arg_in_only: false, fields: Span { first: 0, len: 0 } },
     Ioctl { name: "CRTC_GET_SEQUENCE", class: Class::Kms, cmd: 0xc018643b, nvkms_cmd: 0, size: 24, exec: Exec::Executor, special: Special::None, policy: 0x0, arg_in_only: false, fields: Span { first: 0, len: 0 } },
     Ioctl { name: "CRTC_QUEUE_SEQUENCE", class: Class::Kms, cmd: 0xc018643c, nvkms_cmd: 0, size: 24, exec: Exec::Executor, special: Special::None, policy: 0x0, arg_in_only: false, fields: Span { first: 0, len: 0 } },

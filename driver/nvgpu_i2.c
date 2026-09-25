@@ -974,6 +974,10 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
   if (!ret && st->e->special == NVGPU_SSPECIAL_ATOMIC && call->ops &&
       call->ops->special)
     ret = call->ops->special(call, NVGPU_SSPECIAL_ATOMIC, 0);
+  /* The caller's own look at exactly what will be sent (event reservations,
+   * rewriting a blocking wait into an event, nvgpu_kms.c). */
+  if (!ret && call->ops && call->ops->phase)
+    ret = call->ops->phase(call, 0);
   if (ret)
     goto drop;
 
@@ -1021,6 +1025,15 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
   if (ret)
     goto out;
   nvgpu_i2_restore(st);
+  /* The host has answered: whatever the caller does with that happens before
+   * anything is materialised, so a refusal here still drops every output. */
+  if (call->ops && call->ops->phase) {
+    ret = call->ops->phase(call, 1);
+    if (ret) {
+      nvgpu_i2_drop_outs(call, 0, 0);
+      goto out;
+    }
+  }
   ret = nvgpu_i2_outputs(call);
   if (!ret && st->e->special == NVGPU_SSPECIAL_ATOMIC && call->ops &&
       call->ops->special)

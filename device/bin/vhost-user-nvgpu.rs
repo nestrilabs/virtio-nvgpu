@@ -968,6 +968,24 @@ fn main() -> anyhow::Result<()> {
         abi_policy,
         config,
     )?));
+    // Host connector and lease changes of the cards the guest drives, which
+    // arrive only as uevents (device::kms). Only in compositor-VM mode: the
+    // guest knows card indices (GET_SYS_FILES section 3) only then, and drops
+    // EV_HOTPLUG for cards it was never told about.
+    let _hotplug = if args.kms_card {
+        let shared = backend.read().expect("backend lock").shared.clone();
+        let cards = shared.nvidia.lock().expect("nvidia lock").kms_cards();
+        let sink = shared.clone();
+        match device::kms::HotplugListener::spawn(cards, move |c| sink.forward(vec![c])) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                log::warn!("no host hotplug events for the guest: uevent socket: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(

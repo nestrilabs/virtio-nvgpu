@@ -21,12 +21,14 @@
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/wait.h>
+#include <linux/xarray.h>
 
 #include <drm/drm_gem.h>
 
 #include "nvgpu_wire.h"
 
 struct drm_file;
+struct nvgpu_kms_file;
 
 /* ───────── Driver state ───────── */
 
@@ -251,6 +253,20 @@ struct nvgpu_fd {
    * GEM proxy does.
    */
   u32 kms_handle;
+  /*
+   * DRM files only: the KMS side of a file that has one (nvgpu_kms.c) -- an
+   * adopted lease, or a primary-node file of a compositor-VM guest -- else
+   * NULL. Made at open, freed at release (nvgpu_kms_detach()).
+   */
+  struct nvgpu_kms_file *kms;
+  /*
+   * DRM files only: host GEM handle -> the nvgpu_gem_object standing for it,
+   * for every proxy whose host object lives in this file's render handle. A
+   * PRIME import on the host hands back the handle a file already has for an
+   * object, so a host handle that arrives twice must find its proxy rather
+   * than grow a second one (which would GEM_CLOSE it twice).
+   */
+  struct xarray gem_index;
 };
 
 /*
@@ -374,13 +390,90 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
  * host file, and return a handle for it in `file`. The proxy takes a
  * reference on `owner`. On failure the host handle has already been closed
  * (by the proxy's own free, where one was made): the caller must not close it
- * again.
+ * again -- except for -EEXIST, which means a proxy for that host handle
+ * already exists and the handle is left alone, being that proxy's.
  */
 int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            u32 host_handle, size_t size, u32 *guest_handle);
 /* Guest handle in `file` -> (host GEM handle, owner backend handle). */
 int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
                       u32 *host_handle, u32 *owner_handle);
+/*
+ * The proxy already standing for host GEM handle `host_handle` of `owner`'s
+ * render file, with a reference taken, or NULL. nvgpu_gem_proxy_create()
+ * refuses (-EEXIST, leaving the handle alone: it is that proxy's) to make a
+ * second one, so a caller whose host handle may be one the file already had
+ * -- anything that PRIME-imports on the host -- looks here first.
+ */
+struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
+                                            u32 host_handle);
+/* A proxy's fake mmap offset in this node (MAP_DUMB, GEM_MAP_OFFSET). */
+int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
+                          u64 *offset);
+
+/* ───────── nvgpu_kms.c ───────── */
+
+/*
+ * The KMS side of a guest DRM file (DESIGN §4). A file has one if it is an
+ * adopted host lease, or a primary-node file on a backend offering card nodes
+ * (NVGPU_BCAP_KMS_CARD), whose host card file is then opened lazily. Called
+ * from nvgpu_drm_open() once the render handle is open; consumes a pending
+ * adoption (nvgpu_adopt_drm_file()) meant for this open.
+ */
+int nvgpu_kms_open(struct nvgpu_dri_dev *dri, struct drm_file *file,
+                   struct nvgpu_fd *nfd);
+/*
+ * Release, after nvgpu_fd_detach_drm() and before the KMS handle is CLOSEd:
+ * stop event delivery, give back every reserved event, close a retired card
+ * handle, free the state.
+ */
+void nvgpu_kms_detach(struct nvgpu_fd *nfd);
+/*
+ * A core-range ioctl on a DRM file: true if this file's KMS side answered it
+ * (result in *ret), false to leave it to the caller (drm_ioctl() or the
+ * driver range) -- always false for a file without a KMS side.
+ */
+bool nvgpu_kms_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
+                     long *ret);
+/* drm_driver.master_set / master_drop: mirror guest master onto the host. */
+void nvgpu_kms_master_set(struct drm_file *file, bool new_master);
+void nvgpu_kms_master_drop(struct drm_file *file);
+/*
+ * A host DRM file the backend holds as `kms_handle` (of backend kind `kind`,
+ * NVGPU_HK_DRM_LEASE) as a new guest DRM file: a clone of `tmpl`, which must
+ * be a primary-node (card) file of this module, opened O_RDWR plus
+ * `o_flags & O_NONBLOCK`; returns a descriptor installed with
+ * `o_flags & O_CLOEXEC`, or -errno. The clone opens a render handle of its
+ * own for its GEM objects.
+ *
+ * Ownership of `kms_handle` passes to this call whenever `tmpl` is such a
+ * file: on success the new file owns it (CLOSEd when it is released); on
+ * failure it has been closed here, or by the clone's own release if the
+ * clone got far enough to take it. -EBADF means exactly that `tmpl` is not a
+ * card file of ours: the handle cannot be attributed to a device and is
+ * still the caller's to close. No other failure returns -EBADF.
+ */
+int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
+                         int o_flags);
+
+/* ───────── nvgpu_fence.c (workstream FENCES) ───────── */
+
+/*
+ * Used by ATOMIC's fence properties (nvgpu_kms.c), implemented by FENCES.
+ *
+ * nvgpu_fence_unwrap_fd: the backend sync_file handle behind guest fence fd
+ * `fd` (a sync_file whose fences are our host fences). *owned: the handle is
+ * a temporary made for this call (SYNC_MERGE, SIGNALED_SYNC_FILE) and is to be
+ * consumed by it (NVGPU_I2_FD_CONSUME); otherwise it belongs to a proxy fence
+ * and must not be closed. 0 or -errno.
+ *
+ * nvgpu_fence_from_handle: a guest sync_file descriptor (installed,
+ * O_CLOEXEC) standing for backend sync_file handle `handle`, which it then
+ * owns; or -errno, the handle still the caller's.
+ */
+int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
+                          bool *owned);
+int nvgpu_fence_from_handle(struct nvgpu_device *dev, u32 handle);
 
 /* ───────── nvgpu_hostfile.c ───────── */
 
@@ -580,6 +673,18 @@ struct nvgpu_i2_ops {
   /* Schema specials (e.g. "atomic"): called after gathering (phase 0, may add
    * dyn records / fd records) and after the reply (phase 1). */
   int (*special)(struct nvgpu_i2_call *call, u32 special_id, int phase);
+  /*
+   * Every call, whatever its entry. Phase 0: after gathering, translation and
+   * special(0), before the request is built -- the kernel copies
+   * (nvgpu_i2_buf()) are what will be sent and may be rewritten; an error
+   * refuses the call unsent. Phase 1: as soon as a reply has been parsed,
+   * before GEM/descriptor outputs, special(1) and copy-back; call->ret is the
+   * host's result, and the hook may change it (it is what the caller gets
+   * back) or rewrite the kernel copies that will be copied back. An error
+   * there drops the reply's outputs and is returned. Not called in phase 1
+   * when no reply was parsed (refused, transport failure, abandoned).
+   */
+  int (*phase)(struct nvgpu_i2_call *call, int phase);
 };
 
 struct nvgpu_i2_call {

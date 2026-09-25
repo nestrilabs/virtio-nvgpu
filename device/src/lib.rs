@@ -14,6 +14,7 @@ pub mod host;
 pub mod hostfd;
 #[cfg(test)]
 mod i2_e2e;
+pub mod kms;
 pub mod mmap;
 pub mod nvidia;
 pub mod policy;

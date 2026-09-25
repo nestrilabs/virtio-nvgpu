@@ -445,8 +445,19 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
     nvgpu_close_handle(dev, handle);
     return -EBADF;
   }
-  /* nvgpu_adopt_drm_file validates the template and owns the handle. */
-  fd = nvgpu_adopt_drm_file(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
+  /*
+   * nvgpu_adopt_drm_file validates the template and owns the handle -- once
+   * the template is a card file of ours, and of this device: a handle is a
+   * number in one backend session, and adopted through another device's file
+   * it would name whatever that session has under it. Anything else (-EBADF)
+   * leaves the handle ours to close.
+   */
+  if (nvgpu_drm_file_nfd(tmpl) && nvgpu_drm_file_nfd(tmpl)->dev == dev)
+    fd = nvgpu_adopt_drm_file(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
+  else
+    fd = -EBADF;
+  if (fd == -EBADF)
+    nvgpu_close_handle(dev, handle);
   fput(tmpl);
   return fd;
 }
