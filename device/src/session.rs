@@ -536,6 +536,7 @@ impl NvidiaBackend {
             HostOp::DropIfMaster { card } => {
                 Ok((vec![hostfd::drop_master(self.raw(card)?) as u64], vec![]))
             }
+            HostOp::SyncobjWatch { key, cookie } => Ok((self.syncobj_watch(key, cookie)?, vec![])),
             HostOp::CloseMany { handles } => {
                 let closed = handles
                     .iter()

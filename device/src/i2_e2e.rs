@@ -655,6 +655,8 @@ struct Kernel {
     /// What CREATE_LEASE hands back as the new descriptor, if not a fresh one.
     lease_fd: Option<RawFd>,
     fbs: Vec<(u32, u32)>,
+    /// The timeout_nsec a SYNCOBJ_WAIT reached the host with.
+    wait_timeout: Option<i64>,
 }
 
 struct Fake(Mutex<Kernel>);
@@ -687,6 +689,8 @@ const GETRESOURCES: u32 = 0xc040_64a0;
 const ADDFB2: u32 = 0xc068_64b8;
 const CREATE_LEASE: u32 = 0xc018_64c6;
 const GRANT: u32 = 0xc00c_6452;
+const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
+const SYNCOBJ_EVENTFD: u32 = 0xc018_64cf;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 
 impl Sys for Fake {
@@ -796,6 +800,12 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
                 poke(arg, 16, 4, 9);
                 poke(arg, 20, 4, fd as u32 as u64);
                 0
+            }
+            // drm_syncobj_wait_ioctl with a zero timeout: nothing signalled,
+            // so -ETIME at once (drm_syncobj.c:1156-1159).
+            ("e2e-render", SYNCOBJ_WAIT) => {
+                k.wait_timeout = Some(peek(arg, 8, 8) as i64);
+                -libc::ETIME
             }
             ("e2e-kms", GRANT) => {
                 let fd = peek(arg, 0, 4) as i32;
@@ -1110,16 +1120,35 @@ fn a_consumed_descriptor_is_closed_by_the_backend_once_the_call_ran_and_by_the_g
 }
 
 #[test]
-fn a_fence_call_is_refused_by_the_backends_policy_until_fences_are_served() {
-    // SYNCOBJ_CREATE on the render node: a FENCE entry, which the backend's
-    // policy object (policy.rs) refuses as the defaults do, before the host
-    // sees it.
+fn a_syncobj_wait_reaches_the_host_as_a_poll_and_an_eventfd_never_does() {
+    // SYNCOBJ_WAIT with a timeout far in the future, on one handle: the
+    // backend's FENCES policy (policy.rs, fence.rs) hands the host a zero
+    // timeout, and the host's -ETIME comes back as the call's answer -- the
+    // guest then sleeps on a registration of its own (nvgpu_fence.c).
     let mut w = world();
-    w.mem.put(0x1000, &[0; 8]);
     let render = w.render;
+    let mut a = vec![0u8; 40];
+    wr(&mut a, 0, 8, 0x2000);
+    wr(&mut a, 8, 8, i64::MAX as u64);
+    wr(&mut a, 16, 4, 1);
+    w.mem.put(0x1000, &a);
+    w.mem.put(0x2000, &7u32.to_le_bytes());
     assert_eq!(
-        w.call_in(schema::Class::Render, render, 0xc008_64bf, 0x1000, 0),
-        Err(libc::EOPNOTSUPP)
+        w.call_in(schema::Class::Render, render, SYNCOBJ_WAIT, 0x1000, 0),
+        Ok(-libc::ETIME)
+    );
+    assert_eq!(w.fake.0.lock().unwrap().wait_timeout, Some(0));
+    assert_eq!(w.calls(), vec![("e2e-render".to_string(), SYNCOBJ_WAIT)]);
+
+    // SYNCOBJ_EVENTFD would leave a kernel entry nobody can take back; it is
+    // refused before the host sees it (registrations are HOST_OP state).
+    let mut e = vec![0u8; 24];
+    wr(&mut e, 0, 4, 7);
+    wr(&mut e, 16, 4, u32::MAX as u64);
+    w.mem.put(0x3000, &e);
+    assert_eq!(
+        w.call_in(schema::Class::Render, render, SYNCOBJ_EVENTFD, 0x3000, 0),
+        Err(libc::EPERM)
     );
     assert!(w.calls().is_empty());
 }

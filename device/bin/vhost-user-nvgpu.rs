@@ -1028,6 +1028,9 @@ fn main() -> anyhow::Result<()> {
         kms_card: args.kms_card,
         wayland_socket: args.wayland_socket,
         wayland_export: args.wayland_export,
+        // The fence and syncobj schemas are served (policy.rs FENCES,
+        // fence.rs): waits are polls here and sleeps in the guest.
+        fences: true,
         ..BackendConfig::default()
     };
     if config.kms_card {

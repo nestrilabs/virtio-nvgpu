@@ -435,6 +435,8 @@ pub struct NvidiaBackend {
     pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
     /// The policy every IOCTL2 is checked against (see `policy.rs`).
     pub(crate) hooks: Arc<dyn Hooks>,
+    /// Shared syncobj wait registrations (HOST_OP SYNCOBJ_WATCH, fence.rs).
+    pub(crate) syncobj_regs: crate::fence::Registrations,
     /// The system calls IOCTL2 makes: the host's, except in tests that run
     /// whole calls against a fake kernel.
     pub(crate) xfer_sys: Arc<dyn Sys>,
@@ -854,6 +856,7 @@ impl NvidiaBackend {
             signaled: None,
             kms_states: std::collections::HashMap::new(),
             hooks: BackendHooks::shared(),
+            syncobj_regs: crate::fence::Registrations::default(),
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
             wl: crate::wl::WlState::default(),
@@ -1096,6 +1099,7 @@ impl NvidiaBackend {
         }
         self.kms_states.clear();
         self.wl_forget_all();
+        self.syncobj_regs.clear();
         self.handles.drain_all();
     }
 

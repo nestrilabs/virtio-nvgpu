@@ -17,6 +17,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use protocol::messages::*;
 
+use crate::fence::RegKey;
 use crate::pump::WatchMode;
 
 /// The kind of a backend handle. Wire value in `HK_*` (protocol::messages).
@@ -373,6 +374,7 @@ pub enum HostOp {
     OpenKms { render: u32, card: u32 },
     DropIfMaster { card: u32 },
     CloseMany { handles: Vec<u32> },
+    SyncobjWatch { key: RegKey, cookie: u64 },
 }
 
 /// Most handles SYNC_MERGE and CLOSE_MANY take: `args[0]` is the count and
@@ -476,6 +478,24 @@ pub fn check_host_op(
                 .map(handle)
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(HostOp::CloseMany { handles })
+        }
+        // A shared, capped syncobj wait registration (fence.rs): not a
+        // descriptor operation, but checked here like every other op.
+        OP_SYNCOBJ_WATCH => {
+            want(5)?;
+            let (render, _) = of_kind(args[0], &is_render)?;
+            let syncobj = u32::try_from(args[1]).map_err(|_| libc::EINVAL)?;
+            let flags = u32::try_from(args[3]).map_err(|_| libc::EINVAL)?;
+            let key = RegKey {
+                render,
+                syncobj,
+                point: args[2],
+                flags,
+            };
+            Ok(HostOp::SyncobjWatch {
+                key,
+                cookie: args[4],
+            })
         }
         _ => Err(libc::EINVAL),
     }
@@ -961,6 +981,42 @@ mod tests {
         r.nargs = 7;
         assert_eq!(check_host_op(&r, k, None), Err(libc::EINVAL));
         assert_eq!(check_host_op(&op(77, &[]), k, None), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn a_syncobj_watch_names_a_render_file_and_the_point_it_waits_for() {
+        let k = &kinds;
+        let cookie = 1u64 << 40;
+        assert_eq!(
+            check_host_op(&op(OP_SYNCOBJ_WATCH, &[1, 7, u64::MAX, 4, cookie]), k, None),
+            Ok(HostOp::SyncobjWatch {
+                key: RegKey {
+                    render: 1,
+                    syncobj: 7,
+                    point: u64::MAX,
+                    flags: 4,
+                },
+                cookie,
+            })
+        );
+        // On a file that is not a render node; with a syncobj handle or flags
+        // wider than the u32 they are; with an argument missing.
+        assert_eq!(
+            check_host_op(&op(OP_SYNCOBJ_WATCH, &[5, 7, 0, 0, cookie]), k, None),
+            Err(libc::EBADF)
+        );
+        assert_eq!(
+            check_host_op(&op(OP_SYNCOBJ_WATCH, &[1, 1 << 32, 0, 0, cookie]), k, None),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            check_host_op(&op(OP_SYNCOBJ_WATCH, &[1, 7, 0, 1 << 32, cookie]), k, None),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            check_host_op(&op(OP_SYNCOBJ_WATCH, &[1, 7, 0, 0]), k, None),
+            Err(libc::EINVAL)
+        );
     }
 
     #[test]
