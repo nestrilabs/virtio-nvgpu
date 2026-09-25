@@ -106,12 +106,11 @@ reviewed because the display work depended on it.
   no cgroup and no rlimit, and the per-guest isolate is not built.
 - Four review findings are partly fixed, and two verification findings are
   partly fixed or open (§8). §9 lists every open item.
-- Memory registered by its pages is released to the guest when its RM handle
-  goes, even where another holder still has it in the host kernel -- UVM,
-  NVKMS, nvidia-drm, an RM export to a descriptor (§3, "Memory registered by
-  its pages"). Never the host's memory, but an unprivileged guest process can
-  use it to reach frames its own kernel has reused: a guest privilege
-  escalation, open.
+- Memory registered by its pages is now released to the guest only when no
+  holder the backend knows of in the host kernel still has it: RM objects,
+  UVM external mappings, and exports refused outright (§3, "Memory registered
+  by its pages"). The holders were found by reading the 610 sources, not by a
+  run; one missed would reopen a guest privilege escalation (§9, item 11).
 
 §10 is the order the remaining work should go in.
 
@@ -231,35 +230,58 @@ bounds it:
 - **Only a virtual address.** The descriptor type must be the user virtual
   address. A physical address, a page array, I/O memory, a dma-buf by
   descriptor and the kernel-only types are refused whatever came with them.
-- **Pinned on both sides until RM lets go.** The guest keeps its pins until
-  the backend reports the registration released, and the backend's range
-  stays mapped until then: RM freed the object, its parent or its client
-  (the backend frees a client holding one itself, on its own file, before
-  that file closes), or the session ended. A duplicate made with DUP_OBJECT
-  holds it too. A free the backend cannot see (an ancestor above the parent)
-  makes the release late, never early.
+- **Pinned on both sides until the host kernel lets go.** The guest keeps
+  its pins until the backend reports the registration released, and the
+  backend's range stays mapped until then. It is released only when every
+  holder is gone:
+  - the RM object the call made, each DUP_OBJECT duplicate, and each object
+    RM made over one of those and keeps a duplicate of its own for (a
+    semaphore surface naming it, a memory mapper over such a surface). Each
+    goes when RM frees it, its parent or its client (the backend frees a
+    client holding one itself, on its own file, before that file closes), or
+    with the session;
+  - each UVM external mapping (MAP_EXTERNAL_ALLOCATION) of any of them,
+    counted whatever UVM answered, until UNMAP_EXTERNAL has covered it on
+    every GPU it names, UVM_FREE takes its external range, or its UVM file
+    closes. On that close the backend takes the mappings down itself first,
+    on its own descriptor, because the event pump's duplicate can make the
+    file's last close later; a mapping that will not come down keeps the
+    pages until the session ends.
+
+  A free the backend cannot see (an ancestor above the parent), a range it
+  did not record (past 65,536 per VM) or a mapping UVM never made makes the
+  release late, never early.
+- **Never handed where the backend cannot follow.** RM's export to a
+  descriptor (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD) and
+  NV_MEMORY_EXPORT's EXPORT_MEM duplicate an object into a client of RM's
+  own, and anything that imports it -- another RM client, NVKMS surface
+  registration, nvidia-drm's GEM import -- makes another. Naming an object
+  that holds a registration, both are refused (EPERM) before RM sees them,
+  and so is UVM's ALLOC_DEVICE_P2P. NVKMS takes an RM handle directly only
+  from kernel clients, and nvidia-drm names memory to NVKMS only by an
+  export descriptor, so these refusals are what keep registered memory out
+  of both.
 - **Bounded.** 4,096 registrations per VM, released ones the guest has not
   yet read included, and 1,024 per guest file; 16 GiB per VM and 4 GiB per
   file; 32,768 separately mapped runs per VM, each a mapping of the
-  backend's.
+  backend's; 65,536 UVM mappings of registered memory per VM.
+- **Coherent on the GPU.** Guest RAM is cached write-back in the guest
+  whatever RM thinks (§15 of ARCHITECTURE.md), so every GPU mapping of
+  registered memory snoops, as for the other system memory the backend
+  rewrites, and so does a context DMA over it (`device/src/rmmem.rs`). Its
+  coherency needs no rewrite: RM takes an OS descriptor of ordinary pages
+  write-back or refuses it, natively too.
 
-What it does not cover: a reference that only the host kernel holds. UVM
-keeps its own duplicate of memory it maps as an external allocation, NVKMS
-of memory registered as a surface, nvidia-drm of memory imported as a GEM
-object, and RM of an object exported to a descriptor
-(NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD, which a later import turns
-back into a handle the backend never saw made) or attached to an
-NV_MEMORY_EXPORT object. RM keeps the pages pinned for those, but the backend
-sees only the guest's handles, and reports the registration released when
-they are freed. The guest then unpins, and pages it reuses stay reachable
-through that holder until it lets go. Those are guest pages, never the
-host's: the host is unaffected. But a guest process that does this on
-purpose -- register, export or map, free the handle -- can read and write
-frames its own kernel has since handed to someone else, which is a guest
-privilege escalation for any user who may open the GPU. Closing that needs
-the backend to follow those references too (holding a registration until
-the UVM, NVKMS or DRM file that took one closes), or to refuse them for
-registered memory. A free the backend itself makes (a closing file's
+What it does not cover: a holder in the host kernel the backend does not
+know of. The list above comes from reading 610.57.04: every place RM
+duplicates a caller's object into a client of its own (a semaphore surface,
+a memory mapper, NV_MEMORY_EXPORT and the unix export, UVM through
+nvUvmInterfaceDupMemory; an event buffer is freed with the memory it names,
+an SM debugger's duplicate lasts one call, and the rest are video memory or
+confidential compute), and every way NVKMS and nvidia-drm reach RM memory. A
+holder that list missed, or one a later release adds, would let the guest
+unpin frames the GPU can still reach -- a guest privilege escalation, never
+the host's memory. A free the backend itself makes (a closing file's
 clients, the session's) releases only what RM confirms it freed; a client
 RM would not free keeps its registrations until the session ends. An
 ALLOC_MEMORY with a zero hObjectNew is refused: RM would make the object
@@ -689,14 +711,19 @@ In rough order of weight.
     nothing at all. Only running [`TESTING.md`](TESTING.md) tells the two
     apart. That applies to the headless path too: its UVM, RM and coherency
     changes are unmeasured.
-11. **Registered guest memory outlives its handle in the host kernel.** A
-    UVM external mapping, an NVKMS surface, an nvidia-drm GEM import or an
-    RM export to a descriptor made from memory registered by its pages keeps
-    RM's pin after the guest's handles are freed, and the backend, which
-    follows only RM handles, then tells the guest to unpin (§3, "Memory
-    registered by its pages"). Never the host's memory, but a guest process
-    can reach pages its own kernel has since reused: a guest privilege
-    escalation, High for the guest. None of it has run on hardware.
+11. **Registered guest memory is released by a list of holders.** The
+    backend tells the guest to unpin memory registered by its pages only
+    when the RM objects, duplicates and UVM external mappings holding it are
+    gone, and refuses to export it (§3, "Memory registered by its pages").
+    That list was read out of one release's sources. A holder it misses
+    releases the pages early, and a guest process can then reach frames its
+    own kernel has reused: never the host's memory, but a guest privilege
+    escalation. The rest errs late: a mapping UVM refused, a range past the
+    recorded bound or a mapping that will not come down when its UVM file
+    closes keeps the pages pinned until a later free or the session, and
+    counts against the registration budgets meanwhile. Exporting registered
+    memory (Vulkan's external memory host exported onward, say) fails with
+    EPERM where it works natively. None of it has run on hardware.
 
 ---
 

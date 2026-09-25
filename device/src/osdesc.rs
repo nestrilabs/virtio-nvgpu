@@ -44,24 +44,60 @@
 //! range stays mapped until RM has let go all the same, so a release that
 //! did keep it would find it there.
 //!
-//! **Lifetime.** A registration is keyed by (hClient, hObject), and ends when
-//! RM frees that object, its parent, or its client (a successful
-//! NV_ESC_RM_FREE naming any of them), when the file its client was
-//! allocated on closes (the backend frees the client itself first, so RM
-//! has let go before the guest is told), or with the session. A duplicate
-//! (NV_ESC_RM_DUP_OBJECT) holds it too. Freeing an ancestor further up
-//! (a device whose subdevice holds it) is not seen, and the registration
-//! then lasts until its client does: late, never early. Ended, its mapping
-//! goes and its id joins a release log the guest reads with
-//! [`OP_OSDESC_REAP`]; the guest unpins what it names.
+//! **Lifetime.** A registration ends only when nothing in the host kernel
+//! can still reach its pages:
+//!
+//! - **RM objects that hold it**: the object the call made, keyed by
+//!   (hClient, hObject); every duplicate of it (NV_ESC_RM_DUP_OBJECT); and
+//!   every object RM made over one of those and keeps a duplicate of its
+//!   own for (`holding_fields`: a semaphore surface, and a memory mapper
+//!   over one). Each lets go when RM frees it, its parent, or its client (a
+//!   successful NV_ESC_RM_FREE naming any of them), when the file its
+//!   client was allocated on closes (the backend frees the client itself
+//!   first, so RM has let go before the guest is told), or with the
+//!   session. Freeing an ancestor further up (a device whose subdevice holds
+//!   it) is not seen, and the object then counts until its client goes:
+//!   late, never early.
+//! - **nvidia-uvm external mappings** of any of those objects
+//!   (MAP_EXTERNAL_ALLOCATION): UVM duplicates the memory into a client of
+//!   its own for as long as the mapping lasts, whatever becomes of the
+//!   guest's handle. One holds it -- even when UVM answered with a failure,
+//!   which it can after making the mappings -- until UNMAP_EXTERNAL has
+//!   covered it on every GPU it was mapped on, UVM_FREE takes the external
+//!   range it lies in (every CREATE_EXTERNAL_RANGE is recorded, up to a
+//!   bound), or its UVM file closes. A file's last reference may be dropped
+//!   later than its close (the event pump holds a duplicate), so on close
+//!   the backend takes the mappings down itself first, on its own
+//!   descriptor: UVM_FREE of each recorded range holding one, then
+//!   UNMAP_EXTERNAL of what is left. What will not come down stays held
+//!   until the session ends.
+//! - **Refused**: what would hand one of those objects to a holder the
+//!   backend cannot follow. RM's export to a descriptor
+//!   (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD) duplicates it into
+//!   RM's export client until that file closes, and every import -- another
+//!   RM client, NVKMS's REGISTER_SURFACE, nvidia-drm's GEM import through
+//!   NVKMS -- makes a duplicate of its own; NV00E0_CTRL_CMD_EXPORT_MEM
+//!   duplicates it into an internal client, importable by UUID (`exported`).
+//!   UVM's ALLOC_DEVICE_P2P, which is for video memory, likewise. All are
+//!   EPERM. NVKMS takes an RM object by (hClient, hObject) only from kernel
+//!   clients (RegisterSurface, nvkms.c:2727-2730), and nvidia-drm names
+//!   memory to NVKMS only by an export descriptor, so the refusal covers
+//!   both; a dma-buf is the other way in, and RM's export of one is refused
+//!   already.
+//!
+//! Ended, its mapping goes and its id joins a release log the guest reads
+//! with [`OP_OSDESC_REAP`]; the guest unpins what it names. It reaps after
+//! every RM_FREE, every close and before every registration, so a release a
+//! UVM call causes is read at the next of those.
 //!
 //! **Bounds.** Registrations per VM (released ones not yet reaped
-//! included), per guest file and bytes per both, and separately mapped runs
+//! included), per guest file and bytes per both, separately mapped runs
 //! per VM (each is a mapping of this process's, and there are
-//! `vm.max_map_count` of those).
+//! `vm.max_map_count` of those), and UVM mappings of registered memory and
+//! recorded external ranges per VM.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -675,6 +711,84 @@ impl Resolved {
     }
 }
 
+// ──────────────────── What else can hold the pages ────────────────────
+
+/// NV_SEMAPHORE_SURFACE (cl00da.h) and NV_MEMORY_MAPPER (cl00fe.h).
+pub(crate) const NV_SEMAPHORE_SURFACE: u32 = 0xda;
+pub(crate) const NV_MEMORY_MAPPER: u32 = 0xfe;
+
+/// Where in class `class`'s allocation parameters RM is named objects of
+/// the caller's client that it duplicates into a client of its own, and
+/// holds for as long as the new object lives, not the named one: a
+/// semaphore surface's hSemaphoreMem and hMaxSubmittedMem (sem_surf.c,
+/// _semsurfDupMemory), a memory mapper's hSemaphoreSurface (mem_mapper.c:
+/// 412). Neither is made a dependant of what it names, so freeing that
+/// leaves the new object, and its duplicate, alive.
+pub(crate) fn holding_fields(class: u32) -> &'static [usize] {
+    match class {
+        NV_SEMAPHORE_SURFACE => &[0, 4],
+        NV_MEMORY_MAPPER => &[0],
+        _ => &[],
+    }
+}
+
+/// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD, _EXPORT_OBJECTS_TO_FD, and
+/// NV00E0_CTRL_CMD_EXPORT_MEM.
+pub(crate) const EXPORT_OBJECT_TO_FD: u32 = 0x3d05;
+pub(crate) const EXPORT_OBJECTS_TO_FD: u32 = 0x3d0b;
+pub(crate) const EXPORT_MEM: u32 = 0x00e0_0101;
+
+/// The objects of the calling client RM control `cmd` would hand to a
+/// holder the backend cannot follow, read from `params`: an RM export
+/// descriptor (the object's duplicate lives in RM's export client until
+/// that file closes, and any importer, NVKMS and nvidia-drm among them,
+/// gets a duplicate of its own), or an NV_MEMORY_EXPORT object (duplicated
+/// into an internal client, and importable by UUID). None for any other
+/// control. A block too short for its layout names every word in it.
+pub(crate) fn exported(cmd: u32, params: &[u8]) -> Option<Vec<u32>> {
+    let words = |from: usize, n: usize| -> Vec<u32> {
+        (0..n).filter_map(|i| rd32(params, from + 4 * i)).collect()
+    };
+    let every = || words(0, params.len() / 4);
+    let count16 = |off: usize| {
+        params
+            .get(off..off + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    Some(match cmd {
+        // NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS: object.type,
+        // .rmObject.{hDevice, hParent, hObject} (hObject at 12), fd, flags.
+        EXPORT_OBJECT_TO_FD if params.len() >= 24 => words(12, 1),
+        // NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS: objects[512] at
+        // 76, numObjects at 2124 (RM exports the first numObjects).
+        EXPORT_OBJECTS_TO_FD if params.len() >= 2128 => {
+            words(76, count16(2124).unwrap_or(512).min(512))
+        }
+        // NV00E0_CTRL_EXPORT_MEM_PARAMS: handles[256] at 8, numHandles at
+        // 1032.
+        EXPORT_MEM if params.len() >= 1048 => words(8, count16(1032).unwrap_or(256).min(256)),
+        EXPORT_OBJECT_TO_FD | EXPORT_OBJECTS_TO_FD | EXPORT_MEM => every(),
+        _ => return None,
+    })
+}
+
+/// nvidia-uvm's commands (uvm_ioctl.h, UVM_IOCTL_BASE(n) == n) that make,
+/// take down or refuse a mapping of registered memory.
+pub(crate) const UVM_MAP_EXTERNAL_ALLOCATION: u32 = 33;
+pub(crate) const UVM_UNMAP_EXTERNAL: u32 = 66;
+pub(crate) const UVM_CREATE_EXTERNAL_RANGE: u32 = 73;
+pub(crate) const UVM_ALLOC_DEVICE_P2P: u32 = 78;
+
+/// A MAP_EXTERNAL_ALLOCATION of registered memory on its way to UVM.
+#[derive(Debug)]
+pub(crate) struct UvmMap {
+    pub base: u64,
+    pub len: u64,
+    pub gpus: Vec<GpuUuid>,
+    pub client: u32,
+    pub memory: u32,
+}
+
 // ─────────────────────────── The registry ───────────────────────────
 
 /// How much one VM, and one of its files, may have registered.
@@ -688,6 +802,10 @@ pub struct Limits {
     pub bytes_per_file: u64,
     /// Separately mapped runs per VM.
     pub vmas_per_vm: usize,
+    /// UVM external mappings of registered memory per VM.
+    pub uvm_maps_per_vm: usize,
+    /// UVM external ranges recorded per VM (what a UVM_FREE takes).
+    pub uvm_ranges_per_vm: usize,
 }
 
 impl Default for Limits {
@@ -698,36 +816,82 @@ impl Default for Limits {
             bytes_per_vm: 16 << 30,
             bytes_per_file: 4 << 30,
             vmas_per_vm: 32768,
+            uvm_maps_per_vm: 65536,
+            uvm_ranges_per_vm: 65536,
         }
     }
 }
 
-/// An RM object a registration lives through: (hClient, hObject), and the
-/// parent it was made under.
+/// An RM object a registration lives through: (hClient, hObject).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Key {
     client: u32,
     object: u32,
 }
 
+/// A GPU's UUID, as UVM names one (NvProcessorUuid).
+pub(crate) type GpuUuid = [u8; 16];
+
+/// An nvidia-uvm external mapping of a registration: UVM keeps a
+/// duplicate of the memory in an RM client of its own for as long as the
+/// mapping lasts on any GPU.
+#[derive(Debug)]
+struct UvmHold {
+    /// The guest's UVM file. None once that file closed without the
+    /// mapping coming down: it lasts until the session does.
+    file: Option<u32>,
+    base: u64,
+    len: u64,
+    /// The GPUs it is mapped on.
+    gpus: Vec<GpuUuid>,
+    id: u64,
+}
+
+impl UvmHold {
+    fn within(&self, base: u64, len: u64) -> bool {
+        self.base >= base && self.base + self.len <= base.saturating_add(len)
+    }
+}
+
 #[derive(Debug)]
 struct Reg {
     /// The guest file the call was made on, for its budget.
     file: u32,
+    /// The RM objects that hold it, each with the parent it was made under:
+    /// the object the call made, its duplicates, and objects RM made over
+    /// it that keep a duplicate of their own (a semaphore surface, and a
+    /// memory mapper over one of those).
     keys: Vec<(Key, u32)>,
+    /// Its UVM external mappings (`OsDesc::uvm`).
+    uvm: usize,
     bytes: u64,
     vmas: usize,
     #[allow(dead_code)]
     mapping: Mapping,
 }
 
-/// Every registration of the session, and the releases the guest has not
-/// yet read.
+impl Reg {
+    /// Nothing the host kernel holds names it any more.
+    fn unheld(&self) -> bool {
+        self.keys.is_empty() && self.uvm == 0
+    }
+}
+
+/// Every registration of the session, what holds each, and the releases the
+/// guest has not yet read.
 #[derive(Debug)]
 pub struct OsDesc {
     limits: Limits,
     regs: HashMap<u64, Reg>,
-    by_key: HashMap<Key, u64>,
+    /// Which registrations each RM object holds: one, but for an object
+    /// made over several (a semaphore surface's two memories).
+    by_key: HashMap<Key, Vec<u64>>,
+    uvm: Vec<UvmHold>,
+    /// The external ranges each guest UVM file made, base to length: what
+    /// a UVM_FREE of one takes with it.
+    uvm_ranges: HashMap<u32, BTreeMap<u64, u64>>,
+    uvm_range_count: usize,
+    uvm_ranges_warned: bool,
     per_file: HashMap<u32, (usize, u64)>,
     bytes: u64,
     vmas: usize,
@@ -749,6 +913,10 @@ impl OsDesc {
             limits,
             regs: HashMap::new(),
             by_key: HashMap::new(),
+            uvm: Vec::new(),
+            uvm_ranges: HashMap::new(),
+            uvm_range_count: 0,
+            uvm_ranges_warned: false,
             per_file: HashMap::new(),
             bytes: 0,
             vmas: 0,
@@ -766,6 +934,19 @@ impl OsDesc {
     /// Released, not yet reaped.
     pub fn unreaped(&self) -> usize {
         self.released.len()
+    }
+
+    /// UVM external mappings of registrations, those of closed files
+    /// included.
+    pub fn uvm_held(&self) -> usize {
+        self.uvm.len()
+    }
+
+    /// Whether RM object `object` of client `client` holds a registration:
+    /// the object a registration made, a duplicate of one, or an object made
+    /// over one.
+    pub(crate) fn holds(&self, client: u32, object: u32) -> bool {
+        self.by_key.contains_key(&Key { client, object })
     }
 
     /// Whether a registration of `bytes`, mapped in `vmas` pieces, fits on
@@ -811,32 +992,47 @@ impl OsDesc {
         e.1 += pinned.bytes;
         self.bytes += pinned.bytes;
         self.vmas += pinned.vmas;
-        self.by_key.insert(key, id);
         self.regs.insert(
             id,
             Reg {
                 file,
-                keys: vec![(key, parent)],
+                keys: Vec::new(),
+                uvm: 0,
                 bytes: pinned.bytes,
                 vmas: pinned.vmas,
                 mapping: pinned.mapping,
             },
         );
+        self.add_key(id, key, parent);
         id
     }
 
-    /// Take `key` off whatever it names, ending that registration if it was
-    /// its last.
-    fn drop_key(&mut self, key: Key) {
-        let Some(id) = self.by_key.remove(&key) else {
+    /// `key`, made under `parent`, holds registration `id` too.
+    fn add_key(&mut self, id: u64, key: Key, parent: u32) {
+        let Some(r) = self.regs.get_mut(&id) else {
             return;
         };
-        let last = self.regs.get_mut(&id).is_none_or(|r| {
-            r.keys.retain(|(k, _)| *k != key);
-            r.keys.is_empty()
-        });
-        if last {
-            self.release(id);
+        if r.keys.iter().any(|(k, _)| *k == key) {
+            return;
+        }
+        r.keys.push((key, parent));
+        self.by_key.entry(key).or_default().push(id);
+    }
+
+    /// Take `key` off whatever it holds, ending each registration nothing
+    /// else holds.
+    fn drop_key(&mut self, key: Key) {
+        let Some(ids) = self.by_key.remove(&key) else {
+            return;
+        };
+        for id in ids {
+            let unheld = self.regs.get_mut(&id).is_none_or(|r| {
+                r.keys.retain(|(k, _)| *k != key);
+                r.unheld()
+            });
+            if unheld {
+                self.release(id);
+            }
         }
     }
 
@@ -846,7 +1042,12 @@ impl OsDesc {
             return;
         };
         for (k, _) in &r.keys {
-            self.by_key.remove(k);
+            if let Some(ids) = self.by_key.get_mut(k) {
+                ids.retain(|&i| i != id);
+                if ids.is_empty() {
+                    self.by_key.remove(k);
+                }
+            }
         }
         if let Some(e) = self.per_file.get_mut(&r.file) {
             e.0 -= 1;
@@ -894,15 +1095,29 @@ impl OsDesc {
         let key = Key { client, object };
         // Whatever the new handle named before is gone.
         self.drop_key(key);
-        let Some(&id) = self.by_key.get(&Key {
+        let src = Key {
             client: src_client,
             object: src,
-        }) else {
-            return;
         };
-        if let Some(r) = self.regs.get_mut(&id) {
-            r.keys.push((key, parent));
-            self.by_key.insert(key, id);
+        for id in self.by_key.get(&src).cloned().unwrap_or_default() {
+            self.add_key(id, key, parent);
+        }
+    }
+
+    /// RM made `(client, object)` under `parent` over the objects `named`
+    /// of the same client, and keeps a duplicate of each in a client of its
+    /// own for as long as the new object lives: whatever registration one
+    /// of them holds, the new object holds too.
+    pub(crate) fn made_over(&mut self, client: u32, object: u32, parent: u32, named: &[u32]) {
+        let key = Key { client, object };
+        for &h in named {
+            let src = Key { client, object: h };
+            if h == 0 || src == key {
+                continue;
+            }
+            for id in self.by_key.get(&src).cloned().unwrap_or_default() {
+                self.add_key(id, key, parent);
+            }
         }
     }
 
@@ -930,9 +1145,202 @@ impl OsDesc {
         }
     }
 
+    // ── nvidia-uvm external mappings ──
+
+    /// Whether UVM file `file` may map `(client, memory)` as an external
+    /// allocation: always, unless it is registered memory and the VM holds
+    /// as many such mappings as it may (ENOMEM).
+    pub(crate) fn uvm_admit(&self, client: u32, memory: u32) -> Result<(), Errno> {
+        if self.holds(client, memory) && self.uvm.len() >= self.limits.uvm_maps_per_vm {
+            log::warn!(
+                "UVM external mapping of registered memory {client:#x}/{memory:#x} refused: \
+                 the VM holds {} already",
+                self.uvm.len()
+            );
+            return Err(libc::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// UVM file `file` mapped `(client, memory)` at `[base, base + len)` on
+    /// `gpus` (MAP_EXTERNAL_ALLOCATION), or may have -- UVM can fail the
+    /// call with every mapping made, waiting for the page-table writes
+    /// (uvm_api_map_external_allocation), so a failure counts too: every
+    /// registration the memory holds is held by the mapping as well.
+    pub(crate) fn uvm_mapped(
+        &mut self,
+        file: u32,
+        base: u64,
+        len: u64,
+        gpus: &[GpuUuid],
+        client: u32,
+        memory: u32,
+    ) {
+        let ids = self
+            .by_key
+            .get(&Key {
+                client,
+                object: memory,
+            })
+            .cloned()
+            .unwrap_or_default();
+        for id in ids {
+            if let Some(r) = self.regs.get_mut(&id) {
+                r.uvm += 1;
+                self.uvm.push(UvmHold {
+                    file: Some(file),
+                    base,
+                    len,
+                    gpus: gpus.to_vec(),
+                    id,
+                });
+            }
+        }
+    }
+
+    /// Take UVM mapping number `i` away, ending its registration if nothing
+    /// else holds it.
+    fn drop_uvm(&mut self, i: usize) {
+        let h = self.uvm.swap_remove(i);
+        let unheld = self.regs.get_mut(&h.id).is_none_or(|r| {
+            r.uvm -= 1;
+            r.unheld()
+        });
+        if unheld {
+            self.release(h.id);
+        }
+    }
+
+    /// Drop every UVM mapping `f` picks, and whatever it alone held.
+    fn drop_uvm_where(&mut self, f: impl Fn(&UvmHold) -> bool) {
+        let mut i = 0;
+        while i < self.uvm.len() {
+            if f(&self.uvm[i]) {
+                self.drop_uvm(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// UVM file `file` unmapped `[base, base + len)` from `gpu`
+    /// (UNMAP_EXTERNAL succeeded). A mapping wholly inside is gone from that
+    /// GPU; one only partly inside keeps the rest, and so its duplicate.
+    pub(crate) fn uvm_unmapped(&mut self, file: u32, base: u64, len: u64, gpu: &GpuUuid) {
+        let mut i = 0;
+        while i < self.uvm.len() {
+            let h = &mut self.uvm[i];
+            if h.file == Some(file) && h.within(base, len) && h.gpus.contains(gpu) {
+                h.gpus.retain(|g| g != gpu);
+                if h.gpus.is_empty() {
+                    self.drop_uvm(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// UVM file `file` made an external range (CREATE_EXTERNAL_RANGE
+    /// succeeded). Past the VM's bound it is not recorded, and a mapping of
+    /// registered memory inside it is held until its file closes.
+    pub(crate) fn uvm_range_made(&mut self, file: u32, base: u64, len: u64) {
+        if self.uvm_range_count >= self.limits.uvm_ranges_per_vm {
+            if !self.uvm_ranges_warned {
+                self.uvm_ranges_warned = true;
+                log::warn!(
+                    "UVM external ranges: {} recorded; registered memory mapped in a later \
+                     one stays pinned until its UVM file closes",
+                    self.uvm_range_count
+                );
+            }
+            return;
+        }
+        if self
+            .uvm_ranges
+            .entry(file)
+            .or_default()
+            .insert(base, len)
+            .is_none()
+        {
+            self.uvm_range_count += 1;
+        }
+    }
+
+    /// UVM file `file` freed the range at `base` (UVM_FREE succeeded): an
+    /// external range takes every mapping inside it.
+    pub(crate) fn uvm_range_freed(&mut self, file: u32, base: u64) {
+        let Some(len) = self.uvm_ranges.get_mut(&file).and_then(|m| m.remove(&base)) else {
+            return;
+        };
+        self.uvm_range_count -= 1;
+        self.drop_uvm_where(|h| h.file == Some(file) && h.within(base, len));
+    }
+
+    /// What to take down before UVM file `file` closes, while it is still
+    /// ours: the recorded external ranges holding a mapping of registered
+    /// memory, as (base, length), to UVM_FREE.
+    pub(crate) fn uvm_ranges_held(&self, file: u32) -> Vec<(u64, u64)> {
+        let Some(ranges) = self.uvm_ranges.get(&file) else {
+            return Vec::new();
+        };
+        ranges
+            .iter()
+            .filter(|&(&b, &l)| {
+                self.uvm
+                    .iter()
+                    .any(|h| h.file == Some(file) && h.within(b, l))
+            })
+            .map(|(&b, &l)| (b, l))
+            .collect()
+    }
+
+    /// The mappings of registered memory UVM file `file` still has, one
+    /// (base, length, GPU) for each GPU, to UNMAP_EXTERNAL.
+    pub(crate) fn uvm_maps_held(&self, file: u32) -> Vec<(u64, u64, GpuUuid)> {
+        self.uvm
+            .iter()
+            .filter(|h| h.file == Some(file))
+            .flat_map(|h| h.gpus.iter().map(|g| (h.base, h.len, *g)))
+            .collect()
+    }
+
+    /// The guest UVM files holding a mapping of registered memory.
+    pub(crate) fn uvm_files(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.uvm.iter().filter_map(|h| h.file).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// UVM file `file` is closing. What it could not take down stays held,
+    /// by no file, until the session ends: its last reference may be
+    /// dropped later than this (the event pump holds a duplicate of it),
+    /// and a later file under the same handle must not end it.
+    pub(crate) fn uvm_file_closed(&mut self, file: u32) {
+        if let Some(r) = self.uvm_ranges.remove(&file) {
+            self.uvm_range_count -= r.len();
+        }
+        for h in &mut self.uvm {
+            if h.file == Some(file) {
+                log::warn!(
+                    "OS descriptor {}: UVM mapping at {:#x}+{:#x} was not taken down before its \
+                     file closed; the pages stay pinned until the session ends",
+                    h.id,
+                    h.base,
+                    h.len
+                );
+                h.file = None;
+            }
+        }
+    }
+
     /// The session is gone: every registration and every release with it. A
     /// guest that says HELLO again starts with none.
     pub(crate) fn clear(&mut self) {
+        self.uvm.clear();
+        self.uvm_ranges.clear();
+        self.uvm_range_count = 0;
         let ids: Vec<u64> = self.regs.keys().copied().collect();
         for id in ids {
             self.release(id);
@@ -1348,6 +1756,7 @@ mod tests {
             bytes_per_vm: 3 * PAGE,
             bytes_per_file: 2 * PAGE,
             vmas_per_vm: 2,
+            ..Limits::default()
         });
         assert_eq!(o.admit(1, 3 * PAGE, 0), Err(libc::ENOMEM), "bytes per file");
         assert_eq!(o.admit(1, PAGE, 3), Err(libc::ENOMEM), "mappings per VM");
@@ -1384,6 +1793,162 @@ mod tests {
         assert_eq!((o.live(), o.unreaped()), (0, 0));
         let _ = c;
     }
+
+    const G1: GpuUuid = [1; 16];
+    const G2: GpuUuid = [2; 16];
+
+    #[test]
+    fn a_uvm_mapping_holds_a_registration_past_its_handle_until_every_gpu_unmaps_it() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        // Mapped on two GPUs by UVM file 7, at 1 MiB.
+        o.uvm_mapped(7, 1 << 20, 2 * PAGE, &[G1, G2], 0xc1, 0x10);
+        // Memory nothing registered is not held.
+        o.uvm_mapped(7, 4 << 20, PAGE, &[G1], 0xc1, 0x99);
+        assert_eq!(o.uvm_held(), 1);
+        o.freed(0xc1, 0x10);
+        assert_eq!(o.reap(0), (0, vec![]), "UVM still has it");
+        assert!(!o.holds(0xc1, 0x10), "the handle itself is gone");
+        // An unmap that covers only part of it, or another file's, or one
+        // GPU of two: still held.
+        o.uvm_unmapped(7, 1 << 20, PAGE, &G1);
+        o.uvm_unmapped(8, 1 << 20, 2 * PAGE, &G1);
+        o.uvm_unmapped(7, 1 << 20, 2 * PAGE, &G1);
+        assert_eq!((o.live(), o.reap(0).1), (1, vec![]));
+        o.uvm_unmapped(7, 0, 8 << 20, &G2);
+        assert_eq!(o.reap(0), (1, vec![a]));
+        assert_eq!((o.live(), o.uvm_held(), o.bytes), (0, 0, 0));
+    }
+
+    #[test]
+    fn freeing_the_external_range_takes_the_mappings_inside_it() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        o.uvm_range_made(7, 1 << 20, 4 << 20);
+        o.uvm_range_made(7, 8 << 20, 1 << 20);
+        o.uvm_mapped(7, 2 << 20, PAGE, &[G1], 0xc1, 0x10);
+        assert_eq!(o.uvm_ranges_held(7), vec![(1 << 20, 4 << 20)]);
+        assert_eq!(o.uvm_maps_held(7), vec![(2 << 20, PAGE, G1)]);
+        o.freed(0xc1, 0x10);
+        // Another range, a range of another file, a base no range starts at.
+        o.uvm_range_freed(7, 8 << 20);
+        o.uvm_range_freed(8, 1 << 20);
+        o.uvm_range_freed(7, 2 << 20);
+        assert_eq!(o.reap(0).1, Vec::<u64>::new());
+        o.uvm_range_freed(7, 1 << 20);
+        assert_eq!(o.reap(0).1, vec![a]);
+        assert_eq!(o.uvm_range_count, 0);
+    }
+
+    #[test]
+    fn a_uvm_mapping_and_the_handle_both_hold_whichever_goes_first() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        o.uvm_unmapped(7, 1 << 20, PAGE, &G1);
+        assert_eq!(o.reap(0).1, Vec::<u64>::new(), "RM's handle still holds it");
+        // A duplicate mapped holds it as the original would.
+        o.duplicated(0xc1, 0x10, 0xc2, 0x20, 0xd2);
+        o.uvm_mapped(9, 1 << 20, PAGE, &[G1], 0xc2, 0x20);
+        o.freed(0xc1, 0xc1);
+        o.freed(0xc2, 0xc2);
+        assert_eq!(o.reap(0).1, Vec::<u64>::new());
+        assert!(o.clients().is_empty());
+        assert_eq!(o.uvm_files(), vec![9]);
+        o.uvm_unmapped(9, 0, 4 << 20, &G1);
+        assert_eq!(o.reap(0).1, vec![a]);
+    }
+
+    #[test]
+    fn a_uvm_file_that_closes_with_a_mapping_up_holds_it_until_the_session_ends() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        o.uvm_range_made(7, 1 << 20, 4 << 20);
+        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        o.freed(0xc1, 0x10);
+        o.uvm_file_closed(7);
+        assert!(o.uvm_files().is_empty() && o.uvm_ranges.is_empty());
+        // A later file under the same handle ends nothing of the old one.
+        o.uvm_range_made(7, 1 << 20, 4 << 20);
+        o.uvm_range_freed(7, 1 << 20);
+        o.uvm_unmapped(7, 0, 8 << 20, &G1);
+        assert_eq!((o.live(), o.uvm_held()), (1, 1));
+        o.clear();
+        assert_eq!((o.live(), o.uvm_held(), o.unreaped()), (0, 0, 0));
+    }
+
+    #[test]
+    fn uvm_mappings_and_ranges_are_bounded() {
+        let ram = ram();
+        let mut o = OsDesc::with_limits(Limits {
+            uvm_maps_per_vm: 1,
+            uvm_ranges_per_vm: 1,
+            ..Limits::default()
+        });
+        o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        assert_eq!(o.uvm_admit(0xc1, 0x10), Ok(()));
+        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        assert_eq!(o.uvm_admit(0xc1, 0x10), Err(libc::ENOMEM));
+        assert_eq!(o.uvm_admit(0xc1, 0x99), Ok(()), "memory nothing registered");
+        o.uvm_range_made(7, 1 << 20, 1 << 20);
+        o.uvm_range_made(7, 4 << 20, 1 << 20);
+        assert_eq!(o.uvm_range_count, 1);
+    }
+
+    #[test]
+    fn a_semaphore_surface_over_registered_memory_holds_it_and_so_does_a_mapper_over_that() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        let b = o.add(1, 0xc1, 0x11, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        // A semaphore surface naming both, under subdevice 0xd5.
+        o.made_over(0xc1, 0x20, 0xd5, &[0x10, 0x11]);
+        // A memory mapper naming the surface; one naming nothing registered.
+        o.made_over(0xc1, 0x30, 0xd5, &[0x20]);
+        o.made_over(0xc1, 0x31, 0xd5, &[0x77]);
+        assert!(o.holds(0xc1, 0x30) && !o.holds(0xc1, 0x31));
+        o.freed(0xc1, 0x10);
+        o.freed(0xc1, 0x11);
+        o.freed(0xc1, 0x20);
+        assert_eq!(o.reap(0).1, Vec::<u64>::new());
+        o.freed(0xc1, 0x30);
+        let mut got = o.reap(0).1;
+        got.sort();
+        assert_eq!(got, vec![a, b]);
+        // Freeing the parent a surface was made under ends it too.
+        let c = o.add(1, 0xc1, 0x12, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        o.made_over(0xc1, 0x21, 0xd5, &[0x12]);
+        o.freed(0xc1, 0x12);
+        o.freed(0xc1, 0xd5);
+        assert_eq!(o.reap(2).1, vec![c]);
+    }
+
+    #[test]
+    fn the_objects_an_export_control_names_are_read_where_rm_reads_them() {
+        let mut p = vec![0u8; 24];
+        put32(&mut p, 12, 0x10);
+        assert_eq!(exported(EXPORT_OBJECT_TO_FD, &p), Some(vec![0x10]));
+        let mut p = vec![0u8; 2128];
+        put32(&mut p, 76, 0x10);
+        put32(&mut p, 80, 0x11);
+        put32(&mut p, 84, 0x12);
+        p[2124..2126].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(exported(EXPORT_OBJECTS_TO_FD, &p), Some(vec![0x10, 0x11]));
+        let mut p = vec![0u8; 1048];
+        put32(&mut p, 8, 0x10);
+        p[1032..1034].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(exported(EXPORT_MEM, &p), Some(vec![0x10]));
+        // A block of another layout names all it holds.
+        assert_eq!(
+            exported(EXPORT_MEM, &[1, 0, 0, 0, 2, 0, 0, 0]),
+            Some(vec![1, 2])
+        );
+        assert_eq!(exported(0x2080_0101, &p), None);
+    }
 }
 
 /// Through the whole v1 path, against a fake guest memory (a GuestMemoryMmap
@@ -1410,6 +1975,7 @@ mod backend_tests {
     const VID_HEAP: u32 = ioc(IOC_RW, b'F', NV_ESC_RM_VID_HEAP_CONTROL, 184);
     const RM_ALLOC: u32 = ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC, 48);
     const RM_FREE: u32 = ioc(IOC_RW, b'F', abi::ioctl::NV_ESC_RM_FREE, 16);
+    const CONTROL: u32 = ioc(IOC_RW, b'F', abi::ioctl::NV_ESC_RM_CONTROL, 32);
 
     /// The caller's address: never mapped here, so the host must never be
     /// handed it.
@@ -1436,6 +2002,22 @@ mod backend_tests {
             client: u32,
             object: u32,
         },
+        /// RM_ALLOC of any other class.
+        Alloc {
+            class: u32,
+        },
+        Control {
+            cmd: u32,
+        },
+        /// MAP_MEMORY_DMA: the flags RM was handed.
+        MapDma {
+            flags: u32,
+        },
+        /// A UVM command, and the first word of its block.
+        Uvm {
+            cmd: u32,
+            base: u64,
+        },
     }
 
     std::thread_local! {
@@ -1444,6 +2026,8 @@ mod backend_tests {
         static STATUS: Cell<u32> = const { Cell::new(0) };
         /// RM's answer to the next frees.
         static FREE_STATUS: Cell<u32> = const { Cell::new(0) };
+        /// UVM's answer to the next UVM commands.
+        static UVM_STATUS: Cell<u32> = const { Cell::new(0) };
     }
 
     fn seen() -> Vec<Seen> {
@@ -1478,6 +2062,29 @@ mod backend_tests {
 
     unsafe fn fake_host(_fd: std::os::fd::RawFd, request: u64, arg: *mut u8) -> i32 {
         let request = request as u32;
+        if hostfd::ioc_type(request) == 0 {
+            // UVM: the number alone, no size; every block called here ends
+            // with its status 8 bytes from the end.
+            let size = abi::schema::uvm_table(abi::version::DriverVersion::parse(DRIVER).unwrap())
+                .and_then(|t| t.lookup(request))
+                .map(|c| c.size as usize)
+                .expect("a UVM command of the table");
+            // SAFETY: the HostIoctl contract.
+            let a = unsafe { std::slice::from_raw_parts_mut(arg, size) };
+            let st = if request == UVM_MAP_EXTERNAL_ALLOCATION {
+                size - 4
+            } else {
+                size - 8
+            };
+            put32(a, st, UVM_STATUS.with(|s| s.get()));
+            SEEN.with(|v| {
+                v.borrow_mut().push(Seen::Uvm {
+                    cmd: request,
+                    base: rd64(a, 0),
+                })
+            });
+            return 0;
+        }
         let len = hostfd::ioc_size(request);
         // SAFETY: the HostIoctl contract.
         let a = unsafe { std::slice::from_raw_parts_mut(arg, len) };
@@ -1509,6 +2116,20 @@ mod backend_tests {
                     fd: 0,
                     rights: 0,
                 }
+            }
+            NV_ESC_RM_ALLOC if rd32(a, OS64_CLASS) != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR => {
+                put32(a, OS64_STATUS, 0);
+                Seen::Alloc {
+                    class: rd32(a, OS64_CLASS),
+                }
+            }
+            abi::ioctl::NV_ESC_RM_CONTROL => {
+                put32(a, 28, 0);
+                Seen::Control { cmd: rd32(a, 8) }
+            }
+            abi::ioctl::NV_ESC_RM_MAP_MEMORY_DMA => {
+                put32(a, 56, 0);
+                Seen::MapDma { flags: rd32(a, 32) }
             }
             NV_ESC_RM_ALLOC => {
                 let params = rd64(a, OS64_PARAMS);
@@ -1584,7 +2205,8 @@ mod backend_tests {
             req.extend_from_slice(&v.to_le_bytes());
         }
         req.extend_from_slice(body);
-        let mut resp = vec![0u8; 8192];
+        // Room for UVM_MAP_EXTERNAL_ALLOCATION's 9,264 bytes.
+        let mut resp = vec![0u8; 16384];
         let n = be.dispatch(&req, &mut resp);
         resp.truncate(n);
         resp
@@ -2050,6 +2672,7 @@ mod backend_tests {
             bytes_per_vm: 1 << 30,
             bytes_per_file: 2 * PAGE,
             vmas_per_vm: 64,
+            ..Limits::default()
         });
         let (st, ..) = ioctl(
             &mut vm.be,
@@ -2171,5 +2794,379 @@ mod backend_tests {
         );
         assert!(!reserved_live(addr));
         assert_eq!((vm.be.osdesc.live(), vm.be.osdesc.unreaped()), (0, 0));
+    }
+
+    // ── What else holds the pages: UVM, exports, objects RM makes over it ──
+
+    const DRIVER: &str = "610.57.04";
+    const HANDLE: u32 = 0x5000_0001;
+    const G1: GpuUuid = [0x61; 16];
+    const G2: GpuUuid = [0x62; 16];
+    /// Where the guest's UVM external range is.
+    const UVA: u64 = 0x7f00_0000_0000;
+
+    /// [`vm`] on a host whose release is [`DRIVER`], with a UVM file.
+    fn vm_610() -> (Vm, u32) {
+        let mut vm = vm();
+        vm.be.set_host_driver_version(DRIVER);
+        UVM_STATUS.with(|s| s.set(0));
+        let null = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let uvm = vm
+            .be
+            .adopt_for_test(null(), HandleKind::Dev(protocol::messages::DeviceKind::Uvm));
+        (vm, uvm)
+    }
+
+    /// Register two scattered pages as HANDLE through ALLOC_MEMORY: (the
+    /// address RM was handed, the id).
+    fn register(vm: &mut Vm) -> (u64, u64) {
+        let gpu = vm.gpu;
+        let (st, _, _, deep) = ioctl(
+            &mut vm.be,
+            gpu,
+            ALLOC_MEMORY,
+            &os02(GUEST_VA, 2 * PAGE, -1),
+            &[],
+            Some(&list(
+                OSDESC_F_WRITE,
+                &[(HIGH + 5 * PAGE, 1), (LOW + PAGE, 1)],
+            )),
+        );
+        assert_eq!(st, 0);
+        let addr = match &seen()[..] {
+            [Seen::Register { addr, .. }] => *addr,
+            other => panic!("{other:?}"),
+        };
+        (addr, rd64(&deep, 0))
+    }
+
+    fn uvm_size(cmd: u32) -> usize {
+        abi::schema::uvm_table(abi::version::DriverVersion::parse(DRIVER).unwrap())
+            .and_then(|t| t.lookup(cmd))
+            .unwrap()
+            .size as usize
+    }
+
+    /// A UVM command on `uvm`: its status as the guest reads it (the reply
+    /// header's, then UVM's own at `status_at`).
+    fn uvm_ioctl(vm: &mut Vm, uvm: u32, cmd: u32, p: &[u8], status_at: usize) -> (i32, u32) {
+        let (st, _, params, _) = ioctl(&mut vm.be, uvm, cmd, p, &[], None);
+        let rm = if st == 0 { rd32(&params, status_at) } else { 0 };
+        (st, rm)
+    }
+
+    fn create_range(vm: &mut Vm, uvm: u32, base: u64, len: u64) {
+        let mut p = vec![0u8; uvm_size(UVM_CREATE_EXTERNAL_RANGE)];
+        put64(&mut p, 0, base);
+        put64(&mut p, 8, len);
+        let at = p.len() - 8;
+        assert_eq!(
+            uvm_ioctl(vm, uvm, UVM_CREATE_EXTERNAL_RANGE, &p, at),
+            (0, 0)
+        );
+    }
+
+    /// UVM_MAP_EXTERNAL_ALLOCATION of (CLIENT, `memory`) at `base`, on
+    /// `gpus`, as cuMemHostRegister's mapping would ask.
+    fn map_external(
+        vm: &mut Vm,
+        uvm: u32,
+        base: u64,
+        len: u64,
+        memory: u32,
+        gpus: &[GpuUuid],
+    ) -> (i32, u32) {
+        let fd_off = crate::uvmfd::field(
+            abi::version::DriverVersion::parse(DRIVER),
+            UVM_MAP_EXTERNAL_ALLOCATION,
+        )
+        .unwrap()
+        .offset as usize;
+        let mut p = vec![0u8; uvm_size(UVM_MAP_EXTERNAL_ALLOCATION)];
+        put64(&mut p, 0, base);
+        put64(&mut p, 8, len);
+        for (i, g) in gpus.iter().enumerate() {
+            p[24 + 36 * i..40 + 36 * i].copy_from_slice(g);
+        }
+        put64(&mut p, fd_off - 8, gpus.len() as u64);
+        put32(&mut p, fd_off, vm.ctl);
+        put32(&mut p, fd_off + 4, CLIENT);
+        put32(&mut p, fd_off + 8, memory);
+        uvm_ioctl(vm, uvm, UVM_MAP_EXTERNAL_ALLOCATION, &p, fd_off + 12)
+    }
+
+    fn rm_free(vm: &mut Vm, object: u32) {
+        let mut f = vec![0u8; 16];
+        put32(&mut f, 0, CLIENT);
+        put32(&mut f, 8, object);
+        let ctl = vm.ctl;
+        assert_eq!(ioctl(&mut vm.be, ctl, RM_FREE, &f, &[], None).0, 0);
+    }
+
+    /// cuMemHostRegister's shape: the memory registered (ALLOC_MEMORY of
+    /// 0x71), an external range, the memory mapped into it by UVM, and the
+    /// handle freed. UVM's duplicate still holds the pages, so nothing is
+    /// released -- until the UVM file closes, when the backend takes the
+    /// range down on it first, while it is still ours.
+    #[test]
+    fn a_uvm_external_mapping_holds_registered_memory_until_its_uvm_file_closes() {
+        let (mut vm, uvm) = vm_610();
+        let (addr, id) = register(&mut vm);
+        create_range(&mut vm, uvm, UVA, 4 << 20);
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, 2 * PAGE, HANDLE, &[G1]),
+            (0, 0)
+        );
+        seen();
+        rm_free(&mut vm, HANDLE);
+        assert_eq!(
+            reap(&mut vm.be, 0).1,
+            Vec::<u64>::new(),
+            "UVM still maps it"
+        );
+        assert!(reserved_live(addr), "and the backend's range stays");
+        assert_eq!(vm.be.osdesc.live(), 1);
+        seen();
+        assert_eq!(status(&call(&mut vm.be, MsgType::Close, uvm, &[])), 0);
+        assert_eq!(
+            seen(),
+            vec![Seen::Uvm {
+                cmd: crate::uvmmap::FREE,
+                base: UVA
+            }]
+        );
+        assert!(!reserved_live(addr));
+        assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
+    }
+
+    /// And cuMemHostUnregister's: the range freed, or the mapping unmapped
+    /// from every GPU, before or after the handle -- released when the last
+    /// of them goes, not before.
+    #[test]
+    fn freeing_or_unmapping_the_uvm_mapping_releases_what_the_handle_no_longer_holds() {
+        let (mut vm, uvm) = vm_610();
+        let (_, id) = register(&mut vm);
+        create_range(&mut vm, uvm, UVA, 4 << 20);
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, 2 * PAGE, HANDLE, &[G1]),
+            (0, 0)
+        );
+        // UVM_FREE first: the handle still holds it.
+        let mut p = vec![0u8; uvm_size(crate::uvmmap::FREE)];
+        put64(&mut p, 0, UVA);
+        let at = p.len() - 8;
+        assert_eq!(uvm_ioctl(&mut vm, uvm, crate::uvmmap::FREE, &p, at), (0, 0));
+        assert_eq!(vm.be.osdesc.uvm_held(), 0);
+        assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
+        rm_free(&mut vm, HANDLE);
+        let (ack, got) = reap(&mut vm.be, 0);
+        assert_eq!(got, vec![id]);
+
+        // Handle first, then UNMAP_EXTERNAL from each of two GPUs.
+        seen();
+        let (_, id) = register(&mut vm);
+        create_range(&mut vm, uvm, UVA, 4 << 20);
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, 2 * PAGE, HANDLE, &[G1, G2]),
+            (0, 0)
+        );
+        rm_free(&mut vm, HANDLE);
+        let unmap = |vm: &mut Vm, g: &GpuUuid| {
+            let mut p = vec![0u8; uvm_size(UVM_UNMAP_EXTERNAL)];
+            put64(&mut p, 0, UVA);
+            put64(&mut p, 8, 4 << 20);
+            p[16..32].copy_from_slice(g);
+            assert_eq!(uvm_ioctl(vm, uvm, UVM_UNMAP_EXTERNAL, &p, 32), (0, 0));
+        };
+        unmap(&mut vm, &G1);
+        assert_eq!(reap(&mut vm.be, ack).1, Vec::<u64>::new());
+        unmap(&mut vm, &G2);
+        assert_eq!(reap(&mut vm.be, ack).1, vec![id]);
+    }
+
+    /// A mapping UVM failed still holds the memory -- UVM can fail one
+    /// with the mappings made -- until its range is freed; one of memory
+    /// nothing registered is not followed; ALLOC_DEVICE_P2P of registered
+    /// memory never reaches UVM.
+    #[test]
+    fn a_uvm_mapping_of_registered_memory_holds_it_whatever_uvm_answered() {
+        let (mut vm, uvm) = vm_610();
+        let (_, id) = register(&mut vm);
+        create_range(&mut vm, uvm, UVA, 4 << 20);
+        UVM_STATUS.with(|s| s.set(0x1f));
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]),
+            (0, 0x1f)
+        );
+        UVM_STATUS.with(|s| s.set(0));
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, PAGE, 0x5000_0099, &[G1]),
+            (0, 0)
+        );
+        assert_eq!(vm.be.osdesc.uvm_held(), 1);
+        seen();
+        let mut p = vec![0u8; uvm_size(UVM_ALLOC_DEVICE_P2P)];
+        put32(&mut p, 40, vm.ctl);
+        put32(&mut p, 44, CLIENT);
+        put32(&mut p, 48, HANDLE);
+        assert_eq!(
+            ioctl(&mut vm.be, uvm, UVM_ALLOC_DEVICE_P2P, &p, &[], None).0,
+            -libc::EPERM
+        );
+        assert!(seen().is_empty());
+        rm_free(&mut vm, HANDLE);
+        assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
+        let mut p = vec![0u8; uvm_size(crate::uvmmap::FREE)];
+        put64(&mut p, 0, UVA);
+        let at = p.len() - 8;
+        assert_eq!(uvm_ioctl(&mut vm, uvm, crate::uvmmap::FREE, &p, at), (0, 0));
+        assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
+    }
+
+    /// The range will not come down when the UVM file closes: the pages
+    /// stay pinned, and the session takes them.
+    #[test]
+    fn a_uvm_mapping_that_will_not_come_down_holds_the_pages_until_the_session_ends() {
+        let (mut vm, uvm) = vm_610();
+        let (addr, _) = register(&mut vm);
+        create_range(&mut vm, uvm, UVA, 4 << 20);
+        assert_eq!(map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]), (0, 0));
+        rm_free(&mut vm, HANDLE);
+        UVM_STATUS.with(|s| s.set(0x1f));
+        seen();
+        assert_eq!(status(&call(&mut vm.be, MsgType::Close, uvm, &[])), 0);
+        // UVM_FREE of the range, then UNMAP_EXTERNAL of the mapping.
+        assert_eq!(
+            seen(),
+            vec![
+                Seen::Uvm {
+                    cmd: crate::uvmmap::FREE,
+                    base: UVA
+                },
+                Seen::Uvm {
+                    cmd: UVM_UNMAP_EXTERNAL,
+                    base: UVA
+                }
+            ]
+        );
+        assert!(reserved_live(addr));
+        assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
+        vm.be.session_reset("test");
+        assert!(!reserved_live(addr));
+        assert_eq!((vm.be.osdesc.live(), vm.be.osdesc.uvm_held()), (0, 0));
+    }
+
+    /// Exported to an RM descriptor or attached to an NV_MEMORY_EXPORT
+    /// object, registered memory would be duplicated where the backend
+    /// cannot follow: refused, the handle, a duplicate of it and an object
+    /// made over it alike. Anything else still goes.
+    #[test]
+    fn registered_memory_is_never_exported() {
+        let (mut vm, _) = vm_610();
+        register(&mut vm);
+        let ctl = vm.ctl;
+        let control = |cmd: u32, size: usize| {
+            let mut o = vec![0u8; 32];
+            put32(&mut o, 0, CLIENT);
+            put32(&mut o, 4, CLIENT);
+            put32(&mut o, 8, cmd);
+            put64(&mut o, 16, GUEST_VA);
+            put32(&mut o, 24, size as u32);
+            (o, vec![0u8; size])
+        };
+        // A duplicate of it, in the same client.
+        vm.be
+            .osdesc
+            .duplicated(CLIENT, HANDLE, CLIENT, 0x5000_0002, DEVICE);
+        for h in [HANDLE, 0x5000_0002] {
+            let (o, mut n) = control(EXPORT_OBJECT_TO_FD, 24);
+            put32(&mut n, 12, h);
+            assert_eq!(
+                ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0,
+                -libc::EPERM
+            );
+            let (o, mut n) = control(EXPORT_OBJECTS_TO_FD, 2128);
+            put32(&mut n, 76, 0x5000_0077);
+            put32(&mut n, 80, h);
+            n[2124..2126].copy_from_slice(&2u16.to_le_bytes());
+            assert_eq!(
+                ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0,
+                -libc::EPERM
+            );
+            let (o, mut n) = control(EXPORT_MEM, 1048);
+            put32(&mut n, 8, h);
+            n[1032..1034].copy_from_slice(&1u16.to_le_bytes());
+            assert_eq!(
+                ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0,
+                -libc::EPERM
+            );
+        }
+        assert!(seen().is_empty(), "none reached RM");
+        // Past numObjects, or another object: RM's to answer.
+        let (o, mut n) = control(EXPORT_OBJECTS_TO_FD, 2128);
+        put32(&mut n, 76, 0x5000_0077);
+        put32(&mut n, 80, HANDLE);
+        n[2124..2126].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0, 0);
+        assert_eq!(
+            seen(),
+            vec![Seen::Control {
+                cmd: EXPORT_OBJECTS_TO_FD
+            }]
+        );
+    }
+
+    /// A semaphore surface over registered memory keeps a duplicate of it
+    /// in RM's own client: the memory's handle freed, the surface holds it
+    /// until it is freed itself.
+    #[test]
+    fn a_semaphore_surface_over_registered_memory_holds_it_until_the_surface_goes() {
+        let (mut vm, _) = vm_610();
+        let (addr, id) = register(&mut vm);
+        let ctl = vm.ctl;
+        let mut o = vec![0u8; 48];
+        put32(&mut o, 0, CLIENT);
+        put32(&mut o, 4, DEVICE);
+        put32(&mut o, 8, 0x5000_0020);
+        put32(&mut o, 12, NV_SEMAPHORE_SURFACE);
+        put64(&mut o, OS64_PARAMS, GUEST_VA);
+        put32(&mut o, 32, 16);
+        let mut n = vec![0u8; 16];
+        put32(&mut n, 0, HANDLE);
+        assert_eq!(ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &n, None).0, 0);
+        assert_eq!(
+            seen(),
+            vec![Seen::Alloc {
+                class: NV_SEMAPHORE_SURFACE
+            }]
+        );
+        rm_free(&mut vm, HANDLE);
+        assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
+        assert!(reserved_live(addr));
+        rm_free(&mut vm, 0x5000_0020);
+        assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
+    }
+
+    /// Guest RAM is write-back to the guest whatever RM thinks (rmmem.rs):
+    /// a GPU mapping of registered memory snoops, and the caller reads back
+    /// the flags it sent.
+    #[test]
+    fn a_gpu_mapping_of_registered_memory_snoops() {
+        let (mut vm, _) = vm_610();
+        register(&mut vm);
+        let ctl = vm.ctl;
+        let map_dma = ioc(IOC_RW, b'F', abi::ioctl::NV_ESC_RM_MAP_MEMORY_DMA, 64);
+        let mut p = vec![0u8; 64];
+        put32(&mut p, 0, CLIENT);
+        put32(&mut p, 12, HANDLE);
+        put32(&mut p, 32, 0x1);
+        let (st, _, back, _) = ioctl(&mut vm.be, ctl, map_dma, &p, &[], None);
+        assert_eq!(st, 0);
+        assert_eq!(seen(), vec![Seen::MapDma { flags: 0x11 }]);
+        assert_eq!(rd32(&back, 32), 0x1);
+        // Memory nothing registered is left alone.
+        put32(&mut p, 12, 0x5000_0099);
+        ioctl(&mut vm.be, ctl, map_dma, &p, &[], None);
+        assert_eq!(seen(), vec![Seen::MapDma { flags: 0x1 }]);
     }
 }

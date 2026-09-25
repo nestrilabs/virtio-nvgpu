@@ -1314,8 +1314,14 @@ impl NvidiaBackend {
         self.syncobj_regs.clear();
         self.uvm_refused.clear();
         self.nvkms.reset();
-        // Every client holding a registration is freed on the file it was
-        // made on before any file closes (osdesc.rs); then the records go.
+        // Every UVM mapping of a registration is taken down, and every
+        // client holding one freed on the file it was made on, before any
+        // file closes (osdesc.rs); then the records go.
+        for h in self.osdesc.uvm_files() {
+            if let Ok(fd) = self.handles.get_raw(h) {
+                self.osdesc_uvm_close(fd, h, "session end");
+            }
+        }
         let holders: Vec<u32> = self.osdesc.clients().into_iter().collect();
         for c in holders {
             let fd = self
@@ -2250,6 +2256,11 @@ impl NvidiaBackend {
             self.withdraw_uvm(w, "close");
         }
         self.uvm_refused.remove(&handle);
+        // Registered memory its external mappings hold is taken down while
+        // the file is ours, and only then may the guest unpin it (osdesc.rs).
+        if kind == HandleKind::Dev(DeviceKind::Uvm) {
+            self.osdesc_uvm_close(fd.as_raw_fd(), handle, "close");
+        }
         for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
                 "close handle={handle}: releasing mapping at SHM {:#x}+{:#x}",
@@ -2562,7 +2573,16 @@ impl NvidiaBackend {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                     }
                 };
+                // Registered memory UVM would keep a duplicate of
+                // (osdesc.rs): refused, or followed.
+                let osdesc_map = match self.osdesc_uvm_before(ireq.cmd, &params) {
+                    Ok(m) => m,
+                    Err(errno) => {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                    }
+                };
                 let n = self.dispatch_simple(cookie, host_fd, request, &params, resp_buf);
+                self.osdesc_uvm_after(ireq.cmd, &params, osdesc_map, resp_buf, n);
                 if log::log_enabled!(log::Level::Debug) {
                     // UVM puts its NV_STATUS in the block, not in the ioctl's
                     // return; this is the only place it shows.
@@ -2819,6 +2839,11 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // RM control requires nested handling
             // ---------------------------------------------------------------
+            // Registered memory handed to a holder the backend cannot follow
+            // (osdesc.rs): refused, before RM sees it.
+            NV_ESC_RM_CONTROL if self.osdesc_export_refused(param_in) => {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+            }
             // Controls that list other RM clients' host PIDs (rmctl.rs, S-24):
             // answered here, as RM answers a caller without the privilege.
             NV_ESC_RM_CONTROL if crate::rmctl::host_pid_control(param_in).is_some() => {
@@ -3678,10 +3703,25 @@ impl NvidiaBackend {
             // A zero hObjectNew is no handle: RM made the object under one it
             // generated and, through ALLOC_MEMORY, never wrote back.
             NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
-                if let (Some(c), Some(o)) = (r(0), r(8))
+                if let (Some(c), Some(p), Some(o)) = (r(0), r(4), r(8))
                     && o != 0
                 {
                     self.osdesc.reused(c, o);
+                    // An object RM keeps a duplicate of registered memory
+                    // for, in a client of its own (osdesc.rs,
+                    // `holding_fields`): the class parameters follow
+                    // NVOS64's 48 bytes.
+                    if escape == NV_ESC_RM_ALLOC
+                        && let Some(class) = r(12)
+                    {
+                        let named: Vec<u32> = crate::osdesc::holding_fields(class)
+                            .iter()
+                            .filter_map(|&off| r(48 + off))
+                            .collect();
+                        if !named.is_empty() {
+                            self.osdesc.made_over(c, o, p, &named);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -3732,6 +3772,218 @@ impl NvidiaBackend {
             freed.push(c);
         }
         self.osdesc.forget_clients(&freed);
+    }
+
+    /// Whether RM control `param_in` (NVOS54 and its parameters) would hand
+    /// an object holding registered memory to an RM export descriptor or an
+    /// NV_MEMORY_EXPORT object: a duplicate the backend never sees made or
+    /// freed, which NVKMS, nvidia-drm or another RM client can import in
+    /// turn. Refused (EPERM) rather than followed.
+    fn osdesc_export_refused(&self, param_in: &[u8]) -> bool {
+        if self.osdesc.live() == 0 || param_in.len() < 32 {
+            return false;
+        }
+        let rd = |o: usize| u32::from_le_bytes(param_in[o..o + 4].try_into().unwrap());
+        let (client, cmd) = (rd(0), rd(8));
+        let Some(named) = crate::osdesc::exported(cmd, &param_in[32..]) else {
+            return false;
+        };
+        match named.iter().find(|&&h| self.osdesc.holds(client, h)) {
+            Some(h) => {
+                log::warn!(
+                    "RM control {cmd:#x} refused: it exports {client:#x}/{h:#x}, which holds \
+                     guest memory registered by its pages"
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Before UVM command `cmd` (`params`, the block the host will get):
+    /// ALLOC_DEVICE_P2P of registered memory is refused (it is for video
+    /// memory, and its duplicate outlives a UVM_FREE while a CPU mapping of
+    /// the range holds it); a MAP_EXTERNAL_ALLOCATION of it, what the
+    /// mapping will hold once UVM has made it.
+    fn osdesc_uvm_before(
+        &self,
+        cmd: u32,
+        params: &[u8],
+    ) -> std::result::Result<Option<crate::osdesc::UvmMap>, i32> {
+        use crate::osdesc::{UVM_ALLOC_DEVICE_P2P, UVM_MAP_EXTERNAL_ALLOCATION};
+        if self.osdesc.live() == 0 {
+            return Ok(None);
+        }
+        let (UVM_MAP_EXTERNAL_ALLOCATION | UVM_ALLOC_DEVICE_P2P) = cmd else {
+            return Ok(None);
+        };
+        // hClient and hMemory follow rmCtrlFd in both.
+        let Some(fd_off) = crate::uvmfd::field(self.driver, cmd).map(|f| f.offset as usize) else {
+            return Ok(None);
+        };
+        let rd32 = |o: usize| {
+            params
+                .get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let rd64 = |o: usize| {
+            params
+                .get(o..o + 8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(client), Some(memory)) = (rd32(fd_off + 4), rd32(fd_off + 8)) else {
+            return Ok(None);
+        };
+        if !self.osdesc.holds(client, memory) {
+            return Ok(None);
+        }
+        if cmd == UVM_ALLOC_DEVICE_P2P {
+            log::warn!(
+                "UVM ALLOC_DEVICE_P2P of {client:#x}/{memory:#x} refused: guest memory \
+                 registered by its pages"
+            );
+            return Err(libc::EPERM);
+        }
+        self.osdesc.uvm_admit(client, memory)?;
+        // UVM_MAP_EXTERNAL_ALLOCATION_PARAMS: base, length, offset, then
+        // perGpuAttributes[] at 24 (36 bytes each, the UUID first), and
+        // gpuAttributesCount just before rmCtrlFd.
+        const ATTRS: usize = 24;
+        const ATTR_SIZE: usize = 36;
+        let max = fd_off.saturating_sub(8 + ATTRS) / ATTR_SIZE;
+        let count = rd64(fd_off - 8).unwrap_or(0).min(max as u64) as usize;
+        let gpus = (0..count)
+            .filter_map(|i| {
+                params
+                    .get(ATTRS + i * ATTR_SIZE..ATTRS + i * ATTR_SIZE + 16)
+                    .map(|b| b.try_into().unwrap())
+            })
+            .collect();
+        Ok(Some(crate::osdesc::UvmMap {
+            base: rd64(0).unwrap_or(0),
+            len: rd64(8).unwrap_or(0),
+            gpus,
+            client,
+            memory,
+        }))
+    }
+
+    /// After UVM command `cmd` on the current handle: what it made, mapped,
+    /// unmapped or freed, for the registrations UVM external mappings hold
+    /// (osdesc.rs). `params` is the block the host was handed.
+    fn osdesc_uvm_after(
+        &mut self,
+        cmd: u32,
+        params: &[u8],
+        map: Option<crate::osdesc::UvmMap>,
+        resp_buf: &[u8],
+        n: usize,
+    ) {
+        use crate::osdesc::{
+            UVM_CREATE_EXTERNAL_RANGE, UVM_MAP_EXTERNAL_ALLOCATION, UVM_UNMAP_EXTERNAL,
+        };
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        // UVM's own status, where the block keeps it; None when the call
+        // failed before UVM answered, or the reply is short.
+        let status = |at: usize| -> Option<u32> {
+            if n < body + at + 4 || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+                return None;
+            }
+            Some(u32::from_le_bytes(
+                resp_buf[body + at..body + at + 4].try_into().unwrap(),
+            ))
+        };
+        let handle = self.current_handle;
+        let word = |o: usize| {
+            params
+                .get(o..o + 8)
+                .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        let size = params.len();
+        match cmd {
+            UVM_MAP_EXTERNAL_ALLOCATION => {
+                let Some(m) = map else { return };
+                // Held whatever UVM answered: it can fail the call after
+                // making every mapping (its wait for the page-table writes),
+                // and then leaves them up. A mapping never made is held
+                // until its range is freed or its file closes: late, not
+                // early.
+                self.osdesc
+                    .uvm_mapped(handle, m.base, m.len, &m.gpus, m.client, m.memory);
+            }
+            UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
+                self.osdesc.uvm_range_made(handle, word(0), word(8));
+            }
+            crate::uvmmap::FREE if size >= 16 && status(size - 8) == Some(0) => {
+                self.osdesc.uvm_range_freed(handle, word(0));
+            }
+            UVM_UNMAP_EXTERNAL if size >= 40 && status(size - 8) == Some(0) => {
+                let gpu: crate::osdesc::GpuUuid = params[16..32].try_into().unwrap();
+                self.osdesc.uvm_unmapped(handle, word(0), word(8), &gpu);
+            }
+            _ => {}
+        }
+    }
+
+    /// Take down, on UVM file `host_fd` (guest handle `handle`) while it is
+    /// still ours, every external mapping of registered memory it holds, and
+    /// forget its ranges: UVM_FREE of each recorded range holding one, then
+    /// UNMAP_EXTERNAL of what is left, GPU by GPU. Its last reference may be
+    /// dropped later than the close (the event pump holds a duplicate), so
+    /// the close itself says nothing of when UVM lets go. What will not come
+    /// down stays held until the session ends.
+    pub(crate) fn osdesc_uvm_close(&mut self, host_fd: RawFd, handle: u32, why: &str) {
+        use crate::osdesc::UVM_UNMAP_EXTERNAL;
+        for (base, len) in self.osdesc.uvm_ranges_held(handle) {
+            // UVM_FREE_PARAMS: base, then (before 590.44.01) length.
+            let ok = self.uvm_call(host_fd, crate::uvmmap::FREE, |b, size| {
+                b[0..8].copy_from_slice(&base.to_le_bytes());
+                if size >= 24 {
+                    b[8..16].copy_from_slice(&len.to_le_bytes());
+                }
+            });
+            if ok {
+                self.osdesc.uvm_range_freed(handle, base);
+            } else {
+                log::warn!("{why}: UVM_FREE of the external range at {base:#x} failed");
+            }
+        }
+        for (base, len, gpu) in self.osdesc.uvm_maps_held(handle) {
+            // UVM_UNMAP_EXTERNAL_PARAMS: base, length, gpuUuid.
+            let ok = self.uvm_call(host_fd, UVM_UNMAP_EXTERNAL, |b, _| {
+                b[0..8].copy_from_slice(&base.to_le_bytes());
+                b[8..16].copy_from_slice(&len.to_le_bytes());
+                b[16..32].copy_from_slice(&gpu);
+            });
+            if ok {
+                self.osdesc.uvm_unmapped(handle, base, len, &gpu);
+            } else {
+                log::warn!("{why}: UVM_UNMAP_EXTERNAL of {base:#x}+{len:#x} failed");
+            }
+        }
+        self.osdesc.uvm_file_closed(handle);
+    }
+
+    /// Call UVM command `cmd` on `host_fd` with the block the host's release
+    /// has for it, filled by `fill` (handed at least 40 bytes, and the
+    /// block's size): whether the ioctl and UVM (its status, `size - 8` into
+    /// the block, for every command called here) both succeeded.
+    fn uvm_call(&self, host_fd: RawFd, cmd: u32, fill: impl FnOnce(&mut [u8], usize)) -> bool {
+        let Some(size) = self
+            .driver
+            .and_then(abi::schema::uvm_table)
+            .and_then(|t| t.lookup(cmd))
+            .map(|c| c.size as usize)
+            .filter(|&s| s >= 16)
+        else {
+            return false;
+        };
+        let mut b = vec![0u8; size.max(40)];
+        fill(&mut b, size);
+        // SAFETY: the HostIoctl contract: `b` holds at least the block UVM
+        // copies each way for `cmd` on this release.
+        let rc = unsafe { (self.host_ioctl)(host_fd, u64::from(cmd), b.as_mut_ptr()) };
+        rc == 0 && b[size - 8..size - 4] == [0; 4]
     }
 
     /// OP_OSDESC_REAP: the releases after `ack`, and forget those up to it.
