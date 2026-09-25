@@ -404,9 +404,20 @@ struct nvgpu_gem_object {
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
 
-/* ───────── nvgpu_main.c ───────── */
+/* ───────── nvgpu_rmio.c, or nvgpu_rs.rs with NVGPU_RUST ─────────
+ *
+ * The protocol-v1 IOCTL message: an ioctl on a /dev/nvidia* file (or a DRM
+ * file's driver range), a UVM command, and a v1 backend's NVKMS command.
+ */
 
 long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
+long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
+                        unsigned long arg);
+long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
+                         void __user *uarg, u32 sz);
+
+/* ───────── nvgpu_main.c ───────── */
+
 long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
                         void *kbuf, u32 sz);
 /*
@@ -421,6 +432,8 @@ int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
  * and that process, as struct nvgpu_proc_id at `dst`.
  */
 bool nvgpu_proc_ids(const struct nvgpu_device *dev);
+/* And its euid, with every RM_CONTROL too (NVGPU_BCAP_PROC_EUID). */
+bool nvgpu_proc_euid(const struct nvgpu_device *dev);
 void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst);
 struct task_struct;
 void nvgpu_proc_id_fill_task(const struct nvgpu_device *dev,
@@ -767,7 +780,8 @@ void nvgpu_osdesc_init(struct nvgpu_device *dev);
  * An RM escape that registers memory the caller already has (ALLOC_MEMORY or
  * RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, VID_HEAP_CONTROL's
  * ALLOC_OS_DESCRIPTOR): true if it was handled here, with *ret its result.
- * False for anything else, which goes the usual way.
+ * False for anything else, which goes the usual way. nvgpu_rmio.c; with
+ * NVGPU_RUST, nvgpu_ioctl_fd() in Rust does this itself.
  */
 bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
                         void __user *uarg, unsigned int sz, long *ret);
@@ -775,6 +789,18 @@ bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
 void nvgpu_osdesc_reap(struct nvgpu_device *dev);
 /* remove(), after the reset: unpin everything. */
 void nvgpu_osdesc_release_all(struct nvgpu_device *dev);
+/* What a registration does with its pages, for whichever builds the call. */
+bool nvgpu_osdesc_ok(const struct nvgpu_device *dev);
+/* Pin the `npages` pages from the page-aligned `start`, all of them, into
+ * `pages` (FOLL_LONGTERM, FOLL_WRITE for `write`), as RM would; 0 or -errno. */
+int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
+                     struct page **pages);
+/* Keep them pinned under registration `id` until a reap names it (0: until
+ * remove()); the list and the array are then nvgpu_osdesc.c's. */
+void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
+                       unsigned long npages, bool write);
+/* Unpin them (dirtied for `write`) and free the array. */
+void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 
 /* ── HOST_OP / WATCH / CLOSE ── */
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
@@ -948,6 +974,9 @@ int nvgpu_i2_add_fd(struct nvgpu_i2_call *call, u32 buf, u32 off, u32 handle,
 /* For specials: the kernel copy of buffer `buf` (NULL if none). */
 void *nvgpu_i2_buf(struct nvgpu_i2_call *call, u32 buf, u32 *len);
 
+/* nvgpu_schema.c: the generated tables' one copy. */
+/* The set to use before HELLO has picked the host's (DRM only). */
+const struct nvgpu_schema_set *nvgpu_schema_default(void);
 /* Selects the schema set for the host driver version (NULL: none). */
 const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version);
 /* The UVM block sizes for the host driver version (NULL: UVM refused). */
