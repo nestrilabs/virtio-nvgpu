@@ -37,7 +37,7 @@
 //!   chains.
 
 use std::fs::File;
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -46,8 +46,11 @@ use clap::Parser;
 use device::exec::ExecPool;
 use device::host;
 use device::nvidia::NvidiaBackend;
+use device::privfd;
 use device::pump::{EventQueue, Fill, Pump, PumpCmd, PumpHandle};
-use device::session::{BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, Reply};
+use device::session::{
+    BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, PendingIoctl2, Reply,
+};
 use device::shm::WindowPlacer;
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use protocol::messages::{MsgHeader, MsgType};
@@ -65,7 +68,8 @@ use virtio_bindings::bindings::virtio_ring::{
 };
 use virtio_queue::{Error as VirtQueError, QueueOwnedT, QueueT};
 use vm_memory::{
-    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryMmap,
+    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryBackend,
+    GuestMemoryMmap, GuestMemoryRegion,
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
@@ -189,7 +193,15 @@ const NV_SHM_ID: u8 = 1;
 struct EpochVring<M: GuestAddressSpace = GuestMemoryAtomic<GuestMemoryMmap>> {
     inner: VringRwLock<M>,
     epoch: Arc<AtomicU64>,
+    /// The kick, call and error eventfds the ring holds, by number, so each
+    /// can be registered as the backend's own while it is open (`privfd`):
+    /// they are in no handle table, and an IOCTL2 must never adopt one.
+    eventfds: Arc<Mutex<[Option<RawFd>; 3]>>,
 }
+
+const KICK: usize = 0;
+const CALL: usize = 1;
+const ERR: usize = 2;
 
 impl<M: GuestAddressSpace + 'static> EpochVring<M> {
     /// The current epoch. Read it while holding the ring's lock to tie it to
@@ -203,6 +215,26 @@ impl<M: GuestAddressSpace + 'static> EpochVring<M> {
         let mut g = self.inner.get_mut();
         f(&mut *g);
         self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Hand the ring a new eventfd for `slot`, keeping the private registry
+    /// exact: the new number is registered before the ring holds it, and the
+    /// old one unregistered only after the ring has dropped (closed) it -- a
+    /// moment where a closed number is still registered costs at most one
+    /// refused adoption, while the other order would leave an open one
+    /// unregistered.
+    fn swap_eventfd(&self, slot: usize, file: Option<File>, set: impl FnOnce(Option<File>)) {
+        let new = file.as_ref().map(|f| f.as_raw_fd());
+        if let Some(fd) = new {
+            privfd::register(fd);
+        }
+        let mut fds = self.eventfds.lock().unwrap();
+        set(file);
+        if let Some(old) = std::mem::replace(&mut fds[slot], new) {
+            if Some(old) != new {
+                privfd::unregister(old);
+            }
+        }
     }
 }
 
@@ -219,6 +251,7 @@ impl<M: 'static + GuestAddressSpace> VringT<M> for EpochVring<M> {
         Ok(Self {
             inner: VringRwLock::new(mem, max_queue_size)?,
             epoch: Arc::new(AtomicU64::new(0)),
+            eventfds: Arc::default(),
         })
     }
 
@@ -294,7 +327,7 @@ impl<M: 'static + GuestAddressSpace> VringT<M> for EpochVring<M> {
     }
 
     fn set_kick(&self, file: Option<File>) {
-        self.inner.set_kick(file);
+        self.swap_eventfd(KICK, file, |f| self.inner.set_kick(f));
     }
 
     fn read_kick(&self) -> std::io::Result<bool> {
@@ -302,11 +335,11 @@ impl<M: 'static + GuestAddressSpace> VringT<M> for EpochVring<M> {
     }
 
     fn set_call(&self, file: Option<File>) {
-        self.inner.set_call(file);
+        self.swap_eventfd(CALL, file, |f| self.inner.set_call(f));
     }
 
     fn set_err(&self, file: Option<File>) {
-        self.inner.set_err(file);
+        self.swap_eventfd(ERR, file, |f| self.inner.set_err(f));
     }
 }
 
@@ -452,6 +485,18 @@ impl Shared {
         }
     }
 
+    /// Finish an executed IOCTL2 under the backend lock, and forward what
+    /// finishing told the pump: a consumed handle it closed has a watch to
+    /// end now, not whenever the next request happens to be served.
+    fn finish(&self, p: PendingIoctl2) -> Reply {
+        let mut be = self.nvidia.lock().unwrap();
+        let reply = be.finish_ioctl2(p);
+        let cmds = be.take_pump_cmds();
+        drop(be);
+        self.forward(cmds);
+        reply
+    }
+
     /// Complete a chain, unless its ring has moved on since it was taken.
     fn complete(&self, vring: &Vring, t: &Taken, mut reply: Reply) {
         let Some(mem) = self.mem.read().unwrap().clone() else {
@@ -543,6 +588,10 @@ struct NvGpuBackend {
     config: VirtioGpuNvConfig,
     max_req: usize,
     max_resp: usize,
+    /// Guest memory's backing descriptors, as registered with `privfd`.
+    mem_fds: Vec<RawFd>,
+    /// Whether the library's own descriptors have been registered yet.
+    scanned_fds: bool,
 }
 
 impl NvGpuBackend {
@@ -572,6 +621,7 @@ impl NvGpuBackend {
         let mut nvidia = NvidiaBackend::with_default_zones();
         nvidia.set_abi_policy(abi_policy);
         nvidia.set_config(config);
+        nvidia.set_host_driver_version(&version);
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -587,6 +637,8 @@ impl NvGpuBackend {
             config: VirtioGpuNvConfig::new(&version, &gpus),
             max_req: MAX_XFER_DIRECT as usize,
             max_resp: MAX_XFER_DIRECT as usize,
+            mem_fds: Vec::new(),
+            scanned_fds: false,
         })
     }
 
@@ -699,7 +751,7 @@ impl NvGpuBackend {
                                     p.cancelled_reply()
                                 } else {
                                     p.execute();
-                                    shared.nvidia.lock().unwrap().finish_ioctl2(p)
+                                    shared.finish(p)
                                 };
                                 shared.complete(&vring, &taken, reply);
                             }),
@@ -709,7 +761,7 @@ impl NvGpuBackend {
                         // Inline, but still without the backend lock: the
                         // host call is made by nobody else's schedule.
                         p.execute();
-                        let reply = self.shared.nvidia.lock().unwrap().finish_ioctl2(p);
+                        let reply = self.shared.finish(p);
                         self.shared.complete(vring, &taken, reply);
                     }
                 },
@@ -805,8 +857,36 @@ impl VhostUserBackendMut for NvGpuBackend {
         self.event_idx = enabled;
     }
 
+    /// New guest memory. Its regions' backing files (the VMM's memfds) are
+    /// the backend's own descriptors from here on, and registered as such;
+    /// the previous table's go once it is replaced.
+    ///
+    /// The first time is also when everything else the vhost-user library
+    /// holds is registered, by taking the whole descriptor table: the
+    /// connection is up, the backend request channel has normally arrived,
+    /// the library's worker threads have their epoll and exit eventfds, and
+    /// no guest request can have been served (the rings are not started
+    /// before the memory table exists), so every descriptor open is
+    /// plumbing. None of it is ever shown to this crate one by one.
     fn update_memory(&mut self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> std::io::Result<()> {
+        let fds: Vec<RawFd> = mem
+            .memory()
+            .iter()
+            .filter_map(|r| r.file_offset().map(|f| f.file().as_raw_fd()))
+            .collect();
+        fds.iter().for_each(|&fd| privfd::register(fd));
         *self.shared.mem.write().unwrap() = Some(mem);
+        for old in std::mem::replace(&mut self.mem_fds, fds) {
+            if !self.mem_fds.contains(&old) {
+                privfd::unregister(old);
+            }
+        }
+        if !self.scanned_fds {
+            self.scanned_fds = true;
+            let be = self.shared.nvidia.lock().unwrap();
+            let n = privfd::register_process_fds(&|fd| be.owns_fd(fd));
+            log::info!("{n} descriptor(s) of the transport registered as the backend's own");
+        }
         Ok(())
     }
 
@@ -985,6 +1065,28 @@ mod tests {
         mem.write_slice(b"world", a(0x900)).unwrap();
         let req = gather(&mem, &[(a(0x100), 6), (a(0x900), 5)], 11).unwrap();
         assert_eq!(req, b"hello world");
+    }
+
+    /// A vring's eventfds are in no handle table, so the private registry
+    /// has to know them for exactly as long as the ring holds them.
+    #[test]
+    fn a_rings_eventfds_are_private_while_it_holds_them() {
+        use std::os::fd::FromRawFd;
+        let eventfd = || {
+            // SAFETY: plain syscall; the descriptor is owned by the File.
+            unsafe { File::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) }
+        };
+        let v: Vring = VringT::new(GuestMemoryAtomic::new(memory()), 256).unwrap();
+        let (kick, call) = (eventfd(), eventfd());
+        let (k, c) = (kick.as_raw_fd(), call.as_raw_fd());
+        v.set_kick(Some(kick));
+        v.set_call(Some(call));
+        assert!(privfd::is_private(k) && privfd::is_private(c));
+        v.set_kick(None);
+        assert!(!privfd::is_private(k), "dropped with the ring's file");
+        assert!(privfd::is_private(c));
+        v.set_call(None);
+        assert!(!privfd::is_private(c));
     }
 
     /// Everything that stops or moves a ring must move its epoch, so a

@@ -21,6 +21,22 @@ pub struct GuardedBuf {
     len: usize,
 }
 
+// SAFETY: a GuardedBuf is the sole owner of its mapping. `base` comes from an
+// anonymous private mmap made in `new` and is never handed out except as a
+// borrow of the GuardedBuf itself (`as_slice` through `&self`, `as_mut_slice`
+// and `as_mut_ptr` through `&mut self`), there is no Clone, and `Drop` unmaps
+// it exactly once. So moving the value to another thread moves the only way
+// to reach those pages, and no other thread keeps an alias to them: the raw
+// pointer is only why the compiler cannot see that. Pages of an anonymous
+// mapping are not tied to the thread that created them.
+//
+// This is what lets an IOCTL2 (`xfer::Prepared`, which holds its host buffers
+// in GuardedBufs) be prepared on the queue thread and executed on a per-file
+// executor thread. A pointer to the buffer does reach the host kernel during
+// `execute`, but only for the length of the ioctl call, on the thread that
+// owns the Prepared at that moment.
+unsafe impl Send for GuardedBuf {}
+
 const PAGE: usize = 4096;
 
 /// Readable bytes after the buffer, standing in for the caller's own memory.
@@ -126,6 +142,16 @@ mod tests {
         let b = GuardedBuf::new(100).expect("mapped");
         let guard = b.base as usize + b.mapped - PAGE;
         assert!(guard > b.base as usize + 100 + SLACK - PAGE);
+    }
+
+    #[test]
+    fn a_buffer_can_be_filled_on_one_thread_and_read_on_another() {
+        let mut b = GuardedBuf::new(64).expect("mapped");
+        b.as_mut_slice()[..4].copy_from_slice(b"nvgp");
+        let back = std::thread::spawn(move || b.as_slice()[..4].to_vec())
+            .join()
+            .unwrap();
+        assert_eq!(back, b"nvgp");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 
 use crate::error::{DeviceError, Result};
+use crate::privfd::PrivateFd;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,8 +203,9 @@ pub struct ShmAllocator {
     base_ptr: *mut u8,
 
     /// Self-owned memfd mapping — used as fallback when no external
-    /// base pointer is provided (e.g., unit tests).
-    memfd: Option<OwnedFd>,
+    /// base pointer is provided (e.g., unit tests). Registered as the
+    /// backend's own descriptor (`privfd`), so no IOCTL2 can adopt it.
+    memfd: Option<PrivateFd>,
     memfd_ptr: *mut u8,
     memfd_size: u64,
 
@@ -267,7 +269,7 @@ impl ShmAllocator {
             wc: Zone::new(wc_base, cfg.wc_size),
             wb: Zone::new(wb_base, cfg.wb_size),
             base_ptr: memfd_ptr as *mut u8,
-            memfd: Some(memfd),
+            memfd: Some(PrivateFd::new(memfd)),
             memfd_ptr: memfd_ptr as *mut u8,
             memfd_size: total,
             total_size: total,

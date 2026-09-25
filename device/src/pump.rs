@@ -51,6 +51,8 @@ use std::time::{Duration, Instant};
 
 use protocol::messages::*;
 
+use crate::privfd::PrivateFd;
+
 /// Undelivered DRM event bytes per handle before the pump stops reading.
 ///
 /// The host's own per-file event space: past this the kernel would refuse to
@@ -451,7 +453,9 @@ pub trait EventQueue: Send {
 const WAKE: u64 = u64::MAX;
 
 struct Watched {
-    fd: OwnedFd,
+    /// The pump's own duplicate of the handle's descriptor: a number the
+    /// backend holds that is in no handle table, so registered as private.
+    fd: PrivateFd,
     mode: WatchMode,
 }
 
@@ -459,7 +463,7 @@ struct Watched {
 #[derive(Clone)]
 pub struct PumpHandle {
     tx: Sender<PumpCmd>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<PrivateFd>,
 }
 
 impl PumpHandle {
@@ -481,8 +485,8 @@ impl PumpHandle {
 }
 
 pub struct Pump<Q: EventQueue> {
-    epfd: OwnedFd,
-    wake: Arc<OwnedFd>,
+    epfd: PrivateFd,
+    wake: Arc<PrivateFd>,
     rx: Receiver<PumpCmd>,
     queue: Q,
     outbox: Outbox,
@@ -516,12 +520,12 @@ impl<Q: EventQueue> Pump<Q> {
         if epfd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
+        let epfd = PrivateFd::new(unsafe { OwnedFd::from_raw_fd(epfd) });
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
             return Err(io::Error::last_os_error());
         }
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(wake) });
+        let wake = Arc::new(PrivateFd::new(unsafe { OwnedFd::from_raw_fd(wake) }));
         let (tx, rx) = channel();
         let pump = Self {
             epfd,
@@ -645,7 +649,10 @@ impl<Q: EventQueue> Pump<Q> {
                             self.outbox.forget(handle, old.mode.cookie());
                         }
                     }
-                    let w = Watched { fd, mode };
+                    let w = Watched {
+                        fd: PrivateFd::new(fd),
+                        mode,
+                    };
                     if self.arm(handle, &w) {
                         self.watches.insert(handle, w);
                         // An edge that fired before the watch existed is not

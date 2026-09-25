@@ -337,6 +337,15 @@ pub struct Prepared {
     gem_outs: Vec<(usize, usize, u32, u64)>,
 }
 
+/// A call is prepared on the queue thread and may run on an executor thread
+/// (session.rs, `PendingIoctl2`), so it must be `Send`. Everything in it is
+/// owned outright -- guarded buffers (see the SAFETY note on `GuardedBuf`),
+/// descriptors, `Arc`s of `Send + Sync` state -- and this keeps it that way.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Prepared>();
+};
+
 /// Parse and validate an IOCTL2 payload (the bytes after the MsgHeader) for a
 /// call on `target` (a handle of `target_kind`). The request's `render` field
 /// is used, and checked to be a render handle (the target itself for a render

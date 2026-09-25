@@ -22,13 +22,15 @@
 //! adopts what the host produced and builds the response, under the mutex
 //! again.
 
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use protocol::messages::*;
 
 use crate::hostfd::{self, HandleKind, HostOp};
 use crate::nvidia::NvidiaBackend;
+use crate::privfd::{self, PrivateFd};
 use crate::pump::PumpCmd;
 use crate::schema::SchemaClass;
 use crate::xfer;
@@ -195,6 +197,80 @@ impl xfer::Env for BackendEnv<'_> {
 
     fn nvkms_version(&self) -> Option<abi::version::DriverVersion> {
         self.backend.driver
+    }
+
+    /// Made by `prepare_ioctl2` before this Env exists (it needs the table
+    /// mutably), so here it is only looked up.
+    fn kms_state(&self, target: u32) -> Option<Arc<xfer::KmsFileState>> {
+        self.backend.kms_states.get(&target).cloned()
+    }
+
+    fn hooks(&self) -> Arc<dyn xfer::Hooks> {
+        self.backend.hooks.clone()
+    }
+
+    fn sys(&self) -> Arc<dyn xfer::Sys> {
+        self.backend.xfer_sys.clone()
+    }
+}
+
+/// `xfer::Finisher` over the backend: what a finished IOCTL2 may adopt, and
+/// where.
+struct BackendFinisher<'a> {
+    backend: &'a mut NvidiaBackend,
+    cards: &'a [hostfd::CardNode],
+    /// The session was reset while the call ran: nothing it made may land
+    /// in a table the new session knows nothing about.
+    stale: bool,
+    /// Handles adopted, for the reply to carry (and close, if it is never
+    /// delivered).
+    created: Vec<u32>,
+}
+
+impl xfer::Finisher for BackendFinisher<'_> {
+    /// Every descriptor the backend holds: the guest's, in the handle table,
+    /// and its own -- the vhost-user socket, guest memory, the pump, the
+    /// vrings' eventfds, the window memfd, the cached signalled sync_file --
+    /// in the private registry (`privfd`).
+    fn is_backend_fd(&self, fd: RawFd) -> bool {
+        self.backend.handles.owns_fd(fd) || privfd::is_private(fd)
+    }
+
+    /// Classified by what the kernel says the file is, never by where the
+    /// schema found it; made non-blocking if it is a DRM file, because the
+    /// pump reads those and one blocking read stops every event for the VM.
+    /// Refused (the descriptor closes here, and the record carries handle 0)
+    /// when the session is gone or the table is full.
+    fn adopt(&mut self, fd: OwnedFd) -> (u32, HandleKind) {
+        if self.stale {
+            return (0, HandleKind::Other);
+        }
+        let kind = hostfd::classify(fd.as_fd(), self.cards);
+        if kind.is_kms() {
+            if let Err(e) = hostfd::set_nonblock(fd.as_raw_fd()) {
+                log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
+            }
+        }
+        match self.backend.handles.insert(fd, kind) {
+            Ok(h) => {
+                self.created.push(h);
+                (h, kind)
+            }
+            Err(_) => {
+                log::warn!("IOCTL2: handle table full; closing an adopted {kind:?}");
+                (0, HandleKind::Other)
+            }
+        }
+    }
+
+    /// An `I2_FD_CONSUME` handle, used up by a call that ran. Closed the way
+    /// a CLOSE closes it, so its watches and window state go too. Not in a
+    /// stale session: the reset closed it already, and the number may
+    /// belong to nobody or (after a wrap) to someone else.
+    fn close_handle(&mut self, handle: u32) {
+        if !self.stale {
+            let _ = self.backend.close_handle(handle);
+        }
     }
 }
 
@@ -417,13 +493,18 @@ impl NvidiaBackend {
                         .iter()
                         .map(|d| format!("/dev/dri/{}", d.name))
                         .collect();
-                    self.signaled = Some(hostfd::signaled_sync_file(&paths).map_err(io)?);
+                    self.signaled = Some(PrivateFd::new(
+                        hostfd::signaled_sync_file(&paths).map_err(io)?,
+                    ));
                 }
+                // The duplicate is the guest's: a plain descriptor, not a
+                // private one.
                 let fd = self
                     .signaled
                     .as_ref()
                     .expect("filled above")
-                    .try_clone()
+                    .as_fd()
+                    .try_clone_to_owned()
                     .map_err(io)?;
                 let h = self.insert(fd, HandleKind::SyncFile)?;
                 Ok((vec![h as u64], vec![h]))
@@ -514,7 +595,26 @@ impl NvidiaBackend {
                 return Err(libc::EPERM);
             }
         };
+        if class == SchemaClass::Kms {
+            self.kms_states.entry(target).or_default();
+        }
         let prepared = xfer::prepare(&BackendEnv { backend: self }, class, target, kind, payload)?;
+        // The whole reply must fit what the guest posted, and that is known
+        // now: response_len() is exact up to descriptors and GEM handles the
+        // host might not produce. A call that ran and then could not answer
+        // would have changed host state the guest never hears of -- a lease
+        // made, a framebuffer added -- so it is refused before it runs, and
+        // the guest (which sized its buffer from the same schema) never sees
+        // this unless it lied about its own capacity.
+        let need = HDR + prepared.response_len();
+        if need > cap {
+            log::warn!(
+                "IOCTL2 {} on handle {target}: a reply of up to {need} bytes does not fit \
+                 the {cap} bytes posted; refused before running",
+                prepared.name()
+            );
+            return Err(libc::EMSGSIZE);
+        }
         let (target_fd, _) = self.handles.dup(target).ok_or(libc::EBADF)?;
         let executor = prepared.wants_executor() || class != SchemaClass::Render;
         Ok(PendingIoctl2 {
@@ -528,71 +628,52 @@ impl NvidiaBackend {
         })
     }
 
-    /// Adopt what an executed IOCTL2 produced and build its response.
-    ///
-    /// Descriptors the host produced are classified by what the kernel says
-    /// they are, made non-blocking if they are DRM files, and given handles.
+    /// Adopt what an executed IOCTL2 produced, close what it consumed, and
+    /// build its response (see [`BackendFinisher`] for what is adopted how).
     /// If the session was reset while the call ran, nothing is adopted: the
     /// descriptors are closed and the guest is told the call was cancelled.
     pub fn finish_ioctl2(&mut self, p: PendingIoctl2) -> Reply {
-        let stale = p.generation != self.session.generation;
+        let PendingIoctl2 {
+            prepared,
+            target_fd,
+            target,
+            generation,
+            req_id,
+            cap,
+            ..
+        } = p;
+        // Done with the host file; the handle table still has its own.
+        drop(target_fd);
+        let stale = generation != self.session.generation;
         let nodes = self.host_nodes();
-        let mut created = Vec::new();
-        let handles = &mut self.handles;
-        let mut adopt = |fd: OwnedFd| -> (u32, HandleKind) {
-            if stale {
-                return (0, HandleKind::Other);
-            }
-            if handles.owns_fd(fd.as_raw_fd()) {
-                // The interpreter only adopts numbers the host wrote at schema
-                // positions, so this is a bug there -- and dropping the value
-                // would close a descriptor another handle owns. Let it go
-                // without closing it.
-                log::error!(
-                    "IOCTL2: asked to adopt fd {}, which a handle already owns",
-                    fd.as_raw_fd()
-                );
-                let _ = std::os::fd::IntoRawFd::into_raw_fd(fd);
-                return (0, HandleKind::Other);
-            }
-            let kind = hostfd::classify(fd.as_fd(), &nodes.cards);
-            if kind.is_kms() {
-                if let Err(e) = hostfd::set_nonblock(fd.as_raw_fd()) {
-                    log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
-                }
-            }
-            match handles.insert(fd, kind) {
-                Ok(h) => {
-                    created.push(h);
-                    (h, kind)
-                }
-                Err(_) => {
-                    log::warn!("IOCTL2: handle table full; closing an adopted {kind:?}");
-                    (0, HandleKind::Other)
-                }
-            }
+        let mut fin = BackendFinisher {
+            backend: self,
+            cards: &nodes.cards,
+            stale,
+            created: Vec::new(),
         };
-        let body = p.prepared.finish(&mut adopt);
+        let body = prepared.finish_with(&mut fin);
+        let created = fin.created;
         self.current_msg = MsgType::Ioctl2;
-        self.current_req_id = p.req_id;
+        self.current_req_id = req_id;
         if stale {
-            log::info!(
-                "IOCTL2 on handle {} finished after a session reset; discarded",
-                p.target
-            );
+            log::info!("IOCTL2 on handle {target} finished after a session reset; discarded");
             return self.error_reply(libc::ECANCELED);
         }
-        if HDR + body.len() > p.cap {
-            log::warn!(
-                "IOCTL2 on handle {}: a {}-byte reply does not fit the {}-byte buffer posted",
-                p.target,
+        if HDR + body.len() > cap {
+            // prepare_ioctl2 refused every call whose reply could exceed the
+            // posted buffer, and response_len() bounds what finish builds, so
+            // this is a bug in one of them. The call ran and consumed what it
+            // was given; only what it made can still be taken back.
+            log::error!(
+                "IOCTL2 on handle {target}: a {}-byte reply does not fit the {cap}-byte \
+                 buffer posted, though it was checked before running",
                 HDR + body.len(),
-                p.cap
             );
             self.close_handles(&created);
             return self.error_reply(libc::EMSGSIZE);
         }
-        let mut bytes = hdr(MsgType::Ioctl2, p.target, 0, p.req_id);
+        let mut bytes = hdr(MsgType::Ioctl2, target, 0, req_id);
         bytes.extend_from_slice(&body);
         Reply {
             bytes,

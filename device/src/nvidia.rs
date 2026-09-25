@@ -8,9 +8,12 @@ use crate::error::{DeviceError, Result};
 use crate::guarded::GuardedBuf;
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
+use crate::policy::BackendHooks;
+use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
+use crate::xfer::{Hooks, KmsFileState, Sys};
 
 // ============================================================
 // Device path helpers
@@ -421,8 +424,20 @@ pub struct NvidiaBackend {
     pub(crate) max_resp: u32,
     nodes: Option<Arc<HostNodes>>,
     /// An already-signalled sync_file, made once and duplicated for every
-    /// SIGNALED_SYNC_FILE.
-    pub(crate) signaled: Option<OwnedFd>,
+    /// SIGNALED_SYNC_FILE. The backend's own, not a guest's: registered as
+    /// private so no IOCTL2 can ever adopt its number.
+    pub(crate) signaled: Option<PrivateFd>,
+    /// Per-file KMS state of each `DrmCard`/`DrmLease` handle an IOCTL2 has
+    /// run on: the framebuffers that file created (the only ones GETFB may
+    /// return handles for) and its property names. Made on the first KMS
+    /// call and dropped with the handle, so a later handle that happens to
+    /// get the same number starts with nothing.
+    pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
+    /// The policy every IOCTL2 is checked against (see `policy.rs`).
+    pub(crate) hooks: Arc<dyn Hooks>,
+    /// The system calls IOCTL2 makes: the host's, except in tests that run
+    /// whole calls against a fake kernel.
+    pub(crate) xfer_sys: Arc<dyn Sys>,
     /// The host ioctl entry point. `libc::ioctl`, except in tests that need to
     /// see what the host driver would be handed.
     host_ioctl: HostIoctl,
@@ -835,6 +850,9 @@ impl NvidiaBackend {
             max_resp: MAX_XFER_DIRECT,
             nodes: None,
             signaled: None,
+            kms_states: std::collections::HashMap::new(),
+            hooks: BackendHooks::shared(),
+            xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
         }
     }
@@ -910,6 +928,11 @@ impl NvidiaBackend {
     /// How many host descriptors the guest currently holds open.
     pub fn handle_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Whether `fd` is a descriptor a guest handle stands for.
+    pub fn owns_fd(&self, fd: RawFd) -> bool {
+        self.handles.owns_fd(fd)
     }
 
     /// Free bytes per SHM zone, as `(uc, wc, wb)`. For tests that assert a
@@ -1068,6 +1091,7 @@ impl NvidiaBackend {
         for e in self.active_maps.drain() {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
+        self.kms_states.clear();
         self.handles.drain_all();
     }
 
@@ -1658,6 +1682,7 @@ impl NvidiaBackend {
             self.release_extent(&entry.region, entry.shm_length, "close");
         }
         self.dri_maps.retain(|(h, _), _| *h != handle);
+        self.kms_states.remove(&handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);
@@ -1685,7 +1710,24 @@ impl NvidiaBackend {
         let Some(v) = abi::version::DriverVersion::parse(text) else {
             return;
         };
+        self.set_driver_version(v);
+    }
+
+    /// The host driver version, as the transport read it from the driver at
+    /// start-up. Known before any guest asks, it tells HELLO whether an
+    /// NVKMS schema exists for this host (`BCAP_NVKMS_TABLE`) -- which the
+    /// guest uses to pick its own NVKMS table -- and lets a modeset IOCTL2
+    /// find its table before the guest's first CHECK_VERSION_STR.
+    pub fn set_host_driver_version(&mut self, text: &str) {
+        match abi::version::DriverVersion::parse(text) {
+            Some(v) => self.set_driver_version(v),
+            None => log::warn!("host driver version {text:?} does not parse; no NVKMS schema"),
+        }
+    }
+
+    fn set_driver_version(&mut self, v: abi::version::DriverVersion) {
         self.driver = Some(v);
+        self.config.nvkms_table = crate::schema::modeset_table(v).is_some();
         self.abi = abi::versions::table_for(v);
         match self.abi {
             Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),

@@ -14,6 +14,8 @@ pub mod host;
 pub mod hostfd;
 pub mod mmap;
 pub mod nvidia;
+pub mod policy;
+pub mod privfd;
 pub mod pump;
 pub mod replay;
 pub mod schema;
