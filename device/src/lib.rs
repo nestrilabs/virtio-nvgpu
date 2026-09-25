@@ -42,5 +42,7 @@ pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;
 pub mod virtio;
+#[cfg(feature = "vhost-user")]
+pub mod vring;
 pub mod wl;
 pub mod xfer;
