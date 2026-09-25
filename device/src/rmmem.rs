@@ -28,7 +28,12 @@
 //! PCI or ANY -- both become NV01_MEMORY_SYSTEM,
 //! rmapi_deprecated_vidheapctrl.c:137-142) and ALLOC_MEMORY; NVOS46
 //! CACHE_SNOOP on every GPU mapping of system memory; NVOS03 CACHE_SNOOP of a
-//! client's context DMA over memory made coherent here. Never rewritten:
+//! client's context DMA over memory made coherent here. Memory the guest
+//! registered by its pages (NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, osdesc.rs) is
+//! guest RAM like the rest, and its GPU mappings and context DMAs snoop the
+//! same way; its COHERENCY is left as asked, because RM takes an OS
+//! descriptor of ordinary pages write-back or not at all (`registered`).
+//! Never rewritten:
 //! display memory (ATTR2 ISO or NISO_DISPLAY). The display reads it through a
 //! context DMA whose snoop flag its client chose to match the memory
 //! (nvkms-rm.c:2585-2633), and on a platform where display must not snoop,
@@ -39,12 +44,13 @@
 //! is put back in the reply, so the caller reads what it sent, as it would
 //! natively (RM leaves those bits alone).
 //!
-//! **The records.** Every RM object this backend saw allocated as system
-//! memory or as a usermode (doorbell) aperture, by (hClient, handle), carried
-//! through DUP_OBJECT and dropped on FREE or with the file its client lives
-//! on (which clients those are is the backend's one client set, kept by
-//! semsurf.rs for H-1): what a later RM_MAP_MEMORY of it is
-//! mapped as on the host (M-1), and whether a GPU mapping of it must snoop.
+//! **The records.** Every RM object this backend saw allocated or
+//! registered as system memory or as a usermode (doorbell) aperture, by
+//! (hClient, handle), carried through DUP_OBJECT and dropped on FREE or with
+//! the file its client lives on (which clients those are is the backend's
+//! one client set, kept by semsurf.rs for H-1): what a later RM_MAP_MEMORY
+//! of it is mapped as on the host (M-1), and whether a GPU mapping of it
+//! must snoop.
 
 use std::collections::HashMap;
 
@@ -61,6 +67,11 @@ const NV01_CONTEXT_DMA: u32 = 0x02;
 /// every one to _CLIENT; the host frees it when that file closes).
 use crate::semsurf::ROOT_CLASSES;
 const NV01_MEMORY_SYSTEM: u32 = 0x3e;
+/// Memory the guest registered by its pages (osdesc.rs).
+use crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
+/// VID_HEAP_CONTROL's NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR, and its hMemory.
+const HEAP_ALLOC_OS_DESCRIPTOR: u32 = 27;
+const HEAP_OS_DESC_MEMORY: usize = 40;
 /// VOLTA..BLACKWELL_USERMODE_A: the doorbell aperture, a slice of BAR0
 /// (ADDR_REGMEM, kernel_fifo_gv100.c:371-374), which the host maps UC
 /// whatever the caching type (nv-mmap.c:589-596).
@@ -144,8 +155,9 @@ pub(crate) enum Mem {
         coherency: u8,
         /// ATTR2 ISO or NISO_DISPLAY: left as allocated.
         display: bool,
-        /// Made coherent here.
-        rewritten: bool,
+        /// Made coherent here: allocated write-back by the rewrite, or
+        /// registered by its pages, which RM only takes write-back.
+        made_coherent: bool,
     },
     /// A usermode aperture: registers.
     Regmem,
@@ -326,6 +338,8 @@ impl RmMem {
                         ALLOC_OUTER + MEM_ATTR,
                         ALLOC_OUTER + MEM_ATTR2,
                     )
+                } else if class == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+                    Some(self.registered())
                 } else if USERMODE_CLASSES.contains(&class) {
                     Some(Mem::Regmem)
                 } else {
@@ -353,7 +367,16 @@ impl RmMem {
                     Some(14) => Some((44, 52, 56, 136)),
                     _ => None,
                 };
-                if let Some((handle, flags, attr, attr2)) = at {
+                if rd32(params, HEAP_FUNCTION) == Some(HEAP_ALLOC_OS_DESCRIPTOR) {
+                    p.record = Record::New {
+                        client: HEAP_ROOT,
+                        handle: HEAP_OS_DESC_MEMORY,
+                        status: HEAP_STATUS,
+                        mem: Some(self.registered()),
+                        armed_on: None,
+                        is_client: false,
+                    };
+                } else if let Some((handle, flags, attr, attr2)) = at {
                     let a = rd32(params, attr).unwrap_or(0);
                     let virt = rd32(params, flags).unwrap_or(0) & NVOS32_ALLOC_FLAGS_VIRTUAL != 0;
                     let vidmem = (a >> ATTR_LOCATION_SHIFT) & 3 == ATTR_LOCATION_VIDMEM;
@@ -392,18 +415,22 @@ impl RmMem {
                     Some(Mem::Sysmem {
                         coherency,
                         display: false,
-                        rewritten,
+                        made_coherent: rewritten,
                     })
+                } else if class == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+                    Some(self.registered())
                 } else {
                     None
                 };
-                let fd = rd32(params, OS02_FD).unwrap_or(u32::MAX);
+                // Only NV01_MEMORY_SYSTEM arms a mapping (escape.c:415-431).
+                let fd = rd32(params, OS02_FD)
+                    .filter(|&fd| fd as i32 >= 0 && class == NV01_MEMORY_SYSTEM);
                 p.record = Record::New {
                     client: OS02_ROOT,
                     handle: OS02_NEW,
                     status: OS02_STATUS,
                     mem,
-                    armed_on: (fd as i32 >= 0).then_some(fd),
+                    armed_on: fd,
                     is_client: false,
                 };
             }
@@ -423,6 +450,23 @@ impl RmMem {
             _ => {}
         }
         p
+    }
+
+    /// Memory the guest registered by its pages. RM takes an OS descriptor
+    /// of ordinary pages -- and the backend only ever hands it those, its
+    /// own mapping of guest RAM -- write-back or not at all: an UNCACHED or
+    /// WRITE_COMBINE request is NV_ERR_INVALID_FLAGS
+    /// (osCreateOsDescriptorFromPageArray, osmemdesc.c:353-358), as it is
+    /// natively, so there is no coherency to rewrite, and none would make
+    /// the call succeed where the native one fails. What is left is the
+    /// GPU's side, chosen at each mapping as for any system memory: every
+    /// GPU mapping of it snoops, and so does a context DMA over it.
+    fn registered(&self) -> Mem {
+        Mem::Sysmem {
+            coherency: COHERENCY_WRITE_BACK,
+            display: false,
+            made_coherent: self.coherent,
+        }
     }
 
     /// NV01_MEMORY_SYSTEM through RM_ALLOC or VID_HEAP_CONTROL: rewrite
@@ -451,7 +495,7 @@ impl RmMem {
         Some(Mem::Sysmem {
             coherency,
             display,
-            rewritten,
+            made_coherent: rewritten,
         })
     }
 
@@ -463,7 +507,8 @@ impl RmMem {
             return;
         };
         if let Some(Mem::Sysmem {
-            rewritten: true, ..
+            made_coherent: true,
+            ..
         }) = self.lookup(client, mem)
         {
             p.rewrite(
@@ -667,7 +712,7 @@ mod tests {
                 Some(Mem::Sysmem {
                     coherency: 5,
                     display: false,
-                    rewritten: true
+                    made_coherent: true
                 })
             );
             assert_eq!(
@@ -842,6 +887,83 @@ mod tests {
             rd32(&back, ALLOC_OUTER + CTXDMA_FLAGS),
             Some(OS03_CACHE_SNOOP_DISABLE | 0x3)
         );
+    }
+
+    /// Memory registered by its pages, through each of the three calls.
+    fn registered(m: &mut RmMem) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        // RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, attr UNCACHED.
+        let mut b = vec![0u8; ALLOC_OUTER + 40];
+        put(&mut b, ALLOC_ROOT, CLIENT);
+        put(&mut b, ALLOC_NEW, 0x71);
+        put(&mut b, ALLOC_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+        out.push((b.clone(), run(m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS)).0));
+        // VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR: hMemory at 40.
+        let mut b = vec![0u8; HEAP_SIZE];
+        put(&mut b, HEAP_ROOT, CLIENT);
+        put(&mut b, HEAP_FUNCTION, HEAP_ALLOC_OS_DESCRIPTOR);
+        put(&mut b, HEAP_OS_DESC_MEMORY, 0x72);
+        out.push((
+            b.clone(),
+            run(m, NV_ESC_RM_VID_HEAP_CONTROL, &b, Some(HEAP_STATUS)).0,
+        ));
+        // ALLOC_MEMORY, COHERENCY UNCACHED, with a descriptor.
+        let mut b = vec![0u8; OS02_SIZE];
+        put(&mut b, OS02_ROOT, CLIENT);
+        put(&mut b, OS02_NEW, 0x73);
+        put(&mut b, OS02_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+        put(&mut b, OS02_FD, 42);
+        out.push((
+            b.clone(),
+            run(m, NV_ESC_RM_ALLOC_MEMORY, &b, Some(OS02_STATUS)).0,
+        ));
+        out
+    }
+
+    /// RM takes an OS descriptor of ordinary pages write-back or not at all,
+    /// so its coherency is left as asked; but it is guest RAM, which the
+    /// guest caches, and every GPU mapping of it snoops.
+    #[test]
+    fn registered_memory_is_write_back_system_memory_and_every_gpu_mapping_of_it_snoops() {
+        let mut m = RmMem::default();
+        for (req, seen) in registered(&mut m) {
+            assert_eq!(seen, req, "the registration reaches RM untouched");
+        }
+        for h in [0x71, 0x72, 0x73] {
+            assert_eq!(
+                m.lookup(CLIENT, h),
+                Some(Mem::Sysmem {
+                    coherency: COHERENCY_WRITE_BACK,
+                    display: false,
+                    made_coherent: true
+                }),
+                "{h:#x}"
+            );
+            let req = map_dma(h, 0x1);
+            let (seen, back) = run(&mut m, NV_ESC_RM_MAP_MEMORY_DMA, &req, None);
+            assert_eq!(rd32(&seen, OS46_FLAGS), Some(0x11), "{h:#x} snoops");
+            assert_eq!(rd32(&back, OS46_FLAGS), Some(0x1));
+        }
+        assert_eq!(m.armed(42), None, "RM arms no mapping for an OS descriptor");
+        // A context DMA over it snoops too.
+        let mut b = vec![0u8; ALLOC_OUTER + 32];
+        put(&mut b, ALLOC_ROOT, CLIENT);
+        put(&mut b, ALLOC_NEW, 0x74);
+        put(&mut b, ALLOC_CLASS, NV01_CONTEXT_DMA);
+        put(&mut b, ALLOC_OUTER + CTXDMA_FLAGS, OS03_CACHE_SNOOP_DISABLE);
+        put(&mut b, ALLOC_OUTER + CTXDMA_MEMORY, 0x71);
+        let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+        assert_eq!(rd32(&seen, ALLOC_OUTER + CTXDMA_FLAGS), Some(0));
+    }
+
+    #[test]
+    fn with_the_rewrite_off_registered_memory_is_mapped_as_asked() {
+        let mut m = RmMem::default();
+        m.set_coherent(false);
+        registered(&mut m);
+        let req = map_dma(0x71, 0x1);
+        let (seen, _) = run(&mut m, NV_ESC_RM_MAP_MEMORY_DMA, &req, None);
+        assert_eq!(seen, req);
     }
 
     #[test]

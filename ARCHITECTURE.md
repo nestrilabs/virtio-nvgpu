@@ -238,16 +238,37 @@ first page is kept. RM pins the VMM's view of exactly the guest's pages, and
 the caller reads back its own address.
 
 RM keeps nothing of the address once it has pinned (the escape layer hands
-the rest of RM a page array), but the backend's range stays mapped until RM
-lets go all the same. It does so when RM frees the object, its parent or its
-client, when the file the client was made on closes — the backend frees the
-client itself first, so the pages are released by then — or with the session;
-a duplicate holds it too. Only then does the guest unpin: the reply to a
-registration carries an id, and the guest asks for the ids RM has let go of
+the rest of RM a page array), but the backend's range stays mapped until the
+host kernel lets go all the same, and "lets go" means every holder, not just
+the guest's handle. RM holds the pages for the object the call made, for
+every duplicate of it, and for every object it made over one and keeps a
+duplicate of its own for (a semaphore surface, a memory mapper over one),
+and for every duplicate a semaphore surface hands back (REF_MEMORY):
+each goes when RM frees it, its parent or its client, when the file the
+client was made on closes — the backend frees the client itself first, so
+the pages are released by then — or with the session. nvidia-uvm holds them
+for every external mapping of any of those, in a client of its own, until
+UNMAP_EXTERNAL has taken it off every GPU, UVM_FREE takes its external range,
+or the UVM file closes; the backend takes the mappings down itself before it
+lets that file go, since the event pump's duplicate of the file may outlive
+the close. What the backend could not follow it refuses: an RM export to a
+descriptor, an NV_MEMORY_EXPORT attach and UVM's ALLOC_DEVICE_P2P, naming
+registered memory, are EPERM. Those exports are also the only way a user
+process can name RM memory to NVKMS or to nvidia-drm, so the refusal keeps it
+out of both.
+
+Only when the last holder is gone does the guest unpin: the reply to a
+registration carries an id, and the guest asks for the ids released
 (HOST_OP OSDESC_REAP) after every RM_FREE, every close and before every new
 registration, and unpins what is named. Until then the pages are out of
-ballooning and migration, as RM would keep them. Registrations, bytes and
-separately mapped runs are bounded per file and per VM.
+ballooning and migration, as RM would keep them. Every release the backend
+cannot see happen is taken late, never early. Registrations, bytes,
+separately mapped runs and UVM mappings are bounded per file and per VM.
+
+Registered memory is guest RAM, which the guest caches write-back, so every
+GPU mapping of it snoops, as for any system memory the guest can see (§15).
+RM takes an OS descriptor of ordinary pages only write-back, so there is no
+coherency to rewrite at registration.
 
 ### The UVM aperture
 
@@ -824,7 +845,9 @@ cache: the guest sees stale semaphores, and the GPU stale pushbuffers.
 The GPU's view is chosen twice — once for RM's own mappings, once for each
 mapping a client makes — so the backend makes both coherent. Guest system
 memory is allocated write-back, every GPU mapping of it snoops, and so does a
-context DMA over it; the caller reads back the bits it sent. A cached guest
+context DMA over it; the caller reads back the bits it sent. Memory the guest
+registered by its pages (§5) is write-back to RM already, and its GPU
+mappings and context DMAs snoop the same way. A cached guest
 view is then correct, because the GPU snoops what the CPU has cached. RM allows
 that exactly where context DMAs may snoop, which it sets by default and clears
 only for Tegra.
