@@ -12,7 +12,9 @@
  *     (owner handle, host GEM) of our GEM proxy, so the backend can PRIME
  *     export the very same object on the owner's render file. The dma-buf is
  *     held until the host has answered, so the proxy (and with it the owner's
- *     render handle) cannot go away while the export is in flight.
+ *     render handle) cannot go away while the export is in flight. A client's
+ *     syncobj (explicit sync) becomes the backend handle of the host syncobj
+ *     behind its host-handle file, which is held the same way.
  *   - RECV: a host DRM file (a lease, or the lease device's query fd) arrives
  *     as a backend handle and is adopted into a new guest DRM file cloned
  *     from a card-node template the daemon passes; in export mode a host
