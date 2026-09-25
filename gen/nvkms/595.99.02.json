@@ -1,0 +1,3967 @@
+{
+ "format": "virtio-nvgpu/nvkms-layout/1",
+ "driver_version": "595.99.02",
+ "why": "RTX 3060 box (README: every benchmark number)",
+ "source": {
+  "requested": "595.99.02",
+  "tag": "595.99.02",
+  "note": null,
+  "commit": "e394a404108a9ce5bba988c1dddf694dabbd4a43",
+  "url": "https://codeload.github.com/NVIDIA/open-gpu-kernel-modules/tar.gz/refs/tags/595.99.02"
+ },
+ "abi": {
+  "arch": "x86_64",
+  "data_model": "LP64",
+  "compiler": "gcc (GCC) 15.3.0"
+ },
+ "nvkms": {
+  "ioctl": {
+   "request": 3222301952,
+   "request_hex": "0xc0106d00",
+   "outer_size": 16,
+   "outer": {
+    "cmd": {
+     "off": 0,
+     "size": 4
+    },
+    "size": {
+     "off": 4,
+     "size": 4
+    },
+    "address": {
+     "off": 8,
+     "size": 8
+    }
+   }
+  },
+  "constants": {
+   "NV_MAX_SUBDEVICES": 8,
+   "NV_MAX_HEADS": 4,
+   "NVKMS_MAX_HEADS_PER_DISP": 4,
+   "NVKMS_MAX_LAYERS_PER_HEAD": 8,
+   "NV_MAX_FLIP_REQUEST_HEADS": 32,
+   "NVKMS_MAX_SWAPGROUPS": 128,
+   "NV_MAX_DEVICES": 32,
+   "NVKMS_LUT_ARRAY_SIZE": 1024,
+   "NVKMS_MAX_PLANES_PER_SURFACE": 3,
+   "NVKMS_MAX_EYES": 2,
+   "NVKMS_MODE_VALIDATION_MAX_INFO_STRING_LENGTH": 2048,
+   "NVKMS_NVIDIA_DRIVER_VERSION_STRING_LENGTH": 32,
+   "NVKMS_MAX_DEVICE_REGISTRY_KEYS": 16,
+   "NVKMS_EDID_BUFFER_SIZE": 2048,
+   "NVKMS_SYNCPT_TYPE_NONE": 0,
+   "NVKMS_SYNCPT_TYPE_RAW": 1,
+   "NVKMS_SYNCPT_TYPE_FD": 2,
+   "NV_KMS_PERMISSIONS_TYPE_FLIPPING": 1,
+   "NV_KMS_PERMISSIONS_TYPE_MODESET": 2,
+   "NV_KMS_PERMISSIONS_TYPE_SUB_OWNER": 3
+  },
+  "types": {
+   "struct NvKmsIoctlParams": 16,
+   "struct NvKmsLutRamps": 6144,
+   "struct NvKmsRect": 8,
+   "struct NvKmsFlipCommonParams": 4480,
+   "struct NvKmsFlipRequestOneHead": 4488,
+   "struct NvKmsSetModeOneHeadRequest": 4872,
+   "struct NvKmsSetModeOneDispRequest": 19496,
+   "struct NvKmsFlipCommonReplyOneHead": 96,
+   "struct NvKmsPermissions": 20,
+   "struct NvKmsEvent": 32,
+   "struct NvKmsDeferredRequestFifo": 2568,
+   "NVDpyIdList": 4,
+   "NVDpyId": 4
+  },
+  "event_types": {
+   "NVKMS_EVENT_TYPE_DPY_CHANGED": 0,
+   "NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED": 1,
+   "NVKMS_EVENT_TYPE_DYNAMIC_DPY_DISCONNECTED": 2,
+   "NVKMS_EVENT_TYPE_DPY_ATTRIBUTE_CHANGED": 3,
+   "NVKMS_EVENT_TYPE_FRAMELOCK_ATTRIBUTE_CHANGED": 4,
+   "NVKMS_EVENT_TYPE_FLIP_OCCURRED": 5
+  },
+  "surface_formats": [
+   {
+    "value": 0,
+    "name": "I8",
+    "num_planes": 1
+   },
+   {
+    "value": 1,
+    "name": "A1R5G5B5",
+    "num_planes": 1
+   },
+   {
+    "value": 2,
+    "name": "X1R5G5B5",
+    "num_planes": 1
+   },
+   {
+    "value": 3,
+    "name": "R5G6B5",
+    "num_planes": 1
+   },
+   {
+    "value": 4,
+    "name": "A8R8G8B8",
+    "num_planes": 1
+   },
+   {
+    "value": 5,
+    "name": "X8R8G8B8",
+    "num_planes": 1
+   },
+   {
+    "value": 6,
+    "name": "A2B10G10R10",
+    "num_planes": 1
+   },
+   {
+    "value": 7,
+    "name": "X2B10G10R10",
+    "num_planes": 1
+   },
+   {
+    "value": 8,
+    "name": "A8B8G8R8",
+    "num_planes": 1
+   },
+   {
+    "value": 9,
+    "name": "X8B8G8R8",
+    "num_planes": 1
+   },
+   {
+    "value": 10,
+    "name": "RF16GF16BF16AF16",
+    "num_planes": 1
+   },
+   {
+    "value": 11,
+    "name": "R16G16B16A16",
+    "num_planes": 1
+   },
+   {
+    "value": 12,
+    "name": "RF32GF32BF32AF32",
+    "num_planes": 1
+   },
+   {
+    "value": 13,
+    "name": "Y8_U8__Y8_V8_N422",
+    "num_planes": 1
+   },
+   {
+    "value": 14,
+    "name": "U8_Y8__V8_Y8_N422",
+    "num_planes": 1
+   },
+   {
+    "value": 15,
+    "name": "Y8___U8V8_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 16,
+    "name": "Y8___V8U8_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 17,
+    "name": "Y8___U8V8_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 18,
+    "name": "Y8___V8U8_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 19,
+    "name": "Y8___U8V8_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 20,
+    "name": "Y8___V8U8_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 21,
+    "name": "Y10___U10V10_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 22,
+    "name": "Y10___V10U10_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 23,
+    "name": "Y10___U10V10_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 24,
+    "name": "Y10___V10U10_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 25,
+    "name": "Y10___U10V10_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 26,
+    "name": "Y10___V10U10_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 27,
+    "name": "Y12___U12V12_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 28,
+    "name": "Y12___V12U12_N444",
+    "num_planes": 2
+   },
+   {
+    "value": 29,
+    "name": "Y12___U12V12_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 30,
+    "name": "Y12___V12U12_N422",
+    "num_planes": 2
+   },
+   {
+    "value": 31,
+    "name": "Y12___U12V12_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 32,
+    "name": "Y12___V12U12_N420",
+    "num_planes": 2
+   },
+   {
+    "value": 33,
+    "name": "Y8___U8___V8_N444",
+    "num_planes": 3
+   },
+   {
+    "value": 34,
+    "name": "Y8___U8___V8_N420",
+    "num_planes": 3
+   },
+   {
+    "value": 35,
+    "name": "RF16GF16BF16XF16",
+    "num_planes": 1
+   }
+  ],
+  "exhaustive_members": {
+   "struct NvKmsQueryDpyDynamicDataRequest": [
+    "allowDVISpecPClkOverride",
+    "deviceHandle",
+    "disableACPIBrightnessHotkeys",
+    "dispHandle",
+    "dpInbandStereoSignaling",
+    "dpyId",
+    "edid",
+    "forceConnected",
+    "forceDisconnected",
+    "ignoreEdid",
+    "ignoreEdidChecksum",
+    "overrideEdid"
+   ],
+   "struct NvKmsAllocDeviceRequest": [
+    "deviceId",
+    "enableConsoleHotplugHandling",
+    "no3d",
+    "registryKeys",
+    "versionString"
+   ]
+  },
+  "commands": [
+   {
+    "nr": 0,
+    "name": "ALLOC_DEVICE",
+    "dispatch": true,
+    "func": "AllocDevice",
+    "params": "struct NvKmsAllocDeviceParams",
+    "custom_user": false,
+    "size": 1512,
+    "request": {
+     "offset": 0,
+     "size": 620
+    },
+    "reply": {
+     "offset": 624,
+     "size": 888
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.versionString",
+      "off": 0,
+      "size": 32,
+      "role": "policy",
+      "note": "must equal the host NV_VERSION_STRING"
+     },
+     {
+      "kind": "field",
+      "path": "request.deviceId.rmDeviceId",
+      "off": 32,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.deviceId.migDevice",
+      "off": 36,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.no3d",
+      "off": 40,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.enableConsoleHotplugHandling",
+      "off": 41,
+      "size": 1,
+      "role": "policy",
+      "note": "global side effect on the device"
+     },
+     {
+      "kind": "array",
+      "path": "request.registryKeys",
+      "off": 44,
+      "count": 16,
+      "stride": 36,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "name",
+        "off": 0,
+        "size": 32,
+        "role": "policy"
+       },
+       {
+        "kind": "field",
+        "path": "value",
+        "off": 32,
+        "size": 4,
+        "role": "policy"
+       }
+      ]
+     },
+     {
+      "kind": "field",
+      "path": "reply.status",
+      "off": 624,
+      "size": 4,
+      "role": "status"
+     },
+     {
+      "kind": "field",
+      "path": "reply.deviceHandle",
+      "off": 628,
+      "size": 4,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "reply.numDisps",
+      "off": 640,
+      "size": 4,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "reply.dispHandles",
+      "off": 644,
+      "size": 32,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "reply.supportsSyncpts",
+      "off": 1487,
+      "size": 1,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "reply.vtFbBaseAddress",
+      "off": 1496,
+      "size": 8,
+      "role": "policy",
+      "note": "only filled for kernel clients"
+     },
+     {
+      "kind": "field",
+      "path": "reply.vtFbSize",
+      "off": 1504,
+      "size": 8,
+      "role": "policy",
+      "note": "only filled for kernel clients"
+     }
+    ]
+   },
+   {
+    "nr": 1,
+    "name": "FREE_DEVICE",
+    "dispatch": true,
+    "func": "FreeDevice",
+    "params": "struct NvKmsFreeDeviceParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 2,
+    "name": "QUERY_DISP",
+    "dispatch": true,
+    "func": "QueryDisp",
+    "params": "struct NvKmsQueryDispParams",
+    "custom_user": false,
+    "size": 172,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 164
+    },
+    "fields": []
+   },
+   {
+    "nr": 3,
+    "name": "QUERY_CONNECTOR_STATIC_DATA",
+    "dispatch": true,
+    "func": "QueryConnectorStaticData",
+    "params": "struct NvKmsQueryConnectorStaticDataParams",
+    "custom_user": false,
+    "size": 44,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 32
+    },
+    "fields": []
+   },
+   {
+    "nr": 4,
+    "name": "QUERY_CONNECTOR_DYNAMIC_DATA",
+    "dispatch": true,
+    "func": "QueryConnectorDynamicData",
+    "params": "struct NvKmsQueryConnectorDynamicDataParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 8
+    },
+    "fields": []
+   },
+   {
+    "nr": 5,
+    "name": "QUERY_DPY_STATIC_DATA",
+    "dispatch": true,
+    "func": "QueryDpyStaticData",
+    "params": "struct NvKmsQueryDpyStaticDataParams",
+    "custom_user": false,
+    "size": 92,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 80
+    },
+    "fields": []
+   },
+   {
+    "nr": 6,
+    "name": "QUERY_DPY_DYNAMIC_DATA",
+    "dispatch": true,
+    "func": "QueryDpyDynamicData",
+    "params": "struct NvKmsQueryDpyDynamicDataParams",
+    "custom_user": false,
+    "size": 37168,
+    "request": {
+     "offset": 0,
+     "size": 2072
+    },
+    "reply": {
+     "offset": 2072,
+     "size": 35096
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dpyId",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.forceConnected",
+      "off": 12,
+      "size": 1,
+      "role": "policy",
+      "note": "persists in the dpy (nvkms-dpy.c)"
+     },
+     {
+      "kind": "field",
+      "path": "request.forceDisconnected",
+      "off": 13,
+      "size": 1,
+      "role": "policy",
+      "note": "persists in the dpy"
+     },
+     {
+      "kind": "field",
+      "path": "request.overrideEdid",
+      "off": 14,
+      "size": 1,
+      "role": "policy",
+      "note": "persists in the dpy"
+     },
+     {
+      "kind": "field",
+      "path": "request.ignoreEdid",
+      "off": 15,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.ignoreEdidChecksum",
+      "off": 16,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.allowDVISpecPClkOverride",
+      "off": 17,
+      "size": 1,
+      "role": "policy",
+      "note": "persists in the dpy"
+     },
+     {
+      "kind": "field",
+      "path": "request.dpInbandStereoSignaling",
+      "off": 18,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.disableACPIBrightnessHotkeys",
+      "off": 19,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.edid.bufferSize",
+      "off": 20,
+      "size": 2,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.edid.buffer",
+      "off": 22,
+      "size": 2048,
+      "role": "policy"
+     }
+    ]
+   },
+   {
+    "nr": 7,
+    "name": "VALIDATE_MODE_INDEX",
+    "dispatch": true,
+    "func": "ValidateModeIndex",
+    "params": "struct NvKmsValidateModeIndexParams",
+    "custom_user": true,
+    "size": 736,
+    "request": {
+     "offset": 0,
+     "size": 224
+    },
+    "reply": {
+     "offset": 224,
+     "size": 512
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.dpyId",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.infoStringSize",
+      "off": 208,
+      "size": 4,
+      "role": "count"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.pInfoString",
+      "off": 216,
+      "size": 8,
+      "dir": "out",
+      "len": {
+       "rule": "bytes",
+       "size": {
+        "path": "request.infoStringSize",
+        "off": 208,
+        "size": 4
+       },
+       "max": 2048,
+       "max_name": "NVKMS_MODE_VALIDATION_MAX_INFO_STRING_LENGTH",
+       "written": {
+        "path": "reply.infoStringLenWritten",
+        "off": 532,
+        "size": 4
+       }
+      },
+      "present": {
+       "rule": "size_nonzero",
+       "field": {
+        "path": "request.infoStringSize",
+        "off": 208,
+        "size": 4
+       }
+      },
+      "note": "ignored (and zeroed) when infoStringSize is 0; the kernel copies out reply.infoStringLenWritten bytes"
+     },
+     {
+      "kind": "field",
+      "path": "reply.infoStringLenWritten",
+      "off": 532,
+      "size": 4,
+      "role": "count"
+     }
+    ]
+   },
+   {
+    "nr": 8,
+    "name": "VALIDATE_MODE",
+    "dispatch": true,
+    "func": "ValidateMode",
+    "params": "struct NvKmsValidateModeParams",
+    "custom_user": true,
+    "size": 656,
+    "request": {
+     "offset": 0,
+     "size": 304
+    },
+    "reply": {
+     "offset": 304,
+     "size": 352
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.dpyId",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.infoStringSize",
+      "off": 288,
+      "size": 4,
+      "role": "count"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.pInfoString",
+      "off": 296,
+      "size": 8,
+      "dir": "out",
+      "len": {
+       "rule": "bytes",
+       "size": {
+        "path": "request.infoStringSize",
+        "off": 288,
+        "size": 4
+       },
+       "max": 2048,
+       "max_name": "NVKMS_MODE_VALIDATION_MAX_INFO_STRING_LENGTH",
+       "written": {
+        "path": "reply.infoStringLenWritten",
+        "off": 456,
+        "size": 4
+       }
+      },
+      "present": {
+       "rule": "size_nonzero",
+       "field": {
+        "path": "request.infoStringSize",
+        "off": 288,
+        "size": 4
+       }
+      },
+      "note": "ignored (and zeroed) when infoStringSize is 0; the kernel copies out reply.infoStringLenWritten bytes"
+     },
+     {
+      "kind": "field",
+      "path": "reply.infoStringLenWritten",
+      "off": 456,
+      "size": 4,
+      "role": "count"
+     }
+    ]
+   },
+   {
+    "nr": 9,
+    "name": "SET_MODE",
+    "dispatch": true,
+    "func": "SetMode",
+    "params": "struct NvKmsSetModeParams",
+    "custom_user": true,
+    "size": 171936,
+    "request": {
+     "offset": 0,
+     "size": 155992
+    },
+    "reply": {
+     "offset": 155992,
+     "size": 15944
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.commit",
+      "off": 4,
+      "size": 1,
+      "role": "policy",
+      "note": "FALSE = validate only, needs no permission"
+     },
+     {
+      "kind": "field",
+      "path": "request.requestedDispsBitMask",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "array",
+      "path": "request.disp",
+      "off": 16,
+      "count": 8,
+      "stride": 19496,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "requestedHeadsBitMask",
+        "off": 0,
+        "size": 4,
+        "role": "target"
+       },
+       {
+        "kind": "array",
+        "path": "head",
+        "off": 8,
+        "count": 4,
+        "stride": 4872,
+        "valid": {
+         "rule": "all"
+        },
+        "fields": [
+         {
+          "kind": "field",
+          "path": "dpyIdList",
+          "off": 0,
+          "size": 4,
+          "role": "target"
+         },
+         {
+          "kind": "ptr",
+          "path": "flip.lut.input.pRamps",
+          "off": 360,
+          "size": 8,
+          "dir": "in",
+          "len": {
+           "rule": "const",
+           "type": "struct NvKmsLutRamps",
+           "bytes": 6144
+          },
+          "present": {
+           "rule": "nonzero"
+          },
+          "elem": {
+           "type": "struct NvKmsLutRamps",
+           "size": 6144,
+           "fields": []
+          },
+          "note": "copied in by CopyInLutParams whenever non-zero"
+         },
+         {
+          "kind": "ptr",
+          "path": "flip.lut.output.pRamps",
+          "off": 376,
+          "size": 8,
+          "dir": "in",
+          "len": {
+           "rule": "const",
+           "type": "struct NvKmsLutRamps",
+           "bytes": 6144
+          },
+          "present": {
+           "rule": "nonzero"
+          },
+          "elem": {
+           "type": "struct NvKmsLutRamps",
+           "size": 6144,
+           "fields": []
+          },
+          "note": "copied in by CopyInLutParams whenever non-zero"
+         },
+         {
+          "kind": "array",
+          "path": "flip.layer",
+          "off": 472,
+          "count": 8,
+          "stride": 536,
+          "valid": {
+           "rule": "all"
+          },
+          "fields": [
+           {
+            "kind": "fd_in",
+            "path": "syncObjects.val.u.syncpts.pre.u.fd",
+            "off": 68,
+            "size": 4,
+            "cond": [
+             {
+              "path": "syncObjects.specified",
+              "off": 96,
+              "size": 1,
+              "op": "nonzero"
+             },
+             {
+              "path": "syncObjects.val.useSyncpt",
+              "off": 60,
+              "size": 1,
+              "op": "nonzero"
+             },
+             {
+              "path": "syncObjects.val.u.syncpts.pre.type",
+              "off": 64,
+              "size": 4,
+              "op": "eq",
+              "value": 2,
+              "value_name": "NVKMS_SYNCPT_TYPE_FD"
+             }
+            ],
+            "fd_kinds": [
+             "sync_file"
+            ],
+            "note": "Tegra syncpoints only; dGPU rejects useSyncpt"
+           },
+           {
+            "kind": "field",
+            "path": "syncObjects.specified",
+            "off": 96,
+            "size": 1,
+            "role": "cond"
+           },
+           {
+            "kind": "field",
+            "path": "syncObjects.val.useSyncpt",
+            "off": 60,
+            "size": 1,
+            "role": "policy",
+            "note": "non-zero is a Tegra-only path; a dGPU host fails the flip"
+           },
+           {
+            "kind": "field",
+            "path": "syncObjects.val.u.syncpts.requestedPostType",
+            "off": 76,
+            "size": 4,
+            "role": "cond"
+           }
+          ]
+         }
+        ]
+       }
+      ],
+      "note": "SetModePrepUser copies the LUT ramps of all disps and heads, whatever the requested bitmasks say"
+     },
+     {
+      "kind": "field",
+      "path": "reply.status",
+      "off": 155992,
+      "size": 4,
+      "role": "status"
+     },
+     {
+      "kind": "array",
+      "path": "reply.disp",
+      "off": 156000,
+      "count": 8,
+      "stride": 1992,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "array",
+        "path": "head",
+        "off": 8,
+        "count": 4,
+        "stride": 496,
+        "valid": {
+         "rule": "all"
+        },
+        "fields": [
+         {
+          "kind": "array",
+          "path": "flipReply.layer",
+          "off": 396,
+          "count": 8,
+          "stride": 12,
+          "valid": {
+           "rule": "all"
+          },
+          "fields": [
+           {
+            "kind": "fd_out",
+            "path": "postSyncpt.u.fd",
+            "off": 4,
+            "size": 4,
+            "cond": [
+             {
+              "path": "postSyncpt.type",
+              "off": 0,
+              "size": 4,
+              "op": "eq",
+              "value": 2,
+              "value_name": "NVKMS_SYNCPT_TYPE_FD"
+             }
+            ],
+            "note": "Tegra only; produced when requestedPostType was FD"
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 10,
+    "name": "SET_CURSOR_IMAGE",
+    "dispatch": true,
+    "func": "SetCursorImage",
+    "params": "struct NvKmsSetCursorImageParams",
+    "custom_user": false,
+    "size": 52,
+    "request": {
+     "offset": 0,
+     "size": 48
+    },
+    "reply": {
+     "offset": 48,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.head",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.common.surfaceHandle",
+      "off": 12,
+      "size": 8,
+      "role": "target"
+     }
+    ]
+   },
+   {
+    "nr": 11,
+    "name": "MOVE_CURSOR",
+    "dispatch": true,
+    "func": "MoveCursor",
+    "params": "struct NvKmsMoveCursorParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.head",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     }
+    ]
+   },
+   {
+    "nr": 12,
+    "name": "SET_LUT",
+    "dispatch": true,
+    "func": "SetLut",
+    "params": "struct NvKmsSetLutParams",
+    "custom_user": true,
+    "size": 72,
+    "request": {
+     "offset": 0,
+     "size": 64
+    },
+    "reply": {
+     "offset": 64,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.head",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.common.input.pRamps",
+      "off": 32,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "const",
+       "type": "struct NvKmsLutRamps",
+       "bytes": 6144
+      },
+      "present": {
+       "rule": "nonzero"
+      },
+      "elem": {
+       "type": "struct NvKmsLutRamps",
+       "size": 6144,
+       "fields": []
+      },
+      "note": "copied in by CopyInLutParams whenever non-zero"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.common.output.pRamps",
+      "off": 48,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "const",
+       "type": "struct NvKmsLutRamps",
+       "bytes": 6144
+      },
+      "present": {
+       "rule": "nonzero"
+      },
+      "elem": {
+       "type": "struct NvKmsLutRamps",
+       "size": 6144,
+       "fields": []
+      },
+      "note": "copied in by CopyInLutParams whenever non-zero"
+     }
+    ]
+   },
+   {
+    "nr": 13,
+    "name": "CHECK_LUT_NOTIFIER",
+    "dispatch": true,
+    "func": "CheckLutNotifier",
+    "params": "struct NvKmsCheckLutNotifierParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 1
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.waitForCompletion",
+      "off": 12,
+      "size": 1,
+      "role": "policy",
+      "note": "TRUE blocks in the kernel"
+     }
+    ]
+   },
+   {
+    "nr": 14,
+    "name": "IDLE_BASE_CHANNEL",
+    "dispatch": true,
+    "func": "IdleBaseChannel",
+    "params": "struct NvKmsIdleBaseChannelParams",
+    "custom_user": false,
+    "size": 36,
+    "request": {
+     "offset": 0,
+     "size": 20
+    },
+    "reply": {
+     "offset": 20,
+     "size": 16
+    },
+    "fields": []
+   },
+   {
+    "nr": 15,
+    "name": "FLIP",
+    "dispatch": true,
+    "func": "Flip",
+    "params": "struct NvKmsFlipParams",
+    "custom_user": true,
+    "size": 3104,
+    "request": {
+     "offset": 0,
+     "size": 24
+    },
+    "reply": {
+     "offset": 24,
+     "size": 3080
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.pFlipHead",
+      "off": 8,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "count",
+       "count": {
+        "path": "request.numFlipHeads",
+        "off": 16,
+        "size": 4
+       },
+       "type": "struct NvKmsFlipRequestOneHead",
+       "elem_size": 4488,
+       "min": 1,
+       "max": 32,
+       "max_name": "NV_MAX_FLIP_REQUEST_HEADS"
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsFlipRequestOneHead",
+       "size": 4488,
+       "fields": [
+        {
+         "kind": "field",
+         "path": "sd",
+         "off": 0,
+         "size": 4,
+         "role": "target"
+        },
+        {
+         "kind": "field",
+         "path": "head",
+         "off": 4,
+         "size": 4,
+         "role": "target"
+        },
+        {
+         "kind": "ptr",
+         "path": "flip.lut.input.pRamps",
+         "off": 88,
+         "size": 8,
+         "dir": "in",
+         "len": {
+          "rule": "const",
+          "type": "struct NvKmsLutRamps",
+          "bytes": 6144
+         },
+         "present": {
+          "rule": "nonzero"
+         },
+         "elem": {
+          "type": "struct NvKmsLutRamps",
+          "size": 6144,
+          "fields": []
+         },
+         "note": "copied in by CopyInLutParams whenever non-zero"
+        },
+        {
+         "kind": "ptr",
+         "path": "flip.lut.output.pRamps",
+         "off": 104,
+         "size": 8,
+         "dir": "in",
+         "len": {
+          "rule": "const",
+          "type": "struct NvKmsLutRamps",
+          "bytes": 6144
+         },
+         "present": {
+          "rule": "nonzero"
+         },
+         "elem": {
+          "type": "struct NvKmsLutRamps",
+          "size": 6144,
+          "fields": []
+         },
+         "note": "copied in by CopyInLutParams whenever non-zero"
+        },
+        {
+         "kind": "array",
+         "path": "flip.layer",
+         "off": 200,
+         "count": 8,
+         "stride": 536,
+         "valid": {
+          "rule": "all"
+         },
+         "fields": [
+          {
+           "kind": "fd_in",
+           "path": "syncObjects.val.u.syncpts.pre.u.fd",
+           "off": 68,
+           "size": 4,
+           "cond": [
+            {
+             "path": "syncObjects.specified",
+             "off": 96,
+             "size": 1,
+             "op": "nonzero"
+            },
+            {
+             "path": "syncObjects.val.useSyncpt",
+             "off": 60,
+             "size": 1,
+             "op": "nonzero"
+            },
+            {
+             "path": "syncObjects.val.u.syncpts.pre.type",
+             "off": 64,
+             "size": 4,
+             "op": "eq",
+             "value": 2,
+             "value_name": "NVKMS_SYNCPT_TYPE_FD"
+            }
+           ],
+           "fd_kinds": [
+            "sync_file"
+           ],
+           "note": "Tegra syncpoints only; dGPU rejects useSyncpt"
+          },
+          {
+           "kind": "field",
+           "path": "syncObjects.specified",
+           "off": 96,
+           "size": 1,
+           "role": "cond"
+          },
+          {
+           "kind": "field",
+           "path": "syncObjects.val.useSyncpt",
+           "off": 60,
+           "size": 1,
+           "role": "policy",
+           "note": "non-zero is a Tegra-only path; a dGPU host fails the flip"
+          },
+          {
+           "kind": "field",
+           "path": "syncObjects.val.u.syncpts.requestedPostType",
+           "off": 76,
+           "size": 4,
+           "role": "cond"
+          }
+         ]
+        }
+       ]
+      },
+      "note": "FlipPrepUser refuses numFlipHeads outside [1, max]"
+     },
+     {
+      "kind": "field",
+      "path": "request.numFlipHeads",
+      "off": 16,
+      "size": 4,
+      "role": "count"
+     },
+     {
+      "kind": "field",
+      "path": "request.commit",
+      "off": 20,
+      "size": 1,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "reply.flipResult",
+      "off": 28,
+      "size": 4,
+      "role": "status"
+     },
+     {
+      "kind": "array",
+      "path": "reply.flipHead",
+      "off": 32,
+      "count": 32,
+      "stride": 96,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "array",
+        "path": "layer",
+        "off": 0,
+        "count": 8,
+        "stride": 12,
+        "valid": {
+         "rule": "all"
+        },
+        "fields": [
+         {
+          "kind": "fd_out",
+          "path": "postSyncpt.u.fd",
+          "off": 4,
+          "size": 4,
+          "cond": [
+           {
+            "path": "postSyncpt.type",
+            "off": 0,
+            "size": 4,
+            "op": "eq",
+            "value": 2,
+            "value_name": "NVKMS_SYNCPT_TYPE_FD"
+           }
+          ],
+          "note": "Tegra only; produced when requestedPostType was FD"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 16,
+    "name": "DECLARE_DYNAMIC_DPY_INTEREST",
+    "dispatch": true,
+    "func": "DeclareDynamicDpyInterest",
+    "params": "struct NvKmsDeclareDynamicDpyInterestParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 17,
+    "name": "REGISTER_SURFACE",
+    "dispatch": true,
+    "func": "RegisterSurface",
+    "params": "struct NvKmsRegisterSurfaceParams",
+    "custom_user": false,
+    "size": 152,
+    "request": {
+     "offset": 0,
+     "size": 144
+    },
+    "reply": {
+     "offset": 144,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.useFd",
+      "off": 4,
+      "size": 1,
+      "role": "cond",
+      "note": "NvBool: only the low byte counts"
+     },
+     {
+      "kind": "field",
+      "path": "request.rmClient",
+      "off": 8,
+      "size": 4,
+      "role": "policy",
+      "note": "honoured only when !useFd, which user clients may not use"
+     },
+     {
+      "kind": "field",
+      "path": "request.format",
+      "off": 124,
+      "size": 4,
+      "role": "count"
+     },
+     {
+      "kind": "array",
+      "path": "request.planes",
+      "off": 16,
+      "count": 3,
+      "stride": 32,
+      "valid": {
+       "rule": "format_num_planes",
+       "format": {
+        "path": "request.format",
+        "off": 124,
+        "size": 4
+       },
+       "when": [
+        {
+         "path": "request.useFd",
+         "off": 4,
+         "size": 1,
+         "op": "nonzero"
+        }
+       ]
+      },
+      "fields": [
+       {
+        "kind": "fd_in",
+        "path": "u.fd",
+        "off": 0,
+        "size": 4,
+        "cond": [],
+        "fd_kinds": [
+         "nvidiactl_exported",
+         "dmabuf"
+        ]
+       }
+      ],
+      "note": "planes [0, numPlanes(format)) are read, as fds when useFd"
+     },
+     {
+      "kind": "field",
+      "path": "reply.surfaceHandle",
+      "off": 144,
+      "size": 4,
+      "role": "info"
+     }
+    ]
+   },
+   {
+    "nr": 18,
+    "name": "UNREGISTER_SURFACE",
+    "dispatch": true,
+    "func": "UnregisterSurface",
+    "params": "struct NvKmsUnregisterSurfaceParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.skipSync",
+      "off": 8,
+      "size": 1,
+      "role": "policy",
+      "note": "user clients must pass 0"
+     }
+    ]
+   },
+   {
+    "nr": 19,
+    "name": "GRANT_SURFACE",
+    "dispatch": true,
+    "func": "GrantSurface",
+    "params": "struct NvKmsGrantSurfaceParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 8,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_fresh"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 20,
+    "name": "ACQUIRE_SURFACE",
+    "dispatch": true,
+    "func": "AcquireSurface",
+    "params": "struct NvKmsAcquireSurfaceParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 8
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_grant_surface"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 21,
+    "name": "RELEASE_SURFACE",
+    "dispatch": true,
+    "func": "ReleaseSurface",
+    "params": "struct NvKmsReleaseSurfaceParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 22,
+    "name": "SET_DPY_ATTRIBUTE",
+    "dispatch": true,
+    "func": "SetDpyAttribute",
+    "params": "struct NvKmsSetDpyAttributeParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 24
+    },
+    "reply": {
+     "offset": 24,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dpyId",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.attribute",
+      "off": 12,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.value",
+      "off": 16,
+      "size": 8,
+      "role": "policy"
+     }
+    ]
+   },
+   {
+    "nr": 23,
+    "name": "GET_DPY_ATTRIBUTE",
+    "dispatch": true,
+    "func": "GetDpyAttribute",
+    "params": "struct NvKmsGetDpyAttributeParams",
+    "custom_user": false,
+    "size": 24,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 8
+    },
+    "fields": []
+   },
+   {
+    "nr": 24,
+    "name": "GET_DPY_ATTRIBUTE_VALID_VALUES",
+    "dispatch": true,
+    "func": "GetDpyAttributeValidValues",
+    "params": "struct NvKmsGetDpyAttributeValidValuesParams",
+    "custom_user": false,
+    "size": 40,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 24
+    },
+    "fields": []
+   },
+   {
+    "nr": 25,
+    "name": "SET_DISP_ATTRIBUTE",
+    "dispatch": true,
+    "func": "SetDispAttribute",
+    "params": "struct NvKmsSetDispAttributeParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 24
+    },
+    "reply": {
+     "offset": 24,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.dispHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.attribute",
+      "off": 8,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.value",
+      "off": 16,
+      "size": 8,
+      "role": "policy"
+     }
+    ]
+   },
+   {
+    "nr": 26,
+    "name": "GET_DISP_ATTRIBUTE",
+    "dispatch": true,
+    "func": "GetDispAttribute",
+    "params": "struct NvKmsGetDispAttributeParams",
+    "custom_user": false,
+    "size": 24,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 16,
+     "size": 8
+    },
+    "fields": []
+   },
+   {
+    "nr": 27,
+    "name": "GET_DISP_ATTRIBUTE_VALID_VALUES",
+    "dispatch": true,
+    "func": "GetDispAttributeValidValues",
+    "params": "struct NvKmsGetDispAttributeValidValuesParams",
+    "custom_user": false,
+    "size": 40,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 16,
+     "size": 24
+    },
+    "fields": []
+   },
+   {
+    "nr": 28,
+    "name": "QUERY_FRAMELOCK",
+    "dispatch": true,
+    "func": "QueryFrameLock",
+    "params": "struct NvKmsQueryFrameLockParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 16
+    },
+    "fields": []
+   },
+   {
+    "nr": 29,
+    "name": "SET_FRAMELOCK_ATTRIBUTE",
+    "dispatch": true,
+    "func": "SetFrameLockAttribute",
+    "params": "struct NvKmsSetFrameLockAttributeParams",
+    "custom_user": false,
+    "size": 24,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.frameLockHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.attribute",
+      "off": 4,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.value",
+      "off": 8,
+      "size": 8,
+      "role": "policy"
+     }
+    ]
+   },
+   {
+    "nr": 30,
+    "name": "GET_FRAMELOCK_ATTRIBUTE",
+    "dispatch": true,
+    "func": "GetFrameLockAttribute",
+    "params": "struct NvKmsGetFrameLockAttributeParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 8
+    },
+    "fields": []
+   },
+   {
+    "nr": 31,
+    "name": "GET_FRAMELOCK_ATTRIBUTE_VALID_VALUES",
+    "dispatch": true,
+    "func": "GetFrameLockAttributeValidValues",
+    "params": "struct NvKmsGetFrameLockAttributeValidValuesParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 24
+    },
+    "fields": []
+   },
+   {
+    "nr": 32,
+    "name": "GET_NEXT_EVENT",
+    "dispatch": true,
+    "func": "GetNextEvent",
+    "params": "struct NvKmsGetNextEventParams",
+    "custom_user": false,
+    "size": 48,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 8,
+     "size": 40
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "reply.valid",
+      "off": 8,
+      "size": 1,
+      "role": "status"
+     },
+     {
+      "kind": "field",
+      "path": "reply.event",
+      "off": 16,
+      "size": 32,
+      "role": "info"
+     }
+    ]
+   },
+   {
+    "nr": 33,
+    "name": "DECLARE_EVENT_INTEREST",
+    "dispatch": true,
+    "func": "DeclareEventInterest",
+    "params": "struct NvKmsDeclareEventInterestParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.interestMask",
+      "off": 0,
+      "size": 4,
+      "role": "policy",
+      "note": "bit (1 << NVKMS_EVENT_TYPE_*)"
+     }
+    ]
+   },
+   {
+    "nr": 34,
+    "name": "CLEAR_UNICAST_EVENT",
+    "dispatch": true,
+    "func": "ClearUnicastEvent",
+    "params": "struct NvKmsClearUnicastEventParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.unicastEventFd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_unicast"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 35,
+    "name": "GET_3DVISION_DONGLE_PARAM_BYTES",
+    "dispatch": false,
+    "note": "no dispatch entry: the kernel refuses it"
+   },
+   {
+    "nr": 36,
+    "name": "SET_3DVISION_AEGIS_PARAMS",
+    "dispatch": false,
+    "note": "no dispatch entry: the kernel refuses it"
+   },
+   {
+    "nr": 37,
+    "name": "SET_LAYER_POSITION",
+    "dispatch": true,
+    "func": "SetLayerPosition",
+    "params": "struct NvKmsSetLayerPositionParams",
+    "custom_user": false,
+    "size": 1196,
+    "request": {
+     "offset": 0,
+     "size": 1192
+    },
+    "reply": {
+     "offset": 1192,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.requestedDispsBitMask",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "array",
+      "path": "request.disp",
+      "off": 8,
+      "count": 8,
+      "stride": 148,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "requestedHeadsBitMask",
+        "off": 0,
+        "size": 4,
+        "role": "target"
+       },
+       {
+        "kind": "array",
+        "path": "head",
+        "off": 4,
+        "count": 4,
+        "stride": 36,
+        "valid": {
+         "rule": "all"
+        },
+        "fields": [
+         {
+          "kind": "field",
+          "path": "requestedLayerBitMask",
+          "off": 32,
+          "size": 4,
+          "role": "target"
+         },
+         {
+          "kind": "field",
+          "path": "layerPosition",
+          "off": 0,
+          "size": 32,
+          "role": "policy"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 38,
+    "name": "GRAB_OWNERSHIP",
+    "dispatch": true,
+    "func": "GrabOwnership",
+    "params": "struct NvKmsGrabOwnershipParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     }
+    ]
+   },
+   {
+    "nr": 39,
+    "name": "RELEASE_OWNERSHIP",
+    "dispatch": true,
+    "func": "ReleaseOwnership",
+    "params": "struct NvKmsReleaseOwnershipParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     }
+    ]
+   },
+   {
+    "nr": 40,
+    "name": "GRANT_PERMISSIONS",
+    "dispatch": true,
+    "func": "GrantPermissions",
+    "params": "struct NvKmsGrantPermissionsParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 28
+    },
+    "reply": {
+     "offset": 28,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_fresh"
+      ]
+     },
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.permissions.type",
+      "off": 8,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "array",
+      "path": "request.permissions.flip.head",
+      "off": 12,
+      "count": 4,
+      "stride": 1,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "layerMask",
+        "off": 0,
+        "size": 1,
+        "role": "policy"
+       }
+      ]
+     },
+     {
+      "kind": "array",
+      "path": "request.permissions.modeset.head",
+      "off": 12,
+      "count": 4,
+      "stride": 4,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "dpyIdList",
+        "off": 0,
+        "size": 4,
+        "role": "policy"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 41,
+    "name": "ACQUIRE_PERMISSIONS",
+    "dispatch": true,
+    "func": "AcquirePermissions",
+    "params": "struct NvKmsAcquirePermissionsParams",
+    "custom_user": false,
+    "size": 28,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 24
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_grant_permissions"
+      ]
+     },
+     {
+      "kind": "field",
+      "path": "reply.deviceHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "reply.permissions.type",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "array",
+      "path": "reply.permissions.flip.head",
+      "off": 12,
+      "count": 4,
+      "stride": 1,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "layerMask",
+        "off": 0,
+        "size": 1,
+        "role": "target"
+       }
+      ]
+     },
+     {
+      "kind": "array",
+      "path": "reply.permissions.modeset.head",
+      "off": 12,
+      "count": 4,
+      "stride": 4,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "dpyIdList",
+        "off": 0,
+        "size": 4,
+        "role": "target"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 42,
+    "name": "REVOKE_PERMISSIONS",
+    "dispatch": true,
+    "func": "RevokePermissions",
+    "params": "struct NvKmsRevokePermissionsParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 28
+    },
+    "reply": {
+     "offset": 28,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.deviceHandle",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "request.permissionsTypeBitmask",
+      "off": 4,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "field",
+      "path": "request.permissions.type",
+      "off": 8,
+      "size": 4,
+      "role": "policy"
+     },
+     {
+      "kind": "array",
+      "path": "request.permissions.flip.head",
+      "off": 12,
+      "count": 4,
+      "stride": 1,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "layerMask",
+        "off": 0,
+        "size": 1,
+        "role": "policy"
+       }
+      ]
+     },
+     {
+      "kind": "array",
+      "path": "request.permissions.modeset.head",
+      "off": 12,
+      "count": 4,
+      "stride": 4,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "dpyIdList",
+        "off": 0,
+        "size": 4,
+        "role": "policy"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 43,
+    "name": "QUERY_DPY_CRC32",
+    "dispatch": true,
+    "func": "QueryDpyCRC32",
+    "params": "struct NvKmsQueryDpyCRC32Params",
+    "custom_user": false,
+    "size": 36,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 24
+    },
+    "fields": []
+   },
+   {
+    "nr": 44,
+    "name": "REGISTER_DEFERRED_REQUEST_FIFO",
+    "dispatch": true,
+    "func": "RegisterDeferredRequestFifo",
+    "params": "struct NvKmsRegisterDeferredRequestFifoParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.surfaceHandle",
+      "off": 4,
+      "size": 4,
+      "role": "target",
+      "note": "NVKMS CPU-maps this surface"
+     }
+    ]
+   },
+   {
+    "nr": 45,
+    "name": "UNREGISTER_DEFERRED_REQUEST_FIFO",
+    "dispatch": true,
+    "func": "UnregisterDeferredRequestFifo",
+    "params": "struct NvKmsUnregisterDeferredRequestFifoParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 46,
+    "name": "ALLOC_SWAP_GROUP",
+    "dispatch": true,
+    "func": "AllocSwapGroup",
+    "params": "struct NvKmsAllocSwapGroupParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 47,
+    "name": "FREE_SWAP_GROUP",
+    "dispatch": true,
+    "func": "FreeSwapGroup",
+    "params": "struct NvKmsFreeSwapGroupParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 48,
+    "name": "JOIN_SWAP_GROUP",
+    "dispatch": true,
+    "func": "JoinSwapGroup",
+    "params": "struct NvKmsJoinSwapGroupParams",
+    "custom_user": false,
+    "size": 2568,
+    "request": {
+     "offset": 0,
+     "size": 2564
+    },
+    "reply": {
+     "offset": 2564,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.numMembers",
+      "off": 0,
+      "size": 4,
+      "role": "count"
+     },
+     {
+      "kind": "array",
+      "path": "request.member",
+      "off": 4,
+      "count": 128,
+      "stride": 20,
+      "valid": {
+       "rule": "count",
+       "count": {
+        "path": "request.numMembers",
+        "off": 0,
+        "size": 4
+       },
+       "max": 128,
+       "max_name": "NVKMS_MAX_SWAPGROUPS"
+      },
+      "fields": [
+       {
+        "kind": "fd_in",
+        "path": "unicastEvent.fd",
+        "off": 12,
+        "size": 4,
+        "cond": [
+         {
+          "path": "unicastEvent.specified",
+          "off": 16,
+          "size": 1,
+          "op": "nonzero"
+         }
+        ],
+        "fd_kinds": [
+         "modeset_fresh",
+         "modeset_unicast"
+        ]
+       },
+       {
+        "kind": "field",
+        "path": "unicastEvent.specified",
+        "off": 16,
+        "size": 1,
+        "role": "cond"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 49,
+    "name": "LEAVE_SWAP_GROUP",
+    "dispatch": true,
+    "func": "LeaveSwapGroup",
+    "params": "struct NvKmsLeaveSwapGroupParams",
+    "custom_user": false,
+    "size": 1032,
+    "request": {
+     "offset": 0,
+     "size": 1028
+    },
+    "reply": {
+     "offset": 1028,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 50,
+    "name": "SET_SWAP_GROUP_CLIP_LIST",
+    "dispatch": true,
+    "func": "SetSwapGroupClipList",
+    "params": "struct NvKmsSetSwapGroupClipListParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 24
+    },
+    "reply": {
+     "offset": 24,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.nClips",
+      "off": 8,
+      "size": 2,
+      "role": "count"
+     },
+     {
+      "kind": "ptr",
+      "path": "request.pClipList",
+      "off": 16,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "count",
+       "count": {
+        "path": "request.nClips",
+        "off": 8,
+        "size": 2
+       },
+       "type": "struct NvKmsRect",
+       "elem_size": 8,
+       "min": 0,
+       "max": null,
+       "max_name": null
+      },
+      "present": {
+       "rule": "count_nonzero",
+       "field": {
+        "path": "request.nClips",
+        "off": 8,
+        "size": 2
+       }
+      },
+      "elem": {
+       "type": "struct NvKmsRect",
+       "size": 8,
+       "fields": []
+      },
+      "note": "nClips == 0 means no list; the pointer must then be ignored"
+     }
+    ]
+   },
+   {
+    "nr": 51,
+    "name": "GRANT_SWAP_GROUP",
+    "dispatch": true,
+    "func": "GrantSwapGroup",
+    "params": "struct NvKmsGrantSwapGroupParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 8,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_fresh"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 52,
+    "name": "ACQUIRE_SWAP_GROUP",
+    "dispatch": true,
+    "func": "AcquireSwapGroup",
+    "params": "struct NvKmsAcquireSwapGroupParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 8
+    },
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "request.fd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_grant_swap_group"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 53,
+    "name": "RELEASE_SWAP_GROUP",
+    "dispatch": true,
+    "func": "ReleaseSwapGroup",
+    "params": "struct NvKmsReleaseSwapGroupParams",
+    "custom_user": false,
+    "size": 12,
+    "request": {
+     "offset": 0,
+     "size": 8
+    },
+    "reply": {
+     "offset": 8,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 54,
+    "name": "SWITCH_MUX",
+    "dispatch": true,
+    "func": "SwitchMux",
+    "params": "struct NvKmsSwitchMuxParams",
+    "custom_user": false,
+    "size": 24,
+    "request": {
+     "offset": 0,
+     "size": 20
+    },
+    "reply": {
+     "offset": 20,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 55,
+    "name": "GET_MUX_STATE",
+    "dispatch": true,
+    "func": "GetMuxState",
+    "params": "struct NvKmsGetMuxStateParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 56,
+    "name": "ENABLE_VBLANK_SYNC_OBJECT",
+    "dispatch": true,
+    "func": "EnableVblankSyncObject",
+    "params": "struct NvKmsEnableVblankSyncObjectParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 8
+    },
+    "fields": []
+   },
+   {
+    "nr": 57,
+    "name": "DISABLE_VBLANK_SYNC_OBJECT",
+    "dispatch": true,
+    "func": "DisableVblankSyncObject",
+    "params": "struct NvKmsDisableVblankSyncObjectParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 58,
+    "name": "NOTIFY_VBLANK",
+    "dispatch": true,
+    "func": "NotifyVblank",
+    "params": "struct NvKmsNotifyVblankParams",
+    "custom_user": false,
+    "size": 20,
+    "request": {
+     "offset": 0,
+     "size": 16
+    },
+    "reply": {
+     "offset": 16,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.head",
+      "off": 8,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "fd_in",
+      "path": "request.unicastEvent.fd",
+      "off": 12,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_fresh",
+       "modeset_unicast"
+      ]
+     }
+    ]
+   },
+   {
+    "nr": 59,
+    "name": "SET_FLIPLOCK_GROUP",
+    "dispatch": true,
+    "func": "SetFlipLockGroup",
+    "params": "struct NvKmsSetFlipLockGroupParams",
+    "custom_user": false,
+    "size": 72,
+    "request": {
+     "offset": 0,
+     "size": 68
+    },
+    "reply": {
+     "offset": 68,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 60,
+    "name": "ENABLE_VBLANK_SEM_CONTROL",
+    "dispatch": true,
+    "func": "EnableVblankSemControl",
+    "params": "struct NvKmsEnableVblankSemControlParams",
+    "custom_user": false,
+    "size": 32,
+    "request": {
+     "offset": 0,
+     "size": 24
+    },
+    "reply": {
+     "offset": 24,
+     "size": 4
+    },
+    "fields": [
+     {
+      "kind": "field",
+      "path": "request.surfaceHandle",
+      "off": 8,
+      "size": 4,
+      "role": "target",
+      "note": "NVKMS CPU-writes this surface every vblank"
+     },
+     {
+      "kind": "field",
+      "path": "request.surfaceOffset",
+      "off": 16,
+      "size": 8,
+      "role": "policy"
+     }
+    ]
+   },
+   {
+    "nr": 61,
+    "name": "DISABLE_VBLANK_SEM_CONTROL",
+    "dispatch": true,
+    "func": "DisableVblankSemControl",
+    "params": "struct NvKmsDisableVblankSemControlParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 62,
+    "name": "ACCEL_VBLANK_SEM_CONTROLS",
+    "dispatch": true,
+    "func": "AccelVblankSemControls",
+    "params": "struct NvKmsAccelVblankSemControlsParams",
+    "custom_user": false,
+    "size": 16,
+    "request": {
+     "offset": 0,
+     "size": 12
+    },
+    "reply": {
+     "offset": 12,
+     "size": 4
+    },
+    "fields": []
+   },
+   {
+    "nr": 63,
+    "name": "FRAMEBUFFER_CONSOLE_DISABLED",
+    "dispatch": true,
+    "func": "FramebufferConsoleDisabled",
+    "params": "struct NvKmsFramebufferConsoleDisabledParams",
+    "custom_user": false,
+    "size": 8,
+    "request": {
+     "offset": 0,
+     "size": 4
+    },
+    "reply": {
+     "offset": 4,
+     "size": 4
+    },
+    "fields": []
+   }
+  ]
+ },
+ "nvidia_drm": {
+  "header": "kernel-open/nvidia-drm/nv_drm_common_ioctl.h",
+  "command_base": 64,
+  "constants": {
+   "DRM_COMMAND_BASE": 64,
+   "NV_DRM_PERMISSIONS_TYPE_MODESET": 2,
+   "NV_DRM_PERMISSIONS_TYPE_SUB_OWNER": 3
+  },
+  "ioctls": [
+   {
+    "nr": 64,
+    "name": "GET_CRTC_CRC32",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775424,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_crtc_crc32_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "crtc_id",
+      "off": 0,
+      "size": 4,
+      "role": "target",
+      "note": "KMS object id; lease-filtered"
+     }
+    ],
+    "cmd_hex": "0xc0086440"
+   },
+   {
+    "nr": 65,
+    "name": "GEM_IMPORT_NVKMS_MEMORY",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3223348289,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_import_nvkms_memory_params",
+    "size": 32,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "mem_size",
+      "off": 0,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "ptr",
+      "path": "nvkms_params_ptr",
+      "off": 8,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "nvkms_params_size",
+        "off": 16,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivImportMemoryParams",
+       "bytes": 28
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivImportMemoryParams",
+       "size": 28,
+       "fields": [
+        {
+         "kind": "fd_in",
+         "path": "memFd",
+         "off": 0,
+         "size": 4,
+         "cond": [],
+         "fd_kinds": [
+          "nvidiactl_exported"
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "kind": "field",
+      "path": "nvkms_params_size",
+      "off": 16,
+      "size": 8,
+      "role": "count"
+     },
+     {
+      "kind": "gem_out",
+      "path": "handle",
+      "off": 24,
+      "size": 4,
+      "cond": []
+     }
+    ],
+    "cmd_hex": "0xc0206441"
+   },
+   {
+    "nr": 66,
+    "name": "GEM_IMPORT_USERSPACE_MEMORY",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222824002,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_import_userspace_memory_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "size",
+      "off": 0,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "user_va",
+      "path": "address",
+      "off": 8,
+      "size": 8,
+      "note": "pinned with pin_user_pages in the caller's mm"
+     },
+     {
+      "kind": "gem_out",
+      "path": "handle",
+      "off": 16,
+      "size": 4,
+      "cond": []
+     }
+    ],
+    "cmd_hex": "0xc0186442"
+   },
+   {
+    "nr": 67,
+    "name": "GET_DEV_INFO",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3223610435,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_dev_info_params",
+    "size": 36,
+    "fields": [],
+    "cmd_hex": "0xc0246443"
+   },
+   {
+    "nr": 68,
+    "name": "FENCE_SUPPORTED",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 25668,
+    "dir": "IO",
+    "struct": null,
+    "size": 0,
+    "fields": [],
+    "cmd_hex": "0x00006444"
+   },
+   {
+    "nr": 69,
+    "name": "PRIME_FENCE_CONTEXT_CREATE",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3224396869,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_prime_fence_context_create_params",
+    "size": 48,
+    "fields": [
+     {
+      "kind": "gem_out",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "index",
+      "off": 4,
+      "size": 4,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "size",
+      "off": 8,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "ptr",
+      "path": "import_mem_nvkms_params_ptr",
+      "off": 16,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "import_mem_nvkms_params_size",
+        "off": 24,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivImportMemoryParams",
+       "bytes": 28
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivImportMemoryParams",
+       "size": 28,
+       "fields": [
+        {
+         "kind": "fd_in",
+         "path": "memFd",
+         "off": 0,
+         "size": 4,
+         "cond": [],
+         "fd_kinds": [
+          "nvidiactl_exported"
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "kind": "field",
+      "path": "import_mem_nvkms_params_size",
+      "off": 24,
+      "size": 8,
+      "role": "count"
+     },
+     {
+      "kind": "ptr",
+      "path": "event_nvkms_params_ptr",
+      "off": 32,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "event_nvkms_params_size",
+        "off": 40,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivAllocateChannelEventParams",
+       "bytes": 16
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivAllocateChannelEventParams",
+       "size": 16,
+       "fields": []
+      },
+      "note": "RM client and channel handles (host-valid, no translation)"
+     },
+     {
+      "kind": "field",
+      "path": "event_nvkms_params_size",
+      "off": 40,
+      "size": 8,
+      "role": "count"
+     }
+    ],
+    "cmd_hex": "0xc0306445"
+   },
+   {
+    "nr": 70,
+    "name": "GEM_PRIME_FENCE_ATTACH",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 1074816070,
+    "dir": "IOW",
+    "struct": "struct drm_nvidia_gem_prime_fence_attach_params",
+    "size": 16,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "gem_in",
+      "path": "fence_context_handle",
+      "off": 4,
+      "size": 4,
+      "cond": [],
+      "note": "must live in the same drm_file as handle"
+     }
+    ],
+    "cmd_hex": "0x40106446"
+   },
+   {
+    "nr": 72,
+    "name": "GET_CLIENT_CAPABILITY",
+    "registered": true,
+    "flags": [],
+    "cmd": 3222299720,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_client_capability_params",
+    "size": 16,
+    "fields": [],
+    "cmd_hex": "0xc0106448"
+   },
+   {
+    "nr": 73,
+    "name": "GEM_EXPORT_NVKMS_MEMORY",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222824009,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_export_nvkms_memory_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "ptr",
+      "path": "nvkms_params_ptr",
+      "off": 8,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "nvkms_params_size",
+        "off": 16,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivExportMemoryParams",
+       "bytes": 4
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivExportMemoryParams",
+       "size": 4,
+       "fields": [
+        {
+         "kind": "fd_in",
+         "path": "memFd",
+         "off": 0,
+         "size": 4,
+         "cond": [],
+         "fd_kinds": [
+          "nvidiactl_export_target"
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "kind": "field",
+      "path": "nvkms_params_size",
+      "off": 16,
+      "size": 8,
+      "role": "count"
+     }
+    ],
+    "cmd_hex": "0xc0186449"
+   },
+   {
+    "nr": 74,
+    "name": "GEM_MAP_OFFSET",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222299722,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_map_offset_params",
+    "size": 16,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "offset",
+      "off": 8,
+      "size": 8,
+      "role": "info",
+      "note": "host fake mmap offset"
+     }
+    ],
+    "cmd_hex": "0xc010644a"
+   },
+   {
+    "nr": 75,
+    "name": "GEM_ALLOC_NVKMS_MEMORY",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222824011,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_alloc_nvkms_memory_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_out",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "memory_size",
+      "off": 8,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "field",
+      "path": "flags",
+      "off": 16,
+      "size": 4,
+      "role": "info"
+     }
+    ],
+    "cmd_hex": "0xc018644b"
+   },
+   {
+    "nr": 76,
+    "name": "GET_CRTC_CRC32_V2",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3223086156,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_crtc_crc32_v2_params",
+    "size": 28,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "crtc_id",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     }
+    ],
+    "cmd_hex": "0xc01c644c"
+   },
+   {
+    "nr": 77,
+    "name": "GEM_EXPORT_DMABUF_MEMORY",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222824013,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_export_dmabuf_memory_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "ptr",
+      "path": "nvkms_params_ptr",
+      "off": 8,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "nvkms_params_size",
+        "off": 16,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivExportMemoryParams",
+       "bytes": 4
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivExportMemoryParams",
+       "size": 4,
+       "fields": [
+        {
+         "kind": "fd_in",
+         "path": "memFd",
+         "off": 0,
+         "size": 4,
+         "cond": [],
+         "fd_kinds": [
+          "nvidiactl_export_target"
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "kind": "field",
+      "path": "nvkms_params_size",
+      "off": 16,
+      "size": 8,
+      "role": "count"
+     }
+    ],
+    "cmd_hex": "0xc018644d"
+   },
+   {
+    "nr": 78,
+    "name": "GEM_IDENTIFY_OBJECT",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775438,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_gem_identify_object_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "object_type",
+      "off": 4,
+      "size": 4,
+      "role": "info"
+     }
+    ],
+    "cmd_hex": "0xc008644e"
+   },
+   {
+    "nr": 79,
+    "name": "DMABUF_SUPPORTED",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 25679,
+    "dir": "IO",
+    "struct": null,
+    "size": 0,
+    "fields": [],
+    "cmd_hex": "0x0000644f"
+   },
+   {
+    "nr": 80,
+    "name": "GET_DPY_ID_FOR_CONNECTOR_ID",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775440,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_dpy_id_for_connector_id_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "connectorId",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "dpyId",
+      "off": 4,
+      "size": 4,
+      "role": "info"
+     }
+    ],
+    "cmd_hex": "0xc0086450"
+   },
+   {
+    "nr": 81,
+    "name": "GET_CONNECTOR_ID_FOR_DPY_ID",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775441,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_connector_id_for_dpy_id_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "dpyId",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "connectorId",
+      "off": 4,
+      "size": 4,
+      "role": "info"
+     }
+    ],
+    "cmd_hex": "0xc0086451"
+   },
+   {
+    "nr": 82,
+    "name": "GRANT_PERMISSIONS",
+    "registered": true,
+    "flags": [
+     "DRM_MASTER",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222037586,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_grant_permissions_params",
+    "size": 12,
+    "fields": [
+     {
+      "kind": "fd_in",
+      "path": "fd",
+      "off": 0,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "modeset_fresh"
+      ]
+     },
+     {
+      "kind": "field",
+      "path": "dpyId",
+      "off": 4,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "type",
+      "off": 8,
+      "size": 4,
+      "role": "policy",
+      "note": "NV_DRM_PERMISSIONS_TYPE_*: 2 MODESET, 3 SUB_OWNER"
+     }
+    ],
+    "cmd_hex": "0xc00c6452"
+   },
+   {
+    "nr": 83,
+    "name": "REVOKE_PERMISSIONS",
+    "registered": true,
+    "flags": [
+     "DRM_MASTER",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775443,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_revoke_permissions_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "dpyId",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "field",
+      "path": "type",
+      "off": 4,
+      "size": 4,
+      "role": "policy"
+     }
+    ],
+    "cmd_hex": "0xc0086453"
+   },
+   {
+    "nr": 84,
+    "name": "SEMSURF_FENCE_CTX_CREATE",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3223348308,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_semsurf_fence_ctx_create_params",
+    "size": 32,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "index",
+      "off": 0,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "ptr",
+      "path": "nvkms_params_ptr",
+      "off": 8,
+      "size": 8,
+      "dir": "in",
+      "len": {
+       "rule": "size_eq",
+       "size": {
+        "path": "nvkms_params_size",
+        "off": 16,
+        "size": 8
+       },
+       "type": "struct NvKmsKapiPrivImportSemaphoreSurfaceParams",
+       "bytes": 16
+      },
+      "present": {
+       "rule": "always"
+      },
+      "elem": {
+       "type": "struct NvKmsKapiPrivImportSemaphoreSurfaceParams",
+       "size": 16,
+       "fields": []
+      },
+      "note": "RM handles only"
+     },
+     {
+      "kind": "field",
+      "path": "nvkms_params_size",
+      "off": 16,
+      "size": 8,
+      "role": "count"
+     },
+     {
+      "kind": "gem_out",
+      "path": "handle",
+      "off": 24,
+      "size": 4,
+      "cond": []
+     }
+    ],
+    "cmd_hex": "0xc0206454"
+   },
+   {
+    "nr": 85,
+    "name": "SEMSURF_FENCE_CREATE",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3222824021,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_semsurf_fence_create_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "fence_context_handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "wait_value",
+      "off": 8,
+      "size": 8,
+      "role": "info"
+     },
+     {
+      "kind": "fd_out",
+      "path": "fd",
+      "off": 16,
+      "size": 4,
+      "cond": []
+     }
+    ],
+    "cmd_hex": "0xc0186455"
+   },
+   {
+    "nr": 86,
+    "name": "SEMSURF_FENCE_WAIT",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 1075340374,
+    "dir": "IOW",
+    "struct": "struct drm_nvidia_semsurf_fence_wait_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "fence_context_handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "fd_in",
+      "path": "fd",
+      "off": 4,
+      "size": 4,
+      "cond": [],
+      "fd_kinds": [
+       "sync_file"
+      ]
+     }
+    ],
+    "cmd_hex": "0x40186456"
+   },
+   {
+    "nr": 87,
+    "name": "SEMSURF_FENCE_ATTACH",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 1075340375,
+    "dir": "IOW",
+    "struct": "struct drm_nvidia_semsurf_fence_attach_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "gem_in",
+      "path": "handle",
+      "off": 0,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "gem_in",
+      "path": "fence_context_handle",
+      "off": 4,
+      "size": 4,
+      "cond": []
+     },
+     {
+      "kind": "field",
+      "path": "shared",
+      "off": 12,
+      "size": 4,
+      "role": "policy"
+     }
+    ],
+    "cmd_hex": "0x40186457"
+   },
+   {
+    "nr": 88,
+    "name": "GET_DRM_FILE_UNIQUE_ID",
+    "registered": true,
+    "flags": [
+     "DRM_RENDER_ALLOW",
+     "DRM_UNLOCKED"
+    ],
+    "cmd": 3221775448,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_drm_file_unique_id_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "id",
+      "off": 0,
+      "size": 8,
+      "role": "info"
+     }
+    ],
+    "cmd_hex": "0xc0086458"
+   },
+   {
+    "nr": 89,
+    "name": "REGISTER_ROI",
+    "registered": false,
+    "cmd": 3222824025,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_register_roi_params",
+    "size": 24,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "region_handle",
+      "off": 16,
+      "size": 8,
+      "role": "info",
+      "note": "ROI id, not a GEM handle"
+     }
+    ],
+    "cmd_hex": "0xc0186459"
+   },
+   {
+    "nr": 90,
+    "name": "UNREGISTER_ROI",
+    "registered": false,
+    "cmd": 1074291802,
+    "dir": "IOW",
+    "struct": "struct drm_nvidia_unregister_roi_params",
+    "size": 8,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "region_handle",
+      "off": 0,
+      "size": 8,
+      "role": "info",
+      "note": "ROI id, not a GEM handle"
+     }
+    ],
+    "cmd_hex": "0x4008645a"
+   },
+   {
+    "nr": 91,
+    "name": "GET_CRTC_ROI_CRCS",
+    "registered": false,
+    "cmd": 3425199195,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_read_crc_params",
+    "size": 3112,
+    "fields": [
+     {
+      "kind": "field",
+      "path": "crtc_id",
+      "off": 0,
+      "size": 4,
+      "role": "target"
+     },
+     {
+      "kind": "array",
+      "path": "roi_crcs",
+      "off": 8,
+      "count": 64,
+      "stride": 48,
+      "valid": {
+       "rule": "all"
+      },
+      "fields": [
+       {
+        "kind": "field",
+        "path": "region_handle",
+        "off": 0,
+        "size": 8,
+        "role": "info",
+        "note": "ROI id, not a GEM handle"
+       }
+      ]
+     }
+    ],
+    "cmd_hex": "0xcc28645b"
+   },
+   {
+    "nr": 92,
+    "name": "GET_ROI_CAPABILITIES",
+    "registered": false,
+    "cmd": 3223348316,
+    "dir": "IOWR",
+    "struct": "struct drm_nvidia_get_roi_capabilities_params",
+    "size": 32,
+    "fields": [],
+    "cmd_hex": "0xc020645c"
+   }
+  ]
+ }
+}
