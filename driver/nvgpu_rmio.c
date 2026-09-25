@@ -1701,8 +1701,13 @@ static bool nvgpu_osdesc_describe(struct nvgpu_osdesc_call *c,
   if (check_add_overflow(limit, 1ull, &c->size) ||
       check_add_overflow(c->va, c->size, &end))
     return false;
-  if (DIV_ROUND_UP((c->va & ~PAGE_MASK) + c->size, PAGE_SIZE) >
-      NVGPU_OSDESC_MAX_PAGES)
+  /*
+   * The pages the range spans, counted without rounding up past 2^64: with
+   * DIV_ROUND_UP, a size within a page of it came to none, and a range of
+   * 2^64 bytes was registered with a page list of one empty run.
+   */
+  if ((c->va & ~PAGE_MASK) + c->size >
+      (u64)NVGPU_OSDESC_MAX_PAGES * PAGE_SIZE)
     return false;
   return true;
 }
