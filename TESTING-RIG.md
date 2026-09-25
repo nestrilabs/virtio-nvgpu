@@ -27,6 +27,7 @@ Everything is built into `.rig/` (git-ignored), laid out as
 | `.rig/bin/nesbox` | the VMM (release) |
 | `.rig/bin/virtiofsd` | only with `NVGPU_NVIDIA_SHARE` |
 | `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it |
+| `.rig/kernel-rust/vmlinux`, `.rig/kernel-rust/nvgpu.ko` | the same kernel with `CONFIG_RUST=y`, and the module with its parsers in Rust (`NVGPU_RUST=1`), built by `scripts/rig-build-kernel-rust.sh`; to run one, see [`driver/rust/README.md`](driver/rust/README.md) |
 | `.rig/guest/rootfs.ext4` | the golden image: NVIDIA 595.99.02 userspace at `/run/opengl-driver`, probes at `/opt/nvgpu/<name>.sh`, the module at `/opt/nvgpu/nvgpu.ko` |
 | `.rig/logs/` | one `<tag>.{backend.log,console.log,json}` per run |
 

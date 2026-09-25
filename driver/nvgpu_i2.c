@@ -39,7 +39,6 @@
 
 #include "nvgpu.h"
 
-#define NVGPU_SCHEMA_TABLES
 #include "gen/nvgpu_schema.h"
 
 /*
@@ -107,48 +106,7 @@ static const u8 nvgpu_i2_zero[8];
 
 /* The tables to use before HELLO has picked the host's (DRM only). */
 static const struct nvgpu_schema_set *nvgpu_i2_set(struct nvgpu_device *dev) {
-  return dev->schema ? dev->schema : &nvgpu_schema_sets[0];
-}
-
-/*
- * A host release as NVGPU_SCHEMA_VERSION, or 0 if it does not parse. NVIDIA
- * numbers some releases in two parts (550.67, 595.80): those are .0, as the
- * backend reads them too (abi::version::DriverVersion::parse), so both halves
- * pick the same tables.
- */
-static u32 nvgpu_host_version(const char *driver_version) {
-  unsigned int a, b, c = 0;
-
-  if (!driver_version || sscanf(driver_version, "%u.%u.%u", &a, &b, &c) < 2)
-    return 0;
-  return NVGPU_SCHEMA_VERSION(a, b, c);
-}
-
-const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version) {
-  u32 v = nvgpu_host_version(driver_version), i;
-
-  /* The DRM tables are the same for every host; only NVKMS's layouts move
-   * between releases (REGISTER_SURFACE is command 16 in one and 17 in the
-   * next, R:nvdirect §0.6a), so an unparsable version gets no NVKMS table,
-   * never a guessed one. */
-  if (!v)
-    return &nvgpu_schema_sets[0];
-  for (i = 1; i < ARRAY_SIZE(nvgpu_schema_sets); i++) {
-    const struct nvgpu_stable *t = nvgpu_schema_sets[i].modeset;
-
-    if (t->vmin <= v && v <= t->vmax)
-      return &nvgpu_schema_sets[i];
-  }
-  return &nvgpu_schema_sets[0];
-}
-
-const struct nvgpu_uvm_table *nvgpu_uvm_select(const char *driver_version) {
-  u32 v = nvgpu_host_version(driver_version), i;
-
-  for (i = 0; v && i < ARRAY_SIZE(nvgpu_uvm_tables); i++)
-    if (nvgpu_uvm_tables[i].vmin <= v && v <= nvgpu_uvm_tables[i].vmax)
-      return &nvgpu_uvm_tables[i];
-  return NULL;
+  return dev->schema ? dev->schema : nvgpu_schema_default();
 }
 
 /*
@@ -238,13 +196,24 @@ static void nvgpu_i2_wr(struct nvgpu_i2_state *st, u32 b, u32 off, u32 width,
                         u64 v) {
   struct nvgpu_i2_kbuf *kb = &st->buf[b];
 
-  /* Only ever at positions the walk reached, which it bounds-checked. */
+  /* Only ever at positions the walk reached, which it bounds-checked, and
+   * exactly `width` bytes of them (this wrote 4 for any width but 8). */
   if (width > kb->len || off > kb->len - width)
     return;
-  if (width == 8)
-    put_unaligned_le64(v, kb->k + off);
-  else
+  switch (width) {
+  case 1:
+    kb->k[off] = (u8)v;
+    break;
+  case 2:
+    put_unaligned_le16((u16)v, kb->k + off);
+    break;
+  case 4:
     put_unaligned_le32((u32)v, kb->k + off);
+    break;
+  case 8:
+    put_unaligned_le64(v, kb->k + off);
+    break;
+  }
 }
 
 static s64 nvgpu_i2_sext(u64 v, u32 width) {
@@ -465,6 +434,16 @@ static int nvgpu_i2_walk(struct nvgpu_device *dev, struct nvgpu_i2_state *st,
       break;
     }
     default:
+      /*
+       * A descriptor is 4 or 8 bytes and a GEM handle 4, which the
+       * generator checks (gen/schema_gen.py); a table that disagreed would
+       * have its caller's values put back at another width.
+       */
+      if (((f->kind == NVGPU_SF_FD_IN || f->kind == NVGPU_SF_FD_OUT) &&
+           f->width != 4 && f->width != 8) ||
+          ((f->kind == NVGPU_SF_GEM_IN || f->kind == NVGPU_SF_GEM_OUT) &&
+           f->width != 4))
+        return -EINVAL;
       ret = nvgpu_i2_rd(st, b, at, f->width, &v);
       if (!ret)
         ret = nvgpu_i2_add_slot(st, f, b, at, v);
@@ -689,8 +668,14 @@ static void nvgpu_i2_drop_outs(struct nvgpu_i2_call *call, u32 fd_from,
 
   for (i = fd_from; i < st->nfdo; i++)
     nvgpu_close_handle_async(call->dev, st->fdo[i].handle);
+  /*
+   * A handle an earlier record named is closed already, or is owned now by
+   * the proxy made for it (below gem_from): never closed here. Counting only
+   * from gem_from, a reply naming one handle before and after a gem_out hook
+   * that failed closed the host handle the first proxy stands for.
+   */
   for (i = gem_from; i < st->ngemo; i++) {
-    for (j = gem_from; j < i; j++)
+    for (j = 0; j < i; j++)
       if (st->gemo[j].handle == st->gemo[i].handle)
         break;
     if (j == i)

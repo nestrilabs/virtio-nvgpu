@@ -168,6 +168,7 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
 #define NVGPU_TCI_SRC_PLATFORM_API 3
 #define NVGPU_TCI_PROC_CPU 0
 #define NVGPU_NV_ERR_NOT_SUPPORTED 0x00000056u
+#define NVGPU_NV_ERR_INVALID_ARGUMENT 0x0000001fu
 
 static inline bool nvgpu_intercept_time_correlation_tsc(void __user *uarg,
                                                         void __user *user_nested,

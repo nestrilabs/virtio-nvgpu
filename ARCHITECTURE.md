@@ -129,6 +129,18 @@ carried alongside as a nested block, which the backend holds to tables of its
 own (§8). Every decision about what those bytes *mean* is made on the other
 side.
 
+What the driver does read of a guest process's bytes -- the IOCTL2 walk,
+RM's nested blocks and deep segments, the descriptors in them, the ranges
+registered by their pages -- is where a memory-safety bug is a guest kernel
+compromise, and one guest app's way into another's. So those parsers have a
+Rust implementation (`driver/rust/`, built with `NVGPU_RUST=1` into a kernel
+with `CONFIG_RUST`): a `no_std` core without `unsafe` or a panic path,
+which copies each byte of the caller's once and decides on that copy, around
+which one small file holds the `unsafe` FFI to the C that stays (transport,
+pinning, DRM/KMS hooks). The C is kept, selectable, until the Rust has run
+the hardware regression, and a differential test runs the two on the same
+inputs meanwhile.
+
 **The backend** (`device/`, Apache-2.0, with no VMM in its dependency list)
 holds the real host descriptors, understands the ABI, translates what has to be
 translated, and issues the real ioctls. A VMM adopts it by implementing a few

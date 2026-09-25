@@ -19,6 +19,11 @@
 #
 # MODULE_DIR=<dir> builds the module from a copy of driver/ kept in <dir>
 # instead of in driver/ itself, so the working tree gets no build products.
+#
+# NVGPU_RUST=1 builds a kernel with CONFIG_RUST and the module with its
+# parsers in Rust (driver/rust/, NVGPU_RUST=1 in driver/Makefile) instead of
+# C. It needs rustc, bindgen and RUST_LIB_SRC in the environment: run it in
+# scripts/guest-toolchain-rust (the rig does: .rig/build-kernel-rust.sh).
 set -euo pipefail
 
 usage="usage: build-guest-kernel.sh <linux-source-dir> [jobs] [build-dir]"
@@ -151,7 +156,18 @@ disable CONFIG_DEBUG_INFO_BTF
 enable CONFIG_IKCONFIG
 enable CONFIG_IKCONFIG_PROC
 
+# The module's untrusted-input parsers in Rust (driver/rust/). Rust needs no
+# MODVERSIONS (unset above by defconfig) and no BTF (disabled above).
+if [ "${NVGPU_RUST:-0}" = 1 ]; then
+    enable CONFIG_RUST
+fi
+
 "${KMAKE[@]}" olddefconfig
+if [ "${NVGPU_RUST:-0}" = 1 ] && ! grep -q '^CONFIG_RUST=y' "$KTREE/.config"; then
+    echo "CONFIG_RUST did not stick: no usable Rust toolchain?" >&2
+    "${KMAKE[@]}" rustavailable >&2 || true
+    exit 1
+fi
 # `modules` as well as `vmlinux`, not `modules_prepare`: modpost resolves the
 # module's symbols against the kernel's Module.symvers, and only a real module
 # build writes one. With modules_prepare alone every exported symbol comes back
@@ -173,8 +189,11 @@ fi
 # A Module.symvers carried in from another tree would be consulted first.
 rm -f "$MOD/Module.symvers"
 make -C "$MOD" KDIR="$KTREE" clean
-make -C "$MOD" KDIR="$KTREE"
+make -C "$MOD" KDIR="$KTREE" NVGPU_RUST="${NVGPU_RUST:-0}"
 
-cp "$KTREE/.config" "$HERE/driver/guest-kernel.config"
+# The recorded config is the C build's; a Rust build's stays in its tree.
+if [ "${NVGPU_RUST:-0}" != 1 ]; then
+    cp "$KTREE/.config" "$HERE/driver/guest-kernel.config"
+fi
 echo "== module: $MOD/virtio_gpu_nv.ko"
-echo "== config recorded at driver/guest-kernel.config"
+[ "${NVGPU_RUST:-0}" = 1 ] || echo "== config recorded at driver/guest-kernel.config"
