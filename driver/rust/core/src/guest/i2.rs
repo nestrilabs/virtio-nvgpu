@@ -23,7 +23,7 @@ use super::schema::{
     SLEN_NVKMS_PARAMS, SLEN_PLANES, SLEN_SUM, SSPECIAL_ATOMIC,
 };
 use super::wire::{
-    align8, copy, le32, le64, le_n, put32, put64, Errno, E2BIG, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM, ENOTTY,
+    align8, copy, le32, le64, le_n, put_le, Errno, E2BIG, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM, ENOTTY,
     EPROTO, ETIMEDOUT, HDR_LEN, I2_FD_CONSUME, I2_GEM_OUT_LEN, I2_MAX_BUFS, I2_MAX_RECS,
     I2_REC_LEN, I2_REQ_LEN, I2_RESP_LEN, MAX_ERRNO, MSG_IOCTL2,
 };
@@ -405,13 +405,10 @@ impl<S: Store> State<S> {
     }
 
     /// `nvgpu_i2_wr()`: only ever at positions the walk reached, which it
-    /// bounds-checked; eight bytes for an 8-byte field, four for any other.
+    /// bounds-checked, and exactly `width` bytes of them (1, 2, 4 or 8).
     fn wr(&mut self, b: u32, off: u32, width: u8, v: u64) {
-        let k = self.store.buf_mut(idx(b));
-        if width == 8 {
-            put64(k, idx(off), v);
-        } else {
-            put32(k, idx(off), v as u32);
+        if matches!(width, 1 | 2 | 4 | 8) {
+            put_le(self.store.buf_mut(idx(b)), idx(off), usize::from(width), v);
         }
     }
 
@@ -591,6 +588,17 @@ impl<S: Store> State<S> {
                     }
                 }
                 _ => {
+                    // A descriptor is 4 or 8 bytes and a GEM handle 4, as the
+                    // generator checks; a table that disagreed would have its
+                    // caller's values put back at another width.
+                    let bad = match f.kind {
+                        SF_FD_IN | SF_FD_OUT => !matches!(f.width, 4 | 8),
+                        SF_GEM_IN | SF_GEM_OUT => f.width != 4,
+                        _ => false,
+                    };
+                    if bad {
+                        return Err(-EINVAL);
+                    }
                     let v = self.rd(b, at, u32::from(f.width))?;
                     self.add_slot(fi, &f, b, at, v)?;
                 }
@@ -726,8 +734,10 @@ impl<S: Store> State<S> {
         for o in self.fdo.get(idx(fd_from)..idx(self.nfdo)).unwrap_or(&[]) {
             env.close_handle(o.handle);
         }
-        let gemo = self.gemo.get(idx(gem_from)..idx(self.ngemo)).unwrap_or(&[]);
-        for i in 0..gemo.len() {
+        // A handle an earlier record named is closed already, or owned now
+        // by the proxy made for it (below `gem_from`): never closed here.
+        let gemo = self.gemo.get(..idx(self.ngemo)).unwrap_or(&[]);
+        for i in idx(gem_from)..gemo.len() {
             let Some(o) = gemo.get(i) else { break };
             if !gemo.get(..i).unwrap_or(&[]).iter().any(|p| p.handle == o.handle) {
                 env.gem_close(o.handle);

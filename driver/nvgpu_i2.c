@@ -196,13 +196,24 @@ static void nvgpu_i2_wr(struct nvgpu_i2_state *st, u32 b, u32 off, u32 width,
                         u64 v) {
   struct nvgpu_i2_kbuf *kb = &st->buf[b];
 
-  /* Only ever at positions the walk reached, which it bounds-checked. */
+  /* Only ever at positions the walk reached, which it bounds-checked, and
+   * exactly `width` bytes of them (this wrote 4 for any width but 8). */
   if (width > kb->len || off > kb->len - width)
     return;
-  if (width == 8)
-    put_unaligned_le64(v, kb->k + off);
-  else
+  switch (width) {
+  case 1:
+    kb->k[off] = (u8)v;
+    break;
+  case 2:
+    put_unaligned_le16((u16)v, kb->k + off);
+    break;
+  case 4:
     put_unaligned_le32((u32)v, kb->k + off);
+    break;
+  case 8:
+    put_unaligned_le64(v, kb->k + off);
+    break;
+  }
 }
 
 static s64 nvgpu_i2_sext(u64 v, u32 width) {
@@ -423,6 +434,16 @@ static int nvgpu_i2_walk(struct nvgpu_device *dev, struct nvgpu_i2_state *st,
       break;
     }
     default:
+      /*
+       * A descriptor is 4 or 8 bytes and a GEM handle 4, which the
+       * generator checks (gen/schema_gen.py); a table that disagreed would
+       * have its caller's values put back at another width.
+       */
+      if (((f->kind == NVGPU_SF_FD_IN || f->kind == NVGPU_SF_FD_OUT) &&
+           f->width != 4 && f->width != 8) ||
+          ((f->kind == NVGPU_SF_GEM_IN || f->kind == NVGPU_SF_GEM_OUT) &&
+           f->width != 4))
+        return -EINVAL;
       ret = nvgpu_i2_rd(st, b, at, f->width, &v);
       if (!ret)
         ret = nvgpu_i2_add_slot(st, f, b, at, v);
@@ -647,8 +668,14 @@ static void nvgpu_i2_drop_outs(struct nvgpu_i2_call *call, u32 fd_from,
 
   for (i = fd_from; i < st->nfdo; i++)
     nvgpu_close_handle_async(call->dev, st->fdo[i].handle);
+  /*
+   * A handle an earlier record named is closed already, or is owned now by
+   * the proxy made for it (below gem_from): never closed here. Counting only
+   * from gem_from, a reply naming one handle before and after a gem_out hook
+   * that failed closed the host handle the first proxy stands for.
+   */
   for (i = gem_from; i < st->ngemo; i++) {
-    for (j = gem_from; j < i; j++)
+    for (j = 0; j < i; j++)
       if (st->gemo[j].handle == st->gemo[i].handle)
         break;
     if (j == i)

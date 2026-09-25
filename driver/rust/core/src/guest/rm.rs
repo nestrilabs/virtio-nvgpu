@@ -17,7 +17,7 @@
 use super::deep::{self, UserMem};
 use super::wire::{
     has, ioctl_req_header, le32, le64, put32, put64, sum, Errno, FillFrom, IoctlResp, DEEP_SEGMENTED, EBADF,
-    EFAULT, EINVAL, EIO, ENOMEM, IDLE_CHANNELS_MAX, IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
+    EFAULT, EINVAL, EIO, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX, IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
 };
 
 /// NV_IOCTL_MAGIC, the type byte of every RM escape.
@@ -84,6 +84,7 @@ const TCI_SRC_TSC: u8 = 2;
 const TCI_SRC_PLATFORM_API: u8 = 3;
 const TCI_PROC_CPU: u8 = 0;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
 
 /// NvKmsIoctlCommand REGISTER_SURFACE, and where its descriptor is.
 const NVKMS_REGISTER_SURFACE: u32 = 16;
@@ -534,6 +535,13 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
         return Ok(get_build_version(env, uarg, user_nested, nested_size));
     }
 
+    // A size with no parameters: RM refuses it as it copies the parameters
+    // in (param_copy.c rmapiParamsAcquire), NV_ERR_INVALID_ARGUMENT in the
+    // struct, the ioctl itself succeeding; so that is the answer here.
+    if user_nested == 0 && nested_size != 0 {
+        return Ok(set_status(env, uarg, NV_ERR_INVALID_ARGUMENT));
+    }
+
     // The nested block, read once: what every decision below is taken on,
     // and what is sent.
     let mut nested = alloc(env, if has_nested { nz } else { 0 })?;
@@ -576,7 +584,8 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
             // The leading field says how much the buffer holds: entries of
             // eight bytes for the list-style commands, plain bytes for the
             // caps tables. NvU32 arithmetic, as the C has it.
-            deep_len = if rw.info_style { count.wrapping_mul(8) } else { count };
+            // Past u32, too large: no deep block, below.
+            deep_len = if rw.info_style { count.checked_mul(8).unwrap_or(u32::MAX) } else { count };
             deep_ptr_offset = rw.v1_userptr_offset;
             if deep_user_ptr == 0 || deep_len == 0 || deep_len > DEEP_MAX {
                 deep_user_ptr = 0;
@@ -812,6 +821,16 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
     let hclass = le32(&params, 12).unwrap_or(0);
     let user_alloc = le64(&params, 16).unwrap_or(0);
     let mut nested_size = le32(&params, 32).unwrap_or(0);
+    // No parameters: RM sizes them from the class (rmapiParamsCopyInit) and
+    // with a NULL pointer takes none -- or refuses the class that needs them
+    // -- whatever paramsSize says. So none are sent, and the host is told a
+    // size of 0; the caller's comes back as it was.
+    let mut caller_psize = 0u32;
+    if user_alloc == 0 && nested_size != 0 {
+        caller_psize = nested_size;
+        put32(&mut params, 32, 0);
+        nested_size = 0;
+    }
     // paramsSize 0 with a pointer: the host's RM sizes it from the class,
     // so we must too to know how much to copy.
     if user_alloc != 0 && nested_size == 0 {
@@ -892,6 +911,9 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
         return Ok(ret);
     }
     let r = resp.as_mut();
+    if caller_psize != 0 {
+        put32(r, IOCTL_RESP_LEN + 32, caller_psize);
+    }
     env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVOS64_SIZE)?).map_err(|_| -EFAULT)?;
 
     if user_alloc != 0 && h.nested_len > 0 {
@@ -925,12 +947,22 @@ pub fn modeset_v1<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64) -> i32 {
 }
 
 fn modeset_v1_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64) -> Result<i32, Errno> {
+    // NVKMS takes one ioctl, NVKMS_IOCTL_CMD with exactly NvKmsIoctlParams
+    // behind it; anything else is -ENOTTY (nvidia-modeset-linux.c).
+    if ioc_nr(cmd) != 0 || (cmd >> 16) & 0x3fff != NVKMS_OUTER_SIZE as u32 {
+        return Err(-ENOTTY);
+    }
     let mut outer = [0u8; NVKMS_OUTER_SIZE];
     env.copy_from_user(&mut outer, uarg)?;
     let user_nested = le64(&outer, 8).unwrap_or(0);
     let nested_size = le32(&outer, 4).unwrap_or(0);
     if nested_size > NESTED_MAX {
         return Err(-EINVAL);
+    }
+    // A size with no parameters: NVKMS copies the request in from the
+    // address and fails the call (nvkms.c nvKmsIoctl).
+    if user_nested == 0 && nested_size != 0 {
+        return Err(-EPERM);
     }
     let nz = nested_size as usize;
     let mut req = alloc(env, sum(&[IOCTL_REQ_LEN, NVKMS_OUTER_SIZE, nz]))?;

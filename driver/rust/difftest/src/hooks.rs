@@ -67,7 +67,10 @@ pub fn fd_out(w: &mut World, buf: u32, off: u32, handle: u32, kind: u32) -> (i32
 pub fn gem_out(w: &mut World, buf: u32, off: u32, gem: u32, size: u64) -> (i32, u32) {
     w.events.push(Ev::Hook(Hook::GemOut { buf, off, gem, size }));
     let mut r = rng(w, &[4, u64::from(gem)]);
-    if r.chance(1, 10) {
+    if w.hooks.fail_gem == Some(gem) {
+        return (-12, 0);
+    }
+    if w.hooks.fail_gem.is_none() && r.chance(1, 10) {
         return (-12, 0);
     }
     (0, 7000 + gem)

@@ -15,14 +15,14 @@ const B: u64 = 0x7f00_0003_0000;
 const C: u64 = 0x7f00_0004_0000;
 
 fn dev(caps: u32, fdt: Vec<(u32, u32)>) -> DevSpec {
-    DevSpec { version: "610.57.04".into(), v2: true, caps, max_req: 1 << 20, max_resp: 1 << 20, fdt, handle: 5 }
+    DevSpec { bad_schema: false, version: "610.57.04".into(), v2: true, caps, max_req: 1 << 20, max_resp: 1 << 20, fdt, handle: 5 }
 }
 
 fn world() -> World {
     World {
         fds: FDS.iter().copied().collect(),
         clock: Some(1_000_000),
-        hooks: Hooks { mask: 0x3f, seed: 1 },
+        hooks: Hooks { mask: 0x3f, seed: 1, fail_gem: None },
         ..World::default()
     }
 }
@@ -397,24 +397,135 @@ fn getresources_copies_back_what_the_kernel_would() {
     assert_eq!(le32(mem(&o, ARG), 48), 1920);
 }
 
+/// Both implementations with kmalloc() bytes not zeroed but 0xaa, so a
+/// path that sends what it never wrote shows up as a difference.
+fn run_dirty(d: DevSpec, w: World, call: Call) -> Outcome {
+    unsafe { cabi::harness_set_kmalloc_fill(0xaa) };
+    let s = Scenario { seed: 0, dev: d, world: w, call };
+    let r = scen::diff(&s);
+    unsafe { cabi::harness_set_kmalloc_fill(0) };
+    r.unwrap_or_else(|e| panic!("{e}"))
+}
+
 #[test]
-fn the_c_sends_heap_bytes_it_never_wrote() {
-    // RM_CONTROL with paramsSize set and params NULL: the C allocates the
-    // request with kmalloc() and sends paramsSize bytes it never filled --
-    // guest kernel heap, to the backend. The Rust sends zeroes. (With
-    // kmalloc() zeroed, as the other tests have it, the two agree.)
+fn a_size_with_no_parameters_sends_no_heap() {
+    // RM_CONTROL: RM refuses it in the struct (rmapiParamsAcquire), so it is
+    // answered here, NV_ERR_INVALID_ARGUMENT; the C sent 64 bytes of heap.
     let mut w = world();
     let mut p = vec![0u8; 32];
     put(&mut p, 8, 0x2080_0101, 4);
     put(&mut p, 24, 64, 4);
     w.mem.insert(ARG, p);
-    let s = Scenario { seed: 0, dev: dev(0, vec![]), world: w.clone(), call: Call::Fd { cmd: ioc(3, b'F', 0x2a, 32), arg: ARG } };
-    let r = scen::run_rust(&s);
-    unsafe { cabi::harness_set_kmalloc_fill(0xaa) };
-    let c = scen::run_c(&s, w);
-    unsafe { cabi::harness_set_kmalloc_fill(0) };
-    let (cs, rs) = (&sends(&c)[0], &sends(&r)[0]);
-    assert_eq!(cs.len(), 40 + 32 + 64);
-    assert_eq!(&cs[72..], &[0xaa; 64][..]);
-    assert_eq!(&rs[72..], &[0; 64][..]);
+    let o = run_dirty(dev(0, vec![]), w, Call::Fd { cmd: ioc(3, b'F', 0x2a, 32), arg: ARG });
+    assert_eq!(o.ret, 0);
+    assert!(sends(&o).is_empty());
+    assert_eq!(le32(mem(&o, ARG), 28), 0x1f);
+
+    // RM_ALLOC: RM sizes parameters by the class and takes none with a NULL
+    // pointer, so none go and the host is told 0; the caller's comes back.
+    let mut w = world();
+    let mut p = vec![0u8; 48];
+    put(&mut p, 12, 0x80, 4);
+    put(&mut p, 32, 64, 4);
+    w.mem.insert(ARG, p.clone());
+    let mut back = p.clone();
+    put(&mut back, 32, 0, 4);
+    put(&mut back, 40, 0, 4);
+    w.canned = vec![reply(0, &back, &[], &[])];
+    let o = run_dirty(dev(BCAP_PROC_ID, vec![]), w, Call::Fd { cmd: ioc(3, b'F', 0x2b, 48), arg: ARG });
+    assert_eq!(o.ret, 0);
+    let s = &sends(&o)[0];
+    assert_eq!(le32(s, 28), 0); // nested_len
+    assert_eq!(le32(payload(s), 32), 0); // paramsSize as sent
+    assert_eq!(s.len(), 40 + 48 + 16);
+    assert_eq!(le32(mem(&o, ARG), 32), 64);
+
+    // v1 NVKMS: NVKMS fails the copy-in (nvKmsIoctl), -EPERM, nothing sent.
+    let mut w = world();
+    let mut outer = vec![0u8; 16];
+    put(&mut outer, 0, 3, 4);
+    put(&mut outer, 4, 24, 4);
+    w.mem.insert(ARG, outer);
+    let o = run_dirty(dev(0, vec![]), w, Call::Modeset { cmd: ioc(3, 0x6d, 0, 16), arg: ARG });
+    assert_eq!(o.ret, -1);
+    assert!(sends(&o).is_empty());
+}
+
+#[test]
+fn a_v1v2_count_that_wraps_carries_no_deep_block() {
+    // GPU_GET_INFO counts entries of 8 bytes: 2^29 + 1 of them wrapped to
+    // one entry in u32, and 8 bytes went as the list.
+    let mut w = world();
+    let mut n = vec![0u8; 16];
+    put(&mut n, 0, 0x2000_0001, 4);
+    put(&mut n, 8, A, 8);
+    w.mem.insert(A, vec![0x77; 64]);
+    let call = control(0x2080_0101, n, &mut w);
+    let o = run(dev(0, vec![]), w, call);
+    let s = &sends(&o)[0];
+    assert_eq!((le32(s, 32), le32(s, 36)), (0, 0));
+    assert_eq!(s.len(), 40 + 32 + 16);
+}
+
+#[test]
+fn nvkms_takes_its_one_ioctl_only() {
+    // Another size, or another number: -ENOTTY, as nvkms_ioctl, with nothing
+    // read or written (the C read and wrote 16 bytes whatever the size).
+    for cmd in [ioc(3, 0x6d, 0, 8), ioc(3, 0x6d, 1, 16), ioc(3, 0x6d, 0, 24)] {
+        let mut w = world();
+        let mut outer = vec![0u8; 16];
+        put(&mut outer, 0, 3, 4);
+        w.mem.insert(ARG, outer.clone());
+        let o = run(dev(0, vec![]), w, Call::Modeset { cmd, arg: ARG });
+        assert_eq!(o.ret, -25, "{cmd:#x}");
+        assert!(sends(&o).is_empty());
+        assert_eq!(mem(&o, ARG), &outer[..]);
+    }
+}
+
+#[test]
+fn a_field_of_a_width_the_generator_refuses_is_refused() {
+    // A descriptor 2 bytes wide (the C put 4 bytes back over it), and a GEM
+    // handle 2 bytes wide: -EINVAL before anything is sent.
+    let mut d = dev(0, vec![]);
+    d.bad_schema = true;
+    for cmd in [0xc010_64f0u32, 0xc010_64f1] {
+        let mut w = world();
+        let mut arg = vec![0u8; 16];
+        put(&mut arg, 0, 3, 2);
+        w.mem.insert(ARG, arg.clone());
+        let o = run(d.clone(), w, Call::I2 { sclass: 2, cmd, uarg: ARG, render: 5, xflags: 0 });
+        assert_eq!(o.ret, -22, "{cmd:#x}");
+        assert!(sends(&o).is_empty());
+        assert_eq!(mem(&o, ARG), &arg[..]);
+    }
+}
+
+#[test]
+fn a_failed_gem_proxy_closes_no_handle_another_proxy_owns() {
+    // GETFB2 naming host handle 1, then 2, then 1 again; the proxy for 2
+    // cannot be made. 2 is closed; 1 is the first proxy's, and stays open
+    // (the C closed it too).
+    let cmd = 0xc068_64ce;
+    let mut w = world();
+    w.hooks = Hooks { mask: 8, seed: 1, fail_gem: Some(2) };
+    let arg = vec![0u8; 104];
+    w.mem.insert(ARG, arg.clone());
+    let mut r = Vec::new();
+    for v in [10u32, 0, 0, 0, 0, 1, 0, 3, 104, 0, 0, 0] {
+        r.extend_from_slice(&v.to_le_bytes());
+    }
+    r.extend_from_slice(&arg);
+    for (off, h) in [(20u32, 1u32), (24, 2), (28, 1)] {
+        for v in [0u32, off, h, 0] {
+            r.extend_from_slice(&v.to_le_bytes());
+        }
+        r.extend_from_slice(&4096u64.to_le_bytes());
+    }
+    w.canned = vec![r];
+    let o = run(dev(0, vec![]), w, Call::I2 { sclass: 2, cmd, uarg: ARG, render: 5, xflags: 0 });
+    assert_eq!(o.ret, -12);
+    let closed: Vec<(u32, u32)> =
+        o.world.events.iter().filter_map(|e| if let Ev::GemClose(f, g) = e { Some((*f, *g)) } else { None }).collect();
+    assert_eq!(closed, [(5, 2)]);
 }

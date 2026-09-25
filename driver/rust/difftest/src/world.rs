@@ -114,6 +114,8 @@ pub struct Hooks {
     pub mask: u32,
     /// Varies what they answer.
     pub seed: u64,
+    /// gem_out fails for this host handle.
+    pub fail_gem: Option<u32>,
 }
 
 /// What an IOCTL2 looked like to the Rust interpreter, so the fake backend

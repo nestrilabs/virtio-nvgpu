@@ -19,6 +19,8 @@ use crate::world::{Ev, Hooks, Rng, World};
 /// The device a scenario runs on.
 #[derive(Clone, Debug)]
 pub struct DevSpec {
+    /// The tests' bad table (harness.c) in place of the generated ones.
+    pub bad_schema: bool,
     pub version: String,
     pub v2: bool,
     pub caps: u32,
@@ -71,6 +73,9 @@ impl CDevice {
         let dev = unsafe {
             cabi::harness_dev(v.as_ptr(), d.v2, d.caps, d.max_req, d.max_resp, nr.as_ptr(), pl.as_ptr(), nr.len() as u32)
         };
+        if d.bad_schema {
+            unsafe { cabi::harness_dev_bad_schema(dev) };
+        }
         let nfd = unsafe { cabi::harness_fd(dev, d.handle) };
         CDevice { dev, nfd }
     }
@@ -318,6 +323,7 @@ pub fn base(r: &mut Rng, seed: u64) -> (DevSpec, World) {
         }
     }
     let dev = DevSpec {
+        bad_schema: false,
         version,
         v2: r.chance(7, 8),
         caps,
@@ -334,7 +340,7 @@ pub fn base(r: &mut Rng, seed: u64) -> (DevSpec, World) {
         pin_seed: r.next(),
         clock: if r.chance(3, 4) { Some(r.below(1 << 40) as i64 - (1 << 39)) } else { None },
         compat: r.chance(1, 10),
-        hooks: Hooks { mask: if r.chance(4, 5) { 0x3f } else { r.below(64) as u32 }, seed: r.next() },
+        hooks: Hooks { mask: if r.chance(4, 5) { 0x3f } else { r.below(64) as u32 }, seed: r.next(), fail_gem: None },
         ..World::default()
     };
     world.proc_id.copy_from_slice(&r.bytes(16));

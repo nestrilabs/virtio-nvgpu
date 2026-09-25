@@ -560,6 +560,17 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   /*
+   * A size with no parameters. RM refuses it as it copies the parameters in
+   * (param_copy.c rmapiParamsAcquire: NV_ERR_INVALID_ARGUMENT, in the
+   * struct, the ioctl itself succeeding), so that is the answer here too.
+   * Sent on, the request carried nested_size bytes this never wrote --
+   * uninitialised guest kernel heap -- and the backend, finding a block,
+   * handed RM those bytes as the parameters.
+   */
+  if (!user_nested && nested_size)
+    return nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_INVALID_ARGUMENT);
+
+  /*
    * A second-level pointer, carried rather than rewritten.
    *
    * Some parameter blocks hold an NvP64 pointing at a buffer of the caller's.
@@ -624,7 +635,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
      * The leading field says how much the buffer holds: entries of eight
      * bytes for the list-style commands, plain bytes for the caps tables.
      */
-    deep_len = rw->info_style ? count * 8 : count;
+    if (!rw->info_style)
+      deep_len = count;
+    else if (check_mul_overflow(count, 8u, &deep_len))
+      deep_len = U32_MAX; /* too large, below: no deep block */
     deep_ptr_offset = rw->v1_userptr_offset;
 
     if (!deep_user_ptr || deep_len == 0 || deep_len > NVGPU_DEEP_MAX) {
@@ -928,6 +942,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   /* NV_EVENT_BUFFER's OS event, translated, and the caller's value. */
   bool os_event = false;
   u64 os_event_val = 0;
+  /* paramsSize as the caller wrote it, when it is not what is sent. */
+  u32 caller_psize = 0;
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -943,6 +959,19 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
    * the host RM driver knows the size from hClass.  We need to copy
    * that many bytes from guest userspace so the VMM can forward them.
    */
+  /*
+   * No parameters: RM sizes them from the class (rmapiParamsCopyInit), and
+   * with a NULL pointer takes none -- or refuses the class that needs them
+   * -- whatever paramsSize says. So none are sent, and the host is told a
+   * size of 0 (the caller's comes back as it was): sent on, the request
+   * carried paramsSize bytes this never wrote -- uninitialised guest kernel
+   * heap -- which the backend handed RM as the parameters.
+   */
+  if (!user_alloc && nested_size) {
+    caller_psize = params.paramsSize;
+    params.paramsSize = 0;
+    nested_size = 0;
+  }
   if (user_alloc && nested_size == 0) {
     u32 hClass = le32_to_cpu(params.hClass);
     nested_size = nvgpu_rmalloc_class_param_size(hClass);
@@ -1074,6 +1103,10 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   /* As for RM_CONTROL: a failed reply is a bare header, nothing to copy. */
   if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(params)))
     goto out;
+  if (caller_psize)
+    memcpy(resp_buf + sizeof(*resp) +
+               offsetof(struct NVOS64_PARAMETERS, paramsSize),
+           &caller_psize, sizeof(caller_psize));
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
     ret = -EFAULT;
     goto out;
@@ -1427,6 +1460,13 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   int req_total, resp_max, ret;
   u32 used;
 
+  /*
+   * NVKMS takes one ioctl, NVKMS_IOCTL_CMD with exactly NvKmsIoctlParams
+   * behind it, and anything else is -ENOTTY (nvidia-modeset-linux.c
+   * nvkms_ioctl). This read and wrote 16 bytes whatever the ioctl's size.
+   */
+  if (_IOC_NR(cmd) != 0 || sz != sizeof(outer))
+    return -ENOTTY;
   if (copy_from_user(&outer, uarg, sizeof(outer)))
     return -EFAULT;
 
@@ -1435,6 +1475,13 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
 
   if (nested_size > 1024 * 1024)
     return -EINVAL;
+  /*
+   * A size with no parameters: NVKMS copies the request in from the address
+   * and fails the call (nvkms.c nvKmsIoctl, -EPERM). Sent on, the request
+   * carried nested_size bytes this never wrote -- guest kernel heap.
+   */
+  if (!user_nested && nested_size)
+    return -EPERM;
 
   req_total = sizeof(*req) + sizeof(outer) + nested_size;
   resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(outer) + nested_size;

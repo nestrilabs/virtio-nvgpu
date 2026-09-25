@@ -82,6 +82,7 @@ extern "C" {
     pub fn harness_rmalloc_size(hclass: u32) -> u32;
     pub fn harness_call_ret(call: *mut c_void) -> i32;
     pub fn harness_set_kmalloc_fill(fill: c_int);
+    pub fn harness_dev_bad_schema(dev: *mut CDev);
     pub fn harness_set_call_ret(call: *mut c_void, ret: i32);
     #[allow(clippy::too_many_arguments)]
     pub fn harness_i2(

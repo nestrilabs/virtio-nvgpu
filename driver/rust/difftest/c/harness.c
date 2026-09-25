@@ -462,3 +462,29 @@ long harness_i2(struct nvgpu_device *dev, u32 sclass, u32 cmd, u64 uarg,
   *ret_out = call.ret;
   return r;
 }
+
+/*
+ * A table the generator would refuse, for the tests: _IOWR('d', 0xf0, 16) on
+ * a KMS file, with a descriptor field 2 bytes wide at 0 (the generator allows
+ * 4 or 8), and _IOWR('d', 0xf1, 16) with a GEM handle 2 bytes wide.
+ */
+static const struct nvgpu_sfield harness_bad_fields[] = {
+    {.off = 0, .kind = NVGPU_SF_FD_IN, .width = 2, .kinds = 0xff,
+     .none_value = -1},
+    {.off = 4, .kind = NVGPU_SF_GEM_OUT, .width = 2},
+};
+static const struct nvgpu_sioctl harness_bad_ioctls[] = {
+    {.name = "BAD_FD", .cmd = 0xc01064f0u, .size = 16,
+     .sclass = NVGPU_SCLASS_KMS, .field = 0, .nfield = 1},
+    {.name = "BAD_GEM", .cmd = 0xc01064f1u, .size = 16,
+     .sclass = NVGPU_SCLASS_KMS, .field = 1, .nfield = 1},
+};
+static const struct nvgpu_stable harness_bad_table = {
+    .name = "bad", .ioctls = harness_bad_ioctls, .nioctls = 2,
+    .fields = harness_bad_fields, .nfields = 2};
+static const struct nvgpu_schema_set harness_bad_set = {
+    .drm = &harness_bad_table};
+
+void harness_dev_bad_schema(struct nvgpu_device *dev) {
+  dev->schema = &harness_bad_set;
+}

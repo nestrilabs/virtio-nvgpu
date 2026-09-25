@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let mut w = World {
         fds: FDS.iter().copied().collect(),
         clock: Some(12345),
-        hooks: Hooks { mask: knobs & 0x3f, seed: u64::from(knobs) },
+        hooks: Hooks { mask: knobs & 0x3f, seed: u64::from(knobs), fail_gem: None },
         chaos: u64::from((knobs >> 6) & 7),
         backend_seed: u64::from(knobs),
         ..World::default()
@@ -30,6 +30,7 @@ fuzz_target!(|data: &[u8]| {
         k += 1;
     }
     let dev = DevSpec {
+        bad_schema: false,
         version: "610.57.04".into(),
         v2: knobs & (1 << 9) == 0,
         caps: (knobs >> 10) & 0x3e0,
