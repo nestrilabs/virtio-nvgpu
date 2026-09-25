@@ -145,11 +145,22 @@ refuses to start as root or with `CAP_SYS_ADMIN` unless told
 `--allow-root-unsafe`, and drops every capability before its first thread in
 any case. [`scripts/run-guest.sh`](scripts/run-guest.sh) starts it through
 `setpriv`, with no capabilities and no supplementary groups but those of
-`video`, `render` and `kvm` the host has: as the system user `nvgpu` by
-default, or in the Wayland modes as the owner of the compositor's socket or of
-the export directory ([Display](#display)). Its socket defaults to
+`video`, `render` and `kvm` the host has: as root, as a user of its own per VM
+(`nvgpu-vm0`, `nvgpu-vm1`, ... from a pool the script's header shows how to
+make, with the VMM under nesbox's jailer as the slot's `nvgpu-vmm0`, ...), or
+in the Wayland modes as the owner of the compositor's socket or of the export
+directory ([Display](#display)). Its socket defaults to
 `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock`, in a directory only it can enter, because
 whoever listens there is handed the guest's memory.
+
+Before the first guest message the backend sandboxes itself
+([`device/src/sandbox.rs`](device/src/sandbox.rs)): a network namespace of its
+own, Landlock confining it to the GPU's nodes and the few files it reads, and a
+seccomp syscall allowlist that kills on anything else. A layer the host kernel
+lacks is logged as `sandbox: DEGRADED`; `--sandbox=off` (or
+`NVGPU_SANDBOX=off` for the launcher) is for diagnosis only.
+[SECURITY.md](SECURITY.md) §4 has what each layer and the per-VM uid do and do
+not stop.
 
 What narrows the surface today:
 
@@ -453,7 +464,7 @@ does not know, and the guest stays on v1 with no display features at all.
 
 The backend is started by [`scripts/run-guest.sh`](scripts/run-guest.sh),
 which passes the display flags through and picks the unprivileged user it runs
-as: the system user `nvgpu` by default, the socket's owner with
+as: a pool user of the VM's own by default, the socket's owner with
 `--wayland-socket`, and the export directory's owner with `--wayland-export`.
 Anything else for the backend goes after `--`.
 

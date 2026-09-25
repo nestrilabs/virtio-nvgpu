@@ -176,7 +176,18 @@ impl HotplugListener {
         sink: impl Fn(PumpCmd) + Send + 'static,
         tick: Option<Tick>,
     ) -> io::Result<Self> {
-        let sock = uevent_socket()?;
+        Self::spawn_ticking_on(uevent_socket()?, cards, sink, tick)
+    }
+
+    /// `spawn_ticking` on a socket [`uevent_socket`] made earlier: the
+    /// backend makes it before its sandbox puts it in a network namespace
+    /// of its own, where no uevent would arrive (device::sandbox).
+    pub fn spawn_ticking_on(
+        sock: PrivateFd,
+        cards: Vec<CardNode>,
+        sink: impl Fn(PumpCmd) + Send + 'static,
+        tick: Option<Tick>,
+    ) -> io::Result<Self> {
         // SAFETY: plain syscall; the result is owned below.
         let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if stop < 0 {
@@ -222,7 +233,10 @@ impl Drop for HotplugListener {
 }
 
 /// A non-blocking socket on the kernel uevent group.
-fn uevent_socket() -> io::Result<PrivateFd> {
+///
+/// Of the network namespace it is made in, which keeps it: the kernel
+/// broadcasts uevents only to namespaces of the initial user namespace.
+pub fn uevent_socket() -> io::Result<PrivateFd> {
     // SAFETY: plain syscall; the result is owned below.
     let fd = unsafe {
         libc::socket(
