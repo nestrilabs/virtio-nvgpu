@@ -938,6 +938,16 @@ impl Prepared {
                 if self.class != SchemaClass::Render {
                     return Err(libc::EINVAL);
                 }
+            } else if self.class == SchemaClass::Render {
+                // A render-node call names objects of its own file only. A
+                // temporary re-home here would be closed after the call, and
+                // PRIME import into a file that already holds the object
+                // returns that file's existing handle (drm_prime.c:306-309)
+                // -- so the close would take the handle from under the guest
+                // proxy that owns it. The guest moves such an object into the
+                // target file itself, keeps it there, and names it by that
+                // handle (SEMSURF_FENCE_ATTACH, driver/nvgpu_fence.c).
+                return Err(libc::EINVAL);
             } else if !self.owners.contains_key(&owner) {
                 let (fd, kind) = env.dup_handle(owner).ok_or(libc::EBADF)?;
                 if !matches!(kind, HandleKind::DriRender(_)) {
@@ -1557,6 +1567,7 @@ mod tests {
     const KMS: u32 = 10;
     const OTHER_KMS: u32 = 11;
     const RENDER: u32 = 20;
+    const OTHER_RENDER: u32 = 21;
     const CTL: u32 = 30;
     const MODESET: u32 = 31;
     const SYNC: u32 = 40;
@@ -1565,7 +1576,7 @@ mod tests {
     fn kind_of(h: u32) -> HandleKind {
         match h {
             KMS | OTHER_KMS => HandleKind::DrmLease(0),
-            RENDER => HandleKind::DriRender(0),
+            RENDER | OTHER_RENDER => HandleKind::DriRender(0),
             CTL => HandleKind::Dev(DeviceKind::Ctl),
             MODESET => HandleKind::Dev(DeviceKind::Modeset),
             SYNC => HandleKind::SyncFile,
@@ -2324,6 +2335,32 @@ mod tests {
         );
         h.hooks = Arc::new(AllowFences);
         assert!(h.run(SchemaClass::Render, RENDER, &rq).is_ok());
+    }
+
+    #[test]
+    fn a_render_call_names_only_objects_of_its_own_file() {
+        // SEMSURF_FENCE_ATTACH: buffer @0 and fence context @4, both GEM_IN.
+        // Another render file's object would be re-homed as a temporary and
+        // closed after the call -- and if the target already held it, the
+        // import would have returned the target's own handle, which the
+        // close would take from its proxy. The guest re-homes it for keeps.
+        let mut h = h();
+        h.hooks = Arc::new(AllowFences);
+        let attach = |owner| {
+            Rq::new(0x4000_0000 | 24 << 16 | (b'd' as u32) << 8 | 0x57)
+                .buf(24, Some(&arg(24, &[(0, 4, 3), (4, 4, 4)])))
+                .gem(0, 0, owner, 3)
+                .gem(0, 4, RENDER, 4)
+        };
+        assert_eq!(
+            h.prepare(SchemaClass::Render, RENDER, &attach(OTHER_RENDER))
+                .err(),
+            Some(libc::EINVAL)
+        );
+        assert!(
+            h.prepare(SchemaClass::Render, RENDER, &attach(RENDER))
+                .is_ok()
+        );
     }
 
     #[test]

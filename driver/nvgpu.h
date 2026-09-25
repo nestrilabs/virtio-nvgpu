@@ -382,10 +382,86 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
 int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
                       u32 *host_handle, u32 *owner_handle);
 
+/* Guest handle in `file` -> the proxy itself, referenced (drop it with
+ * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
+struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
+                                          u32 guest_handle);
+
 /* ───────── nvgpu_hostfile.c ───────── */
 
 /* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */
 int nvgpu_hostfile_handle(struct file *f, u32 *handle);
+/*
+ * A backend handle of kind `kind` (NVGPU_HK_*; a host syncobj file, say) as a
+ * guest file: its release CLOSEs the handle. `o_flags`: O_CLOEXEC /
+ * O_NONBLOCK. Returns the new fd. On success the file owns `handle`; on
+ * failure it is closed if `close_on_error`, else still the caller's (an
+ * nvgpu_i2_ops.fd_out hook passes false: the interpreter closes it).
+ */
+int nvgpu_hostfile_install(struct nvgpu_device *dev, u32 handle, u32 kind,
+                           int o_flags, bool close_on_error);
+/* The handle behind guest fd `fd` if it is a host-handle file of `dev` and of
+ * `kind`; -EINVAL for any other file (as the kernel refuses a file that is
+ * not a syncobj, drm_syncobj.c:712), -EBADF for no file. The handle stays the
+ * file's: the caller must not close it. */
+int nvgpu_hostfile_lookup(struct nvgpu_device *dev, int fd, u32 kind,
+                          u32 *handle);
+/* The same, keeping the file referenced -- and so the handle open -- until
+ * the caller's fput(): for a handle about to be sent in a call. ERR_PTR on
+ * failure. */
+struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
+                                 u32 *handle);
+
+/* ───────── nvgpu_fence.c ───────── */
+
+/*
+ * Fences live on the host (DESIGN §6): a guest sync_file this driver makes
+ * wraps an nvgpu host fence, a proxy dma_fence for a host sync_file that
+ * signals (with the host's error, if any) when the host's does.
+ */
+
+/* v2 and the backend serves fences: the syncobj and semsurf paths are live. */
+bool nvgpu_fences_enabled(struct nvgpu_device *dev);
+/*
+ * Host sync_file `handle` as a new guest sync_file fd, opened with `o_flags`
+ * (O_CLOEXEC). Takes ownership of `handle` whatever happens: on failure it is
+ * closed. The proxy is watched from the moment it exists, so it signals even
+ * if the host's fence already has.
+ */
+int nvgpu_fence_from_handle(struct nvgpu_device *dev, u32 handle, int o_flags);
+/* The same for an nvgpu_i2_ops.fd_out hook (an ATOMIC out-fence, say): on
+ * failure `handle` is left alone, because the interpreter closes what a
+ * failing hook was given. */
+int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
+                                    int o_flags);
+/*
+ * The host sync_file standing for guest sync_file `fd`, for handing to a
+ * host consumer (IN_FENCE_FD, SEMSURF_FENCE_WAIT, a syncobj import, the
+ * Wayland proxy). Returns:
+ *   0  *handle names it. *owned false: it is the proxy's own handle (one of
+ *      our fences) -- pass it, never close it; *owned true: a new handle made
+ *      for this call (a merge of our fences) -- pass it with
+ *      NVGPU_I2_FD_CONSUME, or close it.
+ *   1  already signalled: nothing to wait for (the caller sends "no fence",
+ *      or a signalled stand-in if the field cannot be empty).
+ *  <0  -EINVAL for a descriptor that is not a sync_file; -ERESTARTSYS if a
+ *      signal came while waiting (below); transport errors.
+ * A fence the host cannot see -- another guest driver's, sw_sync -- is
+ * waited for here, interruptibly and without a timeout, and then reported as
+ * signalled: the host has no fence to wait on in its place.
+ */
+int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
+                          bool *owned);
+/* The core syncobj ioctls (0xBF-0xCF), when nvgpu_fences_enabled(). */
+bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd);
+long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
+                               unsigned int cmd, unsigned long arg);
+/* nvidia-drm SEMSURF_FENCE_* (0x54-0x57), when nvgpu_fences_enabled(). */
+long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
+                               unsigned int cmd, void __user *uarg);
+/* A GEM proxy is going: close what SEMSURF_FENCE_ATTACH moved into other
+ * files for it. */
+void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
 
 /* ═════════════════════════ Protocol v2 internal API ═════════════════════════
  *
@@ -590,6 +666,13 @@ struct nvgpu_i2_call {
   unsigned int cmd;
   void __user *uarg;
   u32 xflags; /* NVGPU_XF_* */
+  /*
+   * `uarg`, and every pointer in the argument, are kernel addresses: a call
+   * the driver builds itself (a syncobj wait turned into a poll, a rewritten
+   * import). Copy-back lands in that kernel memory, and the caller copies to
+   * userspace what the native ioctl would have.
+   */
+  bool kernel;
   const struct nvgpu_i2_ops *ops;
   void *priv;
   /* filled in: */

@@ -61,18 +61,29 @@ impl BackendHooks {
     // ──────────────────────────── FENCES ────────────────────────────
     //
     // Syncobj and nvidia-drm fence calls (policy::FENCE) and ATOMIC's fence
-    // properties. Until fences are served, every one is refused: a syncobj
-    // wait forwarded as it stands would park a host thread for as long as
-    // the guest asked (DESIGN §6).
+    // properties. Fence objects are the host's and the guest holds proxies
+    // (DESIGN §6), so creating, exporting, importing and signalling them is
+    // forwarded as it is. A wait is not: forwarded as it stands it would park
+    // a host thread for as long as the guest asked, so every wait becomes a
+    // poll and the guest sleeps on a shared eventfd registration instead
+    // (`fence::before`, `fence::Registrations`). Stateless here: the
+    // registrations are HOST_OP state, kept by the backend per session.
 
     fn fences_before(&self, p: &mut Prepared) -> Result<(), Errno> {
-        let _ = p;
-        Err(libc::EOPNOTSUPP)
+        let cmd = p.cmd();
+        let arg = p.buffer_mut(0).ok_or(libc::EINVAL)?;
+        crate::fence::before(cmd, arg)
     }
 
+    /// IN_FENCE_FD, OUT_FENCE_PTR and their kin on an ATOMIC commit. `xfer`
+    /// does the translation -- the guest's handle becomes the host sync_file
+    /// it stands for, an out-fence pointer a host s32 whose descriptor is
+    /// adopted -- and refuses a value without its record; neither waits on
+    /// anything (the commit's own fence waits are the display engine's,
+    /// nvidia-drm-modeset.c:160-315), so each is allowed.
     fn fences_atomic_prop(&self, p: &Prepared, kind: PropKind, name: &[u8]) -> Result<(), Errno> {
         let _ = (p, kind, name);
-        Err(libc::EOPNOTSUPP)
+        Ok(())
     }
 
     // ──────────────────────────── NVKMS ────────────────────────────
@@ -133,6 +144,106 @@ impl Hooks for BackendHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hostfd::HandleKind;
+    use crate::schema::SchemaClass;
+    use std::os::fd::OwnedFd;
+
+    const RENDER: u32 = 20;
+
+    /// Just enough backend for `xfer::prepare` to reach the hooks: one render
+    /// handle, and this module's policy.
+    struct Env;
+
+    impl xfer::Env for Env {
+        fn dup_handle(&self, handle: u32) -> Option<(OwnedFd, HandleKind)> {
+            (handle == RENDER).then(|| {
+                let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+                (fd, HandleKind::DriRender(0))
+            })
+        }
+
+        fn kind(&self, handle: u32) -> Option<HandleKind> {
+            (handle == RENDER).then_some(HandleKind::DriRender(0))
+        }
+
+        fn nvkms_version(&self) -> Option<abi::version::DriverVersion> {
+            None
+        }
+
+        fn hooks(&self) -> Arc<dyn Hooks> {
+            BackendHooks::shared()
+        }
+    }
+
+    /// An IOCTL2 payload with one IN/OUT argument and no pointers followed.
+    fn flat(cmd: u32, arg: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        let data_len = arg.len().next_multiple_of(8) as u32;
+        for v in [cmd, 0, 1, 0, 0, 0, data_len, RENDER, arg.len() as u32] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p.extend_from_slice(arg);
+        p.resize(p.len() + data_len as usize - arg.len(), 0);
+        p
+    }
+
+    fn prepare(cmd: u32, arg: &[u8]) -> Result<Prepared, Errno> {
+        xfer::prepare(
+            &Env,
+            SchemaClass::Render,
+            RENDER,
+            HandleKind::DriRender(0),
+            &flat(cmd, arg),
+        )
+    }
+
+    #[test]
+    fn a_syncobj_wait_reaches_the_host_as_a_poll() {
+        // count_handles 0, so the handles pointer takes no buffer.
+        let mut a = [0u8; 40];
+        a[8..16].copy_from_slice(&i64::MAX.to_le_bytes());
+        let p = prepare(crate::fence::SYNCOBJ_WAIT, &a).unwrap();
+        assert_eq!(&p.buffer(0).unwrap()[8..16], &[0; 8]);
+    }
+
+    #[test]
+    fn fence_calls_that_do_not_wait_are_forwarded() {
+        let create = crate::hostfd::ioc(crate::hostfd::IOC_RW, b'd', 0xbf, 8);
+        assert!(prepare(create, &[0; 8]).is_ok());
+        let transfer = [0u8; 32];
+        assert!(prepare(crate::fence::SYNCOBJ_TRANSFER, &transfer).is_ok());
+    }
+
+    #[test]
+    fn fence_calls_that_would_wait_or_leak_are_refused() {
+        let mut transfer = [0u8; 32];
+        transfer[24] = crate::fence::WAIT_FOR_SUBMIT as u8;
+        assert_eq!(
+            prepare(crate::fence::SYNCOBJ_TRANSFER, &transfer).err(),
+            Some(libc::EINVAL)
+        );
+        // SYNCOBJ_EVENTFD: an fd field, "none" here, so it gets as far as the
+        // policy -- which never lets it through.
+        let mut eventfd = [0u8; 24];
+        eventfd[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(
+            prepare(crate::fence::SYNCOBJ_EVENTFD, &eventfd).err(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[test]
+    fn atomic_fence_properties_are_allowed_now_that_fences_are_served() {
+        let h = BackendHooks::new();
+        let create = crate::hostfd::ioc(crate::hostfd::IOC_RW, b'd', 0xbf, 8);
+        let p = prepare(create, &[0; 8]).unwrap();
+        for (kind, name) in [
+            (PropKind::FenceFd, &b"IN_FENCE_FD"[..]),
+            (PropKind::OutPtr, b"OUT_FENCE_PTR"),
+        ] {
+            assert_eq!(h.atomic_fence_prop(&p, kind, name), Ok(()));
+        }
+    }
 
     #[test]
     fn properties_are_classified_as_the_defaults_classify_them() {

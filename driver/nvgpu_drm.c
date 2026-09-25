@@ -75,6 +75,11 @@ static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
 #define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
 #define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
 #define DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID 0x18 /* abs nr 0x58 */
+/* Semaphore-surface fences, nvgpu_fence.c. */
+#define DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE 0x14 /* abs nr 0x54 */
+#define DRM_NVIDIA_SEMSURF_FENCE_CREATE 0x15     /* abs nr 0x55 */
+#define DRM_NVIDIA_SEMSURF_FENCE_WAIT 0x16       /* abs nr 0x56 */
+#define DRM_NVIDIA_SEMSURF_FENCE_ATTACH 0x17     /* abs nr 0x57 */
 
 /*
  * The GEM ioctls, which are what a swapchain is made of: allocate or import
@@ -264,6 +269,17 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     info[3] = nvgpu_claim_alloc;   /* supports_alloc */
     info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
     info[8] = 0;                   /* supports_semsurf */
+    /*
+     * With the backend serving fences, 0x54..0x57 are forwarded
+     * (nvgpu_fence.c) and both bits are the host's truth again. They go
+     * together: nvidia-drm sets both from one condition, semsurf_stride != 0
+     * (nvidia-drm-drv.c:1086-1117), so no userspace has ever seen one
+     * without the other.
+     */
+    if (nvgpu_fences_enabled(nfd->dev)) {
+      info[7] = 1;
+      info[8] = 1;
+    }
 
     /*
      * primary_index is the number of the DRM node this device is, and it has
@@ -317,6 +333,17 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
   case DRM_NVIDIA_DMABUF_SUPPORTED:
     return 0; /* not supported, no payload */
+
+  /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c).
+   * Only with the backend serving fences, which is also the only time
+   * GET_DEV_INFO says they exist. */
+  case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
+  case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
+  case DRM_NVIDIA_SEMSURF_FENCE_WAIT:
+  case DRM_NVIDIA_SEMSURF_FENCE_ATTACH:
+    if (!file || !nvgpu_fences_enabled(nfd->dev))
+      return -ENOTTY;
+    return nvgpu_fence_semsurf_ioctl(nfd, file, cmd, uarg);
 
   /*
    * ── GEM: forwarded to the host's render node ──
@@ -481,6 +508,9 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 static void nvgpu_gem_free(struct drm_gem_object *obj) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
 
+  /* The handles SEMSURF_FENCE_ATTACH gave this object in other files go
+   * first: each holds the host object too, and a reference on its file. */
+  nvgpu_fence_gem_free(ng);
   if (ng->dev && ng->host_handle)
     nvgpu_gem_close(ng->dev, ng->owner_handle, ng->host_handle);
 
@@ -897,6 +927,19 @@ int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
 
   drm_gem_object_put(obj);
   return ret;
+}
+
+struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
+                                          u32 guest_handle) {
+  struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
+
+  if (!obj)
+    return NULL;
+  if (obj->funcs != &nvgpu_gem_funcs) {
+    drm_gem_object_put(obj);
+    return NULL;
+  }
+  return to_nvgpu_gem(obj);
 }
 
 /*
@@ -1319,6 +1362,14 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
         return -ENODEV;
       return nvgpu_drm_handle_ioctl(nfd, dri, file, cmd, arg);
     }
+
+    /*
+     * Syncobjs are the host's, in the file's render node (nvgpu_fence.c).
+     * Only with the backend serving them; otherwise the core answers, and
+     * with DRIVER_SYNCOBJ cleared for this device it answers -EOPNOTSUPP.
+     */
+    if (nvgpu_fence_is_syncobj_ioctl(cmd) && nvgpu_fences_enabled(nfd->dev))
+      return nvgpu_fence_syncobj_ioctl(nfd, file, cmd, arg);
 
     /*
      * Core DRM, answered by the core against this node's own state. That is

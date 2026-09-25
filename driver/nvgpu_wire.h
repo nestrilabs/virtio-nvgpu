@@ -368,6 +368,10 @@ struct nvgpu_unwatch_req {
 #define NVGPU_OP_OPEN_KMS 7           /* (render handle, card) -> card handle        */
 #define NVGPU_OP_DROP_IF_MASTER 8     /* (card handle) -> 1 if it was master         */
 #define NVGPU_OP_CLOSE_MANY 9         /* (n, h0..) -> ()                             */
+/* (render, syncobj, point, flags, cookie) -> (reporting cookie, joined): one
+ * shared SYNCOBJ_EVENTFD registration per (file, syncobj, point, flags),
+ * reported once as EV_READY; -EAGAIN over the per-VM cap (device/src/fence.rs) */
+#define NVGPU_OP_SYNCOBJ_WATCH 10
 
 #define NVGPU_OP_MAX_ARGS 6
 #define NVGPU_OP_MAX_RES 4

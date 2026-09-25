@@ -81,6 +81,7 @@ struct nvgpu_i2_out {
 struct nvgpu_i2_state {
   const struct nvgpu_stable *t;
   const struct nvgpu_sioctl *e;
+  bool kernel; /* nvgpu_i2_call.kernel: every address is a kernel one */
   u32 nbuf, nslot, nfd, ngem, ndyn, nfdo, ngemo;
   size_t in_bytes, out_bytes; /* request / reply data, padded */
   struct nvgpu_i2_kbuf buf[NVGPU_I2_MAX_BUFS];
@@ -223,7 +224,15 @@ static int nvgpu_i2_new_buf(struct nvgpu_device *dev,
       return -ENOMEM;
   }
   *out = st->nbuf++;
-  if ((dir & NVGPU_SDIR_IN) && len && copy_from_user(kb->k, uptr, len))
+  if (!(dir & NVGPU_SDIR_IN) || !len)
+    return 0;
+  /* A call the driver makes itself, on memory it built (nvgpu_i2_call.kernel):
+   * the caller wrote every address in it, so none is a user's to check. */
+  if (st->kernel) {
+    memcpy(kb->k, (const void __force *)uptr, len);
+    return 0;
+  }
+  if (copy_from_user(kb->k, uptr, len))
     return -EFAULT;
   return 0;
 }
@@ -875,8 +884,11 @@ static int nvgpu_i2_copy_back(struct nvgpu_i2_call *call) {
       nvgpu_i2_copy_extent(kb->f, kb->dir, kb->len, call->ret, kb->sent, left,
                            &start, &end);
     }
-    if (end > start &&
-        copy_to_user(kb->uptr + start, kb->k + start, end - start))
+    if (end <= start)
+      continue;
+    if (st->kernel)
+      memcpy((void __force *)kb->uptr + start, kb->k + start, end - start);
+    else if (copy_to_user(kb->uptr + start, kb->k + start, end - start))
       fault = -EFAULT;
   }
   return fault;
@@ -966,6 +978,7 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
     return -ENOMEM;
   call->st = st;
   call->ret = 0;
+  st->kernel = call->kernel;
 
   ret = nvgpu_i2_gather(call);
   if (ret)

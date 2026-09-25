@@ -568,6 +568,10 @@ pub const OP_SIGNALED_SYNC_FILE: u32 = 6;
 pub const OP_OPEN_KMS: u32 = 7;
 pub const OP_DROP_IF_MASTER: u32 = 8;
 pub const OP_CLOSE_MANY: u32 = 9;
+/// (render, syncobj, point, flags, cookie) -> (reporting cookie, joined):
+/// a shared, capped SYNCOBJ_EVENTFD registration reported as EV_READY
+/// (device/src/fence.rs). -EAGAIN over the per-VM cap.
+pub const OP_SYNCOBJ_WATCH: u32 = 10;
 
 pub const OP_MAX_ARGS: usize = 6;
 pub const OP_MAX_RES: usize = 4;
