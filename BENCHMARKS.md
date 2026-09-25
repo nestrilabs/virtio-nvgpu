@@ -7,6 +7,12 @@ The short version: **above about 2 ms a frame, a guest renders within 2% of the
 same machine's bare metal, and costs the same CPU.** Below that, the cost of
 waiting for the GPU dominates a frame that barely exists.
 
+**Every run here predates protocol v2** — the transport the display work is
+built on, and the security changes that came with it, including a memory type
+per mapping and guest system memory made cacheable and GPU-coherent. None has
+been re-taken since. The display paths have not been measured at all;
+[Display: not measured yet](#display-not-measured-yet) says what will be.
+
 ## What was measured, and how
 
 `nesprobe` — the calibrated headless load probe from
@@ -128,6 +134,45 @@ with p99 spacing of 18.0 ms. An earlier version of this file reported 53 and
 called it an open question; that was a bug of ours in the event queue, described
 below, and not a property of the design.
 
+## Display: not measured yet
+
+Nothing in the display work has run on a GPU, so there is no number for it
+here, and none should be quoted. Three things are worth knowing before one is.
+
+**What a present should cost is reasoned, not observed.** A render loop still
+crosses nothing. A present, in each mode, is a real call with a real answer:
+Wayland messages to the host compositor and its replies; an atomic commit or
+page flip on a leased output, and the flip event that comes back; an NVKMS flip
+per present on the `VK_KHR_display` path. So a small, fixed number of
+crossings per present is expected. A number that grows with frame rate, or any
+crossing per draw, would be a failure.
+
+**What [`TESTING.md`](TESTING.md) will measure**, in the discipline of this
+file — 30 s after an 8 s discard, the backend's own message tally rather than
+an estimate, guest against its own host minutes apart:
+
+- **crossings per present**, for a Wayland-presenting workload and a
+  display-presenting one separately, split by message type as the backend's
+  tally counts them (IOCTL2, WL_SEND and WL_RECV, HOST_OP, WATCH and the
+  rest), and cross-checked against an `strace` count of the backend's syscalls
+  over the same window. The tally goes no finer than the message type, and is
+  printed once, when the backend shuts down: commits, flips and syncobj waits
+  are all IOCTL2, and DRM events are records the backend sends rather than
+  messages it serves, so it does not count them. Telling those apart needs a
+  per-ioctl or per-event counter that does not exist yet, or the `strace`
+  count. The offscreen load's ~0.02 per frame above is not a per-present
+  figure, because it never presents;
+- **frame pacing** on a leased output — the mean, minimum and maximum
+  interval between flips, which should sit at the monitor's refresh period
+  with a tight spread;
+- **frame pacing** through the host compositor, as arrival spacing at the
+  receiver in the style of the whole-chain measurement above, and the number of
+  frames arriving more than ~25 ms after the one before.
+
+**Re-taking the numbers above on protocol v2** is a separate job, and has not
+been done. Nothing in the render path was meant to change, but the memory
+types did, which is exactly the kind of change a benchmark should confirm.
+
 ## Re-taking these
 
 The harnesses are in the private engineering notes rather than here, because
@@ -160,6 +205,8 @@ slower each run — and that is how a harness bug here cost a full set of number
   has a guest doing something heavier than vkcube at 720p.
 - **No claim about a real game.** `nesprobe` is synthetic; the only real
   pipeline here is our own encode chain.
+- **Nothing about protocol v2, or about display.** Every run predates the one
+  and none touched the other.
 - **One card, one driver.** RTX 3060 at **595.99.02**, which resolves to the
   `595.71.05` ABI profile. An RTX A2000 at **615.71.09** renders but has not
   been benchmarked. The shipped profiles are 535.129.03, 580.178.04 and

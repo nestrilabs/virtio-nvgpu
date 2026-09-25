@@ -8,6 +8,21 @@ NVIDIA's kernel driver ABI is not stable — ioctl struct layouts change between
 releases. The tables here map driver versions to struct layouts and to the set
 of commands that exist and are safe to forward.
 
+There are several, each with its own generator:
+
+| table | from | what it is | section |
+|---|---|---|---|
+| `src/versions/*.rs` | `nvabi_gen.py`, gVisor's nvproxy | the ABI profiles: RM escape parameter sizes and kinds | [The generator](#the-generator) |
+| `schema/*.py` → `src/schema/generated.rs`, `../driver/gen/nvgpu_schema.h` | `schema_gen.py` | the IOCTL2 schema both halves interpret: DRM render and KMS, nvidia-drm, NVKMS per release, UVM block sizes | [The IOCTL2 schema](#the-ioctl2-schema) |
+| `nvkms/*.json` | `nvkms_extract.py` | NVKMS and nvidia-drm ioctl layouts, per release | [NVKMS and nvidia-drm layouts](#nvkms-and-nvidia-drm-layouts) |
+| `rmctrl/*.json` → `src/rmctrl/generated.rs` | `rmctrl_extract.py` | where RM follows a pointer inside a control's parameters, per release | [RM control pointers](#rm-control-pointers) |
+| `uvm/*.json` | `uvm_extract.py` | UVM parameter block sizes and descriptor offsets, per release | [UVM parameter blocks](#uvm-parameter-blocks) |
+| `../driver/gen/nvgpu_rmalloc_classes.h`, `nvgpu_v1v2_rewrites.h` | `nvgpu_gen.py` | the guest module's RM class and rewrite tables | — |
+
+The profiles key off a range of releases; the NVKMS, nvidia-drm, RM control and
+UVM tables are measured per release, because the layouts they describe move
+more often.
+
 Two halves, with different risk:
 
 - **The struct half is derived mechanically** from NVIDIA's published
@@ -26,7 +41,7 @@ The generator must stay runnable by someone who does not work on this project.
 
 ## The generator
 
-Two scripts, no build system, no Go toolchain. gVisor is a Bazel project and
+The ABI profiles come from two scripts, no build system, no Go toolchain. gVisor is a Bazel project and
 `go build` on it fails without generated code, so these read its sources
 directly rather than linking against it.
 
@@ -71,6 +86,65 @@ at 64.
 A fixture is only evidence for the driver version and architecture that
 produced it. RM class IDs are per-architecture, so a Turing capture says
 nothing about Ampere's channel classes.
+
+## The IOCTL2 schema
+
+Protocol v2 sends an ioctl whose argument points at more memory, or names a
+descriptor or a GEM handle, as one IOCTL2 (ARCHITECTURE.md §10). The guest
+gathers the caller's buffers by a table; the backend walks its own copy of the
+same table over what it received and refuses anything that disagrees. The two
+copies must never differ, so they come from one source:
+
+- `schema/lang.py` — the schema language: pointers with a direction, a length
+  rule and a copy-back rule; inline arrays; descriptors in and out; GEM
+  handles in and out; conditions; and the *canonical traversal* both sides use
+  to number buffers
+- `schema/drm_render.py`, `schema/drm_kms.py`, `schema/nvidia_drm.py`,
+  `schema/nvkms.py` — the entries: DRM render-node and KMS ioctls, nvidia-drm's
+  private ones, and NVKMS, one table per release converted from `nvkms/`
+- `schema/formats.py` — plane counts per pixel format, for framebuffer checks
+- `schema/uvm.py` — UVM block sizes per range of releases, from `uvm/`
+
+```sh
+./schema_gen.py                 # regenerate both tables in place
+./schema_gen.py --out DIR       # write them under DIR instead
+./schema_gen.py --probe DIR     # write C probes asserting every size and offset
+```
+
+The generator checks the schema before it writes anything — every field inside
+its struct, no two fields overlapping unless their conditions exclude each
+other, every count readable where it is read, every pointer capped — and a
+schema that fails is a bug in the schema. The probes are `_Static_assert`s of
+every size, offset, ioctl number and fourcc the schema states, to be compiled
+against the kernel's uapi headers and the host release's
+`open-gpu-kernel-modules`; the script's docstring has the command. The Rust
+test `the_checked_in_tables_are_what_the_generator_writes` regenerates into a
+temporary directory and compares, so an edit to the Python that was not
+regenerated and committed fails the build's tests.
+
+## NVKMS and nvidia-drm layouts
+
+`nvkms_extract.py` compiles, for each release, where every pointer,
+descriptor and GEM handle sits in NVKMS's and nvidia-drm's private ioctls, the
+size of every parameter block and of its request and reply halves, and the
+fields the backend's NVKMS policy has to read or rewrite. It reads the
+release's own headers and dispatch tables, fetched from
+`open-gpu-kernel-modules` at the tag, and writes `nvkms/<release>.json`. It
+fails loudly rather than guess, and `selftest` proves the refusals still fire.
+
+```sh
+./nvkms_extract.py all        # fetch + extract every release
+./nvkms_extract.py check      # regenerate and fail if nvkms/ is stale
+./nvkms_extract.py selftest
+```
+
+Releases measured: 535.129.03, 580.178.04 and 595.71.05 (the ABI profiles),
+595.99.02 (the RTX 3060 every benchmark comes from), 610.57.04 (the tree the
+display work was written against) and 615.71.09 (the RTX A2000). A host between
+two uses the older table; an NVKMS command whose layout moved in the next
+release measured runs only on the exact release. Command numbers are never
+carried from one release to another: REGISTER_SURFACE is 16 in some and 17 in
+others. [`nvkms/README.md`](nvkms/README.md) has the format and the method.
 
 ## RM control pointers
 
@@ -130,6 +204,7 @@ which the backend holds each block to. A command with no row is refused by
 both. The ranges run from each release to the next measured one, as the
 NVKMS tables' do, but here that is checked rather than assumed: `scan`
 measures every published tag and fails if one differs from the table it
-would get. Besides the six ABI releases, `VERSIONS` has the four where it
-found a change (550.40.53, 565.57.01, 580.65.06, 590.44.01). Sources are
+would get. Besides the six measured releases (the three ABI profiles,
+595.99.02, 610.57.04 and 615.71.09), `VERSIONS` has the four where it found a
+change (550.40.53, 565.57.01, 580.65.06, 590.44.01). Sources are
 cached in `$UVM_EXTRACT_CACHE` (default `$TMPDIR/ogkm-uvm`).
