@@ -73,10 +73,14 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   privilege from the backend's credentials (`FINDINGS.md` S-5), and the backend
   refuses to start as root. `scripts/run-guest.sh` runs as root itself (for the
   VMM) and starts the backend through `setpriv` as an unprivileged user, with the
-  groups `video`, `render` and `kvm`, no capabilities and `no_new_privs`: the
-  system user `nvgpu` by default (`useradd --system --no-create-home --shell
-  /usr/sbin/nologin nvgpu`), the owner of the compositor's socket in the Wayland
-  modes, and the owner of the export socket's directory in export mode.
+  groups `video`, `render` and `kvm`, no capabilities and `no_new_privs`: a
+  user of the VM's own from the pool `nvgpu-vm0`, `nvgpu-vm1`, ... by default
+  (the `useradd` loop is at the top of the script; the VMM runs under nesbox's
+  jailer as the slot's `nvgpu-vmmN`), the owner of the compositor's socket in
+  the Wayland modes, and the owner of the export socket's directory in export
+  mode. The backend then sandboxes itself (network namespace, Landlock,
+  seccomp); a line `sandbox: DEGRADED` in its log says a layer is missing, and
+  `NVGPU_SANDBOX=off` turns it off to rule it out.
   `NVGPU_USER=…` picks another; `NVGPU_USER=root NVGPU_ALLOW_ROOT_UNSAFE=1` is
   the only way to run it as root, for ruling the credentials out, never for a
   test whose result you will keep. Every mode below is started through the

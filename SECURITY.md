@@ -117,9 +117,13 @@ and without `--allow-compute`", §3).
   the call.
 - The host NVIDIA driver is in the TCB. There is no IOMMU boundary between
   guest GPU work and the host.
-- The backend is unsandboxed. There is no seccomp, no landlock, no namespace
-  and no cgroup (it raises its own RLIMIT_NOFILE to the hard limit, and
-  sizes its handle table from it), and the per-guest isolate is not built.
+- The backend sandboxes itself before the first guest message -- a network
+  namespace, Landlock, a seccomp allowlist (§4, "The backend's sandbox") --
+  and, run as root, each VM's backend and VMM are host users of their own
+  (§4, "One uid per VM"). What neither touches is the GPU (RM's page tables
+  keep VMs apart there) and the host kernel the backend still calls. There is
+  no cgroup of the backend's own (the launcher's `NVGPU_MEMORY_MAX` scope
+  holds the whole run), and the per-guest isolate is not built.
 - One VM's budgets are split among its guest processes (§11, quota.rs), but
   a guest process that forks is a new process with a share of its own: the
   guest's own process limits are what bound a forking app.
@@ -142,7 +146,7 @@ and without `--allow-compute`", §3).
 | **guest kernel and all guest userspace** | **no** | One VM is one trust domain. Anything that protects the host is enforced by the backend from its own tables, never from a layout the guest describes. Separating guest users from each other is the guest kernel's job; the checks the guest module makes (the `/dev/nvgpu-wl` mode, the ACCEPT uid check) hold only while the guest kernel does. |
 | **host compositor** (Hyprland, with `patches/`) | yes | It decides what a proxied client may do within the allowlist, and it holds the leases it grants. The backend does not defend against it, but it does not trust it for descriptor types: every descriptor the compositor sends is classified by what the kernel says it is. |
 | **export-mode peers** (host programs on the `--wayland-export` socket) | partly | They must have the backend's uid (`SO_PEERCRED`, `device/src/wl/export.rs`), and their messages go through the same allowlist. A program that connects makes the guest compositor its Wayland server, and a server can type into its clients: connect only programs the guest may drive. The backend is undumpable, so a same-uid peer cannot ptrace it. |
-| **the backend** (`vhost-user-nvgpu`, one process per VM) | **in the TCB** | It maps all of the guest's RAM, holds every host descriptor the guest uses, and is the caller of every host ioctl. Whatever compromises it has that VM's host files and the backend user's privileges. |
+| **the backend** (`vhost-user-nvgpu`, one process per VM) | **in the TCB** | It maps all of the guest's RAM, holds every host descriptor the guest uses, and is the caller of every host ioctl. Whatever compromises it has that VM's host files and what the backend's sandbox leaves it (§4): the GPU's nodes, a few read-only files, the syscalls on its list, as a uid of that VM's own when run as root. |
 | **the VMM** | yes | It hands the backend the guest's memory. |
 | **the host NVIDIA driver** (nvidia, nvidia-uvm, nvidia-modeset, nvidia-drm, GSP firmware) | **in the TCB** | The card is in the host's IOMMU domain. What keeps a guest's GPU work in its own memory is the GPU's MMU, with page tables RM programs for it. |
 | **the host kernel** (DRM core, syncobj, dma-buf, memfd) | yes | The backend relies on its checks for everything §7 does not list. |
@@ -465,9 +469,9 @@ removed, since nothing can say whether RM took it.
 
 | | dev | HEAD |
 |---|---|---|
-| identity | whoever started it. The shipped `scripts/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher starts it through `setpriv` as the system user `nvgpu`, in the groups video, render and kvm, with no capabilities and no_new_privs. With `--wayland-socket` it runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. |
+| identity | whoever started it. The shipped `scripts/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher, as root, gives each VM a slot of a user pool: the backend runs through `setpriv` as `nvgpu-vmN`, in the groups video, render and kvm, with no capabilities and no_new_privs, and the VMM under nesbox's jailer as `nvgpu-vmmN` (below, "One uid per VM"). With `--wayland-socket` the backend runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. Unprivileged (the rig), both are the invoking user. |
 | capabilities | whatever it was given | All dropped before the first thread exists (effective, permitted, inheritable, ambient, and the bounding set where it may), then no_new_privs, undumpable, umask 077. This holds under `--allow-root-unsafe` too, and RM decides administrator by `capable(CAP_SYS_ADMIN)` (`nv-linux.h`), so even then RM sees none. What root keeps is file access by uid. |
-| sandbox | none | **none**: no seccomp, landlock, namespaces or cgroup. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
+| sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED`; `--sandbox=off` is for diagnosis. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
 
 ### Threads and resource caps
 
@@ -481,6 +485,107 @@ removed, since nothing can say whether RM took it.
 | window | the zones, first come first served | each zone (UC 32 MiB, WC 768 MiB, WB 224 MiB) at most half per guest process, the last eighth kept for processes holding at most a sixteenth; a mapping is charged to whoever opened the file it is armed on |
 | Wayland caps | -- | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools, shared by all its connections. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
 | not capped | -- | Memory outside the Wayland and window budgets has no limit, and no cgroup. Several VMs of one backend user share that user's host limits. |
+
+### The backend's sandbox
+
+`device/src/sandbox.rs`, applied from `vhost-user-nvgpu`'s `main` after the
+capability drop and before anything else: before the backend's second thread
+(a user namespace can be entered only by a process with one, and Landlock and
+seccomp reach the calling thread and what it creates), and before the first
+guest message. What it cannot reopen later is opened first: the vhost-user
+listener, the export listener, the uevent socket, and RLIMIT_NOFILE raised.
+
+| layer | what it enforces | on a kernel without it |
+|---|---|---|
+| network | a network namespace with nothing but loopback. As root the launcher makes it (`unshare --net`); otherwise the backend unshares a user namespace and a network namespace together, maps only its own uid and gid onto themselves (so every uid check, its own and the kernel's, is unchanged; supplementary groups keep working, being kernel ids), and drops again the capabilities the new namespace gave it. Every socket the backend uses is a path or was opened before | unprivileged user namespaces off (`user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, AppArmor's userns restriction): the backend keeps the host's network, `DEGRADED` |
+| Landlock | opens only: `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidiaN`, `/dev/nvidia-uvm{,-tools}` with `--allow-compute`, `/dev/udmabuf`, `/dev/null`, and this GPU's render nodes (card nodes with `--kms-card`), read, write and ioctl; `--proc-nvidia`, `/proc/self`, `/proc/cpuinfo` and each GPU's PCI directory in sysfs, read-only. Connects only to the compositor's socket and its own export socket (ABI 9). No file written, created or removed anywhere; no signal to, or abstract socket of, a process outside it (ABI 6); no TCP or UDP (ABI 4, 10). A node made after start is out of reach | no Landlock: every file and socket of the uid, `DEGRADED`; ABI below 9: other pathname sockets reachable, below 6: signals to the uid's other processes, `DEGRADED` either way |
+| seccomp | 84 syscalls. Threads but no processes (`clone` only with CLONE_THREAD and no namespace flag; `clone3` answered ENOSYS, which the C library falls back from); no PROT_EXEC in `mmap` or `mprotect`; `socket` and `socketpair` AF_UNIX only; `ioctl` anything but TIOCSTI and TIOCLINUX (which descriptor a call is on is not visible to a filter); `prctl` only to name threads and read; `tgkill` only this process; `prlimit64` only its own; the SIGSYS handler cannot be replaced (a kill); `unlink` answered EPERM. Absent: `execve`, `ptrace`, `process_vm_*`, `mount`, `unshare`, `setns`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `keyctl`, `kill`, `bind`, `listen`, and the rest. A syscall not on the list stops the process: the log gets `sandbox: syscall N is not on the seccomp allowlist` and the exit status is 159 | no seccomp filters: every syscall, `DEGRADED` |
+| limits | RLIMIT_CORE 0 over undumpable and no_new_privs | -- |
+
+Each start logs one line per layer, `sandbox: DEGRADED: ...` at warning level
+for one not fully in force, and `sandbox: every layer in force` when all are;
+the unit tests (`sandbox::tests`) fork children that apply the filter, the
+Landlock domain and the whole sandbox, check that the backend's own
+operations still work under them, and that a forbidden call, a process
+clone, an executable mapping, an IP socket, PR_SET_DUMPABLE, replacing the
+SIGSYS handler and TIOCSTI each stop the child; on a host with the driver,
+one also checks that the GPU's run-time paths stay open under the plan and
+that `/dev/kvm`, other sysfs and the host's files do not. The list was taken from the
+code, from strace of the unit tests and of a real start and vhost-user
+session against the fake-host fixture; a path only the GPU exercises that
+needs a syscall not on it shows up as that log line, on the device. What it
+does not stop: a backend taken over still has the GPU's nodes and every
+ioctl on them (RM, NVKMS, DRM, UVM: the host kernel's GPU surface, §3), the
+guest's memory, and the host kernel's syscalls on the list. It is a bound on
+what one VM's compromised backend reaches outside that surface: other VMs'
+files and sockets, the user's files, the network, other processes.
+
+### One uid per VM
+
+Run as root, `scripts/run-guest.sh` takes a free slot N of a pool made once
+with `useradd` (the script's header): `nvgpu-vmN` runs the backend, and
+`nvgpu-vmmN`, whose group is `nvgpu-vmN`'s, runs the VMM under nesbox's jailer
+(chrooted into a jail image built for the run, a mount namespace of its own,
+no supplementary groups, no_new_privs). The backend's socket is 0660 in the
+slot's group, so the VMM reaches it and nobody else does. Both run in network
+namespaces of their own. A slot is free when no launcher holds its lock and
+neither user has a live process. Where there is no pool the launcher falls
+back to the one user `nvgpu`, and without a jailer to a root VMM, each with a
+warning. A uid of its own per VM separates two VMs' host processes by the
+kernel's oldest rules, independent of anything this project wrote:
+
+- **Signals.** kill(2) needs the sender's uid to match the target's (or
+  CAP_KILL): one VM's backend or VMM cannot stop, or feed a signal to,
+  another's.
+- **ptrace and `/proc/<pid>/mem`.** Attaching, and reading or writing another
+  process's memory through `/proc` or `process_vm_*`, needs every uid and gid
+  of the two to match (or CAP_SYS_PTRACE), before the dumpable flag or Yama
+  (`kernel.yama.ptrace_scope`, 1 on this host: descendants only) are even
+  asked. The backend is also undumpable, which keeps a same-uid process out;
+  nesbox is not, so with a shared uid only Yama keeps a VM's VMM, which maps
+  all of its guest RAM, from being traced by a same-uid process that is its
+  ancestor. With a uid of its own, neither depends on either.
+- **`/proc/<pid>/fd`, and the memory behind it.** Guest RAM, the shared
+  window, shm pools, blobs and dma-bufs are all anonymous: no path names them,
+  and another process can reach one only by being handed the descriptor or
+  through `/proc/<pid>/fd`, `/proc/<pid>/map_files` or `/proc/<pid>/mem`,
+  all of which take the ptrace check above. The UVM aperture and memory
+  registered by its pages live in the VMM's and the backend's own address
+  spaces, behind the same check.
+- **Files and sockets.** The backend's socket directory is 0700 its own; its
+  socket is open to its slot's group alone; the disk copy is 0600 the VMM's.
+  An export socket admits only peers of the backend's uid (`SO_PEERCRED`),
+  which with a uid per VM means only that VM's own. No VM can connect to
+  another's vhost-user socket and take over its guest memory, or to its
+  export socket and drive its compositor.
+- **RM's security token.** RM's token for a host process is its uid (and
+  PID). With one uid, every VM is one principal wherever RM compares tokens:
+  OS_SECURITY_TOKEN shares, NV01_DEVICE_0's `hClientShare` fallback, the
+  profiler's `hClientTarget` and the channel-ID controls (§3). The backend
+  already holds each of those to its own VM's clients, but with a uid per VM
+  RM refuses the cross-VM case itself as well.
+- **Per-user kernel counts.** Processes (RLIMIT_NPROC), user namespaces,
+  inotify instances, pipe buffers and locked memory are counted per uid; one
+  VM running into them no longer does it for another.
+
+What a uid per VM does not do:
+
+- **The GPU.** Every VM's work runs on one GPU; what keeps one VM's GPU
+  memory from another's is RM's per-client page tables and the GPU's MMU (§2),
+  the same for every uid. The device nodes are 0666, so any uid opens them.
+- **The host kernel.** A bug in nvidia.ko, the DRM core, KVM, memfd or
+  anything else a VM's processes can call crosses every uid.
+- **The Wayland modes.** With `--wayland-socket` or `--wayland-export` the
+  backend is the desktop user, as every such VM's is, so between them and the
+  desktop only the backend's sandbox holds (undumpable; Landlock's signal
+  scoping at ABI 6 and socket scoping at ABI 9, which is what keeps one such
+  backend off another's export socket). Their VMMs still take slots.
+- **The rig.** Run unprivileged, one VM's backend and VMM are the invoking
+  user, and share it with the desktop: the VMM, with seccomp but no Landlock,
+  can open whatever the user can; RM sees the user's own token; two VMs
+  started by one user are one principal. Keep a rig for one VM at a time.
+- **Memory.** No cgroup is keyed to the uid; the launcher's scope
+  (`NVGPU_MEMORY_MAX`) bounds a run.
 
 ---
 
@@ -804,13 +909,26 @@ In rough order of weight.
    in any forwarded path, or in RM's page tables for a guest's GPU work, is a
    host bug. For mutually untrusted tenants, VFIO with an IOMMU or vGPU is
    still the answer.
-3. **The backend is unsandboxed.** One process per VM maps all of that
-   guest's RAM, holds every host descriptor, and parses everything in §4.
+3. **The backend's sandbox is only as strong as the kernel under it.** One
+   process per VM maps all of that guest's RAM, holds every host descriptor,
+   and parses everything in §4. Its sandbox (§4) keeps a compromised one to
+   the GPU's nodes and a few read-only files, without a network, on a list of
+   syscalls; ioctl on those nodes is the host kernel's GPU surface, whole.
+   - Each layer degrades on a kernel without it, loudly. Below Landlock ABI 9,
+     other pathname sockets the uid can reach stay reachable, which matters
+     where backends share a uid.
    - With `--wayland-socket` or `--wayland-export` the launcher runs it as the
-     desktop user, so a compromised backend is that user.
-   - In the default mode every VM's backend is the same user, `nvgpu`, so one
-     can signal another.
-   - No seccomp, landlock, namespace, cgroup or rlimit limits any of this.
+     desktop user, so a compromised backend is that user, within the sandbox.
+   - The syscall list was built from the code, the unit tests and a start
+     against the fake host, not from the device: a device path that needs a
+     syscall it lacks stops the backend (status 159, the number logged).
+   - nesbox's own filter allows `openat`, `socket` and `connect`, and nesbox
+     is dumpable; under the jailer (root) that is inside a chroot as a uid of
+     its own, but in the rig it is the user. Its baseline filter covers the
+     UVM aperture's path (`mmap` with MAP_FIXED_NOREPLACE, `mincore`, the
+     memory-slot ioctl); its tighter vCPU filter is defined but never
+     installed, and if it were, the window-request thread a vCPU spawns at
+     DRIVER_OK would inherit it without `clone` or `mincore`.
 4. **The isolate is not built.** `isolate/README.md` describes one helper per
    guest process holding the descriptors. The display paths share objects
    across a VM's processes (a compositor holds its clients' buffers) through
@@ -949,10 +1067,10 @@ In priority order. Cost is a judgement, not a measurement.
    pools, streams and adopted compositor files would all draw from that
    budget, and MAX_HANDLES would come from it rather than a constant (S-16,
    S-7).
-4. **A PID namespace and a user per backend** (`PrivatePIDs=yes`, or `bwrap
-   --unshare-pid`, and a uid per VM). With the namespace, RM filters the
-   host-PID controls itself; `rmctl.rs` then stays as a second fence. With a
-   uid per VM, one backend cannot signal another. For the Wayland modes, give
+4. **A PID namespace per backend** (`PrivatePIDs=yes`, or `bwrap
+   --unshare-pid`). With the namespace, RM filters the host-PID controls
+   itself; `rmctl.rs` then stays as a second fence. (A uid per VM is done:
+   §4, "One uid per VM".) For the Wayland modes, give
    the backend a `wp_security_context_v1` socket from the desktop session
    rather than running it as the desktop user. Hyprland then filters globals
    for those clients itself (`filterGlobals`, `src/Compositor.cpp`). Its list
@@ -966,12 +1084,10 @@ In priority order. Cost is a judgement, not a measurement.
    `gen/rmallow_extract.py` from them -- NVENC, NVDEC and Vulkan Video first,
    which no run has exercised. After that, holding each control to the
    classes of the object it is sent to (§12, "What it does not do").
-6. **seccomp and landlock per backend.** The syscall set is small and known:
-   ioctl, mmap, epoll, sendmsg and recvmsg, memfd_create, and a few more.
-   Landlock can confine opens to `/dev/nvidia*`, `/dev/dri/*`, `/dev/udmabuf`,
-   `/proc/driver/nvidia` and sysfs, plus the compositor and vhost-user
-   sockets. Guest opens happen at run time, so these paths stay open for the
-   whole run, and the policy is installed after start-up.
+6. **seccomp and Landlock per backend: done** (§4, "The backend's
+   sandbox"). What is left: run the device stages with it on and extend the
+   list by what they report; an `ioctl` filter by request number per
+   descriptor kind is not possible in a filter, and would take the isolate.
 7. **The isolate**: the host descriptors held by an unprivileged helper apart
    from the process that maps guest RAM, so that a parser bug in the backend no
    longer yields the descriptors, and a driver-call bug no longer yields guest
@@ -984,8 +1100,8 @@ In priority order. Cost is a judgement, not a measurement.
    - forcing non-privileged RM clients, as a second
      fence against a privileged backend;
    - translating EXPORT_TO_DMABUF_FD, once something needs it.
-9. **What the `harden` audit left open (§11).** A uid per VM in the
-   launcher; the UVM aperture carved out of the VMM's address space before
+9. **What the `harden` audit left open (§11).** (A uid per VM in the
+   launcher is done.) The UVM aperture carved out of the VMM's address space before
    guest RAM is mapped (F3); a caller's process on IOCTL2 (R4); fair queuing
    per guest file (B6); the remaining VM-wide pools split per process (B7);
    a security context per Wayland channel (W4).

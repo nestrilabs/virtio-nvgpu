@@ -51,6 +51,20 @@ counting PASS/FAIL words: 0 on a PASS and no FAIL, 1 on any FAIL, 2 on
 neither. The other knobs are listed in
 `scripts/run-guest.sh --help`.
 
+The rig runs one VM, as you: without root there is no other user to be, so
+the backend, nesbox and your desktop share a uid (`scripts/run-guest.sh`'s
+header has what that gives up against a root run, where each VM takes users
+of its own from a pool, and SECURITY.md §4 has what the uids separate). What
+still applies: the backend's sandbox -- a user and network namespace of its
+own, Landlock, seccomp (`device/src/sandbox.rs`) -- and nesbox leaving the
+host's network (`"unshare-network"` in the run's config). A missing kernel
+feature shows as `sandbox: DEGRADED` in `<tag>.backend.log`, and preflight
+warns about both halves. To rule them out when something breaks:
+`NVGPU_SANDBOX=off` for the backend, `NVGPU_VMM_NETNS=0` for nesbox. A
+backend that meets a syscall its list lacks stops with status 159 and the
+line `sandbox: syscall N is not on the seccomp allowlist` in its log; that
+number, and the stage that hit it, are what to report.
+
 To see which probes the image has:
 
 ```sh

@@ -154,6 +154,18 @@ struct Args {
     #[arg(long)]
     keep_guest_coherency: bool,
 
+    /// The process sandbox (device::sandbox): a network namespace of its
+    /// own, Landlock confining it to the GPU's nodes and what it reads at
+    /// run time, a seccomp syscall allowlist, RLIMIT_CORE 0. Installed before
+    /// the first guest message; a layer the host kernel lacks is reported as
+    /// DEGRADED and the backend runs without it.
+    ///
+    /// `off` is for finding out whether the sandbox is what broke something,
+    /// never for running a guest: a backend taken over is then everything
+    /// its uid is.
+    #[arg(long, value_name = "on|off", default_value_t = device::sandbox::Mode::On)]
+    sandbox: device::sandbox::Mode,
+
     /// Compositor-VM mode: offer the host's card nodes to the guest, so a
     /// guest compositor can drive the display.
     ///
@@ -350,7 +362,9 @@ impl Wayland {
         // start, not a guest -ENODEV later.
         let export = match &args.wayland_export {
             Some(p) => {
-                let x = WlExport::bind(p).map_err(|e| {
+                // Bound here, before the sandbox leaves no directory to make a
+                // socket in; its thread starts after (`start_export`).
+                let x = WlExport::bind_idle(p).map_err(|e| {
                     anyhow::anyhow!("--wayland-export {}: cannot listen: {e}", p.display())
                 })?;
                 log::info!("wayland export: host clients connect at {}", p.display());
@@ -1145,6 +1159,11 @@ fn main() -> anyhow::Result<()> {
     };
     posture::clear_socket_path(&socket, euid)
         .map_err(|e| anyhow::anyhow!("socket {}: {e}", socket.display()))?;
+    // Bound now: the sandbox below leaves no directory writable. Not
+    // unlinking first -- the path was just cleared, and a socket someone
+    // else put there since makes the bind fail rather than be shared.
+    let mut listener = vhost::vhost_user::Listener::new(&socket, false)
+        .map_err(|e| anyhow::anyhow!("listen on {}: {e}", socket.display()))?;
 
     log::info!(
         "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
@@ -1161,6 +1180,66 @@ fn main() -> anyhow::Result<()> {
     // behind, and a host client connecting to it would wait on a backend that
     // is gone.
     let _export = ExportGuard(wayland.export.as_ref().map(|(x, _)| x.clone()));
+
+    // What the sandbox would put out of reach is opened first: the uevent
+    // socket (a network namespace of the backend's own hears none), and
+    // the descriptor limit (the handle table is sized from it).
+    let uevents = if args.kms_card || args.wayland_lease {
+        match device::kms::uevent_socket() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("no host hotplug events: uevent socket: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let nofile = posture::raise_nofile()
+        .map_err(|e| log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"))
+        .ok();
+
+    // The sandbox, while this is the only thread (device::sandbox).
+    match args.sandbox {
+        device::sandbox::Mode::On => {
+            let gpus: Vec<String> = host::gpu_slots(&args.proc_nvidia)
+                .iter()
+                .map(|g| {
+                    let end = g
+                        .pci_addr
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(g.pci_addr.len());
+                    String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
+                })
+                .collect();
+            let plan = device::sandbox::Plan::backend(
+                &device::sandbox::BackendPaths {
+                    proc_nvidia: &args.proc_nvidia,
+                    gpus,
+                    compute: args.allow_compute,
+                    kms_card: args.kms_card,
+                    wayland_socket: args.wayland_socket.as_deref(),
+                    export_socket: args.wayland_export.as_deref(),
+                },
+                Path::new("/dev"),
+                Path::new("/sys"),
+            );
+            let report = device::sandbox::apply(&plan);
+            report.log();
+            if report.complete() {
+                log::info!("sandbox: every layer in force");
+            }
+        }
+        device::sandbox::Mode::Off => log::warn!(
+            "sandbox: DEGRADED: --sandbox=off: no network namespace, Landlock or seccomp; \
+             a backend taken over is everything uid {euid} is. For diagnosis only"
+        ),
+    }
+    if let Some((x, _)) = &wayland.export {
+        x.start()
+            .map_err(|e| anyhow::anyhow!("--wayland-export: accept thread: {e}"))?;
+    }
     let config = BackendConfig {
         kms_card: args.kms_card,
         wayland_socket: args.wayland_socket,
@@ -1225,24 +1304,29 @@ fn main() -> anyhow::Result<()> {
                 ticker.forward(cmds);
             }),
         };
-        let listener = device::kms::HotplugListener::spawn_ticking(
-            cards,
-            move |c| {
-                if let PumpCmd::Hotplug { card, flags } = c
-                    && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
-                {
-                    let mut be = sink.nvidia.lock().unwrap();
-                    be.check_leases(Some(card));
-                    let cmds = be.take_pump_cmds();
-                    drop(be);
-                    sink.forward(cmds);
-                }
-                if to_guest {
-                    sink.forward(vec![c]);
-                }
-            },
-            Some(tick),
-        );
+        let listener = uevents
+            .ok_or_else(|| std::io::Error::other("no uevent socket"))
+            .and_then(|sock| {
+                device::kms::HotplugListener::spawn_ticking_on(
+                    sock,
+                    cards,
+                    move |c| {
+                        if let PumpCmd::Hotplug { card, flags } = c
+                            && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
+                        {
+                            let mut be = sink.nvidia.lock().unwrap();
+                            be.check_leases(Some(card));
+                            let cmds = be.take_pump_cmds();
+                            drop(be);
+                            sink.forward(cmds);
+                        }
+                        if to_guest {
+                            sink.forward(vec![c]);
+                        }
+                    },
+                    Some(tick),
+                )
+            });
         if let Ok(l) = &listener {
             shared
                 .nvidia
@@ -1275,16 +1359,15 @@ fn main() -> anyhow::Result<()> {
              objects by handle. Remove the registry override (NVreg_RegistryDwords) and \
              reload the driver"
         ),
-        Err(e) => log::warn!("could not ask the host's RM whether it validates clients strictly: {e}"),
-    }
-    // Every guest process's descriptors are this process's: take the whole
-    // of the hard limit, and size the handle table from it (B1).
-    match posture::raise_nofile() {
-        Ok(n) => {
-            let shared = backend.read().expect("backend lock").shared.clone();
-            shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
+        Err(e) => {
+            log::warn!("could not ask the host's RM whether it validates clients strictly: {e}")
         }
-        Err(e) => log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"),
+    }
+    // Every guest process's descriptors are this process's: the whole of the
+    // hard limit, taken before the sandbox, sizes the handle table (B1).
+    if let Some(n) = nofile {
+        let shared = backend.read().expect("backend lock").shared.clone();
+        shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
     }
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
@@ -1293,12 +1376,21 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("create daemon: {e:?}"))?;
 
-    // The path was cleared above (posture::clear_socket_path); serve's own
-    // removal finds nothing, and if someone else's socket appeared since,
-    // the bind fails rather than sharing the path.
-    daemon
-        .serve(&socket)
-        .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", socket.display()))?;
+    // `VhostUserDaemon::serve` on the listener bound before the sandbox: one
+    // connection, served until the VMM hangs up, and the ring workers told
+    // to stop whatever the outcome. A disconnect or a partial message is how
+    // a guest ends, not an error.
+    let served = daemon.start(&mut listener).and_then(|()| daemon.wait());
+    for h in daemon.get_epoll_handlers() {
+        h.send_exit_event();
+    }
+    match served {
+        Ok(())
+        | Err(vhost_user_backend::Error::HandleRequest(
+            vhost::vhost_user::Error::Disconnected | vhost::vhost_user::Error::PartialMessage,
+        )) => {}
+        Err(e) => anyhow::bail!("serve {}: {e:?}", socket.display()),
+    }
 
     backend
         .read()

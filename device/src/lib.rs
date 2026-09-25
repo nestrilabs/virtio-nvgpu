@@ -38,6 +38,7 @@ pub mod rmallow;
 pub mod rmctl;
 pub mod rmmem;
 pub mod rmshare;
+pub mod sandbox;
 pub mod schema;
 pub mod semsurf;
 pub mod session;

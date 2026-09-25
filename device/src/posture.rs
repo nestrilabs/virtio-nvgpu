@@ -24,6 +24,10 @@
 //! host open after that (per guest process, at run time) is a plain file
 //! open under the backend's uid and groups.
 //!
+//! What an unprivileged process still reaches -- its uid's files and
+//! sockets, the network, every syscall -- `crate::sandbox` takes away next,
+//! before the first guest message.
+//!
 //! **Socket** (S-23). The vhost-user socket is how a VMM hands the backend
 //! all of a guest's memory. A path another local user can create first is a
 //! path at which that user receives it: the VMM connects to whatever is
