@@ -704,6 +704,9 @@ struct Kernel {
     lease: LeaseState,
     /// GET_LEASE calls, kept out of `calls`.
     lease_probes: u32,
+    /// completionNotifier.awaken of each layer of the last one-element FLIP
+    /// the host saw.
+    flip_awaken: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -945,6 +948,12 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
                 -libc::EPERM
             }
             (11, 20) => 0, // MOVE_CURSOR
+            // FLIP of one head: what each layer's awaken reached the host as.
+            (15, 3104) if peek(p, 16, 4) == 1 => {
+                let heads = peek(p, 8, 8) as *const u8;
+                k.flip_awaken = (0..8).map(|l| *heads.add(216 + l * 592 + 52)).collect();
+                0
+            }
             // FLIP: two heads, head 0 with an input LUT, head 1 with an
             // output one; refused, with a flipResult.
             (15, 3104) => {
@@ -1365,6 +1374,8 @@ fn nvkms_world() -> World {
 #[test]
 fn a_flip_carries_its_heads_and_their_luts_and_a_refusal_still_brings_the_reply_back() {
     let mut w = nvkms_world();
+    // The guest owns the display: the heads are the host's to refuse.
+    w.be.config.kms_card = true;
     let mut params = vec![0u8; 3104];
     wr(&mut params, 0, 4, 1); // deviceHandle
     wr(&mut params, 8, 8, 0x3000); // pFlipHead
@@ -1402,6 +1413,44 @@ fn a_flip_asking_for_a_tegra_syncpoint_never_reaches_the_host() {
     let modeset = w.modeset;
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert!(w.fake.0.lock().unwrap().nvkms.is_empty());
+}
+
+/// A FLIP element that dirties no layer passes NVKMS's own check on any
+/// head, so the backend holds every element to the grants; and a guest
+/// flip never asks the host for FLIP_OCCURRED, which only nvidia-drm's own
+/// open would get. What the backend cleared stays set in the guest's copy.
+#[test]
+fn a_guest_flip_reaches_the_host_only_on_a_granted_head_and_never_asks_for_flip_occurred() {
+    let mut w = nvkms_world();
+    grant_head_1(&mut w);
+    let modeset = w.modeset;
+    let flip = |w: &mut World, head: u64| {
+        let mut params = vec![0u8; 3104];
+        wr(&mut params, 0, 4, 1); // deviceHandle
+        wr(&mut params, 8, 8, 0x3000); // pFlipHead
+        wr(&mut params, 16, 4, 1); // numFlipHeads
+        nvkms_call(w, 15, &params);
+        let mut heads = vec![0u8; 4952];
+        wr(&mut heads, 4, 4, head);
+        // flip.cursor.imageSpecified would do; a cursor-only element
+        // dirties no layer. Layers 0 and 3 ask for FLIP_OCCURRED:
+        // flip.layer @216, stride 592, completionNotifier.val.awaken @52.
+        heads[216 + 52] = 1;
+        heads[216 + 3 * 592 + 52] = 1;
+        w.mem.put(0x3000, &heads);
+        w.nvkms(modeset, 0x1000)
+    };
+    let seen = w.fake.0.lock().unwrap().nvkms.len();
+    assert_eq!(
+        flip(&mut w, 0),
+        Err(libc::EPERM),
+        "the host compositor's head"
+    );
+    assert_eq!(w.fake.0.lock().unwrap().nvkms.len(), seen);
+    assert_eq!(flip(&mut w, 1), Ok(0));
+    assert_eq!(w.fake.0.lock().unwrap().flip_awaken, vec![0; 8]);
+    let heads = w.mem.get(0x3000);
+    assert_eq!((heads[216 + 52], heads[216 + 3 * 592 + 52]), (1, 1));
 }
 
 #[test]
