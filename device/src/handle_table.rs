@@ -33,14 +33,26 @@
 //! business holding an old handle, but a late executor completion from before
 //! the reset might, and it must not find a new object under it.
 //!
-//! The table is bounded ([`MAX_HANDLES`]) and says -EMFILE when full, the way
-//! the host would say it to a process that opened too much.
+//! The table is bounded ([`MAX_HANDLES`], or less when the backend's
+//! RLIMIT_NOFILE is lower: [`limit_for_nofile`]) and says -EMFILE when full,
+//! the way the host would say it to a process that opened too much.
+//!
+//! --- Per guest process ---
+//!
+//! The table is one pool for every process of the guest, and natively there
+//! is no such pool: each process has its descriptors. So each handle is
+//! charged to the guest process that caused it ([`Owner`]: the opener, or
+//! the owner of the file a call that made it ran on), and one process holds
+//! at most a quarter of the table, with the last sixteenth kept for
+//! processes that hold little (quota.rs). A process past its share gets
+//! EMFILE; the others do not.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use crate::error::{DeviceError, Result};
 use crate::hostfd::HandleKind;
+use crate::quota::{Ledger, Owner, Share};
 
 /// Most handles one session may hold at once.
 ///
@@ -51,6 +63,25 @@ use crate::hostfd::HandleKind;
 /// on HOST_OP NEW_EVENTFD runs out here, with an error it can report, rather
 /// than in the host's fd table, where it takes every other guest down too.
 pub const MAX_HANDLES: usize = 65536;
+
+/// Host descriptors the backend keeps for itself beyond the table: the
+/// vhost-user socket, guest memory, the vrings' eventfds, the window, the
+/// pump's epoll, compositor connections and their reader threads' pipes,
+/// log files, and the short-lived descriptors of the calls it makes.
+pub const NOFILE_RESERVE: u64 = 1024;
+
+/// The most handles a backend whose RLIMIT_NOFILE is `nofile` can back.
+///
+/// Each handle is a host descriptor, and each device, render and Wayland
+/// handle has a second one, the event pump's duplicate; so half of what is
+/// left after the backend's own reserve, and never more than
+/// [`MAX_HANDLES`]. A limit so low that nothing is left still gets 64: the
+/// table then fails early with EMFILE, as it would have in the host's own
+/// table, just with a reason logged.
+pub fn limit_for_nofile(nofile: u64) -> usize {
+    let usable = nofile.saturating_sub(NOFILE_RESERVE) / 2;
+    (usable.min(MAX_HANDLES as u64) as usize).max(64)
+}
 
 /// Why a handle could not be issued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +99,8 @@ struct Entry {
     kind: HandleKind,
     /// The host file was closed under the guest (`bury`).
     buried: bool,
+    /// The guest process it is charged to.
+    owner: Owner,
 }
 
 pub struct HandleTable {
@@ -75,6 +108,9 @@ pub struct HandleTable {
     next: u32,
     table: HashMap<u32, Entry>,
     limit: usize,
+    /// What each guest process holds, and how much it may.
+    held: Ledger,
+    share: Share,
 }
 
 impl HandleTable {
@@ -89,16 +125,58 @@ impl HandleTable {
             next: 1,
             table: HashMap::new(),
             limit,
+            held: Ledger::default(),
+            share: Self::share_of(limit),
         }
     }
 
-    /// Take ownership of `fd` and issue a handle for it.
-    ///
-    /// When the table is full the descriptor is dropped, i.e. closed: there is
-    /// nobody left to hand it to, and a descriptor that nobody can name is a
-    /// leak.
+    fn share_of(limit: usize) -> Share {
+        Share::quarter(limit as u64, 16)
+    }
+
+    /// Change the limit (from the backend's RLIMIT_NOFILE at start). Handles
+    /// already issued stay; a lower limit refuses new ones until enough go.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.share = Self::share_of(limit);
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Take ownership of `fd` and issue a handle for it, charged to no
+    /// process in particular (only the table's own limit applies).
     pub fn insert(&mut self, fd: OwnedFd, kind: HandleKind) -> std::result::Result<u32, TableFull> {
-        if self.table.len() >= self.limit {
+        self.insert_for(fd, kind, Owner::Unknown)
+    }
+
+    /// Take ownership of `fd` and issue a handle for it, charged to `owner`.
+    ///
+    /// When the table is full, or `owner` holds its share of it, the
+    /// descriptor is dropped, i.e. closed: there is nobody left to hand it
+    /// to, and a descriptor that nobody can name is a leak.
+    pub fn insert_for(
+        &mut self,
+        fd: OwnedFd,
+        kind: HandleKind,
+        owner: Owner,
+    ) -> std::result::Result<u32, TableFull> {
+        if let Err(why) = self.held.admits(
+            &self.share,
+            owner,
+            1,
+            self.table.len() as u64,
+            self.limit as u64,
+        ) {
+            if why != crate::quota::Over::Pool {
+                log::warn!(
+                    "handle table: guest process {owner:?} holds {} of {} handles ({why:?}); \
+                     refusing a {kind:?}",
+                    self.held.held(owner),
+                    self.limit
+                );
+            }
             return Err(TableFull);
         }
         // Terminates: fewer than 2^32 - 2 values are live, so some candidate
@@ -115,8 +193,10 @@ impl HandleTable {
                     fd,
                     kind,
                     buried: false,
+                    owner,
                 },
             );
+            self.held.charge(owner, 1);
             return Ok(h);
         }
     }
@@ -138,6 +218,17 @@ impl HandleTable {
     /// What `handle` is, if it exists.
     pub fn kind(&self, handle: u32) -> Option<HandleKind> {
         self.table.get(&handle).map(|e| e.kind)
+    }
+
+    /// The guest process `handle` is charged to; `Unknown` for none, or no
+    /// such handle.
+    pub fn owner(&self, handle: u32) -> Owner {
+        self.table.get(&handle).map_or(Owner::Unknown, |e| e.owner)
+    }
+
+    /// Handles `owner` holds.
+    pub fn held_by(&self, owner: Owner) -> u64 {
+        self.held.held(owner)
     }
 
     /// A duplicate of the descriptor, `O_CLOEXEC`, so a call can keep using
@@ -180,10 +271,12 @@ impl HandleTable {
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).
     pub fn remove(&mut self, handle: u32) -> Result<(OwnedFd, HandleKind)> {
-        self.table
+        let e = self
+            .table
             .remove(&handle)
-            .map(|e| (e.fd, e.kind))
-            .ok_or(DeviceError::BadHandle(handle as u64))
+            .ok_or(DeviceError::BadHandle(handle as u64))?;
+        self.held.refund(e.owner, 1);
+        Ok((e.fd, e.kind))
     }
 
     /// Every live handle.
@@ -201,6 +294,7 @@ impl HandleTable {
         if count > 0 {
             log::info!("HandleTable::drain_all: closing {count} host fds");
         }
+        self.held.clear();
         for (handle, e) in self.table.drain() {
             log::debug!(
                 "  closing handle={handle} ({:?}) host_fd={}",
@@ -353,6 +447,55 @@ mod tests {
         let h = t.handles()[0];
         t.remove(h).unwrap();
         assert!(t.insert(make_fd(), CTL).is_ok());
+    }
+
+    #[test]
+    fn one_guest_process_cannot_take_the_whole_table() {
+        use crate::quota::Owner;
+        let a = Owner::Proc {
+            tgid: 10,
+            start_ns: 1,
+        };
+        let b = Owner::Proc {
+            tgid: 11,
+            start_ns: 2,
+        };
+        let mut t = HandleTable::with_limit(256);
+        let mut mine = Vec::new();
+        loop {
+            match t.insert_for(make_fd(), CTL, a) {
+                Ok(h) => mine.push(h),
+                Err(e) => {
+                    assert_eq!(e.errno(), libc::EMFILE);
+                    break;
+                }
+            }
+        }
+        assert_eq!(mine.len(), 64, "a quarter of the table");
+        assert_eq!(t.held_by(a), 64);
+        assert_eq!(t.owner(mine[0]), a);
+        // Another process still opens.
+        let hb = t.insert_for(make_fd(), CTL, b).unwrap();
+        assert_eq!(t.owner(hb), b);
+        // What a process closes it may open again.
+        t.remove(mine.pop().unwrap()).unwrap();
+        assert_eq!(t.held_by(a), 63);
+        assert!(t.insert_for(make_fd(), CTL, a).is_ok());
+        // A guest that does not say is held to the table alone.
+        assert!(t.insert(make_fd(), CTL).is_ok());
+        assert_eq!(t.owner(t.handles().into_iter().max().unwrap()), Owner::Unknown);
+        t.drain_all();
+        assert_eq!(t.held_by(a), 0);
+    }
+
+    #[test]
+    fn the_limit_follows_the_descriptors_the_backend_may_open() {
+        assert_eq!(limit_for_nofile(1024), 64);
+        assert_eq!(limit_for_nofile(4096), 1536);
+        assert_eq!(limit_for_nofile(524_288), MAX_HANDLES);
+        let mut t = HandleTable::with_limit(4);
+        t.set_limit(limit_for_nofile(4096));
+        assert_eq!(t.limit(), 1536);
     }
 
     #[test]

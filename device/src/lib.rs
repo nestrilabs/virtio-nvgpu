@@ -27,6 +27,7 @@ pub mod policy;
 pub mod posture;
 pub mod privfd;
 pub mod pump;
+pub mod quota;
 pub mod ratelimit;
 pub mod replay;
 pub mod rmctl;

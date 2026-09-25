@@ -334,7 +334,7 @@ static __poll_t nvgpu_modeset_poll(struct file *filp,
  * Whether RM_ALLOC and RM_DUP_OBJECT say which process makes them
  * (nvgpu_wire.h, struct nvgpu_proc_id): only to a backend that asked.
  */
-static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
+bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
   return dev->v2 && (dev->backend_caps & NVGPU_BCAP_PROC_ID);
 }
 
@@ -369,7 +369,7 @@ static bool nvgpu_uvm_offered(const struct nvgpu_device *dev) {
  * RCU grace period, so the leader read here stays readable while a
  * concurrent exec replaces it.
  */
-static void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
+void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
   struct nvgpu_proc_id id = {};
   struct task_struct *leader;
 
@@ -386,6 +386,18 @@ static void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
   if (nvgpu_proc_euid(dev))
     id.euid = cpu_to_le32(__kuid_val(current_euid()));
   memcpy(dst, &id, sizeof(id));
+}
+
+/*
+ * An OPEN's length, with the opener after the request when the backend
+ * charges what a process opens to it (device/src/quota.rs).
+ */
+u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
+                             struct nvgpu_open_req_proc *r) {
+  if (!nvgpu_proc_ids(dev))
+    return sizeof(r->req);
+  nvgpu_proc_id_fill(dev, &r->proc);
+  return sizeof(*r);
 }
 
 /* nvgpu_ioctl_simple — flat struct, no embedded pointers */
@@ -2030,8 +2042,10 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
                              u32 device_type) {
   struct nvgpu_device *dev;
   struct nvgpu_fd *nfd;
+  struct nvgpu_open_req_proc *reqp;
   struct nvgpu_open_req *req;
   struct nvgpu_open_resp *resp;
+  u32 req_len;
   int ret;
 
   /* Recover nvgpu_device pointer depending on which cdev was opened */
@@ -2046,14 +2060,15 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
                        cdev_gpu[iminor(inode)]);
 
   nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  reqp = kzalloc(sizeof(*reqp), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (!nfd || !req || !resp) {
+  if (!nfd || !reqp || !resp) {
     kfree(nfd);
-    kfree(req);
+    kfree(reqp);
     kfree(resp);
     return -ENOMEM;
   }
+  req = &reqp->req;
 
   nfd->dev = dev;
   nfd->device_type = device_type;
@@ -2062,11 +2077,12 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req->device_type = cpu_to_le32(device_type);
   req->flags = cpu_to_le32(filp->f_flags);
+  req_len = nvgpu_open_req_fill_proc(dev, reqp);
 
-  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp, sizeof(*resp));
+  ret = nvgpu_send_recv(dev, reqp, req_len, resp, sizeof(*resp));
   if (ret < 0 || (s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
     kfree(nfd);
-    kfree(req);
+    kfree(reqp);
     kfree(resp);
     if (ret < 0)
       return ret;
@@ -2079,7 +2095,7 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   nvgpu_dev_get(dev);
   nvgpu_fd_register(nfd->dev, nfd);
   filp->private_data = nfd;
-  kfree(req);
+  kfree(reqp);
   kfree(resp);
   return 0;
 }

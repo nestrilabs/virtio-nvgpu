@@ -310,8 +310,10 @@ static void nvgpu_wl_export_unclaim(struct nvgpu_wl_file *wf) {
 static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->dev;
   struct nvgpu_wl_connect c;
-  struct nvgpu_open_req req = {};
+  struct nvgpu_open_req_proc reqp = {};
+  struct nvgpu_open_req *req = &reqp.req;
   struct nvgpu_open_resp resp = {};
+  u32 req_len;
   s32 status;
   int ret;
 
@@ -327,11 +329,13 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
       return ret;
   }
 
-  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
-  req.device_type = cpu_to_le32(NVGPU_DEV_WAYLAND);
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
+  req->device_type = cpu_to_le32(NVGPU_DEV_WAYLAND);
   /* The OPEN flags word says which kind of channel (WL_OPEN_* in wlwire). */
-  req.flags = cpu_to_le32(c.mode);
-  ret = nvgpu_send_recv(dev, &req, sizeof(req), &resp, sizeof(resp));
+  req->flags = cpu_to_le32(c.mode);
+  /* The opener, whose share of the VM's channels this is (quota.rs). */
+  req_len = nvgpu_open_req_fill_proc(dev, &reqp);
+  ret = nvgpu_send_recv(dev, &reqp, req_len, &resp, sizeof(resp));
   status = ret < 0 ? ret : (s32)le32_to_cpu(resp.hdr.status);
   if (status < 0) {
     nvgpu_wl_export_unclaim(wf);

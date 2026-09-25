@@ -319,6 +319,9 @@ struct Ioctl2Call {
     /// as it runs, so a CLOSE racing it cannot pull the file away.
     target_fd: OwnedFd,
     target: u32,
+    /// Who what the call makes is charged to (quota.rs), taken when it was
+    /// served: the target may be closed before it finishes.
+    owner: crate::quota::Owner,
     executor: bool,
     generation: u64,
     req_id: u32,
@@ -397,6 +400,9 @@ struct BackendFinisher<'a> {
     /// Handles adopted, for the reply to carry (and close, if it is never
     /// delivered).
     created: Vec<u32>,
+    /// The guest process they are charged to: the owner of the file the
+    /// call ran on (quota.rs).
+    owner: crate::quota::Owner,
 }
 
 impl xfer::Finisher for BackendFinisher<'_> {
@@ -423,7 +429,7 @@ impl xfer::Finisher for BackendFinisher<'_> {
                 log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
             }
         }
-        match self.backend.handles.insert(fd, kind) {
+        match self.backend.handles.insert_for(fd, kind, self.owner) {
             Ok(h) => {
                 self.created.push(h);
                 (h, kind)
@@ -711,7 +717,7 @@ impl NvidiaBackend {
     }
 
     fn insert(&mut self, fd: OwnedFd, kind: HandleKind) -> Result<u32, i32> {
-        self.handles.insert(fd, kind).map_err(|e| {
+        self.handles.insert_for(fd, kind, self.current_owner).map_err(|e| {
             log::warn!("handle table full; refusing a new {kind:?}");
             e.errno()
         })
@@ -925,6 +931,7 @@ impl NvidiaBackend {
             prepared,
             target_fd,
             target,
+            owner: self.handles.owner(target),
             executor,
             generation: self.session.generation,
             req_id: self.current_req_id,
@@ -945,6 +952,7 @@ impl NvidiaBackend {
             prepared,
             target_fd,
             target,
+            owner,
             generation,
             req_id,
             cap,
@@ -964,6 +972,7 @@ impl NvidiaBackend {
             cards: &nodes.cards,
             stale,
             created: Vec::new(),
+            owner,
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
@@ -1423,6 +1432,54 @@ mod tests {
             status(&r),
             read::<HostOpResp>(&r[HDR..]).unwrap_or_default(),
         )
+    }
+
+    /// HOST_OP with the caller after it (quota.rs): one guest process
+    /// runs out of handles at its share, another does not (B1).
+    #[test]
+    fn one_guest_process_cannot_take_every_handle_through_host_ops() {
+        let mut be = backend();
+        let req = HelloReq {
+            proto: PROTO_V2,
+            flags: HELLO_F_FRESH,
+            guest_caps: GCAP_PROC_ID,
+            uvm_aperture_mib: 0,
+        };
+        call(&mut be, MsgType::Hello, 0, bytes_of(&req));
+        be.handles.set_limit(256);
+        let op = |be: &mut NvidiaBackend, tgid: u32| {
+            let mut body = bytes_of(&HostOpReq {
+                op: OP_NEW_EVENTFD,
+                nargs: 0,
+                args: [0; OP_MAX_ARGS],
+            })
+            .to_vec();
+            body.extend_from_slice(bytes_of(&ProcId {
+                start_ns: 1,
+                tgid,
+                euid: 0,
+            }));
+            let r = call(be, MsgType::HostOp, 0, &body);
+            (status(&r), read::<HostOpResp>(&r[HDR..]).unwrap_or_default())
+        };
+        let mut made = 0;
+        while op(&mut be, 10).0 == 0 {
+            made += 1;
+        }
+        assert_eq!(made, 64, "a quarter of the table");
+        assert_eq!(op(&mut be, 10).0, -libc::EMFILE);
+        let (st, r) = op(&mut be, 11);
+        assert_eq!(st, 0, "another process still gets one");
+        let h = r.res[0] as u32;
+        let b = crate::quota::Owner::Proc {
+            tgid: 11,
+            start_ns: 1,
+        };
+        assert_eq!(be.handles.owner(h), b);
+        assert_eq!(be.handles.held_by(b), 1);
+        // Closing gives the share back.
+        call(&mut be, MsgType::Close, h, &[]);
+        assert_eq!(be.handles.held_by(b), 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::ptr;
 
 use crate::error::{DeviceError, Result};
 use crate::privfd::PrivateFd;
+use crate::quota::{Ledger, Owner, Share};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +49,12 @@ struct Zone {
     /// Free extents as `offset -> length`, offsets relative to `base`, kept
     /// disjoint and coalesced.
     free: BTreeMap<u64, u64>,
+    /// Bytes each guest process holds of the zone, and how many it may
+    /// (quota.rs): half the zone, and the last eighth only while it holds
+    /// at most a sixteenth. One process mapping a whole zone left every
+    /// other process of the VM with ENOMEM (B2).
+    held: Ledger,
+    share: Share,
 }
 
 impl Zone {
@@ -56,7 +63,13 @@ impl Zone {
         if size > 0 {
             free.insert(0, size);
         }
-        Self { base, size, free }
+        Self {
+            base,
+            size,
+            free,
+            held: Ledger::default(),
+            share: Share::half(size),
+        }
     }
 
     /// First-fit. Returns an absolute offset, or `None` if no extent fits.
@@ -219,6 +232,10 @@ pub struct ShmAllocator {
     memfd_size: u64,
 
     total_size: u64,
+
+    /// Who each live extent is charged to, and its charged length, by its
+    /// offset.
+    owners: std::collections::HashMap<u64, (Owner, u64)>,
 }
 
 unsafe impl Send for ShmAllocator {}
@@ -282,6 +299,7 @@ impl ShmAllocator {
             memfd_ptr: memfd_ptr as *mut u8,
             memfd_size: total,
             total_size: total,
+            owners: std::collections::HashMap::new(),
         }
     }
 
@@ -300,18 +318,43 @@ impl ShmAllocator {
     }
 
     pub fn alloc(&mut self, length: u64, pgprot: PgprotKind) -> Result<ShmRegion> {
+        self.alloc_for(length, pgprot, Owner::Unknown)
+    }
+
+    /// An extent of `length` in the `pgprot` zone, charged to `owner`,
+    /// which may hold only its share of the zone (quota.rs).
+    pub fn alloc_for(&mut self, length: u64, pgprot: PgprotKind, owner: Owner) -> Result<ShmRegion> {
         let zone = match pgprot {
             PgprotKind::Uncached => &mut self.uc,
             PgprotKind::WriteCombine => &mut self.wc,
             PgprotKind::WriteBack => &mut self.wb,
         };
 
+        let want = align_up(length, PAGE_SIZE);
+        let in_use = zone.size - zone.free_bytes();
+        if let Err(why) = zone.held.admits(&zone.share, owner, want, in_use, zone.size) {
+            if why != crate::quota::Over::Pool {
+                return Err(DeviceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!(
+                        "SHM {pgprot:?} zone: guest process {owner:?} holds {:#x} of {:#x} \
+                         bytes and may not take {want:#x} more ({why:?})",
+                        zone.held.held(owner),
+                        zone.size
+                    ),
+                )));
+            }
+        }
         match zone.alloc(length) {
-            Some(offset) => Ok(ShmRegion {
-                offset,
-                length,
-                pgprot,
-            }),
+            Some(offset) => {
+                zone.held.charge(owner, want);
+                self.owners.insert(offset, (owner, want));
+                Ok(ShmRegion {
+                    offset,
+                    length,
+                    pgprot,
+                })
+            }
             None => Err(DeviceError::Io(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 format!(
@@ -356,7 +399,21 @@ impl ShmAllocator {
                 ),
             )));
         }
+        if let Some((owner, charged)) = self.owners.remove(&region.offset) {
+            zone.held.refund(owner, charged);
+        }
         Ok(())
+    }
+
+    /// Bytes `owner` holds of the `pgprot` zone.
+    pub fn held_by(&self, pgprot: PgprotKind, owner: Owner) -> u64 {
+        match pgprot {
+            PgprotKind::Uncached => &self.uc,
+            PgprotKind::WriteCombine => &self.wc,
+            PgprotKind::WriteBack => &self.wb,
+        }
+        .held
+        .held(owner)
     }
 
     /// Free bytes remaining in each zone, as `(uc, wc, wb)`.
@@ -507,6 +564,44 @@ mod tests {
 
     fn small_alloc() -> ShmAllocator {
         ShmAllocator::new(small_cfg())
+    }
+
+    /// One guest process maps at most half a zone, and the last eighth is
+    /// kept for processes that hold at most a sixteenth: the one that took
+    /// its half cannot take another's first mapping (B2).
+    #[test]
+    fn one_guest_process_cannot_map_the_whole_zone() {
+        let mib = 1u64 << 20;
+        let mut a = ShmAllocator::new(ZoneConfig {
+            uc_size: 4096 * 16,
+            wc_size: 256 * mib,
+            wb_size: 4096 * 16,
+        });
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        let wc = PgprotKind::WriteCombine;
+        // A game's one large mapping: half the zone is fine, more is not.
+        let big = a.alloc_for(128 * mib, wc, p(1)).unwrap();
+        assert!(a.alloc_for(4096, wc, p(1)).is_err(), "past its half");
+        assert_eq!(a.held_by(wc, p(1)), 128 * mib);
+        // A second process takes what is left down to the reserve (32 MiB).
+        let second = a.alloc_for(96 * mib, wc, p(2)).unwrap();
+        assert!(a.alloc_for(4096, wc, p(2)).is_err(), "the reserve is not its");
+        // A third, holding nothing, still gets its first mapping, up to the
+        // floor of 16 MiB.
+        let third = a.alloc_for(16 * mib, wc, p(3)).unwrap();
+        assert!(a.alloc_for(4096, wc, p(3)).is_err());
+        // A guest that does not say is held to the zone alone.
+        assert!(a.alloc_for(16 * mib, wc, Owner::Unknown).is_ok());
+        // Freeing gives the share back.
+        a.free(&big).unwrap();
+        assert_eq!(a.held_by(wc, p(1)), 0);
+        assert!(a.alloc_for(64 * mib, wc, p(1)).is_ok());
+        a.free(&second).unwrap();
+        a.free(&third).unwrap();
+        assert_eq!((a.held_by(wc, p(2)), a.held_by(wc, p(3))), (0, 0));
     }
 
     #[test]

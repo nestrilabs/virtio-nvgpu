@@ -418,6 +418,12 @@ pub struct OsDescRun {
 /// host, so RM sees one process where the guest has many; this is how the
 /// backend tells them apart (rmshare.rs).
 ///
+/// The same guest also sends one after the fixed part of every `Open`
+/// ([`OpenReq`]) and `HostOp` ([`HostOpReq`]): what those make is charged to
+/// that process, which may hold only a share of the VM's handles and other
+/// budgets (device/src/quota.rs). A backend that predates it ignores the
+/// bytes after the fixed part.
+///
 /// The guest kernel fills it from the calling thread's group leader: its
 /// thread-group id in the initial PID namespace and its start time
 /// (CLOCK_MONOTONIC ns, which exec keeps and a fork does not share). A PID is

@@ -3192,8 +3192,10 @@ mod backend_tests {
             );
         }
         assert!(seen().is_empty(), "none reached RM");
-        // Past numObjects, or another object: RM's to answer.
+        // Past numObjects, or another object: RM's to answer. The export
+        // file must be one of the VM's control files (rmctl.rs, R1).
         let (o, mut n) = control(EXPORT_OBJECTS_TO_FD, 2128);
+        put32(&mut n, 0, ctl);
         put32(&mut n, 76, 0x5000_0077);
         put32(&mut n, 80, HANDLE);
         n[2124..2126].copy_from_slice(&1u16.to_le_bytes());

@@ -80,6 +80,16 @@ const IMPORT_PARAMS_SIZE: usize = 16;
 /// is what bounds the host's kthreads.
 pub const CTX_CAP_PER_FILE: usize = 64;
 pub const CTX_CAP_PER_SESSION: usize = 256;
+/// And per guest process (quota.rs, B3): four files of one process took the
+/// whole session, and every other process's vkCreateDevice failed. A
+/// process holds at most 96, and the session's last 32 are kept for
+/// processes holding at most 16 -- so one that has its 96 cannot take
+/// another's first device's worth.
+pub const CTX_SHARE: crate::quota::Share = crate::quota::Share {
+    per_owner: 96,
+    reserve: 32,
+    floor: 16,
+};
 
 /// `NV01_ROOT`, `NV01_ROOT_NON_PRIV`, `NV01_ROOT_CLIENT`: the classes a
 /// client is allocated as (escape.c:473-481 turns all three into the last).
@@ -152,8 +162,10 @@ struct Inner {
     /// The host's layout per render node (DRI index), once asked. A fact
     /// about the host, so it outlives a session reset.
     layouts: HashMap<u32, Layout>,
-    /// Every live render handle, with its DRI index.
+    /// Every live render handle, with its DRI index and the guest process
+    /// that opened it.
     renders: HashMap<u32, u32>,
+    render_owners: HashMap<u32, crate::quota::Owner>,
     /// Every RM client this VM allocated and has not freed, with the handle
     /// of the file it was allocated through (the client dies with that
     /// file, RmFreeUnusedClients, osapi.c:546-583).
@@ -190,7 +202,14 @@ impl SemsurfPolicy {
 
     /// A render node was opened as `handle`.
     pub fn render_opened(&self, handle: u32, dri: u32) {
-        self.lock().renders.insert(handle, dri);
+        self.render_opened_by(handle, dri, crate::quota::Owner::Unknown);
+    }
+
+    /// The same, by guest process `owner` (quota.rs).
+    pub fn render_opened_by(&self, handle: u32, dri: u32, owner: crate::quota::Owner) {
+        let mut g = self.lock();
+        g.renders.insert(handle, dri);
+        g.render_owners.insert(handle, owner);
     }
 
     /// RM_ALLOC of a client class succeeded through `issuer`.
@@ -301,6 +320,7 @@ impl SemsurfPolicy {
     pub fn forget_handle(&self, handle: u32) -> Vec<u32> {
         let mut g = self.lock();
         g.renders.remove(&handle);
+        g.render_owners.remove(&handle);
         let gone: Vec<u32> = g
             .clients
             .iter()
@@ -319,6 +339,7 @@ impl SemsurfPolicy {
     pub fn reset(&self) {
         let mut g = self.lock();
         g.renders.clear();
+        g.render_owners.clear();
         g.clients.clear();
         g.os_events.clear();
         g.ctxs.clear();
@@ -381,6 +402,27 @@ impl SemsurfPolicy {
             log::warn!(
                 "SEMSURF_FENCE_CTX_CREATE on handle {target}: {mine} contexts in the file, {all} \
                  in the session (caps {CTX_CAP_PER_FILE}, {CTX_CAP_PER_SESSION}); refused"
+            );
+            return Err(libc::ENOSPC);
+        }
+        let owner = g.render_owners.get(&target).copied().unwrap_or_default();
+        let of_owner: usize = g
+            .ctxs
+            .iter()
+            .filter(|(r, _)| g.render_owners.get(r).copied().unwrap_or_default() == owner)
+            .map(|(_, s)| s.len())
+            .sum();
+        if let Err(why) = crate::quota::admits(
+            &CTX_SHARE,
+            owner,
+            of_owner as u64,
+            1,
+            all as u64,
+            CTX_CAP_PER_SESSION as u64,
+        ) {
+            log::warn!(
+                "SEMSURF_FENCE_CTX_CREATE on handle {target}: guest process {owner:?} holds \
+                 {of_owner} contexts, {all} in the session ({why:?}); refused"
             );
             return Err(libc::ENOSPC);
         }
@@ -704,7 +746,8 @@ impl NvidiaBackend {
                 }
             }
         }
-        self.semsurf.render_opened(handle, dri);
+        self.semsurf
+            .render_opened_by(handle, dri, self.handles.owner(handle));
     }
 
     /// The host descriptor for the OS event a guest names at `field` (8
@@ -960,6 +1003,34 @@ mod tests {
         assert_eq!(s.admit(RENDER, 0, &params(CLIENT, 4096)), Ok(()));
         s.forget_handle(RENDER);
         assert_eq!(s.ctx_counts(RENDER), (0, 0));
+    }
+
+    /// Four files of one process took the whole session (B3): one process
+    /// holds at most its share, and another still makes its first ones.
+    #[test]
+    fn one_guest_process_cannot_take_every_fence_context() {
+        use crate::quota::Owner;
+        let s = policy();
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        for r in 100..104 {
+            s.render_opened_by(r, 0, p(1));
+        }
+        s.render_opened_by(200, 0, p(2));
+        let mut made = 0u32;
+        'files: for r in 100..104 {
+            loop {
+                if s.admit(r, 0, &params(CLIENT, 4096)).is_err() {
+                    continue 'files;
+                }
+                s.lock().ctxs.entry(r).or_default().insert(made);
+                made += 1;
+            }
+        }
+        assert_eq!(made as u64, CTX_SHARE.per_owner, "the process's share");
+        assert_eq!(s.admit(200, 0, &params(CLIENT, 4096)), Ok(()));
     }
 
     #[test]

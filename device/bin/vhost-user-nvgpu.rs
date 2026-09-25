@@ -1325,6 +1325,15 @@ fn main() -> anyhow::Result<()> {
     };
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
+    // Every guest process's descriptors are this process's: take the whole
+    // of the hard limit, and size the handle table from it (B1).
+    match posture::raise_nofile() {
+        Ok(n) => {
+            let shared = backend.read().expect("backend lock").shared.clone();
+            shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
+        }
+        Err(e) => log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"),
+    }
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
         backend.clone(),

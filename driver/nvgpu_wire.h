@@ -340,7 +340,9 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
  * The guest process an IOCTL is made by. With NVGPU_BCAP_PROC_ID, every
  * NVGPU_MSG_IOCTL of NV_ESC_RM_ALLOC or NV_ESC_RM_DUP_OBJECT carries one after
  * its blocks (after the deep_len bytes), and with NVGPU_BCAP_PROC_EUID every
- * NV_ESC_RM_CONTROL too. The host sees every guest process's RM calls as the
+ * NV_ESC_RM_CONTROL too; and every NVGPU_MSG_OPEN and NVGPU_MSG_HOST_OP after
+ * its fixed part (struct nvgpu_open_req_proc). The host sees every guest
+ * process's RM calls as the
  * backend's, one process; this is how the backend keeps RM objects to the
  * guest process that made their client, as RM keeps them to a host process,
  * and holds a second client a call names to RM's rule for it -- the same
@@ -354,6 +356,18 @@ struct nvgpu_proc_id {
   __le32 tgid;     /* task_tgid_nr(), initial PID namespace     */
   __le32 euid;     /* current_euid(), initial user namespace, with
                       NVGPU_BCAP_PROC_EUID; 0 otherwise */
+} __packed;
+
+/*
+ * NVGPU_MSG_OPEN with the opener after it, and NVGPU_MSG_HOST_OP likewise:
+ * with NVGPU_BCAP_PROC_ID the handles either makes are charged to the
+ * calling process, which holds at most a share of the VM's handles, window
+ * and other budgets (device/src/quota.rs). A backend that predates it reads
+ * the fixed part and ignores the rest.
+ */
+struct nvgpu_open_req_proc {
+  struct nvgpu_open_req req;
+  struct nvgpu_proc_id proc;
 } __packed;
 
 struct nvgpu_hello_req {
@@ -629,6 +643,9 @@ static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
 static_assert(sizeof(struct nvgpu_osdesc_hdr) == 8, "osdesc hdr");
 static_assert(sizeof(struct nvgpu_osdesc_run) == 16, "osdesc run");
 static_assert(sizeof(struct nvgpu_proc_id) == 16, "proc id");
+static_assert(sizeof(struct nvgpu_open_req_proc) ==
+                  sizeof(struct nvgpu_open_req) + 16,
+              "open req with proc id");
 static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
 static_assert(sizeof(struct nvgpu_ev_fence) == 16, "ev fence");
 static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");

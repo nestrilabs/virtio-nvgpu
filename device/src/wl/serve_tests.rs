@@ -385,6 +385,7 @@ fn a_compositor_descriptor_is_adopted_only_if_it_is_what_its_desc_says() {
         handles: &mut t,
         host: &host,
         created: Vec::new(),
+        owner: crate::quota::Owner::Unknown,
     };
     let fd = |name: &std::ffi::CStr| sys::memfd(name, 0).unwrap();
     let (h, hk) = ops.adopt(fd(c"lease-ours"), frame::DESC_DRM_FILE).unwrap();

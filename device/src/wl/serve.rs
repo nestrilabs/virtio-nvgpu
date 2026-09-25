@@ -181,6 +181,9 @@ pub(super) struct TableRecv<'a> {
     pub(super) handles: &'a mut HandleTable,
     pub(super) host: &'a dyn HostFds,
     pub(super) created: Vec<u32>,
+    /// Who what the compositor sends is charged to: the channel's opener
+    /// (quota.rs).
+    pub(super) owner: crate::quota::Owner,
 }
 
 impl RecvOps for TableRecv<'_> {
@@ -202,7 +205,7 @@ impl RecvOps for TableRecv<'_> {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
         }
-        let h = self.handles.insert(fd, kind).map_err(|full| {
+        let h = self.handles.insert_for(fd, kind, self.owner).map_err(|full| {
             log::warn!("wayland: handle table full; a {kind:?} from the compositor is dropped");
             io::Error::from_raw_os_error(full.errno())
         })?;
@@ -358,7 +361,10 @@ impl NvidiaBackend {
                 return Err(e.raw_os_error().unwrap_or(libc::EMFILE));
             }
         };
-        let handle = match self.handles.insert(ready, HandleKind::Wayland) {
+        let handle = match self
+            .handles
+            .insert_for(ready, HandleKind::Wayland, self.current_owner)
+        {
             Ok(h) => h,
             Err(full) => {
                 log::warn!("OPEN(DEV_WAYLAND): handle table full");
@@ -482,10 +488,12 @@ impl NvidiaBackend {
             Some(Chan::Conn(c)) => c,
             _ => return Err(libc::EBADF),
         };
+        let owner = self.current_owner;
         let mut ops = TableRecv {
             handles: &mut self.handles,
             host: &*host,
             created: Vec::new(),
+            owner,
         };
         let f = conn.recv(req.max_bytes, req.max_desc, &mut ops)?;
         let created = ops.created;

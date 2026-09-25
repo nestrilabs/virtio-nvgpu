@@ -1167,12 +1167,13 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_req body;
+    struct nvgpu_proc_id proc;
   } __packed req = {};
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_resp body;
   } __packed resp;
-  u32 used, got, i;
+  u32 used, got, i, req_len = sizeof(req);
   int ret;
 
   if (!dev->v2)
@@ -1185,8 +1186,13 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   req.body.nargs = cpu_to_le32(nargs);
   for (i = 0; i < nargs; i++)
     req.body.args[i] = cpu_to_le64(args[i]);
+  /* The caller, whose share what the op makes counts against (quota.rs). */
+  if (nvgpu_proc_ids(dev))
+    nvgpu_proc_id_fill(dev, &req.proc);
+  else
+    req_len -= sizeof(req.proc);
 
-  ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
+  ret = nvgpu_call(dev, &req, req_len, &resp, sizeof(resp), 0, &used,
                    NULL, NULL);
   if (ret)
     return ret;

@@ -416,6 +416,15 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
  * never a guess at another driver's private_data.
  */
 int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+/*
+ * Whether calls say which guest process makes them (NVGPU_BCAP_PROC_ID),
+ * and that process, as struct nvgpu_proc_id at `dst`.
+ */
+bool nvgpu_proc_ids(const struct nvgpu_device *dev);
+void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst);
+/* Fill an OPEN's trailer when the backend wants one; the length to send. */
+u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
+                             struct nvgpu_open_req_proc *r);
 /* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);

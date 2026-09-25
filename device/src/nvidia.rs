@@ -446,6 +446,10 @@ pub struct NvidiaBackend {
     /// The guest process making the RM call being served, when the guest
     /// says (rmshare.rs).
     pub(crate) current_proc: Option<crate::rmshare::Caller>,
+    /// The guest process what the message being served makes is charged to
+    /// (quota.rs): the one an OPEN or HOST_OP names, else the owner of the
+    /// handle the message acts on.
+    pub(crate) current_owner: crate::quota::Owner,
     pub(crate) handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
@@ -1015,6 +1019,7 @@ impl NvidiaBackend {
             current_req_id: 0,
             current_data_len: 0,
             current_proc: None,
+            current_owner: crate::quota::Owner::Unknown,
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
@@ -1138,6 +1143,14 @@ impl NvidiaBackend {
     /// Whether a placer is attached (the transport's request channel is up).
     pub(crate) fn has_window(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Size the handle table for a backend that may hold `nofile`
+    /// descriptors (posture::raise_nofile).
+    pub fn set_nofile(&mut self, nofile: u64) {
+        let limit = crate::handle_table::limit_for_nofile(nofile);
+        log::info!("RLIMIT_NOFILE {nofile}: at most {limit} guest handles");
+        self.handles.set_limit(limit);
     }
 
     pub fn handle_count(&self) -> usize {
@@ -1447,6 +1460,23 @@ impl NvidiaBackend {
         self.current_handle = hdr.handle;
 
         let payload = &req_buf[size_of::<MsgHeader>()..];
+        // Who what this message makes is charged to (quota.rs). OPEN and
+        // HOST_OP make handles out of nothing and say the process after
+        // their fixed part; everything else acts on a handle, whose owner
+        // it is.
+        self.current_owner = match msg_type {
+            MsgType::Open => crate::quota::Owner::from_trailer(
+                payload,
+                size_of::<OpenReq>(),
+                self.session.proc_ids,
+            ),
+            MsgType::HostOp => crate::quota::Owner::from_trailer(
+                payload,
+                size_of::<protocol::messages::HostOpReq>(),
+                self.session.proc_ids,
+            ),
+            _ => self.handles.owner(hdr.handle),
+        };
         let mut reply = match msg_type {
             MsgType::Hello
             | MsgType::Ioctl2
@@ -1570,19 +1600,8 @@ impl NvidiaBackend {
         };
 
         if kind == HandleKind::Dev(DeviceKind::Modeset) {
-            // Every one is a host NVKMS open with an event list NVKMS never
-            // bounds (nvkms.c:6422-6435) and permission state of its own.
-            let open = self
-                .handles
-                .handles()
-                .into_iter()
-                .filter(|&h| self.handles.kind(h) == Some(kind))
-                .count();
-            if open >= nvkms::MAX_MODESET_OPENS {
-                log::warn!(
-                    "OPEN of /dev/nvidia-modeset refused: {open} already open, the most one VM \
-                     may hold"
-                );
+            if let Some(why) = self.modeset_open_refused(self.current_owner) {
+                log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
                 return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
             }
         }
@@ -1615,7 +1634,7 @@ impl NvidiaBackend {
             HandleKind::Dev(_) => fd.try_clone().ok(),
             _ => None,
         };
-        let guest_handle = match self.handles.insert(fd, kind) {
+        let guest_handle = match self.handles.insert_for(fd, kind, self.current_owner) {
             Ok(h) => h,
             Err(full) => {
                 log::warn!("open {:?}: handle table full", path);
@@ -1638,6 +1657,37 @@ impl NvidiaBackend {
         // The handle is returned in the header. The driver reads it from there
         // and there is no response payload at all.
         self.write_hdr(resp_buf, guest_handle, 0)
+    }
+
+    /// Why guest process `owner` may not open another `/dev/nvidia-modeset`,
+    /// if it may not. Every one is a host NVKMS open with an event list NVKMS
+    /// never bounds (nvkms.c:6422-6435) and permission state of its own: at
+    /// most [`nvkms::MAX_MODESET_OPENS`] per VM, and a process's share of
+    /// them ([`nvkms::MODESET_SHARE`], B4).
+    pub(crate) fn modeset_open_refused(&self, owner: crate::quota::Owner) -> Option<String> {
+        let kind = HandleKind::Dev(DeviceKind::Modeset);
+        let (mut open, mut mine) = (0usize, 0usize);
+        for h in self.handles.handles() {
+            if self.handles.kind(h) == Some(kind) {
+                open += 1;
+                if self.handles.owner(h) == owner {
+                    mine += 1;
+                }
+            }
+        }
+        if open >= nvkms::MAX_MODESET_OPENS {
+            return Some(format!("{open} already open, the most one VM may hold"));
+        }
+        crate::quota::admits(
+            &nvkms::MODESET_SHARE,
+            owner,
+            mine as u64,
+            1,
+            open as u64,
+            nvkms::MAX_MODESET_OPENS as u64,
+        )
+        .err()
+        .map(|why| format!("guest process {owner:?} holds {mine} of the VM's {open} ({why:?})"))
     }
 
     // ------------------------------------------------------------------
@@ -1778,6 +1828,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
         }
         let (base, len) = (req.offset, req.size);
+        self.uvm_maps.set_owner(handle, self.handles.owner(handle));
         let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
             Ok(p) => p,
             Err(errno) => {
@@ -1883,16 +1934,20 @@ impl NvidiaBackend {
     /// not fit falls back to write-combining, which is always a correct way to
     /// map what the host maps write-back (only slower to read); nothing else
     /// falls back, least of all registers, which must stay uncached.
+    ///
+    /// The extent is charged to `owner`, which holds at most its share of a
+    /// zone (quota.rs, B2).
     fn alloc_zone(
         &mut self,
         length: u64,
         want: crate::shm::PgprotKind,
+        owner: crate::quota::Owner,
     ) -> Result<crate::shm::ShmRegion> {
         use crate::shm::PgprotKind;
-        match self.shm.alloc(length, want) {
+        match self.shm.alloc_for(length, want, owner) {
             Err(e) if want == PgprotKind::WriteBack => {
                 log::warn!("write-back zone: {e}; placing {length:#x} bytes write-combining");
-                self.shm.alloc(length, PgprotKind::WriteCombine)
+                self.shm.alloc_for(length, PgprotKind::WriteCombine, owner)
             }
             r => r,
         }
@@ -2006,7 +2061,7 @@ impl NvidiaBackend {
 
         let length = size.max(4096);
         let writable = crate::shm::host_mapping_writable(host_fd, length, fd_offset);
-        let region = match self.alloc_zone(length, pgprot) {
+        let region = match self.alloc_zone(length, pgprot, self.handles.owner(handle)) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("mmap on handle {handle}: window has no room: {e}");
@@ -2573,6 +2628,17 @@ impl NvidiaBackend {
                 // sent, and a long one is not this release's command.
                 if let Err(errno) = self.uvm_size_ok(ireq.cmd, params.len()) {
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
+                // A semaphore pool is host kernel memory the moment UVM makes
+                // it: its length and the budgets are checked first, not only
+                // whether it may later be mapped (uvmmap.rs, F1).
+                self.uvm_maps
+                    .set_owner(self.current_handle, self.handles.owner(self.current_handle));
+                if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL && params.len() >= 16 {
+                    let len = u64::from_le_bytes(params[8..16].try_into().unwrap());
+                    if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                    }
                 }
                 // The descriptor some commands name another file by
                 // (uvmfd.rs): our handle, as the guest driver sent it, becomes
@@ -4545,7 +4611,13 @@ impl NvidiaBackend {
 
         // --- Step 5: Allocate SHM region ---
 
-        let region = match self.alloc_zone(length, pgprot) {
+        // Charged to whoever opened the file the mapping is armed on: the
+        // process that will map it.
+        let owner = match self.handles.owner(guest_fd_handle) {
+            crate::quota::Owner::Unknown => self.current_owner,
+            o => o,
+        };
+        let region = match self.alloc_zone(length, pgprot, owner) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
@@ -4862,7 +4934,9 @@ impl NvidiaBackend {
             {
                 self.uvm_maps.mark_shared(handle);
             }
-            ALLOC_SEMAPHORE_POOL if self.uvm_maps.is_shared(handle) => {
+            // Every pool, mapped or not: what the pool budgets count
+            // (uvmmap.rs, F1). Only one in sharing mode can be mapped.
+            ALLOC_SEMAPHORE_POOL => {
                 let (base, len) = (word(0), word(8));
                 let (_, stale) = self.uvm_maps.record(handle, base, len);
                 if let Some(w) = stale {
@@ -7807,7 +7881,11 @@ mod uvm_map_tests {
         e.alloc(b, X, L);
         e.mmap(a, X, L, 3).unwrap();
         e.calls();
-        assert_eq!(e.mmap(b, X, L, 3).map(|_| ()), Err(libc::EEXIST));
+        assert_eq!(
+            e.mmap(b, X, L, 3).map(|_| ()),
+            Err(libc::ENOMEM),
+            "refused as any placement is, with no errno of its own"
+        );
         assert!(e.calls().is_empty(), "refused before the VMM is asked");
     }
 
@@ -8044,5 +8122,51 @@ mod descriptor_field_tests {
         assert_eq!(send(&mut be, -1), 0);
         assert_eq!(send(&mut be, -2), -libc::EBADF);
         assert_eq!(send(&mut be, i32::MIN), -libc::EBADF);
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+    use crate::quota::Owner;
+
+    fn devnull() -> OwnedFd {
+        std::fs::File::open("/dev/null").unwrap().into()
+    }
+
+    /// One process holding every NVKMS open left the compositor with none
+    /// (B4): a process holds at most its share, and the VM cap stays.
+    #[test]
+    fn one_guest_process_cannot_hold_every_modeset_open() {
+        let mut be = NvidiaBackend::for_test();
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        let modeset = HandleKind::Dev(DeviceKind::Modeset);
+        let mut n = 0;
+        while be.modeset_open_refused(p(1)).is_none() {
+            be.handles.insert_for(devnull(), modeset, p(1)).unwrap();
+            n += 1;
+        }
+        assert_eq!(n, nvkms::MODESET_SHARE.per_owner);
+        assert!(be.modeset_open_refused(p(2)).is_none());
+        // Three more processes take theirs; the VM's last eight are kept
+        // for processes holding at most two.
+        for t in 2..5 {
+            while be.modeset_open_refused(p(t)).is_none() {
+                be.handles.insert_for(devnull(), modeset, p(t)).unwrap();
+            }
+        }
+        assert!(be.modeset_open_refused(p(9)).is_none(), "a newcomer gets one");
+        for _ in 0..8 {
+            if be.modeset_open_refused(Owner::Unknown).is_none() {
+                be.handles.insert(devnull(), modeset).unwrap();
+            }
+        }
+        assert!(
+            be.modeset_open_refused(p(9)).is_some(),
+            "the VM cap is still the outer bound"
+        );
     }
 }
