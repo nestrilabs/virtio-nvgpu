@@ -160,13 +160,147 @@ struct drm_nvidia_get_dev_info_params {
 } __packed;
 
 /*
+ * GET_DEV_INFO, answered from the host's own node (the record the backend
+ * sent in GET_SYS_FILES), in the layout the caller asked for.
+ *
+ * These fields describe how the card lays memory out, and the ICD matches a
+ * DRM node to an RM device by the gpu_id among them, so none of them is ours
+ * to invent -- the constants that used to be here reported gpu_id 0 where the
+ * host says 0x100, and a page kind correct only on the two architectures the
+ * comment named.
+ *
+ * The struct has had four layouts, and the size in the ioctl number is the
+ * only thing that tells them apart (the backend's normalise_dev_info has the
+ * table): 20 bytes on 535, 28 on 545.23, 32 on 545.29-570 (supports_alloc
+ * after primary_index), 36 from 575 (mig_device after gpu_id). The record is
+ * always the 36-byte one; each caller gets its own layout cut from it. This
+ * used to write 36 bytes whatever the caller's struct was, which on a 535
+ * guest is 16 bytes of its stack past a 20-byte struct, and the words in the
+ * wrong places besides. Nothing is ever written past _IOC_SIZE:
+ *
+ *   20/28/32/36  that layout, from the record
+ *   > 36         the 36-byte layout, the rest cleared -- what drm_ioctl does
+ *                for a caller newer than its driver (drm_ioctl.c:911-912)
+ *   otherwise    -EINVAL; there is no layout to answer in
+ */
+static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
+                                   struct nvgpu_dri_dev *dri,
+                                   struct drm_file *file, unsigned int cmd,
+                                   void __user *uarg) {
+  struct drm_nvidia_get_dev_info_params r;
+  unsigned int want = _IOC_SIZE(cmd);
+  u32 out[NVGPU_DEV_INFO_WORDS];
+  unsigned int n = 0;
+
+  BUILD_BUG_ON(sizeof(r) != NVGPU_DEV_INFO_WORDS * sizeof(u32));
+  if (want != 20 && want != 28 && want != 32 && want < 36)
+    return -EINVAL;
+  memcpy(&r, dri->dev_info, sizeof(r));
+
+  /*
+   * The capability bits are the host's answer about the host's node, ANDed
+   * with what this node forwards -- never set where the host says no. The
+   * host clears all of them without an NVKMS device (nvidia_drm.modeset=0)
+   * and the two fence bits without semaphore-surface support
+   * (nvidia-drm-drv.c:1095-1116); a guest that claimed them anyway sent the
+   * ICD to 0x54 on every vkCreateDevice, where the host answered -EOPNOTSUPP
+   * (nvidia-drm-fence.c:1316-1318) and the device failed to create.
+   *
+   *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
+   *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d); also
+   *                      turned off by claim_alloc=0 to tell a GEM problem
+   *                      from everything else in one boot
+   *   supports_sync_fd   with fences on, the semsurf bit: nvidia-drm sets
+   *   supports_semsurf   both from one condition, so no userspace has seen
+   *                      one without the other, and 0x54..0x57 are forwarded
+   *                      (nvgpu_fence.c). With fences off, semsurf is 0 (no
+   *                      0x54) and sync_fd only with claim_sync_fd.
+   *
+   * The page kinds are "only valid if supports_alloc is true"
+   * (nv_drm_common_ioctl.h:219-221) and the host zeroes them when it is not,
+   * so they are zeroed here when this node turns it off -- but only in a
+   * layout that has the bit: 535's and 545.23's report the kinds without one
+   * (supports_alloc there is the backend's DMABUF_SUPPORTED answer, which
+   * says the same thing), and a caller in those gets them as the host said.
+   */
+  r.supports_alloc = nvgpu_claim_alloc && r.supports_alloc;
+  if (want >= 32 && !r.supports_alloc) {
+    r.generic_page_kind = 0;
+    r.page_kind_generation = 0;
+    r.sector_layout = 0;
+  }
+  if (nvgpu_fences_enabled(nfd->dev)) {
+    r.supports_sync_fd = r.supports_semsurf;
+  } else {
+    r.supports_sync_fd = nvgpu_claim_sync_fd && r.supports_sync_fd;
+    r.supports_semsurf = 0;
+  }
+
+  /*
+   * primary_index is the number of the DRM node this device is, and it has
+   * to be *ours*. The host's number describes the host's /dev/dri, and the
+   * ICD uses it to find the node in the guest's: it looks for card<N>,
+   * does not find it, associates the device with no DRM node at all, and
+   * then reports no dma-buf support -- so a compositor's only buffer path
+   * is gone and nothing can present. The symptom is three steps from the
+   * cause and names none of it:
+   *
+   *   drm props: hasPrimary=0 0:0  hasRender=0 0:0
+   *   VK_EXT_external_memory_dma_buf absent
+   *   vkcube: "Could not find both graphics and present queues"
+   *
+   * This was invisible for as long as there was one test box, because its
+   * NVIDIA card was card0 on the host and card0 in the guest, and passing
+   * the host's number through was indistinguishable from getting it right.
+   * The second box has an integrated GPU, so its NVIDIA node is card1 --
+   * and nothing presented.
+   */
+  if (file && file->minor && file->minor->dev && file->minor->dev->primary)
+    r.primary_index = file->minor->dev->primary->index;
+
+  out[n++] = r.gpu_id;
+  if (want >= 36)
+    out[n++] = r.mig_device;
+  out[n++] = r.primary_index;
+  if (want >= 32)
+    out[n++] = r.supports_alloc;
+  out[n++] = r.generic_page_kind;
+  out[n++] = r.page_kind_generation;
+  out[n++] = r.sector_layout;
+  if (want >= 28) {
+    out[n++] = r.supports_sync_fd;
+    out[n++] = r.supports_semsurf;
+  }
+
+  /*
+   * A caller whose layout is not the host's runs userspace from another
+   * release than the host kernel. The answer above is still right for its
+   * layout, but its RM calls will not be, and this is the one place the
+   * mismatch is visible before they fail.
+   */
+  if (dri->dev_info_size && want != dri->dev_info_size)
+    dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                         "virtio-gpu-nv: GET_DEV_INFO asked in a %u-byte "
+                         "layout, the host's is %u bytes: guest userspace "
+                         "and host driver are different releases\n",
+                         want, dri->dev_info_size);
+
+  if (copy_to_user(uarg, out, n * sizeof(u32)))
+    return -EFAULT;
+  if (want > n * sizeof(u32) &&
+      clear_user((u8 __user *)uarg + n * sizeof(u32), want - n * sizeof(u32)))
+    return -EFAULT;
+  return 0;
+}
+
+/*
  * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
  * nodes.
  *
  * DRM_IOCTL_VERSION  (nr=0x00) — core ioctl, returns name="nvidia-drm"
- * GET_DEV_INFO       (nr=0x43) — driver ioctl, returns gpu_id etc.
- * FENCE_SUPPORTED    (nr=0x44) — driver ioctl, returns 0
- * DMABUF_SUPPORTED   (nr=0x4f) — driver ioctl, returns 0
+ * GET_DEV_INFO       (nr=0x43) — the host's record, in the caller's layout
+ * FENCE_SUPPORTED    (nr=0x44) — -EINVAL: 0x45/0x46 are not forwarded
+ * DMABUF_SUPPORTED   (nr=0x4f) — the host's answer (supports_alloc)
  *
  * Everything else → -ENOTTY.
  */
@@ -215,98 +349,8 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
   switch (nr - DRM_COMMAND_BASE) {
 
-  case DRM_NVIDIA_GET_DEV_INFO: {
-    /*
-     * Straight from the host's own node. These fields describe how the card
-     * lays memory out, and the ICD matches a DRM node to an RM device by the
-     * gpu_id among them, so none of them is ours to invent -- the constants
-     * that used to be here reported gpu_id 0 where the host says 0x100, and a
-     * page kind correct only on the two architectures the comment named.
-     */
-    u32 info[NVGPU_DEV_INFO_WORDS];
-
-    BUILD_BUG_ON(sizeof(struct drm_nvidia_get_dev_info_params) !=
-                 NVGPU_DEV_INFO_WORDS * sizeof(u32));
-
-    memcpy(info, dri->dev_info, sizeof(info));
-
-    /*
-     * The ICD's idea of this struct's size, against ours. A newer driver can
-     * grow it, and this handler answers the user pointer directly rather than
-     * through drm_ioctl's buffer -- so a larger struct is filled to 36 bytes
-     * and the rest is left as whatever the caller had there. The ICD then
-     * reads rubbish for the fields it added, and the symptom is not an error:
-     * it is a device that associates with no DRM node at all.
-     */
-    if (_IOC_SIZE(cmd) != sizeof(info))
-      dev_warn(&nfd->dev->vdev->dev,
-               "virtio-gpu-nv: GET_DEV_INFO size mismatch: caller wants %u "
-               "bytes, this build answers %zu\n",
-               _IOC_SIZE(cmd), sizeof(info));
-
-    /*
-     * The three capability bits are the host's answer about the host's node,
-     * and this node is not that node: it answers four ioctls and forwards
-     * nothing else. Passing them through unchanged is a promise this stub
-     * cannot keep -- with supports_semsurf set, the ICD asks for
-     * SEMSURF_FENCE_CTX_CREATE (nr 0x54) on every device creation, gets
-     * -ENOTTY, and fails the whole vkCreateDevice with
-     * ERROR_INITIALIZATION_FAILED.
-     *
-     * Each stays zero until the ioctls behind it are forwarded:
-     *
-     *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
-     *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d)
-     *   supports_sync_fd   PRIME_FENCE_CONTEXT_CREATE, GEM_PRIME_FENCE_ATTACH
-     *                      (0x05, 0x06)
-     *   supports_semsurf   SEMSURF_FENCE_CTX_CREATE and the three that follow
-     *                      it (0x14..0x17)
-     *
-     * gpu_id, primary_index and the page-kind and sector-layout fields stay
-     * as the host reported them: they describe the card, which is genuinely
-     * the host's, and the ICD matches a DRM node to an RM device by gpu_id.
-     */
-    info[3] = nvgpu_claim_alloc;   /* supports_alloc */
-    info[7] = nvgpu_claim_sync_fd; /* supports_sync_fd */
-    info[8] = 0;                   /* supports_semsurf */
-    /*
-     * With the backend serving fences, 0x54..0x57 are forwarded
-     * (nvgpu_fence.c) and both bits are the host's truth again. They go
-     * together: nvidia-drm sets both from one condition, semsurf_stride != 0
-     * (nvidia-drm-drv.c:1086-1117), so no userspace has ever seen one
-     * without the other.
-     */
-    if (nvgpu_fences_enabled(nfd->dev)) {
-      info[7] = 1;
-      info[8] = 1;
-    }
-
-    /*
-     * primary_index is the number of the DRM node this device is, and it has
-     * to be *ours*. The host's number describes the host's /dev/dri, and the
-     * ICD uses it to find the node in the guest's: it looks for card<N>,
-     * does not find it, associates the device with no DRM node at all, and
-     * then reports no dma-buf support -- so a compositor's only buffer path
-     * is gone and nothing can present. The symptom is three steps from the
-     * cause and names none of it:
-     *
-     *   drm props: hasPrimary=0 0:0  hasRender=0 0:0
-     *   VK_EXT_external_memory_dma_buf absent
-     *   vkcube: "Could not find both graphics and present queues"
-     *
-     * This was invisible for as long as there was one test box, because its
-     * NVIDIA card was card0 on the host and card0 in the guest, and passing
-     * the host's number through was indistinguishable from getting it right.
-     * The second box has an integrated GPU, so its NVIDIA node is card1 --
-     * and nothing presented.
-     */
-    if (file && file->minor && file->minor->dev && file->minor->dev->primary)
-      info[2] = file->minor->dev->primary->index;
-
-    if (copy_to_user(uarg, info, sizeof(info)))
-      return -EFAULT;
-    return 0;
-  }
+  case DRM_NVIDIA_GET_DEV_INFO:
+    return nvgpu_drm_get_dev_info(nfd, dri, file, cmd, uarg);
 
   case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID: {
     /*
@@ -328,15 +372,32 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     return 0;
   }
 
+  /*
+   * FENCE_SUPPORTED answers for the PRIME fence pair behind it,
+   * PRIME_FENCE_CONTEXT_CREATE and GEM_PRIME_FENCE_ATTACH (0x45, 0x46), and
+   * this node forwards neither -- the render schema refuses them by absence.
+   * Its old answer, 0, is the ioctl's "yes" (the host returns 0 with an
+   * NVKMS device and -EINVAL without, nvidia-drm-fence.c:387-392), and the
+   * 610 Xorg DDX (nvidia_drv.so) turns PRIME fencing on from it and then has
+   * every attach fail. -EINVAL is the host's own "no".
+   */
   case DRM_NVIDIA_FENCE_SUPPORTED:
-    return 0; /* not supported, no payload */
+    return -EINVAL;
 
+  /*
+   * DMABUF_SUPPORTED is the host's "is there an NVKMS device behind this
+   * node" (nvidia-drm-drv.c:1127-1135: 0 or -EINVAL), which is exactly
+   * supports_alloc in the record -- the backend fills that word from this
+   * same ioctl on hosts whose GET_DEV_INFO predates it. It used to answer 0
+   * everywhere, which on a modeset=0 host sent the ICD down a dma-buf path
+   * the host then refused.
+   */
   case DRM_NVIDIA_DMABUF_SUPPORTED:
-    return 0; /* not supported, no payload */
+    return dri->dev_info[3] ? 0 : -EINVAL;
 
   /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c).
-   * Only with the backend serving fences, which is also the only time
-   * GET_DEV_INFO says they exist. */
+   * Only with the backend serving fences; GET_DEV_INFO says they exist only
+   * then, and only when the host's node says so too. */
   case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_WAIT:

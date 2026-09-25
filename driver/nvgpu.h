@@ -53,8 +53,12 @@ struct nvgpu_dri_dev {
   /* GET_DEV_INFO as the host's own node answered it. Passed through rather
    * than reconstructed here: the gpu_id in it is what the ICD matches a DRM
    * node to an RM device by, and the page-kind and sector-layout fields are
-   * per-architecture and were previously hardcoded for Ampere. */
+   * per-architecture and were previously hardcoded for Ampere. Always the
+   * 36-byte (575 and later) layout: the backend normalises older hosts'. */
   u32 dev_info[NVGPU_DEV_INFO_WORDS];
+  /* The host's own GET_DEV_INFO struct size (20/28/32/36; 0 unknown), from
+   * GET_SYS_FILES section 4; 36 from a backend that predates it. */
+  u32 dev_info_size;
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
   bool registered;

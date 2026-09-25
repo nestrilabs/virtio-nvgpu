@@ -108,6 +108,14 @@ RENDER_IOCTLS = shared(RENDER) + [
           ]),
     Ioctl('NV_GET_DEV_INFO', RENDER, 'DRM_IOCTL_NVIDIA_GET_DEV_INFO',
           'struct drm_nvidia_get_dev_info_params', 36, nv(0x03), IOWR),
+    # The same struct in its older layouts, all value-only: 535's 20 bytes
+    # (535.129.03 nvidia-drm-ioctl.h:153-161), 545.23's 28 and 545.29-570's
+    # 32 (supports_alloc inserted). The guest answers every one of them from
+    # the host's record (nvgpu_drm_get_dev_info); these say the numbers are
+    # nvidia-drm's, so a v1 forward of one is sized by its own number.
+    Ioctl('NV_GET_DEV_INFO_V535', RENDER, None, None, 20, nv(0x03), IOWR),
+    Ioctl('NV_GET_DEV_INFO_V545', RENDER, None, None, 28, nv(0x03), IOWR),
+    Ioctl('NV_GET_DEV_INFO_V550', RENDER, None, None, 32, nv(0x03), IOWR),
     Ioctl('NV_FENCE_SUPPORTED', RENDER, 'DRM_IOCTL_NVIDIA_FENCE_SUPPORTED',
           None, 0, nv(0x04), IOC_NONE),
     # nvidia-drm-gem-nvkms-memory.c:576 → nvkms-kapi.c:1867 ExportMemory.

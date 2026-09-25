@@ -135,7 +135,8 @@ static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
  * Which capability bits GET_DEV_INFO claims. Parameters rather than constants
  * because what the ICD asks for next depends on them, and the cost of being
  * wrong is a device that will not initialise -- cheaper to sweep than to
- * rebuild. Both default off: the ioctls behind them are not forwarded.
+ * rebuild. Each is ANDed with the host's own bit (nvgpu_drm_get_dev_info), so
+ * it can only take a capability away, never claim one the host lacks.
  */
 /*
  * supports_alloc is on by default now, because the ioctls behind it work: a
@@ -2054,15 +2055,15 @@ static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
  * section 2, and then there is nothing between `p` and `end` and no card is
  * recorded; the parse never runs past what the device wrote.
  */
-static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
-                                     const u8 *end) {
+static const u8 *nvgpu_parse_card_section(struct nvgpu_device *dev,
+                                          const u8 *p, const u8 *end) {
   struct nvgpu_card_record rec;
   __le32 raw_count;
   u32 count, i;
 
   dev->num_card_recs = 0;
   if (end - p < (ptrdiff_t)sizeof(raw_count))
-    return;
+    return NULL;
   memcpy(&raw_count, p, sizeof(raw_count));
   count = le32_to_cpu(raw_count);
   p += sizeof(raw_count);
@@ -2074,7 +2075,7 @@ static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
     if (end - p < (ptrdiff_t)sizeof(rec)) {
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: card section truncated at entry %u\n", i);
-      return;
+      return NULL;
     }
     memcpy(&rec, p, sizeof(rec));
     p += sizeof(rec);
@@ -2083,7 +2084,7 @@ static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
     if (name_len == 0 || name_len > end - p) {
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: card entry %u bad name_len %u\n", i, name_len);
-      return;
+      return NULL;
     }
 
     /*
@@ -2095,7 +2096,7 @@ static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: card entry %u is past the %d this driver keeps\n",
                i, NVGPU_MAX_DRI_DEVS);
-      return;
+      return NULL;
     }
     c = &dev->cards[dev->num_card_recs];
     memset(c->name, 0, sizeof(c->name));
@@ -2118,6 +2119,36 @@ static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
              "virtio-gpu-nv: host card node %s (%u:%u) for DRI record %u\n",
              c->name, c->major, c->minor, render_index);
     dev->num_card_recs++;
+  }
+  return p;
+}
+
+/*
+ * Section 4: the size of each DRI record's host GET_DEV_INFO struct, in
+ * section 2's order. The record's nine words are the 36-byte layout whatever
+ * this says (the backend normalises a 535 host's 20 bytes, and 545's and
+ * 550's 28 and 32); the size says which of them the host really had, which
+ * nvgpu_drm_get_dev_info() uses to name a guest-userspace/host-kernel release
+ * mismatch. Absent from an older backend, whose records stay at 36.
+ */
+static void nvgpu_parse_dev_info_sizes(struct nvgpu_device *dev, const u8 *p,
+                                       const u8 *end) {
+  __le32 raw;
+  u32 count, i;
+
+  if (!p || end - p < (ptrdiff_t)sizeof(raw))
+    return;
+  memcpy(&raw, p, sizeof(raw));
+  count = le32_to_cpu(raw);
+  p += sizeof(raw);
+  if (count > (u32)((end - p) / sizeof(raw))) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: GET_DEV_INFO size section truncated\n");
+    return;
+  }
+  for (i = 0; i < count && i < (u32)dev->num_dri_devs; i++) {
+    memcpy(&raw, p + 4 * i, sizeof(raw));
+    dev->dri_devs[i].dev_info_size = le32_to_cpu(raw);
   }
 }
 
@@ -2319,6 +2350,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->dri_devs[idx].slot_index = slot_index;
       dev->dri_devs[idx].card_index = -1;
       memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
+      dev->dri_devs[idx].dev_info_size = sizeof(info);
       dev->num_dri_devs++;
 
       dev_info(&dev->vdev->dev,
@@ -2332,7 +2364,8 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   }
 
   if (dri_complete)
-    nvgpu_parse_card_section(dev, p, end);
+    nvgpu_parse_dev_info_sizes(dev, nvgpu_parse_card_section(dev, p, end),
+                               end);
 
 out:
   kvfree(resp_buf);

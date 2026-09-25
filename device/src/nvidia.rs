@@ -133,6 +133,13 @@ pub(crate) struct DriDevice {
     /// silently wrong elsewhere, which is the kind of wrong that produces a
     /// scrambled frame rather than an error.
     pub(crate) dev_info: [u32; NV_DEV_INFO_WORDS],
+    /// The size of the host's own `struct drm_nvidia_get_dev_info_params`,
+    /// in bytes, as the probe in [`host_dev_info`] measured it: 20, 28, 32
+    /// or 36, or 0 when the node did not answer or answered in a layout this
+    /// build does not know. `dev_info` above is always the 36-byte layout,
+    /// whatever this says; the size tells the guest which fields the host
+    /// actually had (GET_SYS_FILES section 4).
+    pub(crate) dev_info_size: u32,
 }
 
 /// The host DRM nodes of our GPUs, enumerated once.
@@ -147,20 +154,94 @@ pub(crate) struct HostNodes {
     pub(crate) cards: Vec<CardNode>,
 }
 
-/// `struct drm_nvidia_get_dev_info_params` is nine `u32`s. Carried as words
-/// because nothing here needs to interpret them -- only the guest does.
+/// `struct drm_nvidia_get_dev_info_params` in its current (575 and later)
+/// layout is nine `u32`s: gpu_id, mig_device, primary_index, supports_alloc,
+/// generic_page_kind, page_kind_generation, sector_layout, supports_sync_fd,
+/// supports_semsurf. Every host answer is normalised into this layout (see
+/// [`normalise_dev_info`]), because it is the only one that has every field.
 const NV_DEV_INFO_WORDS: usize = 9;
 
-/// `_IOWR('d', DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO, params)`, i.e.
-/// direction read|write, 36 bytes, type 'd', nr 0x43.
-const DRM_IOCTL_NVIDIA_GET_DEV_INFO: libc::c_ulong = 0xC024_6443;
+/// How many words the probe offers the host: more than any layout so far, so
+/// the one the host fills is measured rather than assumed.
+const NV_DEV_INFO_PROBE_WORDS: usize = 16;
 
-/// Ask a host render node what it is.
+/// `_IOWR('d', DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO, u32[16])`: the
+/// GET_DEV_INFO number with a 64-byte size field. The size is in the number,
+/// but nvidia-drm does not check it -- drm_ioctl (drm_ioctl.c:874-915) sizes
+/// its kernel buffer to the larger of the caller's and the driver's, copies
+/// the caller's 64 bytes in, lets the handler write its own struct over the
+/// front, and copies all 64 back.
+const DRM_IOCTL_NVIDIA_GET_DEV_INFO_PROBE: libc::c_ulong =
+    0xC000_6443 | ((4 * NV_DEV_INFO_PROBE_WORDS as libc::c_ulong) << 16);
+
+/// `DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_DMABUF_SUPPORTED)`: 0 when the node
+/// has an NVKMS device behind it (nvidia_drm.modeset=1), -EINVAL otherwise
+/// (nvidia-drm-drv.c:1127-1135). It has answered the same way in every
+/// release since 535, so it is the one way to learn `supports_alloc` from a
+/// host whose GET_DEV_INFO predates that field.
+const DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED: libc::c_ulong = 0x644f;
+
+/// The probe's filler. Every release's handler writes every field of its
+/// struct (535: nvidia-drm-drv.c:684-707; 545-570 and 610 write the booleans
+/// and page kinds unconditionally before the modeset=1 block, 610:1082-1117),
+/// and the last field of every layout is a small number or a boolean -- so
+/// the host's size is where the filler starts.
+const DEV_INFO_UNWRITTEN: u32 = 0xFFFF_FFFF;
+
+/// The size of the struct the host wrote, from a probe buffer that was full of
+/// [`DEV_INFO_UNWRITTEN`] before the ioctl.
+fn dev_info_host_size(probe: &[u32]) -> u32 {
+    let words = probe
+        .iter()
+        .rposition(|&w| w != DEV_INFO_UNWRITTEN)
+        .map_or(0, |i| i + 1);
+    4 * words as u32
+}
+
+/// The host's GET_DEV_INFO reply, in whatever layout its size says, as the
+/// nine-word current layout.
 ///
-/// `None` when the node cannot be opened or refuses the ioctl, which leaves
-/// the guest on its own constants -- wrong, but no worse than before, and
-/// said out loud rather than discovered later in a frame.
-fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
+/// The struct has had four shapes, and the size is the only thing that tells
+/// them apart -- the fields that moved are all small numbers:
+///
+/// | bytes | releases | fields |
+/// |---|---|---|
+/// | 20 | 535 | gpu_id, primary_index, page kind, generation, sector layout |
+/// | 28 | 545.23 | ... then supports_sync_fd, supports_semsurf |
+/// | 32 | 545.29-570 | supports_alloc inserted after primary_index |
+/// | 36 | 575- | mig_device inserted after gpu_id |
+///
+/// (535.129.03 nvidia-drm-ioctl.h:153-161, 545.23.06 and 550.54.14 likewise,
+/// 575.51.02 and 610.57.04 nv_drm_common_ioctl.h:213-227.) Reading a 20-byte
+/// answer as the 36-byte layout -- what this did before -- took primary_index
+/// for mig_device, the page kind for supports_alloc and the generation for
+/// the page kind. A field the host's layout does not have is reported as
+/// absent (0), except `supports_alloc`, which `modeset` answers: on every
+/// release it means exactly "the node has an NVKMS device", which is what
+/// DMABUF_SUPPORTED reports.
+///
+/// `None` for a size this build does not know.
+fn normalise_dev_info(raw: &[u32], size: u32, modeset: bool) -> Option<[u32; NV_DEV_INFO_WORDS]> {
+    let w = |i: usize| raw.get(i).copied().unwrap_or(0);
+    let alloc = u32::from(modeset);
+    Some(match size {
+        20 => [w(0), 0, w(1), alloc, w(2), w(3), w(4), 0, 0],
+        28 => [w(0), 0, w(1), alloc, w(2), w(3), w(4), w(5), w(6)],
+        32 => [w(0), 0, w(1), w(2), w(3), w(4), w(5), w(6), w(7)],
+        36 => std::array::from_fn(w),
+        _ => return None,
+    })
+}
+
+/// Ask a host render node what it is: its GET_DEV_INFO answer normalised to
+/// the current layout, and the size of the layout the host answered in.
+///
+/// `None` when the node cannot be opened, refuses the ioctl, or answers in a
+/// layout this build does not know. The caller then reports every word as 0,
+/// capability bits included: a node that claims nothing is one the ICD does
+/// not use for allocation or fencing, where invented capabilities made it try
+/// and fail (vkCreateDevice failing on 0x54's -EOPNOTSUPP).
+fn host_dev_info(path: &str) -> Option<([u32; NV_DEV_INFO_WORDS], u32)> {
     let c_path = CString::new(path).ok()?;
     // SAFETY: a NUL-terminated path, and the fd is closed below.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -171,23 +252,33 @@ fn host_dev_info(path: &str) -> Option<[u32; NV_DEV_INFO_WORDS]> {
         );
         return None;
     }
-    let mut params = [0u32; NV_DEV_INFO_WORDS];
-    // SAFETY: `params` is exactly the 36 bytes the ioctl's size field declares.
+    let mut probe = [DEV_INFO_UNWRITTEN; NV_DEV_INFO_PROBE_WORDS];
+    // SAFETY: `probe` is exactly the 64 bytes the ioctl's size field declares.
     let rc = unsafe {
         libc::ioctl(
             fd,
-            DRM_IOCTL_NVIDIA_GET_DEV_INFO,
-            params.as_mut_ptr() as *mut libc::c_void,
+            DRM_IOCTL_NVIDIA_GET_DEV_INFO_PROBE,
+            probe.as_mut_ptr() as *mut libc::c_void,
         )
     };
     let err = std::io::Error::last_os_error();
+    // SAFETY: no argument; the return value is the whole answer.
+    let modeset = unsafe { libc::ioctl(fd, DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED) } == 0;
     // SAFETY: fd came from open() above and is not used again.
     unsafe { libc::close(fd) };
     if rc != 0 {
         log::warn!("{path}: GET_DEV_INFO refused ({err})");
         return None;
     }
-    Some(params)
+    let size = dev_info_host_size(&probe);
+    let Some(info) = normalise_dev_info(&probe, size, modeset) else {
+        log::warn!(
+            "{path}: GET_DEV_INFO answered in a {size}-byte layout this build \
+             does not know; reporting no capabilities"
+        );
+        return None;
+    };
+    Some((info, size))
 }
 
 /// Which host tree a `GetProcFiles`/`GetSysFiles` request refers to.
@@ -671,6 +762,32 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
     off
 }
 
+/// GET_SYS_FILES section 4: `u32 count`, then per DRI record (in section 2's
+/// order) the size in bytes of the host's GET_DEV_INFO struct, 0 for unknown.
+///
+/// Section 2's nine words are always the 36-byte layout -- normalised here
+/// from whatever the host answered (normalise_dev_info) -- so a guest that
+/// never reads this still answers correctly. The size is for the guest to
+/// know which of those words the host really had, and to say so when a caller
+/// asks in another layout: that is guest userspace built for a different
+/// release than the host kernel, which is worth one line in dmesg because
+/// the RM ABI check fails next. A guest that predates the section stops
+/// after section 3; an older backend leaves it out, which the guest reads as
+/// "36", the only layout an older backend ever asked in. Written whole or not
+/// at all, like section 3.
+fn write_dev_info_sizes(devices: &[DriDevice], buf: &mut [u8]) -> usize {
+    let need = 4 + 4 * devices.len();
+    if need > buf.len() {
+        log::warn!("GET_SYS_FILES: no room for the GET_DEV_INFO sizes");
+        return 0;
+    }
+    buf[..4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
+    for (i, d) in devices.iter().enumerate() {
+        buf[4 + 4 * i..8 + 4 * i].copy_from_slice(&d.dev_info_size.to_le_bytes());
+    }
+    need
+}
+
 /// GET_SYS_FILES section 3: the card nodes, in every mode; openable only in
 /// compositor-VM mode (BCAP_KMS_CARD), informational otherwise.
 ///
@@ -773,25 +890,24 @@ fn enumerate_host_nodes() -> HostNodes {
             let Some((major, minor)) = node_dev(name) else {
                 continue;
             };
-            let dev_info = host_dev_info(&format!("/dev/dri/{name}")).unwrap_or_else(|| {
-                // Same shape the guest used to invent, so a refusal is no
-                // worse than the old behaviour -- but it is logged above.
-                let mut fallback = [0u32; NV_DEV_INFO_WORDS];
-                fallback[3] = 1; // supports_alloc
-                fallback[4] = 6; // generic_page_kind
-                fallback[5] = 2; // page_kind_generation
-                fallback[6] = 1; // sector_layout
-                fallback[7] = 1; // supports_sync_fd
-                fallback[8] = 1; // supports_semsurf
-                fallback
-            });
+            // A node that will not say what it is claims nothing. The fallback
+            // used to be a Turing's answer with every capability bit set, which
+            // on any other card is a wrong page kind, and on a modeset=0 host
+            // is a promise of semaphore surfaces that 0x54 then breaks
+            // (-EOPNOTSUPP, nvidia-drm-fence.c:1316) inside vkCreateDevice.
+            let (dev_info, dev_info_size) =
+                host_dev_info(&format!("/dev/dri/{name}")).unwrap_or(([0; NV_DEV_INFO_WORDS], 0));
             log::info!(
                 "DRI {name} at {major}:{minor} on {addr} (slot {index}, \
-                 nvidia gpu_id {:#x}, page kind {}/{}, sector layout {})",
+                 nvidia gpu_id {:#x}, page kind {}/{}, sector layout {}, \
+                 alloc {} sync_fd {} semsurf {}, {dev_info_size}-byte layout)",
                 dev_info[0],
                 dev_info[4],
                 dev_info[5],
                 dev_info[6],
+                dev_info[3],
+                dev_info[7],
+                dev_info[8],
             );
             nodes.dri.push(DriDevice {
                 name: name.clone(),
@@ -799,6 +915,7 @@ fn enumerate_host_nodes() -> HostNodes {
                 minor,
                 slot_index: index as u32,
                 dev_info,
+                dev_info_size,
             });
         }
         if nodes.dri.len() as u32 == first_render {
@@ -1681,10 +1798,17 @@ impl NvidiaBackend {
         // OPEN_KMS is refused without --kms-card. A guest that predates the
         // section stops parsing after the DRI one; an older backend leaves it
         // out, which a guest reads as "no cards".
+        //
+        // A fourth, only after a whole third: the size of each DRI record's
+        // host GET_DEV_INFO layout (write_dev_info_sizes).
         if tree == FileTree::Sys {
             let nodes = self.host_nodes();
             off += write_dri_section(&nodes.dri, &mut resp_buf[off..]);
-            off += write_card_section(&nodes.cards, &mut resp_buf[off..]);
+            let cards = write_card_section(&nodes.cards, &mut resp_buf[off..]);
+            off += cards;
+            if cards > 0 {
+                off += write_dev_info_sizes(&nodes.dri, &mut resp_buf[off..]);
+            }
         }
         off
     }
@@ -4504,6 +4628,114 @@ mod tests {
         assert_eq!(parse_resp(&resp).req_id, 0x1234);
     }
 
+    /// A probe buffer as the host leaves it: its own struct over the front,
+    /// the filler after.
+    fn probe_with(host: &[u32]) -> [u32; NV_DEV_INFO_PROBE_WORDS] {
+        let mut p = [DEV_INFO_UNWRITTEN; NV_DEV_INFO_PROBE_WORDS];
+        p[..host.len()].copy_from_slice(host);
+        p
+    }
+
+    #[test]
+    fn the_get_dev_info_probe_asks_with_a_64_byte_size_field() {
+        assert_eq!(DRM_IOCTL_NVIDIA_GET_DEV_INFO_PROBE, 0xC040_6443);
+        assert_eq!(
+            hostfd::ioc_size(DRM_IOCTL_NVIDIA_GET_DEV_INFO_PROBE as u32),
+            64
+        );
+    }
+
+    #[test]
+    fn the_host_layout_is_measured_from_where_the_filler_starts() {
+        // 535: gpu_id, primary_index, kind, generation, sector layout -- with
+        // a zero in the middle, which is still a written word.
+        assert_eq!(dev_info_host_size(&probe_with(&[0x100, 0, 6, 2, 1])), 20);
+        assert_eq!(
+            dev_info_host_size(&probe_with(&[0x100, 1, 6, 2, 1, 0, 0])),
+            28
+        );
+        assert_eq!(
+            dev_info_host_size(&probe_with(&[0x100, 1, 1, 6, 2, 1, 1, 1])),
+            32
+        );
+        assert_eq!(
+            dev_info_host_size(&probe_with(&[0x100, 0, 1, 1, 6, 2, 1, 0, 0])),
+            36
+        );
+        assert_eq!(dev_info_host_size(&probe_with(&[])), 0);
+    }
+
+    #[test]
+    fn a_535_answer_is_not_read_as_the_610_layout() {
+        let raw = probe_with(&[0x100, 1, 6, 2, 1]);
+        // The old reading: primary_index as mig_device, the page kind as
+        // supports_alloc, the generation as the page kind.
+        let info = normalise_dev_info(&raw, 20, true).unwrap();
+        assert_eq!(info, [0x100, 0, 1, 1, 6, 2, 1, 0, 0]);
+    }
+
+    #[test]
+    fn supports_alloc_comes_from_dmabuf_supported_where_the_layout_lacks_it() {
+        let raw = probe_with(&[0x100, 1, 6, 2, 1]);
+        assert_eq!(normalise_dev_info(&raw, 20, false).unwrap()[3], 0);
+        let raw = probe_with(&[0x100, 1, 6, 2, 1, 1, 1]);
+        assert_eq!(
+            normalise_dev_info(&raw, 28, true).unwrap(),
+            [0x100, 0, 1, 1, 6, 2, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn a_32_byte_answer_keeps_its_own_supports_alloc() {
+        // modeset=0 on 550: supports_alloc false and every kind zero, whatever
+        // DMABUF_SUPPORTED would say.
+        let raw = probe_with(&[0x100, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            normalise_dev_info(&raw, 32, true).unwrap(),
+            [0x100, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_36_byte_answer_passes_through_unchanged() {
+        let host = [0x100, 3, 1, 1, 6, 2, 1, 1, 1];
+        assert_eq!(
+            normalise_dev_info(&probe_with(&host), 36, false).unwrap(),
+            host
+        );
+    }
+
+    #[test]
+    fn an_unknown_layout_is_not_guessed_at() {
+        let raw = probe_with(&[1; 10]);
+        assert_eq!(normalise_dev_info(&raw, 40, true), None);
+        assert_eq!(normalise_dev_info(&raw, 0, true), None);
+    }
+
+    #[test]
+    fn the_dev_info_sizes_follow_the_card_section_in_dri_order() {
+        let dri = |size| DriDevice {
+            name: "renderD128".into(),
+            major: 226,
+            minor: 128,
+            slot_index: 0,
+            dev_info: [0; NV_DEV_INFO_WORDS],
+            dev_info_size: size,
+        };
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(vec![dri(20), dri(36)], Vec::new());
+        let mut buf = vec![0u8; 1 << 20];
+        let n = be.handle_get_files(FileTree::Sys, &mut buf);
+        let tail: Vec<u32> = buf[n - 12..n]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(tail, [2, 20, 36]);
+        // ...and the empty card section is right before them.
+        assert_eq!(read_struct::<u32>(&buf, n - 16), 0);
+        assert_eq!(write_dev_info_sizes(&[dri(20)], &mut [0u8; 7]), 0);
+    }
+
     #[test]
     fn the_card_section_is_written_whole_or_not_at_all() {
         let cards = vec![CardNode {
@@ -4559,7 +4791,9 @@ mod tests {
             assert_eq!(read_struct::<u32>(&buf, off), 1, "kms_card {kms_card}");
             let rec = read_struct::<CardRecord>(&buf, off + 4);
             assert_eq!((rec.major, rec.minor), (226, 1));
-            assert_eq!(n, off + 4 + 16 + 5);
+            off += 4 + 16 + 5;
+            assert_eq!(read_struct::<u32>(&buf, off), 0, "no GET_DEV_INFO sizes");
+            assert_eq!(n, off + 4);
         }
     }
 }
