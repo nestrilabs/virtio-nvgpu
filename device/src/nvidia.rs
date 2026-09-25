@@ -562,6 +562,10 @@ pub struct NvidiaBackend {
     /// The host ioctl entry point. `libc::ioctl`, except in tests that need to
     /// see what the host driver would be handed.
     host_ioctl: HostIoctl,
+    /// UVM files whose VA space came up with pageable access, or could not
+    /// be shown not to (`uvm_pageable_off`): nothing more goes to them, and no
+    /// other file's call may name them.
+    uvm_refused: std::collections::HashSet<u32>,
     /// Wayland channels (`DEV_WAYLAND` handles) and what configures them.
     pub(crate) wl: crate::wl::WlState,
     /// What the RM handles a mapping can name are (system memory and its
@@ -1016,6 +1020,7 @@ impl NvidiaBackend {
             semsurf,
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
+            uvm_refused: std::collections::HashSet::new(),
             wl: crate::wl::WlState::default(),
             rmmem: crate::rmmem::RmMem::default(),
         }
@@ -1275,6 +1280,7 @@ impl NvidiaBackend {
         self.vm_kms.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
+        self.uvm_refused.clear();
         self.nvkms.reset();
         self.semsurf.reset();
         // As in close_handle: display files close on the closer thread, not
@@ -2080,6 +2086,7 @@ impl NvidiaBackend {
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
         let (fd, kind) = self.handles.remove(handle)?;
+        self.uvm_refused.remove(&handle);
         for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
                 "close handle={handle}: releasing mapping at SHM {:#x}+{:#x}",
@@ -2292,8 +2299,26 @@ impl NvidiaBackend {
                 // nvidia-uvm works on the caller's address space, which is
                 // ours: only commands that cannot reach it go (guestptr.rs).
                 let tools = kind == HandleKind::Dev(DeviceKind::UvmTools);
+                if self.uvm_refused.contains(&self.current_handle) {
+                    log::warn!(
+                        "UVM ioctl {:#x} on handle {} refused: its VA space may have pageable \
+                         access",
+                        ireq.cmd,
+                        self.current_handle
+                    );
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+                }
+                let init_flags_mask = self
+                    .driver
+                    .and_then(abi::schema::uvm_table)
+                    .map_or(0, |t| t.init_flags_mask);
                 let mut params = param_in.to_vec();
-                let restore = match crate::guestptr::uvm_gate(tools, ireq.cmd, &mut params) {
+                let restore = match crate::guestptr::uvm_gate(
+                    tools,
+                    ireq.cmd,
+                    &mut params,
+                    init_flags_mask,
+                ) {
                     Ok(r) => r,
                     Err(errno) => {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
@@ -2318,6 +2343,22 @@ impl NvidiaBackend {
                     }
                 };
                 let n = self.dispatch_simple(cookie, host_fd, request, &params, resp_buf);
+                if log::log_enabled!(log::Level::Debug) {
+                    // UVM puts its NV_STATUS in the block, not in the ioctl's
+                    // return; this is the only place it shows.
+                    let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+                    log::debug!(
+                        "UVM {:#x} on handle {}: reply block {:02x?}",
+                        ireq.cmd,
+                        self.current_handle,
+                        resp_buf.get(body..n).unwrap_or(&[])
+                    );
+                }
+                if ireq.cmd == crate::guestptr::UVM_INITIALIZE
+                    && init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS == 0
+                {
+                    self.uvm_pageable_off(host_fd, resp_buf, n);
+                }
                 Self::restore_reply(&restore, resp_buf, n);
                 if let Some((off, handle)) = fd_field {
                     let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
@@ -3823,6 +3864,47 @@ impl NvidiaBackend {
         Ok(())
     }
 
+    /// After UVM_INITIALIZE on a release with no DISABLE_PAGEABLE_ACCESS
+    /// flag: DISABLE_HMM was forced, which leaves ATS as the only way the VA
+    /// space could get pageable access (uvm_va_space.c). Ask UVM itself; if
+    /// it says the space has it, or cannot say, the guest reads
+    /// NV_ERR_NOT_SUPPORTED and the file takes nothing more.
+    fn uvm_pageable_off(&mut self, host_fd: RawFd, resp_buf: &mut [u8], n: usize) {
+        const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
+        let st = body + 8;
+        if n < st + 4 || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+            return;
+        }
+        if u32::from_le_bytes(resp_buf[st..st + 4].try_into().unwrap()) != 0 {
+            return; // not initialised: nothing to check
+        }
+        // The block is 8 bytes; the rest is room a test's fake may touch.
+        let mut q = [0u8; 16];
+        // SAFETY: UVM_PAGEABLE_MEM_ACCESS copies its 8-byte block each way,
+        // and `q` holds at least that.
+        let rc = unsafe {
+            (self.host_ioctl)(
+                host_fd,
+                crate::guestptr::UVM_PAGEABLE_MEM_ACCESS as u64,
+                q.as_mut_ptr(),
+            )
+        };
+        let status = u32::from_le_bytes(q[4..8].try_into().unwrap());
+        if rc == 0 && status == 0 && q[0] == 0 {
+            return;
+        }
+        log::warn!(
+            "UVM handle {}: pageable memory access is not off after UVM_INITIALIZE \
+             (ioctl {rc}, rmStatus {status:#x}, pageableMemAccess {}); refusing the file",
+            self.current_handle,
+            q[0]
+        );
+        self.uvm_refused.insert(self.current_handle);
+        resp_buf[st..st + 4].copy_from_slice(&NV_ERR_NOT_SUPPORTED.to_le_bytes());
+    }
+
     fn uvm_fd_in(
         &self,
         cmd: u32,
@@ -3849,6 +3931,10 @@ impl NvidiaBackend {
             crate::uvmfd::FdOf::Uvm => HandleKind::Dev(DeviceKind::Uvm),
         };
         match self.handles.get(handle) {
+            Some(_) if self.uvm_refused.contains(&handle) => {
+                log::warn!("UVM command {cmd}: names handle {handle}, a refused UVM file");
+                Err(libc::EBADF)
+            }
             Some((fd, kind)) if kind == want => {
                 let host = std::os::fd::AsRawFd::as_raw_fd(&fd);
                 params[off..off + 4].copy_from_slice(&host.to_le_bytes());

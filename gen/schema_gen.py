@@ -822,7 +822,9 @@ def emit_rs(tables):
     for t in uvm.TABLES:
         out.append(f'    UvmTable {{\n        name: "{t.name}",\n'
                    f'        versions: ({rs_version(t.vmin)}, '
-                   f'{rs_version(t.vmax)}),\n        cmds: &[')
+                   f'{rs_version(t.vmax)}),\n'
+                   f'        init_flags_mask: 0x{t.init_flags_mask:x},\n'
+                   f'        cmds: &[')
         for c in t.commands:
             fd = 'None'
             if c['fd']:

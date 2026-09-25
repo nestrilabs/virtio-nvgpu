@@ -75,6 +75,7 @@ VERSIONS = {
     "590.44.01": "FREE loses length, UNREGISTER_CHANNEL loses gpuUuid",
     "595.71.05": "ABI profile",
     "595.99.02": "ABI profile",
+    "610.43.02": "UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS appears, range groups go",
     "610.57.04": "ABI profile; nvidia-driver/",
     "615.71.09": "ABI profile",
 }
@@ -96,6 +97,14 @@ COMMANDS = [
     ("REGISTER_GPU", "rmCtrlFd", "rmctl"),
     ("UNREGISTER_GPU", None, None),
     ("PAGEABLE_MEM_ACCESS", None, None),
+    # Range groups, gone in 610.43.02; flat blocks of range group ids and
+    # UVM's own managed ranges (uvm_range_group.c).
+    ("CREATE_RANGE_GROUP", None, None),
+    ("DESTROY_RANGE_GROUP", None, None),
+    ("SET_RANGE_GROUP", None, None),
+    ("PREVENT_MIGRATION_RANGE_GROUPS", None, None),
+    ("ALLOW_MIGRATION_RANGE_GROUPS", None, None),
+    ("MIGRATE_RANGE_GROUP", None, None),
     ("SET_PREFERRED_LOCATION", None, None),
     ("UNSET_PREFERRED_LOCATION", None, None),
     ("ENABLE_READ_DUPLICATION", None, None),
@@ -222,7 +231,16 @@ def probe_source():
             f"sep, (unsigned long)({m}), {size}, {off}, {width});")
         out.append('  sep = ", ";')
         out.append("#endif")
-    out += ['  printf("]\\n");', "  return 0;", "}"]
+    out += ['  printf("]\\n");',
+            # The initialization flags this release's UVM accepts
+            # (uvm_va_space_create refuses any other bit): which of the
+            # flags that turn pageable access off the backend may force.
+            "#ifdef UVM_INIT_FLAGS_MASK",
+            '  printf("%llu\\n", (unsigned long long)UVM_INIT_FLAGS_MASK);',
+            "#else",
+            '  printf("-1\\n");',
+            "#endif",
+            "  return 0;", "}"]
     return "\n".join(out) + "\n"
 
 
@@ -237,8 +255,11 @@ def measure(root):
                            capture_output=True, text=True)
         if r.returncode:
             raise ExtractError(f"probe does not compile:\n{r.stderr}")
-        rows = json.loads(subprocess.run([str(exe)], check=True,
-                                         capture_output=True, text=True).stdout)
+        lines = subprocess.run([str(exe)], check=True, capture_output=True,
+                               text=True).stdout.splitlines()
+        rows, init_flags_mask = json.loads(lines[0]), int(lines[1])
+    if init_flags_mask < 0:
+        raise ExtractError("no UVM_INIT_FLAGS_MASK: not a UVM this backend knows")
     by = {r["name"]: r for r in rows}
     commands, absent = [], []
     for name, fd, of in COMMANDS:
@@ -257,16 +278,17 @@ def measure(root):
     for name in ("INITIALIZE", "MM_INITIALIZE"):
         if name in absent:
             raise ExtractError(f"no UVM_{name}: not a UVM this backend knows")
-    return commands, absent
+    return commands, absent, init_flags_mask
 
 
 def extract(version, root, why):
-    commands, absent = measure(root)
+    commands, absent, init_flags_mask = measure(root)
     return {
         "format": FORMAT,
         "driver_version": version,
         "why": why,
         "source": source_of(root),
+        "init_flags_mask": init_flags_mask,
         "commands": commands,
         "absent": absent,
     }
@@ -277,8 +299,9 @@ def dump(d):
 
 
 def table_of(d):
-    """What a release's table depends on: its commands, not its source."""
-    return json.dumps(d["commands"], sort_keys=True)
+    """What a release's table depends on: its commands and the
+    initialization flags it takes, not its source."""
+    return json.dumps([d["commands"], d.get("init_flags_mask")], sort_keys=True)
 
 
 def cmd_extract(args):

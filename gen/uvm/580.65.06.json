@@ -18,6 +18,7 @@
    "kernel-open/nvidia-uvm/uvm_types.h": "576803d1cf6b2933cc284dd2d5a47974649a1da27e1476d84d083c0f0f6355fa"
   }
  },
+ "init_flags_mask": 3,
  "commands": [
   {
    "name": "INITIALIZE",
@@ -111,6 +112,42 @@
    "name": "PAGEABLE_MEM_ACCESS",
    "cmd": 39,
    "size": 8,
+   "fd": null
+  },
+  {
+   "name": "CREATE_RANGE_GROUP",
+   "cmd": 23,
+   "size": 16,
+   "fd": null
+  },
+  {
+   "name": "DESTROY_RANGE_GROUP",
+   "cmd": 24,
+   "size": 16,
+   "fd": null
+  },
+  {
+   "name": "SET_RANGE_GROUP",
+   "cmd": 31,
+   "size": 32,
+   "fd": null
+  },
+  {
+   "name": "PREVENT_MIGRATION_RANGE_GROUPS",
+   "cmd": 40,
+   "size": 272,
+   "fd": null
+  },
+  {
+   "name": "ALLOW_MIGRATION_RANGE_GROUPS",
+   "cmd": 41,
+   "size": 272,
+   "fd": null
+  },
+  {
+   "name": "MIGRATE_RANGE_GROUP",
+   "cmd": 53,
+   "size": 32,
    "fd": null
   },
   {

@@ -52,7 +52,9 @@
 //! - **UVM** (`uvm_gate`): nvidia-uvm works on the calling process's address
 //!   space, which is the backend's. Pageable memory access is forced off in
 //!   UVM_INITIALIZE (so neither HMM nor ATS can let the GPU fault in the
-//!   VMM's pages), and only commands that name UVM's own ranges, RM handles or
+//!   VMM's pages) -- with the flags the host's release has, and checked
+//!   with UVM's own query where it lacks the one that says so outright --
+//!   and only commands that name UVM's own ranges, RM handles or
 //!   GPU state go through; the tools device and every command that copies
 //!   to or from a CPU buffer, pins one, or populates pages of the backend's
 //!   own address space are refused.
@@ -362,12 +364,19 @@ pub(crate) fn scrub_control(cmd: u32, nested: &mut [u8], relocated: Option<usize
 
 pub const UVM_INITIALIZE: u32 = 0x3000_0001;
 pub const UVM_DEINITIALIZE: u32 = 0x3000_0002;
+/// UVM_PAGEABLE_MEM_ACCESS: {NvBool pageableMemAccess; NV_STATUS rmStatus;}.
+pub const UVM_PAGEABLE_MEM_ACCESS: u32 = 39;
 
 /// UVM_INIT_FLAGS_DISABLE_HMM / _DISABLE_PAGEABLE_MIGRATIONS (uvm_types.h:64-66).
-const UVM_INIT_FLAGS_DISABLE_HMM: u64 = 0x1;
+pub const UVM_INIT_FLAGS_DISABLE_HMM: u64 = 0x1;
 /// UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS (uvm_types.h:68): with it the VA
 /// space never gets pageable access, by ATS or HMM (uvm_va_space.c:190-204).
-const UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
+/// New in 610.43.02; an older UVM refuses the whole call if it is set
+/// (uvm_va_space_create, `flags & ~UVM_INIT_FLAGS_MASK`), so it is forced
+/// only where the host's table says the release takes it. Before that,
+/// DISABLE_HMM is the only switch, and ATS the other way in: the backend asks
+/// UVM afterwards whether the VA space has pageable access (nvidia.rs).
+pub const UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
 
 /// The UVM commands (uvm_ioctl.h numbers) that go through. Each names UVM's
 /// own ranges -- made by mmap of the UVM file, CREATE_EXTERNAL_RANGE or
@@ -388,6 +397,15 @@ const UVM_ALLOWED: &[u32] = &[
     37, // REGISTER_GPU
     38, // UNREGISTER_GPU
     39, // PAGEABLE_MEM_ACCESS (a query)
+    // Range groups, until 610.43.02 removed them (CUDA before that creates
+    // one in cuInit): group ids, and spans that must be UVM's own managed
+    // ranges end to end (uvm_range_group.c, uvm_api_set_range_group).
+    23, // CREATE_RANGE_GROUP
+    24, // DESTROY_RANGE_GROUP
+    31, // SET_RANGE_GROUP
+    40, // PREVENT_MIGRATION_RANGE_GROUPS (at most 32 ids, inline)
+    41, // ALLOW_MIGRATION_RANGE_GROUPS
+    53, // MIGRATE_RANGE_GROUP
     42, // SET_PREFERRED_LOCATION
     43, // UNSET_PREFERRED_LOCATION
     44, // ENABLE_READ_DUPLICATION
@@ -421,7 +439,15 @@ const UVM_ALLOWED: &[u32] = &[
 /// QUERY_RESIDENCY (two user arrays), POPULATE_PAGEABLE (faults in pages of
 /// the calling process, the backend, uvm_populate_pageable.c:194-226),
 /// the UVM-Lite commands, and the test ioctls.
-pub(crate) fn uvm_gate(tools: bool, cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
+///
+/// `init_flags_mask` is the host release's UVM_INIT_FLAGS_MASK: of the
+/// flags that turn pageable access off, UVM_INITIALIZE gets those it takes.
+pub(crate) fn uvm_gate(
+    tools: bool,
+    cmd: u32,
+    params: &mut [u8],
+    init_flags_mask: u64,
+) -> Result<Restore, Errno> {
     if tools {
         log::warn!("UVM tools ioctl {cmd:#x} refused: the tools device pins user buffers");
         return Err(libc::EPERM);
@@ -436,7 +462,18 @@ pub(crate) fn uvm_gate(tools: bool, cmd: u32, params: &mut [u8]) -> Result<Resto
         let Some(flags) = rd64(params, 0) else {
             return Err(libc::EINVAL);
         };
-        let forced = flags | UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS | UVM_INIT_FLAGS_DISABLE_HMM;
+        let off = (UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS | UVM_INIT_FLAGS_DISABLE_HMM)
+            & init_flags_mask;
+        if off & UVM_INIT_FLAGS_DISABLE_HMM == 0 {
+            log::warn!("UVM_INITIALIZE refused: the host's UVM cannot be told to leave HMM off");
+            return Err(libc::EPERM);
+        }
+        // Bits the host's UVM does not know go no further: it would refuse
+        // the whole call for one (a guest built for a newer release may ask
+        // for DISABLE_PAGEABLE_ACCESS by name), and what they could ask for
+        // is what the backend has just decided. The caller reads its own
+        // flags back either way.
+        let forced = (flags | off) & init_flags_mask;
         if forced != flags {
             restore.0.push((0, flags.to_le_bytes()));
             params[..8].copy_from_slice(&forced.to_le_bytes());
@@ -671,7 +708,7 @@ mod tests {
     fn uvm_is_initialised_without_pageable_access_whatever_the_guest_asks() {
         let mut p = vec![0u8; 16];
         put64(&mut p, 0, 0x2); // MULTI_PROCESS_SHARING_MODE
-        let r = uvm_gate(false, UVM_INITIALIZE, &mut p).unwrap();
+        let r = uvm_gate(false, UVM_INITIALIZE, &mut p, 0x7).unwrap();
         assert_eq!(rd64(&p, 0), Some(0x7));
         r.apply(&mut p);
         assert_eq!(
@@ -681,15 +718,36 @@ mod tests {
         );
     }
 
+    /// A UVM before 610.43.02 refuses UVM_INITIALIZE outright if any bit
+    /// outside its mask is set: only DISABLE_HMM is forced there.
+    #[test]
+    fn uvm_is_only_given_the_flags_its_release_takes() {
+        let mut p = vec![0u8; 16];
+        put64(&mut p, 0, 0x2);
+        uvm_gate(false, UVM_INITIALIZE, &mut p, 0x3).unwrap();
+        assert_eq!(rd64(&p, 0), Some(0x3));
+        // A guest asking for DISABLE_PAGEABLE_ACCESS by name is not handed
+        // to a UVM that would refuse the call for it.
+        let mut p = vec![0u8; 16];
+        put64(&mut p, 0, 0x6);
+        let r = uvm_gate(false, UVM_INITIALIZE, &mut p, 0x3).unwrap();
+        assert_eq!(rd64(&p, 0), Some(0x3));
+        r.apply(&mut p);
+        assert_eq!(rd64(&p, 0), Some(0x6));
+        // One that cannot even leave HMM off is not initialised at all.
+        let mut p = vec![0u8; 16];
+        assert_eq!(uvm_gate(false, UVM_INITIALIZE, &mut p, 0x2), Err(libc::EPERM));
+    }
+
     #[test]
     fn uvm_commands_that_touch_cpu_memory_are_refused() {
         for cmd in [56, 62, 63, 64, 71, 76, 77, 81, 13, 16, 21, 35, 200, 0x7ff] {
             let mut p = vec![0u8; 64];
-            assert_eq!(uvm_gate(false, cmd, &mut p), Err(libc::EPERM), "{cmd}");
+            assert_eq!(uvm_gate(false, cmd, &mut p, 0x7), Err(libc::EPERM), "{cmd}");
         }
         for cmd in [33, 37, 51, 73, 75] {
             let mut p = vec![0u8; 64];
-            assert!(uvm_gate(false, cmd, &mut p).is_ok(), "{cmd}");
+            assert!(uvm_gate(false, cmd, &mut p, 0x7).is_ok(), "{cmd}");
         }
     }
 
@@ -702,8 +760,11 @@ mod tests {
         use std::collections::BTreeSet;
         let allowed: BTreeSet<u32> = UVM_ALLOWED.iter().copied().collect();
         let tables = abi::schema::UVM_TABLES;
-        let newest: BTreeSet<u32> = tables.last().unwrap().cmds.iter().map(|c| c.cmd).collect();
-        assert_eq!(allowed, newest);
+        // Some commands are only in older releases (range groups), so it is
+        // every release's commands together that must be the list.
+        let measured: BTreeSet<u32> =
+            tables.iter().flat_map(|t| t.cmds.iter().map(|c| c.cmd)).collect();
+        assert_eq!(allowed, measured);
         for t in tables {
             for c in t.cmds {
                 assert!(allowed.contains(&c.cmd), "{} {}", t.name, c.name);
@@ -714,7 +775,7 @@ mod tests {
     #[test]
     fn nothing_goes_to_the_uvm_tools_device() {
         let mut p = vec![0u8; 64];
-        assert_eq!(uvm_gate(true, 67, &mut p), Err(libc::EPERM));
+        assert_eq!(uvm_gate(true, 67, &mut p, 0x7), Err(libc::EPERM));
     }
 }
 
@@ -761,6 +822,8 @@ mod backend_tests {
         UvmInit {
             flags: u64,
         },
+        /// UVM_PAGEABLE_MEM_ACCESS, the backend's own question.
+        UvmPageable,
         /// UNMAP_MEMORY: pLinearAddress; UPDATE_DEVICE_MAPPING_INFO: pOld,
         /// pNew. Keys, not pointers, but addresses in this process all the
         /// same.
@@ -770,6 +833,8 @@ mod backend_tests {
 
     std::thread_local! {
         static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+        /// What the fake's UVM_PAGEABLE_MEM_ACCESS answers.
+        static PAGEABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn seen() -> Vec<Seen> {
@@ -802,6 +867,11 @@ mod backend_tests {
             _ if request == UVM_INITIALIZE => Seen::UvmInit {
                 flags: word64(a, 0),
             },
+            _ if request == UVM_PAGEABLE_MEM_ACCESS => {
+                a[0] = PAGEABLE.with(|p| p.get()) as u8;
+                a[4..8].fill(0);
+                Seen::UvmPageable
+            }
             (b'F', 0x2a) => {
                 let params = word64(a, 16);
                 let size = u32::from_le_bytes(a[24..28].try_into().unwrap());
@@ -1161,6 +1231,51 @@ mod backend_tests {
         p[0..8].copy_from_slice(&GUEST_PTR.to_le_bytes());
         assert_eq!(v1(&mut be, h, 62, &p, &[], None).0, -libc::EPERM);
         assert!(seen().is_empty());
+    }
+
+    /// Before 610.43.02 UVM refuses DISABLE_PAGEABLE_ACCESS (the whole call
+    /// fails with NV_ERR_INVALID_ARGUMENT, and CUDA with it): the backend
+    /// forces DISABLE_HMM alone and asks UVM whether pageable access is off.
+    #[test]
+    fn uvm_before_610_43_is_initialised_with_its_own_flags_and_checked() {
+        let (mut be, h) = backend(HandleKind::Dev(DeviceKind::Uvm));
+        be.set_host_driver_version("595.99.02");
+        let mut p = vec![0u8; 16];
+        p[0..8].copy_from_slice(&0x2u64.to_le_bytes());
+        let (st, reply) = v1(&mut be, h, UVM_INITIALIZE, &p, &[], None);
+        assert_eq!(st, 0);
+        assert_eq!(
+            seen(),
+            vec![Seen::UvmInit { flags: 0x3 }, Seen::UvmPageable]
+        );
+        assert_eq!(word64(&reply, 0), 0x2, "the caller reads back its own flags");
+        assert_eq!(&reply[8..12], &[0; 4], "NV_OK");
+        // And the file takes the next call.
+        assert_eq!(v1(&mut be, h, 39, &[0u8; 8], &[], None).0, 0);
+        assert_eq!(seen(), vec![Seen::UvmPageable]);
+    }
+
+    /// If UVM says the VA space has pageable access anyway, the guest reads
+    /// NV_ERR_NOT_SUPPORTED, the file takes nothing more, and no other call
+    /// may name it.
+    #[test]
+    fn a_uvm_file_with_pageable_access_is_refused() {
+        let (mut be, h) = backend(HandleKind::Dev(DeviceKind::Uvm));
+        be.set_host_driver_version("595.99.02");
+        PAGEABLE.with(|p| p.set(true));
+        let (st, reply) = v1(&mut be, h, UVM_INITIALIZE, &[0u8; 16], &[], None);
+        PAGEABLE.with(|p| p.set(false));
+        assert_eq!(st, 0);
+        assert_eq!(&reply[8..12], &0x56u32.to_le_bytes(), "NV_ERR_NOT_SUPPORTED");
+        seen();
+        assert_eq!(v1(&mut be, h, 39, &[0u8; 8], &[], None).0, -libc::EPERM);
+        // MM_INITIALIZE on a second file, naming the refused one.
+        let null: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let h2 = be.adopt_for_test(null, HandleKind::Dev(DeviceKind::Uvm));
+        let mut mm = vec![0u8; 8];
+        mm[0..4].copy_from_slice(&(h as i32).to_le_bytes());
+        assert_eq!(v1(&mut be, h2, 75, &mm, &[], None).0, -libc::EBADF);
+        assert!(seen().is_empty(), "nothing reached the host");
     }
 
     #[test]

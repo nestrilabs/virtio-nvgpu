@@ -18,6 +18,7 @@
    "kernel-open/nvidia-uvm/uvm_types.h": "a1aa7e70f89691db74c2eb2c6d293d332bfa5d9fd6df3b6fc60a613bb899add9"
   }
  },
+ "init_flags_mask": 7,
  "commands": [
   {
    "name": "INITIALIZE",
@@ -242,5 +243,12 @@
    "fd": null
   }
  ],
- "absent": []
+ "absent": [
+  "CREATE_RANGE_GROUP",
+  "DESTROY_RANGE_GROUP",
+  "SET_RANGE_GROUP",
+  "PREVENT_MIGRATION_RANGE_GROUPS",
+  "ALLOW_MIGRATION_RANGE_GROUPS",
+  "MIGRATE_RANGE_GROUP"
+ ]
 }

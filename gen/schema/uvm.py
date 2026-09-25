@@ -38,11 +38,13 @@ class DataError(Exception):
 
 
 class UvmTable:
-    def __init__(self, name, vmin, vmax, commands):
+    def __init__(self, name, vmin, vmax, commands, init_flags_mask):
         self.name = name
         self.vmin = vmin
         self.vmax = vmax
         self.commands = commands  # [{name, cmd, size, fd}], by command number
+        # UVM_INIT_FLAGS_MASK: the initialization flags this release takes.
+        self.init_flags_mask = init_flags_mask
 
 
 def load():
@@ -53,6 +55,10 @@ def load():
             raise DataError(f'{p.name}: format {d.get("format")!r}')
         if d['driver_version'] != p.stem:
             raise DataError(f'{p.name}: driver_version {d["driver_version"]!r}')
+        m = d.get('init_flags_mask')
+        if not isinstance(m, int) or m < 0 or not m & 1:
+            raise DataError(f'{p.name}: init_flags_mask {m!r} (it must take '
+                            'UVM_INIT_FLAGS_DISABLE_HMM)')
         seen = set()
         for c in d['commands']:
             if c['cmd'] in seen:
@@ -71,10 +77,11 @@ def tables():
     out = []
     for d in load():
         cmds = sorted(d['commands'], key=lambda c: c['cmd'])
-        if out and out[-1].commands == cmds:
+        mask = d['init_flags_mask']
+        if out and out[-1].commands == cmds and out[-1].init_flags_mask == mask:
             continue
         out.append(UvmTable('v' + d['driver_version'].replace('.', '_'),
-                            version_of(d['driver_version']), None, cmds))
+                            version_of(d['driver_version']), None, cmds, mask))
     for t, nxt in zip(out, out[1:]):
         t.vmax = before(nxt.vmin)
     out[-1].vmax = LAST

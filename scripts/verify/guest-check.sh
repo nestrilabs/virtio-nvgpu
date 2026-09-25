@@ -20,13 +20,16 @@ warn() { printf '  warn  %s\n' "$1"; }
 echo "== protocol =="
 # The guest driver logs the negotiated protocol at probe. v2 is what every
 # display feature rides on; v1 means an old backend, or HELLO failed.
-if dmesg 2>/dev/null | grep -q 'virtio-gpu-nv: protocol v2'; then
-    line=$(dmesg | grep 'virtio-gpu-nv: protocol v2' | tail -n 1)
+# Read the log once: under pipefail, `dmesg | grep -q` fails when grep exits
+# at the first match and dmesg dies of SIGPIPE -- a match reads as a miss.
+klog=$(dmesg 2>/dev/null || true)
+if grep -q 'virtio-gpu-nv: protocol v2' <<<"$klog"; then
+    line=$(grep 'virtio-gpu-nv: protocol v2' <<<"$klog" | tail -n 1)
     ok "protocol v2 negotiated"
     printf '        %s\n' "${line#*] }"
-elif dmesg 2>/dev/null | grep -q 'virtio-gpu-nv: backend speaks protocol v1'; then
+elif grep -q 'virtio-gpu-nv: backend speaks protocol v1' <<<"$klog"; then
     bad "backend is v1 only -- no display features (update the backend)"
-elif dmesg 2>/dev/null | grep -q 'virtio-gpu-nv'; then
+elif grep -q 'virtio-gpu-nv' <<<"$klog"; then
     warn "driver present but no v2 HELLO line (check RUST_LOG on the backend)"
 else
     bad "virtio_gpu_nv not loaded, or dmesg unreadable"
@@ -70,7 +73,7 @@ fi
 echo "== EGL =="
 # EGL_ANDROID_native_fence_sync is what carries explicit fences out of EGL.
 if command -v eglinfo >/dev/null 2>&1; then
-    if eglinfo 2>/dev/null | grep -q EGL_ANDROID_native_fence_sync; then
+    if grep -q EGL_ANDROID_native_fence_sync <<<"$(eglinfo 2>/dev/null || true)"; then
         ok "EGL_ANDROID_native_fence_sync"
     else
         warn "EGL_ANDROID_native_fence_sync not advertised (explicit-sync EGL clients)"

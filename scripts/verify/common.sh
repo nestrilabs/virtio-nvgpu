@@ -42,5 +42,5 @@ verify_libdrm_flags() {
 # exist and the virtio module is loaded.
 verify_in_guest() {
     [ -e /dev/nvidiactl ] && [ -d /proc/driver/nvidia ] &&
-        lsmod 2>/dev/null | grep -q '^virtio_gpu_nv'
+        grep -q '^virtio_gpu_nv' <<<"$(lsmod 2>/dev/null || true)"
 }

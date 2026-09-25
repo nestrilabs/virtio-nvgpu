@@ -257,9 +257,9 @@ finish() {
     [ -n "${WATCHDOG_PID:-}" ] && kill "$WATCHDOG_PID" 2>/dev/null
 
     section "guest kernel log check"
-    if dmesg 2>/dev/null | grep -Eiq 'Oops|BUG:|general protection|Call Trace|WARNING: CPU'; then
+    if dmesg 2>/dev/null | grep -Eiq 'Oops|BUG:|general protection|Call Trace|WARNING:'; then
         fail "guest kernel reported an oops/WARN:"
-        dmesg | grep -Ei -B2 -A12 'Oops|BUG:|general protection|WARNING: CPU' | head -n 80 | sed 's/^/    /'
+        dmesg | grep -Ei -B2 -A12 'Oops|BUG:|general protection|Call Trace|WARNING:' | head -n 80 | sed 's/^/    /'
     else
         say "no oops/WARN in guest dmesg"
     fi

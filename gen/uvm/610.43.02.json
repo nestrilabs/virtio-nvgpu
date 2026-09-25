@@ -1,24 +1,24 @@
 {
  "format": "virtio-nvgpu/uvm-params/1",
- "driver_version": "595.71.05",
- "why": "ABI profile",
+ "driver_version": "610.43.02",
+ "why": "UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS appears, range groups go",
  "source": {
-  "tag": "595.71.05",
-  "url": "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/595.71.05/",
+  "tag": "610.43.02",
+  "url": "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/610.43.02/",
   "files": {
    "kernel-open/common/inc/cpuopsys.h": "a5aca75935337c79b364b0a3c6c95f576148d0f828cca4e93b752161f85406b2",
    "kernel-open/common/inc/nvCpuUuid.h": "a228c1ac5b26b9e4d7d1efa7dd69bf111bd0bbadddd65bb016e610e13871a234",
-   "kernel-open/common/inc/nv_uvm_user_types.h": "fffd902620642d566fe06619343a151795c7d0e4540c904a41baea24aae03d8c",
+   "kernel-open/common/inc/nv_uvm_user_types.h": "515e192fbd1730579dc0aa542914a95b6ab3edd0e9a490dff7e630908a40cd70",
    "kernel-open/common/inc/nvlimits.h": "7c7bf27c5360464b459f6069d2e72f6070bb3fdd0862baccf6c7aa71da67c593",
    "kernel-open/common/inc/nvstatus.h": "e8267172a1f7a56420d612c6734b3554b9ff6a3d33fdda21b1371ff4ce4b8675",
-   "kernel-open/common/inc/nvstatuscodes.h": "5cbecddb80d43ece59fd33d778e02d38d9fda17413cad64137d2cdf344d78153",
-   "kernel-open/common/inc/nvtypes.h": "d1a66ddfa18987eb09f61804586de432dadacbede19315386167536c8b0c0acc",
-   "kernel-open/nvidia-uvm/uvm_ioctl.h": "9cc909360f2d19135852390fb66a12fe4d22ca39c19e2609b2ff5e925df4bdf4",
+   "kernel-open/common/inc/nvstatuscodes.h": "09c3cacf0ecbb97644a86fa629a51f64919282aeabf51f609542e2421a170746",
+   "kernel-open/common/inc/nvtypes.h": "e647e23504fe4b6cc2337836b2155c49918ed174bd9a3d806125e7c12e894f2a",
+   "kernel-open/nvidia-uvm/uvm_ioctl.h": "ebebe20776fb6f9652f01eead1797a9db8b14a10707c68fcbc9199938314b6cd",
    "kernel-open/nvidia-uvm/uvm_linux_ioctl.h": "0ffb5cf3679fb5e150745e54b72fab861e319823e419f36376468a60862c2748",
-   "kernel-open/nvidia-uvm/uvm_types.h": "94d4124ee87678f45148fe679bf249e19a89c987815aaff6dc72b45ebf606b14"
+   "kernel-open/nvidia-uvm/uvm_types.h": "a1aa7e70f89691db74c2eb2c6d293d332bfa5d9fd6df3b6fc60a613bb899add9"
   }
  },
- "init_flags_mask": 3,
+ "init_flags_mask": 7,
  "commands": [
   {
    "name": "INITIALIZE",
@@ -112,42 +112,6 @@
    "name": "PAGEABLE_MEM_ACCESS",
    "cmd": 39,
    "size": 8,
-   "fd": null
-  },
-  {
-   "name": "CREATE_RANGE_GROUP",
-   "cmd": 23,
-   "size": 16,
-   "fd": null
-  },
-  {
-   "name": "DESTROY_RANGE_GROUP",
-   "cmd": 24,
-   "size": 16,
-   "fd": null
-  },
-  {
-   "name": "SET_RANGE_GROUP",
-   "cmd": 31,
-   "size": 32,
-   "fd": null
-  },
-  {
-   "name": "PREVENT_MIGRATION_RANGE_GROUPS",
-   "cmd": 40,
-   "size": 272,
-   "fd": null
-  },
-  {
-   "name": "ALLOW_MIGRATION_RANGE_GROUPS",
-   "cmd": 41,
-   "size": 272,
-   "fd": null
-  },
-  {
-   "name": "MIGRATE_RANGE_GROUP",
-   "cmd": 53,
-   "size": 32,
    "fd": null
   },
   {
@@ -279,5 +243,12 @@
    "fd": null
   }
  ],
- "absent": []
+ "absent": [
+  "CREATE_RANGE_GROUP",
+  "DESTROY_RANGE_GROUP",
+  "SET_RANGE_GROUP",
+  "PREVENT_MIGRATION_RANGE_GROUPS",
+  "ALLOW_MIGRATION_RANGE_GROUPS",
+  "MIGRATE_RANGE_GROUP"
+ ]
 }

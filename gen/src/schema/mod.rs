@@ -425,6 +425,9 @@ pub struct UvmTable {
     pub name: &'static str,
     /// Host driver versions the table is for, inclusive.
     pub versions: (DriverVersion, DriverVersion),
+    /// UVM_INIT_FLAGS_MASK: the UVM_INITIALIZE flags these releases take;
+    /// uvm_va_space_create refuses the call if any other bit is set.
+    pub init_flags_mask: u64,
     /// By `cmd`.
     pub cmds: &'static [UvmCmd],
 }

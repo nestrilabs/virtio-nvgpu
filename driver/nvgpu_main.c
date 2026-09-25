@@ -1198,10 +1198,6 @@ static int nvgpu_uvm_size(const struct nvgpu_uvm_table *t, unsigned int cmd) {
   return -1;
 }
 
-#define NVGPU_UVM_INITIALIZE 0x30000001u
-/* UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS (uvm_types.h). */
-#define NVGPU_UVM_INIT_DISABLE_PAGEABLE_ACCESS (1ULL << 2)
-
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
@@ -1221,16 +1217,12 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
   if (sz < 0)
     return -EPERM;
 
-  /* UVM_INITIALIZE: no pageable access (the backend forces it as well). */
-  if (cmd == NVGPU_UVM_INITIALIZE) {
-    u64 flags;
-
-    if (copy_from_user(&flags, uarg, sizeof(flags)))
-      return -EFAULT;
-    flags |= NVGPU_UVM_INIT_DISABLE_PAGEABLE_ACCESS;
-    if (copy_to_user(uarg, &flags, sizeof(flags)))
-      return -EFAULT;
-  }
+  /*
+   * UVM_INITIALIZE's flags go as the caller set them. Pageable access is the
+   * backend's to turn off, with the flags the host's release takes
+   * (guestptr.rs); forcing a flag here would only hand an older host's UVM a
+   * bit it refuses the whole call for, and rewrite the caller's own block.
+   */
 
   /*
    * A command naming another file: the caller's descriptor becomes our
@@ -2030,7 +2022,13 @@ static struct proc_dir_entry *nvgpu_proc_mkdir_parents(char *pathbuf,
       strlcat(built, "/", sizeof(built));
     strlcat(built, p, sizeof(built));
 
-    parent = nvgpu_proc_mkdir_cached(built, NULL);
+    /* The proc core makes /proc/driver itself (proc_root_init); a second
+     * proc_mkdir of it WARNs "already registered". Every path is created
+     * from the root by its full name, so there is nothing to look up. */
+    if (strcmp(built, "driver") == 0)
+      parent = NULL;
+    else
+      parent = nvgpu_proc_mkdir_cached(built, NULL);
 
     if (next) {
       *next = '/';
@@ -2038,6 +2036,14 @@ static struct proc_dir_entry *nvgpu_proc_mkdir_parents(char *pathbuf,
     } else {
       break;
     }
+  }
+
+  /* No entry for the leaf's directory (it is /proc/driver, or its mkdir
+   * failed): name the leaf in full, which the proc core resolves from the
+   * root, rather than dropping it into /proc itself. */
+  if (!parent) {
+    *slash = '/';
+    *leaf_name = pathbuf;
   }
 
   return parent;
