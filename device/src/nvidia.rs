@@ -41,6 +41,19 @@ const NVOS54_TOTAL: usize = 32;
 /// `NV_OK`. Every other value is a refusal of some kind.
 const NV_OK: u32 = 0;
 
+/// The key at `key_at` of an RM reply's parameter block (`resp_buf[..n]`,
+/// header first) when the transport answered and RM's status word at
+/// `status_at` is NV_OK.
+fn rm_served(resp_buf: &[u8], n: usize, key_at: usize, status_at: usize) -> Option<u32> {
+    let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+    if n < body || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+        return None;
+    }
+    let p = resp_buf.get(body..n)?;
+    let word = |at: usize| Some(u32::from_le_bytes(p.get(at..at + 4)?.try_into().ok()?));
+    (word(status_at)? == NV_OK).then_some(word(key_at)?)
+}
+
 /// The host path an `Open` refers to, resolving a render node through the DRI
 /// list the guest was given.
 ///
@@ -484,8 +497,10 @@ pub struct NvidiaBackend {
     /// module, and only fewer reachable commands helps with the second. A
     /// filter cannot be written from a guess, so this is the instrument that
     /// says what the set really is.
-    rm_classes: std::collections::BTreeMap<u32, u64>,
-    rm_controls: std::collections::BTreeMap<u32, u64>,
+    ///
+    /// Bounded (tally.rs): the keys are the guest's to choose.
+    rm_classes: crate::tally::Tally,
+    rm_controls: crate::tally::Tally,
     /// Every ioctl forwarded, by namespace and number.
     ///
     /// There are three namespaces, not one, and that is the point of counting
@@ -969,8 +984,8 @@ impl NvidiaBackend {
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
             abi_refused: std::collections::BTreeMap::new(),
-            rm_classes: std::collections::BTreeMap::new(),
-            rm_controls: std::collections::BTreeMap::new(),
+            rm_classes: crate::tally::Tally::default(),
+            rm_controls: crate::tally::Tally::default(),
             ioctls_by_ns: std::collections::BTreeMap::new(),
             pump_cmds: Vec::new(),
             created: Vec::new(),
@@ -1201,28 +1216,26 @@ impl NvidiaBackend {
         // The two sets a filter would be written from. Printed whole rather
         // than summarised: the long tail is the interesting part, because that
         // is where something a pipeline needs exactly once hides.
-        if !self.rm_classes.is_empty() {
-            log::info!(
-                "NvidiaBackend::teardown: {} RM_ALLOC class(es): {}",
-                self.rm_classes.len(),
-                self.rm_classes
-                    .iter()
-                    .map(|(c, n)| format!("{c:#06x}={n}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
-        if !self.rm_controls.is_empty() {
-            log::info!(
-                "NvidiaBackend::teardown: {} RM_CONTROL command(s): {}",
-                self.rm_controls.len(),
-                self.rm_controls
-                    .iter()
-                    .map(|(c, n)| format!("{c:#010x}={n}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
+        // A bounded number of entries to a line, and the calls past the
+        // tally's cap as one number (S-17).
+        let report = |what: &str, tally: &crate::tally::Tally, key: fn(u32) -> String| {
+            for line in tally.lines(key) {
+                log::info!("NvidiaBackend::teardown: {} {what}: {line}", tally.len());
+            }
+            if tally.overflow() > 0 {
+                log::info!(
+                    "NvidiaBackend::teardown: and {} more {what} call(s) past the tally's {} keys",
+                    tally.overflow(),
+                    crate::tally::MAX_KEYS
+                );
+            }
+        };
+        report("RM_ALLOC class(es)", &self.rm_classes, |c| {
+            format!("{c:#06x}")
+        });
+        report("RM_CONTROL command(s)", &self.rm_controls, |c| {
+            format!("{c:#010x}")
+        });
         let total: u64 = self.msg_counts.values().sum();
         log::info!(
             "NvidiaBackend::teardown: served {total} message(s): {}",
@@ -1518,7 +1531,7 @@ impl NvidiaBackend {
             });
         }
         self.created.push(guest_handle);
-        log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
+        log::debug!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
         if let HandleKind::DriRender(dri) = kind {
             self.semsurf_render_opened(guest_handle, dri);
         }
@@ -2417,29 +2430,32 @@ impl NvidiaBackend {
             // RM control requires nested handling
             // ---------------------------------------------------------------
             NV_ESC_RM_CONTROL => {
+                let n = self.dispatch_nested(
+                    cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
+                );
                 // Counted here rather than in the forwarder, which holds only a
                 // shared borrow. NVOS54: hClient, hObject, cmd at byte 8.
-                if param_in.len() >= 12 {
-                    let cmd = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
-                    *self.rm_controls.entry(cmd).or_insert(0) += 1;
+                // Only what RM served: the key is the guest's u32, and a count
+                // of what RM turned down is noise an allowlist is not written
+                // from (S-17).
+                if let Some(cmd) = rm_served(resp_buf, n, 8, NVOS54_STATUS) {
+                    self.rm_controls.add(cmd);
                 }
-                self.dispatch_nested(
-                    cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
-                )
+                n
             }
 
             // ---------------------------------------------------------------
             // RM alloc as well..
             // ---------------------------------------------------------------
             NV_ESC_RM_ALLOC => {
-                // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12.
-                if param_in.len() >= 16 {
-                    let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
-                    *self.rm_classes.entry(class).or_insert(0) += 1;
-                }
                 let n = self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
                 );
+                // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12,
+                // status at 40. As for controls, only what RM made.
+                if let Some(class) = rm_served(resp_buf, n, 12, 40) {
+                    self.rm_classes.add(class);
+                }
                 // A client made here is one 0x54 may name (semsurf.rs).
                 self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
                 n
@@ -2563,10 +2579,11 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
 
-        // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
+        // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init. One line per
+        // call, so debug: at info a guest's RM traffic was the log (S-20).
         if escape == 0x2A && outer.len() >= 12 {
             let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-            log::info!(
+            log::debug!(
                 "RM_CONTROL cmd=0x{:x} (hClient={}, hObject={})",
                 cmd,
                 u32::from_le_bytes(outer[0..4].try_into().unwrap()),
@@ -2575,7 +2592,7 @@ impl NvidiaBackend {
         }
         if escape == 0x2B && outer.len() >= 16 {
             let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-            log::info!("RM_ALLOC hClass=0x{:x}", h_class);
+            log::debug!("RM_ALLOC hClass=0x{:x}", h_class);
         }
 
         if !nested_in.is_empty() {
@@ -2864,7 +2881,7 @@ impl NvidiaBackend {
                 let status =
                     u32::from_le_bytes(outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
                 if status == NV_OK {
-                    log::info!(
+                    log::debug!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",
                         cmd,
                         params_size
@@ -2889,7 +2906,7 @@ impl NvidiaBackend {
             if escape == 0x2b && param_in.len() >= 48 {
                 let hclass = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                 let params_size = u32::from_le_bytes(param_in[32..36].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "RM_ALLOC ENTER: hClass=0x{:04x} paramsSize={} (nested_bytes={})",
                     hclass,
                     params_size,
@@ -2969,11 +2986,11 @@ impl NvidiaBackend {
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::info!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+                log::debug!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
                     hclass,
                     status
@@ -3265,7 +3282,7 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        log::info!(
+        log::debug!(
             "UPDATE_DEVICE_MAPPING_INFO: ENTERED, host_fd={}, param_in.len={}",
             host_fd,
             param_in.len()
@@ -3280,7 +3297,7 @@ impl NvidiaBackend {
         let old_cpu_addr = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
         let new_cpu_addr = u64::from_le_bytes(param_in[24..32].try_into().unwrap());
 
-        log::info!(
+        log::debug!(
             "UPDATE_DEVICE_MAPPING_INFO: client={:#x} mem={:#x} old={:#x} new={:#x}",
             h_client,
             h_memory,
@@ -3298,7 +3315,7 @@ impl NvidiaBackend {
         let mut host_old = 0;
         if let Some(entry) = self.active_maps.find_by_object(h_client, h_memory) {
             host_old = entry.host_p_linear_address;
-            log::info!(
+            log::debug!(
                 "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
                 old_cpu_addr,
                 host_old
@@ -3325,7 +3342,7 @@ impl NvidiaBackend {
         }
 
         let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
-        log::info!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
+        log::debug!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
 
         // The caller's own addresses go back. RM only reads pOld/pNew
         // (escape.c:857-876 takes them into locals and writes nothing but
@@ -3488,7 +3505,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 
-        log::info!(
+        log::debug!(
             "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={:?}{}",
             region.offset,
             length,
@@ -3512,7 +3529,7 @@ impl NvidiaBackend {
         // The handle is the key the mmap that follows will be found by, so it
         // is the one field worth naming in the log: a mapping that is armed
         // against one file and consumed on another is the whole failure mode.
-        log::info!(
+        log::debug!(
             "MAP_MEMORY: armed on handle {} (shm_off={:#x}) → host_va={:#x} client={:#x} mem={:#x}",
             guest_fd_handle,
             region.offset,
@@ -3611,7 +3628,7 @@ impl NvidiaBackend {
             }
         };
 
-        log::info!(
+        log::debug!(
             "UNMAP_MEMORY: shm_off={:#x} → host_va={:#x} (client={:#x}, mem={:#x})",
             guest_linear,
             entry.host_p_linear_address,
@@ -3636,7 +3653,7 @@ impl NvidiaBackend {
         }
 
         let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
-        log::info!("UNMAP_MEMORY: host status=0x{:x}", status);
+        log::debug!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
             // Host unmap succeeded -- empty the window range and return the
@@ -5263,6 +5280,52 @@ mod tests {
         let body = &resp[IOCTL_BODY..];
         assert_eq!(&body[16..32], &p[16..32], "the caller's own pOld and pNew");
         assert_eq!(&body[32..36], &[0xaa; 4], "the host's status");
+    }
+
+    /// An RM that serves one control and one class and turns everything else
+    /// down in the status word, as RM does for a command it does not know.
+    unsafe fn fake_rm_status(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        // SAFETY: the contract of `HostIoctl` -- `arg` holds _IOC_SIZE bytes.
+        let a = unsafe { std::slice::from_raw_parts_mut(arg, hostfd::ioc_size(request as u32)) };
+        let (key_at, status_at, served) = match hostfd::ioc_nr(request as u32) {
+            0x2a => (8, 28, 0x2080_0101),
+            _ => (12, 40, 0x3e),
+        };
+        let key = u32::from_le_bytes(a[key_at..key_at + 4].try_into().unwrap());
+        let status: u32 = if key == served { 0 } else { 0x56 };
+        a[status_at..status_at + 4].copy_from_slice(&status.to_le_bytes());
+        0
+    }
+
+    /// S-17: the tallies are keyed by the guest's u32s, so only what RM
+    /// served is counted -- a guest walking the command space adds nothing.
+    #[test]
+    fn only_controls_and_classes_rm_served_are_tallied() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_rm_status);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let control = hostfd::ioc(hostfd::IOC_RW, b'F', 0x2a, 32);
+        let alloc = hostfd::ioc(hostfd::IOC_RW, b'F', 0x2b, 48);
+        for k in 0..200u32 {
+            let mut p = [0u8; 32];
+            p[8..12].copy_from_slice(&(0x1234_0000 + k).to_le_bytes());
+            v1_ioctl(&mut be, ctl, control, &p);
+            let mut p = [0u8; 48];
+            p[12..16].copy_from_slice(&(0x9000 + k).to_le_bytes());
+            v1_ioctl(&mut be, ctl, alloc, &p);
+        }
+        assert!(be.rm_controls.is_empty() && be.rm_classes.is_empty());
+
+        let mut p = [0u8; 32];
+        p[8..12].copy_from_slice(&0x2080_0101u32.to_le_bytes());
+        v1_ioctl(&mut be, ctl, control, &p);
+        let mut p = [0u8; 48];
+        p[12..16].copy_from_slice(&0x3eu32.to_le_bytes());
+        v1_ioctl(&mut be, ctl, alloc, &p);
+        assert_eq!(be.rm_controls.get(0x2080_0101), Some(1));
+        assert_eq!(be.rm_classes.get(0x3e), Some(1));
+        assert_eq!((be.rm_controls.len(), be.rm_classes.len()), (1, 1));
     }
 }
 

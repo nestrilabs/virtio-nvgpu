@@ -1016,7 +1016,14 @@ impl VhostUserBackendMut for NvGpuBackend {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Every call site metered (device::ratelimit): most of what is logged
+    // here is something a guest did, and a guest can do it in a loop.
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+    let max_level = logger.filter();
+    log::set_boxed_logger(Box::new(device::ratelimit::RateLimited::new(logger)))
+        .expect("the logger is set once, first thing");
+    log::set_max_level(max_level);
     let args = Args::parse();
 
     log::info!(
