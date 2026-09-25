@@ -1126,6 +1126,58 @@ static const struct vm_operations_struct nvgpu_vm_ops = {
     .close = nvgpu_vma_close,
 };
 
+/*
+ * The host maps each placement with a memory type of its own choosing:
+ * registers (the usermode doorbell) uncached, video memory through BAR1
+ * write-combined, system memory with the cache type it was allocated with,
+ * which the backend makes write-back and GPU-coherent (device/src/rmmem.rs).
+ * Mapping everything write-combined here made the doorbell a write-combined
+ * store where the host driver's own is uncached, and every read of cached
+ * system memory an uncached one. A v1 backend leaves the field zero, and zero
+ * keeps the old answer.
+ */
+pgprot_t nvgpu_window_pgprot(struct nvgpu_device *dev, u8 caching,
+                             pgprot_t prot) {
+  switch (dev->v2 ? caching : NVGPU_MMAP_CACHE_DEFAULT) {
+  case NVGPU_MMAP_CACHE_WB:
+    return prot;
+  case NVGPU_MMAP_CACHE_UC:
+    return pgprot_noncached(prot);
+  default:
+    return pgprot_writecombine(prot);
+  }
+}
+
+/*
+ * Whether the top of the window, where the backend keeps its write-back zone
+ * (device/src/shm.rs: uncached, write-combining, then write-back), really is
+ * write-back here. PAT grants a write-back request only where the MTRRs say
+ * write-back too and quietly makes it UC- elsewhere (arch/x86/mm/pat/
+ * memtype.c, pat_x_mtrr_type) -- and a PCI BAR is usually not write-back in
+ * the MTRRs unless the VMM's firmware covered that zone with a variable MTRR
+ * of its own. Nothing is wrong then, only slower: reads of coherent GPU system
+ * memory go uncached. Said once, here, rather than found by a benchmark.
+ */
+static void nvgpu_window_check_wb(struct nvgpu_device *dev) {
+#ifdef CONFIG_X86
+  void __iomem *p;
+  unsigned int level;
+  pte_t *pte;
+
+  p = ioremap_cache(dev->window.addr + dev->window.len - PAGE_SIZE, PAGE_SIZE);
+  if (!p)
+    return;
+  pte = lookup_address((unsigned long)p, &level);
+  if (pte && level == PG_LEVEL_4K && (pte_flags(*pte) & _PAGE_CACHE_MASK))
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: the window's write-back zone is not write-back "
+             "in this guest's MTRRs, so write-back mappings of GPU system "
+             "memory will be uncached (slower, not wrong); the VMM can cover "
+             "it with a write-back MTRR\n");
+  iounmap(p);
+#endif
+}
+
 static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   struct nvgpu_fd *nfd = filp->private_data;
   u64 size = vma->vm_end - vma->vm_start;
@@ -1174,8 +1226,21 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
    * failure below gives it back. */
   mapping_id = le32_to_cpu(resp->mapping_id);
 
+  /*
+   * A mapping the host made read-only (the user-shared-data page; PTIMER and
+   * MC for a non-admin) is read-only here too, by nvidia.ko's own rule for a
+   * context without WRITEABLE (nv-mmap.c:756-761): the mmap succeeds, a write
+   * faults in this process, and mprotect(PROT_WRITE) is refused. Left
+   * writable, the first write would reach KVM as a fault on a read-only host
+   * mapping it cannot resolve, and stop the whole VM.
+   */
+  if (nfd->dev->v2 && (resp->flags & NVGPU_MMAP_F_READ_ONLY)) {
+    vm_flags_clear(vma, VM_WRITE | VM_MAYWRITE);
+    vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+  }
   vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-  vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+  vma->vm_page_prot =
+      nvgpu_window_pgprot(nfd->dev, resp->caching, vma->vm_page_prot);
 
   /*
    * What the backend returns is an offset within the shared window, not a
@@ -2736,6 +2801,9 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (virtio_get_shm_region(vdev, &dev->window, NVGPU_SHM_ID)) {
     dev_info(&vdev->dev, "virtio-gpu-nv: window at %pa, %llu bytes\n",
              &dev->window.addr, dev->window.len);
+    /* Only a v2 backend ever asks for write-back. */
+    if (dev->v2 && dev->window.len >= PAGE_SIZE)
+      nvgpu_window_check_wb(dev);
   } else {
     dev->window.len = 0;
     dev_warn(&vdev->dev,

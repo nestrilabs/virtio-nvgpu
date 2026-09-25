@@ -356,6 +356,8 @@ struct nvgpu_gem_object {
   struct mutex map_lock;
   u64 window_off;
   u32 mapping_id; /* what the backend takes back in MUNMAP */
+  u8 caching;     /* NVGPU_MMAP_CACHE_*, from the placement's reply */
+  bool read_only; /* the host maps it read-only (NVGPU_MMAP_F_READ_ONLY) */
   bool window_valid;
 };
 
@@ -698,6 +700,14 @@ void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
  * CLOSE, a request that never reached the ring is queued instead, not lost.
  */
 int nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id);
+
+/*
+ * The memory type an MMAP reply asks a placement to be mapped with
+ * (NVGPU_MMAP_CACHE_*), applied to `prot`; write-combining for a v1 backend,
+ * which leaves the field zero. nvgpu_main.c.
+ */
+pgprot_t nvgpu_window_pgprot(struct nvgpu_device *dev, u8 caching,
+                             pgprot_t prot);
 
 /* ── Clock ── */
 s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns);
