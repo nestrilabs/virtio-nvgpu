@@ -356,6 +356,8 @@ fn the_syncobj_global_is_offered_with_fences_served_and_a_guest_that_can_name_sy
 }
 
 #[test]
+
+#[cfg_attr(miri, ignore = "Miri has no /proc/self/fd names")]
 fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
     let mut t = HandleTable::new();
     let ev = t
@@ -378,6 +380,8 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
 }
 
 #[test]
+
+#[cfg_attr(miri, ignore = "Miri has no /proc/self/fd names")]
 fn a_compositor_descriptor_is_adopted_only_if_it_is_what_its_desc_says() {
     let mut t = HandleTable::new();
     let host = FakeHost;

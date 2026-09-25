@@ -915,12 +915,16 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd to classify by")]
     fn an_eventfd_classifies_as_an_eventfd() {
         let fd = new_eventfd().unwrap();
         assert_eq!(classify(fd.as_fd(), &[]), HandleKind::Eventfd);
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_memfd_classifies_as_a_memfd() {
         // SAFETY: plain syscall with a static name.
         let fd = owned(unsafe { libc::memfd_create(c"keymap".as_ptr(), libc::MFD_CLOEXEC) });
@@ -963,6 +967,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no F_GETFL on this file")]
     fn nonblock_is_set_on_request() {
         let fd = open_path("/dev/null", libc::O_RDONLY).unwrap();
         set_nonblock(fd.as_raw_fd()).unwrap();
@@ -1220,6 +1226,7 @@ mod tests {
     /// Only runs where a signalled fence can be made without a GPU; says so
     /// otherwise rather than passing silently.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_signaled_sync_file_reports_signalled() {
         match signaled_sync_file(&[]) {
             Ok(fd) => {

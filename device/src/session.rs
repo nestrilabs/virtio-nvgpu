@@ -1163,6 +1163,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri's clocks start at zero")]
     fn time_sync_carries_realtime_and_raw_when_the_guest_has_room() {
         let mut be = backend();
         assert_eq!(status(&hello(&mut be, 0)), 0);

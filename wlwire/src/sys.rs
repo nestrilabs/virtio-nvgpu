@@ -23,6 +23,7 @@ fn cvt_s(r: libc::ssize_t) -> io::Result<usize> {
     }
 }
 
+#[cfg(not(miri))]
 pub fn memfd(name: &CStr, size: u64) -> io::Result<OwnedFd> {
     let fd = cvt(unsafe {
         libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
@@ -34,12 +35,35 @@ pub fn memfd(name: &CStr, size: u64) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Under Miri, which has no `memfd_create`: an unlinked temporary file,
+/// which holds bytes, a size and a file offset as a memfd does. What it
+/// cannot do -- seals, punched holes -- the two functions below stand in for.
+#[cfg(miri)]
+pub fn memfd(_name: &CStr, size: u64) -> io::Result<OwnedFd> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "wlwire-miri-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    f.set_len(size)?;
+    Ok(f.into())
+}
+
 pub fn ftruncate(fd: RawFd, size: u64) -> io::Result<()> {
     cvt(unsafe { libc::ftruncate(fd, size as libc::off_t) }).map(|_| ())
 }
 
 /// Free the pages of `fd` in `[off, off + len)`, keeping its size: they read
 /// as zeros after, and hold no memory until written again.
+#[cfg(not(miri))]
 pub fn punch_hole(fd: RawFd, off: u64, len: u64) -> io::Result<()> {
     cvt(unsafe {
         libc::fallocate(
@@ -52,6 +76,16 @@ pub fn punch_hole(fd: RawFd, off: u64, len: u64) -> io::Result<()> {
     .map(|_| ())
 }
 
+/// Under Miri: zeros written over the range, which reads as a hole does.
+#[cfg(miri)]
+pub fn punch_hole(fd: RawFd, off: u64, len: u64) -> io::Result<()> {
+    let end = off.saturating_add(len).min(file_size(fd)?);
+    if end > off {
+        pwrite_full(fd, &vec![0u8; (end - off) as usize], off)?;
+    }
+    Ok(())
+}
+
 pub fn page_size() -> u64 {
     match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
         n if n > 0 => n as u64,
@@ -60,9 +94,16 @@ pub fn page_size() -> u64 {
 }
 
 /// Seal a finished blob so the receiver can trust its size and contents.
+#[cfg(not(miri))]
 pub fn seal_readonly(fd: RawFd) -> io::Result<()> {
     let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
     cvt(unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) }).map(|_| ())
+}
+
+/// Under Miri, which has no seals: nothing.
+#[cfg(miri)]
+pub fn seal_readonly(_fd: RawFd) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn file_size(fd: RawFd) -> io::Result<u64> {

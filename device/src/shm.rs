@@ -253,7 +253,16 @@ impl ShmAllocator {
         // Create a memfd as fallback backing (used for tests and
         // before set_base_ptr is called).
         let name = CString::new("virtio-gpu-nv-shm").unwrap();
+        #[cfg(not(miri))]
         let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        // Miri has no memfd_create and no file-backed mappings: an unlinked
+        // temporary file stands in for the memfd, and the window's backing
+        // below is anonymous. Everything the allocator does is the same.
+        #[cfg(miri)]
+        let raw_fd = {
+            let _ = &name;
+            miri_memfd()
+        };
         assert!(
             raw_fd >= 0,
             "memfd_create failed: {}",
@@ -269,13 +278,17 @@ impl ShmAllocator {
             std::io::Error::last_os_error()
         );
 
+        #[cfg(not(miri))]
+        let (flags, backing) = (libc::MAP_SHARED, memfd.as_raw_fd());
+        #[cfg(miri)]
+        let (flags, backing) = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1);
         let memfd_ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 total as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                memfd.as_raw_fd(),
+                flags,
+                backing,
                 0,
             )
         };
@@ -544,6 +557,27 @@ impl Drop for ShmAllocator {
     }
 }
 
+/// Under Miri: an unlinked temporary file, as a descriptor.
+#[cfg(miri)]
+fn miri_memfd() -> RawFd {
+    use std::os::fd::IntoRawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "nvgpu-shm-miri-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("a temporary file");
+    let _ = std::fs::remove_file(&path);
+    f.into_raw_fd()
+}
+
 const PAGE_SIZE: u64 = 4096;
 
 fn align_up(v: u64, align: u64) -> u64 {
@@ -570,6 +604,7 @@ mod tests {
     /// kept for processes that hold at most a sixteenth: the one that took
     /// its half cannot take another's first mapping (B2).
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn one_guest_process_cannot_map_the_whole_zone() {
         let mib = 1u64 << 20;
         let mut a = ShmAllocator::new(ZoneConfig {
@@ -658,6 +693,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn map_host_fd_with_memfd_fallback() {
         // Tests using the default memfd-backed base_ptr (no set_base_ptr call)
         let mut a = small_alloc();
@@ -807,6 +844,8 @@ mod probe_tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_file_opened_read_only_is_probed_read_only_and_a_writable_one_writable() {
         let rw = memfd(8192);
         assert!(host_mapping_writable(rw.as_raw_fd(), 5000, 0));
@@ -819,6 +858,8 @@ mod probe_tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn a_file_that_cannot_be_mapped_at_all_is_left_to_the_placement() {
         let null = CString::new("/dev/null").unwrap();
         // SAFETY: opening /dev/null.

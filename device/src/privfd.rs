@@ -171,6 +171,7 @@ mod tests {
     /// register every other test's descriptors too, and leave them
     /// registered after those tests close them.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd")]
     fn the_process_listing_has_what_is_open_and_not_what_it_is_told_to_skip() {
         let kept = high_fd(3100);
         let skipped = high_fd(3200);

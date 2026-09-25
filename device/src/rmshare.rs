@@ -1420,6 +1420,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
     fn the_cap_counts_lists_and_grants() {
         let mut o = Ownership::default();
         let grant = policy(RS_SHARE_TYPE_CLIENT, RS_SHARE_ACTION_FLAG_COMPOSE, PEER);

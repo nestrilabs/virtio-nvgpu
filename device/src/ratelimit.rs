@@ -183,6 +183,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "timing: Miri runs far slower than the refill")]
     fn one_noisy_site_does_not_silence_another() {
         use log::Log;
         let l = RateLimited::new(Sink(Mutex::new(Vec::new())));
