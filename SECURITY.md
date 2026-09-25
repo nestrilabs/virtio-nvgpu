@@ -236,7 +236,8 @@ bounds it:
   holder is gone:
   - the RM object the call made, each DUP_OBJECT duplicate, and each object
     RM made over one of those and keeps a duplicate of its own for (a
-    semaphore surface naming it, a memory mapper over such a surface). Each
+    semaphore surface naming it, a memory mapper over such a surface), and
+    each duplicate a semaphore surface hands back with REF_MEMORY. Each
     goes when RM frees it, its parent or its client (the backend frees a
     client holding one itself, on its own file, before that file closes), or
     with the session;

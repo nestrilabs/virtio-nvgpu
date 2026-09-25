@@ -51,7 +51,8 @@
 //!   (hClient, hObject); every duplicate of it (NV_ESC_RM_DUP_OBJECT); and
 //!   every object RM made over one of those and keeps a duplicate of its
 //!   own for (`holding_fields`: a semaphore surface, and a memory mapper
-//!   over one). Each lets go when RM frees it, its parent, or its client (a
+//!   over one), and every duplicate such a surface hands back into the
+//!   caller's client (`SEMSURF_REF_MEMORY`). Each lets go when RM frees it, its parent, or its client (a
 //!   successful NV_ESC_RM_FREE naming any of them), when the file its
 //!   client was allocated on closes (the backend frees the client itself
 //!   first, so RM has let go before the guest is told), or with the
@@ -732,6 +733,14 @@ pub(crate) fn holding_fields(class: u32) -> &'static [usize] {
     }
 }
 
+/// NV_SEMAPHORE_SURFACE_CTRL_CMD_REF_MEMORY (ctrl00da.h:65): RM duplicates
+/// the memory a semaphore surface keeps in its own client back into the
+/// caller's, at the handles in the reply's NV_SEMAPHORE_SURFACE_CTRL_REF_
+/// MEMORY_PARAMS {hSemaphoreMem, hMaxSubmittedMem} (sem_surf.c,
+/// semsurfCtrlCmdRefMemory). Each is registered memory the backend never saw
+/// made, once the surface holds some (`OsDesc::referenced`).
+pub(crate) const SEMSURF_REF_MEMORY: u32 = 0x00da_0001;
+
 /// NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD, _EXPORT_OBJECTS_TO_FD, and
 /// NV00E0_CTRL_CMD_EXPORT_MEM.
 pub(crate) const EXPORT_OBJECT_TO_FD: u32 = 0x3d05;
@@ -1117,6 +1126,38 @@ impl OsDesc {
             }
             for id in self.by_key.get(&src).cloned().unwrap_or_default() {
                 self.add_key(id, key, parent);
+            }
+        }
+    }
+
+    /// RM handed the caller back, as `out` in the same client, duplicates
+    /// of the memory `(client, object)` keeps in a client of its own
+    /// (NV_SEMAPHORE_SURFACE_CTRL_CMD_REF_MEMORY on a semaphore surface):
+    /// each holds whatever the surface holds. Which of its memories each is
+    /// is not told apart -- a surface over two registrations has both held
+    /// by either duplicate, late rather than early. The device they are
+    /// made under is not known here, so each lasts until it or its client
+    /// is freed.
+    pub(crate) fn referenced(&mut self, client: u32, object: u32, out: &[u32]) {
+        let ids = self
+            .by_key
+            .get(&Key { client, object })
+            .cloned()
+            .unwrap_or_default();
+        let mut made: Vec<u32> = out
+            .iter()
+            .copied()
+            .filter(|&h| h != 0 && h != object && h != client)
+            .collect();
+        made.sort_unstable();
+        made.dedup();
+        for &h in &made {
+            // A handle RM just made: whatever it named before is gone.
+            self.drop_key(Key { client, object: h });
+        }
+        for &h in &made {
+            for &id in &ids {
+                self.add_key(id, Key { client, object: h }, client);
             }
         }
     }
@@ -3144,6 +3185,55 @@ mod backend_tests {
         assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
         assert!(reserved_live(addr));
         rm_free(&mut vm, 0x5000_0020);
+        assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
+    }
+
+    /// A semaphore surface over registered memory hands the caller a
+    /// duplicate of it on request (REF_MEMORY): with the handle and the
+    /// surface freed, that duplicate still holds it, and is never exported.
+    #[test]
+    fn memory_a_semaphore_surface_hands_back_holds_it_too() {
+        let (mut vm, _) = vm_610();
+        let (addr, id) = register(&mut vm);
+        let ctl = vm.ctl;
+        let mut o = vec![0u8; 48];
+        put32(&mut o, 0, CLIENT);
+        put32(&mut o, 4, DEVICE);
+        put32(&mut o, 8, 0x5000_0020);
+        put32(&mut o, 12, NV_SEMAPHORE_SURFACE);
+        put64(&mut o, OS64_PARAMS, GUEST_VA);
+        put32(&mut o, 32, 16);
+        let mut n = vec![0u8; 16];
+        put32(&mut n, 0, HANDLE);
+        assert_eq!(ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &n, None).0, 0);
+        seen();
+        let control = |object: u32, cmd: u32, n: Vec<u8>| {
+            let mut o = vec![0u8; 32];
+            put32(&mut o, 0, CLIENT);
+            put32(&mut o, 4, object);
+            put32(&mut o, 8, cmd);
+            put64(&mut o, 16, GUEST_VA);
+            put32(&mut o, 24, n.len() as u32);
+            (o, n)
+        };
+        // REF_MEMORY: RM makes 0x5000_0030 in the caller's client.
+        let mut p = vec![0u8; 8];
+        put32(&mut p, 0, 0x5000_0030);
+        let (o, n) = control(0x5000_0020, SEMSURF_REF_MEMORY, p);
+        assert_eq!(ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0, 0);
+        assert!(vm.be.osdesc.holds(CLIENT, 0x5000_0030));
+        rm_free(&mut vm, HANDLE);
+        rm_free(&mut vm, 0x5000_0020);
+        assert_eq!(reap(&mut vm.be, 0).1, Vec::<u64>::new());
+        assert!(reserved_live(addr));
+        let mut p = vec![0u8; 24];
+        put32(&mut p, 12, 0x5000_0030);
+        let (o, n) = control(CLIENT, EXPORT_OBJECT_TO_FD, p);
+        assert_eq!(
+            ioctl(&mut vm.be, ctl, CONTROL, &o, &n, None).0,
+            -libc::EPERM
+        );
+        rm_free(&mut vm, 0x5000_0030);
         assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
     }
 

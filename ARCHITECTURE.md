@@ -242,7 +242,8 @@ the rest of RM a page array), but the backend's range stays mapped until the
 host kernel lets go all the same, and "lets go" means every holder, not just
 the guest's handle. RM holds the pages for the object the call made, for
 every duplicate of it, and for every object it made over one and keeps a
-duplicate of its own for (a semaphore surface, a memory mapper over one):
+duplicate of its own for (a semaphore surface, a memory mapper over one),
+and for every duplicate a semaphore surface hands back (REF_MEMORY):
 each goes when RM frees it, its parent or its client, when the file the
 client was made on closes — the backend frees the client itself first, so
 the pages are released by then — or with the session. nvidia-uvm holds them

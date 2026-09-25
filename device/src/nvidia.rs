@@ -3699,6 +3699,20 @@ impl NvidiaBackend {
                     self.osdesc.duplicated(sc, so, c, o, p);
                 }
             }
+            // NVOS54: hClient, hObject, cmd, ..., status at 28, the
+            // parameters from 32. A semaphore surface holding registered
+            // memory hands the caller duplicates of it (osdesc.rs,
+            // `SEMSURF_REF_MEMORY`): each holds it too.
+            NV_ESC_RM_CONTROL
+                if r(28) == Some(0) && r(8) == Some(crate::osdesc::SEMSURF_REF_MEMORY) =>
+            {
+                if let (Some(c), Some(o)) = (r(0), r(4))
+                    && self.osdesc.holds(c, o)
+                {
+                    let out: Vec<u32> = [32, 36].iter().filter_map(|&at| r(at)).collect();
+                    self.osdesc.referenced(c, o, &out);
+                }
+            }
             // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
             // A zero hObjectNew is no handle: RM made the object under one it
             // generated and, through ALLOC_MEMORY, never wrote back.
