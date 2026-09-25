@@ -117,6 +117,19 @@ struct Args {
     #[arg(long)]
     permissive_abi: bool,
 
+    /// Serve CUDA and other compute: `/dev/nvidia-uvm` (with UVM's
+    /// multi-process sharing mode and the UVM aperture, where the VMM maps
+    /// semaphore pools at guest-chosen addresses in its own address space),
+    /// and memory the guest registers by its pages (RM pins guest RAM for the
+    /// GPU, released by a list of holders read from one release's sources).
+    ///
+    /// Off by default. Vulkan, OpenGL, EGL, Vulkan Video and the display
+    /// paths need none of it; without it the guest sees a host whose
+    /// nvidia-uvm is not loaded, and CUDA finds no device (SECURITY.md,
+    /// "Compute").
+    #[arg(long)]
+    allow_compute: bool,
+
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
     ///
@@ -1219,8 +1232,14 @@ fn main() -> anyhow::Result<()> {
         // The fence and syncobj schemas are served (policy.rs FENCES,
         // fence.rs): waits are polls here and sleeps in the guest.
         fences: true,
+        allow_compute: args.allow_compute,
         ..BackendConfig::default()
     };
+    if config.allow_compute {
+        log::info!(
+            "--allow-compute: UVM, the UVM aperture and memory registered by its pages are served"
+        );
+    }
     if config.kms_card {
         log::warn!(
             "compositor-VM mode: the host card nodes are offered to the guest; \

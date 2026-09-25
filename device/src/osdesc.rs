@@ -2273,6 +2273,7 @@ mod backend_tests {
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_host);
         be.set_guest_ram(Some(guest_memory()));
+        be.config_mut().allow_compute = true;
         let hello = HelloReq {
             proto: PROTO_V2,
             flags: HELLO_F_FRESH,
@@ -2530,6 +2531,54 @@ mod backend_tests {
         assert_eq!(&params[..48], &os64()[..], "the caller's own block");
         assert_eq!(&params[48..], &osd(GUEST_VA, PAGE, 1 << 22)[..]);
         assert_eq!(deep.len(), 8);
+    }
+
+    /// Without --allow-compute, BCAP_OS_DESC is never offered, and a page
+    /// list that comes anyway never reaches RM: the surface is what it was
+    /// before registration by pages existed (an address alone is refused as
+    /// it always was).
+    #[test]
+    fn without_allow_compute_memory_is_never_registered_by_its_pages() {
+        let mut vm = vm();
+        vm.be.config_mut().allow_compute = false;
+        let hello = HelloReq {
+            proto: PROTO_V2,
+            flags: 0,
+            guest_caps: 0,
+            uvm_aperture_mib: 0,
+        };
+        // SAFETY: a wire struct as its bytes.
+        let hb = unsafe {
+            std::slice::from_raw_parts(
+                &hello as *const HelloReq as *const u8,
+                size_of::<HelloReq>(),
+            )
+        };
+        let r = call(&mut vm.be, MsgType::Hello, 0, hb);
+        assert_eq!(status(&r), 0);
+        assert_eq!(rd32(&r, 16 + 4) & BCAP_OS_DESC, 0, "guest RAM or not");
+        let ctl = vm.ctl;
+        seen();
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            ctl,
+            RM_ALLOC,
+            &os64(),
+            &osd(GUEST_VA, PAGE, 1 << 22),
+            Some(&list(0, &[(HIGH + 9 * PAGE, 1)])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty(), "RM never called");
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            ctl,
+            VID_HEAP,
+            &os32(GUEST_VA, 2 * PAGE, 0, 0),
+            &[],
+            Some(&list(OSDESC_F_WRITE, &[(LOW, 1), (HIGH, 1)])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty());
     }
 
     /// RM refused: nothing is registered, the range goes at once, and the

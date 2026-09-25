@@ -166,6 +166,7 @@ struct nvgpu_device {
   struct cdev cdev_ctl;      /* /dev/nvidiactl            */
   struct cdev cdev_uvm;      /* /dev/nvidia-uvm           */
   dev_t uvm_devno;           /* dynamic major for UVM     */
+  bool uvm_registered;       /* UVM served: nvgpu_uvm_offered() */
   struct cdev cdev_caps;     /* /dev/nvidia-caps */
   dev_t caps_devno;          /* dynamic major for nvidia-caps */
   struct cdev cdev_modeset;  /* /dev/nvidia-modeset */

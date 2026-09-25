@@ -204,7 +204,7 @@ impl SemsurfPolicy {
         &self,
         issuer: u32,
         h_client: u32,
-        by: Option<crate::rmshare::ProcId>,
+        by: Option<crate::rmshare::Caller>,
     ) {
         let mut g = self.lock();
         g.clients.insert(h_client, issuer);
@@ -217,7 +217,7 @@ impl SemsurfPolicy {
     }
 
     /// The guest process that made `h_client`, if the guest said.
-    pub fn owner_of(&self, h_client: u32) -> Option<crate::rmshare::ProcId> {
+    pub fn owner_of(&self, h_client: u32) -> Option<crate::rmshare::Caller> {
         self.lock().own.owners.get(&h_client).copied()
     }
 
@@ -240,25 +240,23 @@ impl SemsurfPolicy {
         self.lock().own.full_for(owner, object, p)
     }
 
-    /// Whether client `dst` may duplicate `(src, obj)` for `caller`
-    /// (rmshare.rs, `Ownership::dup_verdict`).
-    pub fn dup_verdict(
-        &self,
-        per_process: bool,
-        caller: Option<crate::rmshare::ProcId>,
-        dst: u32,
-        src: u32,
-        obj: u32,
-    ) -> crate::rmshare::DupVerdict {
+    /// Whether client `dst` may duplicate `(src, obj)` (rmshare.rs,
+    /// `Ownership::dup_verdict`).
+    pub fn dup_verdict(&self, dst: u32, src: u32, obj: u32) -> crate::rmshare::DupVerdict {
         let g = self.lock();
-        g.own.dup_verdict(
-            |c| g.clients.contains_key(&c),
-            per_process,
-            caller,
-            dst,
-            src,
-            obj,
-        )
+        g.own
+            .dup_verdict(|c| g.clients.contains_key(&c), dst, src, obj)
+    }
+
+    /// Whether a call by `caller` through client `own` may name `n`
+    /// (rmshare.rs, `Ownership::named_ok`).
+    pub fn named_ok(
+        &self,
+        caller: Option<&crate::rmshare::Caller>,
+        own: u32,
+        n: &crate::rmshare::Named,
+    ) -> bool {
+        self.lock().own.named_ok(caller, own, n)
     }
 
     /// RM_FREE of a client was asked for. Forgotten whatever RM answered: a

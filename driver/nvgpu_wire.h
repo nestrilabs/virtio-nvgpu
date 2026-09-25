@@ -328,26 +328,32 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_UVM_MAP (1u << 6)     /* UVM pools map into the aperture     */
 #define NVGPU_BCAP_OS_DESC (1u << 7)     /* NVGPU_DEEP_PAGE_LIST registrations  */
 #define NVGPU_BCAP_PROC_ID (1u << 8)     /* nvgpu_proc_id on RM_ALLOC, RM_DUP   */
+#define NVGPU_BCAP_PROC_EUID (1u << 9)   /* ... with euid, and on RM_CONTROL    */
+#define NVGPU_BCAP_COMPUTE (1u << 10)    /* UVM served (--allow-compute)        */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
 #define NVGPU_GCAP_PROC_ID (1u << 1)      /* can send nvgpu_proc_id        */
+#define NVGPU_GCAP_PROC_EUID (1u << 2)    /* ... with the caller's euid     */
 
 /*
  * The guest process an IOCTL is made by. With NVGPU_BCAP_PROC_ID, every
  * NVGPU_MSG_IOCTL of NV_ESC_RM_ALLOC or NV_ESC_RM_DUP_OBJECT carries one after
- * its blocks (after the deep_len bytes). The host sees every guest process's
- * RM calls as the backend's, one process; this is how the backend keeps RM
- * objects to the guest process that made their client, as RM keeps them to a
- * host process (protocol/src/messages.rs, ProcId; device/src/rmshare.rs).
- * Opaque to the backend: the calling thread group's leader, by its PID in the
- * initial namespace and its start time, a pair no other process has for the
- * guest's lifetime.
+ * its blocks (after the deep_len bytes), and with NVGPU_BCAP_PROC_EUID every
+ * NV_ESC_RM_CONTROL too. The host sees every guest process's RM calls as the
+ * backend's, one process; this is how the backend keeps RM objects to the
+ * guest process that made their client, as RM keeps them to a host process,
+ * and holds a second client a call names to RM's rule for it -- the same
+ * process, or the same euid where RM's rule is its security token
+ * (protocol/src/messages.rs, ProcId; device/src/rmshare.rs). The process is
+ * the calling thread group's leader, by its PID in the initial namespace and
+ * its start time, a pair no other process has for the guest's lifetime.
  */
 struct nvgpu_proc_id {
   __le64 start_ns; /* group_leader->start_time, CLOCK_MONOTONIC */
   __le32 tgid;     /* task_tgid_nr(), initial PID namespace     */
-  __le32 flags;    /* 0 */
+  __le32 euid;     /* current_euid(), initial user namespace, with
+                      NVGPU_BCAP_PROC_EUID; 0 otherwise */
 } __packed;
 
 struct nvgpu_hello_req {

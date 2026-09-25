@@ -445,7 +445,7 @@ pub struct NvidiaBackend {
     current_data_len: u32,
     /// The guest process making the RM call being served, when the guest
     /// says (rmshare.rs).
-    pub(crate) current_proc: Option<crate::rmshare::ProcId>,
+    pub(crate) current_proc: Option<crate::rmshare::Caller>,
     pub(crate) handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
@@ -1545,6 +1545,13 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, libc::EPERM);
             }
             Some(DeviceKind::Dri(n)) => HandleKind::DriRender(n),
+            // UVM is compute's alone (`--allow-compute`, session.rs): without
+            // it neither device is opened on the host, so no UVM command,
+            // sharing mode or aperture placement is reachable at all.
+            Some(k @ (DeviceKind::Uvm | DeviceKind::UvmTools)) if !self.config.allow_compute => {
+                log::warn!("OPEN of {k:?} refused: UVM is served only with --allow-compute");
+                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
+            }
             // A channel to the host compositor: not a path (wl/serve.rs).
             Some(DeviceKind::Wayland) => {
                 return match self.open_wayland(req.flags) {
@@ -3574,7 +3581,11 @@ impl NvidiaBackend {
         resp_buf: &mut [u8],
     ) -> usize {
         use crate::osdesc::{self as od, Shape};
-        let Some(ram) = self.guest_ram.clone().filter(|_| self.session.v2) else {
+        let Some(ram) = self
+            .guest_ram
+            .clone()
+            .filter(|_| self.session.v2 && self.config.allow_compute)
+        else {
             log::warn!("OS descriptor page list from a guest never offered BCAP_OS_DESC; refused");
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         };
@@ -7477,6 +7488,7 @@ mod uvm_map_tests {
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_uvm);
         be.set_host_driver_version("595.99.02");
+        be.config_mut().allow_compute = true;
         let vmm = Vmm::default();
         be.set_window(Box::new(vmm.clone()));
         let mut e = Env { be, vmm };

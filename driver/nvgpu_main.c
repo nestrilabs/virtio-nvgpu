@@ -313,6 +313,28 @@ static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
 }
 
 /*
+ * Whether the process says its euid too, and every RM_CONTROL carries it: a
+ * control may name a second client, which the backend holds to RM's rule for
+ * it -- the same process, or the same euid where RM's rule is its security
+ * token (device/src/rmshare.rs).
+ */
+static bool nvgpu_proc_euid(const struct nvgpu_device *dev) {
+  return nvgpu_proc_ids(dev) && (dev->backend_caps & NVGPU_BCAP_PROC_EUID);
+}
+
+/*
+ * Whether this guest has a UVM device at all. A v2 backend serves UVM only
+ * with --allow-compute (NVGPU_BCAP_COMPUTE) and refuses every open of it
+ * otherwise; then no /dev/nvidia-uvm is made and "nvidia-uvm" is not in
+ * /proc/devices, which NVIDIA's userspace reads as a host whose nvidia-uvm
+ * is not loaded (and nvidia-modprobe finds no major to make a node with).
+ * A v1 backend knows nothing of the flag and keeps what it had.
+ */
+static bool nvgpu_uvm_offered(const struct nvgpu_device *dev) {
+  return !dev->v2 || (dev->backend_caps & NVGPU_BCAP_COMPUTE);
+}
+
+/*
  * The calling process, as the backend keeps RM clients to one: its thread
  * group, which every thread of it shares, by the group leader's PID in the
  * initial namespace and start time. A fork is a new pair; an exec keeps it
@@ -321,7 +343,7 @@ static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
  * RCU grace period, so the leader read here stays readable while a
  * concurrent exec replaces it.
  */
-static void nvgpu_proc_id_fill(void *dst) {
+static void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
   struct nvgpu_proc_id id = {};
   struct task_struct *leader;
 
@@ -330,6 +352,13 @@ static void nvgpu_proc_id_fill(void *dst) {
   id.start_ns = cpu_to_le64(leader->start_time);
   rcu_read_unlock();
   id.tgid = cpu_to_le32(task_tgid_nr(current));
+  /*
+   * The effective uid, as RM's security token holds it for a host process
+   * (os_get_euid: current->cred->euid, in the initial user namespace). Not
+   * the fsuid: RM never reads it.
+   */
+  if (nvgpu_proc_euid(dev))
+    id.euid = cpu_to_le32(__kuid_val(current_euid()));
   memcpy(dst, &id, sizeof(id));
 }
 
@@ -374,7 +403,7 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
   if (proc)
-    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sz);
+    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sz);
 
   ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &used);
@@ -769,6 +798,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  bool proc;
   u32 used;
 
   if (sz < sizeof(params))
@@ -870,8 +900,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   /* ── Normal path (no V1→V2 rewrite) ── */
 
-  req_total =
-      sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size + deep_len;
+  /* The calling process after the blocks (nvgpu_proc_euid). */
+  proc = nvgpu_proc_euid(nfd->dev);
+  req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size +
+              deep_len + (proc ? sizeof(struct nvgpu_proc_id) : 0);
   resp_max =
       sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size + deep_len;
 
@@ -965,6 +997,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       goto out;
     }
   }
+  if (proc)
+    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sizeof(params) +
+                                     nested_size + deep_len);
 
   ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &used);
@@ -1201,7 +1236,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
   if (nvgpu_proc_ids(nfd->dev))
-    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sizeof(params) + nested_size);
+    nvgpu_proc_id_fill(nfd->dev,
+                       req_buf + sizeof(*req) + sizeof(params) + nested_size);
 
   if (user_alloc && nested_size > 0) {
     nested = req_buf + sizeof(*req) + sizeof(params);
@@ -3442,21 +3478,33 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   device_create(nvgpu_class, &vdev->dev, MKDEV(NV_MAJOR, NV_CTL_MINOR), NULL,
                 "nvidiactl");
 
-  /* Register /dev/nvidia-uvm (major should match host) */
+  /*
+   * Register /dev/nvidia-uvm (major should match host), when the backend
+   * serves it (nvgpu_uvm_offered).
+   */
   dev->uvm_devno = MKDEV(NV_UVM_MAJOR, 0);
-  ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
-  if (ret)
-    goto err_ctl_cdev;
+  if (nvgpu_uvm_offered(dev)) {
+    ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
+    if (ret)
+      goto err_ctl_cdev;
 
-  cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
-  dev->cdev_uvm.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
-  if (ret)
-    goto err_uvm_region;
+    cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
+    dev->cdev_uvm.owner = THIS_MODULE;
+    ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
+    if (ret) {
+      unregister_chrdev_region(dev->uvm_devno, 2);
+      goto err_ctl_cdev;
+    }
 
-  device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
-  device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
-                "nvidia-uvm-tools");
+    device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
+    device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
+                  "nvidia-uvm-tools");
+    dev->uvm_registered = true;
+  } else {
+    dev_info(&vdev->dev,
+             "virtio-gpu-nv: the backend serves no compute (no "
+             "--allow-compute); no /dev/nvidia-uvm\n");
+  }
 
   /* Register /dev/nvidia-modeset (match host, major 195, minor 254) */
   dev->modeset_devno = MKDEV(NV_MAJOR, NV_MODESET_MINOR);
@@ -3543,11 +3591,13 @@ err_proc:
 err_modeset_region:
   unregister_chrdev_region(dev->modeset_devno, 1);
 err_uvm_cdev:
-  device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
-  cdev_del(&dev->cdev_uvm);
-err_uvm_region:
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
 err_ctl_cdev:
   device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
   cdev_del(&dev->cdev_ctl);
@@ -3613,10 +3663,13 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   cdev_del(&dev->cdev_ctl);
   unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
 
-  device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
-  cdev_del(&dev->cdev_uvm);
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
 
   nvgpu_caps_cleanup(dev);
 
