@@ -1422,7 +1422,8 @@ impl NvidiaBackend {
         if req_buf.len() < size_of::<MsgHeader>() {
             self.current_msg = MsgType::Ioctl;
             self.current_req_id = 0;
-            return Outcome::Reply(self.error_reply(libc::EPROTO));
+            let r = self.error_reply(libc::EPROTO);
+            return Outcome::Reply(self.fit(r, cap));
         }
         let hdr = read_struct::<MsgHeader>(req_buf, 0);
         self.current_req_id = hdr.req_id;
@@ -1430,7 +1431,8 @@ impl NvidiaBackend {
         let Some(msg_type) = MsgType::from_u32(hdr.msg_type) else {
             log::warn!("unknown msg_type {}", hdr.msg_type);
             self.current_msg = MsgType::Ioctl;
-            return Outcome::Reply(self.error_reply(libc::EPROTO));
+            let r = self.error_reply(libc::EPROTO);
+            return Outcome::Reply(self.fit(r, cap));
         };
         self.current_msg = msg_type;
         *self
@@ -1477,7 +1479,7 @@ impl NvidiaBackend {
             ),
             _ => self.handles.owner(hdr.handle),
         };
-        let mut reply = match msg_type {
+        let reply = match msg_type {
             MsgType::Hello
             | MsgType::Ioctl2
             | MsgType::TimeSync
@@ -1502,6 +1504,13 @@ impl NvidiaBackend {
                 }
             }
         };
+        Outcome::Reply(self.fit(reply, cap))
+    }
+
+    /// `reply`, or if it is larger than the `cap` bytes the guest posted, a
+    /// header saying so -- or nothing, if even that does not fit: no reply
+    /// is ever longer than the buffer it goes to.
+    fn fit(&mut self, mut reply: Reply, cap: usize) -> Reply {
         if reply.bytes.len() > cap {
             // Nothing the guest could read: say why in a header, if even that
             // fits, and take back whatever the message created.
@@ -1512,7 +1521,7 @@ impl NvidiaBackend {
                 reply.bytes.clear();
             }
         }
-        Outcome::Reply(reply)
+        reply
     }
 
     /// Serve one request into a caller-supplied buffer, all the way through:
@@ -5437,6 +5446,24 @@ mod tests {
         let mut be = NvidiaBackend::for_test();
         be.dispatch(&[0u8; 4], &mut vec![0u8; 32]);
         // just must not panic
+    }
+
+    /// Fuzzing (backend target): a request too short for a header, or of no
+    /// known type, was answered with a 16-byte header whatever capacity the
+    /// guest posted. `serve` promises no reply longer than `cap`; the
+    /// vhost-user transport never posts less than a header, another
+    /// transport might.
+    #[test]
+    fn a_malformed_request_is_answered_within_the_posted_capacity() {
+        let mut be = NvidiaBackend::for_test();
+        for req in [&[0u8; 4][..], &[0xffu8; 16][..]] {
+            for cap in [0, 2, 15, 16] {
+                let Outcome::Reply(r) = be.serve(req, cap) else {
+                    panic!("an IOCTL2 from nothing");
+                };
+                assert!(r.bytes.len() <= cap, "{} bytes for {cap}", r.bytes.len());
+            }
+        }
     }
 
     // ---- teardown tests (no GPU required) ----
