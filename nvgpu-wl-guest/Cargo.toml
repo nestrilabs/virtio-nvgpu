@@ -1,0 +1,21 @@
+[package]
+name = "nvgpu-wl-guest"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Guest-side Wayland proxy daemon for virtio-nvgpu"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nvgpu-wl-guest"
+path = "src/main.rs"
+
+[dependencies]
+wlwire = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+# The loopback test runs the backend's own connection object in process.
+device = { path = "../device" }

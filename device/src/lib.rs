@@ -18,4 +18,5 @@ pub mod schema;
 pub mod shm;
 pub mod userspace;
 pub mod virtio;
+pub mod wl;
 pub mod xfer;

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "wlwire",
+    "nvgpu-wl-guest",
     "protocol",
     "gen",
     "device",
@@ -13,3 +15,4 @@ edition = "2024"
 [workspace.dependencies]
 protocol = { path = "protocol" }
 abi      = { path = "gen" }
+wlwire   = { path = "wlwire" }

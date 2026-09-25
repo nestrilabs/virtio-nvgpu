@@ -1,0 +1,13 @@
+[package]
+name = "wlwire"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Wayland wire codec, channel frame format and translation engine shared by the virtio-nvgpu guest daemon and backend"
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+quick-xml = "0.37"
