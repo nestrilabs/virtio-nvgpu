@@ -171,6 +171,18 @@ pub trait Platform {
     fn drm_file_out(&mut self, fd: OwnedFd) -> DescOut;
     /// A DRM_FILE desc from the channel, for the local peer.
     fn drm_file_in(&mut self, desc: &Desc, fd: Option<OwnedFd>) -> std::io::Result<OwnedFd>;
+    /// A syncobj from the local peer (a client's
+    /// `wp_linux_drm_syncobj_manager_v1.import_timeline`), for the channel.
+    /// Reached only with `Policy::fences`; until the guest kernel can name a
+    /// guest syncobj's host object the default carries nothing.
+    fn syncobj_out(&mut self, _fd: OwnedFd) -> DescOut {
+        DescOut::plain(Desc::invalid(frame::DESC_SYNCOBJ))
+    }
+    /// A SYNCOBJ desc from the channel, for the local peer (the backend: the
+    /// host syncobj behind the backend handle in `desc.a`).
+    fn syncobj_in(&mut self, _desc: &Desc, _fd: Option<OwnedFd>) -> std::io::Result<OwnedFd> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Counters, for logs and tests.
@@ -768,6 +780,10 @@ impl Engine {
                             self.stats.drm_files += 1;
                             plat.drm_file_out(fd)
                         }
+                        // The syncobj global is only offered with fences
+                        // (policy_table.rs), so without them no object can
+                        // carry one here and this is a peer out of step.
+                        FdKind::Syncobj if self.cfg.policy.fences => plat.syncobj_out(fd),
                         FdKind::Syncobj => {
                             return Err(err(
                                 ERR_IMPLEMENTATION,
@@ -855,7 +871,7 @@ impl Engine {
                                 self.stats.drm_files += 1;
                                 plat.drm_file_in(&d, tfd).ok()
                             }
-                            FdKind::Syncobj => None,
+                            FdKind::Syncobj => plat.syncobj_in(&d, tfd).ok(),
                         }
                     };
                     let fd = match fd {

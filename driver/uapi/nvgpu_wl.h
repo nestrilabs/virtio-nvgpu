@@ -115,6 +115,12 @@ struct nvgpu_wl_xfer {
 #define NVGPU_WL_FRAME_MAGIC 0x4c57564eu /* "NVWL" */
 #define NVGPU_WL_FRAME_VERSION 1
 #define NVGPU_WL_MAX_DESC 256
+/*
+ * The smallest RECV buffer the host takes (wlwire::frame::MIN_FRAME): a
+ * header, 32 descriptors and one record of the largest payload (64 KiB).
+ * Anything smaller is refused, with nothing taken from the channel.
+ */
+#define NVGPU_WL_MIN_FRAME (16 + 32 * 24 + 16 + 65536)
 
 /* nvgpu_wl_frame_hdr.flags */
 #define NVGPU_WL_FRAME_F_MORE (1u << 0)

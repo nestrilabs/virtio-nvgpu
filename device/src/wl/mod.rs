@@ -13,7 +13,7 @@
 //! ones it made itself (memfds, pipes) or exported from a guest file's own
 //! host GEM object.
 //!
-//! Integration (for the dispatcher, which owns the handle table):
+//! Integration (the dispatcher's side is `serve.rs`, over the handle table):
 //!
 //! - `OPEN(DEV_WAYLAND, flags = WL_OPEN_CONNECT)` → [`WlConn::open`]; insert
 //!   the connection under a `HandleKind::Wayland` handle and watch the eventfd
@@ -35,8 +35,12 @@
 pub mod conn;
 pub mod export;
 pub mod probe;
+pub mod serve;
 
+#[cfg(test)]
+mod serve_tests;
 #[cfg(test)]
 mod tests;
 
 pub use conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn};
+pub use serve::WlState;

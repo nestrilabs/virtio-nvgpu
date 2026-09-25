@@ -339,6 +339,8 @@ struct nvgpu_gem_object {
   u64 window_off;
   u32 mapping_id; /* what the backend takes back in MUNMAP */
   bool window_valid;
+  /* In the live-proxy table, by (owner, host_handle): nvgpu_gem_proxy_find(). */
+  struct hlist_node live;
 };
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
@@ -381,11 +383,57 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
 /* Guest handle in `file` -> (host GEM handle, owner backend handle). */
 int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
                       u32 *host_handle, u32 *owner_handle);
+/*
+ * The live proxy standing for host GEM @host_handle of @owner's host file,
+ * with a reference the caller puts, or NULL. A host import that returns a
+ * handle the file already holds must reuse that proxy, never make a second.
+ */
+struct nvgpu_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
+                                              u32 host_handle);
+struct dma_buf;
+/*
+ * Wayland channel (nvgpu_wl.c). A dma-buf of one of this device's GEM
+ * proxies -> its (owner backend handle, host GEM), else -EINVAL.
+ */
+int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
+                         u32 *owner, u32 *gem);
+/*
+ * Host GEM @host_gem, just imported into the render handle of @drm_filp (a
+ * DRM file of ours), as a new guest dma-buf descriptor (@o_flags: O_CLOEXEC |
+ * O_RDWR), or -errno. Owns @host_gem unless it returns -EBADF (not our file).
+ */
+int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
+                           int o_flags);
 
 /* ───────── nvgpu_hostfile.c ───────── */
 
 /* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */
 int nvgpu_hostfile_handle(struct file *f, u32 *handle);
+
+/* ───────── nvgpu_kms.c ───────── */
+
+/*
+ * Adopt backend handle @kms_handle (a host DRM file of kind @kind, NVGPU_HK_*)
+ * into a new guest DRM file cloned from template @tmpl, returning its
+ * descriptor (DESIGN §4.2). Ownership of the handle passes to it at the call:
+ * on failure it has closed the handle unless the clone consumed it.
+ */
+int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
+                         int o_flags);
+
+/* ───────── nvgpu_wl.c ───────── */
+
+/* /dev/nvgpu-wl: probe (after HELLO and nvgpu_dri_init()) and remove. */
+int nvgpu_wl_init(struct nvgpu_device *dev);
+void nvgpu_wl_cleanup(struct nvgpu_device *dev);
+struct nvgpu_tbuf;
+/*
+ * A WL_RECV reply whose caller gave up: close the backend handles its
+ * descriptors carry (a host lease among them). The transport's reaper only,
+ * process context.
+ */
+unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
+                                const struct nvgpu_tbuf *resp, u32 used);
 
 /* ═════════════════════════ Protocol v2 internal API ═════════════════════════
  *

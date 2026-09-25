@@ -1067,6 +1067,9 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
   case NVGPU_MSG_HOST_OP:
     closed = nvgpu_reap_host_op(dev, r, used);
     break;
+  case NVGPU_MSG_WL_RECV:
+    closed = nvgpu_wl_reap_recv(dev, r->resp, used);
+    break;
   default:
     break;
   }

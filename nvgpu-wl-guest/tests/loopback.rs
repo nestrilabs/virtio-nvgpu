@@ -7,6 +7,12 @@
 //! the compositor's is the code that ships: both engines, the frame format,
 //! the reader thread, stream pumping, shm copying, blobs, the allowlist.
 //!
+//! Each scenario also runs with the channel going through the backend's
+//! dispatcher instead (`Via::Dispatcher`): OPEN(DEV_WAYLAND), WL_SEND and
+//! WL_RECV as the guest kernel sends them, served by `NvidiaBackend` with its
+//! handle table, response sizing and pump watch -- the path a VM takes, minus
+//! the virtqueue.
+//!
 //! Needs sway, wayland-info, wl-clipboard and weston's demo clients on PATH,
 //! so it is ignored by default; `scripts/wl-loopback-test.sh` provides them
 //! with nix and runs it.
@@ -21,10 +27,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use device::hostfd::HandleKind;
+use device::nvidia::NvidiaBackend;
+use device::pump::PumpCmd;
+use device::shm::ZoneConfig;
 use device::wl::{HostFds, RecvOps, SendOps, WlConfig, WlConn};
 use nvgpu_wl_guest::channel::{Channel, Connector, HostInfo, Received, Sent};
 use nvgpu_wl_guest::daemon::{Config, Daemon, Totals};
 use nvgpu_wl_guest::uapi;
+use protocol::messages::{DEV_WAYLAND, HELLO_F_FRESH, MsgType, PROTO_V2};
 use wlwire::frame::{self, Desc};
 use wlwire::proto::op;
 use wlwire::sys;
@@ -64,17 +74,7 @@ struct LoopChannel {
 
 impl Channel for LoopChannel {
     fn send(&mut self, f: &mut [u8], fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
-        // The kernel's SEND: a dma-buf it cannot resolve goes as invalid.
-        for (i, fd) in fds.iter().enumerate() {
-            if fd.is_some() {
-                let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-                let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
-                d.flags |= frame::DESC_F_INVALID;
-                let mut b = Vec::new();
-                d.write(&mut b);
-                f[at..at + frame::DESC_LEN].copy_from_slice(&b);
-            }
-        }
+        mark_unresolvable(f, fds);
         match self.conn.send(f, &mut NoGpu) {
             Ok(r) => Ok(Sent::Accepted { backlog: r.backlog }),
             Err(libc::EAGAIN) => Ok(Sent::Busy),
@@ -123,6 +123,164 @@ impl Connector for LoopConnector {
         let (conn, ready) = WlConn::open(&self.cfg, Arc::new(Classify))?;
         Ok(Box::new(LoopChannel { conn, ready }))
     }
+}
+
+// ─────────────────── the channel through the dispatcher ───────────────────
+
+/// The backend as the transport drives it, one message at a time.
+struct Dispatcher {
+    be: Mutex<NvidiaBackend>,
+}
+
+const HDR: usize = 16;
+
+impl Dispatcher {
+    fn new(host_socket: &Path) -> Arc<Self> {
+        let mut be = NvidiaBackend::new(ZoneConfig {
+            uc_size: 4096,
+            wc_size: 4096,
+            wb_size: 4096,
+        });
+        be.set_wayland(Some(WlConfig::new(host_socket)));
+        let d = Arc::new(Dispatcher { be: Mutex::new(be) });
+        let mut hello = Vec::new();
+        for w in [PROTO_V2, HELLO_F_FRESH, 0, 0] {
+            hello.extend_from_slice(&w.to_le_bytes());
+        }
+        let (st, _, _) = d.call(MsgType::Hello, 0, &hello, 64);
+        assert_eq!(st, 0, "HELLO");
+        d
+    }
+
+    /// (status, header handle, payload) of one message answered into `cap`
+    /// bytes.
+    fn call(&self, t: MsgType, handle: u32, body: &[u8], cap: usize) -> (i32, u32, Vec<u8>) {
+        let mut req = Vec::with_capacity(HDR + body.len());
+        for w in [t as u32, handle, 0, 1] {
+            req.extend_from_slice(&w.to_le_bytes());
+        }
+        req.extend_from_slice(body);
+        let mut resp = vec![0u8; cap];
+        let n = self.be.lock().unwrap().dispatch(&req, &mut resp);
+        assert!(n >= HDR, "a reply without a header");
+        let w = |i: usize| u32::from_le_bytes(resp[i..i + 4].try_into().unwrap());
+        (w(8) as i32, w(4), resp[HDR..n].to_vec())
+    }
+}
+
+struct DispatchChannel {
+    d: Arc<Dispatcher>,
+    handle: u32,
+    /// The pump's copy of the channel's readiness eventfd, from the watch the
+    /// OPEN asked for: readable exactly when the event queue would say so.
+    ready: OwnedFd,
+}
+
+impl Channel for DispatchChannel {
+    fn send(&mut self, f: &mut [u8], fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
+        mark_unresolvable(f, fds);
+        match self.d.call(MsgType::WlSend, self.handle, f, 64) {
+            (0, _, p) => Ok(Sent::Accepted {
+                backlog: u32::from_le_bytes(p[4..8].try_into().unwrap()),
+            }),
+            (e, _, _) if e == -libc::EAGAIN => Ok(Sent::Busy),
+            (e, _, _) => Err(io::Error::from_raw_os_error(-e)),
+        }
+    }
+    fn recv(
+        &mut self,
+        max: usize,
+        _card: Option<RawFd>,
+        _render: Option<RawFd>,
+    ) -> io::Result<Received> {
+        // What nvgpu_wl.c posts: the header and the whole frame it asks for.
+        let mut body = Vec::new();
+        body.extend_from_slice(&(max as u32).to_le_bytes());
+        body.extend_from_slice(&(frame::MAX_DESC as u32).to_le_bytes());
+        let (st, _, f) = self.d.call(MsgType::WlRecv, self.handle, &body, HDR + max);
+        if st < 0 {
+            return Err(io::Error::from_raw_os_error(-st));
+        }
+        let d = frame::decode(&f).map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let more = d.flags & frame::FRAME_F_MORE != 0;
+        let fds = (0..d.descs.len()).map(|_| None).collect();
+        Ok(Received {
+            frame: f,
+            fds,
+            more,
+        })
+    }
+    fn poll_fd(&self) -> RawFd {
+        self.ready.as_raw_fd()
+    }
+}
+
+impl Drop for DispatchChannel {
+    fn drop(&mut self) {
+        let (st, _, _) = self.d.call(MsgType::Close, self.handle, &[], 64);
+        assert_eq!(st, 0, "CLOSE of a channel");
+    }
+}
+
+struct DispatchConnector {
+    d: Arc<Dispatcher>,
+}
+
+impl Connector for DispatchConnector {
+    fn info(&mut self) -> io::Result<HostInfo> {
+        Ok(HostInfo {
+            caps: uapi::CAP_WAYLAND,
+            clock_offset_ns: 0,
+            max_frame: 256 * 1024 - HDR,
+            devmap: Vec::new(),
+        })
+    }
+    fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>> {
+        let mut open = Vec::new();
+        open.extend_from_slice(&DEV_WAYLAND.to_le_bytes());
+        open.extend_from_slice(&mode.to_le_bytes());
+        let (st, handle, _) = self.d.call(MsgType::Open, 0, &open, 64);
+        if st < 0 {
+            return Err(io::Error::from_raw_os_error(-st));
+        }
+        let cmds = self.d.be.lock().unwrap().take_pump_cmds();
+        let ready = cmds
+            .into_iter()
+            .find_map(|c| match c {
+                PumpCmd::Watch { handle: h, fd, .. } if h == handle => Some(fd),
+                _ => None,
+            })
+            .expect("OPEN(DEV_WAYLAND) watches its handle");
+        Ok(Box::new(DispatchChannel {
+            d: self.d.clone(),
+            handle,
+            ready,
+        }))
+    }
+}
+
+/// The kernel's SEND without a GPU: a dma-buf it cannot resolve goes as
+/// invalid.
+fn mark_unresolvable(f: &mut [u8], fds: &[Option<OwnedFd>]) {
+    for (i, fd) in fds.iter().enumerate() {
+        if fd.is_some() {
+            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
+            let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
+            d.flags |= frame::DESC_F_INVALID;
+            let mut b = Vec::new();
+            d.write(&mut b);
+            f[at..at + frame::DESC_LEN].copy_from_slice(&b);
+        }
+    }
+}
+
+/// Which channel the daemon gets.
+#[derive(Clone, Copy, Debug)]
+enum Via {
+    /// The backend's connection object, called directly.
+    Conn,
+    /// The backend's message dispatcher, as the transport calls it.
+    Dispatcher,
 }
 
 // ───────────────────────── harness ─────────────────────────
@@ -206,13 +364,20 @@ struct DaemonRun {
 }
 
 impl DaemonRun {
-    fn start(dir: &Path, host_socket: &Path) -> DaemonRun {
+    fn start(dir: &Path, host_socket: &Path, via: Via) -> DaemonRun {
         let socket = dir.join("proxy-0");
         let cfg = Config::new(&socket);
-        let wl = WlConfig::new(host_socket);
+        let connector: Box<dyn Connector + Send> = match via {
+            Via::Conn => Box::new(LoopConnector {
+                cfg: WlConfig::new(host_socket),
+            }),
+            Via::Dispatcher => Box::new(DispatchConnector {
+                d: Dispatcher::new(host_socket),
+            }),
+        };
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let mut d = Daemon::new(cfg, Box::new(LoopConnector { cfg: wl })).unwrap();
+            let mut d = Daemon::new(cfg, connector).unwrap();
             tx.send((d.stop_flag(), d.totals())).unwrap();
             d.run().unwrap();
         });
@@ -381,10 +546,20 @@ fn settle(d: &DaemonRun, pred: impl Fn(&Totals) -> bool) -> Totals {
 #[test]
 #[ignore = "needs sway, wayland-utils, wl-clipboard and weston on PATH; run scripts/wl-loopback-test.sh"]
 fn real_clients_run_through_the_proxy_against_a_real_compositor() {
-    let dir = runtime_dir("s");
+    against_sway(Via::Conn, "s");
+}
+
+#[test]
+#[ignore = "needs sway, wayland-utils, wl-clipboard and weston on PATH; run scripts/wl-loopback-test.sh"]
+fn real_clients_run_through_the_backend_dispatcher_against_sway() {
+    against_sway(Via::Dispatcher, "S");
+}
+
+fn against_sway(via: Via, tag: &str) {
+    let dir = runtime_dir(tag);
     let (_sway, host_sock) = start_sway(&dir);
     let _kbd = virtual_keyboard(&host_sock);
-    let d = DaemonRun::start(&dir, &host_sock);
+    let d = DaemonRun::start(&dir, &host_sock, via);
     let proxy = d.socket.clone();
 
     // ── the registry: filtered, and a client that walks all of it works ──
@@ -558,10 +733,20 @@ fn start_weston(dir: &Path) -> (Kill, PathBuf) {
 #[test]
 #[ignore = "needs weston and wayland-utils on PATH; run scripts/wl-loopback-test.sh"]
 fn real_clients_run_through_the_proxy_against_weston() {
-    let dir = runtime_dir("w");
+    against_weston(Via::Conn, "w");
+}
+
+#[test]
+#[ignore = "needs weston and wayland-utils on PATH; run scripts/wl-loopback-test.sh"]
+fn real_clients_run_through_the_backend_dispatcher_against_weston() {
+    against_weston(Via::Dispatcher, "W");
+}
+
+fn against_weston(via: Via, tag: &str) {
+    let dir = runtime_dir(tag);
     std::fs::create_dir_all(&dir).unwrap();
     let (_weston, host_sock) = start_weston(&dir);
-    let d = DaemonRun::start(&dir, &host_sock);
+    let d = DaemonRun::start(&dir, &host_sock, via);
     let proxy = d.socket.clone();
     let (ok, proxied, err) = run(client("wayland-info", &[], &proxy, &dir), 10);
     assert!(ok, "wayland-info through the proxy failed: {err}");
@@ -573,7 +758,10 @@ fn real_clients_run_through_the_proxy_against_weston() {
         "zwp_input_panel_v1",
         "zwp_linux_explicit_synchronization_v1",
     ] {
-        assert!(!proxied.contains(hidden), "{hidden} leaked through the proxy");
+        assert!(
+            !proxied.contains(hidden),
+            "{hidden} leaked through the proxy"
+        );
     }
     let mut shm = client("weston-presentation-shm", &["-f"], &proxy, &dir)
         .stdout(Stdio::null())
@@ -581,7 +769,10 @@ fn real_clients_run_through_the_proxy_against_weston() {
         .spawn()
         .unwrap();
     std::thread::sleep(Duration::from_secs(2));
-    assert!(shm.try_wait().unwrap().is_none(), "weston-presentation-shm exited early");
+    assert!(
+        shm.try_wait().unwrap().is_none(),
+        "weston-presentation-shm exited early"
+    );
     let _ = shm.kill();
     let _ = shm.wait();
     let t = settle(&d, |t| t.clients >= 2 && t.commits > 0);

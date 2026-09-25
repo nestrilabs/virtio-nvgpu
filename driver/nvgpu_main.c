@@ -2746,6 +2746,15 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   /* Create /dev/dri/renderD128 etc. with host major:minor */
   nvgpu_dri_init(dev); /* non-fatal */
 
+  /*
+   * /dev/nvgpu-wl, when the backend offers a compositor: after HELLO (caps,
+   * limits) and the DRM devices (its device map reads their minors).
+   * Non-fatal too: GPU work does not need it.
+   */
+  ret = nvgpu_wl_init(dev);
+  if (ret)
+    dev_warn(&vdev->dev, "virtio-gpu-nv: /dev/nvgpu-wl: %d\n", ret);
+
   dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
   return 0;
@@ -2804,6 +2813,9 @@ static void nvgpu_remove(struct virtio_device *vdev) {
    * goes out. The reset stops the callbacks. After it, nothing on the ring
    * will ever be answered: waiters are failed and every buffer comes back.
    */
+  /* First, so no new channel is opened against a device going away. */
+  nvgpu_wl_cleanup(dev);
+
   nvgpu_xfer_quiesce(dev);
   vdev->config->reset(vdev);
   nvgpu_xfer_reclaim(dev);

@@ -46,6 +46,12 @@ pub trait SendOps {
     /// (a guest file's render handle). The dma-buf goes to the compositor and
     /// is closed here after sending.
     fn prime_export(&mut self, owner: u32, gem: u32) -> io::Result<OwnedFd>;
+    /// The host syncobj behind backend handle `handle`, for the compositor
+    /// (explicit sync, once fences are bridged: the global is hidden until
+    /// then). Closed here after sending, like an export.
+    fn syncobj(&mut self, _handle: u32) -> io::Result<OwnedFd> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Called while a WL_RECV is built.
@@ -176,6 +182,16 @@ impl Platform for HostPlat<'_> {
 
     fn drm_file_in(&mut self, _desc: &Desc, _fd: Option<OwnedFd>) -> io::Result<OwnedFd> {
         Err(io::Error::other("the guest does not send DRM files"))
+    }
+
+    fn syncobj_in(&mut self, desc: &Desc, _fd: Option<OwnedFd>) -> io::Result<OwnedFd> {
+        let ops = self
+            .send
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no export path"))?;
+        ops.syncobj(desc.a).inspect_err(|e| {
+            log::warn!("wayland: syncobj handle {} for the compositor: {e}", desc.a)
+        })
     }
 }
 
