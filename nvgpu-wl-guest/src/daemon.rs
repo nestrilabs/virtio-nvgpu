@@ -110,6 +110,10 @@ const SUB_SOCK: u64 = 0;
 const SUB_CHAN: u64 = 1;
 const SUB_STREAM: u64 = 1 << 31;
 
+/// What one RECV asks the host for (at least `frame::MIN_FRAME`, at most
+/// what HELLO allows).
+const RECV_BYTES: usize = 256 * 1024;
+
 /// The guest kernel as the engine's platform: dma-bufs and DRM files are its
 /// to resolve, in SEND and RECV.
 struct GuestPlat;
@@ -697,7 +701,13 @@ impl Daemon {
     }
 
     fn read_channel(&mut self, slot: usize) {
-        let max = self.info.max_frame;
+        // Not the whole frame limit (4 MiB with indirect descriptors): the
+        // kernel sizes its response buffer, and the backend what it packs,
+        // by what is asked, and what arrives per present is a few small
+        // events. The backend never splits a record and says F_MORE when
+        // more waits, which keeps the channel readable, so a burst only
+        // takes more RECVs.
+        let max = self.info.max_frame.min(RECV_BYTES.max(frame::MIN_FRAME));
         let card = self.card.as_ref().map(|f| f.as_raw_fd());
         let render = self.render.as_ref().map(|f| f.as_raw_fd());
         for _ in 0..64 {
@@ -814,6 +824,8 @@ mod tests {
     /// busy, and there is never anything to receive.
     struct BusyChannel {
         sends: Arc<AtomicUsize>,
+        /// The largest receive the daemon asked for.
+        asked: Arc<AtomicUsize>,
         ready: OwnedFd,
     }
 
@@ -824,10 +836,11 @@ mod tests {
         }
         fn recv(
             &mut self,
-            _max: usize,
+            max: usize,
             _c: Option<RawFd>,
             _r: Option<RawFd>,
         ) -> io::Result<Received> {
+            self.asked.fetch_max(max, Ordering::Relaxed);
             let (frame, _) = frame::pack(&mut VecDeque::new(), frame::MIN_FRAME, 0, false);
             Ok(Received {
                 frame,
@@ -840,8 +853,11 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct BusyHost {
         sends: Arc<AtomicUsize>,
+        asked: Arc<AtomicUsize>,
+        max_frame: usize,
     }
 
     impl Connector for BusyHost {
@@ -849,28 +865,56 @@ mod tests {
             Ok(HostInfo {
                 caps: uapi::CAP_WAYLAND,
                 clock_offset_ns: 0,
-                max_frame: 256 * 1024,
+                max_frame: self.max_frame,
                 devmap: Vec::new(),
             })
         }
         fn connect(&mut self, _mode: u32) -> io::Result<Box<dyn Channel>> {
             Ok(Box::new(BusyChannel {
                 sends: self.sends.clone(),
+                asked: self.asked.clone(),
                 ready: sys::eventfd()?,
             }))
         }
     }
 
+    fn socket_in_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nvwl-daemon-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("wayland-0")
+    }
+
+    #[test]
+    fn a_receive_asks_for_a_modest_frame_not_the_whole_limit() {
+        let sock = socket_in_tmp("recv");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut d = Daemon::new(
+            Config::new(&sock),
+            Box::new(BusyHost {
+                asked: asked.clone(),
+                max_frame: 4 << 20,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let _client = UnixStream::connect(&sock).unwrap();
+        d.turn(100).unwrap();
+        // The first receive is made as the client is added.
+        assert_eq!(asked.load(Ordering::Relaxed), RECV_BYTES);
+        assert!(RECV_BYTES >= frame::MIN_FRAME);
+    }
+
     #[test]
     fn a_client_that_hangs_up_while_the_host_is_busy_is_closed_not_spun_on() {
-        let dir = std::env::temp_dir().join(format!("nvwl-daemon-hup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("wayland-0");
+        let sock = socket_in_tmp("hup");
         let sends = Arc::new(AtomicUsize::new(0));
         let mut d = Daemon::new(
             Config::new(&sock),
             Box::new(BusyHost {
                 sends: sends.clone(),
+                max_frame: 256 * 1024,
+                ..Default::default()
             }),
         )
         .unwrap();
@@ -895,6 +939,5 @@ mod tests {
             retried <= 2,
             "{retried} SENDs retried for a client that is gone"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

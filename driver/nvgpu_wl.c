@@ -88,6 +88,15 @@ struct nvgpu_wl_file {
   u32 mode;
   /* The last RECV said more is waiting. */
   bool more;
+  /*
+   * RECV's response buffer, kept for the next RECV of the same size (under
+   * `lock`): a channel receives at least twice per presented frame, and each
+   * buffer is up to 4 MiB of order-4 pieces, whose allocation under
+   * fragmentation falls back to direct reclaim on the frame-callback path.
+   * The transport zeroes it before every use. Given up to the transport with
+   * an abandoned call (nvgpu_xfer), freed at release.
+   */
+  struct nvgpu_tbuf *rbuf;
 };
 
 /* ── helpers ── */
@@ -623,7 +632,14 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   max_desc = min_t(u32, x.max_desc, NVGPU_WL_MAX_DESC);
 
   req = nvgpu_tbuf_alloc(H + sizeof(rr), GFP_KERNEL);
-  resp = nvgpu_tbuf_alloc(H + cap, GFP_KERNEL);
+  /* Exactly this size or a new one: the transport zeroes all of it per call. */
+  if (wf->rbuf && nvgpu_tbuf_len(wf->rbuf) != H + cap) {
+    nvgpu_tbuf_free(wf->rbuf);
+    wf->rbuf = NULL;
+  }
+  if (!wf->rbuf)
+    wf->rbuf = nvgpu_tbuf_alloc(H + cap, GFP_KERNEL);
+  resp = wf->rbuf;
   if (!req || !resp) {
     ret = -ENOMEM;
     goto out;
@@ -648,10 +664,12 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
     /*
      * Abandoned: whatever the late reply carries (records, and backend
      * handles in its descriptors) is lost to this channel, which cannot
-     * resynchronise after that; the daemon closes it on the error.
+     * resynchronise after that; the daemon closes it on the error. The
+     * buffers are the transport's now, the kept one included.
      */
     req = NULL;
     resp = NULL;
+    wf->rbuf = NULL;
     goto out;
   }
   if (ret)
@@ -744,8 +762,7 @@ out:
   kfree(installed);
   if (req)
     nvgpu_tbuf_free(req);
-  if (resp)
-    nvgpu_tbuf_free(resp);
+  /* resp is wf->rbuf, kept for the next RECV (or the transport's now). */
   return ret;
 }
 
@@ -779,6 +796,8 @@ static int nvgpu_wl_release(struct inode *inode, struct file *filp) {
     nvgpu_fd_unregister(dev, &wf->nfd);
     nvgpu_close_handle(dev, wf->nfd.handle);
   }
+  if (wf->rbuf)
+    nvgpu_tbuf_free(wf->rbuf);
   mutex_destroy(&wf->lock);
   kref_put(&wf->wl->ref, nvgpu_wl_dev_free);
   kfree(wf);
