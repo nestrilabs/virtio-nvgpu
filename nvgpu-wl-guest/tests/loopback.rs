@@ -13,9 +13,9 @@
 //! handle table, response sizing and pump watch -- the path a VM takes, minus
 //! the virtqueue.
 //!
-//! Needs sway, wayland-info, wl-clipboard and weston's demo clients on PATH,
-//! so it is ignored by default; `scripts/wl-loopback-test.sh` provides them
-//! with nix and runs it.
+//! Needs sway, wayland-info, wl-clipboard, weston's demo clients and foot on
+//! PATH, so it is ignored by default; `scripts/wl-loopback-test.sh` provides
+//! them with nix and runs it.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -549,13 +549,13 @@ fn settle(d: &DaemonRun, pred: impl Fn(&Totals) -> bool) -> Totals {
 }
 
 #[test]
-#[ignore = "needs sway, wayland-utils, wl-clipboard and weston on PATH; run scripts/wl-loopback-test.sh"]
+#[ignore = "needs sway, wayland-utils, wl-clipboard, weston and foot on PATH; run scripts/wl-loopback-test.sh"]
 fn real_clients_run_through_the_proxy_against_a_real_compositor() {
     against_sway(Via::Conn, "s");
 }
 
 #[test]
-#[ignore = "needs sway, wayland-utils, wl-clipboard and weston on PATH; run scripts/wl-loopback-test.sh"]
+#[ignore = "needs sway, wayland-utils, wl-clipboard, weston and foot on PATH; run scripts/wl-loopback-test.sh"]
 fn real_clients_run_through_the_backend_dispatcher_against_sway() {
     against_sway(Via::Dispatcher, "S");
 }
@@ -655,6 +655,8 @@ fn against_sway(via: Via, tag: &str) {
         t.time_rewrites >= 10,
         "presentation feedback did not come back: {t:?}"
     );
+
+    foot_scrolls(&d, &proxy, &dir);
 
     // ── the clipboard, host → guest: a stream through both engines ──
     let host_copy = Kill(
@@ -785,6 +787,30 @@ fn against_weston(via: Via, tag: &str) {
     assert!(t.commits >= 20 && t.shm_syncs >= 20, "{t:?}");
     assert!(t.time_rewrites >= 10, "{t:?}");
     assert!(t.errors.is_empty(), "protocol errors: {:?}", t.errors);
+}
+
+/// foot through the proxy: a 512 MiB sparse pool per window, more than one
+/// connection's shm budget, scrolled a line a frame by moving its buffer
+/// forward through the pool and punching holes behind. What the budget sees
+/// is the buffer. (Not against headless weston: it has no seat, and foot
+/// will not start without one.)
+fn foot_scrolls(d: &DaemonRun, proxy: &Path, dir: &Path) {
+    let before = d.totals();
+    let lines = "for i in $(seq 1 300); do echo line $i; sleep 0.01; done";
+    let (ok, _, err) = run(client("foot", &["--", "sh", "-c", lines], proxy, dir), 60);
+    assert!(ok, "foot through the proxy failed: {err}");
+    let t = settle(d, |t| t.shm_syncs >= before.shm_syncs + 50);
+    println!(
+        "foot: {} commits, {} shm syncs ({} bytes)",
+        t.commits - before.commits,
+        t.shm_syncs - before.shm_syncs,
+        t.shm_bytes - before.shm_bytes
+    );
+    assert!(
+        t.shm_syncs >= before.shm_syncs + 50,
+        "foot drew too little: {t:?}"
+    );
+    assert_eq!(t.errors, before.errors, "protocol errors from foot");
 }
 
 // ───────────────────── explicit sync, at the codec level ─────────────────────

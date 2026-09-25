@@ -519,7 +519,7 @@ mode, yet.
 ### Limits
 
 What one VM may hold through the Wayland proxy, all per VM: `--wayland-max-conns`
-channels (64), `--wayland-shm-budget` MiB of shared-memory pools (1024), and
+channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
 `--wayland-queue-budget` MiB of compositor output left unread (256).
 
 ---

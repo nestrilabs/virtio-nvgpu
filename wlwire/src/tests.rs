@@ -981,28 +981,25 @@ fn a_guest_cannot_make_the_host_hold_unbounded_shm() {
     let mut p = Pair::new(Policy::default());
     p.registry(&[(2, "wl_shm", 2)]);
     p.bind(2, "wl_shm", 2, 4).unwrap();
-    // Straight to the host, as a guest skipping its daemon would: pools are
-    // sparse memfds, but their total size is capped per connection.
-    let mut last = Ok(());
-    for i in 0..6u32 {
-        let m = MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
-            .new_id(10 + i)
-            .int(i32::MAX)
-            .finish();
-        let mut q = VecDeque::from([frame::Unit {
-            rec: frame::record(frame::REC_WAYLAND, 0, 1, &m),
-            descs: vec![DescOut::plain(Desc {
-                c: i32::MAX as u64,
-                ..Desc::new(frame::DESC_SHM_POOL)
-            })],
-        }]);
-        let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
-        last = p.h.from_channel(&f, fds, &mut TestPlat::default());
-        if last.is_err() {
-            break;
-        }
+    // Straight to the host, as a guest skipping its daemon would. Pools as
+    // large as the protocol allows are sparse and cost only their count...
+    for i in 0..4u32 {
+        create_pool(&mut p, 10 + i, i32::MAX).unwrap();
     }
-    let e = last.unwrap_err();
+    // ...but what buffers cover is capped per connection: two 512 MiB
+    // buffers in different pools are one more than it allows.
+    let buffer = |pool: u32, id: u32| {
+        MsgBuilder::new(pool, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(id)
+            .int(0)
+            .int(16384)
+            .int(8192)
+            .int(65536)
+            .uint(0)
+            .finish()
+    };
+    raw_to_host(&mut p, buffer(10, 20), None).unwrap();
+    let e = raw_to_host(&mut p, buffer(11, 21), None).unwrap_err();
     assert_eq!(e.code, ERR_NO_MEMORY);
     assert_eq!(e.blame, Blame::Channel);
 }
@@ -1028,12 +1025,41 @@ fn raw_to_host(p: &mut Pair, m: Vec<u8>, pool: Option<u64>) -> Result<(), Fatal>
     p.h.from_channel(&f, fds, &mut TestPlat::default())
 }
 
+/// An SHM_SYNC record straight to the host engine: `bytes` at `off` in
+/// buffer `buffer`.
+fn sync_to_host(p: &mut Pair, buffer: u32, off: u32, bytes: &[u8]) -> Result<(), Fatal> {
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_SHM_SYNC, buffer, off, bytes),
+        descs: vec![],
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut TestPlat::default())
+}
+
 fn create_pool(p: &mut Pair, id: u32, size: i32) -> Result<(), Fatal> {
     let m = MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
         .new_id(id)
         .int(size)
         .finish();
     raw_to_host(p, m, Some(size as u64))
+}
+
+/// `wl_shm_pool.create_buffer` straight to the host: `len` bytes at `offset`
+/// (one row of them).
+fn create_buffer(p: &mut Pair, pool: u32, id: u32, offset: i32, len: i32) -> Result<(), Fatal> {
+    let m = MsgBuilder::new(pool, op::wl_shm_pool::REQ_CREATE_BUFFER)
+        .new_id(id)
+        .int(offset)
+        .int(len / 4)
+        .int(1)
+        .int(len)
+        .uint(0)
+        .finish();
+    raw_to_host(p, m, None)
+}
+
+fn destroy(p: &mut Pair, id: u32, opcode: u16) {
+    raw_to_host(p, MsgBuilder::new(id, opcode).finish(), None).unwrap();
 }
 
 /// A connection with wl_shm bound as 4, whose host engine draws on `vm`.
@@ -1045,35 +1071,83 @@ fn shm_pair(vm: &Arc<crate::shm::ShmBudget>) -> Pair {
     p
 }
 
+/// The host memfd the compositor was handed for the one pool just made.
+fn host_pool(p: &mut Pair) -> OwnedFd {
+    let (_, mut fds) = p.at_server();
+    assert_eq!(fds.len(), 1);
+    fds.remove(0)
+}
+
+/// Bytes of `fd` that hold memory.
+fn allocated(fd: &OwnedFd) -> u64 {
+    sys::fstat(fd.as_raw_fd()).unwrap().st_blocks as u64 * 512
+}
+
+/// The first byte at or after `off` that is data, not a hole.
+fn next_data(fd: &OwnedFd, off: u64) -> Option<u64> {
+    let r = unsafe { libc::lseek(fd.as_raw_fd(), off as libc::off_t, libc::SEEK_DATA) };
+    (r >= 0).then_some(r as u64)
+}
+
+fn pg() -> u64 {
+    sys::page_size()
+}
+
 #[test]
 fn every_connection_of_a_vm_draws_on_one_shm_budget() {
     let vm = Arc::new(crate::shm::ShmBudget::new(3 << 20, 64));
     let mut a = shm_pair(&vm);
     let mut b = shm_pair(&vm);
     create_pool(&mut a, 10, 2 << 20).unwrap();
+    create_buffer(&mut a, 10, 11, 0, 2 << 20).unwrap();
     assert_eq!(vm.used(), (2 << 20, 1));
     // Well inside b's own connection limit, but past what the VM has left:
-    // refused, and nothing taken for it.
-    let e = create_pool(&mut b, 10, 2 << 20).unwrap_err();
+    // refused, and nothing taken for it but its pool's place in the count.
+    create_pool(&mut b, 10, 2 << 20).unwrap();
+    let e = create_buffer(&mut b, 10, 11, 0, 2 << 20).unwrap_err();
     assert_eq!(e.code, ERR_NO_MEMORY);
-    assert_eq!(vm.used(), (2 << 20, 1));
-    // a's pool goes, and with it its charge; b can have the room.
-    raw_to_host(
-        &mut a,
-        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(vm.used(), (0, 0));
+    assert_eq!(vm.used(), (2 << 20, 2));
+    drop(b);
+    // a's buffer goes, and with it its charge; another connection can have
+    // the room.
+    destroy(&mut a, 11, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(vm.used(), (0, 1));
     let mut b = shm_pair(&vm);
     create_pool(&mut b, 10, 2 << 20).unwrap();
-    assert_eq!(vm.used(), (2 << 20, 1));
+    create_buffer(&mut b, 10, 11, 0, 2 << 20).unwrap();
+    assert_eq!(vm.used(), (2 << 20, 2));
     drop(b);
+    drop(a);
     assert_eq!(vm.used(), (0, 0), "a dropped engine gives everything back");
 }
 
 #[test]
-fn a_pool_stays_charged_while_a_buffer_made_from_it_lives() {
+fn the_vm_budget_stops_many_connections_each_within_its_own() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(8 << 20, 1024));
+    let mut conns = Vec::new();
+    let mut refused = None;
+    for i in 0..16 {
+        let mut p = shm_pair(&vm);
+        create_pool(&mut p, 10, 4 << 20).unwrap();
+        if let Err(e) = create_buffer(&mut p, 10, 11, 0, 3 << 20) {
+            assert_eq!(e.code, ERR_NO_MEMORY);
+            refused = Some(i);
+            break;
+        }
+        conns.push(p);
+    }
+    assert_eq!(
+        refused,
+        Some(2),
+        "two 3 MiB buffers fit 8 MiB, a third does not"
+    );
+    assert_eq!(vm.used().0, 6 << 20);
+    conns.clear();
+    assert_eq!(vm.used().0, 0);
+}
+
+#[test]
+fn a_pool_stays_counted_while_a_buffer_made_from_it_lives() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
     let mut p = shm_pair(&vm);
     create_pool(&mut p, 10, 1 << 20).unwrap();
@@ -1090,59 +1164,247 @@ fn a_pool_stays_charged_while_a_buffer_made_from_it_lives() {
         None,
     )
     .unwrap();
+    assert_eq!(
+        vm.used(),
+        (256 << 10, 1),
+        "the buffer is charged, not the pool"
+    );
     // The usual order: the pool is destroyed while its buffers live on, and
     // the memfd with them.
-    raw_to_host(
-        &mut p,
-        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(vm.used(), (1 << 20, 1));
-    raw_to_host(
-        &mut p,
-        MsgBuilder::new(11, op::wl_buffer::REQ_DESTROY).finish(),
-        None,
-    )
-    .unwrap();
+    destroy(&mut p, 10, op::wl_shm_pool::REQ_DESTROY);
+    assert_eq!(vm.used(), (256 << 10, 1));
+    destroy(&mut p, 11, op::wl_buffer::REQ_DESTROY);
     assert_eq!(vm.used(), (0, 0));
 }
 
 #[test]
-fn a_pool_resize_past_the_budget_is_refused_and_takes_nothing() {
+fn a_pool_resize_is_free_and_a_buffer_past_the_budget_takes_nothing() {
     let vm = Arc::new(crate::shm::ShmBudget::new(4 << 20, 64));
     let mut p = shm_pair(&vm);
     create_pool(&mut p, 10, 1 << 20).unwrap();
+    let memfd = host_pool(&mut p);
     raw_to_host(
         &mut p,
         MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
-            .int(3 << 20)
+            .int(64 << 20)
             .finish(),
         None,
     )
     .unwrap();
+    assert_eq!(sys::file_size(memfd.as_raw_fd()).unwrap(), 64 << 20);
+    assert_eq!(vm.used(), (0, 1));
+    assert_eq!(allocated(&memfd), 0, "a grown pool is a hole");
+    create_buffer(&mut p, 10, 11, 0, 3 << 20).unwrap();
     assert_eq!(vm.used(), (3 << 20, 1));
-    let e = raw_to_host(
-        &mut p,
-        MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
-            .int(5 << 20)
-            .finish(),
-        None,
-    )
-    .unwrap_err();
+    let e = create_buffer(&mut p, 10, 12, 3 << 20, 2 << 20).unwrap_err();
     assert_eq!(e.code, ERR_NO_MEMORY);
     assert_eq!(vm.used(), (3 << 20, 1));
 }
 
 #[test]
-fn pools_are_counted_as_well_as_sized() {
+fn pools_are_counted_whatever_their_size() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 2));
     let mut p = shm_pair(&vm);
     create_pool(&mut p, 10, 4096).unwrap();
     create_pool(&mut p, 11, 4096).unwrap();
     let e = create_pool(&mut p, 12, 4096).unwrap_err();
     assert_eq!(e.code, ERR_NO_MEMORY);
-    assert_eq!(vm.used(), (8192, 2));
+    assert_eq!(vm.used(), (0, 2));
+}
+
+#[test]
+fn overlapping_buffers_are_charged_once() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    let pg = pg();
+    // Two buffers over the same bytes, as a client reusing one region
+    // under two ids does, and a third over half of them and half beyond,
+    // starting part-way into a page.
+    create_buffer(&mut p, 10, 11, 0, (4 * pg) as i32).unwrap();
+    create_buffer(&mut p, 10, 12, 0, (4 * pg) as i32).unwrap();
+    assert_eq!(vm.used().0, 4 * pg);
+    create_buffer(&mut p, 10, 13, (2 * pg + 100) as i32, (4 * pg) as i32).unwrap();
+    // Pages 0..7: the third touches pages 2..=6.
+    assert_eq!(vm.used().0, 7 * pg);
+    destroy(&mut p, 11, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(
+        vm.used().0,
+        7 * pg,
+        "the second still covers what the first did"
+    );
+    destroy(&mut p, 12, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(vm.used().0, 5 * pg, "pages 0 and 1 are only the third's");
+    destroy(&mut p, 13, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(vm.used(), (0, 1));
+}
+
+#[test]
+fn the_last_buffer_over_a_page_punches_it_out_and_gives_its_charge_back() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    let memfd = host_pool(&mut p);
+    let pg = pg();
+    // a: pages 0..2 and a little of 2; b: the rest of page 2, and 3.
+    let a_len = 2 * pg + 16;
+    create_buffer(&mut p, 10, 11, 0, a_len as i32).unwrap();
+    create_buffer(&mut p, 10, 12, a_len as i32, (4 * pg - a_len) as i32).unwrap();
+    assert_eq!(vm.used().0, 4 * pg, "page 2, which both touch, once");
+    sync_to_host(&mut p, 11, 0, &vec![0xaa; a_len as usize]).unwrap();
+    sync_to_host(&mut p, 12, 0, &vec![0xbb; (4 * pg - a_len) as usize]).unwrap();
+    assert_eq!(allocated(&memfd), 4 * pg);
+    assert_eq!(next_data(&memfd, 0), Some(0));
+
+    destroy(&mut p, 11, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(vm.used().0, 2 * pg);
+    assert_eq!(allocated(&memfd), 2 * pg, "pages 0 and 1 are punched out");
+    assert_eq!(next_data(&memfd, 0), Some(2 * pg));
+    let mut back = vec![0u8; (4 * pg) as usize];
+    sys::pread_full(memfd.as_raw_fd(), &mut back, 0).unwrap();
+    assert!(back[..(2 * pg) as usize].iter().all(|&x| x == 0));
+    assert!(
+        back[a_len as usize..].iter().all(|&x| x == 0xbb),
+        "b's bytes in the shared page are kept"
+    );
+
+    destroy(&mut p, 12, op::wl_buffer::REQ_DESTROY);
+    assert_eq!(vm.used(), (0, 1));
+    assert_eq!(allocated(&memfd), 0);
+    assert_eq!(next_data(&memfd, 0), None);
+}
+
+#[test]
+fn shm_sync_outside_every_live_buffer_is_refused() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let fresh = || {
+        let mut p = shm_pair(&vm);
+        create_pool(&mut p, 10, 1 << 20).unwrap();
+        let memfd = host_pool(&mut p);
+        create_buffer(&mut p, 10, 11, 4096, 8192).unwrap();
+        (p, memfd)
+    };
+    // Past the end of its buffer, though inside the pool.
+    let (mut p, memfd) = fresh();
+    let e = sync_to_host(&mut p, 11, 8000, &[1u8; 200]).unwrap_err();
+    assert_eq!(e.blame, Blame::Channel);
+    assert_eq!(allocated(&memfd), 0);
+    // A buffer that is gone.
+    let (mut p, memfd) = fresh();
+    destroy(&mut p, 11, op::wl_buffer::REQ_DESTROY);
+    assert!(sync_to_host(&mut p, 11, 0, &[1u8; 16]).is_err());
+    assert_eq!(allocated(&memfd), 0);
+    // A buffer that does not fit its pool is never tracked, nor charged.
+    let (mut p, memfd) = fresh();
+    create_buffer(&mut p, 10, 12, (1 << 20) - 4096, 8192).unwrap();
+    assert!(sync_to_host(&mut p, 12, 0, &[1u8; 16]).is_err());
+    assert_eq!(allocated(&memfd), 0);
+    // Nor a pool, or an id nothing has.
+    let (mut p, _) = fresh();
+    assert!(sync_to_host(&mut p, 10, 0, &[1u8; 16]).is_err());
+    let (mut p, _) = fresh();
+    assert!(sync_to_host(&mut p, 99, 0, &[1u8; 16]).is_err());
+}
+
+/// foot, through both halves: a 512 MiB pool (its default
+/// `max-shm-pool-size-mb`) that it scrolls by moving its one buffer forward
+/// through the pool, wrapping round at the end, destroying the old
+/// `wl_buffer` and making a new one each time. The pool is larger than the
+/// VM's budget, and the buffer travels further than the budget too.
+#[test]
+fn foot_scrolls_through_a_pool_larger_than_the_budget() {
+    let budget: u64 = 8 << 20;
+    let vm = Arc::new(crate::shm::ShmBudget::new(budget, 64));
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+
+    let pool_size: u64 = 512 << 20;
+    let (w, h) = (640u64, 400u64);
+    let stride = w * 4;
+    let size = stride * h;
+    let client_pool = sys::memfd(c"foot-wayland-shm-buffer-pool", pool_size).unwrap();
+    let client_raw = client_pool.try_clone().unwrap();
+    // foot starts a quarter of the way in; start near the end instead, so
+    // the scroll wraps round.
+    let mut offset = pool_size - 24 * size;
+    let buffer = |id: u32, offset: u64| {
+        MsgBuilder::new(5, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(id)
+            .int(offset as i32)
+            .int(w as i32)
+            .int(h as i32)
+            .int(stride as i32)
+            .uint(0)
+            .finish()
+    };
+    let show = |id: u32| {
+        [
+            MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
+                .object(id)
+                .int(0)
+                .int(0)
+                .finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_DAMAGE_BUFFER)
+                .int(0)
+                .int(0)
+                .int(w as i32)
+                .int(h as i32)
+                .finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish(),
+        ]
+    };
+    let mut msgs = vec![
+        MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(5)
+            .int(pool_size as i32)
+            .finish(),
+        MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+            .new_id(7)
+            .finish(),
+        buffer(100, offset),
+    ];
+    msgs.extend(show(100));
+    p.client_sends(&msgs, vec![client_pool]).unwrap();
+    let memfd = host_pool(&mut p);
+    assert_eq!(sys::file_size(memfd.as_raw_fd()).unwrap(), pool_size);
+
+    let rows = 300;
+    let mut travelled = 0;
+    let mut wrapped = false;
+    let pg = pg();
+    for i in 1..=64u32 {
+        let diff = rows * stride;
+        let mut next = offset + diff;
+        if next + size > pool_size {
+            next = 0;
+            wrapped = true;
+        }
+        // Mark the new position's first row, as the client would draw it.
+        sys::pwrite_full(client_raw.as_raw_fd(), &[i as u8; 64], next).unwrap();
+        let id = 100 + i;
+        let mut msgs = vec![
+            MsgBuilder::new(99 + i, op::wl_buffer::REQ_DESTROY).finish(),
+            buffer(id, next),
+        ];
+        msgs.extend(show(id));
+        p.client_sends(&msgs, vec![]).unwrap();
+        offset = next;
+        travelled += diff;
+
+        let held = (offset + size).div_ceil(pg) - offset / pg;
+        assert_eq!(vm.used(), (held * pg, 1), "only the live buffer is charged");
+        assert!(allocated(&memfd) <= held * pg, "and only it holds memory");
+        let mut first = [0u8; 64];
+        sys::pread_full(memfd.as_raw_fd(), &mut first, offset).unwrap();
+        assert_eq!(first, [i as u8; 64], "the compositor sees the new frame");
+    }
+    assert!(wrapped);
+    assert!(pool_size > budget && travelled > budget);
+    // Nothing but the last buffer's pages is left in the memfd.
+    assert_eq!(next_data(&memfd, 0), Some(offset / pg * pg));
 }
 
 #[test]

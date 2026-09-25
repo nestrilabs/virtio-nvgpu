@@ -704,8 +704,13 @@ exactly what the compositor may read, and the release is forwarded untouched,
 so the client's pacing stays the compositor's. The guest side only ever reads
 the client's pool, never maps it, so a client that shrinks its pool under the
 proxy gets short copies rather than a crash. The host's memory is charged to a
-budget per connection and per VM before it exists, because it is memory the
-host's OOM killer would not count as the backend's.
+budget per connection and per VM before it can be written, because it is
+memory the host's OOM killer would not count as the backend's. What is charged
+is what it can come to hold, not the pool's size: the host's copy of a pool is
+made at full size but empty, only the parts a live buffer covers are ever
+written, and those are charged when the buffer is made and freed again when
+the last buffer over them goes. A terminal like foot, which makes a 512 MiB
+pool and scrolls by moving its buffer through it, holds what its buffer takes.
 
 **Bounded both ways.** The host compositor disconnects a client whose output
 buffer fills, and the guest reads when it gets round to it. So the backend

@@ -290,10 +290,10 @@ impl Engine {
         &mut self.cfg.policy
     }
 
-    /// Charge shm pools to `b` as well as to this connection's own limits
-    /// (`shm.rs`): the backend gives every connection of a VM the same one,
-    /// so the number of connections does not multiply what a guest can make
-    /// the host hold.
+    /// Charge shm pools, and the buffers made from them, to `b` as well as to
+    /// this connection's own limits (`shm.rs`): the backend gives every
+    /// connection of a VM the same one, so the number of connections does not
+    /// multiply what a guest can make the host hold.
     pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
         self.shm.set_shared_budget(b);
     }
@@ -837,9 +837,9 @@ impl Engine {
                             // held here: only the count is charged.
                             let charge = self
                                 .shm
-                                .charge(0)
+                                .charge()
                                 .map_err(|_| err(ERR_NO_MEMORY, "too many shm pools".into()))?;
-                            self.shm.add_pool(new_id_at(0), fd, size, charge);
+                            self.shm.add_pool(new_id_at(0), fd, size, charge, false);
                             DescOut::plain(Desc {
                                 c: size,
                                 ..Desc::new(frame::DESC_SHM_POOL)
@@ -937,12 +937,14 @@ impl Engine {
                                         ));
                                     }
                                 };
-                                // Charged before the memfd exists: past this
-                                // connection's or the VM's budget, no memfd.
-                                let charge = self.shm.charge(size).map_err(|_| {
+                                // Counted before the memfd exists: past this
+                                // connection's or the VM's pool count, no
+                                // memfd. Its size costs nothing until a
+                                // buffer made from it is charged.
+                                let charge = self.shm.charge().map_err(|_| {
                                     err(
                                         ERR_NO_MEMORY,
-                                        "shm pool over the connection's or the VM's budget".into(),
+                                        "too many shm pools on the connection or the VM".into(),
                                     )
                                 })?;
                                 let memfd = sys::memfd(c"nvgpu-wl-shm", size)
@@ -950,7 +952,7 @@ impl Engine {
                                 let give = memfd
                                     .try_clone()
                                     .map_err(|e| err(ERR_NO_MEMORY, format!("dup: {e}")))?;
-                                self.shm.add_pool(new_id_at(0), memfd, size, charge);
+                                self.shm.add_pool(new_id_at(0), memfd, size, charge, true);
                                 Some(give)
                             }
                             FdKind::Dmabuf => {
@@ -1026,7 +1028,14 @@ impl Engine {
                         Val::Int(v) => v,
                         _ => 0,
                     };
-                    self.shm.add_buffer(obj_id, new_id_at(0), g(1), g(3), g(4));
+                    self.shm
+                        .add_buffer(obj_id, new_id_at(0), g(1), g(3), g(4))
+                        .map_err(|_| {
+                            err(
+                                ERR_NO_MEMORY,
+                                "shm buffer over the connection's or the VM's budget".into(),
+                            )
+                        })?;
                 }
                 (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_RESIZE) => {
                     if let Val::Int(s) = args[0].val {

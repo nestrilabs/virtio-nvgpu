@@ -169,10 +169,11 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = WlLimits::DEFAULT_MAX_CONNS)]
     wayland_max_conns: usize,
 
-    /// MiB of wl_shm pool memory one VM's clients may have the backend hold,
-    /// over all its connections (each connection is also held to 512 MiB).
-    /// The pages are memfds the host OOM killer does not count as this
-    /// process's; a pool past the budget is a wl_display.error for its client.
+    /// MiB of wl_shm buffer memory one VM's clients may have the backend hold,
+    /// over all its connections (each connection is also held to 512 MiB):
+    /// what their live buffers cover, not how large their pools are. The
+    /// pages are memfds the host OOM killer does not count as this process's;
+    /// a buffer past the budget is a wl_display.error for its client.
     #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_SHM_BYTES >> 20)]
     wayland_shm_budget: u64,
 

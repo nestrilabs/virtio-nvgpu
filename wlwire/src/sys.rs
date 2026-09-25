@@ -38,6 +38,27 @@ pub fn ftruncate(fd: RawFd, size: u64) -> io::Result<()> {
     cvt(unsafe { libc::ftruncate(fd, size as libc::off_t) }).map(|_| ())
 }
 
+/// Free the pages of `fd` in `[off, off + len)`, keeping its size: they read
+/// as zeros after, and hold no memory until written again.
+pub fn punch_hole(fd: RawFd, off: u64, len: u64) -> io::Result<()> {
+    cvt(unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            off as libc::off_t,
+            len as libc::off_t,
+        )
+    })
+    .map(|_| ())
+}
+
+pub fn page_size() -> u64 {
+    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as u64,
+        _ => 4096,
+    }
+}
+
 /// Seal a finished blob so the receiver can trust its size and contents.
 pub fn seal_readonly(fd: RawFd) -> io::Result<()> {
     let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;

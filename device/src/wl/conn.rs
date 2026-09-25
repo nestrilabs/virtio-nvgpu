@@ -20,7 +20,7 @@
 //! **What a VM may hold** ([`WlLimits`]). Every limit above is per connection,
 //! and a guest opens as many connections as it likes, so each one that costs
 //! the host something is also counted per VM: channels (each a compositor
-//! client, a reader thread and a handful of descriptors), shm pool memory
+//! client, a reader thread and a handful of descriptors), shm buffer memory
 //! (`wlwire::shm`, memfd pages the host OOM killer does not see as ours) and
 //! bytes queued for the guest. A connection that would pass the VM's queue
 //! budget is dropped like one that passes its own, and what it had queued is
@@ -165,8 +165,8 @@ pub struct WlLimits {
     /// counted). Each is a host compositor client with up to 131072 objects,
     /// a reader thread and about five descriptors (`--wayland-max-conns`).
     pub max_conns: usize,
-    /// Shm pool memory and pool count, over every connection
-    /// (`--wayland-shm-budget`).
+    /// Shm memory (what live buffers cover) and pool count, over every
+    /// connection (`--wayland-shm-budget`).
     pub shm: Arc<ShmBudget>,
     /// Bytes queued for the guest, over every connection
     /// (`--wayland-queue-budget`).

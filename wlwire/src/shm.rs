@@ -26,23 +26,40 @@
 //! decides how much memory the proxy commits: every `SHM_SYNC` is written into
 //! them at once, no commit or compositor consent needed, and the pages are
 //! shmem that no process's RSS shows, so the host OOM killer, when they have
-//! eaten the host, picks somebody else. Every pool is therefore charged to
-//! [`ShmBudget`]s before its memfd exists and at every grow, and gives the
-//! charge back only when the last reference to it (its own id, or a buffer made
-//! from it) is gone: one budget per connection ([`MAX_POOL_BYTES`],
-//! [`MAX_POOLS`]), and on the backend one per VM that every connection of the
-//! VM shares ([`Engine::set_shm_budget`](crate::engine::Engine::set_shm_budget)),
-//! since a guest can open as many connections as it is allowed channels. The
-//! client's side charges only the count: its pools are the client's own
-//! memory, but each is a descriptor held here.
+//! eaten the host, picks somebody else. So what is charged to [`ShmBudget`]s is
+//! what a memfd can come to hold, not how large it says it is. A pool's memfd
+//! is made at the pool's size, sparse, and costs nothing until written, and
+//! `SHM_SYNC` only ever writes inside a live buffer. A buffer is charged when
+//! it is made, for the pages it touches that no other live buffer of its pool
+//! already does (clients double-buffer in one pool, and overlap), and refused
+//! if that would pass a budget. When the last buffer over a page goes, the
+//! page is punched out of the memfd (`FALLOC_FL_PUNCH_HOLE`) and its charge
+//! given back; the compositor, which maps the whole pool, reads zeros there,
+//! as it would from a client that punched its own pool. That is how foot runs:
+//! it makes a 512 MiB pool per window and scrolls by sliding one buffer
+//! through it and punching behind, so it holds what its buffers take.
+//!
+//! The budgets: one per connection ([`MAX_POOL_BYTES`], [`MAX_POOLS`]), and on
+//! the backend one per VM that every connection of the VM shares
+//! ([`Engine::set_shm_budget`](crate::engine::Engine::set_shm_budget)), since a
+//! guest can open as many connections as it is allowed channels. A pool counts
+//! against the pool count from before its memfd exists until the last
+//! reference to it (its own id, or a buffer made from it) is gone; its size is
+//! held only to what the protocol can say, an `int32`. The client's side
+//! charges only the count: its pools are the client's own memory, but each is
+//! a descriptor held here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record};
 use crate::sys;
+
+/// The largest pool the protocol can make or resize to: its size is an
+/// `int32`.
+pub const MAX_POOL_SIZE: u64 = i32::MAX as u64;
 
 pub struct Pool {
     /// Client side: the client's own pool descriptor. Server side: our memfd.
@@ -50,6 +67,141 @@ pub struct Pool {
     pub size: AtomicU64,
     /// What this pool holds of its budgets, given back when it goes.
     charge: Charge,
+    /// Server side: the pages of our memfd some live buffer covers, which
+    /// are what the pool is charged for. `None` on the client's side.
+    held: Option<Mutex<Extents>>,
+}
+
+impl Pool {
+    /// Pages `[a, b)` of the pool that `[off, off + len)` touches.
+    fn pages(off: u64, len: u64) -> (u64, u64) {
+        let pg = sys::page_size();
+        (off / pg, (off + len).div_ceil(pg))
+    }
+
+    /// A buffer over `[off, off + len)` is made: charge the pages of it no
+    /// live buffer covers yet, or refuse it and take nothing.
+    fn hold(&self, off: u64, len: u64) -> Result<(), ShmError> {
+        let Some(held) = &self.held else {
+            return Ok(());
+        };
+        let (a, b) = Self::pages(off, len);
+        let mut ext = held.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.charge.grow(ext.uncovered(a, b) * sys::page_size()) {
+            return Err(ShmError::TooBig);
+        }
+        ext.add(a, b);
+        Ok(())
+    }
+
+    /// A buffer over `[off, off + len)` is gone: punch out the pages no live
+    /// buffer covers any more, and give back their charge. Pages the kernel
+    /// would not punch stay charged, until the pool goes.
+    fn release(&self, off: u64, len: u64) {
+        let Some(held) = &self.held else {
+            return;
+        };
+        let (a, b) = Self::pages(off, len);
+        let pg = sys::page_size();
+        let freed = held.lock().unwrap_or_else(|e| e.into_inner()).remove(a, b);
+        for (x, y) in freed {
+            let (at, n) = (x * pg, (y - x) * pg);
+            if sys::punch_hole(self.fd.as_raw_fd(), at, n).is_ok() {
+                self.charge.shrink(n);
+            }
+        }
+    }
+}
+
+/// How many live buffers cover each page of a pool, as steps: a key is the
+/// first page of a run that many buffers cover, up to the next key; before
+/// the first key and from the last one on, none do. There are only as many
+/// steps as buffer edges, so a pool costs in proportion to its buffers.
+#[derive(Default)]
+struct Extents {
+    steps: BTreeMap<u64, u32>,
+}
+
+impl Extents {
+    fn at(&self, p: u64) -> u32 {
+        self.steps.range(..=p).next_back().map_or(0, |(_, &c)| c)
+    }
+
+    /// Pages of `[a, b)` no buffer covers.
+    fn uncovered(&self, a: u64, b: u64) -> u64 {
+        if a >= b {
+            return 0;
+        }
+        let (mut from, mut c, mut n) = (a, self.at(a), 0);
+        for (&k, &v) in self.steps.range(a + 1..b) {
+            if c == 0 {
+                n += k - from;
+            }
+            (from, c) = (k, v);
+        }
+        if c == 0 {
+            n += b - from;
+        }
+        n
+    }
+
+    /// A step at `p`, if there is none, of the count already there.
+    fn split(&mut self, p: u64) {
+        let c = self.at(p);
+        self.steps.entry(p).or_insert(c);
+    }
+
+    /// The step at `p` goes if it changes nothing.
+    fn tidy(&mut self, p: u64) {
+        if let Some(&c) = self.steps.get(&p) {
+            let before = p.checked_sub(1).map_or(0, |q| self.at(q));
+            if before == c {
+                self.steps.remove(&p);
+            }
+        }
+    }
+
+    fn add(&mut self, a: u64, b: u64) {
+        if a >= b {
+            return;
+        }
+        self.split(a);
+        self.split(b);
+        for (_, c) in self.steps.range_mut(a..b) {
+            *c += 1;
+        }
+        self.tidy(a);
+        self.tidy(b);
+    }
+
+    /// Take away one buffer over `[a, b)`, added before: the runs of pages it
+    /// was the last to cover.
+    fn remove(&mut self, a: u64, b: u64) -> Vec<(u64, u64)> {
+        if a >= b {
+            return Vec::new();
+        }
+        self.split(a);
+        self.split(b);
+        let mut freed: Vec<(u64, u64)> = Vec::new();
+        let mut run: Option<u64> = None;
+        for (&k, c) in self.steps.range_mut(a..=b) {
+            if let Some(s) = run.take() {
+                match freed.last_mut() {
+                    Some(last) if last.1 == s => last.1 = k,
+                    _ => freed.push((s, k)),
+                }
+            }
+            if k < b {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    run = Some(k);
+                }
+            }
+        }
+        self.tidy(a);
+        self.tidy(b);
+        freed
+    }
 }
 
 /// A limit on pool memory and pool count, shared by whoever holds an `Arc` of
@@ -110,33 +262,37 @@ impl ShmBudget {
     }
 }
 
-/// One pool's share of its budgets: one pool of the count, and `bytes`. Made
-/// before the pool (so a refused pool never has a memfd), owned by it after,
-/// and given back by `Drop` -- once, whichever way the pool goes.
+/// One pool's share of its budgets: one pool of the count, and the bytes its
+/// live buffers cover. Made before the pool (so a refused pool never has a
+/// memfd), owned by it after, and given back by `Drop` -- once, whichever way
+/// the pool goes.
 pub struct Charge {
     budgets: Vec<Arc<ShmBudget>>,
     bytes: AtomicU64,
 }
 
 impl Charge {
-    /// Take one pool and `bytes` from every budget, or from none.
-    fn take(budgets: Vec<Arc<ShmBudget>>, bytes: u64) -> Result<Charge, ShmError> {
+    /// Take one pool from every budget, or from none.
+    fn take(budgets: Vec<Arc<ShmBudget>>) -> Result<Charge, ShmError> {
         for (i, b) in budgets.iter().enumerate() {
-            if !b.take(bytes, 1) {
+            if !b.take(0, 1) {
                 for done in &budgets[..i] {
-                    done.give(bytes, 1);
+                    done.give(0, 1);
                 }
-                return Err(ShmError::TooBig);
+                return Err(ShmError::TooMany);
             }
         }
         Ok(Charge {
             budgets,
-            bytes: AtomicU64::new(bytes),
+            bytes: AtomicU64::new(0),
         })
     }
 
     /// `more` bytes on top, from every budget or from none.
     fn grow(&self, more: u64) -> bool {
+        if more == 0 {
+            return true;
+        }
         for (i, b) in self.budgets.iter().enumerate() {
             if !b.take(more, 0) {
                 for done in &self.budgets[..i] {
@@ -147,6 +303,14 @@ impl Charge {
         }
         self.bytes.fetch_add(more, Ordering::AcqRel);
         true
+    }
+
+    /// `less` bytes, taken before, back to every budget.
+    fn shrink(&self, less: u64) {
+        for b in &self.budgets {
+            b.give(less, 0);
+        }
+        self.bytes.fetch_sub(less, Ordering::AcqRel);
     }
 }
 
@@ -175,6 +339,14 @@ impl Buffer {
     }
 }
 
+/// However the buffer goes (destroyed, its id reused, the connection over),
+/// the pages only it covered leave the memfd and the budgets.
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.pool.release(self.offset, self.len());
+    }
+}
+
 #[derive(Default)]
 struct Surface {
     /// `Some(x)`: an attach is pending, of buffer `x` (0 = null).
@@ -185,11 +357,12 @@ struct Surface {
     buffers: HashSet<u32>,
 }
 
-/// Pool bytes one connection may have the server's side hold at once (in
-/// memfds that are sparse until written). A 4K RGBA buffer is 33 MB, so a
-/// triple-buffered 4K window takes 100 MB and this is five of them, resizes
-/// included; a peer asking for more is after host memory. The VM-wide budget
-/// (`--wayland-shm-budget` on the backend) is what bounds the sum.
+/// Bytes one connection's live buffers may cover, in the server's side's
+/// memfds, at once: what those memfds can come to hold, whatever their pools'
+/// sizes. A 4K RGBA buffer is 33 MB, so a triple-buffered 4K window takes
+/// 100 MB and this is five of them; a peer asking for more is after host
+/// memory. The VM-wide budget (`--wayland-shm-budget` on the backend) is what
+/// bounds the sum.
 pub const MAX_POOL_BYTES: u64 = 512 << 20;
 
 /// Pools one connection may hold at once, on either side: each is a
@@ -228,6 +401,9 @@ pub enum ShmError {
     NoPool(u32),
     NoBuffer(u32),
     OutOfRange(u32),
+    /// Past the pool count of this connection or the VM.
+    TooMany,
+    /// Past the bytes of this connection or the VM, or the protocol's size.
     TooBig,
     Io,
 }
@@ -265,31 +441,35 @@ impl Shm {
     }
 
     /// Everything known about pools, buffers and surfaces goes (the
-    /// connection is over). A pool still referenced from elsewhere keeps its
-    /// charge until that reference goes too.
+    /// connection is over), and with the buffers their pages and charges. A
+    /// pool still referenced from elsewhere keeps its place in the count
+    /// until that reference goes too.
     pub fn clear(&mut self) {
         self.pools.clear();
         self.buffers.clear();
         self.surfaces.clear();
     }
 
-    /// Charge a new pool before it exists: one pool, and `bytes` of memory
-    /// this side will hold (the pool's size for our own memfd, 0 for a
-    /// client's descriptor). `TooBig` if this connection or the VM is at its
-    /// limit, and then nothing is taken.
-    pub fn charge(&self, bytes: u64) -> Result<Charge, ShmError> {
+    /// Charge a new pool before it exists: one of the count. Its bytes are
+    /// charged by the buffers made from it. `TooMany` if this connection or
+    /// the VM is at its limit, and then nothing is taken.
+    pub fn charge(&self) -> Result<Charge, ShmError> {
         let mut budgets = vec![self.conn.clone()];
         budgets.extend(self.shared.iter().cloned());
-        Charge::take(budgets, bytes)
+        Charge::take(budgets)
     }
 
-    pub fn add_pool(&mut self, id: u32, fd: OwnedFd, size: u64, charge: Charge) {
+    /// A pool of `size` bytes, over `fd`: on the server's side our memfd,
+    /// whose buffers are charged by what they cover, on the client's the
+    /// client's own descriptor.
+    pub fn add_pool(&mut self, id: u32, fd: OwnedFd, size: u64, charge: Charge, server_side: bool) {
         self.pools.insert(
             id,
             Arc::new(Pool {
                 fd,
                 size: AtomicU64::new(size),
                 charge,
+                held: server_side.then(Mutex::default),
             }),
         );
     }
@@ -299,17 +479,15 @@ impl Shm {
     }
 
     /// `wl_shm_pool.resize`. On the server side the memfd grows first, so the
-    /// compositor's remap on the forwarded resize sees the new size.
+    /// compositor's remap on the forwarded resize sees the new size. Growing
+    /// is free: the new pages are a hole until a buffer over them is written.
     pub fn resize(&mut self, id: u32, size: u64, server_side: bool) -> Result<(), ShmError> {
         let p = self.pools.get(&id).ok_or(ShmError::NoPool(id))?;
-        let cur = p.size.load(Ordering::Relaxed);
-        if size > cur {
+        if size > MAX_POOL_SIZE {
+            return Err(ShmError::TooBig);
+        }
+        if size > p.size.load(Ordering::Relaxed) {
             if server_side {
-                // Charged before the memfd grows; a grow the kernel then
-                // refuses keeps the charge, which the pool gives back whole.
-                if !p.charge.grow(size - cur) {
-                    return Err(ShmError::TooBig);
-                }
                 sys::ftruncate(p.fd.as_raw_fd(), size).map_err(|_| ShmError::Io)?;
             }
             p.size.store(size, Ordering::Relaxed);
@@ -317,27 +495,43 @@ impl Shm {
         Ok(())
     }
 
-    /// `wl_shm_pool.create_buffer`. Negative or overflowing geometry is left
-    /// for the compositor to refuse; it is simply not tracked here, and a
-    /// commit of it copies nothing.
-    pub fn add_buffer(&mut self, pool: u32, id: u32, offset: i32, height: i32, stride: i32) {
+    /// `wl_shm_pool.create_buffer`. On the server's side the pages it covers
+    /// that no other live buffer of the pool does are charged now, and past a
+    /// budget it is `TooBig` and not made. Negative or overflowing geometry,
+    /// or a buffer that does not fit its pool, is left for the compositor to
+    /// refuse; it is simply not tracked here, so a commit of it copies
+    /// nothing and an `SHM_SYNC` for it is refused.
+    pub fn add_buffer(
+        &mut self,
+        pool: u32,
+        id: u32,
+        offset: i32,
+        height: i32,
+        stride: i32,
+    ) -> Result<(), ShmError> {
         let Some(p) = self.pools.get(&pool) else {
-            return;
+            return Ok(());
         };
         if offset < 0 || height <= 0 || stride <= 0 {
-            return;
+            return Ok(());
         }
+        let (offset, stride, height) = (offset as u64, stride as u64, height as u64);
+        if offset + stride * height > p.size.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        p.hold(offset, stride * height)?;
         self.buffers.insert(
             id,
             Buffer {
                 pool: p.clone(),
-                offset: offset as u64,
-                stride: stride as u64,
-                height: height as u64,
+                offset,
+                stride,
+                height,
                 synced: false,
                 dirty: None,
             },
         );
+        Ok(())
     }
 
     pub fn attach(&mut self, surface: u32, buffer: u32) {
@@ -415,8 +609,10 @@ impl Shm {
         self.syncs += 1;
     }
 
-    /// An SHM_SYNC record on the server's side: store the bytes, within the
-    /// buffer and within the pool.
+    /// An SHM_SYNC record on the server's side: store the bytes, within a
+    /// live buffer and within the pool. This is what keeps every page the
+    /// memfd holds one some live buffer is charged for: a buffer that was
+    /// never tracked, or is gone, takes nothing.
     pub fn sync(&mut self, buffer: u32, off: u32, bytes: &[u8]) -> Result<(), ShmError> {
         let b = self
             .buffers
@@ -431,5 +627,64 @@ impl Shm {
         self.sync_bytes += bytes.len() as u64;
         self.syncs += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod extents_tests {
+    use super::Extents;
+
+    /// Against a count per page, over buffers made and destroyed at random.
+    #[test]
+    fn steps_agree_with_a_count_per_page() {
+        const PAGES: usize = 64;
+        let mut ext = Extents::default();
+        let mut count = [0u32; PAGES];
+        let mut live: Vec<(u64, u64)> = Vec::new();
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rand = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..20_000 {
+            if live.is_empty() || rand(3) != 0 {
+                let a = rand(PAGES as u64);
+                let b = a + 1 + rand(PAGES as u64 - a);
+                let want = (a..b).filter(|&p| count[p as usize] == 0).count() as u64;
+                assert_eq!(ext.uncovered(a, b), want);
+                ext.add(a, b);
+                (a..b).for_each(|p| count[p as usize] += 1);
+                live.push((a, b));
+            } else {
+                let (a, b) = live.swap_remove(rand(live.len() as u64) as usize);
+                (a..b).for_each(|p| count[p as usize] -= 1);
+                let freed = ext.remove(a, b);
+                let mut want: Vec<(u64, u64)> = Vec::new();
+                for p in a..b {
+                    if count[p as usize] == 0 {
+                        match want.last_mut() {
+                            Some(r) if r.1 == p => r.1 = p + 1,
+                            _ => want.push((p, p + 1)),
+                        }
+                    }
+                }
+                assert_eq!(freed, want);
+            }
+            for p in 0..PAGES as u64 {
+                assert_eq!(ext.at(p), count[p as usize]);
+            }
+            // No step repeats the one before it.
+            let mut prev = 0;
+            for &c in ext.steps.values() {
+                assert_ne!(c, prev);
+                prev = c;
+            }
+        }
+        for (a, b) in live.drain(..) {
+            ext.remove(a, b);
+        }
+        assert!(ext.steps.is_empty());
     }
 }

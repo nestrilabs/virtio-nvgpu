@@ -672,6 +672,14 @@ fn a_connection_that_hangs_up_gives_its_shm_back_before_the_guest_closes_it() {
                 .new_id(4)
                 .int(65536)
                 .finish(),
+            MsgBuilder::new(4, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(5)
+                .int(0)
+                .int(64)
+                .int(256)
+                .int(256)
+                .uint(0)
+                .finish(),
         ],
         vec![sys::memfd(c"guest-pool", 65536).unwrap()],
     );
