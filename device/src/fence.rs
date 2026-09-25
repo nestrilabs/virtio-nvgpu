@@ -270,6 +270,14 @@ struct Reg {
 /// Every live registration of a session.
 pub struct Registrations {
     regs: HashMap<RegKey, Reg>,
+    /// Registrations whose key no longer names what they wait on: the
+    /// syncobj handle was destroyed, or the render file closed. The host
+    /// hands the number out again at once (lowest free, drm_syncobj.c:606),
+    /// so a waiter on the new syncobj that joined one of these would sleep
+    /// on a point of the old one, which may never fire (S-13). Never joined,
+    /// only swept once fired; they keep their cap slot until then, since
+    /// the kernel entry does too.
+    orphans: Vec<Reg>,
     cap: usize,
     /// Handles of fired registrations, closed once [`RETIRE_GRACE`] has
     /// passed. Bounded by how fast registrations fire.
@@ -287,6 +295,7 @@ impl Registrations {
     pub fn with_cap(cap: usize) -> Self {
         Self {
             regs: HashMap::new(),
+            orphans: Vec::new(),
             cap,
             retired: VecDeque::new(),
             grace: RETIRE_GRACE,
@@ -299,13 +308,39 @@ impl Registrations {
         self
     }
 
-    /// Registrations that have not been seen to fire.
+    /// Registrations that have not been seen to fire, orphans included.
     pub fn len(&self) -> usize {
-        self.regs.len()
+        self.regs.len() + self.orphans.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.regs.is_empty()
+        self.len() == 0
+    }
+
+    /// Syncobj handle `syncobj` of render handle `render` is being
+    /// destroyed: its registrations stop being joinable, so a watch on the
+    /// next syncobj to get that number starts a registration of its own.
+    /// Called before the DESTROY runs, not after: between the host freeing
+    /// the number and the reply, another guest thread may already import a
+    /// syncobj under it and watch. A DESTROY that then fails leaves a live
+    /// syncobj with an orphaned registration, which costs a second kernel
+    /// entry for the next waiter and nothing else.
+    pub fn orphan(&mut self, render: u32, syncobj: u32) {
+        self.orphan_where(|k| k.render == render && k.syncobj == syncobj);
+    }
+
+    /// Render handle `render` is closing: every registration it made.
+    pub fn orphan_file(&mut self, render: u32) {
+        self.orphan_where(|k| k.render == render);
+    }
+
+    fn orphan_where(&mut self, f: impl Fn(&RegKey) -> bool) {
+        let keys: Vec<RegKey> = self.regs.keys().filter(|k| f(k)).copied().collect();
+        for k in keys {
+            if let Some(r) = self.regs.remove(&k) {
+                self.orphans.push(r);
+            }
+        }
     }
 
     /// Have the guest woken, under `cookie`, when `key`'s point is ready --
@@ -341,14 +376,19 @@ impl Registrations {
             // fresh registration reports -- at once if it is still ready.
             self.retire(&key);
         }
-        if self.regs.values().any(|r| r.cookie == cookie) {
+        if self
+            .regs
+            .values()
+            .chain(&self.orphans)
+            .any(|r| r.cookie == cookie)
+        {
             // Two points under one cookie would wake each other's waiters
             // and, worse, retire one another's guest bookkeeping.
             return Err(libc::EINVAL);
         }
-        if self.regs.len() >= self.cap {
+        if self.len() >= self.cap {
             self.sweep();
-            if self.regs.len() >= self.cap {
+            if self.len() >= self.cap {
                 log::warn!(
                     "syncobj wait registrations at the cap ({}); the guest polls instead",
                     self.cap
@@ -409,6 +449,13 @@ impl Registrations {
         for k in done {
             self.retire(&k);
         }
+        let now = Instant::now();
+        let (fired_orphans, live): (Vec<Reg>, Vec<Reg>) = std::mem::take(&mut self.orphans)
+            .into_iter()
+            .partition(|r| fired(r.eventfd.as_raw_fd()));
+        self.orphans = live;
+        self.retired
+            .extend(fired_orphans.into_iter().map(|r| (r.handle, now)));
     }
 
     fn retire(&mut self, key: &RegKey) {
@@ -435,6 +482,7 @@ impl Registrations {
     /// would for a native process that exited.
     pub fn clear(&mut self) {
         self.regs.clear();
+        self.orphans.clear();
         self.retired.clear();
     }
 }
@@ -739,6 +787,67 @@ mod tests {
         assert_eq!(
             r.watch(&host, &mut t, 3, key(2, 1, 0), C2),
             Err(libc::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn a_watch_after_the_syncobj_was_destroyed_never_joins_the_old_registration() {
+        // Handle 1 destroyed and handed out again: the same key is another
+        // syncobj now, whose point the old registration will never report.
+        let (host, mut t, mut r) = (Host::default(), Table::default(), Registrations::default());
+        r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
+        r.orphan(20, 1);
+        assert_eq!(
+            r.watch(&host, &mut t, 3, key(1, 5, 0), C2),
+            Ok(Watched::New)
+        );
+        assert_eq!(host.registered.borrow().len(), 2, "its own kernel entry");
+        // Another syncobj of the file is untouched.
+        r.watch(&host, &mut t, 3, key(2, 5, 0), C3).unwrap();
+        r.orphan(20, 1);
+        assert_eq!(
+            r.watch(&host, &mut t, 3, key(2, 5, 0), 1 << 40),
+            Ok(Watched::Joined(C3))
+        );
+    }
+
+    #[test]
+    fn a_closed_render_files_registrations_are_never_joined_by_its_successor() {
+        let (host, mut t, mut r) = (Host::default(), Table::default(), Registrations::default());
+        r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
+        r.watch(&host, &mut t, 3, key(2, 5, 0), C2).unwrap();
+        r.orphan_file(20);
+        for (s, c) in [(1, C3), (2, 1 << 40)] {
+            assert_eq!(r.watch(&host, &mut t, 3, key(s, 5, 0), c), Ok(Watched::New));
+        }
+    }
+
+    #[test]
+    fn an_orphan_holds_its_slot_and_its_cookie_until_it_fires() {
+        let host = Host::default();
+        let (mut t, mut r) = (Table::default(), Registrations::with_cap(1));
+        r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
+        r.orphan(20, 1);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.watch(&host, &mut t, 3, key(1, 5, 0), C2),
+            Err(libc::EAGAIN),
+            "the kernel entry is still there, so is its count"
+        );
+        r.sweep();
+        assert_eq!(r.len(), 1, "not fired, not swept");
+        host.fire(0);
+        r.sweep();
+        assert!(r.is_empty());
+        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
+        assert_eq!(t.retired, vec![1], "its handle closes after the grace");
+        let mut r = Registrations::default();
+        r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
+        r.orphan(20, 1);
+        assert_eq!(
+            r.watch(&host, &mut t, 3, key(2, 5, 0), C1),
+            Err(libc::EINVAL),
+            "an orphan still reports under its cookie"
         );
     }
 

@@ -2071,6 +2071,11 @@ impl NvidiaBackend {
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.forget_kms_state(handle);
+        // A render file's syncobj numbers die with it and a later file may
+        // get the same handle number: its waits must never join these (S-13).
+        if matches!(kind, HandleKind::DriRender(_)) {
+            self.syncobj_regs.orphan_file(handle);
+        }
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });

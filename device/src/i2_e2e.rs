@@ -1461,6 +1461,59 @@ fn a_syncobj_wait_reaches_the_host_as_a_poll_and_an_eventfd_never_does() {
     assert!(w.calls().is_empty());
 }
 
+/// Hyprland destroys a dead client's timeline and imports the next one,
+/// which the host gives the same syncobj number (lowest free,
+/// drm_syncobj.c:606). A watch on the new syncobj must not join the old
+/// one's unfired registration, whose point may never come (S-13): the
+/// DESTROY orphans it before it runs, and so does closing the render file.
+#[test]
+fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number() {
+    use crate::fence::{RegKey, SyncobjHost, Watched};
+    struct Host;
+    impl SyncobjHost for Host {
+        fn syncobj_file(&self, _: RawFd, _: u32) -> std::io::Result<OwnedFd> {
+            Ok(memfd(c"e2e-syncobj"))
+        }
+        fn register(&self, _: RawFd, _: u32, _: u64, _: u32, _: RawFd) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn watch(w: &mut World, key: RegKey, cookie: u64) -> Result<Watched, i32> {
+        let mut regs = std::mem::take(&mut w.be.syncobj_regs);
+        let r = regs.watch(&Host, &mut w.be, -1, key, cookie);
+        w.be.syncobj_regs = regs;
+        r
+    }
+    const DESTROY: u32 = hostfd::DRM_IOCTL_SYNCOBJ_DESTROY;
+    let mut w = world();
+    let render = w.render;
+    let key = RegKey {
+        render,
+        syncobj: 3,
+        point: 120,
+        flags: 0,
+    };
+    let c = |n: u64| (1 << 32) | n;
+    assert_eq!(watch(&mut w, key, c(1)), Ok(Watched::New));
+    assert_eq!(watch(&mut w, key, c(2)), Ok(Watched::Joined(c(1))));
+    let mut a = vec![0u8; 8];
+    wr(&mut a, 0, 4, 3);
+    w.mem.put(0x1000, &a);
+    // Whatever the host answers (this one has no syncobjs at all).
+    assert_eq!(
+        w.call_in(schema::Class::Render, render, DESTROY, 0x1000, 0),
+        Ok(-libc::ENOTTY)
+    );
+    assert_eq!(watch(&mut w, key, c(3)), Ok(Watched::New));
+    assert_eq!(w.be.syncobj_regs.len(), 2, "the orphan keeps its slot");
+
+    // A later render file may be given this handle number: the closed
+    // file's registrations are no key's any more.
+    w.be.close_handle(render).unwrap();
+    assert_eq!(watch(&mut w, key, c(4)), Ok(Watched::New));
+    assert_eq!(w.be.syncobj_regs.len(), 3);
+}
+
 // ───────────────────────────── NVKMS ─────────────────────────────
 
 /// NvKmsIoctlParams at 0x1000 for `cmd`, its params block of `size` bytes
