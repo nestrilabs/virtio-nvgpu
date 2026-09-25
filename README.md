@@ -94,11 +94,23 @@ What narrows that surface today:
 
 - ioctls the ABI profile does not describe are **refused**, not forwarded
   (`--permissive-abi` turns that off for diagnosis, and says so loudly)
+- **no guest pointer reaches the host driver as a pointer.** The backend makes
+  every host call itself, so a pointer the guest left in a parameter block
+  would be an address in the VMM. Each pointer field the host follows -- RM's
+  parameter blocks, the pointers RM follows inside control parameters, the
+  NVKMS and nvidia-drm nested blocks -- is pointed at a buffer of the
+  backend's or zeroed, whatever the ABI policy; escapes whose pointers cannot
+  be relocated (IOCTL_XFER_CMD, IDLE_CHANNELS, ACCESS_REGISTRY, I2C_ACCESS,
+  GET_EVENT_DATA) are refused (`device/src/guestptr.rs`)
+- UVM runs with pageable memory access forced off, so the GPU cannot fault in
+  the VMM's own pages, and takes only the commands that name UVM's ranges, RM
+  handles or GPU state: the tools device, and every command that copies
+  through, pins or populates CPU memory, is refused
 
 What does not, yet:
 
-- `RM_ALLOC` classes and RM control commands are unfiltered
-- UVM and modeset ioctls have no equivalent table
+- `RM_ALLOC` classes and RM control commands are otherwise unfiltered
+- modeset ioctls have no equivalent table
 - the backend holds the host descriptors inside the VMM's process; the
   unprivileged per-guest isolate is designed and unbuilt
 

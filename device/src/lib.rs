@@ -10,6 +10,7 @@ pub mod error;
 pub mod exec;
 pub mod fence;
 pub mod guarded;
+pub mod guestptr;
 pub mod handle_table;
 pub mod host;
 pub mod hostfd;

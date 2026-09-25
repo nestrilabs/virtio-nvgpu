@@ -291,10 +291,15 @@ and they are what an encode pipeline uses.
   providing an isolation boundary.
 
   What narrows the surface here: ioctls the ABI profile does not describe are
-  **refused**, not forwarded. What does not, yet: `RM_ALLOC` classes and RM
-  control commands are unfiltered, UVM and modeset have no equivalent table, and
-  the backend holds the host descriptors in the VMM's own process — the isolate
-  is why that last one is in the design at all.
+  **refused**, not forwarded, and no guest pointer reaches the host driver as
+  a pointer — every field the host would follow is pointed at a buffer of the
+  backend's or zeroed, and what cannot be made so is refused
+  (`device/src/guestptr.rs`); UVM runs with pageable memory access off and
+  only its range-, handle- and GPU-level commands. What does not, yet:
+  `RM_ALLOC` classes and RM control commands are otherwise unfiltered, modeset
+  has no equivalent table, and the backend holds the host descriptors in the
+  VMM's own process — the isolate is why that last one is in the design at
+  all.
 
   If you need mutually untrusted tenants isolated by hardware, this is not it:
   one card per guest with an IOMMU, or vGPU.
