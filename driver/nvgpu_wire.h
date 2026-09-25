@@ -124,12 +124,32 @@ struct nvgpu_mmap_req {
   __le32 padding;
 } __packed;
 
+/*
+ * `caching` was padding before protocol v2, and a backend leaves it zero for a
+ * v1 session, so zero keeps its old meaning: the guest's choice, which was
+ * always write-combining. The host picks a memory type per mapping (nv-mmap.c
+ * forces UC on registers and uses the allocation's own type for system
+ * memory), and a guest mapping of another type is slow (WC reads of cached
+ * memory) or wrong (a WC doorbell).
+ */
+#define NVGPU_MMAP_CACHE_DEFAULT 0
+#define NVGPU_MMAP_CACHE_WB 1
+#define NVGPU_MMAP_CACHE_WC 2
+#define NVGPU_MMAP_CACHE_UC 3
+
+/* The host mapping is read-only (nv-mmap.c:756-761 clears VM_WRITE and
+ * VM_MAYWRITE). A guest write through the window would reach KVM as a write
+ * fault it cannot resolve, which stops the VM; the guest refuses it instead. */
+#define NVGPU_MMAP_F_READ_ONLY (1u << 0)
+
 struct nvgpu_mmap_resp {
   struct nvgpu_msg_hdr hdr;
   __le64 guest_phys_addr;
   __le64 size;
   __le32 mapping_id;
-  __le32 padding;
+  __u8 caching; /* NVGPU_MMAP_CACHE_* */
+  __u8 flags;   /* NVGPU_MMAP_F_* */
+  __le16 reserved;
 } __packed;
 
 struct nvgpu_munmap_req {
@@ -445,6 +465,9 @@ struct nvgpu_wl_send_resp {
 } __packed;
 
 static_assert(sizeof(struct nvgpu_msg_hdr) == 16, "msg hdr");
+static_assert(sizeof(struct nvgpu_mmap_resp) == 16 + 24, "mmap resp");
+static_assert(offsetof(struct nvgpu_mmap_resp, caching) == 16 + 20,
+              "mmap resp caching");
 static_assert(sizeof(struct nvgpu_hello_req) == 16, "hello req");
 static_assert(sizeof(struct nvgpu_hello_resp) == 32, "hello resp");
 static_assert(sizeof(struct nvgpu_time_sync_resp) == 8, "time sync");

@@ -455,6 +455,10 @@ pub struct NvidiaBackend {
     host_ioctl: HostIoctl,
     /// Wayland channels (`DEV_WAYLAND` handles) and what configures them.
     pub(crate) wl: crate::wl::WlState,
+    /// What the RM handles a mapping can name are (system memory and its
+    /// coherency, doorbell registers), and the rewrite that makes guest
+    /// system memory GPU-coherent (rmmem.rs).
+    pub(crate) rmmem: crate::rmmem::RmMem,
 }
 
 /// `ioctl(2)` as the forwarding paths call it.
@@ -503,12 +507,20 @@ fn ioctl_arg(cmd: u64, bytes: &[u8]) -> Option<GuardedBuf> {
 /// extent, then none. Now a close leaves the placement alone, and the extent
 /// is withdrawn and freed exactly once, when the last reference goes: the last
 /// MUNMAP of its id, or a session reset.
+///
+/// RM mappings end up here too, once RM_UNMAP_MEMORY or the close of their
+/// file has ended them on the host while a guest vma still maps the id: the
+/// extent must not go to another mapping until those vmas are gone.
 pub(crate) struct LiveMap {
-    key: (u32, u64),
+    /// The `dri_maps` entry that finds it, for a DRM object; none for an RM
+    /// mapping, which nothing maps again once it is here.
+    key: Option<(u32, u64)>,
     region: crate::shm::ShmRegion,
     length: u64,
     /// MMAP replies that handed this id out and have not been taken back.
     refs: u32,
+    /// Whether the host mapping can be written (`shm::host_mapping_writable`).
+    writable: bool,
 }
 
 /// What to do with an ioctl the ABI profile does not vouch for.
@@ -869,6 +881,7 @@ impl NvidiaBackend {
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
             wl: crate::wl::WlState::default(),
+            rmmem: crate::rmmem::RmMem::default(),
         }
     }
 
@@ -897,6 +910,21 @@ impl NvidiaBackend {
             );
         }
         self.abi_policy = policy;
+    }
+
+    /// Whether guest system memory is allocated GPU-coherent (the default;
+    /// see rmmem.rs). Off leaves every allocation as the guest asked, which on
+    /// an Intel host under KVM's default IGNORE_GUEST_PAT quirk means the
+    /// guest caches memory the GPU does not snoop.
+    pub fn set_guest_coherency(&mut self, coherent: bool) {
+        if !coherent {
+            log::warn!(
+                "guest system memory keeps the coherency it asks for: on an Intel host the \
+                 guest may read stale GPU data unless the VMM honours guest PAT"
+            );
+        }
+        self.rmmem.set_coherent(coherent);
+        self.nvkms.set_coherent_display(coherent);
     }
 
     /// What the backend was started with: compositor-VM mode, the Wayland
@@ -1106,6 +1134,7 @@ impl NvidiaBackend {
         for e in self.active_maps.drain() {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
+        self.rmmem.clear();
         self.kms_states.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
@@ -1426,7 +1455,7 @@ impl NvidiaBackend {
         }
 
         let entry = match self.active_maps.find_by_fd_handle(self.current_handle) {
-            Some(e) => e,
+            Some(e) => *e,
             None => {
                 // Bookkeeping here records what RM_MAP_MEMORY armed, and that
                 // is not the only ioctl that arms a mapping: NV_ESC_RM_ALLOC_MEMORY
@@ -1466,19 +1495,61 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
-        log::debug!("mmap: window offset {offset:#x}+{length:#x}");
-        self.write_mmap_resp(resp_buf, offset, mapped_pages, 0)
+        // An id the guest's vmas count on, the same one for every MMAP of this
+        // mapping: RM_UNMAP_MEMORY then leaves the extent alone until the last
+        // of them is gone (see `MmapEntry::mapping_id`).
+        let id = if entry.mapping_id != 0 {
+            entry.mapping_id
+        } else {
+            self.next_mapping_id()
+        };
+        if let Some(e) = self.active_maps.find_by_fd_handle_mut(self.current_handle) {
+            e.mapping_id = id;
+            e.refs += 1;
+        }
+
+        log::debug!("mmap: window offset {offset:#x}+{length:#x}, id {id}");
+        self.write_mmap_resp(
+            resp_buf,
+            offset,
+            mapped_pages,
+            id,
+            entry.region.pgprot,
+            entry.writable,
+        )
     }
 
     fn current_kind(&self) -> Option<HandleKind> {
         self.handles.kind(self.current_handle)
     }
 
-    fn write_mmap_resp(&self, resp_buf: &mut [u8], offset: u64, size: u64, id: u32) -> usize {
+    /// An MMAP reply. `pgprot` is the zone the placement is in, which is the
+    /// memory type the host maps it with; a v2 guest maps it the same way,
+    /// and a v1 guest, which reads nothing there, keeps write-combining.
+    fn write_mmap_resp(
+        &self,
+        resp_buf: &mut [u8],
+        offset: u64,
+        size: u64,
+        id: u32,
+        pgprot: crate::shm::PgprotKind,
+        writable: bool,
+    ) -> usize {
+        use crate::shm::PgprotKind;
         let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
         if resp_buf.len() < need {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
         }
+        let (caching, flags) = if self.session.v2 {
+            let c = match pgprot {
+                PgprotKind::WriteBack => MMAP_CACHE_WB,
+                PgprotKind::WriteCombine => MMAP_CACHE_WC,
+                PgprotKind::Uncached => MMAP_CACHE_UC,
+            };
+            (c, if writable { 0 } else { MMAP_F_READ_ONLY })
+        } else {
+            (MMAP_CACHE_DEFAULT, 0)
+        };
         let mut off = self.write_hdr(resp_buf, self.current_handle, 0);
         off += write_struct(
             &mut resp_buf[off..],
@@ -1486,10 +1557,78 @@ impl NvidiaBackend {
                 guest_phys_addr: offset,
                 size,
                 mapping_id: id,
-                padding: 0,
+                caching,
+                flags,
+                reserved: 0,
             },
         );
         off
+    }
+
+    /// A window extent in the zone for `want`. A write-back request that does
+    /// not fit falls back to write-combining, which is always a correct way to
+    /// map what the host maps write-back (only slower to read); nothing else
+    /// falls back, least of all registers, which must stay uncached.
+    fn alloc_zone(
+        &mut self,
+        length: u64,
+        want: crate::shm::PgprotKind,
+    ) -> Result<crate::shm::ShmRegion> {
+        use crate::shm::PgprotKind;
+        match self.shm.alloc(length, want) {
+            Err(e) if want == PgprotKind::WriteBack => {
+                log::warn!("write-back zone: {e}; placing {length:#x} bytes write-combining");
+                self.shm.alloc(length, PgprotKind::WriteCombine)
+            }
+            r => r,
+        }
+    }
+
+    /// How the host maps what an RM_MAP_MEMORY of `h_client`'s `h_memory`
+    /// armed, from the flags RM returned and our records (M-1).
+    ///
+    /// The caching type in the flags means something only for video memory:
+    /// the escape resets it to DEFAULT before RM sees it (escape.c:600-601),
+    /// and RM writes a real one back only when it maps through BAR1, marking
+    /// the mapping REFLECTED (mapping_cpu.c:586-591). System memory comes back
+    /// DIRECT with DEFAULT, and the host maps it with the allocation's own
+    /// type (nv-mmap.c:727-729), which is in our records; registers (a
+    /// usermode doorbell) come back with MAPPING as the caller left it and are
+    /// mapped UC whatever was asked (nv-mmap.c:589-596).
+    fn rm_mapping_pgprot(
+        &self,
+        flags: u32,
+        h_client: u32,
+        h_memory: u32,
+    ) -> crate::shm::PgprotKind {
+        use crate::rmmem::Mem;
+        use crate::shm::PgprotKind;
+        const MAPPING_SHIFT: u32 = 15; // NVOS33_FLAGS_MAPPING 16:15
+        const MAPPING_DIRECT: u32 = 1;
+        const MAPPING_REFLECTED: u32 = 2;
+        const CACHING_TYPE_SHIFT: u32 = 23; // NVOS33_FLAGS_CACHING_TYPE 25:23
+        const CACHED: u32 = 0;
+        const UNCACHED: u32 = 1;
+        const WRITECOMBINED: u32 = 2;
+        const WRITEBACK: u32 = 5;
+        const UNCACHED_WEAK: u32 = 7;
+
+        let mem = self.rmmem.lookup(h_client, h_memory);
+        match ((flags >> MAPPING_SHIFT) & 3, mem) {
+            (_, Some(Mem::Regmem)) => PgprotKind::Uncached,
+            (MAPPING_REFLECTED, _) => match (flags >> CACHING_TYPE_SHIFT) & 7 {
+                CACHED | WRITEBACK => PgprotKind::WriteBack,
+                WRITECOMBINED => PgprotKind::WriteCombine,
+                UNCACHED | UNCACHED_WEAK => PgprotKind::Uncached,
+                // RM always writes a real type for BAR1; DEFAULT means it did
+                // not map one, and the safe type for what it did map is UC.
+                _ => PgprotKind::Uncached,
+            },
+            (_, Some(m)) => m.pgprot(),
+            // System memory this backend never saw allocated: the old guess.
+            (MAPPING_DIRECT, None) => PgprotKind::WriteCombine,
+            _ => PgprotKind::Uncached,
+        }
     }
 
     /// Serve an mmap on a file this backend has no record of arming.
@@ -1504,15 +1643,24 @@ impl NvidiaBackend {
             Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT),
         };
 
-        // Caching follows the device, which is the same rule the recorded path
-        // reaches through the flags RM returns: the control device carries
-        // system memory, and a GPU device carries the card's own.
+        // Caching follows the device: a GPU device carries the card's own
+        // memory, which the host maps write-combined through BAR1, and so does
+        // a DRM node (drm_gem_mmap_obj, drm_gem.c:1250-1252, for every
+        // nvidia-drm object). The control device carries system memory, armed
+        // by an NV_ESC_RM_ALLOC_MEMORY whose coherency is in our records; one
+        // we did not see is taken to be write-back only when this backend
+        // makes guest system memory coherent, and write-combining otherwise,
+        // which is safe for any system memory.
         let kind = self.current_kind();
         let drm = kind.and_then(HandleKind::index).is_some();
         let pgprot = match kind {
             Some(HandleKind::Dev(DeviceKind::Gpu(_))) => crate::shm::PgprotKind::WriteCombine,
             _ if drm => crate::shm::PgprotKind::WriteCombine,
-            _ => crate::shm::PgprotKind::WriteBack,
+            _ => match self.rmmem.armed(handle) {
+                Some(m) => m.pgprot(),
+                None if self.rmmem.coherent() => crate::shm::PgprotKind::WriteBack,
+                None => crate::shm::PgprotKind::WriteCombine,
+            },
         };
 
         // On a DRM node the guest's offset is a real position in the file --
@@ -1530,12 +1678,21 @@ impl NvidiaBackend {
             if let Some(live) = self.live_maps.get_mut(&id) {
                 live.refs += 1;
                 let (offset, length) = (live.region.offset, live.length);
-                return self.write_mmap_resp(resp_buf, offset, length.div_ceil(4096) * 4096, id);
+                let (pgprot, writable) = (live.region.pgprot, live.writable);
+                return self.write_mmap_resp(
+                    resp_buf,
+                    offset,
+                    length.div_ceil(4096) * 4096,
+                    id,
+                    pgprot,
+                    writable,
+                );
             }
         }
 
         let length = size.max(4096);
-        let region = match self.shm.alloc(length, pgprot) {
+        let writable = crate::shm::host_mapping_writable(host_fd, length, fd_offset);
+        let region = match self.alloc_zone(length, pgprot) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("mmap on handle {handle}: window has no room: {e}");
@@ -1550,7 +1707,7 @@ impl NvidiaBackend {
             }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
         };
-        if let Err(e) = window.place(region.offset, length, host_fd, fd_offset, true) {
+        if let Err(e) = window.place(region.offset, length, host_fd, fd_offset, writable) {
             log::warn!(
                 "mmap on handle {handle}: nothing armed on this file, or it could \
                  not be placed: {e}"
@@ -1567,19 +1724,27 @@ impl NvidiaBackend {
             region.offset
         );
 
-        let offset = region.offset;
+        let (offset, pgprot) = (region.offset, region.pgprot);
         let id = self.next_mapping_id();
         self.dri_maps.insert((handle, fd_offset), id);
         self.live_maps.insert(
             id,
             LiveMap {
-                key: (handle, fd_offset),
+                key: Some((handle, fd_offset)),
                 region,
                 length,
                 refs: 1,
+                writable,
             },
         );
-        self.write_mmap_resp(resp_buf, offset, length.div_ceil(4096) * 4096, id)
+        self.write_mmap_resp(
+            resp_buf,
+            offset,
+            length.div_ceil(4096) * 4096,
+            id,
+            pgprot,
+            writable,
+        )
     }
 
     /// A mapping id no live placement has. Zero means "none" to the guest.
@@ -1587,10 +1752,38 @@ impl NvidiaBackend {
         loop {
             let id = self.next_mapping_id;
             self.next_mapping_id = self.next_mapping_id.wrapping_add(1).max(1);
-            if !self.live_maps.contains_key(&id) {
+            if !self.live_maps.contains_key(&id) && !self.active_maps.has_mapping_id(id) {
                 return id;
             }
         }
+    }
+
+    /// An RM mapping has ended on the host -- RM_UNMAP_MEMORY, or the close
+    /// of the file carrying it -- and its placement goes with it, unless a
+    /// guest vma still maps it: then the extent moves to `live_maps` under the
+    /// id those vmas hold, and the last MUNMAP of it releases it (M-3).
+    fn end_rm_mapping(&mut self, entry: crate::mmap::MmapEntry, why: &str) {
+        if entry.refs == 0 {
+            self.release_extent(&entry.region, entry.shm_length, why);
+            return;
+        }
+        log::debug!(
+            "{why}: window offset {:#x} is still mapped by {} guest vma(s) of id {}; \
+             released when they are gone",
+            entry.region.offset,
+            entry.refs,
+            entry.mapping_id
+        );
+        self.live_maps.insert(
+            entry.mapping_id,
+            LiveMap {
+                key: None,
+                region: entry.region,
+                length: entry.shm_length,
+                refs: entry.refs,
+                writable: entry.writable,
+            },
+        );
     }
 
     fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
@@ -1599,10 +1792,16 @@ impl NvidiaBackend {
         }
         let req = read_struct::<MunmapReq>(payload, 0);
 
-        // Zero is what every mapping the RM path hands out carries: those are
-        // taken back by RM_UNMAP_MEMORY, which names them by the address in
-        // pLinearAddress. Reported as success so a guest tearing one down does
-        // not log a failure for a mapping it never received an id for.
+        // An RM mapping still in force: its vmas are counted here, and its
+        // extent stays with it until RM_UNMAP_MEMORY or its file's close,
+        // which see this count (`end_rm_mapping`).
+        if let Some(e) = self.active_maps.find_by_mapping_id_mut(req.mapping_id) {
+            e.refs = e.refs.saturating_sub(1);
+            return self.write_hdr(resp_buf, 0, 0);
+        }
+        // Zero is what an older backend handed out for RM mappings, and an
+        // unknown id is one already taken back. Reported as success so a guest
+        // tearing one down does not log a failure for it.
         let Some(live) = self.live_maps.get_mut(&req.mapping_id) else {
             return self.write_hdr(resp_buf, 0, 0);
         };
@@ -1614,8 +1813,10 @@ impl NvidiaBackend {
             .live_maps
             .remove(&req.mapping_id)
             .expect("looked up above");
-        if self.dri_maps.get(&live.key) == Some(&req.mapping_id) {
-            self.dri_maps.remove(&live.key);
+        if let Some(key) = live.key {
+            if self.dri_maps.get(&key) == Some(&req.mapping_id) {
+                self.dri_maps.remove(&key);
+            }
         }
         self.release_extent(&live.region, live.length, "munmap");
         log::debug!(
@@ -1731,8 +1932,9 @@ impl NvidiaBackend {
                 entry.region.offset,
                 entry.region.length
             );
-            self.release_extent(&entry.region, entry.shm_length, "close");
+            self.end_rm_mapping(entry, "close");
         }
+        self.rmmem.forget_fd(handle);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.kms_states.remove(&handle);
         self.wl_forget(handle);
@@ -1941,12 +2143,19 @@ impl NvidiaBackend {
                     );
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
-                return self.dispatch_nested(
+                let n = self.dispatch_nested(
                     cookie, host_fd, request, &msg, resp_buf, 16, // outer_size
                     8,  // ptr_offset
                     4,  // size_offset
                     None, None,
                 );
+                // The one reply the policy rewrites (ALLOC_DEVICE's display
+                // coherency modes, nvkms.rs), laid out as `msg` was.
+                let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+                if n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0 {
+                    self.nvkms.v1_after(&mut resp_buf[body..n]);
+                }
+                return n;
             }
             V1Route::DrmNested {
                 outer_size,
@@ -2000,7 +2209,26 @@ impl NvidiaBackend {
         }
 
         use abi::ioctl::*;
-        match escape {
+
+        // What the memory an escape makes, duplicates, frees or GPU-maps is,
+        // and the coherency rewrite (rmmem.rs): the host is handed a rewritten
+        // copy, and the reply gets the caller's own bits back. RM_ALLOC only in
+        // the 48-byte NVOS64 form, the one the offsets are for.
+        let rm_copy: Vec<u8>;
+        let mut rm_pending = None;
+        let param_in: &[u8] = if ioc_type == b'F' as u32
+            && crate::rmmem::RmMem::watches(escape)
+            && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48)
+        {
+            let mut v = param_in.to_vec();
+            rm_pending = Some(self.rmmem.before(escape, self.current_handle, &mut v));
+            rm_copy = v;
+            &rm_copy
+        } else {
+            param_in
+        };
+
+        let n = match escape {
             // ---------------------------------------------------------------
             // FD-carrying ioctls — need handle translation
             // ---------------------------------------------------------------
@@ -2082,7 +2310,18 @@ impl NvidiaBackend {
                 self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
                 n
             }
+        };
+
+        if let Some(p) = rm_pending {
+            // The reply's parameters, laid out as the request's were; none
+            // when the call failed before RM ran, and then nothing is recorded.
+            let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+            let ok = n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0;
+            if ok {
+                self.rmmem.after(p, &mut resp_buf[body..n]);
+            }
         }
+        n
     }
 
     // ------------------------------------------------------------------
@@ -2871,23 +3110,12 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        use crate::shm::PgprotKind;
-
         const _NVOS33_SIZE: usize = 48;
         const WITH_FD_SIZE: usize = 56;
         const FD_OFFSET: usize = 48;
         const LENGTH_OFFSET: usize = 24;
         const STATUS_OFFSET: usize = 40;
         const FLAGS_OFFSET: usize = 44;
-
-        const FLAGS_CACHING_TYPE_SHIFT: u32 = 23;
-        const FLAGS_CACHING_TYPE_MASK: u32 = 0x7;
-        const CACHING_TYPE_CACHED: u32 = 0;
-        const CACHING_TYPE_UNCACHED: u32 = 1;
-        const CACHING_TYPE_WRITECOMBINED: u32 = 2;
-        const CACHING_TYPE_WRITEBACK: u32 = 5;
-        const CACHING_TYPE_DEFAULT: u32 = 6;
-        const CACHING_TYPE_UNCACHED_WEAK: u32 = 7;
 
         if param_in.len() < WITH_FD_SIZE {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
@@ -2972,29 +3200,28 @@ impl NvidiaBackend {
                 .unwrap(),
         );
 
-        // --- Step 4: Determine pgprot from caching type ---
+        // --- Step 4: the memory type the host maps it with ---
         //
-        // The host driver may have updated the caching type in flags after
-        // the ioctl (see nvproxy's rmMapMemory comment about this).
-
-        let caching_type = (flags >> FLAGS_CACHING_TYPE_SHIFT) & FLAGS_CACHING_TYPE_MASK;
-
-        let pgprot = match caching_type {
-            CACHING_TYPE_CACHED | CACHING_TYPE_WRITEBACK => PgprotKind::WriteBack,
-            CACHING_TYPE_WRITECOMBINED | CACHING_TYPE_DEFAULT => PgprotKind::WriteCombine,
-            CACHING_TYPE_UNCACHED | CACHING_TYPE_UNCACHED_WEAK => PgprotKind::Uncached,
-            other => {
-                log::warn!(
-                    "NV_ESC_RM_MAP_MEMORY: unknown caching type {}, defaulting to UC",
-                    other
-                );
-                PgprotKind::Uncached
-            }
-        };
+        // Not the caching type alone: that is real only for video memory (see
+        // `rm_mapping_pgprot`), and reading it for everything put system
+        // memory and the doorbell registers write-combining.
+        let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
+        let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
+        let pgprot = self.rm_mapping_pgprot(flags, h_client, h_memory);
+        // And whether it can be written at all: RM makes some mappings
+        // read-only, and placing one writable would let a guest write stop the
+        // VM (see `shm::host_mapping_writable`).
+        let writable = crate::shm::host_mapping_writable(host_map_fd, length, 0);
+        if !writable {
+            log::info!(
+                "NV_ESC_RM_MAP_MEMORY: client {h_client:#x} memory {h_memory:#x} is read-only \
+                 on the host; placed read-only"
+            );
+        }
 
         // --- Step 5: Allocate SHM region ---
 
-        let region = match self.shm.alloc(length, pgprot) {
+        let region = match self.alloc_zone(length, pgprot) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
@@ -3018,7 +3245,7 @@ impl NvidiaBackend {
             }
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
         };
-        if let Err(e) = window.place(region.offset, length, host_map_fd, 0, true) {
+        if let Err(e) = window.place(region.offset, length, host_map_fd, 0, writable) {
             log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
             if let Err(e) = self.shm.free(&region) {
                 log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
@@ -3027,10 +3254,11 @@ impl NvidiaBackend {
         }
 
         log::info!(
-            "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={}",
+            "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={:?}{}",
             region.offset,
             length,
-            pgprot as u8
+            region.pgprot,
+            if writable { "" } else { " read-only" }
         );
 
         // --- Step 6.5: Save host pLinearAddress and record mapping ---
@@ -3045,8 +3273,6 @@ impl NvidiaBackend {
         // makes NV_ESC_RM_UNMAP_MEMORY return NV_OK -- but does not release the
         // mapping: see repeated_map_unmap_does_not_exhaust_the_zone.
         let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
-        let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
-        let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
 
         // The handle is the key the mmap that follows will be found by, so it
         // is the one field worth naming in the log: a mapping that is armed
@@ -3060,7 +3286,7 @@ impl NvidiaBackend {
             h_memory
         );
 
-        let region_offset = region.offset;
+        let (region_offset, pgprot) = (region.offset, region.pgprot);
         self.active_maps.insert(
             region_offset,
             crate::mmap::MmapEntry {
@@ -3070,6 +3296,9 @@ impl NvidiaBackend {
                 h_memory,
                 map_fd_handle: guest_fd_handle,
                 region,
+                writable,
+                mapping_id: 0,
+                refs: 0,
             },
         );
 
@@ -3083,9 +3312,10 @@ impl NvidiaBackend {
         //
         // Only the parameter buffer goes back. The SHM offset and length do not
         // ride along on the ioctl reply: the guest maps by issuing a separate
-        // Mmap message quoting the cookie just written into pLinearAddress, and
-        // that is where the placement and caching are decided. An earlier reply
-        // struct carried them here, which the guest driver never read.
+        // Mmap message on the file this mapping was armed on, and that reply
+        // is what carries the placement, the memory type decided above and
+        // whether it is read-only. An earlier reply struct carried the
+        // placement here, which the guest driver never read.
         log::debug!(
             "map_memory: SHM {:#x}+{:#x}, pgprot {pgprot:?}",
             region_offset,
@@ -3174,7 +3404,11 @@ impl NvidiaBackend {
             // extent to its zone, so the space can serve a later mapping. The
             // withdraw matters as much as the free: without it the VMM keeps
             // the host device memory mapped there until the extent is reused.
-            self.release_extent(&entry.region, entry.shm_length, "UNMAP_MEMORY");
+            // Unless a guest vma still maps it: RM's unmap does not reach guest
+            // page tables, and handing the extent to the next mapping would
+            // show that process's memory to this one (M-3). Then the release
+            // waits for the last MUNMAP.
+            self.end_rm_mapping(entry, "UNMAP_MEMORY");
         } else {
             // Host returned RM error — put the entry back
             log::warn!(
@@ -4670,5 +4904,472 @@ mod tests {
         let body = &resp[IOCTL_BODY..];
         assert_eq!(&body[16..32], &p[16..32], "the caller's own pOld and pNew");
         assert_eq!(&body[32..36], &[0xaa; 4], "the host's status");
+    }
+}
+
+/// RM mappings as a guest sees them, against a fake RM that answers these
+/// calls the way the real one does: the memory type each is placed and mapped
+/// with (M-1), read-only placements (M-2), and when a window extent may go to
+/// another mapping (M-3).
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use abi::ioctl::*;
+    use std::cell::{Cell, RefCell};
+
+    const CLIENT: u32 = 0xc1d0_0001;
+    const DEVICE: u32 = 0x5c00_0001;
+    /// Handles the fake RM answers for: system memory (a DIRECT mapping),
+    /// registers (MAPPING left as sent) and video memory (REFLECTED, WC).
+    const SYSMEM: u32 = 0x100;
+    const REGS: u32 = 0x200;
+    const VIDMEM: u32 = 0x300;
+    const LEN: u64 = 4096;
+
+    std::thread_local! {
+        /// NV01_MEMORY_SYSTEM attr words the host was handed.
+        static HOST_ATTR: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        static NEXT_VA: Cell<u64> = const { Cell::new(0x7f00_0000_0000) };
+    }
+
+    fn rd(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
+
+    fn put(b: &mut [u8], off: usize, v: u32) {
+        b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// RM, for RM_ALLOC, RM_MAP_MEMORY and RM_UNMAP_MEMORY. MAP_MEMORY comes
+    /// back as escape.c and mapping_cpu.c leave it: caching type DEFAULT, and
+    /// MAPPING DIRECT for system memory, REFLECTED with WRITECOMBINED for video
+    /// memory, untouched for registers.
+    unsafe fn fake_rm(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        let len = hostfd::ioc_size(request as u32);
+        // SAFETY: `HostIoctl`'s contract: `arg` holds _IOC_SIZE bytes.
+        let b = unsafe { std::slice::from_raw_parts_mut(arg, len) };
+        match (request & 0xff) as u32 {
+            NV_ESC_RM_ALLOC => {
+                let params = u64::from_le_bytes(b[16..24].try_into().unwrap()) as *const u8;
+                if rd(b, 12) == 0x3e && !params.is_null() {
+                    // SAFETY: the backend pointed pAllocParms at the class
+                    // parameters it built, NV_MEMORY_ALLOCATION_PARAMS.
+                    let attr = unsafe { std::ptr::read_unaligned(params.add(24) as *const u32) };
+                    HOST_ATTR.with(|a| a.borrow_mut().push(attr));
+                }
+                put(b, 40, 0);
+            }
+            NV_ESC_RM_MAP_MEMORY => {
+                let mut flags = rd(b, 44) & !(3 << 15) & !(7 << 23);
+                flags |= 6 << 23;
+                match rd(b, 8) {
+                    SYSMEM => flags |= 1 << 15,
+                    VIDMEM => flags = (flags & !(7 << 23)) | (2 << 15) | (2 << 23),
+                    _ => {}
+                }
+                put(b, 44, flags);
+                let va = NEXT_VA.with(|v| {
+                    let va = v.get();
+                    v.set(va + 0x10000);
+                    va
+                });
+                b[32..40].copy_from_slice(&va.to_le_bytes());
+                put(b, 40, 0);
+            }
+            NV_ESC_RM_UNMAP_MEMORY => put(b, 24, 0),
+            _ => {}
+        }
+        0
+    }
+
+    /// Records every placement, with whether it was asked to be writable.
+    #[derive(Clone, Default)]
+    struct RecWindow(Arc<std::sync::Mutex<Vec<(&'static str, u64, bool)>>>);
+
+    impl crate::shm::WindowPlacer for RecWindow {
+        fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, w: bool) -> Result<()> {
+            self.0.lock().unwrap().push(("place", off, w));
+            Ok(())
+        }
+        fn withdraw(&self, off: u64, _len: u64) -> Result<()> {
+            self.0.lock().unwrap().push(("withdraw", off, false));
+            Ok(())
+        }
+    }
+
+    impl RecWindow {
+        fn withdrawn(&self) -> Vec<u64> {
+            let log = self.0.lock().unwrap();
+            log.iter()
+                .filter(|e| e.0 == "withdraw")
+                .map(|e| e.1)
+                .collect()
+        }
+        fn last_place(&self) -> (u64, bool) {
+            let log = self.0.lock().unwrap();
+            let e = log
+                .iter()
+                .rev()
+                .find(|e| e.0 == "place")
+                .expect("a placement");
+            (e.1, e.2)
+        }
+    }
+
+    /// A memfd standing for a device file: mappable, so the writability
+    /// probe sees a real answer.
+    fn memfd() -> OwnedFd {
+        let name = std::ffi::CString::new("devfile").unwrap();
+        // SAFETY: plain syscalls; the new fd's ownership passes to OwnedFd.
+        unsafe {
+            let fd = libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            assert_eq!(libc::ftruncate(fd, 1 << 16), 0);
+            OwnedFd::from_raw_fd(fd)
+        }
+    }
+
+    /// The same file, opened read-only: mapping it writable is refused the
+    /// way nvidia.ko refuses a context without NV_PROTECT_WRITEABLE.
+    fn read_only(f: &OwnedFd) -> OwnedFd {
+        let path = std::ffi::CString::new(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(f)
+        ))
+        .unwrap();
+        // SAFETY: reopening our own memfd.
+        unsafe { OwnedFd::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)) }
+    }
+
+    struct Env {
+        be: NvidiaBackend,
+        window: RecWindow,
+        ctl: u32,
+    }
+
+    fn env() -> Env {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_rm);
+        be.session.v2 = true;
+        let window = RecWindow::default();
+        be.set_window(Box::new(window.clone()));
+        let ctl = be.adopt_for_test(memfd(), HandleKind::Dev(DeviceKind::Ctl));
+        Env { be, window, ctl }
+    }
+
+    fn msg(msg_type: MsgType, handle: u32) -> Vec<u8> {
+        let mut v = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: msg_type as u32,
+                handle,
+                status: 0,
+                req_id: 0,
+            },
+        );
+        v
+    }
+
+    fn push<T: Copy>(v: &mut Vec<u8>, val: &T) {
+        let at = v.len();
+        v.resize(at + size_of::<T>(), 0);
+        write_struct(&mut v[at..], val);
+    }
+
+    impl Env {
+        fn call(&mut self, handle: u32, escape: u32, outer: &[u8], nested: &[u8]) -> Vec<u8> {
+            let mut req = msg(MsgType::Ioctl, handle);
+            push(
+                &mut req,
+                &IoctlReq {
+                    cmd: _IOWR(escape, outer.len() as u32) as u32,
+                    data_len: outer.len() as u32,
+                    nested_offset: outer.len() as u32,
+                    nested_len: nested.len() as u32,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(outer);
+            req.extend_from_slice(nested);
+            let mut resp = vec![0u8; 4096];
+            let n = self.be.dispatch(&req, &mut resp);
+            assert_eq!(
+                read_struct::<MsgHeader>(&resp, 0).status,
+                0,
+                "escape {escape:#x}"
+            );
+            let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+            resp[body..n].to_vec()
+        }
+
+        /// RM_ALLOC of `class` as `handle`, with `attr` if it is memory.
+        /// Returns the class parameters as the guest reads them back.
+        fn alloc(&mut self, class: u32, handle: u32, attr: Option<u32>) -> Vec<u8> {
+            let mut outer = vec![0u8; 48];
+            put(&mut outer, 0, CLIENT);
+            put(&mut outer, 4, DEVICE);
+            put(&mut outer, 8, handle);
+            put(&mut outer, 12, class);
+            let nested = attr.map(|a| {
+                let mut p = vec![0u8; 128];
+                put(&mut p, 24, a);
+                p
+            });
+            let ctl = self.ctl;
+            let back = self.call(
+                ctl,
+                NV_ESC_RM_ALLOC,
+                &outer,
+                nested.as_deref().unwrap_or(&[]),
+            );
+            back[48..].to_vec()
+        }
+
+        /// RM_MAP_MEMORY of `mem` armed on `file`; returns (its handle, the
+        /// window offset the guest reads back as pLinearAddress).
+        fn map_on(&mut self, mem: u32, file: OwnedFd) -> (u32, u64) {
+            let fd = self
+                .be
+                .adopt_for_test(file, HandleKind::Dev(DeviceKind::Ctl));
+            let mut p = vec![0u8; 56];
+            put(&mut p, 0, CLIENT);
+            put(&mut p, 4, DEVICE);
+            put(&mut p, 8, mem);
+            p[24..32].copy_from_slice(&LEN.to_le_bytes());
+            put(&mut p, 44, 0x0308_0002);
+            put(&mut p, 48, fd);
+            let ctl = self.ctl;
+            let back = self.call(ctl, NV_ESC_RM_MAP_MEMORY, &p, &[]);
+            assert_eq!(rd(&back, 40), 0, "RM status");
+            (fd, u64::from_le_bytes(back[32..40].try_into().unwrap()))
+        }
+
+        fn map(&mut self, mem: u32) -> (u32, u64) {
+            self.map_on(mem, memfd())
+        }
+
+        fn unmap(&mut self, mem: u32, linear: u64) {
+            let mut p = vec![0u8; 32];
+            put(&mut p, 0, CLIENT);
+            put(&mut p, 4, DEVICE);
+            put(&mut p, 8, mem);
+            p[16..24].copy_from_slice(&linear.to_le_bytes());
+            let ctl = self.ctl;
+            let back = self.call(ctl, NV_ESC_RM_UNMAP_MEMORY, &p, &[]);
+            assert_eq!(rd(&back, 24), 0);
+        }
+
+        fn mmap(&mut self, fd: u32) -> MmapResp {
+            let mut req = msg(MsgType::Mmap, fd);
+            push(
+                &mut req,
+                &MmapReq {
+                    size: LEN,
+                    offset: 0,
+                    prot: 3,
+                    padding: 0,
+                },
+            );
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, 0, "mmap");
+            read_struct::<MmapResp>(&resp, size_of::<MsgHeader>())
+        }
+
+        fn munmap(&mut self, id: u32) {
+            let mut req = msg(MsgType::Munmap, 0);
+            push(
+                &mut req,
+                &MunmapReq {
+                    mapping_id: id,
+                    padding: 0,
+                },
+            );
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, 0, "munmap");
+        }
+    }
+
+    #[test]
+    fn uncached_system_memory_is_allocated_coherent_and_mapped_write_back() {
+        let mut e = env();
+        HOST_ATTR.with(|a| a.borrow_mut().clear());
+        // UNCACHED, LOCATION_PCI: the RM default for system memory.
+        let asked = 1 << 25;
+        let back = e.alloc(0x3e, SYSMEM, Some(asked));
+        let host = HOST_ATTR.with(|a| a.borrow().clone());
+        assert_eq!(
+            host,
+            vec![asked | (5 << 29)],
+            "the host allocates WRITE_BACK"
+        );
+        assert_eq!(
+            rd(&back, 24),
+            asked,
+            "the guest reads back what it asked for"
+        );
+
+        let (fd, linear) = e.map(SYSMEM);
+        let m = e.mmap(fd);
+        assert_eq!(m.caching, MMAP_CACHE_WB);
+        assert_eq!(m.flags, 0);
+        assert_eq!(m.guest_phys_addr, linear);
+        assert!(
+            linear >= 4096 * 6,
+            "placed in the write-back zone, at {linear:#x}"
+        );
+    }
+
+    #[test]
+    fn the_doorbell_is_mapped_uncached_and_video_memory_write_combined() {
+        let mut e = env();
+        e.alloc(0xc461, REGS, None);
+        let (fd, linear) = e.map(REGS);
+        assert_eq!(e.mmap(fd).caching, MMAP_CACHE_UC);
+        assert!(
+            linear < 4096 * 2,
+            "placed in the uncached zone, at {linear:#x}"
+        );
+
+        let (fd, linear) = e.map(VIDMEM);
+        assert_eq!(e.mmap(fd).caching, MMAP_CACHE_WC);
+        assert!(
+            (4096 * 2..4096 * 6).contains(&linear),
+            "write-combining zone, at {linear:#x}"
+        );
+    }
+
+    #[test]
+    fn with_guest_coherency_kept_system_memory_maps_as_it_was_allocated() {
+        let mut e = env();
+        e.be.set_guest_coherency(false);
+        HOST_ATTR.with(|a| a.borrow_mut().clear());
+        let asked = (2 << 29) | (1 << 25); // WRITE_COMBINE, PCI
+        e.alloc(0x3e, SYSMEM, Some(asked));
+        assert_eq!(HOST_ATTR.with(|a| a.borrow().clone()), vec![asked]);
+        let (fd, _) = e.map(SYSMEM);
+        assert_eq!(e.mmap(fd).caching, MMAP_CACHE_WC);
+    }
+
+    #[test]
+    fn a_write_back_mapping_that_does_not_fit_its_zone_is_placed_write_combining() {
+        let mut e = env();
+        e.alloc(0x3e, SYSMEM, Some(1 << 25));
+        // for_test's write-back zone holds two pages.
+        let (a, _) = e.map(SYSMEM);
+        let (b, _) = e.map(SYSMEM);
+        let (c, linear) = e.map(SYSMEM);
+        assert_eq!(e.mmap(a).caching, MMAP_CACHE_WB);
+        assert_eq!(e.mmap(b).caching, MMAP_CACHE_WB);
+        assert_eq!(e.mmap(c).caching, MMAP_CACHE_WC);
+        assert!((4096 * 2..4096 * 6).contains(&linear));
+    }
+
+    #[test]
+    fn a_v1_guest_is_told_nothing_it_cannot_read() {
+        let mut e = env();
+        e.be.session.v2 = false;
+        e.alloc(0xc461, REGS, None);
+        let src = memfd();
+        let (fd, _) = e.map_on(REGS, read_only(&src));
+        let m = e.mmap(fd);
+        assert_eq!((m.caching, m.flags, m.reserved), (MMAP_CACHE_DEFAULT, 0, 0));
+    }
+
+    #[test]
+    fn a_read_only_host_mapping_is_placed_read_only_and_the_guest_is_told() {
+        let mut e = env();
+        let src = memfd();
+        let (fd, linear) = e.map_on(VIDMEM, read_only(&src));
+        assert_eq!(e.window.last_place(), (linear, false));
+        assert_eq!(e.mmap(fd).flags, MMAP_F_READ_ONLY);
+
+        let (fd, linear) = e.map(VIDMEM);
+        assert_eq!(e.window.last_place(), (linear, true));
+        assert_eq!(e.mmap(fd).flags, 0);
+    }
+
+    /// M-3: MAP, MMAP, UNMAP, MAP. The first extent is still in a guest
+    /// process's page tables after the unmap, so the second mapping must not
+    /// be given it; the last MUNMAP of the first gives it back.
+    #[test]
+    fn an_extent_under_a_live_guest_mapping_is_not_reused_after_rm_unmap() {
+        let mut e = env();
+        let empty = e.be.shm_free_bytes();
+        let (fd, first) = e.map(VIDMEM);
+        let m = e.mmap(fd);
+        assert_ne!(m.mapping_id, 0, "RM mappings get an id the guest counts");
+        let again = e.mmap(fd);
+        assert_eq!(again.mapping_id, m.mapping_id, "one id per mapping");
+
+        e.unmap(VIDMEM, first);
+        assert!(
+            e.window.withdrawn().is_empty(),
+            "withdrawn under a live vma"
+        );
+        let (_, second) = e.map(VIDMEM);
+        assert_ne!(
+            second, first,
+            "the extent went to another mapping while mapped"
+        );
+
+        e.munmap(m.mapping_id);
+        assert!(e.window.withdrawn().is_empty(), "one vma still maps it");
+        e.munmap(again.mapping_id);
+        assert_eq!(
+            e.window.withdrawn(),
+            vec![first],
+            "released by the last MUNMAP"
+        );
+
+        e.unmap(VIDMEM, second);
+        assert_eq!(e.be.shm_free_bytes(), empty, "every extent given back once");
+        e.munmap(m.mapping_id); // a late duplicate is harmless
+        assert_eq!(e.be.shm_free_bytes(), empty);
+    }
+
+    #[test]
+    fn an_rm_mapping_nobody_still_maps_is_released_at_rm_unmap() {
+        let mut e = env();
+        let empty = e.be.shm_free_bytes();
+        let (fd, linear) = e.map(VIDMEM);
+        let m = e.mmap(fd);
+        e.munmap(m.mapping_id);
+        assert!(e.window.withdrawn().is_empty(), "RM still has it mapped");
+        e.unmap(VIDMEM, linear);
+        assert_eq!(e.window.withdrawn(), vec![linear]);
+        assert_eq!(e.be.shm_free_bytes(), empty);
+    }
+
+    #[test]
+    fn closing_the_file_of_a_mapped_rm_mapping_waits_for_its_munmap() {
+        let mut e = env();
+        let empty = e.be.shm_free_bytes();
+        let (fd, linear) = e.map(VIDMEM);
+        let m = e.mmap(fd);
+        e.be.close_handle(fd).unwrap();
+        assert!(e.window.withdrawn().is_empty());
+        let (_, other) = e.map(VIDMEM);
+        assert_ne!(other, linear);
+        e.munmap(m.mapping_id);
+        assert_eq!(e.window.withdrawn(), vec![linear]);
+        e.unmap(VIDMEM, other);
+        assert_eq!(e.be.shm_free_bytes(), empty);
+    }
+
+    #[test]
+    fn a_session_reset_releases_rm_extents_still_under_guest_mappings() {
+        let mut e = env();
+        let empty = e.be.shm_free_bytes();
+        let (fd, linear) = e.map(VIDMEM);
+        e.mmap(fd);
+        e.unmap(VIDMEM, linear);
+        e.be.session_reset("test");
+        assert_eq!(e.window.withdrawn(), vec![linear]);
+        assert_eq!(e.be.shm_free_bytes(), empty);
     }
 }

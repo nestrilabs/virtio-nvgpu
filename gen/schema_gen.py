@@ -819,6 +819,7 @@ def rs_layout(lo):
         f'alloc_scrub: {rs_ranges(lo["alloc_scrub"])}',
         f'alloc_reply_device: {lo["alloc_reply_device"]}',
         f'alloc_reply_disps: {lo["alloc_reply_disps"]}',
+        f'alloc_reply_coherency: {lo["alloc_reply_coherency"]}',
         f'dpy_dynamic_scrub: {rs_ranges(lo["dpy_dynamic_scrub"])}',
         f'set_cursor_image: {rs_target(lo["set_cursor_image"])}',
         f'move_cursor: {rs_target(lo["move_cursor"])}',

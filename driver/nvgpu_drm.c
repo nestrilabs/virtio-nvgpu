@@ -653,6 +653,8 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
 
   ng->window_off = window_off;
   ng->mapping_id = le32_to_cpu(resp->mapping_id);
+  ng->caching = resp->caching;
+  ng->read_only = ng->dev->v2 && (resp->flags & NVGPU_MMAP_F_READ_ONLY);
   smp_wmb(); /* the offset is readable before the flag says it is */
   WRITE_ONCE(ng->window_valid, true);
   ret = 0;
@@ -672,8 +674,9 @@ static phys_addr_t nvgpu_gem_phys(struct nvgpu_gem_object *ng) {
 
 /*
  * Map the object into a process, for the node's own mmap and for an importer
- * that maps the dma-buf. Write-combining, because it is device memory across a
- * PCI window and a client writing a buffer streams it.
+ * that maps the dma-buf, with the memory type the host maps it with -- for an
+ * nvidia-drm object that is write-combining (drm_gem_mmap_obj), which the
+ * placement's reply says.
  */
 static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
                                  struct vm_area_struct *vma) {
@@ -698,8 +701,19 @@ static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
   if (ret)
     return ret;
 
+  /*
+   * A read-only host object (a read-only GEM node) is refused a writable
+   * mapping and may not be made writable later, as nvidia-drm does itself
+   * (nvidia-drm-gem.c:292-299): a write through the window would stop the VM.
+   */
+  if (ng->read_only) {
+    if (vma->vm_flags & VM_WRITE)
+      return -EINVAL;
+    vm_flags_clear(vma, VM_MAYWRITE);
+  }
   vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-  vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+  vma->vm_page_prot = nvgpu_window_pgprot(ng->dev, ng->caching,
+                                          vm_get_page_prot(vma->vm_flags));
 
   return io_remap_pfn_range(vma, vma->vm_start,
                             (nvgpu_gem_phys(ng) + within) >> PAGE_SHIFT, size,
@@ -721,7 +735,31 @@ static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
   if (ret)
     return ret;
 
-  vaddr = ioremap_wc(nvgpu_gem_phys(ng), obj->size);
+  /*
+   * A kernel mapping cannot be made read-only through an iosys_map, and a
+   * kernel write into a read-only placement would stop the VM, so a
+   * read-only object has none.
+   */
+  if (ng->read_only) {
+    dev_warn_ratelimited(&ng->dev->vdev->dev,
+                         "virtio-gpu-nv: object %u is read-only on the host; "
+                         "no kernel mapping\n",
+                         ng->host_handle);
+    return -EPERM;
+  }
+
+  /* The same memory type as every other mapping of the placement. */
+  switch (ng->dev->v2 ? ng->caching : NVGPU_MMAP_CACHE_DEFAULT) {
+  case NVGPU_MMAP_CACHE_WB:
+    vaddr = ioremap_cache(nvgpu_gem_phys(ng), obj->size);
+    break;
+  case NVGPU_MMAP_CACHE_UC:
+    vaddr = ioremap(nvgpu_gem_phys(ng), obj->size);
+    break;
+  default:
+    vaddr = ioremap_wc(nvgpu_gem_phys(ng), obj->size);
+    break;
+  }
   if (!vaddr)
     return -ENOMEM;
 
