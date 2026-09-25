@@ -596,12 +596,19 @@ impl<Q: EventQueue> Pump<Q> {
         )
     }
 
-    fn unwatch(&mut self, handle: u32) -> Option<Watched> {
+    /// Stop watching `handle`, returning what it was watched for. The pump's
+    /// duplicate goes to the closer: after the queue thread's CLOSE it is
+    /// usually the file's last reference, and the last close of a card,
+    /// lease or modeset file can run a modeset, which on this thread would
+    /// stop every event of the VM (closer.rs, S-33).
+    fn unwatch(&mut self, handle: u32) -> Option<WatchMode> {
         let w = self.watches.remove(&handle)?;
         self.paused.remove(&handle);
         self.stale.remove(&handle);
         self.ctl(libc::EPOLL_CTL_DEL, w.fd.as_raw_fd(), 0, 0);
-        Some(w)
+        let mode = w.mode;
+        crate::closer::close(w.fd);
+        Some(mode)
     }
 
     /// One round: wait, apply instructions, read what is ready, sweep, fill
@@ -669,8 +676,8 @@ impl<Q: EventQueue> Pump<Q> {
             match self.rx.try_recv() {
                 Ok(PumpCmd::Watch { handle, fd, mode }) => {
                     if let Some(old) = self.unwatch(handle) {
-                        if old.mode.cookie() != mode.cookie() {
-                            self.outbox.forget(handle, old.mode.cookie());
+                        if old.cookie() != mode.cookie() {
+                            self.outbox.forget(handle, old.cookie());
                         }
                     }
                     let w = Watched {
@@ -690,7 +697,7 @@ impl<Q: EventQueue> Pump<Q> {
                     }
                 }
                 Ok(PumpCmd::Unwatch { handle }) => {
-                    let cookie = self.unwatch(handle).and_then(|w| w.mode.cookie());
+                    let cookie = self.unwatch(handle).and_then(|m| m.cookie());
                     self.outbox.forget(handle, cookie);
                 }
                 Ok(PumpCmd::SetV2(v2)) => self.outbox.set_v2(v2),
@@ -1220,6 +1227,30 @@ mod tests {
         unsafe { libc::read(pump.watches[&7].fd.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
         pump.sweep();
         assert!(pump.stale.is_empty());
+    }
+
+    /// S-33: the pump's duplicate is usually a file's last reference once
+    /// the queue thread has closed its own; it goes to the closer, and is
+    /// closed there, not on the pump thread.
+    #[test]
+    fn an_unwatched_files_duplicate_is_closed_by_the_closer() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 5,
+            fd: r,
+            mode: WatchMode::Drm,
+        });
+        pump.step_with_timeout(0);
+        h.send(PumpCmd::Unwatch { handle: 5 });
+        pump.step_with_timeout(0);
+        assert!(crate::closer::wait_idle(Duration::from_secs(5)));
+        // With the only read end closed, a write finds no reader.
+        // SAFETY: a one-byte write from a live array.
+        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        assert_eq!(n, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
     }
 
     #[test]

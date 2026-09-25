@@ -1270,7 +1270,17 @@ impl NvidiaBackend {
         self.syncobj_regs.clear();
         self.nvkms.reset();
         self.semsurf.reset();
-        self.handles.drain_all();
+        // As in close_handle: display files close on the closer thread, not
+        // under the backend mutex a reset holds (S-33).
+        let handles = self.handles.handles();
+        if !handles.is_empty() {
+            log::info!("release_all: closing {} host file(s)", handles.len());
+        }
+        for h in handles {
+            if let Ok((fd, kind)) = self.handles.remove(h) {
+                crate::closer::close_fd(fd, kind);
+            }
+        }
     }
 
     /// Withdraw a placement from the window and return its extent. Called
@@ -2081,7 +2091,9 @@ impl NvidiaBackend {
         self.nvkms.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
-        drop(fd);
+        // A display file's last close can wait on a modeset; not here, on
+        // the queue thread under the backend mutex (closer.rs, S-33).
+        crate::closer::close_fd(fd, kind);
         Ok(())
     }
 
@@ -5476,6 +5488,25 @@ mod tests {
         p[..4].copy_from_slice(&(-1i32).to_le_bytes());
         v1_ioctl(&mut be, second, 75, &p);
         assert_eq!(UVM_FD_SEEN.with(|s| s.take()), Some(-1));
+    }
+
+    /// S-33: a display file's handle-table descriptor is closed by the
+    /// closer, not by the queue thread in CLOSE.
+    #[test]
+    fn closing_a_card_handle_leaves_the_last_close_to_the_closer() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let mut be = gated_backend();
+        let mut p = [0i32; 2];
+        // SAFETY: `p` receives the two new descriptors.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: descriptors pipe2 just returned.
+        let (r, w) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+        let card = be.adopt_for_test(r, HandleKind::DrmCard(0));
+        be.close_handle(card).unwrap();
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        // SAFETY: a one-byte write from a live array.
+        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        assert_eq!(n, -1, "the read end is closed");
     }
 
     /// S-24: a control that lists the host's GPU processes never reaches
