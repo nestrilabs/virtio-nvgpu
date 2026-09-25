@@ -37,7 +37,9 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use protocol::messages::{EV_HOTPLUG_F_HOTPLUG, EV_HOTPLUG_F_LEASE};
 
@@ -140,10 +142,20 @@ const RCVBUF: libc::c_int = 1 << 20;
 const MSG_MAX: usize = 8192;
 
 /// A thread forwarding hotplug and lease uevents of our card nodes to the
-/// event pump. Stopped and joined when dropped.
+/// event pump, and running a backend check on a timer (`Tick`). Stopped and
+/// joined when dropped.
 pub struct HotplugListener {
     stop: PrivateFd,
+    alarm: Arc<LeaseAlarm>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// What the listener runs every `every`, and at once when its alarm rings:
+/// the re-check of the leases NVKMS grants rest on ("lease ends" below),
+/// which must not wait for the guest's next NVKMS call.
+pub struct Tick {
+    pub every: Duration,
+    pub run: Box<dyn Fn() + Send>,
 }
 
 impl HotplugListener {
@@ -155,6 +167,15 @@ impl HotplugListener {
         cards: Vec<CardNode>,
         sink: impl Fn(PumpCmd) + Send + 'static,
     ) -> io::Result<Self> {
+        Self::spawn_ticking(cards, sink, None)
+    }
+
+    /// `spawn`, also running `tick`.
+    pub fn spawn_ticking(
+        cards: Vec<CardNode>,
+        sink: impl Fn(PumpCmd) + Send + 'static,
+        tick: Option<Tick>,
+    ) -> io::Result<Self> {
         let sock = uevent_socket()?;
         // SAFETY: plain syscall; the result is owned below.
         let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -164,13 +185,22 @@ impl HotplugListener {
         // SAFETY: a descriptor eventfd() just returned.
         let stop = PrivateFd::new(unsafe { OwnedFd::from_raw_fd(stop) });
         let stop_rx = stop.try_clone()?;
+        let alarm = Arc::new(LeaseAlarm::new()?);
+        let alarm_rx = alarm.clone();
         let thread = std::thread::Builder::new()
             .name("nvgpu-hotplug".into())
-            .spawn(move || listen(sock, stop_rx, cards, sink))?;
+            .spawn(move || listen(sock, stop_rx, alarm_rx, tick, cards, sink))?;
         Ok(Self {
             stop,
+            alarm,
             thread: Some(thread),
         })
+    }
+
+    /// What makes the tick run now (the Wayland proxy rings it when a
+    /// connection to the host compositor hangs up).
+    pub fn alarm(&self) -> Arc<LeaseAlarm> {
+        self.alarm.clone()
     }
 }
 
@@ -282,12 +312,20 @@ fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<Recv> {
     })
 }
 
-fn listen(sock: PrivateFd, stop: PrivateFd, cards: Vec<CardNode>, sink: impl Fn(PumpCmd)) {
+fn listen(
+    sock: PrivateFd,
+    stop: PrivateFd,
+    alarm: Arc<LeaseAlarm>,
+    tick: Option<Tick>,
+    cards: Vec<CardNode>,
+    sink: impl Fn(PumpCmd),
+) {
     log::info!(
         "hotplug: listening for uevents of {} card node(s)",
         cards.len()
     );
     let mut buf = vec![0u8; MSG_MAX];
+    let mut last_tick = Instant::now();
     loop {
         let mut fds = [
             libc::pollfd {
@@ -300,9 +338,18 @@ fn listen(sock: PrivateFd, stop: PrivateFd, cards: Vec<CardNode>, sink: impl Fn(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: alarm.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: polls two pollfds this function owns.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        // Until the next tick is due (uevents arriving must not starve it).
+        let timeout = tick.as_ref().map_or(-1, |t| {
+            t.every.saturating_sub(last_tick.elapsed()).as_millis() as libc::c_int
+        });
+        // SAFETY: polls three pollfds this function owns.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
         if r < 0 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -312,6 +359,16 @@ fn listen(sock: PrivateFd, stop: PrivateFd, cards: Vec<CardNode>, sink: impl Fn(
         }
         if fds[1].revents != 0 {
             return;
+        }
+        let rung = fds[2].revents != 0;
+        if rung {
+            alarm.clear();
+        }
+        if let Some(t) = &tick
+            && (rung || last_tick.elapsed() >= t.every)
+        {
+            (t.run)();
+            last_tick = Instant::now();
         }
         loop {
             match recv(sock.as_raw_fd(), &mut buf) {
@@ -350,57 +407,153 @@ fn listen(sock: PrivateFd, stop: PrivateFd, cards: Vec<CardNode>, sink: impl Fn(
 //
 // NVKMS permissions granted through a lease (nvidia-drm GRANT_PERMISSIONS on
 // a `DrmLease` handle) are recorded by the NVKMS policy against that handle,
-// and let the guest reach per-head commands NVKMS itself does not check
-// (nvkms.rs). Closing the handle clears them; so must the lease ending while
-// the handle stays open, which the host tells nobody about directly:
+// and every head-level NVKMS call the guest makes is held to those records
+// (nvkms.rs): the unchecked cursor, LUT and attribute commands, and FLIP and
+// SET_MODE. Closing the handle clears them, and nvidia-drm's postclose takes
+// the host's grants back with it (nvidia-drm-drv.c:1588-1600). The lease can
+// also end while the handle stays open, which the host tells nobody about
+// directly, and after which nvidia-drm does not always take its grants back:
 //
 // - the lessor revoking it (DRM_IOCTL_MODE_REVOKE_LEASE, drm_lease.c:725)
-//   empties the lessee's object idr (`_drm_lease_revoke`, :300-333) and sends
-//   no uevent at all -- only a lessee's destruction does (`LEASE=1`, :293);
-// - the lessor closing its file revokes the same way (drm_auth.c
-//   drm_master_release), also silently;
-// - the lessor dropping master (a VT switch) leaves the lease in place, but
-//   every DRM_MASTER call on the lessee fails -EACCES until it comes back
-//   (drm_is_current_master_locked, drm_auth.c), and nvidia-drm's permission
-//   grants go with master.
+//   empties the lessee's object idr (`_drm_lease_revoke`, :300-333); that
+//   ioctl passes through nvidia-drm's wrapper, which revokes the grants on
+//   the revoked connectors (nvidia-drm-drv.c:1750-1774). GET_LEASE on the
+//   lessee then counts zero objects (:636-684). No uevent: only a lessee's
+//   destruction sends one (`LEASE=1`, :293);
+// - the lessor closing its file (the host compositor exiting) revokes the
+//   same way, from drm_master_release (drm_auth.c:351-357), which is *not*
+//   an ioctl and bypasses that wrapper: the grants stay on the lessee's
+//   file. nvidia-drm's master_drop, which runs too, revokes only the
+//   dropping file's own grants (nvidia-drm-drv.c:1038-1043). And since the
+//   lessor is no longer master, GET_LEASE (a DRM_MASTER ioctl,
+//   drm_ioctl.c:746) on the lessee answers -EACCES;
+// - the lessor dropping master (a VT switch) leaves the lease in place and
+//   the lessee's grants with it; GET_LEASE answers -EACCES until master
+//   comes back.
 //
-// All three show on the lessee's own file: DRM_IOCTL_MODE_GET_LEASE (a
-// DRM_MASTER ioctl, drm_ioctl.c:746) answers -EACCES in the last case and
-// counts zero objects in the others (:636-684). A lease holding nothing is
-// one nvidia-drm grants nothing through, however it got that way: the
-// grant finds the dpy's connector only if the lease holds it
-// (nvidia-drm-drv.c:1288-1294). So the backend asks, at the three moments it
-// can:
+// So the host's NVKMS may go on honouring a grant whose lease is gone, and
+// when the lessee's file finally closes, its postclose disables the
+// granted connectors (nvidia-drm-drv.c:1497-1523) -- which by then a
+// restarted host compositor may have taken back. The backend therefore asks
+// (`lease_state`) and acts on the answer:
+//
+// - zero objects, from GET_LEASE, or from GETRESOURCES when GET_LEASE says
+//   -EACCES (a lessee's GETRESOURCES lists only what its lease holds,
+//   drm_mode_config.c:131-172 through drm_lease_held, and needs no master):
+//   the lease is gone for good (a lease cannot be refilled). If a grant was
+//   ever made through the handle, the backend closes its host file at once,
+//   so postclose runs now rather than after the next compositor starts, and
+//   leaves the handle behind as a stub that answers ENODEV until the guest
+//   closes it (`HandleTable::bury`). Not in `--kms-card`: there the guest is
+//   the lessor, the connectors are its own, and a revoked lessee keeps the
+//   native behaviour of an open file with an empty lease. A host mapping
+//   of the file (a dumb buffer mapped through it) holds the file too, and
+//   postclose then waits for the guest to unmap it;
+// - -EACCES with objects still listed: the lessor dropped master. The
+//   records go (a gate, over-clearing: the guest must grant again), the
+//   file stays, and the handle stays on the list asked about, in case the
+//   lease ends for good later;
+// - objects: nothing to do.
+//
+// It asks at four moments:
 //
 // 1. before every NVKMS call, for the handles that granted something still
-//    recorded -- the only moment the records matter, which closes the gap
-//    for all three cases;
+//    recorded or whose lease ended after they had -- the only moment the
+//    records matter to the guest;
 // 2. after a REVOKE_LEASE that a guest ran through one of our card handles
 //    (compositor-VM mode: the guest is the lessor);
-// 3. on a `LEASE=1` uevent for a card (a lessee went away).
+// 3. on a `LEASE=1` uevent for a card (a lessee went away), and on the
+//    hotplug listener's timer (`Tick`, once a second), so a lease that ended
+//    is closed even while the guest makes no NVKMS call;
+// 4. when a connection to the host compositor hangs up (`LeaseAlarm`, rung
+//    by the Wayland proxy): the compositor is the usual lessor, and its exit
+//    is the case nvidia-drm does not follow. The alarm can win the race with
+//    the compositor's DRM file being released; the timer catches it then.
 //
 // What cannot be seen this way: a connector being unplugged (NVKMS drops the
 // dpy's permissions, the lease keeps its objects) -- harmless, as NVKMS then
 // refuses the head itself -- and a lease that ends and is re-granted between
-// two NVKMS calls (the records are then of the old grant, which the host has
-// re-issued anyway). A transient master drop is taken for an end: the guest
-// must grant again, which over-clears rather than under.
+// two checks (the records are then of the old grant, which the host has
+// re-issued anyway).
 
 /// `DRM_IOCTL_MODE_GET_LEASE`: `_IOWR('d', 0xC8, struct drm_mode_get_lease)`,
 /// `{ u32 count_objects; u32 pad; u64 objects_ptr; }`.
 pub const DRM_IOCTL_MODE_GET_LEASE: u32 = 0xc010_64c8;
 
-/// Whether the lessee file `fd` still holds any object: `Ok(false)` once its
-/// lease was revoked or its lessor is no longer master, `Err` when the call
-/// could not say (a descriptor that is no DRM file, say).
-pub fn lease_holds_objects(sys: &dyn xfer::Sys, fd: RawFd) -> Result<bool, xfer::Errno> {
-    // count_objects 0: count only, nothing is written through objects_ptr.
+/// `DRM_IOCTL_MODE_GETRESOURCES`: `_IOWR('d', 0xA0, struct drm_mode_card_res)`,
+/// four u64 id-list pointers, then `count_fbs, count_crtcs,
+/// count_connectors, count_encoders` and the four size limits (64 bytes).
+pub const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xc040_64a0;
+
+/// What a lessee's file says about its lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseState {
+    /// It holds objects, and its lessor is master.
+    Holds,
+    /// It holds nothing: revoked, or its lessor closed. For good.
+    Empty,
+    /// Its lessor is not master (a VT switch), and it still holds objects.
+    NotMaster,
+}
+
+/// Ask the lessee file `fd` about its lease: `Err` when the calls could not
+/// say (a descriptor that is no DRM file, say). Both calls are counts only;
+/// nothing is written through a pointer.
+pub fn lease_state(sys: &dyn xfer::Sys, fd: RawFd) -> Result<LeaseState, xfer::Errno> {
     let mut arg = [0u8; 16];
     let r = sys.ioctl(fd, DRM_IOCTL_MODE_GET_LEASE, arg.as_mut_ptr());
+    let count = |a: &[u8], off: usize| u32::from_le_bytes(a[off..off + 4].try_into().unwrap());
     match r {
-        0.. => Ok(u32::from_le_bytes(arg[..4].try_into().unwrap()) != 0),
-        _ if -r == libc::EACCES => Ok(false),
-        _ => Err(-r),
+        0.. if count(&arg, 0) != 0 => return Ok(LeaseState::Holds),
+        0.. => return Ok(LeaseState::Empty),
+        _ if -r == libc::EACCES => {}
+        _ => return Err(-r),
+    }
+    let mut res = [0u8; 64];
+    let r = sys.ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, res.as_mut_ptr());
+    if r < 0 {
+        return Err(-r);
+    }
+    // count_crtcs and count_connectors: a lease holds at least one of each
+    // (drm_lease.c validate_lease) until it is emptied.
+    Ok(if count(&res, 36) == 0 && count(&res, 40) == 0 {
+        LeaseState::Empty
+    } else {
+        LeaseState::NotMaster
+    })
+}
+
+/// Rung from any thread for the hotplug listener to run its tick now rather
+/// than at the next second.
+pub struct LeaseAlarm(PrivateFd);
+
+impl LeaseAlarm {
+    fn new() -> io::Result<Self> {
+        Ok(Self(PrivateFd::new(crate::hostfd::new_eventfd()?)))
+    }
+
+    pub fn ring(&self) {
+        let one: u64 = 1;
+        // SAFETY: writes 8 bytes from a local to an eventfd this owns.
+        unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            )
+        };
+    }
+
+    fn clear(&self) {
+        let mut v: u64 = 0;
+        // SAFETY: reads 8 bytes into a local from a non-blocking eventfd.
+        unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                &mut v as *mut u64 as *mut libc::c_void,
+                8,
+            )
+        };
     }
 }
 
@@ -411,9 +564,9 @@ impl NvidiaBackend {
         self.host_nodes().cards.clone()
     }
 
-    /// Ask every `DrmLease` handle (of card `card`, or of any) whether its
-    /// lease still holds objects, and end the NVKMS grants of each that no
-    /// longer does. Returns those handles.
+    /// Ask every `DrmLease` handle (of card `card`, or of any) about its
+    /// lease, and end the NVKMS grants of each that no longer holds one.
+    /// Returns those handles.
     pub fn check_leases(&mut self, card: Option<u32>) -> Vec<u32> {
         let leases: Vec<u32> = self
             .handles
@@ -427,19 +580,22 @@ impl NvidiaBackend {
         self.end_dead_leases(&leases)
     }
 
-    /// Before an NVKMS call: the leases that granted something the NVKMS
-    /// policy still records, re-checked, so no per-head gate is opened by a
-    /// grant the host has since taken back.
-    pub(crate) fn recheck_granting_leases(&mut self) {
+    /// The leases that granted something the NVKMS policy still records, or
+    /// whose lease ended after they had, re-checked: before an NVKMS call,
+    /// so no per-head gate is opened by a grant the host has since taken
+    /// back, and on the hotplug listener's tick, so a file whose lease is
+    /// gone does not outlive it. Returns the handles whose lease ended.
+    pub fn recheck_granting_leases(&mut self) -> Vec<u32> {
         let granting: Vec<u32> = self
             .nvkms
             .granting_handles()
             .into_iter()
             .filter(|&h| matches!(self.handles.kind(h), Some(HandleKind::DrmLease(_))))
             .collect();
-        if !granting.is_empty() {
-            self.end_dead_leases(&granting);
+        if granting.is_empty() {
+            return granting;
         }
+        self.end_dead_leases(&granting)
     }
 
     fn end_dead_leases(&mut self, leases: &[u32]) -> Vec<u32> {
@@ -448,12 +604,21 @@ impl NvidiaBackend {
             let Ok(fd) = self.handles.get_raw(h) else {
                 continue;
             };
-            match lease_holds_objects(&*self.xfer_sys, fd) {
-                Ok(true) => {}
-                Ok(false) => {
+            match lease_state(&*self.xfer_sys, fd) {
+                Ok(LeaseState::Holds) => {}
+                Ok(LeaseState::Empty) if !self.config.kms_card && self.nvkms.granted_through(h) => {
                     log::info!(
-                        "lease handle {h} holds nothing any more (revoked, or its lessor \
-                         dropped master); ending the NVKMS grants made through it"
+                        "lease handle {h} holds nothing any more (revoked, or its lessor closed); \
+                         closing its host file so nvidia-drm takes back what was granted \
+                         through it now, and ending those grants here"
+                    );
+                    self.bury_lease(h);
+                    ended.push(h);
+                }
+                Ok(state) => {
+                    log::info!(
+                        "lease handle {h}: {state:?} (revoked, or its lessor closed or dropped \
+                         master); ending the NVKMS grants made through it"
                     );
                     self.nvkms.lease_ended(h);
                     ended.push(h);
@@ -462,6 +627,31 @@ impl NvidiaBackend {
             }
         }
         ended
+    }
+
+    /// Close lease handle `h`'s host file, keeping the handle as a stub the
+    /// guest can still close (and that answers ENODEV until it does). The
+    /// pump's duplicate goes with the watch; an executor call still running
+    /// on it holds the file until it returns.
+    fn bury_lease(&mut self, h: u32) {
+        self.nvkms.lease_ended(h);
+        let stub = match crate::hostfd::new_eventfd() {
+            Ok(fd) => fd,
+            Err(e) => {
+                log::warn!("lease handle {h}: no stub descriptor ({e}); its file stays open");
+                return;
+            }
+        };
+        match self.handles.bury(h, stub) {
+            Ok(old) => drop(old),
+            Err(e) => {
+                log::warn!("lease handle {h}: {e}");
+                return;
+            }
+        }
+        self.kms_states.remove(&h);
+        self.nvkms.forget_handle(h);
+        self.pump_cmds.push(PumpCmd::Unwatch { handle: h });
     }
 }
 
@@ -716,21 +906,36 @@ mod tests {
         assert_eq!(got, Recv::Foreign);
     }
 
-    /// GET_LEASE as the kernel answers a lessee: a count, or -EACCES.
-    struct LeaseSys(Result<u32, i32>);
+    /// A lessee's file as the kernel answers it: GET_LEASE a count or an
+    /// errno, GETRESOURCES (which needs no master) the (crtcs, connectors)
+    /// its lease still holds.
+    struct LeaseSys(Result<u32, i32>, (u32, u32));
 
     impl xfer::Sys for LeaseSys {
         fn ioctl(&self, _: RawFd, cmd: u32, arg: *mut u8) -> i32 {
-            assert_eq!(cmd, DRM_IOCTL_MODE_GET_LEASE);
-            // SAFETY: lease_holds_objects passes its 16-byte argument.
-            let a = unsafe { std::slice::from_raw_parts_mut(arg, 16) };
-            assert!(a.iter().all(|&b| b == 0), "count only: no ids pointer");
-            match self.0 {
-                Ok(n) => {
-                    a[..4].copy_from_slice(&n.to_le_bytes());
+            match cmd {
+                DRM_IOCTL_MODE_GET_LEASE => {
+                    // SAFETY: lease_state passes its 16-byte argument.
+                    let a = unsafe { std::slice::from_raw_parts_mut(arg, 16) };
+                    assert!(a.iter().all(|&b| b == 0), "count only: no ids pointer");
+                    match self.0 {
+                        Ok(n) => {
+                            a[..4].copy_from_slice(&n.to_le_bytes());
+                            0
+                        }
+                        Err(e) => -e,
+                    }
+                }
+                DRM_IOCTL_MODE_GETRESOURCES => {
+                    // SAFETY: lease_state passes its 64-byte argument.
+                    let a = unsafe { std::slice::from_raw_parts_mut(arg, 64) };
+                    assert!(a.iter().all(|&b| b == 0), "counts only: no id lists");
+                    a[36..40].copy_from_slice(&self.1.0.to_le_bytes());
+                    a[40..44].copy_from_slice(&self.1.1.to_le_bytes());
+                    a[44..48].copy_from_slice(&4u32.to_le_bytes()); // encoders: all
                     0
                 }
-                Err(e) => -e,
+                _ => panic!("unexpected ioctl {cmd:#x}"),
             }
         }
         fn close(&self, _: RawFd) {}
@@ -740,17 +945,53 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_holds_objects_until_it_is_revoked_or_its_lessor_loses_master() {
-        assert_eq!(lease_holds_objects(&LeaseSys(Ok(3)), 0), Ok(true));
-        assert_eq!(lease_holds_objects(&LeaseSys(Ok(0)), 0), Ok(false));
-        assert_eq!(
-            lease_holds_objects(&LeaseSys(Err(libc::EACCES)), 0),
-            Ok(false)
-        );
+    fn a_lease_is_empty_once_revoked_or_its_lessor_closed_and_only_gated_while_master_is_away() {
+        let state = |lease, res| lease_state(&LeaseSys(lease, res), 0);
+        assert_eq!(state(Ok(3), (0, 0)), Ok(LeaseState::Holds));
+        // Revoked with the lessor still master.
+        assert_eq!(state(Ok(0), (1, 1)), Ok(LeaseState::Empty));
+        // The lessor closed: no master, and the lease emptied with it.
+        assert_eq!(state(Err(libc::EACCES), (0, 0)), Ok(LeaseState::Empty));
+        // The lessor dropped master: the lease still holds its objects.
+        assert_eq!(state(Err(libc::EACCES), (1, 1)), Ok(LeaseState::NotMaster));
         // Not a DRM file, or not a lease: no answer, and no grant ended on it.
-        assert_eq!(
-            lease_holds_objects(&LeaseSys(Err(libc::ENOTTY)), 0),
-            Err(libc::ENOTTY)
-        );
+        assert_eq!(state(Err(libc::ENOTTY), (0, 0)), Err(libc::ENOTTY));
+    }
+
+    /// The tick runs on its timer and at once when the alarm rings, and the
+    /// alarm's descriptor is the backend's own.
+    #[test]
+    fn the_listener_ticks_on_its_timer_and_when_its_alarm_rings() {
+        let (tx, rx) = mpsc::channel();
+        let tick = Tick {
+            every: Duration::from_millis(50),
+            run: Box::new(move || {
+                let _ = tx.send(Instant::now());
+            }),
+        };
+        let l = match HotplugListener::spawn_ticking(vec![card("card1", 1)], |_| {}, Some(tick)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: no uevent netlink socket here ({e})");
+                return;
+            }
+        };
+        assert!(crate::privfd::is_private(l.alarm().0.as_raw_fd()));
+        let timeout = Duration::from_secs(5);
+        rx.recv_timeout(timeout).expect("a tick on the timer");
+        rx.recv_timeout(timeout).expect("and another");
+        // A slow timer, rung: the tick comes long before the timer would.
+        drop(l);
+        let (tx, rx) = mpsc::channel();
+        let tick = Tick {
+            every: Duration::from_secs(3600),
+            run: Box::new(move || {
+                let _ = tx.send(());
+            }),
+        };
+        let l = HotplugListener::spawn_ticking(vec![card("card1", 1)], |_| {}, Some(tick)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        l.alarm().ring();
+        rx.recv_timeout(timeout).expect("a tick on the alarm");
     }
 }

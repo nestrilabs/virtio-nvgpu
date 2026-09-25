@@ -30,6 +30,7 @@ use protocol::messages::*;
 
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
+use crate::kms::LeaseAlarm;
 use crate::nvidia::NvidiaBackend;
 use crate::pump::{PumpCmd, WatchMode};
 use crate::session::{Reply, hdr};
@@ -63,6 +64,8 @@ pub struct WlState {
     /// How descriptors are classified. The host's own classification over the
     /// card list, made on first use; tests put a fake here.
     host: Option<Arc<dyn HostFds>>,
+    /// Rung when a compositor connection hangs up (`HostFds`).
+    lease_alarm: Option<Arc<LeaseAlarm>>,
 }
 
 impl WlState {
@@ -79,11 +82,18 @@ impl WlState {
 /// thread asks of every DRM file and dma-buf the compositor sends.
 struct CardClassifier {
     cards: Vec<CardNode>,
+    alarm: Option<Arc<LeaseAlarm>>,
 }
 
 impl HostFds for CardClassifier {
     fn classify(&self, fd: BorrowedFd<'_>) -> HandleKind {
         hostfd::classify(fd, &self.cards)
+    }
+
+    fn compositor_hung_up(&self) {
+        if let Some(a) = &self.alarm {
+            a.ring();
+        }
     }
 }
 
@@ -212,12 +222,20 @@ impl NvidiaBackend {
         matches!(self.wl.chans.get(&h), Some(Chan::Conn(c)) if !c.is_closed())
     }
 
+    /// What a compositor connection that hangs up rings: the hotplug
+    /// listener's, so the leases the compositor granted are asked about at
+    /// once (kms.rs, "lease ends"). Set before the first connection.
+    pub fn set_lease_alarm(&mut self, alarm: Arc<LeaseAlarm>) {
+        self.wl.lease_alarm = Some(alarm);
+    }
+
     fn wl_host(&mut self) -> Arc<dyn HostFds> {
         if let Some(h) = &self.wl.host {
             return h.clone();
         }
         let cards = self.host_nodes().cards.clone();
-        let h: Arc<dyn HostFds> = Arc::new(CardClassifier { cards });
+        let alarm = self.wl.lease_alarm.clone();
+        let h: Arc<dyn HostFds> = Arc::new(CardClassifier { cards, alarm });
         self.wl.host = Some(h.clone());
         h
     }

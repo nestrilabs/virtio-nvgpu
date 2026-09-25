@@ -187,6 +187,11 @@ struct State {
     /// ALLOC_DEVICE replies: (modeset handle, deviceHandle) -> dispHandles.
     disps: HashMap<(u32, u32), [u32; MAX_DISPS]>,
     perms: HashMap<(u32, u32), Perms>,
+    /// KMS handles whose lease ended with the handle still open, after
+    /// something was granted through them: the host may still hold those
+    /// grants, so the backend keeps asking (kms.rs, "lease ends") until the
+    /// handle goes.
+    ended: HashSet<u32>,
     /// A cleared `awaken` was logged (once per session; the rest at debug).
     awaken_logged: bool,
 }
@@ -325,25 +330,41 @@ impl NvkmsPolicy {
         st.disps.retain(|&(m, _), _| m != h);
         st.perms.retain(|&(m, _), _| m != h);
         st.revoke_all_through(h);
+        st.ended.remove(&h);
         if st.nvkms_granters.remove(&h) {
             st.forget_nvkms_grants();
         }
     }
 
     /// A lease or card handle stopped holding what it held (the lessor
-    /// revoked the lease, the master dropped): its grants go as if it had
-    /// closed. The backend calls it when GET_LEASE on the handle says so
-    /// (kms.rs, "lease ends"); CLOSE does it anyway.
+    /// revoked the lease, closed, or dropped master): its grants go as if
+    /// it had closed, though the host's may not have (kms.rs, "lease
+    /// ends"), and a handle that had granted something stays on the list
+    /// the backend keeps asking about. CLOSE forgets it anyway.
     pub fn lease_ended(&self, kms: u32) {
-        self.lock().revoke_all_through(kms);
+        let mut st = self.lock();
+        if st.granted_through(kms) {
+            st.ended.insert(kms);
+        }
+        st.revoke_all_through(kms);
+    }
+
+    /// Whether nvidia-drm GRANT_PERMISSIONS ever succeeded through KMS
+    /// handle `kms` (and the handle has not closed since): whether its file
+    /// may be the one a host connector's grant belongs to, which its close
+    /// then disables (nvidia-drm-drv.c:1497-1523).
+    pub fn granted_through(&self, kms: u32) -> bool {
+        self.lock().granted_through(kms)
     }
 
     /// KMS handles that granted something still recorded (nvidia-drm
-    /// GRANT_PERMISSIONS): whose leases the backend re-checks before an
-    /// NVKMS call relies on them (kms.rs, "lease ends").
+    /// GRANT_PERMISSIONS), or whose lease ended after they had: whose leases
+    /// the backend re-checks before an NVKMS call relies on them and on a
+    /// timer (kms.rs, "lease ends").
     pub fn granting_handles(&self) -> Vec<u32> {
         let st = self.lock();
         let mut v: Vec<u32> = st.drm_grants.keys().copied().collect();
+        v.extend(st.ended.iter().copied());
         for s in st.grant_fds.values() {
             if let Source::Drm { kms, .. } = *s {
                 v.push(kms);
@@ -919,6 +940,15 @@ impl State {
             }
         }
         self.grant_fds.retain(|_, s| *s != Source::Drm { kms, dpy });
+    }
+
+    fn granted_through(&self, kms: u32) -> bool {
+        self.drm_grants.contains_key(&kms)
+            || self.ended.contains(&kms)
+            || self
+                .grant_fds
+                .values()
+                .any(|s| matches!(s, Source::Drm { kms: k, .. } if *k == kms))
     }
 
     fn revoke_all_through(&mut self, kms: u32) {
@@ -1669,6 +1699,29 @@ mod tests {
             p.set_kms_card(true);
             assert_eq!(ok(&[(0, 0, DPY << 1)], true), Ok(()), "{v}");
         }
+    }
+
+    /// The host may still hold a grant whose lease ended (kms.rs, "lease
+    /// ends"), so the handle it went through stays on the list the backend
+    /// asks about, until it closes; one that granted nothing never joins.
+    #[test]
+    fn a_handle_whose_lease_ended_after_granting_is_asked_about_until_it_closes() {
+        let v = v610();
+        let p = granted(v);
+        assert_eq!(p.granting_handles(), vec![KMS]);
+        assert!(p.granted_through(KMS));
+        p.lease_ended(KMS);
+        assert_eq!(p.granting_handles(), vec![KMS]);
+        assert!(p.granted_through(KMS));
+        p.lease_ended(KMS);
+        assert_eq!(p.granting_handles(), vec![KMS], "asked again, still there");
+        p.forget_handle(KMS);
+        assert!(p.granting_handles().is_empty());
+        assert!(!p.granted_through(KMS));
+
+        p.lease_ended(KMS + 1);
+        assert!(p.granting_handles().is_empty());
+        assert!(!p.granted_through(KMS + 1));
     }
 
     #[test]
