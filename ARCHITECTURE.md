@@ -173,6 +173,28 @@ And anything that fails to give space back fails *later*, in whatever mapping
 happens to be next, which is why the accounting is explicit rather than
 implicit.
 
+Memory travels one way only: GPU memory, and system memory RM allocates, into
+the guest. **Memory the guest already has cannot be handed to the GPU.** RM
+registers existing memory by CPU address — an NV01_MEMORY_SYSTEM_OS_DESCRIPTOR
+object (through RM_ALLOC or ALLOC_MEMORY) or VID_HEAP_CONTROL's
+ALLOC_OS_DESCRIPTOR — and pins whatever that address maps in the calling
+process. The calling process is the backend, so a guest address would name the
+VMM's memory, and the GPU would read and write it. The backend refuses all three
+(EPERM). That is how `cuMemHostRegister`/`cudaHostRegister` and Vulkan's
+`VK_EXT_external_memory_host` import memory, so both are unsupported; allocate
+the memory through the driver instead (`cuMemHostAlloc`, a host-visible Vulkan
+allocation), which travels the other way and works.
+
+It could be supported. The guest driver would pin the caller's range and send
+its guest-physical page list instead of an address; the backend would check
+every page lies in guest RAM, turn each into its own address through the
+vhost-user memory table it already holds (guest RAM is mapped into the backend
+for the virtqueues), and hand RM an address it owns: directly when the pages
+are contiguous in that mapping, otherwise after mapping them contiguously into
+a reserved range of its own from the memory-region fds. RM then pins the VMM's
+view of exactly the guest's pages. The guest must keep them pinned, and out of
+ballooning and migration, until the RM object is freed.
+
 ---
 
 ## 6. How a buffer becomes shareable

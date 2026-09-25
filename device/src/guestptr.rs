@@ -27,6 +27,18 @@
 //!   HW_ALLOC's two opaque pointers are zeroed and restored. Classes whose
 //!   allocation parameters hold pointers RM follows or calls are refused; see
 //!   [`REFUSED_ALLOC_CLASSES`].
+//! - **Memory named by CPU address** (`rm_escape`, the same gate):
+//!   NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x71) through RM_ALLOC and
+//!   ALLOC_MEMORY (escape.c:407-408, RmAllocOsDescriptor), and
+//!   VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR (escape.c:544-545,
+//!   RmCreateOsDescriptor), hand RM an address for it to pin with
+//!   `os_lock_user_pages` (escape.c:134-203) and map for the GPU -- or, as an
+//!   OS_FILE_HANDLE descriptor, a dma-buf by descriptor number
+//!   (osmemdesc.c:1017-1060). In the backend both name the VMM's memory and
+//!   files, so the GPU would read and write whatever the backend has there.
+//!   Refused with EPERM. This is how cuMemHostRegister and
+//!   VK_EXT_external_memory_host register existing memory, which is therefore
+//!   unsupported; ARCHITECTURE.md §5 sketches how it could be done.
 //! - **RM controls** (`scrub_control`): RM follows pointers inside a
 //!   control's parameters for the commands in [`CONTROL_POINTERS`], and only
 //!   those (embedded_param_copy.c, rmapi_deprecated_control.c, and the
@@ -124,10 +136,17 @@ const NVOS32_FUNCTION_ALLOC_SIZE: u32 = 2;
 const NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT: u32 = 6;
 const NVOS32_FUNCTION_ALLOC_SIZE_RANGE: u32 = 14;
 const NVOS32_FUNCTION_HW_ALLOC: u32 = 19;
+const NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
+
+/// NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: memory the caller already has, named by
+/// CPU address.
+pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
 
 /// Classes no guest may have the backend allocate, because their parameters
 /// hand RM something the backend cannot vouch for as a pointer or address:
 ///
+/// - 0x71 NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: a CPU address to pin, or a
+///   dma-buf descriptor by number (os_desc_mem.c:146, osmemdesc.c:1037).
 /// - 0x78, 0x7e NV01_EVENT_KERNEL_CALLBACK(_EX): `data` is a kernel function
 ///   pointer (os.c:1568-1589). RM refuses a non-kernel caller
 ///   (event_api.c:75-88); refused here too, so that stays true whatever the
@@ -139,10 +158,11 @@ const NVOS32_FUNCTION_HW_ALLOC: u32 = 19;
 /// - 0xc1 NV_FB_SEGMENT: page arrays and CPU addresses (cl00c1.h:50-58).
 /// - 0x0092 NV0092_RG_LINE_CALLBACK, 0x9010 NV9010_VBLANK_CALLBACK: kernel
 ///   function pointers (cl0092.h:68, cl9010.h:39); kernel-privileged in RM.
-pub const REFUSED_ALLOC_CLASSES: [u32; 8] = [0x78, 0x7e, 0x81, 0x82, 0x83, 0xc1, 0x0092, 0x9010];
+pub const REFUSED_ALLOC_CLASSES: [u32; 9] =
+    [0x71, 0x78, 0x7e, 0x81, 0x82, 0x83, 0xc1, 0x0092, 0x9010];
 
 /// ALLOC_MEMORY classes whose `pMemory` RM reads rather than writes.
-const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 3] = [0x81, 0x82, 0x83];
+const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 4] = [0x71, 0x81, 0x82, 0x83];
 
 /// Check a v1 RM escape's top-level block, `params` (the backend's own copy,
 /// the bytes the host will read), and rewrite what must not reach the host.
@@ -219,6 +239,10 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
         NV_ESC_RM_VID_HEAP_CONTROL => {
             sized(OS32_SIZE)?;
             match rd32(params, OS32_FUNCTION).unwrap_or(0) {
+                NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR => {
+                    log::warn!("VID_HEAP_CONTROL ALLOC_OS_DESCRIPTOR refused (guestptr.rs)");
+                    return Err(libc::EPERM);
+                }
                 NVOS32_FUNCTION_ALLOC_SIZE | NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT => {
                     take(params, OS32_ALLOC_ADDRESS);
                 }
@@ -530,7 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn a_page_list_read_through_a_pointer_is_refused() {
+    fn os_descriptor_memory_is_refused_on_every_path() {
+        let mut p = vec![0u8; 56];
+        put32(&mut p, OS02_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+        put64(&mut p, OS02_MEMORY, 0x7f00_0000_0000);
+        assert_eq!(rm_escape(ALLOC_MEMORY, &mut p), Err(libc::EPERM));
+
+        let mut p = vec![0u8; 184];
+        put32(&mut p, OS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
+        assert_eq!(rm_escape(VID_HEAP, &mut p), Err(libc::EPERM));
+
         for class in 0x81..=0x83 {
             let mut p = vec![0u8; 56];
             put32(&mut p, OS02_CLASS, class);
@@ -1025,6 +1058,39 @@ mod backend_tests {
         let (st, _) = v1(&mut be, h, GEM_IMPORT, &p, &[], None);
         assert_eq!(st, -libc::EINVAL);
         assert!(seen().is_empty());
+    }
+
+    #[test]
+    fn memory_named_by_cpu_address_never_reaches_rm() {
+        let (mut be, h) = ctl();
+        // RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, parameters and all.
+        let mut os64 = vec![0u8; 48];
+        os64[12..16].copy_from_slice(&NV01_MEMORY_SYSTEM_OS_DESCRIPTOR.to_le_bytes());
+        os64[16..24].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        os64[32..36].copy_from_slice(&64u32.to_le_bytes());
+        let mut desc = vec![0u8; 64];
+        desc[24..32].copy_from_slice(&GUEST_PTR2.to_le_bytes());
+        assert_eq!(v1(&mut be, h, ALLOC, &os64, &desc, None).0, -libc::EPERM);
+
+        // NVOS02 ALLOC_MEMORY of the same class.
+        let alloc_memory = ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC_MEMORY, 56);
+        let mut os02 = vec![0u8; 56];
+        os02[12..16].copy_from_slice(&NV01_MEMORY_SYSTEM_OS_DESCRIPTOR.to_le_bytes());
+        os02[24..32].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        os02[48..52].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(
+            v1(&mut be, h, alloc_memory, &os02, &[], None).0,
+            -libc::EPERM
+        );
+
+        // VID_HEAP_CONTROL ALLOC_OS_DESCRIPTOR.
+        let vid_heap = ioc(IOC_RW, b'F', NV_ESC_RM_VID_HEAP_CONTROL, 184);
+        let mut os32 = vec![0u8; 184];
+        os32[8..12].copy_from_slice(&NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR.to_le_bytes());
+        os32[64..72].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        assert_eq!(v1(&mut be, h, vid_heap, &os32, &[], None).0, -libc::EPERM);
+
+        assert!(seen().is_empty(), "none of them reached the host");
     }
 
     #[test]

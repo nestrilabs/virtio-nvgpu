@@ -320,6 +320,10 @@ Today the backend does that itself, inside the VMM's process.
 **Out of scope**
 
 - `cudaMallocManaged()` / full unified virtual memory
+- registering memory the guest already has with the GPU: `cuMemHostRegister`
+  and `VK_EXT_external_memory_host` (RM's OS-descriptor memory, which RM pins by
+  CPU address and would pin the VMM's memory here; refused — ARCHITECTURE.md §5
+  sketches how it could be supported)
 - **scanout.** No physical display output: there is no monitor on a streaming
   box, and the frame leaves as video rather than as pixels on a wire
 - MIG, SR-IOV
