@@ -114,11 +114,12 @@ impl HostFds for CardClassifier {
 /// End connections without holding anyone up.
 ///
 /// Dropping a `WlConn` joins its reader thread, and that thread can be inside
-/// a lease-device probe (up to a couple of seconds on a compositor that does
-/// not answer, `probe.rs`) holding the connection's lock, which `Drop` needs
-/// too. The callers hold the backend mutex, and every guest request waits
-/// behind it, so the join happens on a thread of its own. The compositor
-/// still learns at once: `Drop` shuts the socket down before it joins.
+/// a lease-device probe, or waiting for another connection's (up to a couple
+/// of seconds on a compositor that does not answer, `probe.rs`). It holds no
+/// lock of ours while it does, but it cannot notice the stop until it is out.
+/// The callers hold the backend mutex, and every guest request waits behind
+/// it, so the join happens on a thread of its own. The compositor still
+/// learns at once: `Drop` shuts the socket down before it joins.
 fn drop_detached(conns: Vec<WlConn>) {
     if conns.is_empty() {
         return;

@@ -18,6 +18,7 @@ use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
 use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
+use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;
 
 pub(super) fn tmpdir(tag: &str) -> PathBuf {
@@ -680,4 +681,100 @@ fn a_connection_that_hangs_up_gives_its_shm_back_before_the_guest_closes_it() {
     drop(server);
     until("the hangup", || g.conn.is_closed());
     assert_eq!(cfg.limits.shm.used(), (0, 0));
+}
+
+fn global(name: u32, iface: &str, version: u32) -> Vec<u8> {
+    MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(name)
+        .string(Some(iface))
+        .uint(version)
+        .finish()
+}
+
+#[test]
+fn a_lease_probe_that_times_out_is_not_remembered_and_is_asked_again_after_the_backoff() {
+    let dir = tmpdir("probe-retry");
+    let sock = dir.join("wl");
+    // Takes the connection (into its backlog) and never answers: a
+    // compositor busy in a modeset.
+    let silent = UnixListener::bind(&sock).unwrap();
+    let cache = LeaseCache::with_backoff(Duration::from_millis(300));
+    cache.resolve(&sock, &FakeHost, &[40]);
+    assert_eq!(cache.lookup(40), None, "a timeout is not an answer");
+    // Within the backoff nobody waits on the compositor again.
+    let t = Instant::now();
+    cache.resolve(&sock, &FakeHost, &[40]);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    // The compositor answers now; after the backoff, so does the cache.
+    drop(silent);
+    std::fs::remove_file(&sock).unwrap();
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(cache.is_ours(&sock, &FakeHost, 40));
+    assert_eq!(cache.lookup(40), Some(true));
+}
+
+#[test]
+fn a_lease_probe_in_progress_does_not_hold_up_wl_send_or_wl_recv() {
+    let dir = tmpdir("probe-stall");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (mut server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    // A lease device: the reader probes on a connection of its own, which
+    // this compositor takes and never answers.
+    server
+        .write_all(&global(40, "wp_drm_lease_device_v1", 1))
+        .unwrap();
+    let (_probe, _) = l.accept().unwrap();
+    // The probe waits a second for its answer; the queue thread must not.
+    let t = Instant::now();
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(3)
+            .finish()],
+        vec![],
+    );
+    g.conn.recv(1 << 20, 256, &mut g.ops).unwrap();
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "WL_SEND and WL_RECV waited {:?} on the probe",
+        t.elapsed()
+    );
+    // Unanswered, the device stays hidden from this connection, which goes on.
+    server.write_all(&global(1, "wl_compositor", 6)).unwrap();
+    let (b, _) = g.recv_until(|b, _| !global_names(b).is_empty());
+    assert_eq!(global_names(&b), vec!["wl_compositor"]);
+    assert_eq!(cfg.lease_cache.lookup(40), None);
+}
+
+#[test]
+fn the_reader_finds_lease_device_globals_only_in_whole_messages() {
+    let mut b = [
+        global(1, "wl_compositor", 6),
+        global(40, "wp_drm_lease_device_v1", 1),
+        global(41, "wp_drm_lease_device_v1", 1),
+    ]
+    .concat();
+    assert_eq!(super::probe::lease_globals(&b), vec![40, 41]);
+    // The last one cut short is left for the next read, as the engine leaves it.
+    b.truncate(b.len() - 4);
+    assert_eq!(super::probe::lease_globals(&b), vec![40]);
 }

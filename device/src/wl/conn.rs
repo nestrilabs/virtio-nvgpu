@@ -42,7 +42,7 @@ use wlwire::shm::ShmBudget;
 use wlwire::sys;
 
 use crate::hostfd::HandleKind;
-use crate::wl::probe::LeaseCache;
+use crate::wl::probe::{self, LeaseCache};
 
 /// What the backend knows about a host descriptor.
 pub trait HostFds: Send + Sync {
@@ -204,8 +204,6 @@ impl Default for WlLimits {
 
 struct State {
     engine: Engine,
-    inbuf: Vec<u8>,
-    infds: VecDeque<OwnedFd>,
     to_guest: VecDeque<Unit>,
     to_guest_bytes: usize,
     /// The compositor side is finished (EOF, error, or a fatal protocol
@@ -223,6 +221,9 @@ struct Shared {
     wake: OwnedFd,
     host: Arc<dyn HostFds>,
     cfg: WlConfig,
+    /// The registry filter asks `cfg.lease_cache` about lease devices, so the
+    /// reader answers first, outside the lock.
+    probe_leases: bool,
 }
 
 impl Drop for Shared {
@@ -325,10 +326,10 @@ impl WlConn {
     pub fn open(cfg: &WlConfig, host: Arc<dyn HostFds>) -> io::Result<(WlConn, OwnedFd)> {
         let sock = UnixStream::connect(&cfg.socket)?;
         let lease = if cfg.allow_lease {
+            // Only a lookup: the reader resolved every lease-device global in
+            // what it read before the engine (and this) ran (`probe.rs`).
             let cache = cfg.lease_cache.clone();
-            let socket = cfg.socket.clone();
-            let h = host.clone();
-            LeaseGate::Check(Arc::new(move |name| cache.is_ours(&socket, &*h, name)))
+            LeaseGate::Check(Arc::new(move |name| cache.lookup(name).unwrap_or(false)))
         } else {
             LeaseGate::Deny
         };
@@ -365,6 +366,7 @@ impl WlConn {
         policy: Policy,
     ) -> io::Result<(WlConn, OwnedFd)> {
         sock.set_nonblocking(true)?;
+        let probe_leases = matches!(policy.lease, LeaseGate::Check(_));
         let mut engine = Engine::new(EngineConfig {
             side: Side::Host,
             local,
@@ -378,8 +380,6 @@ impl WlConn {
         let wake = sys::eventfd()?;
         let mut st = State {
             engine,
-            inbuf: Vec::new(),
-            infds: VecDeque::new(),
             to_guest: VecDeque::new(),
             to_guest_bytes: 0,
             closed: false,
@@ -398,6 +398,7 @@ impl WlConn {
             wake,
             host,
             cfg: cfg.clone(),
+            probe_leases,
         });
         let ready_dup = shared.ready.try_clone()?;
         let s2 = shared.clone();
@@ -621,6 +622,12 @@ fn hangup(s: &Shared, st: &mut State, errno: i32) {
 fn reader(s: Arc<Shared>) {
     let sock = s.sock.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
+    // What the compositor sent that the engine has not taken yet (a partial
+    // message), and its descriptors. Only this thread reads the socket, so
+    // neither needs the lock -- which lets the lease-device probe run between
+    // the read and the engine without it.
+    let mut inbuf: Vec<u8> = Vec::new();
+    let mut infds: VecDeque<OwnedFd> = VecDeque::new();
     loop {
         let (want_out, streams, closed) = {
             let st = lock(&s);
@@ -676,35 +683,46 @@ fn reader(s: Arc<Shared>) {
         if pfds[1].revents != 0 {
             sys::eventfd_clear(s.wake.as_raw_fd());
         }
-        let mut st = lock(&s);
-        if st.stop {
-            return;
-        }
         let rev = pfds[0].revents;
-        if !st.closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if !closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             // Read until the socket is empty: never leave the compositor's
             // buffer to fill.
             loop {
                 let mut fds = Vec::new();
-                match sys::recv_with_fds(sock, &mut buf, &mut fds) {
+                let r = sys::recv_with_fds(sock, &mut buf, &mut fds);
+                if let Ok(n @ 1..) = r {
+                    inbuf.extend_from_slice(&buf[..n]);
+                    infds.extend(fds);
+                    // Lease-device globals are answered here, before the
+                    // engine's registry filter asks and with no lock held: a
+                    // probe can take seconds, and the connection's lock is
+                    // what WL_SEND and WL_RECV wait on under the backend
+                    // mutex (`probe.rs`).
+                    if s.probe_leases {
+                        let names = probe::lease_globals(&inbuf);
+                        if !names.is_empty() {
+                            s.cfg.lease_cache.resolve(&s.cfg.socket, &*s.host, &names);
+                        }
+                    }
+                }
+                let mut st = lock(&s);
+                if st.stop {
+                    return;
+                }
+                if st.closed {
+                    break;
+                }
+                match r {
                     Ok(0) => {
                         hangup(&s, &mut st, 0);
                         break;
                     }
-                    Ok(n) => {
-                        let State {
-                            engine,
-                            inbuf,
-                            infds,
-                            ..
-                        } = &mut *st;
-                        inbuf.extend_from_slice(&buf[..n]);
-                        infds.extend(fds);
+                    Ok(_) => {
                         let mut plat = HostPlat {
                             host: &*s.host,
                             send: None,
                         };
-                        if let Err(f) = engine.from_local(inbuf, infds, &mut plat) {
+                        if let Err(f) = st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
                             fail(&s, &mut st, f);
                             break;
                         }
@@ -722,6 +740,10 @@ fn reader(s: Arc<Shared>) {
                     }
                 }
             }
+        }
+        let mut st = lock(&s);
+        if st.stop {
+            return;
         }
         if !st.closed && rev & libc::POLLOUT != 0 {
             if let Err(e) = st.engine.local_out().flush(sock) {
