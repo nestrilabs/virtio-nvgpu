@@ -67,6 +67,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/sync_file.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/xarray.h>
@@ -1103,6 +1104,25 @@ static int nvgpu_kms_in_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
    * (drm_atomic_uapi.c:558). */
   if (fd < 0 || fd > INT_MAX)
     return -EINVAL;
+  /*
+   * A TEST_ONLY commit waits on nothing natively: the core takes a reference
+   * on the fence (drm_atomic_uapi.c:551-560) and the check never looks at
+   * it. So it is only checked for being a sync_file, and the host checks the
+   * commit without it -- unwrapping here would wait for a guest-only fence,
+   * or merge on the host, for a commit that will never scan out.
+   */
+  if (!kc->commit) {
+    struct dma_fence *f = sync_file_get_fence((int)fd);
+
+    if (!f)
+      return -EINVAL;
+    dma_fence_put(f);
+    vals = nvgpu_i2_buf(&kc->call, buf, &len);
+    if (!vals || off > len || len - off < 8)
+      return -EINVAL;
+    put_unaligned_le64((u64)-1, vals + off);
+    return 0;
+  }
   ret = nvgpu_fence_unwrap_fd(kc->kf->dev, (int)fd, &h, &owned);
   if (ret < 0)
     return ret;
