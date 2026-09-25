@@ -708,6 +708,10 @@ int nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id);
 /* ── Clock ── */
 s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns);
 s64 nvgpu_guest_to_host_ns(struct nvgpu_device *dev, s64 guest_ns);
+/* A host CLOCK_REALTIME / CLOCK_MONOTONIC_RAW reading in the guest's clock of
+ * the same id; false (value untouched) without TIME_SYNC's long form. */
+bool nvgpu_host_clock_to_guest(struct nvgpu_device *dev, clockid_t clk,
+                               s64 host_ns, s64 *guest_ns);
 
 /* ── Event consumers ──
  *

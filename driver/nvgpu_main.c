@@ -436,6 +436,60 @@ static const struct nvgpu_v1v2_entry *nvgpu_find_deep_rewrite(u32 cmd) {
   return NULL;
 }
 
+/*
+ * GPU/CPU time correlation, rebased: the CPU half of each sample is read on
+ * the host, in the host's clock (nvgpu_rm_intercepts.h has the layout), and
+ * the caller correlates the GPU's timer with its own clock of that id --
+ * glcore asks for OSTIME at 0xa5d94d and 0xa6c54c. The host's realtime and
+ * raw clocks are not the guest's: a guest booted later, or with its own NTP,
+ * disagrees by anything from microseconds to its whole uptime. Each value is
+ * moved into the guest's clock of the same id (nvgpu_host_clock_to_guest);
+ * OSTIME is microseconds of realtime, PLATFORM_API nanoseconds of raw
+ * monotonic, and fills only samples[0] whatever sampleCount says. Left
+ * alone for a GSP-side clock, on a failed RM status, and against a backend
+ * too old to report its other clocks.
+ */
+static void nvgpu_rebase_time_correlation(struct nvgpu_device *dev, u8 *p,
+                                          u32 len) {
+  clockid_t clk;
+  u32 i, n, scale;
+  u8 id;
+
+  if (len < NVGPU_TCI_SAMPLES)
+    return;
+  id = p[NVGPU_TCI_CLK_ID];
+  n = min_t(u32, p[NVGPU_TCI_SAMPLE_COUNT], NVGPU_TCI_MAX_SAMPLES);
+  if (NVGPU_TCI_PROC(id) != NVGPU_TCI_PROC_CPU)
+    return;
+  switch (NVGPU_TCI_SRC(id)) {
+  case NVGPU_TCI_SRC_OSTIME:
+    clk = CLOCK_REALTIME;
+    scale = NSEC_PER_USEC;
+    break;
+  case NVGPU_TCI_SRC_PLATFORM_API:
+    clk = CLOCK_MONOTONIC_RAW;
+    scale = 1;
+    n = min_t(u32, n, 1);
+    break;
+  default:
+    return;
+  }
+
+  for (i = 0; i < n; i++) {
+    u32 at = NVGPU_TCI_SAMPLES + i * NVGPU_TCI_SAMPLE_SIZE;
+    s64 guest;
+
+    if (at + sizeof(u64) > len)
+      return;
+    if (!nvgpu_host_clock_to_guest(
+            dev, clk, (s64)(get_unaligned_le64(p + at) * scale), &guest))
+      return;
+    if (guest < 0)
+      guest = 0;
+    put_unaligned_le64(div_u64((u64)guest, scale), p + at);
+  }
+}
+
 static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
                                    void __user *uarg, unsigned int sz) {
   struct NVOS54_PARAMETERS params;
@@ -635,6 +689,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
              &nested_fd, sizeof(nested_fd));
+    if (ctl_cmd == NVGPU_RM_TIME_CORRELATION &&
+        get_unaligned_le32(resp_buf + sizeof(*resp) + 28) == 0 /* NV_OK */)
+      nvgpu_rebase_time_correlation(
+          nfd->dev, resp_buf + sizeof(*resp) + sizeof(params), copy_back);
 
     if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))

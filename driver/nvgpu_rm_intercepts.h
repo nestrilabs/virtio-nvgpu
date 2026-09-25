@@ -137,6 +137,57 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
   return nvgpu_set_nvos54_status(uarg, 0);
 }
 
+/* ─── 0x20800406: NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO ─
+ *
+ * NV2080_CTRL_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO_PARAMS (ctrl2080tmr.h):
+ *   offset 0: cpuClkId    (u8)  SOURCE in bits 3:0, PROCESSOR in bits 7:4
+ *   offset 1: sampleCount (u8)
+ *   offset 8: samples[16] of {u64 cpuTime; u64 gpuTime}
+ *
+ * The CPU half of each sample is a host clock: OSTIME is CLOCK_REALTIME in
+ * us, PLATFORM_API is CLOCK_MONOTONIC_RAW in ns, TSC is the host's TSC
+ * (subdevice_ctrl_timer_kernel.c:354-455; os.c:126-138). The first two are
+ * rebased into the guest's clocks on the way back (nvgpu_main.c,
+ * nvgpu_rebase_time_correlation). The TSC is not: a guest's TSC is the
+ * host's plus an offset and, with TSC scaling, times a ratio, and neither is
+ * visible from here, so a host TSC value would correlate the GPU clock with a
+ * CPU clock the guest cannot read. It is refused the way RM refuses a clock
+ * it cannot sample, NV_ERR_NOT_SUPPORTED, and the caller falls back to
+ * another source.
+ */
+#define NVGPU_RM_TIME_CORRELATION 0x20800406u
+#define NVGPU_TCI_CLK_ID 0
+#define NVGPU_TCI_SAMPLE_COUNT 1
+#define NVGPU_TCI_SAMPLES 8
+#define NVGPU_TCI_SAMPLE_SIZE 16
+#define NVGPU_TCI_MAX_SAMPLES 16
+#define NVGPU_TCI_SRC(id) ((id) & 0xf)
+#define NVGPU_TCI_PROC(id) (((id) >> 4) & 0xf)
+#define NVGPU_TCI_SRC_OSTIME 1
+#define NVGPU_TCI_SRC_TSC 2
+#define NVGPU_TCI_SRC_PLATFORM_API 3
+#define NVGPU_TCI_PROC_CPU 0
+#define NVGPU_NV_ERR_NOT_SUPPORTED 0x00000056u
+
+static inline bool nvgpu_intercept_time_correlation_tsc(void __user *uarg,
+                                                        void __user *user_nested,
+                                                        u32 nested_size,
+                                                        long *ret) {
+  u8 clk_id;
+
+  if (!user_nested || nested_size <= NVGPU_TCI_CLK_ID)
+    return false;
+  if (copy_from_user(&clk_id, user_nested + NVGPU_TCI_CLK_ID, 1)) {
+    *ret = -EFAULT;
+    return true;
+  }
+  if (NVGPU_TCI_PROC(clk_id) != NVGPU_TCI_PROC_CPU ||
+      NVGPU_TCI_SRC(clk_id) != NVGPU_TCI_SRC_TSC)
+    return false;
+  *ret = nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_NOT_SUPPORTED);
+  return true;
+}
+
 /* ─── Dispatch table ──────────────────────────────────────────────── */
 
 /*
@@ -154,6 +205,10 @@ nvgpu_try_intercept_rm_control(struct nvgpu_fd *nfd, u32 ctl_cmd,
     *ret = nvgpu_intercept_get_build_version(nfd, uarg, user_nested,
                                              nested_size, driver_version);
     return true;
+
+  case NVGPU_RM_TIME_CORRELATION: /* only the TSC source; see above */
+    return nvgpu_intercept_time_correlation_tsc(uarg, user_nested, nested_size,
+                                                ret);
 
     /*
      * TODO: Add future intercepts here as needed:

@@ -241,6 +241,21 @@ struct nvgpu_time_sync_resp {
   __le64 host_mono_ns; /* CLOCK_MONOTONIC, stamped just before add_used */
 } __packed;
 
+/*
+ * The same reply, with the host's other two clocks read in the same instant:
+ * what RM stamps GPU/CPU time correlation samples with (0x20800406: OSTIME is
+ * CLOCK_REALTIME in us, PLATFORM_API is CLOCK_MONOTONIC_RAW in ns), which the
+ * guest rebases per clock. Sent only when the reply buffer has room for it,
+ * so a guest that posts the 8-byte form gets that; a backend that predates it
+ * fills 8 bytes of a larger buffer, which the used length says.
+ */
+struct nvgpu_time_sync_resp2 {
+  __le64 host_mono_ns;
+  __le64 host_realtime_ns; /* CLOCK_REALTIME */
+  __le64 host_mono_raw_ns; /* CLOCK_MONOTONIC_RAW */
+  __le64 reserved;
+} __packed;
+
 /* ── IOCTL2: a vectored ioctl, laid out by a schema both halves share ──
  *
  * The request is the ioctl argument (buffer 0) and every buffer a pointer in
@@ -450,6 +465,7 @@ static_assert(sizeof(struct nvgpu_msg_hdr) == 16, "msg hdr");
 static_assert(sizeof(struct nvgpu_hello_req) == 16, "hello req");
 static_assert(sizeof(struct nvgpu_hello_resp) == 32, "hello resp");
 static_assert(sizeof(struct nvgpu_time_sync_resp) == 8, "time sync");
+static_assert(sizeof(struct nvgpu_time_sync_resp2) == 32, "time sync 2");
 static_assert(sizeof(struct nvgpu_i2_req) == 32, "i2 req");
 static_assert(sizeof(struct nvgpu_i2_fd_in) == 16, "i2 fd in");
 static_assert(sizeof(struct nvgpu_i2_gem_in) == 16, "i2 gem in");

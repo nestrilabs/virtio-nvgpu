@@ -111,12 +111,22 @@ pub struct Reply {
 }
 
 impl Reply {
-    /// Write the monotonic clock at `stamp_at`, if this reply wants one.
+    /// Write the monotonic clock at `stamp_at`, if this reply wants one, and
+    /// `CLOCK_REALTIME` and `CLOCK_MONOTONIC_RAW` after it when the reply has
+    /// room for them (TimeSyncResp2). Read back to back, so the guest can take
+    /// each one's distance from the monotonic clock as of one instant.
     pub fn stamp(&mut self) {
         if let Some(off) = self.stamp_at {
-            let ns = monotonic_ns();
-            if let Some(dst) = self.bytes.get_mut(off..off + 8) {
-                dst.copy_from_slice(&ns.to_le_bytes());
+            let clocks = [
+                monotonic_ns(),
+                clock_ns(libc::CLOCK_REALTIME),
+                clock_ns(libc::CLOCK_MONOTONIC_RAW),
+            ];
+            for (i, ns) in clocks.into_iter().enumerate() {
+                let at = off + 8 * i;
+                if let Some(dst) = self.bytes.get_mut(at..at + 8) {
+                    dst.copy_from_slice(&ns.to_le_bytes());
+                }
             }
         }
     }
@@ -125,10 +135,14 @@ impl Reply {
 /// `CLOCK_MONOTONIC`, in nanoseconds: the clock DRM vblank and flip
 /// timestamps are in, which is what the guest translates.
 pub fn monotonic_ns() -> u64 {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+fn clock_ns(clock: libc::clockid_t) -> u64 {
     // SAFETY: an all-zero timespec is valid and clock_gettime overwrites it.
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: plain syscall into a local.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    unsafe { libc::clock_gettime(clock, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -332,9 +346,18 @@ impl NvidiaBackend {
         }
         let r = match t {
             MsgType::Hello => self.serve_hello(payload),
+            // The long form (TimeSyncResp2) only where the guest posted room
+            // for it: an older guest's 8-byte buffer gets the 8-byte reply.
             MsgType::TimeSync => Ok(Reply {
                 stamp_at: Some(HDR),
-                ..self.ok_reply(0, &[0u8; size_of::<TimeSyncResp>()])
+                ..self.ok_reply(
+                    0,
+                    if cap >= HDR + size_of::<TimeSyncResp2>() {
+                        &[0u8; size_of::<TimeSyncResp2>()][..]
+                    } else {
+                        &[0u8; size_of::<TimeSyncResp>()][..]
+                    },
+                )
             }),
             MsgType::Watch => self.serve_watch(payload),
             MsgType::Unwatch => self.serve_unwatch(payload),
@@ -816,6 +839,33 @@ mod tests {
             u64::from_le_bytes(r[16..24].try_into().unwrap()),
             0,
             "stamped"
+        );
+    }
+
+    #[test]
+    fn time_sync_carries_realtime_and_raw_when_the_guest_has_room() {
+        let mut be = backend();
+        assert_eq!(status(&hello(&mut be, 0)), 0);
+        let r = call(&mut be, MsgType::TimeSync, 0, &[]);
+        assert_eq!(r.len(), HDR + size_of::<TimeSyncResp2>());
+        let w = |i: usize| u64::from_le_bytes(r[HDR + 8 * i..HDR + 8 * i + 8].try_into().unwrap());
+        let (mono, real, raw) = (w(0), w(1), w(2));
+        assert!(mono != 0 && raw != 0);
+        assert!(real > mono, "the epoch is further back than boot");
+        assert_eq!(w(3), 0, "reserved");
+    }
+
+    #[test]
+    fn time_sync_answers_an_old_guests_8_byte_buffer_in_8_bytes() {
+        let mut be = backend();
+        assert_eq!(status(&hello(&mut be, 0)), 0);
+        let mut resp = vec![0u8; HDR + size_of::<TimeSyncResp>()];
+        let n = be.dispatch(&msg(MsgType::TimeSync, 0, &[]), &mut resp);
+        assert_eq!(n, HDR + size_of::<TimeSyncResp>());
+        assert_eq!(status(&resp), 0);
+        assert_ne!(
+            u64::from_le_bytes(resp[HDR..HDR + 8].try_into().unwrap()),
+            0
         );
     }
 
