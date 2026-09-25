@@ -16,7 +16,7 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, sock_fd};
+use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
 use crate::hostfd::HandleKind;
 
@@ -575,4 +575,109 @@ fn recv_refuses_a_buffer_too_small_for_a_record() {
         libc::EINVAL
     );
     let _ = Dir::Request;
+}
+
+/// Poll until `f` holds, or fail after 5 s.
+fn until(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn the_vms_queue_budget_drops_the_connection_that_passes_it_and_what_it_had_queued() {
+    let dir = tmpdir("qbudget");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let mut cfg = WlConfig::new(&sock);
+    // Far under the connection's own 64 MiB: the VM's budget is what trips.
+    cfg.limits = WlLimits::new(64, 1 << 30, 256 * 1024);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (mut server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, false);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    let ev = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wl_compositor"))
+        .uint(6)
+        .finish();
+    server
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Four times the budget, with the guest reading nothing. The backend
+    // shuts the socket part way through, so the write may fail.
+    let _ = server.write_all(&ev.repeat((1 << 20) / ev.len()));
+    until("the connection to drop", || g.conn.is_closed());
+    // What it had queued went with it; only the HANGUP it is owed is left.
+    assert!(cfg.limits.queue.used() < 64, "{}", cfg.limits.queue.used());
+    let f = g.conn.recv(1 << 20, 256, &mut g.ops).unwrap();
+    let types: Vec<u16> = frame::decode(&f).unwrap().records().map(|r| r.ty).collect();
+    assert_eq!(types, vec![frame::REC_HANGUP]);
+    assert_eq!(cfg.limits.queue.used(), 0);
+}
+
+#[test]
+fn every_connection_gives_back_its_queued_bytes_when_it_goes() {
+    let dir = tmpdir("qdrop");
+    let sock = dir.join("wl");
+    let _l = UnixListener::bind(&sock).unwrap();
+    let cfg = WlConfig::new(&sock);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    // The backend's HELLO waits, unread, on the VM's budget.
+    assert!(cfg.limits.queue.used() > 0);
+    drop(conn);
+    assert_eq!(cfg.limits.queue.used(), 0);
+}
+
+#[test]
+fn a_connection_that_hangs_up_gives_its_shm_back_before_the_guest_closes_it() {
+    let dir = tmpdir("shmback");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let cfg = WlConfig::new(&sock);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, false);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    let mut srv = server.try_clone().unwrap();
+    srv.write_all(
+        &MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(5)
+            .string(Some("wl_shm"))
+            .uint(1)
+            .finish(),
+    )
+    .unwrap();
+    g.recv_until(|b, _| !b.is_empty());
+    g.client(
+        &[
+            MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                .uint(5)
+                .generic_new_id("wl_shm", 1, 3)
+                .finish(),
+            MsgBuilder::new(3, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(4)
+                .int(65536)
+                .finish(),
+        ],
+        vec![sys::memfd(c"guest-pool", 65536).unwrap()],
+    );
+    assert_eq!(cfg.limits.shm.used(), (65536, 1));
+    // The compositor goes; the guest has not closed its handle.
+    drop(srv);
+    drop(server);
+    until("the hangup", || g.conn.is_closed());
+    assert_eq!(cfg.limits.shm.used(), (0, 0));
 }

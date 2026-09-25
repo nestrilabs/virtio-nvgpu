@@ -53,8 +53,8 @@ use device::session::{
 };
 use device::shm::WindowPlacer;
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
-use device::wl::WlConfig;
 use device::wl::export::WlExport;
+use device::wl::{WlConfig, WlLimits};
 use protocol::messages::{MsgHeader, MsgType};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
@@ -137,6 +137,26 @@ struct Args {
     /// Accept host Wayland clients here and carry them to a guest compositor.
     #[arg(long, value_name = "PATH")]
     wayland_export: Option<PathBuf>,
+
+    /// Wayland channels one VM may have open at once (guest clients, or
+    /// accepted host clients in export mode). Each is a client of the host
+    /// compositor with a thread and a few descriptors here; past the limit
+    /// the guest's CONNECT fails with EMFILE.
+    #[arg(long, value_name = "N", default_value_t = WlLimits::DEFAULT_MAX_CONNS)]
+    wayland_max_conns: usize,
+
+    /// MiB of wl_shm pool memory one VM's clients may have the backend hold,
+    /// over all its connections (each connection is also held to 512 MiB).
+    /// The pages are memfds the host OOM killer does not count as this
+    /// process's; a pool past the budget is a wl_display.error for its client.
+    #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_SHM_BYTES >> 20)]
+    wayland_shm_budget: u64,
+
+    /// MiB of compositor output one VM may leave unread, over all its
+    /// connections (each is also held to 64 MiB); the connection that passes
+    /// it is dropped.
+    #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_QUEUE_BYTES >> 20)]
+    wayland_queue_budget: usize,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -204,6 +224,8 @@ struct Wayland {
     cfg: Option<WlConfig>,
     /// `--wayland-export`: the listener and its readiness eventfd.
     export: Option<(Arc<WlExport>, OwnedFd)>,
+    /// `--wayland-max-conns` and the budgets: one set for the VM.
+    limits: WlLimits,
 }
 
 impl Wayland {
@@ -235,7 +257,24 @@ impl Wayland {
             }
             None => None,
         };
-        Ok(Self { cfg, export })
+        let limits = WlLimits::new(
+            args.wayland_max_conns,
+            args.wayland_shm_budget.saturating_mul(1 << 20),
+            args.wayland_queue_budget.saturating_mul(1 << 20),
+        );
+        if cfg.is_some() || export.is_some() {
+            log::info!(
+                "wayland: at most {} channels, {} MiB of shm and {} MiB unread per VM",
+                args.wayland_max_conns,
+                args.wayland_shm_budget,
+                args.wayland_queue_budget
+            );
+        }
+        Ok(Self {
+            cfg,
+            export,
+            limits,
+        })
     }
 }
 
@@ -700,6 +739,7 @@ impl NvGpuBackend {
         nvidia.set_host_driver_version(&version);
         nvidia.set_wayland(wayland.cfg);
         nvidia.set_wayland_export(wayland.export);
+        nvidia.set_wayland_limits(wayland.limits);
 
         Ok(Self {
             shared: Arc::new(Shared {

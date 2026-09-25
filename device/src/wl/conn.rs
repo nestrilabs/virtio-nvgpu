@@ -16,18 +16,29 @@
 //!
 //! **Readiness** is an eventfd, readable while anything is queued for the
 //! guest (records, or the HANGUP that ends the connection).
+//!
+//! **What a VM may hold** ([`WlLimits`]). Every limit above is per connection,
+//! and a guest opens as many connections as it likes, so each one that costs
+//! the host something is also counted per VM: channels (each a compositor
+//! client, a reader thread and a handful of descriptors), shm pool memory
+//! (`wlwire::shm`, memfd pages the host OOM killer does not see as ours) and
+//! bytes queued for the guest. A connection that would pass the VM's queue
+//! budget is dropped like one that passes its own, and what it had queued is
+//! let go with it: a guest that is not reading has no use for it.
 
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
+use wlwire::shm::ShmBudget;
 use wlwire::sys;
 
 use crate::hostfd::HandleKind;
@@ -87,6 +98,9 @@ pub struct WlConfig {
     /// syncobjs' host objects (`HELLO_G_SYNCOBJ`). Normal mode only: a host
     /// client's syncobj has no guest object to stand for it.
     pub fences: bool,
+    /// What every connection of the VM shares. The dispatcher puts its own
+    /// in (`WlState`), whichever configuration a connection was made from.
+    pub limits: WlLimits,
 }
 
 impl WlConfig {
@@ -98,7 +112,93 @@ impl WlConfig {
             max_queue: 64 << 20,
             lease_cache: Arc::new(LeaseCache::default()),
             fences: false,
+            limits: WlLimits::default(),
         }
+    }
+}
+
+/// Bytes queued for the guest, over every connection of a VM.
+#[derive(Debug)]
+pub struct QueueBudget {
+    max: usize,
+    used: AtomicUsize,
+}
+
+impl QueueBudget {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// `n` more bytes, if that stays within the budget.
+    fn take(&self, n: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&t| t <= self.max)
+            })
+            .is_ok()
+    }
+
+    /// `n` more bytes whatever the budget says: the few bytes of the ERROR
+    /// and HANGUP records that end a connection, which must reach the guest.
+    fn force(&self, n: usize) {
+        self.used.fetch_add(n, Ordering::AcqRel);
+    }
+
+    fn give(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+/// Limits over every Wayland channel of one VM (one backend). Cloning shares
+/// the budgets.
+#[derive(Clone, Debug)]
+pub struct WlLimits {
+    /// Channels open at once (CONNECT and ACCEPT; the one LISTEN is not
+    /// counted). Each is a host compositor client with up to 131072 objects,
+    /// a reader thread and about five descriptors (`--wayland-max-conns`).
+    pub max_conns: usize,
+    /// Shm pool memory and pool count, over every connection
+    /// (`--wayland-shm-budget`).
+    pub shm: Arc<ShmBudget>,
+    /// Bytes queued for the guest, over every connection
+    /// (`--wayland-queue-budget`).
+    pub queue: Arc<QueueBudget>,
+}
+
+impl WlLimits {
+    /// A guest desktop proxies a few dozen clients at most.
+    pub const DEFAULT_MAX_CONNS: usize = 64;
+    /// Ten triple-buffered 4K shm windows. GPU clients present dma-bufs,
+    /// which cost nothing here; shm is for software rendering and cursors.
+    pub const DEFAULT_SHM_BYTES: u64 = 1 << 30;
+    /// Pools over the VM: every one is a memfd held open in the backend.
+    pub const DEFAULT_SHM_POOLS: u64 = 1024;
+    /// Four connections' worth of the per-connection queue limit.
+    pub const DEFAULT_QUEUE_BYTES: usize = 256 << 20;
+
+    pub fn new(max_conns: usize, shm_bytes: u64, queue_bytes: usize) -> Self {
+        Self {
+            max_conns,
+            shm: Arc::new(ShmBudget::new(shm_bytes, Self::DEFAULT_SHM_POOLS)),
+            queue: Arc::new(QueueBudget::new(queue_bytes)),
+        }
+    }
+}
+
+impl Default for WlLimits {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_CONNS,
+            Self::DEFAULT_SHM_BYTES,
+            Self::DEFAULT_QUEUE_BYTES,
+        )
     }
 }
 
@@ -123,6 +223,14 @@ struct Shared {
     wake: OwnedFd,
     host: Arc<dyn HostFds>,
     cfg: WlConfig,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Whatever the guest never took is off the VM's queue budget.
+        let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        self.cfg.limits.queue.give(st.to_guest_bytes);
+    }
 }
 
 pub struct WlConn {
@@ -264,6 +372,7 @@ impl WlConn {
             rewrites: None,
             synth_released: false,
         });
+        engine.set_shm_budget(cfg.limits.shm.clone());
         engine.hello(0);
         let ready = sys::eventfd()?;
         let wake = sys::eventfd()?;
@@ -277,7 +386,9 @@ impl WlConn {
             stop: false,
         };
         let hello = st.engine.take_units();
-        st.to_guest_bytes += hello.iter().map(|u| u.bytes()).sum::<usize>();
+        let n = hello.iter().map(|u| u.bytes()).sum::<usize>();
+        cfg.limits.queue.force(n);
+        st.to_guest_bytes += n;
         st.to_guest.extend(hello);
         sys::eventfd_signal(ready.as_raw_fd());
         let shared = Arc::new(Shared {
@@ -361,7 +472,9 @@ impl WlConn {
             max_desc as usize,
             true,
         );
-        st.to_guest_bytes = st.to_guest.iter().map(|u| u.bytes()).sum();
+        let left: usize = st.to_guest.iter().map(|u| u.bytes()).sum();
+        s.cfg.limits.queue.give(st.to_guest_bytes - left);
+        st.to_guest_bytes = left;
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
             let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
@@ -415,24 +528,50 @@ impl Drop for WlConn {
     }
 }
 
-/// Move the engine's channel output to the guest queue.
+/// Move the engine's channel output to the guest queue, within this
+/// connection's limit and the VM's budget. Past either the connection is
+/// dropped, and what it had queued with it: kept, it would pin memory until
+/// the guest closes the handle, for a guest that has shown it is not reading.
 fn collect(s: &Shared, st: &mut State) {
     let units = st.engine.take_units();
     if units.is_empty() {
         return;
     }
-    for u in units {
-        st.to_guest_bytes += u.bytes();
-        st.to_guest.push_back(u);
+    // HANGUP is queued: the guest stops at it, so nothing after it is ever
+    // read, and keeping it would only hold memory (and descriptors).
+    if st.closed {
+        return;
     }
-    sys::eventfd_signal(s.ready.as_raw_fd());
-    if st.to_guest_bytes > s.cfg.max_queue && !st.closed {
+    let n: usize = units.iter().map(|u| u.bytes()).sum();
+    let own = st.to_guest_bytes + n <= s.cfg.max_queue;
+    if !own || !s.cfg.limits.queue.take(n) {
         log::warn!(
-            "wayland: the guest has not read {} bytes; dropping the connection",
-            st.to_guest_bytes
+            "wayland: the guest has not read {} bytes ({}); dropping the connection",
+            st.to_guest_bytes + n,
+            if own {
+                "the VM's queue budget is spent"
+            } else {
+                "past the connection's limit"
+            }
         );
+        s.cfg.limits.queue.give(st.to_guest_bytes);
+        st.to_guest.clear();
+        st.to_guest_bytes = 0;
         hangup(s, st, libc::ENOBUFS);
+        return;
     }
+    st.to_guest_bytes += n;
+    st.to_guest.extend(units);
+    sys::eventfd_signal(s.ready.as_raw_fd());
+}
+
+/// Queue a record that ends the connection (ERROR, HANGUP): small, and owed
+/// to the guest whatever the budget says.
+fn push_final(s: &Shared, st: &mut State, u: Unit) {
+    let n = u.bytes();
+    s.cfg.limits.queue.force(n);
+    st.to_guest_bytes += n;
+    st.to_guest.push_back(u);
 }
 
 /// End the connection on a protocol error: the guest is told why.
@@ -450,9 +589,7 @@ fn fail(s: &Shared, st: &mut State, f: Fatal) {
         st.engine.local_out().push(&f.display_error(), Vec::new());
         let _ = st.engine.local_out().flush(s.sock.as_raw_fd());
     }
-    let u = f.record();
-    st.to_guest_bytes += u.bytes();
-    st.to_guest.push_back(u);
+    push_final(s, st, f.record());
     hangup(s, st, libc::EPROTO);
 }
 
@@ -462,14 +599,22 @@ fn hangup(s: &Shared, st: &mut State, errno: i32) {
     }
     st.closed = true;
     let _ = s.sock.shutdown(std::net::Shutdown::Both);
+    // The pools' memfds and any half-received blobs are for a live
+    // connection only; the VM's shm budget has them back now, not when the
+    // guest closes the handle.
+    st.engine.shed();
     // Export mode's peer is a host client, not the compositor.
     if !st.engine.local_is_client() {
         s.host.compositor_hung_up();
     }
-    st.to_guest.push_back(Unit {
-        rec: frame::record(frame::REC_HANGUP, 0, errno as u32, &[]),
-        descs: Vec::new(),
-    });
+    push_final(
+        s,
+        st,
+        Unit {
+            rec: frame::record(frame::REC_HANGUP, 0, errno as u32, &[]),
+            descs: Vec::new(),
+        },
+    );
     sys::eventfd_signal(s.ready.as_raw_fd());
 }
 
@@ -564,6 +709,9 @@ fn reader(s: Arc<Shared>) {
                             break;
                         }
                         collect(&s, &mut st);
+                        if st.closed {
+                            break;
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}

@@ -34,7 +34,7 @@ use crate::kms::LeaseAlarm;
 use crate::nvidia::NvidiaBackend;
 use crate::pump::{PumpCmd, WatchMode};
 use crate::session::{Reply, hdr};
-use crate::wl::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn};
+use crate::wl::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, WlLimits};
 use crate::wl::export::WlExport;
 use wlwire::frame;
 
@@ -66,9 +66,23 @@ pub struct WlState {
     host: Option<Arc<dyn HostFds>>,
     /// Rung when a compositor connection hangs up (`HostFds`).
     lease_alarm: Option<Arc<LeaseAlarm>>,
+    /// What all of this VM's channels may hold together; put into every
+    /// connection's configuration, whichever one it was made from.
+    limits: WlLimits,
+    /// A refused OPEN was logged; cleared once a channel fits again, so a
+    /// guest retrying in a loop costs one line, not one per try.
+    cap_logged: bool,
 }
 
 impl WlState {
+    /// Channels that hold a connection: what `WlLimits::max_conns` counts.
+    fn conns(&self) -> usize {
+        self.chans
+            .values()
+            .filter(|c| matches!(c, Chan::Conn(_)))
+            .count()
+    }
+
     /// Take a channel's connection out, for [`drop_detached`] to end.
     fn take(&mut self, handle: u32) -> Option<WlConn> {
         match self.chans.remove(&handle)? {
@@ -210,6 +224,31 @@ impl NvidiaBackend {
         self.wl.export = export;
     }
 
+    /// The per-VM limits (`--wayland-max-conns`, `--wayland-shm-budget`,
+    /// `--wayland-queue-budget`); `WlLimits::default()` otherwise.
+    pub fn set_wayland_limits(&mut self, limits: WlLimits) {
+        self.wl.limits = limits;
+    }
+
+    /// Room for one more channel with a connection behind it, or EMFILE.
+    /// Asked before anything is connected or accepted, so a refused OPEN
+    /// costs the host no socket, thread or compositor client.
+    fn wl_room(&mut self) -> Result<(), i32> {
+        let n = self.wl.conns();
+        if n < self.wl.limits.max_conns {
+            self.wl.cap_logged = false;
+            return Ok(());
+        }
+        if !self.wl.cap_logged {
+            self.wl.cap_logged = true;
+            log::warn!(
+                "OPEN(DEV_WAYLAND): the VM has {n} channels open, its limit \
+                 (--wayland-max-conns); refusing more until one closes"
+            );
+        }
+        Err(libc::EMFILE)
+    }
+
     /// Replace descriptor classification, which needs real DRM nodes.
     #[cfg(test)]
     pub(crate) fn set_wl_host_for_test(&mut self, host: Arc<dyn HostFds>) {
@@ -251,8 +290,10 @@ impl NvidiaBackend {
         let (chan, ready) = match mode {
             frame::WL_OPEN_CONNECT => {
                 let mut cfg = self.wl.cfg.clone().ok_or(libc::ENODEV)?;
+                self.wl_room()?;
                 // Explicit sync rides on the fences this backend serves.
                 cfg.fences = self.config.fences;
+                cfg.limits = self.wl.limits.clone();
                 let host = self.wl_host();
                 let (conn, ready) = WlConn::open(&cfg, host).map_err(|e| {
                     log::warn!(
@@ -265,6 +306,13 @@ impl NvidiaBackend {
             }
             frame::WL_OPEN_LISTEN => {
                 let (_, ready) = self.wl.export.as_ref().ok_or(libc::ENODEV)?;
+                // One listener: every LISTEN handle would share the export's
+                // one readiness eventfd, and whoever reads it first takes the
+                // others' wake-ups. The daemon opens exactly one.
+                if self.wl.chans.values().any(|c| matches!(c, Chan::Listener)) {
+                    log::warn!("OPEN(DEV_WAYLAND, LISTEN): the export already has a listener");
+                    return Err(libc::EBUSY);
+                }
                 let ready = ready
                     .try_clone()
                     .map_err(|e| e.raw_os_error().unwrap_or(libc::EMFILE))?;
@@ -273,15 +321,19 @@ impl NvidiaBackend {
             frame::WL_OPEN_ACCEPT => {
                 let (export, _) = self.wl.export.as_ref().ok_or(libc::ENODEV)?;
                 let export = export.clone();
+                // Before the accept: a refused ACCEPT leaves the host client
+                // waiting in the export's queue, not accepted and dropped.
+                self.wl_room()?;
                 let stream = export.accept_pending().ok_or(libc::EAGAIN)?;
                 // Export connections face a host client, not the compositor
                 // socket; the configuration only lends its limits, so an
                 // export-only backend makes one of its own.
-                let cfg = self
+                let mut cfg = self
                     .wl
                     .cfg
                     .clone()
                     .unwrap_or_else(|| WlConfig::new(export.path()));
+                cfg.limits = self.wl.limits.clone();
                 let host = self.wl_host();
                 let (conn, ready) = WlConn::from_export(stream, &cfg, host).map_err(|e| {
                     log::warn!("wayland export: taking a host client: {e}");
