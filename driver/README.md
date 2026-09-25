@@ -40,7 +40,7 @@ One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`):
 |---|---|
 | `nvgpu.h` | internal header: shared structs, cross-file prototypes, module parameter `extern`s |
 | `nvgpu_wire.h` | wire protocol and config-space layout (BSD-3-Clause OR GPL-2.0+, mirrors `protocol/`) |
-| `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, RM forwarding (descriptors and OS events translated to backend handles, GPU/CPU time correlation moved into the guest's clocks), UVM, mmap with each placement's memory type and writability, `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
+| `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, RM forwarding (descriptors and OS events translated to backend handles, GPU/CPU time correlation moved into the guest's clocks), UVM, mmap with each placement's memory type and writability (UVM semaphore pools from the UVM aperture, shared memory region 2, found before HELLO and offered in it), `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
 | `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls |
 | `nvgpu_xfer.c` | protocol v2 transport: request contexts and transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, the event queue and its consumer registry, EV_HOTPLUG uevents |
 | `nvgpu_i2.c` | the schema-driven IOCTL2 interpreter: gathers a caller's buffers per `gen/nvgpu_schema.h`, translates descriptors and GEM handles through per-caller hooks, copies replies back by the kernel's own rules |

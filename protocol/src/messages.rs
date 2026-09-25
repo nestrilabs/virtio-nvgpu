@@ -412,6 +412,18 @@ pub const MMAP_CACHE_UC: u8 = 3;
 /// so the write faults in the guest process, as it would on the host.
 pub const MMAP_F_READ_ONLY: u8 = 1 << 0;
 
+/// `MmapResp::flags`: `guest_phys_addr` is an offset in the UVM aperture
+/// (shared memory region [`SHM_ID_UVM`]), not in the window. Only in reply to
+/// an MMAP of a UVM file, and only from a backend that said [`BCAP_UVM_MAP`]
+/// to a guest that said [`GCAP_UVM_APERTURE`]: the mapping is a UVM
+/// semaphore pool the VMM maps at the pool's own host address (UVM requires
+/// address == offset), with a memory slot of its own in the aperture.
+/// Always write-back, never read-only.
+pub const MMAP_F_UVM_APERTURE: u8 = 1 << 1;
+
+/// The shared memory region id of the UVM aperture. The window is id 1.
+pub const SHM_ID_UVM: u8 = 2;
+
 /// Request payload for `MsgType::Munmap`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -483,14 +495,28 @@ pub const BCAP_NVKMS_TABLE: u32 = 1 << 3;
 pub const BCAP_WL_EXPORT: u32 = 1 << 4;
 /// Segmented deep blocks ([`DEEP_SEGMENTED`]) are understood.
 pub const BCAP_DEEP_SEGS: u32 = 1 << 5;
+/// An MMAP of a UVM file that names one of its semaphore pools exactly is
+/// placed in the UVM aperture ([`MMAP_F_UVM_APERTURE`]). Offered only to a
+/// guest that said [`GCAP_UVM_APERTURE`], and only when the host's UVM takes
+/// multi-process sharing mode.
+pub const BCAP_UVM_MAP: u32 = 1 << 6;
+
+/// `HelloReq::guest_caps` bits.
+///
+/// The guest found the UVM aperture (shared memory region [`SHM_ID_UVM`])
+/// and says how large it is in `HelloReq::uvm_aperture_mib`.
+pub const GCAP_UVM_APERTURE: u32 = 1 << 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HelloReq {
     pub proto: u32,
     pub flags: u32,
+    /// `GCAP_*`. Zero from a guest that predates them.
     pub guest_caps: u32,
-    pub reserved: u32,
+    /// The UVM aperture's length in MiB, 0 when the guest has none. Was
+    /// reserved (zero), so an older guest reads as having none.
+    pub uvm_aperture_mib: u32,
 }
 
 #[repr(C)]
@@ -796,10 +822,10 @@ const _: () = {
 mod tests {
     use super::*;
 
-    /// The deep-segment constants are the C header's: nothing else checks
-    /// that the two halves agree on them.
+    /// The deep-segment and UVM-aperture constants are the C header's:
+    /// nothing else checks that the two halves agree on them.
     #[test]
-    fn deep_segment_constants_match_the_driver() {
+    fn wire_constants_match_the_driver() {
         let h = include_str!("../../driver/nvgpu_wire.h");
         let define = |name: &str| -> u64 {
             let line = h
@@ -825,6 +851,23 @@ mod tests {
         assert_eq!(define("NVGPU_DEEP_SEGS_MAX_BYTES"), u64::from(DEEP_SEGS_MAX_BYTES));
         assert_eq!(define("NVGPU_IDLE_CHANNELS_MAX"), u64::from(IDLE_CHANNELS_MAX));
         assert_eq!(define("NVGPU_BCAP_DEEP_SEGS"), u64::from(BCAP_DEEP_SEGS));
+        assert_eq!(define("NVGPU_SHM_ID_UVM"), u64::from(SHM_ID_UVM));
+        assert_eq!(define("NVGPU_BCAP_UVM_MAP"), u64::from(BCAP_UVM_MAP));
+        assert_eq!(
+            define("NVGPU_GCAP_UVM_APERTURE"),
+            u64::from(GCAP_UVM_APERTURE)
+        );
+        assert_eq!(
+            define("NVGPU_MMAP_F_UVM_APERTURE"),
+            u64::from(MMAP_F_UVM_APERTURE)
+        );
+        assert_eq!(
+            define("NVGPU_MMAP_F_READ_ONLY"),
+            u64::from(MMAP_F_READ_ONLY)
+        );
+        // HELLO's request is still the 16 bytes an older backend reads.
+        assert_eq!(size_of::<HelloReq>(), 16);
+        assert_eq!(core::mem::offset_of!(HelloReq, uvm_aperture_mib), 12);
     }
 
     #[test]

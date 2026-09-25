@@ -13,7 +13,10 @@ QEMU, cloud-hypervisor, or a VMM of their own should be able to implement the
 traits and get the whole device without patching this crate.
 
 Buffer and window bookkeeping lives here, not in the VMM. The VMM supplies raw
-map and unmap and nothing more.
+map and unmap and nothing more: SHMEM_MAP and SHMEM_UNMAP on the window
+(region 1), and on the UVM aperture (region 2), where a UVM semaphore pool is
+mapped at its own host address with a memory slot of its own
+(`src/uvmmap.rs`).
 
 Optional capabilities **degrade rather than fail to build** — a no-op
 implementation for `()` returns `ENOTTY` — so a VMM can adopt the device before
@@ -48,6 +51,7 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/rmmem.rs` | records of RM system memory and doorbells, the coherency rewrite, and the Intel guest-PAT warning |
 | `src/guestptr.rs` | every pointer the host would follow in RM, NVKMS, nvidia-drm and UVM parameters is relocated or zeroed, or the call refused; memory named by CPU address refused; the UVM command allowlist |
 | `src/uvmfd.rs` | the descriptors inside UVM parameters, translated like RM's |
+| `src/uvmmap.rs` | the UVM semaphore pools a guest may map, and where each sits in the UVM aperture: recorded from UVM's own replies, matched exactly, bounded per file and per VM, withdrawn on the last MUNMAP, the file's close and a session reset |
 | `src/rmctl.rs` | RM controls answered without asking RM (the ones that list every GPU process on the host) |
 | `src/hostfd.rs` | handle kinds, classification of a descriptor by what the kernel says it is, HOST_OP helpers, commands refused on every handle |
 | `src/handle_table.rs` | backend handles: u32, cyclic, bounded |
@@ -57,7 +61,7 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/pump.rs` | the event pump: v1 EVENT_READY and v2 EVENT_DATA records, DRM event budgets, the level sweep |
 | `src/posture.rs` | refusing root and `CAP_SYS_ADMIN`, dropping capabilities, the socket's directory and path |
 | `src/ratelimit.rs`, `src/tally.rs` | a rate limit per log call site, and bounded RM class and control tallies |
-| `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and a replay of real mapping lifetimes against the allocator |
+| `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and a replay of real mapping lifetimes against the allocator; `WindowPlacer`, what a transport implements to place into the window and the UVM aperture |
 | `src/guarded.rs` | host-written buffers with a guard page behind them |
 | `src/virtio.rs` | device config and feature layout, asserted against `driver/nvgpu_wire.h` |
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |

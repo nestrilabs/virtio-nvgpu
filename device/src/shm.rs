@@ -627,6 +627,26 @@ pub trait WindowPlacer: Send {
     /// Return a range to empty. Not an unmap: leaving a hole would let a later
     /// access reach no mapping at all in a range the memory slot still covers.
     fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
+
+    /// Map `len` bytes of the UVM file `fd`, at its own offset `addr`, into
+    /// the UVM aperture (shared memory region 2) at `aperture_offset`.
+    ///
+    /// Not a window placement: UVM maps a semaphore pool only at the host
+    /// address equal to its offset (uvm.c:792), so the VMM maps it at `addr`
+    /// in its own address space and gives that range a memory slot of its
+    /// own in the aperture. What may be asked for is decided by `uvmmap.rs`.
+    /// A placer with no aperture refuses.
+    fn place_uvm(&self, aperture_offset: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
+        let _ = (aperture_offset, len, fd, addr);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+
+    /// Undo a `place_uvm`. The VMM removes the memory slot before the
+    /// mapping, so the guest never has a slot over nothing.
+    fn withdraw_uvm(&self, aperture_offset: u64, len: u64) -> Result<()> {
+        let _ = (aperture_offset, len);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
 }
 
 /// Whether the host lets `len` bytes of `fd` at `fd_offset` be mapped

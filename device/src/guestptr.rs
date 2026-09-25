@@ -59,8 +59,9 @@
 //! - **UVM** (`uvm_gate`): nvidia-uvm works on the calling process's address
 //!   space, which is the backend's. Pageable memory access is forced off in
 //!   UVM_INITIALIZE (so neither HMM nor ATS can let the GPU fault in the
-//!   VMM's pages) -- with the flags the host's release has, and checked
-//!   with UVM's own query where it lacks the one that says so outright --
+//!   VMM's pages) -- with the flags the host's release has, multi-process
+//!   sharing mode among them, and checked with UVM's own query where it
+//!   lacks the one that says so outright --
 //!   and only commands that name UVM's own ranges, RM handles or
 //!   GPU state go through; the tools device and every command that copies
 //!   to or from a CPU buffer, pins one, or populates pages of the backend's
@@ -464,6 +465,13 @@ pub const UVM_INIT_FLAGS_DISABLE_HMM: u64 = 0x1;
 /// DISABLE_HMM is the only switch, and ATS the other way in: the backend asks
 /// UVM afterwards whether the VA space has pageable access (nvidia.rs).
 pub const UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
+/// UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE (uvm_types.h:67): the VA space
+/// is tied to no process's mm. Then any process may mmap the file
+/// (uvm.c:784), which is what lets the VMM map a semaphore pool the guest
+/// needs to reach (uvmmap.rs), and pageable access is off on every release
+/// (uvm_va_space.c:2079, :2095, which return before looking at HMM or ATS).
+/// In every measured release's mask (0x3 up to 595, 0x7 from 610.43.02).
+pub const UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE: u64 = 0x2;
 
 /// The UVM commands (uvm_ioctl.h numbers) that go through. Each names UVM's
 /// own ranges -- made by mmap of the UVM file, CREATE_EXTERNAL_RANGE or
@@ -549,7 +557,13 @@ pub(crate) fn uvm_gate(
         let Some(flags) = rd64(params, 0) else {
             return Err(libc::EINVAL);
         };
-        let off = (UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS | UVM_INIT_FLAGS_DISABLE_HMM)
+        // Sharing mode on top: one VA-space shape for every guest, whether or
+        // not it maps a pool, and it only takes things away (pageable access,
+        // the tie to our mm). MM_INITIALIZE then answers
+        // NV_WARN_NOTHING_TO_DO (uvm.c:80-84), which CUDA takes in its stride.
+        let off = (UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS
+            | UVM_INIT_FLAGS_DISABLE_HMM
+            | UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE)
             & init_flags_mask;
         if off & UVM_INIT_FLAGS_DISABLE_HMM == 0 {
             log::warn!("UVM_INITIALIZE refused: the host's UVM cannot be told to leave HMM off");
@@ -823,6 +837,38 @@ mod tests {
         // One that cannot even leave HMM off is not initialised at all.
         let mut p = vec![0u8; 16];
         assert_eq!(uvm_gate(false, UVM_INITIALIZE, &mut p, 0x2), Err(libc::EPERM));
+    }
+
+    /// Multi-process sharing mode is forced wherever the release takes it,
+    /// whatever the guest asked, and the guest reads back its own flags.
+    #[test]
+    fn uvm_is_initialised_in_sharing_mode_where_the_release_has_it() {
+        for (mask, want) in [(0x3, 0x3), (0x7, 0x7)] {
+            let mut p = vec![0u8; 16];
+            let r = uvm_gate(false, UVM_INITIALIZE, &mut p, mask).unwrap();
+            assert_eq!(rd64(&p, 0), Some(want), "mask {mask:#x}");
+            assert_ne!(want & UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE, 0);
+            r.apply(&mut p);
+            assert_eq!(rd64(&p, 0), Some(0), "the caller reads back its own flags");
+        }
+        // A release without it (none measured) is not handed the bit.
+        let mut p = vec![0u8; 16];
+        uvm_gate(false, UVM_INITIALIZE, &mut p, 0x1).unwrap();
+        assert_eq!(rd64(&p, 0), Some(0x1));
+    }
+
+    /// Every measured release takes sharing mode: the UVM aperture depends
+    /// on it (uvmmap.rs), and a release without it would quietly lose CUDA.
+    #[test]
+    fn every_measured_release_takes_sharing_mode() {
+        for t in abi::schema::UVM_TABLES {
+            assert_ne!(
+                t.init_flags_mask & UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE,
+                0,
+                "{}",
+                t.name
+            );
+        }
     }
 
     #[test]

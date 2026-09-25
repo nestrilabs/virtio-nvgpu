@@ -56,7 +56,7 @@ use device::shm::WindowPlacer;
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use device::wl::export::WlExport;
 use device::wl::{LeaseThrottle, WlConfig, WlLimits};
-use protocol::messages::{MsgHeader, MsgType};
+use protocol::messages::{MsgHeader, MsgType, SHM_ID_UVM};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
@@ -234,6 +234,55 @@ impl WindowPlacer for VhostWindow {
             .shmem_unmap(&req)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
+    }
+
+    /// The same request on the UVM aperture (shm id 2), with the pool's base
+    /// as the file offset: the VMM maps the file there, at that host address
+    /// (UVM takes no other), and gives it a memory slot at `aperture_offset`.
+    /// The VMM keeps no descriptor; its mapping holds the file.
+    fn place_uvm(
+        &self,
+        aperture_offset: u64,
+        len: u64,
+        fd: RawFd,
+        addr: u64,
+    ) -> device::error::Result<()> {
+        let req = uvm_mmap_msg(aperture_offset, len, addr);
+        // SAFETY: as in `place`: the handle table owns the descriptor for the
+        // whole of this call.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        self.0
+            .shmem_map(&req, &borrowed)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+
+    /// The VMM removes the memory slot, then its mapping, before it answers.
+    fn withdraw_uvm(&self, aperture_offset: u64, len: u64) -> device::error::Result<()> {
+        let req = VhostUserMMap {
+            shmid: SHM_ID_UVM,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: aperture_offset,
+            len,
+            flags: 0,
+        };
+        self.0
+            .shmem_unmap(&req)
+            .map(|_| ())
+            .map_err(device::error::DeviceError::Io)
+    }
+}
+
+/// SHMEM_MAP of a UVM pool: region 2, file offset = host address = `addr`.
+fn uvm_mmap_msg(aperture_offset: u64, len: u64, addr: u64) -> VhostUserMMap {
+    VhostUserMMap {
+        shmid: SHM_ID_UVM,
+        padding: [0; 7],
+        fd_offset: addr,
+        shm_offset: aperture_offset,
+        len,
+        flags: VhostUserMMapFlags::WRITABLE.bits(),
     }
 }
 
@@ -1349,6 +1398,73 @@ mod tests {
         mem.write_slice(b"world", a(0x900)).unwrap();
         let req = gather(&mem, &[(a(0x100), 6), (a(0x900), 5)], 11).unwrap();
         assert_eq!(req, b"hello world");
+    }
+
+    /// A UVM placement reaches the VMM as SHMEM_MAP on region 2 with the
+    /// pool's base as the file offset, carrying the descriptor and asking
+    /// for a reply; the withdraw as SHMEM_UNMAP of the same aperture range.
+    #[test]
+    fn a_uvm_placement_is_a_shmem_map_on_the_aperture_with_its_descriptor() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Mutex as StdMutex;
+        use vhost::vhost_user::message::VhostUserMMap as M;
+        use vhost::vhost_user::{FrontendReqHandler, HandlerResult};
+
+        #[derive(Default)]
+        struct Vmm(StdMutex<Vec<(&'static str, u8, u64, u64, u64, u64, bool)>>);
+        impl VhostUserFrontendReqHandler for Vmm {
+            fn shmem_map(&self, r: &M, fd: &dyn std::os::fd::AsRawFd) -> HandlerResult<u64> {
+                // SAFETY: fcntl on a descriptor the crate holds for this call.
+                let open = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0;
+                let (id, fo, so, len, fl) = (r.shmid, r.fd_offset, r.shm_offset, r.len, r.flags);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("map", id, fo, so, len, fl, open));
+                Ok(0)
+            }
+            fn shmem_unmap(&self, r: &M) -> HandlerResult<u64> {
+                let (id, fo, so, len, fl) = (r.shmid, r.fd_offset, r.shm_offset, r.len, r.flags);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("unmap", id, fo, so, len, fl, false));
+                Ok(0)
+            }
+        }
+
+        let vmm = Arc::new(Vmm::default());
+        let mut frontend = FrontendReqHandler::new(vmm.clone()).unwrap();
+        frontend.set_reply_ack_flag(true);
+        // SAFETY: dup of the frontend's end, owned by the stream from here.
+        let tx = unsafe {
+            <UnixStream as std::os::fd::FromRawFd>::from_raw_fd(libc::dup(frontend.get_tx_raw_fd()))
+        };
+        let backend = Backend::from_stream(tx);
+        backend.set_reply_ack_flag(true);
+        backend.set_shmem_flag(true);
+        let window = VhostWindow(backend);
+
+        let served = std::thread::spawn(move || {
+            frontend.handle_request().unwrap();
+            frontend.handle_request().unwrap();
+        });
+        let file = File::open("/dev/null").unwrap();
+        let x = 0x2_06e0_0000;
+        window
+            .place_uvm(0x40_0000, 0x20_0000, file.as_raw_fd(), x)
+            .unwrap();
+        window.withdraw_uvm(0x40_0000, 0x20_0000).unwrap();
+        served.join().unwrap();
+        let seen = vmm.0.lock().unwrap().clone();
+        let w = VhostUserMMapFlags::WRITABLE.bits();
+        assert_eq!(
+            seen,
+            vec![
+                ("map", 2, x, 0x40_0000, 0x20_0000, w, true),
+                ("unmap", 2, 0, 0x40_0000, 0x20_0000, 0, false),
+            ]
+        );
     }
 
     /// A vring's eventfds are in no handle table, so the private registry

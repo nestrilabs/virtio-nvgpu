@@ -150,6 +150,13 @@ struct nvgpu_device {
    * memory can be mapped on the host but never reached from here.
    */
   struct virtio_shm_region window;
+  /*
+   * The UVM aperture (shared memory region NVGPU_SHM_ID_UVM): where the VMM
+   * gives each UVM semaphore pool a memory slot of its own, since UVM maps a
+   * pool only at the host address equal to its offset and the window cannot
+   * be that. Zero-length when the VMM offers none; HELLO tells the backend.
+   */
+  struct virtio_shm_region uvm_aperture;
   struct virtio_device *vdev;
   struct virtqueue *ctrl_vq;
   struct virtqueue *event_vq;

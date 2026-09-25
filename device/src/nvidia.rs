@@ -566,6 +566,9 @@ pub struct NvidiaBackend {
     /// be shown not to (`uvm_pageable_off`): nothing more goes to them, and no
     /// other file's call may name them.
     uvm_refused: std::collections::HashSet<u32>,
+    /// UVM semaphore pools the guest may map, and those placed in the UVM
+    /// aperture (uvmmap.rs).
+    pub(crate) uvm_maps: crate::uvmmap::UvmMaps,
     /// Wayland channels (`DEV_WAYLAND` handles) and what configures them.
     pub(crate) wl: crate::wl::WlState,
     /// What the RM handles a mapping can name are (system memory and its
@@ -1021,6 +1024,7 @@ impl NvidiaBackend {
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
             uvm_refused: std::collections::HashSet::new(),
+            uvm_maps: crate::uvmmap::UvmMaps::default(),
             wl: crate::wl::WlState::default(),
             rmmem: crate::rmmem::RmMem::default(),
         }
@@ -1110,6 +1114,11 @@ impl NvidiaBackend {
     }
 
     /// How many host descriptors the guest currently holds open.
+    /// Whether a placer is attached (the transport's request channel is up).
+    pub(crate) fn has_window(&self) -> bool {
+        self.window.is_some()
+    }
+
     pub fn handle_count(&self) -> usize {
         self.handles.len()
     }
@@ -1265,6 +1274,12 @@ impl NvidiaBackend {
     /// still live when the process ends -- and the window must not keep host
     /// device memory mapped into a range the next session will be handed.
     pub(crate) fn release_all(&mut self) {
+        // UVM pools first, while their files are still open here: the VMM's
+        // mapping may hold a file's last reference, and its teardown belongs
+        // to this process's close, not to the VMM's munmap.
+        for w in self.uvm_maps.take_all() {
+            self.withdraw_uvm(w, "session end");
+        }
         let live: Vec<LiveMap> = self.live_maps.drain().map(|(_, m)| m).collect();
         for m in live {
             self.release_extent(&m.region, m.length, "session end");
@@ -1312,6 +1327,20 @@ impl NvidiaBackend {
         }
         if let Err(e) = self.shm.free(region) {
             log::warn!("{why}: freeing window region {:#x}: {e}", region.offset);
+        }
+    }
+
+    /// Ask the VMM to take a UVM pool out of the aperture: its memory slot,
+    /// then its mapping (the VMM's order). A failure is logged and the
+    /// aperture space is ours again anyway: the VMM is gone, or has already
+    /// dropped it.
+    fn withdraw_uvm(&self, (off, len): crate::uvmmap::Withdraw, why: &str) {
+        match self.window.as_ref().map(|w| w.withdraw_uvm(off, len)) {
+            Some(Ok(())) => log::info!("{why}: UVM pool at aperture {off:#x}+{len:#x} withdrawn"),
+            Some(Err(e)) => log::warn!(
+                "{why}: the VMM would not withdraw the UVM pool at aperture {off:#x}+{len:#x}: {e}"
+            ),
+            None => log::warn!("{why}: no window to withdraw aperture {off:#x}+{len:#x} from"),
         }
     }
 
@@ -1598,6 +1627,17 @@ impl NvidiaBackend {
             }
         }
 
+        // A UVM file's mapping is a semaphore pool, which UVM maps only at the
+        // host address equal to its offset -- never in the window. Sent there,
+        // the VMM's mmap of it failed and took the window's request channel
+        // down with it.
+        if matches!(
+            self.current_kind(),
+            Some(HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools))
+        ) {
+            return self.uvm_mmap(&req, resp_buf);
+        }
+
         // A DRM node never takes the recorded path. Its bookkeeping is keyed by
         // the file, and one open of a node holds every object a client ever
         // allocates -- so the second object's mmap would find the first one's
@@ -1670,6 +1710,80 @@ impl NvidiaBackend {
             entry.region.pgprot,
             entry.writable,
         )
+    }
+
+    /// MMAP of a UVM file: one of its semaphore pools, exactly, placed in
+    /// the UVM aperture at the pool's own host address (uvmmap.rs).
+    fn uvm_mmap(&mut self, req: &MmapReq, resp_buf: &mut [u8]) -> usize {
+        let handle = self.current_handle;
+        if self.current_kind() == Some(HandleKind::Dev(DeviceKind::UvmTools)) {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EPERM);
+        }
+        if !self.session.v2 || self.window.is_none() {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
+        let Ok(host_fd) = self.handles.get_raw(handle) else {
+            return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT);
+        };
+        // Before anything is placed: a placement whose reply cannot be
+        // written would hold a reference no guest mapping will ever give back.
+        if resp_buf.len() < size_of::<MsgHeader>() + size_of::<MmapResp>() {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+        }
+        let (base, len) = (req.offset, req.size);
+        let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
+            Ok(p) => p,
+            Err(errno) => {
+                log::info!(
+                    "mmap of UVM handle {handle} at {base:#x}+{len:#x} (prot {}) refused: {}",
+                    req.prot,
+                    std::io::Error::from_raw_os_error(errno)
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, errno);
+            }
+        };
+        let (off, id) = match plan {
+            crate::uvmmap::MmapPlan::Existing(p) => {
+                self.uvm_maps.add_ref(handle, base);
+                (p.aperture_off, p.mapping_id)
+            }
+            crate::uvmmap::MmapPlan::New { aperture_off } => {
+                let id = self.next_mapping_id();
+                let placed = self.window.as_ref().expect("checked above").place_uvm(
+                    aperture_off,
+                    len,
+                    host_fd,
+                    base,
+                );
+                if let Err(e) = placed {
+                    self.uvm_maps.abort(aperture_off, len);
+                    log::warn!(
+                        "mmap of UVM handle {handle}: the VMM would not map {base:#x}+{len:#x} \
+                         at aperture {aperture_off:#x}: {e}"
+                    );
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
+                }
+                self.uvm_maps.commit(handle, base, aperture_off, id);
+                log::info!(
+                    "mmap of UVM handle {handle}: pool {base:#x}+{len:#x} at aperture \
+                     {aperture_off:#x}, id {id}"
+                );
+                (aperture_off, id)
+            }
+        };
+        let mut n = self.write_hdr(resp_buf, handle, 0);
+        n += write_struct(
+            &mut resp_buf[n..],
+            &MmapResp {
+                guest_phys_addr: off,
+                size: len,
+                mapping_id: id,
+                caching: MMAP_CACHE_WB,
+                flags: MMAP_F_UVM_APERTURE,
+                reserved: 0,
+            },
+        );
+        n
     }
 
     fn current_kind(&self) -> Option<HandleKind> {
@@ -1905,7 +2019,10 @@ impl NvidiaBackend {
         loop {
             let id = self.next_mapping_id;
             self.next_mapping_id = self.next_mapping_id.wrapping_add(1).max(1);
-            if !self.live_maps.contains_key(&id) && !self.active_maps.has_mapping_id(id) {
+            if !self.live_maps.contains_key(&id)
+                && !self.active_maps.has_mapping_id(id)
+                && !self.uvm_maps.has_mapping_id(id)
+            {
                 return id;
             }
         }
@@ -1944,6 +2061,17 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL);
         }
         let req = read_struct::<MunmapReq>(payload, 0);
+
+        // A UVM pool in the aperture: the last of its MMAP replies given back
+        // takes it out. Only the handle that mapped it can.
+        match self.uvm_maps.munmap(self.current_handle, req.mapping_id) {
+            Some(Some(w)) => {
+                self.withdraw_uvm(w, "munmap");
+                return self.write_hdr(resp_buf, 0, 0);
+            }
+            Some(None) => return self.write_hdr(resp_buf, 0, 0),
+            None => {}
+        }
 
         // An RM mapping still in force: its vmas are counted here, and its
         // extent stays with it until RM_UNMAP_MEMORY or its file's close,
@@ -2086,6 +2214,11 @@ impl NvidiaBackend {
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
         let (fd, kind) = self.handles.remove(handle)?;
+        // Its UVM pools leave the VMM while `fd` is still open here, so the
+        // file's last reference, and UVM's teardown of it, stay ours.
+        for w in self.uvm_maps.take_handle(handle) {
+            self.withdraw_uvm(w, "close");
+        }
         self.uvm_refused.remove(&handle);
         for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
@@ -2382,6 +2515,7 @@ impl NvidiaBackend {
                 {
                     self.uvm_pageable_off(host_fd, resp_buf, n);
                 }
+                self.uvm_observe(ireq.cmd, &params, resp_buf, n, init_flags_mask);
                 Self::restore_reply(&restore, resp_buf, n);
                 if let Some((off, handle)) = fd_field {
                     let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
@@ -4019,6 +4153,62 @@ impl NvidiaBackend {
         );
         self.uvm_refused.insert(self.current_handle);
         resp_buf[st..st + 4].copy_from_slice(&NV_ERR_NOT_SUPPORTED.to_le_bytes());
+    }
+
+    /// What a UVM call that went through means for the aperture: a VA space
+    /// in sharing mode, a semaphore pool made, a range freed. `sent` is the
+    /// block the host was handed (the guest's, with our changes); success is
+    /// the ioctl's and UVM's own status in the block, at `size - 8` for all
+    /// three on every release.
+    fn uvm_observe(
+        &mut self,
+        cmd: u32,
+        sent: &[u8],
+        resp_buf: &[u8],
+        n: usize,
+        init_flags_mask: u64,
+    ) {
+        use crate::uvmmap::{ALLOC_SEMAPHORE_POOL, FREE};
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let size = sent.len();
+        if size < 16 || n < body + size || read_struct::<MsgHeader>(resp_buf, 0).status != 0 {
+            return;
+        }
+        let at = body + size - 8;
+        if u32::from_le_bytes(resp_buf[at..at + 4].try_into().unwrap()) != 0 {
+            return;
+        }
+        let word = |off: usize| u64::from_le_bytes(sent[off..off + 8].try_into().unwrap());
+        let handle = self.current_handle;
+        match cmd {
+            crate::guestptr::UVM_INITIALIZE
+                if init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
+                    != 0
+                    && !self.uvm_refused.contains(&handle) =>
+            {
+                self.uvm_maps.mark_shared(handle);
+            }
+            ALLOC_SEMAPHORE_POOL if self.uvm_maps.is_shared(handle) => {
+                let (base, len) = (word(0), word(8));
+                let (_, stale) = self.uvm_maps.record(handle, base, len);
+                if let Some(w) = stale {
+                    log::error!(
+                        "UVM handle {handle}: a new pool at {base:#x} replaced a placed one"
+                    );
+                    self.withdraw_uvm(w, "alloc");
+                }
+            }
+            FREE => {
+                // UVM refuses to free a pool that is still mapped (the VMM's
+                // mapping counts), so a placement here means our records were
+                // wrong; take it out rather than leave a slot on freed pages.
+                if let Some(w) = self.uvm_maps.forget(handle, word(0)) {
+                    log::error!("UVM handle {handle}: FREE succeeded on a placed pool");
+                    self.withdraw_uvm(w, "free");
+                }
+            }
+            _ => {}
+        }
     }
 
     fn uvm_fd_in(
@@ -6493,5 +6683,481 @@ mod mapping_tests {
         e.be.session_reset("test");
         assert_eq!(e.window.withdrawn(), vec![linear]);
         assert_eq!(e.be.shm_free_bytes(), empty);
+    }
+}
+
+/// UVM semaphore pools in the UVM aperture (uvmmap.rs), end to end through
+/// `dispatch`: a fake UVM that makes and frees pools, and a fake VMM that
+/// records what it was asked to place and withdraw.
+#[cfg(test)]
+mod uvm_map_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const X: u64 = 0x2_06e0_0000;
+    const L: u64 = 2 << 20;
+    /// UVM_ALLOC_SEMAPHORE_POOL's block on 595.99.02 (256 GPUs).
+    const POOL: usize = 9248;
+    const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
+    const BODY: usize = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+
+    std::thread_local! {
+        static ALLOC_STATUS: Cell<u32> = const { Cell::new(0) };
+        static FREE_STATUS: Cell<u32> = const { Cell::new(0) };
+        static HOST: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// UVM as far as a pool's life goes: INITIALIZE and the pageable check
+    /// succeed, ALLOC and FREE answer what the test set.
+    unsafe fn fake_uvm(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        HOST.with(|h| h.borrow_mut().push(request));
+        let put = |off: usize, v: u32| {
+            // SAFETY: every block below is longer than `off + 4`.
+            unsafe { arg.add(off).cast::<u32>().write_unaligned(v) }
+        };
+        match request {
+            0x3000_0001 => put(8, 0),
+            39 => {
+                put(0, 0);
+                put(4, 0);
+            }
+            68 => put(POOL - 8, ALLOC_STATUS.with(Cell::get)),
+            34 => put(8, FREE_STATUS.with(Cell::get)),
+            _ => {}
+        }
+        0
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Call {
+        Place(u64),
+        PlaceUvm {
+            off: u64,
+            len: u64,
+            addr: u64,
+        },
+        /// `file_open`: the descriptor handed to the matching `PlaceUvm` is
+        /// still the same open file when the withdraw comes.
+        WithdrawUvm {
+            off: u64,
+            len: u64,
+            file_open: bool,
+        },
+    }
+
+    fn ino(fd: RawFd) -> Option<u64> {
+        // SAFETY: fstat into a local.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
+    }
+
+    #[derive(Clone, Default)]
+    struct Vmm {
+        calls: Arc<Mutex<Vec<Call>>>,
+        fds: Arc<Mutex<HashMap<u64, (RawFd, u64)>>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl crate::shm::WindowPlacer for Vmm {
+        fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, _w: bool) -> Result<()> {
+            self.calls.lock().unwrap().push(Call::Place(off));
+            Ok(())
+        }
+        fn withdraw(&self, _off: u64, _len: u64) -> Result<()> {
+            Ok(())
+        }
+        fn place_uvm(&self, off: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST).into());
+            }
+            self.fds.lock().unwrap().insert(off, (fd, ino(fd).unwrap()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::PlaceUvm { off, len, addr });
+            Ok(())
+        }
+        fn withdraw_uvm(&self, off: u64, len: u64) -> Result<()> {
+            let file_open = self
+                .fds
+                .lock()
+                .unwrap()
+                .remove(&off)
+                .is_some_and(|(fd, i)| ino(fd) == Some(i));
+            self.calls.lock().unwrap().push(Call::WithdrawUvm {
+                off,
+                len,
+                file_open,
+            });
+            Ok(())
+        }
+    }
+
+    fn memfd() -> OwnedFd {
+        // SAFETY: plain syscalls; ownership of the new fd passes to OwnedFd.
+        unsafe {
+            let fd = libc::memfd_create(c"uvm".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            OwnedFd::from_raw_fd(fd)
+        }
+    }
+
+    fn msg<T: Copy>(t: MsgType, handle: u32, body: &T) -> Vec<u8> {
+        let mut v = vec![0u8; size_of::<MsgHeader>() + size_of::<T>()];
+        let n = write_struct(
+            &mut v,
+            &MsgHeader {
+                msg_type: t as u32,
+                handle,
+                status: 0,
+                req_id: 0,
+            },
+        );
+        write_struct(&mut v[n..], body);
+        v
+    }
+
+    fn status(resp: &[u8]) -> i32 {
+        read_struct::<MsgHeader>(resp, 0).status
+    }
+
+    struct Env {
+        be: NvidiaBackend,
+        vmm: Vmm,
+    }
+
+    /// A v2 session on 595.99.02 whose guest said it has a 1 GiB aperture,
+    /// or none.
+    fn env(aperture: bool) -> Env {
+        ALLOC_STATUS.with(|s| s.set(0));
+        FREE_STATUS.with(|s| s.set(0));
+        HOST.with(|h| h.borrow_mut().clear());
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_uvm);
+        be.set_host_driver_version("595.99.02");
+        let vmm = Vmm::default();
+        be.set_window(Box::new(vmm.clone()));
+        let mut e = Env { be, vmm };
+        let caps = e.hello(aperture);
+        assert_eq!(caps & BCAP_UVM_MAP != 0, aperture);
+        e
+    }
+
+    impl Env {
+        fn hello(&mut self, aperture: bool) -> u32 {
+            let req = HelloReq {
+                proto: PROTO_V2,
+                flags: HELLO_F_FRESH,
+                guest_caps: if aperture { GCAP_UVM_APERTURE } else { 0 },
+                uvm_aperture_mib: if aperture { 1024 } else { 0 },
+            };
+            let mut resp = vec![0u8; 256];
+            self.be.dispatch(&msg(MsgType::Hello, 0, &req), &mut resp);
+            assert_eq!(status(&resp), 0);
+            read_struct::<HelloResp>(&resp, size_of::<MsgHeader>()).backend_caps
+        }
+
+        fn ioctl(&mut self, h: u32, cmd: u32, params: &[u8]) -> Vec<u8> {
+            let mut req = msg(
+                MsgType::Ioctl,
+                h,
+                &IoctlReq {
+                    cmd,
+                    data_len: params.len() as u32,
+                    ..Default::default()
+                },
+            );
+            req.extend_from_slice(params);
+            let mut resp = vec![0u8; 256 + params.len()];
+            let n = self.be.dispatch(&req, &mut resp);
+            resp.truncate(n);
+            resp
+        }
+
+        /// A UVM file, initialised.
+        fn uvm(&mut self) -> u32 {
+            let h = self
+                .be
+                .adopt_for_test(memfd(), HandleKind::Dev(DeviceKind::Uvm));
+            assert_eq!(status(&self.ioctl(h, 0x3000_0001, &[0u8; 16])), 0);
+            h
+        }
+
+        fn alloc(&mut self, h: u32, base: u64, len: u64) {
+            let mut p = vec![0u8; POOL];
+            p[0..8].copy_from_slice(&base.to_le_bytes());
+            p[8..16].copy_from_slice(&len.to_le_bytes());
+            assert_eq!(status(&self.ioctl(h, 68, &p)), 0);
+        }
+
+        /// UVM_FREE; the rmStatus the host answered.
+        fn free(&mut self, h: u32, base: u64) -> u32 {
+            let mut p = [0u8; 16];
+            p[0..8].copy_from_slice(&base.to_le_bytes());
+            let r = self.ioctl(h, 34, &p);
+            assert_eq!(status(&r), 0);
+            u32::from_le_bytes(r[BODY + 8..BODY + 12].try_into().unwrap())
+        }
+
+        fn mmap(
+            &mut self,
+            h: u32,
+            offset: u64,
+            size: u64,
+            prot: u32,
+        ) -> std::result::Result<MmapResp, i32> {
+            let req = MmapReq {
+                size,
+                offset,
+                prot,
+                padding: 0,
+            };
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&msg(MsgType::Mmap, h, &req), &mut resp);
+            match status(&resp) {
+                0 => Ok(read_struct::<MmapResp>(&resp, size_of::<MsgHeader>())),
+                e => Err(-e),
+            }
+        }
+
+        fn munmap(&mut self, h: u32, id: u32) {
+            let req = MunmapReq {
+                mapping_id: id,
+                padding: 0,
+            };
+            let mut resp = vec![0u8; 64];
+            self.be.dispatch(&msg(MsgType::Munmap, h, &req), &mut resp);
+            assert_eq!(status(&resp), 0);
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            std::mem::take(&mut *self.vmm.calls.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_pool_is_placed_at_its_own_address_and_mapped_write_back_from_the_aperture() {
+        let mut e = env(true);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        assert!(e.calls().is_empty());
+        let r = e.mmap(h, X, L, 3).unwrap();
+        assert_eq!((r.guest_phys_addr, r.size), (0, L));
+        assert_eq!(r.caching, MMAP_CACHE_WB);
+        assert_eq!(r.flags, MMAP_F_UVM_APERTURE);
+        assert_ne!(r.mapping_id, 0);
+        assert_eq!(
+            e.calls(),
+            vec![Call::PlaceUvm {
+                off: 0,
+                len: L,
+                addr: X
+            }]
+        );
+        e.munmap(h, r.mapping_id);
+        assert_eq!(
+            e.calls(),
+            vec![Call::WithdrawUvm {
+                off: 0,
+                len: L,
+                file_open: true
+            }]
+        );
+    }
+
+    #[test]
+    fn only_a_pool_of_the_same_file_asked_for_exactly_is_mapped() {
+        let mut e = env(true);
+        let h = e.uvm();
+        let other = e.uvm();
+        e.alloc(h, X, L);
+        for (file, off, len, prot) in [
+            (h, X + 4096, L - 4096, 3),
+            (h, X, 2 * L, 3),
+            (h, X, L - 4096, 3),
+            (h, X, L, 1),
+            (h, X + 0x1000_0000, L, 3),
+            (other, X, L, 3),
+        ] {
+            assert_eq!(
+                e.mmap(file, off, len, prot).map(|_| ()),
+                Err(libc::EINVAL),
+                "{file} {off:#x}+{len:#x} prot {prot}"
+            );
+        }
+        // A pool UVM did not make is not one.
+        ALLOC_STATUS.with(|s| s.set(NV_ERR_INVALID_ARGUMENT));
+        e.alloc(other, X, L);
+        assert_eq!(e.mmap(other, X, L, 3).map(|_| ()), Err(libc::EINVAL));
+        // The tools device maps nothing.
+        let tools =
+            e.be.adopt_for_test(memfd(), HandleKind::Dev(DeviceKind::UvmTools));
+        assert_eq!(e.mmap(tools, X, L, 3).map(|_| ()), Err(libc::EPERM));
+        assert!(e.calls().is_empty(), "the VMM was never asked");
+    }
+
+    /// Without the aperture, a UVM mmap is refused as it always was -- and
+    /// never goes to the window, where the VMM's mmap of a UVM file failed
+    /// and took the request channel down with it (F2).
+    #[test]
+    fn without_the_aperture_a_uvm_mmap_never_reaches_the_vmm() {
+        let mut e = env(false);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        assert_eq!(e.mmap(h, X, L, 3).map(|_| ()), Err(libc::EINVAL));
+        assert_eq!(e.mmap(h, 0, 4096, 3).map(|_| ()), Err(libc::EINVAL));
+        assert!(e.calls().is_empty());
+        // Nor on a v1 session.
+        e.be.session_reset("test");
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        assert_eq!(e.mmap(h, X, L, 3).map(|_| ()), Err(libc::EINVAL));
+        assert!(e.calls().is_empty());
+    }
+
+    #[test]
+    fn a_placement_the_vmm_refuses_is_enomem_and_gives_its_space_back() {
+        let mut e = env(true);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        e.vmm.fail.store(true, Ordering::Relaxed);
+        assert_eq!(e.mmap(h, X, L, 3).map(|_| ()), Err(libc::ENOMEM));
+        e.vmm.fail.store(false, Ordering::Relaxed);
+        assert_eq!(e.mmap(h, X, L, 3).unwrap().guest_phys_addr, 0);
+    }
+
+    /// FREE goes to the host as it is: while the VMM maps the pool, UVM
+    /// refuses it, as it refuses a native process that still maps it, and
+    /// the placement stays. Once the last MUNMAP took it out, FREE succeeds
+    /// and the record goes.
+    #[test]
+    fn free_is_forwarded_while_placed_and_the_hosts_refusal_keeps_the_placement() {
+        let mut e = env(true);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        let r = e.mmap(h, X, L, 3).unwrap();
+        e.calls();
+        FREE_STATUS.with(|s| s.set(NV_ERR_INVALID_ARGUMENT));
+        HOST.with(|h| h.borrow_mut().clear());
+        assert_eq!(e.free(h, X), NV_ERR_INVALID_ARGUMENT);
+        assert_eq!(HOST.with(|h| h.borrow().clone()), vec![34], "forwarded");
+        assert!(e.calls().is_empty(), "still placed");
+        e.munmap(h, r.mapping_id);
+        assert!(matches!(e.calls()[..], [Call::WithdrawUvm { .. }]));
+        FREE_STATUS.with(|s| s.set(0));
+        assert_eq!(e.free(h, X), 0);
+        assert_eq!(
+            e.mmap(h, X, L, 3).map(|_| ()),
+            Err(libc::EINVAL),
+            "forgotten"
+        );
+        // A host that did free a placed pool: the slot goes as soon as the
+        // backend hears of it.
+        e.alloc(h, X, L);
+        e.mmap(h, X, L, 3).unwrap();
+        e.calls();
+        assert_eq!(e.free(h, X), 0);
+        assert!(matches!(e.calls()[..], [Call::WithdrawUvm { .. }]));
+    }
+
+    #[test]
+    fn closing_a_uvm_file_withdraws_its_pools_while_the_file_is_still_open() {
+        let mut e = env(true);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        e.alloc(h, X + 0x1000_0000, L);
+        e.mmap(h, X, L, 3).unwrap();
+        e.mmap(h, X + 0x1000_0000, L, 3).unwrap();
+        e.calls();
+        let mut resp = vec![0u8; 64];
+        e.be.dispatch(&msg(MsgType::Close, h, &[0u8; 0]), &mut resp);
+        assert_eq!(status(&resp), 0);
+        let calls = e.calls();
+        assert_eq!(calls.len(), 2);
+        for c in calls {
+            assert!(
+                matches!(
+                    c,
+                    Call::WithdrawUvm {
+                        file_open: true,
+                        ..
+                    }
+                ),
+                "{c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_hello_withdraws_every_pool_and_asks_for_the_aperture_again() {
+        let mut e = env(true);
+        let (a, b) = (e.uvm(), e.uvm());
+        e.alloc(a, X, L);
+        e.alloc(b, X + 0x1000_0000, L);
+        e.mmap(a, X, L, 3).unwrap();
+        e.mmap(b, X + 0x1000_0000, L, 3).unwrap();
+        e.calls();
+        assert_ne!(e.hello(true) & BCAP_UVM_MAP, 0);
+        let calls = e.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|c| matches!(
+            c,
+            Call::WithdrawUvm {
+                file_open: true,
+                ..
+            }
+        )));
+        assert_eq!(e.be.uvm_maps.placements(), 0);
+    }
+
+    #[test]
+    fn two_files_cannot_map_pools_at_one_host_address() {
+        let mut e = env(true);
+        let (a, b) = (e.uvm(), e.uvm());
+        e.alloc(a, X, L);
+        e.alloc(b, X, L);
+        e.mmap(a, X, L, 3).unwrap();
+        e.calls();
+        assert_eq!(e.mmap(b, X, L, 3).map(|_| ()), Err(libc::EEXIST));
+        assert!(e.calls().is_empty(), "refused before the VMM is asked");
+    }
+
+    #[test]
+    fn a_second_mmap_shares_the_placement_until_the_last_munmap() {
+        let mut e = env(true);
+        let (h, other) = (e.uvm(), e.uvm());
+        e.alloc(h, X, L);
+        let a = e.mmap(h, X, L, 3).unwrap();
+        let b = e.mmap(h, X, L, 3).unwrap();
+        assert_eq!(
+            (a.guest_phys_addr, a.mapping_id),
+            (b.guest_phys_addr, b.mapping_id)
+        );
+        assert_eq!(e.calls().len(), 1);
+        e.munmap(other, a.mapping_id);
+        e.munmap(h, a.mapping_id);
+        assert!(
+            e.calls().is_empty(),
+            "another file's MUNMAP, then one of two"
+        );
+        e.munmap(h, a.mapping_id);
+        assert!(matches!(e.calls()[..], [Call::WithdrawUvm { .. }]));
+    }
+
+    #[test]
+    fn mapping_ids_never_repeat_a_live_uvm_placements() {
+        let mut e = env(true);
+        let h = e.uvm();
+        e.alloc(h, X, L);
+        let id = e.mmap(h, X, L, 3).unwrap().mapping_id;
+        e.be.next_mapping_id = id;
+        let dri = e.be.adopt_for_test(memfd(), HandleKind::DriRender(0));
+        let r = e.mmap(dri, 0, 4096, 3).unwrap();
+        assert_ne!(r.mapping_id, id);
+        assert!(matches!(e.calls()[..], [_, Call::Place(_)]));
     }
 }
