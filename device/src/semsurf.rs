@@ -221,14 +221,23 @@ impl SemsurfPolicy {
     }
 
     /// `handle` was closed: whatever was allocated through it, named by it
-    /// or counted against it is gone (or no longer ours to name).
-    pub fn forget_handle(&self, handle: u32) {
+    /// or counted against it is gone (or no longer ours to name). Returns
+    /// the RM clients that died with it, for the memory records (rmmem.rs),
+    /// which keep no client set of their own.
+    pub fn forget_handle(&self, handle: u32) -> Vec<u32> {
         let mut g = self.lock();
         g.renders.remove(&handle);
+        let gone: Vec<u32> = g
+            .clients
+            .iter()
+            .filter(|&(_, &issuer)| issuer == handle)
+            .map(|(&c, _)| c)
+            .collect();
         g.clients.retain(|_, issuer| *issuer != handle);
         g.os_events
             .retain(|&(_, event), issuer| *issuer != handle && event != handle);
         g.ctxs.remove(&handle);
+        gone
     }
 
     /// The session is gone. The layouts stay: they are the host's.

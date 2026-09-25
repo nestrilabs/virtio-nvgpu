@@ -42,7 +42,8 @@
 //! **The records.** Every RM object this backend saw allocated as system
 //! memory or as a usermode (doorbell) aperture, by (hClient, handle), carried
 //! through DUP_OBJECT and dropped on FREE or with the file its client lives
-//! on: what a later RM_MAP_MEMORY of it is
+//! on (which clients those are is the backend's one client set, kept by
+//! semsurf.rs for H-1): what a later RM_MAP_MEMORY of it is
 //! mapped as on the host (M-1), and whether a GPU mapping of it must snoop.
 
 use std::collections::HashMap;
@@ -58,7 +59,7 @@ const NV01_CONTEXT_DMA: u32 = 0x02;
 /// NV01_ROOT, NV01_ROOT_NON_PRIV, NV01_ROOT_CLIENT: a new RM client, which
 /// lives as long as the file it was allocated on (escape.c:471-481 forces
 /// every one to _CLIENT; the host frees it when that file closes).
-const ROOT_CLASSES: [u32; 3] = [0x00, 0x01, 0x41];
+use crate::semsurf::ROOT_CLASSES;
 const NV01_MEMORY_SYSTEM: u32 = 0x3e;
 /// VOLTA..BLACKWELL_USERMODE_A: the doorbell aperture, a slice of BAR0
 /// (ADDR_REGMEM, kernel_fifo_gv100.c:371-374), which the host maps UC
@@ -191,8 +192,9 @@ enum Record {
         /// ALLOC_MEMORY arms a mapping on this guest file (escape.c:415-431),
         /// which the mmap that follows arrives on with no RM_MAP_MEMORY.
         armed_on: Option<u32>,
-        /// A new client, allocated on this guest file.
-        client_of: Option<u32>,
+        /// A new client: nothing to record here. The backend's client set
+        /// (semsurf.rs) says which file it dies with.
+        is_client: bool,
     },
     Dup,
     Free,
@@ -206,11 +208,6 @@ pub(crate) struct RmMem {
     objects: HashMap<(u32, u32), Mem>,
     /// Guest file handle -> what an ALLOC_MEMORY armed on it.
     armed: HashMap<u32, Mem>,
-    /// hClient -> the guest file it was allocated on. The host frees a
-    /// client, and everything under it, when that file closes, with no
-    /// RM_FREE for us to see; without this a guest that runs one process
-    /// after another would fill the table with objects long gone.
-    clients: HashMap<u32, u32>,
     full_warned: bool,
 }
 
@@ -220,7 +217,6 @@ impl Default for RmMem {
             coherent: true,
             objects: HashMap::new(),
             armed: HashMap::new(),
-            clients: HashMap::new(),
             full_warned: false,
         }
     }
@@ -283,20 +279,15 @@ impl RmMem {
     }
 
     /// A guest file closed: nothing can be mapped through it any more, and
-    /// the clients allocated on it are gone on the host with all they held.
-    pub(crate) fn forget_fd(&mut self, handle: u32) {
+    /// `gone`, the clients allocated on it, are gone on the host with all
+    /// they held. The host frees them with no RM_FREE for us to see; without
+    /// this a guest that runs one process after another would fill the table
+    /// with objects long gone. `gone` comes from the backend's client set
+    /// ([`crate::semsurf::SemsurfPolicy::forget_handle`]).
+    pub(crate) fn forget_fd(&mut self, handle: u32, gone: &[u32]) {
         self.armed.remove(&handle);
-        let gone: Vec<u32> = self
-            .clients
-            .iter()
-            .filter(|&(_, &f)| f == handle)
-            .map(|(&c, _)| c)
-            .collect();
         if gone.is_empty() {
             return;
-        }
-        for c in &gone {
-            self.clients.remove(c);
         }
         self.objects.retain(|(c, _), _| !gone.contains(c));
     }
@@ -305,7 +296,6 @@ impl RmMem {
     pub(crate) fn clear(&mut self) {
         self.objects.clear();
         self.armed.clear();
-        self.clients.clear();
     }
 
     /// COHERENCY for a new system-memory allocation asking for `asked`:
@@ -324,7 +314,7 @@ impl RmMem {
     /// its way to the host, issued on guest file `file`. `params` is the
     /// whole block the host will see (for RM_ALLOC: the 48-byte NVOS64 and
     /// the class parameters after it).
-    pub(crate) fn before(&self, escape: u32, file: u32, params: &mut [u8]) -> Pending {
+    pub(crate) fn before(&self, escape: u32, params: &mut [u8]) -> Pending {
         let mut p = Pending::default();
         match escape {
             NV_ESC_RM_ALLOC if params.len() >= ALLOC_OUTER => {
@@ -350,7 +340,7 @@ impl RmMem {
                     status: ALLOC_STATUS,
                     mem,
                     armed_on: None,
-                    client_of: ROOT_CLASSES.contains(&class).then_some(file),
+                    is_client: ROOT_CLASSES.contains(&class),
                 };
             }
             NV_ESC_RM_VID_HEAP_CONTROL if params.len() >= HEAP_SIZE => {
@@ -378,7 +368,7 @@ impl RmMem {
                         status: HEAP_STATUS,
                         mem,
                         armed_on: None,
-                        client_of: None,
+                        is_client: false,
                     };
                 }
             }
@@ -414,7 +404,7 @@ impl RmMem {
                     status: OS02_STATUS,
                     mem,
                     armed_on: (fd as i32 >= 0).then_some(fd),
-                    client_of: None,
+                    is_client: false,
                 };
             }
             NV_ESC_RM_MAP_MEMORY_DMA if params.len() >= OS46_FLAGS + 4 => {
@@ -501,7 +491,7 @@ impl RmMem {
                 status,
                 mem,
                 armed_on,
-                client_of,
+                is_client,
             } => {
                 if rd32(reply, status) != Some(0) {
                     return;
@@ -509,9 +499,9 @@ impl RmMem {
                 let (Some(c), Some(h)) = (rd32(reply, client), rd32(reply, handle)) else {
                     return;
                 };
-                if let Some(file) = client_of {
-                    // A root allocation names the new client in hObjectNew.
-                    self.clients.insert(h, file);
+                if is_client {
+                    // A root allocation: the new client itself holds no
+                    // memory, and semsurf.rs keeps the client set.
                     return;
                 }
                 self.set(c, h, mem);
@@ -537,7 +527,6 @@ impl RmMem {
                 );
                 if old == root {
                     // The client, and with it everything it held.
-                    self.clients.remove(&root);
                     self.objects.retain(|&(c, _), _| c != root);
                 } else {
                     self.objects.remove(&(root, old));
@@ -648,7 +637,7 @@ mod tests {
         status_at: Option<usize>,
     ) -> (Vec<u8>, Vec<u8>) {
         let mut host = params.to_vec();
-        let p = m.before(escape, 1, &mut host);
+        let p = m.before(escape, &mut host);
         let seen = host.clone();
         if let Some(s) = status_at {
             put(&mut host, s, 0);
@@ -717,7 +706,7 @@ mod tests {
         let mut m = RmMem::default();
         let req = sysmem_alloc(9, 0, 0);
         let mut host = req.clone();
-        let p = m.before(NV_ESC_RM_ALLOC, 1, &mut host);
+        let p = m.before(NV_ESC_RM_ALLOC, &mut host);
         put(&mut host, ALLOC_STATUS, 0x1f);
         m.after(p, &mut host);
         assert_eq!(m.lookup(CLIENT, 9), None);
@@ -786,7 +775,7 @@ mod tests {
         );
         assert_eq!(rd32(&back, OS02_FLAGS), rd32(&b, OS02_FLAGS));
         assert_eq!(m.armed(42).map(Mem::pgprot), Some(PgprotKind::WriteBack));
-        m.forget_fd(42);
+        m.forget_fd(42, &[]);
         assert_eq!(m.armed(42), None);
     }
 
@@ -914,8 +903,9 @@ mod tests {
         put(&mut root, ALLOC_NEW, CLIENT);
         put(&mut root, ALLOC_CLASS, 0x41);
         let mut host = root.clone();
-        let p = m.before(NV_ESC_RM_ALLOC, 7, &mut host);
+        let p = m.before(NV_ESC_RM_ALLOC, &mut host);
         m.after(p, &mut host);
+        assert_eq!(m.lookup(CLIENT, CLIENT), None, "a client is not memory");
         run(
             &mut m,
             NV_ESC_RM_ALLOC,
@@ -923,9 +913,9 @@ mod tests {
             Some(ALLOC_STATUS),
         );
         assert!(m.lookup(CLIENT, 0x60).is_some());
-        m.forget_fd(8);
+        m.forget_fd(8, &[]);
         assert!(m.lookup(CLIENT, 0x60).is_some(), "another file's close");
-        m.forget_fd(7);
+        m.forget_fd(7, &[CLIENT]);
         assert_eq!(m.lookup(CLIENT, 0x60), None);
     }
 

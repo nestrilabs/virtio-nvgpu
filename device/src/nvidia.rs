@@ -2058,12 +2058,14 @@ impl NvidiaBackend {
             );
             self.end_rm_mapping(entry, "close");
         }
-        self.rmmem.forget_fd(handle);
+        // The one client set (semsurf.rs) says which RM clients died with
+        // this file; the memory records drop what those held.
+        let gone_clients = self.semsurf.forget_handle(handle);
+        self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.kms_states.remove(&handle);
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
-        self.semsurf.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);
@@ -2345,7 +2347,7 @@ impl NvidiaBackend {
             && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48)
         {
             let mut v = param_in.to_vec();
-            rm_pending = Some(self.rmmem.before(escape, self.current_handle, &mut v));
+            rm_pending = Some(self.rmmem.before(escape, &mut v));
             rm_copy = v;
             &rm_copy
         } else {
