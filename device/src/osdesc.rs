@@ -320,6 +320,15 @@ pub(crate) fn describe(cmd: u32, outer: &[u8], nested: &[u8]) -> Result<Call, Er
             if !size_is(OS02_SIZE) || !nested.is_empty() {
                 return refuse("not NVOS02 with its fd", libc::EINVAL);
             }
+            // A zero handle has RM generate one it never writes back
+            // (RmAllocOsDescriptor copies only the status out): the object
+            // would live under a handle nothing here could key it by, and a
+            // second such call -- or any ALLOC_MEMORY that makes an object
+            // under a zero handle -- would end its registration while RM
+            // still holds the pages.
+            if rd32(outer, OS02_NEW) == Some(0) {
+                return refuse("a zero hObjectNew", libc::EINVAL);
+            }
             // RmAllocOsDescriptor: ALLOC_USER_READ_ONLY makes ATTR2
             // PROTECTION_USER read-only, which RmCreateOsDescriptor pins for
             // (escape.c:260-261, 161).
@@ -1093,6 +1102,7 @@ mod tests {
 
     fn os02(va: u64, size: u64, flags: u32) -> Vec<u8> {
         let mut p = vec![0u8; 56];
+        put32(&mut p, OS02_NEW, 0x5000_0001);
         put32(&mut p, OS02_CLASS, 0x71);
         put32(&mut p, OS02_FLAGS, flags);
         put64(&mut p, OS02_MEMORY, va);
@@ -1164,6 +1174,10 @@ mod tests {
         );
         let mut p = os02(0x1000, 1, 0);
         put64(&mut p, OS02_LIMIT, u64::MAX);
+        assert_eq!(describe(ALLOC_MEMORY, &p, &[]), Err(libc::EINVAL));
+        // A handle RM would generate and never write back.
+        let mut p = os02(0x1000, 1, 0);
+        put32(&mut p, OS02_NEW, 0);
         assert_eq!(describe(ALLOC_MEMORY, &p, &[]), Err(libc::EINVAL));
         let mut o = vec![0u8; 48];
         put32(&mut o, OS64_CLASS, 0x71);
@@ -1428,6 +1442,8 @@ mod backend_tests {
         static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
         /// RM's answer to the next registrations.
         static STATUS: Cell<u32> = const { Cell::new(0) };
+        /// RM's answer to the next frees.
+        static FREE_STATUS: Cell<u32> = const { Cell::new(0) };
     }
 
     fn seen() -> Vec<Seen> {
@@ -1511,7 +1527,7 @@ mod backend_tests {
                 }
             }
             abi::ioctl::NV_ESC_RM_FREE => {
-                put32(a, 12, 0);
+                put32(a, 12, FREE_STATUS.with(|s| s.get()));
                 Seen::Free {
                     client: rd32(a, 0),
                     object: rd32(a, 8),
@@ -1589,6 +1605,7 @@ mod backend_tests {
     fn vm() -> Vm {
         seen();
         STATUS.with(|s| s.set(0));
+        FREE_STATUS.with(|s| s.set(0));
         let mut be = NvidiaBackend::for_test();
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_host);
@@ -2081,6 +2098,44 @@ mod backend_tests {
         );
         assert!(!reserved_live(addr), "the reserved range is gone");
         assert_eq!(reap(&mut vm.be, 0).1, vec![id]);
+    }
+
+    /// The backend's own free of a closing file's client fails: RM may still
+    /// hold the pages, so nothing is released -- late, with the session, not
+    /// early.
+    #[test]
+    fn a_client_rm_would_not_free_keeps_its_registrations() {
+        let mut vm = vm();
+        let ctl = vm.ctl;
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            ctl,
+            VID_HEAP,
+            &os32(GUEST_VA, 2 * PAGE, 0, 0),
+            &[],
+            Some(&list(OSDESC_F_WRITE, &[(HIGH, 1), (LOW, 1)])),
+        );
+        assert_eq!(st, 0);
+        let addr = match &seen()[..] {
+            [Seen::Register { addr, .. }] => *addr,
+            other => panic!("{other:?}"),
+        };
+        // NV_ERR_INVALID_CLIENT: what RM answers for a client on another file.
+        FREE_STATUS.with(|s| s.set(0x23));
+        assert_eq!(status(&call(&mut vm.be, MsgType::Close, ctl, &[])), 0);
+        assert_eq!(
+            seen(),
+            vec![Seen::Free {
+                client: CLIENT,
+                object: CLIENT
+            }]
+        );
+        assert!(reserved_live(addr), "the range stays while RM may pin it");
+        assert_eq!((vm.be.osdesc.live(), reap(&mut vm.be, 0).1), (1, vec![]));
+        // The session takes it.
+        vm.be.session_reset("test");
+        assert!(!reserved_live(addr));
+        assert_eq!(vm.be.osdesc.live(), 0);
     }
 
     /// A session reset frees every client that holds a registration, on the

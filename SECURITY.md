@@ -107,8 +107,11 @@ reviewed because the display work depended on it.
 - Four review findings are partly fixed, and two verification findings are
   partly fixed or open (§8). §9 lists every open item.
 - Memory registered by its pages is released to the guest when its RM handle
-  goes, even where UVM or NVKMS still holds it in the host kernel (§3,
-  "Memory registered by its pages"): guest memory only, never the host's.
+  goes, even where another holder still has it in the host kernel -- UVM,
+  NVKMS, nvidia-drm, an RM export to a descriptor (§3, "Memory registered by
+  its pages"). Never the host's memory, but an unprivileged guest process can
+  use it to reach frames its own kernel has reused: a guest privilege
+  escalation, open.
 
 §10 is the order the remaining work should go in.
 
@@ -241,15 +244,26 @@ bounds it:
   backend's.
 
 What it does not cover: a reference that only the host kernel holds. UVM
-keeps its own duplicate of memory it maps as an external allocation, and
-NVKMS of memory registered as a surface; RM keeps the pages pinned for those,
-but the backend sees only the guest's handle, and reports the registration
-released when that handle is freed. The guest then unpins, and pages it
-reuses stay reachable by that GPU mapping until the process that made it
-unmaps it or exits. Those are guest pages, never the host's: the host is
-unaffected, but a guest process could reach memory its own kernel has
-reused. Closing that needs the backend to follow those references too (or
-refuse them for registered memory). A registration abandoned in flight (a
+keeps its own duplicate of memory it maps as an external allocation, NVKMS
+of memory registered as a surface, nvidia-drm of memory imported as a GEM
+object, and RM of an object exported to a descriptor
+(NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD, which a later import turns
+back into a handle the backend never saw made) or attached to an
+NV_MEMORY_EXPORT object. RM keeps the pages pinned for those, but the backend
+sees only the guest's handles, and reports the registration released when
+they are freed. The guest then unpins, and pages it reuses stay reachable
+through that holder until it lets go. Those are guest pages, never the
+host's: the host is unaffected. But a guest process that does this on
+purpose -- register, export or map, free the handle -- can read and write
+frames its own kernel has since handed to someone else, which is a guest
+privilege escalation for any user who may open the GPU. Closing that needs
+the backend to follow those references too (holding a registration until
+the UVM, NVKMS or DRM file that took one closes), or to refuse them for
+registered memory. A free the backend itself makes (a closing file's
+clients, the session's) releases only what RM confirms it freed; a client
+RM would not free keeps its registrations until the session ends. An
+ALLOC_MEMORY with a zero hObjectNew is refused: RM would make the object
+under a handle it never reports. A registration abandoned in flight (a
 fatal signal, a timeout) stays pinned in the guest until the device is
 removed, since nothing can say whether RM took it.
 
@@ -676,12 +690,13 @@ In rough order of weight.
     apart. That applies to the headless path too: its UVM, RM and coherency
     changes are unmeasured.
 11. **Registered guest memory outlives its handle in the host kernel.** A
-    UVM external mapping or an NVKMS surface made from memory registered by
-    its pages keeps RM's pin after the guest's handle is freed, and the
-    backend, which follows only RM handles, then tells the guest to unpin
-    (§3, "Memory registered by its pages"). Guest memory only: a guest
-    process could reach pages its own kernel has since reused, never the
-    host's. None of it has run on hardware.
+    UVM external mapping, an NVKMS surface, an nvidia-drm GEM import or an
+    RM export to a descriptor made from memory registered by its pages keeps
+    RM's pin after the guest's handles are freed, and the backend, which
+    follows only RM handles, then tells the guest to unpin (§3, "Memory
+    registered by its pages"). Never the host's memory, but a guest process
+    can reach pages its own kernel has since reused: a guest privilege
+    escalation, High for the guest. None of it has run on hardware.
 
 ---
 

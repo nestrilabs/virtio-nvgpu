@@ -3675,8 +3675,12 @@ impl NvidiaBackend {
                 }
             }
             // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
+            // A zero hObjectNew is no handle: RM made the object under one it
+            // generated and, through ALLOC_MEMORY, never wrote back.
             NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
-                if let (Some(c), Some(o)) = (r(0), r(8)) {
+                if let (Some(c), Some(o)) = (r(0), r(8))
+                    && o != 0
+                {
                     self.osdesc.reused(c, o);
                 }
             }
@@ -3700,13 +3704,19 @@ impl NvidiaBackend {
             return;
         }
         let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16);
+        // Only a client RM says it freed is forgotten. One it would not free
+        // (on another file, or a failed call) may still hold the pages, and
+        // the guest must not be told it may unpin them: its registrations
+        // stay, released late -- by a later free RM does confirm, or with the
+        // session -- never early.
+        let mut freed = Vec::with_capacity(ending.len());
         for &c in &ending {
             // NVOS00: the client names itself.
             let mut p = [0u8; 16];
             p[0..4].copy_from_slice(&c.to_le_bytes());
             p[8..12].copy_from_slice(&c.to_le_bytes());
             let Some(mut a) = ioctl_arg(request, &p) else {
-                log::warn!("{why}: no buffer to free RM client {c:#x}");
+                log::warn!("{why}: no buffer to free RM client {c:#x}; its registrations stay");
                 continue;
             };
             // SAFETY: the HostIoctl contract; `a` is sized by ioctl_arg.
@@ -3714,11 +3724,14 @@ impl NvidiaBackend {
             let status = u32::from_le_bytes(a.as_slice()[12..16].try_into().unwrap());
             if rc < 0 || status != 0 {
                 log::warn!(
-                    "{why}: freeing RM client {c:#x}, which holds registered guest memory:                      rc {rc}, status {status:#x}"
+                    "{why}: freeing RM client {c:#x}, which holds registered guest memory: \
+                     rc {rc}, status {status:#x}; its registrations stay"
                 );
+                continue;
             }
+            freed.push(c);
         }
-        self.osdesc.forget_clients(&ending);
+        self.osdesc.forget_clients(&freed);
     }
 
     /// OP_OSDESC_REAP: the releases after `ack`, and forget those up to it.
