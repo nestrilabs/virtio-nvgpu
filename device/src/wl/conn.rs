@@ -31,9 +31,10 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
@@ -170,6 +171,77 @@ pub struct WlLimits {
     /// Bytes queued for the guest, over every connection
     /// (`--wayland-queue-budget`).
     pub queue: Arc<QueueBudget>,
+    /// How often the VM's clients may submit a lease request
+    /// (`--wayland-lease-interval`).
+    pub lease: Arc<LeaseThrottle>,
+}
+
+/// How often one VM may ask the compositor for a lease.
+///
+/// A lease of a desktop monitor (`leasable` in the Hyprland patch) costs the
+/// host a blocking modeset to take the output away, workspaces moved off it,
+/// and a full modeset to take it back when the lease ends, all on the
+/// compositor's main thread, plus a LEASE uevent to every listener. Nothing
+/// in the protocol limits how often a client may do that, so a guest looping
+/// request, submit, destroy stalls the host desktop and every other VM's
+/// clients. Submits are therefore admitted at one per `interval` on average,
+/// with `burst` at once (a Vulkan client acquiring two displays makes two
+/// requests), over every connection of the VM together -- which bounds each
+/// connection too.
+///
+/// A frame that carries a submit past the rate is refused whole with EAGAIN
+/// before anything in it is looked at: the guest daemon keeps the frame and
+/// retries it (as it does for a compositor that is not reading), so the
+/// client's request is delayed, never lost or reordered, and the compositor
+/// still creates and owns every lease object. How long a lease is then held
+/// is not limited: holding the output is what a lease is for, and the host
+/// takes it back by un-marking the monitor leasable or closing the VM.
+#[derive(Debug)]
+pub struct LeaseThrottle {
+    interval: Duration,
+    burst: u32,
+    /// When the next submit is due at the average rate (GCRA's theoretical
+    /// arrival time); a submit may go up to `burst - 1` intervals early.
+    due: Mutex<Option<Instant>>,
+    /// A refusal was logged since the last admission.
+    logged: AtomicBool,
+}
+
+impl LeaseThrottle {
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+    pub const DEFAULT_BURST: u32 = 3;
+
+    /// `interval` zero admits everything.
+    pub fn new(interval: Duration, burst: u32) -> Self {
+        Self {
+            interval,
+            burst: burst.max(1),
+            due: Mutex::new(None),
+            logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Admit `n` submits at `now`, or say how long until one may go.
+    pub fn admit(&self, n: usize, now: Instant) -> Result<(), Duration> {
+        if n == 0 || self.interval.is_zero() {
+            return Ok(());
+        }
+        let mut due = self.due.lock().unwrap_or_else(|p| p.into_inner());
+        let t = due.map_or(now, |d| d.max(now));
+        let early = self.interval * (self.burst - 1);
+        if t > now + early {
+            return Err(t - early - now);
+        }
+        *due = Some(t + self.interval * n.min(u32::MAX as usize) as u32);
+        self.logged.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Default for LeaseThrottle {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_INTERVAL, Self::DEFAULT_BURST)
+    }
 }
 
 impl WlLimits {
@@ -188,7 +260,14 @@ impl WlLimits {
             max_conns,
             shm: Arc::new(ShmBudget::new(shm_bytes, Self::DEFAULT_SHM_POOLS)),
             queue: Arc::new(QueueBudget::new(queue_bytes)),
+            lease: Arc::new(LeaseThrottle::default()),
         }
+    }
+
+    /// Lease submits at one per `interval`, `burst` at once.
+    pub fn with_lease_rate(mut self, interval: Duration, burst: u32) -> Self {
+        self.lease = Arc::new(LeaseThrottle::new(interval, burst));
+        self
     }
 }
 
@@ -429,6 +508,19 @@ impl WlConn {
         }
         let backlog = st.engine.local_out().len();
         if backlog > s.cfg.max_backlog {
+            return Err(libc::EAGAIN);
+        }
+        // Lease requests at the VM's rate (`LeaseThrottle`): a frame with one
+        // too many waits whole, like one for a compositor that is not reading.
+        let submits = st.engine.lease_submits(frame_bytes);
+        if let Err(wait) = s.cfg.limits.lease.admit(submits, Instant::now()) {
+            if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "wayland: the guest asks for leases faster than one per {:?}; \
+                     holding its next request for {wait:?}",
+                    s.cfg.limits.lease.interval
+                );
+            }
             return Err(libc::EAGAIN);
         }
         let mut plat = HostPlat {

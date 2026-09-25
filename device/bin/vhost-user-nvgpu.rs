@@ -54,7 +54,7 @@ use device::session::{
 use device::shm::WindowPlacer;
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use device::wl::export::WlExport;
-use device::wl::{WlConfig, WlLimits};
+use device::wl::{LeaseThrottle, WlConfig, WlLimits};
 use protocol::messages::{MsgHeader, MsgType};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
@@ -133,6 +133,14 @@ struct Args {
     /// ever shown, and only to a guest that can adopt DRM files.
     #[arg(long, requires = "wayland_socket")]
     wayland_lease: bool,
+
+    /// Seconds between the lease requests one VM may submit, on average
+    /// (three may go at once). A lease of a desktop monitor makes the
+    /// compositor modeset it away and back; this keeps a guest from doing
+    /// that in a loop. A request past the rate waits, it is not refused. 0
+    /// lifts the limit.
+    #[arg(long, value_name = "SECS", default_value_t = LeaseThrottle::DEFAULT_INTERVAL.as_secs())]
+    wayland_lease_interval: u64,
 
     /// Accept host Wayland clients here and carry them to a guest compositor.
     #[arg(long, value_name = "PATH")]
@@ -261,6 +269,10 @@ impl Wayland {
             args.wayland_max_conns,
             args.wayland_shm_budget.saturating_mul(1 << 20),
             args.wayland_queue_budget.saturating_mul(1 << 20),
+        )
+        .with_lease_rate(
+            std::time::Duration::from_secs(args.wayland_lease_interval),
+            LeaseThrottle::DEFAULT_BURST,
         );
         if cfg.is_some() || export.is_some() {
             log::info!(

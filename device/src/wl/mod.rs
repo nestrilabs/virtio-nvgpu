@@ -42,5 +42,5 @@ mod serve_tests;
 #[cfg(test)]
 mod tests;
 
-pub use conn::{HostFds, QueueBudget, RecvOps, SendOps, WlConfig, WlConn, WlLimits};
+pub use conn::{HostFds, LeaseThrottle, QueueBudget, RecvOps, SendOps, WlConfig, WlConn, WlLimits};
 pub use serve::WlState;

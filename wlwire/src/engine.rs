@@ -296,6 +296,79 @@ impl Engine {
         self.shm.set_shared_budget(b);
     }
 
+    /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
+    /// channel carries, looked at before the frame is let in: the backend
+    /// rate-limits them, since the compositor answers every lease of a
+    /// desktop monitor with blocking modesets (releasing it, and taking it
+    /// back when the lease ends). A lease request created in the same frame
+    /// counts, and so does a device bound in it. Nothing is changed, and a
+    /// frame that does not decode counts none (`from_channel` refuses it).
+    /// Costs nothing on a connection that was never offered a lease device.
+    pub fn lease_submits(&self, bytes: &[u8]) -> usize {
+        if !self
+            .registry
+            .offered
+            .values()
+            .any(|(i, _)| *i == proto::WP_DRM_LEASE_DEVICE_V1)
+        {
+            return 0;
+        }
+        let Ok(f) = frame::decode(bytes) else {
+            return 0;
+        };
+        let bind =
+            &iface(proto::WL_REGISTRY).messages(Dir::Request)[op::wl_registry::REQ_BIND as usize];
+        let mut fresh: HashMap<u32, IfaceId> = HashMap::new();
+        let mut n = 0;
+        for r in f.records().filter(|r| r.ty == frame::REC_WAYLAND) {
+            let mut p = r.payload;
+            while let Some(h) = peek_header(p) {
+                let size = h.size as usize;
+                if size < 8 || size > p.len() {
+                    break;
+                }
+                let m = &p[..size];
+                p = &p[size..];
+                let ifc = fresh.get(&h.object).copied().or_else(|| {
+                    self.objects
+                        .get(h.object)
+                        .filter(|o| !o.zombie)
+                        .map(|o| o.iface)
+                });
+                let new_id = || match m.get(8..12) {
+                    Some(b) => u32::from_ne_bytes(b.try_into().unwrap()),
+                    None => 0,
+                };
+                match (ifc, h.opcode) {
+                    (Some(proto::WL_REGISTRY), op::wl_registry::REQ_BIND) => {
+                        if let Ok(a) = wire::parse(bind, m) {
+                            if let Val::NewId {
+                                id,
+                                iface: Some(b"wp_drm_lease_device_v1"),
+                                ..
+                            } = a[1].val
+                            {
+                                fresh.insert(id, proto::WP_DRM_LEASE_DEVICE_V1);
+                            }
+                        }
+                    }
+                    (
+                        Some(proto::WP_DRM_LEASE_DEVICE_V1),
+                        op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST,
+                    ) => {
+                        fresh.insert(new_id(), proto::WP_DRM_LEASE_REQUEST_V1);
+                    }
+                    (
+                        Some(proto::WP_DRM_LEASE_REQUEST_V1),
+                        op::wp_drm_lease_request_v1::REQ_SUBMIT,
+                    ) => n += 1,
+                    _ => {}
+                }
+            }
+        }
+        n
+    }
+
     /// The connection is over: let go at once of what only a live connection
     /// needs -- shm pools (whose memfds are what a guest commits host memory
     /// through) and half-received blobs -- rather than when the owner gets

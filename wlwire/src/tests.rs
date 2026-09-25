@@ -1587,6 +1587,60 @@ fn presentation_timestamps_move_by_the_clock_offset_only_for_monotonic_clocks() 
     assert!(p.g.objects().get(6).unwrap().zombie);
 }
 
+/// One WAYLAND record of `msgs`, framed as the channel carries it.
+fn wayland_frame(msgs: &[Vec<u8>]) -> Vec<u8> {
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, 0, &msgs.concat()),
+        descs: vec![],
+    }]);
+    frame::pack(&mut q, 1 << 20, 256, false).0
+}
+
+#[test]
+fn lease_submits_are_counted_in_a_frame_before_it_is_let_in() {
+    let mut p = Pair::new(Policy {
+        drm_file: false,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(20)
+        .finish();
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    // A connection never offered a lease device: nothing to count, and
+    // nothing is parsed.
+    let mut none = Pair::new(Policy::default());
+    none.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    let submit = |dev: u32, req: u32, lease: u32| {
+        vec![
+            MsgBuilder::new(dev, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(lease)
+                .finish(),
+        ]
+    };
+    // A device bound, a request made and submitted, all in one frame.
+    let mut one = vec![
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 3)
+            .finish(),
+    ];
+    one.extend(submit(3, 4, 5));
+    assert_eq!(p.h.lease_submits(&wayland_frame(&one)), 1);
+    assert_eq!(none.h.lease_submits(&wayland_frame(&one)), 0);
+    // A device the engine already knows, two submits and something else.
+    p.bind(1, "wp_drm_lease_device_v1", 1, 3).unwrap();
+    let mut two = submit(3, 4, 5);
+    two.push(sync.clone());
+    two.extend(submit(3, 6, 7));
+    assert_eq!(p.h.lease_submits(&wayland_frame(&two)), 2);
+    assert_eq!(p.h.lease_submits(&wayland_frame(&[sync])), 0);
+    assert_eq!(p.h.lease_submits(b"not a frame"), 0);
+}
+
 #[test]
 fn a_lease_device_released_without_the_event_gets_one_synthesised() {
     let mut p = Pair::new(Policy {

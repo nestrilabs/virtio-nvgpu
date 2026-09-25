@@ -16,7 +16,7 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
+use super::conn::{HostFds, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
 use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;
@@ -777,4 +777,82 @@ fn the_reader_finds_lease_device_globals_only_in_whole_messages() {
     // The last one cut short is left for the next read, as the engine leaves it.
     b.truncate(b.len() - 4);
     assert_eq!(super::probe::lease_globals(&b), vec![40]);
+}
+
+#[test]
+fn lease_submits_go_at_the_vms_rate_after_a_short_burst() {
+    let s = Duration::from_secs(1);
+    let th = LeaseThrottle::new(5 * s, 3);
+    let t0 = Instant::now();
+    for _ in 0..3 {
+        th.admit(1, t0).unwrap();
+    }
+    // The fourth waits out one interval.
+    assert_eq!(th.admit(1, t0), Err(5 * s));
+    assert_eq!(th.admit(1, t0 + 2 * s), Err(3 * s));
+    th.admit(1, t0 + 5 * s).unwrap();
+    assert!(th.admit(1, t0 + 6 * s).is_err());
+    // A frame without submits is never held; a quiet spell refills the burst.
+    th.admit(0, t0 + 6 * s).unwrap();
+    for _ in 0..3 {
+        th.admit(1, t0 + 60 * s).unwrap();
+    }
+    // Zero interval: no limit.
+    let free = LeaseThrottle::new(Duration::ZERO, 1);
+    for _ in 0..100 {
+        free.admit(1, t0).unwrap();
+    }
+}
+
+#[test]
+fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
+    let dir = tmpdir("lease-rate");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_millis(300), 2);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    g.client(
+        &[MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(40)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 5)
+            .finish()],
+        vec![],
+    );
+    let mut next = 10u32;
+    let mut submit = |g: &mut Guest| {
+        let (req, lease) = (next, next + 1);
+        next += 2;
+        let mut data = [
+            MsgBuilder::new(5, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(lease)
+                .finish(),
+        ]
+        .concat();
+        g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+            .unwrap();
+        let mut q = g.e.take_units();
+        frame::pack(&mut q, 1 << 20, 256, false).0
+    };
+    let (a, b, c) = (submit(&mut g), submit(&mut g), submit(&mut g));
+    g.conn.send(&a, &mut g.ops).unwrap();
+    g.conn.send(&b, &mut g.ops).unwrap();
+    // Past the burst: the whole frame waits, and nothing of it went in.
+    assert_eq!(g.conn.send(&c, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    assert_eq!(g.conn.send(&c, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    // Retried as the daemon retries it, it goes once the interval is up.
+    std::thread::sleep(Duration::from_millis(320));
+    g.conn.send(&c, &mut g.ops).unwrap();
+    assert!(!g.conn.is_closed());
 }
