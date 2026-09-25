@@ -218,6 +218,19 @@ static void nvgpu_host_fence_deliver(struct nvgpu_ev_consumer *c, u32 kind,
   rcu_read_unlock();
   if (!f)
     return; /* the proxy went first: nobody left to tell */
+  /*
+   * The id is the xarray's lowest free one (XA_FLAGS_ALLOC1), so the moment
+   * a proxy is released its id can go to the next one -- while this
+   * consumer, buried but not yet reaped, can still be handed the old
+   * fence's one EV_FENCE (its CLOSE is queued behind other work). Only the
+   * proxy this consumer belongs to is ours to signal: signalling the new
+   * one would let its waiters -- a flip's IN_FENCE_FD, a sampler -- run
+   * ahead of GPU work that has not finished (S-12).
+   */
+  if (READ_ONCE(f->ev) != e) {
+    dma_fence_put(&f->base);
+    return;
+  }
 
   if (!atomic_xchg(&f->signalled, 1)) {
     if (status < 0 && status >= -MAX_ERRNO)
@@ -272,7 +285,13 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
     ret = -ENOMEM;
     goto fail_free;
   }
-  ret = xa_alloc_irq(&nvgpu_host_fences, &e->id, f, xa_limit_32b, GFP_KERNEL);
+  /*
+   * Reserved, not published: xa_load() finds NULL here until the proxy is
+   * whole, so an event racing in (for a stale consumer that held this id
+   * before) never sees a fence whose ev and refcount are not yet set.
+   */
+  ret = xa_alloc_irq(&nvgpu_host_fences, &e->id, NULL, xa_limit_32b,
+                     GFP_KERNEL);
   if (ret)
     goto fail_free;
   e->dev = dev;
@@ -291,6 +310,11 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
   dma_fence_init64(&f->base, &nvgpu_host_fence_ops, NULL,
                    dma_fence_context_alloc(1), 1);
   /* From here the fence's release owns the id, the consumer and the handle. */
+
+  /* Published whole: the store is an rcu_assign_pointer. */
+  ret = xa_err(xa_store_irq(&nvgpu_host_fences, e->id, f, GFP_KERNEL));
+  if (ret)
+    goto put;
 
   /*
    * Consumer first, WATCH second: once the backend watches, the report can
