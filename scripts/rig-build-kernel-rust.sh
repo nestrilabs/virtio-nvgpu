@@ -56,14 +56,16 @@ case "$VERMAGIC" in
     ;;
 esac
 # The Rust parsers are what got linked, not the C ones they replace.
-if ! in_toolchain nm "$KO" | grep -q ' T nvgpu_rs_i2_ioctl$' ||
-    in_toolchain nm "$KO" | grep -q ' T nvgpu_osdesc_ioctl$'; then
+SYMS="$(in_toolchain nm "$KO")"
+if ! grep -q ' T nvgpu_rs_i2_ioctl$' <<<"$SYMS" ||
+    grep -q ' T nvgpu_osdesc_ioctl$' <<<"$SYMS"; then
     echo "FAIL: $KO does not have the Rust parsers in place of the C" >&2
     exit 1
 fi
 # And they cannot panic: no path in them reaches a Rust panic (an overflow
 # check, a bounds check, an unwrap), which in the kernel is a BUG().
-if in_toolchain nm -u "$K/mod/nvgpu_rs.o" | grep -i 'panic'; then
+UNDEF="$(in_toolchain nm -u "$K/mod/nvgpu_rs.o")"
+if grep -i 'panic' <<<"$UNDEF"; then
     echo "FAIL: nvgpu_rs.o has a panic path (above)" >&2
     exit 1
 fi
