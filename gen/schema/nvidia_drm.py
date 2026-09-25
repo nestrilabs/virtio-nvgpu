@@ -15,8 +15,18 @@ GEM_IDENTIFY_OBJECT and 0x58 GET_DRM_FILE_UNIQUE_ID (answered by the guest),
 0x59-0x5c (not registered).
 
 Entries that reach NVKMS or modeset locks run on an executor even on a
-render node: GET_CRTC_CRC32* call nvKms->getCRC32 under nvkms_lock, and the
-dpy/connector lookups walk the connector list under mode_config locks.
+render node: the dpy/connector lookups walk the connector list under
+mode_config locks.
+
+GET_CRTC_CRC32 and _V2 are KMS-class only, although nvidia-drm lets a render
+node call them (DRM_RENDER_ALLOW, nvidia-drm-drv.c:1860-1865): a file with no
+master finds every CRTC, lease or no lease (drm_crtc_find is lease-filtered
+only for a lessee, linux drm_lease.c:109-121, drm_mode_object.c:151-155), so
+from a render node they read back a checksum of whatever the host compositor
+scans out, at the cost of two synchronous core updates under nvkms_lock per
+call (nvkms-evo.c:9301-9318). On a card or lease file the backend lets them
+through only for a card of the guest's own (compositor-VM mode) or a real
+lessee, whose CRTCs the host filters itself (kms.rs, `crc_gate`).
 """
 
 from .lang import *
@@ -44,13 +54,6 @@ MEM_FD = FdIn('memFd', 0, 4, K_DEV_CTL)
 def shared(cls):
     """Entries valid on both a render node and a card or lease."""
     return [
-        Ioctl('NV_GET_CRTC_CRC32', cls, 'DRM_IOCTL_NVIDIA_GET_CRTC_CRC32',
-              'struct drm_nvidia_get_crtc_crc32_params', 8, nv(0x00), IOWR,
-              exec=X, doc='nvidia-drm-crtc.c:3417'),
-        Ioctl('NV_GET_CRTC_CRC32_V2', cls,
-              'DRM_IOCTL_NVIDIA_GET_CRTC_CRC32_V2',
-              'struct drm_nvidia_get_crtc_crc32_v2_params', 28, nv(0x0c), IOWR,
-              exec=X, doc='nvidia-drm-crtc.c:3389'),
         Ioctl('NV_GET_DPY_ID_FOR_CONNECTOR_ID', cls,
               'DRM_IOCTL_NVIDIA_GET_DPY_ID_FOR_CONNECTOR_ID',
               'struct drm_nvidia_get_dpy_id_for_connector_id_params', 8,
@@ -62,7 +65,18 @@ def shared(cls):
     ]
 
 
-KMS_IOCTLS = shared(KMS) + [
+# Card and lease files only (see above): checksums of scanout, each call
+# holding nvkms_lock across two core updates.
+CRC_IOCTLS = [
+    Ioctl('NV_GET_CRTC_CRC32', KMS, 'DRM_IOCTL_NVIDIA_GET_CRTC_CRC32',
+          'struct drm_nvidia_get_crtc_crc32_params', 8, nv(0x00), IOWR,
+          exec=X, doc='nvidia-drm-crtc.c:3417'),
+    Ioctl('NV_GET_CRTC_CRC32_V2', KMS, 'DRM_IOCTL_NVIDIA_GET_CRTC_CRC32_V2',
+          'struct drm_nvidia_get_crtc_crc32_v2_params', 28, nv(0x0c), IOWR,
+          exec=X, doc='nvidia-drm-crtc.c:3389'),
+]
+
+KMS_IOCTLS = CRC_IOCTLS + shared(KMS) + [
     # nvidia-drm-drv.c:1137: reads the drm_file's own client caps; primary
     # nodes only (flags 0).
     Ioctl('NV_GET_CLIENT_CAPABILITY', KMS,
