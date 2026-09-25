@@ -1,6 +1,6 @@
 //! What the guest driver expects to find on the bus.
 //!
-//! Every constant and layout here is a contract with `driver/virtio_gpu_nv.c`,
+//! Every constant and layout here is a contract with `driver/nvgpu_wire.h`,
 //! and each one has been wrong at least once. A mismatch is not a build error
 //! in either half -- the device compiles, the driver compiles, and the guest
 //! simply fails to probe -- so the agreement is asserted by tests that mirror
@@ -8,7 +8,7 @@
 
 /// The virtio device ID the guest driver probes for.
 ///
-/// Must match `VIRTIO_ID_GPU_NV` in `driver/virtio_gpu_nv.c`. This said 0x8042
+/// Must match `VIRTIO_ID_GPU_NV` in `driver/nvgpu_wire.h`. This said 0x8042
 /// while the driver bound 45, so a device advertising it would never have been
 /// probed by its own guest driver.
 pub const VIRTIO_ID_GPU_NV: u32 = 45;

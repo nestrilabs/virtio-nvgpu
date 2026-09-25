@@ -15,3 +15,14 @@ licensed so this module can include the same headers the Rust side uses.
 
 Built out of tree against the guest kernel, or copied/submoduled into a kernel
 tree by whoever is assembling a guest image.
+
+One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`):
+
+| file | contents |
+|---|---|
+| `nvgpu.h` | internal header: shared structs, cross-file prototypes, module parameter `extern`s |
+| `nvgpu_wire.h` | wire protocol and config-space layout (BSD-3-Clause OR GPL-2.0+, mirrors `protocol/`) |
+| `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, RM forwarding, `/proc`, sysfs, fake PCI, nvidia-modeset |
+| `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls |
+| `nvgpu_xfer.c`, `nvgpu_hostfile.c`, `nvgpu_kms.c`, `nvgpu_fence.c`, `nvgpu_nvkms.c`, `nvgpu_wl.c` | placeholders for display passthrough work; each says what it will hold |
+| `nvgpu_rm_intercepts.h`, `gen/` | RM command tables (generated / hand-kept) |

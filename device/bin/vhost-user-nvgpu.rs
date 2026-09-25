@@ -1,6 +1,6 @@
 //! A vhost-user backend serving `NvidiaBackend` to a guest.
 //!
-//! The guest driver (`driver/virtio_gpu_nv.c`) binds virtio device ID 45 and
+//! The guest driver (`driver/nvgpu_main.c`) binds virtio device ID 45 and
 //! posts one descriptor chain per request: a readable descriptor holding the
 //! request, and a writable one for the response. That is the whole transport.
 //!

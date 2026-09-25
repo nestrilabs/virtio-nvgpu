@@ -18,7 +18,7 @@
 //   3. Writes the response into the writable buffer.
 //   4. Pushes the chain back to the used ring.
 //
-// Every layout here mirrors `driver/virtio_gpu_nv.c`. That file is the wire
+// Every layout here mirrors `driver/nvgpu_wire.h`. That file is the wire
 // format: it is the half compiled into a guest kernel, and it cannot negotiate.
 //
 // These definitions previously described a different protocol entirely -- a

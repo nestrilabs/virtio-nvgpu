@@ -2,7 +2,7 @@
 //
 // Wire protocol shared between the VMM backend (Rust) and the guest kernel
 // driver (C).  Every type here has a matching definition in
-// `guest-driver/virtio_gpu_nv.h`.
+// `driver/nvgpu_wire.h`.
 //
 // Layout rules
 // ============
