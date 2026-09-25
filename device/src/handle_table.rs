@@ -329,12 +329,26 @@ mod tests {
         let mut t = HandleTable::with_limit(2);
         t.insert(make_fd(), CTL).unwrap();
         t.insert(make_fd(), CTL).unwrap();
-        let fd = make_fd();
-        let raw = fd.as_raw_fd();
-        let err = t.insert(fd, CTL).unwrap_err();
+        // The refused descriptor is the write end of a pipe whose read end
+        // this test keeps: the read end sees EOF exactly when every write
+        // end is closed. Asking whether the number is still open instead
+        // raced with other test threads reusing it.
+        let mut ends = [0; 2];
+        // SAFETY: pipe2 into a local array of two.
+        assert_eq!(
+            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        // SAFETY: both descriptors were just created and are owned here.
+        let (read, write) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let err = t.insert(write, CTL).unwrap_err();
         assert_eq!(err.errno(), libc::EMFILE);
         // The refused descriptor was closed, not leaked.
-        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        let mut b = [0u8; 1];
+        // SAFETY: a read of at most one byte into a local.
+        let n = unsafe { libc::read(read.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        assert_eq!(n, 0, "EOF: no write end is left open");
         // Space comes back when a handle goes.
         let h = t.handles()[0];
         t.remove(h).unwrap();

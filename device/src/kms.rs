@@ -917,7 +917,17 @@ mod tests {
             "its descriptors are the backend's own"
         );
         drop(l); // joins: a listener that ignored its stop would hang here
-        assert!(!crate::privfd::is_private(stop));
+        // The registry is keyed by descriptor number and shared by every
+        // test thread, so the number may already be another test's private
+        // descriptor (semsurf's RM files, another listener) by the time this
+        // looks. A registration this listener leaked is one whose number is
+        // closed; a number that is open again belongs to whoever reopened it.
+        // SAFETY: F_GETFD on a number, open or not, touches nothing.
+        let open_again = unsafe { libc::fcntl(stop, libc::F_GETFD) } >= 0;
+        assert!(
+            !crate::privfd::is_private(stop) || open_again,
+            "the listener closed its stop descriptor and left it registered"
+        );
     }
 
     /// Only the kernel may speak on the uevent socket: an unprivileged sender
