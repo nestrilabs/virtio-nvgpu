@@ -149,7 +149,8 @@ pub struct Outbox {
     v2: bool,
     order: VecDeque<Key>,
     queued: HashSet<Key>,
-    fence: HashMap<u64, i32>,
+    /// cookie -> (status, host signal time in CLOCK_MONOTONIC ns, 0 unknown)
+    fence: HashMap<u64, (i32, u64)>,
     hotplug: HashMap<u32, u32>,
     drm: HashMap<u32, Vec<u8>>,
 }
@@ -206,8 +207,15 @@ impl Outbox {
     /// A fence completed. A second report for the same cookie replaces the
     /// status rather than queueing another record.
     pub fn fence(&mut self, cookie: u64, status: i32) {
+        self.fence_at(cookie, status, 0);
+    }
+
+    /// [`Outbox::fence`], with when the host's fences signalled
+    /// (`CLOCK_MONOTONIC` ns, 0 for unknown), for the guest proxy to signal
+    /// with that time rather than the time the record reached it.
+    pub fn fence_at(&mut self, cookie: u64, status: i32, timestamp_ns: u64) {
         if self.v2 {
-            self.fence.insert(cookie, status);
+            self.fence.insert(cookie, (status, timestamp_ns));
             self.enqueue(Key::Fence(cookie));
         }
     }
@@ -278,9 +286,12 @@ impl Outbox {
                     self.pop();
                 }
                 Key::Fence(c) => {
-                    let status = self.fence.get(&c).copied().unwrap_or(1);
-                    let mut p = [0u8; 8];
+                    // {i32 status; u32 pad; u64 timestamp_ns}: a guest that
+                    // predates the timestamp reads the first 8 bytes only.
+                    let (status, ts) = self.fence.get(&c).copied().unwrap_or((1, 0));
+                    let mut p = [0u8; 16];
                     p[..4].copy_from_slice(&status.to_le_bytes());
+                    p[8..].copy_from_slice(&ts.to_le_bytes());
                     if !push_rec(&mut out, space, EV_FENCE, c, &p) {
                         break;
                     }
@@ -717,8 +728,8 @@ impl<Q: EventQueue> Pump<Q> {
                 }
             }
             WatchMode::Fence { cookie } => {
-                let status = crate::hostfd::sync_file_status(fd)
-                    .unwrap_or_else(|e| -e.raw_os_error().unwrap_or(libc::EIO));
+                let (status, signalled_at) = crate::hostfd::sync_file_signalled(fd)
+                    .unwrap_or_else(|e| (-e.raw_os_error().unwrap_or(libc::EIO), 0));
                 if status == 0 {
                     // Readable yet still active: nothing to report. One-shot
                     // armed, so arm it again.
@@ -730,7 +741,7 @@ impl<Q: EventQueue> Pump<Q> {
                     );
                     return;
                 }
-                self.outbox.fence(cookie, status);
+                self.outbox.fence_at(cookie, status, signalled_at);
                 self.unwatch(handle);
             }
             WatchMode::Drm => self.read_drm(handle),
@@ -908,10 +919,21 @@ mod tests {
                 (EV_HOTPLUG, 1)
             ]
         );
-        assert_eq!(recs[1].2, [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(recs[1].2, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(recs[2].2.len(), 56);
         assert_eq!(recs[4].2[..4], EV_HOTPLUG_F_LEASE.to_le_bytes());
         assert!(o.is_empty());
+    }
+
+    #[test]
+    fn a_fence_record_carries_the_hosts_signal_time_after_the_status() {
+        let mut o = v2();
+        o.fence_at(7, 1, 0x1122_3344_5566_7788);
+        let recs = records(&o.build(EVENT_BUF_SIZE));
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].2.len(), 16);
+        assert_eq!(recs[0].2[..8], [1, 0, 0, 0, 0, 0, 0, 0], "the old 8 bytes");
+        assert_eq!(recs[0].2[8..], 0x1122_3344_5566_7788u64.to_le_bytes());
     }
 
     #[test]

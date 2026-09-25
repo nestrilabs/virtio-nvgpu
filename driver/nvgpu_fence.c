@@ -224,7 +224,24 @@ static void nvgpu_host_fence_deliver(struct nvgpu_ev_consumer *c, u32 kind,
                            "which is neither signalled nor an error; "
                            "signalling it anyway\n",
                            f->handle, status);
-    dma_fence_signal(&f->base);
+    /*
+     * With the host's own signal time where the backend sent one: the ICD
+     * reads a fence's timestamp back through FILE_INFO (glcore 0xa13870, the
+     * sync-fd ops' slot 0x30), and the time this record arrived is the
+     * host's plus the trip here, about a third of a millisecond. Moved into
+     * the guest's clock, and never later than now -- the slewed offset could
+     * otherwise put it a hair in the future, and a fence that signals after
+     * it was seen signalled is a contradiction.
+     */
+    if (ev.timestamp_ns) {
+      s64 at = nvgpu_host_to_guest_ns(e->dev,
+                                      (s64)le64_to_cpu(ev.timestamp_ns));
+      s64 now = ktime_get_ns();
+
+      dma_fence_signal_timestamp(&f->base, ns_to_ktime(min(at, now)));
+    } else {
+      dma_fence_signal(&f->base);
+    }
   }
   dma_fence_put(&f->base);
 }

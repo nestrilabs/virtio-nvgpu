@@ -640,6 +640,11 @@ pub struct EvFence {
     /// 1 signalled, negative on error.
     pub status: i32,
     pub pad: u32,
+    /// When the host's fences signalled, host `CLOCK_MONOTONIC` ns (the
+    /// latest of them, from SYNC_IOC_FILE_INFO's per-fence array); 0 when
+    /// unknown. A guest that predates it reads the first 8 bytes, and an
+    /// older backend's 8-byte record reads as 0.
+    pub timestamp_ns: u64,
 }
 
 pub const EV_HOTPLUG_F_HOTPLUG: u32 = 1 << 0;
@@ -693,7 +698,7 @@ const _: () = {
     assert!(size_of::<HostOpReq>() == 56);
     assert!(size_of::<HostOpResp>() == 40);
     assert!(size_of::<EvRec>() == 16);
-    assert!(size_of::<EvFence>() == 8);
+    assert!(size_of::<EvFence>() == 16);
     assert!(size_of::<EvHotplug>() == 8);
     assert!(size_of::<CardRecord>() == 16);
 };

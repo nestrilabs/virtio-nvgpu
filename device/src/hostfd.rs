@@ -609,6 +609,69 @@ pub fn sync_file_status(fd: RawFd) -> io::Result<i32> {
     Ok(i32::from_le_bytes(p[32..36].try_into().unwrap()))
 }
 
+/// `struct sync_fence_info` (sync_file.h:46-52): obj_name[32],
+/// driver_name[32], s32 status, u32 flags, u64 timestamp_ns.
+const SYNC_FENCE_INFO_SIZE: usize = 80;
+const SYNC_FENCE_INFO_STATUS: usize = 64;
+const SYNC_FENCE_INFO_TIMESTAMP: usize = 72;
+
+/// More fences than a sync_file is asked about one by one. A merge of more
+/// is still reported, only without a timestamp.
+const SYNC_FENCE_INFO_MAX: usize = 64;
+
+/// A sync_file's status (as [`sync_file_status`]) and, once it has
+/// signalled, when: the latest of its fences' signal times, in
+/// `CLOCK_MONOTONIC` ns (`dma_fence_timestamp`, sync_file.c:268-292), or 0
+/// where the kernel gave none.
+///
+/// The guest proxy signals with this time rather than when the record
+/// reaches it (a third of a millisecond later), and NVIDIA's ICD reads it
+/// back through FILE_INFO (glcore 0xa13870).
+pub fn sync_file_signalled(fd: RawFd) -> io::Result<(i32, u64)> {
+    let mut p = [0u8; 56];
+    ioctl(fd, SYNC_IOC_FILE_INFO, p.as_mut_ptr())?;
+    let status = i32::from_le_bytes(p[32..36].try_into().unwrap());
+    let n = u32::from_le_bytes(p[40..44].try_into().unwrap()) as usize;
+    if status != 1 || n == 0 || n > SYNC_FENCE_INFO_MAX {
+        return Ok((status, 0));
+    }
+    // The fences of a sync_file are fixed when it is made, so the count
+    // just read is the count the kernel will fill.
+    let mut infos = vec![0u8; n * SYNC_FENCE_INFO_SIZE];
+    let mut q = [0u8; 56];
+    q[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+    q[48..56].copy_from_slice(&(infos.as_mut_ptr() as u64).to_le_bytes());
+    // The kernel writes n records to `infos`, which is exactly that long
+    // (sync_file_ioctl_fence_info refuses an n smaller than the count).
+    if ioctl(fd, SYNC_IOC_FILE_INFO, q.as_mut_ptr()).is_err() {
+        return Ok((status, 0));
+    }
+    Ok((status, latest_signal(&infos)))
+}
+
+/// The latest signal time among `struct sync_fence_info` records, counting
+/// only signalled fences; 0 if none says.
+fn latest_signal(infos: &[u8]) -> u64 {
+    infos
+        .chunks_exact(SYNC_FENCE_INFO_SIZE)
+        .filter(|r| {
+            i32::from_le_bytes(
+                r[SYNC_FENCE_INFO_STATUS..SYNC_FENCE_INFO_STATUS + 4]
+                    .try_into()
+                    .unwrap(),
+            ) == 1
+        })
+        .map(|r| {
+            u64::from_le_bytes(
+                r[SYNC_FENCE_INFO_TIMESTAMP..SYNC_FENCE_INFO_TIMESTAMP + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// A fresh eventfd for a syncobj wait registration.
 ///
 /// Non-blocking because the pump drains it when it reports readiness, and a
@@ -771,6 +834,34 @@ fn udmabuf_signaled_sync_file() -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    fn fence_info(status: i32, ts: u64) -> Vec<u8> {
+        let mut r = vec![0u8; SYNC_FENCE_INFO_SIZE];
+        r[..5].copy_from_slice(b"nvkms");
+        r[SYNC_FENCE_INFO_STATUS..SYNC_FENCE_INFO_STATUS + 4]
+            .copy_from_slice(&status.to_le_bytes());
+        r[SYNC_FENCE_INFO_TIMESTAMP..SYNC_FENCE_INFO_TIMESTAMP + 8]
+            .copy_from_slice(&ts.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn a_merged_fence_signalled_when_its_last_part_did() {
+        let infos = [
+            fence_info(1, 5_000),
+            fence_info(1, 9_000),
+            fence_info(1, 7_000),
+        ]
+        .concat();
+        assert_eq!(latest_signal(&infos), 9_000);
+    }
+
+    #[test]
+    fn unsignalled_and_failed_fences_give_no_time() {
+        let infos = [fence_info(0, 0), fence_info(-110, 8_000)].concat();
+        assert_eq!(latest_signal(&infos), 0);
+        assert_eq!(latest_signal(&[]), 0);
+    }
 
     #[test]
     fn identify_has_nvidia_drms_number() {
@@ -1137,6 +1228,11 @@ mod tests {
                 // Merging two signalled fences gives a signalled fence.
                 let m = sync_merge(fd.as_raw_fd(), fd.as_raw_fd()).unwrap();
                 assert_eq!(sync_file_status(m.as_raw_fd()).unwrap(), 1);
+                // ...and a signal time no later than now, from the per-fence
+                // array the kernel really fills.
+                let (status, at) = sync_file_signalled(m.as_raw_fd()).unwrap();
+                assert_eq!(status, 1);
+                assert!(at <= crate::session::monotonic_ns());
             }
             Err(e) => eprintln!("SKIP a_signaled_sync_file_reports_signalled: {e}"),
         }

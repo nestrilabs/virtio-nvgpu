@@ -426,6 +426,10 @@ struct nvgpu_ev_rec {
 struct nvgpu_ev_fence {
   __le32 status; /* 1 signalled, <0 error (signed) */
   __le32 pad;
+  /* When the host's fences signalled, host CLOCK_MONOTONIC ns (the latest
+   * of a merge's), 0 unknown. An older backend sends the first 8 bytes only;
+   * the record's len says, and the rest reads as 0. */
+  __le64 timestamp_ns;
 } __packed;
 
 #define NVGPU_EV_HOTPLUG_F_HOTPLUG (1u << 0)
@@ -478,7 +482,7 @@ static_assert(sizeof(struct nvgpu_unwatch_req) == 8, "unwatch");
 static_assert(sizeof(struct nvgpu_host_op_req) == 56, "host op req");
 static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
 static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
-static_assert(sizeof(struct nvgpu_ev_fence) == 8, "ev fence");
+static_assert(sizeof(struct nvgpu_ev_fence) == 16, "ev fence");
 static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");
 static_assert(sizeof(struct nvgpu_card_record) == 16, "card record");
 
