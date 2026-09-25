@@ -25,7 +25,8 @@ the same across 595, 610 and 615, so a 595 or 615 box is a valid target.
 Throughout, three logs are the ones worth keeping on any failure, and each stage
 names the ones specific to it on top:
 
-- **the backend log** at `RUST_LOG=debug` (the launcher writes it per run);
+- **the backend log** at `RUST_LOG=debug` (`sudo RUST_LOG=debug scripts/run-guest.sh …`;
+  the launcher writes it per run, to `/root/logs/<tag>.backend.log`);
 - **guest `dmesg`** (the guest kernel module logs the cause of each refusal);
 - **host `dmesg`** (a host oops or an nvidia-drm/NVKMS `WARN` is always a FAIL).
 
@@ -69,9 +70,17 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   ioctls to deliver events (a documented limit, DESIGN §9). Turn it on for the
   lease/compositor-VM stages if vblank waits hang.
 - **the backend must not be root.** RM, DRM and NVKMS all take the guest's
-  privilege from the backend's credentials (`FINDINGS.md` S-5); run it as a
-  normal user in the `video`/`render` groups (and `kvm` for udmabuf), never with
-  `CAP_SYS_ADMIN`.
+  privilege from the backend's credentials (`FINDINGS.md` S-5), and the backend
+  refuses to start as root. `scripts/run-guest.sh` runs as root itself (for the
+  VMM) and starts the backend through `setpriv` as an unprivileged user, with the
+  groups `video`, `render` and `kvm`, no capabilities and `no_new_privs`: the
+  system user `nvgpu` by default (`useradd --system --no-create-home --shell
+  /usr/sbin/nologin nvgpu`), the owner of the compositor's socket in the Wayland
+  modes, and the owner of the export socket's directory in export mode.
+  `NVGPU_USER=…` picks another; `NVGPU_USER=root NVGPU_ALLOW_ROOT_UNSAFE=1` is
+  the only way to run it as root, for ruling the credentials out, never for a
+  test whose result you will keep. Every mode below is started through the
+  launcher, with the flags the appendix lists.
 
 ### 0.4 Tools
 
@@ -106,9 +115,9 @@ otherwise. The tests link only libc and libdrm; nothing NVIDIA.
 The foundation: the transport is up, the nodes are present, and the driver's own
 libraries advertise the extensions the later stages need.
 
-**Config:** any mode. Launch the backend and boot the guest as usual
-(`scripts/run-guest.sh`, or the backend directly — see the appendix for the flags
-each mode adds).
+**Config:** any mode. Boot the guest with `scripts/run-guest.sh` as usual; each
+display mode adds its flags to that command line (see the appendix), and the
+launcher passes them to the backend.
 
 **Run (in the guest):**
 
@@ -212,7 +221,10 @@ hl.config({ render = { direct_scanout = 2 } })   -- 2 = auto
 hl.config({ debug  = { enable_stdout_logs = true } })
 ```
 
-**Backend:** `--wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"`.
+**Launch:** from the desktop session, so the variables are its own —
+`sudo scripts/run-guest.sh --wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" <probe>`.
+The backend then runs as the session's user (the socket's owner), which is who
+may connect to it.
 **Guest:** run the daemon, then a fullscreen client through it:
 
 ```sh
@@ -257,7 +269,9 @@ hl.monitor({ output = "DP-2", mode = "preferred", position = "auto", leasable = 
 
 `hyprctl monitors all` should show `leasable: 1` for that output.
 
-**Backend:** `--wayland-socket … --wayland-lease`.
+**Launch:** `sudo scripts/run-guest.sh --wayland-socket … --wayland-lease <probe>`
+(`--wayland-lease-interval SECS` spaces the guest's lease requests, 5 s by
+default; 0 lifts it while iterating on this stage).
 **Guest:** the daemon exposes the host's `wp_drm_lease_device_v1`; a lease client
 acquires the connector and hands its fd to a KMS app.
 
@@ -315,8 +329,9 @@ refused only for SUB_OWNER — see the security stage). **Capture:** the backend
 Mode 5 (DESIGN §0.5): the guest compositor drives the host card directly; the host
 runs no compositor of its own.
 
-**Host:** no compositor running on the card. **Backend:** `--kms-card` (the
-backend warns loudly that the host card nodes are now offered to the guest). This
+**Host:** no compositor running on the card. **Launch:**
+`sudo scripts/run-guest.sh --kms-card <probe>` (the backend warns loudly that the
+host card nodes are now offered to the guest). This
 offers `DEV_DRI_CARD_*` nodes and `num_cards > 0` in HELLO.
 
 **Guest:**
@@ -343,8 +358,9 @@ from the guest compositor.
 Mode 5's other half (DESIGN §0.5, §7): host or second-VM clients reach the guest
 compositor through the proxy in export mode.
 
-**Config:** on the compositor-VM's backend add `--wayland-export /path/sock`
-(socket 0600, peer-uid checked). A host client connects at that socket; the guest
+**Config:** on the compositor-VM's launch add `--wayland-export /path/sock`
+(socket 0600, peer-uid checked: the launcher runs the backend as the owner of
+`/path`, so that user's programs are the ones that may connect). A host client connects at that socket; the guest
 daemon in `--export` mode carries it to the guest compositor.
 
 ```sh
@@ -547,7 +563,7 @@ or out while chasing one of these.
 
 ## Appendix — configuration by mode
 
-| mode | backend flags | host | guest |
+| mode | `run-guest.sh` flags | host | guest |
 |---|---|---|---|
 | Wayland client + direct scanout | `--wayland-socket $SOCK` | Hyprland, `render:direct_scanout=2` | `nvgpu-wl-guest --socket wayland-0` |
 | DRM lease → guest KMS | `--wayland-socket $SOCK --wayland-lease` | Hyprland patched, a `leasable` monitor | lease client + kmscube/modetest/`lease-flip` |
@@ -555,9 +571,17 @@ or out while chasing one of these.
 | compositor-VM | `--kms-card` | **no** host compositor on the card, `nvidia_drm.modeset=1` | guest Hyprland, `/dev/dri/card*` |
 | export | `--wayland-export /path/sock` (+ compositor-VM) | a host/2nd-VM client | `nvgpu-wl-guest --export …` |
 
-Diagnostic flags: `--permissive-abi` (forward unchecked ioctls, loudly — for
-finding what a workload needs, never for running one), `--keep-guest-coherency`
-(caching stage), `--proc-nvidia PATH` (test against a fixture tree).
+The launcher also takes the Wayland limits, for the stages that push them:
+`--wayland-max-conns N` (channels per VM, 64), `--wayland-shm-budget MIB` (1024),
+`--wayland-queue-budget MIB` (256) and `--wayland-lease-interval SECS` (5).
+Anything else goes to the backend after `--`, e.g. the diagnostic flags:
+`--permissive-abi` (forward unchecked ioctls, loudly — for finding what a
+workload needs, never for running one), `--keep-guest-coherency` (caching
+stage), `--proc-nvidia PATH` (test against a fixture tree):
+
+```sh
+sudo scripts/run-guest.sh --kms-card probeQ.sh kms1 -- --keep-guest-coherency
+```
 
 Guest packages the stages assume: NVIDIA userspace (Vulkan ICD, EGL), `nvgpu-wl-guest`,
 and for the checks `vulkan-tools`, `mesa-demos`, `libdrm` (modetest), `kmscube`,
