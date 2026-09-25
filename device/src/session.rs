@@ -531,6 +531,11 @@ impl NvidiaBackend {
         if self.hello_uvm_aperture(&req) {
             backend_caps |= BCAP_UVM_MAP;
         }
+        // Memory the guest already has is registered by its pages, which
+        // takes knowing where guest RAM is (osdesc.rs).
+        if self.guest_ram.is_some() {
+            backend_caps |= BCAP_OS_DESC;
+        }
         let resp = HelloResp {
             proto: PROTO_V2,
             backend_caps,
@@ -608,6 +613,26 @@ impl NvidiaBackend {
 
     fn serve_host_op(&mut self, payload: &[u8]) -> Result<Outcome, i32> {
         let req = read::<HostOpReq>(payload).ok_or(libc::EINVAL)?;
+        // Releases of memory registered by its pages: a list, after the
+        // fixed reply (osdesc.rs).
+        if req.op == OP_OSDESC_REAP {
+            if req.nargs != 1 {
+                return Err(libc::EINVAL);
+            }
+            let (last, ids) = self.osdesc_reap(req.args[0]);
+            let mut resp = HostOpResp {
+                nres: 2,
+                pad: 0,
+                res: [0; OP_MAX_RES],
+            };
+            resp.res[0] = last;
+            resp.res[1] = ids.len() as u64;
+            let mut body = bytes_of(&resp).to_vec();
+            for id in ids {
+                body.extend_from_slice(&id.to_le_bytes());
+            }
+            return Ok(Outcome::Reply(self.ok_reply(0, &body)));
+        }
         let nodes = self.host_nodes();
         let cards = self.config.kms_card.then_some(nodes.cards.as_slice());
         let handles = &self.handles;

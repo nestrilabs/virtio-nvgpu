@@ -208,27 +208,46 @@ And anything that fails to give space back fails *later*, in whatever mapping
 happens to be next, which is why the accounting is explicit rather than
 implicit.
 
-Memory travels one way only: GPU memory, and system memory RM allocates, into
-the guest. **Memory the guest already has cannot be handed to the GPU.** RM
-registers existing memory by CPU address — an NV01_MEMORY_SYSTEM_OS_DESCRIPTOR
-object (through RM_ALLOC or ALLOC_MEMORY) or VID_HEAP_CONTROL's
-ALLOC_OS_DESCRIPTOR — and pins whatever that address maps in the calling
-process. The calling process is the backend, so a guest address would name the
-VMM's memory, and the GPU would read and write it. The backend refuses all three
-(EPERM). That is how `cuMemHostRegister`/`cudaHostRegister` and Vulkan's
-`VK_EXT_external_memory_host` import memory, so both are unsupported; allocate
-the memory through the driver instead (`cuMemHostAlloc`, a host-visible Vulkan
-allocation), which travels the other way and works.
+Memory the guest already has travels the other way, and **cannot be handed
+to the GPU by address.** RM registers existing memory by CPU address — an
+NV01_MEMORY_SYSTEM_OS_DESCRIPTOR object (through RM_ALLOC or ALLOC_MEMORY)
+or VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR — and pins whatever that address
+maps in the calling process. The calling process is the backend, so a guest
+address would name the VMM's memory, and the GPU would read and write it.
+The backend refuses all three when they come with an address alone (EPERM).
+That is how `cuMemHostRegister`/`cudaHostRegister` and Vulkan's
+`VK_EXT_external_memory_host` import memory, and how `cuCtxCreate` registers
+a 2 MiB buffer of its own.
 
-It could be supported. The guest driver would pin the caller's range and send
-its guest-physical page list instead of an address; the backend would check
-every page lies in guest RAM, turn each into its own address through the
-vhost-user memory table it already holds (guest RAM is mapped into the backend
-for the virtqueues), and hand RM an address it owns: directly when the pages
-are contiguous in that mapping, otherwise after mapping them contiguously into
-a reserved range of its own from the memory-region fds. RM then pins the VMM's
-view of exactly the guest's pages. The guest must keep them pinned, and out of
-ballooning and migration, until the RM object is freed.
+So the pages travel instead, to a backend that says it takes them
+(BCAP_OS_DESC, offered when it holds the vhost-user memory table). The guest
+driver pins the caller's range the way RM would — long-term, and for
+writing unless the call asks for memory read-only to the CPU — and sends its
+guest-physical page list, as runs, with the call (`driver/nvgpu_osdesc.c`).
+The backend checks the call is one of the three with the user-virtual-address
+descriptor type (a physical address, a page array or a dma-buf by descriptor
+is refused whatever came with it), that the list covers exactly the pages RM
+would pin, with the same writability, and that every page lies in a region of
+guest RAM. It turns each page into its own address through the memory table
+it already holds (guest RAM is mapped into the backend for the virtqueues),
+and hands RM an address it owns: directly when the pages are contiguous in
+one region of that mapping, otherwise a range of its own, reserved
+`PROT_NONE` and then mapped run by run, `MAP_FIXED | MAP_SHARED`, from the
+regions' memfds (`device/src/osdesc.rs`). The caller's offset inside its
+first page is kept. RM pins the VMM's view of exactly the guest's pages, and
+the caller reads back its own address.
+
+RM keeps nothing of the address once it has pinned (the escape layer hands
+the rest of RM a page array), but the backend's range stays mapped until RM
+lets go all the same. It does so when RM frees the object, its parent or its
+client, when the file the client was made on closes — the backend frees the
+client itself first, so the pages are released by then — or with the session;
+a duplicate holds it too. Only then does the guest unpin: the reply to a
+registration carries an id, and the guest asks for the ids RM has let go of
+(HOST_OP OSDESC_REAP) after every RM_FREE, every close and before every new
+registration, and unpins what is named. Until then the pages are out of
+ballooning and migration, as RM would keep them. Registrations, bytes and
+separately mapped runs are bounded per file and per VM.
 
 ### The UVM aperture
 

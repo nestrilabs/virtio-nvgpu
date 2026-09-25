@@ -6,7 +6,8 @@ obj-$(CONFIG_VIRTIO_GPU_NV) += virtio_gpu_nv.o
 # One module from several objects. None of them may be called virtio_gpu_nv.o,
 # which is the module's own name, so the core is nvgpu_main.c.
 virtio_gpu_nv-y := nvgpu_main.o nvgpu_xfer.o nvgpu_i2.o nvgpu_drm.o nvgpu_hostfile.o \
-                   nvgpu_kms.o nvgpu_fence.o nvgpu_nvkms.o nvgpu_wl.o
+                   nvgpu_kms.o nvgpu_fence.o nvgpu_nvkms.o nvgpu_wl.o \
+                   nvgpu_osdesc.o
 
 # Out-of-tree, for loading into a test guest without rebuilding its kernel:
 #

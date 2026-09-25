@@ -71,6 +71,7 @@ extern struct kset *module_kset;
 /* NVIDIA ioctl numbers that require nested-pointer marshalling */
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
+#define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_IDLE_CHANNELS 0x41
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
@@ -1451,6 +1452,18 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (sz > 65536)
     return -EINVAL;
 
+  /*
+   * Memory the caller already has, registered by its pages rather than its
+   * address (nvgpu_osdesc.c), before ALLOC_MEMORY's descriptor translation:
+   * RM reads no descriptor for this class.
+   */
+  if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE) {
+    long ret;
+
+    if (nvgpu_osdesc_ioctl(nfd, cmd, uarg, sz, &ret))
+      return ret;
+  }
+
   fdt = nvgpu_find_fd_translation(nfd->dev, cmd);
   if (fdt)
     return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz,
@@ -1465,6 +1478,14 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE)
       return nvgpu_ioctl_idle_channels(nfd, cmd, uarg, sz);
     return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+  case NV_ESC_RM_FREE: {
+    long ret = nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+
+    /* An object RM freed may have been registered memory. */
+    if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE)
+      nvgpu_osdesc_reap(nfd->dev);
+    return ret;
+  }
   default:
     return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
   }
@@ -1667,6 +1688,9 @@ static int nvgpu_mmap_uvm_check(struct nvgpu_fd *nfd,
       dev->uvm_aperture.len < PAGE_SIZE)
     return -EINVAL;
   if (vma->vm_start != offset || (vma->vm_flags & rw) != rw)
+    return -EINVAL;
+  /* The band the backend and the VMM hold the pool's host address to. */
+  if (offset < NVGPU_UVM_HVA_MIN || vma->vm_end > NVGPU_UVM_HVA_MAX)
     return -EINVAL;
   return 0;
 }
@@ -1871,6 +1895,8 @@ void nvgpu_fd_put(struct nvgpu_fd *nfd) {
   if (!refcount_dec_and_test(&nfd->ref))
     return;
   nvgpu_close_handle(dev, nfd->handle);
+  /* RM clients the file held are gone, and what they registered with them. */
+  nvgpu_osdesc_reap(dev);
   kfree(nfd);
   nvgpu_dev_put(dev); /* taken when the open succeeded */
 }
@@ -3234,6 +3260,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   vdev->priv = dev;
   INIT_LIST_HEAD(&dev->fds);
   spin_lock_init(&dev->fds_lock);
+  nvgpu_osdesc_init(dev);
 
   /* Find virtqueues */
   ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
@@ -3522,6 +3549,9 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   nvgpu_xfer_quiesce(dev);
   vdev->config->reset(vdev);
   nvgpu_xfer_reclaim(dev);
+  /* Nothing answers now, and the backend ends the session (freeing every
+   * client) when it sees the reset: the pages RM held are the guest's. */
+  nvgpu_osdesc_release_all(dev);
 
   nvgpu_dri_cleanup(dev);
   nvgpu_module_sysfs_cleanup();
