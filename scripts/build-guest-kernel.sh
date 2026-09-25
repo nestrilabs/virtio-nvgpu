@@ -116,6 +116,19 @@ enable CONFIG_X86_PAT
 # Not needed to run, needed to debug. The absence of tracefs cost a whole
 # diagnosis cycle once: a silent -EINVAL out of the DRM core had to be found by
 # reading the kernel source instead of asking the kernel.
+# Namespaces, for the sandboxes guest applications bring: Chromium's and
+# Firefox's own (user and PID namespaces with seccomp), and Flatpak/bubblewrap
+# around whole apps. A guest meant for sandboxing apps needs them; without
+# them browsers run with their sandbox off.
+enable CONFIG_NAMESPACES
+enable CONFIG_USER_NS
+enable CONFIG_PID_NS
+enable CONFIG_NET_NS
+enable CONFIG_UTS_NS
+enable CONFIG_IPC_NS
+enable CONFIG_SECCOMP
+enable CONFIG_SECCOMP_FILTER
+
 enable CONFIG_FTRACE
 enable CONFIG_FUNCTION_TRACER
 enable CONFIG_FUNCTION_GRAPH_TRACER

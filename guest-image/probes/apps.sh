@@ -17,9 +17,48 @@ ALL=typing,pointer,clipboard,glxgears,xterm,gamescope,gtk,qt,firefox,mpv,glmark2
 APPS=$(arg apps "$ALL")
 
 load_module || { fail "module did not load"; finish; }
-start_wl_daemon wayland-0 || finish
-export HOME=/root XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-0
-mkdir -p "$HOME" /tmp/apps /tmp/ffprofile
+
+# nvgpu_user=1: the apps run as an unprivileged user, as a sandbox would run
+# them -- uid 1000 in video and render, the render node group-accessible, the
+# Wayland daemon that user's own (it owns /dev/nvgpu-wl, as the udev rule's
+# nvgpu-wl group gives a session), and the browsers with their own sandboxes
+# on. Default: everything as root, as the image first did.
+USERMODE=$(arg user 0)
+AS=()
+if [ "$USERMODE" = 1 ]; then
+    grep -q '^app:' /etc/passwd || {
+        echo 'app:x:1000:1000:app:/home/app:/bin/sh' >> /etc/passwd
+        echo 'app:x:1000:' >> /etc/group
+        # Into the image's own groups (video, render, nvgpu-wl exist there).
+        for g in video render nvgpu-wl; do
+            sed -i -E "s/^($g:x:[0-9]+:)(.*)\$/\1\2,app/; s/^($g:x:[0-9]+:),app\$/\1app/" /etc/group
+        done
+    }
+    mkdir -p /home/app /run/user/1000
+    chown 1000:1000 /home/app /run/user/1000
+    chmod 0700 /run/user/1000
+    for n in /dev/dri/renderD*; do chgrp render "$n"; chmod 0660 "$n"; done
+    for n in /dev/dri/card*; do chgrp video "$n"; chmod 0660 "$n"; done
+    [ -e /dev/nvgpu-wl ] && { chgrp nvgpu-wl /dev/nvgpu-wl; chmod 0660 /dev/nvgpu-wl; }
+    AS=(setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/home/app USER=app XDG_RUNTIME_DIR=/run/user/1000)
+    export HOME=/home/app XDG_RUNTIME_DIR=/run/user/1000
+    say "apps run as $(id -un 1000 2>/dev/null || echo 1000): groups video render nvgpu-wl, browsers sandboxed"
+    bg "${AS[@]}" nvgpu-wl-guest --socket wayland-0
+    WL_PID=${BG_PIDS[-1]}
+    for _ in $(seq 1 100); do [ -S /run/user/1000/wayland-0 ] && break; sleep 0.1; done
+    if [ -S /run/user/1000/wayland-0 ]; then pass "nvgpu-wl-guest (as app) serving /run/user/1000/wayland-0"
+    else fail "nvgpu-wl-guest (as app) never listened"; finish; fi
+else
+    start_wl_daemon wayland-0 || finish
+    export HOME=/root XDG_RUNTIME_DIR=/run/user/0
+fi
+export WAYLAND_DISPLAY=wayland-0
+mkdir -p "$HOME" /tmp/apps "$HOME/ffprofile"
+[ "$USERMODE" = 1 ] && chown -R 1000:1000 "$HOME"
+NOSANDBOX=--no-sandbox
+[ "$USERMODE" = 1 ] && NOSANDBOX=''
+# The apps write their results under /tmp (the typed line, the paste, X sockets).
+chmod 1777 /tmp
 # Toolkits want a session bus; one per slot, gone with it.
 # The image has no /etc/dbus-1; the package's own session.conf is enough.
 dbus() {
@@ -36,7 +75,7 @@ slot() {
     say "\$ $*"
     printf 'APP_START %s\n' "$name" >/dev/console
     # Through bash, so the helpers below (xwayland, dbus) run like commands.
-    timeout -s TERM -k 5 "$SLOT" bash -c "$(declare -f xwayland dbus); \"\$@\"" _ "$@" \
+    timeout -s TERM -k 5 "$SLOT" "${AS[@]}" bash -c "$(declare -f xwayland dbus); \"\$@\"" _ "$@" \
         > "/tmp/apps/$name.log" 2>&1
     local rc=$?
     printf 'APP_END %s %s\n' "$name" "$rc" >/dev/console
@@ -51,7 +90,7 @@ slot() {
 # An X server of its own for the X11 clients: rootful, so it is one ordinary
 # xdg_toplevel to the compositor and needs no window manager on the host.
 xwayland() {
-    Xwayland :1 -geometry 1280x720 -noreset > /tmp/apps/xwayland.log 2>&1 &
+    Xwayland :1 -geometry 1280x720 -noreset > "$HOME/xwayland.log" 2>&1 &
     local x=$!
     for _ in $(seq 1 50); do [ -S /tmp/.X11-unix/X1 ] && break; sleep 0.1; done
     DISPLAY=:1 "$@"
@@ -119,12 +158,12 @@ let t = 0;
   t++; requestAnimationFrame(f); })();
 </script>
 HTML
-            slot firefox dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile /tmp/ffprofile --new-instance file:///tmp/page.html
+            slot firefox dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile "$HOME/ffprofile" --new-instance file:///tmp/page.html
             ;;
         ffsupport)
             # Firefox's own account of its graphics (about:support, Graphics):
             # the compositor, WebGL renderer, and what it blocklisted.
-            slot ffsupport dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile /tmp/ffprofile --new-instance about:support
+            slot ffsupport dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile "$HOME/ffprofile" --new-instance about:support
             ;;
         chromeanim)
             # Steady rendering and nothing else: does Chromium keep presenting?
@@ -140,12 +179,12 @@ let t = 0;
   t++; document.title = 'frame ' + t; requestAnimationFrame(f); })();
 </script>
 HTML
-            slot chromeanim dbus chromium --no-sandbox --user-data-dir=/tmp/chromium2 --ozone-platform=wayland \
+            slot chromeanim dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium2" --ozone-platform=wayland \
                 --no-first-run --no-default-browser-check --enable-logging=stderr file:///tmp/cpage.html
             say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromeanim.log)"
             ;;
         chromentp)
-            slot chromentp dbus chromium --no-sandbox --user-data-dir=/tmp/chromium3 --ozone-platform=wayland \
+            slot chromentp dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium3" --ozone-platform=wayland \
                 --no-first-run --no-default-browser-check --enable-logging=stderr
             say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromentp.log)"
             grep -aE 'ERROR' /tmp/apps/chromentp.log | grep -avE 'dbus|crashpad' | head -n 3 | cut -c1-200 | sed 's/^/    /'
@@ -160,9 +199,13 @@ HTML
             ( sleep 30; p=$(pgrep -f 'type=gpu-process' | head -n 1)
               [ -n "$p" ] && awk '{split($1,a,"-"); if (strtonum("0x" a[1]) < 0x80000000) print}' "/proc/$p/maps" > /tmp/gpumaps
               [ -n "$p" ] && head -c 4000 "/proc/$p/maps" > /tmp/gpumaps.head ) &
-            slot chromegpu dbus "${tr[@]}" chromium --no-sandbox --user-data-dir=/tmp/chromium --ozone-platform=wayland \
-                --no-first-run --no-default-browser-check --enable-logging=stderr chrome://gpu
-            grep -aiE 'dawn|vulkan|webgpu|adapter|compatible|BackendType' /tmp/apps/chromegpu.log | cut -c1-220 | head -n 20 | sed 's/^/    /'
+            slot chromegpu dbus "${tr[@]}" chromium $NOSANDBOX --user-data-dir="$HOME/chromium" --ozone-platform=wayland \
+                --no-first-run --no-default-browser-check --enable-logging=stderr \
+                --vmodule='*/gpu/*=1,*/ui/gl/*=1,*dawn*=2,*webgpu*=2' $(arg chromeflags "" | tr ',' ' ') chrome://gpu
+            l=$(grep -anE 'incomplete: 0x00000000|MakeFromBackendTexture|eglCreateSync failed' /tmp/apps/chromegpu.log | head -n 1 | cut -d: -f1)
+            say "chromium log before its first GL error (line $l):"
+            [ -n "$l" ] && sed -n "$((l > 60 ? l - 60 : 1)),$((l + 2))p" /tmp/apps/chromegpu.log | grep -avE '^ |^$|wayland_object|Binding to' |
+                cut -c1-230 | sed 's/^/    /'
             grep -avE '^ ' /tmp/apps/chromegpu.log | grep -aE 'ERROR|FATAL' | grep -avE 'dbus|Fontconfig|sandbox|vaapi|crashpad' |
                 cut -c1-220 | head -n 6 | sed 's/^/    /'
             if [ -s /tmp/gpumaps ]; then
