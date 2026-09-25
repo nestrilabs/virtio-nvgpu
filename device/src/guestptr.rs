@@ -40,10 +40,11 @@
 //!   VK_EXT_external_memory_host register existing memory, which is therefore
 //!   unsupported; ARCHITECTURE.md §5 sketches how it could be done.
 //! - **RM controls** (`scrub_control`): RM follows pointers inside a
-//!   control's parameters for the commands in [`CONTROL_POINTERS`], and only
-//!   those (embedded_param_copy.c, rmapi_deprecated_control.c, and the
-//!   handlers that copy from user themselves, mem_mgr_ctrl.c:617 and
-//!   kernel_sm_debugger_session_ctrl.c:156). The guest can relocate one of
+//!   control's parameters for the commands in `abi::rmctrl`, and only those
+//!   (embedded_param_copy.c, rmapi_deprecated_control.c, and the handlers
+//!   that copy from user themselves, mem_mgr_ctrl.c:617 and
+//!   kernel_sm_debugger_session_ctrl.c:156), as gen/rmctrl_extract.py
+//!   measures them per release. The guest can relocate one of
 //!   them (the deep block); every other pointer field of the command is
 //!   zeroed, which RM answers as a missing buffer. Two commands carry
 //!   pointers the table cannot name one by one (a union selected by a type
@@ -235,7 +236,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
         NV_ESC_RM_CONTROL => {
             sized(OS54_SIZE)?;
             let ctl = rd32(params, OS54_CMD).unwrap_or(0);
-            if REFUSED_CONTROLS.contains(&ctl) {
+            if abi::rmctrl::refused(ctl) {
                 log::warn!(
                     "RM control {ctl:#010x} refused: its pointers cannot be named one by one"
                 );
@@ -288,93 +289,27 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
 
 // ───────────────────────────── RM controls ─────────────────────────────
 
-/// A control whose parameters hold user pointers RM follows, and where.
-pub(crate) struct ControlPointers {
-    pub cmd: u32,
-    pub ptrs: &'static [usize],
-}
-
-const fn c(cmd: u32, ptrs: &'static [usize]) -> ControlPointers {
-    ControlPointers { cmd, ptrs }
-}
-
-/// Every control RM dereferences a user pointer inside the parameters of,
-/// with the pointer offsets.
-///
-/// The union of embeddedParamCopyIn (embedded_param_copy.c) in 535.129.03,
-/// 580.95.05, 595.58.03 and 610.57.04, the deprecated V1 controls
-/// (rmapi_deprecated_control.c:80-87) and the two handlers that copy from
-/// user themselves. The offsets were measured with offsetof against each
-/// release's SDK headers and agree in all four, except that 535 numbers the
-/// NV0073 ACPI call differently (both are listed) and has no
-/// busEgmPeerIds (an offset past a block's end is skipped).
-pub(crate) const CONTROL_POINTERS: &[ControlPointers] = &[
-    c(0x2080016e, &[8]),             // NV2080_CTRL_GPU_GET_NVENC_SW_SESSION_INFO
-    c(0x20800123, &[8]),             // NV2080_CTRL_CMD_GPU_GET_ENGINES
-    c(0x20802a01, &[8]),             // NV2080_CTRL_CMD_CE_GET_CAPS
-    c(0x0080170d, &[8, 16]),         // NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST
-    c(0x00801705, &[40]),            // NV0080_CTRL_CMD_FIFO_START_SELECTED_CHANNELS (535)
-    c(0x00000130, &[8, 24]),         // NV0000_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD
-    c(0x00730120, &[8, 24]),         // NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD
-    c(0x00730168, &[8, 24]),         // the same, as 535 numbers it
-    c(0x00801401, &[8]),             // NV0080_CTRL_CMD_HOST_GET_CAPS
-    c(0x20800802, &[8]),             // NV2080_CTRL_CMD_BIOS_GET_INFO
-    c(0x20800803, &[1048]),          // NV2080_CTRL_CMD_BIOS_GET_NBSI
-    c(0x20800806, &[16]),            // NV2080_CTRL_CMD_BIOS_GET_NBSI_OBJ
-    c(0x00801104, &[8]),             // NV0080_CTRL_CMD_GR_GET_INFO
-    c(0x00801701, &[8]),             // NV0080_CTRL_CMD_FIFO_GET_CAPS
-    c(0xa0bc0101, &[24]),            // NVA0BC_CTRL_CMD_NVENC_SW_SESSION_UPDATE_INFO
-    c(0x83de0315, &[16]),            // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
-    c(0x83de0316, &[16]),            // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
-    c(0x83de0326, &[0]),             // NV83DE_CTRL_CMD_DEBUG_READ_BATCH_MEMORY
-    c(0x83de0327, &[0]),             // NV83DE_CTRL_CMD_DEBUG_WRITE_BATCH_MEMORY
-    c(0x402c0102, &[24]),            // NV402C_CTRL_CMD_I2C_INDEXED
-    c(0x20800122, &[24]),            // NV2080_CTRL_CMD_GPU_EXEC_REG_OPS
-    c(0x20802402, &[0]),             // NV2080_CTRL_CMD_NVD_GET_DUMP
-    c(0x00000602, &[0]),             // NV0000_CTRL_CMD_NVD_GET_DUMP
-    c(0x00410110, &[8]),             // NV0041_CTRL_CMD_GET_SURFACE_INFO
-    c(0xa0830103, &[0]),             // NVA083_CTRL_CMD_VIRTUAL_DISPLAY_GET_DEFAULT_EDID
-    c(0x00000127, &[160, 168]),      // NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS
-    c(0x00801301, &[8]),             // NV0080_CTRL_CMD_FB_GET_CAPS
-    c(0x00800201, &[8]),             // NV0080_CTRL_CMD_GPU_GET_CLASSLIST
-    c(0x20800124, &[8]),             // NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST
-    c(0x00801102, &[8]),             // NV0080_CTRL_CMD_GR_GET_CAPS
-    c(0x20800610, &[16]),            // NV2080_CTRL_CMD_I2C_ACCESS
-    c(0x20801201, &[8]),             // NV2080_CTRL_CMD_GR_GET_INFO
-    c(0xb06f010d, &[8]),             // NVB06F_CTRL_CMD_MIGRATE_ENGINE_CTX_DATA
-    c(0xb06f010c, &[8]),             // NVB06F_CTRL_CMD_GET_ENGINE_CTX_DATA
-    c(0x20802204, &[16]),            // NV2080_CTRL_CMD_RC_READ_VIRTUAL_MEM
-    c(0x0080180f, &[48]),            // NV0080_CTRL_CMD_DMA_UPDATE_PDE_2
-    c(0x208001e8, &[24]),            // NV2080_CTRL_CMD_GPU_RPC_GSP_TEST
-    c(0x208001f2, &[8, 24, 40, 64]), // NV2080_CTRL_CMD_GSP_CRYPTO_CONTROL
-    // Deprecated V1 controls, converted by RM with the user's pointers.
-    c(0x00000101, &[8, 16, 24]), // NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION
-    c(0x20801802, &[8]),         // NV2080_CTRL_CMD_BUS_GET_INFO
-    c(0x00801c01, &[8]),         // NV0080_CTRL_CMD_BSP_GET_CAPS
-    c(0x20800101, &[8]),         // NV2080_CTRL_CMD_GPU_GET_INFO
-    c(0x0073136a, &[56]),        // NV0073_CTRL_CMD_DP_SET_MSA_PROPERTIES
-    c(0x00801b01, &[8]),         // NV0080_CTRL_CMD_MSENC_GET_CAPS
-    c(0x20801301, &[8]),         // NV2080_CTRL_CMD_FB_GET_INFO
-    // Handlers that copy to user themselves (mem_mgr_ctrl.c:617).
-    c(0x20801349, &[8, 24]), // NV2080_CTRL_CMD_FB_GET_CLIENT_ALLOCATION_INFO
-];
-
-/// Controls refused outright: their pointers are not at fixed offsets.
-///
-/// - NV402C_CTRL_CMD_I2C_TRANSACTION: `pMessage` sits at 24, 32 or 40
-///   depending on `transType`, overlapping plain fields of the other arms
-///   (embedded_param_copy.c:73-158).
-/// - NV83DE_CTRL_CMD_READ_SURFACE, _WRITE_SURFACE: an array of up to
-///   MAX_ACCESS_OPS ops, each with its own `pCpuVA`, copied to and from with
-///   portMemExCopy*User (kernel_sm_debugger_session_ctrl.c:103-174).
-pub(crate) const REFUSED_CONTROLS: [u32; 3] = [0x402c0105, 0x83de031a, 0x83de031b];
+// Every control RM dereferences a user pointer inside the parameters of,
+// with the pointer offsets, and the controls whose pointers have no fixed
+// place (refused).
+//
+// Measured, not transcribed: `gen/rmctrl_extract.py` takes the commands
+// and fields from each release's embeddedParamCopyIn
+// (embedded_param_copy.c), its deprecated V1 control table
+// (rmapi_deprecated_control.c) and the handlers that copy user memory
+// themselves (mem_mgr_ctrl.c:617; kernel_sm_debugger_session_ctrl.c's
+// READ/WRITE_SURFACE, an array of per-op pointers, and
+// NV402C_CTRL_CMD_I2C_TRANSACTION, whose pointer moves with a union arm,
+// are the refused ones), compiles the offsets against that release's SDK
+// headers, and fails if a release has an RM file copying user memory that
+// none of those account for. The table is the union over 535.129.03,
+// 580.178.04, 595.71.05, 595.99.02, 610.57.04 and 615.71.09 (an offset past
+// a block's end is one that release lacks, and is skipped).
+// (abi::rmctrl::CONTROL_POINTERS and REFUSED_CONTROLS.)
 
 /// The pointer offsets RM follows in control `cmd`'s parameters, if any.
 pub(crate) fn control_pointers(cmd: u32) -> &'static [usize] {
-    CONTROL_POINTERS
-        .iter()
-        .find(|c| c.cmd == cmd)
-        .map_or(&[], |c| c.ptrs)
+    abi::rmctrl::pointers(cmd).map_or(&[], |c| c.ptrs)
 }
 
 /// Zero every pointer RM would follow in control `cmd`'s parameters,
@@ -494,6 +429,7 @@ pub(crate) fn uvm_gate(tools: bool, cmd: u32, params: &mut [u8]) -> Result<Resto
 mod tests {
     use super::*;
     use crate::hostfd::{IOC_RW, ioc};
+    use abi::rmctrl::{CONTROL_POINTERS, REFUSED_CONTROLS};
 
     fn put32(b: &mut [u8], off: usize, v: u32) {
         b[off..off + 4].copy_from_slice(&v.to_le_bytes());
@@ -647,7 +583,7 @@ mod tests {
 
     #[test]
     fn controls_whose_pointers_have_no_fixed_place_are_refused() {
-        for ctl in REFUSED_CONTROLS {
+        for &(ctl, _) in REFUSED_CONTROLS {
             let mut p = vec![0u8; 32];
             put32(&mut p, OS54_CMD, ctl);
             assert_eq!(rm_escape(CONTROL, &mut p), Err(libc::EPERM), "{ctl:#x}");
@@ -692,7 +628,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for c in CONTROL_POINTERS {
             assert!(seen.insert(c.cmd), "{:#x} twice", c.cmd);
-            assert!(!REFUSED_CONTROLS.contains(&c.cmd));
+            assert!(!abi::rmctrl::refused(c.cmd));
             for &o in c.ptrs {
                 assert_eq!(o % 8, 0, "{:#x} at {o}", c.cmd);
             }
