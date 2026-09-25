@@ -24,6 +24,7 @@ use crate::hostfd::HandleKind;
 use crate::kms;
 use crate::nvkms::NvkmsPolicy;
 use crate::schema::policy;
+use crate::semsurf::{self, SemsurfPolicy};
 use crate::xfer::{Errno, Hooks, Prepared, PropKind};
 
 /// The one policy object the backend hands every IOCTL2 (`Env::hooks`).
@@ -37,6 +38,10 @@ pub struct BackendHooks {
     /// Shared with the backend, which feeds it the host version and every
     /// handle it closes.
     nvkms: Arc<NvkmsPolicy>,
+    /// FENCES: what 0x54 may name (the host's semaphore layout, the VM's
+    /// RM clients, its live contexts; semsurf.rs). Shared with the backend,
+    /// which feeds it from the RM path and every handle it opens and closes.
+    semsurf: Arc<SemsurfPolicy>,
 }
 
 impl BackendHooks {
@@ -51,7 +56,12 @@ impl BackendHooks {
 
     /// With the NVKMS state the backend also holds.
     pub fn with_nvkms(nvkms: Arc<NvkmsPolicy>) -> Arc<dyn Hooks> {
-        Arc::new(Self { nvkms })
+        Self::with_state(nvkms, Arc::default())
+    }
+
+    /// With the NVKMS and semaphore-surface state the backend also holds.
+    pub fn with_state(nvkms: Arc<NvkmsPolicy>, semsurf: Arc<SemsurfPolicy>) -> Arc<dyn Hooks> {
+        Arc::new(Self { nvkms, semsurf })
     }
 
     // ───────────────────────────── KMS ─────────────────────────────
@@ -110,13 +120,25 @@ impl BackendHooks {
     // forwarded as it is. A wait is not: forwarded as it stands it would park
     // a host thread for as long as the guest asked, so every wait becomes a
     // poll and the guest sleeps on a shared eventfd registration instead
-    // (`fence::before`, `fence::Registrations`). Stateless here: the
-    // registrations are HOST_OP state, kept by the backend per session.
+    // (`fence::before`, `fence::Registrations`); the registrations are
+    // HOST_OP state, kept by the backend per session. The one call whose
+    // arguments reach host kernel memory unchecked, SEMSURF_FENCE_CTX_CREATE,
+    // is bounded, owned and counted by `semsurf` first.
 
     fn fences_before(&self, p: &mut Prepared) -> Result<(), Errno> {
         let cmd = p.cmd();
+        if cmd == semsurf::SEMSURF_FENCE_CTX_CREATE {
+            return self.semsurf.ctx_create_before(p);
+        }
         let arg = p.buffer_mut(0).ok_or(libc::EINVAL)?;
         crate::fence::before(cmd, arg)
+    }
+
+    /// A fence context made is counted against its file's cap until closed.
+    fn fences_after(&self, p: &mut Prepared, ret: i32) {
+        if p.cmd() == semsurf::SEMSURF_FENCE_CTX_CREATE {
+            self.semsurf.ctx_create_after(p, ret);
+        }
     }
 
     /// IN_FENCE_FD, OUT_FENCE_PTR and their kin on an ATOMIC commit. `xfer`
@@ -180,6 +202,9 @@ impl Hooks for BackendHooks {
     }
 
     fn after(&self, p: &mut Prepared, ret: i32) {
+        if p.policy() & policy::FENCE != 0 {
+            self.fences_after(p, ret);
+        }
         if p.policy() & (policy::GRANT | policy::REVOKE | policy::NVKMS) != 0 {
             self.nvkms_after(p, ret);
         }

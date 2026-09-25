@@ -151,8 +151,13 @@ RENDER_IOCTLS = shared(RENDER) + [
           ]),
     Ioctl('NV_DMABUF_SUPPORTED', RENDER, 'DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED',
           None, 0, nv(0x0f), IOC_NONE),
-    # nvidia-drm-fence.c:1224 → nvkms-kapi-sync.c:182: RM handles of the
-    # caller's own client, no descriptor; the result is a fence-context GEM.
+    # nvidia-drm-fence.c:1224 → nvkms-kapi-sync.c:182: RM handles, no
+    # descriptor; the result is a fence-context GEM. The schema checks only
+    # sizes: the index is added to a host kernel mapping unchecked
+    # (nvidia-drm-fence.c:1257-1261) and the client is dup'd at kernel
+    # privilege, so POL_FENCE's hook bounds the index by the host's layout,
+    # requires one of the VM's own clients and caps live contexts
+    # (device/src/semsurf.rs).
     Ioctl('NV_SEMSURF_FENCE_CTX_CREATE', RENDER,
           'DRM_IOCTL_NVIDIA_SEMSURF_FENCE_CTX_CREATE',
           'struct drm_nvidia_semsurf_fence_ctx_create_params', 32, nv(0x14),
