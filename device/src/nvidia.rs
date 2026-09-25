@@ -2767,9 +2767,12 @@ impl NvidiaBackend {
         let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
         log::info!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
 
-        // Zero out the addresses before sending back to guest
-        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
-        param_buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+        // The caller's own addresses go back. RM only reads pOld/pNew
+        // (escape.c:857-876 takes them into locals and writes nothing but
+        // `status`), and nvidia.ko copies the whole argument back
+        // (nv.c:2834), so a native caller reads back what it passed -- not
+        // zero, and never the host VA we put there for the call.
+        param_buf[16..32].copy_from_slice(&param_in[16..32]);
 
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
@@ -4561,5 +4564,25 @@ mod tests {
             assert_eq!((rec.major, rec.minor), (226, 1));
             assert_eq!(n, off + 4 + 16 + 5);
         }
+    }
+
+    /// RM never writes UPDATE_DEVICE_MAPPING_INFO's pOld/pNew, so the
+    /// caller reads back what it passed -- not zero, and not the host
+    /// address the backend put there for the call (L-6).
+    #[test]
+    fn update_device_mapping_info_gives_the_callers_addresses_back() {
+        let mut be = gated_backend();
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        // NVOS56 {hClient, hDevice, hMemory, pad, pOld, pNew, status, pad}.
+        let mut p = [0u8; 40];
+        p[16..24].copy_from_slice(&0x7f00_1000u64.to_le_bytes());
+        p[24..32].copy_from_slice(&0x7f00_2000u64.to_le_bytes());
+        let cmd = hostfd::ioc(hostfd::IOC_RW, b'F', 0x5e, 40);
+        let resp = v1_ioctl(&mut be, ctl, cmd, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(forwarded(), vec![cmd as u64]);
+        let body = &resp[IOCTL_BODY..];
+        assert_eq!(&body[16..32], &p[16..32], "the caller's own pOld and pNew");
+        assert_eq!(&body[32..36], &[0xaa; 4], "the host's status");
     }
 }
