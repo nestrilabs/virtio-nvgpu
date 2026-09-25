@@ -12,8 +12,6 @@
 //! a fault on the offending write, in the call that made it, while the log line
 //! naming that call is still the last one printed.
 
-use std::ptr;
-
 pub struct GuardedBuf {
     base: *mut u8,
     mapped: usize,
@@ -65,11 +63,38 @@ impl GuardedBuf {
         if len == 0 {
             return None;
         }
+        #[cfg(miri)]
+        return Self::heap(len);
+        #[cfg(not(miri))]
+        Self::mapped(len)
+    }
+
+    /// Miri cannot make a PROT_NONE page, and needs none: it faults an access
+    /// past any allocation itself. The same layout, from the heap.
+    #[cfg(miri)]
+    fn heap(len: usize) -> Option<Self> {
+        let mapped = ((len + SLACK).div_ceil(PAGE) + 1) * PAGE;
+        let layout = std::alloc::Layout::from_size_align(mapped - PAGE, PAGE).ok()?;
+        // SAFETY: a non-zero size.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some(Self {
+            base,
+            mapped,
+            offset: 0,
+            len,
+        })
+    }
+
+    #[cfg(not(miri))]
+    fn mapped(len: usize) -> Option<Self> {
         let pages = (len + SLACK).div_ceil(PAGE);
         let mapped = (pages + 1) * PAGE;
         let base = unsafe {
             libc::mmap(
-                ptr::null_mut(),
+                std::ptr::null_mut(),
                 mapped,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -118,7 +143,16 @@ impl GuardedBuf {
 
 impl Drop for GuardedBuf {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.base as *mut libc::c_void, self.mapped) };
+        #[cfg(miri)]
+        {
+            let layout = std::alloc::Layout::from_size_align(self.mapped - PAGE, PAGE).unwrap();
+            // SAFETY: allocated in `new` with this layout, freed once.
+            unsafe { std::alloc::dealloc(self.base, layout) };
+        }
+        #[cfg(not(miri))]
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.mapped)
+        };
     }
 }
 
@@ -138,6 +172,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "under Miri the guard is Miri's own bounds check")]
     fn a_gross_overrun_still_has_a_guard_behind_it() {
         let b = GuardedBuf::new(100).expect("mapped");
         let guard = b.base as usize + b.mapped - PAGE;

@@ -295,6 +295,12 @@ impl KmsCall {
 /// Open a card node for KMS: O_NONBLOCK, as every DRM-class file the pump
 /// reads is (hostfd::set_nonblock).
 fn open_card(path: &str) -> Result<OwnedFd, i32> {
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    let path = {
+        let _ = path;
+        "/dev/null"
+    };
     let c = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
     // SAFETY: a NUL-terminated path; the descriptor is owned below.
     let fd = unsafe {
@@ -1163,6 +1169,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri's clocks start at zero")]
     fn time_sync_carries_realtime_and_raw_when_the_guest_has_room() {
         let mut be = backend();
         assert_eq!(status(&hello(&mut be, 0)), 0);

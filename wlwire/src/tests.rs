@@ -1240,6 +1240,7 @@ fn overlapping_buffers_are_charged_once() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
 fn the_last_buffer_over_a_page_punches_it_out_and_gives_its_charge_back() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
     let mut p = shm_pair(&vm);
@@ -1275,6 +1276,7 @@ fn the_last_buffer_over_a_page_punches_it_out_and_gives_its_charge_back() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
 fn shm_sync_outside_every_live_buffer_is_refused() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
     let fresh = || {
@@ -1312,6 +1314,7 @@ fn shm_sync_outside_every_live_buffer_is_refused() {
 /// `wl_buffer` and making a new one each time. The pool is larger than the
 /// VM's budget, and the buffer travels further than the budget too.
 #[test]
+#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
 fn foot_scrolls_through_a_pool_larger_than_the_budget() {
     let budget: u64 = 8 << 20;
     let vm = Arc::new(crate::shm::ShmBudget::new(budget, 64));
@@ -1446,6 +1449,7 @@ fn unfinished_blobs_are_capped_by_count_not_only_by_bytes() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no seals (F_GET_SEALS)")]
 fn a_keymap_arrives_as_a_sealed_copy() {
     let mut p = Pair::new(Policy::default());
     p.registry(&[(1, "wl_seat", 9)]);
@@ -1572,6 +1576,7 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri's pipes are unbounded: nothing is held back to overrun")]
 fn a_stream_that_overruns_its_credit_is_a_protocol_error() {
     let mut s = crate::stream::Streams::new(false);
     let (_rd, wr) = sys::pipe().unwrap();

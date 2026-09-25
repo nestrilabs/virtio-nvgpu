@@ -547,6 +547,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
     fn recorded_ranges_are_bounded_per_file_and_per_vm() {
         let mut m = maps(APERTURE_MAX);
         for i in 0..RANGES_PER_FILE as u64 {

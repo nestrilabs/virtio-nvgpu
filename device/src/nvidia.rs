@@ -92,6 +92,12 @@ fn device_path_with(device_type: u32, dri: &[DriDevice]) -> Result<CString> {
             return Err(DeviceError::InvalidDeviceKind(device_type));
         }
     };
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    let path = {
+        let _ = path;
+        "/dev/null".to_string()
+    };
     Ok(CString::new(path).expect("a device path has no interior NUL"))
 }
 
@@ -173,7 +179,7 @@ pub(crate) struct HostNodes {
 /// generic_page_kind, page_kind_generation, sector_layout, supports_sync_fd,
 /// supports_semsurf. Every host answer is normalised into this layout (see
 /// [`normalise_dev_info`]), because it is the only one that has every field.
-const NV_DEV_INFO_WORDS: usize = 9;
+pub(crate) const NV_DEV_INFO_WORDS: usize = 9;
 
 /// How many words the probe offers the host: more than any layout so far, so
 /// the one the host fills is measured rather than assumed.
@@ -256,6 +262,10 @@ fn normalise_dev_info(raw: &[u32], size: u32, modeset: bool) -> Option<[u32; NV_
 /// not use for allocation or fencing, where invented capabilities made it try
 /// and fail (vkCreateDevice failing on 0x54's -EOPNOTSUPP).
 fn host_dev_info(path: &str) -> Option<([u32; NV_DEV_INFO_WORDS], u32)> {
+    #[cfg(fuzzing)]
+    if path != "/dev/null" {
+        return None;
+    }
     let c_path = CString::new(path).ok()?;
     // SAFETY: a NUL-terminated path, and the fd is closed below.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -625,6 +635,19 @@ fn ioctl_arg(cmd: u64, bytes: &[u8]) -> Option<GuardedBuf> {
     let mut b = GuardedBuf::new(ioctl_arg_len(cmd, bytes.len()))?;
     b.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
     Some(b)
+}
+
+impl NvidiaBackend {
+    /// Hand the whole of `arg` to the host driver: it copies `_IOC_SIZE`
+    /// bytes in and out whatever the guest sent (`ioctl_arg_len`), so the
+    /// pointer it is given is the buffer's own, not one taken from a slice of
+    /// the guest's length -- which covers only those bytes, and a slice
+    /// taken before the call is not what the host's writes leave valid
+    /// (Miri, Stacked Borrows). Callers slice `arg` again after the call.
+    fn host_call(&self, fd: RawFd, request: u64, arg: &mut GuardedBuf) -> i32 {
+        // SAFETY: the HostIoctl contract: `arg` holds ioctl_arg_len bytes.
+        unsafe { (self.host_ioctl)(fd, request, arg.as_mut_ptr()) }
+    }
 }
 
 /// A placement the guest can hand back, and everything needed to undo it.
@@ -1199,19 +1222,19 @@ impl NvidiaBackend {
 
     /// Put a descriptor straight into the table, as if an OPEN or an fd out
     /// had produced it.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn adopt_for_test(&mut self, fd: OwnedFd, kind: HandleKind) -> u32 {
         self.handles.insert(fd, kind).expect("test table has room")
     }
 
     /// Replace host node enumeration, which needs real hardware.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn set_host_nodes_for_test(&mut self, dri: Vec<DriDevice>, cards: Vec<CardNode>) {
         self.nodes = Some(Arc::new(HostNodes { dri, cards }));
     }
 
     /// Replace the host ioctl, to see what a forwarding path hands the driver.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn set_host_ioctl_for_test(&mut self, f: HostIoctl) {
         self.host_ioctl = f;
     }
@@ -1425,6 +1448,8 @@ impl NvidiaBackend {
     /// executed with no backend lock held and then handed to
     /// [`NvidiaBackend::finish_ioctl2`].
     pub fn serve(&mut self, req_buf: &[u8], cap: usize) -> Outcome {
+        #[cfg(test)]
+        crate::fuzz_seeds::served(req_buf, cap);
         self.created.clear();
         // The mode is configuration, which the transport may set at any
         // point before the first message; the NVKMS policy reads its copy.
@@ -1432,7 +1457,8 @@ impl NvidiaBackend {
         if req_buf.len() < size_of::<MsgHeader>() {
             self.current_msg = MsgType::Ioctl;
             self.current_req_id = 0;
-            return Outcome::Reply(self.error_reply(libc::EPROTO));
+            let r = self.error_reply(libc::EPROTO);
+            return Outcome::Reply(self.fit(r, cap));
         }
         let hdr = read_struct::<MsgHeader>(req_buf, 0);
         self.current_req_id = hdr.req_id;
@@ -1440,7 +1466,8 @@ impl NvidiaBackend {
         let Some(msg_type) = MsgType::from_u32(hdr.msg_type) else {
             log::warn!("unknown msg_type {}", hdr.msg_type);
             self.current_msg = MsgType::Ioctl;
-            return Outcome::Reply(self.error_reply(libc::EPROTO));
+            let r = self.error_reply(libc::EPROTO);
+            return Outcome::Reply(self.fit(r, cap));
         };
         self.current_msg = msg_type;
         *self
@@ -1487,7 +1514,7 @@ impl NvidiaBackend {
             ),
             _ => self.handles.owner(hdr.handle),
         };
-        let mut reply = match msg_type {
+        let reply = match msg_type {
             MsgType::Hello
             | MsgType::Ioctl2
             | MsgType::TimeSync
@@ -1512,6 +1539,13 @@ impl NvidiaBackend {
                 }
             }
         };
+        Outcome::Reply(self.fit(reply, cap))
+    }
+
+    /// `reply`, or if it is larger than the `cap` bytes the guest posted, a
+    /// header saying so -- or nothing, if even that does not fit: no reply
+    /// is ever longer than the buffer it goes to.
+    fn fit(&mut self, mut reply: Reply, cap: usize) -> Reply {
         if reply.bytes.len() > cap {
             // Nothing the guest could read: say why in a header, if even that
             // fits, and take back whatever the message created.
@@ -1522,7 +1556,7 @@ impl NvidiaBackend {
                 reply.bytes.clear();
             }
         }
-        Outcome::Reply(reply)
+        reply
     }
 
     /// Serve one request into a caller-supplied buffer, all the way through:
@@ -3192,9 +3226,43 @@ impl NvidiaBackend {
             log::debug!("RM_ALLOC hClass=0x{:x}", h_class);
         }
 
+        // The size the host copies through the pointer: the outer struct's
+        // own field (u64 in nvidia-drm's blocks, u32 in RM's and NVKMS's).
+        let size_wide = hostfd::ioc_type(request as u32) == b'd';
+        let host_size = |outer: &[u8]| -> u64 {
+            if size_wide {
+                outer
+                    .get(size_offset..size_offset + 8)
+                    .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+            } else {
+                outer
+                    .get(size_offset..size_offset + 4)
+                    .map_or(0, |b| u64::from(u32::from_le_bytes(b.try_into().unwrap())))
+            }
+        };
+
         if !nested_in.is_empty() {
             // Guest sent nested params — allocate host buffer, point struct at it
             let nested_size = nested_in.len();
+
+            // Exactly as many bytes as the host will copy, or none said
+            // (RM_ALLOC's zero: RM takes the class's own size, and no class
+            // with a pointer in its parameters gets this far, guestptr.rs).
+            // Past what was sent the host reads the zeroed slack after our
+            // buffer (guarded.rs), so a pointer field the block cuts short
+            // reached RM as the guest's low bytes over our zeros: seven of
+            // eight bytes, any address in this process, which the scrub
+            // below -- reading only the bytes sent -- never saw, and RM
+            // copied in from and out to it (FIFO_GET_CHANNELLIST writes its
+            // channel list there). Found by the `backend_v2` fuzz target.
+            let size = host_size(outer);
+            if size != 0 && size != nested_size as u64 {
+                log::warn!(
+                    "ioctl {request:#x}: the host would copy {size} bytes of parameters and \
+                     {nested_size} were sent; refused"
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
             // Guarded rather than heap-allocated: the driver writes its answer
             // here, and if it writes more than the caller's size field claimed,
             // the fault should land on that write rather than on someone else's
@@ -3364,10 +3432,6 @@ impl NvidiaBackend {
                 }
             }
 
-            // Set pointer in outer struct to host buffer address
-            let host_ptr = host_buf.as_mut_ptr() as u64;
-            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
-
             // Extract the RM control command for special handling
             let _ctrl_cmd = if escape == 0x2A && outer.len() >= 12 {
                 Some(u32::from_le_bytes(outer[8..12].try_into().unwrap()))
@@ -3521,8 +3585,16 @@ impl NvidiaBackend {
                 crate::guestptr::Restore::default()
             };
 
-            // Call host ioctl — paramsSize field is untouched (may be 0)
-            let rc = unsafe { (self.host_ioctl)(host_fd, request, outer.as_mut_ptr()) };
+            // The nested block's address goes into the outer struct last:
+            // every write above went through `host_buf`, and an address taken
+            // before them is not the one they leave valid (Miri, Stacked
+            // Borrows). Then the call -- paramsSize untouched (may be 0) --
+            // and both blocks sliced again for the reply.
+            let host_ptr = host_guard.as_mut_ptr() as u64;
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
+            let rc = self.host_call(host_fd, request, &mut outer_buf);
+            let outer = &mut outer_buf.as_mut_slice()[..outer_size];
+            let host_buf = host_guard.as_mut_slice();
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
@@ -3629,16 +3701,7 @@ impl NvidiaBackend {
             // pointer and a size of its choosing. A nonzero size with nothing
             // sent is refused rather than zeroed, so a caller that meant to
             // send parameters learns that none arrived.
-            let size_wide = hostfd::ioc_type(request as u32) == b'd';
-            let size = if size_wide {
-                outer
-                    .get(size_offset..size_offset + 8)
-                    .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
-            } else {
-                outer
-                    .get(size_offset..size_offset + 4)
-                    .map_or(0, |b| u64::from(u32::from_le_bytes(b.try_into().unwrap())))
-            };
+            let size = host_size(outer);
             if size != 0 {
                 log::warn!(
                     "ioctl {request:#x}: parameter size {size} but no parameters sent; refused \
@@ -3648,7 +3711,8 @@ impl NvidiaBackend {
             }
             outer[ptr_offset..ptr_offset + 8].fill(0);
 
-            let rc = unsafe { (self.host_ioctl)(host_fd, request, outer.as_mut_ptr()) };
+            let rc = self.host_call(host_fd, request, &mut outer_buf);
+            let outer = &mut outer_buf.as_mut_slice()[..outer_size];
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!(
@@ -4229,7 +4293,8 @@ impl NvidiaBackend {
             // Leave other fields as-is, call host
         }
 
-        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+        let rc = self.host_call(host_fd, request, &mut arg);
+        let mut param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
 
@@ -4237,7 +4302,8 @@ impl NvidiaBackend {
             if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
                 log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
                 param_buf[0] = 2; // Try V2
-                let rc2 = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+                let rc2 = self.host_call(host_fd, request, &mut arg);
+                param_buf = &mut arg.as_mut_slice()[..param_in.len()];
                 if rc2 < 0 {
                     let errno2 = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     log::warn!(
@@ -4409,8 +4475,8 @@ impl NvidiaBackend {
             let Some(mut arg) = ioctl_arg(request, param_in) else {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
             };
+            let rc = self.host_call(host_fd, request, &mut arg);
             let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
-            let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
@@ -4434,7 +4500,8 @@ impl NvidiaBackend {
         let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         param_buf[fd_offset..fd_offset + 4].copy_from_slice(&(host_embedded as i32).to_le_bytes());
 
-        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+        let rc = self.host_call(host_fd, request, &mut arg);
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -4509,7 +4576,8 @@ impl NvidiaBackend {
         // Set pNewCpuAddress to host VA too (the host mapping didn't move)
         param_buf[24..32].copy_from_slice(&host_old.to_le_bytes());
 
-        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+        let rc = self.host_call(host_fd, request, &mut arg);
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             log::warn!(
@@ -4588,7 +4656,8 @@ impl NvidiaBackend {
 
         // --- Step 2: Call host ioctl ---
 
-        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+        let rc = self.host_call(host_fd, request, &mut arg);
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -4802,7 +4871,8 @@ impl NvidiaBackend {
                 };
                 let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
                 param_buf[16..24].fill(0);
-                let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+                let rc = self.host_call(host_fd, request, &mut arg);
+                let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
                 if rc < 0 {
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
@@ -4827,7 +4897,8 @@ impl NvidiaBackend {
         let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         param_buf[16..24].copy_from_slice(&entry.host_p_linear_address.to_le_bytes());
 
-        let rc = unsafe { (self.host_ioctl)(host_fd, request, param_buf.as_mut_ptr()) };
+        let rc = self.host_call(host_fd, request, &mut arg);
+        let param_buf = &mut arg.as_mut_slice()[..param_in.len()];
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             log::warn!("UNMAP_MEMORY: host ioctl failed: errno={}", errno);
@@ -5158,6 +5229,8 @@ impl NvidiaBackend {
 /// every host fd it held. `cargo` reported it only as an unused-method warning.
 impl Drop for NvidiaBackend {
     fn drop(&mut self) {
+        #[cfg(test)]
+        crate::fuzz_seeds::dropped(self);
         if !self.handles.is_empty() {
             log::warn!(
                 "NvidiaBackend dropped with {} handles still open — \
@@ -5475,6 +5548,24 @@ mod tests {
         let mut be = NvidiaBackend::for_test();
         be.dispatch(&[0u8; 4], &mut vec![0u8; 32]);
         // just must not panic
+    }
+
+    /// Fuzzing (backend target): a request too short for a header, or of no
+    /// known type, was answered with a 16-byte header whatever capacity the
+    /// guest posted. `serve` promises no reply longer than `cap`; the
+    /// vhost-user transport never posts less than a header, another
+    /// transport might.
+    #[test]
+    fn a_malformed_request_is_answered_within_the_posted_capacity() {
+        let mut be = NvidiaBackend::for_test();
+        for req in [&[0u8; 4][..], &[0xffu8; 16][..]] {
+            for cap in [0, 2, 15, 16] {
+                let Outcome::Reply(r) = be.serve(req, cap) else {
+                    panic!("an IOCTL2 from nothing");
+                };
+                assert!(r.bytes.len() <= cap, "{} bytes for {cap}", r.bytes.len());
+            }
+        }
     }
 
     // ---- teardown tests (no GPU required) ----

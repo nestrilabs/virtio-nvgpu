@@ -287,6 +287,8 @@ mod tests {
     use super::*;
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no getrlimit")]
     fn the_descriptor_limit_is_raised_to_the_hard_limit() {
         let soft = raise_nofile().unwrap();
         let mut r = libc::rlimit {
@@ -332,6 +334,7 @@ mod tests {
     /// Run on a thread of its own: capabilities and no_new_privs are per
     /// thread, and the drop must not reach the rest of the test binary.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no prctl")]
     fn after_the_drop_no_capability_is_left_and_none_can_be_gained() {
         std::thread::spawn(|| {
             drop_all_caps().unwrap();
@@ -356,6 +359,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no directory permissions")]
     fn a_private_dir_is_made_0700_and_one_open_to_others_is_refused() {
         let d = tmpdir("dir");
         let p = d.join("nvgpu");
@@ -372,6 +377,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no Unix sockets")]
     fn only_a_stale_socket_of_ours_is_cleared_away() {
         let d = tmpdir("sock");
         let s = d.join("nvgpu.sock");

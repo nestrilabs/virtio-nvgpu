@@ -11,6 +11,10 @@ pub mod deepseg;
 pub mod error;
 pub mod exec;
 pub mod fence;
+#[cfg(test)]
+mod fuzz_seeds;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 pub mod guarded;
 pub mod guestptr;
 pub mod handle_table;
@@ -43,5 +47,7 @@ pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;
 pub mod virtio;
+#[cfg(feature = "vhost-user")]
+pub mod vring;
 pub mod wl;
 pub mod xfer;

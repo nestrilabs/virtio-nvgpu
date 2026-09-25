@@ -638,6 +638,7 @@ mod extents_tests {
 
     /// Against a count per page, over buffers made and destroyed at random.
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive: too slow under Miri, and safe code")]
     fn steps_agree_with_a_count_per_page() {
         const PAGES: usize = 64;
         let mut ext = Extents::default();
