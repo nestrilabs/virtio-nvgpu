@@ -121,16 +121,20 @@ const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version) {
 }
 
 /*
- * The entry for a call: by (class, type, nr) in the DRM tables, or for NVKMS
- * by the command inside the outer struct (`prefix`, its first bytes). Size
- * and direction are compared by the caller, so that a known ioctl with the
- * wrong size is -EINVAL rather than "not ours".
+ * The entry for a call: by (class, type, nr) in the DRM tables -- the one
+ * whose whole number is `cmd` if there is one, since a number can have two
+ * layouts told apart by the size in it (nvidia-drm's GRANT_PERMISSIONS
+ * before and after it grew a type) -- or for NVKMS by the command inside the
+ * outer struct (`prefix`, its first bytes). Size and direction are compared
+ * by the caller, so that a known ioctl with the wrong size is -EINVAL rather
+ * than "not ours". Mirrors Table::lookup (gen/src/schema/mod.rs).
  */
 static const struct nvgpu_sioctl *
 nvgpu_i2_lookup(const struct nvgpu_schema_set *set, u32 sclass,
                 unsigned int cmd, const void *prefix, size_t prefix_len,
                 const struct nvgpu_stable **tp) {
   const struct nvgpu_stable *t = set->drm;
+  const struct nvgpu_sioctl *found = NULL;
   u32 nvkms_cmd = 0, i;
 
   if (sclass == NVGPU_SCLASS_MODESET) {
@@ -144,13 +148,23 @@ nvgpu_i2_lookup(const struct nvgpu_schema_set *set, u32 sclass,
 
     if (e->sclass != sclass)
       continue;
-    if (sclass == NVGPU_SCLASS_MODESET ? e->nvkms_cmd == nvkms_cmd
-                                       : (e->cmd & 0xffff) == (cmd & 0xffff)) {
-      *tp = t;
-      return e;
+    if (sclass == NVGPU_SCLASS_MODESET) {
+      if (e->nvkms_cmd == nvkms_cmd) {
+        found = e;
+        break;
+      }
+    } else if ((e->cmd & 0xffff) == (cmd & 0xffff)) {
+      if (!found)
+        found = e;
+      if (e->cmd == cmd) {
+        found = e;
+        break;
+      }
     }
   }
-  return NULL;
+  if (found)
+    *tp = t;
+  return found;
 }
 
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
@@ -164,15 +178,29 @@ bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
 
 /* ───────── the kernel copies ───────── */
 
+/* A little-endian unsigned field of 1, 2, 4 or 8 bytes (NVKMS counts come
+ * as narrow as SET_SWAP_GROUP_CLIP_LIST's u16 nClips). */
 static int nvgpu_i2_rd(const struct nvgpu_i2_state *st, u32 b, u32 off,
                        u32 width, u64 *v) {
   const struct nvgpu_i2_kbuf *kb = &st->buf[b];
 
   if (width > kb->len || off > kb->len - width)
     return -EINVAL;
-  *v = width == 8 ? get_unaligned_le64(kb->k + off)
-                  : get_unaligned_le32(kb->k + off);
-  return 0;
+  switch (width) {
+  case 1:
+    *v = kb->k[off];
+    return 0;
+  case 2:
+    *v = get_unaligned_le16(kb->k + off);
+    return 0;
+  case 4:
+    *v = get_unaligned_le32(kb->k + off);
+    return 0;
+  case 8:
+    *v = get_unaligned_le64(kb->k + off);
+    return 0;
+  }
+  return -EINVAL;
 }
 
 static void nvgpu_i2_wr(struct nvgpu_i2_state *st, u32 b, u32 off, u32 width,
@@ -315,10 +343,17 @@ static int nvgpu_i2_walk(struct nvgpu_device *dev, struct nvgpu_i2_state *st,
     u64 v, len;
 
     if (f->flags & NVGPU_SFF_COND) {
+      bool holds;
+
       ret = nvgpu_i2_rd(st, b, base + f->cond_off, 4, &v);
       if (ret)
         return ret;
-      if (((u32)v & f->cond_mask) != f->cond_value)
+      /* NE: an NVKMS NvBool, which the kernel tests for non-zero, so a
+       * caller's 2 is as true as its 1 (Cond::holds). */
+      holds = ((u32)v & f->cond_mask) == f->cond_value;
+      if (f->flags & NVGPU_SFF_COND_NE)
+        holds = !holds;
+      if (!holds)
         continue;
     }
 
@@ -365,14 +400,31 @@ static int nvgpu_i2_walk(struct nvgpu_device *dev, struct nvgpu_i2_state *st,
       }
       break;
     }
-    case NVGPU_SF_ARRAY:
-      for (e = 0; e < f->count; e++) {
+    case NVGPU_SF_ARRAY: {
+      u32 n = f->count;
+
+      /* Only the elements the kernel reads (Limit::elements): a descriptor
+       * field in one it never looks at is whatever the caller left there,
+       * and translating it would fail a call the kernel accepts. */
+      if (f->len_kind == NVGPU_SLEN_COUNT) {
+        ret = nvgpu_i2_rd(st, b, base + f->len_a, f->len_width, &v);
+        if (ret)
+          return ret;
+        n = min_t(u64, v, f->count);
+      } else if (f->len_kind == NVGPU_SLEN_PLANES) {
+        ret = nvgpu_i2_rd(st, b, base + f->len_a, 4, &v);
+        if (ret)
+          return ret;
+        n = v < st->t->nplanes ? min_t(u32, st->t->planes[v], f->count) : 0;
+      }
+      for (e = 0; e < n; e++) {
         ret = nvgpu_i2_walk(dev, st, b, at + e * f->stride, f->child,
                             f->nchild, depth + 1);
         if (ret)
           return ret;
       }
       break;
+    }
     default:
       ret = nvgpu_i2_rd(st, b, at, f->width, &v);
       if (!ret)
@@ -848,6 +900,9 @@ static void nvgpu_i2_copy_extent(const struct nvgpu_sfield *f, u8 dir, u64 len,
     *start = min_t(u64, f->cb_off, len);
     *end = min_t(u64, (u64)f->cb_off + f->cb_arg, len);
     return;
+  case NVGPU_SCB_WRITTEN:
+    n = left;
+    break;
   }
   *end = min(n, len);
 }
@@ -868,7 +923,8 @@ static int nvgpu_i2_copy_back(struct nvgpu_i2_call *call) {
     if (kb->f) {
       if (kb->f->cb_kind == NVGPU_SCB_PARTIAL ||
           kb->f->cb_kind == NVGPU_SCB_ALL_OR_NOTHING ||
-          kb->f->cb_kind == NVGPU_SCB_EXACT)
+          kb->f->cb_kind == NVGPU_SCB_EXACT ||
+          kb->f->cb_kind == NVGPU_SCB_WRITTEN)
         if (nvgpu_i2_rd(st, kb->parent, kb->pbase + kb->f->cb_off,
                         kb->f->cb_width, &left))
           continue;

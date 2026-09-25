@@ -16,6 +16,7 @@ pub mod hostfd;
 mod i2_e2e;
 pub mod mmap;
 pub mod nvidia;
+pub mod nvkms;
 pub mod policy;
 pub mod privfd;
 pub mod pump;

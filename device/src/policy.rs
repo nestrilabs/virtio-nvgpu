@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::nvkms::NvkmsPolicy;
 use crate::schema::policy;
 use crate::xfer::{self, Errno, Hooks, Prepared, PropKind};
 
@@ -28,8 +29,13 @@ use crate::xfer::{self, Errno, Hooks, Prepared, PropKind};
 /// Shared between the queue thread (`before`, `after`, under the backend
 /// mutex) and executor threads (`prop_kind`, `atomic_fence_prop`, during
 /// `execute`, without it), so any state a section adds needs its own lock.
-#[derive(Debug, Default)]
-pub struct BackendHooks {}
+#[derive(Default)]
+pub struct BackendHooks {
+    /// NVKMS: grant records, fresh files, the host's layout (nvkms.rs).
+    /// Shared with the backend, which feeds it the host version and every
+    /// handle it closes.
+    nvkms: Arc<NvkmsPolicy>,
+}
 
 impl BackendHooks {
     pub fn new() -> Self {
@@ -39,6 +45,11 @@ impl BackendHooks {
     /// As the `Arc<dyn Hooks>` `xfer::Env::hooks` returns.
     pub fn shared() -> Arc<dyn Hooks> {
         Arc::new(Self::new())
+    }
+
+    /// With the NVKMS state the backend also holds.
+    pub fn with_nvkms(nvkms: Arc<NvkmsPolicy>) -> Arc<dyn Hooks> {
+        Arc::new(Self { nvkms })
     }
 
     // ───────────────────────────── KMS ─────────────────────────────
@@ -78,17 +89,17 @@ impl BackendHooks {
     // ──────────────────────────── NVKMS ────────────────────────────
     //
     // NVKMS commands (policy::NVKMS) and nvidia-drm's GRANT/REVOKE
-    // permissions (policy::GRANT, policy::REVOKE): MODESET grants only, and
-    // every NVKMS command with a table entry, as `xfer::default_before`
-    // decides. Grant records per handle, the commands refused outright and
-    // the fresh-fd check come with the NVKMS tables.
+    // permissions (policy::GRANT, policy::REVOKE), decided by nvkms.rs:
+    // commands refused by name or outside --kms-card, heads and dpys only
+    // as granted, overrides scrubbed, grant files fresh, MODESET grants only
+    // and revocations only through the granting handle.
 
     fn nvkms_before(&self, p: &mut Prepared) -> Result<(), Errno> {
-        xfer::default_before(p)
+        self.nvkms.before(p)
     }
 
     fn nvkms_after(&self, p: &mut Prepared, ret: i32) {
-        let _ = (p, ret);
+        self.nvkms.after(p, ret);
     }
 }
 

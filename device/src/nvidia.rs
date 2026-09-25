@@ -8,6 +8,7 @@ use crate::error::{DeviceError, Result};
 use crate::guarded::GuardedBuf;
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
+use crate::nvkms::{self, NvkmsPolicy};
 use crate::policy::BackendHooks;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
@@ -435,6 +436,9 @@ pub struct NvidiaBackend {
     pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
     /// The policy every IOCTL2 is checked against (see `policy.rs`).
     pub(crate) hooks: Arc<dyn Hooks>,
+    /// Its NVKMS section's state, which also gates v1 NVKMS calls and hears
+    /// of the host version, the mode and every handle closed (nvkms.rs).
+    pub(crate) nvkms: Arc<NvkmsPolicy>,
     /// The system calls IOCTL2 makes: the host's, except in tests that run
     /// whole calls against a fake kernel.
     pub(crate) xfer_sys: Arc<dyn Sys>,
@@ -514,12 +518,6 @@ pub enum AbiPolicy {
     /// that the tables lack -- never for running one.
     Permissive,
 }
-
-/// `NvKmsIoctlCommand::NVKMS_IOCTL_REGISTER_SURFACE`, the one that names the
-/// memory it registers by a file descriptor.
-const NVKMS_REGISTER_SURFACE: u32 = 16;
-/// Byte offset of `planes[0].u` inside `NvKmsRegisterSurfaceRequest`.
-const NVKMS_SURFACE_FD_OFFSET: usize = 16;
 
 /// The result of checking one guest ioctl against the host's ABI profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -822,6 +820,7 @@ fn enumerate_host_nodes() -> HostNodes {
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
+        let nvkms = Arc::new(NvkmsPolicy::new());
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
@@ -851,7 +850,8 @@ impl NvidiaBackend {
             nodes: None,
             signaled: None,
             kms_states: std::collections::HashMap::new(),
-            hooks: BackendHooks::shared(),
+            hooks: BackendHooks::with_nvkms(nvkms.clone()),
+            nvkms,
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
         }
@@ -1092,6 +1092,7 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.kms_states.clear();
+        self.nvkms.reset();
         self.handles.drain_all();
     }
 
@@ -1133,6 +1134,9 @@ impl NvidiaBackend {
     /// [`NvidiaBackend::finish_ioctl2`].
     pub fn serve(&mut self, req_buf: &[u8], cap: usize) -> Outcome {
         self.created.clear();
+        // The mode is configuration, which the transport may set at any
+        // point before the first message; the NVKMS policy reads its copy.
+        self.nvkms.set_kms_card(self.config.kms_card);
         if req_buf.len() < size_of::<MsgHeader>() {
             self.current_msg = MsgType::Ioctl;
             self.current_req_id = 0;
@@ -1281,6 +1285,23 @@ impl NvidiaBackend {
             }
         };
 
+        if kind == HandleKind::Dev(DeviceKind::Modeset) {
+            // Every one is a host NVKMS open with an event list NVKMS never
+            // bounds (nvkms.c:6422-6435) and permission state of its own.
+            let open = self
+                .handles
+                .handles()
+                .into_iter()
+                .filter(|&h| self.handles.kind(h) == Some(kind))
+                .count();
+            if open >= nvkms::MAX_MODESET_OPENS {
+                log::warn!(
+                    "OPEN of /dev/nvidia-modeset refused: {open} already open, the most one VM \
+                     may hold"
+                );
+                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
+            }
+        }
         let nodes = self.host_nodes();
         let path = match device_path_with(req.device_type, &nodes.dri) {
             Ok(p) => p,
@@ -1683,6 +1704,7 @@ impl NvidiaBackend {
         }
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.kms_states.remove(&handle);
+        self.nvkms.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);
@@ -1727,6 +1749,7 @@ impl NvidiaBackend {
 
     fn set_driver_version(&mut self, v: abi::version::DriverVersion) {
         self.driver = Some(v);
+        self.nvkms.set_version(v);
         self.config.nvkms_table = crate::schema::modeset_table(v).is_some();
         self.abi = abi::versions::table_for(v);
         match self.abi {
@@ -1847,32 +1870,39 @@ impl NvidiaBackend {
             V1Route::Nvkms => {
                 // NVKMS multiplexes every operation through one ioctl number,
                 // so the number says nothing and the command inside says
-                // everything. Logged because two of them came back EPERM in a
-                // guest while the same client on the host got zero for all of
-                // them, and an ioctl number alone cannot say which two.
-                let nvkms_cmd = (param_in.len() >= 4)
-                    .then(|| u32::from_le_bytes(param_in[0..4].try_into().unwrap()));
-                if let Some(c) = nvkms_cmd {
-                    log::debug!("NVKMS cmd={c} (0x{c:x})");
+                // everything. v1 carries one flat block and no descriptor, so
+                // only commands the host's NVKMS table has with no pointer and
+                // no descriptor go this way, under the same policy as IOCTL2
+                // (nvkms.rs, which may rewrite the block); everything else
+                // needs IOCTL2. A command number is never trusted across
+                // driver versions: REGISTER_SURFACE is 16 in one release and
+                // 17 in the next.
+                let mut msg = param_in.to_vec();
+                let ok = request == u64::from(crate::schema::NVKMS_IOCTL_IOWR)
+                    && ireq.data_len == 16
+                    && deep_in.is_none();
+                let checked = if ok {
+                    self.nvkms.v1_before(self.current_handle, &mut msg)
+                } else {
+                    Err(libc::EINVAL)
+                };
+                if let Err(errno) = checked {
+                    log::warn!(
+                        "v1 NVKMS call {:#x} on handle {} refused ({errno})",
+                        u32::from_le_bytes(
+                            msg.get(..4)
+                                .and_then(|c| c.try_into().ok())
+                                .unwrap_or([0; 4])
+                        ),
+                        self.current_handle
+                    );
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
-                // REGISTER_SURFACE carries one of our handles where NVKMS
-                // expects a descriptor, because a guest's descriptor number
-                // means nothing here. Told where it sits, the forwarder puts
-                // our own descriptor back. See the driver's side of this,
-                // which explains why it only shows up on some driver versions.
-                let nvkms_fd_offset =
-                    (nvkms_cmd == Some(NVKMS_REGISTER_SURFACE)).then_some(NVKMS_SURFACE_FD_OFFSET);
                 return self.dispatch_nested(
-                    cookie,
-                    host_fd,
-                    request,
-                    param_in,
-                    resp_buf,
-                    16, // outer_size
+                    cookie, host_fd, request, &msg, resp_buf, 16, // outer_size
                     8,  // ptr_offset
                     4,  // size_offset
-                    deep_in,
-                    nvkms_fd_offset,
+                    None, None,
                 );
             }
             V1Route::DrmNested {

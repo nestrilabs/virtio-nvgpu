@@ -274,6 +274,11 @@ static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
  */
 static __poll_t nvgpu_modeset_poll(struct file *filp,
                                    struct poll_table_struct *wait) {
+  struct nvgpu_fd *nfd = filp->private_data;
+
+  /* v2: readable until consumed, as NVKMS is (nvgpu_nvkms.c). */
+  if (nfd && nfd->dev->v2)
+    return nvgpu_nvkms_poll(nfd, filp, wait);
   return nvgpu_poll_mask(filp, wait, EPOLLIN | EPOLLPRI | EPOLLRDNORM);
 }
 
@@ -1596,9 +1601,13 @@ static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
   if (sz > 65536)
     return -EINVAL;
 
-  /* nvidia-modeset ioctls use type 0x6d ('m') */
-  if (ioc_type == 0x6d)
+  /* nvidia-modeset ioctls use type 0x6d ('m'); a v2 backend takes them
+   * through the schema (nvgpu_nvkms.c), a v1 one as a flat block. */
+  if (ioc_type == 0x6d) {
+    if (nfd->dev->v2)
+      return nvgpu_nvkms_ioctl(nfd, cmd, uarg);
     return nvgpu_ioctl_modeset(nfd, cmd, uarg, sz);
+  }
 
   /* Anything else (unlikely) falls back to the standard path */
   return nvgpu_ioctl(filp, cmd, arg);
