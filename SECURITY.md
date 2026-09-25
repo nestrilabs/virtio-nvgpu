@@ -600,6 +600,34 @@ does natively. That the primary client of every RM call is one of the
 calling file's own is RM's strict client validation, which the backend
 checks the host has at start (§11, R3).
 
+**The guest module's parsers in Rust** (branch `rustguest`). What the module
+reads of a guest process's bytes -- IOCTL2's schema walk, the v1 IOCTL
+marshalling with its nested blocks, deep pointers and segments and the
+descriptors in them, OS-descriptor registrations -- can be built in Rust
+(`NVGPU_RUST=1`, `driver/rust/README.md`) instead of C: a core with no
+`unsafe` and no panic path (the build checks the object for panic symbols),
+which copies every byte of the caller's once and decides on that copy, and
+one file of `unsafe` FFI around it. Nothing moves across the trust boundary:
+the backend still checks every request itself. The differential test
+(`driver/rust/difftest`, the C compiled as it is and run with UBSan and
+allocation canaries) and fuzzing found, in the C, now fixed or not carried
+over: (1) an OS-descriptor range within a page of 2^64 passed its page bound
+as zero pages (DIV_ROUND_UP wrapped) and was registered with one empty page
+run -- fixed in the C too; (2) an RM_CONTROL, RM_ALLOC or v1 NVKMS call with
+a size and a NULL pointer sent that many bytes of uninitialised guest kernel
+heap to the backend -- the Rust sends zeroes; (3) double fetches of the
+caller's memory, where the decision and the request came from different
+reads: RM_CONTROL's V1V2 count and pointer, TIME_CORRELATION's clock, the
+OS-descriptor class word, IDLE_CHANNELS' flags -- the Rust reads each once.
+Read in the C but unchanged (both implementations behave the same):
+IOCTL2's `nvgpu_i2_wr()` bounds-checks `width` bytes but writes 4 for a
+width of 1 or 2 (no generated field has one); a reply naming a host GEM
+handle again after a failing `gem_out` hook closes the handle an earlier
+proxy of the same reply now owns; a V1V2 list count is multiplied by 8 in
+u32 and can wrap small; and a v1 NVKMS call reads and writes 16 bytes
+whatever its ioctl's size. The ATOMIC special's parsing (`nvgpu_kms.c`) is
+still C.
+
 Which host surfaces each display mode turns on:
 
 | mode | flag | host surfaces it adds |
