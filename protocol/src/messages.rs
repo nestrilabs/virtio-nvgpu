@@ -190,7 +190,7 @@ pub const MAX_GPU_INDEX: u32 = 254;
 /// The wire encoding is one flat `u32`, not a kind and an index: a GPU is its
 /// own minor number, and the singleton devices take values above every possible
 /// minor. Decoding is therefore a range check, not a table lookup.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeviceKind {
     /// `/dev/nvidiaN`, where N is the guest's minor number.
     Gpu(u32),
@@ -450,7 +450,11 @@ pub struct Ioctl2Req {
     pub ngem: u32,
     pub ndyn: u32,
     pub data_len: u32,
-    pub reserved: u32,
+    /// Render handle of the calling guest file: GEM handles the call creates
+    /// are re-homed into it (host KMS files never own guest objects), and a
+    /// GEM_IN owned by it needs no re-homing. Equal to the header's handle for
+    /// a call made on a render handle.
+    pub render: u32,
 }
 
 #[repr(C)]

@@ -173,6 +173,16 @@ struct nvgpu_device {
 #define NVGPU_MAX_PCI_SLOTS 8
   struct nvgpu_pci_root pci_roots[NVGPU_MAX_PCI_SLOTS];
   int num_pci_roots;
+
+  /* ── protocol v2 (nvgpu_xfer.c owns these) ── */
+  bool v2;            /* HELLO succeeded; every v2 feature is gated on this */
+  u32 backend_caps;   /* NVGPU_BCAP_* */
+  u32 max_req;        /* bytes, from HELLO, clamped by what the ring allows */
+  u32 max_resp;
+  u32 num_cards;
+  struct nvgpu_xfer *xfer;     /* transport state: contexts, ring lock, clock */
+  struct nvgpu_events *events; /* v2 event consumers: handle/cookie registry  */
+  const struct nvgpu_schema_set *schema; /* selected at probe for driver_version */
 };
 
 /*
@@ -312,5 +322,173 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 
 int nvgpu_dri_init(struct nvgpu_device *dev);
 void nvgpu_dri_cleanup(struct nvgpu_device *dev);
+
+/* ═════════════════════════ Protocol v2 internal API ═════════════════════════
+ *
+ * Ownership: nvgpu_xfer.c (transport, HELLO, TIME_SYNC, HOST_OP, WATCH, event
+ * dispatch), nvgpu_i2.c (the schema-driven IOCTL2 interpreter),
+ * nvgpu_hostfile.c (backend handles as guest files), nvgpu_kms.c,
+ * nvgpu_fence.c, nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are nvgpu_wire.h.
+ */
+
+struct nvgpu_xfer;
+struct nvgpu_events;
+struct nvgpu_schema_set;
+
+/* ── Transport buffers ──
+ *
+ * Built from page chunks (at most 64 KiB each), never vmalloc, so a request of
+ * any allowed size can be described to the ring in a bounded number of
+ * scatter-gather entries whether or not indirect descriptors were negotiated.
+ */
+struct nvgpu_tbuf;
+struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);
+void nvgpu_tbuf_free(struct nvgpu_tbuf *tb);
+size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb);
+int nvgpu_tbuf_write(struct nvgpu_tbuf *tb, size_t off, const void *src,
+                     size_t len);
+int nvgpu_tbuf_write_user(struct nvgpu_tbuf *tb, size_t off,
+                          const void __user *src, size_t len);
+int nvgpu_tbuf_read(const struct nvgpu_tbuf *tb, size_t off, void *dst,
+                    size_t len);
+int nvgpu_tbuf_read_user(const struct nvgpu_tbuf *tb, size_t off,
+                         void __user *dst, size_t len);
+int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len);
+
+/* nvgpu_xfer() flags */
+#define NVGPU_XF_EXECUTOR (1u << 0) /* runs on a host executor: long timeout */
+
+/*
+ * Send one request and wait for its response. `req` starts with an
+ * nvgpu_msg_hdr (req_id is filled in here). `resp` is zeroed before sending;
+ * `*used_len` is what the device actually wrote. Returns 0, or -errno for a
+ * transport failure (the response header's status is the caller's to read).
+ *
+ * If the wait is abandoned (timeout, fatal signal) the buffers stay owned by
+ * the transport until the device returns them, and any backend handles the
+ * late response created are closed (IOCTL2 fd/gem outs, HOST_OP results).
+ * Callers must therefore not free `req`/`resp` themselves after -ETIMEDOUT or
+ * -EINTR: ownership passes to the transport on those returns.
+ */
+int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
+               struct nvgpu_tbuf *resp, u32 flags, u32 *used_len);
+
+/* nvgpu_send_recv() (declared above) becomes a helper over nvgpu_xfer for
+ * small kmalloc'd messages, keeping its signature for existing callers. */
+
+/* ── HOST_OP / WATCH / CLOSE ── */
+int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
+                  u32 nargs, u64 *res, u32 nres);
+int nvgpu_watch(struct nvgpu_device *dev, u32 handle, u32 flags, u64 cookie);
+int nvgpu_unwatch(struct nvgpu_device *dev, u32 handle);
+int nvgpu_close_handle(struct nvgpu_device *dev, u32 handle);
+/* From any context: queued on a workqueue that holds a module reference. */
+void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
+void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
+                           u32 gem);
+
+/* ── Clock ── */
+s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns);
+s64 nvgpu_guest_to_host_ns(struct nvgpu_device *dev, s64 guest_ns);
+
+/* ── Event consumers ──
+ *
+ * EVENT_DATA records are dispatched from the event virtqueue callback, i.e.
+ * hard IRQ context. A consumer's callback must not sleep; anything that does
+ * (uevents, CLOSE, UNWATCH) goes to a work item. Registration and
+ * unregistration are safe from process context; once nvgpu_ev_unregister()
+ * returns the callback is not running and will not run again.
+ */
+struct nvgpu_ev_consumer {
+  /* rec->kind, rec->cookie, payload of rec->len bytes */
+  void (*deliver)(struct nvgpu_ev_consumer *c, u32 kind, u64 cookie,
+                  const void *payload, u32 len);
+  /* private to the registry */
+  u64 key;
+  struct hlist_node node;
+};
+/* EV_DRM and legacy EV_READY: keyed by backend handle. EV_FENCE / one-shot
+ * EV_READY: keyed by WATCH cookie. EV_HOTPLUG: keyed by card index. */
+#define NVGPU_EVKEY_HANDLE(h) ((u64)(h))
+#define NVGPU_EVKEY_COOKIE(c) ((u64)(c) | (1ull << 63))
+#define NVGPU_EVKEY_CARD(i) ((u64)(i) | (1ull << 62))
+int nvgpu_ev_register(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c,
+                      u64 key);
+void nvgpu_ev_unregister(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c);
+u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev);
+
+/* ── IOCTL2 interpreter (nvgpu_i2.c) ── */
+
+/* Schema classes: which kind of host file the call targets. */
+#define NVGPU_SCLASS_RENDER 1
+#define NVGPU_SCLASS_KMS 2
+#define NVGPU_SCLASS_MODESET 3
+
+struct nvgpu_i2_call;
+
+/*
+ * Hooks the calling subsystem supplies. Each may be NULL if the schema entry
+ * cannot have that kind of field (the interpreter fails the call with -EINVAL
+ * if one is needed and missing).
+ */
+struct nvgpu_i2_ops {
+  /* A descriptor field. `user_value` is what the caller wrote there.
+   * Return 0 and set *handle (and *flags, e.g. NVGPU_I2_FD_CONSUME) to send
+   * it, 1 for "no descriptor" (the field is sent as -1), or -errno. */
+  int (*fd_in)(struct nvgpu_i2_call *call, u32 buf, u32 off, s64 user_value,
+               u32 kinds, u32 *handle, u32 *flags);
+  /* A GEM handle field: guest handle → the proxy's (owner, host gem). */
+  int (*gem_in)(struct nvgpu_i2_call *call, u32 buf, u32 off,
+                u32 guest_handle, u32 *owner, u32 *gem);
+  /* The host produced a descriptor, now backend handle `handle` of `kind`.
+   * Materialise it and return the value to write in the caller's field. On
+   * error the interpreter closes the handle. */
+  int (*fd_out)(struct nvgpu_i2_call *call, u32 buf, u32 off, u32 handle,
+                u32 kind, s64 *user_value);
+  /* The host produced a GEM handle, valid in call->render. Make a proxy. */
+  int (*gem_out)(struct nvgpu_i2_call *call, u32 buf, u32 off, u32 gem,
+                 u64 size, u32 *guest_handle);
+  /* Schema specials (e.g. "atomic"): called after gathering (phase 0, may add
+   * dyn records / fd records) and after the reply (phase 1). */
+  int (*special)(struct nvgpu_i2_call *call, u32 special_id, int phase);
+};
+
+struct nvgpu_i2_call {
+  struct nvgpu_device *dev;
+  u32 handle; /* target backend handle */
+  u32 render; /* render handle of the calling guest file */
+  u32 sclass; /* NVGPU_SCLASS_* */
+  unsigned int cmd;
+  void __user *uarg;
+  u32 xflags; /* NVGPU_XF_* */
+  const struct nvgpu_i2_ops *ops;
+  void *priv;
+  /* filled in: */
+  s32 ret;                 /* host ioctl result */
+  struct nvgpu_i2_state *st; /* interpreter-private, valid during hooks */
+};
+
+/* Is there a schema for this call? (Used to decide whether to intercept.) */
+bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
+                         unsigned int cmd, const void *arg_prefix,
+                         size_t prefix_len);
+/*
+ * Run an ioctl through IOCTL2: find the schema, gather the caller's buffers,
+ * translate fd/GEM fields through the hooks, send, copy every OUT buffer back
+ * per the schema's copy-back rule (also when the host call failed), and
+ * materialise fd/GEM outputs. Returns the host ioctl's result (0 or -errno) or
+ * a transport/validation -errno.
+ */
+long nvgpu_i2_ioctl(struct nvgpu_i2_call *call);
+/* For specials: add a dyn record / an fd record while gathering (phase 0). */
+int nvgpu_i2_add_dyn(struct nvgpu_i2_call *call, u32 kind, u32 buf, u32 off,
+                     u32 len);
+int nvgpu_i2_add_fd(struct nvgpu_i2_call *call, u32 buf, u32 off, u32 handle,
+                    u32 flags);
+/* For specials: the kernel copy of buffer `buf` (NULL if none). */
+void *nvgpu_i2_buf(struct nvgpu_i2_call *call, u32 buf, u32 *len);
+
+/* Selects the schema set for the host driver version (NULL: none). */
+const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version);
 
 #endif /* NVGPU_H */

@@ -266,7 +266,11 @@ struct nvgpu_i2_req {
   __le32 ngem;
   __le32 ndyn;
   __le32 data_len;
-  __le32 reserved;
+  /* Render handle of the calling guest file. GEM handles the call creates are
+   * re-homed into it (host KMS files never own guest objects), and a GEM_IN
+   * whose owner is this file needs no re-homing. Equal to hdr.handle for a
+   * call made on a render handle. */
+  __le32 render;
   /* followed by: __le32 buf_len[nbuf];
    *              struct nvgpu_i2_fd_in  fd[nfd];
    *              struct nvgpu_i2_gem_in gem[ngem];
