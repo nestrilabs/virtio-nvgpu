@@ -37,7 +37,8 @@
 //!   are cleared outside `--kms-card`: they apply when the call creates the
 //!   device (nvkms-evo.c:9043, nvkms.c:1417). DECLARE_EVENT_INTEREST is cut
 //!   to the events a display client needs: NVKMS's per-open event list has no
-//!   bound (nvkms.c:6422-6435).
+//!   bound (nvkms.c:6422-6435). ALLOC_DEVICE's reply is narrowed to coherent
+//!   display memory where the device allows it (`coherent_display_only`).
 //! - **Fresh files.** The first ioctl on an NVKMS file makes it an "ioctl"
 //!   file forever, and such a file can never become a grant or unicast-event
 //!   file (nvkms.c:1291-1342, 5171). A modeset handle becomes *typed* here
@@ -171,7 +172,36 @@ struct State {
 #[derive(Default)]
 pub struct NvkmsPolicy {
     kms_card: AtomicBool,
+    /// The backend leaves guest system memory as asked (rmmem.rs), so the
+    /// ALLOC_DEVICE reply is left alone too.
+    keep_display_coherency: AtomicBool,
     state: Mutex<State>,
+}
+
+/// Narrow ALLOC_DEVICE's reply to coherent display memory, where the device
+/// supports both kinds (H-4).
+///
+/// The reply's {iso,niso}IOCoherencyModes are how a client picks the memory
+/// model for what display reads from system memory: NVKMS's own allocator
+/// tries non-coherent first -- write-combined memory and a context DMA that
+/// does not snoop -- and coherent only if that is unavailable
+/// (nvkms-rm.c:2585-2633), and the userspace driver reads the same fields.
+/// Non-coherent memory is what a guest cannot keep coherent on an Intel host,
+/// where KVM maps guest RAM write-back whatever the guest's PAT says. On a
+/// dGPU both kinds come from one bus capability (nvkms-rm.c:226-253), so
+/// when `coherent` is set the non-coherent model is merely a preference and
+/// clearing it costs nothing but a snoop. When `coherent` is clear it is left
+/// alone: a device that cannot snoop keeps the only model it has.
+fn coherent_display_only(lo: &NvkmsLayout, params: &mut [u8]) {
+    let at = lo.alloc_reply_coherency as usize;
+    for modes in [at, at + 2] {
+        // NvKmsDispIOCoherencyModes: NvBool coherent, then noncoherent.
+        if params.get(modes) == Some(&1) {
+            if let Some(nc) = params.get_mut(modes + 1) {
+                *nc = 0;
+            }
+        }
+    }
 }
 
 fn rd(b: &[u8], off: usize, width: usize) -> Result<u64, Errno> {
@@ -270,6 +300,12 @@ impl NvkmsPolicy {
     /// Compositor-VM mode: the guest owns the display.
     pub fn set_kms_card(&self, on: bool) {
         self.kms_card.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether ALLOC_DEVICE's reply is narrowed to coherent display memory
+    /// (the default; see `coherent_display_only`).
+    pub fn set_coherent_display(&self, on: bool) {
+        self.keep_display_coherency.store(!on, Ordering::Relaxed);
     }
 
     /// A handle closed: everything that was its, or granted through it,
@@ -372,8 +408,9 @@ impl NvkmsPolicy {
         st.check(lo, name, &call, params)
     }
 
-    /// `Hooks::after`: what the host granted, allocated or revoked.
-    pub fn after(&self, p: &Prepared, ret: i32) {
+    /// `Hooks::after`: what the host granted, allocated or revoked, and the
+    /// one reply rewritten (ALLOC_DEVICE's coherency modes).
+    pub fn after(&self, p: &mut Prepared, ret: i32) {
         if ret != 0 {
             return;
         }
@@ -387,8 +424,36 @@ impl NvkmsPolicy {
         let Ok((lo, _)) = Self::layout(&st) else {
             return;
         };
+        if name == "ALLOC_DEVICE" && !self.keep_display_coherency.load(Ordering::Relaxed) {
+            if let Some(params) = p.buffer_mut(1) {
+                coherent_display_only(lo, params);
+            }
+        }
+        let target = p.target();
         if let Some(params) = p.buffer(1) {
-            st.record(lo, name, p.target(), params, &fds);
+            st.record(lo, name, target, params, &fds);
+        }
+    }
+
+    /// The reply to a v1 call `v1_before` let through: the 16-byte
+    /// NvKmsIoctlParams and the params block, as `msg` was. Only
+    /// ALLOC_DEVICE's reply is rewritten (see `after`); v1 records nothing.
+    pub fn v1_after(&self, msg: &mut [u8]) {
+        if self.keep_display_coherency.load(Ordering::Relaxed) {
+            return;
+        }
+        let st = self.lock();
+        let (Ok((lo, _)), Some(table)) = (
+            Self::layout(&st),
+            st.version.and_then(schema::modeset_table),
+        ) else {
+            return;
+        };
+        let Ok(cmd) = rd32(msg, 0) else { return };
+        if table.lookup_nvkms(cmd).map(|e| e.name) == Some("NVKMS_ALLOC_DEVICE") {
+            if let Some(params) = msg.get_mut(16..) {
+                coherent_display_only(lo, params);
+            }
         }
     }
 
@@ -962,6 +1027,81 @@ mod tests {
             .unwrap();
         acquire(&p, v, M, G, DPY).unwrap();
         p
+    }
+
+    const PROFILED: [(u32, u32, u32); 6] = [
+        (535, 129, 3),
+        (580, 178, 4),
+        (595, 71, 5),
+        (595, 99, 2),
+        (610, 57, 4),
+        (615, 71, 9),
+    ];
+
+    #[test]
+    fn alloc_device_offers_only_coherent_display_memory_where_the_device_can_snoop() {
+        for (a, b, c) in PROFILED {
+            let v = DriverVersion::new(a, b, c);
+            let l = lo(v);
+            let at = l.alloc_reply_coherency as usize;
+            let mut both = vec![0u8; size(v, "NVKMS_ALLOC_DEVICE")];
+            // iso {coherent, noncoherent}, niso {coherent, noncoherent},
+            // then displayIsGpuL2Coherent, which is not ours to touch.
+            both[at..at + 5].copy_from_slice(&[1, 1, 1, 1, 1]);
+            coherent_display_only(l, &mut both);
+            assert_eq!(&both[at..at + 5], &[1, 0, 1, 0, 1], "{v:?}");
+
+            // A device that cannot snoop keeps the only model it has.
+            let mut only = vec![0u8; both.len()];
+            only[at..at + 4].copy_from_slice(&[0, 1, 0, 1]);
+            let before = only.clone();
+            coherent_display_only(l, &mut only);
+            assert_eq!(only, before, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn the_coherency_modes_on_610_are_five_bytes_before_supports_syncpts() {
+        // The layout derives the offset from supportsSyncpts; this pins what
+        // that means against the offsets the probe measured for 610, where
+        // supportsSyncpts is at 1419 and the reply starts at 624.
+        assert_eq!(lo(v610()).alloc_reply_coherency, 1419 - 5);
+    }
+
+    #[test]
+    fn a_v1_alloc_device_reply_is_narrowed_unless_guest_coherency_is_kept() {
+        let v = v610();
+        let l = lo(v);
+        let cmd = schema::modeset_table(v)
+            .unwrap()
+            .ioctls
+            .iter()
+            .find(|e| e.name == "NVKMS_ALLOC_DEVICE")
+            .unwrap()
+            .nvkms_cmd;
+        let at = 16 + l.alloc_reply_coherency as usize;
+        let reply = || {
+            let mut m = vec![0u8; 16 + size(v, "NVKMS_ALLOC_DEVICE")];
+            put(&mut m, 0, cmd);
+            m[at..at + 4].copy_from_slice(&[1, 1, 1, 1]);
+            m
+        };
+        let p = policy(v);
+        let mut m = reply();
+        p.v1_after(&mut m);
+        assert_eq!(&m[at..at + 4], &[1, 0, 1, 0]);
+
+        p.set_coherent_display(false);
+        let mut m = reply();
+        p.v1_after(&mut m);
+        assert_eq!(&m[at..at + 4], &[1, 1, 1, 1]);
+
+        // Any other command's reply is left alone.
+        p.set_coherent_display(true);
+        let mut m = reply();
+        put(&mut m, 0, cmd + 1);
+        p.v1_after(&mut m);
+        assert_eq!(&m[at..at + 4], &[1, 1, 1, 1]);
     }
 
     #[test]

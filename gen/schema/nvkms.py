@@ -341,6 +341,12 @@ def layout(d):
                               and n['path'] != 'request.versionString'),
         'alloc_reply_device': find('ALLOC_DEVICE', af, 'reply.deviceHandle')['off'],
         'alloc_reply_disps': find('ALLOC_DEVICE', af, 'reply.dispHandles')['off'],
+        # isoIOCoherencyModes then nisoIOCoherencyModes ({NvBool coherent;
+        # NvBool noncoherent;} each), then displayIsGpuL2Coherent, then
+        # supportsSyncpts: five bytes of NvBool before supportsSyncpts in
+        # every release profiled, 535 through 615 (nvkms-api.h, e.g. 610
+        # :1232-1246), so no padding can fall between them.
+        'alloc_reply_coherency': find('ALLOC_DEVICE', af, 'reply.supportsSyncpts')['off'] - 5,
         # Every override flag and the EDID: nvDpyGetDynamicData stores them
         # in the dpy, which outlives the call (nvkms-dpy.c:3055-3160).
         'dpy_dynamic_scrub': ranges(dyn, lambda n: n['role'] == 'policy'),

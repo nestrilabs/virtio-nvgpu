@@ -101,6 +101,16 @@ struct Args {
     #[arg(long)]
     permissive_abi: bool,
 
+    /// Allocate guest system memory with the coherency the guest asks for,
+    /// instead of GPU-coherent (write-back, snooped).
+    ///
+    /// For ruling the rewrite out when chasing a problem. On an Intel host
+    /// KVM maps guest RAM write-back whatever the guest asks, unless the VMM
+    /// disables KVM_X86_QUIRK_IGNORE_GUEST_PAT, so with this set a guest there
+    /// caches memory the GPU does not snoop.
+    #[arg(long)]
+    keep_guest_coherency: bool,
+
     /// Compositor-VM mode: offer the host's card nodes to the guest, so a
     /// guest compositor can drive the display.
     ///
@@ -1045,6 +1055,15 @@ fn main() -> anyhow::Result<()> {
         config,
         wayland,
     )?));
+    if args.keep_guest_coherency {
+        let shared = backend.read().expect("backend lock").shared.clone();
+        shared
+            .nvidia
+            .lock()
+            .expect("nvidia lock")
+            .set_guest_coherency(false);
+    }
+    device::rmmem::warn_if_guest_pat_ignored(!args.keep_guest_coherency);
     // Host connector and lease changes of the host's cards, which arrive only
     // as uevents (device::kms). The guest hears of them only in
     // compositor-VM mode: it drives card nodes (BCAP_KMS_CARD) only then,

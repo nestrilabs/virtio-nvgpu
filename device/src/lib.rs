@@ -23,6 +23,7 @@ pub mod policy;
 pub mod privfd;
 pub mod pump;
 pub mod replay;
+pub mod rmmem;
 pub mod schema;
 pub mod session;
 pub mod shm;

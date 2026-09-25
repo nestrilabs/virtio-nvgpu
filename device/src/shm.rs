@@ -619,3 +619,86 @@ pub trait WindowPlacer: Send {
     /// access reach no mapping at all in a range the memory slot still covers.
     fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
 }
+
+/// Whether the host lets `len` bytes of `fd` at `fd_offset` be mapped
+/// writable, found by asking the kernel rather than by knowing which objects
+/// are read-only.
+///
+/// nvidia.ko decides at mmap time: without NV_PROTECT_WRITEABLE in the mapping
+/// context it clears VM_WRITE and VM_MAYWRITE (nv-mmap.c:756-761) -- the
+/// user-shared-data page (gpu_user_shared_data.c:417-418) and, for a
+/// non-admin, the PTIMER and MC windows of BAR0 (osapi.c:2203-2226); nvidia-drm
+/// does the same for a read-only GEM node (nvidia-drm-gem.c:292-299). The mmap
+/// still succeeds, so a placement made writable produces a read-only VMA in the
+/// VMM, and the first guest write reaches KVM as a write fault it cannot
+/// resolve: KVM_RUN fails with EFAULT and the VM stops (kvm_main.c:2928-3024,
+/// mmu.c:3547-3567). So: map it read-only here and ask for write; mprotect
+/// answers EACCES exactly when VM_MAYWRITE is gone (mm/mprotect.c).
+///
+/// The probe mapping is the same kind of mapping the placement makes, of the
+/// same length at the same offset, and it is gone before this returns: the
+/// mapping context stays on the file (nv-mmap.c:540-552 only reads it) and
+/// the page references it takes are dropped at munmap. Anything the probe
+/// cannot tell -- the mmap itself failing -- answers "writable", which is what
+/// every placement assumed before, and the placement then fails on its own.
+pub fn host_mapping_writable(fd: RawFd, len: u64, fd_offset: u64) -> bool {
+    let len = align_up(len.max(1), PAGE_SIZE) as usize;
+    // SAFETY: a fresh mapping at an address the kernel chooses; nothing reads
+    // or writes through it, and it is unmapped below.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            fd_offset as libc::off_t,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return true;
+    }
+    // SAFETY: `p` is the mapping made above, `len` bytes long.
+    let rc = unsafe { libc::mprotect(p, len, libc::PROT_READ | libc::PROT_WRITE) };
+    let err = std::io::Error::last_os_error().raw_os_error();
+    // SAFETY: as above; nothing else refers to it.
+    unsafe { libc::munmap(p, len) };
+    !(rc != 0 && err == Some(libc::EACCES))
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn memfd(len: u64) -> OwnedFd {
+        let name = CString::new("probe").unwrap();
+        // SAFETY: plain syscalls; ownership of the new fd passes to OwnedFd.
+        unsafe {
+            let fd = libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+            OwnedFd::from_raw_fd(fd)
+        }
+    }
+
+    #[test]
+    fn a_file_opened_read_only_is_probed_read_only_and_a_writable_one_writable() {
+        let rw = memfd(8192);
+        assert!(host_mapping_writable(rw.as_raw_fd(), 5000, 0));
+        let path = CString::new(format!("/proc/self/fd/{}", rw.as_raw_fd())).unwrap();
+        // SAFETY: reopening our own memfd read-only.
+        let ro = unsafe {
+            OwnedFd::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC))
+        };
+        assert!(!host_mapping_writable(ro.as_raw_fd(), 4096, 4096));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_mapped_at_all_is_left_to_the_placement() {
+        let null = CString::new("/dev/null").unwrap();
+        // SAFETY: opening /dev/null.
+        let fd = unsafe { OwnedFd::from_raw_fd(libc::open(null.as_ptr(), libc::O_RDONLY)) };
+        assert!(host_mapping_writable(fd.as_raw_fd(), 4096, 0));
+    }
+}

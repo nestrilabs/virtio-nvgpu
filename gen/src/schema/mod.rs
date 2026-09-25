@@ -477,6 +477,10 @@ pub struct NvkmsLayout {
     pub alloc_reply_device: u32,
     /// `NvKmsDispHandle dispHandles[]`, indexed by disp.
     pub alloc_reply_disps: u32,
+    /// `isoIOCoherencyModes` then `nisoIOCoherencyModes`, each
+    /// `{NvBool coherent; NvBool noncoherent;}`: what display lets a client
+    /// allocate display memory as.
+    pub alloc_reply_coherency: u32,
     /// QUERY_DPY_DYNAMIC_DATA's override flags and EDID: (off, len).
     pub dpy_dynamic_scrub: &'static [(u32, u32)],
     pub set_cursor_image: NvkmsTarget,

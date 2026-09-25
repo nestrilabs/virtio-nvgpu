@@ -32,7 +32,22 @@ pub struct MmapEntry {
     /// exits.
     pub map_fd_handle: u32,
     /// What to hand back to the SHM allocator when this mapping goes away.
+    /// Its `pgprot` is the memory type the guest is told to map it with.
     pub region: ShmRegion,
+    /// Whether the host lets it be written (see `shm::host_mapping_writable`).
+    pub writable: bool,
+    /// The id the first MMAP of it handed out, or 0 before then.
+    ///
+    /// The placement is made at RM_MAP_MEMORY and used to be released at
+    /// RM_UNMAP_MEMORY, whatever the guest still had mapped: RM does not know
+    /// about guest page tables, and an unmap does not reach the process that
+    /// mapped (nv-mmap.c:443 keeps a native process's pages until its vma
+    /// closes). The extent then went to the next mapping -- another process's
+    /// -- while the first still had the range in its page tables. An id makes
+    /// guest vmas count, so the extent outlives them.
+    pub mapping_id: u32,
+    /// MMAP replies that handed `mapping_id` out and have not been taken back.
+    pub refs: u32,
 }
 
 /// Live mappings, indexed by SHM offset.
@@ -83,6 +98,28 @@ impl MmapContext {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The mapping made on a given descriptor, to update.
+    pub fn find_by_fd_handle_mut(&mut self, fd_handle: u32) -> Option<&mut MmapEntry> {
+        self.entries
+            .values_mut()
+            .find(|e| e.map_fd_handle == fd_handle)
+    }
+
+    /// The mapping an MMAP reply named `mapping_id`.
+    pub fn find_by_mapping_id_mut(&mut self, mapping_id: u32) -> Option<&mut MmapEntry> {
+        if mapping_id == 0 {
+            return None;
+        }
+        self.entries
+            .values_mut()
+            .find(|e| e.mapping_id == mapping_id)
+    }
+
+    /// Whether an entry already answers to `mapping_id`.
+    pub fn has_mapping_id(&self, mapping_id: u32) -> bool {
+        mapping_id != 0 && self.entries.values().any(|e| e.mapping_id == mapping_id)
     }
 
     /// Take every mapping carried by one guest handle.

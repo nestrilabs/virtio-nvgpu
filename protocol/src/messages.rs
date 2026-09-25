@@ -326,8 +326,32 @@ pub struct MmapResp {
     pub size: u64,
     /// Identifier the guest passes back to `Munmap`.
     pub mapping_id: u32,
-    pub padding: u32,
+    /// How the guest must map it (`MMAP_CACHE_*`). Was padding before
+    /// protocol v2, and a v2 backend still leaves it zero for a v1 session,
+    /// so zero keeps meaning what it always did: the guest's own choice,
+    /// write-combining. The host picks a memory type per mapping (nv-mmap.c
+    /// forces UC on registers, uses the allocation's own type for system
+    /// memory), and a guest mapping of a different type is either slow (WC
+    /// reads of cached memory) or wrong (a WC doorbell).
+    pub caching: u8,
+    /// `MMAP_F_*`.
+    pub flags: u8,
+    pub reserved: u16,
 }
+
+/// `MmapResp::caching`: 0 is a v1 backend's answer (write-combining).
+pub const MMAP_CACHE_DEFAULT: u8 = 0;
+pub const MMAP_CACHE_WB: u8 = 1;
+pub const MMAP_CACHE_WC: u8 = 2;
+pub const MMAP_CACHE_UC: u8 = 3;
+
+/// `MmapResp::flags`: the host mapping is read-only. nvidia.ko clears
+/// VM_WRITE and VM_MAYWRITE when the mapping context lacks WRITEABLE
+/// (nv-mmap.c:756-761), so the placement is read-only too, and a guest write
+/// through it would reach KVM as an unresolvable write fault that stops the
+/// whole VM. The guest clears VM_WRITE and VM_MAYWRITE on its side instead,
+/// so the write faults in the guest process, as it would on the host.
+pub const MMAP_F_READ_ONLY: u8 = 1 << 0;
 
 /// Request payload for `MsgType::Munmap`, following a `MsgHeader`.
 #[repr(C)]
@@ -369,6 +393,8 @@ const _: () = {
     assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapResp>() == 24);
+    assert!(core::mem::offset_of!(MmapResp, caching) == 20);
+    assert!(core::mem::offset_of!(MmapResp, flags) == 21);
     assert!(size_of::<MunmapReq>() == 8);
     assert!(size_of::<FileEntry>() == 8);
 };
