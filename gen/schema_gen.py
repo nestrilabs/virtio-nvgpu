@@ -821,6 +821,9 @@ def rs_layout(lo):
         f'alloc_reply_disps: {lo["alloc_reply_disps"]}',
         f'alloc_reply_coherency: {lo["alloc_reply_coherency"]}',
         f'dpy_dynamic_scrub: {rs_ranges(lo["dpy_dynamic_scrub"])}',
+        f'dpy_dynamic: {rs_target(lo["dpy_dynamic"])}',
+        f'dpy_dynamic_reply: ({lo["dpy_dynamic_reply"][0]}, {lo["dpy_dynamic_reply"][1]})',
+        f'alloc_device_id: {lo["alloc_device_id"]}',
         f'set_cursor_image: {rs_target(lo["set_cursor_image"])}',
         f'move_cursor: {rs_target(lo["move_cursor"])}',
         f'set_lut: {rs_target(lo["set_lut"])}',
@@ -845,6 +848,8 @@ def rs_layout(lo):
         f'event_interest: {lo["event_interest"]}',
         f'events_allowed: 0x{lo["events_allowed"]:x}',
         f'next_event_valid: {lo["next_event_valid"]}',
+        f'next_event_type: {lo["next_event_type"]}',
+        f'dpy_events: 0x{lo["dpy_events"]:x}',
         f'drm_grant_typed: {"true" if lo["drm_grant_typed"] else "false"}',
     ]
     return 'NvkmsLayout {\n    ' + ',\n    '.join(parts) + ',\n}'

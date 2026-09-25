@@ -114,6 +114,9 @@ struct nvgpu_tbuf {
   size_t len;
   unsigned int nents;
   bool inline_data; /* the data follows sg[0] in this allocation */
+  /* nvgpu_tbuf_on_free(): run when the buffer is freed, whoever frees it. */
+  void (*release)(void *arg);
+  void *release_arg;
   struct scatterlist sg[];
 };
 
@@ -211,6 +214,7 @@ static struct nvgpu_tbuf *nvgpu_tbuf_alloc_sg(size_t len, gfp_t gfp,
     tb->len = len;
     tb->nents = 1;
     tb->inline_data = true;
+    tb->release = NULL;
     sg_init_one(&tb->sg[0], &tb->sg[1], len);
     return tb;
   }
@@ -289,6 +293,8 @@ void nvgpu_tbuf_free(struct nvgpu_tbuf *tb) {
 
   if (!tb)
     return;
+  if (tb->release)
+    tb->release(tb->release_arg);
   if (!tb->inline_data)
     for (i = 0; i < tb->nents; i++)
       __free_pages(sg_page(&tb->sg[i]), get_order(tb->sg[i].length));
@@ -296,6 +302,21 @@ void nvgpu_tbuf_free(struct nvgpu_tbuf *tb) {
 }
 
 size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb) { return tb->len; }
+
+/*
+ * What a request's numbers stand for, kept until the request is done with:
+ * a request buffer is freed by its caller once the reply is in, or by the
+ * transport once a request its caller gave up on (-ETIMEDOUT, -EINTR) has
+ * been answered late or is known never to run (nvgpu_req_free_orphan()) --
+ * the moment the host can no longer act on what the request names. Always
+ * process context. One per buffer.
+ */
+void nvgpu_tbuf_on_free(struct nvgpu_tbuf *tb, void (*fn)(void *arg),
+                        void *arg) {
+  WARN_ON(tb->release);
+  tb->release = fn;
+  tb->release_arg = arg;
+}
 
 enum nvgpu_tbuf_op {
   NVGPU_TB_WRITE,
@@ -664,9 +685,11 @@ int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
  * A request from plain kernel memory: copied into transport buffers so the
  * caller's memory is never on the ring and can be freed whatever happens.
  */
-static int nvgpu_call(struct nvgpu_device *dev, const void *req,
-                      size_t req_len, void *resp, size_t resp_len, u32 flags,
-                      u32 *used_len, struct nvgpu_times *tm, bool *sent) {
+static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
+                              size_t req_len, void *resp, size_t resp_len,
+                              u32 flags, u32 *used_len, struct nvgpu_times *tm,
+                              bool *sent, void (*release)(void *arg),
+                              void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_tbuf *rq, *rs;
   size_t posted = resp_len;
@@ -677,13 +700,22 @@ static int nvgpu_call(struct nvgpu_device *dev, const void *req,
     *sent = false;
   if (used_len)
     *used_len = 0;
-  if (!xf)
+  if (!xf) {
+    if (release)
+      release(arg);
     return -ENODEV;
+  }
 
   /* Nothing past what the backend will write is worth posting. */
   posted = min_t(size_t, posted, dev->v2 ? dev->max_resp : NVGPU_V1_RESP_MAX);
   rq = nvgpu_tbuf_alloc_sg(req_len, GFP_KERNEL, xf->max_sg);
   rs = nvgpu_tbuf_alloc_sg(posted, GFP_KERNEL, dev->v2 ? xf->max_sg : 1);
+  if (release) {
+    if (rq)
+      nvgpu_tbuf_on_free(rq, release, arg);
+    else
+      release(arg);
+  }
   if (!rq || !rs) {
     ret = -ENOMEM;
     goto out;
@@ -705,12 +737,30 @@ out:
   return ret;
 }
 
+static int nvgpu_call(struct nvgpu_device *dev, const void *req,
+                      size_t req_len, void *resp, size_t resp_len, u32 flags,
+                      u32 *used_len, struct nvgpu_times *tm, bool *sent) {
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, flags,
+                            used_len, tm, sent, NULL, NULL);
+}
+
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
                          void *resp, int resp_len, u32 *used_len) {
   if (req_len <= 0 || resp_len <= 0)
     return -EINVAL;
   return nvgpu_call(dev, req, req_len, resp, resp_len, 0, used_len, NULL,
                     NULL);
+}
+
+int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
+                            void *resp, int resp_len, u32 *used_len,
+                            void (*release)(void *arg), void *arg) {
+  if (req_len <= 0 || resp_len <= 0) {
+    release(arg);
+    return -EINVAL;
+  }
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
+                            NULL, NULL, release, arg);
 }
 
 int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
@@ -990,6 +1040,9 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
     if (!nvgpu_resp_has(used, at, sizeof(go)) ||
         nvgpu_tbuf_read(r->resp, at, &go, sizeof(go)))
       break;
+    /* A re-home can return a handle the file had: a proxy's (S-11). */
+    if (nvgpu_gem_handle_held(dev, render, le32_to_cpu(go.gem)))
+      continue;
     __nvgpu_gem_close(dev, render, le32_to_cpu(go.gem), true);
     n++;
   }
@@ -1019,7 +1072,11 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
     __nvgpu_close_handle(dev, (u32)res0, true);
     return 1;
   case NVGPU_OP_DMABUF_IMPORT:
-    /* A GEM handle in the render file named by the first argument. */
+    /* A GEM handle in the render file named by the first argument -- unless
+     * the file already had one for the buffer, which the host then returns
+     * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
+    if (nvgpu_gem_handle_held(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0))
+      return 0;
     __nvgpu_gem_close(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0, true);
     return 1;
   default:
@@ -1760,8 +1817,11 @@ void nvgpu_ev_unregister(struct nvgpu_device *dev,
   spin_unlock_irqrestore(&ev->lock, flags);
 }
 
+/* 0 once the device is gone, which no WATCH or registration accepts. */
 u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev) {
-  return (u64)atomic64_inc_return(&dev->events->next_cookie);
+  struct nvgpu_events *ev = dev->events;
+
+  return ev ? (u64)atomic64_inc_return(&ev->next_cookie) : 0;
 }
 
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
@@ -1769,6 +1829,14 @@ bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
   unsigned long flags;
   bool attached;
 
+  if (!ev) {
+    /* The device is gone, and with it every event delivery. */
+    attached = nfd->drm_file != NULL;
+    WRITE_ONCE(nfd->drm_file, NULL);
+    *kms_handle = nfd->kms_handle;
+    nfd->kms_handle = 0;
+    return attached;
+  }
   spin_lock_irqsave(&ev->lock, flags);
   attached = nfd->drm_file != NULL;
   WRITE_ONCE(nfd->drm_file, NULL);
@@ -1862,6 +1930,17 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
   return 0;
 }
 
+/*
+ * Whether nothing sent from here will ever be answered: after a reset or
+ * remove(). For sleepers the transport cannot wake itself. Callers are
+ * inside drm_dev_enter() or otherwise before nvgpu_xfer_destroy().
+ */
+bool nvgpu_xfer_dead(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = READ_ONCE(dev->xfer);
+
+  return !xf || READ_ONCE(xf->dead);
+}
+
 void nvgpu_xfer_quiesce(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = dev->xfer;
 
@@ -1886,6 +1965,7 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
   spin_unlock_irqrestore(&xf->lock, flags);
   wake_up_all(&xf->space_wq);
   wake_up_all(&xf->exec_wq);
+  nvgpu_fence_wake_waiters();
   cancel_delayed_work_sync(&xf->sync_work);
 
   /* After the reset nothing on the ring will ever be answered. */

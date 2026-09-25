@@ -77,11 +77,24 @@
 //! host whose nvidia-drm has that layout.
 //!
 //! Shared by the queue thread (`before`/`after` under the backend mutex) and
-//! nothing else; the lock is only for the `Arc` it lives in.
+//! the executors, which only ever read: a call's head and dpy gates are
+//! decided in `before`, but the call runs later, behind whatever its
+//! executor's FIFO holds, and NVKMS checks nothing itself for
+//! SET_DPY_ATTRIBUTE, SET_LAYER_POSITION, MOVE_CURSOR or SET_CURSOR_IMAGE
+//! (nvkms.c:3070-3085, 3361-3374, 2262-2285, 2230-2257). So every gated call
+//! carries the revocation generation it was decided under, `at_run` refuses
+//! it if a grant has been taken back since, and holds a read lock across the
+//! host ioctl that every revocation takes for writing: a revocation the
+//! guest starts (closing the granting lease, REVOKE_PERMISSIONS) is ordered
+//! strictly after a gated call already running and before any later one
+//! (S-14). A revocation only the host knows of (the lessor ending the
+//! lease) is seen when the backend next asks (kms.rs, "lease ends"), as
+//! before.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use abi::version::DriverVersion;
 
@@ -115,6 +128,25 @@ const REFUSED: &[&str] = &[
     "GET_3DVISION_DONGLE_PARAM_BYTES",
     "SET_3DVISION_AEGIS_PARAMS",
 ];
+
+/// Commands a grant gates outside `--kms-card` (`State::check`,
+/// `flip_heads`, `set_mode`): each carries a run gate (see the module
+/// comment).
+const GATED: &[&str] = &[
+    "SET_CURSOR_IMAGE",
+    "MOVE_CURSOR",
+    "SET_LUT",
+    "SET_DPY_ATTRIBUTE",
+    "SET_LAYER_POSITION",
+    "FLIP",
+    "SET_MODE",
+];
+
+/// How often the VM may make the host probe one dpy (QUERY_DPY_DYNAMIC_DATA)
+/// it may drive -- a grant covers it, or `--kms-card` -- and one it may not.
+/// In between, the last reply is the answer (see `State::dpy_probe`).
+const PROBE_EVERY_GRANTED: Duration = Duration::from_secs(1);
+const PROBE_EVERY_OTHER: Duration = Duration::from_secs(30);
 
 /// Only a guest that owns the display (`--kms-card`): device-wide state
 /// with no permission check in NVKMS.
@@ -165,6 +197,13 @@ impl Perms {
     }
 }
 
+/// The last host probe of one dpy the VM made, and its reply half, if the
+/// host has answered it yet.
+struct DpyProbe {
+    at: Instant,
+    reply: Option<Vec<u8>>,
+}
+
 /// One call, as the policy sees it.
 struct Call<'a> {
     /// The handle it runs on.
@@ -187,6 +226,12 @@ struct State {
     nvkms_granters: HashSet<u32>,
     /// ALLOC_DEVICE replies: (modeset handle, deviceHandle) -> dispHandles.
     disps: HashMap<(u32, u32), [u32; MAX_DISPS]>,
+    /// ALLOC_DEVICE requests: (modeset handle, deviceHandle) -> the GPU's
+    /// rmDeviceId, which is what makes a dpy the same dpy across files.
+    gpus: HashMap<(u32, u32), u32>,
+    /// QUERY_DPY_DYNAMIC_DATA, VM-wide, by (GPU, disp index, dpyId): the
+    /// last probe the host made for this VM (S-8, `dpy_probe`).
+    dpy_probes: HashMap<(u32, usize, u32), DpyProbe>,
     perms: HashMap<(u32, u32), Perms>,
     /// KMS handles whose lease ended with the handle still open, after
     /// something was granted through them: the host may still hold those
@@ -206,6 +251,11 @@ pub struct NvkmsPolicy {
     /// ALLOC_DEVICE reply is left alone too.
     keep_display_coherency: AtomicBool,
     state: Mutex<State>,
+    /// Bumped by every revocation, under `revoking`'s write lock.
+    revocations: AtomicU64,
+    /// Read-held by a gated call across its host ioctl (`at_run`),
+    /// write-held by a revocation. Always taken before `state`.
+    run_lock: RwLock<()>,
 }
 
 /// Narrow ALLOC_DEVICE's reply to coherent display memory, where the device
@@ -338,6 +388,45 @@ impl NvkmsPolicy {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Take a grant back: after every gated call already running has
+    /// returned, and so that every one still queued is refused.
+    ///
+    /// Called on the queue thread under the backend mutex, which no executor
+    /// waits for while holding the read side, so this waits at most for the
+    /// calls in flight; and only when something is really taken back, so a
+    /// CLOSE of any other handle never waits on a flip.
+    fn revoking<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let _w = self.run_lock.write().unwrap_or_else(|e| e.into_inner());
+        let r = f(&mut self.lock());
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        r
+    }
+
+    /// `Hooks::at_run`: a gated call whose grant may have been taken back
+    /// since `before` let it through (see the module comment).
+    pub fn at_run(&self, p: &Prepared) -> Result<Option<crate::xfer::RunGuard<'_>>, Errno> {
+        let Some(seen) = p.run_gate() else {
+            return Ok(None);
+        };
+        self.hold_unless_revoked(seen).map(Some).map_err(|_| {
+            refuse(format_args!(
+                "{} on handle {}: a grant it relied on was taken back while it waited to run",
+                p.name(),
+                p.target()
+            ))
+        })
+    }
+
+    /// The read side of the run lock, if nothing was revoked since the
+    /// count was `seen`.
+    fn hold_unless_revoked(&self, seen: u64) -> Result<crate::xfer::RunGuard<'_>, Errno> {
+        let guard = self.run_lock.read().unwrap_or_else(|e| e.into_inner());
+        if self.revocations.load(Ordering::SeqCst) != seen {
+            return Err(libc::EPERM);
+        }
+        Ok(guard)
+    }
+
     /// The host driver version, which picks the layout every offset below
     /// comes from.
     pub fn set_version(&self, v: DriverVersion) {
@@ -360,15 +449,17 @@ impl NvkmsPolicy {
     /// (nvidia-drm-drv.c:1588-1600) and nvKmsClose frees a file's devices
     /// and permissions (nvkms.c:5254-5308).
     pub fn forget_handle(&self, h: u32) {
-        let mut st = self.lock();
-        st.typed.remove(&h);
-        st.grant_fds.remove(&h);
-        st.disps.retain(|&(m, _), _| m != h);
-        st.perms.retain(|&(m, _), _| m != h);
-        st.revoke_all_through(h);
-        st.ended.remove(&h);
-        if st.nvkms_granters.remove(&h) {
-            st.forget_nvkms_grants();
+        // Grants *through* h: its own records are its file's, which a call
+        // still queued on it keeps open on the host with the permissions it
+        // had.
+        let revokes = {
+            let st = self.lock();
+            st.granted_through(h) || st.nvkms_granters.contains(&h)
+        };
+        if revokes {
+            self.revoking(|st| st.forget_handle(h));
+        } else {
+            self.lock().forget_handle(h);
         }
     }
 
@@ -378,11 +469,13 @@ impl NvkmsPolicy {
     /// ends"), and a handle that had granted something stays on the list
     /// the backend keeps asking about. CLOSE forgets it anyway.
     pub fn lease_ended(&self, kms: u32) {
-        let mut st = self.lock();
-        if st.granted_through(kms) {
-            st.ended.insert(kms);
+        if !self.lock().granted_through(kms) {
+            return;
         }
-        st.revoke_all_through(kms);
+        self.revoking(|st| {
+            st.ended.insert(kms);
+            st.revoke_all_through(kms);
+        });
     }
 
     /// Whether nvidia-drm GRANT_PERMISSIONS ever succeeded through KMS
@@ -413,12 +506,13 @@ impl NvkmsPolicy {
 
     /// A session reset: every handle is gone.
     pub fn reset(&self) {
-        let mut st = self.lock();
-        let version = st.version;
-        *st = State {
-            version,
-            ..State::default()
-        };
+        self.revoking(|st| {
+            let version = st.version;
+            *st = State {
+                version,
+                ..State::default()
+            };
+        });
     }
 
     /// Whether `h` has had an NVKMS call (and so can never be a grant or
@@ -445,13 +539,29 @@ impl NvkmsPolicy {
             fds: &fds,
             kms_card: self.kms_card.load(Ordering::Relaxed),
         };
+        // Read before anything is decided: a revocation from here on is
+        // one the decision below did not see.
+        let seen = self.revocations.load(Ordering::SeqCst);
         let mut st = self.lock();
         let pol = p.policy();
         if pol & (policy::GRANT | policy::REVOKE) != 0 {
             let arg = p.buffer(0).unwrap_or(&[]);
-            return st.drm_check(p.name(), &call, arg);
+            st.drm_check(p.name(), &call, arg)?;
+            if pol & policy::REVOKE != 0 {
+                // Taken back now, not when the reply comes: the host revokes
+                // as the call runs, and a gated call on another executor
+                // must not slip in between. Should the host refuse, the
+                // records are stricter than it for a while, which only
+                // costs the guest its own calls.
+                drop(st);
+                self.revoking(|st| st.drm_record(p.name(), call.target, arg, &[]));
+            }
+            return Ok(());
         }
         let name = p.name().strip_prefix("NVKMS_").unwrap_or(p.name());
+        if !call.kms_card && GATED.contains(&name) {
+            p.set_run_gate(seen);
+        }
         let (lo, exact) = Self::layout(&st)?;
         if pol & policy::NVKMS_EXACT != 0 && !exact {
             return Err(refuse(format_args!(
@@ -471,7 +581,16 @@ impl NvkmsPolicy {
             }
         }
         let params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
-        st.check(lo, name, &call, params)
+        st.check(lo, name, &call, params)?;
+        if name == "QUERY_DPY_DYNAMIC_DATA" && st.dpy_probe(lo, &call, params, Instant::now()) {
+            p.answer_locally(0);
+        }
+        if matches!(name, "REVOKE_PERMISSIONS" | "RELEASE_OWNERSHIP") {
+            // As for nvidia-drm's REVOKE above; `record` forgets them again.
+            drop(st);
+            self.revoking(State::forget_all_grants);
+        }
+        Ok(())
     }
 
     /// `Hooks::after`: what the host granted, allocated or revoked, and the
@@ -523,6 +642,58 @@ impl NvkmsPolicy {
         }
     }
 
+    /// A v1 call `v1_before` let through, answered from the last probe
+    /// if QUERY_DPY_DYNAMIC_DATA may not probe again yet: true if it was
+    /// (the reply is in `msg`, and the host is not asked).
+    pub fn v1_cached(&self, target: u32, msg: &mut [u8]) -> bool {
+        let mut st = self.lock();
+        let (Ok((lo, _)), Some(table)) = (
+            Self::layout(&st),
+            st.version.and_then(schema::modeset_table),
+        ) else {
+            return false;
+        };
+        let Ok(cmd) = rd32(msg, 0) else { return false };
+        if table.lookup_nvkms(cmd).map(|e| e.name) != Some("NVKMS_QUERY_DPY_DYNAMIC_DATA") {
+            return false;
+        }
+        let call = Call {
+            target,
+            fds: &[],
+            kms_card: self.kms_card.load(Ordering::Relaxed),
+        };
+        match msg.get_mut(16..) {
+            Some(params) => st.dpy_probe(lo, &call, params, Instant::now()),
+            None => false,
+        }
+    }
+
+    /// What a successful v1 call leaves for the probe limit: ALLOC_DEVICE's
+    /// disps and GPU, QUERY_DPY_DYNAMIC_DATA's reply, the dpy events a
+    /// GET_NEXT_EVENT returns (`State::record`). Grants cannot travel v1.
+    pub fn v1_record(&self, target: u32, msg: &[u8]) {
+        let mut st = self.lock();
+        let (Ok((lo, _)), Some(table)) = (
+            Self::layout(&st),
+            st.version.and_then(schema::modeset_table),
+        ) else {
+            return;
+        };
+        let Ok(cmd) = rd32(msg, 0) else { return };
+        let Some(name) = table.lookup_nvkms(cmd).map(|e| e.name) else {
+            return;
+        };
+        let name = name.strip_prefix("NVKMS_").unwrap_or(name);
+        if matches!(
+            name,
+            "ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"
+        ) {
+            if let Some(params) = msg.get(16..) {
+                st.record(lo, name, target, params, &[]);
+            }
+        }
+    }
+
     // ───────────────────────────── v1 ─────────────────────────────
 
     /// A v1 IOCTL on a modeset handle: the 16-byte NvKmsIoctlParams and the
@@ -570,7 +741,8 @@ impl NvkmsPolicy {
         };
         st.check(lo, name, &call, &mut msg[16..])?;
         if matches!(name, "RELEASE_OWNERSHIP" | "REVOKE_PERMISSIONS") {
-            st.forget_all_grants();
+            drop(st);
+            self.revoking(State::forget_all_grants);
         }
         Ok(())
     }
@@ -606,6 +778,7 @@ impl State {
                 // outlives its device would gate the next one.
                 let dev = rd32(params, 0)?;
                 self.disps.remove(&(call.target, dev));
+                self.gpus.remove(&(call.target, dev));
                 self.perms.remove(&(call.target, dev));
             }
             "QUERY_DPY_DYNAMIC_DATA" => zero(params, lo.dpy_dynamic_scrub)?,
@@ -764,6 +937,85 @@ impl State {
     }
 
     /// The disp index of `disp` on (target, dev), from the ALLOC_DEVICE reply.
+    /// Which dpy a QUERY_DPY_DYNAMIC_DATA on `target` names, VM-wide:
+    /// (GPU, disp index, dpyId). None for a device or disp the file's
+    /// ALLOC_DEVICE did not answer with, which the host refuses cheaply.
+    fn dpy_key(&self, lo: &NvkmsLayout, target: u32, params: &[u8]) -> Option<(u32, usize, u32)> {
+        let t = lo.dpy_dynamic;
+        let dev = rd32(params, t.device).ok()?;
+        let disp = rd32(params, t.disp).ok()?;
+        let dpy = rd32(params, t.what).ok()?;
+        let d = self.disp_index(target, dev, disp)?;
+        Some((*self.gpus.get(&(target, dev))?, d, dpy))
+    }
+
+    /// QUERY_DPY_DYNAMIC_DATA makes the host reconnect the dpy and read its
+    /// EDID afresh over DDC or AUX (nvDpyGetDynamicData -> DpyConnectEvo ->
+    /// ReadEdidFromResman with COPY_CACHE_NO, nvkms-dpy.c:109-133, 1319),
+    /// all under the global nvkms_lock that the host compositor's flips wait
+    /// on uninterruptibly (nvkms-kapi.c:3488-3491). A guest looping it over
+    /// every host dpy from 16 files would drop the host desktop, and every
+    /// VM whose flips go through NVKMS, to a few frames a second (S-8).
+    ///
+    /// So the VM probes each dpy at most once per `PROBE_EVERY_GRANTED` if
+    /// it may drive the dpy, and once per `PROBE_EVERY_OTHER` otherwise --
+    /// a host monitor is the guest's to see, not to probe -- and in between
+    /// the last reply is the answer, which the host would give too: the
+    /// overrides that could make it differ are always cleared (`check`),
+    /// and the dpy events clear the whole record (`record`). A refusal would
+    /// break every NVKMS client, which queries every dpy as it starts.
+    ///
+    /// True if `params`' reply half now holds that answer.
+    fn dpy_probe(
+        &mut self,
+        lo: &NvkmsLayout,
+        call: &Call,
+        params: &mut [u8],
+        now: Instant,
+    ) -> bool {
+        let Some(key) = self.dpy_key(lo, call.target, params) else {
+            return false;
+        };
+        let (_, d, dpy) = key;
+        let dev = rd32(params, lo.dpy_dynamic.device).unwrap_or(0);
+        let may_drive =
+            call.kms_card || self.perms(call.target, dev).is_some_and(|p| p.dpy(d, dpy));
+        let every = if may_drive {
+            PROBE_EVERY_GRANTED
+        } else {
+            PROBE_EVERY_OTHER
+        };
+        let probe = match self.dpy_probes.entry(key) {
+            // The first: this one goes to the host.
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(DpyProbe {
+                    at: now,
+                    reply: None,
+                });
+                return false;
+            }
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        };
+        if now.duration_since(probe.at) >= every {
+            // Due: this one goes to the host.
+            probe.at = now;
+            return false;
+        }
+        // Not due. With no reply yet the first probe is still running (or
+        // failed): the host answers this one too.
+        let Some(reply) = &probe.reply else {
+            return false;
+        };
+        let (off, len) = lo.dpy_dynamic_reply;
+        match params.get_mut(off as usize..(off + len) as usize) {
+            Some(dst) if dst.len() == reply.len() => {
+                dst.copy_from_slice(reply);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn disp_index(&self, target: u32, dev: u32, disp: u32) -> Option<usize> {
         let d = self.disps.get(&(target, dev))?;
         d.iter().position(|&x| x != 0 && x == disp)
@@ -859,8 +1111,33 @@ impl State {
                     *d = rd32(params, lo.alloc_reply_disps + 4 * i as u32).unwrap_or(0);
                 }
                 self.disps.insert((target, dev), disps);
+                if let Ok(gpu) = rd32(params, lo.alloc_device_id) {
+                    self.gpus.insert((target, dev), gpu);
+                }
                 // A handle number the host reused starts with nothing.
                 self.perms.remove(&(target, dev));
+            }
+            "QUERY_DPY_DYNAMIC_DATA" => {
+                let (off, len) = lo.dpy_dynamic_reply;
+                let Some(reply) = params.get(off as usize..(off + len) as usize) else {
+                    return;
+                };
+                if let Some(key) = self.dpy_key(lo, target, params) {
+                    let probe = self.dpy_probes.entry(key).or_insert(DpyProbe {
+                        at: Instant::now(),
+                        reply: None,
+                    });
+                    probe.reply = Some(reply.to_vec());
+                }
+            }
+            // A dpy came, went or changed: the next probe of any goes to the
+            // host, whatever the limit says.
+            "GET_NEXT_EVENT" => {
+                let valid = rd(params, lo.next_event_valid as usize, 1).unwrap_or(0) != 0;
+                let ty = rd32(params, lo.next_event_type).unwrap_or(u32::MAX);
+                if valid && ty < 32 && lo.dpy_events & (1 << ty) != 0 {
+                    self.dpy_probes.clear();
+                }
             }
             "ACQUIRE_PERMISSIONS" => {
                 if let Err(e) = self.record_acquire(lo, target, params, fds) {
@@ -1024,6 +1301,20 @@ impl State {
         }
         self.grant_fds
             .retain(|_, s| !matches!(s, Source::Drm { kms: k, .. } if *k == kms));
+    }
+
+    /// `NvkmsPolicy::forget_handle`'s records.
+    fn forget_handle(&mut self, h: u32) {
+        self.typed.remove(&h);
+        self.grant_fds.remove(&h);
+        self.disps.retain(|&(m, _), _| m != h);
+        self.gpus.retain(|&(m, _), _| m != h);
+        self.perms.retain(|&(m, _), _| m != h);
+        self.revoke_all_through(h);
+        self.ended.remove(&h);
+        if self.nvkms_granters.remove(&h) {
+            self.forget_nvkms_grants();
+        }
     }
 
     fn forget_nvkms_grants(&mut self) {
@@ -1395,6 +1686,164 @@ mod tests {
             Err(libc::EPERM),
             "and it is not granted twice"
         );
+    }
+
+    // ── the dpy probe limit (S-8) ──
+
+    /// QUERY_DPY_DYNAMIC_DATA of `dpy` on disp 0 of the file's device.
+    fn dyn_query(v: DriverVersion, dpy: u32) -> Vec<u8> {
+        let t = lo(v).dpy_dynamic;
+        let mut q = vec![0u8; size(v, "NVKMS_QUERY_DPY_DYNAMIC_DATA")];
+        put(&mut q, t.device, DEV);
+        put(&mut q, t.disp, DISP);
+        put(&mut q, t.what, dpy);
+        q
+    }
+
+    impl NvkmsPolicy {
+        /// `before`'s probe decision for a QUERY_DPY_DYNAMIC_DATA on
+        /// `target` at `now`: true if answered from the last reply.
+        fn probe(&self, target: u32, q: &mut [u8], now: Instant) -> bool {
+            let mut st = self.lock();
+            let (lo, _) = Self::layout(&st).unwrap();
+            let call = Call {
+                target,
+                fds: &[],
+                kms_card: self.kms_card.load(Ordering::Relaxed),
+            };
+            st.dpy_probe(lo, &call, q, now)
+        }
+
+        /// The host's answer to it: the reply half filled with `byte`.
+        fn answer(&self, v: DriverVersion, target: u32, q: &mut [u8], byte: u8) {
+            let (off, len) = lo(v).dpy_dynamic_reply;
+            q[off as usize..(off + len) as usize].fill(byte);
+            self.record("QUERY_DPY_DYNAMIC_DATA", target, &[], q);
+        }
+    }
+
+    fn reply_byte(v: DriverVersion, q: &[u8]) -> u8 {
+        let (off, len) = lo(v).dpy_dynamic_reply;
+        let r = &q[off as usize..(off + len) as usize];
+        assert!(r.iter().all(|&b| b == r[0]), "the whole reply, not part");
+        r[0]
+    }
+
+    #[test]
+    fn a_dpy_is_probed_once_per_window_and_answered_with_the_last_reply_between() {
+        let v = v610();
+        let p = granted(v);
+        let other = 1 << 5;
+        let t0 = Instant::now();
+        for (dpy, every) in [(DPY, PROBE_EVERY_GRANTED), (other, PROBE_EVERY_OTHER)] {
+            let mut q = dyn_query(v, dpy);
+            assert!(!p.probe(M, &mut q, t0), "the first probe goes to the host");
+            p.answer(v, M, &mut q, 0x5a);
+            let mut again = dyn_query(v, dpy);
+            assert!(p.probe(M, &mut again, t0 + every / 2));
+            assert_eq!(reply_byte(v, &again), 0x5a);
+            let mut due = dyn_query(v, dpy);
+            assert!(!p.probe(M, &mut due, t0 + every), "{dpy:#x} is due again");
+            assert_eq!(reply_byte(v, &due), 0, "and the host answers it");
+        }
+    }
+
+    #[test]
+    fn the_limit_is_the_vms_not_the_files() {
+        // A second file of the same VM, its own device on the same GPU: the
+        // dpy is the same dpy, and the guest opening more files buys it no
+        // more probes.
+        let v = v610();
+        let p = policy(v);
+        alloc_device(&p, v, M);
+        alloc_device(&p, v, M + 1);
+        let t0 = Instant::now();
+        let mut q = dyn_query(v, DPY);
+        assert!(!p.probe(M, &mut q, t0));
+        p.answer(v, M, &mut q, 7);
+        let mut q = dyn_query(v, DPY);
+        assert!(p.probe(M + 1, &mut q, t0 + Duration::from_millis(1)));
+        assert_eq!(reply_byte(v, &q), 7);
+    }
+
+    #[test]
+    fn a_probe_still_running_does_not_stop_the_next_reaching_the_host() {
+        // Nothing to answer with yet: the host must.
+        let v = v610();
+        let p = granted(v);
+        let t0 = Instant::now();
+        assert!(!p.probe(M, &mut dyn_query(v, DPY), t0));
+        assert!(!p.probe(M, &mut dyn_query(v, DPY), t0));
+    }
+
+    #[test]
+    fn a_dpy_event_sends_the_next_probe_of_every_dpy_to_the_host() {
+        let v = v610();
+        let l = lo(v);
+        let p = granted(v);
+        let t0 = Instant::now();
+        let mut q = dyn_query(v, DPY);
+        assert!(!p.probe(M, &mut q, t0));
+        p.answer(v, M, &mut q, 1);
+        let mut ev = vec![0u8; size(v, "NVKMS_GET_NEXT_EVENT")];
+        ev[l.next_event_valid as usize] = 1;
+        // FLIP_OCCURRED (5) says nothing about any dpy.
+        put(&mut ev, l.next_event_type, 5);
+        p.record("GET_NEXT_EVENT", M, &[], &ev);
+        assert!(p.probe(M, &mut dyn_query(v, DPY), t0));
+        // DPY_CHANGED (0) does.
+        put(&mut ev, l.next_event_type, 0);
+        p.record("GET_NEXT_EVENT", M, &[], &ev);
+        assert!(!p.probe(M, &mut dyn_query(v, DPY), t0));
+    }
+
+    #[test]
+    fn a_dpy_of_a_device_the_file_never_allocated_goes_to_the_host_to_refuse() {
+        let v = v610();
+        let p = policy(v);
+        let t0 = Instant::now();
+        assert!(!p.probe(M, &mut dyn_query(v, DPY), t0));
+        assert!(!p.probe(M, &mut dyn_query(v, DPY), t0));
+    }
+
+    #[test]
+    fn a_revocation_waits_for_the_gated_call_running_and_refuses_those_queued() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let p = Arc::new(granted(v610()));
+        let seen = p.revocations.load(Ordering::SeqCst);
+        let running = p.hold_unless_revoked(seen).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let closer = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                p.forget_handle(KMS);
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the lease's close waits for the call already on the host"
+        );
+        drop(running);
+        rx.recv().unwrap();
+        closer.join().unwrap();
+        assert_eq!(p.hold_unless_revoked(seen).err(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn a_close_or_lease_end_that_takes_nothing_back_leaves_queued_calls_alone() {
+        let p = granted(v610());
+        let seen = p.revocations.load(Ordering::SeqCst);
+        // M holds the grant, it did not make it; 99 is nobody.
+        p.forget_handle(M);
+        p.forget_handle(99);
+        p.lease_ended(99);
+        assert!(p.hold_unless_revoked(seen).is_ok());
+        let p = granted(v610());
+        let seen = p.revocations.load(Ordering::SeqCst);
+        p.lease_ended(KMS);
+        assert!(p.hold_unless_revoked(seen).is_err());
     }
 
     #[test]

@@ -59,7 +59,9 @@ MODULE_IMPORT_NS("DMA_BUF");
  * misc device, but files opened before that still name this struct until
  * they are released. The open takes its reference under misc_mtx, which
  * misc_deregister() also takes (drivers/char/misc.c:125-165, 284-293), so no
- * open can find it once cleanup has dropped the initial one.
+ * open can find it once cleanup has dropped the initial one. And it holds
+ * the nvgpu_device, which such a file's release and ioctls use, until it
+ * goes itself: remove() alone would free it under them (S-26).
  */
 struct nvgpu_wl_dev {
   struct miscdevice misc;
@@ -69,7 +71,10 @@ struct nvgpu_wl_dev {
 };
 
 static void nvgpu_wl_dev_free(struct kref *ref) {
-  kfree(container_of(ref, struct nvgpu_wl_dev, ref));
+  struct nvgpu_wl_dev *wl = container_of(ref, struct nvgpu_wl_dev, ref);
+
+  nvgpu_dev_put(wl->dev);
+  kfree(wl);
 }
 
 static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
@@ -563,6 +568,7 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
   }
   args[0] = nfd->handle;
   args[1] = handle;
+again:
   ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 3);
   if (ret < 0)
     goto out;
@@ -576,7 +582,9 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
    * third word, which reads as 0, NVKMS: the old answer.
    */
   if (res[2] > NVGPU_GEM_OBJECT_USERMEMORY) {
-    nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    /* A handle the file already had is a proxy's to close, not ours. */
+    if (!xa_load(&nfd->gem_index, (u32)res[0]))
+      nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
     ret = -EPROTO;
     goto out;
   }
@@ -584,6 +592,18 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
    * proxy that already stands for it. */
   ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], (u32)res[2],
                                O_RDWR | O_CLOEXEC);
+  /*
+   * The host answered with a handle the file had for this buffer, and the
+   * proxy that stood for it is on its way out, about to close it (S-11): a
+   * client recreating a wl_buffer from the same dma-buf as the compositor
+   * drops the last. Once that close is out, the same import gives a handle
+   * that is really ours -- the backend's dma-buf is held until `out`.
+   */
+  if (ret == -EAGAIN) {
+    ret = nvgpu_gem_wait_gone(nfd, (u32)res[0]);
+    if (!ret)
+      goto again;
+  }
 out:
   if (rf)
     fput(rf);
@@ -871,6 +891,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   else
     snprintf(wl->name, sizeof(wl->name), "nvgpu-wl%d", slot);
   wl->dev = dev;
+  nvgpu_dev_get(dev);
   kref_init(&wl->ref);
   wl->misc.minor = MISC_DYNAMIC_MINOR;
   wl->misc.name = wl->name;
@@ -884,7 +905,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
     mutex_unlock(&nvgpu_wl_devs_lock);
     dev_warn(&dev->vdev->dev, "virtio-gpu-nv: /dev/%s: misc_register: %d\n",
              wl->name, ret);
-    kfree(wl);
+    kref_put(&wl->ref, nvgpu_wl_dev_free);
     return ret;
   }
   nvgpu_wl_devs[slot] = wl;

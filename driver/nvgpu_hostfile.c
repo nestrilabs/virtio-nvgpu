@@ -44,6 +44,7 @@ static int nvgpu_hostfile_release(struct inode *inode, struct file *f) {
   struct nvgpu_hostfile *hf = f->private_data;
 
   nvgpu_close_handle(hf->dev, hf->handle);
+  nvgpu_dev_put(hf->dev); /* S-26: the file may outlive the device */
   kfree(hf);
   return 0;
 }
@@ -93,6 +94,7 @@ int nvgpu_hostfile_install(struct nvgpu_device *dev, u32 handle, u32 kind,
       nvgpu_close_handle(dev, handle);
     return PTR_ERR(file);
   }
+  nvgpu_dev_get(dev); /* the file's, put at its release */
   fd_install(fd, file);
   return fd;
 }

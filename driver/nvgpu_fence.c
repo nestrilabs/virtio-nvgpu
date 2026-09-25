@@ -109,11 +109,20 @@ static void nvgpu_fence_bury(struct nvgpu_fence_ev *e) {
   spin_unlock_irqrestore(&nvgpu_fence_dead_lock, flags);
 }
 
-/* Process context only. */
+/*
+ * Process context only. A registered consumer holds its device (taken with
+ * the registration): a buried one may be retired long after remove(), by
+ * whoever reaps next, and a syncobj wait's can outlive every file (S-26).
+ */
 static void nvgpu_fence_ev_retire(struct nvgpu_fence_ev *e) {
-  if (e->registered)
-    nvgpu_ev_unregister(e->dev, &e->c);
+  struct nvgpu_device *dev = e->dev;
+  bool registered = e->registered;
+
+  if (registered)
+    nvgpu_ev_unregister(dev, &e->c);
   e->free(e);
+  if (registered)
+    nvgpu_dev_put(dev);
 }
 
 static void nvgpu_fence_reap(void) {
@@ -181,8 +190,10 @@ static void nvgpu_host_fence_release(struct dma_fence *base) {
   xa_lock_irqsave(&nvgpu_host_fences, flags);
   __xa_erase(&nvgpu_host_fences, f->ev->id);
   xa_unlock_irqrestore(&nvgpu_host_fences, flags);
-  nvgpu_fence_bury(f->ev);
+  /* Before the burial: the consumer's device reference is what keeps
+   * f->dev alive, and a reap on another CPU may retire it at once. */
   nvgpu_close_handle_async(f->dev, f->handle);
+  nvgpu_fence_bury(f->ev);
   dma_fence_free(base);
   module_put(THIS_MODULE);
 }
@@ -218,6 +229,19 @@ static void nvgpu_host_fence_deliver(struct nvgpu_ev_consumer *c, u32 kind,
   rcu_read_unlock();
   if (!f)
     return; /* the proxy went first: nobody left to tell */
+  /*
+   * The id is the xarray's lowest free one (XA_FLAGS_ALLOC1), so the moment
+   * a proxy is released its id can go to the next one -- while this
+   * consumer, buried but not yet reaped, can still be handed the old
+   * fence's one EV_FENCE (its CLOSE is queued behind other work). Only the
+   * proxy this consumer belongs to is ours to signal: signalling the new
+   * one would let its waiters -- a flip's IN_FENCE_FD, a sampler -- run
+   * ahead of GPU work that has not finished (S-12).
+   */
+  if (READ_ONCE(f->ev) != e) {
+    dma_fence_put(&f->base);
+    return;
+  }
 
   if (!atomic_xchg(&f->signalled, 1)) {
     if (status < 0 && status >= -MAX_ERRNO)
@@ -272,7 +296,13 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
     ret = -ENOMEM;
     goto fail_free;
   }
-  ret = xa_alloc_irq(&nvgpu_host_fences, &e->id, f, xa_limit_32b, GFP_KERNEL);
+  /*
+   * Reserved, not published: xa_load() finds NULL here until the proxy is
+   * whole, so an event racing in (for a stale consumer that held this id
+   * before) never sees a fence whose ev and refcount are not yet set.
+   */
+  ret = xa_alloc_irq(&nvgpu_host_fences, &e->id, NULL, xa_limit_32b,
+                     GFP_KERNEL);
   if (ret)
     goto fail_free;
   e->dev = dev;
@@ -292,6 +322,11 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
                    dma_fence_context_alloc(1), 1);
   /* From here the fence's release owns the id, the consumer and the handle. */
 
+  /* Published whole: the store is an rcu_assign_pointer. */
+  ret = xa_err(xa_store_irq(&nvgpu_host_fences, e->id, f, GFP_KERNEL));
+  if (ret)
+    goto put;
+
   /*
    * Consumer first, WATCH second: once the backend watches, the report can
    * come at once (a host fence that has already signalled), and it must find
@@ -301,6 +336,7 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
   ret = nvgpu_ev_register(dev, &e->c, NVGPU_EVKEY_COOKIE(cookie));
   if (ret)
     goto put;
+  nvgpu_dev_get(dev); /* the registration's, put at retire */
   e->registered = true;
   ret = nvgpu_watch(dev, handle, NVGPU_W_FENCE | NVGPU_W_ONESHOT, cookie);
   if (ret) {
@@ -715,6 +751,10 @@ static DECLARE_WAIT_QUEUE_HEAD(nvgpu_sowait_wq);
 /* TRANSFER's WAIT_FOR_SUBMIT waits this long (drm_syncobj.c:420). */
 #define NVGPU_SOWAIT_SUBMIT_NS (5 * NSEC_PER_SEC)
 
+/* The transport died: every guest syncobj waiter looks again (and finds
+ * nvgpu_xfer_dead()). */
+void nvgpu_fence_wake_waiters(void) { wake_up_all(&nvgpu_sowait_wq); }
+
 static void nvgpu_sowait_free(struct nvgpu_fence_ev *e) {
   kfree(container_of(e, struct nvgpu_sowait, ev));
 }
@@ -794,6 +834,7 @@ static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
     kfree(s);
     return ERR_PTR(ret);
   }
+  nvgpu_dev_get(dev); /* the registration's, put at retire */
   s->ev.registered = true;
   spin_lock_irqsave(&nvgpu_sowait_lock, flags);
   hash_add(nvgpu_sowaits, &s->node, cookie);
@@ -1041,8 +1082,11 @@ static long nvgpu_sowait_run(struct nvgpu_sowait_wait *w, s64 timeout_nsec) {
       ret = nvgpu_sowait_poll(w);
       if (ret != -ETIME)
         break;
+      /* Or the device is going: the next poll then fails at once, and
+       * remove() is not kept waiting on this ioctl (S-26). */
       ret = wait_event_interruptible_timeout(
-          nvgpu_sowait_wq, nvgpu_sowait_progress(w),
+          nvgpu_sowait_wq,
+          nvgpu_sowait_progress(w) || nvgpu_xfer_dead(w->p.nfd->dev),
           nvgpu_sowait_left(forever, end));
       if (ret < 0)
         break;
@@ -1638,12 +1682,20 @@ static struct nvgpu_fence_ctx *nvgpu_fence_ctx_lookup(struct drm_file *file,
  * host handle) is counted across proxies and closed with the last (RV:rehome).
  * Each entry holds a reference on the target file, whose render handle the
  * host handle lives in.
+ *
+ * The same goes for a handle a *proxy* of the target file stands for: the
+ * import hands that back too, and it is the proxy's to close (S-11). Such an
+ * entry borrows it -- holds a reference on the proxy, so the number stays
+ * the object's for as long as the entry uses it, and never closes it. One
+ * whose proxy is on its way out (closing it) waits for the close and imports
+ * again.
  */
 struct nvgpu_rehome {
   struct hlist_node node; /* keyed by the proxy */
   struct nvgpu_gem_object *ng;
   struct nvgpu_fd *file;
   u32 gem; /* in file's host render file */
+  struct drm_gem_object *borrowed; /* the proxy of file that owns gem */
 };
 
 static DEFINE_MUTEX(nvgpu_rehome_lock);
@@ -1655,8 +1707,9 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   struct nvgpu_rehome *r;
   u64 args[2], res[2];
   u32 dmabuf;
-  int ret;
+  int ret, tries = 0;
 
+again:
   mutex_lock(&nvgpu_rehome_lock);
   hash_for_each_possible(nvgpu_rehomes, r, node, (unsigned long)ng) {
     if (r->ng == ng && r->file == file) {
@@ -1690,6 +1743,19 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   if (!res[0] || res[0] > U32_MAX) {
     ret = -EPROTO;
     goto out_free;
+  }
+  r->borrowed = nvgpu_gem_proxy_find(file, (u32)res[0]);
+  if (!r->borrowed && nvgpu_gem_dying(file, (u32)res[0])) {
+    /* Not ours to use or close: wait out the proxy's close, outside the
+     * lock its free takes (nvgpu_fence_gem_free()), and import again. */
+    kfree(r);
+    mutex_unlock(&nvgpu_rehome_lock);
+    if (++tries > 3)
+      return -EAGAIN;
+    ret = nvgpu_gem_wait_gone(file, (u32)res[0]);
+    if (ret)
+      return ret;
+    goto again;
   }
   r->ng = ng;
   nvgpu_fd_get(file);
@@ -1729,7 +1795,7 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
     hash_for_each(nvgpu_rehomes, bkt, o, node)
       if (o->file == r->file && o->gem == r->gem)
         shared = true;
-    if (shared)
+    if (shared || r->borrowed)
       r->gem = 0;
     hlist_add_head(&r->node, &gone);
   }
@@ -1738,6 +1804,10 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
   hlist_for_each_entry_safe(r, tmp, &gone, node) {
     if (r->gem)
       nvgpu_gem_close(r->file->dev, r->file->handle, r->gem);
+    /* Outside the lock: this may be that proxy's last reference, and its
+     * free comes back here. */
+    if (r->borrowed)
+      drm_gem_object_put(r->borrowed);
     nvgpu_fd_put(r->file);
     kfree(r);
   }

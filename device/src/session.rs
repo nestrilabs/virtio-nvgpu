@@ -782,7 +782,10 @@ impl NvidiaBackend {
             }
         };
         if class == SchemaClass::Kms {
-            self.kms_states.entry(target).or_default();
+            let vm = self.vm_kms.clone();
+            self.kms_states
+                .entry(target)
+                .or_insert_with(|| Arc::new(xfer::KmsFileState::in_vm(vm)));
             // Scanout checksums: our card or a lessee only (kms.rs).
             self.crc_gate(req.cmd, target, kind)?;
         }
@@ -809,6 +812,16 @@ impl NvidiaBackend {
             return Err(libc::EMSGSIZE);
         }
         let (target_fd, _) = self.handles.dup(target).ok_or(libc::EBADF)?;
+        // SYNCOBJ_DESTROY frees the number the moment it runs, and the next
+        // import in this file gets it back: no watch may join a wait on the
+        // old syncobj from here on (fence.rs, `Registrations::orphan`; S-13).
+        // drm_syncobj_destroy.handle @0.
+        if prepared.name() == "SYNCOBJ_DESTROY" {
+            if let Some(a) = prepared.buffer(0).filter(|a| a.len() >= 4) {
+                let handle = u32::from_le_bytes(a[..4].try_into().unwrap());
+                self.syncobj_regs.orphan(target, handle);
+            }
+        }
         let executor = prepared.wants_executor() || class != SchemaClass::Render;
         Ok(PendingIoctl2(Pending::Ioctl2(Ioctl2Call {
             prepared,

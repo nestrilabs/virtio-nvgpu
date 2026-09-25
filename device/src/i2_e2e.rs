@@ -984,6 +984,12 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
                 poke(p, 456, 4, 5);
                 -libc::EPERM
             }
+            // QUERY_DPY_DYNAMIC_DATA: the reply half (2072 on) memset and
+            // filled (nvkms-dpy.c:3068), here with one byte.
+            (6, 37168) => {
+                std::ptr::write_bytes(p.add(2072), 0x42, 37168 - 2072);
+                0
+            }
             (11, 20) => 0, // MOVE_CURSOR
             // FLIP of one head: what each layer's awaken reached the host as.
             (15, 3104) if peek(p, 16, 4) == 1 => {
@@ -1115,7 +1121,19 @@ impl World {
         self.send(g, 0)
     }
 
-    fn send(&mut self, mut g: Guest, short: usize) -> Result<i32, i32> {
+    fn send(&mut self, g: Guest, short: usize) -> Result<i32, i32> {
+        self.send_with(g, short, |_| {})
+    }
+
+    /// `send`, with `meanwhile` run on the backend after the call was
+    /// prepared and before it runs: what happens while it waits in its
+    /// executor's queue.
+    fn send_with(
+        &mut self,
+        mut g: Guest,
+        short: usize,
+        meanwhile: impl FnOnce(&mut NvidiaBackend),
+    ) -> Result<i32, i32> {
         g.translate(&self.hooks)?;
         let req = g.build();
         let cap = g.resp_len() - short;
@@ -1127,6 +1145,7 @@ impl World {
                     g.executor(),
                     "both halves agree on who waits"
                 );
+                meanwhile(&mut self.be);
                 p.execute();
                 self.be.finish_ioctl2(p)
             }
@@ -1239,6 +1258,45 @@ fn addfb2_takes_the_proxies_objects_into_the_lease_for_one_job_only() {
     // gets the same number owns no framebuffer of this one's.
     w.be.close_handle(kms).unwrap();
     assert!(!w.be.kms_states.contains_key(&kms));
+    assert!(
+        !w.be.vm_kms.made_here(77),
+        "nor may anything of this VM name it as a scanout source any more"
+    );
+}
+
+/// A scanout source is a framebuffer this VM made (S-6): the host looks
+/// framebuffer ids up device-wide and a lease does not cover them, so an id
+/// the host compositor or another VM made would otherwise be shown -- and
+/// checksummed -- on the guest's CRTC. The refusal comes before the host
+/// sees the call; the VM's own framebuffer, from any of its files, passes.
+#[test]
+fn a_page_flip_to_a_framebuffer_this_vm_never_made_never_reaches_the_host() {
+    const PAGE_FLIP: u32 = 0xc018_64b0;
+    let mut w = world();
+    let kms = w.kms;
+    let other =
+        w.be.adopt_for_test(memfd(c"e2e-kms-2"), HandleKind::DrmLease(0));
+    // Any KMS call makes the file's state; the other file made fb 77.
+    let mut a = vec![0u8; 24];
+    wr(&mut a, 4, 4, 5);
+    w.mem.put(0x1000, &a);
+    assert_eq!(w.call(other, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
+    w.be.kms_states[&other].add_fb(77);
+    w.calls();
+
+    wr(&mut a, 4, 4, 5);
+    w.mem.put(0x1000, &a);
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
+    assert!(w.calls().is_empty(), "the host never saw it");
+
+    wr(&mut a, 4, 4, 77);
+    w.mem.put(0x1000, &a);
+    // The fake kernel has no PAGE_FLIP; reaching it is the point.
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::ENOTTY));
+    assert_eq!(w.calls(), vec![("e2e-kms".to_string(), PAGE_FLIP)]);
+
+    w.be.close_handle(other).unwrap();
+    assert_eq!(w.call(kms, PAGE_FLIP, 0x1000, 0), Ok(-libc::EPERM));
 }
 
 /// A framebuffer is NVKMS memory or nothing: a proxy standing for a foreign
@@ -1420,6 +1478,59 @@ fn a_syncobj_wait_reaches_the_host_as_a_poll_and_an_eventfd_never_does() {
         Err(libc::EPERM)
     );
     assert!(w.calls().is_empty());
+}
+
+/// Hyprland destroys a dead client's timeline and imports the next one,
+/// which the host gives the same syncobj number (lowest free,
+/// drm_syncobj.c:606). A watch on the new syncobj must not join the old
+/// one's unfired registration, whose point may never come (S-13): the
+/// DESTROY orphans it before it runs, and so does closing the render file.
+#[test]
+fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number() {
+    use crate::fence::{RegKey, SyncobjHost, Watched};
+    struct Host;
+    impl SyncobjHost for Host {
+        fn syncobj_file(&self, _: RawFd, _: u32) -> std::io::Result<OwnedFd> {
+            Ok(memfd(c"e2e-syncobj"))
+        }
+        fn register(&self, _: RawFd, _: u32, _: u64, _: u32, _: RawFd) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn watch(w: &mut World, key: RegKey, cookie: u64) -> Result<Watched, i32> {
+        let mut regs = std::mem::take(&mut w.be.syncobj_regs);
+        let r = regs.watch(&Host, &mut w.be, -1, key, cookie);
+        w.be.syncobj_regs = regs;
+        r
+    }
+    const DESTROY: u32 = hostfd::DRM_IOCTL_SYNCOBJ_DESTROY;
+    let mut w = world();
+    let render = w.render;
+    let key = RegKey {
+        render,
+        syncobj: 3,
+        point: 120,
+        flags: 0,
+    };
+    let c = |n: u64| (1 << 32) | n;
+    assert_eq!(watch(&mut w, key, c(1)), Ok(Watched::New));
+    assert_eq!(watch(&mut w, key, c(2)), Ok(Watched::Joined(c(1))));
+    let mut a = vec![0u8; 8];
+    wr(&mut a, 0, 4, 3);
+    w.mem.put(0x1000, &a);
+    // Whatever the host answers (this one has no syncobjs at all).
+    assert_eq!(
+        w.call_in(schema::Class::Render, render, DESTROY, 0x1000, 0),
+        Ok(-libc::ENOTTY)
+    );
+    assert_eq!(watch(&mut w, key, c(3)), Ok(Watched::New));
+    assert_eq!(w.be.syncobj_regs.len(), 2, "the orphan keeps its slot");
+
+    // A later render file may be given this handle number: the closed
+    // file's registrations are no key's any more.
+    w.be.close_handle(render).unwrap();
+    assert_eq!(watch(&mut w, key, c(4)), Ok(Watched::New));
+    assert_eq!(w.be.syncobj_regs.len(), 3);
 }
 
 // ───────────────────────────── NVKMS ─────────────────────────────
@@ -1630,6 +1741,81 @@ fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes(
     nvkms_call(&mut w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 41, 11]);
+}
+
+/// Every QUERY_DPY_DYNAMIC_DATA is a fresh EDID read under nvkms_lock on
+/// the host (S-8): a second one of the same dpy inside the limit's window
+/// is answered with the first one's reply, which reaches the guest as the
+/// host's would, and never reaches the host.
+#[test]
+fn a_dpy_probed_a_moment_ago_is_answered_without_the_host() {
+    let mut w = nvkms_world();
+    let modeset = w.modeset;
+    nvkms_call(&mut w, 0, &[0u8; 1440]);
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ALLOC_DEVICE");
+    let mut q = vec![0u8; 37168];
+    wr(&mut q, 0, 4, 1); // deviceHandle
+    wr(&mut q, 4, 4, 0x100); // dispHandle
+    wr(&mut q, 8, 4, 1 << 3); // dpyId
+    for _ in 0..3 {
+        nvkms_call(&mut w, 6, &q);
+        assert_eq!(w.nvkms(modeset, 0x1000), Ok(0));
+        let r = w.mem.get(0x2000);
+        assert!(r[2072..].iter().all(|&b| b == 0x42), "the host's reply");
+        assert_eq!(rd(r, 8, 4), 1 << 3, "and the request as sent");
+    }
+    assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 6], "one probe");
+}
+
+/// A gated call is decided when it is prepared and runs when its executor
+/// gets to it, and NVKMS checks nothing itself for MOVE_CURSOR
+/// (nvkms.c:2262-2285). A grant taken back in between -- here the lease
+/// file that granted it closes -- refuses the call where it runs, before
+/// the host sees it (S-14).
+#[test]
+fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() {
+    let mut w = nvkms_world();
+    let (kms, modeset) = (w.kms, w.modeset);
+    grant_head_1(&mut w);
+    let table = w.be.driver.and_then(schema::modeset_table);
+    nvkms_call(&mut w, 11, &cursor(1));
+    let g = Guest::gather_in(
+        &mut w.mem,
+        schema::Class::Modeset,
+        table,
+        modeset,
+        0,
+        NVKMS,
+        0x1000,
+    )
+    .unwrap();
+    let r = w.send_with(g, 0, |be| be.close_handle(kms).unwrap());
+    assert_eq!(r, Ok(-libc::EPERM));
+    assert_eq!(
+        w.fake.0.lock().unwrap().nvkms,
+        vec![0, 41, 11],
+        "the granted MOVE_CURSOR of grant_head_1, and nothing since"
+    );
+
+    // A revocation that concerns no grant costs a queued call nothing.
+    let mut w = nvkms_world();
+    let modeset = w.modeset;
+    grant_head_1(&mut w);
+    let table = w.be.driver.and_then(schema::modeset_table);
+    nvkms_call(&mut w, 11, &cursor(1));
+    let g = Guest::gather_in(
+        &mut w.mem,
+        schema::Class::Modeset,
+        table,
+        modeset,
+        0,
+        NVKMS,
+        0x1000,
+    )
+    .unwrap();
+    let render = w.render;
+    let r = w.send_with(g, 0, |be| be.close_handle(render).unwrap());
+    assert_eq!(r, Ok(0));
 }
 
 /// The host takes a lease back without a word to the lessee's file -- the

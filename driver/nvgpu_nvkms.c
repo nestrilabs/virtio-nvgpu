@@ -117,12 +117,20 @@ static int nvgpu_nvkms_dmabuf(struct nvgpu_device *dev, int fd, u32 *handle,
   if (IS_ERR(buf))
     return -EBADF;
   ret = nvgpu_dmabuf_to_host(dev, buf, &owner, &gem);
-  dma_buf_put(buf);
-  if (ret < 0)
+  if (ret < 0) {
+    dma_buf_put(buf);
     return -EBADF;
+  }
   args[0] = owner;
   args[1] = gem;
   ret = nvgpu_host_op(dev, NVGPU_OP_PRIME_EXPORT, args, 2, res, 2);
+  /*
+   * Only now: the dma-buf holds the proxy, whose (owner, gem) the export
+   * names, and a last close before it ran would have let the host give the
+   * number to an object the caller was never given (S-25). The host's own
+   * dma-buf pins the object from here.
+   */
+  dma_buf_put(buf);
   if (ret < 0)
     return ret;
   *handle = res[0];

@@ -12,6 +12,7 @@
 #include <linux/completion.h>
 #include <linux/fs.h>
 #include <linux/kobject.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
@@ -133,6 +134,16 @@ struct nvgpu_pci_root {
 };
 
 struct nvgpu_device {
+  /*
+   * Everything that names this struct and can outlive remove() holds a
+   * reference (nvgpu_dev_get()): an open file of any of our nodes, a
+   * Wayland device, a guest file standing for a backend handle, a host
+   * fence's and a syncobj wait's event consumer, an RM mapping's vmas.
+   * remove() drops the probe's, and the last put frees it. After remove()
+   * the transport is gone (xfer and events NULL), so what they still do
+   * with it fails -ENODEV instead of touching freed memory (S-26).
+   */
+  struct kref ref;
   /*
    * Where the VMM placed the window, read out of this device's own shared
    * memory region. Zero-length when the VMM offers none, in which case device
@@ -381,6 +392,11 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
 int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
 /* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
+bool nvgpu_xfer_dead(struct nvgpu_device *dev);
+void nvgpu_fence_wake_waiters(void);
+void nvgpu_dev_get(struct nvgpu_device *dev);
+/* Any context: the last put only frees memory. */
+void nvgpu_dev_put(struct nvgpu_device *dev);
 void nvgpu_fd_register(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_get(struct nvgpu_fd *nfd);
@@ -399,13 +415,15 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
  * reference on `owner`. On failure the host handle has already been closed
  * (by the proxy's own free, where one was made): the caller must not close it
  * again -- except for -EEXIST, which means a proxy for that host handle
- * already exists and the handle is left alone, being that proxy's.
+ * already exists and the handle is left alone, being that proxy's, and
+ * -EAGAIN, which means one on its way out does (nvgpu_gem_dying()).
  */
 int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            u32 host_handle, size_t size, u32 *guest_handle);
-/* Guest handle in `file` -> (host GEM handle, owner backend handle). */
-int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
-                      u32 *host_handle, u32 *owner_handle);
+/* drm_gem_object_put() as a release callback (nvgpu_tbuf_on_free(),
+ * nvgpu_i2_hold()): the reference that keeps a proxy's host handle its own
+ * while a request names it. */
+void nvgpu_gem_put_ref(void *obj);
 /*
  * The proxy already standing for host GEM handle `host_handle` of `owner`'s
  * render file, with a reference taken, or NULL. nvgpu_gem_proxy_create()
@@ -415,6 +433,18 @@ int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
  */
 struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
                                             u32 host_handle);
+/*
+ * One proxy per host handle, until it is closed (S-11): a proxy whose last
+ * reference is gone stays in `owner`'s index until its GEM_CLOSE has gone
+ * out. A host handle it holds is neither found nor adoptable -- a PRIME
+ * import that returns it gets -EAGAIN -- and is nobody else's to close.
+ * Whoever meets one waits it out and asks the host again.
+ */
+bool nvgpu_gem_dying(struct nvgpu_fd *owner, u32 h);
+int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h);
+/* Whether a proxy, alive or dying, holds host GEM `gem` of backend handle
+ * `render` (for the reaper, which has only the numbers). */
+bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem);
 /* A proxy's fake mmap offset in this node (MAP_DUMB, GEM_MAP_OFFSET). */
 int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
                           u64 *offset);
@@ -608,6 +638,10 @@ struct nvgpu_schema_set;
 struct nvgpu_tbuf;
 struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);
 void nvgpu_tbuf_free(struct nvgpu_tbuf *tb);
+/* Run fn(arg) when `tb` is freed -- for a request buffer, once the host can
+ * no longer act on it, even if its caller gave up (S-25). */
+void nvgpu_tbuf_on_free(struct nvgpu_tbuf *tb, void (*fn)(void *arg),
+                        void *arg);
 size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb);
 int nvgpu_tbuf_write(struct nvgpu_tbuf *tb, size_t off, const void *src,
                      size_t len);
@@ -664,6 +698,11 @@ int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
                     void *resp, int resp_len);
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
                          void *resp, int resp_len, u32 *used_len);
+/* nvgpu_send_recv_used(), with release(arg) run once the host can no longer
+ * act on the request (see nvgpu_tbuf_on_free()); always run, failure or not. */
+int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
+                            void *resp, int resp_len, u32 *used_len,
+                            void (*release)(void *arg), void *arg);
 /* Does a response of `used` bytes contain all of [off, off + len)? */
 static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
   return off <= used && len <= used - off;
@@ -825,6 +864,15 @@ struct nvgpu_i2_call {
   s32 ret;                 /* host ioctl result */
   struct nvgpu_i2_state *st; /* interpreter-private, valid during hooks */
 };
+
+/*
+ * For a gem_in or fd_in hook: keep `obj` (a reference the hook took) until
+ * the host is done with the request, then put(obj) -- after the reply, or,
+ * for a request its caller gave up on, once the transport knows it can no
+ * longer run. On failure put(obj) has run already.
+ */
+int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
+                  void *obj);
 
 /* Is there a schema for this call? (Used to decide whether to intercept.) */
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,

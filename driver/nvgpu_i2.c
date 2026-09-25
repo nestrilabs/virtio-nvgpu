@@ -78,7 +78,17 @@ struct nvgpu_i2_out {
   u64 size;
 };
 
+/* What nvgpu_i2_hold() was given, released with the request (S-25). */
+struct nvgpu_i2_held {
+  u32 n;
+  struct {
+    void (*put)(void *obj);
+    void *obj;
+  } e[NVGPU_I2_MAX_RECS];
+};
+
 struct nvgpu_i2_state {
+  struct nvgpu_i2_held *held;
   const struct nvgpu_stable *t;
   const struct nvgpu_sioctl *e;
   bool kernel; /* nvgpu_i2_call.kernel: every address is a kernel one */
@@ -1011,9 +1021,36 @@ static int nvgpu_i2_gather(struct nvgpu_i2_call *call) {
   return 0;
 }
 
+static void nvgpu_i2_release_held(void *arg) {
+  struct nvgpu_i2_held *h = arg;
+  u32 i;
+
+  for (i = 0; i < h->n; i++)
+    h->e[i].put(h->e[i].obj);
+  kfree(h);
+}
+
+int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
+                  void *obj) {
+  struct nvgpu_i2_state *st = call->st;
+
+  if (!st->held)
+    st->held = kzalloc(sizeof(*st->held), GFP_KERNEL);
+  if (!st->held || st->held->n >= NVGPU_I2_MAX_RECS) {
+    put(obj);
+    return st->held ? -E2BIG : -ENOMEM;
+  }
+  st->held->e[st->held->n].put = put;
+  st->held->e[st->held->n].obj = obj;
+  st->held->n++;
+  return 0;
+}
+
 static void nvgpu_i2_free(struct nvgpu_i2_state *st) {
   u32 i;
 
+  if (st->held)
+    nvgpu_i2_release_held(st->held);
   for (i = 0; i < st->nbuf; i++)
     kvfree(st->buf[i].k);
   kvfree(st);
@@ -1068,6 +1105,12 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
   if (!req || !resp) {
     ret = -ENOMEM;
     goto drop;
+  }
+  /* What the request names is held as long as the request is: past a
+   * timeout or a signal too, until the transport knows it is done. */
+  if (st->held) {
+    nvgpu_tbuf_on_free(req, nvgpu_i2_release_held, st->held);
+    st->held = NULL;
   }
   ret = nvgpu_i2_build(call, req);
   if (ret)

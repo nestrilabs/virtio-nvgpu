@@ -25,7 +25,7 @@ use crate::kms;
 use crate::nvkms::NvkmsPolicy;
 use crate::schema::policy;
 use crate::semsurf::{self, SemsurfPolicy};
-use crate::xfer::{Errno, Hooks, Prepared, PropKind};
+use crate::xfer::{Errno, Hooks, Prepared, PropKind, RunGuard};
 
 /// The one policy object the backend hands every IOCTL2 (`Env::hooks`).
 ///
@@ -208,6 +208,15 @@ impl Hooks for BackendHooks {
         if p.policy() & (policy::GRANT | policy::REVOKE | policy::NVKMS) != 0 {
             self.nvkms_after(p, ret);
         }
+    }
+
+    /// Only the NVKMS section gives calls a run gate (its head and dpy
+    /// gates, re-checked where the call runs: S-14).
+    fn at_run<'a>(&'a self, p: &Prepared) -> Result<Option<RunGuard<'a>>, Errno> {
+        if p.policy() & policy::NVKMS != 0 {
+            return self.nvkms.at_run(p);
+        }
+        Ok(None)
     }
 }
 

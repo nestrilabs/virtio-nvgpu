@@ -316,6 +316,20 @@ def layout(d):
     alloc = g('ALLOC_DEVICE')
     af = fields_of(alloc)
     dyn = g('QUERY_DPY_DYNAMIC_DATA')
+    dynf = fields_of(dyn)
+    # The GPU an open's device is: deviceId (535) or deviceId.rmDeviceId
+    # (a struct from 580 on), its first member either way.
+    alloc_id = next((n for n in af if n['path'] in
+                     ('request.deviceId', 'request.deviceId.rmDeviceId')), None)
+    if alloc_id is None:
+        raise DataError(where('ALLOC_DEVICE', 'no request.deviceId'))
+    dyn_disp = find('QUERY_DPY_DYNAMIC_DATA', dynf, 'request.dispHandle')['off']
+    # The extractor lists no deviceHandle for this request; it is the
+    # struct's first member, as in every NVKMS request that names a device,
+    # and dispHandle follows it.
+    if dyn_disp != 4:
+        raise DataError(where('QUERY_DPY_DYNAMIC_DATA', 'dispHandle is not at 4'))
+    nev = g('GET_NEXT_EVENT')
 
     lp = g('SET_LAYER_POSITION')
     lpf = fields_of(lp)
@@ -352,6 +366,12 @@ def layout(d):
         # Every override flag and the EDID: nvDpyGetDynamicData stores them
         # in the dpy, which outlives the call (nvkms-dpy.c:3055-3160).
         'dpy_dynamic_scrub': ranges(dyn, lambda n: n['role'] == 'policy'),
+        # Which dpy a QUERY_DPY_DYNAMIC_DATA probes, and its reply half: what
+        # the backend answers a repeated probe with (S-8).
+        'dpy_dynamic': {'device': 0, 'disp': dyn_disp,
+                        'what': find('QUERY_DPY_DYNAMIC_DATA', dynf, 'request.dpyId')['off']},
+        'dpy_dynamic_reply': (dyn['reply']['offset'], dyn['reply']['size']),
+        'alloc_device_id': alloc_id['off'],
         'set_cursor_image': target(g('SET_CURSOR_IMAGE'), 'request.head'),
         'move_cursor': target(g('MOVE_CURSOR'), 'request.head'),
         'set_lut': target(g('SET_LUT'), 'request.head'),
@@ -410,6 +430,13 @@ def layout(d):
         'events_allowed': sum(1 << ev[e] for e in EVENTS_ALLOWED),
         'next_event_valid': find('GET_NEXT_EVENT', fields_of(g('GET_NEXT_EVENT')),
                                  'reply.valid')['off'],
+        # reply.event.eventType, the event's first member, and the events
+        # after which a dpy's dynamic data may have changed.
+        'next_event_type': find('GET_NEXT_EVENT', fields_of(nev), 'reply.event')['off'],
+        'dpy_events': sum(1 << ev[e] for e in (
+            'NVKMS_EVENT_TYPE_DPY_CHANGED',
+            'NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED',
+            'NVKMS_EVENT_TYPE_DYNAMIC_DPY_DISCONNECTED')),
         'drm_grant_typed': drm['GRANT_PERMISSIONS']['size'] == 12,
     }
 
