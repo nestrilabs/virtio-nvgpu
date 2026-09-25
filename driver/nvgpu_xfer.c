@@ -1817,8 +1817,11 @@ void nvgpu_ev_unregister(struct nvgpu_device *dev,
   spin_unlock_irqrestore(&ev->lock, flags);
 }
 
+/* 0 once the device is gone, which no WATCH or registration accepts. */
 u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev) {
-  return (u64)atomic64_inc_return(&dev->events->next_cookie);
+  struct nvgpu_events *ev = dev->events;
+
+  return ev ? (u64)atomic64_inc_return(&ev->next_cookie) : 0;
 }
 
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
@@ -1826,6 +1829,14 @@ bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
   unsigned long flags;
   bool attached;
 
+  if (!ev) {
+    /* The device is gone, and with it every event delivery. */
+    attached = nfd->drm_file != NULL;
+    WRITE_ONCE(nfd->drm_file, NULL);
+    *kms_handle = nfd->kms_handle;
+    nfd->kms_handle = 0;
+    return attached;
+  }
   spin_lock_irqsave(&ev->lock, flags);
   attached = nfd->drm_file != NULL;
   WRITE_ONCE(nfd->drm_file, NULL);
@@ -1919,6 +1930,17 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
   return 0;
 }
 
+/*
+ * Whether nothing sent from here will ever be answered: after a reset or
+ * remove(). For sleepers the transport cannot wake itself. Callers are
+ * inside drm_dev_enter() or otherwise before nvgpu_xfer_destroy().
+ */
+bool nvgpu_xfer_dead(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = READ_ONCE(dev->xfer);
+
+  return !xf || READ_ONCE(xf->dead);
+}
+
 void nvgpu_xfer_quiesce(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = dev->xfer;
 
@@ -1943,6 +1965,7 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
   spin_unlock_irqrestore(&xf->lock, flags);
   wake_up_all(&xf->space_wq);
   wake_up_all(&xf->exec_wq);
+  nvgpu_fence_wake_waiters();
   cancel_delayed_work_sync(&xf->sync_work);
 
   /* After the reset nothing on the ring will ever be answered. */

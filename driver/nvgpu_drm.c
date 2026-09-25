@@ -802,8 +802,8 @@ static phys_addr_t nvgpu_gem_phys(struct nvgpu_gem_object *ng) {
  * nvidia-drm object that is write-combining (drm_gem_mmap_obj), which the
  * placement's reply says.
  */
-static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
-                                 struct vm_area_struct *vma) {
+static int __nvgpu_gem_object_mmap(struct drm_gem_object *obj,
+                                   struct vm_area_struct *vma) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
   unsigned long size = vma->vm_end - vma->vm_start;
   unsigned long node_start = drm_vma_node_start(&obj->vma_node);
@@ -842,6 +842,18 @@ static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
   return io_remap_pfn_range(vma, vma->vm_start,
                             (nvgpu_gem_phys(ng) + within) >> PAGE_SHIFT, size,
                             vma->vm_page_prot);
+}
+
+/* Not after remove(): the window is the device's (see the ioctl entry). */
+static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
+                                 struct vm_area_struct *vma) {
+  int ret, idx;
+
+  if (!drm_dev_enter(obj->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_gem_object_mmap(obj, vma);
+  drm_dev_exit(idx);
+  return ret;
 }
 
 /*
@@ -1646,6 +1658,8 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
     goto err;
   }
 
+  /* Put by the last nvgpu_fd_put(), which may come after remove(). */
+  nvgpu_dev_get(dev);
   nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
   kfree(req);
@@ -1748,8 +1762,8 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
  *   type 'F'                              NVIDIA RM, proxied to the host like
  *                                         on any other node.
  */
-static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
-                                     unsigned long arg) {
+static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
+                                       unsigned long arg) {
   struct drm_file *file = filp->private_data;
   struct nvgpu_fd *nfd;
   unsigned int nr = _IOC_NR(cmd);
@@ -1809,6 +1823,26 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
   }
 
   return nvgpu_ioctl_fd(nfd, cmd, arg);
+}
+
+/*
+ * Every ioctl inside drm_dev_enter(): remove() unplugs the node
+ * (nvgpu_dri_cleanup()) after failing every waiter and before the transport
+ * is freed, and waits there for any ioctl still inside, so none can reach a
+ * transport that is going (S-26). A file opened before stays open and gets
+ * -ENODEV.
+ */
+static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
+                                     unsigned long arg) {
+  struct drm_file *file = filp->private_data;
+  long ret;
+  int idx;
+
+  if (!file || !drm_dev_enter(file->minor->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_drm_unlocked_ioctl(filp, cmd, arg);
+  drm_dev_exit(idx);
+  return ret;
 }
 
 static const struct file_operations nvgpu_drm_fops = {
@@ -1996,8 +2030,11 @@ void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
       continue;
 
     /* The core owns the node and everything under it, including the sysfs
-     * tree this used to build by hand. */
-    drm_dev_unregister(dri->drm);
+     * tree this used to build by hand. Unplugged, not just unregistered:
+     * files opened before stay open, and from here every ioctl and mmap on
+     * them fails -ENODEV instead of reaching a transport about to be freed;
+     * this waits for any still inside (drm_dev_enter()). */
+    drm_dev_unplug(dri->drm);
     drm_dev_put(dri->drm);
     dri->drm = NULL;
     dri->registered = false;

@@ -12,6 +12,7 @@
 #include <linux/completion.h>
 #include <linux/fs.h>
 #include <linux/kobject.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
@@ -133,6 +134,16 @@ struct nvgpu_pci_root {
 };
 
 struct nvgpu_device {
+  /*
+   * Everything that names this struct and can outlive remove() holds a
+   * reference (nvgpu_dev_get()): an open file of any of our nodes, a
+   * Wayland device, a guest file standing for a backend handle, a host
+   * fence's and a syncobj wait's event consumer, an RM mapping's vmas.
+   * remove() drops the probe's, and the last put frees it. After remove()
+   * the transport is gone (xfer and events NULL), so what they still do
+   * with it fails -ENODEV instead of touching freed memory (S-26).
+   */
+  struct kref ref;
   /*
    * Where the VMM placed the window, read out of this device's own shared
    * memory region. Zero-length when the VMM offers none, in which case device
@@ -381,6 +392,11 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
 int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
 /* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
+bool nvgpu_xfer_dead(struct nvgpu_device *dev);
+void nvgpu_fence_wake_waiters(void);
+void nvgpu_dev_get(struct nvgpu_device *dev);
+/* Any context: the last put only frees memory. */
+void nvgpu_dev_put(struct nvgpu_device *dev);
 void nvgpu_fd_register(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_get(struct nvgpu_fd *nfd);

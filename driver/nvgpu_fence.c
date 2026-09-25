@@ -109,11 +109,20 @@ static void nvgpu_fence_bury(struct nvgpu_fence_ev *e) {
   spin_unlock_irqrestore(&nvgpu_fence_dead_lock, flags);
 }
 
-/* Process context only. */
+/*
+ * Process context only. A registered consumer holds its device (taken with
+ * the registration): a buried one may be retired long after remove(), by
+ * whoever reaps next, and a syncobj wait's can outlive every file (S-26).
+ */
 static void nvgpu_fence_ev_retire(struct nvgpu_fence_ev *e) {
-  if (e->registered)
-    nvgpu_ev_unregister(e->dev, &e->c);
+  struct nvgpu_device *dev = e->dev;
+  bool registered = e->registered;
+
+  if (registered)
+    nvgpu_ev_unregister(dev, &e->c);
   e->free(e);
+  if (registered)
+    nvgpu_dev_put(dev);
 }
 
 static void nvgpu_fence_reap(void) {
@@ -181,8 +190,10 @@ static void nvgpu_host_fence_release(struct dma_fence *base) {
   xa_lock_irqsave(&nvgpu_host_fences, flags);
   __xa_erase(&nvgpu_host_fences, f->ev->id);
   xa_unlock_irqrestore(&nvgpu_host_fences, flags);
-  nvgpu_fence_bury(f->ev);
+  /* Before the burial: the consumer's device reference is what keeps
+   * f->dev alive, and a reap on another CPU may retire it at once. */
   nvgpu_close_handle_async(f->dev, f->handle);
+  nvgpu_fence_bury(f->ev);
   dma_fence_free(base);
   module_put(THIS_MODULE);
 }
@@ -325,6 +336,7 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
   ret = nvgpu_ev_register(dev, &e->c, NVGPU_EVKEY_COOKIE(cookie));
   if (ret)
     goto put;
+  nvgpu_dev_get(dev); /* the registration's, put at retire */
   e->registered = true;
   ret = nvgpu_watch(dev, handle, NVGPU_W_FENCE | NVGPU_W_ONESHOT, cookie);
   if (ret) {
@@ -739,6 +751,10 @@ static DECLARE_WAIT_QUEUE_HEAD(nvgpu_sowait_wq);
 /* TRANSFER's WAIT_FOR_SUBMIT waits this long (drm_syncobj.c:420). */
 #define NVGPU_SOWAIT_SUBMIT_NS (5 * NSEC_PER_SEC)
 
+/* The transport died: every guest syncobj waiter looks again (and finds
+ * nvgpu_xfer_dead()). */
+void nvgpu_fence_wake_waiters(void) { wake_up_all(&nvgpu_sowait_wq); }
+
 static void nvgpu_sowait_free(struct nvgpu_fence_ev *e) {
   kfree(container_of(e, struct nvgpu_sowait, ev));
 }
@@ -818,6 +834,7 @@ static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
     kfree(s);
     return ERR_PTR(ret);
   }
+  nvgpu_dev_get(dev); /* the registration's, put at retire */
   s->ev.registered = true;
   spin_lock_irqsave(&nvgpu_sowait_lock, flags);
   hash_add(nvgpu_sowaits, &s->node, cookie);
@@ -1065,8 +1082,11 @@ static long nvgpu_sowait_run(struct nvgpu_sowait_wait *w, s64 timeout_nsec) {
       ret = nvgpu_sowait_poll(w);
       if (ret != -ETIME)
         break;
+      /* Or the device is going: the next poll then fails at once, and
+       * remove() is not kept waiting on this ioctl (S-26). */
       ret = wait_event_interruptible_timeout(
-          nvgpu_sowait_wq, nvgpu_sowait_progress(w),
+          nvgpu_sowait_wq,
+          nvgpu_sowait_progress(w) || nvgpu_xfer_dead(w->p.nfd->dev),
           nvgpu_sowait_left(forever, end));
       if (ret < 0)
         break;

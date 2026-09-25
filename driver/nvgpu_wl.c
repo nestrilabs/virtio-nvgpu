@@ -59,7 +59,9 @@ MODULE_IMPORT_NS("DMA_BUF");
  * misc device, but files opened before that still name this struct until
  * they are released. The open takes its reference under misc_mtx, which
  * misc_deregister() also takes (drivers/char/misc.c:125-165, 284-293), so no
- * open can find it once cleanup has dropped the initial one.
+ * open can find it once cleanup has dropped the initial one. And it holds
+ * the nvgpu_device, which such a file's release and ioctls use, until it
+ * goes itself: remove() alone would free it under them (S-26).
  */
 struct nvgpu_wl_dev {
   struct miscdevice misc;
@@ -69,7 +71,10 @@ struct nvgpu_wl_dev {
 };
 
 static void nvgpu_wl_dev_free(struct kref *ref) {
-  kfree(container_of(ref, struct nvgpu_wl_dev, ref));
+  struct nvgpu_wl_dev *wl = container_of(ref, struct nvgpu_wl_dev, ref);
+
+  nvgpu_dev_put(wl->dev);
+  kfree(wl);
 }
 
 static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
@@ -886,6 +891,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   else
     snprintf(wl->name, sizeof(wl->name), "nvgpu-wl%d", slot);
   wl->dev = dev;
+  nvgpu_dev_get(dev);
   kref_init(&wl->ref);
   wl->misc.minor = MISC_DYNAMIC_MINOR;
   wl->misc.name = wl->name;
@@ -899,7 +905,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
     mutex_unlock(&nvgpu_wl_devs_lock);
     dev_warn(&dev->vdev->dev, "virtio-gpu-nv: /dev/%s: misc_register: %d\n",
              wl->name, ret);
-    kfree(wl);
+    kref_put(&wl->ref, nvgpu_wl_dev_free);
     return ret;
   }
   nvgpu_wl_devs[slot] = wl;

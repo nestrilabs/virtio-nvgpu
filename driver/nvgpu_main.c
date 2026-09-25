@@ -1288,6 +1288,8 @@ static void nvgpu_vma_map_release(struct kref *ref) {
   struct nvgpu_vma_map *m = container_of(ref, struct nvgpu_vma_map, ref);
 
   nvgpu_munmap(m->dev, m->handle, m->mapping_id);
+  /* The vmas outlive the file, and may outlive the device. */
+  nvgpu_dev_put(m->dev);
   kfree(m);
 }
 
@@ -1457,6 +1459,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
 
   kref_init(&m->ref);
   m->dev = nfd->dev;
+  nvgpu_dev_get(m->dev);
   m->handle = nfd->handle;
   m->mapping_id = mapping_id;
   vma->vm_ops = &nvgpu_vm_ops;
@@ -1498,16 +1501,29 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev,
 
 void nvgpu_fd_get(struct nvgpu_fd *nfd) { refcount_inc(&nfd->ref); }
 
+void nvgpu_dev_get(struct nvgpu_device *dev) { kref_get(&dev->ref); }
+
+static void nvgpu_dev_release(struct kref *ref) {
+  kfree(container_of(ref, struct nvgpu_device, ref));
+}
+
+void nvgpu_dev_put(struct nvgpu_device *dev) {
+  kref_put(&dev->ref, nvgpu_dev_release);
+}
+
 /*
  * The last reference: the host file goes too. Always from process context --
  * a file's release, a DRM postclose, or a GEM proxy's free, which the core
  * runs from the last handle close or dma-buf release.
  */
 void nvgpu_fd_put(struct nvgpu_fd *nfd) {
+  struct nvgpu_device *dev = nfd->dev;
+
   if (!refcount_dec_and_test(&nfd->ref))
     return;
-  nvgpu_close_handle(nfd->dev, nfd->handle);
+  nvgpu_close_handle(dev, nfd->handle);
   kfree(nfd);
+  nvgpu_dev_put(dev); /* taken when the open succeeded */
 }
 
 static int nvgpu_open_common(struct inode *inode, struct file *filp,
@@ -1558,6 +1574,9 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
+  /* The file pins the device, cdevs included (they are in it), until its
+   * last nvgpu_fd_put(). */
+  nvgpu_dev_get(dev);
   nvgpu_fd_register(nfd->dev, nfd);
   filp->private_data = nfd;
   kfree(req);
@@ -2841,9 +2860,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev_t gpu_devno;
   int ret, i;
 
-  dev = devm_kzalloc(&vdev->dev, sizeof(*dev), GFP_KERNEL);
+  /* Not devm: open files and objects may outlive remove(), and every one of
+   * them names this (see struct nvgpu_device's ref). */
+  dev = kzalloc(sizeof(*dev), GFP_KERNEL);
   if (!dev)
     return -ENOMEM;
+  kref_init(&dev->ref);
 
   dev->vdev = vdev;
   vdev->priv = dev;
@@ -2852,8 +2874,11 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   /* Find virtqueues */
   ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
-  if (ret)
+  if (ret) {
+    vdev->priv = NULL;
+    nvgpu_dev_put(dev);
     return ret;
+  }
 
   dev->ctrl_vq = vqs[0];
   dev->event_vq = vqs[1];
@@ -3094,6 +3119,8 @@ err_xfer:
 err_vqs:
   vdev->config->del_vqs(vdev);
   nvgpu_xfer_destroy(dev);
+  vdev->priv = NULL;
+  nvgpu_dev_put(dev);
   return ret;
 }
 
@@ -3148,6 +3175,9 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   nvgpu_xfer_destroy(dev);
 
   remove_proc_subtree("driver/nvidia", NULL);
+  /* Freed with the last open file or object that names it, if not now. */
+  vdev->priv = NULL;
+  nvgpu_dev_put(dev);
 }
 
 /* ───────── Module boilerplate ───────── */
