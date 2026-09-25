@@ -56,8 +56,19 @@ fn main() {
         cfg.card = card;
         cfg.render = render;
         cfg.export_to = export.as_deref().map(socket_path).transpose()?;
-        let mut d = Daemon::new(cfg.clone(), Box::new(DevConnector { path: device }))
-            .map_err(|e| e.to_string())?;
+        let path = device.clone();
+        let mut d = Daemon::new(cfg.clone(), Box::new(DevConnector { path: device })).map_err(
+            |e| match e.kind() {
+                // The node is 0660 root:root unless udev gives it a group
+                // (scripts/70-nvgpu-wl.rules).
+                std::io::ErrorKind::PermissionDenied => format!(
+                    "{}: {e}; run as a member of the group the node belongs to \
+                     (scripts/70-nvgpu-wl.rules makes it nvgpu-wl)",
+                    path.display()
+                ),
+                _ => e.to_string(),
+            },
+        )?;
         unsafe {
             libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
             libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);

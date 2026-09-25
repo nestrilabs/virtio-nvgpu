@@ -89,7 +89,13 @@ struct nvgpu_wl_hello {
   struct nvgpu_wl_devmap dev[NVGPU_WL_MAX_DEVMAP];
 };
 
-/* ── CONNECT ── */
+/* ── CONNECT ──
+ *
+ * One LISTEN per device at a time (-EBUSY while another file holds it), and
+ * ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN (-EACCES;
+ * -ENOTCONN with no listener): whoever accepts a host program becomes its
+ * compositor. -EMFILE: the VM has as many channels as its backend allows.
+ */
 
 #define NVGPU_WL_CONNECT 0 /* a new connection to the host compositor        */
 #define NVGPU_WL_LISTEN 1  /* export mode: poll() says a host client waits   */
