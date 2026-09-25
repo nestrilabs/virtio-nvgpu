@@ -2299,6 +2299,14 @@ impl NvidiaBackend {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                     }
                 };
+                // Exactly the block the host's UVM copies each way
+                // (abi::schema::uvm_table, the table the guest sizes the
+                // call by): UVM's numbers carry no size, so a short block
+                // would have the host read and write past what the guest
+                // sent, and a long one is not this release's command.
+                if let Err(errno) = self.uvm_size_ok(ireq.cmd, params.len()) {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
                 // The descriptor some commands name another file by
                 // (uvmfd.rs): our handle, as the guest driver sent it, becomes
                 // our descriptor for the call and the handle again in the
@@ -3789,6 +3797,32 @@ impl NvidiaBackend {
     /// is not a handle of the kind the field names -- an RM control file, or
     /// a UVM file -- is refused rather than handed to the host as a number
     /// in our table.
+    /// Whether `len` is the size of UVM command `cmd`'s parameters on the
+    /// host's release: EPERM for a command this release has no row for (or
+    /// a host with no table at all), EINVAL for another size.
+    fn uvm_size_ok(&self, cmd: u32, len: usize) -> std::result::Result<(), i32> {
+        let Some(c) = self
+            .driver
+            .and_then(abi::schema::uvm_table)
+            .and_then(|t| t.lookup(cmd))
+        else {
+            log::warn!(
+                "UVM command {cmd:#x} refused: not in the UVM table of host driver {:?}",
+                self.driver
+            );
+            return Err(libc::EPERM);
+        };
+        if len != c.size as usize {
+            log::warn!(
+                "UVM {} ({cmd:#x}): {len} bytes, not the {} its parameters are",
+                c.name,
+                c.size
+            );
+            return Err(libc::EINVAL);
+        }
+        Ok(())
+    }
+
     fn uvm_fd_in(
         &self,
         cmd: u32,
@@ -5486,6 +5520,7 @@ mod tests {
         let mut be = NvidiaBackend::for_test();
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_uvm);
+        be.set_host_driver_version("610.57.04");
         let primary_fd = devnull();
         let primary_raw = primary_fd.as_raw_fd();
         let primary = be.adopt_for_test(primary_fd, HandleKind::Dev(DeviceKind::Uvm));
@@ -5516,6 +5551,46 @@ mod tests {
         p[..4].copy_from_slice(&(-1i32).to_le_bytes());
         v1_ioctl(&mut be, second, 75, &p);
         assert_eq!(UVM_FD_SEEN.with(|s| s.take()), Some(-1));
+    }
+
+    /// UVM copies exactly sizeof its parameters each way, and its numbers
+    /// say nothing of that size: a block must be the size the host's release
+    /// has for the command, and a command the release lacks goes nowhere.
+    #[test]
+    fn a_uvm_block_must_be_the_size_the_hosts_release_copies() {
+        let uvm_backend = |version: &str| {
+            let mut be = NvidiaBackend::for_test();
+            be.set_host_nodes_for_test(Vec::new(), Vec::new());
+            be.set_host_ioctl_for_test(fake_uvm);
+            be.set_host_driver_version(version);
+            let h = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
+            (be, h)
+        };
+        // UVM_FREE lost its length in 590.44.01: 24 bytes before, 16 after.
+        let (mut be, uvm) = uvm_backend("610.57.04");
+        for (len, want) in [(16, 0), (24, -libc::EINVAL), (8, -libc::EINVAL)] {
+            let r = v1_ioctl(&mut be, uvm, 34, &vec![0u8; len]);
+            assert_eq!(parse_resp(&r).status, want, "FREE, {len} bytes on 610");
+        }
+        // UVM_INITIALIZE's number says 0x3000; its block is 16 bytes.
+        let r = v1_ioctl(&mut be, uvm, 0x3000_0001, &[0u8; 0x3000]);
+        assert_eq!(parse_resp(&r).status, -libc::EINVAL);
+        let r = v1_ioctl(&mut be, uvm, 0x3000_0001, &[0u8; 16]);
+        assert_eq!(parse_resp(&r).status, 0);
+
+        let (mut be, uvm) = uvm_backend("580.95.05");
+        let r = v1_ioctl(&mut be, uvm, 34, &[0u8; 24]);
+        assert_eq!(parse_resp(&r).status, 0, "FREE, 24 bytes on 580");
+        // DISCARD (80) came in 580.65.06; 535 has no such command.
+        let (mut be, uvm) = uvm_backend("535.129.03");
+        let r = v1_ioctl(&mut be, uvm, 80, &[0u8; 32]);
+        assert_eq!(parse_resp(&r).status, -libc::EPERM);
+        // And a host with no table refuses them all.
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_uvm);
+        let uvm = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
+        let r = v1_ioctl(&mut be, uvm, 34, &[0u8; 16]);
+        assert_eq!(parse_resp(&r).status, -libc::EPERM);
     }
 
     /// S-33: a display file's handle-table descriptor is closed by the

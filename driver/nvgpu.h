@@ -211,6 +211,7 @@ struct nvgpu_device {
   struct nvgpu_xfer *xfer;     /* transport state: contexts, ring lock, clock */
   struct nvgpu_events *events; /* v2 event consumers: handle/cookie registry  */
   const struct nvgpu_schema_set *schema; /* selected at probe for driver_version */
+  const struct nvgpu_uvm_table *uvm;     /* likewise, v1 or v2; NULL: none */
 };
 
 /*
@@ -626,6 +627,7 @@ unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
 struct nvgpu_xfer;
 struct nvgpu_events;
 struct nvgpu_schema_set;
+struct nvgpu_uvm_table;
 
 /* ── Transport buffers ──
  *
@@ -896,5 +898,7 @@ void *nvgpu_i2_buf(struct nvgpu_i2_call *call, u32 buf, u32 *len);
 
 /* Selects the schema set for the host driver version (NULL: none). */
 const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version);
+/* The UVM block sizes for the host driver version (NULL: UVM refused). */
+const struct nvgpu_uvm_table *nvgpu_uvm_select(const char *driver_version);
 
 #endif /* NVGPU_H */

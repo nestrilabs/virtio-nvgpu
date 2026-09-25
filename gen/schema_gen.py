@@ -6,6 +6,9 @@ One source (gen/schema/*.py), two outputs that must never disagree:
     driver/gen/nvgpu_schema.h        the guest's tables (C)
     gen/src/schema/generated.rs      the backend's tables (Rust, crate abi)
 
+and, beside the schema, the size of every UVM command's parameter block per
+range of host releases (gen/schema/uvm.py, from gen/uvm/*.json).
+
 Usage (from anywhere):
 
     gen/schema_gen.py                 regenerate both, in place
@@ -49,7 +52,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from schema import drm_kms, drm_render, formats, nvidia_drm, nvkms  # noqa: E402
+from schema import drm_kms, drm_render, formats, nvidia_drm, nvkms, uvm  # noqa: E402
 from schema.lang import *  # noqa: E402,F403
 
 C_OUT = Path('driver/gen/nvgpu_schema.h')
@@ -490,6 +493,23 @@ struct nvgpu_schema_set {{
   const struct nvgpu_stable *modeset; /* NULL: no table for this host */
 }};
 
+/*
+ * A UVM command the backend lets through, and the size of its parameter
+ * block on the host's release (gen/schema/uvm.py): UVM's ioctl numbers carry
+ * none, and the host copies exactly this many bytes each way.
+ */
+struct nvgpu_uvm_cmd {{
+  u32 cmd; /* the whole number, as UVM's callers pass it */
+  u32 size;
+}};
+
+struct nvgpu_uvm_table {{
+  const char *name;
+  u32 vmin, vmax; /* NVGPU_SCHEMA_VERSION */
+  const struct nvgpu_uvm_cmd *cmds; /* by cmd */
+  u32 ncmds;
+}};
+
 #ifdef NVGPU_SCHEMA_TABLES
 '''
 
@@ -644,8 +664,27 @@ def emit_c(tables, max_depth):
     for t in mods:
         out.append(f'  {{.drm = &{drm}, .modeset = &{c_sym(t)}}},')
     out.append('};\n')
+    out += emit_c_uvm()
     out.append('#endif /* NVGPU_SCHEMA_TABLES */\n\n#endif /* NVGPU_SCHEMA_H */')
     return '\n'.join(out) + '\n'
+
+
+def emit_c_uvm():
+    out = []
+    for t in uvm.TABLES:
+        out.append(f'static const struct nvgpu_uvm_cmd nvgpu_uvm_{t.name}[] = {{')
+        for c in t.commands:
+            out.append(f'  {{0x{c["cmd"]:08x}u, {c["size"]}}}, /* {c["name"]} */')
+        out.append('};\n')
+    out.append('/* One per range of host releases; none before the first. */')
+    out.append('static const struct nvgpu_uvm_table nvgpu_uvm_tables[] = {')
+    for t in uvm.TABLES:
+        out.append(f'  {{.name = "{t.name}", .vmin = {c_version(t.vmin)}, '
+                   f'.vmax = {c_version(t.vmax)},\n'
+                   f'   .cmds = nvgpu_uvm_{t.name}, '
+                   f'.ncmds = ARRAY_SIZE(nvgpu_uvm_{t.name})}},')
+    out.append('};\n')
+    return out
 
 
 # ────────────────────────────── Rust emission ──────────────────────────────
@@ -777,6 +816,23 @@ def emit_rs(tables):
                'versions.')
     out.append('pub static MODESET_TABLES: &[&Table] = &['
                + ', '.join(f'&{s}' for s in syms[1:]) + '];\n')
+    out.append('/// UVM parameter blocks, one table per range of host driver '
+               'versions.')
+    out.append('pub static UVM_TABLES: &[UvmTable] = &[')
+    for t in uvm.TABLES:
+        out.append(f'    UvmTable {{\n        name: "{t.name}",\n'
+                   f'        versions: ({rs_version(t.vmin)}, '
+                   f'{rs_version(t.vmax)}),\n        cmds: &[')
+        for c in t.commands:
+            fd = 'None'
+            if c['fd']:
+                of = {'rmctl': 'UvmFdOf::RmCtl', 'uvm': 'UvmFdOf::Uvm'}[
+                    c['fd']['of']]
+                fd = f'Some(UvmFd {{ offset: {c["fd"]["offset"]}, of: {of} }})'
+            out.append(f'            UvmCmd {{ name: "{c["name"]}", '
+                       f'cmd: 0x{c["cmd"]:08x}, size: {c["size"]}, fd: {fd} }},')
+        out.append('        ],\n    },')
+    out.append('];\n')
     out.append('/// (fourcc, planes) of every multi-planar format; the rest '
                'have one plane.')
     out.append('pub static MULTI_PLANE_FORMATS: &[(u32, u8)] = &[')

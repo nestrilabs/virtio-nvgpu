@@ -24,12 +24,19 @@ impl DriverVersion {
     }
 
     /// Parse from the string returned by `NV_ESC_CHECK_VERSION_STR`.
-    /// Expected format: `"535.129.03"`.
+    /// Expected format: `"535.129.03"`. NVIDIA numbers some releases in two
+    /// parts (`"550.67"`, `"595.80"`); those are `.0`, so they fall in the
+    /// range of the release below them like any other. The guest driver
+    /// reads a version the same way (nvgpu_i2.c, `nvgpu_host_version`), and
+    /// the two must agree: both pick their NVKMS and UVM tables by it.
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.trim().splitn(3, '.');
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
+        let patch = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
         Some(Self {
             major,
             minor,
@@ -60,5 +67,15 @@ mod tests {
             DriverVersion::parse("535.129.03"),
             Some(DriverVersion::new(535, 129, 3))
         );
+    }
+
+    #[test]
+    fn a_two_part_release_is_its_point_zero() {
+        assert_eq!(
+            DriverVersion::parse("595.80"),
+            Some(DriverVersion::new(595, 80, 0))
+        );
+        assert_eq!(DriverVersion::parse("595"), None);
+        assert_eq!(DriverVersion::parse("595.x"), None);
     }
 }

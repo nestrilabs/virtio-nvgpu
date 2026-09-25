@@ -334,9 +334,12 @@ mod tests {
     /// escape's 8-bit number, can never take one for an escape.
     #[test]
     fn the_uvm_descriptor_fields_follow_the_rm_ones_marked_as_uvm() {
+        // 535 has no ALLOC_DEVICE_P2P (565.57.01 on), so five.
         let cfg = VirtioGpuNvConfig::new("535.129.03", &[]);
         let n = cfg.num_fd_translations as usize;
-        assert_eq!(n, FD_CARRYING_IOCTLS.len() + 6);
+        assert_eq!(n, FD_CARRYING_IOCTLS.len() + 5);
+        let later = VirtioGpuNvConfig::new("610.57.04", &[]);
+        assert_eq!(later.num_fd_translations as usize, FD_CARRYING_IOCTLS.len() + 6);
         let table = cfg.fd_translations;
         for (i, e) in table[..FD_CARRYING_IOCTLS.len()].iter().enumerate() {
             let nr = e.nr;

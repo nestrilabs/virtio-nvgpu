@@ -46,6 +46,7 @@
 #include <drm/drm_prime.h>
 
 #include "gen/nvgpu_rmalloc_classes.h"
+#include "gen/nvgpu_schema.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
 #include "nvgpu.h"
@@ -1180,95 +1181,53 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
   return nvgpu_ioctl_fd(filp->private_data, cmd, arg);
 }
 
+/*
+ * The size of UVM command `cmd`'s parameter block on the host's release, or
+ * -1 for a command the backend does not let through (or this release does
+ * not have). UVM's numbers carry no size -- UVM_IOCTL_BASE(n) is plain n, and
+ * the 0x3000 in UVM_INITIALIZE's is not the size of anything -- and the host
+ * copies exactly sizeof(<cmd>_PARAMS) each way, so the size comes from the
+ * table generated with the backend's (gen/schema/uvm.py).
+ */
+static int nvgpu_uvm_size(const struct nvgpu_uvm_table *t, unsigned int cmd) {
+  u32 i;
+
+  for (i = 0; t && i < t->ncmds; i++)
+    if (t->cmds[i].cmd == cmd)
+      return t->cmds[i].size;
+  return -1;
+}
+
+#define NVGPU_UVM_INITIALIZE 0x30000001u
+/* UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS (uvm_types.h). */
+#define NVGPU_UVM_INIT_DISABLE_PAGEABLE_ACCESS (1ULL << 2)
+
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
-  unsigned int nr = _IOC_NR(cmd);
-  unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
   const struct nvgpu_fd_translation_entry *fdt;
+  int sz;
 
   /*
-   * UVM ioctls use _IOC(0, 0, nr, 0x3000) — type=0, size=0x3000.
-   * _IOC_SIZE() returns 0x3000 which is the max buffer, not the
-   * actual struct size. Use the real struct sizes instead.
-   *
-   * UVM_INITIALIZE     (nr=1): flags:u64 + rmStatus:u32 + pad = 16 bytes
-   * UVM_MM_INITIALIZE  (nr=2): uvmFd:s32 + rmStatus:u32        =  8 bytes
-   *
-   * For all other UVM ioctls we use 0x3000 as an upper bound since
-   * we don't know their sizes — the host driver will only read what
-   * it needs.
+   * Exactly the command's block, both ways. With 0x3000 as a bound for every
+   * command it did not know, this copied 12 KiB in and all of it back out:
+   * bytes past a 4-byte struct in the caller's memory rewritten with what
+   * they held when the call began, under any other thread of the caller
+   * writing there meanwhile. A command with no size is not one the backend
+   * lets through, and goes no further than here.
    */
-  if (sz == 0 || sz == 0x3000) {
-    switch (nr) {
-    case 1:
-      sz = 16;
-      break; /* UVM_INITIALIZE        */
-    case 2:
-      sz = 8;
-      break; /* UVM_MM_INITIALIZE     */
-    default:
-      sz = 0x3000;
-      break;
-    }
-  }
+  sz = nvgpu_uvm_size(nfd->dev->uvm, cmd);
+  if (sz < 0)
+    return -EPERM;
 
-  if (sz > 0x3000)
-    return -EINVAL;
-
-  /*
-   * UVM_MM_INITIALIZE passes arg=0 (NULL) because the uvmFd is
-   * embedded in the ioctl struct on some driver versions, or the
-   * kernel side doesn't need userspace params at all.
-   * Forward with a zeroed buffer — host will fill rmStatus.
-   */
-  if (arg == 0) {
-    /*
-     * Can't copy_from_user a NULL pointer. Build a zeroed buffer
-     * and send it; the host UVM driver will populate rmStatus.
-     */
-    int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
-    int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
-    void *req_buf, *resp_buf;
-    struct nvgpu_ioctl_req *req;
-    struct nvgpu_ioctl_resp *resp;
-    int ret;
-
-    req_buf = kzalloc(req_total, GFP_KERNEL);
-    resp_buf = kzalloc(resp_max, GFP_KERNEL);
-    if (!req_buf || !resp_buf) {
-      kfree(req_buf);
-      kfree(resp_buf);
-      return -ENOMEM;
-    }
-
-    req = (struct nvgpu_ioctl_req *)req_buf;
-    req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-    req->hdr.handle = cpu_to_le32(nfd->handle);
-    req->cmd = cpu_to_le32(cmd);
-    req->data_len = cpu_to_le32(sz);
-    /* payload stays zeroed — no copy_from_user */
-
-    ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
-
-    if (ret == 0) {
-      resp = (struct nvgpu_ioctl_resp *)resp_buf;
-      ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
-      /* arg=0 means no copy_to_user either */
-    }
-
-    kfree(req_buf);
-    kfree(resp_buf);
-    return ret;
-  }
-
-  /* UVM_INITIALIZE: inject MULTI_PROCESS_SHARING_MODE flag */
-  if (nr == 1) {
+  /* UVM_INITIALIZE: no pageable access (the backend forces it as well). */
+  if (cmd == NVGPU_UVM_INITIALIZE) {
     u64 flags;
+
     if (copy_from_user(&flags, uarg, sizeof(flags)))
       return -EFAULT;
-    flags |= (1ULL << 2);
+    flags |= NVGPU_UVM_INIT_DISABLE_PAGEABLE_ACCESS;
     if (copy_to_user(uarg, &flags, sizeof(flags)))
       return -EFAULT;
   }
@@ -1277,15 +1236,19 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
    * A command naming another file: the caller's descriptor becomes our
    * handle for that file (and one not of ours is refused), sent in a block of
    * the command's own size, and the caller reads back its own descriptor.
+   * The backend states that size in the config too; one that disagrees with
+   * the table is a backend of another release, and nothing is sent.
    */
   fdt = nvgpu_find_uvm_fd_translation(nfd->dev, cmd);
   if (fdt) {
     u32 packed = le32_to_cpu(fdt->payload_offset);
 
-    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, packed >> 16,
-                                    packed & 0xffff);
+    if (packed >> 16 != sz)
+      return -EPROTO;
+    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz, packed & 0xffff);
   }
 
+  /* DEINITIALIZE takes no argument, and sends and gets back no bytes. */
   return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
 }
 
@@ -2930,6 +2893,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   /* Read config space written by the VMM at device creation */
   virtio_cread_bytes(vdev, 0, dev->driver_version, 32);
   dev->driver_version[31] = '\0';
+  dev->uvm = nvgpu_uvm_select(dev->driver_version);
+  if (!dev->uvm)
+    dev_warn(&vdev->dev,
+             "virtio-gpu-nv: no UVM table for host driver \"%s\"; "
+             "/dev/nvidia-uvm refuses every command\n",
+             dev->driver_version);
   virtio_cread(vdev, struct virtio_gpu_nv_config, num_gpus, &dev->num_gpus);
   virtio_cread(vdev, struct virtio_gpu_nv_config, caps, &dev->caps);
 

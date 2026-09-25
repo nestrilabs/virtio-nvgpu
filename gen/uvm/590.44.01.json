@@ -1,0 +1,246 @@
+{
+ "format": "virtio-nvgpu/uvm-params/1",
+ "driver_version": "590.44.01",
+ "why": "FREE loses length, UNREGISTER_CHANNEL loses gpuUuid",
+ "source": {
+  "tag": "590.44.01",
+  "url": "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/590.44.01/",
+  "files": {
+   "kernel-open/common/inc/cpuopsys.h": "7401851203255ef203a5e44532957fb039a341950c0ed2d7b19d51e33114f3a1",
+   "kernel-open/common/inc/nvCpuUuid.h": "a228c1ac5b26b9e4d7d1efa7dd69bf111bd0bbadddd65bb016e610e13871a234",
+   "kernel-open/common/inc/nv_uvm_user_types.h": "fffd902620642d566fe06619343a151795c7d0e4540c904a41baea24aae03d8c",
+   "kernel-open/common/inc/nvlimits.h": "7c7bf27c5360464b459f6069d2e72f6070bb3fdd0862baccf6c7aa71da67c593",
+   "kernel-open/common/inc/nvstatus.h": "e8267172a1f7a56420d612c6734b3554b9ff6a3d33fdda21b1371ff4ce4b8675",
+   "kernel-open/common/inc/nvstatuscodes.h": "143fa91191a368e4fad0eae2a5ec533bcdbd41895184c46c7e2865ebfe6107a8",
+   "kernel-open/common/inc/nvtypes.h": "e3901c0991b3a3dc77fffc2269fee84661bdda8a5bc43c0fe70a620af05edd5b",
+   "kernel-open/nvidia-uvm/uvm_ioctl.h": "ef6bbde8bc9c2ebd0cbbfd29d702ca2239a97d8f0a259ceee09607a550023515",
+   "kernel-open/nvidia-uvm/uvm_linux_ioctl.h": "0ffb5cf3679fb5e150745e54b72fab861e319823e419f36376468a60862c2748",
+   "kernel-open/nvidia-uvm/uvm_types.h": "94d4124ee87678f45148fe679bf249e19a89c987815aaff6dc72b45ebf606b14"
+  }
+ },
+ "commands": [
+  {
+   "name": "INITIALIZE",
+   "cmd": 805306369,
+   "size": 16,
+   "fd": null
+  },
+  {
+   "name": "DEINITIALIZE",
+   "cmd": 805306370,
+   "size": 0,
+   "fd": null
+  },
+  {
+   "name": "REGISTER_GPU_VASPACE",
+   "cmd": 25,
+   "size": 32,
+   "fd": {
+    "field": "rmCtrlFd",
+    "offset": 16,
+    "of": "rmctl"
+   }
+  },
+  {
+   "name": "UNREGISTER_GPU_VASPACE",
+   "cmd": 26,
+   "size": 20,
+   "fd": null
+  },
+  {
+   "name": "REGISTER_CHANNEL",
+   "cmd": 27,
+   "size": 56,
+   "fd": {
+    "field": "rmCtrlFd",
+    "offset": 16,
+    "of": "rmctl"
+   }
+  },
+  {
+   "name": "UNREGISTER_CHANNEL",
+   "cmd": 28,
+   "size": 12,
+   "fd": null
+  },
+  {
+   "name": "ENABLE_PEER_ACCESS",
+   "cmd": 29,
+   "size": 36,
+   "fd": null
+  },
+  {
+   "name": "DISABLE_PEER_ACCESS",
+   "cmd": 30,
+   "size": 36,
+   "fd": null
+  },
+  {
+   "name": "MAP_EXTERNAL_ALLOCATION",
+   "cmd": 33,
+   "size": 9264,
+   "fd": {
+    "field": "rmCtrlFd",
+    "offset": 9248,
+    "of": "rmctl"
+   }
+  },
+  {
+   "name": "FREE",
+   "cmd": 34,
+   "size": 16,
+   "fd": null
+  },
+  {
+   "name": "REGISTER_GPU",
+   "cmd": 37,
+   "size": 40,
+   "fd": {
+    "field": "rmCtrlFd",
+    "offset": 24,
+    "of": "rmctl"
+   }
+  },
+  {
+   "name": "UNREGISTER_GPU",
+   "cmd": 38,
+   "size": 20,
+   "fd": null
+  },
+  {
+   "name": "PAGEABLE_MEM_ACCESS",
+   "cmd": 39,
+   "size": 8,
+   "fd": null
+  },
+  {
+   "name": "SET_PREFERRED_LOCATION",
+   "cmd": 42,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "UNSET_PREFERRED_LOCATION",
+   "cmd": 43,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "ENABLE_READ_DUPLICATION",
+   "cmd": 44,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "DISABLE_READ_DUPLICATION",
+   "cmd": 45,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "SET_ACCESSED_BY",
+   "cmd": 46,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "UNSET_ACCESSED_BY",
+   "cmd": 47,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "MIGRATE",
+   "cmd": 51,
+   "size": 80,
+   "fd": null
+  },
+  {
+   "name": "MAP_DYNAMIC_PARALLELISM_REGION",
+   "cmd": 65,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "UNMAP_EXTERNAL",
+   "cmd": 66,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "TOOLS_FLUSH_EVENTS",
+   "cmd": 67,
+   "size": 4,
+   "fd": null
+  },
+  {
+   "name": "ALLOC_SEMAPHORE_POOL",
+   "cmd": 68,
+   "size": 9248,
+   "fd": null
+  },
+  {
+   "name": "CLEAN_UP_ZOMBIE_RESOURCES",
+   "cmd": 69,
+   "size": 4,
+   "fd": null
+  },
+  {
+   "name": "PAGEABLE_MEM_ACCESS_ON_GPU",
+   "cmd": 70,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "VALIDATE_VA_RANGE",
+   "cmd": 72,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "CREATE_EXTERNAL_RANGE",
+   "cmd": 73,
+   "size": 24,
+   "fd": null
+  },
+  {
+   "name": "MAP_EXTERNAL_SPARSE",
+   "cmd": 74,
+   "size": 40,
+   "fd": null
+  },
+  {
+   "name": "MM_INITIALIZE",
+   "cmd": 75,
+   "size": 8,
+   "fd": {
+    "field": "uvmFd",
+    "offset": 0,
+    "of": "uvm"
+   }
+  },
+  {
+   "name": "ALLOC_DEVICE_P2P",
+   "cmd": 78,
+   "size": 56,
+   "fd": {
+    "field": "rmCtrlFd",
+    "offset": 40,
+    "of": "rmctl"
+   }
+  },
+  {
+   "name": "CLEAR_ALL_ACCESS_COUNTERS",
+   "cmd": 79,
+   "size": 4,
+   "fd": null
+  },
+  {
+   "name": "DISCARD",
+   "cmd": 80,
+   "size": 32,
+   "fd": null
+  }
+ ],
+ "absent": []
+}

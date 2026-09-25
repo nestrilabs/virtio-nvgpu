@@ -136,6 +136,23 @@ struct nvgpu_schema_set {
   const struct nvgpu_stable *modeset; /* NULL: no table for this host */
 };
 
+/*
+ * A UVM command the backend lets through, and the size of its parameter
+ * block on the host's release (gen/schema/uvm.py): UVM's ioctl numbers carry
+ * none, and the host copies exactly this many bytes each way.
+ */
+struct nvgpu_uvm_cmd {
+  u32 cmd; /* the whole number, as UVM's callers pass it */
+  u32 size;
+};
+
+struct nvgpu_uvm_table {
+  const char *name;
+  u32 vmin, vmax; /* NVGPU_SCHEMA_VERSION */
+  const struct nvgpu_uvm_cmd *cmds; /* by cmd */
+  u32 ncmds;
+};
+
 #ifdef NVGPU_SCHEMA_TABLES
 
 static const struct nvgpu_sfield nvgpu_schema_drm_fields[] = {
@@ -1852,6 +1869,193 @@ static const struct nvgpu_schema_set nvgpu_schema_sets[] = {
   {.drm = &nvgpu_schema_drm, .modeset = &nvgpu_schema_v595_99_02},
   {.drm = &nvgpu_schema_drm, .modeset = &nvgpu_schema_v610_57_04},
   {.drm = &nvgpu_schema_drm, .modeset = &nvgpu_schema_v615_71_09},
+};
+
+static const struct nvgpu_uvm_cmd nvgpu_uvm_v535_129_03[] = {
+  {0x00000019u, 32}, /* REGISTER_GPU_VASPACE */
+  {0x0000001au, 20}, /* UNREGISTER_GPU_VASPACE */
+  {0x0000001bu, 56}, /* REGISTER_CHANNEL */
+  {0x0000001cu, 28}, /* UNREGISTER_CHANNEL */
+  {0x0000001du, 36}, /* ENABLE_PEER_ACCESS */
+  {0x0000001eu, 36}, /* DISABLE_PEER_ACCESS */
+  {0x00000021u, 1200}, /* MAP_EXTERNAL_ALLOCATION */
+  {0x00000022u, 24}, /* FREE */
+  {0x00000025u, 40}, /* REGISTER_GPU */
+  {0x00000026u, 20}, /* UNREGISTER_GPU */
+  {0x00000027u, 8}, /* PAGEABLE_MEM_ACCESS */
+  {0x0000002au, 40}, /* SET_PREFERRED_LOCATION */
+  {0x0000002bu, 24}, /* UNSET_PREFERRED_LOCATION */
+  {0x0000002cu, 24}, /* ENABLE_READ_DUPLICATION */
+  {0x0000002du, 24}, /* DISABLE_READ_DUPLICATION */
+  {0x0000002eu, 40}, /* SET_ACCESSED_BY */
+  {0x0000002fu, 40}, /* UNSET_ACCESSED_BY */
+  {0x00000033u, 80}, /* MIGRATE */
+  {0x00000041u, 40}, /* MAP_DYNAMIC_PARALLELISM_REGION */
+  {0x00000042u, 40}, /* UNMAP_EXTERNAL */
+  {0x00000043u, 4}, /* TOOLS_FLUSH_EVENTS */
+  {0x00000044u, 1184}, /* ALLOC_SEMAPHORE_POOL */
+  {0x00000045u, 4}, /* CLEAN_UP_ZOMBIE_RESOURCES */
+  {0x00000046u, 24}, /* PAGEABLE_MEM_ACCESS_ON_GPU */
+  {0x00000048u, 24}, /* VALIDATE_VA_RANGE */
+  {0x00000049u, 24}, /* CREATE_EXTERNAL_RANGE */
+  {0x0000004au, 40}, /* MAP_EXTERNAL_SPARSE */
+  {0x0000004bu, 8}, /* MM_INITIALIZE */
+  {0x30000001u, 16}, /* INITIALIZE */
+  {0x30000002u, 0}, /* DEINITIALIZE */
+};
+
+static const struct nvgpu_uvm_cmd nvgpu_uvm_v550_40_53[] = {
+  {0x00000019u, 32}, /* REGISTER_GPU_VASPACE */
+  {0x0000001au, 20}, /* UNREGISTER_GPU_VASPACE */
+  {0x0000001bu, 56}, /* REGISTER_CHANNEL */
+  {0x0000001cu, 28}, /* UNREGISTER_CHANNEL */
+  {0x0000001du, 36}, /* ENABLE_PEER_ACCESS */
+  {0x0000001eu, 36}, /* DISABLE_PEER_ACCESS */
+  {0x00000021u, 9264}, /* MAP_EXTERNAL_ALLOCATION */
+  {0x00000022u, 24}, /* FREE */
+  {0x00000025u, 40}, /* REGISTER_GPU */
+  {0x00000026u, 20}, /* UNREGISTER_GPU */
+  {0x00000027u, 8}, /* PAGEABLE_MEM_ACCESS */
+  {0x0000002au, 40}, /* SET_PREFERRED_LOCATION */
+  {0x0000002bu, 24}, /* UNSET_PREFERRED_LOCATION */
+  {0x0000002cu, 24}, /* ENABLE_READ_DUPLICATION */
+  {0x0000002du, 24}, /* DISABLE_READ_DUPLICATION */
+  {0x0000002eu, 40}, /* SET_ACCESSED_BY */
+  {0x0000002fu, 40}, /* UNSET_ACCESSED_BY */
+  {0x00000033u, 80}, /* MIGRATE */
+  {0x00000041u, 40}, /* MAP_DYNAMIC_PARALLELISM_REGION */
+  {0x00000042u, 40}, /* UNMAP_EXTERNAL */
+  {0x00000043u, 4}, /* TOOLS_FLUSH_EVENTS */
+  {0x00000044u, 9248}, /* ALLOC_SEMAPHORE_POOL */
+  {0x00000045u, 4}, /* CLEAN_UP_ZOMBIE_RESOURCES */
+  {0x00000046u, 24}, /* PAGEABLE_MEM_ACCESS_ON_GPU */
+  {0x00000048u, 24}, /* VALIDATE_VA_RANGE */
+  {0x00000049u, 24}, /* CREATE_EXTERNAL_RANGE */
+  {0x0000004au, 40}, /* MAP_EXTERNAL_SPARSE */
+  {0x0000004bu, 8}, /* MM_INITIALIZE */
+  {0x30000001u, 16}, /* INITIALIZE */
+  {0x30000002u, 0}, /* DEINITIALIZE */
+};
+
+static const struct nvgpu_uvm_cmd nvgpu_uvm_v565_57_01[] = {
+  {0x00000019u, 32}, /* REGISTER_GPU_VASPACE */
+  {0x0000001au, 20}, /* UNREGISTER_GPU_VASPACE */
+  {0x0000001bu, 56}, /* REGISTER_CHANNEL */
+  {0x0000001cu, 28}, /* UNREGISTER_CHANNEL */
+  {0x0000001du, 36}, /* ENABLE_PEER_ACCESS */
+  {0x0000001eu, 36}, /* DISABLE_PEER_ACCESS */
+  {0x00000021u, 9264}, /* MAP_EXTERNAL_ALLOCATION */
+  {0x00000022u, 24}, /* FREE */
+  {0x00000025u, 40}, /* REGISTER_GPU */
+  {0x00000026u, 20}, /* UNREGISTER_GPU */
+  {0x00000027u, 8}, /* PAGEABLE_MEM_ACCESS */
+  {0x0000002au, 40}, /* SET_PREFERRED_LOCATION */
+  {0x0000002bu, 24}, /* UNSET_PREFERRED_LOCATION */
+  {0x0000002cu, 24}, /* ENABLE_READ_DUPLICATION */
+  {0x0000002du, 24}, /* DISABLE_READ_DUPLICATION */
+  {0x0000002eu, 40}, /* SET_ACCESSED_BY */
+  {0x0000002fu, 40}, /* UNSET_ACCESSED_BY */
+  {0x00000033u, 80}, /* MIGRATE */
+  {0x00000041u, 40}, /* MAP_DYNAMIC_PARALLELISM_REGION */
+  {0x00000042u, 40}, /* UNMAP_EXTERNAL */
+  {0x00000043u, 4}, /* TOOLS_FLUSH_EVENTS */
+  {0x00000044u, 9248}, /* ALLOC_SEMAPHORE_POOL */
+  {0x00000045u, 4}, /* CLEAN_UP_ZOMBIE_RESOURCES */
+  {0x00000046u, 24}, /* PAGEABLE_MEM_ACCESS_ON_GPU */
+  {0x00000048u, 24}, /* VALIDATE_VA_RANGE */
+  {0x00000049u, 24}, /* CREATE_EXTERNAL_RANGE */
+  {0x0000004au, 40}, /* MAP_EXTERNAL_SPARSE */
+  {0x0000004bu, 8}, /* MM_INITIALIZE */
+  {0x0000004eu, 56}, /* ALLOC_DEVICE_P2P */
+  {0x0000004fu, 4}, /* CLEAR_ALL_ACCESS_COUNTERS */
+  {0x30000001u, 16}, /* INITIALIZE */
+  {0x30000002u, 0}, /* DEINITIALIZE */
+};
+
+static const struct nvgpu_uvm_cmd nvgpu_uvm_v580_65_06[] = {
+  {0x00000019u, 32}, /* REGISTER_GPU_VASPACE */
+  {0x0000001au, 20}, /* UNREGISTER_GPU_VASPACE */
+  {0x0000001bu, 56}, /* REGISTER_CHANNEL */
+  {0x0000001cu, 28}, /* UNREGISTER_CHANNEL */
+  {0x0000001du, 36}, /* ENABLE_PEER_ACCESS */
+  {0x0000001eu, 36}, /* DISABLE_PEER_ACCESS */
+  {0x00000021u, 9264}, /* MAP_EXTERNAL_ALLOCATION */
+  {0x00000022u, 24}, /* FREE */
+  {0x00000025u, 40}, /* REGISTER_GPU */
+  {0x00000026u, 20}, /* UNREGISTER_GPU */
+  {0x00000027u, 8}, /* PAGEABLE_MEM_ACCESS */
+  {0x0000002au, 40}, /* SET_PREFERRED_LOCATION */
+  {0x0000002bu, 24}, /* UNSET_PREFERRED_LOCATION */
+  {0x0000002cu, 24}, /* ENABLE_READ_DUPLICATION */
+  {0x0000002du, 24}, /* DISABLE_READ_DUPLICATION */
+  {0x0000002eu, 40}, /* SET_ACCESSED_BY */
+  {0x0000002fu, 40}, /* UNSET_ACCESSED_BY */
+  {0x00000033u, 80}, /* MIGRATE */
+  {0x00000041u, 40}, /* MAP_DYNAMIC_PARALLELISM_REGION */
+  {0x00000042u, 40}, /* UNMAP_EXTERNAL */
+  {0x00000043u, 4}, /* TOOLS_FLUSH_EVENTS */
+  {0x00000044u, 9248}, /* ALLOC_SEMAPHORE_POOL */
+  {0x00000045u, 4}, /* CLEAN_UP_ZOMBIE_RESOURCES */
+  {0x00000046u, 24}, /* PAGEABLE_MEM_ACCESS_ON_GPU */
+  {0x00000048u, 24}, /* VALIDATE_VA_RANGE */
+  {0x00000049u, 24}, /* CREATE_EXTERNAL_RANGE */
+  {0x0000004au, 40}, /* MAP_EXTERNAL_SPARSE */
+  {0x0000004bu, 8}, /* MM_INITIALIZE */
+  {0x0000004eu, 56}, /* ALLOC_DEVICE_P2P */
+  {0x0000004fu, 4}, /* CLEAR_ALL_ACCESS_COUNTERS */
+  {0x00000050u, 32}, /* DISCARD */
+  {0x30000001u, 16}, /* INITIALIZE */
+  {0x30000002u, 0}, /* DEINITIALIZE */
+};
+
+static const struct nvgpu_uvm_cmd nvgpu_uvm_v590_44_01[] = {
+  {0x00000019u, 32}, /* REGISTER_GPU_VASPACE */
+  {0x0000001au, 20}, /* UNREGISTER_GPU_VASPACE */
+  {0x0000001bu, 56}, /* REGISTER_CHANNEL */
+  {0x0000001cu, 12}, /* UNREGISTER_CHANNEL */
+  {0x0000001du, 36}, /* ENABLE_PEER_ACCESS */
+  {0x0000001eu, 36}, /* DISABLE_PEER_ACCESS */
+  {0x00000021u, 9264}, /* MAP_EXTERNAL_ALLOCATION */
+  {0x00000022u, 16}, /* FREE */
+  {0x00000025u, 40}, /* REGISTER_GPU */
+  {0x00000026u, 20}, /* UNREGISTER_GPU */
+  {0x00000027u, 8}, /* PAGEABLE_MEM_ACCESS */
+  {0x0000002au, 40}, /* SET_PREFERRED_LOCATION */
+  {0x0000002bu, 24}, /* UNSET_PREFERRED_LOCATION */
+  {0x0000002cu, 24}, /* ENABLE_READ_DUPLICATION */
+  {0x0000002du, 24}, /* DISABLE_READ_DUPLICATION */
+  {0x0000002eu, 40}, /* SET_ACCESSED_BY */
+  {0x0000002fu, 40}, /* UNSET_ACCESSED_BY */
+  {0x00000033u, 80}, /* MIGRATE */
+  {0x00000041u, 40}, /* MAP_DYNAMIC_PARALLELISM_REGION */
+  {0x00000042u, 40}, /* UNMAP_EXTERNAL */
+  {0x00000043u, 4}, /* TOOLS_FLUSH_EVENTS */
+  {0x00000044u, 9248}, /* ALLOC_SEMAPHORE_POOL */
+  {0x00000045u, 4}, /* CLEAN_UP_ZOMBIE_RESOURCES */
+  {0x00000046u, 24}, /* PAGEABLE_MEM_ACCESS_ON_GPU */
+  {0x00000048u, 24}, /* VALIDATE_VA_RANGE */
+  {0x00000049u, 24}, /* CREATE_EXTERNAL_RANGE */
+  {0x0000004au, 40}, /* MAP_EXTERNAL_SPARSE */
+  {0x0000004bu, 8}, /* MM_INITIALIZE */
+  {0x0000004eu, 56}, /* ALLOC_DEVICE_P2P */
+  {0x0000004fu, 4}, /* CLEAR_ALL_ACCESS_COUNTERS */
+  {0x00000050u, 32}, /* DISCARD */
+  {0x30000001u, 16}, /* INITIALIZE */
+  {0x30000002u, 0}, /* DEINITIALIZE */
+};
+
+/* One per range of host releases; none before the first. */
+static const struct nvgpu_uvm_table nvgpu_uvm_tables[] = {
+  {.name = "v535_129_03", .vmin = NVGPU_SCHEMA_VERSION(535, 129, 3), .vmax = NVGPU_SCHEMA_VERSION(550, 40, 52),
+   .cmds = nvgpu_uvm_v535_129_03, .ncmds = ARRAY_SIZE(nvgpu_uvm_v535_129_03)},
+  {.name = "v550_40_53", .vmin = NVGPU_SCHEMA_VERSION(550, 40, 53), .vmax = NVGPU_SCHEMA_VERSION(565, 57, 0),
+   .cmds = nvgpu_uvm_v550_40_53, .ncmds = ARRAY_SIZE(nvgpu_uvm_v550_40_53)},
+  {.name = "v565_57_01", .vmin = NVGPU_SCHEMA_VERSION(565, 57, 1), .vmax = NVGPU_SCHEMA_VERSION(580, 65, 5),
+   .cmds = nvgpu_uvm_v565_57_01, .ncmds = ARRAY_SIZE(nvgpu_uvm_v565_57_01)},
+  {.name = "v580_65_06", .vmin = NVGPU_SCHEMA_VERSION(580, 65, 6), .vmax = NVGPU_SCHEMA_VERSION(590, 44, 0),
+   .cmds = nvgpu_uvm_v580_65_06, .ncmds = ARRAY_SIZE(nvgpu_uvm_v580_65_06)},
+  {.name = "v590_44_01", .vmin = NVGPU_SCHEMA_VERSION(590, 44, 1), .vmax = NVGPU_SCHEMA_VERSION(999, 999, 999),
+   .cmds = nvgpu_uvm_v590_44_01, .ncmds = ARRAY_SIZE(nvgpu_uvm_v590_44_01)},
 };
 
 #endif /* NVGPU_SCHEMA_TABLES */

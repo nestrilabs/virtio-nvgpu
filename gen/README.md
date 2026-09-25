@@ -104,3 +104,32 @@ between releases lists all of them). `render` is pure Python, and the Rust
 test `the_checked_in_table_is_what_the_extractor_renders` runs it, as the
 schema's does. Sources are cached in `$RMCTRL_EXTRACT_CACHE` (default
 `$TMPDIR/ogkm-rm`).
+
+## UVM parameter blocks
+
+nvidia-uvm's ioctl numbers carry no size (`UVM_IOCTL_BASE(n)` is plain `n`,
+and the `0x3000` in `UVM_INITIALIZE`'s is not the size of anything), and the
+kernel copies exactly `sizeof(<cmd>_PARAMS)` each way. `uvm_extract.py`
+measures that size for every UVM command the backend lets through
+(`device/src/guestptr.rs`, `UVM_ALLOWED`), plus the offset of the descriptor
+the six file-naming commands carry (`device/src/uvmfd.rs`), with a C probe
+compiled against each release's own `uvm_linux_ioctl.h` and the SDK headers
+it includes, fetched file by file from the tag.
+
+```sh
+./uvm_extract.py all      # fetch + measure every release in VERSIONS
+./uvm_extract.py check    # re-measure and fail if gen/uvm/ is stale
+./uvm_extract.py scan     # measure every tag since 535.129.03 (slow)
+```
+
+`gen/uvm/<version>.json` holds each release's measurement, and
+`schema_gen.py` renders them (through `schema/uvm.py`) into both halves'
+tables: `nvgpu_uvm_tables` in `driver/gen/nvgpu_schema.h`, which sizes every
+UVM call the guest makes, and `UVM_TABLES` in `src/schema/generated.rs`,
+which the backend holds each block to. A command with no row is refused by
+both. The ranges run from each release to the next measured one, as the
+NVKMS tables' do, but here that is checked rather than assumed: `scan`
+measures every published tag and fails if one differs from the table it
+would get. Besides the six ABI releases, `VERSIONS` has the four where it
+found a change (550.40.53, 565.57.01, 580.65.06, 590.44.01). Sources are
+cached in `$UVM_EXTRACT_CACHE` (default `$TMPDIR/ogkm-uvm`).

@@ -661,6 +661,24 @@ mod tests {
         }
     }
 
+    /// The generated UVM table (gen/uvm_extract.py's COMMANDS) sizes exactly
+    /// the commands let through here: one with no size would be refused by
+    /// both halves anyway, and one sized but not let through is a list that
+    /// drifted.
+    #[test]
+    fn every_uvm_command_let_through_has_a_measured_size_and_nothing_else_does() {
+        use std::collections::BTreeSet;
+        let allowed: BTreeSet<u32> = UVM_ALLOWED.iter().copied().collect();
+        let tables = abi::schema::UVM_TABLES;
+        let newest: BTreeSet<u32> = tables.last().unwrap().cmds.iter().map(|c| c.cmd).collect();
+        assert_eq!(allowed, newest);
+        for t in tables {
+            for c in t.cmds {
+                assert!(allowed.contains(&c.cmd), "{} {}", t.name, c.name);
+            }
+        }
+    }
+
     #[test]
     fn nothing_goes_to_the_uvm_tools_device() {
         let mut p = vec![0u8; 64];
@@ -1097,6 +1115,8 @@ mod backend_tests {
     #[test]
     fn uvm_reaches_the_host_without_pageable_access_and_answers_with_the_callers_flags() {
         let (mut be, h) = backend(HandleKind::Dev(DeviceKind::Uvm));
+        // UVM blocks are sized by the host's release (nvidia.rs, uvm_size_ok).
+        be.set_host_driver_version("610.57.04");
         let mut p = vec![0u8; 16];
         p[0..8].copy_from_slice(&0x2u64.to_le_bytes());
         let (st, reply) = v1(&mut be, h, UVM_INITIALIZE, &p, &[], None);

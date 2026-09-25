@@ -11,7 +11,7 @@
 #[rustfmt::skip]
 mod generated;
 
-pub use generated::{DRM_TABLE, MODESET_TABLES, MULTI_PLANE_FORMATS};
+pub use generated::{DRM_TABLE, MODESET_TABLES, MULTI_PLANE_FORMATS, UVM_TABLES};
 
 use crate::version::DriverVersion;
 
@@ -385,6 +385,64 @@ pub fn modeset_table_exact(v: DriverVersion) -> bool {
     modeset_table(v).is_some_and(|t| t.versions.is_some_and(|(lo, _)| lo == v))
 }
 
+// ───────────────────────────── UVM blocks ─────────────────────────────
+//
+// Not schema: nvidia-uvm's parameters are flat, and what the two sides need
+// is each command's block size, which UVM's ioctl numbers do not carry, and
+// the descriptor some of them name another file by (gen/schema/uvm.py,
+// measured by gen/uvm_extract.py). The guest's copy is `nvgpu_uvm_tables` in
+// driver/gen/nvgpu_schema.h.
+
+/// What a UVM command's descriptor field must name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UvmFdOf {
+    /// An RM control file (/dev/nvidiactl).
+    RmCtl,
+    /// A UVM file (/dev/nvidia-uvm).
+    Uvm,
+}
+
+/// The i32 descriptor inside a UVM command's parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UvmFd {
+    pub offset: u32,
+    pub of: UvmFdOf,
+}
+
+/// A UVM command the backend lets through, on one range of releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UvmCmd {
+    pub name: &'static str,
+    /// The whole number, as UVM's callers pass it: UVM_IOCTL_BASE(n) is n,
+    /// UVM_INITIALIZE 0x30000001.
+    pub cmd: u32,
+    /// sizeof its _PARAMS; 0 for DEINITIALIZE, which takes none.
+    pub size: u32,
+    pub fd: Option<UvmFd>,
+}
+
+pub struct UvmTable {
+    pub name: &'static str,
+    /// Host driver versions the table is for, inclusive.
+    pub versions: (DriverVersion, DriverVersion),
+    /// By `cmd`.
+    pub cmds: &'static [UvmCmd],
+}
+
+impl UvmTable {
+    pub fn lookup(&self, cmd: u32) -> Option<&'static UvmCmd> {
+        self.cmds.iter().find(|c| c.cmd == cmd)
+    }
+}
+
+/// The UVM table for a host driver version; none before the first release
+/// measured, the last for anything newer than every release.
+pub fn uvm_table(v: DriverVersion) -> Option<&'static UvmTable> {
+    UVM_TABLES
+        .iter()
+        .find(|t| t.versions.0 <= v && v <= t.versions.1)
+}
+
 // ───────────────────────── NVKMS policy layout ─────────────────────────
 //
 // What the backend's NVKMS policy (device/src/nvkms.rs) reads and rewrites
@@ -684,6 +742,46 @@ mod tests {
 
     fn v(a: u32, b: u32, c: u32) -> DriverVersion {
         DriverVersion::new(a, b, c)
+    }
+
+    #[test]
+    fn every_release_from_the_first_measured_has_a_uvm_table_and_none_before() {
+        assert!(uvm_table(v(535, 129, 2)).is_none());
+        let mut next = v(535, 129, 3);
+        for t in UVM_TABLES {
+            assert_eq!(t.versions.0, next, "{} starts where the last ended", t.name);
+            assert!(t.versions.0 <= t.versions.1);
+            next = DriverVersion::new(t.versions.1.major, t.versions.1.minor, t.versions.1.patch + 1);
+            assert!(t.cmds.windows(2).all(|w| w[0].cmd < w[1].cmd), "{}", t.name);
+            for c in t.cmds {
+                assert!(c.size <= 0x3000, "{}: {}", t.name, c.name);
+                if let Some(fd) = c.fd {
+                    assert!(fd.offset + 4 <= c.size, "{}: {}", t.name, c.name);
+                }
+            }
+        }
+        assert_eq!(UVM_TABLES.last().unwrap().versions.1, v(999, 999, 999));
+    }
+
+    #[test]
+    fn uvm_blocks_are_the_releases_own() {
+        let size = |rel, cmd| uvm_table(rel).unwrap().lookup(cmd).map(|c| c.size);
+        // UVM_FREE lost `length` in 590.44.01.
+        assert_eq!(size(v(580, 178, 4), 34), Some(24));
+        assert_eq!(size(v(590, 44, 1), 34), Some(16));
+        assert_eq!(size(v(615, 71, 9), 34), Some(16));
+        // MAP_EXTERNAL_ALLOCATION's per-GPU array grew to 256 in 550.40.53.
+        assert_eq!(size(v(550, 40, 7), 33), Some(1200));
+        assert_eq!(size(v(550, 54, 14), 33), Some(9264));
+        // A two-part release is its .0 (version.rs).
+        assert_eq!(size(DriverVersion::parse("550.67").unwrap(), 33), Some(9264));
+        // UVM_INITIALIZE is 16 bytes whatever its number's 0x3000 says, and
+        // DEINITIALIZE takes nothing.
+        assert_eq!(size(v(610, 57, 4), 0x3000_0001), Some(16));
+        assert_eq!(size(v(610, 57, 4), 0x3000_0002), Some(0));
+        // DISCARD (80) came in 580.65.06.
+        assert_eq!(size(v(580, 65, 5), 80), None);
+        assert_eq!(size(v(580, 65, 6), 80), Some(32));
     }
 
     #[test]
