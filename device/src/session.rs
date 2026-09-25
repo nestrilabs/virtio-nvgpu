@@ -606,6 +606,8 @@ impl NvidiaBackend {
         };
         if class == SchemaClass::Kms {
             self.kms_states.entry(target).or_default();
+            // Scanout checksums: our card or a lessee only (kms.rs).
+            self.crc_gate(req.cmd, target, kind)?;
         }
         if class == SchemaClass::Modeset {
             // A per-head gate may rest on a lease's grant; the host takes

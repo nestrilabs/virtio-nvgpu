@@ -108,7 +108,11 @@ const TRANSFER_FLAGS_AT: usize = 24;
 ///
 /// The semaphore-surface calls (nvidia-drm 0x54-0x57) never wait: FENCE_WAIT
 /// registers a callback (nvidia-drm-fence.c:1713-1732), FENCE_CREATE and
-/// ATTACH arm a timer (:1443-1446). They pass as they are.
+/// ATTACH arm a timer (:1443-1446). 0x55-0x57 pass as they are. 0x54 does not
+/// come here: the index it carries is added to a host kernel mapping
+/// unchecked (:1257-1261) and the client it names is dup'd at kernel
+/// privilege, so it is bounded, owned and counted first (`semsurf`, called
+/// from the policy hooks in its place).
 pub fn before(cmd: u32, arg: &mut [u8]) -> Result<(), Errno> {
     let zero = |arg: &mut [u8], at: usize| -> Result<(), Errno> {
         arg.get_mut(at..at + 8)

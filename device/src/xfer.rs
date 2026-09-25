@@ -2926,9 +2926,23 @@ mod tests {
         let dev_info = Rq::new(0xc024_6443).buf(36, Some(&[0; 36]));
         let p = h.prepare(SchemaClass::Render, RENDER, &dev_info).unwrap();
         assert!(!p.wants_executor());
-        let crc = Rq::new(0xc008_6440).buf(8, Some(&[0; 8]));
-        let p = h.prepare(SchemaClass::Render, RENDER, &crc).unwrap();
+        // GET_DPY_ID_FOR_CONNECTOR_ID walks the connector list under
+        // mode_config locks, render node or not.
+        let dpy = Rq::new(0xc008_6450).buf(8, Some(&[0; 8]));
+        let p = h.prepare(SchemaClass::Render, RENDER, &dpy).unwrap();
         assert!(p.wants_executor());
+        // Scanout checksums are no render-node call here at all: from a
+        // render node they would find every host CRTC (M-7).
+        let crc = Rq::new(0xc008_6440).buf(8, Some(&[0; 8]));
+        assert_eq!(
+            h.prepare(SchemaClass::Render, RENDER, &crc).err(),
+            Some(libc::ENOTTY)
+        );
+        assert!(
+            h.prepare(SchemaClass::Kms, KMS, &crc)
+                .unwrap()
+                .wants_executor()
+        );
         let enc = Rq::new(iowr(0xa6, 20)).buf(20, Some(&[0; 20]));
         assert!(
             h.prepare(SchemaClass::Kms, KMS, &enc)

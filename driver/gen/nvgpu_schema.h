@@ -353,8 +353,6 @@ static const struct nvgpu_sioctl nvgpu_schema_drm_ioctls[] = {
   {.name = "SYNCOBJ_TRANSFER", .cmd = 0xc02064ccu, .size = 32, .sclass = NVGPU_SCLASS_RENDER, .policy = 0x1u, .field = 54},
   {.name = "SYNCOBJ_TIMELINE_SIGNAL", .cmd = 0xc01864cdu, .size = 24, .sclass = NVGPU_SCLASS_RENDER, .policy = 0x1u, .field = 54, .nfield = 2},
   {.name = "SYNCOBJ_EVENTFD", .cmd = 0xc01864cfu, .size = 24, .sclass = NVGPU_SCLASS_RENDER, .policy = 0x1u, .field = 56, .nfield = 1},
-  {.name = "NV_GET_CRTC_CRC32", .cmd = 0xc0086440u, .size = 8, .sclass = NVGPU_SCLASS_RENDER, .flags = NVGPU_SIO_EXECUTOR, .field = 57},
-  {.name = "NV_GET_CRTC_CRC32_V2", .cmd = 0xc01c644cu, .size = 28, .sclass = NVGPU_SCLASS_RENDER, .flags = NVGPU_SIO_EXECUTOR, .field = 57},
   {.name = "NV_GET_DPY_ID_FOR_CONNECTOR_ID", .cmd = 0xc0086450u, .size = 8, .sclass = NVGPU_SCLASS_RENDER, .flags = NVGPU_SIO_EXECUTOR, .field = 57},
   {.name = "NV_GET_CONNECTOR_ID_FOR_DPY_ID", .cmd = 0xc0086451u, .size = 8, .sclass = NVGPU_SCLASS_RENDER, .flags = NVGPU_SIO_EXECUTOR, .field = 57},
   {.name = "NV_GEM_IMPORT_NVKMS_MEMORY", .cmd = 0xc0206441u, .size = 32, .sclass = NVGPU_SCLASS_RENDER, .field = 57, .nfield = 2},

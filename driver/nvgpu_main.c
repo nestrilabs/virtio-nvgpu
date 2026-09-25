@@ -90,6 +90,18 @@ extern struct kset *module_kset;
 #define NVGPU_CLASS_EVENT_OS_EVENT 0x79
 #define NVGPU_NV0005_DATA_OFFSET 16
 
+/*
+ * Parameters that name an OS event -- the descriptor ALLOC_OS_EVENT was
+ * given -- as a u64 `notificationHandle`, which RM looks up by (fd, hClient)
+ * in the calling process (os.c:1789-1815): a semaphore surface's
+ * REGISTER_WAITER at 24 and UNREGISTER_WAITER at 16 (ctrl00da.h:207-212,
+ * 251-255), and NV_EVENT_BUFFER's allocation at 40 (cl90cd.h:164-180).
+ */
+#define NVGPU_RM_SEMSURF_REGISTER_WAITER 0x00da0003
+#define NVGPU_RM_SEMSURF_UNREGISTER_WAITER 0x00da0005
+#define NVGPU_CLASS_EVENT_BUFFER 0x90cd
+#define NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET 40
+
 /* ───────── NVIDIA ioctl parameter structs ───────── */
 
 struct NVOS54_PARAMETERS {
@@ -387,6 +399,47 @@ int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
 }
 
 /*
+ * An OS event named by descriptor in a u64 of RM's parameters at `slot`.
+ *
+ * The backend's RM looks the event up by the descriptor in *its* table, so,
+ * as for every other descriptor we forward, the number the backend is sent
+ * is the handle it issued for our file, and the backend turns it into its
+ * own descriptor. Left as the guest's number, a waiter found no event (or
+ * another of the client's), and an NV_EVENT_BUFFER allocation -- which does
+ * not fail when the lookup does, but keeps the raw number as the event
+ * pointer (event_buffer.c:463-477) -- was a host oops waiting to happen; the
+ * backend refuses one now, and this makes the honest caller's call work.
+ * Zero is "no notification" and passes as it is. The caller's value is
+ * saved in `*saved`, for the reply.
+ */
+static int nvgpu_rm_os_event_in(void *slot, u64 *saved) {
+  u32 handle;
+  u64 v;
+
+  memcpy(&v, slot, sizeof(v));
+  *saved = v;
+  if (!v)
+    return 0;
+  if (v > INT_MAX || nvgpu_handle_for_fd((int)v, &handle))
+    return -EBADF;
+  v = handle;
+  memcpy(slot, &v, sizeof(v));
+  return 0;
+}
+
+/* Where an RM control keeps an OS event (see above), or -1. */
+static int nvgpu_rm_os_event_offset(u32 ctl_cmd) {
+  switch (ctl_cmd) {
+  case NVGPU_RM_SEMSURF_REGISTER_WAITER:
+    return 24;
+  case NVGPU_RM_SEMSURF_UNREGISTER_WAITER:
+    return 16;
+  default:
+    return -1;
+  }
+}
+
+/*
  * nvgpu_ioctl_rm_control — NV_ESC_RM_CONTROL with nested params buffer.
  *
  * Handles three cases:
@@ -446,6 +499,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   /* A descriptor named inside the nested block, and where it sits. */
   int nested_fd = -1;
   u32 nested_fd_offset = 0;
+
+  /* An OS event named inside it (nvgpu_rm_os_event_in), and where. */
+  int os_event_off = -1;
+  u64 os_event_val = 0;
 
   /* Second-level pointer carried alongside the nested block. */
   u64 deep_user_ptr = 0;
@@ -592,6 +649,26 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
         }
       }
     }
+
+    /*
+     * A parameter block too short to hold the field is the backend's to
+     * refuse; only one that holds it is translated.
+     */
+    os_event_off = nvgpu_rm_os_event_offset(ctl_cmd);
+    if (os_event_off >= 0 && nested_size >= os_event_off + sizeof(u64)) {
+      ret = nvgpu_rm_os_event_in(req_buf + sizeof(*req) + sizeof(params) +
+                                     os_event_off,
+                                 &os_event_val);
+      if (ret) {
+        dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                             "virtio-gpu-nv: RM control 0x%x names OS event "
+                             "0x%llx, which is not one of our devices\n",
+                             ctl_cmd, os_event_val);
+        goto out;
+      }
+    } else {
+      os_event_off = -1;
+    }
   }
 
   if (deep_len > 0) {
@@ -634,6 +711,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
              &nested_fd, sizeof(nested_fd));
+    if (os_event_off >= 0 && copy_back >= os_event_off + sizeof(u64))
+      memcpy(resp_buf + sizeof(*resp) + sizeof(params) + os_event_off,
+             &os_event_val, sizeof(os_event_val));
 
     if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))
@@ -673,6 +753,9 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
   u32 used;
+  /* NV_EVENT_BUFFER's OS event, translated, and the caller's value. */
+  bool os_event = false;
+  u64 os_event_val = 0;
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -680,7 +763,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (copy_from_user(&params, uarg, sizeof(params)))
     return -EFAULT;
 
-  user_alloc = (void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
+  user_alloc =(void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
   nested_size = le32_to_cpu(params.paramsSize);
 
   /*
@@ -776,6 +859,23 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
           memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
         }
       }
+
+      /* NV_EVENT_BUFFER's OS event, as for a waiter's (see there). */
+      if (hclass == NVGPU_CLASS_EVENT_BUFFER &&
+          nested_size >=
+              NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64)) {
+        ret = nvgpu_rm_os_event_in(nested +
+                                       NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
+                                   &os_event_val);
+        if (ret) {
+          dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                               "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                               "0x%llx, which is not one of our devices\n",
+                               os_event_val);
+          goto out;
+        }
+        os_event = true;
+      }
     }
   }
 
@@ -802,6 +902,11 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
 
+    if (os_event &&
+        copy_back >= NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64))
+      memcpy(resp_buf + sizeof(*resp) + sizeof(params) +
+                 NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
+             &os_event_val, sizeof(os_event_val));
     if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back) &&
         copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))

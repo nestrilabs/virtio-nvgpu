@@ -24,6 +24,7 @@ pub mod privfd;
 pub mod pump;
 pub mod replay;
 pub mod schema;
+pub mod semsurf;
 pub mod session;
 pub mod shm;
 pub mod userspace;

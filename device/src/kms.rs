@@ -404,7 +404,81 @@ pub fn lease_holds_objects(sys: &dyn xfer::Sys, fd: RawFd) -> Result<bool, xfer:
     }
 }
 
+// ─────────────────────────── scanout checksums ───────────────────────────
+//
+// nvidia-drm's GET_CRTC_CRC32 and _V2 hand back a checksum of what a CRTC
+// scans out, each call holding nvkms_lock across two synchronous core
+// updates (nvkms-evo.c:9301-9318). Which CRTCs a file may name is the DRM
+// core's lease filter, and that filters only a lessee: for any file whose
+// master has no lessor -- a non-master file of the card such as a lease
+// device's `drm_fd`, or the lessor itself -- every CRTC is found
+// (drm_lease.c:90-93, 109-121; drm_mode_object.c:151-155). So the schema
+// offers them on card and lease files only (not on render nodes, where
+// nvidia-drm also allows them), and here they pass only on a card the
+// guest drives itself (a `DrmCard`, which exists only in compositor-VM
+// mode) or on a file that is a lessee, whose CRTCs the host then filters
+// natively.
+//
+// A lessee has nothing to show for it but its master's `lessor`, which no
+// query reports: GET_LEASE answers a lessor with every object on the card
+// (drm_lease.c:661-666). CREATE_LEASE looks at it first, though: a
+// lessee's is refused -EINVAL as a sub-lease (:499-505) before the object
+// list is read, which for anyone else is where a NULL list with a count
+// of one faults (-EFAULT, :511-518); and a file that is not current master
+// is refused -EACCES before the call runs at all (DRM_MASTER,
+// drm_ioctl.c). Nothing is created on any of these paths.
+
+/// `DRM_IOCTL_MODE_CREATE_LEASE`: `_IOWR('d', 0xC6, struct
+/// drm_mode_create_lease)`, `{u64 object_ids; u32 object_count; u32 flags;
+/// u32 lessee_id; u32 fd;}`.
+pub const DRM_IOCTL_MODE_CREATE_LEASE: u32 = 0xc018_64c6;
+
+/// `DRM_IOCTL_NVIDIA_GET_CRTC_CRC32` and `_V2` (nv_drm_common_ioctl.h).
+pub const NV_GET_CRTC_CRC32: u32 = 0xc008_6440;
+pub const NV_GET_CRTC_CRC32_V2: u32 = 0xc01c_644c;
+
+/// Whether the DRM file `fd` is a lessee (see above).
+pub fn is_lessee(sys: &dyn xfer::Sys, fd: RawFd) -> bool {
+    let mut arg = [0u8; 24];
+    arg[8..12].copy_from_slice(&1u32.to_le_bytes());
+    let r = sys.ioctl(fd, DRM_IOCTL_MODE_CREATE_LEASE, arg.as_mut_ptr());
+    if r >= 0 {
+        // Cannot happen with a NULL object list; if a kernel ever made a
+        // lease of it, the lessee file is ours and must not stay open.
+        let lessee = i32::from_le_bytes(arg[20..24].try_into().unwrap());
+        if lessee >= 0 {
+            sys.close(lessee);
+        }
+        return false;
+    }
+    -r == libc::EINVAL
+}
+
 impl NvidiaBackend {
+    /// GET_CRTC_CRC32(_V2) on KMS handle `target`: only on a card the guest
+    /// drives or a lessee (see above). Every other call passes.
+    pub(crate) fn crc_gate(&self, cmd: u32, target: u32, kind: HandleKind) -> Result<(), i32> {
+        if cmd != NV_GET_CRTC_CRC32 && cmd != NV_GET_CRTC_CRC32_V2 {
+            return Ok(());
+        }
+        let ok = match kind {
+            HandleKind::DrmCard(_) => true,
+            HandleKind::DrmLease(_) => self
+                .handles
+                .get_raw(target)
+                .is_ok_and(|fd| is_lessee(&*self.xfer_sys, fd)),
+            _ => false,
+        };
+        if !ok {
+            log::warn!(
+                "GET_CRTC_CRC32 on handle {target} ({kind:?}) refused: that file finds every \
+                 CRTC of the host, not only the ones leased to it"
+            );
+            return Err(libc::EPERM);
+        }
+        Ok(())
+    }
+
     /// The host card nodes offered to the guest, in the order its
     /// `EV_HOTPLUG` cookie indexes them (GET_SYS_FILES section 3).
     pub fn kms_cards(&mut self) -> Vec<CardNode> {
@@ -737,6 +811,76 @@ mod tests {
         fn size_of(&self, _: RawFd) -> i64 {
             0
         }
+    }
+
+    /// CREATE_LEASE with a NULL list of one object, as the kernel answers
+    /// a lessee (-EINVAL), anyone else who is master (-EFAULT) and a file
+    /// that is not (-EACCES).
+    struct CreateLeaseSys(i32, std::sync::Mutex<Vec<RawFd>>);
+
+    impl xfer::Sys for CreateLeaseSys {
+        fn ioctl(&self, _: RawFd, cmd: u32, arg: *mut u8) -> i32 {
+            assert_eq!(cmd, DRM_IOCTL_MODE_CREATE_LEASE);
+            // SAFETY: is_lessee passes its 24-byte argument.
+            let a = unsafe { std::slice::from_raw_parts_mut(arg, 24) };
+            assert_eq!(&a[..8], &[0; 8], "no object list: nothing to lease");
+            assert_eq!(&a[8..16], &[1, 0, 0, 0, 0, 0, 0, 0], "one object, no flags");
+            if self.0 >= 0 {
+                a[20..24].copy_from_slice(&self.0.to_le_bytes());
+                return 0;
+            }
+            self.0
+        }
+        fn close(&self, fd: RawFd) {
+            self.1.lock().unwrap().push(fd);
+        }
+        fn size_of(&self, _: RawFd) -> i64 {
+            0
+        }
+    }
+
+    fn create_lease(r: i32) -> CreateLeaseSys {
+        CreateLeaseSys(r, Default::default())
+    }
+
+    #[test]
+    fn only_a_lessee_is_taken_for_one() {
+        assert!(is_lessee(&create_lease(-libc::EINVAL), 0));
+        assert!(!is_lessee(&create_lease(-libc::EFAULT), 0), "a lessor");
+        assert!(
+            !is_lessee(&create_lease(-libc::EACCES), 0),
+            "a lease device's drm_fd, or a lessee whose lessor lost master"
+        );
+        assert!(!is_lessee(&create_lease(-libc::ENOTTY), 0));
+        // A lease somehow made is closed, not kept.
+        let made = create_lease(42);
+        assert!(!is_lessee(&made, 0));
+        assert_eq!(*made.1.lock().unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn scanout_checksums_pass_on_our_card_or_a_lessee_only() {
+        let mut be = NvidiaBackend::for_test();
+        let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let card = be.adopt_for_test(devnull(), HandleKind::DrmCard(0));
+        let lease = be.adopt_for_test(devnull(), HandleKind::DrmLease(0));
+        for cmd in [NV_GET_CRTC_CRC32, NV_GET_CRTC_CRC32_V2] {
+            assert_eq!(be.crc_gate(cmd, card, HandleKind::DrmCard(0)), Ok(()));
+            be.xfer_sys = std::sync::Arc::new(create_lease(-libc::EINVAL));
+            assert_eq!(be.crc_gate(cmd, lease, HandleKind::DrmLease(0)), Ok(()));
+            for other in [-libc::EFAULT, -libc::EACCES] {
+                be.xfer_sys = std::sync::Arc::new(create_lease(other));
+                assert_eq!(
+                    be.crc_gate(cmd, lease, HandleKind::DrmLease(0)),
+                    Err(libc::EPERM)
+                );
+            }
+        }
+        // Anything else on a lease file is none of this gate's business.
+        assert_eq!(
+            be.crc_gate(DRM_IOCTL_MODE_GET_LEASE, lease, HandleKind::DrmLease(0)),
+            Ok(())
+        );
     }
 
     #[test]

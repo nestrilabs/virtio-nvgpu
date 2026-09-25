@@ -12,6 +12,7 @@ use crate::nvkms::{self, NvkmsPolicy};
 use crate::policy::BackendHooks;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
+use crate::semsurf::SemsurfPolicy;
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
 use crate::xfer::{Hooks, KmsFileState, Sys};
@@ -441,6 +442,11 @@ pub struct NvidiaBackend {
     /// Its NVKMS section's state, which also gates v1 NVKMS calls and hears
     /// of the host version, the mode and every handle closed (nvkms.rs).
     pub(crate) nvkms: Arc<NvkmsPolicy>,
+    /// What SEMSURF_FENCE_CTX_CREATE and the OS-event fields of RM calls may
+    /// name: the host's semaphore layout, this VM's RM clients and OS
+    /// events, its live fence contexts (semsurf.rs). Fed here, read by the
+    /// policy hooks too.
+    pub(crate) semsurf: Arc<SemsurfPolicy>,
     /// The system calls IOCTL2 makes: the host's, except in tests that run
     /// whole calls against a fake kernel.
     pub(crate) xfer_sys: Arc<dyn Sys>,
@@ -826,6 +832,7 @@ impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
         let nvkms = Arc::new(NvkmsPolicy::new());
+        let semsurf = Arc::new(SemsurfPolicy::new());
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
@@ -856,8 +863,9 @@ impl NvidiaBackend {
             signaled: None,
             kms_states: std::collections::HashMap::new(),
             syncobj_regs: crate::fence::Registrations::default(),
-            hooks: BackendHooks::with_nvkms(nvkms.clone()),
+            hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone()),
             nvkms,
+            semsurf,
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
             wl: crate::wl::WlState::default(),
@@ -1102,6 +1110,7 @@ impl NvidiaBackend {
         self.wl_forget_all();
         self.syncobj_regs.clear();
         self.nvkms.reset();
+        self.semsurf.reset();
         self.handles.drain_all();
     }
 
@@ -1364,6 +1373,9 @@ impl NvidiaBackend {
         }
         self.created.push(guest_handle);
         log::info!("open {:?} -> handle={guest_handle} (fd={raw_fd})", path);
+        if let HandleKind::DriRender(dri) = kind {
+            self.semsurf_render_opened(guest_handle, dri);
+        }
 
         // The handle is returned in the header. The driver reads it from there
         // and there is no response payload at all.
@@ -1725,6 +1737,7 @@ impl NvidiaBackend {
         self.kms_states.remove(&handle);
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
+        self.semsurf.forget_handle(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);
@@ -1885,7 +1898,16 @@ impl NvidiaBackend {
         match route {
             V1Route::Rm => {}
             V1Route::Uvm | V1Route::DrmFlat => {
-                return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
+                let n = self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
+                // A fence context is a GEM object of the file, and counts
+                // against its cap until it is closed (semsurf.rs).
+                if ireq.cmd == hostfd::DRM_IOCTL_GEM_CLOSE
+                    && crate::semsurf::reply_params(resp_buf, n).is_some()
+                {
+                    let gem = u32::from_le_bytes(param_in[..4].try_into().unwrap());
+                    self.semsurf.gem_closed(self.current_handle, gem);
+                }
+                return n;
             }
             V1Route::Nvkms => {
                 // NVKMS multiplexes every operation through one ioctl number,
@@ -1982,8 +2004,15 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // FD-carrying ioctls — need handle translation
             // ---------------------------------------------------------------
-            NV_ESC_REGISTER_FD | NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
+            NV_ESC_REGISTER_FD => {
                 self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf)
+            }
+            // The OS events RM calls may name later (semsurf.rs).
+            NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
+                let n =
+                    self.dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, resp_buf);
+                self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
+                n
             }
 
             NV_ESC_RM_ALLOC_MEMORY => {
@@ -2025,9 +2054,12 @@ impl NvidiaBackend {
                     let class = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
                     *self.rm_classes.entry(class).or_insert(0) += 1;
                 }
-                self.dispatch_nested(
+                let n = self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
-                )
+                );
+                // A client made here is one 0x54 may name (semsurf.rs).
+                self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
+                n
             }
 
             // ---------------------------------------------------------------
@@ -2045,7 +2077,10 @@ impl NvidiaBackend {
                         &param_in[..std::cmp::min(param_in.len(), 16)]
                     );
                 }
-                self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf)
+                let n = self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
+                // RM_FREE of a client: no longer one 0x54 may name.
+                self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
+                n
             }
         }
     }
@@ -2095,6 +2130,33 @@ impl NvidiaBackend {
             .expect("outer_size covers the pointer field");
 
         let escape = (request & 0xFF) as u32;
+
+        // An OS event named by descriptor inside RM's parameters: semaphore
+        // surface waiters and NV_EVENT_BUFFER (semsurf.rs). Found before
+        // anything is copied, so a call that would have the host read the
+        // field from past what the guest sent is refused outright.
+        let rm = nested_fd_offset.is_none() && hostfd::ioc_type(request as u32) == b'F';
+        let os_event = match crate::semsurf::os_event_field(
+            if rm { escape } else { 0 },
+            &param_in[..outer_size],
+            param_in.len() - outer_size,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!(
+                    "RM call {request:#x}: its OS-event field is not in the {} bytes sent",
+                    param_in.len() - outer_size
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
+            }
+        };
+        // Neither a waiter nor an event buffer holds a second-level pointer,
+        // and one the guest claims could be aimed at the field: the address
+        // written there below would reach RM as the event.
+        if os_event.is_some() && deep_in.is_some() {
+            log::warn!("RM call {request:#x} names an OS event and claims a deep pointer");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
 
         // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
         if escape == 0x2A && outer.len() >= 12 {
@@ -2168,6 +2230,27 @@ impl NvidiaBackend {
                                  the file this event is to be delivered on"
                             );
                         }
+                    }
+                }
+            }
+
+            // The same for the OS event a waiter or an event buffer names by
+            // (u64) descriptor: our handle becomes the host descriptor RM
+            // looks the event up by, and only for an event that is live --
+            // for NV_EVENT_BUFFER a lookup that misses is a host oops, not a
+            // refusal (semsurf.rs).
+            let mut saved_os_event: Option<(usize, [u8; 8])> = None;
+            if let Some((off, h_client)) = os_event {
+                match self.os_event_fd(h_client, &host_buf[off..off + 8]) {
+                    Ok(None) => {}
+                    Ok(Some(fd)) => {
+                        let mut guest = [0u8; 8];
+                        guest.copy_from_slice(&host_buf[off..off + 8]);
+                        saved_os_event = Some((off, guest));
+                        host_buf[off..off + 8].copy_from_slice(&(fd as u64).to_le_bytes());
+                    }
+                    Err(e) => {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
                     }
                 }
             }
@@ -2384,6 +2467,9 @@ impl NvidiaBackend {
             // Restore guest_handle in host_buf before sending back to guest
             if let Some((offset, handle_val)) = saved_nested_handle {
                 host_buf[offset..offset + 4].copy_from_slice(&handle_val.to_le_bytes());
+            }
+            if let Some((offset, guest)) = saved_os_event {
+                host_buf[offset..offset + 8].copy_from_slice(&guest);
             }
 
             // The caller's own pointer value goes back, not ours and not zero.
@@ -2767,9 +2853,12 @@ impl NvidiaBackend {
         let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
         log::info!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
 
-        // Zero out the addresses before sending back to guest
-        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
-        param_buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+        // The caller's own addresses go back. RM only reads pOld/pNew
+        // (escape.c:857-876 takes them into locals and writes nothing but
+        // `status`), and nvidia.ko copies the whole argument back
+        // (nv.c:2834), so a native caller reads back what it passed -- not
+        // zero, and never the host VA we put there for the call.
+        param_buf[16..32].copy_from_slice(&param_in[16..32]);
 
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
@@ -4561,5 +4650,25 @@ mod tests {
             assert_eq!((rec.major, rec.minor), (226, 1));
             assert_eq!(n, off + 4 + 16 + 5);
         }
+    }
+
+    /// RM never writes UPDATE_DEVICE_MAPPING_INFO's pOld/pNew, so the
+    /// caller reads back what it passed -- not zero, and not the host
+    /// address the backend put there for the call (L-6).
+    #[test]
+    fn update_device_mapping_info_gives_the_callers_addresses_back() {
+        let mut be = gated_backend();
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        // NVOS56 {hClient, hDevice, hMemory, pad, pOld, pNew, status, pad}.
+        let mut p = [0u8; 40];
+        p[16..24].copy_from_slice(&0x7f00_1000u64.to_le_bytes());
+        p[24..32].copy_from_slice(&0x7f00_2000u64.to_le_bytes());
+        let cmd = hostfd::ioc(hostfd::IOC_RW, b'F', 0x5e, 40);
+        let resp = v1_ioctl(&mut be, ctl, cmd, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(forwarded(), vec![cmd as u64]);
+        let body = &resp[IOCTL_BODY..];
+        assert_eq!(&body[16..32], &p[16..32], "the caller's own pOld and pNew");
+        assert_eq!(&body[32..36], &[0xaa; 4], "the host's status");
     }
 }
