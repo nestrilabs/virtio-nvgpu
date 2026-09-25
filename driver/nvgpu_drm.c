@@ -14,7 +14,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/fcntl.h>
 #include <linux/fs.h>
-#include <linux/hashtable.h>
 #include <linux/io.h>
 #include <linux/iosys-map.h>
 #include <linux/mm.h>
@@ -506,56 +505,17 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
  * proxy's reference on the owner is what keeps that handle open until now,
  * and it is dropped last, after the GEM_CLOSE and MUNMAP that need it.
  */
-/*
- * ───────── live proxies, by the host object they stand for ─────────
- *
- * A host render file hands out one GEM handle per object, whoever asks: a
- * PRIME import of a dma-buf the file already holds returns the handle it
- * already has (drm_gem_prime_fd_to_handle, drm_prime.c:305-308, on the host
- * as here). So a host handle that comes back from an import may be one a
- * proxy already stands in front of, and a second proxy for it would be a
- * second owner of the same number: the first to go sends GEM_CLOSE, and the
- * other is left naming nothing -- or, once the host reuses the number, some
- * other object. Every proxy is therefore findable by (owner file, host
- * handle) for as long as it lives, and a path that receives a host handle
- * from an import (nvgpu_dmabuf_from_host; IOCTL2 GEM outs) reuses the proxy
- * it finds instead of making another.
- *
- * Entries leave the table first thing in nvgpu_gem_free(), before the
- * GEM_CLOSE; a lookup racing the last put sees a zero refcount and skips it.
- */
-#define NVGPU_GEM_LIVE_BITS 8
-static DEFINE_HASHTABLE(nvgpu_gem_live, NVGPU_GEM_LIVE_BITS);
-static DEFINE_SPINLOCK(nvgpu_gem_live_lock);
-
-static unsigned long nvgpu_gem_live_key(const struct nvgpu_fd *owner,
-                                        u32 host_handle) {
-  return (unsigned long)owner ^ ((unsigned long)host_handle << 4);
-}
-
-struct nvgpu_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
-                                              u32 host_handle) {
-  struct nvgpu_gem_object *ng, *found = NULL;
-
-  spin_lock(&nvgpu_gem_live_lock);
-  hash_for_each_possible(nvgpu_gem_live, ng, live,
-                         nvgpu_gem_live_key(owner, host_handle)) {
-    if (ng->owner == owner && ng->host_handle == host_handle &&
-        kref_get_unless_zero(&ng->base.refcount)) {
-      found = ng;
-      break;
-    }
-  }
-  spin_unlock(&nvgpu_gem_live_lock);
-  return found;
-}
-
 static void nvgpu_gem_free(struct drm_gem_object *obj) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
 
-  spin_lock(&nvgpu_gem_live_lock);
-  hash_del(&ng->live);
-  spin_unlock(&nvgpu_gem_live_lock);
+  /*
+   * Out of the owner's index first, while the host handle is still open: the
+   * number cannot be handed to another object until the GEM_CLOSE below, so
+   * nothing can find this dying proxy under a number that already means
+   * something else. Only our own entry, never a successor's.
+   */
+  if (ng->owner && ng->host_handle)
+    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
 
   /* The handles SEMSURF_FENCE_ATTACH gave this object in other files go
    * first: each holds the host object too, and a reference on its file. */
@@ -908,27 +868,17 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
 };
 
 /*
- * Stand a guest object in front of a host one and return the guest handle.
- *
- * `size` is what the core reports for the object and what it validates
- * framebuffer dimensions against, so it has to be at least the real buffer.
- * Page-aligned because the core rejects an object smaller than a page.
- *
- * The host handle is this function's from the moment it is called: every
- * failure closes it exactly once. Callers used to close it again after a
- * failed drm_gem_handle_create(), whose put had already freed the proxy and
- * sent GEM_CLOSE -- and a second close of a number the host may have reused
- * for a newer object closes that one.
- */
-/*
- * The proxy object itself, with one reference and no handle, registered as
- * live. Owns @host_handle the same way nvgpu_gem_proxy_create() does.
+ * The proxy object itself, with one reference and no handle, indexed in
+ * @owner's gem_index (nvgpu_gem_proxy_find()). Owns @host_handle the same way
+ * nvgpu_gem_proxy_create() does, except on -EEXIST: a proxy already stands for
+ * that host handle, which stays that proxy's.
  */
 static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
                                                     struct nvgpu_fd *owner,
                                                     u32 host_handle,
                                                     size_t size) {
   struct nvgpu_gem_object *ng;
+  int ret;
 
   size = PAGE_ALIGN(size);
   if (!size)
@@ -950,20 +900,54 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
   ng->host_handle = host_handle;
   ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
 
-  spin_lock(&nvgpu_gem_live_lock);
-  hash_add(nvgpu_gem_live, &ng->live, nvgpu_gem_live_key(owner, host_handle));
-  spin_unlock(&nvgpu_gem_live_lock);
+  /*
+   * One proxy per host handle of a file, ever. A second would GEM_CLOSE the
+   * number again when it died, and the host reuses numbers (drm_gem.c idr,
+   * lowest free), so that close would land on whatever object had it by
+   * then. A host handle that is already someone's proxy is theirs: refused
+   * with -EEXIST, and left alone. Indexed only once whole, since
+   * nvgpu_gem_proxy_find() hands out what it finds there.
+   */
+  ret = xa_insert(&owner->gem_index, host_handle, ng, GFP_KERNEL);
+  if (ret) {
+    if (ret == -EBUSY) {
+      ng->host_handle = 0; /* the free below must not close it */
+      ret = -EEXIST;
+    }
+    drm_gem_object_put(&ng->base);
+    return ERR_PTR(ret);
+  }
   return ng;
 }
 
+/*
+ * Stand a guest object in front of a host one and return the guest handle.
+ *
+ * `size` is what the core reports for the object and what it validates
+ * framebuffer dimensions against, so it has to be at least the real buffer.
+ * Page-aligned because the core rejects an object smaller than a page.
+ *
+ * The host handle is this function's from the moment it is called: every
+ * failure closes it exactly once, except -EEXIST (a proxy of @owner already
+ * stands for it, and the number is that proxy's). Callers used to close it
+ * again after a failed drm_gem_handle_create(), whose put had already freed
+ * the proxy and sent GEM_CLOSE -- and a second close of a number the host may
+ * have reused for a newer object closes that one.
+ */
 int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            u32 host_handle, size_t size, u32 *guest_handle) {
   struct nvgpu_gem_object *ng;
   int ret;
 
   ng = nvgpu_gem_proxy_new(file->minor->dev, owner, host_handle, size);
-  if (IS_ERR(ng))
+  if (IS_ERR(ng)) {
+    if (PTR_ERR(ng) == -EEXIST)
+      dev_warn_ratelimited(&owner->dev->vdev->dev,
+                           "virtio-gpu-nv: host GEM handle %u of file %u "
+                           "already has a proxy; not making a second\n",
+                           host_handle, owner->handle);
     return PTR_ERR(ng);
+  }
 
   ret = drm_gem_handle_create(file, &ng->base, guest_handle);
   /* The handle holds the only reference now, or nothing does and it is
@@ -1023,33 +1007,45 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
                            int o_flags) {
   struct nvgpu_fd *nfd = nvgpu_drm_file_nfd(drm_filp);
-  struct drm_file *file;
+  struct drm_gem_object *obj = NULL;
   struct nvgpu_gem_object *ng;
+  struct drm_file *file;
   struct dma_buf *buf;
+  int fd, ret, tries;
   u32 handle;
-  int fd, ret;
 
   if (!nfd)
     return -EBADF;
   file = drm_filp->private_data;
 
-  ng = nvgpu_gem_proxy_find(nfd, host_gem);
-  if (ng && ng->base.dev != file->minor->dev) {
+  /*
+   * The proxy already standing for host_gem, if any; else a new one. A
+   * racing import of the same buffer may index its proxy between the two
+   * (-EEXIST, host_gem left alone): that one is then found on the retry.
+   */
+  for (tries = 0; !obj && tries < 2; tries++) {
+    obj = nvgpu_gem_proxy_find(nfd, host_gem);
+    if (obj)
+      break;
+    ng = nvgpu_gem_proxy_new(file->minor->dev, nfd, host_gem, size);
+    if (!IS_ERR(ng))
+      obj = &ng->base;
+    else if (PTR_ERR(ng) != -EEXIST)
+      return PTR_ERR(ng);
+  }
+  if (!obj)
+    return -EBUSY; /* host_gem is the proxy's that keeps winning the race */
+  if (obj->dev != file->minor->dev) {
     /* Proxies of a file's objects are made in that file's device; one that
      * is not cannot get a handle here, and a second proxy would double-own
      * the host handle. Should never happen: refuse rather than guess. */
-    drm_gem_object_put(&ng->base);
+    drm_gem_object_put(obj);
     return -EINVAL;
   }
-  if (!ng) {
-    ng = nvgpu_gem_proxy_new(file->minor->dev, nfd, host_gem, size);
-    if (IS_ERR(ng))
-      return PTR_ERR(ng);
-  }
-  ret = drm_gem_handle_create(file, &ng->base, &handle);
+  ret = drm_gem_handle_create(file, obj, &handle);
   /* The handle's reference, or none: a proxy made here and never handled is
    * freed now, which closes the host handle. */
-  drm_gem_object_put(&ng->base);
+  drm_gem_object_put(obj);
   if (ret)
     return ret;
   buf = drm_gem_prime_handle_to_dmabuf(file->minor->dev, file, handle,
@@ -1100,6 +1096,40 @@ struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
     return NULL;
   }
   return to_nvgpu_gem(obj);
+}
+
+struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
+                                            u32 host_handle) {
+  struct nvgpu_gem_object *ng;
+  struct drm_gem_object *obj = NULL;
+
+  /* nvgpu_gem_free() erases under this lock before the memory goes, so a
+   * proxy seen here is still allocated; one already on its way out (count
+   * zero) is not handed back. */
+  xa_lock(&owner->gem_index);
+  ng = xa_load(&owner->gem_index, host_handle);
+  if (ng && kref_get_unless_zero(&ng->base.refcount))
+    obj = &ng->base;
+  xa_unlock(&owner->gem_index);
+  return obj;
+}
+
+int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
+                          u64 *offset) {
+  struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
+  int ret;
+
+  if (!obj)
+    return -ENOENT;
+  if (obj->funcs != &nvgpu_gem_funcs) {
+    drm_gem_object_put(obj);
+    return -ENOENT;
+  }
+  ret = drm_gem_create_mmap_offset(obj);
+  if (!ret)
+    *offset = drm_vma_node_offset_addr(&obj->vma_node);
+  drm_gem_object_put(obj);
+  return ret;
 }
 
 /*
@@ -1404,6 +1434,16 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
   nfd->drm_file = file;
+  xa_init(&nfd->gem_index);
+
+  /* A lease being adopted into this very open, or a card file that may
+   * want the host's card later (nvgpu_kms.c). */
+  ret = nvgpu_kms_open(dri, file, nfd);
+  if (ret) {
+    nvgpu_close_handle(dev, nfd->handle);
+    goto err;
+  }
+
   nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
   kfree(req);
@@ -1437,6 +1477,8 @@ static void nvgpu_drm_detach(struct nvgpu_fd *nfd) {
   if (!nvgpu_fd_detach_drm(nfd, &kms))
     return;
   nvgpu_fd_unregister(nfd->dev, nfd);
+  /* Its event consumers and reserved events, while the drm_file stands. */
+  nvgpu_kms_detach(nfd);
   if (kms)
     nvgpu_close_handle(nfd->dev, kms);
 }
@@ -1515,6 +1557,17 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
   nfd = file->driver_priv;
 
   if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE) {
+    long kret;
+
+    /*
+     * A file with a KMS side (a lease, or a card file of a compositor-VM
+     * guest) sends its KMS ioctls -- and nvidia-drm's KMS-class ones -- to
+     * its host card or lease file, ahead of the core, which has no KMS of its
+     * own to answer them with. Everything it leaves goes on as before.
+     */
+    if (nvgpu_kms_ioctl(filp, cmd, arg, &kret))
+      return kret;
+
     if (nr >= DRM_COMMAND_BASE && nr < DRM_COMMAND_END) {
       struct nvgpu_dri_dev *dri = file->minor->dev->dev_private;
 
@@ -1572,6 +1625,23 @@ static const struct file_operations nvgpu_drm_fops = {
 };
 
 /*
+ * The guest core arbitrates DRM master (drm_auth.c) exactly as it would for a
+ * real card, and these follow its decisions onto the host card file behind a
+ * compositor-VM guest's card node. Both run under the core's master_mutex,
+ * after its own permission checks; neither can veto (void in 7.2,
+ * drm_drv.h:268-275).
+ */
+static void nvgpu_drm_master_set(struct drm_device *drm, struct drm_file *file,
+                                 bool new_master) {
+  nvgpu_kms_master_set(file, new_master);
+}
+
+static void nvgpu_drm_master_drop(struct drm_device *drm,
+                                  struct drm_file *file) {
+  nvgpu_kms_master_drop(file);
+}
+
+/*
  * Every feature any device of ours may have. A device that cannot serve one
  * has it cleared in its own drm_device.driver_features (nvgpu_dri_init()),
  * which the core ANDs with these on every check (drm_drv.h,
@@ -1587,6 +1657,8 @@ static const struct drm_driver nvgpu_drm_driver = {
     .gem_prime_import = nvgpu_gem_prime_import,
     .open = nvgpu_drm_open,
     .postclose = nvgpu_drm_postclose,
+    .master_set = nvgpu_drm_master_set,
+    .master_drop = nvgpu_drm_master_drop,
     .fops = &nvgpu_drm_fops,
     .name = "nvidia-drm",
     .desc = "NVIDIA DRM driver",

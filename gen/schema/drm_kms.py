@@ -10,8 +10,10 @@ Every KMS entry runs on the file's serial executor: nearly all of them take
 modeset locks, and the queue thread must never wait on one (DESIGN §2.5).
 
 Refused here by absence, on every class: GEM_CLOSE/FLINK/OPEN, PRIME_*,
-SET/DROP_MASTER, AUTH/GET_MAGIC (guest-local or hooks, never IOCTL2);
-MAP_DUMB and DESTROY_DUMB (answered from the guest's proxy).
+AUTH/GET_MAGIC (guest-local); MAP_DUMB and DESTROY_DUMB (answered from the
+guest's proxy). SET/DROP_MASTER are arbitrated by the guest core and never
+forwarded from userspace; the guest's master hooks send them as IOCTL2 so
+they run on the file's executor (POL_MASTER: host cards only).
 
 Caps (`max`) are bytes and far above anything real hardware reports; they
 exist so a count the caller made up cannot size an allocation.
@@ -35,6 +37,15 @@ IOCTLS = [
     Ioctl('SET_CLIENT_CAP', KMS, 'DRM_IOCTL_SET_CLIENT_CAP',
           'struct drm_set_client_cap', 16, 0x0d, IOW, exec=X,
           doc='drm_ioctl.c:317; per-file host state'),
+    # drm_auth.c:245, 288. Sent only by the guest's drm_driver master hooks,
+    # after its own core has arbitrated (nvgpu_kms.c); nvidia-drm's
+    # master_set grabs NVKMS ownership and master_drop disables every head
+    # (nvidia-drm-drv.c:954, 1038), so they wait on nvkms_lock like any KMS
+    # call and go to the executor.
+    Ioctl('SET_MASTER', KMS, 'DRM_IOCTL_SET_MASTER', None, 0, 0x1e, IOC_NONE,
+          exec=X, policy=POL_MASTER),
+    Ioctl('DROP_MASTER', KMS, 'DRM_IOCTL_DROP_MASTER', None, 0, 0x1f,
+          IOC_NONE, exec=X, policy=POL_MASTER),
     Ioctl('WAIT_VBLANK', KMS, 'DRM_IOCTL_WAIT_VBLANK', 'union drm_wait_vblank',
           24, 0x3a, IOWR, exec=X,
           doc='drm_vblank.c:1740; the guest only forwards the EVENT form'),

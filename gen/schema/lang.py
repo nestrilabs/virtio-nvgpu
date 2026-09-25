@@ -79,6 +79,7 @@ POL_NVKMS = 1 << 8          # NVKMS command; the NVKMS hook decides
 # host between the two may have either; run it only on a host of exactly the
 # table's release (the NVKMS hook checks).
 POL_NVKMS_EXACT = 1 << 9
+POL_MASTER = 1 << 10        # SET/DROP_MASTER: only on a host card, never a lease
 
 
 def ioc(d, t, nr, size):

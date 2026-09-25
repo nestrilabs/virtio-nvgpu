@@ -316,6 +316,7 @@ pub struct Prepared {
     entry: &'static Ioctl,
     class: SchemaClass,
     target: u32,
+    target_kind: HandleKind,
     bufs: Vec<HostBuf>,
     slots: Vec<Slot>,
     fd_ins: Vec<FdInRec>,
@@ -380,6 +381,7 @@ pub fn prepare(
         entry,
         class,
         target,
+        target_kind,
         bufs: w.bufs,
         slots: w.slots,
         fd_ins: Vec::new(),
@@ -524,6 +526,12 @@ impl Prepared {
     /// The handle the call runs on.
     pub fn target(&self) -> u32 {
         self.target
+    }
+
+    /// What kind of host file that handle is (a card and a lease take the
+    /// same KMS schema, but not the same policy).
+    pub fn target_kind(&self) -> HandleKind {
+        self.target_kind
     }
 
     /// Handles standing in descriptor fields: (buffer, offset, handle).

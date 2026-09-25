@@ -421,6 +421,7 @@ C_PREAMBLE = '''\
 #define NVGPU_SPOL_FB_PLANES (1u << 7)
 #define NVGPU_SPOL_NVKMS (1u << 8)
 #define NVGPU_SPOL_NVKMS_EXACT (1u << 9)
+#define NVGPU_SPOL_MASTER (1u << 10)
 
 /* FD_IN kinds: bit n is NVGPU_HK_* n; Dev is split by device. */
 #define NVGPU_SKIND(hk) (1u << (hk))

@@ -470,7 +470,9 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
   /*
    * The handle is this device's backend's; a clone of another device's node
    * would run its KMS ioctls against a backend that never heard of it.
-   * nvgpu_adopt_drm_file checks the rest (a primary-node file of ours).
+   * nvgpu_adopt_drm_file checks the rest (a primary-node file of ours) and
+   * owns the handle from the call, except on -EBADF (the template is not a
+   * card file of ours), which leaves the handle ours to close.
    */
   tn = nvgpu_drm_file_nfd(tmpl);
   if (!tn || tn->dev != dev) {
@@ -482,6 +484,8 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
     return -EBADF;
   }
   fd = nvgpu_adopt_drm_file(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
+  if (fd == -EBADF)
+    nvgpu_close_handle(dev, handle);
   fput(tmpl);
   return fd;
 }

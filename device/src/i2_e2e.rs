@@ -736,6 +736,9 @@ const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
 const SYNCOBJ_EVENTFD: u32 = 0xc018_64cf;
 const NVKMS: u32 = schema::NVKMS_IOCTL_IOWR;
 const LUT: usize = 6144;
+const SET_MASTER: u32 = 0x0000_641e;
+const DROP_MASTER: u32 = 0x0000_641f;
+const GETPROPERTY: u32 = 0xc040_64aa;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 
 impl Sys for Fake {
@@ -851,6 +854,22 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
             ("e2e-render", SYNCOBJ_WAIT) => {
                 k.wait_timeout = Some(peek(arg, 8, 8) as i64);
                 -libc::ETIME
+            }
+            // drm_setmaster_ioctl / drm_dropmaster_ioctl on a card: no
+            // argument at all, only the answer.
+            ("e2e-card", SET_MASTER) | ("e2e-card", DROP_MASTER) => 0,
+            // drm_mode_getproperty with every count 0: name and flags only
+            // (drm_property.c:458), which is how the guest classifies an id.
+            (_, GETPROPERTY) => {
+                assert_eq!(peek(arg, 0, 8), 0, "no values pointer");
+                assert_eq!(peek(arg, 8, 8), 0, "no enum pointer");
+                let name = match peek(arg, 16, 4) {
+                    7 => &b"IN_FENCE_FD"[..],
+                    8 => b"CRTC_ID",
+                    _ => return -libc::ENOENT,
+                };
+                std::ptr::copy_nonoverlapping(name.as_ptr(), arg.add(24), name.len());
+                0
             }
             ("e2e-kms", GRANT) => {
                 let fd = peek(arg, 0, 4) as i32;
@@ -1499,4 +1518,46 @@ fn a_vm_holds_only_so_many_modeset_files() {
         i32::from_le_bytes(resp[8..12].try_into().unwrap()),
         -libc::EMFILE
     );
+}
+
+/// The guest's master hooks send SET/DROP_MASTER as a bare IOCTL2 (the
+/// driver's nvgpu_kms_raw(): one zero-length buffer, nothing else), and the
+/// backend lets them reach a card it opened for the guest and never a lease,
+/// whose master is the host compositor's to arbitrate.
+#[test]
+fn master_calls_reach_a_host_card_and_never_a_lease() {
+    let mut w = world();
+    let card =
+        w.be.adopt_for_test(memfd(c"e2e-card"), HandleKind::DrmCard(0));
+    assert_eq!(w.call(card, SET_MASTER, 0, 0), Ok(0));
+    assert_eq!(w.call(card, DROP_MASTER, 0, 0), Ok(0));
+    assert_eq!(
+        w.calls(),
+        vec![
+            ("e2e-card".to_string(), SET_MASTER),
+            ("e2e-card".to_string(), DROP_MASTER)
+        ]
+    );
+    let kms = w.kms;
+    assert_eq!(w.call(kms, SET_MASTER, 0, 0), Err(libc::EPERM));
+    assert_eq!(w.call(kms, DROP_MASTER, 0, 0), Err(libc::EPERM));
+    assert!(w.calls().is_empty(), "the lease never saw either");
+}
+
+/// How the guest learns what a property id is before an atomic commit
+/// (nvgpu_kms.c, nvgpu_kms_prop_class()): GETPROPERTY with both pointers NULL
+/// and both counts 0 is one buffer out and one back, and an id the host does
+/// not know is the host's -ENOENT.
+#[test]
+fn a_property_is_named_by_a_getproperty_with_nothing_to_fill() {
+    let mut w = world();
+    let mut a = vec![0u8; 64];
+    wr(&mut a, 16, 4, 7);
+    w.mem.put(0x1000, &a);
+    let kms = w.kms;
+    assert_eq!(w.call(kms, GETPROPERTY, 0x1000, 0), Ok(0));
+    assert_eq!(&w.mem.get(0x1000)[24..35], b"IN_FENCE_FD");
+    wr(&mut a, 16, 4, 99);
+    w.mem.put(0x1000, &a);
+    assert_eq!(w.call(kms, GETPROPERTY, 0x1000, 0), Ok(-libc::ENOENT));
 }

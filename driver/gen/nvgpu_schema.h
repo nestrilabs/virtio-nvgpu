@@ -67,6 +67,7 @@
 #define NVGPU_SPOL_FB_PLANES (1u << 7)
 #define NVGPU_SPOL_NVKMS (1u << 8)
 #define NVGPU_SPOL_NVKMS_EXACT (1u << 9)
+#define NVGPU_SPOL_MASTER (1u << 10)
 
 /* FD_IN kinds: bit n is NVGPU_HK_* n; Dev is split by device. */
 #define NVGPU_SKIND(hk) (1u << (hk))
@@ -293,6 +294,8 @@ static const struct nvgpu_sfield nvgpu_schema_drm_fields[] = {
 static const struct nvgpu_sioctl nvgpu_schema_drm_ioctls[] = {
   {.name = "GET_CAP", .cmd = 0xc010640cu, .size = 16, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR},
   {.name = "SET_CLIENT_CAP", .cmd = 0x4010640du, .size = 16, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR},
+  {.name = "SET_MASTER", .cmd = 0x0000641eu, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR, .policy = 0x400u},
+  {.name = "DROP_MASTER", .cmd = 0x0000641fu, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR, .policy = 0x400u},
   {.name = "WAIT_VBLANK", .cmd = 0xc018643au, .size = 24, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR},
   {.name = "CRTC_GET_SEQUENCE", .cmd = 0xc018643bu, .size = 24, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR},
   {.name = "CRTC_QUEUE_SEQUENCE", .cmd = 0xc018643cu, .size = 24, .sclass = NVGPU_SCLASS_KMS, .flags = NVGPU_SIO_EXECUTOR},
