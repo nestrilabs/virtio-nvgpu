@@ -16,6 +16,19 @@ if load_module; then
     fi
     check_versions
 
+    section "PCI"
+    # Exactly one display-class PCI device, the GPU's: a VMM that gives the
+    # virtio transport a display class makes a second "GPU" that libpci and
+    # ANGLE list first, and Chromium judges its blocklist by (nesbox 642ef28).
+    disp=$(for d in /sys/bus/pci/devices/*; do
+        case $(cat "$d/class") in 0x03*) printf '%s:%s ' "$(cat "$d/vendor")" "$(cat "$d/device")" ;; esac
+    done)
+    if [ "$disp" = "0x10de:$(cat /sys/bus/pci/devices/0000:01:00.0/device 2>/dev/null) " ]; then
+        pass "one display-class PCI device, the GPU ($disp)"
+    else
+        fail "display-class PCI devices: ${disp:-none} (want only the NVIDIA GPU)"
+    fi
+
     section "guest-check.sh"
     step "scripts/verify/guest-check.sh" 60 bash "$NVGPU_VERIFY/guest-check.sh"
 fi
