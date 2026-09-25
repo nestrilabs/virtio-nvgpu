@@ -551,19 +551,6 @@ channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
 - **display** on the host's monitors: the four modes under
   [Display](#display), and explicit sync — built, not yet run on a GPU
 
-**Known not to work yet**
-
-- **CUDA contexts.** On an RTX 5090 (595.99.02) `cuInit` succeeds and sees
-  the card, but `cuCtxCreate` fails: once UVM has made the context's
-  semaphore pool, CUDA maps it with `mmap` of the UVM file at the pool's own
-  address, and UVM accepts a mapping only at an address equal to its offset,
-  in the address space of the process that owns the UVM file -- the
-  backend's, not the guest's. The shared window places every other mapping,
-  but it cannot place this one. Carrying it would take the VMM giving such a
-  range a memory slot of its own at that address, UVM's multi-process
-  sharing mode, or a host driver change. Vulkan, EGL, NVENC through Vulkan
-  Video, and the display paths do not map UVM memory and are unaffected.
-
 **Out of scope**
 
 - `cudaMallocManaged()` / full unified virtual memory
