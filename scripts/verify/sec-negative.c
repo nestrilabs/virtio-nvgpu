@@ -26,7 +26,10 @@
  * fd). Exit status is the number of FAILs, so the wrapper can gate on it.
  * T9 is the one positive control: a duplicate between two clients of one
  * process, which must be made (it FAILs when refused), so that T8's refusal of
- * the same duplicate across processes is known to be the backend's.
+ * the same duplicate across processes is known to be the backend's. T10
+ * carries its own control (a device sharing this process's own client).
+ * T8 and T10 need a guest module that says which process makes each call
+ * (BCAP_PROC_ID, BCAP_PROC_EUID); without it both are refused too.
  *
  * Build:  see sec-negative.sh (gcc, libdrm headers, no other deps).
  */
@@ -594,6 +597,102 @@ static void t_dup_other_process(int ctl, uint32_t dst, int control_ok)
 	close(down[1]);
 }
 
+/* A device under `client` whose VA space is `share`'s (NV0080's hClientShare,
+ * at 4 in NV0080_ALLOC_PARAMETERS); RM's status, or -1 for a failed ioctl. */
+static int64_t alloc_device_sharing(int fd, uint32_t client, uint32_t share)
+{
+	uint8_t params[NV0080_ALLOC_PARAMETERS_SIZE] = {0};
+	memcpy(params + 4, &share, sizeof(share));
+	nvos64_t a = {0};
+	a.hRoot = client;
+	a.hObjectParent = client;
+	a.hObjectNew = DEV_HANDLE + 2;
+	a.hClass = NV01_DEVICE_0;
+	a.pAllocParms = (uint64_t)(uintptr_t)params;
+	a.paramsSize = sizeof(params);
+	if (ioctl(fd, NV_IOWR(NV_ESC_RM_ALLOC, sizeof(a)), &a) != 0)
+		return -1;
+	return a.status;
+}
+
+/* T10: a second client named in parameters, of another guest user. A child
+ * drops to uid 65534 and makes a client; the parent makes a device that
+ * shares that client's VA space. RM checks hClientShare with clientValidate:
+ * natively the caller's file (the default, strict) or its euid -- and to RM
+ * every guest process is the backend's. The backend holds the field to RM's
+ * rule with the guest's processes and euids, and refuses it before RM sees it
+ * (NV_ERR_INSUFFICIENT_PERMISSIONS; RM's own strict refusal would be
+ * NV_ERR_INVALID_CLIENT). Control first: a device sharing a client of this
+ * process's own, which the backend must not refuse. Needs root, to drop to
+ * another uid. */
+static void t_share_other_user(int ctl, uint32_t client, uint32_t mine)
+{
+	if (!client || !mine) {
+		skip("second client of another user", "no clients here");
+		return;
+	}
+	if (geteuid() != 0) {
+		skip("second client of another user", "not root: cannot run a child as another uid");
+		return;
+	}
+	/* The control is informational: the refusal below is told apart by its
+	 * status, whatever RM makes of a shared VA space here. */
+	int64_t st = alloc_device_sharing(ctl, client, mine);
+	printf("  (control: a device sharing this process's own client: status 0x%llx%s)\n",
+	       (long long)st, st == NV_ERR_INSUFFICIENT_PERMISSIONS ? ", the backend's refusal: wrong" : "");
+	if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+		fail("second client of another user", "control refused: the backend keeps a process from its own client");
+	int up[2], down[2];
+	if (pipe(up) || pipe(down)) {
+		skip("second client of another user", "pipe failed");
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		skip("second client of another user", "fork failed");
+		return;
+	}
+	if (pid == 0) {
+		uint32_t c = 0;
+		if (setresgid(65534, 65534, 65534) == 0 && setresuid(65534, 65534, 65534) == 0) {
+			int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+			c = fd >= 0 ? alloc_client(fd) : 0;
+		}
+		char go;
+		if (write(up[1], &c, sizeof(c)) != sizeof(c))
+			_exit(1);
+		if (read(down[0], &go, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	uint32_t theirs = 0;
+	if (read(up[0], &theirs, sizeof(theirs)) != sizeof(theirs))
+		theirs = 0;
+	uint32_t fresh = theirs ? alloc_client(ctl) : 0;
+	if (!theirs || !fresh) {
+		skip("second client of another user", "the child (uid 65534) or a fresh client could not be made");
+	} else {
+		st = alloc_device_sharing(ctl, fresh, theirs);
+		if (st == 0)
+			fail("second client of another user", "accepted (another user's VA space)");
+		else if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+			pass("second client of another user", "refused by the backend (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+		else {
+			char how[112];
+			snprintf(how, sizeof(how),
+				 "refused by RM itself (0x%llx), so the backend let it through", (long long)st);
+			fail("second client of another user", how);
+		}
+	}
+	if (write(down[1], "x", 1) != 1)
+		kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(up[0]);
+	close(up[1]);
+	close(down[0]);
+	close(down[1]);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -679,6 +778,8 @@ int main(int argc, char **argv)
 	uint32_t mine = client_with_vaspace(ctl);
 	int control_ok = t_dup_same_process(ctl, mine);
 	t_dup_other_process(ctl, mine, control_ok);
+	/* T10: a second client named in parameters, of another guest user. */
+	t_share_other_user(ctl, client, mine);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)
