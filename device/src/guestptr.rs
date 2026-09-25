@@ -15,11 +15,14 @@
 //! parameter blocks the host dereferences, measured from the host's own
 //! sources.
 //!
-//! - **RM escapes** (`rm_escape`): the top-level blocks. Six escapes carry a
-//!   pointer the backend has no way to relocate (IOCTL_XFER_CMD's whole
-//!   argument, I2C_ACCESS, IDLE_CHANNELS' three handle arrays,
-//!   ACCESS_REGISTRY's three strings, GET_EVENT_DATA's event record, and
-//!   ADD_VBLANK_CALLBACK's function pointer) and are refused. RM_ALLOC's
+//! - **RM escapes** (`rm_escape`): the top-level blocks. Five escapes carry
+//!   a pointer the backend has no way to relocate (IOCTL_XFER_CMD's whole
+//!   argument, I2C_ACCESS, ACCESS_REGISTRY's three strings, GET_EVENT_DATA's
+//!   event record, and ADD_VBLANK_CALLBACK's function pointer) and are
+//!   refused. IDLE_CHANNELS' three handle arrays are zeroed for one channel,
+//!   which never reads them, and relocated for a list when the guest sends
+//!   them as deep segments (`idle_channels_list`); a list without them is
+//!   refused. RM_ALLOC's
 //!   pRightsRequested is zeroed (RM then grants the default rights, which a
 //!   caller could have asked for anyway); ALLOC_MEMORY's pMemory,
 //!   MAP_MEMORY's pLinearAddress and VID_HEAP_CONTROL's `address` outputs are
@@ -45,8 +48,12 @@
 //!   that copy from user themselves, mem_mgr_ctrl.c:617 and
 //!   kernel_sm_debugger_session_ctrl.c:156), as gen/rmctrl_extract.py
 //!   measures them per release. The guest can relocate one of
-//!   them (the deep block); every other pointer field of the command is
-//!   zeroed, which RM answers as a missing buffer. Two commands carry
+//!   them (the deep block), or, for a control whose every pointer has RM's
+//!   size measured (`abi::rmctrl::DEEP_CONTROLS`), each of them as a deep
+//!   segment the backend sizes itself (`deepseg.rs`); every other pointer
+//!   field of the command is zeroed, which RM answers as a missing buffer,
+//!   and the controls in `abi::rmctrl::ZEROED_CONTROLS` (ACPI methods among
+//!   them) take no deep block at all. Two commands carry
 //!   pointers the table cannot name one by one (a union selected by a type
 //!   field, an array of per-op pointers) and are refused.
 //! - **UVM** (`uvm_gate`): nvidia-uvm works on the calling process's address
@@ -332,6 +339,63 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
     Ok(restore)
 }
 
+/// IDLE_CHANNELS' channel list, sent with its three arrays as deep segments
+/// (`deep`, deepseg.rs): each array gets a buffer of ours, sized from the
+/// count in `params` (the backend's copy of NVOS30) exactly as
+/// RmDeprecatedIdleChannels sizes its copies, and the caller's pointers go
+/// back in the reply. The one-channel form, and a list sent without its
+/// arrays, are `rm_escape`'s. The segments must be kept alive until the host
+/// call returns.
+pub(crate) fn idle_channels_list(
+    cmd: u32,
+    params: &mut [u8],
+    deep: &[u8],
+) -> Result<(Restore, crate::deepseg::Segments), Errno> {
+    use abi::rmctrl::{
+        IDLE_CHANNELS, IDLE_CHANNELS_FLAGS, IDLE_CHANNELS_LIST, IDLE_CHANNELS_LIST_BITS,
+        IDLE_CHANNELS_SIZE,
+    };
+    if hostfd::ioc_nr(cmd) != NV_ESC_RM_IDLE_CHANNELS
+        || hostfd::ioc_size(cmd) != IDLE_CHANNELS_SIZE
+        || params.len() != IDLE_CHANNELS_SIZE
+    {
+        log::warn!("RM_IDLE_CHANNELS: {} bytes, not NVOS30's", params.len());
+        return Err(libc::EINVAL);
+    }
+    let count = IDLE_CHANNELS.ptrs[0].counts[0].offset;
+    let num = rd32(params, count).unwrap_or(0);
+    let (lo, hi) = IDLE_CHANNELS_LIST_BITS;
+    let channel =
+        (rd32(params, IDLE_CHANNELS_FLAGS).unwrap_or(0) >> lo) & ((1 << (hi - lo + 1)) - 1);
+    // Only a list reads the arrays: segments for anything else are not a
+    // mistake to paper over.
+    if channel != IDLE_CHANNELS_LIST || num == 0 {
+        log::warn!("RM_IDLE_CHANNELS: arrays sent for a call that reads none");
+        return Err(libc::EINVAL);
+    }
+    if num > protocol::messages::IDLE_CHANNELS_MAX {
+        log::warn!(
+            "RM_IDLE_CHANNELS refused: a list of {num} channels, over {}",
+            protocol::messages::IDLE_CHANNELS_MAX
+        );
+        return Err(libc::EINVAL);
+    }
+    let segs =
+        crate::deepseg::Segments::relocate("RM_IDLE_CHANNELS", IDLE_CHANNELS.ptrs, params, deep)?;
+    let mut restore = Restore::default();
+    restore.0.extend(segs.saved());
+    // An array not sent is not handed to RM as the guest's address; RM
+    // then fails the copy from null, as it would a bad pointer.
+    for p in IDLE_CHANNELS.ptrs {
+        if !segs.offsets().contains(&p.ptr) {
+            if let Some(v) = take(params, p.ptr) {
+                restore.0.push((p.ptr, v));
+            }
+        }
+    }
+    Ok((restore, segs))
+}
+
 // ───────────────────────────── RM controls ─────────────────────────────
 
 // Every control RM dereferences a user pointer inside the parameters of,
@@ -366,10 +430,10 @@ pub(crate) fn control_pointers(cmd: u32) -> &'static [usize] {
 /// NV_ERR_INVALID_ARGUMENT (param_copy.c:43-53), the status a native caller
 /// with a bad pointer would get. An offset past the block's end is one this
 /// release's layout does not have.
-pub(crate) fn scrub_control(cmd: u32, nested: &mut [u8], relocated: Option<usize>) -> Restore {
+pub(crate) fn scrub_control(cmd: u32, nested: &mut [u8], relocated: &[usize]) -> Restore {
     let mut restore = Restore::default();
     for &off in control_pointers(cmd) {
-        if Some(off) == relocated {
+        if relocated.contains(&off) {
             continue;
         }
         if let Some(v) = take(nested, off) {
@@ -688,7 +752,7 @@ mod tests {
         put64(&mut n, 8, 0x1000);
         put64(&mut n, 16, 0x2000);
         put64(&mut n, 24, 0x3000);
-        let r = scrub_control(0x101, &mut n, Some(16));
+        let r = scrub_control(0x101, &mut n, &[16]);
         assert_eq!(
             (rd64(&n, 8), rd64(&n, 16), rd64(&n, 24)),
             (Some(0), Some(0x2000), Some(0))
@@ -701,7 +765,7 @@ mod tests {
     fn a_control_rm_follows_no_pointer_in_is_left_alone() {
         let mut n = vec![0x77u8; 64];
         let before = n.clone();
-        assert!(scrub_control(0x20800a01, &mut n, None).is_empty());
+        assert!(scrub_control(0x20800a01, &mut n, &[]).is_empty());
         assert_eq!(n, before);
     }
 
@@ -710,7 +774,7 @@ mod tests {
         // 535's GET_P2P_CAPS ends at busPeerIds.
         let mut n = vec![0u8; 168];
         put64(&mut n, 160, 0x4000);
-        scrub_control(0x127, &mut n, None);
+        scrub_control(0x127, &mut n, &[]);
         assert_eq!(rd64(&n, 160), Some(0));
     }
 
@@ -809,7 +873,9 @@ mod backend_tests {
     use super::*;
     use crate::hostfd::{HandleKind, IOC_RW, ioc};
     use crate::nvidia::NvidiaBackend;
-    use protocol::messages::{DeviceKind, IoctlResp, MsgHeader, MsgType};
+    use protocol::messages::{
+        DEEP_SEGMENTED, DeviceKind, IDLE_CHANNELS_MAX, IoctlResp, MsgHeader, MsgType,
+    };
     use std::cell::RefCell;
     use std::os::fd::OwnedFd;
 
@@ -851,6 +917,14 @@ mod backend_tests {
         /// same.
         Addresses(Vec<u64>),
         Other(u64),
+        /// RM's own copies through a call's arrays, as RM makes them: for
+        /// FIFO_GET_CHANNELLIST (control 0x80170d) and IDLE_CHANNELS (escape
+        /// 0x41), each pointer and the `count` u32s read behind it (none
+        /// for a null one).
+        Lists {
+            call: u32,
+            arrays: Vec<(u64, Vec<u32>)>,
+        },
     }
 
     std::thread_local! {
@@ -879,6 +953,24 @@ mod backend_tests {
         unsafe { (p as *const u64).read_unaligned() }
     }
 
+    /// NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST.
+    const CHANNELLIST: u32 = 0x0080_170d;
+
+    /// Read `count` u32s behind a pointer the backend handed the host, as RM
+    /// copies them in.
+    fn read_u32s(p: u64, count: usize) -> Vec<u32> {
+        assert!(
+            p != GUEST_PTR && p != GUEST_PTR2,
+            "a guest address reached the host"
+        );
+        // SAFETY: a nonzero pointer the backend put in the block, its own
+        // live buffer for the call, and `count` is the size RM copies,
+        // which the backend sized that buffer to.
+        (0..count)
+            .map(|i| unsafe { (p as *const u32).add(i).read_unaligned() })
+            .collect()
+    }
+
     unsafe fn fake_host(_fd: std::os::fd::RawFd, request: u64, arg: *mut u8) -> i32 {
         let request = request as u32;
         let len = hostfd::ioc_size(request).max(16);
@@ -893,6 +985,33 @@ mod backend_tests {
                 a[0] = PAGEABLE.with(|p| p.get()) as u8;
                 a[4..8].fill(0);
                 Seen::UvmPageable
+            }
+            (b'F', 0x2a) if word64(a, 8) as u32 == CHANNELLIST => {
+                // RM: numChannels u32s in through both lists, and the
+                // channel list back out (embedded_param_copy.c:292-306).
+                let params = word64(a, 16);
+                assert!(params != 0 && params != GUEST_PTR);
+                // SAFETY: the backend's nested block, 24 bytes.
+                let n = unsafe { std::slice::from_raw_parts_mut(params as *mut u8, 24) };
+                let count = u32::from_le_bytes(n[..4].try_into().unwrap()) as usize;
+                let arrays = [8, 16]
+                    .map(|off| {
+                        let p = word64(n, off);
+                        (p, if p == 0 { vec![] } else { read_u32s(p, count) })
+                    })
+                    .to_vec();
+                let out = word64(n, 16);
+                if out != 0 {
+                    for i in 0..count {
+                        // SAFETY: as read_u32s: RM's own size, in our buffer.
+                        unsafe { (out as *mut u32).add(i).write_unaligned(0xc0de_0000 + i as u32) };
+                    }
+                }
+                a[28..32].fill(0);
+                Seen::Lists {
+                    call: CHANNELLIST,
+                    arrays,
+                }
             }
             (b'F', 0x2a) => {
                 let params = word64(a, 16);
@@ -929,10 +1048,26 @@ mod backend_tests {
             }
             (b'd', 0x41) => Seen::Gem { ptr: word64(a, 8) },
             (b'F', 0x41) => {
-                for off in [16, 24, 32] {
-                    assert_eq!(word64(a, off), 0, "IDLE_CHANNELS pointer at {off} reached RM");
+                let count = u32::from_le_bytes(a[12..16].try_into().unwrap()) as usize;
+                let list = (u32::from_le_bytes(a[40..44].try_into().unwrap()) >> 4) & 0xf == 0;
+                if list && count != 0 {
+                    // RmDeprecatedIdleChannels: numChannels u32s in through
+                    // each of the three.
+                    Seen::Lists {
+                        call: 0x41,
+                        arrays: [16, 24, 32]
+                            .map(|off| {
+                                let p = word64(a, off);
+                                (p, if p == 0 { vec![] } else { read_u32s(p, count) })
+                            })
+                            .to_vec(),
+                    }
+                } else {
+                    for off in [16, 24, 32] {
+                        assert_eq!(word64(a, off), 0, "IDLE_CHANNELS pointer at {off} reached RM");
+                    }
+                    Seen::Other(request as u64)
                 }
-                Seen::Other(request as u64)
             }
             (b'F', 0x4f) => Seen::Addresses(vec![word64(a, 16)]),
             (b'F', 0x5e) => Seen::Addresses(vec![word64(a, 16), word64(a, 24)]),
@@ -960,6 +1095,19 @@ mod backend_tests {
         nested: &[u8],
         deep: Option<(u32, &[u8])>,
     ) -> (i32, Vec<u8>) {
+        let (st, _, body) = v1_resp(be, handle, cmd, outer, nested, deep);
+        (st, body)
+    }
+
+    /// As `v1`, with the reply's IoctlResp.
+    fn v1_resp(
+        be: &mut NvidiaBackend,
+        handle: u32,
+        cmd: u32,
+        outer: &[u8],
+        nested: &[u8],
+        deep: Option<(u32, &[u8])>,
+    ) -> (i32, IoctlResp, Vec<u8>) {
         let (deep_at, deep) = deep.unwrap_or((0, &[]));
         let mut req = Vec::new();
         for v in [
@@ -987,7 +1135,15 @@ mod backend_tests {
         let n = be.dispatch(&req, &mut resp);
         let status = i32::from_le_bytes(resp[8..12].try_into().unwrap());
         let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
-        (status, resp[body.min(n)..n].to_vec())
+        let mut r = IoctlResp::default();
+        if n >= body {
+            let w = |i: usize| {
+                let at = size_of::<MsgHeader>() + 4 * i;
+                u32::from_le_bytes(resp[at..at + 4].try_into().unwrap())
+            };
+            (r.data_len, r.nested_len, r.deep_len) = (w(0), w(1), w(2));
+        }
+        (status, r, resp[body.min(n)..n].to_vec())
     }
 
     const CONTROL: u32 = ioc(IOC_RW, b'F', NV_ESC_RM_CONTROL, 32);
@@ -1096,52 +1252,216 @@ mod backend_tests {
         }
     }
 
+    /// FIFO_GET_CHANNELLIST's parameters: numChannels, the handle list at 8
+    /// and the channel list at 16.
+    fn channellist(count: u32) -> Vec<u8> {
+        let mut n = vec![0u8; 24];
+        n[..4].copy_from_slice(&count.to_le_bytes());
+        n[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        n[16..24].copy_from_slice(&GUEST_PTR2.to_le_bytes());
+        n
+    }
+
+    fn u32s(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// The v1 path an old guest takes: one pointer sent with what it
+    /// addresses (the single deep block), every other pointer RM follows
+    /// zeroed, and the caller's own values back in the reply.
     #[test]
     fn every_pointer_rm_follows_in_a_control_is_ours_or_null() {
-        // NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION: pointers at 8, 16, 24,
-        // with the one at 16 sent along with what it addresses.
         let (mut be, h) = ctl();
-        let mut nested = vec![0u8; 32];
-        nested[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
-        nested[16..24].copy_from_slice(&GUEST_PTR2.to_le_bytes());
-        nested[24..32].copy_from_slice(&GUEST_PTR.to_le_bytes());
-        let deep = 0x1122_3344_5566_7788u64.to_le_bytes();
+        let deep = u32s(&[7, 8]);
         let (st, reply) = v1(
             &mut be,
             h,
             CONTROL,
-            &nvos54(0x101, GUEST_PTR, 32),
-            &nested,
+            &nvos54(CHANNELLIST, GUEST_PTR, 24),
+            &channellist(2),
             Some((16, &deep)),
         );
         assert_eq!(st, 0);
         match &seen()[..] {
-            [
-                Seen::Control {
-                    params,
-                    size: 32,
-                    inner,
-                },
-            ] => {
-                assert_ne!(*params, 0);
-                assert_ne!(inner[1].0, 0);
-                assert_eq!(
-                    inner,
-                    &vec![
-                        (0, None),
-                        (inner[1].0, Some(0x1122_3344_5566_7788)),
-                        (0, None)
-                    ]
-                );
+            [Seen::Lists { arrays, .. }] => {
+                assert_eq!(arrays[0], (0, vec![]), "the handle list, not sent, is null");
+                assert_ne!(arrays[1].0, 0);
+                assert_eq!(arrays[1].1, vec![7, 8], "our copy of the channel list");
             }
             other => panic!("{other:?}"),
         }
         // The caller's own pointers come back, in the outer block and in
-        // the nested one.
+        // the nested one, and the one list with what RM wrote.
         assert_eq!(word64(&reply, 16), GUEST_PTR);
-        assert_eq!(word64(&reply, 32 + 8), GUEST_PTR);
-        assert_eq!(word64(&reply, 32 + 16), GUEST_PTR2);
-        assert_eq!(word64(&reply, 32 + 24), GUEST_PTR);
+        assert_eq!(&reply[32..32 + 24], &channellist(2)[..]);
+        assert_eq!(&reply[32 + 24..], &u32s(&[0xc0de_0000, 0xc0de_0001])[..]);
+    }
+
+    /// Both of FIFO_GET_CHANNELLIST's lists, as deep segments: each reaches
+    /// RM as a buffer of ours holding exactly what the guest sent, RM copies
+    /// numChannels u32s through each, and the reply carries the segments
+    /// back, laid out as sent, with the channel list as RM wrote it. This is
+    /// the call cuCtxCreate makes; with the lists zeroed RM refused it.
+    #[test]
+    fn each_list_of_a_control_reaches_rm_as_our_buffer_holding_what_the_guest_sent() {
+        let (mut be, h) = ctl();
+        let handles = u32s(&[0xcafe_0001, 0xcafe_0002, 0xcafe_0003]);
+        let deep = crate::deepseg::build(&[(8, &handles), (16, &[0; 12])]);
+        let (st, resp, reply) = v1_resp(
+            &mut be,
+            h,
+            CONTROL,
+            &nvos54(CHANNELLIST, GUEST_PTR, 24),
+            &channellist(3),
+            Some((DEEP_SEGMENTED, &deep)),
+        );
+        assert_eq!(st, 0);
+        match &seen()[..] {
+            [Seen::Lists { arrays, .. }] => {
+                assert_eq!(arrays[0].1, vec![0xcafe_0001, 0xcafe_0002, 0xcafe_0003]);
+                assert_eq!(arrays[1].1, vec![0, 0, 0]);
+                let (a, b) = (arrays[0].0, arrays[1].0);
+                assert!(a != 0 && b != 0 && a.abs_diff(b) >= 12, "two buffers");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((resp.data_len, resp.nested_len), (32, 24));
+        assert_eq!(resp.deep_len as usize, deep.len());
+        assert_eq!(word64(&reply, 16), GUEST_PTR);
+        assert_eq!(&reply[32..56], &channellist(3)[..], "the caller's pointers");
+        let back = &reply[56..];
+        assert_eq!(&back[..24], &deep[..24], "the table as sent");
+        assert_eq!(&back[24..36], &handles[..]);
+        assert_eq!(&back[36..], &u32s(&[0xc0de_0000, 0xc0de_0001, 0xc0de_0002])[..]);
+    }
+
+    /// The backend sizes every segment itself, from the parameters RM is
+    /// handed, and a guest that says otherwise -- a short list, a long one,
+    /// a pointer RM does not follow, a count it changed -- reaches nothing.
+    #[test]
+    fn deep_segments_that_are_not_rms_size_never_reach_rm() {
+        let (mut be, h) = ctl();
+        for deep in [
+            crate::deepseg::build(&[(8, &[0; 8]), (16, &[0; 12])]),
+            crate::deepseg::build(&[(8, &[0; 12]), (16, &[0; 16])]),
+            crate::deepseg::build(&[(8, &[0; 12]), (0, &[0; 12])]),
+            crate::deepseg::build(&[(8, &[0; 12]), (8, &[0; 12])]),
+        ] {
+            let (st, _) = v1(
+                &mut be,
+                h,
+                CONTROL,
+                &nvos54(CHANNELLIST, GUEST_PTR, 24),
+                &channellist(3),
+                Some((DEEP_SEGMENTED, &deep)),
+            );
+            assert_eq!(st, -libc::EINVAL, "{deep:?}");
+        }
+        // Segments for a control whose pointers are never relocated (an
+        // ACPI method), a single deep block for one, and segments on a call
+        // that is not a control.
+        let mut acpi = vec![0u8; 40];
+        acpi[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        acpi[16..18].copy_from_slice(&4u16.to_le_bytes());
+        let deep = crate::deepseg::build(&[(8, &[0; 4])]);
+        let (st, _) = v1(
+            &mut be,
+            h,
+            CONTROL,
+            &nvos54(0x130, GUEST_PTR, 40),
+            &acpi,
+            Some((DEEP_SEGMENTED, &deep)),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        let (st, _) = v1(
+            &mut be,
+            h,
+            CONTROL,
+            &nvos54(0x130, GUEST_PTR, 40),
+            &acpi,
+            Some((8, &[0; 4])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        let mut os64 = vec![0u8; 48];
+        os64[12..16].copy_from_slice(&0x3eu32.to_le_bytes());
+        let (st, _) = v1(
+            &mut be,
+            h,
+            ALLOC,
+            &os64,
+            &[0; 16],
+            Some((DEEP_SEGMENTED, &crate::deepseg::build(&[(8, &[0; 8])]))),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty());
+    }
+
+    /// NVOS30 for a list of `count` channels, its arrays at the guest's
+    /// addresses.
+    fn idle_list(count: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 56];
+        p[12..16].copy_from_slice(&count.to_le_bytes());
+        for off in [16, 24, 32] {
+            p[off..off + 8].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        }
+        p
+    }
+
+    /// IDLE_CHANNELS for a list, sent with its three arrays: each reaches RM
+    /// as a buffer of ours holding what the guest sent, numChannels u32s as
+    /// RmDeprecatedIdleChannels copies, and the caller reads its pointers
+    /// back. The Vulkan and GL drivers do this as a device goes.
+    #[test]
+    fn idle_channels_for_a_list_carries_its_three_arrays() {
+        let (mut be, h) = ctl();
+        let idle = ioc(IOC_RW, b'F', NV_ESC_RM_IDLE_CHANNELS, 56);
+        let (c, d, ch) = (u32s(&[1, 1, 1]), u32s(&[2, 2, 2]), u32s(&[10, 11, 12]));
+        let deep = crate::deepseg::build(&[(16, &c), (24, &d), (32, &ch)]);
+        let (st, reply) = v1(
+            &mut be,
+            h,
+            idle,
+            &idle_list(3),
+            &[],
+            Some((DEEP_SEGMENTED, &deep)),
+        );
+        assert_eq!(st, 0);
+        match &seen()[..] {
+            [Seen::Lists { call: 0x41, arrays }] => {
+                let got: Vec<_> = arrays.iter().map(|(_, v)| v.clone()).collect();
+                assert_eq!(got, vec![vec![1, 1, 1], vec![2, 2, 2], vec![10, 11, 12]]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(&reply[..56], &idle_list(3)[..], "the caller's pointers");
+
+        // Sizes the backend did not compute, a list over the bound, and
+        // arrays for the one-channel form, which reads none.
+        for (p, deep) in [
+            (
+                idle_list(3),
+                crate::deepseg::build(&[(16, &c), (24, &d), (32, &[0; 8])]),
+            ),
+            (
+                idle_list(IDLE_CHANNELS_MAX + 1),
+                crate::deepseg::build(&[(16, &[0; 4])]),
+            ),
+            (
+                {
+                    let mut p = idle_list(1);
+                    p[40..44].copy_from_slice(&0x10u32.to_le_bytes());
+                    p
+                },
+                crate::deepseg::build(&[(16, &[0; 4])]),
+            ),
+        ] {
+            let (st, _) = v1(&mut be, h, idle, &p, &[], Some((DEEP_SEGMENTED, &deep)));
+            assert_eq!(st, -libc::EINVAL);
+        }
+        assert!(seen().is_empty());
+        // A list with no arrays sent is still refused (an old guest).
+        let (st, _) = v1(&mut be, h, idle, &idle_list(3), &[], None);
+        assert_eq!(st, -libc::EPERM);
     }
 
     #[test]

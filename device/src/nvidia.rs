@@ -2241,11 +2241,34 @@ impl NvidiaBackend {
         // send an address that means anything here, so it sends the bytes and
         // says where the pointer sits; the call below gives them a host
         // address, and the reply carries them back.
-        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 {
+        //
+        // Or, marked DEEP_SEGMENTED, what several pointers refer to, one
+        // segment each (deepseg.rs). Only an RM control's parameters and
+        // IDLE_CHANNELS' top-level block are read that way; a segmented
+        // block on any other call is refused rather than ignored, so a guest
+        // never believes pointers were carried that were not.
+        let segmented = ireq.deep_len > 0 && ireq.deep_ptr_offset == DEEP_SEGMENTED;
+        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 && !segmented {
             Some((ireq.deep_ptr_offset as usize, &body[nested_end..want]))
         } else {
             None
         };
+        let deep_segs: Option<&[u8]> = segmented.then(|| &body[nested_end..want]);
+        if segmented {
+            let nr = hostfd::ioc_nr(ireq.cmd);
+            if hostfd::ioc_type(ireq.cmd) != b'F'
+                || !matches!(
+                    nr,
+                    abi::ioctl::NV_ESC_RM_CONTROL | abi::ioctl::NV_ESC_RM_IDLE_CHANNELS
+                )
+            {
+                log::warn!(
+                    "ioctl cmd={:#x}: deep segments on a call that has none",
+                    ireq.cmd
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
+        }
 
         // How much of the response is the top-level struct. The driver copies
         // exactly this much back to userspace and reads any nested block after
@@ -2423,7 +2446,7 @@ impl NvidiaBackend {
                     cookie, host_fd, request, &msg, resp_buf, 16, // outer_size
                     8,  // ptr_offset
                     4,  // size_offset
-                    None, None,
+                    None, None, None,
                 );
                 // The one reply the policy rewrites (ALLOC_DEVICE's display
                 // coherency modes, nvkms.rs), laid out as `msg` was.
@@ -2453,6 +2476,7 @@ impl NvidiaBackend {
                     deep_in,
                     // Both NVKMS blocks begin with `int memFd`.
                     Some(0),
+                    None,
                 );
             }
         }
@@ -2506,11 +2530,27 @@ impl NvidiaBackend {
         // parameter pointers of RM_CONTROL and RM_ALLOC are dispatch_nested's.
         let mut ptr_copy = param_in.to_vec();
         let outer_len = (ireq.data_len as usize).min(ptr_copy.len());
-        let ptr_restore = match crate::guestptr::rm_escape(ireq.cmd, &mut ptr_copy[..outer_len]) {
-            Ok(r) => r,
-            Err(errno) => {
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        // IDLE_CHANNELS' channel list, sent with its three arrays: they are
+        // ours for the call (`_idle_segs` holds them until it returns).
+        let (ptr_restore, _idle_segs) = match (escape, deep_segs) {
+            (NV_ESC_RM_IDLE_CHANNELS, Some(deep)) => {
+                match crate::guestptr::idle_channels_list(
+                    ireq.cmd,
+                    &mut ptr_copy[..outer_len],
+                    deep,
+                ) {
+                    Ok((r, s)) => (r, Some(s)),
+                    Err(errno) => {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                    }
+                }
             }
+            _ => match crate::guestptr::rm_escape(ireq.cmd, &mut ptr_copy[..outer_len]) {
+                Ok(r) => (r, None),
+                Err(errno) => {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
+            },
         };
         let param_in: &[u8] = &ptr_copy;
 
@@ -2580,6 +2620,7 @@ impl NvidiaBackend {
             NV_ESC_RM_CONTROL => {
                 let n = self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
+                    deep_segs,
                 );
                 // Counted here rather than in the forwarder, which holds only a
                 // shared borrow. NVOS54: hClient, hObject, cmd at byte 8.
@@ -2598,6 +2639,7 @@ impl NvidiaBackend {
             NV_ESC_RM_ALLOC => {
                 let n = self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 48, 16, 32, deep_in, None,
+                    None,
                 );
                 // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12,
                 // status at 40. As for controls, only what RM made.
@@ -2674,6 +2716,8 @@ impl NvidiaBackend {
         // descriptors. `None` for the RM paths, which name their descriptors
         // by command rather than by position.
         nested_fd_offset: Option<usize>,
+        // A segmented deep block (deepseg.rs): RM_CONTROL only.
+        deep_segs: Option<&[u8]>,
     ) -> usize {
         if param_in.len() < outer_size {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
@@ -2722,7 +2766,7 @@ impl NvidiaBackend {
         // Neither a waiter nor an event buffer holds a second-level pointer,
         // and one the guest claims could be aimed at the field: the address
         // written there below would reach RM as the event.
-        if os_event.is_some() && deep_in.is_some() {
+        if os_event.is_some() && (deep_in.is_some() || deep_segs.is_some()) {
             log::warn!("RM call {request:#x} names an OS event and claims a deep pointer");
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
@@ -2937,6 +2981,23 @@ impl NvidiaBackend {
             let mut deep_buf: Option<crate::guarded::GuardedBuf> = None;
             let mut deep_saved: Option<(usize, [u8; 8])> = None;
             if let Some((ptr_off, bytes)) = deep_in {
+                // Controls whose pointers stay zeroed (ACPI methods among
+                // them; abi::rmctrl::ZEROED_CONTROLS) take no deep block.
+                if rm && escape == abi::ioctl::NV_ESC_RM_CONTROL {
+                    let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                    if abi::rmctrl::zeroed(cmd) {
+                        log::warn!(
+                            "RM control {cmd:#010x}: a deep block for a control whose \
+                             pointers are never relocated"
+                        );
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EINVAL,
+                        );
+                    }
+                }
                 if ptr_off + 8 > host_buf.len() {
                     log::warn!(
                         "ioctl {request:#x}: pointer at {ptr_off} is outside {} nested bytes",
@@ -2999,9 +3060,51 @@ impl NvidiaBackend {
             // parameters: zeroed, and the caller's value restored below
             // (guestptr.rs). Left alone, RM copied in from and out to that
             // address in this process.
+            //
+            // Before that, what several of them refer to, when the guest sent
+            // it as deep segments: checked against the sizes RM will copy,
+            // computed from these very parameters, and each given a buffer of
+            // ours (deepseg.rs). Only a control's parameters are read so.
+            let segs = match deep_segs {
+                None => None,
+                Some(deep) if rm && escape == abi::ioctl::NV_ESC_RM_CONTROL => {
+                    let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                    let Some(ctl) = abi::rmctrl::deep_control(cmd) else {
+                        log::warn!(
+                            "RM control {cmd:#010x}: deep segments for a control whose \
+                             pointers are not relocated"
+                        );
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EINVAL,
+                        );
+                    };
+                    let what = format!("RM control {cmd:#010x} ({})", ctl.name);
+                    match crate::deepseg::Segments::relocate(&what, ctl.ptrs, host_buf, deep) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
+                        }
+                    }
+                }
+                Some(_) => {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::EINVAL,
+                    );
+                }
+            };
             let ctl_restore = if rm && escape == abi::ioctl::NV_ESC_RM_CONTROL {
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                crate::guestptr::scrub_control(cmd, host_buf, deep_saved.map(|(o, _)| o))
+                let relocated: Vec<usize> = match &segs {
+                    Some(s) => s.offsets(),
+                    None => deep_saved.map(|(o, _)| o).into_iter().collect(),
+                };
+                crate::guestptr::scrub_control(cmd, host_buf, &relocated)
             } else {
                 crate::guestptr::Restore::default()
             };
@@ -3079,6 +3182,15 @@ impl NvidiaBackend {
                 host_buf[ptr_off..ptr_off + 8].copy_from_slice(&guest_ptr);
             }
             ctl_restore.apply(host_buf);
+            // Each segment's bytes as RM left them, after the table as sent.
+            if let Some(segs) = &segs {
+                segs.restore(host_buf);
+                let deep = segs.reply();
+                let mut combined = outer.to_vec();
+                combined.extend_from_slice(host_buf);
+                combined.extend_from_slice(&deep);
+                return self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep.len());
+            }
             // Only what the guest allocated room for goes back, not the pad.
             let deep_reply = deep_in.map(|(_, b)| b.len()).unwrap_or(0);
             let mut combined = outer.to_vec();
@@ -3088,6 +3200,10 @@ impl NvidiaBackend {
             }
             self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
         } else {
+            if deep_segs.is_some() {
+                log::warn!("ioctl {request:#x}: deep segments with no parameters to hold them");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
             // No nested params: the call names no parameter block, so the
             // host is told exactly that -- a null pointer and a zero size.
             //

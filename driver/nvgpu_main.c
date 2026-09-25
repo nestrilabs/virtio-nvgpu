@@ -45,6 +45,7 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_prime.h>
 
+#include "gen/nvgpu_rm_deep.h"
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_schema.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
@@ -70,6 +71,7 @@ extern struct kset *module_kset;
 /* NVIDIA ioctl numbers that require nested-pointer marshalling */
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
+#define NV_ESC_RM_IDLE_CHANNELS 0x41
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
 
@@ -491,6 +493,160 @@ static const struct nvgpu_v1v2_entry *nvgpu_find_deep_rewrite(u32 cmd) {
 }
 
 /*
+ * Deep segments: several pointers of one parameter block, each sent with
+ * what it addresses (NVGPU_DEEP_SEGMENTED, nvgpu_wire.h).
+ *
+ * One deep block carries one pointer, and some calls hold more, every one of
+ * which RM follows. FIFO_GET_CHANNELLIST copies numChannels handles in through
+ * one list and channel ids both ways through another; cuCtxCreate asks for it,
+ * and with one list zeroed RM answers NV_ERR_INVALID_ARGUMENT. The table of
+ * such controls, and how much RM copies through each pointer, is generated
+ * from RM's own sources with the backend's (gen/nvgpu_rm_deep.h); the backend
+ * computes every size again from what it is sent and refuses the call if one
+ * differs, so this side only has to be right, not trusted.
+ */
+struct nvgpu_deep_plan {
+  u32 n;
+  u32 bytes; /* the deep block: header, table and segments */
+  struct {
+    u64 uptr;
+    u32 ptr; /* offset of the pointer in the block holding it */
+    u32 len;
+    u8 flags; /* NVGPU_RM_DEEP_IN / _OUT */
+  } seg[NVGPU_DEEP_SEGS_MAX];
+};
+
+static bool nvgpu_deep_segs_ok(const struct nvgpu_device *dev) {
+  return dev->v2 && (dev->backend_caps & NVGPU_BCAP_DEEP_SEGS);
+}
+
+/*
+ * How much RM copies through pointer `p` of the `len`-byte block `blk`, as
+ * RM computes it: the counts multiplied in NvU32, which wraps, then by the
+ * element size, which RM checks (portSafeMulU32). The backend's copy of this
+ * is DeepPtr::size in gen/src/rmctrl/mod.rs. False for a count outside the
+ * block or an overflow.
+ */
+static bool nvgpu_rm_deep_size(const struct nvgpu_rm_deep_ptr *p,
+                               const u8 *blk, u32 len, u32 *size) {
+  u32 n = p->scale;
+  unsigned int i;
+
+  for (i = 0; i < p->ncounts && i < NVGPU_RM_DEEP_COUNTS_MAX; i++) {
+    const struct nvgpu_rm_deep_count *c = &p->counts[i];
+    u32 v;
+
+    if ((u32)c->offset + c->width > len)
+      return false;
+    switch (c->width) {
+    case 1:
+      v = blk[c->offset];
+      break;
+    case 2:
+      v = get_unaligned_le16(blk + c->offset);
+      break;
+    case 4:
+      v = get_unaligned_le32(blk + c->offset);
+      break;
+    default:
+      return false;
+    }
+    n *= v;
+  }
+  return !check_mul_overflow(n, p->elem, size);
+}
+
+/*
+ * One segment for each pointer of `ctl` the caller set in `blk`, of RM's
+ * size for it. A pointer whose size is not known, or is zero, gets none and
+ * is zeroed by the backend, as every pointer was before. Past
+ * NVGPU_DEEP_SEGS_MAX_BYTES in all, nothing is planned.
+ */
+static void nvgpu_deep_plan(const struct nvgpu_rm_deep_control *ctl,
+                            const u8 *blk, u32 len,
+                            struct nvgpu_deep_plan *plan) {
+  u32 i, total = 0;
+
+  plan->n = 0;
+  plan->bytes = 0;
+  for (i = 0; i < ctl->nptrs && i < NVGPU_RM_DEEP_PTRS_MAX; i++) {
+    const struct nvgpu_rm_deep_ptr *p = &ctl->ptrs[i];
+    u64 uptr;
+    u32 size;
+
+    /* A pointer this release's block does not have. */
+    if ((u32)p->ptr + sizeof(u64) > len)
+      continue;
+    uptr = get_unaligned_le64(blk + p->ptr);
+    if (!uptr || !nvgpu_rm_deep_size(p, blk, len, &size) || !size)
+      continue;
+    if (size > NVGPU_DEEP_SEGS_MAX_BYTES - total ||
+        plan->n == NVGPU_DEEP_SEGS_MAX) {
+      plan->n = 0;
+      return;
+    }
+    total += size;
+    plan->seg[plan->n].uptr = uptr;
+    plan->seg[plan->n].ptr = p->ptr;
+    plan->seg[plan->n].len = size;
+    plan->seg[plan->n].flags = p->flags;
+    plan->n++;
+  }
+  if (plan->n)
+    plan->bytes = sizeof(struct nvgpu_deep_seg_hdr) +
+                  plan->n * sizeof(struct nvgpu_deep_seg) + total;
+}
+
+/*
+ * Lay the planned deep block out at `dst` (plan->bytes). Every segment goes
+ * with the caller's bytes, a buffer RM only writes too: the reply carries
+ * each back as RM left it, so one RM did not get to write -- a call that
+ * failed first -- is copied back to the caller unchanged, as natively.
+ */
+static int nvgpu_deep_fill(const struct nvgpu_deep_plan *plan, u8 *dst) {
+  struct nvgpu_deep_seg_hdr *h = (struct nvgpu_deep_seg_hdr *)dst;
+  struct nvgpu_deep_seg *t = (struct nvgpu_deep_seg *)(h + 1);
+  u8 *at = (u8 *)(t + plan->n);
+  u32 i;
+
+  h->count = cpu_to_le32(plan->n);
+  h->reserved = 0;
+  for (i = 0; i < plan->n; i++) {
+    t[i].ptr_offset = cpu_to_le32(plan->seg[i].ptr);
+    t[i].len = cpu_to_le32(plan->seg[i].len);
+  }
+  for (i = 0; i < plan->n; i++) {
+    if (copy_from_user(at, u64_to_user_ptr(plan->seg[i].uptr),
+                       plan->seg[i].len))
+      return -EFAULT;
+    at += plan->seg[i].len;
+  }
+  return 0;
+}
+
+/*
+ * Copy back each segment RM writes, from `src`, the reply's deep block of
+ * `len` bytes. One not laid out as ours was is not read at all.
+ */
+static int nvgpu_deep_copy_back(const struct nvgpu_deep_plan *plan,
+                                const u8 *src, u32 len) {
+  u32 i, at;
+
+  if (len != plan->bytes)
+    return 0;
+  at = sizeof(struct nvgpu_deep_seg_hdr) +
+       plan->n * sizeof(struct nvgpu_deep_seg);
+  for (i = 0; i < plan->n; i++) {
+    if ((plan->seg[i].flags & NVGPU_RM_DEEP_OUT) &&
+        copy_to_user(u64_to_user_ptr(plan->seg[i].uptr), src + at,
+                     plan->seg[i].len))
+      return -EFAULT;
+    at += plan->seg[i].len;
+  }
+  return 0;
+}
+
+/*
  * GPU/CPU time correlation, rebased: the CPU half of each sample is read on
  * the host, in the host's clock (nvgpu_rm_intercepts.h has the layout), and
  * the caller correlates the GPU's timer with its own clock of that id --
@@ -565,6 +721,11 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   u32 deep_ptr_offset = 0;
   u32 deep_len = 0;
 
+  /* Or several, as deep segments, and the nested block they were sized from. */
+  const struct nvgpu_rm_deep_control *ctl_deep = NULL;
+  struct nvgpu_deep_plan plan = {0};
+  u8 *nested_copy = NULL;
+
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
@@ -613,6 +774,30 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    */
   rw = (user_nested && nested_size > 0) ? nvgpu_find_deep_rewrite(ctl_cmd)
                                         : NULL;
+
+  /*
+   * Several pointers, each with what it addresses (nvgpu_deep_plan). The
+   * nested block is read once, here, and that copy is what is sent: the sizes
+   * the backend checks are computed from the same bytes they were planned
+   * from, whatever another thread of the caller writes meanwhile.
+   */
+  if (user_nested && nested_size > 0 && nvgpu_deep_segs_ok(nfd->dev))
+    ctl_deep = nvgpu_rm_deep_find(ctl_cmd);
+  if (ctl_deep) {
+    rw = NULL;
+    nested_copy = kmalloc(nested_size, GFP_KERNEL);
+    if (!nested_copy)
+      return -ENOMEM;
+    if (copy_from_user(nested_copy, user_nested, nested_size)) {
+      kfree(nested_copy);
+      return -EFAULT;
+    }
+    nvgpu_deep_plan(ctl_deep, nested_copy, nested_size, &plan);
+    if (plan.n) {
+      deep_ptr_offset = NVGPU_DEEP_SEGMENTED;
+      deep_len = plan.bytes;
+    }
+  }
 
   if (rw && nested_size >= rw->v1_userptr_offset + 8) {
     void *pbuf = kmalloc(nested_size, GFP_KERNEL);
@@ -673,8 +858,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
   if (user_nested && nested_size > 0) {
-    if (copy_from_user(req_buf + sizeof(*req) + sizeof(params), user_nested,
-                       nested_size)) {
+    if (nested_copy)
+      memcpy(req_buf + sizeof(*req) + sizeof(params), nested_copy, nested_size);
+    else if (copy_from_user(req_buf + sizeof(*req) + sizeof(params),
+                            user_nested, nested_size)) {
       ret = -EFAULT;
       goto out;
     }
@@ -727,7 +914,12 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  if (deep_len > 0) {
+  if (plan.n) {
+    ret = nvgpu_deep_fill(&plan,
+                          req_buf + sizeof(*req) + sizeof(params) + nested_size);
+    if (ret)
+      goto out;
+  } else if (deep_len > 0) {
     if (copy_from_user(req_buf + sizeof(*req) + sizeof(params) + nested_size,
                        (const void __user *)deep_user_ptr, deep_len)) {
       ret = -EFAULT;
@@ -780,7 +972,16 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       ret = -EFAULT;
   }
 
-  if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
+  if (plan.n && le32_to_cpu(resp->deep_len) > 0) {
+    /* Each segment RM writes goes back to its own pointer. */
+    u32 back = le32_to_cpu(resp->deep_len);
+    size_t at = sizeof(*resp) + sizeof(params) +
+                (size_t)le32_to_cpu(resp->nested_len);
+
+    if (nvgpu_resp_has(used, at, back) &&
+        nvgpu_deep_copy_back(&plan, resp_buf + at, back))
+      ret = -EFAULT;
+  } else if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
     u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
     size_t at = sizeof(*resp) + sizeof(params) +
                 (size_t)le32_to_cpu(resp->nested_len);
@@ -789,6 +990,97 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
         copy_to_user((void __user *)deep_user_ptr, resp_buf + at, copy_back))
       ret = -EFAULT;
   }
+
+out:
+  kfree(nested_copy);
+  kfree(req_buf);
+  kfree(resp_buf);
+  return ret;
+}
+
+/*
+ * NV_ESC_RM_IDLE_CHANNELS: NVOS30 names three arrays of handles, which RM
+ * reads only for a channel list -- flags' CHANNEL field LIST, and a nonzero
+ * count (RmDeprecatedIdleChannels). The Vulkan and GL drivers idle a list of
+ * three as a device goes. A list goes with its arrays as deep segments, to a
+ * backend that takes them; anything else goes as the flat block it is, and
+ * the backend zeroes the pointers of the one-channel form and refuses a list
+ * it was not sent the arrays of.
+ */
+static long nvgpu_ioctl_idle_channels(struct nvgpu_fd *nfd, unsigned int cmd,
+                                      void __user *uarg, unsigned int sz) {
+  const struct nvgpu_rm_deep_control *rule = &nvgpu_rm_deep_idle_channels;
+  u8 params[NVGPU_RM_IDLE_CHANNELS_SIZE];
+  struct nvgpu_deep_plan plan;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  void *req_buf = NULL, *resp_buf = NULL;
+  u32 channel, count, used, data_len;
+  size_t req_total, resp_max;
+  int ret;
+
+  if (sz != sizeof(params) || !nvgpu_deep_segs_ok(nfd->dev))
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+  if (copy_from_user(params, uarg, sizeof(params)))
+    return -EFAULT;
+  channel = (get_unaligned_le32(params + NVGPU_RM_IDLE_CHANNELS_FLAGS) >>
+             NVGPU_RM_IDLE_CHANNELS_LIST_LO) &
+            GENMASK(NVGPU_RM_IDLE_CHANNELS_LIST_HI -
+                        NVGPU_RM_IDLE_CHANNELS_LIST_LO,
+                    0);
+  count = get_unaligned_le32(params + rule->ptrs[0].counts[0].offset);
+  if (channel != NVGPU_RM_IDLE_CHANNELS_LIST || !count ||
+      count > NVGPU_IDLE_CHANNELS_MAX)
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+  nvgpu_deep_plan(rule, params, sizeof(params), &plan);
+  if (!plan.n)
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+
+  req_total = sizeof(*req) + sizeof(params) + plan.bytes;
+  resp_max = sizeof(*resp) + sizeof(params);
+  req_buf = kmalloc(req_total, GFP_KERNEL);
+  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->hdr.status = 0;
+  req->hdr.req_id = 0;
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(sizeof(params));
+  req->nested_offset = 0;
+  req->nested_len = 0;
+  req->deep_ptr_offset = cpu_to_le32(NVGPU_DEEP_SEGMENTED);
+  req->deep_len = cpu_to_le32(plan.bytes);
+  memcpy(req_buf + sizeof(*req), params, sizeof(params));
+  ret = nvgpu_deep_fill(&plan, req_buf + sizeof(*req) + sizeof(params));
+  if (ret)
+    goto out;
+
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
+  if (ret < 0)
+    goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+
+  /* RM only reads the arrays: the block, with RM's status, is all that
+   * comes back. */
+  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
+                 ? le32_to_cpu(resp->data_len)
+                 : 0;
+  if (data_len && data_len <= sizeof(params) &&
+      nvgpu_resp_has(used, sizeof(*resp), data_len) &&
+      copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
+    ret = -EFAULT;
 
 out:
   kfree(req_buf);
@@ -1169,6 +1461,10 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     return nvgpu_ioctl_rm_control(nfd, cmd, uarg, sz);
   case NV_ESC_RM_ALLOC:
     return nvgpu_ioctl_rm_alloc(nfd, cmd, uarg, sz);
+  case NV_ESC_RM_IDLE_CHANNELS:
+    if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE)
+      return nvgpu_ioctl_idle_channels(nfd, cmd, uarg, sz);
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
   default:
     return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
   }

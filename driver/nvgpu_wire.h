@@ -116,6 +116,33 @@ struct nvgpu_ioctl_resp {
    *              deep_len bytes modified second-level data   */
 } __packed;
 
+/*
+ * deep_ptr_offset == NVGPU_DEEP_SEGMENTED: the deep block carries what several
+ * pointers of one parameter block address, one segment each -- a
+ * nvgpu_deep_seg_hdr, `count` nvgpu_deep_seg, then each segment's bytes back
+ * to back in table order. The pointers are an RM control's (in the nested
+ * block) or NV_ESC_RM_IDLE_CHANNELS' (in the top-level NVOS30). Sent only to
+ * a backend with NVGPU_BCAP_DEEP_SEGS, which sizes every segment itself and
+ * refuses the call if a length is not what RM will copy. A reply's deep
+ * block, if any, is laid out as the request's, with the bytes RM left.
+ * protocol/src/messages.rs, DEEP_SEGMENTED, has the rest.
+ */
+#define NVGPU_DEEP_SEGMENTED 0xffffffffu
+#define NVGPU_DEEP_SEGS_MAX 4
+#define NVGPU_DEEP_SEGS_MAX_BYTES (1u << 20)
+/* Most channels an IDLE_CHANNELS list may name. */
+#define NVGPU_IDLE_CHANNELS_MAX 4096
+
+struct nvgpu_deep_seg_hdr {
+  __le32 count; /* 1..NVGPU_DEEP_SEGS_MAX */
+  __le32 reserved;
+} __packed;
+
+struct nvgpu_deep_seg {
+  __le32 ptr_offset; /* of the pointer, in the block holding it */
+  __le32 len;        /* bytes it addresses, after the table     */
+} __packed;
+
 struct nvgpu_mmap_req {
   struct nvgpu_msg_hdr hdr;
   __le64 size;
@@ -251,6 +278,7 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_FENCES (1u << 2)      /* fence and syncobj schemas           */
 #define NVGPU_BCAP_NVKMS_TABLE (1u << 3) /* NVKMS schema for this host version  */
 #define NVGPU_BCAP_WL_EXPORT (1u << 4)   /* --wayland-export                    */
+#define NVGPU_BCAP_DEEP_SEGS (1u << 5)   /* NVGPU_DEEP_SEGMENTED deep blocks    */
 
 struct nvgpu_hello_req {
   __le32 proto;      /* NVGPU_PROTO_V2 */

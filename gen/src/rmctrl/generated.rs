@@ -258,3 +258,570 @@ pub const REFUSED_CONTROLS: &[(u32, &str)] = &[
     (0x83de031a, "NV83DE_CTRL_CMD_READ_SURFACE"),
     (0x83de031b, "NV83DE_CTRL_CMD_WRITE_SURFACE"),
 ];
+
+/// A count RM reads to size a copy: `width` bytes, little-endian, at
+/// `offset` in the control's parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountField {
+    pub offset: usize,
+    pub width: usize,
+}
+
+/// How much RM copies through the pointer at `ptr`, as its
+/// RMAPI_PARAM_COPY_INIT computes it: `scale` times the `counts`, in
+/// NvU32 arithmetic, times `elem`, which must not overflow. `copy_in` and
+/// `copy_out` are false where RM skips that direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepPtr {
+    pub ptr: usize,
+    pub scale: u32,
+    pub counts: &'static [CountField],
+    pub elem: u32,
+    pub copy_in: bool,
+    pub copy_out: bool,
+}
+
+/// A control whose every pointer the guest may send the data for, one
+/// deep segment per pointer, sized by the rule for it.
+#[derive(Debug, Clone, Copy)]
+pub struct DeepControl {
+    pub cmd: u32,
+    pub name: &'static str,
+    pub ptrs: &'static [DeepPtr],
+}
+
+/// Every control in CONTROL_POINTERS whose sizes are read from RM's
+/// embeddedParamCopyIn, identically in every release that has it.
+#[rustfmt::skip]
+pub const DEEP_CONTROLS: &[DeepControl] = &[
+    DeepControl {
+        cmd: 0x00000127,
+        name: "NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 160,
+                scale: 1,
+                counts: &[CountField { offset: 128, width: 4 }, CountField { offset: 128, width: 4 }],
+                elem: 4,
+                copy_in: false,
+                copy_out: true,
+            },
+            DeepPtr {
+                ptr: 168,
+                scale: 1,
+                counts: &[CountField { offset: 128, width: 4 }, CountField { offset: 128, width: 4 }],
+                elem: 4,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00000602,
+        name: "NV0000_CTRL_CMD_NVD_GET_DUMP",
+        ptrs: &[
+            DeepPtr {
+                ptr: 0,
+                scale: 1,
+                counts: &[CountField { offset: 12, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00410110,
+        name: "NV0041_CTRL_CMD_GET_SURFACE_INFO",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 8,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00800201,
+        name: "NV0080_CTRL_CMD_GPU_GET_CLASSLIST",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801102,
+        name: "NV0080_CTRL_CMD_GR_GET_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801104,
+        name: "NV0080_CTRL_CMD_GR_GET_INFO",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 8,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801301,
+        name: "NV0080_CTRL_CMD_FB_GET_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801401,
+        name: "NV0080_CTRL_CMD_HOST_GET_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801701,
+        name: "NV0080_CTRL_CMD_FIFO_GET_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x00801705,
+        name: "NV0080_CTRL_CMD_FIFO_START_SELECTED_CHANNELS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 40,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x0080170d,
+        name: "NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: false,
+            },
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x0080180f,
+        name: "NV0080_CTRL_CMD_DMA_UPDATE_PDE_2",
+        ptrs: &[
+            DeepPtr {
+                ptr: 48,
+                scale: 1,
+                counts: &[],
+                elem: 16,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800122,
+        name: "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 24,
+                scale: 1,
+                counts: &[CountField { offset: 20, width: 4 }],
+                elem: 32,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800123,
+        name: "NV2080_CTRL_CMD_GPU_GET_ENGINES",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800124,
+        name: "NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x2080016e,
+        name: "NV2080_CTRL_GPU_GET_NVENC_SW_SESSION_INFO",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 32,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x208001e8,
+        name: "NV2080_CTRL_CMD_GPU_RPC_GSP_TEST",
+        ptrs: &[
+            DeepPtr {
+                ptr: 24,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 4,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800610,
+        name: "NV2080_CTRL_CMD_I2C_ACCESS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 28, width: 4 }],
+                elem: 1,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800803,
+        name: "NV2080_CTRL_CMD_BIOS_GET_NBSI",
+        ptrs: &[
+            DeepPtr {
+                ptr: 1048,
+                scale: 1,
+                counts: &[CountField { offset: 1056, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20800806,
+        name: "NV2080_CTRL_CMD_BIOS_GET_NBSI_OBJ",
+        ptrs: &[
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 24, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20801201,
+        name: "NV2080_CTRL_CMD_GR_GET_INFO",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 0, width: 4 }],
+                elem: 8,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20802204,
+        name: "NV2080_CTRL_CMD_RC_READ_VIRTUAL_MEM",
+        ptrs: &[
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 24, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20802402,
+        name: "NV2080_CTRL_CMD_NVD_GET_DUMP",
+        ptrs: &[
+            DeepPtr {
+                ptr: 0,
+                scale: 1,
+                counts: &[CountField { offset: 12, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x20802a01,
+        name: "NV2080_CTRL_CMD_CE_GET_CAPS",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x402c0102,
+        name: "NV402C_CTRL_CMD_I2C_INDEXED",
+        ptrs: &[
+            DeepPtr {
+                ptr: 24,
+                scale: 1,
+                counts: &[CountField { offset: 16, width: 4 }],
+                elem: 1,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x83de0315,
+        name: "NV83DE_CTRL_CMD_DEBUG_READ_MEMORY",
+        ptrs: &[
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x83de0316,
+        name: "NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY",
+        ptrs: &[
+            DeepPtr {
+                ptr: 16,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 1,
+                copy_in: true,
+                copy_out: false,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x83de0326,
+        name: "NV83DE_CTRL_CMD_DEBUG_READ_BATCH_MEMORY",
+        ptrs: &[
+            DeepPtr {
+                ptr: 0,
+                scale: 1,
+                counts: &[CountField { offset: 8, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0x83de0327,
+        name: "NV83DE_CTRL_CMD_DEBUG_WRITE_BATCH_MEMORY",
+        ptrs: &[
+            DeepPtr {
+                ptr: 0,
+                scale: 1,
+                counts: &[CountField { offset: 8, width: 4 }],
+                elem: 1,
+                copy_in: true,
+                copy_out: false,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0xa0830103,
+        name: "NVA083_CTRL_CMD_VIRTUAL_DISPLAY_GET_DEFAULT_EDID",
+        ptrs: &[
+            DeepPtr {
+                ptr: 0,
+                scale: 1,
+                counts: &[CountField { offset: 8, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0xa0bc0101,
+        name: "NVA0BC_CTRL_CMD_NVENC_SW_SESSION_UPDATE_INFO",
+        ptrs: &[
+            DeepPtr {
+                ptr: 24,
+                scale: 1,
+                counts: &[CountField { offset: 16, width: 4 }],
+                elem: 16,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0xb06f010c,
+        name: "NVB06F_CTRL_CMD_GET_ENGINE_CTX_DATA",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 1,
+                copy_in: false,
+                copy_out: true,
+            },
+        ],
+    },
+    DeepControl {
+        cmd: 0xb06f010d,
+        name: "NVB06F_CTRL_CMD_MIGRATE_ENGINE_CTX_DATA",
+        ptrs: &[
+            DeepPtr {
+                ptr: 8,
+                scale: 1,
+                counts: &[CountField { offset: 4, width: 4 }],
+                elem: 1,
+                copy_in: true,
+                copy_out: true,
+            },
+        ],
+    },
+];
+
+/// Controls whose pointers are always zeroed: no deep block is taken
+/// for them, single or segmented (rmctrl_extract.py, LEFT_ZEROED).
+pub const ZEROED_CONTROLS: &[(u32, &str)] = &[
+    (0x00000101, "NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION"),
+    (0x00000130, "NV0000_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD"),
+    (0x00730120, "NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD"),
+    (0x00730168, "NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD"),
+    (0x208001f2, "NV2080_CTRL_CMD_GSP_CRYPTO_CONTROL"),
+    (0x20801336, "NV2080_CTRL_CMD_FB_GET_AMAP_CONF"),
+    (0x20801349, "NV2080_CTRL_CMD_FB_GET_CLIENT_ALLOCATION_INFO"),
+];
+
+/// NV_ESC_RM_IDLE_CHANNELS, an escape: NVOS30's three handle arrays,
+/// which RmDeprecatedIdleChannels copies in only for a channel list --
+/// `flags` bits IDLE_CHANNELS_LIST_BITS equal to IDLE_CHANNELS_LIST --
+/// with a nonzero count. `cmd` is unused.
+#[rustfmt::skip]
+pub const IDLE_CHANNELS: DeepControl = DeepControl {
+    cmd: 0,
+    name: "NV_ESC_RM_IDLE_CHANNELS",
+    ptrs: &[
+        DeepPtr {
+            ptr: 16,
+            scale: 1,
+            counts: &[CountField { offset: 12, width: 4 }],
+            elem: 4,
+            copy_in: true,
+            copy_out: false,
+        },
+        DeepPtr {
+            ptr: 24,
+            scale: 1,
+            counts: &[CountField { offset: 12, width: 4 }],
+            elem: 4,
+            copy_in: true,
+            copy_out: false,
+        },
+        DeepPtr {
+            ptr: 32,
+            scale: 1,
+            counts: &[CountField { offset: 12, width: 4 }],
+            elem: 4,
+            copy_in: true,
+            copy_out: false,
+        },
+    ],
+};
+pub const IDLE_CHANNELS_SIZE: usize = 56;
+pub const IDLE_CHANNELS_FLAGS: usize = 40;
+pub const IDLE_CHANNELS_LIST_BITS: (u32, u32) = (4, 7);
+pub const IDLE_CHANNELS_LIST: u32 = 0;

@@ -7,6 +7,7 @@
 // received from the guest driver over virtqueues.
 
 pub mod closer;
+pub mod deepseg;
 pub mod error;
 pub mod exec;
 pub mod fence;

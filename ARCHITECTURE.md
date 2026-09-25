@@ -164,7 +164,12 @@ them was its own bug:
 **Pointers.** Many NVIDIA parameter structs carry a pointer to a second block of
 memory. A guest address means nothing in the backend's process, so the block
 travels alongside the request, and the backend rewrites the pointer to its own
-copy before the call and copies the result back afterwards.
+copy before the call and copies the result back afterwards. Some blocks hold
+several — FIFO_GET_CHANNELLIST's two lists, which cuCtxCreate asks for, and
+IDLE_CHANNELS' three arrays — and then each travels as a segment of its own.
+How much each segment holds is not the guest's to say: the backend computes it
+from the parameters it is about to hand RM, as RM will, and refuses a call
+whose segments differ.
 
 **Handles.** The driver's object handles are per-open-file. Each guest open of a
 device holds exactly one host open, so a handle the host issues is already
@@ -312,15 +317,17 @@ trusted.
 
 Protocol v2 and the work around it need layouts that move more often than the
 profiles do, so those are measured per **release**: NVKMS and nvidia-drm ioctl
-layouts, the pointers RM follows inside control parameters, and UVM's
-parameter block sizes, each extracted from a release's own sources by
-compiling probes against them. For NVKMS and UVM, a host between two measured
+layouts, the pointers RM follows inside control parameters and how much it
+copies through each, and UVM's parameter block sizes, each extracted from a
+release's own sources by compiling probes against them. For NVKMS and UVM, a host between two measured
 releases uses the older table, and the NVKMS commands whose layout changed in
 the next measured release run only on the exact release their table came from;
 the RM control table is the union of every release's. The ioctl schema both
 halves interpret (§10) is written once and generated into a C table for the
 guest and a Rust table for the backend, and a test fails if either checked-in
-copy is not what the generator writes.
+copy is not what the generator writes; the RM copy sizes the guest sends
+segments by are rendered the same way, with the backend's table, from the same
+measurements.
 
 ---
 
@@ -396,7 +403,10 @@ The first protocol's IOCTL message stays for RM escapes, UVM and nvidia-drm's
 own GEM calls, from every guest, and for a v1 guest's NVKMS commands, of which
 it takes only those with no pointer and no descriptor. RM's embedded pointers
 travel as that message's nested and deep blocks, and the backend holds them to
-its own RM control table (§8), not to the IOCTL2 schema. The message is refused
+its own RM control table (§8), not to the IOCTL2 schema. A deep block carries
+one pointer, or, to a backend that says so in HELLO (`BCAP_DEEP_SEGS`), a
+segment for each pointer of a control or of IDLE_CHANNELS; a guest that sees no
+such bit sends one or none, and the backend zeroes the rest. The message is refused
 on every kind of handle v2 introduced, so it cannot be used to go around
 IOCTL2's checks.
 

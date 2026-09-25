@@ -278,6 +278,9 @@ pub struct IoctlReq {
     pub nested_len: u32,
     /// Where, inside the nested block, a further pointer sits, when the nested
     /// block carries one. Only meaningful when `deep_len` is non-zero.
+    ///
+    /// [`DEEP_SEGMENTED`] instead says the deep block is a segment table
+    /// ([`DeepSegHdr`]) carrying what several pointers address.
     pub deep_ptr_offset: u32,
     /// Bytes of a second-level block following the nested block: what the
     /// pointer at `deep_ptr_offset` points at in the guest.
@@ -287,6 +290,62 @@ pub struct IoctlReq {
     /// and the backend gives them a host address before the call. Zero when
     /// the nested block carries no pointer.
     pub deep_len: u32,
+}
+
+/// `IoctlReq::deep_ptr_offset` for a segmented deep block: several pointers
+/// of one parameter block, each sent with the bytes it addresses. Only to a
+/// backend that says [`BCAP_DEEP_SEGS`]. An older one would refuse the call
+/// (an RM control's: the offset is outside any nested block) or ignore the
+/// block (IDLE_CHANNELS', and then refuse the list), and a guest that sees
+/// no bit sends what it always did: the pointers go unrelocated, and the
+/// backend zeroes them.
+///
+/// The deep block is a [`DeepSegHdr`], `count` [`DeepSeg`]s, and then each
+/// segment's bytes, back to back in table order and nothing after. The block
+/// whose pointers the segments name is fixed by the call: an RM_CONTROL's
+/// parameters (the nested block), or NV_ESC_RM_IDLE_CHANNELS' top-level
+/// NVOS30. The backend sizes every segment from that block itself -- how much
+/// RM will copy through the pointer, from the count fields RM reads -- and
+/// refuses the call if a length differs, if a pointer is named twice or is
+/// not one RM follows there, or if the table and the bytes do not add up.
+/// Pointers of the block with no segment are zeroed, as ever.
+///
+/// The reply's deep block, when there is one, is laid out as the request's
+/// was, with each segment's bytes as RM left them; the guest copies back the
+/// ones RM writes. A reply with no deep block (IDLE_CHANNELS, whose arrays
+/// RM only reads) has nothing to copy back.
+pub const DEEP_SEGMENTED: u32 = u32::MAX;
+
+/// Most segments in one deep block: RM's embedded copies have four slots
+/// (embedded_param_copy.c, `paramCopies[4]`).
+pub const DEEP_SEGS_MAX: u32 = 4;
+
+/// Most bytes all of one call's segments may carry together. RM's own bound
+/// on one embedded copy is the same (RMAPI_PARAM_COPY_MAX_PARAMS_SIZE).
+pub const DEEP_SEGS_MAX_BYTES: u32 = 1 << 20;
+
+/// Most channels an NV_ESC_RM_IDLE_CHANNELS list may name (RM has no bound
+/// of its own: "this should have a max", rmapi_deprecated_misc.c).
+pub const IDLE_CHANNELS_MAX: u32 = 4096;
+
+/// Head of a segmented deep block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeepSegHdr {
+    /// Segments in the table, 1 to [`DEEP_SEGS_MAX`].
+    pub count: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// One pointer of a segmented deep block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeepSeg {
+    /// Where the pointer sits in the block that holds it.
+    pub ptr_offset: u32,
+    /// Bytes it addresses, sent after the table.
+    pub len: u32,
 }
 
 /// Response payload for `MsgType::Ioctl`, following a `MsgHeader`.
@@ -391,6 +450,8 @@ const _: () = {
     assert!(size_of::<OpenReq>() == 8);
     assert!(size_of::<IoctlReq>() == 24);
     assert!(size_of::<IoctlResp>() == 12);
+    assert!(size_of::<DeepSegHdr>() == 8);
+    assert!(size_of::<DeepSeg>() == 8);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapResp>() == 24);
     assert!(core::mem::offset_of!(MmapResp, caching) == 20);
@@ -420,6 +481,8 @@ pub const BCAP_WAYLAND: u32 = 1 << 1;
 pub const BCAP_FENCES: u32 = 1 << 2;
 pub const BCAP_NVKMS_TABLE: u32 = 1 << 3;
 pub const BCAP_WL_EXPORT: u32 = 1 << 4;
+/// Segmented deep blocks ([`DEEP_SEGMENTED`]) are understood.
+pub const BCAP_DEEP_SEGS: u32 = 1 << 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -732,6 +795,37 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deep-segment constants are the C header's: nothing else checks
+    /// that the two halves agree on them.
+    #[test]
+    fn deep_segment_constants_match_the_driver() {
+        let h = include_str!("../../driver/nvgpu_wire.h");
+        let define = |name: &str| -> u64 {
+            let line = h
+                .lines()
+                .find(|l| l.split_whitespace().take(2).eq(["#define", name]))
+                .unwrap_or_else(|| panic!("{name} not in nvgpu_wire.h"));
+            let v = line.split_once(name).unwrap().1;
+            let v = v.split("/*").next().unwrap().trim();
+            let v = v.trim_start_matches('(').trim_end_matches(')');
+            let (v, shift) = match v.split_once("<<") {
+                Some((a, b)) => (a.trim(), b.trim().parse::<u32>().unwrap()),
+                None => (v, 0),
+            };
+            let v = v.trim_end_matches('u');
+            let v = match v.strip_prefix("0x") {
+                Some(x) => u64::from_str_radix(x, 16).unwrap(),
+                None => v.parse().unwrap(),
+            };
+            v << shift
+        };
+        assert_eq!(define("NVGPU_DEEP_SEGMENTED"), u64::from(DEEP_SEGMENTED));
+        assert_eq!(define("NVGPU_DEEP_SEGS_MAX"), u64::from(DEEP_SEGS_MAX));
+        assert_eq!(define("NVGPU_DEEP_SEGS_MAX_BYTES"), u64::from(DEEP_SEGS_MAX_BYTES));
+        assert_eq!(define("NVGPU_IDLE_CHANNELS_MAX"), u64::from(IDLE_CHANNELS_MAX));
+        assert_eq!(define("NVGPU_BCAP_DEEP_SEGS"), u64::from(BCAP_DEEP_SEGS));
+    }
 
     #[test]
     fn device_types_decode_the_way_the_driver_encodes_them() {

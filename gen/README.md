@@ -15,7 +15,7 @@ There are several, each with its own generator:
 | `src/versions/*.rs` | `nvabi_gen.py`, gVisor's nvproxy | the ABI profiles: RM escape parameter sizes and kinds | [The generator](#the-generator) |
 | `schema/*.py` → `src/schema/generated.rs`, `../driver/gen/nvgpu_schema.h` | `schema_gen.py` | the IOCTL2 schema both halves interpret: DRM render and KMS, nvidia-drm, NVKMS per release, UVM block sizes | [The IOCTL2 schema](#the-ioctl2-schema) |
 | `nvkms/*.json` | `nvkms_extract.py` | NVKMS and nvidia-drm ioctl layouts, per release | [NVKMS and nvidia-drm layouts](#nvkms-and-nvidia-drm-layouts) |
-| `rmctrl/*.json` → `src/rmctrl/generated.rs` | `rmctrl_extract.py` | where RM follows a pointer inside a control's parameters, per release | [RM control pointers](#rm-control-pointers) |
+| `rmctrl/*.json` → `src/rmctrl/generated.rs`, `../driver/gen/nvgpu_rm_deep.h` | `rmctrl_extract.py` | where RM follows a pointer inside a control's parameters, and how much it copies through it, per release | [RM control pointers](#rm-control-pointers) |
 | `uvm/*.json` | `uvm_extract.py` | UVM parameter block sizes and descriptor offsets, per release | [UVM parameter blocks](#uvm-parameter-blocks) |
 | `../driver/gen/nvgpu_rmalloc_classes.h`, `nvgpu_v1v2_rewrites.h` | `nvgpu_gen.py` | the guest module's RM class and rewrite tables | — |
 
@@ -172,9 +172,21 @@ a pointer fails the run instead of being missed.
 ./rmctrl_extract.py render   # gen/rmctrl/*.json -> src/rmctrl/generated.rs
 ```
 
+Each pointer copied through `RMAPI_PARAM_COPY_INIT` also gets RM's size rule
+for it — the count fields multiplied in NvU32, times the element size — read
+from the call's arguments and measured by the same probe, with its direction
+from the SKIP_COPYIN/SKIP_COPYOUT flags; RmDeprecatedIdleChannels is read the
+same way for NV_ESC_RM_IDLE_CHANNELS. A control whose every pointer has a rule
+is one the guest may send as deep segments, and the backend checks each
+segment's length against the rule. A control with several pointers must have
+a rule for each or be listed in `LEFT_ZEROED` with the reason (the ACPI
+methods among them); the extractor fails otherwise.
+
 `gen/rmctrl/<version>.json` holds each release's measurement;
 `src/rmctrl/generated.rs` is their union (a command whose pointers differ
-between releases lists all of them). `render` is pure Python, and the Rust
+between releases lists all of them; one relocated in some releases and not
+others is not relocated), and `../driver/gen/nvgpu_rm_deep.h` the guest's copy
+of the multi-pointer rows, rendered from the same union. `render` is pure Python, and the Rust
 test `the_checked_in_table_is_what_the_extractor_renders` runs it, as the
 schema's does. Sources are cached in `$RMCTRL_EXTRACT_CACHE` (default
 `$TMPDIR/ogkm-rm`).

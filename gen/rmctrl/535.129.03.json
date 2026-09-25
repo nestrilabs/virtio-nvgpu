@@ -1,5 +1,5 @@
 {
- "format": "virtio-nvgpu/rmctrl-pointers/1",
+ "format": "virtio-nvgpu/rmctrl-pointers/2",
  "version": "535.129.03",
  "abi": "x86_64 LP64",
  "source": {
@@ -18,17 +18,22 @@
    "pointers": [
     {
      "field": "pDriverVersionBuffer",
-     "offset": 8
+     "offset": 8,
+     "size": null
     },
     {
      "field": "pVersionBuffer",
-     "offset": 16
+     "offset": 16,
+     "size": null
     },
     {
      "field": "pTitleBuffer",
-     "offset": 24
+     "offset": 24,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "answered in the guest (nvgpu_rm_intercepts.h); RM's deprecated converter sizes the strings itself"
   },
   {
    "name": "NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS",
@@ -38,9 +43,29 @@
    "pointers": [
     {
      "field": "busPeerIds",
-     "offset": 160
+     "offset": 160,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "gpuCount",
+        "offset": 128,
+        "width": 4
+       },
+       {
+        "field": "gpuCount",
+        "offset": 128,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": true
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0000_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD",
@@ -50,13 +75,43 @@
    "pointers": [
     {
      "field": "inData",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "inDataSize",
+        "offset": 16,
+        "width": 2
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": false,
+      "if_nonnull": false
+     }
     },
     {
      "field": "outData",
-     "offset": 24
+     "offset": 24,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "outDataSize",
+        "offset": 32,
+        "width": 2
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "runs an ACPI method on the host's firmware; not a VM's to call"
   },
   {
    "name": "NV0000_CTRL_CMD_NVD_GET_DUMP",
@@ -66,9 +121,24 @@
    "pointers": [
     {
      "field": "pBuffer",
-     "offset": 0
+     "offset": 0,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "size",
+        "offset": 12,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0041_CTRL_CMD_GET_SURFACE_INFO",
@@ -78,9 +148,24 @@
    "pointers": [
     {
      "field": "surfaceInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "surfaceInfoListSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 8,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD",
@@ -90,13 +175,43 @@
    "pointers": [
     {
      "field": "inData",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "inDataSize",
+        "offset": 16,
+        "width": 2
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": false,
+      "if_nonnull": false
+     }
     },
     {
      "field": "outData",
-     "offset": 24
+     "offset": 24,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "outDataSize",
+        "offset": 32,
+        "width": 2
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "runs an ACPI method on the host's firmware; not a VM's to call"
   },
   {
    "name": "NV0073_CTRL_CMD_DP_SET_MSA_PROPERTIES",
@@ -106,9 +221,12 @@
    "pointers": [
     {
      "field": "pFeatureDebugValues",
-     "offset": 56
+     "offset": 56,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "RM's size for it is not read here"
   },
   {
    "name": "NV0080_CTRL_CMD_GPU_GET_CLASSLIST",
@@ -118,9 +236,24 @@
    "pointers": [
     {
      "field": "classList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "numClasses",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_GR_GET_CAPS",
@@ -130,9 +263,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_GR_GET_INFO",
@@ -142,9 +290,24 @@
    "pointers": [
     {
      "field": "grInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "grInfoListSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 8,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_FB_GET_CAPS",
@@ -154,9 +317,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_HOST_GET_CAPS",
@@ -166,9 +344,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_FIFO_GET_CAPS",
@@ -178,9 +371,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_FIFO_START_SELECTED_CHANNELS",
@@ -190,9 +398,24 @@
    "pointers": [
     {
      "field": "fifoStartChannelList",
-     "offset": 40
+     "offset": 40,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "fifoStartChannelListCount",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST",
@@ -202,13 +425,42 @@
    "pointers": [
     {
      "field": "pChannelHandleList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "numChannels",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": false,
+      "if_nonnull": false
+     }
     },
     {
      "field": "pChannelList",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "numChannels",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_DMA_UPDATE_PDE_2",
@@ -218,9 +470,18 @@
    "pointers": [
     {
      "field": "pPdeBuffer",
-     "offset": 48
+     "offset": 48,
+     "size": {
+      "scale": 1,
+      "count": [],
+      "elem": 16,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_MSENC_GET_CAPS",
@@ -230,9 +491,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV0080_CTRL_CMD_BSP_GET_CAPS",
@@ -242,9 +518,12 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "RM's size for it is not read here"
   },
   {
    "name": "NV2080_CTRL_CMD_GPU_GET_INFO",
@@ -254,9 +533,12 @@
    "pointers": [
     {
      "field": "gpuInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "RM's size for it is not read here"
   },
   {
    "name": "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS",
@@ -266,9 +548,24 @@
    "pointers": [
     {
      "field": "regOps",
-     "offset": 24
+     "offset": 24,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "regOpCount",
+        "offset": 20,
+        "width": 4
+       }
+      ],
+      "elem": 32,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_GPU_GET_ENGINES",
@@ -278,9 +575,24 @@
    "pointers": [
     {
      "field": "engineList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "engineCount",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST",
@@ -290,9 +602,24 @@
    "pointers": [
     {
      "field": "classList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "numClasses",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 4,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_I2C_ACCESS",
@@ -302,9 +629,24 @@
    "pointers": [
     {
      "field": "data",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "dataBuffSize",
+        "offset": 28,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_BIOS_GET_INFO",
@@ -314,9 +656,12 @@
    "pointers": [
     {
      "field": "biosInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "RM's size for it is not read here"
   },
   {
    "name": "NV2080_CTRL_CMD_BIOS_GET_NBSI",
@@ -326,9 +671,24 @@
    "pointers": [
     {
      "field": "retBuf",
-     "offset": 1048
+     "offset": 1048,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "retSize",
+        "offset": 1056,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_BIOS_GET_NBSI_OBJ",
@@ -338,9 +698,24 @@
    "pointers": [
     {
      "field": "retBuf",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "retSize",
+        "offset": 24,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_GR_GET_INFO",
@@ -350,9 +725,24 @@
    "pointers": [
     {
      "field": "grInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "grInfoListSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 8,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_FB_GET_INFO",
@@ -362,9 +752,24 @@
    "pointers": [
     {
      "field": "fbInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "fbInfoListSize",
+        "offset": 0,
+        "width": 4
+       }
+      ],
+      "elem": 8,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_FB_GET_AMAP_CONF",
@@ -374,13 +779,17 @@
    "pointers": [
     {
      "field": "pAmapConfParams",
-     "offset": 0
+     "offset": 0,
+     "size": null
     },
     {
      "field": "pCbcSwizzleParams",
-     "offset": 8
+     "offset": 8,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "copied only under USE_AMAPLIB, which no open build defines, with sizes of amaplib types the SDK does not have"
   },
   {
    "name": "NV2080_CTRL_CMD_FB_GET_CLIENT_ALLOCATION_INFO",
@@ -390,13 +799,17 @@
    "pointers": [
     {
      "field": "pAllocInfo",
-     "offset": 8
+     "offset": 8,
+     "size": null
     },
     {
      "field": "pClientInfo",
-     "offset": 24
+     "offset": 24,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "served only by DEBUG/DEVELOP builds (mem_mgr_ctrl.c), and it lists every client's host PID"
   },
   {
    "name": "NV2080_CTRL_CMD_BUS_GET_INFO",
@@ -406,9 +819,12 @@
    "pointers": [
     {
      "field": "busInfoList",
-     "offset": 8
+     "offset": 8,
+     "size": null
     }
-   ]
+   ],
+   "relocate": false,
+   "why": "RM's size for it is not read here"
   },
   {
    "name": "NV2080_CTRL_CMD_RC_READ_VIRTUAL_MEM",
@@ -418,9 +834,24 @@
    "pointers": [
     {
      "field": "bufferPtr",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "bufferSize",
+        "offset": 24,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_NVD_GET_DUMP",
@@ -430,9 +861,24 @@
    "pointers": [
     {
      "field": "pBuffer",
-     "offset": 0
+     "offset": 0,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "size",
+        "offset": 12,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV2080_CTRL_CMD_CE_GET_CAPS",
@@ -442,9 +888,24 @@
    "pointers": [
     {
      "field": "capsTbl",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "capsTblSize",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV402C_CTRL_CMD_I2C_INDEXED",
@@ -454,9 +915,24 @@
    "pointers": [
     {
      "field": "pMessage",
-     "offset": 24
+     "offset": 24,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "messageLength",
+        "offset": 16,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV83DE_CTRL_CMD_DEBUG_READ_MEMORY",
@@ -466,9 +942,24 @@
    "pointers": [
     {
      "field": "buffer",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "length",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY",
@@ -478,9 +969,24 @@
    "pointers": [
     {
      "field": "buffer",
-     "offset": 16
+     "offset": 16,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "length",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": false,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV83DE_CTRL_CMD_DEBUG_READ_BATCH_MEMORY",
@@ -490,9 +996,24 @@
    "pointers": [
     {
      "field": "pData",
-     "offset": 0
+     "offset": 0,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "dataLength",
+        "offset": 8,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NV83DE_CTRL_CMD_DEBUG_WRITE_BATCH_MEMORY",
@@ -502,9 +1023,24 @@
    "pointers": [
     {
      "field": "pData",
-     "offset": 0
+     "offset": 0,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "dataLength",
+        "offset": 8,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": false,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NVB06F_CTRL_CMD_GET_ENGINE_CTX_DATA",
@@ -514,9 +1050,24 @@
    "pointers": [
     {
      "field": "pEngineCtxBuff",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "size",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": false,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   },
   {
    "name": "NVB06F_CTRL_CMD_MIGRATE_ENGINE_CTX_DATA",
@@ -526,9 +1077,24 @@
    "pointers": [
     {
      "field": "pEngineCtxBuff",
-     "offset": 8
+     "offset": 8,
+     "size": {
+      "scale": 1,
+      "count": [
+       {
+        "field": "size",
+        "offset": 4,
+        "width": 4
+       }
+      ],
+      "elem": 1,
+      "copy_in": true,
+      "copy_out": true,
+      "if_nonnull": false
+     }
     }
-   ]
+   ],
+   "relocate": true
   }
  ],
  "refused": [
@@ -547,5 +1113,71 @@
    "cmd": 2212365083,
    "why": "an array of up to MAX_ACCESS_OPS ops, each with its own pCpuVA (kernel_sm_debugger_session_ctrl.c)"
   }
- ]
+ ],
+ "idle_channels": {
+  "name": "NV_ESC_RM_IDLE_CHANNELS",
+  "params_size": 56,
+  "pointers": [
+   {
+    "field": "phClients",
+    "offset": 16,
+    "size": {
+     "scale": 1,
+     "count": [
+      {
+       "field": "numChannels",
+       "offset": 12,
+       "width": 4
+      }
+     ],
+     "elem": 4,
+     "copy_in": true,
+     "copy_out": false,
+     "if_nonnull": false
+    }
+   },
+   {
+    "field": "phDevices",
+    "offset": 24,
+    "size": {
+     "scale": 1,
+     "count": [
+      {
+       "field": "numChannels",
+       "offset": 12,
+       "width": 4
+      }
+     ],
+     "elem": 4,
+     "copy_in": true,
+     "copy_out": false,
+     "if_nonnull": false
+    }
+   },
+   {
+    "field": "phChannels",
+    "offset": 32,
+    "size": {
+     "scale": 1,
+     "count": [
+      {
+       "field": "numChannels",
+       "offset": 12,
+       "width": 4
+      }
+     ],
+     "elem": 4,
+     "copy_in": true,
+     "copy_out": false,
+     "if_nonnull": false
+    }
+   }
+  ],
+  "list_when": {
+   "offset": 40,
+   "lo": 4,
+   "hi": 7,
+   "value": 0
+  }
+ }
 }

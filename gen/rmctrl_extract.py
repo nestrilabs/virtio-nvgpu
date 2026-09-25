@@ -26,7 +26,14 @@ For one driver release it:
    handler fails here, loudly);
 3. compiles and runs a C probe against the release's own SDK headers for
    every command number, every offset and every field width (each must be an
-   8-byte NvP64): nothing is transcribed.
+   8-byte NvP64): nothing is transcribed;
+4. reads, for each embedded pointer, how much RM copies through it -- the
+   count and element-size arguments of its RMAPI_PARAM_COPY_INIT, the counts'
+   offsets and widths and the element's size from the same probe -- and the
+   same for NV_ESC_RM_IDLE_CHANNELS' arrays from RmDeprecatedIdleChannels.
+   Those sizes are what the backend checks the guest's deep segments against
+   (device/src/deepseg.rs), and the guest's copy of the rows it sends as
+   segments is rendered alongside (driver/gen/nvgpu_rm_deep.h).
 
     ./rmctrl_extract.py all                # every version in VERSIONS, then render
     ./rmctrl_extract.py extract 610.57.04  # one version (fetches if needed)
@@ -60,8 +67,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE / "rmctrl"
 RUST_OUT = HERE / "src" / "rmctrl" / "generated.rs"
+C_OUT = HERE.parent / "driver" / "gen" / "nvgpu_rm_deep.h"
 REPO = "NVIDIA/open-gpu-kernel-modules"
-FORMAT = "virtio-nvgpu/rmctrl-pointers/1"
+FORMAT = "virtio-nvgpu/rmctrl-pointers/2"
 DEFAULT_CACHE = Path(os.environ.get("RMCTRL_EXTRACT_CACHE",
                                     Path(tempfile.gettempdir()) / "ogkm-rm"))
 
@@ -127,6 +135,28 @@ REFUSED = {
     "NV83DE_CTRL_CMD_WRITE_SURFACE":
         "an array of up to MAX_ACCESS_OPS ops, each with its own pCpuVA "
         "(kernel_sm_debugger_session_ctrl.c)",
+}
+
+# Controls whose pointers are zeroed and never relocated, whatever the guest
+# sends: the backend refuses a deep block for any of them. Every control with
+# more than one pointer is either here or has RM's size read for each
+# pointer (parse_size_rule); `extract` fails otherwise.
+LEFT_ZEROED = {
+    "NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION":
+        "answered in the guest (nvgpu_rm_intercepts.h); RM's deprecated "
+        "converter sizes the strings itself",
+    "NV0000_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD":
+        "runs an ACPI method on the host's firmware; not a VM's to call",
+    "NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD":
+        "runs an ACPI method on the host's firmware; not a VM's to call",
+    "NV2080_CTRL_CMD_FB_GET_AMAP_CONF":
+        "copied only under USE_AMAPLIB, which no open build defines, with "
+        "sizes of amaplib types the SDK does not have",
+    "NV2080_CTRL_CMD_FB_GET_CLIENT_ALLOCATION_INFO":
+        "served only by DEBUG/DEVELOP builds (mem_mgr_ctrl.c), and it lists "
+        "every client's host PID",
+    "NV2080_CTRL_CMD_GSP_CRYPTO_CONTROL":
+        "PRIVILEGED and RM_TEST_ONLY_CODE (0x100044)",
 }
 
 # Every RM file that calls a user-copy primitive, and what accounts for it.
@@ -355,8 +385,88 @@ def switch_cases(body):
     return out
 
 
+INT_LITERAL = re.compile(r"(0[xX][0-9a-fA-F]+|[0-9]+)[uU]?")
+
+
+def _one_line(expr):
+    return " ".join(expr.split())
+
+
+def _count_field(expr):
+    """The parameter field a count expression reads, or None: an argument of
+    the form `((T*)pParams)->f` or `pParams->f` (callers require pParams)."""
+    try:
+        return field_of(expr)
+    except ExtractError:
+        return None
+
+
+def parse_size_rule(block, dest, field, num, size):
+    """How much RM copies through the pointer `field`, as RM computes it:
+    `RMAPI_PARAM_COPY_INIT(dest, .., .., num, size)` sets paramsSize to
+    num * size (portSafeMulU32; an overflow is RM's NV_ERR_INVALID_ARGUMENT),
+    with num evaluated in NvU32. Returns None for any form not read here --
+    the pointer is then never relocated, only zeroed.
+
+    num is a parameter field, a literal, or a local set from a product of
+    fields when the pointer is set (GET_P2P_CAPS's gpuCount * gpuCount);
+    size is sizeof(T) or a literal. The directions are the SKIP_COPYIN and
+    SKIP_COPYOUT flags set on `dest` in the same case."""
+    num, size = _one_line(num), _one_line(size)
+    rule = {"scale": 1, "count": [], "elem": None, "elem_type": None,
+            "if_nonnull": False}
+    m = INT_LITERAL.fullmatch(num)
+    if m:
+        rule["scale"] = int(m.group(1), 0)
+    elif re.fullmatch(r"[A-Za-z_]\w*", num):
+        # A local: accepted only as `if (NvP64_VALUE(<this pointer>) != NULL)
+        # { num = a * b ...; }`, zero otherwise (RM initialises it to 0).
+        pat = (r"if\s*\(\s*NvP64_VALUE\s*\((.*?)\)\s*!=\s*NULL\s*\)\s*\{\s*"
+               + re.escape(num) + r"\s*=\s*([^;]+);\s*\}")
+        hit = [h for h in re.finditer(pat, block, flags=re.S)
+               if _count_field(h.group(1)) == field]
+        if len(hit) != 1:
+            return None
+        factors, depth, cur = [], 0, []
+        for ch in hit[0].group(2):
+            depth += ch in "([{"
+            depth -= ch in ")]}"
+            if ch == "*" and depth == 0:
+                factors.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        factors.append("".join(cur))
+        parts = [_count_field(p) for p in factors]
+        if not parts or None in parts:
+            return None
+        rule["count"] = parts
+        rule["if_nonnull"] = True
+    else:
+        f = _count_field(num)
+        if f is None or "pParams" not in num:
+            return None
+        rule["count"] = [f]
+    m = INT_LITERAL.fullmatch(size)
+    if m:
+        rule["elem"] = int(m.group(1), 0)
+    else:
+        m = re.fullmatch(r"sizeof\s*\(\s*([A-Za-z_]\w*)\s*\)", size)
+        if not m:
+            return None
+        rule["elem_type"] = m.group(1)
+    flags = set(re.findall(re.escape(dest) + r"\.flags\s*\|=\s*(RMAPI_PARAM_COPY_FLAGS_\w+)",
+                           block))
+    if re.search(re.escape(dest) + r"\.flags\s*=", block):
+        return None
+    rule["copy_in"] = "RMAPI_PARAM_COPY_FLAGS_SKIP_COPYIN" not in flags
+    rule["copy_out"] = "RMAPI_PARAM_COPY_FLAGS_SKIP_COPYOUT" not in flags
+    return rule
+
+
 def parse_epc(text):
-    """{command name: (params type, [fields])} from embeddedParamCopyIn."""
+    """{command name: (params type, [fields], {field: size rule or None})}
+    from embeddedParamCopyIn."""
     s = strip_comments(text)
     body = function_body(s, "embeddedParamCopyIn")
     found = {}
@@ -375,8 +485,16 @@ def parse_epc(text):
         if len(set(types)) != 1:
             raise ExtractError(f"{labels}: params type is not one of {types}")
         fields = [field_of(a[1]) for a in inits]
+        rules = {}
+        for a in inits:
+            if len(a) != 5:
+                raise ExtractError(f"{labels}: RMAPI_PARAM_COPY_INIT with {len(a)} arguments")
+            f = field_of(a[1])
+            if field_of(a[2]) != f:
+                raise ExtractError(f"{labels}: copies {f} to {field_of(a[2])}")
+            rules[f] = parse_size_rule(block, a[0].strip(), f, a[3], a[4])
         for name in labels:
-            found[name] = (types[0], fields)
+            found[name] = (types[0], fields, rules)
     if not found:
         raise ExtractError("embeddedParamCopyIn: no commands found")
     return found
@@ -450,22 +568,37 @@ def defining_header(root, symbol, kind):
 
 
 def probe(root, rows, workdir):
-    """Compile and run the offset probe; returns {name: {...}}."""
+    """Compile and run the offset probe; returns {name: {...}}.
+
+    rows are (name, params type, [pointer fields], {field: size rule}); for
+    each rule the probe also measures its count fields (offset and width)
+    and its element type's size."""
     headers = set()
-    for name, ptype, fields in rows:
-        for sym, kind in ((name, "macro"), (ptype, "type")):
+    for name, ptype, fields, rules in rows:
+        syms = [(name, "macro"), (ptype, "type")]
+        syms += [(r["elem_type"], "type") for r in rules.values()
+                 if r and r["elem_type"] and not r["elem_type"].startswith("Nv")]
+        for sym, kind in syms:
             h = defining_header(root, sym, kind)
             if h:
                 headers.add(h[0])
     lines = ["#include <stdio.h>", "#include <stddef.h>", '#include "nvtypes.h"']
     lines += [f'#include "{h}"' for h in sorted(headers)]
     lines.append("int main(void) {")
-    for name, ptype, fields in rows:
+    for name, ptype, fields, rules in rows:
         lines.append(f"#ifdef {name}")
         lines.append(f'  printf("ROW {name} %u %zu\\n", (unsigned)({name}), sizeof({ptype}));')
         for f in fields:
             lines.append(f'  printf("F {name} {f} %zu %zu\\n", offsetof({ptype}, {f}), '
                          f'sizeof((({ptype} *)0)->{f}));')
+            r = rules.get(f)
+            if not r:
+                continue
+            for c in r["count"]:
+                lines.append(f'  printf("C {name} {f} {c} %zu %zu\\n", offsetof({ptype}, {c}), '
+                             f'sizeof((({ptype} *)0)->{c}));')
+            if r["elem_type"]:
+                lines.append(f'  printf("E {name} {f} %zu\\n", sizeof({r["elem_type"]}));')
         lines.append("#endif")
     lines.append("  return 0;\n}")
     c = workdir / "probe.c"
@@ -481,12 +614,21 @@ def probe(root, rows, workdir):
     for line in out.splitlines():
         p = line.split()
         if p[0] == "ROW":
-            got[p[1]] = {"cmd": int(p[2]), "size": int(p[3]), "fields": []}
-        else:
+            got[p[1]] = {"cmd": int(p[2]), "size": int(p[3]), "fields": [],
+                         "counts": {}, "elems": {}}
+        elif p[0] == "F":
             name, field, off, width = p[1], p[2], int(p[3]), int(p[4])
             if width != 8 or off % 8:
                 raise ExtractError(f"{name}.{field}: {width} bytes at {off}, not an NvP64")
             got[name]["fields"].append({"field": field, "offset": off})
+        elif p[0] == "C":
+            name, field, cf, off, width = p[1], p[2], p[3], int(p[4]), int(p[5])
+            if width not in (1, 2, 4):
+                raise ExtractError(f"{name}.{cf}: a count of {width} bytes; RM takes an NvU32")
+            got[name]["counts"].setdefault(field, []).append(
+                {"field": cf, "offset": off, "width": width})
+        else:
+            got[p[1]]["elems"][p[2]] = int(p[3])
     return got
 
 
@@ -502,21 +644,24 @@ def extract(version, root, source):
             f"{unknown}. Read them; a handler that follows a pointer in a control's "
             f"parameters belongs in SELF_COPY or REFUSED.")
     rows, origin = [], {}
+    dep = {n: (t, f, {}) for n, (t, f) in dep.items()}
     for table, what in ((epc, "embedded"), (dep, "deprecated")):
-        for name, (ptype, fields) in table.items():
+        for name, (ptype, fields, rules) in table.items():
             if name in origin:
                 # In both (BIOS_GET_INFO): whichever path RM takes, each
-                # pointer either names is followed.
+                # pointer either names is followed. How much it copies
+                # depends on the path, so no size is recorded.
                 i = next(k for k, r in enumerate(rows) if r[0] == name)
                 if rows[i][1] != ptype:
                     raise ExtractError(f"{name}: {rows[i][1]} in one table, {ptype} in the other")
-                rows[i] = (name, ptype, rows[i][2] + [f for f in fields if f not in rows[i][2]])
+                rows[i] = (name, ptype, rows[i][2] + [f for f in fields if f not in rows[i][2]],
+                           {})
                 origin[name] += "+" + what
                 continue
-            rows.append((name, ptype, fields))
+            rows.append((name, ptype, fields, rules))
             origin[name] = what
     for name, (_, ptype, fields) in SELF_COPY.items():
-        rows.append((name, ptype, fields))
+        rows.append((name, ptype, fields, {}))
         origin[name] = "self-copy"
     with tempfile.TemporaryDirectory() as d:
         got = probe(root, rows, Path(d))
@@ -545,12 +690,46 @@ def extract(version, root, source):
                 n, v = line.split()
                 refused[n] = int(v)
     controls = []
-    for name, _, _ in rows:
+    for name, _, _, rules in rows:
         if name not in got:
             continue  # not defined by this release's headers (an #ifdef'd case)
         g = got[name]
-        controls.append({"name": name, "cmd": g["cmd"], "from": origin[name],
-                         "params_size": g["size"], "pointers": g["fields"]})
+        pointers = []
+        for p in g["fields"]:
+            r = rules.get(p["field"])
+            size = None
+            if r:
+                size = {
+                    "scale": r["scale"],
+                    "count": g["counts"].get(p["field"], []),
+                    "elem": r["elem"] if r["elem"] is not None else g["elems"][p["field"]],
+                    "copy_in": r["copy_in"],
+                    "copy_out": r["copy_out"],
+                    "if_nonnull": r["if_nonnull"],
+                }
+                if [c["field"] for c in size["count"]] != r["count"]:
+                    raise ExtractError(f"{name}.{p['field']}: counts {r['count']} not measured")
+            pointers.append({**p, "size": size})
+        c = {"name": name, "cmd": g["cmd"], "from": origin[name],
+             "params_size": g["size"], "pointers": pointers}
+        # Relocated (the guest may send what each pointer addresses, and the
+        # backend checks every length against the size rule) only when RM's
+        # size is known for every pointer and nothing here says otherwise.
+        # A control with several pointers must be one or the other on purpose.
+        if name in LEFT_ZEROED:
+            c["relocate"] = False
+            c["why"] = LEFT_ZEROED[name]
+        elif all(p["size"] for p in pointers):
+            c["relocate"] = True
+        elif len(pointers) > 1:
+            raise ExtractError(
+                f"{version}: {name} has {len(pointers)} pointers and RM's size for "
+                f"{[p['field'] for p in pointers if not p['size']]} is not read here; "
+                f"teach parse_size_rule its form, or add it to LEFT_ZEROED with the reason")
+        else:
+            c["relocate"] = False
+            c["why"] = "RM's size for it is not read here"
+        controls.append(c)
     controls.sort(key=lambda c: (c["cmd"], c["name"]))
     return {
         "format": FORMAT,
@@ -560,6 +739,90 @@ def extract(version, root, source):
         "controls": controls,
         "refused": [{"name": n, "cmd": v, "why": REFUSED[n]}
                     for n, v in sorted(refused.items(), key=lambda x: x[1])],
+        "idle_channels": idle_channels(root),
+    }
+
+
+# NV_ESC_RM_IDLE_CHANNELS is an escape, not a control: its parameters are the
+# top-level NVOS30 block, and RmDeprecatedIdleChannels copies its three handle
+# arrays itself.
+IDLE_SRC = "src/nvidia/interface/deprecated/rmapi_deprecated_misc.c"
+IDLE_TYPE = "NVOS30_PARAMETERS"
+
+
+def idle_channels(root):
+    """The three arrays NV_ESC_RM_IDLE_CHANNELS copies in, and when: read
+    from RmDeprecatedIdleChannels (the size is `portSafeMulU32(count,
+    sizeof(T))`, each array a COPYIN of that size, only for a channel list
+    -- DRF_VAL(OS30, _FLAGS, _CHANNEL, flags) == LIST -- with a nonzero
+    count), measured against nvos.h."""
+    s = strip_comments((root / IDLE_SRC).read_text(errors="replace"))
+    body = function_body(s, "RmDeprecatedIdleChannels")
+    muls = [a for a in calls(body, "portSafeMulU32")]
+    if len(muls) != 1:
+        raise ExtractError(f"RmDeprecatedIdleChannels: {len(muls)} portSafeMulU32 calls")
+    m_count = re.fullmatch(r"pArgs->(\w+)", muls[0][0])
+    m_elem = re.fullmatch(r"sizeof\s*\(\s*(\w+)\s*\)", muls[0][1])
+    m_var = re.fullmatch(r"&\s*(\w+)", muls[0][2])
+    if not (m_count and m_elem and m_var):
+        raise ExtractError(f"RmDeprecatedIdleChannels: size is {muls[0]}")
+    ptrs = []
+    for a in calls(body, "CopyUser"):
+        if a[1] == "RMAPI_DEPRECATED_COPYRELEASE":
+            continue
+        pm = re.fullmatch(r"pArgs->(\w+)", a[3])
+        if a[1] != "RMAPI_DEPRECATED_COPYIN" or not pm or a[4] != m_var.group(1):
+            raise ExtractError(f"RmDeprecatedIdleChannels: a copy {a} not of the form read here")
+        ptrs.append(pm.group(1))
+    if len(ptrs) != 3:
+        raise ExtractError(f"RmDeprecatedIdleChannels: copies {ptrs}")
+    if not re.search(r"DRF_VAL\s*\(\s*OS30\s*,\s*_FLAGS\s*,\s*_CHANNEL\s*,\s*pArgs->flags\s*\)"
+                     r"\s*==\s*NVOS30_FLAGS_CHANNEL_LIST\s*&&\s*params\.numChannels\s*\)", body):
+        raise ExtractError("RmDeprecatedIdleChannels: the copies' condition is not the one "
+                           "read here")
+    nvos = (root / INCLUDE_DIRS[0] / "nvos.h").read_text(errors="replace")
+    rng = re.search(r"#define\s+NVOS30_FLAGS_CHANNEL\s+(\d+):(\d+)", nvos)
+    if not rng:
+        raise ExtractError("nvos.h: no NVOS30_FLAGS_CHANNEL range")
+    hi, lo = int(rng.group(1)), int(rng.group(2))
+    fields = ptrs + [m_count.group(1), "flags"]
+    lines = ["#include <stdio.h>", "#include <stddef.h>", '#include "nvtypes.h"',
+             '#include "nvos.h"', "int main(void) {",
+             f'  printf("SIZE %zu\\n", sizeof({IDLE_TYPE}));',
+             f'  printf("ELEM %zu\\n", sizeof({m_elem.group(1)}));',
+             '  printf("LIST %u\\n", (unsigned)(NVOS30_FLAGS_CHANNEL_LIST));']
+    lines += [f'  printf("F {f} %zu %zu\\n", offsetof({IDLE_TYPE}, {f}), '
+              f'sizeof((({IDLE_TYPE} *)0)->{f}));' for f in fields]
+    lines.append("  return 0;\n}")
+    with tempfile.TemporaryDirectory() as d:
+        c, exe = Path(d) / "idle.c", Path(d) / "idle"
+        c.write_text("\n".join(lines) + "\n")
+        r = subprocess.run(["gcc", "-w", "-DNV_LINUX", "-o", str(exe), str(c)]
+                           + [f"-I{root / i}" for i in INCLUDE_DIRS],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise ExtractError("IDLE_CHANNELS probe does not compile:\n" + r.stderr[-4000:])
+        out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+    got, off = {}, {}
+    for line in out.splitlines():
+        p = line.split()
+        if p[0] == "F":
+            off[p[1]] = (int(p[2]), int(p[3]))
+        else:
+            got[p[0]] = int(p[1])
+    for f in ptrs:
+        if off[f][1] != 8 or off[f][0] % 8:
+            raise ExtractError(f"{IDLE_TYPE}.{f}: {off[f][1]} bytes at {off[f][0]}, not an NvP64")
+    cnt, flags = off[m_count.group(1)], off["flags"]
+    if cnt[1] != 4 or flags[1] != 4:
+        raise ExtractError(f"{IDLE_TYPE}: count or flags not 4 bytes")
+    size = {"scale": 1, "count": [{"field": m_count.group(1), "offset": cnt[0], "width": 4}],
+            "elem": got["ELEM"], "copy_in": True, "copy_out": False, "if_nonnull": False}
+    return {
+        "name": "NV_ESC_RM_IDLE_CHANNELS",
+        "params_size": got["SIZE"],
+        "pointers": [{"field": f, "offset": off[f][0], "size": size} for f in ptrs],
+        "list_when": {"offset": flags[0], "lo": lo, "hi": hi, "value": got["LIST"]},
     }
 
 
@@ -620,6 +883,279 @@ def render(data):
     for cmd in sorted(refused):
         out.append(f"    ({cmd:#010x}, \"{refused[cmd]}\"),")
     out += ["];", ""]
+    deep, zeroed = deep_union(data)
+    out += [
+        "/// A count RM reads to size a copy: `width` bytes, little-endian, at",
+        "/// `offset` in the control's parameters.",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub struct CountField {",
+        "    pub offset: usize,",
+        "    pub width: usize,",
+        "}",
+        "",
+        "/// How much RM copies through the pointer at `ptr`, as its",
+        "/// RMAPI_PARAM_COPY_INIT computes it: `scale` times the `counts`, in",
+        "/// NvU32 arithmetic, times `elem`, which must not overflow. `copy_in` and",
+        "/// `copy_out` are false where RM skips that direction.",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub struct DeepPtr {",
+        "    pub ptr: usize,",
+        "    pub scale: u32,",
+        "    pub counts: &'static [CountField],",
+        "    pub elem: u32,",
+        "    pub copy_in: bool,",
+        "    pub copy_out: bool,",
+        "}",
+        "",
+        "/// A control whose every pointer the guest may send the data for, one",
+        "/// deep segment per pointer, sized by the rule for it.",
+        "#[derive(Debug, Clone, Copy)]",
+        "pub struct DeepControl {",
+        "    pub cmd: u32,",
+        "    pub name: &'static str,",
+        "    pub ptrs: &'static [DeepPtr],",
+        "}",
+        "",
+        "/// Every control in CONTROL_POINTERS whose sizes are read from RM's",
+        "/// embeddedParamCopyIn, identically in every release that has it.",
+        "#[rustfmt::skip]",
+        "pub const DEEP_CONTROLS: &[DeepControl] = &[",
+    ]
+    for cmd in sorted(deep):
+        e = deep[cmd]
+        out.append("    DeepControl {")
+        out.append(f"        cmd: {cmd:#010x},")
+        out.append(f"        name: \"{e['name']}\",")
+        out.append("        ptrs: &[")
+        for p in e["ptrs"]:
+            s = p["size"]
+            counts = ", ".join(f"CountField {{ offset: {c['offset']}, width: {c['width']} }}"
+                               for c in s["count"])
+            out.append("            DeepPtr {")
+            out.append(f"                ptr: {p['offset']},")
+            out.append(f"                scale: {s['scale']},")
+            out.append(f"                counts: &[{counts}],")
+            out.append(f"                elem: {s['elem']},")
+            out.append(f"                copy_in: {str(s['copy_in']).lower()},")
+            out.append(f"                copy_out: {str(s['copy_out']).lower()},")
+            out.append("            },")
+        out.append("        ],")
+        out.append("    },")
+    out += [
+        "];",
+        "",
+        "/// Controls whose pointers are always zeroed: no deep block is taken",
+        "/// for them, single or segmented (rmctrl_extract.py, LEFT_ZEROED).",
+        "pub const ZEROED_CONTROLS: &[(u32, &str)] = &[",
+    ]
+    for cmd in sorted(zeroed):
+        out.append(f"    ({cmd:#010x}, \"{zeroed[cmd]}\"),")
+    out += ["];", ""]
+    idle = idle_union(data)
+    w = idle["list_when"]
+    out += [
+        "/// NV_ESC_RM_IDLE_CHANNELS, an escape: NVOS30's three handle arrays,",
+        "/// which RmDeprecatedIdleChannels copies in only for a channel list --",
+        "/// `flags` bits IDLE_CHANNELS_LIST_BITS equal to IDLE_CHANNELS_LIST --",
+        "/// with a nonzero count. `cmd` is unused.",
+        "#[rustfmt::skip]",
+        "pub const IDLE_CHANNELS: DeepControl = DeepControl {",
+        "    cmd: 0,",
+        f"    name: \"{idle['name']}\",",
+        "    ptrs: &[",
+    ]
+    for p in idle["pointers"]:
+        s = p["size"]
+        c = s["count"][0]
+        out += [
+            "        DeepPtr {",
+            f"            ptr: {p['offset']},",
+            f"            scale: {s['scale']},",
+            f"            counts: &[CountField {{ offset: {c['offset']}, width: {c['width']} }}],",
+            f"            elem: {s['elem']},",
+            f"            copy_in: {str(s['copy_in']).lower()},",
+            f"            copy_out: {str(s['copy_out']).lower()},",
+            "        },",
+        ]
+    out += [
+        "    ],",
+        "};",
+        f"pub const IDLE_CHANNELS_SIZE: usize = {idle['params_size']};",
+        f"pub const IDLE_CHANNELS_FLAGS: usize = {w['offset']};",
+        f"pub const IDLE_CHANNELS_LIST_BITS: (u32, u32) = ({w['lo']}, {w['hi']});",
+        f"pub const IDLE_CHANNELS_LIST: u32 = {w['value']};",
+        "",
+    ]
+    return "\n".join(out)
+
+
+def idle_union(data):
+    """IDLE_CHANNELS, which must measure the same in every release."""
+    first = data[0]["idle_channels"]
+    for d in data[1:]:
+        if d["idle_channels"] != first:
+            raise ExtractError(f"IDLE_CHANNELS differs between {data[0]['version']} and "
+                               f"{d['version']}")
+    return first
+
+
+# The most pointers one control's segments may relocate, and the most count
+# fields one size multiplies: protocol::messages::DEEP_SEGS_MAX and the C
+# table's array bounds.
+DEEP_SEGS_MAX = 4
+DEEP_COUNTS_MAX = 2
+
+
+def deep_union(data):
+    """({cmd: {name, ptrs}} of relocatable controls, {cmd: name} of zeroed
+    ones) over every release. As for CONTROL_POINTERS, a pointer a later
+    release adds is listed with the others (GET_P2P_CAPS's busEgmPeerIds;
+    in a release without it the offset is past the block's end). A control
+    is relocated only if it is in every release that has it: MSENC_GET_CAPS
+    and FB_GET_INFO are embedded in 535 and deprecated after, where RM's
+    converter sizes the copy. A pointer with different rules in two releases
+    fails: which to believe is a decision, not a union."""
+    seen, zeroed = {}, {}
+    for d in data:
+        for c in d["controls"]:
+            if c["name"] in LEFT_ZEROED:
+                zeroed[c["cmd"]] = c["name"]
+            e = seen.setdefault(c["cmd"], {"name": c["name"], "relocate": True, "ptrs": {}})
+            e["relocate"] &= c["relocate"]
+            if not c["relocate"]:
+                continue
+            for p in c["pointers"]:
+                prev = e["ptrs"].setdefault(p["offset"], (p, d["version"]))
+                if prev[0] != p:
+                    raise ExtractError(
+                        f"{c['name']} ({c['cmd']:#x}): the pointer at {p['offset']} is "
+                        f"{prev[0]} in {prev[1]} and {p} in {d['version']}")
+    deep = {}
+    for cmd, e in seen.items():
+        if not e["relocate"]:
+            continue
+        ptrs = [p for _, (p, _) in sorted(e["ptrs"].items())]
+        if len(ptrs) > DEEP_SEGS_MAX:
+            raise ExtractError(f"{e['name']}: {len(ptrs)} pointers, over {DEEP_SEGS_MAX}")
+        for p in ptrs:
+            if len(p["size"]["count"]) > DEEP_COUNTS_MAX:
+                raise ExtractError(f"{e['name']}.{p['field']}: over {DEEP_COUNTS_MAX} counts")
+        deep[cmd] = {"name": e["name"], "ptrs": ptrs}
+    return deep, zeroed
+
+
+def render_c(data):
+    """driver/gen/nvgpu_rm_deep.h: the guest's copy of the multi-pointer rows
+    of DEEP_CONTROLS. Single-pointer controls go by the one deep block
+    (nvgpu_main.c) and are not listed."""
+    deep, _ = deep_union(data)
+    out = [
+        "/* SPDX-License-Identifier: GPL-2.0 */",
+        "/*",
+        " * @generated by gen/rmctrl_extract.py from gen/rmctrl/<release>.json. DO NOT",
+        " * EDIT -- re-measure with `gen/rmctrl_extract.py all`.",
+        " *",
+        " * RM controls with more than one embedded pointer that the guest sends",
+        " * as deep segments (NVGPU_DEEP_SEGMENTED), one per pointer, and how much",
+        " * RM copies through each: scale times the counts (NvU32 arithmetic)",
+        " * times elem, measured from each release's embeddedParamCopyIn and SDK",
+        " * headers. The backend's copy, which it checks every segment against, is",
+        " * DEEP_CONTROLS in gen/src/rmctrl/generated.rs, rendered from the same",
+        " * measurements.",
+        " */",
+        "",
+        "#ifndef NVGPU_RM_DEEP_H",
+        "#define NVGPU_RM_DEEP_H",
+        "",
+        "#include <linux/types.h>",
+        "",
+        f"#define NVGPU_RM_DEEP_PTRS_MAX {DEEP_SEGS_MAX}",
+        f"#define NVGPU_RM_DEEP_COUNTS_MAX {DEEP_COUNTS_MAX}",
+        "",
+        "/* RM copies the buffer in / out (no SKIP_COPYIN / SKIP_COPYOUT). */",
+        "#define NVGPU_RM_DEEP_IN 1",
+        "#define NVGPU_RM_DEEP_OUT 2",
+        "",
+        "struct nvgpu_rm_deep_count {",
+        "  u16 offset; /* in the control's parameters */",
+        "  u8 width;   /* bytes, little-endian */",
+        "};",
+        "",
+        "struct nvgpu_rm_deep_ptr {",
+        "  u16 ptr; /* offset of the NvP64 */",
+        "  u8 flags;",
+        "  u8 ncounts;",
+        "  struct nvgpu_rm_deep_count counts[NVGPU_RM_DEEP_COUNTS_MAX];",
+        "  u32 scale;",
+        "  u32 elem;",
+        "};",
+        "",
+        "struct nvgpu_rm_deep_control {",
+        "  u32 cmd;",
+        "  u32 nptrs;",
+        "  struct nvgpu_rm_deep_ptr ptrs[NVGPU_RM_DEEP_PTRS_MAX];",
+        "};",
+        "",
+        "static const struct nvgpu_rm_deep_control nvgpu_rm_deep_table[] = {",
+    ]
+    for cmd in sorted(deep):
+        e = deep[cmd]
+        if len(e["ptrs"]) < 2:
+            continue
+        out.append(f"    /* {e['name']} */")
+        out.append(f"    {{{cmd:#010x},")
+        out.append(f"     {len(e['ptrs'])},")
+        out.append("     {")
+        for p in e["ptrs"]:
+            s = p["size"]
+            flags = " | ".join(n for n, on in (("NVGPU_RM_DEEP_IN", s["copy_in"]),
+                                               ("NVGPU_RM_DEEP_OUT", s["copy_out"])) if on) or "0"
+            counts = ", ".join(f"{{{c['offset']}, {c['width']}}}" for c in s["count"]) or "{0, 0}"
+            out.append(f"         {{{p['offset']}, {flags}, {len(s['count'])}, {{{counts}}}, "
+                       f"{s['scale']}, {s['elem']}}}, /* {p['field']} */")
+        out.append("     }},")
+    idle = idle_union(data)
+    w = idle["list_when"]
+    out += [
+        "};",
+        "",
+        "/*",
+        " * NV_ESC_RM_IDLE_CHANNELS (NVOS30), an escape: its three handle arrays,",
+        " * copied in by RmDeprecatedIdleChannels only for a channel list -- flags",
+        " * bits LIST_HI:LIST_LO equal to LIST -- with a nonzero count. cmd unused.",
+        " */",
+        f"#define NVGPU_RM_IDLE_CHANNELS_SIZE {idle['params_size']}",
+        f"#define NVGPU_RM_IDLE_CHANNELS_FLAGS {w['offset']}",
+        f"#define NVGPU_RM_IDLE_CHANNELS_LIST_LO {w['lo']}",
+        f"#define NVGPU_RM_IDLE_CHANNELS_LIST_HI {w['hi']}",
+        f"#define NVGPU_RM_IDLE_CHANNELS_LIST {w['value']}",
+        "",
+        "static const struct nvgpu_rm_deep_control nvgpu_rm_deep_idle_channels = {",
+        "    0,",
+        f"    {len(idle['pointers'])},",
+        "    {",
+    ]
+    for p in idle["pointers"]:
+        s = p["size"]
+        c = s["count"][0]
+        out.append(f"        {{{p['offset']}, NVGPU_RM_DEEP_IN, 1, "
+                   f"{{{{{c['offset']}, {c['width']}}}}}, "
+                   f"{s['scale']}, {s['elem']}}}, /* {p['field']} */")
+    out += [
+        "    }};",
+        "",
+        "static inline const struct nvgpu_rm_deep_control *nvgpu_rm_deep_find(u32 cmd) {",
+        "  unsigned int i;",
+        "",
+        "  for (i = 0; i < ARRAY_SIZE(nvgpu_rm_deep_table); i++)",
+        "    if (nvgpu_rm_deep_table[i].cmd == cmd)",
+        "      return &nvgpu_rm_deep_table[i];",
+        "  return NULL;",
+        "}",
+        "",
+        "#endif /* NVGPU_RM_DEEP_H */",
+        "",
+    ]
     return "\n".join(out)
 
 
@@ -666,14 +1202,19 @@ def main():
                 root = fetch(v, a.cache)
                 source = json.loads((root / "SOURCE.json").read_text())
                 write_json(OUT_DIR / f"{v}.json", extract(v, root, source))
-            RUST_OUT.write_text(render(load_all(OUT_DIR)))
+            data = load_all(OUT_DIR)
+            RUST_OUT.write_text(render(data))
+            C_OUT.write_text(render_c(data))
         elif a.cmd == "render":
-            text = render(load_all(OUT_DIR))
+            data = load_all(OUT_DIR)
+            text, c_text = render(data), render_c(data)
             if a.out:
                 a.out.mkdir(parents=True, exist_ok=True)
                 (a.out / "generated.rs").write_text(text)
+                (a.out / C_OUT.name).write_text(c_text)
             else:
                 RUST_OUT.write_text(text)
+                C_OUT.write_text(c_text)
         elif a.cmd == "check":
             a.cache.mkdir(parents=True, exist_ok=True)
             stale = []
@@ -684,12 +1225,16 @@ def main():
                 p = OUT_DIR / f"{v}.json"
                 if not p.exists() or json.loads(p.read_text()) != fresh:
                     stale.append(str(p))
-            if RUST_OUT.read_text() != render(load_all(OUT_DIR)):
+            data = load_all(OUT_DIR)
+            if RUST_OUT.read_text() != render(data):
                 stale.append(str(RUST_OUT))
+            if not C_OUT.exists() or C_OUT.read_text() != render_c(data):
+                stale.append(str(C_OUT))
             if stale:
                 print("stale: " + ", ".join(stale) + f"; run {sys.argv[0]} all", file=sys.stderr)
                 return 1
-            print("gen/rmctrl and gen/src/rmctrl/generated.rs are up to date")
+            print("gen/rmctrl, gen/src/rmctrl/generated.rs and driver/gen/nvgpu_rm_deep.h "
+                  "are up to date")
     except ExtractError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1

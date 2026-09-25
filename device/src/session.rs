@@ -65,7 +65,9 @@ pub struct BackendConfig {
 impl BackendConfig {
     /// `HelloResp::backend_caps`.
     pub fn caps(&self) -> u32 {
-        let mut caps = 0;
+        // Segmented deep blocks are this code's, whatever it was started
+        // with (deepseg.rs).
+        let mut caps = BCAP_DEEP_SEGS;
         if self.kms_card {
             caps |= BCAP_KMS_CARD;
         }
@@ -1093,7 +1095,10 @@ mod tests {
         );
         let resp = read::<HelloResp>(&r[HDR..]).unwrap();
         assert_eq!(resp.proto, PROTO_V2);
-        assert_eq!(resp.backend_caps, BCAP_KMS_CARD | BCAP_WAYLAND);
+        assert_eq!(
+            resp.backend_caps,
+            BCAP_KMS_CARD | BCAP_WAYLAND | BCAP_DEEP_SEGS
+        );
         assert_eq!(resp.max_req, MAX_XFER_DIRECT);
         assert_eq!(resp.num_cards, 1);
         let bad = HelloReq {

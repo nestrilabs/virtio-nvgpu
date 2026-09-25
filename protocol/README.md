@@ -16,7 +16,11 @@ Nothing here should contain logic.
 assert their sizes. It defines both protocols:
 
 - **v1**: OPEN, IOCTL, MMAP, MUNMAP, CLOSE, the proc/sys file listings and the
-  16-byte EVENT_READY — everything a guest needs to render and encode.
+  16-byte EVENT_READY — everything a guest needs to render and encode. IOCTL
+  carries what an RM pointer addresses as a nested and a deep block; with the
+  v2 capability `BCAP_DEEP_SEGS`, the deep block may instead be a segment
+  table (`DEEP_SEGMENTED`), one segment per pointer, which the backend sizes
+  itself.
 - **v2**, negotiated by HELLO: IOCTL2 (the schema-driven vectored ioctl),
   TIME_SYNC, EVENT_DATA records (readiness, fences, DRM events, hotplug),
   WATCH and UNWATCH, HOST_OP, and WL_SEND/WL_RECV for the Wayland channel; the
