@@ -110,6 +110,10 @@ const SUB_SOCK: u64 = 0;
 const SUB_CHAN: u64 = 1;
 const SUB_STREAM: u64 = 1 << 31;
 
+/// What one RECV asks the host for (at least `frame::MIN_FRAME`, at most
+/// what HELLO allows).
+const RECV_BYTES: usize = 256 * 1024;
+
 /// The guest kernel as the engine's platform: dma-bufs and DRM files are its
 /// to resolve, in SEND and RECV.
 struct GuestPlat;
@@ -402,7 +406,24 @@ impl Daemon {
                     }
                     match sub {
                         SUB_SOCK => {
-                            if events & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32
+                            let gone = events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
+                            let c = self.clients[slot].as_mut().unwrap();
+                            if gone && !c.tx.is_empty() {
+                                // The client is gone with frames still waiting
+                                // for a busy host. read_local will not read
+                                // while they wait, so the EOF that closes the
+                                // slot would never be seen, and HUP cannot be
+                                // masked: every epoll_wait would return at once
+                                // and retry the SEND, at 100% CPU and a
+                                // virtqueue round trip each, until the host's
+                                // compositor drained. Nobody is left to read
+                                // the replies to those frames, and closing the
+                                // channel ends the host's side of the client
+                                // anyway.
+                                c.tx.clear();
+                                c.closing = true;
+                            } else if events
+                                & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32
                                 != 0
                             {
                                 self.read_local(slot);
@@ -680,7 +701,13 @@ impl Daemon {
     }
 
     fn read_channel(&mut self, slot: usize) {
-        let max = self.info.max_frame;
+        // Not the whole frame limit (4 MiB with indirect descriptors): the
+        // kernel sizes its response buffer, and the backend what it packs,
+        // by what is asked, and what arrives per present is a few small
+        // events. The backend never splits a record and says F_MORE when
+        // more waits, which keeps the channel readable, so a burst only
+        // takes more RECVs.
+        let max = self.info.max_frame.min(RECV_BYTES.max(frame::MIN_FRAME));
         let card = self.card.as_ref().map(|f| f.as_raw_fd());
         let render = self.render.as_ref().map(|f| f.as_raw_fd());
         for _ in 0..64 {
@@ -735,9 +762,14 @@ impl Daemon {
             return;
         }
         let base = (slot as u64) << 32;
-        let mut want = libc::EPOLLRDHUP as u32;
+        // Nothing of the client's is read while frames wait for the host, so
+        // nothing that says "readable" is asked for then either: not EPOLLIN,
+        // and not EPOLLRDHUP, which a client that shut down only its writing
+        // side would report on every wait. A client that is gone altogether
+        // still wakes us with EPOLLHUP, which cannot be masked (turn).
+        let mut want = 0;
         if c.tx.is_empty() {
-            want |= libc::EPOLLIN as u32;
+            want |= (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
         }
         if c.engine.local_out_len() > 0 {
             want |= libc::EPOLLOUT as u32;
@@ -779,5 +811,133 @@ impl Daemon {
             // Dropping the socket, the channel (CLOSE on the host handle) and
             // the engine's streams removes them from epoll.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::Received;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A host whose compositor is not reading: every SEND is refused as
+    /// busy, and there is never anything to receive.
+    struct BusyChannel {
+        sends: Arc<AtomicUsize>,
+        /// The largest receive the daemon asked for.
+        asked: Arc<AtomicUsize>,
+        ready: OwnedFd,
+    }
+
+    impl Channel for BusyChannel {
+        fn send(&mut self, _f: &mut [u8], _fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            Ok(Sent::Busy)
+        }
+        fn recv(
+            &mut self,
+            max: usize,
+            _c: Option<RawFd>,
+            _r: Option<RawFd>,
+        ) -> io::Result<Received> {
+            self.asked.fetch_max(max, Ordering::Relaxed);
+            let (frame, _) = frame::pack(&mut VecDeque::new(), frame::MIN_FRAME, 0, false);
+            Ok(Received {
+                frame,
+                fds: Vec::new(),
+                more: false,
+            })
+        }
+        fn poll_fd(&self) -> RawFd {
+            self.ready.as_raw_fd()
+        }
+    }
+
+    #[derive(Default)]
+    struct BusyHost {
+        sends: Arc<AtomicUsize>,
+        asked: Arc<AtomicUsize>,
+        max_frame: usize,
+    }
+
+    impl Connector for BusyHost {
+        fn info(&mut self) -> io::Result<HostInfo> {
+            Ok(HostInfo {
+                caps: uapi::CAP_WAYLAND,
+                clock_offset_ns: 0,
+                max_frame: self.max_frame,
+                devmap: Vec::new(),
+            })
+        }
+        fn connect(&mut self, _mode: u32) -> io::Result<Box<dyn Channel>> {
+            Ok(Box::new(BusyChannel {
+                sends: self.sends.clone(),
+                asked: self.asked.clone(),
+                ready: sys::eventfd()?,
+            }))
+        }
+    }
+
+    fn socket_in_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nvwl-daemon-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("wayland-0")
+    }
+
+    #[test]
+    fn a_receive_asks_for_a_modest_frame_not_the_whole_limit() {
+        let sock = socket_in_tmp("recv");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let mut d = Daemon::new(
+            Config::new(&sock),
+            Box::new(BusyHost {
+                asked: asked.clone(),
+                max_frame: 4 << 20,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let _client = UnixStream::connect(&sock).unwrap();
+        d.turn(100).unwrap();
+        // The first receive is made as the client is added.
+        assert_eq!(asked.load(Ordering::Relaxed), RECV_BYTES);
+        assert!(RECV_BYTES >= frame::MIN_FRAME);
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_while_the_host_is_busy_is_closed_not_spun_on() {
+        let sock = socket_in_tmp("hup");
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut d = Daemon::new(
+            Config::new(&sock),
+            Box::new(BusyHost {
+                sends: sends.clone(),
+                max_frame: 256 * 1024,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let client = UnixStream::connect(&sock).unwrap();
+        d.turn(100).unwrap();
+        // The daemon's HELLO waits for the host.
+        assert!(d.clients.iter().flatten().any(|c| !c.tx.is_empty()));
+        drop(client);
+        let before = sends.load(Ordering::Relaxed);
+        for _ in 0..50 {
+            d.turn(100).unwrap();
+            if d.clients.iter().all(|c| c.is_none()) {
+                break;
+            }
+        }
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the slot of a client that hung up is closed"
+        );
+        let retried = sends.load(Ordering::Relaxed) - before;
+        assert!(
+            retried <= 2,
+            "{retried} SENDs retried for a client that is gone"
+        );
     }
 }

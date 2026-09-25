@@ -1,0 +1,17 @@
+# /dev/nvgpu-wl*, the guest end of the virtio-nvgpu Wayland channel.
+#
+# Every open of it is a client of the host's compositor (or, in export mode,
+# the compositor of a host program), so only the Wayland proxy daemon,
+# nvgpu-wl-guest, should have it: guest clients reach the host through the
+# daemon's socket in their own XDG_RUNTIME_DIR. The module creates the node
+# root:root 0660 (virtio_gpu_nv wl_mode=); this gives it to a group for the
+# daemon's account:
+#
+#   groupadd --system nvgpu-wl
+#   usermod -aG nvgpu-wl <the account nvgpu-wl-guest runs as>
+#   install -m 0644 scripts/70-nvgpu-wl.rules /etc/udev/rules.d/
+#   udevadm control --reload && udevadm trigger --subsystem-match=misc
+#
+# Do not add TAG+="uaccess": that hands the node to whoever sits at the
+# guest's seat, not to the daemon.
+SUBSYSTEM=="misc", KERNEL=="nvgpu-wl*", GROUP="nvgpu-wl", MODE="0660"

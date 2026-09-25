@@ -21,7 +21,10 @@
  *                   host-handle file). The kernel puts the backend handle of
  *                   its host syncobj in `a`, holds the file until the host has
  *                   duplicated it for the compositor, and sets `fd` to -1.
- *                   Any other file is sent as NVGPU_WL_DESC_F_INVALID.
+ *                   Any other file is sent as NVGPU_WL_DESC_F_INVALID, and
+ *                   the backend ends that connection with the protocol's
+ *                   fatal invalid_timeline error on the manager (the
+ *                   compositor never sees it).
  *   RECV, DRM_FILE: `a` is a backend handle to a host DRM file of our GPU (a
  *                   lease). The kernel adopts it into a new guest DRM file,
  *                   cloned from the `card_fd` template, and stores the new
@@ -86,7 +89,13 @@ struct nvgpu_wl_hello {
   struct nvgpu_wl_devmap dev[NVGPU_WL_MAX_DEVMAP];
 };
 
-/* ── CONNECT ── */
+/* ── CONNECT ──
+ *
+ * One LISTEN per device at a time (-EBUSY while another file holds it), and
+ * ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN (-EACCES;
+ * -ENOTCONN with no listener): whoever accepts a host program becomes its
+ * compositor. -EMFILE: the VM has as many channels as its backend allows.
+ */
 
 #define NVGPU_WL_CONNECT 0 /* a new connection to the host compositor        */
 #define NVGPU_WL_LISTEN 1  /* export mode: poll() says a host client waits   */

@@ -16,22 +16,34 @@
 //!
 //! **Readiness** is an eventfd, readable while anything is queued for the
 //! guest (records, or the HANGUP that ends the connection).
+//!
+//! **What a VM may hold** ([`WlLimits`]). Every limit above is per connection,
+//! and a guest opens as many connections as it likes, so each one that costs
+//! the host something is also counted per VM: channels (each a compositor
+//! client, a reader thread and a handful of descriptors), shm pool memory
+//! (`wlwire::shm`, memfd pages the host OOM killer does not see as ours) and
+//! bytes queued for the guest. A connection that would pass the VM's queue
+//! budget is dropped like one that passes its own, and what it had queued is
+//! let go with it: a guest that is not reading has no use for it.
 
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
+use wlwire::shm::ShmBudget;
 use wlwire::sys;
 
 use crate::hostfd::HandleKind;
-use crate::wl::probe::LeaseCache;
+use crate::wl::probe::{self, LeaseCache};
 
 /// What the backend knows about a host descriptor.
 pub trait HostFds: Send + Sync {
@@ -87,6 +99,9 @@ pub struct WlConfig {
     /// syncobjs' host objects (`HELLO_G_SYNCOBJ`). Normal mode only: a host
     /// client's syncobj has no guest object to stand for it.
     pub fences: bool,
+    /// What every connection of the VM shares. The dispatcher puts its own
+    /// in (`WlState`), whichever configuration a connection was made from.
+    pub limits: WlLimits,
 }
 
 impl WlConfig {
@@ -98,14 +113,176 @@ impl WlConfig {
             max_queue: 64 << 20,
             lease_cache: Arc::new(LeaseCache::default()),
             fences: false,
+            limits: WlLimits::default(),
         }
+    }
+}
+
+/// Bytes queued for the guest, over every connection of a VM.
+#[derive(Debug)]
+pub struct QueueBudget {
+    max: usize,
+    used: AtomicUsize,
+}
+
+impl QueueBudget {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// `n` more bytes, if that stays within the budget.
+    fn take(&self, n: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&t| t <= self.max)
+            })
+            .is_ok()
+    }
+
+    /// `n` more bytes whatever the budget says: the few bytes of the ERROR
+    /// and HANGUP records that end a connection, which must reach the guest.
+    fn force(&self, n: usize) {
+        self.used.fetch_add(n, Ordering::AcqRel);
+    }
+
+    fn give(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+/// Limits over every Wayland channel of one VM (one backend). Cloning shares
+/// the budgets.
+#[derive(Clone, Debug)]
+pub struct WlLimits {
+    /// Channels open at once (CONNECT and ACCEPT; the one LISTEN is not
+    /// counted). Each is a host compositor client with up to 131072 objects,
+    /// a reader thread and about five descriptors (`--wayland-max-conns`).
+    pub max_conns: usize,
+    /// Shm pool memory and pool count, over every connection
+    /// (`--wayland-shm-budget`).
+    pub shm: Arc<ShmBudget>,
+    /// Bytes queued for the guest, over every connection
+    /// (`--wayland-queue-budget`).
+    pub queue: Arc<QueueBudget>,
+    /// How often the VM's clients may submit a lease request
+    /// (`--wayland-lease-interval`).
+    pub lease: Arc<LeaseThrottle>,
+}
+
+/// How often one VM may ask the compositor for a lease.
+///
+/// A lease of a desktop monitor (`leasable` in the Hyprland patch) costs the
+/// host a blocking modeset to take the output away, workspaces moved off it,
+/// and a full modeset to take it back when the lease ends, all on the
+/// compositor's main thread, plus a LEASE uevent to every listener. Nothing
+/// in the protocol limits how often a client may do that, so a guest looping
+/// request, submit, destroy stalls the host desktop and every other VM's
+/// clients. Submits are therefore admitted at one per `interval` on average,
+/// with `burst` at once (a Vulkan client acquiring two displays makes two
+/// requests), over every connection of the VM together -- which bounds each
+/// connection too.
+///
+/// A frame that carries a submit past the rate is refused whole with EAGAIN
+/// before anything in it is looked at: the guest daemon keeps the frame and
+/// retries it (as it does for a compositor that is not reading), so the
+/// client's request is delayed, never lost or reordered, and the compositor
+/// still creates and owns every lease object. How long a lease is then held
+/// is not limited: holding the output is what a lease is for, and the host
+/// takes it back by un-marking the monitor leasable or closing the VM.
+#[derive(Debug)]
+pub struct LeaseThrottle {
+    interval: Duration,
+    burst: u32,
+    /// When the next submit is due at the average rate (GCRA's theoretical
+    /// arrival time); a submit may go up to `burst - 1` intervals early.
+    due: Mutex<Option<Instant>>,
+    /// A refusal was logged since the last admission.
+    logged: AtomicBool,
+}
+
+impl LeaseThrottle {
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+    pub const DEFAULT_BURST: u32 = 3;
+
+    /// `interval` zero admits everything.
+    pub fn new(interval: Duration, burst: u32) -> Self {
+        Self {
+            interval,
+            burst: burst.max(1),
+            due: Mutex::new(None),
+            logged: AtomicBool::new(false),
+        }
+    }
+
+    /// Admit `n` submits at `now`, or say how long until one may go.
+    pub fn admit(&self, n: usize, now: Instant) -> Result<(), Duration> {
+        if n == 0 || self.interval.is_zero() {
+            return Ok(());
+        }
+        let mut due = self.due.lock().unwrap_or_else(|p| p.into_inner());
+        let t = due.map_or(now, |d| d.max(now));
+        let early = self.interval * (self.burst - 1);
+        if t > now + early {
+            return Err(t - early - now);
+        }
+        *due = Some(t + self.interval * n.min(u32::MAX as usize) as u32);
+        self.logged.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Default for LeaseThrottle {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_INTERVAL, Self::DEFAULT_BURST)
+    }
+}
+
+impl WlLimits {
+    /// A guest desktop proxies a few dozen clients at most.
+    pub const DEFAULT_MAX_CONNS: usize = 64;
+    /// Ten triple-buffered 4K shm windows. GPU clients present dma-bufs,
+    /// which cost nothing here; shm is for software rendering and cursors.
+    pub const DEFAULT_SHM_BYTES: u64 = 1 << 30;
+    /// Pools over the VM: every one is a memfd held open in the backend.
+    pub const DEFAULT_SHM_POOLS: u64 = 1024;
+    /// Four connections' worth of the per-connection queue limit.
+    pub const DEFAULT_QUEUE_BYTES: usize = 256 << 20;
+
+    pub fn new(max_conns: usize, shm_bytes: u64, queue_bytes: usize) -> Self {
+        Self {
+            max_conns,
+            shm: Arc::new(ShmBudget::new(shm_bytes, Self::DEFAULT_SHM_POOLS)),
+            queue: Arc::new(QueueBudget::new(queue_bytes)),
+            lease: Arc::new(LeaseThrottle::default()),
+        }
+    }
+
+    /// Lease submits at one per `interval`, `burst` at once.
+    pub fn with_lease_rate(mut self, interval: Duration, burst: u32) -> Self {
+        self.lease = Arc::new(LeaseThrottle::new(interval, burst));
+        self
+    }
+}
+
+impl Default for WlLimits {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_CONNS,
+            Self::DEFAULT_SHM_BYTES,
+            Self::DEFAULT_QUEUE_BYTES,
+        )
     }
 }
 
 struct State {
     engine: Engine,
-    inbuf: Vec<u8>,
-    infds: VecDeque<OwnedFd>,
     to_guest: VecDeque<Unit>,
     to_guest_bytes: usize,
     /// The compositor side is finished (EOF, error, or a fatal protocol
@@ -123,6 +300,17 @@ struct Shared {
     wake: OwnedFd,
     host: Arc<dyn HostFds>,
     cfg: WlConfig,
+    /// The registry filter asks `cfg.lease_cache` about lease devices, so the
+    /// reader answers first, outside the lock.
+    probe_leases: bool,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Whatever the guest never took is off the VM's queue budget.
+        let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        self.cfg.limits.queue.give(st.to_guest_bytes);
+    }
 }
 
 pub struct WlConn {
@@ -217,10 +405,10 @@ impl WlConn {
     pub fn open(cfg: &WlConfig, host: Arc<dyn HostFds>) -> io::Result<(WlConn, OwnedFd)> {
         let sock = UnixStream::connect(&cfg.socket)?;
         let lease = if cfg.allow_lease {
+            // Only a lookup: the reader resolved every lease-device global in
+            // what it read before the engine (and this) ran (`probe.rs`).
             let cache = cfg.lease_cache.clone();
-            let socket = cfg.socket.clone();
-            let h = host.clone();
-            LeaseGate::Check(Arc::new(move |name| cache.is_ours(&socket, &*h, name)))
+            LeaseGate::Check(Arc::new(move |name| cache.lookup(name).unwrap_or(false)))
         } else {
             LeaseGate::Deny
         };
@@ -257,6 +445,7 @@ impl WlConn {
         policy: Policy,
     ) -> io::Result<(WlConn, OwnedFd)> {
         sock.set_nonblocking(true)?;
+        let probe_leases = matches!(policy.lease, LeaseGate::Check(_));
         let mut engine = Engine::new(EngineConfig {
             side: Side::Host,
             local,
@@ -264,20 +453,21 @@ impl WlConn {
             rewrites: None,
             synth_released: false,
         });
+        engine.set_shm_budget(cfg.limits.shm.clone());
         engine.hello(0);
         let ready = sys::eventfd()?;
         let wake = sys::eventfd()?;
         let mut st = State {
             engine,
-            inbuf: Vec::new(),
-            infds: VecDeque::new(),
             to_guest: VecDeque::new(),
             to_guest_bytes: 0,
             closed: false,
             stop: false,
         };
         let hello = st.engine.take_units();
-        st.to_guest_bytes += hello.iter().map(|u| u.bytes()).sum::<usize>();
+        let n = hello.iter().map(|u| u.bytes()).sum::<usize>();
+        cfg.limits.queue.force(n);
+        st.to_guest_bytes += n;
         st.to_guest.extend(hello);
         sys::eventfd_signal(ready.as_raw_fd());
         let shared = Arc::new(Shared {
@@ -287,6 +477,7 @@ impl WlConn {
             wake,
             host,
             cfg: cfg.clone(),
+            probe_leases,
         });
         let ready_dup = shared.ready.try_clone()?;
         let s2 = shared.clone();
@@ -317,6 +508,19 @@ impl WlConn {
         }
         let backlog = st.engine.local_out().len();
         if backlog > s.cfg.max_backlog {
+            return Err(libc::EAGAIN);
+        }
+        // Lease requests at the VM's rate (`LeaseThrottle`): a frame with one
+        // too many waits whole, like one for a compositor that is not reading.
+        let submits = st.engine.lease_submits(frame_bytes);
+        if let Err(wait) = s.cfg.limits.lease.admit(submits, Instant::now()) {
+            if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "wayland: the guest asks for leases faster than one per {:?}; \
+                     holding its next request for {wait:?}",
+                    s.cfg.limits.lease.interval
+                );
+            }
             return Err(libc::EAGAIN);
         }
         let mut plat = HostPlat {
@@ -361,7 +565,9 @@ impl WlConn {
             max_desc as usize,
             true,
         );
-        st.to_guest_bytes = st.to_guest.iter().map(|u| u.bytes()).sum();
+        let left: usize = st.to_guest.iter().map(|u| u.bytes()).sum();
+        s.cfg.limits.queue.give(st.to_guest_bytes - left);
+        st.to_guest_bytes = left;
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
             let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
@@ -415,24 +621,50 @@ impl Drop for WlConn {
     }
 }
 
-/// Move the engine's channel output to the guest queue.
+/// Move the engine's channel output to the guest queue, within this
+/// connection's limit and the VM's budget. Past either the connection is
+/// dropped, and what it had queued with it: kept, it would pin memory until
+/// the guest closes the handle, for a guest that has shown it is not reading.
 fn collect(s: &Shared, st: &mut State) {
     let units = st.engine.take_units();
     if units.is_empty() {
         return;
     }
-    for u in units {
-        st.to_guest_bytes += u.bytes();
-        st.to_guest.push_back(u);
+    // HANGUP is queued: the guest stops at it, so nothing after it is ever
+    // read, and keeping it would only hold memory (and descriptors).
+    if st.closed {
+        return;
     }
-    sys::eventfd_signal(s.ready.as_raw_fd());
-    if st.to_guest_bytes > s.cfg.max_queue && !st.closed {
+    let n: usize = units.iter().map(|u| u.bytes()).sum();
+    let own = st.to_guest_bytes + n <= s.cfg.max_queue;
+    if !own || !s.cfg.limits.queue.take(n) {
         log::warn!(
-            "wayland: the guest has not read {} bytes; dropping the connection",
-            st.to_guest_bytes
+            "wayland: the guest has not read {} bytes ({}); dropping the connection",
+            st.to_guest_bytes + n,
+            if own {
+                "the VM's queue budget is spent"
+            } else {
+                "past the connection's limit"
+            }
         );
+        s.cfg.limits.queue.give(st.to_guest_bytes);
+        st.to_guest.clear();
+        st.to_guest_bytes = 0;
         hangup(s, st, libc::ENOBUFS);
+        return;
     }
+    st.to_guest_bytes += n;
+    st.to_guest.extend(units);
+    sys::eventfd_signal(s.ready.as_raw_fd());
+}
+
+/// Queue a record that ends the connection (ERROR, HANGUP): small, and owed
+/// to the guest whatever the budget says.
+fn push_final(s: &Shared, st: &mut State, u: Unit) {
+    let n = u.bytes();
+    s.cfg.limits.queue.force(n);
+    st.to_guest_bytes += n;
+    st.to_guest.push_back(u);
 }
 
 /// End the connection on a protocol error: the guest is told why.
@@ -450,9 +682,7 @@ fn fail(s: &Shared, st: &mut State, f: Fatal) {
         st.engine.local_out().push(&f.display_error(), Vec::new());
         let _ = st.engine.local_out().flush(s.sock.as_raw_fd());
     }
-    let u = f.record();
-    st.to_guest_bytes += u.bytes();
-    st.to_guest.push_back(u);
+    push_final(s, st, f.record());
     hangup(s, st, libc::EPROTO);
 }
 
@@ -462,20 +692,34 @@ fn hangup(s: &Shared, st: &mut State, errno: i32) {
     }
     st.closed = true;
     let _ = s.sock.shutdown(std::net::Shutdown::Both);
+    // The pools' memfds and any half-received blobs are for a live
+    // connection only; the VM's shm budget has them back now, not when the
+    // guest closes the handle.
+    st.engine.shed();
     // Export mode's peer is a host client, not the compositor.
     if !st.engine.local_is_client() {
         s.host.compositor_hung_up();
     }
-    st.to_guest.push_back(Unit {
-        rec: frame::record(frame::REC_HANGUP, 0, errno as u32, &[]),
-        descs: Vec::new(),
-    });
+    push_final(
+        s,
+        st,
+        Unit {
+            rec: frame::record(frame::REC_HANGUP, 0, errno as u32, &[]),
+            descs: Vec::new(),
+        },
+    );
     sys::eventfd_signal(s.ready.as_raw_fd());
 }
 
 fn reader(s: Arc<Shared>) {
     let sock = s.sock.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
+    // What the compositor sent that the engine has not taken yet (a partial
+    // message), and its descriptors. Only this thread reads the socket, so
+    // neither needs the lock -- which lets the lease-device probe run between
+    // the read and the engine without it.
+    let mut inbuf: Vec<u8> = Vec::new();
+    let mut infds: VecDeque<OwnedFd> = VecDeque::new();
     loop {
         let (want_out, streams, closed) = {
             let st = lock(&s);
@@ -531,39 +775,53 @@ fn reader(s: Arc<Shared>) {
         if pfds[1].revents != 0 {
             sys::eventfd_clear(s.wake.as_raw_fd());
         }
-        let mut st = lock(&s);
-        if st.stop {
-            return;
-        }
         let rev = pfds[0].revents;
-        if !st.closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if !closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             // Read until the socket is empty: never leave the compositor's
             // buffer to fill.
             loop {
                 let mut fds = Vec::new();
-                match sys::recv_with_fds(sock, &mut buf, &mut fds) {
+                let r = sys::recv_with_fds(sock, &mut buf, &mut fds);
+                if let Ok(n @ 1..) = r {
+                    inbuf.extend_from_slice(&buf[..n]);
+                    infds.extend(fds);
+                    // Lease-device globals are answered here, before the
+                    // engine's registry filter asks and with no lock held: a
+                    // probe can take seconds, and the connection's lock is
+                    // what WL_SEND and WL_RECV wait on under the backend
+                    // mutex (`probe.rs`).
+                    if s.probe_leases {
+                        let names = probe::lease_globals(&inbuf);
+                        if !names.is_empty() {
+                            s.cfg.lease_cache.resolve(&s.cfg.socket, &*s.host, &names);
+                        }
+                    }
+                }
+                let mut st = lock(&s);
+                if st.stop {
+                    return;
+                }
+                if st.closed {
+                    break;
+                }
+                match r {
                     Ok(0) => {
                         hangup(&s, &mut st, 0);
                         break;
                     }
-                    Ok(n) => {
-                        let State {
-                            engine,
-                            inbuf,
-                            infds,
-                            ..
-                        } = &mut *st;
-                        inbuf.extend_from_slice(&buf[..n]);
-                        infds.extend(fds);
+                    Ok(_) => {
                         let mut plat = HostPlat {
                             host: &*s.host,
                             send: None,
                         };
-                        if let Err(f) = engine.from_local(inbuf, infds, &mut plat) {
+                        if let Err(f) = st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
                             fail(&s, &mut st, f);
                             break;
                         }
                         collect(&s, &mut st);
+                        if st.closed {
+                            break;
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -574,6 +832,10 @@ fn reader(s: Arc<Shared>) {
                     }
                 }
             }
+        }
+        let mut st = lock(&s);
+        if st.stop {
+            return;
         }
         if !st.closed && rev & libc::POLLOUT != 0 {
             if let Err(e) = st.engine.local_out().flush(sock) {

@@ -16,8 +16,9 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, sock_fd};
+use super::conn::{HostFds, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
+use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;
 
 pub(super) fn tmpdir(tag: &str) -> PathBuf {
@@ -575,4 +576,283 @@ fn recv_refuses_a_buffer_too_small_for_a_record() {
         libc::EINVAL
     );
     let _ = Dir::Request;
+}
+
+/// Poll until `f` holds, or fail after 5 s.
+fn until(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn the_vms_queue_budget_drops_the_connection_that_passes_it_and_what_it_had_queued() {
+    let dir = tmpdir("qbudget");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let mut cfg = WlConfig::new(&sock);
+    // Far under the connection's own 64 MiB: the VM's budget is what trips.
+    cfg.limits = WlLimits::new(64, 1 << 30, 256 * 1024);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (mut server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, false);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    let ev = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wl_compositor"))
+        .uint(6)
+        .finish();
+    server
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Four times the budget, with the guest reading nothing. The backend
+    // shuts the socket part way through, so the write may fail.
+    let _ = server.write_all(&ev.repeat((1 << 20) / ev.len()));
+    until("the connection to drop", || g.conn.is_closed());
+    // What it had queued went with it; only the HANGUP it is owed is left.
+    assert!(cfg.limits.queue.used() < 64, "{}", cfg.limits.queue.used());
+    let f = g.conn.recv(1 << 20, 256, &mut g.ops).unwrap();
+    let types: Vec<u16> = frame::decode(&f).unwrap().records().map(|r| r.ty).collect();
+    assert_eq!(types, vec![frame::REC_HANGUP]);
+    assert_eq!(cfg.limits.queue.used(), 0);
+}
+
+#[test]
+fn every_connection_gives_back_its_queued_bytes_when_it_goes() {
+    let dir = tmpdir("qdrop");
+    let sock = dir.join("wl");
+    let _l = UnixListener::bind(&sock).unwrap();
+    let cfg = WlConfig::new(&sock);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    // The backend's HELLO waits, unread, on the VM's budget.
+    assert!(cfg.limits.queue.used() > 0);
+    drop(conn);
+    assert_eq!(cfg.limits.queue.used(), 0);
+}
+
+#[test]
+fn a_connection_that_hangs_up_gives_its_shm_back_before_the_guest_closes_it() {
+    let dir = tmpdir("shmback");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let cfg = WlConfig::new(&sock);
+    let (conn, _ready) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, false);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    let mut srv = server.try_clone().unwrap();
+    srv.write_all(
+        &MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(5)
+            .string(Some("wl_shm"))
+            .uint(1)
+            .finish(),
+    )
+    .unwrap();
+    g.recv_until(|b, _| !b.is_empty());
+    g.client(
+        &[
+            MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                .uint(5)
+                .generic_new_id("wl_shm", 1, 3)
+                .finish(),
+            MsgBuilder::new(3, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(4)
+                .int(65536)
+                .finish(),
+        ],
+        vec![sys::memfd(c"guest-pool", 65536).unwrap()],
+    );
+    assert_eq!(cfg.limits.shm.used(), (65536, 1));
+    // The compositor goes; the guest has not closed its handle.
+    drop(srv);
+    drop(server);
+    until("the hangup", || g.conn.is_closed());
+    assert_eq!(cfg.limits.shm.used(), (0, 0));
+}
+
+fn global(name: u32, iface: &str, version: u32) -> Vec<u8> {
+    MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(name)
+        .string(Some(iface))
+        .uint(version)
+        .finish()
+}
+
+#[test]
+fn a_lease_probe_that_times_out_is_not_remembered_and_is_asked_again_after_the_backoff() {
+    let dir = tmpdir("probe-retry");
+    let sock = dir.join("wl");
+    // Takes the connection (into its backlog) and never answers: a
+    // compositor busy in a modeset.
+    let silent = UnixListener::bind(&sock).unwrap();
+    let cache = LeaseCache::with_backoff(Duration::from_millis(300));
+    cache.resolve(&sock, &FakeHost, &[40]);
+    assert_eq!(cache.lookup(40), None, "a timeout is not an answer");
+    // Within the backoff nobody waits on the compositor again.
+    let t = Instant::now();
+    cache.resolve(&sock, &FakeHost, &[40]);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    // The compositor answers now; after the backoff, so does the cache.
+    drop(silent);
+    std::fs::remove_file(&sock).unwrap();
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(cache.is_ours(&sock, &FakeHost, 40));
+    assert_eq!(cache.lookup(40), Some(true));
+}
+
+#[test]
+fn a_lease_probe_in_progress_does_not_hold_up_wl_send_or_wl_recv() {
+    let dir = tmpdir("probe-stall");
+    let sock = dir.join("wl");
+    let l = UnixListener::bind(&sock).unwrap();
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let (mut server, _) = l.accept().unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish()],
+        vec![],
+    );
+    // A lease device: the reader probes on a connection of its own, which
+    // this compositor takes and never answers.
+    server
+        .write_all(&global(40, "wp_drm_lease_device_v1", 1))
+        .unwrap();
+    let (_probe, _) = l.accept().unwrap();
+    // The probe waits a second for its answer; the queue thread must not.
+    let t = Instant::now();
+    g.client(
+        &[MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(3)
+            .finish()],
+        vec![],
+    );
+    g.conn.recv(1 << 20, 256, &mut g.ops).unwrap();
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "WL_SEND and WL_RECV waited {:?} on the probe",
+        t.elapsed()
+    );
+    // Unanswered, the device stays hidden from this connection, which goes on.
+    server.write_all(&global(1, "wl_compositor", 6)).unwrap();
+    let (b, _) = g.recv_until(|b, _| !global_names(b).is_empty());
+    assert_eq!(global_names(&b), vec!["wl_compositor"]);
+    assert_eq!(cfg.lease_cache.lookup(40), None);
+}
+
+#[test]
+fn the_reader_finds_lease_device_globals_only_in_whole_messages() {
+    let mut b = [
+        global(1, "wl_compositor", 6),
+        global(40, "wp_drm_lease_device_v1", 1),
+        global(41, "wp_drm_lease_device_v1", 1),
+    ]
+    .concat();
+    assert_eq!(super::probe::lease_globals(&b), vec![40, 41]);
+    // The last one cut short is left for the next read, as the engine leaves it.
+    b.truncate(b.len() - 4);
+    assert_eq!(super::probe::lease_globals(&b), vec![40]);
+}
+
+#[test]
+fn lease_submits_go_at_the_vms_rate_after_a_short_burst() {
+    let s = Duration::from_secs(1);
+    let th = LeaseThrottle::new(5 * s, 3);
+    let t0 = Instant::now();
+    for _ in 0..3 {
+        th.admit(1, t0).unwrap();
+    }
+    // The fourth waits out one interval.
+    assert_eq!(th.admit(1, t0), Err(5 * s));
+    assert_eq!(th.admit(1, t0 + 2 * s), Err(3 * s));
+    th.admit(1, t0 + 5 * s).unwrap();
+    assert!(th.admit(1, t0 + 6 * s).is_err());
+    // A frame without submits is never held; a quiet spell refills the burst.
+    th.admit(0, t0 + 6 * s).unwrap();
+    for _ in 0..3 {
+        th.admit(1, t0 + 60 * s).unwrap();
+    }
+    // Zero interval: no limit.
+    let free = LeaseThrottle::new(Duration::ZERO, 1);
+    for _ in 0..100 {
+        free.admit(1, t0).unwrap();
+    }
+}
+
+#[test]
+fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
+    let dir = tmpdir("lease-rate");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_millis(300), 2);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    g.client(
+        &[MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(40)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 5)
+            .finish()],
+        vec![],
+    );
+    let mut next = 10u32;
+    let mut submit = |g: &mut Guest| {
+        let (req, lease) = (next, next + 1);
+        next += 2;
+        let mut data = [
+            MsgBuilder::new(5, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(lease)
+                .finish(),
+        ]
+        .concat();
+        g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+            .unwrap();
+        let mut q = g.e.take_units();
+        frame::pack(&mut q, 1 << 20, 256, false).0
+    };
+    let (a, b, c) = (submit(&mut g), submit(&mut g), submit(&mut g));
+    g.conn.send(&a, &mut g.ops).unwrap();
+    g.conn.send(&b, &mut g.ops).unwrap();
+    // Past the burst: the whole frame waits, and nothing of it went in.
+    assert_eq!(g.conn.send(&c, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    assert_eq!(g.conn.send(&c, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    // Retried as the daemon retries it, it goes once the interval is up.
+    std::thread::sleep(Duration::from_millis(320));
+    g.conn.send(&c, &mut g.ops).unwrap();
+    assert!(!g.conn.is_closed());
 }

@@ -21,6 +21,20 @@
 //! The client's descriptor is only ever read with `pread`, never mapped: a
 //! client that truncates its pool under us gets short copies, not a SIGBUS in
 //! the proxy.
+//!
+//! **What the server's side may hold.** Its memfds are the one place a peer
+//! decides how much memory the proxy commits: every `SHM_SYNC` is written into
+//! them at once, no commit or compositor consent needed, and the pages are
+//! shmem that no process's RSS shows, so the host OOM killer, when they have
+//! eaten the host, picks somebody else. Every pool is therefore charged to
+//! [`ShmBudget`]s before its memfd exists and at every grow, and gives the
+//! charge back only when the last reference to it (its own id, or a buffer made
+//! from it) is gone: one budget per connection ([`MAX_POOL_BYTES`],
+//! [`MAX_POOLS`]), and on the backend one per VM that every connection of the
+//! VM shares ([`Engine::set_shm_budget`](crate::engine::Engine::set_shm_budget)),
+//! since a guest can open as many connections as it is allowed channels. The
+//! client's side charges only the count: its pools are the client's own
+//! memory, but each is a descriptor held here.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -34,6 +48,115 @@ pub struct Pool {
     /// Client side: the client's own pool descriptor. Server side: our memfd.
     pub fd: OwnedFd,
     pub size: AtomicU64,
+    /// What this pool holds of its budgets, given back when it goes.
+    charge: Charge,
+}
+
+/// A limit on pool memory and pool count, shared by whoever holds an `Arc` of
+/// it: every pool charged to it draws from the same two counters, lock-free,
+/// from whichever connection's thread.
+#[derive(Debug)]
+pub struct ShmBudget {
+    max_bytes: u64,
+    max_pools: u64,
+    bytes: AtomicU64,
+    pools: AtomicU64,
+}
+
+impl ShmBudget {
+    pub fn new(max_bytes: u64, max_pools: u64) -> Self {
+        Self {
+            max_bytes,
+            max_pools,
+            bytes: AtomicU64::new(0),
+            pools: AtomicU64::new(0),
+        }
+    }
+
+    /// (bytes, pools) charged now.
+    pub fn used(&self) -> (u64, u64) {
+        (
+            self.bytes.load(Ordering::Relaxed),
+            self.pools.load(Ordering::Relaxed),
+        )
+    }
+
+    /// (bytes, pools) it allows.
+    pub fn limits(&self) -> (u64, u64) {
+        (self.max_bytes, self.max_pools)
+    }
+
+    /// Both or neither: a charge that would pass either limit takes nothing.
+    fn take(&self, bytes: u64, pools: u64) -> bool {
+        let add = |c: &AtomicU64, n: u64, max: u64| {
+            c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                u.checked_add(n).filter(|&t| t <= max)
+            })
+            .is_ok()
+        };
+        if !add(&self.bytes, bytes, self.max_bytes) {
+            return false;
+        }
+        if !add(&self.pools, pools, self.max_pools) {
+            self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn give(&self, bytes: u64, pools: u64) {
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.pools.fetch_sub(pools, Ordering::AcqRel);
+    }
+}
+
+/// One pool's share of its budgets: one pool of the count, and `bytes`. Made
+/// before the pool (so a refused pool never has a memfd), owned by it after,
+/// and given back by `Drop` -- once, whichever way the pool goes.
+pub struct Charge {
+    budgets: Vec<Arc<ShmBudget>>,
+    bytes: AtomicU64,
+}
+
+impl Charge {
+    /// Take one pool and `bytes` from every budget, or from none.
+    fn take(budgets: Vec<Arc<ShmBudget>>, bytes: u64) -> Result<Charge, ShmError> {
+        for (i, b) in budgets.iter().enumerate() {
+            if !b.take(bytes, 1) {
+                for done in &budgets[..i] {
+                    done.give(bytes, 1);
+                }
+                return Err(ShmError::TooBig);
+            }
+        }
+        Ok(Charge {
+            budgets,
+            bytes: AtomicU64::new(bytes),
+        })
+    }
+
+    /// `more` bytes on top, from every budget or from none.
+    fn grow(&self, more: u64) -> bool {
+        for (i, b) in self.budgets.iter().enumerate() {
+            if !b.take(more, 0) {
+                for done in &self.budgets[..i] {
+                    done.give(more, 0);
+                }
+                return false;
+            }
+        }
+        self.bytes.fetch_add(more, Ordering::AcqRel);
+        true
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let bytes = self.bytes.load(Ordering::Acquire);
+        for b in &self.budgets {
+            b.give(bytes, 1);
+        }
+    }
 }
 
 pub struct Buffer {
@@ -63,17 +186,41 @@ struct Surface {
 }
 
 /// Pool bytes one connection may have the server's side hold at once (in
-/// memfds that are sparse until written). Four 4K HDR swapchains fit many
-/// times over; a peer asking for more is only after host memory.
-pub const MAX_POOL_BYTES: u64 = 8 << 30;
+/// memfds that are sparse until written). A 4K RGBA buffer is 33 MB, so a
+/// triple-buffered 4K window takes 100 MB and this is five of them, resizes
+/// included; a peer asking for more is after host memory. The VM-wide budget
+/// (`--wayland-shm-budget` on the backend) is what bounds the sum.
+pub const MAX_POOL_BYTES: u64 = 512 << 20;
 
-#[derive(Default)]
+/// Pools one connection may hold at once, on either side: each is a
+/// descriptor here (our memfd, or the client's own), and a toolkit makes a
+/// handful -- one per buffer at most, cursors included.
+pub const MAX_POOLS: u64 = 256;
+
 pub struct Shm {
     pools: HashMap<u32, Arc<Pool>>,
     buffers: HashMap<u32, Buffer>,
     surfaces: HashMap<u32, Surface>,
+    /// This connection's own limits.
+    conn: Arc<ShmBudget>,
+    /// Everyone's (the VM's), if the owner of the engine set one.
+    shared: Option<Arc<ShmBudget>>,
     pub sync_bytes: u64,
     pub syncs: u64,
+}
+
+impl Default for Shm {
+    fn default() -> Self {
+        Self {
+            pools: HashMap::new(),
+            buffers: HashMap::new(),
+            surfaces: HashMap::new(),
+            conn: Arc::new(ShmBudget::new(MAX_POOL_BYTES, MAX_POOLS)),
+            shared: None,
+            sync_bytes: 0,
+            syncs: 0,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,33 +258,40 @@ impl Shm {
         self.surfaces.remove(&id);
     }
 
-    pub fn add_pool(&mut self, id: u32, fd: OwnedFd, size: u64) {
+    /// Draw on a budget every connection of the VM shares, beside this
+    /// connection's own. Pools already made keep what they were charged to.
+    pub fn set_shared_budget(&mut self, b: Arc<ShmBudget>) {
+        self.shared = Some(b);
+    }
+
+    /// Everything known about pools, buffers and surfaces goes (the
+    /// connection is over). A pool still referenced from elsewhere keeps its
+    /// charge until that reference goes too.
+    pub fn clear(&mut self) {
+        self.pools.clear();
+        self.buffers.clear();
+        self.surfaces.clear();
+    }
+
+    /// Charge a new pool before it exists: one pool, and `bytes` of memory
+    /// this side will hold (the pool's size for our own memfd, 0 for a
+    /// client's descriptor). `TooBig` if this connection or the VM is at its
+    /// limit, and then nothing is taken.
+    pub fn charge(&self, bytes: u64) -> Result<Charge, ShmError> {
+        let mut budgets = vec![self.conn.clone()];
+        budgets.extend(self.shared.iter().cloned());
+        Charge::take(budgets, bytes)
+    }
+
+    pub fn add_pool(&mut self, id: u32, fd: OwnedFd, size: u64, charge: Charge) {
         self.pools.insert(
             id,
             Arc::new(Pool {
                 fd,
                 size: AtomicU64::new(size),
+                charge,
             }),
         );
-    }
-
-    /// Whether the server's side may take on `more` pool bytes. Counts every
-    /// pool still referenced, by its own id or by a buffer made from it.
-    pub fn may_grow(&self, more: u64) -> bool {
-        let mut seen: Vec<*const Pool> = Vec::new();
-        let mut total = 0u64;
-        let pools = self
-            .pools
-            .values()
-            .chain(self.buffers.values().map(|b| &b.pool));
-        for p in pools {
-            let ptr = Arc::as_ptr(p);
-            if !seen.contains(&ptr) {
-                seen.push(ptr);
-                total += p.size.load(Ordering::Relaxed);
-            }
-        }
-        total.saturating_add(more) <= MAX_POOL_BYTES
     }
 
     pub fn pool(&self, id: u32) -> Option<&Arc<Pool>> {
@@ -147,18 +301,15 @@ impl Shm {
     /// `wl_shm_pool.resize`. On the server side the memfd grows first, so the
     /// compositor's remap on the forwarded resize sees the new size.
     pub fn resize(&mut self, id: u32, size: u64, server_side: bool) -> Result<(), ShmError> {
-        let cur = self
-            .pools
-            .get(&id)
-            .ok_or(ShmError::NoPool(id))?
-            .size
-            .load(Ordering::Relaxed);
-        if server_side && size > cur && !self.may_grow(size - cur) {
-            return Err(ShmError::TooBig);
-        }
         let p = self.pools.get(&id).ok_or(ShmError::NoPool(id))?;
-        if size > p.size.load(Ordering::Relaxed) {
+        let cur = p.size.load(Ordering::Relaxed);
+        if size > cur {
             if server_side {
+                // Charged before the memfd grows; a grow the kernel then
+                // refuses keeps the charge, which the pool gives back whole.
+                if !p.charge.grow(size - cur) {
+                    return Err(ShmError::TooBig);
+                }
                 sys::ftruncate(p.fd.as_raw_fd(), size).map_err(|_| ShmError::Io)?;
             }
             p.size.store(size, Ordering::Relaxed);

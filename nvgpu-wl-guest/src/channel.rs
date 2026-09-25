@@ -81,6 +81,12 @@ pub struct DevConnector {
 
 pub struct DevChannel {
     file: File,
+    /// Where RECV writes, kept from call to call: a RECV comes at least twice
+    /// per presented frame (frame done, release, feedback), and a fresh
+    /// zeroed buffer of the whole receive size each time was calloc or
+    /// mmap churn on that path. The kernel writes what it returns, so the
+    /// buffer is never cleared; only the frame's own bytes are copied out.
+    rbuf: Vec<u8>,
 }
 
 fn ioctl<T>(f: &File, req: libc::c_ulong, arg: &mut T) -> io::Result<()> {
@@ -127,7 +133,10 @@ impl Connector for DevConnector {
         let file = self.open()?;
         let mut c = uapi::Connect { mode, flags: 0 };
         ioctl(&file, uapi::IOC_CONNECT, &mut c)?;
-        Ok(Box::new(DevChannel { file }))
+        Ok(Box::new(DevChannel {
+            file,
+            rbuf: Vec::new(),
+        }))
     }
 }
 
@@ -154,9 +163,11 @@ impl Channel for DevChannel {
         card: Option<RawFd>,
         render: Option<RawFd>,
     ) -> io::Result<Received> {
-        let mut buf = vec![0u8; max];
+        if self.rbuf.len() < max {
+            self.rbuf.resize(max, 0);
+        }
         let mut x = uapi::Xfer {
-            frame: buf.as_mut_ptr() as u64,
+            frame: self.rbuf.as_mut_ptr() as u64,
             len: max as u32,
             max_desc: frame::MAX_DESC as u32,
             card_fd: card.unwrap_or(-1),
@@ -164,7 +175,7 @@ impl Channel for DevChannel {
             ..Default::default()
         };
         ioctl(&self.file, uapi::IOC_RECV, &mut x)?;
-        buf.truncate(x.len as usize);
+        let buf = self.rbuf[..(x.len as usize).min(max)].to_vec();
         let mut fds = Vec::new();
         if buf.len() >= frame::FRAME_HDR_LEN {
             let n = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;

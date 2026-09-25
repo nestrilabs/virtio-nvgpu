@@ -63,19 +63,45 @@ MODULE_IMPORT_NS("DMA_BUF");
  * the nvgpu_device, which such a file's release and ioctls use, until it
  * goes itself: remove() alone would free it under them (S-26).
  */
+struct nvgpu_wl_file;
+
 struct nvgpu_wl_dev {
   struct miscdevice misc;
   struct nvgpu_device *dev;
   struct kref ref;
   char name[16];
+  /*
+   * Export mode: the file holding the one LISTEN channel, and the effective
+   * uid it was made with, which is the only one that may ACCEPT (besides
+   * CAP_SYS_ADMIN). An accepted channel is a host program's connection to a
+   * Wayland server, so whoever ACCEPTs is that program's compositor -- its
+   * keyboard, its clipboard -- and that must be the daemon that listens, not
+   * whichever guest process asks first. Under listen_lock.
+   */
+  struct mutex listen_lock;
+  struct nvgpu_wl_file *listener;
+  kuid_t listener_euid;
 };
 
 static void nvgpu_wl_dev_free(struct kref *ref) {
   struct nvgpu_wl_dev *wl = container_of(ref, struct nvgpu_wl_dev, ref);
 
+  mutex_destroy(&wl->listen_lock);
   nvgpu_dev_put(wl->dev);
   kfree(wl);
 }
+
+/*
+ * Who may use /dev/nvgpu-wl*. Every open is a host compositor client (or, in
+ * export mode, a host program's compositor), and a guest's clients only ever
+ * talk to the daemon's socket, so only the daemon's account needs the node:
+ * root:root 0660 by default, and a group for the daemon from udev
+ * (scripts/70-nvgpu-wl.rules). 0666 is the old, open behaviour.
+ */
+static ushort nvgpu_wl_mode = 0660;
+module_param_named(wl_mode, nvgpu_wl_mode, ushort, 0444);
+MODULE_PARM_DESC(wl_mode, "permissions of /dev/nvgpu-wl* (default 0660; "
+                          "the group comes from udev)");
 
 static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
 static DEFINE_MUTEX(nvgpu_wl_devs_lock);
@@ -93,6 +119,15 @@ struct nvgpu_wl_file {
   u32 mode;
   /* The last RECV said more is waiting. */
   bool more;
+  /*
+   * RECV's response buffer, kept for the next RECV of the same size (under
+   * `lock`): a channel receives at least twice per presented frame, and each
+   * buffer is up to 4 MiB of order-4 pieces, whose allocation under
+   * fragmentation falls back to direct reclaim on the frame-callback path.
+   * The transport zeroes it before every use. Given up to the transport with
+   * an abandoned call (nvgpu_xfer), freed at release.
+   */
+  struct nvgpu_tbuf *rbuf;
 };
 
 /* ── helpers ── */
@@ -233,6 +268,45 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
 
 /* ── CONNECT ── */
 
+/*
+ * Export mode's two channel kinds: LISTEN is taken by one file at a time
+ * (every LISTEN handle would share the export's one readiness eventfd, and
+ * a second listener takes the first's wake-ups), and ACCEPT only by the
+ * listener's effective uid. Before the backend is asked, so a refused
+ * ACCEPT leaves the host program queued for the daemon.
+ */
+static int nvgpu_wl_export_claim(struct nvgpu_wl_file *wf, u32 mode) {
+  struct nvgpu_wl_dev *wl = wf->wl;
+  int ret = 0;
+
+  mutex_lock(&wl->listen_lock);
+  if (mode == NVGPU_WL_LISTEN) {
+    if (wl->listener) {
+      ret = -EBUSY;
+    } else {
+      wl->listener = wf;
+      wl->listener_euid = current_euid();
+    }
+  } else if (!wl->listener) {
+    ret = -ENOTCONN;
+  } else if (!uid_eq(current_euid(), wl->listener_euid) &&
+             !capable(CAP_SYS_ADMIN)) {
+    ret = -EACCES;
+  }
+  mutex_unlock(&wl->listen_lock);
+  return ret;
+}
+
+/* The listener goes (its file is released, or its LISTEN failed). */
+static void nvgpu_wl_export_unclaim(struct nvgpu_wl_file *wf) {
+  struct nvgpu_wl_dev *wl = wf->wl;
+
+  mutex_lock(&wl->listen_lock);
+  if (wl->listener == wf)
+    wl->listener = NULL;
+  mutex_unlock(&wl->listen_lock);
+}
+
 static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->dev;
   struct nvgpu_wl_connect c;
@@ -247,17 +321,22 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
     return -EINVAL;
   if (wf->bound)
     return -EBUSY;
+  if (c.mode == NVGPU_WL_LISTEN || c.mode == NVGPU_WL_ACCEPT) {
+    ret = nvgpu_wl_export_claim(wf, c.mode);
+    if (ret)
+      return ret;
+  }
 
   req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req.device_type = cpu_to_le32(NVGPU_DEV_WAYLAND);
   /* The OPEN flags word says which kind of channel (WL_OPEN_* in wlwire). */
   req.flags = cpu_to_le32(c.mode);
   ret = nvgpu_send_recv(dev, &req, sizeof(req), &resp, sizeof(resp));
-  if (ret < 0)
-    return ret;
-  status = (s32)le32_to_cpu(resp.hdr.status);
-  if (status < 0)
+  status = ret < 0 ? ret : (s32)le32_to_cpu(resp.hdr.status);
+  if (status < 0) {
+    nvgpu_wl_export_unclaim(wf);
     return status;
+  }
 
   wf->nfd.dev = dev;
   wf->nfd.handle = le32_to_cpu(resp.hdr.handle);
@@ -281,6 +360,7 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   if (ret < 0) {
     nvgpu_fd_unregister(dev, &wf->nfd);
     nvgpu_close_handle(dev, wf->nfd.handle);
+    nvgpu_wl_export_unclaim(wf);
     return ret;
   }
   wf->bound = true;
@@ -333,8 +413,11 @@ invalid:
  * the host: a syncobj file of this device is a host-handle file, whose backend
  * handle the backend duplicates for the compositor (SendOps::syncobj). The
  * file is kept in @held until the host answered, so the handle cannot be
- * closed under the send. Anyone else's is sent as invalid; the compositor
- * gets a placeholder and refuses that timeline, not the connection.
+ * closed under the send. Anyone else's is sent as invalid, and the backend
+ * ends that client's connection with the protocol's INVALID_TIMELINE error
+ * (fatal, as a compositor's own refusal of the timeline would be) rather
+ * than hand the compositor a placeholder. Unlike a dma-buf: a buffer the
+ * compositor cannot import only fails that buffer.
  */
 static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
                                      struct nvgpu_wl_desc *d,
@@ -348,7 +431,8 @@ static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
   if (IS_ERR(f)) {
     dev_warn_ratelimited(&dev->vdev->dev,
                          "virtio-gpu-nv: wayland: a client's syncobj is not "
-                         "one of ours; the host gets a placeholder\n");
+                         "one of ours; its connection ends with "
+                         "invalid_timeline\n");
     goto invalid;
   }
   d->a = handle;
@@ -639,7 +723,14 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   max_desc = min_t(u32, x.max_desc, NVGPU_WL_MAX_DESC);
 
   req = nvgpu_tbuf_alloc(H + sizeof(rr), GFP_KERNEL);
-  resp = nvgpu_tbuf_alloc(H + cap, GFP_KERNEL);
+  /* Exactly this size or a new one: the transport zeroes all of it per call. */
+  if (wf->rbuf && nvgpu_tbuf_len(wf->rbuf) != H + cap) {
+    nvgpu_tbuf_free(wf->rbuf);
+    wf->rbuf = NULL;
+  }
+  if (!wf->rbuf)
+    wf->rbuf = nvgpu_tbuf_alloc(H + cap, GFP_KERNEL);
+  resp = wf->rbuf;
   if (!req || !resp) {
     ret = -ENOMEM;
     goto out;
@@ -664,10 +755,12 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
     /*
      * Abandoned: whatever the late reply carries (records, and backend
      * handles in its descriptors) is lost to this channel, which cannot
-     * resynchronise after that; the daemon closes it on the error.
+     * resynchronise after that; the daemon closes it on the error. The
+     * buffers are the transport's now, the kept one included.
      */
     req = NULL;
     resp = NULL;
+    wf->rbuf = NULL;
     goto out;
   }
   if (ret)
@@ -760,8 +853,7 @@ out:
   kfree(installed);
   if (req)
     nvgpu_tbuf_free(req);
-  if (resp)
-    nvgpu_tbuf_free(resp);
+  /* resp is wf->rbuf, kept for the next RECV (or the transport's now). */
   return ret;
 }
 
@@ -795,6 +887,9 @@ static int nvgpu_wl_release(struct inode *inode, struct file *filp) {
     nvgpu_fd_unregister(dev, &wf->nfd);
     nvgpu_close_handle(dev, wf->nfd.handle);
   }
+  nvgpu_wl_export_unclaim(wf);
+  if (wf->rbuf)
+    nvgpu_tbuf_free(wf->rbuf);
   mutex_destroy(&wf->lock);
   kref_put(&wf->wl->ref, nvgpu_wl_dev_free);
   kfree(wf);
@@ -893,13 +988,20 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   wl->dev = dev;
   nvgpu_dev_get(dev);
   kref_init(&wl->ref);
+  mutex_init(&wl->listen_lock);
   wl->misc.minor = MISC_DYNAMIC_MINOR;
   wl->misc.name = wl->name;
   wl->misc.fops = &nvgpu_wl_fops;
   wl->misc.parent = &dev->vdev->dev;
-  /* Like /dev/nvidia* and the render node: any guest process may use it.
-   * Separating guest users from each other is the guest's own business. */
-  wl->misc.mode = 0666;
+  /*
+   * Not like /dev/nvidia* and the render node, which any guest process may
+   * use: a channel makes its opener a client of the host's compositor (host
+   * windows, the host clipboard when focused), which on a desktop only the
+   * session's own programs are, through a 0700 XDG_RUNTIME_DIR. Guest
+   * clients reach it through the daemon's socket, which sits in theirs; the
+   * node is for the daemon (wl_mode above).
+   */
+  wl->misc.mode = nvgpu_wl_mode & 0777;
   ret = misc_register(&wl->misc);
   if (ret) {
     mutex_unlock(&nvgpu_wl_devs_lock);

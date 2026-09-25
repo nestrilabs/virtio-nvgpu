@@ -21,6 +21,12 @@ use crate::sys;
 pub const MAX_BLOB: u64 = 16 * 1024 * 1024;
 /// Most blob bytes a receiver holds unfinished at once.
 const MAX_PENDING: u64 = 4 * MAX_BLOB;
+/// Most blobs a receiver holds unfinished at once, whatever their size: each
+/// is a memfd here, and bytes alone would let a peer open one per empty chunk
+/// until this process runs out of descriptors. A sender's chunks come just
+/// ahead of the message that names the blob (`send`), so an honest peer has
+/// one or two in flight.
+pub const MAX_INCOMING: usize = 16;
 
 struct Incoming {
     fd: OwnedFd,
@@ -42,6 +48,11 @@ pub enum BlobError {
     OutOfOrder(u32),
     TooBig(u32),
     Incomplete(u32),
+    /// A chunk with no bytes: never sent (`send` makes none for an empty
+    /// blob), and the one way to open a memfd here without paying in bytes.
+    Empty(u32),
+    /// More unfinished blobs than `MAX_INCOMING`.
+    TooMany(u32),
     Io,
 }
 
@@ -86,9 +97,15 @@ impl Blobs {
         if (id & 0x8000_0000 != 0) == self.host_side || id & 0x7fff_ffff == 0 {
             return Err(BlobError::BadId(id));
         }
+        if bytes.is_empty() {
+            return Err(BlobError::Empty(id));
+        }
         if !self.incoming.contains_key(&id) {
             if off != 0 {
                 return Err(BlobError::OutOfOrder(id));
+            }
+            if self.incoming.len() >= MAX_INCOMING {
+                return Err(BlobError::TooMany(id));
             }
             let fd = sys::memfd(c"nvgpu-wl-blob", 0).map_err(|_| BlobError::Io)?;
             self.incoming.insert(id, Incoming { fd, have: 0 });
@@ -106,6 +123,12 @@ impl Blobs {
         inc.have += bytes.len() as u64;
         self.pending_bytes += bytes.len() as u64;
         Ok(())
+    }
+
+    /// Drop every unfinished blob (the connection is over).
+    pub fn clear(&mut self) {
+        self.incoming.clear();
+        self.pending_bytes = 0;
     }
 
     /// The finished blob `id`, which must be exactly `len` bytes, sealed and

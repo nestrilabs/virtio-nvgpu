@@ -17,7 +17,7 @@ use wlwire::proto::op;
 use wlwire::sys;
 use wlwire::wire::MsgBuilder;
 
-use super::conn::{RecvOps, SendOps, WlConfig};
+use super::conn::{RecvOps, SendOps, WlConfig, WlLimits};
 use super::export::WlExport;
 use super::serve::{TableRecv, TableSend};
 use super::tests::{
@@ -613,5 +613,44 @@ fn export_mode_listens_and_accepts_host_clients_as_channels() {
     assert_eq!(status(&r), 0);
     let f = frame::decode(&r[HDR..]).unwrap();
     assert_eq!(f.records().next().map(|r| r.ty), Some(frame::REC_HELLO));
+    x.shutdown();
+}
+
+#[test]
+fn a_vm_gets_no_more_wayland_channels_than_its_limit() {
+    let dir = tmpdir("serve-cap");
+    let sock = dir.join("wl");
+    // Connections wait in the listener's backlog; nothing need answer them.
+    let _l = UnixListener::bind(&sock).unwrap();
+    let mut be = backend();
+    be.set_wayland(Some(WlConfig::new(&sock)));
+    be.set_wayland_limits(WlLimits::new(2, 1 << 30, 1 << 20));
+    hello(&mut be);
+    let (st, first) = open(&mut be, frame::WL_OPEN_CONNECT);
+    assert_eq!(st, 0);
+    assert_eq!(open(&mut be, frame::WL_OPEN_CONNECT).0, 0);
+    let handles = be.handle_count();
+    assert_eq!(open(&mut be, frame::WL_OPEN_CONNECT).0, -libc::EMFILE);
+    assert_eq!(be.handle_count(), handles, "a refused OPEN leaves nothing");
+    // A channel that closes makes room for the next.
+    assert_eq!(close(&mut be, first), 0);
+    assert_eq!(open(&mut be, frame::WL_OPEN_CONNECT).0, 0);
+}
+
+#[test]
+fn export_mode_has_one_listener_at_a_time() {
+    let dir = tmpdir("serve-one-listener");
+    let path = dir.join("export-0");
+    let (x, ready) = WlExport::bind(&path).unwrap();
+    let mut be = backend();
+    be.config_mut().wayland_export = Some(path.clone());
+    be.set_wayland_export(Some((x.clone(), ready)));
+    hello(&mut be);
+    let (st, listen) = open(&mut be, frame::WL_OPEN_LISTEN);
+    assert_eq!(st, 0);
+    // A second one would share the first's readiness and take its wake-ups.
+    assert_eq!(open(&mut be, frame::WL_OPEN_LISTEN).0, -libc::EBUSY);
+    assert_eq!(close(&mut be, listen), 0);
+    assert_eq!(open(&mut be, frame::WL_OPEN_LISTEN).0, 0);
     x.shutdown();
 }

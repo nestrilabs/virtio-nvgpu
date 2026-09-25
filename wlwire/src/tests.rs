@@ -1007,6 +1007,182 @@ fn a_guest_cannot_make_the_host_hold_unbounded_shm() {
     assert_eq!(e.blame, Blame::Channel);
 }
 
+/// One message straight to the host engine, as a guest kernel skipping its
+/// daemon could send it; `pool` is the size of an SHM_POOL descriptor riding
+/// along.
+fn raw_to_host(p: &mut Pair, m: Vec<u8>, pool: Option<u64>) -> Result<(), Fatal> {
+    let descs: Vec<DescOut> = pool
+        .map(|c| {
+            DescOut::plain(Desc {
+                c,
+                ..Desc::new(frame::DESC_SHM_POOL)
+            })
+        })
+        .into_iter()
+        .collect();
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, descs.len() as u32, &m),
+        descs,
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut TestPlat::default())
+}
+
+fn create_pool(p: &mut Pair, id: u32, size: i32) -> Result<(), Fatal> {
+    let m = MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+        .new_id(id)
+        .int(size)
+        .finish();
+    raw_to_host(p, m, Some(size as u64))
+}
+
+/// A connection with wl_shm bound as 4, whose host engine draws on `vm`.
+fn shm_pair(vm: &Arc<crate::shm::ShmBudget>) -> Pair {
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    p.registry(&[(2, "wl_shm", 2)]);
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    p
+}
+
+#[test]
+fn every_connection_of_a_vm_draws_on_one_shm_budget() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(3 << 20, 64));
+    let mut a = shm_pair(&vm);
+    let mut b = shm_pair(&vm);
+    create_pool(&mut a, 10, 2 << 20).unwrap();
+    assert_eq!(vm.used(), (2 << 20, 1));
+    // Well inside b's own connection limit, but past what the VM has left:
+    // refused, and nothing taken for it.
+    let e = create_pool(&mut b, 10, 2 << 20).unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (2 << 20, 1));
+    // a's pool goes, and with it its charge; b can have the room.
+    raw_to_host(
+        &mut a,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (0, 0));
+    let mut b = shm_pair(&vm);
+    create_pool(&mut b, 10, 2 << 20).unwrap();
+    assert_eq!(vm.used(), (2 << 20, 1));
+    drop(b);
+    assert_eq!(vm.used(), (0, 0), "a dropped engine gives everything back");
+}
+
+#[test]
+fn a_pool_stays_charged_while_a_buffer_made_from_it_lives() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(11)
+            .int(0)
+            .int(256)
+            .int(256)
+            .int(1024)
+            .uint(0)
+            .finish(),
+        None,
+    )
+    .unwrap();
+    // The usual order: the pool is destroyed while its buffers live on, and
+    // the memfd with them.
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (1 << 20, 1));
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(11, op::wl_buffer::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (0, 0));
+}
+
+#[test]
+fn a_pool_resize_past_the_budget_is_refused_and_takes_nothing() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(4 << 20, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
+            .int(3 << 20)
+            .finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (3 << 20, 1));
+    let e = raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
+            .int(5 << 20)
+            .finish(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (3 << 20, 1));
+}
+
+#[test]
+fn pools_are_counted_as_well_as_sized() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 2));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 4096).unwrap();
+    create_pool(&mut p, 11, 4096).unwrap();
+    let e = create_pool(&mut p, 12, 4096).unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (8192, 2));
+}
+
+#[test]
+fn a_connection_that_is_over_sheds_its_pools_at_once() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    // The memfd the compositor got is its own reference; ours goes.
+    let _at_compositor = p.at_server();
+    p.h.shed();
+    assert_eq!(vm.used(), (0, 0));
+}
+
+#[test]
+fn an_empty_blob_chunk_is_refused_before_it_opens_anything() {
+    let mut b = crate::blob::Blobs::new(true);
+    assert_eq!(b.chunk(1, 0, &[]), Err(crate::blob::BlobError::Empty(1)));
+    // A zero-length blob needs no chunks at all.
+    assert!(b.take(1, 0).is_ok());
+}
+
+#[test]
+fn unfinished_blobs_are_capped_by_count_not_only_by_bytes() {
+    let mut b = crate::blob::Blobs::new(true);
+    for id in 1..=crate::blob::MAX_INCOMING as u32 {
+        b.chunk(id, 0, b"x").unwrap();
+    }
+    let next = crate::blob::MAX_INCOMING as u32 + 1;
+    assert_eq!(
+        b.chunk(next, 0, b"x"),
+        Err(crate::blob::BlobError::TooMany(next))
+    );
+    // A blob already under way may still finish, and taking one makes room.
+    b.chunk(1, 1, b"y").unwrap();
+    assert!(b.take(1, 2).is_ok());
+    b.chunk(next, 0, b"x").unwrap();
+    b.clear();
+    assert_eq!(b.take(2, 1).unwrap_err(), crate::blob::BlobError::BadId(2));
+}
+
 #[test]
 fn a_keymap_arrives_as_a_sealed_copy() {
     let mut p = Pair::new(Policy::default());
@@ -1240,6 +1416,71 @@ fn a_descriptor_the_guest_could_not_carry_arrives_as_a_placeholder() {
 }
 
 #[test]
+fn a_timeline_nobody_could_name_ends_the_client_with_invalid_timeline_not_a_placeholder() {
+    let mut h = Engine::new(EngineConfig {
+        side: Side::Host,
+        local: Local::Server,
+        policy: Policy {
+            fences: true,
+            ..Policy::default()
+        },
+        rewrites: None,
+        synth_released: false,
+    });
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(
+            frame::REC_WAYLAND,
+            0,
+            0,
+            &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(2)
+                .finish(),
+        ),
+        descs: vec![],
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    h.from_channel(&f, fds, &mut TestPlat::default()).unwrap();
+    let mut data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wp_linux_drm_syncobj_manager_v1"))
+        .uint(1)
+        .finish();
+    h.from_local(&mut data, &mut VecDeque::new(), &mut TestPlat::default())
+        .unwrap();
+    h.local_out().drain();
+    let m = [
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_linux_drm_syncobj_manager_v1", 1, 3)
+            .finish(),
+        MsgBuilder::new(3, op::wp_linux_drm_syncobj_manager_v1::REQ_IMPORT_TIMELINE)
+            .new_id(4)
+            .finish(),
+    ]
+    .concat();
+    // The guest kernel found no host syncobj behind the client's file.
+    q.push_back(frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, 1, &m),
+        descs: vec![DescOut::plain(Desc::invalid(frame::DESC_SYNCOBJ))],
+    });
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    let e = h
+        .from_channel(&f, fds, &mut TestPlat::default())
+        .unwrap_err();
+    assert_eq!(
+        (e.object, e.code, e.blame),
+        (3, ERR_SYNCOBJ_INVALID_TIMELINE, Blame::Channel),
+        "{}",
+        e.message
+    );
+    // The compositor got the bind and nothing of the import.
+    let (msgs, fds) = flatten(h.local_out().drain());
+    assert_eq!(split(&msgs).len(), 1);
+    assert!(fds.is_empty());
+    assert_eq!(h.stats.placeholders, 0);
+}
+
+#[test]
 fn a_wayland_record_that_miscounts_its_descriptors_is_refused() {
     let mut h = Engine::new(EngineConfig {
         side: Side::Host,
@@ -1409,6 +1650,60 @@ fn presentation_timestamps_move_by_the_clock_offset_only_for_monotonic_clocks() 
     // The presented event is a destructor: feedback 6 is gone (a zombie
     // until delete_id).
     assert!(p.g.objects().get(6).unwrap().zombie);
+}
+
+/// One WAYLAND record of `msgs`, framed as the channel carries it.
+fn wayland_frame(msgs: &[Vec<u8>]) -> Vec<u8> {
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, 0, &msgs.concat()),
+        descs: vec![],
+    }]);
+    frame::pack(&mut q, 1 << 20, 256, false).0
+}
+
+#[test]
+fn lease_submits_are_counted_in_a_frame_before_it_is_let_in() {
+    let mut p = Pair::new(Policy {
+        drm_file: false,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(20)
+        .finish();
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    // A connection never offered a lease device: nothing to count, and
+    // nothing is parsed.
+    let mut none = Pair::new(Policy::default());
+    none.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    let submit = |dev: u32, req: u32, lease: u32| {
+        vec![
+            MsgBuilder::new(dev, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(lease)
+                .finish(),
+        ]
+    };
+    // A device bound, a request made and submitted, all in one frame.
+    let mut one = vec![
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 3)
+            .finish(),
+    ];
+    one.extend(submit(3, 4, 5));
+    assert_eq!(p.h.lease_submits(&wayland_frame(&one)), 1);
+    assert_eq!(none.h.lease_submits(&wayland_frame(&one)), 0);
+    // A device the engine already knows, two submits and something else.
+    p.bind(1, "wp_drm_lease_device_v1", 1, 3).unwrap();
+    let mut two = submit(3, 4, 5);
+    two.push(sync.clone());
+    two.extend(submit(3, 6, 7));
+    assert_eq!(p.h.lease_submits(&wayland_frame(&two)), 2);
+    assert_eq!(p.h.lease_submits(&wayland_frame(&[sync])), 0);
+    assert_eq!(p.h.lease_submits(b"not a frame"), 0);
 }
 
 #[test]

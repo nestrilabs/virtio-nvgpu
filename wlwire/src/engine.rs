@@ -32,7 +32,7 @@ use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::Shm;
+use crate::shm::{Shm, ShmBudget};
 use crate::stream::{Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
@@ -42,6 +42,8 @@ pub const ERR_INVALID_OBJECT: u32 = 0;
 pub const ERR_INVALID_METHOD: u32 = 1;
 pub const ERR_NO_MEMORY: u32 = 2;
 pub const ERR_IMPLEMENTATION: u32 = 3;
+/// `wp_linux_drm_syncobj_manager_v1.error.invalid_timeline`.
+pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -286,6 +288,97 @@ impl Engine {
 
     pub fn policy_mut(&mut self) -> &mut Policy {
         &mut self.cfg.policy
+    }
+
+    /// Charge shm pools to `b` as well as to this connection's own limits
+    /// (`shm.rs`): the backend gives every connection of a VM the same one,
+    /// so the number of connections does not multiply what a guest can make
+    /// the host hold.
+    pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+        self.shm.set_shared_budget(b);
+    }
+
+    /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
+    /// channel carries, looked at before the frame is let in: the backend
+    /// rate-limits them, since the compositor answers every lease of a
+    /// desktop monitor with blocking modesets (releasing it, and taking it
+    /// back when the lease ends). A lease request created in the same frame
+    /// counts, and so does a device bound in it. Nothing is changed, and a
+    /// frame that does not decode counts none (`from_channel` refuses it).
+    /// Costs nothing on a connection that was never offered a lease device.
+    pub fn lease_submits(&self, bytes: &[u8]) -> usize {
+        if !self
+            .registry
+            .offered
+            .values()
+            .any(|(i, _)| *i == proto::WP_DRM_LEASE_DEVICE_V1)
+        {
+            return 0;
+        }
+        let Ok(f) = frame::decode(bytes) else {
+            return 0;
+        };
+        let bind =
+            &iface(proto::WL_REGISTRY).messages(Dir::Request)[op::wl_registry::REQ_BIND as usize];
+        let mut fresh: HashMap<u32, IfaceId> = HashMap::new();
+        let mut n = 0;
+        for r in f.records().filter(|r| r.ty == frame::REC_WAYLAND) {
+            let mut p = r.payload;
+            while let Some(h) = peek_header(p) {
+                let size = h.size as usize;
+                if size < 8 || size > p.len() {
+                    break;
+                }
+                let m = &p[..size];
+                p = &p[size..];
+                let ifc = fresh.get(&h.object).copied().or_else(|| {
+                    self.objects
+                        .get(h.object)
+                        .filter(|o| !o.zombie)
+                        .map(|o| o.iface)
+                });
+                let new_id = || match m.get(8..12) {
+                    Some(b) => u32::from_ne_bytes(b.try_into().unwrap()),
+                    None => 0,
+                };
+                match (ifc, h.opcode) {
+                    (Some(proto::WL_REGISTRY), op::wl_registry::REQ_BIND) => {
+                        if let Ok(a) = wire::parse(bind, m) {
+                            if let Val::NewId {
+                                id,
+                                iface: Some(b"wp_drm_lease_device_v1"),
+                                ..
+                            } = a[1].val
+                            {
+                                fresh.insert(id, proto::WP_DRM_LEASE_DEVICE_V1);
+                            }
+                        }
+                    }
+                    (
+                        Some(proto::WP_DRM_LEASE_DEVICE_V1),
+                        op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST,
+                    ) => {
+                        fresh.insert(new_id(), proto::WP_DRM_LEASE_REQUEST_V1);
+                    }
+                    (
+                        Some(proto::WP_DRM_LEASE_REQUEST_V1),
+                        op::wp_drm_lease_request_v1::REQ_SUBMIT,
+                    ) => n += 1,
+                    _ => {}
+                }
+            }
+        }
+        n
+    }
+
+    /// The connection is over: let go at once of what only a live connection
+    /// needs -- shm pools (whose memfds are what a guest commits host memory
+    /// through) and half-received blobs -- rather than when the owner gets
+    /// round to dropping the engine, which for the backend is whenever the
+    /// guest closes the handle.
+    pub fn shed(&mut self) {
+        self.shm.clear();
+        self.blobs.clear();
     }
 
     /// The far side has gone (HANGUP received).
@@ -740,7 +833,13 @@ impl Engine {
                                     ));
                                 }
                             };
-                            self.shm.add_pool(new_id_at(0), fd, size);
+                            // The client's own memory, but a descriptor
+                            // held here: only the count is charged.
+                            let charge = self
+                                .shm
+                                .charge(0)
+                                .map_err(|_| err(ERR_NO_MEMORY, "too many shm pools".into()))?;
+                            self.shm.add_pool(new_id_at(0), fd, size, charge);
                             DescOut::plain(Desc {
                                 c: size,
                                 ..Desc::new(frame::DESC_SHM_POOL)
@@ -838,18 +937,20 @@ impl Engine {
                                         ));
                                     }
                                 };
-                                if !self.shm.may_grow(size) {
-                                    return Err(err(
+                                // Charged before the memfd exists: past this
+                                // connection's or the VM's budget, no memfd.
+                                let charge = self.shm.charge(size).map_err(|_| {
+                                    err(
                                         ERR_NO_MEMORY,
-                                        "too much shm for one connection".into(),
-                                    ));
-                                }
+                                        "shm pool over the connection's or the VM's budget".into(),
+                                    )
+                                })?;
                                 let memfd = sys::memfd(c"nvgpu-wl-shm", size)
                                     .map_err(|e| err(ERR_NO_MEMORY, format!("shm pool: {e}")))?;
                                 let give = memfd
                                     .try_clone()
                                     .map_err(|e| err(ERR_NO_MEMORY, format!("dup: {e}")))?;
-                                self.shm.add_pool(new_id_at(0), memfd, size);
+                                self.shm.add_pool(new_id_at(0), memfd, size, charge);
                                 Some(give)
                             }
                             FdKind::Dmabuf => {
@@ -883,6 +984,24 @@ impl Engine {
                     };
                     let fd = match fd {
                         Some(f) => f,
+                        // A timeline nobody can name (the guest kernel found
+                        // no host syncobj behind the client's file: another
+                        // device's, or no syncobj at all) ends the client
+                        // here, with the error the protocol has for it. A
+                        // placeholder would earn it the same error from the
+                        // compositor (Hyprland's CSyncTimeline::create fails
+                        // on it, DRMSyncobj.cpp:128-131), only later, from a
+                        // host process, and naming nothing -- unlike a dma-buf,
+                        // whose placeholder only fails that one buffer.
+                        None if class == FdKind::Syncobj => {
+                            return Err(err(
+                                ERR_SYNCOBJ_INVALID_TIMELINE,
+                                "import_timeline: the syncobj is not one of the virtio-nvgpu \
+                                 device's (a timeline from another DRM device cannot reach \
+                                 the host compositor)"
+                                    .into(),
+                            ));
+                        }
                         None => {
                             self.stats.placeholders += 1;
                             sys::placeholder_fd()

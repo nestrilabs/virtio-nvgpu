@@ -12,7 +12,24 @@
 //! lease device, classifies each `drm_fd`, and remembers the answer by global
 //! name for every later connection (global names are per compositor, not per
 //! client). The probe is a few round trips on a socket nobody else sees, bounded
-//! by a timeout; an unanswered one counts as "not ours".
+//! by a timeout.
+//!
+//! **Where it runs.** A probe can take a couple of seconds on a compositor that
+//! is busy (a modeset, a stalled output, a login), so it runs where nothing
+//! waits on it: in the connection's reader thread, *before* the engine sees the
+//! bytes and with no lock held but its own ([`LeaseCache::resolve`]). The
+//! registry filter itself only looks answers up ([`LeaseCache::lookup`]) under
+//! the connection's lock, which WL_SEND and WL_RECV take from the queue thread
+//! with the backend mutex held -- a probe there stalled every request of the VM.
+//! One probe runs at a time; a connection that finds one running waits for its
+//! answer, holding nothing anyone else needs.
+//!
+//! **What is remembered.** Only answers: a name whose `drm_fd` arrived and was
+//! classified. A probe that failed or timed out, or a device that sent no
+//! `drm_fd`, leaves the name unknown -- hidden from the connection that asked,
+//! and asked about again by a later one once a backoff has passed (5 s, doubling
+//! to a minute), so one slow moment of the compositor does not hide leasing for
+//! the life of the backend.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -30,30 +47,136 @@ use crate::hostfd::HandleKind;
 use crate::wl::conn::HostFds;
 
 const TIMEOUT: Duration = Duration::from_secs(1);
+const BACKOFF_FIRST: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-#[derive(Default)]
 pub struct LeaseCache {
+    /// Answers by global name. Held only to look up or insert.
     known: Mutex<HashMap<u32, bool>>,
+    /// Held for the whole of a probe: one at a time. Guards when the next
+    /// may start after one that left names unanswered.
+    probing: Mutex<Backoff>,
+}
+
+struct Backoff {
+    not_before: Option<Instant>,
+    next: Duration,
+}
+
+impl Default for LeaseCache {
+    fn default() -> Self {
+        Self::with_backoff(BACKOFF_FIRST)
+    }
 }
 
 impl LeaseCache {
-    /// Whether lease-device global `name` hands out files of our GPU, probing
-    /// the compositor if this name has not been seen.
-    pub fn is_ours(&self, socket: &Path, host: &dyn HostFds, name: u32) -> bool {
-        let mut known = self.known.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(&v) = known.get(&name) {
-            return v;
+    /// A cache whose first retry after a failed probe waits `first`.
+    pub fn with_backoff(first: Duration) -> Self {
+        Self {
+            known: Mutex::new(HashMap::new()),
+            probing: Mutex::new(Backoff {
+                not_before: None,
+                next: first,
+            }),
         }
-        match probe(socket, host) {
+    }
+
+    /// The answer for lease-device global `name`, if one is known. Never
+    /// probes: this is what the registry filter asks, under the connection's
+    /// lock. Unknown means hidden, this time.
+    pub fn lookup(&self, name: u32) -> Option<bool> {
+        let known = self.known.lock().unwrap_or_else(|p| p.into_inner());
+        known.get(&name).copied()
+    }
+
+    /// Make the answers for `names` known, probing the compositor if any is
+    /// not and no backoff is running. Call it with no other lock held: it
+    /// may take a couple of seconds.
+    pub fn resolve(&self, socket: &Path, host: &dyn HostFds, names: &[u32]) {
+        let missing = |c: &Self| names.iter().any(|n| c.lookup(*n).is_none());
+        if !missing(self) {
+            return;
+        }
+        let mut b = self.probing.lock().unwrap_or_else(|p| p.into_inner());
+        // Another connection's probe may have answered while we waited.
+        if !missing(self) {
+            return;
+        }
+        if b.not_before.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        let r = probe(socket, host);
+        let failed = match r {
             Ok(found) => {
-                for (n, ours) in found {
-                    known.insert(n, ours);
+                let mut known = self.known.lock().unwrap_or_else(|p| p.into_inner());
+                known.extend(found);
+                drop(known);
+                if missing(self) {
+                    log::info!(
+                        "wayland: a lease device sent no drm_fd; asking again in {:?}",
+                        b.next
+                    );
+                    true
+                } else {
+                    false
                 }
             }
-            Err(e) => log::warn!("wayland: probing the compositor's lease devices failed: {e}"),
+            Err(e) => {
+                log::warn!(
+                    "wayland: probing the compositor's lease devices failed ({e}); \
+                     hidden for now, asking again in {:?}",
+                    b.next
+                );
+                true
+            }
+        };
+        if failed {
+            b.not_before = Some(Instant::now() + b.next);
+            b.next = (b.next * 2).min(BACKOFF_MAX);
+        } else {
+            b.not_before = None;
+            b.next = BACKOFF_FIRST;
         }
-        *known.entry(name).or_insert(false)
     }
+
+    /// Whether lease-device global `name` hands out files of our GPU:
+    /// [`resolve`](Self::resolve), then [`lookup`](Self::lookup).
+    pub fn is_ours(&self, socket: &Path, host: &dyn HostFds, name: u32) -> bool {
+        self.resolve(socket, host, &[name]);
+        self.lookup(name).unwrap_or(false)
+    }
+}
+
+/// The names of the `wp_drm_lease_device_v1` globals announced among the
+/// whole messages at the front of `buf` (bytes from the compositor not yet
+/// run through the engine), for [`LeaseCache::resolve`] to answer before the
+/// registry filter asks.
+///
+/// Read by shape, not by object: any event with opcode 0 (`wl_registry.global`)
+/// whose arguments parse as (uint, that string, uint). Which objects are
+/// registries is the engine's to know, under the lock this runs outside of;
+/// a message of another object that happens to match costs only a probe,
+/// and the filter still asks by the registry's own global.
+pub fn lease_globals(mut buf: &[u8]) -> Vec<u32> {
+    const NAME: &[u8] = b"wp_drm_lease_device_v1\0";
+    let mut out = Vec::new();
+    while let Some(h) = peek_header(buf) {
+        let size = h.size as usize;
+        if size < 8 || size > buf.len() {
+            break;
+        }
+        let m = &buf[..size];
+        buf = &buf[size..];
+        if h.opcode != op::wl_registry::EVT_GLOBAL || size < 16 {
+            continue;
+        }
+        let word = |at: usize| u32::from_ne_bytes(m[at..at + 4].try_into().unwrap());
+        let len = word(12) as usize;
+        if len == NAME.len() && m.get(16..16 + len) == Some(NAME) {
+            out.push(word(8));
+        }
+    }
+    out
 }
 
 /// A minimal client: enough object tracking to parse the replies, and to
@@ -153,7 +276,7 @@ impl Probe {
 }
 
 /// Bind every lease device on a private connection and classify its drm_fd.
-/// Returns (global name, is ours) for each.
+/// Returns (global name, is ours) for each whose drm_fd arrived.
 pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> {
     let sock = UnixStream::connect(socket)?;
     sock.set_nonblocking(true)?;
@@ -206,7 +329,9 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
             .new_id(4)
             .finish(),
     )?;
-    let mut result: HashMap<u32, bool> = devices.iter().map(|n| (*n, false)).collect();
+    // Only what a drm_fd answered: a device that sent none is not known to
+    // be anyone's, and is asked about again later rather than hidden for good.
+    let mut result: HashMap<u32, bool> = HashMap::new();
     p.until_done(4, &mut |obj, opc, _, fds| {
         if opc == op::wp_drm_lease_device_v1::EVT_DRM_FD {
             if let (Some(name), Some(fd)) = (by_obj.get(&obj), fds.first()) {
