@@ -3258,6 +3258,9 @@ mod backend_tests {
     #[test]
     fn registered_memory_is_never_exported() {
         let (mut vm, _) = vm_610();
+        // This module's gate alone: NV_MEMORY_EXPORT's EXPORT_MEM is not in
+        // the RM allowlist (rmallow.rs), which would answer it first.
+        vm.be.set_rm_allowlist(crate::rmallow::Mode::Log);
         register(&mut vm);
         let ctl = vm.ctl;
         let control = |cmd: u32, size: usize| {

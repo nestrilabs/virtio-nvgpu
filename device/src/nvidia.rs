@@ -508,6 +508,8 @@ pub struct NvidiaBackend {
     /// Bounded (tally.rs): the keys are the guest's to choose.
     rm_classes: crate::tally::Tally,
     rm_controls: crate::tally::Tally,
+    /// Which RM controls and classes reach the host at all (rmallow.rs).
+    rmallow: crate::rmallow::RmAllow,
     /// Every ioctl forwarded, by namespace and number.
     ///
     /// There are three namespaces, not one, and that is the point of counting
@@ -1010,6 +1012,7 @@ impl NvidiaBackend {
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: crate::tally::Tally::default(),
             rm_controls: crate::tally::Tally::default(),
+            rmallow: crate::rmallow::RmAllow::default(),
             ioctls_by_ns: std::collections::BTreeMap::new(),
             pump_cmds: Vec::new(),
             created: Vec::new(),
@@ -1073,6 +1076,12 @@ impl NvidiaBackend {
             );
         }
         self.abi_policy = policy;
+    }
+
+    /// Refuse the RM controls and classes the host release's allowlist lacks
+    /// (the default), or only log them (`--rm-allowlist=log`; rmallow.rs).
+    pub fn set_rm_allowlist(&mut self, mode: crate::rmallow::Mode) {
+        self.rmallow.set_mode(mode);
     }
 
     /// Whether guest system memory is allocated GPU-coherent (the default;
@@ -1288,6 +1297,7 @@ impl NvidiaBackend {
         report("RM_CONTROL command(s)", &self.rm_controls, |c| {
             format!("{c:#010x}")
         });
+        self.rmallow.report();
         let total: u64 = self.msg_counts.values().sum();
         log::info!(
             "NvidiaBackend::teardown: served {total} message(s): {}",
@@ -2408,6 +2418,7 @@ impl NvidiaBackend {
 
     fn set_driver_version(&mut self, v: abi::version::DriverVersion) {
         self.driver = Some(v);
+        self.rmallow.set_driver(v);
         self.nvkms.set_version(v);
         self.config.nvkms_table = crate::schema::modeset_table(v).is_some();
         self.abi = abi::versions::table_for(v);
@@ -2817,6 +2828,33 @@ impl NvidiaBackend {
                 "escape {escape:#04x} carries a descriptor the backend does not translate; refused"
             );
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EOPNOTSUPP);
+        }
+
+        // Default deny: an RM control or class the host release's allowlist
+        // lacks is answered here as RM answers what it does not implement
+        // (rmallow.rs). Whatever the ABI policy. The controls the backend
+        // answers itself below (rmctl.rs) never reach RM and keep their own
+        // answers; the page-list path's classes are held to it too.
+        if ioc_type == b'F' as u32 {
+            let answered_here = escape == NV_ESC_RM_CONTROL
+                && (crate::rmctl::unix_refused(param_in).is_some()
+                    || crate::rmctl::host_pid_control(param_in).is_some());
+            let sent = &body[..nested_end];
+            if !answered_here
+                && let Err(r) = self.rmallow.check(escape, sent, ireq.data_len as usize)
+            {
+                return match r {
+                    crate::rmallow::Refusal::Errno(errno) => {
+                        self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno)
+                    }
+                    crate::rmallow::Refusal::Status { at, status } => {
+                        let mut out = crate::rmshare::refusal(sent, at, status);
+                        let deep = &body[nested_end..want];
+                        out.extend_from_slice(deep);
+                        self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len())
+                    }
+                };
+            }
         }
 
         // Memory registered by its pages rather than its address: its own
@@ -7964,6 +8002,10 @@ mod descriptor_field_tests {
                 SEEN.with(|s| s.borrow_mut().push((cmd, i32::MIN)));
             }
             b[28..32].copy_from_slice(&0u32.to_le_bytes());
+        } else if (request & 0xff) as u32 == NV_ESC_RM_ALLOC {
+            // (class | 1 << 31, 0): an allocation RM was asked for.
+            let class = u32::from_le_bytes(b[12..16].try_into().unwrap());
+            SEEN.with(|s| s.borrow_mut().push((class | 1 << 31, 0)));
         }
         0
     }
@@ -8006,6 +8048,125 @@ mod descriptor_field_tests {
         let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
         let st = read_struct::<MsgHeader>(&resp, 0).status;
         (st, resp[body.min(n)..n].to_vec())
+    }
+
+    /// NV_ESC_RM_ALLOC (NVOS64) of `class` with `params`.
+    fn alloc(be: &mut NvidiaBackend, on: u32, class: u32, params: &[u8]) -> (i32, Vec<u8>) {
+        let mut outer = [0u8; 48];
+        outer[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        outer[4..8].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        outer[8..12].copy_from_slice(&0x5000_0001u32.to_le_bytes());
+        outer[12..16].copy_from_slice(&class.to_le_bytes());
+        outer[32..36].copy_from_slice(&(params.len() as u32).to_le_bytes());
+        let mut req = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut req,
+            &MsgHeader {
+                msg_type: MsgType::Ioctl as u32,
+                handle: on,
+                status: 0,
+                req_id: 0,
+            },
+        );
+        let at = req.len();
+        req.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(
+            &mut req[at..],
+            &IoctlReq {
+                cmd: _IOWR(NV_ESC_RM_ALLOC, 48) as u32,
+                data_len: 48,
+                nested_offset: 16,
+                nested_len: params.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        req.extend_from_slice(&outer);
+        req.extend_from_slice(params);
+        let mut resp = vec![0u8; 8192];
+        let n = be.dispatch(&req, &mut resp);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = read_struct::<MsgHeader>(&resp, 0).status;
+        (st, resp[body.min(n)..n].to_vec())
+    }
+
+    fn status_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// The RM allowlist (rmallow.rs) is on by default, in front of RM, for
+    /// controls and classes alike, and the host's release picks its list.
+    #[test]
+    fn rm_calls_the_allowlist_lacks_never_reach_rm() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        be.set_host_driver_version("610.57.04");
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let _ = seen();
+        // GPU_SET_POWER and EXEC_REG_OPS: RM lets any user process call
+        // them; no workload the project runs does.
+        for (cmd, size) in [
+            (0x2080_0112u32, 4usize),
+            (0x2080_0122, 16),
+            (0xdead_beef, 8),
+        ] {
+            let (st, back) = control(&mut be, ctl, cmd, &vec![0u8; size]);
+            assert_eq!(st, 0, "{cmd:#x}: RM's own answer, not a failed ioctl");
+            assert_eq!(
+                status_at(&back, 28),
+                crate::rmallow::NV_ERR_NOT_SUPPORTED,
+                "{cmd:#x}"
+            );
+        }
+        assert!(seen().is_empty(), "none reached RM");
+        // GPU_GET_INFO_V2 is 580 bytes in 610.57.04: another size is RM's
+        // INVALID_PARAM_STRUCT, and the right one goes.
+        let (_, back) = control(&mut be, ctl, 0x2080_0102, &[0u8; 64]);
+        assert_eq!(
+            status_at(&back, 28),
+            crate::rmallow::NV_ERR_INVALID_PARAM_STRUCT
+        );
+        assert!(seen().is_empty());
+        let (st, _) = control(&mut be, ctl, 0x2080_0102, &[0u8; 580]);
+        assert_eq!(st, 0);
+        assert_eq!(seen(), [(0x2080_0102, i32::MIN)]);
+        // A class: NV40_I2C is RM's to refuse a user anyway, NV20_SUBDEVICE_DIAG
+        // is not; neither is the guest's. NV01_ROOT_CLIENT is.
+        for class in [0x402cu32, 0x208f] {
+            let (st, back) = alloc(&mut be, ctl, class, &[]);
+            assert_eq!(st, 0, "{class:#x}");
+            assert_eq!(
+                status_at(&back, 40),
+                crate::rmallow::NV_ERR_INVALID_CLASS,
+                "{class:#x}"
+            );
+        }
+        assert!(seen().is_empty());
+        let (st, _) = alloc(&mut be, ctl, 0x41, &[]);
+        assert_eq!(st, 0);
+        assert_eq!(seen(), [(0x41 | 1 << 31, 0)]);
+    }
+
+    #[test]
+    fn in_log_mode_the_allowlist_only_says_what_it_would_refuse() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        be.set_host_driver_version("610.57.04");
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let _ = seen();
+        let (st, _) = control(&mut be, ctl, 0x2080_0112, &[0u8; 4]);
+        assert_eq!(st, 0);
+        assert_eq!(seen(), [(0x2080_0112, i32::MIN)]);
+        // And the ABI policy does not reach it: permissive or not, enforced.
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        be.set_host_driver_version("610.57.04");
+        be.set_abi_policy(AbiPolicy::Permissive);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let (_, back) = control(&mut be, ctl, 0x2080_0112, &[0u8; 4]);
+        assert_eq!(status_at(&back, 28), crate::rmallow::NV_ERR_NOT_SUPPORTED);
+        assert!(seen().is_empty());
     }
 
     fn with_fd(len: usize, at: usize, v: i32) -> Vec<u8> {
@@ -8081,10 +8242,19 @@ mod descriptor_field_tests {
             );
         }
         assert!(seen().is_empty());
-        // The two without a descriptor go to RM.
-        let (st, _) = control(&mut be, ctl, 0x3d07, &[0u8; 8]);
+        // FLUSH_USER_CACHE carries no descriptor and goes to RM.
+        // OS_GET_GPU_INFO, which RM's tables do not export, is answered as
+        // RM answers it, by the allowlist (rmallow.rs).
+        let (st, _) = control(&mut be, ctl, 0x3d02, &[0u8; 40]);
         assert_eq!(st, 0);
         assert_eq!(seen().len(), 1);
+        let (st, back) = control(&mut be, ctl, 0x3d07, &[0u8; 8]);
+        assert_eq!(st, 0);
+        assert_eq!(
+            u32::from_le_bytes(back[28..32].try_into().unwrap()),
+            crate::rmctl::NV_ERR_NOT_SUPPORTED
+        );
+        assert!(seen().is_empty());
     }
 
     #[test]

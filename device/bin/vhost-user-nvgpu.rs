@@ -117,6 +117,19 @@ struct Args {
     #[arg(long)]
     permissive_abi: bool,
 
+    /// What to do with an RM control or class the host release's allowlist
+    /// lacks: `enforce` refuses it before the host's RM sees it, as RM
+    /// answers a call it does not implement; `log` logs it with RM's name
+    /// for it and forwards it anyway.
+    ///
+    /// `log` is for finding out what a new workload needs (the teardown
+    /// report lists everything it would have refused); like
+    /// `--permissive-abi`, it hands a guest the parts of RM nobody has
+    /// vetted, so it is not a way to run one. `--permissive-abi` does not
+    /// change this gate.
+    #[arg(long, value_name = "MODE", default_value = "enforce")]
+    rm_allowlist: device::rmallow::Mode,
+
     /// Serve CUDA and other compute: `/dev/nvidia-uvm` (with UVM's
     /// multi-process sharing mode and the UVM aperture, where the VMM maps
     /// semaphore pools at guest-chosen addresses in its own address space),
@@ -808,6 +821,7 @@ impl NvGpuBackend {
     fn new(
         proc_nvidia: &Path,
         abi_policy: device::nvidia::AbiPolicy,
+        rm_allowlist: device::rmallow::Mode,
         config: BackendConfig,
         wayland: Wayland,
     ) -> anyhow::Result<Self> {
@@ -826,6 +840,7 @@ impl NvGpuBackend {
 
         let mut nvidia = NvidiaBackend::with_default_zones();
         nvidia.set_abi_policy(abi_policy);
+        nvidia.set_rm_allowlist(rm_allowlist);
         nvidia.set_config(config);
         nvidia.set_host_driver_version(&version);
         nvidia.set_wayland(wayland.cfg);
@@ -1249,6 +1264,7 @@ fn main() -> anyhow::Result<()> {
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
         abi_policy,
+        args.rm_allowlist,
         config,
         wayland,
     )?));

@@ -1219,7 +1219,8 @@ mod backend_tests {
             &mut be,
             h,
             CONTROL,
-            &nvos54(0x20800a01, GUEST_PTR, 0),
+            // GPU_ACQUIRE_COMPUTE_MODE_RESERVATION: no parameters.
+            &nvos54(0x2080_0145, GUEST_PTR, 0),
             &[],
             None,
         );
@@ -1246,7 +1247,7 @@ mod backend_tests {
             &mut be,
             h,
             CONTROL,
-            &nvos54(0x20800a01, GUEST_PTR, 64),
+            &nvos54(0x2080_0145, GUEST_PTR, 64),
             &[],
             None,
         );
@@ -1391,6 +1392,9 @@ mod backend_tests {
     #[test]
     fn deep_segments_that_are_not_rms_size_never_reach_rm() {
         let (mut be, h) = ctl();
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         for deep in [
             crate::deepseg::build(&[(8, &[0; 8]), (16, &[0; 12])]),
             crate::deepseg::build(&[(8, &[0; 12]), (16, &[0; 16])]),

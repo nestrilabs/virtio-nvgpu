@@ -5,6 +5,7 @@
 // Ported from gVisor's pkg/abi/nvgpu/ (Apache-2.0).
 
 pub mod ioctl;
+pub mod rmallow;
 pub mod rmctrl;
 pub mod schema;
 pub mod types;
