@@ -74,8 +74,11 @@ const CTX_HANDLE_AT: usize = 24;
 const IMPORT_PARAMS_SIZE: usize = 16;
 
 /// Live fence contexts one render file may hold, and one session. The ICD
-/// makes one per VkDevice (R:fences §1.3); a compositor a handful.
-pub const CTX_CAP_PER_FILE: usize = 16;
+/// makes more than one per VkDevice: mpv's libplacebo device, which asks for
+/// every queue family, ran past 16 on one file on an RTX 5090 (595.99.02)
+/// and failed vkCreateDevice. A compositor makes a handful. The session cap
+/// is what bounds the host's kthreads.
+pub const CTX_CAP_PER_FILE: usize = 64;
 pub const CTX_CAP_PER_SESSION: usize = 256;
 
 /// `NV01_ROOT`, `NV01_ROOT_NON_PRIV`, `NV01_ROOT_CLIENT`: the classes a
@@ -308,6 +311,7 @@ impl SemsurfPolicy {
             );
             return Err(libc::ENOSPC);
         }
+        log::debug!("SEMSURF_FENCE_CTX_CREATE on handle {target}: {mine} in the file, {all} in the session before this one");
         Ok(())
     }
 

@@ -119,7 +119,7 @@ while kill -0 "$RUN" 2>/dev/null; do
     seen_end=$((seen_end + 1))
     app=${line#APP_START }
     case $app in
-        clipboard) printf clip-from-host | wl-copy >/dev/null 2>&1 </dev/null && say "clipboard: host selection set" ;;
+        clipboard) wl-copy clip-from-host >/dev/null 2>&1 </dev/null && say "clipboard: host selection set" ;;
     esac
     if ! wait_view "$app"; then
         host_result[$app]="no window"
