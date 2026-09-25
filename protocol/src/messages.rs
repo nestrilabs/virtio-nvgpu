@@ -560,6 +560,10 @@ pub struct UnwatchReq {
 
 /// HOST_OP operations.
 pub const OP_PRIME_EXPORT: u32 = 1;
+/// `(render file, dmabuf) -> (gem, size, type)`: `type` is the imported
+/// object's GEM_IDENTIFY_OBJECT answer (0 NVKMS, 1 DMABUF, 2 USERMEMORY). A
+/// guest that predates it reads the first two; a backend that predates it
+/// sends two, which the guest reads as NVKMS.
 pub const OP_DMABUF_IMPORT: u32 = 2;
 pub const OP_SYNC_MERGE: u32 = 3;
 pub const OP_NEW_EVENTFD: u32 = 4;

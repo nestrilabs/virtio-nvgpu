@@ -361,6 +361,8 @@ struct nvgpu_unwatch_req {
 /* ── HOST_OP ── */
 #define NVGPU_OP_PRIME_EXPORT 1       /* (render file, gem) -> dmabuf handle         */
 #define NVGPU_OP_DMABUF_IMPORT 2      /* (render file, dmabuf) -> (gem, size)        */
+/* ... and a third result, the imported object's GEM_IDENTIFY_OBJECT type
+ * (NVGPU_GEM_OBJECT_*); an older backend sends two, read as NVKMS (0). */
 #define NVGPU_OP_SYNC_MERGE 3         /* (n, h0..) -> sync_file handle               */
 #define NVGPU_OP_NEW_EVENTFD 4        /* () -> eventfd handle                        */
 #define NVGPU_OP_FD_KIND 5            /* (handle) -> NVGPU_HK_*                      */

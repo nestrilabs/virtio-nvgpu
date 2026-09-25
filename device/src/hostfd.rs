@@ -526,6 +526,52 @@ pub fn prime_import(render: RawFd, dmabuf: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(p[0..4].try_into().unwrap()))
 }
 
+/// `DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT`: `{u32 handle; u32 object_type}`.
+pub const DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT: u32 = ioc(IOC_RW, b'd', 0x4e, 8);
+
+/// `enum drm_nvidia_gem_object_type` (nv_drm_common_ioctl.h:316-322).
+pub const NV_GEM_OBJECT_NVKMS: u32 = 0;
+pub const NV_GEM_OBJECT_DMABUF: u32 = 1;
+pub const NV_GEM_OBJECT_USERMEMORY: u32 = 2;
+pub const NV_GEM_OBJECT_UNKNOWN: u32 = 0x7fff_ffff;
+
+/// `DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT` on `gem` in `render`: what kind of
+/// nvidia-drm object it is.
+pub fn gem_identify(render: RawFd, gem: u32) -> io::Result<u32> {
+    let mut p = [0u8; 8];
+    p[0..4].copy_from_slice(&gem.to_le_bytes());
+    ioctl(render, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, p.as_mut_ptr())?;
+    Ok(u32::from_le_bytes(p[4..8].try_into().unwrap()))
+}
+
+/// The object type a DMABUF_IMPORT reports, from IDENTIFY on the imported
+/// handle, or the errno that fails the import.
+///
+/// A PRIME import into nvidia-drm yields one of three kinds of object: the
+/// exporter's own NVKMS memory when the dma-buf came from this device (the
+/// self-import fast path), and otherwise a dma-buf-backed object
+/// (nvidia-drm-gem-dma-buf.c:134-163) -- a host iGPU's buffer, a udmabuf, a
+/// v4l2 frame -- or, for a re-imported user-memory export, that. The guest's
+/// proxy used to call every one of them NVKMS, so the guest compositor's
+/// EXPORT_NVKMS_MEMORY, which refuses a dma-buf object
+/// (nvidia-drm-gem-nvkms-memory.c:595-603), failed where on bare metal it
+/// never tries. UNKNOWN is a handle that is none of those, which an import
+/// cannot legitimately produce: refused (EINVAL). IDENTIFY itself refuses
+/// with EOPNOTSUPP on a node without DRIVER_MODESET (nvidia-drm-gem.c:318-320,
+/// nvidia_drm.modeset=0), where no NVKMS object can exist -- they need the
+/// NVKMS device -- so the import is a dma-buf object.
+pub fn import_type(identified: io::Result<u32>) -> Result<u32, i32> {
+    match identified {
+        Ok(t @ (NV_GEM_OBJECT_NVKMS | NV_GEM_OBJECT_DMABUF | NV_GEM_OBJECT_USERMEMORY)) => Ok(t),
+        Ok(t) => {
+            log::warn!("DMABUF_IMPORT: the imported object identifies as {t:#x}; refused");
+            Err(libc::EINVAL)
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(NV_GEM_OBJECT_DMABUF),
+        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
 /// `DRM_IOCTL_GEM_CLOSE`, for undoing an import whose reply cannot be sent.
 pub fn gem_close(file: RawFd, gem: u32) -> io::Result<()> {
     let mut p = [0u8; 8];
@@ -725,6 +771,41 @@ fn udmabuf_signaled_sync_file() -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn identify_has_nvidia_drms_number() {
+        assert_eq!(DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, 0xC008_644E);
+    }
+
+    #[test]
+    fn an_imported_foreign_dmabuf_is_reported_as_one() {
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_DMABUF)),
+            Ok(NV_GEM_OBJECT_DMABUF)
+        );
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_NVKMS)),
+            Ok(NV_GEM_OBJECT_NVKMS)
+        );
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_USERMEMORY)),
+            Ok(NV_GEM_OBJECT_USERMEMORY)
+        );
+    }
+
+    #[test]
+    fn an_import_that_identifies_as_unknown_is_refused() {
+        assert_eq!(import_type(Ok(NV_GEM_OBJECT_UNKNOWN)), Err(libc::EINVAL));
+        assert_eq!(import_type(Ok(3)), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn a_node_without_modeset_imports_dmabuf_objects() {
+        let e = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert_eq!(import_type(Err(e)), Ok(NV_GEM_OBJECT_DMABUF));
+        let e = io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(import_type(Err(e)), Err(libc::EBADF));
+    }
 
     /// The numbers are computed, so check a few against their uapi values.
     #[test]

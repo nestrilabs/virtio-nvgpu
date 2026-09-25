@@ -544,7 +544,7 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
                            u32 handle) {
   struct nvgpu_fd *nfd;
   struct file *rf;
-  u64 args[2], res[2];
+  u64 args[2], res[3];
   int ret;
 
   /*
@@ -563,12 +563,27 @@ static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
   }
   args[0] = nfd->handle;
   args[1] = handle;
-  ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 2);
+  ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 3);
   if (ret < 0)
     goto out;
+  /*
+   * res[2] is what the host says the object is. A host client's buffer from
+   * another device -- an iGPU's, a udmabuf, a v4l2 frame -- is a dma-buf
+   * object, not NVKMS memory, and the guest compositor's ICD asks: on
+   * NVKMS it tries EXPORT_NVKMS_MEMORY, which the host refuses for a dma-buf
+   * object (nvidia-drm-gem-nvkms-memory.c:595-603), and the import fails
+   * where on bare metal it takes the dma-buf path. An older backend sends no
+   * third word, which reads as 0, NVKMS: the old answer.
+   */
+  if (res[2] > NVGPU_GEM_OBJECT_USERMEMORY) {
+    nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    ret = -EPROTO;
+    goto out;
+  }
   /* Owns the host GEM handle from here: closed on failure, or left to the
    * proxy that already stands for it. */
-  ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], O_RDWR | O_CLOEXEC);
+  ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], (u32)res[2],
+                               O_RDWR | O_CLOEXEC);
 out:
   if (rf)
     fput(rf);

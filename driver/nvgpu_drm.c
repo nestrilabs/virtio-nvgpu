@@ -937,7 +937,8 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
 static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
                                                     struct nvgpu_fd *owner,
                                                     u32 host_handle,
-                                                    size_t size) {
+                                                    size_t size,
+                                                    u32 obj_type) {
   struct nvgpu_gem_object *ng;
   int ret;
 
@@ -959,7 +960,10 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
   ng->owner = owner;
   ng->owner_handle = owner->handle;
   ng->host_handle = host_handle;
-  ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
+  /* What the host said the object is (DMABUF_IMPORT's third word), for
+   * GEM_IDENTIFY_OBJECT to answer; NVKMS for everything this node allocates
+   * or imports as NVKMS memory itself. */
+  ng->obj_type = obj_type;
 
   /*
    * One proxy per host handle of a file, ever. A second would GEM_CLOSE the
@@ -984,9 +988,16 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
 /*
  * Stand a guest object in front of a host one and return the guest handle.
  *
- * `size` is what the core reports for the object and what it validates
- * framebuffer dimensions against, so it has to be at least the real buffer.
- * Page-aligned because the core rejects an object smaller than a page.
+ * `size` is the object's size as the guest core knows it, and this node has
+ * no DRIVER_MODESET (nvgpu_drm_driver), so nothing validates framebuffer
+ * dimensions against it here -- the host's ADDFB2 does that against the host
+ * object. What it does bound is everything that hands the memory out: the
+ * mmap of the fake offset, the window placement, and the size of the dma-buf
+ * an importer gets. So it has to be the real buffer's: an allocation's
+ * memory_size, an import's mem_size, a host dma-buf's lseek size; a nested
+ * import with no size field would fall to the single page below and
+ * under-report, which is why none is described without one. Page-aligned
+ * because the core rejects an object smaller than a page.
  *
  * The host handle is this function's from the moment it is called: every
  * failure closes it exactly once, except -EEXIST (a proxy of @owner already
@@ -1000,7 +1011,8 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
   struct nvgpu_gem_object *ng;
   int ret;
 
-  ng = nvgpu_gem_proxy_new(file->minor->dev, owner, host_handle, size);
+  ng = nvgpu_gem_proxy_new(file->minor->dev, owner, host_handle, size,
+                           NVGPU_GEM_OBJECT_NVKMS);
   if (IS_ERR(ng)) {
     if (PTR_ERR(ng) == -EEXIST)
       dev_warn_ratelimited(&owner->dev->vdev->dev,
@@ -1066,7 +1078,7 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
  * caller.
  */
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           int o_flags) {
+                           u32 obj_type, int o_flags) {
   struct nvgpu_fd *nfd = nvgpu_drm_file_nfd(drm_filp);
   struct drm_gem_object *obj = NULL;
   struct nvgpu_gem_object *ng;
@@ -1088,7 +1100,8 @@ int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
     obj = nvgpu_gem_proxy_find(nfd, host_gem);
     if (obj)
       break;
-    ng = nvgpu_gem_proxy_new(file->minor->dev, nfd, host_gem, size);
+    ng = nvgpu_gem_proxy_new(file->minor->dev, nfd, host_gem, size,
+                             obj_type);
     if (!IS_ERR(ng))
       obj = &ng->base;
     else if (PTR_ERR(ng) != -EEXIST)

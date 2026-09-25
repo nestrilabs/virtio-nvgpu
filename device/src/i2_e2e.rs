@@ -689,6 +689,8 @@ impl Guest {
 struct Kernel {
     /// file -> GEM handle -> object
     gems: HashMap<String, BTreeMap<u32, u64>>,
+    /// object -> what GEM_IDENTIFY_OBJECT says it is, NVKMS (0) if absent.
+    types: HashMap<u64, u32>,
     dmabufs: HashMap<RawFd, u64>,
     next_dmabuf: RawFd,
     /// What each main ioctl saw, for the test to look at.
@@ -796,8 +798,20 @@ impl Sys for Fake {
                         None => -libc::EINVAL,
                     }
                 }
+                // Per object, as nv_drm_gem_identify_object_ioctl answers it
+                // (nvidia-drm-gem.c:310-345): the type of whatever the handle
+                // names in this file, UNKNOWN for a handle it does not hold.
                 IDENTIFY => {
-                    poke(arg, 4, 4, 0); // NV_GEM_OBJECT_NVKMS
+                    let h = peek(arg, 0, 4) as u32;
+                    let t = match k.gems.get(&file).and_then(|g| g.get(&h)) {
+                        Some(obj) => k
+                            .types
+                            .get(obj)
+                            .copied()
+                            .unwrap_or(hostfd::NV_GEM_OBJECT_NVKMS),
+                        None => hostfd::NV_GEM_OBJECT_UNKNOWN,
+                    };
+                    poke(arg, 4, 4, u64::from(t));
                     0
                 }
                 // drm_mode_get_lease_ioctl with count_objects 0: the count
@@ -1193,6 +1207,39 @@ fn addfb2_takes_the_proxies_objects_into_the_lease_for_one_job_only() {
     // gets the same number owns no framebuffer of this one's.
     w.be.close_handle(kms).unwrap();
     assert!(!w.be.kms_states.contains_key(&kms));
+}
+
+/// A framebuffer is NVKMS memory or nothing: a proxy standing for a foreign
+/// dma-buf (a host iGPU's buffer imported in export mode) is refused before
+/// the host's ADDFB2 could dereference its NULL pMemory, and the temporaries
+/// made for the job are closed all the same.
+#[test]
+fn addfb2_of_a_dmabuf_object_is_refused_by_what_the_host_says_it_is() {
+    let mut w = world();
+    {
+        let mut k = w.fake.0.lock().unwrap();
+        let g = k.gems.entry("e2e-render".into()).or_default();
+        g.insert(7, 0xa);
+        g.insert(8, 0xb);
+        k.types.insert(0xb, hostfd::NV_GEM_OBJECT_DMABUF);
+    }
+    w.hooks.gems.insert(3, (w.render, 7));
+    w.hooks.gems.insert(4, (w.render, 8));
+    let mut a = vec![0u8; 104];
+    wr(&mut a, 4, 4, 1920);
+    wr(&mut a, 8, 4, 1080);
+    wr(&mut a, 12, 4, u64::from(NV12));
+    wr(&mut a, 20, 4, 3);
+    wr(&mut a, 24, 4, 4);
+    w.mem.put(0x1000, &a);
+    let kms = w.kms;
+    assert_eq!(w.call(kms, ADDFB2, 0x1000, 0), Ok(-libc::EINVAL));
+    let k = w.fake.0.lock().unwrap();
+    assert!(k.fbs.is_empty(), "the host never saw the ADDFB2");
+    assert!(
+        k.gems.get("e2e-kms").is_none_or(|g| g.is_empty()),
+        "the temporaries are closed in the lease file"
+    );
 }
 
 /// drm_mode_create_lease at 0x1000 leasing objects 41 and 51.

@@ -427,10 +427,12 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
 /*
  * Host GEM @host_gem, just imported into the render handle of @drm_filp (a
  * DRM file of ours), as a new guest dma-buf descriptor (@o_flags: O_CLOEXEC |
- * O_RDWR), or -errno. Owns @host_gem unless it returns -EBADF (not our file).
+ * O_RDWR), or -errno. @obj_type is the host's IDENTIFY answer for it
+ * (NVGPU_GEM_OBJECT_*), which a new proxy reports. Owns @host_gem unless it
+ * returns -EBADF (not our file).
  */
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           int o_flags);
+                           u32 obj_type, int o_flags);
 
 /* Guest handle in `file` -> the proxy itself, referenced (drop it with
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */

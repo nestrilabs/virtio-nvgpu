@@ -458,13 +458,23 @@ impl NvidiaBackend {
             HostOp::DmabufImport { file, dmabuf } => {
                 let (file, dmabuf) = (self.raw(file)?, self.raw(dmabuf)?);
                 let gem = hostfd::prime_import(file, dmabuf).map_err(io)?;
-                match hostfd::dmabuf_size(dmabuf) {
-                    Ok(size) => Ok((vec![gem as u64, size], vec![])),
+                // The third word is what the object is, for the guest proxy to
+                // answer IDENTIFY with (hostfd::import_type); a guest that
+                // predates it reads two words, and a backend that predates it
+                // sends two, which the guest reads as NVKMS -- the old answer.
+                let described = hostfd::dmabuf_size(dmabuf)
+                    .map_err(|e| errno_of(&e))
+                    .and_then(|size| {
+                        let ty = hostfd::import_type(hostfd::gem_identify(file, gem))?;
+                        Ok((size, ty))
+                    });
+                match described {
+                    Ok((size, ty)) => Ok((vec![gem as u64, size, u64::from(ty)], vec![])),
                     Err(e) => {
                         // A GEM handle the guest will never hear about is a
                         // leak in the host file; take it back.
                         let _ = hostfd::gem_close(file, gem);
-                        Err(errno_of(&e))
+                        Err(e)
                     }
                 }
             }
