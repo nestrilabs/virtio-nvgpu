@@ -1006,17 +1006,31 @@ fn syncobj_compositor(sock: PathBuf, got: mpsc::Sender<OwnedFd>) {
     });
 }
 
+/// What a guest client saw and what the compositor got, for
+/// [`syncobj_round_trip`].
+struct SyncobjSeen {
+    /// The syncobj global was offered.
+    offered: bool,
+    /// The descriptor import_timeline delivered to the compositor.
+    got: Option<OwnedFd>,
+    /// The inode of the host syncobj the guest's handle stands for.
+    host_ino: u64,
+    /// The wl_display.error the client got instead: (object, code, message).
+    error: Option<(u32, u32, String)>,
+}
+
 /// What a guest client saw and what the compositor got: whether the syncobj
 /// global was offered, and the descriptor import_timeline delivered (if the
-/// client could send one), for a guest whose kernel does or does not say
-/// NVGPU_WL_CAP_SYNCOBJ, a backend that does or does not serve fences, and a
-/// client syncobj the kernel does or does not know.
+/// client could send one) or the error the client got, for a guest whose
+/// kernel does or does not say NVGPU_WL_CAP_SYNCOBJ, a backend that does or
+/// does not serve fences, and a client syncobj the kernel does or does not
+/// know.
 fn syncobj_round_trip(
     tag: &str,
     guest_caps: u32,
     backend_fences: bool,
     known: bool,
-) -> (bool, Option<OwnedFd>, u64) {
+) -> SyncobjSeen {
     let dir = runtime_dir(tag);
     let host_sock = dir.join("host-0");
     let (tx, rx) = mpsc::channel();
@@ -1069,7 +1083,12 @@ fn syncobj_round_trip(
         obj == 3
     });
     let Some(name) = offered else {
-        return (false, None, host_ino);
+        return SyncobjSeen {
+            offered: false,
+            got: None,
+            host_ino,
+            error: None,
+        };
     };
     w.write_all(
         &MsgBuilder::new(2, op::wl_registry::REQ_BIND)
@@ -1088,41 +1107,61 @@ fn syncobj_round_trip(
             .finish(),
     )
     .unwrap();
-    read_msgs(&s, &mut buf, &mut fds, |obj, _, _, _| obj == 6);
-    let got = rx.recv_timeout(Duration::from_secs(5)).ok();
-    (true, got, host_ino)
+    // The sync's done, or the error that ends the client first.
+    let mut error = None;
+    read_msgs(&s, &mut buf, &mut fds, |obj, opc, m, _| {
+        if obj == 1 && opc == op::wl_display::EVT_ERROR {
+            let len = word(m, 4) as usize;
+            let msg = String::from_utf8_lossy(&m[20..20 + len - 1]).into_owned();
+            error = Some((word(m, 2), word(m, 3), msg));
+            return true;
+        }
+        obj == 6
+    });
+    // Nothing is coming to the compositor after an error; wait only briefly.
+    let wait = if error.is_some() { 200 } else { 5000 };
+    let got = rx.recv_timeout(Duration::from_millis(wait)).ok();
+    SyncobjSeen {
+        offered: true,
+        got,
+        host_ino,
+        error,
+    }
 }
 
 const SYNCOBJ_CAPS: u32 = uapi::CAP_WAYLAND | uapi::CAP_SYNCOBJ;
 
 #[test]
 fn a_client_timeline_reaches_the_compositor_as_the_host_syncobj_behind_it() {
-    let (offered, got, host_ino) = syncobj_round_trip("y1", SYNCOBJ_CAPS, true, true);
-    assert!(offered, "the syncobj global is offered");
-    let got = got.expect("import_timeline reached the compositor");
+    let r = syncobj_round_trip("y1", SYNCOBJ_CAPS, true, true);
+    assert!(r.offered, "the syncobj global is offered");
+    assert_eq!(r.error, None);
+    let got = r.got.expect("import_timeline reached the compositor");
     assert_eq!(
         sys::fstat(got.as_raw_fd()).unwrap().st_ino,
-        host_ino,
+        r.host_ino,
         "what the compositor imports is the host syncobj, not the guest's file"
     );
 }
 
 #[test]
-fn a_syncobj_the_guest_kernel_does_not_know_reaches_the_compositor_as_a_placeholder() {
-    let (offered, got, host_ino) = syncobj_round_trip("y2", SYNCOBJ_CAPS, true, false);
-    assert!(offered);
-    let got = got.expect("the message still carries one descriptor");
-    assert_ne!(sys::fstat(got.as_raw_fd()).unwrap().st_ino, host_ino);
-    let link = std::fs::read_link(format!("/proc/self/fd/{}", got.as_raw_fd())).unwrap();
-    assert!(
-        !link.to_string_lossy().contains("guest-syncobj"),
-        "{link:?}"
+fn a_syncobj_the_guest_kernel_does_not_know_ends_the_client_before_the_compositor_sees_it() {
+    let r = syncobj_round_trip("y2", SYNCOBJ_CAPS, true, false);
+    assert!(r.offered);
+    // The error the compositor would have raised (Hyprland answers a
+    // placeholder with it), raised by the proxy on the manager, saying why.
+    let (object, code, msg) = r.error.expect("the client is told");
+    assert_eq!(
+        (object, code),
+        (4, wlwire::engine::ERR_SYNCOBJ_INVALID_TIMELINE)
     );
+    assert!(msg.contains("syncobj"), "{msg}");
+    assert!(r.got.is_none(), "the compositor never gets a placeholder");
 }
 
 #[test]
 fn the_syncobj_global_needs_fences_on_both_ends() {
     // A guest kernel without fences, and a backend without them.
-    assert!(!syncobj_round_trip("y3", uapi::CAP_WAYLAND, true, true).0);
-    assert!(!syncobj_round_trip("y4", SYNCOBJ_CAPS, false, true).0);
+    assert!(!syncobj_round_trip("y3", uapi::CAP_WAYLAND, true, true).offered);
+    assert!(!syncobj_round_trip("y4", SYNCOBJ_CAPS, false, true).offered);
 }

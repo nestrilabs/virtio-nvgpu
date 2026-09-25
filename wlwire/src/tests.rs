@@ -1416,6 +1416,71 @@ fn a_descriptor_the_guest_could_not_carry_arrives_as_a_placeholder() {
 }
 
 #[test]
+fn a_timeline_nobody_could_name_ends_the_client_with_invalid_timeline_not_a_placeholder() {
+    let mut h = Engine::new(EngineConfig {
+        side: Side::Host,
+        local: Local::Server,
+        policy: Policy {
+            fences: true,
+            ..Policy::default()
+        },
+        rewrites: None,
+        synth_released: false,
+    });
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(
+            frame::REC_WAYLAND,
+            0,
+            0,
+            &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(2)
+                .finish(),
+        ),
+        descs: vec![],
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    h.from_channel(&f, fds, &mut TestPlat::default()).unwrap();
+    let mut data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wp_linux_drm_syncobj_manager_v1"))
+        .uint(1)
+        .finish();
+    h.from_local(&mut data, &mut VecDeque::new(), &mut TestPlat::default())
+        .unwrap();
+    h.local_out().drain();
+    let m = [
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_linux_drm_syncobj_manager_v1", 1, 3)
+            .finish(),
+        MsgBuilder::new(3, op::wp_linux_drm_syncobj_manager_v1::REQ_IMPORT_TIMELINE)
+            .new_id(4)
+            .finish(),
+    ]
+    .concat();
+    // The guest kernel found no host syncobj behind the client's file.
+    q.push_back(frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, 1, &m),
+        descs: vec![DescOut::plain(Desc::invalid(frame::DESC_SYNCOBJ))],
+    });
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    let e = h
+        .from_channel(&f, fds, &mut TestPlat::default())
+        .unwrap_err();
+    assert_eq!(
+        (e.object, e.code, e.blame),
+        (3, ERR_SYNCOBJ_INVALID_TIMELINE, Blame::Channel),
+        "{}",
+        e.message
+    );
+    // The compositor got the bind and nothing of the import.
+    let (msgs, fds) = flatten(h.local_out().drain());
+    assert_eq!(split(&msgs).len(), 1);
+    assert!(fds.is_empty());
+    assert_eq!(h.stats.placeholders, 0);
+}
+
+#[test]
 fn a_wayland_record_that_miscounts_its_descriptors_is_refused() {
     let mut h = Engine::new(EngineConfig {
         side: Side::Host,

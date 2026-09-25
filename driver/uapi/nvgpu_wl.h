@@ -21,7 +21,10 @@
  *                   host-handle file). The kernel puts the backend handle of
  *                   its host syncobj in `a`, holds the file until the host has
  *                   duplicated it for the compositor, and sets `fd` to -1.
- *                   Any other file is sent as NVGPU_WL_DESC_F_INVALID.
+ *                   Any other file is sent as NVGPU_WL_DESC_F_INVALID, and
+ *                   the backend ends that connection with the protocol's
+ *                   fatal invalid_timeline error on the manager (the
+ *                   compositor never sees it).
  *   RECV, DRM_FILE: `a` is a backend handle to a host DRM file of our GPU (a
  *                   lease). The kernel adopts it into a new guest DRM file,
  *                   cloned from the `card_fd` template, and stores the new

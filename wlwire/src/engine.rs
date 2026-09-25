@@ -42,6 +42,8 @@ pub const ERR_INVALID_OBJECT: u32 = 0;
 pub const ERR_INVALID_METHOD: u32 = 1;
 pub const ERR_NO_MEMORY: u32 = 2;
 pub const ERR_IMPLEMENTATION: u32 = 3;
+/// `wp_linux_drm_syncobj_manager_v1.error.invalid_timeline`.
+pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -982,6 +984,24 @@ impl Engine {
                     };
                     let fd = match fd {
                         Some(f) => f,
+                        // A timeline nobody can name (the guest kernel found
+                        // no host syncobj behind the client's file: another
+                        // device's, or no syncobj at all) ends the client
+                        // here, with the error the protocol has for it. A
+                        // placeholder would earn it the same error from the
+                        // compositor (Hyprland's CSyncTimeline::create fails
+                        // on it, DRMSyncobj.cpp:128-131), only later, from a
+                        // host process, and naming nothing -- unlike a dma-buf,
+                        // whose placeholder only fails that one buffer.
+                        None if class == FdKind::Syncobj => {
+                            return Err(err(
+                                ERR_SYNCOBJ_INVALID_TIMELINE,
+                                "import_timeline: the syncobj is not one of the virtio-nvgpu \
+                                 device's (a timeline from another DRM device cannot reach \
+                                 the host compositor)"
+                                    .into(),
+                            ));
+                        }
                         None => {
                             self.stats.placeholders += 1;
                             sys::placeholder_fd()

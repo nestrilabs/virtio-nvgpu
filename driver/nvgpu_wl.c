@@ -328,8 +328,11 @@ invalid:
  * the host: a syncobj file of this device is a host-handle file, whose backend
  * handle the backend duplicates for the compositor (SendOps::syncobj). The
  * file is kept in @held until the host answered, so the handle cannot be
- * closed under the send. Anyone else's is sent as invalid; the compositor
- * gets a placeholder and refuses that timeline, not the connection.
+ * closed under the send. Anyone else's is sent as invalid, and the backend
+ * ends that client's connection with the protocol's INVALID_TIMELINE error
+ * (fatal, as a compositor's own refusal of the timeline would be) rather
+ * than hand the compositor a placeholder. Unlike a dma-buf: a buffer the
+ * compositor cannot import only fails that buffer.
  */
 static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
                                      struct nvgpu_wl_desc *d,
@@ -343,7 +346,8 @@ static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
   if (IS_ERR(f)) {
     dev_warn_ratelimited(&dev->vdev->dev,
                          "virtio-gpu-nv: wayland: a client's syncobj is not "
-                         "one of ours; the host gets a placeholder\n");
+                         "one of ours; its connection ends with "
+                         "invalid_timeline\n");
     goto invalid;
   }
   d->a = handle;
