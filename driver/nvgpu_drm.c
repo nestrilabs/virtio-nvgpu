@@ -52,19 +52,9 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
 
 /* Defined below; named here because the ioctls that test it come first. */
 static const struct drm_gem_object_funcs nvgpu_gem_funcs;
+static const struct file_operations nvgpu_drm_fops;
 
-static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
-                                  u32 host_handle, size_t size,
-                                  u32 *guest_handle);
-static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
-                             u32 *host_handle, u32 *owner_handle);
 static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
-
-/* struct drm_gem_close — UAPI, include/uapi/drm/drm.h */
-struct nvgpu_drm_gem_close {
-  __u32 handle;
-  __u32 pad;
-};
 
 /*
  * The nvidia-drm ioctls, answered here rather than through a drm_ioctl_desc
@@ -415,16 +405,12 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     if (ret < 0)
       return ret;
 
-    /* The host's handle never reaches userspace; a proxy stands in for it. */
+    /* The host's handle never reaches userspace; a proxy stands in for it.
+     * On failure the proxy code has closed the host handle already. */
     ret = nvgpu_gem_proxy_create(file, nfd, p.handle, p.memory_size,
                                  &guest_handle);
-    if (ret) {
-      struct nvgpu_drm_gem_close close = {.handle = p.handle};
-
-      nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, DRM_IOCTL_GEM_CLOSE, &close,
-                         sizeof(close));
+    if (ret)
       return ret;
-    }
 
     p.handle = guest_handle;
     if (copy_to_user(uarg, &p, sizeof(p)))
@@ -488,17 +474,15 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
  *
  * Forwarded on the owner's handle rather than the caller's: the host object
  * belongs to the drm_file that created it, and that file may well have closed
- * first -- a compositor can outlive the client whose buffer it imported.
+ * first -- a compositor can outlive the client whose buffer it imported. The
+ * proxy's reference on the owner is what keeps that handle open until now,
+ * and it is dropped last, after the GEM_CLOSE and MUNMAP that need it.
  */
 static void nvgpu_gem_free(struct drm_gem_object *obj) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
 
-  if (ng->dev && ng->host_handle) {
-    struct nvgpu_drm_gem_close close = {.handle = ng->host_handle};
-
-    nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle, DRM_IOCTL_GEM_CLOSE, &close,
-                       sizeof(close));
-  }
+  if (ng->dev && ng->host_handle)
+    nvgpu_gem_close(ng->dev, ng->owner_handle, ng->host_handle);
 
   /*
    * Give the window space back. The window is a gigabyte and a swapchain is
@@ -521,6 +505,8 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   }
 
   drm_gem_object_release(obj);
+  if (ng->owner)
+    nvgpu_fd_put(ng->owner);
   kfree(ng);
 }
 
@@ -564,6 +550,7 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
   u64 window_off;
+  u32 used;
   long ret;
 
   if (READ_ONCE(ng->window_valid))
@@ -606,12 +593,19 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   req->offset = cpu_to_le64(mo.offset);
   req->prot = cpu_to_le32(3); /* read-write: the host's GPU writes it */
 
-  ret = nvgpu_send_recv(ng->dev, req, sizeof(*req), resp, sizeof(*resp));
+  ret = nvgpu_send_recv_used(ng->dev, req, sizeof(*req), resp, sizeof(*resp),
+                             &used);
   if (ret < 0)
     goto out_free;
-  ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = nvgpu_resp_has(used, 0, sizeof(resp->hdr))
+            ? (s32)le32_to_cpu((__le32)resp->hdr.status)
+            : -EIO;
   if (ret < 0)
     goto out_free;
+  if (!nvgpu_resp_has(used, 0, sizeof(*resp))) {
+    ret = -EIO;
+    goto out_free;
+  }
 
   window_off = le64_to_cpu(resp->guest_phys_addr);
   if (window_off + obj->size > ng->dev->window.len) {
@@ -845,10 +839,15 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
  * `size` is what the core reports for the object and what it validates
  * framebuffer dimensions against, so it has to be at least the real buffer.
  * Page-aligned because the core rejects an object smaller than a page.
+ *
+ * The host handle is this function's from the moment it is called: every
+ * failure closes it exactly once. Callers used to close it again after a
+ * failed drm_gem_handle_create(), whose put had already freed the proxy and
+ * sent GEM_CLOSE -- and a second close of a number the host may have reused
+ * for a newer object closes that one.
  */
-static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
-                                  u32 host_handle, size_t size,
-                                  u32 *guest_handle) {
+int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
+                           u32 host_handle, size_t size, u32 *guest_handle) {
   struct nvgpu_gem_object *ng;
   int ret;
 
@@ -857,19 +856,24 @@ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
     size = PAGE_SIZE;
 
   ng = kzalloc(sizeof(*ng), GFP_KERNEL);
-  if (!ng)
+  if (!ng) {
+    nvgpu_gem_close(owner->dev, owner->handle, host_handle);
     return -ENOMEM;
+  }
 
   mutex_init(&ng->map_lock);
   drm_gem_private_object_init(file->minor->dev, &ng->base, size);
   ng->base.funcs = &nvgpu_gem_funcs;
-  ng->dev = nfd->dev;
-  ng->owner_handle = nfd->handle;
+  ng->dev = owner->dev;
+  nvgpu_fd_get(owner);
+  ng->owner = owner;
+  ng->owner_handle = owner->handle;
   ng->host_handle = host_handle;
   ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
 
   ret = drm_gem_handle_create(file, &ng->base, guest_handle);
-  /* The handle holds the only reference now, or nothing does and it is freed. */
+  /* The handle holds the only reference now, or nothing does and it is
+   * freed -- which closes the host handle and drops the owner. */
   drm_gem_object_put(&ng->base);
   return ret;
 }
@@ -879,8 +883,8 @@ static int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *nfd,
  * forward on. Fails for anything that is not one of our proxies rather than
  * forwarding a number that would name some unrelated host object.
  */
-static int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
-                             u32 *host_handle, u32 *owner_handle) {
+int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
+                      u32 *host_handle, u32 *owner_handle) {
   struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
   int ret = -ENOENT;
 
@@ -959,6 +963,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   int req_total, resp_max, ret;
   u32 fwd_handle = nfd->handle;
   u32 caller_handle = 0;
+  u32 used, data_len, nested_len;
 
   /*
    * The caller's struct has to be the one this descriptor describes, or the
@@ -1070,21 +1075,33 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
     }
   }
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  if (nvgpu_resp_has(used, 0, sizeof(*resp))) {
+    data_len = le32_to_cpu(resp->data_len);
+    nested_len = le32_to_cpu(resp->nested_len);
+  } else {
+    data_len = 0;
+    nested_len = 0;
+  }
 
   /*
    * The outer struct carries the answer: GEM_IMPORT writes the new handle
    * into it. Copied back even when the call failed, because the host's
    * failure may have written a field too, and the caller reads what the host
-   * driver would have left it.
+   * driver would have left it -- but only what the device actually wrote.
    */
-  if (le32_to_cpu(resp->data_len) &&
-      le32_to_cpu(resp->data_len) <= d->size) {
+  if (data_len && data_len <= d->size &&
+      nvgpu_resp_has(used, sizeof(*resp), data_len)) {
     u8 *out = resp_buf + sizeof(*resp);
 
     if (d->handle_offset != NVGPU_GEM_NO_FIELD && ret >= 0) {
@@ -1103,13 +1120,10 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
         if (d->size_field_offset != NVGPU_GEM_NO_FIELD)
           obj_size = get_unaligned_le64(out + d->size_field_offset);
 
+        /* A failure has closed the host handle already. */
         cret = nvgpu_gem_proxy_create(file, nfd, host_handle, (size_t)obj_size,
                                       &guest_handle);
         if (cret) {
-          struct nvgpu_drm_gem_close close = {.handle = host_handle};
-
-          nvgpu_ioctl_flat_h(nfd->dev, fwd_handle, DRM_IOCTL_GEM_CLOSE, &close,
-                             sizeof(close));
           ret = cret;
           goto out;
         }
@@ -1120,14 +1134,15 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       }
     }
 
-    if (copy_to_user(uarg, out, le32_to_cpu(resp->data_len)))
+    if (copy_to_user(uarg, out, data_len))
       ret = -EFAULT;
   }
 
-  if (user_nested && nested_size > 0 && le32_to_cpu(resp->nested_len) > 0) {
-    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+  if (user_nested && nested_size > 0 && nested_len > 0) {
+    u32 copy_back = min(nested_size, nested_len);
 
-    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + d->size,
+    if (nvgpu_resp_has(used, sizeof(*resp) + d->size, copy_back) &&
+        copy_to_user(user_nested, resp_buf + sizeof(*resp) + d->size,
                      copy_back))
       ret = -EFAULT;
   }
@@ -1173,6 +1188,8 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
 
   nfd->dev = dev;
   nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
+  /* The file's own reference; GEM proxies it owns add theirs. */
+  refcount_set(&nfd->ref, 1);
 
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req->device_type = cpu_to_le32(nfd->device_type);
@@ -1188,6 +1205,7 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   }
 
   nfd->handle = le32_to_cpu(resp->hdr.handle);
+  nfd->drm_file = file;
   nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
   kfree(req);
@@ -1201,25 +1219,61 @@ err:
   return ret;
 }
 
+/*
+ * The guest file is going: cut everything that could reach its drm_file.
+ *
+ * The core frees the drm_file right after postclose, and drains its event
+ * list well before that (drm_file_free(), drm_file.c:250 against :267), while
+ * the nvgpu_fd lives on for as long as GEM proxies need its render handle. So
+ * the back-pointer is cleared under the event registry lock -- after which no
+ * consumer can inject an event into this file -- and the KMS handle is closed
+ * now, not when the last proxy goes: host master, framebuffers and a lease
+ * have to end with the file, as they would on the host itself.
+ *
+ * Runs from our .release, before drm_release(). postclose calls it again for
+ * safety, and the second call finds nothing to do.
+ */
+static void nvgpu_drm_detach(struct nvgpu_fd *nfd) {
+  u32 kms;
+
+  if (!nvgpu_fd_detach_drm(nfd, &kms))
+    return;
+  nvgpu_fd_unregister(nfd->dev, nfd);
+  if (kms)
+    nvgpu_close_handle(nfd->dev, kms);
+}
+
+/*
+ * The render handle outlives the file if proxies still need it: the file's
+ * reference goes here, and the backend CLOSE with the last one.
+ * drm_gem_release() has already run (drm_file.c:261), so the proxies this
+ * file held handles to that nobody else references are gone by now.
+ */
 static void nvgpu_drm_postclose(struct drm_device *drm, struct drm_file *file) {
   struct nvgpu_fd *nfd = file->driver_priv;
-  struct nvgpu_msg_hdr *req, *resp;
 
   if (!nfd)
     return;
-
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
-  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (req && resp) {
-    req->msg_type = cpu_to_le32(NVGPU_MSG_CLOSE);
-    req->handle = cpu_to_le32(nfd->handle);
-    nvgpu_send_recv(nfd->dev, req, sizeof(*req), resp, sizeof(*resp));
-  }
-  kfree(req);
-  kfree(resp);
-  nvgpu_fd_unregister(nfd->dev, nfd);
-  kfree(nfd);
+  nvgpu_drm_detach(nfd);
   file->driver_priv = NULL;
+  nvgpu_fd_put(nfd);
+}
+
+static int nvgpu_drm_release(struct inode *inode, struct file *filp) {
+  struct drm_file *file = filp->private_data;
+
+  if (file && file->driver_priv)
+    nvgpu_drm_detach(file->driver_priv);
+  return drm_release(inode, filp);
+}
+
+struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
+  struct drm_file *file;
+
+  if (f->f_op != &nvgpu_drm_fops)
+    return NULL;
+  file = f->private_data;
+  return file ? file->driver_priv : NULL;
 }
 
 /*
@@ -1302,7 +1356,7 @@ static const struct file_operations nvgpu_drm_fops = {
     .fop_flags = FOP_UNSIGNED_OFFSET,
 #endif
     .open = drm_open,
-    .release = drm_release,
+    .release = nvgpu_drm_release,
     .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
     .compat_ioctl = nvgpu_drm_unlocked_ioctl,
     .mmap = drm_gem_mmap,
@@ -1311,8 +1365,18 @@ static const struct file_operations nvgpu_drm_fops = {
     .llseek = noop_llseek,
 };
 
+/*
+ * Every feature any device of ours may have. A device that cannot serve one
+ * has it cleared in its own drm_device.driver_features (nvgpu_dri_init()),
+ * which the core ANDs with these on every check (drm_drv.h,
+ * drm_core_check_all_features()) and which exists for exactly that: one
+ * shared driver, per-device limits. A per-device copy of this struct would
+ * work too, but the drm_device keeps a pointer to it and can outlive the
+ * nvgpu_device it would live in, since an open file holds the drm_device.
+ */
 static const struct drm_driver nvgpu_drm_driver = {
-    .driver_features = DRIVER_GEM | DRIVER_RENDER,
+    .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_SYNCOBJ |
+                       DRIVER_SYNCOBJ_TIMELINE,
     /* Without this, a buffer this node exported cannot be imported back. */
     .gem_prime_import = nvgpu_gem_prime_import,
     .open = nvgpu_drm_open,
@@ -1414,6 +1478,15 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
       continue;
     }
     drm->dev_private = dri;
+
+    /*
+     * Syncobjs only where the backend serves them. With the feature on, the
+     * core answers GET_CAP(SYNCOBJ) with 1 and creates guest-local syncobjs
+     * whose handles mean nothing on the host (drm_ioctl.c:250-253); with it
+     * off, every syncobj ioctl fails -EOPNOTSUPP, which is the truth.
+     */
+    if (!(dev->v2 && (dev->backend_caps & NVGPU_BCAP_FENCES)))
+      drm->driver_features &= ~(DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE);
 
     if (drm_dev_register(drm, 0) != 0) {
       dev_warn(&dev->vdev->dev, "virtio-gpu-nv: drm_dev_register %s failed\n",
