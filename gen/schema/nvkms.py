@@ -41,7 +41,8 @@ What is left out of every table, and so refused by both halves:
 Tegra syncpoint descriptors (FLIP/SET_MODE layers' pre and post fences) are
 left out of the layouts: a dGPU host refuses useSyncpt
 (nvkms-hw-flip.c:716-719), and the backend refuses it before the host does,
-so no descriptor ever sits there.
+so no descriptor ever sits there. (Both read useSyncpt only in a layer whose
+syncObjects.specified is set, which is why the layout carries that byte too.)
 """
 
 import json
@@ -326,7 +327,8 @@ def layout(d):
     flayer = find('FLIP', heads['fields'], 'flip.layer')
 
     sm = g('SET_MODE')
-    smd = find('SET_MODE', fields_of(sm), 'request.disp')
+    smf = fields_of(sm)
+    smd = find('SET_MODE', smf, 'request.disp')
     smh = find('SET_MODE', smd['fields'], 'head')
     sml = find('SET_MODE', smh['fields'], 'flip.layer')
 
@@ -354,15 +356,40 @@ def layout(d):
             'disp': arr(lpd),
             'heads': find('SET_LAYER_POSITION', lpd['fields'], 'requestedHeadsBitMask')['off'],
             'head': arr(find('SET_LAYER_POSITION', lpd['fields'], 'head'))},
+        # FLIP: which (sd, head) each pFlipHead element acts on -- NVKMS
+        # checks permission only for the layers a flip dirties
+        # (nvkms-flip.c nvCheckFlipPermissions), so a cursor-, HDR- or
+        # colorimetry-only element passes it on any head -- and per layer
+        # the bytes the policy vets: useSyncpt (read only where
+        # syncObjects.specified is set, nvkms-hw-flip.c:714-718) and
+        # completionNotifier.awaken (a FLIP_OCCURRED broadcast).
         'flip': {
+            'device': find('FLIP', ff, 'request.deviceHandle')['off'],
             'ptr': find('FLIP', ff, 'request.pFlipHead')['off'],
             'heads': find('FLIP', ff, 'request.numFlipHeads')['off'],
             'head_size': heads['size'],
+            'sd': find('FLIP', heads['fields'], 'sd')['off'],
+            'head': find('FLIP', heads['fields'], 'head')['off'],
             'layer': arr(flayer),
-            'use_syncpt': find('FLIP', flayer['fields'], 'syncObjects.val.useSyncpt')['off']},
+            'use_syncpt': find('FLIP', flayer['fields'], 'syncObjects.val.useSyncpt')['off'],
+            'sync_specified': find('FLIP', flayer['fields'], 'syncObjects.specified')['off'],
+            'awaken': find('FLIP', flayer['fields'], 'completionNotifier.val.awaken')['off']},
+        # SET_MODE: the heads a committed request touches and the dpys it
+        # puts on them, which NVKMS's ValidateRequest checks against the
+        # file's modeset permissions (nvkms-modeset.c:3940-3966), plus the
+        # same per-layer bytes as FLIP.
         'set_mode': {
-            'disp': arr(smd), 'head': arr(smh), 'layer': arr(sml),
-            'use_syncpt': find('SET_MODE', sml['fields'], 'syncObjects.val.useSyncpt')['off']},
+            'device': find('SET_MODE', smf, 'request.deviceHandle')['off'],
+            'commit': find('SET_MODE', smf, 'request.commit')['off'],
+            'disps': find('SET_MODE', smf, 'request.requestedDispsBitMask')['off'],
+            'disp': arr(smd),
+            'heads': find('SET_MODE', smd['fields'], 'requestedHeadsBitMask')['off'],
+            'head': arr(smh),
+            'dpys': find('SET_MODE', smh['fields'], 'dpyIdList')['off'],
+            'layer': arr(sml),
+            'use_syncpt': find('SET_MODE', sml['fields'], 'syncObjects.val.useSyncpt')['off'],
+            'sync_specified': find('SET_MODE', sml['fields'], 'syncObjects.specified')['off'],
+            'awaken': find('SET_MODE', sml['fields'], 'completionNotifier.val.awaken')['off']},
         'grant': dict(perms(g('GRANT_PERMISSIONS'), 'request'),
                       device=find('GRANT_PERMISSIONS', fields_of(g('GRANT_PERMISSIONS')),
                                   'request.deviceHandle')['off']),

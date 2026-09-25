@@ -827,12 +827,17 @@ def rs_layout(lo):
         (f'layer_position: NvkmsLayerPosition {{ device: {lp["device"]}, '
          f'disps: {lp["disps"]}, disp: {rs_arr(lp["disp"])}, '
          f'heads: {lp["heads"]}, head: {rs_arr(lp["head"])} }}'),
-        (f'flip: NvkmsFlipLayout {{ ptr: {fl["ptr"]}, heads: {fl["heads"]}, '
-         f'head_size: {fl["head_size"]}, layer: {rs_arr(fl["layer"])}, '
-         f'use_syncpt: {fl["use_syncpt"]} }}'),
-        (f'set_mode: NvkmsSetModeLayout {{ disp: {rs_arr(sm["disp"])}, '
-         f'head: {rs_arr(sm["head"])}, layer: {rs_arr(sm["layer"])}, '
-         f'use_syncpt: {sm["use_syncpt"]} }}'),
+        (f'flip: NvkmsFlipLayout {{ device: {fl["device"]}, ptr: {fl["ptr"]}, '
+         f'heads: {fl["heads"]}, head_size: {fl["head_size"]}, '
+         f'sd: {fl["sd"]}, head: {fl["head"]}, layer: {rs_arr(fl["layer"])}, '
+         f'use_syncpt: {fl["use_syncpt"]}, '
+         f'sync_specified: {fl["sync_specified"]}, awaken: {fl["awaken"]} }}'),
+        (f'set_mode: NvkmsSetModeLayout {{ device: {sm["device"]}, '
+         f'commit: {sm["commit"]}, disps: {sm["disps"]}, '
+         f'disp: {rs_arr(sm["disp"])}, heads: {sm["heads"]}, '
+         f'head: {rs_arr(sm["head"])}, dpys: {sm["dpys"]}, '
+         f'layer: {rs_arr(sm["layer"])}, use_syncpt: {sm["use_syncpt"]}, '
+         f'sync_specified: {sm["sync_specified"]}, awaken: {sm["awaken"]} }}'),
         f'grant: {rs_perms(lo["grant"])}',
         f'acquire: {rs_perms(lo["acquire"])}',
         f'revoke: {rs_perms(lo["revoke"])}',

@@ -447,25 +447,41 @@ pub struct NvkmsLayerPosition {
     pub head: Arr,
 }
 
-/// FLIP: pFlipHead, numFlipHeads, the size of one pFlipHead element, and
-/// within one the layers and each layer's useSyncpt (a byte).
+/// FLIP: deviceHandle, pFlipHead, numFlipHeads, the size of one pFlipHead
+/// element, and within one its `sd` and `head` (u32s), the layers, and each
+/// layer's useSyncpt, syncObjects.specified and completionNotifier.awaken
+/// (bytes, relative to the layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvkmsFlipLayout {
+    pub device: u32,
     pub ptr: u32,
     pub heads: u32,
     pub head_size: u32,
+    pub sd: u32,
+    pub head: u32,
     pub layer: Arr,
     pub use_syncpt: u32,
+    pub sync_specified: u32,
+    pub awaken: u32,
 }
 
-/// SET_MODE: disp[].head[].flip.layer[].syncObjects.val.useSyncpt, each
-/// array relative to its parent element.
+/// SET_MODE: deviceHandle, commit (a byte), requestedDispsBitMask, then
+/// disp[] (requestedHeadsBitMask), disp[].head[] (dpyIdList) and
+/// disp[].head[].flip.layer[] (the same three bytes as FLIP's), each array
+/// and field relative to its parent element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NvkmsSetModeLayout {
+    pub device: u32,
+    pub commit: u32,
+    pub disps: u32,
     pub disp: Arr,
+    pub heads: u32,
     pub head: Arr,
+    pub dpys: u32,
     pub layer: Arr,
     pub use_syncpt: u32,
+    pub sync_specified: u32,
+    pub awaken: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -939,11 +955,33 @@ mod tests {
                 }
             };
             let set_mode = lo.set_mode;
-            let last = set_mode.disp.at(set_mode.disp.count - 1)
+            let last_layer = set_mode.disp.at(set_mode.disp.count - 1)
                 + set_mode.head.at(set_mode.head.count - 1)
-                + set_mode.layer.at(set_mode.layer.count - 1)
-                + set_mode.use_syncpt as usize;
-            assert!(last < size("NVKMS_SET_MODE"), "{}", t.name);
+                + set_mode.layer.at(set_mode.layer.count - 1);
+            for byte in [
+                set_mode.use_syncpt,
+                set_mode.sync_specified,
+                set_mode.awaken,
+            ] {
+                assert!(
+                    last_layer + (byte as usize) < size("NVKMS_SET_MODE"),
+                    "{}",
+                    t.name
+                );
+                assert!(byte < set_mode.layer.stride, "{}", t.name);
+            }
+            // FLIP's per-layer bytes sit inside one pFlipHead element, as
+            // its sd and head do.
+            let flip = lo.flip;
+            let last_layer = flip.layer.at(flip.layer.count - 1);
+            for byte in [flip.use_syncpt, flip.sync_specified, flip.awaken] {
+                assert!(
+                    last_layer + (byte as usize) < flip.head_size as usize,
+                    "{}",
+                    t.name
+                );
+            }
+            assert!(flip.sd + 4 <= flip.head_size && flip.head + 4 <= flip.head_size);
             for &(off, len) in lo.dpy_dynamic_scrub {
                 assert!((off + len) as usize <= size("NVKMS_QUERY_DPY_DYNAMIC_DATA"));
             }
