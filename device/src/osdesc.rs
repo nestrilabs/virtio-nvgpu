@@ -1454,6 +1454,7 @@ impl OsDesc {
             self.release(id);
         }
         self.released.clear();
+        self.file_owners.clear();
     }
 
     /// The guest has read every release up to `ack`: forget those, and name
