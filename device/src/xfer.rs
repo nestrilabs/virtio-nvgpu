@@ -478,11 +478,14 @@ impl Prepared {
             let (handle, kind) = f.adopt(unsafe { OwnedFd::from_raw_fd(fd) });
             fd_recs.push([buf as u32, off as u32, handle, kind.wire()]);
         }
+        // The hook first, while every handle the call named is still open:
+        // a record it makes of one (an NVKMS grant file) is then dropped by
+        // that handle's close like any other, rather than outliving it.
+        let (hooks, ret) = (self.hooks.clone(), self.ret);
+        hooks.after(&mut self, ret);
         for h in std::mem::take(&mut self.consumed) {
             f.close_handle(h);
         }
-        let (hooks, ret) = (self.hooks.clone(), self.ret);
-        hooks.after(&mut self, ret);
         self.response(&fd_recs)
     }
 
@@ -526,6 +529,16 @@ impl Prepared {
     /// Handles standing in descriptor fields: (buffer, offset, handle).
     pub fn fd_in_handles(&self) -> impl Iterator<Item = (usize, usize, u32)> + '_ {
         self.fd_ins.iter().map(|r| (r.buf, r.off, r.handle))
+    }
+
+    /// The buffer the pointer at (`buf`, `off`) was given, if it got one
+    /// (it was non-NULL with a non-zero length). For policy hooks that look
+    /// past the argument, such as NVKMS FLIP's per-head array.
+    pub fn pointee(&self, buf: usize, off: usize) -> Option<usize> {
+        self.slots
+            .iter()
+            .find(|s| s.buf == buf && s.off == off && matches!(s.field.kind, Kind::Ptr { .. }))
+            .and_then(|s| s.target)
     }
 
     /// The most the response `finish` builds can take (exact unless the host
@@ -717,7 +730,7 @@ impl Walk<'_> {
         for (i, f) in fields.iter().enumerate() {
             if let Some(c) = f.cond {
                 let v = self.read(buf, base + c.off as usize, 4)? as u32;
-                if v & c.mask != c.value {
+                if !c.holds(v) {
                     continue;
                 }
             }
@@ -767,9 +780,21 @@ impl Walk<'_> {
                 Kind::Array {
                     count,
                     stride,
+                    limit,
                     children,
                 } => {
-                    for e in 0..count as usize {
+                    // Only the elements the kernel reads: a descriptor field
+                    // in one it never looks at is the caller's garbage, not
+                    // a descriptor (REGISTER_SURFACE's unused planes).
+                    let value = match limit {
+                        schema::Limit::All => 0,
+                        schema::Limit::Count { off, width } => {
+                            self.read(buf, base + off as usize, width as usize)?
+                        }
+                        schema::Limit::Planes { off } => self.read(buf, base + off as usize, 4)?,
+                    };
+                    let n = limit.elements(count, value, self.table.planes);
+                    for e in 0..n as usize {
                         self.list(buf, at + e * stride as usize, children, depth + 1)?;
                     }
                 }
@@ -2182,6 +2207,8 @@ mod tests {
             versions: None,
             ioctls: &IOCTLS,
             fields: &FIELDS,
+            planes: &[],
+            nvkms: None,
         };
         let mut a = vec![1u8; 48];
         wr(&mut a, 40, 4, 1 << 20);
@@ -2858,7 +2885,8 @@ mod tests {
         assert_eq!(rd(&r.data, 12, 4), 0x5555);
         let wrong_size = nvkms(3, 40).buf(40, Some(&[0; 40]));
         assert_eq!(modeset(&h, &wrong_size).err(), Some(libc::EINVAL));
-        let unknown = nvkms(9, 44).buf(44, Some(&params));
+        // 35 has no dispatch entry in any release, so no table has it.
+        let unknown = nvkms(35, 44).buf(44, Some(&params));
         assert_eq!(modeset(&h, &unknown).err(), Some(libc::ENOTTY));
         let mut not_nvkms = rq.clone();
         not_nvkms.cmd = iowr(0, 16);

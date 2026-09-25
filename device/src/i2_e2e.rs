@@ -157,7 +157,9 @@ struct Guest {
 }
 
 impl Guest {
-    /// nvgpu_i2_gather, for a DRM-table call of `class` (call->sclass).
+    /// nvgpu_i2_gather, for a call of `class` (call->sclass): a DRM-table
+    /// one, or an NVKMS one against `modeset` (dev->schema->modeset), keyed
+    /// by the command in the outer struct's first bytes.
     fn gather(
         mem: &mut UserMem,
         class: schema::Class,
@@ -166,11 +168,36 @@ impl Guest {
         cmd: u32,
         uarg: u64,
     ) -> Result<Self, i32> {
-        let table = schema::DRM_TABLE;
-        let e = table.lookup(class, cmd).ok_or(libc::ENOTTY)?;
-        if e.cmd != cmd {
-            return Err(libc::EINVAL);
-        }
+        Self::gather_in(mem, class, None, handle, render, cmd, uarg)
+    }
+
+    fn gather_in(
+        mem: &mut UserMem,
+        class: schema::Class,
+        modeset: Option<&'static Table>,
+        handle: u32,
+        render: u32,
+        cmd: u32,
+        uarg: u64,
+    ) -> Result<Self, i32> {
+        let (table, e) = if class == schema::Class::Modeset {
+            if cmd != schema::NVKMS_IOCTL_IOWR {
+                return Err(libc::ENOTTY);
+            }
+            let t = modeset.ok_or(libc::ENOTTY)?;
+            let prefix = mem.read(uarg, 4)?;
+            let e = t
+                .lookup_nvkms(rd(&prefix, 0, 4) as u32)
+                .ok_or(libc::ENOTTY)?;
+            (t, e)
+        } else {
+            let table = schema::DRM_TABLE;
+            let e = table.lookup(class, cmd).ok_or(libc::ENOTTY)?;
+            if e.cmd != cmd {
+                return Err(libc::EINVAL);
+            }
+            (table, e)
+        };
         let mut g = Guest {
             table,
             e,
@@ -196,6 +223,10 @@ impl Guest {
         }
         if cmd & (1 << 31) != 0 {
             dir |= OUT; // _IOC_READ
+        }
+        // NVKMS never writes the outer struct.
+        if class == schema::Class::Modeset {
+            dir = IN;
         }
         // _IOC_SIZE
         g.new_buf(mem, u64::from((cmd >> 16) & 0x3fff), dir, uarg)?;
@@ -307,7 +338,7 @@ impl Guest {
         for (i, f) in fields.iter().enumerate() {
             if let Some(c) = f.cond {
                 let v = self.rd(b, base + c.off as usize, 4)? as u32;
-                if v & c.mask != c.value {
+                if !c.holds(v) {
                     continue;
                 }
             }
@@ -361,9 +392,18 @@ impl Guest {
                 Kind::Array {
                     count,
                     stride,
+                    limit,
                     children,
                 } => {
-                    for e in 0..count as usize {
+                    let v = match limit {
+                        schema::Limit::All => 0,
+                        schema::Limit::Count { off, width } => {
+                            self.rd(b, base + off as usize, width as usize)?
+                        }
+                        schema::Limit::Planes { off } => self.rd(b, base + off as usize, 4)?,
+                    };
+                    let n = limit.elements(count, v, self.table.planes);
+                    for e in 0..n as usize {
                         self.walk(mem, b, at + e * stride as usize, children, depth + 1)?;
                     }
                 }
@@ -624,7 +664,8 @@ impl Guest {
                 let left = match copyback {
                     CopyBack::Partial { off, width, .. }
                     | CopyBack::AllOrNothing { off, width, .. }
-                    | CopyBack::Exact { off, width } => {
+                    | CopyBack::Exact { off, width }
+                    | CopyBack::Written { off, width } => {
                         let p = &self.bufs[kb.parent].k;
                         rd(p, kb.pbase + off as usize, width as usize)
                     }
@@ -654,6 +695,8 @@ struct Kernel {
     calls: Vec<(String, u32)>,
     /// What CREATE_LEASE hands back as the new descriptor, if not a fresh one.
     lease_fd: Option<RawFd>,
+    /// NVKMS commands that reached the host, in order.
+    nvkms: Vec<u32>,
     fbs: Vec<(u32, u32)>,
     /// The timeout_nsec a SYNCOBJ_WAIT reached the host with.
     wait_timeout: Option<i64>,
@@ -691,6 +734,8 @@ const CREATE_LEASE: u32 = 0xc018_64c6;
 const GRANT: u32 = 0xc00c_6452;
 const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
 const SYNCOBJ_EVENTFD: u32 = 0xc018_64cf;
+const NVKMS: u32 = schema::NVKMS_IOCTL_IOWR;
+const LUT: usize = 6144;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 
 impl Sys for Fake {
@@ -809,14 +854,84 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
             }
             ("e2e-kms", GRANT) => {
                 let fd = peek(arg, 0, 4) as i32;
-                assert_eq!(
-                    file_of(fd),
-                    "e2e-modeset",
+                assert!(
+                    file_of(fd).starts_with("e2e-modeset"),
                     "the modeset file, by our number"
                 );
                 0
             }
+            ("e2e-modeset", NVKMS) => nvkms_ioctl(k, arg),
             _ => -libc::ENOTTY,
+        }
+    }
+}
+
+/// NVKMS 610.57.04 as the tests use it (offsets: gen/nvkms/610.57.04.json).
+/// Every failure is -EPERM, with the reply half written all the same
+/// (nvidia-modeset-linux.c:1539, nvkms.c:5220-5243).
+unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
+    unsafe {
+        let (cmd, size) = (peek(arg, 0, 4) as u32, peek(arg, 4, 4) as u32);
+        let p = peek(arg, 8, 8) as *mut u8;
+        k.nvkms.push(cmd);
+        match (cmd, size) {
+            // ALLOC_DEVICE: deviceHandle 1, disp 0 is 0x100.
+            (0, 1440) => {
+                poke(p, 628, 4, 1);
+                poke(p, 644, 4, 0x100);
+                0
+            }
+            // VALIDATE_MODE: five bytes of pInfoString, and a failure.
+            (8, 656) => {
+                let s = peek(p, 296, 8) as *mut u8;
+                assert!(!s.is_null(), "a buffer of infoStringSize bytes");
+                std::ptr::copy_nonoverlapping(b"hello".as_ptr(), s, 5);
+                poke(p, 456, 4, 5);
+                -libc::EPERM
+            }
+            (11, 20) => 0, // MOVE_CURSOR
+            // FLIP: two heads, head 0 with an input LUT, head 1 with an
+            // output one; refused, with a flipResult.
+            (15, 3104) => {
+                let heads = peek(p, 8, 8) as *const u8;
+                assert_eq!(peek(p, 16, 4), 2);
+                assert_eq!(peek(heads, 4, 4), 5, "head 0's head");
+                assert_eq!(peek(heads, 4952 + 4, 4), 6, "head 1's head");
+                let in0 = peek(heads, 88, 8) as *const u8;
+                let out1 = peek(heads, 4952 + 104, 8) as *const u8;
+                assert_eq!((peek(heads, 104, 8), peek(heads, 4952 + 88, 8)), (0, 0));
+                assert_eq!((*in0, *in0.add(LUT - 1)), (0x11, 0x11));
+                assert_eq!((*out1, *out1.add(LUT - 1)), (0x22, 0x22));
+                poke(p, 28, 4, 0x77);
+                -libc::EPERM
+            }
+            // REGISTER_SURFACE: format 19 (Y8___U8V8_N420) has two planes,
+            // so two descriptors of ours and the third as the caller left it.
+            (17, 152) => {
+                // useFd == FALSE names RM handles, which a user client may
+                // not (nvkms.c:2727-2730).
+                if peek(p, 4, 1) == 0 {
+                    return -libc::EPERM;
+                }
+                for plane in [16, 48] {
+                    let fd = peek(p, plane, 4) as i32;
+                    assert_eq!(file_of(fd), "e2e-ctl", "plane at {plane}");
+                }
+                assert_eq!(peek(p, 80, 4), 0, "the unused third plane");
+                poke(p, 144, 4, 0x55);
+                0
+            }
+            // ACQUIRE_PERMISSIONS of a grant file: MODESET on head 1 for
+            // dpy bit 3.
+            (41, 28) => {
+                let fd = peek(p, 0, 4) as i32;
+                assert_eq!(file_of(fd), "e2e-modeset-grant");
+                poke(p, 4, 4, 1);
+                poke(p, 8, 4, 2);
+                poke(p, 12 + 4, 4, 1 << 3);
+                0
+            }
+            _ => -libc::EPERM,
         }
     }
 }
@@ -879,7 +994,27 @@ impl World {
         uarg: u64,
         short: usize,
     ) -> Result<i32, i32> {
-        let mut g = Guest::gather(&mut self.mem, class, target, self.render, cmd, uarg)?;
+        let g = Guest::gather(&mut self.mem, class, target, self.render, cmd, uarg)?;
+        self.send(g, short)
+    }
+
+    /// An NVKMS ioctl on `target` (nvgpu_nvkms.c: render 0, the table the
+    /// host version selects), its NvKmsIoctlParams at `uarg`.
+    fn nvkms(&mut self, target: u32, uarg: u64) -> Result<i32, i32> {
+        let table = self.be.driver.and_then(schema::modeset_table);
+        let g = Guest::gather_in(
+            &mut self.mem,
+            schema::Class::Modeset,
+            table,
+            target,
+            0,
+            NVKMS,
+            uarg,
+        )?;
+        self.send(g, 0)
+    }
+
+    fn send(&mut self, mut g: Guest, short: usize) -> Result<i32, i32> {
         g.translate(&self.hooks)?;
         let req = g.build();
         let cap = g.resp_len() - short;
@@ -1151,4 +1286,217 @@ fn a_syncobj_wait_reaches_the_host_as_a_poll_and_an_eventfd_never_does() {
         Err(libc::EPERM)
     );
     assert!(w.calls().is_empty());
+}
+
+// ───────────────────────────── NVKMS ─────────────────────────────
+
+/// NvKmsIoctlParams at 0x1000 for `cmd`, its params block of `size` bytes
+/// at 0x2000.
+fn nvkms_call(w: &mut World, cmd: u32, params: &[u8]) {
+    let mut outer = vec![0u8; 16];
+    wr(&mut outer, 0, 4, u64::from(cmd));
+    wr(&mut outer, 4, 4, params.len() as u64);
+    wr(&mut outer, 8, 8, 0x2000);
+    w.mem.put(0x1000, &outer);
+    w.mem.put(0x2000, params);
+}
+
+fn nvkms_world() -> World {
+    let mut w = world();
+    w.be.set_host_driver_version("610.57.04");
+    w
+}
+
+#[test]
+fn a_flip_carries_its_heads_and_their_luts_and_a_refusal_still_brings_the_reply_back() {
+    let mut w = nvkms_world();
+    let mut params = vec![0u8; 3104];
+    wr(&mut params, 0, 4, 1); // deviceHandle
+    wr(&mut params, 8, 8, 0x3000); // pFlipHead
+    wr(&mut params, 16, 4, 2); // numFlipHeads
+    wr(&mut params, 28, 4, 0xdead); // reply.flipResult, as the caller left it
+    nvkms_call(&mut w, 15, &params);
+    let mut heads = vec![0u8; 2 * 4952];
+    wr(&mut heads, 4, 4, 5);
+    wr(&mut heads, 4952 + 4, 4, 6);
+    wr(&mut heads, 88, 8, 0x5000); // head 0: flip.lut.input.pRamps
+    wr(&mut heads, 4952 + 104, 8, 0x6000); // head 1: flip.lut.output.pRamps
+    w.mem.put(0x3000, &heads);
+    w.mem.put(0x5000, &[0x11; LUT]);
+    w.mem.put(0x6000, &[0x22; LUT]);
+    let modeset = w.modeset;
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(-libc::EPERM));
+    assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![15]);
+    let p = w.mem.get(0x2000);
+    assert_eq!(rd(p, 28, 4), 0x77, "the reply half, even on -EPERM");
+    assert_eq!(rd(p, 8, 8), 0x3000, "the request half is the caller's");
+    assert_eq!(rd(w.mem.get(0x1000), 8, 8), 0x2000);
+}
+
+#[test]
+fn a_flip_asking_for_a_tegra_syncpoint_never_reaches_the_host() {
+    let mut w = nvkms_world();
+    let mut params = vec![0u8; 3104];
+    wr(&mut params, 8, 8, 0x3000);
+    wr(&mut params, 16, 4, 1);
+    nvkms_call(&mut w, 15, &params);
+    let mut heads = vec![0u8; 4952];
+    // flip.layer[2].syncObjects.val.useSyncpt: layer array @216, stride 592.
+    heads[216 + 2 * 592 + 60] = 1;
+    w.mem.put(0x3000, &heads);
+    let modeset = w.modeset;
+    assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
+    assert!(w.fake.0.lock().unwrap().nvkms.is_empty());
+}
+
+#[test]
+fn register_surface_translates_exactly_the_planes_its_format_has() {
+    let mut w = nvkms_world();
+    let ctl =
+        w.be.adopt_for_test(memfd(c"e2e-ctl"), HandleKind::Dev(DeviceKind::Ctl));
+    let mut params = vec![0u8; 152];
+    wr(&mut params, 4, 4, 0xff02); // useFd = 2, and padding the kernel ignores
+    wr(&mut params, 16, 4, 7); // planes[0].u.fd: the caller's fd 7
+    wr(&mut params, 48, 4, 8); // planes[1]
+    wr(&mut params, 124, 4, 19); // format: two planes
+    nvkms_call(&mut w, 17, &params);
+    w.hooks.fds.insert(7, (ctl, 0));
+    w.hooks.fds.insert(8, (ctl, 0));
+    let modeset = w.modeset;
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0));
+    let p = w.mem.get(0x2000);
+    assert_eq!(rd(p, 144, 4), 0x55, "surfaceHandle");
+    assert_eq!((rd(p, 16, 4), rd(p, 48, 4)), (7, 8), "the caller's own fds");
+    // useFd = 0: no descriptors at all, whatever the planes hold (the
+    // guest has none of these fds now), and NVKMS refuses the call itself.
+    wr(&mut params, 4, 4, 0xff00);
+    nvkms_call(&mut w, 17, &params);
+    w.hooks.fds.clear();
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(-libc::EPERM));
+}
+
+#[test]
+fn validate_mode_copies_back_only_the_bytes_nvkms_wrote() {
+    let mut w = nvkms_world();
+    let mut params = vec![0u8; 656];
+    wr(&mut params, 288, 4, 64); // infoStringSize
+    wr(&mut params, 296, 8, 0x4000); // pInfoString
+    nvkms_call(&mut w, 8, &params);
+    w.mem.put(0x4000, &[0xee; 64]);
+    let modeset = w.modeset;
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(-libc::EPERM));
+    let s = w.mem.get(0x4000);
+    assert_eq!(&s[..5], b"hello");
+    assert!(
+        s[5..].iter().all(|&b| b == 0xee),
+        "nothing past infoStringLenWritten"
+    );
+    assert_eq!(rd(w.mem.get(0x2000), 456, 4), 5);
+}
+
+#[test]
+fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes() {
+    let mut w = nvkms_world();
+    let grant = w.be.adopt_for_test(
+        memfd(c"e2e-modeset-grant"),
+        HandleKind::Dev(DeviceKind::Modeset),
+    );
+    let (kms, modeset) = (w.kms, w.modeset);
+    nvkms_call(&mut w, 0, &[0u8; 1440]);
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ALLOC_DEVICE");
+
+    // Before any grant, MOVE_CURSOR on head 1 is refused by the backend.
+    let cursor = |head: u64| {
+        let mut c = vec![0u8; 20];
+        wr(&mut c, 0, 4, 1);
+        wr(&mut c, 4, 4, 0x100);
+        wr(&mut c, 8, 4, head);
+        c
+    };
+    nvkms_call(&mut w, 11, &cursor(1));
+    assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
+
+    // The modeset file, by now typed, is no grant file.
+    let mut g = vec![0u8; 12];
+    wr(&mut g, 0, 4, 5);
+    wr(&mut g, 4, 4, 1 << 3);
+    wr(&mut g, 8, 4, 2);
+    w.mem.put(0x5000, &g);
+    w.hooks.fds.insert(5, (modeset, 0));
+    assert_eq!(w.call(kms, GRANT, 0x5000, 0), Err(libc::EPERM));
+    // A fresh one is.
+    w.hooks.fds.insert(5, (grant, 0));
+    assert_eq!(w.call(kms, GRANT, 0x5000, 0), Ok(0));
+
+    let mut acq = vec![0u8; 28];
+    wr(&mut acq, 0, 4, 5);
+    nvkms_call(&mut w, 41, &acq);
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ACQUIRE_PERMISSIONS");
+    nvkms_call(&mut w, 11, &cursor(1));
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "head 1 is granted");
+    nvkms_call(&mut w, 11, &cursor(0));
+    assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM), "head 0 is not");
+
+    // The lease file closes: nvidia-drm revokes what it granted.
+    w.be.close_handle(kms).unwrap();
+    nvkms_call(&mut w, 11, &cursor(1));
+    assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
+    assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 41, 11]);
+}
+
+#[test]
+fn nvkms_through_v1_takes_only_flat_commands_and_never_a_descriptor() {
+    let mut w = nvkms_world();
+    let modeset = w.modeset;
+    // A v1 IOCTL: nvgpu_ioctl_req {cmd, data_len, nested_offset, nested_len,
+    // deep_ptr_offset, deep_len} then the outer struct and the params.
+    let v1 = |cmd: u32, size: usize| {
+        let mut m = Vec::new();
+        for v in [MsgType::Ioctl as u32, modeset, 0, 0x99] {
+            m.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [NVKMS, 16, 16, size as u32, 0, 0] {
+            m.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut outer = vec![0u8; 16];
+        wr(&mut outer, 0, 4, u64::from(cmd));
+        wr(&mut outer, 4, 4, size as u64);
+        m.extend_from_slice(&outer);
+        m.resize(m.len() + size, 0);
+        m
+    };
+    let status = |w: &mut World, m: &[u8]| {
+        let mut resp = vec![0u8; 4096];
+        assert!(w.be.dispatch(m, &mut resp) >= 16);
+        i32::from_le_bytes(resp[8..12].try_into().unwrap())
+    };
+    // REGISTER_SURFACE (fds) and FLIP (pointers) need IOCTL2.
+    assert_eq!(status(&mut w, &v1(17, 152)), -libc::EPERM);
+    assert_eq!(status(&mut w, &v1(15, 3104)), -libc::EPERM);
+    // So does anything whose size is not the command's.
+    assert_eq!(status(&mut w, &v1(3, 40)), -libc::EINVAL);
+    assert!(!w.be.nvkms.is_typed(modeset), "nothing reached the host");
+    // A flat query goes (and the memfd answers ENOTTY, as a host would not).
+    assert_ne!(status(&mut w, &v1(3, 44)), -libc::EPERM);
+    assert!(w.be.nvkms.is_typed(modeset));
+}
+
+#[test]
+fn a_vm_holds_only_so_many_modeset_files() {
+    let mut w = world();
+    let mut have = 1; // world()'s own
+    while have < crate::nvkms::MAX_MODESET_OPENS {
+        w.be.adopt_for_test(memfd(c"e2e-modeset"), HandleKind::Dev(DeviceKind::Modeset));
+        have += 1;
+    }
+    let mut m = Vec::new();
+    for v in [MsgType::Open as u32, 0, 0, 0x98, DEV_MODESET, 0] {
+        m.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut resp = vec![0u8; 64];
+    w.be.dispatch(&m, &mut resp);
+    assert_eq!(
+        i32::from_le_bytes(resp[8..12].try_into().unwrap()),
+        -libc::EMFILE
+    );
 }

@@ -12,7 +12,8 @@ Both walks are the *canonical traversal*:
   PTR field whose value is non-zero and whose length is non-zero gets the next
   buffer, and the fields of what it points at (element by element) are walked
   before the next field of its parent. ARRAY fields are inline and are walked
-  element by element in place. A NULL or zero-length pointer contributes no
+  element by element in place -- only as many elements as the array's
+  `limit` says the kernel reads. A NULL or zero-length pointer contributes no
   buffer, and the backend hands the host NULL for it.
 
 Lengths are read from the IN bytes of the enclosing buffer, which are also
@@ -74,6 +75,10 @@ POL_FB_READ = 1 << 5        # GEM_OUT handles only for the file's own FBs
 POL_SETPROP = 1 << 6        # legacy property set: no fd/pointer properties
 POL_FB_PLANES = 1 << 7      # ADDFB2: plane count from pixel_format
 POL_NVKMS = 1 << 8          # NVKMS command; the NVKMS hook decides
+# NVKMS: the command's layout differs in the next release we measured, so a
+# host between the two may have either; run it only on a host of exactly the
+# table's release (the NVKMS hook checks).
+POL_NVKMS_EXACT = 1 << 9
 
 
 def ioc(d, t, nr, size):
@@ -86,7 +91,10 @@ def ioc(d, t, nr, size):
 
 @dataclass
 class Cond:
-    """A field that exists only when (u32 at `off` & mask) == value.
+    """A field that exists only when (u32 at `off` & mask) == value, or with
+    `ne`, != value: NVKMS's NvBool flags are one byte the kernel tests for
+    non-zero (`if (pRequest->useFd)`), so a caller's 2 must count as true
+    here too, or a descriptor the kernel reads would cross untranslated.
 
     `off` is in the same struct as the field; `name` is the C member it
     reads, for the offset probe."""
@@ -94,6 +102,11 @@ class Cond:
     off: int
     mask: int
     value: int
+    ne: bool = False
+
+    def holds(self, v):
+        return ((v & self.mask) != self.value) if self.ne else \
+            ((v & self.mask) == self.value)
 
 
 # ── Length rules ──
@@ -181,6 +194,17 @@ class Exact:
 
 
 @dataclass
+class Written:
+    """Bytes [0, n), always, n being the `width`-byte field at `off` of the
+    pointer's struct as the host left it: NVKMS's pInfoString, which
+    InfoStringDoneUserCommon copies out infoStringLenWritten bytes of
+    whether or not the command succeeded (nvkms.c:1920-1945, 5220-5229)."""
+    name: str
+    off: int
+    width: int
+
+
+@dataclass
 class Range:
     """Bytes [off, off+len), always: NVKMS copies its reply half out even
     when the command failed."""
@@ -207,8 +231,31 @@ class Ptr:
 
 
 @dataclass
+class ArrayCount:
+    """Only the first min(count, n) elements are the kernel's, n being the
+    `width`-byte field at `off` of the enclosing struct (JOIN_SWAP_GROUP's
+    numMembers)."""
+    name: str
+    off: int
+    width: int
+
+
+@dataclass
+class ArrayPlanes:
+    """Only the first numPlanes(format) elements are the kernel's, format
+    being the u32 at `off` of the enclosing struct and numPlanes the
+    table's own format list (REGISTER_SURFACE's planes, nvkms-surface.c
+    reads [0, numPlanes)); a format the table does not know has none."""
+    name: str
+    off: int
+
+
+@dataclass
 class Array:
-    """An inline array of structs inside the enclosing buffer."""
+    """An inline array of structs inside the enclosing buffer. Every element
+    is walked unless `limit` (ArrayCount / ArrayPlanes) says fewer are the
+    kernel's: a descriptor in an element the kernel never reads must not
+    have to be one."""
     name: str
     off: int
     count: int
@@ -216,6 +263,7 @@ class Array:
     elem_struct: Optional[str] = None
     fields: list = field(default_factory=list)
     cond: Optional[Cond] = None
+    limit: object = None
 
 
 @dataclass
@@ -309,3 +357,8 @@ class ModesetTable:
     # Include path (relative to an open-gpu-kernel-modules tree) for the probe.
     probe_includes: list = field(default_factory=list)
     probe_headers: list = field(default_factory=list)
+    # numPlanes by NvKmsSurfaceMemoryFormat value (ArrayPlanes).
+    planes: list = field(default_factory=list)
+    # What the backend's NVKMS policy reads and rewrites, for the Rust
+    # tables only: {field name: value}, see NvkmsLayout in gen/src/schema.
+    layout: Optional[dict] = None

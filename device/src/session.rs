@@ -568,10 +568,15 @@ impl NvidiaBackend {
         }
         let target = self.current_handle;
         let kind = self.handles.kind(target).ok_or(libc::EBADF)?;
-        if !matches!(
-            self.handles.kind(req.render),
-            Some(HandleKind::DriRender(_))
-        ) {
+        // An NVKMS call makes no GEM handle, so it has no render file to
+        // put one in, and a guest modeset file has none to name: 0 there.
+        let nvkms_without_render = kind == HandleKind::Dev(DeviceKind::Modeset) && req.render == 0;
+        if !nvkms_without_render
+            && !matches!(
+                self.handles.kind(req.render),
+                Some(HandleKind::DriRender(_))
+            )
+        {
             log::warn!(
                 "IOCTL2 {:#x}: render field {} is not a render handle",
                 req.cmd,

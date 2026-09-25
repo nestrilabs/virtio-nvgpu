@@ -410,6 +410,15 @@ int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
 struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
                                           u32 guest_handle);
 
+/* ───────── nvgpu_nvkms.c ───────── */
+
+/* /dev/nvidia-modeset on a v2 device: NVKMS through IOCTL2, and the
+ * readiness NVKMS keeps until GET_NEXT_EVENT/CLEAR_UNICAST_EVENT. */
+long nvgpu_nvkms_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
+                       void __user *uarg);
+__poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,
+                          struct poll_table_struct *wait);
+
 /* ───────── nvgpu_hostfile.c ───────── */
 
 /* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */

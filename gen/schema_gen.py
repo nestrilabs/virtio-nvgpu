@@ -60,7 +60,7 @@ MAX_LIST = 32
 NVKMS_IOCTL_IOWR = ioc(IOWR, 'm', 0, 16)
 
 # NVGPU_SFF_* in the C header.
-FF_COND, FF_VALIDATE = 1, 2
+FF_COND, FF_VALIDATE, FF_COND_NE = 1, 2, 4
 
 
 class SchemaError(Exception):
@@ -97,27 +97,37 @@ def span_of(f):
 
 class Io:
     """What the enclosing buffer carries: bytes the caller sends (IN) and
-    bytes the host writes back (OUT)."""
+    bytes the host writes back (OUT); `planes`, whether the table has a
+    format list for ArrayPlanes."""
 
-    def __init__(self, size, has_in, has_out, where):
+    def __init__(self, size, has_in, has_out, where, planes=False):
         self.size = size
         self.has_in = has_in
         self.has_out = has_out
         self.where = where
+        self.planes = planes
 
 
-def check_ref(io, where, what, off, width):
-    if width not in (4, 8):
-        fail(where, f'{what}: width {width} is not 4 or 8')
+def check_ref(io, where, what, off, width, widths=(4, 8)):
+    if width not in widths:
+        fail(where, f'{what}: width {width} is not one of {widths}')
     if off < 0 or off + width > io.size:
         fail(where, f'{what} at {off}+{width} is outside the {io.size}-byte '
              'struct')
 
 
 def exclusive(a, b):
-    return (a.cond is not None and b.cond is not None
-            and a.cond.off == b.cond.off and a.cond.mask == b.cond.mask
-            and a.cond.value != b.cond.value)
+    """No value of the word both conditions read makes both hold."""
+    if a.cond is None or b.cond is None:
+        return False
+    x, y = a.cond, b.cond
+    if x.off != y.off or x.mask != y.mask:
+        return False
+    if x.ne and y.ne:
+        return False
+    if x.ne or y.ne:
+        return x.value == y.value
+    return x.value != y.value
 
 
 def check_list(fields, io, where, root_modeset=False):
@@ -142,7 +152,22 @@ def check_list(fields, io, where, root_modeset=False):
         elif isinstance(a, Array):
             if a.count <= 0 or a.stride <= 0:
                 fail(fw, 'an array needs a count and a stride')
-            check_list(a.fields, Io(a.stride, io.has_in, io.has_out, fw), fw)
+            lim = a.limit
+            if isinstance(lim, ArrayCount):
+                if not io.has_in:
+                    fail(fw, 'an array limit must be read from bytes the '
+                         'caller sends')
+                check_ref(io, fw, f'limit {lim.name!r}', lim.off, lim.width,
+                          (1, 2, 4, 8))
+            elif isinstance(lim, ArrayPlanes):
+                if not io.has_in or not io.planes:
+                    fail(fw, 'a plane-count limit needs the table\'s formats '
+                         'and bytes the caller sends')
+                check_ref(io, fw, f'format {lim.name!r}', lim.off, 4)
+            elif lim is not None:
+                fail(fw, f'unknown array limit {lim!r}')
+            check_list(a.fields, Io(a.stride, io.has_in, io.has_out, fw,
+                                    io.planes), fw)
         elif isinstance(a, FdIn):
             if a.width not in (4, 8) or not a.kinds or not io.has_in:
                 fail(fw, 'FdIn needs width 4/8, kinds, and an IN buffer')
@@ -169,7 +194,8 @@ def check_ptr(p, before, io, where, root_modeset):
     elif isinstance(ln, Count):
         if not io.has_in:
             fail(where, 'a count must be read from bytes the caller sends')
-        check_ref(io, where, f'count {ln.name!r}', ln.off, ln.width)
+        check_ref(io, where, f'count {ln.name!r}', ln.off, ln.width,
+                  (1, 2, 4, 8))
         if ln.elem <= 0:
             fail(where, 'count element size must be positive')
     elif isinstance(ln, Sum):
@@ -202,6 +228,11 @@ def check_ptr(p, before, io, where, root_modeset):
         elif isinstance(cb, Range):
             if cb.off < 0 or cb.len <= 0 or cb.off + cb.len > p.max:
                 fail(where, 'copy-back range outside the buffer')
+        elif isinstance(cb, Written):
+            if not io.has_out:
+                fail(where, 'a written count must be one the host returns')
+            check_ref(io, where, f'written count {cb.name!r}', cb.off,
+                      cb.width)
         elif not isinstance(cb, Full):
             fail(where, f'unknown copy-back rule {cb!r}')
 
@@ -211,7 +242,7 @@ def check_ptr(p, before, io, where, root_modeset):
         if p.stride <= 0:
             fail(where, 'a pointer with fields needs a stride')
         check_list(p.fields, Io(p.stride, bool(p.dir & IN),
-                                bool(p.dir & OUT), where), where)
+                                bool(p.dir & OUT), where, io.planes), where)
 
 
 def root_io(e):
@@ -225,6 +256,8 @@ class Table:
         self.name = name
         self.versions = versions
         self.entries = entries  # list of (Ioctl-like, root fields)
+        self.planes = []
+        self.layout = None
         self.flat = []
         self.roots = []
         for e, fields in entries:
@@ -273,7 +306,10 @@ def build():
            + nvidia_drm.RENDER_IOCTLS)
     seen = {}
     for e in drm:
-        key = (e.cls, e.type, e.nr)
+        # One number may have two layouts, told apart by the size its
+        # ioctl number carries (nvidia-drm's GRANT_PERMISSIONS before and
+        # after it grew a type); lookups prefer the exact number.
+        key = (e.cls, e.type, e.nr, e.size)
         if key in seen:
             fail(e.name, f'same key as {seen[key]}')
         seen[key] = e.name
@@ -295,12 +331,21 @@ def build():
                 fail(m.name, 'reply half outside the params block')
             e = ModesetEntry(m)
             root = modeset_root(m)
-            check_list(root, Io(16, True, False, e.name), e.name,
-                       root_modeset=True)
+            check_list(root, Io(16, True, False, e.name, bool(t.planes)),
+                       e.name, root_modeset=True)
             entries.append((e, root))
         if t.vmin > t.vmax:
             fail(t.name, 'empty version range')
-        tables.append(Table(t.name, (t.vmin, t.vmax), entries))
+        if any(n > 3 for n in t.planes):
+            fail(t.name, 'a format with more planes than a surface has')
+        tb = Table(t.name, (t.vmin, t.vmax), entries)
+        tb.planes = t.planes
+        tb.layout = t.layout
+        tables.append(tb)
+    ranges = sorted(t.versions for t in tables[1:])
+    for (_, hi), (lo, _) in zip(ranges, ranges[1:]):
+        if lo <= hi:
+            fail('nvkms', f'version ranges overlap at {lo}')
     return tables
 
 
@@ -340,12 +385,16 @@ C_PREAMBLE = '''\
 /* Field flags. */
 #define NVGPU_SFF_COND (1u << 0)            /* present only if cond holds */
 #define NVGPU_SFF_VALIDATE_NVKMS (1u << 1)  /* GEM_IN: backend IDENTIFYs  */
+#define NVGPU_SFF_COND_NE (1u << 2)         /* cond: masked word != value */
 
-/* Length rules. */
+/* Length rules (PTR); for an ARRAY, how many elements are the kernel's
+ * (0: all `count`; COUNT: min(count, uN at len_a); PLANES: the table's
+ * planes[] of the u32 format at len_a). */
 #define NVGPU_SLEN_CONST 1        /* len_a bytes                            */
 #define NVGPU_SLEN_COUNT 2        /* uN at len_a (width len_width) x elem   */
 #define NVGPU_SLEN_SUM 3          /* sum of u32s of field len_a's buffer    */
 #define NVGPU_SLEN_NVKMS_PARAMS 4 /* NvKmsIoctlParams.size, == max          */
+#define NVGPU_SLEN_PLANES 5       /* ARRAY only, see above                  */
 
 /* Copy-back rules. */
 #define NVGPU_SCB_NONE 0
@@ -354,6 +403,7 @@ C_PREAMBLE = '''\
 #define NVGPU_SCB_ALL_OR_NOTHING 3
 #define NVGPU_SCB_EXACT 4
 #define NVGPU_SCB_RANGE 5
+#define NVGPU_SCB_WRITTEN 6 /* [0, uN at cb_off as the host left it), always */
 
 /* Specials, as passed to nvgpu_i2_ops.special. */
 #define NVGPU_SSPECIAL_NONE 0
@@ -370,6 +420,7 @@ C_PREAMBLE = '''\
 #define NVGPU_SPOL_SETPROP (1u << 6)
 #define NVGPU_SPOL_FB_PLANES (1u << 7)
 #define NVGPU_SPOL_NVKMS (1u << 8)
+#define NVGPU_SPOL_NVKMS_EXACT (1u << 9)
 
 /* FD_IN kinds: bit n is NVGPU_HK_* n; Dev is split by device. */
 #define NVGPU_SKIND(hk) (1u << (hk))
@@ -386,6 +437,8 @@ C_PREAMBLE = '''\
 #define NVGPU_SCHEMA_MAX_DEPTH {max_depth}
 
 #define NVGPU_NVKMS_IOCTL_IOWR 0x{nvkms_iowr:08x}u
+/* NvKmsGetNextEventReply.valid, from the params block, in every table. */
+#define NVGPU_NVKMS_NEXT_EVENT_VALID_OFF {next_event_valid}u
 
 #define NVGPU_SCHEMA_VERSION(a, b, c) ((a) * 1000000u + (b) * 1000u + (c))
 
@@ -426,6 +479,8 @@ struct nvgpu_stable {{
   u32 nioctls;
   const struct nvgpu_sfield *fields;
   u32 nfields;
+  const u8 *planes; /* numPlanes by NVKMS surface format (NVGPU_SLEN_PLANES) */
+  u32 nplanes;
 }};
 
 /* What a guest runs with: the DRM tables, and NVKMS's for the host version. */
@@ -449,6 +504,8 @@ def c_field(fl, index):
     flags = 0
     if f.cond is not None:
         flags |= FF_COND
+        if f.cond.ne:
+            flags |= FF_COND_NE
         m.update(cond_off=f.cond.off, cond_mask=f.cond.mask,
                  cond_value=f.cond.value)
     if isinstance(f, Ptr):
@@ -479,8 +536,16 @@ def c_field(fl, index):
                      cb_width=cb.width)
         elif isinstance(cb, Range):
             m.update(cb_kind='NVGPU_SCB_RANGE', cb_off=cb.off, cb_arg=cb.len)
+        elif isinstance(cb, Written):
+            m.update(cb_kind='NVGPU_SCB_WRITTEN', cb_off=cb.off,
+                     cb_width=cb.width)
     elif isinstance(f, Array):
         m.update(kind='NVGPU_SF_ARRAY', stride=f.stride, count=f.count)
+        if isinstance(f.limit, ArrayCount):
+            m.update(len_kind='NVGPU_SLEN_COUNT', len_a=f.limit.off,
+                     len_width=f.limit.width)
+        elif isinstance(f.limit, ArrayPlanes):
+            m.update(len_kind='NVGPU_SLEN_PLANES', len_a=f.limit.off)
     elif isinstance(f, FdIn):
         m.update(kind='NVGPU_SF_FD_IN', width=f.width,
                  kinds=f'0x{f.kinds:x}u', none_value=f.none)
@@ -494,7 +559,8 @@ def c_field(fl, index):
         m.update(kind='NVGPU_SF_GEM_OUT', width=4)
     if flags:
         m['flags'] = ' | '.join(n for b, n in ((FF_COND, 'NVGPU_SFF_COND'),
-                                (FF_VALIDATE, 'NVGPU_SFF_VALIDATE_NVKMS'))
+                                (FF_VALIDATE, 'NVGPU_SFF_VALIDATE_NVKMS'),
+                                (FF_COND_NE, 'NVGPU_SFF_COND_NE'))
                                 if flags & b)
     if fl.nchild:
         m.update(child=fl.child, nchild=fl.nchild)
@@ -510,11 +576,27 @@ def c_sym(t):
     return f'nvgpu_schema_{t.name}'
 
 
+def next_event_valid(tables):
+    """Where GET_NEXT_EVENT's reply says whether it had one: the guest
+    reads it to keep a modeset file readable until the queue is empty, and
+    it has never moved, which this keeps true or loud."""
+    offs = {t.layout['next_event_valid'] for t in tables if t.layout}
+    if len(offs) != 1:
+        fail('nvkms', f'NvKmsGetNextEventReply.valid moves: {sorted(offs)}')
+    return offs.pop()
+
+
 def emit_c(tables, max_depth):
     out = [C_PREAMBLE.format(max_list=MAX_LIST, max_depth=max_depth,
-                             nvkms_iowr=NVKMS_IOCTL_IOWR)]
+                             nvkms_iowr=NVKMS_IOCTL_IOWR,
+                             next_event_valid=next_event_valid(tables))]
     for t in tables:
         sym = c_sym(t)
+        if t.planes:
+            out.append(f'static const u8 {sym}_planes[] = {{')
+            row = ', '.join(str(n) for n in t.planes)
+            out.append(f'  {row},')
+            out.append('};\n')
         out.append(f'static const struct nvgpu_sfield {sym}_fields[] = {{')
         for i, fl in enumerate(t.flat):
             out.append(c_field(fl, i))
@@ -543,11 +625,14 @@ def emit_c(tables, max_depth):
         out.append('};\n')
         vmin, vmax = (('0', '0') if t.versions is None else
                       (c_version(t.versions[0]), c_version(t.versions[1])))
+        planes = (f'  .planes = {sym}_planes, .nplanes = {len(t.planes)},\n'
+                  if t.planes else '')
         out.append(f'static const struct nvgpu_stable {sym} = {{\n'
                    f'  .name = "{t.name}", .vmin = {vmin}, .vmax = {vmax},\n'
                    f'  .ioctls = {sym}_ioctls, .nioctls = '
                    f'ARRAY_SIZE({sym}_ioctls),\n'
                    f'  .fields = {sym}_fields, .nfields = {len(t.flat)},\n'
+                   f'{planes}'
                    '};\n')
     mods = [t for t in tables if t.versions is not None]
     drm = c_sym(tables[0])
@@ -581,7 +666,8 @@ def rs_field(fl, index):
     cond = 'None'
     if f.cond is not None:
         cond = (f'Some(Cond {{ off: {f.cond.off}, mask: 0x{f.cond.mask:x}, '
-                f'value: 0x{f.cond.value:x} }})')
+                f'value: 0x{f.cond.value:x}, '
+                f'ne: {"true" if f.cond.ne else "false"} }})')
     span = f'Span {{ first: {fl.child}, len: {fl.nchild} }}'
     if isinstance(f, Ptr):
         ln = f.len
@@ -607,14 +693,23 @@ def rs_field(fl, index):
             cbs = f'CopyBack::Exact {{ off: {cb.off}, width: {cb.width} }}'
         elif isinstance(cb, Range):
             cbs = f'CopyBack::Range {{ off: {cb.off}, len: {cb.len} }}'
+        elif isinstance(cb, Written):
+            cbs = f'CopyBack::Written {{ off: {cb.off}, width: {cb.width} }}'
         else:
             cbs = 'CopyBack::None'
         kind = (f'Kind::Ptr {{ dir: {RS_DIR[f.dir]}, len: {lens}, '
                 f'copyback: {cbs}, max: {f.max}, stride: {f.stride}, '
                 f'children: {span} }}')
     elif isinstance(f, Array):
+        if isinstance(f.limit, ArrayCount):
+            lim = (f'Limit::Count {{ off: {f.limit.off}, '
+                   f'width: {f.limit.width} }}')
+        elif isinstance(f.limit, ArrayPlanes):
+            lim = f'Limit::Planes {{ off: {f.limit.off} }}'
+        else:
+            lim = 'Limit::All'
         kind = (f'Kind::Array {{ count: {f.count}, stride: {f.stride}, '
-                f'children: {span} }}')
+                f'limit: {lim}, children: {span} }}')
     elif isinstance(f, FdIn):
         kind = (f'Kind::FdIn {{ width: {f.width}, kinds: 0x{f.kinds:x}, '
                 f'none: {f.none} }}')
@@ -663,9 +758,16 @@ def emit_rs(tables):
         vers = ('None' if t.versions is None else
                 f'Some(({rs_version(t.versions[0])}, '
                 f'{rs_version(t.versions[1])}))')
+        layout = 'None'
+        if t.layout:
+            out.append(f'static {sym}_LAYOUT: NvkmsLayout = '
+                       f'{rs_layout(t.layout)};\n')
+            layout = f'Some(&{sym}_LAYOUT)'
+        planes = ', '.join(str(n) for n in t.planes)
         out.append(f'static {sym}: Table = Table {{\n'
                    f'    name: "{t.name}",\n    versions: {vers},\n'
                    f'    ioctls: {sym}_IOCTLS,\n    fields: {sym}_FIELDS,\n'
+                   f'    planes: &[{planes}],\n    nvkms: {layout},\n'
                    '};\n')
     out.append('/// DRM core and nvidia-drm entries (classes Render and Kms), '
                'for any host version.')
@@ -681,6 +783,64 @@ def emit_rs(tables):
         out.append(f'    (0x{code:08x}, {planes}), // {name}')
     out.append('];')
     return '\n'.join(out) + '\n'
+
+
+def rs_arr(a):
+    return (f'Arr {{ off: {a["off"]}, count: {a["count"]}, '
+            f'stride: {a["stride"]} }}')
+
+
+def rs_target(t):
+    return (f'NvkmsTarget {{ device: {t["device"]}, disp: {t["disp"]}, '
+            f'what: {t["what"]} }}')
+
+
+def rs_perm_arr(p):
+    disp = 'None' if p['disp'] is None else f'Some({rs_arr(p["disp"])})'
+    return f'NvkmsPermArr {{ disp: {disp}, head: {rs_arr(p["head"])} }}'
+
+
+def rs_perms(p):
+    return (f'NvkmsPerms {{ device: {p["device"]}, ptype: {p["ptype"]}, '
+            f'flip: {rs_perm_arr(p["flip"])}, '
+            f'modeset: {rs_perm_arr(p["modeset"])} }}')
+
+
+def rs_ranges(r):
+    return '&[' + ', '.join(f'({o}, {n})' for o, n in r) + ']'
+
+
+def rs_layout(lo):
+    """The NVKMS policy's layout of one release (gen/src/schema/mod.rs,
+    NvkmsLayout), from what gen/schema/nvkms.py read out of its JSON."""
+    lp, fl, sm = lo['layer_position'], lo['flip'], lo['set_mode']
+    parts = [
+        f'alloc_scrub: {rs_ranges(lo["alloc_scrub"])}',
+        f'alloc_reply_device: {lo["alloc_reply_device"]}',
+        f'alloc_reply_disps: {lo["alloc_reply_disps"]}',
+        f'dpy_dynamic_scrub: {rs_ranges(lo["dpy_dynamic_scrub"])}',
+        f'set_cursor_image: {rs_target(lo["set_cursor_image"])}',
+        f'move_cursor: {rs_target(lo["move_cursor"])}',
+        f'set_lut: {rs_target(lo["set_lut"])}',
+        f'set_dpy_attribute: {rs_target(lo["set_dpy_attribute"])}',
+        (f'layer_position: NvkmsLayerPosition {{ device: {lp["device"]}, '
+         f'disps: {lp["disps"]}, disp: {rs_arr(lp["disp"])}, '
+         f'heads: {lp["heads"]}, head: {rs_arr(lp["head"])} }}'),
+        (f'flip: NvkmsFlipLayout {{ ptr: {fl["ptr"]}, heads: {fl["heads"]}, '
+         f'head_size: {fl["head_size"]}, layer: {rs_arr(fl["layer"])}, '
+         f'use_syncpt: {fl["use_syncpt"]} }}'),
+        (f'set_mode: NvkmsSetModeLayout {{ disp: {rs_arr(sm["disp"])}, '
+         f'head: {rs_arr(sm["head"])}, layer: {rs_arr(sm["layer"])}, '
+         f'use_syncpt: {sm["use_syncpt"]} }}'),
+        f'grant: {rs_perms(lo["grant"])}',
+        f'acquire: {rs_perms(lo["acquire"])}',
+        f'revoke: {rs_perms(lo["revoke"])}',
+        f'event_interest: {lo["event_interest"]}',
+        f'events_allowed: 0x{lo["events_allowed"]:x}',
+        f'next_event_valid: {lo["next_event_valid"]}',
+        f'drm_grant_typed: {"true" if lo["drm_grant_typed"] else "false"}',
+    ]
+    return 'NvkmsLayout {\n    ' + ',\n    '.join(parts) + ',\n}'
 
 
 def max_depth(tables):
@@ -703,7 +863,7 @@ def probe_lines(struct, fields, prefix=''):
             path = prefix + f.name
             out.append(f'_Static_assert(offsetof({struct}, {path}) == '
                        f'{f.off}, "{struct}.{path}");')
-        for ref in ('len', 'copyback'):
+        for ref in ('len', 'copyback', 'limit'):
             r = getattr(f, ref, None)
             if struct and getattr(r, 'name', None) and hasattr(r, 'off'):
                 out.append(f'_Static_assert(offsetof({struct}, '
@@ -712,6 +872,10 @@ def probe_lines(struct, fields, prefix=''):
                 if hasattr(r, 'width'):
                     out.append(f'_Static_assert(sizeof((({struct} *)0)->'
                                f'{prefix}{r.name}) == {r.width}, '
+                               f'"{struct}.{r.name} width");')
+                elif isinstance(r, ArrayPlanes):
+                    out.append(f'_Static_assert(sizeof((({struct} *)0)->'
+                               f'{prefix}{r.name}) == 4, '
                                f'"{struct}.{r.name} width");')
         if f.cond is not None and struct:
             out.append(f'_Static_assert(offsetof({struct}, {prefix}'

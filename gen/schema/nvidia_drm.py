@@ -83,6 +83,17 @@ KMS_IOCTLS = shared(KMS) + [
     Ioctl('NV_REVOKE_PERMISSIONS', KMS, 'DRM_IOCTL_NVIDIA_REVOKE_PERMISSIONS',
           'struct drm_nvidia_revoke_permissions_params', 8, nv(0x13), IOWR,
           exec=X, policy=POL_REVOKE),
+    # The same two before they grew a `type` (535's nvidia-drm-ioctl.h:
+    # {s32 fd; u32 dpyId} and {u32 dpyId}, always MODESET;
+    # gen/nvkms/535.129.03.json). Their own numbers, since the size is in
+    # the number; the NVKMS hook lets them through only on a host whose
+    # nvidia-drm has that layout (NvkmsLayout::drm_grant_typed).
+    Ioctl('NV_GRANT_PERMISSIONS_UNTYPED', KMS, None, None, 8, nv(0x12), IOWR,
+          exec=X, policy=POL_GRANT, fields=[
+              FdIn('fd', 0, 4, K_DEV_MODESET),
+          ]),
+    Ioctl('NV_REVOKE_PERMISSIONS_UNTYPED', KMS, None, None, 4, nv(0x13), IOWR,
+          exec=X, policy=POL_REVOKE),
 ]
 
 RENDER_IOCTLS = shared(RENDER) + [
