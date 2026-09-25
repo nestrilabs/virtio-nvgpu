@@ -8,9 +8,19 @@
 # daemon's account:
 #
 #   groupadd --system nvgpu-wl
-#   usermod -aG nvgpu-wl <the account nvgpu-wl-guest runs as>
+#   chgrp nvgpu-wl "$(command -v nvgpu-wl-guest)"
+#   chmod 2755 "$(command -v nvgpu-wl-guest)"    # setgid nvgpu-wl
 #   install -m 0644 scripts/70-nvgpu-wl.rules /etc/udev/rules.d/
 #   udevadm control --reload && udevadm trigger --subsystem-match=misc
+#
+# Give the group to the daemon, never to an application account: whoever
+# can open the node can hold host compositor connections it never reads,
+# and can charge channels to any process it names (CONNECT_FOR), spending
+# that process's share of the VM's channels. A setgid daemon runs as the
+# session's user with the group, and a setgid process is not dumpable, so
+# the session's applications cannot ptrace it for the descriptor. If the
+# daemon runs under an account of its own instead, that account and no
+# other is in the group.
 #
 # Do not add TAG+="uaccess": that hands the node to whoever sits at the
 # guest's seat, not to the daemon.

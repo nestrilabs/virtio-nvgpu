@@ -39,7 +39,9 @@
 #include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/pid.h>
 #include <linux/poll.h>
+#include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -307,9 +309,15 @@ static void nvgpu_wl_export_unclaim(struct nvgpu_wl_file *wf) {
   mutex_unlock(&wl->listen_lock);
 }
 
-static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
+/*
+ * CONNECT, LISTEN or ACCEPT. The channel is charged to `peer` (a task the
+ * caller holds a reference on) when there is one, else to the caller.
+ */
+static long nvgpu_wl_bind(struct nvgpu_wl_file *wf,
+                          const struct nvgpu_wl_connect *cp,
+                          struct task_struct *peer) {
   struct nvgpu_device *dev = wf->wl->dev;
-  struct nvgpu_wl_connect c;
+  struct nvgpu_wl_connect c = *cp;
   struct nvgpu_open_req_proc reqp = {};
   struct nvgpu_open_req *req = &reqp.req;
   struct nvgpu_open_resp resp = {};
@@ -317,8 +325,6 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   s32 status;
   int ret;
 
-  if (copy_from_user(&c, uarg, sizeof(c)))
-    return -EFAULT;
   if (c.flags || c.mode > NVGPU_WL_ACCEPT)
     return -EINVAL;
   if (wf->bound)
@@ -333,8 +339,13 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   req->device_type = cpu_to_le32(NVGPU_DEV_WAYLAND);
   /* The OPEN flags word says which kind of channel (WL_OPEN_* in wlwire). */
   req->flags = cpu_to_le32(c.mode);
-  /* The opener, whose share of the VM's channels this is (quota.rs). */
+  /*
+   * The process whose share of the VM's channels this is (quota.rs): the
+   * client the daemon connects for, or the opener.
+   */
   req_len = nvgpu_open_req_fill_proc(dev, &reqp);
+  if (peer && req_len == sizeof(reqp))
+    nvgpu_proc_id_fill_task(dev, peer, &reqp.proc);
   ret = nvgpu_send_recv(dev, &reqp, req_len, &resp, sizeof(resp));
   status = ret < 0 ? ret : (s32)le32_to_cpu(resp.hdr.status);
   if (status < 0) {
@@ -371,6 +382,39 @@ static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
   /* The backend queues its HELLO record at once. */
   atomic_set(&wf->nfd.pending, 1);
   return 0;
+}
+
+static long nvgpu_wl_connect(struct nvgpu_wl_file *wf, void __user *uarg) {
+  struct nvgpu_wl_connect c;
+
+  if (copy_from_user(&c, uarg, sizeof(c)))
+    return -EFAULT;
+  return nvgpu_wl_bind(wf, &c, NULL);
+}
+
+/* CONNECT for the client process `pid` (NVGPU_WL_IOC_CONNECT_FOR). */
+static long nvgpu_wl_connect_for(struct nvgpu_wl_file *wf, void __user *uarg) {
+  struct nvgpu_wl_connect_for f;
+  struct nvgpu_wl_connect c;
+  struct task_struct *peer;
+  struct pid *pid;
+  long ret;
+
+  if (copy_from_user(&f, uarg, sizeof(f)))
+    return -EFAULT;
+  if (f.mode != NVGPU_WL_CONNECT || f.flags || f.pad || f.pid <= 0)
+    return -EINVAL;
+  /* In the caller's PID namespace, where SO_PEERCRED numbered it. */
+  pid = find_get_pid(f.pid);
+  peer = pid ? get_pid_task(pid, PIDTYPE_TGID) : NULL;
+  put_pid(pid);
+  if (!peer)
+    return -ESRCH;
+  c.mode = f.mode;
+  c.flags = 0;
+  ret = nvgpu_wl_bind(wf, &c, peer);
+  put_task_struct(peer);
+  return ret;
 }
 
 /* ── SEND ── */
@@ -914,6 +958,9 @@ static long nvgpu_wl_ioctl(struct file *filp, unsigned int cmd,
     break;
   case NVGPU_WL_IOC_CONNECT:
     ret = nvgpu_wl_connect(wf, uarg);
+    break;
+  case NVGPU_WL_IOC_CONNECT_FOR:
+    ret = nvgpu_wl_connect_for(wf, uarg);
     break;
   case NVGPU_WL_IOC_SEND:
     ret = nvgpu_wl_send(wf, uarg);

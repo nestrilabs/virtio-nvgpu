@@ -370,21 +370,27 @@ static bool nvgpu_uvm_offered(const struct nvgpu_device *dev) {
  * concurrent exec replaces it.
  */
 void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
+  nvgpu_proc_id_fill_task(dev, current, dst);
+}
+
+/* The same for task `t`, which the caller holds a reference on. */
+void nvgpu_proc_id_fill_task(const struct nvgpu_device *dev,
+                             struct task_struct *t, void *dst) {
   struct nvgpu_proc_id id = {};
   struct task_struct *leader;
 
   rcu_read_lock();
-  leader = READ_ONCE(current->group_leader);
+  leader = READ_ONCE(t->group_leader);
   id.start_ns = cpu_to_le64(leader->start_time);
   rcu_read_unlock();
-  id.tgid = cpu_to_le32(task_tgid_nr(current));
+  id.tgid = cpu_to_le32(task_tgid_nr(t));
   /*
    * The effective uid, as RM's security token holds it for a host process
    * (os_get_euid: current->cred->euid, in the initial user namespace). Not
    * the fsuid: RM never reads it.
    */
   if (nvgpu_proc_euid(dev))
-    id.euid = cpu_to_le32(__kuid_val(current_euid()));
+    id.euid = cpu_to_le32(__kuid_val(task_euid(t)));
   memcpy(dst, &id, sizeof(id));
 }
 

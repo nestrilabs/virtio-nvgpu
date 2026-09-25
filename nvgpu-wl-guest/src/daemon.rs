@@ -77,6 +77,9 @@ pub struct Totals {
     pub devt_rewrites: u64,
     pub released_synthesised: u64,
     pub placeholders: u64,
+    /// The most bytes one client has been seen not to have read (bounded
+    /// by `LOCAL_OUT_MAX` and one received frame).
+    pub peak_unread: u64,
     pub errors: Vec<String>,
 }
 
@@ -113,6 +116,38 @@ const SUB_STREAM: u64 = 1 << 31;
 /// What one RECV asks the host for (at least `frame::MIN_FRAME`, at most
 /// what HELLO allows).
 const RECV_BYTES: usize = 256 * 1024;
+
+/// Bytes the daemon holds for one client that has not read them. Past this
+/// the client's channel is not read any more until it catches up: its
+/// output waits in the backend, charged to that client's share of the VM's
+/// queue budget, instead of here, where a client flooding requests whose
+/// replies it never reads grew the daemon until the guest's OOM killer took
+/// it and every client with it (W2). A native compositor drops only the
+/// stuck client, and so does this: after [`STUCK_FOR`] over the line.
+const LOCAL_OUT_MAX: usize = 4 << 20;
+const STUCK_FOR: Duration = Duration::from_secs(30);
+
+/// The process at the other end of a client socket (SO_PEERCRED), in the
+/// daemon's PID namespace; `None` when the kernel cannot say.
+fn peer_pid(s: &UnixStream) -> Option<i32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt into a local of the size given.
+    let r = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (r == 0 && cred.pid > 0).then_some(cred.pid)
+}
 
 /// The guest kernel as the engine's platform: dma-bufs and DRM files are its
 /// to resolve, in SEND and RECV.
@@ -154,6 +189,11 @@ struct Client {
     tx: VecDeque<(Vec<u8>, Vec<Option<OwnedFd>>)>,
     streams: HashMap<RawFd, u32>,
     sock_events: u32,
+    /// What the channel is watched for: nothing while the client has
+    /// [`LOCAL_OUT_MAX`] unread.
+    chan_events: u32,
+    /// Since when the client has had that much unread.
+    stuck_since: Option<Instant>,
     closing: bool,
 }
 
@@ -460,6 +500,14 @@ impl Daemon {
                 self.pump_tx(slot);
                 touched.push(slot);
             }
+            // A client that has fallen behind is looked at every turn, so
+            // one that stays behind is closed even if nothing else happens.
+            if self.clients[slot]
+                .as_ref()
+                .is_some_and(|c| c.stuck_since.is_some())
+            {
+                touched.push(slot);
+            }
         }
         touched.sort_unstable();
         touched.dedup();
@@ -537,6 +585,8 @@ impl Daemon {
             tx: VecDeque::new(),
             streams: HashMap::new(),
             sock_events: ev,
+            chan_events: libc::EPOLLIN as u32,
+            stuck_since: None,
             closing: false,
         });
         self.totals.lock().unwrap().clients += 1;
@@ -550,7 +600,13 @@ impl Daemon {
         loop {
             let Some(l) = &self.listener else { return };
             match l.accept() {
-                Ok((s, _)) => match self.conn.connect(uapi::CONNECT) {
+                // Charged to the client, not to the daemon: each guest
+                // process holds only a share of the VM's channels and their
+                // budgets (NVGPU_WL_IOC_CONNECT_FOR).
+                Ok((s, _)) => match match peer_pid(&s) {
+                    Some(pid) => self.conn.connect_for(pid),
+                    None => self.conn.connect(uapi::CONNECT),
+                } {
                     Ok(ch) => self.add_client(s, ch, Local::Client),
                     Err(e) => {
                         eprintln!("nvgpu-wl-guest: cannot open a channel to the host: {e}");
@@ -714,6 +770,11 @@ impl Daemon {
             let Some(c) = self.clients[slot].as_mut() else {
                 return;
             };
+            // A client that is not reading gets nothing more from the host
+            // until it does (LOCAL_OUT_MAX); sync stops watching the channel.
+            if c.engine.local_out_len() >= LOCAL_OUT_MAX {
+                return;
+            }
             let r = match c.chan.recv(max, card, render) {
                 Ok(r) => r,
                 Err(e) => {
@@ -734,6 +795,11 @@ impl Daemon {
                 if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
                     eprintln!("nvgpu-wl-guest: writing to a client: {e}");
                     c.closing = true;
+                }
+                let unread = c.engine.local_out_len() as u64;
+                {
+                    let mut t = self.totals.lock().unwrap();
+                    t.peak_unread = t.peak_unread.max(unread);
                 }
                 self.pump_tx(slot);
             }
@@ -773,6 +839,35 @@ impl Daemon {
         }
         if c.engine.local_out_len() > 0 {
             want |= libc::EPOLLOUT as u32;
+        }
+        // The channel is read only while the client keeps up (W2), and a
+        // client that stays that far behind is dropped, as a compositor
+        // drops a client it cannot write to.
+        let behind = c.engine.local_out_len() >= LOCAL_OUT_MAX;
+        let chan_want = if behind { 0 } else { libc::EPOLLIN as u32 };
+        if behind {
+            let since = *c.stuck_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STUCK_FOR {
+                eprintln!(
+                    "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
+                    c.engine.local_out_len(),
+                    STUCK_FOR.as_secs()
+                );
+                self.close(slot);
+                return;
+            }
+        } else {
+            c.stuck_since = None;
+        }
+        if chan_want != c.chan_events {
+            let _ = epoll_ctl(
+                ep,
+                libc::EPOLL_CTL_MOD,
+                c.chan.poll_fd(),
+                chan_want,
+                base | SUB_CHAN,
+            );
+            c.chan_events = chan_want;
         }
         if want != c.sock_events {
             let _ = epoll_ctl(

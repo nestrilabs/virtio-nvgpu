@@ -422,6 +422,9 @@ int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
  */
 bool nvgpu_proc_ids(const struct nvgpu_device *dev);
 void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst);
+struct task_struct;
+void nvgpu_proc_id_fill_task(const struct nvgpu_device *dev,
+                             struct task_struct *t, void *dst);
 /* Fill an OPEN's trailer when the backend wants one; the length to send. */
 u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
                              struct nvgpu_open_req_proc *r);

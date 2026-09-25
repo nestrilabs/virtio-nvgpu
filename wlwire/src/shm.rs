@@ -376,8 +376,9 @@ pub struct Shm {
     surfaces: HashMap<u32, Surface>,
     /// This connection's own limits.
     conn: Arc<ShmBudget>,
-    /// Everyone's (the VM's), if the owner of the engine set one.
-    shared: Option<Arc<ShmBudget>>,
+    /// Budgets shared with other connections: the VM's, and the guest
+    /// process's the connection is for, if the owner of the engine set them.
+    shared: Vec<Arc<ShmBudget>>,
     pub sync_bytes: u64,
     pub syncs: u64,
 }
@@ -389,7 +390,7 @@ impl Default for Shm {
             buffers: HashMap::new(),
             surfaces: HashMap::new(),
             conn: Arc::new(ShmBudget::new(MAX_POOL_BYTES, MAX_POOLS)),
-            shared: None,
+            shared: Vec::new(),
             sync_bytes: 0,
             syncs: 0,
         }
@@ -434,10 +435,11 @@ impl Shm {
         self.surfaces.remove(&id);
     }
 
-    /// Draw on a budget every connection of the VM shares, beside this
-    /// connection's own. Pools already made keep what they were charged to.
+    /// Draw on a budget other connections share too (the VM's, a guest
+    /// process's), beside this connection's own and any set before. Pools
+    /// already made keep what they were charged to.
     pub fn set_shared_budget(&mut self, b: Arc<ShmBudget>) {
-        self.shared = Some(b);
+        self.shared.push(b);
     }
 
     /// Everything known about pools, buffers and surfaces goes (the

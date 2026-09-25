@@ -47,6 +47,18 @@ pub struct Connect {
     pub flags: u32,
 }
 
+/// `struct nvgpu_wl_connect_for`: CONNECT charged to the client process
+/// `pid` rather than to the daemon (the backend's per-process share of the
+/// VM's channels, device/src/quota.rs).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConnectFor {
+    pub mode: u32,
+    pub flags: u32,
+    pub pid: i32,
+    pub pad: u32,
+}
+
 pub const XFER_MORE: u32 = 1 << 0;
 
 /// `NVGPU_WL_MIN_FRAME`: the smallest RECV buffer the host accepts.
@@ -74,11 +86,13 @@ pub const IOC_HELLO: libc::c_ulong = ioc(IOC_READ, b'W', 0x40, size_of::<Hello>(
 pub const IOC_CONNECT: libc::c_ulong = ioc(IOC_WRITE, b'W', 0x41, size_of::<Connect>());
 pub const IOC_SEND: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, b'W', 0x42, size_of::<Xfer>());
 pub const IOC_RECV: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, b'W', 0x43, size_of::<Xfer>());
+pub const IOC_CONNECT_FOR: libc::c_ulong = ioc(IOC_WRITE, b'W', 0x44, size_of::<ConnectFor>());
 
 const _: () = {
     assert!(size_of::<Devmap>() == 24);
     assert!(size_of::<Hello>() == 216);
     assert!(size_of::<Connect>() == 8);
+    assert!(size_of::<ConnectFor>() == 16);
     assert!(size_of::<Xfer>() == 32);
     // The frame structs the header declares are wlwire's.
     assert!(wlwire::frame::FRAME_HDR_LEN == 16);
@@ -98,5 +112,7 @@ mod tests {
         assert_eq!(IOC_CONNECT, 0x4008_5741);
         assert_eq!(IOC_SEND, 0xc020_5742);
         assert_eq!(IOC_RECV, 0xc020_5743);
+        // _IOW('W', 0x44, 16)
+        assert_eq!(IOC_CONNECT_FOR, 0x4010_5744);
     }
 }

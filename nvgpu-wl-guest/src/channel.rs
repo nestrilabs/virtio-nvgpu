@@ -58,6 +58,12 @@ pub trait Connector {
     /// A new channel: `uapi::CONNECT` (to the host compositor), `LISTEN` or
     /// `ACCEPT` (export mode).
     fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>>;
+    /// A connection to the host compositor for the client process `pid`,
+    /// charged to it rather than to the daemon. A kernel that predates it is
+    /// asked for a plain CONNECT.
+    fn connect_for(&mut self, _pid: i32) -> io::Result<Box<dyn Channel>> {
+        self.connect(uapi::CONNECT)
+    }
 }
 
 /// Write each pending descriptor's number into its desc's `fd` field.
@@ -137,6 +143,28 @@ impl Connector for DevConnector {
             file,
             rbuf: Vec::new(),
         }))
+    }
+
+    fn connect_for(&mut self, pid: i32) -> io::Result<Box<dyn Channel>> {
+        let file = self.open()?;
+        let mut c = uapi::ConnectFor {
+            mode: uapi::CONNECT,
+            flags: 0,
+            pid,
+            pad: 0,
+        };
+        match ioctl(&file, uapi::IOC_CONNECT_FOR, &mut c) {
+            Ok(()) => Ok(Box::new(DevChannel {
+                file,
+                rbuf: Vec::new(),
+            })),
+            // An older kernel, or a client already gone: the daemon's own.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::ESRCH)) => {
+                drop(file);
+                self.connect(uapi::CONNECT)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -293,7 +293,8 @@ impl Engine {
     /// Charge shm pools, and the buffers made from them, to `b` as well as to
     /// this connection's own limits (`shm.rs`): the backend gives every
     /// connection of a VM the same one, so the number of connections does not
-    /// multiply what a guest can make the host hold.
+    /// multiply what a guest can make the host hold. Called again, a further
+    /// budget is added (a guest process's, beside the VM's).
     pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
         self.shm.set_shared_budget(b);
     }

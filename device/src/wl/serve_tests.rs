@@ -638,6 +638,61 @@ fn a_vm_gets_no_more_wayland_channels_than_its_limit() {
     assert_eq!(open(&mut be, frame::WL_OPEN_CONNECT).0, 0);
 }
 
+/// OPEN(DEV_WAYLAND, CONNECT) for guest process `tgid`, as a guest that
+/// says which process a channel is for sends it.
+fn open_for(be: &mut NvidiaBackend, tgid: u32) -> (i32, u32) {
+    let req = OpenReq {
+        device_type: DEV_WAYLAND,
+        flags: frame::WL_OPEN_CONNECT,
+    };
+    let mut body = bytes_of(&req).to_vec();
+    body.extend_from_slice(bytes_of(&ProcId {
+        start_ns: 5,
+        tgid,
+        euid: 1000,
+    }));
+    let r = call(be, MsgType::Open, 0, &body, 64);
+    (status(&r), resp_handle(&r))
+}
+
+/// One guest process opening every channel left the VM's other clients
+/// without a window (W1): each process holds a quarter, and the last eighth
+/// is kept for processes with at most two.
+#[test]
+fn one_guest_process_cannot_take_every_wayland_channel() {
+    let dir = tmpdir("serve-share");
+    let sock = dir.join("wl");
+    let _l = UnixListener::bind(&sock).unwrap();
+    let mut be = backend();
+    be.set_wayland(Some(WlConfig::new(&sock)));
+    be.set_wayland_limits(WlLimits::new(16, 1 << 30, 1 << 20));
+    let req = HelloReq {
+        proto: PROTO_V2,
+        flags: HELLO_F_FRESH,
+        guest_caps: GCAP_PROC_ID,
+        ..Default::default()
+    };
+    assert_eq!(status(&call(&mut be, MsgType::Hello, 0, bytes_of(&req), 4096)), 0);
+    let mut mine = 0;
+    while open_for(&mut be, 7).0 == 0 {
+        mine += 1;
+    }
+    assert_eq!(mine, 4, "a quarter of 16");
+    assert_eq!(open_for(&mut be, 7).0, -libc::EMFILE);
+    // All of its connections draw on one shm budget, a quarter of the VM's.
+    assert_eq!(be.wl_owner_shm(), (1, 1 << 28));
+    let (st, h) = open_for(&mut be, 8);
+    assert_eq!(st, 0, "another process still gets a window");
+    assert_eq!(be.wl_owner_shm().0, 2, "and a budget of its own");
+    assert_eq!(
+        be.handles.owner(h),
+        crate::quota::Owner::Proc {
+            tgid: 8,
+            start_ns: 5
+        }
+    );
+}
+
 #[test]
 fn export_mode_has_one_listener_at_a_time() {
     let dir = tmpdir("serve-one-listener");
