@@ -404,9 +404,10 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
  */
 int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            u32 host_handle, size_t size, u32 *guest_handle);
-/* Guest handle in `file` -> (host GEM handle, owner backend handle). */
-int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
-                      u32 *host_handle, u32 *owner_handle);
+/* drm_gem_object_put() as a release callback (nvgpu_tbuf_on_free(),
+ * nvgpu_i2_hold()): the reference that keeps a proxy's host handle its own
+ * while a request names it. */
+void nvgpu_gem_put_ref(void *obj);
 /*
  * The proxy already standing for host GEM handle `host_handle` of `owner`'s
  * render file, with a reference taken, or NULL. nvgpu_gem_proxy_create()
@@ -621,6 +622,10 @@ struct nvgpu_schema_set;
 struct nvgpu_tbuf;
 struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);
 void nvgpu_tbuf_free(struct nvgpu_tbuf *tb);
+/* Run fn(arg) when `tb` is freed -- for a request buffer, once the host can
+ * no longer act on it, even if its caller gave up (S-25). */
+void nvgpu_tbuf_on_free(struct nvgpu_tbuf *tb, void (*fn)(void *arg),
+                        void *arg);
 size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb);
 int nvgpu_tbuf_write(struct nvgpu_tbuf *tb, size_t off, const void *src,
                      size_t len);
@@ -677,6 +682,11 @@ int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
                     void *resp, int resp_len);
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
                          void *resp, int resp_len, u32 *used_len);
+/* nvgpu_send_recv_used(), with release(arg) run once the host can no longer
+ * act on the request (see nvgpu_tbuf_on_free()); always run, failure or not. */
+int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
+                            void *resp, int resp_len, u32 *used_len,
+                            void (*release)(void *arg), void *arg);
 /* Does a response of `used` bytes contain all of [off, off + len)? */
 static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
   return off <= used && len <= used - off;
@@ -838,6 +848,15 @@ struct nvgpu_i2_call {
   s32 ret;                 /* host ioctl result */
   struct nvgpu_i2_state *st; /* interpreter-private, valid during hooks */
 };
+
+/*
+ * For a gem_in or fd_in hook: keep `obj` (a reference the hook took) until
+ * the host is done with the request, then put(obj) -- after the reply, or,
+ * for a request its caller gave up on, once the transport knows it can no
+ * longer run. On failure put(obj) has run already.
+ */
+int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
+                  void *obj);
 
 /* Is there a schema for this call? (Used to decide whether to intercept.) */
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,

@@ -114,6 +114,9 @@ struct nvgpu_tbuf {
   size_t len;
   unsigned int nents;
   bool inline_data; /* the data follows sg[0] in this allocation */
+  /* nvgpu_tbuf_on_free(): run when the buffer is freed, whoever frees it. */
+  void (*release)(void *arg);
+  void *release_arg;
   struct scatterlist sg[];
 };
 
@@ -211,6 +214,7 @@ static struct nvgpu_tbuf *nvgpu_tbuf_alloc_sg(size_t len, gfp_t gfp,
     tb->len = len;
     tb->nents = 1;
     tb->inline_data = true;
+    tb->release = NULL;
     sg_init_one(&tb->sg[0], &tb->sg[1], len);
     return tb;
   }
@@ -289,6 +293,8 @@ void nvgpu_tbuf_free(struct nvgpu_tbuf *tb) {
 
   if (!tb)
     return;
+  if (tb->release)
+    tb->release(tb->release_arg);
   if (!tb->inline_data)
     for (i = 0; i < tb->nents; i++)
       __free_pages(sg_page(&tb->sg[i]), get_order(tb->sg[i].length));
@@ -296,6 +302,21 @@ void nvgpu_tbuf_free(struct nvgpu_tbuf *tb) {
 }
 
 size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb) { return tb->len; }
+
+/*
+ * What a request's numbers stand for, kept until the request is done with:
+ * a request buffer is freed by its caller once the reply is in, or by the
+ * transport once a request its caller gave up on (-ETIMEDOUT, -EINTR) has
+ * been answered late or is known never to run (nvgpu_req_free_orphan()) --
+ * the moment the host can no longer act on what the request names. Always
+ * process context. One per buffer.
+ */
+void nvgpu_tbuf_on_free(struct nvgpu_tbuf *tb, void (*fn)(void *arg),
+                        void *arg) {
+  WARN_ON(tb->release);
+  tb->release = fn;
+  tb->release_arg = arg;
+}
 
 enum nvgpu_tbuf_op {
   NVGPU_TB_WRITE,
@@ -664,9 +685,11 @@ int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
  * A request from plain kernel memory: copied into transport buffers so the
  * caller's memory is never on the ring and can be freed whatever happens.
  */
-static int nvgpu_call(struct nvgpu_device *dev, const void *req,
-                      size_t req_len, void *resp, size_t resp_len, u32 flags,
-                      u32 *used_len, struct nvgpu_times *tm, bool *sent) {
+static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
+                              size_t req_len, void *resp, size_t resp_len,
+                              u32 flags, u32 *used_len, struct nvgpu_times *tm,
+                              bool *sent, void (*release)(void *arg),
+                              void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_tbuf *rq, *rs;
   size_t posted = resp_len;
@@ -677,13 +700,22 @@ static int nvgpu_call(struct nvgpu_device *dev, const void *req,
     *sent = false;
   if (used_len)
     *used_len = 0;
-  if (!xf)
+  if (!xf) {
+    if (release)
+      release(arg);
     return -ENODEV;
+  }
 
   /* Nothing past what the backend will write is worth posting. */
   posted = min_t(size_t, posted, dev->v2 ? dev->max_resp : NVGPU_V1_RESP_MAX);
   rq = nvgpu_tbuf_alloc_sg(req_len, GFP_KERNEL, xf->max_sg);
   rs = nvgpu_tbuf_alloc_sg(posted, GFP_KERNEL, dev->v2 ? xf->max_sg : 1);
+  if (release) {
+    if (rq)
+      nvgpu_tbuf_on_free(rq, release, arg);
+    else
+      release(arg);
+  }
   if (!rq || !rs) {
     ret = -ENOMEM;
     goto out;
@@ -705,12 +737,30 @@ out:
   return ret;
 }
 
+static int nvgpu_call(struct nvgpu_device *dev, const void *req,
+                      size_t req_len, void *resp, size_t resp_len, u32 flags,
+                      u32 *used_len, struct nvgpu_times *tm, bool *sent) {
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, flags,
+                            used_len, tm, sent, NULL, NULL);
+}
+
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
                          void *resp, int resp_len, u32 *used_len) {
   if (req_len <= 0 || resp_len <= 0)
     return -EINVAL;
   return nvgpu_call(dev, req, req_len, resp, resp_len, 0, used_len, NULL,
                     NULL);
+}
+
+int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
+                            void *resp, int resp_len, u32 *used_len,
+                            void (*release)(void *arg), void *arg) {
+  if (req_len <= 0 || resp_len <= 0) {
+    release(arg);
+    return -EINVAL;
+  }
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
+                            NULL, NULL, release, arg);
 }
 
 int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,

@@ -1324,10 +1324,20 @@ static int nvgpu_kms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
 }
 
 /* A framebuffer's or cursor's GEM handle: our proxy's (owner, host GEM); the
- * backend re-homes it into the KMS file for the one call (RV:rehome). */
+ * backend re-homes it into the KMS file for the one call (RV:rehome). The
+ * proxy is held until the host is done with the request: its last close
+ * would otherwise GEM_CLOSE the numbers, and the host could give them to a
+ * new object before ADDFB2 or SETCURSOR ran (S-25). */
 static int nvgpu_kms_gem_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
                             u32 guest_handle, u32 *owner, u32 *gem) {
-  return nvgpu_gem_to_host(to_kms_call(call)->file, guest_handle, gem, owner);
+  struct nvgpu_gem_object *ng =
+      nvgpu_gem_lookup(to_kms_call(call)->file, guest_handle);
+
+  if (!ng)
+    return -ENOENT;
+  *gem = ng->host_handle;
+  *owner = ng->owner_handle;
+  return nvgpu_i2_hold(call, nvgpu_gem_put_ref, &ng->base);
 }
 
 /*

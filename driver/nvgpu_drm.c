@@ -1265,30 +1265,14 @@ int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
 }
 
 /*
- * Guest handle → the host handle it stands for, and the backend handle to
- * forward on. Fails for anything that is not one of our proxies rather than
- * forwarding a number that would name some unrelated host object.
+ * There is no "guest handle -> host numbers" that lets go of the proxy (this
+ * was nvgpu_gem_to_host()): the numbers are the proxy's only while it lives,
+ * and a concurrent last close would GEM_CLOSE them and let the host hand
+ * them to a new object before the request that names them ran (S-25).
+ * Whoever sends them holds the proxy (nvgpu_gem_lookup()) until the host is
+ * done with the request: nvgpu_i2_hold(), nvgpu_send_recv_holding().
  */
-int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
-                      u32 *host_handle, u32 *owner_handle) {
-  struct drm_gem_object *obj = drm_gem_object_lookup(file, guest_handle);
-  int ret = -ENOENT;
-
-  if (!obj)
-    return -ENOENT;
-
-  if (obj->funcs == &nvgpu_gem_funcs) {
-    struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
-
-    *host_handle = ng->host_handle;
-    if (owner_handle)
-      *owner_handle = ng->owner_handle;
-    ret = 0;
-  }
-
-  drm_gem_object_put(obj);
-  return ret;
-}
+void nvgpu_gem_put_ref(void *obj) { drm_gem_object_put(obj); }
 
 struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
                                           u32 guest_handle) {
@@ -1397,6 +1381,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   u32 fwd_handle = nfd->handle;
   u32 caller_handle = 0;
   u32 used, data_len, nested_len;
+  struct drm_gem_object *held = NULL;
 
   /*
    * The caller's struct has to be the one this descriptor describes, or the
@@ -1440,13 +1425,16 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
    * case that matters.
    */
   if (d->handle_offset != NVGPU_GEM_NO_FIELD && !d->handle_is_out) {
-    u32 host_handle;
+    struct nvgpu_gem_object *ng;
 
     caller_handle = get_unaligned_le32(outer + d->handle_offset);
-    ret = nvgpu_gem_to_host(file, caller_handle, &host_handle, &fwd_handle);
-    if (ret)
-      return ret;
-    put_unaligned_le32(host_handle, outer + d->handle_offset);
+    /* Held until the host is done with the numbers (S-25). */
+    ng = nvgpu_gem_lookup(file, caller_handle);
+    if (!ng)
+      return -ENOENT;
+    held = &ng->base;
+    fwd_handle = ng->owner_handle;
+    put_unaligned_le32(ng->host_handle, outer + d->handle_offset);
   }
 
   req_total = sizeof(*req) + d->size + nested_size;
@@ -1508,8 +1496,15 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
     }
   }
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  if (held) {
+    /* The request holds it from here, as long as the host may act on it. */
+    ret = nvgpu_send_recv_holding(nfd->dev, req_buf, req_total, resp_buf,
+                                  resp_max, &used, nvgpu_gem_put_ref, held);
+    held = NULL;
+  } else {
+    ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf,
+                               resp_max, &used);
+  }
   if (ret < 0)
     goto out;
   if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
@@ -1581,6 +1576,8 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   }
 
 out:
+  if (held)
+    drm_gem_object_put(held);
   kfree(req_buf);
   kfree(resp_buf);
   return ret;
