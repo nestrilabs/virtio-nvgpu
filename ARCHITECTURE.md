@@ -158,7 +158,7 @@ parts that cannot survive the crossing, calls the real ioctl, and sends the
 result back. The guest driver copies the reply into the caller's buffer and
 returns.
 
-Three kinds of thing cannot survive the crossing unchanged, and finding each of
+Four kinds of thing cannot survive the crossing unchanged, and finding each of
 them was its own bug:
 
 **Pointers.** Many NVIDIA parameter structs carry a pointer to a second block of
@@ -184,6 +184,22 @@ number forwarded verbatim picks out whatever the backend's process happens to
 have open at that number, which is not a failure with an error message; it is a
 failure with a plausible wrong answer. The guest driver replaces those with the
 handle of the file it refers to, and the backend puts its own descriptor back.
+
+**Processes.** RM keeps an object to the process that made its client: another
+process may duplicate it only if it was shared, and the one share RM starts
+with is "the same process". Every guest process's calls are the backend's, so
+to RM a whole VM is one process, and anything a guest shares RM shares with the
+host. So the backend holds sharing to the VM — a share goes to RM only when it
+narrows or grants to the VM's own clients — and keeps a duplicate's source
+client and its destination client to one guest process, unless the source was
+shared with the destination (`device/src/rmshare.rs`). Which process that is,
+only the guest kernel knows: its driver sends the caller's identity — the
+thread group's PID and its leader's start time, one process for the guest's
+lifetime — with every RM_ALLOC and RM_DUP_OBJECT, to a backend that asks in HELLO
+(`BCAP_PROC_ID`). A client handed to another process with its file stays its
+maker's, as RM's does. Processes in one guest that share GPU work do it
+through descriptors (dma-bufs, RM's export to a file) rather than handles, and
+cross nothing here.
 
 ---
 
@@ -438,7 +454,9 @@ registers its DRM devices. An older backend answers it the way it answers any
 message it does not know, and the guest stays on the first protocol, with no
 display features at all. The backend's reply says what it offers — the host's
 card nodes, a Wayland socket, fences, an NVKMS table for this host's release,
-export mode — and how large one request may be.
+export mode — and how large one request may be. The guest's side says what it
+can: the UVM aperture it found, and that it can name the process behind each
+RM call (§4).
 
 A HELLO also says whether this is a fresh driver instance, and a fresh one
 resets the session: every host file the previous instance held is closed,
@@ -923,7 +941,9 @@ host compositor really enters direct scanout for a guest window is stage 3 of
   a pointer — every field the host would follow is pointed at a buffer of the
   backend's or zeroed, and what cannot be made so is refused
   (`device/src/guestptr.rs`); UVM runs with pageable memory access off and
-  only its range-, handle- and GPU-level commands. IOCTL2 holds every display
+  only its range-, handle- and GPU-level commands. RM shares stay inside the
+  VM, and a duplicate or a second client named in parameters must be the VM's
+  own (§4). IOCTL2 holds every display
   call to the backend's own table (§10), NVKMS is held to grants (§13), a lease
   may scan out only its own VM's framebuffers (§11), the Wayland allowlist is
   enforced on the host (§14), and the backend refuses to run with privileges

@@ -462,6 +462,9 @@ The tests, each an ioctl a hostile guest would use:
 | `GRANT_PERMISSIONS SUB_OWNER` | nvidia-drm `0x52` with `type=3` | only `MODESET` allowed; SUB_OWNER refused | H (GRANT) |
 | `ADDFB2 non-NVKMS handle` | scan out a handle not IDENTIFYed as NVKMS | refused | L6, S-6 |
 | `GETFB foreign fb` | fetch a GEM handle for an fb this file did not create | handle returned as 0 | S-6, RV:getfb |
+| `RM_SHARE type ALL` | share an object with every RM client on the host | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS` in the status | S-35 |
+| `DUP other process` | a forked child makes a client and a VA space; the parent duplicates it into its own client | refused before RM (the clients' guest processes differ), `NV_ERR_INSUFFICIENT_PERMISSIONS` | S-35 |
+| `DUP same process` | **positive control**: the same duplicate between two clients of one process, on two files | **made** — a FAIL here is the backend refusing what RM allows, and makes the row above inconclusive | S-35 |
 
 **PASS:** every test reports `PASS refused` (or `SKIP` where the mode is not
 offered), the program exits 0, and — checked separately — **host `dmesg` is clean

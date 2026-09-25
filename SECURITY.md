@@ -151,6 +151,7 @@ each call is validated:
 | **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Any `F` ioctl on any open handle. **Size-checked** against the profile (23 escapes for 535, 24 for 580 and 595) once the host version had been learned from the guest's first CHECK_VERSION_STR; **raw** before that. | Only on GPU and control handles (`v1_route`, `device/src/nvidia.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused**, and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
 | **RM_CONTROL** commands | 1,362 method ids | All, **raw** past the 32-byte outer check. One embedded pointer was relocated, at an offset the guest named, into a heap buffer sized from what the guest sent. Every other embedded pointer reached RM as a guest address, which RM dereferences in the backend. | Still all but 15, and **not allow-listed**. 3 are **refused** (pointers the table cannot name one by one). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. |
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | All, **raw**. | All but **12, refused** (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event. The rest reach RM **not allow-listed**. |
+| **RM_SHARE, RM_DUP_OBJECT, and a second client named in parameters** | NV04 share and dup; 2 NV0000 share controls; 7 classes and 17 controls that name another client | **Raw**. RM saw every client of a VM as one process, the backend's, so a guest could share an object with every client on the host (type ALL) or every process of the backend's uid (OS_SECURITY_TOKEN), and any guest process could duplicate any other's objects by handle. | Shares go to RM only when they narrow or grant inside the VM; the rest are **refused**. A duplicate's two clients must be this VM's and, for a guest that says who makes each call, one guest process's unless the source was shared with the destination. A second client named in class or control parameters must be this VM's. Below, "RM objects between guest processes". |
 | **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | **Raw**: RM pinned the backend's pages at a guest-chosen address and mapped them for the GPU. | With an address alone, **refused**. With the guest-physical pages behind it (BCAP_OS_DESC), **table-sized**: only the user-virtual-address descriptor type, a page list covering exactly what RM pins, every page in guest RAM, and RM handed the backend's own mapping of exactly those pages (below). |
 | **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | All, **raw**. The guest copied 12 KiB each way for every command but the two it knew the size of, and pointers and descriptors went as sent. | At most **33** (30 to 33 per release), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages, and every file is put in multi-process sharing mode, which takes pageable access away on every release and ties the VA space to no process. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**. |
 | **nvidia-uvm tools**, `/dev/nvidia-uvm-tools` | 7 | All, **raw**. | **0**: the file opens, and every ioctl on it is **refused**. |
@@ -205,6 +206,67 @@ guest's choice. What bounds it:
 Sharing mode only takes things away (pageable access, the tie to the
 backend's mm), no host driver change is needed, and the VMM's seccomp filter
 already allows the calls involved (`mmap`, `mincore`, `ioctl`).
+
+### RM objects between guest processes
+
+RM keeps a user client's objects to the process that made it. Its one default
+share policy is `RS_SHARE_TYPE_PID` for DUP_OBJECT (`serverInitGlobalSharePolicies`,
+`sharing.c`), and a PID policy matches when the source client's ProcID is the
+duplicating client's (`cliresShareCallback`; the policy's `target` is never
+read). Every RM call a guest makes is the backend's, so all of a VM's clients
+were one process to RM: any guest process could duplicate any other's objects
+by handle, and a share a guest made RM applied to the host. The backend now
+judges three things before RM sees the call (`device/src/rmshare.rs`):
+
+- **Sharing.** NV_ESC_RM_SHARE and the two controls that do the same
+  (NV0000_CTRL_CMD_CLIENT_SHARE_OBJECT, SET_INHERITED_SHARE_POLICY) go to RM
+  when they revoke or only add a REQUIRE, which can only narrow what RM
+  shares, and when they grant to this VM: CLIENT naming one of its live
+  clients or the owner itself, PID (the owner's own process, the backend's,
+  whose other clients are this VM's and the backend's own), and NONE. A
+  grant of type ALL, OS_SECURITY_TOKEN (the uid, shared with every host
+  process of the backend's user, other VMs' backends included), GPU,
+  SMC_PARTITION, FM_CLIENT, a type RM does not define, or CLIENT naming any
+  other client is refused. The CLIENT grants RM takes are recorded, at most
+  4,096 a session.
+- **Duplicating.** NV_ESC_RM_DUP_OBJECT's destination and source clients must
+  both be clients this VM allocated and has not freed. And the source client
+  must have been made by the guest process that made the destination client,
+  as RM would require of two host processes, unless the caller made the
+  source (its own object, into a client whose file it holds), or a recorded
+  CLIENT grant on the object or on its client covers the destination for
+  DUP_OBJECT.
+- **Naming a second client.** Allocation classes and controls that name a
+  client besides the caller's are checked by RM with the caller's security
+  token, which matches any host process of the same euid, or not at all:
+  NV01_DEVICE_0's `hClientShare` and `hTargetClient`, the events'
+  `hParentClient`, GT200_DEBUGGER's `hAppClient`, the profiler's
+  `hClientTarget`, UVM_CHANNEL_RETAINER's and NV_CONFIDENTIAL_COMPUTE's
+  `hClient`; and CLIENT_GET_ACCESS_RIGHTS, NV503C REGISTER_PID, the five GR
+  ctxsw binds, EXEC_REG_OPS, MIGRATABLE_OPS, PROMOTE, EVICT and
+  INITIALIZE_CTX, two FIFO controls, INVALIDATE_TLB, and DEFERRED_API with
+  the control it bundles. Each such client must be none or this VM's. Every
+  `NvHandle h*Client*` field of 610.57.04's class and control headers was
+  read for this; the rest are kernel-only, vGPU host, diagnostics or
+  INTERNAL, which RM refuses the backend.
+
+A refusal is RM's own answer to a caller without the right,
+NV_ERR_INSUFFICIENT_PERMISSIONS in the parameters' status with the ioctl
+succeeding, as for the host-PID controls. A block too short to hold the
+fields is EINVAL.
+
+Only the guest kernel knows which guest process makes a call. The guest
+module says, when the backend asks for it in HELLO (`BCAP_PROC_ID`): 16
+bytes after the blocks of every RM_ALLOC and RM_DUP_OBJECT, the calling
+thread group's leader by its PID in the initial namespace and its start
+time. That pair is one process for the guest's lifetime, whatever PID
+namespace it runs in and however PIDs are reused. A fork is a new process,
+an exec is not, and a client passed to another process by its file stays its
+maker's, as RM keys a client's ProcID when the client is made. The backend
+takes the guest kernel's word, which is §2's line: separating guest users
+is the guest kernel's job. A guest module without the capability keeps what
+it had, with its processes sharing RM objects freely (logged once a
+session); the rules about the host and other VMs hold for it all the same.
 
 ### Memory registered by its pages: what the guest can make the GPU reach
 
@@ -439,6 +501,12 @@ type. One listener is allowed per export.
 | adopted DRM files | -- | a lease received from the host becomes a guest DRM file, cloned from a card-node file |
 | `nvgpu-wl-guest` | -- | a daemon listening at `$XDG_RUNTIME_DIR/wayland-0` in the guest |
 
+Every guest user reaches RM, as before, but no longer another guest
+process's RM objects: a duplicate between clients two processes made is
+refused unless the source was shared with the destination (§3, "RM objects
+between guest processes"). That rests on the guest module saying which
+process makes each call, and so holds only while the guest kernel does.
+
 Which host surfaces each display mode turns on:
 
 | mode | flag | host surfaces it adds |
@@ -467,6 +535,9 @@ Which host surfaces each display mode turns on:
 - the NVKMS grants and gates, framebuffer ownership, KMS master, the CRC gate
   and the property rules in §5;
 - the semaphore-surface bounds, ownership and caps;
+- that RM shares stay inside the VM, a duplicate's clients are the VM's and
+  one guest process's (or shared between them), and a second client named
+  in parameters is the VM's (§3, "RM objects between guest processes");
 - which UVM pools the VMM maps into the aperture, at what address, and how
   many;
 - the host-PID answers;
@@ -521,7 +592,8 @@ the IMEX and fabric classes (`50286f8`).
 1 is partly fixed and 1 is open.** "Fixed" means the finding's scenario no
 longer works in the code. None of it has been checked on hardware. No second
 adversarial pass has been run over the fixes: each status is taken from its
-fix commit and the code.
+fix commit and the code. S-35, which a later review of the RM path opened
+(NV_ESC_RM_SHARE forwarded raw), is fixed in the code the same way.
 
 ### Verification findings (NVK_VERIFICATION)
 
@@ -591,6 +663,7 @@ fix commit and the code.
 | S-32 | low | an unresolvable syncobj becomes a placeholder | `a6d3d2f` | fixed |
 | S-33 | low | final closes of display files block the VM's threads | `03b3539` | fixed; the pump's duplicate can delay a master release until UNWATCH |
 | S-34 | low | OPEN_KMS and DROP_IF_MASTER run on the queue thread | `03b3539` | fixed; a single "open non-master" op not added |
+| S-35 | high | RM_SHARE forwarded raw: a guest shares an object with every host client; DUP_OBJECT from a client not the VM's; every guest process duplicates every other's objects | `f550116` | fixed; opened by the review after these, not by the 34. Grants on intermediate objects are not followed (refused where RM allows), and a second client named in parameters is held to the VM, not to the guest process (§9) |
 
 Rejected by the security review:
 
@@ -725,6 +798,19 @@ In rough order of weight.
     counts against the registration budgets meanwhile. Exporting registered
     memory (Vulkan's external memory host exported onward, say) fails with
     EPERM where it works natively. None of it has run on hardware.
+12. **RM objects between guest processes rest on the guest kernel and on
+    reading.** Which guest process made a client, and which makes a
+    duplicate, is the guest kernel's word (§2). A guest module without
+    BCAP_PROC_ID gets no per-process check at all, only the VM boundary.
+    Grants are followed on the object and on its client only; a CLIENT grant
+    on a device or other intermediate object that RM would honour for the
+    objects under it is refused here. A second client named in class or
+    control parameters (a device sharing a VA space, register operations, a
+    profiler, GR binds) is held to the VM, not to the guest process: RM
+    allows those between host processes of one euid, which the backend
+    cannot see in the guest. The lists of shares and second-client fields
+    were read from 595.99.02 and 610.57.04; none of it has run on hardware,
+    and no workload of the 88 runs issued NV_ESC_RM_SHARE.
 
 ---
 
