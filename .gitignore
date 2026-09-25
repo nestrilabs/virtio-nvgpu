@@ -23,3 +23,4 @@ modules.order
 .DS_Store
 .vscode/
 .idea/
+scripts/verify/bin/
