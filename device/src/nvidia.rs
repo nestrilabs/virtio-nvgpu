@@ -1725,6 +1725,11 @@ impl NvidiaBackend {
         let Ok(host_fd) = self.handles.get_raw(handle) else {
             return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT);
         };
+        // Before anything is placed: a placement whose reply cannot be
+        // written would hold a reference no guest mapping will ever give back.
+        if resp_buf.len() < size_of::<MsgHeader>() + size_of::<MmapResp>() {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
+        }
         let (base, len) = (req.offset, req.size);
         let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
             Ok(p) => p,
@@ -1753,21 +1758,19 @@ impl NvidiaBackend {
                 if let Err(e) = placed {
                     self.uvm_maps.abort(aperture_off, len);
                     log::warn!(
-                        "mmap of UVM handle {handle}: the VMM would not map {base:#x}+{len:#x}                          at aperture {aperture_off:#x}: {e}"
+                        "mmap of UVM handle {handle}: the VMM would not map {base:#x}+{len:#x} \
+                         at aperture {aperture_off:#x}: {e}"
                     );
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
                 }
                 self.uvm_maps.commit(handle, base, aperture_off, id);
                 log::info!(
-                    "mmap of UVM handle {handle}: pool {base:#x}+{len:#x} at aperture                      {aperture_off:#x}, id {id}"
+                    "mmap of UVM handle {handle}: pool {base:#x}+{len:#x} at aperture \
+                     {aperture_off:#x}, id {id}"
                 );
                 (aperture_off, id)
             }
         };
-        let need = size_of::<MsgHeader>() + size_of::<MmapResp>();
-        if resp_buf.len() < need {
-            return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
-        }
         let mut n = self.write_hdr(resp_buf, handle, 0);
         n += write_struct(
             &mut resp_buf[n..],
