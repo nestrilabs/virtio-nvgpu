@@ -142,14 +142,14 @@ pub trait Env {
 /// on its own plane would show the host desktop or another VM's lease on its
 /// connector, and read it back through its CRTC's checksum (S-6). A
 /// framebuffer id a guest names as a source must be one some KMS file of the
-/// same VM made ([`VmFbs`]); within the VM it is the guest kernel's business
+/// same VM made ([`VmKms`]); within the VM it is the guest kernel's business
 /// who uses whose, as it is on bare metal.
 pub struct KmsFileState {
     /// Which file this is in `vm`: a number never reused, so a call still
     /// running on a closed file cannot credit what it makes to the next file
     /// the guest's handle number is given to.
     serial: u64,
-    vm: Arc<VmFbs>,
+    vm: Arc<VmKms>,
     inner: Mutex<KmsInner>,
 }
 
@@ -158,8 +158,10 @@ struct KmsInner {
     prop_names: HashMap<u32, [u8; 32]>,
 }
 
-/// Every framebuffer the KMS files of one VM made and have not removed, by
-/// id, with the file ([`KmsFileState::serial`]) that made it.
+/// What the KMS files of one VM share: every framebuffer they made and
+/// have not removed, by id, with the file ([`KmsFileState::serial`]) that
+/// made it; and when the VM last had the host probe each connector
+/// ([`VmKms::may_probe`]).
 ///
 /// A record goes before the host could hand its id to anyone else: RMFB and
 /// CLOSEFB take it out before the call and put it back only if the host
@@ -169,22 +171,28 @@ struct KmsInner {
 /// finishing on it after the close cannot leave an id behind that outlives
 /// the host framebuffer.
 #[derive(Default)]
-pub struct VmFbs {
-    inner: Mutex<VmFbsInner>,
+pub struct VmKms {
+    inner: Mutex<VmKmsInner>,
 }
 
 #[derive(Default)]
-struct VmFbsInner {
+struct VmKmsInner {
     owner: HashMap<u32, u64>,
     retired: HashSet<u64>,
+    /// (card, connector id) -> the last forced probe.
+    probed: HashMap<(u32, u32), std::time::Instant>,
 }
 
-impl VmFbs {
+/// How often the VM may have the host probe one connector (GETCONNECTOR
+/// with count_modes 0); see `Prepared::limit_forced_probe`.
+pub const CONNECTOR_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl VmKms {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VmFbsInner> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VmKmsInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -199,6 +207,20 @@ impl VmFbs {
         let mut v = self.lock();
         v.owner.clear();
         v.retired.clear();
+        v.probed.clear();
+    }
+
+    /// Whether connector `connector` of card `card` may be probed at `now`
+    /// (and if so, that it was): once per [`CONNECTOR_PROBE_EVERY`] across
+    /// every file of the VM, since connector ids are the device's.
+    pub fn may_probe(&self, card: u32, connector: u32, now: std::time::Instant) -> bool {
+        let mut v = self.lock();
+        let last = v.probed.entry((card, connector)).or_insert(now);
+        if *last == now || now.duration_since(*last) >= CONNECTOR_PROBE_EVERY {
+            *last = now;
+            return true;
+        }
+        false
     }
 }
 
@@ -215,7 +237,7 @@ impl KmsFileState {
     }
 
     /// A file of the VM whose framebuffers `vm` records.
-    pub fn in_vm(vm: Arc<VmFbs>) -> Self {
+    pub fn in_vm(vm: Arc<VmKms>) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
@@ -467,6 +489,9 @@ pub struct Prepared {
     kms: Option<Arc<KmsFileState>>,
     /// What `Hooks::before` asked `Hooks::at_run` to check again.
     run_gate: Option<u64>,
+    /// `Hooks::before` answered the call itself (`answer_locally`): the
+    /// host is not asked, and this is its return value.
+    local: Option<i32>,
     hooks: Arc<dyn Hooks>,
     sys: Arc<dyn Sys>,
     ret: i32,
@@ -531,6 +556,7 @@ pub fn prepare(
         fence_outs: Vec::new(),
         kms: None,
         run_gate: None,
+        local: None,
         hooks: env.hooks(),
         sys: env.sys(),
         ret: -libc::ECANCELED,
@@ -668,6 +694,20 @@ impl Prepared {
     /// What `set_run_gate` recorded.
     pub fn run_gate(&self) -> Option<u64> {
         self.run_gate
+    }
+
+    /// For `Hooks::before`: the call is answered without the host, with
+    /// `ret` and the buffers as the hook leaves them (it writes the reply
+    /// into them). Only for calls that make nothing -- no descriptor, no
+    /// GEM handle -- since nothing of that kind would be there to adopt.
+    pub fn answer_locally(&mut self, ret: i32) {
+        debug_assert!(self.fd_outs.is_empty() && self.gem_outs.is_empty());
+        self.local = Some(ret);
+    }
+
+    /// What `answer_locally` set.
+    pub fn answered_locally(&self) -> Option<i32> {
+        self.local
     }
 
     pub fn policy(&self) -> u32 {
@@ -1233,8 +1273,13 @@ const NV_GEM_OBJECT_NVKMS: u64 = 0;
 
 impl Prepared {
     fn run(&mut self, target_fd: RawFd) -> Result<i32, Errno> {
+        if let Some(ret) = self.local {
+            return Ok(ret);
+        }
         self.check_fb_sources()?;
         self.check_props(target_fd)?;
+        // Held until the ioctl has returned: the kernel may write there.
+        let _scratch = self.limit_forced_probe(std::time::Instant::now())?;
         let hooks = self.hooks.clone();
         let gate = match self.run_gate {
             Some(_) => hooks.at_run(self)?,
@@ -1315,6 +1360,55 @@ impl Prepared {
             self.target
         );
         Err(libc::EPERM)
+    }
+
+    /// GETCONNECTOR with count_modes 0 from a (lessee) master is a forced
+    /// probe: under mode_config.mutex, fill_modes (drm_connector.c:3373-3377)
+    /// -> nv_drm_connector_detect -> QUERY_DPY_DYNAMIC_DATA through the kapi
+    /// (nvidia-drm-connector.c:165, nvkms-kapi.c:1527), a fresh EDID read
+    /// under nvkms_lock, which the host compositor's flips wait on (S-8).
+    /// Once per [`CONNECTOR_PROBE_EVERY`] per connector per VM it goes as
+    /// sent; in between, count_modes becomes 1 with a one-mode buffer of our
+    /// own behind modes_ptr: then the kernel only reports the modes of the
+    /// last probe (3374: no fill_modes), copies them only if exactly one
+    /// fits (into that buffer, which nobody reads), and writes the real
+    /// count back, which is all a count_modes 0 caller gets anyway. The
+    /// guest's own modes_ptr (NULL: it asked for no modes) goes back in
+    /// place as for every pointer. Returns the buffer, to outlive the call.
+    fn limit_forced_probe(&mut self, now: std::time::Instant) -> Result<Option<GuardedBuf>, Errno> {
+        const COUNT_MODES: usize = 32;
+        const MODES_PTR: usize = 8;
+        const CONNECTOR_ID: usize = 48;
+        const MODEINFO: usize = 68;
+        if self.entry.name != "GETCONNECTOR" {
+            return Ok(None);
+        }
+        let card = match self.target_kind {
+            HandleKind::DrmCard(c) | HandleKind::DrmLease(c) => c,
+            _ => return Ok(None),
+        };
+        let arg = self.bufs[0].bytes();
+        if rd(arg, COUNT_MODES, 4) != 0 {
+            return Ok(None);
+        }
+        let connector = rd(arg, CONNECTOR_ID, 4) as u32;
+        let Some(k) = &self.kms else {
+            return Ok(None);
+        };
+        if k.vm.may_probe(card, connector, now) {
+            return Ok(None);
+        }
+        let mut scratch = GuardedBuf::new(MODEINFO).ok_or(libc::ENOMEM)?;
+        let at = scratch.as_mut_ptr() as u64;
+        let arg = self.bufs[0].bytes_mut();
+        wr(arg, COUNT_MODES, 4, 1);
+        wr(arg, MODES_PTR, 8, at);
+        log::debug!(
+            "GETCONNECTOR {connector} on handle {}: probed less than {:?} ago; reported, not probed",
+            self.target,
+            CONNECTOR_PROBE_EVERY
+        );
+        Ok(Some(scratch))
     }
 
     /// RMFB/CLOSEFB: the record goes before the call, so no scanout call on
@@ -3185,7 +3279,7 @@ mod tests {
     #[test]
     fn a_framebuffer_any_file_of_the_vm_made_is_a_source_until_that_file_retires() {
         let mut h = h();
-        let vm = Arc::new(VmFbs::new());
+        let vm = Arc::new(VmKms::new());
         let other = KmsFileState::in_vm(vm.clone());
         other.add_fb(42);
         h.kms = Some(Arc::new(KmsFileState::in_vm(vm.clone())));
@@ -3221,6 +3315,55 @@ mod tests {
         h.sys.on_ioctl(|_, _, _, _| 0);
         assert_eq!(h.kms(&rmfb).unwrap().ret, 0);
         assert!(!k.may_scan_out(42));
+    }
+
+    // ── forced connector probes (S-8) ──
+
+    fn getconnector(connector: u32) -> Rq {
+        Rq::new(iowr(0xa7, 80)).buf(80, Some(&arg(80, &[(48, 4, connector as u64)])))
+    }
+
+    #[test]
+    fn a_connector_probed_a_moment_ago_is_reported_without_a_probe() {
+        let h = h();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        h.sys.on_ioctl(move |_, _, _, arg| unsafe {
+            let (count, ptr) = (peek(arg, 32, 4), peek(arg, 8, 8));
+            log.lock().unwrap().push((count, ptr != 0));
+            if count >= 1 && ptr != 0 {
+                // One mode, and room for one: the kernel copies it.
+                poke(ptr as *mut u8, 0, 4, 0xdead);
+            }
+            poke(arg, 32, 4, 1);
+            0
+        });
+        for _ in 0..2 {
+            let r = h.kms(&getconnector(7)).unwrap();
+            assert_eq!(r.ret, 0);
+            assert_eq!(rd(&r.data, 32, 4), 1, "the real count, either way");
+            assert_eq!(rd(&r.data, 8, 8), 0, "and the guest's own pointer");
+        }
+        // Another connector is its own.
+        h.kms(&getconnector(8)).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, false), (1, true), (0, false)],
+            "the second call asked for one mode into a buffer of ours: no probe"
+        );
+    }
+
+    #[test]
+    fn a_connector_may_be_probed_once_a_window_across_the_vm() {
+        let vm = VmKms::new();
+        let t0 = std::time::Instant::now();
+        assert!(vm.may_probe(0, 7, t0));
+        assert!(!vm.may_probe(0, 7, t0 + CONNECTOR_PROBE_EVERY / 2));
+        assert!(
+            vm.may_probe(1, 7, t0),
+            "another card's connector 7 is another"
+        );
+        assert!(vm.may_probe(0, 7, t0 + CONNECTOR_PROBE_EVERY));
     }
 
     // ── NVKMS ──

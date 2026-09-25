@@ -471,6 +471,9 @@ static V535_129_03_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 636,
     alloc_reply_coherency: 1066,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35024),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -484,6 +487,8 @@ static V535_129_03_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: false,
 };
 
@@ -739,6 +744,9 @@ static V580_178_04_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 644,
     alloc_reply_coherency: 1482,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35088),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -752,6 +760,8 @@ static V580_178_04_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: true,
 };
 
@@ -1007,6 +1017,9 @@ static V595_71_05_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 644,
     alloc_reply_coherency: 1482,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35096),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -1020,6 +1033,8 @@ static V595_71_05_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: true,
 };
 
@@ -1275,6 +1290,9 @@ static V595_99_02_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 644,
     alloc_reply_coherency: 1482,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35096),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -1288,6 +1306,8 @@ static V595_99_02_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: true,
 };
 
@@ -1543,6 +1563,9 @@ static V610_57_04_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 644,
     alloc_reply_coherency: 1414,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35096),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -1556,6 +1579,8 @@ static V610_57_04_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: true,
 };
 
@@ -1808,6 +1833,9 @@ static V615_71_09_LAYOUT: NvkmsLayout = NvkmsLayout {
     alloc_reply_disps: 644,
     alloc_reply_coherency: 1414,
     dpy_dynamic_scrub: &[(12, 2058)],
+    dpy_dynamic: NvkmsTarget { device: 0, disp: 4, what: 8 },
+    dpy_dynamic_reply: (2072, 35096),
+    alloc_device_id: 32,
     set_cursor_image: NvkmsTarget { device: 0, disp: 4, what: 8 },
     move_cursor: NvkmsTarget { device: 0, disp: 4, what: 8 },
     set_lut: NvkmsTarget { device: 0, disp: 4, what: 8 },
@@ -1821,6 +1849,8 @@ static V615_71_09_LAYOUT: NvkmsLayout = NvkmsLayout {
     event_interest: 0,
     events_allowed: 0x27,
     next_event_valid: 8,
+    next_event_type: 16,
+    dpy_events: 0x7,
     drm_grant_typed: true,
 };
 

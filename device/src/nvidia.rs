@@ -15,7 +15,7 @@ use crate::pump::{PumpCmd, WatchMode};
 use crate::semsurf::SemsurfPolicy;
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
-use crate::xfer::{Hooks, KmsFileState, Sys, VmFbs};
+use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
 
 // ============================================================
 // Device path helpers
@@ -528,7 +528,7 @@ pub struct NvidiaBackend {
     pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
     /// Every framebuffer those files made, VM-wide: the only ids a guest
     /// may name as a scanout source (S-6, `xfer::KmsFileState`).
-    pub(crate) vm_fbs: Arc<VmFbs>,
+    pub(crate) vm_kms: Arc<VmKms>,
     /// The policy every IOCTL2 is checked against (see `policy.rs`).
     pub(crate) hooks: Arc<dyn Hooks>,
     /// Shared syncobj wait registrations (HOST_OP SYNCOBJ_WATCH, fence.rs).
@@ -994,7 +994,7 @@ impl NvidiaBackend {
             nodes: None,
             signaled: None,
             kms_states: std::collections::HashMap::new(),
-            vm_fbs: Arc::default(),
+            vm_kms: Arc::default(),
             syncobj_regs: crate::fence::Registrations::default(),
             hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone()),
             nvkms,
@@ -1259,7 +1259,7 @@ impl NvidiaBackend {
         for (_, k) in self.kms_states.drain() {
             k.retire();
         }
-        self.vm_fbs.clear();
+        self.vm_kms.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
         self.nvkms.reset();
@@ -2305,6 +2305,11 @@ impl NvidiaBackend {
                     );
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
+                // A dpy probed too recently is answered with the last reply
+                // (nvkms.rs, `dpy_probe`; S-8), laid out as the host's.
+                if self.nvkms.v1_cached(self.current_handle, &mut msg) {
+                    return self.write_ioctl_resp(resp_buf, cookie, &msg);
+                }
                 let n = self.dispatch_nested(
                     cookie, host_fd, request, &msg, resp_buf, 16, // outer_size
                     8,  // ptr_offset
@@ -2316,6 +2321,8 @@ impl NvidiaBackend {
                 let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
                 if n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0 {
                     self.nvkms.v1_after(&mut resp_buf[body..n]);
+                    self.nvkms
+                        .v1_record(self.current_handle, &resp_buf[body..n]);
                 }
                 return n;
             }

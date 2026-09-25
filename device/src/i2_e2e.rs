@@ -984,6 +984,12 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
                 poke(p, 456, 4, 5);
                 -libc::EPERM
             }
+            // QUERY_DPY_DYNAMIC_DATA: the reply half (2072 on) memset and
+            // filled (nvkms-dpy.c:3068), here with one byte.
+            (6, 37168) => {
+                std::ptr::write_bytes(p.add(2072), 0x42, 37168 - 2072);
+                0
+            }
             (11, 20) => 0, // MOVE_CURSOR
             // FLIP of one head: what each layer's awaken reached the host as.
             (15, 3104) if peek(p, 16, 4) == 1 => {
@@ -1253,7 +1259,7 @@ fn addfb2_takes_the_proxies_objects_into_the_lease_for_one_job_only() {
     w.be.close_handle(kms).unwrap();
     assert!(!w.be.kms_states.contains_key(&kms));
     assert!(
-        !w.be.vm_fbs.made_here(77),
+        !w.be.vm_kms.made_here(77),
         "nor may anything of this VM name it as a scanout source any more"
     );
 }
@@ -1735,6 +1741,30 @@ fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes(
     nvkms_call(&mut w, 11, &cursor(1));
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 41, 11]);
+}
+
+/// Every QUERY_DPY_DYNAMIC_DATA is a fresh EDID read under nvkms_lock on
+/// the host (S-8): a second one of the same dpy inside the limit's window
+/// is answered with the first one's reply, which reaches the guest as the
+/// host's would, and never reaches the host.
+#[test]
+fn a_dpy_probed_a_moment_ago_is_answered_without_the_host() {
+    let mut w = nvkms_world();
+    let modeset = w.modeset;
+    nvkms_call(&mut w, 0, &[0u8; 1440]);
+    assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ALLOC_DEVICE");
+    let mut q = vec![0u8; 37168];
+    wr(&mut q, 0, 4, 1); // deviceHandle
+    wr(&mut q, 4, 4, 0x100); // dispHandle
+    wr(&mut q, 8, 4, 1 << 3); // dpyId
+    for _ in 0..3 {
+        nvkms_call(&mut w, 6, &q);
+        assert_eq!(w.nvkms(modeset, 0x1000), Ok(0));
+        let r = w.mem.get(0x2000);
+        assert!(r[2072..].iter().all(|&b| b == 0x42), "the host's reply");
+        assert_eq!(rd(r, 8, 4), 1 << 3, "and the request as sent");
+    }
+    assert_eq!(w.fake.0.lock().unwrap().nvkms, vec![0, 6], "one probe");
 }
 
 /// A gated call is decided when it is prepared and runs when its executor

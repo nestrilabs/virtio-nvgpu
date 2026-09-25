@@ -499,6 +499,12 @@ pub struct NvkmsLayout {
     pub alloc_reply_coherency: u32,
     /// QUERY_DPY_DYNAMIC_DATA's override flags and EDID: (off, len).
     pub dpy_dynamic_scrub: &'static [(u32, u32)],
+    /// QUERY_DPY_DYNAMIC_DATA's device, disp and dpyId (`what`).
+    pub dpy_dynamic: NvkmsTarget,
+    /// QUERY_DPY_DYNAMIC_DATA's reply half: (off, len).
+    pub dpy_dynamic_reply: (u32, u32),
+    /// ALLOC_DEVICE's request.deviceId(.rmDeviceId): which GPU.
+    pub alloc_device_id: u32,
     pub set_cursor_image: NvkmsTarget,
     pub move_cursor: NvkmsTarget,
     pub set_lut: NvkmsTarget,
@@ -517,6 +523,11 @@ pub struct NvkmsLayout {
     pub events_allowed: u32,
     /// GET_NEXT_EVENT's reply.valid (a byte).
     pub next_event_valid: u32,
+    /// GET_NEXT_EVENT's reply.event.eventType.
+    pub next_event_type: u32,
+    /// The event types (as bits) after which a dpy's dynamic data may have
+    /// changed: DPY_CHANGED, DYNAMIC_DPY_CONNECTED/DISCONNECTED.
+    pub dpy_events: u32,
     /// nvidia-drm's GRANT/REVOKE_PERMISSIONS carry a `type` (12/8 bytes;
     /// false: 535's 8/4, always MODESET).
     pub drm_grant_typed: bool,

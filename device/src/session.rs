@@ -643,7 +643,7 @@ impl NvidiaBackend {
             }
         };
         if class == SchemaClass::Kms {
-            let vm = self.vm_fbs.clone();
+            let vm = self.vm_kms.clone();
             self.kms_states
                 .entry(target)
                 .or_insert_with(|| Arc::new(xfer::KmsFileState::in_vm(vm)));
