@@ -2266,8 +2266,26 @@ impl NvidiaBackend {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                     }
                 };
+                // The descriptor some commands name another file by
+                // (uvmfd.rs): our handle, as the guest driver sent it, becomes
+                // our descriptor for the call and the handle again in the
+                // reply.
+                let fd_field = match self.uvm_fd_in(ireq.cmd, &mut params) {
+                    Ok(f) => f,
+                    Err(errno) => {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                    }
+                };
                 let n = self.dispatch_simple(cookie, host_fd, request, &params, resp_buf);
                 Self::restore_reply(&restore, resp_buf, n);
+                if let Some((off, handle)) = fd_field {
+                    let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+                    if let Some(s) = resp_buf.get_mut(body + off..body + off + 4)
+                        && n >= body + off + 4
+                    {
+                        s.copy_from_slice(&handle.to_le_bytes());
+                    }
+                }
                 return n;
             }
             V1Route::DrmFlat => {
@@ -3724,6 +3742,55 @@ impl NvidiaBackend {
     /// handle is one of the NVIDIA devices. RM and NVKMS only understand their
     /// own files; a card, a lease or a sync_file has no business in one of
     /// their parameter blocks.
+    /// Turn the handle in UVM command `cmd`'s descriptor field (uvmfd.rs)
+    /// into the descriptor it stands for, in `params`, the block the host
+    /// will be handed. `Some((offset, handle))` when one was replaced, for
+    /// the reply; a negative value is UVM's "none" and stays. Anything that
+    /// is not a handle of the kind the field names -- an RM control file, or
+    /// a UVM file -- is refused rather than handed to the host as a number
+    /// in our table.
+    fn uvm_fd_in(
+        &self,
+        cmd: u32,
+        params: &mut [u8],
+    ) -> std::result::Result<Option<(usize, u32)>, i32> {
+        let Some(field) = crate::uvmfd::field(self.driver, cmd) else {
+            return Ok(None);
+        };
+        let off = field.offset as usize;
+        let Some(raw) = params.get(off..off + 4) else {
+            log::warn!(
+                "UVM command {cmd}: {} bytes, too short for its descriptor at {off}",
+                params.len()
+            );
+            return Err(libc::EINVAL);
+        };
+        let value = i32::from_le_bytes(raw.try_into().unwrap());
+        if value < 0 {
+            return Ok(None);
+        }
+        let handle = value as u32;
+        let want = match field.of {
+            crate::uvmfd::FdOf::RmCtl => HandleKind::Dev(DeviceKind::Ctl),
+            crate::uvmfd::FdOf::Uvm => HandleKind::Dev(DeviceKind::Uvm),
+        };
+        match self.handles.get(handle) {
+            Some((fd, kind)) if kind == want => {
+                let host = std::os::fd::AsRawFd::as_raw_fd(&fd);
+                params[off..off + 4].copy_from_slice(&host.to_le_bytes());
+                Ok(Some((off, handle)))
+            }
+            other => {
+                log::warn!(
+                    "UVM command {cmd}: descriptor field names handle {handle} ({:?}), not a \
+                     {want:?} of ours",
+                    other.map(|(_, k)| k)
+                );
+                Err(libc::EBADF)
+            }
+        }
+    }
+
     fn dev_fd(&self, handle: u32) -> Result<RawFd> {
         match self.handles.get(handle) {
             Some((fd, HandleKind::Dev(_))) => Ok(std::os::fd::AsRawFd::as_raw_fd(&fd)),
@@ -5354,6 +5421,61 @@ mod tests {
         let status: u32 = if key == served { 0 } else { 0x56 };
         a[status_at..status_at + 4].copy_from_slice(&status.to_le_bytes());
         0
+    }
+
+    std::thread_local! {
+        /// The descriptor the fake UVM was handed in MM_INITIALIZE.
+        static UVM_FD_SEEN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+
+    unsafe fn fake_uvm(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        if request == 75 {
+            // SAFETY: MM_INITIALIZE's 8 bytes.
+            let v = unsafe { (arg as *const i32).read_unaligned() };
+            UVM_FD_SEEN.with(|s| s.set(Some(v)));
+        }
+        0
+    }
+
+    /// UVM fgets MM_INITIALIZE's uvmFd in the calling process: the handle
+    /// the guest driver sent must reach it as our descriptor of that UVM
+    /// file, come back as the handle, and name nothing else.
+    #[test]
+    fn a_uvm_descriptor_field_reaches_the_host_as_our_descriptor_of_that_file() {
+        use std::os::fd::AsRawFd;
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_uvm);
+        let primary_fd = devnull();
+        let primary_raw = primary_fd.as_raw_fd();
+        let primary = be.adopt_for_test(primary_fd, HandleKind::Dev(DeviceKind::Uvm));
+        let second = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+
+        let mut p = [0u8; 8];
+        p[..4].copy_from_slice(&primary.to_le_bytes());
+        let resp = v1_ioctl(&mut be, second, 75, &p);
+        assert_eq!(parse_resp(&resp).status, 0);
+        assert_eq!(UVM_FD_SEEN.with(|s| s.take()), Some(primary_raw));
+        assert_eq!(
+            &resp[IOCTL_BODY..IOCTL_BODY + 4],
+            &primary.to_le_bytes(),
+            "the handle comes back, never our descriptor"
+        );
+
+        // An RM control file is not a UVM file, and a number that is no
+        // handle of ours is not passed on as one.
+        for bad in [ctl, 0x7777] {
+            p[..4].copy_from_slice(&bad.to_le_bytes());
+            let resp = v1_ioctl(&mut be, second, 75, &p);
+            assert_eq!(parse_resp(&resp).status, -libc::EBADF);
+            assert_eq!(UVM_FD_SEEN.with(|s| s.take()), None);
+        }
+
+        // -1 is UVM's "none", and names nothing anywhere.
+        p[..4].copy_from_slice(&(-1i32).to_le_bytes());
+        v1_ioctl(&mut be, second, 75, &p);
+        assert_eq!(UVM_FD_SEEN.with(|s| s.take()), Some(-1));
     }
 
     /// S-24: a control that lists the host's GPU processes never reaches

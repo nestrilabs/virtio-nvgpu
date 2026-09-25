@@ -1119,6 +1119,26 @@ nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int cmd) {
   return NULL;
 }
 
+/*
+ * The UVM commands that name another open file -- the RM control file a GPU,
+ * VA space, channel or allocation belongs to, or the primary UVM file
+ * MM_INITIALIZE pins -- as the config's table lists them (NVGPU_FDT_UVM).
+ * UVM looks a descriptor up in the calling process, which on the host is the
+ * backend: forwarded as the caller's number, it named whatever the backend
+ * had open under that number.
+ */
+static const struct nvgpu_fd_translation_entry *
+nvgpu_find_uvm_fd_translation(struct nvgpu_device *dev, unsigned int cmd) {
+  u32 i;
+
+  if (cmd & NVGPU_FDT_UVM)
+    return NULL;
+  for (i = 0; i < dev->num_fd_translations; i++)
+    if (le32_to_cpu(dev->fd_translations[i].nr) == (NVGPU_FDT_UVM | cmd))
+      return &dev->fd_translations[i];
+  return NULL;
+}
+
 /* Main ioctl dispatcher */
 /*
  * Split from nvgpu_ioctl so a DRM node can reach it. On a real DRM node
@@ -1166,6 +1186,7 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
   unsigned int nr = _IOC_NR(cmd);
   unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
+  const struct nvgpu_fd_translation_entry *fdt;
 
   /*
    * UVM ioctls use _IOC(0, 0, nr, 0x3000) — type=0, size=0x3000.
@@ -1250,6 +1271,19 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
     flags |= (1ULL << 2);
     if (copy_to_user(uarg, &flags, sizeof(flags)))
       return -EFAULT;
+  }
+
+  /*
+   * A command naming another file: the caller's descriptor becomes our
+   * handle for that file (and one not of ours is refused), sent in a block of
+   * the command's own size, and the caller reads back its own descriptor.
+   */
+  fdt = nvgpu_find_uvm_fd_translation(nfd->dev, cmd);
+  if (fdt) {
+    u32 packed = le32_to_cpu(fdt->payload_offset);
+
+    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, packed >> 16,
+                                    packed & 0xffff);
   }
 
   return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);

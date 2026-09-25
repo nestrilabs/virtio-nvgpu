@@ -208,13 +208,20 @@ impl VirtioGpuNvConfig {
         // The list has to agree with the backend's own, in
         // `nvidia.rs::dispatch_fd_ioctl`, since that is what reads the
         // rewritten field back out.
-        for (i, (nr, off)) in FD_CARRYING_IOCTLS.iter().enumerate() {
+        //
+        // Then the UVM commands that name a file (crate::uvmfd), marked
+        // FDT_UVM, with their block sizes; where one of them sits depends on
+        // the host release.
+        let uvm = crate::uvmfd::config_entries(abi::version::DriverVersion::parse(driver_version));
+        let entries: Vec<(u32, u32)> = FD_CARRYING_IOCTLS.iter().copied().chain(uvm).collect();
+        assert!(entries.len() <= MAX_FD_TRANSLATIONS);
+        for (i, (nr, off)) in entries.iter().enumerate() {
             cfg.fd_translations[i] = FdTranslation {
                 nr: *nr,
                 payload_offset: *off,
             };
         }
-        cfg.num_fd_translations = FD_CARRYING_IOCTLS.len() as u32;
+        cfg.num_fd_translations = entries.len() as u32;
         cfg
     }
 
@@ -322,6 +329,28 @@ mod tests {
         assert_eq!(&slot.pci_addr[..15], b"0000:01:00.0:ex");
     }
 
+    /// The UVM descriptor fields follow the RM escapes' in the table,
+    /// marked so an older guest driver, which matches `nr` against an
+    /// escape's 8-bit number, can never take one for an escape.
+    #[test]
+    fn the_uvm_descriptor_fields_follow_the_rm_ones_marked_as_uvm() {
+        let cfg = VirtioGpuNvConfig::new("535.129.03", &[]);
+        let n = cfg.num_fd_translations as usize;
+        assert_eq!(n, FD_CARRYING_IOCTLS.len() + 6);
+        let table = cfg.fd_translations;
+        for (i, e) in table[..FD_CARRYING_IOCTLS.len()].iter().enumerate() {
+            let nr = e.nr;
+            assert_eq!(nr, FD_CARRYING_IOCTLS[i].0);
+        }
+        let uvm: Vec<(u32, u32)> = table[FD_CARRYING_IOCTLS.len()..n]
+            .iter()
+            .map(|e| (e.nr, e.payload_offset))
+            .collect();
+        assert!(uvm.iter().all(|(nr, _)| nr & crate::uvmfd::FDT_UVM != 0));
+        // MAP_EXTERNAL_ALLOCATION at 535's offset, in a 1200-byte block.
+        assert!(uvm.contains(&(crate::uvmfd::FDT_UVM | 33, 1184 | (1200 << 16))));
+    }
+
     #[test]
     fn more_gpus_than_slots_are_truncated_not_over_claimed() {
         let many: Vec<_> = (0..12)
@@ -329,7 +358,10 @@ mod tests {
             .collect();
         let cfg = VirtioGpuNvConfig::new("615.71.09", &many);
         let n = cfg.num_gpus;
-        assert_eq!(n as usize, MAX_GPUS, "claimed more GPUs than it can describe");
+        assert_eq!(
+            n as usize, MAX_GPUS,
+            "claimed more GPUs than it can describe"
+        );
     }
 
     #[test]
