@@ -32,7 +32,7 @@ use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::Shm;
+use crate::shm::{Shm, ShmBudget};
 use crate::stream::{Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
@@ -286,6 +286,24 @@ impl Engine {
 
     pub fn policy_mut(&mut self) -> &mut Policy {
         &mut self.cfg.policy
+    }
+
+    /// Charge shm pools to `b` as well as to this connection's own limits
+    /// (`shm.rs`): the backend gives every connection of a VM the same one,
+    /// so the number of connections does not multiply what a guest can make
+    /// the host hold.
+    pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+        self.shm.set_shared_budget(b);
+    }
+
+    /// The connection is over: let go at once of what only a live connection
+    /// needs -- shm pools (whose memfds are what a guest commits host memory
+    /// through) and half-received blobs -- rather than when the owner gets
+    /// round to dropping the engine, which for the backend is whenever the
+    /// guest closes the handle.
+    pub fn shed(&mut self) {
+        self.shm.clear();
+        self.blobs.clear();
     }
 
     /// The far side has gone (HANGUP received).
@@ -740,7 +758,13 @@ impl Engine {
                                     ));
                                 }
                             };
-                            self.shm.add_pool(new_id_at(0), fd, size);
+                            // The client's own memory, but a descriptor
+                            // held here: only the count is charged.
+                            let charge = self
+                                .shm
+                                .charge(0)
+                                .map_err(|_| err(ERR_NO_MEMORY, "too many shm pools".into()))?;
+                            self.shm.add_pool(new_id_at(0), fd, size, charge);
                             DescOut::plain(Desc {
                                 c: size,
                                 ..Desc::new(frame::DESC_SHM_POOL)
@@ -838,18 +862,20 @@ impl Engine {
                                         ));
                                     }
                                 };
-                                if !self.shm.may_grow(size) {
-                                    return Err(err(
+                                // Charged before the memfd exists: past this
+                                // connection's or the VM's budget, no memfd.
+                                let charge = self.shm.charge(size).map_err(|_| {
+                                    err(
                                         ERR_NO_MEMORY,
-                                        "too much shm for one connection".into(),
-                                    ));
-                                }
+                                        "shm pool over the connection's or the VM's budget".into(),
+                                    )
+                                })?;
                                 let memfd = sys::memfd(c"nvgpu-wl-shm", size)
                                     .map_err(|e| err(ERR_NO_MEMORY, format!("shm pool: {e}")))?;
                                 let give = memfd
                                     .try_clone()
                                     .map_err(|e| err(ERR_NO_MEMORY, format!("dup: {e}")))?;
-                                self.shm.add_pool(new_id_at(0), memfd, size);
+                                self.shm.add_pool(new_id_at(0), memfd, size, charge);
                                 Some(give)
                             }
                             FdKind::Dmabuf => {

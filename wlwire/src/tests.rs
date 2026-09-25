@@ -1007,6 +1007,182 @@ fn a_guest_cannot_make_the_host_hold_unbounded_shm() {
     assert_eq!(e.blame, Blame::Channel);
 }
 
+/// One message straight to the host engine, as a guest kernel skipping its
+/// daemon could send it; `pool` is the size of an SHM_POOL descriptor riding
+/// along.
+fn raw_to_host(p: &mut Pair, m: Vec<u8>, pool: Option<u64>) -> Result<(), Fatal> {
+    let descs: Vec<DescOut> = pool
+        .map(|c| {
+            DescOut::plain(Desc {
+                c,
+                ..Desc::new(frame::DESC_SHM_POOL)
+            })
+        })
+        .into_iter()
+        .collect();
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_WAYLAND, 0, descs.len() as u32, &m),
+        descs,
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut TestPlat::default())
+}
+
+fn create_pool(p: &mut Pair, id: u32, size: i32) -> Result<(), Fatal> {
+    let m = MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+        .new_id(id)
+        .int(size)
+        .finish();
+    raw_to_host(p, m, Some(size as u64))
+}
+
+/// A connection with wl_shm bound as 4, whose host engine draws on `vm`.
+fn shm_pair(vm: &Arc<crate::shm::ShmBudget>) -> Pair {
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    p.registry(&[(2, "wl_shm", 2)]);
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    p
+}
+
+#[test]
+fn every_connection_of_a_vm_draws_on_one_shm_budget() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(3 << 20, 64));
+    let mut a = shm_pair(&vm);
+    let mut b = shm_pair(&vm);
+    create_pool(&mut a, 10, 2 << 20).unwrap();
+    assert_eq!(vm.used(), (2 << 20, 1));
+    // Well inside b's own connection limit, but past what the VM has left:
+    // refused, and nothing taken for it.
+    let e = create_pool(&mut b, 10, 2 << 20).unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (2 << 20, 1));
+    // a's pool goes, and with it its charge; b can have the room.
+    raw_to_host(
+        &mut a,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (0, 0));
+    let mut b = shm_pair(&vm);
+    create_pool(&mut b, 10, 2 << 20).unwrap();
+    assert_eq!(vm.used(), (2 << 20, 1));
+    drop(b);
+    assert_eq!(vm.used(), (0, 0), "a dropped engine gives everything back");
+}
+
+#[test]
+fn a_pool_stays_charged_while_a_buffer_made_from_it_lives() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(11)
+            .int(0)
+            .int(256)
+            .int(256)
+            .int(1024)
+            .uint(0)
+            .finish(),
+        None,
+    )
+    .unwrap();
+    // The usual order: the pool is destroyed while its buffers live on, and
+    // the memfd with them.
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (1 << 20, 1));
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(11, op::wl_buffer::REQ_DESTROY).finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (0, 0));
+}
+
+#[test]
+fn a_pool_resize_past_the_budget_is_refused_and_takes_nothing() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(4 << 20, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
+            .int(3 << 20)
+            .finish(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vm.used(), (3 << 20, 1));
+    let e = raw_to_host(
+        &mut p,
+        MsgBuilder::new(10, op::wl_shm_pool::REQ_RESIZE)
+            .int(5 << 20)
+            .finish(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (3 << 20, 1));
+}
+
+#[test]
+fn pools_are_counted_as_well_as_sized() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 2));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 4096).unwrap();
+    create_pool(&mut p, 11, 4096).unwrap();
+    let e = create_pool(&mut p, 12, 4096).unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(vm.used(), (8192, 2));
+}
+
+#[test]
+fn a_connection_that_is_over_sheds_its_pools_at_once() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
+    let mut p = shm_pair(&vm);
+    create_pool(&mut p, 10, 1 << 20).unwrap();
+    // The memfd the compositor got is its own reference; ours goes.
+    let _at_compositor = p.at_server();
+    p.h.shed();
+    assert_eq!(vm.used(), (0, 0));
+}
+
+#[test]
+fn an_empty_blob_chunk_is_refused_before_it_opens_anything() {
+    let mut b = crate::blob::Blobs::new(true);
+    assert_eq!(b.chunk(1, 0, &[]), Err(crate::blob::BlobError::Empty(1)));
+    // A zero-length blob needs no chunks at all.
+    assert!(b.take(1, 0).is_ok());
+}
+
+#[test]
+fn unfinished_blobs_are_capped_by_count_not_only_by_bytes() {
+    let mut b = crate::blob::Blobs::new(true);
+    for id in 1..=crate::blob::MAX_INCOMING as u32 {
+        b.chunk(id, 0, b"x").unwrap();
+    }
+    let next = crate::blob::MAX_INCOMING as u32 + 1;
+    assert_eq!(
+        b.chunk(next, 0, b"x"),
+        Err(crate::blob::BlobError::TooMany(next))
+    );
+    // A blob already under way may still finish, and taking one makes room.
+    b.chunk(1, 1, b"y").unwrap();
+    assert!(b.take(1, 2).is_ok());
+    b.chunk(next, 0, b"x").unwrap();
+    b.clear();
+    assert_eq!(b.take(2, 1).unwrap_err(), crate::blob::BlobError::BadId(2));
+}
+
 #[test]
 fn a_keymap_arrives_as_a_sealed_copy() {
     let mut p = Pair::new(Policy::default());
