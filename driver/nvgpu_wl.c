@@ -181,10 +181,12 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
    * whatever minor the DRM core gave our node.
    *
    * Card nodes too, where the host's card numbers are known: GET_SYS_FILES
-   * section 3, which a backend sends only in compositor-VM mode. Hyprland's
-   * scanout tranche names the primary node it drives (devIDFromFD of its DRM
-   * fd); without the entry the daemon maps that dev_t to 0, and a client
-   * simply finds no tranche it can scan out from.
+   * section 3, which a backend sends in every mode (older ones only in
+   * compositor-VM mode). The entries only translate numbers; whether a card
+   * can be opened is NVGPU_BCAP_KMS_CARD's to say. Hyprland's scanout
+   * tranche names the primary node it drives (devIDFromFD of its DRM fd);
+   * without the entry the daemon maps that dev_t to 0, and a client simply
+   * finds no tranche it can scan out from.
    */
   for (i = 0; i < dev->num_dri_devs && n < NVGPU_WL_MAX_DEVMAP; i++) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];

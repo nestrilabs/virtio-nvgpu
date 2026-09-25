@@ -1047,9 +1047,8 @@ fn main() -> anyhow::Result<()> {
     )?));
     // Host connector and lease changes of the host's cards, which arrive only
     // as uevents (device::kms). The guest hears of them only in
-    // compositor-VM mode: it can open card nodes (GET_SYS_FILES section 3
-    // records without the informational flag) only then, and drops
-    // EV_HOTPLUG for any other card. A lease change also makes the backend
+    // compositor-VM mode: it drives card nodes (BCAP_KMS_CARD) only then,
+    // and otherwise drops EV_HOTPLUG. A lease change also makes the backend
     // re-check the leases it holds (NVKMS grants made through one that ended
     // must end too), which matters whenever the guest can hold a lease.
     let _hotplug = if args.kms_card || args.wayland_lease {

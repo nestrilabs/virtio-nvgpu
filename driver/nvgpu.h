@@ -170,9 +170,11 @@ struct nvgpu_device {
   struct nvgpu_dri_dev dri_devs[NVGPU_MAX_DRI_DEVS];
   int num_dri_devs;
   /*
-   * Host card nodes, from GET_SYS_FILES section 3. Only a backend started
-   * with --kms-card sends any; each names the DRI record (and so the guest
-   * DRM device) it is the primary node of. EV_HOTPLUG's cookie indexes this.
+   * Host card nodes, from GET_SYS_FILES section 3 (every mode; older
+   * backends only with --kms-card). Each names the DRI record (and so the
+   * guest DRM device) it is the primary node of. Openable only with
+   * NVGPU_BCAP_KMS_CARD; otherwise only their numbers are used (the Wayland
+   * devmap). EV_HOTPLUG's cookie indexes this.
    */
   struct nvgpu_card_rec cards[NVGPU_MAX_DRI_DEVS];
   int num_card_recs;

@@ -1631,6 +1631,11 @@ static void nvgpu_hotplug_work(struct work_struct *work) {
   unsigned long any = hp | ls;
   unsigned int i;
 
+  /* Card records without NVGPU_BCAP_KMS_CARD only name host numbers (the
+   * Wayland devmap): no compositor here drives those cards. */
+  if (!(dev->backend_caps & NVGPU_BCAP_KMS_CARD))
+    return;
+
   for_each_set_bit(i, &any, BITS_PER_LONG) {
     struct nvgpu_dri_dev *dri;
     struct drm_device *drm;

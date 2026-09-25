@@ -671,7 +671,8 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
     off
 }
 
-/// GET_SYS_FILES section 3: the card nodes, for compositor-VM mode.
+/// GET_SYS_FILES section 3: the card nodes, in every mode; openable only in
+/// compositor-VM mode (BCAP_KMS_CARD), informational otherwise.
 ///
 /// A count, then `CardRecord {name_len, major, minor, render_index}` and the
 /// name per card. `render_index` names the DRI record of the same PCI device,
@@ -1672,16 +1673,18 @@ impl NvidiaBackend {
         // Headless forwarding hands out no render node, so the count is zero
         // and it still has to be written.
         //
-        // In compositor-VM mode a third follows: the card nodes. Only then --
-        // an old guest stops parsing after the DRI section and a new one reads
-        // the zeroed rest of its buffer as "no cards", so leaving it out is
-        // how the other modes say there are none.
+        // A third follows: the card nodes. In every mode -- a guest needs the
+        // host's card numbers to map the dev_t a compositor names its scanout
+        // device by (the Wayland devmap) -- but a card is *openable* only in
+        // compositor-VM mode, which BCAP_KMS_CARD says: the guest opens one
+        // (nvgpu_kms_open) and forwards its hotplugs only then, and HOST_OP
+        // OPEN_KMS is refused without --kms-card. A guest that predates the
+        // section stops parsing after the DRI one; an older backend leaves it
+        // out, which a guest reads as "no cards".
         if tree == FileTree::Sys {
             let nodes = self.host_nodes();
             off += write_dri_section(&nodes.dri, &mut resp_buf[off..]);
-            if self.config.kms_card {
-                off += write_card_section(&nodes.cards, &mut resp_buf[off..]);
-            }
+            off += write_card_section(&nodes.cards, &mut resp_buf[off..]);
         }
         off
     }
@@ -4520,5 +4523,43 @@ mod tests {
         );
         assert_eq!(&buf[20..25], b"card1");
         assert_eq!(write_card_section(&cards, &mut [0u8; 10]), 0);
+    }
+
+    /// Plain Wayland mode needs the host card numbers too (the devmap), so
+    /// GET_SYS_FILES carries them without --kms-card; only BCAP_KMS_CARD
+    /// makes them openable.
+    #[test]
+    fn get_sys_files_names_the_cards_in_every_mode() {
+        for kms_card in [false, true] {
+            let mut be = NvidiaBackend::for_test();
+            be.config.kms_card = kms_card;
+            be.set_host_nodes_for_test(
+                Vec::new(),
+                vec![CardNode {
+                    name: "card1".into(),
+                    major: 226,
+                    minor: 1,
+                    render_index: 0,
+                }],
+            );
+            let mut buf = vec![0u8; 1 << 20];
+            let n = be.handle_get_files(FileTree::Sys, &mut buf);
+            // The file stream, up to its terminator.
+            let mut off = 0;
+            loop {
+                let e = read_struct::<FileEntry>(&buf, off);
+                off += size_of::<FileEntry>();
+                if e.path_len == 0 && e.content_len == 0 {
+                    break;
+                }
+                off += (e.path_len + e.content_len) as usize;
+            }
+            assert_eq!(read_struct::<u32>(&buf, off), 0, "no DRI records");
+            off += 4;
+            assert_eq!(read_struct::<u32>(&buf, off), 1, "kms_card {kms_card}");
+            let rec = read_struct::<CardRecord>(&buf, off + 4);
+            assert_eq!((rec.major, rec.minor), (226, 1));
+            assert_eq!(n, off + 4 + 16 + 5);
+        }
     }
 }

@@ -419,7 +419,12 @@ struct nvgpu_ev_hotplug {
   __le32 pad;
 } __packed;
 
-/* ── GET_SYS_FILES section 3: card nodes (compositor-VM mode only) ── */
+/*
+ * ── GET_SYS_FILES section 3: card nodes ──
+ * Sent in every mode (older backends: compositor-VM mode only). Openable only
+ * with NVGPU_BCAP_KMS_CARD; otherwise they only say how the host numbers its
+ * cards (the Wayland devmap).
+ */
 struct nvgpu_card_record {
   __le32 name_len;
   __le32 major;

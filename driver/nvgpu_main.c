@@ -2046,10 +2046,13 @@ static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
 
 /*
- * Section 3: the host card nodes, sent only by a backend started with
- * --kms-card. An older backend ends the stream after section 2, and then
- * there is nothing between `p` and `end` and no card is recorded; the parse
- * never runs past what the device wrote.
+ * Section 3: the host card nodes. A backend sends it in every mode, for the
+ * host card numbers (the Wayland devmap maps a compositor's scanout dev_t by
+ * them); the cards are openable only when it also says NVGPU_BCAP_KMS_CARD
+ * (nvgpu_kms_open() checks, and the backend refuses OPEN_KMS otherwise). An
+ * older backend sends it only with --kms-card, or ends the stream after
+ * section 2, and then there is nothing between `p` and `end` and no card is
+ * recorded; the parse never runs past what the device wrote.
  */
 static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
                                      const u8 *end) {
