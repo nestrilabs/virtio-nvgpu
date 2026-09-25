@@ -222,7 +222,10 @@ impl SemsurfPolicy {
     }
 
     /// RM_FREE of an object that is not a client was asked for: its share
-    /// policy goes with it (forgotten whatever RM answered, as for clients).
+    /// policy goes with it, and the grants of every other object of the
+    /// client, which may have gone with it (rmshare.rs,
+    /// `Ownership::object_freed`; forgotten whatever RM answered, as for
+    /// clients).
     pub fn object_freed(&self, h_client: u32, object: u32) {
         self.lock().own.object_freed(h_client, object);
     }
@@ -232,9 +235,9 @@ impl SemsurfPolicy {
         self.lock().own.shared(owner, object, p);
     }
 
-    /// Whether share `p` would record a grant past the cap.
-    pub fn grants_full_for(&self, owner: u32, p: &crate::rmshare::Policy) -> bool {
-        self.lock().own.full_for(owner, p)
+    /// Whether share `p` of `(owner, object)` would record past the cap.
+    pub fn grants_full_for(&self, owner: u32, object: u32, p: &crate::rmshare::Policy) -> bool {
+        self.lock().own.full_for(owner, object, p)
     }
 
     /// Whether client `dst` may duplicate `(src, obj)` for `caller`

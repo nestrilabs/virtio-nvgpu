@@ -30,9 +30,10 @@
 //!   the guest's processes were the host's, the source client must have been
 //!   made by the same guest process as the destination client -- or by the
 //!   process making the call (its own object, into a client it holds a file
-//!   of), or the source object (or its client, whose policy every object of
-//!   it inherits) must carry a CLIENT grant to the destination client for
-//!   DUP_OBJECT. Which process made a client, and which makes a call, only
+//!   of), or the list RM checks the source object against must carry a
+//!   CLIENT grant to the destination client for DUP_OBJECT: the object's
+//!   own, or its client's while no other object of the client has one
+//!   ([`Ownership`]). Which process made a client, and which makes a call, only
 //!   the guest kernel knows: it says, with [`ProcId`] (BCAP_PROC_ID). A guest
 //!   that cannot keeps what it had -- its processes share RM objects freely,
 //!   noted once per session -- as it did before this was checked; the rules
@@ -41,7 +42,8 @@
 //!   [`control_named`]). Allocation classes and controls that name a client
 //!   besides the caller's -- a device sharing another client's VA space, an
 //!   event on another client's object, a debugger or profiler of another
-//!   client's context, register operations on another client's channel --
+//!   client's context, register operations on another client's channel,
+//!   other clients' channels disabled --
 //!   are checked by RM against the caller's security token, which matches
 //!   any host process of the backend's uid, or not at all; the client they
 //!   name must be none (the caller's own) or this VM's.
@@ -117,8 +119,10 @@ pub const CTRL_SET_INHERITED_SHARE_POLICY: u32 = 0x0000_0d04;
 /// NV0000_CTRL_CMD_CLIENT_SHARE_OBJECT: `{hObject, RS_SHARE_POLICY}`.
 pub const CTRL_SHARE_OBJECT: u32 = 0x0000_0d06;
 
-/// Recorded grants a session may hold. Each is a policy RM also holds; this
-/// bounds what the backend keeps, not what RM does.
+/// Recorded share lists and grants a session may hold, together. Each is a
+/// list or a policy RM also holds; this bounds what the backend keeps, not
+/// what RM does. A share past it is refused, a revoke that would start a
+/// list included.
 pub const GRANT_CAP: usize = 4096;
 
 fn rd32(b: &[u8], at: usize) -> Option<u32> {
@@ -348,7 +352,70 @@ pub const CONTROL_CLIENT_FIELDS: &[(u32, &str, &[usize])] = &[
     (0x2080_2502, "NV2080_CTRL_CMD_DMA_INVALIDATE_TLB", &[0]),
 ];
 
-/// NV5080_CTRL_CMD_DEFERRED_API and _V2: `{hApiHandle, cmd, flags,
+/// Controls whose parameters name clients in a list, with where the count
+/// is, where the list starts, and its length: `(cmd, name, count, list,
+/// max)`. RM reads the first `count` entries (NON_PRIVILEGED in 595.99.02
+/// and 610.57.04, the layouts identical). DISABLE_CHANNELS goes to GSP-RM
+/// as it is (kernel_fifo_ctrl.c, subdeviceCtrlCmdFifoDisableChannels): the
+/// channels of whatever clients it names, stopped; QUERY_CHANNEL_UNIQUE_ID
+/// checks them by security token (`_kfifoValidateTargetClient`).
+pub const CONTROL_CLIENT_LISTS: &[(u32, &str, usize, usize, usize)] = &[
+    (
+        0x2080_110b,
+        "NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS",
+        4,
+        24,
+        64,
+    ),
+    (
+        0x2080_111a,
+        "NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS_FOR_KEY_ROTATION",
+        0,
+        4,
+        64,
+    ),
+    (0x2080_111c, "NV2080_CTRL_CMD_FIFO_ROTATE_KEYS", 0, 4, 64),
+    (
+        0x2080_1124,
+        "NV2080_CTRL_CMD_FIFO_QUERY_CHANNEL_UNIQUE_ID",
+        1024,
+        0,
+        128,
+    ),
+];
+
+/// The clients a listed control names (`CONTROL_CLIENT_LISTS`), zeros left
+/// out; a count past the list is refused whole, as RM refuses it.
+fn named_list(
+    b: &[u8],
+    count: usize,
+    list: usize,
+    max: usize,
+    name: &'static str,
+) -> Result<Vec<(u32, &'static str)>, &'static str> {
+    let n = rd32(b, count).ok_or(name)? as usize;
+    if n > max {
+        return Err(name);
+    }
+    let fields: Vec<usize> = (0..n).map(|i| list + 4 * i).collect();
+    named(b, &fields, name)
+}
+
+/// The clients control `cmd`'s parameters `params` name, from either table.
+fn control_fields(
+    cmd: u32,
+    params: &[u8],
+) -> Option<Result<Vec<(u32, &'static str)>, &'static str>> {
+    if let Some(&(_, name, fields)) = CONTROL_CLIENT_FIELDS.iter().find(|(c, _, _)| *c == cmd) {
+        return Some(named(params, fields, name));
+    }
+    CONTROL_CLIENT_LISTS
+        .iter()
+        .find(|(c, ..)| *c == cmd)
+        .map(|&(_, name, count, list, max)| named_list(params, count, list, max, name))
+}
+
+/// NV5080_CTRL_CMD_DEFERRED_API and _V2:`{hApiHandle, cmd, flags,
 /// hClientVA, hDeviceVA, union api_bundle}` with the bundle at 24, holding
 /// the parameters of the control `cmd` names, run later at the caller's
 /// privilege (deferred_api.c).
@@ -380,17 +447,13 @@ pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<(u32, &'static str)>
             "NV5080_CTRL_CMD_DEFERRED_API",
         )?;
         let inner = rd32(params, DEFERRED_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
-        if let Some(&(_, name, fields)) = CONTROL_CLIENT_FIELDS.iter().find(|(c, _, _)| *c == inner)
-        {
-            let bundle = params.get(DEFERRED_BUNDLE..).ok_or(name)?;
-            out.extend(named(bundle, fields, name)?);
+        let bundle = params.get(DEFERRED_BUNDLE..).unwrap_or(&[]);
+        if let Some(r) = control_fields(inner, bundle) {
+            out.extend(r?);
         }
         return Ok(out);
     }
-    match CONTROL_CLIENT_FIELDS.iter().find(|(c, _, _)| *c == cmd) {
-        Some(&(_, name, fields)) => named(params, fields, name),
-        None => Ok(Vec::new()),
-    }
+    control_fields(cmd, params).unwrap_or(Ok(Vec::new()))
 }
 
 fn named(
@@ -446,11 +509,20 @@ pub fn status_at(escape: u32) -> Option<usize> {
 
 /// What the ownership state keeps per session (held in semsurf.rs's client
 /// set, whose lifecycle it shares): which guest process made each client,
-/// and the CLIENT grants RM took.
+/// and the share lists RM keeps for this VM's objects.
+///
+/// `grants` has an entry for every object whose list a share RM took has
+/// modified -- empty when it grants no other client anything -- holding the
+/// CLIENT grants in it. RM checks a duplicate against the object's own list
+/// once modified, else its nearest modified ancestor's, else the default
+/// (rsAccessGetActiveShareList); the backend does not know an object's
+/// ancestors, so it reads an object's own list, and its client's only while
+/// no other object of that client has one.
 #[derive(Default)]
 pub struct Ownership {
     pub owners: HashMap<u32, ProcId>,
     pub grants: HashMap<(u32, u32), Vec<Grant>>,
+    /// Lists plus the grants in them, against [`GRANT_CAP`].
     pub grant_count: usize,
 }
 
@@ -465,51 +537,71 @@ impl Ownership {
         for list in self.grants.values_mut() {
             list.retain(|g| !clients.contains(&g.target));
         }
-        self.grants.retain(|_, l| !l.is_empty());
         self.recount();
     }
 
-    /// `(client, object)` was freed: its policy list with it.
+    /// `(client, object)` was freed, and with it whatever RM made under it,
+    /// which the backend cannot tell from the client's other objects. Every
+    /// other object's grants go too (a handle freed with its parent and made
+    /// again would otherwise inherit the grants of the object it replaced);
+    /// their lists stay, empty, so the client's own is not read for them in
+    /// their place. The client's own list is untouched: it is not freed.
     pub fn object_freed(&mut self, client: u32, object: u32) {
-        if self.grants.remove(&(client, object)).is_some() {
+        if object == client {
+            return;
+        }
+        let mut changed = self.grants.remove(&(client, object)).is_some();
+        for (&(c, o), list) in self.grants.iter_mut() {
+            if c == client && o != client && !list.is_empty() {
+                list.clear();
+                changed = true;
+            }
+        }
+        if changed {
             self.recount();
         }
     }
 
     fn recount(&mut self) {
-        self.grant_count = self.grants.values().map(Vec::len).sum();
+        self.grant_count = self.grants.values().map(|l| 1 + l.len()).sum();
     }
 
-    /// A share RM answered NV_OK for.
+    /// A share RM answered NV_OK for: the object's list is modified.
     pub fn shared(&mut self, owner: u32, object: u32, p: &Policy) {
         let list = self.grants.entry((owner, object)).or_default();
         apply_share(list, owner, p);
-        if list.is_empty() {
-            self.grants.remove(&(owner, object));
-        }
         self.recount();
     }
 
-    /// Whether a share could add a grant past [`GRANT_CAP`].
-    pub fn full_for(&self, owner: u32, p: &Policy) -> bool {
-        p.kind == RS_SHARE_TYPE_CLIENT
-            && p.target != owner
-            && p.action & (RS_SHARE_ACTION_FLAG_REVOKE | RS_SHARE_ACTION_FLAG_REQUIRE) == 0
-            && self.grant_count >= GRANT_CAP
+    /// Whether share `p` of `(owner, object)` could take the lists past
+    /// [`GRANT_CAP`]: a new list, or a new grant in one.
+    pub fn full_for(&self, owner: u32, object: u32, p: &Policy) -> bool {
+        self.grant_count >= GRANT_CAP
+            && (!self.grants.contains_key(&(owner, object))
+                || (p.kind == RS_SHARE_TYPE_CLIENT
+                    && p.target != owner
+                    && p.action & (RS_SHARE_ACTION_FLAG_REVOKE | RS_SHARE_ACTION_FLAG_REQUIRE)
+                        == 0))
     }
 
-    /// Whether a grant on the object or on its client (the policy every
-    /// object of it inherits until its own is set) lets `dst` duplicate
-    /// `(src, obj)`. Grants on objects between the two (a device, say) are
-    /// not followed: the backend does not know an object's parents, so such
-    /// a duplicate is refused where RM would allow it.
+    /// Whether the list RM checks a duplicate of `(src, obj)` into `dst`
+    /// against grants `dst` the DUP_OBJECT right: the object's own, if it
+    /// has one; else its client's, while no other object of the client has
+    /// one (it may be an ancestor of `obj`, whose list RM would read
+    /// instead). Grants on intermediate objects (a device, say) are not
+    /// followed, so such a duplicate is refused where RM would allow it.
     fn granted(&self, src: u32, obj: u32, dst: u32) -> bool {
-        [(src, obj), (src, src)].iter().any(|k| {
-            self.grants.get(k).is_some_and(|l| {
-                l.iter()
-                    .any(|g| g.target == dst && g.mask & RS_ACCESS_DUP_OBJECT_BIT != 0)
-            })
-        })
+        let grants = |l: &Vec<Grant>| {
+            l.iter()
+                .any(|g| g.target == dst && g.mask & RS_ACCESS_DUP_OBJECT_BIT != 0)
+        };
+        if let Some(l) = self.grants.get(&(src, obj)) {
+            return grants(l);
+        }
+        if self.grants.keys().any(|&(c, o)| c == src && o != src) {
+            return false;
+        }
+        self.grants.get(&(src, src)).is_some_and(grants)
     }
 
     /// The verdict on a duplicate from `(src, obj)` into client `dst` made by
@@ -650,7 +742,7 @@ impl NvidiaBackend {
                     );
                     return Err(Refuse::Status(NV_ERR_INSUFFICIENT_PERMISSIONS));
                 }
-                ShareVerdict::Forward if self.semsurf.grants_full_for(owner, &p) => {
+                ShareVerdict::Forward if self.semsurf.grants_full_for(owner, object, &p) => {
                     log::warn!(
                         "RM share of {owner:#x}/{object:#x} refused: {GRANT_CAP} grants \
                          recorded already"
@@ -958,11 +1050,13 @@ mod tests {
             OtherProcess
         );
         o.shared(OWNER, OWNER, &grant);
+        // The client's list is not read for 0x56 while 0x55 has one of its
+        // own: 0x55 may be 0x56's parent, whose list RM would read.
         assert_eq!(
             o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x56),
-            Allowed
+            OtherProcess
         );
-        // A grant without DUP_OBJECT does not.
+        // A grant without DUP_OBJECT does not open anything.
         let mut o2 = Ownership::default();
         o2.owners = o.owners.clone();
         o2.shared(
@@ -977,14 +1071,81 @@ mod tests {
             o2.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x55),
             OtherProcess
         );
-        // Freeing the object, or either client, takes its grants.
-        o.object_freed(OWNER, OWNER);
+        // Freeing the object takes its list, and the client's is read again.
         o.object_freed(OWNER, 0x55);
-        assert_eq!(o.grant_count, 0);
+        assert_eq!(o.grant_count, 2, "the client's list and its one grant");
+        assert_eq!(
+            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x56),
+            Allowed
+        );
+        // Freeing a client takes everything of it, and every grant to it.
         o.shared(OWNER, 0x55, &grant);
         o.forget_clients(&[PEER]);
-        assert!(o.grants.is_empty());
+        assert!(o.grants.values().all(Vec::is_empty));
         assert!(!o.owners.contains_key(&PEER));
+        o.forget_clients(&[OWNER]);
+        assert!(o.grants.is_empty());
+        assert_eq!(o.grant_count, 0);
+    }
+
+    /// RM checks a duplicate against the object's own list once a share
+    /// has modified it, not its client's (rsAccessGetActiveShareList); and a
+    /// handle freed with its parent can be made again, a new object.
+    #[test]
+    fn an_objects_own_list_and_a_freed_parent_are_followed() {
+        let live = vm;
+        use DupVerdict::*;
+        let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
+        let mut o = Ownership::default();
+        o.owners.insert(OWNER, id(10));
+        o.owners.insert(PEER, id(20));
+        let dup = |o: &Ownership, obj| o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, obj);
+        // The client grants PEER; the object revokes it: RM's list for the
+        // object is its own, without PEER (and with the PID default, which
+        // RM matches for every client of the backend's).
+        o.shared(OWNER, OWNER, &policy(RS_SHARE_TYPE_CLIENT, compose, PEER));
+        assert_eq!(dup(&o, 0x55), Allowed);
+        o.shared(
+            OWNER,
+            0x55,
+            &policy(
+                RS_SHARE_TYPE_CLIENT,
+                compose | RS_SHARE_ACTION_FLAG_REVOKE,
+                PEER,
+            ),
+        );
+        assert_eq!(dup(&o, 0x55), OtherProcess);
+        // A PID-only list on it, likewise.
+        o.shared(OWNER, 0x66, &policy(RS_SHARE_TYPE_PID, 0, 0));
+        assert_eq!(dup(&o, 0x66), OtherProcess);
+        // A grant on 0x77 whose parent is freed: 0x77 went with it, and a
+        // new object at 0x77 is not the one granted.
+        o.shared(OWNER, 0x77, &policy(RS_SHARE_TYPE_CLIENT, compose, PEER));
+        assert_eq!(dup(&o, 0x77), Allowed);
+        o.object_freed(OWNER, 0xde7);
+        assert_eq!(dup(&o, 0x77), OtherProcess);
+        // Nor does the client's list stand in for the one 0x77 had.
+        assert!(o.grants.contains_key(&(OWNER, 0x77)));
+        // Freeing the client itself is not an object's free.
+        o.object_freed(OWNER, OWNER);
+        assert!(o.grants.contains_key(&(OWNER, OWNER)));
+    }
+
+    #[test]
+    fn the_cap_counts_lists_and_grants() {
+        let mut o = Ownership::default();
+        let grant = policy(RS_SHARE_TYPE_CLIENT, RS_SHARE_ACTION_FLAG_COMPOSE, PEER);
+        let revoke = policy(RS_SHARE_TYPE_CLIENT, RS_SHARE_ACTION_FLAG_REVOKE, PEER);
+        for obj in 0..(GRANT_CAP as u32 / 2) {
+            assert!(!o.full_for(OWNER, obj + 0x100, &grant));
+            o.shared(OWNER, obj + 0x100, &grant);
+        }
+        assert_eq!(o.grant_count, GRANT_CAP);
+        // Full: no new list, not even a revoke's, and no new grant...
+        assert!(o.full_for(OWNER, 0x5, &revoke));
+        assert!(o.full_for(OWNER, 0x100, &policy(RS_SHARE_TYPE_CLIENT, 0, OWNER + 7)));
+        // ...but a revoke in a list there is fine.
+        assert!(!o.full_for(OWNER, 0x100, &revoke));
     }
 
     #[test]
@@ -1015,6 +1176,39 @@ mod tests {
         assert_eq!(control_named(0x2080_0101, &d), Ok(vec![]));
     }
 
+    #[test]
+    fn clients_in_a_list_are_found_up_to_its_count() {
+        // DISABLE_CHANNELS: numChannels at 4, hClientList at 24.
+        let mut d = vec![0u8; 536];
+        d[4..8].copy_from_slice(&2u32.to_le_bytes());
+        d[24..28].copy_from_slice(&OWNER.to_le_bytes());
+        d[28..32].copy_from_slice(&HOST.to_le_bytes());
+        // Past the count: not read by RM, nor here.
+        d[32..36].copy_from_slice(&PEER.to_le_bytes());
+        let n = control_named(0x2080_110b, &d).unwrap();
+        assert_eq!(n.iter().map(|x| x.0).collect::<Vec<_>>(), [OWNER, HOST]);
+        // A count past the list: refused whole.
+        d[4..8].copy_from_slice(&65u32.to_le_bytes());
+        assert!(control_named(0x2080_110b, &d).is_err());
+        // QUERY_CHANNEL_UNIQUE_ID: hClients at 0, numChannels at 1024.
+        let mut q = vec![0u8; 1540];
+        q[1024..1028].copy_from_slice(&1u32.to_le_bytes());
+        q[0..4].copy_from_slice(&HOST.to_le_bytes());
+        assert_eq!(
+            control_named(0x2080_1124, &q),
+            Ok(vec![(HOST, "NV2080_CTRL_CMD_FIFO_QUERY_CHANNEL_UNIQUE_ID")])
+        );
+        // ROTATE_KEYS and its sibling: numChannels at 0, the list at 4.
+        let mut k = vec![0u8; 520];
+        k[0..4].copy_from_slice(&1u32.to_le_bytes());
+        k[4..8].copy_from_slice(&HOST.to_le_bytes());
+        for cmd in [0x2080_111a, 0x2080_111c] {
+            assert_eq!(control_named(cmd, &k).unwrap()[0].0, HOST);
+        }
+        // Too short for the count it gives: refused.
+        assert!(control_named(0x2080_111c, &k[..6]).is_err());
+    }
+
     /// Every control's fields fit the parameters it has on the host
     /// (sizeof, 610.57.04; checked against 595.99.02's headers too).
     #[test]
@@ -1043,9 +1237,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}"));
             assert!(fields.iter().all(|&f| f + 4 <= size.1), "{name}");
         }
+        // The lists: (sizeof, 610.57.04 and 595.99.02).
+        let list_sizes: &[(u32, usize)] = &[
+            (0x2080_110b, 536),
+            (0x2080_111a, 520),
+            (0x2080_111c, 520),
+            (0x2080_1124, 1540),
+        ];
+        for &(cmd, name, count, list, max) in CONTROL_CLIENT_LISTS {
+            let size = list_sizes
+                .iter()
+                .find(|(c, _)| *c == cmd)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(count + 4 <= size.1 && list + 4 * max <= size.1, "{name}");
+        }
         let mut seen = std::collections::HashSet::new();
-        for (c, name, _) in CONTROL_CLIENT_FIELDS.iter().chain(ALLOC_CLIENT_FIELDS) {
-            assert!(seen.insert(*c), "{name} twice");
+        let lists = CONTROL_CLIENT_LISTS.iter().map(|&(c, n, ..)| (c, n));
+        for (c, name) in CONTROL_CLIENT_FIELDS
+            .iter()
+            .chain(ALLOC_CLIENT_FIELDS)
+            .map(|&(c, n, _)| (c, n))
+            .chain(lists)
+        {
+            assert!(seen.insert(c), "{name} twice");
         }
     }
 }
@@ -1476,7 +1690,17 @@ mod backend_tests {
         assert_eq!(rm_status(&r, OS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
         assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
-        // On the client (SET_INHERITED_SHARE_POLICY), every object of it.
+        // On the client (SET_INHERITED_SHARE_POLICY), every object of it
+        // that has no list of its own -- once 0x55, which has one, is gone.
+        let r = call(
+            &mut be,
+            f1,
+            FREE,
+            &words(&[(0, a), (4, a), (8, 0x55)], 16),
+            &[],
+            None,
+        );
+        assert_eq!(errno(&r), 0);
         let ctl = words(
             &[
                 (0, a),
@@ -1556,6 +1780,93 @@ mod backend_tests {
         assert!(!reached(0x2a));
         let r = call(&mut be, f1, CONTROL, &ctl, &words(&[(0, a)], 48), None);
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
+    }
+
+    #[test]
+    fn a_grant_does_not_outlive_its_object_freed_with_a_parent() {
+        let (mut be, f1, f2) = vm(true);
+        let a = alloc_client(&mut be, f1, Some(pid(10)));
+        let b = alloc_client(&mut be, f2, Some(pid(20)));
+        let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
+        // Memory 0x55 under device 0xde7, shared with b.
+        let r = call(
+            &mut be,
+            f1,
+            SHARE,
+            &share(a, 0x55, RS_SHARE_TYPE_CLIENT, compose, b),
+            &[],
+            None,
+        );
+        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
+        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        // The device is freed, 0x55 with it; a new object made at 0x55 is
+        // a's own, and not shared.
+        let r = call(
+            &mut be,
+            f1,
+            FREE,
+            &words(&[(0, a), (4, a), (8, 0xde7)], 16),
+            &[],
+            None,
+        );
+        assert_eq!(errno(&r), 0);
+        seen();
+        let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
+        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert!(!reached(0x34));
+        // And a revoke on one object holds against a grant on its client.
+        let (mut be, f1, f2) = vm(true);
+        let a2 = alloc_client(&mut be, f1, Some(pid(10)));
+        let b2 = alloc_client(&mut be, f2, Some(pid(20)));
+        let ctl = words(
+            &[
+                (0, a2),
+                (4, a2),
+                (8, CTRL_SET_INHERITED_SHARE_POLICY),
+                (24, 12),
+            ],
+            32,
+        );
+        let mut p = words(&[(0, b2), (4, 1)], 12);
+        p[8..10].copy_from_slice(&RS_SHARE_TYPE_CLIENT.to_le_bytes());
+        p[10] = compose;
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        let r = call(&mut be, f2, DUP, &dup(b2, a2, 0x66), &[], Some(pid(20)));
+        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        let r = call(
+            &mut be,
+            f1,
+            SHARE,
+            &share(
+                a2,
+                0x66,
+                RS_SHARE_TYPE_CLIENT,
+                compose | RS_SHARE_ACTION_FLAG_REVOKE,
+                b2,
+            ),
+            &[],
+            None,
+        );
+        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        let r = call(&mut be, f2, DUP, &dup(b2, a2, 0x66), &[], Some(pid(20)));
+        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+    }
+
+    #[test]
+    fn channels_of_another_vms_clients_are_not_disabled() {
+        let (mut be, f1, _) = vm(true);
+        let a = alloc_client(&mut be, f1, Some(pid(10)));
+        let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_110b), (24, 536)], 32);
+        let list = |c: u32| words(&[(4, 1), (24, c), (280, 0xc4a)], 536);
+        seen();
+        let r = call(&mut be, f1, CONTROL, &ctl, &list(HOST), None);
+        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert!(!reached(0x2a));
+        let r = call(&mut be, f1, CONTROL, &ctl, &list(a), None);
+        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert!(reached(0x2a));
     }
 
     #[test]

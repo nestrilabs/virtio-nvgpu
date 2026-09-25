@@ -227,15 +227,20 @@ judges three things before RM sees the call (`device/src/rmshare.rs`):
   grant of type ALL, OS_SECURITY_TOKEN (the uid, shared with every host
   process of the backend's user, other VMs' backends included), GPU,
   SMC_PARTITION, FM_CLIENT, a type RM does not define, or CLIENT naming any
-  other client is refused. The CLIENT grants RM takes are recorded, at most
-  4,096 a session.
+  other client is refused. The share lists RM modifies, and the CLIENT
+  grants in them, are recorded, at most 4,096 together a session; past that
+  a share is refused, a revoke that would start a list included.
 - **Duplicating.** NV_ESC_RM_DUP_OBJECT's destination and source clients must
   both be clients this VM allocated and has not freed. And the source client
   must have been made by the guest process that made the destination client,
   as RM would require of two host processes, unless the caller made the
-  source (its own object, into a client whose file it holds), or a recorded
-  CLIENT grant on the object or on its client covers the destination for
-  DUP_OBJECT.
+  source (its own object, into a client whose file it holds), or the list
+  RM checks the object against grants the destination DUP_OBJECT: the
+  object's own list once a share has modified it, else its client's while
+  no other object of that client has a list of its own (it could be the
+  object's parent, whose list RM would read). A free of any object of a
+  client takes the grants of all its objects, since the backend cannot tell
+  which went with it and a handle freed with its parent can be made again.
 - **Naming a second client.** Allocation classes and controls that name a
   client besides the caller's are checked by RM with the caller's security
   token, which matches any host process of the same euid, or not at all:
@@ -245,10 +250,14 @@ judges three things before RM sees the call (`device/src/rmshare.rs`):
   `hClient`; and CLIENT_GET_ACCESS_RIGHTS, NV503C REGISTER_PID, the five GR
   ctxsw binds, EXEC_REG_OPS, MIGRATABLE_OPS, PROMOTE, EVICT and
   INITIALIZE_CTX, two FIFO controls, INVALIDATE_TLB, and DEFERRED_API with
-  the control it bundles. Each such client must be none or this VM's. Every
-  `NvHandle h*Client*` field of 610.57.04's class and control headers was
-  read for this; the rest are kernel-only, vGPU host, diagnostics or
-  INTERNAL, which RM refuses the backend.
+  the control it bundles; and the client lists, up to their counts, of
+  FIFO_DISABLE_CHANNELS (sent to GSP-RM as it is: another VM's channels
+  stopped), DISABLE_CHANNELS_FOR_KEY_ROTATION, ROTATE_KEYS and
+  QUERY_CHANNEL_UNIQUE_ID. Each such client must be none or this VM's. Every
+  `NvHandle h*Client*` field of 610.57.04's class and control headers,
+  arrays included, was read for this; the rest are kernel-only, vGPU host,
+  diagnostics or INTERNAL, which RM refuses the backend, or classes RM does
+  not implement (NV_FB_SEGMENT, NV_EVENT_BUFFER's bind).
 
 A refusal is RM's own answer to a caller without the right,
 NV_ERR_INSUFFICIENT_PERMISSIONS in the parameters' status with the ioctl
@@ -663,7 +672,7 @@ fix commit and the code. S-35, which a later review of the RM path opened
 | S-32 | low | an unresolvable syncobj becomes a placeholder | `a6d3d2f` | fixed |
 | S-33 | low | final closes of display files block the VM's threads | `03b3539` | fixed; the pump's duplicate can delay a master release until UNWATCH |
 | S-34 | low | OPEN_KMS and DROP_IF_MASTER run on the queue thread | `03b3539` | fixed; a single "open non-master" op not added |
-| S-35 | high | RM_SHARE forwarded raw: a guest shares an object with every host client; DUP_OBJECT from a client not the VM's; every guest process duplicates every other's objects | `f550116` | fixed; opened by the review after these, not by the 34. Grants on intermediate objects are not followed (refused where RM allows), and a second client named in parameters is held to the VM, not to the guest process (§9) |
+| S-35 | high | RM_SHARE forwarded raw: a guest shares an object with every host client; DUP_OBJECT from a client not the VM's; every guest process duplicates every other's objects | `f550116` | fixed; opened by the review after these, not by the 34. Its review then found a grant outliving an object freed with its parent, an object's own list not overriding its client's, and the FIFO controls' client lists unchecked; fixed in the commit after. Grants on intermediate objects are not followed (refused where RM allows), and a second client named in parameters is held to the VM, not to the guest process (§9) |
 
 Rejected by the security review:
 
@@ -804,7 +813,9 @@ In rough order of weight.
     BCAP_PROC_ID gets no per-process check at all, only the VM boundary.
     Grants are followed on the object and on its client only; a CLIENT grant
     on a device or other intermediate object that RM would honour for the
-    objects under it is refused here. A second client named in class or
+    objects under it is refused here, a client's grant stops counting once
+    any of its objects has a list of its own, and any free in a client drops
+    its objects' grants. A second client named in class or
     control parameters (a device sharing a VA space, register operations, a
     profiler, GR binds) is held to the VM, not to the guest process: RM
     allows those between host processes of one euid, which the backend
