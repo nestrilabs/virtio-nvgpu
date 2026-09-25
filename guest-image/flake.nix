@@ -115,6 +115,7 @@
             gnome-calculator # GTK4 + libadwaita
             qalculate-qt
             firefox
+            chromium
             mpv
             glmark2
             vkmark

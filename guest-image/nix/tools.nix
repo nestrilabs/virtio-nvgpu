@@ -7,6 +7,8 @@
 #   bin/vk-acquire-display   vkGetDrmDisplayEXT + vkAcquireDrmDisplayEXT + present (stage 5)
 #   bin/cuda-smoke           CUDA driver API round trip + a PTX kernel, dlopen()s libcuda
 #   bin/nvgpu-poweroff       reboot(RB_POWER_OFF) for PID-1 probe scripts
+#   bin/egl-fence            EGL_ANDROID_native_fence_sync: create, export, wait, import
+#   bin/gl-then-vk           a GL context survives a Vulkan device in the same process
 #   libexec/nvgpu/verify/{sec-negative,lease-flip}   (only with nvgpuSrc)
 {
   pkgs,
@@ -29,6 +31,7 @@ pkgs.stdenv.mkDerivation {
     wayland
     vulkan-headers
     vulkan-loader
+    libglvnd
   ];
   verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/scripts/verify";
   buildPhase = ''
@@ -45,6 +48,8 @@ pkgs.stdenv.mkDerivation {
       $(pkg-config --cflags --libs libdrm vulkan)
     $CC $CFLAGS cuda-smoke.c -o cuda-smoke -ldl
     $CC $CFLAGS nvgpu-poweroff.c -o nvgpu-poweroff
+    $CC $CFLAGS egl-fence.c -o egl-fence -lEGL -lGLESv2
+    $CC $CFLAGS gl-then-vk.c -o gl-then-vk -lEGL -lGLESv2 $(pkg-config --cflags --libs vulkan)
 
     if [ -n "$verifySrc" ]; then
       $CC -O2 -Wall -Wextra $(pkg-config --cflags libdrm) $verifySrc/sec-negative.c \
@@ -56,7 +61,7 @@ pkgs.stdenv.mkDerivation {
   '';
   installPhase = ''
     runHook preInstall
-    install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff
+    install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff egl-fence gl-then-vk
     install -Dm755 -t $out/lib libnvgpu-shim.so
     if [ -n "$verifySrc" ]; then
       install -Dm755 -t $out/libexec/nvgpu/verify sec-negative lease-flip

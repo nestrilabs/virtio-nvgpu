@@ -107,7 +107,7 @@ CONSOLE=$RIG/logs/$TAG.console.log
 N=$(tr ',' '\n' <<<"$APPS" | wc -l)
 say "guest: apps=$APPS slot=${SLOT}s"
 NVGPU_TIMEOUT=$((N * (SLOT + 10) + 90)) \
-    NVGPU_CMDLINE_EXTRA="nvgpu_apps=$APPS nvgpu_slot=$SLOT" \
+    NVGPU_CMDLINE_EXTRA="nvgpu_apps=$APPS nvgpu_slot=$SLOT ${NVGPU_APPS_EXTRA:-}" \
     "$REPO/scripts/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" > "$OUT/run.log" 2>&1 &
 RUN=$!
 
@@ -137,6 +137,31 @@ while kill -0 "$RUN" 2>/dev/null; do
             ptr 'abs 900 500' 'sleep 300' 'move 40 25' 'click' 'wheel 2'
             keys k
             say "pointer: moved, clicked, scrolled, and pressed k"
+            ;;
+        chromentp)
+            for i in 1 2 3 4; do capture "$app-$i"; sleep 6; done
+            ;;
+        chromeanim)
+            for i in 1 2 3 4 5 6; do
+                capture "$app-$i"
+                say "$app: title $(view_geom | cut -d' ' -f4-)"
+                # Between the second and third captures, type into the
+                # address bar (focus it with ctrl+l first).
+                [ "$i" = 2 ] && keys -M ctrl l -m ctrl -s 300 "abc" && say "$app: typed into the address bar"
+                sleep 5
+            done
+            ;;
+        ffsupport | chromegpu)
+            # Chromium ignores a chrome:// URL on its command line: type it
+            # into the address bar, which a new window focuses.
+            [ "$app" = chromegpu ] && sleep 4 && keys "chrome://gpu" -k Return
+            # Long pages: let them fill in, then a capture per screenful.
+            sleep 20
+            for i in 1 2 3 4 5; do
+                capture "$app-$i"
+                keys -k Next
+                sleep 1.5
+            done
             ;;
         clipboard)
             sleep 4

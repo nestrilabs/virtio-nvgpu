@@ -121,6 +121,66 @@ let t = 0;
 HTML
             slot firefox dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile /tmp/ffprofile --new-instance file:///tmp/page.html
             ;;
+        ffsupport)
+            # Firefox's own account of its graphics (about:support, Graphics):
+            # the compositor, WebGL renderer, and what it blocklisted.
+            slot ffsupport dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile /tmp/ffprofile --new-instance about:support
+            ;;
+        chromeanim)
+            # Steady rendering and nothing else: does Chromium keep presenting?
+            cat > /tmp/cpage.html <<'HTML'
+<body style="font:28px sans-serif"><pre id=o></pre><canvas id=c width=640 height=200></canvas><script>
+const g = document.getElementById('c').getContext('webgl2');
+const d = g && g.getExtension('WEBGL_debug_renderer_info');
+document.getElementById('o').textContent = 'WebGL2: ' + (g ? 'on' : 'off') + '\nvendor: ' +
+  (d ? g.getParameter(d.UNMASKED_VENDOR_WEBGL) : '?') + '\nrenderer: ' + (d ? g.getParameter(d.UNMASKED_RENDERER_WEBGL) : '?') +
+  '\nWebGPU: ' + ('gpu' in navigator ? 'present' : 'absent');
+let t = 0;
+(function f() { if (g) { g.clearColor((t % 120) / 120, .3, .6, 1); g.clear(g.COLOR_BUFFER_BIT); }
+  t++; document.title = 'frame ' + t; requestAnimationFrame(f); })();
+</script>
+HTML
+            slot chromeanim dbus chromium --no-sandbox --user-data-dir=/tmp/chromium2 --ozone-platform=wayland \
+                --no-first-run --no-default-browser-check --enable-logging=stderr file:///tmp/cpage.html
+            say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromeanim.log)"
+            ;;
+        chromentp)
+            slot chromentp dbus chromium --no-sandbox --user-data-dir=/tmp/chromium3 --ozone-platform=wayland \
+                --no-first-run --no-default-browser-check --enable-logging=stderr
+            say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromentp.log)"
+            grep -aE 'ERROR' /tmp/apps/chromentp.log | grep -avE 'dbus|crashpad' | head -n 3 | cut -c1-200 | sed 's/^/    /'
+            ;;
+        chromegpu)
+            # Chromium's (chrome://gpu): feature status, GL/ANGLE renderer.
+            # As root it needs --no-sandbox; Wayland by ozone.
+            tr=()
+            [ "$(arg trace 0)" = 1 ] && tr=(strace -f -qq -e trace=ioctl,mmap,openat -o /tmp/crst)
+            [ "$(arg trace 0)" = 2 ] && tr=(strace -f -qq -k -e trace=mmap -e signal=none -o /tmp/crst)
+            # What fills the low 2 GiB of the GPU process (MAP_32BIT's window).
+            ( sleep 30; p=$(pgrep -f 'type=gpu-process' | head -n 1)
+              [ -n "$p" ] && awk '{split($1,a,"-"); if (strtonum("0x" a[1]) < 0x80000000) print}' "/proc/$p/maps" > /tmp/gpumaps
+              [ -n "$p" ] && head -c 4000 "/proc/$p/maps" > /tmp/gpumaps.head ) &
+            slot chromegpu dbus "${tr[@]}" chromium --no-sandbox --user-data-dir=/tmp/chromium --ozone-platform=wayland \
+                --no-first-run --no-default-browser-check --enable-logging=stderr chrome://gpu
+            grep -aiE 'dawn|vulkan|webgpu|adapter|compatible|BackendType' /tmp/apps/chromegpu.log | cut -c1-220 | head -n 20 | sed 's/^/    /'
+            grep -avE '^ ' /tmp/apps/chromegpu.log | grep -aE 'ERROR|FATAL' | grep -avE 'dbus|Fontconfig|sandbox|vaapi|crashpad' |
+                cut -c1-220 | head -n 6 | sed 's/^/    /'
+            if [ -s /tmp/gpumaps ]; then
+                say "gpu-process mappings below 2 GiB: $(wc -l < /tmp/gpumaps)"
+                head -n 5 /tmp/gpumaps | sed 's/^/    /'
+                awk '{split($1,a,"-"); sz=strtonum("0x" a[2])-strtonum("0x" a[1]); n[$6]+=sz; c[$6]++} END {for (k in n) printf "%8.1f MiB %5d  %s\n", n[k]/1048576, c[k], k}' /tmp/gpumaps | sort -rn | head -n 12 | sed 's/^/    /'
+            fi
+            if [ "$(arg trace 0)" = 2 ] && [ -s /tmp/crst ]; then
+                say "the low reservation, with its stack:"
+                grep -anE 'mmap\((0x10000|NULL), 4[0-9]{9}' /tmp/crst | head -n 3 | cut -c1-200 | sed 's/^/    /'
+                l=$(grep -anE 'mmap\((0x10000|NULL), 4[0-9]{9}' /tmp/crst | head -n 1 | cut -d: -f1)
+                [ -n "$l" ] && sed -n "$((l+1)),$((l+25))p" /tmp/crst | cut -c1-200 | sed 's/^/    /'
+            elif [ -s /tmp/crst ]; then
+                say "failed calls (strace):"
+                grep -aE '= -1 E' /tmp/crst | grep -avE 'ENOENT|EAGAIN|ENOTTY|EACCES' |
+                    sed -E 's/^[0-9]+ +//; s/0x[0-9a-f]{6,}/ADDR/g' | cut -c1-160 | sort | uniq -c | sort -rn | head -n 20 | sed 's/^/    /'
+            fi
+            ;;
         mpv) slot mpv mpv --no-config --vo=gpu-next --gpu-api=vulkan --loop 'av://lavfi:testsrc2=size=1280x720:rate=60' ;;
         glmark2) slot glmark2 glmark2-wayland --run-forever -b build:use-vbo=true ;;
         vkmark) slot vkmark vkmark --winsys wayland --run-forever -b vertex ;;
