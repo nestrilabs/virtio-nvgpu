@@ -54,6 +54,7 @@
 #define NV_ESC_RM_CONTROL 0x2A
 #define NV_ESC_RM_ALLOC 0x2B
 #define NV_ESC_RM_VID_HEAP_CONTROL 0x4A
+#define NV_ESC_REGISTER_FD 0xC9 /* NV_IOCTL_BASE + 1; nv_ioctl_register_fd_t {int ctl_fd;} */
 #define NV_ESC_RM_DUP_OBJECT 0x34
 #define NV_ESC_RM_SHARE 0x35
 
@@ -432,14 +433,30 @@ static int64_t alloc_object(int fd, uint32_t client, uint32_t parent,
  * T8 and T9 duplicate. The client's handle, or 0. */
 static uint32_t client_with_vaspace(int fd)
 {
+	/* RM lets a client allocate a device only through a control file the
+	 * GPU's file has been registered with (NV_ESC_REGISTER_FD, as NVIDIA's
+	 * own userspace does first); otherwise NV_ERR_INSUFFICIENT_PERMISSIONS. */
+	int gpu = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+	if (gpu < 0 || ioctl(gpu, NV_IOWR(NV_ESC_REGISTER_FD, sizeof(int)), &fd) != 0) {
+		fprintf(stderr, "sec-negative: registering the control file with /dev/nvidia0: %s\n",
+			strerror(errno));
+		return 0;
+	}
 	uint32_t c = alloc_client(fd);
 	if (!c)
 		return 0;
-	if (alloc_object(fd, c, c, DEV_HANDLE, NV01_DEVICE_0,
-			 NV0080_ALLOC_PARAMETERS_SIZE) != 0 ||
-	    alloc_object(fd, c, DEV_HANDLE, VAS_HANDLE, FERMI_VASPACE_A,
-			 NV_VASPACE_ALLOCATION_PARAMETERS_SIZE) != 0)
+	int64_t st = alloc_object(fd, c, c, DEV_HANDLE, NV01_DEVICE_0,
+				  NV0080_ALLOC_PARAMETERS_SIZE);
+	if (st != 0) {
+		fprintf(stderr, "sec-negative: device alloc: status %#llx\n", (long long)st);
 		return 0;
+	}
+	st = alloc_object(fd, c, DEV_HANDLE, VAS_HANDLE, FERMI_VASPACE_A,
+			  NV_VASPACE_ALLOCATION_PARAMETERS_SIZE);
+	if (st != 0) {
+		fprintf(stderr, "sec-negative: VA space alloc: status %#llx\n", (long long)st);
+		return 0;
+	}
 	return c;
 }
 
