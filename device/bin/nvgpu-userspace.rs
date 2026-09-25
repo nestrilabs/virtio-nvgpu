@@ -150,14 +150,15 @@ fn main() -> Result<()> {
         .or_else(|| loaded_version.clone())
         .or_else(|| manifest_version.clone());
 
+    // What the retargeted build lacks is not reported: the list above
+    // already named what is absent, and a retarget is only accepted when
+    // nearly all of it is there.
     let mut found = found;
-    let mut missing = missing;
-    let mut retargeted_from = None;
 
     if let (Some(m), Some(t)) = (&manifest_version, &target) {
         if m != t && !args.allow_version_mismatch {
             let swapped = retarget(&entries, m, t);
-            let (f2, m2) = resolve(&swapped, &caps, &search);
+            let (f2, _) = resolve(&swapped, &caps, &search);
             // Only accept the swap if that build is really installed. A
             // target with nothing on disk must fail loudly below, not quietly
             // produce a share with three files in it.
@@ -168,9 +169,7 @@ fn main() -> Result<()> {
                     f2.len(),
                     found.len()
                 );
-                retargeted_from = Some(m.clone());
                 found = f2;
-                missing = m2;
             }
         }
     }
