@@ -2458,6 +2458,18 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // RM control requires nested handling
             // ---------------------------------------------------------------
+            // Controls that list other RM clients' host PIDs (rmctl.rs, S-24):
+            // answered here, as RM answers a caller without the privilege.
+            NV_ESC_RM_CONTROL if crate::rmctl::host_pid_control(param_in).is_some() => {
+                log::warn!(
+                    "RM control {} refused: it lists the host's GPU processes",
+                    crate::rmctl::host_pid_control(param_in).unwrap_or_default()
+                );
+                let mut out = crate::rmctl::refusal(param_in);
+                let deep = deep_in.map_or(&[][..], |(_, b)| b);
+                out.extend_from_slice(deep);
+                self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len())
+            }
             NV_ESC_RM_CONTROL => {
                 let n = self.dispatch_nested(
                     cookie, host_fd, request, param_in, resp_buf, 32, 16, 24, deep_in, None,
@@ -5342,6 +5354,28 @@ mod tests {
         let status: u32 = if key == served { 0 } else { 0x56 };
         a[status_at..status_at + 4].copy_from_slice(&status.to_le_bytes());
         0
+    }
+
+    /// S-24: a control that lists the host's GPU processes never reaches
+    /// RM; the caller reads RM's own "insufficient permissions" and its
+    /// parameters back as sent.
+    #[test]
+    fn a_control_listing_host_pids_is_answered_without_rm() {
+        let mut be = gated_backend();
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let control = hostfd::ioc(hostfd::IOC_RW, b'F', 0x2a, 32);
+        let mut p = [0u8; 32];
+        p[8..12].copy_from_slice(&0x2080_018du32.to_le_bytes());
+        let resp = v1_ioctl(&mut be, ctl, control, &p);
+        assert_eq!(parse_resp(&resp).status, 0, "the call itself succeeds");
+        assert!(forwarded().is_empty(), "RM never saw it");
+        let body = &resp[IOCTL_BODY..];
+        assert_eq!(
+            &body[28..32],
+            &crate::rmctl::NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes()
+        );
+        assert_eq!(&body[..28], &p[..28]);
+        assert!(be.rm_controls.is_empty());
     }
 
     /// S-17: the tallies are keyed by the guest's u32s, so only what RM

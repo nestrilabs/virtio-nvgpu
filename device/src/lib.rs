@@ -25,6 +25,7 @@ pub mod privfd;
 pub mod pump;
 pub mod ratelimit;
 pub mod replay;
+pub mod rmctl;
 pub mod rmmem;
 pub mod schema;
 pub mod semsurf;
