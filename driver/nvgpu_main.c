@@ -17,6 +17,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iosys-map.h>
+#include <linux/kref.h>
 #include <linux/cpu.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -1069,25 +1070,54 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
 
 /* ───────── mmap ───────── */
 
-static void nvgpu_vma_close(struct vm_area_struct *vma) {
-  struct nvgpu_fd *nfd = vma->vm_file->private_data;
-  u32 mapping_id = (u32)(unsigned long)vma->vm_private_data;
-  struct nvgpu_munmap_req *req;
-  struct nvgpu_munmap_resp *resp;
+/*
+ * One window placement made through a character device, shared by every vma
+ * that maps it.
+ *
+ * The backend counts a reference per MMAP reply, and a reply makes one vma --
+ * but a vma is not what the kernel keeps. An munmap or mprotect of part of
+ * the range splits it in two (__split_vma calls .open on the new half), fork
+ * copies it into the child (dup_mmap, .open again), mremap moves it (copy_vma:
+ * .open on the new one, .close on the old), and every one of those vmas is
+ * closed on its own. With no .open and the mapping id kept bare in
+ * vm_private_data, each of them sent MUNMAP: the second gave back a reference
+ * the first had already given back, and with the backend counting, took the
+ * placement away from whoever else held it -- another MMAP of the same host
+ * object -- while this process still had the pages mapped.
+ *
+ * So the vmas share this, counted: .open takes a reference, .close drops one,
+ * and the last sends the one MUNMAP the reply is owed. The handle stays valid
+ * until then: every vma pins the file, and the file's release is what CLOSEs
+ * the handle.
+ */
+struct nvgpu_vma_map {
+  struct kref ref;
+  struct nvgpu_device *dev;
+  u32 handle;
+  u32 mapping_id;
+};
 
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
-  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (req && resp) {
-    req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_MUNMAP);
-    req->hdr.handle = cpu_to_le32(nfd->handle);
-    req->mapping_id = cpu_to_le32(mapping_id);
-    nvgpu_send_recv(nfd->dev, req, sizeof(*req), resp, sizeof(*resp));
-  }
-  kfree(req);
-  kfree(resp);
+static void nvgpu_vma_map_release(struct kref *ref) {
+  struct nvgpu_vma_map *m = container_of(ref, struct nvgpu_vma_map, ref);
+
+  nvgpu_munmap(m->dev, m->handle, m->mapping_id);
+  kfree(m);
+}
+
+static void nvgpu_vma_open(struct vm_area_struct *vma) {
+  struct nvgpu_vma_map *m = vma->vm_private_data;
+
+  kref_get(&m->ref);
+}
+
+static void nvgpu_vma_close(struct vm_area_struct *vma) {
+  struct nvgpu_vma_map *m = vma->vm_private_data;
+
+  kref_put(&m->ref, nvgpu_vma_map_release);
 }
 
 static const struct vm_operations_struct nvgpu_vm_ops = {
+    .open = nvgpu_vma_open,
     .close = nvgpu_vma_close,
 };
 
@@ -1098,12 +1128,16 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   u64 window_off;
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
-  u32 used;
+  /* Allocated before asking, so that nothing can fail between the backend
+   * placing the memory and this side owning the placement. */
+  struct nvgpu_vma_map *m;
+  u32 used, mapping_id = 0;
   int ret;
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (!req || !resp) {
+  m = kzalloc(sizeof(*m), GFP_KERNEL);
+  if (!req || !resp || !m) {
     ret = -ENOMEM;
     goto out;
   }
@@ -1131,6 +1165,9 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
     ret = -EIO;
     goto out;
   }
+  /* The backend holds a placement for this reply from here on; every
+   * failure below gives it back. */
+  mapping_id = le32_to_cpu(resp->mapping_id);
 
   vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
   vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
@@ -1166,10 +1203,18 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   if (ret)
     goto out;
 
+  kref_init(&m->ref);
+  m->dev = nfd->dev;
+  m->handle = nfd->handle;
+  m->mapping_id = mapping_id;
   vma->vm_ops = &nvgpu_vm_ops;
-  vma->vm_private_data = (void *)(unsigned long)le32_to_cpu(resp->mapping_id);
+  vma->vm_private_data = m;
+  m = NULL;
 
 out:
+  if (ret && mapping_id)
+    nvgpu_munmap(nfd->dev, nfd->handle, mapping_id);
+  kfree(m);
   kfree(req);
   kfree(resp);
   return ret;

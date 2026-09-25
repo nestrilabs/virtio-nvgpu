@@ -489,20 +489,13 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
    * megabytes at a time, so a guest that allocates and frees buffers for an
    * hour exhausts it otherwise -- and the failure lands on whichever mapping
    * happens to be next, not on the one that leaked.
+   *
+   * Exactly once per proxy: the placement is the object's, made by one MMAP
+   * on first use, not per vma -- vmas of a GEM object only hold object
+   * references (drm_gem_vm_open/close), and this runs after the last one.
    */
-  if (ng->window_valid && ng->mapping_id) {
-    struct nvgpu_munmap_req *req = kzalloc(sizeof(*req), GFP_KERNEL);
-    struct nvgpu_munmap_resp *resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-
-    if (req && resp) {
-      req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_MUNMAP);
-      req->hdr.handle = cpu_to_le32(ng->owner_handle);
-      req->mapping_id = cpu_to_le32(ng->mapping_id);
-      nvgpu_send_recv(ng->dev, req, sizeof(*req), resp, sizeof(*resp));
-    }
-    kfree(req);
-    kfree(resp);
-  }
+  if (ng->window_valid && ng->mapping_id)
+    nvgpu_munmap(ng->dev, ng->owner_handle, ng->mapping_id);
 
   drm_gem_object_release(obj);
   if (ng->owner)
@@ -613,6 +606,8 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
              "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "
              "window\n",
              window_off, obj->size, ng->dev->window.len);
+    /* Placed but unusable: the placement is still the backend's to free. */
+    nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
     ret = -ERANGE;
     goto out_free;
   }

@@ -439,6 +439,11 @@ int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len);
  * frees the unsent buffers then, so the rule has no exception.) -ENODEV: the
  * device is gone; the buffers are the caller's.
  *
+ * On those two returns an IOCTL2's NVGPU_I2_FD_CONSUME handles are the
+ * transport's too: it closes them if the call never ran (unsent, or answered
+ * with a non-zero status), and the backend closes them if it did, so the
+ * caller must not.
+ *
  * NVGPU_XF_EXECUTOR waits up to 60 s, anything else 30 s, killable only:
  * host display calls are bounded but uninterruptible, like the native ioctls.
  */
@@ -496,6 +501,13 @@ int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
+/*
+ * MUNMAP: give back one window placement an MMAP reply handed out, through
+ * the handle it was made on. The backend counts a reference per MMAP reply,
+ * so exactly one of these per reply, never per vma. Process context; like
+ * CLOSE, a request that never reached the ring is queued instead, not lost.
+ */
+int nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id);
 
 /* ── Clock ── */
 s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns);

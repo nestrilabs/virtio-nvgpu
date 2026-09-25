@@ -624,7 +624,14 @@ static int nvgpu_i2_parse(struct nvgpu_i2_call *call, struct nvgpu_tbuf *tb,
   u32 nfd, ngem, i, j;
   s32 status, ret;
 
-  if (used < sizeof(h) || nvgpu_tbuf_read(tb, 0, &h, sizeof(h)))
+  /*
+   * The status first, from the header alone: a refusal -- by the transport or
+   * by the backend before the call ran -- is a bare nvgpu_msg_hdr, with no
+   * nvgpu_i2_resp behind it. Requiring the whole head first turned every
+   * refusal (-ENOTTY, -EPERM, -EMSGSIZE...) into -EPROTO and leaked the
+   * handles the call was to consume.
+   */
+  if (used < sizeof(h.hdr) || nvgpu_tbuf_read(tb, 0, &h.hdr, sizeof(h.hdr)))
     return -EPROTO;
   status = (s32)le32_to_cpu(h.hdr.status);
   if (status) {
@@ -632,6 +639,8 @@ static int nvgpu_i2_parse(struct nvgpu_i2_call *call, struct nvgpu_tbuf *tb,
     nvgpu_i2_drop_consumed(call);
     return status < 0 && status >= -MAX_ERRNO ? status : -EPROTO;
   }
+  if (used < sizeof(h) || nvgpu_tbuf_read(tb, 0, &h, sizeof(h)))
+    return -EPROTO;
   ret = (s32)le32_to_cpu(h.resp.ret);
   nfd = le32_to_cpu(h.resp.nfd);
   ngem = le32_to_cpu(h.resp.ngem);
@@ -782,9 +791,16 @@ static int nvgpu_i2_outputs(struct nvgpu_i2_call *call) {
     struct nvgpu_i2_out *o = &st->fdo[i];
     s64 v = -1;
 
-    ret = ops && ops->fd_out ? ops->fd_out(call, o->buf, o->off, o->handle,
-                                           o->kind, &v)
-                             : -EINVAL;
+    /* Handle 0: the host made the descriptor but the backend could not keep
+     * it (its handle table was full) and closed it again. What the call made
+     * is gone -- a lease, a fence -- so the caller hears it failed, the way a
+     * host process out of descriptors would. */
+    if (!o->handle)
+      ret = -EMFILE;
+    else
+      ret = ops && ops->fd_out ? ops->fd_out(call, o->buf, o->off, o->handle,
+                                             o->kind, &v)
+                               : -EINVAL;
     if (ret) {
       nvgpu_i2_drop_outs(call, i, st->ngemo);
       return ret;
@@ -992,8 +1008,9 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
     xflags |= NVGPU_XF_EXECUTOR;
   ret = nvgpu_xfer(dev, req, resp, xflags, &used);
   if (ret == -ETIMEDOUT || ret == -EINTR) {
-    /* The transport owns both buffers now, and closes whatever the late
-     * reply creates. */
+    /* The transport owns both buffers now, closes whatever the late reply
+     * creates, and releases the consumed handles if the call never runs --
+     * so neither is freed nor dropped here. */
     req = resp = NULL;
     goto out;
   }

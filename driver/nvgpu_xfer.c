@@ -386,6 +386,8 @@ struct nvgpu_times {
 };
 
 static void nvgpu_req_reap_work(struct work_struct *work);
+static unsigned int nvgpu_release_consumed(struct nvgpu_device *dev,
+                                           const struct nvgpu_tbuf *req);
 
 /* Budget units go back when the device returns the buffers, not when a
  * waiter gives up: until then the slots are still on the ring. */
@@ -602,6 +604,27 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   }
 
   ret = r->dead ? -ENODEV : 0;
+  /*
+   * The backend echoes the id (0 only in the bare header of a transport
+   * refusal, which answers a request it could not read). It is not used to
+   * route anything -- the context is the token -- but a different one here
+   * means a reply landed in the wrong request's buffers, which is worth a
+   * line in the log before it is worth a corrupted ioctl. The file streams
+   * are the two replies with no header to look in.
+   */
+  if (!ret && min_t(u32, r->used_len, resp->len) >= sizeof(hdr) &&
+      le32_to_cpu(hdr.msg_type) != NVGPU_MSG_GET_PROC_FILES &&
+      le32_to_cpu(hdr.msg_type) != NVGPU_MSG_GET_SYS_FILES) {
+    struct nvgpu_msg_hdr ah;
+
+    if (!nvgpu_tbuf_read(resp, 0, &ah, sizeof(ah)) && ah.req_id &&
+        le32_to_cpu(ah.req_id) != id && dev->v2)
+      dev_warn_ratelimited(&dev->vdev->dev,
+                           "virtio-gpu-nv: request %u (msg_type %u) was "
+                           "answered as request %u\n",
+                           id, le32_to_cpu(hdr.msg_type),
+                           le32_to_cpu(ah.req_id));
+  }
   if (used_len)
     *used_len = min_t(u32, r->used_len, resp->len);
   if (tm) {
@@ -615,8 +638,11 @@ unsent_units:
   nvgpu_exec_release(xf, units);
 unsent:
   kfree(r);
-  /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h. */
+  /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h.
+   * Unsent, the backend never saw the request, so what it would have
+   * consumed is released here, as the reaper does for a refused one. */
   if (ret == -EINTR) {
+    nvgpu_release_consumed(dev, req);
     nvgpu_tbuf_free(req);
     nvgpu_tbuf_free(resp);
   }
@@ -702,13 +728,23 @@ static int nvgpu_hdr_status(const void *resp, u32 used) {
 
 /* ───────── CLOSE, GEM_CLOSE and their async twins ───────── */
 
+/* What a queued close takes back. */
+enum nvgpu_close_what {
+  NVGPU_CLOSE_HANDLE, /* CLOSE `handle` */
+  NVGPU_CLOSE_GEM,    /* GEM_CLOSE `id` in the file `handle` */
+  NVGPU_CLOSE_MUNMAP, /* MUNMAP mapping `id`, made through `handle` */
+};
+
 struct nvgpu_close_work {
   struct work_struct work;
   struct nvgpu_device *dev;
   u32 handle; /* the handle to close, or the file the GEM handle is in */
-  u32 gem;
-  bool is_gem;
+  u32 id;     /* GEM handle or mapping id */
+  enum nvgpu_close_what what;
 };
+
+static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
+                              enum nvgpu_close_what what);
 
 static int __nvgpu_close_handle(struct nvgpu_device *dev, u32 handle,
                                 bool fallback) {
@@ -724,7 +760,7 @@ static int __nvgpu_close_handle(struct nvgpu_device *dev, u32 handle,
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, &sent);
   if (!sent && fallback && ret != -ENODEV)
-    nvgpu_close_handle_async(dev, handle);
+    nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
 }
 
@@ -761,7 +797,7 @@ static int __nvgpu_gem_close(struct nvgpu_device *dev, u32 file, u32 gem,
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, &sent);
   if (!sent && fallback && ret != -ENODEV)
-    nvgpu_gem_close_async(dev, file, gem);
+    nvgpu_queue_close(dev, file, gem, NVGPU_CLOSE_GEM);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
 }
 
@@ -769,14 +805,51 @@ int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem) {
   return __nvgpu_gem_close(dev, file_handle, gem, true);
 }
 
+/*
+ * A window placement handed back. The backend counts one reference per MMAP
+ * reply that named the placement, so this must be sent exactly once per such
+ * reply -- a lost one leaks a slice of the window for the session, and a
+ * second one takes a reference somebody else holds.
+ */
+static int __nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id,
+                          bool fallback) {
+  struct nvgpu_munmap_req req = {};
+  struct nvgpu_munmap_resp resp;
+  bool sent;
+  u32 used;
+  int ret;
+
+  if (!mapping_id)
+    return 0;
+  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_MUNMAP);
+  req.hdr.handle = cpu_to_le32(handle);
+  req.mapping_id = cpu_to_le32(mapping_id);
+  ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
+                   NULL, &sent);
+  if (!sent && fallback && ret != -ENODEV)
+    nvgpu_queue_close(dev, handle, mapping_id, NVGPU_CLOSE_MUNMAP);
+  return ret ? ret : nvgpu_hdr_status(&resp, used);
+}
+
+int nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id) {
+  return __nvgpu_munmap(dev, handle, mapping_id, true);
+}
+
 static void nvgpu_close_work_fn(struct work_struct *work) {
   struct nvgpu_close_work *cw =
       container_of(work, struct nvgpu_close_work, work);
 
-  if (cw->is_gem)
-    __nvgpu_gem_close(cw->dev, cw->handle, cw->gem, false);
-  else
+  switch (cw->what) {
+  case NVGPU_CLOSE_HANDLE:
     __nvgpu_close_handle(cw->dev, cw->handle, false);
+    break;
+  case NVGPU_CLOSE_GEM:
+    __nvgpu_gem_close(cw->dev, cw->handle, cw->id, false);
+    break;
+  case NVGPU_CLOSE_MUNMAP:
+    __nvgpu_munmap(cw->dev, cw->handle, cw->id, false);
+    break;
+  }
   kfree(cw);
   module_put(THIS_MODULE);
 }
@@ -787,8 +860,8 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
  * module reference so the code it runs cannot be unloaded under it; remove()
  * drains the queue before the device goes, and refuses new items after.
  */
-static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 gem,
-                              bool is_gem) {
+static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
+                              enum nvgpu_close_what what) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_close_work *cw;
   unsigned long flags;
@@ -798,16 +871,17 @@ static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 gem,
   cw = kmalloc(sizeof(*cw), GFP_ATOMIC);
   if (!cw) {
     dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: no memory to close backend handle %u "
-                         "(gem %u); it stays open until the session resets\n",
-                         handle, gem);
+                         "virtio-gpu-nv: no memory to release backend handle "
+                         "%u (%s %u); it stays until the session resets\n",
+                         handle,
+                         what == NVGPU_CLOSE_MUNMAP ? "mapping" : "gem", id);
     return;
   }
   INIT_WORK(&cw->work, nvgpu_close_work_fn);
   cw->dev = dev;
   cw->handle = handle;
-  cw->gem = gem;
-  cw->is_gem = is_gem;
+  cw->id = id;
+  cw->what = what;
 
   spin_lock_irqsave(&xf->lock, flags);
   if (xf->dead) {
@@ -821,25 +895,53 @@ static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 gem,
 }
 
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle) {
-  nvgpu_queue_close(dev, handle, 0, false);
+  nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE);
 }
 
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem) {
   if (gem)
-    nvgpu_queue_close(dev, file_handle, gem, true);
+    nvgpu_queue_close(dev, file_handle, gem, NVGPU_CLOSE_GEM);
 }
 
 /* ───────── Replies nobody waited for ───────── */
 
-static void nvgpu_munmap_handle(struct nvgpu_device *dev, u32 handle, u32 id) {
-  struct nvgpu_munmap_req req = {};
-  struct nvgpu_munmap_resp resp;
+/*
+ * IOCTL2 descriptors the caller handed over to be consumed (NVGPU_I2_FD_CONSUME:
+ * a fence unwrap that made a temporary). The backend closes them only when
+ * the call runs; for one that never did -- refused, cancelled by a reset, or
+ * never put on the ring -- they are still open there and nobody else knows.
+ * Queued rather than sent: the unsent case runs with a fatal signal pending,
+ * where a synchronous request would be abandoned before it was made.
+ */
+static unsigned int nvgpu_release_consumed(struct nvgpu_device *dev,
+                                           const struct nvgpu_tbuf *req) {
+  const size_t base = sizeof(struct nvgpu_msg_hdr);
+  struct nvgpu_msg_hdr qh;
+  struct nvgpu_i2_req q;
+  u32 nbuf, nfd, i;
+  size_t at;
+  unsigned int n = 0;
 
-  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_MUNMAP);
-  req.hdr.handle = cpu_to_le32(handle);
-  req.mapping_id = cpu_to_le32(id);
-  nvgpu_send_recv(dev, &req, sizeof(req), &resp, sizeof(resp));
+  if (nvgpu_tbuf_read(req, 0, &qh, sizeof(qh)) ||
+      le32_to_cpu(qh.msg_type) != NVGPU_MSG_IOCTL2 ||
+      nvgpu_tbuf_read(req, base, &q, sizeof(q)))
+    return 0;
+  /* Our own request, so the counts are ours; bounded all the same. */
+  nbuf = min_t(u32, le32_to_cpu(q.nbuf), NVGPU_I2_MAX_BUFS);
+  nfd = min_t(u32, le32_to_cpu(q.nfd), NVGPU_I2_MAX_RECS);
+  at = base + sizeof(q) + (size_t)nbuf * sizeof(__le32);
+  for (i = 0; i < nfd; i++, at += sizeof(struct nvgpu_i2_fd_in)) {
+    struct nvgpu_i2_fd_in fi;
+
+    if (nvgpu_tbuf_read(req, at, &fi, sizeof(fi)))
+      break;
+    if (le32_to_cpu(fi.flags) & NVGPU_I2_FD_CONSUME) {
+      nvgpu_close_handle_async(dev, le32_to_cpu(fi.handle));
+      n++;
+    }
+  }
+  return n;
 }
 
 /* IOCTL2: every descriptor the host produced, and every GEM handle it made in
@@ -933,9 +1035,15 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
 
   if (r->dead || !nvgpu_resp_has(used, 0, sizeof(ah)) ||
       nvgpu_tbuf_read(r->resp, 0, &ah, sizeof(ah)) ||
-      nvgpu_tbuf_read(r->req, 0, &qh, sizeof(qh)) ||
-      (s32)le32_to_cpu(ah.status) < 0)
+      nvgpu_tbuf_read(r->req, 0, &qh, sizeof(qh)))
     return;
+  if ((s32)le32_to_cpu(ah.status) < 0) {
+    /* Refused before it ran -- the backend sets a status on nothing else,
+     * bar a call whose session a reset already emptied: nothing was made,
+     * but an IOCTL2's consumed handles are still open there. */
+    closed = nvgpu_release_consumed(dev, r->req);
+    goto out;
+  }
 
   switch (le32_to_cpu(qh.msg_type)) {
   case NVGPU_MSG_OPEN:
@@ -948,8 +1056,7 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
     if (nvgpu_resp_has(used, 0, sizeof(m)) &&
         !nvgpu_tbuf_read(r->resp, 0, &m, sizeof(m)) &&
         le32_to_cpu(m.mapping_id)) {
-      nvgpu_munmap_handle(dev, le32_to_cpu(qh.handle),
-                          le32_to_cpu(m.mapping_id));
+      nvgpu_munmap(dev, le32_to_cpu(qh.handle), le32_to_cpu(m.mapping_id));
       closed = 1;
     }
     break;
@@ -964,6 +1071,7 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
     break;
   }
 
+out:
   if (closed)
     dev_warn_ratelimited(&dev->vdev->dev,
                          "virtio-gpu-nv: request %u (msg_type %u) came back "
@@ -1266,6 +1374,15 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
   dev->max_req = min_not_zero(le32_to_cpu(resp.body.max_req), ring_max);
   dev->max_resp = min_not_zero(le32_to_cpu(resp.body.max_resp), ring_max);
   dev->num_cards = le32_to_cpu(resp.body.num_cards);
+  /*
+   * The IOCTL2 tables. The DRM ones are the same for every host; an NVKMS
+   * table only when the backend has one for its driver too, because both
+   * halves must walk the same table or every modeset call is refused (or
+   * worse, gathered by a layout the backend does not have). Before this the
+   * interpreter falls back to the DRM-only set, and it never runs before v2.
+   */
+  dev->schema = nvgpu_schema_select(
+      dev->backend_caps & NVGPU_BCAP_NVKMS_TABLE ? dev->driver_version : NULL);
   dev->v2 = true;
 
   dev_info(&dev->vdev->dev,
