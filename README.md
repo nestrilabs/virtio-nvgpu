@@ -163,17 +163,29 @@ What narrows the surface today:
   backend's or zeroed, whatever the ABI policy; escapes whose pointers cannot
   be relocated (IOCTL_XFER_CMD, IDLE_CHANNELS, ACCESS_REGISTRY, I2C_ACCESS,
   GET_EVENT_DATA) are refused (`device/src/guestptr.rs`)
+- **compute is opt-in.** Everything only CUDA needs -- `/dev/nvidia-uvm`,
+  UVM's sharing mode and aperture, memory registered by its pages -- is served
+  only with `--allow-compute` (`scripts/run-guest.sh --allow-compute`, or
+  `NVGPU_COMPUTE=1`). Without it the guest has no UVM device and CUDA finds no
+  device; Vulkan, OpenGL, EGL, Vulkan Video and display need none of it
+  ([`SECURITY.md`](SECURITY.md), "Compute")
+- **RM objects stay with the guest process that made them.** A duplicate
+  between two clients follows RM's own rule with guest processes in place of
+  the backend's one, and a second client named in parameters is held to RM's
+  rule for that field (the same process, or the same euid where RM checks its
+  security token). The guest kernel says which process and euid make each
+  call; a guest that cannot is refused both (`device/src/rmshare.rs`)
 - **memory the guest registers with the GPU travels as its pages, not its
   address.** RM pins what an address maps in the calling process -- the
   VMM -- so the guest driver pins the caller's range and sends the
   guest-physical pages instead; the backend checks each is guest RAM and hands
   RM its own mapping of exactly those pages, and the guest keeps them pinned
-  until RM has let go (`device/src/osdesc.rs`)
+  until RM has let go (`device/src/osdesc.rs`; `--allow-compute` only)
 - **guest descriptor numbers are translated, not forwarded.** A file named
   inside RM escape, UVM, NVKMS or DRM parameters becomes the backend's own
   descriptor for that file, or the call is refused; a few descriptors inside
   RM control parameters are not translated yet ([`SECURITY.md`](SECURITY.md))
-- UVM runs with pageable memory access forced off, so the GPU cannot fault in
+- UVM (`--allow-compute` only) runs with pageable memory access forced off, so the GPU cannot fault in
   the VMM's own pages, and takes only the commands that name UVM's ranges, RM
   handles or GPU state, each held to a block size measured per release: the
   tools device, and every command that copies through, pins or populates CPU

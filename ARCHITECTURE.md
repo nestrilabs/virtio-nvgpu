@@ -185,18 +185,28 @@ have open at that number, which is not a failure with an error message; it is a
 failure with a plausible wrong answer. The guest driver replaces those with the
 handle of the file it refers to, and the backend puts its own descriptor back.
 
-**Processes.** RM keeps an object to the process that made its client: another
-process may duplicate it only if it was shared, and the one share RM starts
-with is "the same process". Every guest process's calls are the backend's, so
-to RM a whole VM is one process, and anything a guest shares RM shares with the
-host. So the backend holds sharing to the VM — a share goes to RM only when it
-narrows or grants to the VM's own clients — and keeps a duplicate's source
-client and its destination client to one guest process, unless the source was
-shared with the destination (`device/src/rmshare.rs`). Which process that is,
-only the guest kernel knows: its driver sends the caller's identity — the
-thread group's PID and its leader's start time, one process for the guest's
-lifetime — with every RM_ALLOC and RM_DUP_OBJECT, to a backend that asks in HELLO
-(`BCAP_PROC_ID`). A client handed to another process with its file stays its
+**Processes.** RM keeps an object to the process that made its client:
+another process may duplicate it only if it was shared, and the one share RM
+starts with is "the same process". Every guest process's calls are the
+backend's, so to RM a whole VM is one process, and anything a guest shares RM
+shares with the host. So the backend holds sharing to the VM — a share goes to
+RM only when it narrows or grants to the VM's own clients — and applies RM's
+own duplicate rule with guest processes in place of the backend's: the
+source client and the destination client were made by one guest process, or
+the source object's share list grants the destination (`device/src/rmshare.rs`).
+Calls that name a second client in their parameters — a device sharing
+another client's VA space, register operations or a profiler on another
+client's context, other clients' channels — are held to the rule RM applies to
+that field between host processes: the same process where RM checks nothing
+(or checks only inside GSP-RM), the same process or the same euid where it
+checks its security token, the share list where it checks a right. Which
+process and which euid, only the guest kernel knows: its driver sends the
+caller's identity — the thread group's PID and its leader's start time, one
+process for the guest's lifetime, and the effective uid — with every
+RM_ALLOC, RM_DUP_OBJECT and RM_CONTROL, to a backend that asks in HELLO
+(`BCAP_PROC_ID`, `BCAP_PROC_EUID`). A guest that does not gets no duplicate
+between two clients except by a grant, and names no client but the caller's
+own: fail closed. A client handed to another process with its file stays its
 maker's, as RM's does. Processes in one guest that share GPU work do it
 through descriptors (dma-bufs, RM's export to a file) rather than handles, and
 cross nothing here.
@@ -236,7 +246,8 @@ That is how `cuMemHostRegister`/`cudaHostRegister` and Vulkan's
 a 2 MiB buffer of its own.
 
 So the pages travel instead, to a backend that says it takes them
-(BCAP_OS_DESC, offered when it holds the vhost-user memory table). The guest
+(BCAP_OS_DESC, offered when it holds the vhost-user memory table and was
+started with `--allow-compute`; see "Compute is opt-in" below). The guest
 driver pins the caller's range the way RM would — long-term, and for
 writing unless the call asks for memory read-only to the CPU — and sends its
 guest-physical page list, as runs, with the call (`driver/nvgpu_osdesc.c`).
@@ -315,6 +326,21 @@ per pool because the address is fixed per pool; a slot costs about 0.7 ms to
 add and 2 ms to remove, once per CUDA context. UVM itself keeps the pages
 alive: it refuses to free a pool that is still mapped, and the VMM's mapping
 counts.
+
+### Compute is opt-in
+
+Everything in this section that exists only for CUDA — the UVM device with
+its sharing mode and range groups, the UVM aperture, and memory registered by
+its pages — is served only when the backend is started with
+`--allow-compute`, and is off by default. Without it the backend refuses
+every open of `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, offers neither
+BCAP_UVM_MAP nor BCAP_OS_DESC, and says so in HELLO (no `BCAP_COMPUTE`); the
+guest driver then makes no UVM device and does not register the
+`nvidia-uvm` major, which NVIDIA's userspace reads as a host whose
+nvidia-uvm is not loaded. Vulkan, OpenGL, EGL, Vulkan Video and the display
+paths use RM, NVKMS and nvidia-drm and none of this (SECURITY.md, "Compute").
+`scripts/run-guest.sh --allow-compute` (or `NVGPU_COMPUTE=1`) turns it on
+for a run.
 
 ---
 
@@ -456,7 +482,8 @@ display features at all. The backend's reply says what it offers — the host's
 card nodes, a Wayland socket, fences, an NVKMS table for this host's release,
 export mode — and how large one request may be. The guest's side says what it
 can: the UVM aperture it found, and that it can name the process behind each
-RM call (§4).
+RM call and its euid (§4). Whether compute is served is the backend's to say
+(§5, "Compute is opt-in").
 
 A HELLO also says whether this is a fresh driver instance, and a fresh one
 resets the session: every host file the previous instance held is closed,

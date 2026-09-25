@@ -63,7 +63,7 @@ nix shell nixpkgs#e2fsprogs -c debugfs -R 'ls -l /opt/nvgpu' .rig/guest/rootfs.e
 | probe | stages |
 |---|---|
 | `stage1` | 1 (+0.1) |
-| `render` | 2's offscreen part (nvidia-smi, Vulkan, EGL, CUDA); not the envyhooks differential |
+| `render` | 2's offscreen part (nvidia-smi, Vulkan, EGL, CUDA); not the envyhooks differential. CUDA runs with `--allow-compute`; without it the probe checks there is no UVM device and CUDA fails cleanly (`nvgpu_compute`, which run-guest.sh sets) |
 | `wayland` | 3 and 8 (the `WAYLAND_DEBUG` trace shows the modifiers and syncobj use) |
 | `lease` | 4, and 9's lease round trip |
 | `vkdisplay` | 5 |
@@ -89,7 +89,8 @@ on the host GPU.
 scripts/rig-preflight.sh
 ```
 
-Every line is OK, WARN or FAIL, with a hint. It exits non-zero only on a FAIL.
+Every line is OK, WARN or FAIL, with a hint. A missing `/dev/nvidia-uvm` is
+only a WARN: it matters only to `--allow-compute` runs. It exits non-zero only on a FAIL.
 Inside the Claude sandbox, the rig needs these bound in: `/dev/kvm`,
 `/dev/nvidiactl`, `/dev/nvidia0`, `/dev/nvidia-uvm`, `/dev/nvidia-modeset`,
 `/dev/dri`, optionally `/dev/udmabuf`, and `/sys`. The backend needs `/sys`
@@ -106,7 +107,7 @@ never connect to the live compositor. Run them first, in this order.
 | # | stage | run | backend flags |
 |---|---|---|---|
 | A1 | **1**: HELLO v2, nodes, extensions | `scripts/run-guest.sh stage1 s1` | none |
-| A2 | **2, W1 only**: offscreen render (the envyhooks differential has no probe) | `scripts/run-guest.sh render s2` | none |
+| A2 | **2, W1 only**: offscreen render (the envyhooks differential has no probe), twice: without compute (nvidia-smi, Vulkan and EGL with no UVM device; CUDA must find no device and exit cleanly), then with it (CUDA must run) | `scripts/run-guest.sh render s2` then `scripts/run-guest.sh --allow-compute render s2c` | none, then `--allow-compute` |
 | A3 | **security negatives**, ctl + render tests (no `--kms`). Run only after A1 and A2 pass, with your work saved: a regressed fix can oops the host (SAFETY-NOTES risk 2) | `NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh secneg sec` | none |
 | A4 | **3** against a **separate headless compositor** | see below | `--wayland-socket <headless socket>` |
 | A5 | **8**: explicit sync (all three parts) | as A4 | `--wayland-socket <headless socket>` |
