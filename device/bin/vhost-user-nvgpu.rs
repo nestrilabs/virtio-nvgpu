@@ -1050,22 +1050,53 @@ fn main() -> anyhow::Result<()> {
     // compositor-VM mode: it drives card nodes (BCAP_KMS_CARD) only then,
     // and otherwise drops EV_HOTPLUG. A lease change also makes the backend
     // re-check the leases it holds (NVKMS grants made through one that ended
-    // must end too), which matters whenever the guest can hold a lease.
+    // must end too), which matters whenever the guest can hold a lease. The
+    // same thread asks the leases NVKMS grants rest on once a second, and at
+    // once when a connection to the host compositor hangs up: a lease can
+    // end without any uevent, and its file must not outlive it
+    // (device::kms, "lease ends"). What that closes, the pump must stop
+    // watching now, not at the next guest request.
     let _hotplug = if args.kms_card || args.wayland_lease {
         let shared = backend.read().expect("backend lock").shared.clone();
         let cards = shared.nvidia.lock().expect("nvidia lock").kms_cards();
         let sink = shared.clone();
         let to_guest = args.kms_card;
-        let listener = device::kms::HotplugListener::spawn(cards, move |c| {
-            if let PumpCmd::Hotplug { card, flags } = c
-                && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
-            {
-                sink.nvidia.lock().unwrap().check_leases(Some(card));
-            }
-            if to_guest {
-                sink.forward(vec![c]);
-            }
-        });
+        let ticker = shared.clone();
+        let tick = device::kms::Tick {
+            every: std::time::Duration::from_secs(1),
+            run: Box::new(move || {
+                let mut be = ticker.nvidia.lock().unwrap();
+                be.recheck_granting_leases();
+                let cmds = be.take_pump_cmds();
+                drop(be);
+                ticker.forward(cmds);
+            }),
+        };
+        let listener = device::kms::HotplugListener::spawn_ticking(
+            cards,
+            move |c| {
+                if let PumpCmd::Hotplug { card, flags } = c
+                    && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
+                {
+                    let mut be = sink.nvidia.lock().unwrap();
+                    be.check_leases(Some(card));
+                    let cmds = be.take_pump_cmds();
+                    drop(be);
+                    sink.forward(cmds);
+                }
+                if to_guest {
+                    sink.forward(vec![c]);
+                }
+            },
+            Some(tick),
+        );
+        if let Ok(l) = &listener {
+            shared
+                .nvidia
+                .lock()
+                .expect("nvidia lock")
+                .set_lease_alarm(l.alarm());
+        }
         match listener {
             Ok(l) => Some(l),
             Err(e) => {

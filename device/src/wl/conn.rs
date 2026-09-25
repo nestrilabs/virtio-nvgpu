@@ -38,6 +38,11 @@ pub trait HostFds: Send + Sync {
     /// `hostfd` classification: a DRM file must come out as `DrmLease` of
     /// *our* GPU to be carried at all.
     fn classify(&self, fd: BorrowedFd<'_>) -> HandleKind;
+    /// A connection to the host compositor ended. The compositor is the
+    /// usual lessor of the guest's leases, and its exit ends them in a way
+    /// nvidia-drm does not follow (kms.rs, "lease ends"): the backend asks
+    /// its leases now rather than at its next tick.
+    fn compositor_hung_up(&self) {}
 }
 
 /// Called while a WL_SEND is processed.
@@ -457,6 +462,10 @@ fn hangup(s: &Shared, st: &mut State, errno: i32) {
     }
     st.closed = true;
     let _ = s.sock.shutdown(std::net::Shutdown::Both);
+    // Export mode's peer is a host client, not the compositor.
+    if !st.engine.local_is_client() {
+        s.host.compositor_hung_up();
+    }
     st.to_guest.push_back(Unit {
         rec: frame::record(frame::REC_HANGUP, 0, errno as u32, &[]),
         descs: Vec::new(),

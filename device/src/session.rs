@@ -568,6 +568,11 @@ impl NvidiaBackend {
         }
         let target = self.current_handle;
         let kind = self.handles.kind(target).ok_or(libc::EBADF)?;
+        // A lease file the backend closed when its lease ended (kms.rs,
+        // "lease ends"): the handle lives on only to be closed.
+        if self.handles.is_buried(target) {
+            return Err(libc::ENODEV);
+        }
         // An NVKMS call makes no GEM handle, so it has no render file to
         // put one in, and a guest modeset file has none to name: 0 there.
         let nvkms_without_render = kind == HandleKind::Dev(DeviceKind::Modeset) && req.render == 0;

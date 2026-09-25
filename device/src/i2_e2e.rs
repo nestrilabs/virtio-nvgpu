@@ -28,6 +28,7 @@ use protocol::messages::*;
 use crate::hostfd::{self, HandleKind};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
+use crate::pump::PumpCmd;
 use crate::schema::{self, CopyBack, Dir, Field, Ioctl, Kind, Len, Span, Table};
 use crate::session::Outcome;
 use crate::xfer::Sys;
@@ -702,8 +703,12 @@ struct Kernel {
     wait_timeout: Option<i64>,
     /// What "e2e-kms"'s lease looks like to GET_LEASE now.
     lease: LeaseState,
-    /// GET_LEASE calls, kept out of `calls`.
+    /// GET_LEASE calls, and GETRESOURCES calls asking after the lease, kept
+    /// out of `calls`.
     lease_probes: u32,
+    /// completionNotifier.awaken of each layer of the last one-element FLIP
+    /// the host saw.
+    flip_awaken: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,8 +717,12 @@ enum LeaseState {
     Held,
     /// The lessor revoked it: the lessee's object idr is empty.
     Revoked,
-    /// The lessor dropped master: DRM_MASTER calls on the lessee fail.
+    /// The lessor dropped master: DRM_MASTER calls on the lessee fail, and
+    /// the lease still holds its objects.
     LessorNotMaster,
+    /// The lessor closed (drm_master_release): no master, and the lease
+    /// emptied (drm_auth.c:351-357).
+    LessorGone,
 }
 
 struct Fake(Mutex<Kernel>);
@@ -809,8 +818,25 @@ impl Sys for Fake {
                     match k.lease {
                         LeaseState::Held => poke(arg, 0, 4, 3),
                         LeaseState::Revoked => poke(arg, 0, 4, 0),
-                        LeaseState::LessorNotMaster => return -libc::EACCES,
+                        LeaseState::LessorNotMaster | LeaseState::LessorGone => {
+                            return -libc::EACCES;
+                        }
                     }
+                    0
+                }
+                // drm_mode_getresources on a lessee whose lessor is not
+                // master (it needs none): only what the lease still holds,
+                // through drm_lease_held (drm_mode_config.c:131-172).
+                GETRESOURCES if file == "e2e-kms" && k.lease != LeaseState::Held => {
+                    k.lease_probes += 1;
+                    assert!((0..48).all(|i| *arg.add(i) == 0), "counts only");
+                    let (crtcs, connectors) = match k.lease {
+                        LeaseState::LessorNotMaster => (2, 3),
+                        _ => (0, 0),
+                    };
+                    poke(arg, 36, 4, crtcs);
+                    poke(arg, 40, 4, connectors);
+                    poke(arg, 44, 4, 1);
                     0
                 }
                 _ => {
@@ -945,6 +971,12 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
                 -libc::EPERM
             }
             (11, 20) => 0, // MOVE_CURSOR
+            // FLIP of one head: what each layer's awaken reached the host as.
+            (15, 3104) if peek(p, 16, 4) == 1 => {
+                let heads = peek(p, 8, 8) as *const u8;
+                k.flip_awaken = (0..8).map(|l| *heads.add(216 + l * 592 + 52)).collect();
+                0
+            }
             // FLIP: two heads, head 0 with an input LUT, head 1 with an
             // output one; refused, with a flipResult.
             (15, 3104) => {
@@ -1365,6 +1397,8 @@ fn nvkms_world() -> World {
 #[test]
 fn a_flip_carries_its_heads_and_their_luts_and_a_refusal_still_brings_the_reply_back() {
     let mut w = nvkms_world();
+    // The guest owns the display: the heads are the host's to refuse.
+    w.be.config.kms_card = true;
     let mut params = vec![0u8; 3104];
     wr(&mut params, 0, 4, 1); // deviceHandle
     wr(&mut params, 8, 8, 0x3000); // pFlipHead
@@ -1402,6 +1436,44 @@ fn a_flip_asking_for_a_tegra_syncpoint_never_reaches_the_host() {
     let modeset = w.modeset;
     assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
     assert!(w.fake.0.lock().unwrap().nvkms.is_empty());
+}
+
+/// A FLIP element that dirties no layer passes NVKMS's own check on any
+/// head, so the backend holds every element to the grants; and a guest
+/// flip never asks the host for FLIP_OCCURRED, which only nvidia-drm's own
+/// open would get. What the backend cleared stays set in the guest's copy.
+#[test]
+fn a_guest_flip_reaches_the_host_only_on_a_granted_head_and_never_asks_for_flip_occurred() {
+    let mut w = nvkms_world();
+    grant_head_1(&mut w);
+    let modeset = w.modeset;
+    let flip = |w: &mut World, head: u64| {
+        let mut params = vec![0u8; 3104];
+        wr(&mut params, 0, 4, 1); // deviceHandle
+        wr(&mut params, 8, 8, 0x3000); // pFlipHead
+        wr(&mut params, 16, 4, 1); // numFlipHeads
+        nvkms_call(w, 15, &params);
+        let mut heads = vec![0u8; 4952];
+        wr(&mut heads, 4, 4, head);
+        // flip.cursor.imageSpecified would do; a cursor-only element
+        // dirties no layer. Layers 0 and 3 ask for FLIP_OCCURRED:
+        // flip.layer @216, stride 592, completionNotifier.val.awaken @52.
+        heads[216 + 52] = 1;
+        heads[216 + 3 * 592 + 52] = 1;
+        w.mem.put(0x3000, &heads);
+        w.nvkms(modeset, 0x1000)
+    };
+    let seen = w.fake.0.lock().unwrap().nvkms.len();
+    assert_eq!(
+        flip(&mut w, 0),
+        Err(libc::EPERM),
+        "the host compositor's head"
+    );
+    assert_eq!(w.fake.0.lock().unwrap().nvkms.len(), seen);
+    assert_eq!(flip(&mut w, 1), Ok(0));
+    assert_eq!(w.fake.0.lock().unwrap().flip_awaken, vec![0; 8]);
+    let heads = w.mem.get(0x3000);
+    assert_eq!((heads[216 + 52], heads[216 + 3 * 592 + 52]), (1, 1));
 }
 
 #[test]
@@ -1514,29 +1586,82 @@ fn a_grant_through_the_lease_opens_exactly_its_head_until_the_lease_file_closes(
 }
 
 /// The host takes a lease back without a word to the lessee's file -- the
-/// lessor revokes it, or drops master -- and the file stays open. The
-/// backend asks the lease before the next NVKMS call and ends what was
-/// granted through it, so no per-head gate outlives the grant.
+/// lessor revokes it, or closes -- and the file stays open, and after the
+/// lessor's close nvidia-drm still holds the grant on it. The backend asks
+/// the lease before the next NVKMS call, ends what was granted through it,
+/// and closes the host file then and there (so nvidia-drm's postclose
+/// runs now, not after the next compositor has taken the connector),
+/// leaving a handle that answers ENODEV until the guest closes it.
 #[test]
-fn a_grant_ends_with_its_lease_while_the_lease_file_stays_open() {
-    for gone in [LeaseState::Revoked, LeaseState::LessorNotMaster] {
+fn a_lease_that_ended_for_good_ends_its_grants_and_closes_its_host_file() {
+    for gone in [LeaseState::Revoked, LeaseState::LessorGone] {
         let mut w = nvkms_world();
         let (kms, modeset) = (w.kms, w.modeset);
         grant_head_1(&mut w);
         w.fake.0.lock().unwrap().lease = gone;
         nvkms_call(&mut w, 11, &cursor(1));
         assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM), "{gone:?}");
+        assert!(w.be.handles.is_buried(kms), "{gone:?}");
+        assert_eq!(w.be.handles.kind(kms), Some(HandleKind::Other));
         assert!(
-            w.be.handles.kind(kms).is_some(),
-            "the lease file is still open"
+            w.be.take_pump_cmds()
+                .iter()
+                .any(|c| matches!(c, PumpCmd::Unwatch { handle } if *handle == kms)),
+            "the pump lets its duplicate go"
         );
         assert!(w.be.nvkms.granting_handles().is_empty());
+        w.mem.put(0x1000, &[0u8; 64]);
+        assert_eq!(w.call(kms, GETRESOURCES, 0x1000, 0), Err(libc::ENODEV));
         // Nothing is left to ask about.
         let probes = w.fake.0.lock().unwrap().lease_probes;
         nvkms_call(&mut w, 11, &cursor(1));
         assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
         assert_eq!(w.fake.0.lock().unwrap().lease_probes, probes);
+        // And the guest closes the number as it would any other.
+        w.be.close_handle(kms).unwrap();
+        assert!(!w.be.handles.is_buried(kms));
     }
+}
+
+/// A master drop (a VT switch) leaves the lease in place: the grants are
+/// ended here, the file stays open, and the backend keeps asking, so that
+/// a lessor that then closes is caught too.
+#[test]
+fn a_lessor_dropping_master_only_gates_and_keeps_the_lease_asked_about() {
+    let mut w = nvkms_world();
+    let (kms, modeset) = (w.kms, w.modeset);
+    grant_head_1(&mut w);
+    w.fake.0.lock().unwrap().lease = LeaseState::LessorNotMaster;
+    nvkms_call(&mut w, 11, &cursor(1));
+    assert_eq!(w.nvkms(modeset, 0x1000), Err(libc::EPERM));
+    assert_eq!(w.be.handles.kind(kms), Some(HandleKind::DrmLease(0)));
+    assert!(!w.be.handles.is_buried(kms));
+    assert_eq!(w.be.nvkms.granting_handles(), vec![kms]);
+    let probes = w.fake.0.lock().unwrap().lease_probes;
+    assert!(w.be.recheck_granting_leases().contains(&kms));
+    assert!(
+        w.fake.0.lock().unwrap().lease_probes > probes,
+        "still asked"
+    );
+    assert!(!w.be.handles.is_buried(kms));
+    w.fake.0.lock().unwrap().lease = LeaseState::LessorGone;
+    assert_eq!(w.be.recheck_granting_leases(), vec![kms]);
+    assert!(w.be.handles.is_buried(kms));
+    assert!(w.be.nvkms.granting_handles().is_empty());
+}
+
+/// Compositor-VM mode: the guest is the lessor and the connectors are its
+/// own, so a revoked lessee keeps a native open file with an empty lease.
+#[test]
+fn in_kms_card_mode_a_revoked_lease_file_stays_open() {
+    let mut w = nvkms_world();
+    let kms = w.kms;
+    grant_head_1(&mut w);
+    w.be.config.kms_card = true;
+    w.fake.0.lock().unwrap().lease = LeaseState::Revoked;
+    assert_eq!(w.be.check_leases(None), vec![kms]);
+    assert_eq!(w.be.handles.kind(kms), Some(HandleKind::DrmLease(0)));
+    assert!(!w.be.handles.is_buried(kms));
 }
 
 /// Compositor-VM mode: the guest is the lessor, and revokes a lease through

@@ -66,6 +66,8 @@ impl TableFull {
 struct Entry {
     fd: OwnedFd,
     kind: HandleKind,
+    /// The host file was closed under the guest (`bury`).
+    buried: bool,
 }
 
 pub struct HandleTable {
@@ -107,7 +109,14 @@ impl HandleTable {
             if h == 0 || h == u32::MAX || self.table.contains_key(&h) {
                 continue;
             }
-            self.table.insert(h, Entry { fd, kind });
+            self.table.insert(
+                h,
+                Entry {
+                    fd,
+                    kind,
+                    buried: false,
+                },
+            );
             return Ok(h);
         }
     }
@@ -145,6 +154,28 @@ impl HandleTable {
     /// it under two handles, and the second close would close someone else's.
     pub fn owns_fd(&self, fd: RawFd) -> bool {
         self.table.values().any(|e| e.fd.as_raw_fd() == fd)
+    }
+
+    /// Close the host file behind `handle` without ending the handle: the
+    /// descriptor is swapped for `stub` (an eventfd nobody signals) and the
+    /// kind becomes `Other`, so nothing can use it again, and the guest,
+    /// which still holds the number, closes it as it would any other. The
+    /// old descriptor is returned (it closes when dropped). For a lease file
+    /// whose lease the host ended (kms.rs, "lease ends").
+    pub fn bury(&mut self, handle: u32, stub: OwnedFd) -> Result<OwnedFd> {
+        let e = self
+            .table
+            .get_mut(&handle)
+            .ok_or(DeviceError::BadHandle(handle as u64))?;
+        e.kind = HandleKind::Other;
+        e.buried = true;
+        Ok(std::mem::replace(&mut e.fd, stub))
+    }
+
+    /// Whether `handle`'s host file was closed under it (`bury`): a call on
+    /// it is answered ENODEV, as a file whose device went away is.
+    pub fn is_buried(&self, handle: u32) -> bool {
+        self.table.get(&handle).is_some_and(|e| e.buried)
     }
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).
@@ -198,6 +229,33 @@ impl Default for HandleTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_buried_handle_keeps_its_number_but_not_its_file_until_it_is_removed() {
+        let mut t = HandleTable::new();
+        let fd = crate::hostfd::new_eventfd().unwrap();
+        let raw = fd.as_raw_fd();
+        let h = t.insert(fd, HandleKind::DrmLease(0)).unwrap();
+        assert!(!t.is_buried(h));
+        let stub = crate::hostfd::new_eventfd().unwrap();
+        let stub_raw = stub.as_raw_fd();
+        let old = t.bury(h, stub).unwrap();
+        assert_eq!(
+            old.as_raw_fd(),
+            raw,
+            "the host file comes back, to be closed"
+        );
+        drop(old);
+        assert!(t.is_buried(h));
+        assert_eq!(t.kind(h), Some(HandleKind::Other), "usable as nothing");
+        assert_eq!(t.get_raw(h).unwrap(), stub_raw);
+        assert!(
+            t.bury(h + 1, crate::hostfd::new_eventfd().unwrap())
+                .is_err()
+        );
+        t.remove(h).unwrap();
+        assert!(!t.is_buried(h));
+    }
     use protocol::messages::DeviceKind;
     use std::os::fd::FromRawFd;
 

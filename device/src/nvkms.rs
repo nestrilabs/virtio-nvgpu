@@ -24,15 +24,38 @@
 //!   it. Records go when nvidia-drm's do: REVOKE through the same KMS handle,
 //!   close of that handle (nvidia-drm-drv.c:1588-1600 revokes at postclose),
 //!   FREE_DEVICE, close of the NVKMS file, and -- over-clearing, never
-//!   under -- whenever an owner revokes wholesale.
+//!   under -- whenever an owner revokes wholesale. They also go when the
+//!   lease under the KMS handle ends while the handle stays open, which
+//!   nvidia-drm does *not* always follow (kms.rs, "lease ends"): from then
+//!   on the host may still hold the grant, and only these records stand
+//!   between it and the guest.
+//! - **Head-level FLIP and SET_MODE.** NVKMS checks a FLIP only for the
+//!   layers it dirties (nvCheckFlipPermissions, nvkms-flip.c:84-111), so an
+//!   element that only moves the cursor or sets HDR metadata, colorimetry,
+//!   the output TF or dithering passes on any head of the GPU, the host
+//!   compositor's included (nvkms-flip.c:163-190). Every pFlipHead element
+//!   must therefore name a head a grant covers. SET_MODE's own check
+//!   (ValidateRequest, nvkms-modeset.c:3940-3966) is sound, but it asks
+//!   the host's permission set, which a lease end does not always shrink; a
+//!   committed SET_MODE is held to the records as well, by the same rule.
 //! - **Refusals.** GRAB_OWNERSHIP, SET_DISP_ATTRIBUTE and
 //!   SET_FRAMELOCK_ATTRIBUTE only in compositor-VM mode (`--kms-card`), where
 //!   the guest owns the display anyway; the head and dpy gates are lifted
 //!   there too. Kernel-client and device-global commands never (they are in
 //!   no table either; named here as a second fence). Tegra syncpoints never
 //!   (a dGPU host refuses `useSyncpt` itself, nvkms-hw-flip.c:716-719, but
-//!   the descriptor behind it is one the schema does not translate).
+//!   the descriptor behind it is one the schema does not translate) -- in a
+//!   layer whose syncObjects.specified is set, the only place NVKMS reads
+//!   it (nvkms-hw-flip.c:714, nvkms-modeset.c:246, 4013).
 //! - **Rewrites.** QUERY_DPY_DYNAMIC_DATA's overrides are cleared, always.
+//!   A FLIP or SET_MODE layer's `completionNotifier.awaken` is cleared
+//!   outside `--kms-card`: it makes the flip's completion broadcast
+//!   FLIP_OCCURRED to every open with flip permission on the head
+//!   (nvkms-evo3.c:3686-3695, nvkms.c:6580-6625). A modeset grantee holds
+//!   none, so the guest never gets the event itself; nvidia-drm's own open
+//!   does, finds no flip of its own queued and WARNs
+//!   (nv_drm_crtc_dequeue_flip, nvidia-drm-crtc.h:334-358) -- a host log
+//!   flood, a panic under panic_on_warn. The notifier is still written.
 //!   ALLOC_DEVICE's device-wide knobs (registry keys, console hotplugs, no3d)
 //!   are cleared outside `--kms-card`: they apply when the call creates the
 //!   device (nvkms-evo.c:9043, nvkms.c:1417). DECLARE_EVENT_INTEREST is cut
@@ -164,6 +187,13 @@ struct State {
     /// ALLOC_DEVICE replies: (modeset handle, deviceHandle) -> dispHandles.
     disps: HashMap<(u32, u32), [u32; MAX_DISPS]>,
     perms: HashMap<(u32, u32), Perms>,
+    /// KMS handles whose lease ended with the handle still open, after
+    /// something was granted through them: the host may still hold those
+    /// grants, so the backend keeps asking (kms.rs, "lease ends") until the
+    /// handle goes.
+    ended: HashSet<u32>,
+    /// A cleared `awaken` was logged (once per session; the rest at debug).
+    awaken_logged: bool,
 }
 
 /// The NVKMS section's state, shared by the policy object and the backend
@@ -230,21 +260,38 @@ fn each_perm(
     Ok(())
 }
 
-/// No layer of any FLIP head (pFlipHead's array) asks for a Tegra
-/// syncpoint: the fence descriptor behind one is not in the schema, so it
-/// would reach the host as the guest's own number.
-fn flip_heads_ok(lo: &NvkmsLayout, heads: &[u8]) -> Result<(), Errno> {
-    let f = lo.flip;
-    for (e, head) in heads.chunks(f.head_size as usize).enumerate() {
-        for l in 0..f.layer.count {
-            if rd(head, f.layer.at(l) + f.use_syncpt as usize, 1)? != 0 {
-                return Err(refuse(format_args!(
-                    "FLIP head {e} layer {l} asks for a Tegra syncpoint"
-                )));
-            }
-        }
+/// Which disp row of a `Perms` covers subdevice `sd`: its own before 595,
+/// the device's only one after (a permission set is per head there, and
+/// NVKMS checks a head's whatever the subdevice, nvkms-flip.c:40-111).
+fn perm_disp(lo: &NvkmsLayout, sd: usize) -> usize {
+    if lo.acquire.modeset.disp.is_none() {
+        0
+    } else {
+        sd
     }
-    Ok(())
+}
+
+/// One FLIP or SET_MODE layer at `at` in `b`. A Tegra syncpoint is refused
+/// (the fence descriptor behind one is not in the schema, so it would reach
+/// the host as the guest's own number) in a layer whose syncObjects are
+/// specified, the only kind NVKMS reads useSyncpt in; and, when `scrub`,
+/// `awaken` is cleared. Says whether it cleared one.
+fn layer_ok(
+    b: &mut [u8],
+    at: usize,
+    (specified, use_syncpt, awaken): (u32, u32, u32),
+    scrub: bool,
+    what: std::fmt::Arguments,
+) -> Result<bool, Errno> {
+    if rd(b, at + specified as usize, 1)? != 0 && rd(b, at + use_syncpt as usize, 1)? != 0 {
+        return Err(refuse(format_args!("{what} asks for a Tegra syncpoint")));
+    }
+    let awaken = at + awaken as usize;
+    if scrub && rd(b, awaken, 1)? != 0 {
+        b[awaken] = 0;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn refuse(why: std::fmt::Arguments) -> Errno {
@@ -283,25 +330,41 @@ impl NvkmsPolicy {
         st.disps.retain(|&(m, _), _| m != h);
         st.perms.retain(|&(m, _), _| m != h);
         st.revoke_all_through(h);
+        st.ended.remove(&h);
         if st.nvkms_granters.remove(&h) {
             st.forget_nvkms_grants();
         }
     }
 
     /// A lease or card handle stopped holding what it held (the lessor
-    /// revoked the lease, the master dropped): its grants go as if it had
-    /// closed. The backend calls it when GET_LEASE on the handle says so
-    /// (kms.rs, "lease ends"); CLOSE does it anyway.
+    /// revoked the lease, closed, or dropped master): its grants go as if
+    /// it had closed, though the host's may not have (kms.rs, "lease
+    /// ends"), and a handle that had granted something stays on the list
+    /// the backend keeps asking about. CLOSE forgets it anyway.
     pub fn lease_ended(&self, kms: u32) {
-        self.lock().revoke_all_through(kms);
+        let mut st = self.lock();
+        if st.granted_through(kms) {
+            st.ended.insert(kms);
+        }
+        st.revoke_all_through(kms);
+    }
+
+    /// Whether nvidia-drm GRANT_PERMISSIONS ever succeeded through KMS
+    /// handle `kms` (and the handle has not closed since): whether its file
+    /// may be the one a host connector's grant belongs to, which its close
+    /// then disables (nvidia-drm-drv.c:1497-1523).
+    pub fn granted_through(&self, kms: u32) -> bool {
+        self.lock().granted_through(kms)
     }
 
     /// KMS handles that granted something still recorded (nvidia-drm
-    /// GRANT_PERMISSIONS): whose leases the backend re-checks before an
-    /// NVKMS call relies on them (kms.rs, "lease ends").
+    /// GRANT_PERMISSIONS), or whose lease ended after they had: whose leases
+    /// the backend re-checks before an NVKMS call relies on them and on a
+    /// timer (kms.rs, "lease ends").
     pub fn granting_handles(&self) -> Vec<u32> {
         let st = self.lock();
         let mut v: Vec<u32> = st.drm_grants.keys().copied().collect();
+        v.extend(st.ended.iter().copied());
         for s in st.grant_fds.values() {
             if let Source::Drm { kms, .. } = *s {
                 v.push(kms);
@@ -362,10 +425,13 @@ impl NvkmsPolicy {
             )));
         }
         if name == "FLIP" {
+            let dev = rd32(p.buffer(1).ok_or(libc::EINVAL)?, lo.flip.device)?;
             // pFlipHead's array, if it got a buffer (a NULL one reaches the
-            // host as NULL and fails there).
-            if let Some(heads) = p.pointee(1, lo.flip.ptr as usize).and_then(|b| p.buffer(b)) {
-                flip_heads_ok(lo, heads)?;
+            // host as NULL and fails there). It is IN only: what is cleared
+            // here never reaches the guest's copy.
+            if let Some(b) = p.pointee(1, lo.flip.ptr as usize) {
+                let heads = p.buffer_mut(b).ok_or(libc::EINVAL)?;
+                st.flip_heads(lo, &call, dev, heads)?;
             }
         }
         let params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
@@ -447,7 +513,7 @@ impl NvkmsPolicy {
 
 impl State {
     /// The policy for one NVKMS call on `call.target`, over its params block.
-    /// (FLIP's heads, behind a pointer, are `flip_heads_ok`'s.)
+    /// (FLIP's heads, behind a pointer, are `flip_heads`'.)
     fn check(
         &mut self,
         lo: &NvkmsLayout,
@@ -493,22 +559,7 @@ impl State {
                 self.dpy_granted(name, call.target, params, lo.set_dpy_attribute)?
             }
             "SET_LAYER_POSITION" if gated => self.layers_granted(lo, call.target, params)?,
-            "SET_MODE" => {
-                let m = lo.set_mode;
-                for d in 0..m.disp.count {
-                    for h in 0..m.head.count {
-                        for l in 0..m.layer.count {
-                            let at =
-                                m.disp.at(d) + m.head.at(h) + m.layer.at(l) + m.use_syncpt as usize;
-                            if rd(params, at, 1)? != 0 {
-                                return Err(refuse(format_args!(
-                                    "SET_MODE disp {d} head {h} layer {l} asks for a Tegra syncpoint"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
+            "SET_MODE" => self.set_mode(lo, call, params)?,
             "ACQUIRE_PERMISSIONS" => {
                 // A grant we did not see made cannot be tracked, so it
                 // cannot be revoked here when it is revoked on the host.
@@ -522,6 +573,113 @@ impl State {
         }
         self.typed.insert(call.target);
         Ok(())
+    }
+
+    /// FLIP's pFlipHead array on device `dev`. Outside `--kms-card` every
+    /// element must name a head a grant to this file covers, whatever it
+    /// changes there: NVKMS itself lets through any element that dirties
+    /// no layer (cursor, HDR infoframe, colorimetry, TF, dithering,
+    /// olutFpNormScale; nvkms-flip.c:84-111, 163-190). The (sd, head) pair
+    /// is what nvFlipEvo acts on (nvkms-flip.c:542-560); the host checks
+    /// both are in range (ValidateFlipHeads, nvkms.c:2639-2663), the
+    /// records hold only what a grant gave. Then each layer (`layer_ok`).
+    fn flip_heads(
+        &mut self,
+        lo: &NvkmsLayout,
+        call: &Call,
+        dev: u32,
+        heads: &mut [u8],
+    ) -> Result<(), Errno> {
+        let f = lo.flip;
+        let gated = !call.kms_card;
+        let bytes = (f.sync_specified, f.use_syncpt, f.awaken);
+        let mut cleared = 0;
+        for (e, head) in heads.chunks_mut(f.head_size as usize).enumerate() {
+            if gated {
+                let (sd, h) = (rd32(head, f.sd)?, rd32(head, f.head)?);
+                let d = perm_disp(lo, sd as usize);
+                if !self
+                    .perms(call.target, dev)
+                    .is_some_and(|p| p.head(d, h as usize))
+                {
+                    return Err(refuse(format_args!(
+                        "FLIP element {e} on sd {sd} head {h}, which no grant to handle {} covers",
+                        call.target
+                    )));
+                }
+            }
+            for l in 0..f.layer.count {
+                let what = format_args!("FLIP element {e} layer {l}");
+                cleared += layer_ok(head, f.layer.at(l), bytes, gated, what)? as u32;
+            }
+        }
+        self.awaken_cleared("FLIP", cleared);
+        Ok(())
+    }
+
+    /// SET_MODE. Outside `--kms-card`, a committed request is held to the
+    /// records the way ValidateRequest holds it to the host's permission
+    /// set (nvkms-modeset.c:3940-3966): every requested head needs modeset
+    /// permission, and the dpys put on it must be ones granted for it -- so
+    /// a grant the backend ended (a lease that ended, kms.rs) ends here too,
+    /// though the host may still have it. Requested disps and heads past
+    /// what the host has room for it refuses itself (3897-3935), so they
+    /// are skipped, and unrequested ones it never reads (1076-1094). Then
+    /// each requested head's layers (`layer_ok`).
+    fn set_mode(&mut self, lo: &NvkmsLayout, call: &Call, params: &mut [u8]) -> Result<(), Errno> {
+        let m = lo.set_mode;
+        let gated = !call.kms_card;
+        let commit = rd(params, m.commit as usize, 1)? != 0;
+        let dev = rd32(params, m.device)?;
+        let disps = rd32(params, m.disps)?;
+        let bytes = (m.sync_specified, m.use_syncpt, m.awaken);
+        let mut cleared = 0;
+        for d in (0..m.disp.count).filter(|d| disps & (1 << d) != 0) {
+            let heads = rd32(params, (m.disp.at(d) + m.heads as usize) as u32)?;
+            for h in (0..m.head.count).filter(|h| heads & (1 << h) != 0) {
+                let at = m.disp.at(d) + m.head.at(h);
+                if gated && commit {
+                    let dpys = rd32(params, (at + m.dpys as usize) as u32)?;
+                    let pd = perm_disp(lo, d as usize);
+                    let ok = self.perms(call.target, dev).is_some_and(|p| {
+                        p.full
+                            || (pd < MAX_DISPS && (h as usize) < MAX_HEADS && {
+                                let granted = p.modeset[pd][h as usize];
+                                granted != 0 && dpys & !granted == 0
+                            })
+                    });
+                    if !ok {
+                        return Err(refuse(format_args!(
+                            "SET_MODE on disp {d} head {h} (dpys {dpys:#x}), which no grant to \
+                             handle {} covers",
+                            call.target
+                        )));
+                    }
+                }
+                for l in 0..m.layer.count {
+                    let what = format_args!("SET_MODE disp {d} head {h} layer {l}");
+                    cleared += layer_ok(params, at + m.layer.at(l), bytes, gated, what)? as u32;
+                }
+            }
+        }
+        self.awaken_cleared("SET_MODE", cleared);
+        Ok(())
+    }
+
+    fn awaken_cleared(&mut self, name: &str, n: u32) {
+        if n == 0 {
+            return;
+        }
+        if !self.awaken_logged {
+            self.awaken_logged = true;
+            log::warn!(
+                "NVKMS: {name} asked for FLIP_OCCURRED on {n} layer(s), which would reach \
+                 nvidia-drm's own open on the host; completionNotifier.awaken cleared \
+                 (logged once per session)"
+            );
+        } else {
+            log::debug!("NVKMS: {name}: completionNotifier.awaken cleared on {n} layer(s)");
+        }
     }
 
     /// Every modeset file in a descriptor field must be one no NVKMS call
@@ -784,6 +942,15 @@ impl State {
         self.grant_fds.retain(|_, s| *s != Source::Drm { kms, dpy });
     }
 
+    fn granted_through(&self, kms: u32) -> bool {
+        self.drm_grants.contains_key(&kms)
+            || self.ended.contains(&kms)
+            || self
+                .grant_fds
+                .values()
+                .any(|s| matches!(s, Source::Drm { kms: k, .. } if *k == kms))
+    }
+
     fn revoke_all_through(&mut self, kms: u32) {
         if let Some(dpys) = self.drm_grants.remove(&kms) {
             for dpy in dpys {
@@ -871,6 +1038,18 @@ mod tests {
             let mut st = self.lock();
             let (lo, _) = Self::layout(&st).unwrap();
             st.record(lo, name, target, params, fds);
+        }
+
+        /// FLIP's pFlipHead array, as `before` hands it over.
+        fn flip(&self, target: u32, heads: &mut [u8]) -> Result<(), Errno> {
+            let mut st = self.lock();
+            let (lo, _) = Self::layout(&st).unwrap();
+            let call = Call {
+                target,
+                fds: &[],
+                kms_card: self.kms_card.load(Ordering::Relaxed),
+            };
+            st.flip_heads(lo, &call, DEV, heads)
         }
 
         fn drm(&self, name: &str, kms: u32, fds: &[u32], arg: &[u8]) -> Result<(), Errno> {
@@ -1319,27 +1498,230 @@ mod tests {
         assert_eq!(rd32(&a, 0), Ok(0b10_0111));
     }
 
-    #[test]
-    fn a_tegra_syncpoint_anywhere_in_a_flip_or_modeset_is_refused() {
-        let v = v610();
-        let p = policy(v);
+    /// pFlipHead elements, each on (sd, head).
+    fn flip_heads(v: DriverVersion, on: &[(u32, u32)]) -> Vec<u8> {
         let f = lo(v).flip;
-        let mut heads = vec![0u8; 2 * f.head_size as usize];
-        let mut st = p.lock();
-        let (l, _) = NvkmsPolicy::layout(&st).unwrap();
-        let call = Call {
-            target: M,
-            fds: &[],
-            kms_card: true,
-        };
-        assert_eq!(flip_heads_ok(l, &heads), Ok(()));
-        heads[f.head_size as usize + f.layer.at(7) + f.use_syncpt as usize] = 1;
-        assert_eq!(flip_heads_ok(l, &heads), Err(libc::EPERM));
-        let m = l.set_mode;
-        let mut sm = vec![0u8; size(v, "NVKMS_SET_MODE")];
-        assert_eq!(st.check(l, "SET_MODE", &call, &mut sm), Ok(()));
-        sm[m.disp.at(7) + m.head.at(3) + m.layer.at(7) + m.use_syncpt as usize] = 1;
-        assert_eq!(st.check(l, "SET_MODE", &call, &mut sm), Err(libc::EPERM));
+        let mut heads = vec![0u8; on.len() * f.head_size as usize];
+        for (e, &(sd, head)) in on.iter().enumerate() {
+            let base = e as u32 * f.head_size;
+            put(&mut heads, base + f.sd, sd);
+            put(&mut heads, base + f.head, head);
+        }
+        heads
+    }
+
+    /// Byte `field` (relative to the layer) of layer `l` of element `e`.
+    fn flip_byte(v: DriverVersion, e: usize, l: u32, field: u32) -> usize {
+        let f = lo(v).flip;
+        e * f.head_size as usize + f.layer.at(l) + field as usize
+    }
+
+    /// SET_MODE on device DEV requesting `heads` (disp, head, dpyIdList).
+    fn set_mode(v: DriverVersion, commit: bool, heads: &[(u32, u32, u32)]) -> Vec<u8> {
+        let m = lo(v).set_mode;
+        let mut a = vec![0u8; size(v, "NVKMS_SET_MODE")];
+        put(&mut a, m.device, DEV);
+        a[m.commit as usize] = commit as u8;
+        for &(d, h, dpys) in heads {
+            let disps = rd32(&a, m.disps).unwrap();
+            put(&mut a, m.disps, disps | 1 << d);
+            let at = m.disp.at(d) as u32 + m.heads;
+            let hs = rd32(&a, at).unwrap();
+            put(&mut a, at, hs | 1 << h);
+            put(&mut a, (m.disp.at(d) + m.head.at(h)) as u32 + m.dpys, dpys);
+        }
+        a
+    }
+
+    fn set_mode_byte(v: DriverVersion, d: u32, h: u32, l: u32, field: u32) -> usize {
+        let m = lo(v).set_mode;
+        m.disp.at(d) + m.head.at(h) + m.layer.at(l) + field as usize
+    }
+
+    /// NVKMS reads useSyncpt only where the layer's syncObjects are
+    /// specified (nvkms-hw-flip.c:714-718, nvkms-modeset.c:246, 4013), and
+    /// only in the heads a SET_MODE requests; a stray byte anywhere else is
+    /// nothing the host would act on.
+    #[test]
+    fn a_tegra_syncpoint_is_refused_only_where_the_host_would_read_it() {
+        let v = v610();
+        let f = lo(v).flip;
+        let m = lo(v).set_mode;
+        let p = policy(v);
+        p.set_kms_card(true);
+        let mut heads = flip_heads(v, &[(0, 0), (0, 1)]);
+        heads[flip_byte(v, 1, 7, f.use_syncpt)] = 1;
+        assert_eq!(p.flip(M, &mut heads), Ok(()), "not specified");
+        heads[flip_byte(v, 1, 7, f.sync_specified)] = 1;
+        assert_eq!(p.flip(M, &mut heads), Err(libc::EPERM));
+        heads[flip_byte(v, 1, 7, f.use_syncpt)] = 0;
+        assert_eq!(p.flip(M, &mut heads), Ok(()), "specified semaphores");
+
+        let mut sm = set_mode(v, true, &[(0, 1, DPY)]);
+        assert_eq!(p.check("SET_MODE", M, &[], &mut sm), Ok(()));
+        sm[set_mode_byte(v, 0, 1, 7, m.use_syncpt)] = 1;
+        assert_eq!(
+            p.check("SET_MODE", M, &[], &mut sm),
+            Ok(()),
+            "not specified"
+        );
+        sm[set_mode_byte(v, 0, 1, 7, m.sync_specified)] = 1;
+        assert_eq!(p.check("SET_MODE", M, &[], &mut sm), Err(libc::EPERM));
+        // The same layer of a head the request does not name.
+        let mut sm = set_mode(v, true, &[(0, 1, DPY)]);
+        sm[set_mode_byte(v, 7, 3, 7, m.use_syncpt)] = 1;
+        sm[set_mode_byte(v, 7, 3, 7, m.sync_specified)] = 1;
+        assert_eq!(p.check("SET_MODE", M, &[], &mut sm), Ok(()));
+    }
+
+    /// NVKMS checks a flip only for the layers it dirties: a cursor, HDR
+    /// or colorimetry element names its head and nothing else. So the head
+    /// itself must be granted, for every element, before 595 per (sd,
+    /// head), from 595 per head whatever the sd.
+    #[test]
+    fn every_flip_element_must_name_a_head_a_grant_covers_whatever_it_changes() {
+        for (v, per_head) in [
+            (v610(), true),
+            (DriverVersion::new(595, 71, 5), true),
+            (DriverVersion::new(580, 178, 4), false),
+            (DriverVersion::new(535, 129, 3), false),
+        ] {
+            let p = policy(v);
+            alloc_device(&p, v, M);
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(0, 1)])),
+                Err(libc::EPERM),
+                "{v}: no grant yet"
+            );
+            let p = granted(v);
+            assert_eq!(p.flip(M, &mut flip_heads(v, &[(0, 1)])), Ok(()), "{v}");
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(0, 0)])),
+                Err(libc::EPERM),
+                "{v}: the host compositor's head"
+            );
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(0, 1), (0, 0)])),
+                Err(libc::EPERM),
+                "{v}: one element on another head refuses the lot"
+            );
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(1, 1)])).is_ok(),
+                per_head,
+                "{v}: another subdevice"
+            );
+            assert_eq!(
+                p.flip(M + 5, &mut flip_heads(v, &[(0, 1)])),
+                Err(libc::EPERM),
+                "{v}: another file"
+            );
+            p.set_kms_card(true);
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(0, 0)])),
+                Ok(()),
+                "{v}: the guest owns the display"
+            );
+            p.set_kms_card(false);
+            p.lease_ended(KMS);
+            assert_eq!(
+                p.flip(M, &mut flip_heads(v, &[(0, 1)])),
+                Err(libc::EPERM),
+                "{v}: the lease ended, though the host may still have the grant"
+            );
+        }
+    }
+
+    /// FLIP_OCCURRED from a guest flip reaches only nvidia-drm's own open
+    /// (a modeset grantee has no flip permission), which WARNs on it.
+    #[test]
+    fn awaken_is_cleared_in_every_flip_and_modeset_layer_outside_kms_card() {
+        let v = v610();
+        let f = lo(v).flip;
+        let m = lo(v).set_mode;
+        let p = granted(v);
+        let mut heads = flip_heads(v, &[(0, 1), (0, 1)]);
+        for (e, l) in [(0, 0), (1, 7)] {
+            heads[flip_byte(v, e, l, f.awaken)] = 1;
+        }
+        let before = heads.clone();
+        assert_eq!(p.flip(M, &mut heads), Ok(()));
+        assert_eq!(heads[flip_byte(v, 0, 0, f.awaken)], 0);
+        assert_eq!(heads[flip_byte(v, 1, 7, f.awaken)], 0);
+        let changed = before.iter().zip(&heads).filter(|(a, b)| a != b).count();
+        assert_eq!(changed, 2, "nothing else is touched");
+
+        let mut sm = set_mode(v, true, &[(0, 1, DPY)]);
+        sm[set_mode_byte(v, 0, 1, 3, m.awaken)] = 1;
+        assert_eq!(p.check("SET_MODE", M, &[], &mut sm), Ok(()));
+        assert_eq!(sm[set_mode_byte(v, 0, 1, 3, m.awaken)], 0);
+
+        p.set_kms_card(true);
+        let mut heads = flip_heads(v, &[(0, 1)]);
+        heads[flip_byte(v, 0, 0, f.awaken)] = 1;
+        assert_eq!(p.flip(M, &mut heads), Ok(()));
+        assert_eq!(heads[flip_byte(v, 0, 0, f.awaken)], 1, "the guest owns it");
+        let mut sm = set_mode(v, true, &[(0, 1, DPY)]);
+        sm[set_mode_byte(v, 0, 1, 3, m.awaken)] = 1;
+        assert_eq!(p.check("SET_MODE", M, &[], &mut sm), Ok(()));
+        assert_eq!(sm[set_mode_byte(v, 0, 1, 3, m.awaken)], 1);
+    }
+
+    /// ValidateRequest's rule (nvkms-modeset.c:3940-3966), against the
+    /// records rather than the host's set: a lease that ended ends it here.
+    #[test]
+    fn a_committed_set_mode_needs_every_requested_head_and_dpy_granted() {
+        for v in [
+            v610(),
+            DriverVersion::new(580, 178, 4),
+            DriverVersion::new(535, 129, 3),
+        ] {
+            let p = granted(v);
+            let ok = |heads: &[(u32, u32, u32)], commit| {
+                p.check("SET_MODE", M, &[], &mut set_mode(v, commit, heads))
+            };
+            assert_eq!(ok(&[(0, 1, DPY)], true), Ok(()), "{v}");
+            assert_eq!(ok(&[(0, 1, 0)], true), Ok(()), "{v}: shutting it down");
+            assert_eq!(ok(&[(0, 1, DPY << 1)], true), Err(libc::EPERM), "{v}");
+            assert_eq!(ok(&[(0, 1, DPY | DPY << 1)], true), Err(libc::EPERM), "{v}");
+            assert_eq!(ok(&[(0, 0, 0)], true), Err(libc::EPERM), "{v}");
+            assert_eq!(
+                ok(&[(0, 1, DPY), (0, 2, 0)], true),
+                Err(libc::EPERM),
+                "{v}: every requested head"
+            );
+            assert_eq!(
+                ok(&[(0, 0, DPY << 1)], false),
+                Ok(()),
+                "{v}: validation only needs no permission"
+            );
+            p.lease_ended(KMS);
+            assert_eq!(ok(&[(0, 1, DPY)], true), Err(libc::EPERM), "{v}");
+            p.set_kms_card(true);
+            assert_eq!(ok(&[(0, 0, DPY << 1)], true), Ok(()), "{v}");
+        }
+    }
+
+    /// The host may still hold a grant whose lease ended (kms.rs, "lease
+    /// ends"), so the handle it went through stays on the list the backend
+    /// asks about, until it closes; one that granted nothing never joins.
+    #[test]
+    fn a_handle_whose_lease_ended_after_granting_is_asked_about_until_it_closes() {
+        let v = v610();
+        let p = granted(v);
+        assert_eq!(p.granting_handles(), vec![KMS]);
+        assert!(p.granted_through(KMS));
+        p.lease_ended(KMS);
+        assert_eq!(p.granting_handles(), vec![KMS]);
+        assert!(p.granted_through(KMS));
+        p.lease_ended(KMS);
+        assert_eq!(p.granting_handles(), vec![KMS], "asked again, still there");
+        p.forget_handle(KMS);
+        assert!(p.granting_handles().is_empty());
+        assert!(!p.granted_through(KMS));
+
+        p.lease_ended(KMS + 1);
+        assert!(p.granting_handles().is_empty());
+        assert!(!p.granted_through(KMS + 1));
     }
 
     #[test]

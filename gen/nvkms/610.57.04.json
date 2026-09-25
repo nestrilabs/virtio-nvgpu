@@ -935,6 +935,14 @@
             "off": 76,
             "size": 4,
             "role": "cond"
+           },
+           {
+            "kind": "field",
+            "path": "completionNotifier.val.awaken",
+            "off": 52,
+            "size": 1,
+            "role": "policy",
+            "note": "makes the flip's completion broadcast FLIP_OCCURRED to every open with flip permission on the head (nvkms-evo3.c, nvSendFlipOccurredEventEvo) -- nvidia-drm's own included"
            }
           ]
          }
@@ -1388,6 +1396,14 @@
            "off": 76,
            "size": 4,
            "role": "cond"
+          },
+          {
+           "kind": "field",
+           "path": "completionNotifier.val.awaken",
+           "off": 52,
+           "size": 1,
+           "role": "policy",
+           "note": "makes the flip's completion broadcast FLIP_OCCURRED to every open with flip permission on the head (nvkms-evo3.c, nvSendFlipOccurredEventEvo) -- nvidia-drm's own included"
           }
          ]
         }

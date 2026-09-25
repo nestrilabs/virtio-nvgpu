@@ -256,6 +256,10 @@ def flip_common(prefix):
             VAL("syncObjects.val.useSyncpt", "policy",
                 note="non-zero is a Tegra-only path; a dGPU host fails the flip"),
             VAL("syncObjects.val.u.syncpts.requestedPostType", "cond"),
+            VAL("completionNotifier.val.awaken", "policy",
+                note="makes the flip's completion broadcast FLIP_OCCURRED to every "
+                     "open with flip permission on the head (nvkms-evo3.c, "
+                     "nvSendFlipOccurredEventEvo) -- nvidia-drm's own included"),
         ]),
     ]
 
