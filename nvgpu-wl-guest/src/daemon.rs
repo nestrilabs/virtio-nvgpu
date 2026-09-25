@@ -402,7 +402,24 @@ impl Daemon {
                     }
                     match sub {
                         SUB_SOCK => {
-                            if events & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32
+                            let gone = events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
+                            let c = self.clients[slot].as_mut().unwrap();
+                            if gone && !c.tx.is_empty() {
+                                // The client is gone with frames still waiting
+                                // for a busy host. read_local will not read
+                                // while they wait, so the EOF that closes the
+                                // slot would never be seen, and HUP cannot be
+                                // masked: every epoll_wait would return at once
+                                // and retry the SEND, at 100% CPU and a
+                                // virtqueue round trip each, until the host's
+                                // compositor drained. Nobody is left to read
+                                // the replies to those frames, and closing the
+                                // channel ends the host's side of the client
+                                // anyway.
+                                c.tx.clear();
+                                c.closing = true;
+                            } else if events
+                                & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32
                                 != 0
                             {
                                 self.read_local(slot);
@@ -735,9 +752,14 @@ impl Daemon {
             return;
         }
         let base = (slot as u64) << 32;
-        let mut want = libc::EPOLLRDHUP as u32;
+        // Nothing of the client's is read while frames wait for the host, so
+        // nothing that says "readable" is asked for then either: not EPOLLIN,
+        // and not EPOLLRDHUP, which a client that shut down only its writing
+        // side would report on every wait. A client that is gone altogether
+        // still wakes us with EPOLLHUP, which cannot be masked (turn).
+        let mut want = 0;
         if c.tx.is_empty() {
-            want |= libc::EPOLLIN as u32;
+            want |= (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
         }
         if c.engine.local_out_len() > 0 {
             want |= libc::EPOLLOUT as u32;
@@ -779,5 +801,100 @@ impl Daemon {
             // Dropping the socket, the channel (CLOSE on the host handle) and
             // the engine's streams removes them from epoll.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::Received;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A host whose compositor is not reading: every SEND is refused as
+    /// busy, and there is never anything to receive.
+    struct BusyChannel {
+        sends: Arc<AtomicUsize>,
+        ready: OwnedFd,
+    }
+
+    impl Channel for BusyChannel {
+        fn send(&mut self, _f: &mut [u8], _fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            Ok(Sent::Busy)
+        }
+        fn recv(
+            &mut self,
+            _max: usize,
+            _c: Option<RawFd>,
+            _r: Option<RawFd>,
+        ) -> io::Result<Received> {
+            let (frame, _) = frame::pack(&mut VecDeque::new(), frame::MIN_FRAME, 0, false);
+            Ok(Received {
+                frame,
+                fds: Vec::new(),
+                more: false,
+            })
+        }
+        fn poll_fd(&self) -> RawFd {
+            self.ready.as_raw_fd()
+        }
+    }
+
+    struct BusyHost {
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl Connector for BusyHost {
+        fn info(&mut self) -> io::Result<HostInfo> {
+            Ok(HostInfo {
+                caps: uapi::CAP_WAYLAND,
+                clock_offset_ns: 0,
+                max_frame: 256 * 1024,
+                devmap: Vec::new(),
+            })
+        }
+        fn connect(&mut self, _mode: u32) -> io::Result<Box<dyn Channel>> {
+            Ok(Box::new(BusyChannel {
+                sends: self.sends.clone(),
+                ready: sys::eventfd()?,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_while_the_host_is_busy_is_closed_not_spun_on() {
+        let dir = std::env::temp_dir().join(format!("nvwl-daemon-hup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("wayland-0");
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut d = Daemon::new(
+            Config::new(&sock),
+            Box::new(BusyHost {
+                sends: sends.clone(),
+            }),
+        )
+        .unwrap();
+        let client = UnixStream::connect(&sock).unwrap();
+        d.turn(100).unwrap();
+        // The daemon's HELLO waits for the host.
+        assert!(d.clients.iter().flatten().any(|c| !c.tx.is_empty()));
+        drop(client);
+        let before = sends.load(Ordering::Relaxed);
+        for _ in 0..50 {
+            d.turn(100).unwrap();
+            if d.clients.iter().all(|c| c.is_none()) {
+                break;
+            }
+        }
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the slot of a client that hung up is closed"
+        );
+        let retried = sends.load(Ordering::Relaxed) - before;
+        assert!(
+            retried <= 2,
+            "{retried} SENDs retried for a client that is gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
