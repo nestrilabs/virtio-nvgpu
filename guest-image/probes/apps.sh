@@ -30,7 +30,10 @@ if [ "$USERMODE" = 1 ]; then
         echo 'app:x:1000:1000:app:/home/app:/bin/sh' >> /etc/passwd
         echo 'app:x:1000:' >> /etc/group
         # Into the image's own groups (video, render, nvgpu-wl exist there).
-        for g in video render nvgpu-wl; do
+        # The apps are NOT in nvgpu-wl: only the daemon may open
+        # /dev/nvgpu-wl (CONNECT_FOR names the client process it proxies),
+        # as a setgid daemon would have it; below it gets the group alone.
+        for g in video render; do
             sed -i -E "s/^($g:x:[0-9]+:)(.*)\$/\1\2,app/; s/^($g:x:[0-9]+:),app\$/\1app/" /etc/group
         done
     }
@@ -42,8 +45,10 @@ if [ "$USERMODE" = 1 ]; then
     [ -e /dev/nvgpu-wl ] && { chgrp nvgpu-wl /dev/nvgpu-wl; chmod 0660 /dev/nvgpu-wl; }
     AS=(setpriv --reuid=1000 --regid=1000 --init-groups env HOME=/home/app USER=app XDG_RUNTIME_DIR=/run/user/1000)
     export HOME=/home/app XDG_RUNTIME_DIR=/run/user/1000
-    say "apps run as $(id -un 1000 2>/dev/null || echo 1000): groups video render nvgpu-wl, browsers sandboxed"
-    bg "${AS[@]}" nvgpu-wl-guest --socket wayland-0
+    say "apps run as $(id -un 1000 2>/dev/null || echo 1000): groups video render (not nvgpu-wl: only the daemon), browsers sandboxed"
+    nvgid=$(awk -F: '$1 == "nvgpu-wl" {print $3}' /etc/group)
+    bg setpriv --reuid=1000 --regid=1000 --groups="$(id -G 1000 | tr ' ' ','),$nvgid" \
+        env HOME=/home/app USER=app XDG_RUNTIME_DIR=/run/user/1000 nvgpu-wl-guest --socket wayland-0
     WL_PID=${BG_PIDS[-1]}
     for _ in $(seq 1 100); do [ -S /run/user/1000/wayland-0 ] && break; sleep 0.1; done
     if [ -S /run/user/1000/wayland-0 ]; then pass "nvgpu-wl-guest (as app) serving /run/user/1000/wayland-0"
