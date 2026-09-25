@@ -1249,8 +1249,12 @@ mod tests {
         // With the only read end closed, a write finds no reader.
         // SAFETY: a one-byte write from a live array.
         let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-        assert_eq!(n, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
+        if n != -1 {
+            // A forked test child's copy (testfd.rs).
+            assert!(crate::testfd::only_end_here(std::os::fd::AsFd::as_fd(&w)));
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
+        }
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub mod semsurf;
 pub mod session;
 pub mod shm;
 pub mod tally;
+#[cfg(test)]
+mod testfd;
 pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;

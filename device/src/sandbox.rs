@@ -1087,11 +1087,20 @@ mod tests {
     /// Run `f` in a forked child and say how it ended. The child exits with
     /// what `f` returns, 101 on a panic. glibc keeps malloc usable across
     /// fork, and the children touch no lock another thread could hold.
+    ///
+    /// The child first closes every descriptor but 0-2: it inherits every
+    /// other test thread's too, and holding them for the length of its test
+    /// made other tests' "the backend closed its end" probes see a live
+    /// peer. From fork to that close the copies still exist, which those
+    /// probes allow for (testfd.rs). No child here uses a descriptor it did
+    /// not open itself.
     fn forked(f: impl FnOnce() -> i32) -> End {
         // SAFETY: fork; the child only runs `f` and exits without unwinding.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
         if pid == 0 {
+            // SAFETY: closes this child's own copies; the parent's are untouched.
+            unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
             let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(101);
             // SAFETY: the child ends here.
             unsafe { libc::_exit(code) };

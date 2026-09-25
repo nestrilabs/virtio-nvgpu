@@ -1652,7 +1652,10 @@ mod tests {
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
         // SAFETY: a one-byte write from a live array.
         let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-        assert_eq!(n, -1, "closed, not adopted");
+        assert!(
+            n == -1 || crate::testfd::only_end_here(w.as_fd()),
+            "closed, not adopted"
+        );
 
         let (r, _w) = pipe_ends();
         let p = opened(&be, r);
