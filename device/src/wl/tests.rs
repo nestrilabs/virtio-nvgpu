@@ -20,7 +20,7 @@ use super::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, sock_fd};
 use super::export::WlExport;
 use crate::hostfd::HandleKind;
 
-fn tmpdir(tag: &str) -> PathBuf {
+pub(super) fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("nvwl-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -29,7 +29,7 @@ fn tmpdir(tag: &str) -> PathBuf {
 
 /// Classifies memfds by name: "…ours…" is a lease of our GPU, "…dmabuf…" a
 /// dma-buf, anything else Other.
-struct FakeHost;
+pub(super) struct FakeHost;
 impl HostFds for FakeHost {
     fn classify(&self, fd: BorrowedFd<'_>) -> HandleKind {
         let l = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap_or_default();
@@ -63,7 +63,7 @@ impl RecvOps for Ops {
 }
 
 /// The guest kernel, for the guest engine: DRM files arrive already adopted.
-struct GuestPlat;
+pub(super) struct GuestPlat;
 impl Platform for GuestPlat {
     fn dmabuf_out(&mut self, _fd: OwnedFd) -> DescOut {
         DescOut::plain(Desc {
@@ -164,7 +164,7 @@ impl Guest {
     }
 }
 
-fn msgs(mut b: &[u8]) -> Vec<Vec<u8>> {
+pub(super) fn msgs(mut b: &[u8]) -> Vec<Vec<u8>> {
     let mut v = Vec::new();
     while let Some(h) = peek_header(b) {
         v.push(b[..h.size as usize].to_vec());
@@ -173,7 +173,7 @@ fn msgs(mut b: &[u8]) -> Vec<Vec<u8>> {
     v
 }
 
-fn global_names(b: &[u8]) -> Vec<String> {
+pub(super) fn global_names(b: &[u8]) -> Vec<String> {
     let d = &iface(proto::WL_REGISTRY).events[op::wl_registry::EVT_GLOBAL as usize];
     msgs(b)
         .iter()
@@ -188,7 +188,7 @@ fn global_names(b: &[u8]) -> Vec<String> {
 /// A compositor that answers get_registry with `globals`, sync with done, and
 /// a lease-device bind with a drm_fd memfd named after the global (so
 /// FakeHost can tell "ours" from not).
-fn fake_compositor(
+pub(super) fn fake_compositor(
     path: PathBuf,
     globals: Vec<(u32, &'static str, u32)>,
     lease_names: Vec<(u32, &'static str)>,
@@ -268,7 +268,7 @@ fn fake_compositor(
     });
 }
 
-fn get_registry() -> Vec<Vec<u8>> {
+pub(super) fn get_registry() -> Vec<Vec<u8>> {
     vec![
         MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
             .new_id(2)
@@ -279,7 +279,7 @@ fn get_registry() -> Vec<Vec<u8>> {
     ]
 }
 
-fn sync_done(b: &[u8], _: usize) -> bool {
+pub(super) fn sync_done(b: &[u8], _: usize) -> bool {
     msgs(b).iter().any(|m| {
         let h = peek_header(m).unwrap();
         h.object == 3 && h.opcode == op::wl_callback::EVT_DONE

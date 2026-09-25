@@ -37,7 +37,7 @@
 //!   chains.
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -53,6 +53,8 @@ use device::session::{
 };
 use device::shm::WindowPlacer;
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use device::wl::WlConfig;
+use device::wl::export::WlExport;
 use protocol::messages::{MsgHeader, MsgType};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
@@ -109,9 +111,18 @@ struct Args {
     #[arg(long)]
     kms_card: bool,
 
-    /// The host compositor's Wayland socket, for the Wayland proxy.
+    /// The host compositor's Wayland socket, for the Wayland proxy
+    /// (typically `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`).
     #[arg(long, value_name = "PATH")]
     wayland_socket: Option<PathBuf>,
+
+    /// Offer the compositor's `wp_drm_lease_device_v1` to guest clients, so
+    /// a guest can lease a host output and drive it through its own KMS.
+    ///
+    /// Only a lease device whose DRM file is one of this GPU's card nodes is
+    /// ever shown, and only to a guest that can adopt DRM files.
+    #[arg(long, requires = "wayland_socket")]
+    wayland_lease: bool,
 
     /// Accept host Wayland clients here and carry them to a guest compositor.
     #[arg(long, value_name = "PATH")]
@@ -174,6 +185,60 @@ impl WindowPlacer for VhostWindow {
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
+
+/// The Wayland proxy's configuration, made once at startup.
+struct Wayland {
+    /// `--wayland-socket`: one `WlConfig` cloned into every connection, so
+    /// what the lease-device probe learns about the compositor's globals is
+    /// learnt once and shared.
+    cfg: Option<WlConfig>,
+    /// `--wayland-export`: the listener and its readiness eventfd.
+    export: Option<(Arc<WlExport>, OwnedFd)>,
+}
+
+impl Wayland {
+    fn from_args(args: &Args) -> anyhow::Result<Self> {
+        let cfg = args.wayland_socket.as_ref().map(|p| {
+            let mut c = WlConfig::new(p);
+            c.allow_lease = args.wayland_lease;
+            log::info!(
+                "wayland: guest clients reach the compositor at {}{}",
+                p.display(),
+                if c.allow_lease {
+                    ", leases offered"
+                } else {
+                    ""
+                }
+            );
+            c
+        });
+        // Bound now rather than on the guest's first LISTEN: a path that cannot
+        // be listened on is a configuration error the operator should see at
+        // start, not a guest -ENODEV later.
+        let export = match &args.wayland_export {
+            Some(p) => {
+                let x = WlExport::bind(p).map_err(|e| {
+                    anyhow::anyhow!("--wayland-export {}: cannot listen: {e}", p.display())
+                })?;
+                log::info!("wayland export: host clients connect at {}", p.display());
+                Some(x)
+            }
+            None => None,
+        };
+        Ok(Self { cfg, export })
+    }
+}
+
+/// `WlExport::shutdown` at exit.
+struct ExportGuard(Option<Arc<WlExport>>);
+
+impl Drop for ExportGuard {
+    fn drop(&mut self) {
+        if let Some(x) = self.0.take() {
+            x.shutdown();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Rings with an epoch
@@ -604,6 +669,7 @@ impl NvGpuBackend {
         proc_nvidia: &Path,
         abi_policy: device::nvidia::AbiPolicy,
         config: BackendConfig,
+        wayland: Wayland,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -622,6 +688,8 @@ impl NvGpuBackend {
         nvidia.set_abi_policy(abi_policy);
         nvidia.set_config(config);
         nvidia.set_host_driver_version(&version);
+        nvidia.set_wayland(wayland.cfg);
+        nvidia.set_wayland_export(wayland.export);
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -951,6 +1019,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         device::nvidia::AbiPolicy::Enforce
     };
+    let wayland = Wayland::from_args(&args)?;
+    // Stops listening however main ends: the socket file would otherwise stay
+    // behind, and a host client connecting to it would wait on a backend that
+    // is gone.
+    let _export = ExportGuard(wayland.export.as_ref().map(|(x, _)| x.clone()));
     let config = BackendConfig {
         kms_card: args.kms_card,
         wayland_socket: args.wayland_socket,
@@ -967,6 +1040,7 @@ fn main() -> anyhow::Result<()> {
         &args.proc_nvidia,
         abi_policy,
         config,
+        wayland,
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.

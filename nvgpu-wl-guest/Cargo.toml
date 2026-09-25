@@ -17,5 +17,7 @@ wlwire = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
-# The loopback test runs the backend's own connection object in process.
+# The loopback test runs the backend's own connection object in process, and
+# the whole dispatcher (NvidiaBackend::serve) in front of it.
 device = { path = "../device" }
+protocol = { workspace = true }

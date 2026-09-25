@@ -1482,6 +1482,149 @@ fn a_lease_device_that_did_send_released_gets_no_second_one() {
     assert_eq!(p.g.stats.released_synthesised, 0);
 }
 
+/// Hyprland with the lease patch (patches/hyprland): a desktop output leased,
+/// the lease ending, the connector advertised again to a client that had
+/// destroyed its object for it, and `released` sent by the compositor itself.
+/// The proxy must carry every step, and synthesise `released` only for the
+/// device the compositor did not answer -- per resource, never twice.
+#[test]
+fn a_lease_round_trip_keeps_hyprlands_released_and_re_advertised_connectors() {
+    use op::wp_drm_lease_connector_v1 as conn_op;
+    use op::wp_drm_lease_device_v1 as dev_op;
+    let mut p = Pair::new(Policy {
+        drm_file: false,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    p.registry(&[
+        (1, "wp_drm_lease_device_v1", 1),
+        (2, "wp_drm_lease_device_v1", 1),
+    ]);
+    p.bind(1, "wp_drm_lease_device_v1", 1, 3).unwrap();
+    p.bind(2, "wp_drm_lease_device_v1", 1, 4).unwrap();
+    p.at_server();
+    const CONN: u32 = 0xff00_0000;
+    let advertise = |dev: u32| {
+        vec![
+            MsgBuilder::new(dev, dev_op::EVT_CONNECTOR)
+                .new_id(CONN)
+                .finish(),
+            MsgBuilder::new(CONN, conn_op::EVT_NAME)
+                .string(Some("DP-2"))
+                .finish(),
+            MsgBuilder::new(CONN, conn_op::EVT_CONNECTOR_ID)
+                .uint(90)
+                .finish(),
+            MsgBuilder::new(CONN, conn_op::EVT_DONE).finish(),
+            MsgBuilder::new(dev, dev_op::EVT_DONE).finish(),
+        ]
+    };
+    let mut first = vec![MsgBuilder::new(3, dev_op::EVT_DRM_FD).finish()];
+    first.extend(advertise(3));
+    first.push(MsgBuilder::new(4, dev_op::EVT_DRM_FD).finish());
+    first.push(MsgBuilder::new(4, dev_op::EVT_DONE).finish());
+    p.server_sends(&first, vec![memfd_with(b"card"), memfd_with(b"card")])
+        .unwrap();
+    let (msgs, fds) = p.at_client();
+    assert_eq!(split(&msgs).len(), first.len());
+    assert_eq!(fds.len(), 2);
+
+    // Lease DP-2: request 5, lease 6; the lease fd is a DRM file like drm_fd.
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, dev_op::REQ_CREATE_LEASE_REQUEST)
+                .new_id(5)
+                .finish(),
+            MsgBuilder::new(5, op::wp_drm_lease_request_v1::REQ_REQUEST_CONNECTOR)
+                .object(CONN)
+                .finish(),
+            MsgBuilder::new(5, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(6)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(split(&p.at_server().0).len(), 3);
+    p.server_sends(
+        &[
+            MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+                .uint(5)
+                .finish(),
+            MsgBuilder::new(6, op::wp_drm_lease_v1::EVT_LEASE_FD).finish(),
+        ],
+        vec![memfd_with(b"lease")],
+    )
+    .unwrap();
+    let (_, fds) = p.at_client();
+    assert_eq!(fds.len(), 1, "the lease fd");
+
+    // The lease ends; the client drops the lease and its connector object,
+    // and Hyprland advertises the output again -- reusing the freed server
+    // id, as libwayland-server's id map does.
+    p.server_sends(
+        &[MsgBuilder::new(6, op::wp_drm_lease_v1::EVT_FINISHED).finish()],
+        vec![],
+    )
+    .unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(6, op::wp_drm_lease_v1::REQ_DESTROY).finish(),
+            MsgBuilder::new(CONN, conn_op::REQ_DESTROY).finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let mut again = vec![
+        MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+            .uint(6)
+            .finish(),
+    ];
+    again.extend(advertise(3));
+    p.server_sends(&again, vec![]).unwrap();
+    let (msgs, _) = p.at_client();
+    let msgs = split(&msgs);
+    assert_eq!(msgs.len(), again.len() + 1, "finished, then all of these");
+    let h = wire::peek_header(&msgs[2]).unwrap();
+    assert_eq!((h.object, h.opcode), (3, dev_op::EVT_CONNECTOR));
+
+    // Release both devices. Hyprland answers device 3 with `released`; device
+    // 4's compositor (an unpatched one) only frees the id.
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, dev_op::REQ_RELEASE).finish(),
+            MsgBuilder::new(4, dev_op::REQ_RELEASE).finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    p.server_sends(
+        &[
+            MsgBuilder::new(3, dev_op::EVT_RELEASED).finish(),
+            MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+                .uint(3)
+                .finish(),
+            MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+                .uint(4)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (msgs, _) = p.at_client();
+    let released = |dev: u32| {
+        split(&msgs)
+            .iter()
+            .filter(|m| {
+                let h = wire::peek_header(m).unwrap();
+                (h.object, h.opcode) == (dev, dev_op::EVT_RELEASED)
+            })
+            .count()
+    };
+    assert_eq!((released(3), released(4)), (1, 1));
+    assert_eq!(p.g.stats.released_synthesised, 1);
+}
+
 #[test]
 fn the_host_error_record_reaches_the_guest_as_a_remote_fatal() {
     let mut p = Pair::new(Policy::default());

@@ -441,6 +441,8 @@ pub struct NvidiaBackend {
     /// The host ioctl entry point. `libc::ioctl`, except in tests that need to
     /// see what the host driver would be handed.
     host_ioctl: HostIoctl,
+    /// Wayland channels (`DEV_WAYLAND` handles) and what configures them.
+    pub(crate) wl: crate::wl::WlState,
 }
 
 /// `ioctl(2)` as the forwarding paths call it.
@@ -854,6 +856,7 @@ impl NvidiaBackend {
             hooks: BackendHooks::shared(),
             xfer_sys: Arc::new(crate::xfer::HostSys),
             host_ioctl: libc_ioctl,
+            wl: crate::wl::WlState::default(),
         }
     }
 
@@ -1092,6 +1095,7 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.kms_states.clear();
+        self.wl_forget_all();
         self.handles.drain_all();
     }
 
@@ -1184,9 +1188,7 @@ impl NvidiaBackend {
                 Outcome::Reply(r) => r,
                 pending => return pending,
             },
-            // The Wayland channel is not served yet. -EPROTO is what an old
-            // backend answers to an unknown message.
-            MsgType::WlSend | MsgType::WlRecv => self.error_reply(libc::EPROTO),
+            MsgType::WlSend | MsgType::WlRecv => self.serve_wl(msg_type, payload, cap),
             _ => {
                 // The v1 handlers write into a buffer of the response's size.
                 // Zeroed, so nothing of an earlier response can reach the
@@ -1274,6 +1276,16 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, libc::EPERM);
             }
             Some(DeviceKind::Dri(n)) => HandleKind::DriRender(n),
+            // A channel to the host compositor: not a path (wl/serve.rs).
+            Some(DeviceKind::Wayland) => {
+                return match self.open_wayland(req.flags) {
+                    Ok(h) => {
+                        self.created.push(h);
+                        self.write_hdr(resp_buf, h, 0)
+                    }
+                    Err(e) => self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, e),
+                };
+            }
             Some(k) => HandleKind::Dev(k),
             None => {
                 log::warn!("handle_open: invalid device type {}", req.device_type);
@@ -1683,6 +1695,7 @@ impl NvidiaBackend {
         }
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.kms_states.remove(&handle);
+        self.wl_forget(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         drop(fd);

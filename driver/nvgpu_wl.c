@@ -34,6 +34,7 @@
 #include <linux/dma-buf.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
+#include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/poll.h>
@@ -49,41 +50,25 @@
 
 MODULE_IMPORT_NS("DMA_BUF");
 
-/*
- * Provided by other files of the module. These prototypes belong in nvgpu.h;
- * they are here until the owners of those files add them there.
- *
- * nvgpu_drm.c: if @buf is one of our GEM proxies' dma-bufs (ops ==
- * nvgpu_dmabuf_ops and the object is on one of this device's DRM devices),
- * its (owner backend handle, host GEM handle); else -EINVAL.
- */
-int nvgpu_dmabuf_to_host(struct dma_buf *buf, u32 *owner, u32 *gem);
-/*
- * nvgpu_drm.c: make a GEM proxy for host GEM @host_gem, which lives in the
- * render handle of @drm_filp (a guest render-node file of ours), and return a
- * new dma-buf descriptor for it (@o_flags: O_CLOEXEC | O_RDWR), or -errno.
- */
-int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           int o_flags);
-/*
- * KMS workstream (DESIGN §4.2): adopt backend handle @kms_handle (a host DRM
- * file of kind @kind) into a new guest DRM file cloned from template @tmpl,
- * returning its descriptor. Ownership of the handle passes to it: on failure
- * it has closed the handle unless the clone consumed it.
- */
-int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
-                         int o_flags);
-/* Called from probe (after HELLO and DRI registration) and remove. */
-int nvgpu_wl_init(struct nvgpu_device *dev);
-void nvgpu_wl_cleanup(struct nvgpu_device *dev);
-
 #define NVGPU_WL_MAX_DEVS 8
 
+/*
+ * One /dev/nvgpu-wl per virtio device. Refcounted: remove deregisters the
+ * misc device, but files opened before that still name this struct until
+ * they are released. The open takes its reference under misc_mtx, which
+ * misc_deregister() also takes (drivers/char/misc.c:125-165, 284-293), so no
+ * open can find it once cleanup has dropped the initial one.
+ */
 struct nvgpu_wl_dev {
   struct miscdevice misc;
   struct nvgpu_device *dev;
+  struct kref ref;
   char name[16];
 };
+
+static void nvgpu_wl_dev_free(struct kref *ref) {
+  kfree(container_of(ref, struct nvgpu_wl_dev, ref));
+}
 
 static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
 static DEFINE_MUTEX(nvgpu_wl_devs_lock);
@@ -121,7 +106,7 @@ static void nvgpu_wl_ev_deliver(struct nvgpu_ev_consumer *c, u32 kind,
   wake_up_interruptible(&wf->nfd.wq);
 }
 
-static int nvgpu_wl_desc_get(struct nvgpu_tbuf *tb, size_t base, u32 i,
+static int nvgpu_wl_desc_get(const struct nvgpu_tbuf *tb, size_t base, u32 i,
                              struct nvgpu_wl_desc *d) {
   return nvgpu_tbuf_read(tb, base + sizeof(struct nvgpu_wl_frame_hdr) +
                                  (size_t)i * sizeof(*d),
@@ -190,8 +175,13 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
    * dev_t of its render node (linux-dmabuf main_device, tranche target
    * device), and a guest client looks that number up in *its* /dev. The host
    * numbers of each render node came with GET_SYS_FILES; the guest's are
-   * whatever minor the DRM core gave our node. Card nodes are added when
-   * the host's card numbers are known here (compositor-VM mode).
+   * whatever minor the DRM core gave our node.
+   *
+   * Card nodes too, where the host's card numbers are known: GET_SYS_FILES
+   * section 3, which a backend sends only in compositor-VM mode. Hyprland's
+   * scanout tranche names the primary node it drives (devIDFromFD of its DRM
+   * fd); without the entry the daemon maps that dev_t to 0, and a client
+   * simply finds no tranche it can scan out from.
    */
   for (i = 0; i < dev->num_dri_devs && n < NVGPU_WL_MAX_DEVMAP; i++) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
@@ -203,6 +193,22 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
     h->dev[n].guest_major = DRM_MAJOR;
     h->dev[n].guest_minor = dri->drm->render->index;
     h->dev[n].flags = NVGPU_WL_DEV_RENDER;
+    n++;
+  }
+  for (i = 0; i < dev->num_card_recs && n < NVGPU_WL_MAX_DEVMAP; i++) {
+    const struct nvgpu_card_rec *c = &dev->cards[i];
+    struct nvgpu_dri_dev *dri;
+
+    if (c->render_index >= (u32)dev->num_dri_devs)
+      continue;
+    dri = &dev->dri_devs[c->render_index];
+    if (!dri->registered || !dri->drm || !dri->drm->primary)
+      continue;
+    h->dev[n].host_major = c->major;
+    h->dev[n].host_minor = c->minor;
+    h->dev[n].guest_major = DRM_MAJOR;
+    h->dev[n].guest_minor = dri->drm->primary->index;
+    h->dev[n].flags = NVGPU_WL_DEV_CARD;
     n++;
   }
   h->ndev = n;
@@ -290,7 +296,7 @@ static void nvgpu_wl_resolve_dmabuf(struct nvgpu_device *dev,
   buf = dma_buf_get(d->fd);
   if (IS_ERR(buf))
     goto invalid;
-  if (nvgpu_dmabuf_to_host(buf, &owner, &gem) < 0) {
+  if (nvgpu_dmabuf_to_host(dev, buf, &owner, &gem) < 0) {
     dev_warn_ratelimited(&dev->vdev->dev,
                          "virtio-gpu-nv: wayland: a client's dma-buf is not "
                          "one of ours; the host gets a placeholder\n");
@@ -375,8 +381,19 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
         goto out;
       }
       break;
+    case NVGPU_WL_DESC_SYNCOBJ:
+      /*
+       * Explicit sync (wp_linux_drm_syncobj_manager_v1.import_timeline),
+       * reserved: the host hides that global until fences are bridged. What
+       * it needs from here is the backend handle of the guest syncobj's host
+       * object in `a` (FENCES: syncobj files that are host-handle files);
+       * the backend then hands the compositor a duplicate of that host
+       * syncobj (SendOps::syncobj). Refused until then.
+       */
+      ret = -EOPNOTSUPP;
+      goto out;
     default:
-      /* DRM files and syncobjs never go guest → host. */
+      /* DRM files never go guest → host, and nothing else exists. */
       ret = -EINVAL;
       goto out;
     }
@@ -431,9 +448,14 @@ out:
 
 /* ── RECV ── */
 
-/* A host DRM file (backend handle @handle of kind @kind) as a guest file. */
+/*
+ * A host DRM file (backend handle @handle of kind @kind) as a guest file.
+ * The handle is closed here or owned by nvgpu_adopt_drm_file() from its call
+ * on; either way the caller is done with it.
+ */
 static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
                           u32 kind) {
+  struct nvgpu_fd *tn;
   struct file *tmpl;
   int fd;
 
@@ -445,7 +467,20 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
     nvgpu_close_handle(dev, handle);
     return -EBADF;
   }
-  /* nvgpu_adopt_drm_file validates the template and owns the handle. */
+  /*
+   * The handle is this device's backend's; a clone of another device's node
+   * would run its KMS ioctls against a backend that never heard of it.
+   * nvgpu_adopt_drm_file checks the rest (a primary-node file of ours).
+   */
+  tn = nvgpu_drm_file_nfd(tmpl);
+  if (!tn || tn->dev != dev) {
+    dev_warn_ratelimited(&dev->vdev->dev,
+                         "virtio-gpu-nv: wayland: the card template is not a "
+                         "DRM file of this device; dropping a DRM file\n");
+    fput(tmpl);
+    nvgpu_close_handle(dev, handle);
+    return -EBADF;
+  }
   fd = nvgpu_adopt_drm_file(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
   fput(tmpl);
   return fd;
@@ -458,30 +493,36 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
  */
 static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
                            u32 handle) {
-  struct file *rf = NULL;
-  u32 render;
+  struct nvgpu_fd *nfd;
+  struct file *rf;
   u64 args[2], res[2];
   int ret;
 
-  ret = render_fd >= 0 ? nvgpu_handle_for_fd(render_fd, &render) : -EBADF;
-  if (ret < 0)
+  /*
+   * One lookup of the descriptor, held for the whole import: the file whose
+   * render handle the host imports into is then the file the proxy is made
+   * in, whatever the daemon's other threads do to its descriptor table. It
+   * must be a DRM file of ours, on this device -- a render handle is what
+   * DMABUF_IMPORT takes, and the backend of another device would not know
+   * the number.
+   */
+  rf = render_fd >= 0 ? fget(render_fd) : NULL;
+  nfd = rf ? nvgpu_drm_file_nfd(rf) : NULL;
+  if (!nfd || nfd->dev != dev) {
+    ret = -EBADF;
     goto out;
-  args[0] = render;
+  }
+  args[0] = nfd->handle;
   args[1] = handle;
   ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 2);
   if (ret < 0)
     goto out;
-  rf = fget(render_fd);
-  if (!rf) {
-    nvgpu_gem_close_async(dev, render, (u32)res[0]);
-    ret = -EBADF;
-    goto out;
-  }
+  /* Owns the host GEM handle from here: closed on failure, or left to the
+   * proxy that already stands for it. */
   ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], O_RDWR | O_CLOEXEC);
-  if (ret < 0)
-    nvgpu_gem_close_async(dev, render, (u32)res[0]);
-  fput(rf);
 out:
+  if (rf)
+    fput(rf);
   nvgpu_close_handle(dev, handle);
   return ret;
 }
@@ -504,7 +545,12 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   if (!wf->bound || wf->mode == NVGPU_WL_LISTEN)
     return -ENOTCONN;
   cap = min(x.len, nvgpu_wl_max_frame(dev));
-  if (cap < sizeof(fh))
+  /*
+   * Room for the largest record the host engine makes, or the backend
+   * refuses the call (it never takes from the queue what it could not
+   * deliver whole). HELLO's max_frame is always at least this.
+   */
+  if (cap < NVGPU_WL_MIN_FRAME)
     return -EMSGSIZE;
   max_desc = min_t(u32, x.max_desc, NVGPU_WL_MAX_DESC);
 
@@ -647,6 +693,7 @@ static int nvgpu_wl_open(struct inode *inode, struct file *filp) {
   wf = kzalloc(sizeof(*wf), GFP_KERNEL);
   if (!wf)
     return -ENOMEM;
+  kref_get(&wl->ref); /* under misc_mtx: see struct nvgpu_wl_dev */
   wf->wl = wl;
   mutex_init(&wf->lock);
   init_waitqueue_head(&wf->nfd.wq);
@@ -665,6 +712,7 @@ static int nvgpu_wl_release(struct inode *inode, struct file *filp) {
     nvgpu_close_handle(dev, wf->nfd.handle);
   }
   mutex_destroy(&wf->lock);
+  kref_put(&wf->wl->ref, nvgpu_wl_dev_free);
   kfree(wf);
   return 0;
 }
@@ -759,6 +807,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   else
     snprintf(wl->name, sizeof(wl->name), "nvgpu-wl%d", slot);
   wl->dev = dev;
+  kref_init(&wl->ref);
   wl->misc.minor = MISC_DYNAMIC_MINOR;
   wl->misc.name = wl->name;
   wl->misc.fops = &nvgpu_wl_fops;
@@ -781,6 +830,43 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   return 0;
 }
 
+/*
+ * A WL_RECV that came back after its caller gave up (timeout, fatal signal).
+ * Its records are lost to the channel, which the daemon then closes; the
+ * backend handles in its descriptors would be lost to everyone, and one of
+ * them may be a lease: a host lessee nobody can close keeps Hyprland's
+ * output leased until the session resets. So each is CLOSEd here, as the
+ * transport does for IOCTL2 and HOST_OP results (nvgpu_req_reap).
+ */
+unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
+                                const struct nvgpu_tbuf *resp, u32 used) {
+  const size_t H = sizeof(struct nvgpu_msg_hdr);
+  struct nvgpu_wl_frame_hdr fh;
+  unsigned int n = 0;
+  u32 ndesc, i;
+
+  if (!nvgpu_resp_has(used, H, sizeof(fh)) ||
+      nvgpu_tbuf_read(resp, H, &fh, sizeof(fh)) ||
+      le32_to_cpu((__le32)fh.magic) != NVGPU_WL_FRAME_MAGIC)
+    return 0;
+  ndesc = min_t(u32, le16_to_cpu((__le16)fh.ndesc), NVGPU_WL_MAX_DESC);
+  for (i = 0; i < ndesc; i++) {
+    size_t at = H + sizeof(fh) + (size_t)i * sizeof(struct nvgpu_wl_desc);
+    struct nvgpu_wl_desc d;
+
+    if (!nvgpu_resp_has(used, at, sizeof(d)) ||
+        nvgpu_wl_desc_get(resp, H, i, &d))
+      break;
+    if (d.flags & NVGPU_WL_DESC_F_INVALID)
+      continue;
+    if (d.kind == NVGPU_WL_DESC_DRM_FILE || d.kind == NVGPU_WL_DESC_DMABUF) {
+      nvgpu_close_handle(dev, d.a);
+      n++;
+    }
+  }
+  return n;
+}
+
 void nvgpu_wl_cleanup(struct nvgpu_device *dev) {
   int slot;
 
@@ -792,7 +878,7 @@ void nvgpu_wl_cleanup(struct nvgpu_device *dev) {
       continue;
     misc_deregister(&wl->misc);
     nvgpu_wl_devs[slot] = NULL;
-    kfree(wl);
+    kref_put(&wl->ref, nvgpu_wl_dev_free);
   }
   mutex_unlock(&nvgpu_wl_devs_lock);
 }

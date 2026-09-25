@@ -1,7 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run the Wayland proxy end to end without a VM: real clients (wayland-info,
 # weston-presentation-shm, wl-copy/wl-paste) → the guest daemon → an
-# in-process channel → the backend's WlConn → a headless sway.
+# in-process channel → the backend's WlConn (directly, and again through the
+# whole dispatcher, NvidiaBackend::serve) → a headless sway or weston.
 #
 # Usage: scripts/wl-loopback-test.sh [extra cargo test args]
 #

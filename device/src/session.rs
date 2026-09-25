@@ -78,6 +78,9 @@ impl BackendConfig {
         if self.nvkms_table {
             caps |= BCAP_NVKMS_TABLE;
         }
+        if self.wayland_export.is_some() {
+            caps |= BCAP_WL_EXPORT;
+        }
         caps
     }
 }

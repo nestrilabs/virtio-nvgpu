@@ -14,6 +14,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/fcntl.h>
 #include <linux/fs.h>
+#include <linux/hashtable.h>
 #include <linux/io.h>
 #include <linux/iosys-map.h>
 #include <linux/mm.h>
@@ -478,8 +479,56 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
  * proxy's reference on the owner is what keeps that handle open until now,
  * and it is dropped last, after the GEM_CLOSE and MUNMAP that need it.
  */
+/*
+ * ───────── live proxies, by the host object they stand for ─────────
+ *
+ * A host render file hands out one GEM handle per object, whoever asks: a
+ * PRIME import of a dma-buf the file already holds returns the handle it
+ * already has (drm_gem_prime_fd_to_handle, drm_prime.c:305-308, on the host
+ * as here). So a host handle that comes back from an import may be one a
+ * proxy already stands in front of, and a second proxy for it would be a
+ * second owner of the same number: the first to go sends GEM_CLOSE, and the
+ * other is left naming nothing -- or, once the host reuses the number, some
+ * other object. Every proxy is therefore findable by (owner file, host
+ * handle) for as long as it lives, and a path that receives a host handle
+ * from an import (nvgpu_dmabuf_from_host; IOCTL2 GEM outs) reuses the proxy
+ * it finds instead of making another.
+ *
+ * Entries leave the table first thing in nvgpu_gem_free(), before the
+ * GEM_CLOSE; a lookup racing the last put sees a zero refcount and skips it.
+ */
+#define NVGPU_GEM_LIVE_BITS 8
+static DEFINE_HASHTABLE(nvgpu_gem_live, NVGPU_GEM_LIVE_BITS);
+static DEFINE_SPINLOCK(nvgpu_gem_live_lock);
+
+static unsigned long nvgpu_gem_live_key(const struct nvgpu_fd *owner,
+                                        u32 host_handle) {
+  return (unsigned long)owner ^ ((unsigned long)host_handle << 4);
+}
+
+struct nvgpu_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
+                                              u32 host_handle) {
+  struct nvgpu_gem_object *ng, *found = NULL;
+
+  spin_lock(&nvgpu_gem_live_lock);
+  hash_for_each_possible(nvgpu_gem_live, ng, live,
+                         nvgpu_gem_live_key(owner, host_handle)) {
+    if (ng->owner == owner && ng->host_handle == host_handle &&
+        kref_get_unless_zero(&ng->base.refcount)) {
+      found = ng;
+      break;
+    }
+  }
+  spin_unlock(&nvgpu_gem_live_lock);
+  return found;
+}
+
 static void nvgpu_gem_free(struct drm_gem_object *obj) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
+
+  spin_lock(&nvgpu_gem_live_lock);
+  hash_del(&ng->live);
+  spin_unlock(&nvgpu_gem_live_lock);
 
   if (ng->dev && ng->host_handle)
     nvgpu_gem_close(ng->dev, ng->owner_handle, ng->host_handle);
@@ -841,10 +890,15 @@ static const struct drm_gem_object_funcs nvgpu_gem_funcs = {
  * sent GEM_CLOSE -- and a second close of a number the host may have reused
  * for a newer object closes that one.
  */
-int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
-                           u32 host_handle, size_t size, u32 *guest_handle) {
+/*
+ * The proxy object itself, with one reference and no handle, registered as
+ * live. Owns @host_handle the same way nvgpu_gem_proxy_create() does.
+ */
+static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
+                                                    struct nvgpu_fd *owner,
+                                                    u32 host_handle,
+                                                    size_t size) {
   struct nvgpu_gem_object *ng;
-  int ret;
 
   size = PAGE_ALIGN(size);
   if (!size)
@@ -853,11 +907,11 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
   ng = kzalloc(sizeof(*ng), GFP_KERNEL);
   if (!ng) {
     nvgpu_gem_close(owner->dev, owner->handle, host_handle);
-    return -ENOMEM;
+    return ERR_PTR(-ENOMEM);
   }
 
   mutex_init(&ng->map_lock);
-  drm_gem_private_object_init(file->minor->dev, &ng->base, size);
+  drm_gem_private_object_init(drm, &ng->base, size);
   ng->base.funcs = &nvgpu_gem_funcs;
   ng->dev = owner->dev;
   nvgpu_fd_get(owner);
@@ -866,11 +920,117 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
   ng->host_handle = host_handle;
   ng->obj_type = NVGPU_GEM_OBJECT_NVKMS;
 
+  spin_lock(&nvgpu_gem_live_lock);
+  hash_add(nvgpu_gem_live, &ng->live, nvgpu_gem_live_key(owner, host_handle));
+  spin_unlock(&nvgpu_gem_live_lock);
+  return ng;
+}
+
+int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
+                           u32 host_handle, size_t size, u32 *guest_handle) {
+  struct nvgpu_gem_object *ng;
+  int ret;
+
+  ng = nvgpu_gem_proxy_new(file->minor->dev, owner, host_handle, size);
+  if (IS_ERR(ng))
+    return PTR_ERR(ng);
+
   ret = drm_gem_handle_create(file, &ng->base, guest_handle);
   /* The handle holds the only reference now, or nothing does and it is
    * freed -- which closes the host handle and drops the owner. */
   drm_gem_object_put(&ng->base);
   return ret;
+}
+
+/*
+ * ───────── dma-bufs for the Wayland channel (nvgpu_wl.c) ─────────
+ */
+
+/*
+ * A client's dma-buf, on its way to the host compositor: the backend exports
+ * the very object the proxy stands for on the proxy's owner file, so what is
+ * needed is exactly that pair. Only our own proxies' dma-bufs, and only this
+ * device's: anything else has no host object behind it that this backend
+ * could name, and a pair read out of someone else's priv would be a guess.
+ */
+int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
+                         u32 *owner, u32 *gem) {
+  struct drm_gem_object *obj;
+  struct nvgpu_gem_object *ng;
+
+  if (buf->ops != &nvgpu_dmabuf_ops)
+    return -EINVAL;
+  obj = buf->priv;
+  if (!obj || obj->funcs != &nvgpu_gem_funcs)
+    return -EINVAL;
+  ng = to_nvgpu_gem(obj);
+  if (ng->dev != dev || !ng->host_handle)
+    return -EINVAL;
+  *owner = ng->owner_handle;
+  *gem = ng->host_handle;
+  return 0;
+}
+
+/*
+ * A host dma-buf, already imported into @drm_filp's render handle as host GEM
+ * @host_gem, as a guest dma-buf descriptor (export mode: a host client's
+ * buffer for the guest compositor).
+ *
+ * The proxy is owned by the file's own nvgpu_fd, whose handle is the render
+ * handle the import ran on. If a proxy already stands for that host handle --
+ * the host import returned a handle the file already had -- it is reused, not
+ * doubled (see nvgpu_gem_proxy_find()). The export goes through the core with
+ * a handle held in @drm_filp just for the call, so obj->dma_buf stays what the
+ * core expects when the compositor imports the descriptor back
+ * (drm_gem_prime_fd_to_handle's WARN_ON, drm_prime.c:320-324); the dma-buf
+ * alone keeps the proxy alive afterwards.
+ *
+ * @host_gem is this function's once @drm_filp is known to be ours: every later
+ * failure closes it (or leaves it to the proxy already standing for it).
+ * -EBADF for a file that is not one of our DRM files leaves it with the
+ * caller.
+ */
+int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
+                           int o_flags) {
+  struct nvgpu_fd *nfd = nvgpu_drm_file_nfd(drm_filp);
+  struct drm_file *file;
+  struct nvgpu_gem_object *ng;
+  struct dma_buf *buf;
+  u32 handle;
+  int fd, ret;
+
+  if (!nfd)
+    return -EBADF;
+  file = drm_filp->private_data;
+
+  ng = nvgpu_gem_proxy_find(nfd, host_gem);
+  if (ng && ng->base.dev != file->minor->dev) {
+    /* Proxies of a file's objects are made in that file's device; one that
+     * is not cannot get a handle here, and a second proxy would double-own
+     * the host handle. Should never happen: refuse rather than guess. */
+    drm_gem_object_put(&ng->base);
+    return -EINVAL;
+  }
+  if (!ng) {
+    ng = nvgpu_gem_proxy_new(file->minor->dev, nfd, host_gem, size);
+    if (IS_ERR(ng))
+      return PTR_ERR(ng);
+  }
+  ret = drm_gem_handle_create(file, &ng->base, &handle);
+  /* The handle's reference, or none: a proxy made here and never handled is
+   * freed now, which closes the host handle. */
+  drm_gem_object_put(&ng->base);
+  if (ret)
+    return ret;
+  buf = drm_gem_prime_handle_to_dmabuf(file->minor->dev, file, handle,
+                                       o_flags & (O_CLOEXEC | O_RDWR));
+  drm_gem_handle_delete(file, handle);
+  if (IS_ERR(buf))
+    return PTR_ERR(buf);
+  fd = dma_buf_fd(buf, o_flags & O_CLOEXEC);
+  if (fd < 0)
+    dma_buf_put(buf);
+  return fd;
 }
 
 /*

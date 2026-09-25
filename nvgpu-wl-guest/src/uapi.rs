@@ -48,6 +48,9 @@ pub struct Connect {
 
 pub const XFER_MORE: u32 = 1 << 0;
 
+/// `NVGPU_WL_MIN_FRAME`: the smallest RECV buffer the host accepts.
+pub const MIN_FRAME: usize = 16 + 32 * 24 + 16 + 65536;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Xfer {
@@ -80,6 +83,7 @@ const _: () = {
     assert!(wlwire::frame::FRAME_HDR_LEN == 16);
     assert!(wlwire::frame::DESC_LEN == 24);
     assert!(wlwire::frame::REC_HDR_LEN == 16);
+    assert!(MIN_FRAME == wlwire::frame::MIN_FRAME);
 };
 
 #[cfg(test)]
