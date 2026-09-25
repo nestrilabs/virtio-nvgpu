@@ -92,6 +92,12 @@ fn device_path_with(device_type: u32, dri: &[DriDevice]) -> Result<CString> {
             return Err(DeviceError::InvalidDeviceKind(device_type));
         }
     };
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    let path = {
+        let _ = path;
+        "/dev/null".to_string()
+    };
     Ok(CString::new(path).expect("a device path has no interior NUL"))
 }
 
@@ -173,7 +179,7 @@ pub(crate) struct HostNodes {
 /// generic_page_kind, page_kind_generation, sector_layout, supports_sync_fd,
 /// supports_semsurf. Every host answer is normalised into this layout (see
 /// [`normalise_dev_info`]), because it is the only one that has every field.
-const NV_DEV_INFO_WORDS: usize = 9;
+pub(crate) const NV_DEV_INFO_WORDS: usize = 9;
 
 /// How many words the probe offers the host: more than any layout so far, so
 /// the one the host fills is measured rather than assumed.
@@ -256,6 +262,10 @@ fn normalise_dev_info(raw: &[u32], size: u32, modeset: bool) -> Option<[u32; NV_
 /// not use for allocation or fencing, where invented capabilities made it try
 /// and fail (vkCreateDevice failing on 0x54's -EOPNOTSUPP).
 fn host_dev_info(path: &str) -> Option<([u32; NV_DEV_INFO_WORDS], u32)> {
+    #[cfg(fuzzing)]
+    if path != "/dev/null" {
+        return None;
+    }
     let c_path = CString::new(path).ok()?;
     // SAFETY: a NUL-terminated path, and the fd is closed below.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -1203,19 +1213,19 @@ impl NvidiaBackend {
 
     /// Put a descriptor straight into the table, as if an OPEN or an fd out
     /// had produced it.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn adopt_for_test(&mut self, fd: OwnedFd, kind: HandleKind) -> u32 {
         self.handles.insert(fd, kind).expect("test table has room")
     }
 
     /// Replace host node enumeration, which needs real hardware.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn set_host_nodes_for_test(&mut self, dri: Vec<DriDevice>, cards: Vec<CardNode>) {
         self.nodes = Some(Arc::new(HostNodes { dri, cards }));
     }
 
     /// Replace the host ioctl, to see what a forwarding path hands the driver.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn set_host_ioctl_for_test(&mut self, f: HostIoctl) {
         self.host_ioctl = f;
     }
@@ -1428,6 +1438,8 @@ impl NvidiaBackend {
     /// executed with no backend lock held and then handed to
     /// [`NvidiaBackend::finish_ioctl2`].
     pub fn serve(&mut self, req_buf: &[u8], cap: usize) -> Outcome {
+        #[cfg(test)]
+        crate::fuzz_seeds::served(req_buf, cap);
         self.created.clear();
         // The mode is configuration, which the transport may set at any
         // point before the first message; the NVKMS policy reads its copy.
@@ -5179,6 +5191,8 @@ impl NvidiaBackend {
 /// every host fd it held. `cargo` reported it only as an unused-method warning.
 impl Drop for NvidiaBackend {
     fn drop(&mut self) {
+        #[cfg(test)]
+        crate::fuzz_seeds::dropped(self);
         if !self.handles.is_empty() {
             log::warn!(
                 "NvidiaBackend dropped with {} handles still open — \

@@ -1042,3 +1042,25 @@ quarter at a time. What bounds that is the guest's own process limits
 limit does natively. It also rests on the guest kernel's word about which
 process is which (§2), and `/dev/nvgpu-wl`'s group may charge a channel to
 any process it names, which is why that group is the daemon's alone.
+
+## 12. Fuzzing and Miri
+
+Every place the backend parses what a guest or a Wayland peer sent has a
+fuzz target (`fuzz/`, `scripts/fuzz.sh`, `device/README.md` "Fuzzing"): the
+v1 dispatcher and protocol v2 (HELLO, IOCTL2, HOST_OP, WATCH, MMAP and
+MUNMAP) as whole message sequences, the control queue as guest memory,
+deep segments, OS-descriptor page lists, RM share parsing and ownership,
+NVKMS policy, the pointer scrub, and the Wayland engine both ways. The
+host they run against is a fake kernel that follows every pointer the real
+driver would, as far as it would copy, and fails on a guest value or an
+unmapped address there; the window and aperture are a fake VMM that fails
+on an overlap, a placement outside them or of a private descriptor. Miri
+runs over the unit tests it can model (`scripts/fuzz.sh miri`).
+
+| id | sev | finding | fix |
+|---|---|---|---|
+| Z1 | critical | a nested parameter block sent shorter than the size field the host copies by (RM_CONTROL's paramsSize) had RM read a pointer field cut short as the guest's low bytes over the guarded buffer's zeroed slack, past the pointer scrub, which read only the bytes sent: a guest-chosen address in the backend that RM reads and writes through (FIFO_GET_CHANNELLIST and every control with a pointer). Default configuration, graphics included | `20434fa`: the size the host copies must equal the block sent, or be zero, on every nested path |
+| Z2 | low | v1 host calls were handed a pointer taken from a slice of the guest's length, while the driver copies `_IOC_SIZE`; the nested block's address was taken before the writes that relocate its pointers. Undefined behaviour under Stacked Borrows (Miri), not known to miscompile | `5e62911` |
+| Z3 | low | `serve` could answer a malformed request with more bytes than the capacity posted; the vhost-user transport never posts that little | `0b320bb` |
+
+Nothing of it has run on the GPU; the fuzzers run with no device at all.

@@ -692,6 +692,11 @@ fn rm_ioctl(fd: RawFd, request: u32, arg: &mut [u8]) -> Result<(), String> {
 
 impl Rm for HostRm {
     fn open(&self, path: &str) -> io::Result<PrivateFd> {
+        // Fuzzing (device/src/fuzzing): no real device is ever opened.
+        #[cfg(fuzzing)]
+        if path != "/dev/null" {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
         let c = CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         // SAFETY: a NUL-terminated path; the result is owned below.
         let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };

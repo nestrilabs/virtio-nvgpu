@@ -295,6 +295,12 @@ impl KmsCall {
 /// Open a card node for KMS: O_NONBLOCK, as every DRM-class file the pump
 /// reads is (hostfd::set_nonblock).
 fn open_card(path: &str) -> Result<OwnedFd, i32> {
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    let path = {
+        let _ = path;
+        "/dev/null"
+    };
     let c = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
     // SAFETY: a NUL-terminated path; the descriptor is owned below.
     let fd = unsafe {

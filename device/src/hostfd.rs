@@ -739,6 +739,11 @@ fn verified_signaled(fd: OwnedFd) -> io::Result<OwnedFd> {
 }
 
 fn open_path(path: &str, flags: i32) -> io::Result<OwnedFd> {
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    if path != "/dev/null" {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
     let c = std::ffi::CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: a NUL-terminated path.
     let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC) };

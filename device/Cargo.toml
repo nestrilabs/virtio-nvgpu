@@ -60,3 +60,7 @@ path = "bin/test-harness.rs"
 [[bin]]
 name = "test-client"
 path = "bin/test_client.rs"
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing` (device/src/fuzzing, fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
