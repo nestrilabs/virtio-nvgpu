@@ -15,6 +15,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/refcount.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/virtio.h>
@@ -56,10 +57,20 @@ struct nvgpu_dri_dev {
   struct drm_device *drm;
   bool registered;
   u32 index;
+  /* Index into nvgpu_device.cards of this device's host card node, or -1. */
+  int card_index;
   struct nvgpu_device *dev;
   /* sysfs drm tree under the PCI device — required by Vulkan ICD */
   struct kobject *drm_kobj;      /* .../pci_addr/drm          */
   struct kobject *drm_node_kobj; /* .../pci_addr/drm/<name>   */
+};
+
+/* A host card node (GET_SYS_FILES section 3, struct nvgpu_card_record). */
+struct nvgpu_card_rec {
+  char name[32];
+  u32 major;
+  u32 minor;
+  u32 render_index; /* which nvgpu_device.dri_devs[] it belongs to */
 };
 
 /* ── Fake PCI device state ── */
@@ -141,14 +152,6 @@ struct nvgpu_device {
   u32 num_gpus;
   u32 caps;
 
-  /* Serialise virtqueue access */
-  struct mutex vq_lock;
-
-  /* Completion for synchronous request */
-  struct completion req_done;
-  void *resp_buf;
-  int resp_len;
-
   /* GPU slots read from config space at probe */
   struct virtio_gpu_nv_gpu_slot gpu_slots[8];
 
@@ -159,12 +162,18 @@ struct nvgpu_device {
   /* Every open descriptor, so an event naming a handle can find its file. */
   struct list_head fds;
   spinlock_t fds_lock;
-  struct nvgpu_event_buf *event_bufs; /* defined with the event queue, nvgpu_main.c */
 
   /* ── DRI device nodes ── */
 #define NVGPU_MAX_DRI_DEVS 8
   struct nvgpu_dri_dev dri_devs[NVGPU_MAX_DRI_DEVS];
   int num_dri_devs;
+  /*
+   * Host card nodes, from GET_SYS_FILES section 3. Only a backend started
+   * with --kms-card sends any; each names the DRI record (and so the guest
+   * DRM device) it is the primary node of. EV_HOTPLUG's cookie indexes this.
+   */
+  struct nvgpu_card_rec cards[NVGPU_MAX_DRI_DEVS];
+  int num_card_recs;
 
   /* ── PCI sysfs fake hierarchy ── */
   struct kobject *pci_bus_kobj;     /* /sys/bus/pci              */
@@ -214,10 +223,35 @@ struct nvgpu_fd {
   /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
    * "not yet asked", which is why the counter starts at one. */
   u64 drm_unique_id;
+  /*
+   * Lifetime of `handle`. The opener holds one reference, and for a DRM file
+   * every GEM proxy whose host object lives in this file holds one more: the
+   * host GEM handle belongs to the host drm_file, so the backend handle has to
+   * stay open for as long as any guest object stands in front of one of its
+   * objects -- a compositor routinely outlives the client whose buffer it
+   * imported. The backend CLOSE goes out when the last reference goes
+   * (nvgpu_fd_put()), so for a DRM file this struct outlives the drm_file.
+   */
+  refcount_t ref;
+  /*
+   * DRM files only: the guest drm_file this is the private state of, or NULL
+   * for a character device and from the moment the file is released. Written
+   * under the event registry lock (nvgpu_fd_detach_drm()); an event consumer,
+   * which runs under that lock, may dereference it there and only there.
+   * Nothing may reach the drm_file through this after release: the core frees
+   * it right after postclose, while this struct lives on.
+   */
+  struct drm_file *drm_file;
+  /*
+   * DRM files only: the backend handle of a host card or lease file used for
+   * KMS ioctls, or 0. Set by the KMS code from the file's open or an ioctl on
+   * it (the file is alive then, so release cannot run concurrently); taken
+   * and CLOSEd at release, before drm_release(), so host master, framebuffers
+   * and leases go away when the guest file does rather than when the last
+   * GEM proxy does.
+   */
+  u32 kms_handle;
 };
-
-/* Posted on the event queue for the host to fill; see NVGPU_EVENT_BUFS. */
-struct nvgpu_event_buf;
 
 /*
  * A GEM parameter struct that carries a userspace pointer, described well
@@ -286,6 +320,8 @@ struct nvgpu_gem_nested_desc {
 struct nvgpu_gem_object {
   struct drm_gem_object base;
   struct nvgpu_device *dev;
+  /* The file the host object lives in; the proxy holds a reference on it. */
+  struct nvgpu_fd *owner;
   u32 owner_handle; /* backend handle of the drm_file owning the host object */
   u32 host_handle;  /* the GEM handle in the host's drm_file */
   u32 obj_type;     /* what GEM_IDENTIFY_OBJECT answers */
@@ -309,19 +345,47 @@ struct nvgpu_gem_object {
 
 /* ───────── nvgpu_main.c ───────── */
 
-int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
-                    void *resp, int resp_len);
 long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
 long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
                         void *kbuf, u32 sz);
+/*
+ * The backend handle standing for one of this module's open files: an
+ * /dev/nvidia* character device, a DRM node of ours (its render handle), or a
+ * host-handle file (nvgpu_hostfile_handle()). -EBADF for anything else --
+ * never a guess at another driver's private_data.
+ */
 int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+/* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
+struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
 void nvgpu_fd_register(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
+void nvgpu_fd_get(struct nvgpu_fd *nfd);
+/* Drops a reference; the last one CLOSEs the backend handle and frees. */
+void nvgpu_fd_put(struct nvgpu_fd *nfd);
 
 /* ───────── nvgpu_drm.c ───────── */
 
 int nvgpu_dri_init(struct nvgpu_device *dev);
 void nvgpu_dri_cleanup(struct nvgpu_device *dev);
+/* The nvgpu_fd of a DRM file of this driver, else NULL. */
+struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
+/*
+ * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
+ * host file, and return a handle for it in `file`. The proxy takes a
+ * reference on `owner`. On failure the host handle has already been closed
+ * (by the proxy's own free, where one was made): the caller must not close it
+ * again.
+ */
+int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
+                           u32 host_handle, size_t size, u32 *guest_handle);
+/* Guest handle in `file` -> (host GEM handle, owner backend handle). */
+int nvgpu_gem_to_host(struct drm_file *file, u32 guest_handle,
+                      u32 *host_handle, u32 *owner_handle);
+
+/* ───────── nvgpu_hostfile.c ───────── */
+
+/* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */
+int nvgpu_hostfile_handle(struct file *f, u32 *handle);
 
 /* ═════════════════════════ Protocol v2 internal API ═════════════════════════
  *
@@ -340,6 +404,8 @@ struct nvgpu_schema_set;
  * Built from page chunks (at most 64 KiB each), never vmalloc, so a request of
  * any allowed size can be described to the ring in a bounded number of
  * scatter-gather entries whether or not indirect descriptors were negotiated.
+ * nvgpu_tbuf_alloc() returns NULL on failure; the accessors return -EINVAL
+ * for a range outside the buffer and -EFAULT for a bad user pointer.
  */
 struct nvgpu_tbuf;
 struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);
@@ -368,20 +434,64 @@ int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len);
  * the transport until the device returns them, and any backend handles the
  * late response created are closed (IOCTL2 fd/gem outs, HOST_OP results).
  * Callers must therefore not free `req`/`resp` themselves after -ETIMEDOUT or
- * -EINTR: ownership passes to the transport on those returns.
+ * -EINTR: ownership passes to the transport on those returns. (-EINTR is also
+ * what a fatal signal while waiting for ring space returns; the transport
+ * frees the unsent buffers then, so the rule has no exception.) -ENODEV: the
+ * device is gone; the buffers are the caller's.
+ *
+ * NVGPU_XF_EXECUTOR waits up to 60 s, anything else 30 s, killable only:
+ * host display calls are bounded but uninterruptible, like the native ioctls.
  */
 int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                struct nvgpu_tbuf *resp, u32 flags, u32 *used_len);
 
-/* nvgpu_send_recv() (declared above) becomes a helper over nvgpu_xfer for
- * small kmalloc'd messages, keeping its signature for existing callers. */
+/*
+ * One request from plain kernel buffers, for the fixed-size and v1 messages.
+ * The bytes are copied through transport buffers, so `req` and `resp` may be
+ * any kernel memory (kvmalloc included) and are the caller's again whatever
+ * this returns. `resp` reads as zero past what the device wrote.
+ *
+ * nvgpu_send_recv() fails with -EIO when the device wrote less than a header,
+ * so a caller that reads only the header cannot mistake silence for success.
+ * nvgpu_send_recv_used() leaves that to the caller, who gets the length and
+ * must check every field it reads against it (nvgpu_resp_has()); a response
+ * with no header at all (GET_PROC_FILES) has to use this one.
+ */
+int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
+                    void *resp, int resp_len);
+int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
+                         void *resp, int resp_len, u32 *used_len);
+/* Does a response of `used` bytes contain all of [off, off + len)? */
+static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
+  return off <= used && len <= used - off;
+}
+
+/* ── Probe / remove (nvgpu_xfer.c), in the order they are called ── */
+/* After virtio_find_vqs(): transport state, event buffers posted. */
+int nvgpu_xfer_init(struct nvgpu_device *dev);
+/* After virtio_device_ready(): HELLO, then TIME_SYNC and its resync work. */
+void nvgpu_xfer_hello(struct nvgpu_device *dev);
+/* Remove, device still live: stop the clock work, let queued CLOSEs out. */
+void nvgpu_xfer_quiesce(struct nvgpu_device *dev);
+/* Remove, after the device reset: fail waiters, reclaim every buffer. */
+void nvgpu_xfer_reclaim(struct nvgpu_device *dev);
+/* After del_vqs (remove, or a probe that failed): free what init allocated. */
+void nvgpu_xfer_destroy(struct nvgpu_device *dev);
+void nvgpu_ctrl_vq_cb(struct virtqueue *vq);
+void nvgpu_event_vq_cb(struct virtqueue *vq);
 
 /* ── HOST_OP / WATCH / CLOSE ── */
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
                   u32 nargs, u64 *res, u32 nres);
 int nvgpu_watch(struct nvgpu_device *dev, u32 handle, u32 flags, u64 cookie);
 int nvgpu_unwatch(struct nvgpu_device *dev, u32 handle);
+/*
+ * CLOSE / GEM_CLOSE, waiting for the answer; process context. Neither can be
+ * lost: a request that never reached the ring (a fatal signal while the ring
+ * was full, no memory) is handed to the _async variant instead.
+ */
 int nvgpu_close_handle(struct nvgpu_device *dev, u32 handle);
+int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 /* From any context: queued on a workqueue that holds a module reference. */
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
@@ -415,7 +525,14 @@ struct nvgpu_ev_consumer {
 int nvgpu_ev_register(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c,
                       u64 key);
 void nvgpu_ev_unregister(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c);
+/* Never below 2^32, so a WATCH cookie can never be read as a legacy handle. */
 u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev);
+/*
+ * Release of a DRM file: under the registry lock, clear nfd->drm_file (so no
+ * consumer can reach the dying drm_file) and take nfd->kms_handle. Returns
+ * false if the file was already detached. The caller CLOSEs the KMS handle.
+ */
+bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle);
 
 /* ── IOCTL2 interpreter (nvgpu_i2.c) ── */
 

@@ -13,7 +13,6 @@
 
 #include <drm/drm.h>
 #include <linux/cdev.h>
-#include <linux/completion.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -29,7 +28,6 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
-#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/topology.h>
@@ -212,132 +210,6 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz);
 
-/* ───────── Virtqueue communication ───────── */
-
-/*
- * nvgpu_send_recv — submit one request to controlq and block until the VMM
- * returns the response.  Caller must supply pre-allocated resp buffer.
- */
-int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
-                    void *resp, int resp_len) {
-  struct scatterlist sg_out, sg_in;
-  struct scatterlist *sgs[2] = {&sg_out, &sg_in};
-  int ret;
-
-  mutex_lock(&dev->vq_lock);
-
-  reinit_completion(&dev->req_done);
-  dev->resp_buf = resp;
-  dev->resp_len = resp_len;
-
-  sg_init_one(&sg_out, req, req_len);
-  sg_init_one(&sg_in, resp, resp_len);
-
-  ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, resp, GFP_KERNEL);
-  if (ret < 0) {
-    mutex_unlock(&dev->vq_lock);
-    return ret;
-  }
-
-  mutex_unlock(&dev->vq_lock);
-  virtqueue_kick(dev->ctrl_vq);
-
-  ret = wait_for_completion_killable_timeout(&dev->req_done, 10 * HZ);
-  if (ret == 0) {
-    return -ETIMEDOUT;
-  }
-  if (ret < 0) {
-    return ret;
-  }
-
-  return 0;
-}
-
-/* Virtqueue callback: VMM has written the response buffer */
-static void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
-  struct nvgpu_device *dev = vq->vdev->priv;
-  void *buf;
-  unsigned int len;
-
-  while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
-    complete(&dev->req_done);
-  }
-}
-
-/* ───────── Events from the host ───────── */
-
-/*
- * Buffers posted on the event queue for the host to fill.
- *
- * The queue carries one message type and it is fixed-size, so the buffers are
- * allocated once at probe and handed straight back after each event. A guest
- * that posts none simply never hears about a readable descriptor, which is
- * what every build before this one did.
- */
-#define NVGPU_EVENT_BUFS 16
-
-struct nvgpu_event_buf {
-  struct nvgpu_msg_hdr hdr;
-};
-
-static void nvgpu_event_post(struct nvgpu_device *dev,
-                             struct nvgpu_event_buf *buf) {
-  struct scatterlist sg;
-  int ret;
-
-  sg_init_one(&sg, buf, sizeof(*buf));
-  ret = virtqueue_add_inbuf(dev->event_vq, &sg, 1, buf, GFP_ATOMIC);
-  if (ret < 0)
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: event queue would not take a buffer: %d\n",
-                         ret);
-}
-
-/*
- * The host says a descriptor has something to report. Wake whoever is waiting
- * on it.
- *
- * `pending` is a flag rather than a count: what the waiter does on waking is
- * ask the hardware's own semaphore, so two events and one event mean the same
- * thing to it. A wake with nothing behind it costs a wasted poll, and the host
- * re-sends while the descriptor stays readable, so a lost one costs a
- * millisecond rather than a hang.
- */
-static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle) {
-  struct nvgpu_fd *nfd;
-  unsigned long flags;
-
-  spin_lock_irqsave(&dev->fds_lock, flags);
-  list_for_each_entry(nfd, &dev->fds, node) {
-    if (nfd->handle == handle) {
-      atomic_set(&nfd->pending, 1);
-      wake_up_interruptible(&nfd->wq);
-      break;
-    }
-  }
-  spin_unlock_irqrestore(&dev->fds_lock, flags);
-}
-
-static void nvgpu_event_vq_cb(struct virtqueue *vq) {
-  struct nvgpu_device *dev = vq->vdev->priv;
-  struct nvgpu_event_buf *buf;
-  unsigned int len;
-
-  while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
-    if (len >= sizeof(buf->hdr) &&
-        le32_to_cpu(buf->hdr.msg_type) == NVGPU_MSG_EVENT_READY)
-      nvgpu_event_deliver(dev, le32_to_cpu(buf->hdr.handle));
-    else if (len)
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: event queue carried msg_type %u\n",
-                           len >= sizeof(buf->hdr)
-                               ? le32_to_cpu(buf->hdr.msg_type)
-                               : 0);
-    nvgpu_event_post(dev, buf);
-  }
-  virtqueue_kick(dev->event_vq);
-}
-
 /*
  * poll() on a device descriptor.
  *
@@ -345,7 +217,9 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
  * without this the VFS reported every one of these descriptors as permanently
  * ready and the user-mode driver's wait never waited.
  */
-static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
+static __poll_t nvgpu_poll_mask(struct file *filp,
+                                struct poll_table_struct *wait,
+                                __poll_t ready) {
   struct nvgpu_fd *nfd = filp->private_data;
 
   if (!nfd)
@@ -383,8 +257,23 @@ static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
    * back to a full core. One report per event it is.
    */
   if (atomic_xchg(&nfd->pending, 0))
-    return EPOLLIN | EPOLLRDNORM;
+    return ready;
   return 0;
+}
+
+static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
+  return nvgpu_poll_mask(filp, wait, EPOLLIN | EPOLLRDNORM);
+}
+
+/*
+ * nvidia-modeset reports a pending NVKMS event as POLLPRI | POLLIN
+ * (nvidia-modeset-linux.c:2027-2029, nvkms_poll), so a caller may wait for
+ * either. Answered like the RM devices, with EPOLLIN only, a poll for POLLPRI
+ * would sleep through an event that had already arrived.
+ */
+static __poll_t nvgpu_modeset_poll(struct file *filp,
+                                   struct poll_table_struct *wait) {
+  return nvgpu_poll_mask(filp, wait, EPOLLIN | EPOLLPRI | EPOLLRDNORM);
 }
 
 /* ───────── Ioctl forwarding ───────── */
@@ -397,6 +286,7 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf, *resp_buf;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  u32 used, data_len;
   int ret;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
@@ -425,16 +315,29 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  if (sz > 0 && resp->data_len && le32_to_cpu(resp->data_len) <= sz) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
-                     le32_to_cpu(resp->data_len)))
+  /*
+   * Only what the device wrote. A failed call comes back as a bare header,
+   * and before the used length was kept the bytes after it were whatever the
+   * kmalloc'd buffer held -- guest kernel heap, copied out to userspace.
+   */
+  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
+                 ? le32_to_cpu(resp->data_len)
+                 : 0;
+  if (sz > 0 && data_len && data_len <= sz &&
+      nvgpu_resp_has(used, sizeof(*resp), data_len)) {
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
       ret = -EFAULT;
   }
 
@@ -451,8 +354,9 @@ out:
  * open file has to name it by the handle the backend issued when we opened it.
  */
 int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
-  struct file *f;
   struct nvgpu_fd *other;
+  struct file *f;
+  int ret = 0;
 
   if (guest_fd < 0)
     return -EBADF;
@@ -461,15 +365,19 @@ int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
   if (!f)
     return -EBADF;
 
-  other = f->private_data;
-  if (!other) {
-    fput(f);
-    return -EINVAL;
-  }
-
-  *handle = other->handle;
+  /*
+   * Only a file of ours has an nvgpu_fd behind it, and which field holds it
+   * depends on which of ours it is. Reading private_data of any file as one
+   * forwarded a number out of a drm_file, a pipe or a socket as if it were a
+   * backend handle.
+   */
+  other = nvgpu_fd_from_file(f);
+  if (other)
+    *handle = other->handle;
+  else
+    ret = nvgpu_hostfile_handle(f, handle);
   fput(f);
-  return 0;
+  return ret;
 }
 
 /*
@@ -542,6 +450,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  u32 used;
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -687,13 +596,25 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
+  /*
+   * RM's own verdict is in params.status, so a successful reply always
+   * carries the struct back. A failed one is a bare header: nothing to copy,
+   * and the caller's struct is left as it was rather than overwritten.
+   */
+  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(params)))
+    goto out;
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
     ret = -EFAULT;
     goto out;
@@ -702,6 +623,8 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
 
+    if (!nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back))
+      goto out;
     if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
              &nested_fd, sizeof(nested_fd));
@@ -713,10 +636,11 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
     u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
-    if (copy_to_user((void __user *)deep_user_ptr,
-                     resp_buf + sizeof(*resp) + sizeof(params) +
-                         le32_to_cpu(resp->nested_len),
-                     copy_back))
+    size_t at = sizeof(*resp) + sizeof(params) +
+                (size_t)le32_to_cpu(resp->nested_len);
+
+    if (nvgpu_resp_has(used, at, copy_back) &&
+        copy_to_user((void __user *)deep_user_ptr, resp_buf + at, copy_back))
       ret = -EFAULT;
   }
 
@@ -742,6 +666,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  u32 used;
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -826,30 +751,43 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
         memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
         if (event_fd >= 0) {
-          struct file *ev_file = fget(event_fd);
+          u32 handle;
 
-          if (ev_file) {
-            struct nvgpu_fd *ev_nfd = ev_file->private_data;
-
-            if (ev_nfd) {
-              u32 handle = ev_nfd->handle;
-
-              memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
-            }
-            fput(ev_file);
+          /*
+           * The descriptor is the one the event will be delivered on, so it
+           * is always one of our devices. Anything else would reach the
+           * backend as a number it reads as a handle of its own.
+           */
+          if (nvgpu_handle_for_fd(event_fd, &handle)) {
+            dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                                 "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                                 "names fd %d, which is not one of our "
+                                 "devices\n",
+                                 hclass, event_fd);
+            ret = -EBADF;
+            goto out;
           }
+          memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
         }
       }
     }
   }
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
+  /* As for RM_CONTROL: a failed reply is a bare header, nothing to copy. */
+  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(params)))
+    goto out;
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
     ret = -EFAULT;
     goto out;
@@ -857,7 +795,9 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
-    if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
+
+    if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back) &&
+        copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))
       ret = -EFAULT;
   }
@@ -869,12 +809,10 @@ out:
 }
 
 /*
- * NOTE: The only subtlety worth noting: copy_to_user on the way back writes the
- * VMM handle value (not a host fd number) back into the guest's buffer. That's
- * fine — nvidia-smi doesn't read the payload back after REGISTER_FD, it only
- * checks the return code. If a future fd-carrying ioctl does need the response
- * payload, the VMM would need to translate back from host fd → handle before
- * returning.
+ * An ioctl the device's config names as carrying a descriptor at a fixed
+ * offset of its argument. The backend puts its own descriptor there for the
+ * call and our value back before it answers (nvidia.rs:2169-2171), so the
+ * caller reads back what it passed.
  */
 static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                                      void __user *uarg, unsigned int sz,
@@ -882,10 +820,8 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   void *req_buf = NULL, *resp_buf = NULL;
-  struct file *other_file;
-  struct nvgpu_fd *other_nfd;
   int guest_fd;
-  u32 host_handle;
+  u32 host_handle, used, data_len;
   int req_total, resp_max, ret;
 
   if (sz < payload_offset + sizeof(guest_fd))
@@ -923,21 +859,9 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
    */
   if (guest_fd >= 0) {
     /* Resolve guest fd → nvgpu_fd → VMM handle */
-    other_file = fget(guest_fd);
-    if (!other_file) {
-      ret = -EBADF;
+    ret = nvgpu_handle_for_fd(guest_fd, &host_handle);
+    if (ret)
       goto out;
-    }
-
-    other_nfd = other_file->private_data;
-    if (!other_nfd) {
-      fput(other_file);
-      ret = -EINVAL;
-      goto out;
-    }
-
-    host_handle = other_nfd->handle;
-    fput(other_file);
 
     /* Patch payload: replace raw guest fd with VMM handle */
     memcpy(req_buf + sizeof(*req) + payload_offset, &host_handle,
@@ -957,17 +881,25 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   req->deep_ptr_offset = 0;
   req->deep_len = 0;
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
   /* Write the (possibly modified) payload back to userspace */
-  if (ret == 0 && le32_to_cpu(resp->data_len) > 0) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
-                     le32_to_cpu(resp->data_len)))
+  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
+                 ? le32_to_cpu(resp->data_len)
+                 : 0;
+  if (ret == 0 && data_len > 0 && data_len <= sz &&
+      nvgpu_resp_has(used, sizeof(*resp), data_len)) {
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
       ret = -EFAULT;
   }
 
@@ -977,11 +909,24 @@ out:
   return ret;
 }
 
+/* NV_IOCTL_MAGIC, the type byte of every RM escape. */
+#define NVGPU_RM_IOCTL_TYPE 'F'
+
+/*
+ * The config's table names ioctls by number alone, and those numbers are
+ * RM's: 0xC9, 0xCE and 0xCF are also DRM's REVOKE_LEASE, GETFB2 and
+ * SYNCOBJ_EVENTFD (drm.h). Matched on the number only, a DRM ioctl that
+ * reached this path would have four bytes of its argument rewritten as a
+ * descriptor, so the type byte has to be RM's too.
+ */
 static const struct nvgpu_fd_translation_entry *
-nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int nr) {
+nvgpu_find_fd_translation(struct nvgpu_device *dev, unsigned int cmd) {
   u32 i;
+
+  if (_IOC_TYPE(cmd) != NVGPU_RM_IOCTL_TYPE)
+    return NULL;
   for (i = 0; i < dev->num_fd_translations; i++)
-    if (le32_to_cpu(dev->fd_translations[i].nr) == nr)
+    if (le32_to_cpu(dev->fd_translations[i].nr) == _IOC_NR(cmd))
       return &dev->fd_translations[i];
   return NULL;
 }
@@ -1005,7 +950,7 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (sz > 65536)
     return -EINVAL;
 
-  fdt = nvgpu_find_fd_translation(nfd->dev, nr);
+  fdt = nvgpu_find_fd_translation(nfd->dev, cmd);
   if (fdt)
     return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz,
                                     le32_to_cpu(fdt->payload_offset));
@@ -1153,6 +1098,7 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   u64 window_off;
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
+  u32 used;
   int ret;
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
@@ -1168,12 +1114,21 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
   req->offset = cpu_to_le64(offset);
   req->prot = cpu_to_le32((vma->vm_flags & VM_WRITE) ? 3 : 1);
 
-  ret = nvgpu_send_recv(nfd->dev, req, sizeof(*req), resp, sizeof(*resp));
+  ret = nvgpu_send_recv_used(nfd->dev, req, sizeof(*req), resp, sizeof(*resp),
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   if ((s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
     ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+    goto out;
+  }
+  if (!nvgpu_resp_has(used, 0, sizeof(*resp))) {
+    ret = -EIO;
     goto out;
   }
 
@@ -1244,6 +1199,20 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev,
   wake_up_interruptible_all(&nfd->wq);
 }
 
+void nvgpu_fd_get(struct nvgpu_fd *nfd) { refcount_inc(&nfd->ref); }
+
+/*
+ * The last reference: the host file goes too. Always from process context --
+ * a file's release, a DRM postclose, or a GEM proxy's free, which the core
+ * runs from the last handle close or dma-buf release.
+ */
+void nvgpu_fd_put(struct nvgpu_fd *nfd) {
+  if (!refcount_dec_and_test(&nfd->ref))
+    return;
+  nvgpu_close_handle(nfd->dev, nfd->handle);
+  kfree(nfd);
+}
+
 static int nvgpu_open_common(struct inode *inode, struct file *filp,
                              u32 device_type) {
   struct nvgpu_device *dev;
@@ -1275,6 +1244,7 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
 
   nfd->dev = dev;
   nfd->device_type = device_type;
+  refcount_set(&nfd->ref, 1);
 
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req->device_type = cpu_to_le32(device_type);
@@ -1312,20 +1282,9 @@ static int nvgpu_uvm_open(struct inode *inode, struct file *filp) {
 
 static int nvgpu_release(struct inode *inode, struct file *filp) {
   struct nvgpu_fd *nfd = filp->private_data;
-  struct nvgpu_msg_hdr *req;
-  struct nvgpu_msg_hdr *resp;
 
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
-  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (req && resp) {
-    req->msg_type = cpu_to_le32(NVGPU_MSG_CLOSE);
-    req->handle = cpu_to_le32(nfd->handle);
-    nvgpu_send_recv(nfd->dev, req, sizeof(*req), resp, sizeof(*resp));
-  }
-  kfree(req);
-  kfree(resp);
   nvgpu_fd_unregister(nfd->dev, nfd);
-  kfree(nfd);
+  nvgpu_fd_put(nfd);
   return 0;
 }
 
@@ -1396,6 +1355,7 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  u32 used;
 
   if (copy_from_user(&outer, uarg, sizeof(outer)))
     return -EFAULT;
@@ -1488,14 +1448,21 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  /* Write back outer struct */
+  /* Write back outer struct -- if the device sent one back. */
+  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(outer)))
+    goto out;
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(outer))) {
     ret = -EFAULT;
     goto out;
@@ -1504,7 +1471,9 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   /* Write back nested params */
   if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
-    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(outer),
+
+    if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(outer), copy_back) &&
+        copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(outer),
                      copy_back))
       ret = -EFAULT;
   }
@@ -1527,6 +1496,7 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  u32 used;
   long ret;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
@@ -1549,13 +1519,20 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
   req->deep_len = 0;
   memcpy(req_buf + sizeof(*req), kbuf, sz);
 
-  ret = nvgpu_send_recv(dev, req_buf, req_total, resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(dev, req_buf, req_total, resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
+  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
+    ret = -EIO;
+    goto out;
+  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (long)(s32)le32_to_cpu((__le32)resp->hdr.status);
-  if (le32_to_cpu(resp->data_len) >= sz)
+  if (nvgpu_resp_has(used, 0, sizeof(*resp)) &&
+      le32_to_cpu(resp->data_len) >= sz &&
+      nvgpu_resp_has(used, sizeof(*resp), sz))
     memcpy(kbuf, resp_buf + sizeof(*resp), sz);
 
 out:
@@ -1592,8 +1569,15 @@ static const struct file_operations nvgpu_modeset_fops = {
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_modeset_ioctl,
     .mmap = nvgpu_mmap,
-    .poll = nvgpu_poll,
+    .poll = nvgpu_modeset_poll,
 };
+
+struct nvgpu_fd *nvgpu_fd_from_file(struct file *f) {
+  if (f->f_op == &nvgpu_gpu_fops || f->f_op == &nvgpu_ctl_fops ||
+      f->f_op == &nvgpu_uvm_fops || f->f_op == &nvgpu_modeset_fops)
+    return f->private_data;
+  return nvgpu_drm_file_nfd(f);
+}
 
 /* ───────── /proc/driver/nvidia ───────── */
 
@@ -1747,13 +1731,19 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
   u8 *resp_buf, *p, *end;
   /* 512 KiB — vastly more than needed, avoids any size guessing */
   const size_t resp_size = 512 * 1024;
+  u32 used;
   int ret = 0;
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   if (!req)
     return -ENOMEM;
 
-  resp_buf = kvmalloc(resp_size, GFP_KERNEL);
+  /*
+   * Any memory will do: nvgpu_send_recv_used() copies through transport
+   * buffers, so this is never put on the ring itself. It used to be, with
+   * sg_init_one(), which is wrong for the vmalloc memory kvmalloc may return.
+   */
+  resp_buf = kvzalloc(resp_size, GFP_KERNEL);
   if (!resp_buf) {
     kfree(req);
     return -ENOMEM;
@@ -1764,14 +1754,16 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
   req->status = 0;
   req->req_id = 0;
 
-  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_size);
+  ret = nvgpu_send_recv_used(dev, req, sizeof(*req), resp_buf, resp_size,
+                             &used);
   if (ret < 0) {
     dev_err(&dev->vdev->dev, "virtio-gpu-nv: GET_PROC_FILES failed: %d\n", ret);
     goto out;
   }
 
+  /* The stream has no header; what the device wrote is where it ends. */
   p = resp_buf;
-  end = resp_buf + resp_size;
+  end = resp_buf + used;
 
   nvgpu_dir_cache_reset();
 
@@ -1999,11 +1991,86 @@ static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
 
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
 
+/*
+ * Section 3: the host card nodes, sent only by a backend started with
+ * --kms-card. An older backend ends the stream after section 2, and then
+ * there is nothing between `p` and `end` and no card is recorded; the parse
+ * never runs past what the device wrote.
+ */
+static void nvgpu_parse_card_section(struct nvgpu_device *dev, const u8 *p,
+                                     const u8 *end) {
+  struct nvgpu_card_record rec;
+  __le32 raw_count;
+  u32 count, i;
+
+  dev->num_card_recs = 0;
+  if (end - p < (ptrdiff_t)sizeof(raw_count))
+    return;
+  memcpy(&raw_count, p, sizeof(raw_count));
+  count = le32_to_cpu(raw_count);
+  p += sizeof(raw_count);
+
+  for (i = 0; i < count; i++) {
+    struct nvgpu_card_rec *c;
+    u32 name_len, render_index;
+
+    if (end - p < (ptrdiff_t)sizeof(rec)) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: card section truncated at entry %u\n", i);
+      return;
+    }
+    memcpy(&rec, p, sizeof(rec));
+    p += sizeof(rec);
+    name_len = le32_to_cpu(rec.name_len);
+    render_index = le32_to_cpu(rec.render_index);
+    if (name_len == 0 || name_len > end - p) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: card entry %u bad name_len %u\n", i, name_len);
+      return;
+    }
+
+    /*
+     * Kept in the order sent even when unusable, because EV_HOTPLUG names a
+     * card by its position here; one that names no DRI device we registered
+     * is recorded and never attached.
+     */
+    if (dev->num_card_recs >= NVGPU_MAX_DRI_DEVS) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: card entry %u is past the %d this driver keeps\n",
+               i, NVGPU_MAX_DRI_DEVS);
+      return;
+    }
+    c = &dev->cards[dev->num_card_recs];
+    memset(c->name, 0, sizeof(c->name));
+    memcpy(c->name, p, min_t(u32, name_len, sizeof(c->name) - 1));
+    c->major = le32_to_cpu(rec.major);
+    c->minor = le32_to_cpu(rec.minor);
+    c->render_index = render_index;
+    p += name_len;
+
+    if (render_index < (u32)dev->num_dri_devs &&
+        dev->dri_devs[render_index].card_index < 0)
+      dev->dri_devs[render_index].card_index = dev->num_card_recs;
+    else
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: card %s names DRI record %u, which is not "
+               "one this guest keeps or already has a card\n",
+               c->name, render_index);
+
+    dev_info(&dev->vdev->dev,
+             "virtio-gpu-nv: host card node %s (%u:%u) for DRI record %u\n",
+             c->name, c->major, c->minor, render_index);
+    dev->num_card_recs++;
+  }
+}
+
 static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   struct nvgpu_msg_hdr *req;
   u8 *resp_buf;
   u8 *p, *end;
   const int resp_max = 128 * 1024;
+  bool dri_complete = false;
+  u32 used;
   int ret = 0;
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
@@ -2022,12 +2089,14 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   req->status = 0;
   req->req_id = 0;
 
-  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_max);
+  ret = nvgpu_send_recv_used(dev, req, sizeof(*req), resp_buf, resp_max,
+                             &used);
   if (ret < 0)
     goto out;
 
+  /* A headerless stream: it ends where the device stopped writing. */
   p = resp_buf;
-  end = resp_buf + resp_max;
+  end = resp_buf + used;
 
   /* ── Section 1: sysfs files ─────────────────────────────────────── */
   while (p + 8 <= end) {
@@ -2136,7 +2205,11 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     num_dri = le32_to_cpu(raw_num_dri);
     p += 4;
 
-    num_dri = min(num_dri, (u32)NVGPU_MAX_DRI_DEVS);
+    /*
+     * Every record is walked, and only the first NVGPU_MAX_DRI_DEVS kept:
+     * section 3 starts after the last one, so stopping early would leave the
+     * card records unreachable.
+     */
     dev->num_dri_devs = 0;
 
     for (i = 0; i < num_dri; i++) {
@@ -2166,10 +2239,18 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       }
       p += NVGPU_DRI_RECORD_BYTES;
 
-      if (name_len == 0 || p + name_len > end) {
+      if (name_len == 0 || name_len > end - p) {
         dev_warn(&dev->vdev->dev,
                  "virtio-gpu-nv: DRI entry %u bad name_len %u\n", i, name_len);
         break;
+      }
+      if (dev->num_dri_devs >= NVGPU_MAX_DRI_DEVS) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: DRI entry %u is past the %d this driver "
+                 "keeps\n",
+                 i, NVGPU_MAX_DRI_DEVS);
+        p += name_len;
+        continue;
       }
 
       idx = dev->num_dri_devs;
@@ -2179,6 +2260,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->dri_devs[idx].major = major;
       dev->dri_devs[idx].minor = minor;
       dev->dri_devs[idx].slot_index = slot_index;
+      dev->dri_devs[idx].card_index = -1;
       memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
       dev->num_dri_devs++;
 
@@ -2189,7 +2271,11 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
                info[4], info[5], info[6]);
       p += name_len;
     }
+    dri_complete = i == num_dri;
   }
+
+  if (dri_complete)
+    nvgpu_parse_card_section(dev, p, end);
 
 out:
   kvfree(resp_buf);
@@ -2348,6 +2434,65 @@ static char *nvgpu_caps_devnode(const struct device *dev, umode_t *mode) {
   return kasprintf(GFP_KERNEL, "nvidia-caps/%s", dev_name(dev));
 }
 
+/*
+ * /dev/nvidia-caps/nvidia-cap{1,2}. Optional: a guest without them only loses
+ * MIG capability checks, so a failure here is logged and the rest goes on.
+ * nvgpu_caps_class is set only once all of it is in place, which is what
+ * cleanup keys on -- a half-made registration is undone here, not left for it.
+ */
+static void nvgpu_caps_init(struct nvgpu_device *dev) {
+  struct class *cls;
+  int ret;
+
+  dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
+  ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
+  if (ret) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: cannot register nvidia-caps: %d\n", ret);
+    return;
+  }
+
+  cls = class_create("nvidia-caps");
+  if (IS_ERR(cls)) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: cannot create the nvidia-caps class: %ld\n",
+             PTR_ERR(cls));
+    unregister_chrdev_region(dev->caps_devno, 2);
+    return;
+  }
+  cls->devnode = nvgpu_caps_devnode;
+
+  cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
+  dev->cdev_caps.owner = THIS_MODULE;
+  ret = cdev_add(&dev->cdev_caps, dev->caps_devno, 2);
+  if (ret) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: cannot add the nvidia-caps cdev: %d\n", ret);
+    class_destroy(cls);
+    unregister_chrdev_region(dev->caps_devno, 2);
+    return;
+  }
+
+  device_create(cls, &dev->vdev->dev, MKDEV(NV_CAPS_MAJOR, 1), NULL,
+                "nvidia-cap1");
+  device_create(cls, &dev->vdev->dev, MKDEV(NV_CAPS_MAJOR, 2), NULL,
+                "nvidia-cap2");
+  nvgpu_caps_class = cls;
+  dev_info(&dev->vdev->dev,
+           "virtio-gpu-nv: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
+}
+
+static void nvgpu_caps_cleanup(struct nvgpu_device *dev) {
+  if (!nvgpu_caps_class)
+    return;
+  device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 1));
+  device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 2));
+  cdev_del(&dev->cdev_caps);
+  unregister_chrdev_region(dev->caps_devno, 2);
+  class_destroy(nvgpu_caps_class);
+  nvgpu_caps_class = NULL;
+}
+
 /* ───────── Probe / remove ───────── */
 
 static int nvgpu_probe(struct virtio_device *vdev) {
@@ -2366,8 +2511,6 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   dev->vdev = vdev;
   vdev->priv = dev;
-  mutex_init(&dev->vq_lock);
-  init_completion(&dev->req_done);
   INIT_LIST_HEAD(&dev->fds);
   spin_lock_init(&dev->fds_lock);
 
@@ -2380,22 +2523,14 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev->event_vq = vqs[1];
 
   /*
-   * Give the host somewhere to put an event. Until this existed the queue was
-   * negotiated and empty, so the host had no way to say a descriptor had
-   * become readable and the guest's poll() had nothing to report.
+   * Request contexts, and somewhere for the host to put an event. Until the
+   * event queue had buffers it was negotiated and empty, so the host had no
+   * way to say a descriptor had become readable and the guest's poll() had
+   * nothing to report.
    */
-  dev->event_bufs =
-      kcalloc(NVGPU_EVENT_BUFS, sizeof(*dev->event_bufs), GFP_KERNEL);
-  if (dev->event_bufs) {
-    int i;
-
-    for (i = 0; i < NVGPU_EVENT_BUFS; i++)
-      nvgpu_event_post(dev, &dev->event_bufs[i]);
-    virtqueue_kick(dev->event_vq);
-  } else {
-    dev_warn(&vdev->dev,
-             "virtio-gpu-nv: no event buffers; waits will not be woken\n");
-  }
+  ret = nvgpu_xfer_init(dev);
+  if (ret)
+    goto err_vqs;
 
   /* Read config space written by the VMM at device creation */
   virtio_cread_bytes(vdev, 0, dev->driver_version, 32);
@@ -2405,7 +2540,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   if (dev->num_gpus == 0 || dev->num_gpus > 248) {
     dev_err(&vdev->dev, "virtio-gpu-nv: bad num_gpus %u\n", dev->num_gpus);
-    return -EINVAL;
+    ret = -EINVAL;
+    goto err_xfer;
   }
 
   /* GPU info records */
@@ -2446,12 +2582,19 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   /* Ensure virtio is running before we open devices */
   virtio_device_ready(vdev);
 
+  /*
+   * Which protocol, before anything else is said: the answer sizes every
+   * request after it, and the DRM devices registered below advertise
+   * features (syncobjs) only a v2 backend with the right caps can serve.
+   */
+  nvgpu_xfer_hello(dev);
+
   /* Create device class once */
   nvgpu_class = class_create("nvidia");
   if (IS_ERR(nvgpu_class)) {
     ret = PTR_ERR(nvgpu_class);
     nvgpu_class = NULL;
-    return ret;
+    goto err_ready;
   }
 
   /* Set more open permissions to device node */
@@ -2507,13 +2650,13 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev->modeset_devno = MKDEV(NV_MAJOR, NV_MODESET_MINOR);
   ret = register_chrdev_region(dev->modeset_devno, 1, "nvidia-modeset");
   if (ret)
-    goto err_gpu_modeset;
+    goto err_uvm_cdev;
 
   cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
   dev->cdev_modeset.owner = THIS_MODULE;
   ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
   if (ret)
-    goto err_gpu_modeset;
+    goto err_modeset_region;
 
   device_create(nvgpu_class, &vdev->dev, dev->modeset_devno, NULL,
                 "nvidia-modeset");
@@ -2521,36 +2664,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
            "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
            MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
 
-  /* Register /dev/nvidia-caps/nvidia-cap{1,2} */
-  dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
-  ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
-  if (ret) {
-    dev_warn(&vdev->dev, "virtio-gpu-nv: cannot register nvidia-caps: %d\n",
-             ret);
-    /* non-fatal — continue without caps */
-  } else {
-    nvgpu_caps_class = class_create("nvidia-caps");
-    if (!IS_ERR(nvgpu_caps_class)) {
-      nvgpu_caps_class->devnode = nvgpu_caps_devnode;
-
-      cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
-      dev->cdev_caps.owner = THIS_MODULE;
-      if (cdev_add(&dev->cdev_caps, MKDEV(NV_CAPS_MAJOR, 1), 2) == 0) {
-        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 1),
-                      NULL, "nvidia-cap1");
-        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 2),
-                      NULL, "nvidia-cap2");
-        dev_info(
-            &vdev->dev,
-            "virtio-gpu-nv: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
-      }
-    }
-  }
+  nvgpu_caps_init(dev);
 
   /* Create /proc/driver/nvidia/version */
   ret = nvgpu_proc_init(dev);
   if (ret)
-    goto err_uvm_cdev;
+    goto err_proc;
 
   /*
    * Where device memory will appear. The VMM publishes it as a virtio shared
@@ -2586,14 +2705,28 @@ static int nvgpu_probe(struct virtio_device *vdev) {
            dev->driver_version);
   return 0;
 
-err_gpu_modeset:
+  /*
+   * Each label undoes what was set up before the step that jumped to it, in
+   * reverse order. The old ladder unregistered a modeset region it had never
+   * registered, and a /proc failure left the modeset, uvm and caps devices
+   * behind.
+   */
+err_proc:
+  remove_proc_subtree("driver/nvidia", NULL);
+  nvgpu_caps_cleanup(dev);
+  device_destroy(nvgpu_class, dev->modeset_devno);
+  cdev_del(&dev->cdev_modeset);
+err_modeset_region:
   unregister_chrdev_region(dev->modeset_devno, 1);
+err_uvm_cdev:
+  device_destroy(nvgpu_class, dev->uvm_devno);
+  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+  cdev_del(&dev->cdev_uvm);
 err_uvm_region:
   unregister_chrdev_region(dev->uvm_devno, 2);
-err_uvm_cdev:
 err_ctl_cdev:
-  cdev_del(&dev->cdev_ctl);
   device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
+  cdev_del(&dev->cdev_ctl);
 err_ctl_region:
   unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
 err_gpu_cdevs:
@@ -2605,6 +2738,14 @@ err_gpu_cdevs:
 err_class:
   class_destroy(nvgpu_class);
   nvgpu_class = NULL;
+err_ready:
+  nvgpu_xfer_quiesce(dev);
+err_xfer:
+  vdev->config->reset(vdev);
+  nvgpu_xfer_reclaim(dev);
+err_vqs:
+  vdev->config->del_vqs(vdev);
+  nvgpu_xfer_destroy(dev);
   return ret;
 }
 
@@ -2612,10 +2753,15 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   struct nvgpu_device *dev = vdev->priv;
   int i;
 
+  /*
+   * The transport comes down in three steps around the reset. Before it, the
+   * device still answers, so the clock work is stopped and any queued CLOSE
+   * goes out. The reset stops the callbacks. After it, nothing on the ring
+   * will ever be answered: waiters are failed and every buffer comes back.
+   */
+  nvgpu_xfer_quiesce(dev);
   vdev->config->reset(vdev);
-  /* After the reset: the queue is quiet, so the buffers cannot be in use. */
-  kfree(dev->event_bufs);
-  dev->event_bufs = NULL;
+  nvgpu_xfer_reclaim(dev);
 
   nvgpu_dri_cleanup(dev);
   nvgpu_module_sysfs_cleanup();
@@ -2640,15 +2786,7 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   cdev_del(&dev->cdev_uvm);
   unregister_chrdev_region(dev->uvm_devno, 2);
 
-  /* nvidia-caps cleanup */
-  if (nvgpu_caps_class) {
-    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 1));
-    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 2));
-    cdev_del(&dev->cdev_caps);
-    unregister_chrdev_region(MKDEV(NV_CAPS_MAJOR, 1), 2);
-    class_destroy(nvgpu_caps_class);
-    nvgpu_caps_class = NULL;
-  }
+  nvgpu_caps_cleanup(dev);
 
   if (nvgpu_class) {
     class_destroy(nvgpu_class);
@@ -2656,6 +2794,7 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   }
 
   vdev->config->del_vqs(vdev);
+  nvgpu_xfer_destroy(dev);
 
   remove_proc_subtree("driver/nvidia", NULL);
 }
