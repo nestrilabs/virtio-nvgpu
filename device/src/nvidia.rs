@@ -2269,7 +2269,8 @@ impl NvidiaBackend {
             // `NV0005_ALLOC_PARAMETERS.data` at offset 16. The guest driver has
             // already turned the caller's descriptor into one of our handles;
             // this turns that handle into the descriptor this process holds,
-            // and puts the guest's value back before replying.
+            // and puts the handle back before replying (the guest driver then
+            // restores the caller's own descriptor over it).
             if escape == 0x2B && outer.len() >= 16 {
                 let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
                 const NV0005_DATA: usize = 16;
@@ -2818,8 +2819,11 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
 
-        // Restore guest handle in response so user-mode code reading it back
-        // gets what it originally wrote.
+        // Put the guest's handle back in place of our descriptor. It is not
+        // what user mode wrote -- that was its own descriptor, which never
+        // reached us -- so the guest driver writes the caller's value over it
+        // on the way out (nvgpu_ioctl_translate_fd); RM never writes the
+        // field (escape.c:393-428, 584-624), and callers read it back.
         param_buf[fd_offset..fd_offset + 4].copy_from_slice(&(guest_embedded as i32).to_le_bytes());
 
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)

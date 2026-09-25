@@ -673,6 +673,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  /* The event descriptor NV0005 names, once swapped for a handle. */
+  int event_fd = -1;
   u32 used;
 
   if (sz < sizeof(params))
@@ -754,8 +756,6 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
       if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
           nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
-        int event_fd;
-
         memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
         if (event_fd >= 0) {
           u32 handle;
@@ -803,6 +803,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
     u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
 
+    /*
+     * The event's `data` comes back holding the backend's handle, which
+     * the backend restored in place of its own descriptor; the caller passed
+     * its descriptor, and RM leaves the field alone, so that is what goes
+     * back -- on a failed RM status too.
+     */
+    if (event_fd >= 0 && copy_back >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32))
+      memcpy(resp_buf + sizeof(*resp) + sizeof(params) +
+                 NVGPU_NV0005_DATA_OFFSET,
+             &event_fd, sizeof(event_fd));
     if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back) &&
         copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))
@@ -817,9 +827,14 @@ out:
 
 /*
  * An ioctl the device's config names as carrying a descriptor at a fixed
- * offset of its argument. The backend puts its own descriptor there for the
- * call and our value back before it answers (nvidia.rs:2169-2171), so the
- * caller reads back what it passed.
+ * offset of its argument. This swaps the caller's descriptor for the handle
+ * the backend issued for that file; the backend swaps the handle for its own
+ * descriptor for the call and puts the *handle* back (dispatch_fd_carrying,
+ * dispatch_map_memory), since it never saw the caller's number. So the
+ * caller's descriptor goes back here, on every reply that carries the struct,
+ * an RM-status failure included: RM never writes the field (escape.c:393-428,
+ * 584-624), so native userspace reads back exactly what it passed, and
+ * envyhooks keys its mmap tracking by that value and unwrap()s the lookup.
  */
 static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                                      void __user *uarg, unsigned int sz,
@@ -906,6 +921,9 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                  : 0;
   if (ret == 0 && data_len > 0 && data_len <= sz &&
       nvgpu_resp_has(used, sizeof(*resp), data_len)) {
+    if (data_len >= payload_offset + sizeof(guest_fd))
+      memcpy(resp_buf + sizeof(*resp) + payload_offset, &guest_fd,
+             sizeof(guest_fd));
     if (copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
       ret = -EFAULT;
   }
