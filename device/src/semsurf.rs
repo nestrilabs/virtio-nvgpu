@@ -1696,6 +1696,9 @@ mod backend_tests {
     #[test]
     fn an_event_buffer_is_allocated_only_on_a_live_os_event() {
         let (mut be, ctl) = backend();
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let outer = nvos64(CLIENT, 0x5b, NV_EVENT_BUFFER, 0x7000, 72);
         let with = |event: u64| {
             let mut n = [0u8; 72];

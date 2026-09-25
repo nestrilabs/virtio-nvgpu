@@ -1,9 +1,10 @@
 //! RM controls the backend answers itself, without asking the host.
 //!
-//! RM_CONTROL is forwarded without an allowlist (the tallies in `tally.rs`
-//! are what one will be written from), so every control a host process could
-//! call, an unprivileged guest process can call too -- as the backend, a
-//! client of the host's RM like any other. Most controls say something only
+//! An RM control the host release's allowlist has (`rmallow.rs`) is one any
+//! unprivileged host process could call, and an unprivileged guest process
+//! calls it as the backend, a client of the host's RM like any other. These
+//! are answered here, before that list is consulted, with RM's own answer
+//! to a caller without the privilege. Most controls say something only
 //! about the guest's own objects or about the GPU. These say something about
 //! every other client of the GPU on the host (S-24): the host PIDs of the
 //! host compositor, of other VMs' backends and of host CUDA jobs, and per PID

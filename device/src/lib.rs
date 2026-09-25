@@ -30,6 +30,7 @@ pub mod pump;
 pub mod quota;
 pub mod ratelimit;
 pub mod replay;
+pub mod rmallow;
 pub mod rmctl;
 pub mod rmmem;
 pub mod rmshare;
