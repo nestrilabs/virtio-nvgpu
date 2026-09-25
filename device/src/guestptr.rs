@@ -159,8 +159,28 @@ pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
 /// - 0xc1 NV_FB_SEGMENT: page arrays and CPU addresses (cl00c1.h:50-58).
 /// - 0x0092 NV0092_RG_LINE_CALLBACK, 0x9010 NV9010_VBLANK_CALLBACK: kernel
 ///   function pointers (cl0092.h:68, cl9010.h:39); kernel-privileged in RM.
-pub const REFUSED_ALLOC_CLASSES: [u32; 9] =
-    [0x71, 0x78, 0x7e, 0x81, 0x82, 0x83, 0xc1, 0x0092, 0x9010];
+/// - 0xf1 NV_IMEX_SESSION, 0xf9 NV_MEMORY_FABRIC_IMPORT_V2, 0xfd
+///   NV_MEMORY_MULTICAST_FABRIC: `pOsEvent` is an OS event by descriptor,
+///   which RM looks up in the backend's event list under hClient
+///   (osUserHandleToKernelPtr, os.c:1789-1815; imex_session_api.c:278,
+///   mem_fabric_import_v2.c:458, mem_multicast_fabric.c:478), and none of
+///   the three could work if it were translated like NV_EVENT_BUFFER's.
+///   An IMEX session makes its caller the host's one IMEX daemon
+///   (fabricSetImexEvent: "only one IMEX instance listening to events"),
+///   holding NV_RM_CAP_SYS_FABRIC_IMEX_MGMT through `capDescriptor`, a
+///   second descriptor, of a /dev/nvidia-caps node: host-wide fabric
+///   management, never a VM's. A fabric import, and a multicast object made
+///   from an export packet, need the client subscribed to an IMEX channel
+///   (mem_fabric_import_v2.c:600, mem_multicast_fabric.c:1343), which
+///   NV0000_CTRL_CMD_CLIENT_SUBSCRIBE_TO_IMEX_CHANNEL does from a
+///   /dev/nvidia-caps-imex-channels descriptor the backend never holds. A
+///   prime multicast object (cuMulticastCreate) needs an NVSwitch fabric the
+///   hosts this serves do not have, and its ATTACH_GPU names a GPU by yet
+///   another descriptor (ctrl00fd.h). So they are refused whole rather than
+///   half translated.
+pub const REFUSED_ALLOC_CLASSES: [u32; 12] = [
+    0x71, 0x78, 0x7e, 0x81, 0x82, 0x83, 0xc1, 0x0092, 0x9010, 0xf1, 0xf9, 0xfd,
+];
 
 /// ALLOC_MEMORY classes whose `pMemory` RM reads rather than writes.
 const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 4] = [0x71, 0x81, 0x82, 0x83];
@@ -489,6 +509,18 @@ mod tests {
         let mut p = vec![0u8; 48];
         put32(&mut p, OS64_CLASS, 0x3e);
         assert!(rm_escape(ALLOC, &mut p).is_ok(), "plain system memory");
+    }
+
+    /// IMEX and fabric memory name an OS event by descriptor (pOsEvent), and
+    /// what they are for -- the host's IMEX daemon, memory over an NVLink
+    /// fabric -- is not a VM's to have: none reaches the host.
+    #[test]
+    fn imex_sessions_and_fabric_memory_are_never_allocated() {
+        for class in [0xf1, 0xf9, 0xfd] {
+            let mut p = vec![0u8; 48];
+            put32(&mut p, OS64_CLASS, class);
+            assert_eq!(rm_escape(ALLOC, &mut p), Err(libc::EPERM), "class {class:#x}");
+        }
     }
 
     #[test]
