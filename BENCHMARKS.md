@@ -128,6 +128,38 @@ with p99 spacing of 18.0 ms. An earlier version of this file reported 53 and
 called it an open question; that was a bug of ours in the event queue, described
 below, and not a property of the design.
 
+## A real game, on an A2000
+
+Slime Rancher 2 under Proton, played by a person for about 15 minutes and
+streamed to a client at 1920×1080@60 in H.265 10-bit, 6 Mbps CBR, captured and
+encoded on the game's own device. RTX A2000 (70 W) at **615.71.09**, an
+i7-8700K host with 12 threads, one guest with 6 vCPUs and 16 GiB. The game's
+swapchain is FIFO at 1920×1080.
+
+GPU from `nvidia-smi dmon` every second (medians), CPU from each process's
+`utime + stime` every 5 s (averages over the window). Where a cell has two
+figures, they are the two client connections:
+
+| | GPU busy | NVENC | power | VM process | backend | whole host |
+|---|---|---|---|---|---|---|
+| streaming to a client, 10 min | 39–41% | 9–10% | 42–65 W | 2.10–2.33 cores | **0.18 cores** | 3.65–4.00 of 12 |
+| game running, nobody connected, 3 min | 40% | 9% | 58 W | 2.31 cores | 0.18 cores | 3.93 of 12 |
+
+- **The card is not the limit.** A 60 Hz FIFO game holds the GPU at about 40%,
+  with headroom.
+- **Forwarding costs 0.18 of a core** under a real game, flat across the
+  session. That is the backend alone; the VM process is everything in the
+  guest — game, Proton, compositor, capture and encode.
+- **Encode is about 10% of NVENC** at 1080p60 10-bit, rising to 20–26% for a
+  few seconds around a reconnect.
+- **No throttling.** 718 of 720 seconds show no power violation, and none show
+  a thermal one.
+
+What this does **not** support: an overhead figure. The game was not run on the
+host directly, so none of these numbers is a cost of virtualisation — they are
+what one streamed game uses on this card. Frame rate and frame pacing were not
+recorded.
+
 ## Re-taking these
 
 The harnesses are in the private engineering notes rather than here, because
@@ -157,10 +189,11 @@ slower each run — and that is how a harness bug here cost a full set of number
 - **No comparison with another hypervisor.** None was run. "Faster than X" is
   not a claim this data can carry, and neither is "the fastest".
 - **Four guests, not "many".** Four ran; eight has not been tried, and neither
-  has a guest doing something heavier than vkcube at 720p.
-- **No claim about a real game.** `nesprobe` is synthetic; the only real
-  pipeline here is our own encode chain.
-- **One card, one driver.** RTX 3060 at **595.99.02**, which resolves to the
-  `595.71.05` ABI profile. An RTX A2000 at **615.71.09** renders but has not
-  been benchmarked. The shipped profiles are 535.129.03, 580.178.04 and
-  595.71.05, and a version older than the first is refused — see the README.
+  have four guests running a real game.
+- **No overhead figure for a real game.** `nesprobe` is synthetic. One game has
+  been streamed, on the A2000, and what it uses is above — but it has no
+  bare-metal run beside it.
+- **One card against bare metal.** RTX 3060 at **595.99.02**, which resolves to
+  the `595.71.05` ABI profile. An RTX A2000 at **615.71.09** has resource
+  numbers from one game and no bare-metal comparison. The shipped profiles
+  are 535.129.03, 580.178.04 and 595.71.05, and a version older than the first is refused — see the README.

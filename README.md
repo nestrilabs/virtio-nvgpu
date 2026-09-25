@@ -64,9 +64,11 @@ Four is what was run, not a limit found.
 
 ### Driver versions
 
-Measured on **595.99.02**; an A2000 on **615.71.09** renders but is not
-benchmarked. ABI profiles shipped: 535.129.03, 580.178.04, 595.71.05, matched by
-range, with anything older than the first refused. Details below.
+Measured against bare metal on **595.99.02**. An A2000 on **615.71.09**
+presents, encodes and has streamed a real game — its resource use is in
+[`BENCHMARKS.md`](BENCHMARKS.md), but it has no bare-metal comparison. ABI
+profiles shipped: 535.129.03, 580.178.04, 595.71.05, matched by range, with
+anything older than the first refused. Details below.
 
 ### What is known to work
 
@@ -108,10 +110,15 @@ memory — and for mutually untrusted tenants that or vGPU is still the answer.
 
 ### What is not done
 
-- **more than four guests**, or guests doing anything heavier than vkcube at
-  720p. Four share the card evenly; eight has not been tried.
-- **two cards, two driver versions.** RTX 3060 / 595.99.02 is where the numbers
-  come from; an RTX A2000 / 615.71.09 has rendered but is not benchmarked.
+- **more than four guests**, or more than one guest running a real game. Four
+  vkcubes at 720p share the card evenly; one guest has streamed a game; eight
+  has not been tried.
+- **a bare-metal comparison on a second card.** RTX 3060 / 595.99.02 is where
+  the overhead numbers come from. An RTX A2000 / 615.71.09 has streamed a game
+  for about 15 minutes, but the game was not run on its host directly.
+- **one of two game launches on the A2000 lost its capture**: the swapchain
+  refused `TRANSFER_SRC`, so nothing was encoded, and a relaunch worked. The
+  error code was not recorded and the cause is not known.
 - CUDA is forwarded but untested beyond enumeration; the jailer, per-version
   driver shares and the multi-tenant envelope are unbuilt.
 
@@ -369,10 +376,11 @@ driver misbehaves.
 
 | version | card | how far it got |
 |---|---|---|
-| **595.99.02** | RTX 3060 | everything — renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
-| **615.71.09** | RTX A2000 | enumerates and renders; not benchmarked, and not re-tested since |
+| **595.99.02** | RTX 3060 | everything — renders, presents, encodes, and every bare-metal comparison in [`BENCHMARKS.md`](BENCHMARKS.md) |
+| **615.71.09** | RTX A2000 | renders, presents, encodes, and has streamed a real game; resource use measured, no bare-metal comparison |
 
-Two cards, two versions, one of them thoroughly. Anything else is untested.
+Two cards, two versions, one of them compared against bare metal. Anything
+else is untested.
 
 ### How a profile is built
 
