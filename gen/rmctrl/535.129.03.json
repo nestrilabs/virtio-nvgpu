@@ -1,0 +1,551 @@
+{
+ "format": "virtio-nvgpu/rmctrl-pointers/1",
+ "version": "535.129.03",
+ "abi": "x86_64 LP64",
+ "source": {
+  "tag": "535.129.03",
+  "commit": "e573018659734be4add3e5ab3e0ad94602498ca4",
+  "url": "https://codeload.github.com/NVIDIA/open-gpu-kernel-modules/tar.gz/refs/tags/535.129.03",
+  "tarball_sha256": "170ee91b6cd6c801bba0de91e0d62af8e574adde38120bc762784755b5a9821d",
+  "files": 765
+ },
+ "controls": [
+  {
+   "name": "NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION",
+   "cmd": 257,
+   "from": "deprecated",
+   "params_size": 40,
+   "pointers": [
+    {
+     "field": "pDriverVersionBuffer",
+     "offset": 8
+    },
+    {
+     "field": "pVersionBuffer",
+     "offset": 16
+    },
+    {
+     "field": "pTitleBuffer",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS",
+   "cmd": 295,
+   "from": "embedded",
+   "params_size": 168,
+   "pointers": [
+    {
+     "field": "busPeerIds",
+     "offset": 160
+    }
+   ]
+  },
+  {
+   "name": "NV0000_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD",
+   "cmd": 304,
+   "from": "embedded",
+   "params_size": 40,
+   "pointers": [
+    {
+     "field": "inData",
+     "offset": 8
+    },
+    {
+     "field": "outData",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV0000_CTRL_CMD_NVD_GET_DUMP",
+   "cmd": 1538,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "pBuffer",
+     "offset": 0
+    }
+   ]
+  },
+  {
+   "name": "NV0041_CTRL_CMD_GET_SURFACE_INFO",
+   "cmd": 4260112,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "surfaceInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0073_CTRL_CMD_SYSTEM_EXECUTE_ACPI_METHOD",
+   "cmd": 7537000,
+   "from": "embedded",
+   "params_size": 40,
+   "pointers": [
+    {
+     "field": "inData",
+     "offset": 8
+    },
+    {
+     "field": "outData",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV0073_CTRL_CMD_DP_SET_MSA_PROPERTIES",
+   "cmd": 7541610,
+   "from": "deprecated",
+   "params_size": 64,
+   "pointers": [
+    {
+     "field": "pFeatureDebugValues",
+     "offset": 56
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_GPU_GET_CLASSLIST",
+   "cmd": 8389121,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "classList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_GR_GET_CAPS",
+   "cmd": 8392962,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_GR_GET_INFO",
+   "cmd": 8392964,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "grInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_FB_GET_CAPS",
+   "cmd": 8393473,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_HOST_GET_CAPS",
+   "cmd": 8393729,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_FIFO_GET_CAPS",
+   "cmd": 8394497,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_FIFO_START_SELECTED_CHANNELS",
+   "cmd": 8394501,
+   "from": "embedded",
+   "params_size": 48,
+   "pointers": [
+    {
+     "field": "fifoStartChannelList",
+     "offset": 40
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST",
+   "cmd": 8394509,
+   "from": "embedded",
+   "params_size": 24,
+   "pointers": [
+    {
+     "field": "pChannelHandleList",
+     "offset": 8
+    },
+    {
+     "field": "pChannelList",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_DMA_UPDATE_PDE_2",
+   "cmd": 8394767,
+   "from": "embedded",
+   "params_size": 64,
+   "pointers": [
+    {
+     "field": "pPdeBuffer",
+     "offset": 48
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_MSENC_GET_CAPS",
+   "cmd": 8395521,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV0080_CTRL_CMD_BSP_GET_CAPS",
+   "cmd": 8395777,
+   "from": "deprecated",
+   "params_size": 24,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_GPU_GET_INFO",
+   "cmd": 545259777,
+   "from": "deprecated",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "gpuInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS",
+   "cmd": 545259810,
+   "from": "embedded",
+   "params_size": 48,
+   "pointers": [
+    {
+     "field": "regOps",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_GPU_GET_ENGINES",
+   "cmd": 545259811,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "engineList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_GPU_GET_ENGINE_CLASSLIST",
+   "cmd": 545259812,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "classList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_I2C_ACCESS",
+   "cmd": 545261072,
+   "from": "embedded",
+   "params_size": 40,
+   "pointers": [
+    {
+     "field": "data",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_BIOS_GET_INFO",
+   "cmd": 545261570,
+   "from": "embedded+deprecated",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "biosInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_BIOS_GET_NBSI",
+   "cmd": 545261571,
+   "from": "embedded",
+   "params_size": 1064,
+   "pointers": [
+    {
+     "field": "retBuf",
+     "offset": 1048
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_BIOS_GET_NBSI_OBJ",
+   "cmd": 545261574,
+   "from": "embedded",
+   "params_size": 40,
+   "pointers": [
+    {
+     "field": "retBuf",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_GR_GET_INFO",
+   "cmd": 545264129,
+   "from": "embedded",
+   "params_size": 32,
+   "pointers": [
+    {
+     "field": "grInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_FB_GET_INFO",
+   "cmd": 545264385,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "fbInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_FB_GET_AMAP_CONF",
+   "cmd": 545264438,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "pAmapConfParams",
+     "offset": 0
+    },
+    {
+     "field": "pCbcSwizzleParams",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_FB_GET_CLIENT_ALLOCATION_INFO",
+   "cmd": 545264457,
+   "from": "self-copy",
+   "params_size": 32,
+   "pointers": [
+    {
+     "field": "pAllocInfo",
+     "offset": 8
+    },
+    {
+     "field": "pClientInfo",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_BUS_GET_INFO",
+   "cmd": 545265666,
+   "from": "embedded+deprecated",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "busInfoList",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_RC_READ_VIRTUAL_MEM",
+   "cmd": 545268228,
+   "from": "embedded",
+   "params_size": 32,
+   "pointers": [
+    {
+     "field": "bufferPtr",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_NVD_GET_DUMP",
+   "cmd": 545268738,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "pBuffer",
+     "offset": 0
+    }
+   ]
+  },
+  {
+   "name": "NV2080_CTRL_CMD_CE_GET_CAPS",
+   "cmd": 545270273,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "capsTbl",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NV402C_CTRL_CMD_I2C_INDEXED",
+   "cmd": 1076625666,
+   "from": "embedded",
+   "params_size": 32,
+   "pointers": [
+    {
+     "field": "pMessage",
+     "offset": 24
+    }
+   ]
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_DEBUG_READ_MEMORY",
+   "cmd": 2212365077,
+   "from": "embedded",
+   "params_size": 24,
+   "pointers": [
+    {
+     "field": "buffer",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY",
+   "cmd": 2212365078,
+   "from": "embedded",
+   "params_size": 24,
+   "pointers": [
+    {
+     "field": "buffer",
+     "offset": 16
+    }
+   ]
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_DEBUG_READ_BATCH_MEMORY",
+   "cmd": 2212365094,
+   "from": "embedded",
+   "params_size": 3616,
+   "pointers": [
+    {
+     "field": "pData",
+     "offset": 0
+    }
+   ]
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_DEBUG_WRITE_BATCH_MEMORY",
+   "cmd": 2212365095,
+   "from": "embedded",
+   "params_size": 3616,
+   "pointers": [
+    {
+     "field": "pData",
+     "offset": 0
+    }
+   ]
+  },
+  {
+   "name": "NVB06F_CTRL_CMD_GET_ENGINE_CTX_DATA",
+   "cmd": 2960064780,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "pEngineCtxBuff",
+     "offset": 8
+    }
+   ]
+  },
+  {
+   "name": "NVB06F_CTRL_CMD_MIGRATE_ENGINE_CTX_DATA",
+   "cmd": 2960064781,
+   "from": "embedded",
+   "params_size": 16,
+   "pointers": [
+    {
+     "field": "pEngineCtxBuff",
+     "offset": 8
+    }
+   ]
+  }
+ ],
+ "refused": [
+  {
+   "name": "NV402C_CTRL_CMD_I2C_TRANSACTION",
+   "cmd": 1076625669,
+   "why": "pMessage sits at a different offset in each arm of a union selected by transType, over plain fields of the other arms (_i2cTransactionCopyIn)"
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_READ_SURFACE",
+   "cmd": 2212365082,
+   "why": "an array of up to MAX_ACCESS_OPS ops, each with its own pCpuVA (kernel_sm_debugger_session_ctrl.c)"
+  },
+  {
+   "name": "NV83DE_CTRL_CMD_WRITE_SURFACE",
+   "cmd": 2212365083,
+   "why": "an array of up to MAX_ACCESS_OPS ops, each with its own pCpuVA (kernel_sm_debugger_session_ctrl.c)"
+  }
+ ]
+}

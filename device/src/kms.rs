@@ -717,7 +717,8 @@ impl NvidiaBackend {
             }
         };
         match self.handles.bury(h, stub) {
-            Ok(old) => drop(old),
+            // A lease file's last close is a master drop (closer.rs).
+            Ok(old) => crate::closer::close(old),
             Err(e) => {
                 log::warn!("lease handle {h}: {e}");
                 return;

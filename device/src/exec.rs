@@ -86,7 +86,17 @@ impl ExecPool {
         if first && !st.running.contains(&file) {
             st.ready.push_back(file);
         }
-        if st.idle == 0 && st.threads < self.shared.max_threads {
+        // Spawn when the files waiting for a thread outnumber the workers that
+        // can still take one. `idle` counts a worker from the moment it waits
+        // until it has the lock back, so a worker already woken by an earlier
+        // submit still counts as idle here; it will take one file and then run
+        // that file's job to the end. Testing `idle == 0` instead let a second
+        // submit in that window spawn nothing and lose its notify, and the
+        // second file then waited behind the first file's job -- a three
+        // second commit, say -- with threads to spare (S-27). Comparing counts
+        // over-spawns at worst, when a busy worker would have come back for
+        // the file soon anyway; `max_threads` still bounds it.
+        if st.ready.len() > st.idle && st.threads < self.shared.max_threads {
             st.threads += 1;
             let shared = self.shared.clone();
             let spawned = std::thread::Builder::new()
@@ -208,6 +218,33 @@ mod tests {
         pool.submit(2, Box::new(move |_| done_tx.send(2).unwrap()));
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(2));
         gate_tx.send(()).unwrap();
+    }
+
+    /// A worker woken for one file still counts as idle until it has the
+    /// lock back; a second file submitted in that window must get a thread
+    /// of its own rather than wait behind the first file's job.
+    #[test]
+    fn a_second_file_submitted_while_the_idle_worker_wakes_is_not_left_behind() {
+        for _ in 0..100 {
+            let pool = ExecPool::new(4);
+            let (warm_tx, warm_rx) = channel();
+            pool.submit(99, Box::new(move |_| warm_tx.send(()).unwrap()));
+            warm_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Let the one worker go back to waiting: exactly one idle.
+            while pool.shared.state.lock().unwrap().idle != 1 {
+                std::thread::yield_now();
+            }
+            let (gate_tx, gate_rx) = channel::<()>();
+            let (done_tx, done_rx) = channel();
+            pool.submit(1, Box::new(move |_| gate_rx.recv().unwrap()));
+            pool.submit(2, Box::new(move |_| done_tx.send(2).unwrap()));
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(5)),
+                Ok(2),
+                "file 2 waited behind file 1's blocked job"
+            );
+            gate_tx.send(()).unwrap();
+        }
     }
 
     #[test]

@@ -71,3 +71,36 @@ at 64.
 A fixture is only evidence for the driver version and architecture that
 produced it. RM class IDs are per-architecture, so a Turing capture says
 nothing about Ampere's channel classes.
+
+## RM control pointers
+
+`rmctrl_extract.py` measures, per release, where RM follows a user pointer
+inside an RM_CONTROL's parameters. The backend is the caller of every
+forwarded control, so each such pointer is an address in *its* process, and
+`device/src/guestptr.rs` zeroes every one the guest did not send the data
+for; this is the table it does that from.
+
+The commands and fields come from RM's own sources: each `case` of
+`embeddedParamCopyIn` (embedded_param_copy.c) with its
+`RMAPI_PARAM_COPY_INIT` calls, each converter of the deprecated V1 control
+table (rmapi_deprecated_control.c) with its user copies, and a short
+hand-written list of handlers that copy user memory themselves (`SELF_COPY`)
+or whose pointers have no fixed place (`REFUSED`). The offsets come from a C
+probe compiled against the release's SDK headers, and every field is checked
+to be an 8-byte NvP64. The extractor refuses to write anything if the release
+has an RM `.c` file that calls a user-copy primitive and none of those
+entries account for it (`KNOWN_USER_COPY_FILES`): a new handler that follows
+a pointer fails the run instead of being missed.
+
+```sh
+./rmctrl_extract.py all      # fetch + measure every release, render the table
+./rmctrl_extract.py check    # re-measure and fail if gen/rmctrl/ is stale
+./rmctrl_extract.py render   # gen/rmctrl/*.json -> src/rmctrl/generated.rs
+```
+
+`gen/rmctrl/<version>.json` holds each release's measurement;
+`src/rmctrl/generated.rs` is their union (a command whose pointers differ
+between releases lists all of them). `render` is pure Python, and the Rust
+test `the_checked_in_table_is_what_the_extractor_renders` runs it, as the
+schema's does. Sources are cached in `$RMCTRL_EXTRACT_CACHE` (default
+`$TMPDIR/ogkm-rm`).

@@ -155,8 +155,145 @@ pub enum Outcome {
     Ioctl2(PendingIoctl2),
 }
 
+/// Work the queue thread must not wait for, between `prepare` and `finish`:
+/// an IOCTL2, or one of the two HOST_OPs that can take the display's locks
+/// (see [`KmsCall`]).
+pub struct PendingIoctl2(Pending);
+
+enum Pending {
+    Ioctl2(Ioctl2Call),
+    Kms(KmsCall),
+}
+
+impl PendingIoctl2 {
+    /// The executor queue this call belongs on, or `None` to run it inline on
+    /// the queue thread.
+    pub fn executor_key(&self) -> Option<u64> {
+        match &self.0 {
+            Pending::Ioctl2(c) => c.executor_key(),
+            Pending::Kms(k) => Some(k.executor_key()),
+        }
+    }
+
+    /// The answer for a call that a session reset withdrew before it ran.
+    /// Consumes the call, closing every descriptor it held.
+    pub fn cancelled_reply(self) -> Reply {
+        match self.0 {
+            Pending::Ioctl2(c) => c.cancelled_reply(),
+            Pending::Kms(k) => k.cancelled_reply(),
+        }
+    }
+
+    /// Run the host side. Takes no lock; may block for as long as the host
+    /// call does.
+    pub fn execute(&mut self) {
+        match &mut self.0 {
+            Pending::Ioctl2(c) => c.execute(),
+            Pending::Kms(k) => k.execute(),
+        }
+    }
+}
+
+/// Executor keys for work that has no host file of its own yet: one serial
+/// queue per card, above every handle's (handles are u32).
+const CARD_KEY: u64 = 1 << 32;
+
+/// OPEN_KMS and DROP_IF_MASTER (S-34). Neither is the quick call it looks
+/// like. Opening a card node while the host has no master makes the new file
+/// master (drm_master_open), and nvidia-drm's master_set then grabs NVKMS
+/// ownership under nvkms_lock (nvidia-drm-drv.c:954-966), behind any other
+/// client's SET_MODE or FLIP. Dropping master runs nv_drm_master_drop:
+/// mode_config.mutex, every modeset lock, a disable-all commit and
+/// releaseOwnership (nvidia-drm-drv.c:1038-1068). On the queue thread either
+/// stalled every RM call of the VM behind the display. So they run on an
+/// executor like a card IOCTL2: DROP_IF_MASTER in the file's own queue, after
+/// whatever it already has queued; OPEN_KMS, which has no file yet, in a
+/// queue per card. The new file is adopted under the backend lock only when
+/// the job finishes, so a session reset in between closes it instead.
+struct KmsCall {
+    op: KmsOp,
+    generation: u64,
+    req_id: u32,
+}
+
+enum KmsOp {
+    Open {
+        card: u32,
+        path: String,
+        opened: Option<Result<OwnedFd, i32>>,
+    },
+    DropIfMaster {
+        handle: u32,
+        /// A duplicate, so a CLOSE racing the job cannot pull the file away.
+        fd: OwnedFd,
+        dropped: bool,
+    },
+}
+
+impl KmsCall {
+    fn executor_key(&self) -> u64 {
+        match &self.op {
+            KmsOp::Open { card, .. } => CARD_KEY | u64::from(*card),
+            KmsOp::DropIfMaster { handle, .. } => u64::from(*handle),
+        }
+    }
+
+    fn cancelled_reply(self) -> Reply {
+        match self.op {
+            KmsOp::Open {
+                opened: Some(Ok(fd)),
+                ..
+            } => crate::closer::close(fd),
+            KmsOp::DropIfMaster { fd, .. } => crate::closer::close(fd),
+            KmsOp::Open { .. } => {}
+        }
+        Reply {
+            bytes: hdr(MsgType::HostOp, 0, -libc::ECANCELED, self.req_id),
+            ..Reply::default()
+        }
+    }
+
+    fn execute(&mut self) {
+        match &mut self.op {
+            KmsOp::Open { path, opened, .. } => {
+                // A card file the guest just closed may still be closing
+                // (closer.rs); if it was master, the file opened now must
+                // find master free, as it would natively once close()
+                // returned.
+                if !crate::closer::wait_idle(std::time::Duration::from_secs(3)) {
+                    log::warn!("OPEN_KMS: earlier closes still running after 3 s; opening anyway");
+                }
+                *opened = Some(open_card(path));
+            }
+            KmsOp::DropIfMaster { fd, dropped, .. } => {
+                *dropped = hostfd::drop_master(fd.as_raw_fd());
+            }
+        }
+    }
+}
+
+/// Open a card node for KMS: O_NONBLOCK, as every DRM-class file the pump
+/// reads is (hostfd::set_nonblock).
+fn open_card(path: &str) -> Result<OwnedFd, i32> {
+    let c = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    // SAFETY: a NUL-terminated path; the descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        log::warn!("OPEN_KMS: {path}: {e}");
+        return Err(errno_of(&e));
+    }
+    // SAFETY: a descriptor open() just returned.
+    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+}
+
 /// An IOCTL2 between `prepare` and `finish`.
-pub struct PendingIoctl2 {
+struct Ioctl2Call {
     prepared: xfer::Prepared,
     /// A duplicate of the target's descriptor: the call owns it for as long
     /// as it runs, so a CLOSE racing it cannot pull the file away.
@@ -168,27 +305,25 @@ pub struct PendingIoctl2 {
     cap: usize,
 }
 
-impl PendingIoctl2 {
+impl Ioctl2Call {
     /// The executor queue this call belongs on, or `None` to run it inline on
     /// the queue thread. Card, lease and modeset calls always go to an
     /// executor, whatever the schema says: the queue thread must never wait
     /// on a modeset lock or `nvkms_lock`.
-    pub fn executor_key(&self) -> Option<u64> {
+    fn executor_key(&self) -> Option<u64> {
         self.executor.then_some(self.target as u64)
     }
 
     /// The answer for a call that a session reset withdrew before it ran.
     /// Consumes the call, closing every descriptor it held.
-    pub fn cancelled_reply(self) -> Reply {
+    fn cancelled_reply(self) -> Reply {
         Reply {
             bytes: hdr(MsgType::Ioctl2, 0, -libc::ECANCELED, self.req_id),
             ..Reply::default()
         }
     }
 
-    /// Run the host side. Takes no lock; may block for as long as the host
-    /// call does.
-    pub fn execute(&mut self) {
+    fn execute(&mut self) {
         let ret = self.prepared.execute(self.target_fd.as_raw_fd());
         log::debug!(
             "IOCTL2 {:#x} on handle {}: host returned {ret}",
@@ -361,7 +496,10 @@ impl NvidiaBackend {
             }),
             MsgType::Watch => self.serve_watch(payload),
             MsgType::Unwatch => self.serve_unwatch(payload),
-            MsgType::HostOp => self.serve_host_op(payload),
+            MsgType::HostOp => match self.serve_host_op(payload) {
+                Ok(o) => return o,
+                Err(e) => Err(e),
+            },
             MsgType::Ioctl2 => return self.serve_ioctl2(payload, cap),
             _ => Err(libc::EPROTO),
         };
@@ -430,7 +568,7 @@ impl NvidiaBackend {
         Ok(self.ok_reply(0, &[]))
     }
 
-    fn serve_host_op(&mut self, payload: &[u8]) -> Result<Reply, i32> {
+    fn serve_host_op(&mut self, payload: &[u8]) -> Result<Outcome, i32> {
         let req = read::<HostOpReq>(payload).ok_or(libc::EINVAL)?;
         let nodes = self.host_nodes();
         let cards = self.config.kms_card.then_some(nodes.cards.as_slice());
@@ -438,6 +576,27 @@ impl NvidiaBackend {
         let op = hostfd::check_host_op(&req, &|h| handles.kind(h), cards).inspect_err(|e| {
             log::warn!("HOST_OP {} refused before running: errno {e}", req.op);
         })?;
+        // The two that can wait on the display go to an executor (KmsCall).
+        let kms = match op {
+            HostOp::OpenKms { card, .. } => Some(KmsOp::Open {
+                card,
+                path: nodes.cards[card as usize].path(),
+                opened: None,
+            }),
+            HostOp::DropIfMaster { card } => Some(KmsOp::DropIfMaster {
+                handle: card,
+                fd: self.handles.dup(card).ok_or(libc::EBADF)?.0,
+                dropped: false,
+            }),
+            _ => None,
+        };
+        if let Some(op) = kms {
+            return Ok(Outcome::Ioctl2(PendingIoctl2(Pending::Kms(KmsCall {
+                op,
+                generation: self.session.generation,
+                req_id: self.current_req_id,
+            }))));
+        }
         let (res, created) = self.run_host_op(op).inspect_err(|e| {
             log::warn!("HOST_OP {} failed on the host: errno {e}", req.op);
         })?;
@@ -447,10 +606,10 @@ impl NvidiaBackend {
             res: [0; OP_MAX_RES],
         };
         resp.res[..res.len()].copy_from_slice(&res);
-        Ok(Reply {
+        Ok(Outcome::Reply(Reply {
             created,
             ..self.ok_reply(0, bytes_of(&resp))
-        })
+        }))
     }
 
     fn insert(&mut self, fd: OwnedFd, kind: HandleKind) -> Result<u32, i32> {
@@ -467,8 +626,9 @@ impl NvidiaBackend {
     /// Run a checked HOST_OP. Returns the result words and the handles made.
     ///
     /// Every op here is non-blocking on the host: PRIME export and import,
-    /// sync_file merges, DROP_MASTER and opening a card node take short
-    /// kernel locks and no display waits, so they run on the queue thread.
+    /// sync_file merges and eventfds take short kernel locks and no display
+    /// waits, so they run on the queue thread. OPEN_KMS and DROP_IF_MASTER
+    /// are not: they go to an executor (KmsCall) and never get here.
     fn run_host_op(&mut self, op: HostOp) -> Result<(Vec<u64>, Vec<u32>), i32> {
         let io = |e: std::io::Error| errno_of(&e);
         match op {
@@ -545,29 +705,8 @@ impl NvidiaBackend {
                 let h = self.insert(fd, HandleKind::SyncFile)?;
                 Ok((vec![h as u64], vec![h]))
             }
-            HostOp::OpenKms { card, .. } => {
-                let path = self.host_nodes().cards[card as usize].path();
-                let c = std::ffi::CString::new(path.clone()).map_err(|_| libc::EINVAL)?;
-                // SAFETY: a NUL-terminated path; the descriptor is owned below.
-                let fd = unsafe {
-                    libc::open(
-                        c.as_ptr(),
-                        libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                    )
-                };
-                if fd < 0 {
-                    let e = std::io::Error::last_os_error();
-                    log::warn!("OPEN_KMS: {path}: {e}");
-                    return Err(errno_of(&e));
-                }
-                // SAFETY: a descriptor open() just returned.
-                let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-                let h = self.insert(fd, HandleKind::DrmCard(card))?;
-                log::info!("OPEN_KMS: {path} -> handle {h}");
-                Ok((vec![h as u64], vec![h]))
-            }
-            HostOp::DropIfMaster { card } => {
-                Ok((vec![hostfd::drop_master(self.raw(card)?) as u64], vec![]))
+            HostOp::OpenKms { .. } | HostOp::DropIfMaster { .. } => {
+                unreachable!("serve_host_op sends these to an executor")
             }
             HostOp::SyncobjWatch { key, cookie } => Ok((self.syncobj_watch(key, cookie)?, vec![])),
             HostOp::CloseMany { handles } => {
@@ -671,7 +810,7 @@ impl NvidiaBackend {
         }
         let (target_fd, _) = self.handles.dup(target).ok_or(libc::EBADF)?;
         let executor = prepared.wants_executor() || class != SchemaClass::Render;
-        Ok(PendingIoctl2 {
+        Ok(PendingIoctl2(Pending::Ioctl2(Ioctl2Call {
             prepared,
             target_fd,
             target,
@@ -679,7 +818,7 @@ impl NvidiaBackend {
             generation: self.session.generation,
             req_id: self.current_req_id,
             cap,
-        })
+        })))
     }
 
     /// Adopt what an executed IOCTL2 produced, close what it consumed, and
@@ -687,7 +826,11 @@ impl NvidiaBackend {
     /// If the session was reset while the call ran, nothing is adopted: the
     /// descriptors are closed and the guest is told the call was cancelled.
     pub fn finish_ioctl2(&mut self, p: PendingIoctl2) -> Reply {
-        let PendingIoctl2 {
+        let call = match p.0 {
+            Pending::Ioctl2(c) => c,
+            Pending::Kms(k) => return self.finish_kms(k),
+        };
+        let Ioctl2Call {
             prepared,
             target_fd,
             target,
@@ -695,9 +838,11 @@ impl NvidiaBackend {
             req_id,
             cap,
             ..
-        } = p;
-        // Done with the host file; the handle table still has its own.
-        drop(target_fd);
+        } = call;
+        // Done with the host file; the handle table still has its own --
+        // unless a CLOSE raced the call, and then this is the last reference,
+        // dropped under the backend mutex (closer.rs, S-33).
+        crate::closer::close(target_fd);
         let stale = generation != self.session.generation;
         // A lease a guest lessor revoked through us: whatever the lessee's
         // handle granted is gone on the host (kms.rs, "lease ends").
@@ -739,6 +884,51 @@ impl NvidiaBackend {
             bytes,
             stamp_at: None,
             created,
+        }
+    }
+
+    /// Adopt what an OPEN_KMS job opened, or answer a DROP_IF_MASTER, under
+    /// the backend lock; after a session reset, close instead.
+    fn finish_kms(&mut self, k: KmsCall) -> Reply {
+        self.current_msg = MsgType::HostOp;
+        self.current_req_id = k.req_id;
+        let stale = k.generation != self.session.generation;
+        let (res, created) = match k.op {
+            KmsOp::DropIfMaster { fd, dropped, .. } => {
+                crate::closer::close(fd);
+                (dropped as u64, Vec::new())
+            }
+            KmsOp::Open {
+                card, path, opened, ..
+            } => match opened {
+                Some(Ok(fd)) if stale => {
+                    crate::closer::close(fd);
+                    (0, Vec::new())
+                }
+                Some(Ok(fd)) => match self.insert(fd, HandleKind::DrmCard(card)) {
+                    Ok(h) => {
+                        log::info!("OPEN_KMS: {path} -> handle {h}");
+                        (h as u64, vec![h])
+                    }
+                    Err(e) => return self.error_reply(e),
+                },
+                Some(Err(e)) => return self.error_reply(e),
+                None => return self.error_reply(libc::EIO),
+            },
+        };
+        if stale {
+            log::info!("HOST_OP finished after a session reset; discarded");
+            return self.error_reply(libc::ECANCELED);
+        }
+        let mut resp = HostOpResp {
+            nres: 1,
+            pad: 0,
+            res: [0; OP_MAX_RES],
+        };
+        resp.res[0] = res;
+        Reply {
+            created,
+            ..self.ok_reply(0, bytes_of(&resp))
         }
     }
 
@@ -1067,5 +1257,105 @@ mod tests {
         assert_eq!(r.created.len(), 1);
         be.close_handles(&r.created);
         assert_eq!(be.handle_count(), 0);
+    }
+
+    fn kms_backend() -> NvidiaBackend {
+        let mut be = backend();
+        be.set_config(BackendConfig {
+            kms_card: true,
+            ..BackendConfig::default()
+        });
+        hello(&mut be, HELLO_F_FRESH);
+        be
+    }
+
+    fn host_op_req(op: u32, args: &[u64]) -> Vec<u8> {
+        let mut req = HostOpReq {
+            op,
+            nargs: args.len() as u32,
+            args: [0; OP_MAX_ARGS],
+        };
+        req.args[..args.len()].copy_from_slice(args);
+        msg(MsgType::HostOp, 0, bytes_of(&req))
+    }
+
+    /// S-34: both can wait on nvkms_lock or every modeset lock, so neither
+    /// runs on the queue thread. DROP_IF_MASTER queues behind whatever its
+    /// file already has; OPEN_KMS, with no file yet, in its card's queue.
+    #[test]
+    fn open_kms_and_drop_if_master_run_on_an_executor() {
+        let mut be = kms_backend();
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let Outcome::Ioctl2(p) = be.serve(&host_op_req(OP_OPEN_KMS, &[render as u64, 0]), 4096)
+        else {
+            panic!("OPEN_KMS answered on the queue thread")
+        };
+        assert_eq!(p.executor_key(), Some(CARD_KEY));
+        let r = p.cancelled_reply();
+        assert_eq!(status(&r.bytes), -libc::ECANCELED);
+
+        let card = be.adopt_for_test(devnull(), HandleKind::DrmCard(0));
+        let Outcome::Ioctl2(mut p) =
+            be.serve(&host_op_req(OP_DROP_IF_MASTER, &[card as u64]), 4096)
+        else {
+            panic!("DROP_IF_MASTER answered on the queue thread")
+        };
+        assert_eq!(p.executor_key(), Some(card as u64));
+        p.execute();
+        let r = be.finish_ioctl2(p);
+        assert_eq!(status(&r.bytes), 0);
+        let resp = read::<HostOpResp>(&r.bytes[HDR..]).unwrap();
+        assert_eq!(
+            (resp.nres, resp.res[0]),
+            (1, 0),
+            "/dev/null was never master"
+        );
+    }
+
+    fn pipe_ends() -> (OwnedFd, OwnedFd) {
+        let mut p = [0i32; 2];
+        // SAFETY: `p` receives the two new descriptors.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: descriptors pipe2 just returned.
+        unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) }
+    }
+
+    fn opened(be: &NvidiaBackend, fd: OwnedFd) -> PendingIoctl2 {
+        PendingIoctl2(Pending::Kms(KmsCall {
+            op: KmsOp::Open {
+                card: 0,
+                path: "/dev/dri/card1".into(),
+                opened: Some(Ok(fd)),
+            },
+            generation: be.generation(),
+            req_id: 7,
+        }))
+    }
+
+    /// What OPEN_KMS opened is adopted only when the job finishes, and only
+    /// into the session it was asked in: after a reset it is closed, and the
+    /// guest hears the call was cancelled.
+    #[test]
+    fn an_open_kms_finishing_after_a_session_reset_is_closed_not_adopted() {
+        let mut be = kms_backend();
+        let (r, w) = pipe_ends();
+        let p = opened(&be, r);
+        be.session_reset("test");
+        let reply = be.finish_ioctl2(p);
+        assert_eq!(status(&reply.bytes), -libc::ECANCELED);
+        assert!(reply.created.is_empty());
+        assert_eq!(be.handle_count(), 0);
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        // SAFETY: a one-byte write from a live array.
+        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        assert_eq!(n, -1, "closed, not adopted");
+
+        let (r, _w) = pipe_ends();
+        let p = opened(&be, r);
+        let reply = be.finish_ioctl2(p);
+        assert_eq!(status(&reply.bytes), 0);
+        let h = read::<HostOpResp>(&reply.bytes[HDR..]).unwrap().res[0] as u32;
+        assert_eq!(reply.created, vec![h]);
+        assert_eq!(be.handles.kind(h), Some(HandleKind::DrmCard(0)));
     }
 }

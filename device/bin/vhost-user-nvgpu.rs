@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! qemu-system-x86_64 \
-//!   -chardev socket,id=nv,path=/tmp/nvgpu.sock \
+//!   -chardev socket,id=nv,path=$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock \
 //!   -device vhost-user-device-pci,virtio-id=45,num_vqs=2,chardev=nv \
 //!   -object memory-backend-memfd,id=mem,size=2G,share=on -numa node,memdev=mem
 //! ```
@@ -46,6 +46,7 @@ use clap::Parser;
 use device::exec::ExecPool;
 use device::host;
 use device::nvidia::NvidiaBackend;
+use device::posture;
 use device::privfd;
 use device::pump::{EventQueue, Fill, Pump, PumpCmd, PumpHandle};
 use device::session::{
@@ -83,9 +84,24 @@ const HDR: usize = size_of::<MsgHeader>();
 #[derive(Parser, Debug)]
 #[command(version, about = "vhost-user backend for virtio-nvgpu")]
 struct Args {
-    /// Unix socket QEMU connects to.
-    #[arg(long, default_value = "/tmp/nvgpu.sock")]
-    socket: String,
+    /// Unix socket the VMM connects to [default:
+    /// $XDG_RUNTIME_DIR/nvgpu/nvgpu.sock].
+    ///
+    /// Whoever listens here receives the guest's memory, so the default is
+    /// in a directory only this user can enter, and a file already at the
+    /// path is removed only if it is this user's socket
+    /// (device::posture).
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+
+    /// Start even as root or with CAP_SYS_ADMIN.
+    ///
+    /// RM, DRM and NVKMS take a guest's privilege from the backend's
+    /// credentials: as root every guest process is an RM administrator with
+    /// all of BAR0 mappable, which is the host kernel. Capabilities are
+    /// dropped at startup either way; this only lets the start happen.
+    #[arg(long)]
+    allow_root_unsafe: bool,
 
     /// Where the host driver publishes itself. Overridable for testing
     /// against a fixture tree rather than a live driver.
@@ -1016,12 +1032,67 @@ impl VhostUserBackendMut for NvGpuBackend {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Every call site metered (device::ratelimit): most of what is logged
+    // here is something a guest did, and a guest can do it in a loop.
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+    let max_level = logger.filter();
+    log::set_boxed_logger(Box::new(device::ratelimit::RateLimited::new(logger)))
+        .expect("the logger is set once, first thing");
+    log::set_max_level(max_level);
     let args = Args::parse();
+
+    // Before any thread exists: capabilities are per thread
+    // (device::posture, S-5).
+    // SAFETY: plain syscalls.
+    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    let caps = posture::Caps::current()?;
+    log::info!("credentials: uid {uid}, euid {euid}, capabilities {caps}");
+    if let Some(why) = posture::too_privileged(euid, &caps) {
+        if !args.allow_root_unsafe {
+            anyhow::bail!(
+                "refusing to start: {why}. RM, DRM and NVKMS take a guest's privilege from \
+                 the backend's, so every guest process would be an RM administrator with \
+                 BAR0 mappable read-write. Run the backend as an unprivileged user in the \
+                 video, render and kvm groups (scripts/run-guest.sh does), or pass \
+                 --allow-root-unsafe"
+            );
+        }
+        log::warn!(
+            "--allow-root-unsafe: starting although {why}; capabilities are dropped below, \
+             but files owned by root stay open to this process"
+        );
+    }
+    posture::drop_all_caps().map_err(|e| anyhow::anyhow!("dropping capabilities: {e}"))?;
+    posture::set_undumpable().map_err(|e| anyhow::anyhow!("PR_SET_DUMPABLE: {e}"))?;
+    // Nothing this process creates is for anyone else: the vhost-user
+    // socket among others.
+    // SAFETY: plain syscall.
+    unsafe { libc::umask(0o077) };
+    log::info!(
+        "capabilities now {}, no_new_privs set",
+        posture::Caps::current()?
+    );
+
+    let socket = match &args.socket {
+        Some(p) => p.clone(),
+        None => {
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            let p = posture::default_socket(runtime.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!("no --socket given and no XDG_RUNTIME_DIR to put one in")
+            })?;
+            let dir = p.parent().expect("the default has a directory");
+            posture::private_dir(dir, euid)
+                .map_err(|e| anyhow::anyhow!("socket directory: {e}"))?;
+            p
+        }
+    };
+    posture::clear_socket_path(&socket, euid)
+        .map_err(|e| anyhow::anyhow!("socket {}: {e}", socket.display()))?;
 
     log::info!(
         "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
-        args.socket
+        socket.display()
     );
 
     let abi_policy = if args.permissive_abi {
@@ -1135,10 +1206,12 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("create daemon: {e:?}"))?;
 
-    let _ = std::fs::remove_file(&args.socket);
+    // The path was cleared above (posture::clear_socket_path); serve's own
+    // removal finds nothing, and if someone else's socket appeared since,
+    // the bind fails rather than sharing the path.
     daemon
-        .serve(&args.socket)
-        .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", args.socket))?;
+        .serve(&socket)
+        .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", socket.display()))?;
 
     backend
         .read()

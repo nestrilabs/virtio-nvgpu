@@ -194,6 +194,17 @@ struct nvgpu_fd_translation_entry {
   __le32 payload_offset;
 } __packed;
 
+/*
+ * An entry whose nr has this bit set names a UVM command (the whole command
+ * number in the low bits, UVM numbers being plain) rather than an RM escape,
+ * and its payload_offset is packed: the descriptor's offset in bits 0-15 and
+ * the parameter block's size in bits 16-31, UVM numbers carrying no size and
+ * one offset depending on the host release (device/src/uvmfd.rs). A driver
+ * that predates it compares nr with an escape's 8-bit number and so never
+ * matches one.
+ */
+#define NVGPU_FDT_UVM 0x80000000u
+
 /* VMM config space layout */
 struct virtio_gpu_nv_config {
   char driver_version[32];               /* 0.. 32  */

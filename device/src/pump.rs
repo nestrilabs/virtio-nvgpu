@@ -37,6 +37,15 @@
 //!   1 ms level sweep as the safety net for a missed edge. One-shot watches
 //!   are `EPOLLONESHOT` and never swept: a sync_file stays readable forever
 //!   once signalled, and sweeping it would report it forever.
+//! - **A sweep that costs by the handle.** The sweep polls only handles
+//!   that were reported readable and may still be: the guest consumes RM
+//!   events one ioctl at a time, and a descriptor left readable after one
+//!   makes no new edge, which is what the sweep is there for. A handle
+//!   leaves that set the first sweep that finds it drained, and an idle
+//!   handle is never in it. Sweeping every watch instead cost a `poll` per
+//!   open device file per millisecond -- a guest holding a thousand idle
+//!   nvidiactl files pinned a host core (S-21) -- and with nothing to sweep
+//!   the pump now sleeps until an event or a kick.
 //! - **Latency when buffers run out.** A kick on the event queue (the guest
 //!   posting buffers) writes an eventfd this loop waits on, and the pump
 //!   enables notifications on the queue whenever it finds none posted -- with
@@ -504,6 +513,9 @@ pub struct Pump<Q: EventQueue> {
     watches: HashMap<u32, Watched>,
     /// DRM handles taken out of epoll for being over budget.
     paused: HashSet<u32>,
+    /// Swept handles reported readable that may still be: the only ones the
+    /// sweep polls.
+    stale: HashSet<u32>,
     last_sweep: Instant,
     buf: Vec<u8>,
 }
@@ -546,6 +558,7 @@ impl<Q: EventQueue> Pump<Q> {
             outbox: Outbox::new(),
             watches: HashMap::new(),
             paused: HashSet::new(),
+            stale: HashSet::new(),
             last_sweep: Instant::now(),
             buf: vec![0u8; DRM_READ_MAX],
         };
@@ -583,18 +596,25 @@ impl<Q: EventQueue> Pump<Q> {
         )
     }
 
-    fn unwatch(&mut self, handle: u32) -> Option<Watched> {
+    /// Stop watching `handle`, returning what it was watched for. The pump's
+    /// duplicate goes to the closer: after the queue thread's CLOSE it is
+    /// usually the file's last reference, and the last close of a card,
+    /// lease or modeset file can run a modeset, which on this thread would
+    /// stop every event of the VM (closer.rs, S-33).
+    fn unwatch(&mut self, handle: u32) -> Option<WatchMode> {
         let w = self.watches.remove(&handle)?;
         self.paused.remove(&handle);
+        self.stale.remove(&handle);
         self.ctl(libc::EPOLL_CTL_DEL, w.fd.as_raw_fd(), 0, 0);
-        Some(w)
+        let mode = w.mode;
+        crate::closer::close(w.fd);
+        Some(mode)
     }
 
     /// One round: wait, apply instructions, read what is ready, sweep, fill
     /// buffers. False once the backend has gone away.
     pub fn step(&mut self) -> bool {
-        let sweeping = self.watches.values().any(|w| w.mode.swept());
-        let timeout = if sweeping {
+        let timeout = if !self.stale.is_empty() {
             // Rounded up: a remainder under a millisecond rounded down is a
             // zero timeout, and the loop would spin until the sweep is due.
             SWEEP
@@ -656,8 +676,8 @@ impl<Q: EventQueue> Pump<Q> {
             match self.rx.try_recv() {
                 Ok(PumpCmd::Watch { handle, fd, mode }) => {
                     if let Some(old) = self.unwatch(handle) {
-                        if old.mode.cookie() != mode.cookie() {
-                            self.outbox.forget(handle, old.mode.cookie());
+                        if old.cookie() != mode.cookie() {
+                            self.outbox.forget(handle, old.cookie());
                         }
                     }
                     let w = Watched {
@@ -677,7 +697,7 @@ impl<Q: EventQueue> Pump<Q> {
                     }
                 }
                 Ok(PumpCmd::Unwatch { handle }) => {
-                    let cookie = self.unwatch(handle).and_then(|w| w.mode.cookie());
+                    let cookie = self.unwatch(handle).and_then(|m| m.cookie());
                     self.outbox.forget(handle, cookie);
                 }
                 Ok(PumpCmd::SetV2(v2)) => self.outbox.set_v2(v2),
@@ -709,6 +729,10 @@ impl<Q: EventQueue> Pump<Q> {
             return;
         };
         let (fd, mode) = (w.fd.as_raw_fd(), w.mode);
+        if mode.swept() {
+            // Reported; the sweep looks again until it finds it drained.
+            self.stale.insert(handle);
+        }
         match mode {
             WatchMode::Legacy => self.outbox.ready_legacy(handle),
             WatchMode::Ready {
@@ -796,14 +820,22 @@ impl<Q: EventQueue> Pump<Q> {
         }
     }
 
-    /// The safety net under a missed edge: ask the swept descriptors directly.
+    /// The safety net under a missed edge: ask the descriptors reported
+    /// readable since they were last found drained, and no others. One still
+    /// readable is reported again (coalesced with anything undelivered); one
+    /// drained leaves the set, and its next edge brings it back.
     fn sweep(&mut self) {
-        let due: Vec<u32> = self
-            .watches
-            .iter()
-            .filter(|(_, w)| w.mode.swept() && readable(w.fd.as_raw_fd()))
-            .map(|(&h, _)| h)
-            .collect();
+        let mut due = Vec::new();
+        self.stale.retain(|h| {
+            let still = self
+                .watches
+                .get(h)
+                .is_some_and(|w| w.mode.swept() && readable(w.fd.as_raw_fd()));
+            if still {
+                due.push(*h);
+            }
+            still
+        });
         for h in due {
             self.on_ready(h);
         }
@@ -1159,6 +1191,66 @@ mod tests {
             pump.watches.is_empty(),
             "a one-shot watch ends when it fires"
         );
+    }
+
+    /// S-21: idle handles cost the sweep nothing. Only a handle reported
+    /// readable is polled again, until a sweep finds it drained; with none
+    /// the pump waits without a timeout.
+    #[test]
+    fn the_sweep_polls_only_handles_left_readable_after_a_report() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        let mut ends = Vec::new();
+        for handle in 0..100 {
+            let (r, w) = pipe();
+            h.send(PumpCmd::Watch {
+                handle,
+                fd: r,
+                mode: WatchMode::Legacy,
+            });
+            ends.push(w);
+        }
+        pump.step_with_timeout(0);
+        assert!(pump.stale.is_empty(), "a hundred idle handles, none swept");
+
+        // One becomes readable: reported, and kept for the sweep while it
+        // stays so, as a guest that has not consumed its event yet.
+        write_all(&ends[7], b"x");
+        pump.step_with_timeout(0);
+        assert_eq!(pump.stale, HashSet::from([7]));
+        pump.sweep();
+        assert_eq!(pump.stale, HashSet::from([7]));
+
+        // Drained: the next sweep drops it, and nothing is left to poll.
+        let mut b = [0u8; 1];
+        // SAFETY: a one-byte read from the pump's copy of the pipe.
+        unsafe { libc::read(pump.watches[&7].fd.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        pump.sweep();
+        assert!(pump.stale.is_empty());
+    }
+
+    /// S-33: the pump's duplicate is usually a file's last reference once
+    /// the queue thread has closed its own; it goes to the closer, and is
+    /// closed there, not on the pump thread.
+    #[test]
+    fn an_unwatched_files_duplicate_is_closed_by_the_closer() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 5,
+            fd: r,
+            mode: WatchMode::Drm,
+        });
+        pump.step_with_timeout(0);
+        h.send(PumpCmd::Unwatch { handle: 5 });
+        pump.step_with_timeout(0);
+        assert!(crate::closer::wait_idle(Duration::from_secs(5)));
+        // With the only read end closed, a write finds no reader.
+        // SAFETY: a one-byte write from a live array.
+        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        assert_eq!(n, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
     }
 
     #[test]
