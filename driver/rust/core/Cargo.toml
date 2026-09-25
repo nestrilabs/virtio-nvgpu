@@ -4,6 +4,9 @@ version.workspace = true
 # The kernel builds every Rust object with --edition=2021, and this crate's
 # sources are compiled there too (driver/nvgpu_rs.rs), so it is held to it.
 edition = "2021"
+# What Linux 7.2 accepts (scripts/min-tool-version.sh): the kernel build of
+# these sources may use any rustc from there on.
+rust-version = "1.85"
 license = "GPL-2.0"
 description = "The guest module's untrusted-input parsers: no_std, no unsafe, no kernel dependencies"
 
@@ -33,3 +36,5 @@ arithmetic_side_effects = "warn"
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
+# `as_chunks` is newer than the oldest rustc Linux 7.2 builds with (1.85).
+chunks_exact_to_as_chunks = "allow"

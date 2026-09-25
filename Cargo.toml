@@ -7,7 +7,10 @@ members = [
     "gen",
     "device",
     "driver/rust/core",
+    "driver/rust/difftest",
 ]
+# cargo-fuzz targets: a workspace of their own, built with nightly.
+exclude = ["driver/rust/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

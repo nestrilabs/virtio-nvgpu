@@ -1167,3 +1167,323 @@ pub fn run<S: Store, E: Env<S>>(env: &mut E, st: &mut State<S>, set: &SchemaSet<
 pub fn abandons(err: Errno) -> bool {
     err == -ETIMEDOUT || err == -EINTR
 }
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::guest::schema::{SIoctl, SCB_PARTIAL, SCLASS_KMS, SDIR_OUT};
+    use std::boxed::Box;
+    use std::collections::BTreeMap;
+    use std::vec;
+    use std::vec::Vec;
+
+    const EBADF_: i32 = 9;
+    const EPERM_: i32 = 1;
+    const ARG: u64 = 0x1000;
+    const LIST: u64 = 0x9000;
+
+    /// `_IOWR('d', nr, size)`.
+    fn iowr(nr: u32, size: u32) -> u32 {
+        (3 << 30) | (size << 16) | (0x64 << 8) | nr
+    }
+
+    /// A struct of 32 bytes: a pointer at 0 to `count` (at 8) u32s the host
+    /// fills (PARTIAL), a descriptor at 12 (-1: none), a GEM handle at 16,
+    /// and a descriptor the host writes at 20.
+    fn table() -> (Vec<SIoctl>, Vec<SField>) {
+        let ioctls = vec![SIoctl {
+            name: core::ptr::null(),
+            cmd: iowr(0xa0, 32),
+            nvkms_cmd: 0,
+            size: 32,
+            sclass: SCLASS_KMS as u8,
+            special: 0,
+            flags: 0,
+            policy: 0,
+            field: 0,
+            nfield: 4,
+        }];
+        let fields = vec![
+            SField {
+                off: 0,
+                kind: SF_PTR,
+                width: 8,
+                dir: SDIR_OUT,
+                len_kind: SLEN_COUNT,
+                len_a: 8,
+                len_width: 4,
+                len_elem: 4,
+                max: 64,
+                cb_kind: SCB_PARTIAL,
+                cb_off: 8,
+                cb_width: 4,
+                cb_arg: 4,
+                ..SField::default()
+            },
+            SField { off: 12, kind: SF_FD_IN, width: 4, none_value: -1, kinds: 7, ..SField::default() },
+            SField { off: 16, kind: SF_GEM_IN, width: 4, ..SField::default() },
+            SField { off: 20, kind: SF_FD_OUT, width: 4, ..SField::default() },
+        ];
+        (ioctls, fields)
+    }
+
+    /// The caller's memory and the kernel copies.
+    #[derive(Default)]
+    struct Mem {
+        user: BTreeMap<u64, Vec<u8>>,
+        bufs: BTreeMap<usize, Vec<u8>>,
+        fetches: Vec<(u64, usize)>,
+    }
+
+    impl Mem {
+        fn region(&mut self, a: u64, n: usize) -> Option<&mut [u8]> {
+            let (&base, r) = self.user.range_mut(..=a).next_back()?;
+            let off = (a - base) as usize;
+            r.get_mut(off..off + n)
+        }
+    }
+
+    impl Store for Mem {
+        fn alloc(&mut self, i: usize, len: usize) -> Result<(), Errno> {
+            self.bufs.insert(i, vec![0; len]);
+            Ok(())
+        }
+        fn fetch(&mut self, i: usize, uptr: u64) -> Result<(), Errno> {
+            let n = self.bufs[&i].len();
+            self.fetches.push((uptr, n));
+            let src = self.region(uptr, n).ok_or(-EFAULT)?.to_vec();
+            self.bufs.get_mut(&i).unwrap().copy_from_slice(&src);
+            Ok(())
+        }
+        fn buf(&self, i: usize) -> &[u8] {
+            self.bufs.get(&i).map_or(&[], |b| b.as_slice())
+        }
+        fn buf_mut(&mut self, i: usize) -> &mut [u8] {
+            self.bufs.get_mut(&i).map_or(&mut [], |b| b.as_mut_slice())
+        }
+        fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
+            let src = self.bufs[&i][start..end].to_vec();
+            self.region(uptr + start as u64, end - start).ok_or(-EFAULT)?.copy_from_slice(&src);
+            Ok(())
+        }
+    }
+
+    /// Hooks and a backend that answers with `reply(request)`.
+    struct Fake {
+        reply: fn(&[u8]) -> Vec<u8>,
+        sent: Vec<Vec<u8>>,
+        closed: Vec<u32>,
+    }
+
+    impl Env<Mem> for Fake {
+        type TBuf = Vec<u8>;
+        fn fd_in(&mut self, _: &mut State<Mem>, _: u32, _: u32, v: i64, _: u32) -> (i32, u32, u32) {
+            if v == 3 {
+                (0, 103, I2_FD_CONSUME)
+            } else {
+                (-EBADF_, 0, 0)
+            }
+        }
+        fn gem_in(&mut self, _: &mut State<Mem>, _: u32, _: u32, g: u32) -> (i32, u32, u32) {
+            (0, 9, g + 1000)
+        }
+        fn fd_out(&mut self, _: &mut State<Mem>, _: u32, _: u32, h: u32, _: u32) -> (i32, i64) {
+            (0, i64::from(h) + 50)
+        }
+        fn gem_out(&mut self, _: &mut State<Mem>, _: u32, _: u32, g: u32, _: u64) -> (i32, u32) {
+            (0, g)
+        }
+        fn special(&mut self, _: &mut State<Mem>, _: u32, _: i32) -> i32 {
+            0
+        }
+        fn phase(&mut self, _: &mut State<Mem>, _: i32) -> i32 {
+            0
+        }
+        fn close_handle(&mut self, h: u32) {
+            self.closed.push(h);
+        }
+        fn gem_close(&mut self, _: u32) {}
+        fn tbuf_alloc(&mut self, len: usize) -> Option<Vec<u8>> {
+            Some(vec![0; len])
+        }
+        fn tbuf_write(&mut self, tb: &mut Vec<u8>, off: usize, src: &[u8]) -> Result<(), Errno> {
+            tb.get_mut(off..off + src.len()).ok_or(-EINVAL)?.copy_from_slice(src);
+            Ok(())
+        }
+        fn tbuf_read(&mut self, tb: &Vec<u8>, off: usize, dst: &mut [u8]) -> Result<(), Errno> {
+            dst.copy_from_slice(tb.get(off..off + dst.len()).ok_or(-EINVAL)?);
+            Ok(())
+        }
+        fn hand_over_held(&mut self, _: &mut State<Mem>, _: &mut Vec<u8>) {}
+        fn xfer(&mut self, req: Vec<u8>, mut resp: Vec<u8>, _: u32) -> Xfer<Vec<u8>> {
+            self.sent.push(req.clone());
+            let r = (self.reply)(&req);
+            let n = r.len().min(resp.len());
+            resp[..n].copy_from_slice(&r[..n]);
+            Xfer::Done { req, resp, used: n as u32 }
+        }
+        fn warn(&mut self, _: Warn<'_>) {}
+    }
+
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn arg(ptr: u64, count: u32, fd: i32, gem: u32) -> Vec<u8> {
+        let mut a = vec![0u8; 32];
+        a[0..8].copy_from_slice(&ptr.to_le_bytes());
+        a[8..12].copy_from_slice(&count.to_le_bytes());
+        a[12..16].copy_from_slice(&fd.to_le_bytes());
+        a[16..20].copy_from_slice(&gem.to_le_bytes());
+        a
+    }
+
+    fn run_with(a: Vec<u8>, reply: fn(&[u8]) -> Vec<u8>) -> (i32, Box<State<Mem>>, Fake) {
+        let (ioctls, fields) = table();
+        let set = SchemaSet { drm: Table { ioctls: &ioctls, fields: &fields, planes: &[] }, modeset: None };
+        let mut mem = Mem::default();
+        mem.user.insert(ARG, a);
+        mem.user.insert(LIST, vec![0xee; 16]);
+        let mut st = Box::new(State::new(mem));
+        let mut env = Fake { reply, sent: Vec::new(), closed: Vec::new() };
+        let args = Args {
+            sclass: SCLASS_KMS,
+            cmd: iowr(0xa0, 32),
+            uarg: ARG,
+            handle: 7,
+            render: 8,
+            max_req: 1 << 16,
+            max_resp: 1 << 16,
+            ..Args::default()
+        };
+        let r = run(&mut env, &mut st, &set, &args);
+        (r, st, env)
+    }
+
+    /// A good reply: the argument with count 2 and the list's four words,
+    /// and a new descriptor at buffer 0, offset 20.
+    fn good(_: &[u8]) -> Vec<u8> {
+        let mut r = words(&[MSG_IOCTL2, 7, 0, 0, 0, 2, 1, 0, 48, 0, 0, 0]);
+        r.extend_from_slice(&arg(0, 2, -1, 0));
+        r.extend_from_slice(&words(&[11, 22, 33, 44]));
+        r.extend_from_slice(&words(&[0, 20, 40, 1]));
+        r
+    }
+
+    #[test]
+    fn gathers_translates_and_builds_the_request() {
+        let (r, st, env) = run_with(arg(LIST, 4, 3, 5), good);
+        assert_eq!(r, 0);
+        // Each buffer copied in once: the argument; the list is OUT only.
+        assert_eq!(st.store.fetches, [(ARG, 32)]);
+        let q = &env.sent[0];
+        // Header; cmd, flags, nbuf 2, nfd 1, ngem 1, ndyn 0, IN bytes 32,
+        // render 8; the buffer lengths; the records; the argument.
+        assert_eq!(&q[..16], &words(&[MSG_IOCTL2, 7, 0, 0])[..]);
+        assert_eq!(&q[16..48], &words(&[iowr(0xa0, 32), 0, 2, 1, 1, 0, 32, 8])[..]);
+        assert_eq!(&q[48..56], &words(&[32, 16])[..]);
+        assert_eq!(&q[56..72], &words(&[0, 12, 103, I2_FD_CONSUME])[..]);
+        assert_eq!(&q[72..88], &words(&[0, 16, 9, 1005])[..]);
+        // The pointer as the caller wrote it, the descriptor as none, the GEM
+        // handle as the host's.
+        let sent = &q[88..120];
+        assert_eq!(&sent[0..8], &LIST.to_le_bytes());
+        assert_eq!(&sent[12..16], &(-1i32).to_le_bytes());
+        assert_eq!(&sent[16..20], &1005u32.to_le_bytes());
+    }
+
+    #[test]
+    fn copies_back_what_the_kernel_would() {
+        let (r, st, _) = run_with(arg(LIST, 4, 3, 5), good);
+        assert_eq!(r, 0);
+        let a = &st.store.user[&ARG];
+        // The caller's pointer, descriptor and GEM handle back; the count as
+        // the host left it; the new descriptor, materialised.
+        assert_eq!(&a[0..8], &LIST.to_le_bytes());
+        assert_eq!(&a[8..12], &2u32.to_le_bytes());
+        assert_eq!(&a[12..16], &3i32.to_le_bytes());
+        assert_eq!(&a[16..20], &5u32.to_le_bytes());
+        assert_eq!(&a[20..24], &90u32.to_le_bytes());
+        // PARTIAL: min(sent 4, now 2) entries.
+        assert_eq!(
+            &st.store.user[&LIST][..],
+            &[11, 0, 0, 0, 22, 0, 0, 0, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee]
+        );
+    }
+
+    #[test]
+    fn refuses_before_allocating_or_sending() {
+        // A count past the field's maximum.
+        let (r, st, env) = run_with(arg(LIST, 17, -1, 0), good);
+        assert_eq!(r, -E2BIG);
+        assert!(env.sent.is_empty() && st.nbuf() == 1);
+        // A descriptor that is not ours.
+        let (r, _, env) = run_with(arg(LIST, 1, 4, 0), good);
+        assert_eq!(r, -EBADF_);
+        assert!(env.sent.is_empty());
+        // An argument that is not there; another size of a known number;
+        // an unknown number.
+        let (ioctls, fields) = table();
+        let set = SchemaSet { drm: Table { ioctls: &ioctls, fields: &fields, planes: &[] }, modeset: None };
+        let mut st = Box::new(State::new(Mem::default()));
+        let mut env = Fake { reply: good, sent: Vec::new(), closed: Vec::new() };
+        let args = Args {
+            sclass: SCLASS_KMS,
+            cmd: iowr(0xa0, 32),
+            uarg: 0xdead_0000,
+            max_req: 4096,
+            max_resp: 4096,
+            ..Args::default()
+        };
+        assert_eq!(run(&mut env, &mut st, &set, &args), -EFAULT);
+        let args = Args { cmd: iowr(0xa0, 24), ..args };
+        assert_eq!(run(&mut env, &mut st, &set, &args), -EINVAL);
+        let args = Args { cmd: iowr(0xa1, 32), ..args };
+        assert_eq!(run(&mut env, &mut st, &set, &args), -ENOTTY);
+    }
+
+    #[test]
+    fn a_null_pointer_or_an_empty_list_gets_no_buffer() {
+        for (p, n) in [(0u64, 4u32), (LIST, 0)] {
+            let (_, _, env) = run_with(arg(p, n, -1, 0), good);
+            assert_eq!(&env.sent[0][24..28], &1u32.to_le_bytes(), "{p:#x} {n}");
+        }
+    }
+
+    #[test]
+    fn a_reply_naming_a_descriptor_elsewhere_is_refused_and_closed() {
+        fn elsewhere(req: &[u8]) -> Vec<u8> {
+            let mut r = good(req);
+            let n = r.len();
+            r[n - 12..n - 8].copy_from_slice(&24u32.to_le_bytes());
+            r
+        }
+        let (r, _, env) = run_with(arg(LIST, 4, -1, 0), elsewhere);
+        assert_eq!(r, -EPROTO);
+        assert_eq!(env.closed, [40]);
+        // A refusal before the call ran closes what it was to consume.
+        fn refused(_: &[u8]) -> Vec<u8> {
+            words(&[MSG_IOCTL2, 7, (-EPERM_) as u32, 0])
+        }
+        let (r, _, env) = run_with(arg(LIST, 4, 3, 0), refused);
+        assert_eq!(r, -EPERM_);
+        assert_eq!(env.closed, [103]);
+    }
+
+    #[test]
+    fn copy_extents_follow_the_kernels_fill_rules() {
+        let f = |cb_kind, cb_off, cb_arg| SField { cb_kind, cb_off, cb_arg, ..SField::default() };
+        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, 0, 0, 0), (0, 64));
+        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, -1, 0, 0), (0, 0));
+        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_INOUT, 64, -1, 0, 0), (0, 64));
+        assert_eq!(copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, 3, 5), (0, 24));
+        assert_eq!(copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, u64::MAX, u64::MAX), (0, 64));
+        assert_eq!(copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 3, 5), (0, 0));
+        assert_eq!(copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 5, 3), (0, 24));
+        assert_eq!(copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 5), (0, 64));
+        assert_eq!(copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 4), (0, 0));
+        assert_eq!(copy_extent(&f(SCB_RANGE, 16, 32), SDIR_OUT, 40, -1, 0, 0), (16, 40));
+        assert_eq!(copy_extent(&f(SCB_WRITTEN, 0, 0), SDIR_OUT, 64, -1, 0, 10), (0, 10));
+    }
+}

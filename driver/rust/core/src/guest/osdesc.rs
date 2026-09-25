@@ -415,7 +415,7 @@ pub fn ioctl<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, outer: &[u8]) ->
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::vec::Vec;
