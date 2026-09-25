@@ -328,26 +328,46 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_UVM_MAP (1u << 6)     /* UVM pools map into the aperture     */
 #define NVGPU_BCAP_OS_DESC (1u << 7)     /* NVGPU_DEEP_PAGE_LIST registrations  */
 #define NVGPU_BCAP_PROC_ID (1u << 8)     /* nvgpu_proc_id on RM_ALLOC, RM_DUP   */
+#define NVGPU_BCAP_PROC_EUID (1u << 9)   /* ... with euid, and on RM_CONTROL    */
+#define NVGPU_BCAP_COMPUTE (1u << 10)    /* UVM served (--allow-compute)        */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
 #define NVGPU_GCAP_PROC_ID (1u << 1)      /* can send nvgpu_proc_id        */
+#define NVGPU_GCAP_PROC_EUID (1u << 2)    /* ... with the caller's euid     */
 
 /*
  * The guest process an IOCTL is made by. With NVGPU_BCAP_PROC_ID, every
  * NVGPU_MSG_IOCTL of NV_ESC_RM_ALLOC or NV_ESC_RM_DUP_OBJECT carries one after
- * its blocks (after the deep_len bytes). The host sees every guest process's
- * RM calls as the backend's, one process; this is how the backend keeps RM
- * objects to the guest process that made their client, as RM keeps them to a
- * host process (protocol/src/messages.rs, ProcId; device/src/rmshare.rs).
- * Opaque to the backend: the calling thread group's leader, by its PID in the
- * initial namespace and its start time, a pair no other process has for the
- * guest's lifetime.
+ * its blocks (after the deep_len bytes), and with NVGPU_BCAP_PROC_EUID every
+ * NV_ESC_RM_CONTROL too; and every NVGPU_MSG_OPEN and NVGPU_MSG_HOST_OP after
+ * its fixed part (struct nvgpu_open_req_proc). The host sees every guest
+ * process's RM calls as the
+ * backend's, one process; this is how the backend keeps RM objects to the
+ * guest process that made their client, as RM keeps them to a host process,
+ * and holds a second client a call names to RM's rule for it -- the same
+ * process, or the same euid where RM's rule is its security token
+ * (protocol/src/messages.rs, ProcId; device/src/rmshare.rs). The process is
+ * the calling thread group's leader, by its PID in the initial namespace and
+ * its start time, a pair no other process has for the guest's lifetime.
  */
 struct nvgpu_proc_id {
   __le64 start_ns; /* group_leader->start_time, CLOCK_MONOTONIC */
   __le32 tgid;     /* task_tgid_nr(), initial PID namespace     */
-  __le32 flags;    /* 0 */
+  __le32 euid;     /* current_euid(), initial user namespace, with
+                      NVGPU_BCAP_PROC_EUID; 0 otherwise */
+} __packed;
+
+/*
+ * NVGPU_MSG_OPEN with the opener after it, and NVGPU_MSG_HOST_OP likewise:
+ * with NVGPU_BCAP_PROC_ID the handles either makes are charged to the
+ * calling process, which holds at most a share of the VM's handles, window
+ * and other budgets (device/src/quota.rs). A backend that predates it reads
+ * the fixed part and ignores the rest.
+ */
+struct nvgpu_open_req_proc {
+  struct nvgpu_open_req req;
+  struct nvgpu_proc_id proc;
 } __packed;
 
 struct nvgpu_hello_req {
@@ -623,6 +643,9 @@ static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
 static_assert(sizeof(struct nvgpu_osdesc_hdr) == 8, "osdesc hdr");
 static_assert(sizeof(struct nvgpu_osdesc_run) == 16, "osdesc run");
 static_assert(sizeof(struct nvgpu_proc_id) == 16, "proc id");
+static_assert(sizeof(struct nvgpu_open_req_proc) ==
+                  sizeof(struct nvgpu_open_req) + 16,
+              "open req with proc id");
 static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
 static_assert(sizeof(struct nvgpu_ev_fence) == 16, "ev fence");
 static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");

@@ -1612,7 +1612,9 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   struct nvgpu_dri_dev *dri = drm->dev_private;
   struct nvgpu_device *dev;
   struct nvgpu_fd *nfd = NULL;
-  struct nvgpu_open_req *req = NULL;
+  struct nvgpu_open_req_proc *reqp = NULL;
+  struct nvgpu_open_req *req;
+  u32 req_len;
   struct nvgpu_open_resp *resp = NULL;
   int ret;
 
@@ -1621,9 +1623,9 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   dev = dri->dev;
 
   nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  reqp = kzalloc(sizeof(*reqp), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (!nfd || !req || !resp) {
+  if (!nfd || !reqp || !resp) {
     ret = -ENOMEM;
     goto err;
   }
@@ -1633,11 +1635,14 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   /* The file's own reference; GEM proxies it owns add theirs. */
   refcount_set(&nfd->ref, 1);
 
+  req = &reqp->req;
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req->device_type = cpu_to_le32(nfd->device_type);
   req->flags = cpu_to_le32(O_RDWR);
 
-  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp, sizeof(*resp));
+  /* The opener, for the backend's per-process share (quota.rs). */
+  req_len = nvgpu_open_req_fill_proc(dev, reqp);
+  ret = nvgpu_send_recv(dev, reqp, req_len, resp, sizeof(*resp));
   if (ret < 0)
     goto err;
 
@@ -1662,13 +1667,13 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   nvgpu_dev_get(dev);
   nvgpu_fd_register(nfd->dev, nfd);
   file->driver_priv = nfd;
-  kfree(req);
+  kfree(reqp);
   kfree(resp);
   return 0;
 
 err:
   kfree(nfd);
-  kfree(req);
+  kfree(reqp);
   kfree(resp);
   return ret;
 }

@@ -185,18 +185,28 @@ have open at that number, which is not a failure with an error message; it is a
 failure with a plausible wrong answer. The guest driver replaces those with the
 handle of the file it refers to, and the backend puts its own descriptor back.
 
-**Processes.** RM keeps an object to the process that made its client: another
-process may duplicate it only if it was shared, and the one share RM starts
-with is "the same process". Every guest process's calls are the backend's, so
-to RM a whole VM is one process, and anything a guest shares RM shares with the
-host. So the backend holds sharing to the VM — a share goes to RM only when it
-narrows or grants to the VM's own clients — and keeps a duplicate's source
-client and its destination client to one guest process, unless the source was
-shared with the destination (`device/src/rmshare.rs`). Which process that is,
-only the guest kernel knows: its driver sends the caller's identity — the
-thread group's PID and its leader's start time, one process for the guest's
-lifetime — with every RM_ALLOC and RM_DUP_OBJECT, to a backend that asks in HELLO
-(`BCAP_PROC_ID`). A client handed to another process with its file stays its
+**Processes.** RM keeps an object to the process that made its client:
+another process may duplicate it only if it was shared, and the one share RM
+starts with is "the same process". Every guest process's calls are the
+backend's, so to RM a whole VM is one process, and anything a guest shares RM
+shares with the host. So the backend holds sharing to the VM — a share goes to
+RM only when it narrows or grants to the VM's own clients — and applies RM's
+own duplicate rule with guest processes in place of the backend's: the
+source client and the destination client were made by one guest process, or
+the source object's share list grants the destination (`device/src/rmshare.rs`).
+Calls that name a second client in their parameters — a device sharing
+another client's VA space, register operations or a profiler on another
+client's context, other clients' channels — are held to the rule RM applies to
+that field between host processes: the same process where RM checks nothing
+(or checks only inside GSP-RM), the same process or the same euid where it
+checks its security token, the share list where it checks a right. Which
+process and which euid, only the guest kernel knows: its driver sends the
+caller's identity — the thread group's PID and its leader's start time, one
+process for the guest's lifetime, and the effective uid — with every
+RM_ALLOC, RM_DUP_OBJECT and RM_CONTROL, to a backend that asks in HELLO
+(`BCAP_PROC_ID`, `BCAP_PROC_EUID`). A guest that does not gets no duplicate
+between two clients except by a grant, and names no client but the caller's
+own: fail closed. A client handed to another process with its file stays its
 maker's, as RM's does. Processes in one guest that share GPU work do it
 through descriptors (dma-bufs, RM's export to a file) rather than handles, and
 cross nothing here.
@@ -236,7 +246,8 @@ That is how `cuMemHostRegister`/`cudaHostRegister` and Vulkan's
 a 2 MiB buffer of its own.
 
 So the pages travel instead, to a backend that says it takes them
-(BCAP_OS_DESC, offered when it holds the vhost-user memory table). The guest
+(BCAP_OS_DESC, offered when it holds the vhost-user memory table and was
+started with `--allow-compute`; see "Compute is opt-in" below). The guest
 driver pins the caller's range the way RM would — long-term, and for
 writing unless the call asks for memory read-only to the CPU — and sends its
 guest-physical page list, as runs, with the call (`driver/nvgpu_osdesc.c`).
@@ -279,7 +290,8 @@ registration carries an id, and the guest asks for the ids released
 registration, and unpins what is named. Until then the pages are out of
 ballooning and migration, as RM would keep them. Every release the backend
 cannot see happen is taken late, never early. Registrations, bytes,
-separately mapped runs and UVM mappings are bounded per file and per VM.
+separately mapped runs and UVM mappings are bounded per file, per guest
+process and per VM.
 
 Registered memory is guest RAM, which the guest caches write-back, so every
 GPU mapping of it snoops, as for any system memory the guest can see (§15).
@@ -315,6 +327,21 @@ per pool because the address is fixed per pool; a slot costs about 0.7 ms to
 add and 2 ms to remove, once per CUDA context. UVM itself keeps the pages
 alive: it refuses to free a pool that is still mapped, and the VMM's mapping
 counts.
+
+### Compute is opt-in
+
+Everything in this section that exists only for CUDA — the UVM device with
+its sharing mode and range groups, the UVM aperture, and memory registered by
+its pages — is served only when the backend is started with
+`--allow-compute`, and is off by default. Without it the backend refuses
+every open of `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, offers neither
+BCAP_UVM_MAP nor BCAP_OS_DESC, and says so in HELLO (no `BCAP_COMPUTE`); the
+guest driver then makes no UVM device and does not register the
+`nvidia-uvm` major, which NVIDIA's userspace reads as a host whose
+nvidia-uvm is not loaded. Vulkan, OpenGL, EGL, Vulkan Video and the display
+paths use RM, NVKMS and nvidia-drm and none of this (SECURITY.md, "Compute").
+`scripts/run-guest.sh --allow-compute` (or `NVGPU_COMPUTE=1`) turns it on
+for a run.
 
 ---
 
@@ -456,7 +483,8 @@ display features at all. The backend's reply says what it offers — the host's
 card nodes, a Wayland socket, fences, an NVKMS table for this host's release,
 export mode — and how large one request may be. The guest's side says what it
 can: the UVM aperture it found, and that it can name the process behind each
-RM call (§4).
+RM call and its euid (§4). Whether compute is served is the backend's to say
+(§5, "Compute is opt-in").
 
 A HELLO also says whether this is a fresh driver instance, and a fresh one
 resets the session: every host file the previous instance held is closed,
@@ -802,7 +830,8 @@ exactly what the compositor may read, and the release is forwarded untouched,
 so the client's pacing stays the compositor's. The guest side only ever reads
 the client's pool, never maps it, so a client that shrinks its pool under the
 proxy gets short copies rather than a crash. The host's memory is charged to a
-budget per connection and per VM before it can be written, because it is
+budget per connection, per guest process and per VM before it can be
+written, because it is
 memory the host's OOM killer would not count as the backend's. What is charged
 is what it can come to hold, not the pool's size: the host's copy of a pool is
 made at full size but empty, only the parts a live buffer covers are ever
@@ -813,9 +842,12 @@ pool and scrolls by moving its buffer through it, holds what its buffer takes.
 **Bounded both ways.** The host compositor disconnects a client whose output
 buffer fills, and the guest reads when it gets round to it. So the backend
 reads every host connection eagerly, on a thread of its own, and queues what it
-translated until the guest takes it, within a budget per connection and per VM;
-a guest that stops reading loses the connection rather than the backend its
-memory. The other way, the backend takes no more from the guest while a
+translated until the guest takes it, within a budget per connection, per guest
+process and per VM; a guest that stops reading loses the connection rather than
+the backend its memory, and a process that stops reading loses its own
+connection, never another process's. The guest daemon charges each client's
+connection to that client (NVGPU_WL_IOC_CONNECT_FOR), and holds at most 4 MiB
+a client has not read before it stops taking that client's output. The other way, the backend takes no more from the guest while a
 compositor that is not reading has too much waiting, and the daemon stops
 reading its client, so the client's own library buffer is where it waits. The
 number of channels one VM may have, and how often it may ask for a lease, are
@@ -972,12 +1004,15 @@ host compositor really enters direct scanout for a guest window is stage 3 of
   will fail to map it.
 - **One address space for every UVM pool of a VM.** Each pool the guest maps
   sits at its own address in the VMM (§5), so two guest processes whose pools
-  overlap cannot both be mapped: the second CUDA context fails with EEXIST.
+  overlap cannot both be mapped: the second CUDA context fails with ENOMEM
+  (the errno of any placement that cannot be made).
   CUDA picks its addresses the same way in every process, so two CUDA
   processes at once may meet this; how often is still to be measured. A pool
   cannot be moved — its GPU address is the same number — so this needs a host
-  driver change to lift. Pools are also bounded (16 per process, 64 and
-  256 MiB per VM), and the aperture is 1 GiB.
+  driver change to lift. Pools are also bounded (16 placements and 64 MiB per
+  UVM file and per guest process, 64 and 256 MiB per VM; pools made at all,
+  mapped or not, 256 MiB per file and 1 GiB per VM), and the aperture is
+  1 GiB.
 
 ---
 

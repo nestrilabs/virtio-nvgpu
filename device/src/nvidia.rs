@@ -445,7 +445,11 @@ pub struct NvidiaBackend {
     current_data_len: u32,
     /// The guest process making the RM call being served, when the guest
     /// says (rmshare.rs).
-    pub(crate) current_proc: Option<crate::rmshare::ProcId>,
+    pub(crate) current_proc: Option<crate::rmshare::Caller>,
+    /// The guest process what the message being served makes is charged to
+    /// (quota.rs): the one an OPEN or HOST_OP names, else the owner of the
+    /// handle the message acts on.
+    pub(crate) current_owner: crate::quota::Owner,
     pub(crate) handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
@@ -1015,6 +1019,7 @@ impl NvidiaBackend {
             current_req_id: 0,
             current_data_len: 0,
             current_proc: None,
+            current_owner: crate::quota::Owner::Unknown,
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
@@ -1138,6 +1143,14 @@ impl NvidiaBackend {
     /// Whether a placer is attached (the transport's request channel is up).
     pub(crate) fn has_window(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Size the handle table for a backend that may hold `nofile`
+    /// descriptors (posture::raise_nofile).
+    pub fn set_nofile(&mut self, nofile: u64) {
+        let limit = crate::handle_table::limit_for_nofile(nofile);
+        log::info!("RLIMIT_NOFILE {nofile}: at most {limit} guest handles");
+        self.handles.set_limit(limit);
     }
 
     pub fn handle_count(&self) -> usize {
@@ -1447,6 +1460,23 @@ impl NvidiaBackend {
         self.current_handle = hdr.handle;
 
         let payload = &req_buf[size_of::<MsgHeader>()..];
+        // Who what this message makes is charged to (quota.rs). OPEN and
+        // HOST_OP make handles out of nothing and say the process after
+        // their fixed part; everything else acts on a handle, whose owner
+        // it is.
+        self.current_owner = match msg_type {
+            MsgType::Open => crate::quota::Owner::from_trailer(
+                payload,
+                size_of::<OpenReq>(),
+                self.session.proc_ids,
+            ),
+            MsgType::HostOp => crate::quota::Owner::from_trailer(
+                payload,
+                size_of::<protocol::messages::HostOpReq>(),
+                self.session.proc_ids,
+            ),
+            _ => self.handles.owner(hdr.handle),
+        };
         let mut reply = match msg_type {
             MsgType::Hello
             | MsgType::Ioctl2
@@ -1545,6 +1575,13 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, libc::EPERM);
             }
             Some(DeviceKind::Dri(n)) => HandleKind::DriRender(n),
+            // UVM is compute's alone (`--allow-compute`, session.rs): without
+            // it neither device is opened on the host, so no UVM command,
+            // sharing mode or aperture placement is reachable at all.
+            Some(k @ (DeviceKind::Uvm | DeviceKind::UvmTools)) if !self.config.allow_compute => {
+                log::warn!("OPEN of {k:?} refused: UVM is served only with --allow-compute");
+                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
+            }
             // A channel to the host compositor: not a path (wl/serve.rs).
             Some(DeviceKind::Wayland) => {
                 return match self.open_wayland(req.flags) {
@@ -1563,19 +1600,8 @@ impl NvidiaBackend {
         };
 
         if kind == HandleKind::Dev(DeviceKind::Modeset) {
-            // Every one is a host NVKMS open with an event list NVKMS never
-            // bounds (nvkms.c:6422-6435) and permission state of its own.
-            let open = self
-                .handles
-                .handles()
-                .into_iter()
-                .filter(|&h| self.handles.kind(h) == Some(kind))
-                .count();
-            if open >= nvkms::MAX_MODESET_OPENS {
-                log::warn!(
-                    "OPEN of /dev/nvidia-modeset refused: {open} already open, the most one VM \
-                     may hold"
-                );
+            if let Some(why) = self.modeset_open_refused(self.current_owner) {
+                log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
                 return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
             }
         }
@@ -1608,7 +1634,7 @@ impl NvidiaBackend {
             HandleKind::Dev(_) => fd.try_clone().ok(),
             _ => None,
         };
-        let guest_handle = match self.handles.insert(fd, kind) {
+        let guest_handle = match self.handles.insert_for(fd, kind, self.current_owner) {
             Ok(h) => h,
             Err(full) => {
                 log::warn!("open {:?}: handle table full", path);
@@ -1631,6 +1657,37 @@ impl NvidiaBackend {
         // The handle is returned in the header. The driver reads it from there
         // and there is no response payload at all.
         self.write_hdr(resp_buf, guest_handle, 0)
+    }
+
+    /// Why guest process `owner` may not open another `/dev/nvidia-modeset`,
+    /// if it may not. Every one is a host NVKMS open with an event list NVKMS
+    /// never bounds (nvkms.c:6422-6435) and permission state of its own: at
+    /// most [`nvkms::MAX_MODESET_OPENS`] per VM, and a process's share of
+    /// them ([`nvkms::MODESET_SHARE`], B4).
+    pub(crate) fn modeset_open_refused(&self, owner: crate::quota::Owner) -> Option<String> {
+        let kind = HandleKind::Dev(DeviceKind::Modeset);
+        let (mut open, mut mine) = (0usize, 0usize);
+        for h in self.handles.handles() {
+            if self.handles.kind(h) == Some(kind) {
+                open += 1;
+                if self.handles.owner(h) == owner {
+                    mine += 1;
+                }
+            }
+        }
+        if open >= nvkms::MAX_MODESET_OPENS {
+            return Some(format!("{open} already open, the most one VM may hold"));
+        }
+        crate::quota::admits(
+            &nvkms::MODESET_SHARE,
+            owner,
+            mine as u64,
+            1,
+            open as u64,
+            nvkms::MAX_MODESET_OPENS as u64,
+        )
+        .err()
+        .map(|why| format!("guest process {owner:?} holds {mine} of the VM's {open} ({why:?})"))
     }
 
     // ------------------------------------------------------------------
@@ -1771,6 +1828,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::BufferTooSmall, 0, 0);
         }
         let (base, len) = (req.offset, req.size);
+        self.uvm_maps.set_owner(handle, self.handles.owner(handle));
         let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
             Ok(p) => p,
             Err(errno) => {
@@ -1876,16 +1934,20 @@ impl NvidiaBackend {
     /// not fit falls back to write-combining, which is always a correct way to
     /// map what the host maps write-back (only slower to read); nothing else
     /// falls back, least of all registers, which must stay uncached.
+    ///
+    /// The extent is charged to `owner`, which holds at most its share of a
+    /// zone (quota.rs, B2).
     fn alloc_zone(
         &mut self,
         length: u64,
         want: crate::shm::PgprotKind,
+        owner: crate::quota::Owner,
     ) -> Result<crate::shm::ShmRegion> {
         use crate::shm::PgprotKind;
-        match self.shm.alloc(length, want) {
+        match self.shm.alloc_for(length, want, owner) {
             Err(e) if want == PgprotKind::WriteBack => {
                 log::warn!("write-back zone: {e}; placing {length:#x} bytes write-combining");
-                self.shm.alloc(length, PgprotKind::WriteCombine)
+                self.shm.alloc_for(length, PgprotKind::WriteCombine, owner)
             }
             r => r,
         }
@@ -1999,7 +2061,7 @@ impl NvidiaBackend {
 
         let length = size.max(4096);
         let writable = crate::shm::host_mapping_writable(host_fd, length, fd_offset);
-        let region = match self.alloc_zone(length, pgprot) {
+        let region = match self.alloc_zone(length, pgprot, self.handles.owner(handle)) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("mmap on handle {handle}: window has no room: {e}");
@@ -2567,6 +2629,17 @@ impl NvidiaBackend {
                 if let Err(errno) = self.uvm_size_ok(ireq.cmd, params.len()) {
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
+                // A semaphore pool is host kernel memory the moment UVM makes
+                // it: its length and the budgets are checked first, not only
+                // whether it may later be mapped (uvmmap.rs, F1).
+                self.uvm_maps
+                    .set_owner(self.current_handle, self.handles.owner(self.current_handle));
+                if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL && params.len() >= 16 {
+                    let len = u64::from_le_bytes(params[8..16].try_into().unwrap());
+                    if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
+                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                    }
+                }
                 // The descriptor some commands name another file by
                 // (uvmfd.rs): our handle, as the guest driver sent it, becomes
                 // our descriptor for the call and the handle again in the
@@ -2877,6 +2950,18 @@ impl NvidiaBackend {
             NV_ESC_RM_CONTROL if self.osdesc_export_refused(param_in) => {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
             }
+            // OS_UNIX controls whose descriptors nothing translates, and
+            // ones RM does not define (rmctl.rs): RM's NOT_SUPPORTED.
+            NV_ESC_RM_CONTROL if crate::rmctl::unix_refused(param_in).is_some() => {
+                log::warn!(
+                    "RM control {} refused: it names a host descriptor nothing translates",
+                    crate::rmctl::unix_refused(param_in).unwrap_or_default()
+                );
+                let mut out = crate::rmctl::unsupported(param_in);
+                let deep = deep_in.map_or(&[][..], |(_, b)| b);
+                out.extend_from_slice(deep);
+                self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len())
+            }
             // Controls that list other RM clients' host PIDs (rmctl.rs, S-24):
             // answered here, as RM answers a caller without the privilege.
             NV_ESC_RM_CONTROL if crate::rmctl::host_pid_control(param_in).is_some() => {
@@ -3118,13 +3203,21 @@ impl NvidiaBackend {
                             host_buf[NV0005_DATA..NV0005_DATA + 4]
                                 .copy_from_slice(&(real_fd as i32).to_le_bytes());
                         }
+                        // -1, "no descriptor", goes as it is.
+                        Err(_) if guest_handle_val == -1 => {}
+                        // Anything else is refused, not forwarded: RM would
+                        // look the number up among every guest process's
+                        // files (R2).
                         Err(_) => {
-                            // Worth naming rather than forwarding: RM answers
-                            // NV_ERR_OBJECT_NOT_FOUND, which reads as a missing
-                            // object rather than an untranslated descriptor.
                             log::warn!(
                                 "event class {h_class:#x}: no handle {guest_handle_val} for \
                                  the file this event is to be delivered on"
+                            );
+                            return self.write_error_resp(
+                                resp_buf,
+                                Status::BadHandle,
+                                cookie,
+                                libc::EBADF,
                             );
                         }
                     }
@@ -3152,47 +3245,46 @@ impl NvidiaBackend {
                 }
             }
 
+            // A control file named by descriptor in NV0000's OS_UNIX
+            // controls (rmctl.rs): the guest's handle becomes our descriptor
+            // of that very file, and only a control file's; a number that is
+            // not one is refused, never forwarded, since RM would resolve it
+            // among every guest process's files (R1, R2). -1 passes: RM
+            // refuses it itself.
             if escape == 0x2A && outer.len() >= 12 {
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-
-                if cmd == 0x3d05 && host_buf.len() >= 20 {
-                    // EXPORT_OBJECT_TO_FD: guest_handle at offset 16 in nested
-                    let guest_handle_val = i32::from_le_bytes(host_buf[16..20].try_into().unwrap());
-
-                    match self.dev_fd(guest_handle_val as u32) {
-                        Ok(real_fd) => {
-                            log::debug!(
-                                "EXPORT_TO_FD: handle {} → host fd {}",
-                                guest_handle_val,
-                                real_fd
-                            );
-                            saved_nested_handle = Some((16, guest_handle_val));
-                            host_buf[16..20].copy_from_slice(&(real_fd as i32).to_le_bytes());
-                        }
-                        Err(_) => {
-                            log::warn!("EXPORT_TO_FD: bad guest_handle {}", guest_handle_val);
-                            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
-                        }
+                if let Some(crate::rmctl::UnixCtl::Fd { at }) = crate::rmctl::unix_control(cmd) {
+                    if host_buf.len() < at + 4 {
+                        log::warn!(
+                            "RM control {cmd:#x}: {} parameter bytes do not hold its descriptor",
+                            host_buf.len()
+                        );
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::EINVAL,
+                        );
                     }
-                }
-
-                if cmd == 0x3d06 && host_buf.len() >= 4 {
-                    // IMPORT_OBJECT_FROM_FD: guest_handle at offset 0 in nested
-                    let guest_handle_val = i32::from_le_bytes(host_buf[0..4].try_into().unwrap());
-
-                    match self.dev_fd(guest_handle_val as u32) {
-                        Ok(real_fd) => {
-                            log::debug!(
-                                "IMPORT_FROM_FD: handle {} → host fd {}",
-                                guest_handle_val,
-                                real_fd
-                            );
-                            saved_nested_handle = Some((0, guest_handle_val));
-                            host_buf[0..4].copy_from_slice(&(real_fd as i32).to_le_bytes());
-                        }
-                        Err(_) => {
-                            log::warn!("IMPORT_FROM_FD: bad guest_handle {}", guest_handle_val);
-                            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
+                    let guest_val = i32::from_le_bytes(host_buf[at..at + 4].try_into().unwrap());
+                    if guest_val != -1 {
+                        match self.ctl_fd(guest_val as u32) {
+                            Ok(real_fd) => {
+                                saved_nested_handle = Some((at, guest_val));
+                                host_buf[at..at + 4].copy_from_slice(&real_fd.to_le_bytes());
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "RM control {cmd:#x}: {guest_val} is no control file of \
+                                     this VM"
+                                );
+                                return self.write_error_resp(
+                                    resp_buf,
+                                    Status::BadHandle,
+                                    cookie,
+                                    libc::EBADF,
+                                );
+                            }
                         }
                     }
                 }
@@ -3574,12 +3666,18 @@ impl NvidiaBackend {
         resp_buf: &mut [u8],
     ) -> usize {
         use crate::osdesc::{self as od, Shape};
-        let Some(ram) = self.guest_ram.clone().filter(|_| self.session.v2) else {
+        let Some(ram) = self
+            .guest_ram
+            .clone()
+            .filter(|_| self.session.v2 && self.config.allow_compute)
+        else {
             log::warn!("OS descriptor page list from a guest never offered BCAP_OS_DESC; refused");
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         };
         let cmd = request as u32;
         let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
+        self.osdesc
+            .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
         let prepared = od::describe(cmd, outer, nested).and_then(|call| {
             let runs = od::parse_runs(&call, list)?;
             let resolved = od::resolve(&ram, &runs)?;
@@ -4263,7 +4361,13 @@ impl NvidiaBackend {
         // NV_ESC_RM_ALLOC_MEMORY carries it for every allocation not being made
         // on another open file. It is forwarded as it stands, because that is
         // what the host driver is being asked to read.
-        if embedded < 0 {
+        // Only -1: another negative number is no descriptor either, and
+        // RM would look it up among the backend's files (R5).
+        if embedded < -1 {
+            log::warn!("fd-carrying ioctl: descriptor field {embedded} refused");
+            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, libc::EBADF);
+        }
+        if embedded == -1 {
             let Some(mut arg) = ioctl_arg(request, param_in) else {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
             };
@@ -4509,7 +4613,13 @@ impl NvidiaBackend {
 
         // --- Step 5: Allocate SHM region ---
 
-        let region = match self.alloc_zone(length, pgprot) {
+        // Charged to whoever opened the file the mapping is armed on: the
+        // process that will map it.
+        let owner = match self.handles.owner(guest_fd_handle) {
+            crate::quota::Owner::Unknown => self.current_owner,
+            o => o,
+        };
+        let region = match self.alloc_zone(length, pgprot, owner) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
@@ -4826,7 +4936,9 @@ impl NvidiaBackend {
             {
                 self.uvm_maps.mark_shared(handle);
             }
-            ALLOC_SEMAPHORE_POOL if self.uvm_maps.is_shared(handle) => {
+            // Every pool, mapped or not: what the pool budgets count
+            // (uvmmap.rs, F1). Only one in sharing mode can be mapped.
+            ALLOC_SEMAPHORE_POOL => {
                 let (base, len) = (word(0), word(8));
                 let (_, stale) = self.uvm_maps.record(handle, base, len);
                 if let Some(w) = stale {
@@ -4892,6 +5004,16 @@ impl NvidiaBackend {
                 );
                 Err(libc::EBADF)
             }
+        }
+    }
+
+    /// The descriptor of `handle` when it is a control file
+    /// (`/dev/nvidiactl`), the only kind RM's export and import controls
+    /// resolve (`nv_get_file_private(fd, NV_TRUE, ..)`).
+    fn ctl_fd(&self, handle: u32) -> Result<RawFd> {
+        match self.handles.get(handle) {
+            Some((fd, HandleKind::Dev(DeviceKind::Ctl))) => Ok(std::os::fd::AsRawFd::as_raw_fd(&fd)),
+            _ => Err(DeviceError::BadHandle(handle as u64)),
         }
     }
 
@@ -7477,6 +7599,7 @@ mod uvm_map_tests {
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_uvm);
         be.set_host_driver_version("595.99.02");
+        be.config_mut().allow_compute = true;
         let vmm = Vmm::default();
         be.set_window(Box::new(vmm.clone()));
         let mut e = Env { be, vmm };
@@ -7760,7 +7883,11 @@ mod uvm_map_tests {
         e.alloc(b, X, L);
         e.mmap(a, X, L, 3).unwrap();
         e.calls();
-        assert_eq!(e.mmap(b, X, L, 3).map(|_| ()), Err(libc::EEXIST));
+        assert_eq!(
+            e.mmap(b, X, L, 3).map(|_| ()),
+            Err(libc::ENOMEM),
+            "refused as any placement is, with no errno of its own"
+        );
         assert!(e.calls().is_empty(), "refused before the VMM is asked");
     }
 
@@ -7797,5 +7924,251 @@ mod uvm_map_tests {
         let r = e.mmap(dri, 0, 4096, 3).unwrap();
         assert_ne!(r.mapping_id, id);
         assert!(matches!(e.calls()[..], [_, Call::Place(_)]));
+    }
+}
+
+/// Descriptors RM resolves in the backend's process: every one is the
+/// guest's handle of the caller's own file, turned into our descriptor of it,
+/// or the call never reaches RM (R1, R2, R5).
+#[cfg(test)]
+mod descriptor_field_tests {
+    use super::*;
+    use abi::ioctl::*;
+    use std::cell::RefCell;
+    use std::os::fd::AsRawFd;
+
+    std::thread_local! {
+        /// (control, the descriptor RM was handed) for each RM_CONTROL.
+        static SEEN: RefCell<Vec<(u32, i32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn seen() -> Vec<(u32, i32)> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// RM_CONTROL: record the descriptor field of an OS_UNIX control,
+    /// answer NV_OK.
+    unsafe fn fake_rm(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+        let len = hostfd::ioc_size(request as u32);
+        // SAFETY: `HostIoctl`'s contract.
+        let b = unsafe { std::slice::from_raw_parts_mut(arg, len) };
+        if (request & 0xff) as u32 == NV_ESC_RM_CONTROL {
+            let cmd = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            let p = u64::from_le_bytes(b[16..24].try_into().unwrap()) as *const u8;
+            if let Some(crate::rmctl::UnixCtl::Fd { at }) = crate::rmctl::unix_control(cmd) {
+                // SAFETY: the backend pointed pParams at its own copy of the
+                // parameters, which hold the field (checked before the call).
+                let fd = unsafe { std::ptr::read_unaligned(p.add(at) as *const i32) };
+                SEEN.with(|s| s.borrow_mut().push((cmd, fd)));
+            } else {
+                SEEN.with(|s| s.borrow_mut().push((cmd, i32::MIN)));
+            }
+            b[28..32].copy_from_slice(&0u32.to_le_bytes());
+        }
+        0
+    }
+
+    fn devnull() -> OwnedFd {
+        std::fs::File::open("/dev/null").unwrap().into()
+    }
+
+    fn control(be: &mut NvidiaBackend, on: u32, cmd: u32, params: &[u8]) -> (i32, Vec<u8>) {
+        let mut outer = [0u8; 32];
+        outer[8..12].copy_from_slice(&cmd.to_le_bytes());
+        outer[24..28].copy_from_slice(&(params.len() as u32).to_le_bytes());
+        let mut req = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut req,
+            &MsgHeader {
+                msg_type: MsgType::Ioctl as u32,
+                handle: on,
+                status: 0,
+                req_id: 0,
+            },
+        );
+        let at = req.len();
+        req.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(
+            &mut req[at..],
+            &IoctlReq {
+                cmd: _IOWR(NV_ESC_RM_CONTROL, 32) as u32,
+                data_len: 32,
+                nested_offset: 32,
+                nested_len: params.len() as u32,
+                deep_ptr_offset: 0,
+                deep_len: 0,
+            },
+        );
+        req.extend_from_slice(&outer);
+        req.extend_from_slice(params);
+        let mut resp = vec![0u8; 8192];
+        let n = be.dispatch(&req, &mut resp);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = read_struct::<MsgHeader>(&resp, 0).status;
+        (st, resp[body.min(n)..n].to_vec())
+    }
+
+    fn with_fd(len: usize, at: usize, v: i32) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn each_export_and_import_control_gets_our_descriptor_of_the_callers_control_file() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl_fd = devnull();
+        let raw = ctl_fd.as_raw_fd();
+        let ctl = be.adopt_for_test(ctl_fd, HandleKind::Dev(DeviceKind::Ctl));
+        let _ = seen();
+        // (control, parameter size in 610.57.04, where the descriptor is)
+        for (cmd, len, at) in [
+            (0x3d05u32, 24usize, 16usize),
+            (0x3d06, 20, 0),
+            (0x3d08, 80, 0),
+            (0x3d0a, 76, 72),
+            (0x3d0b, 2128, 0),
+            (0x3d0c, 648, 0),
+        ] {
+            let (st, back) = control(&mut be, ctl, cmd, &with_fd(len, at, ctl as i32));
+            assert_eq!(st, 0, "{cmd:#x}");
+            assert_eq!(seen(), [(cmd, raw)], "{cmd:#x}: RM sees our descriptor");
+            let guest = i32::from_le_bytes(back[32 + at..32 + at + 4].try_into().unwrap());
+            assert_eq!(guest, ctl as i32, "{cmd:#x}: the guest's handle comes back");
+        }
+    }
+
+    #[test]
+    fn a_number_that_is_no_control_file_of_the_vm_never_reaches_rm() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let gpu = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Gpu(0)));
+        let ev = be.adopt_for_test(devnull(), HandleKind::Eventfd);
+        let _ = seen();
+        // Another process's number as the guest sent it, a GPU file, an
+        // eventfd, and a negative number other than -1: EBADF, RM not asked.
+        for v in [ctl as i32 + 7, gpu as i32, ev as i32, -2, i32::MIN] {
+            for (cmd, len, at) in [(0x3d0c, 648, 0), (0x3d06, 20, 0), (0x3d0b, 2128, 0)] {
+                let (st, _) = control(&mut be, ctl, cmd, &with_fd(len, at, v));
+                assert_eq!(st, -libc::EBADF, "{cmd:#x} naming {v}");
+            }
+        }
+        assert!(seen().is_empty());
+        // -1 goes as it is: RM refuses it itself.
+        let (st, _) = control(&mut be, ctl, 0x3d0c, &with_fd(648, 0, -1));
+        assert_eq!(st, 0);
+        assert_eq!(seen(), [(0x3d0c, -1)]);
+        // A block too short to hold the field is refused, not forwarded.
+        let (st, _) = control(&mut be, ctl, 0x3d0a, &[0u8; 40]);
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty());
+    }
+
+    #[test]
+    fn memacct_and_undefined_os_unix_controls_are_answered_without_rm() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let _ = seen();
+        for cmd in [0x3d0du32, 0x3d0e, 0x3d04, 0x3d20] {
+            let (st, back) = control(&mut be, ctl, cmd, &[0u8; 32]);
+            assert_eq!(st, 0, "{cmd:#x}: RM's own answer, not a failed ioctl");
+            assert_eq!(
+                u32::from_le_bytes(back[28..32].try_into().unwrap()),
+                crate::rmctl::NV_ERR_NOT_SUPPORTED
+            );
+        }
+        assert!(seen().is_empty());
+        // The two without a descriptor go to RM.
+        let (st, _) = control(&mut be, ctl, 0x3d07, &[0u8; 8]);
+        assert_eq!(st, 0);
+        assert_eq!(seen().len(), 1);
+    }
+
+    #[test]
+    fn an_fd_carrying_escape_forwards_minus_one_and_refuses_other_negatives() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        // NV_ESC_RM_ALLOC_MEMORY: the descriptor at 48 of 56 bytes.
+        let send = |be: &mut NvidiaBackend, v: i32| {
+            let mut p = vec![0u8; 56];
+            p[48..52].copy_from_slice(&v.to_le_bytes());
+            let mut req = vec![0u8; size_of::<MsgHeader>()];
+            write_struct(
+                &mut req,
+                &MsgHeader {
+                    msg_type: MsgType::Ioctl as u32,
+                    handle: ctl,
+                    status: 0,
+                    req_id: 0,
+                },
+            );
+            let at = req.len();
+            req.resize(at + size_of::<IoctlReq>(), 0);
+            write_struct(
+                &mut req[at..],
+                &IoctlReq {
+                    cmd: _IOWR(NV_ESC_RM_ALLOC_MEMORY, 56) as u32,
+                    data_len: 56,
+                    ..Default::default()
+                },
+            );
+            req.extend_from_slice(&p);
+            let mut resp = vec![0u8; 4096];
+            be.dispatch(&req, &mut resp);
+            read_struct::<MsgHeader>(&resp, 0).status
+        };
+        assert_eq!(send(&mut be, -1), 0);
+        assert_eq!(send(&mut be, -2), -libc::EBADF);
+        assert_eq!(send(&mut be, i32::MIN), -libc::EBADF);
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+    use crate::quota::Owner;
+
+    fn devnull() -> OwnedFd {
+        std::fs::File::open("/dev/null").unwrap().into()
+    }
+
+    /// One process holding every NVKMS open left the compositor with none
+    /// (B4): a process holds at most its share, and the VM cap stays.
+    #[test]
+    fn one_guest_process_cannot_hold_every_modeset_open() {
+        let mut be = NvidiaBackend::for_test();
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        let modeset = HandleKind::Dev(DeviceKind::Modeset);
+        let mut n = 0;
+        while be.modeset_open_refused(p(1)).is_none() {
+            be.handles.insert_for(devnull(), modeset, p(1)).unwrap();
+            n += 1;
+        }
+        assert_eq!(n, nvkms::MODESET_SHARE.per_owner);
+        assert!(be.modeset_open_refused(p(2)).is_none());
+        // Three more processes take theirs; the VM's last eight are kept
+        // for processes holding at most two.
+        for t in 2..5 {
+            while be.modeset_open_refused(p(t)).is_none() {
+                be.handles.insert_for(devnull(), modeset, p(t)).unwrap();
+            }
+        }
+        assert!(be.modeset_open_refused(p(9)).is_none(), "a newcomer gets one");
+        for _ in 0..8 {
+            if be.modeset_open_refused(Owner::Unknown).is_none() {
+                be.handles.insert(devnull(), modeset).unwrap();
+            }
+        }
+        assert!(
+            be.modeset_open_refused(p(9)).is_some(),
+            "the VM cap is still the outer bound"
+        );
     }
 }

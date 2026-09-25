@@ -80,6 +80,16 @@ const IMPORT_PARAMS_SIZE: usize = 16;
 /// is what bounds the host's kthreads.
 pub const CTX_CAP_PER_FILE: usize = 64;
 pub const CTX_CAP_PER_SESSION: usize = 256;
+/// And per guest process (quota.rs, B3): four files of one process took the
+/// whole session, and every other process's vkCreateDevice failed. A
+/// process holds at most 96, and the session's last 32 are kept for
+/// processes holding at most 16 -- so one that has its 96 cannot take
+/// another's first device's worth.
+pub const CTX_SHARE: crate::quota::Share = crate::quota::Share {
+    per_owner: 96,
+    reserve: 32,
+    floor: 16,
+};
 
 /// `NV01_ROOT`, `NV01_ROOT_NON_PRIV`, `NV01_ROOT_CLIENT`: the classes a
 /// client is allocated as (escape.c:473-481 turns all three into the last).
@@ -152,8 +162,10 @@ struct Inner {
     /// The host's layout per render node (DRI index), once asked. A fact
     /// about the host, so it outlives a session reset.
     layouts: HashMap<u32, Layout>,
-    /// Every live render handle, with its DRI index.
+    /// Every live render handle, with its DRI index and the guest process
+    /// that opened it.
     renders: HashMap<u32, u32>,
+    render_owners: HashMap<u32, crate::quota::Owner>,
     /// Every RM client this VM allocated and has not freed, with the handle
     /// of the file it was allocated through (the client dies with that
     /// file, RmFreeUnusedClients, osapi.c:546-583).
@@ -190,7 +202,14 @@ impl SemsurfPolicy {
 
     /// A render node was opened as `handle`.
     pub fn render_opened(&self, handle: u32, dri: u32) {
-        self.lock().renders.insert(handle, dri);
+        self.render_opened_by(handle, dri, crate::quota::Owner::Unknown);
+    }
+
+    /// The same, by guest process `owner` (quota.rs).
+    pub fn render_opened_by(&self, handle: u32, dri: u32, owner: crate::quota::Owner) {
+        let mut g = self.lock();
+        g.renders.insert(handle, dri);
+        g.render_owners.insert(handle, owner);
     }
 
     /// RM_ALLOC of a client class succeeded through `issuer`.
@@ -204,7 +223,7 @@ impl SemsurfPolicy {
         &self,
         issuer: u32,
         h_client: u32,
-        by: Option<crate::rmshare::ProcId>,
+        by: Option<crate::rmshare::Caller>,
     ) {
         let mut g = self.lock();
         g.clients.insert(h_client, issuer);
@@ -217,7 +236,7 @@ impl SemsurfPolicy {
     }
 
     /// The guest process that made `h_client`, if the guest said.
-    pub fn owner_of(&self, h_client: u32) -> Option<crate::rmshare::ProcId> {
+    pub fn owner_of(&self, h_client: u32) -> Option<crate::rmshare::Caller> {
         self.lock().own.owners.get(&h_client).copied()
     }
 
@@ -240,25 +259,23 @@ impl SemsurfPolicy {
         self.lock().own.full_for(owner, object, p)
     }
 
-    /// Whether client `dst` may duplicate `(src, obj)` for `caller`
-    /// (rmshare.rs, `Ownership::dup_verdict`).
-    pub fn dup_verdict(
-        &self,
-        per_process: bool,
-        caller: Option<crate::rmshare::ProcId>,
-        dst: u32,
-        src: u32,
-        obj: u32,
-    ) -> crate::rmshare::DupVerdict {
+    /// Whether client `dst` may duplicate `(src, obj)` (rmshare.rs,
+    /// `Ownership::dup_verdict`).
+    pub fn dup_verdict(&self, dst: u32, src: u32, obj: u32) -> crate::rmshare::DupVerdict {
         let g = self.lock();
-        g.own.dup_verdict(
-            |c| g.clients.contains_key(&c),
-            per_process,
-            caller,
-            dst,
-            src,
-            obj,
-        )
+        g.own
+            .dup_verdict(|c| g.clients.contains_key(&c), dst, src, obj)
+    }
+
+    /// Whether a call by `caller` through client `own` may name `n`
+    /// (rmshare.rs, `Ownership::named_ok`).
+    pub fn named_ok(
+        &self,
+        caller: Option<&crate::rmshare::Caller>,
+        own: u32,
+        n: &crate::rmshare::Named,
+    ) -> bool {
+        self.lock().own.named_ok(caller, own, n)
     }
 
     /// RM_FREE of a client was asked for. Forgotten whatever RM answered: a
@@ -303,6 +320,7 @@ impl SemsurfPolicy {
     pub fn forget_handle(&self, handle: u32) -> Vec<u32> {
         let mut g = self.lock();
         g.renders.remove(&handle);
+        g.render_owners.remove(&handle);
         let gone: Vec<u32> = g
             .clients
             .iter()
@@ -321,6 +339,7 @@ impl SemsurfPolicy {
     pub fn reset(&self) {
         let mut g = self.lock();
         g.renders.clear();
+        g.render_owners.clear();
         g.clients.clear();
         g.os_events.clear();
         g.ctxs.clear();
@@ -383,6 +402,27 @@ impl SemsurfPolicy {
             log::warn!(
                 "SEMSURF_FENCE_CTX_CREATE on handle {target}: {mine} contexts in the file, {all} \
                  in the session (caps {CTX_CAP_PER_FILE}, {CTX_CAP_PER_SESSION}); refused"
+            );
+            return Err(libc::ENOSPC);
+        }
+        let owner = g.render_owners.get(&target).copied().unwrap_or_default();
+        let of_owner: usize = g
+            .ctxs
+            .iter()
+            .filter(|(r, _)| g.render_owners.get(r).copied().unwrap_or_default() == owner)
+            .map(|(_, s)| s.len())
+            .sum();
+        if let Err(why) = crate::quota::admits(
+            &CTX_SHARE,
+            owner,
+            of_owner as u64,
+            1,
+            all as u64,
+            CTX_CAP_PER_SESSION as u64,
+        ) {
+            log::warn!(
+                "SEMSURF_FENCE_CTX_CREATE on handle {target}: guest process {owner:?} holds \
+                 {of_owner} contexts, {all} in the session ({why:?}); refused"
             );
             return Err(libc::ENOSPC);
         }
@@ -554,6 +594,54 @@ pub fn query_layout(rm: &dyn Rm, gpu_minor: u32, gpu_id: u32) -> Result<Layout, 
     })
 }
 
+/// NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS (ctrl0000gpu.h:61-70): `{NvU32
+/// gpuIds[32];}`, answered on the root client, NON_PRIVILEGED.
+const NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS: u32 = 0x201;
+
+/// Whether the host's RM keeps a client to the file it was made on (R3).
+///
+/// Every guest process's RM files are the backend's, and every VM's backend
+/// may run as one user, so what keeps one guest process -- or one VM -- from
+/// using another's RM client by its handle is RM's strict client validation
+/// (PDB_PROP_SYS_VALIDATE_CLIENT_HANDLE_STRICT, rmclientValidate,
+/// client.c:774-784): a client is usable only through the file it was made
+/// on, or one registered to it. It is on by default, and a registry key
+/// (RmValidateClientData, system.c:715-754) turns it off; RM then falls back
+/// to comparing security tokens (the euid, or the PID), which every guest
+/// process and every backend of one user shares.
+///
+/// So this asks RM: a client made on one control file of the backend's
+/// own, used from a second. `Ok(true)` when RM refuses it (strict), and
+/// `Ok(false)` when RM serves it. `Err` when RM could not be asked at all,
+/// or would not answer on the client's own file either.
+pub fn probe_strict_clients(rm: &dyn Rm) -> Result<bool, String> {
+    let a = rm
+        .open("/dev/nvidiactl")
+        .map_err(|e| format!("/dev/nvidiactl: {e}"))?;
+    let b = rm
+        .open("/dev/nvidiactl")
+        .map_err(|e| format!("/dev/nvidiactl: {e}"))?;
+    let client = rm.alloc(a.as_raw_fd(), 0, 0, NV01_ROOT_CLIENT, None)?;
+    let mut ids = [0u8; 128];
+    rm.control(
+        a.as_raw_fd(),
+        client,
+        client,
+        NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS,
+        &mut ids,
+    )
+    .map_err(|e| format!("GET_ATTACHED_IDS on the client's own file: {e}"))?;
+    Ok(rm
+        .control(
+            b.as_raw_fd(),
+            client,
+            client,
+            NV0000_CTRL_CMD_GPU_GET_ATTACHED_IDS,
+            &mut ids,
+        )
+        .is_err())
+}
+
 /// The host's RM.
 pub struct HostRm;
 
@@ -706,7 +794,8 @@ impl NvidiaBackend {
                 }
             }
         }
-        self.semsurf.render_opened(handle, dri);
+        self.semsurf
+            .render_opened_by(handle, dri, self.handles.owner(handle));
     }
 
     /// The host descriptor for the OS event a guest names at `field` (8
@@ -964,6 +1053,34 @@ mod tests {
         assert_eq!(s.ctx_counts(RENDER), (0, 0));
     }
 
+    /// Four files of one process took the whole session (B3): one process
+    /// holds at most its share, and another still makes its first ones.
+    #[test]
+    fn one_guest_process_cannot_take_every_fence_context() {
+        use crate::quota::Owner;
+        let s = policy();
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        for r in 100..104 {
+            s.render_opened_by(r, 0, p(1));
+        }
+        s.render_opened_by(200, 0, p(2));
+        let mut made = 0u32;
+        'files: for r in 100..104 {
+            loop {
+                if s.admit(r, 0, &params(CLIENT, 4096)).is_err() {
+                    continue 'files;
+                }
+                s.lock().ctxs.entry(r).or_default().insert(made);
+                made += 1;
+            }
+        }
+        assert_eq!(made as u64, CTX_SHARE.per_owner, "the process's share");
+        assert_eq!(s.admit(200, 0, &params(CLIENT, 4096)), Ok(()));
+    }
+
     #[test]
     fn contexts_past_the_per_session_cap_are_refused_on_any_file() {
         let s = policy();
@@ -1219,6 +1336,64 @@ mod tests {
                 _ => Err("RM status 0x56".into()),
             }
         }
+    }
+
+    /// RM, as far as the strict-client probe asks it: a client made on one
+    /// file, and a control that is served only there when `strict`.
+    struct ProbeRm {
+        strict: bool,
+        opened: RefCell<Vec<RawFd>>,
+    }
+
+    impl Rm for ProbeRm {
+        fn open(&self, _: &str) -> io::Result<PrivateFd> {
+            let f: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+            self.opened.borrow_mut().push(f.as_raw_fd());
+            Ok(PrivateFd::new(f))
+        }
+
+        fn alloc(
+            &self,
+            _: RawFd,
+            _: u32,
+            _: u32,
+            class: u32,
+            _: Option<&mut [u8]>,
+        ) -> Result<u32, String> {
+            assert_eq!(class, NV01_ROOT_CLIENT);
+            Ok(0xc1d0_0001)
+        }
+
+        fn control(
+            &self,
+            fd: RawFd,
+            _: u32,
+            _: u32,
+            cmd: u32,
+            params: &mut [u8],
+        ) -> Result<(), String> {
+            assert_eq!((cmd, params.len()), (0x201, 128));
+            if self.strict && fd != self.opened.borrow()[0] {
+                return Err("RM status 0x1a".into()); // NV_ERR_INVALID_CLIENT
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_host_whose_rm_serves_a_client_from_another_file_is_found_out() {
+        let strict = ProbeRm {
+            strict: true,
+            opened: RefCell::default(),
+        };
+        assert_eq!(probe_strict_clients(&strict), Ok(true));
+        let lax = ProbeRm {
+            strict: false,
+            opened: RefCell::default(),
+        };
+        assert_eq!(probe_strict_clients(&lax), Ok(false));
+        // A host that answers nothing is not called strict.
+        assert!(probe_strict_clients(&FakeRm::default()).is_err());
     }
 
     #[test]

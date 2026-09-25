@@ -60,6 +60,13 @@ pub struct BackendConfig {
     pub fences: bool,
     /// Whether an NVKMS schema exists for the host driver version.
     pub nvkms_table: bool,
+    /// Serve the paths only CUDA and other compute needs (`--allow-compute`):
+    /// `/dev/nvidia-uvm` (every open of it or its tools device is refused
+    /// without), and with it UVM's sharing mode and the UVM aperture
+    /// (BCAP_UVM_MAP), and memory registered by its guest pages
+    /// (BCAP_OS_DESC). Off by default: graphics, video and display need none
+    /// of them (SECURITY.md, "Compute").
+    pub allow_compute: bool,
 }
 
 impl BackendConfig {
@@ -83,6 +90,9 @@ impl BackendConfig {
         if self.wayland_export.is_some() {
             caps |= BCAP_WL_EXPORT;
         }
+        if self.allow_compute {
+            caps |= BCAP_COMPUTE;
+        }
         caps
     }
 }
@@ -99,6 +109,9 @@ pub struct Session {
     /// The guest says which of its processes makes each RM_ALLOC and
     /// RM_DUP_OBJECT (HELLO's GCAP_PROC_ID, rmshare.rs).
     pub proc_ids: bool,
+    /// With them, the caller's euid, and on every RM_CONTROL too (HELLO's
+    /// GCAP_PROC_EUID, BCAP_PROC_EUID).
+    pub proc_euid: bool,
     /// A guest that does not has been told of in the log, once a session.
     pub proc_ids_noted: bool,
 }
@@ -306,6 +319,9 @@ struct Ioctl2Call {
     /// as it runs, so a CLOSE racing it cannot pull the file away.
     target_fd: OwnedFd,
     target: u32,
+    /// Who what the call makes is charged to (quota.rs), taken when it was
+    /// served: the target may be closed before it finishes.
+    owner: crate::quota::Owner,
     executor: bool,
     generation: u64,
     req_id: u32,
@@ -384,6 +400,9 @@ struct BackendFinisher<'a> {
     /// Handles adopted, for the reply to carry (and close, if it is never
     /// delivered).
     created: Vec<u32>,
+    /// The guest process they are charged to: the owner of the file the
+    /// call ran on (quota.rs).
+    owner: crate::quota::Owner,
 }
 
 impl xfer::Finisher for BackendFinisher<'_> {
@@ -410,7 +429,7 @@ impl xfer::Finisher for BackendFinisher<'_> {
                 log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
             }
         }
-        match self.backend.handles.insert(fd, kind) {
+        match self.backend.handles.insert_for(fd, kind, self.owner) {
             Ok(h) => {
                 self.created.push(h);
                 (h, kind)
@@ -537,15 +556,22 @@ impl NvidiaBackend {
             backend_caps |= BCAP_UVM_MAP;
         }
         // Memory the guest already has is registered by its pages, which
-        // takes knowing where guest RAM is (osdesc.rs).
-        if self.guest_ram.is_some() {
+        // takes knowing where guest RAM is (osdesc.rs), and is served only
+        // for compute.
+        if self.guest_ram.is_some() && self.config.allow_compute {
             backend_caps |= BCAP_OS_DESC;
         }
         // RM objects kept to the guest process that made their client
-        // (rmshare.rs), for a guest that can say which that is.
+        // (rmshare.rs), for a guest that can say which that is; and a second
+        // client a call names held to RM's rule, for one that also says the
+        // caller's euid.
         self.session.proc_ids = req.guest_caps & GCAP_PROC_ID != 0;
+        self.session.proc_euid = self.session.proc_ids && req.guest_caps & GCAP_PROC_EUID != 0;
         if self.session.proc_ids {
             backend_caps |= BCAP_PROC_ID;
+        }
+        if self.session.proc_euid {
+            backend_caps |= BCAP_PROC_EUID;
         }
         let resp = HelloResp {
             proto: PROTO_V2,
@@ -577,7 +603,11 @@ impl NvidiaBackend {
             .is_some_and(|t| {
                 t.init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE != 0
             });
-        let len = if req.guest_caps & GCAP_UVM_APERTURE != 0 && self.has_window() && sharing {
+        let len = if req.guest_caps & GCAP_UVM_APERTURE != 0
+            && self.config.allow_compute
+            && self.has_window()
+            && sharing
+        {
             u64::from(req.uvm_aperture_mib) << 20
         } else {
             0
@@ -687,7 +717,7 @@ impl NvidiaBackend {
     }
 
     fn insert(&mut self, fd: OwnedFd, kind: HandleKind) -> Result<u32, i32> {
-        self.handles.insert(fd, kind).map_err(|e| {
+        self.handles.insert_for(fd, kind, self.current_owner).map_err(|e| {
             log::warn!("handle table full; refusing a new {kind:?}");
             e.errno()
         })
@@ -901,6 +931,7 @@ impl NvidiaBackend {
             prepared,
             target_fd,
             target,
+            owner: self.handles.owner(target),
             executor,
             generation: self.session.generation,
             req_id: self.current_req_id,
@@ -921,6 +952,7 @@ impl NvidiaBackend {
             prepared,
             target_fd,
             target,
+            owner,
             generation,
             req_id,
             cap,
@@ -940,6 +972,7 @@ impl NvidiaBackend {
             cards: &nodes.cards,
             stale,
             created: Vec::new(),
+            owner,
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
@@ -1038,6 +1071,7 @@ impl NvidiaBackend {
         self.session.generation += 1;
         self.session.v2 = false;
         self.session.proc_ids = false;
+        self.session.proc_euid = false;
         self.session.proc_ids_noted = false;
         self.pump_cmds.push(PumpCmd::Reset);
         self.pump_cmds.push(PumpCmd::SetV2(false));
@@ -1213,6 +1247,16 @@ mod tests {
         };
         let mut be = backend();
         be.set_host_driver_version("595.99.02");
+        be.set_window(Box::new(NoVmm));
+        assert_eq!(
+            caps(&mut be, GCAP_UVM_APERTURE, 1024),
+            0,
+            "no --allow-compute"
+        );
+        assert_eq!(be.uvm_maps.aperture_len(), 0);
+        let mut be = backend();
+        be.set_host_driver_version("595.99.02");
+        be.config_mut().allow_compute = true;
         assert_eq!(
             caps(&mut be, GCAP_UVM_APERTURE, 1024),
             0,
@@ -1234,12 +1278,67 @@ mod tests {
         assert_eq!(be.uvm_maps.aperture_len(), 6 << 20);
         // A host whose UVM this backend has no table for.
         let mut be = backend();
+        be.config_mut().allow_compute = true;
         be.set_window(Box::new(NoVmm));
         assert_eq!(
             caps(&mut be, GCAP_UVM_APERTURE, 1024),
             0,
             "no sharing mode known"
         );
+    }
+
+    /// `--allow-compute` off (the default): no UVM device opens on the
+    /// host, and HELLO offers none of what only compute uses.
+    #[test]
+    fn compute_is_served_only_when_the_operator_allows_it() {
+        let caps = |be: &mut NvidiaBackend| {
+            let req = HelloReq {
+                proto: PROTO_V2,
+                flags: HELLO_F_FRESH,
+                guest_caps: GCAP_UVM_APERTURE | GCAP_PROC_ID | GCAP_PROC_EUID,
+                uvm_aperture_mib: 1024,
+            };
+            let r = call(be, MsgType::Hello, 0, bytes_of(&req));
+            assert_eq!(status(&r), 0);
+            read::<HelloResp>(&r[HDR..]).unwrap().backend_caps
+        };
+        let open = |be: &mut NvidiaBackend, device_type: u32| {
+            let req = OpenReq {
+                device_type,
+                flags: 0,
+            };
+            call(be, MsgType::Open, 0, bytes_of(&req))
+        };
+        assert!(!BackendConfig::default().allow_compute, "off by default");
+        let mut be = backend();
+        be.set_host_driver_version("595.99.02");
+        be.set_window(Box::new(NoVmm));
+        let c = caps(&mut be);
+        assert_eq!(c & (BCAP_COMPUTE | BCAP_UVM_MAP | BCAP_OS_DESC), 0);
+        // What the RM isolation needs is not compute's.
+        assert_eq!(
+            c & (BCAP_PROC_ID | BCAP_PROC_EUID),
+            BCAP_PROC_ID | BCAP_PROC_EUID
+        );
+        for dev in [DEV_UVM, DEV_UVM_TOOLS] {
+            let r = open(&mut be, dev);
+            assert_eq!(status(&r), -libc::ENODEV, "device {dev:#x}");
+        }
+        assert_eq!(be.handle_count(), 0, "nothing opened on the host");
+        // Allowed: offered, and the open goes to the host (which in this
+        // sandbox may or may not have a UVM device; either way the gate is
+        // not what answers).
+        be.config_mut().allow_compute = true;
+        let c = caps(&mut be);
+        assert_ne!(c & BCAP_COMPUTE, 0);
+        assert_ne!(c & BCAP_UVM_MAP, 0);
+        let r = open(&mut be, DEV_UVM_TOOLS);
+        if status(&r) == 0 {
+            let h = read::<MsgHeader>(&r).unwrap().handle;
+            be.close_handle(h).unwrap();
+        } else if !std::path::Path::new("/dev/nvidia-uvm-tools").exists() {
+            assert_eq!(status(&r), -libc::ENOENT, "the host's own answer");
+        }
     }
 
     #[test]
@@ -1333,6 +1432,54 @@ mod tests {
             status(&r),
             read::<HostOpResp>(&r[HDR..]).unwrap_or_default(),
         )
+    }
+
+    /// HOST_OP with the caller after it (quota.rs): one guest process
+    /// runs out of handles at its share, another does not (B1).
+    #[test]
+    fn one_guest_process_cannot_take_every_handle_through_host_ops() {
+        let mut be = backend();
+        let req = HelloReq {
+            proto: PROTO_V2,
+            flags: HELLO_F_FRESH,
+            guest_caps: GCAP_PROC_ID,
+            uvm_aperture_mib: 0,
+        };
+        call(&mut be, MsgType::Hello, 0, bytes_of(&req));
+        be.handles.set_limit(256);
+        let op = |be: &mut NvidiaBackend, tgid: u32| {
+            let mut body = bytes_of(&HostOpReq {
+                op: OP_NEW_EVENTFD,
+                nargs: 0,
+                args: [0; OP_MAX_ARGS],
+            })
+            .to_vec();
+            body.extend_from_slice(bytes_of(&ProcId {
+                start_ns: 1,
+                tgid,
+                euid: 0,
+            }));
+            let r = call(be, MsgType::HostOp, 0, &body);
+            (status(&r), read::<HostOpResp>(&r[HDR..]).unwrap_or_default())
+        };
+        let mut made = 0;
+        while op(&mut be, 10).0 == 0 {
+            made += 1;
+        }
+        assert_eq!(made, 64, "a quarter of the table");
+        assert_eq!(op(&mut be, 10).0, -libc::EMFILE);
+        let (st, r) = op(&mut be, 11);
+        assert_eq!(st, 0, "another process still gets one");
+        let h = r.res[0] as u32;
+        let b = crate::quota::Owner::Proc {
+            tgid: 11,
+            start_ns: 1,
+        };
+        assert_eq!(be.handles.owner(h), b);
+        assert_eq!(be.handles.held_by(b), 1);
+        // Closing gives the share back.
+        call(&mut be, MsgType::Close, h, &[]);
+        assert_eq!(be.handles.held_by(b), 0);
     }
 
     #[test]

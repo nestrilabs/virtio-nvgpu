@@ -3,6 +3,11 @@
 # drives the host GPU through RM/UVM forwarding. nvidia-smi, Vulkan, EGL, and
 # the CUDA driver API (with a kernel launch). Any display mode.
 #   nvgpu_frames=N   (unused here)
+#   nvgpu_compute=1  the backend runs with --allow-compute (run-guest.sh
+#                    --allow-compute or NVGPU_COMPUTE=1 passes it): CUDA must
+#                    work. Otherwise (0, the default) the guest must have no
+#                    UVM device, CUDA must fail cleanly, and everything else
+#                    must work without it.
 . /opt/nvgpu/probe-common.sh
 probe_init render 170
 
@@ -58,9 +63,40 @@ done
 if [ "$egl_ok" = 1 ]; then pass "EGL: an NVIDIA EGL display initialised"; else fail "EGL: no platform initialised the NVIDIA EGL vendor"; fi
 
 section "CUDA"
-# Context creation needs the UVM aperture (semaphore pools) and OS-descriptor
-# memory by guest page (ARCHITECTURE.md §5); both are in, so any failure is one.
-step "cuda-smoke (driver API, 16 MiB round trip, PTX kernel)" 90 cuda-smoke
+if [ "$(arg compute 0)" = 1 ]; then
+    # Context creation needs the UVM aperture (semaphore pools) and
+    # OS-descriptor memory by guest page (ARCHITECTURE.md §5); both are
+    # served with --allow-compute, so any failure is one.
+    if [ -c /dev/nvidia-uvm ]; then
+        pass "/dev/nvidia-uvm is there (--allow-compute)"
+    else
+        fail "no /dev/nvidia-uvm although the backend was started with --allow-compute"
+    fi
+    step "cuda-smoke (driver API, 16 MiB round trip, PTX kernel)" 90 cuda-smoke
+else
+    # Without --allow-compute the backend serves no UVM (SECURITY.md,
+    # "Compute"): the guest makes no /dev/nvidia-uvm, as on a host whose
+    # nvidia-uvm is not loaded, and CUDA finds nothing to run on. What this
+    # section checks is that it says so and exits, rather than crashing or
+    # hanging -- and the sections above, which ran without UVM, are the proof
+    # that graphics does not need it.
+    if [ -e /dev/nvidia-uvm ] || grep -q ' nvidia-uvm$' /proc/devices; then
+        fail "compute is off, yet the guest has a UVM device ($(ls -l /dev/nvidia-uvm* 2>&1 | tr '\n' ' '))"
+    else
+        pass "no UVM device without --allow-compute"
+    fi
+    out=$(timeout -k 5 60 cuda-smoke 2>&1)
+    rc=$?
+    printf '%s\n' "$out" | head -n 10 | sed 's/^/    /'
+    if [ "$rc" = 0 ]; then
+        fail "cuda-smoke succeeded without --allow-compute"
+    elif [ "$rc" -lt 124 ] && printf '%s\n' "$out" |
+        grep -Eq 'FAIL (cuInit|cuDriverGetVersion|cuDeviceGet[A-Za-z]*|cuCtxCreate|no CUDA device)'; then
+        pass "cuda-smoke finds no usable device without --allow-compute (exit $rc: $(printf '%s\n' "$out" | grep -m1 'FAIL' | sed 's/^cuda-smoke: //'))"
+    else
+        fail "cuda-smoke: exit $rc without --allow-compute (a crash, a hang, or a failure past context creation)"
+    fi
+fi
 
 section "vkcube"
 # vkcube has no WSI that needs no display (no headless surface); the Wayland

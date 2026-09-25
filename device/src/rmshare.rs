@@ -24,29 +24,32 @@
 //!   other VMs' backends included), SMC_PARTITION, GPU, FM_CLIENT, a type RM
 //!   does not define, or CLIENT naming a client that is not this VM's, is
 //!   refused. What RM took is recorded ([`Grant`]), for the next rule.
-//! - **A duplicate's source is this VM's, and its guest process's**
-//!   ([`DupVerdict`]). NV_ESC_RM_DUP_OBJECT (NVOS55) names two clients: both
-//!   must be clients this VM allocated and has not freed. And as RM would if
-//!   the guest's processes were the host's, the source client must have been
-//!   made by the same guest process as the destination client -- or by the
-//!   process making the call (its own object, into a client it holds a file
-//!   of), or the list RM checks the source object against must carry a
-//!   CLIENT grant to the destination client for DUP_OBJECT: the object's
-//!   own, or its client's while no other object of the client has one
-//!   ([`Ownership`]). Which process made a client, and which makes a call, only
-//!   the guest kernel knows: it says, with [`ProcId`] (BCAP_PROC_ID). A guest
-//!   that cannot keeps what it had -- its processes share RM objects freely,
-//!   noted once per session -- as it did before this was checked; the rules
-//!   about other VMs and the host hold for it all the same.
-//! - **No other client is named as a second one** ([`alloc_named`],
-//!   [`control_named`]). Allocation classes and controls that name a client
-//!   besides the caller's -- a device sharing another client's VA space, an
-//!   event on another client's object, a debugger or profiler of another
-//!   client's context, register operations on another client's channel,
-//!   other clients' channels disabled --
-//!   are checked by RM against the caller's security token, which matches
-//!   any host process of the backend's uid, or not at all; the client they
-//!   name must be none (the caller's own) or this VM's.
+//! - **A duplicate is RM's rule, kept to guest processes** ([`DupVerdict`]).
+//!   NV_ESC_RM_DUP_OBJECT (NVOS55) names two clients: both must be clients
+//!   this VM allocated and has not freed. RM's own rule between them is its
+//!   PID default -- the source client's maker is the destination client's
+//!   (cliresShareCallback) -- or a grant in the list RM checks the source
+//!   object against; the backend applies exactly that, with guest processes
+//!   for host ones: the two clients were made by one guest process, or the
+//!   object's own list, or its client's while no other object of the client
+//!   has one ([`Ownership`]), carries a CLIENT grant of DUP_OBJECT to the
+//!   destination. Which process made a client only the guest kernel knows: it
+//!   says, with [`ProcId`] (BCAP_PROC_ID). A guest that cannot gets no
+//!   duplicate between two clients except by a recorded grant: without the
+//!   process, RM's rule cannot be told from "any client of the VM".
+//! - **A second client named in parameters, to RM's rule for it**
+//!   ([`alloc_named`], [`control_named`], [`Rule`]). Allocation classes and
+//!   controls that name a client besides the caller's -- a device sharing
+//!   another client's VA space, an event on another client's object, a
+//!   debugger or profiler of another client's context, register operations
+//!   on another client's channel, other clients' channels disabled -- are
+//!   checked by RM, when at all, with a security token (the caller's euid, or
+//!   its process) that every guest process shares, since all are the
+//!   backend's. Each field gets the rule RM applies to it between host
+//!   processes, with the guest's processes and euids ([`Caller`], from
+//!   BCAP_PROC_EUID) in place of the backend's; where RM checks nothing, the
+//!   named client must be the calling process's own. The client must be this
+//!   VM's first of all.
 //!
 //! A refusal is RM's own for a caller without the right,
 //! NV_ERR_INSUFFICIENT_PERMISSIONS in the parameters' status with the ioctl
@@ -251,6 +254,39 @@ pub fn apply_share(list: &mut Vec<Grant>, owner: u32, p: &Policy) -> isize {
     list.len() as isize - before
 }
 
+/// Who makes an RM call, or made a client, as the guest kernel says
+/// ([`ProcId`]): one guest process, and its effective uid when the session
+/// has BCAP_PROC_EUID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub start_ns: u64,
+    pub tgid: u32,
+    pub euid: Option<u32>,
+}
+
+impl Caller {
+    /// From the wire; `euid` says whether its euid field is one.
+    pub fn from_wire(id: &ProcId, euid: bool) -> Self {
+        Self {
+            start_ns: id.start_ns,
+            tgid: id.tgid,
+            euid: euid.then_some(id.euid),
+        }
+    }
+
+    /// One guest process: an exec keeps it, a setuid does not change it.
+    pub fn same_process(&self, o: &Self) -> bool {
+        self.start_ns == o.start_ns && self.tgid == o.tgid
+    }
+
+    /// RM's security-token match between two host processes
+    /// (osValidateClientTokens, os.c: one euid, or one PID). An euid the
+    /// guest did not say matches none.
+    pub fn same_token(&self, o: &Self) -> bool {
+        self.same_process(o) || matches!((self.euid, o.euid), (Some(a), Some(b)) if a == b)
+    }
+}
+
 /// Whether a duplicate may reach RM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DupVerdict {
@@ -262,6 +298,9 @@ pub enum DupVerdict {
     /// Both are this VM's, made by different guest processes, and nothing
     /// shares the source with the destination.
     OtherProcess,
+    /// Both are this VM's, and which guest process made one of them is not
+    /// known (a guest without BCAP_PROC_ID), nor does a grant share it.
+    Unattributed,
 }
 
 /// NV_ESC_RM_DUP_OBJECT's `(hClient, hClientSrc, hObjectSrc)`.
@@ -273,65 +312,161 @@ pub fn dup_names(params: &[u8]) -> Option<(u32, u32, u32)> {
     ))
 }
 
+/// The rule a second client named in parameters is held to: RM's for that
+/// field between two host processes, the guest's processes and euids in
+/// place of the backend's one. The caller's own client, and none (zero),
+/// pass every rule, as they do in RM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule {
+    /// Made by the calling guest process. For the fields RM checks nothing
+    /// of, or checks only inside GSP-RM, whose security token is the GFID or
+    /// none (kernel_sm_debugger_session.c, the comment above
+    /// VALIDATE_MATCHING_SEC_TOKENS): any host process could name any client
+    /// there, and the backend holds it to the one the guest process made.
+    Process,
+    /// clientValidate against the caller (client.c, rmclientValidate): with
+    /// RM's default PDB_PROP_SYS_VALIDATE_CLIENT_HANDLE_STRICT the client
+    /// must be one of the calling file's, which RM itself checks on the
+    /// backend's file (one per guest file); without it, the calling
+    /// process's security token: made by the calling guest process or by one
+    /// of the caller's euid.
+    Token,
+    /// osValidateClientTokens between the caller's client and the named one
+    /// (`_kfifoValidateTargetClient`, profilerDevConstruct): the two clients
+    /// were made by one guest process, or by processes of one euid.
+    ClientToken,
+    /// A right RM grants from the object's share list (rsAccessCheckRights):
+    /// its PID default, which the backend's process matches for every guest
+    /// client, becomes "the two clients were made by one guest process"; a
+    /// CLIENT grant of any of `rights` on the object at offset `obj` of the
+    /// parameters, recorded when RM took it, counts as RM counts it.
+    Shared { rights: u32, obj: usize },
+}
+
+/// A client field: its offset in the parameters, and its rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub at: usize,
+    pub rule: Rule,
+}
+
+const fn f(at: usize, rule: Rule) -> Field {
+    Field { at, rule }
+}
+
+/// `RS_ACCESS_DEBUG`, as a bit of an `RS_ACCESS_MASK`'s one limb.
+pub const RS_ACCESS_DEBUG_BIT: u32 = 1 << 2;
+/// Every right RM defines (RS_ACCESS_COUNT is 4).
+const RS_ACCESS_ANY: u32 = 0xf;
+
 /// Allocation classes whose parameters name a client besides the caller's,
-/// with where (class parameters, after NVOS64). Zero there is the caller's
-/// own client (or none) to RM. Measured on 610.57.04's SDK headers and the
-/// same in 595.99.02:
+/// with where (class parameters, after NVOS64) and RM's rule for it. Zero
+/// there is the caller's own client (or none) to RM. Measured on
+/// 610.57.04's SDK headers and the same in 595.99.02:
 ///
 /// - 0x0080 NV01_DEVICE_0: `hClientShare` (4), the client whose VA space the
-///   device shares, checked by RM with clientValidate (the security token,
-///   device.c `_deviceValidateClientShare`); `hTargetClient` (8), vGPU's.
+///   device shares: clientValidate (device.c `_deviceValidateClientShare`),
+///   [`Rule::Token`]. `hTargetClient` (8) is stored for vGPU and never
+///   checked: [`Rule::Process`].
 /// - 0x0005 NV01_EVENT, 0x0079 NV01_EVENT_OS_EVENT: `hParentClient` (0), the
-///   client of the object the event is on, not checked at all
-///   (event_api.c, eventConstruct). 0x0078/0x007e are refused whole
+///   client of the object the event is on, not checked at all (event_api.c,
+///   eventConstruct; rmapi_specific.c only moves the event under the
+///   caller's client): [`Rule::Process`]. 0x0078/0x007e are refused whole
 ///   (guestptr.rs).
-/// - 0x83de GT200_DEBUGGER: `hAppClient` (4), the debugged client; RM wants
-///   RS_ACCESS_DEBUG shared, which only a CLIENT grant this VM may make can.
-/// - 0xb2cc MAXWELL_PROFILER_DEVICE: `hClientTarget` (0), checked by
-///   security token (kern_profiler_v2.c) -- and not at all for a caller at
-///   USER_ROOT.
-/// - 0xc574 UVM_CHANNEL_RETAINER: `hClient` (0); kernel-privileged in RM.
-/// - 0xcb33 NV_CONFIDENTIAL_COMPUTE: `hClient` (0).
-pub const ALLOC_CLIENT_FIELDS: &[(u32, &str, &[usize])] = &[
-    (0x0080, "NV01_DEVICE_0", &[4, 8]),
-    (0x0005, "NV01_EVENT", &[0]),
-    (0x0079, "NV01_EVENT_OS_EVENT", &[0]),
-    (0x83de, "GT200_DEBUGGER", &[4]),
-    (0xb2cc, "MAXWELL_PROFILER_DEVICE", &[0]),
-    (0xc574, "UVM_CHANNEL_RETAINER", &[0]),
-    (0xcb33, "NV_CONFIDENTIAL_COMPUTE", &[0]),
+/// - 0x83de GT200_DEBUGGER: `hAppClient` (4), the debugged client; CPU-RM
+///   wants RS_ACCESS_DEBUG on `hClass3dObject` (8) from its share list
+///   (ksmdbgssnConstruct): [`Rule::Shared`].
+/// - 0xb2cc MAXWELL_PROFILER_DEVICE: `hClientTarget` (0), the two clients'
+///   security tokens (kern_profiler_v2.c, profilerDevConstruct; skipped for
+///   a caller at USER_ROOT, which no guest process is to the backend):
+///   [`Rule::ClientToken`].
+/// - 0xc574 UVM_CHANNEL_RETAINER: `hClient` (0); RM makes it for kernel
+///   clients only (uvmchanrtnrIsAllocationAllowed): [`Rule::Process`].
+/// - 0xcb33 NV_CONFIDENTIAL_COMPUTE: `hClient` (0), never read by
+///   confComputeApiConstruct: [`Rule::Process`].
+pub const ALLOC_CLIENT_FIELDS: &[(u32, &str, &[Field])] = &[
+    (
+        0x0080,
+        "NV01_DEVICE_0",
+        &[f(4, Rule::Token), f(8, Rule::Process)],
+    ),
+    (0x0005, "NV01_EVENT", &[f(0, Rule::Process)]),
+    (0x0079, "NV01_EVENT_OS_EVENT", &[f(0, Rule::Process)]),
+    (
+        0x83de,
+        "GT200_DEBUGGER",
+        &[f(
+            4,
+            Rule::Shared {
+                rights: RS_ACCESS_DEBUG_BIT,
+                obj: 8,
+            },
+        )],
+    ),
+    (
+        0xb2cc,
+        "MAXWELL_PROFILER_DEVICE",
+        &[f(0, Rule::ClientToken)],
+    ),
+    (0xc574, "UVM_CHANNEL_RETAINER", &[f(0, Rule::Process)]),
+    (0xcb33, "NV_CONFIDENTIAL_COMPUTE", &[f(0, Rule::Process)]),
 ];
 
 /// NV2080_CTRL_CMD_GPU_{INITIALIZE,PROMOTE,EVICT}_CTX: `hClient` at 4 and
-/// `hChanClient` at 12.
-const CTX_FIELDS: &[usize] = &[4, 12];
+/// `hChanClient` at 12, handled in GSP-RM (RMCTRL_FLAGS ROUTE_TO_PHYSICAL).
+const CTX_FIELDS: &[Field] = &[f(4, Rule::Process), f(12, Rule::Process)];
+const P0: &[Field] = &[f(0, Rule::Process)];
 
-/// Controls whose parameters name a client besides the caller's, with where.
-/// Every one with a `NvHandle h*Client*` field in 610.57.04's ctrl headers
-/// that a user client reaches (RMCTRL_FLAGS NON_PRIVILEGED or PRIVILEGED
-/// in the exported method tables; the kernel-privileged ones RM refuses the
-/// backend anyway, and the vGPU host plugin's, diagnostics' and INTERNAL
-/// ones are not for it either). RM checks these, when it does, by security
-/// token (`_kfifoValidateTargetClient`, the regops path), which a host
-/// process of the backend's uid passes.
-pub const CONTROL_CLIENT_FIELDS: &[(u32, &str, &[usize])] = &[
+/// Controls whose parameters name a client besides the caller's, with where
+/// and RM's rule. Every one with a `NvHandle h*Client*` field in 610.57.04's
+/// ctrl headers that a user client reaches (RMCTRL_FLAGS NON_PRIVILEGED or
+/// PRIVILEGED in the exported method tables; the kernel-privileged ones RM
+/// refuses the backend anyway, and the vGPU host plugin's, diagnostics' and
+/// INTERNAL ones are not for it either). What RM does with each:
+///
+/// - CLIENT_GET_ACCESS_RIGHTS: nothing checked; the answer is the caller's
+///   rights on `(hClient, hObject)` (hObject at 0) from the object's share
+///   list (cliresCtrlCmdClientGetAccessRights): [`Rule::Shared`], any right.
+/// - NV503C REGISTER_PID: nothing checked; registers the named client's
+///   ProcID for third-party P2P (thirdpartyp2pCtrlCmdRegisterPid).
+/// - the GR ctxsw binds, EXEC_REG_OPS and MIGRATABLE_OPS, PROMOTE, EVICT and
+///   INITIALIZE_CTX: sent on to GSP-RM, CPU-RM checking nothing of the
+///   client (subdevice_ctrl_gpu_regops.c; ROUTE_TO_PHYSICAL).
+/// - FIFO_UPDATE_CHANNEL_INFO: looked up, not checked (kernel_fifo_ctrl.c).
+/// - FIFO_GET_CHANNEL_GROUP_UNIQUE_ID_INFO: `_kfifoValidateTargetClient`,
+///   the two clients' tokens: [`Rule::ClientToken`].
+/// - DMA_INVALIDATE_TLB: not read by CPU-RM (the subdevice's own client is
+///   used, dma.c).
+///
+/// All [`Rule::Process`] but the two named.
+pub const CONTROL_CLIENT_FIELDS: &[(u32, &str, &[Field])] = &[
     (
         0x0000_0d03,
         "NV0000_CTRL_CMD_CLIENT_GET_ACCESS_RIGHTS",
-        &[4],
+        &[f(
+            4,
+            Rule::Shared {
+                rights: RS_ACCESS_ANY,
+                obj: 0,
+            },
+        )],
     ),
-    (0x503c_0106, "NV503C_CTRL_CMD_REGISTER_PID", &[0]),
-    (0x2080_1205, "NV2080_CTRL_CMD_GR_CTXSW_ZCULL_MODE", &[4]),
-    (0x2080_1208, "NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND", &[0]),
-    (0x2080_1209, "NV2080_CTRL_CMD_GR_CTXSW_PM_BIND", &[0]),
-    (0x2080_123a, "NV2080_CTRL_CMD_GR_CTXSW_SETUP_BIND", &[0]),
+    (0x503c_0106, "NV503C_CTRL_CMD_REGISTER_PID", P0),
+    (
+        0x2080_1205,
+        "NV2080_CTRL_CMD_GR_CTXSW_ZCULL_MODE",
+        &[f(4, Rule::Process)],
+    ),
+    (0x2080_1208, "NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND", P0),
+    (0x2080_1209, "NV2080_CTRL_CMD_GR_CTXSW_PM_BIND", P0),
+    (0x2080_123a, "NV2080_CTRL_CMD_GR_CTXSW_SETUP_BIND", P0),
     (
         0x2080_1211,
         "NV2080_CTRL_CMD_GR_CTXSW_PREEMPTION_BIND",
-        &[4],
+        &[f(4, Rule::Process)],
     ),
-    (0x2080_0122, "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS", &[0]),
-    (0x2080_01a6, "NV2080_CTRL_CMD_GPU_MIGRATABLE_OPS", &[0]),
+    (0x2080_0122, "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS", P0),
+    (0x2080_01a6, "NV2080_CTRL_CMD_GPU_MIGRATABLE_OPS", P0),
     (0x2080_012b, "NV2080_CTRL_CMD_GPU_PROMOTE_CTX", CTX_FIELDS),
     (0x2080_012c, "NV2080_CTRL_CMD_GPU_EVICT_CTX", CTX_FIELDS),
     (
@@ -339,33 +474,31 @@ pub const CONTROL_CLIENT_FIELDS: &[(u32, &str, &[usize])] = &[
         "NV2080_CTRL_CMD_GPU_INITIALIZE_CTX",
         CTX_FIELDS,
     ),
-    (
-        0x2080_1116,
-        "NV2080_CTRL_CMD_FIFO_UPDATE_CHANNEL_INFO",
-        &[0],
-    ),
+    (0x2080_1116, "NV2080_CTRL_CMD_FIFO_UPDATE_CHANNEL_INFO", P0),
     (
         0x2080_1123,
         "NV2080_CTRL_CMD_FIFO_GET_CHANNEL_GROUP_UNIQUE_ID_INFO",
-        &[0],
+        &[f(0, Rule::ClientToken)],
     ),
-    (0x2080_2502, "NV2080_CTRL_CMD_DMA_INVALIDATE_TLB", &[0]),
+    (0x2080_2502, "NV2080_CTRL_CMD_DMA_INVALIDATE_TLB", P0),
 ];
 
 /// Controls whose parameters name clients in a list, with where the count
-/// is, where the list starts, and its length: `(cmd, name, count, list,
-/// max)`. RM reads the first `count` entries (NON_PRIVILEGED in 595.99.02
-/// and 610.57.04, the layouts identical). DISABLE_CHANNELS goes to GSP-RM
-/// as it is (kernel_fifo_ctrl.c, subdeviceCtrlCmdFifoDisableChannels): the
-/// channels of whatever clients it names, stopped; QUERY_CHANNEL_UNIQUE_ID
-/// checks them by security token (`_kfifoValidateTargetClient`).
-pub const CONTROL_CLIENT_LISTS: &[(u32, &str, usize, usize, usize)] = &[
+/// is, where the list starts, its length and RM's rule: `(cmd, name, count,
+/// list, max, rule)`. RM reads the first `count` entries (NON_PRIVILEGED in
+/// 595.99.02 and 610.57.04, the layouts identical). DISABLE_CHANNELS goes
+/// to GSP-RM as it is (kernel_fifo_ctrl.c, subdeviceCtrlCmdFifoDisable
+/// Channels): the channels of whatever clients it names, stopped, and so do
+/// the two key-rotation ones; QUERY_CHANNEL_UNIQUE_ID checks the two
+/// clients' tokens (`_kfifoValidateTargetClient`).
+pub const CONTROL_CLIENT_LISTS: &[(u32, &str, usize, usize, usize, Rule)] = &[
     (
         0x2080_110b,
         "NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS",
         4,
         24,
         64,
+        Rule::Process,
     ),
     (
         0x2080_111a,
@@ -373,16 +506,35 @@ pub const CONTROL_CLIENT_LISTS: &[(u32, &str, usize, usize, usize)] = &[
         0,
         4,
         64,
+        Rule::Process,
     ),
-    (0x2080_111c, "NV2080_CTRL_CMD_FIFO_ROTATE_KEYS", 0, 4, 64),
+    (
+        0x2080_111c,
+        "NV2080_CTRL_CMD_FIFO_ROTATE_KEYS",
+        0,
+        4,
+        64,
+        Rule::Process,
+    ),
     (
         0x2080_1124,
         "NV2080_CTRL_CMD_FIFO_QUERY_CHANNEL_UNIQUE_ID",
         1024,
         0,
         128,
+        Rule::ClientToken,
     ),
 ];
+
+/// A second client a call names: the handle, the call's name, RM's rule, and
+/// for [`Rule::Shared`] the object it is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Named {
+    pub h: u32,
+    pub what: &'static str,
+    pub rule: Rule,
+    pub obj: u32,
+}
 
 /// The clients a listed control names (`CONTROL_CLIENT_LISTS`), zeros left
 /// out; a count past the list is refused whole, as RM refuses it.
@@ -392,33 +544,32 @@ fn named_list(
     list: usize,
     max: usize,
     name: &'static str,
-) -> Result<Vec<(u32, &'static str)>, &'static str> {
+    rule: Rule,
+) -> Result<Vec<Named>, &'static str> {
     let n = rd32(b, count).ok_or(name)? as usize;
     if n > max {
         return Err(name);
     }
-    let fields: Vec<usize> = (0..n).map(|i| list + 4 * i).collect();
+    let fields: Vec<Field> = (0..n).map(|i| f(list + 4 * i, rule)).collect();
     named(b, &fields, name)
 }
 
 /// The clients control `cmd`'s parameters `params` name, from either table.
-fn control_fields(
-    cmd: u32,
-    params: &[u8],
-) -> Option<Result<Vec<(u32, &'static str)>, &'static str>> {
+fn control_fields(cmd: u32, params: &[u8]) -> Option<Result<Vec<Named>, &'static str>> {
     if let Some(&(_, name, fields)) = CONTROL_CLIENT_FIELDS.iter().find(|(c, _, _)| *c == cmd) {
         return Some(named(params, fields, name));
     }
     CONTROL_CLIENT_LISTS
         .iter()
         .find(|(c, ..)| *c == cmd)
-        .map(|&(_, name, count, list, max)| named_list(params, count, list, max, name))
+        .map(|&(_, name, count, list, max, rule)| named_list(params, count, list, max, name, rule))
 }
 
 /// NV5080_CTRL_CMD_DEFERRED_API and _V2:`{hApiHandle, cmd, flags,
 /// hClientVA, hDeviceVA, union api_bundle}` with the bundle at 24, holding
 /// the parameters of the control `cmd` names, run later at the caller's
-/// privilege (deferred_api.c).
+/// privilege (deferred_api.c). `hClientVA` is looked up, never checked:
+/// [`Rule::Process`].
 const DEFERRED_API: [u32; 2] = [0x5080_0101, 0x5080_0103];
 const DEFERRED_CMD: usize = 4;
 const DEFERRED_CLIENT_VA: usize = 12;
@@ -427,7 +578,7 @@ const DEFERRED_BUNDLE: usize = 24;
 /// The client handles an RM_ALLOC's class parameters (`nested`, after NVOS64)
 /// name besides the caller's, zeros left out; `Err` names a field the block
 /// is too short to hold. No parameters at all is RM's defaults: none named.
-pub fn alloc_named(class: u32, nested: &[u8]) -> Result<Vec<(u32, &'static str)>, &'static str> {
+pub fn alloc_named(class: u32, nested: &[u8]) -> Result<Vec<Named>, &'static str> {
     let Some(&(_, name, fields)) = ALLOC_CLIENT_FIELDS.iter().find(|(c, _, _)| *c == class) else {
         return Ok(Vec::new());
     };
@@ -439,11 +590,11 @@ pub fn alloc_named(class: u32, nested: &[u8]) -> Result<Vec<(u32, &'static str)>
 
 /// The client handles an RM control's parameters (`params`, after NVOS54)
 /// name besides the caller's.
-pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<(u32, &'static str)>, &'static str> {
+pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<Named>, &'static str> {
     if DEFERRED_API.contains(&cmd) {
         let mut out = named(
             params,
-            &[DEFERRED_CLIENT_VA],
+            &[f(DEFERRED_CLIENT_VA, Rule::Process)],
             "NV5080_CTRL_CMD_DEFERRED_API",
         )?;
         let inner = rd32(params, DEFERRED_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
@@ -456,17 +607,23 @@ pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<(u32, &'static str)>
     control_fields(cmd, params).unwrap_or(Ok(Vec::new()))
 }
 
-fn named(
-    b: &[u8],
-    fields: &[usize],
-    name: &'static str,
-) -> Result<Vec<(u32, &'static str)>, &'static str> {
+fn named(b: &[u8], fields: &[Field], name: &'static str) -> Result<Vec<Named>, &'static str> {
     let mut out = Vec::new();
-    for &at in fields {
-        match rd32(b, at).ok_or(name)? {
-            0 => {}
-            h => out.push((h, name)),
+    for fl in fields {
+        let h = rd32(b, fl.at).ok_or(name)?;
+        if h == 0 {
+            continue;
         }
+        let obj = match fl.rule {
+            Rule::Shared { obj, .. } => rd32(b, obj).ok_or(name)?,
+            _ => 0,
+        };
+        out.push(Named {
+            h,
+            what: name,
+            rule: fl.rule,
+            obj,
+        });
     }
     Ok(out)
 }
@@ -520,7 +677,7 @@ pub fn status_at(escape: u32) -> Option<usize> {
 /// no other object of that client has one.
 #[derive(Default)]
 pub struct Ownership {
-    pub owners: HashMap<u32, ProcId>,
+    pub owners: HashMap<u32, Caller>,
     pub grants: HashMap<(u32, u32), Vec<Grant>>,
     /// Lists plus the grants in them, against [`GRANT_CAP`].
     pub grant_count: usize,
@@ -584,17 +741,14 @@ impl Ownership {
                         == 0))
     }
 
-    /// Whether the list RM checks a duplicate of `(src, obj)` into `dst`
-    /// against grants `dst` the DUP_OBJECT right: the object's own, if it
-    /// has one; else its client's, while no other object of the client has
-    /// one (it may be an ancestor of `obj`, whose list RM would read
-    /// instead). Grants on intermediate objects (a device, say) are not
-    /// followed, so such a duplicate is refused where RM would allow it.
-    fn granted(&self, src: u32, obj: u32, dst: u32) -> bool {
-        let grants = |l: &Vec<Grant>| {
-            l.iter()
-                .any(|g| g.target == dst && g.mask & RS_ACCESS_DUP_OBJECT_BIT != 0)
-        };
+    /// Whether the list RM checks `dst`'s use of `(src, obj)` against grants
+    /// `dst` any of `rights`: the object's own, if it has one; else its
+    /// client's, while no other object of the client has one (it may be an
+    /// ancestor of `obj`, whose list RM would read instead). Grants on
+    /// intermediate objects (a device, say) are not followed, so such a use
+    /// is refused where RM would allow it.
+    fn granted(&self, src: u32, obj: u32, dst: u32, rights: u32) -> bool {
+        let grants = |l: &Vec<Grant>| l.iter().any(|g| g.target == dst && g.mask & rights != 0);
         if let Some(l) = self.grants.get(&(src, obj)) {
             return grants(l);
         }
@@ -604,14 +758,21 @@ impl Ownership {
         self.grants.get(&(src, src)).is_some_and(grants)
     }
 
-    /// The verdict on a duplicate from `(src, obj)` into client `dst` made by
-    /// `caller`. `live` says whether a handle is a client this VM has;
-    /// `per_process` whether the guest says which process made each client.
+    /// Whether clients `a` and `b` were made by one guest process: RM's PID
+    /// default between them. Unknown makers are not one.
+    fn one_process(&self, a: u32, b: u32) -> bool {
+        matches!((self.owners.get(&a), self.owners.get(&b)), (Some(x), Some(y)) if x.same_process(y))
+    }
+
+    /// The verdict on a duplicate from `(src, obj)` into client `dst`: RM's
+    /// rule (a PID default, or a grant in the list), with guest processes
+    /// for the backend's. `live` says whether a handle is a client this VM
+    /// has. Within one client there is nothing to keep apart, and a grant is
+    /// RM's own record; anything else rests on the guest having said who
+    /// made both clients, and is refused when it has not.
     pub fn dup_verdict(
         &self,
         live: impl Fn(u32) -> bool,
-        per_process: bool,
-        caller: Option<ProcId>,
         dst: u32,
         src: u32,
         obj: u32,
@@ -622,18 +783,32 @@ impl Ownership {
         if !live(dst) {
             return DupVerdict::ForeignDestination;
         }
-        if !per_process || src == dst {
+        if src == dst
+            || self.one_process(src, dst)
+            || self.granted(src, obj, dst, RS_ACCESS_DUP_OBJECT_BIT)
+        {
             return DupVerdict::Allowed;
         }
-        let (Some(s), Some(d)) = (self.owners.get(&src), self.owners.get(&dst)) else {
-            // Made before the guest said who makes what (a HELLO without
-            // FRESH after v1 calls): kept to no process, as before.
-            return DupVerdict::Allowed;
-        };
-        if s == d || caller.as_ref() == Some(s) || self.granted(src, obj, dst) {
-            DupVerdict::Allowed
-        } else {
+        if self.owners.contains_key(&src) && self.owners.contains_key(&dst) {
             DupVerdict::OtherProcess
+        } else {
+            DupVerdict::Unattributed
+        }
+    }
+
+    /// Whether a call by `caller` through client `own` may name client `n.h`,
+    /// a client of this VM other than `own`: `n.rule` (see [`Rule`]).
+    /// Makers the guest did not say match nothing.
+    pub fn named_ok(&self, caller: Option<&Caller>, own: u32, n: &Named) -> bool {
+        let named = self.owners.get(&n.h);
+        let mine = self.owners.get(&own);
+        match n.rule {
+            Rule::Process => matches!((caller, named), (Some(c), Some(o)) if c.same_process(o)),
+            Rule::Token => matches!((caller, named), (Some(c), Some(o)) if c.same_token(o)),
+            Rule::ClientToken => matches!((mine, named), (Some(c), Some(o)) if c.same_token(o)),
+            Rule::Shared { rights, .. } => {
+                self.one_process(own, n.h) || self.granted(n.h, n.obj, own, rights)
+            }
         }
     }
 }
@@ -672,18 +847,21 @@ impl NvidiaBackend {
     /// The calling guest process an RM call carries (`trailer`, what follows
     /// its blocks), if this session has them. `Err` is the errno for a call
     /// that must carry one and does not: an RM_ALLOC of a client, whose
-    /// maker is its owner, and an RM_DUP_OBJECT.
+    /// maker is its owner, an RM_DUP_OBJECT, and with BCAP_PROC_EUID every
+    /// RM_CONTROL.
     pub(crate) fn rm_proc_id(
         &self,
         escape: u32,
         params: &[u8],
         trailer: &[u8],
-    ) -> Result<Option<ProcId>, i32> {
+    ) -> Result<Option<Caller>, i32> {
         if !self.session.proc_ids {
             return Ok(None);
         }
+        let euid = self.session.proc_euid;
         let needed = match escape {
             NV_ESC_RM_DUP_OBJECT => true,
+            NV_ESC_RM_CONTROL => euid,
             NV_ESC_RM_ALLOC => {
                 rd32(params, OS64_CLASS).is_some_and(|c| crate::semsurf::ROOT_CLASSES.contains(&c))
             }
@@ -692,10 +870,10 @@ impl NvidiaBackend {
         let id = trailer.get(..size_of::<ProcId>()).map(|b| ProcId {
             start_ns: u64::from_le_bytes(b[0..8].try_into().unwrap()),
             tgid: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            flags: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+            euid: u32::from_le_bytes(b[12..16].try_into().unwrap()),
         });
         match id {
-            Some(id) => Ok(Some(id)),
+            Some(id) => Ok(Some(Caller::from_wire(&id, euid))),
             None if needed => {
                 log::warn!(
                     "RM escape {escape:#04x} without the calling process this guest said it \
@@ -715,7 +893,7 @@ impl NvidiaBackend {
         &mut self,
         escape: u32,
         params: &[u8],
-        caller: Option<ProcId>,
+        caller: Option<Caller>,
     ) -> Result<Pending, Refuse> {
         let mut pending = Pending::default();
         let share = share_of(escape, params);
@@ -759,21 +937,17 @@ impl NvidiaBackend {
                     log::warn!("RM_DUP_OBJECT too short to name its clients; refused");
                     return Err(Refuse::Errno(libc::EINVAL));
                 };
-                let per_process = self.session.proc_ids;
-                if !per_process && self.session.v2 && !self.session.proc_ids_noted {
-                    self.session.proc_ids_noted = true;
-                    log::info!(
-                        "this guest does not say which of its processes makes each RM call: \
-                         its processes may duplicate each other's RM objects, as before"
-                    );
-                }
-                let v = self.semsurf.dup_verdict(per_process, caller, dst, src, obj);
+                self.note_no_proc_ids();
+                let v = self.semsurf.dup_verdict(dst, src, obj);
                 if v != DupVerdict::Allowed {
                     log::warn!(
                         "RM_DUP_OBJECT of {src:#x}/{obj:#x} into client {dst:#x} refused: {}",
                         match v {
                             DupVerdict::ForeignSource => "the source client is not this VM's",
                             DupVerdict::ForeignDestination => "the client is not this VM's",
+                            DupVerdict::Unattributed => {
+                                "the guest has not said which process made both clients"
+                            }
                             _ => "another guest process's client, not shared with this one",
                         }
                     );
@@ -781,15 +955,17 @@ impl NvidiaBackend {
                 }
             }
             NV_ESC_RM_ALLOC => {
+                let own = rd32(params, 0).unwrap_or(0);
                 let class = rd32(params, OS64_CLASS).unwrap_or(0);
                 let nested = params.get(OS64_SIZE..).unwrap_or(&[]);
-                self.named_clients_ok(alloc_named(class, nested))
+                self.named_clients_ok(own, caller, alloc_named(class, nested))
                     .map_err(Refuse::Status)?;
             }
             NV_ESC_RM_CONTROL => {
+                let own = rd32(params, 0).unwrap_or(0);
                 let cmd = rd32(params, OS54_CMD).unwrap_or(0);
                 let ctl = params.get(OS54_SIZE..).unwrap_or(&[]);
-                self.named_clients_ok(control_named(cmd, ctl))
+                self.named_clients_ok(own, caller, control_named(cmd, ctl))
                     .map_err(Refuse::Status)?;
             }
             _ => {}
@@ -797,17 +973,52 @@ impl NvidiaBackend {
         Ok(pending)
     }
 
+    /// Once a session: a guest that does not say which of its processes
+    /// makes each call gets no RM object between two clients but by a grant.
+    fn note_no_proc_ids(&mut self) {
+        if !self.session.proc_ids && !self.session.proc_ids_noted {
+            self.session.proc_ids_noted = true;
+            log::warn!(
+                "this guest does not say which of its processes makes each RM call: \
+                 duplicates between its clients, and calls naming another client, are refused"
+            );
+        }
+    }
+
+    /// Every second client `named` by a call through client `own` from
+    /// `caller`: this VM's, and to its field's rule ([`Rule`]).
     fn named_clients_ok(
-        &self,
-        named: Result<Vec<(u32, &'static str)>, &'static str>,
+        &mut self,
+        own: u32,
+        caller: Option<Caller>,
+        named: Result<Vec<Named>, &'static str>,
     ) -> Result<(), u32> {
         let named = named.map_err(|what| {
             log::warn!("{what}: parameters too short to hold the client they name; refused");
             NV_ERR_INSUFFICIENT_PERMISSIONS
         })?;
-        for (h, what) in named {
-            if !self.semsurf.owns_client(h) {
-                log::warn!("{what} names client {h:#x}, which is not this VM's; refused");
+        for n in named {
+            // The caller's own client, as RM treats it: every rule passes.
+            if n.h == own {
+                continue;
+            }
+            if !self.semsurf.owns_client(n.h) {
+                log::warn!(
+                    "{} names client {:#x}, which is not this VM's; refused",
+                    n.what,
+                    n.h
+                );
+                return Err(NV_ERR_INSUFFICIENT_PERMISSIONS);
+            }
+            self.note_no_proc_ids();
+            if !self.semsurf.named_ok(caller.as_ref(), own, &n) {
+                log::warn!(
+                    "{} names client {:#x}, which RM's rule for it ({:?}) does not let the \
+                     caller name; refused",
+                    n.what,
+                    n.h,
+                    n.rule
+                );
                 return Err(NV_ERR_INSUFFICIENT_PERMISSIONS);
             }
         }
@@ -994,68 +1205,63 @@ mod tests {
         assert_eq!(share_of(NV_ESC_RM_CONTROL, &c), None);
     }
 
-    fn id(tgid: u32) -> ProcId {
-        ProcId {
+    fn id(tgid: u32) -> Caller {
+        Caller {
             start_ns: u64::from(tgid) * 1000,
             tgid,
-            flags: 0,
+            euid: Some(1000 + tgid),
+        }
+    }
+
+    fn as_uid(c: Caller, euid: u32) -> Caller {
+        Caller {
+            euid: Some(euid),
+            ..c
         }
     }
 
     #[test]
-    fn a_duplicate_is_kept_to_the_process_that_made_both_clients() {
+    fn a_duplicate_is_rms_rule_between_guest_processes() {
         let mut o = Ownership::default();
         o.owners.insert(OWNER, id(10));
         o.owners.insert(PEER, id(20));
         let live = vm;
         use DupVerdict::*;
-        // Across processes: refused; within one: allowed.
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x55),
-            OtherProcess
-        );
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(10)), OWNER, OWNER, 0x55),
-            Allowed
-        );
-        // The caller's own object into a client it holds a file of.
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(10)), PEER, OWNER, 0x55),
-            Allowed
-        );
+        // Across processes: refused, whoever asks -- the caller having made
+        // the source is not RM's rule, the two clients' makers are.
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x55), OtherProcess);
+        // Within one client, or between two of one process: allowed.
+        assert_eq!(o.dup_verdict(live, OWNER, OWNER, 0x55), Allowed);
+        o.owners.insert(PEER, id(10));
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x55), Allowed);
+        // One process across a setuid is still one process.
+        o.owners.insert(PEER, as_uid(id(10), 0));
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x55), Allowed);
+        // One euid is not one process: RM's DUP default is by PID.
+        o.owners.insert(PEER, as_uid(id(20), 1010));
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x55), OtherProcess);
+        o.owners.insert(PEER, id(20));
         // Not this VM's at either end.
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(10)), PEER, HOST, 1),
-            ForeignSource
-        );
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(10)), HOST, OWNER, 1),
-            ForeignDestination
-        );
-        assert_eq!(
-            o.dup_verdict(live, false, None, PEER, HOST, 1),
-            ForeignSource
-        );
-        // Without process ids: as before, inside the VM.
-        assert_eq!(o.dup_verdict(live, false, None, PEER, OWNER, 0x55), Allowed);
-        // A CLIENT grant on the object, or on its client, opens it to PEER.
+        assert_eq!(o.dup_verdict(live, PEER, HOST, 1), ForeignSource);
+        assert_eq!(o.dup_verdict(live, HOST, OWNER, 1), ForeignDestination);
+        // A client whose maker the guest never said: refused, not assumed.
+        let mut anon = Ownership::default();
+        assert_eq!(anon.dup_verdict(live, PEER, OWNER, 0x55), Unattributed);
+        assert_eq!(anon.dup_verdict(live, OWNER, OWNER, 0x55), Allowed);
+        anon.owners.insert(OWNER, id(10));
+        assert_eq!(anon.dup_verdict(live, PEER, OWNER, 0x55), Unattributed);
+        // ... but a grant RM took is RM's own record, and counts.
         let grant = policy(RS_SHARE_TYPE_CLIENT, RS_SHARE_ACTION_FLAG_COMPOSE, PEER);
+        anon.shared(OWNER, 0x55, &grant);
+        assert_eq!(anon.dup_verdict(live, PEER, OWNER, 0x55), Allowed);
+        // A CLIENT grant on the object, or on its client, opens it to PEER.
         o.shared(OWNER, 0x55, &grant);
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x55),
-            Allowed
-        );
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x56),
-            OtherProcess
-        );
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x55), Allowed);
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x56), OtherProcess);
         o.shared(OWNER, OWNER, &grant);
         // The client's list is not read for 0x56 while 0x55 has one of its
         // own: 0x55 may be 0x56's parent, whose list RM would read.
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x56),
-            OtherProcess
-        );
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x56), OtherProcess);
         // A grant without DUP_OBJECT does not open anything.
         let mut o2 = Ownership::default();
         o2.owners = o.owners.clone();
@@ -1063,21 +1269,15 @@ mod tests {
             OWNER,
             0x55,
             &Policy {
-                mask: 1 << 2,
+                mask: RS_ACCESS_DEBUG_BIT,
                 ..grant
             },
         );
-        assert_eq!(
-            o2.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x55),
-            OtherProcess
-        );
+        assert_eq!(o2.dup_verdict(live, PEER, OWNER, 0x55), OtherProcess);
         // Freeing the object takes its list, and the client's is read again.
         o.object_freed(OWNER, 0x55);
         assert_eq!(o.grant_count, 2, "the client's list and its one grant");
-        assert_eq!(
-            o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, 0x56),
-            Allowed
-        );
+        assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x56), Allowed);
         // Freeing a client takes everything of it, and every grant to it.
         o.shared(OWNER, 0x55, &grant);
         o.forget_clients(&[PEER]);
@@ -1086,6 +1286,94 @@ mod tests {
         o.forget_clients(&[OWNER]);
         assert!(o.grants.is_empty());
         assert_eq!(o.grant_count, 0);
+    }
+
+    /// Each rule a second client is held to, between guest processes.
+    #[test]
+    fn a_named_client_is_held_to_its_fields_rule() {
+        let mut o = Ownership::default();
+        let (me, same_uid, other) = (id(10), as_uid(id(20), 1010), id(30));
+        o.owners.insert(OWNER, me);
+        let n = |h: u32, rule: Rule| Named {
+            h,
+            what: "t",
+            rule,
+            obj: 0x55,
+        };
+        for (maker, process, token) in [
+            (me, true, true),
+            (same_uid, false, true),
+            (other, false, false),
+        ] {
+            o.owners.insert(PEER, maker);
+            assert_eq!(
+                o.named_ok(Some(&me), OWNER, &n(PEER, Rule::Process)),
+                process
+            );
+            assert_eq!(o.named_ok(Some(&me), OWNER, &n(PEER, Rule::Token)), token);
+            assert_eq!(
+                o.named_ok(Some(&me), OWNER, &n(PEER, Rule::ClientToken)),
+                token
+            );
+            let shared = Rule::Shared {
+                rights: RS_ACCESS_DEBUG_BIT,
+                obj: 0,
+            };
+            assert_eq!(o.named_ok(Some(&me), OWNER, &n(PEER, shared)), process);
+        }
+        // Token is the caller's; ClientToken the caller's client's maker's.
+        o.owners.insert(PEER, other);
+        let other_as_me = as_uid(other, 1010);
+        assert!(!o.named_ok(Some(&other_as_me), OWNER, &n(PEER, Rule::ClientToken)));
+        assert!(o.named_ok(Some(&other), OWNER, &n(PEER, Rule::Token)));
+        // An euid the guest never said matches nothing but the process.
+        let quiet = |c: Caller| Caller { euid: None, ..c };
+        o.owners.insert(PEER, quiet(same_uid));
+        assert!(!o.named_ok(Some(&quiet(me)), OWNER, &n(PEER, Rule::Token)));
+        // No caller, or an unattributed client: refused.
+        o.owners.insert(PEER, me);
+        assert!(!o.named_ok(None, OWNER, &n(PEER, Rule::Process)));
+        assert!(!o.named_ok(Some(&me), OWNER, &n(HOST, Rule::Token)));
+        // Shared: a CLIENT grant of the right, on that object, to the
+        // caller's client.
+        o.owners.insert(PEER, other);
+        let debug = Rule::Shared {
+            rights: RS_ACCESS_DEBUG_BIT,
+            obj: 0,
+        };
+        o.shared(
+            PEER,
+            0x55,
+            &Policy {
+                target: OWNER,
+                mask: RS_ACCESS_DUP_OBJECT_BIT,
+                kind: RS_SHARE_TYPE_CLIENT,
+                action: RS_SHARE_ACTION_FLAG_COMPOSE,
+            },
+        );
+        assert!(
+            !o.named_ok(Some(&me), OWNER, &n(PEER, debug)),
+            "DUP is not DEBUG"
+        );
+        o.shared(
+            PEER,
+            0x55,
+            &Policy {
+                target: OWNER,
+                mask: RS_ACCESS_DEBUG_BIT,
+                kind: RS_SHARE_TYPE_CLIENT,
+                action: RS_SHARE_ACTION_FLAG_COMPOSE,
+            },
+        );
+        assert!(o.named_ok(Some(&me), OWNER, &n(PEER, debug)));
+        assert!(!o.named_ok(
+            Some(&me),
+            OWNER,
+            &Named {
+                obj: 0x56,
+                ..n(PEER, debug)
+            }
+        ));
     }
 
     /// RM checks a duplicate against the object's own list once a share
@@ -1099,7 +1387,7 @@ mod tests {
         let mut o = Ownership::default();
         o.owners.insert(OWNER, id(10));
         o.owners.insert(PEER, id(20));
-        let dup = |o: &Ownership, obj| o.dup_verdict(live, true, Some(id(20)), PEER, OWNER, obj);
+        let dup = |o: &Ownership, obj| o.dup_verdict(live, PEER, OWNER, obj);
         // The client grants PEER; the object revokes it: RM's list for the
         // object is its own, without PEER (and with the PID default, which
         // RM matches for every client of the backend's).
@@ -1153,7 +1441,26 @@ mod tests {
         let mut dev = vec![0u8; 56];
         assert_eq!(alloc_named(0x80, &dev), Ok(vec![]));
         dev[4..8].copy_from_slice(&HOST.to_le_bytes());
-        assert_eq!(alloc_named(0x80, &dev), Ok(vec![(HOST, "NV01_DEVICE_0")]));
+        let hs = |v: Vec<Named>| v.iter().map(|n| (n.h, n.rule)).collect::<Vec<_>>();
+        assert_eq!(hs(alloc_named(0x80, &dev).unwrap()), [(HOST, Rule::Token)]);
+        dev[8..12].copy_from_slice(&PEER.to_le_bytes());
+        assert_eq!(
+            hs(alloc_named(0x80, &dev).unwrap()),
+            [(HOST, Rule::Token), (PEER, Rule::Process)]
+        );
+        // The debugger names its object too.
+        let mut dbg = vec![0u8; 12];
+        dbg[4..8].copy_from_slice(&PEER.to_le_bytes());
+        dbg[8..12].copy_from_slice(&0x3d0u32.to_le_bytes());
+        let d = alloc_named(0x83de, &dbg).unwrap();
+        assert_eq!((d[0].h, d[0].obj), (PEER, 0x3d0));
+        assert!(matches!(
+            d[0].rule,
+            Rule::Shared {
+                rights: RS_ACCESS_DEBUG_BIT,
+                ..
+            }
+        ));
         // No parameters: RM's defaults. Too few: refused.
         assert_eq!(alloc_named(0x80, &[]), Ok(vec![]));
         assert!(alloc_named(0x83de, &[0u8; 6]).is_err());
@@ -1162,9 +1469,10 @@ mod tests {
 
         let mut regops = vec![0u8; 48];
         regops[0..4].copy_from_slice(&HOST.to_le_bytes());
+        let r = control_named(0x2080_0122, &regops).unwrap();
         assert_eq!(
-            control_named(0x2080_0122, &regops),
-            Ok(vec![(HOST, "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS")])
+            (r[0].h, r[0].what, r[0].rule),
+            (HOST, "NV2080_CTRL_CMD_GPU_EXEC_REG_OPS", Rule::Process)
         );
         // DEFERRED_API: its own VA client and the bundled control's.
         let mut d = vec![0u8; 584];
@@ -1172,7 +1480,7 @@ mod tests {
         d[12..16].copy_from_slice(&OWNER.to_le_bytes());
         d[24 + 12..24 + 16].copy_from_slice(&HOST.to_le_bytes());
         let n = control_named(0x5080_0101, &d).unwrap();
-        assert_eq!(n.iter().map(|x| x.0).collect::<Vec<_>>(), [OWNER, HOST]);
+        assert_eq!(n.iter().map(|x| x.h).collect::<Vec<_>>(), [OWNER, HOST]);
         assert_eq!(control_named(0x2080_0101, &d), Ok(vec![]));
     }
 
@@ -1186,7 +1494,8 @@ mod tests {
         // Past the count: not read by RM, nor here.
         d[32..36].copy_from_slice(&PEER.to_le_bytes());
         let n = control_named(0x2080_110b, &d).unwrap();
-        assert_eq!(n.iter().map(|x| x.0).collect::<Vec<_>>(), [OWNER, HOST]);
+        assert_eq!(n.iter().map(|x| x.h).collect::<Vec<_>>(), [OWNER, HOST]);
+        assert!(n.iter().all(|x| x.rule == Rule::Process));
         // A count past the list: refused whole.
         d[4..8].copy_from_slice(&65u32.to_le_bytes());
         assert!(control_named(0x2080_110b, &d).is_err());
@@ -1194,16 +1503,21 @@ mod tests {
         let mut q = vec![0u8; 1540];
         q[1024..1028].copy_from_slice(&1u32.to_le_bytes());
         q[0..4].copy_from_slice(&HOST.to_le_bytes());
+        let r = control_named(0x2080_1124, &q).unwrap();
         assert_eq!(
-            control_named(0x2080_1124, &q),
-            Ok(vec![(HOST, "NV2080_CTRL_CMD_FIFO_QUERY_CHANNEL_UNIQUE_ID")])
+            (r[0].h, r[0].what, r[0].rule),
+            (
+                HOST,
+                "NV2080_CTRL_CMD_FIFO_QUERY_CHANNEL_UNIQUE_ID",
+                Rule::ClientToken
+            )
         );
         // ROTATE_KEYS and its sibling: numChannels at 0, the list at 4.
         let mut k = vec![0u8; 520];
         k[0..4].copy_from_slice(&1u32.to_le_bytes());
         k[4..8].copy_from_slice(&HOST.to_le_bytes());
         for cmd in [0x2080_111a, 0x2080_111c] {
-            assert_eq!(control_named(cmd, &k).unwrap()[0].0, HOST);
+            assert_eq!(control_named(cmd, &k).unwrap()[0].h, HOST);
         }
         // Too short for the count it gives: refused.
         assert!(control_named(0x2080_111c, &k[..6]).is_err());
@@ -1235,7 +1549,16 @@ mod tests {
                 .iter()
                 .find(|(c, _)| c == cmd)
                 .unwrap_or_else(|| panic!("{name}"));
-            assert!(fields.iter().all(|&f| f + 4 <= size.1), "{name}");
+            assert!(
+                fields.iter().all(|f| {
+                    f.at + 4 <= size.1
+                        && match f.rule {
+                            Rule::Shared { obj, .. } => obj + 4 <= size.1,
+                            _ => true,
+                        }
+                }),
+                "{name}"
+            );
         }
         // The lists: (sizeof, 610.57.04 and 595.99.02).
         let list_sizes: &[(u32, usize)] = &[
@@ -1244,7 +1567,7 @@ mod tests {
             (0x2080_111c, 520),
             (0x2080_1124, 1540),
         ];
-        for &(cmd, name, count, list, max) in CONTROL_CLIENT_LISTS {
+        for &(cmd, name, count, list, max, _) in CONTROL_CLIENT_LISTS {
             let size = list_sizes
                 .iter()
                 .find(|(c, _)| *c == cmd)
@@ -1271,7 +1594,8 @@ mod backend_tests {
     use super::*;
     use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
     use protocol::messages::{
-        BCAP_PROC_ID, DeviceKind, GCAP_PROC_ID, HELLO_F_FRESH, HelloReq, MsgType, PROTO_V2,
+        BCAP_PROC_EUID, BCAP_PROC_ID, DeviceKind, GCAP_PROC_EUID, GCAP_PROC_ID, HELLO_F_FRESH,
+        HelloReq, MsgType, PROTO_V2, ProcId,
     };
     use std::cell::{Cell, RefCell};
     use std::os::fd::{OwnedFd, RawFd};
@@ -1332,8 +1656,12 @@ mod backend_tests {
         0
     }
 
-    /// A session, v2 with or without process ids, and two control files.
-    fn vm(proc_ids: bool) -> (NvidiaBackend, u32, u32) {
+    /// What a current guest module says it can do.
+    const FULL: u32 = GCAP_PROC_ID | GCAP_PROC_EUID;
+
+    /// A session, v2 with the guest capabilities `gcaps`, and two control
+    /// files.
+    fn vm(gcaps: u32) -> (NvidiaBackend, u32, u32) {
         seen();
         let mut be = NvidiaBackend::for_test();
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
@@ -1341,7 +1669,7 @@ mod backend_tests {
         let hello = HelloReq {
             proto: PROTO_V2,
             flags: HELLO_F_FRESH,
-            guest_caps: if proc_ids { GCAP_PROC_ID } else { 0 },
+            guest_caps: gcaps,
             uvm_aperture_mib: 0,
         };
         let mut req = Vec::new();
@@ -1362,8 +1690,13 @@ mod backend_tests {
         let caps = rd32(&resp, 16 + 4).unwrap();
         assert_eq!(
             caps & BCAP_PROC_ID != 0,
-            proc_ids,
+            gcaps & GCAP_PROC_ID != 0,
             "offered only when asked for"
+        );
+        assert_eq!(
+            caps & BCAP_PROC_EUID != 0,
+            gcaps & FULL == FULL,
+            "and the euid only with the process"
         );
         let null = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
         let a = be.adopt_for_test(null(), HandleKind::Dev(DeviceKind::Ctl));
@@ -1371,12 +1704,23 @@ mod backend_tests {
         (be, a, b)
     }
 
+    /// Guest process `tgid`, running as uid `1000 + tgid`.
     fn pid(tgid: u32) -> ProcId {
         ProcId {
             start_ns: 1_000_000 + u64::from(tgid),
             tgid,
-            flags: 0,
+            euid: 1000 + tgid,
         }
+    }
+
+    /// The same, as `euid`.
+    fn pid_as(tgid: u32, euid: u32) -> ProcId {
+        ProcId { euid, ..pid(tgid) }
+    }
+
+    /// What the backend recorded of a maker.
+    fn caller(p: ProcId) -> Caller {
+        Caller::from_wire(&p, true)
     }
 
     /// A v1 IOCTL, with the calling process after its blocks when `by` says.
@@ -1409,7 +1753,7 @@ mod backend_tests {
         if let Some(p) = by {
             req.extend_from_slice(&p.start_ns.to_le_bytes());
             req.extend_from_slice(&p.tgid.to_le_bytes());
-            req.extend_from_slice(&p.flags.to_le_bytes());
+            req.extend_from_slice(&p.euid.to_le_bytes());
         }
         let mut resp = vec![0u8; 4096];
         let n = be.dispatch(&req, &mut resp);
@@ -1457,10 +1801,10 @@ mod backend_tests {
 
     #[test]
     fn a_duplicate_within_one_process_reaches_rm_across_its_files() {
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let b = alloc_client(&mut be, f2, Some(pid(10)));
-        assert_eq!(be.semsurf.owner_of(a), Some(pid(10)));
+        assert_eq!(be.semsurf.owner_of(a), Some(caller(pid(10))));
         seen();
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(10)));
         assert_eq!(rm_status(&r, OS55_STATUS), 0);
@@ -1472,7 +1816,7 @@ mod backend_tests {
 
     #[test]
     fn a_duplicate_across_processes_is_refused_before_rm() {
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         // A forked child's client and object; the parent's own client.
         let child = alloc_client(&mut be, f1, Some(pid(20)));
         let parent = alloc_client(&mut be, f2, Some(pid(10)));
@@ -1487,8 +1831,11 @@ mod backend_tests {
         );
         assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         assert!(!reached(0x34), "the host never saw it");
-        // The child pushing its own object into the parent's client (a file
-        // the parent passed it): its own to give.
+        // Nor by the child, into the parent's client (a file the parent
+        // passed it): RM's rule is the two clients' makers, not the
+        // caller's, and a host process holding another's file could not
+        // either.
+        seen();
         let r = call(
             &mut be,
             f2,
@@ -1497,7 +1844,19 @@ mod backend_tests {
             &[],
             Some(pid(20)),
         );
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert!(!reached(0x34));
+        // Nor between two processes of one uid: RM's default is by PID.
+        let same_uid = alloc_client(&mut be, f1, Some(pid_as(40, 1010)));
+        let r = call(
+            &mut be,
+            f2,
+            DUP,
+            &dup(parent, same_uid, 0x55),
+            &[],
+            Some(pid(10)),
+        );
+        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         // A client passed on keeps its maker: the parent using the child's
         // file is still not the child.
         let r = call(
@@ -1514,7 +1873,7 @@ mod backend_tests {
     #[test]
     fn a_foreign_source_or_destination_client_is_refused_old_guest_or_new() {
         for proc_ids in [true, false] {
-            let (mut be, f1, _) = vm(proc_ids);
+            let (mut be, f1, _) = vm(if proc_ids { FULL } else { 0 });
             let by = proc_ids.then(|| pid(10));
             let a = alloc_client(&mut be, f1, by);
             seen();
@@ -1533,20 +1892,50 @@ mod backend_tests {
     }
 
     #[test]
-    fn an_old_guest_keeps_duplicating_between_its_processes() {
-        // No GCAP_PROC_ID: no process ids, and none needed.
-        let (mut be, f1, f2) = vm(false);
+    fn a_guest_that_cannot_say_who_calls_fails_closed() {
+        // No GCAP_PROC_ID: no process ids, and none can be asked for.
+        let (mut be, f1, f2) = vm(0);
         let a = alloc_client(&mut be, f1, None);
         let b = alloc_client(&mut be, f2, None);
         assert_eq!(be.semsurf.owner_of(a), None);
+        // Between two clients: refused, where it was let through before.
+        seen();
+        let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], None);
+        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert!(!reached(0x34));
+        // Within one client: nothing to tell apart.
+        let r = call(&mut be, f1, DUP, &dup(a, a, 0x55), &[], None);
+        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        // A grant RM took is RM's own rule, and holds without a process.
+        let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
+        let r = call(
+            &mut be,
+            f1,
+            SHARE,
+            &share(a, 0x55, RS_SHARE_TYPE_CLIENT, compose, b),
+            &[],
+            None,
+        );
+        assert_eq!(rm_status(&r, OS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], None);
         assert_eq!(rm_status(&r, OS55_STATUS), 0);
-        assert!(reached(0x34));
+        // A second client named in parameters: refused, whatever the rule.
+        seen();
+        let regops = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
+        let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, b)], 48), None);
+        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let r = call(&mut be, f1, ALLOC, &outer, &words(&[(4, b)], 56), None);
+        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert!(!reached(0x2a) && !reached(0x2b));
+        // Its own client it may name.
+        let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
+        assert_eq!(rm_status(&r, OS54_STATUS), 0);
     }
 
     #[test]
     fn a_guest_that_said_it_would_name_the_caller_must() {
-        let (mut be, f1, _) = vm(true);
+        let (mut be, f1, _) = vm(FULL);
         // A client, or a duplicate, without it: a broken guest, refused.
         let r = call(&mut be, f1, ALLOC, &words(&[(12, 0x41)], 48), &[], None);
         assert_eq!(errno(&r), -libc::EINVAL);
@@ -1581,7 +1970,7 @@ mod backend_tests {
 
     #[test]
     fn outward_grants_are_refused_and_narrowing_reaches_rm() {
-        let (mut be, f1, _) = vm(true);
+        let (mut be, f1, _) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         for (kind, target) in [
             (RS_SHARE_TYPE_ALL, 0),
@@ -1626,19 +2015,19 @@ mod backend_tests {
         let mut p = words(&[(0, 0x55)], 16);
         p[12..14].copy_from_slice(&RS_SHARE_TYPE_ALL.to_le_bytes());
         seen();
-        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         ctl[8..12].copy_from_slice(&CTRL_SET_INHERITED_SHARE_POLICY.to_le_bytes());
         let mut p = vec![0u8; 12];
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_OS_SECURITY_TOKEN.to_le_bytes());
-        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         assert!(!reached(0x2a));
     }
 
     #[test]
     fn a_client_grant_opens_an_object_to_another_process_until_revoked() {
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let b = alloc_client(&mut be, f2, Some(pid(20)));
         let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
@@ -1713,13 +2102,13 @@ mod backend_tests {
         let mut p = words(&[(0, b), (4, 1)], 12);
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_CLIENT.to_le_bytes());
         p[10] = compose;
-        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x77), &[], Some(pid(20)));
         assert_eq!(rm_status(&r, OS55_STATUS), 0);
         // A revoke without COMPOSE empties the client's list.
         p[10] = RS_SHARE_ACTION_FLAG_REVOKE;
-        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x77), &[], Some(pid(20)));
         assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
@@ -1759,7 +2148,7 @@ mod backend_tests {
 
     #[test]
     fn a_second_client_named_in_parameters_must_be_this_vms() {
-        let (mut be, f1, _) = vm(true);
+        let (mut be, f1, _) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         // A device sharing a host client's VA space.
         let dev = |share: u32| words(&[(4, share)], 56);
@@ -1775,16 +2164,161 @@ mod backend_tests {
         // Register operations on a host client's channel.
         let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
         seen();
-        let r = call(&mut be, f1, CONTROL, &ctl, &words(&[(0, HOST)], 48), None);
+        let r = call(
+            &mut be,
+            f1,
+            CONTROL,
+            &ctl,
+            &words(&[(0, HOST)], 48),
+            Some(pid(10)),
+        );
         assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         assert!(!reached(0x2a));
-        let r = call(&mut be, f1, CONTROL, &ctl, &words(&[(0, a)], 48), None);
+        let r = call(
+            &mut be,
+            f1,
+            CONTROL,
+            &ctl,
+            &words(&[(0, a)], 48),
+            Some(pid(10)),
+        );
+        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+    }
+
+    #[test]
+    fn a_second_client_is_held_to_rms_rule_for_its_field() {
+        let (mut be, f1, f2) = vm(FULL);
+        let me = pid(10);
+        let a = alloc_client(&mut be, f1, Some(me));
+        let mine_too = alloc_client(&mut be, f2, Some(me));
+        let same_uid = alloc_client(&mut be, f2, Some(pid_as(20, me.euid)));
+        let other = alloc_client(&mut be, f2, Some(pid(30)));
+        let ok = |r: &[u8], at| rm_status(r, at) == 0;
+
+        // NV01_DEVICE_0's hClientShare: clientValidate, the security token --
+        // the caller's process or its euid.
+        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let dev = |at: usize, c: u32| words(&[(at, c)], 56);
+        for (c, want) in [(mine_too, true), (same_uid, true), (other, false)] {
+            let r = call(&mut be, f1, ALLOC, &outer, &dev(4, c), Some(me));
+            assert_eq!(ok(&r, OS64_STATUS), want, "hClientShare {c:#x}");
+        }
+        // The token is the caller's: the same call from the other process
+        // may name its own client and not mine.
+        let r = call(&mut be, f1, ALLOC, &outer, &dev(4, other), Some(pid(30)));
+        assert!(ok(&r, OS64_STATUS));
+        // hTargetClient, which RM never checks: the calling process's own.
+        let r = call(&mut be, f1, ALLOC, &outer, &dev(8, same_uid), Some(me));
+        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        let r = call(&mut be, f1, ALLOC, &outer, &dev(8, mine_too), Some(me));
+        assert!(ok(&r, OS64_STATUS));
+
+        // EXEC_REG_OPS, checked by nothing on the CPU side: the calling
+        // process's clients only, not another of its uid.
+        let regops = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
+        for (c, want) in [(mine_too, true), (same_uid, false), (other, false)] {
+            seen();
+            let r = call(
+                &mut be,
+                f1,
+                CONTROL,
+                &regops,
+                &words(&[(0, c)], 48),
+                Some(me),
+            );
+            assert_eq!(ok(&r, OS54_STATUS), want, "regops on {c:#x}");
+            assert_eq!(reached(0x2a), want);
+        }
+
+        // QUERY_CHANNEL_UNIQUE_ID: the two clients' tokens.
+        let q = words(&[(0, a), (4, 0x2080), (8, 0x2080_1124), (24, 1540)], 32);
+        let list = |c: u32| words(&[(0, c), (1024, 1)], 1540);
+        for (c, want) in [(same_uid, true), (other, false)] {
+            let r = call(&mut be, f1, CONTROL, &q, &list(c), Some(me));
+            assert_eq!(ok(&r, OS54_STATUS), want, "unique id of {c:#x}");
+        }
+
+        // GT200_DEBUGGER: RS_ACCESS_DEBUG on the object, from its list --
+        // the other process's object only once it grants a DEBUG.
+        let dbg_outer = words(&[(0, a), (4, a), (8, 0xdb9), (12, 0x83de), (32, 12)], 48);
+        let dbg = words(&[(4, same_uid), (8, 0x3d)], 12);
+        let r = call(&mut be, f1, ALLOC, &dbg_outer, &dbg, Some(me));
+        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        let mut grant = share(
+            same_uid,
+            0x3d,
+            RS_SHARE_TYPE_CLIENT,
+            RS_SHARE_ACTION_FLAG_COMPOSE,
+            a,
+        );
+        grant[12..16].copy_from_slice(&RS_ACCESS_DEBUG_BIT.to_le_bytes());
+        let r = call(&mut be, f2, SHARE, &grant, &[], None);
+        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        let r = call(&mut be, f1, ALLOC, &dbg_outer, &dbg, Some(me));
+        assert!(ok(&r, OS64_STATUS));
+        // ...for that object alone.
+        let r = call(
+            &mut be,
+            f1,
+            ALLOC,
+            &dbg_outer,
+            &words(&[(4, same_uid), (8, 0x3e)], 12),
+            Some(me),
+        );
+        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+
+        // A control without the caller, from a guest that said it sends one.
+        let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
+        assert_eq!(errno(&r), -libc::EINVAL);
+    }
+
+    #[test]
+    fn without_the_euid_a_token_rule_is_the_process() {
+        // GCAP_PROC_ID alone: the process, no euid, and no caller on
+        // controls.
+        let (mut be, f1, f2) = vm(GCAP_PROC_ID);
+        let me = pid(10);
+        let a = alloc_client(&mut be, f1, Some(me));
+        let mine_too = alloc_client(&mut be, f2, Some(me));
+        let same_uid = alloc_client(&mut be, f2, Some(pid_as(20, me.euid)));
+        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let r = call(
+            &mut be,
+            f1,
+            ALLOC,
+            &outer,
+            &words(&[(4, same_uid)], 56),
+            Some(me),
+        );
+        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        let r = call(
+            &mut be,
+            f1,
+            ALLOC,
+            &outer,
+            &words(&[(4, mine_too)], 56),
+            Some(me),
+        );
+        assert_eq!(rm_status(&r, OS64_STATUS), 0);
+        // A control carries no caller: another client named is refused, the
+        // caller's own is fine.
+        let regops = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
+        let r = call(
+            &mut be,
+            f1,
+            CONTROL,
+            &regops,
+            &words(&[(0, mine_too)], 48),
+            None,
+        );
+        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
     }
 
     #[test]
     fn a_grant_does_not_outlive_its_object_freed_with_a_parent() {
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let b = alloc_client(&mut be, f2, Some(pid(20)));
         let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
@@ -1816,7 +2350,7 @@ mod backend_tests {
         assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         assert!(!reached(0x34));
         // And a revoke on one object holds against a grant on its client.
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         let a2 = alloc_client(&mut be, f1, Some(pid(10)));
         let b2 = alloc_client(&mut be, f2, Some(pid(20)));
         let ctl = words(
@@ -1831,7 +2365,7 @@ mod backend_tests {
         let mut p = words(&[(0, b2), (4, 1)], 12);
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_CLIENT.to_le_bytes());
         p[10] = compose;
-        let r = call(&mut be, f1, CONTROL, &ctl, &p, None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b2, a2, 0x66), &[], Some(pid(20)));
         assert_eq!(rm_status(&r, OS55_STATUS), 0);
@@ -1856,22 +2390,22 @@ mod backend_tests {
 
     #[test]
     fn channels_of_another_vms_clients_are_not_disabled() {
-        let (mut be, f1, _) = vm(true);
+        let (mut be, f1, _) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_110b), (24, 536)], 32);
         let list = |c: u32| words(&[(4, 1), (24, c), (280, 0xc4a)], 536);
         seen();
-        let r = call(&mut be, f1, CONTROL, &ctl, &list(HOST), None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &list(HOST), Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
         assert!(!reached(0x2a));
-        let r = call(&mut be, f1, CONTROL, &ctl, &list(a), None);
+        let r = call(&mut be, f1, CONTROL, &ctl, &list(a), Some(pid(10)));
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
         assert!(reached(0x2a));
     }
 
     #[test]
     fn a_closed_file_takes_its_clients_ownership_and_grants() {
-        let (mut be, f1, f2) = vm(true);
+        let (mut be, f1, f2) = vm(FULL);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let b = alloc_client(&mut be, f2, Some(pid(20)));
         let compose = RS_SHARE_ACTION_FLAG_COMPOSE;

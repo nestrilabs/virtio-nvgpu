@@ -106,6 +106,16 @@ use crate::xfer::{Errno, Prepared};
 /// needs one per display client plus a few short-lived grant files.
 pub const MAX_MODESET_OPENS: usize = 64;
 
+/// And per guest process (quota.rs, B4): one process holding all 64 left
+/// the compositor and every EGL and Vulkan window-system path without one.
+/// A process holds at most 16, and the last 8 are kept for processes that
+/// hold at most 2.
+pub const MODESET_SHARE: crate::quota::Share = crate::quota::Share {
+    per_owner: 16,
+    reserve: 8,
+    floor: 2,
+};
+
 // NvKmsPermissionsType (nvkms-api.h) and nvidia-drm's own
 // (nv_drm_common_ioctl.h: MODESET 2, SUB_OWNER 3).
 const PERM_FLIPPING: u32 = 1;

@@ -1167,12 +1167,13 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_req body;
+    struct nvgpu_proc_id proc;
   } __packed req = {};
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_resp body;
   } __packed resp;
-  u32 used, got, i;
+  u32 used, got, i, req_len = sizeof(req);
   int ret;
 
   if (!dev->v2)
@@ -1185,8 +1186,13 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   req.body.nargs = cpu_to_le32(nargs);
   for (i = 0; i < nargs; i++)
     req.body.args[i] = cpu_to_le64(args[i]);
+  /* The caller, whose share what the op makes counts against (quota.rs). */
+  if (nvgpu_proc_ids(dev))
+    nvgpu_proc_id_fill(dev, &req.proc);
+  else
+    req_len -= sizeof(req.proc);
 
-  ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
+  ret = nvgpu_call(dev, &req, req_len, &resp, sizeof(resp), 0, &used,
                    NULL, NULL);
   if (ret)
     return ret;
@@ -1464,8 +1470,11 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
   req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HELLO);
   req.body.proto = cpu_to_le32(NVGPU_PROTO_V2);
   req.body.flags = cpu_to_le32(NVGPU_HELLO_F_FRESH);
-  /* Which process makes each RM call (nvgpu_main.c, nvgpu_proc_id_fill). */
-  guest_caps = NVGPU_GCAP_PROC_ID;
+  /*
+   * Which process makes each RM call, and its euid (nvgpu_main.c,
+   * nvgpu_proc_id_fill).
+   */
+  guest_caps = NVGPU_GCAP_PROC_ID | NVGPU_GCAP_PROC_EUID;
   /* The backend hands out aperture offsets in 2 MiB granules, so a smaller
    * aperture is none. */
   if (dev->uvm_aperture.len >= SZ_2M) {

@@ -81,11 +81,37 @@ extern struct kset *module_kset;
 
 /*
  * RM control commands that name an open file by descriptor inside their
- * parameters. The export form carries it after the 16-byte object it names.
+ * parameters (ctrl0000unix.h). RM looks the number up in the calling
+ * process -- the backend, which holds every guest process's control files
+ * -- so a number that is not translated names someone else's file there.
  */
 #define NVGPU_RM_EXPORT_OBJECT_TO_FD 0x00003d05
 #define NVGPU_RM_IMPORT_OBJECT_FROM_FD 0x00003d06
-#define NVGPU_RM_EXPORT_FD_OFFSET 16
+#define NVGPU_RM_GET_EXPORT_OBJECT_INFO 0x00003d08
+#define NVGPU_RM_CREATE_EXPORT_OBJECT_FD 0x00003d0a
+#define NVGPU_RM_EXPORT_OBJECTS_TO_FD 0x00003d0b
+#define NVGPU_RM_IMPORT_OBJECTS_FROM_FD 0x00003d0c
+
+/*
+ * Where one of those keeps its descriptor, or -1: after the 16-byte object
+ * for EXPORT_OBJECT_TO_FD, after hDevice, maxObjects and 64 bytes of
+ * metadata (aligned to 4) for CREATE_EXPORT_OBJECT_FD, first for the rest.
+ */
+static int nvgpu_rm_unix_fd_offset(u32 ctl_cmd) {
+  switch (ctl_cmd) {
+  case NVGPU_RM_EXPORT_OBJECT_TO_FD:
+    return 16;
+  case NVGPU_RM_CREATE_EXPORT_OBJECT_FD:
+    return 72;
+  case NVGPU_RM_IMPORT_OBJECT_FROM_FD:
+  case NVGPU_RM_GET_EXPORT_OBJECT_INFO:
+  case NVGPU_RM_EXPORT_OBJECTS_TO_FD:
+  case NVGPU_RM_IMPORT_OBJECTS_FROM_FD:
+    return 0;
+  default:
+    return -1;
+  }
+}
 
 /* Largest second-level buffer we will carry for one call. */
 #define NVGPU_DEEP_MAX (64 * 1024)
@@ -308,8 +334,30 @@ static __poll_t nvgpu_modeset_poll(struct file *filp,
  * Whether RM_ALLOC and RM_DUP_OBJECT say which process makes them
  * (nvgpu_wire.h, struct nvgpu_proc_id): only to a backend that asked.
  */
-static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
+bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
   return dev->v2 && (dev->backend_caps & NVGPU_BCAP_PROC_ID);
+}
+
+/*
+ * Whether the process says its euid too, and every RM_CONTROL carries it: a
+ * control may name a second client, which the backend holds to RM's rule for
+ * it -- the same process, or the same euid where RM's rule is its security
+ * token (device/src/rmshare.rs).
+ */
+static bool nvgpu_proc_euid(const struct nvgpu_device *dev) {
+  return nvgpu_proc_ids(dev) && (dev->backend_caps & NVGPU_BCAP_PROC_EUID);
+}
+
+/*
+ * Whether this guest has a UVM device at all. A v2 backend serves UVM only
+ * with --allow-compute (NVGPU_BCAP_COMPUTE) and refuses every open of it
+ * otherwise; then no /dev/nvidia-uvm is made and "nvidia-uvm" is not in
+ * /proc/devices, which NVIDIA's userspace reads as a host whose nvidia-uvm
+ * is not loaded (and nvidia-modprobe finds no major to make a node with).
+ * A v1 backend knows nothing of the flag and keeps what it had.
+ */
+static bool nvgpu_uvm_offered(const struct nvgpu_device *dev) {
+  return !dev->v2 || (dev->backend_caps & NVGPU_BCAP_COMPUTE);
 }
 
 /*
@@ -321,16 +369,41 @@ static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
  * RCU grace period, so the leader read here stays readable while a
  * concurrent exec replaces it.
  */
-static void nvgpu_proc_id_fill(void *dst) {
+void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst) {
+  nvgpu_proc_id_fill_task(dev, current, dst);
+}
+
+/* The same for task `t`, which the caller holds a reference on. */
+void nvgpu_proc_id_fill_task(const struct nvgpu_device *dev,
+                             struct task_struct *t, void *dst) {
   struct nvgpu_proc_id id = {};
   struct task_struct *leader;
 
   rcu_read_lock();
-  leader = READ_ONCE(current->group_leader);
+  leader = READ_ONCE(t->group_leader);
   id.start_ns = cpu_to_le64(leader->start_time);
   rcu_read_unlock();
-  id.tgid = cpu_to_le32(task_tgid_nr(current));
+  id.tgid = cpu_to_le32(task_tgid_nr(t));
+  /*
+   * The effective uid, as RM's security token holds it for a host process
+   * (os_get_euid: current->cred->euid, in the initial user namespace). Not
+   * the fsuid: RM never reads it.
+   */
+  if (nvgpu_proc_euid(dev))
+    id.euid = cpu_to_le32(__kuid_val(task_euid(t)));
   memcpy(dst, &id, sizeof(id));
+}
+
+/*
+ * An OPEN's length, with the opener after the request when the backend
+ * charges what a process opens to it (device/src/quota.rs).
+ */
+u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
+                             struct nvgpu_open_req_proc *r) {
+  if (!nvgpu_proc_ids(dev))
+    return sizeof(r->req);
+  nvgpu_proc_id_fill(dev, &r->proc);
+  return sizeof(*r);
 }
 
 /* nvgpu_ioctl_simple — flat struct, no embedded pointers */
@@ -374,7 +447,7 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
   if (proc)
-    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sz);
+    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sz);
 
   ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &used);
@@ -750,6 +823,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   /* A descriptor named inside the nested block, and where it sits. */
   int nested_fd = -1;
   u32 nested_fd_offset = 0;
+  int unix_fd_off;
 
   /* An OS event named inside it (nvgpu_rm_os_event_in), and where. */
   int os_event_off = -1;
@@ -769,6 +843,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
+  bool proc;
   u32 used;
 
   if (sz < sizeof(params))
@@ -870,8 +945,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   /* ── Normal path (no V1→V2 rewrite) ── */
 
-  req_total =
-      sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size + deep_len;
+  /* The calling process after the blocks (nvgpu_proc_euid). */
+  proc = nvgpu_proc_euid(nfd->dev);
+  req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size +
+              deep_len + (proc ? sizeof(struct nvgpu_proc_id) : 0);
   resp_max =
       sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size + deep_len;
 
@@ -906,29 +983,37 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     }
 
     /*
-     * Exporting an object to a descriptor, and importing one back, name
-     * another of our open files inside the nested parameters. The backend
-     * knows that file by the handle it issued, not by our descriptor number,
-     * so swap one for the other here and swap it back on the way out --
-     * userspace gets its own descriptor returned, which is what it passed in.
+     * Exporting objects to a descriptor, importing them back and asking
+     * about an export name another of our open files inside the nested
+     * parameters. The backend knows that file by the handle it issued, not
+     * by our descriptor number, so swap one for the other here and swap it
+     * back on the way out -- userspace gets its own descriptor returned,
+     * which is what it passed in.
+     *
+     * A number that is not one of our files is refused here, never sent as
+     * it is: the backend reads the field as one of its handles, and handles
+     * are issued in order, so a small number is likely another process's
+     * control file -- and RM would import that process's exported memory
+     * into the caller's client. -1, which RM refuses itself (os.c), is the
+     * one value that passes unchanged.
      */
-    if (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD ||
-        ctl_cmd == NVGPU_RM_IMPORT_OBJECT_FROM_FD) {
-      u32 off = (ctl_cmd == NVGPU_RM_EXPORT_OBJECT_TO_FD)
-                    ? NVGPU_RM_EXPORT_FD_OFFSET
-                    : 0;
+    unix_fd_off = nvgpu_rm_unix_fd_offset(ctl_cmd);
+    if (unix_fd_off >= 0 && nested_size >= unix_fd_off + sizeof(u32)) {
+      void *slot = req_buf + sizeof(*req) + sizeof(params) + unix_fd_off;
+      u32 handle;
 
-      if (nested_size >= off + sizeof(u32)) {
-        void *slot = req_buf + sizeof(*req) + sizeof(params) + off;
-        u32 handle;
-
-        memcpy(&nested_fd, slot, sizeof(nested_fd));
-        if (nvgpu_handle_for_fd(nested_fd, &handle) == 0) {
-          memcpy(slot, &handle, sizeof(handle));
-          nested_fd_offset = off;
-        } else {
-          nested_fd = -1;
+      memcpy(&nested_fd, slot, sizeof(nested_fd));
+      if (nested_fd != -1) {
+        if (nvgpu_handle_for_fd(nested_fd, &handle)) {
+          dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                               "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                               "which is not one of our devices\n",
+                               ctl_cmd, nested_fd);
+          ret = -EBADF;
+          goto out;
         }
+        memcpy(slot, &handle, sizeof(handle));
+        nested_fd_offset = unix_fd_off;
       }
     }
 
@@ -965,6 +1050,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       goto out;
     }
   }
+  if (proc)
+    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sizeof(params) +
+                                     nested_size + deep_len);
 
   ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &used);
@@ -1201,7 +1289,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
   if (nvgpu_proc_ids(nfd->dev))
-    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sizeof(params) + nested_size);
+    nvgpu_proc_id_fill(nfd->dev,
+                       req_buf + sizeof(*req) + sizeof(params) + nested_size);
 
   if (user_alloc && nested_size > 0) {
     nested = req_buf + sizeof(*req) + sizeof(params);
@@ -1234,6 +1323,11 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
           nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
         memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
+        /* -1 is "no descriptor"; any other negative is refused, as below. */
+        if (event_fd < -1) {
+          ret = -EBADF;
+          goto out;
+        }
         if (event_fd >= 0) {
           u32 handle;
 
@@ -1377,7 +1471,14 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
    * -EBADF from fget(-1) before the request was ever sent, so the call failed
    * with nothing recorded anywhere on the far side.  The value only keeps its
    * meaning if it is forwarded unchanged.
+   *
+   * -1 only: any other negative number is no descriptor either, and sent
+   * as it is the backend would read it as a handle of its own.
    */
+  if (guest_fd < -1) {
+    ret = -EBADF;
+    goto out;
+  }
   if (guest_fd >= 0) {
     /* Resolve guest fd → nvgpu_fd → VMM handle */
     ret = nvgpu_handle_for_fd(guest_fd, &host_handle);
@@ -1947,8 +2048,10 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
                              u32 device_type) {
   struct nvgpu_device *dev;
   struct nvgpu_fd *nfd;
+  struct nvgpu_open_req_proc *reqp;
   struct nvgpu_open_req *req;
   struct nvgpu_open_resp *resp;
+  u32 req_len;
   int ret;
 
   /* Recover nvgpu_device pointer depending on which cdev was opened */
@@ -1963,14 +2066,15 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
                        cdev_gpu[iminor(inode)]);
 
   nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
-  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  reqp = kzalloc(sizeof(*reqp), GFP_KERNEL);
   resp = kzalloc(sizeof(*resp), GFP_KERNEL);
-  if (!nfd || !req || !resp) {
+  if (!nfd || !reqp || !resp) {
     kfree(nfd);
-    kfree(req);
+    kfree(reqp);
     kfree(resp);
     return -ENOMEM;
   }
+  req = &reqp->req;
 
   nfd->dev = dev;
   nfd->device_type = device_type;
@@ -1979,11 +2083,12 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
   req->device_type = cpu_to_le32(device_type);
   req->flags = cpu_to_le32(filp->f_flags);
+  req_len = nvgpu_open_req_fill_proc(dev, reqp);
 
-  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp, sizeof(*resp));
+  ret = nvgpu_send_recv(dev, reqp, req_len, resp, sizeof(*resp));
   if (ret < 0 || (s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
     kfree(nfd);
-    kfree(req);
+    kfree(reqp);
     kfree(resp);
     if (ret < 0)
       return ret;
@@ -1996,7 +2101,7 @@ static int nvgpu_open_common(struct inode *inode, struct file *filp,
   nvgpu_dev_get(dev);
   nvgpu_fd_register(nfd->dev, nfd);
   filp->private_data = nfd;
-  kfree(req);
+  kfree(reqp);
   kfree(resp);
   return 0;
 }
@@ -2171,11 +2276,17 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
           memcpy(nested + NVGPU_NVKMS_SURFACE_FD_OFFSET, &as_u64,
                  sizeof(as_u64));
         } else {
+          /*
+           * Refused, not forwarded: the backend would read the caller's
+           * number as one of its handles -- another process's file.
+           */
           dev_warn_ratelimited(
               &nfd->dev->vdev->dev,
               "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
-              "of ours; forwarding it unchanged\n",
+              "of ours\n",
               guest_fd);
+          ret = -EBADF;
+          goto out;
         }
       }
     }
@@ -3442,21 +3553,33 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   device_create(nvgpu_class, &vdev->dev, MKDEV(NV_MAJOR, NV_CTL_MINOR), NULL,
                 "nvidiactl");
 
-  /* Register /dev/nvidia-uvm (major should match host) */
+  /*
+   * Register /dev/nvidia-uvm (major should match host), when the backend
+   * serves it (nvgpu_uvm_offered).
+   */
   dev->uvm_devno = MKDEV(NV_UVM_MAJOR, 0);
-  ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
-  if (ret)
-    goto err_ctl_cdev;
+  if (nvgpu_uvm_offered(dev)) {
+    ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
+    if (ret)
+      goto err_ctl_cdev;
 
-  cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
-  dev->cdev_uvm.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
-  if (ret)
-    goto err_uvm_region;
+    cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
+    dev->cdev_uvm.owner = THIS_MODULE;
+    ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
+    if (ret) {
+      unregister_chrdev_region(dev->uvm_devno, 2);
+      goto err_ctl_cdev;
+    }
 
-  device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
-  device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
-                "nvidia-uvm-tools");
+    device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
+    device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
+                  "nvidia-uvm-tools");
+    dev->uvm_registered = true;
+  } else {
+    dev_info(&vdev->dev,
+             "virtio-gpu-nv: the backend serves no compute (no "
+             "--allow-compute); no /dev/nvidia-uvm\n");
+  }
 
   /* Register /dev/nvidia-modeset (match host, major 195, minor 254) */
   dev->modeset_devno = MKDEV(NV_MAJOR, NV_MODESET_MINOR);
@@ -3543,11 +3666,13 @@ err_proc:
 err_modeset_region:
   unregister_chrdev_region(dev->modeset_devno, 1);
 err_uvm_cdev:
-  device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
-  cdev_del(&dev->cdev_uvm);
-err_uvm_region:
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
 err_ctl_cdev:
   device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
   cdev_del(&dev->cdev_ctl);
@@ -3613,10 +3738,13 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   cdev_del(&dev->cdev_ctl);
   unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
 
-  device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
-  cdev_del(&dev->cdev_uvm);
-  unregister_chrdev_region(dev->uvm_devno, 2);
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
 
   nvgpu_caps_cleanup(dev);
 

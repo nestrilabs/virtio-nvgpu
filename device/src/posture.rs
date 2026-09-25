@@ -183,6 +183,38 @@ pub fn set_undumpable() -> io::Result<()> {
     Ok(())
 }
 
+/// Raise RLIMIT_NOFILE's soft limit to its hard limit, and return the soft
+/// limit now in force.
+///
+/// One backend holds a host descriptor for everything every guest process
+/// has open on the device, so the inherited soft limit -- 1,024 under most
+/// launchers, against a hard limit a few hundred times that -- was the real
+/// size of the VM's handle table, one pool every guest process drew from
+/// (B1). The handle table is sized from what this returns
+/// (`handle_table::limit_for_nofile`).
+pub fn raise_nofile() -> io::Result<u64> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit into a local.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if r.rlim_cur < r.rlim_max {
+        let want = libc::rlimit {
+            rlim_cur: r.rlim_max,
+            rlim_max: r.rlim_max,
+        };
+        // SAFETY: setrlimit from a local.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &want) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        r.rlim_cur = r.rlim_max;
+    }
+    Ok(r.rlim_cur)
+}
+
 /// The socket path used when none is given: `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock`.
 /// `None` without an XDG_RUNTIME_DIR; there is no shared-directory default.
 pub fn default_socket(xdg_runtime_dir: Option<&Path>) -> Option<PathBuf> {
@@ -253,6 +285,19 @@ pub fn clear_socket_path(path: &Path, euid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_descriptor_limit_is_raised_to_the_hard_limit() {
+        let soft = raise_nofile().unwrap();
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit into a local.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
+        assert_eq!(soft, r.rlim_cur);
+        assert_eq!(r.rlim_cur, r.rlim_max);
+    }
     use std::os::unix::net::UnixListener;
 
     fn tmpdir(tag: &str) -> PathBuf {

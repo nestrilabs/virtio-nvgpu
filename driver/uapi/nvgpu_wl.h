@@ -106,6 +106,23 @@ struct nvgpu_wl_connect {
   __u32 flags; /* 0 */
 };
 
+/*
+ * CONNECT for another process: the daemon's connection for the client that
+ * connected to it, charged to that client (its pid, from SO_PEERCRED, in
+ * the caller's PID namespace) rather than to the daemon. Each guest process
+ * may hold only a share of the VM's channels, and of their shm and queue
+ * budgets (device/src/quota.rs); charged to the daemon, every client would
+ * share one. Mode NVGPU_WL_CONNECT only. -ESRCH when the pid names no
+ * process. Whoever may open this device (the daemon's group) may name any
+ * process, so no app is to be in that group.
+ */
+struct nvgpu_wl_connect_for {
+  __u32 mode;  /* NVGPU_WL_CONNECT */
+  __u32 flags; /* 0 */
+  __s32 pid;   /* the client process */
+  __u32 pad;   /* 0 */
+};
+
 /* ── SEND / RECV ── */
 
 /* nvgpu_wl_xfer.flags (RECV, out) */
@@ -125,6 +142,7 @@ struct nvgpu_wl_xfer {
 #define NVGPU_WL_IOC_CONNECT _IOW('W', 0x41, struct nvgpu_wl_connect)
 #define NVGPU_WL_IOC_SEND _IOWR('W', 0x42, struct nvgpu_wl_xfer)
 #define NVGPU_WL_IOC_RECV _IOWR('W', 0x43, struct nvgpu_wl_xfer)
+#define NVGPU_WL_IOC_CONNECT_FOR _IOW('W', 0x44, struct nvgpu_wl_connect_for)
 
 /* ── Frames ── */
 

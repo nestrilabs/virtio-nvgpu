@@ -114,7 +114,7 @@ fi
 section "nvidia device nodes"
 need_rw /dev/nvidiactl "RM control"
 need_rw /dev/nvidia0 "the GPU"
-need_rw /dev/nvidia-uvm "UVM"
+need_rw /dev/nvidia-uvm "UVM, for --allow-compute (CUDA) runs only" warn
 need_rw /dev/nvidia-modeset "NVKMS (display stages, semsurf)"
 need_rw /dev/udmabuf "stub fences, only when no NVIDIA render node takes a syncobj" warn
 

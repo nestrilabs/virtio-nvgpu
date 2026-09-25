@@ -102,6 +102,12 @@ pub struct WlConfig {
     /// What every connection of the VM shares. The dispatcher puts its own
     /// in (`WlState`), whichever configuration a connection was made from.
     pub limits: WlLimits,
+    /// The guest process the connection is for (quota.rs): what its queue
+    /// is charged to. Set by the dispatcher.
+    pub owner: crate::quota::Owner,
+    /// That process's shm budget, which every connection of it shares,
+    /// beside the VM's. Set by the dispatcher.
+    pub owner_shm: Option<Arc<ShmBudget>>,
 }
 
 impl WlConfig {
@@ -114,22 +120,43 @@ impl WlConfig {
             lease_cache: Arc::new(LeaseCache::default()),
             fences: false,
             limits: WlLimits::default(),
+            owner: crate::quota::Owner::Unknown,
+            owner_shm: None,
         }
     }
 }
 
-/// Bytes queued for the guest, over every connection of a VM.
+/// Bytes queued for the guest, over every connection of a VM, and what each
+/// guest process's connections hold of it.
+///
+/// A connection past the budget is dropped. Counted only per VM, the one
+/// dropped was whichever connection's output crossed the line -- often not
+/// the one holding the unread bytes: a guest process that opened channels
+/// and never read them made the next event of any other process's
+/// connection hang that one up (W3). So each guest process the channels are
+/// charged to (quota.rs) holds at most half the budget, and the last quarter
+/// only while it holds at most a quarter: the connection that crosses its
+/// process's share is that process's own.
 #[derive(Debug)]
 pub struct QueueBudget {
     max: usize,
     used: AtomicUsize,
+    held: Mutex<crate::quota::Ledger>,
+    share: crate::quota::Share,
 }
 
 impl QueueBudget {
     pub fn new(max: usize) -> Self {
+        let m = max as u64;
         Self {
             max,
             used: AtomicUsize::new(0),
+            held: Mutex::new(crate::quota::Ledger::default()),
+            share: crate::quota::Share {
+                per_owner: m / 2,
+                reserve: m / 4,
+                floor: m / 4,
+            },
         }
     }
 
@@ -137,23 +164,47 @@ impl QueueBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// `n` more bytes, if that stays within the budget.
-    fn take(&self, n: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
-                u.checked_add(n).filter(|&t| t <= self.max)
-            })
-            .is_ok()
+    /// Bytes `owner`'s connections have queued.
+    pub fn held_by(&self, owner: crate::quota::Owner) -> usize {
+        self.ledger().held(owner) as usize
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, crate::quota::Ledger> {
+        self.held.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `n` more bytes for `owner`, if that stays within the VM's budget and
+    /// the owner's share of it.
+    fn take(&self, owner: crate::quota::Owner, n: usize) -> bool {
+        let mut held = self.ledger();
+        let ok = held
+            .admits(
+                &self.share,
+                owner,
+                n as u64,
+                self.used() as u64,
+                self.max as u64,
+            )
+            .is_ok();
+        if ok {
+            self.used.fetch_add(n, Ordering::AcqRel);
+            held.charge(owner, n as u64);
+        }
+        ok
     }
 
     /// `n` more bytes whatever the budget says: the few bytes of the ERROR
     /// and HANGUP records that end a connection, which must reach the guest.
-    fn force(&self, n: usize) {
+    fn force(&self, owner: crate::quota::Owner, n: usize) {
+        let mut held = self.ledger();
         self.used.fetch_add(n, Ordering::AcqRel);
+        held.charge(owner, n as u64);
     }
 
-    fn give(&self, n: usize) {
+    fn give(&self, owner: crate::quota::Owner, n: usize) {
+        let mut held = self.ledger();
         self.used.fetch_sub(n, Ordering::AcqRel);
+        held.refund(owner, n as u64);
     }
 }
 
@@ -309,7 +360,7 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // Whatever the guest never took is off the VM's queue budget.
         let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
-        self.cfg.limits.queue.give(st.to_guest_bytes);
+        self.cfg.limits.queue.give(self.cfg.owner, st.to_guest_bytes);
     }
 }
 
@@ -454,6 +505,9 @@ impl WlConn {
             synth_released: false,
         });
         engine.set_shm_budget(cfg.limits.shm.clone());
+        if let Some(b) = &cfg.owner_shm {
+            engine.set_shm_budget(b.clone());
+        }
         engine.hello(0);
         let ready = sys::eventfd()?;
         let wake = sys::eventfd()?;
@@ -466,7 +520,7 @@ impl WlConn {
         };
         let hello = st.engine.take_units();
         let n = hello.iter().map(|u| u.bytes()).sum::<usize>();
-        cfg.limits.queue.force(n);
+        cfg.limits.queue.force(cfg.owner, n);
         st.to_guest_bytes += n;
         st.to_guest.extend(hello);
         sys::eventfd_signal(ready.as_raw_fd());
@@ -566,7 +620,7 @@ impl WlConn {
             true,
         );
         let left: usize = st.to_guest.iter().map(|u| u.bytes()).sum();
-        s.cfg.limits.queue.give(st.to_guest_bytes - left);
+        s.cfg.limits.queue.give(s.cfg.owner, st.to_guest_bytes - left);
         st.to_guest_bytes = left;
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
@@ -637,17 +691,17 @@ fn collect(s: &Shared, st: &mut State) {
     }
     let n: usize = units.iter().map(|u| u.bytes()).sum();
     let own = st.to_guest_bytes + n <= s.cfg.max_queue;
-    if !own || !s.cfg.limits.queue.take(n) {
+    if !own || !s.cfg.limits.queue.take(s.cfg.owner, n) {
         log::warn!(
             "wayland: the guest has not read {} bytes ({}); dropping the connection",
             st.to_guest_bytes + n,
             if own {
-                "the VM's queue budget is spent"
+                "the VM's queue budget, or its guest process's share of it, is spent"
             } else {
                 "past the connection's limit"
             }
         );
-        s.cfg.limits.queue.give(st.to_guest_bytes);
+        s.cfg.limits.queue.give(s.cfg.owner, st.to_guest_bytes);
         st.to_guest.clear();
         st.to_guest_bytes = 0;
         hangup(s, st, libc::ENOBUFS);
@@ -662,7 +716,7 @@ fn collect(s: &Shared, st: &mut State) {
 /// to the guest whatever the budget says.
 fn push_final(s: &Shared, st: &mut State, u: Unit) {
     let n = u.bytes();
-    s.cfg.limits.queue.force(n);
+    s.cfg.limits.queue.force(s.cfg.owner, n);
     st.to_guest_bytes += n;
     st.to_guest.push_back(u);
 }
@@ -857,4 +911,51 @@ fn reader(s: Arc<Shared>) {
 #[cfg(test)]
 pub(crate) fn sock_fd(c: &WlConn) -> std::os::fd::RawFd {
     c.shared.sock.as_raw_fd()
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::quota::Owner;
+
+    /// A process whose channels are never read fills at most its share of
+    /// the queue budget, so the connection that crosses the line is its own
+    /// and never another process's (W3).
+    #[test]
+    fn a_process_that_never_reads_hits_its_own_share_not_everyones() {
+        let q = QueueBudget::new(256);
+        let (a, b) = (
+            Owner::Proc {
+                tgid: 1,
+                start_ns: 1,
+            },
+            Owner::Proc {
+                tgid: 2,
+                start_ns: 1,
+            },
+        );
+        assert!(q.take(a, 128));
+        assert!(!q.take(a, 1), "past half the budget");
+        assert_eq!(q.held_by(a), 128);
+        // Another process still queues, down to the last quarter...
+        assert!(q.take(b, 64));
+        assert!(!q.take(b, 64), "the last quarter is not for one holding a quarter");
+        // ...which is kept for a process that holds little.
+        let c = Owner::Proc {
+            tgid: 3,
+            start_ns: 1,
+        };
+        assert!(q.take(c, 64));
+        assert!(!q.take(c, 1), "the VM's budget is the outer bound");
+        q.give(a, 128);
+        q.give(b, 64);
+        q.give(c, 64);
+        assert_eq!((q.used(), q.held_by(a), q.held_by(b)), (0, 0, 0));
+        // A guest that does not say is held to the VM's budget alone.
+        assert!(q.take(Owner::Unknown, 256));
+        assert!(!q.take(Owner::Unknown, 1));
+        // The records that end a connection are owed whatever the budget.
+        q.force(a, 16);
+        assert_eq!(q.used(), 272);
+    }
 }

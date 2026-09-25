@@ -1191,3 +1191,110 @@ fn the_syncobj_global_needs_fences_on_both_ends() {
     assert!(!syncobj_round_trip("y3", uapi::CAP_WAYLAND, true, true).offered);
     assert!(!syncobj_round_trip("y4", SYNCOBJ_CAPS, false, true).offered);
 }
+
+/// A compositor that answers every wl_display.sync, and nothing else.
+fn sync_compositor(sock: PathBuf) {
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let Ok((s, _)) = l.accept() else { return };
+        s.set_nonblocking(true).unwrap();
+        let (mut buf, mut fds) = (Vec::new(), Vec::new());
+        let mut out = s.try_clone().unwrap();
+        out.set_nonblocking(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            while let Some(h) = peek_header(&buf) {
+                if buf.len() < h.size as usize {
+                    break;
+                }
+                let m: Vec<u8> = buf.drain(..h.size as usize).collect();
+                if (h.object, h.opcode) == (1, op::wl_display::REQ_SYNC) {
+                    let cb = word(&m, 2);
+                    let mut ev = MsgBuilder::new(cb, op::wl_callback::EVT_DONE)
+                        .uint(0)
+                        .finish();
+                    ev.extend_from_slice(
+                        &MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+                            .uint(cb)
+                            .finish(),
+                    );
+                    if out.write_all(&ev).is_err() {
+                        return;
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                return;
+            }
+            let mut chunk = [0u8; 65536];
+            match sys::recv_with_fds(s.as_raw_fd(), &mut chunk, &mut fds) {
+                Ok(0) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// A client that floods requests and never reads the replies: the daemon
+/// holds at most a bounded amount for it, and stops taking the channel's
+/// output until the client catches up, where it once grew until the
+/// guest's OOM killer took it and every other client with it (W2).
+#[test]
+fn a_client_that_never_reads_cannot_grow_the_daemon_without_bound() {
+    let dir = runtime_dir("w2");
+    let host_sock = dir.join("host-0");
+    sync_compositor(host_sock.clone());
+    let d = DaemonRun::start(&dir, &host_sock, Via::Conn);
+    let s = UnixStream::connect(&d.socket).unwrap();
+    let mut w = s.try_clone().unwrap();
+    // Every reply is 24 bytes; this many is well past what the daemon keeps.
+    let n = 400_000u32;
+    let writer = std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(12 * 1024);
+        for id in 0..n {
+            batch.extend_from_slice(
+                &MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+                    .new_id(3 + id)
+                    .finish(),
+            );
+            if batch.len() >= 12 * 1024 {
+                if w.write_all(&batch).is_err() {
+                    return;
+                }
+                batch.clear();
+            }
+            // Paced, so that what is in flight stays under the proxy's cap
+            // on live objects and the replies are what piles up.
+            if id % 8192 == 8191 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let _ = w.write_all(&batch);
+    });
+    let _ = writer.join();
+    // Let what can flow, flow.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = 0;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        let p = d.totals().peak_unread;
+        if p == last && p > 0 {
+            break;
+        }
+        last = p;
+    }
+    let peak = d.totals().peak_unread;
+    assert!(
+        peak >= 2 << 20,
+        "the flood never built up ({peak} bytes); the test proves nothing"
+    );
+    assert!(
+        peak <= (4 << 20) + (512 << 10),
+        "the daemon held {peak} bytes for a client that does not read"
+    );
+    drop(s);
+}

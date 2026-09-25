@@ -20,7 +20,15 @@
 #   --wayland-queue-budget MIB  unread compositor output per VM (default 256)
 #   --wayland-lease-interval S  seconds between lease requests (default 5)
 #
+# Compute (off by default; SECURITY.md, "Compute"):
+#   --allow-compute             serve CUDA: UVM, the UVM aperture and memory
+#                               registered by its pages. Without it the guest
+#                               has no /dev/nvidia-uvm and CUDA finds no
+#                               device. The probe is told which, as
+#                               nvgpu_compute=0|1 on the kernel command line.
+#
 # Environment (all optional):
+#   NVGPU_COMPUTE=1     the same as --allow-compute
 #   NVGPU_RIG           the rig directory (bin/ kernel/ guest/ logs/); default
 #                       the repo's .rig when not root
 #   NVGPU_BACKEND NVGPU_VMM NVGPU_KERNEL NVGPU_ROOTFS NVGPU_LOGS
@@ -177,9 +185,15 @@ BACKEND_ARGS=()
 WL_SOCK=
 WL_EXPORT=
 KMS_CARD=0
+COMPUTE=0
+[ "${NVGPU_COMPUTE:-0}" = 1 ] && COMPUTE=1
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case $1 in
+        --allow-compute)
+            COMPUTE=1
+            shift
+            ;;
         --kms-card | --wayland-lease)
             [ "$1" = --kms-card ] && KMS_CARD=1
             BACKEND_ARGS+=("$1")
@@ -205,8 +219,15 @@ while [ $# -gt 0 ]; do
             ;;
         --)
             shift
-            for a in "$@"; do [ "$a" = --kms-card ] && KMS_CARD=1; done
-            BACKEND_ARGS+=("$@")
+            for a in "$@"; do
+                case $a in
+                    --allow-compute) COMPUTE=1 ;;
+                    *)
+                        [ "$a" = --kms-card ] && KMS_CARD=1
+                        BACKEND_ARGS+=("$a")
+                        ;;
+                esac
+            done
             break
             ;;
         -h | --help) usage ;;
@@ -221,6 +242,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ ${#POSITIONAL[@]} -ge 1 ] && [ ${#POSITIONAL[@]} -le 2 ] || usage
+# Compute is the backend's to serve and the probe's to expect: one switch for
+# both (guest-image/probes/render.sh reads nvgpu_compute).
+[ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
 
 PROBE=${POSITIONAL[0]}
 TAG=${POSITIONAL[1]:-$(date +%H%M%S)}
@@ -263,6 +287,10 @@ else
     NVIDIA_SHARE=${NVGPU_NVIDIA_SHARE-/var/lib/nvgpu}
 fi
 CMDLINE_EXTRA=${NVGPU_CMDLINE_EXTRA:-}
+case " $CMDLINE_EXTRA " in
+    *" nvgpu_compute="*) ;;
+    *) CMDLINE_EXTRA="${CMDLINE_EXTRA:+$CMDLINE_EXTRA }nvgpu_compute=$COMPUTE" ;;
+esac
 # An interactive run (the shell probe, nvgpu_hold=1) needs the guest console
 # on this terminal: with stdin at /dev/null the guest's shell reads EOF at
 # once and the VM powers off.

@@ -866,6 +866,8 @@ impl UvmHold {
 struct Reg {
     /// The guest file the call was made on, for its budget.
     file: u32,
+    /// The guest process that file is charged to, for its share.
+    owner: crate::quota::Owner,
     /// The RM objects that hold it, each with the parent it was made under:
     /// the object the call made, its duplicates, and objects RM made over
     /// it that keep a duplicate of their own (a semaphore surface, and a
@@ -902,6 +904,12 @@ pub struct OsDesc {
     uvm_range_count: usize,
     uvm_ranges_warned: bool,
     per_file: HashMap<u32, (usize, u64)>,
+    /// The guest process each file is charged to, and what each process
+    /// holds (quota.rs): a process holds at most a file's budget, whatever
+    /// number of files it has, and the VM's last sixteenth is kept for
+    /// processes holding at most a sixty-fourth (B5).
+    file_owners: HashMap<u32, crate::quota::Owner>,
+    per_owner: HashMap<crate::quota::Owner, (usize, u64)>,
     bytes: u64,
     vmas: usize,
     /// (sequence, id), oldest first.
@@ -927,6 +935,8 @@ impl OsDesc {
             uvm_range_count: 0,
             uvm_ranges_warned: false,
             per_file: HashMap::new(),
+            file_owners: HashMap::new(),
+            per_owner: HashMap::new(),
             bytes: 0,
             vmas: 0,
             released: VecDeque::new(),
@@ -958,12 +968,53 @@ impl OsDesc {
         self.by_key.contains_key(&Key { client, object })
     }
 
+    /// Guest file `file` is charged to `owner` (quota.rs).
+    pub(crate) fn set_file_owner(&mut self, file: u32, owner: crate::quota::Owner) {
+        if owner == crate::quota::Owner::Unknown {
+            self.file_owners.remove(&file);
+        } else {
+            self.file_owners.insert(file, owner);
+        }
+    }
+
     /// Whether a registration of `bytes`, mapped in `vmas` pieces, fits on
     /// guest file `file`. ENOMEM if not.
     pub(crate) fn admit(&self, file: u32, bytes: u64, vmas: usize) -> Result<(), Errno> {
         let (fregs, fbytes) = self.per_file.get(&file).copied().unwrap_or((0, 0));
         let l = &self.limits;
-        let why = if self.regs.len() + self.released.len() >= l.regs_per_vm {
+        let owner = self.file_owners.get(&file).copied().unwrap_or_default();
+        let (oregs, obytes) = self.per_owner.get(&owner).copied().unwrap_or((0, 0));
+        let in_use = (self.regs.len() + self.released.len()) as u64;
+        let share = |per_file: u64, per_vm: u64| crate::quota::Share {
+            per_owner: per_file,
+            reserve: per_vm / 16,
+            floor: per_vm / 64,
+        };
+        let why = if crate::quota::admits(
+            &share(l.regs_per_file as u64, l.regs_per_vm as u64),
+            owner,
+            oregs as u64,
+            1,
+            in_use,
+            l.regs_per_vm as u64,
+        )
+        .is_err()
+            && in_use < l.regs_per_vm as u64
+        {
+            "registrations for the guest process"
+        } else if crate::quota::admits(
+            &share(l.bytes_per_file, l.bytes_per_vm),
+            owner,
+            obytes,
+            bytes,
+            self.bytes,
+            l.bytes_per_vm,
+        )
+        .is_err()
+            && self.bytes + bytes <= l.bytes_per_vm
+        {
+            "bytes for the guest process"
+        } else if self.regs.len() + self.released.len() >= l.regs_per_vm {
             "registrations for the VM"
         } else if fregs >= l.regs_per_file {
             "registrations for the file"
@@ -999,12 +1050,19 @@ impl OsDesc {
         let e = self.per_file.entry(file).or_default();
         e.0 += 1;
         e.1 += pinned.bytes;
+        let owner = self.file_owners.get(&file).copied().unwrap_or_default();
+        if owner != crate::quota::Owner::Unknown {
+            let o = self.per_owner.entry(owner).or_default();
+            o.0 += 1;
+            o.1 += pinned.bytes;
+        }
         self.bytes += pinned.bytes;
         self.vmas += pinned.vmas;
         self.regs.insert(
             id,
             Reg {
                 file,
+                owner,
                 keys: Vec::new(),
                 uvm: 0,
                 bytes: pinned.bytes,
@@ -1063,6 +1121,15 @@ impl OsDesc {
             e.1 -= r.bytes;
             if e.0 == 0 {
                 self.per_file.remove(&r.file);
+                // Set again before the file's next registration.
+                self.file_owners.remove(&r.file);
+            }
+        }
+        if let Some(e) = self.per_owner.get_mut(&r.owner) {
+            e.0 -= 1;
+            e.1 -= r.bytes;
+            if e.0 == 0 {
+                self.per_owner.remove(&r.owner);
             }
         }
         self.bytes -= r.bytes;
@@ -1387,6 +1454,7 @@ impl OsDesc {
             self.release(id);
         }
         self.released.clear();
+        self.file_owners.clear();
     }
 
     /// The guest has read every release up to `ack`: forget those, and name
@@ -1817,6 +1885,43 @@ mod tests {
         let (last, _) = o.reap(0);
         o.reap(last);
         assert_eq!(o.admit(3, PAGE, 0), Ok(()));
+    }
+
+    /// One process's files together hold at most a file's budget (B5).
+    #[test]
+    fn one_guest_process_holds_at_most_a_files_budget_across_its_files() {
+        use crate::quota::Owner;
+        let ram = ram();
+        let mut o = OsDesc::with_limits(Limits {
+            regs_per_vm: 64,
+            regs_per_file: 16,
+            ..Limits::default()
+        });
+        let p = |t: u32| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        for f in 1..=4 {
+            o.set_file_owner(f, p(1));
+        }
+        o.set_file_owner(9, p(2));
+        let mut n = 0u32;
+        'files: for f in 1..=4u32 {
+            loop {
+                if o.admit(f, PAGE, 0).is_err() {
+                    continue 'files;
+                }
+                n += 1;
+                o.add(f, 0xc1, n, 0, pinned(&ram, &[(LOW, 1)]));
+            }
+        }
+        assert_eq!(n, 16, "a file's budget, over four files");
+        assert_eq!(o.admit(9, PAGE, 0), Ok(()), "another process has its own");
+        // Releases give it back.
+        o.freed(0xc1, 1);
+        let (last, _) = o.reap(0);
+        o.reap(last);
+        assert_eq!(o.admit(2, PAGE, 0), Ok(()));
     }
 
     #[test]
@@ -2273,6 +2378,7 @@ mod backend_tests {
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
         be.set_host_ioctl_for_test(fake_host);
         be.set_guest_ram(Some(guest_memory()));
+        be.config_mut().allow_compute = true;
         let hello = HelloReq {
             proto: PROTO_V2,
             flags: HELLO_F_FRESH,
@@ -2530,6 +2636,54 @@ mod backend_tests {
         assert_eq!(&params[..48], &os64()[..], "the caller's own block");
         assert_eq!(&params[48..], &osd(GUEST_VA, PAGE, 1 << 22)[..]);
         assert_eq!(deep.len(), 8);
+    }
+
+    /// Without --allow-compute, BCAP_OS_DESC is never offered, and a page
+    /// list that comes anyway never reaches RM: the surface is what it was
+    /// before registration by pages existed (an address alone is refused as
+    /// it always was).
+    #[test]
+    fn without_allow_compute_memory_is_never_registered_by_its_pages() {
+        let mut vm = vm();
+        vm.be.config_mut().allow_compute = false;
+        let hello = HelloReq {
+            proto: PROTO_V2,
+            flags: 0,
+            guest_caps: 0,
+            uvm_aperture_mib: 0,
+        };
+        // SAFETY: a wire struct as its bytes.
+        let hb = unsafe {
+            std::slice::from_raw_parts(
+                &hello as *const HelloReq as *const u8,
+                size_of::<HelloReq>(),
+            )
+        };
+        let r = call(&mut vm.be, MsgType::Hello, 0, hb);
+        assert_eq!(status(&r), 0);
+        assert_eq!(rd32(&r, 16 + 4) & BCAP_OS_DESC, 0, "guest RAM or not");
+        let ctl = vm.ctl;
+        seen();
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            ctl,
+            RM_ALLOC,
+            &os64(),
+            &osd(GUEST_VA, PAGE, 1 << 22),
+            Some(&list(0, &[(HIGH + 9 * PAGE, 1)])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty(), "RM never called");
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            ctl,
+            VID_HEAP,
+            &os32(GUEST_VA, 2 * PAGE, 0, 0),
+            &[],
+            Some(&list(OSDESC_F_WRITE, &[(LOW, 1), (HIGH, 1)])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty());
     }
 
     /// RM refused: nothing is registered, the range goes at once, and the
@@ -3143,8 +3297,10 @@ mod backend_tests {
             );
         }
         assert!(seen().is_empty(), "none reached RM");
-        // Past numObjects, or another object: RM's to answer.
+        // Past numObjects, or another object: RM's to answer. The export
+        // file must be one of the VM's control files (rmctl.rs, R1).
         let (o, mut n) = control(EXPORT_OBJECTS_TO_FD, 2128);
+        put32(&mut n, 0, ctl);
         put32(&mut n, 76, 0x5000_0077);
         put32(&mut n, 80, HANDLE);
         n[2124..2126].copy_from_slice(&1u16.to_le_bytes());

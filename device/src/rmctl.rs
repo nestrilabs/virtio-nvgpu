@@ -90,9 +90,114 @@ pub fn refusal(params: &[u8]) -> Vec<u8> {
     out
 }
 
+// ─────────────────────── NV0000's OS_UNIX controls ───────────────────────
+//
+// ctrl0000unix.h, 0x3d00-0x3dff on the root client. Six of them name a
+// control file by descriptor inside their parameters -- where objects are
+// exported to, imported from, or asked about -- and RM resolves the number
+// in the calling process (nv_get_file_private, os.c:2465-2834): the backend,
+// which holds every guest process's control files. So an untranslated
+// number is another guest process's file, and RM would import that
+// process's exported objects into the caller's client, or overwrite its
+// export slots. Each is translated from the guest's handle to the backend's
+// descriptor of that very file, and only a control file (RM's own `NV_TRUE`
+// in the lookup) is accepted. -1 is the one value that passes as it is: RM
+// refuses it itself. The two MEMACCT controls name a cgroup by descriptor,
+// a host cgroup to the backend; nothing translates one, so they, and every
+// 0x3dxx command RM does not define, are answered NOT_SUPPORTED without RM.
+// FLUSH_USER_CACHE and GET_GPU_INFO carry no descriptor and pass.
+
+/// How the backend treats one OS_UNIX control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnixCtl {
+    /// A control file's descriptor at this offset of the parameters.
+    Fd { at: usize },
+    /// No descriptor: forwarded as any control is.
+    Plain,
+    /// Answered NOT_SUPPORTED here.
+    Refused(&'static str),
+}
+
+/// What the OS_UNIX control `cmd` is, or `None` for a command outside
+/// 0x3d00-0x3dff of the root client.
+pub fn unix_control(cmd: u32) -> Option<UnixCtl> {
+    if cmd & 0xffff_ff00 != 0x3d00 {
+        return None;
+    }
+    Some(match cmd {
+        // FLUSH_USER_CACHE: a range of the caller's own memory object.
+        0x3d02 => UnixCtl::Plain,
+        // GET_GPU_INFO: a gpuId's device minor.
+        0x3d07 => UnixCtl::Plain,
+        // EXPORT_OBJECT_TO_FD: after the 16-byte object.
+        0x3d05 => UnixCtl::Fd { at: 16 },
+        // IMPORT_OBJECT_FROM_FD, GET_EXPORT_OBJECT_INFO, EXPORT_OBJECTS_TO_FD,
+        // IMPORT_OBJECTS_FROM_FD: first.
+        0x3d06 | 0x3d08 | 0x3d0b | 0x3d0c => UnixCtl::Fd { at: 0 },
+        // CREATE_EXPORT_OBJECT_FD: after hDevice, maxObjects and 64 bytes of
+        // metadata, aligned to 4.
+        0x3d0a => UnixCtl::Fd { at: 72 },
+        0x3d0d => UnixCtl::Refused("NV0000_CTRL_OS_UNIX_CMD_MEMACCT_SET_LIMITS"),
+        0x3d0e => UnixCtl::Refused("NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS"),
+        _ => UnixCtl::Refused("an OS_UNIX control RM does not define"),
+    })
+}
+
+/// NV_ERR_NOT_SUPPORTED (nvstatuscodes.h).
+pub const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+
+/// The control `params` (an NVOS54 block) names, when it is an OS_UNIX one
+/// the backend refuses: its name.
+pub fn unix_refused(params: &[u8]) -> Option<&'static str> {
+    let cmd = u32::from_le_bytes(params.get(OS54_CMD..OS54_CMD + 4)?.try_into().ok()?);
+    match unix_control(cmd)? {
+        UnixCtl::Refused(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// `params` answered NOT_SUPPORTED, as RM answers a control it does not
+/// serve.
+pub fn unsupported(params: &[u8]) -> Vec<u8> {
+    let mut out = params.to_vec();
+    if out.len() >= OS54_SIZE {
+        out[OS54_STATUS..OS54_STATUS + 4].copy_from_slice(&NV_ERR_NOT_SUPPORTED.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_os_unix_control_that_names_a_file_is_translated_and_the_rest_refused() {
+        // The four that were forwarded with the guest's number (R1).
+        for (cmd, at) in [(0x3d08, 0), (0x3d0a, 72), (0x3d0b, 0), (0x3d0c, 0)] {
+            assert_eq!(unix_control(cmd), Some(UnixCtl::Fd { at }), "{cmd:#x}");
+        }
+        assert_eq!(unix_control(0x3d05), Some(UnixCtl::Fd { at: 16 }));
+        assert_eq!(unix_control(0x3d06), Some(UnixCtl::Fd { at: 0 }));
+        assert_eq!(unix_control(0x3d02), Some(UnixCtl::Plain));
+        assert_eq!(unix_control(0x3d07), Some(UnixCtl::Plain));
+        for cmd in [0x3d0d, 0x3d0e, 0x3d04, 0x3d09, 0x3d0f, 0x3dff] {
+            assert!(
+                matches!(unix_control(cmd), Some(UnixCtl::Refused(_))),
+                "{cmd:#x}"
+            );
+        }
+        // Not OS_UNIX: another interface of the root client, another class.
+        assert_eq!(unix_control(0x3e05), None);
+        assert_eq!(unix_control(0x2080_3d05), None);
+        let mut b = nvos54(0x3d0d);
+        assert!(unix_refused(&b).is_some());
+        b = unsupported(&b);
+        assert_eq!(
+            u32::from_le_bytes(b[OS54_STATUS..OS54_STATUS + 4].try_into().unwrap()),
+            NV_ERR_NOT_SUPPORTED
+        );
+        assert!(unix_refused(&nvos54(0x3d0c)).is_none());
+    }
 
     fn nvos54(cmd: u32) -> Vec<u8> {
         let mut b = vec![0u8; 32];

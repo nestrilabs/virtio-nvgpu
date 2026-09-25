@@ -72,6 +72,24 @@ pub struct WlState {
     /// A refused OPEN was logged; cleared once a channel fits again, so a
     /// guest retrying in a loop costs one line, not one per try.
     cap_logged: bool,
+    /// Each guest process's shm budget, which all its connections share
+    /// (quota.rs): a quarter of the VM's bytes and pools. An entry no
+    /// connection holds any more goes at the next OPEN.
+    owner_shm: HashMap<crate::quota::Owner, Arc<wlwire::shm::ShmBudget>>,
+}
+
+/// A guest process's share of the VM's channels (quota.rs, W1): a quarter,
+/// with the last eighth kept for processes holding at most two. Its
+/// connections' shm is a quarter of the VM's, and their unread output half
+/// of the VM's queue budget (`QueueBudget`). The guest daemon charges each
+/// connection to the client it is for, not to itself (NVGPU_WL_IOC_CONNECT_FOR).
+fn chan_share(max_conns: usize) -> crate::quota::Share {
+    let m = max_conns as u64;
+    crate::quota::Share {
+        per_owner: (m / 4).max(1),
+        reserve: m / 8,
+        floor: 2,
+    }
 }
 
 impl WlState {
@@ -181,6 +199,9 @@ pub(super) struct TableRecv<'a> {
     pub(super) handles: &'a mut HandleTable,
     pub(super) host: &'a dyn HostFds,
     pub(super) created: Vec<u32>,
+    /// Who what the compositor sends is charged to: the channel's opener
+    /// (quota.rs).
+    pub(super) owner: crate::quota::Owner,
 }
 
 impl RecvOps for TableRecv<'_> {
@@ -202,7 +223,7 @@ impl RecvOps for TableRecv<'_> {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
         }
-        let h = self.handles.insert(fd, kind).map_err(|full| {
+        let h = self.handles.insert_for(fd, kind, self.owner).map_err(|full| {
             log::warn!("wayland: handle table full; a {kind:?} from the compositor is dropped");
             io::Error::from_raw_os_error(full.errno())
         })?;
@@ -236,7 +257,29 @@ impl NvidiaBackend {
     /// costs the host no socket, thread or compositor client.
     fn wl_room(&mut self) -> Result<(), i32> {
         let n = self.wl.conns();
-        if n < self.wl.limits.max_conns {
+        let owner = self.current_owner;
+        let mine = self
+            .wl
+            .chans
+            .iter()
+            .filter(|(h, c)| matches!(c, Chan::Conn(_)) && self.handles.owner(**h) == owner)
+            .count();
+        let max = self.wl.limits.max_conns;
+        if n < max {
+            if let Err(why) = crate::quota::admits(
+                &chan_share(max),
+                owner,
+                mine as u64,
+                1,
+                n as u64,
+                max as u64,
+            ) {
+                log::warn!(
+                    "OPEN(DEV_WAYLAND): guest process {owner:?} holds {mine} of the VM's {n} \
+                     channels ({why:?}); refused"
+                );
+                return Err(libc::EMFILE);
+            }
             self.wl.cap_logged = false;
             return Ok(());
         }
@@ -248,6 +291,45 @@ impl NvidiaBackend {
             );
         }
         Err(libc::EMFILE)
+    }
+
+    /// What the connection being opened is charged to: the guest process
+    /// the OPEN names, and that process's shm budget.
+    fn wl_owner_budgets(&mut self, cfg: &mut WlConfig) {
+        let owner = self.current_owner;
+        cfg.owner = owner;
+        self.wl.owner_shm.retain(|_, b| Arc::strong_count(b) > 1);
+        if owner == crate::quota::Owner::Unknown {
+            cfg.owner_shm = None;
+            return;
+        }
+        let (bytes, pools) = self.wl.limits.shm.limits();
+        let b = self
+            .wl
+            .owner_shm
+            .entry(owner)
+            .or_insert_with(|| {
+                Arc::new(wlwire::shm::ShmBudget::new(
+                    (bytes / 4).max(1),
+                    (pools / 4).max(1),
+                ))
+            })
+            .clone();
+        cfg.owner_shm = Some(b);
+    }
+
+    /// Guest processes with a shm budget of their own, and the most bytes
+    /// each may cover.
+    #[cfg(test)]
+    pub(crate) fn wl_owner_shm(&self) -> (usize, u64) {
+        let max = self
+            .wl
+            .owner_shm
+            .values()
+            .map(|b| b.limits().0)
+            .max()
+            .unwrap_or(0);
+        (self.wl.owner_shm.len(), max)
     }
 
     /// Replace descriptor classification, which needs real DRM nodes.
@@ -295,6 +377,7 @@ impl NvidiaBackend {
                 // Explicit sync rides on the fences this backend serves.
                 cfg.fences = self.config.fences;
                 cfg.limits = self.wl.limits.clone();
+                self.wl_owner_budgets(&mut cfg);
                 let host = self.wl_host();
                 let (conn, ready) = WlConn::open(&cfg, host).map_err(|e| {
                     log::warn!(
@@ -335,6 +418,7 @@ impl NvidiaBackend {
                     .clone()
                     .unwrap_or_else(|| WlConfig::new(export.path()));
                 cfg.limits = self.wl.limits.clone();
+                self.wl_owner_budgets(&mut cfg);
                 let host = self.wl_host();
                 let (conn, ready) = WlConn::from_export(stream, &cfg, host).map_err(|e| {
                     log::warn!("wayland export: taking a host client: {e}");
@@ -358,7 +442,10 @@ impl NvidiaBackend {
                 return Err(e.raw_os_error().unwrap_or(libc::EMFILE));
             }
         };
-        let handle = match self.handles.insert(ready, HandleKind::Wayland) {
+        let handle = match self
+            .handles
+            .insert_for(ready, HandleKind::Wayland, self.current_owner)
+        {
             Ok(h) => h,
             Err(full) => {
                 log::warn!("OPEN(DEV_WAYLAND): handle table full");
@@ -482,10 +569,12 @@ impl NvidiaBackend {
             Some(Chan::Conn(c)) => c,
             _ => return Err(libc::EBADF),
         };
+        let owner = self.current_owner;
         let mut ops = TableRecv {
             handles: &mut self.handles,
             host: &*host,
             created: Vec::new(),
+            owner,
         };
         let f = conn.recv(req.max_bytes, req.max_desc, &mut ops)?;
         let created = ops.created;
