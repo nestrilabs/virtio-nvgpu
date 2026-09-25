@@ -290,7 +290,8 @@ registration carries an id, and the guest asks for the ids released
 registration, and unpins what is named. Until then the pages are out of
 ballooning and migration, as RM would keep them. Every release the backend
 cannot see happen is taken late, never early. Registrations, bytes,
-separately mapped runs and UVM mappings are bounded per file and per VM.
+separately mapped runs and UVM mappings are bounded per file, per guest
+process and per VM.
 
 Registered memory is guest RAM, which the guest caches write-back, so every
 GPU mapping of it snoops, as for any system memory the guest can see (§15).
@@ -829,7 +830,8 @@ exactly what the compositor may read, and the release is forwarded untouched,
 so the client's pacing stays the compositor's. The guest side only ever reads
 the client's pool, never maps it, so a client that shrinks its pool under the
 proxy gets short copies rather than a crash. The host's memory is charged to a
-budget per connection and per VM before it can be written, because it is
+budget per connection, per guest process and per VM before it can be
+written, because it is
 memory the host's OOM killer would not count as the backend's. What is charged
 is what it can come to hold, not the pool's size: the host's copy of a pool is
 made at full size but empty, only the parts a live buffer covers are ever
@@ -840,9 +842,12 @@ pool and scrolls by moving its buffer through it, holds what its buffer takes.
 **Bounded both ways.** The host compositor disconnects a client whose output
 buffer fills, and the guest reads when it gets round to it. So the backend
 reads every host connection eagerly, on a thread of its own, and queues what it
-translated until the guest takes it, within a budget per connection and per VM;
-a guest that stops reading loses the connection rather than the backend its
-memory. The other way, the backend takes no more from the guest while a
+translated until the guest takes it, within a budget per connection, per guest
+process and per VM; a guest that stops reading loses the connection rather than
+the backend its memory, and a process that stops reading loses its own
+connection, never another process's. The guest daemon charges each client's
+connection to that client (NVGPU_WL_IOC_CONNECT_FOR), and holds at most 4 MiB
+a client has not read before it stops taking that client's output. The other way, the backend takes no more from the guest while a
 compositor that is not reading has too much waiting, and the daemon stops
 reading its client, so the client's own library buffer is where it waits. The
 number of channels one VM may have, and how often it may ask for a lease, are
@@ -999,12 +1004,15 @@ host compositor really enters direct scanout for a guest window is stage 3 of
   will fail to map it.
 - **One address space for every UVM pool of a VM.** Each pool the guest maps
   sits at its own address in the VMM (§5), so two guest processes whose pools
-  overlap cannot both be mapped: the second CUDA context fails with EEXIST.
+  overlap cannot both be mapped: the second CUDA context fails with ENOMEM
+  (the errno of any placement that cannot be made).
   CUDA picks its addresses the same way in every process, so two CUDA
   processes at once may meet this; how often is still to be measured. A pool
   cannot be moved — its GPU address is the same number — so this needs a host
-  driver change to lift. Pools are also bounded (16 per process, 64 and
-  256 MiB per VM), and the aperture is 1 GiB.
+  driver change to lift. Pools are also bounded (16 placements and 64 MiB per
+  UVM file and per guest process, 64 and 256 MiB per VM; pools made at all,
+  mapped or not, 256 MiB per file and 1 GiB per VM), and the aperture is
+  1 GiB.
 
 ---
 
