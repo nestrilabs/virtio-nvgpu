@@ -34,6 +34,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "diff_atomic"
+path = "fuzz_targets/diff_atomic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "i2_raw"
 path = "fuzz_targets/i2_raw.rs"
 test = false

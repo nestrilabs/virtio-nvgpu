@@ -23,6 +23,7 @@ pub mod guest;
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 use core::ptr;
 
+use guest::atomic;
 use guest::deep::{self, UserMem};
 use guest::dispatch;
 use guest::i2::{self, State, Store, Xfer};
@@ -965,4 +966,100 @@ pub unsafe extern "C" fn nvgpu_rs_i2_held(st: *mut c_void) -> *mut *mut c_void {
         Some(st) => &mut st.store.held,
         None => ptr::null_mut(),
     }
+}
+
+// ───────────────────────── ATOMIC ─────────────────────────
+
+/// `struct nvgpu_atomic_ops`: nvgpu_kms.c's hooks for the parse.
+#[repr(C)]
+pub struct AtomicOps {
+    obj_class: unsafe extern "C" fn(ctx: *mut c_void, obj: u32, crtc: *mut u32) -> c_int,
+    prop_class: unsafe extern "C" fn(ctx: *mut c_void, id: u32) -> c_int,
+    in_fence: unsafe extern "C" fn(ctx: *mut c_void, st: *mut c_void, buf: u32, off: u32, fd: i64) -> c_int,
+    out_fence: unsafe extern "C" fn(ctx: *mut c_void, st: *mut c_void, buf: u32, off: u32, uptr: u64) -> c_int,
+    learn: unsafe extern "C" fn(ctx: *mut c_void, obj: u32, crtc: u32),
+    reserve: unsafe extern "C" fn(ctx: *mut c_void, crtc: u32, user_data: u64) -> c_int,
+}
+
+/// `struct nvgpu_atomic_out`.
+#[repr(C)]
+pub struct AtomicOut {
+    commit: bool,
+    values_buf: u32,
+}
+
+// The layouts nvgpu_rs_glue.c asserts on the C side.
+const _: () = assert!(core::mem::size_of::<AtomicOut>() == 8);
+const _: () = assert!(core::mem::size_of::<AtomicOps>() == 6 * core::mem::size_of::<usize>());
+
+/// The hooks of one parse.
+struct AtomicEnv<'a> {
+    ops: &'a AtomicOps,
+    ctx: *mut c_void,
+}
+
+impl atomic::Env<KStore> for AtomicEnv<'_> {
+    fn obj_class(&mut self, obj: u32) -> (i32, u32) {
+        let mut crtc = 0u32;
+        // SAFETY: nvgpu_kms.c's hook, on the context it passed with it,
+        // writing one u32 local.
+        let r = unsafe { (self.ops.obj_class)(self.ctx, obj, &mut crtc) };
+        (r, crtc)
+    }
+
+    fn prop_class(&mut self, id: u32) -> i32 {
+        // SAFETY: as above.
+        unsafe { (self.ops.prop_class)(self.ctx, id) }
+    }
+
+    fn in_fence(&mut self, st: &mut KState, buf: u32, off: u32, fd: i64) -> i32 {
+        // SAFETY: as above; the hook reaches the kernel copies only through
+        // the state pointer it is handed, derived from `st`, which is not
+        // used again until it returns (see I2Env).
+        unsafe { (self.ops.in_fence)(self.ctx, st_ptr(st), buf, off, fd) }
+    }
+
+    fn out_fence(&mut self, st: &mut KState, buf: u32, off: u32, uptr: u64) -> i32 {
+        // SAFETY: as for in_fence.
+        unsafe { (self.ops.out_fence)(self.ctx, st_ptr(st), buf, off, uptr) }
+    }
+
+    fn learn(&mut self, obj: u32, crtc: u32) {
+        // SAFETY: as for obj_class.
+        unsafe { (self.ops.learn)(self.ctx, obj, crtc) }
+    }
+
+    fn reserve(&mut self, crtc: u32, user_data: u64) -> i32 {
+        // SAFETY: as for obj_class.
+        unsafe { (self.ops.reserve)(self.ctx, crtc, user_data) }
+    }
+}
+
+/// `nvgpu_atomic_parse()`, on the state the ATOMIC special was handed.
+///
+/// # Safety
+///
+/// `st` is NULL or `call->st` of a running special hook; `ops` points at a
+/// filled `struct nvgpu_atomic_ops` whose hooks accept `ctx`; `out` at a
+/// `struct nvgpu_atomic_out`.
+#[no_mangle]
+pub unsafe extern "C" fn nvgpu_rs_atomic_parse(
+    st: *mut c_void,
+    fences: bool,
+    ops: *const c_void,
+    ctx: *mut c_void,
+    out: *mut c_void,
+) -> c_int {
+    // SAFETY: the caller's contract.
+    let (Some(st), Some(ops), Some(out)) = (unsafe { hook_state(st) }, unsafe { ops.cast::<AtomicOps>().as_ref() }, unsafe {
+        out.cast::<AtomicOut>().as_mut()
+    }) else {
+        return -EINVAL;
+    };
+    let mut o = atomic::Out { commit: out.commit, values_buf: out.values_buf };
+    let mut env = AtomicEnv { ops, ctx };
+    let r = atomic::parse(st, &mut env, fences, &mut o);
+    out.commit = o.commit;
+    out.values_buf = o.values_buf;
+    r
 }

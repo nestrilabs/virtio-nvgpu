@@ -529,3 +529,45 @@ fn a_failed_gem_proxy_closes_no_handle_another_proxy_owns() {
         o.world.events.iter().filter_map(|e| if let Ev::GemClose(f, g) = e { Some((*f, *g)) } else { None }).collect();
     assert_eq!(closed, [(5, 2)]);
 }
+
+#[test]
+fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
+    use nvgpu_guest_difftest::world::Hook;
+    // Two objects: plane 2 (on CRTC 2, per the world) with CRTC_ID = 6 and
+    // IN_FENCE_FD = 7; CRTC 3 with OUT_FENCE_PTR. A committing, evented
+    // commit with the fence bridge.
+    let mut w = world();
+    w.hooks = Hooks { mask: 1 << 4, seed: 1, fail_gem: None };
+    w.atomic = Some(true);
+    w.mem.insert(A, [2u32, 3].iter().flat_map(|v| v.to_le_bytes()).collect());
+    w.mem.insert(B, [2u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect());
+    // Property ids by the world's classes: 5 -> CRTC_ID, 6 -> IN_FENCE,
+    // 7 -> OUT_PTR.
+    w.mem.insert(C, [5u32, 6, 7].iter().flat_map(|v| v.to_le_bytes()).collect());
+    const V: u64 = 0x7f00_0005_0000;
+    const OUT: u64 = 0x7f00_0006_0000;
+    w.mem.insert(V, [6u64, 7, OUT].iter().flat_map(|v| v.to_le_bytes()).collect());
+    w.mem.insert(OUT, vec![0; 4]);
+    let mut a = vec![0u8; 56];
+    put(&mut a, 0, 1, 4);
+    put(&mut a, 4, 2, 4);
+    put(&mut a, 8, A, 8);
+    put(&mut a, 16, B, 8);
+    put(&mut a, 24, C, 8);
+    put(&mut a, 32, V, 8);
+    put(&mut a, 48, 0xabcd, 8);
+    w.mem.insert(ARG, a);
+    let o = run(dev(0, vec![]), w, Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg: ARG, render: 5, xflags: 0 });
+    let hooks: Vec<Hook> = o.world.events.iter().filter_map(|e| if let Ev::Hook(h) = e { Some(h.clone()) } else { None }).collect();
+    assert!(hooks.contains(&Hook::ALearn { obj: 2, crtc: 6 }));
+    assert!(hooks.contains(&Hook::AInFence { buf: 4, off: 8, fd: 7 }));
+    assert!(hooks.contains(&Hook::AOutFence { buf: 4, off: 16, uptr: OUT }));
+    let reserved: Vec<u32> =
+        hooks.iter().filter_map(|h| if let Hook::AReserve { crtc, .. } = h { Some(*crtc) } else { None }).collect();
+    assert_eq!(reserved, [2, 6, 3]);
+    assert!(hooks.contains(&Hook::AtomicOut { commit: true, values_buf: 4 }));
+    assert_eq!(mem(&o, OUT), &(-1i32).to_le_bytes());
+    // The request carries the in-fence's record and the out-fence's dyn.
+    let s = &sends(&o)[0];
+    assert_eq!((le32(s, 28), le32(s, 36)), (1, 1));
+}

@@ -615,18 +615,30 @@ over: (1) an OS-descriptor range within a page of 2^64 passed its page bound
 as zero pages (DIV_ROUND_UP wrapped) and was registered with one empty page
 run -- fixed in the C too; (2) an RM_CONTROL, RM_ALLOC or v1 NVKMS call with
 a size and a NULL pointer sent that many bytes of uninitialised guest kernel
-heap to the backend -- the Rust sends zeroes; (3) double fetches of the
-caller's memory, where the decision and the request came from different
-reads: RM_CONTROL's V1V2 count and pointer, TIME_CORRELATION's clock, the
-OS-descriptor class word, IDLE_CHANNELS' flags -- the Rust reads each once.
-Read in the C but unchanged (both implementations behave the same):
-IOCTL2's `nvgpu_i2_wr()` bounds-checks `width` bytes but writes 4 for a
-width of 1 or 2 (no generated field has one); a reply naming a host GEM
-handle again after a failing `gem_out` hook closes the handle an earlier
-proxy of the same reply now owns; a V1V2 list count is multiplied by 8 in
-u32 and can wrap small; and a v1 NVKMS call reads and writes 16 bytes
-whatever its ioctl's size. The ATOMIC special's parsing (`nvgpu_kms.c`) is
-still C.
+heap to the backend, which handed them to RM as the parameters -- both now
+answer as the native driver does (RM_CONTROL NV_ERR_INVALID_ARGUMENT in the
+struct, RM_ALLOC with no parameters and a size of 0, NVKMS -EPERM); (3)
+double fetches of the caller's memory, where the decision and the request
+came from different reads: RM_CONTROL's V1V2 count and pointer,
+TIME_CORRELATION's clock, the OS-descriptor class word, IDLE_CHANNELS'
+flags -- the Rust reads each once. Also fixed in both, with a regression
+case each: IOCTL2's `nvgpu_i2_wr()` wrote 4 bytes for a field of width 1 or
+2 (no generated field has one; the walk now refuses a descriptor or GEM
+field of a width the generator refuses); a V1V2 list count multiplied by 8
+in u32 wrapped small (now checked: no deep block); a v1 NVKMS call read and
+wrote 16 bytes whatever its ioctl's size (now -ENOTTY unless it is
+NVKMS_IOCTL_CMD with 16, as nvkms_ioctl); and a reply naming a host GEM
+handle again after a failing `gem_out` hook closed the handle an earlier
+proxy of the same reply owned. That last stayed within the caller's own
+file: GEM handles are per host DRM file, one per guest DRM file, so the
+closed handle was the calling file's (a later GEM_CLOSE of the stale proxy
+could then close an object the same file made meanwhile), which the file's
+owner can close natively anyway; another process's objects are reached only
+through its own files, or through dma-bufs whose import here is a reference
+of this file's. And it needs a reply from the backend, which the guest does
+not write. The ATOMIC special's parsing of the commit's arrays is in Rust
+too (`nvgpu_atomic.c` in C); what it asks of `nvgpu_kms.c` -- object and
+property classes, the fence bridge, event reservations -- stays C.
 
 Which host surfaces each display mode turns on:
 

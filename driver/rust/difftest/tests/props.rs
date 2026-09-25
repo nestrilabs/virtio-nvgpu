@@ -111,6 +111,14 @@ proptest! {
     }
 
     #[test]
+    fn atomic_agrees_on_any_seed(seed in any::<u64>()) {
+        let s = scen::gen_atomic(seed);
+        if let Err(e) = scen::diff(&s) {
+            prop_assert!(false, "{}", e);
+        }
+    }
+
+    #[test]
     fn ioctl2_agrees_on_any_seed(seed in any::<u64>()) {
         let s = scen::gen_i2(seed);
         if let Err(e) = scen::diff(&s) {

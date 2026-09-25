@@ -105,6 +105,7 @@ extern "C" {
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;
     fn nvgpu_i2_add_fd(call: *mut c_void, buf: u32, off: u32, handle: u32, flags: u32) -> c_int;
+    fn harness_atomic(call: *mut c_void, fences: bool, ctx: *mut c_void, commit: *mut bool, values_buf: *mut u32) -> c_int;
 }
 
 thread_local! {
@@ -288,6 +289,61 @@ impl CallBufs for CCall {
     fn set_ret(&mut self, r: i32) {
         unsafe { harness_set_call_ret(self.0, r) }
     }
+
+    fn atomic(&mut self, w: &mut World, fences: bool) -> (i32, bool, u32) {
+        let mut ctx = ACtx { w, call: self.0 };
+        let (mut commit, mut values_buf) = (false, 0u32);
+        let r = unsafe {
+            harness_atomic(self.0, fences, (&raw mut ctx).cast(), &mut commit, &mut values_buf)
+        };
+        (r, commit, values_buf)
+    }
+}
+
+/// What the C atomic parse's hooks get as their context.
+struct ACtx<'a> {
+    w: &'a mut World,
+    call: *mut c_void,
+}
+
+fn actx<'a>(ctx: *mut c_void) -> &'a mut ACtx<'a> {
+    unsafe { &mut *ctx.cast::<ACtx<'a>>() }
+}
+
+/// # Safety
+/// `crtc` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn dt_a_obj(ctx: *mut c_void, obj: u32, crtc: *mut u32) -> c_int {
+    let (r, c) = hooks::a_obj(actx(ctx).w, obj);
+    unsafe { *crtc = c };
+    r
+}
+
+#[no_mangle]
+pub extern "C" fn dt_a_prop(ctx: *mut c_void, id: u32) -> c_int {
+    hooks::a_prop(actx(ctx).w, id)
+}
+
+#[no_mangle]
+pub extern "C" fn dt_a_in_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, off: u32, fd: i64) -> c_int {
+    let a = actx(ctx);
+    hooks::a_in_fence(a.w, &mut CCall(a.call), buf, off, fd)
+}
+
+#[no_mangle]
+pub extern "C" fn dt_a_out_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, off: u32, uptr: u64) -> c_int {
+    let a = actx(ctx);
+    hooks::a_out_fence(a.w, &mut CCall(a.call), buf, off, uptr)
+}
+
+#[no_mangle]
+pub extern "C" fn dt_a_learn(ctx: *mut c_void, obj: u32, crtc: u32) {
+    hooks::a_learn(actx(ctx).w, obj, crtc)
+}
+
+#[no_mangle]
+pub extern "C" fn dt_a_reserve(ctx: *mut c_void, crtc: u32, user_data: u64) -> c_int {
+    hooks::a_reserve(actx(ctx).w, crtc, user_data)
 }
 
 /// # Safety

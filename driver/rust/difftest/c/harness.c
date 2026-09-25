@@ -488,3 +488,31 @@ static const struct nvgpu_schema_set harness_bad_set = {
 void harness_dev_bad_schema(struct nvgpu_device *dev) {
   dev->schema = &harness_bad_set;
 }
+
+/* ── ATOMIC: the parse's hooks, forwarded to the test's world ── */
+
+int dt_a_obj(void *ctx, u32 obj, u32 *crtc);
+int dt_a_prop(void *ctx, u32 id);
+int dt_a_in_fence(void *ctx, void *st, u32 buf, u32 off, s64 fd);
+int dt_a_out_fence(void *ctx, void *st, u32 buf, u32 off, u64 uptr);
+void dt_a_learn(void *ctx, u32 obj, u32 crtc);
+int dt_a_reserve(void *ctx, u32 crtc, u64 user_data);
+
+static const struct nvgpu_atomic_ops harness_atomic_ops = {
+    .obj_class = dt_a_obj,
+    .prop_class = dt_a_prop,
+    .in_fence = dt_a_in_fence,
+    .out_fence = dt_a_out_fence,
+    .learn = dt_a_learn,
+    .reserve = dt_a_reserve,
+};
+
+int harness_atomic(struct nvgpu_i2_call *call, bool fences, void *ctx,
+                   bool *commit, u32 *values_buf) {
+  struct nvgpu_atomic_out out = {};
+  int r = nvgpu_atomic_parse(call, fences, &harness_atomic_ops, ctx, &out);
+
+  *commit = out.commit;
+  *values_buf = out.values_buf;
+  return r;
+}

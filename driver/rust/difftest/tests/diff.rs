@@ -70,3 +70,28 @@ fn ioctl2_agrees() {
         assert!(sent > ok.len() / 4 && good > ok.len() / 20 && outs > 0 && gems > 0);
     }
 }
+
+#[test]
+fn atomic_agrees() {
+    use nvgpu_guest_difftest::world::Hook;
+    let ok = check("ATOMIC", scen::gen_atomic, seeds(3));
+    let parsed = ok
+        .iter()
+        .filter(|(_, o)| o.world.events.iter().any(|e| matches!(e, Ev::Hook(Hook::AtomicOut { .. }))))
+        .count();
+    let has = |f: &dyn Fn(&Hook) -> bool| {
+        ok.iter().filter(|(_, o)| o.world.events.iter().any(|e| matches!(e, Ev::Hook(h) if f(h)))).count()
+    };
+    let reserved = has(&|h| matches!(h, Hook::AReserve { .. }));
+    let in_f = has(&|h| matches!(h, Hook::AInFence { .. }));
+    let out_f = has(&|h| matches!(h, Hook::AOutFence { .. }));
+    let learned = has(&|h| matches!(h, Hook::ALearn { .. }));
+    let sent = ok.iter().filter(|(_, o)| o.world.events.iter().any(|e| matches!(e, Ev::Send(_)))).count();
+    eprintln!(
+        "ATOMIC: {} scenarios, {parsed} parsed, {reserved} reserved events, {in_f} in-fences, {out_f} out-fences, {learned} learned, {sent} sent",
+        ok.len()
+    );
+    if ok.len() > 1000 {
+        assert!(parsed > ok.len() / 3 && reserved > 0 && in_f > 0 && out_f > 0 && learned > 0 && sent > 0);
+    }
+}

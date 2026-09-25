@@ -757,3 +757,93 @@ fn fill_ptr(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool
 pub fn count(w: &World, f: impl Fn(&Ev) -> bool) -> usize {
     w.events.iter().filter(|e| f(e)).count()
 }
+
+/// An atomic commit: objects, their property counts, properties and values
+/// laid out for the schema walk, the ATOMIC special running the parse.
+pub fn gen_atomic(seed: u64) -> Scenario {
+    gen_atomic_from(Rng::new(seed), seed)
+}
+
+/// [`gen_atomic`], drawing from `r` (the fuzzer's bytes).
+pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
+    let (mut dev, mut world) = base(&mut r, seed);
+    dev.v2 = true;
+    dev.max_req = 1 << 20;
+    dev.max_resp = 1 << 20;
+    world.chaos = r.pick(&[0, 0, 1, 2]);
+    world.atomic = Some(r.chance(3, 4));
+    // The special always: ATOMIC's parse is what is under test.
+    world.hooks.mask |= 1 << 4;
+    let mut m = Layout::new(world);
+
+    // Now and then a big one: more CRTC_IDs than a commit may teach (64).
+    let big = r.chance(1, 8);
+    let count = match r.below(10) {
+        _ if big => 20 + r.below(40) as u32,
+        0 => 0,
+        1 => r.below(40) as u32,
+        _ => 1 + r.below(6) as u32,
+    };
+    let mut objs = Vec::new();
+    let mut cps = Vec::new();
+    for _ in 0..count {
+        let any = r.below(1 << 20) as u32;
+        let obj = if big { r.pick(&[1u32, 2, 4, 5]) } else { r.pick(&[1u32, 2, 3, 4, 5, 6, 9, 12, 13, 0xdead, any]) };
+        objs.extend_from_slice(&obj.to_le_bytes());
+        let n = match r.below(12) {
+            _ if big => 1 + r.below(8) as u32,
+            0 => r.below(20) as u32,
+            1 => 0,
+            _ => r.below(4) as u32,
+        };
+        cps.extend_from_slice(&n.to_le_bytes());
+    }
+    let sum: u64 = cps.chunks(4).map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap()))).sum();
+    let mut props = Vec::new();
+    let mut vals = Vec::new();
+    for _ in 0..sum.min(4096) {
+        let any = r.below(1000) as u32;
+        let id = if big { r.pick(&[1u32, 5, 9, 2, 4, 8]) } else { r.pick(&[1u32, 2, 3, 4, 5, 6, 7, 8, 21, 32, any]) };
+        props.extend_from_slice(&id.to_le_bytes());
+        let v: u64 = match r.below(9) {
+            0 => 0,
+            1 => u64::MAX,
+            2 => r.pick(&[3u64, 4, 7, 10, 99, (-5i64) as u64, 1 << 35]),
+            3 => m.hole(),
+            4 | 5 => {
+                let b = r.bytes(4);
+                m.put(&mut r, b)
+            }
+            _ => r.pick(&[1u64, 2, 3, 5, 6, 13, 30]),
+        };
+        vals.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut a = vec![0u8; 56];
+    let flags = r.pick(&[0u32, 1, 0x100, 0x101, 0x201, 0x200]);
+    put(&mut a, 0, 4, u64::from(flags));
+    let wrong = r.chance(1, 12);
+    put(&mut a, 4, 4, u64::from(if wrong { count + 1 } else { count }));
+    let ptr = |r: &mut Rng, m: &mut Layout, b: Vec<u8>| -> u64 {
+        match r.below(20) {
+            0 => 0,
+            1 => m.hole(),
+            _ => m.put(r, b),
+        }
+    };
+    let p1 = ptr(&mut r, &mut m, objs);
+    let p2 = ptr(&mut r, &mut m, cps);
+    let p3 = ptr(&mut r, &mut m, props);
+    let p4 = ptr(&mut r, &mut m, vals);
+    put(&mut a, 8, 8, p1);
+    put(&mut a, 16, 8, p2);
+    put(&mut a, 24, 8, p3);
+    put(&mut a, 32, 8, p4);
+    put(&mut a, 48, 8, r.next());
+    let uarg = m.put(&mut r, a);
+    Scenario {
+        seed,
+        dev,
+        world: m.world,
+        call: Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg, render: 5, xflags: 0 },
+    }
+}

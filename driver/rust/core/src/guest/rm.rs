@@ -585,7 +585,7 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
             // eight bytes for the list-style commands, plain bytes for the
             // caps tables. NvU32 arithmetic, as the C has it.
             // Past u32, too large: no deep block, below.
-            deep_len = if rw.info_style { count.checked_mul(8).unwrap_or(u32::MAX) } else { count };
+            deep_len = if rw.info_style { count.saturating_mul(8) } else { count };
             deep_ptr_offset = rw.v1_userptr_offset;
             if deep_user_ptr == 0 || deep_len == 0 || deep_len > DEEP_MAX {
                 deep_user_ptr = 0;

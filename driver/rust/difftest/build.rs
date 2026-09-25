@@ -105,7 +105,7 @@ fn main() {
     // The sources are copied next to the generated nvgpu.h, so that their
     // `#include "nvgpu.h"` finds it before the real one.
     let mut files = Vec::new();
-    for f in ["nvgpu_i2.c", "nvgpu_rmio.c", "nvgpu_schema.c"] {
+    for f in ["nvgpu_i2.c", "nvgpu_rmio.c", "nvgpu_schema.c", "nvgpu_atomic.c"] {
         fs::copy(driver.join(f), out.join(f)).expect(f);
         files.push(out.join(f));
         println!("cargo:rerun-if-changed={}", driver.join(f).display());

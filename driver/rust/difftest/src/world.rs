@@ -38,6 +38,13 @@ pub enum Hook {
     GemOut { buf: u32, off: u32, gem: u32, size: u64 },
     Special { id: u32, phase: i32 },
     Phase { phase: i32 },
+    AObj { obj: u32 },
+    AProp { id: u32 },
+    AInFence { buf: u32, off: u32, fd: i64 },
+    AOutFence { buf: u32, off: u32, uptr: u64 },
+    ALearn { obj: u32, crtc: u32 },
+    AReserve { crtc: u32, user_data: u64 },
+    AtomicOut { commit: bool, values_buf: u32 },
 }
 
 /// A deterministic generator (SplitMix64), or, for the fuzzer, the fuzzer's
@@ -164,6 +171,10 @@ pub struct World {
     pub next_id: u64,
     /// Replies to give, in order, instead of the fake backend's.
     pub canned: Vec<Vec<u8>>,
+    /// The ATOMIC special runs the atomic parse, with this fence bridge.
+    pub atomic: Option<bool>,
+    /// Out-fences taken in this call.
+    pub nfence: u32,
 }
 
 impl World {

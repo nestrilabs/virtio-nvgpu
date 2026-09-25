@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use nvgpu_guest_core::guest::atomic;
 use nvgpu_guest_core::guest::deep::{self, UserMem};
 use nvgpu_guest_core::guest::i2::{self, State, Store, Xfer};
 use nvgpu_guest_core::guest::osdesc::{self, PinError};
@@ -307,6 +308,38 @@ impl CallBufs for RCall<'_> {
 
     fn set_ret(&mut self, r: i32) {
         self.0.ret = r;
+    }
+
+    fn atomic(&mut self, w: &mut World, fences: bool) -> (i32, bool, u32) {
+        let mut out = atomic::Out::default();
+        let r = atomic::parse(self.0, &mut AEnv { w }, fences, &mut out);
+        (r, out.commit, out.values_buf)
+    }
+}
+
+/// The atomic parse's hooks, over the world.
+struct AEnv<'a> {
+    w: &'a mut World,
+}
+
+impl atomic::Env<RStore> for AEnv<'_> {
+    fn obj_class(&mut self, obj: u32) -> (i32, u32) {
+        hooks::a_obj(self.w, obj)
+    }
+    fn prop_class(&mut self, id: u32) -> i32 {
+        hooks::a_prop(self.w, id)
+    }
+    fn in_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, fd: i64) -> i32 {
+        hooks::a_in_fence(self.w, &mut RCall(st), buf, off, fd)
+    }
+    fn out_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, uptr: u64) -> i32 {
+        hooks::a_out_fence(self.w, &mut RCall(st), buf, off, uptr)
+    }
+    fn learn(&mut self, obj: u32, crtc: u32) {
+        hooks::a_learn(self.w, obj, crtc)
+    }
+    fn reserve(&mut self, crtc: u32, user_data: u64) -> i32 {
+        hooks::a_reserve(self.w, crtc, user_data)
     }
 }
 

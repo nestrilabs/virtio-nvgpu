@@ -7,6 +7,7 @@
 //! a trait method performs, with bytes this code chose. Errors are the
 //! kernel's: a negative errno.
 
+pub mod atomic;
 pub mod deep;
 pub mod dispatch;
 pub mod i2;

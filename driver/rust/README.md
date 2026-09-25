@@ -26,6 +26,7 @@ regression (below).
 | `rm.rs` — flat escapes, RM_CONTROL (GET_BUILD_VERSION and TIME_CORRELATION intercepts, OS_UNIX and OS-event descriptors, V1V2 deep pointers, the clock rebase), RM_ALLOC (event descriptors, class sizes), IDLE_CHANNELS, descriptor translation at a fixed offset, a v1 backend's NVKMS commands | `nvgpu_rmio.c` |
 | `deep.rs` — deep segments: the plan, the block, the copy-back | `nvgpu_deep_*()` |
 | `osdesc.rs` — which calls register memory by its pages, the range, the page runs, the request, the reply's id | `nvgpu_osdesc_describe()`, `_runs()`, `_register()` |
+| `atomic.rs` — an ATOMIC commit's object, property-count, property and value arrays: which CRTCs get flip events, what the commit teaches, which values are fences | `nvgpu_atomic.c` (was `nvgpu_kms_atomic()`) |
 
 What stays C, and why:
 
@@ -37,8 +38,10 @@ What stays C, and why:
   `nvgpu_drm.c`): DRM/KMS objects, `dma_fence`, `sync_file`, `dma-buf`, which
   7.2's Rust bindings do not cover for an out-of-tree module. They reach the
   kernel copies only through `nvgpu_i2_buf()` and friends, which Rust
-  implements over buffers it owns. Their own parsing (ATOMIC's object and
-  property arrays, in `nvgpu_kms.c`) is still C: the next thing to port.
+  implements over buffers it owns. ATOMIC's arrays are parsed by
+  `atomic.rs`, which asks `nvgpu_kms.c` (`struct nvgpu_atomic_ops`) what an
+  object or a property is -- host queries behind caches -- and has it
+  bridge the fences and reserve the events.
 - **The transport, virtio, mmap/window placement, the Wayland device** (`nvgpu_xfer.c`,
   `nvgpu_main.c`, `nvgpu_wl.c`): as the task set out; the transport's reply
   reaper (`nvgpu_reap_ioctl2`) reads host input, not guest input.
@@ -76,7 +79,8 @@ What stays C, and why:
   carry canaries.
 - `fuzz/` is cargo-fuzz (nightly, from fenix): `diff_rm` and `diff_i2` drive
   the differential test from libFuzzer's bytes, `i2_raw` feeds the Rust core
-  raw bytes with debug assertions (overflow checks) on.
+  raw bytes with debug assertions (overflow checks) on, `diff_atomic`
+  drives ATOMIC commits through both.
 
 ## Building, testing, fuzzing
 
@@ -127,13 +131,18 @@ vermagic; that is not what was tested.)
 - **Unreadable before decided.** TIME_CORRELATION reads its whole block
   before refusing a TSC clock: a block that is not all readable is
   `-EFAULT`, where the C read one byte and answered NOT_SUPPORTED.
-- **Zeroed.** Where the C sent `kmalloc()` bytes it never wrote (an
-  RM_CONTROL, RM_ALLOC or v1 NVKMS call with a size and a NULL pointer: the
-  size's worth of guest kernel heap, to the backend), the Rust sends zeroes.
+Fixed in both since, each with a case in `difftest/tests/cases.rs` that
+fails against the earlier C: a size with a NULL pointer (RM_CONTROL,
+RM_ALLOC, v1 NVKMS) sent that much uninitialised guest kernel heap, and now
+gets the native driver's answer; `nvgpu_i2_wr()` wrote 4 bytes for a field
+of width 1 or 2, and the walk refuses a descriptor or GEM field of a width
+the generator refuses; a GEM handle named again after a failing `gem_out`
+hook was closed while an earlier proxy owned it; V1V2's count times 8
+wrapped in u32; a v1 NVKMS call read and wrote 16 bytes whatever its size.
 
 ## When the Rust has passed
 
-Delete `nvgpu_i2.c` and `nvgpu_rmio.c`, the `NVGPU_RUST` switch in
+Delete `nvgpu_i2.c`, `nvgpu_rmio.c` and `nvgpu_atomic.c`, the `NVGPU_RUST` switch in
 `Makefile` (keep the Rust objects unconditionally), the `NVGPU_RUST`
 handling in `scripts/build-guest-kernel.sh` (always enable `CONFIG_RUST`),
 and `difftest/` (its `cases.rs` can become core unit tests against a fake

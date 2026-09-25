@@ -82,11 +82,11 @@
  * (drm_atomic_uapi.c:1433-1455), so this is "more CRTCs than any GPU has";
  * anything past it is reserved when its event arrives instead.
  */
-#define NVGPU_KMS_MAX_EVENTS 32
+#define NVGPU_KMS_MAX_EVENTS NVGPU_ATOMIC_MAX_EVENTS
 /* Out-fence pointers in one commit: one per CRTC or writeback connector. */
 #define NVGPU_KMS_MAX_FENCES 32
 /* CRTC_ID assignments one commit may teach us. */
-#define NVGPU_KMS_MAX_LEARN 64
+#define NVGPU_KMS_MAX_LEARN NVGPU_ATOMIC_MAX_LEARN
 /* DRM_CLIENT_CAP_* remembered for a replay; the highest is 7 in 7.2. */
 #define NVGPU_KMS_NCAPS 16
 /* How long a blocking WAIT_VBLANK waits: the core's own bound
@@ -102,16 +102,26 @@
 #define NVGPU_KMS_COOKIE_TAG 0x6e76677076626cull /* "nvgpvbl" */
 #define NVGPU_KMS_COOKIE_SHIFT 16
 
-/* What a property is, as far as this file cares (by name, like the backend). */
-#define NVGPU_KPROP_PLAIN 1
-#define NVGPU_KPROP_CRTC_ID 2  /* plane/connector CRTC_ID: a CRTC joins the commit */
-#define NVGPU_KPROP_IN_FENCE 3 /* a sync_file descriptor, -1 none */
-#define NVGPU_KPROP_OUT_PTR 4  /* a user pointer the kernel writes an fd to */
+/* NVGPU_KPROP_* and NVGPU_KOBJ_* are nvgpu.h's; objs keeps an object's
+ * CRTC (<< 2), when a GETPLANE reply or a committed CRTC_ID told us. */
 
-/* What an object is: a CRTC, or not -- then with the CRTC it is on (<< 2),
- * when a GETPLANE reply or a committed CRTC_ID told us. */
-#define NVGPU_KOBJ_CRTC 1
-#define NVGPU_KOBJ_OTHER 2
+/* The layout nvgpu_atomic_parse() reads, which is drm_mode_atomic's. */
+static_assert(sizeof(struct drm_mode_atomic) == NVGPU_ATOMIC_SIZE);
+static_assert(offsetof(struct drm_mode_atomic, flags) == NVGPU_ATOMIC_FLAGS);
+static_assert(offsetof(struct drm_mode_atomic, count_objs) ==
+              NVGPU_ATOMIC_COUNT_OBJS);
+static_assert(offsetof(struct drm_mode_atomic, objs_ptr) ==
+              NVGPU_ATOMIC_OBJS_PTR);
+static_assert(offsetof(struct drm_mode_atomic, count_props_ptr) ==
+              NVGPU_ATOMIC_COUNT_PROPS_PTR);
+static_assert(offsetof(struct drm_mode_atomic, props_ptr) ==
+              NVGPU_ATOMIC_PROPS_PTR);
+static_assert(offsetof(struct drm_mode_atomic, prop_values_ptr) ==
+              NVGPU_ATOMIC_VALUES_PTR);
+static_assert(offsetof(struct drm_mode_atomic, user_data) ==
+              NVGPU_ATOMIC_USER_DATA);
+static_assert(DRM_MODE_PAGE_FLIP_EVENT == NVGPU_ATOMIC_FLIP_EVENT);
+static_assert(DRM_MODE_ATOMIC_TEST_ONLY == NVGPU_ATOMIC_TEST_ONLY);
 
 #define NVGPU_KNR(ioc) _IOC_NR(ioc)
 
@@ -1076,17 +1086,6 @@ static int nvgpu_kms_obj_class(struct nvgpu_kms_call *kc, u32 obj,
 
 /* ───────── ATOMIC ───────── */
 
-/* Past NVGPU_KMS_MAX_EVENTS a CRTC's event is reserved when it arrives. */
-static void nvgpu_kms_add_crtc(u32 *crtcs, u32 *n, u32 crtc) {
-  u32 i;
-
-  for (i = 0; i < *n; i++)
-    if (crtcs[i] == crtc)
-      return;
-  if (*n < NVGPU_KMS_MAX_EVENTS)
-    crtcs[(*n)++] = crtc;
-}
-
 /*
  * IN_FENCE_FD: the backend sync_file behind the caller's fence descriptor. A
  * fence that has already signalled -- or one only the guest could see, which
@@ -1163,127 +1162,85 @@ static int nvgpu_kms_out_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
 }
 
 /*
- * Before an atomic commit goes: which CRTCs it touches, for their flip
- * events, and its fence properties. Buffers follow the canonical traversal:
- * after the argument, each of objs, count_props, props and prop_values that is
- * non-NULL with a non-zero length, in that order (gen/schema/drm_kms.py).
- *
- * The kernel makes one event per CRTC whose state the commit carries
- * (drm_atomic_uapi.c:1430): a CRTC object with properties set, the CRTC a
- * plane or connector is put on (CRTC_ID), and the CRTC a touched plane or
- * connector is already on (drm_atomic.c:583, 1334). The last we know only as
- * far as GETPLANE replies and earlier commits told us; an event for a CRTC we
- * missed is reserved when it arrives instead.
+ * What an atomic commit's arrays ask of this file (nvgpu_atomic_parse(),
+ * in nvgpu_atomic.c or Rust). Each hook that reaches the kernel copies does
+ * so through call->st as the parse has it.
  */
+struct nvgpu_kms_actx {
+  struct nvgpu_kms_call *kc;
+  struct nvgpu_atomic_out *out;
+};
+
+static int nvgpu_kms_a_obj(void *ctx, u32 obj, u32 *crtc) {
+  struct nvgpu_kms_actx *a = ctx;
+
+  return nvgpu_kms_obj_class(a->kc, obj, crtc);
+}
+
+static int nvgpu_kms_a_prop(void *ctx, u32 id) {
+  struct nvgpu_kms_actx *a = ctx;
+
+  return nvgpu_kms_prop_class(a->kc, id);
+}
+
+static int nvgpu_kms_a_in_fence(void *ctx, void *st, u32 buf, u32 off,
+                                s64 fd) {
+  struct nvgpu_kms_actx *a = ctx;
+
+  a->kc->call.st = st;
+  /* Set by the parse before any hook: a TEST_ONLY commit's fences are only
+   * checked (nvgpu_kms_in_fence). */
+  a->kc->commit = a->out->commit;
+  return nvgpu_kms_in_fence(a->kc, buf, off, fd);
+}
+
+static int nvgpu_kms_a_out_fence(void *ctx, void *st, u32 buf, u32 off,
+                                 u64 uptr) {
+  struct nvgpu_kms_actx *a = ctx;
+
+  a->kc->call.st = st;
+  return nvgpu_kms_out_fence(a->kc, buf, off, uptr);
+}
+
+static void nvgpu_kms_a_learn(void *ctx, u32 obj, u32 crtc) {
+  struct nvgpu_kms_call *kc = ((struct nvgpu_kms_actx *)ctx)->kc;
+
+  if (kc->nlearn < NVGPU_KMS_MAX_LEARN) {
+    kc->learn[kc->nlearn].obj = obj;
+    kc->learn[kc->nlearn].crtc = crtc;
+    kc->nlearn++;
+  }
+}
+
+static int nvgpu_kms_a_reserve(void *ctx, u32 crtc, u64 user_data) {
+  struct nvgpu_kms_actx *a = ctx;
+
+  return nvgpu_kms_reserve(a->kc, DRM_EVENT_FLIP_COMPLETE, crtc, user_data);
+}
+
+static const struct nvgpu_atomic_ops nvgpu_kms_atomic_ops = {
+    .obj_class = nvgpu_kms_a_obj,
+    .prop_class = nvgpu_kms_a_prop,
+    .in_fence = nvgpu_kms_a_in_fence,
+    .out_fence = nvgpu_kms_a_out_fence,
+    .learn = nvgpu_kms_a_learn,
+    .reserve = nvgpu_kms_a_reserve,
+};
+
+/* Before an atomic commit goes: its events and its fences. */
 static int nvgpu_kms_atomic(struct nvgpu_kms_call *kc) {
-  struct nvgpu_i2_call *call = &kc->call;
-  struct nvgpu_kms_file *kf = kc->kf;
-  u32 len, l1, l2, l3, l4, idx = 1, bobjs, bcp, bprops = 0, bvals = 0;
-  u32 crtcs[NVGPU_KMS_MAX_EVENTS], ncrtc = 0;
-  u8 *b0 = nvgpu_i2_buf(call, 0, &len);
-  u8 *objs, *cp, *props, *vals;
-  u32 flags, count, o, j, k = 0;
-  bool events, fences;
-  u64 sum = 0;
+  struct nvgpu_atomic_out out = {};
+  struct nvgpu_kms_actx a = {.kc = kc, .out = &out};
+  void *st = kc->call.st;
   int ret;
 
-  if (!b0 || len < sizeof(struct drm_mode_atomic))
-    return 0;
-  flags = get_unaligned_le32(b0 + offsetof(struct drm_mode_atomic, flags));
-  count = get_unaligned_le32(b0 + offsetof(struct drm_mode_atomic, count_objs));
-  kc->commit = !(flags & DRM_MODE_ATOMIC_TEST_ONLY);
-  events = (flags & DRM_MODE_PAGE_FLIP_EVENT) && kc->commit;
-  fences = kf->dev->backend_caps & NVGPU_BCAP_FENCES;
-  /*
-   * Without the fence bridge a fence property is the backend's to refuse
-   * (-EOPNOTSUPP, policy.rs FENCES), which it does from its own copy; there
-   * is nothing to look up for it here.
-   */
-  if (!count || (!events && !fences))
-    return 0;
-
-  bobjs = get_unaligned_le64(b0 + offsetof(struct drm_mode_atomic, objs_ptr))
-              ? idx++
-              : 0;
-  bcp = get_unaligned_le64(b0 + offsetof(struct drm_mode_atomic,
-                                         count_props_ptr))
-            ? idx++
-            : 0;
-  if (!bobjs || !bcp)
-    return 0; /* the host faults on it; nothing will be made */
-  objs = nvgpu_i2_buf(call, bobjs, &l1);
-  cp = nvgpu_i2_buf(call, bcp, &l2);
-  if (!objs || !cp || l1 != count * 4 || l2 != count * 4)
-    return 0;
-  for (o = 0; o < count; o++)
-    sum += get_unaligned_le32(cp + 4 * o);
-  if (sum && get_unaligned_le64(b0 + offsetof(struct drm_mode_atomic, props_ptr)))
-    bprops = idx++;
-  if (sum && get_unaligned_le64(b0 + offsetof(struct drm_mode_atomic,
-                                              prop_values_ptr)))
-    bvals = idx++;
-  props = bprops ? nvgpu_i2_buf(call, bprops, &l3) : NULL;
-  vals = bvals ? nvgpu_i2_buf(call, bvals, &l4) : NULL;
-  if (sum && (!props || !vals || l3 != sum * 4 || l4 != sum * 8))
-    return 0;
-  kc->values_buf = bvals;
-
-  for (o = 0; o < count; o++) {
-    u32 obj = get_unaligned_le32(objs + 4 * o);
-    u32 n = get_unaligned_le32(cp + 4 * o), on;
-
-    if (n && events) {
-      ret = nvgpu_kms_obj_class(kc, obj, &on);
-      if (ret < 0)
-        return ret;
-      if (ret == NVGPU_KOBJ_CRTC)
-        nvgpu_kms_add_crtc(crtcs, &ncrtc, obj);
-      else if (on)
-        nvgpu_kms_add_crtc(crtcs, &ncrtc, on);
-    }
-    for (j = 0; j < n; j++, k++) {
-      u32 id = get_unaligned_le32(props + 4 * k);
-      u64 v = get_unaligned_le64(vals + 8 * k);
-
-      ret = nvgpu_kms_prop_class(kc, id);
-      if (ret < 0)
-        return ret;
-      switch (ret) {
-      case NVGPU_KPROP_CRTC_ID:
-        if (events && v)
-          nvgpu_kms_add_crtc(crtcs, &ncrtc, (u32)v);
-        if (kc->nlearn < NVGPU_KMS_MAX_LEARN) {
-          kc->learn[kc->nlearn].obj = obj;
-          kc->learn[kc->nlearn].crtc = (u32)v;
-          kc->nlearn++;
-        }
-        break;
-      case NVGPU_KPROP_IN_FENCE:
-        if (fences && (s64)v != -1) {
-          ret = nvgpu_kms_in_fence(kc, bvals, 8 * k, (s64)v);
-          if (ret)
-            return ret;
-        }
-        break;
-      case NVGPU_KPROP_OUT_PTR:
-        if (fences && v) {
-          ret = nvgpu_kms_out_fence(kc, bvals, 8 * k, v);
-          if (ret)
-            return ret;
-        }
-        break;
-      }
-    }
-  }
-
-  for (o = 0; events && o < ncrtc; o++) {
-    ret = nvgpu_kms_reserve(
-        kc, DRM_EVENT_FLIP_COMPLETE, crtcs[o],
-        get_unaligned_le64(b0 + offsetof(struct drm_mode_atomic, user_data)));
-    if (ret)
-      return ret;
-  }
-  return 0;
+  ret = nvgpu_atomic_parse(&kc->call,
+                           kc->kf->dev->backend_caps & NVGPU_BCAP_FENCES,
+                           &nvgpu_kms_atomic_ops, &a, &out);
+  kc->call.st = st;
+  kc->commit = out.commit;
+  kc->values_buf = out.values_buf;
+  return ret;
 }
 
 /* ───────── the interpreter's hooks ───────── */

@@ -16,6 +16,9 @@ pub trait CallBufs {
     fn add_fd(&mut self, buf: u32, off: u32, handle: u32, flags: u32) -> i32;
     fn ret(&self) -> i32;
     fn set_ret(&mut self, r: i32);
+    /// `nvgpu_atomic_parse()` of the implementation under test, its hooks
+    /// the ones below: (result, commit, values_buf).
+    fn atomic(&mut self, w: &mut World, fences: bool) -> (i32, bool, u32);
 }
 
 fn rng(w: &World, salt: &[u64]) -> Rng {
@@ -81,6 +84,11 @@ pub fn gem_out(w: &mut World, buf: u32, off: u32, gem: u32, size: u64) -> (i32, 
 /// to add but its say on the result.
 pub fn special(w: &mut World, c: &mut dyn CallBufs, id: u32, phase: i32) -> i32 {
     w.events.push(Ev::Hook(Hook::Special { id, phase }));
+    if let (Some(fences), 1, 0) = (w.atomic, id, phase) {
+        let (r, commit, values_buf) = c.atomic(w, fences);
+        w.events.push(Ev::Hook(Hook::AtomicOut { commit, values_buf }));
+        return r;
+    }
     let mut r = rng(w, &[5, u64::from(id), phase as u64]);
     if phase == 0 {
         let len = c.buf(0).map_or(0, |b| b.len() as u32);
@@ -128,4 +136,82 @@ pub fn phase(w: &mut World, c: &mut dyn CallBufs, phase: i32) -> i32 {
         return -5;
     }
     0
+}
+
+// ── what nvgpu_kms.c answers the atomic parse, reduced ──
+
+/// NVGPU_KOBJ_*: every third id a CRTC, 0xdead unknown to the host.
+pub fn a_obj(w: &mut World, obj: u32) -> (i32, u32) {
+    w.events.push(Ev::Hook(Hook::AObj { obj }));
+    if obj == 0xdead {
+        return (-5, 0);
+    }
+    if obj.is_multiple_of(3) {
+        (1, 0)
+    } else {
+        (2, obj % 5)
+    }
+}
+
+/// NVGPU_KPROP_* by id: plain, CRTC_ID, IN_FENCE_FD, OUT_FENCE_PTR; ids
+/// that end in 10 (mod 11) are unknown to the host.
+pub fn a_prop(w: &mut World, id: u32) -> i32 {
+    w.events.push(Ev::Hook(Hook::AProp { id }));
+    if id % 11 == 10 {
+        return -22;
+    }
+    1 + (id % 4) as i32
+}
+
+/// nvgpu_kms_in_fence(): -1 in the copy for a fence that has signalled (4),
+/// a record for one of ours, -EBADF otherwise.
+pub fn a_in_fence(w: &mut World, c: &mut dyn CallBufs, buf: u32, off: u32, fd: i64) -> i32 {
+    w.events.push(Ev::Hook(Hook::AInFence { buf, off, fd }));
+    if fd < 0 || fd > i64::from(i32::MAX) {
+        return -EINVAL;
+    }
+    if fd == 4 {
+        let Some(vals) = c.buf(buf) else { return -EINVAL };
+        let off = off as usize;
+        if off > vals.len() || vals.len() - off < 8 {
+            return -EINVAL;
+        }
+        vals[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        return 0;
+    }
+    match w.fds.get(&(fd as i32)).copied() {
+        Some(h) => c.add_fd(buf, off, h, if fd == 3 { I2_FD_CONSUME } else { 0 }),
+        None => -9,
+    }
+}
+
+/// nvgpu_kms_out_fence(): at most 32, -1 written through the pointer, a dyn
+/// record.
+pub fn a_out_fence(w: &mut World, c: &mut dyn CallBufs, buf: u32, off: u32, uptr: u64) -> i32 {
+    w.events.push(Ev::Hook(Hook::AOutFence { buf, off, uptr }));
+    if w.nfence >= 32 {
+        return -7;
+    }
+    if !w.copy_to_user(uptr, &(-1i32).to_le_bytes()) {
+        return -14;
+    }
+    let r = c.add_dyn(1, buf, off, 4);
+    if r == 0 {
+        w.nfence += 1;
+    }
+    r
+}
+
+pub fn a_learn(w: &mut World, obj: u32, crtc: u32) {
+    w.events.push(Ev::Hook(Hook::ALearn { obj, crtc }));
+}
+
+/// nvgpu_kms_reserve(): CRTC 13 has no memory left.
+pub fn a_reserve(w: &mut World, crtc: u32, user_data: u64) -> i32 {
+    w.events.push(Ev::Hook(Hook::AReserve { crtc, user_data }));
+    if crtc == 13 {
+        -12
+    } else {
+        0
+    }
 }

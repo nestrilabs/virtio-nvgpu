@@ -471,3 +471,17 @@ int nvgpu_rs_i2_xfer(struct nvgpu_i2_call *call, void *req, void *resp,
                      u32 flags, u32 *used) {
   return nvgpu_xfer(call->dev, req, resp, flags, used);
 }
+
+/* ───────── ATOMIC ───────── */
+
+static_assert(sizeof(struct nvgpu_atomic_out) == 8, "nvgpu_atomic_out");
+static_assert(offsetof(struct nvgpu_atomic_out, values_buf) == 4,
+              "nvgpu_atomic_out.values_buf");
+static_assert(sizeof(struct nvgpu_atomic_ops) == 6 * sizeof(void *),
+              "nvgpu_atomic_ops");
+
+int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
+                       const struct nvgpu_atomic_ops *ops, void *ctx,
+                       struct nvgpu_atomic_out *out) {
+  return nvgpu_rs_atomic_parse(call->st, fences, ops, ctx, out);
+}

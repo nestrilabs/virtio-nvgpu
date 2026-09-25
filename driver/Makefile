@@ -13,7 +13,7 @@ virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
 # IOCTL2 schema walk, RM escapes' parameter blocks and deep segments, OS
 # descriptor registrations:
 #
-#   NVGPU_RUST=0 (default)  the C: nvgpu_i2.c, nvgpu_rmio.c
+#   NVGPU_RUST=0 (default)  the C: nvgpu_i2.c, nvgpu_rmio.c, nvgpu_atomic.c
 #   NVGPU_RUST=1            the Rust: nvgpu_rs.rs, which compiles
 #                           driver/rust/core (no unsafe, no kernel deps) into
 #                           the module, and nvgpu_rs_glue.c, the C it calls.
@@ -22,13 +22,14 @@ virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
 #
 # Both export the same functions (nvgpu.h), so nothing else changes. Once the
 # Rust build has passed the hardware regression, the C goes: delete
-# nvgpu_i2.c and nvgpu_rmio.c and this switch, and keep the Rust lines.
+# nvgpu_i2.c, nvgpu_rmio.c, nvgpu_atomic.c and this switch, and keep the
+# Rust lines.
 NVGPU_RUST ?= 0
 ifeq ($(NVGPU_RUST),1)
 virtio_gpu_nv-y += nvgpu_rs.o nvgpu_rs_glue.o
 ccflags-y += -DNVGPU_RUST
 else
-virtio_gpu_nv-y += nvgpu_i2.o nvgpu_rmio.o
+virtio_gpu_nv-y += nvgpu_i2.o nvgpu_rmio.o nvgpu_atomic.o
 endif
 
 # Out-of-tree, for loading into a test guest without rebuilding its kernel:

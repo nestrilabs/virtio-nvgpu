@@ -977,6 +977,65 @@ void *nvgpu_i2_buf(struct nvgpu_i2_call *call, u32 buf, u32 *len);
 /* nvgpu_schema.c: the generated tables' one copy. */
 /* The set to use before HELLO has picked the host's (DRM only). */
 const struct nvgpu_schema_set *nvgpu_schema_default(void);
+/* ── An atomic commit's arrays (nvgpu_atomic.c, or nvgpu_rs.rs) ── */
+
+/* struct drm_mode_atomic, as the parse reads it (nvgpu_kms.c asserts it). */
+#define NVGPU_ATOMIC_SIZE 56
+#define NVGPU_ATOMIC_FLAGS 0
+#define NVGPU_ATOMIC_COUNT_OBJS 4
+#define NVGPU_ATOMIC_OBJS_PTR 8
+#define NVGPU_ATOMIC_COUNT_PROPS_PTR 16
+#define NVGPU_ATOMIC_PROPS_PTR 24
+#define NVGPU_ATOMIC_VALUES_PTR 32
+#define NVGPU_ATOMIC_USER_DATA 48
+#define NVGPU_ATOMIC_FLIP_EVENT 0x01u  /* DRM_MODE_PAGE_FLIP_EVENT */
+#define NVGPU_ATOMIC_TEST_ONLY 0x100u  /* DRM_MODE_ATOMIC_TEST_ONLY */
+/* Events reserved per commit: "more CRTCs than any GPU has"; anything past
+ * it is reserved when its event arrives instead. */
+#define NVGPU_ATOMIC_MAX_EVENTS 32
+/* CRTC_ID assignments one commit may teach nvgpu_kms.c. */
+#define NVGPU_ATOMIC_MAX_LEARN 64
+
+/* What a property is, as far as the parse cares (by name, like the backend). */
+#define NVGPU_KPROP_PLAIN 1
+#define NVGPU_KPROP_CRTC_ID 2  /* plane/connector CRTC_ID: a CRTC joins the commit */
+#define NVGPU_KPROP_IN_FENCE 3 /* a sync_file descriptor, -1 none */
+#define NVGPU_KPROP_OUT_PTR 4  /* a user pointer the kernel writes an fd to */
+/* What an object is: a CRTC, or not -- then with the CRTC it is on. */
+#define NVGPU_KOBJ_CRTC 1
+#define NVGPU_KOBJ_OTHER 2
+
+/* What the parse asks of nvgpu_kms.c. `st` is the interpreter's state for
+ * the call, to be call->st while a hook that reaches the buffers runs. */
+struct nvgpu_atomic_ops {
+  /* NVGPU_KOBJ_* with the CRTC a non-CRTC is on (0: not known), or -errno. */
+  int (*obj_class)(void *ctx, u32 obj, u32 *crtc);
+  /* NVGPU_KPROP_*, or a negative error (the host's, for an unknown id). */
+  int (*prop_class)(void *ctx, u32 id);
+  /* IN_FENCE_FD with a value other than -1, at `off` of buffer `buf`. */
+  int (*in_fence)(void *ctx, void *st, u32 buf, u32 off, s64 fd);
+  /* A *_PTR property with a nonzero value. */
+  int (*out_fence)(void *ctx, void *st, u32 buf, u32 off, u64 uptr);
+  /* Object `obj` is put on CRTC `crtc` (0: off), if the commit goes. */
+  void (*learn)(void *ctx, u32 obj, u32 crtc);
+  /* A flip event for `crtc`. */
+  int (*reserve)(void *ctx, u32 crtc, u64 user_data);
+};
+
+struct nvgpu_atomic_out {
+  bool commit;    /* not TEST_ONLY */
+  u32 values_buf; /* prop_values' buffer, 0 for none */
+};
+
+/*
+ * From the ATOMIC special's phase 0: walk the commit's arrays in the call's
+ * kernel copies, asking `ops` what its objects and properties are, reserving
+ * the flip events and bridging the fences. 0 or -errno.
+ */
+int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
+                       const struct nvgpu_atomic_ops *ops, void *ctx,
+                       struct nvgpu_atomic_out *out);
+
 /* Selects the schema set for the host driver version (NULL: none). */
 const struct nvgpu_schema_set *nvgpu_schema_select(const char *driver_version);
 /* The UVM block sizes for the host driver version (NULL: UVM refused). */

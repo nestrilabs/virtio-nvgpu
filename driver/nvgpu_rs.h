@@ -139,6 +139,12 @@ int nvgpu_rs_i2_add_fd(void *st, u32 buf, u32 off, u32 handle, u32 flags);
 void *nvgpu_rs_i2_buf(void *st, u32 buf, u32 *len);
 /* Where the state keeps what nvgpu_i2_hold() was given (C's to manage). */
 void **nvgpu_rs_i2_held(void *st);
+/* nvgpu_atomic_parse() on the state a running ATOMIC special was handed. */
+struct nvgpu_atomic_ops;
+struct nvgpu_atomic_out;
+int nvgpu_rs_atomic_parse(void *st, bool fences,
+                          const struct nvgpu_atomic_ops *ops, void *ctx,
+                          struct nvgpu_atomic_out *out);
 
 /* ── Implemented by nvgpu_rs_glue.c, for nvgpu_rs.rs ── */
 
