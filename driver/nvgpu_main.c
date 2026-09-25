@@ -410,7 +410,7 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(nfd->handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sz);
   req->nested_offset = 0;
@@ -634,7 +634,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(nfd->handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sizeof(params));
   req->nested_offset = cpu_to_le32(sizeof(params));
@@ -782,7 +782,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(nfd->handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sizeof(params));
   req->nested_offset = cpu_to_le32(sizeof(params));
@@ -949,7 +949,7 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(nfd->handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sz);
   req->nested_offset = 0;
@@ -1420,7 +1420,7 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(nfd->handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sizeof(outer));
   req->nested_offset = cpu_to_le32(sizeof(outer));
@@ -1540,7 +1540,7 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sz);
   req->nested_offset = 0;
@@ -1762,7 +1762,7 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
   req->msg_type = cpu_to_le32(NVGPU_MSG_GET_PROC_FILES);
   req->handle = 0;
   req->status = 0;
-  req->padding = 0;
+  req->req_id = 0;
 
   ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_size);
   if (ret < 0) {
@@ -2020,7 +2020,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   req->msg_type = cpu_to_le32(NVGPU_MSG_GET_SYS_FILES);
   req->handle = 0;
   req->status = 0;
-  req->padding = 0;
+  req->req_id = 0;
 
   ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_max);
   if (ret < 0)

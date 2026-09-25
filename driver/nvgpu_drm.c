@@ -1025,7 +1025,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req->hdr.handle = cpu_to_le32(fwd_handle);
   req->hdr.status = 0;
-  req->hdr.padding = 0;
+  req->hdr.req_id = 0;
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(d->size);
   req->nested_offset = cpu_to_le32(d->size);

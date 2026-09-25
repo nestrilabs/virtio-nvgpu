@@ -66,6 +66,11 @@ fn device_path_with(device_type: u32, dri: &[DriDevice]) -> Result<CString> {
                 .ok_or(DeviceError::InvalidDeviceKind(device_type))?;
             format!("/dev/dri/{}", d.name)
         }
+        // Not opened by path here: card nodes and Wayland channels arrive with
+        // protocol v2, which opens them through its own handlers.
+        DeviceKind::DriCard(_) | DeviceKind::Wayland => {
+            return Err(DeviceError::InvalidDeviceKind(device_type));
+        }
     };
     Ok(CString::new(path).expect("a device path has no interior NUL"))
 }
@@ -672,6 +677,15 @@ impl NvidiaBackend {
                 MsgType::GetProcFiles => "get_proc_files",
                 MsgType::GetSysFiles => "get_sys_files",
                 MsgType::EventReady => "event_ready",
+                MsgType::Hello => "hello",
+                MsgType::Ioctl2 => "ioctl2",
+                MsgType::TimeSync => "time_sync",
+                MsgType::EventData => "event_data",
+                MsgType::Watch => "watch",
+                MsgType::Unwatch => "unwatch",
+                MsgType::HostOp => "host_op",
+                MsgType::WlSend => "wl_send",
+                MsgType::WlRecv => "wl_recv",
             })
             .or_insert(0) += 1;
         // The handle travels in the header, not the payload -- every message
@@ -693,6 +707,21 @@ impl NvidiaBackend {
                 log::warn!("EventReady arrived from the guest; that message only travels outward");
                 self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
             }
+            MsgType::EventData => {
+                log::warn!("EventData arrived from the guest; that message only travels outward");
+                self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, libc::EINVAL)
+            }
+            // Protocol v2 is not served yet. -EPROTO is exactly what an old
+            // backend answers to an unknown message, so a v2 guest falls back
+            // to v1 cleanly.
+            MsgType::Hello
+            | MsgType::Ioctl2
+            | MsgType::TimeSync
+            | MsgType::Watch
+            | MsgType::Unwatch
+            | MsgType::HostOp
+            | MsgType::WlSend
+            | MsgType::WlRecv => self.write_error_resp(resp_buf, Status::InvalidMsgType, 0, 0),
         }
     }
 
@@ -2563,7 +2592,7 @@ impl NvidiaBackend {
             msg_type: self.current_msg as u32,
             handle,
             status,
-            padding: 0,
+            req_id: 0,
         };
         write_struct(resp_buf, &hdr)
     }
@@ -2603,7 +2632,7 @@ impl NvidiaBackend {
                 msg_type: self.current_msg as u32,
                 handle: self.current_handle,
                 status: 0,
-                padding: 0,
+                req_id: 0,
             },
         );
         off += write_struct(
@@ -2808,7 +2837,7 @@ mod tests {
                 msg_type: msg_type as u32,
                 handle: handle as u32,
                 status: 0,
-                padding: 0,
+                req_id: 0,
             },
         );
         v
@@ -2824,6 +2853,8 @@ mod tests {
             DeviceKind::UvmTools => DEV_UVM_TOOLS,
             DeviceKind::Modeset => DEV_MODESET,
             DeviceKind::Dri(n) => DEV_DRI_BASE + n,
+            DeviceKind::DriCard(n) => DEV_DRI_CARD_BASE + n,
+            DeviceKind::Wayland => DEV_WAYLAND,
         }
     }
 

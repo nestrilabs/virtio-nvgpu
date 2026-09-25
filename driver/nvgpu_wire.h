@@ -36,13 +36,29 @@
 #define NVGPU_MSG_GET_SYS_FILES 7
 /* Host → guest, on the event queue: this handle's descriptor is readable. */
 #define NVGPU_MSG_EVENT_READY 8
+/* Protocol v2 (see the v2 section at the end of this file). */
+#define NVGPU_MSG_HELLO 9
+#define NVGPU_MSG_IOCTL2 10
+#define NVGPU_MSG_TIME_SYNC 11
+/* Host → guest, on the event queue: a batch of nvgpu_ev_rec records. */
+#define NVGPU_MSG_EVENT_DATA 12
+#define NVGPU_MSG_WATCH 13
+#define NVGPU_MSG_UNWATCH 14
+#define NVGPU_MSG_HOST_OP 15
+#define NVGPU_MSG_WL_SEND 16
+#define NVGPU_MSG_WL_RECV 17
 
 /* device_type values for OPEN */
 #define NVGPU_DEV_CTL 255
 #define NVGPU_DEV_UVM 256
 #define NVGPU_DEV_UVM_TOOLS 257
 #define NVGPU_DEV_MODESET 258
+#define NVGPU_DEV_WAYLAND 259
 #define NVGPU_DEV_DRI_BASE 512
+/* Card (primary) nodes, only offered in compositor-VM mode. Decoded before the
+ * render-node range, so an old backend reads 1024 as render node 512 and
+ * answers ENODEV rather than opening something else. */
+#define NVGPU_DEV_DRI_CARD_BASE 1024
 
 /* capability bits */
 #define NVGPU_CAP_COMPUTE (1 << 0)
@@ -52,11 +68,18 @@
 
 /* ───────── Wire protocol structs ───────── */
 
+/*
+ * Every message starts with this, in both directions.
+ *
+ * `req_id` was padding until protocol v2. A v2 guest puts a non-zero id in
+ * every request and the backend echoes it; it is for logging and for telling a
+ * late reply from a fresh one, and a v1 guest's zero there means "none".
+ */
 struct nvgpu_msg_hdr {
   __le32 msg_type;
   __le32 handle;
   __le32 status;
-  __le32 padding;
+  __le32 req_id;
 } __packed;
 
 struct nvgpu_open_req {
@@ -176,5 +199,256 @@ static_assert(offsetof(struct virtio_gpu_nv_config, num_fd_translations) ==
  * it is unreadable. */
 static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
               "config space must fit in one page; see virtio_pci_modern_dev.c");
+
+/* ═════════════════════════ Protocol v2 ═════════════════════════
+ *
+ * Negotiated at run time, not by feature bit: the VMM in front of the device
+ * may not pass device feature bits through, and an old backend answers an
+ * unknown message with -EPROTO, which is all the guest needs to stay on v1.
+ * Only a successful HELLO switches a session to v2; without it the backend
+ * sends nothing but 16-byte EVENT_READY and behaves exactly as before.
+ */
+
+#define NVGPU_PROTO_V2 2
+
+/* HELLO.flags */
+#define NVGPU_HELLO_F_FRESH (1u << 0) /* new driver instance: reset the session */
+
+/* HELLO backend_caps */
+#define NVGPU_BCAP_KMS_CARD (1u << 0)    /* card nodes offered (--kms-card)     */
+#define NVGPU_BCAP_WAYLAND (1u << 1)     /* a host Wayland socket is configured */
+#define NVGPU_BCAP_FENCES (1u << 2)      /* fence and syncobj schemas           */
+#define NVGPU_BCAP_NVKMS_TABLE (1u << 3) /* NVKMS schema for this host version  */
+#define NVGPU_BCAP_WL_EXPORT (1u << 4)   /* --wayland-export                    */
+
+struct nvgpu_hello_req {
+  __le32 proto;      /* NVGPU_PROTO_V2 */
+  __le32 flags;      /* NVGPU_HELLO_F_* */
+  __le32 guest_caps; /* reserved, 0 */
+  __le32 reserved;
+} __packed;
+
+struct nvgpu_hello_resp {
+  __le32 proto;
+  __le32 backend_caps;
+  __le32 max_req;  /* largest request the backend accepts, bytes */
+  __le32 max_resp; /* largest response it will build, bytes      */
+  __le32 num_cards;
+  __le32 reserved[3];
+} __packed;
+
+struct nvgpu_time_sync_resp {
+  __le64 host_mono_ns; /* CLOCK_MONOTONIC, stamped just before add_used */
+} __packed;
+
+/* ── IOCTL2: a vectored ioctl, laid out by a schema both halves share ──
+ *
+ * The request is the ioctl argument (buffer 0) and every buffer a pointer in
+ * it reaches, in the schema's canonical traversal order. The backend does not
+ * take the guest's word for any of that: it walks its own copy of the schema
+ * over the bytes it received, recomputes every pointer, length, descriptor and
+ * GEM field, and refuses a request that disagrees. See gen/schema/.
+ */
+#define NVGPU_I2_MAX_BUFS 256
+#define NVGPU_I2_MAX_RECS 256
+
+/* nvgpu_i2_fd_in.flags */
+#define NVGPU_I2_FD_CONSUME (1u << 0) /* backend closes the handle after the call */
+
+/* nvgpu_i2_dyn.kind */
+#define NVGPU_I2_DYN_OUT_FENCE 1 /* ATOMIC OUT_FENCE_PTR: 4-byte OUT buffer + fd out */
+
+struct nvgpu_i2_req {
+  __le32 cmd;   /* the caller's ioctl number, verbatim */
+  __le32 flags; /* reserved, 0 */
+  __le32 nbuf;
+  __le32 nfd;
+  __le32 ngem;
+  __le32 ndyn;
+  __le32 data_len;
+  __le32 reserved;
+  /* followed by: __le32 buf_len[nbuf];
+   *              struct nvgpu_i2_fd_in  fd[nfd];
+   *              struct nvgpu_i2_gem_in gem[ngem];
+   *              struct nvgpu_i2_dyn    dyn[ndyn];
+   *              u8 data[data_len]: the IN bytes of every IN/INOUT buffer,
+   *                                 in buffer order, each padded to 8 */
+} __packed;
+
+struct nvgpu_i2_fd_in {
+  __le32 buf;    /* which buffer the descriptor field is in */
+  __le32 off;    /* byte offset of the field in that buffer */
+  __le32 handle; /* backend handle standing for the caller's descriptor */
+  __le32 flags;  /* NVGPU_I2_FD_* */
+} __packed;
+
+struct nvgpu_i2_gem_in {
+  __le32 buf;
+  __le32 off;
+  __le32 owner; /* backend handle of the file the host GEM handle lives in */
+  __le32 gem;   /* host GEM handle in that file */
+} __packed;
+
+struct nvgpu_i2_dyn {
+  __le32 kind; /* NVGPU_I2_DYN_* */
+  __le32 buf;
+  __le32 off;
+  __le32 len;
+} __packed;
+
+struct nvgpu_i2_resp {
+  __le32 ret; /* host ioctl result: 0 or -errno (signed) */
+  __le32 nbuf;
+  __le32 nfd;
+  __le32 ngem;
+  __le32 data_len;
+  __le32 reserved[3];
+  /* followed by: u8 data[data_len]: the OUT bytes of every OUT/INOUT buffer,
+   *                                 full length, in buffer order, padded to 8;
+   *              struct nvgpu_i2_fd_out  fd[nfd];
+   *              struct nvgpu_i2_gem_out gem[ngem]; */
+} __packed;
+
+struct nvgpu_i2_fd_out {
+  __le32 buf;
+  __le32 off;
+  __le32 handle; /* new backend handle now owning the host descriptor */
+  __le32 kind;   /* NVGPU_HK_* */
+} __packed;
+
+struct nvgpu_i2_gem_out {
+  __le32 buf;
+  __le32 off;
+  __le32 gem; /* host GEM handle, valid in the calling file's render handle */
+  __le32 reserved;
+  __le64 size;
+} __packed;
+
+/* ── Handle kinds, as the backend classifies a host descriptor ── */
+#define NVGPU_HK_DEV 1
+#define NVGPU_HK_DRI_RENDER 2
+#define NVGPU_HK_DRM_CARD 3
+#define NVGPU_HK_DRM_LEASE 4
+#define NVGPU_HK_SYNC_FILE 5
+#define NVGPU_HK_SYNCOBJ 6
+#define NVGPU_HK_DMABUF 7
+#define NVGPU_HK_EVENTFD 8
+#define NVGPU_HK_MEMFD 9
+#define NVGPU_HK_WAYLAND 10
+#define NVGPU_HK_OTHER 11
+
+/* ── WATCH ── */
+#define NVGPU_W_ONESHOT (1u << 0)
+#define NVGPU_W_FENCE (1u << 1) /* SyncFile: report EV_FENCE with its status */
+#define NVGPU_W_DRM (1u << 2)   /* DRM card/lease: read events, EV_DRM       */
+#define NVGPU_W_READY (1u << 3) /* readiness only, EV_READY                  */
+
+struct nvgpu_watch_req {
+  __le32 handle;
+  __le32 flags;
+  __le64 cookie;
+} __packed;
+
+struct nvgpu_unwatch_req {
+  __le32 handle;
+  __le32 pad;
+} __packed;
+
+/* ── HOST_OP ── */
+#define NVGPU_OP_PRIME_EXPORT 1       /* (render file, gem) -> dmabuf handle         */
+#define NVGPU_OP_DMABUF_IMPORT 2      /* (render file, dmabuf) -> (gem, size)        */
+#define NVGPU_OP_SYNC_MERGE 3         /* (n, h0..) -> sync_file handle               */
+#define NVGPU_OP_NEW_EVENTFD 4        /* () -> eventfd handle                        */
+#define NVGPU_OP_FD_KIND 5            /* (handle) -> NVGPU_HK_*                      */
+#define NVGPU_OP_SIGNALED_SYNC_FILE 6 /* () -> sync_file handle, already signalled   */
+#define NVGPU_OP_OPEN_KMS 7           /* (render handle, card) -> card handle        */
+#define NVGPU_OP_DROP_IF_MASTER 8     /* (card handle) -> 1 if it was master         */
+#define NVGPU_OP_CLOSE_MANY 9         /* (n, h0..) -> ()                             */
+
+#define NVGPU_OP_MAX_ARGS 6
+#define NVGPU_OP_MAX_RES 4
+
+struct nvgpu_host_op_req {
+  __le32 op;
+  __le32 nargs;
+  __le64 args[NVGPU_OP_MAX_ARGS];
+} __packed;
+
+struct nvgpu_host_op_resp {
+  __le32 nres;
+  __le32 pad;
+  __le64 res[NVGPU_OP_MAX_RES];
+} __packed;
+
+/* ── EVENT_DATA records (host → guest) ──
+ *
+ * The message is an nvgpu_msg_hdr whose req_id carries the payload length,
+ * followed by records. A record never splits a struct drm_event.
+ */
+#define NVGPU_EV_DRM 1     /* cookie = backend handle; bytes = drm_event stream */
+#define NVGPU_EV_FENCE 2   /* cookie = WATCH cookie; bytes = nvgpu_ev_fence     */
+#define NVGPU_EV_READY 3   /* cookie = WATCH cookie (legacy watches: handle)     */
+#define NVGPU_EV_HOTPLUG 4 /* cookie = card index; bytes = nvgpu_ev_hotplug      */
+
+#define NVGPU_EVENT_BUF_SIZE 8192
+
+struct nvgpu_ev_rec {
+  __le32 kind;
+  __le32 len; /* payload bytes that follow, before padding to 8 */
+  __le64 cookie;
+} __packed;
+
+struct nvgpu_ev_fence {
+  __le32 status; /* 1 signalled, <0 error (signed) */
+  __le32 pad;
+} __packed;
+
+#define NVGPU_EV_HOTPLUG_F_HOTPLUG (1u << 0)
+#define NVGPU_EV_HOTPLUG_F_LEASE (1u << 1)
+
+struct nvgpu_ev_hotplug {
+  __le32 flags;
+  __le32 pad;
+} __packed;
+
+/* ── GET_SYS_FILES section 3: card nodes (compositor-VM mode only) ── */
+struct nvgpu_card_record {
+  __le32 name_len;
+  __le32 major;
+  __le32 minor;
+  __le32 render_index; /* the DRI record this card belongs to */
+  /* followed by name_len bytes of name */
+} __packed;
+
+/* ── Wayland channel frames (WL_SEND / WL_RECV) ── */
+struct nvgpu_wl_recv_req {
+  __le32 max_bytes;
+  __le32 max_desc;
+} __packed;
+
+struct nvgpu_wl_send_resp {
+  __le32 accepted;
+  __le32 backlog;
+} __packed;
+
+static_assert(sizeof(struct nvgpu_msg_hdr) == 16, "msg hdr");
+static_assert(sizeof(struct nvgpu_hello_req) == 16, "hello req");
+static_assert(sizeof(struct nvgpu_hello_resp) == 32, "hello resp");
+static_assert(sizeof(struct nvgpu_time_sync_resp) == 8, "time sync");
+static_assert(sizeof(struct nvgpu_i2_req) == 32, "i2 req");
+static_assert(sizeof(struct nvgpu_i2_fd_in) == 16, "i2 fd in");
+static_assert(sizeof(struct nvgpu_i2_gem_in) == 16, "i2 gem in");
+static_assert(sizeof(struct nvgpu_i2_dyn) == 16, "i2 dyn");
+static_assert(sizeof(struct nvgpu_i2_resp) == 32, "i2 resp");
+static_assert(sizeof(struct nvgpu_i2_fd_out) == 16, "i2 fd out");
+static_assert(sizeof(struct nvgpu_i2_gem_out) == 24, "i2 gem out");
+static_assert(sizeof(struct nvgpu_watch_req) == 16, "watch");
+static_assert(sizeof(struct nvgpu_unwatch_req) == 8, "unwatch");
+static_assert(sizeof(struct nvgpu_host_op_req) == 56, "host op req");
+static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
+static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
+static_assert(sizeof(struct nvgpu_ev_fence) == 8, "ev fence");
+static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");
+static_assert(sizeof(struct nvgpu_card_record) == 16, "card record");
 
 #endif /* NVGPU_WIRE_H */

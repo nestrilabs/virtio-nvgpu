@@ -67,6 +67,24 @@ pub enum MsgType {
     ///
     /// No payload. The handle in the header is the whole message.
     EventReady = 8,
+    /// Guest → host: start protocol v2. See [`HelloReq`].
+    Hello = 9,
+    /// Guest → host: a schema-driven vectored ioctl. See [`Ioctl2Req`].
+    Ioctl2 = 10,
+    /// Guest → host: read the host's `CLOCK_MONOTONIC`, for timestamp translation.
+    TimeSync = 11,
+    /// **Host → guest**, on the event queue: a batch of [`EvRec`] records.
+    EventData = 12,
+    /// Guest → host: start reporting a handle's readiness. See [`WatchReq`].
+    Watch = 13,
+    /// Guest → host: stop reporting it.
+    Unwatch = 14,
+    /// Guest → host: a helper operation on host descriptors. See [`HostOpReq`].
+    HostOp = 15,
+    /// Guest → host: bytes and descriptors for a Wayland channel.
+    WlSend = 16,
+    /// Guest → host: take what a Wayland channel has pending.
+    WlRecv = 17,
 }
 
 impl MsgType {
@@ -81,6 +99,15 @@ impl MsgType {
             6 => Self::GetProcFiles,
             7 => Self::GetSysFiles,
             8 => Self::EventReady,
+            9 => Self::Hello,
+            10 => Self::Ioctl2,
+            11 => Self::TimeSync,
+            12 => Self::EventData,
+            13 => Self::Watch,
+            14 => Self::Unwatch,
+            15 => Self::HostOp,
+            16 => Self::WlSend,
+            17 => Self::WlRecv,
             _ => return None,
         })
     }
@@ -106,7 +133,9 @@ pub struct MsgHeader {
     /// driver tests `(s32)status < 0`, so writing an unsigned error code here
     /// reads as success.
     pub status: i32,
-    pub padding: u32,
+    /// Was padding until protocol v2. A v2 guest puts a non-zero id in every
+    /// request and the backend echoes it; zero means "none" (a v1 guest).
+    pub req_id: u32,
 }
 
 impl MsgHeader {
@@ -116,7 +145,7 @@ impl MsgHeader {
             msg_type: msg_type as u32,
             handle,
             status: 0,
-            padding: 0,
+            req_id: 0,
         }
     }
 
@@ -127,7 +156,7 @@ impl MsgHeader {
             msg_type: msg_type as u32,
             handle: 0,
             status: -errno.abs(),
-            padding: 0,
+            req_id: 0,
         }
     }
 }
@@ -144,8 +173,15 @@ pub const DEV_UVM: u32 = 256;
 pub const DEV_UVM_TOOLS: u32 = 257;
 /// `/dev/nvidia-modeset`.
 pub const DEV_MODESET: u32 = 258;
+/// A Wayland channel to the host compositor (protocol v2).
+pub const DEV_WAYLAND: u32 = 259;
 /// Render nodes start here.
 pub const DEV_DRI_BASE: u32 = 512;
+/// Card (primary) nodes start here; offered only in compositor-VM mode.
+///
+/// Decoded before the render range, so an old backend reads 1024 as render
+/// node 512, fails the lookup and answers ENODEV rather than opening something.
+pub const DEV_DRI_CARD_BASE: u32 = 1024;
 /// Highest GPU index expressible before the control device's value.
 pub const MAX_GPU_INDEX: u32 = 254;
 
@@ -164,6 +200,10 @@ pub enum DeviceKind {
     Modeset,
     /// A DRM render node, by its index in the list the device reported.
     Dri(u32),
+    /// A DRM card node, by its index in GET_SYS_FILES section 3.
+    DriCard(u32),
+    /// A channel to the host Wayland compositor.
+    Wayland,
 }
 
 impl DeviceKind {
@@ -183,6 +223,8 @@ impl DeviceKind {
             DEV_UVM => Self::Uvm,
             DEV_UVM_TOOLS => Self::UvmTools,
             DEV_MODESET => Self::Modeset,
+            DEV_WAYLAND => Self::Wayland,
+            _ if v >= DEV_DRI_CARD_BASE => Self::DriCard(v - DEV_DRI_CARD_BASE),
             _ if v >= DEV_DRI_BASE => Self::Dri(v - DEV_DRI_BASE),
             _ => return None,
         })
@@ -331,6 +373,301 @@ const _: () = {
     assert!(size_of::<FileEntry>() == 8);
 };
 
+// ---------------------------------------------------------------------------
+// Protocol v2
+// ---------------------------------------------------------------------------
+//
+// Negotiated at run time by HELLO, not by a feature bit: the VMM may not pass
+// device feature bits through, and an old backend answers an unknown message
+// with -EPROTO, which is all the guest needs to stay on v1. Mirrors the v2
+// section of driver/nvgpu_wire.h, field for field.
+
+/// The protocol version HELLO carries.
+pub const PROTO_V2: u32 = 2;
+
+/// `HelloReq::flags`: a new guest driver instance. The session is reset.
+pub const HELLO_F_FRESH: u32 = 1 << 0;
+
+/// `HelloResp::backend_caps` bits.
+pub const BCAP_KMS_CARD: u32 = 1 << 0;
+pub const BCAP_WAYLAND: u32 = 1 << 1;
+pub const BCAP_FENCES: u32 = 1 << 2;
+pub const BCAP_NVKMS_TABLE: u32 = 1 << 3;
+pub const BCAP_WL_EXPORT: u32 = 1 << 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HelloReq {
+    pub proto: u32,
+    pub flags: u32,
+    pub guest_caps: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HelloResp {
+    pub proto: u32,
+    pub backend_caps: u32,
+    pub max_req: u32,
+    pub max_resp: u32,
+    pub num_cards: u32,
+    pub reserved: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeSyncResp {
+    /// Host `CLOCK_MONOTONIC`, stamped just before the chain is handed back.
+    pub host_mono_ns: u64,
+}
+
+/// Most buffers, and most fd/GEM/dyn records, one IOCTL2 may carry.
+pub const I2_MAX_BUFS: u32 = 256;
+pub const I2_MAX_RECS: u32 = 256;
+
+/// `Ioctl2FdIn::flags`: close the handle once the host call has used it.
+pub const I2_FD_CONSUME: u32 = 1 << 0;
+
+/// `Ioctl2Dyn::kind`: an ATOMIC OUT_FENCE_PTR, i.e. a 4-byte OUT buffer the
+/// host writes a sync_file descriptor into.
+pub const I2_DYN_OUT_FENCE: u32 = 1;
+
+/// Request payload of `MsgType::Ioctl2`.
+///
+/// Followed by `u32 buf_len[nbuf]`, `Ioctl2FdIn[nfd]`, `Ioctl2GemIn[ngem]`,
+/// `Ioctl2Dyn[ndyn]`, then `data_len` bytes: the IN bytes of every IN/INOUT
+/// buffer in buffer order, each padded to 8. Buffer 0 is the ioctl argument;
+/// the rest follow the schema's canonical traversal. The backend recomputes
+/// all of it from its own schema and refuses a request that disagrees.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ioctl2Req {
+    pub cmd: u32,
+    pub flags: u32,
+    pub nbuf: u32,
+    pub nfd: u32,
+    pub ngem: u32,
+    pub ndyn: u32,
+    pub data_len: u32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ioctl2FdIn {
+    pub buf: u32,
+    pub off: u32,
+    pub handle: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ioctl2GemIn {
+    pub buf: u32,
+    pub off: u32,
+    /// Backend handle of the file the host GEM handle lives in.
+    pub owner: u32,
+    pub gem: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ioctl2Dyn {
+    pub kind: u32,
+    pub buf: u32,
+    pub off: u32,
+    pub len: u32,
+}
+
+/// Response payload of `MsgType::Ioctl2`.
+///
+/// Followed by `data_len` bytes (the OUT bytes of every OUT/INOUT buffer, full
+/// length, buffer order, padded to 8), `Ioctl2FdOut[nfd]`, `Ioctl2GemOut[ngem]`.
+/// OUT buffers come back even when the host ioctl failed, as DRM and NVKMS both
+/// copy back on error.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ioctl2Resp {
+    /// Host ioctl result: 0 or a negative errno.
+    pub ret: i32,
+    pub nbuf: u32,
+    pub nfd: u32,
+    pub ngem: u32,
+    pub data_len: u32,
+    pub reserved: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ioctl2FdOut {
+    pub buf: u32,
+    pub off: u32,
+    pub handle: u32,
+    /// One of the `HK_*` kinds.
+    pub kind: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ioctl2GemOut {
+    pub buf: u32,
+    pub off: u32,
+    /// Host GEM handle, valid in the calling file's render handle.
+    pub gem: u32,
+    pub reserved: u32,
+    pub size: u64,
+}
+
+/// Handle kinds, as the backend classifies a host descriptor.
+pub const HK_DEV: u32 = 1;
+pub const HK_DRI_RENDER: u32 = 2;
+pub const HK_DRM_CARD: u32 = 3;
+pub const HK_DRM_LEASE: u32 = 4;
+pub const HK_SYNC_FILE: u32 = 5;
+pub const HK_SYNCOBJ: u32 = 6;
+pub const HK_DMABUF: u32 = 7;
+pub const HK_EVENTFD: u32 = 8;
+pub const HK_MEMFD: u32 = 9;
+pub const HK_WAYLAND: u32 = 10;
+pub const HK_OTHER: u32 = 11;
+
+/// `WatchReq::flags`.
+pub const W_ONESHOT: u32 = 1 << 0;
+pub const W_FENCE: u32 = 1 << 1;
+pub const W_DRM: u32 = 1 << 2;
+pub const W_READY: u32 = 1 << 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WatchReq {
+    pub handle: u32,
+    pub flags: u32,
+    pub cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnwatchReq {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// HOST_OP operations.
+pub const OP_PRIME_EXPORT: u32 = 1;
+pub const OP_DMABUF_IMPORT: u32 = 2;
+pub const OP_SYNC_MERGE: u32 = 3;
+pub const OP_NEW_EVENTFD: u32 = 4;
+pub const OP_FD_KIND: u32 = 5;
+pub const OP_SIGNALED_SYNC_FILE: u32 = 6;
+pub const OP_OPEN_KMS: u32 = 7;
+pub const OP_DROP_IF_MASTER: u32 = 8;
+pub const OP_CLOSE_MANY: u32 = 9;
+
+pub const OP_MAX_ARGS: usize = 6;
+pub const OP_MAX_RES: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostOpReq {
+    pub op: u32,
+    pub nargs: u32,
+    pub args: [u64; OP_MAX_ARGS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostOpResp {
+    pub nres: u32,
+    pub pad: u32,
+    pub res: [u64; OP_MAX_RES],
+}
+
+/// EVENT_DATA record kinds.
+pub const EV_DRM: u32 = 1;
+pub const EV_FENCE: u32 = 2;
+pub const EV_READY: u32 = 3;
+pub const EV_HOTPLUG: u32 = 4;
+
+/// Size of each buffer a v2 guest posts on the event queue.
+pub const EVENT_BUF_SIZE: usize = 8192;
+
+/// One EVENT_DATA record: this header, then `len` bytes, padded to 8.
+///
+/// The message itself is a `MsgHeader` whose `req_id` carries the payload
+/// length. A record never splits a `struct drm_event`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvRec {
+    pub kind: u32,
+    pub len: u32,
+    pub cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvFence {
+    /// 1 signalled, negative on error.
+    pub status: i32,
+    pub pad: u32,
+}
+
+pub const EV_HOTPLUG_F_HOTPLUG: u32 = 1 << 0;
+pub const EV_HOTPLUG_F_LEASE: u32 = 1 << 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EvHotplug {
+    pub flags: u32,
+    pub pad: u32,
+}
+
+/// GET_SYS_FILES section 3: one card node, followed by its name.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CardRecord {
+    pub name_len: u32,
+    pub major: u32,
+    pub minor: u32,
+    pub render_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WlRecvReq {
+    pub max_bytes: u32,
+    pub max_desc: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WlSendResp {
+    pub accepted: u32,
+    pub backlog: u32,
+}
+
+const _: () = {
+    assert!(size_of::<HelloReq>() == 16);
+    assert!(size_of::<HelloResp>() == 32);
+    assert!(size_of::<TimeSyncResp>() == 8);
+    assert!(size_of::<Ioctl2Req>() == 32);
+    assert!(size_of::<Ioctl2FdIn>() == 16);
+    assert!(size_of::<Ioctl2GemIn>() == 16);
+    assert!(size_of::<Ioctl2Dyn>() == 16);
+    assert!(size_of::<Ioctl2Resp>() == 32);
+    assert!(size_of::<Ioctl2FdOut>() == 16);
+    assert!(size_of::<Ioctl2GemOut>() == 24);
+    assert!(size_of::<WatchReq>() == 16);
+    assert!(size_of::<UnwatchReq>() == 8);
+    assert!(size_of::<HostOpReq>() == 56);
+    assert!(size_of::<HostOpResp>() == 40);
+    assert!(size_of::<EvRec>() == 16);
+    assert!(size_of::<EvFence>() == 8);
+    assert!(size_of::<EvHotplug>() == 8);
+    assert!(size_of::<CardRecord>() == 16);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +695,15 @@ mod tests {
             Some(DeviceKind::Dri(3))
         );
         assert_eq!(DeviceKind::from_device_type(300), None);
+        assert_eq!(DeviceKind::from_device_type(DEV_WAYLAND), Some(DeviceKind::Wayland));
+        assert_eq!(
+            DeviceKind::from_device_type(DEV_DRI_CARD_BASE + 1),
+            Some(DeviceKind::DriCard(1))
+        );
+        assert_eq!(
+            DeviceKind::from_device_type(DEV_DRI_CARD_BASE - 1),
+            Some(DeviceKind::Dri(DEV_DRI_CARD_BASE - 1 - DEV_DRI_BASE))
+        );
     }
 
     /// The driver tests `(s32)status < 0`. An unsigned error code stored here
@@ -383,10 +729,19 @@ mod tests {
             MsgType::GetProcFiles,
             MsgType::GetSysFiles,
             MsgType::EventReady,
+            MsgType::Hello,
+            MsgType::Ioctl2,
+            MsgType::TimeSync,
+            MsgType::EventData,
+            MsgType::Watch,
+            MsgType::Unwatch,
+            MsgType::HostOp,
+            MsgType::WlSend,
+            MsgType::WlRecv,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
         assert_eq!(MsgType::from_u32(0), None);
-        assert_eq!(MsgType::from_u32(9), None);
+        assert_eq!(MsgType::from_u32(18), None);
     }
 }
