@@ -105,6 +105,22 @@
             seatd
             foot
             wlr-randr
+            # Real clients, for the Wayland stage's application pass: X11
+            # through a rootful Xwayland, a nested gamescope, toolkits (GTK4,
+            # Qt6), a browser, a video player, and GL/Vulkan benchmarks.
+            xwayland
+            xorg.xeyes
+            xterm
+            gamescope
+            gnome-calculator # GTK4 + libadwaita
+            qalculate-qt
+            firefox
+            mpv
+            glmark2
+            vkmark
+            wev # the events a client gets (apps.sh pointer)
+            wl-clipboard # wl-copy, wl-paste (apps.sh clipboard)
+            dbus # dbus-run-session, for the toolkits
           ])
           ++ [
             weston-clients
