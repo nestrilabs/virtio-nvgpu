@@ -110,18 +110,25 @@ struct Guest {
 
 impl Guest {
     fn new(be: &mut NvidiaBackend, h: u32, drm_file: bool) -> Self {
+        let caps = if drm_file { frame::HELLO_G_DRM_FILE } else { 0 };
+        Self::with_caps(be, h, caps)
+    }
+
+    /// A guest whose HELLO says `caps` (and whose own engine allows what
+    /// they say).
+    fn with_caps(be: &mut NvidiaBackend, h: u32, caps: u32) -> Self {
         let mut e = Engine::new(EngineConfig {
             side: Side::Guest,
             local: Local::Client,
             policy: Policy {
-                drm_file,
+                drm_file: caps & frame::HELLO_G_DRM_FILE != 0,
                 lease: LeaseGate::Allow,
-                fences: false,
+                fences: caps & frame::HELLO_G_SYNCOBJ != 0,
             },
             rewrites: None,
             synth_released: true,
         });
-        e.hello(if drm_file { frame::HELLO_G_DRM_FILE } else { 0 });
+        e.hello(caps);
         let mut g = Guest { e, h };
         g.flush(be);
         g
@@ -307,6 +314,45 @@ fn a_dmabuf_is_exported_only_on_a_render_handle_of_the_session() {
     assert_eq!(e(ops.prime_export(12345, 1)), Some(libc::EBADF));
     // A render handle reaches the host: /dev/null answers the ioctl itself.
     assert_eq!(e(ops.prime_export(render, 1)), Some(libc::ENOTTY));
+}
+
+/// Explicit sync is offered when this backend serves fences (BCAP_FENCES,
+/// `BackendConfig::fences`) and the guest's HELLO says its kernel can name a
+/// client's syncobj by its host syncobj -- both, and only both.
+#[test]
+fn the_syncobj_global_is_offered_with_fences_served_and_a_guest_that_can_name_syncobjs() {
+    let dir = tmpdir("serve-syncobj");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![
+            (1, "wl_compositor", 6),
+            (2, "wp_linux_drm_syncobj_manager_v1", 1),
+        ],
+        vec![],
+    );
+    for (fences, caps, offered) in [
+        (true, frame::HELLO_G_SYNCOBJ, true),
+        (true, 0, false),
+        (false, frame::HELLO_G_SYNCOBJ, false),
+    ] {
+        let mut be = backend();
+        be.config.fences = fences;
+        be.set_wayland(Some(WlConfig::new(&sock)));
+        hello(&mut be);
+        let (st, h) = open(&mut be, frame::WL_OPEN_CONNECT);
+        assert_eq!(st, 0);
+        let mut g = Guest::with_caps(&mut be, h, caps);
+        g.client(&mut be, &get_registry());
+        let (b, _) = g.recv_until(&mut be, |b, _| sync_done(b, 0));
+        let names = global_names(&b);
+        assert_eq!(
+            names.iter().any(|n| n == "wp_linux_drm_syncobj_manager_v1"),
+            offered,
+            "fences {fences}, caps {caps:#x}: {names:?}"
+        );
+        assert_eq!(close(&mut be, h), 0);
+    }
 }
 
 #[test]

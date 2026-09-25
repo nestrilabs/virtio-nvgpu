@@ -498,8 +498,10 @@ fn the_lease_device_needs_drm_files_and_a_passing_check() {
     assert!(p.offer(5, b"wp_drm_lease_device_v1", 1).is_none());
     p.drm_file = false;
     assert!(p.offer(4, b"wp_drm_lease_device_v1", 1).is_none());
-    // Fences never, yet.
+    // Explicit sync: only with fences.
     assert!(p.offer(6, b"wp_linux_drm_syncobj_manager_v1", 1).is_none());
+    p.fences = true;
+    assert!(p.offer(6, b"wp_linux_drm_syncobj_manager_v1", 1).is_some());
 }
 
 // ───────────────────────── engine, end to end ─────────────────────────

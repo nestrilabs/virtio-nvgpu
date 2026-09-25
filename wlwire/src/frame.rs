@@ -31,7 +31,7 @@
 //! | `BLOB` | `a` = blob id, `c` = length; bytes in earlier `BLOB` records | same |
 //! | `STREAM` | `a` = stream id; the far side makes a pipe | same |
 //! | `DRM_FILE` | refused | backend: `a` = backend handle, `b` = its `HK_*`; kernel adopts it and sets `fd` |
-//! | `SYNCOBJ` | reserved | reserved |
+//! | `SYNCOBJ` | daemon: `fd` = the client's syncobj; kernel: `a` = the backend `Syncobj` handle behind it (a host-handle file), `fd` = -1 | not carried (export mode hides the global) |
 //!
 //! `DESC_F_INVALID` marks a descriptor that could not be carried (a dma-buf
 //! the guest kernel does not own, a failed export or adoption): the receiver
@@ -100,6 +100,10 @@ pub const WL_PROTO_VERSION: u32 = 1;
 pub const HELLO_G_DRM_FILE: u32 = 1 << 0;
 /// HELLO caps from the guest: it can import host dma-bufs (export mode).
 pub const HELLO_G_DMABUF_IMPORT: u32 = 1 << 1;
+/// HELLO caps from the guest: its kernel names a client's syncobj by the
+/// backend handle of its host syncobj (the backend serves fences), so
+/// `wp_linux_drm_syncobj_manager_v1` can be offered.
+pub const HELLO_G_SYNCOBJ: u32 = 1 << 2;
 
 /// OPEN(DEV_WAYLAND) flags, chosen by the guest kernel from the daemon's
 /// CONNECT: a connection to the host compositor; the export listener's

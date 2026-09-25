@@ -173,8 +173,9 @@ pub trait Platform {
     fn drm_file_in(&mut self, desc: &Desc, fd: Option<OwnedFd>) -> std::io::Result<OwnedFd>;
     /// A syncobj from the local peer (a client's
     /// `wp_linux_drm_syncobj_manager_v1.import_timeline`), for the channel.
-    /// Reached only with `Policy::fences`; until the guest kernel can name a
-    /// guest syncobj's host object the default carries nothing.
+    /// Reached only with `Policy::fences`. The guest daemon hands the fd to
+    /// its kernel, which names the host syncobj behind it; a side that cannot
+    /// carries nothing (the default).
     fn syncobj_out(&mut self, _fd: OwnedFd) -> DescOut {
         DescOut::plain(Desc::invalid(frame::DESC_SYNCOBJ))
     }
@@ -453,6 +454,12 @@ impl Engine {
                     self.got_hello = true;
                     if self.cfg.side == Side::Host {
                         self.cfg.policy.drm_file = h.caps & frame::HELLO_G_DRM_FILE != 0;
+                        // Explicit sync needs both ends: fences served here
+                        // (the policy this engine was made with) and a guest
+                        // kernel that names host syncobjs.
+                        if h.caps & frame::HELLO_G_SYNCOBJ == 0 {
+                            self.cfg.policy.fences = false;
+                        }
                     }
                 }
                 frame::REC_WAYLAND => {

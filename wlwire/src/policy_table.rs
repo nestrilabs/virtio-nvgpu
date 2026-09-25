@@ -39,7 +39,8 @@ pub enum FdClass {
     /// A DRM file of the host GPU (a lease, or the lease device's query fd):
     /// adopted into a guest DRM file by the guest kernel.
     DrmFile,
-    /// A DRM syncobj. Refused until fences are bridged.
+    /// A DRM syncobj (explicit sync): guest to host only, as the backend
+    /// handle of the host syncobj behind the guest's (`Requires::Fences`).
     Syncobj,
 }
 
@@ -52,7 +53,8 @@ pub enum Requires {
     /// DRM files can be adopted on the guest side, and the host's lease device
     /// hands out files of *our* GPU (checked per global by the host).
     DrmFile,
-    /// Fence bridging (syncobj proxies). Not yet available.
+    /// Fence bridging: the backend serves fences and the guest kernel names
+    /// a client's syncobj by its host syncobj (`Policy::fences`).
     Fences,
 }
 

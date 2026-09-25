@@ -16,6 +16,12 @@
  *                   exported it, and sets `fd` to -1. A dma-buf of anyone
  *                   else is sent as NVGPU_WL_DESC_F_INVALID (the compositor
  *                   then refuses that buffer, not the connection).
+ *   SEND, SYNCOBJ:  (NVGPU_WL_CAP_SYNCOBJ) `fd` is a syncobj file of this
+ *                   device (drmSyncobjHandleToFD on one of our DRM files: a
+ *                   host-handle file). The kernel puts the backend handle of
+ *                   its host syncobj in `a`, holds the file until the host has
+ *                   duplicated it for the compositor, and sets `fd` to -1.
+ *                   Any other file is sent as NVGPU_WL_DESC_F_INVALID.
  *   RECV, DRM_FILE: `a` is a backend handle to a host DRM file of our GPU (a
  *                   lease). The kernel adopts it into a new guest DRM file,
  *                   cloned from the `card_fd` template, and stores the new
@@ -53,6 +59,7 @@
 #define NVGPU_WL_CAP_EXPORT (1u << 1)        /* the host exports a socket to us     */
 #define NVGPU_WL_CAP_DRM_FILE (1u << 2)      /* RECV can adopt DRM files            */
 #define NVGPU_WL_CAP_DMABUF_IMPORT (1u << 3) /* RECV can import host dma-bufs       */
+#define NVGPU_WL_CAP_SYNCOBJ (1u << 4)       /* SEND can name host syncobjs         */
 
 #define NVGPU_WL_MAX_DEVMAP 8
 

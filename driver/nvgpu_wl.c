@@ -160,6 +160,9 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
     h->caps |= NVGPU_WL_CAP_EXPORT | NVGPU_WL_CAP_DMABUF_IMPORT;
   /* Adoption needs a card-node template, which the daemon brings. */
   h->caps |= NVGPU_WL_CAP_DRM_FILE;
+  /* A client's syncobj is a host-handle file only when fences are served. */
+  if (nvgpu_fences_enabled(dev))
+    h->caps |= NVGPU_WL_CAP_SYNCOBJ;
 
   /*
    * The offset is what the kernel's slewed estimate says now; the daemon asks
@@ -316,6 +319,42 @@ invalid:
   d->fd = -1;
 }
 
+/*
+ * A client's syncobj (wp_linux_drm_syncobj_manager_v1.import_timeline), for
+ * the host: a syncobj file of this device is a host-handle file, whose backend
+ * handle the backend duplicates for the compositor (SendOps::syncobj). The
+ * file is kept in @held until the host answered, so the handle cannot be
+ * closed under the send. Anyone else's is sent as invalid; the compositor
+ * gets a placeholder and refuses that timeline, not the connection.
+ */
+static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
+                                     struct nvgpu_wl_desc *d,
+                                     struct file **held) {
+  struct file *f;
+  u32 handle;
+
+  if (d->flags & NVGPU_WL_DESC_F_INVALID)
+    goto invalid;
+  f = nvgpu_hostfile_fget(dev, d->fd, NVGPU_HK_SYNCOBJ, &handle);
+  if (IS_ERR(f)) {
+    dev_warn_ratelimited(&dev->vdev->dev,
+                         "virtio-gpu-nv: wayland: a client's syncobj is not "
+                         "one of ours; the host gets a placeholder\n");
+    goto invalid;
+  }
+  d->a = handle;
+  d->b = 0;
+  d->fd = -1;
+  *held = f;
+  return;
+
+invalid:
+  d->flags |= NVGPU_WL_DESC_F_INVALID;
+  d->a = 0;
+  d->b = 0;
+  d->fd = -1;
+}
+
 static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->dev;
   const size_t H = sizeof(struct nvgpu_msg_hdr);
@@ -325,6 +364,7 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_wl_send_resp sr;
   struct nvgpu_tbuf *req = NULL, *resp = NULL;
   struct dma_buf **held = NULL;
+  struct file **held_files = NULL;
   u32 ndesc = 0, used = 0, i;
   s32 status;
   long ret;
@@ -357,7 +397,8 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
   ndesc = le16_to_cpu((__le16)fh.ndesc);
   if (ndesc) {
     held = kcalloc(ndesc, sizeof(*held), GFP_KERNEL);
-    if (!held) {
+    held_files = kcalloc(ndesc, sizeof(*held_files), GFP_KERNEL);
+    if (!held || !held_files) {
       ret = -ENOMEM;
       goto out;
     }
@@ -382,16 +423,10 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
       }
       break;
     case NVGPU_WL_DESC_SYNCOBJ:
-      /*
-       * Explicit sync (wp_linux_drm_syncobj_manager_v1.import_timeline),
-       * reserved: the host hides that global until fences are bridged. What
-       * it needs from here is the backend handle of the guest syncobj's host
-       * object in `a` (FENCES: syncobj files that are host-handle files);
-       * the backend then hands the compositor a duplicate of that host
-       * syncobj (SendOps::syncobj). Refused until then.
-       */
-      ret = -EOPNOTSUPP;
-      goto out;
+      /* Explicit sync: the host offers the global only when we said
+       * NVGPU_WL_CAP_SYNCOBJ, so without fences no syncobj is ours. */
+      nvgpu_wl_resolve_syncobj(dev, &d, &held_files[i]);
+      break;
     default:
       /* DRM files never go guest → host, and nothing else exists. */
       ret = -EINVAL;
@@ -438,6 +473,12 @@ out:
       if (held[i])
         dma_buf_put(held[i]);
     kfree(held);
+  }
+  if (held_files) {
+    for (i = 0; i < ndesc; i++)
+      if (held_files[i])
+        fput(held_files[i]);
+    kfree(held_files);
   }
   if (req)
     nvgpu_tbuf_free(req);

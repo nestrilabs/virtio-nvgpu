@@ -17,6 +17,7 @@
 //! so it is ignored by default; `scripts/wl-loopback-test.sh` provides them
 //! with nix and runs it.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -365,8 +366,6 @@ struct DaemonRun {
 
 impl DaemonRun {
     fn start(dir: &Path, host_socket: &Path, via: Via) -> DaemonRun {
-        let socket = dir.join("proxy-0");
-        let cfg = Config::new(&socket);
         let connector: Box<dyn Connector + Send> = match via {
             Via::Conn => Box::new(LoopConnector {
                 cfg: WlConfig::new(host_socket),
@@ -375,6 +374,12 @@ impl DaemonRun {
                 d: Dispatcher::new(host_socket),
             }),
         };
+        Self::with(dir, connector)
+    }
+
+    fn with(dir: &Path, connector: Box<dyn Connector + Send>) -> DaemonRun {
+        let socket = dir.join("proxy-0");
+        let cfg = Config::new(&socket);
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut d = Daemon::new(cfg, connector).unwrap();
@@ -780,4 +785,344 @@ fn against_weston(via: Via, tag: &str) {
     assert!(t.commits >= 20 && t.shm_syncs >= 20, "{t:?}");
     assert!(t.time_rewrites >= 10, "{t:?}");
     assert!(t.errors.is_empty(), "protocol errors: {:?}", t.errors);
+}
+
+// ───────────────────── explicit sync, at the codec level ─────────────────────
+//
+// No GPU and no compositor with explicit sync: the syncobjs are memfds
+// standing in for them, the guest kernel's SEND is a table from a guest file
+// to a backend handle, and the compositor is a few lines of wire protocol
+// that offers `wp_linux_drm_syncobj_manager_v1` and reports what
+// `import_timeline` brought it. Everything between -- both engines, the
+// allowlist and its HELLO gate, the frame's SYNCOBJ descriptor, WlConn and
+// its SendOps -- is the code that ships.
+
+/// The guest kernel's half: a syncobj file it knows (by inode, as
+/// nvgpu_hostfile_fget knows its own files) is sent as its backend handle;
+/// anything else as invalid.
+struct SyncobjKernel {
+    guest: HashMap<u64, u32>,
+}
+
+impl SyncobjKernel {
+    fn resolve(&self, f: &mut [u8], fds: &[Option<OwnedFd>]) {
+        for (i, fd) in fds.iter().enumerate() {
+            let Some(fd) = fd else { continue };
+            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
+            let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
+            let ino = sys::fstat(fd.as_raw_fd()).unwrap().st_ino;
+            match (d.kind, self.guest.get(&ino)) {
+                (frame::DESC_SYNCOBJ, Some(&h)) => d.a = h,
+                _ => d.flags |= frame::DESC_F_INVALID,
+            }
+            d.fd = -1;
+            let mut b = Vec::new();
+            d.write(&mut b);
+            f[at..at + frame::DESC_LEN].copy_from_slice(&b);
+        }
+    }
+}
+
+/// The backend's handle table, as far as SendOps::syncobj looks at it.
+struct HostSyncobjs(HashMap<u32, OwnedFd>);
+
+impl SendOps for HostSyncobjs {
+    fn prime_export(&mut self, _owner: u32, _gem: u32) -> io::Result<OwnedFd> {
+        Err(io::Error::other("no GPU in this test"))
+    }
+    fn syncobj(&mut self, handle: u32) -> io::Result<OwnedFd> {
+        match self.0.get(&handle) {
+            Some(fd) => fd.try_clone(),
+            None => Err(io::Error::from_raw_os_error(libc::EBADF)),
+        }
+    }
+}
+
+struct SyncobjChannel {
+    conn: WlConn,
+    ready: OwnedFd,
+    kernel: Arc<SyncobjKernel>,
+    host: HostSyncobjs,
+}
+
+impl Channel for SyncobjChannel {
+    fn send(&mut self, f: &mut [u8], fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
+        self.kernel.resolve(f, fds);
+        match self.conn.send(f, &mut self.host) {
+            Ok(r) => Ok(Sent::Accepted { backlog: r.backlog }),
+            Err(libc::EAGAIN) => Ok(Sent::Busy),
+            Err(e) => Err(io::Error::from_raw_os_error(e)),
+        }
+    }
+    fn recv(
+        &mut self,
+        max: usize,
+        _card: Option<RawFd>,
+        _render: Option<RawFd>,
+    ) -> io::Result<Received> {
+        let f = self
+            .conn
+            .recv(max as u32, frame::MAX_DESC as u32, &mut NoGpu)
+            .map_err(io::Error::from_raw_os_error)?;
+        let d = frame::decode(&f).unwrap();
+        let more = d.flags & frame::FRAME_F_MORE != 0;
+        let fds = (0..d.descs.len()).map(|_| None).collect();
+        Ok(Received {
+            frame: f,
+            fds,
+            more,
+        })
+    }
+    fn poll_fd(&self) -> RawFd {
+        self.ready.as_raw_fd()
+    }
+}
+
+struct SyncobjConnector {
+    cfg: WlConfig,
+    caps: u32,
+    kernel: Arc<SyncobjKernel>,
+    /// Backend handle -> the host syncobj (a memfd) behind it.
+    host: Vec<(u32, OwnedFd)>,
+}
+
+impl Connector for SyncobjConnector {
+    fn info(&mut self) -> io::Result<HostInfo> {
+        Ok(HostInfo {
+            caps: self.caps,
+            clock_offset_ns: 0,
+            max_frame: 256 * 1024,
+            devmap: Vec::new(),
+        })
+    }
+    fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>> {
+        assert_eq!(mode, uapi::CONNECT);
+        let (conn, ready) = WlConn::open(&self.cfg, Arc::new(Classify))?;
+        let host = self
+            .host
+            .iter()
+            .map(|(h, fd)| (*h, fd.try_clone().unwrap()))
+            .collect();
+        Ok(Box::new(SyncobjChannel {
+            conn,
+            ready,
+            kernel: self.kernel.clone(),
+            host: HostSyncobjs(host),
+        }))
+    }
+}
+
+/// Read whole messages (and the descriptors that came with them) until
+/// `f` says stop.
+fn read_msgs(
+    s: &UnixStream,
+    buf: &mut Vec<u8>,
+    fds: &mut Vec<OwnedFd>,
+    mut f: impl FnMut(u32, u16, &[u8], &mut Vec<OwnedFd>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Some(h) = peek_header(buf) {
+            if buf.len() < h.size as usize {
+                break;
+            }
+            let m: Vec<u8> = buf.drain(..h.size as usize).collect();
+            if f(h.object, h.opcode, &m, fds) {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out on the wire");
+        let mut chunk = [0u8; 4096];
+        // recv_with_fds never blocks.
+        match sys::recv_with_fds(s.as_raw_fd(), &mut chunk, fds) {
+            Ok(n) => {
+                assert!(n > 0, "the peer hung up");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => panic!("recv: {e}"),
+        }
+    }
+}
+
+fn word(m: &[u8], i: usize) -> u32 {
+    u32::from_ne_bytes(m[4 * i..4 * i + 4].try_into().unwrap())
+}
+
+/// A compositor offering only `wp_linux_drm_syncobj_manager_v1`: answers
+/// get_registry and sync, and sends every descriptor an import_timeline
+/// brought down `got`.
+fn syncobj_compositor(sock: PathBuf, got: mpsc::Sender<OwnedFd>) {
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let (mut buf, mut fds) = (Vec::new(), Vec::new());
+        let mut manager = None;
+        let mut out = s.try_clone().unwrap();
+        read_msgs(&s, &mut buf, &mut fds, |obj, opc, m, fds| {
+            match (obj, opc) {
+                (1, op::wl_display::REQ_GET_REGISTRY) => {
+                    let reg = word(m, 2);
+                    let g = MsgBuilder::new(reg, op::wl_registry::EVT_GLOBAL)
+                        .uint(1)
+                        .string(Some("wp_linux_drm_syncobj_manager_v1"))
+                        .uint(1)
+                        .finish();
+                    out.write_all(&g).unwrap();
+                }
+                (1, op::wl_display::REQ_SYNC) => {
+                    let cb = word(m, 2);
+                    out.write_all(
+                        &MsgBuilder::new(cb, op::wl_callback::EVT_DONE)
+                            .uint(0)
+                            .finish(),
+                    )
+                    .unwrap();
+                    out.write_all(
+                        &MsgBuilder::new(1, op::wl_display::EVT_DELETE_ID)
+                            .uint(cb)
+                            .finish(),
+                    )
+                    .unwrap();
+                }
+                // bind(name, interface, version, id): the id is last.
+                (_, op::wl_registry::REQ_BIND) if manager.is_none() && obj != 1 => {
+                    manager = Some(word(m, m.len() / 4 - 1));
+                }
+                (o, op::wp_linux_drm_syncobj_manager_v1::REQ_IMPORT_TIMELINE)
+                    if Some(o) == manager =>
+                {
+                    assert!(!fds.is_empty(), "import_timeline without its fd");
+                    if got.send(fds.remove(0)).is_err() {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            false
+        });
+    });
+}
+
+/// What a guest client saw and what the compositor got: whether the syncobj
+/// global was offered, and the descriptor import_timeline delivered (if the
+/// client could send one), for a guest whose kernel does or does not say
+/// NVGPU_WL_CAP_SYNCOBJ, a backend that does or does not serve fences, and a
+/// client syncobj the kernel does or does not know.
+fn syncobj_round_trip(
+    tag: &str,
+    guest_caps: u32,
+    backend_fences: bool,
+    known: bool,
+) -> (bool, Option<OwnedFd>, u64) {
+    let dir = runtime_dir(tag);
+    let host_sock = dir.join("host-0");
+    let (tx, rx) = mpsc::channel();
+    syncobj_compositor(host_sock.clone(), tx);
+
+    // The client's syncobj, the guest kernel's handle for it, and the host
+    // syncobj behind that handle.
+    let guest_so = sys::memfd(c"guest-syncobj", 0).unwrap();
+    let host_so = sys::memfd(c"host-syncobj", 0).unwrap();
+    let host_ino = sys::fstat(host_so.as_raw_fd()).unwrap().st_ino;
+    let mut guest = HashMap::new();
+    if known {
+        guest.insert(sys::fstat(guest_so.as_raw_fd()).unwrap().st_ino, 77);
+    }
+    let mut cfg = WlConfig::new(&host_sock);
+    cfg.fences = backend_fences;
+    let d = DaemonRun::with(
+        &dir,
+        Box::new(SyncobjConnector {
+            cfg,
+            caps: guest_caps,
+            kernel: Arc::new(SyncobjKernel { guest }),
+            host: vec![(77, host_so)],
+        }),
+    );
+
+    let s = UnixStream::connect(&d.socket).unwrap();
+    let mut w = s.try_clone().unwrap();
+    w.write_all(
+        &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(2)
+            .finish(),
+    )
+    .unwrap();
+    w.write_all(
+        &MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(3)
+            .finish(),
+    )
+    .unwrap();
+    let (mut buf, mut fds) = (Vec::new(), Vec::new());
+    let mut offered = None;
+    read_msgs(&s, &mut buf, &mut fds, |obj, opc, m, _| {
+        if obj == 2 && opc == op::wl_registry::EVT_GLOBAL {
+            let len = word(m, 3) as usize;
+            if &m[16..16 + len - 1] == b"wp_linux_drm_syncobj_manager_v1" {
+                offered = Some(word(m, 2));
+            }
+        }
+        obj == 3
+    });
+    let Some(name) = offered else {
+        return (false, None, host_ino);
+    };
+    w.write_all(
+        &MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(name)
+            .generic_new_id("wp_linux_drm_syncobj_manager_v1", 1, 4)
+            .finish(),
+    )
+    .unwrap();
+    let import = MsgBuilder::new(4, op::wp_linux_drm_syncobj_manager_v1::REQ_IMPORT_TIMELINE)
+        .new_id(5)
+        .finish();
+    sys::send_with_fds(s.as_raw_fd(), &import, &[guest_so.as_raw_fd()]).unwrap();
+    w.write_all(
+        &MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(6)
+            .finish(),
+    )
+    .unwrap();
+    read_msgs(&s, &mut buf, &mut fds, |obj, _, _, _| obj == 6);
+    let got = rx.recv_timeout(Duration::from_secs(5)).ok();
+    (true, got, host_ino)
+}
+
+const SYNCOBJ_CAPS: u32 = uapi::CAP_WAYLAND | uapi::CAP_SYNCOBJ;
+
+#[test]
+fn a_client_timeline_reaches_the_compositor_as_the_host_syncobj_behind_it() {
+    let (offered, got, host_ino) = syncobj_round_trip("y1", SYNCOBJ_CAPS, true, true);
+    assert!(offered, "the syncobj global is offered");
+    let got = got.expect("import_timeline reached the compositor");
+    assert_eq!(
+        sys::fstat(got.as_raw_fd()).unwrap().st_ino,
+        host_ino,
+        "what the compositor imports is the host syncobj, not the guest's file"
+    );
+}
+
+#[test]
+fn a_syncobj_the_guest_kernel_does_not_know_reaches_the_compositor_as_a_placeholder() {
+    let (offered, got, host_ino) = syncobj_round_trip("y2", SYNCOBJ_CAPS, true, false);
+    assert!(offered);
+    let got = got.expect("the message still carries one descriptor");
+    assert_ne!(sys::fstat(got.as_raw_fd()).unwrap().st_ino, host_ino);
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", got.as_raw_fd())).unwrap();
+    assert!(
+        !link.to_string_lossy().contains("guest-syncobj"),
+        "{link:?}"
+    );
+}
+
+#[test]
+fn the_syncobj_global_needs_fences_on_both_ends() {
+    // A guest kernel without fences, and a backend without them.
+    assert!(!syncobj_round_trip("y3", uapi::CAP_WAYLAND, true, true).0);
+    assert!(!syncobj_round_trip("y4", SYNCOBJ_CAPS, false, true).0);
 }

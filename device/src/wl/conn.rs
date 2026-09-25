@@ -47,8 +47,9 @@ pub trait SendOps {
     /// is closed here after sending.
     fn prime_export(&mut self, owner: u32, gem: u32) -> io::Result<OwnedFd>;
     /// The host syncobj behind backend handle `handle`, for the compositor
-    /// (explicit sync, once fences are bridged: the global is hidden until
-    /// then). Closed here after sending, like an export.
+    /// (explicit sync: `wp_linux_drm_syncobj_manager_v1.import_timeline`,
+    /// offered only with `WlConfig::fences` and a guest that says
+    /// `HELLO_G_SYNCOBJ`). Closed here after sending, like an export.
     fn syncobj(&mut self, _handle: u32) -> io::Result<OwnedFd> {
         Err(io::ErrorKind::Unsupported.into())
     }
@@ -76,6 +77,11 @@ pub struct WlConfig {
     pub max_queue: usize,
     /// Which lease-device globals are ours, shared by every connection.
     pub lease_cache: Arc<LeaseCache>,
+    /// The backend serves fences (BCAP_FENCES): offer
+    /// `wp_linux_drm_syncobj_manager_v1` to a guest that can name its
+    /// syncobjs' host objects (`HELLO_G_SYNCOBJ`). Normal mode only: a host
+    /// client's syncobj has no guest object to stand for it.
+    pub fences: bool,
 }
 
 impl WlConfig {
@@ -86,6 +92,7 @@ impl WlConfig {
             max_backlog: 4 << 20,
             max_queue: 64 << 20,
             lease_cache: Arc::new(LeaseCache::default()),
+            fences: false,
         }
     }
 }
@@ -220,7 +227,8 @@ impl WlConn {
             Policy {
                 drm_file: false,
                 lease,
-                fences: false,
+                // Kept only if the guest's HELLO says HELLO_G_SYNCOBJ.
+                fences: cfg.fences,
             },
         )
     }

@@ -131,6 +131,13 @@ impl Platform for GuestPlat {
     fn drm_file_in(&mut self, _d: &Desc, fd: Option<OwnedFd>) -> io::Result<OwnedFd> {
         fd.ok_or_else(|| io::Error::other("the kernel could not adopt the DRM file"))
     }
+    fn syncobj_out(&mut self, fd: OwnedFd) -> DescOut {
+        // The kernel names the host syncobj behind it, or marks it invalid.
+        DescOut {
+            desc: Desc::new(frame::DESC_SYNCOBJ),
+            fd: Some(fd),
+        }
+    }
 }
 
 struct Client {
@@ -308,6 +315,11 @@ impl Daemon {
                     d.hello_caps |= frame::HELLO_G_DRM_FILE;
                 }
             }
+            // Explicit sync: the kernel can name a client's syncobj by its
+            // host syncobj (the backend serves fences).
+            if d.info.caps & uapi::CAP_SYNCOBJ != 0 {
+                d.hello_caps |= frame::HELLO_G_SYNCOBJ;
+            }
             let _ = std::fs::remove_file(&d.cfg.listen);
             let l = UnixListener::bind(&d.cfg.listen)?;
             l.set_nonblocking(true)?;
@@ -450,7 +462,7 @@ impl Daemon {
                 drm_file: self.hello_caps & frame::HELLO_G_DRM_FILE != 0,
                 // The host decides which lease devices are ours.
                 lease: LeaseGate::Allow,
-                fences: false,
+                fences: self.hello_caps & frame::HELLO_G_SYNCOBJ != 0,
             },
             rewrites: Some(Rewrites {
                 devmap: self.info.devmap.clone(),

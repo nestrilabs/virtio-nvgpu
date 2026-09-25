@@ -30,7 +30,9 @@ pub struct Policy {
     /// HELLO, or on the guest side: the kernel can and a card node exists).
     pub drm_file: bool,
     pub lease: LeaseGate,
-    /// Fence bridging exists. Nothing sets it yet.
+    /// Syncobjs can be carried (explicit sync): on the host, the backend
+    /// serves fences and the guest's HELLO says `HELLO_G_SYNCOBJ`; on the
+    /// guest, its kernel said it can name host syncobjs.
     pub fences: bool,
 }
 

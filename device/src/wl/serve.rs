@@ -232,7 +232,9 @@ impl NvidiaBackend {
         }
         let (chan, ready) = match mode {
             frame::WL_OPEN_CONNECT => {
-                let cfg = self.wl.cfg.clone().ok_or(libc::ENODEV)?;
+                let mut cfg = self.wl.cfg.clone().ok_or(libc::ENODEV)?;
+                // Explicit sync rides on the fences this backend serves.
+                cfg.fences = self.config.fences;
                 let host = self.wl_host();
                 let (conn, ready) = WlConn::open(&cfg, host).map_err(|e| {
                     log::warn!(
