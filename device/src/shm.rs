@@ -169,6 +169,15 @@ impl ZoneConfig {
     /// matters more than the totals, because a zone with enough free bytes can
     /// still refuse one large request if it has fragmented. Re-measure against
     /// a real render trace before treating this split as settled.
+    ///
+    /// **The traces also predate per-mapping classification.** Everything
+    /// landed in write-combining then because the backend read the caching
+    /// type RM returns, which the escape resets to DEFAULT for all but video
+    /// memory (escape.c:600-601). Now system memory goes to write-back (it is
+    /// allocated coherent, rmmem.rs) and doorbells to uncached, so part of
+    /// the measured write-combine peak belongs to those zones. A write-back
+    /// request that does not fit falls back to write-combining
+    /// (`NvidiaBackend::alloc_zone`); an uncached one does not.
     pub fn default_1gib() -> Self {
         Self {
             uc_size: 32 * 1024 * 1024,
