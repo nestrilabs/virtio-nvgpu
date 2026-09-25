@@ -215,9 +215,32 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
     };
     let mut restore = Restore::default();
     match escape {
+        // NVOS30: hClient, hDevice, hChannel, numChannels, then phClients,
+        // phDevices, phChannels at 16/24/32, flags at 40. RM reads the three
+        // arrays only for a channel list (NVOS30_FLAGS_CHANNEL, bits 7:4, is
+        // LIST and numChannels is not 0: RmDeprecatedIdleChannels); the one-
+        // channel form never follows them. That is the form the Vulkan and
+        // GL drivers use as they tear a device down, a dozen times a run, so
+        // it goes, with the pointers zeroed; a list is still refused.
+        NV_ESC_RM_IDLE_CHANNELS => {
+            sized(56)?;
+            let num = rd32(params, 12).unwrap_or(0);
+            let flags = rd32(params, 40).unwrap_or(0);
+            if (flags >> 4) & 0xf == 0 && num != 0 {
+                log::warn!(
+                    "RM_IDLE_CHANNELS refused: a list of {num} channels is three arrays the \
+                     backend cannot give addresses of its own"
+                );
+                return Err(libc::EPERM);
+            }
+            for off in [16, 24, 32] {
+                if let Some(v) = take(params, off) {
+                    restore.0.push((off, v));
+                }
+            }
+        }
         NV_ESC_IOCTL_XFER_CMD
         | NV_ESC_RM_I2C_ACCESS
-        | NV_ESC_RM_IDLE_CHANNELS
         | NV_ESC_RM_ACCESS_REGISTRY
         | NV_ESC_RM_GET_EVENT_DATA
         | NV_ESC_RM_ADD_VBLANK_CALLBACK => {
@@ -506,7 +529,6 @@ mod tests {
         for (nr, size) in [
             (NV_ESC_IOCTL_XFER_CMD, 16),
             (NV_ESC_RM_I2C_ACCESS, 32),
-            (NV_ESC_RM_IDLE_CHANNELS, 56),
             (NV_ESC_RM_ACCESS_REGISTRY, 72),
             (NV_ESC_RM_GET_EVENT_DATA, 16),
             (NV_ESC_RM_ADD_VBLANK_CALLBACK, 32),
@@ -906,6 +928,12 @@ mod backend_tests {
                 s
             }
             (b'd', 0x41) => Seen::Gem { ptr: word64(a, 8) },
+            (b'F', 0x41) => {
+                for off in [16, 24, 32] {
+                    assert_eq!(word64(a, off), 0, "IDLE_CHANNELS pointer at {off} reached RM");
+                }
+                Seen::Other(request as u64)
+            }
             (b'F', 0x4f) => Seen::Addresses(vec![word64(a, 16)]),
             (b'F', 0x5e) => Seen::Addresses(vec![word64(a, 16), word64(a, 24)]),
             _ => Seen::Other(request as u64),
@@ -1209,9 +1237,33 @@ mod backend_tests {
         let mut p = vec![0u8; 16];
         p[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
         assert_eq!(v1(&mut be, h, xfer, &p, &[], None).0, -libc::EPERM);
+        // IDLE_CHANNELS with a channel list (flags' CHANNEL field 0, LIST).
         let idle = ioc(IOC_RW, b'F', NV_ESC_RM_IDLE_CHANNELS, 56);
-        assert_eq!(v1(&mut be, h, idle, &[0u8; 56], &[], None).0, -libc::EPERM);
+        let mut p = vec![0u8; 56];
+        p[12..16].copy_from_slice(&1u32.to_le_bytes());
+        p[16..24].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        assert_eq!(v1(&mut be, h, idle, &p, &[], None).0, -libc::EPERM);
         assert!(seen().is_empty());
+    }
+
+    /// IDLE_CHANNELS for one channel never follows its three array
+    /// pointers: it goes, with them zeroed, and the caller reads back its own.
+    #[test]
+    fn idle_channels_for_one_channel_goes_without_its_pointers() {
+        let (mut be, h) = ctl();
+        let idle = ioc(IOC_RW, b'F', NV_ESC_RM_IDLE_CHANNELS, 56);
+        let mut p = vec![0u8; 56];
+        p[12..16].copy_from_slice(&1u32.to_le_bytes());
+        for off in [16, 24, 32] {
+            p[off..off + 8].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        }
+        p[40..44].copy_from_slice(&0x10u32.to_le_bytes()); // CHANNEL_SINGLE
+        let (st, reply) = v1(&mut be, h, idle, &p, &[], None);
+        assert_eq!(st, 0);
+        assert_eq!(seen().len(), 1, "it reached the host");
+        for off in [16, 24, 32] {
+            assert_eq!(word64(&reply, off), GUEST_PTR, "the caller's pointer at {off}");
+        }
     }
 
     #[test]
