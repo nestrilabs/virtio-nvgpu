@@ -6,6 +6,7 @@ members = [
     "protocol",
     "gen",
     "device",
+    "driver/rust/core",
 ]
 
 [workspace.package]

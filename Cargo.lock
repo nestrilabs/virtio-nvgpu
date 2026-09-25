@@ -382,6 +382,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvgpu-guest-core"
+version = "0.1.0"
+
+[[package]]
 name = "nvgpu-wl-guest"
 version = "0.1.0"
 dependencies = [
