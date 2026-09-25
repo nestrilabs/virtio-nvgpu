@@ -39,9 +39,11 @@
 //!   OS_FILE_HANDLE descriptor, a dma-buf by descriptor number
 //!   (osmemdesc.c:1017-1060). In the backend both name the VMM's memory and
 //!   files, so the GPU would read and write whatever the backend has there.
-//!   Refused with EPERM. This is how cuMemHostRegister and
-//!   VK_EXT_external_memory_host register existing memory, which is therefore
-//!   unsupported; ARCHITECTURE.md §5 sketches how it could be done.
+//!   Refused with EPERM when they come this way, with an address alone. A
+//!   guest offered BCAP_OS_DESC sends the guest-physical pages behind the
+//!   address instead, and `osdesc.rs` hands RM the backend's own mapping of
+//!   exactly those pages; that is how cuMemHostRegister and
+//!   VK_EXT_external_memory_host work here.
 //! - **RM controls** (`scrub_control`): RM follows pointers inside a
 //!   control's parameters for the commands in `abi::rmctrl`, and only those
 //!   (embedded_param_copy.c, rmapi_deprecated_control.c, and the handlers
@@ -158,6 +160,8 @@ pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
 ///
 /// - 0x71 NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: a CPU address to pin, or a
 ///   dma-buf descriptor by number (os_desc_mem.c:146, osmemdesc.c:1037).
+///   Sent with its guest-physical pages it goes through `osdesc.rs` instead,
+///   and never gets here.
 /// - 0x78, 0x7e NV01_EVENT_KERNEL_CALLBACK(_EX): `data` is a kernel function
 ///   pointer (os.c:1568-1589). RM refuses a non-kernel caller
 ///   (event_api.c:75-88); refused here too, so that stays true whatever the

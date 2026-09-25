@@ -1071,6 +1071,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             .filter_map(|r| r.file_offset().map(|f| f.file().as_raw_fd()))
             .collect();
         fds.iter().for_each(|&fd| privfd::register(fd));
+        // Where guest RAM is, for memory the guest registers with RM by its
+        // pages (device::osdesc): each page it names must be in this table.
+        self.shared.nvidia.lock().unwrap().set_guest_ram(Some(
+            device::osdesc::GuestRam::from_vm_memory(mem.memory().into_inner()),
+        ));
         *self.shared.mem.write().unwrap() = Some(mem);
         for old in std::mem::replace(&mut self.mem_fds, fds) {
             if !self.mem_fds.contains(&old) {

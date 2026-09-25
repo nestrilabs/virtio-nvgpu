@@ -17,10 +17,14 @@
 //! - **What may be mapped.** Only a pool this VM's own UVM file was seen to
 //!   create (a successful ALLOC_SEMAPHORE_POOL on that handle), asked for
 //!   exactly -- same base, same length, read-write -- on a VA space in
-//!   sharing mode, at a base in [`HVA_MIN`, `HVA_MAX`). The band holds nothing
-//!   of the VMM's (its executable, heap and mmap base all sit far above it),
-//!   so the VMM's `MAP_FIXED_NOREPLACE` never collides with a mapping of its
-//!   own, and a guest cannot learn the VMM's layout from whether it did.
+//!   sharing mode, at a base in [`HVA_MIN`, `HVA_MAX`), [4 GiB, 32 TiB).
+//!   The band holds nothing of the VMM's: its executable and heap sit at
+//!   two-thirds of the 47-bit space (85 TiB), and its mappings grow down
+//!   from below the stack or, under a legacy layout (an unlimited stack
+//!   rlimit), up from a third of it (42.7 TiB) -- which the 64 TiB top this
+//!   band once had would have reached. So the VMM's `MAP_FIXED_NOREPLACE`
+//!   never collides with a mapping of its own, and a guest cannot learn the
+//!   VMM's layout from whether it did.
 //! - **How much.** Placements per file and per VM, bytes per file and per
 //!   VM, and recorded ranges per file and per VM, all bounded.
 //! - **Where in the aperture.** First fit in [`CHUNK`] granules. An offset is
@@ -44,9 +48,10 @@ pub const CHUNK: u64 = 2 << 20;
 pub const APERTURE_MAX: u64 = 1 << 30;
 /// The largest one pool that is ever mapped.
 pub const MAX_LEN: u64 = 64 << 20;
-/// The band a pool's host address must lie in: [4 GiB, 64 TiB).
-pub const HVA_MIN: u64 = 1 << 32;
-pub const HVA_MAX: u64 = 1 << 46;
+/// The band a pool's host address must lie in: [4 GiB, 32 TiB), the one the
+/// VMM and the guest driver hold it to too (protocol's UVM_HVA_MIN/MAX).
+pub const HVA_MIN: u64 = protocol::messages::UVM_HVA_MIN;
+pub const HVA_MAX: u64 = protocol::messages::UVM_HVA_MAX;
 /// Live placements, and their bytes, per VM.
 pub const MAPS_PER_VM: usize = 64;
 pub const BYTES_PER_VM: u64 = 256 << 20;
@@ -416,12 +421,16 @@ mod tests {
 
     #[test]
     fn the_host_address_band_is_enforced_at_both_edges() {
+        assert_eq!((HVA_MIN, HVA_MAX), (4 << 30, 32 << 40));
         let mut m = maps(APERTURE_MAX);
         for (base, ok) in [
             (HVA_MIN - 4096, false),
             (HVA_MIN, true),
             (HVA_MAX - MB2, true),
             (HVA_MAX - MB2 + 4096, false),
+            // A legacy (bottom-up) mmap layout starts at a third of the
+            // 47-bit space, where the VMM's own mappings would be.
+            (((1u64 << 47) / 3) & !(MB2 - 1), false),
             (u64::MAX & !4095, false),
         ] {
             m.record(1, base, MB2);

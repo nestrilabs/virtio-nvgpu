@@ -219,6 +219,23 @@ struct nvgpu_device {
   struct nvgpu_events *events; /* v2 event consumers: handle/cookie registry  */
   const struct nvgpu_schema_set *schema; /* selected at probe for driver_version */
   const struct nvgpu_uvm_table *uvm;     /* likewise, v1 or v2; NULL: none */
+
+  /*
+   * Memory the caller already has, registered with RM by its pages
+   * (nvgpu_osdesc.c): what each registration pinned, until a reap names its
+   * id. osdesc_lock covers the list, the ack, the early releases, and one
+   * reap at a time; osdesc_count is read without it to skip a reap when there
+   * is nothing to reap. osdesc_dead: remove() has unpinned everything, and a
+   * registration that finishes after it unpins at once.
+   */
+  struct mutex osdesc_lock;
+  struct list_head osdescs;
+  unsigned int osdesc_count;
+  u64 osdesc_ack;
+#define NVGPU_OSDESC_EARLY 64
+  u64 osdesc_early[NVGPU_OSDESC_EARLY];
+  unsigned int osdesc_early_next;
+  bool osdesc_dead;
 };
 
 /*
@@ -730,6 +747,21 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev);
 void nvgpu_xfer_destroy(struct nvgpu_device *dev);
 void nvgpu_ctrl_vq_cb(struct virtqueue *vq);
 void nvgpu_event_vq_cb(struct virtqueue *vq);
+
+/* ── Memory registered by its pages (nvgpu_osdesc.c) ── */
+void nvgpu_osdesc_init(struct nvgpu_device *dev);
+/*
+ * An RM escape that registers memory the caller already has (ALLOC_MEMORY or
+ * RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, VID_HEAP_CONTROL's
+ * ALLOC_OS_DESCRIPTOR): true if it was handled here, with *ret its result.
+ * False for anything else, which goes the usual way.
+ */
+bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
+                        void __user *uarg, unsigned int sz, long *ret);
+/* Unpin what RM has let go of. Process context; cheap with nothing pinned. */
+void nvgpu_osdesc_reap(struct nvgpu_device *dev);
+/* remove(), after the reset: unpin everything. */
+void nvgpu_osdesc_release_all(struct nvgpu_device *dev);
 
 /* ── HOST_OP / WATCH / CLOSE ── */
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,

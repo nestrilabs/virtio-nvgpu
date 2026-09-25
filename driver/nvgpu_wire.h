@@ -143,6 +143,37 @@ struct nvgpu_deep_seg {
   __le32 len;        /* bytes it addresses, after the table     */
 } __packed;
 
+/*
+ * deep_ptr_offset == NVGPU_DEEP_PAGE_LIST: memory the caller already has,
+ * registered with RM by the guest-physical pages behind it rather than by its
+ * address -- NV_ESC_RM_ALLOC_MEMORY or NV_ESC_RM_ALLOC of
+ * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, or NV_ESC_RM_VID_HEAP_CONTROL's
+ * ALLOC_OS_DESCRIPTOR, with the user virtual address descriptor type. The
+ * deep block is a nvgpu_osdesc_hdr and `nruns` nvgpu_osdesc_run, nothing
+ * after: the pages RM would pin, from the one holding the address to the one
+ * holding its last byte, pinned here (for writing unless the call asks for
+ * read-only memory: NVGPU_OSDESC_F_WRITE). Sent only to a backend with
+ * NVGPU_BCAP_OS_DESC. A reply with RM's NV_OK carries an 8-byte deep block,
+ * the registration id; the pages stay pinned until a reap
+ * (NVGPU_OP_OSDESC_REAP) names it. protocol/src/messages.rs, DEEP_PAGE_LIST,
+ * has the rest.
+ */
+#define NVGPU_DEEP_PAGE_LIST 0xfffffffeu
+#define NVGPU_OSDESC_F_WRITE (1u << 0)
+#define NVGPU_OSDESC_MAX_RUNS 8192
+#define NVGPU_OSDESC_MAX_PAGES (1u << 20)
+
+struct nvgpu_osdesc_hdr {
+  __le32 nruns; /* 1..NVGPU_OSDESC_MAX_RUNS */
+  __le32 flags; /* NVGPU_OSDESC_F_* */
+} __packed;
+
+struct nvgpu_osdesc_run {
+  __le64 gpa;   /* page-aligned guest-physical address */
+  __le32 pages; /* >= 1 */
+  __le32 reserved;
+} __packed;
+
 struct nvgpu_mmap_req {
   struct nvgpu_msg_hdr hdr;
   __le64 size;
@@ -177,6 +208,12 @@ struct nvgpu_mmap_req {
 
 /* The shared memory region id of the UVM aperture. The window is id 1. */
 #define NVGPU_SHM_ID_UVM 2
+
+/* The band a UVM pool's host address must lie in, [4 GiB, 32 TiB): nothing of
+ * a 64-bit VMM's own is there (protocol/src/messages.rs, UVM_HVA_MIN). The
+ * backend and the VMM check it too; this only refuses sooner. */
+#define NVGPU_UVM_HVA_MIN (1ull << 32)
+#define NVGPU_UVM_HVA_MAX (1ull << 45)
 
 struct nvgpu_mmap_resp {
   struct nvgpu_msg_hdr hdr;
@@ -289,6 +326,7 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_WL_EXPORT (1u << 4)   /* --wayland-export                    */
 #define NVGPU_BCAP_DEEP_SEGS (1u << 5)   /* NVGPU_DEEP_SEGMENTED deep blocks    */
 #define NVGPU_BCAP_UVM_MAP (1u << 6)     /* UVM pools map into the aperture     */
+#define NVGPU_BCAP_OS_DESC (1u << 7)     /* NVGPU_DEEP_PAGE_LIST registrations  */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
@@ -462,6 +500,12 @@ struct nvgpu_unwatch_req {
  * shared SYNCOBJ_EVENTFD registration per (file, syncobj, point, flags),
  * reported once as EV_READY; -EAGAIN over the per-VM cap (device/src/fence.rs) */
 #define NVGPU_OP_SYNCOBJ_WATCH 10
+/* (ack) -> (last, count), then `count` __le64 registration ids after the
+ * nvgpu_host_op_resp: OS-descriptor registrations RM has let go of, released
+ * after `ack`, oldest first. `last` is the next ack; the backend forgets them
+ * only then, so a lost reply is answered again. */
+#define NVGPU_OP_OSDESC_REAP 11
+#define NVGPU_OSDESC_REAP_MAX 256
 
 #define NVGPU_OP_MAX_ARGS 6
 #define NVGPU_OP_MAX_RES 4
@@ -557,6 +601,8 @@ static_assert(sizeof(struct nvgpu_watch_req) == 16, "watch");
 static_assert(sizeof(struct nvgpu_unwatch_req) == 8, "unwatch");
 static_assert(sizeof(struct nvgpu_host_op_req) == 56, "host op req");
 static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
+static_assert(sizeof(struct nvgpu_osdesc_hdr) == 8, "osdesc hdr");
+static_assert(sizeof(struct nvgpu_osdesc_run) == 16, "osdesc run");
 static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
 static_assert(sizeof(struct nvgpu_ev_fence) == 16, "ev fence");
 static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");

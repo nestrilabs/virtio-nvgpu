@@ -82,7 +82,9 @@ paths that dev already had. Measured against dev:
   by CPU address (OS descriptors) was pinned from the backend's address space
   and mapped for the GPU. None of these reaches the host now. The pointer
   fields come from tables measured per release (`device/src/guestptr.rs`,
-  `gen/rmctrl/`).
+  `gen/rmctrl/`). Memory the guest registers now travels as the
+  guest-physical pages behind it, each checked to be guest RAM, and RM pins
+  the backend's own mapping of exactly those pages (below).
 - **The whole host.** dev's launcher ran the backend as root, so every guest
   process was an RM administrator with all of BAR0 mappable read-write. Its
   default socket was a fixed path in `/tmp` that another user could bind
@@ -104,6 +106,12 @@ reviewed because the display work depended on it.
   no cgroup and no rlimit, and the per-guest isolate is not built.
 - Four review findings are partly fixed, and two verification findings are
   partly fixed or open (§8). §9 lists every open item.
+- Memory registered by its pages is released to the guest when its RM handle
+  goes, even where another holder still has it in the host kernel -- UVM,
+  NVKMS, nvidia-drm, an RM export to a descriptor (§3, "Memory registered by
+  its pages"). Never the host's memory, but an unprivileged guest process can
+  use it to reach frames its own kernel has reused: a guest privilege
+  escalation, open.
 
 §10 is the order the remaining work should go in.
 
@@ -143,14 +151,14 @@ each call is validated:
 |---|---|---|---|
 | **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Any `F` ioctl on any open handle. **Size-checked** against the profile (23 escapes for 535, 24 for 580 and 595) once the host version had been learned from the guest's first CHECK_VERSION_STR; **raw** before that. | Only on GPU and control handles (`v1_route`, `device/src/nvidia.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused**, and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
 | **RM_CONTROL** commands | 1,362 method ids | All, **raw** past the 32-byte outer check. One embedded pointer was relocated, at an offset the guest named, into a heap buffer sized from what the guest sent. Every other embedded pointer reached RM as a guest address, which RM dereferences in the backend. | Still all but 15, and **not allow-listed**. 3 are **refused** (pointers the table cannot name one by one). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. |
-| **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | All, **raw**. | All but **12, refused** (OS-descriptor memory 0x71, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event. The rest reach RM **not allow-listed**. |
-| **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | **Raw**: RM pinned the backend's pages at a guest-chosen address and mapped them for the GPU. | **Refused**. `cuMemHostRegister` and `VK_EXT_external_memory_host` are therefore unsupported. |
+| **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | All, **raw**. | All but **12, refused** (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event. The rest reach RM **not allow-listed**. |
+| **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | **Raw**: RM pinned the backend's pages at a guest-chosen address and mapped them for the GPU. | With an address alone, **refused**. With the guest-physical pages behind it (BCAP_OS_DESC), **table-sized**: only the user-virtual-address descriptor type, a page list covering exactly what RM pins, every page in guest RAM, and RM handed the backend's own mapping of exactly those pages (below). |
 | **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | All, **raw**. The guest copied 12 KiB each way for every command but the two it knew the size of, and pointers and descriptors went as sent. | At most **33** (30 to 33 per release), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages, and every file is put in multi-process sharing mode, which takes pageable access away on every release and ties the VA space to no process. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**. |
 | **nvidia-uvm tools**, `/dev/nvidia-uvm-tools` | 7 | All, **raw**. | **0**: the file opens, and every ioctl on it is **refused**. |
 | **NVKMS**, `/dev/nvidia-modeset` | one ioctl carrying 66 commands (610.57.04) | Every command, **raw**, with **no policy**. One descriptor, REGISTER_SURFACE's, was translated at a fixed offset. | 56 to 61 per release, **schema-authoritative** over IOCTL2. v1 carries only the commands with no pointer and no descriptor. 7 are **refused** by name, 3 run only with `--kms-card`, and 7 are gated on grants outside it. Everything else is in §5. At most 64 opens per VM. |
 | **nvidia-drm and DRM core on a host render node** | 24 nvidia-drm ioctls (21 render-allowed), plus the core's render-allowed ones | Any `d` ioctl. Three nested GEM calls translated `memFd`; the rest were **raw** in a buffer sized by the guest, while the host copies `_IOC_SIZE` back (a heap overflow in the backend). | v1: 6 full ioctl numbers. IOCTL2: 28 render-class entries (12 syncobj, 16 nvidia-drm), **schema-authoritative**. GEM_IMPORT_USERSPACE_MEMORY, GEM_FLINK and GEM_OPEN are **refused** on every handle. SEMSURF_FENCE_CTX_CREATE's index must lie inside the surface, and its client must be one this VM allocated, with at most 16 contexts per file and 256 per VM (`device/src/semsurf.rs`). Every argument buffer is at least `_IOC_SIZE` and guarded. |
 | **DRM KMS on a host card or lease file** | the KMS core | None: no such file existed. | 49 KMS-class entries, **schema-authoritative**, only on card handles (`--kms-card`) and lease handles. See §5. |
-| **HOST_OP** (backend-made host calls on the guest's behalf) | -- | None. | 10 ops, each argument checked against the handle kind it must be: PRIME export and import on render files, sync_file merge (at most 5), eventfd, a signalled sync_file (by `/dev/udmabuf` when needed), a syncobj wait registration (at most 1,024 per VM), fd kind, close-many, and OPEN_KMS and DROP_IF_MASTER, which are `--kms-card` only. |
+| **HOST_OP** (backend-made host calls on the guest's behalf) | -- | None. | 11 ops, each argument checked against the handle kind it must be: PRIME export and import on render files, sync_file merge (at most 5), eventfd, a signalled sync_file (by `/dev/udmabuf` when needed), a syncobj wait registration (at most 1,024 per VM), fd kind, close-many, and OPEN_KMS and DROP_IF_MASTER, which are `--kms-card` only. OSDESC_REAP calls nothing on the host: it reads which registrations of guest memory RM has let go of. |
 | **mmap** | per device | Any handle. A UVM file went to the window, where the VMM's mmap of it failed and closed the window's request channel for the rest of the VM. | Device, render, card and lease handles only. Each placement carries the host's memory type and whether it is writable, so a read-only host page is mapped read-only in the guest. A UVM file maps only a semaphore pool the same file was seen to create, asked for exactly, into the UVM aperture (below); anything else on it is **refused** before the VMM is asked. |
 | **any other ioctl type** | -- | **Raw**, to whatever host file the handle was. | **Refused** (EPERM). |
 
@@ -172,9 +180,13 @@ guest's choice. What bounds it:
   sharing mode, another file's pool, a sub-range and a read-only request are
   refused. UVM checks the same range again when the VMM maps it.
 - **Never over the VMM's own memory.** The address must lie in [4 GiB,
-  64 TiB), where a 64-bit VMM has nothing (its executable, heap and mmap base
-  all sit above 85 TiB), and the VMM maps with `MAP_FIXED_NOREPLACE`, so a
-  collision fails rather than replacing anything. Two of the guest's own pools
+  32 TiB), where a 64-bit VMM has nothing: its executable and heap sit at
+  two-thirds of the 47-bit space (85 TiB), and its mappings grow down from
+  below the stack or, under a legacy layout (an unlimited stack rlimit), up
+  from a third of it (42.7 TiB), which the 64 TiB top the band once had
+  reached. The backend, the VMM and the guest driver all check the band, and
+  the VMM maps with `MAP_FIXED_NOREPLACE`, so a collision fails rather than
+  replacing anything. Two of the guest's own pools
   at one address are refused by the backend before the VMM is asked, so a
   failure never tells the guest anything about the VMM's layout.
 - **No descriptor kept.** The UVM file travels to the VMM on the vhost-user
@@ -194,6 +206,66 @@ guest's choice. What bounds it:
 Sharing mode only takes things away (pageable access, the tie to the
 backend's mm), no host driver change is needed, and the VMM's seccomp filter
 already allows the calls involved (`mmap`, `mincore`, `ioctl`).
+
+### Memory registered by its pages: what the guest can make the GPU reach
+
+RM registers memory a caller already has by CPU address, and pins what that
+address maps in the calling process, the backend. Sent that way the three
+calls are refused (the critical finding on dev: RM pinned the VMM's memory at
+a guest-chosen address). A guest that is offered BCAP_OS_DESC sends the
+guest-physical pages behind the caller's range instead, and the backend hands
+RM an address of its own (ARCHITECTURE.md §5, `device/src/osdesc.rs`). What
+bounds it:
+
+- **Only guest RAM.** Every page of the list must lie in a region of the
+  vhost-user memory table, which holds guest RAM and nothing else: the window,
+  the UVM aperture and every other device region are not in it, and a page
+  outside refuses the whole call before RM is called. The backend maps only
+  from those regions' own memfds, at the page's own offset.
+- **Only what RM pins, as RM pins it.** The list must cover exactly the
+  pages from the one holding the caller's address to the one holding its last
+  byte (`limit + 1` bytes on), in runs of whole pages, at most 8,192 runs and
+  4 GiB, with the writability the call asks RM for; the backend maps
+  read-only memory read-only. The caller's offset in its first page is kept,
+  and RM refuses an unaligned one as it does natively.
+- **Only a virtual address.** The descriptor type must be the user virtual
+  address. A physical address, a page array, I/O memory, a dma-buf by
+  descriptor and the kernel-only types are refused whatever came with them.
+- **Pinned on both sides until RM lets go.** The guest keeps its pins until
+  the backend reports the registration released, and the backend's range
+  stays mapped until then: RM freed the object, its parent or its client
+  (the backend frees a client holding one itself, on its own file, before
+  that file closes), or the session ended. A duplicate made with DUP_OBJECT
+  holds it too. A free the backend cannot see (an ancestor above the parent)
+  makes the release late, never early.
+- **Bounded.** 4,096 registrations per VM, released ones the guest has not
+  yet read included, and 1,024 per guest file; 16 GiB per VM and 4 GiB per
+  file; 32,768 separately mapped runs per VM, each a mapping of the
+  backend's.
+
+What it does not cover: a reference that only the host kernel holds. UVM
+keeps its own duplicate of memory it maps as an external allocation, NVKMS
+of memory registered as a surface, nvidia-drm of memory imported as a GEM
+object, and RM of an object exported to a descriptor
+(NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD, which a later import turns
+back into a handle the backend never saw made) or attached to an
+NV_MEMORY_EXPORT object. RM keeps the pages pinned for those, but the backend
+sees only the guest's handles, and reports the registration released when
+they are freed. The guest then unpins, and pages it reuses stay reachable
+through that holder until it lets go. Those are guest pages, never the
+host's: the host is unaffected. But a guest process that does this on
+purpose -- register, export or map, free the handle -- can read and write
+frames its own kernel has since handed to someone else, which is a guest
+privilege escalation for any user who may open the GPU. Closing that needs
+the backend to follow those references too (holding a registration until
+the UVM, NVKMS or DRM file that took one closes), or to refuse them for
+registered memory. A free the backend itself makes (a closing file's
+clients, the session's) releases only what RM confirms it freed; a client
+RM would not free keeps its registrations until the session ends. An
+ALLOC_MEMORY with a zero hObjectNew is refused: RM would make the object
+under a handle it never reports. A registration abandoned in flight (a
+fatal signal, a timeout) stays pinned in the guest until the device is
+removed, since nothing can say whether RM took it.
 
 ---
 
@@ -617,6 +689,14 @@ In rough order of weight.
     nothing at all. Only running [`TESTING.md`](TESTING.md) tells the two
     apart. That applies to the headless path too: its UVM, RM and coherency
     changes are unmeasured.
+11. **Registered guest memory outlives its handle in the host kernel.** A
+    UVM external mapping, an NVKMS surface, an nvidia-drm GEM import or an
+    RM export to a descriptor made from memory registered by its pages keeps
+    RM's pin after the guest's handles are freed, and the backend, which
+    follows only RM handles, then tells the guest to unpin (§3, "Memory
+    registered by its pages"). Never the host's memory, but a guest process
+    can reach pages its own kernel has since reused: a guest privilege
+    escalation, High for the guest. None of it has run on hardware.
 
 ---
 

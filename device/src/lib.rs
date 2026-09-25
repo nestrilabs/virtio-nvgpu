@@ -22,6 +22,7 @@ pub mod kms;
 pub mod mmap;
 pub mod nvidia;
 pub mod nvkms;
+pub mod osdesc;
 pub mod policy;
 pub mod posture;
 pub mod privfd;

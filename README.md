@@ -163,6 +163,12 @@ What narrows the surface today:
   backend's or zeroed, whatever the ABI policy; escapes whose pointers cannot
   be relocated (IOCTL_XFER_CMD, IDLE_CHANNELS, ACCESS_REGISTRY, I2C_ACCESS,
   GET_EVENT_DATA) are refused (`device/src/guestptr.rs`)
+- **memory the guest registers with the GPU travels as its pages, not its
+  address.** RM pins what an address maps in the calling process -- the
+  VMM -- so the guest driver pins the caller's range and sends the
+  guest-physical pages instead; the backend checks each is guest RAM and hands
+  RM its own mapping of exactly those pages, and the guest keeps them pinned
+  until RM has let go (`device/src/osdesc.rs`)
 - **guest descriptor numbers are translated, not forwarded.** A file named
   inside RM escape, UVM, NVKMS or DRM parameters becomes the backend's own
   descriptor for that file, or the call is refused; a few descriptors inside
@@ -533,6 +539,13 @@ channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
   buffer becomes shareable
 - OpenGL rendering (headless EGL)
 - CUDA device memory allocation
+- registering memory the guest already has with the GPU:
+  `cuMemHostRegister`, `VK_EXT_external_memory_host`, and the buffer
+  `cuCtxCreate` registers for itself. RM's OS-descriptor memory is pinned by
+  CPU address, which here would be the VMM's, so the guest sends the
+  guest-physical pages behind it and the backend maps exactly those (an
+  address alone is still refused). Built and tested against a fake host; not
+  yet run on a GPU
 - CUDA ↔ Vulkan/GL interop, zero-copy, GPU-side pointers
 - NVENC encoding from CUDA device pointers; NVDEC decoding
 - **display** on the host's monitors: the four modes under
@@ -561,10 +574,6 @@ channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
 **Refused, so unsupported** — each would let a guest reach past its own
 objects on the host, and is turned away before the host driver sees it:
 
-- registering memory the guest already has with the GPU: `cuMemHostRegister`
-  and `VK_EXT_external_memory_host` (RM's OS-descriptor memory, which RM pins by
-  CPU address and would pin the VMM's memory here; `EPERM` — ARCHITECTURE.md §5
-  sketches how it could be supported)
 - RM's `EXPORT_TO_DMABUF_FD`, which installs the new dma-buf in the caller's
   descriptor table — the backend's (`EOPNOTSUPP`). NVIDIA's GBM export through
   RM and CUDA's `cuMemGetHandleForAddressRange` with a dma-buf handle fail as

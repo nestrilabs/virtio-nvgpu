@@ -1,7 +1,7 @@
 // crates/device/src/nvidia.rs
 use protocol::messages::*;
 use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::{DeviceError, Result};
@@ -575,6 +575,13 @@ pub struct NvidiaBackend {
     /// coherency, doorbell registers), and the rewrite that makes guest
     /// system memory GPU-coherent (rmmem.rs).
     pub(crate) rmmem: crate::rmmem::RmMem,
+    /// Guest RAM, as the vhost-user memory table gives it: what an OS
+    /// descriptor's page list is checked against and mapped from
+    /// (osdesc.rs). None where there is none (the socket harness, tests
+    /// that do not set one), and then no guest is offered BCAP_OS_DESC.
+    pub(crate) guest_ram: Option<crate::osdesc::GuestRam>,
+    /// Memory the guest registered with RM by its pages (osdesc.rs).
+    pub(crate) osdesc: crate::osdesc::OsDesc,
 }
 
 /// `ioctl(2)` as the forwarding paths call it.
@@ -1027,6 +1034,8 @@ impl NvidiaBackend {
             uvm_maps: crate::uvmmap::UvmMaps::default(),
             wl: crate::wl::WlState::default(),
             rmmem: crate::rmmem::RmMem::default(),
+            guest_ram: None,
+            osdesc: crate::osdesc::OsDesc::default(),
         }
     }
 
@@ -1111,6 +1120,14 @@ impl NvidiaBackend {
     /// there is no address in the guest that names it.
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
+    }
+
+    /// Guest RAM, from the vhost-user memory table. Every OS descriptor's
+    /// page list is checked against, and mapped from, the table current when
+    /// it arrives (osdesc.rs); a registration made from an older one keeps
+    /// what it mapped. With none, no guest is offered BCAP_OS_DESC.
+    pub fn set_guest_ram(&mut self, ram: Option<crate::osdesc::GuestRam>) {
+        self.guest_ram = ram;
     }
 
     /// How many host descriptors the guest currently holds open.
@@ -1297,6 +1314,19 @@ impl NvidiaBackend {
         self.syncobj_regs.clear();
         self.uvm_refused.clear();
         self.nvkms.reset();
+        // Every client holding a registration is freed on the file it was
+        // made on before any file closes (osdesc.rs); then the records go.
+        let holders: Vec<u32> = self.osdesc.clients().into_iter().collect();
+        for c in holders {
+            let fd = self
+                .semsurf
+                .issuer_of(c)
+                .and_then(|h| self.handles.get_raw(h).ok());
+            if let Some(fd) = fd {
+                self.osdesc_end_clients(fd, &[c], "session end");
+            }
+        }
+        self.osdesc.clear();
         self.semsurf.reset();
         // As in close_handle: display files close on the closer thread, not
         // under the backend mutex a reset holds (S-33).
@@ -2231,6 +2261,11 @@ impl NvidiaBackend {
         // The one client set (semsurf.rs) says which RM clients died with
         // this file; the memory records drop what those held.
         let gone_clients = self.semsurf.forget_handle(handle);
+        // Clients holding memory the guest registered by its pages are freed
+        // here, while the file is ours: RM lets go of the pages now, not
+        // whenever the file's last reference goes, and only then is the guest
+        // told it may unpin them (osdesc.rs).
+        self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, "close");
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         self.forget_kms_state(handle);
@@ -2381,7 +2416,27 @@ impl NvidiaBackend {
         // block on any other call is refused rather than ignored, so a guest
         // never believes pointers were carried that were not.
         let segmented = ireq.deep_len > 0 && ireq.deep_ptr_offset == DEEP_SEGMENTED;
-        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 && !segmented {
+        // Or, marked DEEP_PAGE_LIST, the guest-physical pages of memory the
+        // caller registers with RM (osdesc.rs): only on the three calls that
+        // register it.
+        let listed = ireq.deep_len > 0 && ireq.deep_ptr_offset == DEEP_PAGE_LIST;
+        let page_list: Option<&[u8]> = listed.then(|| &body[nested_end..want]);
+        if listed
+            && (hostfd::ioc_type(ireq.cmd) != b'F'
+                || !matches!(
+                    hostfd::ioc_nr(ireq.cmd),
+                    abi::ioctl::NV_ESC_RM_ALLOC
+                        | abi::ioctl::NV_ESC_RM_ALLOC_MEMORY
+                        | abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL
+                ))
+        {
+            log::warn!(
+                "ioctl cmd={:#x}: a page list on a call that registers no memory",
+                ireq.cmd
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 && !segmented && !listed {
             Some((ireq.deep_ptr_offset as usize, &body[nested_end..want]))
         } else {
             None
@@ -2448,6 +2503,15 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
         };
+
+        if page_list.is_some() && !matches!(route, V1Route::Rm) {
+            log::warn!(
+                "ioctl cmd={:#x}: a page list on handle {} ({kind:?}), which is no RM file",
+                ireq.cmd,
+                self.current_handle
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
 
         match route {
             V1Route::Rm => {}
@@ -2658,6 +2722,22 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EOPNOTSUPP);
         }
 
+        // Memory registered by its pages rather than its address: its own
+        // path, and the only one on which RM is handed an address for an OS
+        // descriptor -- one of ours (osdesc.rs). Sent with an address alone,
+        // the same calls are refused below.
+        if let Some(list) = page_list {
+            return self.dispatch_osdesc(
+                cookie,
+                host_fd,
+                request,
+                ireq.data_len as usize,
+                param_in,
+                list,
+                resp_buf,
+            );
+        }
+
         // No guest pointer reaches RM as a pointer (guestptr.rs), whatever
         // the ABI policy: the fields RM would dereference are zeroed or the
         // call is refused, and the caller's values go back in the reply. The
@@ -2814,6 +2894,14 @@ impl NvidiaBackend {
             let ok = n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0;
             if ok {
                 self.rmmem.after(p, &mut resp_buf[body..n]);
+            }
+        }
+        // What RM freed, duplicated or made anew, as registrations of memory
+        // by its pages live through (osdesc.rs).
+        if ioc_type == b'F' as u32 {
+            let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+            if n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0 {
+                self.osdesc_observe(escape, &resp_buf[body..n]);
             }
         }
         Self::restore_reply(&ptr_restore, resp_buf, n);
@@ -3400,6 +3488,255 @@ impl NvidiaBackend {
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&caller_ptr);
             self.write_ioctl_resp(resp_buf, cookie, outer)
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Memory registered by its pages (osdesc.rs)
+    // ------------------------------------------------------------------
+
+    /// One of the three calls that register memory the caller already has
+    /// -- ALLOC_MEMORY or RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+    /// VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR -- sent with the
+    /// guest-physical pages behind it (`list`). `param_in` is the top-level
+    /// block (`outer_len` bytes) and, for RM_ALLOC, the class parameters
+    /// after it. RM is handed an address of this process's that maps
+    /// exactly those pages; the caller reads back its own. On RM's NV_OK the
+    /// reply carries the registration's id as its deep block.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_osdesc(
+        &mut self,
+        cookie: u64,
+        host_fd: RawFd,
+        request: u64,
+        outer_len: usize,
+        param_in: &[u8],
+        list: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        use crate::osdesc::{self as od, Shape};
+        let Some(ram) = self.guest_ram.clone().filter(|_| self.session.v2) else {
+            log::warn!("OS descriptor page list from a guest never offered BCAP_OS_DESC; refused");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        };
+        let cmd = request as u32;
+        let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
+        let prepared = od::describe(cmd, outer, nested).and_then(|call| {
+            let runs = od::parse_runs(&call, list)?;
+            let resolved = od::resolve(&ram, &runs)?;
+            self.osdesc
+                .admit(self.current_handle, resolved.bytes(), resolved.vmas())?;
+            Ok((call, resolved.map(call.in_page(), call.writable)?))
+        });
+        let (call, pinned) = match prepared {
+            Ok(p) => p,
+            Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
+        };
+        let addr = pinned.addr.to_le_bytes();
+        let put = |b: &mut [u8], off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
+
+        // What records the memory an escape makes (rmmem.rs) sees the call
+        // too: a handle made here is no longer whatever it named before.
+        let escape = hostfd::ioc_nr(cmd);
+        let mut seen = param_in.to_vec();
+        let rm_pending = self.rmmem.before(escape, &mut seen);
+
+        // The blocks the host is handed: ours, with our address where the
+        // caller's was.
+        let Some(mut arg) = ioctl_arg(request, outer) else {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        };
+        let mut class_params: Option<GuardedBuf> = None;
+        let (status_at, handle_at) = match call.shape {
+            Shape::AllocMemory => {
+                let a = arg.as_mut_slice();
+                put(a, od::OS02_MEMORY, &addr);
+                // RM reads the descriptor only to arm a mapping of
+                // NV01_MEMORY_SYSTEM (escape.c:415-431); a guest number goes
+                // no further than here.
+                put(a, od::OS02_FD, &(-1i32).to_le_bytes());
+                (od::OS02_STATUS, od::OS02_NEW)
+            }
+            Shape::VidHeap => {
+                put(arg.as_mut_slice(), od::OS32_DESCRIPTOR, &addr);
+                (od::OS32_STATUS, od::OS32_HMEMORY)
+            }
+            Shape::RmAlloc => {
+                let Some(mut n) = GuardedBuf::new(nested.len()) else {
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOMEM,
+                    );
+                };
+                n.as_mut_slice().copy_from_slice(nested);
+                put(n.as_mut_slice(), od::OSD_DESCRIPTOR, &addr);
+                let a = arg.as_mut_slice();
+                put(a, od::OS64_PARAMS, &(n.as_mut_ptr() as u64).to_le_bytes());
+                // As guestptr::rm_escape: RM grants the default rights.
+                put(a, od::OS64_RIGHTS, &[0; 8]);
+                class_params = Some(n);
+                (od::OS64_STATUS, od::OS64_NEW)
+            }
+        };
+        // SAFETY: the HostIoctl contract: `arg` is sized by ioctl_arg, and
+        // the class parameters and the range RM pins live past the call.
+        let rc = unsafe { (self.host_ioctl)(host_fd, request, arg.as_mut_ptr()) };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            log::warn!("OS descriptor {cmd:#x}: the host refused the call (errno {errno})");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+
+        // The caller's own values back where ours were.
+        let mut out = arg.as_slice()[..outer.len()].to_vec();
+        let back = |out: &mut [u8], off: usize, n: usize| {
+            out[off..off + n].copy_from_slice(&outer[off..off + n])
+        };
+        match call.shape {
+            Shape::AllocMemory => {
+                back(&mut out, od::OS02_MEMORY, 8);
+                back(&mut out, od::OS02_FD, 4);
+            }
+            Shape::VidHeap => back(&mut out, od::OS32_DESCRIPTOR, 8),
+            Shape::RmAlloc => {
+                back(&mut out, od::OS64_PARAMS, 8);
+                back(&mut out, od::OS64_RIGHTS, 8);
+            }
+        }
+        if let Some(n) = &class_params {
+            let mut p = n.as_slice().to_vec();
+            p[od::OSD_DESCRIPTOR..od::OSD_DESCRIPTOR + 8]
+                .copy_from_slice(&nested[od::OSD_DESCRIPTOR..od::OSD_DESCRIPTOR + 8]);
+            out.extend_from_slice(&p);
+        }
+        self.rmmem.after(rm_pending, &mut out);
+
+        let rd = |o: usize| u32::from_le_bytes(out[o..o + 4].try_into().unwrap());
+        let status = rd(status_at);
+        let deep = if status == 0 {
+            let object = rd(handle_at);
+            let id = self.osdesc.add(
+                self.current_handle,
+                call.client,
+                object,
+                call.parent,
+                pinned,
+            );
+            log::debug!(
+                "OS descriptor {id}: {:#x} bytes as {:#x}/{:#x}",
+                call.size,
+                call.client,
+                object
+            );
+            if call.shape == Shape::RmAlloc {
+                self.rm_classes.add(od::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+            }
+            out.extend_from_slice(&id.to_le_bytes());
+            8
+        } else {
+            // Nothing made, nothing pinned by RM: the range goes now.
+            log::debug!("OS descriptor {cmd:#x}: RM answered {status:#x}; nothing registered");
+            drop(pinned);
+            0
+        };
+        self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep)
+    }
+
+    /// What RM freed, duplicated or made anew, from a successful reply's
+    /// parameters (`reply`), for the registrations that live through RM
+    /// objects (osdesc.rs).
+    fn osdesc_observe(&mut self, escape: u32, reply: &[u8]) {
+        use abi::ioctl::*;
+        if self.osdesc.live() == 0 {
+            return;
+        }
+        let r = |o: usize| {
+            reply
+                .get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        match escape {
+            // NVOS00: hRoot, hObjectParent, hObjectOld, status.
+            NV_ESC_RM_FREE if r(12) == Some(0) => {
+                if let (Some(c), Some(o)) = (r(0), r(8)) {
+                    self.osdesc.freed(c, o);
+                }
+            }
+            // NVOS55: hClient, hParent, hObject, hClientSrc, hObjectSrc,
+            // flags, status.
+            NV_ESC_RM_DUP_OBJECT if r(24) == Some(0) => {
+                if let (Some(c), Some(p), Some(o), Some(sc), Some(so)) =
+                    (r(0), r(4), r(8), r(12), r(16))
+                {
+                    self.osdesc.duplicated(sc, so, c, o, p);
+                }
+            }
+            // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
+            // A zero hObjectNew is no handle: RM made the object under one it
+            // generated and, through ALLOC_MEMORY, never wrote back.
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
+                if let (Some(c), Some(o)) = (r(0), r(8))
+                    && o != 0
+                {
+                    self.osdesc.reused(c, o);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Free `clients` on `host_fd`, the file they were allocated on, if they
+    /// hold memory registered by its pages, and forget what they held. RM
+    /// lets go of the pages in the free (the file's own last close may be
+    /// later: the event pump holds a duplicate of a watched file), and only
+    /// then may the guest unpin them.
+    pub(crate) fn osdesc_end_clients(&mut self, host_fd: RawFd, clients: &[u32], why: &str) {
+        let holders = self.osdesc.clients();
+        let ending: Vec<u32> = clients
+            .iter()
+            .copied()
+            .filter(|c| holders.contains(c))
+            .collect();
+        if ending.is_empty() {
+            return;
+        }
+        let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16);
+        // Only a client RM says it freed is forgotten. One it would not free
+        // (on another file, or a failed call) may still hold the pages, and
+        // the guest must not be told it may unpin them: its registrations
+        // stay, released late -- by a later free RM does confirm, or with the
+        // session -- never early.
+        let mut freed = Vec::with_capacity(ending.len());
+        for &c in &ending {
+            // NVOS00: the client names itself.
+            let mut p = [0u8; 16];
+            p[0..4].copy_from_slice(&c.to_le_bytes());
+            p[8..12].copy_from_slice(&c.to_le_bytes());
+            let Some(mut a) = ioctl_arg(request, &p) else {
+                log::warn!("{why}: no buffer to free RM client {c:#x}; its registrations stay");
+                continue;
+            };
+            // SAFETY: the HostIoctl contract; `a` is sized by ioctl_arg.
+            let rc = unsafe { (self.host_ioctl)(host_fd, request, a.as_mut_ptr()) };
+            let status = u32::from_le_bytes(a.as_slice()[12..16].try_into().unwrap());
+            if rc < 0 || status != 0 {
+                log::warn!(
+                    "{why}: freeing RM client {c:#x}, which holds registered guest memory: \
+                     rc {rc}, status {status:#x}; its registrations stay"
+                );
+                continue;
+            }
+            freed.push(c);
+        }
+        self.osdesc.forget_clients(&freed);
+    }
+
+    /// OP_OSDESC_REAP: the releases after `ack`, and forget those up to it.
+    pub(crate) fn osdesc_reap(&mut self, ack: u64) -> (u64, Vec<u64>) {
+        self.osdesc.reap(ack)
     }
 
     // ------------------------------------------------------------------

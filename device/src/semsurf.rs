@@ -208,6 +208,11 @@ impl SemsurfPolicy {
         self.lock().clients.contains_key(&h_client)
     }
 
+    /// The file `h_client` was allocated on, if it is live.
+    pub fn issuer_of(&self, h_client: u32) -> Option<u32> {
+        self.lock().clients.get(&h_client).copied()
+    }
+
     /// ALLOC_OS_EVENT succeeded on `issuer` for `(h_client, event)`.
     pub fn os_event_allocated(&self, issuer: u32, h_client: u32, event: u32) {
         self.lock().os_events.insert((h_client, event), issuer);

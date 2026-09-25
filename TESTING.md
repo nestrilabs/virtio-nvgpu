@@ -456,7 +456,7 @@ The tests, each an ioctl a hostile guest would use:
 
 | test | what it attempts | refusal expected | finding |
 |---|---|---|---|
-| `os-descriptor RM_ALLOC 0x71` | allocate `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` / `VID_HEAP ALLOC_OS_DESCRIPTOR` | RM would pin memory named by a VMM address; refused by class/function | S-1 (3) |
+| `os-descriptor RM_ALLOC 0x71` | allocate `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` / `VID_HEAP ALLOC_OS_DESCRIPTOR` | RM would pin memory named by a VMM address; refused by class/function when sent with an address alone (the supported form sends the guest-physical pages, BCAP_OS_DESC) | S-1 (3) |
 | `raw-pointer RM_CONTROL` | an embedded-pointer control with a guest pointer the guest table does not list | backend relocates every `NvP64` to its own buffer, or refuses | S-1 |
 | `semsurf 0x54 huge index` | `SEMSURF_FENCE_CTX_CREATE` with an overflowing `index` | index bounded to the host layout; refused | C-1 |
 | `GRANT_PERMISSIONS SUB_OWNER` | nvidia-drm `0x52` with `type=3` | only `MODESET` allowed; SUB_OWNER refused | H (GRANT) |

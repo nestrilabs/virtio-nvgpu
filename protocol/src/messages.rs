@@ -348,6 +348,68 @@ pub struct DeepSeg {
     pub len: u32,
 }
 
+/// `IoctlReq::deep_ptr_offset` for an OS-descriptor page list: memory the
+/// caller already has, registered with RM by the guest-physical pages behind
+/// it rather than by its address. Only to a backend that says
+/// [`BCAP_OS_DESC`], and only on the three calls that register it:
+/// NV_ESC_RM_ALLOC_MEMORY and NV_ESC_RM_ALLOC of
+/// NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x71), and NV_ESC_RM_VID_HEAP_CONTROL's
+/// NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR. The descriptor type must be the user
+/// virtual address one, and the address stays in the block as the caller
+/// wrote it: the backend reads its offset inside the first page from it.
+///
+/// The deep block is an [`OsDescHdr`] and `nruns` [`OsDescRun`]s, nothing
+/// after. The guest has pinned the pages (as RM pins them: for writing
+/// unless the call asks for read-only memory, and says which in
+/// [`OSDESC_F_WRITE`]) and keeps them pinned until the backend reports the
+/// registration released ([`OP_OSDESC_REAP`]). The runs cover exactly the
+/// pages RM would pin: from the one holding the address to the one holding
+/// its last byte, `limit + 1` bytes on. The backend checks every page lies in
+/// guest RAM and hands RM an address of its own mapping those pages, in
+/// order; anything else refuses the call before it reaches the host.
+///
+/// A reply whose RM status is NV_OK carries a deep block of 8 bytes: the
+/// registration's id, which a later reap names. Otherwise there is none,
+/// nothing was registered, and the guest unpins at once.
+pub const DEEP_PAGE_LIST: u32 = u32::MAX - 1;
+
+/// [`OsDescHdr::flags`]: the pages were pinned for writing, which is what
+/// RM asks for unless the call says the memory is read-only to the CPU.
+/// The backend maps them read-only otherwise, and refuses a list whose flag
+/// disagrees with the call.
+pub const OSDESC_F_WRITE: u32 = 1 << 0;
+
+/// Most runs one page list may carry: what the backend maps separately for
+/// scattered pages, and a list that fits a request without indirect
+/// descriptors.
+pub const OSDESC_MAX_RUNS: u32 = 8192;
+
+/// Most pages one registration may name (4 GiB).
+pub const OSDESC_MAX_PAGES: u32 = 1 << 20;
+
+/// Head of an OS-descriptor page list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsDescHdr {
+    /// Runs following, 1 to [`OSDESC_MAX_RUNS`].
+    pub nruns: u32,
+    /// `OSDESC_F_*`.
+    pub flags: u32,
+}
+
+/// Guest-physically contiguous pages of a page list, in the order they
+/// appear in the caller's range.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsDescRun {
+    /// Page-aligned guest-physical address.
+    pub gpa: u64,
+    /// Pages from there, at least one.
+    pub pages: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
 /// Response payload for `MsgType::Ioctl`, following a `MsgHeader`.
 ///
 /// Layout: `MsgHeader` | `IoctlResp` | `data_len` bytes | `nested_len` bytes |
@@ -424,6 +486,15 @@ pub const MMAP_F_UVM_APERTURE: u8 = 1 << 1;
 /// The shared memory region id of the UVM aperture. The window is id 1.
 pub const SHM_ID_UVM: u8 = 2;
 
+/// The host addresses a UVM pool may be mapped at, in the VMM: [4 GiB,
+/// 32 TiB). The address is the guest's choice, so it is held to a band where
+/// a 64-bit VMM has nothing of its own: its executable and heap sit at
+/// two-thirds of the 47-bit space (85 TiB), its mappings grow down from
+/// below the stack or, under a legacy layout, up from a third of it
+/// (42.7 TiB). The backend, the VMM and the guest driver all check it.
+pub const UVM_HVA_MIN: u64 = 1 << 32;
+pub const UVM_HVA_MAX: u64 = 1 << 45;
+
 /// Request payload for `MsgType::Munmap`, following a `MsgHeader`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -464,6 +535,8 @@ const _: () = {
     assert!(size_of::<IoctlResp>() == 12);
     assert!(size_of::<DeepSegHdr>() == 8);
     assert!(size_of::<DeepSeg>() == 8);
+    assert!(size_of::<OsDescHdr>() == 8);
+    assert!(size_of::<OsDescRun>() == 16);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapResp>() == 24);
     assert!(core::mem::offset_of!(MmapResp, caching) == 20);
@@ -500,6 +573,10 @@ pub const BCAP_DEEP_SEGS: u32 = 1 << 5;
 /// guest that said [`GCAP_UVM_APERTURE`], and only when the host's UVM takes
 /// multi-process sharing mode.
 pub const BCAP_UVM_MAP: u32 = 1 << 6;
+/// Memory the caller already has is registered by its guest-physical pages
+/// ([`DEEP_PAGE_LIST`]) and released through [`OP_OSDESC_REAP`]. Offered
+/// only when the backend holds guest RAM (the vhost-user memory table).
+pub const BCAP_OS_DESC: u32 = 1 << 7;
 
 /// `HelloReq::guest_caps` bits.
 ///
@@ -708,6 +785,19 @@ pub const OP_CLOSE_MANY: u32 = 9;
 /// a shared, capped SYNCOBJ_EVENTFD registration reported as EV_READY
 /// (device/src/fence.rs). -EAGAIN over the per-VM cap.
 pub const OP_SYNCOBJ_WATCH: u32 = 10;
+/// `(ack) -> (last, count)`, then `count` u64 registration ids after the
+/// [`HostOpResp`]: the OS-descriptor registrations ([`DEEP_PAGE_LIST`]) RM
+/// has let go of, whose pages the guest may now unpin. Each release has a
+/// sequence number; the reply names the ones after `ack`, oldest first, at
+/// most [`OSDESC_REAP_MAX`], and `last` is the sequence number of the last
+/// one named (`ack` itself when none is). The guest passes `last` as the
+/// next `ack`, and only then does the backend forget them: a reply that is
+/// lost is answered again. A release not yet acknowledged still counts
+/// against the VM's registrations, so a guest that never reaps runs out of
+/// its own budget and nothing else.
+pub const OP_OSDESC_REAP: u32 = 11;
+/// Most ids one reap reply names.
+pub const OSDESC_REAP_MAX: u32 = 256;
 
 pub const OP_MAX_ARGS: usize = 6;
 pub const OP_MAX_RES: usize = 4;
@@ -839,7 +929,7 @@ mod tests {
                 Some((a, b)) => (a.trim(), b.trim().parse::<u32>().unwrap()),
                 None => (v, 0),
             };
-            let v = v.trim_end_matches('u');
+            let v = v.trim_end_matches(['u', 'l', 'U', 'L']);
             let v = match v.strip_prefix("0x") {
                 Some(x) => u64::from_str_radix(x, 16).unwrap(),
                 None => v.parse().unwrap(),
@@ -865,6 +955,18 @@ mod tests {
             define("NVGPU_MMAP_F_READ_ONLY"),
             u64::from(MMAP_F_READ_ONLY)
         );
+        assert_eq!(define("NVGPU_BCAP_OS_DESC"), u64::from(BCAP_OS_DESC));
+        assert_eq!(define("NVGPU_DEEP_PAGE_LIST"), u64::from(DEEP_PAGE_LIST));
+        assert_eq!(define("NVGPU_OSDESC_F_WRITE"), u64::from(OSDESC_F_WRITE));
+        assert_eq!(define("NVGPU_OSDESC_MAX_RUNS"), u64::from(OSDESC_MAX_RUNS));
+        assert_eq!(
+            define("NVGPU_OSDESC_MAX_PAGES"),
+            u64::from(OSDESC_MAX_PAGES)
+        );
+        assert_eq!(define("NVGPU_OP_OSDESC_REAP"), u64::from(OP_OSDESC_REAP));
+        assert_eq!(define("NVGPU_OSDESC_REAP_MAX"), u64::from(OSDESC_REAP_MAX));
+        assert_eq!(define("NVGPU_UVM_HVA_MIN"), UVM_HVA_MIN);
+        assert_eq!(define("NVGPU_UVM_HVA_MAX"), UVM_HVA_MAX);
         // HELLO's request is still the 16 bytes an older backend reads.
         assert_eq!(size_of::<HelloReq>(), 16);
         assert_eq!(core::mem::offset_of!(HelloReq, uvm_aperture_mib), 12);

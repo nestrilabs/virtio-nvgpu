@@ -50,8 +50,9 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/semsurf.rs` | semaphore-surface fence contexts (nvidia-drm 0x54): index bound by the host's layout, the VM's RM clients, per-file and per-session caps; OS events named inside RM parameters |
 | `src/rmmem.rs` | records of RM system memory and doorbells, the coherency rewrite, and the Intel guest-PAT warning |
 | `src/guestptr.rs` | every pointer the host would follow in RM, NVKMS, nvidia-drm and UVM parameters is relocated or zeroed, or the call refused; memory named by CPU address refused; the UVM command allowlist |
+| `src/osdesc.rs` | memory the guest registers by its guest-physical pages instead: the call and its page list checked, every page looked up in guest RAM (the vhost-user memory table, `GuestRam`), RM handed the backend's own mapping of exactly those pages (its mapping of guest RAM, or a range reserved and mapped run by run from the memfds), registrations kept until RM lets go and their releases read by the guest with HOST_OP OSDESC_REAP; bounded per file and per VM |
 | `src/uvmfd.rs` | the descriptors inside UVM parameters, translated like RM's |
-| `src/uvmmap.rs` | the UVM semaphore pools a guest may map, and where each sits in the UVM aperture: recorded from UVM's own replies, matched exactly, bounded per file and per VM, withdrawn on the last MUNMAP, the file's close and a session reset |
+| `src/uvmmap.rs` | the UVM semaphore pools a guest may map, and where each sits in the UVM aperture: recorded from UVM's own replies, matched exactly, at host addresses in [4 GiB, 32 TiB), bounded per file and per VM, withdrawn on the last MUNMAP, the file's close and a session reset |
 | `src/rmctl.rs` | RM controls answered without asking RM (the ones that list every GPU process on the host) |
 | `src/hostfd.rs` | handle kinds, classification of a descriptor by what the kernel says it is, HOST_OP helpers, commands refused on every handle |
 | `src/handle_table.rs` | backend handles: u32, cyclic, bounded |
@@ -67,6 +68,6 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
 | `src/i2_e2e.rs` | test only: `driver/nvgpu_i2.c` transliterated to Rust, run against the whole backend |
 | `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`) |
-| `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, and every command-line flag (`--help`) |
+| `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, guest RAM handed to the backend from each memory table, and every command-line flag (`--help`) |
 | `bin/nvgpu-userspace.rs` | stages the host's NVIDIA user-mode driver for a guest to mount |
 | `bin/test-harness.rs`, `bin/test_client.rs` | an early socket harness and its client |

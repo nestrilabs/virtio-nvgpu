@@ -21,6 +21,13 @@ several pointers, a deep segment each (`gen/nvgpu_rm_deep.h`, rendered with
 the backend's table), to a backend that offers them. Keeping the module dumb is
 what keeps it stable across NVIDIA driver releases.
 
+The one call it does more for is the registration of memory the caller already
+has (`nvgpu_osdesc.c`): RM pins such memory by CPU address, which in the
+backend would be the VMM's, so the module pins the caller's range itself, as
+RM would, and sends the guest-physical page list with the call. The pages stay
+pinned until the backend says RM has let go of them, which the module asks
+after an RM_FREE, a close and before the next registration.
+
 Shared wire-format and ABI definitions live in `protocol/` and are dual
 licensed so this module can include the same headers the Rust side uses.
 
@@ -40,7 +47,8 @@ One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`):
 |---|---|
 | `nvgpu.h` | internal header: shared structs, cross-file prototypes, module parameter `extern`s |
 | `nvgpu_wire.h` | wire protocol and config-space layout (BSD-3-Clause OR GPL-2.0+, mirrors `protocol/`) |
-| `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, RM forwarding (descriptors and OS events translated to backend handles, GPU/CPU time correlation moved into the guest's clocks), UVM, mmap with each placement's memory type and writability (UVM semaphore pools from the UVM aperture, shared memory region 2, found before HELLO and offered in it), `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
+| `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, RM forwarding (descriptors and OS events translated to backend handles, GPU/CPU time correlation moved into the guest's clocks), UVM, mmap with each placement's memory type and writability (UVM semaphore pools from the UVM aperture, shared memory region 2, found before HELLO and offered in it, at host addresses in [4 GiB, 32 TiB) only), `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
+| `nvgpu_osdesc.c` | memory the caller already has, registered with RM by its pages: ALLOC_MEMORY and RM_ALLOC of the OS-descriptor class and VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR pin the caller's range as RM would and send its guest-physical runs; the pins last until a reap (HOST_OP OSDESC_REAP) names the registration, or remove() |
 | `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls |
 | `nvgpu_xfer.c` | protocol v2 transport: request contexts and transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, the event queue and its consumer registry, EV_HOTPLUG uevents |
 | `nvgpu_i2.c` | the schema-driven IOCTL2 interpreter: gathers a caller's buffers per `gen/nvgpu_schema.h`, translates descriptors and GEM handles through per-caller hooks, copies replies back by the kernel's own rules |
