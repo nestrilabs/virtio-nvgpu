@@ -4600,13 +4600,19 @@ mod tests {
     //   TURING_USERMODE_A(0xc461) -> hMemory, mapped at 64 KiB
     //
     // TURING_USERMODE_A is the usermode doorbell aperture, so this maps real
-    // GPU registers, not system memory.
+    // GPU registers, not system memory. Later GPUs have their own usermode
+    // class (a GB202 driver allocates HOPPER_USERMODE_A); the chain takes the
+    // newest one the device lists, as userspace chooses from that list too.
     // ------------------------------------------------------------------
 
     const NV01_ROOT_CLIENT: u32 = 0x41;
     const NV01_DEVICE_0: u32 = 0x80;
     const NV20_SUBDEVICE_0: u32 = 0x2080;
-    const TURING_USERMODE_A: u32 = 0xc461;
+    /// VOLTA .. BLACKWELL_USERMODE_A, oldest first (rmmem.rs treats every
+    /// one of them as registers).
+    const USERMODE_CLASSES: [u32; 5] = [0xc361, 0xc461, 0xc561, 0xc661, 0xc761];
+    const NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2: u32 = 0x0080_0292;
+    const NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE: usize = 200;
 
     /// NVOS64_PARAMETERS field offsets.
     const A_ROOT: usize = 0;
@@ -4617,11 +4623,62 @@ mod tests {
     const A_STATUS: usize = 40;
     const ALLOC_OUTER: usize = 48;
 
+    /// Places device memory in this process's own SHM window, the way the
+    /// VMM places it in the guest's (bin/vhost-user-nvgpu.rs `VhostWindow`):
+    /// `MAP_FIXED` of the device fd over the range, and the memfd back on
+    /// withdraw. With it the window really aliases what RM mapped, so a test
+    /// can read the GPU through it.
+    struct LocalWindow {
+        base: usize,
+        memfd: RawFd,
+    }
+
+    impl LocalWindow {
+        fn fixed(&self, off: u64, len: u64, prot: i32, fd: RawFd, fo: u64) -> Result<()> {
+            // SAFETY: `base` is the backend's SHM mapping, which covers every
+            // extent its allocator hands out; this replaces pages inside it.
+            let p = unsafe {
+                libc::mmap(
+                    (self.base + off as usize) as *mut libc::c_void,
+                    len as usize,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd,
+                    fo as libc::off_t,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(crate::error::DeviceError::Io(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::shm::WindowPlacer for LocalWindow {
+        fn place(&self, off: u64, len: u64, fd: RawFd, fo: u64, writable: bool) -> Result<()> {
+            let prot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+            self.fixed(off, len, prot, fd, fo)
+        }
+        fn withdraw(&self, off: u64, len: u64) -> Result<()> {
+            self.fixed(
+                off,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                self.memfd,
+                off,
+            )
+        }
+    }
+
     struct Chain {
         be: NvidiaBackend,
         ctl: u64,
         gpu: u64,
         cookie: u64,
+        /// The usermode class the device lists, found by `usermode_object`.
+        usermode: u32,
     }
 
     impl Chain {
@@ -4629,6 +4686,13 @@ mod tests {
             // Not for_test(): its write-combine zone is 16 KiB, and the
             // smallest real mapping here is 64 KiB.
             let mut be = NvidiaBackend::with_default_zones();
+            // A mapping is refused (EOPNOTSUPP) until something can place it
+            // where the guest reaches it. The VMM does that in a real run;
+            // here this process is the VMM, and the window is its own.
+            be.set_window(Box::new(LocalWindow {
+                base: be.shm_base_ptr() as usize,
+                memfd: be.shm_memfd_raw(),
+            }));
             let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
             be.dispatch(&req, &mut resp);
@@ -4639,6 +4703,7 @@ mod tests {
                 ctl,
                 gpu: 0,
                 cookie: 2,
+                usermode: 0,
             };
             // The driver always issues these two before allocating a client.
             // Without them the device allocation is refused with
@@ -4761,6 +4826,65 @@ mod tests {
             u32::from_le_bytes(out[A_NEW..A_NEW + 4].try_into().unwrap())
         }
 
+        /// NV_ESC_RM_CONTROL with inline parameters; returns them as RM
+        /// left them.
+        fn control(&mut self, client: u32, object: u32, cmd: u32, params: &[u8]) -> Vec<u8> {
+            let mut outer = vec![0u8; NVOS54_TOTAL];
+            outer[0..4].copy_from_slice(&client.to_le_bytes());
+            outer[4..8].copy_from_slice(&object.to_le_bytes());
+            outer[NVOS54_CMD..NVOS54_CMD + 4].copy_from_slice(&cmd.to_le_bytes());
+            outer[NVOS54_PARAMS_SIZE..NVOS54_PARAMS_SIZE + 4]
+                .copy_from_slice(&(params.len() as u32).to_le_bytes());
+
+            self.cookie += 1;
+            let mut req = hdr(MsgType::Ioctl, self.ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, NVOS54_TOTAL as u32)
+                        as u32,
+                    data_len: NVOS54_TOTAL as u32,
+                    nested_offset: NVOS54_TOTAL as u32,
+                    nested_len: params.len() as u32,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(&outer);
+            req.extend_from_slice(params);
+
+            let mut resp = vec![0u8; 8192];
+            self.be.dispatch(&req, &mut resp);
+            assert_eq!(parse_resp(&resp).status, 0, "control {cmd:#x}: transport");
+            let out = &resp[IOCTL_BODY..IOCTL_BODY + NVOS54_TOTAL + params.len()];
+            let st = u32::from_le_bytes(out[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
+            assert_eq!(st, 0, "control {cmd:#x}: RM status {st:#x}");
+            out[NVOS54_TOTAL..].to_vec()
+        }
+
+        /// The newest usermode class the device lists.
+        fn usermode_class(&mut self, client: u32, device: u32) -> u32 {
+            let size = 4 + 4 * NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE;
+            let out = self.control(
+                client,
+                device,
+                NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2,
+                &vec![0u8; size],
+            );
+            let n = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
+            let listed: Vec<u32> = out[4..4 + 4 * n.min(NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE)]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let class = *USERMODE_CLASSES
+                .iter()
+                .rev()
+                .find(|c| listed.contains(c))
+                .expect("the device lists no usermode class");
+            eprintln!("usermode class {class:#x} (of {n} classes listed)");
+            class
+        }
+
         /// Build the object chain and return (hClient, hSubdevice, hMemory).
         fn usermode_object(&mut self) -> (u32, u32, u32) {
             let client = self.alloc(0, 0, NV01_ROOT_CLIENT, &[]);
@@ -4777,7 +4901,8 @@ mod tests {
             // NV2080_ALLOC_PARAMETERS is a single subDeviceID.
             let subdevice = self.alloc(client, device, NV20_SUBDEVICE_0, &0u32.to_le_bytes());
 
-            let memory = self.alloc(client, subdevice, TURING_USERMODE_A, &[]);
+            self.usermode = self.usermode_class(client, device);
+            let memory = self.alloc(client, subdevice, self.usermode, &[]);
             (client, subdevice, memory)
         }
 
@@ -4916,21 +5041,47 @@ mod tests {
         let (client, sub, mem) = c.usermode_object();
         let fd = c.map_fd();
 
+        let (uc_before, wc_before, wb_before) = c.be.shm_free_bytes();
         let (off, len, linear) = c.map(client, sub, mem, 65536, fd);
         assert_eq!(len, 65536, "mapped length");
-        assert_ne!(linear, 0, "pLinearAddress should be the SHM offset");
         assert_eq!(
             linear, off,
             "pLinearAddress must be the SHM offset the guest sees"
+        );
+        // Registers are mapped uncached (rmmem.rs), so the extent comes from
+        // the uncached zone. That zone starts the window, which makes offset
+        // 0 a real answer: the first usermode mapping of a session gets it.
+        assert_eq!(
+            c.be.shm_free_bytes(),
+            (uc_before - 65536, wc_before, wb_before),
+            "usermode registers must take 64 KiB of the uncached zone"
+        );
+        assert!(
+            off < ZoneConfig::default_1gib().uc_size,
+            "offset {off:#x} outside UC"
         );
 
         // The SHM window now aliases GPU registers. Reading must not fault.
         let base = c.be.shm_base_ptr();
         assert!(!base.is_null(), "SHM base");
         let first = unsafe { std::ptr::read_volatile(base.add(off as usize) as *const u32) };
-        eprintln!("TURING_USERMODE_A first dword through SHM: {first:#010x}");
+        eprintln!(
+            "usermode {:#x} first dword through SHM: {first:#010x}",
+            c.usermode
+        );
+        // NV_USERMODE_CFG0: the low half is the chip's usermode class, which
+        // the memfd behind an unplaced window would read as zero.
+        assert!(
+            USERMODE_CLASSES.contains(&(first & 0xffff)),
+            "the window does not alias the usermode registers (read {first:#x})"
+        );
 
         c.unmap(client, sub, mem, linear);
+        assert_eq!(
+            c.be.shm_free_bytes(),
+            (uc_before, wc_before, wb_before),
+            "unmap must return the extent"
+        );
         c.be.teardown();
     }
 
@@ -4952,10 +5103,15 @@ mod tests {
 
         let before = c.be.shm_free_bytes();
         for i in 0..50 {
-            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            let class = c.usermode;
+            let mem = c.alloc(client, sub, class, &[]);
             let fd = c.map_fd();
-            let (off, _len, _linear) = c.map(client, sub, mem, 65536, fd);
-            assert_ne!(off, 0, "run {i}: no SHM offset");
+            c.map(client, sub, mem, 65536, fd);
+            assert_ne!(
+                before,
+                c.be.shm_free_bytes(),
+                "run {i}: mapping took no SHM"
+            );
 
             // Exit the way CUDA does: free the object and drop the fd, with no
             // unmap anywhere.
@@ -5002,18 +5158,23 @@ mod tests {
         // during setup has to go before the loop makes its own.
         c.free_obj(client, sub, first);
 
-        // TURING_USERMODE_A permits one mapping per object -- a second map of
+        // The usermode aperture permits one mapping per object -- a second map of
         // a still-mapped object is refused with NV_ERR_STATE_IN_USE -- so each
         // cycle allocates its own.
         let before = c.be.shm_free_bytes();
         let handles_before = c.be.handle_count();
         let cycles = 100;
         for i in 0..cycles {
-            let mem = c.alloc(client, sub, TURING_USERMODE_A, &[]);
+            let class = c.usermode;
+            let mem = c.alloc(client, sub, class, &[]);
             let fd = c.map_fd();
             eprintln!("cycle {i}: mem={mem:#x} fd={fd}");
-            let (off, _len, linear) = c.map(client, sub, mem, 65536, fd);
-            assert_ne!(off, 0, "iteration {i}: no SHM offset");
+            let (_off, _len, linear) = c.map(client, sub, mem, 65536, fd);
+            assert_ne!(
+                before,
+                c.be.shm_free_bytes(),
+                "iteration {i}: mapping took no SHM"
+            );
             c.unmap(client, sub, mem, linear);
             c.free_obj(client, sub, mem);
             c.close_dev(fd);
