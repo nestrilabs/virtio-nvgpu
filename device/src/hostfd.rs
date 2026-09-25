@@ -526,6 +526,52 @@ pub fn prime_import(render: RawFd, dmabuf: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(p[0..4].try_into().unwrap()))
 }
 
+/// `DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT`: `{u32 handle; u32 object_type}`.
+pub const DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT: u32 = ioc(IOC_RW, b'd', 0x4e, 8);
+
+/// `enum drm_nvidia_gem_object_type` (nv_drm_common_ioctl.h:316-322).
+pub const NV_GEM_OBJECT_NVKMS: u32 = 0;
+pub const NV_GEM_OBJECT_DMABUF: u32 = 1;
+pub const NV_GEM_OBJECT_USERMEMORY: u32 = 2;
+pub const NV_GEM_OBJECT_UNKNOWN: u32 = 0x7fff_ffff;
+
+/// `DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT` on `gem` in `render`: what kind of
+/// nvidia-drm object it is.
+pub fn gem_identify(render: RawFd, gem: u32) -> io::Result<u32> {
+    let mut p = [0u8; 8];
+    p[0..4].copy_from_slice(&gem.to_le_bytes());
+    ioctl(render, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, p.as_mut_ptr())?;
+    Ok(u32::from_le_bytes(p[4..8].try_into().unwrap()))
+}
+
+/// The object type a DMABUF_IMPORT reports, from IDENTIFY on the imported
+/// handle, or the errno that fails the import.
+///
+/// A PRIME import into nvidia-drm yields one of three kinds of object: the
+/// exporter's own NVKMS memory when the dma-buf came from this device (the
+/// self-import fast path), and otherwise a dma-buf-backed object
+/// (nvidia-drm-gem-dma-buf.c:134-163) -- a host iGPU's buffer, a udmabuf, a
+/// v4l2 frame -- or, for a re-imported user-memory export, that. The guest's
+/// proxy used to call every one of them NVKMS, so the guest compositor's
+/// EXPORT_NVKMS_MEMORY, which refuses a dma-buf object
+/// (nvidia-drm-gem-nvkms-memory.c:595-603), failed where on bare metal it
+/// never tries. UNKNOWN is a handle that is none of those, which an import
+/// cannot legitimately produce: refused (EINVAL). IDENTIFY itself refuses
+/// with EOPNOTSUPP on a node without DRIVER_MODESET (nvidia-drm-gem.c:318-320,
+/// nvidia_drm.modeset=0), where no NVKMS object can exist -- they need the
+/// NVKMS device -- so the import is a dma-buf object.
+pub fn import_type(identified: io::Result<u32>) -> Result<u32, i32> {
+    match identified {
+        Ok(t @ (NV_GEM_OBJECT_NVKMS | NV_GEM_OBJECT_DMABUF | NV_GEM_OBJECT_USERMEMORY)) => Ok(t),
+        Ok(t) => {
+            log::warn!("DMABUF_IMPORT: the imported object identifies as {t:#x}; refused");
+            Err(libc::EINVAL)
+        }
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(NV_GEM_OBJECT_DMABUF),
+        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
 /// `DRM_IOCTL_GEM_CLOSE`, for undoing an import whose reply cannot be sent.
 pub fn gem_close(file: RawFd, gem: u32) -> io::Result<()> {
     let mut p = [0u8; 8];
@@ -561,6 +607,69 @@ pub fn sync_file_status(fd: RawFd) -> io::Result<i32> {
     let mut p = [0u8; 56];
     ioctl(fd, SYNC_IOC_FILE_INFO, p.as_mut_ptr())?;
     Ok(i32::from_le_bytes(p[32..36].try_into().unwrap()))
+}
+
+/// `struct sync_fence_info` (sync_file.h:46-52): obj_name[32],
+/// driver_name[32], s32 status, u32 flags, u64 timestamp_ns.
+const SYNC_FENCE_INFO_SIZE: usize = 80;
+const SYNC_FENCE_INFO_STATUS: usize = 64;
+const SYNC_FENCE_INFO_TIMESTAMP: usize = 72;
+
+/// More fences than a sync_file is asked about one by one. A merge of more
+/// is still reported, only without a timestamp.
+const SYNC_FENCE_INFO_MAX: usize = 64;
+
+/// A sync_file's status (as [`sync_file_status`]) and, once it has
+/// signalled, when: the latest of its fences' signal times, in
+/// `CLOCK_MONOTONIC` ns (`dma_fence_timestamp`, sync_file.c:268-292), or 0
+/// where the kernel gave none.
+///
+/// The guest proxy signals with this time rather than when the record
+/// reaches it (a third of a millisecond later), and NVIDIA's ICD reads it
+/// back through FILE_INFO (glcore 0xa13870).
+pub fn sync_file_signalled(fd: RawFd) -> io::Result<(i32, u64)> {
+    let mut p = [0u8; 56];
+    ioctl(fd, SYNC_IOC_FILE_INFO, p.as_mut_ptr())?;
+    let status = i32::from_le_bytes(p[32..36].try_into().unwrap());
+    let n = u32::from_le_bytes(p[40..44].try_into().unwrap()) as usize;
+    if status != 1 || n == 0 || n > SYNC_FENCE_INFO_MAX {
+        return Ok((status, 0));
+    }
+    // The fences of a sync_file are fixed when it is made, so the count
+    // just read is the count the kernel will fill.
+    let mut infos = vec![0u8; n * SYNC_FENCE_INFO_SIZE];
+    let mut q = [0u8; 56];
+    q[40..44].copy_from_slice(&(n as u32).to_le_bytes());
+    q[48..56].copy_from_slice(&(infos.as_mut_ptr() as u64).to_le_bytes());
+    // The kernel writes n records to `infos`, which is exactly that long
+    // (sync_file_ioctl_fence_info refuses an n smaller than the count).
+    if ioctl(fd, SYNC_IOC_FILE_INFO, q.as_mut_ptr()).is_err() {
+        return Ok((status, 0));
+    }
+    Ok((status, latest_signal(&infos)))
+}
+
+/// The latest signal time among `struct sync_fence_info` records, counting
+/// only signalled fences; 0 if none says.
+fn latest_signal(infos: &[u8]) -> u64 {
+    infos
+        .chunks_exact(SYNC_FENCE_INFO_SIZE)
+        .filter(|r| {
+            i32::from_le_bytes(
+                r[SYNC_FENCE_INFO_STATUS..SYNC_FENCE_INFO_STATUS + 4]
+                    .try_into()
+                    .unwrap(),
+            ) == 1
+        })
+        .map(|r| {
+            u64::from_le_bytes(
+                r[SYNC_FENCE_INFO_TIMESTAMP..SYNC_FENCE_INFO_TIMESTAMP + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// A fresh eventfd for a syncobj wait registration.
@@ -725,6 +834,69 @@ fn udmabuf_signaled_sync_file() -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    fn fence_info(status: i32, ts: u64) -> Vec<u8> {
+        let mut r = vec![0u8; SYNC_FENCE_INFO_SIZE];
+        r[..5].copy_from_slice(b"nvkms");
+        r[SYNC_FENCE_INFO_STATUS..SYNC_FENCE_INFO_STATUS + 4]
+            .copy_from_slice(&status.to_le_bytes());
+        r[SYNC_FENCE_INFO_TIMESTAMP..SYNC_FENCE_INFO_TIMESTAMP + 8]
+            .copy_from_slice(&ts.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn a_merged_fence_signalled_when_its_last_part_did() {
+        let infos = [
+            fence_info(1, 5_000),
+            fence_info(1, 9_000),
+            fence_info(1, 7_000),
+        ]
+        .concat();
+        assert_eq!(latest_signal(&infos), 9_000);
+    }
+
+    #[test]
+    fn unsignalled_and_failed_fences_give_no_time() {
+        let infos = [fence_info(0, 0), fence_info(-110, 8_000)].concat();
+        assert_eq!(latest_signal(&infos), 0);
+        assert_eq!(latest_signal(&[]), 0);
+    }
+
+    #[test]
+    fn identify_has_nvidia_drms_number() {
+        assert_eq!(DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, 0xC008_644E);
+    }
+
+    #[test]
+    fn an_imported_foreign_dmabuf_is_reported_as_one() {
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_DMABUF)),
+            Ok(NV_GEM_OBJECT_DMABUF)
+        );
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_NVKMS)),
+            Ok(NV_GEM_OBJECT_NVKMS)
+        );
+        assert_eq!(
+            import_type(Ok(NV_GEM_OBJECT_USERMEMORY)),
+            Ok(NV_GEM_OBJECT_USERMEMORY)
+        );
+    }
+
+    #[test]
+    fn an_import_that_identifies_as_unknown_is_refused() {
+        assert_eq!(import_type(Ok(NV_GEM_OBJECT_UNKNOWN)), Err(libc::EINVAL));
+        assert_eq!(import_type(Ok(3)), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn a_node_without_modeset_imports_dmabuf_objects() {
+        let e = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert_eq!(import_type(Err(e)), Ok(NV_GEM_OBJECT_DMABUF));
+        let e = io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(import_type(Err(e)), Err(libc::EBADF));
+    }
 
     /// The numbers are computed, so check a few against their uapi values.
     #[test]
@@ -1056,6 +1228,11 @@ mod tests {
                 // Merging two signalled fences gives a signalled fence.
                 let m = sync_merge(fd.as_raw_fd(), fd.as_raw_fd()).unwrap();
                 assert_eq!(sync_file_status(m.as_raw_fd()).unwrap(), 1);
+                // ...and a signal time no later than now, from the per-fence
+                // array the kernel really fills.
+                let (status, at) = sync_file_signalled(m.as_raw_fd()).unwrap();
+                assert_eq!(status, 1);
+                assert!(at <= crate::session::monotonic_ns());
             }
             Err(e) => eprintln!("SKIP a_signaled_sync_file_reports_signalled: {e}"),
         }

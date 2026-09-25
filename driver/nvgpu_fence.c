@@ -25,7 +25,9 @@
  *
  * Handing a guest fence back to a host consumer is "unwrap": our own proxy
  * gives its handle; a merge of our proxies becomes a host merge; anything the
- * host cannot see is waited for here.
+ * host cannot see is waited for here -- by a callback for SEMSURF_FENCE_WAIT,
+ * which returns at once as natively (nvgpu_semsurf_defer), and by sleeping
+ * for syncobj IMPORT_SYNC_FILE and a committing IN_FENCE_FD.
  *
  * Nothing may wait on the host. A syncobj wait is forwarded as a poll (the
  * backend clamps its timeout to zero, device/src/fence.rs), and the sleeping
@@ -53,6 +55,7 @@
 #include <drm/drm_utils.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/dma-fence.h>
+#include <linux/dma-resv.h>
 #include <linux/err.h>
 #include <linux/eventfd.h>
 #include <linux/fcntl.h>
@@ -69,6 +72,7 @@
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/xarray.h>
 
 #include "nvgpu.h"
@@ -224,27 +228,44 @@ static void nvgpu_host_fence_deliver(struct nvgpu_ev_consumer *c, u32 kind,
                            "which is neither signalled nor an error; "
                            "signalling it anyway\n",
                            f->handle, status);
-    dma_fence_signal(&f->base);
+    /*
+     * With the host's own signal time where the backend sent one: the ICD
+     * reads a fence's timestamp back through FILE_INFO (glcore 0xa13870, the
+     * sync-fd ops' slot 0x30), and the time this record arrived is the
+     * host's plus the trip here, about a third of a millisecond. Moved into
+     * the guest's clock, and never later than now -- the slewed offset could
+     * otherwise put it a hair in the future, and a fence that signals after
+     * it was seen signalled is a contradiction.
+     */
+    if (ev.timestamp_ns) {
+      s64 at = nvgpu_host_to_guest_ns(e->dev,
+                                      (s64)le64_to_cpu(ev.timestamp_ns));
+      s64 now = ktime_get_ns();
+
+      dma_fence_signal_timestamp(&f->base, ns_to_ktime(min(at, now)));
+    } else {
+      dma_fence_signal(&f->base);
+    }
   }
   dma_fence_put(&f->base);
 }
 
 /*
- * A guest sync_file for host sync_file `handle`. On failure `handle` is
- * closed only if `own`; an IOCTL2 fd_out hook passes false, because the
- * interpreter closes what a failing hook was given.
+ * A proxy dma_fence for host sync_file `handle`, with one reference, which
+ * signals when the host's does. On failure `handle` is closed only if `own`;
+ * an IOCTL2 fd_out hook passes false, because the interpreter closes what a
+ * failing hook was given.
  */
-static int nvgpu_host_fence_fd(struct nvgpu_device *dev, u32 handle,
-                               int o_flags, bool own) {
+static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
+                                              u32 handle, bool own) {
   struct nvgpu_host_fence *f;
   struct nvgpu_fence_ev *e;
-  struct sync_file *sync;
   u64 cookie;
-  int fd, ret;
+  int ret;
 
   nvgpu_fence_reap();
   if (!handle)
-    return -EINVAL;
+    return ERR_PTR(-EINVAL);
   f = kzalloc(sizeof(*f), GFP_KERNEL);
   e = kzalloc(sizeof(*e), GFP_KERNEL);
   if (!f || !e) {
@@ -289,8 +310,32 @@ static int nvgpu_host_fence_fd(struct nvgpu_device *dev, u32 handle,
                          handle, ret);
     goto put;
   }
+  return &f->base;
 
-  sync = sync_file_create(&f->base);
+put:
+  if (!own)
+    f->handle = 0; /* the caller's to close; release closes nothing */
+  dma_fence_put(&f->base);
+  return ERR_PTR(ret);
+
+fail_free:
+  kfree(f);
+  kfree(e);
+  if (own)
+    nvgpu_close_handle(dev, handle);
+  return ERR_PTR(ret);
+}
+
+/* A guest sync_file for host sync_file `handle`; `own` as above. */
+static int nvgpu_host_fence_fd(struct nvgpu_device *dev, u32 handle,
+                               int o_flags, bool own) {
+  struct dma_fence *base = nvgpu_host_fence_new(dev, handle, own);
+  struct sync_file *sync;
+  int fd, ret;
+
+  if (IS_ERR(base))
+    return PTR_ERR(base);
+  sync = sync_file_create(base);
   if (!sync) {
     ret = -ENOMEM;
     goto put;
@@ -298,26 +343,21 @@ static int nvgpu_host_fence_fd(struct nvgpu_device *dev, u32 handle,
   fd = get_unused_fd_flags(o_flags & O_CLOEXEC);
   if (fd < 0) {
     ret = fd;
+    /* Before the fput: the sync_file's release may drop the last
+     * reference first, and must then close nothing that is not ours. */
     if (!own)
-      f->handle = 0;
+      container_of(base, struct nvgpu_host_fence, base)->handle = 0;
     fput(sync->file);
     goto put;
   }
   fd_install(fd, sync->file);
-  dma_fence_put(&f->base); /* the sync_file holds its own */
+  dma_fence_put(base); /* the sync_file holds its own */
   return fd;
 
 put:
   if (!own)
-    f->handle = 0; /* the caller's to close; release closes nothing */
-  dma_fence_put(&f->base);
-  return ret;
-
-fail_free:
-  kfree(f);
-  kfree(e);
-  if (own)
-    nvgpu_close_handle(dev, handle);
+    container_of(base, struct nvgpu_host_fence, base)->handle = 0;
+  dma_fence_put(base);
   return ret;
 }
 
@@ -333,9 +373,9 @@ int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
 
 /* ───────── unwrap: a guest fence, for a host consumer ───────── */
 
-/* Components of a fence array or chain we merge on the host at most; past
- * that the guest waits (it is correct, only slower). */
-#define NVGPU_UNWRAP_MAX 64
+/* nvgpu_fence_unwrap_ex()'s answer for a fence the host has no counterpart of,
+ * not signalled yet, when the caller asked not to wait for it. */
+#define NVGPU_UNWRAP_FOREIGN 2
 
 static struct nvgpu_host_fence *nvgpu_host_fence_of(struct nvgpu_device *dev,
                                                     struct dma_fence *f) {
@@ -379,8 +419,15 @@ static int nvgpu_fence_merge(struct nvgpu_device *dev, const u32 *hs, u32 n,
   return 0;
 }
 
-static int nvgpu_fence_unwrap(struct nvgpu_device *dev, struct dma_fence *f,
-                              u32 *handle, bool *owned) {
+/*
+ * A guest fence as one host sync_file: 0 with its handle (*owned when it is a
+ * new one, the caller's to consume), 1 when there is nothing left to wait
+ * for, <0 on error. A fence only the guest can see is waited for here when
+ * `wait`, else NVGPU_UNWRAP_FOREIGN is returned and the caller waits its own
+ * way (0x56 without blocking, nvgpu_semsurf_defer).
+ */
+static int nvgpu_fence_unwrap_ex(struct nvgpu_device *dev, struct dma_fence *f,
+                                 u32 *handle, bool *owned, bool wait) {
   struct nvgpu_host_fence *hf = nvgpu_host_fence_of(dev, f);
   long waited;
 
@@ -395,36 +442,47 @@ static int nvgpu_fence_unwrap(struct nvgpu_device *dev, struct dma_fence *f,
    * before handing one on (R:fences §2.1), so a dma_fence_array of our
    * proxies is the common case, not a curiosity. Its unsignalled components,
    * if all ours, merge on the host into one fence the host consumer can
-   * take; the array itself exists only here.
+   * take; the array itself exists only here. However many there are: the
+   * merge runs five at a time (nvgpu_fence_merge), so a large array costs
+   * round trips, where a cap on it used to make the caller wait here for a
+   * fence the host could have waited on.
    */
   if (dma_fence_is_array(f) || dma_fence_is_chain(f)) {
     struct dma_fence_unwrap cur;
     struct dma_fence *c;
     bool foreign = false;
-    u32 *hs, n = 0, i;
+    u32 *hs, n = 0, max = 0, i;
     int ret;
 
-    hs = kmalloc_array(NVGPU_UNWRAP_MAX, sizeof(*hs), GFP_KERNEL);
-    if (!hs)
-      return -ENOMEM;
-    /* Walked to the end even once the answer is known: the cursor holds a
-     * reference that only the walk's own end drops. */
+    /* Counted first, then collected: the components are fixed when the
+     * array or chain is made, and one that signals between the two walks
+     * only makes the second find fewer. Each walk runs to its end even once
+     * the answer is known: the cursor holds a reference only the end drops. */
     dma_fence_unwrap_for_each(c, &cur, f) {
-      struct nvgpu_host_fence *hc;
-
       if (foreign || dma_fence_is_signaled(c))
         continue;
-      hc = nvgpu_host_fence_of(dev, c);
-      if (!hc || n == NVGPU_UNWRAP_MAX) {
+      if (!nvgpu_host_fence_of(dev, c))
         foreign = true;
-        continue;
-      }
-      for (i = 0; i < n && hs[i] != hc->handle; i++)
-        ;
-      if (i == n)
-        hs[n++] = hc->handle;
+      else
+        max++;
     }
     if (!foreign) {
+      hs = kvmalloc_array(max ? max : 1, sizeof(*hs), GFP_KERNEL);
+      if (!hs)
+        return -ENOMEM;
+      dma_fence_unwrap_for_each(c, &cur, f) {
+        struct nvgpu_host_fence *hc;
+
+        if (n == max || dma_fence_is_signaled(c))
+          continue;
+        hc = nvgpu_host_fence_of(dev, c);
+        if (!hc)
+          continue;
+        for (i = 0; i < n && hs[i] != hc->handle; i++)
+          ;
+        if (i == n)
+          hs[n++] = hc->handle;
+      }
       if (n == 0) {
         ret = 1;
       } else if (n == 1) {
@@ -434,20 +492,24 @@ static int nvgpu_fence_unwrap(struct nvgpu_device *dev, struct dma_fence *f,
         ret = nvgpu_fence_merge(dev, hs, n, handle);
         *owned = !ret;
       }
-      kfree(hs);
+      kvfree(hs);
       return ret;
     }
-    kfree(hs);
   }
 
   if (dma_fence_is_signaled(f))
     return 1;
+  if (!wait)
+    return NVGPU_UNWRAP_FOREIGN;
   /*
    * A fence the host has no counterpart of: another guest driver's, sw_sync,
    * a guest-CPU fence. The host cannot wait on it, so the guest does, here,
    * before the host is told there is nothing to wait for (R:fences §3.7,
    * step 4). Interruptible and unbounded, like the native waits on such a
-   * fence; its error, if it has one, is not carried over.
+   * fence; its error, if it has one, is not carried over. Native never
+   * blocks here -- the host kernel takes a callback -- which is what 0x56
+   * now does too; syncobj IMPORT_SYNC_FILE and a committing IN_FENCE_FD
+   * still wait.
    */
   waited = dma_fence_wait(f, true);
   return waited < 0 ? (int)waited : 1;
@@ -463,7 +525,7 @@ int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
   f = sync_file_get_fence(fd);
   if (!f)
     return -EINVAL; /* as the kernel says for a descriptor that is not one */
-  ret = nvgpu_fence_unwrap(dev, f, handle, owned);
+  ret = nvgpu_fence_unwrap_ex(dev, f, handle, owned, true);
   dma_fence_put(f);
   return ret;
 }
@@ -479,8 +541,11 @@ struct nvgpu_fence_call {
   bool in_used;
   u32 in_handle;
   u32 in_flags;
-  /* FD_OUT: the kind the call must produce. */
+  /* FD_OUT: the kind the call must produce, and whether the sync_file is
+   * wanted as a proxy fence (`fence`, referenced) rather than a descriptor. */
   u32 want_kind;
+  bool want_fence;
+  struct dma_fence *fence;
   /* GEM_IN: (offset in the argument) -> (owner file, host handle). */
   u32 ngem;
   struct {
@@ -535,6 +600,15 @@ static int nvgpu_fence_hook_fd_out(struct nvgpu_i2_call *call, u32 buf,
                          "%u where kind %u was due; refused\n",
                          kind, p->want_kind);
     return -EPROTO;
+  }
+  if (kind == NVGPU_HK_SYNC_FILE && p->want_fence) {
+    struct dma_fence *f = nvgpu_host_fence_new(call->dev, handle, false);
+
+    if (IS_ERR(f))
+      return PTR_ERR(f);
+    p->fence = f;
+    *user_value = -1;
+    return 0;
   }
   if (kind == NVGPU_HK_SYNC_FILE)
     fd = nvgpu_fence_from_handle_noclose(call->dev, handle, O_CLOEXEC);
@@ -1476,10 +1550,18 @@ struct nvgpu_fence_ctx {
   struct nvgpu_device *dev;
   struct nvgpu_fd *owner; /* referenced: its render handle holds the object */
   u32 host_handle;
+  /* SEMSURF_FENCE_WAITs still waiting on a guest-only fence, which the
+   * context's end cancels (nvgpu_semsurf_defer). */
+  spinlock_t lock;
+  struct list_head pending;
 };
+
+static void nvgpu_semsurf_cancel_all(struct nvgpu_fence_ctx *ctx);
 
 static void nvgpu_fence_ctx_free(struct drm_gem_object *obj) {
   struct nvgpu_fence_ctx *ctx = container_of(obj, struct nvgpu_fence_ctx, base);
+
+  nvgpu_semsurf_cancel_all(ctx);
 
   if (ctx->host_handle)
     nvgpu_gem_close(ctx->dev, ctx->owner->handle, ctx->host_handle);
@@ -1514,6 +1596,8 @@ static int nvgpu_fence_ctx_create(struct nvgpu_fence_call *p, u32 host_handle,
   nvgpu_fd_get(p->nfd);
   ctx->owner = p->nfd;
   ctx->host_handle = host_handle;
+  spin_lock_init(&ctx->lock);
+  INIT_LIST_HEAD(&ctx->pending);
   ret = drm_gem_handle_create(p->file, &ctx->base, guest_handle);
   if (ret)
     ctx->host_handle = 0;
@@ -1659,6 +1743,10 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
   }
 }
 
+static void nvgpu_semsurf_mirror(struct nvgpu_fence_ctx *ctx,
+                                 struct nvgpu_gem_object *ng,
+                                 const struct nvgpu_semsurf_attach *a);
+
 static long nvgpu_semsurf_attach(struct nvgpu_fence_call *p, unsigned int cmd,
                                  void __user *uarg) {
   struct nvgpu_semsurf_attach a;
@@ -1694,14 +1782,27 @@ static long nvgpu_semsurf_attach(struct nvgpu_fence_call *p, unsigned int cmd,
     p->gem[1].gem = ctx->host_handle;
     ret = nvgpu_fence_call(p, target->handle, cmd, &a, true);
   }
+  if (!ret && (p->nfd->dev->backend_caps & NVGPU_BCAP_KMS_CARD))
+    nvgpu_semsurf_mirror(ctx, ng, &a);
   drm_gem_object_put(&ng->base);
   drm_gem_object_put(&ctx->base);
   return ret;
 }
 
-/* FENCE_CREATE and FENCE_WAIT: the fence context, then the call on its
- * file (which is the caller's: a context cannot leave the file it was made
- * in, since nothing exports it). */
+/* A call on a fence context's file (which is the caller's: a context cannot
+ * leave the file it was made in, since nothing exports it), the context's
+ * handle in the argument at offset 0 in every struct that has one. */
+static long nvgpu_semsurf_ctx_call(struct nvgpu_fence_call *p,
+                                   unsigned int cmd, void *karg,
+                                   struct nvgpu_fence_ctx *ctx) {
+  p->ngem = 1;
+  p->gem[0].off = 0; /* fence_context_handle @0 in both */
+  p->gem[0].owner = ctx->owner->handle;
+  p->gem[0].gem = ctx->host_handle;
+  return nvgpu_fence_call(p, ctx->owner->handle, cmd, karg, true);
+}
+
+/* FENCE_CREATE: the fence context, then the call on its file. */
 static long nvgpu_semsurf_on_ctx(struct nvgpu_fence_call *p, unsigned int cmd,
                                  void *karg, u32 ctx_handle) {
   struct nvgpu_fence_ctx *ctx = nvgpu_fence_ctx_lookup(p->file, ctx_handle);
@@ -1712,13 +1813,199 @@ static long nvgpu_semsurf_on_ctx(struct nvgpu_fence_call *p, unsigned int cmd,
       nvgpu_close_handle(p->nfd->dev, p->in_handle);
     return -EINVAL;
   }
-  p->ngem = 1;
-  p->gem[0].off = 0; /* fence_context_handle @0 in both */
-  p->gem[0].owner = ctx->owner->handle;
-  p->gem[0].gem = ctx->host_handle;
-  ret = nvgpu_fence_call(p, ctx->owner->handle, cmd, karg, true);
+  ret = nvgpu_semsurf_ctx_call(p, cmd, karg, ctx);
   drm_gem_object_put(&ctx->base);
   return ret;
+}
+
+/*
+ * FENCE_WAIT with nothing left to wait for. The fence field cannot be empty
+ * (the host looks the descriptor up, nvidia-drm-fence.c:1692), so an
+ * already-signalled host sync_file stands in for it: the host's
+ * pre-wait-then-post ordering holds unchanged.
+ */
+static long nvgpu_semsurf_wait_signalled(struct nvgpu_fence_ctx *ctx,
+                                         unsigned int cmd,
+                                         struct nvgpu_semsurf_wait *a) {
+  struct nvgpu_fence_call p = {.nfd = ctx->owner};
+  u64 res[1];
+  long ret;
+
+  ret = nvgpu_host_op(ctx->dev, NVGPU_OP_SIGNALED_SYNC_FILE, NULL, 0, res, 1);
+  if (ret)
+    return ret;
+  if (!res[0] || res[0] > U32_MAX)
+    return -EPROTO;
+  p.has_in = true;
+  p.in_handle = (u32)res[0];
+  p.in_flags = NVGPU_I2_FD_CONSUME;
+  return nvgpu_semsurf_ctx_call(&p, cmd, a, ctx);
+}
+
+/*
+ * FENCE_WAIT on a fence only the guest can see -- another guest driver's,
+ * sw_sync, a CPU fence -- without blocking the caller, as the host does it
+ * natively: a callback on the fence, and the second half (the post write)
+ * when it fires (nvidia-drm-fence.c:1682-1729). Here the second half is the
+ * forward itself, with a signalled stand-in fence, run from a work item
+ * because it is a round trip. The ioctl returns 0 at once, as native does
+ * whatever happens later; a failed forward is logged.
+ *
+ * The wait hangs off its context and does not keep it alive: natively a
+ * context's end drops the waits pending on it (nv_drm_semsurf_fence_ctx
+ * free), and so does this one's (nvgpu_semsurf_cancel_all). The work item
+ * checks the context is still alive, under its lock, before touching
+ * anything; the cancel either takes the callback back or waits the work
+ * item out. A 0x55 fence was not used as the stand-in because it
+ * force-signals after its timeout (5 s at most), which a guest-only fence
+ * need not respect.
+ */
+struct nvgpu_semsurf_defer {
+  struct dma_fence_cb cb;
+  struct work_struct work;
+  struct list_head node;       /* ctx->pending, under ctx->lock */
+  struct nvgpu_fence_ctx *ctx; /* not referenced: its end cancels this */
+  struct dma_fence *fence;     /* referenced */
+  unsigned int cmd;
+  struct nvgpu_semsurf_wait a;
+};
+
+static void nvgpu_semsurf_defer_work(struct work_struct *work) {
+  struct nvgpu_semsurf_defer *d =
+      container_of(work, struct nvgpu_semsurf_defer, work);
+  struct nvgpu_fence_ctx *ctx = d->ctx;
+  unsigned long flags;
+  bool live;
+  long ret;
+
+  spin_lock_irqsave(&ctx->lock, flags);
+  live = kref_get_unless_zero(&ctx->base.refcount);
+  if (live)
+    list_del(&d->node);
+  spin_unlock_irqrestore(&ctx->lock, flags);
+  if (!live)
+    return; /* the context is ending: its cancel frees this */
+
+  ret = nvgpu_semsurf_wait_signalled(ctx, d->cmd, &d->a);
+  if (ret)
+    dev_warn_ratelimited(&ctx->dev->vdev->dev,
+                         "virtio-gpu-nv: SEMSURF_FENCE_WAIT after a guest "
+                         "fence signalled: the host refused it (%ld)\n",
+                         ret);
+  drm_gem_object_put(&ctx->base);
+  dma_fence_put(d->fence);
+  kfree(d);
+}
+
+static void nvgpu_semsurf_defer_cb(struct dma_fence *f,
+                                   struct dma_fence_cb *cb) {
+  struct nvgpu_semsurf_defer *d =
+      container_of(cb, struct nvgpu_semsurf_defer, cb);
+
+  queue_work(system_unbound_wq, &d->work);
+}
+
+/* Takes its own reference on `f`. */
+static long nvgpu_semsurf_defer(struct nvgpu_fence_ctx *ctx, unsigned int cmd,
+                                const struct nvgpu_semsurf_wait *a,
+                                struct dma_fence *f) {
+  struct nvgpu_semsurf_defer *d = kzalloc(sizeof(*d), GFP_KERNEL);
+  unsigned long flags;
+  long ret;
+
+  if (!d)
+    return -ENOMEM;
+  INIT_WORK(&d->work, nvgpu_semsurf_defer_work);
+  d->ctx = ctx;
+  d->fence = dma_fence_get(f);
+  d->cmd = cmd;
+  d->a = *a;
+  spin_lock_irqsave(&ctx->lock, flags);
+  list_add_tail(&d->node, &ctx->pending);
+  spin_unlock_irqrestore(&ctx->lock, flags);
+  if (!dma_fence_add_callback(f, &d->cb, nvgpu_semsurf_defer_cb))
+    return 0;
+
+  /* Signalled meanwhile (or, as the host treats any failure here, as good
+   * as): the second half now, as native does (nvidia-drm-fence.c:1717-1729). */
+  spin_lock_irqsave(&ctx->lock, flags);
+  list_del(&d->node);
+  spin_unlock_irqrestore(&ctx->lock, flags);
+  ret = nvgpu_semsurf_wait_signalled(ctx, cmd, &d->a);
+  dma_fence_put(d->fence);
+  kfree(d);
+  return ret;
+}
+
+/* The context is ending (its last reference; process context): every wait
+ * still pending on it is dropped, as natively. */
+static void nvgpu_semsurf_cancel_all(struct nvgpu_fence_ctx *ctx) {
+  struct nvgpu_semsurf_defer *d, *n;
+  unsigned long flags;
+  LIST_HEAD(gone);
+
+  spin_lock_irqsave(&ctx->lock, flags);
+  list_splice_init(&ctx->pending, &gone);
+  spin_unlock_irqrestore(&ctx->lock, flags);
+  list_for_each_entry_safe(d, n, &gone, node) {
+    /* Fired already: its work item is queued or running, and finds the
+     * context dead (refcount zero) without touching the list. */
+    if (!dma_fence_remove_callback(d->fence, &d->cb))
+      cancel_work_sync(&d->work);
+    dma_fence_put(d->fence);
+    kfree(d);
+  }
+}
+
+/*
+ * SEMSURF_FENCE_ATTACH, mirrored into the guest buffer's reservation object
+ * in compositor-VM mode. The host attaches its fence to the host object's
+ * resv (nvidia-drm-fence.c:1764-1813), which host scanout sees; a guest
+ * compositor's implicit sync reads the guest proxy's resv (EXPORT_SYNC_FILE,
+ * poll on the dma-buf), which stayed empty. A host SEMSURF_FENCE_CREATE on
+ * the same context, value and timeout makes a fence that signals when the
+ * attached one does; its proxy goes into the guest resv, shared or
+ * exclusive as the attach said (READ / WRITE, nvidia-dma-resv-helper.h). One
+ * more round trip per attach, so only where a guest compositor reads the
+ * resv. A failure leaves the attach done and the resv as it was.
+ */
+static void nvgpu_semsurf_mirror(struct nvgpu_fence_ctx *ctx,
+                                 struct nvgpu_gem_object *ng,
+                                 const struct nvgpu_semsurf_attach *a) {
+  struct nvgpu_semsurf_create c = {
+      .timeout_value_ms = a->timeout_value_ms,
+      .wait_value = a->wait_value,
+      .fd = -1,
+  };
+  struct nvgpu_fence_call p = {
+      .nfd = ctx->owner,
+      .want_kind = NVGPU_HK_SYNC_FILE,
+      .want_fence = true,
+  };
+  struct dma_resv *resv = ng->base.resv;
+  long ret;
+
+  ret = nvgpu_semsurf_ctx_call(&p, NVGPU_IOCTL_SEMSURF_CREATE, &c, ctx);
+  if (!ret && !p.fence)
+    ret = -EPROTO;
+  if (!ret) {
+    ret = dma_resv_lock_interruptible(resv, NULL);
+    if (!ret) {
+      ret = dma_resv_reserve_fences(resv, 1);
+      if (!ret)
+        dma_resv_add_fence(resv, p.fence,
+                           a->shared ? DMA_RESV_USAGE_READ
+                                     : DMA_RESV_USAGE_WRITE);
+      dma_resv_unlock(resv);
+    }
+  }
+  if (p.fence)
+    dma_fence_put(p.fence);
+  if (ret)
+    dev_warn_ratelimited(&ctx->dev->vdev->dev,
+                         "virtio-gpu-nv: SEMSURF_FENCE_ATTACH done, but not "
+                         "mirrored into the guest buffer's resv: %ld\n",
+                         ret);
 }
 
 long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
@@ -1751,36 +2038,39 @@ long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
 
   case _IOC_NR(NVGPU_IOCTL_SEMSURF_WAIT): {
     struct nvgpu_semsurf_wait a;
+    struct nvgpu_fence_ctx *ctx;
+    struct dma_fence *f;
     bool owned;
 
     ret = nvgpu_fence_copy_in(cmd, NVGPU_IOCTL_SEMSURF_WAIT, &a, uarg);
     if (ret)
       return ret;
-    /*
-     * The fence to wait on, as the host sees it. One that is already
-     * signalled has no host counterpart to name, and the field cannot be
-     * empty (the host looks the descriptor up, nvidia-drm-fence.c:1692), so
-     * an already-signalled host sync_file stands in for it: the host's
-     * pre-wait-then-post ordering holds unchanged.
-     */
-    ret = nvgpu_fence_unwrap_fd(nfd->dev, a.fd, &p.in_handle, &owned);
-    if (ret < 0)
-      return ret;
-    if (ret == 1) {
-      u64 res[1];
-
-      ret = nvgpu_host_op(nfd->dev, NVGPU_OP_SIGNALED_SYNC_FILE, NULL, 0, res,
-                          1);
-      if (ret)
-        return ret;
-      if (!res[0] || res[0] > U32_MAX)
-        return -EPROTO;
-      p.in_handle = (u32)res[0];
-      owned = true;
+    ctx = nvgpu_fence_ctx_lookup(file, a.fence_context_handle);
+    if (!ctx)
+      return -EINVAL;
+    f = sync_file_get_fence(a.fd);
+    if (!f) {
+      drm_gem_object_put(&ctx->base);
+      return -EINVAL; /* as the kernel says for a descriptor that is not one */
     }
-    p.has_in = true;
-    p.in_flags = owned ? NVGPU_I2_FD_CONSUME : 0;
-    return nvgpu_semsurf_on_ctx(&p, cmd, &a, a.fence_context_handle);
+    /*
+     * The fence to wait on, as the host sees it: a host sync_file (ours, or
+     * a host merge of ours), nothing at all (signalled already), or one only
+     * the guest can see, which is waited for without blocking the caller.
+     */
+    ret = nvgpu_fence_unwrap_ex(nfd->dev, f, &p.in_handle, &owned, false);
+    if (ret == 0) {
+      p.has_in = true;
+      p.in_flags = owned ? NVGPU_I2_FD_CONSUME : 0;
+      ret = nvgpu_semsurf_ctx_call(&p, cmd, &a, ctx);
+    } else if (ret == 1) {
+      ret = nvgpu_semsurf_wait_signalled(ctx, cmd, &a);
+    } else if (ret == NVGPU_UNWRAP_FOREIGN) {
+      ret = nvgpu_semsurf_defer(ctx, cmd, &a, f);
+    }
+    dma_fence_put(f);
+    drm_gem_object_put(&ctx->base);
+    return ret;
   }
 
   case _IOC_NR(NVGPU_IOCTL_SEMSURF_ATTACH):

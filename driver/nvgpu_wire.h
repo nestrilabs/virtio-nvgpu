@@ -261,6 +261,21 @@ struct nvgpu_time_sync_resp {
   __le64 host_mono_ns; /* CLOCK_MONOTONIC, stamped just before add_used */
 } __packed;
 
+/*
+ * The same reply, with the host's other two clocks read in the same instant:
+ * what RM stamps GPU/CPU time correlation samples with (0x20800406: OSTIME is
+ * CLOCK_REALTIME in us, PLATFORM_API is CLOCK_MONOTONIC_RAW in ns), which the
+ * guest rebases per clock. Sent only when the reply buffer has room for it,
+ * so a guest that posts the 8-byte form gets that; a backend that predates it
+ * fills 8 bytes of a larger buffer, which the used length says.
+ */
+struct nvgpu_time_sync_resp2 {
+  __le64 host_mono_ns;
+  __le64 host_realtime_ns; /* CLOCK_REALTIME */
+  __le64 host_mono_raw_ns; /* CLOCK_MONOTONIC_RAW */
+  __le64 reserved;
+} __packed;
+
 /* ── IOCTL2: a vectored ioctl, laid out by a schema both halves share ──
  *
  * The request is the ioctl argument (buffer 0) and every buffer a pointer in
@@ -381,6 +396,8 @@ struct nvgpu_unwatch_req {
 /* ── HOST_OP ── */
 #define NVGPU_OP_PRIME_EXPORT 1       /* (render file, gem) -> dmabuf handle         */
 #define NVGPU_OP_DMABUF_IMPORT 2      /* (render file, dmabuf) -> (gem, size)        */
+/* ... and a third result, the imported object's GEM_IDENTIFY_OBJECT type
+ * (NVGPU_GEM_OBJECT_*); an older backend sends two, read as NVKMS (0). */
 #define NVGPU_OP_SYNC_MERGE 3         /* (n, h0..) -> sync_file handle               */
 #define NVGPU_OP_NEW_EVENTFD 4        /* () -> eventfd handle                        */
 #define NVGPU_OP_FD_KIND 5            /* (handle) -> NVGPU_HK_*                      */
@@ -429,6 +446,10 @@ struct nvgpu_ev_rec {
 struct nvgpu_ev_fence {
   __le32 status; /* 1 signalled, <0 error (signed) */
   __le32 pad;
+  /* When the host's fences signalled, host CLOCK_MONOTONIC ns (the latest
+   * of a merge's), 0 unknown. An older backend sends the first 8 bytes only;
+   * the record's len says, and the rest reads as 0. */
+  __le64 timestamp_ns;
 } __packed;
 
 #define NVGPU_EV_HOTPLUG_F_HOTPLUG (1u << 0)
@@ -471,6 +492,7 @@ static_assert(offsetof(struct nvgpu_mmap_resp, caching) == 16 + 20,
 static_assert(sizeof(struct nvgpu_hello_req) == 16, "hello req");
 static_assert(sizeof(struct nvgpu_hello_resp) == 32, "hello resp");
 static_assert(sizeof(struct nvgpu_time_sync_resp) == 8, "time sync");
+static_assert(sizeof(struct nvgpu_time_sync_resp2) == 32, "time sync 2");
 static_assert(sizeof(struct nvgpu_i2_req) == 32, "i2 req");
 static_assert(sizeof(struct nvgpu_i2_fd_in) == 16, "i2 fd in");
 static_assert(sizeof(struct nvgpu_i2_gem_in) == 16, "i2 gem in");
@@ -483,7 +505,7 @@ static_assert(sizeof(struct nvgpu_unwatch_req) == 8, "unwatch");
 static_assert(sizeof(struct nvgpu_host_op_req) == 56, "host op req");
 static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
 static_assert(sizeof(struct nvgpu_ev_rec) == 16, "ev rec");
-static_assert(sizeof(struct nvgpu_ev_fence) == 8, "ev fence");
+static_assert(sizeof(struct nvgpu_ev_fence) == 16, "ev fence");
 static_assert(sizeof(struct nvgpu_ev_hotplug) == 8, "ev hotplug");
 static_assert(sizeof(struct nvgpu_card_record) == 16, "card record");
 

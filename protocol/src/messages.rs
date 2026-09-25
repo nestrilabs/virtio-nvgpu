@@ -448,6 +448,23 @@ pub struct TimeSyncResp {
     pub host_mono_ns: u64,
 }
 
+/// [`TimeSyncResp`] with the host's other two clocks, read in the same
+/// instant: the ones RM stamps GPU/CPU time-correlation samples with
+/// (NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO: OSTIME is
+/// `CLOCK_REALTIME` in microseconds, PLATFORM_API `CLOCK_MONOTONIC_RAW` in
+/// nanoseconds). Sent only when the reply buffer has room for it: an older
+/// guest posts room for the 8-byte form and gets that, and an older backend
+/// fills only the first 8 bytes of a larger buffer, which the used length
+/// tells the guest.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeSyncResp2 {
+    pub host_mono_ns: u64,
+    pub host_realtime_ns: u64,
+    pub host_mono_raw_ns: u64,
+    pub reserved: u64,
+}
+
 /// Most buffers, and most fd/GEM/dyn records, one IOCTL2 may carry.
 pub const I2_MAX_BUFS: u32 = 256;
 pub const I2_MAX_RECS: u32 = 256;
@@ -586,6 +603,10 @@ pub struct UnwatchReq {
 
 /// HOST_OP operations.
 pub const OP_PRIME_EXPORT: u32 = 1;
+/// `(render file, dmabuf) -> (gem, size, type)`: `type` is the imported
+/// object's GEM_IDENTIFY_OBJECT answer (0 NVKMS, 1 DMABUF, 2 USERMEMORY). A
+/// guest that predates it reads the first two; a backend that predates it
+/// sends two, which the guest reads as NVKMS.
 pub const OP_DMABUF_IMPORT: u32 = 2;
 pub const OP_SYNC_MERGE: u32 = 3;
 pub const OP_NEW_EVENTFD: u32 = 4;
@@ -645,6 +666,11 @@ pub struct EvFence {
     /// 1 signalled, negative on error.
     pub status: i32,
     pub pad: u32,
+    /// When the host's fences signalled, host `CLOCK_MONOTONIC` ns (the
+    /// latest of them, from SYNC_IOC_FILE_INFO's per-fence array); 0 when
+    /// unknown. A guest that predates it reads the first 8 bytes, and an
+    /// older backend's 8-byte record reads as 0.
+    pub timestamp_ns: u64,
 }
 
 pub const EV_HOTPLUG_F_HOTPLUG: u32 = 1 << 0;
@@ -685,6 +711,7 @@ const _: () = {
     assert!(size_of::<HelloReq>() == 16);
     assert!(size_of::<HelloResp>() == 32);
     assert!(size_of::<TimeSyncResp>() == 8);
+    assert!(size_of::<TimeSyncResp2>() == 32);
     assert!(size_of::<Ioctl2Req>() == 32);
     assert!(size_of::<Ioctl2FdIn>() == 16);
     assert!(size_of::<Ioctl2GemIn>() == 16);
@@ -697,7 +724,7 @@ const _: () = {
     assert!(size_of::<HostOpReq>() == 56);
     assert!(size_of::<HostOpResp>() == 40);
     assert!(size_of::<EvRec>() == 16);
-    assert!(size_of::<EvFence>() == 8);
+    assert!(size_of::<EvFence>() == 16);
     assert!(size_of::<EvHotplug>() == 8);
     assert!(size_of::<CardRecord>() == 16);
 };

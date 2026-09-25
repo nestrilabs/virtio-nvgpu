@@ -53,8 +53,12 @@ struct nvgpu_dri_dev {
   /* GET_DEV_INFO as the host's own node answered it. Passed through rather
    * than reconstructed here: the gpu_id in it is what the ICD matches a DRM
    * node to an RM device by, and the page-kind and sector-layout fields are
-   * per-architecture and were previously hardcoded for Ampere. */
+   * per-architecture and were previously hardcoded for Ampere. Always the
+   * 36-byte (575 and later) layout: the backend normalises older hosts'. */
   u32 dev_info[NVGPU_DEV_INFO_WORDS];
+  /* The host's own GET_DEV_INFO struct size (20/28/32/36; 0 unknown), from
+   * GET_SYS_FILES section 4; 36 from a backend that predates it. */
+  u32 dev_info_size;
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
   bool registered;
@@ -425,10 +429,12 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
 /*
  * Host GEM @host_gem, just imported into the render handle of @drm_filp (a
  * DRM file of ours), as a new guest dma-buf descriptor (@o_flags: O_CLOEXEC |
- * O_RDWR), or -errno. Owns @host_gem unless it returns -EBADF (not our file).
+ * O_RDWR), or -errno. @obj_type is the host's IDENTIFY answer for it
+ * (NVGPU_GEM_OBJECT_*), which a new proxy reports. Owns @host_gem unless it
+ * returns -EBADF (not our file).
  */
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           int o_flags);
+                           u32 obj_type, int o_flags);
 
 /* Guest handle in `file` -> the proxy itself, referenced (drop it with
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
@@ -712,6 +718,10 @@ pgprot_t nvgpu_window_pgprot(struct nvgpu_device *dev, u8 caching,
 /* ── Clock ── */
 s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns);
 s64 nvgpu_guest_to_host_ns(struct nvgpu_device *dev, s64 guest_ns);
+/* A host CLOCK_REALTIME / CLOCK_MONOTONIC_RAW reading in the guest's clock of
+ * the same id; false (value untouched) without TIME_SYNC's long form. */
+bool nvgpu_host_clock_to_guest(struct nvgpu_device *dev, clockid_t clk,
+                               s64 host_ns, s64 *guest_ns);
 
 /* ── Event consumers ──
  *
