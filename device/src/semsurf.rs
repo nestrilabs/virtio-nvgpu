@@ -164,6 +164,10 @@ struct Inner {
     os_events: HashMap<(u32, u32), u32>,
     /// Live fence contexts: GEM handles per render handle.
     ctxs: HashMap<u32, HashSet<u32>>,
+    /// Which guest process made each client, and the grants RM took for
+    /// their objects (rmshare.rs): kept with the client set, whose lifecycle
+    /// they share.
+    own: crate::rmshare::Ownership,
 }
 
 impl SemsurfPolicy {
@@ -191,7 +195,67 @@ impl SemsurfPolicy {
 
     /// RM_ALLOC of a client class succeeded through `issuer`.
     pub fn client_allocated(&self, issuer: u32, h_client: u32) {
-        self.lock().clients.insert(h_client, issuer);
+        self.client_allocated_by(issuer, h_client, None);
+    }
+
+    /// The same, made by guest process `by` when the guest says
+    /// (rmshare.rs).
+    pub fn client_allocated_by(
+        &self,
+        issuer: u32,
+        h_client: u32,
+        by: Option<crate::rmshare::ProcId>,
+    ) {
+        let mut g = self.lock();
+        g.clients.insert(h_client, issuer);
+        // A handle RM hands out again is a new client: nothing of the last
+        // one's carries over.
+        g.own.forget_clients(&[h_client]);
+        if let Some(by) = by {
+            g.own.owners.insert(h_client, by);
+        }
+    }
+
+    /// The guest process that made `h_client`, if the guest said.
+    pub fn owner_of(&self, h_client: u32) -> Option<crate::rmshare::ProcId> {
+        self.lock().own.owners.get(&h_client).copied()
+    }
+
+    /// RM_FREE of an object that is not a client was asked for: its share
+    /// policy goes with it (forgotten whatever RM answered, as for clients).
+    pub fn object_freed(&self, h_client: u32, object: u32) {
+        self.lock().own.object_freed(h_client, object);
+    }
+
+    /// RM took share `p` of `(owner, object)`.
+    pub fn shared(&self, owner: u32, object: u32, p: &crate::rmshare::Policy) {
+        self.lock().own.shared(owner, object, p);
+    }
+
+    /// Whether share `p` would record a grant past the cap.
+    pub fn grants_full_for(&self, owner: u32, p: &crate::rmshare::Policy) -> bool {
+        self.lock().own.full_for(owner, p)
+    }
+
+    /// Whether client `dst` may duplicate `(src, obj)` for `caller`
+    /// (rmshare.rs, `Ownership::dup_verdict`).
+    pub fn dup_verdict(
+        &self,
+        per_process: bool,
+        caller: Option<crate::rmshare::ProcId>,
+        dst: u32,
+        src: u32,
+        obj: u32,
+    ) -> crate::rmshare::DupVerdict {
+        let g = self.lock();
+        g.own.dup_verdict(
+            |c| g.clients.contains_key(&c),
+            per_process,
+            caller,
+            dst,
+            src,
+            obj,
+        )
     }
 
     /// RM_FREE of a client was asked for. Forgotten whatever RM answered: a
@@ -202,6 +266,7 @@ impl SemsurfPolicy {
         let mut g = self.lock();
         g.clients.remove(&h_client);
         g.os_events.retain(|&(c, _), _| c != h_client);
+        g.own.forget_clients(&[h_client]);
     }
 
     pub fn owns_client(&self, h_client: u32) -> bool {
@@ -245,6 +310,7 @@ impl SemsurfPolicy {
         g.os_events
             .retain(|&(_, event), issuer| *issuer != handle && event != handle);
         g.ctxs.remove(&handle);
+        g.own.forget_clients(&gone);
         gone
     }
 
@@ -255,6 +321,7 @@ impl SemsurfPolicy {
         g.clients.clear();
         g.os_events.clear();
         g.ctxs.clear();
+        g.own = crate::rmshare::Ownership::default();
     }
 
     /// A GEM handle of render file `render` was closed.
@@ -685,17 +752,23 @@ impl NvidiaBackend {
                 if let Some(out) = reply_params(resp, n).filter(|_| is_client) {
                     if word(out, 40) == Some(0) {
                         if let Some(h) = word(out, 8).filter(|&h| h != 0) {
-                            self.semsurf.client_allocated(issuer, h);
+                            // Its maker, the calling guest process when the
+                            // guest says (rmshare.rs).
+                            self.semsurf
+                                .client_allocated_by(issuer, h, self.current_proc);
                         }
                     }
                 }
             }
             // NVOS00 {hRoot, hObjectParent, hObjectOld, status}: freeing the
-            // root frees the client.
+            // root frees the client; any other object takes its share
+            // policy with it (rmshare.rs).
             NV_ESC_RM_FREE => {
                 if let (Some(root), Some(old)) = (word(param_in, 0), word(param_in, 8)) {
                     if root == old {
                         self.semsurf.client_freed(root);
+                    } else {
+                        self.semsurf.object_freed(root, old);
                     }
                 }
             }

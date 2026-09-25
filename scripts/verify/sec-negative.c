@@ -24,6 +24,9 @@
  * GETFB's case hands back a zero handle). It is FAIL only when the action is
  * accepted. SKIP means the mode this test needs was not offered (no card/lease
  * fd). Exit status is the number of FAILs, so the wrapper can gate on it.
+ * T9 is the one positive control: a duplicate between two clients of one
+ * process, which must be made (it FAILs when refused), so that T8's refusal of
+ * the same duplicate across processes is known to be the backend's.
  *
  * Build:  see sec-negative.sh (gcc, libdrm headers, no other deps).
  */
@@ -31,11 +34,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <drm.h>
@@ -49,6 +54,8 @@
 #define NV_ESC_RM_CONTROL 0x2A
 #define NV_ESC_RM_ALLOC 0x2B
 #define NV_ESC_RM_VID_HEAP_CONTROL 0x4A
+#define NV_ESC_RM_DUP_OBJECT 0x34
+#define NV_ESC_RM_SHARE 0x35
 
 /* NVIDIA builds its escape numbers as _IOC(dir, 'F', nr, sizeof(params)). */
 #define NV_IOWR(nr, size) _IOC(_IOC_READ | _IOC_WRITE, NV_IOCTL_MAGIC, (nr), (size))
@@ -57,6 +64,23 @@
 #define NV01_ROOT 0x00000000u
 #define NV01_MEMORY_SYSTEM_OS_DESCRIPTOR 0x00000071u
 #define NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR 8
+
+/* A device, and a VA space under it: the simplest object RM duplicates
+ * (vaspaceapiCanCopy), with parameters that are all zeros by default. */
+#define NV01_DEVICE_0 0x00000080u
+#define FERMI_VASPACE_A 0x000090f1u
+#define NV0080_ALLOC_PARAMETERS_SIZE 56
+#define NV_VASPACE_ALLOCATION_PARAMETERS_SIZE 56
+
+/* What RM answers a caller without the right (nvstatuscodes.h), and what the
+ * backend answers for it when it refuses a share or a duplicate itself. */
+#define NV_ERR_INSUFFICIENT_PERMISSIONS 0x1bu
+
+/* rs_access.h: RS_SHARE_TYPE_ALL, RS_SHARE_ACTION_FLAG_COMPOSE, and the
+ * DUP_OBJECT right as a mask bit. */
+#define RS_SHARE_TYPE_ALL 1
+#define RS_SHARE_ACTION_FLAG_COMPOSE 4
+#define RS_ACCESS_DUP_OBJECT_BIT 1u
 
 /* A non-privileged control that carries embedded pointers and runs on the
  * client root object, so it needs no device/subdevice to reach the embedded-
@@ -87,6 +111,29 @@ typedef struct {
 	uint32_t paramsSize;
 	uint32_t status;
 } nvos54_t;
+
+/* NVOS55_PARAMETERS (nvos.h): RM_DUP_OBJECT. */
+typedef struct {
+	uint32_t hClient;
+	uint32_t hParent;
+	uint32_t hObject;
+	uint32_t hClientSrc;
+	uint32_t hObjectSrc;
+	uint32_t flags;
+	uint32_t status;
+} nvos55_t;
+
+/* NVOS57_PARAMETERS (nvos.h): RM_SHARE, with its RS_SHARE_POLICY. */
+typedef struct {
+	uint32_t hClient;
+	uint32_t hObject;
+	uint32_t target;
+	uint32_t accessMask;
+	uint16_t type;
+	uint8_t action;
+	uint8_t _pad;
+	uint32_t status;
+} nvos57_t;
 
 /* NVOS32_PARAMETERS is a big union; we only need the header far enough to set
  * `function`, so the backend can refuse ALLOC_OS_DESCRIPTOR by function alone.
@@ -359,6 +406,177 @@ static void t_getfb_foreign(int kms)
 					       : "no foreign fbs visible");
 }
 
+/* Allocate `class` as `handle` under `parent` of `client`, with `size` bytes
+ * of zeroed parameters; RM's status, or -1 for a failed ioctl. */
+static int64_t alloc_object(int fd, uint32_t client, uint32_t parent,
+			    uint32_t handle, uint32_t class, uint32_t size)
+{
+	uint8_t params[64] = {0};
+	nvos64_t a = {0};
+	a.hRoot = client;
+	a.hObjectParent = parent;
+	a.hObjectNew = handle;
+	a.hClass = class;
+	a.pAllocParms = (uint64_t)(uintptr_t)params;
+	a.paramsSize = size;
+	if (ioctl(fd, NV_IOWR(NV_ESC_RM_ALLOC, sizeof(a)), &a) != 0)
+		return -1;
+	return a.status;
+}
+
+#define DEV_HANDLE 0xde700001u
+#define VAS_HANDLE 0x7a500001u
+#define DUP_HANDLE 0xd0b00001u
+
+/* A client on `fd` with a device and a VA space under it: the VA space is what
+ * T8 and T9 duplicate. The client's handle, or 0. */
+static uint32_t client_with_vaspace(int fd)
+{
+	uint32_t c = alloc_client(fd);
+	if (!c)
+		return 0;
+	if (alloc_object(fd, c, c, DEV_HANDLE, NV01_DEVICE_0,
+			 NV0080_ALLOC_PARAMETERS_SIZE) != 0 ||
+	    alloc_object(fd, c, DEV_HANDLE, VAS_HANDLE, FERMI_VASPACE_A,
+			 NV_VASPACE_ALLOCATION_PARAMETERS_SIZE) != 0)
+		return 0;
+	return c;
+}
+
+/* Duplicate the VA space of `src` into `dst`'s device (`dst` made by
+ * client_with_vaspace on `fd`); RM's status, or -1 for a failed ioctl. */
+static int64_t dup_vaspace(int fd, uint32_t dst, uint32_t src, uint32_t as)
+{
+	nvos55_t d = {0};
+	d.hClient = dst;
+	d.hParent = DEV_HANDLE;
+	d.hObject = as;
+	d.hClientSrc = src;
+	d.hObjectSrc = VAS_HANDLE;
+	if (ioctl(fd, NV_IOWR(NV_ESC_RM_DUP_OBJECT, sizeof(d)), &d) != 0)
+		return -1;
+	return d.status;
+}
+
+/* T7: RM_SHARE of type ALL. RM would let every client on the host duplicate
+ * the object -- other VMs' included, since RM sees them all as processes
+ * like the backend; the backend refuses a share that reaches outside the VM
+ * before RM sees it, with RM's own status for a caller without the right. */
+static void t_share_all(int ctl, uint32_t client)
+{
+	if (!client) {
+		skip("RM_SHARE type ALL", "no RM client (alloc failed)");
+		return;
+	}
+	nvos57_t sh = {0};
+	sh.hClient = client;
+	sh.hObject = client;
+	sh.accessMask = RS_ACCESS_DUP_OBJECT_BIT;
+	sh.type = RS_SHARE_TYPE_ALL;
+	sh.action = RS_SHARE_ACTION_FLAG_COMPOSE;
+	int r = ioctl(ctl, NV_IOWR(NV_ESC_RM_SHARE, sizeof(sh)), &sh);
+	if (r == 0 && sh.status == 0)
+		fail("RM_SHARE type ALL", "accepted (shared with every host client)");
+	else if (r == 0 && sh.status == NV_ERR_INSUFFICIENT_PERMISSIONS)
+		pass("RM_SHARE type ALL", "refused (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+	else
+		pass("RM_SHARE type ALL", "refused");
+}
+
+/* T9, the positive control for T8: one process, two files, a client on each.
+ * RM lets a process duplicate between its own clients, and so must the
+ * backend -- this is what every CUDA/GL/Vulkan interop inside one process
+ * rests on. PASS when the duplicate is made; FAIL when it is refused. Returns
+ * whether it was made, so T8's refusal can be told from RM failing the
+ * duplicate for some other reason. */
+static int t_dup_same_process(int ctl, uint32_t dst)
+{
+	if (!dst) {
+		skip("DUP same process", "no client with a VA space here");
+		return 0;
+	}
+	int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+	uint32_t src = fd >= 0 ? client_with_vaspace(fd) : 0;
+	if (!src) {
+		skip("DUP same process", "no second client with a VA space");
+		if (fd >= 0)
+			close(fd);
+		return 0;
+	}
+	int64_t st = dup_vaspace(ctl, dst, src, DUP_HANDLE);
+	int ok = st == 0;
+	if (ok)
+		pass("DUP same process", "allowed (positive control)");
+	else if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+		fail("DUP same process", "refused: the backend keeps a process from its own objects");
+	else {
+		char how[64];
+		snprintf(how, sizeof(how), "RM failed it (status 0x%llx)", (long long)st);
+		fail("DUP same process", how);
+	}
+	close(fd);
+	return ok;
+}
+
+/* T8: a forked child makes a client and a VA space on a file of its own; the
+ * parent, knowing the handles, duplicates the child's VA space into its own
+ * client. Natively RM refuses (the two clients' processes differ, the default
+ * PID share policy); through the backend both clients are the backend's
+ * process to RM, so the backend refuses it, knowing from the guest kernel
+ * which guest process made each client. */
+static void t_dup_other_process(int ctl, uint32_t dst, int control_ok)
+{
+	if (!dst) {
+		skip("DUP other process", "no client with a VA space here");
+		return;
+	}
+	int up[2], down[2];
+	if (pipe(up) || pipe(down)) {
+		skip("DUP other process", "pipe failed");
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		skip("DUP other process", "fork failed");
+		return;
+	}
+	if (pid == 0) {
+		int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+		uint32_t c = fd >= 0 ? client_with_vaspace(fd) : 0;
+		char go;
+		if (write(up[1], &c, sizeof(c)) != sizeof(c))
+			_exit(1);
+		/* Keep the client alive until the parent has tried. */
+		if (read(down[0], &go, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	uint32_t child = 0;
+	if (read(up[0], &child, sizeof(child)) != sizeof(child))
+		child = 0;
+	if (!child) {
+		skip("DUP other process", "the child could not make a VA space");
+	} else {
+		int64_t st = dup_vaspace(ctl, dst, child, DUP_HANDLE + 1);
+		if (st == 0)
+			fail("DUP other process", "accepted (another process's object)");
+		else if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+			pass("DUP other process", "refused (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+		else if (!control_ok)
+			skip("DUP other process",
+			     "refused, but T9 could not duplicate either: inconclusive");
+		else
+			pass("DUP other process", "refused");
+	}
+	if (write(down[1], "x", 1) != 1)
+		kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(up[0]);
+	close(up[1]);
+	close(down[0]);
+	close(down[1]);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -437,6 +655,13 @@ int main(int argc, char **argv)
 	t_grant_sub_owner(kms);
 	t_addfb2_non_nvkms(kms);
 	t_getfb_foreign(kms);
+
+	/* RM objects between clients: T7 on the client above; T8 and T9 on a
+	 * second client of this process's with a device and a VA space. */
+	t_share_all(ctl, client);
+	uint32_t mine = client_with_vaspace(ctl);
+	int control_ok = t_dup_same_process(ctl, mine);
+	t_dup_other_process(ctl, mine, control_ok);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)

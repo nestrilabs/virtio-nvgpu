@@ -1456,7 +1456,7 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_hello_resp body;
   } __packed resp;
-  u32 used, ring_max;
+  u32 used, ring_max, guest_caps;
   int ret;
 
   if (!xf)
@@ -1464,13 +1464,16 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
   req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HELLO);
   req.body.proto = cpu_to_le32(NVGPU_PROTO_V2);
   req.body.flags = cpu_to_le32(NVGPU_HELLO_F_FRESH);
+  /* Which process makes each RM call (nvgpu_main.c, nvgpu_proc_id_fill). */
+  guest_caps = NVGPU_GCAP_PROC_ID;
   /* The backend hands out aperture offsets in 2 MiB granules, so a smaller
    * aperture is none. */
   if (dev->uvm_aperture.len >= SZ_2M) {
-    req.body.guest_caps = cpu_to_le32(NVGPU_GCAP_UVM_APERTURE);
+    guest_caps |= NVGPU_GCAP_UVM_APERTURE;
     req.body.uvm_aperture_mib =
         cpu_to_le32(min_t(u64, dev->uvm_aperture.len >> 20, U32_MAX));
   }
+  req.body.guest_caps = cpu_to_le32(guest_caps);
 
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, NULL);

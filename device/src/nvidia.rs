@@ -443,6 +443,9 @@ pub struct NvidiaBackend {
     /// Top-level parameter length of the ioctl being served. The response has
     /// to split the bytes the same way the request did.
     current_data_len: u32,
+    /// The guest process making the RM call being served, when the guest
+    /// says (rmshare.rs).
+    pub(crate) current_proc: Option<crate::rmshare::ProcId>,
     pub(crate) handles: HandleTable,
     shm: ShmAllocator,
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
@@ -1011,6 +1014,7 @@ impl NvidiaBackend {
             current_handle: 0,
             current_req_id: 0,
             current_data_len: 0,
+            current_proc: None,
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
             active_maps: crate::mmap::MmapContext::new(),
@@ -2788,6 +2792,35 @@ impl NvidiaBackend {
         };
         let param_in: &[u8] = &ptr_copy;
 
+        // Sharing, duplicating and naming RM objects of another client
+        // (rmshare.rs): the calling guest process, and what the call may
+        // name, judged on the parameters as the guest sent them. A refusal
+        // is RM's own status in those parameters, and the host is not asked.
+        self.current_proc = None;
+        let mut share_pending = crate::rmshare::Pending::default();
+        if ioc_type == b'F' as u32 {
+            let sent = &body[..nested_end];
+            self.current_proc = match self.rm_proc_id(escape, sent, &body[want..]) {
+                Ok(p) => p,
+                Err(errno) => {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
+            };
+            match self.rm_share_gate(escape, sent, self.current_proc) {
+                Ok(p) => share_pending = p,
+                Err(crate::rmshare::Refuse::Errno(errno)) => {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
+                Err(crate::rmshare::Refuse::Status(status)) => {
+                    let at = crate::rmshare::status_at(escape).unwrap_or(0);
+                    let mut out = crate::rmshare::refusal(sent, at, status);
+                    let deep = &body[nested_end..want];
+                    out.extend_from_slice(deep);
+                    return self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len());
+                }
+            }
+        }
+
         // What the memory an escape makes, duplicates, frees or GPU-maps is,
         // and the coherency rewrite (rmmem.rs): the host is handed a rewritten
         // copy, and the reply gets the caller's own bits back. RM_ALLOC only in
@@ -2927,6 +2960,8 @@ impl NvidiaBackend {
             let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
             if n >= body && read_struct::<MsgHeader>(resp_buf, 0).status == 0 {
                 self.osdesc_observe(escape, &resp_buf[body..n]);
+                // A share RM took, for the duplicates it lets through.
+                self.rm_share_after(escape, share_pending, &resp_buf[body..n]);
             }
         }
         Self::restore_reply(&ptr_restore, resp_buf, n);

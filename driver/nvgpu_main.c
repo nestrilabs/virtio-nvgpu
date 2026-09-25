@@ -29,6 +29,8 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
+#include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/topology.h>
@@ -72,6 +74,7 @@ extern struct kset *module_kset;
 #define NV_ESC_RM_CONTROL 0x2a
 #define NV_ESC_RM_ALLOC 0x2b
 #define NV_ESC_RM_FREE 0x29
+#define NV_ESC_RM_DUP_OBJECT 0x34
 #define NV_ESC_RM_IDLE_CHANNELS 0x41
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
@@ -301,10 +304,43 @@ static __poll_t nvgpu_modeset_poll(struct file *filp,
 
 /* ───────── Ioctl forwarding ───────── */
 
+/*
+ * Whether RM_ALLOC and RM_DUP_OBJECT say which process makes them
+ * (nvgpu_wire.h, struct nvgpu_proc_id): only to a backend that asked.
+ */
+static bool nvgpu_proc_ids(const struct nvgpu_device *dev) {
+  return dev->v2 && (dev->backend_caps & NVGPU_BCAP_PROC_ID);
+}
+
+/*
+ * The calling process, as the backend keeps RM clients to one: its thread
+ * group, which every thread of it shares, by the group leader's PID in the
+ * initial namespace and start time. A fork is a new pair; an exec keeps it
+ * (de_thread gives the execing thread the leader's PID and start time), as
+ * the host's RM keeps a process's PID across exec. Tasks are freed after an
+ * RCU grace period, so the leader read here stays readable while a
+ * concurrent exec replaces it.
+ */
+static void nvgpu_proc_id_fill(void *dst) {
+  struct nvgpu_proc_id id = {};
+  struct task_struct *leader;
+
+  rcu_read_lock();
+  leader = READ_ONCE(current->group_leader);
+  id.start_ns = cpu_to_le64(leader->start_time);
+  rcu_read_unlock();
+  id.tgid = cpu_to_le32(task_tgid_nr(current));
+  memcpy(dst, &id, sizeof(id));
+}
+
 /* nvgpu_ioctl_simple — flat struct, no embedded pointers */
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz) {
-  int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
+  /* RM_DUP_OBJECT carries the calling process after the struct. */
+  bool proc = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT &&
+              nvgpu_proc_ids(nfd->dev);
+  int req_total = sizeof(struct nvgpu_ioctl_req) + sz +
+                  (proc ? sizeof(struct nvgpu_proc_id) : 0);
   int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
   void *req_buf, *resp_buf;
   struct nvgpu_ioctl_req *req;
@@ -337,6 +373,8 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
       goto out;
     }
   }
+  if (proc)
+    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sz);
 
   ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &used);
@@ -1137,7 +1175,9 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (nested_size > 1024 * 1024)
     return -EINVAL;
 
-  req_total = sizeof(*req) + sizeof(params) + nested_size;
+  /* The calling process after the blocks: a client made here is its. */
+  req_total = sizeof(*req) + sizeof(params) + nested_size +
+              (nvgpu_proc_ids(nfd->dev) ? sizeof(struct nvgpu_proc_id) : 0);
   resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
@@ -1160,6 +1200,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->deep_len = 0;
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+  if (nvgpu_proc_ids(nfd->dev))
+    nvgpu_proc_id_fill(req_buf + sizeof(*req) + sizeof(params) + nested_size);
 
   if (user_alloc && nested_size > 0) {
     nested = req_buf + sizeof(*req) + sizeof(params);

@@ -410,6 +410,28 @@ pub struct OsDescRun {
     pub reserved: u32,
 }
 
+/// The guest process an IOCTL is made by, sent after its blocks (after the
+/// `deep_len` bytes) on `NV_ESC_RM_ALLOC` and `NV_ESC_RM_DUP_OBJECT`, by a
+/// guest that said [`GCAP_PROC_ID`] to a backend that answered
+/// [`BCAP_PROC_ID`]. Every guest process's RM calls are the backend's on the
+/// host, so RM sees one process where the guest has many; this is how the
+/// backend tells them apart (rmshare.rs).
+///
+/// Opaque to the backend, which only compares it. The guest kernel fills it
+/// from the calling thread's group leader: its thread-group id in the
+/// initial PID namespace and its start time (CLOCK_MONOTONIC ns, which exec
+/// keeps and a fork does not share). A PID is unique among live processes,
+/// and a reused one comes with a later start time, so the pair names one
+/// process for the guest's lifetime, whatever PID namespace it runs in.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ProcId {
+    pub start_ns: u64,
+    pub tgid: u32,
+    /// Zero.
+    pub flags: u32,
+}
+
 /// Response payload for `MsgType::Ioctl`, following a `MsgHeader`.
 ///
 /// Layout: `MsgHeader` | `IoctlResp` | `data_len` bytes | `nested_len` bytes |
@@ -537,6 +559,7 @@ const _: () = {
     assert!(size_of::<DeepSeg>() == 8);
     assert!(size_of::<OsDescHdr>() == 8);
     assert!(size_of::<OsDescRun>() == 16);
+    assert!(size_of::<ProcId>() == 16);
     assert!(size_of::<MmapReq>() == 24);
     assert!(size_of::<MmapResp>() == 24);
     assert!(core::mem::offset_of!(MmapResp, caching) == 20);
@@ -577,12 +600,20 @@ pub const BCAP_UVM_MAP: u32 = 1 << 6;
 /// ([`DEEP_PAGE_LIST`]) and released through [`OP_OSDESC_REAP`]. Offered
 /// only when the backend holds guest RAM (the vhost-user memory table).
 pub const BCAP_OS_DESC: u32 = 1 << 7;
+/// Every `NV_ESC_RM_ALLOC` and `NV_ESC_RM_DUP_OBJECT` is to carry the calling
+/// guest process ([`ProcId`]) after its blocks, and RM objects are kept to
+/// the process that made their client (rmshare.rs). Offered only to a guest
+/// that said [`GCAP_PROC_ID`].
+pub const BCAP_PROC_ID: u32 = 1 << 8;
 
 /// `HelloReq::guest_caps` bits.
 ///
 /// The guest found the UVM aperture (shared memory region [`SHM_ID_UVM`])
 /// and says how large it is in `HelloReq::uvm_aperture_mib`.
 pub const GCAP_UVM_APERTURE: u32 = 1 << 0;
+/// The guest can say which of its processes makes each RM call
+/// ([`ProcId`], [`BCAP_PROC_ID`]).
+pub const GCAP_PROC_ID: u32 = 1 << 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -967,6 +998,31 @@ mod tests {
         assert_eq!(define("NVGPU_OSDESC_REAP_MAX"), u64::from(OSDESC_REAP_MAX));
         assert_eq!(define("NVGPU_UVM_HVA_MIN"), UVM_HVA_MIN);
         assert_eq!(define("NVGPU_UVM_HVA_MAX"), UVM_HVA_MAX);
+        assert_eq!(define("NVGPU_BCAP_PROC_ID"), u64::from(BCAP_PROC_ID));
+        assert_eq!(define("NVGPU_GCAP_PROC_ID"), u64::from(GCAP_PROC_ID));
+        // Every capability bit is distinct, on each side.
+        let bcaps = [
+            BCAP_KMS_CARD,
+            BCAP_WAYLAND,
+            BCAP_FENCES,
+            BCAP_NVKMS_TABLE,
+            BCAP_WL_EXPORT,
+            BCAP_DEEP_SEGS,
+            BCAP_UVM_MAP,
+            BCAP_OS_DESC,
+            BCAP_PROC_ID,
+        ];
+        assert_eq!(
+            bcaps.iter().fold(0, |a, b| a | b).count_ones() as usize,
+            bcaps.len()
+        );
+        assert_eq!(GCAP_UVM_APERTURE & GCAP_PROC_ID, 0);
+        // The process identity the guest appends, field for field.
+        assert_eq!(size_of::<ProcId>(), 16);
+        assert_eq!(core::mem::offset_of!(ProcId, start_ns), 0);
+        assert_eq!(core::mem::offset_of!(ProcId, tgid), 8);
+        assert_eq!(core::mem::offset_of!(ProcId, flags), 12);
+        assert!(h.contains("static_assert(sizeof(struct nvgpu_proc_id) == 16"));
         // HELLO's request is still the 16 bytes an older backend reads.
         assert_eq!(size_of::<HelloReq>(), 16);
         assert_eq!(core::mem::offset_of!(HelloReq, uvm_aperture_mib), 12);

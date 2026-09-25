@@ -96,6 +96,11 @@ pub struct Session {
     /// another is discarded: its handles would land in a table the new guest
     /// knows nothing about, and never be closed.
     pub generation: u64,
+    /// The guest says which of its processes makes each RM_ALLOC and
+    /// RM_DUP_OBJECT (HELLO's GCAP_PROC_ID, rmshare.rs).
+    pub proc_ids: bool,
+    /// A guest that does not has been told of in the log, once a session.
+    pub proc_ids_noted: bool,
 }
 
 /// A response, ready to be written into the chain it answers.
@@ -535,6 +540,12 @@ impl NvidiaBackend {
         // takes knowing where guest RAM is (osdesc.rs).
         if self.guest_ram.is_some() {
             backend_caps |= BCAP_OS_DESC;
+        }
+        // RM objects kept to the guest process that made their client
+        // (rmshare.rs), for a guest that can say which that is.
+        self.session.proc_ids = req.guest_caps & GCAP_PROC_ID != 0;
+        if self.session.proc_ids {
+            backend_caps |= BCAP_PROC_ID;
         }
         let resp = HelloResp {
             proto: PROTO_V2,
@@ -1026,6 +1037,8 @@ impl NvidiaBackend {
         );
         self.session.generation += 1;
         self.session.v2 = false;
+        self.session.proc_ids = false;
+        self.session.proc_ids_noted = false;
         self.pump_cmds.push(PumpCmd::Reset);
         self.pump_cmds.push(PumpCmd::SetV2(false));
         self.release_all();
