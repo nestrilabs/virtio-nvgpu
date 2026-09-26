@@ -392,17 +392,20 @@ bounds it:
     goes when RM frees it, its parent or its client (the backend frees a
     client holding one itself, on its own file, before that file closes), or
     with the session;
-  - each UVM external mapping (MAP_EXTERNAL_ALLOCATION) of any of them,
-    counted whatever UVM answered, until UNMAP_EXTERNAL has covered it on
-    every GPU it names, UVM_FREE takes its external range, or its UVM file
-    closes. On that close the backend takes the mappings down itself first,
+  - each UVM external mapping (MAP_EXTERNAL_ALLOCATION) of any of them --
+    which must lie in an external range the file made and the backend
+    recorded, or it is refused before UVM sees it -- counted when UVM
+    answered NV_OK or one of the errors of its wait for the page-table
+    writes, which leave the mappings up (RC, ECC, GPU lost), until
+    UNMAP_EXTERNAL has covered it on every GPU it names, UVM_FREE takes its
+    external range, or its UVM file closes. On that close the backend takes the mappings down itself first,
     on its own descriptor, because the event pump's duplicate can make the
     file's last close later; a mapping that will not come down keeps the
     pages until the session ends.
 
-  A free the backend cannot see (an ancestor above the parent), a range it
-  did not record (past 65,536 per VM) or a mapping UVM never made makes the
-  release late, never early.
+  A free the backend cannot see (an ancestor above the parent) or a mapping
+  UVM never made makes the release late, never early; a range it did not
+  record (past 65,536 per VM) takes no mapping of registered memory.
 - **Never handed where the backend cannot follow.** RM's export to a
   descriptor (NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT(S)_TO_FD) and
   NV_MEMORY_EXPORT's EXPORT_MEM duplicate an object into a client of RM's
@@ -417,7 +420,9 @@ bounds it:
   yet read included, and 1,024 per guest file; 16 GiB per VM and 4 GiB per
   file; a guest process at most a file's budget across all its files, the
   VM's last sixteenth kept for processes holding at most a sixty-fourth; 32,768 separately mapped runs per VM, each a mapping of the
-  backend's; 65,536 UVM mappings of registered memory per VM.
+  backend's; 65,536 UVM mappings of registered memory per VM, a quarter
+  per guest process, the last sixteenth kept for processes holding at most
+  a sixty-fourth.
 - **Coherent on the GPU.** Guest RAM is cached write-back in the guest
   whatever RM thinks (§15 of ARCHITECTURE.md), so every GPU mapping of
   registered memory snoops, as for the other system memory the backend

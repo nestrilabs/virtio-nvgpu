@@ -3989,7 +3989,10 @@ impl NvidiaBackend {
             );
             return Err(libc::EPERM);
         }
-        self.osdesc.uvm_admit(client, memory)?;
+        let (base, len) = (rd64(0).unwrap_or(0), rd64(8).unwrap_or(0));
+        let file = self.current_handle;
+        self.osdesc
+            .uvm_admit(file, self.handles.owner(file), client, memory, base, len)?;
         // UVM_MAP_EXTERNAL_ALLOCATION_PARAMS: base, length, offset, then
         // perGpuAttributes[] at 24 (36 bytes each, the UUID first), and
         // gpuAttributesCount just before rmCtrlFd.
@@ -4005,11 +4008,13 @@ impl NvidiaBackend {
             })
             .collect();
         Ok(Some(crate::osdesc::UvmMap {
-            base: rd64(0).unwrap_or(0),
-            len: rd64(8).unwrap_or(0),
+            base,
+            len,
             gpus,
             client,
             memory,
+            // rmStatus, after rmCtrlFd, hClient and hMemory.
+            status_at: fd_off + 12,
         }))
     }
 
@@ -4048,13 +4053,26 @@ impl NvidiaBackend {
         match cmd {
             UVM_MAP_EXTERNAL_ALLOCATION => {
                 let Some(m) = map else { return };
-                // Held whatever UVM answered: it can fail the call after
-                // making every mapping (its wait for the page-table writes),
-                // and then leaves them up. A mapping never made is held
-                // until its range is freed or its file closes: late, not
-                // early.
-                self.osdesc
-                    .uvm_mapped(handle, m.base, m.len, &m.gpus, m.client, m.memory);
+                // Held when UVM made it: NV_OK, or a failure of its wait for
+                // the page-table writes, after which it leaves every mapping
+                // up -- a channel's RC or ECC error, or the GPU gone
+                // (uvm_map_external_allocation, uvm_channel_get_status).
+                // Every other failure is answered before anything is mapped,
+                // or after tearing down what the call made; and with no
+                // answer at all the call never reached UVM. A mapping held
+                // that was never made lasts until its range is freed or its
+                // file closes (it lies in a recorded range, uvm_admit): late,
+                // not early.
+                const NV_ERR_ECC_ERROR: u32 = 0x0b;
+                const NV_ERR_GPU_IS_LOST: u32 = 0x0f;
+                const NV_ERR_RC_ERROR: u32 = 0x60;
+                if let Some(0 | NV_ERR_ECC_ERROR | NV_ERR_GPU_IS_LOST | NV_ERR_RC_ERROR) =
+                    status(m.status_at)
+                {
+                    let owner = self.handles.owner(handle);
+                    self.osdesc
+                        .uvm_mapped(handle, owner, m.base, m.len, &m.gpus, m.client, m.memory);
+                }
             }
             UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
                 self.osdesc.uvm_range_made(handle, word(0), word(8));
