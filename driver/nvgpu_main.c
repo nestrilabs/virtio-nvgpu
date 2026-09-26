@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * virtio-gpu-nv: NVIDIA GPU ioctl proxy for libkrun VMs.
+ * virtio-nvgpu guest driver: the NVIDIA character devices, DRM nodes and the
+ * Wayland channel of a KVM guest, forwarded to the host's NVIDIA driver.
  *
- * Each guest open("/dev/nvidia*") creates a new host FD via the VMM.
- * Ioctls are forwarded over the control virtqueue; mmap requests result
- * in KVM memory slots set up by the VMM so hot-path GPU writes go direct
- * through EPT — no VMM involvement in the render loop.
+ * Each guest open("/dev/nvidia*") creates a new host FD via the backend.
+ * Ioctls are forwarded over the control virtqueue; mmap requests are placed
+ * in the shared window the VMM maps into guest memory, so hot-path GPU
+ * writes go direct through EPT/NPT -- no VMM involvement in the render loop.
  *
- * Guest kernel driver — runs inside the VM.
- * Place in: drivers/virtio/ with the other nvgpu_* files (libkrunfw tree)
+ * Built out of tree (driver/Makefile) or in a kernel tree under
+ * drivers/virtio/ with the other nvgpu_* files (driver/Kconfig).
  */
 
 #include <drm/drm.h>
@@ -2195,11 +2196,12 @@ MODULE_DEVICE_TABLE(virtio, id_table);
 /*
  * The virtio device ID to bind.
  *
- * VIRTIO_ID_GPU_NV is 45, which is what libkrun assigns. QEMU cannot express
- * it: its virtio_device_names table stops at 41, and a higher id trips an
- * assertion in virtio_id_to_name() before the device is even realised. Making
- * this a parameter lets the same module be tested under QEMU without changing
- * the identity it uses in production.
+ * VIRTIO_ID_GPU_NV is 45, the number libkrun assigned it and the VMMs here
+ * (nesbox, crosvm) present. QEMU cannot express it: its virtio_device_names
+ * table stops at 41, and a higher id trips an assertion in
+ * virtio_id_to_name() before the device is even realised. Making this a
+ * parameter lets the same module be tested under QEMU without changing the
+ * identity it uses in production.
  *
  *     insmod virtio_gpu_nv.ko virtio_id=41
  */

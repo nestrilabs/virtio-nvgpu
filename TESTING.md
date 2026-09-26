@@ -617,7 +617,7 @@ is given too (they are hidden from its `--help` without it); the launcher adds
 `NVGPU_ALLOW_ROOT_UNSAFE=1`:
 
 ```sh
-sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card shell kms1 -- --keep-guest-coherency
+sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card shell.sh kms1 -- --keep-guest-coherency
 ```
 
 Guest packages the stages assume: NVIDIA userspace (Vulkan ICD, EGL), `nvgpu-wl-guest`,

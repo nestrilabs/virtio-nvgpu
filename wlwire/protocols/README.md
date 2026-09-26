@@ -10,7 +10,7 @@ must have a class. Each file keeps its own copyright and licence header.
 | wayland (`protocol/wayland.xml`) | 381af21 | `wayland.xml` |
 | wayland-protocols | 819004a | stable: linux-dmabuf, presentation-time, tablet, viewporter, xdg-shell; staging: alpha-modifier, color-management, commit-timing, content-type, cursor-shape, drm-lease, ext-background-effect, ext-foreign-toplevel-list, ext-idle-notify, ext-image-capture-source, ext-image-copy-capture, fifo, fractional-scale, linux-drm-syncobj, single-pixel-buffer, tearing-control, xdg-activation, xdg-dialog, xdg-system-bell, xdg-toplevel-tag; unstable: idle-inhibit, keyboard-shortcuts-inhibit, pointer-constraints, pointer-gestures, primary-selection, relative-pointer, text-input v1/v3, xdg-decoration, xdg-foreign v2, xdg-output |
 | hyprland-protocols | cc9a8fd (0.7.1, what Hyprland 0.56 pins) | `hyprland-surface-v1.xml` |
-| Hyprland 0.56 `protocols/` | e368c13c | `kde-server-decoration.xml` |
+| Hyprland `protocols/` | `main` at e368c13c (0.56.0 + 203 commits) | `kde-server-decoration.xml` (LGPL-2.1-or-later, as its header says; [`NOTICE`](../../NOTICE)) |
 
 Files for globals that are *not* allowed are here only where a rewrite rule
 names them (`ext-image-copy-capture`, for its `dmabuf_device` dev_t), so that

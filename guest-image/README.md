@@ -1,7 +1,9 @@
 # guest-image: the test guest's root filesystem
 
 A reproducible, nix-built ext4 root for the on-device stages in
-[`TESTING.md`](../TESTING.md). It carries NVIDIA's 595.99.02 userspace (the
+[`TESTING.md`](../TESTING.md). It is a test image: every probe runs as root
+unless told otherwise, and it is not a model for a production guest
+([`DEPLOY.md`](../DEPLOY.md), "The guest", says what one needs). It carries NVIDIA's 595.99.02 userspace (the
 host's release, to the digit), the tools each stage runs, this repo's
 `nvgpu-wl-guest` and verify helpers, and one probe script per stage that runs
 as the guest's init and powers the VM off when it is done.
@@ -69,12 +71,13 @@ works too, but without `nvgpu-wl-guest` and the verify helpers
   as written in TESTING.md and `kms-smoke.sh` otherwise finds nothing.
 - `/opt/nvgpu/verify/`: `scripts/verify/*.sh`, with `bin/sec-negative` and
   `bin/lease-flip` already built.
-- `/opt/nvgpu/nvgpu.ko`: the guest module, put in at image time (never by
-  nix), so a module change is `--module-only`.
+- `/opt/nvgpu/nvgpu.ko`: the guest module (Kbuild's `virtio_gpu_nv.ko`), put
+  in at image time (never by nix), so a module change is `--module-only`.
 
 ## Probes
 
-Boot with `init=/opt/nvgpu/<probe>.sh` (`run-guest.sh <probe>.sh`). Each
+Boot with `init=/opt/nvgpu/<probe>.sh` (`run-guest.sh <probe>`; the rig
+layout adds the `.sh`). Each
 mounts proc/sys/dev/pts/shm/run/tmp, loads the module (passing
 `virtio_gpu_nv.<param>=<v>` tokens from the kernel command line to insmod),
 waits for `/dev/nvidiactl`, prints the driver's dmesg lines, runs its stage

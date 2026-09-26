@@ -7,9 +7,9 @@
  *
  * This is the C implementation of what driver/rust/core/src/guest/rm.rs and
  * dispatch.rs implement in Rust; the Makefile builds one or the other
- * (NVGPU_RUST). It stays the reference, and the default, until the Rust one
- * has passed the hardware regression; driver/rust/difftest runs both on the
- * same inputs.
+ * (NVGPU_RUST). The Rust one has passed the hardware regression; this stays
+ * the out-of-tree default, the reference driver/rust/difftest runs the Rust
+ * against on the same inputs, and what a kernel without Rust builds.
  */
 
 #include <linux/kernel.h>
