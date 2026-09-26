@@ -1,4 +1,4 @@
-From 9ec675b91069dc7cca4d47d3a08b1b2125a8905f Mon Sep 17 00:00:00 2001
+From ab7942b0e89f974fc4b2641de35b6c6849a3a033 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
 Subject: [PATCH 9/9] devices: run the nvgpu vhost-user frontend in a jailed
@@ -18,6 +18,12 @@ child makes no KVM call and maps nothing into guest memory. Other vhost-user
 types keep upstream's behaviour. keep_rds names what the child needs: its
 backend socket, the backend request channel, the crash tube and the memory
 tube.
+
+A virtio device's control tube (its PCI transport's, whichever process that
+is in) no longer takes HotPlugVfioCommand: only power management events come
+that way, and a compromised device process could otherwise have the main
+process add a host VFIO device to the VM. Hot-plug ports keep theirs
+(AnyControlTube::DeviceNoHotplug).
 
 The test forks a real frontend under the embedded policy, keeping only its
 keep_rds and what every device process is handed, against a fake backend
@@ -40,10 +46,13 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
  .../riscv64/vhost_user_frontend_device.policy |  17 +
  .../x86_64/vhost_user_frontend_device.policy  |  18 +
  src/crosvm/cmdline.rs                         |   2 +
- src/crosvm/sys/linux.rs                       |   1 +
- src/crosvm/sys/linux/device_helpers.rs        |  17 +-
+ src/crosvm/sys/linux.rs                       |  29 +-
+ src/crosvm/sys/linux/device_helpers.rs        |  21 +-
  third_party/vmm_vhost/src/frontend_server.rs  |   5 +
- 12 files changed, 586 insertions(+), 5 deletions(-)
+ vm_control/src/any_control_tube.rs            |   5 +
+ vm_control/src/lib.rs                         |   5 +
+ vm_control/src/sys/linux/nvgpu.rs             |  23 +
+ 15 files changed, 648 insertions(+), 8 deletions(-)
  create mode 100644 devices/tests/vhost_user_frontend_seccomp.rs
  create mode 100644 jail/seccomp/aarch64/vhost_user_frontend_device.policy
  create mode 100644 jail/seccomp/riscv64/vhost_user_frontend_device.policy
@@ -81,10 +90,10 @@ index f23055f..7e0afd8 100644
  pub use self::DeviceType::Pvclock;
  
 diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
-index fb7180a..4bb7415 100644
+index a9db5cd..dc3af3b 100644
 --- a/devices/src/virtio/vhost_user_frontend/mod.rs
 +++ b/devices/src/virtio/vhost_user_frontend/mod.rs
-@@ -409,8 +409,19 @@ impl VirtioDevice for VhostUserFrontend {
+@@ -435,8 +435,19 @@ impl VirtioDevice for VhostUserFrontend {
          format!("vu-{}", self.device_type())
      }
  
@@ -106,10 +115,10 @@ index fb7180a..4bb7415 100644
  
      fn device_type(&self) -> DeviceType {
 diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
-index 019b2b4..288ac38 100644
+index 0c1b7bc..99c2d12 100644
 --- a/devices/src/virtio/virtio_pci_device.rs
 +++ b/devices/src/virtio/virtio_pci_device.rs
-@@ -1535,7 +1535,9 @@ impl Suspendable for VirtioPciDevice {
+@@ -1547,7 +1547,9 @@ impl Suspendable for VirtioPciDevice {
      }
  }
  
@@ -120,7 +129,7 @@ index 019b2b4..288ac38 100644
      vm_memory_client: VmMemoryClient,
      alloc: Alloc,
      mappings: BTreeMap<u64, VmMemoryRegionId>,
-@@ -1544,7 +1546,7 @@ struct VmRequester {
+@@ -1556,7 +1558,7 @@ struct VmRequester {
  }
  
  impl VmRequester {
@@ -705,7 +714,7 @@ index e3d31de..21825e1 100644
  
      #[argh(option)]
 diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
-index 8c09f13..0239346 100644
+index 148b733..6514967 100644
 --- a/src/crosvm/sys/linux.rs
 +++ b/src/crosvm/sys/linux.rs
 @@ -886,6 +886,7 @@ fn create_virtio_devices(
@@ -716,8 +725,73 @@ index 8c09f13..0239346 100644
                  opt,
                  cfg.vhost_user_connect_timeout_ms,
                  vm_evt_wrtube.try_clone()?,
+@@ -1129,9 +1130,11 @@ fn create_devices(
+             });
+         }
+ 
++        // A virtio device's transport asks the main process for power management events only,
++        // never for a hot-plug; a jailed device process may not either.
+         let (host_tube, device_tube) =
+             Tube::pair().context("failed to create device control tube")?;
+-        add_control_tube(AnyControlTube::Device(host_tube));
++        add_control_tube(AnyControlTube::DeviceNoHotplug(host_tube));
+ 
+         let mut dev = VirtioPciDevice::new(
+             vm.get_memory().clone(),
+@@ -3362,6 +3365,9 @@ fn process_vm_request(
+     let mut add_control_tube = |t| match t {
+         AnyControlTube::Balloon(_) => panic!("balloon tube hotplug not supported"),
+         AnyControlTube::Device(t) => add_tubes.push(TaggedControlTube::Device(t)),
++        AnyControlTube::DeviceNoHotplug(t) => {
++            add_tubes.push(TaggedControlTube::DeviceNoHotplug(t))
++        }
+         AnyControlTube::Disk(_) => panic!("disk tube hotplug not supported"),
+         AnyControlTube::Fs(t) => add_tubes.push(TaggedControlTube::Fs(t)),
+         AnyControlTube::Gpu(_) => panic!("gpu tube hotplug not supported"),
+@@ -3675,6 +3681,9 @@ fn handle_device_control_request(
+     let mut add_control_tube = |t| match t {
+         AnyControlTube::Balloon(_) => panic!("balloon tube hotplug not supported"),
+         AnyControlTube::Device(t) => add_tubes.push(TaggedControlTube::Device(t)),
++        AnyControlTube::DeviceNoHotplug(t) => {
++            add_tubes.push(TaggedControlTube::DeviceNoHotplug(t))
++        }
+         AnyControlTube::Disk(_) => panic!("disk tube hotplug not supported"),
+         AnyControlTube::Fs(t) => add_tubes.push(TaggedControlTube::Fs(t)),
+         AnyControlTube::Gpu(_) => panic!("gpu tube hotplug not supported"),
+@@ -3785,7 +3794,20 @@ fn process_vm_control_event(
+     let mut vm_control_ids_to_remove = Vec::new();
+     let mut add_tubes = Vec::new();
+     match socket {
+-        TaggedControlTube::Device(tube) => match tube.recv::<DeviceControlRequest>() {
++        TaggedControlTube::Device(tube) | TaggedControlTube::DeviceNoHotplug(tube) => match tube
++            .recv::<DeviceControlRequest>()
++        {
++            Ok(request)
++                if request.is_hotplug()
++                    && matches!(socket, TaggedControlTube::DeviceNoHotplug(_)) =>
++            {
++                warn!("refused a hot-plug request from a device that may not make one");
++                if let Err(e) = tube.send(&DeviceControlResponse::Err(base::Error::new(
++                    libc::EPERM,
++                ))) {
++                    error!("failed to send DeviceControlResponse: {}", e);
++                }
++            }
+             Ok(request) => {
+                 process_device_control_request(state, tube, request, &mut add_tubes)?;
+             }
+@@ -3982,6 +4004,9 @@ fn run_control(
+             #[cfg(not(feature = "balloon"))]
+             AnyControlTube::Balloon(_) => unreachable!(),
+             AnyControlTube::Device(t) => control_tubes.push(TaggedControlTube::Device(t)),
++            AnyControlTube::DeviceNoHotplug(t) => {
++                control_tubes.push(TaggedControlTube::DeviceNoHotplug(t))
++            }
+             AnyControlTube::Disk(t) => disk_host_tubes.push(t),
+             AnyControlTube::Fs(t) => control_tubes.push(TaggedControlTube::Fs(t)),
+             #[cfg(feature = "gpu")]
 diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
-index d29febb..c8434e7 100644
+index d29febb..1c1bb07 100644
 --- a/src/crosvm/sys/linux/device_helpers.rs
 +++ b/src/crosvm/sys/linux/device_helpers.rs
 @@ -49,6 +49,7 @@ use devices::virtio::pvclock::PvClock;
@@ -728,7 +802,25 @@ index d29febb..c8434e7 100644
  use devices::virtio::MemSlotConfig;
  use devices::virtio::PmemConfig;
  use devices::virtio::VhostUserFrontend;
-@@ -299,6 +300,7 @@ fn vhost_user_connection(
+@@ -85,6 +86,8 @@ use crate::crosvm::sys::config::PmemExt2Option;
+ pub enum TaggedControlTube {
+     /// Receives `DeviceControlRequest`.
+     Device(Tube),
++    /// Receives `DeviceControlRequest`, but no hot-plug (`AnyControlTube::DeviceNoHotplug`).
++    DeviceNoHotplug(Tube),
+     /// Receives `FsMappingRequest`.
+     Fs(Tube),
+     /// Receives `VmRequest`.
+@@ -97,7 +100,7 @@ impl AsRef<Tube> for TaggedControlTube {
+     fn as_ref(&self) -> &Tube {
+         use self::TaggedControlTube::*;
+         match &self {
+-            Device(tube) | Fs(tube) | Vm(tube) | VmMsync(tube) => tube,
++            Device(tube) | DeviceNoHotplug(tube) | Fs(tube) | Vm(tube) | VmMsync(tube) => tube,
+         }
+     }
+ }
+@@ -299,6 +302,7 @@ fn vhost_user_connection(
  
  pub fn create_vhost_user_frontend(
      protection_type: ProtectionType,
@@ -736,7 +828,7 @@ index d29febb..c8434e7 100644
      opt: &VhostUserFrontendOption,
      connect_timeout_ms: Option<u64>,
      vm_evt_wrtube: base::SendTube,
-@@ -321,10 +323,21 @@ pub fn create_vhost_user_frontend(
+@@ -321,10 +325,21 @@ pub fn create_vhost_user_frontend(
      )
      .context("failed to set up vhost-user frontend")?;
  
@@ -776,6 +868,72 @@ index ee6cc22..061a5fb 100644
      /// Get the underlying frontend
      pub fn frontend_mut(&mut self) -> &mut S {
          &mut self.frontend
+diff --git a/vm_control/src/any_control_tube.rs b/vm_control/src/any_control_tube.rs
+index d6da300..fcec77e 100644
+--- a/vm_control/src/any_control_tube.rs
++++ b/vm_control/src/any_control_tube.rs
+@@ -13,6 +13,11 @@ pub enum AnyControlTube {
+     Balloon(Tube),
+     /// Receives `DeviceControlRequest`.
+     Device(Tube),
++    /// Receives `DeviceControlRequest` from a device that has no business hot-plugging anything
++    /// (a virtio device's PCI transport): `HotPlugVfioCommand` is refused. A compromised device
++    /// process could otherwise ask the main process to add a host VFIO device to the VM.
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    DeviceNoHotplug(Tube),
+     // Sends `DiskControlCommand`.
+     Disk(Tube),
+     /// Receives `FsMappingRequest`.
+diff --git a/vm_control/src/lib.rs b/vm_control/src/lib.rs
+index 169d38e..9e2cb5a 100644
+--- a/vm_control/src/lib.rs
++++ b/vm_control/src/lib.rs
+@@ -1678,6 +1678,11 @@ impl From<DeviceControlResponse> for VmResponse {
+ }
+ 
+ impl DeviceControlRequest {
++    /// Whether this request changes the VM's devices, which only a hot-plug port may ask.
++    pub fn is_hotplug(&self) -> bool {
++        matches!(self, DeviceControlRequest::HotPlugVfioCommand { .. })
++    }
++
+     /// Executes this request on the given VM power management resource.
+     pub fn execute(
+         &self,
+diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
+index ebc7a3f..493392a 100644
+--- a/vm_control/src/sys/linux/nvgpu.rs
++++ b/vm_control/src/sys/linux/nvgpu.rs
+@@ -2156,6 +2156,29 @@ mod tests {
+         );
+     }
+ 
++    /// What a virtio device's control tube is refused (`AnyControlTube::DeviceNoHotplug`).
++    #[test]
++    fn only_a_hotplug_is_a_hotplug() {
++        use crate::DeviceControlRequest;
++        use crate::HotPlugDeviceInfo;
++        use crate::HotPlugDeviceType;
++        let hp = DeviceControlRequest::HotPlugVfioCommand {
++            device: HotPlugDeviceInfo {
++                device_type: HotPlugDeviceType::EndPoint,
++                path: "/sys/bus/pci/devices/0000:01:00.0".into(),
++                hp_interrupt: true,
++            },
++            add: true,
++        };
++        assert!(hp.is_hotplug());
++        assert!(!DeviceControlRequest::PciPme(0x18).is_hotplug());
++        assert!(!DeviceControlRequest::Gpe {
++            gpe: 1,
++            clear_evt: None
++        }
++        .is_hotplug());
++    }
++
+     /// `mincore` is believed only for a file the kernel answers it for.
+     #[test]
+     fn mincore_is_trusted_only_where_the_kernel_answers_it() {
 -- 
 2.55.0
 

@@ -1,4 +1,4 @@
-From cf482d09ee52876dc48b553cbbc5698855322963 Mon Sep 17 00:00:00 2001
+From 659d1c806251a56fd576cc25ec99d7fe531fa10c Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
 Subject: [PATCH 8/9] devices: virtio-nvgpu's UVM aperture, in the window's BAR
@@ -13,19 +13,22 @@ with its own VIRTIO_PCI_CAP_SHARED_MEMORY_CFG capability at its own offset
 id (virtio_get_shm_region), so its driver needs nothing new. The transport
 reports the layout it allocated -- from the main process, before the device
 is moved into a process of its own -- for the main process to hold the
-device's requests to (vm_control's SharedMemoryBarLayout).
+device's requests to (vm_control's SharedMemoryBarLayout), with the queue
+notification addresses of its settings BAR for the ioevent tube.
 
 The nvgpu vhost-user frontend publishes region 2, the UVM aperture (at most
 1 GiB), after the window when the backend's GET_SHMEM_CONFIG reports it,
-which vhost-user-nvgpu does only with --allow-compute. Its backend request
-handler keeps a record per region and checks a SHMEM_MAP on the aperture as
-a UVM semaphore pool first -- shared read-write, a whole number of pages up
-to 64 MiB, at a host address (its file offset) in [4 GiB, 32 TiB), at an
-aperture offset on the backend's 2 MiB boundary, clear of every live pool in
-the aperture and in host memory, at most 64 pools and 256 MiB -- and passes
-it to the mapper as a pool (SharedMemoryMapper::add_uvm_pool_mapping, whose
-default refuses), which VmRequester sends to the main process as
-RegisterUvmPool. A reset withdraws pools as it does window mappings.
+which vhost-user-nvgpu does only with --allow-compute. Regions are taken by
+id however many the backend reports: a lone region that is not region 1 is
+no window. Its backend request handler keeps a record per region and checks
+a SHMEM_MAP on the aperture as a UVM semaphore pool first -- shared
+read-write, a whole number of pages up to 64 MiB, at a host address (its
+file offset) in [4 GiB, 32 TiB), at an aperture offset on the backend's
+2 MiB boundary, clear of every live pool in the aperture and in host
+memory, at most 64 pools and 256 MiB -- and passes it to the mapper as a
+pool (SharedMemoryMapper::add_uvm_pool_mapping, whose default refuses),
+which VmRequester sends to the main process as RegisterUvmPool. A reset
+withdraws pools as it does window mappings.
 
 The main process holds virtio-nvgpu's shared memory and ioevent tubes to
 what the device needs (vm_control::sys::linux::nvgpu), withdraws what a
@@ -38,12 +41,12 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
  devices/src/virtio/mod.rs                     |   1 +
  .../src/virtio/vhost_user_frontend/handler.rs | 456 +++++++++++++++---
- devices/src/virtio/vhost_user_frontend/mod.rs |  68 ++-
+ devices/src/virtio/vhost_user_frontend/mod.rs | 112 ++++-
  devices/src/virtio/virtio_device.rs           | 112 +++++
- devices/src/virtio/virtio_pci_device.rs       | 119 ++++-
+ devices/src/virtio/virtio_pci_device.rs       | 131 ++++-
  src/crosvm/sys/linux.rs                       | 170 ++++++-
  src/crosvm/sys/linux/device_helpers.rs        |   4 +
- 7 files changed, 818 insertions(+), 112 deletions(-)
+ 7 files changed, 873 insertions(+), 113 deletions(-)
 
 diff --git a/devices/src/virtio/mod.rs b/devices/src/virtio/mod.rs
 index fd3f42d..f23055f 100644
@@ -711,7 +714,7 @@ index bca22b3..61bb140 100644
  
      fn req(shm_offset: u64, len: u64, fd_offset: u64) -> VhostUserMMap {
 diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
-index 2eae2ab..fb7180a 100644
+index 2eae2ab..a9db5cd 100644
 --- a/devices/src/virtio/vhost_user_frontend/mod.rs
 +++ b/devices/src/virtio/vhost_user_frontend/mod.rs
 @@ -40,6 +40,7 @@ use vmm_vhost::VringConfigData;
@@ -731,7 +734,7 @@ index 2eae2ab..fb7180a 100644
  
      queue_sizes: Vec<u16>,
      expose_shmem_descriptors_with_viommu: bool,
-@@ -83,7 +86,9 @@ pub struct VhostUserFrontend {
+@@ -83,7 +86,35 @@ pub struct VhostUserFrontend {
  }
  
  /// virtio-nvgpu's window: the shared memory region its guest driver maps device memory through.
@@ -739,10 +742,36 @@ index 2eae2ab..fb7180a 100644
 +const NVGPU_SHM_ID_WINDOW: u8 = vm_control::nvgpu::NVGPU_SHM_ID_WINDOW;
 +/// virtio-nvgpu's UVM aperture, where CUDA's semaphore pools are mapped.
 +const NVGPU_SHM_ID_UVM: u8 = vm_control::nvgpu::NVGPU_SHM_ID_UVM;
++
++/// What virtio-nvgpu publishes of the regions its backend reported, by id and however many
++/// there are: the window (region 1), the aperture (region 2, at most `UVM_APERTURE_MAX`, whole
++/// pages, none if that leaves nothing), and how many others were left out.
++fn nvgpu_shmem_regions(
++    regions: &[SharedMemoryRegion],
++) -> (Option<SharedMemoryRegion>, Option<SharedMemoryRegion>, usize) {
++    let window = regions
++        .iter()
++        .find(|r| r.id == NVGPU_SHM_ID_WINDOW)
++        .copied();
++    let page = base::pagesize() as u64;
++    let aperture = regions
++        .iter()
++        .find(|r| r.id == NVGPU_SHM_ID_UVM)
++        .map(|r| SharedMemoryRegion {
++            id: r.id,
++            length: r.length.min(vm_control::nvgpu::UVM_APERTURE_MAX) & !(page - 1),
++        })
++        .filter(|r| r.length > 0);
++    let others = regions
++        .iter()
++        .filter(|r| r.id != NVGPU_SHM_ID_WINDOW && r.id != NVGPU_SHM_ID_UVM)
++        .count();
++    (window, aperture, others)
++}
  
  /// Ring features a device type's backend may negotiate with the guest beyond the common ones.
  ///
-@@ -247,6 +252,7 @@ impl VhostUserFrontend {
+@@ -247,6 +278,7 @@ impl VhostUserFrontend {
              protocol_features,
              backend_req_handler,
              shmem_region: RefCell::new(None),
@@ -750,15 +779,18 @@ index 2eae2ab..fb7180a 100644
              queue_sizes,
              expose_shmem_descriptors_with_viommu: device_type == DeviceType::Gpu,
              pci_address,
-@@ -554,23 +560,41 @@ impl VirtioDevice for VhostUserFrontend {
+@@ -552,28 +584,31 @@ impl VirtioDevice for VhostUserFrontend {
+         };
+         let region = match regions.len() {
              0 => None,
-             1 => Some(regions[0]),
+-            1 => Some(regions[0]),
              // virtio-nvgpu's region 1 is the window every guest maps GPU memory through; its
 -            // region 2, the UVM aperture, only CUDA uses. The PCI transport publishes one region
 -            // per device, so the window is published and the guest finds no aperture, which it
 -            // reads as no compute.
 +            // region 2, the UVM aperture, only CUDA uses, and only a backend started with compute
-+            // reports it. Both go in the one BAR, the aperture after the window.
++            // reports it. Both go in the one BAR, the aperture after the window. Checked by id
++            // however many there are: a lone region that is not the window is no window.
              n if self.device_type == DeviceType::Nvgpu => {
 -                let window = regions.iter().find(|r| r.id == NVGPU_SHM_ID_WINDOW).copied();
 -                if window.is_some() {
@@ -768,23 +800,7 @@ index 2eae2ab..fb7180a 100644
 -                        n, NVGPU_SHM_ID_WINDOW
 -                    );
 -                } else {
-+                let window = regions
-+                    .iter()
-+                    .find(|r| r.id == NVGPU_SHM_ID_WINDOW)
-+                    .copied();
-+                let page = base::pagesize() as u64;
-+                let aperture = regions
-+                    .iter()
-+                    .find(|r| r.id == NVGPU_SHM_ID_UVM)
-+                    .map(|r| SharedMemoryRegion {
-+                        id: r.id,
-+                        length: r.length.min(vm_control::nvgpu::UVM_APERTURE_MAX) & !(page - 1),
-+                    })
-+                    .filter(|r| r.length > 0);
-+                let others = regions
-+                    .iter()
-+                    .filter(|r| r.id != NVGPU_SHM_ID_WINDOW && r.id != NVGPU_SHM_ID_UVM)
-+                    .count();
++                let (window, aperture, others) = nvgpu_shmem_regions(&regions);
 +                if window.is_none() {
                      error!(
                          "vhost-user nvgpu backend reported {} shared memory regions and no \
@@ -803,7 +819,11 @@ index 2eae2ab..fb7180a 100644
                  }
                  window
              }
-@@ -586,6 +610,12 @@ impl VirtioDevice for VhostUserFrontend {
++            1 => Some(regions[0]),
+             n => {
+                 error!(
+                     "Failed to get shared memory region {}",
+@@ -586,6 +621,12 @@ impl VirtioDevice for VhostUserFrontend {
          region
      }
  
@@ -816,7 +836,7 @@ index 2eae2ab..fb7180a 100644
      fn set_shared_memory_mapper(&mut self, mapper: Box<dyn SharedMemoryMapper>) {
          // Return error if backend request handler is not available. This indicates
          // that `VhostUserProtocolFeatures::BACKEND_REQ` is not negotiated.
-@@ -599,10 +629,22 @@ impl VirtioDevice for VhostUserFrontend {
+@@ -599,10 +640,22 @@ impl VirtioDevice for VhostUserFrontend {
  
          // The virtio framework will only call this if get_shared_memory_region returned a region
          let region = self.shmem_region.borrow().flatten().expect("missing shmid");
@@ -840,6 +860,41 @@ index 2eae2ab..fb7180a 100644
      }
  
      fn expose_shmem_descriptors_with_viommu(&self) -> bool {
+@@ -757,3 +810,34 @@ fn new_pipe_pair() -> anyhow::Result<(impl AsRawDescriptor + Read, impl AsRawDes
+     )
+     .context("failed to create named pipes")
+ }
++
++#[cfg(test)]
++mod nvgpu_region_tests {
++    use super::*;
++
++    fn r(id: u8, length: u64) -> SharedMemoryRegion {
++        SharedMemoryRegion { id, length }
++    }
++
++    /// Regions are taken by id, one of them or several: a lone region that is not the window
++    /// (the aperture, say) is not published as the window.
++    #[test]
++    fn nvgpu_regions_are_taken_by_id() {
++        let (w, a, o) = nvgpu_shmem_regions(&[r(1, 1 << 30)]);
++        assert_eq!((w.map(|w| w.id), a.is_none(), o), (Some(1), true, 0));
++        let (w, a, _) = nvgpu_shmem_regions(&[r(2, 1 << 30)]);
++        assert!(w.is_none() && a.is_some(), "a lone aperture became the window");
++        let (w, _, o) = nvgpu_shmem_regions(&[r(7, 1 << 30)]);
++        assert!(w.is_none());
++        assert_eq!(o, 1);
++        let (w, a, o) = nvgpu_shmem_regions(&[r(2, 3 << 30), r(1, 1 << 30), r(9, 4096)]);
++        assert_eq!(w.map(|w| w.length), Some(1 << 30));
++        assert_eq!(
++            a.map(|a| a.length),
++            Some(vm_control::nvgpu::UVM_APERTURE_MAX)
++        );
++        assert_eq!(o, 1);
++        let (_, a, _) = nvgpu_shmem_regions(&[r(1, 1 << 30), r(2, 100)]);
++        assert!(a.is_none(), "an aperture of less than a page");
++    }
++}
 diff --git a/devices/src/virtio/virtio_device.rs b/devices/src/virtio/virtio_device.rs
 index 4b65748..2bd2c00 100644
 --- a/devices/src/virtio/virtio_device.rs
@@ -982,7 +1037,7 @@ index 4b65748..2bd2c00 100644
 +    }
 +}
 diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
-index 644ea40..019b2b4 100644
+index 644ea40..0c1b7bc 100644
 --- a/devices/src/virtio/virtio_pci_device.rs
 +++ b/devices/src/virtio/virtio_pci_device.rs
 @@ -13,6 +13,7 @@ use anyhow::Context;
@@ -1116,11 +1171,22 @@ index 644ea40..019b2b4 100644
          let config = PciBarConfiguration::new(
              SHMEM_BAR_NUM,
              bar_size,
-@@ -1145,6 +1180,24 @@ where
+@@ -1145,6 +1180,36 @@ where
              .device
              .set_shared_memory_mapper(vm_requester);
  
 +        if let Some(report) = &virtio_pci_device.shared_memory_layout_report {
++            // The settings BAR is laid out first (`allocate_io_bars`), so its address is known;
++            // the queue notification addresses are where the device's ioevents go.
++            let settings = virtio_pci_device
++                .config_regs
++                .get_bar_addr(virtio_pci_device.settings_bar);
++            let notify = (settings != 0).then(|| {
++                (
++                    settings + NOTIFICATION_BAR_OFFSET,
++                    virtio_pci_device.queues.len() as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
++                )
++            });
 +            let layout = SharedMemoryBarLayout {
 +                alloc,
 +                size: bar_size,
@@ -1129,6 +1195,7 @@ index 644ea40..019b2b4 100644
 +                    .zip(&offsets)
 +                    .map(|(r, &offset)| (r.id, offset, r.length))
 +                    .collect(),
++                notify,
 +            };
 +            if report.set(layout).is_err() {
 +                warn!(
@@ -1141,7 +1208,7 @@ index 644ea40..019b2b4 100644
          vec![config]
      };
      let mut ranges = vec![];
-@@ -1565,6 +1618,26 @@ impl SharedMemoryMapper for VmRequester {
+@@ -1565,6 +1630,26 @@ impl SharedMemoryMapper for VmRequester {
              .context("unregister_memory failed")
      }
  
@@ -1169,7 +1236,7 @@ index 644ea40..019b2b4 100644
          Some(self.vm_memory_client.as_raw_descriptor())
      }
 diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
-index 36a71ee..8c09f13 100644
+index 36a71ee..148b733 100644
 --- a/src/crosvm/sys/linux.rs
 +++ b/src/crosvm/sys/linux.rs
 @@ -102,6 +102,7 @@ use devices::virtio::vhost_user_backend::VhostUserConnectionTrait;
@@ -1232,11 +1299,11 @@ index 36a71ee..8c09f13 100644
 -            expose_with_viommu: false,
 -            remote_peer: stub.jail.is_some(),
 -        });
-+        if layout_report.is_some() {
++        if let Some(report) = &layout_report {
 +            add_control_tube(AnyControlTube::RestrictedVmMemoryTube {
 +                tube: ioevent_host_tube,
 +                remote_peer: stub.jail.is_some(),
-+                restriction: VmMemoryTubeRestriction::NvgpuIoEvents,
++                restriction: VmMemoryTubeRestriction::NvgpuIoEvents(report.clone()),
 +            });
 +        } else {
 +            add_control_tube(AnyControlTube::VmMemoryTube {

@@ -1,4 +1,4 @@
-From 5f349a17b30ee468206b960356dc252874787d00 Mon Sep 17 00:00:00 2001
+From 8ae3d5873d784aca2535cab09359c873a5709f57 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 03:30:07 +0000
 Subject: [PATCH 5/9] base: place an arena file mapping without leaving a hole
@@ -17,25 +17,100 @@ steer into by handing over such a descriptor.
 
 Place the fd at an address the kernel picks first, where a failure leaves
 the arena untouched, then move it over the target atomically with
-mremap(MREMAP_FIXED). Should the move itself fail (it unmaps the
-destination first), restore the arena's reservation over the range as
+mremap(MREMAP_FIXED). Should the move itself fail after it has unmapped
+the destination, restore the arena's reservation over the range as
 PROT_NONE so a stray access faults here rather than reading whatever
-lands next. Anonymous fixed mappings -- the path `remove` uses to
-re-reserve on unmap -- have no such failure-after-unmap and are left as
-they were. A test forces the pipe-fd failure and asserts, via
-/proc/self/maps, that the arena keeps every page.
+lands next -- with MAP_FIXED_NOREPLACE, so as never to replace a mapping
+another thread made in the hole meanwhile, and checked: if the range
+cannot be refilled, the process aborts rather than leave something
+unknown behind a KVM slot. (A move the kernel refuses before unmapping
+anything, at the mapping limit, aborts too: the two cannot be told apart
+without trusting /proc/self/maps.) A hugetlbfs file is refused before
+anything is mapped: its mapping is a whole huge page long, and moving it
+into the arena would replace up to a gigabyte past the checked range.
+Anonymous fixed mappings -- the path `remove` uses to re-reserve on unmap
+-- have no such failure-after-unmap and are left as they were. Tests force
+the pipe-fd failure and assert, via /proc/self/maps, that the arena keeps
+every page; refill a hole and refuse to replace what is there; and refuse
+a hugetlbfs file.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
- base/src/sys/linux/mmap.rs | 145 +++++++++++++++++++++++++++++++++----
- 1 file changed, 129 insertions(+), 16 deletions(-)
+ base/src/sys/linux/mmap.rs | 268 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 252 insertions(+), 16 deletions(-)
 
 diff --git a/base/src/sys/linux/mmap.rs b/base/src/sys/linux/mmap.rs
-index 371cfea..8f78476 100644
+index 371cfea..836a0f6 100644
 --- a/base/src/sys/linux/mmap.rs
 +++ b/base/src/sys/linux/mmap.rs
-@@ -758,23 +758,74 @@ impl MemoryMappingArena {
+@@ -636,6 +636,55 @@ impl Drop for MemoryMapping {
+     }
+ }
+ 
++/// Whether `fd` is a file of hugetlbfs.
++fn on_hugetlbfs(fd: RawDescriptor) -> Result<bool> {
++    // SAFETY: fstatfs writes one statfs into the zeroed struct.
++    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
++    // SAFETY: as above.
++    if unsafe { libc::fstatfs(fd, &mut sfs) } != 0 {
++        return Err(Error::SystemCallFailed(ErrnoError::last()));
++    }
++    Ok(sfs.f_type as i64 == libc::HUGETLBFS_MAGIC as i64)
++}
++
++/// Put an arena's reservation back over `[target, target + size)`, which a failed
++/// `mremap(MREMAP_FIXED)` may have left unmapped.
++///
++/// With `MAP_FIXED_NOREPLACE`, never `MAP_FIXED`: another thread's mmap may have
++/// landed in the hole since, and replacing it would pull memory out from under that
++/// thread. An error means the range could not be refilled -- it is no longer only a
++/// hole, whatever is in it is not the arena's, and the caller must not carry on as if
++/// it were. (A move the kernel refused before it unmapped anything -- the process at
++/// its mapping limit, say -- also lands here, the reservation whole; the two cannot be
++/// told apart without trusting what /proc/self/maps says of a range another thread may
++/// be mapping into.)
++fn refill_hole(target: *mut u8, size: usize) -> std::result::Result<(), ErrnoError> {
++    // SAFETY: NOREPLACE never displaces an existing mapping.
++    let p = unsafe {
++        libc::mmap64(
++            target as *mut libc::c_void,
++            size,
++            libc::PROT_NONE,
++            libc::MAP_PRIVATE
++                | libc::MAP_ANONYMOUS
++                | libc::MAP_FIXED_NOREPLACE
++                | libc::MAP_NORESERVE,
++            -1,
++            0,
++        )
++    };
++    if p == target as *mut libc::c_void {
++        return Ok(());
++    }
++    if p == libc::MAP_FAILED {
++        return Err(ErrnoError::last());
++    }
++    // A kernel before 4.17 takes NOREPLACE as a hint and maps elsewhere.
++    // SAFETY: the mapping just made, at the address the kernel chose.
++    unsafe { libc::munmap(p, size) };
++    Err(ErrnoError::new(libc::EEXIST))
++}
++
+ /// Tracks Fixed Memory Maps within an anonymous memory-mapped fixed-sized arena
+ /// in the current process.
+ pub struct MemoryMappingArena {
+@@ -745,6 +794,9 @@ impl MemoryMappingArena {
+ 
+     /// Helper method that calls appropriate MemoryMapping constructor and adds
+     /// the resulting map into the arena.
++    ///
++    /// A failed file mapping never leaves a hole in the arena: see
++    /// [`refill_hole`].
+     fn try_add(
+         &mut self,
+         offset: usize,
+@@ -758,23 +810,77 @@ impl MemoryMappingArena {
          }
          validate_includes_range(self.size(), offset, size)?;
  
@@ -67,6 +142,11 @@ index 371cfea..8f78476 100644
 +                // through a KVM slot laid over this arena. Instead map the fd at an
 +                // address the kernel picks, where a failure leaves the arena
 +                // untouched, then move it over the target atomically with mremap.
++                // Not a hugetlbfs file: its mapping is rounded up to the huge page, so the move
++                // below would replace arena -- and whatever follows the arena -- past `size`.
++                if on_hugetlbfs(fd.as_raw_descriptor())? {
++                    return Err(Error::SystemCallFailed(ErrnoError::new(libc::EINVAL)));
++                }
 +                let tmp = MemoryMapping::from_fd_offset_protection(fd, size, fd_offset, prot)?;
 +                // SAFETY: `tmp` owns a live mapping of `size` bytes, and
 +                // `target..target+size` is inside this arena. On success the
@@ -84,23 +164,21 @@ index 371cfea..8f78476 100644
 +                if ret == libc::MAP_FAILED {
 +                    let err = ErrnoError::last();
 +                    // mremap(MREMAP_FIXED) unmaps the destination before it moves,
-+                    // so a failed move leaves a hole there. Restore the arena's
++                    // so a failed move can leave a hole there. Restore the arena's
 +                    // reservation over it (PROT_NONE, so a stray access faults here
-+                    // rather than reading whatever lands next) before returning.
-+                    // `tmp` is then dropped, unmapping the untouched source.
-+                    // SAFETY: `target..target+size` is inside this arena.
-+                    unsafe {
-+                        libc::mmap64(
-+                            target as *mut libc::c_void,
++                    // rather than reading whatever lands next) before returning, or
++                    // stop the process if that cannot be done. `tmp` is then
++                    // dropped, unmapping the untouched source.
++                    if let Err(e) = refill_hole(target, size) {
++                        log::error!(
++                            "arena: {:p}+{:#x} could not be re-reserved after a failed \
++                             placement ({}); stopping, as whatever is there is reachable \
++                             through the arena",
++                            target,
 +                            size,
-+                            libc::PROT_NONE,
-+                            libc::MAP_PRIVATE
-+                                | libc::MAP_ANONYMOUS
-+                                | libc::MAP_FIXED
-+                                | libc::MAP_NORESERVE,
-+                            -1,
-+                            0,
++                            e
 +                        );
++                        std::process::abort();
 +                    }
 +                    return Err(Error::SystemCallFailed(err));
 +                }
@@ -126,7 +204,7 @@ index 371cfea..8f78476 100644
          Ok(())
      }
  
-@@ -1194,4 +1245,66 @@ mod tests {
+@@ -1194,4 +1300,134 @@ mod tests {
              e => panic!("unexpected error: {e}"),
          }
      }
@@ -191,6 +269,74 @@ index 371cfea..8f78476 100644
 +        assert!(fully_mapped(base, 4 * ps));
 +        m.remove(ps, ps).expect("remove should succeed");
 +        assert!(fully_mapped(base, 4 * ps), "unmap left a hole");
++    }
++
++    /// The re-reserve after a failed move fills a hole, and never replaces what is
++    /// there: it reports that instead, and its caller stops.
++    #[test]
++    fn a_hole_is_refilled_and_nothing_else_is_replaced() {
++        let ps = pagesize();
++        // A reservation far below where this process's mappings go (they grow down from
++        // below the stack), so no other test thread's mmap can land in the hole made in it.
++        let base = 0x2000_0000_0000usize;
++        // SAFETY: NOREPLACE never displaces an existing mapping.
++        let p = unsafe {
++            libc::mmap64(
++                base as *mut libc::c_void,
++                4 * ps,
++                libc::PROT_NONE,
++                libc::MAP_PRIVATE
++                    | libc::MAP_ANONYMOUS
++                    | libc::MAP_FIXED_NOREPLACE
++                    | libc::MAP_NORESERVE,
++                -1,
++                0,
++            )
++        };
++        assert_eq!(p as usize, base);
++        let hole = (base + ps) as *mut u8;
++        // SAFETY: a page of the reservation this test owns, which nothing refers to.
++        assert_eq!(unsafe { libc::munmap(hole as *mut libc::c_void, ps) }, 0);
++        assert!(!fully_mapped(base, 4 * ps));
++        refill_hole(hole, ps).expect("a hole is refilled");
++        assert!(fully_mapped(base, 4 * ps));
++        // Now the page is mapped: refused, and left as it is.
++        assert_eq!(
++            refill_hole(hole, ps).map_err(|e| e.errno()),
++            Err(libc::EEXIST)
++        );
++        assert!(fully_mapped(base, 4 * ps));
++        // SAFETY: the reservation made above.
++        unsafe { libc::munmap(p, 4 * ps) };
++    }
++
++    /// A hugetlbfs file never goes into an arena: its mapping would be a huge page long.
++    #[test]
++    fn arena_refuses_a_hugetlbfs_file() {
++        let ps = pagesize();
++        let mut m = MemoryMappingArena::new_protection(4 * ps, Protection::read_write()).unwrap();
++        let base = m.as_ptr() as usize;
++        // SAFETY: a plain syscall; the descriptor is owned below.
++        let fd = unsafe {
++            libc::memfd_create(
++                c"arena-huge".as_ptr(),
++                libc::MFD_CLOEXEC | libc::MFD_HUGETLB,
++            )
++        };
++        if fd < 0 {
++            // No hugetlbfs on this host: nothing to test.
++            return;
++        }
++        let huge = Descriptor(fd);
++        assert!(on_hugetlbfs(fd).unwrap());
++        assert!(m
++            .add_fd_offset_protection(0, ps, &huge, 0, Protection::read())
++            .is_err());
++        assert!(fully_mapped(base, 4 * ps));
++        // SAFETY: the descriptor made above.
++        unsafe { libc::close(fd) };
++        let plain = tempfile().unwrap();
++        assert!(!on_hugetlbfs(plain.as_raw_descriptor()).unwrap());
 +    }
  }
 -- 

@@ -1,4 +1,4 @@
-From e7b866fbe3ea4bca908c87f55169fd5b8236aba0 Mon Sep 17 00:00:00 2001
+From 46c8c2267e4fe008c858aab8040e0eddc67c7656 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
 Subject: [PATCH 7/9] vm_control: hold virtio-nvgpu's memory tubes, and map UVM
@@ -18,7 +18,10 @@ once, from an NVIDIA device (major 195) or a DRM node (226) -- the only files
 the backend places there -- and writable only if opened read-write. Anything
 else a VmMemoryRequest can ask -- another allocation, a guest physical
 address, a non-descriptor source, ballooning, ioevents -- is refused. The
-ioevent tube may register ioevents and nothing else.
+ioevent tube may register ioevents and nothing else, and only at the
+device's own queue notification addresses (the layout reports them), any
+length, each once: anywhere else a compromised device process could take
+another device's doorbell, or any MMIO address of the VM.
 
 Two new requests place CUDA's UVM semaphore pools in region 2, the UVM
 aperture: RegisterUvmPool maps a UVM file at the host address that is its
@@ -28,20 +31,25 @@ the slot away, then the mapping. The main process checks the address is
 page-aligned and in [4 GiB, 32 TiB), the length non-zero, whole pages and at
 most 64 MiB, the offset inside the aperture it laid out and clear of live
 pools, the file offset equal to the address, the descriptor really
-/dev/nvidia-uvm (minor 0 of the major /proc/devices gives, or its
-/proc/self/fd link) opened read-write, and at most 64 pools and 256 MiB per
-device. Withdrawal must name a live pool exactly. When the tube goes away,
-every pool and window mapping it made is withdrawn. Refusals are logged,
-the first eight and then every 1024th. Unrestricted tubes refuse both.
+/dev/nvidia-uvm (minor 0 of the major /proc/devices gives; with no major
+known, nothing is) opened read-write, the file one this process's mincore
+is answered for (its owner, or writable by it: otherwise the kernel reports
+every page present and the check proves nothing), and at most 64 pools and
+256 MiB per device. Withdrawal must name a live pool exactly. When the tube
+goes away, every pool and window mapping it made is withdrawn. Refusals are
+logged, the first eight and then every 1024th. Unrestricted tubes refuse
+both.
 
 reserve_uvm_band reserves [4 GiB, 32 TiB) PROT_NONE, MAP_NORESERVE, before
 anything else can be placed there. A pool is then mapped with MAP_FIXED over
 that reservation only (a range the band tracks: never a live pool, never a
 range left unknown by a failure), and withdrawal puts the reservation back
-in the same step. A failed placement refills any hole it left (checked
-against /proc/self/maps) or never maps there again. UVM does not take a
-mapping moved in with mremap (its offset must equal the address at mmap
-time, and a semaphore pool's vm_open disables a moved vma), so the window's
+in the same step. A failed placement refills any hole it left with
+MAP_FIXED_NOREPLACE; a range that cannot be refilled is never mapped over
+again (what /proc/self/maps shows there cannot say whose it is), and past
+256 such ranges the band takes no more pools. UVM does not take a mapping
+moved in with mremap (its offset must equal the address at mmap time, and a
+semaphore pool's vm_open disables a moved vma), so the window's
 map-then-move placement cannot be used; without the band a pool is mapped
 with MAP_FIXED_NOREPLACE.
 
@@ -50,11 +58,11 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
  vm_control/src/any_control_tube.rs |    9 +
  vm_control/src/api.rs              |   31 +
- vm_control/src/lib.rs              |   57 +
+ vm_control/src/lib.rs              |   60 +
  vm_control/src/nvgpu.rs            |   26 +
  vm_control/src/sys/linux.rs        |   23 +-
- vm_control/src/sys/linux/nvgpu.rs  | 1957 ++++++++++++++++++++++++++++
- 6 files changed, 2102 insertions(+), 1 deletion(-)
+ vm_control/src/sys/linux/nvgpu.rs  | 2206 ++++++++++++++++++++++++++++
+ 6 files changed, 2354 insertions(+), 1 deletion(-)
  create mode 100644 vm_control/src/nvgpu.rs
  create mode 100644 vm_control/src/sys/linux/nvgpu.rs
 
@@ -121,7 +129,7 @@ index 5f04d72..987f8fa 100644
          self.request_unit(&VmMemoryRequest::BalloonTargetReached { size })
      }
 diff --git a/vm_control/src/lib.rs b/vm_control/src/lib.rs
-index 0387a13..5581984 100644
+index 0387a13..169d38e 100644
 --- a/vm_control/src/lib.rs
 +++ b/vm_control/src/lib.rs
 @@ -23,6 +23,7 @@ pub use device_id::PlatformDeviceId;
@@ -132,7 +140,7 @@ index 0387a13..5581984 100644
  
  use base::debug;
  #[cfg(any(target_os = "android", target_os = "linux"))]
-@@ -550,6 +551,34 @@ impl VmMemorySource {
+@@ -550,6 +551,37 @@ impl VmMemorySource {
      }
  }
  
@@ -147,6 +155,9 @@ index 0387a13..5581984 100644
 +    pub size: u64,
 +    /// Each region: its shared memory id, its offset in the BAR and its length.
 +    pub regions: Vec<(u8, u64, u64)>,
++    /// The guest physical address and length of the device's queue notification addresses (one
++    /// per queue, in its settings BAR), where its ioevents belong.
++    pub notify: Option<(u64, u64)>,
 +}
 +
 +impl SharedMemoryBarLayout {
@@ -167,7 +178,7 @@ index 0387a13..5581984 100644
  /// Destination of a `VmMemoryRequest::RegisterMemory` mapping in guest address space.
  #[derive(Serialize, Deserialize)]
  pub enum VmMemoryDestination {
-@@ -633,6 +662,28 @@ pub enum VmMemoryRequest {
+@@ -633,6 +665,28 @@ pub enum VmMemoryRequest {
      UnregisterMemory(VmMemoryRegionId),
      /// Register an eventfd with raw guest memory address.
      IoEventRaw(IoEventUpdateRequest),
@@ -196,7 +207,7 @@ index 0387a13..5581984 100644
  }
  
  /// Struct for managing `VmMemoryRequest`s IOMMU related state.
-@@ -1084,6 +1135,12 @@ impl VmMemoryRequest {
+@@ -1084,6 +1138,12 @@ impl VmMemoryRequest {
                      Err(e) => VmMemoryResponse::Err(e.into()),
                  }
              }
@@ -290,10 +301,10 @@ index c3594f3..4992ece 100644
              };
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
 new file mode 100644
-index 0000000..d5bc11e
+index 0000000..ebc7a3f
 --- /dev/null
 +++ b/vm_control/src/sys/linux/nvgpu.rs
-@@ -0,0 +1,1957 @@
+@@ -0,0 +1,2206 @@
 +// Copyright 2026 The ChromiumOS Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -313,7 +324,9 @@ index 0000000..d5bc11e
 +//! another allocation, a guest physical address, a source that is not a descriptor, ballooning,
 +//! ioevents -- is refused.
 +//!
-+//! **The ioevent tube** may register and unregister ioevents, nothing else.
++//! **The ioevent tube** may register and unregister ioevents, nothing else, and only at the
++//! device's own queue notification addresses in its settings BAR (as the transport reported them
++//! when it laid the BAR out), any length, each once.
 +//!
 +//! **The UVM aperture.** A CUDA context maps a UVM semaphore pool at a host address equal to its
 +//! file offset (UVM takes it nowhere else, `uvm.c` `uvm_mmap`), and that address is the guest's
@@ -336,6 +349,7 @@ index 0000000..d5bc11e
 +//! device's tube goes away, every pool it placed is withdrawn here.
 +
 +use std::collections::BTreeMap;
++use std::collections::BTreeSet;
 +use std::fs::File;
 +use std::io;
 +use std::os::unix::fs::MetadataExt;
@@ -348,6 +362,7 @@ index 0000000..d5bc11e
 +use base::MappedRegion;
 +use base::Protection;
 +use base::SafeDescriptor;
++use hypervisor::Datamatch;
 +use hypervisor::MemCacheType;
 +use hypervisor::MemSlot;
 +use hypervisor::Vm;
@@ -389,17 +404,20 @@ index 0000000..d5bc11e
 +    /// The tube its shared memory is mapped through, held to the BAR the PCI transport reports
 +    /// into this cell.
 +    NvgpuSharedMemory(SharedMemoryLayoutReport),
-+    /// The tube its ioevents are registered through.
-+    NvgpuIoEvents,
++    /// The tube its ioevents are registered through, held to the notification addresses the PCI
++    /// transport reports into this cell.
++    NvgpuIoEvents(SharedMemoryLayoutReport),
 +}
 +
 +impl VmMemoryTubeRestriction {
-+    /// The policy, once the BAR has been laid out. A shared memory tube whose BAR was never laid
-+    /// out gets a policy that refuses everything.
++    /// The policy, once the BARs have been laid out. A tube whose BAR was never laid out gets a
++    /// policy that refuses everything.
 +    pub fn resolve(&self) -> NvgpuTubePolicy {
 +        match self {
 +            Self::NvgpuSharedMemory(report) => NvgpuTubePolicy::SharedMemory(report.get().cloned()),
-+            Self::NvgpuIoEvents => NvgpuTubePolicy::IoEvents,
++            Self::NvgpuIoEvents(report) => {
++                NvgpuTubePolicy::IoEvents(report.get().and_then(|layout| layout.notify))
++            }
 +        }
 +    }
 +}
@@ -409,9 +427,14 @@ index 0000000..d5bc11e
 +pub enum NvgpuTubePolicy {
 +    /// Region 1 and region 2 of this BAR, as described above; `None` for nothing at all.
 +    SharedMemory(Option<SharedMemoryBarLayout>),
-+    /// Ioevents only.
-+    IoEvents,
++    /// Ioevents only, each at one of the device's own queue notification addresses (guest
++    /// physical base and length); `None` for none at all.
++    IoEvents(Option<(u64, u64)>),
 +}
++
++/// The distance between two queues' notification addresses (virtio-pci's
++/// `notify_off_multiplier`, as crosvm's transport sets it).
++pub const NOTIFY_OFF_MULTIPLIER: u64 = 4;
 +
 +/// The two regions, checked.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,6 +543,10 @@ index 0000000..d5bc11e
 +}
 +
 +/// The descriptor's kind and its access mode (`O_ACCMODE` of its flags).
++///
++/// A character device is nvidia-uvm only by its major as `/proc/devices` names it. Without that
++/// major nothing is: a path (`/proc/self/fd`'s link) says only where some character device was
++/// opened, in whichever mount namespace opened it.
 +fn describe(fd: &SafeDescriptor) -> io::Result<(FdKind, i32)> {
 +    let file = File::from(fd.try_clone().map_err(io::Error::from)?);
 +    let meta = file.metadata()?;
@@ -528,16 +555,27 @@ index 0000000..d5bc11e
 +    if flags < 0 {
 +        return Err(io::Error::last_os_error());
 +    }
-+    let mut kind = classify(meta.mode(), meta.rdev(), uvm_major());
-+    if kind == FdKind::Other && meta.mode() & libc::S_IFMT == libc::S_IFCHR && uvm_major().is_none()
-+    {
-+        // No nvidia-uvm in /proc/devices (another mount namespace's procfs): its path, then.
-+        let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_descriptor()));
-+        if link.is_ok_and(|p| p.as_os_str() == "/dev/nvidia-uvm") {
-+            kind = FdKind::Uvm;
-+        }
-+    }
++    let kind = classify(meta.mode(), meta.rdev(), uvm_major());
 +    Ok((kind, flags & libc::O_ACCMODE))
++}
++
++/// Whether `mincore` on a shared mapping of `fd` says what is really there.
++///
++/// For a file mapping the kernel reports residency only when the caller owns the file or could
++/// open it for writing (`can_do_mincore`); otherwise it says every page is present, whatever is
++/// there. A pool's pages are checked with `mincore` before its slot is added, and a slot over
++/// nothing stops the VM, so that check must not be vacuous. The descriptor being open read-write
++/// is not enough: the kernel asks about this process's credentials on the file.
++fn mincore_reports_on(fd: &SafeDescriptor) -> io::Result<bool> {
++    let file = File::from(fd.try_clone().map_err(io::Error::from)?);
++    // SAFETY: a plain syscall with no memory of ours.
++    if file.metadata()?.uid() == unsafe { libc::geteuid() } {
++        return Ok(true);
++    }
++    let path = std::ffi::CString::new(format!("/proc/self/fd/{}", file.as_raw_descriptor()))
++        .expect("no NUL");
++    // SAFETY: `path` is a valid C string that access only reads.
++    Ok(unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
 +}
 +
 +/// Whether a descriptor of `kind`, opened with `accmode`, may be mapped `writable` into the
@@ -567,8 +605,13 @@ index 0000000..d5bc11e
 +
 +fn check_uvm_fd(fd: &SafeDescriptor) -> Result<(), i32> {
 +    match describe(fd) {
-+        Ok((kind, accmode)) if uvm_fd_allowed(kind, accmode) => Ok(()),
-+        Ok(_) => Err(libc::EPERM),
++        Ok((kind, accmode)) if uvm_fd_allowed(kind, accmode) => {}
++        Ok(_) => return Err(libc::EPERM),
++        Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EBADF)),
++    }
++    match mincore_reports_on(fd) {
++        Ok(true) => Ok(()),
++        Ok(false) => Err(libc::EACCES),
 +        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EBADF)),
 +    }
 +}
@@ -593,7 +636,10 @@ index 0000000..d5bc11e
 +}
 +
 +/// Whether `[addr, addr + len)` is covered, without a gap, by anonymous `PROT_NONE` private
-+/// mappings: what the band's reservation looks like in `/proc/self/maps`.
++/// mappings: what the band's reservation looks like in `/proc/self/maps`. For tests only: any
++/// other thread's `PROT_NONE` reserve (a malloc arena's, say) looks the same, so it proves
++/// nothing about whose a range is.
++#[cfg(test)]
 +fn is_reservation(addr: u64, len: u64) -> bool {
 +    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
 +        return false;
@@ -644,6 +690,9 @@ index 0000000..d5bc11e
 +pub static UVM_BAND: Mutex<UvmBand> = Mutex::new(UvmBand::new(UVM_HVA_MIN, UVM_HVA_MAX));
 +
 +const RESERVE_FLAGS: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
++
++/// Ranges the band will give up before it takes no more pools.
++const UVM_BAND_MAX_TAINTED: usize = 256;
 +
 +/// Reserve this process's band, `PROT_NONE`, before anything else is placed in it. Call once, in
 +/// the main process, before any thread or device process is started. Without it pools are mapped
@@ -722,6 +771,11 @@ index 0000000..d5bc11e
 +        if b.overlaps(addr, len) {
 +            return Err(io::Error::from_raw_os_error(libc::EEXIST));
 +        }
++        // Every failed placement may taint its range, and a guest can fail placements at will:
++        // past this many, the band takes no more pools rather than grow the list without end.
++        if b.tainted.len() >= UVM_BAND_MAX_TAINTED {
++            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
++        }
 +        let fixed = if b.reserved {
 +            libc::MAP_FIXED
 +        } else {
@@ -773,8 +827,10 @@ index 0000000..d5bc11e
 +    }
 +
 +    /// After a failed `MAP_FIXED` over the reservation: the kernel either put the reservation
-+    /// back or left the range unmapped. Fill a hole; if the range holds anything but the
-+    /// reservation, never map over it again.
++    /// back or left the range unmapped. Fill a hole, with `MAP_FIXED_NOREPLACE` so as never to
++    /// replace what another thread may have mapped there since. If that cannot be done, what is
++    /// there is not known -- the reservation, or something of another thread's that only looks
++    /// like it -- so the range is never mapped over again.
 +    fn repair(&mut self, addr: u64, len: u64) {
 +        // SAFETY: NOREPLACE never displaces an existing mapping.
 +        let p = unsafe {
@@ -794,14 +850,12 @@ index 0000000..d5bc11e
 +            // SAFETY: the mapping just made, at the address the kernel gave.
 +            unsafe { libc::munmap(p, len as usize) };
 +        }
-+        if !is_reservation(addr, len) {
-+            error!(
-+                "nvgpu uvm: {:#x}+{:#x} is no longer reserved after a failed placement; never \
-+                 placing there again",
-+                addr, len
-+            );
-+            self.tainted.push((addr, len));
-+        }
++        warn!(
++            "nvgpu uvm: {:#x}+{:#x} could not be re-reserved after a failed placement; never \
++             placing there again",
++            addr, len
++        );
++        self.tainted.push((addr, len));
 +    }
 +
 +    /// Take a pool's mapping away, putting the reservation back in the same step.
@@ -920,6 +974,7 @@ index 0000000..d5bc11e
 +    Nothing,
 +    Register { offset: u64, len: u64 },
 +    Unregister(VmMemoryRegionId),
++    IoEvent { addr: u64, register: bool },
 +}
 +
 +enum Admission {
@@ -947,7 +1002,8 @@ index 0000000..d5bc11e
 +
 +enum Role {
 +    SharedMemory(Option<Regions>),
-+    IoEvents,
++    /// The device's queue notification addresses: guest physical base and length.
++    IoEvents(Option<(u64, u64)>),
 +}
 +
 +/// One restricted tube's record: what it has mapped, and how many refusals it has had.
@@ -960,6 +1016,8 @@ index 0000000..d5bc11e
 +    /// Pools, by BAR offset.
 +    pools: BTreeMap<u64, Pool>,
 +    pool_bytes: u64,
++    /// The notification addresses an ioevent is registered at, through this tube.
++    ioevents: BTreeSet<u64>,
 +    refusals: u64,
 +    band: &'static Mutex<UvmBand>,
 +    window_fd_check: fn(&SafeDescriptor, bool) -> Result<(), i32>,
@@ -984,7 +1042,15 @@ index 0000000..d5bc11e
 +                }
 +                Role::SharedMemory(regions)
 +            }
-+            NvgpuTubePolicy::IoEvents => Role::IoEvents,
++            NvgpuTubePolicy::IoEvents(notify) => {
++                if notify.is_none() {
++                    error!(
++                        "nvgpu: no queue notification addresses were reported; every ioevent \
++                         of this device will be refused"
++                    );
++                }
++                Role::IoEvents(notify)
++            }
 +        };
 +        NvgpuTubeState {
 +            role,
@@ -992,6 +1058,7 @@ index 0000000..d5bc11e
 +            window_ids: BTreeMap::new(),
 +            pools: BTreeMap::new(),
 +            pool_bytes: 0,
++            ioevents: BTreeSet::new(),
 +            refusals: 0,
 +            band: &UVM_BAND,
 +            window_fd_check: check_window_fd,
@@ -1046,6 +1113,15 @@ index 0000000..d5bc11e
 +            Pending::Unregister(id) => {
 +                if let Some(offset) = self.window_ids.remove(&id) {
 +                    self.window.remove(&offset);
++                }
++            }
++            Pending::IoEvent { addr, register } => {
++                if let VmMemoryResponse::Ok = response {
++                    if register {
++                        self.ioevents.insert(addr);
++                    } else {
++                        self.ioevents.remove(&addr);
++                    }
 +                }
 +            }
 +        }
@@ -1104,9 +1180,18 @@ index 0000000..d5bc11e
 +
 +    fn admit(&mut self, request: VmMemoryRequest) -> Admission {
 +        let regions = match &self.role {
-+            Role::IoEvents => {
++            Role::IoEvents(notify) => {
 +                return match request {
-+                    VmMemoryRequest::IoEventRaw(_) => Admission::Execute(request, Pending::Nothing),
++                    VmMemoryRequest::IoEventRaw(ref r) => match self.check_ioevent(*notify, r) {
++                        Ok(()) => {
++                            let pending = Pending::IoEvent {
++                                addr: r.addr,
++                                register: r.register,
++                            };
++                            Admission::Execute(request, pending)
++                        }
++                        Err((errno, why)) => Admission::Refuse(errno, why),
++                    },
 +                    _ => Admission::Refuse(
 +                        libc::EPERM,
 +                        "the ioevent tube asked for something other than an ioevent".into(),
@@ -1196,6 +1281,48 @@ index 0000000..d5bc11e
 +                libc::EPERM,
 +                "the shared memory tube asked for something it has no use for".into(),
 +            ),
++        }
++    }
++
++    /// An ioevent is allowed: at one of the device's own queue notification addresses, any
++    /// length (as the transport registers them), registered once and unregistered only where it
++    /// is. Anywhere else it would take another device's doorbell -- or any MMIO address of the
++    /// VM -- out of that device's hands.
++    fn check_ioevent(
++        &self,
++        notify: Option<(u64, u64)>,
++        r: &crate::IoEventUpdateRequest,
++    ) -> Result<(), (i32, String)> {
++        let Some((base, len)) = notify else {
++            return Err((libc::ENODEV, "no queue notification addresses".into()));
++        };
++        let off = r.addr.wrapping_sub(base);
++        if r.addr < base || off >= len || off % NOTIFY_OFF_MULTIPLIER != 0 {
++            return Err((
++                libc::EPERM,
++                format!(
++                    "ioevent at {:#x}, not one of the device's notification addresses \
++                     ({:#x}+{:#x})",
++                    r.addr, base, len
++                ),
++            ));
++        }
++        if !matches!(r.datamatch, Datamatch::AnyLength) {
++            return Err((
++                libc::EPERM,
++                format!("ioevent at {:#x} matching on a value", r.addr),
++            ));
++        }
++        match (r.register, self.ioevents.contains(&r.addr)) {
++            (true, true) => Err((
++                libc::EEXIST,
++                format!("ioevent at {:#x} is already registered", r.addr),
++            )),
++            (false, false) => Err((
++                libc::ENOENT,
++                format!("ioevent at {:#x} is not registered", r.addr),
++            )),
++            _ => Ok(()),
 +        }
 +    }
 +
@@ -1494,8 +1621,12 @@ index 0000000..d5bc11e
 +            alloc: ALLOC,
 +            size: 2 << 30,
 +            regions,
++            notify: Some((NOTIFY, 2 * NOTIFY_OFF_MULTIPLIER)),
 +        }
 +    }
++
++    /// Guest physical address of the fake device's queue notification addresses.
++    const NOTIFY: u64 = 0xc000_3000;
 +
 +    /// A test band of its own, 1 GiB, at an address no other test uses.
 +    fn band() -> (&'static Mutex<UvmBand>, u64) {
@@ -1773,6 +1904,88 @@ index 0000000..d5bc11e
 +        assert_eq!(admit_ok(&mut s, register(0, 4096, 0)), None);
 +    }
 +
++    fn ioevent(addr: u64, register: bool) -> VmMemoryRequest {
++        VmMemoryRequest::IoEventRaw(IoEventUpdateRequest {
++            event: base::Event::new().unwrap(),
++            addr,
++            datamatch: Datamatch::AnyLength,
++            register,
++        })
++    }
++
++    /// Admit `r` and, if it would be executed, record the answer `ok` or an error.
++    fn ioevent_run(s: &mut NvgpuTubeState, r: VmMemoryRequest, ok: bool) -> Option<i32> {
++        match s.admit(r) {
++            Admission::Execute(_, p) => {
++                let response = if ok {
++                    VmMemoryResponse::Ok
++                } else {
++                    err_response(libc::EIO)
++                };
++                s.note(p, &response);
++                None
++            }
++            a => errno(&a),
++        }
++    }
++
++    /// Ioevents only at the device's own notification addresses, each once.
++    #[test]
++    fn ioevents_are_held_to_the_devices_doorbells() {
++        let mut s = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents(Some((NOTIFY, 8))));
++        // Queue 0 and 1; not between them, before, past, or anywhere else in the VM.
++        assert_eq!(ioevent_run(&mut s, ioevent(NOTIFY, true), true), None);
++        assert_eq!(ioevent_run(&mut s, ioevent(NOTIFY + 4, true), true), None);
++        for addr in [NOTIFY + 2, NOTIFY - 4, NOTIFY + 8, 0xfee0_0000, 0, u64::MAX] {
++            assert_eq!(
++                ioevent_run(&mut s, ioevent(addr, true), true),
++                Some(libc::EPERM),
++                "{:#x}",
++                addr
++            );
++        }
++        // Once each, and unregistered only where registered.
++        assert_eq!(
++            ioevent_run(&mut s, ioevent(NOTIFY, true), true),
++            Some(libc::EEXIST)
++        );
++        assert_eq!(ioevent_run(&mut s, ioevent(NOTIFY, false), true), None);
++        assert_eq!(
++            ioevent_run(&mut s, ioevent(NOTIFY, false), true),
++            Some(libc::ENOENT)
++        );
++        // A registration KVM refused is not recorded.
++        assert_eq!(ioevent_run(&mut s, ioevent(NOTIFY, true), false), None);
++        assert_eq!(ioevent_run(&mut s, ioevent(NOTIFY, true), true), None);
++        // Only any-length matches, as the transport registers them.
++        let r = VmMemoryRequest::IoEventRaw(IoEventUpdateRequest {
++            event: base::Event::new().unwrap(),
++            addr: NOTIFY + 4,
++            datamatch: Datamatch::U32(Some(0)),
++            register: false,
++        });
++        assert_eq!(ioevent_run(&mut s, r, true), Some(libc::EPERM));
++
++        // No addresses reported: no ioevents.
++        let mut none = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents(None));
++        assert_eq!(
++            ioevent_run(&mut none, ioevent(NOTIFY, true), true),
++            Some(libc::ENODEV)
++        );
++        // Resolved from the transport's report.
++        let report: SharedMemoryLayoutReport = Default::default();
++        let restriction = VmMemoryTubeRestriction::NvgpuIoEvents(report.clone());
++        assert!(matches!(
++            restriction.resolve(),
++            NvgpuTubePolicy::IoEvents(None)
++        ));
++        report.set(layout(true)).unwrap();
++        assert!(matches!(
++            restriction.resolve(),
++            NvgpuTubePolicy::IoEvents(Some((NOTIFY, 8)))
++        ));
++    }
++
 +    #[test]
 +    fn nothing_else_is_served() {
 +        let mut s = state(true);
@@ -1817,8 +2030,11 @@ index 0000000..d5bc11e
 +        ));
 +
 +        // The ioevent tube: ioevents and nothing else.
-+        let mut io_tube = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents);
-+        assert!(matches!(io_tube.admit(io()), Admission::Execute(..)));
++        let mut io_tube = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents(layout(true).notify));
++        assert!(matches!(
++            io_tube.admit(ioevent(NOTIFY, true)),
++            Admission::Execute(..)
++        ));
 +        assert_eq!(
 +            errno(&io_tube.admit(register(0, 4096, 0))),
 +            Some(libc::EPERM)
@@ -2216,7 +2432,51 @@ index 0000000..d5bc11e
 +        let hva = base + 64 * MIB;
 +        assert!(UvmBand::place(band, &r, hva, 2 * MIB).is_err());
 +        assert!(is_reservation(base, 1 << 30));
-+        assert!(band.lock().unwrap().tainted.is_empty());
++        // The kernel refused before it touched the reservation, so it could not be refilled:
++        // the range is given up rather than judged by what /proc/self/maps shows, and nothing
++        // is placed over it again.
++        assert_eq!(band.lock().unwrap().tainted, vec![(hva, 2 * MIB)]);
++        let pool = pool_file(hva - 2 * MIB, 4 * MIB, true);
++        assert_eq!(
++            UvmBand::place(band, &pool, hva + MIB, 2 * MIB)
++                .err()
++                .and_then(|e| e.raw_os_error()),
++            Some(libc::EEXIST)
++        );
++        match UvmBand::place(band, &pool, hva - 2 * MIB, 2 * MIB) {
++            Ok(elsewhere) => drop(elsewhere),
++            Err(e) => panic!("a pool next to the tainted range: {}", e),
++        }
++
++        // Past the cap, the band takes no more pools.
++        {
++            let mut b = band.lock().unwrap();
++            while b.tainted.len() < UVM_BAND_MAX_TAINTED {
++                b.tainted.push((0, 0));
++            }
++        }
++        assert_eq!(
++            UvmBand::place(band, &pool, hva - 2 * MIB, 2 * MIB)
++                .err()
++                .and_then(|e| e.raw_os_error()),
++            Some(libc::ENOSPC)
++        );
++    }
++
++    /// `mincore` is believed only for a file the kernel answers it for.
++    #[test]
++    fn mincore_is_trusted_only_where_the_kernel_answers_it() {
++        let own = pool_file(0, 4096, true);
++        assert!(mincore_reports_on(&own).unwrap());
++        // SAFETY: a plain syscall.
++        if unsafe { libc::geteuid() } != 0 {
++            if let Ok(f) = File::open("/etc/passwd") {
++                // SAFETY: a plain syscall.
++                if f.metadata().unwrap().uid() != unsafe { libc::geteuid() } {
++                    assert!(!mincore_reports_on(&SafeDescriptor::from(f)).unwrap());
++                }
++            }
++        }
 +    }
 +
 +    #[test]
