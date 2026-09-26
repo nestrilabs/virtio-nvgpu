@@ -983,6 +983,23 @@ fi
 # log call site (device/src/ratelimit.rs), so a guest cannot grow it at will.
 BLOG=$LOGS/$TAG.backend.log
 CONSOLE=$LOGS/$TAG.console.log
+# The backend refuses its diagnostic flags without --diagnostic
+# (vhost-user-nvgpu --diagnostic --help). One here was asked for -- after --,
+# or by NVGPU_SANDBOX=off or NVGPU_ALLOW_ROOT_UNSAFE=1 above -- so say so.
+diag_prev=
+for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
+    case $diag_prev/$a in
+        */--diagnostic) break ;;
+        */--allow-root-unsafe | */--proc-nvidia | */--proc-nvidia=* | */--permissive-abi | \
+            */--keep-guest-coherency | */--allow-unmeasured-release | \
+            */--rm-allowlist=log | --rm-allowlist/log | \
+            */--sandbox=off | */--sandbox=best-effort | --sandbox/off | --sandbox/best-effort)
+            BACKEND_ARGS+=(--diagnostic)
+            break
+            ;;
+    esac
+    diag_prev=$a
+done
 echo "backend: as $NVGPU_USER ($PRIV, $LAYOUT layout)${BACKEND_ARGS[*]:+, with ${BACKEND_ARGS[*]}}" >&2
 RUST_LOG=${RUST_LOG:-info} "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
     "$BACKEND_EXE" --socket "$SOCK" "${BACKEND_ARGS[@]}" \

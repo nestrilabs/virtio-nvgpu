@@ -88,6 +88,17 @@ const HDR: usize = size_of::<MsgHeader>();
 #[derive(Parser, Debug)]
 #[command(version, about = "vhost-user backend for virtio-nvgpu")]
 struct Args {
+    /// Allow the diagnostic flags: those that take away a protection to find
+    /// out whether it is what broke something, and are never for running a
+    /// guest. Each is refused without this (or NVGPU_DIAGNOSTIC=1), and each
+    /// in effect is announced on stderr and in the log at every start:
+    /// `--allow-root-unsafe`, `--proc-nvidia`, `--permissive-abi`,
+    /// `--keep-guest-coherency`, `--rm-allowlist=log`,
+    /// `--sandbox=best-effort`, `--sandbox=off` and
+    /// `--allow-unmeasured-release` (see each with `--diagnostic --help`).
+    #[arg(long)]
+    diagnostic: bool,
+
     /// Unix socket the VMM connects to [default:
     /// $XDG_RUNTIME_DIR/nvgpu/nvgpu.sock].
     ///
@@ -104,12 +115,13 @@ struct Args {
     /// credentials: as root every guest process is an RM administrator with
     /// all of BAR0 mappable, which is the host kernel. Capabilities are
     /// dropped at startup either way; this only lets the start happen.
-    #[arg(long)]
+    /// Diagnostic.
+    #[arg(long, hide = true)]
     allow_root_unsafe: bool,
 
     /// Where the host driver publishes itself. Overridable for testing
-    /// against a fixture tree rather than a live driver.
-    #[arg(long, default_value = host::PROC_NVIDIA)]
+    /// against a fixture tree rather than a live driver. Diagnostic.
+    #[arg(long, default_value = host::PROC_NVIDIA, hide = true)]
     proc_nvidia: PathBuf,
 
     /// Forward ioctls the ABI profile does not describe instead of refusing
@@ -117,8 +129,8 @@ struct Args {
     ///
     /// For finding out what a workload needs that the tables lack. It hands a
     /// guest the parts of the host driver's interface nobody has checked, so it
-    /// is not a way to run one.
-    #[arg(long)]
+    /// is not a way to run one. Diagnostic.
+    #[arg(long, hide = true)]
     permissive_abi: bool,
 
     /// Start on a host driver release the tables were not all measured at
@@ -128,8 +140,8 @@ struct Args {
     /// For keeping a host running across a driver upgrade until the new
     /// release is measured (gen/README.md). The older tables may let
     /// through a control whose parameters the new release reads
-    /// differently; that is what measuring it rules out.
-    #[arg(long)]
+    /// differently; that is what measuring it rules out. Diagnostic.
+    #[arg(long, hide = true)]
     allow_unmeasured_release: bool,
 
     /// What to do with an RM control or class the host release's allowlist
@@ -140,8 +152,8 @@ struct Args {
     /// `log` is for finding out what a new workload needs (the teardown
     /// report lists everything it would have refused); like
     /// `--permissive-abi`, it hands a guest the parts of RM nobody has
-    /// vetted, so it is not a way to run one. `--permissive-abi` does not
-    /// change this gate.
+    /// vetted, so it is not a way to run one: `log` is diagnostic.
+    /// `--permissive-abi` does not change this gate.
     #[arg(long, value_name = "MODE", default_value = "enforce")]
     rm_allowlist: device::rmallow::Mode,
 
@@ -164,8 +176,8 @@ struct Args {
     /// For ruling the rewrite out when chasing a problem. On an Intel host
     /// KVM maps guest RAM write-back whatever the guest asks, unless the VMM
     /// disables KVM_X86_QUIRK_IGNORE_GUEST_PAT, so with this set a guest there
-    /// caches memory the GPU does not snoop.
-    #[arg(long)]
+    /// caches memory the GPU does not snoop. Diagnostic.
+    #[arg(long, hide = true)]
     keep_guest_coherency: bool,
 
     /// The process sandbox (device::sandbox): a network namespace of its
@@ -178,7 +190,7 @@ struct Args {
     /// reported as DEGRADED: for a host being brought up to the sandbox.
     /// `off` is for finding out whether the sandbox is what broke something,
     /// never for running a guest: a backend taken over is then everything
-    /// its uid is.
+    /// its uid is. Both are diagnostic.
     #[arg(long, value_name = "on|best-effort|off", default_value_t = device::sandbox::Mode::On)]
     sandbox: device::sandbox::Mode,
 
@@ -1142,6 +1154,102 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 }
 
+/// Whether NVGPU_DIAGNOSTIC=1 is set.
+fn diagnostic_env() -> bool {
+    std::env::var_os("NVGPU_DIAGNOSTIC").is_some_and(|v| v == "1")
+}
+
+/// The arguments. The diagnostic flags are hidden from `--help` unless
+/// `--diagnostic` (or NVGPU_DIAGNOSTIC=1) is given too.
+fn parse_args() -> Args {
+    use clap::{CommandFactory, FromArgMatches};
+    let diagnostic = diagnostic_env() || std::env::args_os().any(|a| a == "--diagnostic");
+    let mut cmd = Args::command();
+    if diagnostic {
+        cmd = cmd.mut_args(|a| a.hide(false));
+    }
+    let m = cmd.get_matches();
+    Args::from_arg_matches(&m).unwrap_or_else(|e| e.exit())
+}
+
+/// The diagnostic flags in effect, each with what it takes away.
+fn diagnostic_flags(args: &Args) -> Vec<(&'static str, &'static str)> {
+    let mut v = Vec::new();
+    if args.allow_root_unsafe {
+        v.push((
+            "--allow-root-unsafe",
+            "the backend may start as root or with CAP_SYS_ADMIN, and every guest process is \
+             then an RM administrator with BAR0 mappable",
+        ));
+    }
+    if args.proc_nvidia != Path::new(host::PROC_NVIDIA) {
+        v.push((
+            "--proc-nvidia",
+            "the host driver is read from a tree other than /proc/driver/nvidia, and the \
+             sandbox opens that tree instead",
+        ));
+    }
+    if args.permissive_abi {
+        v.push((
+            "--permissive-abi",
+            "ioctls the ABI profile does not describe are forwarded to the host driver \
+             unchecked",
+        ));
+    }
+    if args.keep_guest_coherency {
+        v.push((
+            "--keep-guest-coherency",
+            "guest system memory is allocated with the coherency the guest asks for; on an \
+             Intel host a guest can cache memory the GPU does not snoop",
+        ));
+    }
+    if args.rm_allowlist == device::rmallow::Mode::Log {
+        v.push((
+            "--rm-allowlist=log",
+            "RM controls and classes the allowlist lacks are forwarded to the host's RM",
+        ));
+    }
+    match args.sandbox {
+        device::sandbox::Mode::On => {}
+        device::sandbox::Mode::BestEffort => v.push((
+            "--sandbox=best-effort",
+            "a sandbox layer this kernel lacks is done without",
+        )),
+        device::sandbox::Mode::Off => v.push((
+            "--sandbox=off",
+            "no network namespace, Landlock or seccomp: a backend taken over is everything \
+             its uid is",
+        )),
+    }
+    if args.allow_unmeasured_release {
+        v.push((
+            "--allow-unmeasured-release",
+            "a host release the tables were not measured at runs on the nearest older ones",
+        ));
+    }
+    v
+}
+
+/// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
+fn check_diagnostic(args: &Args, env: bool) -> anyhow::Result<Vec<String>> {
+    let flags = diagnostic_flags(args);
+    if flags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<&str> = flags.iter().map(|(n, _)| *n).collect();
+    anyhow::ensure!(
+        args.diagnostic || env,
+        "refusing to start: {} {} diagnostic, for finding out what broke something and never \
+         for running a guest; add --diagnostic (or NVGPU_DIAGNOSTIC=1) if that is what this is",
+        names.join(", "),
+        if names.len() == 1 { "is" } else { "are" }
+    );
+    Ok(flags
+        .iter()
+        .map(|(n, w)| format!("DIAGNOSTIC: {n}: {w}. Not for running a guest"))
+        .collect())
+}
+
 /// Refuse a host release the tables were not measured at, unless
 /// `--allow-unmeasured-release`; name the tables chosen either way.
 fn release_gate(version: &str, allow_unmeasured: bool) -> anyhow::Result<()> {
@@ -1195,7 +1303,13 @@ fn main() -> anyhow::Result<()> {
     log::set_boxed_logger(Box::new(device::ratelimit::RateLimited::new(logger)))
         .expect("the logger is set once, first thing");
     log::set_max_level(max_level);
-    let args = Args::parse();
+    let args = parse_args();
+    // Before anything is opened: a diagnostic flag without --diagnostic
+    // stops here, and one with it is said on stderr whatever the log level.
+    for line in check_diagnostic(&args, diagnostic_env())? {
+        eprintln!("vhost-user-nvgpu: {line}");
+        log::warn!("{line}");
+    }
 
     // Before any thread exists: capabilities are per thread
     // (device::posture, S-5).
@@ -1209,7 +1323,7 @@ fn main() -> anyhow::Result<()> {
                  the backend's, so every guest process would be an RM administrator with \
                  BAR0 mappable read-write. Run the backend as an unprivileged user in the \
                  video, render and kvm groups (scripts/run-guest.sh does), or pass \
-                 --allow-root-unsafe"
+                 --allow-root-unsafe --diagnostic"
             );
         }
         log::warn!(
@@ -1523,6 +1637,72 @@ mod tests {
     }
 
     use super::*;
+
+    fn args(a: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("vhost-user-nvgpu").chain(a.iter().copied())).unwrap()
+    }
+
+    /// Every diagnostic flag is refused alone and announced with
+    /// --diagnostic (or the environment variable); the defaults are none.
+    #[test]
+    fn a_diagnostic_flag_needs_diagnostic() {
+        assert!(check_diagnostic(&args(&[]), false).unwrap().is_empty());
+        assert!(check_diagnostic(&args(&["--rm-allowlist=enforce", "--sandbox=on"]), false)
+            .unwrap()
+            .is_empty());
+        for flag in [
+            &["--allow-root-unsafe"][..],
+            &["--proc-nvidia", "/tmp/fixture"],
+            &["--permissive-abi"],
+            &["--keep-guest-coherency"],
+            &["--rm-allowlist=log"],
+            &["--sandbox=best-effort"],
+            &["--sandbox=off"],
+            &["--allow-unmeasured-release"],
+        ] {
+            let e = check_diagnostic(&args(flag), false).unwrap_err().to_string();
+            assert!(e.contains("--diagnostic"), "{flag:?}: {e}");
+            let with: Vec<&str> = flag.iter().copied().chain(["--diagnostic"]).collect();
+            let lines = check_diagnostic(&args(&with), false).unwrap();
+            assert_eq!(lines.len(), 1, "{flag:?}");
+            assert!(lines[0].starts_with("DIAGNOSTIC: "), "{}", lines[0]);
+            assert_eq!(check_diagnostic(&args(flag), true).unwrap().len(), 1);
+        }
+        let e = check_diagnostic(&args(&["--permissive-abi", "--sandbox=off"]), false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--permissive-abi, --sandbox=off are diagnostic"), "{e}");
+    }
+
+    /// `--help` shows none of them unless asked with --diagnostic.
+    #[test]
+    fn the_diagnostic_flags_are_hidden_from_help() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        for hidden in [
+            "--allow-root-unsafe",
+            "--proc-nvidia",
+            "--permissive-abi",
+            "--keep-guest-coherency",
+            "--allow-unmeasured-release",
+        ] {
+            // Named in --diagnostic's own text, never as an option line.
+            assert!(
+                !help.lines().any(|l| l.trim_start().starts_with(hidden)),
+                "{hidden}"
+            );
+        }
+        assert!(help.lines().any(|l| l.trim_start().starts_with("--diagnostic")));
+        let shown = Args::command()
+            .mut_args(|a| a.hide(false))
+            .render_long_help()
+            .to_string();
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.trim_start().starts_with("--permissive-abi"))
+        );
+    }
 
     fn memory() -> GuestMemoryMmap {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()

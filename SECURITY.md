@@ -1564,3 +1564,14 @@ release build does (from the main thread and a worker) and sees SIGABRT, not
 the 159 of a violation. The fuzz workspaces have profiles of their own and
 are unchanged; the difftest runs under the new profile (`cargo test
 --release`).
+
+**Diagnostic flags.** `--allow-root-unsafe`, `--proc-nvidia`,
+`--permissive-abi`, `--keep-guest-coherency`, `--rm-allowlist=log`,
+`--sandbox=best-effort|off` and `--allow-unmeasured-release` each take a
+protection away. They are hidden from `--help` (shown with `--diagnostic
+--help`), the backend refuses to start with any of them unless
+`--diagnostic` or `NVGPU_DIAGNOSTIC=1` is given too, and each in effect is
+announced as `DIAGNOSTIC: <flag>: <what it takes away>` on stderr, whatever
+the log level, and in the log. `scripts/run-guest.sh` adds `--diagnostic`
+only when one of them reached the backend's arguments (after `--`, or from
+`NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`).
