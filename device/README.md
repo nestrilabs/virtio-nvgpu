@@ -30,8 +30,9 @@ vhost-user backend binary that serves it all to a VMM.
 
 **Where it stands.** The backend runs on an RTX 5090 (595.99.02) under nesbox
 and crosvm: every graphics and compute path, the Wayland proxy against the
-live host compositor, a lease and `VK_KHR_display`, with the RM allowlist
-enforcing and the sandbox on ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
+live host compositor, a lease and `VK_KHR_display`, capture injection
+(host buffers into guest EGL and Vulkan, with explicit sync), with the RM
+allowlist enforcing and the sandbox on ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
 compositor-VM and export modes have not met real hardware. The crate's tests
 run the dispatcher, the IOCTL2 interpreter, the policies and the Wayland
 connection against fake kernels and a fake compositor; `nvgpu-wl-guest`'s
@@ -82,6 +83,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/testfd.rs` | test only: whether this process still holds the other end of a pipe |
 | `src/fuzzing/` | fuzzing only (`--cfg fuzzing`, never in the backend): the fuzz targets' entry points and the fake host they run against; see "Fuzzing" below |
 | `src/fuzz_seeds.rs` | test only: with `NVGPU_FUZZ_SEEDS` set, every session a unit test serves is written out as a seed for the `backend` targets |
+| `src/inject.rs` | capture injection (`--inject-socket`): the helper's socket (SOCK_SEQPACKET, one uid, four peers), the registry of injected buffers and syncobjs (a dma-buf must import into this GPU's render node as NVKMS memory, its layout fit the object; ids and tokens; 32 buffers, 1 GiB, 16 syncobjs per VM), HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, and the read-only placement of an injected object's mmap range; SECURITY.md §18 |
 | `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`) |
 | `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, guest RAM handed to the backend from each memory table, and every command-line flag (`--help`) |
 | `bin/nvgpu-userspace.rs` | stages the host's NVIDIA user-mode driver for a guest to mount |
@@ -118,6 +120,7 @@ scripts/fuzz.sh miri
 | `misc` | fence rewrites, uevents, KMS property names | |
 | `wl_engine` | a configuration byte (normal or export mode, fences, DRM files, the lease device) and a lease rate, then a sequence of: app and compositor messages (raw, or built from the protocol tables against live objects, with descriptors of every class), channel frames into either end (raw, or built from any record type: Wayland, stream data, EOF, credit, SHM_SYNC, blob, error, hangup), moving what is queued across, stream readiness, time passing; frames into the host go through `lease_submits` and a `LeaseThrottle` as `WlConn::send` sends them | no descriptor left open once both ends are dropped; neither engine holds more than its budgets allow (`Engine::held_bytes`); no more lease submits reach the compositor than were admitted, and the throttle keeps to its burst and rate |
 | `wl_codec` | a frame, and a message against any signature | |
+| `inject` | capture injection: helper packets (parsed, then served with descriptors of every kind: dma-bufs of any object type, size, device and offset, the same object again, syncobj files, none), hangups, guest INJECT_OPEN and INJECT_OPEN_SYNCOBJ with right, altered and arbitrary tokens, render files closed | no open without a live id's own token, a wrong token the same ENOENT as a missing id, the registry within its bounds, no descriptor left open |
 
 The `backend` targets run the whole dispatcher (`serve`, IOCTL2's
 `execute` and `finish`) against a fake host (`src/fuzzing/host.rs`): RM,

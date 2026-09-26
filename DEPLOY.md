@@ -100,6 +100,7 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 | Wayland client of the host compositor, direct scanout | run on hardware | run on hardware |
 | DRM lease → guest KMS, `VK_KHR_display` | run on hardware | run on hardware |
 | compositor VM (`--kms-card`), export mode | **not run on hardware** | **not run on hardware** |
+| capture injection (`--inject-socket`), with the rig's own helper and daemon | run on hardware | run on hardware |
 
 "Run on hardware" means an RTX 5090 with 595.99.02 on an AMD host, with the
 probes and the application pass of [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md) green,
@@ -195,6 +196,101 @@ Export mode admits only host clients of the backend's own uid, so there it
 is run as the owner of the export socket's directory; like the compositor VM
 it has not run on hardware.
 
+## Capture injection
+
+A guest application's screen share, zero-copy (ARCHITECTURE.md §17,
+SECURITY.md §18). The backend provides one primitive: a host buffer made a
+guest dma-buf. The two programs around it are the integrator's: a **capture
+helper** on the host, one per VM, and a **capture daemon** in the guest. The
+rig's `rig/rig-tools/nvgpu-inject-test.c` and
+`rig/guest-image/tools/nvgpu-capture-import.c` are the reference for each.
+
+**Host side.** Each VM that shares screens gets a helper user of its own
+(never the backend's, the VMM's, or the desktop user's uid, and never one
+shared with another VM: whoever has a VM's helper uid can inject into it).
+In `/etc/virtio-nvgpu/vmN.env`:
+
+```sh
+NVGPU_BACKEND_ARGS="--inject-socket /run/nvgpu/vmN/inject.sock --inject-uid 950"
+NVGPU_INJECT_GROUP=nvgpu-cap0     # the helper's group: the socket is opened to it
+```
+
+or, on NixOS, `services.virtio-nvgpu.vms."N".inject = { enable = true;
+helperUid = 950; helperGroup = "nvgpu-cap0"; }`. The backend binds the socket
+0600 before its sandbox; the unit's `nvgpu-socket-open` makes it 0660 in
+that group once it exists. The helper then runs as that user, in that
+group, with the portal and PipeWire of the desktop session it serves.
+
+**The helper's side of the socket** (`protocol/src/inject.rs` is
+normative): `AF_UNIX`, `SOCK_SEQPACKET`, one request per packet, each
+answered in order by one 48-byte reply `{u32 op, i32 status, u32 id, u32
+version, u8 token[16], u32 max_buffers, u32 max_syncobjs, u64 max_bytes}`;
+all integers little-endian.
+
+| request | bytes | descriptors | reply |
+|---|---|---|---|
+| HELLO `{1, version=1, flags=0, 0}` | 16 | none | `version`, the VM's bounds (32 buffers, 16 syncobjs, 1 GiB) |
+| IMPORT `{2, nplanes, width, height, drm_fourcc, flags, u64 modifier, u32 offsets[4], u32 strides[4]}` | 64 | one dma-buf per plane (`spa_data[i].fd`), in plane order | `id`, `token`; or -EBADF (not a dma-buf), -ENODEV (not this GPU's nvidia-drm memory), -EINVAL (layout, format, planes of two objects), -ENOSPC, -EDQUOT |
+| IMPORT_SYNCOBJ `{4, flags=0}` | 8 | one syncobj file (`drmSyncobjHandleToFD`, no flags) | `id`, `token` of the syncobj |
+| RELEASE `{3, id}` | 8 | none | 0, or -ENOENT for an id this connection did not import |
+
+`flags` bit 0 is "rows bottom to top", carried to the guest. A malformed
+packet ends the connection; closing it releases everything it imported.
+The helper, in order:
+
+1. HELLO once per connection.
+2. When PipeWire adds a buffer to the stream (a DMA-BUF stream: the
+   helper's format offer asks for `SPA_DATA_DmaBuf` with modifiers, as a
+   GPU consumer's does), IMPORT it and keep `pw_buffer -> (id, token)`;
+   send the daemon `(id, token)` and the reply's layout. RELEASE it when
+   PipeWire removes the buffer.
+3. On each frame: if the producer attaches `SPA_META_SyncTimeline`, wait
+   for its acquire point on the host first (xdg-desktop-portal-hyprland
+   1.4.1 attaches none: a buffer it queues is complete). Then tell the
+   daemon `(id, sequence, timestamps, damage, crop, cursor)` and keep the
+   buffer: do not give it back to the stream yet.
+4. When the daemon says `done(id, sequence)` -- or after a timeout of a few
+   frame periods, whatever the daemon does -- give the buffer back
+   (`pw_stream_queue_buffer`), and signal the producer's release point if
+   it has one. The guest never signals anything of the producer's.
+5. On a new daemon connection, send every live `(id, token)` again.
+
+With explicit sync instead of step 4's message: make a timeline syncobj on
+the helper's render node, IMPORT_SYNCOBJ it once per stream and send the
+daemon its `(id, token)`; signal point `2k-1` for frame `k` in step 3 and
+wait for `2k` (with the same timeout) in step 4. Points the guest signals
+are hints: early, late or never, they change only this stream.
+
+**Guest side.** The node exists when the backend has `--inject-socket`:
+`/dev/nvgpu-capture`, root:root 0660 (module parameter `capture_mode`, which
+refuses anything for "other"). Give it to the daemon's account alone, with
+`contrib/udev/70-nvgpu-capture.rules` and a group `nvgpu-capture`; never to
+an application, which gets the daemon's dma-bufs through PipeWire.
+
+**The daemon's side** (`driver/uapi/nvgpu_capture.h`):
+
+- Open `/dev/nvgpu-capture` and a render node of the GPU,
+  `/dev/dri/renderD128`, `O_RDWR`.
+- For each `(id, token)` from the helper: `NVGPU_CAPTURE_IOC_OPEN
+  {render_fd, id, token, flags=0}` returns a read-only dma-buf
+  `dmabuf_fd` (close-on-exec) and `width, height, fourcc, modifier,
+  nplanes, offsets[4], strides[4], buf_flags, size`; offer it to consumers
+  as a PipeWire buffer of type `SPA_DATA_DmaBuf` with that modifier (every
+  plane is `dmabuf_fd` at its offset). ENOENT is a wrong token or an id the
+  helper has released.
+- Queue a buffer to consumers when the helper announces its frame; tell the
+  helper `done` once the consumers have returned it and their work on it
+  has finished. Close the dma-buf when the helper releases the id and the
+  consumers are done with it.
+- With explicit sync: `NVGPU_CAPTURE_IOC_OPEN_SYNCOBJ {render_fd, id,
+  token, flags=0}` returns a syncobj `handle` of the render file: wait for
+  `2k-1` with `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` (`WAIT_FOR_SUBMIT`) before
+  queueing frame `k`, or hand consumers a `SPA_META_SyncTimeline` of it
+  (`drmSyncobjHandleToFD`), and signal `2k`
+  (`DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL`) when they are done.
+- The helper's timestamps are the host's `CLOCK_MONOTONIC`, not the
+  guest's: stamp frames on arrival, or keep an offset of the daemon's own.
+
 ## Backend flags
 
 `vhost-user-nvgpu --help` has each one's full text; `--diagnostic --help`
@@ -212,6 +308,8 @@ shows the diagnostic ones too.
 | `--wayland-max-conns N` | 64 | Wayland channels per VM |
 | `--wayland-shm-budget MIB` | 1024 | wl_shm buffer memory per VM |
 | `--wayland-queue-budget MIB` | 256 | unread compositor output per VM |
+| `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection") |
+| `--inject-uid UID` | none | the only uid `--inject-socket` serves: the VM's capture helper |
 | `--rm-allowlist enforce` | `enforce` | the RM allowlist; `log` is diagnostic |
 | `--sandbox on` | `on` | the process sandbox; `best-effort` and `off` are diagnostic |
 | `--diagnostic` | off | allow the diagnostic flags below (or `NVGPU_DIAGNOSTIC=1`) |
@@ -256,6 +354,7 @@ parsers ([`driver/README.md`](driver/README.md)). Its parameters:
 | parameter | default | |
 |---|---|---|
 | `wl_mode` | `0660` | mode of `/dev/nvgpu-wl*`, created `root:root`; anything for "other" is refused |
+| `capture_mode` | `0660` | mode of `/dev/nvgpu-capture*` (only with `--inject-socket`), created `root:root`; anything for "other" is refused |
 | `virtio_id` | `45` | the virtio device ID to bind (another only for a VMM that cannot express 45) |
 
 **NVIDIA userspace.** The host's own release, exactly: in the image, or
@@ -288,8 +387,10 @@ log level (`info` by default).
 loaded at boot; the host's NVIDIA userspace (Vulkan ICD, EGL and GBM
 vendors, `libcuda` and the video libraries if compute is served); the
 `video`, `render` and `nvgpu-wl` groups and the udev rule; `nvgpu-wl-guest`
-setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set; and
-applications run as unprivileged users in `video` and `render` only.
+setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set; for
+capture injection, the capture daemon's account in `nvgpu-capture` and its
+udev rule; and applications run as unprivileged users in `video` and
+`render` only.
 [`rig/guest-image/`](rig/guest-image/) builds the test image, which runs every probe
 as root by default and is not a model for a production image.
 
@@ -308,7 +409,7 @@ as root by default and is not a model for a production image.
   extensions but cannot create a device with them, natively as well; an app
   that enables every one it is offered fails in a graphics-only guest.
 - Two CUDA processes whose UVM semaphore pools want the same host address:
-  the second context fails with ENOMEM (ARCHITECTURE.md §17).
+  the second context fails with ENOMEM (ARCHITECTURE.md §18).
 - crosvm with a virtiofs share (no read-only mode), and crosvm
   `--allow-compute` without patches `0007`-`0009`.
 - More than four guests on one card has not been tried.
@@ -332,6 +433,9 @@ In the backend's log (the unit's journal):
 | `handle table full`, `OS descriptor ... refused: over the ...` | a guest at a budget: one app starving others, or misbehaving |
 | `Intel host: KVM ignores guest PAT ...` | display memory may be incoherent on this Intel host |
 | `NVKMS: ...; refused`, `OPEN of ... refused`, `... refused (guestptr.rs)` | a guest asked for something the policy refuses: expected occasionally, a pattern is worth a look |
+| `inject: refusing a connection from uid ...` | something other than the VM's capture helper reached its inject socket: the socket's group is wrong, or a probe |
+| `inject: ... is not nvidia-drm (NVKMS) memory of this GPU; refused` | the helper got a stream from another device (a desktop on another GPU) or shared memory: that stream cannot be injected, only copied |
+| `INJECT_OPEN of id ... refused` | a guest asked for an id without its token, or after the helper released it; many in a row are a guest guessing |
 
 In the VMM's log: crosvm's `refused a memory request` (the main process
 refused a mapping the frontend passed on), a `SIGSYS`/seccomp kill of a

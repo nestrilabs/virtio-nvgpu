@@ -28,6 +28,13 @@ assert their sizes. It defines both protocols:
   and writability in the MMAP reply. A v1 guest or backend reads the fields v2
   added as zero, which keeps the old behaviour.
 
+`src/inject.rs` is the one format here that does not cross the virtqueue:
+the capture-injection socket's packets between the host's capture helper
+and the backend (HELLO, IMPORT, IMPORT_SYNCOBJ, RELEASE and their reply),
+kept here because the helper is built elsewhere and needs one normative
+description; and `InjectInfo`, which HOST_OP INJECT_OPEN's reply carries
+to the guest.
+
 Two things both halves share live elsewhere, because they are generated or
 belong to another component: the IOCTL2 schema tables (`gen/`, generated into
 `gen/src/schema/` and `driver/gen/nvgpu_schema.h`), and the Wayland channel's

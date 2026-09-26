@@ -634,6 +634,19 @@ NVKMS to the heads the grant covers.
   own uid are accepted), and in the guest run `nvgpu-wl-guest --export NAME`,
   which connects each host client to the guest compositor at `NAME`.
 
+### Screen capture into a guest
+
+A host screen share, handed to a guest application without a copy: the
+VM's capture helper on the host gets the stream through the desktop's
+portal and injects its GPU buffers into the backend (`--inject-socket PATH
+--inject-uid UID`), and the guest's capture daemon opens each, with the id
+and token the helper tells it, as a read-only guest dma-buf through
+`/dev/nvgpu-capture`. PipeWire and the portal stay out of the backend; only
+this GPU's own nvidia-drm memory is taken. The helper and the daemon are
+the integrator's: [`DEPLOY.md`](DEPLOY.md), "Capture injection", has their
+interface, [ARCHITECTURE.md](ARCHITECTURE.md) §17 the design and
+[SECURITY.md](SECURITY.md) §18 what it trusts.
+
 ### Explicit sync
 
 On whenever both sides speak protocol v2: fences live on the host, and the

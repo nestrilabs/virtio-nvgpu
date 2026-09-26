@@ -520,6 +520,62 @@ and when the VM goes the backend drops the card.
 | C2 | **7**: export mode (host client shown by the guest compositor) | `mkdir -m 0700 -p "$XDG_RUNTIME_DIR/nvgpu-export"`, then `rig/run-guest.sh --kms-card --wayland-export "$XDG_RUNTIME_DIR/nvgpu-export/wayland-x" export s7` | `--kms-card --wayland-export PATH` (PATH's directory must be yours) |
 | C3 | **9**: hotplug (unplug/replug, or toggle `leasable`) | as C1, probe `shell` (no hotplug probe yet) | `--kms-card` |
 
+## Capture injection
+
+Safe with the desktop running: no KMS, no compositor, no picker. The host
+half is `rig/rig-tools/nvgpu-inject-test` (built by
+`rig/rig-tools/build.sh`), which allocates GBM buffers as
+xdg-desktop-portal-hyprland does, paints a pattern into them and injects
+them; `rig/rig-tools/inject-hook.sh` runs it as `run-guest.sh`'s
+`NVGPU_BEFORE_VMM` hook, with the guest image's copy of the host's NVIDIA
+userspace, and puts its ids and tokens on the guest's command line. The
+guest half is the `capture` probe and `nvgpu-capture-import`.
+
+```sh
+rig/rig-tools/build.sh                         # .rig/bin/nvgpu-inject-test
+NVGPU_BEFORE_VMM=$PWD/rig/rig-tools/inject-hook.sh rig/run-guest.sh --inject capture cap1
+NVGPU_VMM_KIND=crosvm NVGPU_BEFORE_VMM=$PWD/rig/rig-tools/inject-hook.sh \
+    NVGPU_INJECT_ARGS="--size 2560x1440" rig/run-guest.sh --inject capture cap1cv
+```
+
+The helper's side is in `.rig/logs/<tag>.hook.log` (its explicit-sync
+timings at the end, after the guest has run). What the probe checks: the
+node's mode, and that a user without its group cannot open it; each buffer
+opened, its writable CPU mappings refused, imported into EGL and Vulkan
+and every pixel checked against the frame the host painted, with the host's
+checksum; the same with no CPU mapping at all (the backend's debug log
+shows no window placement for it); a wrong token, a missing id and a
+released id refused alike; a buffer the host keeps painting seen changing
+without a new open; and 200 frames of explicit sync through an injected
+syncobj. The host half checks the refusals it can cause: a memfd, a
+udmabuf, a layout past the buffer, a memfd as a syncobj.
+
+Results (RTX 5090, 595.99.02, 2026-09-26, sandbox on):
+
+| | nesbox | crosvm (frontend jailed) |
+|---|---|---|
+| `capture`, 1280x720 | 16/0/0 | 16/0/0 |
+| `capture`, 2560x1440 | 14/0/0 (before explicit sync) | 16/0/0 |
+| IMPORT round trip (host) | median 16-22 us | median 16 us |
+| OPEN (guest ioctl, INJECT_OPEN included) | 31-48 us | 27-79 us |
+| explicit sync, announce to release, guest only waiting and signalling | median 55 us, p99 133 us | median 45 us, p99 109 us |
+| the same with the guest reading each frame back through Vulkan | 1.2 ms (720p) | 4.4 ms (1440p) |
+
+**With a real screen share.** The tests never open the host's picker.
+`rig/rig-tools/portal-identify.sh`, run by the desktop's user on the
+desktop (not in a sandbox without the session bus and PipeWire), asks the
+ScreenCast portal for a stream -- choose a monitor or a window in the
+picker -- takes its first DMA-BUF frame and says whether it is NVKMS
+memory, which is what the backend takes:
+
+```sh
+rig/rig-tools/portal-identify.sh --selftest        # the environment only
+rig/rig-tools/portal-identify.sh                   # the picker appears
+# and into a backend, as the capture helper would (the socket from a
+# running `run-guest.sh --inject ... ` is $XDG_RUNTIME_DIR/nvgpu-run.*/inject.sock):
+rig/rig-tools/portal-identify.sh --inject "$XDG_RUNTIME_DIR"/nvgpu-run.*/inject.sock
+```
+
 ## Regression of the merged tree
 
 The tree the 2026-09-26 review fixes were merged into (`integrate`) ran

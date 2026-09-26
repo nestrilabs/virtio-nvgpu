@@ -8,8 +8,8 @@ against `dev` at `50ff74a` (called **dev** below), brought up to date by the
 audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
 the fuzzing of branch `fuzz` (§13), the memory-safety structure of
 branch `dind` (§14), the review of `dind` for memory passing (§15), and the
-VMMs it runs under, nesbox and crosvm (§16); and by the review of 2026-09-26
-(§17). It is written for the project's owner. The
+VMMs it runs under, nesbox and crosvm (§16); by the review of 2026-09-26
+(§17); and by capture injection (§18). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -480,7 +480,7 @@ removed, since nothing can say whether RM took it.
 |---|---|---|
 | guest messages | 8 types; responses capped at 64 KiB | 17 types, where every v2 type except HELLO is refused (EPROTO) until a HELLO succeeds; requests up to 256 KiB, or 4 MiB with indirect descriptors |
 | guest payloads | the ioctl header with its nested and deep blocks; mmap and munmap requests | those, plus the IOCTL2 schema interpreter, HOST_OP, WATCH and UNWATCH, and Wayland frames through `wlwire` (codec generated from 39 vendored protocol XMLs, whose build fails if any reachable message carries a descriptor the policy does not classify) |
-| host peers | the VMM's vhost-user messages | plus the host compositor's Wayland messages, export peers' Wayland messages, and kernel uevents (messages from any sender but the kernel are dropped). Every descriptor received over a socket is classified by what the kernel says it is (`hostfd::classify`), not by what the message claims. |
+| host peers | the VMM's vhost-user messages | plus the host compositor's Wayland messages, export peers' Wayland messages, the capture helper's fixed-size packets (`--inject-socket`, §18), and kernel uevents (messages from any sender but the kernel are dropped). Every descriptor received over a socket is classified by what the kernel says it is (`hostfd::classify`), not by what the message claims. |
 
 ### Host files, sockets and netlink
 
@@ -489,7 +489,7 @@ removed, since nothing can say whether RM took it.
 | device files | `/dev/nvidia*`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dri/renderD*` | the same, the two UVM devices only with `--allow-compute`, plus `/dev/dri/card*` (`--kms-card` only, through OPEN_KMS; a plain OPEN of a card is refused), lessee files received from the compositor, which must classify as a lease of this GPU, and `/dev/udmabuf` |
 | other files | `/proc/driver/nvidia`, PCI config in sysfs | the same, plus memfds for shm pools, blobs and a sealed page, and readlink of `/proc/self/fd` |
 | vhost-user socket | default `/tmp/nvgpu.sock`, and a failed unlink was ignored, so another user could bind it first and receive the guest's memory | default `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` in a 0700 directory, refused if the directory is anyone else's; a file already at the path is removed only if it is a socket of the backend's uid, and anything else stops the start (`device/src/posture.rs`) |
-| other sockets | none | with `--wayland-socket`, one connection to the compositor per channel plus a probe connection; with `--wayland-export`, a listener created 0600 that admits only peers of the backend's uid, with 16 pending |
+| other sockets | none | with `--wayland-socket`, one connection to the compositor per channel plus a probe connection; with `--wayland-export`, a listener created 0600 that admits only peers of the backend's uid, with 16 pending; with `--inject-socket`, a `SOCK_SEQPACKET` listener created 0600 (opened to the capture helper's group by root after start) that serves only `--inject-uid`, four connections at once (§18) |
 | netlink | none | `NETLINK_KOBJECT_UEVENT`, receive only, with `--kms-card` or `--wayland-lease` |
 
 ### Privileges
@@ -728,6 +728,7 @@ type. One listener is allowed per export.
 | `/dev/nvidia-caps/*` | 0444 | 0444 |
 | DRM node | a hand-made character device, 0666 | a real DRM device per host render node, whose render and primary nodes the guest's DRM core makes. Syncobjs are enabled only when the backend serves fences, and the primary node drives KMS only when the backend offers `--kms-card`. |
 | `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`, which refuses any mode giving "other" access), with `contrib/udev/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
+| `/dev/nvgpu-capture[N]` | -- | only with `--inject-socket`: root:root 0660 by default (`capture_mode`, refusing "other" as `wl_mode` does), `contrib/udev/70-nvgpu-capture.rules` giving it to the capture daemon's group. OPEN (an injected buffer as a read-only dma-buf) and OPEN_SYNCOBJ, each needing the id's 128-bit token (§18) |
 | adopted DRM files | -- | a lease received from the host becomes a guest DRM file, cloned from a card-node file |
 | `nvgpu-wl-guest` | -- | a daemon listening at `$XDG_RUNTIME_DIR/wayland-0` in the guest |
 
@@ -795,6 +796,7 @@ Which host surfaces each display mode turns on:
 | DRM lease, VK_KHR_display | `--wayland-lease` | lessee files as KMS handles, nvidia-drm grants and NVKMS gates, uevent netlink, leasable monitors in the patched compositor |
 | compositor VM | `--kms-card` | host card files as DRM master, OPEN_KMS and DROP_IF_MASTER, CREATE_LEASE, the three NVKMS commands above, uevent netlink. The guest owns the host's display and can show anything on it. |
 | export | `--wayland-export` | the listener, host peers, import of host dma-bufs |
+| capture injection | `--inject-socket`, `--inject-uid` | a listener for one helper uid, its fixed-size packets, PRIME import and IDENTIFY of its dma-bufs, import of its syncobjs; HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ (§18) |
 
 ---
 
@@ -2191,3 +2193,220 @@ loses the oldest, whose pins then stay until remove() (a list would let a
 backend grow it without bound). The Rust build has passed the hardware
 regression (nesbox, 2026-09-26); the C parsers stay, as the difftest's
 oracle and for a kernel built without Rust.
+
+---
+
+## 18. Capture injection
+
+Branch `capture-inject`: a screen share on the host reaches a guest
+application without a copy. The desktop's portal gives a PipeWire stream of
+GPU buffers to a per-VM **capture helper** on the host (built by the
+integrator, not here: it runs the portal request, and the user picks what
+to share in the host's own picker). The helper hands each buffer to the
+VM's backend over `--inject-socket`; the backend checks it and answers with
+an id and a random token; the helper tells the guest's capture daemon both
+over a channel of its own (vsock); the daemon opens the buffer through
+`/dev/nvgpu-capture` as a guest dma-buf of the same memory and publishes
+it to the guest application as a PipeWire stream of its own. PipeWire, the
+portal and every stream protocol stay outside the backend. Off by default;
+ARCHITECTURE.md §17 has the design, DEPLOY.md "Capture injection" the
+deployment.
+
+### The trust boundary
+
+| party | trusted for | not trusted for |
+|---|---|---|
+| the helper (`--inject-uid`) | injecting only what the user consented to share with this VM: the backend cannot tell a screen share from any other buffer, since a dma-buf says nothing of where its pixels came from | anything else: every packet is parsed as hostile, every descriptor classified by what the kernel says it is, every layout checked against the object, every count bounded |
+| the guest (kernel and daemon) | nothing | ids are the helper's to make; a guest names one with a token it can only have been told |
+| other host users | nothing | the socket is 0600, opened to the helper's group by root after start, and served only to `--inject-uid` (`SO_PEERCRED`) |
+
+**What the backend checks** (`device/src/inject.rs`, each with a unit test
+against a fake nvidia-drm, and the `inject` fuzz target):
+
+- The packet: `SOCK_SEQPACKET`, exactly the size of its op (16, 64 or 8
+  bytes), reserved words zero, HELLO first and once at version 1,
+  descriptors only on IMPORT (exactly `nplanes`) and IMPORT_SYNCOBJ
+  (exactly one), at most 8 per packet (`MSG_CTRUNC` ends the connection);
+  a malformed packet ends the connection, a refused request is answered
+  with its errno.
+- Each plane's descriptor is a dma-buf (`fstatfs`'s magic, not the link
+  text a same-uid FUSE file could imitate: §17 #13).
+- It imports (PRIME_FD_TO_HANDLE) into a render file of this GPU the backend
+  opens for the purpose, and GEM_IDENTIFY_OBJECT there says **NVKMS**:
+  nvidia-drm hands a dma-buf of its own device back as the object it
+  exported, and imports any other -- an iGPU's, a udmabuf, a camera's --
+  as a dma-buf object, which is refused (ENODEV). Only this GPU's
+  nvidia-drm memory is injected.
+- Every plane is the same object (the guest gets one dma-buf and the planes'
+  offsets into it); the format is one of thirteen capture formats with its
+  plane count; width and height are 1..16384; the modifier is not INVALID;
+  unknown flags are refused; and for each plane, `stride >= width * cpp`
+  and `offset + stride * rows <= size` of the object, in u64 with every
+  step checked.
+- A syncobj (IMPORT_SYNCOBJ) must classify as a syncobj file and import
+  into a render file of the backend's (the DRM core checks its file
+  operations); the handle is destroyed at once and the file kept.
+
+**Bounds**, per VM (one backend): 32 buffer ids and 1 GiB of them at once,
+16 syncobj ids, 4 helper connections (a thread each), a 4-connection
+backlog; guest opens, one per (render file, object), 1024 and a quarter
+per guest process (`quota::Share::quarter`). Refusals log through the
+per-site rate limit. What the bounds do not count: an object a guest keeps
+open after the helper released it. That is memory the helper allocated,
+held by at most 1024 guest opens, and a guest can allocate GPU memory of
+its own without any of this (§4, "not capped").
+
+**Why a token and a node permission.** The node (`/dev/nvgpu-capture`,
+root:root 0660, `capture_mode`, never "other"; `contrib/udev/70-nvgpu-
+capture.rules` gives it to the daemon's group) decides who may try at all:
+applications never open it, they get the daemon's dma-bufs through
+PipeWire. The token decides which stream: one daemon, or several of
+several guest users, may open the node, and a buffer opens only for the
+one told its 128-bit token, compared in constant time; a wrong token and a
+missing id are the same ENOENT, and a released id's token opens nothing
+again (each IMPORT draws a new one from `getrandom`). No guest message
+lists, enumerates or makes an id.
+
+### What a guest can do with a buffer
+
+**Read it**, which is what it is for, from the moment its daemon opens it
+until it closes its last handle; the helper's RELEASE only stops new opens,
+and a guest's GEM handle keeps the memory as any importer's does.
+
+**Not map it writable for the CPU through the proxy.** Every window
+placement of the object's mmap range (its `drm_vma_node` offset, the same
+from every file) is read-only whichever of the VM's files maps it, for as
+long as the id lives or a guest open of it does
+(`BackendInject::read_only`); the guest module refuses a writable mapping
+of a read-only placement, and the dma-buf it hands out is opened without
+`O_RDWR`. On the RTX 5090 a `PROT_WRITE` mapping fails with EACCES
+(dma-buf) and EINVAL (render node), and an `mprotect` to writable with
+EACCES.
+
+**Write it with the GPU**, and there is no way to stop that. An NVIDIA
+import is read-write: NVIDIA's userspace turns the imported object into an
+RM handle of its own (GEM_EXPORT_NVKMS_MEMORY, then RM's OS_UNIX
+export/import, a full duplicate of the memory descriptor into the guest's
+client), and RM's read-only GPU mapping (`NVOS46_FLAGS_ACCESS_READ_ONLY`)
+is the mapper's choice, forced only for memory allocated
+`MEMDESC_FLAGS_DEVICE_READ_ONLY`, which NVKMS never asks for
+(nvidia-drm-gem-nvkms-memory.c, mem_mgr/mem.c, virt_mem_allocator_gm107.c,
+610.57.04). The same duplicate can be CPU-mapped writable through RM (BAR1)
+unless the memory was allocated `ATTR2_PROTECTION_USER=READ_ONLY`, which it
+is not. So the read-only placement is hygiene, not a boundary: a guest
+process holding the buffer can write it. What it can write is its own
+stream's buffers, which only it, its daemon, the helper and the compositor
+filling them see; the compositor overwrites them each frame, nothing on the
+host reads them, and they are no host scanout surface. Natively, a
+PipeWire consumer of the same stream can do the same.
+
+**Nothing else.** INJECT_OPEN's host calls on the guest's render file are
+calls the guest can already cause there -- a PRIME import (the self-import
+of NVKMS memory; HOST_OP DMABUF_IMPORT does the same), IDENTIFY, MAP_OFFSET,
+SYNCOBJ_FD_TO_HANDLE -- on descriptors the backend holds; the guest's
+bytes are an id and a token. A guest's GEM handle is a handle of its own
+render file, one per (file, object), closed with the file.
+
+### Across VMs, and apps within one
+
+Each VM's backend has its own socket and registry: another VM's ids and
+tokens mean nothing there (tested with two backends), and a helper reaches
+another VM only if that VM's backend admits its uid -- which is why each VM
+needs a helper user of its own (DEPLOY.md; the NixOS module refuses two VMs
+one helper uid). The injected object is the helper's allocation; no VM's
+backend but its own ever receives the dma-buf. Inside a guest, the daemon
+decides which application gets which stream, as a desktop's PipeWire does;
+an application given the dma-buf can read and GPU-write it, as natively.
+
+### Sync, and what the guest can do with a syncobj
+
+The first cut has no host fence at all: the helper announces a frame over
+its own channel only once the frame is complete, and learns that the guest
+is done with a buffer the same way (ARCHITECTURE.md §17 has the contract).
+Nothing on the host waits for the guest: a guest that never says done
+costs the helper a timeout, after which it gives the buffer back to the
+stream and the guest sees tearing at worst.
+
+The second step, built and run: IMPORT_SYNCOBJ hands the backend a DRM
+syncobj the helper made; INJECT_OPEN_SYNCOBJ imports it into the guest's
+render file. The guest may then wait on and signal any point of it, early,
+late, out of order or never. Its signals reach the helper's syncobj and
+nothing else: the helper must treat every point as a hint, bound its own
+waits, and never forward the guest's release points to anything that
+trusts them. The guest's waits are the VM's ordinary syncobj waits, turned
+into polls and counted against the 1024 wait registrations per VM and a
+quarter per guest process (§12's fence work, fence.rs); the render file is
+marked as one that imported a syncobj, so its registrations wait out their
+firing rather than go with a DESTROY, as for any syncobj someone else
+holds. Each INJECT_OPEN_SYNCOBJ makes a new handle in the caller's file, as
+SYNCOBJ_FD_TO_HANDLE and SYNCOBJ_CREATE do, which the guest can already
+make without bound (§4).
+
+### What a compromised helper could and could not do
+
+**Could:** inject any NVKMS dma-buf it holds into its VM -- its own
+allocations, the stream the portal gave it, any buffer another process
+hands it -- which shows its VM pixels it could equally send over vsock as
+a copy; hold host GPU memory through the backend, within the bounds above,
+memory it allocated itself; make the backend import other devices'
+dma-bufs it holds (refused after the import, which attaches the buffer to
+its exporter for a moment); keep its four connections and threads.
+
+**Could not:** reach another VM (another backend, another uid); make the
+backend open, map or write anything (it imports, identifies, sizes and
+keeps descriptors it was given; nothing is mapped into the backend); reach
+guest memory, the window or the virtqueue; stall the VM: its imports hold
+a lock of their own that no guest message takes, and the registry's state
+lock, which INJECT_OPEN takes, is never held across a kernel call on a
+helper's descriptor (a test stalls an import and opens meanwhile); make
+the guest open anything the guest's daemon does not ask for.
+
+### What it adds to the host
+
+- **Backend surface:** one listener, at most four connection threads, a
+  fixed-size parser (`protocol/src/inject.rs`), and the host calls above.
+- **Sandbox:** no change. The listener is bound before the sandbox, like
+  the export socket; `accept4`, `recvmsg` (SCM_RIGHTS), `fstatfs`, `lseek`,
+  `readlinkat` of `/proc/self/fd` and `getrandom` were on the seccomp list
+  already; the render node the backend imports into is one Landlock already
+  opens. The sandbox ran enforcing ("every layer in force") in every
+  hardware run below.
+- **Guest surface:** HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, which
+  refuse everything without a live id's token, and the guest node's two
+  fixed-size ioctls (`driver/nvgpu_capture.c`, C in both builds; it parses
+  only its own structs).
+
+### Tests and hardware
+
+24 unit tests (`inject::tests`: every rule above, the socket's framing,
+uid and peer limits, release on hangup, two backends, a stalled import, the
+read-only placement through the dispatcher, the per-process open share),
+the protocol's own, and the `inject` fuzz target (packets, imports with
+descriptors of every kind, opens with right and altered tokens, syncobjs,
+closes; bounds, token and descriptor-leak oracles): ten minutes, no
+finding.
+
+On the RTX 5090 (595.99.02), under nesbox and under crosvm (its nvgpu
+frontend jailed), with the backend's sandbox on (`rig/TESTING-RIG.md`,
+"Capture injection"): GBM buffers allocated as xdg-desktop-portal-hyprland
+allocates them (`gbm_bo_create_with_modifiers`, block-linear modifier
+`0x0300000000606014`) are NVKMS memory and accepted; a udmabuf (ENODEV), a
+memfd (EBADF) and a layout past the buffer (EINVAL) are refused; each
+buffer's pixels, painted on the host, read back identical in the guest
+through EGL and through Vulkan at 1280x720 and 2560x1440, checksums equal
+to the host's; writable CPU mappings are refused; a wrong token, a missing
+id and a released id are ENOENT; a user without the node's group cannot
+open it; a buffer the host keeps painting is seen changing without a new
+open; and 200 frames of explicit sync through an injected syncobj arrive
+whole and in order, the host's announce-to-release round trip 55 us
+(nesbox) and 45 us (crosvm) at the median. A GPU-only import costs the
+shared window nothing (no placement is made); a CPU mapping of a 1440p
+buffer places 15 MiB, read-only.
+
+**Open:** the helper and the guest daemon are the integrator's, and so is
+how the helper proves consent; buffers whose planes are separate objects
+are refused (one dma-buf per buffer in the guest ABI); a guest open whose
+reply its caller abandoned leaves its GEM or syncobj handle in the caller's
+file until it closes; a real portal stream was not injected by the project
+(the tests may not open the host's picker): `rig/rig-tools/portal-identify.sh`
+checks one, for the owner to run.

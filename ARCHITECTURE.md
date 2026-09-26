@@ -21,7 +21,8 @@ faster than prose can follow.
 > output (§11); fences kept on the host (§12); NVKMS forwarding and its
 > permission gates (§13); the Wayland proxy against the live host compositor
 > (§14); a memory type per mapping, and guest system memory made GPU-coherent
-> (§15); direct scanout of guest buffers by the host compositor (§16); CUDA,
+> (§15); direct scanout of guest buffers by the host compositor (§16); host
+> screen-capture buffers injected into a guest without a copy (§17); CUDA,
 > with the UVM aperture and memory registered by its pages (§5); the RM
 > allowlist, enforcing; and the security changes that came with them
 > ([`SECURITY.md`](SECURITY.md)). About 35 applications ran on the live
@@ -159,7 +160,7 @@ backend, connected to the host's compositor. `wlwire/` is the code they share
 **The isolate** is the part that is not built (Future work, below). The intent is one sandboxed,
 unprivileged helper process per guest, holding the device descriptors so that a
 compromised backend, which maps all of the guest's memory, does not hold them. Today the backend holds them itself — as
-an unprivileged process, which it insists on being (§17).
+an unprivileged process, which it insists on being (§18).
 
 ---
 
@@ -976,7 +977,125 @@ blocker reported for the whole run (stage 3 of [`TESTING.md`](TESTING.md)).
 
 ---
 
-## 17. What this design cannot do
+## 17. Capture injection
+
+A guest application that shares the screen asks the ordinary desktop portal,
+the user picks in the host's own picker, and the application receives a
+PipeWire stream whose frames are GPU buffers of the host. None of that can
+cross a VM boundary as it is: the portal answers with a PipeWire remote
+descriptor, the frames are more descriptors, and a VM's session bus reaches
+the host through a byte relay. Copying the frames instead costs about
+900 MB/s of memcpy on each side at 1440p60. But the buffers are the same
+GPU's memory the guest already renders into, so what is needed is only a
+way to name one to the guest -- the one thing only the backend can do.
+
+**The shape.** Everything that speaks PipeWire or the portal is on the
+host and outside the backend: a **capture helper** per VM, running as a
+user of its own, makes the portal request on the application's behalf,
+consumes the stream, and hands each buffer to the VM's backend over a
+socket of the backend's own (`--inject-socket`, served only to
+`--inject-uid`). The backend checks the buffer and answers with an **id**
+and a random 16-byte **token**; the helper sends both, with the frame's
+metadata, to a **capture daemon** in the guest over a channel of its own
+(vsock). The daemon opens the buffer through `/dev/nvgpu-capture`, gets a
+guest dma-buf of the same memory, and publishes it to the application as a
+PipeWire node of its own, behind a guest portal backend that answers the
+application's ScreenCast request with that node.
+
+```text
+host                                        guest
+────────────────────────────────            ─────────────────────────────
+compositor ─screencopy─► xdg-desktop-portal-hyprland (GBM buffers)
+                           │ PipeWire (dma-bufs)
+capture helper (uid of its own) ──────── vsock: id, token, frame metadata ──► capture daemon
+   │ IMPORT (SCM_RIGHTS)                                                        │ /dev/nvgpu-capture OPEN
+   ▼                                                                            ▼
+backend: check, keep, id + token ◄──── HOST_OP INJECT_OPEN (id, token) ─── guest module
+                                                                                │ guest dma-buf
+                                                                          PipeWire ─► application
+```
+
+**What the backend takes** is deliberately little: a fixed-size packet
+protocol (`protocol/src/inject.rs`: HELLO, IMPORT, IMPORT_SYNCOBJ, RELEASE)
+on a `SOCK_SEQPACKET` socket, with the planes' dma-bufs as `SCM_RIGHTS`. It
+keeps only this GPU's own nvidia-drm memory: the dma-buf is imported into a
+render file the backend holds, and nvidia-drm hands one of its own buffers
+back as the very object it exported, NVKMS memory, while a buffer of any
+other device becomes a dma-buf object, which is refused. The layout the
+helper describes must fit the object. Ids and bytes are bounded per VM,
+and a helper's hangup releases everything it injected. SECURITY.md §18 has
+every check and bound.
+
+**What the guest gets.** INJECT_OPEN names an id and its token and a guest
+file's render handle; the backend imports the object into that file's host
+render file -- the same object, so the guest file now holds a GEM handle of
+the helper's buffer -- and the guest module makes a proxy of it and a
+dma-buf, exactly as for a host client's buffer in export mode (§14). From
+there it is any guest dma-buf: EGL and Vulkan import it with its modifier
+as they would natively (NVIDIA's userspace turns it into an RM handle of
+its own on the host), which needs **no window space** at all. Only a CPU
+mapping places it in the window (§5), and every placement of an injected
+buffer is read-only. The GPU's access cannot be made read-only: NVIDIA's
+imports are read-write, so a guest can scribble on its own stream's
+buffers, which nobody else reads (SECURITY.md §18).
+
+**Why a socket and a node of their own**, rather than a channel class of
+`/dev/nvgpu-wl`. The Wayland proxy is the most parsing-heavy path the backend
+has, tied to a compositor connection per channel, and its export socket
+admits only the backend's own uid; the helper is another user by design,
+and a buffer stream needs no parsing at all. A node of its own gives the
+capture daemon a group of its own, separate from the Wayland daemon's.
+
+**Lifetime.** The backend keeps the object (a handle in its own render
+file, and the dma-buf) while the id lives. RELEASE, or the helper's hangup,
+only stops new opens: every guest handle keeps the memory, as any
+importer's does, until the guest closes it.
+
+**The window budget.** A consumer that imports into the GPU -- a browser,
+OBS, a compositor -- costs the window nothing. One that maps frames for the
+CPU places each buffer it maps once, in the write-combining zone (768 MiB of
+the default gigabyte, half of it per guest process): a 2560x1440 XRGB
+buffer is 15 MiB there, so a stream of 8 is 120 MiB, and a process can map
+three such streams; at 3840x2160, 4 to 6 buffers a stream.
+
+**Sync: the first cut.** No host fence crosses. The contract between the
+helper and the daemon, all on their own channel:
+
+1. The helper sends a frame's id only once the frame is complete. With
+   xdg-desktop-portal-hyprland 1.4.1 that is when PipeWire gives it the
+   buffer: the portal queues a buffer only after the compositor's
+   screencopy said ready, and attaches no `SPA_META_SyncTimeline`. A
+   producer that does attach one is waited on by the helper, on the host,
+   before it announces the frame (a CPU wait; still no copy).
+2. The daemon hands the frame to its consumers, and tells the helper
+   "done" with the id once the consumers have returned the buffer and their
+   GPU work on it has finished.
+3. Only then does the helper give the buffer back to the producer's stream,
+   which may paint it again.
+4. A daemon that never says "done" does not hold the producer: after a
+   timeout of its choosing (a few frame periods) the helper gives the
+   buffer back anyway. The producer then paints into a buffer the guest may
+   still be reading: tearing, in that guest's stream, at worst.
+
+**Sync: the second step.** IMPORT_SYNCOBJ hands the backend a DRM syncobj
+of the helper's; INJECT_OPEN_SYNCOBJ imports it into the guest file, where
+its handle is the guest's (fences are the host's, §12). Then the same
+contract runs on timeline points instead of messages: the helper signals
+point `2k-1` when frame `k` is in the buffer (after its own wait on the
+producer, or from the producer's own acquire point), the guest waits for it
+and signals `2k` when it is done, and the helper reuses the buffer after
+`2k` or its timeout. The guest may signal any point, early or never; that
+reaches only the helper, whose waits are its own to bound. On the rig the
+round trip from the helper's signal to its seeing the release is about
+50 us, against a vsock message each way.
+
+**The helper's and the daemon's interface** is in DEPLOY.md, "Capture
+injection"; the rig's `nvgpu-inject-test` and `nvgpu-capture-import`
+(`rig/`) are the reference for each.
+
+---
+
+## 18. What this design cannot do
 
 - **NVIDIA only.** It proxies one vendor's kernel ABI. Nothing here generalises.
 - **Version-locked**, as §8 describes — and the display tables per release.
@@ -1071,7 +1190,7 @@ host's Wayland compositor.
 
 ---
 
-## 18. Prior art
+## 19. Prior art
 
 **gVisor `nvproxy`** is the direct ancestor: it established that forwarding the
 NVIDIA kernel ABI is viable, and its versioned ABI tables are the model for §8.
