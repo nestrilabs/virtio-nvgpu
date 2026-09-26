@@ -61,7 +61,8 @@ use device::wl::export::WlExport;
 use device::wl::{LeaseThrottle, WlConfig, WlLimits};
 use protocol::messages::{MsgHeader, MsgType, SHM_ID_UVM};
 use vhost::vhost_user::message::{
-    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserShMemConfig,
+    VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 use vhost_user_backend::{
@@ -328,6 +329,22 @@ fn uvm_mmap_msg(aperture_offset: u64, len: u64, addr: u64) -> VhostUserMMap {
 /// The shared-memory id the guest driver looks the window up by, which must
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
+
+/// The shared memory regions this device has, for a VMM that asks
+/// (GET_SHMEM_CONFIG; crosvm does, nesbox sizes both itself): the window,
+/// region 1, as large as the allocator's zones, and with `--allow-compute`
+/// the UVM aperture, region 2, as large as the backend will place pools in.
+/// Region 0 is the "undefined" id a guest discards, so it is never used.
+fn shmem_config(allow_compute: bool) -> VhostUserShMemConfig {
+    let mut sizes = [0u64; 3];
+    sizes[usize::from(NV_SHM_ID)] = device::shm::ZoneConfig::default_1gib().total();
+    let mut n = 1;
+    if allow_compute {
+        sizes[usize::from(SHM_ID_UVM)] = device::uvmmap::APERTURE_MAX;
+        n += 1;
+    }
+    VhostUserShMemConfig::new(n, &sizes)
+}
 
 /// The Wayland proxy's configuration, made once at startup.
 struct Wayland {
@@ -743,6 +760,8 @@ struct NvGpuBackend {
     mem_fds: Vec<RawFd>,
     /// Whether the library's own descriptors have been registered yet.
     scanned_fds: bool,
+    /// `--allow-compute`, for the regions GET_SHMEM_CONFIG reports.
+    allow_compute: bool,
 }
 
 impl NvGpuBackend {
@@ -771,6 +790,7 @@ impl NvGpuBackend {
         );
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
 
+        let allow_compute = config.allow_compute;
         let mut nvidia = NvidiaBackend::with_default_zones();
         nvidia.set_abi_policy(abi_policy);
         nvidia.set_rm_allowlist(rm_allowlist);
@@ -796,6 +816,7 @@ impl NvGpuBackend {
             max_resp: MAX_XFER_DIRECT as usize,
             mem_fds: Vec::new(),
             scanned_fds: false,
+            allow_compute,
         })
     }
 
@@ -1008,6 +1029,10 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
         self.config.read(offset, size)
+    }
+
+    fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
+        Ok(shmem_config(self.allow_compute))
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
@@ -1402,6 +1427,26 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// GET_SHMEM_CONFIG: the window as region 1, and the UVM aperture as
+    /// region 2 only when compute is served; region 0 never.
+    #[test]
+    fn shmem_config_names_the_window_and_the_aperture_only_with_compute() {
+        let g = super::shmem_config(false);
+        let (n, sizes) = (g.nregions, g.memory_sizes);
+        assert_eq!(n, 1);
+        assert_eq!(sizes[0], 0);
+        assert_eq!(sizes[1], 1 << 30);
+        assert!(sizes[2..].iter().all(|&s| s == 0));
+
+        let c = super::shmem_config(true);
+        let (n, sizes) = (c.nregions, c.memory_sizes);
+        assert_eq!(n, 2);
+        assert_eq!(sizes[0], 0);
+        assert_eq!(sizes[1], 1 << 30);
+        assert_eq!(sizes[2], device::uvmmap::APERTURE_MAX);
+        assert!(sizes[3..].iter().all(|&s| s == 0));
+    }
+
     use super::*;
 
     fn memory() -> GuestMemoryMmap {

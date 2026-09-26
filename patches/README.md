@@ -51,3 +51,19 @@ cd aquamarine && git am ../patches/aquamarine/0001-keep-leased-crtcs.patch
 
 With Nix, point Hyprland's `aquamarine` flake input at the patched tree, or add the patch to
 `aquamarine.patches` in an overlay. The aquamarine patch changes no headers, so the ABI is unchanged.
+
+# crosvm
+
+`crosvm/` is a series against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets crosvm be the
+VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; TESTING-RIG.md,
+"crosvm"):
+
+| Patch | What it does |
+|---|---|
+| `0001-vhost_user_frontend-check-every-backend-mapping-agai.patch` | every `SHMEM_MAP` (and `GPU_MAP`, `EXTERNAL_MAP`) is checked against the region the backend reported, page-aligned, and refused if it overlaps a live mapping; an unmap must name one exactly; a reset unmaps everything; a refusal no longer stops the VM |
+| `0002-devices-virtio-nvgpu-as-a-vhost-user-device-type.patch` | `--vhost-user type=nvgpu`: virtio ID 45, PCI class 0xff0000, indirect descriptors passed through, region 1 published when the backend reports more, `GPU_MAP` and `EXTERNAL_MAP` refused |
+| `0003-x86_64-no-pci-hotplug-port.patch` | `--no-pci-hotplug-port`: no empty hot-plug root port on PCI bus 1, which the guest driver needs for the GPU's host address |
+| `0004-vhost_user_frontend-tests-for-the-backend-mapping-ch.patch` | unit tests for 0001 and 0002 |
+
+To apply and build: the top of `scripts/rig-build-crosvm.sh`. No seccomp policy and no minijail
+setting changes: the vhost-user frontend runs in crosvm's main process, as upstream has it.

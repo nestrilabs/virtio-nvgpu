@@ -25,6 +25,7 @@ Everything is built into `.rig/` (git-ignored), laid out as
 |---|---|
 | `.rig/bin/vhost-user-nvgpu` | the backend (release) |
 | `.rig/bin/nesbox` | the VMM (release) |
+| `.rig/bin/crosvm` | the other VMM, `--vmm crosvm` (release, static; below, "crosvm") |
 | `.rig/bin/virtiofsd` | only with `NVGPU_NVIDIA_SHARE` |
 | `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it |
 | `.rig/kernel-rust/vmlinux`, `.rig/kernel-rust/nvgpu.ko` | the same kernel with `CONFIG_RUST=y`, and the module with its parsers in Rust (`NVGPU_RUST=1`), built by `scripts/rig-build-kernel-rust.sh`; to run one, see [`driver/rust/README.md`](driver/rust/README.md) |
@@ -191,7 +192,86 @@ stage needs Hyprland's own behaviour without the desktop's session, run it
 nested inside the headless sway
 (`WAYLAND_DISPLAY=<headless socket> Hyprland`). That setup is untested.
 
-## Group B: takes one monitor, desktop keeps running
+## crosvm
+
+Every Group A stage also runs under crosvm, with its sandbox on: add
+`--vmm crosvm` (or set `NVGPU_VMM_KIND=crosvm`). The kernel, image, probes,
+backend and logs are the same; `<tag>.json` records crosvm's command line,
+as it has no config file.
+
+```sh
+scripts/rig-build-crosvm.sh                     # .rig/src/crosvm -> .rig/bin/crosvm
+scripts/run-guest.sh --vmm crosvm stage1 cv-s1
+scripts/run-guest.sh --vmm crosvm render cv-render
+scripts/run-guest.sh --vmm crosvm --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland cv-wl
+NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh --vmm crosvm secneg cv-sec
+NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 scripts/rig-app-check.sh \
+  typing,pointer,clipboard,glxgears,gamescope,gtk,qt,firefox,mpv,vkmark,chromegpu cv-apps
+```
+
+`.rig/src/crosvm` is upstream crosvm (c0474109d64d, 2026-09-25) on branch
+`virtio-nvgpu`, with the four patches in `patches/crosvm/`; README.md,
+"What a VMM must do", says what each is for. It is built static and without
+crosvm's default features: no virtio-gpu, virgl, virtio-wl, audio, USB or
+network devices.
+
+What crosvm's sandbox does here, unprivileged: every device crosvm emulates
+(the disk, both consoles, rng) runs as a process of its own, each in new
+user, pid, mount and network namespaces with no uid mapped, pivoted into the
+empty `.rig/run/crosvm-empty`, under its seccomp policy (`Seccomp: 2` in
+`/proc/<pid>/status`). The vhost-user frontend stays in crosvm's main
+process, as upstream has it; the launcher starts that process in a user and
+network namespace of its own (`NVGPU_VMM_NETNS=0` does not). No seccomp
+policy and no minijail setting changed for virtio-nvgpu. `NVGPU_CROSVM_SANDBOX=off`
+runs `--disable-sandbox`, and says so at the top of the console log.
+
+Not under crosvm yet: `--allow-compute` (the launcher refuses it: crosvm
+publishes one shared memory region per device, so there is no UVM aperture,
+and the guest reports no compute), a virtiofs share, and the root layout.
+
+Results on the 5090 (2026-09-26), against nesbox's from the regression
+before the hardening merge (nesbox `stage1` and `render` re-run on this tree
+match them):
+
+| probe | crosvm | nesbox |
+|---|---|---|
+| `stage1` | 6 pass, 0 fail, 0 skip | 6/0/0 |
+| `render`, no compute | 9/0/1 (vkcube: no WSI) | 9/0/1 |
+| `wayland`, headless sway | 11/0/3 (the three natives also skip) | 11/0/3 |
+| `secneg`, `kms=none` | 10 passed, 3 KMS skips | the same |
+| apps, as uid 1000 | 19/0/0; captures render; chrome://gpu hardware accelerated, `Sandboxed: true`, one GPU (the 5090) | all PASS |
+
+All but `secneg` ran with `-- --rm-allowlist=log` (for the app pass,
+`NVGPU_APPS_BACKEND_ARGS=--rm-allowlist=log`): on this tree the backend's
+allowlist refuses RM class `NV01_MEMORY_LOCAL_PRIVILEGED` (0x3f) on
+ALLOC_MEMORY, which the 5090's Vulkan driver allocates, so `vulkaninfo`
+fails under either VMM without it. That is the backend's, not the VMM's.
+
+Chromium needs `NVGPU_SLOT=40` to get to chrome://gpu when it runs alone;
+at 25 s its capture is still the black window it opens with, under either
+VMM.
+
+### What compute would need from crosvm
+
+The UVM aperture (ARCHITECTURE.md §5): a second shared memory region, where
+each UVM semaphore pool is mapped at the host address UVM demands. crosvm
+would need:
+
+- more than one shared memory region per virtio-pci device (a second BAR
+  and `VirtioPciShmCap`, and a mapper per region); today
+  `VirtioDevice::get_shared_memory_region` returns one;
+- a mapping that is placed at a host address the backend names (the file
+  offset is that address): `MAP_FIXED_NOREPLACE` in crosvm's own address
+  space, never over anything crosvm has, and only inside a band reserved
+  for it up front (nesbox holds [4 GiB, 32 TiB)), then a memory slot of its
+  own at the aperture offset. crosvm's prepared-region arena cannot do this:
+  it maps into a reservation crosvm chose. It is a new `VmMemorySource`
+  kind, checked as the window's are, and one KVM memory slot per pool
+  (about 0.7 ms to add, 2 ms to remove, once per CUDA context);
+- withdrawal in the other order: the slot, then the mapping;
+- no seccomp change as long as this stays in the main process, as the
+  window's placement does; nothing for memory registered by its pages,
+  which needs only the memory table crosvm already sends.
 
 These stages need the **patched Hyprland as the live compositor**
 ([`patches/README.md`](patches/README.md); `.rig/hypr-build` has a build). One

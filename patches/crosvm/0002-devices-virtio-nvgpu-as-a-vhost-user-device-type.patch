@@ -1,0 +1,319 @@
+From 9d1bbb4f76e51aa29452735d97f70d335b6b1271 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 01:45:11 +0000
+Subject: [PATCH 2/4] devices: virtio-nvgpu as a vhost-user device type
+
+`--vhost-user type=nvgpu,socket=PATH` connects a virtio-nvgpu backend
+(NVIDIA driver calls forwarded to the host; virtio device ID 45, not one
+the virtio specification assigns). Only the vhost-user frontend exists:
+the backend walks the queues, and crosvm walks none.
+
+What the type needs of the generic frontend:
+- PCI class 0xff0000 (unassigned). The device forwards another GPU's
+  driver calls and drives no display, and a display-class function is
+  what guest userspace takes for a GPU of its own: Chromium's GPU
+  blocklist, for one, saw a second GPU.
+- Indirect descriptors (VIRTIO_RING_F_INDIRECT_DESC), which the generic
+  feature mask drops. They let one ring slot carry a request of up to
+  4 MiB; without them driver and backend keep to 256 KiB. A ring feature
+  costs this process nothing: it never reads a descriptor.
+- Region 1 when the backend reports more than one shared memory region.
+  Region 1 is the window every guest maps GPU memory through; region 2,
+  the UVM aperture, only CUDA uses, and the PCI transport publishes one
+  region per device. With region 2 left out the guest driver finds no
+  aperture and offers no compute.
+- Only SHMEM_MAP and SHMEM_UNMAP: GPU_MAP and EXTERNAL_MAP are refused
+  (EPERM), so a backend that is taken over cannot reach the gralloc or
+  external-pointer paths.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ devices/src/pci/mod.rs                        |  1 +
+ devices/src/pci/pci_configuration.rs          |  2 +
+ devices/src/virtio/mod.rs                     |  6 +++
+ .../src/virtio/vhost_user_frontend/handler.rs | 18 +++++++-
+ devices/src/virtio/vhost_user_frontend/mod.rs | 41 ++++++++++++++++++-
+ devices/src/virtio/virtio_pci_device.rs       |  9 ++++
+ src/crosvm/config.rs                          |  1 +
+ virtio_sys/bindgen.sh                         |  3 ++
+ virtio_sys/src/virtio_ids.rs                  |  3 ++
+ 9 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/devices/src/pci/mod.rs b/devices/src/pci/mod.rs
+index 50c3fc8..f9849dd 100644
+--- a/devices/src/pci/mod.rs
++++ b/devices/src/pci/mod.rs
+@@ -53,6 +53,7 @@ pub use self::pci_configuration::PciInputDeviceSubclass;
+ pub use self::pci_configuration::PciMassStorageSubclass;
+ pub use self::pci_configuration::PciMultimediaSubclass;
+ pub use self::pci_configuration::PciNetworkControllerSubclass;
++pub use self::pci_configuration::PciOtherSubclass;
+ pub use self::pci_configuration::PciProgrammingInterface;
+ pub use self::pci_configuration::PciSerialBusSubClass;
+ pub use self::pci_configuration::PciSimpleCommunicationControllerSubclass;
+diff --git a/devices/src/pci/pci_configuration.rs b/devices/src/pci/pci_configuration.rs
+index acf2ec4..ad07c9b 100644
+--- a/devices/src/pci/pci_configuration.rs
++++ b/devices/src/pci/pci_configuration.rs
+@@ -282,6 +282,8 @@ impl PciSubclass for PciWirelessControllerSubclass {
+ #[derive(Copy, Clone)]
+ #[repr(u8)]
+ pub enum PciOtherSubclass {
++    /// Class code 0xff0000: a device that is none of the assigned classes.
++    Unassigned = 0x00,
+     Other = 0xff,
+ }
+ 
+diff --git a/devices/src/virtio/mod.rs b/devices/src/virtio/mod.rs
+index e570ca4..fd3f42d 100644
+--- a/devices/src/virtio/mod.rs
++++ b/devices/src/virtio/mod.rs
+@@ -154,6 +154,9 @@ pub enum DeviceType {
+     Tpm,
+     Pvclock,
+     Media,
++    /// virtio-nvgpu: NVIDIA driver ioctls forwarded to a vhost-user backend.
++    /// Only its vhost-user frontend exists in crosvm.
++    Nvgpu,
+     VendorDevice(u32),
+ }
+ 
+@@ -185,6 +188,7 @@ impl DeviceType {
+             DeviceType::Tpm => virtio_ids::VIRTIO_ID_TPM,
+             DeviceType::Pvclock => virtio_ids::VIRTIO_ID_PVCLOCK,
+             DeviceType::Media => virtio_ids::VIRTIO_ID_MEDIA,
++            DeviceType::Nvgpu => virtio_ids::VIRTIO_ID_NVGPU,
+             DeviceType::VendorDevice(id) => *id,
+         }
+     }
+@@ -217,6 +221,7 @@ impl DeviceType {
+             DeviceType::Tpm => 1,           // request queue
+             DeviceType::Pvclock => 1,       // request queue
+             DeviceType::Media => 2,         // commandq, eventq
++            DeviceType::Nvgpu => 2,         // requestq, eventq
+             DeviceType::VendorDevice(_) => unimplemented!("vhost-user frontend is not supported"),
+         }
+     }
+@@ -254,6 +259,7 @@ impl std::fmt::Display for DeviceType {
+             DeviceType::Mac80211HwSim => write!(f, "mac80211-hwsim"),
+             DeviceType::Scmi => write!(f, "scmi"),
+             DeviceType::Media => write!(f, "media"),
++            DeviceType::Nvgpu => write!(f, "nvgpu"),
+             DeviceType::VendorDevice(id) => write!(f, "vendor-device-{}", id),
+         }
+     }
+diff --git a/devices/src/virtio/vhost_user_frontend/handler.rs b/devices/src/virtio/vhost_user_frontend/handler.rs
+index 3c210e2..69d3e1f 100644
+--- a/devices/src/virtio/vhost_user_frontend/handler.rs
++++ b/devices/src/virtio/vhost_user_frontend/handler.rs
+@@ -21,6 +21,7 @@ use vmm_vhost::FrontendServer;
+ use vmm_vhost::HandlerResult;
+ use vmm_vhost::SharedMemoryRegion;
+ 
++use crate::virtio::DeviceType;
+ use crate::virtio::Interrupt;
+ use crate::virtio::SharedMemoryMapper;
+ 
+@@ -132,14 +133,19 @@ pub struct BackendReqHandlerImpl {
+     interrupt: Option<Interrupt>,
+     shared_mapper_state: Option<SharedMapperState>,
+     is_remote_backend: bool,
++    /// Whether the backend may use GPU_MAP and EXTERNAL_MAP as well as
++    /// SHMEM_MAP. A device that only ever has file descriptors mapped is not
++    /// offered the others.
++    allow_gpu_maps: bool,
+ }
+ 
+ impl BackendReqHandlerImpl {
+-    pub(crate) fn new(is_remote_backend: bool) -> Self {
++    pub(crate) fn new(is_remote_backend: bool, device_type: DeviceType) -> Self {
+         BackendReqHandlerImpl {
+             interrupt: None,
+             shared_mapper_state: None,
+             is_remote_backend,
++            allow_gpu_maps: device_type != DeviceType::Nvgpu,
+         }
+     }
+ 
+@@ -175,6 +181,14 @@ impl BackendReqHandlerImpl {
+             }
+         }
+     }
++
++    fn gpu_maps_allowed(&self) -> HandlerResult<()> {
++        if self.allow_gpu_maps {
++            Ok(())
++        } else {
++            Err(std::io::Error::from_raw_os_error(libc::EPERM))
++        }
++    }
+ }
+ 
+ impl Frontend for BackendReqHandlerImpl {
+@@ -213,6 +227,7 @@ impl Frontend for BackendReqHandlerImpl {
+         req: &VhostUserGpuMapMsg,
+         descriptor: &dyn AsRawDescriptor,
+     ) -> HandlerResult<()> {
++        self.gpu_maps_allowed()?;
+         let state = self
+             .shared_mapper_state
+             .as_mut()
+@@ -232,6 +247,7 @@ impl Frontend for BackendReqHandlerImpl {
+     }
+ 
+     fn external_map(&mut self, req: &VhostUserExternalMapMsg) -> HandlerResult<()> {
++        self.gpu_maps_allowed()?;
+         // Only allow EXTERNAL_MAP when the backend is in-process because it contains raw pointers
+         // that can't be trusted between processes.
+         if self.is_remote_backend {
+diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
+index a2f7874..2eae2ab 100644
+--- a/devices/src/virtio/vhost_user_frontend/mod.rs
++++ b/devices/src/virtio/vhost_user_frontend/mod.rs
+@@ -18,6 +18,7 @@ use anyhow::bail;
+ use anyhow::Context;
+ use base::error;
+ use base::trace;
++use base::warn;
+ use base::AsRawDescriptor;
+ #[cfg(windows)]
+ use base::CloseNotifier;
+@@ -81,6 +82,22 @@ pub struct VhostUserFrontend {
+     sent_queues: Option<BTreeMap<usize, Queue>>,
+ }
+ 
++/// virtio-nvgpu's window: the shared memory region its guest driver maps device memory through.
++const NVGPU_SHM_ID_WINDOW: u8 = 1;
++
++/// Ring features a device type's backend may negotiate with the guest beyond the common ones.
++///
++/// Only features that live entirely in the rings belong here: the backend walks the rings and
++/// this process never reads a descriptor.
++fn ring_features(device_type: DeviceType) -> u64 {
++    match device_type {
++        // Indirect descriptors let one ring slot carry a request of up to 4 MiB; without them
++        // the virtio-nvgpu driver and backend both keep to 256 KiB.
++        DeviceType::Nvgpu => 1 << virtio_sys::virtio_ring::VIRTIO_RING_F_INDIRECT_DESC,
++        _ => 0,
++    }
++}
++
+ // Returns the largest power of two that is less than or equal to `val`.
+ fn power_of_two_le(val: u16) -> Option<u16> {
+     if val == 0 {
+@@ -133,6 +150,7 @@ impl VhostUserFrontend {
+ 
+         let allow_features = VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK
+             | base_features
++            | ring_features(device_type)
+             | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
+         let avail_features =
+             allow_features & backend_client.get_features().map_err(Error::GetFeatures)?;
+@@ -174,7 +192,7 @@ impl VhostUserFrontend {
+         let backend_req_handler =
+             if protocol_features.contains(VhostUserProtocolFeatures::BACKEND_REQ) {
+                 let (mut handler, tx_fd) = create_backend_req_handler(
+-                    BackendReqHandlerImpl::new(is_remote_backend),
++                    BackendReqHandlerImpl::new(is_remote_backend, device_type),
+                     #[cfg(windows)]
+                     backend_pid,
+                 )?;
+@@ -535,6 +553,27 @@ impl VirtioDevice for VhostUserFrontend {
+         let region = match regions.len() {
+             0 => None,
+             1 => Some(regions[0]),
++            // virtio-nvgpu's region 1 is the window every guest maps GPU memory through; its
++            // region 2, the UVM aperture, only CUDA uses. The PCI transport publishes one region
++            // per device, so the window is published and the guest finds no aperture, which it
++            // reads as no compute.
++            n if self.device_type == DeviceType::Nvgpu => {
++                let window = regions.iter().find(|r| r.id == NVGPU_SHM_ID_WINDOW).copied();
++                if window.is_some() {
++                    warn!(
++                        "vhost-user nvgpu backend reported {} shared memory regions; only \
++                         region {} is published",
++                        n, NVGPU_SHM_ID_WINDOW
++                    );
++                } else {
++                    error!(
++                        "vhost-user nvgpu backend reported {} shared memory regions and no \
++                         region {}",
++                        n, NVGPU_SHM_ID_WINDOW
++                    );
++                }
++                window
++            }
+             n => {
+                 error!(
+                     "Failed to get shared memory region {}",
+diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
+index 1fd6a95..e5b64af 100644
+--- a/devices/src/virtio/virtio_pci_device.rs
++++ b/devices/src/virtio/virtio_pci_device.rs
+@@ -86,6 +86,7 @@ use crate::pci::PciInterruptPin;
+ use crate::pci::PciMassStorageSubclass;
+ use crate::pci::PciMultimediaSubclass;
+ use crate::pci::PciNetworkControllerSubclass;
++use crate::pci::PciOtherSubclass;
+ use crate::pci::PciSimpleCommunicationControllerSubclass;
+ use crate::pci::PciSubclass;
+ use crate::pci::PciWirelessControllerSubclass;
+@@ -471,6 +472,14 @@ impl VirtioPciDevice {
+                 PciClassCode::BaseSystemPeripheral,
+                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
+             ),
++            // Not a display controller: the device forwards another GPU's
++            // driver calls and drives no display itself, and a display-class
++            // function is what guest userspace (Chromium's GPU blocklist, for
++            // one) takes to be a GPU of its own.
++            DeviceType::Nvgpu => (
++                PciClassCode::Other,
++                &PciOtherSubclass::Unassigned as &dyn PciSubclass,
++            ),
+             DeviceType::VendorDevice(_) => (
+                 PciClassCode::BaseSystemPeripheral,
+                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
+diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
+index 9eda2bc..cea9f6b 100644
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -2079,6 +2079,7 @@ mod tests {
+         test_device_type("wl", DeviceType::Wl);
+         test_device_type("tpm", DeviceType::Tpm);
+         test_device_type("pvclock", DeviceType::Pvclock);
++        test_device_type("nvgpu", DeviceType::Nvgpu);
+     }
+ 
+     #[cfg(target_arch = "x86_64")]
+diff --git a/virtio_sys/bindgen.sh b/virtio_sys/bindgen.sh
+index fb8ecde..9fff6ca 100755
+--- a/virtio_sys/bindgen.sh
++++ b/virtio_sys/bindgen.sh
+@@ -63,6 +63,9 @@ pub const VIRTIO_ID_TPM: u32 = 62;
+ pub const VIRTIO_ID_PVCLOCK: u32 = 61;
+ // TODO: Remove this once the ID is included in the Linux headers.
+ pub const VIRTIO_ID_MEDIA: u32 = 48;
++// virtio-nvgpu, not assigned by the virtio specification; must match
++// VIRTIO_ID_GPU_NV in the virtio-nvgpu guest driver.
++pub const VIRTIO_ID_NVGPU: u32 = 45;
+ "
+ 
+ bindgen_generate \
+diff --git a/virtio_sys/src/virtio_ids.rs b/virtio_sys/src/virtio_ids.rs
+index dda0150..943ebb2 100644
+--- a/virtio_sys/src/virtio_ids.rs
++++ b/virtio_sys/src/virtio_ids.rs
+@@ -19,6 +19,9 @@ pub const VIRTIO_ID_TPM: u32 = 62;
+ pub const VIRTIO_ID_PVCLOCK: u32 = 61;
+ // TODO: Remove this once the ID is included in the Linux headers.
+ pub const VIRTIO_ID_MEDIA: u32 = 48;
++// virtio-nvgpu, not assigned by the virtio specification; must match
++// VIRTIO_ID_GPU_NV in the virtio-nvgpu guest driver.
++pub const VIRTIO_ID_NVGPU: u32 = 45;
+ 
+ pub const VIRTIO_ID_NET: u32 = 1;
+ pub const VIRTIO_ID_BLOCK: u32 = 2;
+-- 
+2.55.0
+

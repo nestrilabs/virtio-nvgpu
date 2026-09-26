@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Boot a guest against the vhost-user backend and keep both sides' output.
 #
-# Usage: run-guest.sh [display options] <probe-name> [tag] [-- backend-args...]
+# Usage: run-guest.sh [--vmm nesbox|crosvm] [display options] <probe-name> [tag]
+#                     [-- backend-args...]
+#   --vmm       which VMM boots the guest (default nesbox, or NVGPU_VMM_KIND);
+#               crosvm is unprivileged (rig layout) and graphics-only (no
+#               --allow-compute), see "crosvm" below
 #   probe-name  a script under /opt/nvgpu in the guest rootfs, e.g. probeQ.sh;
 #               in the rig layout a bare name gets .sh added (stage1 ->
 #               /opt/nvgpu/stage1.sh)
@@ -58,7 +62,13 @@
 #                       for the run (nesbox's build/output/jail); nesbox must be
 #                       at /usr/bin/nesbox in it
 #   NVGPU_VMM_NETNS     unprivileged only: 1 (default) has nesbox leave the
-#                       host's network ("unshare-network"); 0 does not
+#                       host's network ("unshare-network"), and starts crosvm
+#                       in a user and network namespace of its own; 0 does not
+#   NVGPU_VMM_KIND      nesbox (default) or crosvm, the same as --vmm
+#   NVGPU_CROSVM_SANDBOX  on (default) or off: crosvm's own sandbox (a minijail
+#                       per device process, with its seccomp policy); off runs
+#                       crosvm with --disable-sandbox, and says so loudly on
+#                       the console log. For diagnosis only
 #
 # Safety knobs, for a GPU that also drives the desktop (.rig/SAFETY-NOTES.md):
 #   NVGPU_MEMORY_MAX    e.g. 12G: run the launcher, backend and VMM in a
@@ -189,6 +199,28 @@
 # 0, trace them; RM's security token -- the uid -- is the user's own, the same
 # as every GPU program on the desktop; and two VMs started by one user are one
 # principal to RM and to the kernel. Keep a rig for one VM at a time.
+#
+# crosvm (--vmm crosvm, rig layout: bin/crosvm, built from the virtio-nvgpu
+# branch in .rig/src/crosvm, patches/crosvm/): the same kernel, disk, console
+# log, probe and backend; the guest's device is crosvm's vhost-user frontend
+# of type nvgpu. crosvm has no config file, so <tag>.json records the command
+# line it was given. Unprivileged, crosvm runs with its sandbox: every device
+# it emulates itself (disk, consoles, rng) is a process of its own in a
+# minijail -- user, pid, mount and network namespaces, pivoted into an empty
+# directory (the rig's run/crosvm-empty), under its seccomp policy -- while
+# the vhost-user frontend stays in crosvm's main process, as upstream has it:
+# it walks no queue, and places the backend's mappings only after checking
+# each against the window (patches/crosvm). With NVGPU_VMM_NETNS=1 the main
+# process is started in a user and network namespace of its own (unshare),
+# the counterpart of nesbox's "unshare-network". No virtiofs share: crosvm's
+# has no read-only mode, so NVGPU_NVIDIA_SHARE must be empty.
+#
+# Not implemented, as root: what production would use is crosvm as the slot's
+# nvgpu-vmmN (setpriv, with only the slot's group and kvm), with its sandbox
+# on and /var/empty as the pivot root, in a network namespace made by root,
+# and the backend's socket 0660 in the slot's group -- the same slot, the same
+# socket arrangement and the same disk copy as nesbox's jailer gets above. The
+# launcher refuses --vmm crosvm as root until that has been built and run.
 set -euo pipefail
 
 usage() {
@@ -243,12 +275,18 @@ WL_EXPORT=
 KMS_CARD=0
 COMPUTE=0
 [ "${NVGPU_COMPUTE:-0}" = 1 ] && COMPUTE=1
+VMM_KIND=${NVGPU_VMM_KIND:-nesbox}
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case $1 in
         --allow-compute)
             COMPUTE=1
             shift
+            ;;
+        --vmm)
+            [ $# -ge 2 ] || usage
+            VMM_KIND=$2
+            shift 2
             ;;
         --kms-card | --wayland-lease)
             [ "$1" = --kms-card ] && KMS_CARD=1
@@ -298,6 +336,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ ${#POSITIONAL[@]} -ge 1 ] && [ ${#POSITIONAL[@]} -le 2 ] || usage
+case $VMM_KIND in nesbox | crosvm) ;; *) die "--vmm $VMM_KIND: nesbox or crosvm" ;; esac
+CROSVM_SANDBOX=${NVGPU_CROSVM_SANDBOX:-on}
+case $CROSVM_SANDBOX in on | off) ;; *) die "NVGPU_CROSVM_SANDBOX=$CROSVM_SANDBOX: on or off" ;; esac
 # Compute is the backend's to serve and the probe's to expect: one switch for
 # both (guest-image/probes/render.sh reads nvgpu_compute).
 [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
@@ -331,7 +372,7 @@ if [ -n "${NVGPU_RIG:-}" ] || [ $PRIV = user ]; then
     LAYOUT=rig
     RIG=$(realpath -s -m -- "${NVGPU_RIG:-$(dirname -- "$0")/../.rig}")
     BACKEND_BIN=${NVGPU_BACKEND:-$RIG/bin/vhost-user-nvgpu}
-    VMM=${NVGPU_VMM:-$RIG/bin/nesbox}
+    VMM=${NVGPU_VMM:-$RIG/bin/$VMM_KIND}
     KERNEL=${NVGPU_KERNEL:-$RIG/kernel/vmlinux}
     ROOTFS=${NVGPU_ROOTFS:-$RIG/guest/rootfs.ext4}
     LOGS=${NVGPU_LOGS:-$RIG/logs}
@@ -357,6 +398,16 @@ else
     COPY_ROOTFS=${NVGPU_COPY_ROOTFS:-auto}
     # Unset means the share this layout always had; set but empty means none.
     NVIDIA_SHARE=${NVGPU_NVIDIA_SHARE-/var/lib/nvgpu}
+fi
+if [ "$VMM_KIND" = crosvm ]; then
+    [ $PRIV = user ] ||
+        die "--vmm crosvm runs unprivileged only for now; the header says what root would need"
+    [ -z "$NVIDIA_SHARE" ] ||
+        die "--vmm crosvm has no read-only virtiofs share; NVGPU_NVIDIA_SHARE must be empty"
+    # crosvm publishes the window alone, not the UVM aperture: the guest would
+    # get a UVM device whose pools it cannot map, and CUDA would fail late.
+    [ "$COMPUTE" = 0 ] ||
+        die "--vmm crosvm serves graphics only (no UVM aperture yet); drop --allow-compute"
 fi
 CMDLINE_EXTRA=${NVGPU_CMDLINE_EXTRA:-}
 case " $CMDLINE_EXTRA " in
@@ -662,11 +713,16 @@ else
     RUN_PARENT=${XDG_RUNTIME_DIR:-$RIG/run}
     pkill -u "$(id -u)" -f "^$(re "$BACKEND_BIN") --socket $(re "$RUN_PARENT")/nvgpu-run\." || true
 fi
-pkill -u "$(id -u)" -f "^$(re "$VMM") $(re "$LOGS")/[^/ ]+\.json" || true
+if [ "$VMM_KIND" = crosvm ]; then
+    pkill -u "$(id -u)" -f "^$(re "$VMM") run .*--vhost-user type=nvgpu,socket=$(re "$RUN_PARENT")/nvgpu-run\." || true
+else
+    pkill -u "$(id -u)" -f "^$(re "$VMM") $(re "$LOGS")/[^/ ]+\.json" || true
+fi
 
 # ── Cleanup, however the run ends ────────────────────────────────────────────
 BACKEND=
 VMM_PID=
+VMM_MARK=
 RUN=
 DISK_COPY=
 TTY_STATE=
@@ -681,7 +737,7 @@ still_ours() {
     [[ $cmd == *"$2"* ]]
 }
 cleanup() {
-    if [ -n "$VMM_PID" ] && still_ours "$VMM_PID" "${CFG:-}"; then
+    if [ -n "$VMM_PID" ] && still_ours "$VMM_PID" "${VMM_MARK:-}"; then
         kill "$VMM_PID" 2>/dev/null || true
     fi
     # nesbox puts the terminal in raw mode; one killed never restores it.
@@ -772,7 +828,10 @@ CFG=$LOGS/$TAG.json
 # of leaving an empty log. panic=-1: a panic (a probe that exits as PID 1, an
 # oops in the module at probe) reboots, which ends nesbox at once rather than
 # at the timeout.
-BOOT_ARGS="console=hvc0 earlyprintk=serial,ttyS0 panic=-1 root=/dev/vda rw init=/opt/nvgpu/$PROBE${CMDLINE_EXTRA:+ $CMDLINE_EXTRA}"
+# crosvm puts console=, earlycon= and panic=-1 on the command line itself,
+# for the consoles it is given, and is handed the rest.
+CONSOLE_ARGS="console=hvc0 earlyprintk=serial,ttyS0 panic=-1"
+BOOT_ARGS="$CONSOLE_ARGS root=/dev/vda rw init=/opt/nvgpu/$PROBE${CMDLINE_EXTRA:+ $CMDLINE_EXTRA}"
 SHARES=
 if [ -n "$NVIDIA_SHARE" ]; then
     SHARES=",
@@ -780,6 +839,45 @@ if [ -n "$NVIDIA_SHARE" ]; then
     { \"tag\": \"nvidia\", \"path-on-host\": $(json_str "$NVIDIA_SHARE"), \"read-only\": true }
   ]"
 fi
+CROSVM_NOTE=
+if [ "$VMM_KIND" = crosvm ]; then
+    # The same guest, said as crosvm's command line. Two consoles to the one
+    # log, as nesbox has: hvc0 (virtio-console) and COM1 for earlyprintk.
+    # The queue size is the backend's: crosvm offers 32768 unless told. No
+    # hot-plug root port: crosvm puts it on PCI bus 1, and the guest driver
+    # gives the GPU the host's own PCI address, commonly 0000:01:00.0.
+    CONSOLE_OPTS=type=stdout,hardware=virtio-console,console
+    [ "$INTERACTIVE" = 1 ] && CONSOLE_OPTS=$CONSOLE_OPTS,stdin
+    VMM_ARGS=(run --cpus "$VCPUS" --mem "$MEM_MIB"
+        --block "path=$DISK"
+        --serial "$CONSOLE_OPTS"
+        --serial "type=stdout,hardware=serial,num=1,earlycon"
+        --vhost-user "type=nvgpu,socket=$SOCK,max-queue-size=256"
+        --no-pci-hotplug-port
+        -p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
+    case $DISK$SOCK in *,*) die "a comma in $DISK or $SOCK would split crosvm's option" ;; esac
+    if [ "$CROSVM_SANDBOX" = on ]; then
+        # minijail pivots each device process into an empty directory:
+        # crosvm's default is /var/empty, which not every host has.
+        EMPTY=$RIG/run/crosvm-empty
+        mkdir -p "$EMPTY"
+        chmod 0755 "$EMPTY"
+        [ -z "$(ls -A -- "$EMPTY")" ] || die "$EMPTY must be empty: crosvm pivots its devices into it"
+        VMM_ARGS+=(--pivot-root "$EMPTY")
+    else
+        VMM_ARGS+=(--disable-sandbox)
+        CROSVM_NOTE="run-guest: WARNING: crosvm runs with --disable-sandbox (NVGPU_CROSVM_SANDBOX=off): every device it emulates is in its main process, with no minijail and no seccomp policy. For diagnosis only"
+        echo "$CROSVM_NOTE" >&2
+    fi
+    VMM_ARGS+=("$KERNEL")
+    VMM_MARK=socket=$SOCK
+    {
+        printf '{\n  "vmm": "crosvm",\n  "argv": [\n    %s' "$(json_str "$VMM")"
+        for a in "${VMM_ARGS[@]}"; do printf ',\n    %s' "$(json_str "$a")"; done
+        printf '\n  ]\n}\n'
+    } > "$CFG"
+else
+VMM_MARK=$CFG
 cat > "$CFG" <<JSON
 {
   "boot-source": {
@@ -794,6 +892,7 @@ cat > "$CFG" <<JSON
   "unshare-network": $VMM_OWN_NETNS$SHARES
 }
 JSON
+fi
 
 # ── The VMM's jail ───────────────────────────────────────────────────────────
 #
@@ -836,6 +935,15 @@ if [ "$VMM_JAIL" = on ]; then
     fi
     VMM_CMD=("${VMM_NETNS[@]}" "$JAILER" --config "$CFG" --jail-root "$JAIL_ROOT"
         --uid "$(id -u "$VMM_USER")" --gid "$(getent group "$SLOT_GROUP" | cut -d: -f3)")
+elif [ "$VMM_KIND" = crosvm ]; then
+    # Unprivileged, crosvm leaves the host's network the only way it can: in
+    # a user namespace of its own that maps just this user, where minijail
+    # still makes each device's namespaces beneath it.
+    if [ "$VMM_OWN_NETNS" = true ]; then
+        VMM_CMD=(unshare --user --map-current-user --net -- "$VMM" "${VMM_ARGS[@]}")
+    else
+        VMM_CMD=("$VMM" "${VMM_ARGS[@]}")
+    fi
 else
     VMM_CMD=("${VMM_NETNS[@]}" "$VMM" "$CFG")
 fi
@@ -884,6 +992,13 @@ echo "guest:   $PROBE on $(basename -- "$DISK"), $VCPUS vCPU / $MEM_MIB MiB, ${T
 if [ "$VMM_JAIL" = on ]; then
     echo "vmm:     as $VMM_USER under $JAILER, jail $JAIL_ROOT, own network namespace" >&2
 fi
+if [ "$VMM_KIND" = crosvm ]; then
+    echo "vmm:     crosvm, sandbox $CROSVM_SANDBOX$([ "$VMM_OWN_NETNS" = true ] && echo ', own user and network namespace')" >&2
+fi
+# The console log starts with what the reader must know before the guest's
+# first line: a VMM without its sandbox.
+: > "$CONSOLE"
+[ -z "$CROSVM_NOTE" ] || printf '%s\n' "$CROSVM_NOTE" >> "$CONSOLE"
 if [ "$INTERACTIVE" = 1 ]; then
     # The terminal is the guest's console; the log still gets everything.
     # --foreground: timeout otherwise moves itself and nesbox into a process
@@ -892,13 +1007,12 @@ if [ "$INTERACTIVE" = 1 ]; then
     # background job of a script otherwise reads /dev/null.
     echo "guest console on this terminal; exit the guest's shell to power off" >&2
     TTY_STATE=$(stty -g 2>/dev/null) || TTY_STATE=
-    : > "$CONSOLE"
-    timeout --foreground -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- <&0 > "$CONSOLE" 2>&1 &
+    timeout --foreground -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- <&0 >> "$CONSOLE" 2>&1 &
     VMM_PID=$!
     tail -n +1 -f --pid="$VMM_PID" "$CONSOLE" &
     TAIL_PID=$!
 else
-    timeout -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- < /dev/null > "$CONSOLE" 2>&1 &
+    timeout -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- < /dev/null >> "$CONSOLE" 2>&1 &
     VMM_PID=$!
     TAIL_PID=
 fi

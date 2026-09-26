@@ -1,0 +1,99 @@
+From 97d402498383338d925aa606775adc4d1d2f1717 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 01:45:18 +0000
+Subject: [PATCH 3/4] x86_64: --no-pci-hotplug-port
+
+crosvm always makes one empty PCIe root port for hot-plugging devices
+later, and gives it the first free bus, bus 1. A guest that needs that
+bus number has no way to get it back: the virtio-nvgpu guest driver gives
+the GPU it forwards the host's own PCI address -- the address NVIDIA's
+userspace looks the device up by -- and on most hosts that is
+0000:01:00.0, so its PCI host bridge collides with the root port's bus
+(pci_scan_root_bus_bridge: -EEXIST) and the guest has no GPU device.
+
+--no-pci-hotplug-port leaves the port out. Without it nothing changes.
+It cannot be combined with --pci-hotplug-slots, which asks for ports.
+One device fewer is also one guest-visible device fewer, for a VM that
+will never have anything hot-plugged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ src/crosvm/cmdline.rs   |  7 +++++++
+ src/crosvm/config.rs    |  2 ++
+ src/crosvm/sys/linux.rs | 10 +++++++++-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index a57aa14..e3d31de 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -1546,6 +1546,12 @@ pub struct RunCommand {
+     /// don't use legacy KBD devices emulation
+     pub no_i8042: Option<bool>,
+ 
++    #[cfg(target_arch = "x86_64")]
++    #[argh(switch)]
++    /// don't create the empty PCIe root port kept for hot-plugging devices,
++    /// which takes the first free PCI bus (bus 1)
++    pub no_pci_hotplug_port: Option<bool>,
++
+     #[cfg(target_arch = "aarch64")]
+     #[argh(switch)]
+     /// disable Performance Monitor Unit (PMU)
+@@ -3194,6 +3200,7 @@ impl TryFrom<RunCommand> for super::config::Config {
+             cfg.force_s2idle = cmd.s2idle.unwrap_or_default();
+             cfg.no_i8042 = cmd.no_i8042.unwrap_or_default();
+             cfg.no_rtc = cmd.no_rtc.unwrap_or_default();
++            cfg.no_pci_hotplug_port = cmd.no_pci_hotplug_port.unwrap_or_default();
+             cfg.smbios = cmd.smbios.unwrap_or_default();
+ 
+             if let Some(pci_start) = cmd.pci_start {
+diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
+index cea9f6b..7d2bcdd 100644
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -714,6 +714,7 @@ pub struct Config {
+     #[cfg(windows)]
+     pub net_vhost_user_tube: Option<Tube>,
+     pub no_i8042: bool,
++    pub no_pci_hotplug_port: bool,
+     pub no_pmu: bool,
+     pub no_rtc: bool,
+     pub no_smt: bool,
+@@ -955,6 +956,7 @@ impl Default for Config {
+             #[cfg(windows)]
+             net_vhost_user_tube: None,
+             no_i8042: false,
++            no_pci_hotplug_port: false,
+             no_pmu: false,
+             no_rtc: false,
+             no_smt: false,
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 1972d75..36a71ee 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -2339,11 +2339,19 @@ fn run_vm(
+     #[allow(unused_variables)]
+     let pci_hotplug_slots: Option<u8> = None;
+     #[cfg(target_arch = "x86_64")]
++    if cfg.no_pci_hotplug_port && pci_hotplug_slots.is_some() {
++        bail!("--no-pci-hotplug-port and --pci-hotplug-slots cannot be used together");
++    }
++    #[cfg(target_arch = "x86_64")]
+     let hp_stub = create_pure_virtual_pcie_root_port(
+         &mut sys_allocator,
+         &mut add_control_tube,
+         &mut devices,
+-        pci_hotplug_slots.unwrap_or(1),
++        if cfg.no_pci_hotplug_port {
++            0
++        } else {
++            pci_hotplug_slots.unwrap_or(1)
++        },
+     )?;
+ 
+     arch::assign_pci_addresses(&mut devices, &mut sys_allocator)?;
+-- 
+2.55.0
+
