@@ -123,7 +123,7 @@ fn string(buf: &[u8], off: usize) -> Result<(Option<&[u8]>, usize), WireError> {
 pub fn parse<'a>(desc: &Message, msg: &'a [u8]) -> Result<Vec<At<'a>>, WireError> {
     let h = peek_header(msg).ok_or(WireError::Short)?;
     let size = h.size as usize;
-    if size < 8 || size > MAX_MSG || size % 4 != 0 || size != msg.len() {
+    if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) || size != msg.len() {
         return Err(WireError::BadSize);
     }
     let mut out = Vec::with_capacity(desc.args.len());
@@ -248,7 +248,7 @@ impl MsgBuilder {
                     .extend_from_slice(&((s.len() + 1) as u32).to_ne_bytes());
                 self.buf.extend_from_slice(s.as_bytes());
                 self.buf.push(0);
-                while self.buf.len() % 4 != 0 {
+                while !self.buf.len().is_multiple_of(4) {
                     self.buf.push(0);
                 }
                 self
@@ -258,7 +258,7 @@ impl MsgBuilder {
     pub fn array(mut self, a: &[u8]) -> Self {
         self.buf.extend_from_slice(&(a.len() as u32).to_ne_bytes());
         self.buf.extend_from_slice(a);
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
         self

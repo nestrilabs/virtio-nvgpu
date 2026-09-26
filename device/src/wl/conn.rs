@@ -1042,10 +1042,12 @@ fn reader(s: Arc<Shared>) {
         } else {
             libc::POLLOUT
         };
-        if !st.closed && want_out && rev & out_ready != 0 {
-            if let Err(e) = st.engine.local_out().flush(sock) {
-                hangup(&s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
-            }
+        if !st.closed
+            && want_out
+            && rev & out_ready != 0
+            && let Err(e) = st.engine.local_out().flush(sock)
+        {
+            hangup(&s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
         }
         for (i, p) in streams.iter().zip(&pfds[2..]) {
             if p.revents != 0 {

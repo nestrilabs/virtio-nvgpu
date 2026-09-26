@@ -45,6 +45,10 @@ use wlwire::proto::{self, Dir, IfaceId, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
+/// What [`Probe::until_done`] hands each event to: (object, opcode,
+/// arguments, descriptors).
+type OnEvent<'a> = dyn FnMut(u32, u16, &[wire::At<'_>], Vec<OwnedFd>) + 'a;
+
 use crate::hostfd::HandleKind;
 use crate::wl::conn::HostFds;
 
@@ -211,14 +215,14 @@ impl Probe {
     fn until_done(
         &mut self,
         callback: u32,
-        f: &mut dyn FnMut(u32, u16, &[wire::At<'_>], Vec<OwnedFd>),
+        f: &mut OnEvent<'_>,
     ) -> io::Result<()> {
         let deadline = Instant::now() + TIMEOUT;
         let mut chunk = vec![0u8; 16 * 1024];
         loop {
             while let Some(h) = peek_header(&self.buf) {
                 let size = h.size as usize;
-                if size < 8 || size > wire::MAX_MSG {
+                if !(8..=wire::MAX_MSG).contains(&size) {
                     return Err(io::Error::other("bad message from the compositor"));
                 }
                 if self.buf.len() < size {
@@ -304,12 +308,12 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
     )?;
     let mut devices = Vec::new();
     p.until_done(3, &mut |obj, opc, args, _| {
-        if obj == 2 && opc == op::wl_registry::EVT_GLOBAL {
-            if let (Val::Uint(name), Val::Str(Some(b"wp_drm_lease_device_v1"))) =
+        if obj == 2
+            && opc == op::wl_registry::EVT_GLOBAL
+            && let (Val::Uint(name), Val::Str(Some(b"wp_drm_lease_device_v1"))) =
                 (args[0].val, args[1].val)
-            {
-                devices.push(name);
-            }
+        {
+            devices.push(name);
         }
     })?;
     if devices.is_empty() {
@@ -342,11 +346,11 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
     // be anyone's, and is asked about again later rather than hidden for good.
     let mut result: HashMap<u32, bool> = HashMap::new();
     p.until_done(done, &mut |obj, opc, _, fds| {
-        if opc == op::wp_drm_lease_device_v1::EVT_DRM_FD {
-            if let (Some(name), Some(fd)) = (by_obj.get(&obj), fds.first()) {
-                let ours = matches!(host.classify(fd.as_fd()), HandleKind::DrmLease(_));
-                result.insert(*name, ours);
-            }
+        if opc == op::wp_drm_lease_device_v1::EVT_DRM_FD
+            && let (Some(name), Some(fd)) = (by_obj.get(&obj), fds.first())
+        {
+            let ours = matches!(host.classify(fd.as_fd()), HandleKind::DrmLease(_));
+            result.insert(*name, ours);
         }
     })?;
     Ok(result.into_iter().collect())

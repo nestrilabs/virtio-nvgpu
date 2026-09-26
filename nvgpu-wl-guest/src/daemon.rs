@@ -139,6 +139,7 @@ const SUB_STREAM: u64 = 1 << 31;
 /// What one RECV asks the host for (at least `frame::MIN_FRAME`, at most
 /// what HELLO allows).
 const RECV_BYTES: usize = 256 * 1024;
+const _: () = assert!(RECV_BYTES >= frame::MIN_FRAME);
 
 /// Bytes the daemon holds for one client that has not read them. Past this
 /// the client's channel is not read any more until it catches up: its
@@ -640,8 +641,9 @@ impl Daemon {
                 } {
                     Ok(ch) => self.add_client(s, ch, Local::Client),
                     Err(e) => {
-                        self.log
-                            .say(format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"));
+                        self.log.say(format!(
+                            "nvgpu-wl-guest: cannot open a channel to the host: {e}"
+                        ));
                         let err = Fatal {
                             object: 1,
                             code: wlwire::engine::ERR_IMPLEMENTATION,
@@ -1079,7 +1081,6 @@ mod tests {
         d.turn(100).unwrap();
         // The first receive is made as the client is added.
         assert_eq!(asked.load(Ordering::Relaxed), RECV_BYTES);
-        assert!(RECV_BYTES >= frame::MIN_FRAME);
     }
 
     #[test]
@@ -1279,7 +1280,11 @@ mod tests {
     }
 
     fn the_client(d: &Daemon) -> &Client {
-        d.clients.iter().flatten().next().expect("the client is open")
+        d.clients
+            .iter()
+            .flatten()
+            .next()
+            .expect("the client is open")
     }
 
     /// A client committing a large buffer over and over, to a host that is

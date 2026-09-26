@@ -324,19 +324,22 @@ fn start_sway(dir: &Path) -> (Kill, PathBuf) {
     let cfg = dir.join("sway.cfg");
     std::fs::write(&cfg, "output HEADLESS-1 resolution 800x600\n").unwrap();
     let log = std::fs::File::create(dir.join("sway.log")).unwrap();
-    let child = Command::new(tool("sway"))
-        .arg("-c")
-        .arg(&cfg)
-        .env("XDG_RUNTIME_DIR", dir)
-        .env("WLR_BACKENDS", "headless")
-        .env("WLR_LIBINPUT_NO_DEVICES", "1")
-        .env("WLR_RENDERER", "pixman")
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("DISPLAY")
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .unwrap();
+    // Killed and reaped however this returns, a failed start included.
+    let child = Kill(
+        Command::new(tool("sway"))
+            .arg("-c")
+            .arg(&cfg)
+            .env("XDG_RUNTIME_DIR", dir)
+            .env("WLR_BACKENDS", "headless")
+            .env("WLR_LIBINPUT_NO_DEVICES", "1")
+            .env("WLR_RENDERER", "pixman")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let found = std::fs::read_dir(dir)
@@ -348,7 +351,7 @@ fn start_sway(dir: &Path) -> (Kill, PathBuf) {
                 n.starts_with("wayland-") && !n.ends_with(".lock")
             });
         if let Some(p) = found {
-            return (Kill(child), p);
+            return (child, p);
         }
         assert!(
             Instant::now() < deadline,

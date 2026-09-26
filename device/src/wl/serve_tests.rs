@@ -598,7 +598,7 @@ fn export_mode_listens_and_accepts_host_clients_as_channels() {
 
     let _client = UnixStream::connect(&path).unwrap();
     let (fd, _) = be.handles.get(listen).unwrap();
-    assert_eq!(crate::sys::fd::readable(fd.as_raw_fd(), 2000), true, "LISTEN readable");
+    assert!(crate::sys::fd::readable(fd.as_raw_fd(), 2000), "LISTEN readable");
     let (st, chan) = open(&mut be, frame::WL_OPEN_ACCEPT);
     assert_eq!(st, 0);
     assert!(be.wl_is_open(chan));

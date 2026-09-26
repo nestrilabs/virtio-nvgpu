@@ -4,7 +4,6 @@
 #![forbid(unsafe_code)]
 
 /// Index into [`INTERFACES`].
-
 pub type IfaceId = u16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

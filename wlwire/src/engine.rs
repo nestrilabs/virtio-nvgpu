@@ -457,7 +457,10 @@ impl Engine {
                     continue;
                 };
                 for (a, at) in desc.args.iter().zip(args.iter()) {
-                    if let Val::NewId { id, iface: name, .. } = at.val {
+                    if let Val::NewId {
+                        id, iface: name, ..
+                    } = at.val
+                    {
                         let ni = a.iface.or_else(|| name.and_then(proto::iface_by_name));
                         if let Some(ni) = ni {
                             fresh.insert(id, ni);
@@ -694,7 +697,7 @@ impl Engine {
                 break Ok(());
             };
             let size = h.size as usize;
-            if size < 8 || size > MAX_MSG || size % 4 != 0 {
+            if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
                 break Err(Fatal::new(
                     Blame::Local,
                     h.object,
@@ -766,7 +769,10 @@ impl Engine {
                         let h = peek_header(p)
                             .ok_or_else(|| chan("partial message in WAYLAND record"))?;
                         let size = h.size as usize;
-                        if size < 8 || size > MAX_MSG || size % 4 != 0 || size > p.len() {
+                        if !(8..=MAX_MSG).contains(&size)
+                            || !size.is_multiple_of(4)
+                            || size > p.len()
+                        {
                             return Err(chan("bad message size in WAYLAND record"));
                         }
                         self.message(
@@ -1078,8 +1084,8 @@ impl Engine {
                             // A client's file is read as the channel takes
                             // it, as a pool is: memory only. A compositor's
                             // (a keymap) is trusted to be readable.
-                            let readable = self.cfg.local == Local::Server
-                                || sys::is_shmem(fd.as_raw_fd());
+                            let readable =
+                                self.cfg.local == Local::Server || sys::is_shmem(fd.as_raw_fd());
                             let sent = if readable {
                                 self.blobs.send(fd, off, len, &mut pre_units)
                             } else {
@@ -1269,12 +1275,12 @@ impl Engine {
                         })?;
                 }
                 (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_RESIZE) => {
-                    if let Val::Int(s) = args[0].val {
-                        if s > 0 {
-                            self.shm
-                                .resize(obj_id, s as u64, server_side)
-                                .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
-                        }
+                    if let Val::Int(s) = args[0].val
+                        && s > 0
+                    {
+                        self.shm
+                            .resize(obj_id, s as u64, server_side)
+                            .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
                     }
                 }
                 (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) if client_side => {
@@ -1324,22 +1330,17 @@ impl Engine {
         if dir == Dir::Event
             && obj.iface == proto::WL_DISPLAY
             && h.opcode == op::wl_display::EVT_DELETE_ID
+            && let Val::Uint(id) = args[0].val
+            && self.cfg.synth_released
+            && !from_local
+            && self.release_pending.remove(&id)
+            && !self.released_seen.remove(&id)
+            && self
+                .objects
+                .get(id)
+                .is_some_and(|o| !o.zombie && o.iface == proto::WP_DRM_LEASE_DEVICE_V1)
         {
-            if let Val::Uint(id) = args[0].val {
-                if self.cfg.synth_released
-                    && !from_local
-                    && self.release_pending.remove(&id)
-                    && !self.released_seen.remove(&id)
-                    && self
-                        .objects
-                        .get(id)
-                        .is_some_and(|o| !o.zombie && o.iface == proto::WP_DRM_LEASE_DEVICE_V1)
-                {
-                    synth = Some(
-                        MsgBuilder::new(id, op::wp_drm_lease_device_v1::EVT_RELEASED).finish(),
-                    );
-                }
-            }
+            synth = Some(MsgBuilder::new(id, op::wp_drm_lease_device_v1::EVT_RELEASED).finish());
         }
         if dir == Dir::Event
             && obj.iface == proto::WP_DRM_LEASE_DEVICE_V1
@@ -1370,13 +1371,12 @@ impl Engine {
         if dir == Dir::Event
             && obj.iface == proto::WL_DISPLAY
             && h.opcode == op::wl_display::EVT_DELETE_ID
+            && let Val::Uint(id) = args[0].val
         {
-            if let Val::Uint(id) = args[0].val {
-                self.objects.delete_id(id);
-                self.shm.forget(id);
-                self.release_pending.remove(&id);
-                self.released_seen.remove(&id);
-            }
+            self.objects.delete_id(id);
+            self.shm.forget(id);
+            self.release_pending.remove(&id);
+            self.released_seen.remove(&id);
         }
 
         drop(args);
@@ -1420,30 +1420,30 @@ impl Engine {
             }
             RewriteKind::DevT(i) => {
                 let at = &args[i as usize];
-                if let Val::Array(a) = at.val {
-                    if a.len() == 8 {
-                        let dev = u64::from_ne_bytes(a.try_into().unwrap());
-                        let mm = major_minor(dev);
-                        let mapped = rw
-                            .devmap
-                            .iter()
-                            .find(|p| {
-                                if to_guest {
-                                    p.host == mm
-                                } else {
-                                    p.guest == mm
-                                }
-                            })
-                            .map(|p| if to_guest { p.guest } else { p.host });
-                        // A node with no counterpart (another GPU of the
-                        // host's, say) must not alias one of ours: 0 says
-                        // "unknown device" rather than naming the wrong one.
-                        let new = mapped.map(|(ma, mi)| makedev(ma, mi)).unwrap_or(0);
-                        let b = new.to_ne_bytes();
-                        edits.push((at.off + 4, u32::from_ne_bytes(b[0..4].try_into().unwrap())));
-                        edits.push((at.off + 8, u32::from_ne_bytes(b[4..8].try_into().unwrap())));
-                        self.stats.devt_rewrites += 1;
-                    }
+                if let Val::Array(a) = at.val
+                    && a.len() == 8
+                {
+                    let dev = u64::from_ne_bytes(a.try_into().unwrap());
+                    let mm = major_minor(dev);
+                    let mapped = rw
+                        .devmap
+                        .iter()
+                        .find(|p| {
+                            if to_guest {
+                                p.host == mm
+                            } else {
+                                p.guest == mm
+                            }
+                        })
+                        .map(|p| if to_guest { p.guest } else { p.host });
+                    // A node with no counterpart (another GPU of the host's,
+                    // say) must not alias one of ours: 0 says "unknown
+                    // device" rather than naming the wrong one.
+                    let new = mapped.map(|(ma, mi)| makedev(ma, mi)).unwrap_or(0);
+                    let b = new.to_ne_bytes();
+                    edits.push((at.off + 4, u32::from_ne_bytes(b[0..4].try_into().unwrap())));
+                    edits.push((at.off + 8, u32::from_ne_bytes(b[4..8].try_into().unwrap())));
+                    self.stats.devt_rewrites += 1;
                 }
             }
             RewriteKind::Timestamp {

@@ -308,7 +308,7 @@ fn the_guest_sees_only_allowed_globals_at_clamped_versions() {
     let (b, _) = g.recv_until(sync_done);
     assert_eq!(global_names(&b), vec!["wl_compositor"]);
     // Nothing more queued: the readiness eventfd is clear.
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 0), false);
+    assert!(!crate::sys::fd::readable(ready.as_raw_fd(), 0));
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn the_compositor_socket_is_drained_while_the_guest_is_not_reading() {
     server
         .write_all(&all)
         .expect("the compositor's writes must never block on us");
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 1000), true);
+    assert!(crate::sys::fd::readable(ready.as_raw_fd(), 1000));
     let (b, _) = g.recv_until(|b, _| b.len() >= all.len());
     assert_eq!(b.len(), all.len());
 }
@@ -543,7 +543,7 @@ fn the_export_socket_is_private_and_hands_over_connections() {
     );
     assert!(x.accept_pending().is_none());
     let _c = UnixStream::connect(&path).unwrap();
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 2000), true);
+    assert!(crate::sys::fd::readable(ready.as_raw_fd(), 2000));
     let s = x.accept_pending().expect("our own uid is accepted");
     // The accepted connection becomes a channel facing a client.
     let (conn, _r) = WlConn::from_export(s, &WlConfig::new(&path), Arc::new(FakeHost)).unwrap();
@@ -1085,10 +1085,10 @@ fn an_export_client_committing_faster_than_the_guest_reads_waits_and_is_kept() {
     let deadline = Instant::now() + Duration::from_secs(5);
     // The backend stops taking the client's input: it waits in the socket.
     until("the engine stops taking input", || {
-        if written < commits.len() {
-            if let Ok(n) = host_client.write(&commits[written..]) {
-                written += n;
-            }
+        if written < commits.len()
+            && let Ok(n) = host_client.write(&commits[written..])
+        {
+            written += n;
         }
         super::conn::export_state(&conn).1
     });
@@ -1108,10 +1108,10 @@ fn an_export_client_committing_faster_than_the_guest_reads_waits_and_is_kept() {
             "{synced} of {} bytes arrived",
             COMMITS * size
         );
-        if written < commits.len() {
-            if let Ok(n) = host_client.write(&commits[written..]) {
-                written += n;
-            }
+        if written < commits.len()
+            && let Ok(n) = host_client.write(&commits[written..])
+        {
+            written += n;
         }
         let f = conn.recv(4 << 20, 256, &mut Ops::default()).unwrap();
         let d = frame::decode(&f).unwrap();
