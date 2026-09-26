@@ -315,6 +315,141 @@ after each B stage. If it stays dark after the guest lets go, that is the M-9
 FAIL (stage 9). Toggle it back with `hyprctl keyword`/`hyprctl reload`, or
 replug it.
 
+## Application pass on the live desktop
+
+Real applications in a guest, as uid 1000 with the browsers' sandboxes on,
+shown on the live Hyprland (Group B's setup: the patched Hyprland, DP-3
+leasable). Nothing is typed or clicked into the desktop -- input and the
+clipboard were verified against the headless sway -- and every guest window
+goes to DP-3's workspace, silently and without focus. DP-3 is an OLED: the
+harness powers it (DPMS) only while a slot has a window, and leaves it off.
+
+```sh
+# graphics only (nesbox; NVGPU_VMM_KIND=crosvm for crosvm), in three batches
+export NVGPU_MEM_MIB=8192 NVGPU_APPS_EXTRA=nvgpu_user=1
+NVGPU_TIMEOUT=700  scripts/rig-app-check.sh --live glxgears,xterm,gamescope,gtk,qt,firefox,mpv,glmark2,vkmark,chromeanim a0
+NVGPU_TIMEOUT=1100 scripts/rig-app-check.sh --live blender,stk,stkgs,neverball,godot,godotgl,blendervk,gimp,inkscape,krita a1
+NVGPU_TIMEOUT=1300 scripts/rig-app-check.sh --live lo,loskia,gte,gtevk,qml,qmlvk,electron,element,ffgl,crgl,mpvvk,ffvkdec,ffvkenc a2
+# compute (nesbox only)
+NVGPU_COMPUTE=1 NVGPU_TIMEOUT=1600 NVGPU_APPS_EXTRA="nvgpu_user=1 nvgpu_compute=1" scripts/rig-app-check.sh --live \
+  cuda,opencl,cycles,nvenc,ffnvdec,vainfo,mpvnvdec,mpvvaapi,ffvaapi,crvaapi,godot c1
+```
+
+`scripts/rig-app-check.sh --live` (its header has the details) finds each
+window with `hyprctl clients -j`, captures the monitor and the window with
+grim into `.rig/logs/<tag>/`, and follows the guest's `APP_START`/`APP_END`
+lines, so a slot that fails fast does not put it behind. What each slot
+checks is in `guest-image/probes/apps.sh`; the apps' logs stay in the run's
+disk under `/var/log/nvgpu/apps` (`NVGPU_KEEP_ROOTFS=1`). The media are
+built into the image (`/opt/nvgpu/apps`): the guest has no network.
+
+To tell a failure of ours from the app's, `scripts/rig-native-run.sh` runs
+the same program on the host with the guest image's own userspace and
+NVIDIA 595.99.02 files, against the headless sway (or `--live`), and
+`--no-uvm` hides `/dev/nvidia-uvm` as a graphics-only guest has it.
+
+### Results (RTX 5090, 595.99.02, 2026-09-26)
+
+Every app ran as uid 1000; every window appeared on DP-3 and every capture
+was looked at and shows the app's real content. Tags: nesbox `g0`, `n1`,
+`n2`, `c2`; crosvm `x0`, `x1`, `x2`. "native" = shown the same on the host
+with `rig-native-run.sh`.
+
+| app | API / path | nesbox | crosvm | notes |
+|---|---|---|---|---|
+| glxgears, xterm/xeyes | GLX / X11 through rootful Xwayland | PASS | PASS | |
+| gamescope + vkcube | Vulkan, nested compositor | PASS | PASS | |
+| gnome-calculator, qalculate-qt | GTK4, Qt6 | PASS | PASS | |
+| glmark2, vkmark, mpv (testsrc) | GL (EGL Wayland), Vulkan | PASS | PASS | |
+| Firefox (webgl2 page), Chromium (animation) | WebGL2, GPU compositing | PASS | PASS | |
+| SuperTuxKart | GL 4.6, SDL2, native Wayland | PASS, 116 fps avg | PASS, 116 fps | profile race, 4 karts |
+| SuperTuxKart in gamescope | GL in gamescope's Xwayland, Vulkan compositor | PASS | PASS | gamescope 3.16 segfaults tearing down after its child exits (see below); the slot outlasts the race |
+| Neverball | SDL2 + GLX, Xwayland | PASS | PASS | glxinfo in the same server: NVIDIA RTX 5090 |
+| Godot 4 (Forward+) | Vulkan 1.4, native Wayland | SKIP (native) / PASS with compute, 213 fps | SKIP (native) | no UVM: see below |
+| Godot 4 (compatibility) | GL 3.3, native Wayland | PASS | PASS | |
+| Blender 5.2 UI + EEVEE frame | GL 4.6 / Vulkan backend | PASS, 8.6 s / 3.0 s | PASS, 8.4 s / 3.2 s | one EGL_BAD_ALLOC at start in the first run, not seen again in five |
+| Blender Cycles | CUDA / OptiX | PASS, 2.08 s / 2.61 s (native 1.21 / 1.73) | n/a (compute) | 128 spp 1280x720, default scene |
+| GIMP 3.2, Inkscape 1.4 | GTK3 | PASS | PASS | |
+| Krita 6 | Qt6, OpenGL canvas, through Xwayland | PASS, canvas vendor NVIDIA | PASS | Krita picks xcb itself |
+| LibreOffice Writer | GTK3 VCL, native Wayland | PASS | PASS | |
+| LibreOffice, X11 VCL | Skia on Vulkan (skia.log: vulkan, 0x10de) | PASS | PASS | the probe supplies the Vulkan loader nixpkgs' LibreOffice lacks |
+| gnome-text-editor | GTK4, GSK ngl / vulkan | PASS | PASS | |
+| qml runtime | Qt Quick on GL / Vulkan (RHI) | PASS, 100 / 109 fps | PASS | |
+| Electron 43 app | Chromium GPU process, WebGL1/2, video | PASS: gpu_compositing, webgl, vulkan, webgpu enabled; ANGLE on the RTX 5090 | PASS | |
+| Element | Electron | PASS | PASS | a "System unsupported" (no keyring) dialog, native too |
+| Firefox, page | WebGL 1/2, video (software decode) | PASS | PASS | Firefox reports its sanitised "GTX 980, or similar" |
+| Chromium, page | WebGL 1/2 (ANGLE), video | PASS | PASS | |
+| mpv | Vulkan Video decode, H.264/HEVC/AV1 | PASS, all three | PASS | |
+| ffmpeg decode | Vulkan Video: HEVC, AV1, VP9 | PASS | PASS | H.264 stalls before the end in 2 of 5 runs (native) |
+| ffmpeg encode | Vulkan Video: h264_vulkan, av1_vulkan | PASS, 12.8x / 12.3x real time | PASS | hevc_vulkan hangs finishing, every run (native) |
+| ffmpeg encode | NVENC h264/hevc/av1 (CUDA) | PASS, 486 / 427 / 464 fps, valid files | n/a (compute) | needed two allowlist additions |
+| ffmpeg decode | NVDEC via `-hwaccel cuda`, 4 codecs | PASS | n/a (compute) | |
+| vainfo; mpv `--hwdec=vaapi` | VA-API on NVDEC (nvidia-vaapi-driver, CUDA) | PASS | n/a (compute) | needed the guest driver's DUMB_BUFFER cap fix |
+| mpv `--hwdec=nvdec` | NVDEC (CUDA) | PASS, all three | n/a (compute) | |
+| Chromium VA-API | VaapiVideoDecoder on nvidia-vaapi-driver | PASS, powerEfficient=true | n/a (compute) | |
+| Firefox VA-API | RDD process, sandbox on | SKIP (native) | n/a (compute) | vaInitialize fails under the RDD sandbox, natively too |
+| nvgpu-nbody | CUDA runtime | PASS, 24.4 TFLOP/s (native 24.4), 14.4 GB/s pinned | n/a (compute) | needed three allowlist additions |
+| clinfo, clpeak | OpenCL (NVIDIA ICD) | PASS | n/a (compute) | |
+
+Group B's lease stages under crosvm too (2026-09-26, `--vmm crosvm
+--wayland-socket <session> --wayland-lease`): `lease` 9/0/1, `vkdisplay`
+8/0/1 and `secneg` with `nvgpu_secneg_kms=lease` 6/0/0 (inside it: ctl and
+render 10 passed, 5 skipped; KMS on the lease 15 passed, 0 failed), the same
+as nesbox's, which were re-run the same day. After each lease DP-3 went back
+to Hyprland; it was powered off again.
+
+Under crosvm the compute slots are not run: the launcher refuses
+`--allow-compute` there. The video paths that need it are every one that goes
+through CUDA: NVENC as ffmpeg drives it (a CUDA context), NVDEC with
+`-hwaccel cuda` and mpv's nvdec, and VA-API (nvidia-vaapi-driver is NVDEC on
+CUDA) in vainfo, mpv, Chromium and Firefox. Vulkan Video, decode and encode,
+is the graphics-only path and runs under both VMMs; NVIDIA's NVENC sits
+behind it too, through the same session controls.
+
+No run under either VMM stopped the backend's seccomp filter (status 159),
+and no guest oops or host Xid was seen. Refusals and what was done with each
+are in SECURITY.md §12, "Added from the application pass".
+
+### Fixed on the way
+
+- The CUDA runtime and NVENC: six GSS legacy RM controls the allowlist did
+  not have (cudart's clock queries, NVENC's session setup); added, each held
+  to its measured size (`16f9235`, SECURITY.md §12).
+- VA-API: the guest's render node answered DRM_CAP_DUMB_BUFFER with
+  -EOPNOTSUPP, which nvidia-vaapi-driver takes for `nvidia_drm.modeset=0`;
+  it now answers 0, as a modeset device without dumb buffers (`0202233`).
+- The probe side: Krita through Xwayland, SDL told X11 for Neverball,
+  LibreOffice given the Vulkan loader, Qt's log on stderr, clpeak's options,
+  Element's store, Electron's feature names; and the harness's live mode
+  (window identity by stableId, following the guest).
+
+### Known native failures, and how they were shown
+
+| what | shown natively by |
+|---|---|
+| Godot Forward+ in a guest without `--allow-compute`: NVIDIA's Vulkan driver lists `VK_KHR_acceleration_structure`, `ray_query`, `ray_tracing_pipeline`, `VK_NV_ray_tracing`, `optical_flow`, `cuda_kernel_launch`, `VK_NVX_binary_import` without `/dev/nvidia-uvm` but `vkCreateDevice` fails with any of them | `rig-native-run.sh --no-uvm`: Godot fails the same way; a one-extension-at-a-time probe fails those seven and no other; with UVM, all 276 create |
+| ffmpeg 9.0.1: H.264 Vulkan Video decode into GPU frames stalls at frame 252; with download, stalls in 2 of 5 runs; hevc_vulkan encode hangs finishing in 5 of 5 | the same commands on the host, five runs each |
+| Firefox's RDD sandbox: nvidia-vaapi-driver's `vaInitialize` fails in the RDD process | the host with the same prefs: fails with the sandbox, works with `MOZ_DISABLE_RDD_SANDBOX=1` |
+| Element's "System unsupported" dialog (no keyring) | the host, headless sway, captured |
+
+Not settled natively: gamescope 3.16's segfault after its child exits
+(status 139 at teardown, the game having run; it also logs "Compositor
+released us but we were not acquired"). The proxy forwards `wl_buffer.release`
+untouched (`wlwire/src/shm.rs`); gamescope cannot start natively inside the
+Claude sandbox (its Xwayland cannot reach it there), so this was not compared.
+
+### Skipped
+
+- Xonotic (about 1 GB of game data) and vkQuake (needs id's pak files):
+  SuperTuxKart, Neverball and Godot cover GL, SDL2 and Vulkan.
+- NVIDIA's CUDA samples and `cudaPackages.saxpy`: they pull cuBLAS, cuFFT,
+  cuSPARSE and more, about 2 GB from NVIDIA's servers at ~300 KB/s;
+  `nvgpu-nbody` (`guest-image/apps/cuda`) needs only nvcc and cudart.
+- PyTorch (size), VS Code (Element covers Electron), anything needing the
+  network, and the input-driven checks (chrome://gpu, about:support
+  scrolling) on the live desktop.
+- The compute slots under crosvm (refused by the launcher, as designed).
+
 ## Group C: desktop stopped, run from a TTY
 
 The guest drives the card itself (`--kms-card`), so **no host compositor may
