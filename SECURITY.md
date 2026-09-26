@@ -8,7 +8,8 @@ against `dev` at `50ff74a` (called **dev** below), brought up to date by the
 audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
 the fuzzing of branch `fuzz` (§13), the memory-safety structure of
 branch `dind` (§14), the review of `dind` for memory passing (§15), and the
-VMMs it runs under, nesbox and crosvm (§16). It is written for the project's owner. The
+VMMs it runs under, nesbox and crosvm (§16); and by the review of 2026-09-26
+(§17). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -1518,3 +1519,38 @@ there collides: the guest driver now fails cleanly and names the bridge in
 the way, and `run-guest.sh` refuses a crosvm whose buses would hold the
 address.
 
+
+## 17. The 2026-09-26 review
+
+A review of the backend for cross-VM and app-to-app reach and for denial of
+service (`.rig/notes/review-2026-09-26/backend.md`, numbered as there). The
+items below are the ones branch `fix-backend` took; the rest -- 8, 15-18 and
+the logging and cleanup items -- are the hardening branch's. Each was checked
+against the code and, where RM's behaviour decides it, NVIDIA's 610.57.04
+sources; each fix has a unit test that fails without it. None has run on a
+GPU.
+
+| # | sev | finding | status | commit |
+|---|---|---|---|---|
+| 1 | high, cross-VM | ALLOC_OS_EVENT and FREE_OS_EVENT reached RM with the guest's hClient unchecked. RM keeps OS events in one host-wide list matched by (hClient, fd), checking neither against the caller (osapi.c allocate_os_event, free_os_event; os.c osUserHandleToKernelPtr), and every backend's descriptor numbers are small: a neighbour's client (handed out in sequence) let a guest free that VM's events or take the key its next one needs | fixed: the client must be one this VM allocated and has not freed (the semsurf client record, `rm_share_gate`), else NV_ERR_INSUFFICIENT_PERMISSIONS without RM. Not "made on the calling file": RM posts an event to the file the call is made on (nv_post_event, `event->nvfp`), the file the caller then polls, which is not the one its client was made on -- that rule would refuse every legitimate event | 9a9d3aa |
+| 2 | high, DoS | a fence context's GEM could be PRIME-exported (HOST_OP); the dma-buf kept the context -- a host kthread, a timer, an NVKMS duplicate -- alive after GEM_CLOSE gave its slot back to the caps | fixed: HOST_OP PRIME_EXPORT of a live fence context is refused (EINVAL). Nothing legitimate exports one: nvidia-drm's object has no sg table, Vulkan and EGL use a context only through 0x55-0x57, and the guest driver's own proxy refuses export (`nvgpu_fence_ctx_export`) | d7c41fc |
+| 3 | medium, app vs app | RM_FREE and FREE_OS_EVENT wiped the backend's records whatever RM answered: one guest process freeing another's client, which RM refuses, broke the owner's duplicates, fence contexts, OS events and grants | fixed: forgotten on NV_OK, or when the free came through the file that made the client (or the event) | 9a9d3aa |
+| 4 | medium, compute | UVM external mappings of registered memory were held whatever UVM answered and wherever they lay, against one VM-wide bound: holds nothing took down (pinned to the session's end), and one process filling the bound refused every other's | fixed: the mapping must lie in an external range the file made and the backend recorded (overflow-checked), or it is refused before UVM; held on NV_OK and on the failures of UVM's page-table wait, which leave mappings up (RC, ECC, GPU lost); a quarter of the bound per guest process; `UvmHold::within` does not wrap. The holds stay a list scanned per call, bounded by the cap | cf2c132 |
+| 5 | medium, cross-VM | S-6's framebuffer check and the ioctl were not one step: an RMFB, CLOSEFB or file close on another executor in between freed the id, and the kernel gives the lowest free id to the next framebuffer anyone makes | fixed: each id a call names is in use from its check to the end of its ioctl; RMFB/CLOSEFB wait for it on their own executor (5 s at most: past the check the kernel holds the framebuffer by reference), and a KMS file whose framebuffers are in use is parked and closed after the last such call (close, lease burial, reset). Not one per-VM lock: that would have the queue thread wait on a blocking commit | 3034888 |
+| 6 | medium, DoS | the S-8 probe limits kept a record per guest-chosen connector id and dpyId, made before the host saw the call: unbounded | fixed: a GETCONNECTOR probe the host refuses takes its record back; past 256 records the stale ones go, and a new id in a full window is reported, not probed. Past 256 dpy records the ones the host never answered go | 59f098d |
+| 7 | low-medium | the one-pointer deep block was pointed at any 8 bytes of a control's or an allocation's parameters: where RM follows no pointer the address reached RM as data (SET_ZBC_COLOR_CLEAR put it in the GPU-wide ZBC table, an address of the backend's for any tenant to read) | fixed: relocated only at an offset `control_pointers(cmd)` names; elsewhere the field keeps the guest's bytes and the block goes back as sent (the guest driver still carries one for V1 GPU_GET_ID_INFO, whose szName RM 610 ignores). Refused (EINVAL) on anything but RM_CONTROL: no class takes one | e15e535 |
+| 9 | low | IOCTL2's `after` hooks ran for a call finishing after its file closed or after a session reset: grants re-recorded for a closed file, an old REVOKE forgetting the new session's grants | fixed: `Finisher::records`; the reply is still rewritten, nothing is recorded | a0ee4ee |
+| 10 | low | an OPEN_KMS card file was charged to whichever process the queue thread served last | fixed: the owner is taken when the call is served | f41a67b |
+| 11 | low | pump instructions were forwarded after the backend lock was dropped, so a CLOSE's Unwatch could overtake an earlier Watch and leave the pump a duplicate of a closed file (a master, a lease) | fixed: the pump's lock is taken before the backend's is let go, at every site | 2643f5d |
+| 12 | low, cross-VM | GETPROPBLOB read any blob by id: other VMs' MODE_ID and damage clips, the host desktop's EDIDs | fixed: only blobs a file of this VM made (until destroyed or closed) or saw as the value of a blob property of an object it can see (OBJ_GETPROPERTIES, GETCONNECTOR); ENOENT otherwise. A blob reported and freed since stays readable until asked again: another tenant would have to get that very id meanwhile | 20dbc70 |
+| 13 | low | descriptors were classified by their `/proc/self/fd` link text, a path: a same-uid process with a mount namespace of its own could pass a FUSE file at `/dmabuf:x` and stall the reader | fixed: by `fstatfs`'s f_type first (anon_inodefs, the dma-buf fs, shmem or hugetlbfs), then the link; fstatfs added to the seccomp list | d97cfe1 |
+| 14 | low, DoS | a display file handed to the closer was refunded to the handle table at once, so a stuck closer let a guest queue host files without bound, to EMFILE for the whole VM | fixed: counted against the table and the owner's share until the closer has closed it | 69e8306 |
+| 19 | low | (a) `map_unrecorded` reusing a placement keyed (handle, 0) on an RM file; (b) a freed parent left its children's memory records | (a) not a finding: RM keeps one mapping context per file (nv-usermap.c: a second is NV_ERR_STATE_IN_USE), so every mmap of the file maps the same memory. (b) fixed: each object's parent is kept and a free takes the subtree; a guest freeing devices in a loop could fill the table and leave other processes' memory unrecorded | c9ff8ef |
+
+**Needs hardware.** Every one of these ran against fake kernels only. On
+the rig: an application pass with Vulkan and CUDA (OS events on the
+event's own file, #1; fence contexts, #2; frees of clients, #3;
+cuMemHostRegister's UVM mappings, #4); a lease session (drm_info and
+modetest reading MODE_ID, IN_FORMATS and EDID blobs, #12; a compositor's
+RMFB and page flips, #5; GETCONNECTOR probes, #6); descriptors from the
+host compositor, Wayland shm and dma-buf, classified (#13).
