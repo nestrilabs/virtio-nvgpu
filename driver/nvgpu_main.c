@@ -896,6 +896,14 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
       le32_to_cpu(resp->data_len) >= sz &&
       nvgpu_resp_has(used, sizeof(*resp), sz))
     memcpy(kbuf, resp_buf + sizeof(*resp), sz);
+  else if (ret >= 0)
+    /*
+     * A success that did not carry the struct back: `kbuf` still holds what
+     * was sent, which a caller reading an answer out of it (ALLOC_NVKMS's
+     * handle, MAP_OFFSET's offset) would take for the host's -- a proxy for
+     * a handle number its caller chose.
+     */
+    ret = -EIO;
 
 out:
   kfree(req_buf);

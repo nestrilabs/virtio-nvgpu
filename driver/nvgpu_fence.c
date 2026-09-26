@@ -551,17 +551,31 @@ static int nvgpu_fence_unwrap_ex(struct nvgpu_device *dev, struct dma_fence *f,
   return waited < 0 ? (int)waited : 1;
 }
 
+void nvgpu_fence_put_ref(void *fence) { dma_fence_put(fence); }
+
 int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
-                          bool *owned) {
+                          bool *owned, struct dma_fence **ref) {
   struct dma_fence *f;
   int ret;
 
   nvgpu_fence_reap();
   *owned = false;
+  *ref = NULL;
   f = sync_file_get_fence(fd);
   if (!f)
     return -EINVAL; /* as the kernel says for a descriptor that is not one */
   ret = nvgpu_fence_unwrap_ex(dev, f, handle, owned, true);
+  /*
+   * A proxy's own handle is open only as long as the proxy is: another
+   * thread closing the sync_file could let its last reference go, and the
+   * handle's CLOSE, before the call naming it ran -- and the host give the
+   * number to someone else's object. So the caller keeps the fence (an
+   * array's components with it) until the host is done with the call.
+   */
+  if (ret == 0 && !*owned) {
+    *ref = f;
+    return 0;
+  }
   dma_fence_put(f);
   return ret;
 }
@@ -572,11 +586,13 @@ int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
 struct nvgpu_fence_call {
   struct nvgpu_fd *nfd;
   struct drm_file *file;
-  /* FD_IN: the one descriptor field, resolved before the call. */
+  /* FD_IN: the one descriptor field, resolved before the call, and the
+   * fence keeping a proxy's own handle open (nvgpu_fence_unwrap_fd()). */
   bool has_in;
   bool in_used;
   u32 in_handle;
   u32 in_flags;
+  struct dma_fence *in_ref;
   /* FD_OUT: the kind the call must produce, and whether the sync_file is
    * wanted as a proxy fence (`fence`, referenced) rather than a descriptor. */
   u32 want_kind;
@@ -599,6 +615,13 @@ static int nvgpu_fence_hook_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   p->in_used = true;
   *handle = p->in_handle;
   *flags = p->in_flags;
+  /* Held with the request: past a timeout too, until the host is done. */
+  if (p->in_ref) {
+    struct dma_fence *f = p->in_ref;
+
+    p->in_ref = NULL;
+    return nvgpu_i2_hold(call, nvgpu_fence_put_ref, f);
+  }
   return 0;
 }
 
@@ -695,6 +718,11 @@ static long nvgpu_fence_call(struct nvgpu_fence_call *p, u32 target,
 
   if (p->has_in && !p->in_used && (p->in_flags & NVGPU_I2_FD_CONSUME))
     nvgpu_close_handle(p->nfd->dev, p->in_handle);
+  /* Never handed to the request: the call never named the handle. */
+  if (p->in_ref) {
+    dma_fence_put(p->in_ref);
+    p->in_ref = NULL;
+  }
   return ret;
 }
 
@@ -1601,7 +1629,8 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
   if (a.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE) {
     u64 point = a.flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE ? a.point : 0;
 
-    ret = nvgpu_fence_unwrap_fd(nfd->dev, a.fd, &p.in_handle, &owned);
+    ret = nvgpu_fence_unwrap_fd(nfd->dev, a.fd, &p.in_handle, &owned,
+                                &p.in_ref);
     if (ret < 0)
       return ret;
     if (ret == 1) {
@@ -2309,6 +2338,9 @@ long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
     if (ret == 0) {
       p.has_in = true;
       p.in_flags = owned ? NVGPU_I2_FD_CONSUME : 0;
+      /* A proxy's own handle: kept open with the request, as above. */
+      if (!owned)
+        p.in_ref = dma_fence_get(f);
       ret = nvgpu_semsurf_ctx_call(&p, cmd, &a, ctx);
     } else if (ret == 1) {
       ret = nvgpu_semsurf_wait_signalled(ctx, cmd, &a);

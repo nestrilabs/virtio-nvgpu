@@ -622,6 +622,8 @@ struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
  * signals (with the host's error, if any) when the host's does.
  */
 
+struct dma_fence;
+
 /* v2 and the backend serves fences: the syncobj and semsurf paths are live. */
 bool nvgpu_fences_enabled(struct nvgpu_device *dev);
 /*
@@ -641,8 +643,10 @@ int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
  * host consumer (IN_FENCE_FD, SEMSURF_FENCE_WAIT, a syncobj import, the
  * Wayland proxy). Returns:
  *   0  *handle names it. *owned false: it is the proxy's own handle (one of
- *      our fences) -- pass it, never close it; *owned true: a new handle made
- *      for this call (a merge of our fences) -- pass it with
+ *      our fences) -- pass it, never close it, and hold *ref (the fence that
+ *      keeps it open) until the host is done with the call, then
+ *      nvgpu_fence_put_ref() it (nvgpu_i2_hold()); *owned true: a new handle
+ *      made for this call (a merge of our fences), *ref NULL -- pass it with
  *      NVGPU_I2_FD_CONSUME, or close it.
  *   1  already signalled: nothing to wait for (the caller sends "no fence",
  *      or a signalled stand-in if the field cannot be empty).
@@ -653,7 +657,9 @@ int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
  * signalled: the host has no fence to wait on in its place.
  */
 int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
-                          bool *owned);
+                          bool *owned, struct dma_fence **ref);
+/* dma_fence_put() as a release callback (nvgpu_i2_hold()). */
+void nvgpu_fence_put_ref(void *fence);
 /* The core syncobj ioctls (0xBF-0xCF), when nvgpu_fences_enabled(). */
 bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd);
 long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,

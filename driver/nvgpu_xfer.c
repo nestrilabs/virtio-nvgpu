@@ -1821,6 +1821,9 @@ void nvgpu_event_vq_cb(struct virtqueue *vq) {
       break;
 
     nvgpu_event_dispatch(dev, buf, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
+    /* Back to zero, as it was posted: what the next batch does not write
+     * reads as nothing, not as this one's records. */
+    memset(buf, 0, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
 
     spin_lock_irqsave(&ev->vq_lock, flags);
     ret = nvgpu_event_post(ev, buf);
@@ -2026,8 +2029,10 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
    * backend speaks: a v1 backend writes its 16-byte EVENT_READY at the front
    * of whatever it is given, and a v2 one batches records up to the size.
    */
+  /* Zeroed: a device that says it wrote more than it did must not have the
+   * dispatch read whatever the heap held there before. */
   for (i = 0; i < NVGPU_EVENT_BUFS; i++)
-    ev->bufs[i] = kmalloc(NVGPU_EVENT_BUF_SIZE, GFP_KERNEL);
+    ev->bufs[i] = kzalloc(NVGPU_EVENT_BUF_SIZE, GFP_KERNEL);
   spin_lock_irqsave(&ev->vq_lock, flags);
   for (i = 0; i < NVGPU_EVENT_BUFS; i++) {
     if (!ev->bufs[i] || nvgpu_event_post(ev, ev->bufs[i]))

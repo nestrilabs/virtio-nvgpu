@@ -19,6 +19,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -726,11 +727,12 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   struct nvgpu_gem_map_offset_params mo = {};
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
-  u64 window_off;
+  u64 window_off, end;
   u32 used;
   long ret;
 
-  if (READ_ONCE(ng->window_valid))
+  /* Acquire: the placement's fields below are read after this says so. */
+  if (smp_load_acquire(&ng->window_valid))
     return 0;
 
   if (!ng->dev->window.len) {
@@ -750,10 +752,10 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   ret = nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle,
                            NVGPU_IOCTL_GEM_MAP_OFFSET, &mo, sizeof(mo));
   if (ret < 0) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: the host would not give object %u an mmap "
-             "offset: %ld\n",
-             ng->host_handle, ret);
+    dev_dbg_ratelimited(&ng->dev->vdev->dev,
+                        "virtio-gpu-nv: the host would not give object %u an "
+                        "mmap offset: %ld\n",
+                        ng->host_handle, ret);
     goto out;
   }
 
@@ -787,20 +789,25 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   window_off = le64_to_cpu(resp->guest_phys_addr);
   /* Every mapping of the object reaches up to obj->size past window_off:
    * the placement must hold that much, or the rest is the window's next
-   * extent (another process's memory) or unplaced window. */
+   * extent (another process's memory) or unplaced window. And start on a
+   * page: every mapping is made in pages from window_off, so a placement
+   * that does not would hand out the bytes before it. */
   if (le64_to_cpu(resp->size) < obj->size) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: object %u placed in %llu bytes, not its %zu\n",
-             ng->host_handle, le64_to_cpu(resp->size), obj->size);
+    dev_warn_ratelimited(&ng->dev->vdev->dev,
+                         "virtio-gpu-nv: object %u placed in %llu bytes, not "
+                         "its %zu\n",
+                         ng->host_handle, le64_to_cpu(resp->size), obj->size);
     nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
     ret = -ERANGE;
     goto out_free;
   }
-  if (window_off + obj->size > ng->dev->window.len) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "
-             "window\n",
-             window_off, obj->size, ng->dev->window.len);
+  if (!PAGE_ALIGNED(window_off) ||
+      check_add_overflow(window_off, (u64)obj->size, &end) ||
+      end > ng->dev->window.len) {
+    dev_warn_ratelimited(&ng->dev->vdev->dev,
+                         "virtio-gpu-nv: a buffer placed at %llu+%zu is not "
+                         "a page run inside the %llu-byte window\n",
+                         window_off, obj->size, ng->dev->window.len);
     /* Placed but unusable: the placement is still the backend's to free. */
     nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
     ret = -ERANGE;
@@ -811,8 +818,9 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   ng->mapping_id = le32_to_cpu(resp->mapping_id);
   ng->caching = resp->caching;
   ng->read_only = ng->dev->v2 && (resp->flags & NVGPU_MMAP_F_READ_ONLY);
-  smp_wmb(); /* the offset is readable before the flag says it is */
-  WRITE_ONCE(ng->window_valid, true);
+  /* Release: every field above is visible before the flag says it is (a
+   * lockless reader pairs with the acquire at the top). */
+  smp_store_release(&ng->window_valid, true);
   ret = 0;
 
 out_free:
@@ -894,7 +902,8 @@ static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
  * it goes into the iosys_map as such and a caller that cannot handle iomem
  * will say so rather than dereference it.
  */
-static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
+static int __nvgpu_gem_vmap(struct drm_gem_object *obj,
+                            struct iosys_map *map) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
   void __iomem *vaddr;
   int ret;
@@ -909,10 +918,10 @@ static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
    * read-only object has none.
    */
   if (ng->read_only) {
-    dev_warn_ratelimited(&ng->dev->vdev->dev,
-                         "virtio-gpu-nv: object %u is read-only on the host; "
-                         "no kernel mapping\n",
-                         ng->host_handle);
+    dev_dbg_ratelimited(&ng->dev->vdev->dev,
+                        "virtio-gpu-nv: object %u is read-only on the host; "
+                        "no kernel mapping\n",
+                        ng->host_handle);
     return -EPERM;
   }
 
@@ -933,6 +942,17 @@ static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
 
   iosys_map_set_vaddr_iomem(map, vaddr);
   return 0;
+}
+
+/* Not after remove(): the window is the device's (see the ioctl entry). */
+static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
+  int ret, idx;
+
+  if (!drm_dev_enter(obj->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_gem_vmap(obj, map);
+  drm_dev_exit(idx);
+  return ret;
 }
 
 static void nvgpu_gem_vunmap(struct drm_gem_object *obj,
@@ -957,11 +977,22 @@ static struct sg_table *nvgpu_dmabuf_map(struct dma_buf_attachment *attach,
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
   struct sg_table *sgt;
   dma_addr_t addr;
-  int ret;
+  int ret, idx;
 
+  /* Not after remove(): the window is the device's. */
+  if (!drm_dev_enter(obj->dev, &idx))
+    return ERR_PTR(-ENODEV);
   ret = nvgpu_gem_place_in_window(ng);
+  drm_dev_exit(idx);
   if (ret)
     return ERR_PTR(ret);
+  /*
+   * A read-only placement is read by an importer's device and never
+   * written: a DMA write into it would stop the VM, as a CPU one would
+   * (nvgpu_gem_object_mmap(), nvgpu_gem_vmap()).
+   */
+  if (ng->read_only && dir != DMA_TO_DEVICE)
+    return ERR_PTR(-EPERM);
 
   sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
   if (!sgt)

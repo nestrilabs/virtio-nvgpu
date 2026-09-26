@@ -1094,6 +1094,7 @@ static int nvgpu_kms_obj_class(struct nvgpu_kms_call *kc, u32 obj,
  */
 static int nvgpu_kms_in_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
                               s64 fd) {
+  struct dma_fence *ref = NULL;
   bool owned = false;
   u8 *vals;
   u32 h = 0, len;
@@ -1122,9 +1123,15 @@ static int nvgpu_kms_in_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
     put_unaligned_le64((u64)-1, vals + off);
     return 0;
   }
-  ret = nvgpu_fence_unwrap_fd(kc->kf->dev, (int)fd, &h, &owned);
+  ret = nvgpu_fence_unwrap_fd(kc->kf->dev, (int)fd, &h, &owned, &ref);
   if (ret < 0)
     return ret;
+  /* A proxy's own handle stays open as long as the request may name it. */
+  if (ref) {
+    ret = nvgpu_i2_hold(&kc->call, nvgpu_fence_put_ref, ref);
+    if (ret)
+      return ret;
+  }
   if (ret > 0) {
     vals = nvgpu_i2_buf(&kc->call, buf, &len);
     if (!vals || off > len || len - off < 8)
