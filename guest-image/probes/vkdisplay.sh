@@ -30,7 +30,19 @@ if [ -e /dev/nvgpu-wl ]; then
     section "vkcube --wsi display (VK_KHR_display, lease held)"
     # vkcube does not acquire the display through the lease fd; whether the
     # driver lets it use the head the lease holds is what this shows.
-    step "vkcube --wsi display --c $FRAMES" 60 "${LEASE[@]}" vkcube --wsi display --c "$FRAMES"
+    # With only a lease held, vkcube segfaults natively too (host vkcube on
+    # the same Hyprland lease, NVIDIA 595.99.02, 2026-09-26): SIGSEGV is a
+    # SKIP, anything else is judged as usual.
+    say "---- vkcube --wsi display --c $FRAMES: ${LEASE[*]} vkcube --wsi display --c $FRAMES"
+    timeout -k 5 60 "${LEASE[@]}" vkcube --wsi display --c "$FRAMES"
+    rc=$?
+    if [ "$rc" = 0 ]; then
+        pass "vkcube --wsi display --c $FRAMES"
+    elif [ "$rc" = 139 ]; then
+        skip "vkcube --wsi display with a lease held: SIGSEGV; it does the same natively"
+    else
+        fail "vkcube --wsi display --c $FRAMES (exit $rc)"
+    fi
     section "daemon"
     wl_daemon_alive
 else

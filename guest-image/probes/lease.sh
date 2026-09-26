@@ -43,7 +43,21 @@ step "modetest -c -p on the lease" 30 "${LEASE[@]}" "${SHIM[@]}" modetest -D /de
 
 sleep "$GAP"
 section "lease -> kmscube (GBM + NVIDIA EGL on the leased output)"
-step "kmscube on the lease, 300 frames" 60 "${LEASE[@]}" "${SHIM[@]}" kmscube -D /dev/dri/lease -c 300
+# NVIDIA's GBM buffers on a lease fd: SETCRTC answers EINVAL natively too
+# (kmscube on the host against the same Hyprland lease, NVIDIA 595.99.02,
+# 2026-09-26), while dumb buffers (lease-flip, modetest) scan out. So that
+# exact failure is a SKIP; anything else about kmscube still FAILs.
+say "---- kmscube on the lease, 300 frames: ${LEASE[*]} ${SHIM[*]} kmscube -D /dev/dri/lease -c 300"
+timeout -k 5 60 "${LEASE[@]}" "${SHIM[@]}" kmscube -D /dev/dri/lease -c 300 >/tmp/kmscube.log 2>&1
+rc=$?
+grep -v extensions /tmp/kmscube.log
+if [ "$rc" = 0 ]; then
+    pass "kmscube on the lease, 300 frames"
+elif grep -q 'failed to set mode: Invalid argument' /tmp/kmscube.log; then
+    skip "kmscube on the lease: SETCRTC EINVAL on an NVIDIA GBM buffer; it does the same natively"
+else
+    fail "kmscube on the lease, 300 frames (exit $rc)"
+fi
 
 sleep "$GAP"
 section "lease round trip (stage 9): take it again after release"

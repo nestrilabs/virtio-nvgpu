@@ -24,13 +24,13 @@ esac
 case $MODE in
     card)
         section "KMS tests on $CARD"
-        step "sec-negative.sh -- --kms $CARD" 60 bash "$NVGPU_VERIFY/sec-negative.sh" -- --kms "$CARD"
+        step "sec-negative.sh --kms $CARD" 60 bash "$NVGPU_VERIFY/sec-negative.sh" --kms "$CARD"
         ;;
     lease)
         section "KMS tests on a lease"
         if start_wl_daemon wayland-0; then
-            step "sec-negative.sh -- --kms-fd <lease>" 60 \
-                nvgpu-lease --timeout 20 -- bash "$NVGPU_VERIFY/sec-negative.sh" -- --kms-fd '{fd}'
+            step "sec-negative.sh --kms-fd <lease>" 60 \
+                nvgpu-lease --timeout 20 -- bash "$NVGPU_VERIFY/sec-negative.sh" --kms-fd '{fd}'
             wl_daemon_alive
         fi
         ;;

@@ -343,13 +343,32 @@ static void t_grant_sub_owner(int kms)
 		pass("GRANT_PERMISSIONS SUB_OWNER", "refused");
 }
 
-/* T5: ADDFB2 of a handle the host does not know as NVKMS memory. The backend
- * IDENTIFYs every scanout handle as NVKMS and refuses otherwise. We use a dumb
- * buffer, which is not an NVKMS surface on this path. Needs a KMS/lease file. */
+/* T5: ADDFB2 takes only GEM handles this file made. The backend re-homes each
+ * handle from the guest file that owns it and IDENTIFYs it as NVKMS memory on
+ * the target file before the host sees the ioctl. A dumb buffer made on this
+ * file is NVKMS memory under nvidia-drm (nv_drm_dumb_create), so ADDFB2 of it
+ * must work, as it does natively: the positive control. A handle this file
+ * never made, and one it has just closed, must be refused. Needs a KMS/lease
+ * file. */
+static int addfb2_handle(int kms, uint32_t handle, uint32_t pitch, uint32_t *fb_id)
+{
+	struct drm_mode_fb_cmd2 fb = {0};
+	fb.width = 64;
+	fb.height = 64;
+	fb.pixel_format = DRM_FORMAT_XRGB8888;
+	fb.handles[0] = handle;
+	fb.pitches[0] = pitch;
+	int r = ioctl(kms, DRM_IOCTL_MODE_ADDFB2, &fb);
+	*fb_id = fb.fb_id;
+	return r;
+}
+
 static void t_addfb2_non_nvkms(int kms)
 {
 	if (kms < 0) {
-		skip("ADDFB2 non-NVKMS handle", "no card/lease fd (--kms)");
+		skip("ADDFB2 own dumb buffer", "no card/lease fd (--kms)");
+		skip("ADDFB2 handle never made", "no card/lease fd (--kms)");
+		skip("ADDFB2 closed handle", "no card/lease fd (--kms)");
 		return;
 	}
 	struct drm_mode_create_dumb cd = {0};
@@ -357,27 +376,33 @@ static void t_addfb2_non_nvkms(int kms)
 	cd.height = 64;
 	cd.bpp = 32;
 	if (ioctl(kms, DRM_IOCTL_MODE_CREATE_DUMB, &cd) != 0) {
-		skip("ADDFB2 non-NVKMS handle", "CREATE_DUMB unavailable here");
+		skip("ADDFB2 own dumb buffer", "CREATE_DUMB unavailable here");
 		return;
 	}
-	struct drm_mode_fb_cmd2 fb = {0};
-	fb.width = 64;
-	fb.height = 64;
-	fb.pixel_format = DRM_FORMAT_XRGB8888;
-	fb.handles[0] = cd.handle;
-	fb.pitches[0] = cd.pitch;
-	int r = ioctl(kms, DRM_IOCTL_MODE_ADDFB2, &fb);
-	if (r == 0) {
-		fail("ADDFB2 non-NVKMS handle", "accepted");
-		struct drm_mode_fb_cmd2 rm = {0};
-		rm.fb_id = fb.fb_id;
-		ioctl(kms, DRM_IOCTL_MODE_RMFB, &fb.fb_id);
-		(void)rm;
+	uint32_t fb_id = 0;
+	if (addfb2_handle(kms, cd.handle, cd.pitch, &fb_id) == 0) {
+		pass("ADDFB2 own dumb buffer", "allowed (positive control)");
+		ioctl(kms, DRM_IOCTL_MODE_RMFB, &fb_id);
 	} else {
-		pass("ADDFB2 non-NVKMS handle", "refused");
+		fail("ADDFB2 own dumb buffer", strerror(errno));
 	}
+
+	/* A handle number far past anything this file has made. */
+	if (addfb2_handle(kms, cd.handle + 0x10000, cd.pitch, &fb_id) == 0) {
+		fail("ADDFB2 handle never made", "accepted");
+		ioctl(kms, DRM_IOCTL_MODE_RMFB, &fb_id);
+	} else {
+		pass("ADDFB2 handle never made", "refused");
+	}
+
 	struct drm_mode_destroy_dumb dd = {.handle = cd.handle};
 	ioctl(kms, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+	if (addfb2_handle(kms, cd.handle, cd.pitch, &fb_id) == 0) {
+		fail("ADDFB2 closed handle", "accepted");
+		ioctl(kms, DRM_IOCTL_MODE_RMFB, &fb_id);
+	} else {
+		pass("ADDFB2 closed handle", "refused");
+	}
 }
 
 /* T6: GETFB of framebuffer ids this file did not create. The backend returns a
