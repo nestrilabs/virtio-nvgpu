@@ -27,6 +27,12 @@
 #   --wayland-queue-budget MIB  unread compositor output per VM (default 256)
 #   --wayland-lease-interval S  seconds between lease requests (default 5)
 #
+# Capture injection (SECURITY.md §18; unprivileged runs only):
+#   --inject                    give the backend --inject-socket in the run's
+#                               directory (inject.sock), for peers of this
+#                               user's uid; NVGPU_INJECT_SOCKET names it to the
+#                               NVGPU_BEFORE_VMM hook (rig/rig-tools/inject-hook.sh)
+#
 # Compute (off by default; SECURITY.md, "Compute"):
 #   --allow-compute             serve CUDA: UVM, the UVM aperture and memory
 #                               registered by its pages. Without it the guest
@@ -43,6 +49,13 @@
 #   NVGPU_VCPUS NVGPU_MEM_MIB   guest size (rig 4 / 4096, root 2 / 2048)
 #   NVGPU_TIMEOUT       seconds before the VMM is killed (180; 3600 interactive)
 #   NVGPU_CMDLINE_EXTRA appended to the guest kernel command line
+#   NVGPU_BEFORE_VMM    unprivileged only: a command run (bash -c) once the
+#                       backend listens and before the VMM starts, with
+#                       NVGPU_RUN_DIR, NVGPU_INJECT_SOCKET (with --inject) and
+#                       NVGPU_HOOK_LOG (<tag>.hook.log) set; the last line it
+#                       prints is added to the guest kernel command line
+#                       (letters, digits and . _ , : = - only). The capture
+#                       probe's ids and tokens come this way
 #   NVGPU_NVIDIA_SHARE  host directory offered to the guest as virtiofs tag
 #                       "nvidia" (rig: none; root: /var/lib/nvgpu; set it
 #                       empty to drop it there too)
@@ -331,6 +344,7 @@ WL_SOCK=
 WL_EXPORT=
 KMS_CARD=0
 COMPUTE=0
+INJECT=0
 [ "${NVGPU_COMPUTE:-0}" = 1 ] && COMPUTE=1
 VMM_KIND=${NVGPU_VMM_KIND:-nesbox}
 POSITIONAL=()
@@ -338,6 +352,10 @@ while [ $# -gt 0 ]; do
     case $1 in
         --allow-compute)
             COMPUTE=1
+            shift
+            ;;
+        --inject)
+            INJECT=1
             shift
             ;;
         --vmm)
@@ -958,6 +976,14 @@ fi
 SOCK=$RUN/nvgpu.sock
 # sun_path holds 107 bytes and a NUL; a longer path fails deep in bind().
 [ ${#SOCK} -le 107 ] || die "socket path $SOCK is too long for a unix socket; set XDG_RUNTIME_DIR shorter"
+# The capture helper's socket, for this user's own processes (the rig's
+# helper is nvgpu-inject-test, run by the NVGPU_BEFORE_VMM hook).
+INJECT_SOCK=
+if [ "$INJECT" = 1 ]; then
+    [ $PRIV = user ] || die "--inject: unprivileged runs only (the helper would be another user's)"
+    INJECT_SOCK=$RUN/inject.sock
+    BACKEND_ARGS+=(--inject-socket "$INJECT_SOCK" --inject-uid "$BACKEND_UID")
+fi
 
 # ── The disk ─────────────────────────────────────────────────────────────────
 #
@@ -1176,6 +1202,27 @@ fi
 if [ "$VMM_JAIL" = on ]; then
     chgrp -h -- "$SLOT_GROUP" "$SOCK"
     chmod 0660 -- "$SOCK"
+fi
+
+# ── The hook ─────────────────────────────────────────────────────────────────
+#
+# What must happen between the backend and the guest: the capture test's
+# helper imports its buffers now, and its ids and tokens reach the guest as
+# kernel command-line words, added to the config already written.
+if [ -n "${NVGPU_BEFORE_VMM:-}" ]; then
+    [ $PRIV = user ] || die "NVGPU_BEFORE_VMM: unprivileged runs only"
+    HOOK_WORDS=$(NVGPU_RUN_DIR=$RUN NVGPU_INJECT_SOCKET=$INJECT_SOCK NVGPU_HOOK_LOG=$LOGS/$TAG.hook.log \
+        bash -c "$NVGPU_BEFORE_VMM" | tail -n 1) || die "NVGPU_BEFORE_VMM failed; see $LOGS/$TAG.hook.log"
+    [[ $HOOK_WORDS =~ ^[A-Za-z0-9_.,:=\ -]*$ ]] || die "NVGPU_BEFORE_VMM printed characters a command line cannot take"
+    if [ -n "$HOOK_WORDS" ]; then
+        echo "hook:    adds to the guest command line: $HOOK_WORDS" >&2
+        # nesbox's config, and crosvm's argv log, carry the boot line whole;
+        # crosvm's own argv carries it after -p.
+        sed -i "0,/init=\/opt\/nvgpu\/$PROBE/s//init=\/opt\/nvgpu\/$PROBE $HOOK_WORDS/" "$CFG"
+        for i in "${!VMM_CMD[@]}"; do
+            [ "${VMM_CMD[$i]}" = -p ] && VMM_CMD[i + 1]+=" $HOOK_WORDS"
+        done
+    fi
 fi
 
 # ── The guest ────────────────────────────────────────────────────────────────

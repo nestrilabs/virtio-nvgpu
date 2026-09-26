@@ -10,6 +10,8 @@
 #   bin/nvgpu-poweroff       reboot(RB_POWER_OFF) for PID-1 probe scripts
 #   bin/egl-fence            EGL_ANDROID_native_fence_sync: create, export, wait, import
 #   bin/gl-then-vk           a GL context survives a Vulkan device in the same process
+#   bin/nvgpu-capture-import /dev/nvgpu-capture: an injected host buffer into EGL
+#                            and Vulkan, pixels and read-only mappings checked
 #   libexec/nvgpu/verify/{sec-negative,lease-flip}   (only with nvgpuSrc)
 {
   pkgs,
@@ -51,6 +53,8 @@ pkgs.stdenv.mkDerivation {
     $CC $CFLAGS nvgpu-poweroff.c -o nvgpu-poweroff
     $CC $CFLAGS egl-fence.c -o egl-fence -lEGL -lGLESv2
     $CC $CFLAGS gl-then-vk.c -o gl-then-vk -lEGL -lGLESv2 $(pkg-config --cflags --libs vulkan)
+    $CC $CFLAGS nvgpu-capture-import.c -o nvgpu-capture-import -lEGL -lGLESv2 \
+      $(pkg-config --cflags --libs vulkan)
 
     if [ -n "$verifySrc" ]; then
       $CC -O2 -Wall -Wextra $(pkg-config --cflags libdrm) $verifySrc/sec-negative.c \
@@ -62,7 +66,8 @@ pkgs.stdenv.mkDerivation {
   '';
   installPhase = ''
     runHook preInstall
-    install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff egl-fence gl-then-vk
+    install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff egl-fence gl-then-vk \
+      nvgpu-capture-import
     install -Dm755 -t $out/lib libnvgpu-shim.so
     if [ -n "$verifySrc" ]; then
       install -Dm755 -t $out/libexec/nvgpu/verify sec-negative lease-flip
