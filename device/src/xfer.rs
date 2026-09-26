@@ -213,6 +213,10 @@ impl Drop for FbUses {
     }
 }
 
+/// How many connectors' last probe the VM keeps (see
+/// [`VmKms::may_probe`]): far more than a host has.
+pub const PROBES_KEPT: usize = 256;
+
 /// How often the VM may have the host probe one connector (GETCONNECTOR
 /// with count_modes 0); see `Prepared::limit_forced_probe`.
 pub const CONNECTOR_PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -323,14 +327,38 @@ impl VmKms {
     /// Whether connector `connector` of card `card` may be probed at `now`
     /// (and if so, that it was): once per [`CONNECTOR_PROBE_EVERY`] across
     /// every file of the VM, since connector ids are the device's.
+    ///
+    /// The id is the guest's: the host's refusal takes the record back
+    /// ([`VmKms::probe_refused`]), so only connectors the host serves stay
+    /// recorded, and past [`PROBES_KEPT`] records the ones older than the
+    /// window, which say nothing, go first (review 2026-09-26, backend 6).
     pub fn may_probe(&self, card: u32, connector: u32, now: std::time::Instant) -> bool {
         let mut v = self.lock();
+        if v.probed.len() >= PROBES_KEPT && !v.probed.contains_key(&(card, connector)) {
+            v.probed
+                .retain(|_, &mut t| now.saturating_duration_since(t) < CONNECTOR_PROBE_EVERY);
+            if v.probed.len() >= PROBES_KEPT {
+                // As many connectors probed this very window as a host has
+                // no need of: this one is reported, not probed.
+                return false;
+            }
+        }
         let last = v.probed.entry((card, connector)).or_insert(now);
         if *last == now || now.duration_since(*last) >= CONNECTOR_PROBE_EVERY {
             *last = now;
             return true;
         }
         false
+    }
+
+    /// The host refused the probe `may_probe` let through at `at`: no such
+    /// connector, or not one this file may see. Its record goes, unless a
+    /// later probe has made it since.
+    pub fn probe_refused(&self, card: u32, connector: u32, at: std::time::Instant) {
+        let mut v = self.lock();
+        if v.probed.get(&(card, connector)) == Some(&at) {
+            v.probed.remove(&(card, connector));
+        }
     }
 }
 
@@ -608,6 +636,8 @@ pub struct Prepared {
     /// The framebuffers this call names as scanout sources, in use from
     /// their check to the end of the ioctl ([`VmKms`]).
     fb_uses: FbUses,
+    /// A forced connector probe this call makes: (card, connector, when).
+    probing: Option<(u32, u32, std::time::Instant)>,
     /// What `Hooks::before` asked `Hooks::at_run` to check again.
     run_gate: Option<u64>,
     /// `Hooks::before` answered the call itself (`answer_locally`): the
@@ -679,6 +709,7 @@ pub fn prepare(
         fence_outs: Vec::new(),
         kms: None,
         fb_uses: FbUses::default(),
+        probing: None,
         run_gate: None,
         local: None,
         hooks: env.hooks(),
@@ -1480,6 +1511,11 @@ impl Prepared {
             .call(&*sys, target_fd, u64::from(self.entry.cmd), top);
         // The host has the framebuffers it was named (or refused them).
         self.fb_uses.release();
+        if let (Some((card, connector, at)), Some(k)) = (self.probing, &self.kms) {
+            if ret < 0 {
+                k.vm.probe_refused(card, connector, at);
+            }
+        }
         drop(gate);
         for h in temps {
             self.gem_close(target_fd, h);
@@ -1591,6 +1627,7 @@ impl Prepared {
             return Ok(());
         };
         if k.vm.may_probe(card, connector, now) {
+            self.probing = Some((card, connector, now));
             return Ok(());
         }
         let scratch = self.arena.block(&[], MODEINFO)?;
@@ -3716,6 +3753,34 @@ mod tests {
             "another card's connector 7 is another"
         );
         assert!(vm.may_probe(0, 7, t0 + CONNECTOR_PROBE_EVERY));
+    }
+
+    /// Connector ids are the guest's: every GETCONNECTOR of a made-up one
+    /// used to leave a record behind, and the map grew without bound. A
+    /// probe the host refuses keeps none, and the records are bounded.
+    #[test]
+    fn a_probe_of_a_connector_the_host_refuses_leaves_no_record() {
+        let h = h();
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
+            if peek(arg, top, 48, 4) == 7 { 0 } else { -libc::ENOENT }
+        });
+        for c in 1000..1100 {
+            assert_eq!(h.kms(&getconnector(c)).unwrap().ret, -libc::ENOENT);
+        }
+        assert_eq!(h.kms(&getconnector(7)).unwrap().ret, 0);
+        let vm = &h.kms.as_ref().unwrap().vm;
+        assert_eq!(vm.lock().probed.len(), 1, "only the connector the host served");
+
+        let vm = VmKms::new();
+        let t0 = std::time::Instant::now();
+        for c in 0..PROBES_KEPT as u32 {
+            assert!(vm.may_probe(0, c, t0));
+        }
+        assert!(!vm.may_probe(0, 9999, t0), "full of this window's probes");
+        let later = t0 + CONNECTOR_PROBE_EVERY;
+        assert!(vm.may_probe(0, 9999, later), "the stale ones make room");
+        assert_eq!(vm.lock().probed.len(), 1);
     }
 
     // ── NVKMS ──
