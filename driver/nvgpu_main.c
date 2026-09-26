@@ -1243,13 +1243,44 @@ static int nvgpu_parse_pci_addr(const char *addr, u16 *domain, u8 *bus,
   return 0;
 }
 
+/*
+ * Whether the bus the GPU's host address names is already in this guest. The
+ * device can only be registered where the host has it (userspace finds the
+ * GPU by that address), and a bus the VMM already populated cannot be made
+ * again: pci_scan_root_bus_bridge() refuses it with -EEXIST, saying why only
+ * at dev_dbg. The usual cause is a VMM bridge whose secondary bus is the GPU's:
+ * crosvm's hot-plug root port sits on 00:xx and has bus 1 behind it, and many
+ * hosts have their GPU at 0000:01:00.0. Asked first so the log names both.
+ */
+static bool nvgpu_pci_bus_taken(struct nvgpu_device *dev,
+                                const struct nvgpu_pci_root *root) {
+  struct pci_bus *b = pci_find_bus(root->slot.domain, root->slot.bus_nr);
+
+  if (!b)
+    return false;
+  if (b->self)
+    dev_err(&dev->vdev->dev,
+            "virtio-gpu-nv: cannot put the GPU at its host address %s: bus "
+            "%04x:%02x already exists in this guest, behind the VMM's bridge "
+            "%s [%04x:%04x]. The VMM has a device at the host GPU's address; "
+            "start it without that bridge (crosvm: --no-pci-hotplug-port)\n",
+            root->slot.pci_addr, root->slot.domain, root->slot.bus_nr,
+            pci_name(b->self), b->self->vendor, b->self->device);
+  else
+    dev_err(&dev->vdev->dev,
+            "virtio-gpu-nv: cannot put the GPU at its host address %s: bus "
+            "%04x:%02x is already one of this guest's root buses. The VMM "
+            "has devices at the host GPU's address\n",
+            root->slot.pci_addr, root->slot.domain, root->slot.bus_nr);
+  return true;
+}
+
 static int nvgpu_pci_init(struct nvgpu_device *dev) {
-  int i, ret = 0;
+  int i, ret, err = 0;
 
   for (i = 0; i < dev->num_pci_roots; i++) {
     struct nvgpu_pci_root *root = &dev->pci_roots[i];
     struct pci_host_bridge *bridge;
-    struct resource *bus_res;
 
     if (!root->slot.config_valid) {
       dev_warn(&dev->vdev->dev,
@@ -1258,28 +1289,35 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
       continue;
     }
 
+    if (nvgpu_pci_bus_taken(dev, root)) {
+      err = err ?: -EEXIST;
+      continue;
+    }
+
     bridge = pci_alloc_host_bridge(0);
     if (!bridge) {
       dev_err(&dev->vdev->dev,
               "virtio-gpu-nv: pci_alloc_host_bridge failed for %s\n",
               root->slot.pci_addr);
-      ret = -ENOMEM;
+      err = err ?: -ENOMEM;
       continue;
     }
 
     /* One bus resource covering exactly our bus number */
-    bus_res = kzalloc(sizeof(*bus_res), GFP_KERNEL);
-    if (!bus_res) {
-      pci_free_host_bridge(bridge);
-      ret = -ENOMEM;
-      continue;
-    }
-    bus_res->start = root->slot.bus_nr;
-    bus_res->end = root->slot.bus_nr;
-    bus_res->flags = IORESOURCE_BUS;
-    pci_add_resource(&bridge->windows, bus_res);
+    root->bus_res = (struct resource){
+        .start = root->slot.bus_nr,
+        .end = root->slot.bus_nr,
+        .flags = IORESOURCE_BUS,
+    };
+    pci_add_resource(&bridge->windows, &root->bus_res);
 
     bridge->dev.parent = &dev->vdev->dev;
+    /* x86 reads the domain from the sysdata (pci_domain_nr()), not from
+     * bridge->domain_nr, which stays PCI_DOMAIN_NR_NOT_SET: set, the bridge's
+     * release takes it for a number this driver allocated from the PCI
+     * core's emulated-domain IDA and frees it there, and ida_free() WARNs on
+     * a number it never handed out. That was the WARN on every failed scan,
+     * and the reason the bridge was never freed after a successful one. */
     root->domain = (int)root->slot.domain;
     /* No node to claim: the GPU is the host's, and the guest's idea of
      * distance to it means nothing. NUMA_NO_NODE lets every allocation made
@@ -1288,16 +1326,16 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
     bridge->sysdata = root;
     bridge->ops = &nvgpu_pci_ops;
     bridge->busnr = root->slot.bus_nr;
-    bridge->domain_nr = root->slot.domain; /* parsed u16, not ASCII bytes */
     root->nvdev = dev;
 
     ret = pci_scan_root_bus_bridge(bridge);
     if (ret) {
       dev_err(&dev->vdev->dev,
-              "virtio-gpu-nv: pci_scan_root_bus_bridge %s: %d\n",
-              root->slot.pci_addr, ret);
+              "virtio-gpu-nv: pci_scan_root_bus_bridge %s: %d%s\n",
+              root->slot.pci_addr, ret,
+              ret == -EEXIST ? " (bus already present in this guest)" : "");
       pci_free_host_bridge(bridge);
-      kfree(bus_res);
+      err = err ?: ret;
       continue;
     }
 
@@ -1318,7 +1356,7 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
              root->slot.pci_addr);
   }
 
-  return ret;
+  return err;
 }
 
 static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
@@ -1330,9 +1368,12 @@ static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
     if (!root->registered)
       continue;
 
+    /* Removing the root bus deletes the bridge's device and drops the bus's
+     * reference to it; the one pci_alloc_host_bridge() gave is ours. */
     pci_remove_root_bus(root->bridge->bus);
-    /* pci_remove_root_bus frees the bridge */
+    pci_free_host_bridge(root->bridge);
     root->bridge = NULL;
+    root->pdev = NULL;
     root->registered = false;
   }
 }

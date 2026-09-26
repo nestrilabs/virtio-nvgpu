@@ -130,6 +130,10 @@ struct nvgpu_pci_root {
   struct nvgpu_device *nvdev; /* back pointer        */
   struct pci_host_bridge *bridge;
   struct pci_dev *pdev; /* first (only) device on this bus */
+  /* The bridge's one window, [bus_nr, bus_nr]. The bridge's resource list
+   * points at it and never frees it, so it lives here rather than on the
+   * heap, where it had no owner to free it. */
+  struct resource bus_res;
   bool registered;
 };
 
