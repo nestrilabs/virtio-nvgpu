@@ -7,20 +7,18 @@ This is the security review of branch `display-passthrough` at `ae182ab`
 against `dev` at `50ff74a` (called **dev** below), brought up to date by the
 audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
 the fuzzing of branch `fuzz` (§13), the memory-safety structure of
-branch `dind` (§14), and the review of `dind` for memory passing (§15). It is written for the project's owner. The
+branch `dind` (§14), the review of `dind` for memory passing (§15), and the
+VMMs it runs under, nesbox and crosvm (§16). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
-> **Nothing in the display work has run on a GPU or in a VM.** It is built and
-> unit-tested: the Rust workspace's tests, and the guest module compiled
-> against a 7.2.7 guest kernel. The Wayland proxy has also run real clients
-> against a headless sway, with no VM and no GPU
-> (`nvgpu-wl-guest/tests/loopback.rs`). Every statement below about what the
-> host kernel does with a request -- that nvidia-drm adds an index to a kernel
-> mapping without a bound, that RM follows a pointer in the backend -- was read
-> from source (NVIDIA's open modules 610.57.04, Linux 7.2.7), not observed. The
-> on-device plan is [`TESTING.md`](TESTING.md). The headless numbers in
-> [`BENCHMARKS.md`](BENCHMARKS.md) were measured on dev, before any of this.
+> **Hardware status.** The rig (`TESTING-RIG.md`) runs stage 1, render (with
+> and without CUDA), the Wayland proxy against a headless sway, the security
+> negatives and an application pass on an RTX 5090, under nesbox and crosvm,
+> with the RM allowlist enforcing and the backend's sandbox on. KMS, leases and
+> direct scanout have not run. Statements below about what the host kernel does
+> with a request were read from source (NVIDIA's open modules 610.57.04, Linux
+> 7.2.7) unless a section says it was observed.
 
 ---
 
@@ -1464,3 +1462,54 @@ What the review found holding, for the questions it was asked:
   above. A uid per VM (§4) keeps one VM's processes from another's by the
   kernel's own rules, but it does nothing for a bug in the host kernel or
   the NVIDIA driver, which every uid reaches.
+
+## 16. The VMMs: nesbox and crosvm
+
+The VMM maps all of guest RAM and the window, and it executes the backend's
+mapping requests (vhost-user `SHMEM_MAP`/`SHMEM_UNMAP`). A compromised backend
+talks to it; the guest reaches it through the device's PCI function.
+
+**A failed placement must not leave a hole.** Both VMMs placed a backend
+descriptor into the window with one `mmap(MAP_FIXED)`, which drops the
+`PROT_NONE` reservation before the descriptor's own mmap runs. A descriptor
+that refuses (a pipe, a bad offset, a writable request on a read-only file)
+left the range unmapped inside the KVM memory slot; a later mmap of the
+VMM's own (heap, a stack) could land there and the guest would read and
+write it. Fixed in both: the descriptor is mapped where the kernel chooses,
+then moved over the reservation with `mremap(MREMAP_FIXED)`, and the
+reservation is put back if the move fails. nesbox: `virtio-devices/src/
+nvgpu.rs` `WindowMapper::place` (branch `virtio-nvgpu-v2`, d633165); crosvm:
+`patches/crosvm/0005` (`base/src/sys/linux/mmap.rs`). Each has a test that
+forces the failure and checks `/proc/self/maps`. nesbox's UVM aperture was
+already safe (`MAP_FIXED_NOREPLACE`, a slot only on success).
+
+**crosvm** (`patches/crosvm/`): every request is bounds-checked against the
+region the backend reported (overflow-checked, page-aligned offsets,
+overlaps refused, unmaps must name a live mapping, reset unmaps all); GPU and
+external maps are refused for the nvgpu type; a region size above 64 GiB is
+an error, not a panic; a refused request no longer stops the VM. No seccomp
+or minijail policy changed.
+
+**Where the mapping requests run.** crosvm jails each device it emulates in
+a process of its own with a seccomp policy, but a vhost-user *frontend* runs
+in its main process, which upstream does not seccomp-confine; the launcher
+adds a user and network namespace and pivots into an empty root. nesbox
+installs one baseline seccomp filter on every thread, including the one
+that serves these requests. So for this device's mapping path nesbox is the
+more confined of the two; for everything else crosvm emulates, crosvm is.
+The backend -- where guest bytes are parsed -- is the same process, uid and
+sandbox under both.
+
+**Compute** runs under nesbox only: crosvm publishes one shared-memory
+region per device, and the UVM aperture needs a second with mappings at
+host addresses the backend names. The launcher refuses `--allow-compute`
+with `--vmm crosvm`.
+
+**The GPU's PCI address.** The guest puts its fake PCI device at the host
+GPU's address, because NVIDIA's userspace matches what RM reports against
+sysfs and procfs; rewriting that address in every reply that carries it
+would be new rewriting surface, so it is not done. A VMM with its own device
+there collides: the guest driver now fails cleanly and names the bridge in
+the way, and `run-guest.sh` refuses a crosvm whose buses would hold the
+address.
+
