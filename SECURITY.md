@@ -470,7 +470,7 @@ removed, since nothing can say whether RM took it.
 |---|---|---|
 | identity | whoever started it. The shipped `scripts/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher, as root, gives each VM a slot of a user pool: the backend runs through `setpriv` as `nvgpu-vmN`, in the groups video, render and kvm, with no capabilities and no_new_privs, and the VMM under nesbox's jailer as `nvgpu-vmmN` (below, "One uid per VM"). With `--wayland-socket` the backend runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. Unprivileged (the rig), both are the invoking user. |
 | capabilities | whatever it was given | All dropped before the first thread exists (effective, permitted, inheritable, ambient, and the bounding set where it may), then no_new_privs, undumpable, umask 077. This holds under `--allow-root-unsafe` too, and RM decides administrator by `capable(CAP_SYS_ADMIN)` (`nv-linux.h`), so even then RM sees none. What root keeps is file access by uid. |
-| sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED`; `--sandbox=off` is for diagnosis. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
+| sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED` and stops the start; `--sandbox=best-effort` and `--sandbox=off` are diagnostic flags. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
 
 ### Threads and resource caps
 
@@ -502,7 +502,8 @@ listener, the export listener, the uevent socket, and RLIMIT_NOFILE raised.
 | limits | RLIMIT_CORE 0 over undumpable and no_new_privs | -- |
 
 Each start logs one line per layer, `sandbox: DEGRADED: ...` at warning level
-for one not fully in force, and `sandbox: every layer in force` when all are;
+for one not fully in force (and then, with `--sandbox=on`, refuses to start),
+and `sandbox: every layer in force` when all are;
 the unit tests (`sandbox::tests`) fork children that apply the filter, the
 Landlock domain and the whole sandbox, check that the backend's own
 operations still work under them, and that a forbidden call, a process
@@ -1537,3 +1538,16 @@ tables, without compute (no UVM table on either side); a host older than
 every release is refused regardless, and inside the backend it gets an
 empty RM allowlist and every RM escape refused. The rig's 595.99.02 is
 measured by all four.
+
+**Start-up fails closed.** Three conditions the backend used to log and run
+through now stop it. A sandbox layer the kernel lacks, or has only in part
+(`sandbox: DEGRADED`), with `--sandbox=on`, the default; the new
+`--sandbox=best-effort` runs with what the kernel has, and it and
+`--sandbox=off` are diagnostic flags. An error asking the host's RM whether it
+keeps clients to their file (`probe_strict_clients`; R3): only an answer of
+yes lets it start. And the seccomp filter is installed with
+`SECCOMP_FILTER_FLAG_TSYNC`, while `sandbox::apply` installs nothing at all
+when the process already has a second thread (or its thread count cannot be
+read): Landlock and the user namespace reach only the calling thread, so a
+thread made before them would have been outside both. Tests: a two-thread
+child gets no layer; a thread made before the filter is stopped by it.

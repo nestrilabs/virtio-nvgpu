@@ -309,9 +309,11 @@ struct Fprog {
 }
 
 const SECCOMP_SET_MODE_FILTER: u32 = 1;
+const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
 
-/// Install `prog` as a seccomp filter on the calling thread (and what it
-/// creates from here). no_new_privs must be set.
+/// Install `prog` as a seccomp filter on every thread of the process (and
+/// what they create from here): TSYNC, so a thread that already existed
+/// cannot stay outside it. no_new_privs must be set.
 pub fn seccomp_install(prog: &[Insn]) -> io::Result<()> {
     let len = u16::try_from(prog.len()).map_err(|_| io::Error::other("filter too long"))?;
     let fprog = Fprog {
@@ -320,15 +322,22 @@ pub fn seccomp_install(prog: &[Insn]) -> io::Result<()> {
     };
     // SAFETY: `fprog` and the program it points at outlive the call, and the
     // kernel copies them.
-    cvt_l(unsafe {
+    let r = cvt_l(unsafe {
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER,
-            0u32,
+            SECCOMP_FILTER_FLAG_TSYNC,
             &fprog as *const Fprog,
         )
-    })
-    .map(|_| ())
+    })?;
+    // With TSYNC, a positive return is the thread that could not be brought
+    // under the filter, and nothing was installed.
+    if r > 0 {
+        return Err(io::Error::other(format!(
+            "thread {r} could not be synchronised to the filter"
+        )));
+    }
+    Ok(())
 }
 
 /// The exit status of a process the seccomp handler stopped.

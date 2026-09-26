@@ -51,11 +51,14 @@
 //!    raised, not lowered, by `posture::raise_nofile` (the handle table is
 //!    sized from it), and memory is the launcher's cgroup's to bound.
 //!
-//! Every layer degrades rather than stops the backend on a kernel that lacks
-//! it -- a host whose kernel has no Landlock still runs guests -- and says so
-//! in a line beginning `sandbox: DEGRADED`, at warning level, every start.
-//! `--sandbox=off` turns all four off, for finding out whether the sandbox
-//! is what broke something, and says so just as loudly.
+//! A layer the host kernel lacks, or has only in part, is reported in a
+//! line beginning `sandbox: DEGRADED`, and with `--sandbox=on` (the default)
+//! the backend then refuses to start: a guest is never served by a backend
+//! less confined than this describes. `--sandbox=best-effort` runs with what
+//! the kernel has, for a host being brought up to it; `--sandbox=off` turns
+//! all four off, for finding out whether the sandbox is what broke
+//! something. Both are diagnostic flags (`--diagnostic`), and say so at
+//! every start.
 //!
 //! What this does not do: it keeps a compromised backend from the rest of
 //! the host, and from other VMs' backends and VMMs, but not from the host
@@ -74,9 +77,13 @@ use std::path::{Path, PathBuf};
 /// `--sandbox`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
+    /// Every layer, in full, or the backend does not start.
     #[default]
     On,
-    /// For diagnosis only.
+    /// Every layer the host kernel has; the rest reported DEGRADED and
+    /// done without. For a host that lacks one, while it is being fixed.
+    BestEffort,
+    /// None. For diagnosis only.
     Off,
 }
 
@@ -85,8 +92,9 @@ impl std::str::FromStr for Mode {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "on" => Ok(Mode::On),
+            "best-effort" => Ok(Mode::BestEffort),
             "off" => Ok(Mode::Off),
-            _ => Err(format!("{s:?}: on or off")),
+            _ => Err(format!("{s:?}: on, best-effort or off")),
         }
     }
 }
@@ -95,6 +103,7 @@ impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Mode::On => "on",
+            Mode::BestEffort => "best-effort",
             Mode::Off => "off",
         })
     }
@@ -238,13 +247,31 @@ impl Plan {
 /// `posture::drop_all_caps` (which sets no_new_privs), and after opening
 /// everything `plan` does not cover.
 pub fn apply(plan: &Plan) -> Report {
-    let threads = thread_count();
-    let network = match threads {
-        Some(n) if n > 1 => Layer::Degraded(format!(
-            "{n} threads already; a user namespace needs one (a bug in the start-up order)"
-        )),
-        _ => private_network(),
-    };
+    // A second thread would be outside Landlock's domain (it reaches only
+    // the calling thread's descendants) and cannot follow into the user
+    // namespace; the filter would reach it (TSYNC), the rest not. That is a
+    // bug in the start-up order, and nothing is installed half-way.
+    match thread_count() {
+        Some(1) => {}
+        n => {
+            let why = match n {
+                Some(n) => format!(
+                    "{n} threads already; the sandbox is installed with one (a bug in the \
+                     start-up order), so no layer was"
+                ),
+                None => "cannot read the thread count from /proc/self/status, so no layer \
+                         was installed"
+                    .to_string(),
+            };
+            return Report {
+                network: Layer::Degraded(why.clone()),
+                limits: Layer::Degraded(why.clone()),
+                landlock: Layer::Degraded(why.clone()),
+                seccomp: Layer::Degraded(why),
+            };
+        }
+    }
+    let network = private_network();
     let limits = limits();
     let landlock = landlock(plan);
     let seccomp = seccomp();
@@ -1150,6 +1177,67 @@ mod tests {
             0
         });
         assert_eq!(end, End::Exit(0));
+    }
+
+    /// A process with a second thread already gets no layer at all: the
+    /// sandbox is not installed half-way.
+    #[test]
+    fn a_process_with_two_threads_gets_no_layer() {
+        let end = forked(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || rx.recv().ok());
+            let r = apply(&Plan::default());
+            let none = [&r.network, &r.limits, &r.landlock, &r.seccomp]
+                .iter()
+                .all(|l| matches!(l, Layer::Degraded(s) if s.contains("threads already")));
+            let unfiltered = status_field("Seccomp:").as_deref() == Some("0");
+            drop(tx);
+            let _ = t.join();
+            if r.complete() {
+                return 2;
+            }
+            if !none {
+                return 3;
+            }
+            if !unfiltered {
+                return 4;
+            }
+            0
+        });
+        assert_eq!(end, End::Exit(0));
+    }
+
+    /// The filter reaches a thread that existed before it (TSYNC).
+    #[test]
+    fn the_filter_reaches_a_thread_made_before_it() {
+        let end = forked(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                if rx.recv().is_ok() {
+                    crate::sys::proc::testing::ptrace_traceme();
+                }
+                0
+            });
+            filter();
+            let _ = tx.send(());
+            let _ = t.join();
+            0
+        });
+        assert_eq!(end, End::Exit(REFUSED_EXIT));
+    }
+
+    #[test]
+    fn the_modes_parse_and_print() {
+        for (s, m) in [
+            ("on", Mode::On),
+            ("best-effort", Mode::BestEffort),
+            ("off", Mode::Off),
+        ] {
+            assert_eq!(s.parse::<Mode>(), Ok(m));
+            assert_eq!(m.to_string(), s);
+        }
+        assert!("partial".parse::<Mode>().is_err());
+        assert_eq!(Mode::default(), Mode::On);
     }
 
     #[test]

@@ -171,13 +171,15 @@ struct Args {
     /// The process sandbox (device::sandbox): a network namespace of its
     /// own, Landlock confining it to the GPU's nodes and what it reads at
     /// run time, a seccomp syscall allowlist, RLIMIT_CORE 0. Installed before
-    /// the first guest message; a layer the host kernel lacks is reported as
-    /// DEGRADED and the backend runs without it.
+    /// the first guest message; with `on` a layer the host kernel lacks, or
+    /// has only in part, stops the start.
     ///
+    /// `best-effort` runs with the layers the kernel has, each missing one
+    /// reported as DEGRADED: for a host being brought up to the sandbox.
     /// `off` is for finding out whether the sandbox is what broke something,
     /// never for running a guest: a backend taken over is then everything
     /// its uid is.
-    #[arg(long, value_name = "on|off", default_value_t = device::sandbox::Mode::On)]
+    #[arg(long, value_name = "on|best-effort|off", default_value_t = device::sandbox::Mode::On)]
     sandbox: device::sandbox::Mode,
 
     /// Compositor-VM mode: offer the host's card nodes to the guest, so a
@@ -1282,7 +1284,7 @@ fn main() -> anyhow::Result<()> {
 
     // The sandbox, while this is the only thread (device::sandbox).
     match args.sandbox {
-        device::sandbox::Mode::On => {
+        mode @ (device::sandbox::Mode::On | device::sandbox::Mode::BestEffort) => {
             let gpus: Vec<String> = host::gpu_slots(&args.proc_nvidia)
                 .iter()
                 .map(|g| {
@@ -1310,6 +1312,16 @@ fn main() -> anyhow::Result<()> {
             report.log();
             if report.complete() {
                 log::info!("sandbox: every layer in force");
+            } else if mode == device::sandbox::Mode::On {
+                anyhow::bail!(
+                    "refusing to start: the sandbox is not complete on this host (the \
+                     `sandbox: DEGRADED` lines above say which layer and why). Fix the host, \
+                     or pass --sandbox=best-effort --diagnostic to run without what it lacks"
+                );
+            } else {
+                log::warn!(
+                    "--sandbox=best-effort: running without the layers reported DEGRADED above"
+                );
             }
         }
         device::sandbox::Mode::Off => log::warn!(
@@ -1441,9 +1453,11 @@ fn main() -> anyhow::Result<()> {
              objects by handle. Remove the registry override (NVreg_RegistryDwords) and \
              reload the driver"
         ),
-        Err(e) => {
-            log::warn!("could not ask the host's RM whether it validates clients strictly: {e}")
-        }
+        Err(e) => anyhow::bail!(
+            "refusing to start: could not ask the host's RM whether it keeps each client to \
+             the file it was made on ({e}); without that, one guest process could use \
+             another's RM objects by handle"
+        ),
     }
     // Every guest process's descriptors are this process's: the whole of the
     // hard limit, taken before the sandbox, sizes the handle table (B1).
