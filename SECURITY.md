@@ -110,7 +110,7 @@ and without `--allow-compute`", §3).
 ### What is still open
 
 - `RM_CONTROL` and `RM_ALLOC` are allow-listed per release (§12), default
-  deny: 215 of 610.57.04's 1,370 controls (plus 24 GSP pass-through numbers
+  deny: 215 of 610.57.04's 1,370 controls (plus 30 GSP pass-through numbers
   seen on hardware) and 96 of its 222 classes reach RM. The list was built
   from 106 hardware runs and NVIDIA's sources, and has not itself run: a
   workload it misses breaks with RM's "not supported" and a log line naming
@@ -1289,7 +1289,7 @@ release:
 | 610.57.04 | 215 / 1,370 | 96 / 222 |
 | 615.71.09 | 217 / 1,389 | 96 / 224 |
 
-Each release also allows the 24 observed controls RM passes to GSP-RM with no
+Each release also allows the 30 observed controls RM passes to GSP-RM with no
 CPU-side table (below). Of the ~750 controls RM would serve an unprivileged
 caller in 610.57.04, the list keeps 215: `NV2080_CTRL_CMD_GPU_SET_POWER`,
 `GPU_EXEC_REG_OPS`, `PERF_RATED_TDP_SET_CONTROL` and several hundred more that
@@ -1311,7 +1311,53 @@ control with bit 15 set (the "GSS legacy" range, `RmGssLegacyRpcCmd`) is sent
 to GSP-RM with any size, checked only against the PRIVILEGED mask 0xC000; and
 every control on an NV2081_BINAPI object, which any user may allocate, is
 sent on as it is (`binapiControl`). Neither has a name or size in the open
-sources. Only the 22 GSS legacy and 2 BINAPI numbers observed are allowed.
+sources. Only the 28 GSS legacy and 2 BINAPI numbers observed are allowed (six of them since the application pass, below, each held to its measured size).
+
+**Added from the application pass (2026-09-26).** The pass on the live
+desktop (`TESTING-RIG.md`, "Application pass") ran NVENC, NVDEC, Vulkan
+Video and CUDA-runtime programs on the hardware for the first time. Every
+refusal it met is listed here with what was done; six GSS legacy controls
+were added to `observed.txt`, each held to its measured size:
+
+| control | what (measured natively, LD_PRELOAD ioctl logger) | refused, what broke | decision |
+|---|---|---|---|
+| `0x20809001` (CLK legacy) | 8 bytes, zeros in, a clock-domain mask out | every CUDA runtime program: `cudaGetDeviceCount` "initialization error" | allowed, size 8 |
+| `0x2080a026` (PERF legacy) | 532 bytes, a request in, the GPU and memory clocks (kHz) out | as above (cudart initialisation) | allowed, size 532 |
+| `0x2080a084` (PERF legacy) | 4 bytes, zeros in and out | as above | allowed, size 4 |
+| `0x20808165` (GPU legacy) | 1 byte, zero in and out, at NVENC encoder open | NVENC through Vulkan Video and through CUDA: "AuthorizeEncoderSession: Failed to authorize this encoder instance" | allowed, size 1 |
+| `0x20808163` / `0x20808164` (GPU legacy) | 4 bytes, zeros in and out, at encoder open / close | as above | allowed, size 4 |
+| `0x2080a028` (PERF legacy) | 2192 bytes, mostly the caller's uninitialised stack in, one clock out | nothing: NVENC and NVDEC work without it | **left refused** |
+| `NV0000_CTRL_CMD_GPU_ATTACH_IDS` at 128 bytes | libnvcuvid/libnvidia-encode's first try; RM itself answers `NV_ERR_INVALID_PARAM_STRUCT` natively and the caller retries with 132 | nothing: the backend answers exactly what RM does | unchanged |
+| `AMPERE_SMC_CONFIG_SESSION`, `AMPERE_SMC_MONITOR_SESSION` (MIG) | nvidia-smi's MIG queries | nothing (no MIG on a GeForce) | unchanged |
+
+Why these meet the policy: all six are in NVIDIA's own
+`NV2080_CTRL_*_LEGACY_NON_PRIVILEGED` ranges (`ctrl2080base.h`: 0x81 GPU,
+0x90 CLK, 0xa0 PERF), below the privileged mask RM checks (rule 2); their
+blocks carry no pointer, descriptor or process id -- three concurrent
+encoder sessions all sent and got 0, so the NVENC value is no GPU-wide id one
+client could name for another's session (rule 3); and real workloads need
+them: every CUDA-runtime program (most CUDA software; Cycles only worked
+because it uses the driver API) and every NVENC session (rule 4). What they
+read is clock telemetry any host user reads (nvidia-smi shows the same).
+RM's CPU side forwards a GSS legacy block of any size to GSP-RM
+(`RmGssLegacyRpcCmd`), so unlike the 24 GSS entries before them, these six
+carry the size measured on 595.99.02 (`GSS_LEGACY_SIZES` in
+`gen/rmallow_extract.py`) and the backend refuses any other size there; on
+other releases they have none, as the rest. Counts: the GSS pass-through numbers every
+release allows go from 24 to 30 (the backend's log line for 595.99.02: 245
+of 1,349 controls, 239 before); classes unchanged. No seccomp exit
+(status 159) and no other backend refusal occurred in the pass.
+
+Found alongside, not an allowlist matter: without `--allow-compute`, NVIDIA's
+Vulkan driver still lists `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
+`VK_KHR_ray_tracing_pipeline`, `VK_NV_ray_tracing`, `VK_NV_optical_flow`,
+`VK_NV_cuda_kernel_launch` and `VK_NVX_binary_import`, but cannot create a
+device with any of them (`VK_ERROR_INITIALIZATION_FAILED`: they run on its
+CUDA stack, which needs `/dev/nvidia-uvm`). Natively the same with the node
+hidden. An app that enables every ray tracing extension it is offered (Godot's
+Forward+ renderer; likely vkd3d-proton's DXR) fails in a graphics-only guest;
+with `--allow-compute` it runs. Hiding those extensions in the guest (a
+Vulkan layer) would make such apps fall back instead; not done.
 
 **What it does not do.** It keys on the command, not on the object it is sent
 to: an allowed control sent to an NV2081_BINAPI handle still goes to GSP-RM
