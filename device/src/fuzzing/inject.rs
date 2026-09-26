@@ -203,5 +203,7 @@ pub fn run(b: &mut Bytes<'_>) {
         be.session_reset("fuzz end");
         assert_eq!(be.inject.opens(), 0);
     }
+    // A render file's last close is the closer thread's (closer.rs).
+    crate::closer::wait_idle(std::time::Duration::from_secs(5));
     assert_eq!(super::open_fds(), before, "a descriptor was leaked");
 }

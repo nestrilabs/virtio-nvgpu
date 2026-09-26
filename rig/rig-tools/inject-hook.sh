@@ -17,7 +17,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
 : "${NVGPU_INJECT_SOCKET:?run with rig/run-guest.sh --inject}"
-: "${NVGPU_RUN_DIR:?run as rig/run-guest.sh's NVGPU_BEFORE_VMM}"
+: "${NVGPU_RUN_DIR:?run as the NVGPU_BEFORE_VMM of rig/run-guest.sh}"
 LOG=${NVGPU_HOOK_LOG:-$NVGPU_RUN_DIR/inject.log}
 BIN=${NVGPU_INJECT_TEST:-$RIG/bin/nvgpu-inject-test}
 [ -x "$BIN" ] || { echo "no $BIN: rig/rig-tools/build.sh" >&2; exit 1; }
