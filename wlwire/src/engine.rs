@@ -46,6 +46,8 @@ pub const ERR_NO_MEMORY: u32 = 2;
 pub const ERR_IMPLEMENTATION: u32 = 3;
 /// `wp_linux_drm_syncobj_manager_v1.error.invalid_timeline`.
 pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
+/// `wl_shm.error.invalid_fd`.
+pub const ERR_SHM_INVALID_FD: u32 = 2;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -1037,8 +1039,19 @@ impl Engine {
                                     ));
                                 }
                             };
+                            // Read at every commit, on the thread that
+                            // serves the rest of the connection: memory,
+                            // not a file whose server decides how long a
+                            // read takes (sys::is_shmem).
+                            if !sys::is_shmem(fd.as_raw_fd()) {
+                                return Err(err(
+                                    ERR_SHM_INVALID_FD,
+                                    "an shm pool must be a memfd or a file on tmpfs".into(),
+                                ));
+                            }
                             // The client's own memory, but a descriptor
-                            // held here: only the count is charged.
+                            // held here: its count, and what its buffers
+                            // cover, are charged.
                             let charge = self
                                 .shm
                                 .charge()
@@ -1062,7 +1075,17 @@ impl Engine {
                             if let Some(o) = offset_arg {
                                 edits.push((args[o as usize].off, 0));
                             }
-                            match self.blobs.send(fd, off, len, &mut pre_units) {
+                            // A client's file is read as the channel takes
+                            // it, as a pool is: memory only. A compositor's
+                            // (a keymap) is trusted to be readable.
+                            let readable = self.cfg.local == Local::Server
+                                || sys::is_shmem(fd.as_raw_fd());
+                            let sent = if readable {
+                                self.blobs.send(fd, off, len, &mut pre_units)
+                            } else {
+                                None
+                            };
+                            match sent {
                                 Some((id, job)) => {
                                     pre_job = job.map(Out::Blob);
                                     DescOut::plain(Desc {

@@ -346,3 +346,34 @@ pub fn is_regular(fd: RawFd) -> bool {
         .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
         .unwrap_or(false)
 }
+
+/// `statfs.f_type` of tmpfs (and of every memfd), and of hugetlbfs (a
+/// hugetlb memfd).
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
+
+/// A regular file whose pages are memory: a memfd, or a file on tmpfs or
+/// hugetlbfs. A `pread` of it never waits on anyone. A file on FUSE, NFS or a
+/// device can make it wait for as long as its server likes, and the proxy
+/// reads shm pools and blobs on the thread that serves every other message
+/// of the connection -- in the backend, under the lock WL_SEND and WL_RECV
+/// take.
+#[cfg(not(miri))]
+pub fn is_shmem(fd: RawFd) -> bool {
+    // SAFETY: an all-zero statfs is a valid value for fstatfs to overwrite.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a live, writable statfs.
+    if cvt(unsafe { libc::fstatfs(fd, &mut st) }).is_err() {
+        return false;
+    }
+    let magic = st.f_type as i64;
+    is_regular(fd) && (magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC)
+}
+
+/// Under Miri, whose "memfd" is a temporary file (above), and which has no
+/// `fstatfs`: any regular file.
+#[cfg(miri)]
+pub fn is_shmem(fd: RawFd) -> bool {
+    let _ = (TMPFS_MAGIC, HUGETLBFS_MAGIC);
+    is_regular(fd)
+}

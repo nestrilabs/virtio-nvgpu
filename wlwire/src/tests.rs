@@ -2633,3 +2633,68 @@ fn error_text_from_a_peer_arrives_printable_and_bounded() {
     assert!(e.message.contains("wl_compositor\\n[fake] x"), "{}", e.message);
     assert!(!e.message.chars().any(char::is_control));
 }
+
+/// Shm pools and a client's blobs are read on the connection's own thread
+/// (the backend's, under its lock): only memory is taken, never a file whose
+/// server decides how long a read takes (FUSE), nor something that is not a
+/// file at all. Before, any descriptor was taken and read.
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no fstatfs")]
+fn a_pool_or_a_clients_blob_must_be_memory() {
+    // Not memory: an eventfd, and a file on the source tree's filesystem
+    // (unless that is tmpfs too).
+    let file: OwnedFd = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .unwrap()
+        .into();
+    let on_disk = !sys::is_shmem(file.as_raw_fd());
+    assert!(sys::is_shmem(sys::memfd(c"t", 0).unwrap().as_raw_fd()));
+    let mut not_memory: Vec<OwnedFd> = vec![sys::eventfd().unwrap()];
+    if on_disk {
+        not_memory.push(file);
+    }
+    for fd in not_memory {
+        let mut p = Pair::new(Policy::default());
+        p.registry(&[(2, "wl_shm", 2)]);
+        p.bind(2, "wl_shm", 2, 4).unwrap();
+        let e = p
+            .client_sends(
+                &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                    .new_id(5)
+                    .int(4096)
+                    .finish()],
+                vec![fd],
+            )
+            .unwrap_err();
+        assert_eq!((e.object, e.code), (4, ERR_SHM_INVALID_FD));
+        assert_eq!(e.blame, Blame::Local);
+    }
+    // A blob from such a file goes as an invalid descriptor: the compositor
+    // gets a placeholder, and the connection goes on.
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wp_color_manager_v1", 1)]);
+    p.bind(1, "wp_color_manager_v1", 1, 3).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wp_color_manager_v1::REQ_CREATE_ICC_CREATOR)
+                .new_id(4)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (rd, _wr) = sys::pipe().unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+                .uint(0)
+                .uint(10)
+                .finish(),
+        ],
+        vec![rd],
+    )
+    .unwrap();
+    let (_, fds) = p.at_server();
+    assert_eq!(fds.len(), 1);
+    assert_eq!(sys::file_size(fds[0].as_raw_fd()).unwrap(), 0, "a placeholder");
+    assert_eq!(p.h.stats.placeholders, 1);
+}
