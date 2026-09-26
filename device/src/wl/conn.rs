@@ -933,9 +933,13 @@ fn reader(s: Arc<Shared>) {
             loop {
                 let mut fds = Vec::new();
                 let r = sys::recv_with_fds(sock, &mut buf, &mut fds);
+                let mut overflow = false;
                 if let Ok(n @ 1..) = r {
                     inbuf.extend_from_slice(&buf[..n]);
                     infds.extend(fds);
+                    // Descriptors no message has taken, held for ever
+                    // otherwise; libwayland closes the connection too.
+                    overflow = infds.len() > wlwire::wire::MAX_FDS_QUEUED;
                     // Lease-device globals are answered here, before the
                     // engine's registry filter asks and with no lock held: a
                     // probe can take seconds, and the connection's lock is
@@ -953,6 +957,23 @@ fn reader(s: Arc<Shared>) {
                     return;
                 }
                 if st.closed {
+                    break;
+                }
+                if overflow {
+                    infds.clear();
+                    fail(
+                        &s,
+                        &mut st,
+                        Fatal {
+                            object: 1,
+                            code: wlwire::engine::ERR_NO_MEMORY,
+                            message: format!(
+                                "more than {} file descriptors that no message takes",
+                                wlwire::wire::MAX_FDS_QUEUED
+                            ),
+                            blame: Blame::Local,
+                        },
+                    );
                     break;
                 }
                 match r {

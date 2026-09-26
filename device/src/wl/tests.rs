@@ -1128,3 +1128,25 @@ fn an_export_client_committing_faster_than_the_guest_reads_waits_and_is_kept() {
     assert_eq!(synced, COMMITS * size);
     assert!(!conn.is_closed());
 }
+
+/// The local peer's descriptors that no message takes are not held for
+/// ever: past libwayland's own ring the connection ends (here a host client
+/// in export mode; the compositor's socket is read the same way). Before,
+/// the reader kept every one.
+#[test]
+fn a_peer_sending_descriptors_no_message_takes_is_disconnected() {
+    let (host_client, ours) = UnixStream::pair().unwrap();
+    let (conn, _r) =
+        WlConn::from_export(ours, &WlConfig::new("/nonexistent"), Arc::new(FakeHost)).unwrap();
+    let e = sys::eventfd().unwrap();
+    let fds = [e.as_raw_fd(); 28];
+    for id in 0..(wlwire::wire::MAX_FDS_QUEUED / 28 + 2) as u32 {
+        let m = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(100 + id)
+            .finish();
+        if sys::send_with_fds(host_client.as_raw_fd(), &m, &fds).is_err() {
+            break;
+        }
+    }
+    until("the connection ends", || conn.is_closed());
+}

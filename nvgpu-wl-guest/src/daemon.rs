@@ -640,6 +640,21 @@ impl Daemon {
                 Ok(n) => {
                     c.inbuf.extend_from_slice(&buf[..n]);
                     c.infds.extend(fds);
+                    if c.infds.len() > wlwire::wire::MAX_FDS_QUEUED {
+                        // As libwayland does with a client that overflows
+                        // its descriptor ring.
+                        let f = Fatal {
+                            object: 1,
+                            code: wlwire::engine::ERR_NO_MEMORY,
+                            message: format!(
+                                "more than {} file descriptors sent that no request takes",
+                                wlwire::wire::MAX_FDS_QUEUED
+                            ),
+                            blame: Blame::Local,
+                        };
+                        self.fatal(slot, f);
+                        break;
+                    }
                     self.drive(slot);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -1267,5 +1282,35 @@ mod tests {
             .find(|r| r.0 == frame::REC_WAYLAND)
             .unwrap();
         assert!(last.2.ends_with(&sync), "the sync went last");
+    }
+
+    /// Descriptors sent beside messages that take none are not held for
+    /// ever: past libwayland's own ring the client is closed, as libwayland
+    /// closes it. Before, the daemon kept every one.
+    #[test]
+    fn a_client_sending_descriptors_no_request_takes_is_closed() {
+        let (mut d, _script, client) = scripted("fds");
+        let e = sys::eventfd().unwrap();
+        let fds = [e.as_raw_fd(); 28];
+        let mut sent = 0;
+        let mut id = 100;
+        while sent <= wlwire::wire::MAX_FDS_QUEUED {
+            let m = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+                .new_id(id)
+                .finish();
+            id += 1;
+            if sys::send_with_fds(client.as_raw_fd(), &m, &fds).is_err() {
+                break;
+            }
+            sent += fds.len();
+            d.turn(0).unwrap();
+        }
+        for _ in 0..10 {
+            d.turn(10).unwrap();
+        }
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the client holding {sent} descriptors is closed"
+        );
     }
 }

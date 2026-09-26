@@ -19,6 +19,13 @@ pub const SERVER_ID_START: u32 = 0xff00_0000;
 /// the `CLEN` control buffer the receiver sizes from it). More in one
 /// `sendmsg` to a libwayland peer are truncated.
 pub const MAX_FDS_PER_SENDMSG: usize = 28;
+/// The most descriptors a proxy holds from its local peer that no message has
+/// taken yet: libwayland's own input ring (`wl_connection.fds_in`, 4096 bytes
+/// of them), past which it closes the connection. Descriptors cost nothing to
+/// send and are only taken by the messages that carry them, so without this a
+/// peer sending them beside messages that carry none makes the proxy hold
+/// them for ever, to its descriptor limit and every other client's cost.
+pub const MAX_FDS_QUEUED: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
