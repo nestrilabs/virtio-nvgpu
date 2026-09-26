@@ -2069,6 +2069,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (ret)
     dev_warn(&vdev->dev, "virtio-gpu-nv: /dev/nvgpu-wl: %d\n", ret);
 
+  /* /dev/nvgpu-capture, when the backend has a capture helper's socket:
+   * like the Wayland node, after the DRM devices, and not fatal. */
+  ret = nvgpu_capture_init(dev);
+  if (ret)
+    dev_warn(&vdev->dev, "virtio-gpu-nv: /dev/nvgpu-capture: %d\n", ret);
+
   dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
   return 0;
@@ -2133,6 +2139,7 @@ static void nvgpu_remove(struct virtio_device *vdev) {
    */
   /* First, so no new channel is opened against a device going away. */
   nvgpu_wl_cleanup(dev);
+  nvgpu_capture_cleanup(dev);
 
   nvgpu_xfer_quiesce(dev);
   vdev->config->reset(vdev);

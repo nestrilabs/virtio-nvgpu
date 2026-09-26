@@ -1122,6 +1122,7 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
     __nvgpu_close_handle(dev, (u32)res0, true);
     return 1;
   case NVGPU_OP_DMABUF_IMPORT:
+  case NVGPU_OP_INJECT_OPEN:
     /* A GEM handle in the render file named by the first argument -- unless
      * the file already had one for the buffer, which the host then returns
      * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
@@ -1297,6 +1298,64 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   for (i = 0; i < nres; i++)
     res[i] = i < got ? le64_to_cpu(resp.body.res[i]) : 0;
   return 0;
+}
+
+int nvgpu_host_op_tail(struct nvgpu_device *dev, u32 op, const u64 *args,
+                       u32 nargs, u64 *res, u32 nres, void *tail,
+                       u32 tail_len, u32 *tail_used) {
+  struct {
+    struct nvgpu_msg_hdr hdr;
+    struct nvgpu_host_op_req body;
+    struct nvgpu_proc_id proc;
+  } __packed req = {};
+  const size_t fixed =
+      sizeof(struct nvgpu_msg_hdr) + sizeof(struct nvgpu_host_op_resp);
+  const struct nvgpu_host_op_resp *a;
+  u32 used, got, i, req_len = sizeof(req);
+  u8 *resp;
+  int ret;
+
+  *tail_used = 0;
+  if (!dev->v2)
+    return -EOPNOTSUPP;
+  if (nargs > NVGPU_OP_MAX_ARGS || nres > NVGPU_OP_MAX_RES ||
+      tail_len > PAGE_SIZE)
+    return -EINVAL;
+  resp = kzalloc(fixed + tail_len, GFP_KERNEL);
+  if (!resp)
+    return -ENOMEM;
+
+  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HOST_OP);
+  req.body.op = cpu_to_le32(op);
+  req.body.nargs = cpu_to_le32(nargs);
+  for (i = 0; i < nargs; i++)
+    req.body.args[i] = cpu_to_le64(args[i]);
+  if (nvgpu_proc_ids(dev))
+    nvgpu_proc_id_fill(dev, &req.proc);
+  else
+    req_len -= sizeof(req.proc);
+
+  ret = nvgpu_call(dev, &req, req_len, resp, fixed + tail_len, 0, &used,
+                   NULL, NULL);
+  if (ret)
+    goto out;
+  ret = nvgpu_hdr_status(resp, used);
+  if (ret < 0)
+    goto out;
+  if (!nvgpu_resp_has(used, 0, fixed)) {
+    ret = -EIO;
+    goto out;
+  }
+  a = (const void *)(resp + sizeof(struct nvgpu_msg_hdr));
+  got = min_t(u32, le32_to_cpu(a->nres), NVGPU_OP_MAX_RES);
+  for (i = 0; i < nres; i++)
+    res[i] = i < got ? le64_to_cpu(a->res[i]) : 0;
+  *tail_used = min_t(u32, used - fixed, tail_len);
+  memcpy(tail, resp + fixed, *tail_used);
+  ret = 0;
+out:
+  kfree(resp);
+  return ret;
 }
 
 int nvgpu_watch(struct nvgpu_device *dev, u32 handle, u32 flags, u64 cookie) {

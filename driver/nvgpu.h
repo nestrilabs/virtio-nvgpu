@@ -675,6 +675,12 @@ void nvgpu_fence_file_release(struct nvgpu_fd *nfd);
 /* Retire the event consumers buried so far (remove(), module exit). */
 void nvgpu_fence_drain(void);
 
+/* ───────── nvgpu_capture.c ───────── */
+
+/* /dev/nvgpu-capture: probe (after HELLO and nvgpu_dri_init()) and remove. */
+int nvgpu_capture_init(struct nvgpu_device *dev);
+void nvgpu_capture_cleanup(struct nvgpu_device *dev);
+
 /* ───────── nvgpu_wl.c ───────── */
 
 /* /dev/nvgpu-wl: probe (after HELLO and nvgpu_dri_init()) and remove. */
@@ -858,6 +864,15 @@ void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 /* ── HOST_OP / WATCH / CLOSE ── */
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
                   u32 nargs, u64 *res, u32 nres);
+/*
+ * nvgpu_host_op() for an op whose reply carries more after the fixed part
+ * (INJECT_OPEN): up to `tail_len` bytes of it into `tail`, and how many the
+ * backend sent in `*tail_used`. A caller that gives up still has the op's
+ * results reaped (nvgpu_reap_host_op()).
+ */
+int nvgpu_host_op_tail(struct nvgpu_device *dev, u32 op, const u64 *args,
+                       u32 nargs, u64 *res, u32 nres, void *tail,
+                       u32 tail_len, u32 *tail_used);
 int nvgpu_watch(struct nvgpu_device *dev, u32 handle, u32 flags, u64 cookie);
 int nvgpu_unwatch(struct nvgpu_device *dev, u32 handle);
 /*

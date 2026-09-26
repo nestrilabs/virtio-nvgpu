@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# /dev/nvgpu-capture*, where the guest's capture daemon opens the host
+# buffers the VM's capture helper injected (SECURITY.md §18).
+#
+# An open is how an injected screen-share buffer becomes a guest dma-buf,
+# given its id and token, which the helper tells the daemon alone. The module
+# creates the node root:root 0660 (virtio_gpu_nv capture_mode=); this gives
+# it to a group for the daemon's account:
+#
+#   groupadd --system nvgpu-capture
+#   install -m 0644 contrib/udev/70-nvgpu-capture.rules /etc/udev/rules.d/
+#   udevadm control --reload && udevadm trigger --subsystem-match=misc
+#
+# Give the group to the capture daemon, never to an application account:
+# applications get the daemon's dma-bufs (through PipeWire), not the node.
+# The token is what keeps one stream's buffers from another process that
+# may open the node; the group is what keeps every other process from trying.
+#
+# Do not add TAG+="uaccess".
+SUBSYSTEM=="misc", KERNEL=="nvgpu-capture*", GROUP="nvgpu-capture", MODE="0660"
