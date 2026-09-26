@@ -3,6 +3,9 @@ name    = "device"
 version.workspace = true
 edition.workspace = true
 license = "Apache-2.0"
+rust-version.workspace = true
+publish.workspace = true
+description = "The virtio-nvgpu device, VMM-agnostic, and its vhost-user backend (vhost-user-nvgpu)"
 
 [dependencies]
 protocol = { workspace = true }

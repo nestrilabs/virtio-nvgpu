@@ -3,7 +3,9 @@ name = "nvgpu-guest-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-license = "GPL-2.0"
+license = "GPL-2.0-only"
+# Built with nightly by cargo-fuzz; stable builds the crates it drives.
+rust-version = "1.87"
 description = "cargo-fuzz targets: the differential test, driven by libFuzzer"
 
 [package.metadata]

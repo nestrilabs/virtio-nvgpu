@@ -2,7 +2,9 @@
 name = "nvgpu-guest-difftest"
 version.workspace = true
 edition = "2021"
-license = "GPL-2.0"
+# u32::is_multiple_of; the parsers themselves build with the kernel's 1.85.
+rust-version = "1.87"
+license = "GPL-2.0-only"
 publish = false
 description = "The guest module's C parsers and their Rust port, run side by side on the same inputs"
 

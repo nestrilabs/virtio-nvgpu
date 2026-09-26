@@ -7,7 +7,8 @@ edition = "2021"
 # What Linux 7.2 accepts (scripts/min-tool-version.sh): the kernel build of
 # these sources may use any rustc from there on.
 rust-version = "1.85"
-license = "GPL-2.0"
+license = "GPL-2.0-only"
+publish = false
 description = "The guest module's untrusted-input parsers: no_std, no unsafe, no kernel dependencies"
 
 [lib]

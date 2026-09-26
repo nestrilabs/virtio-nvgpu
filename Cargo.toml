@@ -15,6 +15,12 @@ exclude = ["fuzz", "driver/rust/fuzz"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# The oldest rustc the host crates build with (format_args! temporaries
+# held by a `let`, 1.89). The guest's parser crate keeps its own, the
+# kernel's (driver/rust/core).
+rust-version = "1.89"
+# Nothing here is meant for crates.io.
+publish = false
 
 [workspace.dependencies]
 protocol = { path = "protocol" }

@@ -2,6 +2,8 @@
 name = "wlwire"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license = "Apache-2.0"
 description = "Wayland wire codec, channel frame format and translation engine shared by the virtio-nvgpu guest daemon and backend"
 build = "build.rs"

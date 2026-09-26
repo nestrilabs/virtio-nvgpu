@@ -4,6 +4,9 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 license = "Apache-2.0"
+# Built with nightly by cargo-fuzz (scripts/fuzz.sh); stable builds the crates it drives.
+rust-version = "1.89"
+description = "cargo-fuzz targets for the virtio-nvgpu backend, ABI tables and Wayland proxy"
 
 [package.metadata]
 cargo-fuzz = true
