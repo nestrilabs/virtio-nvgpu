@@ -1551,3 +1551,16 @@ when the process already has a second thread (or its thread count cannot be
 read): Landlock and the user namespace reach only the calling thread, so a
 thread made before them would have been outside both. Tests: a two-thread
 child gets no layer; a thread made before the filter is stopped by it.
+
+**The release profile.** There was none: a panic unwound one thread, so a
+vring worker's panic stalled its queue and the VM with it, a lock held
+across it was poisoned for the rest, and an executor job left its file
+mid-call. The workspace's `[profile.release]` is now `panic = "abort"`,
+`overflow-checks = true`, thin LTO, one codegen unit, line tables only.
+Nothing outside tests catches an unwind. What `abort()` does -- block
+signals, `tgkill` its own thread with SIGABRT, reset a handler that caught
+it -- is on the seccomp list, and a test panics a filtered child the way a
+release build does (from the main thread and a worker) and sees SIGABRT, not
+the 159 of a violation. The fuzz workspaces have profiles of their own and
+are unchanged; the difftest runs under the new profile (`cargo test
+--release`).

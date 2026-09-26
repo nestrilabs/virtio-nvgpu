@@ -1207,6 +1207,47 @@ mod tests {
         assert_eq!(end, End::Exit(0));
     }
 
+    /// A release build panics with `panic = "abort"`: the default hook
+    /// writes the message, then `abort()` blocks signals, raises SIGABRT
+    /// with `tgkill` on its own thread, and resets the handler if one
+    /// caught it. All of that must be on the list, from the main thread and
+    /// from a worker, or a panic would read as a sandbox violation (status
+    /// 159) instead of the abort it is.
+    #[test]
+    fn a_panic_under_abort_is_an_abort_not_a_violation() {
+        fn panic_aborting() -> ! {
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                default(info);
+                std::process::abort();
+            }));
+            panic!("a release build's panic");
+        }
+        let end = forked(|| {
+            filter();
+            panic_aborting();
+        });
+        assert_eq!(end, End::Signal(libc::SIGABRT));
+        let end = forked(|| {
+            filter();
+            let _ = std::thread::Builder::new()
+                .name("vring-worker".into())
+                .spawn(|| panic_aborting())
+                .unwrap()
+                .join();
+            0
+        });
+        assert_eq!(end, End::Signal(libc::SIGABRT));
+        // And an abort() with a handler installed, which glibc resets to
+        // the default and raises again.
+        let end = forked(|| {
+            filter();
+            crate::sys::proc::testing::sigabrt_ignored();
+            std::process::abort();
+        });
+        assert_eq!(end, End::Signal(libc::SIGABRT));
+    }
+
     /// The filter reaches a thread that existed before it (TSYNC).
     #[test]
     fn the_filter_reaches_a_thread_made_before_it() {

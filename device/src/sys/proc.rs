@@ -492,6 +492,12 @@ pub mod testing {
         unsafe { libc::signal(libc::SIGSYS, libc::SIG_DFL) };
     }
 
+    /// SIGABRT ignored, so `abort()` has to take the handler back itself.
+    pub fn sigabrt_ignored() {
+        // SAFETY: the ignore disposition.
+        unsafe { libc::signal(libc::SIGABRT, libc::SIG_IGN) };
+    }
+
     /// TIOCSTI on descriptor 0: push a byte into a terminal's input.
     pub fn tiocsti() {
         const TIOCSTI: libc::c_ulong = 0x5412;
