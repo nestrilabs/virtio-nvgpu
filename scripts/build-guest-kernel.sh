@@ -184,7 +184,7 @@ if [ "$MOD" != "$HERE/driver" ]; then
     # driver/ itself would be.
     rsync -a --delete --exclude='*.o' --exclude='*.ko' --exclude='*.mod' \
         --exclude='*.mod.c' --exclude='.*.cmd' --exclude='modules.order' \
-        --exclude='Module.symvers' --exclude='.tmp*' --exclude='guest-kernel.config' \
+        --exclude='Module.symvers' --exclude='.tmp*' --exclude='guest-kernel.defconfig' \
         "$HERE/driver/" "$MOD/"
 fi
 # A Module.symvers carried in from another tree would be consulted first.
@@ -192,9 +192,12 @@ rm -f "$MOD/Module.symvers"
 make -C "$MOD" KDIR="$KTREE" clean
 make -C "$MOD" KDIR="$KTREE" NVGPU_RUST="${NVGPU_RUST:-0}"
 
-# The recorded config is the C build's; a Rust build's stays in its tree.
+# The recorded config is the C build's, as a savedefconfig (only what differs
+# from the defaults: `cp driver/guest-kernel.defconfig $O/.config && make
+# olddefconfig` gives the whole .config back); a Rust build's stays in its tree.
 if [ "${NVGPU_RUST:-0}" != 1 ]; then
-    cp "$KTREE/.config" "$HERE/driver/guest-kernel.config"
+    "${KMAKE[@]}" savedefconfig
+    cp "$KTREE/defconfig" "$HERE/driver/guest-kernel.defconfig"
 fi
 echo "== module: $MOD/virtio_gpu_nv.ko"
-[ "${NVGPU_RUST:-0}" = 1 ] || echo "== config recorded at driver/guest-kernel.config"
+[ "${NVGPU_RUST:-0}" = 1 ] || echo "== config recorded at driver/guest-kernel.defconfig"
