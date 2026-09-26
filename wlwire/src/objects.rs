@@ -19,6 +19,8 @@
 //! - A `new_id` over a live id is an error; over a zombie it is allowed only
 //!   where libwayland would allow it (the server reusing one of its own ids).
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use crate::proto::{IfaceId, WL_DISPLAY};

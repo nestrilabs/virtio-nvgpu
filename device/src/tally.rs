@@ -9,6 +9,8 @@
 //! counted together, and the report comes out a bounded number of entries per
 //! line.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 
 /// Distinct keys kept one by one: RM's whole control and class namespace a

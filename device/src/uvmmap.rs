@@ -51,6 +51,8 @@
 //! Pure bookkeeping: `nvidia.rs` makes the calls, observes UVM's replies, and
 //! asks the VMM to place and withdraw.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::quota::{Owner, admits};

@@ -64,7 +64,7 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/posture.rs` | refusing root and `CAP_SYS_ADMIN`, dropping capabilities, the socket's directory and path |
 | `src/ratelimit.rs`, `src/tally.rs` | a rate limit per log call site, and bounded RM class and control tallies |
 | `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and a replay of real mapping lifetimes against the allocator; `WindowPlacer`, what a transport implements to place into the window and the UVM aperture |
-| `src/guarded.rs` | host-written buffers with a guard page behind them |
+| `src/sys/` | every `unsafe` of the crate, and nothing else (`scripts/check-unsafe.sh`; every other module is `#![forbid(unsafe_code)]`): the arena that builds each host call's parameter blocks from the guest's bytes and the backend's own pointers and descriptors (`block.rs`), the one `ioctl` (`ioctl.rs`), the guarded buffers the host writes into (`guarded.rs`), owned mappings with checked `MAP_FIXED` (`mem.rs`), descriptors, netlink, process and sandbox calls (`fd.rs`, `net.rs`, `proc.rs`), wire structs as bytes (`pod.rs`); SECURITY.md §14 |
 | `src/virtio.rs` | device config and feature layout, asserted against `driver/nvgpu_wire.h` |
 | `src/vring.rs` | a control-queue chain as the vhost-user transport takes it: summed before it is read, gathered, the reply scattered back (feature `vhost-user`) |
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
@@ -112,10 +112,11 @@ The `backend` targets run the whole dispatcher (`serve`, IOCTL2's
 `execute` and `finish`) against a fake host (`src/fuzzing/host.rs`): RM,
 UVM, NVKMS and nvidia-drm as far as their parameter blocks go. Every pointer
 the real driver would follow is followed, for as many bytes as it would
-copy, probed the way the kernel's copy would fault (EFAULT, the guard pages
-of `guarded.rs` working) and checked with AddressSanitizer's shadow (a heap
-buffer shorter than the copy is a finding); a pointer holding any 8 bytes of
-the input, or a small number, is a finding. OS-descriptor registrations are
+copy, against the regions of the call's own arena (`src/sys/block.rs`,
+`Arg::reach`): a pointer that starts in none of them -- any 8 bytes of the
+input, a small number, any other memory of the process -- is a finding, and
+a copy that runs past a block and its slack is the EFAULT the guard pages of
+`sys/guarded.rs` turn it into. OS-descriptor registrations are
 checked page by page against an independent reading of the page list, over
 guest RAM whose every word holds its own address. IOCTL2's host calls walk
 the schema tables as the kernel walks the struct. The window and the UVM

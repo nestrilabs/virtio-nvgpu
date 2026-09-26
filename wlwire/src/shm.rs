@@ -49,6 +49,8 @@
 //! charges only the count: its pools are the client's own memory, but each is
 //! a descriptor held here.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};

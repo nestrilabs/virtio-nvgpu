@@ -56,6 +56,8 @@
 //! Stream and blob ids are allocated by the side that creates them: the guest
 //! uses `1..=0x7fff_ffff`, the host sets bit 31.
 
+#![forbid(unsafe_code)]
+
 use std::os::fd::OwnedFd;
 
 pub const FRAME_MAGIC: u32 = u32::from_le_bytes(*b"NVWL");

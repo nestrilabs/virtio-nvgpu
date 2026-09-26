@@ -29,6 +29,8 @@
 //! takes the whole table once, at a point where nothing but the backend's own
 //! plumbing is open.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -128,10 +130,9 @@ pub fn open_fds(skip: &dyn Fn(RawFd) -> bool) -> Vec<RawFd> {
         .collect();
     fds.into_iter()
         .filter(|&fd| {
-            // SAFETY: F_GETFD only reads the descriptor's flags; a closed
-            // number answers EBADF.
-            let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-            open && !skip(fd)
+            // F_GETFD only reads the descriptor's flags; a closed number
+            // answers EBADF.
+            crate::sys::fd::is_open(fd) && !skip(fd)
         })
         .collect()
 }
@@ -139,18 +140,15 @@ pub fn open_fds(skip: &dyn Fn(RawFd) -> bool) -> Vec<RawFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd;
 
     /// A descriptor at a number far above what the other tests in this
     /// process open, so a parallel test cannot recycle it between the drop
     /// and the check below.
     fn high_fd(min: RawFd) -> OwnedFd {
         let ev = crate::hostfd::new_eventfd().unwrap();
-        // SAFETY: plain fcntl; the result is owned below.
-        let fd = unsafe { libc::fcntl(ev.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min) };
-        assert!(fd >= min);
-        // SAFETY: a descriptor fcntl just made.
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        let fd = crate::sys::fd::dup_at_least(&ev, min).unwrap();
+        assert!(fd.as_raw_fd() >= min);
+        fd
     }
 
     #[test]
@@ -162,8 +160,7 @@ mod tests {
         assert!(is_private(q.as_raw_fd()));
         drop(p);
         assert!(!is_private(n), "unregistered before its number is free");
-        // SAFETY: F_GETFD on a number this test owned and closed.
-        assert!(unsafe { libc::fcntl(n, libc::F_GETFD) } < 0, "and closed");
+        assert!(!crate::sys::fd::is_open(n), "and closed");
         drop(q);
     }
 

@@ -6,11 +6,14 @@
 //! simply fails to probe -- so the agreement is asserted by tests that mirror
 //! the driver's own `static_assert`s.
 
+#![forbid(unsafe_code)]
+
 /// The virtio device ID the guest driver probes for.
 ///
 /// Must match `VIRTIO_ID_GPU_NV` in `driver/nvgpu_wire.h`. This said 0x8042
 /// while the driver bound 45, so a device advertising it would never have been
 /// probed by its own guest driver.
+
 pub const VIRTIO_ID_GPU_NV: u32 = 45;
 
 /// Virtqueue count.
@@ -227,14 +230,9 @@ impl VirtioGpuNvConfig {
 
     /// Config space as the bytes a guest reads.
     pub fn as_bytes(&self) -> &[u8] {
-        // Safe: `repr(C, packed)` with no padding and no pointers, so every
-        // byte of the struct is initialised and meaningful.
-        unsafe {
-            std::slice::from_raw_parts(
-                self as *const Self as *const u8,
-                std::mem::size_of::<Self>(),
-            )
-        }
+        // `repr(C, packed)` with no padding and no pointers, so every byte
+        // of the struct is initialised and meaningful (sys::pod).
+        crate::sys::pod::bytes(self)
     }
 
     /// Serve a config read, clamped to the struct.

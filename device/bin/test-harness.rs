@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use device::nvidia::NvidiaBackend;
 use device::shm::ZoneConfig;

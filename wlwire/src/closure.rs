@@ -9,6 +9,8 @@
 //! `new_id` in the core protocol, `wl_registry.bind`, is exactly the edge the
 //! allowlist controls, so it is not followed.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeSet, HashMap};
 
 /// One message, reduced to what the check needs.

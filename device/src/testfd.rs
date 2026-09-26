@@ -7,6 +7,8 @@
 //! included. So a "still open" from the kernel is checked again against this
 //! process's own descriptor table, which no child shares.
 
+#![forbid(unsafe_code)]
+
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 /// Whether `end` is the only descriptor of this process on its file: for a

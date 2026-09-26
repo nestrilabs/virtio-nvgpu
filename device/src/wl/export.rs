@@ -8,6 +8,8 @@
 //! compositor is as trusted as the VM, which is to say not at all, and only
 //! this user's own programs are meant to be its clients.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -35,21 +37,7 @@ pub struct WlExport {
 }
 
 fn peer_uid(s: &UnixStream) -> io::Result<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let r = unsafe {
-        libc::getsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
+    Ok(crate::sys::fd::peer_cred(s.as_raw_fd())?.uid)
 }
 
 impl WlExport {
@@ -145,7 +133,7 @@ impl SocketLike for std::fs::FileType {
 }
 
 fn accept_loop(e: Arc<WlExport>, l: UnixListener) {
-    let me = unsafe { libc::getuid() };
+    let me = crate::sys::proc::uid();
     for s in l.incoming() {
         if e.stop.load(Ordering::Relaxed) {
             return;

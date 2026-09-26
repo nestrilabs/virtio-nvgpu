@@ -48,15 +48,17 @@
 //! (event_buffer.c:463-477, 495-505). So a nonzero handle there must name an
 //! OS event the backend saw allocated and has not seen freed.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::hostfd::{IOC_RW, ioc};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
+use crate::sys::block::{Arena, BufId};
 use crate::xfer::{Errno, Prepared};
 
 /// `DRM_IOCTL_NVIDIA_SEMSURF_FENCE_CTX_CREATE`
@@ -674,20 +676,34 @@ pub fn nvos54(client: u32, object: u32, cmd: u32, params: u64, params_size: u32)
     a
 }
 
-fn rm_ioctl(fd: RawFd, request: u32, arg: &mut [u8]) -> Result<(), String> {
-    loop {
-        // SAFETY: `arg` is _IOC_SIZE(request) bytes; any pointer in it
-        // addresses a live buffer of the caller's, as large as the host
-        // copies (see `alloc`).
-        let r = unsafe { libc::ioctl(fd, request as libc::Ioctl, arg.as_mut_ptr()) };
-        if r >= 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(e.to_string());
-        }
+/// RM call `request` on `fd`: `top` (NVOS64 or NVOS54, `_IOC_SIZE` bytes)
+/// with its parameter pointer at 16 aimed at `params` (or null), in an
+/// arena of its own, retried across signals.
+fn rm_ioctl(
+    fd: RawFd,
+    request: u32,
+    top: &[u8],
+    ptrs: &[usize],
+    params: Option<&[u8]>,
+) -> Result<(Arena, BufId, Option<BufId>), String> {
+    let mut a = Arena::new();
+    let t = a.small(top);
+    for &p in ptrs {
+        a.ptr(t, p).map_err(|e| format!("layout: {e}"))?;
     }
+    let p = match params {
+        Some(b) => {
+            let p = a.small(b);
+            a.point(t, 16, p).map_err(|e| format!("layout: {e}"))?;
+            Some(p)
+        }
+        None => None,
+    };
+    let r = a.call(&crate::sys::ioctl::HostRetry, fd, u64::from(request), t);
+    if r < 0 {
+        return Err(io::Error::from_raw_os_error(-r).to_string());
+    }
+    Ok((a, t, p))
 }
 
 impl Rm for HostRm {
@@ -697,14 +713,10 @@ impl Rm for HostRm {
         if path != "/dev/null" {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
-        let c = CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        // SAFETY: a NUL-terminated path; the result is owned below.
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a descriptor open() just returned; nothing else owns it.
-        Ok(PrivateFd::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(PrivateFd::new(crate::sys::fd::open_path(
+            path,
+            libc::O_RDWR | libc::O_CLOEXEC,
+        )?))
     }
 
     fn alloc(
@@ -720,17 +732,24 @@ impl Rm for HostRm {
         // 181-212), whatever paramsSize says. A host whose struct grew would
         // write past ours, so the host is handed a page of our own.
         let mut page = vec![0u8; 4096];
-        let (ptr, size) = match params {
+        let size = match &params {
             Some(p) => {
                 page[..p.len()].copy_from_slice(p);
-                (page.as_mut_ptr() as u64, p.len() as u32)
+                p.len() as u32
             }
-            None => (0, 0),
+            None => 0,
         };
-        let mut a = nvos64(root, parent, class, ptr, size);
-        rm_ioctl(ctl, NV_ESC_RM_ALLOC_64, &mut a)?;
-        match rd(&a, 40, 4).unwrap_or(0) as u32 {
-            0 => Ok(rd(&a, 8, 4).unwrap_or(0) as u32),
+        let top = nvos64(root, parent, class, 0, size);
+        let (a, t, _) = rm_ioctl(
+            ctl,
+            NV_ESC_RM_ALLOC_64,
+            &top,
+            &[16, 24],
+            params.is_some().then_some(&page[..]),
+        )?;
+        let a = a.bytes(t);
+        match rd(a, 40, 4).unwrap_or(0) as u32 {
+            0 => Ok(rd(a, 8, 4).unwrap_or(0) as u32),
             s => Err(format!("RM status {s:#x}")),
         }
     }
@@ -745,15 +764,18 @@ impl Rm for HostRm {
     ) -> Result<(), String> {
         // Controls copy exactly paramsSize, which RM requires to be the
         // command's own size.
-        let mut a = nvos54(
-            client,
-            object,
-            cmd,
-            params.as_mut_ptr() as u64,
-            params.len() as u32,
-        );
-        rm_ioctl(ctl, NV_ESC_RM_CONTROL, &mut a)?;
-        match rd(&a, 28, 4).unwrap_or(0) as u32 {
+        let top = nvos54(client, object, cmd, 0, params.len() as u32);
+        let (a, t, p) = rm_ioctl(
+            ctl,
+            NV_ESC_RM_CONTROL,
+            &top,
+            &[16],
+            (!params.is_empty()).then_some(&params[..]),
+        )?;
+        if let Some(p) = p {
+            params.copy_from_slice(a.bytes(p));
+        }
+        match rd(a.bytes(t), 28, 4).unwrap_or(0) as u32 {
             0 => Ok(()),
             s => Err(format!("RM status {s:#x}")),
         }
@@ -807,14 +829,18 @@ impl NvidiaBackend {
     /// bytes, the guest's handle for the file) under client `h_client`:
     /// `None` for 0 (no notification). EBADF for a number that is none of
     /// our devices, EINVAL for one no live OS event of that client names.
-    pub(crate) fn os_event_fd(&self, h_client: u32, field: &[u8]) -> Result<Option<RawFd>, Errno> {
+    pub(crate) fn os_event_fd(
+        &self,
+        h_client: u32,
+        field: &[u8],
+    ) -> Result<Option<std::os::fd::BorrowedFd<'_>>, Errno> {
         let v = rd(field, 0, 8).ok_or(libc::EINVAL)?;
         if v == 0 {
             return Ok(None);
         }
         let handle = u32::try_from(v).map_err(|_| libc::EBADF)?;
         let fd = match self.handles.get(handle) {
-            Some((fd, crate::hostfd::HandleKind::Dev(_))) => fd.as_raw_fd(),
+            Some((fd, crate::hostfd::HandleKind::Dev(_))) => fd,
             _ => {
                 log::warn!("RM call names OS event handle {v:#x}, which is none of our devices");
                 return Err(libc::EBADF);
@@ -900,6 +926,7 @@ mod tests {
     use crate::schema::SchemaClass;
     use crate::xfer;
     use std::cell::RefCell;
+    use std::os::fd::OwnedFd;
     use std::sync::Arc;
 
     const L: Layout = Layout {
@@ -1255,7 +1282,7 @@ mod tests {
         let s = Arc::new(policy());
         let mut p = prepare(&s, &ctx_create(0, Some(&params(CLIENT, 4096)))).unwrap();
         // What the host writes back: the context's GEM handle.
-        p.buffer_mut(0).unwrap()[24..28].copy_from_slice(&9u32.to_le_bytes());
+        p.host_writes(0, 24, &9u32.to_le_bytes());
         s.ctx_create_after(&p, -libc::ENOMEM);
         assert_eq!(s.ctx_counts(RENDER), (0, 0), "a failed call made nothing");
         s.ctx_create_after(&p, 0);
@@ -1466,6 +1493,7 @@ mod backend_tests {
     use crate::hostfd::{self, HandleKind};
     use protocol::messages::{DeviceKind, MsgType};
     use std::cell::RefCell;
+    use std::os::fd::OwnedFd;
 
     const CLIENT: u32 = 0xc1d0_0001;
 
@@ -1482,22 +1510,20 @@ mod backend_tests {
     /// A host RM: a client allocation gets CLIENT, an OS event and every
     /// other call succeed, and whatever notificationHandle reaches it is
     /// recorded, read through the parameter pointer as RM reads it.
-    unsafe fn fake_rm(_: RawFd, request: u64, arg: *mut u8) -> i32 {
+    fn fake_rm(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
         let request = request as u32;
-        // SAFETY: the HostIoctl contract, `arg` holds _IOC_SIZE bytes.
-        let a = unsafe { std::slice::from_raw_parts_mut(arg, hostfd::ioc_size(request)) };
+        let (a, others) = arg.split();
+        let a = &mut a[..hostfd::ioc_size(request)];
         let word = |a: &[u8], at: usize| u32::from_le_bytes(a[at..at + 4].try_into().unwrap());
-        let params = |a: &[u8]| u64::from_le_bytes(a[16..24].try_into().unwrap()) as *const u8;
+        let params = |a: &[u8]| u64::from_le_bytes(a[16..24].try_into().unwrap());
         let note = |what: u32, v: u64| SEEN.with(|s| s.borrow_mut().push((what, v)));
         match (hostfd::ioc_type(request), hostfd::ioc_nr(request)) {
             (b'F', 0x2b) => {
                 match word(a, 12) {
                     0x41 => a[8..12].copy_from_slice(&CLIENT.to_le_bytes()),
-                    // SAFETY: the backend's copy of the parameters, which
-                    // it checked hold the field.
-                    NV_EVENT_BUFFER => note(NV_EVENT_BUFFER, unsafe {
-                        params(a).add(40).cast::<u64>().read_unaligned()
-                    }),
+                    // The backend's copy of the parameters, which it
+                    // checked hold the field.
+                    NV_EVENT_BUFFER => note(NV_EVENT_BUFFER, others.peek(params(a) + 40, 8)),
                     _ => {}
                 }
                 a[40..44].fill(0);
@@ -1509,10 +1535,7 @@ mod backend_tests {
                     SEMSURF_UNREGISTER_WAITER => 16,
                     _ => 0,
                 };
-                // SAFETY: as above.
-                note(cmd, unsafe {
-                    params(a).add(off).cast::<u64>().read_unaligned()
-                });
+                note(cmd, others.peek(params(a) + off, 8));
                 a[28..32].fill(0);
             }
             (b'F', 0xce) => {

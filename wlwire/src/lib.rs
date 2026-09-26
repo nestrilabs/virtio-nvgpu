@@ -6,6 +6,11 @@
 //! See `frame.rs` for the byte-level channel format, `policy_table.rs` for
 //! what is allowed and why, and `engine.rs` for what happens to a message.
 
+// Every `unsafe` of the crate is in `sys` (sys.rs); every other module
+// forbids it, and scripts/check-unsafe.sh holds the tree to that.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod blob;
 pub mod closure;
 pub mod engine;
@@ -17,6 +22,7 @@ pub mod policy_table;
 pub mod proto;
 pub mod shm;
 pub mod stream;
+#[allow(unsafe_code)]
 pub mod sys;
 pub mod wire;
 

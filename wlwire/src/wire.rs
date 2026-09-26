@@ -7,6 +7,8 @@
 //! `fd` arguments -- which is why nothing here can skip a message it does not
 //! understand.
 
+#![forbid(unsafe_code)]
+
 use crate::proto::{Arg, ArgKind, Message};
 
 /// libwayland refuses anything larger, on both ends (`WL_MAX_MESSAGE_SIZE`).

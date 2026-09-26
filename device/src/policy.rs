@@ -18,6 +18,8 @@
 //! nothing until a section is filled in. A section extends its own methods and
 //! nothing else.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use crate::hostfd::HandleKind;
@@ -130,8 +132,8 @@ impl BackendHooks {
         if cmd == semsurf::SEMSURF_FENCE_CTX_CREATE {
             return self.semsurf.ctx_create_before(p);
         }
-        let arg = p.buffer_mut(0).ok_or(libc::EINVAL)?;
-        crate::fence::before(cmd, arg)
+        let mut arg = p.buffer_mut(0).ok_or(libc::EINVAL)?;
+        crate::fence::before(cmd, &mut arg)
     }
 
     /// A fence context made is counted against its file's cap until closed.

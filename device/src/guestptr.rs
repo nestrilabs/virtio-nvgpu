@@ -69,31 +69,100 @@
 //!   to or from a CPU buffer, pins one, or populates pages of the backend's
 //!   own address space are refused.
 
+#![forbid(unsafe_code)]
+
+use std::os::fd::BorrowedFd;
+
 use abi::ioctl::*;
 
 use crate::hostfd;
+use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 
 /// A refusal: the errno the guest's ioctl returns.
 pub type Errno = i32;
 
-/// Fields of a top-level block the backend changed and the caller must read
-/// back as it wrote them: `(offset, caller's bytes)`.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Restore(Vec<(usize, [u8; 8])>);
+/// What the host is to find in one field of a top-level block the guest
+/// sent, other than the guest's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TopSlot {
+    /// A pointer the host would follow: 0 for the host, and the caller's
+    /// value back in the reply.
+    Zeroed,
+    /// An address the host only writes: 0 for the host, and what the host
+    /// wrote back in the reply.
+    Out,
+    /// A value of the backend's (`width` bytes); the caller's own back in
+    /// the reply.
+    Forced { value: u64, width: usize },
+    /// The descriptor behind handle `handle` of the backend's table
+    /// (`width` bytes); the caller's value (the handle) back in the reply.
+    Handle { handle: u32, width: usize },
+}
 
-impl Restore {
-    /// Put the caller's values back into `reply`, the block as the host left
-    /// it.
-    pub(crate) fn apply(&self, reply: &mut [u8]) {
-        for (off, v) in &self.0 {
-            if let Some(s) = reply.get_mut(*off..off + 8) {
-                s.copy_from_slice(v);
-            }
-        }
+/// How the host's copy of a top-level block differs from the guest's: every
+/// field named here is declared in the arena before the call (sys/block.rs),
+/// so none of them holds a byte the guest wrote. Everything else is the
+/// guest's data.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plan<'g> {
+    pub slots: Vec<(usize, TopSlot)>,
+    /// IDLE_CHANNELS' channel list, sent as deep segments (deepseg.rs).
+    pub idle: Option<&'g [u8]>,
+}
+
+impl Plan<'_> {
+    fn zeroed(&mut self, off: usize) {
+        self.slots.push((off, TopSlot::Zeroed));
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    fn out(&mut self, off: usize) {
+        self.slots.push((off, TopSlot::Out));
+    }
+
+    /// Declare the plan's fields in block `top` of `a`; `fd_of` names the
+    /// descriptor behind a handle (None: not one the field may name).
+    pub(crate) fn declare<'f>(
+        &self,
+        a: &mut Arena,
+        top: BufId,
+        fd_of: &dyn Fn(u32) -> Option<BorrowedFd<'f>>,
+    ) -> Result<(), Errno> {
+        for &(off, s) in &self.slots {
+            match s {
+                TopSlot::Zeroed => {
+                    a.slot(top, off, 8, SlotKind::Ptr, Restore::IfSet)?;
+                }
+                TopSlot::Out => {
+                    a.ptr_out(top, off)?;
+                }
+                TopSlot::Forced { value, width } => {
+                    a.value(top, off, width, Restore::Yes)?;
+                    a.set_value(top, off, value)?;
+                }
+                TopSlot::Handle { handle, width } => {
+                    a.fd(top, off, width)?;
+                    a.set_fd(top, off, fd_of(handle).ok_or(libc::EBADF)?)?;
+                }
+            }
+        }
+        if let Some(deep) = self.idle {
+            use abi::rmctrl::IDLE_CHANNELS;
+            let segs = crate::deepseg::Segments::relocate(
+                "RM_IDLE_CHANNELS",
+                IDLE_CHANNELS.ptrs,
+                a,
+                top,
+                deep,
+            )?;
+            // An array not sent is not handed to RM as the guest's address;
+            // RM then fails the copy from null, as it would a bad pointer.
+            for p in IDLE_CHANNELS.ptrs {
+                if !segs.offsets().contains(&p.ptr) {
+                    a.slot(top, p.ptr, 8, SlotKind::Ptr, Restore::IfSet)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -103,18 +172,6 @@ fn rd32(b: &[u8], off: usize) -> Option<u32> {
 
 fn rd64(b: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
-}
-
-/// Zero the u64 at `off`, returning the caller's bytes if there was anything
-/// but zero there.
-fn take(b: &mut [u8], off: usize) -> Option<[u8; 8]> {
-    let s = b.get_mut(off..off + 8)?;
-    let old: [u8; 8] = s.try_into().ok()?;
-    if old == [0; 8] {
-        return None;
-    }
-    s.fill(0);
-    Some(old)
 }
 
 // ───────────────────────────── RM escapes ─────────────────────────────
@@ -199,16 +256,17 @@ pub const REFUSED_ALLOC_CLASSES: [u32; 12] = [
 /// ALLOC_MEMORY classes whose `pMemory` RM reads rather than writes.
 const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 4] = [0x71, 0x81, 0x82, 0x83];
 
-/// Check a v1 RM escape's top-level block, `params` (the backend's own copy,
-/// the bytes the host will read), and rewrite what must not reach the host.
-/// `cmd` is the full ioctl number the host will be called with. `Err` is
-/// the errno to answer with, and nothing reaches the host.
+/// Check a v1 RM escape's top-level block, `params` (the guest's, as sent),
+/// and say which of its fields the host must not be handed as sent: the
+/// plan the host's copy is built by (`Plan::declare`). `cmd` is the full
+/// ioctl number the host will be called with. `Err` is the errno to answer
+/// with, and nothing reaches the host.
 ///
-/// RM_ALLOC's and RM_CONTROL's own parameter pointer is not handled here:
-/// `dispatch_nested` points it at the nested block or zeroes it.
+/// RM_ALLOC's and RM_CONTROL's own parameter pointer is not named here:
+/// `dispatch_nested` points it at the nested block or leaves it null.
 /// UNMAP_MEMORY's and UPDATE_DEVICE_MAPPING_INFO's addresses are keys, not
 /// pointers, and their dispatchers put the backend's own in.
-pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
+pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno> {
     let escape = hostfd::ioc_nr(cmd);
     // The host reads the block by _IOC_SIZE (nv.c:2496); the offsets below
     // are for the one size each escape has.
@@ -225,7 +283,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
             Err(libc::EINVAL)
         }
     };
-    let mut restore = Restore::default();
+    let mut plan = Plan::default();
     match escape {
         // NVOS30: hClient, hDevice, hChannel, numChannels, then phClients,
         // phDevices, phChannels at 16/24/32, flags at 40. RM reads the three
@@ -246,9 +304,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
                 return Err(libc::EPERM);
             }
             for off in [16, 24, 32] {
-                if let Some(v) = take(params, off) {
-                    restore.0.push((off, v));
-                }
+                plan.zeroed(off);
             }
         }
         NV_ESC_IOCTL_XFER_CMD
@@ -286,9 +342,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
                 log::warn!("RM_ALLOC of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
             }
-            if let Some(v) = take(params, OS64_RIGHTS) {
-                restore.0.push((OS64_RIGHTS, v));
-            }
+            plan.zeroed(OS64_RIGHTS);
         }
         NV_ESC_RM_CONTROL => {
             sized(OS54_SIZE)?;
@@ -309,7 +363,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
             }
             // OUT for every other class: RM writes it and reads nothing
             // (rmapi_deprecated_allocmemory.c:162, 174).
-            take(params, OS02_MEMORY);
+            plan.out(OS02_MEMORY);
         }
         NV_ESC_RM_VID_HEAP_CONTROL => {
             sized(OS32_SIZE)?;
@@ -319,17 +373,14 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
                     return Err(libc::EPERM);
                 }
                 NVOS32_FUNCTION_ALLOC_SIZE | NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT => {
-                    take(params, OS32_ALLOC_ADDRESS);
+                    plan.out(OS32_ALLOC_ADDRESS);
                 }
                 NVOS32_FUNCTION_ALLOC_SIZE_RANGE => {
-                    take(params, OS32_RANGE_ADDRESS);
+                    plan.out(OS32_RANGE_ADDRESS);
                 }
                 NVOS32_FUNCTION_HW_ALLOC => {
-                    for off in [OS32_HW_BIND, OS32_HW_HANDLE] {
-                        if let Some(v) = take(params, off) {
-                            restore.0.push((off, v));
-                        }
-                    }
+                    plan.zeroed(OS32_HW_BIND);
+                    plan.zeroed(OS32_HW_HANDLE);
                 }
                 _ => {}
             }
@@ -337,25 +388,25 @@ pub(crate) fn rm_escape(cmd: u32, params: &mut [u8]) -> Result<Restore, Errno> {
         NV_ESC_RM_MAP_MEMORY => {
             sized(OS33_FD_SIZE)?;
             // OUT: RM writes the mapping's address (Nv04MapMemory).
-            take(params, OS33_LINEAR);
+            plan.out(OS33_LINEAR);
         }
         _ => {}
     }
-    Ok(restore)
+    Ok(plan)
 }
 
 /// IDLE_CHANNELS' channel list, sent with its three arrays as deep segments
-/// (`deep`, deepseg.rs): each array gets a buffer of ours, sized from the
-/// count in `params` (the backend's copy of NVOS30) exactly as
-/// RmDeprecatedIdleChannels sizes its copies, and the caller's pointers go
-/// back in the reply. The one-channel form, and a list sent without its
-/// arrays, are `rm_escape`'s. The segments must be kept alive until the host
-/// call returns.
-pub(crate) fn idle_channels_list(
+/// (`deep`, deepseg.rs): checked here against the count in `params` (the
+/// guest's NVOS30, as sent); each array gets a block of the call's arena,
+/// sized from that count exactly as RmDeprecatedIdleChannels sizes its
+/// copies, when the plan is declared, and the caller's pointers go back in
+/// the reply. The one-channel form, and a list sent without its arrays, are
+/// `rm_escape`'s.
+pub(crate) fn idle_channels_list<'g>(
     cmd: u32,
-    params: &mut [u8],
-    deep: &[u8],
-) -> Result<(Restore, crate::deepseg::Segments), Errno> {
+    params: &[u8],
+    deep: &'g [u8],
+) -> Result<Plan<'g>, Errno> {
     use abi::rmctrl::{
         IDLE_CHANNELS, IDLE_CHANNELS_FLAGS, IDLE_CHANNELS_LIST, IDLE_CHANNELS_LIST_BITS,
         IDLE_CHANNELS_SIZE,
@@ -385,20 +436,10 @@ pub(crate) fn idle_channels_list(
         );
         return Err(libc::EINVAL);
     }
-    let segs =
-        crate::deepseg::Segments::relocate("RM_IDLE_CHANNELS", IDLE_CHANNELS.ptrs, params, deep)?;
-    let mut restore = Restore::default();
-    restore.0.extend(segs.saved());
-    // An array not sent is not handed to RM as the guest's address; RM
-    // then fails the copy from null, as it would a bad pointer.
-    for p in IDLE_CHANNELS.ptrs {
-        if !segs.offsets().contains(&p.ptr) {
-            if let Some(v) = take(params, p.ptr) {
-                restore.0.push((p.ptr, v));
-            }
-        }
-    }
-    Ok((restore, segs))
+    Ok(Plan {
+        slots: Vec::new(),
+        idle: Some(deep),
+    })
 }
 
 // ───────────────────────────── RM controls ─────────────────────────────
@@ -426,30 +467,31 @@ pub(crate) fn control_pointers(cmd: u32) -> &'static [usize] {
     abi::rmctrl::pointers(cmd).map_or(&[], |c| c.ptrs)
 }
 
-/// Zero every pointer RM would follow in control `cmd`'s parameters,
-/// `nested` (the backend's copy), except the one at `relocated`, which
-/// already holds the address of a buffer of the backend's. Returns the
-/// caller's values, offsets into `nested`, for the reply.
+/// Declare every pointer RM would follow in control `cmd`'s parameters --
+/// block `nested` of `a` -- except those at `relocated`, which already hold
+/// the address of a block of the call: each is 0 for the host, and the
+/// caller's value comes back in the reply.
 ///
 /// Zero is RM's "no buffer": with a nonzero count it answers
 /// NV_ERR_INVALID_ARGUMENT (param_copy.c:43-53), the status a native caller
 /// with a bad pointer would get. An offset past the block's end is one this
 /// release's layout does not have.
-pub(crate) fn scrub_control(cmd: u32, nested: &mut [u8], relocated: &[usize]) -> Restore {
-    let mut restore = Restore::default();
+pub(crate) fn scrub_control(cmd: u32, a: &mut Arena, nested: BufId, relocated: &[usize]) {
+    let len = a.len(nested);
     for &off in control_pointers(cmd) {
-        if relocated.contains(&off) {
+        if relocated.contains(&off) || off + 8 > len {
             continue;
         }
-        if let Some(v) = take(nested, off) {
-            log::warn!(
+        match a.slot(nested, off, 8, SlotKind::Ptr, Restore::IfSet) {
+            Ok(v) if v != 0 => log::warn!(
                 "RM control {cmd:#010x}: pointer at {off} was not sent with the data it \
                  addresses; zeroed rather than handed to the host"
-            );
-            restore.0.push((off, v));
+            ),
+            // A field the call's own translation already declared (a
+            // descriptor, say) holds nothing of the guest's either.
+            _ => {}
         }
     }
-    restore
 }
 
 // ───────────────────────────── UVM ─────────────────────────────
@@ -544,9 +586,9 @@ const UVM_ALLOWED: &[u32] = &[
 pub(crate) fn uvm_gate(
     tools: bool,
     cmd: u32,
-    params: &mut [u8],
+    params: &[u8],
     init_flags_mask: u64,
-) -> Result<Restore, Errno> {
+) -> Result<Plan<'static>, Errno> {
     if tools {
         log::warn!("UVM tools ioctl {cmd:#x} refused: the tools device pins user buffers");
         return Err(libc::EPERM);
@@ -555,7 +597,7 @@ pub(crate) fn uvm_gate(
         log::warn!("UVM ioctl {cmd:#x} refused (guestptr.rs)");
         return Err(libc::EPERM);
     }
-    let mut restore = Restore::default();
+    let mut plan = Plan::default();
     if cmd == UVM_INITIALIZE {
         // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
         let Some(flags) = rd64(params, 0) else {
@@ -579,12 +621,15 @@ pub(crate) fn uvm_gate(
         // is what the backend has just decided. The caller reads its own
         // flags back either way.
         let forced = (flags | off) & init_flags_mask;
-        if forced != flags {
-            restore.0.push((0, flags.to_le_bytes()));
-            params[..8].copy_from_slice(&forced.to_le_bytes());
-        }
+        plan.slots.push((
+            0,
+            TopSlot::Forced {
+                value: forced,
+                width: 8,
+            },
+        ));
     }
-    Ok(restore)
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -606,6 +651,23 @@ mod tests {
     const VID_HEAP: u32 = ioc(IOC_RW, b'F', NV_ESC_RM_VID_HEAP_CONTROL, 184);
     const MAP_MEMORY: u32 = ioc(IOC_RW, b'F', NV_ESC_RM_MAP_MEMORY, 56);
 
+    /// What the host is handed, and what the caller reads back, of block
+    /// `p` built under `plan` (the host writing nothing).
+    fn built(plan: &Plan<'_>, p: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut a = Arena::new();
+        let top = a.block(p, p.len()).unwrap();
+        plan.declare(&mut a, top, &|_| None).unwrap();
+        (a.bytes(top).to_vec(), a.reply(top))
+    }
+
+    /// The same for a control's parameters `n`, scrubbed.
+    fn scrubbed(cmd: u32, n: &[u8], relocated: &[usize]) -> (Vec<u8>, Vec<u8>) {
+        let mut a = Arena::new();
+        let b = a.block(n, n.len()).unwrap();
+        scrub_control(cmd, &mut a, b, relocated);
+        (a.bytes(b).to_vec(), a.reply(b))
+    }
+
     #[test]
     fn escapes_with_pointers_the_backend_cannot_relocate_are_refused() {
         for (nr, size) in [
@@ -615,9 +677,9 @@ mod tests {
             (NV_ESC_RM_GET_EVENT_DATA, 16),
             (NV_ESC_RM_ADD_VBLANK_CALLBACK, 32),
         ] {
-            let mut p = vec![0x11u8; size];
+            let p = vec![0x11u8; size];
             assert_eq!(
-                rm_escape(ioc(IOC_RW, b'F', nr, size), &mut p),
+                rm_escape(ioc(IOC_RW, b'F', nr, size), &p),
                 Err(libc::EPERM),
                 "escape {nr:#x}"
             );
@@ -629,10 +691,8 @@ mod tests {
         let mut p = vec![0u8; 48];
         put32(&mut p, OS64_CLASS, 0x41);
         put64(&mut p, OS64_RIGHTS, 0x7fff_dead_b000);
-        let r = rm_escape(ALLOC, &mut p).unwrap();
-        assert_eq!(rd64(&p, OS64_RIGHTS), Some(0));
-        let mut reply = p.clone();
-        r.apply(&mut reply);
+        let (host, reply) = built(&rm_escape(ALLOC, &p).unwrap(), &p);
+        assert_eq!(rd64(&host, OS64_RIGHTS), Some(0));
         assert_eq!(rd64(&reply, OS64_RIGHTS), Some(0x7fff_dead_b000));
     }
 
@@ -642,14 +702,14 @@ mod tests {
             let mut p = vec![0u8; 48];
             put32(&mut p, OS64_CLASS, class);
             assert_eq!(
-                rm_escape(ALLOC, &mut p),
+                rm_escape(ALLOC, &p),
                 Err(libc::EPERM),
                 "class {class:#x}"
             );
         }
         let mut p = vec![0u8; 48];
         put32(&mut p, OS64_CLASS, 0x3e);
-        assert!(rm_escape(ALLOC, &mut p).is_ok(), "plain system memory");
+        assert!(rm_escape(ALLOC, &p).is_ok(), "plain system memory");
     }
 
     /// IMEX and fabric memory name an OS event by descriptor (pOsEvent), and
@@ -660,20 +720,20 @@ mod tests {
         for class in [0xf1, 0xf9, 0xfd] {
             let mut p = vec![0u8; 48];
             put32(&mut p, OS64_CLASS, class);
-            assert_eq!(rm_escape(ALLOC, &mut p), Err(libc::EPERM), "class {class:#x}");
+            assert_eq!(rm_escape(ALLOC, &p), Err(libc::EPERM), "class {class:#x}");
         }
     }
 
     #[test]
     fn an_rm_alloc_of_another_size_is_not_guessed_at() {
-        let mut p = vec![0u8; 32];
+        let p = vec![0u8; 32];
         assert_eq!(
-            rm_escape(ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC, 32), &mut p),
+            rm_escape(ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC, 32), &p),
             Err(libc::EINVAL)
         );
-        let mut p = vec![0u8; 48];
+        let p = vec![0u8; 48];
         assert_eq!(
-            rm_escape(ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC, 32), &mut p),
+            rm_escape(ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC, 32), &p),
             Err(libc::EINVAL),
             "the host reads by the command's size"
         );
@@ -684,17 +744,17 @@ mod tests {
         let mut p = vec![0u8; 56];
         put32(&mut p, OS02_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
         put64(&mut p, OS02_MEMORY, 0x7f00_0000_0000);
-        assert_eq!(rm_escape(ALLOC_MEMORY, &mut p), Err(libc::EPERM));
+        assert_eq!(rm_escape(ALLOC_MEMORY, &p), Err(libc::EPERM));
 
         let mut p = vec![0u8; 184];
         put32(&mut p, OS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
-        assert_eq!(rm_escape(VID_HEAP, &mut p), Err(libc::EPERM));
+        assert_eq!(rm_escape(VID_HEAP, &p), Err(libc::EPERM));
 
         for class in 0x81..=0x83 {
             let mut p = vec![0u8; 56];
             put32(&mut p, OS02_CLASS, class);
             assert_eq!(
-                rm_escape(ALLOC_MEMORY, &mut p),
+                rm_escape(ALLOC_MEMORY, &p),
                 Err(libc::EPERM),
                 "{class:#x}"
             );
@@ -706,13 +766,14 @@ mod tests {
         let mut p = vec![0u8; 56];
         put32(&mut p, OS02_CLASS, 0x3e);
         put64(&mut p, OS02_MEMORY, 0x1234_5000);
-        assert!(rm_escape(ALLOC_MEMORY, &mut p).unwrap().is_empty());
-        assert_eq!(rd64(&p, OS02_MEMORY), Some(0));
+        let plan = rm_escape(ALLOC_MEMORY, &p).unwrap();
+        assert_eq!(plan.slots, [(OS02_MEMORY, TopSlot::Out)], "the host's answer goes back");
+        assert_eq!(rd64(&built(&plan, &p).0, OS02_MEMORY), Some(0));
 
         let mut p = vec![0u8; 56];
         put64(&mut p, OS33_LINEAR, 0x1234_5000);
-        rm_escape(MAP_MEMORY, &mut p).unwrap();
-        assert_eq!(rd64(&p, OS33_LINEAR), Some(0));
+        let plan = rm_escape(MAP_MEMORY, &p).unwrap();
+        assert_eq!(rd64(&built(&plan, &p).0, OS33_LINEAR), Some(0));
 
         for (f, off) in [
             (NVOS32_FUNCTION_ALLOC_SIZE, OS32_ALLOC_ADDRESS),
@@ -722,8 +783,8 @@ mod tests {
             let mut p = vec![0u8; 184];
             put32(&mut p, OS32_FUNCTION, f);
             put64(&mut p, off, 0x1234_5000);
-            rm_escape(VID_HEAP, &mut p).unwrap();
-            assert_eq!(rd64(&p, off), Some(0), "function {f}");
+            let plan = rm_escape(VID_HEAP, &p).unwrap();
+            assert_eq!(rd64(&built(&plan, &p).0, off), Some(0), "function {f}");
         }
     }
 
@@ -733,14 +794,13 @@ mod tests {
         put32(&mut p, OS32_FUNCTION, NVOS32_FUNCTION_HW_ALLOC);
         put64(&mut p, OS32_HW_BIND, 0xaaaa);
         put64(&mut p, OS32_HW_HANDLE, 0xbbbb);
-        let r = rm_escape(VID_HEAP, &mut p).unwrap();
+        let (host, reply) = built(&rm_escape(VID_HEAP, &p).unwrap(), &p);
         assert_eq!(
-            (rd64(&p, OS32_HW_BIND), rd64(&p, OS32_HW_HANDLE)),
+            (rd64(&host, OS32_HW_BIND), rd64(&host, OS32_HW_HANDLE)),
             (Some(0), Some(0))
         );
-        r.apply(&mut p);
         assert_eq!(
-            (rd64(&p, OS32_HW_BIND), rd64(&p, OS32_HW_HANDLE)),
+            (rd64(&reply, OS32_HW_BIND), rd64(&reply, OS32_HW_HANDLE)),
             (Some(0xaaaa), Some(0xbbbb))
         );
     }
@@ -749,9 +809,9 @@ mod tests {
     fn a_heap_function_without_pointers_is_left_alone() {
         let mut p = vec![0x5au8; 184];
         put32(&mut p, OS32_FUNCTION, 3); // FREE
-        let before = p.clone();
-        rm_escape(VID_HEAP, &mut p).unwrap();
-        assert_eq!(p, before);
+        let plan = rm_escape(VID_HEAP, &p).unwrap();
+        assert!(plan.slots.is_empty());
+        assert_eq!(built(&plan, &p).0, p);
     }
 
     #[test]
@@ -759,7 +819,7 @@ mod tests {
         for &(ctl, _) in REFUSED_CONTROLS {
             let mut p = vec![0u8; 32];
             put32(&mut p, OS54_CMD, ctl);
-            assert_eq!(rm_escape(CONTROL, &mut p), Err(libc::EPERM), "{ctl:#x}");
+            assert_eq!(rm_escape(CONTROL, &p), Err(libc::EPERM), "{ctl:#x}");
         }
     }
 
@@ -770,21 +830,18 @@ mod tests {
         put64(&mut n, 8, 0x1000);
         put64(&mut n, 16, 0x2000);
         put64(&mut n, 24, 0x3000);
-        let r = scrub_control(0x101, &mut n, &[16]);
+        let (host, reply) = scrubbed(0x101, &n, &[16]);
         assert_eq!(
-            (rd64(&n, 8), rd64(&n, 16), rd64(&n, 24)),
+            (rd64(&host, 8), rd64(&host, 16), rd64(&host, 24)),
             (Some(0), Some(0x2000), Some(0))
         );
-        r.apply(&mut n);
-        assert_eq!((rd64(&n, 8), rd64(&n, 24)), (Some(0x1000), Some(0x3000)));
+        assert_eq!((rd64(&reply, 8), rd64(&reply, 24)), (Some(0x1000), Some(0x3000)));
     }
 
     #[test]
     fn a_control_rm_follows_no_pointer_in_is_left_alone() {
-        let mut n = vec![0x77u8; 64];
-        let before = n.clone();
-        assert!(scrub_control(0x20800a01, &mut n, &[]).is_empty());
-        assert_eq!(n, before);
+        let n = vec![0x77u8; 64];
+        assert_eq!(scrubbed(0x20800a01, &n, &[]), (n.clone(), n));
     }
 
     #[test]
@@ -792,8 +849,7 @@ mod tests {
         // 535's GET_P2P_CAPS ends at busPeerIds.
         let mut n = vec![0u8; 168];
         put64(&mut n, 160, 0x4000);
-        scrub_control(0x127, &mut n, &[]);
-        assert_eq!(rd64(&n, 160), Some(0));
+        assert_eq!(rd64(&scrubbed(0x127, &n, &[]).0, 160), Some(0));
     }
 
     #[test]
@@ -812,11 +868,10 @@ mod tests {
     fn uvm_is_initialised_without_pageable_access_whatever_the_guest_asks() {
         let mut p = vec![0u8; 16];
         put64(&mut p, 0, 0x2); // MULTI_PROCESS_SHARING_MODE
-        let r = uvm_gate(false, UVM_INITIALIZE, &mut p, 0x7).unwrap();
-        assert_eq!(rd64(&p, 0), Some(0x7));
-        r.apply(&mut p);
+        let (host, reply) = built(&uvm_gate(false, UVM_INITIALIZE, &p, 0x7).unwrap(), &p);
+        assert_eq!(rd64(&host, 0), Some(0x7));
         assert_eq!(
-            rd64(&p, 0),
+            rd64(&reply, 0),
             Some(0x2),
             "the caller reads back its own flags"
         );
@@ -828,19 +883,18 @@ mod tests {
     fn uvm_is_only_given_the_flags_its_release_takes() {
         let mut p = vec![0u8; 16];
         put64(&mut p, 0, 0x2);
-        uvm_gate(false, UVM_INITIALIZE, &mut p, 0x3).unwrap();
-        assert_eq!(rd64(&p, 0), Some(0x3));
+        let (host, _) = built(&uvm_gate(false, UVM_INITIALIZE, &p, 0x3).unwrap(), &p);
+        assert_eq!(rd64(&host, 0), Some(0x3));
         // A guest asking for DISABLE_PAGEABLE_ACCESS by name is not handed
         // to a UVM that would refuse the call for it.
         let mut p = vec![0u8; 16];
         put64(&mut p, 0, 0x6);
-        let r = uvm_gate(false, UVM_INITIALIZE, &mut p, 0x3).unwrap();
-        assert_eq!(rd64(&p, 0), Some(0x3));
-        r.apply(&mut p);
-        assert_eq!(rd64(&p, 0), Some(0x6));
+        let (host, reply) = built(&uvm_gate(false, UVM_INITIALIZE, &p, 0x3).unwrap(), &p);
+        assert_eq!(rd64(&host, 0), Some(0x3));
+        assert_eq!(rd64(&reply, 0), Some(0x6));
         // One that cannot even leave HMM off is not initialised at all.
-        let mut p = vec![0u8; 16];
-        assert_eq!(uvm_gate(false, UVM_INITIALIZE, &mut p, 0x2), Err(libc::EPERM));
+        let p = vec![0u8; 16];
+        assert_eq!(uvm_gate(false, UVM_INITIALIZE, &p, 0x2), Err(libc::EPERM));
     }
 
     /// Multi-process sharing mode is forced wherever the release takes it,
@@ -848,17 +902,16 @@ mod tests {
     #[test]
     fn uvm_is_initialised_in_sharing_mode_where_the_release_has_it() {
         for (mask, want) in [(0x3, 0x3), (0x7, 0x7)] {
-            let mut p = vec![0u8; 16];
-            let r = uvm_gate(false, UVM_INITIALIZE, &mut p, mask).unwrap();
-            assert_eq!(rd64(&p, 0), Some(want), "mask {mask:#x}");
+            let p = vec![0u8; 16];
+            let (host, reply) = built(&uvm_gate(false, UVM_INITIALIZE, &p, mask).unwrap(), &p);
+            assert_eq!(rd64(&host, 0), Some(want), "mask {mask:#x}");
             assert_ne!(want & UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE, 0);
-            r.apply(&mut p);
-            assert_eq!(rd64(&p, 0), Some(0), "the caller reads back its own flags");
+            assert_eq!(rd64(&reply, 0), Some(0), "the caller reads back its own flags");
         }
         // A release without it (none measured) is not handed the bit.
-        let mut p = vec![0u8; 16];
-        uvm_gate(false, UVM_INITIALIZE, &mut p, 0x1).unwrap();
-        assert_eq!(rd64(&p, 0), Some(0x1));
+        let p = vec![0u8; 16];
+        let (host, _) = built(&uvm_gate(false, UVM_INITIALIZE, &p, 0x1).unwrap(), &p);
+        assert_eq!(rd64(&host, 0), Some(0x1));
     }
 
     /// Every measured release takes sharing mode: the UVM aperture depends
@@ -878,12 +931,12 @@ mod tests {
     #[test]
     fn uvm_commands_that_touch_cpu_memory_are_refused() {
         for cmd in [56, 62, 63, 64, 71, 76, 77, 81, 13, 16, 21, 35, 200, 0x7ff] {
-            let mut p = vec![0u8; 64];
-            assert_eq!(uvm_gate(false, cmd, &mut p, 0x7), Err(libc::EPERM), "{cmd}");
+            let p = vec![0u8; 64];
+            assert_eq!(uvm_gate(false, cmd, &p, 0x7), Err(libc::EPERM), "{cmd}");
         }
         for cmd in [33, 37, 51, 73, 75] {
-            let mut p = vec![0u8; 64];
-            assert!(uvm_gate(false, cmd, &mut p, 0x7).is_ok(), "{cmd}");
+            let p = vec![0u8; 64];
+            assert!(uvm_gate(false, cmd, &p, 0x7).is_ok(), "{cmd}");
         }
     }
 
@@ -910,8 +963,8 @@ mod tests {
 
     #[test]
     fn nothing_goes_to_the_uvm_tools_device() {
-        let mut p = vec![0u8; 64];
-        assert_eq!(uvm_gate(true, 67, &mut p, 0x7), Err(libc::EPERM));
+        let p = vec![0u8; 64];
+        assert_eq!(uvm_gate(true, 67, &p, 0x7), Err(libc::EPERM));
     }
 }
 
@@ -993,14 +1046,14 @@ mod backend_tests {
 
     /// Read 8 bytes behind a pointer the backend handed the host. A guest
     /// address fails the assertion before anything is read.
-    fn behind(p: u64) -> u64 {
+    fn behind(o: &crate::sys::block::Others<'_>, p: u64) -> u64 {
         assert!(
             p != GUEST_PTR && p != GUEST_PTR2,
             "a guest address reached the host"
         );
-        // SAFETY: a nonzero pointer the backend put in the block, which is
-        // its own live buffer for the length of the call.
-        unsafe { (p as *const u64).read_unaligned() }
+        // A nonzero pointer the backend put in the block: a block of the
+        // call's own (peek fails on anything else).
+        o.peek(p, 8)
     }
 
     /// NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST.
@@ -1008,25 +1061,30 @@ mod backend_tests {
 
     /// Read `count` u32s behind a pointer the backend handed the host, as RM
     /// copies them in.
-    fn read_u32s(p: u64, count: usize) -> Vec<u32> {
+    fn read_u32s(o: &crate::sys::block::Others<'_>, p: u64, count: usize) -> Vec<u32> {
         assert!(
             p != GUEST_PTR && p != GUEST_PTR2,
             "a guest address reached the host"
         );
-        // SAFETY: a nonzero pointer the backend put in the block, its own
-        // live buffer for the call, and `count` is the size RM copies,
-        // which the backend sized that buffer to.
-        (0..count)
-            .map(|i| unsafe { (p as *const u32).add(i).read_unaligned() })
-            .collect()
+        // A nonzero pointer the backend put in the block, and `count` is the
+        // size RM copies, which the backend sized that block to.
+        let b = o
+            .read(p, 4 * count)
+            .expect("a block of the call, as long as RM copies");
+        b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
     }
 
-    unsafe fn fake_host(_fd: std::os::fd::RawFd, request: u64, arg: *mut u8) -> i32 {
+    fn fake_host(
+        _fd: std::os::fd::RawFd,
+        request: u64,
+        arg: &mut crate::sys::block::Arg<'_>,
+    ) -> i32 {
         let request = request as u32;
-        let len = hostfd::ioc_size(request).max(16);
-        // SAFETY: the HostIoctl contract: `arg` holds at least _IOC_SIZE
-        // bytes; UVM's plain numbers carry the guest's 16.
-        let a = unsafe { std::slice::from_raw_parts_mut(arg, len) };
+        // At least _IOC_SIZE bytes; UVM's plain numbers carry the guest's
+        // block, 16 bytes or fewer.
+        let (a, mut others) = arg.split();
+        let len = hostfd::ioc_size(request).max(16).min(a.len());
+        let a = &mut a[..len];
         let s = match (hostfd::ioc_type(request), hostfd::ioc_nr(request)) {
             _ if request == UVM_INITIALIZE => Seen::UvmInit {
                 flags: word64(a, 0),
@@ -1041,20 +1099,20 @@ mod backend_tests {
                 // channel list back out (embedded_param_copy.c:292-306).
                 let params = word64(a, 16);
                 assert!(params != 0 && params != GUEST_PTR);
-                // SAFETY: the backend's nested block, 24 bytes.
-                let n = unsafe { std::slice::from_raw_parts_mut(params as *mut u8, 24) };
+                // The backend's nested block, 24 bytes.
+                let n = others.read(params, 24).expect("the nested block");
                 let count = u32::from_le_bytes(n[..4].try_into().unwrap()) as usize;
                 let arrays = [8, 16]
                     .map(|off| {
-                        let p = word64(n, off);
-                        (p, if p == 0 { vec![] } else { read_u32s(p, count) })
+                        let p = word64(&n, off);
+                        (p, if p == 0 { vec![] } else { read_u32s(&others, p, count) })
                     })
                     .to_vec();
-                let out = word64(n, 16);
+                let out = word64(&n, 16);
                 if out != 0 {
                     for i in 0..count {
-                        // SAFETY: as read_u32s: RM's own size, in our buffer.
-                        unsafe { (out as *mut u32).add(i).write_unaligned(0xc0de_0000 + i as u32) };
+                        // As read_u32s: RM's own size, in our block.
+                        others.poke(out + 4 * i as u64, 4, u64::from(0xc0de_0000 + i as u32));
                     }
                 }
                 a[28..32].fill(0);
@@ -1069,13 +1127,12 @@ mod backend_tests {
                 let mut inner = Vec::new();
                 if params != 0 {
                     assert!(params != GUEST_PTR, "the guest's params pointer reached RM");
-                    // SAFETY: the backend's nested block, `size` bytes.
-                    let n =
-                        unsafe { std::slice::from_raw_parts(params as *const u8, size as usize) };
+                    // The backend's nested block, `size` bytes.
+                    let n = others.read(params, size as usize).expect("the nested block");
                     for off in [8, 16, 24] {
                         if off + 8 <= n.len() {
-                            let p = word64(n, off);
-                            inner.push((p, (p != 0).then(|| behind(p))));
+                            let p = word64(&n, off);
+                            inner.push((p, (p != 0).then(|| behind(&others, p))));
                         }
                     }
                 }
@@ -1090,7 +1147,7 @@ mod backend_tests {
                 let params = word64(a, 16);
                 let s = Seen::Alloc {
                     params,
-                    first: (params != 0).then(|| behind(params)),
+                    first: (params != 0).then(|| behind(&others, params)),
                     rights: word64(a, 24),
                 };
                 a[40..44].fill(0);
@@ -1108,7 +1165,7 @@ mod backend_tests {
                         arrays: [16, 24, 32]
                             .map(|off| {
                                 let p = word64(a, off);
-                                (p, if p == 0 { vec![] } else { read_u32s(p, count) })
+                                (p, if p == 0 { vec![] } else { read_u32s(&others, p, count) })
                             })
                             .to_vec(),
                     }

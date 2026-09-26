@@ -97,10 +97,11 @@
 //! `vm.max_map_count` of those), and UVM mappings of registered memory and
 //! recorded external ranges per VM.
 
+#![forbid(unsafe_code)]
+
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use abi::ioctl::{NV_ESC_RM_ALLOC, NV_ESC_RM_ALLOC_MEMORY, NV_ESC_RM_VID_HEAP_CONTROL};
@@ -111,6 +112,7 @@ use protocol::messages::{
 };
 
 use crate::hostfd;
+use crate::sys::mem::{HostSpan, Reservation};
 
 /// A refusal: the errno the guest's ioctl returns.
 pub type Errno = i32;
@@ -137,9 +139,9 @@ pub struct RamRegion {
     /// Guest-physical start.
     pub gpa: u64,
     pub len: u64,
-    /// The backend's own mapping of the region (read-write, shared): valid
-    /// for as long as the [`GuestRam`] holding this lives.
-    pub host: u64,
+    /// The backend's own mapping of the region (read-write, shared), which
+    /// the span keeps mapped.
+    pub host: HostSpan,
     /// The region's backing file and where in it the region starts. None
     /// for anonymous memory, which only a registration inside one region
     /// can use.
@@ -170,7 +172,8 @@ impl GuestRam {
             let aligned = r.gpa % PAGE == 0
                 && r.len % PAGE == 0
                 && r.len > 0
-                && r.host % PAGE == 0
+                && r.host.addr() % PAGE == 0
+                && r.host.len() as u64 == r.len
                 && r.file.as_ref().is_none_or(|(_, o)| o % PAGE == 0)
                 && r.gpa.checked_add(r.len).is_some();
             if !aligned {
@@ -201,14 +204,13 @@ impl GuestRam {
     /// The table vhost-user handed the backend: every region of `mem`.
     #[cfg(feature = "vhost-user")]
     pub fn from_vm_memory(mem: Arc<vm_memory::GuestMemoryMmap>) -> Self {
-        use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
-        let regions = mem
-            .iter()
-            .map(|r| RamRegion {
-                gpa: r.start_addr().raw_value(),
-                len: r.len(),
-                host: r.as_ptr() as u64,
-                file: r.file_offset().map(|f| (f.arc().clone(), f.start())),
+        let regions = HostSpan::of_vm_memory(mem.clone())
+            .into_iter()
+            .map(|(gpa, host, file)| RamRegion {
+                gpa,
+                len: host.len() as u64,
+                host,
+                file,
             })
             .collect();
         Self::new(regions, mem)
@@ -505,7 +507,7 @@ pub(crate) fn parse_runs(call: &Call, deep: &[u8]) -> Result<Vec<(u64, u64)>, Er
 /// mapping and in the region's file.
 #[derive(Clone, Debug)]
 struct Piece {
-    host: u64,
+    host: HostSpan,
     file: Option<(Arc<File>, u64)>,
     len: u64,
 }
@@ -548,20 +550,22 @@ pub(crate) fn resolve(ram: &GuestRam, runs: &[(u64, u64)]) -> Result<Resolved, E
             };
             let off = at - r.gpa;
             let len = (end - at).min(r.len - off);
-            let host = r.host + off;
+            let Some(host) = r.host.sub(off, len) else {
+                return Err(libc::EFAULT);
+            };
             let file = r.file.as_ref().map(|(f, o)| (f.clone(), o + off));
-            match pieces.last_mut() {
-                Some(p)
-                    if p.host + p.len == host
-                        && match (&p.file, &file) {
-                            (Some((pf, po)), Some((f, o))) => {
-                                Arc::ptr_eq(pf, f) && po + p.len == *o
-                            }
-                            (None, None) => true,
-                            _ => false,
-                        } =>
-                {
-                    p.len += len
+            let joined = pieces.last().and_then(|p| {
+                let same_file = match (&p.file, &file) {
+                    (Some((pf, po)), Some((f, o))) => Arc::ptr_eq(pf, f) && po + p.len == *o,
+                    (None, None) => true,
+                    _ => false,
+                };
+                same_file.then(|| p.host.join(&host)).flatten()
+            });
+            match (joined, pieces.last_mut()) {
+                (Some(j), Some(p)) => {
+                    p.host = j;
+                    p.len += len;
                 }
                 _ => pieces.push(Piece { host, file, len }),
             }
@@ -582,8 +586,8 @@ pub(crate) enum Mapping {
         #[allow(dead_code)]
         keep: Arc<dyn Any + Send + Sync>,
     },
-    /// A range of its own, unmapped when this goes.
-    Reserved { base: usize, len: usize },
+    /// A range of its own, unmapped when the last holder of it goes.
+    Reserved(#[allow(dead_code)] Arc<Reservation>),
 }
 
 // The ranges this thread has reserved and not yet unmapped, for tests: the
@@ -602,27 +606,28 @@ pub(crate) fn reserved_live(addr: u64) -> bool {
     RESERVED.with(|r| r.borrow().iter().any(|&(b, l)| a >= b && a < b + l))
 }
 
+#[cfg(test)]
 impl Drop for Mapping {
     fn drop(&mut self) {
-        if let Mapping::Reserved { base, len } = *self {
-            #[cfg(test)]
-            RESERVED.with(|r| r.borrow_mut().remove(&(base, len)));
-            // SAFETY: a range this module reserved and mapped, and nothing
-            // else holds its address.
-            if unsafe { libc::munmap(base as *mut libc::c_void, len) } != 0 {
-                log::warn!(
-                    "OS descriptor: unmapping {base:#x}+{len:#x}: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+        if let Mapping::Reserved(r) = self {
+            RESERVED.with(|s| s.borrow_mut().remove(&(r.addr() as usize, r.len())));
         }
     }
 }
 
-/// What RM is handed: `addr`, in `mapping`.
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Reservation({:#x}+{:#x})", self.addr(), self.len())
+    }
+}
+
+/// What RM is handed: `at` bytes into `span` (the address `addr`), kept
+/// mapped by `mapping`.
 #[derive(Debug)]
 pub(crate) struct Pinned {
     pub addr: u64,
+    pub span: HostSpan,
+    pub at: u64,
     pub mapping: Mapping,
     pub bytes: u64,
     pub vmas: usize,
@@ -635,40 +640,28 @@ impl Resolved {
         let bytes = self.bytes();
         let vmas = self.vmas();
         if self.pieces.len() == 1 {
+            let span = self.pieces[0].host.clone();
             return Ok(Pinned {
-                addr: self.pieces[0].host + in_page,
+                addr: span.addr() + in_page,
+                span,
+                at: in_page,
                 mapping: Mapping::Direct { keep: self.keep },
                 bytes,
                 vmas,
             });
         }
         let len = usize::try_from(bytes).map_err(|_| libc::ENOMEM)?;
-        // SAFETY: a fresh anonymous reservation, placed by the kernel.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
+        let res = match Reservation::new(len) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                log::warn!("OS descriptor: reserving {len:#x} bytes: {e}");
+                return Err(libc::ENOMEM);
+            }
         };
-        if base == libc::MAP_FAILED {
-            log::warn!(
-                "OS descriptor: reserving {len:#x} bytes: {}",
-                std::io::Error::last_os_error()
-            );
-            return Err(libc::ENOMEM);
-        }
         // From here the reservation is unmapped on any return.
-        let mapping = Mapping::Reserved {
-            base: base as usize,
-            len,
-        };
         #[cfg(test)]
-        RESERVED.with(|r| r.borrow_mut().insert((base as usize, len)));
-        let prot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+        RESERVED.with(|r| r.borrow_mut().insert((res.addr() as usize, len)));
+        let mapping = Mapping::Reserved(res.clone());
         let mut at = 0usize;
         for p in &self.pieces {
             let Some((file, off)) = &p.file else {
@@ -678,33 +671,24 @@ impl Resolved {
                 );
                 return Err(libc::EINVAL);
             };
-            let (Ok(plen), Ok(off)) = (usize::try_from(p.len), libc::off_t::try_from(*off)) else {
+            let Ok(plen) = usize::try_from(p.len) else {
                 return Err(libc::ENOMEM);
             };
-            // SAFETY: MAP_FIXED over part of our own reservation, which
-            // nothing else uses; the file is guest RAM's backing memfd.
-            let got = unsafe {
-                libc::mmap(
-                    (base as usize + at) as *mut libc::c_void,
-                    plen,
-                    prot,
-                    libc::MAP_SHARED | libc::MAP_FIXED,
-                    file.as_raw_fd(),
-                    off,
-                )
-            };
-            if got == libc::MAP_FAILED {
+            // Over part of our own reservation; the file is guest RAM's
+            // backing memfd.
+            if let Err(e) = res.map_file(at, plen, file.as_ref(), *off, writable) {
                 log::warn!(
                     "OS descriptor: mapping {plen:#x} bytes of guest RAM at file offset \
-                     {off:#x}: {}",
-                    std::io::Error::last_os_error()
+                     {off:#x}: {e}"
                 );
                 return Err(libc::ENOMEM);
             }
             at += plen;
         }
         Ok(Pinned {
-            addr: base as u64 + in_page,
+            addr: res.addr() + in_page,
+            span: res.span(),
+            at: in_page,
             mapping,
             bytes,
             vmas,
@@ -1480,15 +1464,7 @@ pub(crate) mod test_ram {
     //! Guest RAM for tests: a memfd with a known pattern, mapped shared, cut
     //! into regions the way a VMM splits RAM around the PCI hole.
     use super::*;
-    use std::os::fd::FromRawFd;
-
-    pub struct Map(pub usize, pub usize);
-    impl Drop for Map {
-        fn drop(&mut self) {
-            // SAFETY: the mapping `memfd` made, dropped once.
-            unsafe { libc::munmap(self.0 as *mut libc::c_void, self.1) };
-        }
-    }
+    use crate::sys::mem::Mapping as Map;
 
     /// The byte at offset `i` of the memfd: page number and offset mixed, so
     /// no two pages read alike.
@@ -1498,32 +1474,13 @@ pub(crate) mod test_ram {
 
     /// A memfd of `pages` pages holding [`byte`], and the backend's mapping.
     pub fn memfd(pages: u64) -> (Arc<File>, Arc<Map>) {
-        // SAFETY: plain syscalls; the descriptor passes to the File.
-        let file = unsafe {
-            let fd = libc::memfd_create(c"osdesc-test".as_ptr(), libc::MFD_CLOEXEC);
-            assert!(fd >= 0);
-            File::from_raw_fd(fd)
-        };
+        let file = File::from(crate::sys::fd::memfd(c"osdesc-test", libc::MFD_CLOEXEC).unwrap());
         let len = (pages * PAGE) as usize;
         file.set_len(len as u64).unwrap();
-        // SAFETY: a fresh shared mapping of the whole file.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(p, libc::MAP_FAILED);
-        // SAFETY: the mapping just made, `len` bytes.
-        let s = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
-        for (i, b) in s.iter_mut().enumerate() {
-            *b = byte(i as u64);
-        }
-        (Arc::new(file), Arc::new(Map(p as usize, len)))
+        let map = Map::shared(&file, len, 0, true).unwrap();
+        let bytes: Vec<u8> = (0..len as u64).map(byte).collect();
+        map.write(0, &bytes);
+        (Arc::new(file), map)
     }
 
     /// Low RAM: 64 pages at 0, file offset 0. High RAM: 64 pages at 4 GiB,
@@ -1535,19 +1492,19 @@ pub(crate) mod test_ram {
 
     pub fn ram() -> GuestRam {
         let (file, map) = memfd(2 * REGION_PAGES);
-        let base = map.0 as u64;
+        let span = map.span();
         GuestRam::new(
             vec![
                 RamRegion {
                     gpa: LOW,
                     len: REGION_PAGES * PAGE,
-                    host: base,
+                    host: span.sub(0, REGION_PAGES * PAGE).unwrap(),
                     file: Some((file.clone(), 0)),
                 },
                 RamRegion {
                     gpa: HIGH,
                     len: REGION_PAGES * PAGE,
-                    host: base + REGION_PAGES * PAGE,
+                    host: span.sub(REGION_PAGES * PAGE, REGION_PAGES * PAGE).unwrap(),
                     file: Some((file, REGION_PAGES * PAGE)),
                 },
             ],
@@ -1584,19 +1541,7 @@ pub(crate) mod test_ram {
 
     /// Whether any page of `[addr, addr+len)` is mapped in this process.
     pub fn mapped(addr: u64, len: u64) -> bool {
-        let base = addr & !(PAGE - 1);
-        let n = ((addr + len - base).div_ceil(PAGE)) as usize;
-        let mut v = vec![0u8; n];
-        (0..n).any(|i| {
-            // SAFETY: mincore on one page, into one byte; ENOMEM if unmapped.
-            unsafe {
-                libc::mincore(
-                    (base + i as u64 * PAGE) as *mut libc::c_void,
-                    PAGE as usize,
-                    v.as_mut_ptr().add(i),
-                ) == 0
-            }
-        })
+        crate::sys::mem::any_mapped(addr, len)
     }
 }
 
@@ -1737,7 +1682,7 @@ mod tests {
         assert_eq!(r.vmas(), 0);
         let p = r.map(0x10, true).unwrap();
         assert!(matches!(p.mapping, Mapping::Direct { .. }));
-        assert_eq!(p.addr, ram.regions()[0].host + 5 * PAGE + 0x10);
+        assert_eq!(p.addr, ram.regions()[0].host.addr() + 5 * PAGE + 0x10);
 
         // Scattered, and across both regions: read through the range the
         // bytes of exactly those pages, in list order.
@@ -1745,13 +1690,12 @@ mod tests {
         let r = resolve(&ram, &runs).unwrap();
         assert_eq!(r.vmas(), 3);
         let p = r.map(0, false).unwrap();
-        let (base, len) = match p.mapping {
-            Mapping::Reserved { base, len } => (base as u64, len as u64),
+        let (base, len) = match &p.mapping {
+            Mapping::Reserved(r) => (r.addr(), r.len() as u64),
             _ => panic!("not reserved"),
         };
         assert_eq!((p.addr, len), (base, 4 * PAGE));
-        // SAFETY: the range just mapped, 4 pages.
-        let got = unsafe { std::slice::from_raw_parts(base as *const u8, len as usize) };
+        let got = p.span.read(0, len as usize);
         let mut want = expect(HIGH + 7 * PAGE, 2 * PAGE);
         want.extend(expect(LOW + 3 * PAGE, PAGE));
         want.extend(expect(HIGH, PAGE));
@@ -1766,19 +1710,19 @@ mod tests {
         // Two regions adjacent in guest-physical space whose file offsets
         // are not: one run over the seam is two pieces.
         let (file, map) = memfd(8);
-        let base = map.0 as u64;
+        let span = map.span();
         let ram = GuestRam::new(
             vec![
                 RamRegion {
                     gpa: 0,
                     len: 4 * PAGE,
-                    host: base + 4 * PAGE,
+                    host: span.sub(4 * PAGE, 4 * PAGE).unwrap(),
                     file: Some((file.clone(), 4 * PAGE)),
                 },
                 RamRegion {
                     gpa: 4 * PAGE,
                     len: 4 * PAGE,
-                    host: base,
+                    host: span.sub(0, 4 * PAGE).unwrap(),
                     file: Some((file, 0)),
                 },
             ],
@@ -1787,8 +1731,7 @@ mod tests {
         let r = resolve(&ram, &[(2 * PAGE, 4)]).unwrap();
         assert_eq!(r.vmas(), 2);
         let p = r.map(0, true).unwrap();
-        // SAFETY: the 4 pages just mapped.
-        let got = unsafe { std::slice::from_raw_parts(p.addr as *const u8, 4 * PAGE as usize) };
+        let got = p.span.read(p.at, 4 * PAGE as usize);
         let want: Vec<u8> = (6 * PAGE..8 * PAGE).chain(0..2 * PAGE).map(byte).collect();
         assert_eq!(got, &want[..]);
     }
@@ -2113,7 +2056,7 @@ mod backend_tests {
         IoctlResp, MsgHeader, MsgType, OP_OSDESC_REAP, PROTO_V2,
     };
     use std::cell::{Cell, RefCell};
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::FileExt;
     use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 
@@ -2194,20 +2137,24 @@ mod backend_tests {
     }
 
     /// Read what RM would pin: `size` bytes from `addr`, which must not be
-    /// the guest's.
-    fn pinned_bytes(addr: u64, size: u64) -> Vec<u8> {
+    /// the guest's, and must be memory the call handed the host.
+    fn pinned_bytes(others: &crate::sys::block::Others<'_>, addr: u64, size: u64) -> Vec<u8> {
         assert!(
             addr.abs_diff(GUEST_VA) > 1 << 30,
             "the guest's address reached RM: {addr:#x}"
         );
-        assert!(mapped(addr, size), "RM was handed an address nothing maps");
-        // SAFETY: the backend's own mapping of guest RAM, `size` bytes of it
-        // for the length of the call (checked mapped just above).
-        unsafe { std::slice::from_raw_parts(addr as *const u8, size as usize).to_vec() }
+        others
+            .read(addr, size as usize)
+            .expect("RM was handed an address the call did not map for it")
     }
 
-    unsafe fn fake_host(_fd: std::os::fd::RawFd, request: u64, arg: *mut u8) -> i32 {
+    fn fake_host(
+        _fd: std::os::fd::RawFd,
+        request: u64,
+        arg: &mut crate::sys::block::Arg<'_>,
+    ) -> i32 {
         let request = request as u32;
+        let (a, others) = arg.split();
         if hostfd::ioc_type(request) == 0 {
             // UVM: the number alone, no size; every block called here ends
             // with its status 8 bytes from the end.
@@ -2215,8 +2162,7 @@ mod backend_tests {
                 .and_then(|t| t.lookup(request))
                 .map(|c| c.size as usize)
                 .expect("a UVM command of the table");
-            // SAFETY: the HostIoctl contract.
-            let a = unsafe { std::slice::from_raw_parts_mut(arg, size) };
+            let a = &mut a[..size];
             let st = if request == UVM_MAP_EXTERNAL_ALLOCATION {
                 size - 4
             } else {
@@ -2232,13 +2178,12 @@ mod backend_tests {
             return 0;
         }
         let len = hostfd::ioc_size(request);
-        // SAFETY: the HostIoctl contract.
-        let a = unsafe { std::slice::from_raw_parts_mut(arg, len) };
+        let a = &mut a[..len];
         let status = STATUS.with(|s| s.get());
         let s = match hostfd::ioc_nr(request) {
             NV_ESC_RM_ALLOC_MEMORY => {
                 let addr = rd64(a, OS02_MEMORY);
-                let bytes = pinned_bytes(addr, rd64(a, 32) + 1);
+                let bytes = pinned_bytes(&others, addr, rd64(a, 32) + 1);
                 put32(a, OS02_STATUS, status);
                 Seen::Register {
                     nr: NV_ESC_RM_ALLOC_MEMORY,
@@ -2250,7 +2195,7 @@ mod backend_tests {
             }
             NV_ESC_RM_VID_HEAP_CONTROL => {
                 let addr = rd64(a, OS32_DESCRIPTOR);
-                let bytes = pinned_bytes(addr, rd64(a, 72) + 1);
+                let bytes = pinned_bytes(&others, addr, rd64(a, 72) + 1);
                 put32(a, OS32_STATUS, status);
                 if rd32(a, OS32_HMEMORY) == 0 {
                     put32(a, OS32_HMEMORY, 0xbeef_0001);
@@ -2280,10 +2225,10 @@ mod backend_tests {
             NV_ESC_RM_ALLOC => {
                 let params = rd64(a, OS64_PARAMS);
                 assert!(params != 0 && params.abs_diff(GUEST_VA) > 1 << 30);
-                // SAFETY: the backend's copy of the class parameters.
-                let n = unsafe { std::slice::from_raw_parts(params as *const u8, 40) };
-                let addr = rd64(n, OSD_DESCRIPTOR);
-                let bytes = pinned_bytes(addr, rd64(n, 24) + 1);
+                // The backend's copy of the class parameters.
+                let n = others.read(params, 40).expect("the class parameters");
+                let addr = rd64(&n, OSD_DESCRIPTOR);
+                let bytes = pinned_bytes(&others, addr, rd64(&n, 24) + 1);
                 put32(a, OS64_STATUS, status);
                 Seen::Register {
                     nr: NV_ESC_RM_ALLOC,
@@ -2309,12 +2254,7 @@ mod backend_tests {
     /// Guest memory as vhost-user gives it: low RAM at 0 and high RAM at
     /// 4 GiB, both from one memfd, 64 pages each, holding `byte`.
     fn guest_memory() -> GuestRam {
-        // SAFETY: plain syscalls; the descriptor passes to the File.
-        let file = unsafe {
-            let fd = libc::memfd_create(c"osdesc-guest".as_ptr(), libc::MFD_CLOEXEC);
-            assert!(fd >= 0);
-            File::from_raw_fd(fd)
-        };
+        let file = File::from(crate::sys::fd::memfd(c"osdesc-guest", libc::MFD_CLOEXEC).unwrap());
         let len = 2 * PAGES * PAGE;
         let bytes: Vec<u8> = (0..len).map(byte).collect();
         file.write_all_at(&bytes, 0).unwrap();
@@ -2385,13 +2325,7 @@ mod backend_tests {
             guest_caps: 0,
             uvm_aperture_mib: 0,
         };
-        // SAFETY: a wire struct as its bytes.
-        let hb = unsafe {
-            std::slice::from_raw_parts(
-                &hello as *const HelloReq as *const u8,
-                size_of::<HelloReq>(),
-            )
-        };
+        let hb = crate::sys::pod::bytes(&hello);
         let r = call(&mut be, MsgType::Hello, 0, hb);
         assert_eq!(status(&r), 0);
         assert_ne!(rd32(&r, 16 + 4) & BCAP_OS_DESC, 0, "offered with guest RAM");
@@ -2497,13 +2431,7 @@ mod backend_tests {
             ..HostOpReq::default()
         };
         req.args[0] = ack;
-        // SAFETY: a wire struct as its bytes.
-        let b = unsafe {
-            std::slice::from_raw_parts(
-                &req as *const HostOpReq as *const u8,
-                size_of::<HostOpReq>(),
-            )
-        };
+        let b = crate::sys::pod::bytes(&req);
         let r = call(be, MsgType::HostOp, 0, b);
         assert_eq!(status(&r), 0);
         let h = size_of::<MsgHeader>();
@@ -2522,7 +2450,7 @@ mod backend_tests {
     fn contiguous_pages_reach_rm_as_the_backends_mapping_of_exactly_them() {
         let mut vm = vm();
         let gpu = vm.gpu;
-        let host = vm.be.guest_ram.as_ref().unwrap().regions()[0].host;
+        let host = vm.be.guest_ram.as_ref().unwrap().regions()[0].host.addr();
         let size = 3 * PAGE;
         let (st, resp, params, deep) = ioctl(
             &mut vm.be,
@@ -2652,13 +2580,7 @@ mod backend_tests {
             guest_caps: 0,
             uvm_aperture_mib: 0,
         };
-        // SAFETY: a wire struct as its bytes.
-        let hb = unsafe {
-            std::slice::from_raw_parts(
-                &hello as *const HelloReq as *const u8,
-                size_of::<HelloReq>(),
-            )
-        };
+        let hb = crate::sys::pod::bytes(&hello);
         let r = call(&mut vm.be, MsgType::Hello, 0, hb);
         assert_eq!(status(&r), 0);
         assert_eq!(rd32(&r, 16 + 4) & BCAP_OS_DESC, 0, "guest RAM or not");

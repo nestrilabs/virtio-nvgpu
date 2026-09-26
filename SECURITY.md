@@ -5,8 +5,9 @@ work, and what is still open.
 
 This is the security review of branch `display-passthrough` at `ae182ab`
 against `dev` at `50ff74a` (called **dev** below), brought up to date by the
-audit of branch `harden` (§11) and the RM allowlist of branch `rmallow` (§12) and the fuzzing of branch
-`fuzz` (§13). It is written for the project's owner. The
+audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
+the fuzzing of branch `fuzz` (§13), and the memory-safety structure of
+branch `dind` (§14). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -1100,7 +1101,11 @@ In priority order. Cost is a judgement, not a measurement.
    - forcing non-privileged RM clients, as a second
      fence against a privileged backend;
    - translating EXPORT_TO_DMABUF_FD, once something needs it.
-9. **What the `harden` audit left open (§11).** (A uid per VM in the
+9. **Parse, don't patch: the rest (§14).** The data rewrites that are
+   still edits of the host's copy (the coherency attributes, NVKMS policy,
+   fence waits) made declared values; RM's top-level blocks as typed
+   structs per release.
+10. **What the `harden` audit left open (§11).** (A uid per VM in the
    launcher is done.) The UVM aperture carved out of the VMM's address space before
    guest RAM is mapped (F3); a caller's process on IOCTL2 (R4); fair queuing
    per guest file (B6); the remaining VM-wide pools split per process (B7);
@@ -1278,3 +1283,92 @@ runs over the unit tests it can model (`scripts/fuzz.sh miri`).
 | Z3 | low | `serve` could answer a malformed request with more bytes than the capacity posted; the vhost-user transport never posts that little | `0b320bb` |
 
 Nothing of it has run on the GPU; the fuzzers run with no device at all.
+
+---
+
+## 14. Memory safety: `unsafe` in one module, host blocks built
+
+Branch `dind`. A change of structure, not of behaviour: every test that
+passed passes (715, 4 skipped), the guest module is untouched, and the fuzz
+targets run against a stricter fake host.
+
+**Where `unsafe` is.** Before, 376 uses of the keyword in 37 files: 333 in
+`device` (the dispatcher, the window, OS descriptors, the sandbox, the pump,
+the fakes of most test modules), 31 in `wlwire`, 12 in the guest daemon.
+Now 173 in 10 files, 15 of them test- or fuzz-only:
+
+| module | what |
+|---|---|
+| `device/src/sys/block.rs` | the arena every host call's parameter blocks are built in (below) |
+| `device/src/sys/ioctl.rs` | the one `ioctl` with an argument, which takes only an argument an arena built; UDMABUF_CREATE; a no-argument `ioctl` |
+| `device/src/sys/guarded.rs` | the guarded buffers the host writes into |
+| `device/src/sys/mem.rs` | every mapping, each owned by a type that unmaps it once; every `MAP_FIXED` checked to land inside a range that type owns (the window, an OS-descriptor reservation); `HostSpan`, the only memory outside an arena a pointer field can name |
+| `device/src/sys/fd.rs`, `net.rs`, `proc.rs` | descriptors (returned as `OwnedFd`), netlink, identity, limits, Landlock, seccomp |
+| `device/src/sys/pod.rs` | wire structs as bytes, for the types that are all integers and no padding (checked field by field) |
+| `wlwire/src/sys.rs`, `nvgpu-wl-guest/src/sys.rs` | the Wayland proxy's and the guest daemon's system calls |
+
+Every crate root is `#![deny(unsafe_code)]` and `#![deny(unsafe_op_in_unsafe_fn)]`,
+with only `mod sys` allowed; every other file is `#![forbid(unsafe_code)]`.
+`scripts/check-unsafe.sh` fails a tree in which `unsafe`, a raw address
+(`as_ptr`, a `*const`/`*mut` cast or type, `transmute`, `from_raw_parts`), a
+descriptor claimed by number (`from_raw_fd`, `borrow_raw`) or an
+`allow(unsafe_code)` appears outside `sys`, a file has lost its attribute,
+or an `unsafe` inside `sys` has no `SAFETY:` comment.
+
+**Built, not patched.** Every `ioctl` the backend makes -- a guest's v1
+call, an IOCTL2, and its own (RM frees, UVM queries, PRIME, syncobjs,
+sync_files, leases, semaphore-surface probes) -- goes through an
+`Arena` (`sys/block.rs`). The guest's bytes are read once, from the request
+already copied out of the ring, and never edited; the host's copy is a block
+of the arena, the guest's bytes as data with every field the backend knows
+to be more than data *declared* first: a pointer, a descriptor the host
+resolves or creates, a value the backend decides. Declaring takes the
+guest's value out (for the reply) and leaves 0 (-1 for a descriptor out);
+after that the field holds only what the arena puts there:
+
+- a pointer: 0, another block of the same arena, or a `HostSpan` the arena
+  holds for the call (guest RAM as the transport mapped it, or an
+  OS-descriptor reservation). A block cannot point at itself, a data write
+  (`Arena::write`, and the `DataMut` view policy code rewrites through)
+  cannot touch a declared field, and no code outside `sys` takes a
+  pointer's address (the only addresses it sees are the numbers `sys`
+  reports for its own mappings, for comparisons and logs);
+- a descriptor: one of the handle table's, by `BorrowedFd`, never the
+  guest's number; a descriptor out is claimed only once, only after a call
+  that succeeded, and only from a field that held -1;
+- the reply is a copy, with the caller's value back in every declared field
+  that restores it and in every field the arena pointed: no address of the
+  backend's leaves.
+
+Declared on each path: RM escapes (`guestptr::rm_escape`, a plan instead of
+edits: pRightsRequested, HW_ALLOC's two pointers, IDLE_CHANNELS' arrays; the
+OUT addresses of ALLOC_MEMORY, MAP_MEMORY and VID_HEAP_CONTROL); RM_CONTROL's
+and RM_ALLOC's parameter pointer, the single deep pointer, each deep segment
+(`deepseg.rs`, sized from the host's copy) and every other pointer of a
+control (`scrub_control`); the descriptors of the six OS_UNIX controls,
+NV0005 events, OS events, REGISTER_FD, ALLOC_OS_EVENT, ALLOC_MEMORY,
+MAP_MEMORY, NVKMS's and nvidia-drm's memFd and UVM's descriptor fields;
+the address an OS descriptor pins (`osdesc.rs`); UVM_INITIALIZE's forced
+flags; UNMAP_MEMORY's and UPDATE_DEVICE_MAPPING_INFO's keys; and in IOCTL2
+every schema pointer, descriptor and GEM field, declared as the walk meets
+it (before, the guest's pointer bytes sat in the host's copy until
+`aim_pointers` overwrote them).
+
+What went with it: a lifetime bug class (a relocated buffer dropped before
+the call -- `_idle_segs` was held alive by name), an address leaking back
+in a reply whose restore was skipped, a guest descriptor number reaching a
+descriptor field, and an OwnedFd made of a number the kernel did not write.
+
+**What it does not do.** Which fields are pointers is still the tables' word
+(`guestptr.rs`, `abi::rmctrl`, `schema.rs`, measured from the drivers'
+sources): a pointer field they miss reaches the host as the guest's bytes,
+exactly as before. Data rewrites are still edits of the host's copy -- the
+coherency attributes (`rmmem.rs`, on a copy before it is built), NVKMS
+policy (`nvkms.rs`), fence waits (`fence::before`), SYS_PARAMS' and
+CHECK_VERSION_STR's command byte -- only unable to reach a declared field.
+RM's top-level blocks are field offsets (`Plan`), not typed structs. Both
+are roadmap item 9. The raw-descriptor helpers (`read_raw`, `fstat`, ...)
+take numbers: a wrong one is EBADF or another of the backend's own files,
+never memory outside the buffers passed. The guest module, which is C, is
+unchanged; §14 is the host's.
+

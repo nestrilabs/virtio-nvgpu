@@ -26,6 +26,8 @@
 //! budget is dropped like one that passes its own, and what it had queued is
 //! let go with it: a guest that is not reading has no use for it.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -381,7 +383,7 @@ impl Platform for HostPlat<'_> {
         // Export mode: a host client's buffer, for the guest compositor.
         match self.host.classify(fd.as_fd()) {
             HandleKind::Dmabuf => {
-                let size = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) }.max(0) as u64;
+                let size = crate::sys::fd::size(fd.as_raw_fd()).unwrap_or(0);
                 DescOut {
                     desc: Desc {
                         c: size,
@@ -818,12 +820,11 @@ fn reader(s: Arc<Shared>) {
                 revents: 0,
             });
         }
-        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 1000) };
-        if r < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+        if let Err(e) = crate::sys::fd::poll(&mut pfds, 1000) {
+            if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            log::error!("wayland: poll: {}", io::Error::last_os_error());
+            log::error!("wayland: poll: {e}");
             return;
         }
         if pfds[1].revents != 0 {

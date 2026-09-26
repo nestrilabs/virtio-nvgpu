@@ -1,5 +1,7 @@
 // crates/device/src/error.rs
 
+#![forbid(unsafe_code)]
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

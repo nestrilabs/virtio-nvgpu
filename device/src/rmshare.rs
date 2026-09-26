@@ -56,6 +56,8 @@
 //! itself succeeding, as for the controls in rmctl.rs: the caller sees what
 //! it would natively for a share or a duplicate RM will not allow.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use abi::ioctl::{NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL, NV_ESC_RM_DUP_OBJECT, NV_ESC_RM_SHARE};
@@ -1629,10 +1631,9 @@ mod backend_tests {
 
     /// A host RM that allocates clients with fresh handles and answers
     /// NV_OK to everything else.
-    unsafe fn fake_rm(_: RawFd, request: u64, arg: *mut u8) -> i32 {
+    fn fake_rm(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
         let request = request as u32;
-        // SAFETY: the HostIoctl contract, `arg` holds _IOC_SIZE bytes.
-        let a = unsafe { std::slice::from_raw_parts_mut(arg, hostfd::ioc_size(request)) };
+        let a = &mut arg.bytes()[..hostfd::ioc_size(request)];
         let nr = hostfd::ioc_nr(request);
         SEEN.with(|s| s.borrow_mut().push((nr, rd32(a, 0).unwrap())));
         let status = match nr {

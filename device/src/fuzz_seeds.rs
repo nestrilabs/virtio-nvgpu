@@ -12,6 +12,8 @@
 //! HELLO itself is left out (the harness says it from the configuration
 //! byte, before opening its files; a recorded fresh HELLO would close them).
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -2,6 +2,8 @@
 //! format, the policy, and the engine end to end (a guest engine facing a
 //! client wired to a host engine facing a compositor, both in memory).
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
@@ -1085,8 +1087,7 @@ fn allocated(fd: &OwnedFd) -> u64 {
 
 /// The first byte at or after `off` that is data, not a hole.
 fn next_data(fd: &OwnedFd, off: u64) -> Option<u64> {
-    let r = unsafe { libc::lseek(fd.as_raw_fd(), off as libc::off_t, libc::SEEK_DATA) };
-    (r >= 0).then_some(r as u64)
+    crate::sys::seek_data(fd.as_raw_fd(), off).ok()
 }
 
 fn pg() -> u64 {
@@ -1474,7 +1475,7 @@ fn a_keymap_arrives_as_a_sealed_copy() {
     assert_eq!(split(&msgs).len(), 1);
     assert_eq!(fds.len(), 1);
     assert_eq!(read_all(&fds[0]), keymap);
-    let seals = unsafe { libc::fcntl(fds[0].as_raw_fd(), libc::F_GET_SEALS) };
+    let seals = crate::sys::seals(fds[0].as_raw_fd()).unwrap();
     assert_eq!(seals & libc::F_SEAL_WRITE, libc::F_SEAL_WRITE);
     assert_eq!(p.h.blob_stats().0, 1);
 }

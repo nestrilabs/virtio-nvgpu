@@ -22,6 +22,8 @@
 //! never gets here, so turning on `debug` for a chase is not throttled by
 //! lines that were never printed before.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;

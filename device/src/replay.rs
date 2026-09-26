@@ -10,6 +10,8 @@
 //! workload? A guest does not map once and stop. It runs an encode, tears it
 //! down, and runs another.
 
+#![forbid(unsafe_code)]
+
 #[cfg(test)]
 mod tests {
     use crate::shm::{PgprotKind, ShmAllocator, ShmRegion};

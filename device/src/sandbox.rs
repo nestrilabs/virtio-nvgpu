@@ -63,9 +63,11 @@
 //! guest whose memory it maps. The GPU's own isolation between clients is
 //! RM's page tables, which no process sandbox touches.
 
+#![forbid(unsafe_code)]
+
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -286,11 +288,8 @@ fn private_network() -> Layer {
         Ok(false) => {}
         Err(e) => return Layer::Degraded(format!("cannot read /proc/self/net/dev: {e}")),
     }
-    // SAFETY: plain syscalls.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    // SAFETY: unshare with constant flags and no pointers.
-    if unsafe { libc::unshare(CLONE_NEWUSER | CLONE_NEWNET) } != 0 {
-        let e = io::Error::last_os_error();
+    let (uid, gid) = (crate::sys::proc::euid(), crate::sys::proc::egid());
+    if let Err(e) = crate::sys::proc::unshare(CLONE_NEWUSER | CLONE_NEWNET) {
         return Layer::Degraded(format!(
             "no network namespace: unshare(CLONE_NEWUSER|CLONE_NEWNET): {e}. Unprivileged \
              user namespaces are off on this host (user.max_user_namespaces, \
@@ -308,9 +307,8 @@ fn private_network() -> Layer {
     // again before anything else happens. Nothing is mapped yet, there is
     // one thread, and the new namespace's capabilities are not yet dropped
     // -- but reaching them takes being this process already.
-    // SAFETY: plain prctls.
-    let was_dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+    let was_dumpable = crate::sys::proc::dumpable();
+    let _ = crate::sys::proc::set_dumpable(true);
     let maps = [
         ("/proc/self/setgroups", "deny".to_string()),
         ("/proc/self/uid_map", format!("{uid} {uid} 1")),
@@ -319,25 +317,21 @@ fn private_network() -> Layer {
     for (path, text) in &maps {
         if let Err(e) = std::fs::write(path, text) {
             log::error!("sandbox: writing {path} in the new user namespace: {e}; stopping");
-            // SAFETY: plain exit; nothing has been served.
-            unsafe { libc::_exit(1) };
+            // Nothing has been served.
+            crate::sys::proc::exit_now(1);
         }
     }
-    // SAFETY: plain prctl.
-    if was_dumpable != 1 && unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        log::error!(
-            "sandbox: undumpable again: {}; stopping",
-            io::Error::last_os_error()
-        );
-        // SAFETY: as above.
-        unsafe { libc::_exit(1) };
+    if was_dumpable != 1
+        && let Err(e) = crate::sys::proc::set_dumpable(false)
+    {
+        log::error!("sandbox: undumpable again: {e}; stopping");
+        crate::sys::proc::exit_now(1);
     }
     // The new namespace gave this process every capability in it. None of
     // them reach anything outside it, and none of them are kept.
     if let Err(e) = crate::posture::drop_all_caps() {
         log::error!("sandbox: dropping the new user namespace's capabilities: {e}; stopping");
-        // SAFETY: as above.
-        unsafe { libc::_exit(1) };
+        crate::sys::proc::exit_now(1);
     }
     match only_loopback() {
         Ok(true) => Layer::Enforced(
@@ -353,13 +347,8 @@ fn private_network() -> Layer {
 // ── 4. Limits ────────────────────────────────────────────────────────────────
 
 fn limits() -> Layer {
-    let zero = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: setrlimit from a local.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
-        return Layer::Degraded(format!("RLIMIT_CORE: {}", io::Error::last_os_error()));
+    if let Err(e) = crate::sys::proc::set_rlimit(libc::RLIMIT_CORE, 0, 0) {
+        return Layer::Degraded(format!("RLIMIT_CORE: {e}"));
     }
     Layer::Enforced("RLIMIT_CORE 0; no_new_privs and undumpable (posture)".into())
 }
@@ -387,39 +376,11 @@ mod ll {
     pub const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     pub const SCOPE_SIGNAL: u64 = 1 << 1;
 
-    pub const CREATE_RULESET_VERSION: u32 = 1 << 0;
-    pub const RULE_PATH_BENEATH: libc::c_int = 1;
-}
-
-#[repr(C)]
-struct RulesetAttr {
-    handled_access_fs: u64,
-    handled_access_net: u64,
-    scoped: u64,
-}
-
-#[repr(C, packed)]
-struct PathBeneathAttr {
-    allowed_access: u64,
-    parent_fd: i32,
 }
 
 /// The Landlock ABI this kernel speaks, or why none.
 fn landlock_abi() -> Result<i64, io::Error> {
-    // SAFETY: the version query takes no attribute.
-    let v = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<RulesetAttr>(),
-            0usize,
-            ll::CREATE_RULESET_VERSION,
-        )
-    };
-    if v < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(v)
-    }
+    crate::sys::proc::landlock_abi()
 }
 
 /// Every filesystem access an ABI can restrict.
@@ -471,35 +432,17 @@ fn attr_size(abi: i64) -> usize {
     }
 }
 
-fn owned(fd: libc::c_long) -> io::Result<OwnedFd> {
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor the kernel just returned, owned from here.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-}
-
 /// Add one rule; `Ok(false)` when there is nothing at `path` (a node that
 /// does not exist at start stays unreachable, which the caller reports).
 fn add_rule(ruleset: &OwnedFd, path: &Path, access: u64, handled: u64) -> io::Result<bool> {
     let c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: a NUL-terminated path; the result is owned below.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if fd < 0 {
-        let e = io::Error::last_os_error();
-        return if e.kind() == io::ErrorKind::NotFound {
-            Ok(false)
-        } else {
-            Err(e)
-        };
-    }
-    let fd = owned(fd as libc::c_long)?;
-    // SAFETY: fstat into a local.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let fd = match crate::sys::fd::open(&c, libc::O_PATH | libc::O_CLOEXEC) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let st = crate::sys::fd::fstat(fd.as_raw_fd())?;
     let mut allowed = access & handled;
     if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
         allowed &= ll::ACCESS_FILE;
@@ -508,23 +451,7 @@ fn add_rule(ruleset: &OwnedFd, path: &Path, access: u64, handled: u64) -> io::Re
         // Nothing this kernel restricts: nothing to grant.
         return Ok(true);
     }
-    let attr = PathBeneathAttr {
-        allowed_access: allowed,
-        parent_fd: fd.as_raw_fd(),
-    };
-    // SAFETY: a path-beneath attribute of the kernel's layout.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_add_rule,
-            ruleset.as_raw_fd(),
-            ll::RULE_PATH_BENEATH,
-            &attr as *const PathBeneathAttr,
-            0u32,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    crate::sys::proc::landlock_allow_beneath(ruleset, &fd, allowed)?;
     Ok(true)
 }
 
@@ -540,20 +467,12 @@ fn landlock(plan: &Plan) -> Layer {
         }
     };
     let fs = handled_fs(abi);
-    let attr = RulesetAttr {
-        handled_access_fs: fs,
-        handled_access_net: handled_net(abi),
-        scoped: scoped(abi),
-    };
-    // SAFETY: the attribute, of the size this ABI takes.
-    let ruleset = match owned(unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attr as *const RulesetAttr,
-            attr_size(abi),
-            0u32,
-        )
-    }) {
+    let ruleset = match crate::sys::proc::landlock_ruleset(
+        fs,
+        handled_net(abi),
+        scoped(abi),
+        attr_size(abi),
+    ) {
         Ok(fd) => fd,
         Err(e) => return Layer::Degraded(format!("landlock_create_ruleset (ABI {abi}): {e}")),
     };
@@ -585,12 +504,9 @@ fn landlock(plan: &Plan) -> Layer {
             absent.join(", ")
         );
     }
-    // SAFETY: no_new_privs is set (posture::drop_all_caps).
-    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0u32) } != 0 {
-        return Layer::Degraded(format!(
-            "landlock_restrict_self: {}",
-            io::Error::last_os_error()
-        ));
+    // no_new_privs is set (posture::drop_all_caps).
+    if let Err(e) = crate::sys::proc::landlock_restrict_self(&ruleset) {
+        return Layer::Degraded(format!("landlock_restrict_self: {e}"));
     }
     let what = format!(
         "ABI {abi}, {granted} paths: the GPU's nodes, /proc/driver/nvidia, /proc/self, the \
@@ -641,8 +557,6 @@ const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
-const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
-
 /// `struct seccomp_data`.
 const DATA_NR: u32 = 0;
 const DATA_ARCH: u32 = 4;
@@ -669,20 +583,7 @@ const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541C;
 const PR_SET_VMA: u32 = 0x5356_4d41;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Insn {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
-}
-
-#[repr(C)]
-struct Fprog {
-    len: u16,
-    filter: *const Insn,
-}
+use crate::sys::proc::Insn;
 
 const fn ld(k: u32) -> Insn {
     Insn {
@@ -923,82 +824,12 @@ fn program(pid: u32, violation: u32) -> Vec<Insn> {
     p
 }
 
-/// The SIGSYS handler: one line on stderr naming the syscall, then exit.
-/// Async-signal-safe: `write` and `exit_group`, both on the list.
-extern "C" fn on_sigsys(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
-    // siginfo's _sigsys: call_addr at 16, syscall at 24, arch at 28, on both
-    // 64-bit architectures this builds for.
-    let nr = if info.is_null() {
-        -1
-    } else {
-        // SAFETY: the kernel hands a full siginfo_t for a seccomp SIGSYS.
-        unsafe { *(info.cast::<u8>().add(24).cast::<i32>()) }
-    };
-    let mut buf = [0u8; 256];
-    let mut n = 0;
-    let mut put = |b: &[u8]| {
-        let k = b.len().min(buf.len() - n);
-        buf[n..n + k].copy_from_slice(&b[..k]);
-        n += k;
-    };
-    put(b"vhost-user-nvgpu: sandbox: syscall ");
-    let mut digits = [0u8; 12];
-    let mut i = digits.len();
-    let mut x = i64::from(nr).unsigned_abs();
-    loop {
-        i -= 1;
-        digits[i] = b'0' + (x % 10) as u8;
-        x /= 10;
-        if x == 0 {
-            break;
-        }
-    }
-    if nr < 0 {
-        put(b"-");
-    }
-    put(&digits[i..]);
-    put(
-        b" is not on the seccomp allowlist (device/src/sandbox.rs); stopping. \
-          --sandbox=off only to diagnose\n",
-    );
-    // SAFETY: a local buffer and its length; then an exit that never returns.
-    unsafe {
-        libc::write(2, buf.as_ptr().cast(), n);
-        libc::syscall(libc::SYS_exit_group, REFUSED_EXIT);
-    }
-}
-
 fn install_sigsys_handler() -> io::Result<()> {
-    // SAFETY: a zeroed sigaction is valid; the fields used are set.
-    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-    sa.sa_sigaction = on_sigsys as *const () as usize;
-    sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
-    // SAFETY: an initialised sigaction that outlives the call.
-    if unsafe { libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::sys::proc::install_sigsys_report(REFUSED_EXIT)
 }
 
 fn install(prog: &[Insn]) -> io::Result<()> {
-    let len = u16::try_from(prog.len()).map_err(|_| io::Error::other("filter too long"))?;
-    let fprog = Fprog {
-        len,
-        filter: prog.as_ptr(),
-    };
-    // SAFETY: the program outlives the call, and the kernel copies it.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER,
-            0u32,
-            &fprog as *const Fprog,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::sys::proc::seccomp_install(prog)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1006,8 +837,7 @@ fn seccomp() -> Layer {
     if let Err(e) = install_sigsys_handler() {
         return Layer::Degraded(format!("SIGSYS handler: {e}; no filter installed"));
     }
-    // SAFETY: plain syscall.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::sys::proc::pid() as u32;
     let prog = program(pid, SECCOMP_RET_TRAP);
     match install(&prog) {
         Ok(()) => Layer::Enforced(format!(
@@ -1054,16 +884,7 @@ fn verify(r: &mut Report) {
     }
     if r.landlock.is_enforced() {
         // The root directory is never on the plan.
-        // SAFETY: a constant path; closed below if it opens.
-        let fd = unsafe {
-            libc::open(
-                c"/".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: the descriptor just opened.
-            unsafe { libc::close(fd) };
+        if crate::sys::fd::open(c"/", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC).is_ok() {
             r.landlock = Layer::Degraded("installed, but / still opens".into());
         }
     }
@@ -1077,57 +898,16 @@ mod tests {
     use super::*;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    /// How a forked child ended.
-    #[derive(Debug, PartialEq, Eq)]
-    enum End {
-        Exit(i32),
-        Signal(i32),
-    }
-
-    /// Run `f` in a forked child and say how it ended. The child exits with
-    /// what `f` returns, 101 on a panic. glibc keeps malloc usable across
-    /// fork, and the children touch no lock another thread could hold.
-    ///
-    /// The child first closes every descriptor but 0-2: it inherits every
-    /// other test thread's too, and holding them for the length of its test
-    /// made other tests' "the backend closed its end" probes see a live
-    /// peer. From fork to that close the copies still exist, which those
-    /// probes allow for (testfd.rs). No child here uses a descriptor it did
-    /// not open itself.
-    fn forked(f: impl FnOnce() -> i32) -> End {
-        // SAFETY: fork; the child only runs `f` and exits without unwinding.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
-        if pid == 0 {
-            // SAFETY: closes this child's own copies; the parent's are untouched.
-            unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
-            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(101);
-            // SAFETY: the child ends here.
-            unsafe { libc::_exit(code) };
-        }
-        let mut status = 0;
-        // SAFETY: waits for the child just forked.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        if libc::WIFEXITED(status) {
-            End::Exit(libc::WEXITSTATUS(status))
-        } else {
-            End::Signal(libc::WTERMSIG(status))
-        }
-    }
+    use crate::sys::proc::testing::{End, forked};
 
     fn nnp() {
-        // SAFETY: plain prctl.
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
-            0
-        );
+        crate::sys::proc::set_no_new_privs().unwrap();
     }
 
     fn filter() {
         nnp();
         install_sigsys_handler().unwrap();
-        // SAFETY: plain syscall.
-        let pid = unsafe { libc::getpid() } as u32;
+        let pid = crate::sys::proc::pid() as u32;
         install(&program(pid, SECCOMP_RET_TRAP)).unwrap();
     }
 
@@ -1212,30 +992,8 @@ mod tests {
             if t.join().unwrap() != 7 << 20 {
                 return 2;
             }
-            // SAFETY: plain syscalls on descriptors made here.
-            unsafe {
-                let m = libc::memfd_create(c"t".as_ptr(), libc::MFD_CLOEXEC);
-                if m < 0 || libc::ftruncate(m, 4096) != 0 {
-                    return 3;
-                }
-                let p = libc::mmap(
-                    std::ptr::null_mut(),
-                    4096,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    m,
-                    0,
-                );
-                if p == libc::MAP_FAILED {
-                    return 4;
-                }
-                *(p as *mut u8) = 1;
-                libc::munmap(p, 4096);
-                let e = libc::eventfd(0, libc::EFD_CLOEXEC);
-                let ep = libc::epoll_create1(libc::EPOLL_CLOEXEC);
-                if e < 0 || ep < 0 {
-                    return 5;
-                }
+            if let Err(step) = crate::sys::proc::testing::memfd_mapping_works() {
+                return step;
             }
             let (a, b) = UnixStream::pair().unwrap();
             drop((a, b));
@@ -1260,66 +1018,50 @@ mod tests {
         // Not on the list at all.
         let end = forked(|| {
             filter();
-            // SAFETY: a syscall the filter refuses; the child never returns.
-            unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_TRACEME, 0, 0, 0) };
+            // A syscall the filter refuses; the child never returns.
+            crate::sys::proc::testing::ptrace_traceme();
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
         // A process, not a thread.
         let end = forked(|| {
             filter();
-            // SAFETY: as above.
-            unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) };
+            crate::sys::proc::testing::clone_process();
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
         // An executable mapping.
         let end = forked(|| {
             filter();
-            // SAFETY: as above.
-            unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    4096,
-                    libc::PROT_READ | libc::PROT_EXEC,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
+            crate::sys::proc::testing::map_executable();
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
         // An IP socket.
         let end = forked(|| {
             filter();
-            // SAFETY: as above.
-            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            crate::sys::proc::testing::ip_socket();
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
         // Making the process dumpable again.
         let end = forked(|| {
             filter();
-            // SAFETY: as above.
-            unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+            let _ = crate::sys::proc::set_dumpable(true);
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
         // Taking the SIGSYS handler away is a kill without it.
         let end = forked(|| {
             filter();
-            // SAFETY: as above.
-            unsafe { libc::signal(libc::SIGSYS, libc::SIG_DFL) };
+            crate::sys::proc::testing::sigsys_default();
             0
         });
         assert_eq!(end, End::Signal(libc::SIGSYS));
         // Pushing input into a terminal.
         let end = forked(|| {
             filter();
-            let c = 0u8;
-            // SAFETY: as above.
-            unsafe { libc::ioctl(0, TIOCSTI as _, &c) };
+            crate::sys::proc::testing::tiocsti();
             0
         });
         assert_eq!(end, End::Exit(REFUSED_EXIT));
@@ -1357,8 +1099,7 @@ mod tests {
             connect: vec![ours.clone()],
         };
         let abi = landlock_abi().unwrap();
-        // SAFETY: plain syscall.
-        let parent = unsafe { libc::getppid() };
+        let parent = crate::sys::proc::ppid();
         let end = forked(move || {
             nnp();
             let l = landlock(&plan);
@@ -1386,9 +1127,10 @@ mod tests {
                 return 6;
             }
             // A memfd reopened through /proc/self/fd, as shm.rs does.
-            // SAFETY: plain syscall.
-            let m = unsafe { libc::memfd_create(c"m".as_ptr(), libc::MFD_CLOEXEC) };
-            if m < 0 || std::fs::File::open(format!("/proc/self/fd/{m}")).is_err() {
+            let Ok(m) = crate::sys::fd::memfd(c"m", libc::MFD_CLOEXEC) else {
+                return 7;
+            };
+            if std::fs::File::open(format!("/proc/self/fd/{}", m.as_raw_fd())).is_err() {
                 return 7;
             }
             if abi >= 9 {
@@ -1400,8 +1142,8 @@ mod tests {
                 }
             }
             if abi >= 6 {
-                // SAFETY: signal 0 only asks.
-                if unsafe { libc::kill(parent, 0) } == 0 {
+                // Signal 0 only asks.
+                if crate::sys::proc::kill(parent, 0).is_ok() {
                     return 10;
                 }
             }
@@ -1439,12 +1181,10 @@ mod tests {
             if t != 5 {
                 return 5;
             }
-            // SAFETY: plain syscall.
-            if unsafe { libc::geteuid() } == 65534 {
+            if crate::sys::proc::euid() == 65534 {
                 return 6;
             }
-            // SAFETY: plain prctl.
-            if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            if crate::sys::proc::dumpable() != 0 {
                 return 8;
             }
             // And what it takes away, it takes away.

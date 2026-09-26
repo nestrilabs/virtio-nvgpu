@@ -36,8 +36,10 @@
 //!   run on per-file executors (`device::exec`), which complete their own
 //!   chains.
 
+#![forbid(unsafe_code)]
+
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -251,11 +253,10 @@ impl WindowPlacer for VhostWindow {
                 0
             },
         };
-        // SAFETY: the descriptor is owned by the handle table for the whole of
-        // this call, and is only borrowed to be sent.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        // The descriptor is owned by the handle table for the whole of this
+        // call, and is only sent by number.
         self.0
-            .shmem_map(&req, &borrowed)
+            .shmem_map(&req, &fd)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
@@ -287,11 +288,10 @@ impl WindowPlacer for VhostWindow {
         addr: u64,
     ) -> device::error::Result<()> {
         let req = uvm_mmap_msg(aperture_offset, len, addr);
-        // SAFETY: as in `place`: the handle table owns the descriptor for the
-        // whole of this call.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        // As in `place`: the handle table owns the descriptor for the whole
+        // of this call.
         self.0
-            .shmem_map(&req, &borrowed)
+            .shmem_map(&req, &fd)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
@@ -595,9 +595,7 @@ struct Taken {
 fn transport_error(errno: i32) -> Reply {
     let hdr = MsgHeader::err(MsgType::Ioctl, errno);
     // The wire form is the struct's bytes, which is what the driver reads.
-    let p = &hdr as *const MsgHeader as *const u8;
-    // SAFETY: a plain-old-data header viewed as its 16 bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(p, HDR) }.to_vec();
+    let bytes = device::sys::pod::bytes(&hdr)[..HDR].to_vec();
     Reply {
         bytes,
         ..Reply::default()
@@ -1114,8 +1112,7 @@ fn main() -> anyhow::Result<()> {
 
     // Before any thread exists: capabilities are per thread
     // (device::posture, S-5).
-    // SAFETY: plain syscalls.
-    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    let (uid, euid) = (device::sys::proc::uid(), device::sys::proc::euid());
     let caps = posture::Caps::current()?;
     log::info!("credentials: uid {uid}, euid {euid}, capabilities {caps}");
     if let Some(why) = posture::too_privileged(euid, &caps) {
@@ -1137,8 +1134,7 @@ fn main() -> anyhow::Result<()> {
     posture::set_undumpable().map_err(|e| anyhow::anyhow!("PR_SET_DUMPABLE: {e}"))?;
     // Nothing this process creates is for anyone else: the vhost-user
     // socket among others.
-    // SAFETY: plain syscall.
-    unsafe { libc::umask(0o077) };
+    device::sys::proc::umask(0o077);
     log::info!(
         "capabilities now {}, no_new_privs set",
         posture::Caps::current()?
@@ -1426,8 +1422,7 @@ mod tests {
         struct Vmm(StdMutex<Vec<(&'static str, u8, u64, u64, u64, u64, bool)>>);
         impl VhostUserFrontendReqHandler for Vmm {
             fn shmem_map(&self, r: &M, fd: &dyn std::os::fd::AsRawFd) -> HandlerResult<u64> {
-                // SAFETY: fcntl on a descriptor the crate holds for this call.
-                let open = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0;
+                let open = device::sys::fd::is_open(fd.as_raw_fd());
                 let (id, fo, so, len, fl) = (r.shmid, r.fd_offset, r.shm_offset, r.len, r.flags);
                 self.0
                     .lock()
@@ -1448,10 +1443,8 @@ mod tests {
         let vmm = Arc::new(Vmm::default());
         let mut frontend = FrontendReqHandler::new(vmm.clone()).unwrap();
         frontend.set_reply_ack_flag(true);
-        // SAFETY: dup of the frontend's end, owned by the stream from here.
-        let tx = unsafe {
-            <UnixStream as std::os::fd::FromRawFd>::from_raw_fd(libc::dup(frontend.get_tx_raw_fd()))
-        };
+        // A dup of the frontend's end, owned by the stream from here.
+        let tx = UnixStream::from(device::sys::fd::dup_raw(frontend.get_tx_raw_fd()).unwrap());
         let backend = Backend::from_stream(tx);
         backend.set_reply_ack_flag(true);
         backend.set_shmem_flag(true);
@@ -1483,11 +1476,7 @@ mod tests {
     /// has to know them for exactly as long as the ring holds them.
     #[test]
     fn a_rings_eventfds_are_private_while_it_holds_them() {
-        use std::os::fd::FromRawFd;
-        let eventfd = || {
-            // SAFETY: plain syscall; the descriptor is owned by the File.
-            unsafe { File::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) }
-        };
+        let eventfd = || File::from(device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap());
         let v: Vring = VringT::new(GuestMemoryAtomic::new(memory()), 256).unwrap();
         let (kick, call) = (eventfd(), eventfd());
         let (k, c) = (kick.as_raw_fd(), call.as_raw_fd());

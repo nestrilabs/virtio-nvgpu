@@ -2,9 +2,11 @@
 //! WL_RECV and CLOSE as the guest kernel sends them, served by
 //! `NvidiaBackend::serve` against a fake compositor on a real socket.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,9 +33,8 @@ use crate::session::hdr;
 
 const HDR: usize = size_of::<MsgHeader>();
 
-fn bytes_of<T: Copy>(v: &T) -> &[u8] {
-    // SAFETY: a plain-old-data wire struct viewed as its bytes.
-    unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
+fn bytes_of<T: crate::sys::pod::Pod>(v: &T) -> &[u8] {
+    crate::sys::pod::bytes(v)
 }
 
 fn msg(t: MsgType, handle: u32, body: &[u8]) -> Vec<u8> {
@@ -140,8 +141,7 @@ impl Guest {
             let (f, _) = frame::pack(&mut q, MAX as usize, frame::MAX_DESC, false);
             let r = call(be, MsgType::WlSend, self.h, &f, 64);
             assert_eq!(status(&r), 0, "WL_SEND");
-            let resp: WlSendResp =
-                unsafe { (r[HDR..].as_ptr() as *const WlSendResp).read_unaligned() };
+            let resp: WlSendResp = crate::sys::pod::read(&r, HDR).unwrap();
             assert_eq!(resp.accepted as usize, f.len());
         }
     }
@@ -288,7 +288,7 @@ fn a_lease_of_our_gpu_arrives_as_a_nonblocking_handle_in_the_table() {
     assert_eq!(d.b, HK_DRM_LEASE);
     assert_eq!(be.handles.kind(d.a), Some(HandleKind::DrmLease(0)));
     let (fd, _) = be.handles.get(d.a).unwrap();
-    let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    let fl = crate::sys::fd::status_flags(fd.as_raw_fd()).unwrap();
     assert_ne!(fl & libc::O_NONBLOCK, 0, "the pump must never block on it");
     // The guest owns it now, like any other handle.
     assert_eq!(close(&mut be, d.a), 0);
@@ -300,13 +300,7 @@ fn a_dmabuf_is_exported_only_on_a_render_handle_of_the_session() {
     let ev = t
         .insert(crate::hostfd::new_eventfd().unwrap(), HandleKind::Eventfd)
         .unwrap();
-    // SAFETY: a NUL-terminated path; ownership passes to the OwnedFd.
-    let null = unsafe {
-        OwnedFd::from_raw_fd(libc::open(
-            c"/dev/null".as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC,
-        ))
-    };
+    let null = crate::sys::fd::open(c"/dev/null", libc::O_RDWR | libc::O_CLOEXEC).unwrap();
     let render = t.insert(null, HandleKind::DriRender(0)).unwrap();
     let mut ops = TableSend { handles: &t };
     let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
@@ -587,7 +581,7 @@ fn export_mode_listens_and_accepts_host_clients_as_channels() {
         ..Default::default()
     };
     let r = call(&mut be, MsgType::Hello, 0, bytes_of(&req), 4096);
-    let resp: HelloResp = unsafe { (r[HDR..].as_ptr() as *const HelloResp).read_unaligned() };
+    let resp: HelloResp = crate::sys::pod::read(&r, HDR).unwrap();
     assert_eq!(resp.backend_caps & BCAP_WL_EXPORT, BCAP_WL_EXPORT);
     assert_eq!(resp.backend_caps & BCAP_WAYLAND, 0);
 
@@ -604,12 +598,7 @@ fn export_mode_listens_and_accepts_host_clients_as_channels() {
 
     let _client = UnixStream::connect(&path).unwrap();
     let (fd, _) = be.handles.get(listen).unwrap();
-    let mut p = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(unsafe { libc::poll(&mut p, 1, 2000) }, 1, "LISTEN readable");
+    assert_eq!(crate::sys::fd::readable(fd.as_raw_fd(), 2000), true, "LISTEN readable");
     let (st, chan) = open(&mut be, frame::WL_OPEN_ACCEPT);
     assert_eq!(st, 0);
     assert!(be.wl_is_open(chan));

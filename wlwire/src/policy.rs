@@ -7,6 +7,8 @@
 //! is met, and at min(what the compositor advertised, the vendored XML's
 //! version, the table's cap). A bind of anything else is a protocol error.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use crate::policy_table::{GLOBALS, Requires};

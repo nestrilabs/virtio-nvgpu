@@ -52,6 +52,8 @@
 //! of it is mapped as on the host (M-1), and whether a GPU mapping of it
 //! must snoop.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use abi::ioctl::{

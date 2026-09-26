@@ -36,6 +36,8 @@
 //! used, a file already there is removed only if it is a socket the backend's
 //! user owns -- anything else stops the start instead of being ignored.
 
+#![forbid(unsafe_code)]
+
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -44,22 +46,6 @@ use std::path::{Path, PathBuf};
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// CAP_SETPCAP: what emptying the bounding set takes.
 const CAP_SETPCAP: u32 = 8;
-
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
-#[repr(C)]
-struct CapHeader {
-    version: u32,
-    pid: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct CapData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
 
 /// The calling thread's capability sets, 64 bits each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,27 +58,11 @@ pub struct Caps {
 impl Caps {
     /// The calling thread's.
     pub fn current() -> io::Result<Self> {
-        let mut hdr = CapHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [CapData::default(); 2];
-        // SAFETY: capget with a v3 header writes two CapData.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_capget,
-                &mut hdr as *mut CapHeader,
-                data.as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let wide = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+        let (effective, permitted, inheritable) = crate::sys::proc::capget()?;
         Ok(Self {
-            effective: wide(data[0].effective, data[1].effective),
-            permitted: wide(data[0].permitted, data[1].permitted),
-            inheritable: wide(data[0].inheritable, data[1].inheritable),
+            effective,
+            permitted,
+            inheritable,
         })
     }
 
@@ -132,40 +102,19 @@ pub fn too_privileged(euid: u32, caps: &Caps) -> Option<String> {
 pub fn drop_all_caps() -> io::Result<()> {
     // Ambient first: it may be cleared by anyone, and an ambient capability
     // would otherwise survive an execve of a plain binary.
-    // SAFETY: plain prctls with integer arguments.
-    unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        )
-    };
+    crate::sys::proc::clear_ambient_caps();
     // The bounding set takes CAP_SETPCAP to shrink, so only a process that
     // could have used it does; for any other no_new_privs below is what
     // stops an execve gaining file capabilities.
     if Caps::current()?.effective & (1u64 << CAP_SETPCAP) != 0 {
         let mut cap = 0;
-        // SAFETY: as above; EINVAL past the kernel's last capability ends it.
-        while unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } == 0 {
+        // EINVAL past the kernel's last capability ends it.
+        while crate::sys::proc::capbset_drop(cap) {
             cap += 1;
         }
     }
-    let mut hdr = CapHeader {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
-    };
-    let data = [CapData::default(); 2];
-    // SAFETY: capset with a v3 header reads two CapData.
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: plain prctl.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    crate::sys::proc::capset_none()?;
+    crate::sys::proc::set_no_new_privs()?;
     let left = Caps::current()?;
     if !left.is_empty() {
         return Err(io::Error::other(format!(
@@ -180,11 +129,7 @@ pub fn drop_all_caps() -> io::Result<()> {
 /// process's own /proc/self/fd stays readable to it (proc_fd_permission,
 /// and ptrace_may_access passes its own thread group).
 pub fn set_undumpable() -> io::Result<()> {
-    // SAFETY: plain prctl.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::sys::proc::set_dumpable(false)
 }
 
 /// Raise RLIMIT_NOFILE's soft limit to its hard limit, and return the soft
@@ -197,26 +142,11 @@ pub fn set_undumpable() -> io::Result<()> {
 /// (B1). The handle table is sized from what this returns
 /// (`handle_table::limit_for_nofile`).
 pub fn raise_nofile() -> io::Result<u64> {
-    let mut r = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit into a local.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
-        return Err(io::Error::last_os_error());
+    let (soft, hard) = crate::sys::proc::rlimit(libc::RLIMIT_NOFILE)?;
+    if soft < hard {
+        crate::sys::proc::set_rlimit(libc::RLIMIT_NOFILE, hard, hard)?;
     }
-    if r.rlim_cur < r.rlim_max {
-        let want = libc::rlimit {
-            rlim_cur: r.rlim_max,
-            rlim_max: r.rlim_max,
-        };
-        // SAFETY: setrlimit from a local.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &want) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        r.rlim_cur = r.rlim_max;
-    }
-    Ok(r.rlim_cur)
+    Ok(hard.max(soft))
 }
 
 /// The socket path used when none is given: `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock`.
@@ -295,14 +225,9 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri has no getrlimit")]
     fn the_descriptor_limit_is_raised_to_the_hard_limit() {
         let soft = raise_nofile().unwrap();
-        let mut r = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit into a local.
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
-        assert_eq!(soft, r.rlim_cur);
-        assert_eq!(r.rlim_cur, r.rlim_max);
+        let (cur, max) = crate::sys::proc::rlimit(libc::RLIMIT_NOFILE).unwrap();
+        assert_eq!(soft, cur);
+        assert_eq!(cur, max);
     }
     use std::os::unix::net::UnixListener;
 
@@ -314,8 +239,7 @@ mod tests {
     }
 
     fn euid() -> u32 {
-        // SAFETY: plain syscall.
-        unsafe { libc::geteuid() }
+        crate::sys::proc::euid()
     }
 
     #[test]
@@ -343,11 +267,7 @@ mod tests {
         std::thread::spawn(|| {
             drop_all_caps().unwrap();
             assert!(Caps::current().unwrap().is_empty());
-            // SAFETY: plain prctl.
-            assert_eq!(
-                unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
-                1
-            );
+            assert!(crate::sys::proc::no_new_privs().unwrap());
         })
         .join()
         .unwrap();

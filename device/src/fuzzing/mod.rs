@@ -20,6 +20,8 @@
 //! (`scripts/fuzz.sh` runs every target in a bubblewrap sandbox with a
 //! `/dev` of its own).
 
+#![forbid(unsafe_code)]
+
 pub mod backend;
 pub mod host;
 pub mod parsers;

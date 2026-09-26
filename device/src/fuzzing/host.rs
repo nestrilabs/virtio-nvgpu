@@ -3,12 +3,11 @@
 //!
 //! What it checks, on every call the backend makes:
 //!
-//! - every pointer the real driver would follow is NULL or one of the
-//!   backend's own buffers: never a value the guest sent (the words of the
-//!   whole input are the taint set), never a small number, and readable and
-//!   writable for exactly as many bytes as the driver copies -- touched here
-//!   byte by byte, so AddressSanitizer or the guard page catches a buffer
-//!   shorter than the copy;
+//! - every pointer the real driver would follow is NULL or a block of the
+//!   call's own arena (sys/block.rs): never a value the guest sent (the words
+//!   of the whole input are the taint set), never a small number, never any
+//!   other memory of the process, and as long as the driver copies -- a copy
+//!   that runs past a block's slack is the guard page's EFAULT;
 //! - the argument itself holds `_IOC_SIZE` bytes (UVM: its table's size);
 //! - memory registered by its guest pages (OS descriptors) is exactly the
 //!   pages the guest named, in order, from the backend's mapping of guest
@@ -21,6 +20,8 @@
 //!
 //! Every address the backend handed the host is remembered for the message,
 //! and `backend.rs` checks the reply carries none of them back.
+
+#![forbid(unsafe_code)]
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -168,15 +169,13 @@ const MAX_COPY: u64 = 64 << 20;
 /// The host follows `p` for `len` bytes, as copy_from_user and then
 /// copy_to_user would: `false` where the kernel's copy would fault (EFAULT,
 /// which the caller answers with), a panic where the copy would read or
-/// write memory that is not the buffer the backend meant -- a value the
-/// guest sent, a small number, or (under AddressSanitizer) a heap block
-/// shorter than the copy, whose neighbour the real kernel would overwrite.
+/// write memory that is not a block the backend built for this very call --
+/// a value the guest sent, a small number, anything else of the process's.
 ///
-/// Probed with `process_vm_readv` on this process, which faults as the
-/// kernel's own copy would, rather than by dereferencing: the guarded
-/// buffers (`guarded.rs`) end in a page that exists to turn an overlong copy
-/// into EFAULT, and that is the design working, not a finding.
-pub fn follow(p: u64, len: u64, what: &str) -> bool {
+/// Probed against the call's own regions (sys/block.rs, `Arg::reach`): a
+/// start inside none of them is the finding; a copy that starts in one and
+/// runs past its end (and slack) is the guard page doing its job.
+pub fn follow(arg: &crate::sys::block::Arg<'_>, p: u64, len: u64, what: &str) -> bool {
     if p == 0 || len == 0 {
         return true;
     }
@@ -194,79 +193,22 @@ pub fn follow(p: u64, len: u64, what: &str) -> bool {
         );
         s.seen.insert(p);
     });
-    // The start is the backend's choice, always: a buffer of its own or
+    // The start is the backend's choice, always: a block of the call's or
     // nothing. Only how far the host copies may run into a guard page.
-    assert!(
-        readable(p, 1),
-        "the host was handed an address nothing is mapped at: {what} = {p:#x} ({})",
-        ST.with(|s| s.borrow().call.clone())
-    );
-    let len = len.min(MAX_COPY) as usize;
-    if !readable(p, len) {
-        return false;
-    }
-    if let Some(bad) = poisoned(p, len) {
+    let Some(fits) = arg.reach(p, len.min(MAX_COPY)) else {
         panic!(
-            "the host was handed {what} = {p:#x} for {len:#x} bytes, and {bad:#x} is not the \
-             backend's to give (AddressSanitizer: redzone or freed)"
+            "the host was handed an address that is no block of the call: {what} = {p:#x} ({})",
+            ST.with(|s| s.borrow().call.clone())
         );
-    }
-    true
-}
-
-/// Whether the kernel could copy `len` bytes from `p` in this process.
-fn readable(p: u64, len: usize) -> bool {
-    let mut scratch = vec![0u8; len.min(1 << 20)];
-    let mut at = 0usize;
-    while at < len {
-        let n = (len - at).min(scratch.len());
-        let local = libc::iovec {
-            iov_base: scratch.as_mut_ptr().cast(),
-            iov_len: n,
-        };
-        let remote = libc::iovec {
-            iov_base: (p as usize + at) as *mut libc::c_void,
-            iov_len: n,
-        };
-        // SAFETY: reads this process's memory into `scratch`; a bad remote
-        // address is an error return, never a fault here.
-        let r = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
-        if r != n as isize {
-            return false;
-        }
-        at += n;
-    }
-    true
-}
-
-/// AddressSanitizer's view of `[p, p + len)`: the first byte it says is not
-/// addressable, if any. Nothing without AddressSanitizer.
-fn poisoned(p: u64, len: usize) -> Option<u64> {
-    type F = unsafe extern "C" fn(*const libc::c_void, usize) -> *const libc::c_void;
-    static F: std::sync::OnceLock<Option<F>> = std::sync::OnceLock::new();
-    let f = F.get_or_init(|| {
-        // SAFETY: looking a symbol up by a NUL-terminated name.
-        let s = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__asan_region_is_poisoned".as_ptr()) };
-        // SAFETY: the sanitizer interface function's signature.
-        (!s.is_null()).then(|| unsafe { std::mem::transmute::<*mut libc::c_void, F>(s) })
-    });
-    // SAFETY: the sanitizer only reads its shadow for the range.
-    let bad = unsafe { f.as_ref()?(p as *const libc::c_void, len) };
-    (!bad.is_null()).then_some(bad as u64)
-}
-
-/// The bytes at `p`, which `follow` has vouched for.
-fn view<'a>(p: u64, len: usize) -> &'a mut [u8] {
-    // SAFETY: `follow(p, len)` returned: `len` bytes of the backend's live
-    // buffer, for the length of this call.
-    unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) }
+    };
+    fits
 }
 
 /// RM pins `size` bytes from `addr` for an OS descriptor: they must be the
 /// pages the message's page list names, in order.
-fn pinned(addr: u64, size: u64, what: &str) {
+fn pinned(arg: &crate::sys::block::Arg<'_>, addr: u64, size: u64, what: &str) {
     assert!(
-        follow(addr, 1, what),
+        follow(arg, addr, 1, what),
         "{what}: RM handed {addr:#x}, which is not mapped"
     );
     let pages = ST.with(|s| page_list(&s.borrow().msg));
@@ -288,9 +230,8 @@ fn pinned(addr: u64, size: u64, what: &str) {
         }
         for off in [0u64, 4088] {
             let at = first + i as u64 * 4096 + off;
-            assert!(follow(at, 8, what), "{what}: page {i} is not mapped");
-            // SAFETY: followed just above.
-            let got = unsafe { (at as *const u64).read_unaligned() };
+            assert!(follow(arg, at, 8, what), "{what}: page {i} is not mapped");
+            let got = arg.peek(at, 8);
             assert_eq!(
                 got,
                 ram_word(gpa + off),
@@ -342,12 +283,10 @@ fn uvm_size(request: u32) -> usize {
         .map_or(16, |c| (c.size as usize).max(16))
 }
 
-/// The v1 host call (`nvidia::HostIoctl`).
-///
-/// # Safety
-/// `arg` holds at least `_IOC_SIZE(request)` bytes (UVM: its block), the
-/// `HostIoctl` contract -- which is checked here by touching them.
-pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
+/// The v1 host call (`nvidia::HostIoctl`): the argument must hold
+/// `_IOC_SIZE(request)` bytes (UVM: its block), which is checked here, and
+/// every pointer it follows must be a block of the call's.
+pub fn fake_ioctl(_fd: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
     let request = request as u32;
     ST.with(|s| s.borrow_mut().calls += 1);
     let ty = hostfd::ioc_type(request);
@@ -359,10 +298,24 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
     if len == 0 {
         return 0;
     }
-    if !follow(arg as u64, len as u64, "the argument") {
+    let top = arg.addr();
+    if !follow(arg, top, len as u64, "the argument") {
         return -libc::EFAULT;
     }
-    let a = view(arg as u64, len);
+    // The argument, copied out, answered, and copied back.
+    let mut a = arg.read(top, len).expect("followed");
+    let r = fake_answer(arg, request, ty, len, &mut a);
+    arg.write(top, &a);
+    r
+}
+
+fn fake_answer(
+    arg: &mut crate::sys::block::Arg<'_>,
+    request: u32,
+    ty: u8,
+    len: usize,
+    a: &mut [u8],
+) -> i32 {
     let status = ST.with(|s| s.borrow_mut().rm_status());
     match (ty, hostfd::ioc_nr(request)) {
         (0, _) => {
@@ -382,12 +335,12 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
             let cmd = rd32(a, 8);
             let params = rd64(a, 16);
             let size = rd32(a, 24);
-            if !follow(params, u64::from(size), "RM_CONTROL params") {
+            if !follow(arg, params, u64::from(size), "RM_CONTROL params") {
                 return -libc::EFAULT;
             }
             if params != 0 && size != 0 {
-                let n = view(params, size as usize);
-                control_pointers(cmd, n);
+                let n = arg.read(params, size as usize).expect("followed");
+                control_pointers(arg, cmd, &n);
             }
             put32(a, 28, status);
         }
@@ -395,21 +348,22 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
             let class = rd32(a, 12);
             let params = rd64(a, 16);
             let psize = rd32(a, 32);
-            let _ = follow(rd64(a, 24), 4, "RM_ALLOC pRightsRequested");
+            let _ = follow(arg, rd64(a, 24), 4, "RM_ALLOC pRightsRequested");
             if class == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
-                if !follow(params, 40, "OS descriptor params") {
+                if !follow(arg, params, 40, "OS descriptor params") {
                     return -libc::EFAULT;
                 }
-                let n = view(params, 40);
+                let n = arg.read(params, 40).expect("followed");
                 pinned(
-                    rd64(n, 16),
-                    rd64(n, 24).wrapping_add(1),
+                    arg,
+                    rd64(&n, 16),
+                    rd64(&n, 24).wrapping_add(1),
                     "RM_ALLOC OS descriptor",
                 );
             } else {
                 // RM copies the class's own size; the block is at least what
                 // the caller said it is.
-                if !follow(params, u64::from(psize.max(1)).min(4096), "RM_ALLOC params") {
+                if !follow(arg, params, u64::from(psize.max(1)).min(4096), "RM_ALLOC params") {
                     return -libc::EFAULT;
                 }
             }
@@ -422,6 +376,7 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
         (b'F', NV_ESC_RM_ALLOC_MEMORY) if len >= 56 => {
             if rd32(a, 12) == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                 pinned(
+                    arg,
                     rd64(a, 24),
                     rd64(a, 32).wrapping_add(1),
                     "ALLOC_MEMORY OS descriptor",
@@ -438,6 +393,7 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
         (b'F', NV_ESC_RM_VID_HEAP_CONTROL) if len >= 184 => {
             if rd32(a, 8) == crate::osdesc::NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR {
                 pinned(
+                    arg,
                     rd64(a, 64),
                     rd64(a, 72).wrapping_add(1),
                     "VID_HEAP OS descriptor",
@@ -454,7 +410,7 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
             let count = u64::from(rd32(a, 12));
             if (rd32(a, 40) >> 4) & 0xf == 0 && count != 0 {
                 for off in [16, 24, 32] {
-                    if !follow(rd64(a, off), count * 4, "IDLE_CHANNELS list") {
+                    if !follow(arg, rd64(a, off), count * 4, "IDLE_CHANNELS list") {
                         return -libc::EFAULT;
                     }
                 }
@@ -480,12 +436,13 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
         }
         (b'm', 0) if len >= 16 => {
             // NVKMS: NvKmsIoctlParams { cmd, size, address }.
-            if !follow(rd64(a, 8), u64::from(rd32(a, 4)), "NVKMS params") {
+            if !follow(arg, rd64(a, 8), u64::from(rd32(a, 4)), "NVKMS params") {
                 return -libc::EFAULT;
             }
         }
         (b'd', 0x41) if len >= 24 => {
             if !follow(
+                arg,
                 rd64(a, 8),
                 rd64(a, 16).min(4096),
                 "GEM import nvkms_params_ptr",
@@ -499,7 +456,7 @@ pub unsafe fn fake_ioctl(_fd: RawFd, request: u64, arg: *mut u8) -> i32 {
 }
 
 /// The pointers RM follows inside a control's parameters.
-fn control_pointers(cmd: u32, params: &mut [u8]) {
+fn control_pointers(arg: &crate::sys::block::Arg<'_>, cmd: u32, params: &[u8]) {
     let deep = abi::rmctrl::deep_control(cmd);
     for &off in abi::rmctrl::pointers(cmd).map_or(&[][..], |c| c.ptrs) {
         let p = rd64(params, off);
@@ -510,7 +467,7 @@ fn control_pointers(cmd: u32, params: &mut [u8]) {
             .and_then(|d| d.ptrs.iter().find(|r| r.ptr == off))
             .and_then(|r| r.size(params))
             .map_or(1, u64::from);
-        let _ = follow(p, len, "a pointer inside RM_CONTROL params");
+        let _ = follow(arg, p, len, "a pointer inside RM_CONTROL params");
     }
 }
 
@@ -533,11 +490,22 @@ fn tables(v: Option<DriverVersion>) -> Vec<&'static Table> {
 /// Walk `fields` of the struct at `base` (`len` bytes, already followed) as
 /// the kernel copies it: every pointer followed for its length, each element
 /// it points at walked in turn; every descriptor the kernel creates made.
-fn walk(t: &Table, base: u64, len: usize, fields: schema::Span, depth: u32, outer_size: u32) {
+fn walk(
+    arg: &mut crate::sys::block::Arg<'_>,
+    t: &Table,
+    base: u64,
+    len: usize,
+    fields: schema::Span,
+    depth: u32,
+    outer_size: u32,
+) {
     if depth > 6 || base == 0 || len == 0 {
         return;
     }
-    let s = view(base, len);
+    let Some(s) = arg.read(base, len) else {
+        return;
+    };
+    let s = &s[..];
     for f in t.fields(fields) {
         let off = f.off as usize;
         if let Some(c) = f.cond {
@@ -570,13 +538,14 @@ fn walk(t: &Table, base: u64, len: usize, fields: schema::Span, depth: u32, oute
                 if p == 0 || n == 0 {
                     continue;
                 }
-                if !follow(p, n, f.name) {
+                if !follow(arg, p, n, f.name) {
                     continue;
                 }
                 if stride > 0 && children.len > 0 {
                     let n = n.min(MAX_COPY);
                     for i in 0..n / u64::from(stride) {
                         walk(
+                            arg,
                             t,
                             p + i * u64::from(stride),
                             stride as usize,
@@ -596,19 +565,17 @@ fn walk(t: &Table, base: u64, len: usize, fields: schema::Span, depth: u32, oute
                 for i in 0..count {
                     let at = off + (i * stride) as usize;
                     if at + stride as usize <= len {
-                        walk(t, base + at as u64, stride as usize, children, depth + 1, 0);
+                        walk(arg, t, base + at as u64, stride as usize, children, depth + 1, 0);
                     }
                 }
             }
             Kind::FdOut { width } => {
-                // SAFETY: a plain syscall; the descriptor is the backend's
-                // from here, as a kernel-made one would be.
-                let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-                if fd >= 0 {
-                    match width {
-                        4 => put32(s, off, fd as u32),
-                        _ => put64(s, off, fd as u64),
-                    }
+                // A real descriptor, the backend's from here, as a
+                // kernel-made one would be.
+                if let Ok(fd) = crate::sys::fd::eventfd(libc::EFD_CLOEXEC) {
+                    let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
+                    let w = if width == 4 { 4 } else { 8 };
+                    arg.write(base + off as u64, &(fd as i64 as u64).to_le_bytes()[..w]);
                 }
             }
             _ => {}
@@ -616,8 +583,9 @@ fn walk(t: &Table, base: u64, len: usize, fields: schema::Span, depth: u32, oute
     }
 }
 
-impl crate::xfer::Sys for FakeSys {
-    fn ioctl(&self, _fd: RawFd, cmd: u32, arg: *mut u8) -> i32 {
+impl crate::sys::block::Kernel for FakeSys {
+    fn ioctl(&self, _fd: RawFd, cmd: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        let cmd = cmd as u32;
         ST.with(|s| {
             let mut s = s.borrow_mut();
             s.calls += 1;
@@ -627,7 +595,8 @@ impl crate::xfer::Sys for FakeSys {
         if size == 0 {
             return 0;
         }
-        if !follow(arg as u64, size as u64, "the IOCTL2 argument") {
+        let top = arg.addr();
+        if !follow(arg, top, size as u64, "the IOCTL2 argument") {
             return -libc::EFAULT;
         }
         if ST.with(|s| s.borrow_mut().mood()) == 0xee {
@@ -649,30 +618,30 @@ impl crate::xfer::Sys for FakeSys {
                 // NvKmsIoctlParams { cmd, size, address }: the command's own
                 // entry describes this outer struct, its one root field the
                 // pointer to the params block (Len::NvkmsParams: `size`).
-                let a = view(arg as u64, size);
-                let (ncmd, nsize) = (rd32(a, 0), rd32(a, 4));
+                let a = arg.read(top, size).expect("followed");
+                let (ncmd, nsize) = (rd32(&a, 0), rd32(&a, 4));
                 if let Some(inner) = t.lookup_nvkms(ncmd) {
                     ST.with(|s| s.borrow_mut().call = inner.name.to_string());
-                    walk(t, arg as u64, size, inner.fields, 0, nsize);
+                    walk(arg, t, top, size, inner.fields, 0, nsize);
                 } else {
-                    let _ = follow(rd64(a, 8), u64::from(nsize), "NvKmsIoctlParams.address");
+                    let _ = follow(arg, rd64(&a, 8), u64::from(nsize), "NvKmsIoctlParams.address");
                 }
             } else {
-                walk(t, arg as u64, size, e.fields, 0, 0);
+                walk(arg, t, top, size, e.fields, 0, 0);
             }
         }
         0
     }
+}
 
-    fn close(&self, fd: RawFd) {
-        // SAFETY: a descriptor xfer received from this fake kernel.
-        unsafe { libc::close(fd) };
+impl crate::xfer::Sys for FakeSys {
+    fn close(&self, fd: std::os::fd::OwnedFd) {
+        // A descriptor xfer received from this fake kernel: a real one.
+        drop(fd);
     }
 
     fn size_of(&self, fd: RawFd) -> i64 {
-        // SAFETY: plain syscall.
-        let r = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-        if r < 0 { -(libc::EBADF as i64) } else { r }
+        crate::sys::fd::size(fd).map_or(-(libc::EBADF as i64), |n| n as i64)
     }
 }
 

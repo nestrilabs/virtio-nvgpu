@@ -15,6 +15,8 @@
 //! from the source) rather than guessed from a short read, and a sink whose
 //! reader went away tells the source to stop the same way.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};

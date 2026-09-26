@@ -15,6 +15,8 @@
 //! across filesystems, which a share can still follow because the target is
 //! resolved on the host side.
 
+#![forbid(unsafe_code)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{

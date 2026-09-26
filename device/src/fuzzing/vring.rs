@@ -7,6 +7,8 @@
 //! Guest memory is two regions with a hole between them, so descriptors can
 //! point into nothing, across a region's end, or at the rings themselves.
 
+#![forbid(unsafe_code)]
+
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{Bytes as _, GuestAddress, GuestMemoryMmap};
 

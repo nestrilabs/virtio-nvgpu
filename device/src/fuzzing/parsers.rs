@@ -7,6 +7,8 @@
 //! looks -- that is checked against an independent reading of the wire
 //! format, not just that nothing panics.
 
+#![forbid(unsafe_code)]
+
 use protocol::messages::*;
 
 use super::{Bytes, backend, host};
@@ -45,13 +47,18 @@ pub fn deep_segments(b: &mut Bytes) {
     let mut block = b.take(block_len).to_vec();
     block.resize(block_len, 0);
     let deep = b.rest();
-    let before = block.clone();
-    match deepseg::Segments::relocate("fuzz", c.ptrs, &mut block, deep) {
-        Err(_) => assert_eq!(block, before, "a refused relocation changed the block"),
+    let mut a = crate::sys::block::Arena::new();
+    let Ok(blk) = a.block(&block, block_len) else {
+        return;
+    };
+    match deepseg::Segments::relocate("fuzz", c.ptrs, &mut a, blk, deep) {
+        Err(_) => assert_eq!(a.bytes(blk), &block[..], "a refused relocation changed the block"),
         Ok(segs) => {
-            // The segments as the guest laid them out, read independently.
+            // The segments as the guest laid them out, read independently,
+            // and read through the pointers as RM would (`Follow`).
             let count = rd32(deep, 0) as usize;
             let mut at = 8 + count * 8;
+            let mut expect = Vec::new();
             for i in 0..count {
                 let (ptr, len) = (
                     rd32(deep, 8 + i * 8) as usize,
@@ -63,30 +70,48 @@ pub fn deep_segments(b: &mut Bytes) {
                     .find(|r| r.ptr == ptr)
                     .expect("a pointer RM follows");
                 assert_eq!(
-                    rule.size(&block).map(|s| s as usize),
+                    rule.size(a.bytes(blk)).map(|s| s as usize),
                     Some(len),
                     "RM's size"
                 );
-                let p = rd64(&block, ptr);
-                assert!(
-                    host::follow(p, len as u64, "a relocated segment"),
-                    "a segment not mapped"
-                );
-                // SAFETY: followed just above.
-                let got = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
-                assert_eq!(got, &deep[at..at + len], "segment {i} holds other bytes");
+                expect.push((ptr, deep[at..at + len].to_vec()));
                 at += len;
             }
             assert_eq!(at, deep.len());
-            let mut back = block.clone();
-            segs.restore(&mut back);
-            assert_eq!(back, before, "restore gives the caller's block back");
+            if block_len > 0 {
+                host::reset(&[], None);
+                let follow = Follow(expect);
+                assert!(a.call(&follow, -1, 0, blk) >= 0, "a segment not mapped");
+            }
+            assert_eq!(a.reply(blk), block, "the reply gives the caller's block back");
             assert_eq!(
-                segs.reply().len(),
-                deep.len(),
-                "the reply is laid out as the request"
+                segs.reply(&a),
+                deep,
+                "the reply is laid out as the request, the host having written nothing"
             );
         }
+    }
+}
+
+/// A host that reads each relocated pointer of the block it is handed and
+/// checks the segment behind it holds the guest's bytes.
+struct Follow(Vec<(usize, Vec<u8>)>);
+
+impl crate::sys::block::Kernel for Follow {
+    fn ioctl(&self, _: std::os::fd::RawFd, _: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        for (i, (ptr, want)) in self.0.iter().enumerate() {
+            let p = rd64(arg.bytes(), *ptr);
+            assert!(
+                host::follow(arg, p, want.len() as u64, "a relocated segment"),
+                "a segment not mapped"
+            );
+            assert_eq!(
+                arg.read(p, want.len()).as_deref(),
+                Some(&want[..]),
+                "segment {i} holds other bytes"
+            );
+        }
+        0
     }
 }
 
@@ -146,11 +171,11 @@ pub fn os_descriptor(b: &mut Bytes) {
         return;
     };
     assert_eq!(pinned.addr % 4096, call.in_page());
+    assert_eq!(pinned.span.addr_at(pinned.at), Some(pinned.addr));
     for (i, gpa) in pages.iter().enumerate() {
         for off in [0u64, 4088] {
-            let at = pinned.addr - call.in_page() + i as u64 * 4096 + off;
-            // SAFETY: the mapping `map` made, `pages` pages of it.
-            let got = unsafe { (at as *const u64).read_unaligned() };
+            let at = pinned.at - call.in_page() + i as u64 * 4096 + off;
+            let got = u64::from_le_bytes(pinned.span.read(at, 8).try_into().unwrap());
             assert_eq!(
                 got,
                 host::ram_word(gpa + off),
@@ -218,37 +243,46 @@ pub fn nvkms_v1(b: &mut Bytes) {
     p.reset();
 }
 
-/// `guestptr::rm_escape` and `scrub_control`: after them, no pointer field RM
-/// follows holds a value the guest sent, and the caller's values come back.
+/// `guestptr::rm_escape` and `scrub_control`: in the host's copy they
+/// build, no pointer field RM follows holds a value the guest sent, and the
+/// caller's values come back in the reply.
 pub fn pointer_scrub(b: &mut Bytes) {
+    use crate::sys::block::Arena;
     let cmd = b.u32();
     let ctl = b.u32();
     let len = b.u16() as usize % 512;
-    let mut params = b.take(len).to_vec();
-    let original = params.clone();
-    if let Ok(restore) = guestptr::rm_escape(cmd, &mut params) {
-        let mut reply = params.clone();
-        restore.apply(&mut reply);
-        // Whatever was changed is given back.
-        assert_eq!(reply.len(), original.len());
+    let params = b.take(len).to_vec();
+    if let Ok(plan) = guestptr::rm_escape(cmd, &params) {
+        let mut a = Arena::new();
+        if let Ok(top) = a.block(&params, params.len()) {
+            if plan.declare(&mut a, top, &|_| None).is_ok() {
+                for &(off, _) in &plan.slots {
+                    assert_eq!(rd64(a.bytes(top), off), 0, "escape {cmd:#x}: {off} left for RM");
+                }
+                // Whatever was taken out is given back (nothing was
+                // written by a host).
+                assert_eq!(a.reply(top), params);
+            }
+        }
     }
-    let mut nested = b.rest().to_vec();
-    let before = nested.clone();
-    let restore = guestptr::scrub_control(ctl, &mut nested, &[]);
+    let nested = b.rest().to_vec();
+    let mut a = Arena::new();
+    let Ok(nb) = a.block(&nested, nested.len()) else {
+        return;
+    };
+    guestptr::scrub_control(ctl, &mut a, nb, &[]);
     for &off in guestptr::control_pointers(ctl) {
         if off + 8 <= nested.len() {
             assert_eq!(
-                rd64(&nested, off),
+                rd64(a.bytes(nb), off),
                 0,
                 "control {ctl:#x}: a pointer at {off} left for RM"
             );
         }
     }
-    restore.apply(&mut nested);
-    assert_eq!(nested, before, "the caller reads its own pointers back");
+    assert_eq!(a.reply(nb), nested, "the caller reads its own pointers back");
     let init_mask = b.u64();
-    let mut uvm = before.clone();
-    let _ = guestptr::uvm_gate(ctl & 1 != 0, cmd, &mut uvm, init_mask);
+    let _ = guestptr::uvm_gate(ctl & 1 != 0, cmd, &nested, init_mask);
 }
 
 /// RM's IDLE_CHANNELS with its lists as deep segments.
@@ -258,22 +292,37 @@ pub fn idle_channels(b: &mut Bytes) {
     let mut params = b.take(56).to_vec();
     params.resize(56, 0);
     let deep = b.rest();
-    if let Ok((_restore, segs)) = guestptr::idle_channels_list(cmd, &mut params, deep) {
-        let count = u64::from(rd32(&params, 12));
+    let Ok(plan) = guestptr::idle_channels_list(cmd, &params, deep) else {
+        return;
+    };
+    let mut a = crate::sys::block::Arena::new();
+    let Ok(top) = a.block(&params, 56) else {
+        return;
+    };
+    if plan.declare(&mut a, top, &|_| None).is_err() {
+        return;
+    }
+    // RM follows every non-null one for numChannels u32s: each must be a
+    // block of the call; the rest are null.
+    host::reset(&[], None);
+    assert!(a.call(&IdleLists, -1, 0, top) >= 0);
+}
+
+/// RmDeprecatedIdleChannels, as far as its three lists go.
+struct IdleLists;
+
+impl crate::sys::block::Kernel for IdleLists {
+    fn ioctl(&self, _: std::os::fd::RawFd, _: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        let a = arg.bytes().to_vec();
+        let count = u64::from(rd32(&a, 12));
         for off in [16usize, 24, 32] {
-            let p = rd64(&params, off);
-            if segs.offsets().contains(&off) {
-                assert!(
-                    host::follow(p, count * 4, "an IDLE_CHANNELS list"),
-                    "a list not mapped"
-                );
-            } else {
-                assert_eq!(
-                    p, 0,
-                    "an IDLE_CHANNELS pointer at {off} not relocated and not zeroed"
-                );
-            }
+            let p = rd64(&a, off);
+            assert!(
+                p == 0 || host::follow(arg, p, count * 4, "an IDLE_CHANNELS list"),
+                "a list not mapped"
+            );
         }
+        0
     }
 }
 

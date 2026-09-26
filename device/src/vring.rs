@@ -9,6 +9,8 @@
 //! in order and no further. Here rather than in the binary so it can be
 //! fuzzed with the rest (`fuzz/`, the `vring` target).
 
+#![forbid(unsafe_code)]
+
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 /// What a chain's descriptors add up to, before anything is read.

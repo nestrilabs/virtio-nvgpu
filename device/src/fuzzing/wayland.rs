@@ -20,8 +20,10 @@
 //! would the connection. Anything else wrong -- a panic, a descriptor still
 //! open after both ends are dropped, memory without bound -- is the finding.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
@@ -76,8 +78,7 @@ impl Platform for Plat {
         if d.a == 0 {
             return Err(std::io::ErrorKind::NotFound.into());
         }
-        // SAFETY: plain syscall.
-        Ok(unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) })
+        crate::sys::fd::eventfd(libc::EFD_CLOEXEC)
     }
 }
 

@@ -17,8 +17,10 @@
 //! transport would. After the last, the session is torn down, and every
 //! descriptor the run made must be closed.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use protocol::messages::*;
@@ -205,88 +207,56 @@ const LOW_PAGES: u64 = 64;
 const HIGH_PAGES: u64 = 64;
 const HIGH: u64 = 1 << 32;
 
-struct RamKeep(Vec<(usize, usize)>);
-impl Drop for RamKeep {
-    fn drop(&mut self) {
-        for &(p, l) in &self.0 {
-            // SAFETY: the mappings `guest_ram` made, dropped once.
-            unsafe { libc::munmap(p as *mut libc::c_void, l) };
-        }
-    }
-}
-
 /// Guest RAM as a VMM splits it: low RAM at 0 and high RAM at 4 GiB, one
 /// memfd behind both (adjacent in the file, not in guest-physical space),
 /// and a small anonymous region at 8 GiB. Every 8 bytes hold
 /// `host::ram_word` of their own guest-physical address.
 pub fn guest_ram() -> GuestRam {
-    // SAFETY: plain syscalls; the descriptor passes to the File.
-    let file = unsafe {
-        let fd = libc::memfd_create(c"fuzz-guest-ram".as_ptr(), libc::MFD_CLOEXEC);
-        assert!(fd >= 0);
-        std::fs::File::from_raw_fd(fd)
-    };
+    use crate::sys::mem::Mapping;
+    let file = std::fs::File::from(
+        crate::sys::fd::memfd(c"fuzz-guest-ram", libc::MFD_CLOEXEC).unwrap(),
+    );
     let len = ((LOW_PAGES + HIGH_PAGES) * 4096) as usize;
     file.set_len(len as u64).unwrap();
-    let map = |fd: i32, len: usize| {
-        // SAFETY: a fresh shared mapping.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                if fd < 0 {
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS
-                } else {
-                    libc::MAP_SHARED
-                },
-                fd,
-                0,
-            )
-        };
-        assert_ne!(p, libc::MAP_FAILED);
-        p as usize
-    };
-    let base = map(file.as_raw_fd(), len);
+    let base = Mapping::shared(&file, len, 0, true).unwrap();
     let anon_len = 16 * 4096;
-    let anon = map(-1, anon_len);
-    let fill = |host: usize, gpa: u64, len: usize| {
-        for i in (0..len).step_by(8) {
-            // SAFETY: inside the mapping just made.
-            unsafe { ((host + i) as *mut u64).write(host::ram_word(gpa + i as u64)) };
-        }
+    let anon = Mapping::anon(anon_len).unwrap();
+    let fill = |m: &Mapping, at: usize, gpa: u64, len: usize| {
+        let words: Vec<u8> = (0..len)
+            .step_by(8)
+            .flat_map(|i| host::ram_word(gpa + i as u64).to_le_bytes())
+            .collect();
+        m.write(at, &words);
     };
     let lo = (LOW_PAGES * 4096) as usize;
-    fill(base, 0, lo);
-    fill(base + lo, HIGH, len - lo);
-    fill(anon, 2 * HIGH, anon_len);
+    fill(&base, 0, 0, lo);
+    fill(&base, lo, HIGH, len - lo);
+    fill(&anon, 0, 2 * HIGH, anon_len);
     crate::privfd::register(file.as_raw_fd());
     let file = Arc::new(file);
+    let (bs, anons) = (base.span(), anon.span());
     GuestRam::new(
         vec![
             RamRegion {
                 gpa: 0,
                 len: lo as u64,
-                host: base as u64,
+                host: bs.sub(0, lo as u64).unwrap(),
                 file: Some((file.clone(), 0)),
             },
             RamRegion {
                 gpa: HIGH,
                 len: (len - lo) as u64,
-                host: (base + lo) as u64,
+                host: bs.sub(lo as u64, (len - lo) as u64).unwrap(),
                 file: Some((file.clone(), lo as u64)),
             },
             RamRegion {
                 gpa: 2 * HIGH,
                 len: anon_len as u64,
-                host: anon as u64,
+                host: anons,
                 file: None,
             },
         ],
-        Arc::new((
-            RamKeep(vec![(base, len), (anon, anon_len)]),
-            FileGuard(file),
-        )),
+        Arc::new((base, anon, FileGuard(file))),
     )
 }
 
@@ -300,28 +270,19 @@ impl Drop for FileGuard {
 // ───────────────────────────── the files ─────────────────────────────
 
 fn file_for(kind: HandleKind) -> OwnedFd {
-    // SAFETY: plain syscalls; each result is owned at once.
-    unsafe {
-        let fd = match kind {
-            HandleKind::Eventfd => libc::eventfd(0, libc::EFD_CLOEXEC),
-            HandleKind::Dev(DeviceKind::Ctl)
-            | HandleKind::Dev(DeviceKind::Modeset)
-            | HandleKind::Syncobj
-            | HandleKind::SyncFile => {
-                libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-            }
-            // Mappable: a GPU file, a render node, a dma-buf, a memfd.
-            _ => {
-                let fd = libc::memfd_create(c"fuzz-file".as_ptr(), libc::MFD_CLOEXEC);
-                if fd >= 0 {
-                    libc::ftruncate(fd, 1 << 20);
-                }
-                fd
-            }
-        };
-        assert!(fd >= 0, "cannot make a file for {kind:?}");
-        OwnedFd::from_raw_fd(fd)
-    }
+    use crate::sys::fd;
+    let made = match kind {
+        HandleKind::Eventfd => fd::eventfd(libc::EFD_CLOEXEC),
+        HandleKind::Dev(DeviceKind::Ctl)
+        | HandleKind::Dev(DeviceKind::Modeset)
+        | HandleKind::Syncobj
+        | HandleKind::SyncFile => fd::open(c"/dev/null", libc::O_RDWR | libc::O_CLOEXEC),
+        // Mappable: a GPU file, a render node, a dma-buf, a memfd.
+        _ => fd::memfd(c"fuzz-file", libc::MFD_CLOEXEC).inspect(|f| {
+            let _ = fd::ftruncate(f, 1 << 20);
+        }),
+    };
+    made.unwrap_or_else(|e| panic!("cannot make a file for {kind:?}: {e}"))
 }
 
 fn hello(be: &mut NvidiaBackend, caps: u32, aperture_mib: u32) {
@@ -335,10 +296,7 @@ fn hello(be: &mut NvidiaBackend, caps: u32, aperture_mib: u32) {
     for v in [MsgType::Hello as u32, 0, 0, 1] {
         msg.extend_from_slice(&v.to_le_bytes());
     }
-    // SAFETY: a plain-old-data wire struct as its bytes.
-    msg.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(&req as *const HelloReq as *const u8, size_of::<HelloReq>())
-    });
+    msg.extend_from_slice(crate::sys::pod::bytes(&req));
     let mut resp = [0u8; 256];
     be.dispatch(&msg, &mut resp);
 }

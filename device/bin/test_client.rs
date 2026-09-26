@@ -10,6 +10,8 @@
 // Usage:
 //   cargo run --bin test-client [--socket /tmp/nv-vhost.sock]
 
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use std::io::{Read, Write};
 use std::mem::size_of;
@@ -113,13 +115,135 @@ struct IoctlResp {
 // Serialisation helpers
 // ---------------------------------------------------------------------------
 
-fn as_bytes<T: Sized>(val: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(val as *const T as *const u8, size_of::<T>()) }
+/// The wire form of a message struct, written and read field by field in
+/// the order and at the widths of its `repr(C)` layout (which has no
+/// padding: every struct here is laid out in 8-byte units).
+trait Wire: Sized {
+    fn put(&self, out: &mut Vec<u8>);
+    fn get(b: &[u8]) -> Self;
 }
 
-fn from_bytes<T: Copy>(buf: &[u8], offset: usize) -> T {
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+impl Wire for MsgHeader {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.msg_type.to_le_bytes());
+        out.extend_from_slice(&self._pad.to_le_bytes());
+        out.extend_from_slice(&self.cookie.to_le_bytes());
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            msg_type: u32_at(b, 0),
+            _pad: u32_at(b, 4),
+            cookie: u64_at(b, 8),
+        }
+    }
+}
+
+impl Wire for RespHeader {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.status.to_le_bytes());
+        out.extend_from_slice(&self.errno_host.to_le_bytes());
+        out.extend_from_slice(&self.cookie.to_le_bytes());
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            status: u32_at(b, 0),
+            errno_host: u32_at(b, 4) as i32,
+            cookie: u64_at(b, 8),
+        }
+    }
+}
+
+impl Wire for OpenReq {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[self.kind, self.index]);
+        out.extend_from_slice(&self._pad);
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            kind: b[0],
+            index: b[1],
+            _pad: b[2..8].try_into().unwrap(),
+        }
+    }
+}
+
+impl Wire for OpenResp {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.guest_handle.to_le_bytes());
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            guest_handle: u64_at(b, 0),
+        }
+    }
+}
+
+impl Wire for CloseReq {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.guest_handle.to_le_bytes());
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            guest_handle: u64_at(b, 0),
+        }
+    }
+}
+
+impl Wire for IoctlReq {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.guest_handle.to_le_bytes());
+        out.extend_from_slice(&self.request.to_le_bytes());
+        out.extend_from_slice(&self.param_size.to_le_bytes());
+        out.extend_from_slice(&self._pad.to_le_bytes());
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            guest_handle: u64_at(b, 0),
+            request: u64_at(b, 8),
+            param_size: u32_at(b, 16),
+            _pad: u32_at(b, 20),
+        }
+    }
+}
+
+impl Wire for IoctlResp {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.param_size.to_le_bytes());
+        out.extend_from_slice(&self._pad.to_le_bytes());
+        out.extend_from_slice(&self.shm_offset.to_le_bytes());
+        out.extend_from_slice(&self.shm_length.to_le_bytes());
+        out.push(self.pgprot);
+        out.extend_from_slice(&self._pad2);
+    }
+    fn get(b: &[u8]) -> Self {
+        Self {
+            param_size: u32_at(b, 0),
+            _pad: u32_at(b, 4),
+            shm_offset: u64_at(b, 8),
+            shm_length: u64_at(b, 16),
+            pgprot: b[24],
+            _pad2: b[25..32].try_into().unwrap(),
+        }
+    }
+}
+
+fn as_bytes<T: Wire>(val: &T) -> Vec<u8> {
+    let mut out = Vec::new();
+    val.put(&mut out);
+    out
+}
+
+fn from_bytes<T: Wire>(buf: &[u8], offset: usize) -> T {
     assert!(buf.len() >= offset + size_of::<T>());
-    unsafe { (buf.as_ptr().add(offset) as *const T).read_unaligned() }
+    T::get(&buf[offset..])
 }
 
 // ---------------------------------------------------------------------------
@@ -147,12 +271,12 @@ fn recv_msg(stream: &mut UnixStream) -> Vec<u8> {
 
 fn build_open_ctl(cookie: u64) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(as_bytes(&MsgHeader {
+    buf.extend_from_slice(&as_bytes(&MsgHeader {
         msg_type: MsgType::Open as u32,
         _pad: 0,
         cookie,
     }));
-    buf.extend_from_slice(as_bytes(&OpenReq {
+    buf.extend_from_slice(&as_bytes(&OpenReq {
         kind: 0, // DeviceKind::Ctl
         _pad: [0; 6],
         index: 0,
@@ -162,12 +286,12 @@ fn build_open_ctl(cookie: u64) -> Vec<u8> {
 
 fn build_close(cookie: u64, guest_handle: u64) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(as_bytes(&MsgHeader {
+    buf.extend_from_slice(&as_bytes(&MsgHeader {
         msg_type: MsgType::Close as u32,
         _pad: 0,
         cookie,
     }));
-    buf.extend_from_slice(as_bytes(&CloseReq { guest_handle }));
+    buf.extend_from_slice(&as_bytes(&CloseReq { guest_handle }));
     buf
 }
 
@@ -188,12 +312,12 @@ fn build_check_version_str(cookie: u64, guest_handle: u64) -> Vec<u8> {
     let ioctl_nr: u64 = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_CHECK_VERSION_STR, param_size);
 
     let mut buf = Vec::new();
-    buf.extend_from_slice(as_bytes(&MsgHeader {
+    buf.extend_from_slice(&as_bytes(&MsgHeader {
         msg_type: MsgType::Ioctl as u32,
         _pad: 0,
         cookie,
     }));
-    buf.extend_from_slice(as_bytes(&IoctlReq {
+    buf.extend_from_slice(&as_bytes(&IoctlReq {
         guest_handle,
         request: ioctl_nr,
         param_size,

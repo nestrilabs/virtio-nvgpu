@@ -5,6 +5,8 @@
 //! and proxy every client to the host compositor. `--export NAME`: proxy the
 //! host's export socket to the guest compositor at NAME instead.
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,10 +71,7 @@ fn main() {
                 _ => e.to_string(),
             },
         )?;
-        unsafe {
-            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        }
+        nvgpu_wl_guest::sys::on_terminate(on_signal);
         let stop = d.stop_flag();
         match &cfg.export_to {
             Some(t) => eprintln!(

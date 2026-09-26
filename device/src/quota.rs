@@ -25,6 +25,8 @@
 //! that does not say which process makes a call ([`Owner::Unknown`]) is held
 //! to the per-VM caps alone, as before.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use protocol::messages::ProcId;

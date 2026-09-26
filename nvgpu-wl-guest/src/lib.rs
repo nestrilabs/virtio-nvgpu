@@ -10,6 +10,13 @@
 //! With `--export`, the other way round: host applications reach a compositor
 //! running in this guest.
 
+// Every `unsafe` of the crate is in `sys` (sys.rs); every other module
+// forbids it, and scripts/check-unsafe.sh holds the tree to that.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod channel;
 pub mod daemon;
+#[allow(unsafe_code)]
+pub mod sys;
 pub mod uapi;

@@ -40,6 +40,8 @@
 //! no table (older than the first measured, or a version that does not
 //! parse) has no fields: its UVM calls are refused whole.
 
+#![forbid(unsafe_code)]
+
 use abi::schema::{UvmFdOf, uvm_table};
 use abi::version::DriverVersion;
 

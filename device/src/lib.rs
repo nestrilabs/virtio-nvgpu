@@ -6,6 +6,11 @@
 // real host file descriptors for `/dev/nvidia*` and dispatches messages
 // received from the guest driver over virtqueues.
 
+// Every `unsafe` of the crate is in `sys` (sys/mod.rs); scripts/check-unsafe.sh
+// holds the tree to that, and each other module forbids it outright.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod closer;
 pub mod deepseg;
 pub mod error;
@@ -15,7 +20,10 @@ pub mod fence;
 mod fuzz_seeds;
 #[cfg(fuzzing)]
 pub mod fuzzing;
-pub mod guarded;
+/// The guarded buffers, where the rest of the crate has always found them.
+pub mod guarded {
+    pub use crate::sys::guarded::GuardedBuf;
+}
 pub mod guestptr;
 pub mod handle_table;
 pub mod host;
@@ -43,6 +51,8 @@ pub mod schema;
 pub mod semsurf;
 pub mod session;
 pub mod shm;
+#[allow(unsafe_code)]
+pub mod sys;
 pub mod tally;
 #[cfg(test)]
 mod testfd;

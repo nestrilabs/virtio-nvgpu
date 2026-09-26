@@ -91,6 +91,8 @@
 //! lease) is seen when the backend next asks (kms.rs, "lease ends"), as
 //! before.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -586,13 +588,16 @@ impl NvkmsPolicy {
             // host as NULL and fails there). It is IN only: what is cleared
             // here never reaches the guest's copy.
             if let Some(b) = p.pointee(1, lo.flip.ptr as usize) {
-                let heads = p.buffer_mut(b).ok_or(libc::EINVAL)?;
-                st.flip_heads(lo, &call, dev, heads)?;
+                let mut heads = p.buffer_mut(b).ok_or(libc::EINVAL)?;
+                st.flip_heads(lo, &call, dev, &mut heads)?;
             }
         }
-        let params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
-        st.check(lo, name, &call, params)?;
-        if name == "QUERY_DPY_DYNAMIC_DATA" && st.dpy_probe(lo, &call, params, Instant::now()) {
+        let mut params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
+        st.check(lo, name, &call, &mut params)?;
+        let local =
+            name == "QUERY_DPY_DYNAMIC_DATA" && st.dpy_probe(lo, &call, &mut params, Instant::now());
+        drop(params);
+        if local {
             p.answer_locally(0);
         }
         if matches!(name, "REVOKE_PERMISSIONS" | "RELEASE_OWNERSHIP") {
@@ -620,8 +625,8 @@ impl NvkmsPolicy {
             return;
         };
         if name == "ALLOC_DEVICE" && !self.keep_display_coherency.load(Ordering::Relaxed) {
-            if let Some(params) = p.buffer_mut(1) {
-                coherent_display_only(lo, params);
+            if let Some(mut params) = p.buffer_mut(1) {
+                coherent_display_only(lo, &mut params);
             }
         }
         let target = p.target();

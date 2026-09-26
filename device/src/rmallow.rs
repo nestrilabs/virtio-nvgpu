@@ -34,6 +34,8 @@
 //! what a new workload needs without breaking it; it is not a way to run
 //! one. `--permissive-abi` does not touch this gate.
 
+#![forbid(unsafe_code)]
+
 use abi::ioctl::*;
 use abi::rmallow::{self, Release};
 use abi::version::DriverVersion;

@@ -9,6 +9,8 @@
 //! reinterpreted: a format table's indices stay valid because the table is
 //! copied verbatim.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};

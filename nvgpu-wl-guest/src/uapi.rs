@@ -2,6 +2,8 @@
 //! asserted. The frame layout itself is `wlwire::frame`, which the header's
 //! frame structs mirror in turn.
 
+#![forbid(unsafe_code)]
+
 pub const UAPI_VERSION: u32 = 1;
 
 pub const CAP_WAYLAND: u32 = 1 << 0;
