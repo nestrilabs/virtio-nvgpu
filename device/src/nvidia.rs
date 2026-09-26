@@ -2098,6 +2098,21 @@ impl NvidiaBackend {
         // under the second user.
         if let Some(&id) = self.dri_maps.get(&(handle, fd_offset)) {
             if let Some(live) = self.live_maps.get_mut(&id) {
+                // No more than the placement holds. The guest maps as many
+                // bytes as it asked for from the placement's offset, so a
+                // second MMAP of the same file asking for more than the first
+                // would reach past this extent into the window's next ones --
+                // another guest process's device memory -- or into unplaced
+                // window, whose first touch stops the VM. The recorded path
+                // refuses the same (`handle_mmap`).
+                let mapped = live.length.div_ceil(4096) * 4096;
+                if size > mapped {
+                    log::warn!(
+                        "mmap on handle {handle}: {size:#x} bytes asked of a {mapped:#x}-byte \
+                         placement already made at file offset {fd_offset:#x}; refused"
+                    );
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+                }
                 live.refs += 1;
                 let (offset, length) = (live.region.offset, live.length);
                 let (pgprot, writable) = (live.region.pgprot, live.writable);
@@ -2708,6 +2723,11 @@ impl NvidiaBackend {
                     Err(errno) => {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                     }
+                }
+                // The RM client whose objects UVM would duplicate: one this
+                // VM made on the control file the call names (uvm_client_ok).
+                if let Err(errno) = self.uvm_client_ok(ireq.cmd, params) {
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
                 }
                 // Registered memory UVM would keep a duplicate of
                 // (osdesc.rs): refused, or followed.
@@ -4961,6 +4981,64 @@ impl NvidiaBackend {
         }
     }
 
+    /// The RM client a UVM command names beside its `rmCtrlFd`: `hClient`,
+    /// the word after the descriptor in REGISTER_GPU, REGISTER_GPU_VASPACE,
+    /// REGISTER_CHANNEL, MAP_EXTERNAL_ALLOCATION and ALLOC_DEVICE_P2P
+    /// (uvm_ioctl.h), with the object UVM takes from it after that.
+    ///
+    /// UVM hands that pair to RM from a kernel client of its own
+    /// (nvUvmInterfaceDupMemory, DupAddressSpace, RetainChannel), and RM's
+    /// check is the PID share policy: the source client's process must be
+    /// the *calling* one (cliresShareCallback, client_resource.c:219-226,
+    /// for a kernel destination). Natively that keeps one process's GPU
+    /// memory, VA spaces and channels out of another's UVM. Here every
+    /// client of the VM is the backend's process, so RM's check passes for
+    /// any of them, and one guest process could map another's memory into
+    /// its own UVM VA space. UVM does not look at `rmCtrlFd` yet (the "Bug
+    /// 1624521" TODOs, uvm_va_space.c:1557); the backend does what that
+    /// TODO describes: the client must be one this VM allocated on the very
+    /// control file `rmCtrlFd` names, which the guest driver translated from
+    /// the caller's own descriptor. So the caller holds the file the client
+    /// was made on -- the file RM's strict client validation keys every
+    /// other use of that client to (§11, R3). A zero client names nothing
+    /// (REGISTER_GPU without a partition sends -1 and 0), and passes.
+    fn uvm_client_ok(&self, cmd: u32, params: &[u8]) -> std::result::Result<(), i32> {
+        let Some(field) = crate::uvmfd::field(self.driver, cmd) else {
+            return Ok(());
+        };
+        if field.of != crate::uvmfd::FdOf::RmCtl {
+            return Ok(());
+        }
+        let off = field.offset as usize;
+        let rd32 = |o: usize| {
+            params
+                .get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let (Some(fd), Some(client)) = (rd32(off), rd32(off + 4)) else {
+            log::warn!("UVM command {cmd}: too short for its client at {}", off + 4);
+            return Err(libc::EINVAL);
+        };
+        if client == 0 {
+            return Ok(());
+        }
+        let issuer = self.semsurf.issuer_of(client);
+        if (fd as i32) >= 0 && issuer == Some(fd) {
+            return Ok(());
+        }
+        log::warn!(
+            "UVM command {cmd} names RM client {client:#x}, which {}; refused",
+            match issuer {
+                None => "is not this VM's".to_string(),
+                Some(h) if (fd as i32) < 0 => {
+                    format!("was made on handle {h}, and no control file is named")
+                }
+                Some(h) => format!("was made on handle {h}, not on the named handle {fd}"),
+            }
+        );
+        Err(libc::EPERM)
+    }
+
     /// The descriptor of `handle` when it is a control file
     /// (`/dev/nvidiactl`), the only kind RM's export and import controls
     /// resolve (`nv_get_file_private(fd, NV_TRUE, ..)`).
@@ -6478,6 +6556,48 @@ mod tests {
         assert_ne!(be.shm_free_bytes(), empty, "still mapped once");
         munmap(&mut be, b.mapping_id);
         assert_eq!(be.shm_free_bytes(), empty);
+    }
+
+    /// An MMAP of a file already placed, asking for more than the placement
+    /// holds, is refused: the guest maps what it asked for from the
+    /// placement's offset, so the rest would be the window's next extents --
+    /// another guest process's -- or unplaced window. The control file's
+    /// ALLOC_MEMORY mappings take this path (nothing records them).
+    #[test]
+    fn a_second_mmap_larger_than_the_placement_is_refused() {
+        let mut be = gated_backend();
+        be.set_window(Box::new(FakeWindow::default()));
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let first = mmap(&mut be, ctl, 0);
+        let ask = |be: &mut NvidiaBackend, size: u64| {
+            let mut req = hdr(MsgType::Mmap, ctl as u64);
+            append(
+                &mut req,
+                &MmapReq {
+                    size,
+                    offset: 0,
+                    prot: 3,
+                    padding: 0,
+                },
+            );
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&req, &mut resp);
+            (
+                parse_resp(&resp).status,
+                read_struct::<MmapResp>(&resp, size_of::<MsgHeader>()),
+            )
+        };
+        let (st, _) = ask(&mut be, 64 << 20);
+        assert_eq!(st, -libc::EINVAL, "past the placement");
+        // The same size, or less, is the same placement.
+        let (st, again) = ask(&mut be, 4096);
+        assert_eq!(st, 0);
+        assert_eq!(
+            (again.guest_phys_addr, again.mapping_id, again.size),
+            (first.guest_phys_addr, first.mapping_id, 4096)
+        );
+        let (st, _) = ask(&mut be, 100);
+        assert_eq!(st, 0);
     }
 
     #[test]

@@ -764,6 +764,17 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   }
 
   window_off = le64_to_cpu(resp->guest_phys_addr);
+  /* Every mapping of the object reaches up to obj->size past window_off:
+   * the placement must hold that much, or the rest is the window's next
+   * extent (another process's memory) or unplaced window. */
+  if (le64_to_cpu(resp->size) < obj->size) {
+    dev_warn(&ng->dev->vdev->dev,
+             "virtio-gpu-nv: object %u placed in %llu bytes, not its %zu\n",
+             ng->host_handle, le64_to_cpu(resp->size), obj->size);
+    nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
+    ret = -ERANGE;
+    goto out_free;
+  }
   if (window_off + obj->size > ng->dev->window.len) {
     dev_warn(&ng->dev->vdev->dev,
              "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "

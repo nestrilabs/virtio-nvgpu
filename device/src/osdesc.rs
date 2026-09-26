@@ -3012,6 +3012,68 @@ mod backend_tests {
         uvm_ioctl(vm, uvm, UVM_MAP_EXTERNAL_ALLOCATION, &p, fd_off + 12)
     }
 
+    /// UVM duplicates what REGISTER_GPU_VASPACE, REGISTER_CHANNEL,
+    /// MAP_EXTERNAL_ALLOCATION (and the rest with an `rmCtrlFd`) name from a
+    /// kernel client of its own, where RM's only check is that the source
+    /// client's process is the caller's -- the backend's, for every guest
+    /// process. So the client must be one this VM made on the control file
+    /// the call names: another guest process's client, named through the
+    /// caller's own control file, is refused before UVM sees it, and so is
+    /// a client no file of this VM made.
+    #[test]
+    fn a_uvm_command_names_only_a_client_made_on_the_control_file_it_names() {
+        const OTHER: u32 = 0xc1d0_0002;
+        let (mut vm, uvm) = vm_610();
+        let null = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let other_ctl = vm.be.adopt_for_test(null(), HandleKind::Dev(DeviceKind::Ctl));
+        vm.be.semsurf.client_allocated(other_ctl, OTHER);
+        let v = abi::version::DriverVersion::parse(DRIVER);
+        let map_off = crate::uvmfd::field(v, UVM_MAP_EXTERNAL_ALLOCATION)
+            .unwrap()
+            .offset as usize;
+        let map = |ctl: u32, client: u32| {
+            let mut p = vec![0u8; uvm_size(UVM_MAP_EXTERNAL_ALLOCATION)];
+            put64(&mut p, 0, 1 << 32);
+            put64(&mut p, 8, PAGE);
+            put32(&mut p, map_off, ctl);
+            put32(&mut p, map_off + 4, client);
+            put32(&mut p, map_off + 8, 0x5000_0009);
+            p
+        };
+        const REGISTER_GPU_VASPACE: u32 = 25;
+        let va_off = crate::uvmfd::field(v, REGISTER_GPU_VASPACE).unwrap().offset as usize;
+        let vaspace = |ctl: u32, client: u32| {
+            let mut p = vec![0u8; uvm_size(REGISTER_GPU_VASPACE)];
+            put32(&mut p, va_off, ctl);
+            put32(&mut p, va_off + 4, client);
+            put32(&mut p, va_off + 8, 0x5c00_0008);
+            p
+        };
+        seen();
+        let (ctl, map_at) = (vm.ctl, map_off + 12);
+        for (p, cmd, at) in [
+            (map(ctl, OTHER), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
+            (map(ctl, 0xc1d0_0077), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
+            (map(u32::MAX, CLIENT), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
+            (vaspace(ctl, OTHER), REGISTER_GPU_VASPACE, va_off + 12),
+            (vaspace(other_ctl, CLIENT), REGISTER_GPU_VASPACE, va_off + 12),
+        ] {
+            assert_eq!(uvm_ioctl(&mut vm, uvm, cmd, &p, at).0, -libc::EPERM, "cmd {cmd}");
+        }
+        assert_eq!(seen(), vec![], "UVM was asked");
+        // Each client through the file it was made on: UVM is asked.
+        for (p, cmd, at) in [
+            (map(ctl, CLIENT), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
+            (map(other_ctl, OTHER), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
+            (vaspace(ctl, CLIENT), REGISTER_GPU_VASPACE, va_off + 12),
+            // No client, and no control file: names nothing.
+            (vaspace(u32::MAX, 0), REGISTER_GPU_VASPACE, va_off + 12),
+        ] {
+            assert_eq!(uvm_ioctl(&mut vm, uvm, cmd, &p, at), (0, 0), "cmd {cmd}");
+        }
+        assert_eq!(seen().len(), 4);
+    }
+
     fn rm_free(vm: &mut Vm, object: u32) {
         let mut f = vec![0u8; 16];
         put32(&mut f, 0, CLIENT);

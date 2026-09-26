@@ -6,8 +6,8 @@ work, and what is still open.
 This is the security review of branch `display-passthrough` at `ae182ab`
 against `dev` at `50ff74a` (called **dev** below), brought up to date by the
 audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
-the fuzzing of branch `fuzz` (§13), and the memory-safety structure of
-branch `dind` (§14). It is written for the project's owner. The
+the fuzzing of branch `fuzz` (§13), the memory-safety structure of
+branch `dind` (§14), and the review of `dind` for memory passing (§15). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -1381,3 +1381,43 @@ take numbers: a wrong one is EBADF or another of the backend's own files,
 never memory outside the buffers passed. The guest module, which is C, is
 unchanged; §14 is the host's.
 
+---
+
+## 15. Memory passing: the review of `dind`
+
+An adversarial review of `dind` (at `69c3abc`) for how memory moves between
+the guest, the backend, the VMM, the host kernel and other VMs, against the
+product's requirement: no app less protected from another, no VM less
+protected from another, than natively. Read from source; the fixes are
+unit-tested and the guest module builds clean; none of it has run on a GPU.
+
+| id | sev | lens | finding | status |
+|---|---|---|---|---|
+| M1 | high | app vs app | A second MMAP of a file the backend had placed without a record (the control file's ALLOC_MEMORY mappings, and every DRM object) got the first placement back whatever size it asked for, and the guest driver mapped the size it asked for from the placement's offset: an app could map past its own extent into the window's next ones -- other apps' device memory -- or into unplaced window, which stops the VM on the first touch | fixed: the backend refuses a request larger than the placement (`map_unrecorded`), and the guest driver refuses a vma, or a GEM object, larger than the placement the reply names (`nvgpu_mmap`, `nvgpu_gem_place_in_window`) |
+| M2 | high | app vs app (`--allow-compute`) | UVM's REGISTER_GPU_VASPACE, REGISTER_CHANNEL, MAP_EXTERNAL_ALLOCATION and ALLOC_DEVICE_P2P name an RM client and object that UVM duplicates from a kernel client of its own; RM's check there is that the source client's process is the caller's (cliresShareCallback, PID policy), which every client of the VM passes, since all are the backend's. Any guest process could map another's GPU memory into its own UVM VA space, or register another's VA space or channel. Not cross-VM: another VM's clients are another process's | fixed: the client must be one this VM allocated on the control file `rmCtrlFd` names (what UVM's "Bug 1624521" TODO describes), so the caller holds the file the client was made on; a zero client passes |
+
+What the review found holding, for the questions it was asked:
+
+- **Guest RAM** is read once, from the chain copied out of the ring before
+  anything is parsed (`vring.rs`); nothing parses guest RAM in place.
+  Replies go only into the writable descriptors the guest posted.
+- **Host blocks** are guarded mappings of their own with a readable slack
+  page and a guard page, so a host write past a block faults (EFAULT) rather
+  than landing on other backend memory; every pointer the tables name holds
+  0 or an address the arena owns. What the tables miss still reaches the
+  host as the guest's bytes (§14): the fuzzers' fake host follows the same
+  tables, so it tests the arena, not the tables.
+- **The window** holds only descriptors of this VM's handle table, placed
+  by the VMM inside its reservation; withdrawn ranges become PROT_NONE
+  anonymous memory in the VMM, whose touch stops only this VM. A guest vma
+  keeps its placement until its last vma (splits, forks, mremap) closes.
+- **Registered memory and the UVM aperture** reach only this VM's guest RAM
+  and this VM's UVM pools in the VMM's own address space; a holder missed in
+  the release list (§9, item 11) exposes guest pages, never the host's.
+- **Across VMs**, each VM has its own backend and VMM process; the host
+  kernel's shared namespaces (RM clients, framebuffer ids, GEM names) are
+  held to the VM by RM's per-file client validation (§11, R3), the
+  framebuffer rule (S-6), refusing FLINK and GEM_OPEN, and the PID policy
+  above. A uid per VM (§4) keeps one VM's processes from another's by the
+  kernel's own rules, but it does nothing for a bug in the host kernel or
+  the NVIDIA driver, which every uid reaches.
