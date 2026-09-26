@@ -224,11 +224,17 @@ impl RmAllow {
             }
             What::VidHeap(f) => format!("VID_HEAP_CONTROL function {f}"),
         };
-        let why = match refusal {
-            Refusal::Status { status, .. } if status == NV_ERR_INVALID_PARAM_STRUCT => {
-                "sent with a parameter size RM does not take"
+        let why = match (refusal, what) {
+            (Refusal::Status { status, .. }, What::Control(cmd))
+                if status == NV_ERR_INVALID_PARAM_STRUCT =>
+            {
+                // Both sizes: which caller sends what is the question a
+                // size refusal raises.
+                let sent_size = rd32(top_block, rmallow::NVOS54_PARAMS_SIZE).unwrap_or(0);
+                let want = self.release.control(cmd).and_then(|e| e.size).unwrap_or(0);
+                format!("sent with a parameter size RM does not take ({sent_size} bytes; RM takes {want})")
             }
-            _ => "not in the allowlist",
+            _ => "not in the allowlist".to_string(),
         };
         match self.mode {
             Mode::Enforce => {

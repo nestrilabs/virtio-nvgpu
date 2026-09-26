@@ -164,6 +164,36 @@ GSS_LEGACY_PRIVILEGED = 0xC000
 # GSP-RM as it is (binary_api.c, binapiControl), with no table lookup.
 BINAPI_CLASS = 0x2081
 
+# GSS legacy controls held to the parameter size NVIDIA's own userspace was
+# seen sending, per release it was measured on: RM's CPU side takes any size
+# for them (RmGssLegacyRpcCmd copies paramsSize bytes and forwards them to
+# GSP-RM), so without this a guest could hand GSP-RM a block of any length.
+# Measured with an LD_PRELOAD ioctl logger around the native runs that use
+# them (TESTING-RIG.md, "Application pass"); every block was all zeros in, and
+# out held clock rates or zeros -- no pointer, descriptor or process id.
+# Their ranges are NVIDIA's own NV2080_CTRL_*_LEGACY_NON_PRIVILEGED (0x81 GPU,
+# 0x90 CLK, 0xa0 PERF; ctrl2080base.h).
+GSS_LEGACY_SIZES = {
+    "595.99.02": {
+        # NVENC session setup (libnvidia-encode, through Vulkan Video's
+        # encoders and through CUDA): 0x8165 (1 byte) then 0x8163 (4) at
+        # open, 0x8164 (4) at close. Three concurrent sessions each sent and
+        # got 0: the value is no GPU-wide session id one client could name
+        # for another's session; RM keys the session by the calling client.
+        0x20808163: 4,
+        0x20808164: 4,
+        0x20808165: 1,
+        # CUDA runtime initialisation (cudart's cudaGetDeviceCount and every
+        # first CUDA runtime call; also OpenCL): the clock domains (CLK,
+        # 8 bytes, out a domain mask) and the current clocks (PERF: 532
+        # bytes, out the GPU and memory clocks in kHz; 4 bytes, zeros).
+        # Refused, cudart fails with "initialization error".
+        0x20809001: 8,
+        0x2080a026: 532,
+        0x2080a084: 4,
+    },
+}
+
 
 # --------------------------------------------------------------------------
 # The judgement half.
@@ -1037,7 +1067,8 @@ def apply_policy(rel, observed):
         elif cmd & GSS_LEGACY_MASK:
             if cmd & GSS_LEGACY_PRIVILEGED == GSS_LEGACY_PRIVILEGED:
                 raise ExtractError(f"observed {cmd:#010x} is a privileged GSS legacy control")
-            allow[cmd] = {"name": f"GSS_LEGACY_{cmd:#010x}", "size": None}
+            allow[cmd] = {"name": f"GSS_LEGACY_{cmd:#010x}",
+                          "size": GSS_LEGACY_SIZES.get(rel["version"], {}).get(cmd)}
         # else: a control this release does not have (it came later).
     # An observed call RM serves an unprivileged caller in this release
     # must be allowed: one refused here would be a policy bug.

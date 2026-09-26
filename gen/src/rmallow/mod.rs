@@ -127,11 +127,34 @@ mod tests {
             .collect()
     }
 
+    /// The GSS legacy controls the application pass measured (NVENC
+    /// session setup, the CUDA runtime's clock queries) are held to the size
+    /// NVIDIA's userspace sends on the release measured, since RM's CPU side
+    /// forwards any size to GSP-RM; the older GSS entries have none.
+    #[test]
+    fn measured_gss_legacy_controls_carry_their_size() {
+        let (r, exact) = release_for(DriverVersion::new(595, 99, 2));
+        assert!(exact);
+        for (cmd, size) in [
+            (0x2080_8163, 4),
+            (0x2080_8164, 4),
+            (0x2080_8165, 1),
+            (0x2080_9001, 8),
+            (0x2080_a026, 532),
+            (0x2080_a084, 4),
+        ] {
+            assert_eq!(r.control(cmd).map(|c| c.size), Some(Some(size)), "{cmd:#010x}");
+        }
+        // Seen used and left refused: works without it (TESTING-RIG.md).
+        assert!(r.control(0x2080_a028).is_none());
+        assert_eq!(r.control(0x2080_8159).map(|c| c.size), Some(None));
+    }
+
     #[test]
     fn every_observed_control_and_class_is_allowed_in_every_release() {
         let controls = observed("controls ");
         let classes = observed("classes ");
-        assert_eq!(controls.len(), 156);
+        assert_eq!(controls.len(), 162);
         assert_eq!(classes.len(), 33);
         for r in RELEASES {
             // What a release lacks, or refuses an unprivileged caller itself
