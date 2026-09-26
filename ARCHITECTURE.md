@@ -1021,7 +1021,10 @@ on a `SOCK_SEQPACKET` socket, with the planes' dma-bufs as `SCM_RIGHTS`. It
 keeps only this GPU's own nvidia-drm memory: the dma-buf is imported into a
 render file the backend holds, and nvidia-drm hands one of its own buffers
 back as the very object it exported, NVKMS memory, while a buffer of any
-other device becomes a dma-buf object, which is refused. The layout the
+other device becomes a dma-buf object, which is refused -- or, from another
+NVIDIA device, a duplicate NVKMS object of this one, which the backend
+tells from the object itself by exporting it back: only the helper's own
+object exports as the helper's own dma-buf. The layout the
 helper describes must fit the object. Ids and bytes are bounded per VM,
 and a helper's hangup releases everything it injected. SECURITY.md §18 has
 every check and bound.
@@ -1030,8 +1033,10 @@ every check and bound.
 file's render handle; the backend imports the object into that file's host
 render file -- the same object, so the guest file now holds a GEM handle of
 the helper's buffer -- and the guest module makes a proxy of it and a
-dma-buf, exactly as for a host client's buffer in export mode (§14). From
-there it is any guest dma-buf: EGL and Vulkan import it with its modifier
+dma-buf, exactly as for a host client's buffer in export mode (§14). No
+host path exports it again -- not to the host compositor, not into a KMS
+file -- since the helper's buffer is the guest's to read, not to show the
+host. From there it is any guest dma-buf: EGL and Vulkan import it with its modifier
 as they would natively (NVIDIA's userspace turns it into an RM handle of
 its own on the host), which needs **no window space** at all. Only a CPU
 mapping places it in the window (§5), and every placement of an injected

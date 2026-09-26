@@ -982,7 +982,9 @@ INJECT_SOCK=
 if [ "$INJECT" = 1 ]; then
     [ $PRIV = user ] || die "--inject: unprivileged runs only (the helper would be another user's)"
     INJECT_SOCK=$RUN/inject.sock
-    BACKEND_ARGS+=(--inject-socket "$INJECT_SOCK" --inject-uid "$BACKEND_UID")
+    # The rig is one user for everything, so the helper is the backend's own
+    # uid, which the backend accepts only as a diagnostic.
+    BACKEND_ARGS+=(--inject-socket "$INJECT_SOCK" --inject-uid "$BACKEND_UID" --allow-inject-self)
 fi
 
 # ── The disk ─────────────────────────────────────────────────────────────────
@@ -1157,7 +1159,7 @@ for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
     case $diag_prev/$a in
         */--diagnostic) break ;;
         */--allow-root-unsafe | */--proc-nvidia | */--proc-nvidia=* | */--permissive-abi | \
-            */--keep-guest-coherency | */--allow-unmeasured-release | \
+            */--keep-guest-coherency | */--allow-unmeasured-release | */--allow-inject-self | \
             */--rm-allowlist=log | --rm-allowlist/log | \
             */--sandbox=off | */--sandbox=best-effort | --sandbox/off | --sandbox/best-effort)
             BACKEND_ARGS+=(--diagnostic)

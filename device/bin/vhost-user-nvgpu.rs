@@ -95,8 +95,9 @@ struct Args {
     /// in effect is announced on stderr and in the log at every start:
     /// `--allow-root-unsafe`, `--proc-nvidia`, `--permissive-abi`,
     /// `--keep-guest-coherency`, `--rm-allowlist=log`,
-    /// `--sandbox=best-effort`, `--sandbox=off` and
-    /// `--allow-unmeasured-release` (see each with `--diagnostic --help`).
+    /// `--sandbox=best-effort`, `--sandbox=off`,
+    /// `--allow-unmeasured-release` and `--allow-inject-self` (see each with
+    /// `--diagnostic --help`).
     #[arg(long)]
     diagnostic: bool,
 
@@ -246,6 +247,12 @@ struct Args {
     /// (SO_PEERCRED): the VM's capture helper, a user of its own.
     #[arg(long, value_name = "UID", requires = "inject_socket")]
     inject_uid: Option<u32>,
+
+    /// Let `--inject-uid` be the backend's own uid: every process of the
+    /// backend's user may then inject into this VM, which is how the rig
+    /// runs (one user for everything), never a deployment. Diagnostic.
+    #[arg(long, hide = true, requires = "inject_uid")]
+    allow_inject_self: bool,
 
     /// Wayland channels one VM may have open at once (guest clients, or
     /// accepted host clients in export mode). Each is a client of the host
@@ -1221,6 +1228,13 @@ fn diagnostic_flags(args: &Args) -> Vec<(&'static str, &'static str)> {
              sandbox opens that tree instead",
         ));
     }
+    if args.allow_inject_self {
+        v.push((
+            "--allow-inject-self",
+            "--inject-uid may be the backend's own uid, so every process of that user may \
+             inject buffers into this VM",
+        ));
+    }
     if args.permissive_abi {
         v.push((
             "--permissive-abi",
@@ -1263,6 +1277,23 @@ fn diagnostic_flags(args: &Args) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
+/// The capture helper is a user of its own: not root, which is every user,
+/// and not the backend's own uid, which is every process of the VM's backend
+/// user (in the Wayland modes, the desktop's) -- unless the diagnostic
+/// `--allow-inject-self` says this is a test rig of one user.
+fn inject_uid_ok(uid: u32, own: u32, allow_self: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        uid != 0,
+        "refusing to start: --inject-uid 0; give the capture helper a user of its own"
+    );
+    anyhow::ensure!(
+        uid != own || allow_self,
+        "refusing to start: --inject-uid {uid} is the backend's own uid; give the capture \
+         helper a user of its own (--allow-inject-self --diagnostic is for a test rig)"
+    );
+    Ok(())
+}
+
 fn check_diagnostic(args: &Args, env: bool) -> anyhow::Result<Vec<String>> {
     let flags = diagnostic_flags(args);
     if flags.is_empty() {
@@ -1415,12 +1446,7 @@ fn main() -> anyhow::Result<()> {
     // make a socket in. Its threads start after the sandbox.
     let inject = match (&args.inject_socket, args.inject_uid) {
         (Some(p), Some(uid)) => {
-            if uid == 0 {
-                log::warn!(
-                    "--inject-uid 0: root's processes may inject; give the capture helper a \
-                     user of its own"
-                );
-            }
+            inject_uid_ok(uid, device::sys::proc::uid(), args.allow_inject_self)?;
             let registry = Arc::new(device::inject::Registry::new(Arc::new(
                 device::inject::SysInjectHost::for_this_host(),
             )));
@@ -1731,6 +1757,13 @@ mod tests {
             &["--sandbox=best-effort"],
             &["--sandbox=off"],
             &["--allow-unmeasured-release"],
+            &[
+                "--inject-socket",
+                "/x",
+                "--inject-uid",
+                "5",
+                "--allow-inject-self",
+            ],
         ] {
             let e = check_diagnostic(&args(flag), false)
                 .unwrap_err()
@@ -1751,6 +1784,17 @@ mod tests {
         );
     }
 
+    /// The capture helper's uid is neither root nor the backend's own, but
+    /// for a rig that says so.
+    #[test]
+    fn the_inject_uid_is_a_user_of_its_own() {
+        assert!(inject_uid_ok(950, 1000, false).is_ok());
+        assert!(inject_uid_ok(0, 1000, false).is_err());
+        assert!(inject_uid_ok(0, 1000, true).is_err());
+        assert!(inject_uid_ok(1000, 1000, false).is_err());
+        assert!(inject_uid_ok(1000, 1000, true).is_ok());
+    }
+
     /// `--help` shows none of them unless asked with --diagnostic.
     #[test]
     fn the_diagnostic_flags_are_hidden_from_help() {
@@ -1762,6 +1806,7 @@ mod tests {
             "--permissive-abi",
             "--keep-guest-coherency",
             "--allow-unmeasured-release",
+            "--allow-inject-self",
         ] {
             // Named in --diagnostic's own text, never as an option line.
             assert!(

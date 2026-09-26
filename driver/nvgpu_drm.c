@@ -1239,18 +1239,19 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
  * not the caller's to close either. Wait (nvgpu_gem_wait_gone()) and import
  * again, which gives a handle that is really the caller's.
  */
-int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           u32 obj_type, int o_flags) {
+struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
+                                           u32 host_gem, u64 size,
+                                           u32 obj_type, int o_flags) {
   struct nvgpu_fd *nfd = nvgpu_drm_file_nfd(drm_filp);
   struct drm_gem_object *obj = NULL;
   struct nvgpu_gem_object *ng;
   struct drm_file *file;
   struct dma_buf *buf;
-  int fd, ret, tries;
+  int ret, tries;
   u32 handle;
 
   if (!nfd)
-    return -EBADF;
+    return ERR_PTR(-EBADF);
   file = drm_filp->private_data;
 
   /*
@@ -1267,26 +1268,36 @@ int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
     if (!IS_ERR(ng))
       obj = &ng->base;
     else if (PTR_ERR(ng) != -EEXIST)
-      return PTR_ERR(ng);
+      return ERR_CAST(ng);
   }
   if (!obj)
-    return -EBUSY; /* host_gem is the proxy's that keeps winning the race */
+    return ERR_PTR(-EBUSY); /* host_gem is the proxy's that keeps winning */
   if (obj->dev != file->minor->dev) {
     /* Proxies of a file's objects are made in that file's device; one that
      * is not cannot get a handle here, and a second proxy would double-own
      * the host handle. Should never happen: refuse rather than guess. */
     drm_gem_object_put(obj);
-    return -EINVAL;
+    return ERR_PTR(-EINVAL);
   }
   ret = drm_gem_handle_create(file, obj, &handle);
   /* The handle's reference, or none: a proxy made here and never handled is
    * freed now, which closes the host handle. */
   drm_gem_object_put(obj);
   if (ret)
-    return ret;
+    return ERR_PTR(ret);
   buf = drm_gem_prime_handle_to_dmabuf(file->minor->dev, file, handle,
                                        o_flags & (O_CLOEXEC | O_RDWR));
   drm_gem_handle_delete(file, handle);
+  return buf;
+}
+
+/* nvgpu_dmabuf_from_host_buf(), installed as a descriptor. */
+int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
+                           u32 obj_type, int o_flags) {
+  struct dma_buf *buf = nvgpu_dmabuf_from_host_buf(drm_filp, host_gem, size,
+                                                   obj_type, o_flags);
+  int fd;
+
   if (IS_ERR(buf))
     return PTR_ERR(buf);
   fd = dma_buf_fd(buf, o_flags & O_CLOEXEC);

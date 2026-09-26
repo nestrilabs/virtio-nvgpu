@@ -2231,12 +2231,19 @@ against a fake nvidia-drm, and the `inject` fuzz target):
   with its errno.
 - Each plane's descriptor is a dma-buf (`fstatfs`'s magic, not the link
   text a same-uid FUSE file could imitate: §17 #13).
-- It imports (PRIME_FD_TO_HANDLE) into a render file of this GPU the backend
-  opens for the purpose, and GEM_IDENTIFY_OBJECT there says **NVKMS**:
-  nvidia-drm hands a dma-buf of its own device back as the object it
-  exported, and imports any other -- an iGPU's, a udmabuf, a camera's --
-  as a dma-buf object, which is refused (ENODEV). Only this GPU's
-  nvidia-drm memory is injected.
+- It imports (PRIME_FD_TO_HANDLE) into a render file of this GPU list the
+  backend opens for the purpose, GEM_IDENTIFY_OBJECT there says **NVKMS**,
+  and the import is a **self-import**: exported back from the backend's
+  file (PRIME_HANDLE_TO_FD) it is the helper's very dma-buf, the same file
+  (`fstat`'s device and inode). nvidia-drm imports any other device's
+  buffer -- an iGPU's, a udmabuf, a camera's -- as a dma-buf object, which
+  IDENTIFY names; but it imports another NVIDIA device's buffer by
+  duplicating it into an NVKMS object of its own device
+  (`nv_drm_gem_prime_import` -> prime_dup -> `dupMemory`), which IDENTIFY
+  calls NVKMS too, and only the self-import proof tells them apart. Each
+  render node is tried; the buffer is the node whose import is itself, or
+  it is refused (ENODEV). Only a GPU's own nvidia-drm memory is injected,
+  and only into guest files of that GPU.
 - Every plane is the same object (the guest gets one dma-buf and the planes'
   offsets into it); the format is one of thirteen capture formats with its
   plane count; width and height are 1..16384; the modifier is not INVALID;
@@ -2251,7 +2258,10 @@ against a fake nvidia-drm, and the `inject` fuzz target):
 16 syncobj ids, 4 helper connections (a thread each), a 4-connection
 backlog; guest opens, one per (render file, object), 1024 and a quarter
 per guest process (`quota::Share::quarter`). Refusals log through the
-per-site rate limit. What the bounds do not count: an object a guest keeps
+per-site rate limit. INJECT_OPEN checks the caller's share before it
+imports anything, and on any later failure closes nothing: an import that
+finds the object already in the file hands back the handle the file had,
+whatever made it, which is not the backend's to close. What the bounds do not count: an object a guest keeps
 open after the helper released it. That is memory the helper allocated,
 held by at most 1024 guest opens, and a guest can allocate GPU memory of
 its own without any of this (§4, "not capped").
@@ -2265,7 +2275,11 @@ several guest users, may open the node, and a buffer opens only for the
 one told its 128-bit token, compared in constant time; a wrong token and a
 missing id are the same ENOENT, and a released id's token opens nothing
 again (each IMPORT draws a new one from `getrandom`). No guest message
-lists, enumerates or makes an id.
+lists, enumerates or makes an id. A token is a secret only while nobody
+else can read it: it must never be on a command line or the kernel's
+(readable by every user), in a log or in a world-readable file (DEPLOY.md;
+the rig's test puts it on the guest's kernel command line, for want of
+vsock, and is no model).
 
 ### What a guest can do with a buffer
 
@@ -2299,6 +2313,23 @@ stream's buffers, which only it, its daemon, the helper and the compositor
 filling them see; the compositor overwrites them each frame, nothing on the
 host reads them, and they are no host scanout surface. Natively, a
 PipeWire consumer of the same stream can do the same.
+
+**Not hand it on.** No export of an injected object leaves the backend:
+HOST_OP PRIME_EXPORT of a handle INJECT_OPEN made is refused (EINVAL)
+before the host is asked, and so is any export whose dma-buf is an injected
+object's, from any handle and any path -- PRIME_EXPORT, a Wayland buffer
+for the host compositor, an IOCTL2 re-home into a KMS file for a
+framebuffer -- recognised by its identity: an export of the object from any
+file is the helper's own dma-buf (nvidia-drm keeps the object's
+`dma_buf`), which the backend holds, and keeps open while an id or a guest
+open does (`inject::Taint`). Otherwise a guest could send the portal's
+buffer to the host compositor as its own window, scan it out on a leased
+output, or make host dma-buf handles of it outside the open's bounds.
+Inside the guest nothing changes: the guest's dma-buf is its own proxy's,
+shared between guest processes without the host. Not covered: an object a
+guest still holds through a handle no open recorded (a GETFB of a
+framebuffer made from it) after its id and every open are gone -- by then
+the export makes a new dma-buf of an object the helper has let go.
 
 **Nothing else.** INJECT_OPEN's host calls on the guest's render file are
 calls the guest can already cause there -- a PRIME import (the self-import
@@ -2352,7 +2383,11 @@ memory it allocated itself; make the backend import other devices'
 dma-bufs it holds (refused after the import, which attaches the buffer to
 its exporter for a moment); keep its four connections and threads.
 
-**Could not:** reach another VM (another backend, another uid); make the
+**Could not:** be root or the backend's own uid (the backend refuses
+either as `--inject-uid`, the latter but for the diagnostic
+`--allow-inject-self` a one-user rig needs; the NixOS module also refuses
+the VM's backend and VMM uids where they are fixed, and one helper uid for
+two VMs); reach another VM (another backend, another uid); make the
 backend open, map or write anything (it imports, identifies, sizes and
 keeps descriptors it was given; nothing is mapped into the backend); reach
 guest memory, the window or the virtqueue; stall the VM: its imports hold
@@ -2402,6 +2437,10 @@ whole and in order, the host's announce-to-release round trip 55 us
 (nesbox) and 45 us (crosvm) at the median. A GPU-only import costs the
 shared window nothing (no placement is made); a CPU mapping of a 1440p
 buffer places 15 MiB, read-only.
+
+**The guest module** reserves the dma-buf's descriptor number before it
+builds anything and installs it only after the reply is copied out, so a
+failed copy-out takes back only what the call made.
 
 **Open:** the helper and the guest daemon are the integrator's, and so is
 how the helper proves consent; buffers whose planes are separate objects

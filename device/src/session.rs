@@ -786,7 +786,19 @@ impl NvidiaBackend {
                     );
                     return Err(libc::EINVAL);
                 }
+                // An injected capture buffer stays the guest's to read: its
+                // dma-buf is the helper's, and exported it would bypass the
+                // open's bounds and read-only tracking, and could go to the
+                // host compositor (SECURITY.md §18).
+                if !self.inject.exportable_handle(file, gem) {
+                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
+                    return Err(libc::EINVAL);
+                }
                 let dmabuf = hostfd::prime_export(self.raw(file)?, gem).map_err(io)?;
+                if !crate::inject::exportable(&self.inject_taint, dmabuf.as_fd()) {
+                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
+                    return Err(libc::EINVAL);
+                }
                 let size = hostfd::dmabuf_size(dmabuf.as_raw_fd()).unwrap_or(0);
                 let h = self.insert(dmabuf, HandleKind::Dmabuf)?;
                 Ok((vec![h as u64, size], vec![h]))

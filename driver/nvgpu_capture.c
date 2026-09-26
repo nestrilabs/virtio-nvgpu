@@ -90,12 +90,15 @@ static void nvgpu_capture_dev_free(struct kref *ref) {
 
 /*
  * INJECT_OPEN on @nfd's render handle, then a proxy and a read-only dma-buf
- * in @rf. Fills @a's outputs; returns the new descriptor or -errno.
+ * in @rf. Fills @a's outputs; returns the dma-buf (not yet a descriptor) or
+ * an ERR_PTR.
  */
-static int nvgpu_capture_do_open(struct nvgpu_device *dev, struct file *rf,
-                                 struct nvgpu_fd *nfd,
-                                 struct nvgpu_capture_open *a) {
+static struct dma_buf *nvgpu_capture_do_open(struct nvgpu_device *dev,
+                                             struct file *rf,
+                                             struct nvgpu_fd *nfd,
+                                             struct nvgpu_capture_open *a) {
   struct nvgpu_inject_info info;
+  struct dma_buf *buf;
   u64 args[4], res[3];
   u32 gem, tail, i;
   int ret;
@@ -109,10 +112,10 @@ again:
   ret = nvgpu_host_op_tail(dev, NVGPU_OP_INJECT_OPEN, args, 4, res, 3, &info,
                            sizeof(info), &tail);
   if (ret < 0)
-    return ret;
+    return ERR_PTR(ret);
   /* A GEM handle is a non-zero u32 (none can be closed that is not). */
   if (!res[0] || res[0] > U32_MAX)
-    return -EPROTO;
+    return ERR_PTR(-EPROTO);
   gem = (u32)res[0];
   /*
    * The rest checked before anything is made of it: a size a proxy can
@@ -126,7 +129,7 @@ again:
       le32_to_cpu(info.nplanes) > NVGPU_CAPTURE_MAX_PLANES) {
     if (!xa_load(&nfd->gem_index, gem))
       nvgpu_gem_close(dev, nfd->handle, gem);
-    return -EPROTO;
+    return ERR_PTR(-EPROTO);
   }
   /*
    * Owns the host GEM handle from here: closed on failure, or left to the
@@ -134,17 +137,18 @@ again:
    * read-only, so no process can map it writable (the backend's read-only
    * placement refuses what does get through, nvgpu_drm.c).
    */
-  ret = nvgpu_dmabuf_from_host(rf, gem, res[1], NVGPU_GEM_OBJECT_NVKMS,
-                               O_CLOEXEC);
+  buf = nvgpu_dmabuf_from_host_buf(rf, gem, res[1], NVGPU_GEM_OBJECT_NVKMS,
+                                   O_CLOEXEC);
   /* A proxy of the same handle on its way out: wait it out and import
    * again (as nvgpu_wl_import()). */
-  if (ret == -EAGAIN) {
+  if (buf == ERR_PTR(-EAGAIN)) {
     ret = nvgpu_gem_wait_gone(nfd, gem);
     if (!ret)
       goto again;
+    return ERR_PTR(ret);
   }
-  if (ret < 0)
-    return ret;
+  if (IS_ERR(buf))
+    return buf;
 
   a->width = le32_to_cpu(info.width);
   a->height = le32_to_cpu(info.height);
@@ -158,7 +162,7 @@ again:
   a->buf_flags = le32_to_cpu(info.flags) & NVGPU_CAPTURE_F_Y_INVERT;
   a->pad = 0;
   a->size = PAGE_ALIGN(res[1]);
-  return ret;
+  return buf;
 }
 
 static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
@@ -166,6 +170,7 @@ static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
   struct nvgpu_device *dev = cd->dev;
   struct nvgpu_capture_open a;
   struct nvgpu_fd *nfd;
+  struct dma_buf *buf;
   struct file *rf;
   int fd;
 
@@ -185,19 +190,33 @@ static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
       fput(rf);
     return -EBADF;
   }
-  fd = nvgpu_capture_do_open(dev, rf, nfd, &a);
-  fput(rf);
+  /*
+   * The number first, installed last: until fd_install() nothing else in
+   * the process can see or close it, so a failed copy-out takes back only
+   * what this call made (a close_fd() after installing could close a file
+   * another thread had put there meanwhile).
+   */
+  fd = get_unused_fd_flags(O_CLOEXEC);
   if (fd < 0) {
-    dev_dbg_ratelimited(&dev->vdev->dev,
-                        "virtio-gpu-nv: capture: id %u not opened: %d\n",
-                        a.id, fd);
+    fput(rf);
     return fd;
+  }
+  buf = nvgpu_capture_do_open(dev, rf, nfd, &a);
+  fput(rf);
+  if (IS_ERR(buf)) {
+    put_unused_fd(fd);
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: capture: id %u not opened: %ld\n",
+                        a.id, PTR_ERR(buf));
+    return PTR_ERR(buf);
   }
   a.dmabuf_fd = fd;
   if (copy_to_user(uarg, &a, sizeof(a))) {
-    close_fd(fd);
+    put_unused_fd(fd);
+    dma_buf_put(buf);
     return -EFAULT;
   }
+  fd_install(fd, buf->file);
   return 0;
 }
 

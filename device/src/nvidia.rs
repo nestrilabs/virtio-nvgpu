@@ -615,6 +615,9 @@ pub struct NvidiaBackend {
     /// Host buffers a capture helper injected (`--inject-socket`), and the
     /// handles INJECT_OPEN made of them (inject.rs).
     pub(crate) inject: crate::inject::BackendInject,
+    /// The injected objects' dma-bufs, which no export may hand out
+    /// (inject.rs, `Taint`); shared with the IOCTL2 hooks.
+    pub(crate) inject_taint: crate::inject::SharedTaint,
 }
 
 /// A fake host driver for tests: what the forwarding paths hand the host,
@@ -1054,6 +1057,7 @@ impl NvidiaBackend {
     pub fn new(cfg: ZoneConfig) -> Self {
         let nvkms = Arc::new(NvkmsPolicy::new());
         let semsurf = Arc::new(SemsurfPolicy::new());
+        let inject_taint = crate::inject::SharedTaint::default();
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
@@ -1088,7 +1092,9 @@ impl NvidiaBackend {
             kms_states: std::collections::HashMap::new(),
             vm_kms: Arc::default(),
             syncobj_regs: crate::fence::Registrations::default(),
-            hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone()),
+            hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone())
+                .with_inject_taint(inject_taint.clone()),
+            inject_taint,
             nvkms,
             semsurf,
             xfer_sys: Arc::new(crate::xfer::HostSys),

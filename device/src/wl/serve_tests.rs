@@ -303,7 +303,10 @@ fn a_dmabuf_is_exported_only_on_a_render_handle_of_the_session() {
         .unwrap();
     let null = crate::sys::fd::open(c"/dev/null", libc::O_RDWR | libc::O_CLOEXEC).unwrap();
     let render = t.insert(null, HandleKind::DriRender(0)).unwrap();
-    let mut ops = TableSend { handles: &t };
+    let mut ops = TableSend {
+        handles: &t,
+        taint: None,
+    };
     let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
     assert_eq!(e(ops.prime_export(ev, 1)), Some(libc::EBADF));
     assert_eq!(e(ops.prime_export(12345, 1)), Some(libc::EBADF));
@@ -361,7 +364,10 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
     let so = t
         .insert(sys::memfd(c"syncobj", 0).unwrap(), HandleKind::Syncobj)
         .unwrap();
-    let mut ops = TableSend { handles: &t };
+    let mut ops = TableSend {
+        handles: &t,
+        taint: None,
+    };
     let fd = ops.syncobj(so).unwrap();
     let link = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
     assert!(link.to_string_lossy().contains("syncobj"), "{link:?}");

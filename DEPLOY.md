@@ -261,6 +261,15 @@ daemon its `(id, token)`; signal point `2k-1` for frame `k` in step 3 and
 wait for `2k` (with the same timeout) in step 4. Points the guest signals
 are hints: early, late or never, they change only this stream.
 
+**Tokens stay secret.** A token is what keeps one stream's buffers from
+every other process that can open the guest node, and it works only while
+no one else can read it. The helper sends it to the daemon over their own
+channel, and neither writes it to a command line (a process's arguments,
+and the kernel's, are readable by every user of the machine), an
+environment variable a child inherits, a log, or a file anyone else can
+read. The rig's capture test puts tokens on the guest's kernel command
+line because it has no vsock; that is a test's shortcut, not a model.
+
 **Guest side.** The node exists when the backend has `--inject-socket`:
 `/dev/nvgpu-capture`, root:root 0660 (module parameter `capture_mode`, which
 refuses anything for "other"). Give it to the daemon's account alone, with
@@ -327,6 +336,7 @@ stderr and in the log at every start. None is for running a tenant:
 | `--rm-allowlist log` | the RM allowlist: what it would refuse is logged and forwarded |
 | `--sandbox best-effort`, `--sandbox off` | the refusal to run with a sandbox layer missing; all of the sandbox |
 | `--allow-unmeasured-release` | the exact-measured-release rule |
+| `--allow-inject-self` | the refusal of an `--inject-uid` that is the backend's own uid (every process of that user could inject into the VM); the rig's, which is one user |
 
 `RUST_LOG` sets the log level (`warn` by default, which is what production
 should keep: the start-up lines worth reading are warnings, and every call

@@ -279,6 +279,8 @@ pub trait InjectHost: Send + Sync {
     fn prime_import(&self, render: BorrowedFd<'_>, dmabuf: BorrowedFd<'_>) -> io::Result<u32>;
     /// GEM_IDENTIFY_OBJECT.
     fn identify(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u32>;
+    /// PRIME_HANDLE_TO_FD: the dma-buf of handle `gem` of `render`.
+    fn prime_export(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<OwnedFd>;
     /// GEM_MAP_OFFSET: the object's mmap offset.
     fn map_offset(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u64>;
     fn gem_close(&self, render: BorrowedFd<'_>, gem: u32);
@@ -349,6 +351,9 @@ impl InjectHost for SysInjectHost {
     fn identify(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u32> {
         hostfd::gem_identify(render.as_raw_fd(), gem)
     }
+    fn prime_export(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<OwnedFd> {
+        hostfd::prime_export(render.as_raw_fd(), gem)
+    }
     fn map_offset(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u64> {
         hostfd::gem_map_offset(render.as_raw_fd(), gem)
     }
@@ -391,6 +396,8 @@ struct Injected {
     size: u64,
     /// Its mmap offset: the object's, the same from every file.
     offset: u64,
+    /// Its hold on the taint set.
+    taint: Option<FileId>,
 }
 
 /// One injected syncobj.
@@ -437,6 +444,7 @@ pub struct Opened {
 /// One VM's injected buffers.
 pub struct Registry {
     host: Arc<dyn InjectHost>,
+    taint: Arc<Taint>,
     own: Mutex<Own>,
     state: Mutex<State>,
     max_buffers: usize,
@@ -463,6 +471,7 @@ impl Registry {
     pub fn with_limits(host: Arc<dyn InjectHost>, max_buffers: usize, max_bytes: u64) -> Self {
         Self {
             host,
+            taint: Arc::default(),
             own: Mutex::new(Own::default()),
             state: Mutex::new(State {
                 next_id: 1,
@@ -525,12 +534,14 @@ impl Registry {
 
     /// IMPORT from helper connection `peer`: the checked buffer's id and
     /// token, or the errno the helper is answered with.
-    pub fn import(
+    pub fn import<F: Into<PrivateFd>>(
         &self,
         peer: u64,
         imp: &InjImport,
-        fds: Vec<OwnedFd>,
+        fds: Vec<F>,
     ) -> Result<(u32, [u8; 16]), i32> {
+        // The backend's own descriptors from here (privfd.rs).
+        let fds: Vec<PrivateFd> = fds.into_iter().map(Into::into).collect();
         check_request(imp)?;
         if fds.len() != imp.nplanes as usize {
             return Err(libc::EINVAL);
@@ -556,12 +567,22 @@ impl Registry {
                 continue;
             };
             match self.host.identify(r, gem) {
-                Ok(hostfd::NV_GEM_OBJECT_NVKMS) => {
+                // NVKMS is not enough: nvidia-drm imports another NVIDIA
+                // device's buffer by duplicating it into an NVKMS object of
+                // this one (nv_drm_gem_prime_import -> prime_dup ->
+                // dupMemory), which identifies as NVKMS too. Only a
+                // self-import is the helper's very object: its export from
+                // our file is the helper's own dma-buf, the one file
+                // (drm_gem_prime_handle_to_dmabuf reuses obj->dma_buf).
+                Ok(hostfd::NV_GEM_OBJECT_NVKMS) if self.self_import(r, gem, &fds[0]) => {
                     found = Some((gpu, gem));
                     break;
                 }
                 t => {
-                    log::debug!("inject: on render node {gpu} the buffer identifies as {t:?}");
+                    log::debug!(
+                        "inject: on render node {gpu} the buffer identifies as {t:?}, \
+                         or is not this device's own object"
+                    );
                     self.drop_unheld(&mut own, gpu, gem);
                 }
             }
@@ -607,9 +628,10 @@ impl Registry {
             flags: imp.flags,
             reserved: 0,
         };
-        let dmabuf = PrivateFd::new(fds.into_iter().next().expect("nplanes >= 1"));
+        let dmabuf = fds.into_iter().next().expect("nplanes >= 1");
         *own.held.entry((gpu, gem)).or_insert(0) += 1;
         st.bytes += size;
+        let taint = self.taint.hold(&dmabuf);
         st.live.insert(
             id,
             Injected {
@@ -621,6 +643,7 @@ impl Registry {
                 gem,
                 size,
                 offset,
+                taint,
             },
         );
         log::debug!(
@@ -631,6 +654,24 @@ impl Registry {
             imp.modifier
         );
         Ok((id, token))
+    }
+
+    /// Whether handle `gem` of `render` is the object `helper` is a dma-buf
+    /// of: its export is the same file.
+    fn self_import(&self, render: BorrowedFd<'_>, gem: u32, helper: &PrivateFd) -> bool {
+        match self.host.prime_export(render, gem) {
+            Ok(back) => same_file(back.as_fd(), helper.as_fd()),
+            Err(e) => {
+                log::debug!("inject: PRIME export of the import for its proof: {e}");
+                false
+            }
+        }
+    }
+
+    /// The taint set: dma-bufs of injected objects, which no path exports
+    /// to anyone (`BackendInject::exportable`).
+    pub fn taint(&self) -> &Arc<Taint> {
+        &self.taint
     }
 
     /// Whether one more buffer of `size` bytes fits (0: the count alone).
@@ -662,7 +703,7 @@ impl Registry {
         &self,
         own: &mut Own,
         imp: &InjImport,
-        fds: &[OwnedFd],
+        fds: &[PrivateFd],
         gpu: u32,
         gem: u32,
     ) -> Result<(u64, u64), i32> {
@@ -720,6 +761,7 @@ impl Registry {
         }
         let b = forget(&mut st, id).expect("live");
         drop(st);
+        self.taint.release(b.taint);
         self.unhold(&mut own, b.gpu, b.gem);
         Ok(())
     }
@@ -740,18 +782,20 @@ impl Registry {
         let n = gone.len() + before - st.syncobjs.len();
         drop(st);
         for b in gone {
+            self.taint.release(b.taint);
             self.unhold(&mut own, b.gpu, b.gem);
         }
         n
     }
 
     /// IMPORT_SYNCOBJ from `peer`: the syncobj file's id and token.
-    pub fn import_syncobj(
+    pub fn import_syncobj<F: Into<PrivateFd>>(
         &self,
         peer: u64,
         flags: u32,
-        fds: Vec<OwnedFd>,
+        fds: Vec<F>,
     ) -> Result<(u32, [u8; 16]), i32> {
+        let fds: Vec<PrivateFd> = fds.into_iter().map(Into::into).collect();
         if flags != 0 || fds.len() != 1 {
             return Err(libc::EINVAL);
         }
@@ -789,7 +833,6 @@ impl Registry {
         let mut st = self.lock();
         room(&st)?;
         let id = next_id(&mut st);
-        let file = PrivateFd::new(file);
         st.syncobjs
             .insert(id, InjectedSyncobj { token, peer, file });
         log::debug!("inject: syncobj id {id}");
@@ -887,6 +930,84 @@ fn overlaps(a: u64, alen: u64, b: u64, blen: u64) -> bool {
     a < b.saturating_add(blen) && b < a.saturating_add(alen.max(1))
 }
 
+/// A file's identity: its device and inode (a dma-buf's inode is its own).
+pub type FileId = (u64, u64);
+
+fn file_id(fd: BorrowedFd<'_>) -> Option<FileId> {
+    crate::sys::fd::fstat(fd.as_raw_fd())
+        .ok()
+        .map(|st| (st.st_dev, st.st_ino))
+}
+
+/// Whether two descriptors are one file.
+fn same_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> bool {
+    matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The dma-bufs of injected objects, while an id or a guest open holds
+/// them: what no PRIME export may hand anyone (HOST_OP PRIME_EXPORT, a
+/// Wayland buffer for the host compositor, an IOCTL2 re-home into a KMS
+/// file). An export of an injected object from any file is the helper's
+/// own dma-buf (nvidia-drm keeps the object's `dma_buf` while the file is
+/// open), so one held here is recognised by its identity; each entry keeps
+/// its dma-buf open so that identity stays the object's.
+#[derive(Debug, Default)]
+pub struct Taint {
+    held: Mutex<HashMap<FileId, (PrivateFd, u32)>>,
+}
+
+impl Taint {
+    fn lock(&self) -> MutexGuard<'_, HashMap<FileId, (PrivateFd, u32)>> {
+        self.held.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Hold `fd`'s file; `None` if it has no identity (then nothing is held).
+    pub fn hold(&self, fd: &PrivateFd) -> Option<FileId> {
+        let id = file_id(fd.as_fd())?;
+        let mut m = self.lock();
+        if let Some(e) = m.get_mut(&id) {
+            e.1 += 1;
+        } else {
+            m.insert(id, (fd.try_clone().ok()?, 1));
+        }
+        Some(id)
+    }
+
+    pub fn release(&self, id: Option<FileId>) {
+        let Some(id) = id else { return };
+        let mut m = self.lock();
+        if let Some(e) = m.get_mut(&id) {
+            e.1 -= 1;
+            if e.1 == 0 {
+                m.remove(&id);
+            }
+        }
+    }
+
+    /// Whether `fd` is an injected object's dma-buf.
+    pub fn contains(&self, fd: BorrowedFd<'_>) -> bool {
+        file_id(fd).is_some_and(|id| self.lock().contains_key(&id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What a PRIME export may leave the backend with, shared with the IOCTL2
+/// hooks (policy.rs), which run off the backend's lock: set once, by
+/// `set_inject`.
+pub type SharedTaint = Arc<std::sync::OnceLock<Arc<Taint>>>;
+
+/// Whether dma-buf `fd`, just exported, may go anywhere (see [`Taint`]).
+pub fn exportable(taint: &SharedTaint, fd: BorrowedFd<'_>) -> bool {
+    !taint.get().is_some_and(|t| t.contains(fd))
+}
+
 // ---------------------------------------------------------------------------
 // The backend's side: what INJECT_OPEN made
 // ---------------------------------------------------------------------------
@@ -897,6 +1018,7 @@ struct OpenRec {
     offset: u64,
     size: u64,
     owner: Owner,
+    taint: Option<FileId>,
 }
 
 /// The backend's injection state: the registry (with `--inject-socket`),
@@ -915,6 +1037,28 @@ const OPENS_SHARE: Share = Share::quarter(MAX_OPENS, 4);
 impl BackendInject {
     pub fn set_registry(&mut self, r: Option<Arc<Registry>>) {
         self.registry = r;
+    }
+
+    fn untaint(&self, o: &OpenRec) {
+        if let Some(r) = &self.registry {
+            r.taint().release(o.taint);
+        }
+    }
+
+    /// Whether `owner` may make one more open (INJECT_OPEN asks before it
+    /// imports anything, so a refusal leaves the file as it was).
+    pub fn admits(&self, owner: Owner) -> Result<(), i32> {
+        let used = self.opens.len() as u64;
+        self.ledger
+            .admits(&OPENS_SHARE, owner, 1, used, MAX_OPENS)
+            .map_err(|over| {
+                log::warn!(
+                    "INJECT_OPEN: {used} opens held in the VM, {} by this process: {over:?}; \
+                     refused",
+                    self.ledger.held(owner)
+                );
+                libc::EAGAIN
+            })
     }
 
     pub fn registry(&self) -> Option<&Arc<Registry>> {
@@ -948,34 +1092,42 @@ impl BackendInject {
         offset: u64,
         size: u64,
         owner: Owner,
+        dmabuf: Option<&PrivateFd>,
     ) -> Result<(), i32> {
         if self.opens.contains_key(&(render, gem)) {
             return Ok(());
         }
-        let used = self.opens.len() as u64;
-        if let Err(over) = self.ledger.admits(&OPENS_SHARE, owner, 1, used, MAX_OPENS) {
-            log::warn!(
-                "INJECT_OPEN: {used} opens held in the VM, {} by this process: {over:?}; refused",
-                self.ledger.held(owner)
-            );
-            return Err(libc::EAGAIN);
-        }
+        self.admits(owner)?;
         self.ledger.charge(owner, 1);
+        let taint = match (&self.registry, dmabuf) {
+            (Some(r), Some(d)) => r.taint().hold(d),
+            _ => None,
+        };
         self.opens.insert(
             (render, gem),
             OpenRec {
                 offset,
                 size,
                 owner,
+                taint,
             },
         );
         Ok(())
+    }
+
+    /// Whether handle `gem` of render handle `render` may be PRIME-exported
+    /// (HOST_OP PRIME_EXPORT): not one INJECT_OPEN made. The dma-buf an
+    /// export makes is checked as well ([`exportable`]), which also catches
+    /// an injected object reached through another handle.
+    pub fn exportable_handle(&self, render: u32, gem: u32) -> bool {
+        !self.is_open(render, gem)
     }
 
     /// GEM_CLOSE of `gem` on `render` succeeded.
     pub fn gem_closed(&mut self, render: u32, gem: u32) {
         if let Some(o) = self.opens.remove(&(render, gem)) {
             self.ledger.refund(o.owner, 1);
+            self.untaint(&o);
         }
     }
 
@@ -990,12 +1142,16 @@ impl BackendInject {
         for k in gone {
             if let Some(o) = self.opens.remove(&k) {
                 self.ledger.refund(o.owner, 1);
+                self.untaint(&o);
             }
         }
     }
 
     pub fn reset(&mut self) {
-        self.opens.clear();
+        let opens: Vec<OpenRec> = self.opens.drain().map(|(_, o)| o).collect();
+        for o in &opens {
+            self.untaint(o);
+        }
         self.ledger.clear();
     }
 
@@ -1008,6 +1164,9 @@ impl crate::nvidia::NvidiaBackend {
     /// `--inject-socket`'s registry; without one INJECT_OPEN is EOPNOTSUPP
     /// and HELLO offers no BCAP_INJECT.
     pub fn set_inject(&mut self, r: Option<Arc<Registry>>) {
+        if let Some(r) = &r {
+            let _ = self.inject_taint.set(r.taint().clone());
+        }
         self.inject.set_registry(r);
     }
 
@@ -1032,33 +1191,28 @@ impl crate::nvidia::NvidiaBackend {
         })?;
         let host = reg.host().clone();
         let owner = self.current_owner;
+        // The share first: a refusal must leave the file as it was.
+        self.inject.admits(owner)?;
         let (render, _) = self.handles.get(file).ok_or(libc::EBADF)?;
         let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
         let gem = host
             .prime_import(render, opened.dmabuf.as_fd())
             .map_err(errno)?;
-        // An import of an object the file already holds gives its handle
-        // again; that one is not ours to close on the way out.
-        let had = self.inject.is_open(file, gem);
-        let checked = (|| {
-            match host.identify(render, gem) {
-                Ok(hostfd::NV_GEM_OBJECT_NVKMS) => {}
-                t => {
-                    log::warn!("INJECT_OPEN of id {id}: the import identifies as {t:?}");
-                    return Err(libc::EIO);
-                }
+        // From here nothing is closed on failure. An import of an object the
+        // file already holds gives back the handle it has -- made by any
+        // path, a GETFB, a DMABUF_IMPORT -- which is not ours to close; and
+        // a new one stays in the caller's own file, closed with it, the same
+        // number again on a retry (drm_prime.c's per-file lookup).
+        match host.identify(render, gem) {
+            Ok(hostfd::NV_GEM_OBJECT_NVKMS) => {}
+            t => {
+                log::warn!("INJECT_OPEN of id {id}: the import identifies as {t:?}");
+                return Err(libc::EIO);
             }
-            let offset = host.map_offset(render, gem).map_err(errno)?;
-            self.inject
-                .record(file, gem, offset, opened.size, owner)
-                .map(|()| offset)
-        })();
-        if let Err(e) = checked {
-            if !had {
-                host.gem_close(render, gem);
-            }
-            return Err(e);
         }
+        let offset = host.map_offset(render, gem).map_err(errno)?;
+        self.inject
+            .record(file, gem, offset, opened.size, owner, Some(&opened.dmabuf))?;
         log::debug!("INJECT_OPEN of id {id}: GEM {gem} of render handle {file}");
         Ok((
             vec![
@@ -1360,89 +1514,127 @@ fn serve_peer(s: &Shared, peer: u64, conn: &PrivateFd) {
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(_) => return,
         };
-        if p.len == 0 && p.fds.is_empty() && !p.truncated {
+        // The helper's descriptors are the backend's own from here: no
+        // IOCTL2 may adopt one of their numbers (privfd.rs).
+        let fds: Vec<PrivateFd> = p.fds.into_iter().map(PrivateFd::new).collect();
+        if p.len == 0 && fds.is_empty() && !p.truncated {
             return; // hangup
         }
-        if p.truncated || p.fds_truncated {
-            log::warn!("inject: a helper sent an oversized packet; disconnected");
-            return;
-        }
-        let req = match parse_request(&buf[..p.len]) {
-            Ok(r) => r,
-            Err(m) => {
-                let why = match m {
-                    InjMalformed::Size => "a packet of the wrong size",
-                    InjMalformed::Op => "an unknown op",
-                    InjMalformed::Reserved => "a reserved field set",
-                };
-                log::warn!("inject: a helper sent {why}; disconnected");
-                return;
-            }
+        let r = serve_packet(
+            &s.registry,
+            peer,
+            &mut hello,
+            &buf[..p.len],
+            p.truncated || p.fds_truncated,
+            fds,
+        );
+        let (r, end) = match r {
+            Served::Reply(r) => (r, false),
+            Served::Last(r) => (r, true),
+            Served::Hangup => return,
         };
-        let (op, takes_fds) = match req {
-            InjRequest::Hello(_) => (INJ_OP_HELLO, false),
-            InjRequest::Import(_) => (INJ_OP_IMPORT, true),
-            InjRequest::Release(_) => (INJ_OP_RELEASE, false),
-            InjRequest::ImportSyncobj(_) => (INJ_OP_IMPORT_SYNCOBJ, true),
-        };
-        if !takes_fds && !p.fds.is_empty() {
-            log::warn!("inject: descriptors on a message that takes none; disconnected");
-            return;
-        }
-        if !hello && op != INJ_OP_HELLO {
-            log::warn!("inject: a request before HELLO; disconnected");
-            return;
-        }
-        let mut r = InjReply {
-            op,
-            ..InjReply::default()
-        };
-        match req {
-            InjRequest::Hello(h) => {
-                if hello || h.version != INJ_VERSION || h.flags != 0 {
-                    r.status = -libc::EPROTO;
-                    r.version = INJ_VERSION;
-                    let _ = reply(conn, &r);
-                    log::warn!(
-                        "inject: HELLO for version {} (flags {:#x}); this backend speaks {INJ_VERSION}",
-                        h.version,
-                        h.flags
-                    );
-                    return;
-                }
-                hello = true;
-                let (max_buffers, max_bytes, max_syncobjs) = s.registry.limits();
-                r.version = INJ_VERSION;
-                r.max_buffers = max_buffers as u32;
-                r.max_bytes = max_bytes;
-                r.max_syncobjs = max_syncobjs as u32;
-            }
-            InjRequest::Import(imp) => match s.registry.import(peer, &imp, p.fds) {
-                Ok((id, token)) => {
-                    r.id = id;
-                    r.token = token;
-                }
-                Err(e) => r.status = -e,
-            },
-            InjRequest::ImportSyncobj(so) => {
-                match s.registry.import_syncobj(peer, so.flags, p.fds) {
-                    Ok((id, token)) => {
-                        r.id = id;
-                        r.token = token;
-                    }
-                    Err(e) => r.status = -e,
-                }
-            }
-            InjRequest::Release(rel) => {
-                if let Err(e) = s.registry.release(peer, rel.id) {
-                    r.status = -e;
-                }
-            }
-        }
-        if !reply(conn, &r) {
+        if !reply(conn, &r) || end {
             return;
         }
     }
+}
+
+/// What one packet gets.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Served {
+    Reply(InjReply),
+    /// A reply, and then the connection ends.
+    Last(InjReply),
+    /// The connection ends with no reply.
+    Hangup,
+}
+
+/// One packet of helper connection `peer` (whose HELLO state is `hello`):
+/// `bytes` as received, `truncated` if the kernel cut the packet or its
+/// descriptors. Every framing rule is here, apart from the socket, for the
+/// fuzzer to drive (fuzzing/inject.rs).
+pub fn serve_packet(
+    reg: &Registry,
+    peer: u64,
+    hello: &mut bool,
+    bytes: &[u8],
+    truncated: bool,
+    fds: Vec<PrivateFd>,
+) -> Served {
+    if truncated {
+        log::warn!("inject: a helper sent an oversized packet; disconnected");
+        return Served::Hangup;
+    }
+    let req = match parse_request(bytes) {
+        Ok(r) => r,
+        Err(m) => {
+            let why = match m {
+                InjMalformed::Size => "a packet of the wrong size",
+                InjMalformed::Op => "an unknown op",
+                InjMalformed::Reserved => "a reserved field set",
+            };
+            log::warn!("inject: a helper sent {why}; disconnected");
+            return Served::Hangup;
+        }
+    };
+    let (op, takes_fds) = match req {
+        InjRequest::Hello(_) => (INJ_OP_HELLO, false),
+        InjRequest::Import(_) => (INJ_OP_IMPORT, true),
+        InjRequest::Release(_) => (INJ_OP_RELEASE, false),
+        InjRequest::ImportSyncobj(_) => (INJ_OP_IMPORT_SYNCOBJ, true),
+    };
+    if !takes_fds && !fds.is_empty() {
+        log::warn!("inject: descriptors on a message that takes none; disconnected");
+        return Served::Hangup;
+    }
+    if !*hello && op != INJ_OP_HELLO {
+        log::warn!("inject: a request before HELLO; disconnected");
+        return Served::Hangup;
+    }
+    let mut r = InjReply {
+        op,
+        ..InjReply::default()
+    };
+    match req {
+        InjRequest::Hello(h) => {
+            if *hello || h.version != INJ_VERSION || h.flags != 0 {
+                r.status = -libc::EPROTO;
+                r.version = INJ_VERSION;
+                log::warn!(
+                    "inject: HELLO for version {} (flags {:#x}); this backend speaks {INJ_VERSION}",
+                    h.version,
+                    h.flags
+                );
+                return Served::Last(r);
+            }
+            *hello = true;
+            let (max_buffers, max_bytes, max_syncobjs) = reg.limits();
+            r.version = INJ_VERSION;
+            r.max_buffers = max_buffers as u32;
+            r.max_bytes = max_bytes;
+            r.max_syncobjs = max_syncobjs as u32;
+        }
+        InjRequest::Import(imp) => match reg.import(peer, &imp, fds) {
+            Ok((id, token)) => {
+                r.id = id;
+                r.token = token;
+            }
+            Err(e) => r.status = -e,
+        },
+        InjRequest::ImportSyncobj(so) => match reg.import_syncobj(peer, so.flags, fds) {
+            Ok((id, token)) => {
+                r.id = id;
+                r.token = token;
+            }
+            Err(e) => r.status = -e,
+        },
+        InjRequest::Release(rel) => {
+            if let Err(e) = reg.release(peer, rel.id) {
+                r.status = -e;
+            }
+        }
+    }
+    Served::Reply(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,8 +1653,11 @@ pub mod fake {
         /// GEM_IDENTIFY_OBJECT's answer.
         pub ty: u32,
         pub size: u64,
-        /// The render node (index) whose device the object is memory of;
-        /// importing it anywhere else makes a dma-buf object.
+        /// The render node (index) whose device the object is memory of.
+        /// Imported on another node, an NVKMS object is duplicated there
+        /// as a new NVKMS object (nvidia-drm's prime_dup: IDENTIFY says
+        /// NVKMS, but its export is another dma-buf), and anything else
+        /// becomes a dma-buf object.
         pub gpu: u32,
         pub offset: u64,
     }
@@ -1473,6 +1668,9 @@ pub mod fake {
         objs: HashMap<u64, Obj>,
         /// dma-bufs, by inode (fstatfs says so).
         dmabufs: HashSet<u64>,
+        /// A descriptor of each object's own dma-buf, what an export of a
+        /// self-import gives back.
+        exports: HashMap<u64, OwnedFd>,
         /// (render file inode, object inode) -> handle.
         handles: HashMap<(u64, u64), u32>,
         /// render file inode -> its node.
@@ -1518,6 +1716,7 @@ pub mod fake {
             let mut st = self.st();
             st.objs.insert(i, o);
             st.dmabufs.insert(i);
+            st.exports.insert(i, fd.try_clone().unwrap());
             fd
         }
 
@@ -1621,11 +1820,11 @@ pub mod fake {
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
             let o = st.objs[&d];
             let node = st.files[&r];
-            Ok(if o.ty == hostfd::NV_GEM_OBJECT_NVKMS && o.gpu != node {
-                hostfd::NV_GEM_OBJECT_DMABUF
-            } else {
-                o.ty
-            })
+            // An NVKMS object imported on another NVIDIA device is its
+            // duplicate there, NVKMS too; what is not NVKMS memory stays
+            // what it is.
+            let _ = node;
+            Ok(o.ty)
         }
         fn map_offset(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u64> {
             let r = ino(render);
@@ -1635,6 +1834,24 @@ pub mod fake {
                 .find(|((f, _), h)| *f == r && **h == gem)
                 .map(|((_, d), _)| st.objs[d].offset)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+        }
+        fn prime_export(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<OwnedFd> {
+            let r = ino(render);
+            let st = self.st();
+            let d = st
+                .handles
+                .iter()
+                .find(|((f, _), h)| *f == r && **h == gem)
+                .map(|((_, d), _)| *d)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            if st.objs[&d].gpu == st.files[&r] {
+                // The object's own dma-buf, again.
+                st.exports[&d].try_clone()
+            } else {
+                // A duplicate's (prime_dup), or a dma-buf object's: another
+                // file.
+                crate::sys::fd::memfd(c"fake-dup-export", libc::MFD_CLOEXEC)
+            }
         }
         fn gem_close(&self, render: BorrowedFd<'_>, gem: u32) {
             let r = ino(render);
@@ -1955,14 +2172,14 @@ mod tests {
             start_ns: 1,
         };
         for g in 0..MAX_OPENS / 4 {
-            bi.record(1, g as u32 + 1, 0, 4096, p(1)).unwrap();
+            bi.record(1, g as u32 + 1, 0, 4096, p(1), None).unwrap();
         }
-        assert_eq!(bi.record(1, 9999, 0, 4096, p(1)), Err(libc::EAGAIN));
+        assert_eq!(bi.record(1, 9999, 0, 4096, p(1), None), Err(libc::EAGAIN));
         // The same handle again is not a second open.
-        assert_eq!(bi.record(1, 1, 0, 4096, p(1)), Ok(()));
-        assert!(bi.record(2, 1, 0, 4096, p(2)).is_ok());
+        assert_eq!(bi.record(1, 1, 0, 4096, p(1), None), Ok(()));
+        assert!(bi.record(2, 1, 0, 4096, p(2), None).is_ok());
         bi.gem_closed(1, 1);
-        assert!(bi.record(1, 9999, 0, 4096, p(1)).is_ok());
+        assert!(bi.record(1, 9999, 0, 4096, p(1), None).is_ok());
         bi.file_closed(1);
         assert_eq!(bi.opens(), 1);
         assert!(bi.read_only(0, 1));
@@ -2201,6 +2418,94 @@ mod tests {
         assert_eq!(inject_open(&mut be, r, id, &token, 10).0, -libc::EAGAIN);
         let (fd, _) = be.handles.get(r).unwrap();
         assert_eq!(host.handles_in(fd), 0);
+        // And a handle the file had before the call is left as it was.
+        let r = be.adopt_for_test(host.render_file(0), HandleKind::DriRender(0));
+        let (fd, _) = be.handles.get(r).unwrap();
+        let before = host.handles_in(fd);
+        let opened = be.inject.registry().unwrap().open(id, &token, 0).unwrap();
+        host.prime_import(fd, opened.dmabuf.as_fd()).unwrap();
+        assert_eq!(host.handles_in(fd), before + 1);
+        let closes = host.closes();
+        assert_eq!(inject_open(&mut be, r, id, &token, 10).0, -libc::EAGAIN);
+        assert_eq!(host.closes(), closes, "nothing closed in the caller's file");
+    }
+
+    /// nvidia-drm imports another NVIDIA device's buffer as a duplicate,
+    /// an NVKMS object of its own device: IDENTIFY cannot tell. Only the
+    /// device whose import is the helper's very object takes it.
+    #[test]
+    fn another_nvidia_devices_buffer_is_its_own_not_a_duplicates() {
+        let host = Arc::new(FakeHost::new(2));
+        let reg = Registry::new(host.clone());
+        let (id, token) = reg
+            .import(
+                1,
+                &rgb(32, 32),
+                vec![host.dmabuf(Obj {
+                    gpu: 1,
+                    ..obj(4096 * 4, 0)
+                })],
+            )
+            .unwrap();
+        // Node 0's duplicate was made, refused and closed.
+        assert_eq!(host.closes(), 1);
+        assert_eq!(reg.open(id, &token, 0).unwrap_err(), libc::ENODEV);
+        assert!(reg.open(id, &token, 1).is_ok());
+        // With one GPU in the list, another GPU's buffer is nobody's.
+        let h1 = Arc::new(FakeHost::new(1));
+        let one = Registry::new(h1.clone());
+        assert_eq!(
+            one.import(
+                1,
+                &rgb(32, 32),
+                vec![h1.dmabuf(Obj {
+                    gpu: 1,
+                    ..obj(4096 * 4, 0)
+                })]
+            ),
+            Err(libc::ENODEV)
+        );
+    }
+
+    /// No export hands out an injected buffer: HOST_OP PRIME_EXPORT of the
+    /// handle INJECT_OPEN made is refused before the host is asked, and the
+    /// dma-buf any other path would export is recognised (the taint set).
+    #[test]
+    fn an_injected_buffer_is_never_exported() {
+        let host = Arc::new(FakeHost::new(1));
+        let reg = Arc::new(Registry::new(host.clone()));
+        let d = host.dmabuf(obj(4096 * 4, 0));
+        let helper_copy = d.try_clone().unwrap();
+        let (id, token) = reg.import(1, &rgb(32, 32), vec![d]).unwrap();
+        let mut be = v2_backend(Some(reg.clone()));
+        let render = be.adopt_for_test(host.render_file(0), HandleKind::DriRender(0));
+        let (st, res, _) = inject_open(&mut be, render, id, &token, 10);
+        assert_eq!(st, 0);
+        let prime_export = |be: &mut NvidiaBackend, gem: u64| {
+            let mut req = HostOpReq {
+                op: OP_PRIME_EXPORT,
+                nargs: 2,
+                args: [0; OP_MAX_ARGS],
+            };
+            req.args[0] = u64::from(render);
+            req.args[1] = gem;
+            status(&call(be, MsgType::HostOp, 0, crate::sys::pod::bytes(&req)))
+        };
+        assert_eq!(prime_export(&mut be, res[0]), -libc::EINVAL);
+        // Another handle reaches the host (a memfd: no ioctls).
+        assert_eq!(prime_export(&mut be, res[0] + 100), -libc::ENOTTY);
+        // The helper's dma-buf is tainted while the id or an open holds it.
+        let taint = be.inject_taint.clone();
+        assert!(!exportable(&taint, helper_copy.as_fd()));
+        assert!(exportable(&taint, host.not_dmabuf().as_fd()));
+        reg.release(1, id).unwrap();
+        assert!(
+            !exportable(&taint, helper_copy.as_fd()),
+            "the open still holds it"
+        );
+        call(&mut be, MsgType::Close, render, &[]);
+        assert!(exportable(&taint, helper_copy.as_fd()));
+        assert!(reg.taint().is_empty());
     }
 
     #[test]
@@ -2211,7 +2516,10 @@ mod tests {
             reg.import_syncobj(1, 0, vec![host.not_dmabuf()]),
             Err(libc::EBADF)
         );
-        assert_eq!(reg.import_syncobj(1, 0, vec![]), Err(libc::EINVAL));
+        assert_eq!(
+            reg.import_syncobj(1, 0, Vec::<OwnedFd>::new()),
+            Err(libc::EINVAL)
+        );
         assert_eq!(
             reg.import_syncobj(1, 0, vec![host.syncobj(), host.syncobj()]),
             Err(libc::EINVAL)

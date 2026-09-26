@@ -588,6 +588,14 @@ pub trait Hooks: Send + Sync {
         let _ = p;
         Ok(None)
     }
+
+    /// Whether a dma-buf a re-home has just exported may be imported
+    /// elsewhere; false refuses the call (EINVAL). On the thread that runs
+    /// the call.
+    fn exportable(&self, dmabuf: std::os::fd::BorrowedFd<'_>) -> bool {
+        let _ = dmabuf;
+        true
+    }
 }
 
 /// What `Hooks::at_run` holds across a host ioctl.
@@ -2183,7 +2191,13 @@ impl Prepared {
         if r < 0 {
             return Err(-r);
         }
-        a.claim_fd(top, 8).ok_or(libc::EIO)
+        let dmabuf = a.claim_fd(top, 8).ok_or(libc::EIO)?;
+        if !self.hooks.exportable(dmabuf.as_fd()) {
+            log::warn!("IOCTL2: an injected capture buffer would be re-homed; refused");
+            self.sys.close(dmabuf);
+            return Err(libc::EINVAL);
+        }
+        Ok(dmabuf)
     }
 
     fn prime_import(&self, fd: RawFd, dmabuf: RawFd) -> Result<u32, Errno> {
@@ -3318,6 +3332,35 @@ mod tests {
         );
         assert_eq!(rd(&r.data, 20, 4), 9, "the guest's handles come back");
         assert!(h.owns(42));
+    }
+
+    /// A re-home whose export the hooks refuse (an injected capture buffer,
+    /// inject.rs) runs nothing and leaves nothing in the KMS file.
+    #[test]
+    fn a_rehome_the_hooks_refuse_never_reaches_addfb() {
+        struct NoExport;
+        impl Hooks for NoExport {
+            fn before(&self, _: &mut Prepared) -> Result<(), Errno> {
+                Ok(())
+            }
+            fn exportable(&self, _: std::os::fd::BorrowedFd<'_>) -> bool {
+                false
+            }
+        }
+        let mut h = h();
+        h.hooks = Arc::new(NoExport);
+        h.sys
+            .k()
+            .object(RENDER, 3, 100, NV_GEM_OBJECT_NVKMS, 1 << 20);
+        let rq = Rq::new(ADDFB2)
+            .buf(104, Some(&addfb2(XRGB8888, [9, 0, 0, 0])))
+            .gem(0, 20, RENDER, 3);
+        let r = h.kms(&rq).unwrap();
+        assert_eq!(r.ret, -libc::EINVAL);
+        let log = h.sys.log();
+        assert!(!log.iter().any(|l| l.starts_with("ioctl")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("import")), "{log:?}");
+        assert!(h.sys.k().gems.get(&KMS).is_none_or(|g| g.is_empty()));
     }
 
     #[test]

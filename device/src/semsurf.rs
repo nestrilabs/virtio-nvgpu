@@ -1256,6 +1256,7 @@ mod tests {
 
         fn hooks(&self) -> Arc<dyn xfer::Hooks> {
             crate::policy::BackendHooks::with_state(Default::default(), self.0.clone())
+                .with_inject_taint(Default::default())
         }
     }
 

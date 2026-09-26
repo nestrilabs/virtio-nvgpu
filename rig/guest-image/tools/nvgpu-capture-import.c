@@ -17,10 +17,22 @@
  * printed. It is also the reference for what a guest daemon does with an id
  * and a token: steps 1, 3 and 4, and nothing else.
  *
- * Usage: nvgpu-capture-import --id N --token HEX32 [--frame F] [--fnv HEX]
+ * TOKENS NEVER GO ON A COMMAND LINE. A process's arguments are readable by
+ * every user of its system (/proc/PID/cmdline), and so is the kernel's
+ * command line; a token there is a token every guest process knows, which
+ * is no token at all. A daemon keeps the helper's tokens in its own memory,
+ * from its own vsock channel. This tool takes them on a descriptor
+ * (--token-fd: one token, 32 hex digits, per line; the syncobj's second).
+ *
+ * Usage: nvgpu-capture-import --id N --token-fd FD [--frame F] [--fnv HEX]
  *          [--render PATH] [--node PATH] [--no-egl] [--no-vk]
  *          [--expect-errno E] [--watch MS] [--no-cpu]
- *          [--sync ID:TOKEN --pingpong N]
+ *          [--sync ID --pingpong N]
+ *   --token-fd FD  read the buffer's token (and, with --sync, the syncobj's
+ *                  on the next line) from descriptor FD; 0 is stdin
+ *   --token HEX32  the token on the command line: for poking at the node by
+ *                  hand in a throwaway guest, NEVER in a daemon or a script
+ *                  that runs where other users are (see above)
  *   --frame F      the frame the host painted last into this buffer; without
  *                  it the frame is read from pixel (0,0) and the rest of the
  *                  image checked against it
@@ -33,7 +45,7 @@
  *                  keeps painting it): the frame must have moved on, without
  *                  a new OPEN; a read of a frame half painted is counted as
  *                  a tear (there is no sync in this first cut)
- *   --sync ID:TOKEN --pingpong N
+ *   --sync ID --pingpong N
  *                  explicit sync with the helper's injected syncobj
  *                  (OPEN_SYNCOBJ): N frames, each waited for at its acquire
  *                  point (2k-1), read, and released (2k); see pingpong();
@@ -756,7 +768,7 @@ static void vk_check(const struct nvgpu_capture_open *o, int frame, uint32_t fnv
 
 static int hex_token(const char *s, uint8_t t[16])
 {
-	if (strlen(s) != 32)
+	if (strlen(s) < 32 || (s[32] && s[32] != '\n'))
 		return -1;
 	for (int i = 0; i < 16; i++) {
 		unsigned b;
@@ -775,10 +787,14 @@ int main(int argc, char **argv)
 	int pp = 0, expect_sync_errno = 0;
 	uint32_t fnv = 0, sync_id = 0;
 	uint8_t sync_token[16] = {0};
+	int token_fd = -1;
 	for (int i = 1; i < argc; i++) {
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 		if (!strcmp(argv[i], "--id") && v)
 			o.id = (uint32_t)strtoul(v, NULL, 0), i++;
+		else if (!strcmp(argv[i], "--token-fd") && v)
+			token_fd = atoi(v), i++;
+		/* On the command line: every user can read it (see the head). */
 		else if (!strcmp(argv[i], "--token") && v)
 			have_token = hex_token(v, o.token) == 0, i++;
 		else if (!strcmp(argv[i], "--frame") && v)
@@ -799,9 +815,10 @@ int main(int argc, char **argv)
 			no_vk = 1;
 		else if (!strcmp(argv[i], "--no-cpu"))
 			no_cpu = 1;
-		else if (!strcmp(argv[i], "--sync") && v && strchr(v, ':')) {
+		else if (!strcmp(argv[i], "--sync") && v) {
 			sync_id = (uint32_t)strtoul(v, NULL, 0);
-			if (hex_token(strchr(v, ':') + 1, sync_token))
+			/* ID:TOKEN, the command line again: by hand only. */
+			if (strchr(v, ':') && hex_token(strchr(v, ':') + 1, sync_token))
 				return 2;
 			i++;
 		} else if (!strcmp(argv[i], "--pingpong") && v)
@@ -813,8 +830,17 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+	if (token_fd >= 0) {
+		FILE *f = fdopen(token_fd, "r");
+		char line[80];
+		have_token = f && fgets(line, sizeof line, f) && hex_token(line, o.token) == 0;
+		if (have_token && sync_id && !(fgets(line, sizeof line, f) && hex_token(line, sync_token) == 0)) {
+			fprintf(stderr, "--token-fd: no syncobj token on the second line\n");
+			return 2;
+		}
+	}
 	if (!have_token) {
-		fprintf(stderr, "--token: 32 hex digits\n");
+		fprintf(stderr, "a token: --token-fd FD, 32 hex digits a line\n");
 		return 2;
 	}
 	int cap = open(node, O_RDWR | O_CLOEXEC);

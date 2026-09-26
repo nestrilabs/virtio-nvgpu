@@ -2,31 +2,38 @@
 //! The capture-injection socket's packets and INJECT_OPEN (inject.rs),
 //! against the fake nvidia-drm of `inject::fake`.
 //!
-//! The input is a sequence of operations: a helper packet (parsed by
-//! `protocol::inject::parse_request`, then served by the registry with
+//! The input is a sequence of operations: a helper packet (built or raw,
+//! through `inject::serve_packet`, every framing rule of the socket, with
 //! descriptors the input chooses -- dma-bufs of objects of any type, size,
-//! device and offset, the same object again, or no dma-buf at all), a
-//! helper's hangup, a guest's INJECT_OPEN through the dispatcher (a known id
-//! with its token, the token altered, or any bytes), and a guest file's
-//! close. After every step: the registry holds no more than its bounds; an
-//! open succeeds only with a live id's own token, and a wrong token gets
-//! the same ENOENT as a missing id; an id's mmap range stays read-only
-//! while it or an open of it lives. At the end, with everything dropped,
-//! no descriptor is left open.
+//! device and offset, the same object again, syncobj files, or nothing), a
+//! helper's hangup, a guest's INJECT_OPEN and INJECT_OPEN_SYNCOBJ through the
+//! dispatcher (a known id with its token, the token altered, or any bytes),
+//! an MMAP of an injected object's range, a GEM_CLOSE and a PRIME_EXPORT of
+//! an open's handle, and a guest file's close. After every step: the
+//! registry holds no more than its bounds; an open succeeds only with a live
+//! id's own token, and a wrong token gets the same ENOENT as a missing id; a
+//! placement of a range an id or an open holds is read-only, placed and
+//! reported so; an open's handle is never exported, and a GEM_CLOSE of it
+//! forgets it. At the end, with everything dropped, no descriptor is left
+//! open.
 
 #![forbid(unsafe_code)]
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use protocol::inject::{InjRequest, parse_request};
+use protocol::inject::{
+    INJ_OP_IMPORT, INJ_OP_IMPORT_SYNCOBJ, INJ_VERSION, InjHello, InjImport, InjImportSyncobj,
+    InjRelease,
+};
 use protocol::messages::*;
 
 use super::Bytes;
 use crate::hostfd::{HandleKind, NV_GEM_OBJECT_DMABUF, NV_GEM_OBJECT_NVKMS};
 use crate::inject::fake::{FakeHost, Obj};
-use crate::inject::{MAX_OPENS, Registry};
+use crate::inject::{MAX_OPENS, Registry, Served, serve_packet};
 use crate::nvidia::NvidiaBackend;
+use crate::privfd::PrivateFd;
 
 fn call(be: &mut NvidiaBackend, t: MsgType, handle: u32, body: &[u8]) -> Vec<u8> {
     let mut msg = crate::session::hdr(t, handle, 0, 1);
@@ -43,23 +50,112 @@ fn status(r: &[u8]) -> i32 {
 }
 
 /// A descriptor for one plane, as the input says.
-fn plane(b: &mut Bytes<'_>, host: &FakeHost, prev: &[OwnedFd]) -> OwnedFd {
+fn plane(b: &mut Bytes<'_>, host: &FakeHost, prev: &[OwnedFd], offs: &mut Vec<u64>) -> OwnedFd {
     match b.u8() % 5 {
         0 if !prev.is_empty() => prev[b.u8() as usize % prev.len()].try_clone().unwrap(),
         1 => host.not_dmabuf(),
-        k => host.dmabuf(Obj {
-            ty: match k {
-                2 => NV_GEM_OBJECT_DMABUF,
-                _ => NV_GEM_OBJECT_NVKMS,
+        k => {
+            let o = Obj {
+                ty: match k {
+                    2 => NV_GEM_OBJECT_DMABUF,
+                    _ => NV_GEM_OBJECT_NVKMS,
+                },
+                size: u64::from(b.u32() % (64 << 20)),
+                gpu: u32::from(b.u8() % 3),
+                // Pages, below 2^40: the offsets GEM_MAP_OFFSET gives.
+                offset: (u64::from(b.u32()) % (1 << 28)) << 12,
+            };
+            offs.push(o.offset);
+            host.dmabuf(o)
+        }
+    }
+}
+
+/// Every host ioctl answers 0 (a GEM_CLOSE that succeeded).
+fn ok_ioctl(_: std::os::fd::RawFd, _: u64, _: &mut crate::sys::block::Arg<'_>) -> i32 {
+    0
+}
+
+/// A window that takes every placement and remembers whether the last one
+/// was writable.
+#[derive(Clone, Default)]
+struct Window(Arc<std::sync::Mutex<Option<bool>>>);
+
+impl crate::shm::WindowPlacer for Window {
+    fn place(
+        &self,
+        _: u64,
+        _: u64,
+        _: std::os::fd::RawFd,
+        _: u64,
+        writable: bool,
+    ) -> crate::error::Result<()> {
+        *self.0.lock().unwrap() = Some(writable);
+        Ok(())
+    }
+    fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+        Ok(())
+    }
+}
+
+/// A helper packet: a well-formed one of each op, from the input's values,
+/// or the input's bytes as they are.
+fn packet(b: &mut Bytes<'_>) -> Vec<u8> {
+    match b.u8() % 6 {
+        0 => InjHello {
+            version: if b.u8() % 8 == 0 {
+                b.u32()
+            } else {
+                INJ_VERSION
             },
-            size: u64::from(b.u32() % (64 << 20)),
-            gpu: u32::from(b.u8() % 3),
-            offset: b.u64() & !0xfff,
-        }),
+            flags: if b.u8() % 8 == 0 { b.u32() } else { 0 },
+        }
+        .to_bytes()
+        .to_vec(),
+        1 | 2 => {
+            let mut offsets = [0; 4];
+            let mut strides = [0; 4];
+            let nplanes = u32::from(b.u8() % 3);
+            let (w, h) = (1 + u32::from(b.u16() % 256), 1 + u32::from(b.u16() % 256));
+            for i in 0..nplanes as usize {
+                offsets[i] = if b.u8() % 4 == 0 { b.u32() } else { 0 };
+                strides[i] = if b.u8() % 4 == 0 { b.u32() } else { w * 4 };
+            }
+            InjImport {
+                nplanes,
+                width: w,
+                height: h,
+                fourcc: [0x3432_5258, 0x3231_564e, b.u32()][b.u8() as usize % 3],
+                flags: u32::from(b.u8() % 4 == 0),
+                modifier: b.u64(),
+                offsets,
+                strides,
+            }
+            .to_bytes()
+            .to_vec()
+        }
+        3 => InjRelease { id: b.u32() % 16 }.to_bytes().to_vec(),
+        4 => InjImportSyncobj {
+            flags: u32::from(b.u8() % 8 == 0),
+        }
+        .to_bytes()
+        .to_vec(),
+        _ => b.chunk(80).to_vec(),
     }
 }
 
 fn inject_open(be: &mut NvidiaBackend, render: u32, id: u64, token: &[u8; 16], tgid: u32) -> i32 {
+    inject_open_gem(be, render, id, token, tgid).0
+}
+
+/// INJECT_OPEN: its status and the GEM handle it answered.
+fn inject_open_gem(
+    be: &mut NvidiaBackend,
+    render: u32,
+    id: u64,
+    token: &[u8; 16],
+    tgid: u32,
+) -> (i32, u32) {
     let mut req = HostOpReq {
         op: OP_INJECT_OPEN,
         nargs: 4,
@@ -75,7 +171,12 @@ fn inject_open(be: &mut NvidiaBackend, render: u32, id: u64, token: &[u8; 16], t
         tgid,
         euid: 0,
     }));
-    status(&call(be, MsgType::HostOp, 0, &body))
+    let r = call(be, MsgType::HostOp, 0, &body);
+    let h = size_of::<MsgHeader>();
+    let gem = r
+        .get(h + 8..h + 12)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    (status(&r), gem)
 }
 
 pub fn run(b: &mut Bytes<'_>) {
@@ -100,6 +201,12 @@ pub fn run(b: &mut Bytes<'_>) {
         };
         call(&mut be, MsgType::Hello, 0, crate::sys::pod::bytes(&hello));
         be.set_inject(Some(reg.clone()));
+        be.set_host_ioctl_for_test(ok_ioctl);
+        let window = Window::default();
+        be.set_window(Box::new(window.clone()));
+        let mut hello = [false; 3];
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut opened: Vec<(u32, u32)> = Vec::new();
         let mut renders: Vec<(u32, u32)> = Vec::new();
         let mut known: Vec<(u32, [u8; 16])> = Vec::new();
         let mut kept: Vec<OwnedFd> = Vec::new();
@@ -109,40 +216,39 @@ pub fn run(b: &mut Bytes<'_>) {
         while !b.is_empty() && steps < 256 {
             steps += 1;
             let peer = u64::from(b.u8() % 3);
-            match b.u8() % 6 {
-                0 | 1 => match parse_request(b.chunk(80)) {
-                    Ok(InjRequest::Import(imp)) => {
-                        let n = b.u8() % 6;
-                        let mut fds = Vec::new();
-                        for _ in 0..n {
-                            let f = plane(b, &host, &kept);
-                            kept.push(f.try_clone().unwrap());
-                            fds.push(f);
+            match b.u8() % 9 {
+                0 | 1 => {
+                    let bytes = packet(b);
+                    let n = b.u8() % 5;
+                    let mut fds = Vec::new();
+                    for _ in 0..n {
+                        let f = if b.u8() % 4 == 0 {
+                            host.syncobj()
+                        } else {
+                            plane(b, &host, &kept, &mut offsets)
+                        };
+                        kept.push(f.try_clone().unwrap());
+                        fds.push(PrivateFd::new(f));
+                    }
+                    let truncated = b.u8() % 32 == 0;
+                    let p = peer as usize;
+                    match serve_packet(&reg, peer, &mut hello[p], &bytes, truncated, fds) {
+                        Served::Reply(r) => {
+                            if r.status == 0 && r.op == INJ_OP_IMPORT {
+                                known.push((r.id, r.token));
+                            }
+                            if r.status == 0 && r.op == INJ_OP_IMPORT_SYNCOBJ {
+                                syncobjs.push((r.id, r.token));
+                            }
                         }
-                        if let Ok((id, tok)) = reg.import(peer, &imp, fds) {
-                            known.push((id, tok));
+                        Served::Last(_) | Served::Hangup => {
+                            hello[p] = false;
+                            reg.release_peer(peer);
                         }
                     }
-                    Ok(InjRequest::Release(r)) => {
-                        let _ = reg.release(peer, r.id);
-                    }
-                    Ok(InjRequest::ImportSyncobj(so)) => {
-                        let fds: Vec<OwnedFd> = (0..b.u8() % 3)
-                            .map(|_| {
-                                if b.u8() % 4 == 0 {
-                                    host.not_dmabuf()
-                                } else {
-                                    host.syncobj()
-                                }
-                            })
-                            .collect();
-                        if let Ok((id, tok)) = reg.import_syncobj(peer, so.flags, fds) {
-                            syncobjs.push((id, tok));
-                        }
-                    }
-                    Ok(InjRequest::Hello(_)) | Err(_) => {}
-                },
+                }
                 2 => {
+                    hello[peer as usize] = false;
                     reg.release_peer(peer);
                 }
                 3 => {
@@ -173,7 +279,10 @@ pub fn run(b: &mut Bytes<'_>) {
                             tok[b.u8() as usize % 16] ^= 1 | b.u8();
                         }
                         let live = reg.open(id, &tok, gpu);
-                        let st = inject_open(&mut be, render, u64::from(id), &tok, tgid);
+                        let (st, gem) = inject_open_gem(&mut be, render, u64::from(id), &tok, tgid);
+                        if st == 0 {
+                            opened.push((render, gem));
+                        }
                         match live {
                             Ok(_) => assert!(
                                 st == 0 || st == -libc::EAGAIN,
@@ -224,6 +333,84 @@ pub fn run(b: &mut Bytes<'_>) {
                     );
                     if wrong {
                         assert_eq!(st, -libc::ENOENT, "a wrong token opened a syncobj");
+                    }
+                }
+                6 if !renders.is_empty() => {
+                    // An MMAP of an injected range (or near one).
+                    let (render, _) = renders[b.u8() as usize % renders.len()];
+                    let off = if offsets.is_empty() || b.u8() % 4 == 0 {
+                        u64::from(b.u32()) << 12
+                    } else {
+                        offsets[b.u8() as usize % offsets.len()]
+                    };
+                    let size = 4096 * (1 + u64::from(b.u8() % 4));
+                    let ro = be.inject.read_only(off, size);
+                    *window.0.lock().unwrap() = None;
+                    let req = MmapReq {
+                        size,
+                        offset: off,
+                        prot: 3,
+                        padding: 0,
+                    };
+                    let r = call(&mut be, MsgType::Mmap, render, crate::sys::pod::bytes(&req));
+                    if ro && status(&r) == 0 {
+                        let m: MmapResp =
+                            crate::sys::pod::read(&r, size_of::<MsgHeader>()).unwrap_or_default();
+                        assert_ne!(
+                            m.flags & MMAP_F_READ_ONLY,
+                            0,
+                            "an injected range told writable"
+                        );
+                        assert_ne!(
+                            *window.0.lock().unwrap(),
+                            Some(true),
+                            "an injected range placed writable"
+                        );
+                    }
+                }
+                7 if !opened.is_empty() => {
+                    // A GEM_CLOSE, or a PRIME_EXPORT, of an open's handle.
+                    let (render, gem) = opened[b.u8() as usize % opened.len()];
+                    if b.u8() % 2 == 0 {
+                        let was = be.inject.is_open(render, gem);
+                        let mut close = [0u8; 8];
+                        close[..4].copy_from_slice(&gem.to_le_bytes());
+                        let mut req = Vec::new();
+                        for v in [
+                            MsgType::Ioctl as u32,
+                            render,
+                            0,
+                            0,
+                            crate::hostfd::DRM_IOCTL_GEM_CLOSE,
+                            8,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ] {
+                            req.extend_from_slice(&v.to_le_bytes());
+                        }
+                        req.extend_from_slice(&close);
+                        let mut resp = vec![0u8; 4096];
+                        let n = be.dispatch(&req, &mut resp);
+                        if was && status(&resp[..n]) == 0 {
+                            assert!(!be.inject.is_open(render, gem), "a closed open is kept");
+                        }
+                    } else if be.inject.is_open(render, gem) {
+                        let mut req = HostOpReq {
+                            op: OP_PRIME_EXPORT,
+                            nargs: 2,
+                            args: [0; OP_MAX_ARGS],
+                        };
+                        req.args[0] = u64::from(render);
+                        req.args[1] = u64::from(gem);
+                        let st = status(&call(
+                            &mut be,
+                            MsgType::HostOp,
+                            0,
+                            crate::sys::pod::bytes(&req),
+                        ));
+                        assert_eq!(st, -libc::EINVAL, "an open's handle was exported");
                     }
                 }
                 _ => {

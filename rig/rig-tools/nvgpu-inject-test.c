@@ -19,6 +19,13 @@
  *   nvgpu_cap_sync=ID:TOKEN:SID:STOKEN:N a buffer and a syncobj (IMPORT_SYNCOBJ)
  *                                        for N frames of explicit sync
  *
+ * The ids and tokens it prints are for the rig, which has no vsock and puts
+ * them on the guest's kernel command line: every guest process can read
+ * that, and every host user the VMM's. A real helper sends each token over
+ * its own channel to the guest's daemon alone, and never writes one to a
+ * command line, a log or a world-readable file (DEPLOY.md, "Capture
+ * injection").
+ *
  * It also checks the refusals it can cause itself: a memfd (not a dma-buf,
  * EBADF), a udmabuf (another device's memory, ENODEV) when /dev/udmabuf can
  * be opened, and a layout larger than the buffer (EINVAL).

@@ -43,6 +43,8 @@ pub struct BackendHooks {
     /// RM clients, its live contexts; semsurf.rs). Shared with the backend,
     /// which feeds it from the RM path and every handle it opens and closes.
     semsurf: Arc<SemsurfPolicy>,
+    /// Capture injection: the dma-bufs no re-home may export (inject.rs).
+    inject_taint: crate::inject::SharedTaint,
 }
 
 impl BackendHooks {
@@ -59,8 +61,18 @@ impl BackendHooks {
     }
 
     /// With the NVKMS and semaphore-surface state the backend also holds.
-    pub fn with_state(nvkms: Arc<NvkmsPolicy>, semsurf: Arc<SemsurfPolicy>) -> Arc<dyn Hooks> {
-        Arc::new(Self { nvkms, semsurf })
+    pub fn with_state(nvkms: Arc<NvkmsPolicy>, semsurf: Arc<SemsurfPolicy>) -> Self {
+        Self {
+            nvkms,
+            semsurf,
+            inject_taint: Default::default(),
+        }
+    }
+
+    /// With the backend's taint set (inject.rs), as its `Arc<dyn Hooks>`.
+    pub fn with_inject_taint(mut self, t: crate::inject::SharedTaint) -> Arc<dyn Hooks> {
+        self.inject_taint = t;
+        Arc::new(self)
     }
 
     // ───────────────────────────── KMS ─────────────────────────────
@@ -169,6 +181,13 @@ impl BackendHooks {
 }
 
 impl Hooks for BackendHooks {
+    /// A re-home (an ADDFB's object moved into a KMS file) exports no
+    /// injected object: a capture buffer is the guest's to read, never a
+    /// framebuffer of the host's display (SECURITY.md §18).
+    fn exportable(&self, dmabuf: std::os::fd::BorrowedFd<'_>) -> bool {
+        crate::inject::exportable(&self.inject_taint, dmabuf)
+    }
+
     fn prop_kind(&self, name: &[u8]) -> PropKind {
         self.kms_prop_kind(name)
     }

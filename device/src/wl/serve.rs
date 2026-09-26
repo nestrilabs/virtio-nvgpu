@@ -159,6 +159,8 @@ fn drop_detached(conns: Vec<WlConn>) {
 /// that owner is a render file of this session.
 pub(super) struct TableSend<'a> {
     pub(super) handles: &'a HandleTable,
+    /// Injected capture buffers, which never go to the compositor.
+    pub(super) taint: Option<&'a crate::inject::SharedTaint>,
 }
 
 impl SendOps for TableSend<'_> {
@@ -168,7 +170,19 @@ impl SendOps for TableSend<'_> {
             // file holds only an executor's temporaries, ARCHITECTURE.md §10), and a
             // PRIME export on a lease or card file would be one of the host
             // compositor's framebuffer objects by number.
-            Some((fd, HandleKind::DriRender(_))) => hostfd::prime_export(fd.as_raw_fd(), gem),
+            Some((fd, HandleKind::DriRender(_))) => {
+                let dmabuf = hostfd::prime_export(fd.as_raw_fd(), gem)?;
+                // A capture buffer the helper injected is the guest's to
+                // read, not to show the host (SECURITY.md §18).
+                if self
+                    .taint
+                    .is_some_and(|t| !crate::inject::exportable(t, dmabuf.as_fd()))
+                {
+                    log::warn!("wayland: a dma-buf is an injected capture buffer; refused");
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                Ok(dmabuf)
+            }
             Some((_, kind)) => {
                 log::warn!(
                     "wayland: a dma-buf names owner {owner}, a {kind:?}, not a render file; refused"
@@ -525,6 +539,7 @@ impl NvidiaBackend {
         let conn = self.wl_conn(handle)?;
         let mut ops = TableSend {
             handles: &self.handles,
+            taint: Some(&self.inject_taint),
         };
         let resp = conn.send(frame_bytes, &mut ops)?;
         let mut bytes = hdr(MsgType::WlSend, handle, 0, self.current_req_id);

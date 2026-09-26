@@ -76,7 +76,9 @@ let
           '';
         };
         helperGroup = mkOption {
-          type = types.str;
+          # A group name and nothing else: it reaches the socket helper's
+          # command line through the unit's environment.
+          type = types.strMatching "^[a-z_][a-z0-9_-]*$";
           description = "The group the inject socket is opened to: the helper's own.";
         };
       };
@@ -161,6 +163,23 @@ in
           in
           lib.length uids == lib.length (lib.unique uids);
         message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: each VM needs a capture helper user of its own";
+      }
+      {
+        # Not the VM's backend or VMM user, where their uids are fixed
+        # (the backend refuses its own uid itself, at start).
+        assertion = lib.all (
+          n:
+          let
+            vm = cfg.vms.${n};
+            fixed = u: if config.users.users ? ${u} then config.users.users.${u}.uid else null;
+          in
+          !vm.inject.enable
+          || !(lib.elem vm.inject.helperUid [
+            (fixed "nvgpu-vm${n}")
+            (fixed "nvgpu-vmm${n}")
+          ])
+        ) (lib.attrNames cfg.vms);
+        message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: the capture helper must not be the VM's backend or VMM user";
       }
       {
         # The display paths and the semaphore-surface fences need NVKMS.
@@ -266,7 +285,10 @@ in
             ]
           );
         }
-        // lib.optionalAttrs vm.inject.enable { NVGPU_INJECT_GROUP = vm.inject.helperGroup; };
+        // lib.optionalAttrs vm.inject.enable {
+          # A name `helperGroup`'s type holds to [a-z0-9_-]: one word.
+          NVGPU_INJECT_GROUP = vm.inject.helperGroup;
+        };
         wantedBy = lib.optional vm.autoStart "multi-user.target";
       }
     ) cfg.vms;

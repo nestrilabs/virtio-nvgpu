@@ -524,6 +524,11 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
  * (NVGPU_GEM_OBJECT_*), which a new proxy reports. Owns @host_gem unless it
  * returns -EBADF (not our file).
  */
+/* The same, as the dma-buf itself (an ERR_PTR on failure), for a caller
+ * that installs the descriptor only once nothing else can fail. */
+struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
+                                           u32 host_gem, u64 size,
+                                           u32 obj_type, int o_flags);
 int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
                            u32 obj_type, int o_flags);
 
