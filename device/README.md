@@ -74,7 +74,7 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`) |
 | `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, guest RAM handed to the backend from each memory table, and every command-line flag (`--help`) |
 | `bin/nvgpu-userspace.rs` | stages the host's NVIDIA user-mode driver for a guest to mount |
-| `bin/test-harness.rs`, `bin/test_client.rs` | an early socket harness and its client |
+| `bin/test-harness.rs` | an early socket harness, built only with `--features test-bins` (no sandbox, no posture: development only) |
 
 ## Fuzzing
 

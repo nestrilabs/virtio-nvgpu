@@ -1616,3 +1616,15 @@ other release. Userspace must match the host's module, as natively
 guest as RM's API-mismatch error, with RM's usual `NVRM: API mismatch`
 line (the backend's process name) in the host's kernel log. Test:
 `sys_params_and_check_version_go_as_sent_and_come_back_as_answered`.
+
+**Test binaries.** `test-harness` served a backend on a socket with no
+sandbox and no posture checks, removing whatever was at its socket path
+first (default `/tmp/nv-vhost.sock`); it was built by every `cargo build
+-p device`. It is now built only with `--features test-bins` (which also
+brings in tokio and tracing, no longer dependencies of the backend), and
+clears its path only if it holds this user's socket
+(`posture::clear_socket_path`). `test-client`, which carried its own stale
+copy of the protocol, is deleted. `nvgpu-userspace --stage DIR` ran
+`remove_dir_all(DIR)` on whatever it was given; it now clears only a
+directory that is empty or holds the marker it writes into every share it
+stages, never through a symlink.
