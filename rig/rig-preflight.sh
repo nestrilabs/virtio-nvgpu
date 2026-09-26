@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Is this host ready to run the rig? Checks what an unprivileged
-# scripts/run-guest.sh needs, one line each:
+# rig/run-guest.sh needs, one line each:
 #
 #   OK    it is there and usable
 #   WARN  it works, but something about it will bite a particular stage
@@ -67,7 +67,7 @@ need_rw() {
 section "user"
 if [ "$(id -u)" = 0 ]; then
     fail "running as root"
-    hint "the rig runs unprivileged: run this and scripts/run-guest.sh as your own user" \
+    hint "the rig runs unprivileged: run this and rig/run-guest.sh as your own user" \
         "(as root, run-guest.sh uses the /root layout and its own user switching instead)"
 else
     ok "running as $ME (uid $(id -u))"
@@ -206,7 +206,7 @@ if [ -z "$GUEST_VERSION" ]; then
     elif command -v debugfs >/dev/null && [ -r "$RIG/guest/rootfs.ext4" ] &&
         GUEST_VERSION=$(debugfs -R 'cat /etc/nvgpu/manifest' "$RIG/guest/rootfs.ext4" 2>/dev/null |
             sed -n 's/^nvidia-userspace \([^ ]*\).*/\1/p') && [ -n "$GUEST_VERSION" ]; then
-        # guest-image/mkimage.sh records what it baked in here.
+        # rig/guest-image/mkimage.sh records what it baked in here.
         GV_FROM="the image's /etc/nvgpu/manifest"
     else
         GUEST_VERSION=${NVGPU_GUEST_NV_VERSION:-595.99.02}
@@ -299,7 +299,7 @@ if [ ${#socks[@]} -gt 0 ]; then
     warn "a compositor is running: ${socks[*]}$hypr${WAYLAND_DISPLAY:+; this session is $WAYLAND_DISPLAY}"
     hint "who is DRM master of the NVIDIA card is not visible from here. If this desktop runs on it" \
         "(${on:-no monitors seen on it}), the KMS stages 4, 5, 6 and 9 take a monitor or need the" \
-        "desktop stopped -- TESTING-RIG.md. Stages 1, 2, 3 (against a separate headless compositor)" \
+        "desktop stopped -- rig/TESTING-RIG.md. Stages 1, 2, 3 (against a separate headless compositor)" \
         "and the security negatives leave it alone."
 else
     ok "no Wayland socket in ${XDG_RUNTIME_DIR:-(no XDG_RUNTIME_DIR)}"
@@ -446,12 +446,12 @@ if [ -r "$ROOTFS" ]; then
         debugfs -R "dump /opt/nvgpu/nvgpu.ko $tmpko" "$ROOTFS" >/dev/null 2>&1
         if [ ! -s "$tmpko" ]; then
             fail "the image has no /opt/nvgpu/nvgpu.ko"
-            hint "guest-image/mkimage.sh --module-only"
+            hint "rig/guest-image/mkimage.sh --module-only"
         elif cmp -s "$tmpko" "$KO"; then
             ok "the image's /opt/nvgpu/nvgpu.ko is $KO"
         else
             fail "the image's /opt/nvgpu/nvgpu.ko differs from $KO"
-            hint "guest-image/mkimage.sh --module-only"
+            hint "rig/guest-image/mkimage.sh --module-only"
         fi
         rm -f "$tmpko"
     fi

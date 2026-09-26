@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Run the guest's application pass (guest-image/probes/apps.sh) against a
+# Run the guest's application pass (rig/guest-image/probes/apps.sh) against a
 # host compositor, and do the host's half of it: find each app's window,
 # capture it, and (headless sway only) type, click and copy into it.
 #
-# Usage: scripts/rig-app-check.sh [--live] [app,app,...] [tag]
+# Usage: rig/rig-app-check.sh [--live] [app,app,...] [tag]
 #   --live  against the live Hyprland session (NVGPU_APPS_LIVE=1 does the
 #           same) instead of the rig's headless sway; see "Live" below
 #   apps    default: every app apps.sh knows (less, live, the input apps)
@@ -16,7 +16,7 @@
 # and handed to the backend (run-guest.sh's "-- backend-args").
 # NVGPU_TIMEOUT, when set, replaces the budget worked out from the slots.
 #
-# Headless sway (the default). Needs scripts/rig-headless-sway.sh running.
+# Headless sway (the default). Needs rig/rig-headless-sway.sh running.
 # Everything here talks to that compositor only: the input it injects
 # (virtual keyboard and pointer) and the captures (screencopy) go to the
 # headless sway, never to a desktop session.
@@ -73,7 +73,7 @@ if [ "$LIVE" = 1 ]; then
     [ -n "$APPS" ] || { echo "--live: no apps left" >&2; exit 1; }
 else
     SOCK=$(cat "$RIG/run/headless-sway.socket" 2>/dev/null) || SOCK=
-    [ -S "$SOCK" ] || { echo "no headless sway; start scripts/rig-headless-sway.sh" >&2; exit 1; }
+    [ -S "$SOCK" ] || { echo "no headless sway; start rig/rig-headless-sway.sh" >&2; exit 1; }
     RT=$(dirname "$SOCK")
     export WAYLAND_DISPLAY=$SOCK XDG_RUNTIME_DIR=$RT
     SWAYSOCK=$(ls "$RT"/sway-ipc.*.sock 2>/dev/null | head -n 1)
@@ -323,10 +323,10 @@ else
     KBS=()
     keys() { wtype -s 400 "$@" -s 86400000 >/dev/null 2>&1 </dev/null & KBS+=($!); }
     keys -s 1
-    # And a pointer, the same way, driven through a fifo (scripts/rig-tools/vptr.c;
-    # scripts/rig-tools/build.sh builds it). wlrctl's pointers live for one
+    # And a pointer, the same way, driven through a fifo (rig/rig-tools/vptr.c;
+    # rig/rig-tools/build.sh builds it). wlrctl's pointers live for one
     # command, which no client ever sees move.
-    [ -x "$RIG/bin/vptr" ] || "$REPO/scripts/rig-tools/build.sh" "$RIG/bin" >/dev/null
+    [ -x "$RIG/bin/vptr" ] || "$REPO/rig/rig-tools/build.sh" "$RIG/bin" >/dev/null
     PTR=$OUT/pointer.fifo
     rm -f "$PTR" && mkfifo "$PTR"
     "$RIG/bin/vptr" < "$PTR" 2>>"$OUT/vptr.log" &
@@ -346,7 +346,7 @@ say "guest: apps=$APPS slot=${SLOT}s live=$LIVE"
 read -r -a BACKEND_ARGS <<<"${NVGPU_APPS_BACKEND_ARGS:-}"
 NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((N * (SLOT + 10) + 90))} \
     NVGPU_CMDLINE_EXTRA="nvgpu_apps=$APPS nvgpu_slot=$SLOT nvgpu_live=$LIVE ${NVGPU_APPS_EXTRA:-}" \
-    "$REPO/scripts/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" \
+    "$REPO/rig/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" \
     -- ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"} > "$OUT/run.log" 2>&1 &
 RUN=$!
 

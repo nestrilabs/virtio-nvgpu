@@ -17,7 +17,7 @@
 #               --permissive-abi and --rm-allowlist=log are said aloud
 #
 # Display options, passed through to the backend (TESTING.md has which mode
-# wants which, TESTING-RIG.md which of them are safe next to a live desktop):
+# wants which, rig/TESTING-RIG.md which of them are safe next to a live desktop):
 #   --kms-card                  compositor-VM: offer the host's card nodes
 #   --wayland-socket PATH       the host compositor's socket, for the proxy
 #   --wayland-lease             offer the compositor's DRM lease device
@@ -126,10 +126,10 @@
 # sticky one aside). Anything else is refused: whoever could change one of
 # them could have root run, read or overwrite something of their choosing --
 # a rig of the user's own, a launcher in a user's checkout. Install a copy
-# (sudo install -D -o root -g root -m 0755 scripts/run-guest.sh
+# (sudo install -D -o root -g root -m 0755 rig/run-guest.sh
 # /root/bin/run-guest.sh) and a root-owned tree for it.
 #
-# As an ordinary user, with the rig layout (TESTING-RIG.md): the user needs
+# As an ordinary user, with the rig layout (rig/TESTING-RIG.md): the user needs
 # /dev/kvm and the NVIDIA nodes, and nothing here needs root. Paths come from
 # $NVGPU_RIG, laid out as
 #   bin/vhost-user-nvgpu  bin/nesbox  [bin/virtiofsd]
@@ -137,7 +137,7 @@
 # The rootfs there is the golden image: each run boots a copy of it
 # (cp --reflink, so on btrfs or XFS the copy costs nothing until the guest
 # writes), and deletes the copy afterwards, so a run can never leave the next
-# one a dirty or half-written filesystem. scripts/rig-preflight.sh says
+# one a dirty or half-written filesystem. rig/rig-preflight.sh says
 # whether this host is ready for it.
 #
 # The backend does NOT run as root. RM, DRM and NVKMS take a guest's
@@ -397,7 +397,7 @@ case $VMM_KIND in nesbox | crosvm) ;; *) die "--vmm $VMM_KIND: nesbox or crosvm"
 CROSVM_SANDBOX=${NVGPU_CROSVM_SANDBOX:-on}
 case $CROSVM_SANDBOX in on | off) ;; *) die "NVGPU_CROSVM_SANDBOX=$CROSVM_SANDBOX: on or off" ;; esac
 # Compute is the backend's to serve and the probe's to expect: one switch for
-# both (guest-image/probes/render.sh reads nvgpu_compute).
+# both (rig/guest-image/probes/render.sh reads nvgpu_compute).
 [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
 SANDBOX=${NVGPU_SANDBOX:-on}
 case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
@@ -602,7 +602,7 @@ if [ "$VMM_KIND" = crosvm ]; then
             1) [ "$CROSVM_NO_HP" = 1 ] ||
                 die "the host GPU ${g##*/} is on PCI bus 1, where $VMM puts its hot-plug" \
                     "root port, and it has no --no-pci-hotplug-port to leave it out: build" \
-                    "it with patches/crosvm (scripts/rig-build-crosvm.sh)" ;;
+                    "it with patches/crosvm (rig/rig-build-crosvm.sh)" ;;
         esac
     done
     [ "$CROSVM_NO_HP" = 1 ] ||
@@ -649,7 +649,7 @@ fi
 # is DRM master becomes master. A compositor that is only switched away (a
 # VT switch, or another session in front) has dropped master, so the VM would
 # take the card and the desktop could not get it back until the VM ends.
-# Group C in TESTING-RIG.md stops the compositor first; a socket still in the
+# Group C in rig/TESTING-RIG.md stops the compositor first; a socket still in the
 # runtime directory says it has not been. (Inside the sandbox the host's
 # runtime directory is hidden and this sees nothing: stop it anyway.)
 if [ "$KMS_CARD" = 1 ] && [ "${NVGPU_KMS_CARD_FORCE:-}" != 1 ]; then
@@ -663,7 +663,7 @@ if [ "$KMS_CARD" = 1 ] && [ "${NVGPU_KMS_CARD_FORCE:-}" != 1 ]; then
     done
     [ ${#LIVE[@]} -eq 0 ] ||
         die "--kms-card while a compositor's socket exists (${LIVE[*]}): stop the desktop first" \
-            "(TESTING-RIG.md group C); NVGPU_KMS_CARD_FORCE=1 if that socket is stale"
+            "(rig/TESTING-RIG.md group C); NVGPU_KMS_CARD_FORCE=1 if that socket is stale"
 fi
 
 # ── A slot of the pool: this VM's own host users ────────────────────────────
@@ -854,7 +854,7 @@ if [ -n "$WL_SOCK" ] && [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR
     case $live in /*) ;; *) live=$XDG_RUNTIME_DIR/$live ;; esac
     if [ "$(realpath -m -- "$WL_SOCK")" = "$(realpath -m -- "$live")" ]; then
         echo "WARNING: $WL_SOCK is this session's own compositor; the guest's clients" \
-            "appear on the live desktop (TESTING-RIG.md says which stages want that)" >&2
+            "appear on the live desktop (rig/TESTING-RIG.md says which stages want that)" >&2
     fi
 fi
 if [ $PRIV = user ] && [ -n "$WL_EXPORT" ]; then
@@ -1232,7 +1232,7 @@ echo "config:  $CFG"
 
 # ── What the probe said ──────────────────────────────────────────────────────
 #
-# The rig's probes (guest-image/probes) end with one verdict line,
+# The rig's probes (rig/guest-image/probes) end with one verdict line,
 #   NVGPU_PROBE_DONE probe=<name> result=PASS|FAIL pass=N fail=N skip=N
 # and that line is the result: the tools they run print PASS/FAIL lines of
 # their own, some of them expected (cuda-smoke says FAIL where a probe wants

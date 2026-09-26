@@ -10,7 +10,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=scripts/verify/common.sh
+# shellcheck source=rig/verify/common.sh
 . "$here/common.sh"
 
 fails=0

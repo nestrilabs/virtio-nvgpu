@@ -1,6 +1,6 @@
 # Running the display stages on the dev box
 
-[`TESTING.md`](TESTING.md) says what each stage checks and what a pass looks
+[`TESTING.md`](../TESTING.md) says what each stage checks and what a pass looks
 like. This file says **in what order to run them on this machine**, with the
 unprivileged launcher, and **which ones touch the monitors**.
 
@@ -20,7 +20,7 @@ notes on this (`.rig/SAFETY-NOTES.md`, git-ignored, host-specific) go further.
 ## The rig
 
 Everything is built into `.rig/` (git-ignored), laid out as
-`scripts/run-guest.sh` expects when it is not run as root:
+`rig/run-guest.sh` expects when it is not run as root:
 
 | path | what |
 |---|---|
@@ -29,7 +29,7 @@ Everything is built into `.rig/` (git-ignored), laid out as
 | `.rig/bin/crosvm` | the other VMM, `--vmm crosvm` (release, static; below, "crosvm") |
 | `.rig/bin/virtiofsd` | only with `NVGPU_NVIDIA_SHARE` |
 | `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it (Kbuild names it `virtio_gpu_nv.ko`; the rig installs it as `nvgpu.ko`) |
-| `.rig/kernel-rust/vmlinux`, `.rig/kernel-rust/nvgpu.ko` | the same kernel with `CONFIG_RUST=y`, and the module with its parsers in Rust (`NVGPU_RUST=1`), built by `scripts/rig-build-kernel-rust.sh`; to run one, see [`driver/rust/README.md`](driver/rust/README.md) |
+| `.rig/kernel-rust/vmlinux`, `.rig/kernel-rust/nvgpu.ko` | the same kernel with `CONFIG_RUST=y`, and the module with its parsers in Rust (`NVGPU_RUST=1`), built by `rig/rig-build-kernel-rust.sh`; to run one, see [`driver/rust/README.md`](../driver/rust/README.md) |
 | `.rig/guest/rootfs.ext4` | the golden image: NVIDIA 595.99.02 userspace at `/run/opengl-driver`, probes at `/opt/nvgpu/<name>.sh`, the module at `/opt/nvgpu/nvgpu.ko` |
 | `.rig/logs/` | one `<tag>.{backend.log,console.log,json}` per run |
 
@@ -52,10 +52,10 @@ PASS, 1 on FAIL, and 124 when the guest did not power off in time
 (`NVGPU_TIMEOUT`, 180 s by default). Without a verdict line it falls back to
 counting PASS/FAIL words: 0 on a PASS and no FAIL, 1 on any FAIL, 2 on
 neither. The other knobs are listed in
-`scripts/run-guest.sh --help`.
+`rig/run-guest.sh --help`.
 
 The rig runs one VM, as you: without root there is no other user to be, so
-the backend, nesbox and your desktop share a uid (`scripts/run-guest.sh`'s
+the backend, nesbox and your desktop share a uid (`rig/run-guest.sh`'s
 header has what that gives up against a root run, where each VM takes users
 of its own from a pool, and SECURITY.md §4 has what the uids separate). What
 still applies: the backend's sandbox -- a user and network namespace of its
@@ -75,7 +75,7 @@ nix shell nixpkgs#e2fsprogs -c debugfs -R 'ls -l /opt/nvgpu' .rig/guest/rootfs.e
 ```
 
 `run-guest.sh stage1` boots `init=/opt/nvgpu/stage1.sh`. The image's probes
-(`guest-image/README.md` has what each checks) and the stages they cover:
+(`rig/guest-image/README.md` has what each checks) and the stages they cover:
 
 | probe | stages |
 |---|---|
@@ -103,7 +103,7 @@ not part of the repository). Neither opens anything on the host GPU.
 ## Before anything: preflight
 
 ```sh
-scripts/rig-preflight.sh
+rig/rig-preflight.sh
 ```
 
 Every line is OK, WARN or FAIL, with a hint. A missing `/dev/nvidia-uvm` is
@@ -123,12 +123,12 @@ never connect to the live compositor. Run them first, in this order.
 
 | # | stage | run | backend flags |
 |---|---|---|---|
-| A1 | **1**: HELLO v2, nodes, extensions | `scripts/run-guest.sh stage1 s1` | none |
-| A2 | **2, W1 only**: offscreen render (the envyhooks differential has no probe), twice: without compute (nvidia-smi, Vulkan and EGL with no UVM device; CUDA must find no device and exit cleanly), then with it (CUDA must run) | `scripts/run-guest.sh render s2` then `scripts/run-guest.sh --allow-compute render s2c` | none, then `--allow-compute` |
-| A3 | **security negatives**, ctl + render tests (no `--kms`). Run only after A1 and A2 pass, with your work saved: a regressed fix can oops the host (T1-T3 reach RM and nvidia-drm if the backend's refusal is gone) | `NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh secneg sec` | none |
+| A1 | **1**: HELLO v2, nodes, extensions | `rig/run-guest.sh stage1 s1` | none |
+| A2 | **2, W1 only**: offscreen render (the envyhooks differential has no probe), twice: without compute (nvidia-smi, Vulkan and EGL with no UVM device; CUDA must find no device and exit cleanly), then with it (CUDA must run) | `rig/run-guest.sh render s2` then `rig/run-guest.sh --allow-compute render s2c` | none, then `--allow-compute` |
+| A3 | **security negatives**, ctl + render tests (no `--kms`). Run only after A1 and A2 pass, with your work saved: a regressed fix can oops the host (T1-T3 reach RM and nvidia-drm if the backend's refusal is gone) | `NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none rig/run-guest.sh secneg sec` | none |
 | A4 | **3** against a **separate headless compositor** | see below | `--wayland-socket <headless socket>` |
 | A5 | **8**: explicit sync (all three parts) | as A4 | `--wayland-socket <headless socket>` |
-| A6 | caching **M-2** (read-only mapping; no probe yet) | `scripts/run-guest.sh shell m2`, by hand | none (`-- --keep-guest-coherency` only to rule the rewrite out) |
+| A6 | caching **M-2** (read-only mapping; no probe yet) | `rig/run-guest.sh shell m2`, by hand | none (`-- --keep-guest-coherency` only to rule the rewrite out) |
 | A7 | performance, W1 crossings; W2 crossings against the headless compositor | as A2 / A4 | as A2 / A4 |
 
 H-4 and M-1 in the caching stage are Intel-only and cannot occur on this AMD
@@ -145,9 +145,9 @@ where a hole in the allowlist costs nothing:
 
 ```sh
 # terminal 1: sway, headless, rendering on the 5090's render node
-scripts/rig-headless-sway.sh                  # --renderer gles2 to try the other one
+rig/rig-headless-sway.sh                  # --renderer gles2 to try the other one
 # terminal 2:
-scripts/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland s3
+rig/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland s3
 ```
 
 `rig-headless-sway.sh` runs `nix shell nixpkgs#sway` (sway 1.12, wlroots 0.20)
@@ -204,13 +204,13 @@ backend and logs are the same; `<tag>.json` records crosvm's command line,
 as it has no config file.
 
 ```sh
-scripts/rig-build-crosvm.sh                     # .rig/src/crosvm -> .rig/bin/crosvm
+rig/rig-build-crosvm.sh                     # .rig/src/crosvm -> .rig/bin/crosvm
                                                 # (first time: the top of that script)
-scripts/run-guest.sh --vmm crosvm stage1 cv-s1
-scripts/run-guest.sh --vmm crosvm render cv-render
-scripts/run-guest.sh --vmm crosvm --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland cv-wl
-NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh --vmm crosvm secneg cv-sec
-NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 scripts/rig-app-check.sh \
+rig/run-guest.sh --vmm crosvm stage1 cv-s1
+rig/run-guest.sh --vmm crosvm render cv-render
+rig/run-guest.sh --vmm crosvm --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland cv-wl
+NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none rig/run-guest.sh --vmm crosvm secneg cv-sec
+NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 rig/rig-app-check.sh \
   typing,pointer,clipboard,glxgears,gamescope,gtk,qt,firefox,mpv,vkmark,chromegpu cv-apps
 ```
 
@@ -222,8 +222,8 @@ to its own binary, so the graphics one is left alone:
 
 ```sh
 CROSVM_SRC=.rig/src/crosvm-compute CROSVM_OUT=.rig/bin/crosvm-compute \
-  CARGO_TARGET_DIR=.rig/target-crosvm-compute scripts/rig-build-crosvm.sh
-NVGPU_VMM=.rig/bin/crosvm-compute scripts/run-guest.sh --vmm crosvm ...
+  CARGO_TARGET_DIR=.rig/target-crosvm-compute rig/rig-build-crosvm.sh
+NVGPU_VMM=.rig/bin/crosvm-compute rig/run-guest.sh --vmm crosvm ...
 ``` It is built static and without
 crosvm's default features: no virtio-gpu, virgl, virtio-wl, audio, USB or
 network devices.
@@ -291,11 +291,11 @@ on the same tree:
 
 ```sh
 V=NVGPU_VMM=.rig/bin/crosvm-compute
-env $V scripts/run-guest.sh --vmm crosvm stage1 cvc-s1
-env $V NVGPU_COMPUTE=1 scripts/run-guest.sh --vmm crosvm render cvc-render   # cuda-smoke too
+env $V rig/run-guest.sh --vmm crosvm stage1 cvc-s1
+env $V NVGPU_COMPUTE=1 rig/run-guest.sh --vmm crosvm render cvc-render   # cuda-smoke too
 NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none env $V NVGPU_COMPUTE=1 \
-  scripts/run-guest.sh --vmm crosvm secneg cvc-sec
-env $V scripts/run-guest.sh --vmm crosvm render cvc-render-nocompute       # graphics only, as before
+  rig/run-guest.sh --vmm crosvm secneg cvc-sec
+env $V rig/run-guest.sh --vmm crosvm render cvc-render-nocompute       # graphics only, as before
 ```
 
 and a CUDA workload of more than one context (the render probe's
@@ -319,7 +319,7 @@ What to look at besides the probes' results:
 ## Group B: takes one monitor, desktop keeps running
 
 These stages need the **patched Hyprland as the live compositor**
-([`patches/README.md`](patches/README.md); `.rig/hypr-build` has a build). One
+([`patches/README.md`](../patches/README.md); `.rig/hypr-build` has a build). One
 monitor must be marked leasable. The lease takes only that monitor. The rest of
 the desktop keeps running. Pick a monitor you can lose, and prefer
 `disabled = true, leasable = true` so Hyprland never puts windows on it:
@@ -371,23 +371,23 @@ harness powers it (DPMS) only while a slot has a window, and leaves it off.
 ```sh
 # graphics only (nesbox; NVGPU_VMM_KIND=crosvm for crosvm), in three batches
 export NVGPU_MEM_MIB=8192 NVGPU_APPS_EXTRA=nvgpu_user=1
-NVGPU_TIMEOUT=700  scripts/rig-app-check.sh --live glxgears,xterm,gamescope,gtk,qt,firefox,mpv,glmark2,vkmark,chromeanim a0
-NVGPU_TIMEOUT=1100 scripts/rig-app-check.sh --live blender,stk,stkgs,neverball,godot,godotgl,blendervk,gimp,inkscape,krita a1
-NVGPU_TIMEOUT=1300 scripts/rig-app-check.sh --live lo,loskia,gte,gtevk,qml,qmlvk,electron,element,ffgl,crgl,mpvvk,ffvkdec,ffvkenc a2
+NVGPU_TIMEOUT=700  rig/rig-app-check.sh --live glxgears,xterm,gamescope,gtk,qt,firefox,mpv,glmark2,vkmark,chromeanim a0
+NVGPU_TIMEOUT=1100 rig/rig-app-check.sh --live blender,stk,stkgs,neverball,godot,godotgl,blendervk,gimp,inkscape,krita a1
+NVGPU_TIMEOUT=1300 rig/rig-app-check.sh --live lo,loskia,gte,gtevk,qml,qmlvk,electron,element,ffgl,crgl,mpvvk,ffvkdec,ffvkenc a2
 # compute (nesbox only)
-NVGPU_COMPUTE=1 NVGPU_TIMEOUT=1600 NVGPU_APPS_EXTRA="nvgpu_user=1 nvgpu_compute=1" scripts/rig-app-check.sh --live \
+NVGPU_COMPUTE=1 NVGPU_TIMEOUT=1600 NVGPU_APPS_EXTRA="nvgpu_user=1 nvgpu_compute=1" rig/rig-app-check.sh --live \
   cuda,opencl,cycles,nvenc,ffnvdec,vainfo,mpvnvdec,mpvvaapi,ffvaapi,crvaapi,godot c1
 ```
 
-`scripts/rig-app-check.sh --live` (its header has the details) finds each
+`rig/rig-app-check.sh --live` (its header has the details) finds each
 window with `hyprctl clients -j`, captures the monitor and the window with
 grim into `.rig/logs/<tag>/`, and follows the guest's `APP_START`/`APP_END`
 lines, so a slot that fails fast does not put it behind. What each slot
-checks is in `guest-image/probes/apps.sh`; the apps' logs stay in the run's
+checks is in `rig/guest-image/probes/apps.sh`; the apps' logs stay in the run's
 disk under `/var/log/nvgpu/apps` (`NVGPU_KEEP_ROOTFS=1`). The media are
 built into the image (`/opt/nvgpu/apps`): the guest has no network.
 
-To tell a failure of ours from the app's, `scripts/rig-native-run.sh` runs
+To tell a failure of ours from the app's, `rig/rig-native-run.sh` runs
 the same program on the host with the guest image's own userspace and
 NVIDIA 595.99.02 files, against the headless sway (or `--live`), and
 `--no-uvm` hides `/dev/nvidia-uvm` as a graphics-only guest has it.
@@ -489,7 +489,7 @@ Claude sandbox (its Xwayland cannot reach it there), so this was not compared.
   SuperTuxKart, Neverball and Godot cover GL, SDL2 and Vulkan.
 - NVIDIA's CUDA samples and `cudaPackages.saxpy`: they pull cuBLAS, cuFFT,
   cuSPARSE and more, about 2 GB from NVIDIA's servers at ~300 KB/s;
-  `nvgpu-nbody` (`guest-image/apps/cuda`) needs only nvcc and cudart.
+  `nvgpu-nbody` (`rig/guest-image/apps/cuda`) needs only nvcc and cudart.
 - PyTorch (size), VS Code (Element covers Electron), anything needing the
   network, and the input-driven checks (chrome://gpu, about:support
   scrolling) on the live desktop.
@@ -516,8 +516,8 @@ and when the VM goes the backend drops the card.
 
 | # | stage | run | backend flags |
 |---|---|---|---|
-| C1 | **6**: compositor-VM (guest Hyprland on the host card) | `NVGPU_TIMEOUT=600 NVGPU_CMDLINE_EXTRA="nvgpu_comp=hyprland nvgpu_timeout=560" scripts/run-guest.sh --kms-card compositor s6` | `--kms-card` |
-| C2 | **7**: export mode (host client shown by the guest compositor) | `mkdir -m 0700 -p "$XDG_RUNTIME_DIR/nvgpu-export"`, then `scripts/run-guest.sh --kms-card --wayland-export "$XDG_RUNTIME_DIR/nvgpu-export/wayland-x" export s7` | `--kms-card --wayland-export PATH` (PATH's directory must be yours) |
+| C1 | **6**: compositor-VM (guest Hyprland on the host card) | `NVGPU_TIMEOUT=600 NVGPU_CMDLINE_EXTRA="nvgpu_comp=hyprland nvgpu_timeout=560" rig/run-guest.sh --kms-card compositor s6` | `--kms-card` |
+| C2 | **7**: export mode (host client shown by the guest compositor) | `mkdir -m 0700 -p "$XDG_RUNTIME_DIR/nvgpu-export"`, then `rig/run-guest.sh --kms-card --wayland-export "$XDG_RUNTIME_DIR/nvgpu-export/wayland-x" export s7` | `--kms-card --wayland-export PATH` (PATH's directory must be yours) |
 | C3 | **9**: hotplug (unplug/replug, or toggle `leasable`) | as C1, probe `shell` (no hotplug probe yet) | `--kms-card` |
 
 ## Regression of the merged tree

@@ -24,7 +24,27 @@ modules.order
 .DS_Store
 .vscode/
 .idea/
-scripts/verify/bin/
+rig/verify/bin/
+
+# Local checkouts and state beside the tree, never part of it: the test rig's
+# data (.rig/), the host compositor's and NVIDIA's sources, audit scratch,
+# agent worktrees, and nix build links.
+/.rig/
+/hyprland/
+/nvidia-driver/
+/audit/
+/.claude/
+/result
+/result-*
+
+# Fuzzing: corpora, findings and coverage, in both fuzz workspaces
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/driver/rust/fuzz/target/
+/driver/rust/fuzz/corpus/
+/driver/rust/fuzz/artifacts/
+/driver/rust/fuzz/coverage/
 
 # The NixOS config agent's host-specific brief (kept out of the repository)
 NIXOS-AGENT.md

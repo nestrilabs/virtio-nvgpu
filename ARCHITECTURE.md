@@ -25,7 +25,7 @@ faster than prose can follow.
 > with the UVM aperture and memory registered by its pages (§5); the RM
 > allowlist, enforcing; and the security changes that came with them
 > ([`SECURITY.md`](SECURITY.md)). About 35 applications ran on the live
-> desktop ([`TESTING-RIG.md`](TESTING-RIG.md)). None of it has been timed.
+> desktop ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)). None of it has been timed.
 >
 > **Built, not yet run on hardware:** a guest driving the host card itself
 > (compositor-VM mode, §11) and export mode (§14), which need the host desktop
@@ -360,7 +360,7 @@ guest driver then makes no UVM device and does not register the
 `nvidia-uvm` major, which NVIDIA's userspace reads as a host whose
 nvidia-uvm is not loaded. Vulkan, OpenGL, EGL, Vulkan Video and the display
 paths use RM, NVKMS and nvidia-drm and none of this (SECURITY.md, "Compute").
-`scripts/run-guest.sh --allow-compute` (or `NVGPU_COMPUTE=1`) turns it on
+`rig/run-guest.sh --allow-compute` (or `NVGPU_COMPUTE=1`) turns it on
 for a run.
 
 ---

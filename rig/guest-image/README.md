@@ -1,17 +1,17 @@
 # guest-image: the test guest's root filesystem
 
 A reproducible, nix-built ext4 root for the on-device stages in
-[`TESTING.md`](../TESTING.md). It is a test image: every probe runs as root
+[`TESTING.md`](../../TESTING.md). It is a test image: every probe runs as root
 unless told otherwise, and it is not a model for a production guest
-([`DEPLOY.md`](../DEPLOY.md), "The guest", says what one needs). It carries NVIDIA's 595.99.02 userspace (the
+([`DEPLOY.md`](../../DEPLOY.md), "The guest", says what one needs). It carries NVIDIA's 595.99.02 userspace (the
 host's release, to the digit), the tools each stage runs, this repo's
 `nvgpu-wl-guest` and verify helpers, and one probe script per stage that runs
 as the guest's init and powers the VM off when it is done.
 
 ```sh
-guest-image/mkimage.sh                 # -> .rig/guest/rootfs.ext4 (golden; boot a copy)
-guest-image/mkimage.sh --module-only   # swap in .rig/kernel/nvgpu.ko, in place, seconds
-guest-image/mkimage.sh --probes-only   # copy probes/*.sh into the image, in place
+rig/guest-image/mkimage.sh                 # -> .rig/guest/rootfs.ext4 (golden; boot a copy)
+rig/guest-image/mkimage.sh --module-only   # swap in .rig/kernel/nvgpu.ko, in place, seconds
+rig/guest-image/mkimage.sh --probes-only   # copy probes/*.sh into the image, in place
 ```
 
 A full build is about 10 s warm (a few minutes cold: the 420 MB `.run`, a few
@@ -28,7 +28,7 @@ file in the image is `root:root`. Nothing is setuid.
 | `flake.nix`, `flake.lock` | the pinned nixpkgs and the guest root (`packages.x86_64-linux.guestRoot`) |
 | `nix/nvidia.nix` | 595.99.02 via `nvidiaPackages.mkDriver` (userspace: no module, firmware, settings or persistenced; 64-bit only), and the `/run/opengl-driver` tree: the driver plus egl-wayland, egl-wayland2, egl-gbm and egl-x11. **No mesa**: the guest must use NVIDIA's ICDs and fail loudly without them. |
 | `nix/nvgpu-wl-guest.nix` | the daemon, from the workspace `mkimage.sh` stages |
-| `nix/tools.nix`, `tools/*.c` | the helpers below, plus `sec-negative` and `lease-flip` from `scripts/verify` built against nix's libdrm |
+| `nix/tools.nix`, `tools/*.c` | the helpers below, plus `sec-negative` and `lease-flip` from `rig/verify` built against nix's libdrm |
 | `probes/*.sh` | the init scripts, installed to `/opt/nvgpu` |
 | `mkimage.sh` | build, stage, image |
 
@@ -40,7 +40,7 @@ e2fsck logs).
 A flake sees only its own tree, so the repo's sources reach it through
 `mkimage.sh`: it copies this directory to `.rig/guest/flake/` with a filtered
 `nvgpu-src/` beside it (`Cargo.toml`, `Cargo.lock`, the workspace members
-without `target/`, and `scripts/verify`). Building `guest-image/` directly
+without `target/`, and `rig/verify`). Building `rig/guest-image/` directly
 works too, but without `nvgpu-wl-guest` and the verify helpers
 (`/etc/nvgpu/manifest` says so).
 
@@ -69,7 +69,7 @@ works too, but without `nvgpu-wl-guest` and the verify helpers
   `drm_info` and `modetest -D` drive a lease, and (b) makes `modetest -D PATH`
   open a path: libdrm treats `-D` as a *bus id*, so `modetest -D /dev/dri/card0`
   as written in TESTING.md and `kms-smoke.sh` otherwise finds nothing.
-- `/opt/nvgpu/verify/`: `scripts/verify/*.sh`, with `bin/sec-negative` and
+- `/opt/nvgpu/verify/`: `rig/verify/*.sh`, with `bin/sec-negative` and
   `bin/lease-flip` already built.
 - `/opt/nvgpu/nvgpu.ko`: the guest module (Kbuild's `virtio_gpu_nv.ko`), put
   in at image time (never by nix), so a module change is `--module-only`.

@@ -18,7 +18,7 @@
 # Runs in the foreground until interrupted. While it runs, the socket's path
 # is in $NVGPU_RIG/run/headless-sway.socket, for
 #
-#   scripts/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" <probe>
+#   rig/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" <probe>
 #
 # Why a separate compositor, and why sway. The Wayland proxy has never run
 # against a real compositor, and a Hyprland session hands any client its
@@ -157,7 +157,7 @@ printf '%s\n' "$SOCK" > "$POINTER"
 echo "headless sway: renderer $RENDERER${NODE:+ on $NODE}, output HEADLESS-1 $MODE"
 echo "socket:  $SOCK   (also in $POINTER)"
 echo "log:     $LOG"
-echo "run:     scripts/run-guest.sh --wayland-socket $SOCK <probe>"
+echo "run:     rig/run-guest.sh --wayland-socket $SOCK <probe>"
 echo "Ctrl-C stops it."
 RC=0
 wait "$SWAY_PID" || RC=$?

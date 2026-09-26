@@ -16,7 +16,7 @@
 # toolchain is scripts/guest-toolchain-rust: the rig's pinned nixpkgs, plus
 # rustc, bindgen and rust-src.
 #
-# Usage: scripts/rig-build-kernel-rust.sh [jobs]
+# Usage: rig/rig-build-kernel-rust.sh [jobs]
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

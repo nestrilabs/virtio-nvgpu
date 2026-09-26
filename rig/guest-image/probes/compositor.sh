@@ -15,7 +15,7 @@ FRAMES=$(arg frames 120)
 load_module || finish
 
 section "guest-check.sh (card nodes expected)"
-step "scripts/verify/guest-check.sh" 60 bash "$NVGPU_VERIFY/guest-check.sh"
+step "rig/verify/guest-check.sh" 60 bash "$NVGPU_VERIFY/guest-check.sh"
 CARD=$(arg card "$(ls /dev/dri/card* 2>/dev/null | head -n 1)")
 if [ -z "$CARD" ] || [ ! -e "$CARD" ]; then
     fail "no guest card node (backend not started with --kms-card?)"

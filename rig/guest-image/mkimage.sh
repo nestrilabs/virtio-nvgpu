@@ -2,25 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # Build the guest root filesystem image: .rig/guest/rootfs.ext4.
 #
-# Usage: guest-image/mkimage.sh [options]
+# Usage: rig/guest-image/mkimage.sh [options]
 #   (none)            nix build the guest root, stage it with its closure, and
 #                     make the ext4 image (a few minutes cold, well under one
 #                     warm)
 #   --module-only     put .rig/kernel/nvgpu.ko (or --module PATH) into the
 #                     existing image in place, with debugfs; seconds
-#   --probes-only     copy guest-image/probes/*.sh into the existing image's
+#   --probes-only     copy rig/guest-image/probes/*.sh into the existing image's
 #                     /opt/nvgpu in place (for iterating on a probe; the next
 #                     full build puts the nix-built ones back, identical)
 #   --module PATH     the guest module to install (default .rig/kernel/nvgpu.ko)
 #   --out PATH        the image (default .rig/guest/rootfs.ext4)
 #   NVGPU_RIG=DIR     the rig directory (default the repo's .rig), as for
-#                     scripts/run-guest.sh
+#                     rig/run-guest.sh
 #   --headroom MIB    free space in the image beyond its contents (default 1024)
 #   --keep-staging    leave .rig/guest/staging after a full build
 #
 # What it does, in order (full build):
 #   1. stages this directory, plus a filtered copy of the repo's workspace and
-#      scripts/verify, as .rig/guest/flake/ (a flake can only see its own tree;
+#      rig/verify, as .rig/guest/flake/ (a flake can only see its own tree;
 #      see flake.nix), and `nix build`s its guestRoot, with the out-link at
 #      .rig/guest/result;
 #   2. copies guestRoot (the root overlay: /bin, /etc, /opt/nvgpu, ...) and
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
 RIG="${NVGPU_RIG:-$REPO/.rig}"
 G="$RIG/guest"
 LOGDIR="$RIG/logs/guest-image"
@@ -122,7 +122,7 @@ case $MODE in
             esac
             put_file "$p" /opt/nvgpu "$(basename "$p")" "$m"
         done
-        log "copied guest-image/probes/*.sh into $OUT:/opt/nvgpu"
+        log "copied rig/guest-image/probes/*.sh into $OUT:/opt/nvgpu"
         exit 0
         ;;
 esac
@@ -131,7 +131,7 @@ esac
 FLAKE="$G/flake"
 log "staging the flake at $FLAKE"
 if [ -d "$FLAKE" ]; then chmod -R u+w "$FLAKE"; rm -rf "$FLAKE"; fi
-mkdir -p "$FLAKE/nvgpu-src/scripts/verify"
+mkdir -p "$FLAKE/nvgpu-src/rig/verify"
 cp -a "$HERE/flake.nix" "$HERE/nix" "$HERE/tools" "$HERE/probes" "$HERE/apps" "$FLAKE/"
 [ -f "$HERE/flake.lock" ] && cp -a "$HERE/flake.lock" "$FLAKE/"
 # The workspace, as cargo needs to see it: every member, never a target/.
@@ -140,7 +140,7 @@ members=$(sed -n '/^members/,/\]/p' "$REPO/Cargo.toml" | grep -o '"[^"]*"' | tr 
 for m in $members; do
     tar -C "$REPO" --exclude=target --exclude='*.rs.bk' -cf - "$m" | tar -C "$FLAKE/nvgpu-src" -xf -
 done
-cp -a "$REPO"/scripts/verify/*.sh "$REPO"/scripts/verify/*.c "$FLAKE/nvgpu-src/scripts/verify/"
+cp -a "$REPO"/rig/verify/*.sh "$REPO"/rig/verify/*.c "$FLAKE/nvgpu-src/rig/verify/"
 
 log "nix build (log: $LOGDIR/build.log)"
 if ! nix build "path:$FLAKE#guestRoot" --out-link "$G/result" --print-build-logs \
@@ -152,7 +152,7 @@ fi
 # The first build writes the lock; keep it with the sources.
 if [ -f "$FLAKE/flake.lock" ] && ! cmp -s "$FLAKE/flake.lock" "$HERE/flake.lock" 2>/dev/null; then
     cp "$FLAKE/flake.lock" "$HERE/flake.lock"
-    log "wrote guest-image/flake.lock"
+    log "wrote rig/guest-image/flake.lock"
 fi
 ROOT=$(readlink -f "$G/result")
 log "guestRoot: $ROOT"
@@ -189,7 +189,7 @@ if [ -f "$MODULE" ]; then
     log "module: $MODULE"
 else
     log "WARNING: no module at $MODULE; the image has no /opt/nvgpu/nvgpu.ko."
-    log "         Add it later with: guest-image/mkimage.sh --module-only"
+    log "         Add it later with: rig/guest-image/mkimage.sh --module-only"
 fi
 
 # Directories the running guest writes to must be writable (store paths are

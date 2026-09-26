@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # TESTING.md "Security negative tests": the guest-reachable requests the
 # backend must refuse, fired from a real guest process
-# (scripts/verify/sec-negative.sh). Any mode; the KMS/lease tests run when a
+# (rig/verify/sec-negative.sh). Any mode; the KMS/lease tests run when a
 # KMS file is available:
 #   nvgpu_secneg_kms=auto|card|lease|none   (default auto: the card node when
 #       the backend offers card nodes (--kms-card), else a lease if

@@ -101,7 +101,7 @@ static void nvgpu_wl_dev_free(struct kref *ref) {
  * export mode, a host program's compositor), and a guest's clients only ever
  * talk to the daemon's socket, so only the daemon's account needs the node:
  * root:root 0660 by default, and a group for the daemon from udev
- * (scripts/70-nvgpu-wl.rules). A mode that gives "other" anything is
+ * (contrib/udev/70-nvgpu-wl.rules). A mode that gives "other" anything is
  * refused (the module does not load with it): that would make every guest
  * process a client of the host's compositor.
  */

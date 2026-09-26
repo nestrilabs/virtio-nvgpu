@@ -8,8 +8,9 @@ This repository's own code is under three licences, by directory (README.md,
   driver/uapi/nvgpu_wl.h,
   protocol/                      BSD-3-Clause OR GPL-2.0-or-later
                                  (LICENSE-BSD-3-Clause, LICENSE-GPL-2.0)
-  device/, wlwire/, nvgpu-wl-guest/, gen/, fuzz/, scripts/, guest-image/,
-  patches/nixos/*.nix            Apache-2.0 (LICENSE-APACHE-2.0)
+  device/, wlwire/, nvgpu-wl-guest/, gen/, fuzz/, scripts/, rig/, contrib/,
+  nix/, flake.nix, patches/nixos/*.nix
+                                 Apache-2.0 (LICENSE-APACHE-2.0)
 
 It contains or is derived from the third-party works below, which keep their
 own terms.

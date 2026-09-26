@@ -1339,7 +1339,7 @@ fn main() -> anyhow::Result<()> {
                 "refusing to start: {why}. RM, DRM and NVKMS take a guest's privilege from \
                  the backend's, so every guest process would be an RM administrator with \
                  BAR0 mappable read-write. Run the backend as an unprivileged user in the \
-                 video, render and kvm groups (scripts/run-guest.sh does), or pass \
+                 video, render and kvm groups (rig/run-guest.sh does), or pass \
                  --allow-root-unsafe --diagnostic"
             );
         }

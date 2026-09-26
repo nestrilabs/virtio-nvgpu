@@ -4,7 +4,7 @@ How to run the backend for real guests: what the host must have, which
 combinations are supported, how each VM gets a user of its own, which flags
 exist and which are only for diagnosis, what a guest image must contain, and
 what to watch for in the logs. [`SECURITY.md`](SECURITY.md) says what each of
-these protects against; [`TESTING-RIG.md`](TESTING-RIG.md) is how the project
+these protects against; [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md) is how the project
 itself runs guests on its dev box, with a launcher that is not meant for
 production.
 
@@ -102,10 +102,10 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 | compositor VM (`--kms-card`), export mode | **not run on hardware** | **not run on hardware** |
 
 "Run on hardware" means an RTX 5090 with 595.99.02 on an AMD host, with the
-probes and the application pass of [`TESTING-RIG.md`](TESTING-RIG.md) green,
+probes and the application pass of [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md) green,
 the RM allowlist enforcing and the sandbox on. The lease modes need the
 patched Hyprland 0.56.2 ([`patches/`](patches/)) as the host compositor. The
-compositor-VM and export modes (TESTING-RIG.md, "Group C") need the host
+compositor-VM and export modes (rig/TESTING-RIG.md, "Group C") need the host
 desktop stopped, and have run only in unit and loopback tests: treat them as
 unsupported until they have run. What each VMM checks of the backend's
 mapping requests: SECURITY.md §16.
@@ -274,7 +274,7 @@ opener can charge channels to any guest process. So the node's group,
 groupadd --system nvgpu-wl
 chgrp nvgpu-wl "$(command -v nvgpu-wl-guest)"
 chmod 2755 "$(command -v nvgpu-wl-guest)"        # setgid nvgpu-wl: not dumpable
-install -m 0644 scripts/70-nvgpu-wl.rules /etc/udev/rules.d/
+install -m 0644 contrib/udev/70-nvgpu-wl.rules /etc/udev/rules.d/
 udevadm control --reload && udevadm trigger --subsystem-match=misc
 ```
 
@@ -290,7 +290,7 @@ vendors, `libcuda` and the video libraries if compute is served); the
 `video`, `render` and `nvgpu-wl` groups and the udev rule; `nvgpu-wl-guest`
 setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set; and
 applications run as unprivileged users in `video` and `render` only.
-[`guest-image/`](guest-image/) builds the test image, which runs every probe
+[`rig/guest-image/`](rig/guest-image/) builds the test image, which runs every probe
 as root by default and is not a model for a production image.
 
 ## Not supported

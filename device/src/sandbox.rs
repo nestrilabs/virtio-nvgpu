@@ -13,7 +13,7 @@
 //! 1. **No network.** The backend needs none: every socket it uses is a
 //!    pathname UNIX socket or a netlink socket opened before this. If the
 //!    launcher already put it in a network namespace of its own (one with
-//!    only a loopback interface, as `scripts/run-guest.sh` does as root),
+//!    only a loopback interface, as `rig/run-guest.sh` does as root),
 //!    that is kept; otherwise it unshares a user namespace and a network
 //!    namespace together, which needs no privilege where unprivileged user
 //!    namespaces are allowed. The user namespace maps only the backend's own

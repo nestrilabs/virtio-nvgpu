@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# A dry run of scripts/run-guest.sh, root and unprivileged, with stub binaries:
+# A dry run of rig/run-guest.sh, root and unprivileged, with stub binaries:
 # no KVM, no GPU, no root. The root half runs in a user namespace (one uid,
 # mapped to 0), chrooted into a tmpfs holding a root-owned rig, and compares
 # the launcher against an older one on two things a root run must not do --
@@ -11,7 +11,7 @@
 # write or does not belong to root, no jailer). The unprivileged half checks
 # a rig run still gets to the VMM and still kills a stale backend of its own.
 #
-# Usage: scripts/verify/launcher-dryrun/run.sh [OLD_LAUNCHER]
+# Usage: rig/verify/launcher-dryrun/run.sh [OLD_LAUNCHER]
 #   OLD_LAUNCHER  a run-guest.sh to compare with (default: e513ba9's)
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,6 +31,6 @@ else
         nix shell nixpkgs#gcc -c gcc -O2 -o "$W/stubvmm" "$W/stubvmm.c"
 fi
 echo "### as root (in a user namespace)"
-unshare --user --map-root-user --mount --pid --fork bash "$W/setup.sh" "$W/old.sh" "$REPO/scripts/run-guest.sh"
+unshare --user --map-root-user --mount --pid --fork bash "$W/setup.sh" "$W/old.sh" "$REPO/rig/run-guest.sh"
 echo "### unprivileged"
-bash "$W/user.sh" "$REPO/scripts/run-guest.sh"
+bash "$W/user.sh" "$REPO/rig/run-guest.sh"

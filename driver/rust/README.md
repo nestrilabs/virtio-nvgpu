@@ -101,7 +101,7 @@ nix shell github:nix-community/fenix#minimal.toolchain nixpkgs#cargo-fuzz nixpkg
            cargo fuzz run --fuzz-dir driver/rust/fuzz diff_i2 -- -max_total_time=600'
 # The kernel with CONFIG_RUST and the module with the Rust parsers, in
 # .rig/kernel-rust/ (never .rig/kernel/):
-scripts/rig-build-kernel-rust.sh
+rig/rig-build-kernel-rust.sh
 ```
 
 The toolchain is `scripts/guest-toolchain-rust` (the rig's pinned nixpkgs:
@@ -112,14 +112,14 @@ rustc >= 1.85 and bindgen >= 0.71.1.
 
 ```sh
 cp .rig/guest/rootfs.ext4 .rig/guest/rootfs-rust.ext4
-guest-image/mkimage.sh --module-only --module .rig/kernel-rust/nvgpu.ko \
+rig/guest-image/mkimage.sh --module-only --module .rig/kernel-rust/nvgpu.ko \
   --out .rig/guest/rootfs-rust.ext4
 NVGPU_KERNEL=.rig/kernel-rust/vmlinux NVGPU_ROOTFS=.rig/guest/rootfs-rust.ext4 \
-  scripts/run-guest.sh <probe>
+  rig/run-guest.sh <probe>
 ```
 
 On 2026-09-26 this ran the whole Group A and B regression on the RTX 5090
-under nesbox, with results identical to the C module's (TESTING-RIG.md,
+under nesbox, with results identical to the C module's (rig/TESTING-RIG.md,
 "Regression of the merged tree").
 
 Run the Rust module on the kernel it was built against. (It references no

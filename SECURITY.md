@@ -15,7 +15,7 @@ is right.
 
 > **Hardware status (2026-09-26).** On an RTX 5090 with 595.99.02, under
 > nesbox and crosvm, with the RM allowlist enforcing (the default) and the
-> backend's sandbox on, the rig (`TESTING-RIG.md`) runs green on the code this
+> backend's sandbox on, the rig (`rig/TESTING-RIG.md`) runs green on the code this
 > document describes: stage 1; render with and without `--allow-compute`
 > (CUDA under both VMMs, crosvm's frontend jailed); the Wayland proxy against
 > a headless sway and against the live patched Hyprland, with direct scanout;
@@ -228,7 +228,7 @@ cuda-smoke's; the counts fit its two nvidia-smi runs, which were not traced.
 A host whose nvidia-uvm is not loaded is an ordinary configuration for
 NVIDIA's userspace, and the render probe checks that nvidia-smi, Vulkan and
 EGL still pass without it and that CUDA finds no device
-(`guest-image/probes/render.sh`). Vulkan Video (NVENC and NVDEC) uses RM's
+(`rig/guest-image/probes/render.sh`). Vulkan Video (NVENC and NVDEC) uses RM's
 video classes, not UVM; NVENC through CUDA is compute. What does go without
 the flag is registering existing host memory with RM:
 `VK_EXT_external_memory_host` imports and `cuMemHostRegister` fail, as they
@@ -496,7 +496,7 @@ removed, since nothing can say whether RM took it.
 
 | | dev | HEAD |
 |---|---|---|
-| identity | whoever started it. The shipped `scripts/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher, as root, gives each VM a slot of a user pool: the backend runs through `setpriv` as `nvgpu-vmN`, in the groups video, render and kvm, with no capabilities and no_new_privs, and the VMM under nesbox's jailer as `nvgpu-vmmN` (below, "One uid per VM"). With `--wayland-socket` the backend runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. Unprivileged (the rig), both are the invoking user. |
+| identity | whoever started it. The shipped `rig/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher, as root, gives each VM a slot of a user pool: the backend runs through `setpriv` as `nvgpu-vmN`, in the groups video, render and kvm, with no capabilities and no_new_privs, and the VMM under nesbox's jailer as `nvgpu-vmmN` (below, "One uid per VM"). With `--wayland-socket` the backend runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. Unprivileged (the rig), both are the invoking user. |
 | capabilities | whatever it was given | All dropped before the first thread exists (effective, permitted, inheritable, ambient, and the bounding set where it may), then no_new_privs, undumpable, umask 077. This holds under `--allow-root-unsafe` too, and RM decides administrator by `capable(CAP_SYS_ADMIN)` (`nv-linux.h`), so even then RM sees none. What root keeps is file access by uid. |
 | sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED` and stops the start; `--sandbox=best-effort` and `--sandbox=off` are diagnostic flags. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
 
@@ -550,7 +550,7 @@ files and sockets, the user's files, the network, other processes.
 
 ### One uid per VM
 
-Run as root, `scripts/run-guest.sh` takes a free slot N of a pool made once
+Run as root, `rig/run-guest.sh` takes a free slot N of a pool made once
 with `useradd` (the script's header): `nvgpu-vmN` runs the backend, and
 `nvgpu-vmmN`, whose group is `nvgpu-vmN`'s, runs the VMM under nesbox's jailer
 (chrooted into a jail image built for the run, a mount namespace of its own,
@@ -727,7 +727,7 @@ type. One listener is allowed per export.
 | `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` | 0666 | 0666, unchanged: any guest user reaches everything §3 lists. The two UVM nodes exist only when the backend runs with `--allow-compute` |
 | `/dev/nvidia-caps/*` | 0444 | 0444 |
 | DRM node | a hand-made character device, 0666 | a real DRM device per host render node, whose render and primary nodes the guest's DRM core makes. Syncobjs are enabled only when the backend serves fences, and the primary node drives KMS only when the backend offers `--kms-card`. |
-| `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`, which refuses any mode giving "other" access), with `scripts/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
+| `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`, which refuses any mode giving "other" access), with `contrib/udev/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
 | adopted DRM files | -- | a lease received from the host becomes a guest DRM file, cloned from a card-node file |
 | `nvgpu-wl-guest` | -- | a daemon listening at `$XDG_RUNTIME_DIR/wayland-0` in the guest |
 
@@ -1086,7 +1086,7 @@ In rough order of weight.
    (`set_driver_version`, `device/src/nvidia.rs`). It does not refuse them.
    Pointer scrubbing still applies, and UVM and NVKMS fail closed there.
 9. **The on-device negative test has a hole.** In
-   `scripts/verify/sec-negative.c`, the VID_HEAP_CONTROL half of T1 sets
+   `rig/verify/sec-negative.c`, the VID_HEAP_CONTROL half of T1 sets
    function 8 where ALLOC_OS_DESCRIPTOR is 27 (`nvos.h`), and sends a
    1,064-byte block where the escape is 184. The backend refuses it on size, so
    it passes without testing what it names. The backend's unit test
@@ -1137,7 +1137,7 @@ In priority order. Cost is a judgement, not a measurement.
 1. **Run the rest of [`TESTING.md`](TESTING.md)**: the compositor-VM and
    export modes, hotplug, and the performance stages. Groups A and B, the
    security negatives included, have run on the RTX 5090
-   (`TESTING-RIG.md`).
+   (`rig/TESTING-RIG.md`).
 2. **A memory cgroup per backend: done in the shipped unit.**
    `contrib/systemd/vhost-user-nvgpu@.service` runs each VM's backend in a
    cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and
@@ -1213,7 +1213,7 @@ budgets one app could empty for all the others. Everything was read from
 source (the guest module, the backend, the daemon, NVIDIA 610.57.04); the
 fixes are unit-tested and the guest module builds clean. At the time none of
 it had run on the GPU; it has since, in the rig's regression and application
-pass (`TESTING-RIG.md`).
+pass (`rig/TESTING-RIG.md`).
 
 ### Findings
 
@@ -1230,7 +1230,7 @@ pass (`TESTING-RIG.md`).
 | B5 | medium | app vs app | UVM placements, pools and OS-descriptor registrations capped per VM (four files took them); pools of two processes at one address collide in the one VMM address space, with a distinct errno | `6b75a82`, `fbe3f22` | **partly**: every one of those budgets now per process as well (a file's worth, with a reserve); a collision is ENOMEM like any refusal. Not fixable here: one process can still find another's pool address by trying, and squat on the address CUDA would use. UVM maps a pool only at the host address equal to its offset, so every guest process's pools share the VMM's one address space; only per-process VMM address spaces, or a UVM that maps at an offset, would end it |
 | W1 | medium | app vs app | 64 channels per VM, and the daemon opened one per client with no per-peer limit; 1 GiB of shm per VM at 512 MiB a connection | `b5980e5` | fixed: the daemon opens each client's channel with CONNECT_FOR, naming the client (SO_PEERCRED), and the guest module charges the OPEN to it; the backend holds each process to a quarter of the channels, a quarter of the shm (one budget for all its connections) and half of the queue budget |
 | W2 | medium | app vs app | the daemon's per-client output buffer had no bound: a client flooding requests whose replies it never read grew the daemon until the OOM killer took it, and every client with it | `b5980e5` | fixed: at 4 MiB unread the daemon stops reading that client's channel, and closes a client that stays behind for 30 s; the output waits in the backend, on that client's share (loopback test) |
-| W3 | medium | app vs app | at the VM's queue budget the connection whose output crossed it was dropped, often an innocent one; the rig's app pass (`6263e20`, on `display-passthrough`) puts the app user in `nvgpu-wl`, so any app can hold raw channels it never reads | `b5980e5` | fixed in the backend: the queue budget is per process, so the connection that crosses its share is its own. The guest-image side is fixed too: `guest-image/probes/apps.sh` (`nvgpu_user=1`) no longer adds the app user to `nvgpu-wl`, and gives the group to the daemon alone (§17, "The Wayland proxy") |
+| W3 | medium | app vs app | at the VM's queue budget the connection whose output crossed it was dropped, often an innocent one; the rig's app pass (`6263e20`, on `display-passthrough`) puts the app user in `nvgpu-wl`, so any app can hold raw channels it never reads | `b5980e5` | fixed in the backend: the queue budget is per process, so the connection that crosses its share is its own. The guest-image side is fixed too: `rig/guest-image/probes/apps.sh` (`nvgpu_user=1`) no longer adds the app user to `nvgpu-wl`, and gives the group to the daemon alone (§17, "The Wayland proxy") |
 | F2 | low | app vs app | export/import to a descriptor is a second way to move an RM object between clients, outside the DUP_OBJECT gate | -- | native strength, documented (§6): after R1/R2 the descriptor must be a control file the caller has open, which another process can only have handed it |
 | F3 | low | host surface | the aperture band [4 GiB, 32 TiB) can hold the VMM's own mappings, guest RAM among them, when its stack rlimit is unlimited (or above about 96 TiB: x86 then starts the mmap area near 21 TiB): a pool there fails, and says the address is taken | crosvm `patches/crosvm/0007`, `0008` | **fixed for crosvm, open for nesbox.** crosvm reserves the band (PROT_NONE, MAP_NORESERVE) at the start of `run_config`, before it maps guest RAM, and maps each pool with MAP_FIXED over its own reservation (§16); UVM refuses a pool moved in with mremap, so the window's map-then-move cannot be used. nesbox would need the same change to its start-up order, and a run to trust |
 | F4 | low | host surface | CARD_INFO, ATTACH_GPUS_TO_FD and NUMA_INFO pass with no size check | -- | unchanged (§3): the argument is never smaller than `_IOC_SIZE`, and ATTACH_GPUS_TO_FD, read again (nv.c), carries GPU ids only, no descriptor, once per file |
@@ -1334,7 +1334,7 @@ sent on as it is (`binapiControl`). Neither has a name or size in the open
 sources. Only the 28 GSS legacy and 2 BINAPI numbers observed are allowed (six of them since the application pass, below, each held to its measured size).
 
 **Added from the application pass (2026-09-26).** The pass on the live
-desktop (`TESTING-RIG.md`, "Application pass") ran NVENC, NVDEC, Vulkan
+desktop (`rig/TESTING-RIG.md`, "Application pass") ran NVENC, NVDEC, Vulkan
 Video and CUDA-runtime programs on the hardware for the first time. Every
 refusal it met is listed here with what was done; six GSS legacy controls
 were added to `observed.txt`, each held to its measured size:
@@ -1523,7 +1523,7 @@ the guest, the backend, the VMM, the host kernel and other VMs, against the
 product's requirement: no app less protected from another, no VM less
 protected from another, than natively. Read from source; the fixes are
 unit-tested and the guest module builds clean; at the time none of it had
-run on a GPU (it has since: `TESTING-RIG.md`).
+run on a GPU (it has since: `rig/TESTING-RIG.md`).
 
 | id | sev | lens | finding | status |
 |---|---|---|---|---|
@@ -1725,7 +1725,7 @@ allows `--allow-compute` with `--vmm crosvm` only when the binary's
 `run --help` names the `nvgpu-uvm-aperture`. The crosvm side has unit tests
 for every check above and the seccomp test, and has run on the RTX 5090: the
 render probe's CUDA and the security negatives with `--allow-compute`, with
-the frontend jailed (TESTING-RIG.md, "crosvm"). The frontend takes the backend's regions by id,
+the frontend jailed (rig/TESTING-RIG.md, "crosvm"). The frontend takes the backend's regions by id,
 however many it reports: a lone region that is not region 1 is no window.
 
 **Hot-plug.** A virtio device's control tube -- its PCI transport's,
@@ -1801,7 +1801,7 @@ protection away. They are hidden from `--help` (shown with `--diagnostic
 --help`), the backend refuses to start with any of them unless
 `--diagnostic` or `NVGPU_DIAGNOSTIC=1` is given too, and each in effect is
 announced as `DIAGNOSTIC: <flag>: <what it takes away>` on stderr, whatever
-the log level, and in the log. `scripts/run-guest.sh` adds `--diagnostic`
+the log level, and in the log. `rig/run-guest.sh` adds `--diagnostic`
 only when one of them reached the backend's arguments (after `--`, or from
 `NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`).
 
@@ -1995,7 +1995,7 @@ and wrote a user's files** (low): the launcher itself, the binaries (the
 jailer and virtiofsd too), kernel, rootfs, share, jail image and logs
 directory, and every directory above them, must be root's and writable by
 no one else (a sticky one aside), and are used by their resolved paths.
-`scripts/verify/launcher-dryrun/run.sh` shows both against the launcher
+`rig/verify/launcher-dryrun/run.sh` shows both against the launcher
 before this: in a user namespace, as its root, with stub binaries, the old
 one killed another VM's backend and VMM and turned a root daemon's 0600
 socket 0660; this one kills neither and refuses the symlink. Cleanup:
@@ -2055,7 +2055,7 @@ hand against a bound of 16 KiB, which a single blob chunk trips.
 **W3's guest-image side: fixed.** `apps.sh` (`nvgpu_user=1`) no longer puts
 the app user in `nvgpu-wl`: the apps are in `video` and `render` only, and
 the daemon alone is started with `nvgpu-wl` added to its groups (checked in
-`guest-image/probes/apps.sh`). The rig runs the daemon as the app's own uid;
+`rig/guest-image/probes/apps.sh`). The rig runs the daemon as the app's own uid;
 a production guest runs it setgid `nvgpu-wl` or as an account of its own
 ([`DEPLOY.md`](DEPLOY.md), "The guest").
 

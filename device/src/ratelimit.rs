@@ -6,7 +6,7 @@
 //! control the host turned down. Each costs the guest microseconds and the
 //! host a formatted line, so a guest posting them in a loop writes on the
 //! order of ten megabytes a second -- into an unrotated file under the
-//! repository's own launcher (scripts/run-guest.sh), or through journald,
+//! repository's own launcher (rig/run-guest.sh), or through journald,
 //! which drops them only after parsing every one (S-20). None of those sites
 //! can be trusted to stay quiet on their own, and there are over two hundred
 //! of them.

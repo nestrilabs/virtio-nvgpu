@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 1 (and 0.1): the module loads, HELLO negotiates protocol v2,
 # the nodes are there, and the driver's own libraries advertise the extensions
-# the later stages need (scripts/verify/guest-check.sh). Any display mode.
+# the later stages need (rig/verify/guest-check.sh). Any display mode.
 . /opt/nvgpu/probe-common.sh
 probe_init stage1 90
 
@@ -31,6 +31,6 @@ if load_module; then
     fi
 
     section "guest-check.sh"
-    step "scripts/verify/guest-check.sh" 60 bash "$NVGPU_VERIFY/guest-check.sh"
+    step "rig/verify/guest-check.sh" 60 bash "$NVGPU_VERIFY/guest-check.sh"
 fi
 finish

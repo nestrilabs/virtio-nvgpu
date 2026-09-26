@@ -100,10 +100,10 @@ fn main() {
         let mut d = Daemon::new(cfg.clone(), Box::new(DevConnector { path: device })).map_err(
             |e| match e.kind() {
                 // The node is 0660 root:root unless udev gives it a group
-                // (scripts/70-nvgpu-wl.rules).
+                // (contrib/udev/70-nvgpu-wl.rules).
                 std::io::ErrorKind::PermissionDenied => format!(
                     "{}: {e}; run as a member of the group the node belongs to \
-                     (scripts/70-nvgpu-wl.rules makes it nvgpu-wl)",
+                     (contrib/udev/70-nvgpu-wl.rules makes it nvgpu-wl)",
                     path.display()
                 ),
                 _ => e.to_string(),

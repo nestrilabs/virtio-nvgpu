@@ -170,7 +170,7 @@ BINAPI_CLASS = 0x2081
 # for them (RmGssLegacyRpcCmd copies paramsSize bytes and forwards them to
 # GSP-RM), so without this a guest could hand GSP-RM a block of any length.
 # Measured with an LD_PRELOAD ioctl logger around the native runs that use
-# them (TESTING-RIG.md, "Application pass"); every block was all zeros in, and
+# them (rig/TESTING-RIG.md, "Application pass"); every block was all zeros in, and
 # out held clock rates or zeros -- no pointer, descriptor or process id.
 # Their ranges are NVIDIA's own NV2080_CTRL_*_LEGACY_NON_PRIVILEGED (0x81 GPU,
 # 0x90 CLK, 0xa0 PERF; ctrl2080base.h).

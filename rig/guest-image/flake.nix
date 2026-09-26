@@ -8,7 +8,7 @@
   # README.md; do not build this directly unless you know you want the pieces.
   #
   # The repo's own sources (nvgpu-wl-guest and the workspace it lives in, and
-  # scripts/verify) are NOT read from the parent directory: a flake can only
+  # rig/verify) are NOT read from the parent directory: a flake can only
   # see its own tree. mkimage.sh copies them into ./nvgpu-src of a staged copy
   # of this directory (under .rig/guest/flake) and builds that. Without
   # ./nvgpu-src the image is built without nvgpu-wl-guest and the verify
@@ -152,7 +152,7 @@
             wev # the events a client gets (apps.sh pointer)
             wl-clipboard # wl-copy, wl-paste (apps.sh clipboard)
             dbus # dbus-run-session, for the toolkits
-            # The broader application pass (apps.sh; TESTING-RIG.md has the
+            # The broader application pass (apps.sh; rig/TESTING-RIG.md has the
             # table): games and engines, creative apps, office and toolkits,
             # Electron, video decode and encode, and compute.
             supertuxkart # GL, SDL2, native Wayland
@@ -209,7 +209,7 @@
           inherit appsData;
           bash = pkgs.bashInteractive;
           coreutils = pkgs.coreutils;
-          verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/scripts/verify";
+          verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/rig/verify";
           tools = tools;
         }
         ''

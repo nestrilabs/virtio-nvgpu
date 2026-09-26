@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Real applications through the Wayland proxy, one at a time, each for a slot
-# the host side (scripts/rig-app-check.sh) watches: it waits for the line
+# the host side (rig/rig-app-check.sh) watches: it waits for the line
 #   APP_START <name>
 # on the console, finds the app's window in the host compositor, captures it,
 # and for the input apps types and clicks into it. What only the guest can
@@ -9,7 +9,7 @@
 # the slot and reported as PASS/FAIL.
 #
 #   nvgpu_apps=a,b,c   which apps (default: the first set below; the rest
-#                      are named one by one, TESTING-RIG.md has batches)
+#                      are named one by one, rig/TESTING-RIG.md has batches)
 #   nvgpu_slot=S       seconds per app (default 25; a slow starter gets more)
 #   nvgpu_live=1       the host is the live desktop (rig-app-check.sh --live):
 #                      nothing will be typed, so no slot waits for input
@@ -88,7 +88,7 @@ dbus() {
 # SLOTLEN=S before it gives this slot S seconds instead (never fewer than
 # $SLOT); OPTS adds to the announcement (wait=S, settle=S). KNOWN="why", when
 # set, makes an early exit a SKIP: a failure that is the same natively
-# (TESTING-RIG.md, "Application pass", says how each was shown).
+# (rig/TESTING-RIG.md, "Application pass", says how each was shown).
 slot() {
     local name=$1 len=${SLOTLEN:-$SLOT}
     shift
@@ -339,7 +339,7 @@ HTML
             # The same game nested in gamescope: an X11 client of gamescope's
             # own Xwayland, composited by gamescope with Vulkan. The race
             # outlasts the slot: gamescope 3.16 segfaults as it tears down
-            # after its child exits (TESTING-RIG.md), which is not this test.
+            # after its child exits (rig/TESTING-RIG.md), which is not this test.
             SLOTLEN=55 OPTS="wait=40 settle=15" slot stkgs gamescope -W 1280 -H 720 -- supertuxkart \
                 --no-start-screen --track=lighthouse --numkarts=4 --laps=1 --profile-time=90 --windowed
             check stkgs "GL renderer" 'NVIDIA|GeForce'
@@ -361,7 +361,7 @@ HTML
             # Forward+ enables every ray tracing extension the device lists,
             # and NVIDIA's driver lists them without /dev/nvidia-uvm but
             # cannot create a device with them (VK_ERROR_INITIALIZATION_FAILED):
-            # natively the same with the node hidden (TESTING-RIG.md).
+            # natively the same with the node hidden (rig/TESTING-RIG.md).
             kn=
             [ "$a" = godot ] && [ "$COMPUTE" != 1 ] &&
                 kn="no UVM (graphics-only guest): NVIDIA's vkCreateDevice fails with the ray tracing extensions it lists"
@@ -534,7 +534,7 @@ HTML
                     hwa=(-hwaccel cuda)
                 fi
                 # H.264 on Vulkan Video stops short of the end in 2 of 5 runs
-                # natively too (this ffmpeg and driver; TESTING-RIG.md).
+                # natively too (this ffmpeg and driver; rig/TESTING-RIG.md).
                 kn=
                 [ "$a" = ffvkdec ] && [ "$c" = h264 ] && kn="H.264 Vulkan decode stalls before the last frame in 2 of 5 runs"
                 KNOWN=$kn task "$a-$c" 90 ffmpeg -hide_banner -v verbose "${hwa[@]}" -i "$f" -f null -
@@ -546,7 +546,7 @@ HTML
             done
             # Frames kept on the GPU (-hwaccel_output_format vulkan): H.264
             # stops after 252 of 300 frames and ignores SIGTERM, natively
-            # the same with this ffmpeg and driver (TESTING-RIG.md).
+            # the same with this ffmpeg and driver (rig/TESTING-RIG.md).
             [ "$a" = ffvkdec ] && KNOWN="H.264 Vulkan decode into GPU frames stalls at frame 252" \
                 task ffvkdec-h264-gpu 30 ffmpeg -hide_banner -init_hw_device vulkan=vk -hwaccel vulkan -hwaccel_device vk \
                 -hwaccel_output_format vulkan -i "$A/www/h264.mp4" -f null -

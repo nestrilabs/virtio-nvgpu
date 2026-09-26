@@ -31,7 +31,7 @@ vhost-user backend binary that serves it all to a VMM.
 **Where it stands.** The backend runs on an RTX 5090 (595.99.02) under nesbox
 and crosvm: every graphics and compute path, the Wayland proxy against the
 live host compositor, a lease and `VK_KHR_display`, with the RM allowlist
-enforcing and the sandbox on ([`TESTING-RIG.md`](../TESTING-RIG.md)). The
+enforcing and the sandbox on ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
 compositor-VM and export modes have not met real hardware. The crate's tests
 run the dispatcher, the IOCTL2 interpreter, the policies and the Wayland
 connection against fake kernels and a fake compositor; `nvgpu-wl-guest`'s

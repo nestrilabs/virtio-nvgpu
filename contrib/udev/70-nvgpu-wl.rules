@@ -11,7 +11,7 @@
 #   groupadd --system nvgpu-wl
 #   chgrp nvgpu-wl "$(command -v nvgpu-wl-guest)"
 #   chmod 2755 "$(command -v nvgpu-wl-guest)"    # setgid nvgpu-wl
-#   install -m 0644 scripts/70-nvgpu-wl.rules /etc/udev/rules.d/
+#   install -m 0644 contrib/udev/70-nvgpu-wl.rules /etc/udev/rules.d/
 #   udevadm control --reload && udevadm trigger --subsystem-match=misc
 #
 # Give the group to the daemon, never to an application account: whoever

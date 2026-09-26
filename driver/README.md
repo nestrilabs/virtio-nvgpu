@@ -46,7 +46,7 @@ and falls back to v1 — no display features — when it does not. It has run on
 Linux 7.2.7 guests on an RTX 5090 (595.99.02), under nesbox and crosvm, built
 both ways (C and Rust parsers): every graphics and compute path, the Wayland
 channel, a lease driven with KMS, `VK_KHR_display`, the security negatives
-and the application pass ([`TESTING-RIG.md`](../TESTING-RIG.md)). The
+and the application pass ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
 compositor-VM mode (the guest driving the host card) has not run on hardware.
 Off the hardware, its IOCTL2 interpreter is exercised end to end against the
 whole backend by `device/src/i2_e2e.rs`, which runs the module's own Rust
@@ -98,7 +98,7 @@ against, as `make savedefconfig` writes it: copy it to a build tree's
 
 | parameter | default | what it does |
 |---|---|---|
-| `wl_mode` | `0660` | permissions of `/dev/nvgpu-wl*`, created `root:root`. Every open is a client of the host compositor, so the node is for the Wayland daemon alone; `scripts/70-nvgpu-wl.rules` gives it the `nvgpu-wl` group. A mode outside `0770` (anything for "other") is refused and the module does not load. |
+| `wl_mode` | `0660` | permissions of `/dev/nvgpu-wl*`, created `root:root`. Every open is a client of the host compositor, so the node is for the Wayland daemon alone; `contrib/udev/70-nvgpu-wl.rules` gives it the `nvgpu-wl` group. A mode outside `0770` (anything for "other") is refused and the module does not load. |
 | `virtio_id` | `45` | virtio device ID to bind: libkrun's number; another for a VMM that cannot express 45 (QEMU stops at 41) |
 
 Both are read-only once loaded. The experiment switches of earlier builds

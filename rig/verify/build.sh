@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Build the two C helpers (sec-negative, lease-flip) into scripts/verify/bin/.
+# Build the two C helpers (sec-negative, lease-flip) into rig/verify/bin/.
 #
 # Run it wherever the binary will run: on the dev box it finds a toolchain
 # through nix; inside the guest it uses the guest's own cc so the binary matches
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=scripts/verify/common.sh
+# shellcheck source=rig/verify/common.sh
 . "$here/common.sh"
 
 out="${1:-$here/bin}"

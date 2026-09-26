@@ -34,7 +34,7 @@ pkgs.stdenv.mkDerivation {
     vulkan-loader
     libglvnd
   ];
-  verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/scripts/verify";
+  verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/rig/verify";
   buildPhase = ''
     runHook preBuild
     CFLAGS="-O2 -g -Wall -Wextra -Wno-unused-parameter"

@@ -14,19 +14,19 @@ The design under test is the display modes of the README's "Display" section and
 come from the on-device plan in the verification review
 ([`docs/review/NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5) and
 the security review ([`docs/review/FINDINGS.md`](docs/review/FINDINGS.md)). The
-runnable helpers live in [`scripts/verify/`](scripts/verify/).
+runnable helpers live in [`rig/verify/`](rig/verify/).
 
 **Where it stands (2026-09-26).** Stages 1–5, 8, the lease round trip of 9 and
 the security negatives have run and pass on an **RTX 5090, driver 595.99.02**,
 under nesbox and crosvm, against the live patched Hyprland;
-[`TESTING-RIG.md`](TESTING-RIG.md) has the order they were run in, the results
+[`rig/TESTING-RIG.md`](rig/TESTING-RIG.md) has the order they were run in, the results
 and the application pass. Stages 6 and 7 (the compositor VM and export mode),
 hotplug, and the performance stages have not run.
 
 The machines this plan has been used on:
 
 - **RTX 5090, driver 595.99.02** — the dev box, where every stage above ran
-  ([`TESTING-RIG.md`](TESTING-RIG.md)).
+  ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)).
 - **RTX 3060, driver 595.99.02** — the box everything in [`BENCHMARKS.md`](BENCHMARKS.md)
   was measured on, before protocol v2.
 - **RTX A2000, driver 615.71.09** — renders (before protocol v2), not yet
@@ -86,7 +86,7 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   lease/compositor-VM stages if vblank waits hang.
 - **the backend must not be root.** RM, DRM and NVKMS all take the guest's
   privilege from the backend's credentials ([`FINDINGS.md`](docs/review/FINDINGS.md) S-5), and the backend
-  refuses to start as root. `scripts/run-guest.sh` runs as root itself (for the
+  refuses to start as root. `rig/run-guest.sh` runs as root itself (for the
   VMM) and starts the backend through `setpriv` as an unprivileged user, with the
   groups `video`, `render` and `kvm`, no capabilities and `no_new_privs`: a
   user of the VM's own from the pool `nvgpu-vm0`, `nvgpu-vm1`, ... by default
@@ -104,7 +104,7 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   it would run, read or write that is not root's, or sits in a directory
   someone else can write -- itself included -- so it is not run from a user's
   checkout: install a copy, `sudo install -D -o root -g root -m 0755
-  scripts/run-guest.sh /root/bin/run-guest.sh`, with the tree it expects under
+  rig/run-guest.sh /root/bin/run-guest.sh`, with the tree it expects under
   `/root` (the launcher's header), and name the layout:
   `sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh …` (or `NVGPU_RIG=` a
   root-owned rig). The VMM runs jailed unless `NVGPU_VMM_JAIL=auto|off`, and
@@ -131,7 +131,7 @@ host-side pieces, and **inside the guest** for the guest-side ones, so the binar
 matches the guest's glibc:
 
 ```sh
-scripts/verify/build.sh              # -> scripts/verify/bin/{sec-negative,lease-flip}
+rig/verify/build.sh              # -> rig/verify/bin/{sec-negative,lease-flip}
 ```
 
 It uses a system `cc` and `pkg-config libdrm` if present, and falls back to nix
@@ -144,14 +144,14 @@ otherwise. The tests link only libc and libdrm; nothing NVIDIA.
 The foundation: the transport is up, the nodes are present, and the driver's own
 libraries advertise the extensions the later stages need.
 
-**Config:** any mode. Boot the guest with `scripts/run-guest.sh` as usual; each
+**Config:** any mode. Boot the guest with `rig/run-guest.sh` as usual; each
 display mode adds its flags to that command line (see the appendix), and the
 launcher passes them to the backend.
 
 **Run (in the guest):**
 
 ```sh
-scripts/verify/guest-check.sh
+rig/verify/guest-check.sh
 ```
 
 **Expected:**
@@ -198,15 +198,15 @@ other GPU clients.
 ```sh
 export EHKS=/opt/ehks/libenvyhooks.so
 # W1 offscreen, W2 Wayland present, W3 display present:
-scripts/verify/envy-capture.sh bare  W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
-scripts/verify/envy-capture.sh guest W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
+rig/verify/envy-capture.sh bare  W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
+rig/verify/envy-capture.sh guest W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
 # … and again for W2 (vkcube --wsi wayland --c 300) and W3 (vkcube --wsi display --c 300)
 ```
 
 Then diff:
 
 ```sh
-scripts/verify/envy-diff.sh ~/ehks/bare/W1 ~/ehks/guest/W1
+rig/verify/envy-diff.sh ~/ehks/bare/W1 ~/ehks/guest/W1
 ```
 
 `envy-diff.sh` normalises away the differences that are *expected* — RM-assigned
@@ -309,10 +309,10 @@ drm_info /dev/dri/card1                 # lists the leased connector
 modetest -D /dev/dri/card1 -c           # connectors/modes visible
 kmscube -D /dev/dri/card1               # renders to the leased output
 # or the smoke helper (modeset + a few page flips, reports flip pacing):
-scripts/verify/lease-flip.sh --device /dev/dri/card1 --frames 120
+rig/verify/lease-flip.sh --device /dev/dri/card1 --frames 120
 ```
 
-`lease-flip.sh` / `scripts/verify/kms-smoke.sh` are the minimal libdrm drivers if
+`lease-flip.sh` / `rig/verify/kms-smoke.sh` are the minimal libdrm drivers if
 `kmscube` is not to hand; `kms-smoke.sh <dev> DP-2@crtc:preferred` does an
 explicit `modetest` modeset.
 
@@ -366,9 +366,9 @@ offers `DEV_DRI_CARD_*` nodes and `num_cards > 0` in HELLO.
 **Guest:**
 
 ```sh
-scripts/verify/guest-check.sh          # now expects /dev/dri/card* to be present
-scripts/verify/kms-smoke.sh /dev/dri/card0            # enumerate
-scripts/verify/kms-smoke.sh /dev/dri/card0 DP-1@crtc:preferred   # drive it
+rig/verify/guest-check.sh          # now expects /dev/dri/card* to be present
+rig/verify/kms-smoke.sh /dev/dri/card0            # enumerate
+rig/verify/kms-smoke.sh /dev/dri/card0 DP-1@crtc:preferred   # drive it
 Hyprland                                # a full guest compositor on the host card
 ```
 
@@ -477,8 +477,8 @@ makes the request, and that neither the guest nor the host dies doing it.
 **Run (guest):**
 
 ```sh
-scripts/verify/sec-negative.sh                       # ctl + render tests
-scripts/verify/sec-negative.sh -- --kms /dev/dri/card1   # add the KMS/lease tests
+rig/verify/sec-negative.sh                       # ctl + render tests
+rig/verify/sec-negative.sh -- --kms /dev/dri/card1   # add the KMS/lease tests
 ```
 
 The tests, each an ioctl a hostile guest would use:
@@ -552,7 +552,7 @@ over the same window.
 
 A present path is only right if it holds cadence. Two ways to see it:
 
-- **Leased output:** `scripts/verify/lease-flip.sh --device /dev/dri/cardN
+- **Leased output:** `rig/verify/lease-flip.sh --device /dev/dri/cardN
   --frames 300` reports mean/min/max flip interval; the mean should sit at the
   monitor's refresh period (16.67 ms at 60 Hz) with a tight spread.
 - **Wayland present:** the whole-chain measurement BENCHMARKS.md already uses —

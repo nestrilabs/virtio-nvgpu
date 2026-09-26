@@ -138,7 +138,7 @@ below, and not a property of the design.
 
 The display paths now run on hardware -- the Wayland-client mode with direct
 scanout, a lease driven with KMS, and `VK_KHR_display` on an RTX 5090
-(595.99.02), under nesbox and crosvm ([`TESTING-RIG.md`](TESTING-RIG.md)) --
+(595.99.02), under nesbox and crosvm ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)) --
 but none has been timed, so there is no number for them here, and none should
 be quoted. The application pass's frame rates (SuperTuxKart's 116 fps, say)
 are what an app reported, not measurements in the discipline of this file.

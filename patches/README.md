@@ -7,7 +7,7 @@ so these patches let it lease a normal monitor too.
 
 **Status.** The 0.56.2 pair (`…-efb5099.patch` + `…-1a10fe2.patch`) runs as the live desktop compositor
 of the dev box, Hyprland 0.56.2 at `efb50993` from its flake, and carried every lease stage on an RTX 5090
-(TESTING-RIG.md, "Group B"): a desktop monitor leased to a guest, driven with KMS and `VK_KHR_display`,
+(rig/TESTING-RIG.md, "Group B"): a desktop monitor leased to a guest, driven with KMS and `VK_KHR_display`,
 and taken back after each lease. The `e368c13c` pair builds and passes Hyprland's and aquamarine's own
 tests, and has not run as a desktop.
 
@@ -93,7 +93,7 @@ patch changes no headers, so the ABI is unchanged.
 # crosvm
 
 `crosvm/` is a series of nine patches against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets
-crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; TESTING-RIG.md,
+crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; rig/TESTING-RIG.md,
 "crosvm"). All nine have run on an RTX 5090, graphics and compute, the frontend jailed:
 
 | Patch | What it does |
@@ -108,7 +108,7 @@ crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM
 | `0008-devices-virtio-nvgpu-s-UVM-aperture-in-the-window-s-.patch` | more than one shared memory region per virtio-pci device (`VirtioDevice::get_extra_shared_memory_regions`, empty by default), each with its own capability at its own offset of the one BAR; the transport reports the layout, and the queue notification addresses, to the main process. The nvgpu frontend takes regions by id and publishes region 2, the UVM aperture, when the backend reports it (`--allow-compute`), checks each pool itself first and sends it as `RegisterUvmPool`; crosvm wires the restricted tubes, and reserves the band at the start of `run_config` when a device is of type nvgpu |
 | `0009-devices-run-the-nvgpu-vhost-user-frontend-in-a-jaile.patch` | with the sandbox on, the nvgpu vhost-user frontend runs in a minijail'd process of its own under `vhost_user_frontend_device.policy` (common device syscalls, `getrandom`, `prctl` names; `open` refused; no socket, no ioctl beyond vmm-swap's); a test forks the real frontend under the embedded policy against a fake backend and main process; `run --help` names the `nvgpu-uvm-aperture` for the launcher to detect. Other vhost-user types keep upstream's in-process frontend. No virtio device's control tube may ask for a hot-plug |
 
-To apply and build: the top of `scripts/rig-build-crosvm.sh` (`CROSVM_SRC`, `CROSVM_OUT` build another
+To apply and build: the top of `rig/rig-build-crosvm.sh` (`CROSVM_SRC`, `CROSVM_OUT` build another
 checkout to another binary). `0001`-`0006` are graphics only, with the frontend in crosvm's main process
 as upstream has it; `0007`-`0009` add compute and jail the frontend, and change no other device's
 seccomp policy or minijail setting. What the main process checks: SECURITY.md §16.

@@ -3,10 +3,10 @@
 # Run a command on the host the way the guest runs it, to tell a failure of
 # ours from one the app has natively: the guest image's own NVIDIA userspace
 # (its /run/opengl-driver, the same 595.99.02 files, pinned the way
-# guest-image/probes/env.sh pins them) and the image's own programs on PATH,
+# rig/guest-image/probes/env.sh pins them) and the image's own programs on PATH,
 # against the rig's headless sway -- never the desktop.
 #
-# Usage: scripts/rig-native-run.sh [--live] [--timeout S] -- CMD [ARGS...]
+# Usage: rig/rig-native-run.sh [--live] [--timeout S] -- CMD [ARGS...]
 #   --live      against the session's compositor instead (a window appears
 #               on the desktop; for comparing with a --live app pass only)
 #   --timeout   seconds before CMD is stopped (default 60); the exit status
@@ -15,7 +15,7 @@
 #               has it (bubblewrap: a /dev of its own with the other nodes)
 #
 # Needs a built image (.rig/guest/result) and, without --live,
-# scripts/rig-headless-sway.sh running. The image's store paths are read from
+# rig/rig-headless-sway.sh running. The image's store paths are read from
 # the chroot store's copy when there is one (nix without root).
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -44,7 +44,7 @@ if [ "$LIVE" = 1 ]; then
 else
     WL=$(cat "$RIG/run/headless-sway.socket" 2>/dev/null) || WL=
 fi
-[ -S "$WL" ] || { echo "no compositor socket ($WL); start scripts/rig-headless-sway.sh" >&2; exit 1; }
+[ -S "$WL" ] || { echo "no compositor socket ($WL); start rig/rig-headless-sway.sh" >&2; exit 1; }
 RT=$(mktemp -d "${TMPDIR:-/tmp}/nvgpu-native.XXXXXX")
 chmod 0700 "$RT"
 ln -s "$WL" "$RT/wayland-0"

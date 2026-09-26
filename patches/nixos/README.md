@@ -166,4 +166,4 @@ NixOS module:
   lease tests included.
 
 The 0.56.2 build has run as a live desktop compositor and carried every lease
-stage of [`TESTING-RIG.md`](../../TESTING-RIG.md) ("Group B").
+stage of [`rig/TESTING-RIG.md`](../../rig/TESTING-RIG.md) ("Group B").

@@ -152,7 +152,7 @@ mod tests {
                 "{cmd:#010x}"
             );
         }
-        // Seen used and left refused: works without it (TESTING-RIG.md).
+        // Seen used and left refused: works without it (rig/TESTING-RIG.md).
         assert!(r.control(0x2080_a028).is_none());
         assert_eq!(r.control(0x2080_8159).map(|c| c.size), Some(None));
     }

@@ -88,7 +88,7 @@ Details below.
 
 Run on an **RTX 5090, driver 595.99.02**, on the current code (2026-09-26),
 under both nesbox and crosvm, with the RM allowlist enforcing and the
-backend's sandbox on ([`TESTING-RIG.md`](TESTING-RIG.md)):
+backend's sandbox on ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)):
 
 - a guest enumerates the card — `nvidia-smi` reports real power and memory, and
   the `deviceUUID` is the host's
@@ -134,7 +134,7 @@ sync to go with them:
 **Modes 1 to 3 have run on hardware**: an RTX 5090 on 595.99.02, under nesbox
 and crosvm, against the live patched Hyprland (0.56.2), with explicit sync in
 the Wayland mode and a lease handed back and taken again. **Mode 4, and export
-mode, have not**: they need the desktop stopped (TESTING-RIG.md, "Group C").
+mode, have not**: they need the desktop stopped (rig/TESTING-RIG.md, "Group C").
 No mode has been timed yet.
 [`TESTING.md`](TESTING.md) is the plan, stage by stage; how to turn each mode
 on: [Display](#display).
@@ -165,7 +165,7 @@ its first thread in any case. In production each VM's backend runs as a user
 of its own (`nvgpu-vm0`, `nvgpu-vm1`, ...), with the VMM as the slot's
 `nvgpu-vmm0`, ..., from the shipped systemd unit or NixOS module, in a cgroup
 of its own with a memory bound ([`DEPLOY.md`](DEPLOY.md)); the rig's launcher,
-[`scripts/run-guest.sh`](scripts/run-guest.sh), does the same through
+[`rig/run-guest.sh`](rig/run-guest.sh), does the same through
 `setpriv` when run as root, and in the Wayland modes runs it as the owner of
 the compositor's socket or of the export directory ([Display](#display)).
 Its socket defaults to
@@ -197,7 +197,7 @@ What narrows the surface today:
   GET_EVENT_DATA) are refused (`device/src/guestptr.rs`)
 - **compute is opt-in.** Everything only CUDA needs -- `/dev/nvidia-uvm`,
   UVM's sharing mode and aperture, memory registered by its pages -- is served
-  only with `--allow-compute` (`scripts/run-guest.sh --allow-compute`, or
+  only with `--allow-compute` (`rig/run-guest.sh --allow-compute`, or
   `NVGPU_COMPUTE=1`). Without it the guest has no UVM device and CUDA finds no
   device; Vulkan, OpenGL, EGL, Vulkan Video and display need none of it
   ([`SECURITY.md`](SECURITY.md), "Compute")
@@ -305,7 +305,11 @@ both.
 | [`gen/`](gen/) | — | Generated tables: the ABI profiles, the IOCTL2 schema both halves interpret, NVKMS and nvidia-drm layouts, RM control pointers and UVM block sizes, each measured per driver release. Checked in *and* reproducible. |
 | [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0-or-later** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
 | [`patches/`](patches/) | the patched project's | Patches to Hyprland and aquamarine that let the host lease a desktop monitor to a guest, and to crosvm to run the device as a vhost-user frontend. |
-| [`scripts/`](scripts/) | — | The guest launcher, the guest's udev rule for `/dev/nvgpu-wl`, the Wayland loopback test, and [`scripts/verify/`](scripts/verify/), the helpers [`TESTING.md`](TESTING.md) runs on the GPU box. |
+| [`scripts/`](scripts/) | **Apache-2.0** | The project's own tooling: `ci.sh` (the checks, in tiers), `check-unsafe.sh`, `fuzz.sh`, `gen-check.sh` (every generated table against its sources), `build-guest-kernel.sh` (the guest kernel and module), the Wayland loopback test. |
+| [`contrib/`](contrib/) | **Apache-2.0** | What a deployment installs: the systemd unit per VM and its socket helper, and the guest's udev rule for `/dev/nvgpu-wl` ([`DEPLOY.md`](DEPLOY.md)). |
+| [`nix/`](nix/) | **Apache-2.0** | The NixOS module for the backend: per-VM users and the unit. The root `flake.nix` packages the backend and the daemon and runs the fast checks. |
+| [`rig/`](rig/) | **Apache-2.0** | The dev box's test rig, not for production: the launcher (`run-guest.sh`), preflight, the test guest image (`guest-image/`), the on-device helpers (`verify/`), and [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md). Its data lives in `.rig/`, git-ignored. |
+| [`docs/review/`](docs/review/) | — | Review records the security documents cite by finding id. |
 
 The layout follows [`chromeos/virtio-media`](https://chromium.googlesource.com/chromiumos/platform/virtio-media/),
 which solves the same problem — one repository holding a GPL guest driver beside
@@ -388,7 +392,7 @@ already implements the upstream `GET_SHMEM_CONFIG`, `SHMEM_MAP` and
 `SHMEM_UNMAP` messages byte for byte as rust-vmm does; the backend answers
 `GET_SHMEM_CONFIG`, which nesbox never asks. Every other device crosvm
 emulates is a minijail'd process with its seccomp policy, none of which
-changed. How to run it: [`TESTING-RIG.md`](TESTING-RIG.md), "crosvm".
+changed. How to run it: [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md), "crosvm".
 
 ---
 
@@ -556,7 +560,7 @@ driver and backend that both speak **protocol v2**. The guest module asks for it
 at probe (`HELLO`); an older backend answers the way it answers any message it
 does not know, and the guest stays on v1 with no display features at all.
 
-The backend is started by [`scripts/run-guest.sh`](scripts/run-guest.sh),
+The backend is started by [`rig/run-guest.sh`](rig/run-guest.sh),
 which passes the display flags through and picks the unprivileged user it runs
 as: a pool user of the VM's own by default, the socket's owner with
 `--wayland-socket`, and the export directory's owner with `--wayland-export`.
@@ -578,7 +582,7 @@ compositor, one host connection per guest client.
   ```sh
   groupadd --system nvgpu-wl
   usermod -aG nvgpu-wl <the daemon's account>
-  install -m 0644 scripts/70-nvgpu-wl.rules /etc/udev/rules.d/
+  install -m 0644 contrib/udev/70-nvgpu-wl.rules /etc/udev/rules.d/
   udevadm control --reload && udevadm trigger --subsystem-match=misc
 
   nvgpu-wl-guest &                      # as that account
@@ -753,7 +757,7 @@ natively: RM refuses a client of another release (`NVRM: API mismatch`).
 
 | version | card | how far it got |
 |---|---|---|
-| **595.99.02** | RTX 5090 | the current code: every graphics and compute path, three display modes, the application pass, under nesbox and crosvm ([`TESTING-RIG.md`](TESTING-RIG.md)) |
+| **595.99.02** | RTX 5090 | the current code: every graphics and compute path, three display modes, the application pass, under nesbox and crosvm ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)) |
 | **595.99.02** | RTX 3060 | the code before protocol v2: renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
 | **615.71.09** | RTX A2000 | the code before protocol v2: enumerates and renders; not benchmarked, and not re-tested since |
 

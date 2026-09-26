@@ -2,7 +2,7 @@
 {
   description = "virtio-nvgpu: NVIDIA GPU access in KVM guests at the driver ABI level";
 
-  # The nixpkgs the guest image and the rig are built with (guest-image/flake.nix).
+  # The nixpkgs the guest image and the rig are built with (rig/guest-image/flake.nix).
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/34ca302a9572963c02e385c056be37c85ff51b77";
 
   outputs =

@@ -5,7 +5,7 @@
 # default features (no virtio-gpu, virgl, virtio-wl, audio, usb or net):
 # the guest's GPU is the vhost-user nvgpu device, and nothing else is needed.
 #
-# Usage: scripts/rig-build-crosvm.sh [extra cargo args]
+# Usage: rig/rig-build-crosvm.sh [extra cargo args]
 #   NVGPU_RIG      the rig (default: the repo's .rig)
 #   CROSVM_SRC     the crosvm checkout (default: $NVGPU_RIG/src/crosvm)
 #   CROSVM_OUT     where the binary goes (default: $NVGPU_RIG/bin/crosvm)
