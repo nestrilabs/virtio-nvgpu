@@ -1331,7 +1331,9 @@ mod backend_tests {
     /// Fuzzing (`backend_v2`, `dind`): a deep pointer the guest places
     /// across a pointer RM follows (FIFO_GET_CHANNELLIST's at 8 and 16, the
     /// deep one at 12) would have RM read four bytes of the guest's and four
-    /// of our address as one pointer. Refused before anything is built.
+    /// of our address as one pointer. 12 is no pointer RM follows, so the
+    /// block is not relocated at all (review 2026-09-26, backend 7): RM
+    /// reads each of its two pointers as 0, no buffer, and nothing of ours.
     #[test]
     fn a_deep_pointer_across_a_pointer_rm_follows_never_reaches_rm() {
         let (mut be, h) = ctl();
@@ -1347,8 +1349,12 @@ mod backend_tests {
             &nested,
             Some((12, &[0u8; 8])),
         );
-        assert_eq!(st, -libc::EINVAL);
-        assert!(seen().is_empty(), "RM never saw it");
+        assert_eq!(st, 0);
+        assert!(
+            matches!(&seen()[..], [Seen::Lists { call: CHANNELLIST, arrays }]
+                if arrays == &[(0, vec![]), (0, vec![])]),
+            "RM saw two null pointers"
+        );
     }
 
     /// Fuzzing (`backend_v2`): FIFO_GET_CHANNELLIST's parameters sent 23
