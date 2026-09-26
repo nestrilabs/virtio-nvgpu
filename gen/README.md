@@ -68,6 +68,22 @@ Adding a driver version is one command plus a line in `src/versions/mod.rs`.
 If gVisor does not know the version, the generator says so and stops rather
 than guessing.
 
+### A new host release
+
+The backend refuses to start on a host release the tables were not measured
+at (`device/src/release.rs`): it needs this release's own RM allowlist
+(`rmallow/<release>.json`) and NVKMS schema (`nvkms/<release>.json`), a UVM
+table whose range holds it (the last one ends at the newest `uvm/*.json`),
+and an ABI profile no newer than `MEASURED_THROUGH` in `src/versions/mod.rs`.
+So measuring a release is: `rmallow_extract.py extract`, `nvkms_extract.py
+extract`, `uvm_extract.py extract` (and `scan`), `rmctrl_extract.py extract`,
+the renders, `schema_gen.py`, and moving `MEASURED_THROUGH` once gVisor's
+nvproxy (or a capture in `fixtures/`) shows the frontend escapes unchanged --
+or a new profile if they moved. Until then `--allow-unmeasured-release
+--diagnostic` runs the host on the nearest older tables, without compute,
+and says so at every start. `scripts/gen-check.sh` re-measures every
+checked-in release.
+
 ## Fixtures
 
 `fixtures/*.tsv` holds ioctl parameter sizes **observed on real hardware**,

@@ -2467,10 +2467,16 @@ impl NvidiaBackend {
     /// NVKMS schema exists for this host (`BCAP_NVKMS_TABLE`) -- which the
     /// guest uses to pick its own NVKMS table -- and lets a modeset IOCTL2
     /// find its table before the guest's first CHECK_VERSION_STR.
+    ///
+    /// The transport refuses to start on a version that does not parse, or
+    /// one the tables were not measured at (`crate::release`), before this.
     pub fn set_host_driver_version(&mut self, text: &str) {
         match abi::version::DriverVersion::parse(text) {
             Some(v) => self.set_driver_version(v),
-            None => log::warn!("host driver version {text:?} does not parse; no NVKMS schema"),
+            None => log::error!(
+                "host driver version {text:?} does not parse; no NVKMS schema, and no RM \
+                 escape passes the ABI check"
+            ),
         }
     }
 
@@ -2481,11 +2487,25 @@ impl NvidiaBackend {
         self.config.nvkms_table = crate::schema::modeset_table(v).is_some();
         self.abi = abi::versions::table_for(v);
         match self.abi {
-            Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
-            None => log::warn!(
-                "host driver {v} is older than every ABI profile; ioctls will be \
-                 forwarded without size checking"
+            Some(t) => log::debug!("host driver {v}: ABI profile selected, {} escapes", t.len()),
+            None => log::error!(
+                "host driver {v} has no measured ABI profile; every RM escape is refused"
             ),
+        }
+    }
+
+    /// `--allow-unmeasured-release`: a host newer than the ABI profiles were
+    /// measured through is size-checked against the nearest older profile,
+    /// rather than refused outright. After `set_host_driver_version`.
+    pub fn allow_unmeasured_release(&mut self) {
+        if let (Some(v), None) = (self.driver, self.abi) {
+            self.abi = abi::versions::nearest_table_for(v);
+            if self.abi.is_some() {
+                log::warn!(
+                    "host driver {v}: ABI profile of {} (nearest older, unmeasured at {v})",
+                    abi::versions::nearest_profile_version(v).expect("a table has a version")
+                );
+            }
         }
     }
 
@@ -2863,25 +2883,31 @@ impl NvidiaBackend {
         }
 
         // Only NVIDIA's own magic is described by the ABI tables.
+        let host = self
+            .driver
+            .map_or_else(|| "(unknown)".to_string(), |v| v.to_string());
         let refuse = match self.check_abi(escape, ireq.data_len) {
             AbiCheck::SizeMismatch { expected, actual } => {
                 log::warn!(
-                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
-                     {expected}",
-                    self.driver.expect("a profile implies a known version")
+                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {host} expects \
+                     {expected}"
                 );
                 true
             }
             AbiCheck::UnknownEscape => {
-                log::warn!(
-                    "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                    self.driver.expect("a profile implies a known version")
-                );
+                log::warn!("escape {escape:#04x} is not in the ABI profile for host driver {host}");
                 true
             }
-            // No profile yet means CHECK_VERSION_STR has not been answered,
-            // which is itself one of the first ioctls a client sends. Refusing
-            // here would refuse the call that makes checking possible at all.
+            // A known host with no profile: one no table was measured at,
+            // which the transport refuses to start on (crate::release). Its
+            // layouts are nobody's to guess.
+            AbiCheck::NoProfile if self.driver.is_some() => {
+                log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
+                true
+            }
+            // No version at all: only a backend built without the transport
+            // (the transport reads it from the driver before any guest
+            // calls), where the guest's CHECK_VERSION_STR teaches it.
             AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
         };
         if refuse {

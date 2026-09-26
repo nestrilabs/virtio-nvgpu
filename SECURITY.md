@@ -1513,3 +1513,27 @@ there collides: the guest driver now fails cleanly and names the bridge in
 the way, and `run-guest.sh` refuses a crosvm whose buses would hold the
 address.
 
+
+## 17. The 2026-09-26 review
+
+### Fail closed, and production hardening
+
+**Unmeasured driver releases.** A host release above the newest one
+measured silently ran on the newest release's tables (RM allowlist, ABI
+profile, NVKMS schema, and a UVM table open-ended at 999.999.999), and one
+below the oldest on the oldest's allowlist with no ABI profile, forwarding
+RM escapes unchecked. 580 is the precedent for why that matters: it added
+pointers to two controls the older list let through. Now the backend refuses
+to start unless every table was measured at the host's release
+(`device/src/release.rs`): its own RM allowlist and NVKMS schema, a UVM
+table whose range holds it (the last range now ends at the newest release
+measured, in both the backend's and the guest's copy), and an ABI profile no
+newer than `MEASURED_THROUGH` (`gen/src/versions/mod.rs`; 615.71.09, on
+gVisor's lineage, the A2000 capture, and every measured release's RM escape
+blocks). A version that does not parse is fatal. The tables chosen are named
+on one warning line at every start. `--allow-unmeasured-release` (a
+diagnostic flag) runs a newer or in-between host on the nearest older
+tables, without compute (no UVM table on either side); a host older than
+every release is refused regardless, and inside the backend it gets an
+empty RM allowlist and every RM escape refused. The rig's 595.99.02 is
+measured by all four.

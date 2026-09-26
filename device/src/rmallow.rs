@@ -89,6 +89,19 @@ enum What {
     VidHeap(u32),
 }
 
+/// The list of a host older than every release measured: nothing.
+static NO_RELEASE: Release = Release {
+    version: (0, 0, 0),
+    controls: &[],
+    classes: &[],
+    vidheap: &[],
+    deferred: &[],
+    unserved_controls: &[],
+    unserved_classes: &[],
+    total_controls: 0,
+    total_classes: 0,
+};
+
 /// The gate. One per backend: the host's release, the mode, and counts of
 /// what it refused.
 #[derive(Debug)]
@@ -139,12 +152,24 @@ impl RmAllow {
         self.mode = mode;
     }
 
-    /// Hold the guest to the list of the release the host runs.
+    /// Hold the guest to the list of the release the host runs: its own, or
+    /// the nearest older one's (which the backend starts on only with
+    /// `--allow-unmeasured-release`, `crate::release`). A host older than
+    /// every release measured gets an empty list: nothing reaches its RM.
     pub fn set_driver(&mut self, v: DriverVersion) {
-        let (release, exact) = rmallow::release_for(v);
+        let Some((release, exact)) = rmallow::release_for(v) else {
+            log::error!(
+                "RM allowlist: host driver {v} is older than every release measured ({}); \
+                 every RM control and class is refused",
+                rmallow::RELEASES[0].version()
+            );
+            self.release = &NO_RELEASE;
+            self.exact = false;
+            return;
+        };
         self.release = release;
         self.exact = exact;
-        log::info!(
+        let line = format!(
             "RM allowlist: host driver {v}, list of {}{} ({} of {} controls, {} of {} classes)",
             release.version(),
             if exact {
@@ -157,6 +182,13 @@ impl RmAllow {
             release.classes.len(),
             release.total_classes
         );
+        // The start-up line (crate::release) already names the list; a
+        // nearest-older one is worth saying twice.
+        if exact {
+            log::debug!("{line}");
+        } else {
+            log::warn!("{line}");
+        }
     }
 
     /// Check an RM escape before it reaches the host: `escape` its number,
@@ -378,6 +410,21 @@ mod tests {
                 "{cmd:#x}"
             );
         }
+    }
+
+    /// A host older than every release measured has no list: what the
+    /// newest host lets through is refused there.
+    #[test]
+    fn a_host_older_than_every_release_gets_nothing() {
+        let mut g = RmAllow::new(Mode::Enforce);
+        g.set_driver(DriverVersion::new(470, 256, 2));
+        let ok = nvos54(0x2080_0102, &[0u8; 580]);
+        assert!(g.check(NV_ESC_RM_CONTROL, &ok, 32).is_err());
+        let alloc = with_class(rmallow::NVOS64_SIZE, 0xc56f);
+        assert!(
+            g.check(NV_ESC_RM_ALLOC, &alloc, rmallow::NVOS64_SIZE)
+                .is_err()
+        );
     }
 
     #[test]

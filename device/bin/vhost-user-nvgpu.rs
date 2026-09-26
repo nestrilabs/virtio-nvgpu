@@ -121,6 +121,17 @@ struct Args {
     #[arg(long)]
     permissive_abi: bool,
 
+    /// Start on a host driver release the tables were not all measured at
+    /// (device::release), with the nearest older RM allowlist, ABI profile
+    /// and NVKMS schema, and no UVM table (compute refused).
+    ///
+    /// For keeping a host running across a driver upgrade until the new
+    /// release is measured (gen/README.md). The older tables may let
+    /// through a control whose parameters the new release reads
+    /// differently; that is what measuring it rules out.
+    #[arg(long)]
+    allow_unmeasured_release: bool,
+
     /// What to do with an RM control or class the host release's allowlist
     /// lacks: `enforce` refuses it before the host's RM sees it, as RM
     /// answers a call it does not implement; `log` logs it with RM's name
@@ -776,6 +787,7 @@ impl NvGpuBackend {
         rm_allowlist: device::rmallow::Mode,
         config: BackendConfig,
         wayland: Wayland,
+        allow_unmeasured: bool,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -789,6 +801,7 @@ impl NvGpuBackend {
             "driver {version} is loaded but owns no GPUs; the guest driver rejects an empty table"
         );
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
+        release_gate(&version, allow_unmeasured)?;
 
         let allow_compute = config.allow_compute;
         let mut nvidia = NvidiaBackend::with_default_zones();
@@ -796,6 +809,9 @@ impl NvGpuBackend {
         nvidia.set_rm_allowlist(rm_allowlist);
         nvidia.set_config(config);
         nvidia.set_host_driver_version(&version);
+        if allow_unmeasured {
+            nvidia.allow_unmeasured_release();
+        }
         nvidia.set_wayland(wayland.cfg);
         nvidia.set_wayland_export(wayland.export);
         nvidia.set_wayland_limits(wayland.limits);
@@ -1124,6 +1140,50 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 }
 
+/// Refuse a host release the tables were not measured at, unless
+/// `--allow-unmeasured-release`; name the tables chosen either way.
+fn release_gate(version: &str, allow_unmeasured: bool) -> anyhow::Result<()> {
+    let v = abi::version::DriverVersion::parse(version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "refusing to start: host driver version {version:?} does not parse, so no table \
+             can be chosen for it"
+        )
+    })?;
+    let cov = device::release::Coverage::of(v);
+    // One line, at warning level, every start: what a guest is held to.
+    log::warn!("{}", cov.summary());
+    if cov.measured() {
+        return Ok(());
+    }
+    let measured: Vec<String> = device::release::measured_releases()
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    if !cov.runnable() {
+        anyhow::bail!(
+            "refusing to start: host driver {v} is older than every release measured ({}); \
+             no table describes it",
+            measured.join(", ")
+        );
+    }
+    if !allow_unmeasured {
+        anyhow::bail!(
+            "refusing to start: host driver {v} is not a release the tables were measured at \
+             ({} unmeasured). Measured: {}. Measure it (gen/README.md), or run a measured \
+             release; --allow-unmeasured-release (with --diagnostic) runs it on the nearest \
+             older tables",
+            cov.unmeasured().join(", "),
+            measured.join(", ")
+        );
+    }
+    log::warn!(
+        "--allow-unmeasured-release: host driver {v} runs on the nearest older tables ({} \
+         unmeasured); a control or layout that changed in it is not caught",
+        cov.unmeasured().join(", ")
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // Every call site metered (device::ratelimit): most of what is logged
     // here is something a guest did, and a guest can do it in a loop.
@@ -1288,6 +1348,7 @@ fn main() -> anyhow::Result<()> {
         args.rm_allowlist,
         config,
         wayland,
+        args.allow_unmeasured_release,
     )?));
     if args.keep_guest_coherency {
         let shared = backend.read().expect("backend lock").shared.clone();

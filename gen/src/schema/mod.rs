@@ -763,7 +763,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(UVM_TABLES.last().unwrap().versions.1, v(999, 999, 999));
+        // The last ends at the newest release measured: nothing past it has a
+        // table, so compute is refused on a host nobody has looked at.
+        assert_eq!(UVM_TABLES.last().unwrap().versions.1, v(615, 71, 9));
+        assert!(uvm_table(v(615, 71, 9)).is_some());
+        assert!(uvm_table(v(615, 71, 10)).is_none());
+        assert!(uvm_table(v(999, 0, 0)).is_none());
+        // The rig's host.
+        assert!(uvm_table(v(595, 99, 2)).is_some());
     }
 
     #[test]
