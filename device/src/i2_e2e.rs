@@ -1,14 +1,18 @@
 //! IOCTL2 end to end, as close as it gets without a VM: the guest's
 //! interpreter against the whole backend.
 //!
-//! `Guest` below is `driver/nvgpu_i2.c` transliterated function for function
-//! (`nvgpu_i2_gather`/`_walk`/`_new_buf`/`_translate`/`_build` on the way out,
-//! `nvgpu_i2_parse`/`_restore`/`_outputs`/`_copy_back` on the way back),
-//! walking the Rust copy of the generated tables -- which the regeneration
-//! test in `abi::schema` holds equal to the C copy. It builds the request byte
-//! for byte as the driver does, including the header the transport sends and
-//! the response capacity it posts, and reads the reply the way the driver
-//! reads it, down to what lands in the caller's memory.
+//! The guest is the guest module's own IOCTL2 interpreter,
+//! `nvgpu_guest_core::guest::i2` (`driver/rust/core`: the code the Rust build
+//! of the module runs, and which `driver/rust/difftest` holds equal to
+//! `driver/nvgpu_i2.c`), walking the backend's copy of the generated tables
+//! turned into the guest's layout (`guest_table`, as `gen/schema_gen.py`
+//! writes `driver/gen/nvgpu_schema.h`; the regeneration test in
+//! `abi::schema` holds the two copies equal). It builds the request byte for
+//! byte as the driver does, posts the reply capacity the driver posts, and
+//! reads the reply the way the driver reads it, down to what lands in the
+//! caller's memory. What the module's hooks would do -- descriptor and GEM
+//! translation, the transport -- is `GuestEnv` below, standing in for
+//! `driver/nvgpu_rs.rs`.
 //!
 //! In between is the real backend: `NvidiaBackend::serve` (the class from the
 //! target's kind, the -EMSGSIZE check against the posted capacity,
@@ -18,6 +22,9 @@
 //! between the halves about layout, padding, record positions or ownership
 //! shows up here as a refused request or a wrong byte in user memory, rather
 //! than in a guest.
+//!
+//! `nvgpu-guest-core` is GPL-2.0 and a dev-dependency of this crate only: it
+//! is linked into this test and never into anything the crate ships.
 
 #![forbid(unsafe_code)]
 
@@ -25,36 +32,31 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 
+use nvgpu_guest_core::guest::i2::{self as gi2, Env, State, Store, Xfer};
+use nvgpu_guest_core::guest::schema as gs;
+use nvgpu_guest_core::guest::wire::Errno;
 use protocol::messages::*;
 
 use crate::hostfd::{self, HandleKind};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::PumpCmd;
-use crate::schema::{self, CopyBack, Dir, Field, Ioctl, Kind, Len, Span, Table};
+use crate::schema::{self, CopyBack, Dir, Field, Kind, Len, Limit, Table};
 use crate::session::Outcome;
 use crate::sys::block::Arg;
 use crate::xfer::Sys;
 
-// ───────────────────────── the guest, transliterated ─────────────────────────
+// ─────────────────────────── the guest's interpreter ───────────────────────────
 
-const HDR: usize = 16;
-/// NVGPU_SDIR_IN / NVGPU_SDIR_OUT.
-const IN: u8 = 1;
-const OUT: u8 = 2;
-const MAX_DEPTH: usize = 8;
-
-fn dir_bits(d: Dir) -> u8 {
-    match d {
-        Dir::In => IN,
-        Dir::Out => OUT,
-        Dir::InOut => IN | OUT,
-    }
-}
-
-fn align8(n: u64) -> u64 {
-    (n + 7) & !7
-}
+/// The request id the transport puts in the header; the backend echoes it.
+const REQ_ID: u32 = 0x1234;
+/// What the guest's device says it takes and builds (`dev->max_req`,
+/// `dev->max_resp`).
+const MAX_MSG: u64 = 256 << 10;
+/// `NVGPU_SIO_ARG_IN_ONLY`, which the interpreter never reads.
+const SIO_ARG_IN_ONLY: u16 = 1 << 1;
+/// `NVGPU_SFF_VALIDATE_NVKMS`, which the interpreter never reads.
+const SFF_VALIDATE_NVKMS: u8 = 1 << 1;
 
 fn rd(b: &[u8], off: usize, width: usize) -> u64 {
     let mut v = [0u8; 8];
@@ -64,6 +66,165 @@ fn rd(b: &[u8], off: usize, width: usize) -> u64 {
 
 fn wr(b: &mut [u8], off: usize, width: usize, v: u64) {
     b[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
+}
+
+/// `struct nvgpu_sfield` for `f`, field for field as `gen/schema_gen.py`'s
+/// `c_field` writes it into the guest's header.
+fn guest_field(f: &Field) -> gs::SField {
+    let mut s = gs::SField {
+        off: f.off,
+        ..Default::default()
+    };
+    if let Some(c) = f.cond {
+        s.flags |= gs::SFF_COND;
+        if c.ne {
+            s.flags |= gs::SFF_COND_NE;
+        }
+        (s.cond_off, s.cond_mask, s.cond_value) = (c.off, c.mask, c.value);
+    }
+    let children = |s: &mut gs::SField, c: schema::Span| {
+        if c.len > 0 {
+            (s.child, s.nchild) = (c.first, c.len);
+        }
+    };
+    match f.kind {
+        Kind::Ptr {
+            dir,
+            len,
+            copyback,
+            max,
+            stride,
+            children: c,
+        } => {
+            s.kind = gs::SF_PTR;
+            s.width = 8;
+            s.dir = match dir {
+                Dir::In => gs::SDIR_IN,
+                Dir::Out => gs::SDIR_OUT,
+                Dir::InOut => gs::SDIR_INOUT,
+            };
+            (s.max, s.stride) = (max, stride);
+            match len {
+                Len::Const(n) => (s.len_kind, s.len_a) = (gs::SLEN_CONST, n),
+                Len::Count { off, width, elem } => {
+                    (s.len_kind, s.len_a, s.len_width, s.len_elem) =
+                        (gs::SLEN_COUNT, off, width, elem)
+                }
+                Len::Sum { field, elem } => {
+                    (s.len_kind, s.len_a, s.len_elem) = (gs::SLEN_SUM, u32::from(field), elem)
+                }
+                Len::NvkmsParams => s.len_kind = gs::SLEN_NVKMS_PARAMS,
+            }
+            match copyback {
+                CopyBack::None => {}
+                CopyBack::Full => s.cb_kind = gs::SCB_FULL,
+                CopyBack::Partial { off, width, elem } => {
+                    (s.cb_kind, s.cb_off, s.cb_width, s.cb_arg) =
+                        (gs::SCB_PARTIAL, off, width, elem)
+                }
+                CopyBack::AllOrNothing { off, width, elem } => {
+                    (s.cb_kind, s.cb_off, s.cb_width, s.cb_arg) =
+                        (gs::SCB_ALL_OR_NOTHING, off, width, elem)
+                }
+                CopyBack::Exact { off, width } => {
+                    (s.cb_kind, s.cb_off, s.cb_width) = (gs::SCB_EXACT, off, width)
+                }
+                CopyBack::Range { off, len } => {
+                    (s.cb_kind, s.cb_off, s.cb_arg) = (gs::SCB_RANGE, off, len)
+                }
+                CopyBack::Written { off, width } => {
+                    (s.cb_kind, s.cb_off, s.cb_width) = (gs::SCB_WRITTEN, off, width)
+                }
+            }
+            children(&mut s, c);
+        }
+        Kind::Array {
+            count,
+            stride,
+            limit,
+            children: c,
+        } => {
+            s.kind = gs::SF_ARRAY;
+            (s.stride, s.count) = (stride, count);
+            match limit {
+                Limit::All => {}
+                Limit::Count { off, width } => {
+                    (s.len_kind, s.len_a, s.len_width) = (gs::SLEN_COUNT, off, width)
+                }
+                Limit::Planes { off } => (s.len_kind, s.len_a) = (gs::SLEN_PLANES, off),
+            }
+            children(&mut s, c);
+        }
+        Kind::FdIn { width, kinds, none } => {
+            (s.kind, s.width, s.kinds, s.none_value) = (gs::SF_FD_IN, width, kinds, none)
+        }
+        Kind::FdOut { width } => (s.kind, s.width) = (gs::SF_FD_OUT, width),
+        Kind::GemIn { validate_nvkms } => {
+            (s.kind, s.width) = (gs::SF_GEM_IN, 4);
+            if validate_nvkms {
+                s.flags |= SFF_VALIDATE_NVKMS;
+            }
+        }
+        Kind::GemOut => (s.kind, s.width) = (gs::SF_GEM_OUT, 4),
+    }
+    s
+}
+
+/// One of the guest's `struct nvgpu_stable`s, made from the backend's table.
+struct GuestTable {
+    ioctls: Vec<gs::SIoctl>,
+    fields: Vec<gs::SField>,
+    planes: &'static [u8],
+}
+
+impl GuestTable {
+    fn new(t: &Table) -> GuestTable {
+        let ioctls = t
+            .ioctls
+            .iter()
+            .map(|e| gs::SIoctl {
+                name: std::ptr::null(),
+                cmd: e.cmd,
+                nvkms_cmd: e.nvkms_cmd,
+                size: e.size,
+                sclass: sclass(e.class) as u8,
+                special: match e.special {
+                    schema::Special::None => 0,
+                    schema::Special::Atomic => gs::SSPECIAL_ATOMIC,
+                    schema::Special::NvkmsParams => 2,
+                },
+                flags: if e.exec == schema::Exec::Executor {
+                    gs::SIO_EXECUTOR
+                } else {
+                    0
+                } | if e.arg_in_only { SIO_ARG_IN_ONLY } else { 0 },
+                policy: e.policy,
+                field: e.fields.first,
+                nfield: e.fields.len,
+            })
+            .collect();
+        GuestTable {
+            ioctls,
+            fields: t.fields.iter().map(guest_field).collect(),
+            planes: t.planes,
+        }
+    }
+
+    fn table(&self) -> gs::Table<'_> {
+        gs::Table {
+            ioctls: &self.ioctls,
+            fields: &self.fields,
+            planes: self.planes,
+        }
+    }
+}
+
+fn sclass(c: schema::Class) -> u32 {
+    match c {
+        schema::Class::Render => gs::SCLASS_RENDER,
+        schema::Class::Kms => gs::SCLASS_KMS,
+        schema::Class::Modeset => gs::SCLASS_MODESET,
+    }
 }
 
 /// A guest process's memory: the regions an ioctl's pointers reach.
@@ -77,25 +238,14 @@ impl UserMem {
         self.regions.insert(addr, bytes.to_vec());
     }
 
-    fn region(&mut self, addr: u64, len: usize) -> Result<&mut [u8], i32> {
+    fn region(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
         let (&base, r) = self
             .regions
             .range_mut(..=addr)
             .next_back()
-            .ok_or(libc::EFAULT)?;
+            .ok_or(-libc::EFAULT)?;
         let at = (addr - base) as usize;
-        r.get_mut(at..at + len).ok_or(libc::EFAULT)
-    }
-
-    /// copy_from_user
-    fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, i32> {
-        Ok(self.region(addr, len)?.to_vec())
-    }
-
-    /// copy_to_user
-    fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), i32> {
-        self.region(addr, bytes.len())?.copy_from_slice(bytes);
-        Ok(())
+        r.get_mut(at..at + len).ok_or(-libc::EFAULT)
     }
 
     fn get(&self, addr: u64) -> &[u8] {
@@ -103,26 +253,51 @@ impl UserMem {
     }
 }
 
-/// struct nvgpu_i2_kbuf
-struct KBuf {
-    k: Vec<u8>,
-    dir: u8,
-    f: Option<&'static Field>,
-    parent: usize,
-    pbase: usize,
-    sent: u64,
-    uptr: u64,
+/// The kernel copies of one call's buffers, over the caller's memory
+/// (`copy_from_user` / `copy_to_user`).
+struct Bufs<'a> {
+    mem: &'a mut UserMem,
+    bufs: Vec<Option<Vec<u8>>>,
 }
 
-/// struct nvgpu_i2_slot
-struct GSlot {
-    f: &'static Field,
-    buf: usize,
-    off: usize,
-    orig: u64,
+impl Store for Bufs<'_> {
+    fn alloc(&mut self, i: usize, len: usize) -> Result<(), Errno> {
+        if self.bufs.len() <= i {
+            self.bufs.resize(i + 1, None);
+        }
+        assert!(self.bufs[i].is_none(), "buffer {i} made twice");
+        self.bufs[i] = Some(vec![0; len]);
+        Ok(())
+    }
+
+    fn fetch(&mut self, i: usize, uptr: u64) -> Result<(), Errno> {
+        let b = self.bufs[i].as_mut().ok_or(-libc::EINVAL)?;
+        let len = b.len();
+        b.copy_from_slice(self.mem.region(uptr, len)?);
+        Ok(())
+    }
+
+    fn buf(&self, i: usize) -> &[u8] {
+        self.bufs.get(i).and_then(|b| b.as_deref()).unwrap_or(&[])
+    }
+
+    fn buf_mut(&mut self, i: usize) -> &mut [u8] {
+        self.bufs
+            .get_mut(i)
+            .and_then(|b| b.as_deref_mut())
+            .unwrap_or(&mut [])
+    }
+
+    fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
+        let src = self.buf(i).get(start..end).ok_or(-libc::EFAULT)?.to_vec();
+        self.mem
+            .region(uptr + start as u64, src.len())?
+            .copy_from_slice(&src);
+        Ok(())
+    }
 }
 
-/// What the guest-side hooks (struct nvgpu_i2_ops) did, and what they
+/// What the guest-side hooks (`struct nvgpu_i2_ops`) did, and what they
 /// answer: a guest fd table and a guest GEM table standing in for the KMS
 /// workstream's materialisers.
 #[derive(Default)]
@@ -139,552 +314,111 @@ struct Hooks {
     closed: Vec<u32>,
 }
 
-/// struct nvgpu_i2_call plus struct nvgpu_i2_state.
-struct Guest {
-    table: &'static Table,
-    e: &'static Ioctl,
-    handle: u32,
-    render: u32,
-    cmd: u32,
-    max_req: u64,
-    max_resp: u64,
-    bufs: Vec<KBuf>,
-    slots: Vec<GSlot>,
-    fd: Vec<[u32; 4]>,
-    gem: Vec<[u32; 4]>,
-    dyn_: Vec<[u32; 4]>,
-    in_bytes: u64,
-    out_bytes: u64,
-    fdo: Vec<[u32; 4]>,
-    gemo: Vec<(u32, u32, u32, u64, u32)>,
-    ret: i32,
+/// The module around the interpreter: its hooks, answered from `Hooks`, and
+/// the transport, which is the backend itself.
+struct GuestEnv<'a> {
+    be: &'a mut NvidiaBackend,
+    hooks: &'a mut Hooks,
+    /// Bytes less than the interpreter's reply buffer to post as its
+    /// capacity.
+    short: usize,
+    /// Run on the backend after the call was prepared and before it runs.
+    meanwhile: &'a mut dyn FnMut(&mut NvidiaBackend),
+    /// The backend answered with status 0: the call reached the host
+    /// (or was answered in its stead), and what the interpreter returns
+    /// is the ioctl's result unless reading the reply failed.
+    answered: bool,
 }
 
-impl Guest {
-    /// nvgpu_i2_gather, for a call of `class` (call->sclass): a DRM-table
-    /// one, or an NVKMS one against `modeset` (dev->schema->modeset), keyed
-    /// by the command in the outer struct's first bytes.
-    fn gather(
-        mem: &mut UserMem,
-        class: schema::Class,
-        handle: u32,
-        render: u32,
-        cmd: u32,
-        uarg: u64,
-    ) -> Result<Self, i32> {
-        Self::gather_in(mem, class, None, handle, render, cmd, uarg)
-    }
+impl<'a> Env<Bufs<'a>> for GuestEnv<'_> {
+    type TBuf = Vec<u8>;
 
-    fn gather_in(
-        mem: &mut UserMem,
-        class: schema::Class,
-        modeset: Option<&'static Table>,
-        handle: u32,
-        render: u32,
-        cmd: u32,
-        uarg: u64,
-    ) -> Result<Self, i32> {
-        let (table, e) = if class == schema::Class::Modeset {
-            if cmd != schema::NVKMS_IOCTL_IOWR {
-                return Err(libc::ENOTTY);
-            }
-            let t = modeset.ok_or(libc::ENOTTY)?;
-            let prefix = mem.read(uarg, 4)?;
-            let e = t
-                .lookup_nvkms(rd(&prefix, 0, 4) as u32)
-                .ok_or(libc::ENOTTY)?;
-            (t, e)
-        } else {
-            let table = schema::DRM_TABLE;
-            let e = table.lookup(class, cmd).ok_or(libc::ENOTTY)?;
-            if e.cmd != cmd {
-                return Err(libc::EINVAL);
-            }
-            (table, e)
-        };
-        let mut g = Guest {
-            table,
-            e,
-            handle,
-            render,
-            cmd,
-            max_req: 256 << 10,
-            max_resp: 256 << 10,
-            bufs: Vec::new(),
-            slots: Vec::new(),
-            fd: Vec::new(),
-            gem: Vec::new(),
-            dyn_: Vec::new(),
-            in_bytes: 0,
-            out_bytes: 0,
-            fdo: Vec::new(),
-            gemo: Vec::new(),
-            ret: 0,
-        };
-        let mut dir = 0;
-        if cmd & (1 << 30) != 0 {
-            dir |= IN; // _IOC_WRITE
-        }
-        if cmd & (1 << 31) != 0 {
-            dir |= OUT; // _IOC_READ
-        }
-        // NVKMS never writes the outer struct.
-        if class == schema::Class::Modeset {
-            dir = IN;
-        }
-        // _IOC_SIZE
-        g.new_buf(mem, u64::from((cmd >> 16) & 0x3fff), dir, uarg)?;
-        g.walk(mem, 0, 0, e.fields, 0)?;
-        Ok(g)
-    }
-
-    fn rd(&self, b: usize, off: usize, width: usize) -> Result<u64, i32> {
-        let kb = &self.bufs[b].k;
-        if width > kb.len() || off > kb.len() - width {
-            return Err(libc::EINVAL);
-        }
-        Ok(rd(kb, off, width))
-    }
-
-    fn wr(&mut self, b: usize, off: usize, width: usize, v: u64) {
-        let kb = &mut self.bufs[b].k;
-        if width <= kb.len() && off <= kb.len() - width {
-            wr(kb, off, width, v);
+    fn fd_in(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, value: i64, _: u32) -> (i32, u32, u32) {
+        match self.hooks.fds.get(&value) {
+            Some(&(handle, flags)) => (0, handle, flags),
+            None => (-libc::EBADF, 0, 0),
         }
     }
 
-    /// nvgpu_i2_new_buf
-    fn new_buf(&mut self, mem: &mut UserMem, len: u64, dir: u8, uptr: u64) -> Result<usize, i32> {
-        if self.bufs.len() >= I2_MAX_BUFS as usize {
-            return Err(libc::E2BIG);
+    fn gem_in(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, guest: u32) -> (i32, u32, u32) {
+        match self.hooks.gems.get(&guest) {
+            Some(&(owner, gem)) => (0, owner, gem),
+            None => (-libc::ENOENT, 0, 0),
         }
-        if dir & IN != 0 {
-            self.in_bytes += align8(len);
-        }
-        if dir & OUT != 0 {
-            self.out_bytes += align8(len);
-        }
-        if self.in_bytes > self.max_req || self.out_bytes > self.max_resp {
-            return Err(libc::E2BIG);
-        }
-        let k = if dir & IN != 0 && len > 0 {
-            mem.read(uptr, len as usize)?
-        } else {
-            vec![0; len as usize]
-        };
-        self.bufs.push(KBuf {
-            k,
-            dir,
-            f: None,
-            parent: 0,
-            pbase: 0,
-            sent: 0,
-            uptr,
-        });
-        Ok(self.bufs.len() - 1)
     }
 
-    /// nvgpu_i2_len
-    fn len(
-        &self,
-        f: &Field,
-        b: usize,
-        base: usize,
-        first: u16,
-        created: &[i64],
-    ) -> Result<u64, i32> {
-        let Kind::Ptr { len, max, .. } = f.kind else {
-            unreachable!()
-        };
-        Ok(match len {
-            Len::Const(n) => u64::from(n),
-            Len::Count { off, width, elem } => self
-                .rd(b, base + off as usize, width as usize)?
-                .checked_mul(u64::from(elem))
-                .ok_or(libc::E2BIG)?,
-            Len::Sum { field, elem } => {
-                let src = created.get((field - first) as usize).copied().unwrap_or(-1);
-                let sum: u64 = if src >= 0 {
-                    self.bufs[src as usize]
-                        .k
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|&c| u64::from(u32::from_le_bytes(c)))
-                        .sum()
-                } else {
-                    0
-                };
-                sum.checked_mul(u64::from(elem)).ok_or(libc::E2BIG)?
-            }
-            Len::NvkmsParams => {
-                let n = self.rd(b, base + 4, 4)?;
-                if n != u64::from(max) {
-                    return Err(libc::EINVAL);
-                }
-                n
-            }
-        })
+    fn fd_out(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, handle: u32, kind: u32) -> (i32, i64) {
+        self.hooks.fd_outs.push((handle, kind));
+        (0, 99 + self.hooks.fd_outs.len() as i64)
     }
 
-    /// nvgpu_i2_walk
-    fn walk(
-        &mut self,
-        mem: &mut UserMem,
-        b: usize,
-        base: usize,
-        span: Span,
-        depth: usize,
-    ) -> Result<(), i32> {
-        if depth > MAX_DEPTH {
-            return Err(libc::EINVAL);
-        }
-        let fields = self.table.fields(span);
-        let mut created = vec![-1i64; fields.len()];
-        for (i, f) in fields.iter().enumerate() {
-            if let Some(c) = f.cond {
-                let v = self.rd(b, base + c.off as usize, 4)? as u32;
-                if !c.holds(v) {
-                    continue;
-                }
-            }
-            let at = base + f.off as usize;
-            match f.kind {
-                Kind::Ptr {
-                    dir,
-                    copyback,
-                    max,
-                    stride,
-                    children,
-                    ..
-                } => {
-                    let v = self.rd(b, at, 8)?;
-                    let len = self.len(f, b, base, span.first, &created)?;
-                    self.slots.push(GSlot {
-                        f,
-                        buf: b,
-                        off: at,
-                        orig: v,
-                    });
-                    if v == 0 || len == 0 {
-                        continue;
-                    }
-                    if len > u64::from(max) {
-                        return Err(libc::E2BIG);
-                    }
-                    if children.len > 0 && (stride == 0 || len % u64::from(stride) != 0) {
-                        return Err(libc::EINVAL);
-                    }
-                    let nb = self.new_buf(mem, len, dir_bits(dir), v)?;
-                    created[i] = nb as i64;
-                    self.bufs[nb].f = Some(f);
-                    self.bufs[nb].parent = b;
-                    self.bufs[nb].pbase = base;
-                    let counted = match copyback {
-                        CopyBack::Partial { off, width, .. }
-                        | CopyBack::AllOrNothing { off, width, .. }
-                        | CopyBack::Exact { off, width } => Some((off, width)),
-                        _ => None,
-                    };
-                    if let Some((off, width)) = counted {
-                        self.bufs[nb].sent = self.rd(b, base + off as usize, width as usize)?;
-                    }
-                    if children.len > 0 {
-                        for e in 0..(len / u64::from(stride)) as usize {
-                            self.walk(mem, nb, e * stride as usize, children, depth + 1)?;
-                        }
-                    }
-                }
-                Kind::Array {
-                    count,
-                    stride,
-                    limit,
-                    children,
-                } => {
-                    let v = match limit {
-                        schema::Limit::All => 0,
-                        schema::Limit::Count { off, width } => {
-                            self.rd(b, base + off as usize, width as usize)?
-                        }
-                        schema::Limit::Planes { off } => self.rd(b, base + off as usize, 4)?,
-                    };
-                    let n = limit.elements(count, v, self.table.planes);
-                    for e in 0..n as usize {
-                        self.walk(mem, b, at + e * stride as usize, children, depth + 1)?;
-                    }
-                }
-                _ => {
-                    let v = self.rd(b, at, f.width() as usize)?;
-                    self.slots.push(GSlot {
-                        f,
-                        buf: b,
-                        off: at,
-                        orig: v,
-                    });
-                }
-            }
-        }
+    fn gem_out(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, gem: u32, size: u64) -> (i32, u32) {
+        self.hooks.gem_outs.push((gem, size));
+        (0, 199 + self.hooks.gem_outs.len() as u32)
+    }
+
+    fn special(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: i32) -> i32 {
+        0
+    }
+
+    fn phase(&mut self, _: &mut State<Bufs<'a>>, _: i32) -> i32 {
+        0
+    }
+
+    fn close_handle(&mut self, handle: u32) {
+        self.hooks.closed.push(handle);
+    }
+
+    fn gem_close(&mut self, _: u32) {}
+
+    fn tbuf_alloc(&mut self, len: usize) -> Option<Vec<u8>> {
+        Some(vec![0; len])
+    }
+
+    fn tbuf_write(&mut self, tb: &mut Vec<u8>, off: usize, src: &[u8]) -> Result<(), Errno> {
+        tb.get_mut(off..off + src.len())
+            .ok_or(-libc::EINVAL)?
+            .copy_from_slice(src);
         Ok(())
     }
 
-    /// nvgpu_i2_translate, with the hooks' answers from `h`.
-    fn translate(&mut self, h: &Hooks) -> Result<(), i32> {
-        for i in 0..self.slots.len() {
-            let (f, b, off, orig) = {
-                let s = &self.slots[i];
-                (s.f, s.buf, s.off, s.orig)
-            };
-            match f.kind {
-                Kind::FdIn { width, none, .. } => {
-                    let v = if width == 4 {
-                        orig as u32 as i32 as i64
-                    } else {
-                        orig as i64
-                    };
-                    if v == i64::from(none) {
-                        continue;
-                    }
-                    let &(handle, flags) = h.fds.get(&v).ok_or(libc::EBADF)?;
-                    self.wr(b, off, width as usize, none as i64 as u64);
-                    self.fd.push([b as u32, off as u32, handle, flags]);
-                }
-                Kind::GemIn { .. } => {
-                    if orig == 0 {
-                        continue;
-                    }
-                    let &(owner, gem) = h.gems.get(&(orig as u32)).ok_or(libc::ENOENT)?;
-                    if gem == 0 {
-                        return Err(libc::EINVAL);
-                    }
-                    self.wr(b, off, 4, u64::from(gem));
-                    self.gem.push([b as u32, off as u32, owner, gem]);
-                }
-                _ => {}
-            }
-        }
+    fn tbuf_read(&mut self, tb: &Vec<u8>, off: usize, dst: &mut [u8]) -> Result<(), Errno> {
+        dst.copy_from_slice(tb.get(off..off + dst.len()).ok_or(-libc::EINVAL)?);
         Ok(())
     }
 
-    fn count(&self, pick: impl Fn(&Kind) -> bool) -> usize {
-        self.slots.iter().filter(|s| pick(&s.f.kind)).count()
-    }
+    fn hand_over_held(&mut self, _: &mut State<Bufs<'a>>, _: &mut Vec<u8>) {}
 
-    fn max_fdo(&self) -> usize {
-        self.count(|k| matches!(k, Kind::FdOut { .. })) + self.dyn_.len()
-    }
-
-    fn max_gemo(&self) -> usize {
-        self.count(|k| matches!(k, Kind::GemOut))
-    }
-
-    /// The capacity nvgpu_i2_ioctl posts for the reply (resp_len).
-    fn resp_len(&self) -> usize {
-        HDR + 32 + self.out_bytes as usize + 16 * self.max_fdo() + 24 * self.max_gemo()
-    }
-
-    /// Whether nvgpu_i2_ioctl sends this with NVGPU_XF_EXECUTOR.
-    fn executor(&self) -> bool {
-        self.e.class != schema::Class::Render || self.e.exec == schema::Exec::Executor
-    }
-
-    /// nvgpu_i2_build: struct nvgpu_i2_head, buf_len[], the records, the IN
-    /// bytes padded to 8.
-    fn build(&self) -> Vec<u8> {
-        let mut t = Vec::new();
-        let words = |t: &mut Vec<u8>, ws: &[u32]| {
-            ws.iter()
-                .for_each(|w| t.extend_from_slice(&w.to_le_bytes()))
+    /// `nvgpu_xfer()`, with the backend on the other side of the queue.
+    fn xfer(&mut self, mut req: Vec<u8>, mut resp: Vec<u8>, flags: u32) -> Xfer<Vec<u8>> {
+        wr(&mut req, 12, 4, u64::from(REQ_ID));
+        let cap = resp.len() - self.short;
+        let reply = match self.be.serve(&req, cap) {
+            Outcome::Reply(r) => r,
+            Outcome::Ioctl2(mut p) => {
+                assert_eq!(
+                    p.executor_key().is_some(),
+                    flags & gi2::XF_EXECUTOR != 0,
+                    "both halves agree on who waits"
+                );
+                (self.meanwhile)(self.be);
+                p.execute();
+                self.be.finish_ioctl2(p)
+            }
         };
-        // nvgpu_msg_hdr (req_id is the transport's to fill in).
-        words(&mut t, &[MsgType::Ioctl2 as u32, self.handle, 0, 0x1234]);
-        words(
-            &mut t,
-            &[
-                self.cmd,
-                0,
-                self.bufs.len() as u32,
-                self.fd.len() as u32,
-                self.gem.len() as u32,
-                self.dyn_.len() as u32,
-                self.in_bytes as u32,
-                self.render,
-            ],
-        );
-        for kb in &self.bufs {
-            words(&mut t, &[kb.k.len() as u32]);
-        }
-        for r in self.fd.iter().chain(&self.gem).chain(&self.dyn_) {
-            words(&mut t, r);
-        }
-        for kb in self.bufs.iter().filter(|kb| kb.dir & IN != 0) {
-            t.extend_from_slice(&kb.k);
-            t.resize(
-                t.len() + (align8(kb.k.len() as u64) as usize - kb.k.len()),
-                0,
-            );
-        }
-        t
-    }
-
-    fn at_slot(&self, pick: impl Fn(&Kind) -> bool, b: u32, off: u32) -> bool {
-        self.slots
-            .iter()
-            .any(|s| pick(&s.f.kind) && s.buf == b as usize && s.off == off as usize)
-    }
-
-    /// nvgpu_i2_parse. On a non-zero status, `h.closed` gets the consumed
-    /// handles (nvgpu_i2_drop_consumed).
-    fn parse(&mut self, r: &[u8], h: &mut Hooks) -> Result<(), i32> {
-        let used = r.len();
-        if used < HDR {
-            return Err(libc::EPROTO);
-        }
-        let status = rd(r, 8, 4) as u32 as i32;
-        if status != 0 {
-            for f in &self.fd {
-                if f[3] & I2_FD_CONSUME != 0 {
-                    h.closed.push(f[2]);
-                }
-            }
-            return Err(-status);
-        }
-        if used < HDR + 32 {
-            return Err(libc::EPROTO);
-        }
-        let w = |i: usize| rd(r, HDR + 4 * i, 4) as u32;
-        let (ret, nbuf, nfd, ngem, dlen) = (w(0) as i32, w(1), w(2) as usize, w(3) as usize, w(4));
-        let need = HDR + 32 + self.out_bytes as usize + nfd * 16 + ngem * 24;
-        if nbuf as usize != self.bufs.len()
-            || u64::from(dlen) != self.out_bytes
-            || nfd > self.max_fdo()
-            || ngem > self.max_gemo()
-            || used < need
-            || ret < -4095
-        {
-            return Err(libc::EPROTO);
-        }
-        let mut off = HDR + 32;
-        for kb in self.bufs.iter_mut().filter(|kb| kb.dir & OUT != 0) {
-            let n = kb.k.len();
-            kb.k.copy_from_slice(&r[off..off + n]);
-            off += align8(n as u64) as usize;
-        }
-        for _ in 0..nfd {
-            self.fdo
-                .push(std::array::from_fn(|j| rd(r, off + 4 * j, 4) as u32));
-            off += 16;
-        }
-        for _ in 0..ngem {
-            let q = |j: usize| rd(r, off + 4 * j, 4) as u32;
-            self.gemo.push((q(0), q(1), q(2), rd(r, off + 16, 8), 0));
-            off += 24;
-        }
-        for (i, o) in self.fdo.iter().enumerate() {
-            let at_dyn = self.dyn_.iter().any(|d| d[1] == o[0] && d[2] == o[1]);
-            let ok = (self.at_slot(|k| matches!(k, Kind::FdOut { .. }), o[0], o[1]) || at_dyn)
-                && self.fdo[..i].iter().all(|p| p[0] != o[0] || p[1] != o[1]);
-            if !ok {
-                return Err(libc::EPROTO);
-            }
-        }
-        for (i, o) in self.gemo.iter().enumerate() {
-            let ok = o.2 != 0
-                && self.at_slot(|k| matches!(k, Kind::GemOut), o.0, o.1)
-                && self.gemo[..i].iter().all(|p| p.0 != o.0 || p.1 != o.1);
-            if !ok {
-                return Err(libc::EPROTO);
-            }
-        }
-        self.ret = ret;
-        Ok(())
-    }
-
-    /// nvgpu_i2_restore
-    fn restore(&mut self) {
-        for i in 0..self.slots.len() {
-            let (f, b, off, orig) = {
-                let s = &self.slots[i];
-                (s.f, s.buf, s.off, s.orig)
-            };
-            match f.kind {
-                Kind::Ptr { .. } => self.wr(b, off, 8, orig),
-                Kind::FdIn { width, .. } => self.wr(b, off, width as usize, orig),
-                Kind::GemIn { .. } => self.wr(b, off, 4, orig),
-                Kind::FdOut { width } => self.wr(b, off, width as usize, u64::MAX),
-                Kind::GemOut => self.wr(b, off, 4, 0),
-                Kind::Array { .. } => {}
-            }
+        let r = &reply.bytes;
+        assert!(r.len() <= cap, "the reply fits what was posted");
+        assert_eq!(rd(r, 12, 4), u64::from(REQ_ID), "req_id echoed");
+        self.answered = rd(r, 8, 4) == 0;
+        resp[..r.len()].copy_from_slice(r);
+        Xfer::Done {
+            req,
+            resp,
+            used: r.len() as u32,
         }
     }
 
-    /// nvgpu_i2_outputs
-    fn outputs(&mut self, h: &mut Hooks) -> Result<(), i32> {
-        for i in 0..self.gemo.len() {
-            let (b, off, gem, size, _) = self.gemo[i];
-            let guest = match self.gemo[..i].iter().find(|p| p.2 == gem) {
-                Some(p) => p.4,
-                None => {
-                    h.gem_outs.push((gem, size));
-                    199 + h.gem_outs.len() as u32
-                }
-            };
-            self.gemo[i].4 = guest;
-            self.wr(b as usize, off as usize, 4, u64::from(guest));
-        }
-        for i in 0..self.fdo.len() {
-            let [b, off, handle, kind] = self.fdo[i];
-            if handle == 0 {
-                return Err(libc::EMFILE);
-            }
-            h.fd_outs.push((handle, kind));
-            let v = 99 + h.fd_outs.len() as u64;
-            let width = self
-                .slots
-                .iter()
-                .find(|s| {
-                    matches!(s.f.kind, Kind::FdOut { .. })
-                        && s.buf == b as usize
-                        && s.off == off as usize
-                })
-                .map(|s| s.f.width() as usize);
-            if let Some(width) = width {
-                self.wr(b as usize, off as usize, width, v);
-            }
-        }
-        Ok(())
-    }
-
-    /// nvgpu_i2_copy_back, through CopyBack::extent (which
-    /// nvgpu_i2_copy_extent mirrors line for line).
-    fn copy_back(&mut self, mem: &mut UserMem) -> Result<(), i32> {
-        for kb in self
-            .bufs
-            .iter()
-            .filter(|kb| kb.dir & OUT != 0 && !kb.k.is_empty())
-        {
-            let (mut start, mut end) = (0, kb.k.len() as u64);
-            if let Some(f) = kb.f {
-                let Kind::Ptr { dir, copyback, .. } = f.kind else {
-                    unreachable!()
-                };
-                let left = match copyback {
-                    CopyBack::Partial { off, width, .. }
-                    | CopyBack::AllOrNothing { off, width, .. }
-                    | CopyBack::Exact { off, width }
-                    | CopyBack::Written { off, width } => {
-                        let p = &self.bufs[kb.parent].k;
-                        rd(p, kb.pbase + off as usize, width as usize)
-                    }
-                    _ => 0,
-                };
-                (start, end) = copyback.extent(dir, kb.k.len() as u64, self.ret, kb.sent, left);
-            }
-            if end > start {
-                mem.write(kb.uptr + start, &kb.k[start as usize..end as usize])?;
-            }
-        }
-        Ok(())
-    }
+    fn warn(&mut self, _: gi2::Warn<'_>) {}
 }
 
 // ───────────────────────────── the host ─────────────────────────────
@@ -1103,7 +837,10 @@ fn world() -> World {
 impl World {
     /// One call all the way through: gather, send (with the capacity the
     /// guest posts, less `short`), serve, execute, finish, parse, copy back.
-    /// Returns what nvgpu_i2_ioctl would.
+    /// `Ok` is the ioctl's result as the host (or the backend in its stead)
+    /// answered it; `Err` a refusal, of the backend or of the guest's own
+    /// interpreter. The caller gets -errno either way, as from
+    /// nvgpu_i2_ioctl.
     fn call(&mut self, target: u32, cmd: u32, uarg: u64, short: usize) -> Result<i32, i32> {
         self.call_in(schema::Class::Kms, target, cmd, uarg, short)
     }
@@ -1116,62 +853,86 @@ impl World {
         uarg: u64,
         short: usize,
     ) -> Result<i32, i32> {
-        let g = Guest::gather(&mut self.mem, class, target, self.render, cmd, uarg)?;
-        self.send(g, short)
+        let render = self.render;
+        self.run(class, target, render, cmd, uarg, short, |_| {})
     }
 
     /// An NVKMS ioctl on `target` (nvgpu_nvkms.c: render 0, the table the
     /// host version selects), its NvKmsIoctlParams at `uarg`.
     fn nvkms(&mut self, target: u32, uarg: u64) -> Result<i32, i32> {
-        let table = self.be.driver.and_then(schema::modeset_table);
-        let g = Guest::gather_in(
-            &mut self.mem,
-            schema::Class::Modeset,
-            table,
-            target,
-            0,
-            NVKMS,
-            uarg,
-        )?;
-        self.send(g, 0)
+        self.nvkms_with(target, uarg, |_| {})
     }
 
-    fn send(&mut self, g: Guest, short: usize) -> Result<i32, i32> {
-        self.send_with(g, short, |_| {})
-    }
-
-    /// `send`, with `meanwhile` run on the backend after the call was
+    /// `nvkms`, with `meanwhile` run on the backend after the call was
     /// prepared and before it runs: what happens while it waits in its
     /// executor's queue.
-    fn send_with(
+    fn nvkms_with(
         &mut self,
-        mut g: Guest,
+        target: u32,
+        uarg: u64,
+        meanwhile: impl FnOnce(&mut NvidiaBackend),
+    ) -> Result<i32, i32> {
+        self.run(schema::Class::Modeset, target, 0, NVKMS, uarg, 0, meanwhile)
+    }
+
+    /// The guest module's `i2::run` for one call, on the schema set its
+    /// device would have selected for this host.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        class: schema::Class,
+        target: u32,
+        render: u32,
+        cmd: u32,
+        uarg: u64,
         short: usize,
         meanwhile: impl FnOnce(&mut NvidiaBackend),
     ) -> Result<i32, i32> {
-        g.translate(&self.hooks)?;
-        let req = g.build();
-        let cap = g.resp_len() - short;
-        let reply = match self.be.serve(&req, cap) {
-            Outcome::Reply(r) => r,
-            Outcome::Ioctl2(mut p) => {
-                assert_eq!(
-                    p.executor_key().is_some(),
-                    g.executor(),
-                    "both halves agree on who waits"
-                );
-                meanwhile(&mut self.be);
-                p.execute();
-                self.be.finish_ioctl2(p)
+        let drm = GuestTable::new(schema::DRM_TABLE);
+        let modeset = self
+            .be
+            .driver
+            .and_then(schema::modeset_table)
+            .map(GuestTable::new);
+        let set = gs::SchemaSet {
+            drm: drm.table(),
+            modeset: modeset.as_ref().map(GuestTable::table),
+        };
+        let args = gi2::Args {
+            sclass: sclass(class),
+            cmd,
+            uarg,
+            handle: target,
+            render,
+            xflags: 0,
+            compat: false,
+            max_req: MAX_MSG,
+            max_resp: MAX_MSG,
+        };
+        let mut st = Box::new(State::new(Bufs {
+            mem: &mut self.mem,
+            bufs: Vec::new(),
+        }));
+        let mut meanwhile = Some(meanwhile);
+        let mut meanwhile = |be: &mut NvidiaBackend| {
+            if let Some(f) = meanwhile.take() {
+                f(be)
             }
         };
-        assert!(reply.bytes.len() <= cap, "the reply fits what was posted");
-        assert_eq!(rd(&reply.bytes, 12, 4), 0x1234, "req_id echoed");
-        g.parse(&reply.bytes, &mut self.hooks)?;
-        g.restore();
-        g.outputs(&mut self.hooks)?;
-        g.copy_back(&mut self.mem)?;
-        Ok(g.ret)
+        let mut env = GuestEnv {
+            be: &mut self.be,
+            hooks: &mut self.hooks,
+            short,
+            meanwhile: &mut meanwhile,
+            answered: false,
+        };
+        let r = gi2::run(&mut env, &mut st, &set, &args);
+        if env.answered && r == st.ret {
+            Ok(r)
+        } else {
+            assert!(r < 0, "a refusal is an errno: {r}");
+            Err(-r)
+        }
     }
 
     fn calls(&self) -> Vec<(String, u32)> {
@@ -1794,19 +1555,8 @@ fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() 
     let mut w = nvkms_world();
     let (kms, modeset) = (w.kms, w.modeset);
     grant_head_1(&mut w);
-    let table = w.be.driver.and_then(schema::modeset_table);
     nvkms_call(&mut w, 11, &cursor(1));
-    let g = Guest::gather_in(
-        &mut w.mem,
-        schema::Class::Modeset,
-        table,
-        modeset,
-        0,
-        NVKMS,
-        0x1000,
-    )
-    .unwrap();
-    let r = w.send_with(g, 0, |be| be.close_handle(kms).unwrap());
+    let r = w.nvkms_with(modeset, 0x1000, |be| be.close_handle(kms).unwrap());
     assert_eq!(r, Ok(-libc::EPERM));
     assert_eq!(
         w.fake.0.lock().unwrap().nvkms,
@@ -1818,20 +1568,9 @@ fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() 
     let mut w = nvkms_world();
     let modeset = w.modeset;
     grant_head_1(&mut w);
-    let table = w.be.driver.and_then(schema::modeset_table);
     nvkms_call(&mut w, 11, &cursor(1));
-    let g = Guest::gather_in(
-        &mut w.mem,
-        schema::Class::Modeset,
-        table,
-        modeset,
-        0,
-        NVKMS,
-        0x1000,
-    )
-    .unwrap();
     let render = w.render;
-    let r = w.send_with(g, 0, |be| be.close_handle(render).unwrap());
+    let r = w.nvkms_with(modeset, 0x1000, |be| be.close_handle(render).unwrap());
     assert_eq!(r, Ok(0));
 }
 
@@ -1860,9 +1599,7 @@ fn a_grant_that_finishes_after_its_file_closed_records_nothing() {
         w.mem.put(0x5000, &g);
         w.hooks.fds.insert(5, (grant, 0));
         let render = w.render;
-        let call = Guest::gather(&mut w.mem, schema::Class::Kms, kms, render, GRANT, 0x5000)
-            .unwrap();
-        let _ = w.send_with(call, 0, |be| {
+        let _ = w.run(schema::Class::Kms, kms, render, GRANT, 0x5000, 0, |be| {
             if reset {
                 be.session_reset("test");
             } else {

@@ -242,6 +242,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "nvgpu-guest-core",
  "protocol",
  "thiserror",
  "tokio",

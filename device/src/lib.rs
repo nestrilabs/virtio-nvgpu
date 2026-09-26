@@ -42,7 +42,8 @@ pub mod pump;
 pub mod quota;
 pub mod ratelimit;
 pub mod release;
-pub mod replay;
+#[cfg(test)]
+mod replay;
 pub mod rmallow;
 pub mod rmctl;
 pub mod rmmem;
