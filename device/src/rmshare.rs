@@ -60,7 +60,10 @@
 
 use std::collections::HashMap;
 
-use abi::ioctl::{NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL, NV_ESC_RM_DUP_OBJECT, NV_ESC_RM_SHARE};
+use abi::ioctl::{
+    NV_ESC_ALLOC_OS_EVENT, NV_ESC_FREE_OS_EVENT, NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL,
+    NV_ESC_RM_DUP_OBJECT, NV_ESC_RM_SHARE,
+};
 pub use protocol::messages::ProcId;
 
 pub use crate::rmctl::NV_ERR_INSUFFICIENT_PERMISSIONS;
@@ -116,6 +119,11 @@ const OS64_SIZE: usize = 48;
 const OS54_CMD: usize = 8;
 pub const OS54_STATUS: usize = 28;
 const OS54_SIZE: usize = 32;
+
+/// nv_ioctl_{alloc,free}_os_event_t: `{hClient, hDevice, fd, Status}`, 16
+/// bytes (nv-ioctl.h).
+pub const OS_EVENT_SIZE: usize = 16;
+pub const OS_EVENT_STATUS: usize = 12;
 
 /// NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY: `{RS_SHARE_POLICY}`,
 /// applied to the calling client itself (cliresCtrlCmdClientSetInherited
@@ -662,6 +670,7 @@ pub fn status_at(escape: u32) -> Option<usize> {
         NV_ESC_RM_DUP_OBJECT => Some(OS55_STATUS),
         NV_ESC_RM_ALLOC => Some(OS64_STATUS),
         NV_ESC_RM_CONTROL => Some(OS54_STATUS),
+        NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => Some(OS_EVENT_STATUS),
         _ => None,
     }
 }
@@ -969,6 +978,32 @@ impl NvidiaBackend {
                 let ctl = params.get(OS54_SIZE..).unwrap_or(&[]);
                 self.named_clients_ok(own, caller, control_named(cmd, ctl))
                     .map_err(Refuse::Status)?;
+            }
+            // RM keeps OS events in one list for the whole host, matched by
+            // (hClient, fd) with no check of either against the caller
+            // (osapi.c allocate_os_event and free_os_event, os.c
+            // osUserHandleToKernelPtr): the fd is a number in the calling
+            // process, and every backend's numbers are small. So a guest that
+            // named another VM's client -- handed out in sequence -- could
+            // free that VM's events, or take the (hClient, fd) its next event
+            // needs. The client must be one of this VM's (semsurf.rs, the
+            // issuer record). Not the calling file's own: the event's
+            // notifications go to the file the call is made on (nv_post_event,
+            // `event->nvfp`), which is the one the caller then polls, a file of
+            // its own and not the one its client was made on.
+            NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
+                let Some(client) = rd32(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE)
+                else {
+                    log::warn!("OS event call ({escape:#04x}) too short to name its client");
+                    return Err(Refuse::Errno(libc::EINVAL));
+                };
+                if self.semsurf.issuer_of(client).is_none() {
+                    log::warn!(
+                        "OS event call ({escape:#04x}) names RM client {client:#x}, which is not \
+                         this VM's; refused"
+                    );
+                    return Err(Refuse::Status(NV_ERR_INSUFFICIENT_PERMISSIONS));
+                }
             }
             _ => {}
         }
