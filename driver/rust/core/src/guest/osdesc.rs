@@ -268,9 +268,15 @@ pub trait Env: rm::Env {
     fn pin(&mut self, start: u64, npages: u64, write: bool) -> Result<Self::Pin, PinError>;
     /// Page `i`'s guest-physical address.
     fn page_phys(&self, pin: &Self::Pin, i: u64) -> u64;
-    /// Keep the pages pinned under `id` until a reap names it (0: a request
-    /// abandoned in flight, pinned until remove()).
+    /// Keep the pages pinned under registration `id` (non-zero) until a
+    /// reap names it.
     fn keep(&mut self, id: u64, pin: Self::Pin);
+    /// `nvgpu_osdesc_send()`: send the registration with its pins riding
+    /// along. The pins come back with the answer, except when the request
+    /// was abandoned ([`i2::abandons`](super::i2::abandons)): then they are
+    /// the transport's -- unpinned at once if the request never reached the
+    /// ring, else kept until its late reply says what RM registered.
+    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], pin: Self::Pin) -> (Result<u32, Errno>, Option<Self::Pin>);
     /// Unpin them now.
     fn unpin(&mut self, pin: Self::Pin);
 }
@@ -343,21 +349,17 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
         });
     }
 
-    let used = env.send_recv(req.as_ref(), resp.as_mut());
+    let (used, pin) = env.send_pinned(req.as_ref(), resp.as_mut(), pin);
     drop(req);
-    let used = match used {
-        Ok(u) => u,
-        Err(e) if super::i2::abandons(e) => {
-            // It may reach RM yet, and nothing will say so: pinned until
-            // remove().
-            env.warn(rm::Warn::OsDescAbandoned { pages: npages });
-            env.keep(0, pin);
+    let (used, pin) = match (used, pin) {
+        (Ok(u), Some(p)) => (u, p),
+        // Abandoned: the pins went with the request.
+        (Err(e), None) => return e,
+        (Err(e), Some(p)) => {
+            env.unpin(p);
             return e;
         }
-        Err(e) => {
-            env.unpin(pin);
-            return e;
-        }
+        (Ok(_), None) => return -EIO,
     };
     let Some(h) = IoctlResp::parse(resp.as_ref(), used) else {
         env.unpin(pin);

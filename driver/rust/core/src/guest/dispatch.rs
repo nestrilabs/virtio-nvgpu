@@ -10,7 +10,7 @@
 
 use super::osdesc;
 use super::rm;
-use super::wire::{EINVAL, EPERM, EPROTO};
+use super::wire::{EPERM, EPROTO};
 
 /// `NV_ESC_RM_FREE`.
 pub const ESC_RM_FREE: u32 = 0x29;
@@ -32,12 +32,6 @@ pub fn ioctl_fd<E: osdesc::Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64) -> i3
     let nr = cmd & 0xff;
     let sz = (cmd >> 16) & 0x3fff;
     let rm_type = ioc_type(cmd) == rm::RM_IOCTL_TYPE;
-
-    // Hard cap only; sz == 0 is valid for several NVIDIA ioctls. (_IOC_SIZE
-    // is 14 bits, so this never fires; kept as the C has it.)
-    if sz > 65536 {
-        return -EINVAL;
-    }
 
     // Memory the caller already has, registered by its pages rather than its
     // address, before ALLOC_MEMORY's descriptor translation: RM reads no

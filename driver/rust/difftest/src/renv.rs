@@ -94,9 +94,6 @@ pub fn rm_warn_fmt(w: rm::Warn) -> &'static str {
             "virtio-gpu-nv: NV_EVENT_BUFFER names OS event 0x%llx, which is not one of our devices\n"
         }
         rm::Warn::SurfaceFd { .. } => "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one of ours\n",
-        rm::Warn::OsDescAbandoned { .. } => {
-            "virtio-gpu-nv: an OS-descriptor registration was abandoned in flight; its %lu pages stay pinned\n"
-        }
     }
 }
 
@@ -212,6 +209,17 @@ impl osdesc::Env for RmEnv<'_> {
     fn unpin(&mut self, pin: RPin) {
         self.w.events.push(Ev::Unpin { n: pin.pas.len() as u64, write: pin.write });
     }
+
+    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], pin: RPin) -> (Result<u32, Errno>, Option<RPin>) {
+        let r = rm::Env::send_recv(self, req, resp);
+        match r {
+            Err(e) if i2::abandons(e) => {
+                self.w.events.push(Ev::HandOver { n: pin.pas.len() as u64, write: pin.write });
+                (r, None)
+            }
+            _ => (r, Some(pin)),
+        }
+    }
 }
 
 /// The schema set the C device selected.
@@ -312,17 +320,22 @@ impl CallBufs for RCall<'_> {
 
     fn atomic(&mut self, w: &mut World, fences: bool) -> (i32, bool, u32) {
         let mut out = atomic::Out::default();
-        let r = atomic::parse(self.0, &mut AEnv { w }, fences, &mut out);
+        let r = atomic::parse(self.0, &mut AEnv { w, commit: false }, fences, &mut out);
         (r, out.commit, out.values_buf)
     }
 }
 
-/// The atomic parse's hooks, over the world.
+/// The atomic parse's hooks, over the world, and what the parse has said
+/// about the commit (`begin`), as the kernel's hook reads it.
 struct AEnv<'a> {
     w: &'a mut World,
+    commit: bool,
 }
 
 impl atomic::Env<RStore> for AEnv<'_> {
+    fn begin(&mut self, commit: bool) {
+        self.commit = commit;
+    }
     fn obj_class(&mut self, obj: u32) -> (i32, u32) {
         hooks::a_obj(self.w, obj)
     }
@@ -330,7 +343,7 @@ impl atomic::Env<RStore> for AEnv<'_> {
         hooks::a_prop(self.w, id)
     }
     fn in_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, fd: i64) -> i32 {
-        hooks::a_in_fence(self.w, &mut RCall(st), buf, off, fd)
+        hooks::a_in_fence(self.w, &mut RCall(st), buf, off, fd, self.commit)
     }
     fn out_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, uptr: u64) -> i32 {
         hooks::a_out_fence(self.w, &mut RCall(st), buf, off, uptr)

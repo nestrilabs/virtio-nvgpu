@@ -715,7 +715,7 @@ type. One listener is allowed per export.
 | `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` | 0666 | 0666, unchanged: any guest user reaches everything §3 lists. The two UVM nodes exist only when the backend runs with `--allow-compute` |
 | `/dev/nvidia-caps/*` | 0444 | 0444 |
 | DRM node | a hand-made character device, 0666 | a real DRM device per host render node, whose render and primary nodes the guest's DRM core makes. Syncobjs are enabled only when the backend serves fences, and the primary node drives KMS only when the backend offers `--kms-card`. |
-| `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`), with `scripts/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
+| `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`, which refuses any mode giving "other" access), with `scripts/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
 | adopted DRM files | -- | a lease received from the host becomes a guest DRM file, cloned from a card-node file |
 | `nvgpu-wl-guest` | -- | a daemon listening at `$XDG_RUNTIME_DIR/wayland-0` in the guest |
 
@@ -1987,3 +1987,132 @@ hand against a bound of 16 KiB, which a single blob chunk trips.
 `nvgpu-wl`) is outside this branch. A client may still hold a sink's share
 of the queue budget by never reading its pipe, as it may hold a queue by
 never reading its socket; both are its own process's share.
+
+---
+
+
+A review of the guest module, the backend, the Wayland proxy and the VMM
+launchers, each finding checked before it was fixed.
+
+### The guest module (`driver/`)
+
+Every finding below was confirmed in the code before the fix; where a parser
+has both implementations, both were fixed and `driver/rust/difftest` agrees.
+None needed a new host surface; the backend change is the syncobj
+registrations' accounting in `device/src/fence.rs`.
+
+**Medium.**
+
+- **OS-descriptor pins held until remove().** A registration abandoned in
+  flight (a fatal signal, a timeout) kept its pages pinned under id 0 until
+  the device went -- even one that never reached the ring -- so a guest
+  process could pin memory without bound. `nvgpu_osdesc_send()` now takes
+  the pins with the request: unsent, they are unpinned at once; sent, they
+  are kept under the request id, and the transport's reaper reads the late
+  reply as the registration would have -- kept under the id it names, or
+  unpinned when it names none or was refused. A reply that beats the
+  waiter's hand-over is remembered for it; one that never comes (a garbage
+  backend) leaves the pins until remove(), as before. Rust:
+  `osdesc::Env::send_pinned`; a difftest case for the hand-over.
+- **Syncobj wait registrations fill the VM's cap.** A process polling
+  never-signalled points, then destroying the syncobjs or closing the file,
+  left orphans that held the 1024 slots until they fired -- never -- and
+  every other process polled. Now (fence.rs) each registration is charged to
+  the guest process that asked and a process holds at most a quarter
+  (`quota::Share::quarter`); and a syncobj that never left its render file
+  (not exported as a syncobj file, in a file that never imported one) has
+  its registrations dropped when a DESTROY of it succeeds or the file
+  closes: our syncobj file was its last reference, so the kernel frees its
+  entries with it, as for a native process. A syncobj that did get out keeps
+  its orphans counted until they fire, charged to their maker -- dropping
+  them would let a guest leave uncounted host kernel entries on a syncobj it
+  keeps alive elsewhere, the growth the cap exists to stop. **Residual:** a
+  process that forks children to make orphans on shared syncobjs and exit
+  can still fill the pool (`Share::owners_to_exhaust`, as quota.rs says of
+  every pool); the cost is polling latency for the VM's other waits, not
+  host memory. Guest side (nvgpu_fence.c): userspace SYNCOBJ_EVENTFD
+  subscribers are charged per process (a quarter of 4096) and freed,
+  unsignalled, when their syncobj handle is destroyed or their file closed,
+  as the kernel frees a dead syncobj's entries.
+- **GEM proxy tombstone erased before the host closed the handle.** When a
+  proxy's GEM_CLOSE could only be queued, its gem_index entry went at once,
+  and a GETFB or PRIME import that got the number back made a new proxy the
+  queued close then closed. The close is now always queued with a release
+  that erases the entry, wakes waiters and frees the tombstone once the host
+  has answered it or it is known never to run.
+- **Rust ATOMIC: IN_FENCE_FD dropped.** nvgpu_kms.c's in-fence hook read the
+  commit/TEST_ONLY bit from the parse's out struct, which the Rust wrapper
+  wrote only after the parse: every real commit's in-fence went to the host
+  as -1. kms.c takes the bit from the argument's kernel copy before the
+  parse; the core says it before any hook (`atomic::Env::begin`), written
+  through a raw pointer, no `&mut` held while C reads; the difftest records
+  the bit each hook sees, and fails with `begin` removed.
+
+**Low-medium.** **Use after free on device remove.** The character devices
+are embedded in `struct nvgpu_device`, freed with its last reference -- taken
+in a file's release, before the VFS's `cdev_put()`; and remove() freed the
+transport's state under files still holding the device. The device's count
+is a kobject now, every cdev parented to it (`cdev_set_parent()`), so it is
+freed after the last `cdev_put()`; the transport's state is freed with the
+device and found dead, not gone, until then; the device holds the virtio
+device its late log lines name. No SRCU was needed: every late path holds a
+device reference and checks `nvgpu_xfer_dead()`.
+
+**Low.**
+
+- A Wayland SEND's dma-bufs and syncobj files ride on its request buffer, so
+  one abandoned in flight keeps them until the host is done with it.
+- A placement's offset is checked page-aligned and its end without
+  overflow; `window_valid` is published and read with release/acquire; a
+  dma-buf importer gets no device-writable mapping of a read-only
+  placement, and the dma-buf's map and vmap run inside `drm_dev_enter()`.
+- IOCTL2 refuses, before sending, a call whose reply could name more
+  descriptors than its state holds (C wrote the excess over the GEM
+  records, Rust skipped them and leaked their handles).
+- The C reads each of the caller's blocks once, as the Rust does:
+  RM_CONTROL's nested block (TIME_CORRELATION's TSC refusal, V1V2), the
+  OS-descriptor class word, IDLE_CHANNELS' flat fallback, NVKMS's outer
+  struct and GET_NEXT_EVENT's reply. The difftest's one recognised
+  difference is gone.
+- GET_PROC_FILES / GET_SYS_FILES lengths are checked against what is left of
+  the stream, and the GPU lookup stays within the 8 config-space slots.
+- A descriptor of another nvgpu device is refused (`nvgpu_handle_for_fd()`,
+  `nvgpu_hostfile_handle()` take the device).
+- An adopted lease file does not stay the guest device's master (it became
+  it when none was), and its SET/DROP_MASTER are refused, as a lessee's.
+- The KMS object-class cache keeps only CRTCs; -ENOENT (any number a commit
+  names) was cached without bound. The caches are memcg-charged.
+- DMABUF_IMPORT's results are checked (a non-zero u32 handle, a size below
+  64 GiB); a proxy refuses a size `PAGE_ALIGN()` would wrap; a RECV whose
+  frame fails its check closes the handles its descriptors carry.
+- `nvgpu_fence_unwrap_fd()` hands back the fence that keeps a proxy's own
+  host handle open, held with the request: dropping it first let a racing
+  close of the sync_file free the number before the call naming it ran.
+- A short success reply to a flat nvidia-drm call is -EIO rather than the
+  caller's own bytes read back as the answer (ALLOC_NVKMS made a proxy for a
+  handle number the caller chose).
+- A driver-built IOCTL2 (`nvgpu_i2_call.kernel`) refuses a pointer in the
+  user range instead of `memcpy()`ing through it (both builds).
+- Event buffers are zeroed, when posted and after each batch.
+
+**Correctness.** Each GPU's render node now hangs off its own fake PCI
+device (every one was parented to the first); the DRM node's compat_ioctl
+sends the core's ioctls through `drm_compat_ioctl()`, as nvidia-drm does.
+`/dev/nvidia-uvm-tools` has a cdev behind it (the backend opens the host's
+tools node); `/dev/nvidia-caps/*` answer no ioctl, as nv-caps.c's do.
+
+**Cleanup.** Dead code removed; the experiment switches `poll_events`,
+`poll_spin_us`, `claim_alloc`, `claim_sync_fd` are gone; `wl_mode` refuses a
+mode giving "other" anything; lines a guest process can cause are
+`dev_dbg_ratelimited`, the host's device details at probe `dev_dbg`;
+Kconfig is a tristate depending on VIRTIO, DRM and PCI with
+`VIRTIO_GPU_NV_RUST`, and the Makefile refuses to link a Rust object that
+names a panic symbol. The module says which parsers it has
+(`modinfo -F parsers`).
+
+**Not done.** `osdesc_early` is still a ring of 64: a reap that names more
+unrecorded ids than that before their registrations' replies are read
+loses the oldest, whose pins then stay until remove() (a list would let a
+backend grow it without bound). The C parsers stay, the difftest's oracle
+and a kernel without Rust's build, until the Rust build has passed the
+hardware regression.

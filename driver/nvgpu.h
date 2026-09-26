@@ -35,10 +35,6 @@ struct nvgpu_kms_file;
 
 struct nvgpu_device;
 
-/* Module parameters read outside nvgpu_main.c; see their definitions there. */
-extern int nvgpu_claim_alloc;
-extern int nvgpu_claim_sync_fd;
-
 /* struct drm_nvidia_get_dev_info_params is nine u32s. */
 #define NVGPU_DEV_INFO_WORDS 9
 /* name_len, major, minor, slot_index, then the dev_info words. */
@@ -67,9 +63,6 @@ struct nvgpu_dri_dev {
   /* Index into nvgpu_device.cards of this device's host card node, or -1. */
   int card_index;
   struct nvgpu_device *dev;
-  /* sysfs drm tree under the PCI device — required by Vulkan ICD */
-  struct kobject *drm_kobj;      /* .../pci_addr/drm          */
-  struct kobject *drm_node_kobj; /* .../pci_addr/drm/<name>   */
 };
 
 /* A host card node (GET_SYS_FILES section 3, struct nvgpu_card_record). */
@@ -142,12 +135,16 @@ struct nvgpu_device {
    * Everything that names this struct and can outlive remove() holds a
    * reference (nvgpu_dev_get()): an open file of any of our nodes, a
    * Wayland device, a guest file standing for a backend handle, a host
-   * fence's and a syncobj wait's event consumer, an RM mapping's vmas.
-   * remove() drops the probe's, and the last put frees it. After remove()
-   * the transport is gone (xfer and events NULL), so what they still do
-   * with it fails -ENODEV instead of touching freed memory (S-26).
+   * fence's and a syncobj wait's event consumer, an RM mapping's vmas --
+   * and each character device below, whose kobject is parented here
+   * (cdev_set_parent()), so the cdevs embedded in this struct outlive the
+   * last cdev_put() of an inode. remove() drops the probe's, and the last
+   * put frees it, with the transport's state and a reference on the virtio
+   * device held for its log lines. After remove() the transport is dead
+   * (nvgpu_xfer_dead()), not freed, so what still uses it fails -ENODEV
+   * instead of touching freed memory (S-26). Never added to sysfs.
    */
-  struct kref ref;
+  struct kobject kobj;
   /*
    * Where the VMM placed the window, read out of this device's own shared
    * memory region. Zero-length when the VMM offers none, in which case device
@@ -235,6 +232,9 @@ struct nvgpu_device {
    */
   struct mutex osdesc_lock;
   struct list_head osdescs;
+  /* Late replies to abandoned registrations read before their waiter had
+   * handed the pins over (struct nvgpu_osdesc_late). */
+  struct list_head osdesc_late;
   unsigned int osdesc_count;
   u64 osdesc_ack;
 #define NVGPU_OSDESC_EARLY 64
@@ -418,19 +418,20 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
 long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                         unsigned long arg);
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                         void __user *uarg, u32 sz);
+                         void __user *uarg);
 
 /* ───────── nvgpu_main.c ───────── */
 
 long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
                         void *kbuf, u32 sz);
 /*
- * The backend handle standing for one of this module's open files: an
- * /dev/nvidia* character device, a DRM node of ours (its render handle), or a
- * host-handle file (nvgpu_hostfile_handle()). -EBADF for anything else --
- * never a guess at another driver's private_data.
+ * The backend handle standing for one of this module's open files of device
+ * `dev`: an /dev/nvidia* character device, a DRM node of ours (its render
+ * handle), or a host-handle file (nvgpu_hostfile_handle()). -EBADF for
+ * anything else -- never a guess at another driver's private_data, nor a
+ * handle of another device's backend, which is someone else's number here.
  */
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle);
 /*
  * Whether calls say which guest process makes them (NVGPU_BCAP_PROC_ID),
  * and that process, as struct nvgpu_proc_id at `dst`.
@@ -464,6 +465,9 @@ int nvgpu_dri_init(struct nvgpu_device *dev);
 void nvgpu_dri_cleanup(struct nvgpu_device *dev);
 /* The nvgpu_fd of a DRM file of this driver, else NULL. */
 struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
+/* A DRM file of ours the caller just opened stops being the guest device's
+ * master, if it had become it. */
+void nvgpu_drm_drop_master(struct file *f);
 /*
  * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
  * host file, and return a handle for it in `file`. The proxy takes a
@@ -490,8 +494,10 @@ struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
                                             u32 host_handle);
 /*
  * One proxy per host handle, until it is closed (S-11): a proxy whose last
- * reference is gone stays in `owner`'s index until its GEM_CLOSE has gone
- * out. A host handle it holds is neither found nor adoptable -- a PRIME
+ * reference is gone stays in `owner`'s index until the host has closed its
+ * handle -- its GEM_CLOSE answered, or known never to run -- not merely until
+ * the close was queued. A host handle it holds is neither found nor
+ * adoptable -- a PRIME
  * import that returns it gets -EAGAIN -- and is nobody else's to close.
  * Whoever meets one waits it out and asks the host again.
  */
@@ -582,8 +588,10 @@ __poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,
 
 /* ───────── nvgpu_hostfile.c ───────── */
 
-/* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */
-int nvgpu_hostfile_handle(struct file *f, u32 *handle);
+/* The backend handle behind a host-handle file of `dev`, or -EBADF if `f`
+ * is not one. */
+int nvgpu_hostfile_handle(struct nvgpu_device *dev, struct file *f,
+                          u32 *handle);
 /*
  * A backend handle of kind `kind` (NVGPU_HK_*; a host syncobj file, say) as a
  * guest file: its release CLOSEs the handle. `o_flags`: O_CLOEXEC /
@@ -613,6 +621,8 @@ struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
  * signals (with the host's error, if any) when the host's does.
  */
 
+struct dma_fence;
+
 /* v2 and the backend serves fences: the syncobj and semsurf paths are live. */
 bool nvgpu_fences_enabled(struct nvgpu_device *dev);
 /*
@@ -632,8 +642,10 @@ int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
  * host consumer (IN_FENCE_FD, SEMSURF_FENCE_WAIT, a syncobj import, the
  * Wayland proxy). Returns:
  *   0  *handle names it. *owned false: it is the proxy's own handle (one of
- *      our fences) -- pass it, never close it; *owned true: a new handle made
- *      for this call (a merge of our fences) -- pass it with
+ *      our fences) -- pass it, never close it, and hold *ref (the fence that
+ *      keeps it open) until the host is done with the call, then
+ *      nvgpu_fence_put_ref() it (nvgpu_i2_hold()); *owned true: a new handle
+ *      made for this call (a merge of our fences), *ref NULL -- pass it with
  *      NVGPU_I2_FD_CONSUME, or close it.
  *   1  already signalled: nothing to wait for (the caller sends "no fence",
  *      or a signalled stand-in if the field cannot be empty).
@@ -644,7 +656,9 @@ int nvgpu_fence_from_handle_noclose(struct nvgpu_device *dev, u32 handle,
  * signalled: the host has no fence to wait on in its place.
  */
 int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
-                          bool *owned);
+                          bool *owned, struct dma_fence **ref);
+/* dma_fence_put() as a release callback (nvgpu_i2_hold()). */
+void nvgpu_fence_put_ref(void *fence);
 /* The core syncobj ioctls (0xBF-0xCF), when nvgpu_fences_enabled(). */
 bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd);
 long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
@@ -655,6 +669,11 @@ long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
 /* A GEM proxy is going: close what SEMSURF_FENCE_ATTACH moved into other
  * files for it. */
 void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
+/* A DRM file is going: the SYNCOBJ_EVENTFD subscribers made through it go
+ * too, as its syncobjs do. Process context. */
+void nvgpu_fence_file_release(struct nvgpu_fd *nfd);
+/* Retire the event consumers buried so far (remove(), module exit). */
+void nvgpu_fence_drain(void);
 
 /* ───────── nvgpu_wl.c ───────── */
 
@@ -759,6 +778,15 @@ int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
 int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
                             void *resp, int resp_len, u32 *used_len,
                             void (*release)(void *arg), void *arg);
+/*
+ * nvgpu_send_recv_used(), saying whether the request reached the ring
+ * (`*sent`) and under which request id (`*req_id`, 0 if it never got one):
+ * what a caller that hands something over on -EINTR/-ETIMEDOUT needs to know
+ * to tell a request the host may still run from one it never will.
+ */
+int nvgpu_send_recv_sent(struct nvgpu_device *dev, void *req, int req_len,
+                         void *resp, int resp_len, u32 *used_len, bool *sent,
+                         u32 *req_id);
 /* Does a response of `used` bytes contain all of [off, off + len)? */
 static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
   return off <= used && len <= used - off;
@@ -773,8 +801,11 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev);
 void nvgpu_xfer_quiesce(struct nvgpu_device *dev);
 /* Remove, after the device reset: fail waiters, reclaim every buffer. */
 void nvgpu_xfer_reclaim(struct nvgpu_device *dev);
-/* After del_vqs (remove, or a probe that failed): free what init allocated. */
+/* After del_vqs (remove, or a probe that failed): stop the work queue. The
+ * state stays, dead, for whatever still holds the device. */
 void nvgpu_xfer_destroy(struct nvgpu_device *dev);
+/* The device's last reference: free what init allocated. Any context. */
+void nvgpu_xfer_free(struct nvgpu_device *dev);
 void nvgpu_ctrl_vq_cb(struct virtqueue *vq);
 void nvgpu_event_vq_cb(struct virtqueue *vq);
 
@@ -783,12 +814,16 @@ void nvgpu_osdesc_init(struct nvgpu_device *dev);
 /*
  * An RM escape that registers memory the caller already has (ALLOC_MEMORY or
  * RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, VID_HEAP_CONTROL's
- * ALLOC_OS_DESCRIPTOR): true if it was handled here, with *ret its result.
- * False for anything else, which goes the usual way. nvgpu_rmio.c; with
- * NVGPU_RUST, nvgpu_ioctl_fd() in Rust does this itself.
+ * ALLOC_OS_DESCRIPTOR), on its block `outer` as the caller read it (`sz`
+ * bytes, all of it): true if it was handled here, with *ret its result.
+ * False for anything else, which goes the usual way with the same bytes.
+ * nvgpu_rmio.c; with NVGPU_RUST, nvgpu_ioctl_fd() in Rust does this itself.
  */
 bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                        void __user *uarg, unsigned int sz, long *ret);
+                        void __user *uarg, const void *outer, unsigned int sz,
+                        long *ret);
+/* Whether an escape of number `nr` and size `sz` can be one of the three. */
+bool nvgpu_osdesc_candidate(unsigned int nr, unsigned int sz);
 /* Unpin what RM has let go of. Process context; cheap with nothing pinned. */
 void nvgpu_osdesc_reap(struct nvgpu_device *dev);
 /* remove(), after the reset: unpin everything. */
@@ -799,10 +834,24 @@ bool nvgpu_osdesc_ok(const struct nvgpu_device *dev);
  * `pages` (FOLL_LONGTERM, FOLL_WRITE for `write`), as RM would; 0 or -errno. */
 int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
                      struct page **pages);
-/* Keep them pinned under registration `id` until a reap names it (0: until
- * remove()); the list and the array are then nvgpu_osdesc.c's. */
+/* Keep them pinned under registration `id` (non-zero) until a reap names
+ * it; the list and the array are then nvgpu_osdesc.c's. */
 void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
                        unsigned long npages, bool write);
+/*
+ * Send a registration whose pages are pinned: nvgpu_send_recv_used(), except
+ * that on -EINTR and -ETIMEDOUT the pins are no longer the caller's. A
+ * request that never reached the ring had them unpinned at once; one that
+ * did keeps them under its request id until its late reply says what RM
+ * registered (nvgpu_osdesc_late()), or remove(). On any other return they
+ * are still the caller's.
+ */
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write);
+/* The transport's reaper: request `req_id`, a registration its caller gave
+ * up on, came back naming registration `id` (0: none was made). */
+void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id);
 /* Unpin them (dirtied for `write`) and free the array. */
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 
@@ -822,6 +871,10 @@ int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
+/* The same, and release(arg) once the host can no longer act on the close:
+ * after its answer, or when it is known never to run. Process context. */
+void nvgpu_gem_close_then(struct nvgpu_device *dev, u32 file_handle, u32 gem,
+                          void (*release)(void *arg), void *arg);
 /*
  * MUNMAP: give back one window placement an MMAP reply handed out, through
  * the handle it was made on. The backend counts a reference per MMAP reply,
@@ -1034,7 +1087,9 @@ struct nvgpu_atomic_out {
 /*
  * From the ATOMIC special's phase 0: walk the commit's arrays in the call's
  * kernel copies, asking `ops` what its objects and properties are, reserving
- * the flip events and bridging the fences. 0 or -errno.
+ * the flip events and bridging the fences. 0 or -errno. `out->commit` is
+ * written before any hook runs (both implementations; the difftest checks
+ * what a hook sees), `out->values_buf` by the end.
  */
 int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
                        const struct nvgpu_atomic_ops *ops, void *ctx,

@@ -25,7 +25,10 @@
  * so a registration that succeeds carries an id, and the pages are unpinned
  * only when a reap (NVGPU_OP_OSDESC_REAP) names it: after an RM_FREE, after a
  * file's CLOSE, and before the next registration. A request abandoned in
- * flight keeps its pages until remove(): it may still have reached RM.
+ * flight may still reach RM: its pages are kept under its request id until
+ * the late reply says which registration it made, if any (the transport's
+ * reaper, nvgpu_osdesc_late()), and one that never reached the ring is
+ * unpinned at once (nvgpu_osdesc_send()).
  *
  * Anything that is not exactly one of the three, with the user virtual
  * address descriptor type, goes the old way, and the backend refuses it.
@@ -42,13 +45,24 @@
 /* Pages pinned at one go. */
 #define NVGPU_OSDESC_PIN_CHUNK 4096
 
-/* One registration's pins. `id` 0: a request abandoned in flight. */
+/*
+ * One registration's pins, under `id`; or, with `id` 0, under `req_id`: a
+ * request abandoned in flight whose late reply has not come back yet.
+ */
 struct nvgpu_osdesc {
   struct list_head node;
   u64 id;
+  u32 req_id;
   struct page **pages;
   unsigned long npages;
   bool write;
+};
+
+/* A late reply the reaper read before the waiter handed its pins over. */
+struct nvgpu_osdesc_late {
+  struct list_head node;
+  u32 req_id;
+  u64 id;
 };
 
 bool nvgpu_osdesc_ok(const struct nvgpu_device *dev) {
@@ -58,6 +72,7 @@ bool nvgpu_osdesc_ok(const struct nvgpu_device *dev) {
 void nvgpu_osdesc_init(struct nvgpu_device *dev) {
   mutex_init(&dev->osdesc_lock);
   INIT_LIST_HEAD(&dev->osdescs);
+  INIT_LIST_HEAD(&dev->osdesc_late);
 }
 
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write) {
@@ -87,9 +102,33 @@ static bool nvgpu_osdesc_released_early(struct nvgpu_device *dev, u64 id) {
   return false;
 }
 
-/* Keep `pages` pinned under `id` until a reap names it (or remove()). */
-void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
-                       unsigned long npages, bool write) {
+/*
+ * Whether a late reply to request `req_id` was read already, and the id it
+ * named if so (0: none). Taken out if so. Under osdesc_lock.
+ */
+static bool nvgpu_osdesc_answered_early(struct nvgpu_device *dev, u32 req_id,
+                                        u64 *id) {
+  struct nvgpu_osdesc_late *l;
+
+  list_for_each_entry(l, &dev->osdesc_late, node) {
+    if (l->req_id == req_id) {
+      *id = l->id;
+      list_del(&l->node);
+      kfree(l);
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * Keep `pages` pinned under registration `id` until a reap names it (or
+ * remove()), or, with `id` 0, under abandoned request `req_id` until its late
+ * reply comes back.
+ */
+static void nvgpu_osdesc_record(struct nvgpu_device *dev, u64 id, u32 req_id,
+                                struct page **pages, unsigned long npages,
+                                bool write) {
   struct nvgpu_osdesc *d = kzalloc(sizeof(*d), GFP_KERNEL);
   bool now;
 
@@ -102,12 +141,18 @@ void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
                          id, npages);
     return;
   }
-  d->id = id;
   d->pages = pages;
   d->npages = npages;
   d->write = write;
   mutex_lock(&dev->osdesc_lock);
-  now = dev->osdesc_dead || (id && nvgpu_osdesc_released_early(dev, id));
+  /* The late reply beat the waiter here: it said what RM made. */
+  if (!id && nvgpu_osdesc_answered_early(dev, req_id, &id) && !id) {
+    now = true;
+  } else {
+    d->id = id;
+    d->req_id = id ? 0 : req_id;
+    now = dev->osdesc_dead || (id && nvgpu_osdesc_released_early(dev, id));
+  }
   if (!now) {
     list_add_tail(&d->node, &dev->osdescs);
     WRITE_ONCE(dev->osdesc_count, dev->osdesc_count + 1);
@@ -115,6 +160,77 @@ void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
   mutex_unlock(&dev->osdesc_lock);
   if (now)
     nvgpu_osdesc_free(d);
+}
+
+void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
+                       unsigned long npages, bool write) {
+  nvgpu_osdesc_record(dev, id, 0, pages, npages, write);
+}
+
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write) {
+  bool sent;
+  u32 req_id;
+  int ret;
+
+  ret = nvgpu_send_recv_sent(dev, req, req_len, resp, resp_len, used, &sent,
+                             &req_id);
+  if (ret != -EINTR && ret != -ETIMEDOUT)
+    return ret;
+  if (!sent || !req_id) {
+    /* Never on the ring: RM cannot have seen the pages. */
+    nvgpu_osdesc_unpin(pages, npages, write);
+    return ret;
+  }
+  /* It may reach RM yet: pinned until its reply says what RM made. */
+  dev_dbg_ratelimited(&dev->vdev->dev,
+                      "virtio-gpu-nv: an OS-descriptor registration was "
+                      "abandoned in flight; its %lu pages stay pinned until "
+                      "its reply comes back\n",
+                      npages);
+  nvgpu_osdesc_record(dev, 0, req_id, pages, npages, write);
+  return ret;
+}
+
+void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id) {
+  struct nvgpu_osdesc *d, *found = NULL;
+  struct nvgpu_osdesc_late *l;
+  bool release = false;
+
+  if (!req_id)
+    return;
+  mutex_lock(&dev->osdesc_lock);
+  list_for_each_entry(d, &dev->osdescs, node) {
+    if (!d->id && d->req_id == req_id) {
+      found = d;
+      break;
+    }
+  }
+  if (found) {
+    /* Registered: a reap naming the id finds it from here. Or nothing was
+     * (or a reap named it already), and RM holds none of the pages. */
+    if (id && !nvgpu_osdesc_released_early(dev, id)) {
+      found->id = id;
+      found->req_id = 0;
+    } else {
+      list_del(&found->node);
+      WRITE_ONCE(dev->osdesc_count, dev->osdesc_count - 1);
+      release = true;
+    }
+  } else if (!dev->osdesc_dead) {
+    /* Its waiter has not handed the pins over yet: it looks here. Without
+     * memory to say so, they stay pinned until remove(). */
+    l = kmalloc(sizeof(*l), GFP_KERNEL);
+    if (l) {
+      l->req_id = req_id;
+      l->id = id;
+      list_add_tail(&l->node, &dev->osdesc_late);
+    }
+  }
+  mutex_unlock(&dev->osdesc_lock);
+  if (release)
+    nvgpu_osdesc_free(found);
 }
 
 /* Pin the `npages` pages from `start`, all of them, into `pages`. */
@@ -162,7 +278,15 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
   if (!resp)
     return;
 
-  mutex_lock(&dev->osdesc_lock);
+  /*
+   * One reap at a time, and each round is a HOST_OP that may take the
+   * transport's full timeout: a caller that is killed meanwhile leaves it to
+   * the next one (every registration and every file's last close reaps).
+   */
+  if (mutex_lock_killable(&dev->osdesc_lock)) {
+    kfree(resp);
+    return;
+  }
   for (round = 0; round < 64 && !dev->osdesc_dead; round++) {
     const struct nvgpu_host_op_resp *a =
         (const void *)(resp + sizeof(struct nvgpu_msg_hdr));
@@ -188,6 +312,9 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
       u64 id = get_unaligned_le64(resp + fixed + i * sizeof(u64));
       bool found = false;
 
+      /* No registration is 0; an abandoned request's pins are (req_id). */
+      if (!id)
+        continue;
       list_for_each_entry(d, &dev->osdescs, node) {
         if (d->id == id) {
           list_move_tail(&d->node, &done);
@@ -197,7 +324,7 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
         }
       }
       /* Its registration's reply has not been read yet: it will look. */
-      if (!found && id) {
+      if (!found) {
         dev->osdesc_early[dev->osdesc_early_next] = id;
         dev->osdesc_early_next =
             (dev->osdesc_early_next + 1) % NVGPU_OSDESC_EARLY;
@@ -222,15 +349,22 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
  */
 void nvgpu_osdesc_release_all(struct nvgpu_device *dev) {
   struct nvgpu_osdesc *d, *tmp;
+  struct nvgpu_osdesc_late *l, *ltmp;
   LIST_HEAD(done);
+  LIST_HEAD(late);
 
   mutex_lock(&dev->osdesc_lock);
   dev->osdesc_dead = true;
   list_splice_init(&dev->osdescs, &done);
+  list_splice_init(&dev->osdesc_late, &late);
   WRITE_ONCE(dev->osdesc_count, 0);
   mutex_unlock(&dev->osdesc_lock);
   list_for_each_entry_safe(d, tmp, &done, node) {
     list_del(&d->node);
     nvgpu_osdesc_free(d);
+  }
+  list_for_each_entry_safe(l, ltmp, &late, node) {
+    list_del(&l->node);
+    kfree(l);
   }
 }

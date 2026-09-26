@@ -30,6 +30,7 @@ void dt_reap(void);
 int dt_pin(u64 start, u64 npages, bool write, u64 *phys);
 void dt_keep(u64 id, u64 npages, bool write);
 void dt_unpin(u64 npages, bool write);
+void dt_hand_over(u64 npages, bool write);
 void dt_warn(const char *fmt);
 bool dt_compat(void);
 int dt_xfer(const void *req, size_t req_len, void *resp, size_t resp_len,
@@ -123,7 +124,8 @@ bool in_compat_syscall(void) { return dt_compat(); }
 
 /* ── nvgpu_main.c ── */
 
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle) {
+  (void)dev;
   if (guest_fd < 0)
     return -EBADF;
   return dt_handle_for_fd(guest_fd, handle);
@@ -271,6 +273,19 @@ void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write) {
   dt_unpin(n, write);
   harness_kfree(pages);
+}
+
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write) {
+  int r = nvgpu_send_recv_used(dev, req, req_len, resp, resp_len, used);
+
+  /* Abandoned: the pins are the transport's (nvgpu_osdesc.c). */
+  if (r == -ETIMEDOUT || r == -EINTR) {
+    dt_hand_over(npages, write);
+    harness_kfree(pages);
+  }
+  return r;
 }
 
 /* ── devices and calls, for the test ── */
@@ -507,11 +522,20 @@ static const struct nvgpu_atomic_ops harness_atomic_ops = {
     .reserve = dt_a_reserve,
 };
 
+/* The parse in progress's out struct, as a hook sees it (nvgpu_kms.c's read
+ * it from its context): what out->commit says while a hook runs. */
+static __thread struct nvgpu_atomic_out *harness_out;
+
+bool harness_atomic_commit(void) { return harness_out && harness_out->commit; }
+
 int harness_atomic(struct nvgpu_i2_call *call, bool fences, void *ctx,
                    bool *commit, u32 *values_buf) {
   struct nvgpu_atomic_out out = {};
-  int r = nvgpu_atomic_parse(call, fences, &harness_atomic_ops, ctx, &out);
+  int r;
 
+  harness_out = &out;
+  r = nvgpu_atomic_parse(call, fences, &harness_atomic_ops, ctx, &out);
+  harness_out = NULL;
   *commit = out.commit;
   *values_buf = out.values_buf;
   return r;

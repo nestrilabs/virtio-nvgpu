@@ -28,13 +28,23 @@
 //!   second waiter is told the cookie of the first, and the guest fans the one
 //!   `EV_READY` out to every waiter it has on that cookie;
 //! - **a per-VM cap** ([`REGISTRATION_CAP`]) on registrations that have not
-//!   fired, counted until they fire. Over it the guest falls back to polling
-//!   with a short backoff, which costs it latency and the host nothing;
+//!   fired, counted until they fire, and **a share of it per guest process**
+//!   ([`REGISTRATION_SHARE`], quota.rs), so one process's waits cannot use up
+//!   every other's. Over either the guest falls back to polling with a short
+//!   backoff, which costs it latency and the host nothing;
 //! - **the syncobj kept alive** by the registration (a syncobj file of our
 //!   own), so an entry can only ever end by firing -- which we see -- and never
 //!   by the syncobj being freed behind our back, which we would not: without
 //!   it, destroy-and-reimport would let a guest leave entries on a syncobj it
-//!   keeps alive through an exported fd, uncounted.
+//!   keeps alive through an exported fd, uncounted;
+//! - **except for a syncobj nobody else can hold.** One that was never
+//!   exported from its render file, in a file that never imported one, is
+//!   reachable only through that file's handle and our syncobj file. When
+//!   the handle is destroyed or the file closed, its registrations are
+//!   dropped outright: closing our syncobj file then frees the syncobj, and
+//!   the kernel frees its entries with it (drm_syncobj.c:533-538), as it
+//!   would for a native process. Anything else waits out its firing as an
+//!   orphan, charged to the process that made it.
 //!
 //! Userspace SYNCOBJ_EVENTFD (a compositor in the guest waiting on acquire
 //! points) is served by the same registrations; the guest signals its own
@@ -42,7 +52,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -51,6 +61,7 @@ use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
+use crate::quota::{Ledger, Owner, Share};
 use crate::sys::block::{Arena, BufId};
 use crate::xfer::Errno;
 
@@ -60,6 +71,10 @@ use crate::xfer::Errno;
 /// a handful outstanding per surface; this is far above any honest workload
 /// and far below anything that matters to the host.
 pub const REGISTRATION_CAP: usize = 1024;
+
+/// What one guest process may hold of [`REGISTRATION_CAP`] (quota.rs): a
+/// quarter, the last sixteenth kept for processes holding at most 16.
+pub const REGISTRATION_SHARE: Share = Share::quarter(REGISTRATION_CAP as u64, 16);
 
 /// How long a fired registration's eventfd handle outlives the registration.
 ///
@@ -206,8 +221,7 @@ impl SyncobjHost for HostSyncobj {
         // (drm_syncobj_get_fd, drm_syncobj.c:687, with O_CLOEXEC).
         let mut a = Arena::new();
         let top = a.small(&arg);
-        a.fd_out(top, 8, 4)
-            .map_err(io::Error::from_raw_os_error)?;
+        a.fd_out(top, 8, 4).map_err(io::Error::from_raw_os_error)?;
         drm_ioctl(render, hostfd::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut a, top)?;
         a.claim_fd(top, 8)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
@@ -257,6 +271,13 @@ pub trait RegTable {
 }
 
 struct Reg {
+    /// What it waits for; an orphan's names what it waited for.
+    key: RegKey,
+    /// An orphan no handle names any more (its DESTROY ran, or its file
+    /// closed): the numbers in its key may be another syncobj's or file's.
+    detached: bool,
+    /// The guest process it is charged to.
+    owner: Owner,
     cookie: u64,
     /// The eventfd's handle, which the pump watches.
     handle: u32,
@@ -281,10 +302,21 @@ pub struct Registrations {
     /// the kernel entry does too.
     orphans: Vec<Reg>,
     cap: usize,
+    /// Each guest process's part of it, orphans included.
+    share: Share,
+    held: Ledger,
     /// Handles of fired registrations, closed once [`RETIRE_GRACE`] has
     /// passed. Bounded by how fast registrations fire.
     retired: VecDeque<(u32, Instant)>,
     grace: Duration,
+    /// Syncobj handles a render file exported as a syncobj file
+    /// (SYNCOBJ_HANDLE_TO_FD without EXPORT_SYNC_FILE): whoever holds the
+    /// file can keep the syncobj alive and import it anywhere.
+    exported: HashSet<(u32, u32)>,
+    /// Render files that imported a syncobj file (SYNCOBJ_FD_TO_HANDLE
+    /// without IMPORT_SYNC_FILE): any of their handles may be a syncobj
+    /// someone else holds.
+    importers: HashSet<u32>,
 }
 
 impl Default for Registrations {
@@ -293,15 +325,120 @@ impl Default for Registrations {
     }
 }
 
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE` and
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`, both bit 0: a fence
+/// moves, not the syncobj (include/uapi/drm/drm.h).
+const SYNC_FILE_MODE: u32 = 1 << 0;
+
+fn word(arg: Option<&[u8]>, at: usize) -> Option<u32> {
+    arg.and_then(|a| a.get(at..at + 4))
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
 impl Registrations {
     pub fn with_cap(cap: usize) -> Self {
         Self {
             regs: HashMap::new(),
             orphans: Vec::new(),
             cap,
+            share: if cap == REGISTRATION_CAP {
+                REGISTRATION_SHARE
+            } else {
+                Share::quarter(cap as u64, 1)
+            },
+            held: Ledger::default(),
             retired: VecDeque::new(),
             grace: RETIRE_GRACE,
+            exported: HashSet::new(),
+            importers: HashSet::new(),
         }
+    }
+
+    /// What guest process `o` holds, orphans included.
+    pub fn held_by(&self, o: Owner) -> u64 {
+        self.held.held(o)
+    }
+
+    /// Whether syncobj handle `syncobj` of render handle `render` can only
+    /// be reached through that handle (and our own syncobj file).
+    fn private(&self, render: u32, syncobj: u32) -> bool {
+        !self.importers.contains(&render) && !self.exported.contains(&(render, syncobj))
+    }
+
+    /// A render-class IOCTL2 on `render` is about to run, its argument
+    /// `arg` (the backend's copy): what it does to a syncobj's reach.
+    /// SYNCOBJ_DESTROY orphans the handle's registrations first
+    /// ([`Registrations::orphan`]); an export or an import of a syncobj file
+    /// makes the syncobjs it touches ones another holder may keep alive.
+    /// Before the call, so that no registration is dropped on a syncobj that
+    /// got out while the call ran.
+    pub fn before_ioctl2(&mut self, render: u32, name: &str, arg: Option<&[u8]>) {
+        match name {
+            // drm_syncobj_destroy.handle @0.
+            "SYNCOBJ_DESTROY" => {
+                if let Some(h) = word(arg, 0) {
+                    self.orphan(render, h);
+                }
+            }
+            // drm_syncobj_handle { handle @0, flags @4, fd @8, .. }.
+            "SYNCOBJ_HANDLE_TO_FD" => match (word(arg, 0), word(arg, 4)) {
+                (Some(_), Some(f)) if f & SYNC_FILE_MODE != 0 => {}
+                (Some(h), Some(_)) => {
+                    self.exported.insert((render, h));
+                }
+                // Unreadable: the whole file is shared from here.
+                _ => {
+                    self.importers.insert(render);
+                }
+            },
+            "SYNCOBJ_FD_TO_HANDLE" if word(arg, 4).is_none_or(|f| f & SYNC_FILE_MODE == 0) => {
+                self.importers.insert(render);
+            }
+            _ => {}
+        }
+    }
+
+    /// The call [`Registrations::before_ioctl2`] saw has run, with host
+    /// result `result`. A SYNCOBJ_DESTROY that succeeded took the handle,
+    /// and with it the last way to reach a private syncobj: its orphans are
+    /// dropped, and the syncobj with its kernel entries goes with our file.
+    /// One that failed leaves the handle, and so the orphans, as they were.
+    pub fn after_ioctl2(
+        &mut self,
+        render: u32,
+        name: &str,
+        arg: Option<&[u8]>,
+        result: Option<i32>,
+    ) {
+        if name != "SYNCOBJ_DESTROY" || result != Some(0) {
+            return;
+        }
+        let Some(h) = word(arg, 0) else { return };
+        let private = self.private(render, h);
+        let now = Instant::now();
+        let (gone, kept): (Vec<Reg>, Vec<Reg>) = std::mem::take(&mut self.orphans)
+            .into_iter()
+            .partition(|r| private && !r.detached && r.key.render == render && r.key.syncobj == h);
+        self.orphans = kept;
+        for r in gone {
+            self.drop_reg(r, now);
+        }
+        // The number is the host's to give out again, to a syncobj of its own.
+        for r in self.orphans.iter_mut() {
+            if r.key.render == render && r.key.syncobj == h {
+                r.detached = true;
+            }
+        }
+        self.exported.remove(&(render, h));
+    }
+
+    /// A registration nothing will ever fire again, dropped: its slot and
+    /// its owner's charge back at once, its descriptors closed now (our
+    /// syncobj file with them, which may free the syncobj and its kernel
+    /// entries), its handle after the grace, as a fired one's.
+    fn drop_reg(&mut self, r: Reg, now: Instant) {
+        self.held.refund(r.owner, 1);
+        self.retired.push_back((r.handle, now));
     }
 
     /// A different grace before fired handles are closed (tests).
@@ -331,9 +468,40 @@ impl Registrations {
         self.orphan_where(|k| k.render == render && k.syncobj == syncobj);
     }
 
-    /// Render handle `render` is closing: every registration it made.
+    /// Render handle `render` is closing: every registration it made. Those
+    /// on syncobjs only the file could reach are dropped, as the file's
+    /// close frees the syncobjs; the rest are orphaned.
     pub fn orphan_file(&mut self, render: u32) {
-        self.orphan_where(|k| k.render == render);
+        let now = Instant::now();
+        let importer = self.importers.remove(&render);
+        let keys: Vec<RegKey> = self
+            .regs
+            .keys()
+            .filter(|k| k.render == render)
+            .copied()
+            .collect();
+        for k in keys {
+            if let Some(r) = self.regs.remove(&k) {
+                self.orphans.push(r);
+            }
+        }
+        let exported = &self.exported;
+        let (gone, kept): (Vec<Reg>, Vec<Reg>) = std::mem::take(&mut self.orphans)
+            .into_iter()
+            .partition(|r| {
+                !r.detached
+                    && r.key.render == render
+                    && !importer
+                    && !exported.contains(&(render, r.key.syncobj))
+            });
+        self.orphans = kept;
+        for r in gone {
+            self.drop_reg(r, now);
+        }
+        for r in self.orphans.iter_mut().filter(|r| r.key.render == render) {
+            r.detached = true;
+        }
+        self.exported.retain(|&(f, _)| f != render);
     }
 
     fn orphan_where(&mut self, f: impl Fn(&RegKey) -> bool) {
@@ -359,6 +527,21 @@ impl Registrations {
         render_fd: RawFd,
         key: RegKey,
         cookie: u64,
+    ) -> Result<Watched, Errno> {
+        self.watch_by(host, table, render_fd, key, cookie, Owner::Unknown)
+    }
+
+    /// [`Registrations::watch`], a new registration charged to guest
+    /// process `owner`, which may hold only its share of the cap. Joining
+    /// makes no kernel entry, and is not charged.
+    pub fn watch_by(
+        &mut self,
+        host: &dyn SyncobjHost,
+        table: &mut dyn RegTable,
+        render_fd: RawFd,
+        key: RegKey,
+        cookie: u64,
+        owner: Owner,
     ) -> Result<Watched, Errno> {
         self.reap(table, Instant::now());
         if key.flags & !WAIT_AVAILABLE != 0 {
@@ -388,11 +571,18 @@ impl Registrations {
             // and, worse, retire one another's guest bookkeeping.
             return Err(libc::EINVAL);
         }
-        if self.len() >= self.cap {
+        let admits = |r: &Self| {
+            r.held
+                .admits(&r.share, owner, 1, r.len() as u64, r.cap as u64)
+        };
+        if admits(self).is_err() {
             self.sweep();
-            if self.len() >= self.cap {
+            if let Err(why) = admits(self) {
                 log::warn!(
-                    "syncobj wait registrations at the cap ({}); the guest polls instead",
+                    "syncobj wait registrations: guest process {owner:?} holds {}, the VM {} of {} \
+                     ({why:?}); it polls instead",
+                    self.held.held(owner),
+                    self.len(),
                     self.cap
                 );
                 return Err(libc::EAGAIN);
@@ -427,9 +617,13 @@ impl Registrations {
             table.retire(handle);
             return Err(errno(&e));
         }
+        self.held.charge(owner, 1);
         self.regs.insert(
             key,
             Reg {
+                key,
+                detached: false,
+                owner,
                 cookie,
                 handle,
                 eventfd,
@@ -456,12 +650,15 @@ impl Registrations {
             .into_iter()
             .partition(|r| fired(r.eventfd.as_raw_fd()));
         self.orphans = live;
-        self.retired
-            .extend(fired_orphans.into_iter().map(|r| (r.handle, now)));
+        for r in fired_orphans {
+            self.held.refund(r.owner, 1);
+            self.retired.push_back((r.handle, now));
+        }
     }
 
     fn retire(&mut self, key: &RegKey) {
         if let Some(r) = self.regs.remove(key) {
+            self.held.refund(r.owner, 1);
             self.retired.push_back((r.handle, Instant::now()));
         }
     }
@@ -486,6 +683,9 @@ impl Registrations {
         self.regs.clear();
         self.orphans.clear();
         self.retired.clear();
+        self.held.clear();
+        self.exported.clear();
+        self.importers.clear();
     }
 }
 
@@ -536,8 +736,13 @@ impl NvidiaBackend {
     /// under `cookie`. Returns `[reporting cookie, 1 if joined]`.
     pub(crate) fn syncobj_watch(&mut self, key: RegKey, cookie: u64) -> Result<Vec<u64>, Errno> {
         let render_fd = self.handles.get_raw(key.render).map_err(|_| libc::EBADF)?;
+        // The process that asked (HOST_OP's trailer), else the file's opener.
+        let owner = match self.current_owner {
+            Owner::Unknown => self.handles.owner(key.render),
+            o => o,
+        };
         let mut regs = std::mem::take(&mut self.syncobj_regs);
-        let r = regs.watch(&HostSyncobj, self, render_fd, key, cookie);
+        let r = regs.watch_by(&HostSyncobj, self, render_fd, key, cookie, owner);
         self.syncobj_regs = regs;
         match r? {
             Watched::New => Ok(vec![cookie, 0]),
@@ -839,6 +1044,170 @@ mod tests {
             Err(libc::EINVAL),
             "an orphan still reports under its cookie"
         );
+    }
+
+    fn p(tgid: u32) -> Owner {
+        Owner::Proc {
+            tgid,
+            start_ns: u64::from(tgid),
+        }
+    }
+
+    fn destroy(r: &mut Registrations, syncobj: u32, result: i32) {
+        let arg = syncobj.to_le_bytes();
+        r.before_ioctl2(20, "SYNCOBJ_DESTROY", Some(&arg));
+        r.after_ioctl2(20, "SYNCOBJ_DESTROY", Some(&arg), Some(result));
+    }
+
+    fn handle_arg(syncobj: u32, flags: u32) -> [u8; 24] {
+        let mut a = [0u8; 24];
+        a[0..4].copy_from_slice(&syncobj.to_le_bytes());
+        a[4..8].copy_from_slice(&flags.to_le_bytes());
+        a
+    }
+
+    #[test]
+    fn one_process_holds_at_most_its_share_of_the_cap() {
+        // A process polling never-signalled points cannot leave the others
+        // of its VM without registrations.
+        let host = Host::default();
+        let (mut t, mut r) = (Table::default(), Registrations::with_cap(64));
+        let share = Share::quarter(64, 1).per_owner as u32;
+        for i in 0..share {
+            let k = RegKey {
+                point: u64::from(i),
+                ..key(1, 0, 0)
+            };
+            assert_eq!(
+                r.watch_by(&host, &mut t, 3, k, (2 << 32) | u64::from(i), p(1)),
+                Ok(Watched::New)
+            );
+        }
+        let k = RegKey {
+            point: 999,
+            ..key(1, 0, 0)
+        };
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, k, 3 << 32, p(1)),
+            Err(libc::EAGAIN)
+        );
+        assert_eq!(r.held_by(p(1)), u64::from(share));
+        // Another process is not affected, and joining is free.
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, k, 3 << 32, p(2)),
+            Ok(Watched::New)
+        );
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, k, 4 << 32, p(1)),
+            Ok(Watched::Joined(3 << 32))
+        );
+        // A fired one is given back to its owner.
+        host.fire(0);
+        r.sweep();
+        assert_eq!(r.held_by(p(1)), u64::from(share) - 1);
+    }
+
+    #[test]
+    fn a_destroyed_syncobj_only_its_file_could_reach_takes_its_registrations_along() {
+        // Never exported, in a file that never imported one: the handle was
+        // the only way to it, so the kernel frees it -- and the entries on it
+        // -- once our syncobj file goes. Nothing is left to count.
+        let host = Host::default();
+        // A share of one.
+        let (mut t, mut r) = (Table::default(), Registrations::with_cap(4));
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        destroy(&mut r, 1, 0);
+        assert!(r.is_empty());
+        assert_eq!(r.held_by(p(1)), 0);
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1)),
+            Ok(Watched::New),
+            "its share is free at once"
+        );
+        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
+        assert_eq!(t.retired, vec![1], "its handle closes after the grace");
+    }
+
+    #[test]
+    fn a_failed_destroy_leaves_the_orphan_counted() {
+        // DESTROY with a pad, or of a handle the file does not have: the
+        // syncobj (if any) lives on, and so does the kernel entry.
+        let host = Host::default();
+        let (mut t, mut r) = (Table::default(), Registrations::default());
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        destroy(&mut r, 1, -libc::EINVAL);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.held_by(p(1)), 1);
+    }
+
+    #[test]
+    fn a_syncobj_that_got_out_stays_counted_until_it_fires() {
+        // Exported as a syncobj file, or in a file that imported one: another
+        // holder can keep it alive, and a dropped entry would be uncounted.
+        let host = Host::default();
+        let (mut t, mut r) = (Table::default(), Registrations::default());
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1))
+            .unwrap();
+        r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(1, 0)));
+        // A sync_file export moves a fence, not the syncobj.
+        r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(2, 1)));
+        destroy(&mut r, 1, 0);
+        destroy(&mut r, 2, 0);
+        assert_eq!(r.len(), 1, "the exported one is an orphan");
+        assert_eq!(r.held_by(p(1)), 1, "charged to its maker");
+        host.fire(0);
+        r.sweep();
+        assert!(r.is_empty());
+        assert_eq!(r.held_by(p(1)), 0);
+
+        // An importing file's syncobjs may all be someone else's.
+        let mut r = Registrations::default();
+        r.watch_by(&host, &mut t, 3, key(3, 5, 0), 1 << 40, p(1))
+            .unwrap();
+        r.before_ioctl2(20, "SYNCOBJ_FD_TO_HANDLE", Some(&handle_arg(0, 0)));
+        destroy(&mut r, 3, 0);
+        assert_eq!(r.len(), 1);
+        r.orphan_file(20);
+        assert_eq!(r.len(), 1, "closing the file does not drop it either");
+    }
+
+    #[test]
+    fn closing_a_file_drops_what_only_it_could_reach() {
+        let host = Host::default();
+        let (mut t, mut r) = (Table::default(), Registrations::default());
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(3, 5, 0), C3, p(1))
+            .unwrap();
+        r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(2, 0)));
+        // A DESTROY that failed left handle 3 an orphan; the close takes it.
+        destroy(&mut r, 3, -libc::EINVAL);
+        r.orphan_file(20);
+        assert_eq!(r.len(), 1, "only the exported one is left");
+        assert_eq!(r.held_by(p(1)), 1);
+        // And the file's handle number starts clean for its next owner,
+        // whose destroy of syncobj 2 is not the old file's syncobj 2. Nor is
+        // a new private syncobj under an exported one's old number.
+        let mut r2 = Registrations::default();
+        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 41, p(1))
+            .unwrap();
+        r2.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(4, 0)));
+        destroy(&mut r2, 4, 0);
+        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 42, p(1))
+            .unwrap();
+        destroy(&mut r2, 4, 0);
+        assert_eq!(r2.len(), 1, "the exported one's orphan stays");
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), 1 << 40, p(2))
+            .unwrap();
+        destroy(&mut r, 2, 0);
+        assert_eq!(r.len(), 1);
+        assert_eq!((r.held_by(p(1)), r.held_by(p(2))), (1, 0));
     }
 
     #[test]

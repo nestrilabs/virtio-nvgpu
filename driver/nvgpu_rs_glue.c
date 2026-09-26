@@ -25,9 +25,14 @@
 int nvgpu_rs_copy_from(bool kernel, void *dst, u64 src, size_t len) {
   if (!len)
     return 0;
-  /* A call the driver makes itself, on memory it built: the caller wrote
-   * every address in it, so none is a user's to check. */
+  /*
+   * A call the driver makes itself, on memory it built: the caller wrote
+   * every address in it. One in the user range is a user's pointer copied
+   * along and not replaced, which a memcpy would follow: refused.
+   */
   if (kernel) {
+    if (access_ok(u64_to_user_ptr(src), len))
+      return -EFAULT;
     memcpy(dst, (const void *)(uintptr_t)src, len);
     return 0;
   }
@@ -38,6 +43,8 @@ int nvgpu_rs_copy_to(bool kernel, u64 dst, const void *src, size_t len) {
   if (!len)
     return 0;
   if (kernel) {
+    if (access_ok(u64_to_user_ptr(dst), len))
+      return -EFAULT;
     memcpy((void *)(uintptr_t)dst, src, len);
     return 0;
   }
@@ -66,6 +73,10 @@ u32 nvgpu_rs_caps(struct nvgpu_fd *nfd) {
 }
 
 u32 nvgpu_rs_fd_handle(struct nvgpu_fd *nfd) { return nfd->handle; }
+
+int nvgpu_rs_handle_for_fd(struct nvgpu_fd *nfd, int fd, u32 *handle) {
+  return nvgpu_handle_for_fd(nfd->dev, fd, handle);
+}
 
 int nvgpu_rs_send_recv(struct nvgpu_fd *nfd, const void *req, size_t req_len,
                        void *resp, size_t resp_len, u32 *used) {
@@ -166,42 +177,36 @@ void nvgpu_rs_warn(struct nvgpu_fd *nfd, u32 code, u64 a, u64 b) {
 
   switch (code) {
   case NVGPU_RS_WARN_CONTROL_FD:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM control 0x%x names fd %d, "
-                         "which is not one of our devices\n",
-                         (u32)a, (s32)b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                        "which is not one of our devices\n",
+                        (u32)a, (s32)b);
     break;
   case NVGPU_RS_WARN_CONTROL_OS_EVENT:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM control 0x%x names OS event "
-                         "0x%llx, which is not one of our devices\n",
-                         (u32)a, b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM control 0x%x names OS event "
+                        "0x%llx, which is not one of our devices\n",
+                        (u32)a, b);
     break;
   case NVGPU_RS_WARN_ALLOC_EVENT_FD:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
-                         "names fd %d, which is not one of our "
-                         "devices\n",
-                         (u32)a, (s32)b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                        "names fd %d, which is not one of our "
+                        "devices\n",
+                        (u32)a, (s32)b);
     break;
   case NVGPU_RS_WARN_EVENT_BUFFER:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
-                         "0x%llx, which is not one of our devices\n",
-                         b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                        "0x%llx, which is not one of our devices\n",
+                        b);
     break;
   case NVGPU_RS_WARN_SURFACE_FD:
-    dev_warn_ratelimited(
+    dev_dbg_ratelimited(
         d,
         "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
         "of ours\n",
         (s32)b);
-    break;
-  case NVGPU_RS_WARN_OSDESC_ABANDONED:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: an OS-descriptor registration was "
-                         "abandoned in flight; its %llu pages stay pinned\n",
-                         b);
     break;
   }
 }
@@ -232,6 +237,15 @@ void nvgpu_rs_osdesc_keep(struct nvgpu_fd *nfd, u64 id, void *pages,
 
 void nvgpu_rs_osdesc_unpin(void *pages, u64 npages, bool write) {
   nvgpu_osdesc_unpin(pages, npages, write);
+}
+
+int nvgpu_rs_osdesc_send(struct nvgpu_fd *nfd, const void *req,
+                         size_t req_len, void *resp, size_t resp_len, u32 *used,
+                         void *pages, u64 npages, bool write) {
+  if (req_len > INT_MAX || resp_len > INT_MAX)
+    return -E2BIG;
+  return nvgpu_osdesc_send(nfd->dev, (void *)req, (int)req_len, resp,
+                           (int)resp_len, used, pages, npages, write);
 }
 
 /* ───────── IOCTL2 ───────── */

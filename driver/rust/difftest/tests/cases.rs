@@ -161,6 +161,18 @@ fn time_correlation_refuses_the_tsc_and_rebases_the_others() {
     assert!(sends(&o).is_empty());
     assert_eq!(le32(mem(&o, ARG), 28), 0x56); // NV_ERR_NOT_SUPPORTED
 
+    // The block is read whole, once, before the clock is looked at: one that
+    // does not all read is -EFAULT, in both (the C once read the clock byte
+    // alone and answered NOT_SUPPORTED).
+    let mut w = world();
+    let call = control(0x2080_0406, vec![0x02, 1, 0, 0, 0, 0, 0, 0], &mut w);
+    let mut p = w.mem[&ARG].clone();
+    put(&mut p, 24, 4096, 4);
+    w.mem.insert(ARG, p);
+    let o = run(dev(0, vec![]), w, call);
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+
     // OSTIME, microseconds of realtime: moved by the clock offset (1 ms).
     let mut w = world();
     let mut n = vec![0u8; 8 + 2 * 16];
@@ -345,6 +357,20 @@ fn memory_the_caller_has_is_registered_by_its_pages() {
     assert_eq!(o.ret, 0);
     assert!(sends(&o).is_empty());
     assert_eq!(le32(mem(&o, ARG), 40), 0x1e);
+
+    // A registration whose caller gave up after it went out: the pins go
+    // with the request, for its late reply to settle (nvgpu_osdesc_late()),
+    // neither kept under no id until remove() nor unpinned under RM.
+    for err in [-4, -110] {
+        let mut w = world();
+        w.fail = vec![err];
+        let call = alloc_memory(va, 0x2fff, &mut w);
+        let o = run(d.clone(), w, call);
+        assert_eq!(o.ret, i64::from(err));
+        let ev = &o.world.events;
+        assert!(matches!(ev.last(), Some(Ev::HandOver { n: 4, write: true })), "{ev:?}");
+        assert!(!ev.iter().any(|e| matches!(e, Ev::Keep { .. } | Ev::Unpin { .. })));
+    }
 
     // A range within a page of 2^64 is not zero pages: it is not ours at
     // all, and goes the usual way (the C registered it with no pages).
@@ -557,10 +583,20 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
     put(&mut a, 32, V, 8);
     put(&mut a, 48, 0xabcd, 8);
     w.mem.insert(ARG, a);
+    let test_only = {
+        let mut w = w.clone();
+        let mut a = w.mem[&ARG].clone();
+        put(&mut a, 0, 0x100, 4);
+        w.mem.insert(ARG, a);
+        w
+    };
     let o = run(dev(0, vec![]), w, Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg: ARG, render: 5, xflags: 0 });
     let hooks: Vec<Hook> = o.world.events.iter().filter_map(|e| if let Ev::Hook(h) = e { Some(h.clone()) } else { None }).collect();
     assert!(hooks.contains(&Hook::ALearn { obj: 2, crtc: 6 }));
-    assert!(hooks.contains(&Hook::AInFence { buf: 4, off: 8, fd: 7 }));
+    // The hook sees a real commit: a TEST_ONLY one's fences are only
+    // checked. (The Rust parse said so only once it had finished, and every
+    // IN_FENCE_FD went to the host as -1.)
+    assert!(hooks.contains(&Hook::AInFence { buf: 4, off: 8, fd: 7, commit: true }));
     assert!(hooks.contains(&Hook::AOutFence { buf: 4, off: 16, uptr: OUT }));
     let reserved: Vec<u32> =
         hooks.iter().filter_map(|h| if let Hook::AReserve { crtc, .. } = h { Some(*crtc) } else { None }).collect();
@@ -570,4 +606,8 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
     // The request carries the in-fence's record and the out-fence's dyn.
     let s = &sends(&o)[0];
     assert_eq!((le32(s, 28), le32(s, 36)), (1, 1));
+
+    // TEST_ONLY: the hook knows that too.
+    let o = run(dev(0, vec![]), test_only, Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg: ARG, render: 5, xflags: 0 });
+    assert!(o.world.events.contains(&Ev::Hook(Hook::AInFence { buf: 4, off: 8, fd: 7, commit: false })));
 }

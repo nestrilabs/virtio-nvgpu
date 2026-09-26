@@ -110,7 +110,6 @@ const WARN_CONTROL_OS_EVENT: u32 = 2;
 const WARN_ALLOC_EVENT_FD: u32 = 3;
 const WARN_EVENT_BUFFER: u32 = 4;
 const WARN_SURFACE_FD: u32 = 5;
-const WARN_OSDESC_ABANDONED: u32 = 6;
 const WARN_I2_CMD: u32 = 16;
 const WARN_I2_MALFORMED: u32 = 17;
 const WARN_I2_UNNAMED: u32 = 18;
@@ -134,7 +133,7 @@ extern "C" {
         resp_len: usize,
         used: *mut u32,
     ) -> c_int;
-    fn nvgpu_handle_for_fd(guest_fd: c_int, handle: *mut u32) -> c_int;
+    fn nvgpu_rs_handle_for_fd(nfd: *mut c_void, guest_fd: c_int, handle: *mut u32) -> c_int;
     fn nvgpu_rs_proc_id(nfd: *mut c_void, dst: *mut c_void);
     fn nvgpu_rs_driver_version(nfd: *mut c_void, len: *mut usize) -> *const c_char;
     fn nvgpu_rs_clock_to_guest(nfd: *mut c_void, raw: u32, host_ns: i64, guest_ns: *mut i64) -> bool;
@@ -149,6 +148,17 @@ extern "C" {
     fn nvgpu_rs_page_phys(pages: *mut c_void, i: u64) -> u64;
     fn nvgpu_rs_osdesc_keep(nfd: *mut c_void, id: u64, pages: *mut c_void, npages: u64, write: bool);
     fn nvgpu_rs_osdesc_unpin(pages: *mut c_void, npages: u64, write: bool);
+    fn nvgpu_rs_osdesc_send(
+        nfd: *mut c_void,
+        req: *const c_void,
+        req_len: usize,
+        resp: *mut c_void,
+        resp_len: usize,
+        used: *mut u32,
+        pages: *mut c_void,
+        npages: u64,
+        write: bool,
+    ) -> c_int;
 
     fn nvgpu_rs_i2_fd_in(
         call: *mut c_void,
@@ -359,8 +369,8 @@ impl rm::Env for RmEnv {
     fn handle_for_fd(&mut self, fd: i32) -> Result<u32, Errno> {
         let mut h = 0u32;
         // SAFETY: fget()s a number of the calling process's and writes one
-        // u32 through a pointer to a local.
-        let r = unsafe { nvgpu_handle_for_fd(fd, &mut h) };
+        // u32 through a pointer to a local; `nfd` is the live file.
+        let r = unsafe { nvgpu_rs_handle_for_fd(self.nfd, fd, &mut h) };
         if r != 0 {
             Err(r)
         } else {
@@ -451,7 +461,6 @@ impl rm::Env for RmEnv {
             rm::Warn::AllocEventFd { class, fd } => (WARN_ALLOC_EVENT_FD, u64::from(class), fd as u64),
             rm::Warn::EventBufferOsEvent { val } => (WARN_EVENT_BUFFER, 0, val),
             rm::Warn::SurfaceFd { fd } => (WARN_SURFACE_FD, 0, fd as u64),
-            rm::Warn::OsDescAbandoned { pages } => (WARN_OSDESC_ABANDONED, 0, pages),
         };
         // SAFETY: logs; reads the live file's device.
         unsafe { nvgpu_rs_warn(self.nfd, code, a, b) };
@@ -516,6 +525,33 @@ impl osdesc::Env for RmEnv {
     fn unpin(&mut self, pin: KPin) {
         drop(pin);
     }
+
+    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], mut pin: KPin) -> (Result<u32, Errno>, Option<KPin>) {
+        let mut used = 0u32;
+        // SAFETY: as for send_recv; `pages` is the array
+        // nvgpu_rs_osdesc_pin() filled with `npages` pinned pages, which
+        // the call takes over only when it says so (-EINTR, -ETIMEDOUT).
+        let r = unsafe {
+            nvgpu_rs_osdesc_send(
+                self.nfd,
+                req.as_ptr().cast(),
+                req.len(),
+                resp.as_mut_ptr().cast(),
+                resp.len(),
+                &mut used,
+                pin.pages,
+                pin.npages,
+                pin.write,
+            )
+        };
+        if i2::abandons(r) {
+            // The transport's now: `pin` no longer names them, so its drop
+            // does nothing.
+            pin.pages = ptr::null_mut();
+            return (Err(r), None);
+        }
+        (if r < 0 { Err(r) } else { Ok(used) }, Some(pin))
+    }
 }
 
 /// `nvgpu_ioctl_fd()`: an ioctl on one of our `/dev/nvidia*` files, or a
@@ -549,7 +585,7 @@ pub unsafe extern "C" fn nvgpu_uvm_ioctl_fd(nfd: *mut c_void, cmd: c_uint, arg: 
 ///
 /// As [`nvgpu_ioctl_fd`].
 #[no_mangle]
-pub unsafe extern "C" fn nvgpu_ioctl_modeset(nfd: *mut c_void, cmd: c_uint, uarg: *mut c_void, _sz: u32) -> c_long {
+pub unsafe extern "C" fn nvgpu_ioctl_modeset(nfd: *mut c_void, cmd: c_uint, uarg: *mut c_void) -> c_long {
     // SAFETY: the caller's contract.
     let mut env = unsafe { RmEnv::new(nfd) };
     c_long::from(rm::modeset_v1(&mut env, cmd, uarg as u64))
@@ -992,13 +1028,22 @@ pub struct AtomicOut {
 const _: () = assert!(core::mem::size_of::<AtomicOut>() == 8);
 const _: () = assert!(core::mem::size_of::<AtomicOps>() == 6 * core::mem::size_of::<usize>());
 
-/// The hooks of one parse.
+/// The hooks of one parse, and the C's `struct nvgpu_atomic_out`, which a
+/// hook may read (through its context) while the parse runs: only ever
+/// written through the raw pointer, never held as a reference across a hook.
 struct AtomicEnv<'a> {
     ops: &'a AtomicOps,
     ctx: *mut c_void,
+    out: *mut AtomicOut,
 }
 
 impl atomic::Env<KStore> for AtomicEnv<'_> {
+    fn begin(&mut self, commit: bool) {
+        // SAFETY: `out` is the caller's live struct nvgpu_atomic_out (the
+        // nvgpu_rs_atomic_parse contract); no reference to it is held.
+        unsafe { ptr::addr_of_mut!((*self.out).commit).write(commit) };
+    }
+
     fn obj_class(&mut self, obj: u32) -> (i32, u32) {
         let mut crtc = 0u32;
         // SAFETY: nvgpu_kms.c's hook, on the context it passed with it,
@@ -1050,16 +1095,23 @@ pub unsafe extern "C" fn nvgpu_rs_atomic_parse(
     ctx: *mut c_void,
     out: *mut c_void,
 ) -> c_int {
+    let out = out.cast::<AtomicOut>();
     // SAFETY: the caller's contract.
-    let (Some(st), Some(ops), Some(out)) = (unsafe { hook_state(st) }, unsafe { ops.cast::<AtomicOps>().as_ref() }, unsafe {
-        out.cast::<AtomicOut>().as_mut()
-    }) else {
+    let (Some(st), Some(ops)) = (unsafe { hook_state(st) }, unsafe { ops.cast::<AtomicOps>().as_ref() }) else {
         return -EINVAL;
     };
-    let mut o = atomic::Out { commit: out.commit, values_buf: out.values_buf };
-    let mut env = AtomicEnv { ops, ctx };
+    if out.is_null() {
+        return -EINVAL;
+    }
+    // SAFETY: `out` is a live struct nvgpu_atomic_out; read and written by
+    // value, as the hooks may read it while the parse runs (AtomicEnv).
+    let mut o = unsafe { atomic::Out { commit: ptr::addr_of!((*out).commit).read(), values_buf: ptr::addr_of!((*out).values_buf).read() } };
+    let mut env = AtomicEnv { ops, ctx, out };
     let r = atomic::parse(st, &mut env, fences, &mut o);
-    out.commit = o.commit;
-    out.values_buf = o.values_buf;
+    // SAFETY: as above.
+    unsafe {
+        ptr::addr_of_mut!((*out).commit).write(o.commit);
+        ptr::addr_of_mut!((*out).values_buf).write(o.values_buf);
+    }
     r
 }

@@ -28,5 +28,7 @@ void harness_warn(const char *fmt);
     (void)sizeof(dev);                                                         \
     harness_warn(fmt);                                                         \
   } while (0)
+/* A line a caller can make: logged at debug level, compared all the same. */
+#define dev_dbg_ratelimited(dev, fmt, ...) dev_warn_ratelimited(dev, fmt)
 
 #endif

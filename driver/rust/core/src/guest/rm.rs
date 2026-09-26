@@ -157,12 +157,6 @@ pub enum Warn {
         /// The descriptor.
         fd: i32,
     },
-    /// An OS-descriptor registration was abandoned in flight; its pages
-    /// stay pinned until remove().
-    OsDescAbandoned {
-        /// The pages.
-        pages: u64,
-    },
 }
 
 /// The module around these paths: the caller's memory, the transport, the

@@ -478,7 +478,7 @@ void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
  */
 static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                         struct nvgpu_tbuf *resp, u32 flags, u32 *used_len,
-                        struct nvgpu_times *tm, bool *sent) {
+                        struct nvgpu_times *tm, bool *sent, u32 *req_id) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct scatterlist *sgs[2];
   struct nvgpu_msg_hdr hdr;
@@ -492,6 +492,8 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
 
   if (sent)
     *sent = false;
+  if (req_id)
+    *req_id = 0;
   if (used_len)
     *used_len = 0;
   if (!xf)
@@ -530,6 +532,8 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   do {
     id = (u32)atomic_inc_return(&xf->next_id);
   } while (!id);
+  if (req_id)
+    *req_id = id;
   nvgpu_tbuf_read(req, 0, &hdr, sizeof(hdr));
   hdr.req_id = cpu_to_le32(id);
   nvgpu_tbuf_write(req, 0, &hdr, sizeof(hdr));
@@ -678,7 +682,7 @@ unsent:
 
 int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                struct nvgpu_tbuf *resp, u32 flags, u32 *used_len) {
-  return __nvgpu_xfer(dev, req, resp, flags, used_len, NULL, NULL);
+  return __nvgpu_xfer(dev, req, resp, flags, used_len, NULL, NULL, NULL);
 }
 
 /*
@@ -688,8 +692,8 @@ int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
 static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
                               size_t req_len, void *resp, size_t resp_len,
                               u32 flags, u32 *used_len, struct nvgpu_times *tm,
-                              bool *sent, void (*release)(void *arg),
-                              void *arg) {
+                              bool *sent, u32 *req_id,
+                              void (*release)(void *arg), void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_tbuf *rq, *rs;
   size_t posted = resp_len;
@@ -698,6 +702,8 @@ static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
 
   if (sent)
     *sent = false;
+  if (req_id)
+    *req_id = 0;
   if (used_len)
     *used_len = 0;
   if (!xf) {
@@ -722,7 +728,7 @@ static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
   }
   nvgpu_tbuf_write(rq, 0, req, req_len);
 
-  ret = __nvgpu_xfer(dev, rq, rs, flags, &used, tm, sent);
+  ret = __nvgpu_xfer(dev, rq, rs, flags, &used, tm, sent, req_id);
   if (ret == -ETIMEDOUT || ret == -EINTR)
     return ret; /* the transport owns rq and rs now */
   if (!ret) {
@@ -741,7 +747,7 @@ static int nvgpu_call(struct nvgpu_device *dev, const void *req,
                       size_t req_len, void *resp, size_t resp_len, u32 flags,
                       u32 *used_len, struct nvgpu_times *tm, bool *sent) {
   return nvgpu_call_holding(dev, req, req_len, resp, resp_len, flags,
-                            used_len, tm, sent, NULL, NULL);
+                            used_len, tm, sent, NULL, NULL, NULL);
 }
 
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
@@ -760,7 +766,19 @@ int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
     return -EINVAL;
   }
   return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
-                            NULL, NULL, release, arg);
+                            NULL, NULL, NULL, release, arg);
+}
+
+int nvgpu_send_recv_sent(struct nvgpu_device *dev, void *req, int req_len,
+                         void *resp, int resp_len, u32 *used_len, bool *sent,
+                         u32 *req_id) {
+  if (req_len <= 0 || resp_len <= 0) {
+    *sent = false;
+    *req_id = 0;
+    return -EINVAL;
+  }
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
+                            NULL, sent, req_id, NULL, NULL);
 }
 
 int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
@@ -797,10 +815,15 @@ struct nvgpu_close_work {
   u32 handle; /* the handle to close, or the file the GEM handle is in */
   u32 id;     /* GEM handle or mapping id */
   enum nvgpu_close_what what;
+  /* Run once the host can no longer act on the close: answered, abandoned
+   * and then answered or reset, or never sent at all. Process context. */
+  void (*release)(void *arg);
+  void *arg;
 };
 
 static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
-                              enum nvgpu_close_what what);
+                              enum nvgpu_close_what what,
+                              void (*release)(void *arg), void *arg);
 
 static int __nvgpu_close_handle(struct nvgpu_device *dev, u32 handle,
                                 bool fallback) {
@@ -816,7 +839,7 @@ static int __nvgpu_close_handle(struct nvgpu_device *dev, u32 handle,
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, &sent);
   if (!sent && fallback && ret != -ENODEV)
-    nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE);
+    nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE, NULL, NULL);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
 }
 
@@ -835,30 +858,40 @@ struct nvgpu_gem_close_reply {
   struct drm_gem_close arg;
 } __packed;
 
+/*
+ * With `release`, which runs once the host can no longer act on the close
+ * (see nvgpu_call_holding()), whatever happens. Only the queued close passes
+ * one, and it has no fallback: a fallback would queue a close whose release
+ * had already run with the unsent request.
+ */
 static int __nvgpu_gem_close(struct nvgpu_device *dev, u32 file, u32 gem,
-                             bool fallback) {
+                             bool fallback, void (*release)(void *arg),
+                             void *arg) {
   struct nvgpu_gem_close_msg req = {};
   struct nvgpu_gem_close_reply resp;
   bool sent;
   u32 used;
   int ret;
 
-  if (!file || !gem)
+  if (!file || !gem) {
+    if (release)
+      release(arg);
     return 0;
+  }
   req.io.hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
   req.io.hdr.handle = cpu_to_le32(file);
   req.io.cmd = cpu_to_le32(DRM_IOCTL_GEM_CLOSE);
   req.io.data_len = cpu_to_le32(sizeof(req.arg));
   req.arg.handle = gem;
-  ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
-                   NULL, &sent);
+  ret = nvgpu_call_holding(dev, &req, sizeof(req), &resp, sizeof(resp), 0,
+                           &used, NULL, &sent, NULL, release, arg);
   if (!sent && fallback && ret != -ENODEV)
-    nvgpu_queue_close(dev, file, gem, NVGPU_CLOSE_GEM);
+    nvgpu_queue_close(dev, file, gem, NVGPU_CLOSE_GEM, NULL, NULL);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
 }
 
 int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem) {
-  return __nvgpu_gem_close(dev, file_handle, gem, true);
+  return __nvgpu_gem_close(dev, file_handle, gem, true, NULL, NULL);
 }
 
 /*
@@ -883,7 +916,7 @@ static int __nvgpu_munmap(struct nvgpu_device *dev, u32 handle, u32 mapping_id,
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, &sent);
   if (!sent && fallback && ret != -ENODEV)
-    nvgpu_queue_close(dev, handle, mapping_id, NVGPU_CLOSE_MUNMAP);
+    nvgpu_queue_close(dev, handle, mapping_id, NVGPU_CLOSE_MUNMAP, NULL, NULL);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
 }
 
@@ -900,7 +933,8 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
     __nvgpu_close_handle(cw->dev, cw->handle, false);
     break;
   case NVGPU_CLOSE_GEM:
-    __nvgpu_gem_close(cw->dev, cw->handle, cw->id, false);
+    __nvgpu_gem_close(cw->dev, cw->handle, cw->id, false, cw->release,
+                      cw->arg);
     break;
   case NVGPU_CLOSE_MUNMAP:
     __nvgpu_munmap(cw->dev, cw->handle, cw->id, false);
@@ -915,15 +949,18 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
  * put, an event consumer) and from paths that must not wait. The item holds a
  * module reference so the code it runs cannot be unloaded under it; remove()
  * drains the queue before the device goes, and refuses new items after.
+ * `release` (NVGPU_CLOSE_GEM only) runs here when the close is never queued,
+ * so a caller passing one must be in process context.
  */
 static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
-                              enum nvgpu_close_what what) {
+                              enum nvgpu_close_what what,
+                              void (*release)(void *arg), void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_close_work *cw;
   unsigned long flags;
 
   if (!xf || !handle)
-    return;
+    goto unqueued;
   cw = kmalloc(sizeof(*cw), GFP_ATOMIC);
   if (!cw) {
     dev_warn_ratelimited(&dev->vdev->dev,
@@ -931,33 +968,46 @@ static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
                          "%u (%s %u); it stays until the session resets\n",
                          handle,
                          what == NVGPU_CLOSE_MUNMAP ? "mapping" : "gem", id);
-    return;
+    goto unqueued;
   }
   INIT_WORK(&cw->work, nvgpu_close_work_fn);
   cw->dev = dev;
   cw->handle = handle;
   cw->id = id;
   cw->what = what;
+  cw->release = release;
+  cw->arg = arg;
 
   spin_lock_irqsave(&xf->lock, flags);
   if (xf->dead) {
     spin_unlock_irqrestore(&xf->lock, flags);
     kfree(cw);
-    return;
+    goto unqueued;
   }
   __module_get(THIS_MODULE);
   queue_work(xf->wq, &cw->work);
   spin_unlock_irqrestore(&xf->lock, flags);
+  return;
+
+unqueued:
+  /* Nothing will send it now, so nothing will act on it either. */
+  if (release)
+    release(arg);
 }
 
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle) {
-  nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE);
+  nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE, NULL, NULL);
 }
 
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem) {
   if (gem)
-    nvgpu_queue_close(dev, file_handle, gem, NVGPU_CLOSE_GEM);
+    nvgpu_queue_close(dev, file_handle, gem, NVGPU_CLOSE_GEM, NULL, NULL);
+}
+
+void nvgpu_gem_close_then(struct nvgpu_device *dev, u32 file_handle, u32 gem,
+                          void (*release)(void *arg), void *arg) {
+  nvgpu_queue_close(dev, file_handle, gem, NVGPU_CLOSE_GEM, release, arg);
 }
 
 /* ───────── Replies nobody waited for ───────── */
@@ -1043,7 +1093,7 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
     /* A re-home can return a handle the file had: a proxy's (S-11). */
     if (nvgpu_gem_handle_held(dev, render, le32_to_cpu(go.gem)))
       continue;
-    __nvgpu_gem_close(dev, render, le32_to_cpu(go.gem), true);
+    __nvgpu_gem_close(dev, render, le32_to_cpu(go.gem), true, NULL, NULL);
     n++;
   }
   return n;
@@ -1077,11 +1127,45 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
      * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
     if (nvgpu_gem_handle_held(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0))
       return 0;
-    __nvgpu_gem_close(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0, true);
+    __nvgpu_gem_close(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0, true,
+                      NULL, NULL);
     return 1;
   default:
     return 0;
   }
+}
+
+/*
+ * An OS-descriptor registration (NVGPU_DEEP_PAGE_LIST): which registration
+ * the late reply names, 0 for none -- refused, failed, or a backend that
+ * names none -- so the pins its waiter handed over are kept under it or let
+ * go (nvgpu_osdesc_late()). The same reading as nvgpu_osdesc_register()'s.
+ */
+static unsigned int nvgpu_reap_osdesc(struct nvgpu_device *dev,
+                                      struct nvgpu_req *r, u32 used,
+                                      const struct nvgpu_msg_hdr *ah) {
+  struct nvgpu_ioctl_req q;
+  struct nvgpu_ioctl_resp a;
+  u32 data_len, nested_len;
+  __le64 id = 0;
+
+  if (nvgpu_tbuf_read(r->req, 0, &q, sizeof(q)) ||
+      le32_to_cpu(q.deep_ptr_offset) != NVGPU_DEEP_PAGE_LIST)
+    return 0;
+  if ((s32)le32_to_cpu(ah->status) >= 0 &&
+      nvgpu_resp_has(used, 0, sizeof(a)) &&
+      !nvgpu_tbuf_read(r->resp, 0, &a, sizeof(a))) {
+    data_len = le32_to_cpu(a.data_len);
+    nested_len = data_len ? le32_to_cpu(a.nested_len) : 0;
+    if (data_len && le32_to_cpu(a.deep_len) == sizeof(id) &&
+        nvgpu_resp_has(used, sizeof(a) + (size_t)data_len + nested_len,
+                       sizeof(id)) &&
+        nvgpu_tbuf_read(r->resp, sizeof(a) + (size_t)data_len + nested_len,
+                        &id, sizeof(id)))
+      id = 0;
+  }
+  nvgpu_osdesc_late(dev, le32_to_cpu(q.hdr.req_id), le64_to_cpu(id));
+  return 1;
 }
 
 /*
@@ -1100,11 +1184,18 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
       nvgpu_tbuf_read(r->resp, 0, &ah, sizeof(ah)) ||
       nvgpu_tbuf_read(r->req, 0, &qh, sizeof(qh)))
     return;
+  /*
+   * A registration of the caller's pages, answered after its waiter left: the
+   * pins it kept for it are this reply's to settle (nvgpu_osdesc.c). Before
+   * the status, which says whether RM ever saw it.
+   */
+  if (le32_to_cpu(qh.msg_type) == NVGPU_MSG_IOCTL)
+    closed += nvgpu_reap_osdesc(dev, r, used, &ah);
   if ((s32)le32_to_cpu(ah.status) < 0) {
     /* Refused before it ran -- the backend sets a status on nothing else,
      * bar a call whose session a reset already emptied: nothing was made,
      * but an IOCTL2's consumed handles are still open there. */
-    closed = nvgpu_release_consumed(dev, r->req);
+    closed += nvgpu_release_consumed(dev, r->req);
     goto out;
   }
 
@@ -1730,6 +1821,9 @@ void nvgpu_event_vq_cb(struct virtqueue *vq) {
       break;
 
     nvgpu_event_dispatch(dev, buf, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
+    /* Back to zero, as it was posted: what the next batch does not write
+     * reads as nothing, not as this one's records. */
+    memset(buf, 0, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
 
     spin_lock_irqsave(&ev->vq_lock, flags);
     ret = nvgpu_event_post(ev, buf);
@@ -1811,6 +1905,9 @@ int nvgpu_ev_register(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c,
 
   if (!ev || !c->deliver)
     return -EINVAL;
+  /* Nothing will ever be delivered again. */
+  if (nvgpu_xfer_dead(dev))
+    return -ENODEV;
   spin_lock_irqsave(&ev->lock, flags);
   c->key = key;
   hash_add(ev->consumers, &c->node, key);
@@ -1840,7 +1937,9 @@ void nvgpu_ev_unregister(struct nvgpu_device *dev,
 u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev) {
   struct nvgpu_events *ev = dev->events;
 
-  return ev ? (u64)atomic64_inc_return(&ev->next_cookie) : 0;
+  if (!ev || nvgpu_xfer_dead(dev))
+    return 0;
+  return (u64)atomic64_inc_return(&ev->next_cookie);
 }
 
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
@@ -1930,8 +2029,10 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
    * backend speaks: a v1 backend writes its 16-byte EVENT_READY at the front
    * of whatever it is given, and a v2 one batches records up to the size.
    */
+  /* Zeroed: a device that says it wrote more than it did must not have the
+   * dispatch read whatever the heap held there before. */
   for (i = 0; i < NVGPU_EVENT_BUFS; i++)
-    ev->bufs[i] = kmalloc(NVGPU_EVENT_BUF_SIZE, GFP_KERNEL);
+    ev->bufs[i] = kzalloc(NVGPU_EVENT_BUF_SIZE, GFP_KERNEL);
   spin_lock_irqsave(&ev->vq_lock, flags);
   for (i = 0; i < NVGPU_EVENT_BUFS; i++) {
     if (!ev->bufs[i] || nvgpu_event_post(ev, ev->bufs[i]))
@@ -1951,8 +2052,8 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
 
 /*
  * Whether nothing sent from here will ever be answered: after a reset or
- * remove(). For sleepers the transport cannot wake itself. Callers are
- * inside drm_dev_enter() or otherwise before nvgpu_xfer_destroy().
+ * remove(). For sleepers the transport cannot wake itself. Any holder of a
+ * device reference may ask: the state lives until the last one goes.
  */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = READ_ONCE(dev->xfer);
@@ -2010,17 +2111,35 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
     }
 }
 
+/*
+ * The queue goes; the state stays, dead, for whatever still holds the device
+ * (an open file, a fence, a mapping): each of them finds nvgpu_xfer_dead()
+ * rather than freed memory, and every path that could still queue work
+ * checks that under xf->lock first (nvgpu_queue_close()), or ran on a
+ * virtqueue that is gone (the callbacks, hotplug).
+ */
 void nvgpu_xfer_destroy(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+
+  if (!xf)
+    return;
+  spin_lock_irqsave(&xf->lock, flags);
+  xf->dead = true;
+  spin_unlock_irqrestore(&xf->lock, flags);
+  cancel_delayed_work_sync(&xf->sync_work);
+  if (xf->wq) {
+    destroy_workqueue(xf->wq);
+    xf->wq = NULL;
+  }
+}
+
+void nvgpu_xfer_free(struct nvgpu_device *dev) {
   struct nvgpu_events *ev = dev->events;
   int i;
 
-  if (xf) {
-    cancel_delayed_work_sync(&xf->sync_work);
-    destroy_workqueue(xf->wq);
-    kfree(xf);
-    dev->xfer = NULL;
-  }
+  kfree(dev->xfer);
+  dev->xfer = NULL;
   if (ev) {
     for (i = 0; i < NVGPU_EVENT_BUFS; i++)
       kfree(ev->bufs[i]);

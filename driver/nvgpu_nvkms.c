@@ -52,6 +52,7 @@
 #include <linux/poll.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 
 #include "nvgpu.h"
 #include "gen/nvgpu_schema.h"
@@ -63,9 +64,12 @@
 
 struct nvgpu_nvkms_call {
   struct nvgpu_fd *nfd;
-  const char *name;       /* the table entry's, "NVKMS_..." */
+  const char *name;       /* the table entry's, "NVKMS_..."; NULL until known */
+  u32 cmd;                /* the NVKMS command, once known */
+  bool next_event;        /* GET_NEXT_EVENT */
   struct nvgpu_fd *event; /* CLEAR_UNICAST_EVENT: the file it clears */
   bool event_claimed, self_claimed;
+  u8 valid;               /* GET_NEXT_EVENT's reply.valid, as the host left it */
 };
 
 /* The table entry for NVKMS command @cmd on this host, or NULL. */
@@ -89,6 +93,30 @@ static bool nvgpu_nvkms_claim(struct nvgpu_fd *nfd) {
 static void nvgpu_nvkms_settle(struct nvgpu_fd *nfd, bool drained) {
   atomic_cmpxchg(&nfd->pending, NVGPU_NVKMS_CLAIMED,
                  drained ? NVGPU_NVKMS_IDLE : NVGPU_NVKMS_READY);
+}
+
+/*
+ * Which command the call is, from the interpreter's own copy of the outer
+ * struct (buffer 0: NvKmsIoctlParams, whose first word is the command) --
+ * the bytes it sends, read once. From the first hook that runs.
+ */
+static void nvgpu_nvkms_identify(struct nvgpu_i2_call *call) {
+  struct nvgpu_nvkms_call *nc = call->priv;
+  const struct nvgpu_sioctl *e;
+  u32 len;
+  u8 *b0;
+
+  if (nc->name)
+    return;
+  b0 = nvgpu_i2_buf(call, 0, &len);
+  if (!b0 || len < sizeof(u32))
+    return;
+  nc->cmd = get_unaligned_le32(b0);
+  e = nvgpu_nvkms_entry(call->dev, nc->cmd);
+  if (!e)
+    return;
+  nc->name = e->name;
+  nc->next_event = !strcmp(e->name, "NVKMS_GET_NEXT_EVENT");
 }
 
 /* One of our /dev/nvidia* character-device files of @type on this device. */
@@ -146,6 +174,7 @@ static int nvgpu_nvkms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   struct nvgpu_fd *nfd = NULL;
   struct file *f;
 
+  nvgpu_nvkms_identify(call);
   if (user_value < 0 || user_value > INT_MAX)
     goto bad;
   f = fget(user_value);
@@ -162,7 +191,7 @@ static int nvgpu_nvkms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
      * claim that file's readiness now, before the host clears it, so a new
      * event after the clear is not lost with the old one.
      */
-    if (nfd->device_type == NVGPU_DEV_MODESET && !nc->event &&
+    if (nfd->device_type == NVGPU_DEV_MODESET && !nc->event && nc->name &&
         !strcmp(nc->name, "NVKMS_CLEAR_UNICAST_EVENT")) {
       nvgpu_fd_get(nfd);
       nc->event = nfd;
@@ -179,16 +208,42 @@ static int nvgpu_nvkms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
       return ret;
   }
 bad:
-  dev_warn_ratelimited(&dev->vdev->dev,
-                       "virtio-gpu-nv: %s: descriptor %lld at %u+%u is not a "
-                       "file of ours of the kind NVKMS takes there (kinds "
-                       "%#x)\n",
-                       nc->name, user_value, buf, off, kinds);
+  dev_dbg_ratelimited(&dev->vdev->dev,
+                      "virtio-gpu-nv: %s: descriptor %lld at %u+%u is not a "
+                      "file of ours of the kind NVKMS takes there (kinds "
+                      "%#x)\n",
+                      nc->name ? nc->name : "NVKMS", user_value, buf, off,
+                      kinds);
   return -EBADF;
+}
+
+/*
+ * Phase 0, the request about to go: GET_NEXT_EVENT claims the file's
+ * readiness now, so a report arriving while it runs is kept. Phase 1, the
+ * reply parsed: what GET_NEXT_EVENT said about the queue, from the copy that
+ * goes back to the caller (NvKmsGetNextEventParams.reply.valid).
+ */
+static int nvgpu_nvkms_phase(struct nvgpu_i2_call *call, int phase) {
+  struct nvgpu_nvkms_call *nc = call->priv;
+  u32 len;
+  u8 *params;
+
+  nvgpu_nvkms_identify(call);
+  if (!nc->next_event)
+    return 0;
+  if (phase == 0) {
+    nc->self_claimed = nvgpu_nvkms_claim(nc->nfd);
+    return 0;
+  }
+  params = nvgpu_i2_buf(call, 1, &len);
+  if (params && len > NVGPU_NVKMS_NEXT_EVENT_VALID_OFF)
+    nc->valid = params[NVGPU_NVKMS_NEXT_EVENT_VALID_OFF];
+  return 0;
 }
 
 static const struct nvgpu_i2_ops nvgpu_nvkms_ops = {
     .fd_in = nvgpu_nvkms_fd_in,
+    .phase = nvgpu_nvkms_phase,
 };
 
 /*
@@ -205,15 +260,15 @@ static long nvgpu_nvkms_errno(struct nvgpu_device *dev, const char *name,
   case -EBADF:
   case -EOPNOTSUPP:
   case -EMSGSIZE:
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: NVKMS command %u (%s) refused (%ld): "
-                         "%s\n",
-                         cmd, name ? name : "none", ret,
-                         ret == -ENOTTY  ? "no table entry for this host"
-                         : ret == -EBADF ? "a descriptor that is not ours"
-                         : ret == -E2BIG ? "larger than the transport carries"
-                                         : "not the host's layout, or the "
-                                           "backend's policy");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: NVKMS command %u (%s) refused (%ld): "
+                        "%s\n",
+                        cmd, name ? name : "none", ret,
+                        ret == -ENOTTY  ? "no table entry for this host"
+                        : ret == -EBADF ? "a descriptor that is not ours"
+                        : ret == -E2BIG ? "larger than the transport carries"
+                                        : "not the host's layout, or the "
+                                          "backend's policy");
     return -EPERM;
   }
   return ret;
@@ -233,50 +288,31 @@ long nvgpu_nvkms_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
       .ops = &nvgpu_nvkms_ops,
       .priv = &nc,
   };
-  /* struct NvKmsIoctlParams (nvkms-ioctl.h:38). */
-  struct {
-    __le32 cmd;
-    __le32 size;
-    __le64 address;
-  } outer;
-  const struct nvgpu_sioctl *e;
-  bool next_event;
-  u8 valid = 1;
-  u32 nvkms_cmd;
   long ret;
 
   /* nvkms_ioctl's own checks (nvidia-modeset-linux.c:1976-1985). */
   if (cmd != NVGPU_NVKMS_IOCTL_IOWR)
     return -ENOTTY;
-  if (copy_from_user(&outer, uarg, sizeof(outer)))
-    return -EFAULT;
-  nvkms_cmd = le32_to_cpu(outer.cmd);
-  e = nvgpu_nvkms_entry(dev, nvkms_cmd);
-  if (!e)
-    return nvgpu_nvkms_errno(dev, NULL, nvkms_cmd, -ENOTTY);
-  nc.name = e->name;
-  next_event = !strcmp(e->name, "NVKMS_GET_NEXT_EVENT");
-  if (next_event)
-    nc.self_claimed = nvgpu_nvkms_claim(nfd);
 
+  /*
+   * Everything this decides -- which command, GET_NEXT_EVENT's claim and
+   * what it found -- is decided on the interpreter's one copy of the call,
+   * in its hooks: the outer struct used to be read here first, and a thread
+   * rewriting it in between had one command's readiness handled for
+   * another's.
+   */
+  nc.valid = 1;
   ret = nvgpu_i2_ioctl(&call);
 
-  if (next_event && nc.self_claimed) {
-    /* reply.valid: FALSE is "the queue was empty", nvkms.c:3291-3320.
-     * Read back from the caller, where the reply half has just landed. */
-    void __user *params = u64_to_user_ptr(le64_to_cpu(outer.address));
-
-    if (ret ||
-        copy_from_user(&valid, params + NVGPU_NVKMS_NEXT_EVENT_VALID_OFF, 1))
-      valid = 1;
-    nvgpu_nvkms_settle(nfd, !valid);
-  }
+  if (nc.next_event && nc.self_claimed)
+    /* reply.valid: FALSE is "the queue was empty", nvkms.c:3291-3320. */
+    nvgpu_nvkms_settle(nfd, !ret && !nc.valid);
   if (nc.event) {
     if (nc.event_claimed)
       nvgpu_nvkms_settle(nc.event, ret == 0);
     nvgpu_fd_put(nc.event);
   }
-  return nvgpu_nvkms_errno(dev, e->name, nvkms_cmd, ret);
+  return nvgpu_nvkms_errno(dev, nc.name, nc.cmd, ret);
 }
 
 __poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,

@@ -167,6 +167,14 @@ bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
 
 /* ───────── the kernel copies ───────── */
 
+/*
+ * A driver-built call's buffer: in kernel memory, never the user range
+ * (access_ok() is what says a range is a user's).
+ */
+static bool nvgpu_i2_kernel_range(const void __user *p, size_t len) {
+  return !access_ok(p, len);
+}
+
 /* A little-endian unsigned field of 1, 2, 4 or 8 bytes (NVKMS counts come
  * as narrow as SET_SWAP_GROUP_CLIP_LIST's u16 nClips). */
 static int nvgpu_i2_rd(const struct nvgpu_i2_state *st, u32 b, u32 off,
@@ -253,9 +261,15 @@ static int nvgpu_i2_new_buf(struct nvgpu_device *dev,
   *out = st->nbuf++;
   if (!(dir & NVGPU_SDIR_IN) || !len)
     return 0;
-  /* A call the driver makes itself, on memory it built (nvgpu_i2_call.kernel):
-   * the caller wrote every address in it, so none is a user's to check. */
+  /*
+   * A call the driver makes itself, on memory it built (nvgpu_i2_call.kernel):
+   * the caller wrote every address in it. One in the user range is a user's
+   * pointer that the driver copied along and forgot to replace -- which a
+   * kernel memcpy would follow at the caller's choice -- and is refused.
+   */
   if (st->kernel) {
+    if (!nvgpu_i2_kernel_range(uptr, len))
+      return -EFAULT;
     memcpy(kb->k, (const void __force *)uptr, len);
     return 0;
   }
@@ -957,10 +971,14 @@ static int nvgpu_i2_copy_back(struct nvgpu_i2_call *call) {
     }
     if (end <= start)
       continue;
-    if (st->kernel)
-      memcpy((void __force *)kb->uptr + start, kb->k + start, end - start);
-    else if (copy_to_user(kb->uptr + start, kb->k + start, end - start))
+    if (st->kernel) {
+      if (nvgpu_i2_kernel_range(kb->uptr + start, end - start))
+        memcpy((void __force *)kb->uptr + start, kb->k + start, end - start);
+      else
+        fault = -EFAULT;
+    } else if (copy_to_user(kb->uptr + start, kb->k + start, end - start)) {
       fault = -EFAULT;
+    }
   }
   return fault;
 }
@@ -1094,6 +1112,15 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
 
   max_fdo = nvgpu_i2_count(st, NVGPU_SF_FD_OUT) + st->ndyn;
   max_gemo = nvgpu_i2_count(st, NVGPU_SF_GEM_OUT);
+  /*
+   * A reply may name one descriptor per slot and dyn record, and each lands
+   * in st->fdo[]: a call that could be answered with more than it holds is
+   * not sent (a reply of up to 512 wrote the rest over st->gemo[]).
+   */
+  if (max_fdo > NVGPU_I2_MAX_RECS) {
+    ret = -E2BIG;
+    goto drop;
+  }
   req_len = sizeof(struct nvgpu_i2_head) + 4 * st->nbuf +
             sizeof(struct nvgpu_i2_fd_in) * st->nfd +
             sizeof(struct nvgpu_i2_gem_in) * st->ngem +

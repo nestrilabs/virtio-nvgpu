@@ -50,7 +50,8 @@ transliteration (`device/src/i2_e2e.rs`) that has to be kept in step with
 itself against its Rust port.
 
 **The parsers of guest-process input have a Rust implementation**
-(`NVGPU_RUST=1`, needing a kernel with `CONFIG_RUST=y`): the IOCTL2 walk, the
+(`NVGPU_RUST=1`, or `CONFIG_VIRTIO_GPU_NV_RUST=y` in-tree, needing a kernel
+with `CONFIG_RUST=y`): the IOCTL2 walk, the
 v1 IOCTL marshalling and descriptor translation, deep segments and the
 OS-descriptor registrations. The C is the default until the Rust has passed
 the hardware regression; [`rust/README.md`](rust/README.md) has what differs,
@@ -64,7 +65,7 @@ One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`):
 | `nvgpu_wire.h` | wire protocol and config-space layout (BSD-3-Clause OR GPL-2.0+, mirrors `protocol/`) |
 | `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, mmap with each placement's memory type and writability (UVM semaphore pools from the UVM aperture, shared memory region 2, found before HELLO and offered in it, at host addresses in [4 GiB, 32 TiB) only), `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
 | `nvgpu_rmio.c` | the protocol-v1 IOCTL message, in C: the ioctl dispatcher for `/dev/nvidia*` and DRM driver-range calls, RM forwarding (descriptors and OS events translated to backend handles, deep pointers and deep segments, GPU/CPU time correlation moved into the guest's clocks, the calling process on RM_ALLOC and RM_DUP_OBJECT), UVM, v1 nvidia-modeset, and what reads an OS-descriptor registration and builds its page list. Built with `NVGPU_RUST=0` (the default) |
-| `nvgpu_osdesc.c` | memory the caller already has, registered with RM by its pages: ALLOC_MEMORY and RM_ALLOC of the OS-descriptor class and VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR pin the caller's range as RM would and send its guest-physical runs; the pins last until a reap (HOST_OP OSDESC_REAP) names the registration, or remove() |
+| `nvgpu_osdesc.c` | memory the caller already has, registered with RM by its pages: ALLOC_MEMORY and RM_ALLOC of the OS-descriptor class and VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR pin the caller's range as RM would and send its guest-physical runs; the pins last until a reap (HOST_OP OSDESC_REAP) names the registration, or remove(); a registration abandoned in flight keeps them under its request id until its late reply names what RM registered, and one never sent unpins at once |
 | `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls |
 | `nvgpu_xfer.c` | protocol v2 transport: request contexts and transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, the event queue and its consumer registry, EV_HOTPLUG uevents |
 | `nvgpu_i2.c` | the schema-driven IOCTL2 interpreter, in C: gathers a caller's buffers per `gen/nvgpu_schema.h`, translates descriptors and GEM handles through per-caller hooks, copies replies back by the kernel's own rules. Built with `NVGPU_RUST=0` |
@@ -88,9 +89,14 @@ against).
 
 | parameter | default | what it does |
 |---|---|---|
-| `wl_mode` | `0660` | permissions of `/dev/nvgpu-wl*`, created `root:root`. Every open is a client of the host compositor, so the node is for the Wayland daemon alone; `scripts/70-nvgpu-wl.rules` gives it the `nvgpu-wl` group. `0666` is the old, open behaviour. |
-| `poll_events` | `1` | a wait on a device descriptor really waits for the host's event; `0` is the old behaviour, which spins |
-| `poll_spin_us` | `0` | microseconds to spin before sleeping for an event; measured not to help, kept as a knob |
-| `claim_alloc` | `1` | GET_DEV_INFO reports `supports_alloc` (ANDed with the host's) |
-| `claim_sync_fd` | `0` | GET_DEV_INFO reports `supports_sync_fd` (ANDed with the host's) — only without fences (a v1 backend); with fences it follows the host's semaphore-surface bit and this is ignored |
-| `virtio_id` | `45` | virtio device ID to bind, for testing under another VMM's numbering |
+| `wl_mode` | `0660` | permissions of `/dev/nvgpu-wl*`, created `root:root`. Every open is a client of the host compositor, so the node is for the Wayland daemon alone; `scripts/70-nvgpu-wl.rules` gives it the `nvgpu-wl` group. A mode outside `0770` (anything for "other") is refused and the module does not load. |
+| `virtio_id` | `45` | virtio device ID to bind: libkrun's number; another for a VMM that cannot express 45 (QEMU stops at 41) |
+
+Both are read-only once loaded. The experiment switches of earlier builds
+(`poll_events`, `poll_spin_us`, `claim_alloc`, `claim_sync_fd`) are gone: a
+wait always waits for the host's event, and GET_DEV_INFO's capability bits
+are the host's (the fence bits only with a backend that serves fences).
+
+`modinfo -F parsers virtio_gpu_nv.ko` says which implementation reads
+guest-process input: `c`, or `rust` (`NVGPU_RUST=1`, or
+`CONFIG_VIRTIO_GPU_NV_RUST=y` in-tree).

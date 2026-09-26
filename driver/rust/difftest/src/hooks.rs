@@ -164,9 +164,11 @@ pub fn a_prop(w: &mut World, id: u32) -> i32 {
 }
 
 /// nvgpu_kms_in_fence(): -1 in the copy for a fence that has signalled (4),
-/// a record for one of ours, -EBADF otherwise.
-pub fn a_in_fence(w: &mut World, c: &mut dyn CallBufs, buf: u32, off: u32, fd: i64) -> i32 {
-    w.events.push(Ev::Hook(Hook::AInFence { buf, off, fd }));
+/// a record for one of ours, -EBADF otherwise. `commit` is what the parse
+/// had said about the commit when the hook ran (nvgpu_atomic_parse()'s
+/// `out->commit`, `atomic::Env::begin`), which the kernel's hook acts on.
+pub fn a_in_fence(w: &mut World, c: &mut dyn CallBufs, buf: u32, off: u32, fd: i64, commit: bool) -> i32 {
+    w.events.push(Ev::Hook(Hook::AInFence { buf, off, fd, commit }));
     if fd < 0 || fd > i64::from(i32::MAX) {
         return -EINVAL;
     }

@@ -28,6 +28,9 @@ pub fn serve(w: &mut World, req: &[u8], resp: &mut [u8]) -> Result<u32, i32> {
         logged[12..16].fill(0);
     }
     w.events.push(Ev::Send(logged));
+    if !w.fail.is_empty() {
+        return Err(w.fail.remove(0));
+    }
     if !w.canned.is_empty() {
         let reply = w.canned.remove(0);
         let n = reply.len().min(resp.len());

@@ -50,8 +50,8 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
 long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                         unsigned long arg);
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                         void __user *uarg, u32 sz);
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+                         void __user *uarg);
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle);
 bool nvgpu_proc_ids(const struct nvgpu_device *dev);
 bool nvgpu_proc_euid(const struct nvgpu_device *dev);
 void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst);
@@ -59,7 +59,9 @@ bool nvgpu_host_clock_to_guest(struct nvgpu_device *dev, clockid_t clk,
                                s64 host_ns, s64 *guest_ns);
 
 bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                        void __user *uarg, unsigned int sz, long *ret);
+                        void __user *uarg, const void *outer, unsigned int sz,
+                        long *ret);
+bool nvgpu_osdesc_candidate(unsigned int nr, unsigned int sz);
 void nvgpu_osdesc_reap(struct nvgpu_device *dev);
 bool nvgpu_osdesc_ok(const struct nvgpu_device *dev);
 int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
@@ -67,6 +69,9 @@ int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
 void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
                        unsigned long npages, bool write);
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write);
 
 struct nvgpu_tbuf;
 struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);

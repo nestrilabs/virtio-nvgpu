@@ -3,7 +3,7 @@
  * The protocol-v1 IOCTL message, in C: RM escapes (flat ones, RM_CONTROL with
  * its nested block, intercepts and deep pointers, RM_ALLOC, IDLE_CHANNELS),
  * ioctls that carry a descriptor at a fixed offset, UVM, and a v1 backend's
- * NVKMS commands. Moved here from nvgpu_main.c unchanged.
+ * NVKMS commands.
  *
  * This is the C implementation of what driver/rust/core/src/guest/rm.rs and
  * dispatch.rs implement in Rust; the Makefile builds one or the other
@@ -35,8 +35,6 @@
 #define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_DUP_OBJECT 0x34
 #define NV_ESC_RM_IDLE_CHANNELS 0x41
-/* UVM_INITIALIZE ioctl nr */
-#define UVM_INITIALIZE_NR 0x30
 
 /*
  * RM control commands that name an open file by descriptor inside their
@@ -130,9 +128,13 @@ struct NVOS64_PARAMETERS {
 static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
               "RM_ALLOC parameter struct must match the host driver ABI");
 
-/* nvgpu_ioctl_simple — flat struct, no embedded pointers */
+/*
+ * nvgpu_ioctl_simple — flat struct, no embedded pointers. `pre`: the block,
+ * already copied in whole by a caller that decided on it (NULL: read here).
+ */
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
-                               void __user *uarg, unsigned int sz) {
+                               void __user *uarg, unsigned int sz,
+                               const void *pre) {
   /* RM_DUP_OBJECT carries the calling process after the struct. */
   bool proc = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT &&
               nvgpu_proc_ids(nfd->dev);
@@ -165,7 +167,9 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   req->deep_len = 0;
 
   if (sz > 0) {
-    if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
+    if (pre)
+      memcpy(req_buf + sizeof(*req), pre, sz);
+    else if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
       ret = -EFAULT;
       goto out;
     }
@@ -219,7 +223,8 @@ out:
  * Zero is "no notification" and passes as it is. The caller's value is
  * saved in `*saved`, for the reply.
  */
-static int nvgpu_rm_os_event_in(void *slot, u64 *saved) {
+static int nvgpu_rm_os_event_in(struct nvgpu_device *dev, void *slot,
+                                u64 *saved) {
   u32 handle;
   u64 v;
 
@@ -227,7 +232,7 @@ static int nvgpu_rm_os_event_in(void *slot, u64 *saved) {
   *saved = v;
   if (!v)
     return 0;
-  if (v > INT_MAX || nvgpu_handle_for_fd((int)v, &handle))
+  if (v > INT_MAX || nvgpu_handle_for_fd(dev, (int)v, &handle))
     return -EBADF;
   v = handle;
   memcpy(slot, &v, sizeof(v));
@@ -577,9 +582,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * This used to be handled by swapping the command for an inline "V2"
    * variant that has no pointer. That bound us to the struct layouts of one
    * driver release: against any other it sent requests of the wrong size and
-   * shape, and some V2 variants are not served at all, which is what ended
-   * every Vulkan run here -- RM answered NV_ERR_INVALID_ARGUMENT to a command
-   * userspace had never asked for.
+   * shape, and some V2 variants are not served at all -- RM answered
+   * NV_ERR_INVALID_ARGUMENT to a command userspace had never asked for, and
+   * Vulkan failed to start.
    *
    * The backend already solves this one level up: it allocates a host buffer
    * for the top-level pointer, copies the guest's bytes in, points the struct
@@ -588,19 +593,14 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * the pointer sits and how much it addresses. Both are properties of the
    * layout that carries the pointer, which is the stable one.
    */
-  rw = (user_nested && nested_size > 0) ? nvgpu_find_deep_rewrite(ctl_cmd)
-                                        : NULL;
-
   /*
-   * Several pointers, each with what it addresses (nvgpu_deep_plan). The
-   * nested block is read once, here, and that copy is what is sent: the sizes
-   * the backend checks are computed from the same bytes they were planned
-   * from, whatever another thread of the caller writes meanwhile.
+   * The nested block, read once: what every decision below is taken on --
+   * the TSC refusal, the V1V2 count and pointer, the deep segments' sizes,
+   * the descriptors in it -- and what is sent, whatever another thread of
+   * the caller writes meanwhile. (The TSC clock byte and the V1V2 block were
+   * each read apart from the bytes that were then sent.)
    */
-  if (user_nested && nested_size > 0 && nvgpu_deep_segs_ok(nfd->dev))
-    ctl_deep = nvgpu_rm_deep_find(ctl_cmd);
-  if (ctl_deep) {
-    rw = NULL;
+  if (user_nested && nested_size > 0) {
     nested_copy = kmalloc(nested_size, GFP_KERNEL);
     if (!nested_copy)
       return -ENOMEM;
@@ -608,6 +608,26 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       kfree(nested_copy);
       return -EFAULT;
     }
+  }
+
+  /* A host TSC reading means nothing in the guest (nvgpu_rm_intercepts.h). */
+  if (ctl_cmd == NVGPU_RM_TIME_CORRELATION && nested_copy &&
+      nvgpu_tci_is_tsc(nested_copy[NVGPU_TCI_CLK_ID])) {
+    kfree(nested_copy);
+    return nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_NOT_SUPPORTED);
+  }
+
+  rw = nested_copy ? nvgpu_find_deep_rewrite(ctl_cmd) : NULL;
+
+  /*
+   * Several pointers, each with what it addresses (nvgpu_deep_plan): the
+   * sizes the backend checks are computed from the same bytes they were
+   * planned from.
+   */
+  if (nested_copy && nvgpu_deep_segs_ok(nfd->dev))
+    ctl_deep = nvgpu_rm_deep_find(ctl_cmd);
+  if (ctl_deep) {
+    rw = NULL;
     nvgpu_deep_plan(ctl_deep, nested_copy, nested_size, &plan);
     if (plan.n) {
       deep_ptr_offset = NVGPU_DEEP_SEGMENTED;
@@ -616,20 +636,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   if (rw && nested_size >= rw->v1_userptr_offset + 8) {
-    void *pbuf = kmalloc(nested_size, GFP_KERNEL);
     u32 count;
 
-    if (!pbuf)
-      return -ENOMEM;
-
-    if (copy_from_user(pbuf, user_nested, nested_size)) {
-      kfree(pbuf);
-      return -EFAULT;
-    }
-
-    memcpy(&deep_user_ptr, pbuf + rw->v1_userptr_offset, sizeof(u64));
-    memcpy(&count, pbuf, sizeof(u32));
-    kfree(pbuf);
+    memcpy(&deep_user_ptr, nested_copy + rw->v1_userptr_offset, sizeof(u64));
+    memcpy(&count, nested_copy, sizeof(u32));
 
     /*
      * The leading field says how much the buffer holds: entries of eight
@@ -678,14 +688,8 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
-  if (user_nested && nested_size > 0) {
-    if (nested_copy)
-      memcpy(req_buf + sizeof(*req) + sizeof(params), nested_copy, nested_size);
-    else if (copy_from_user(req_buf + sizeof(*req) + sizeof(params),
-                            user_nested, nested_size)) {
-      ret = -EFAULT;
-      goto out;
-    }
+  if (nested_copy) {
+    memcpy(req_buf + sizeof(*req) + sizeof(params), nested_copy, nested_size);
 
     /*
      * Exporting objects to a descriptor, importing them back and asking
@@ -709,11 +713,11 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
       memcpy(&nested_fd, slot, sizeof(nested_fd));
       if (nested_fd != -1) {
-        if (nvgpu_handle_for_fd(nested_fd, &handle)) {
-          dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                               "virtio-gpu-nv: RM control 0x%x names fd %d, "
-                               "which is not one of our devices\n",
-                               ctl_cmd, nested_fd);
+        if (nvgpu_handle_for_fd(nfd->dev, nested_fd, &handle)) {
+          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                              "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                              "which is not one of our devices\n",
+                              ctl_cmd, nested_fd);
           ret = -EBADF;
           goto out;
         }
@@ -728,14 +732,15 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
      */
     os_event_off = nvgpu_rm_os_event_offset(ctl_cmd);
     if (os_event_off >= 0 && nested_size >= os_event_off + sizeof(u64)) {
-      ret = nvgpu_rm_os_event_in(req_buf + sizeof(*req) + sizeof(params) +
+      ret = nvgpu_rm_os_event_in(nfd->dev,
+                                 req_buf + sizeof(*req) + sizeof(params) +
                                      os_event_off,
                                  &os_event_val);
       if (ret) {
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: RM control 0x%x names OS event "
-                             "0x%llx, which is not one of our devices\n",
-                             ctl_cmd, os_event_val);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: RM control 0x%x names OS event "
+                            "0x%llx, which is not one of our devices\n",
+                            ctl_cmd, os_event_val);
         goto out;
       }
     } else {
@@ -852,7 +857,8 @@ static long nvgpu_ioctl_idle_channels(struct nvgpu_fd *nfd, unsigned int cmd,
   int ret;
 
   if (sz != sizeof(params) || !nvgpu_deep_segs_ok(nfd->dev))
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz, NULL);
+  /* Read once: the flat form, if it comes to that, sends these bytes. */
   if (copy_from_user(params, uarg, sizeof(params)))
     return -EFAULT;
   channel = (get_unaligned_le32(params + NVGPU_RM_IDLE_CHANNELS_FLAGS) >>
@@ -863,10 +869,10 @@ static long nvgpu_ioctl_idle_channels(struct nvgpu_fd *nfd, unsigned int cmd,
   count = get_unaligned_le32(params + rule->ptrs[0].counts[0].offset);
   if (channel != NVGPU_RM_IDLE_CHANNELS_LIST || !count ||
       count > NVGPU_IDLE_CHANNELS_MAX)
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz, params);
   nvgpu_deep_plan(rule, params, sizeof(params), &plan);
   if (!plan.n)
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz, params);
 
   req_total = sizeof(*req) + sizeof(params) + plan.bytes;
   resp_max = sizeof(*resp) + sizeof(params);
@@ -928,7 +934,8 @@ out:
  * so we know how many bytes to copy_from_user.
  */
 static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
-                                 void __user *uarg, unsigned int sz) {
+                                 void __user *uarg, unsigned int sz,
+                                 const void *pre) {
   struct NVOS64_PARAMETERS params;
   void __user *user_alloc;
   u32 nested_size;
@@ -948,7 +955,9 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (sz < sizeof(params))
     return -EINVAL;
 
-  if (copy_from_user(&params, uarg, sizeof(params)))
+  if (pre)
+    memcpy(&params, pre, sizeof(params));
+  else if (copy_from_user(&params, uarg, sizeof(params)))
     return -EFAULT;
 
   user_alloc =(void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
@@ -1028,9 +1037,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
      * it, and answers NV_ERR_OBJECT_NOT_FOUND.
      *
      * Userspace reports that as "Failed to allocate semaphore event" and
-     * abandons the device, which is what ended every run here after
-     * enumeration started working: four allocations of these two classes fail,
-     * and nothing else in the run does.
+     * abandons the device.
      *
      * NV0005_ALLOC_PARAMETERS keeps the descriptor in `data` at offset 16.
      * Rewrite it the way the fixed-position path does: to the handle the
@@ -1056,12 +1063,12 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
            * is always one of our devices. Anything else would reach the
            * backend as a number it reads as a handle of its own.
            */
-          if (nvgpu_handle_for_fd(event_fd, &handle)) {
-            dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                                 "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
-                                 "names fd %d, which is not one of our "
-                                 "devices\n",
-                                 hclass, event_fd);
+          if (nvgpu_handle_for_fd(nfd->dev, event_fd, &handle)) {
+            dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                                "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                                "names fd %d, which is not one of our "
+                                "devices\n",
+                                hclass, event_fd);
             ret = -EBADF;
             goto out;
           }
@@ -1073,14 +1080,14 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       if (hclass == NVGPU_CLASS_EVENT_BUFFER &&
           nested_size >=
               NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64)) {
-        ret = nvgpu_rm_os_event_in(nested +
+        ret = nvgpu_rm_os_event_in(nfd->dev, nested +
                                        NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
                                    &os_event_val);
         if (ret) {
-          dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                               "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
-                               "0x%llx, which is not one of our devices\n",
-                               os_event_val);
+          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                              "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                              "0x%llx, which is not one of our devices\n",
+                              os_event_val);
           goto out;
         }
         os_event = true;
@@ -1155,7 +1162,8 @@ out:
  */
 static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                                      void __user *uarg, unsigned int sz,
-                                     unsigned int payload_offset) {
+                                     unsigned int payload_offset,
+                                     const void *pre) {
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   void *req_buf = NULL, *resp_buf = NULL;
@@ -1176,8 +1184,10 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
     goto out;
   }
 
-  /* Copy the full payload from userspace */
-  if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
+  /* The full payload: from userspace, or as the caller already read it */
+  if (pre)
+    memcpy(req_buf + sizeof(*req), pre, sz);
+  else if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
     ret = -EFAULT;
     goto out;
   }
@@ -1205,7 +1215,7 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   }
   if (guest_fd >= 0) {
     /* Resolve guest fd → nvgpu_fd → VMM handle */
-    ret = nvgpu_handle_for_fd(guest_fd, &host_handle);
+    ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &host_handle);
     if (ret)
       goto out;
 
@@ -1312,50 +1322,62 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
   const struct nvgpu_fd_translation_entry *fdt;
-
-  /* Hard cap only — sz == 0 is valid for several NVIDIA ioctls
-   * (e.g. NV_ESC_RM_FREE on some driver versions, and any ioctl
-   * that encodes parameters via _IOC_NR only with no struct). */
-  if (sz > 65536)
-    return -EINVAL;
+  void *pre = NULL;
+  long ret;
 
   /*
    * Memory the caller already has, registered by its pages rather than its
    * address (nvgpu_osdesc.c), before ALLOC_MEMORY's descriptor translation:
-   * RM reads no descriptor for this class.
+   * RM reads no descriptor for this class. A call that may be one is read
+   * once, and the same bytes go to whichever path it takes (the class word
+   * was read apart from the block that was then sent). A block that does
+   * not read goes on to the path it would take otherwise, which reads it
+   * itself and fails as it does.
    */
-  if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE) {
-    long ret;
-
-    if (nvgpu_osdesc_ioctl(nfd, cmd, uarg, sz, &ret))
-      return ret;
+  if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE && nvgpu_osdesc_ok(nfd->dev) &&
+      nvgpu_osdesc_candidate(nr, sz)) {
+    pre = kmalloc(sz, GFP_KERNEL);
+    if (pre && copy_from_user(pre, uarg, sz)) {
+      kfree(pre);
+      pre = NULL;
+    }
+    if (pre && nvgpu_osdesc_ioctl(nfd, cmd, uarg, pre, sz, &ret))
+      goto out;
   }
 
   fdt = nvgpu_find_fd_translation(nfd->dev, cmd);
-  if (fdt)
-    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz,
-                                    le32_to_cpu(fdt->payload_offset));
+  if (fdt) {
+    ret = nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz,
+                                   le32_to_cpu(fdt->payload_offset), pre);
+    goto out;
+  }
 
   switch (nr) {
   case NV_ESC_RM_CONTROL:
-    return nvgpu_ioctl_rm_control(nfd, cmd, uarg, sz);
+    ret = nvgpu_ioctl_rm_control(nfd, cmd, uarg, sz);
+    break;
   case NV_ESC_RM_ALLOC:
-    return nvgpu_ioctl_rm_alloc(nfd, cmd, uarg, sz);
+    ret = nvgpu_ioctl_rm_alloc(nfd, cmd, uarg, sz, pre);
+    break;
   case NV_ESC_RM_IDLE_CHANNELS:
     if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE)
-      return nvgpu_ioctl_idle_channels(nfd, cmd, uarg, sz);
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
-  case NV_ESC_RM_FREE: {
-    long ret = nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
-
+      ret = nvgpu_ioctl_idle_channels(nfd, cmd, uarg, sz);
+    else
+      ret = nvgpu_ioctl_simple(nfd, cmd, uarg, sz, pre);
+    break;
+  case NV_ESC_RM_FREE:
+    ret = nvgpu_ioctl_simple(nfd, cmd, uarg, sz, pre);
     /* An object RM freed may have been registered memory. */
     if (_IOC_TYPE(cmd) == NVGPU_RM_IOCTL_TYPE)
       nvgpu_osdesc_reap(nfd->dev);
-    return ret;
-  }
+    break;
   default:
-    return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+    ret = nvgpu_ioctl_simple(nfd, cmd, uarg, sz, pre);
+    break;
   }
+out:
+  kfree(pre);
+  return ret;
 }
 
 /*
@@ -1413,11 +1435,12 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
 
     if (packed >> 16 != sz)
       return -EPROTO;
-    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz, packed & 0xffff);
+    return nvgpu_ioctl_translate_fd(nfd, cmd, uarg, sz, packed & 0xffff,
+                                    NULL);
   }
 
   /* DEINITIALIZE takes no argument, and sends and gets back no bytes. */
-  return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
+  return nvgpu_ioctl_simple(nfd, cmd, uarg, sz, NULL);
 }
 
 /* ───────── nvidia-modeset ioctl (/dev/nvidia-modeset, ioc_type 0x6d) ───────
@@ -1450,7 +1473,8 @@ struct nvidia_modeset_outer {
  * type and size.
  */
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                         void __user *uarg, u32 sz) {
+                         void __user *uarg) {
+  u32 sz = _IOC_SIZE(cmd);
   struct nvidia_modeset_outer outer;
   void __user *user_nested;
   u32 nested_size;
@@ -1523,10 +1547,9 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
      * VK_EXT_external_memory_dma_buf, and a client is left unable to present
      * with no error anywhere that names the cause.
      *
-     * This is rung 8 on a second path. The GEM import was translated when it
-     * was found; this one is reached instead on driver 615, where the ICD
-     * registers the surface with NVKMS directly rather than through the DRM
-     * node, which is why one box presented and the other did not.
+     * The same translation as the DRM node's GEM import (nvgpu_drm.c), on
+     * the path driver 615's ICD takes instead: it registers the surface with
+     * NVKMS directly rather than through the DRM node.
      *
      * struct NvKmsRegisterSurfaceRequest:
      *   0  NvKmsDeviceHandle deviceHandle
@@ -1549,7 +1572,7 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
 
         memcpy(&guest_fd, nested + NVGPU_NVKMS_SURFACE_FD_OFFSET,
                sizeof(guest_fd));
-        if (nvgpu_handle_for_fd(guest_fd, &handle) == 0) {
+        if (nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle) == 0) {
           u64 as_u64 = handle;
 
           memcpy(nested + NVGPU_NVKMS_SURFACE_FD_OFFSET, &as_u64,
@@ -1559,7 +1582,7 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
            * Refused, not forwarded: the backend would read the caller's
            * number as one of its handles -- another process's file.
            */
-          dev_warn_ratelimited(
+          dev_dbg_ratelimited(
               &nfd->dev->vdev->dev,
               "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
               "of ours\n",
@@ -1669,33 +1692,20 @@ struct nvgpu_osdesc_call {
  * goes the old way (the backend refuses a registration by address). An
  * unreadable block sets *ret.
  */
+static u32 nvgpu_osdesc_size(unsigned int nr);
+
 static bool nvgpu_osdesc_describe(struct nvgpu_osdesc_call *c,
-                                  unsigned int cmd, void __user *uarg,
+                                  unsigned int cmd, const void *outer,
                                   unsigned int sz, long *ret) {
   const u8 *o = c->outer;
   u64 limit, end;
   u32 psize;
 
   c->nr = _IOC_NR(cmd);
-  switch (c->nr) {
-  case NVGPU_ESC_RM_ALLOC_MEMORY:
-    c->outer_len = NVGPU_OS02_SIZE;
-    break;
-  case NVGPU_ESC_RM_VID_HEAP_CONTROL:
-    c->outer_len = NVGPU_OS32_SIZE;
-    break;
-  case NVGPU_ESC_RM_ALLOC:
-    c->outer_len = NVGPU_OS64_SIZE;
-    break;
-  default:
+  c->outer_len = nvgpu_osdesc_size(c->nr);
+  if (!c->outer_len || sz != c->outer_len)
     return false;
-  }
-  if (sz != c->outer_len)
-    return false;
-  if (copy_from_user(c->outer, uarg, c->outer_len)) {
-    *ret = -EFAULT;
-    return true;
-  }
+  memcpy(c->outer, outer, c->outer_len);
 
   switch (c->nr) {
   case NVGPU_ESC_RM_ALLOC_MEMORY:
@@ -1861,17 +1871,12 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   h->flags = cpu_to_le32(c->write ? NVGPU_OSDESC_F_WRITE : 0);
   nvgpu_osdesc_runs(pages, npages, (struct nvgpu_osdesc_run *)(h + 1));
 
-  ret = nvgpu_send_recv_used(dev, req, (int)req_len, resp, (int)resp_len,
-                             &used);
+  ret = nvgpu_osdesc_send(dev, req, (int)req_len, resp, (int)resp_len, &used,
+                          pages, npages, c->write);
   kvfree(req);
   req = NULL;
   if (ret == -EINTR || ret == -ETIMEDOUT) {
-    /* It may reach RM yet, and nothing will say so: pinned until remove(). */
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: an OS-descriptor registration was "
-                         "abandoned in flight; its %lu pages stay pinned\n",
-                         npages);
-    nvgpu_osdesc_keep(dev, 0, pages, npages, c->write);
+    /* The pins went with the request (nvgpu_osdesc_send()). */
     kfree(resp);
     return ret;
   }
@@ -1921,13 +1926,33 @@ out:
   return ret;
 }
 
-bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                        void __user *uarg, unsigned int sz, long *ret) {
-  struct nvgpu_osdesc_call *c;
-  bool ours;
+/* The parameter block of one of the three calls, by _IOC_NR; 0 for others. */
+static u32 nvgpu_osdesc_size(unsigned int nr) {
+  switch (nr) {
+  case NVGPU_ESC_RM_ALLOC_MEMORY:
+    return NVGPU_OS02_SIZE;
+  case NVGPU_ESC_RM_VID_HEAP_CONTROL:
+    return NVGPU_OS32_SIZE;
+  case NVGPU_ESC_RM_ALLOC:
+    return NVGPU_OS64_SIZE;
+  default:
+    return 0;
+  }
+}
 
-  u32 which, want;
+bool nvgpu_osdesc_candidate(unsigned int nr, unsigned int sz) {
+  u32 len = nvgpu_osdesc_size(nr);
+
+  return len && sz == len;
+}
+
+bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
+                        void __user *uarg, const void *outer, unsigned int sz,
+                        long *ret) {
+  struct nvgpu_osdesc_call *c;
+  u32 want;
   size_t at;
+  bool ours;
 
   if (!nvgpu_osdesc_ok(nfd->dev))
     return false;
@@ -1948,8 +1973,8 @@ bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
   default:
     return false;
   }
-  if (sz < at + sizeof(which) || get_user(which, (u32 __user *)(uarg + at)) ||
-      le32_to_cpu((__force __le32)which) != want)
+  if (sz < at + sizeof(want) ||
+      get_unaligned_le32((const u8 *)outer + at) != want)
     return false;
   c = kzalloc(sizeof(*c), GFP_KERNEL);
   if (!c) {
@@ -1957,7 +1982,7 @@ bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
     return true;
   }
   *ret = 0;
-  ours = nvgpu_osdesc_describe(c, cmd, uarg, sz, ret);
+  ours = nvgpu_osdesc_describe(c, cmd, outer, sz, ret);
   if (ours && !*ret)
     *ret = nvgpu_osdesc_register(nfd, cmd, uarg, c);
   kfree(c);

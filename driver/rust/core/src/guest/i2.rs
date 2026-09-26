@@ -1094,6 +1094,13 @@ pub fn run<S: Store, E: Env<S>>(env: &mut E, st: &mut State<S>, set: &SchemaSet<
 
     let max_fdo = st.count(SF_FD_OUT).saturating_add(st.ndyn);
     let max_gemo = st.count(SF_GEM_OUT);
+    // A reply may name one descriptor per slot and dyn record, each kept in
+    // `fdo`: a call that could be answered with more than it holds is not
+    // sent (one past it was skipped, and its handle never closed).
+    if idx(max_fdo) > I2_MAX_RECS {
+        st.drop_consumed(env);
+        return -E2BIG;
+    }
     let rec = I2_REC_LEN as u64;
     let req_len = ((HDR_LEN + I2_REQ_LEN) as u64)
         .saturating_add(4u64.saturating_mul(u64::from(st.nbuf)))

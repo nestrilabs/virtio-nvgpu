@@ -25,6 +25,8 @@ pub enum Ev {
     Keep { id: u64, n: u64, write: bool },
     /// Pinned pages released.
     Unpin { n: u64, write: bool },
+    /// Pinned pages handed to the transport with a request it abandoned.
+    HandOver { n: u64, write: bool },
     /// An IOCTL2 hook ran, with these arguments.
     Hook(Hook),
 }
@@ -40,7 +42,8 @@ pub enum Hook {
     Phase { phase: i32 },
     AObj { obj: u32 },
     AProp { id: u32 },
-    AInFence { buf: u32, off: u32, fd: i64 },
+    /// `commit`: what the parse had said about the commit by then.
+    AInFence { buf: u32, off: u32, fd: i64, commit: bool },
     AOutFence { buf: u32, off: u32, uptr: u64 },
     ALearn { obj: u32, crtc: u32 },
     AReserve { crtc: u32, user_data: u64 },
@@ -171,6 +174,9 @@ pub struct World {
     pub next_id: u64,
     /// Replies to give, in order, instead of the fake backend's.
     pub canned: Vec<Vec<u8>>,
+    /// Transport errors to give, in order, before any reply (-EINTR, say:
+    /// the caller gave up on a request that did go out).
+    pub fail: Vec<i32>,
     /// The ATOMIC special runs the atomic parse, with this fence bridge.
     pub atomic: Option<bool>,
     /// Out-fences taken in this call.

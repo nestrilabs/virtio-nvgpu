@@ -10,6 +10,7 @@
 
 #include <drm/drm.h>
 #include <linux/atomic.h>
+#include <linux/compat.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/fcntl.h>
@@ -19,12 +20,14 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 
+#include <drm/drm_auth.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -134,23 +137,6 @@ static const struct nvgpu_gem_nested_desc nvgpu_gem_export_dmabuf = {
     .size_field_offset = NVGPU_GEM_NO_FIELD,
 };
 
-/*
- * struct drm_version — UAPI, stable since DRM was upstreamed.
- * Copy of include/uapi/drm/drm.h:struct drm_version so we need
- * no DRM kernel headers.
- */
-struct nvgpu_drm_version {
-  int version_major;
-  int version_minor;
-  int version_patchlevel;
-  size_t name_len;
-  char __user *name;
-  size_t date_len;
-  char __user *date;
-  size_t desc_len;
-  char __user *desc;
-};
-
 struct drm_nvidia_get_dev_info_params {
   __u32 gpu_id;
   __u32 mig_device;
@@ -211,23 +197,22 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
    * (nvidia-drm-fence.c:1316-1318) and the device failed to create.
    *
    *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
-   *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d); also
-   *                      turned off by claim_alloc=0 to tell a GEM problem
-   *                      from everything else in one boot
+   *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d): the
+   *                      host's
    *   supports_sync_fd   with fences on, the semsurf bit: nvidia-drm sets
    *   supports_semsurf   both from one condition, so no userspace has seen
    *                      one without the other, and 0x54..0x57 are forwarded
-   *                      (nvgpu_fence.c). With fences off, semsurf is 0 (no
-   *                      0x54) and sync_fd only with claim_sync_fd.
+   *                      (nvgpu_fence.c). With fences off (a v1 backend),
+   *                      neither: 0x54 is not served, nor the PRIME fence
+   *                      pair behind sync_fd (0x45, 0x46).
    *
    * The page kinds are "only valid if supports_alloc is true"
-   * (nv_drm_common_ioctl.h:219-221) and the host zeroes them when it is not,
-   * so they are zeroed here when this node turns it off -- but only in a
-   * layout that has the bit: 535's and 545.23's report the kinds without one
-   * (supports_alloc there is the backend's DMABUF_SUPPORTED answer, which
-   * says the same thing), and a caller in those gets them as the host said.
+   * (nv_drm_common_ioctl.h:219-221) and the host zeroes them when it is not;
+   * zeroed here too when it is not set, in a layout that has the bit: 535's
+   * and 545.23's report the kinds without one (supports_alloc there is the
+   * backend's DMABUF_SUPPORTED answer, which says the same thing), and a
+   * caller in those gets them as the host said.
    */
-  r.supports_alloc = nvgpu_claim_alloc && r.supports_alloc;
   if (want >= 32 && !r.supports_alloc) {
     r.generic_page_kind = 0;
     r.page_kind_generation = 0;
@@ -236,7 +221,7 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
   if (nvgpu_fences_enabled(nfd->dev)) {
     r.supports_sync_fd = r.supports_semsurf;
   } else {
-    r.supports_sync_fd = nvgpu_claim_sync_fd && r.supports_sync_fd;
+    r.supports_sync_fd = 0;
     r.supports_semsurf = 0;
   }
 
@@ -253,11 +238,9 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
    *   VK_EXT_external_memory_dma_buf absent
    *   vkcube: "Could not find both graphics and present queues"
    *
-   * This was invisible for as long as there was one test box, because its
-   * NVIDIA card was card0 on the host and card0 in the guest, and passing
-   * the host's number through was indistinguishable from getting it right.
-   * The second box has an integrated GPU, so its NVIDIA node is card1 --
-   * and nothing presented.
+   * The two numbers agree only where the host's NVIDIA card is its card0; on
+   * a host with an integrated GPU as well it is card1, and passing the
+   * host's number through left nothing able to present.
    */
   if (file && file->minor && file->minor->dev && file->minor->dev->primary)
     r.primary_index = file->minor->dev->primary->index;
@@ -298,10 +281,9 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
 }
 
 /*
- * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
- * nodes.
+ * nvgpu_drm_handle_ioctl — nvidia-drm's driver range on our /dev/dri/..
+ * nodes (DRM_IOCTL_VERSION is the core's, from nvgpu_drm_driver's fields).
  *
- * DRM_IOCTL_VERSION  (nr=0x00) — core ioctl, returns name="nvidia-drm"
  * GET_DEV_INFO       (nr=0x43) — the host's record, in the caller's layout
  * FENCE_SUPPORTED    (nr=0x44) — -EINVAL: 0x45/0x46 are not forwarded
  * DMABUF_SUPPORTED   (nr=0x4f) — the host's answer (supports_alloc)
@@ -314,38 +296,6 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
                                    unsigned long arg) {
   unsigned int nr = _IOC_NR(cmd);
   void __user *uarg = (void __user *)arg;
-
-  /* ── DRM_IOCTL_VERSION (type='d', nr=0x00) ── */
-  if (nr == 0x00) {
-    struct nvgpu_drm_version v;
-
-    if (copy_from_user(&v, uarg, sizeof(v)))
-      return -EFAULT;
-
-    v.version_major = 0;
-    v.version_minor = 1;
-    v.version_patchlevel = 0;
-
-#define FILL_DRM_STR(field, str)                                               \
-  do {                                                                         \
-    const char *_s = (str);                                                    \
-    size_t _sl = strlen(_s);                                                   \
-    if (v.field##_len >= _sl && v.field)                                       \
-      if (copy_to_user(v.field, _s, _sl))                                      \
-        return -EFAULT;                                                        \
-    v.field##_len = _sl;                                                       \
-  } while (0)
-
-    FILL_DRM_STR(name, "nvidia-drm");
-    FILL_DRM_STR(date, "20240101");
-    FILL_DRM_STR(desc, "NVIDIA DRM stub");
-#undef FILL_DRM_STR
-
-    if (copy_to_user(uarg, &v, sizeof(v)))
-      return -EFAULT;
-
-    return 0;
-  }
 
   /* ── Driver ioctls: DRM_COMMAND_BASE .. DRM_COMMAND_END ── */
   if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_END)
@@ -552,11 +502,11 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * is the ICD asking for something the node cannot do yet, and -ENOTTY on
      * its own turns up much later as a device that would not initialise.
      */
-    dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: unhandled nvidia-drm ioctl "
-                         "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
-                         nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
-                         _IOC_DIR(cmd));
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: unhandled nvidia-drm ioctl "
+                        "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
+                        nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
+                        _IOC_DIR(cmd));
     return -ENOTTY;
   }
 }
@@ -609,6 +559,25 @@ bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem) {
 }
 
 /*
+ * The host has closed the proxy's handle, or never will (the close was never
+ * sent): the number is the host's to give out again, and an importer waiting
+ * on it (nvgpu_gem_wait_gone()) may ask again. Only our own entry, never a
+ * successor's. Then the owner's reference, which the close needed, and the
+ * tombstone itself. Process context (nvgpu_gem_close_then()).
+ */
+static void nvgpu_gem_tomb_gone(void *arg) {
+  struct nvgpu_gem_object *ng = arg;
+
+  if (ng->owner && ng->host_handle) {
+    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
+    wake_up_all(&nvgpu_gem_gone_wq);
+  }
+  if (ng->owner)
+    nvgpu_fd_put(ng->owner);
+  kfree(ng);
+}
+
+/*
  * The last reference to a proxy is gone, so the host's object can go too.
  *
  * Forwarded on the owner's handle rather than the caller's: the host object
@@ -636,8 +605,6 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   /* The handles SEMSURF_FENCE_ATTACH gave this object in other files go
    * first: each holds the host object too, and a reference on its file. */
   nvgpu_fence_gem_free(ng);
-  if (ng->dev && ng->host_handle)
-    nvgpu_gem_close(ng->dev, ng->owner_handle, ng->host_handle);
 
   /*
    * Give the window space back. The window is a gigabyte and a swapchain is
@@ -652,18 +619,22 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   if (ng->window_valid && ng->mapping_id)
     nvgpu_munmap(ng->dev, ng->owner_handle, ng->mapping_id);
 
-  /* Closed: the number is the host's to give out again, and an importer
-   * waiting on it (nvgpu_gem_wait_gone()) may ask again. Only our own
-   * entry, never a successor's. */
-  if (ng->owner && ng->host_handle) {
-    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
-    wake_up_all(&nvgpu_gem_gone_wq);
-  }
-
   drm_gem_object_release(obj);
-  if (ng->owner)
-    nvgpu_fd_put(ng->owner);
-  kfree(ng);
+
+  /*
+   * The GEM_CLOSE last, and the tombstone stays until the host has really
+   * closed the number (nvgpu_gem_tomb_gone()). Erased when the close was
+   * merely queued -- a fatal signal while the ring was full, no memory --
+   * the index let a GETFB or a PRIME import that got the same number back
+   * make a new proxy for it, which the queued close then closed under it.
+   * Queued always, so the release has one path; the proxy's memory is the
+   * tombstone's until then.
+   */
+  if (ng->dev && ng->host_handle)
+    nvgpu_gem_close_then(ng->dev, ng->owner_handle, ng->host_handle,
+                         nvgpu_gem_tomb_gone, ng);
+  else
+    nvgpu_gem_tomb_gone(ng);
 }
 
 /*
@@ -705,11 +676,12 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   struct nvgpu_gem_map_offset_params mo = {};
   struct nvgpu_mmap_req *req;
   struct nvgpu_mmap_resp *resp;
-  u64 window_off;
+  u64 window_off, end;
   u32 used;
   long ret;
 
-  if (READ_ONCE(ng->window_valid))
+  /* Acquire: the placement's fields below are read after this says so. */
+  if (smp_load_acquire(&ng->window_valid))
     return 0;
 
   if (!ng->dev->window.len) {
@@ -729,10 +701,10 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   ret = nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle,
                            NVGPU_IOCTL_GEM_MAP_OFFSET, &mo, sizeof(mo));
   if (ret < 0) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: the host would not give object %u an mmap "
-             "offset: %ld\n",
-             ng->host_handle, ret);
+    dev_dbg_ratelimited(&ng->dev->vdev->dev,
+                        "virtio-gpu-nv: the host would not give object %u an "
+                        "mmap offset: %ld\n",
+                        ng->host_handle, ret);
     goto out;
   }
 
@@ -766,20 +738,25 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   window_off = le64_to_cpu(resp->guest_phys_addr);
   /* Every mapping of the object reaches up to obj->size past window_off:
    * the placement must hold that much, or the rest is the window's next
-   * extent (another process's memory) or unplaced window. */
+   * extent (another process's memory) or unplaced window. And start on a
+   * page: every mapping is made in pages from window_off, so a placement
+   * that does not would hand out the bytes before it. */
   if (le64_to_cpu(resp->size) < obj->size) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: object %u placed in %llu bytes, not its %zu\n",
-             ng->host_handle, le64_to_cpu(resp->size), obj->size);
+    dev_warn_ratelimited(&ng->dev->vdev->dev,
+                         "virtio-gpu-nv: object %u placed in %llu bytes, not "
+                         "its %zu\n",
+                         ng->host_handle, le64_to_cpu(resp->size), obj->size);
     nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
     ret = -ERANGE;
     goto out_free;
   }
-  if (window_off + obj->size > ng->dev->window.len) {
-    dev_warn(&ng->dev->vdev->dev,
-             "virtio-gpu-nv: a buffer at %llu+%zu runs past the %llu-byte "
-             "window\n",
-             window_off, obj->size, ng->dev->window.len);
+  if (!PAGE_ALIGNED(window_off) ||
+      check_add_overflow(window_off, (u64)obj->size, &end) ||
+      end > ng->dev->window.len) {
+    dev_warn_ratelimited(&ng->dev->vdev->dev,
+                         "virtio-gpu-nv: a buffer placed at %llu+%zu is not "
+                         "a page run inside the %llu-byte window\n",
+                         window_off, obj->size, ng->dev->window.len);
     /* Placed but unusable: the placement is still the backend's to free. */
     nvgpu_munmap(ng->dev, ng->owner_handle, le32_to_cpu(resp->mapping_id));
     ret = -ERANGE;
@@ -790,8 +767,9 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   ng->mapping_id = le32_to_cpu(resp->mapping_id);
   ng->caching = resp->caching;
   ng->read_only = ng->dev->v2 && (resp->flags & NVGPU_MMAP_F_READ_ONLY);
-  smp_wmb(); /* the offset is readable before the flag says it is */
-  WRITE_ONCE(ng->window_valid, true);
+  /* Release: every field above is visible before the flag says it is (a
+   * lockless reader pairs with the acquire at the top). */
+  smp_store_release(&ng->window_valid, true);
   ret = 0;
 
 out_free:
@@ -873,7 +851,8 @@ static int nvgpu_gem_object_mmap(struct drm_gem_object *obj,
  * it goes into the iosys_map as such and a caller that cannot handle iomem
  * will say so rather than dereference it.
  */
-static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
+static int __nvgpu_gem_vmap(struct drm_gem_object *obj,
+                            struct iosys_map *map) {
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
   void __iomem *vaddr;
   int ret;
@@ -888,10 +867,10 @@ static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
    * read-only object has none.
    */
   if (ng->read_only) {
-    dev_warn_ratelimited(&ng->dev->vdev->dev,
-                         "virtio-gpu-nv: object %u is read-only on the host; "
-                         "no kernel mapping\n",
-                         ng->host_handle);
+    dev_dbg_ratelimited(&ng->dev->vdev->dev,
+                        "virtio-gpu-nv: object %u is read-only on the host; "
+                        "no kernel mapping\n",
+                        ng->host_handle);
     return -EPERM;
   }
 
@@ -912,6 +891,17 @@ static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
 
   iosys_map_set_vaddr_iomem(map, vaddr);
   return 0;
+}
+
+/* Not after remove(): the window is the device's (see the ioctl entry). */
+static int nvgpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map) {
+  int ret, idx;
+
+  if (!drm_dev_enter(obj->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_gem_vmap(obj, map);
+  drm_dev_exit(idx);
+  return ret;
 }
 
 static void nvgpu_gem_vunmap(struct drm_gem_object *obj,
@@ -936,11 +926,22 @@ static struct sg_table *nvgpu_dmabuf_map(struct dma_buf_attachment *attach,
   struct nvgpu_gem_object *ng = to_nvgpu_gem(obj);
   struct sg_table *sgt;
   dma_addr_t addr;
-  int ret;
+  int ret, idx;
 
+  /* Not after remove(): the window is the device's. */
+  if (!drm_dev_enter(obj->dev, &idx))
+    return ERR_PTR(-ENODEV);
   ret = nvgpu_gem_place_in_window(ng);
+  drm_dev_exit(idx);
   if (ret)
     return ERR_PTR(ret);
+  /*
+   * A read-only placement is read by an importer's device and never
+   * written: a DMA write into it would stop the VM, as a CPU one would
+   * (nvgpu_gem_object_mmap(), nvgpu_gem_vmap()).
+   */
+  if (ng->read_only && dir != DMA_TO_DEVICE)
+    return ERR_PTR(-EPERM);
 
   sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
   if (!sgt)
@@ -1067,6 +1068,13 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
   struct nvgpu_gem_object *ng;
   int ret;
 
+  /* A size from the host's reply, which PAGE_ALIGN() must not wrap to 0. */
+  if (size > SIZE_MAX - PAGE_SIZE + 1) {
+    /* Ours to close, unless a proxy (alive or dying) holds the number. */
+    if (!xa_load(&owner->gem_index, host_handle))
+      nvgpu_gem_close(owner->dev, owner->handle, host_handle);
+    return ERR_PTR(-E2BIG);
+  }
   size = PAGE_ALIGN(size);
   if (!size)
     size = PAGE_SIZE;
@@ -1142,10 +1150,10 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            NVGPU_GEM_OBJECT_NVKMS);
   if (IS_ERR(ng)) {
     if (PTR_ERR(ng) == -EEXIST)
-      dev_warn_ratelimited(&owner->dev->vdev->dev,
-                           "virtio-gpu-nv: host GEM handle %u of file %u "
-                           "already has a proxy; not making a second\n",
-                           host_handle, owner->handle);
+      dev_dbg_ratelimited(&owner->dev->vdev->dev,
+                          "virtio-gpu-nv: host GEM handle %u of file %u "
+                          "already has a proxy; not making a second\n",
+                          host_handle, owner->handle);
     return PTR_ERR(ng);
   }
 
@@ -1414,10 +1422,10 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
    * out of the wrong offset would forward a plausible-looking address.
    */
   if (sz != d->size) {
-    dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
-                         "bytes, this driver knows it as %u\n",
-                         _IOC_NR(cmd), sz, d->size);
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
+                        "bytes, this driver knows it as %u\n",
+                        _IOC_NR(cmd), sz, d->size);
     return -EINVAL;
   }
 
@@ -1507,12 +1515,12 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       int guest_fd = (int)get_unaligned_le32(nested + d->fd_offset);
       u32 handle;
 
-      ret = nvgpu_handle_for_fd(guest_fd, &handle);
+      ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle);
       if (ret) {
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
-                             "fd %d, which is not one of our devices\n",
-                             _IOC_NR(cmd), guest_fd);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
+                            "fd %d, which is not one of our devices\n",
+                            _IOC_NR(cmd), guest_fd);
         goto out;
       }
       put_unaligned_le32(handle, nested + d->fd_offset);
@@ -1709,6 +1717,8 @@ static void nvgpu_drm_detach(struct nvgpu_fd *nfd) {
   if (!nvgpu_fd_detach_drm(nfd, &kms))
     return;
   nvgpu_fd_unregister(nfd->dev, nfd);
+  /* Its syncobjs' userspace eventfds, which end with its syncobjs. */
+  nvgpu_fence_file_release(nfd);
   /* Its event consumers and reserved events, while the drm_file stands. */
   nvgpu_kms_detach(nfd);
   if (kms)
@@ -1737,6 +1747,18 @@ static int nvgpu_drm_release(struct inode *inode, struct file *filp) {
   if (file && file->driver_priv)
     nvgpu_drm_detach(file->driver_priv);
   return drm_release(inode, filp);
+}
+
+void nvgpu_drm_drop_master(struct file *f) {
+  struct drm_file *file = f->private_data;
+
+  /*
+   * Through the core's own DROP_MASTER, so its bookkeeping is the one a
+   * user's drop makes; the caller opened the file, which is what the
+   * core's check asks (was_master, same tgid). No argument to copy.
+   */
+  if (file && drm_is_current_master(file))
+    drm_ioctl(f, DRM_IOCTL_DROP_MASTER, 0);
 }
 
 struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
@@ -1779,7 +1801,7 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
  *                                         on any other node.
  */
 static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
-                                       unsigned long arg) {
+                                       unsigned long arg, bool compat) {
   struct drm_file *file = filp->private_data;
   struct nvgpu_fd *nfd;
   unsigned int nr = _IOC_NR(cmd);
@@ -1850,13 +1872,21 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
      * boundary, and turns up much later as a client that stopped asking.
      */
     {
-      long ret = drm_ioctl(filp, cmd, arg);
+      long ret;
 
+#ifdef CONFIG_COMPAT
+      /* The core's 32-bit layouts (VERSION, GET_UNIQUE, ...) are the core's
+       * to translate, as for any DRM driver. */
+      if (compat)
+        ret = drm_compat_ioctl(filp, cmd, arg);
+      else
+#endif
+        ret = drm_ioctl(filp, cmd, arg);
       if (ret < 0)
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
-                             "locally with %ld\n",
-                             nr, ret);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
+                            "locally with %ld\n",
+                            nr, ret);
       return ret;
     }
   }
@@ -1879,10 +1909,36 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
 
   if (!file || !drm_dev_enter(file->minor->dev, &idx))
     return -ENODEV;
-  ret = __nvgpu_drm_unlocked_ioctl(filp, cmd, arg);
+  ret = __nvgpu_drm_unlocked_ioctl(filp, cmd, arg, false);
   drm_dev_exit(idx);
   return ret;
 }
+
+#ifdef CONFIG_COMPAT
+/*
+ * A 32-bit caller. nvidia-drm's own fops take compat_ioctl = drm_compat_ioctl
+ * (nvidia-drm-drv.c): the core translates its own ioctls whose layout
+ * differs in 32 bits, and hands everything else -- the driver range, whose
+ * structs carry pointers as u64 so no layout differs -- to the native
+ * handler as it is. So here: the core's ioctls that the core answers go
+ * through drm_compat_ioctl(); the ones forwarded (the driver range, KMS and
+ * syncobj calls, RM) go the native way with the pointer widened, the IOCTL2
+ * interpreter reading in_compat_syscall() where a layout does differ.
+ */
+static long nvgpu_drm_compat_ioctl(struct file *filp, unsigned int cmd,
+                                   unsigned long arg) {
+  struct drm_file *file = filp->private_data;
+  long ret;
+  int idx;
+
+  if (!file || !drm_dev_enter(file->minor->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_drm_unlocked_ioctl(
+      filp, cmd, (unsigned long)compat_ptr((compat_uptr_t)arg), true);
+  drm_dev_exit(idx);
+  return ret;
+}
+#endif
 
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
@@ -1892,7 +1948,9 @@ static const struct file_operations nvgpu_drm_fops = {
     .open = drm_open,
     .release = nvgpu_drm_release,
     .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
-    .compat_ioctl = nvgpu_drm_unlocked_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = nvgpu_drm_compat_ioctl,
+#endif
     .mmap = drm_gem_mmap,
     .poll = drm_poll,
     .read = drm_read,
@@ -1942,6 +2000,39 @@ static const struct drm_driver nvgpu_drm_driver = {
     .patchlevel = 0,
 };
 
+/*
+ * The fake PCI device a DRI record's GPU is: the root whose address is the
+ * config-space GPU slot with the record's minor. With several GPUs each node
+ * must hang off its own -- the ICD matches a node to an RM device through
+ * that parent -- where every one was hung off the first root. The first
+ * registered root is the last resort, as before, for a record that names no
+ * slot (a single-GPU backend that numbers it otherwise); NULL if none.
+ */
+static struct nvgpu_pci_root *nvgpu_dri_root(struct nvgpu_device *dev,
+                                             const struct nvgpu_dri_dev *dri) {
+  struct nvgpu_pci_root *first = NULL;
+  u32 nslots = min_t(u32, dev->num_gpus, ARRAY_SIZE(dev->gpu_slots));
+  int ri;
+  u32 gi;
+
+  for (ri = 0; ri < dev->num_pci_roots; ri++) {
+    struct nvgpu_pci_root *root = &dev->pci_roots[ri];
+
+    if (!root->registered || !root->pdev)
+      continue;
+    if (!first)
+      first = root;
+    for (gi = 0; gi < nslots; gi++) {
+      const struct virtio_gpu_nv_gpu_slot *s = &dev->gpu_slots[gi];
+
+      if (!strncmp(s->pci_addr, root->slot.pci_addr, sizeof(s->pci_addr)) &&
+          le32_to_cpu(s->minor) == dri->slot_index)
+        return root;
+    }
+  }
+  return first;
+}
+
 int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
 
@@ -1955,41 +2046,16 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
 
     /*
-     * Find the pci_dev that owns this DRI device so we can:
-     *   a) Use it as the parent of the device_create() call — this causes
-     *      the kernel to create /sys/dev/char/M:N/device → pci_dev, which
-     *      is what Vulkan/EGL reads when it traverses the sysfs char-dev tree.
-     *   b) Create drm/<name> kobjects under the PCI device, which gives
-     *      /sys/bus/pci/devices/<addr>/drm/<name> — required by the NVIDIA
-     *      Vulkan ICD when it enumerates display engines.
-     *
-     * We match by gpu_id (minor number) against the GPU slots in config space.
+     * The pci_dev this DRI device's GPU is, as its parent: the kernel then
+     * makes /sys/dev/char/M:N/device -> pci_dev and
+     * /sys/bus/pci/devices/<addr>/drm/<name>, which is what Vulkan/EGL walk.
      */
     struct device *pci_parent = &dev->vdev->dev; /* fallback */
-    struct kobject *pci_kobj = NULL;
+    struct nvgpu_pci_root *root = nvgpu_dri_root(dev, dri);
     struct drm_device *drm;
-    int gi;
 
-    for (gi = 0; gi < dev->num_pci_roots; gi++) {
-      struct nvgpu_pci_root *root = &dev->pci_roots[gi];
-
-      if (!root->registered || !root->pdev)
-        continue;
-
-      /* Match: the DRI device belongs to this GPU if the GPU's minor number
-       * (which equals the /dev/nvidia<minor> index) matches the gpu_id field
-       * set from the host.  gpu_id is the 32-bit RM client GPU identifier,
-       * but we stored minor there from the VMM side — see device.rs. */
-      {
-        u32 slot_minor = le32_to_cpu(dev->gpu_slots[gi].minor);
-        if (slot_minor != dri->slot_index && gi != 0)
-          continue; /* only fall through for GPU 0 as a last resort */
-      }
-
+    if (root)
       pci_parent = &root->pdev->dev;
-      pci_kobj = &root->pdev->dev.kobj;
-      break;
-    }
 
     /*
      * No sysfs is built by hand here any more.
@@ -2050,10 +2116,10 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
 
     dri->drm = drm;
     dri->registered = true;
-    dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
-             "gpu_id=0x%x\n",
-             dri->name, dri->major, dri->minor, dri->dev_info[0]);
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
+            "gpu_id=0x%x\n",
+            dri->name, dri->major, dri->minor, dri->dev_info[0]);
   }
 
   return 0;

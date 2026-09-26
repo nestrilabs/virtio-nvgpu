@@ -519,10 +519,10 @@ static int nvgpu_kms_swap(struct nvgpu_kms_file *kf) {
   kf->retired = old;
   kf->host_master_ok = true;
   nvgpu_kms_publish(kf, h);
-  dev_info(&kf->dev->vdev->dev,
-           "virtio-gpu-nv: host card file %u was opened while another file "
-           "was master and can never be; guest master now drives %u\n",
-           old, h);
+  dev_dbg(&kf->dev->vdev->dev,
+          "virtio-gpu-nv: host card file %u was opened while another file "
+          "was master and can never be; guest master now drives %u\n",
+          old, h);
   return 0;
 }
 
@@ -688,17 +688,17 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
    * one (hostfd.rs classify()).
    */
   if (!drm_is_primary_client(tfile) || !dri || dri->dev != dev) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: a host DRM file can only be adopted "
-                         "through a card-node file of the same GPU\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: a host DRM file can only be adopted "
+                        "through a card-node file of the same GPU\n");
     ret = -EINVAL;
     goto close;
   }
   if (kind != NVGPU_HK_DRM_LEASE) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: refusing to adopt backend handle %u "
-                         "of kind %u as a DRM file: only leases are\n",
-                         kms_handle, kind);
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: refusing to adopt backend handle %u "
+                        "of kind %u as a DRM file: only leases are\n",
+                        kms_handle, kind);
     ret = -EINVAL;
     goto close;
   }
@@ -745,6 +745,15 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
     ret = -EIO;
     goto close;
   }
+  /*
+   * A clone of a card-node file became the guest device's master if none
+   * was (drm_master_open(), after our open ran): a host lease must not hold
+   * the guest's own master -- a compositor-VM's compositor could then never
+   * take it, and the lease's holder could authenticate others. Dropped
+   * before anyone sees the file; its SET/DROP_MASTER are refused from here,
+   * as a lessee's are (nvgpu_kms_ioctl()).
+   */
+  nvgpu_drm_drop_master(f);
   fd_install(fd, f);
   return fd;
 
@@ -1002,7 +1011,7 @@ static void nvgpu_kms_settle(struct nvgpu_kms_call *kc) {
     xa_store(&kf->objs, kc->learn[i].obj,
              xa_mk_value(NVGPU_KOBJ_OTHER | ((unsigned long)kc->learn[i].crtc
                                              << 2)),
-             GFP_KERNEL);
+             GFP_KERNEL_ACCOUNT);
   if (kc->cap_set && kc->cap < NVGPU_KMS_NCAPS) {
     mutex_lock(&kf->lock);
     kf->caps[kc->cap] = kc->cap_value;
@@ -1047,7 +1056,7 @@ static int nvgpu_kms_prop_class(struct nvgpu_kms_call *kc, u32 id) {
   if (hr)
     return hr; /* an unknown id: the commit would fail on it too */
   kind = nvgpu_kms_prop_kind_of(gp.name);
-  xa_store(&kf->props, id, xa_mk_value(kind), GFP_KERNEL);
+  xa_store(&kf->props, id, xa_mk_value(kind), GFP_KERNEL_ACCOUNT);
   return kind;
 }
 
@@ -1069,10 +1078,16 @@ static int nvgpu_kms_obj_class(struct nvgpu_kms_call *kc, u32 obj,
     if (ret)
       return ret;
     v = hr ? NVGPU_KOBJ_OTHER : NVGPU_KOBJ_CRTC;
-    /* Never over something a commit or GETPLANE taught us meanwhile (-EBUSY
-     * then); a cache that cannot grow (-ENOMEM) just asks again next time. */
-    if ((!hr || hr == -ENOENT) &&
-        xa_insert(&kf->objs, obj, xa_mk_value(v), GFP_KERNEL) == -EBUSY) {
+    /*
+     * Only a CRTC is cached from here: -ENOENT is a plane or a connector,
+     * but also any number at all, and a cache of every id a commit named
+     * would grow without bound. Planes and connectors a commit puts on a
+     * CRTC are learnt when it succeeds. Never over something a commit or
+     * GETPLANE taught us meanwhile (-EBUSY then); a cache that cannot grow
+     * (-ENOMEM) just asks again next time.
+     */
+    if (!hr && xa_insert(&kf->objs, obj, xa_mk_value(v),
+                         GFP_KERNEL_ACCOUNT) == -EBUSY) {
       e = xa_load(&kf->objs, obj);
       if (e)
         v = xa_to_value(e);
@@ -1094,6 +1109,7 @@ static int nvgpu_kms_obj_class(struct nvgpu_kms_call *kc, u32 obj,
  */
 static int nvgpu_kms_in_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
                               s64 fd) {
+  struct dma_fence *ref = NULL;
   bool owned = false;
   u8 *vals;
   u32 h = 0, len;
@@ -1122,9 +1138,15 @@ static int nvgpu_kms_in_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
     put_unaligned_le64((u64)-1, vals + off);
     return 0;
   }
-  ret = nvgpu_fence_unwrap_fd(kc->kf->dev, (int)fd, &h, &owned);
+  ret = nvgpu_fence_unwrap_fd(kc->kf->dev, (int)fd, &h, &owned, &ref);
   if (ret < 0)
     return ret;
+  /* A proxy's own handle stays open as long as the request may name it. */
+  if (ref) {
+    ret = nvgpu_i2_hold(&kc->call, nvgpu_fence_put_ref, ref);
+    if (ret)
+      return ret;
+  }
   if (ret > 0) {
     vals = nvgpu_i2_buf(&kc->call, buf, &len);
     if (!vals || off > len || len - off < 8)
@@ -1168,7 +1190,6 @@ static int nvgpu_kms_out_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
  */
 struct nvgpu_kms_actx {
   struct nvgpu_kms_call *kc;
-  struct nvgpu_atomic_out *out;
 };
 
 static int nvgpu_kms_a_obj(void *ctx, u32 obj, u32 *crtc) {
@@ -1188,9 +1209,6 @@ static int nvgpu_kms_a_in_fence(void *ctx, void *st, u32 buf, u32 off,
   struct nvgpu_kms_actx *a = ctx;
 
   a->kc->call.st = st;
-  /* Set by the parse before any hook: a TEST_ONLY commit's fences are only
-   * checked (nvgpu_kms_in_fence). */
-  a->kc->commit = a->out->commit;
   return nvgpu_kms_in_fence(a->kc, buf, off, fd);
 }
 
@@ -1230,10 +1248,22 @@ static const struct nvgpu_atomic_ops nvgpu_kms_atomic_ops = {
 /* Before an atomic commit goes: its events and its fences. */
 static int nvgpu_kms_atomic(struct nvgpu_kms_call *kc) {
   struct nvgpu_atomic_out out = {};
-  struct nvgpu_kms_actx a = {.kc = kc, .out = &out};
+  struct nvgpu_kms_actx a = {.kc = kc};
   void *st = kc->call.st;
+  u32 len;
+  u8 *b0 = nvgpu_i2_buf(&kc->call, 0, &len);
   int ret;
 
+  /*
+   * Commit or TEST_ONLY, before any hook runs, from the same copy the parse
+   * reads: a TEST_ONLY commit's in-fences are only checked
+   * (nvgpu_kms_in_fence()), a real one's bridged. It was read from the
+   * parse's out struct, which the Rust parse filled in only once it had
+   * finished -- so every real commit's IN_FENCE_FD went to the host as -1.
+   */
+  kc->commit = b0 && len >= NVGPU_ATOMIC_SIZE &&
+               !(get_unaligned_le32(b0 + NVGPU_ATOMIC_FLAGS) &
+                 NVGPU_ATOMIC_TEST_ONLY);
   ret = nvgpu_atomic_parse(&kc->call,
                            kc->kf->dev->backend_caps & NVGPU_BCAP_FENCES,
                            &nvgpu_kms_atomic_ops, &a, &out);
@@ -1273,10 +1303,10 @@ static int nvgpu_kms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   }
   fput(f);
   if (ret)
-    dev_warn_ratelimited(&kc->kf->dev->vdev->dev,
-                         "virtio-gpu-nv: KMS ioctl nr=0x%02x names fd %lld, "
-                         "which is not the kind of device it takes\n",
-                         _IOC_NR(call->cmd), user_value);
+    dev_dbg_ratelimited(&kc->kf->dev->vdev->dev,
+                        "virtio-gpu-nv: KMS ioctl nr=0x%02x names fd %lld, "
+                        "which is not the kind of device it takes\n",
+                        _IOC_NR(call->cmd), user_value);
   return ret;
 }
 
@@ -1590,13 +1620,13 @@ static int nvgpu_kms_phase(struct nvgpu_i2_call *call, int phase) {
                xa_mk_value(nvgpu_kms_prop_kind_of(
                    (const char *)b0 +
                    offsetof(struct drm_mode_get_property, name))),
-               GFP_KERNEL);
+               GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETCRTC):
     if (ok)
       xa_store(&kf->objs,
                get_unaligned_le32(b0 + offsetof(struct drm_mode_crtc, crtc_id)),
-               xa_mk_value(NVGPU_KOBJ_CRTC), GFP_KERNEL);
+               xa_mk_value(NVGPU_KOBJ_CRTC), GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETPLANE):
     if (ok)
@@ -1608,7 +1638,7 @@ static int nvgpu_kms_phase(struct nvgpu_i2_call *call, int phase) {
                                 b0 + offsetof(struct drm_mode_get_plane,
                                               crtc_id))
                             << 2)),
-               GFP_KERNEL);
+               GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETRESOURCES):
     if (!phase)
@@ -1717,6 +1747,14 @@ bool nvgpu_kms_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
 
   if (!kf || _IOC_TYPE(cmd) != DRM_IOCTL_BASE)
     return false;
+
+  /* An adopted lease is never the guest's master: as a lessee's, its
+   * SET/DROP_MASTER are refused (drm_auth.c, "lessee as master"). */
+  if (kf->adopted && (_IOC_NR(cmd) == NVGPU_KNR(DRM_IOCTL_SET_MASTER) ||
+                      _IOC_NR(cmd) == NVGPU_KNR(DRM_IOCTL_DROP_MASTER))) {
+    *ret = -EINVAL;
+    return true;
+  }
 
   switch (_IOC_NR(cmd)) {
   /* The guest core's: its own node, its own auth domain, its own master

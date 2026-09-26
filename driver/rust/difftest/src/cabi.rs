@@ -100,12 +100,13 @@ extern "C" {
 
     pub fn nvgpu_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
     pub fn nvgpu_uvm_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
-    pub fn nvgpu_ioctl_modeset(nfd: *mut CFd, cmd: c_uint, uarg: u64, sz: u32) -> c_long;
+    pub fn nvgpu_ioctl_modeset(nfd: *mut CFd, cmd: c_uint, uarg: u64) -> c_long;
     pub fn nvgpu_i2_has_schema(dev: *mut CDev, sclass: u32, cmd: c_uint, prefix: *const c_void, len: usize) -> bool;
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;
     fn nvgpu_i2_add_fd(call: *mut c_void, buf: u32, off: u32, handle: u32, flags: u32) -> c_int;
     fn harness_atomic(call: *mut c_void, fences: bool, ctx: *mut c_void, commit: *mut bool, values_buf: *mut u32) -> c_int;
+    fn harness_atomic_commit() -> bool;
 }
 
 thread_local! {
@@ -233,6 +234,11 @@ pub extern "C" fn dt_unpin(n: u64, write: bool) {
     with(|w| w.events.push(Ev::Unpin { n, write }));
 }
 
+#[no_mangle]
+pub extern "C" fn dt_hand_over(n: u64, write: bool) {
+    with(|w| w.events.push(Ev::HandOver { n, write }));
+}
+
 /// # Safety
 /// `fmt` is a C string.
 #[no_mangle]
@@ -327,7 +333,9 @@ pub extern "C" fn dt_a_prop(ctx: *mut c_void, id: u32) -> c_int {
 #[no_mangle]
 pub extern "C" fn dt_a_in_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, off: u32, fd: i64) -> c_int {
     let a = actx(ctx);
-    hooks::a_in_fence(a.w, &mut CCall(a.call), buf, off, fd)
+    // What the parse has said about the commit by now.
+    let commit = unsafe { harness_atomic_commit() };
+    hooks::a_in_fence(a.w, &mut CCall(a.call), buf, off, fd, commit)
 }
 
 #[no_mangle]
