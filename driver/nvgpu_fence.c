@@ -720,6 +720,10 @@ static int nvgpu_fence_copy_in(unsigned int cmd, unsigned int want,
 struct nvgpu_sowait {
   struct nvgpu_fence_ev ev;
   u64 cookie;
+  /* What it waits on: syncobj handle `syncobj` of backend render handle
+   * `render` (a DESTROY or the file's close ends its subscribers). */
+  u32 render;
+  u32 syncobj;
   refcount_t ref;
   atomic_t fired;
   struct list_head subs; /* nvgpu_sowait_sub, under nvgpu_sowait_lock */
@@ -727,11 +731,25 @@ struct nvgpu_sowait {
   struct hlist_node node; /* nvgpu_sowaits, under nvgpu_sowait_lock */
 };
 
+/*
+ * A guest process's userspace SYNCOBJ_EVENTFDs outstanding (quota.rs's
+ * pattern, on this side: the backend's share bounds registrations, this the
+ * subscribers riding on them, each an eventfd reference and a little
+ * memory). Under nvgpu_sowait_lock.
+ */
+struct nvgpu_sowait_owner {
+  struct hlist_node node;
+  u64 start_ns;
+  u32 tgid;
+  u32 n;
+};
+
 /* A userspace SYNCOBJ_EVENTFD. Whoever takes it off its registration's list
  * (under nvgpu_sowait_lock) signals and frees it. */
 struct nvgpu_sowait_sub {
   struct list_head node;
   struct eventfd_ctx *ctx;
+  struct nvgpu_sowait_owner *owner; /* charged to, under nvgpu_sowait_lock */
   u64 id; /* tells it from a later one at the same address */
 };
 
@@ -739,6 +757,19 @@ static atomic64_t nvgpu_sowait_sub_ids = ATOMIC64_INIT(0);
 
 static DEFINE_SPINLOCK(nvgpu_sowait_lock);
 static DEFINE_HASHTABLE(nvgpu_sowaits, 6);
+static DEFINE_HASHTABLE(nvgpu_sowait_owners, 6);
+static u32 nvgpu_sowait_nsubs;
+
+/*
+ * Subscribers outstanding in the guest, and each process's share: a quarter,
+ * the last sixteenth kept for processes holding at most a sixty-fourth (the
+ * split device/src/quota.rs calls Share::quarter). A compositor holds one per
+ * pending acquire point, a handful per surface.
+ */
+#define NVGPU_SOWAIT_SUBS_MAX 4096
+#define NVGPU_SOWAIT_SUBS_OWNER (NVGPU_SOWAIT_SUBS_MAX / 4)
+#define NVGPU_SOWAIT_SUBS_RESERVE (NVGPU_SOWAIT_SUBS_MAX / 16)
+#define NVGPU_SOWAIT_SUBS_FLOOR (NVGPU_SOWAIT_SUBS_MAX / 64)
 /* Every guest waiter sleeps here; any registration firing wakes them all,
  * and each looks at its own. Fences fire at frame rate, not faster. */
 static DECLARE_WAIT_QUEUE_HEAD(nvgpu_sowait_wq);
@@ -757,6 +788,63 @@ void nvgpu_fence_wake_waiters(void) { wake_up_all(&nvgpu_sowait_wq); }
 
 static void nvgpu_sowait_free(struct nvgpu_fence_ev *e) {
   kfree(container_of(e, struct nvgpu_sowait, ev));
+}
+
+/*
+ * Charge a new subscriber to the calling process: its owner record (the
+ * existing one, or `*spare`, which is then consumed), or NULL over its share
+ * or the pool -- the caller answers -ENOMEM, the kernel's own answer when it
+ * cannot make an entry. Under the lock.
+ */
+static struct nvgpu_sowait_owner *
+nvgpu_sowait_charge_locked(struct nvgpu_sowait_owner **spare) {
+  struct nvgpu_sowait_owner *it, *mine = NULL;
+  u64 start_ns;
+  u32 tgid, after;
+
+  rcu_read_lock();
+  start_ns = READ_ONCE(current->group_leader)->start_time;
+  rcu_read_unlock();
+  tgid = task_tgid_nr(current);
+  hash_for_each_possible(nvgpu_sowait_owners, it, node, tgid) {
+    if (it->tgid == tgid && it->start_ns == start_ns) {
+      mine = it;
+      break;
+    }
+  }
+  after = (mine ? mine->n : 0) + 1;
+  if (nvgpu_sowait_nsubs >= NVGPU_SOWAIT_SUBS_MAX ||
+      after > NVGPU_SOWAIT_SUBS_OWNER ||
+      (nvgpu_sowait_nsubs + 1 >
+           NVGPU_SOWAIT_SUBS_MAX - NVGPU_SOWAIT_SUBS_RESERVE &&
+       after > NVGPU_SOWAIT_SUBS_FLOOR))
+    return NULL;
+  if (!mine) {
+    mine = *spare;
+    *spare = NULL;
+    mine->tgid = tgid;
+    mine->start_ns = start_ns;
+    mine->n = 0;
+    hash_add(nvgpu_sowait_owners, &mine->node, tgid);
+  }
+  mine->n++;
+  nvgpu_sowait_nsubs++;
+  return mine;
+}
+
+/* A subscriber is gone: its process's charge back. Under the lock; any
+ * context. */
+static void nvgpu_sowait_uncharge_locked(struct nvgpu_sowait_sub *sub) {
+  struct nvgpu_sowait_owner *o = sub->owner;
+
+  sub->owner = NULL;
+  if (!o)
+    return;
+  nvgpu_sowait_nsubs--;
+  if (!--o->n) {
+    hash_del(&o->node);
+    kfree(o);
+  }
 }
 
 static bool nvgpu_sowait_unhash(struct nvgpu_sowait *s) {
@@ -799,6 +887,8 @@ static void nvgpu_sowait_deliver(struct nvgpu_ev_consumer *c, u32 kind,
   spin_lock_irqsave(&nvgpu_sowait_lock, flags);
   atomic_set(&s->fired, 1);
   list_splice_init(&s->subs, &subs);
+  list_for_each_entry(sub, &subs, node)
+    nvgpu_sowait_uncharge_locked(sub);
   drop = s->subs_ref;
   s->subs_ref = false;
   spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
@@ -815,7 +905,8 @@ static void nvgpu_sowait_deliver(struct nvgpu_ev_consumer *c, u32 kind,
 
 /* A new registration object for `cookie`, registered and hashed. */
 static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
-                                             u64 cookie) {
+                                             u64 cookie, u32 render,
+                                             u32 syncobj) {
   struct nvgpu_sowait *s;
   unsigned long flags;
   int ret;
@@ -827,6 +918,8 @@ static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
   s->ev.free = nvgpu_sowait_free;
   s->ev.c.deliver = nvgpu_sowait_deliver;
   s->cookie = cookie;
+  s->render = render;
+  s->syncobj = syncobj;
   refcount_set(&s->ref, 1);
   INIT_LIST_HEAD(&s->subs);
   ret = nvgpu_ev_register(dev, &s->ev.c, NVGPU_EVKEY_COOKIE(cookie));
@@ -880,7 +973,7 @@ static struct nvgpu_sowait *nvgpu_sowait_get(struct nvgpu_fd *nfd,
   int ret;
 
   cookie = nvgpu_ev_new_cookie(dev);
-  s = nvgpu_sowait_new(dev, cookie);
+  s = nvgpu_sowait_new(dev, cookie, nfd->handle, syncobj);
   if (IS_ERR(s))
     return s;
   args[0] = nfd->handle;
@@ -900,8 +993,59 @@ static struct nvgpu_sowait *nvgpu_sowait_get(struct nvgpu_fd *nfd,
   if (res[0] <= U32_MAX)
     return ERR_PTR(-EPROTO); /* a legacy handle's cookie: not a registration */
   t = nvgpu_sowait_find(dev, res[0]);
-  return t ? t : nvgpu_sowait_new(dev, res[0]);
+  return t ? t : nvgpu_sowait_new(dev, res[0], nfd->handle, syncobj);
 }
+
+/*
+ * Syncobj `syncobj` of `nfd`'s render file was destroyed (`all`: the file
+ * is going, and every one of its syncobjs with it): the userspace eventfds
+ * subscribed through it are let go unsignalled, as the kernel frees a
+ * syncobj's entries without signalling them (drm_syncobj.c:533-538). The
+ * backend drops or orphans the registrations themselves; a guest waiter
+ * inside SYNCOBJ_WAIT holds its own references and finds out on its next
+ * poll.
+ */
+static void nvgpu_sowait_forget(struct nvgpu_fd *nfd, u32 syncobj, bool all) {
+  struct nvgpu_sowait_sub *sub, *n;
+  struct nvgpu_sowait *s, *found;
+  unsigned long flags;
+  unsigned int bkt;
+
+  for (;;) {
+    LIST_HEAD(subs);
+
+    found = NULL;
+    spin_lock_irqsave(&nvgpu_sowait_lock, flags);
+    hash_for_each(nvgpu_sowaits, bkt, s, node) {
+      if (s->ev.dev == nfd->dev && s->render == nfd->handle &&
+          (all || s->syncobj == syncobj) && s->subs_ref) {
+        found = s;
+        break;
+      }
+    }
+    if (found) {
+      list_splice_init(&found->subs, &subs);
+      list_for_each_entry(sub, &subs, node)
+        nvgpu_sowait_uncharge_locked(sub);
+      found->subs_ref = false;
+    }
+    spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
+    if (!found)
+      return;
+    list_for_each_entry_safe(sub, n, &subs, node) {
+      eventfd_ctx_put(sub->ctx);
+      kfree(sub);
+    }
+    nvgpu_sowait_put(found);
+  }
+}
+
+void nvgpu_fence_file_release(struct nvgpu_fd *nfd) {
+  nvgpu_sowait_forget(nfd, 0, true);
+  nvgpu_fence_reap();
+}
+
+void nvgpu_fence_drain(void) { nvgpu_fence_reap(); }
 
 /* One syncobj wait in progress. */
 struct nvgpu_sowait_wait {
@@ -1296,14 +1440,18 @@ static long nvgpu_fence_transfer(struct nvgpu_fd *nfd, unsigned int cmd,
  * The registration may have fired before this subscriber joined it, so the
  * point is polled once after joining; ready then, the eventfd is signalled
  * here instead (exactly once either way: whoever takes the subscriber off the
- * list signals it). Over the VM's cap this fails -ENOMEM, the kernel's own
- * answer when an entry cannot be made (drm_syncobj.c:1487-1491).
+ * list signals it). Over the VM's cap, the caller's share of it, or the
+ * caller's share of the guest's subscribers, this fails -ENOMEM, the
+ * kernel's own answer when an entry cannot be made (drm_syncobj.c:1487-1491).
+ * A subscriber lasts until it is signalled, or its syncobj handle is
+ * destroyed or its file closed (nvgpu_sowait_forget()).
  */
 static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
                                 void __user *uarg) {
   struct nvgpu_fence_call p = {.nfd = nfd};
   struct drm_syncobj_eventfd a;
   struct nvgpu_sowait_sub *sub, *it;
+  struct nvgpu_sowait_owner *owner;
   struct nvgpu_sowait *s;
   struct eventfd_ctx *ctx;
   bool now = false, drop = false;
@@ -1320,7 +1468,10 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (IS_ERR(ctx))
     return PTR_ERR(ctx);
   sub = kzalloc(sizeof(*sub), GFP_KERNEL);
-  if (!sub) {
+  owner = kzalloc(sizeof(*owner), GFP_KERNEL);
+  if (!sub || !owner) {
+    kfree(sub);
+    kfree(owner);
     eventfd_ctx_put(ctx);
     return -ENOMEM;
   }
@@ -1331,6 +1482,7 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (IS_ERR(s)) {
     ret = PTR_ERR(s) == -EAGAIN ? -ENOMEM : PTR_ERR(s);
     kfree(sub);
+    kfree(owner);
     eventfd_ctx_put(ctx);
     return ret;
   }
@@ -1339,13 +1491,24 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   if (atomic_read(&s->fired)) {
     now = true;
   } else {
-    list_add_tail(&sub->node, &s->subs);
-    if (!s->subs_ref) {
-      refcount_inc(&s->ref);
-      s->subs_ref = true;
+    sub->owner = nvgpu_sowait_charge_locked(&owner);
+    if (sub->owner) {
+      list_add_tail(&sub->node, &s->subs);
+      if (!s->subs_ref) {
+        refcount_inc(&s->ref);
+        s->subs_ref = true;
+      }
     }
   }
   spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
+  kfree(owner); /* unless the charge took it */
+  if (!now && !sub->owner) {
+    /* Over the caller's share of the guest's subscribers. */
+    kfree(sub);
+    eventfd_ctx_put(ctx);
+    nvgpu_sowait_put(s);
+    return -ENOMEM;
+  }
 
   if (!now) {
     struct drm_syncobj_timeline_wait k = {
@@ -1364,6 +1527,7 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
       list_for_each_entry(it, &s->subs, node) {
         if (it == sub && it->id == id) {
           list_del(&sub->node);
+          nvgpu_sowait_uncharge_locked(sub);
           now = true;
           break;
         }
@@ -1525,9 +1689,22 @@ long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
     return nvgpu_fence_transfer(nfd, cmd, uarg);
   case _IOC_NR(DRM_IOCTL_SYNCOBJ_EVENTFD):
     return nvgpu_fence_eventfd(nfd, cmd, uarg);
+  case _IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY): {
+    struct drm_syncobj_destroy a;
+    long ret;
+
+    /* Read once: the handle whose subscribers go is the one destroyed. */
+    ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_DESTROY, &a, uarg);
+    if (ret)
+      return ret;
+    ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
+    if (!ret)
+      nvgpu_sowait_forget(nfd, a.handle, false);
+    return ret;
+  }
   default:
-    /* CREATE, DESTROY, RESET, SIGNAL, QUERY, TIMELINE_SIGNAL: handles and
-     * points, nothing to translate and nothing that waits. */
+    /* CREATE, RESET, SIGNAL, QUERY, TIMELINE_SIGNAL: handles and points,
+     * nothing to translate and nothing that waits. */
     return nvgpu_fence_call(&p, nfd->handle, cmd, (void __force *)uarg,
                             false);
   }

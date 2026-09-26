@@ -1709,6 +1709,8 @@ static void nvgpu_drm_detach(struct nvgpu_fd *nfd) {
   if (!nvgpu_fd_detach_drm(nfd, &kms))
     return;
   nvgpu_fd_unregister(nfd->dev, nfd);
+  /* Its syncobjs' userspace eventfds, which end with its syncobjs. */
+  nvgpu_fence_file_release(nfd);
   /* Its event consumers and reserved events, while the drm_file stands. */
   nvgpu_kms_detach(nfd);
   if (kms)

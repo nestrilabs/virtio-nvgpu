@@ -658,6 +658,11 @@ long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
 /* A GEM proxy is going: close what SEMSURF_FENCE_ATTACH moved into other
  * files for it. */
 void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
+/* A DRM file is going: the SYNCOBJ_EVENTFD subscribers made through it go
+ * too, as its syncobjs do. Process context. */
+void nvgpu_fence_file_release(struct nvgpu_fd *nfd);
+/* Retire the event consumers buried so far (remove(), module exit). */
+void nvgpu_fence_drain(void);
 
 /* ───────── nvgpu_wl.c ───────── */
 

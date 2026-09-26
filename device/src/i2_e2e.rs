@@ -1540,10 +1540,12 @@ fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number(
     assert_eq!(w.be.syncobj_regs.len(), 2, "the orphan keeps its slot");
 
     // A later render file may be given this handle number: the closed
-    // file's registrations are no key's any more.
+    // file's registrations are no key's any more -- and, on syncobjs only
+    // that file could reach (none was exported or imported), are dropped
+    // with it rather than kept as orphans (fence.rs, `orphan_file`).
     w.be.close_handle(render).unwrap();
     assert_eq!(watch(&mut w, key, c(4)), Ok(Watched::New));
-    assert_eq!(w.be.syncobj_regs.len(), 3);
+    assert_eq!(w.be.syncobj_regs.len(), 1);
 }
 
 // ───────────────────────────── NVKMS ─────────────────────────────

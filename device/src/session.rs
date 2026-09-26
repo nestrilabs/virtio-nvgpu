@@ -908,13 +908,10 @@ impl NvidiaBackend {
         // SYNCOBJ_DESTROY frees the number the moment it runs, and the next
         // import in this file gets it back: no watch may join a wait on the
         // old syncobj from here on (fence.rs, `Registrations::orphan`; S-13).
-        // drm_syncobj_destroy.handle @0.
-        if prepared.name() == "SYNCOBJ_DESTROY" {
-            if let Some(a) = prepared.buffer(0).filter(|a| a.len() >= 4) {
-                let handle = u32::from_le_bytes(a[..4].try_into().unwrap());
-                self.syncobj_regs.orphan(target, handle);
-            }
-        }
+        // And an export or import of a syncobj file is where a syncobj gets
+        // a holder other than its file (fence.rs, `before_ioctl2`).
+        self.syncobj_regs
+            .before_ioctl2(target, prepared.name(), prepared.buffer(0));
         let executor = prepared.wants_executor() || class != SchemaClass::Render;
         Ok(PendingIoctl2(Pending::Ioctl2(Ioctl2Call {
             prepared,
@@ -955,6 +952,16 @@ impl NvidiaBackend {
         // A lease a guest lessor revoked through us: whatever the lessee's
         // handle granted is gone on the host (kms.rs, "lease ends").
         let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);
+        // A destroyed syncobj only its file could reach: its wait
+        // registrations go with it (fence.rs, `after_ioctl2`).
+        if !stale && prepared.name() == "SYNCOBJ_DESTROY" {
+            self.syncobj_regs.after_ioctl2(
+                target,
+                prepared.name(),
+                prepared.buffer(0),
+                prepared.result(),
+            );
+        }
         let nodes = self.host_nodes();
         let mut fin = BackendFinisher {
             backend: self,

@@ -2246,6 +2246,8 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   /* Nothing answers now, and the backend ends the session (freeing every
    * client) when it sees the reset: the pages RM held are the guest's. */
   nvgpu_osdesc_release_all(dev);
+  /* Fence consumers buried so far; later ones go with the next reap. */
+  nvgpu_fence_drain();
 
   nvgpu_dri_cleanup(dev);
   nvgpu_module_sysfs_cleanup();
@@ -2342,6 +2344,7 @@ static int __init nvgpu_init(void)
 static void __exit nvgpu_exit(void)
 {
     unregister_virtio_driver(&nvgpu_driver);
+    nvgpu_fence_drain();
 }
 
 module_init(nvgpu_init);
