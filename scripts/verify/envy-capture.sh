@@ -9,7 +9,10 @@
 #   export EHKS=/opt/ehks/libenvyhooks.so
 #
 # Usage: envy-capture.sh <bare|guest> <workload-label> [outdir] -- <cmd...>
-#   e.g. envy-capture.sh guest W2 /tmp/ehks -- vkcube --wsi wayland --c 300
+#   e.g. envy-capture.sh guest W2 ~/ehks -- vkcube --wsi wayland --c 300
+# Without an outdir, a fresh one (mktemp -d) is made and named: a fixed name
+# in a shared /tmp is one another user can take first, as a symlink to
+# somewhere of theirs.
 #
 # Leaves, under <outdir>/<side>/<workload>/:
 #   rm.log            the AFTER/BEFORE IOCTL trace (envyhooks on stderr)
@@ -23,10 +26,11 @@ fi
 
 side="$1"; shift
 label="$1"; shift
-outdir="/tmp/ehks"
+outdir=
 if [ "$1" != "--" ]; then outdir="$1"; shift; fi
 [ "$1" = "--" ] || { echo "expected -- before the command" >&2; exit 2; }
 shift
+[ -n "$outdir" ] || outdir=$(mktemp -d "${TMPDIR:-/tmp}/ehks.XXXXXX")
 
 case "$side" in bare|guest) ;; *) echo "side must be bare or guest" >&2; exit 2;; esac
 : "${EHKS:?point EHKS at libenvyhooks.so built for this driver version}"

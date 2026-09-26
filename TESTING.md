@@ -25,7 +25,7 @@ the same across 595, 610 and 615, so a 595 or 615 box is a valid target.
 Throughout, three logs are the ones worth keeping on any failure, and each stage
 names the ones specific to it on top:
 
-- **the backend log** at `RUST_LOG=debug` (`sudo RUST_LOG=debug scripts/run-guest.sh …`;
+- **the backend log** at `RUST_LOG=debug` (`sudo RUST_LOG=debug NVGPU_PREFIX=/root /root/bin/run-guest.sh …`;
   the launcher writes it per run, to `/root/logs/<tag>.backend.log`);
 - **guest `dmesg`** (the guest kernel module logs the cause of each refusal);
 - **host `dmesg`** (a host oops or an nvidia-drm/NVKMS `WARN` is always a FAIL).
@@ -85,6 +85,16 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   the only way to run it as root, for ruling the credentials out, never for a
   test whose result you will keep. Every mode below is started through the
   launcher, with the flags the appendix lists.
+- **As root, only root's files.** The launcher run as root refuses anything
+  it would run, read or write that is not root's, or sits in a directory
+  someone else can write -- itself included -- so it is not run from a user's
+  checkout: install a copy, `sudo install -D -o root -g root -m 0755
+  scripts/run-guest.sh /root/bin/run-guest.sh`, with the tree it expects under
+  `/root` (the launcher's header), and name the layout:
+  `sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh …` (or `NVGPU_RIG=` a
+  root-owned rig). The VMM runs jailed unless `NVGPU_VMM_JAIL=auto|off`, and
+  `NVGPU_SANDBOX=off` and `NVGPU_ALLOW_ROOT_UNSAFE=1` also need
+  `NVGPU_DIAGNOSTIC=1`.
 
 ### 0.4 Tools
 
@@ -173,15 +183,15 @@ other GPU clients.
 ```sh
 export EHKS=/opt/ehks/libenvyhooks.so
 # W1 offscreen, W2 Wayland present, W3 display present:
-scripts/verify/envy-capture.sh bare  W1 /tmp/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
-scripts/verify/envy-capture.sh guest W1 /tmp/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
+scripts/verify/envy-capture.sh bare  W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
+scripts/verify/envy-capture.sh guest W1 ~/ehks -- nesprobe --device 0 --cost 400 --seconds 10 --warmup 0
 # … and again for W2 (vkcube --wsi wayland --c 300) and W3 (vkcube --wsi display --c 300)
 ```
 
 Then diff:
 
 ```sh
-scripts/verify/envy-diff.sh /tmp/ehks/bare/W1 /tmp/ehks/guest/W1
+scripts/verify/envy-diff.sh ~/ehks/bare/W1 ~/ehks/guest/W1
 ```
 
 `envy-diff.sh` normalises away the differences that are *expected* — RM-assigned
@@ -226,7 +236,7 @@ hl.config({ debug  = { enable_stdout_logs = true } })
 ```
 
 **Launch:** from the desktop session, so the variables are its own —
-`sudo scripts/run-guest.sh --wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" <probe>`.
+`sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" <probe>`.
 The backend then runs as the session's user (the socket's owner), which is who
 may connect to it.
 **Guest:** run the daemon, then a fullscreen client through it:
@@ -273,7 +283,7 @@ hl.monitor({ output = "DP-2", mode = "preferred", position = "auto", leasable = 
 
 `hyprctl monitors all` should show `leasable: 1` for that output.
 
-**Launch:** `sudo scripts/run-guest.sh --wayland-socket … --wayland-lease <probe>`
+**Launch:** `sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --wayland-socket … --wayland-lease <probe>`
 (`--wayland-lease-interval SECS` spaces the guest's lease requests, 5 s by
 default; 0 lifts it while iterating on this stage).
 **Guest:** the daemon exposes the host's `wp_drm_lease_device_v1`; a lease client
@@ -334,7 +344,7 @@ Mode 5 (DESIGN §0.5): the guest compositor drives the host card directly; the h
 runs no compositor of its own.
 
 **Host:** no compositor running on the card. **Launch:**
-`sudo scripts/run-guest.sh --kms-card <probe>` (the backend warns loudly that the
+`sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card <probe>` (the backend warns loudly that the
 host card nodes are now offered to the guest). This
 offers `DEV_DRI_CARD_*` nodes and `num_cards > 0` in HELLO.
 
@@ -592,7 +602,7 @@ is given too (they are hidden from its `--help` without it); the launcher adds
 `NVGPU_ALLOW_ROOT_UNSAFE=1`:
 
 ```sh
-sudo scripts/run-guest.sh --kms-card probeQ.sh kms1 -- --keep-guest-coherency
+sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card probeQ.sh kms1 -- --keep-guest-coherency
 ```
 
 Guest packages the stages assume: NVIDIA userspace (Vulkan ICD, EGL), `nvgpu-wl-guest`,

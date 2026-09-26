@@ -1,7 +1,7 @@
-From 97d402498383338d925aa606775adc4d1d2f1717 Mon Sep 17 00:00:00 2001
+From 093497cbce6c8dc5b6f1c196bf227b9b8589524c Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 01:45:18 +0000
-Subject: [PATCH 3/6] x86_64: --no-pci-hotplug-port
+Subject: [PATCH 3/9] x86_64: --no-pci-hotplug-port
 
 crosvm always makes one empty PCIe root port for hot-plugging devices
 later, and gives it the first free bus, bus 1. A guest that needs that

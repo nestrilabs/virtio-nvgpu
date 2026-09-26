@@ -318,9 +318,17 @@ else
     ok "$avail_mib MiB available (a run wants $want_mib)"
 fi
 sysrq=$(cat /proc/sys/kernel/sysrq 2>/dev/null)
+# 244 (0xf4) is what getting out needs: unraw (4), sync (16), remount
+# read-only (32), signal every process (64), reboot (128). Not 1: that is every
+# function, the memory, task and register dumps to the console and a forced
+# crash among them, for anyone at the keyboard.
 if [ "$sysrq" = 0 ]; then
     warn "kernel.sysrq=0: no Alt+SysRq way out of a frozen desktop"
-    hint "sysctl kernel.sysrq=1 (or at least 0xf4: sync, remount, reboot, kill), as root, before the first GPU stage"
+    hint "sysctl kernel.sysrq=244 (unraw, sync, remount, kill, reboot; not 1, which is every function)," \
+        "as root, before the first GPU stage"
+elif [ "$sysrq" = 1 ]; then
+    ok "kernel.sysrq=1 (Alt+SysRq works if the keyboard still does)"
+    hint "1 enables every SysRq function, the debug dumps and a forced crash too; 244 is what recovery needs"
 elif [ -n "$sysrq" ]; then
     ok "kernel.sysrq=$sysrq (Alt+SysRq works if the keyboard still does)"
 fi

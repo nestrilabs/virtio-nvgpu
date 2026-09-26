@@ -170,10 +170,10 @@ Unpatched Hyprland reports `leasable` as a config error: in Lua, in `monitorv2`,
 
 **Read this whole section to the user and get their explicit yes before applying it.** It is their call. The request reached this document second-hand, through the agent that wrote it, and that is not their consent.
 
-What it exposes. Claude's sandbox becomes as powerful as the user's own desktop session:
+What it exposes. Claude's sandbox becomes as powerful as any Wayland client of the user's desktop session:
 
-- **The main Wayland socket.** Any process in the sandbox can bind every privileged global. These are: screencopy and image-copy-capture (silent screenshots), toplevel export, virtual keyboard and virtual pointer (typing and clicking into any window), input-method, wlr/ext data-control (reading and setting the clipboard), layer-shell (full-screen overlays), output management, gamma and CTM control, session lock, foreign-toplevel, global shortcuts and input capture.
-- **`$XDG_RUNTIME_DIR/hypr/` (hyprctl).** This is stronger still.
+- **The main Wayland socket** (the change below). Any process in the sandbox can bind every privileged global. These are: screencopy and image-copy-capture (silent screenshots), toplevel export, virtual keyboard and virtual pointer (typing and clicking into any window), input-method, wlr/ext data-control (reading and setting the clipboard), layer-shell (full-screen overlays), output management, gamma and CTM control, session lock, foreign-toplevel, global shortcuts and input capture.
+- **`$XDG_RUNTIME_DIR/hypr/` (hyprctl) -- not bound by default, and not needed** (step 3). It is stronger still.
   - `hyprctl dispatch exec <cmd>` makes Hyprland run `<cmd>` on the host, outside the sandbox, as the user.
   - `hyprctl keyword` rewrites the live config, including `permission` rules.
   - In effect this is no sandbox at all while it is bound.
@@ -198,26 +198,32 @@ What it exposes. Claude's sandbox becomes as powerful as the user's own desktop 
 
    It is the nixpak app whose `bubblewrap.bind.dev` lists `/dev/kvm`, `/dev/udmabuf`, `/dev/nvidia*` and `/dev/dri`, and which binds `/sys` read-only.
 
-2. Add these to that app's nixpak config. `sloth` is nixpak's helper, already in scope in nixpak app modules. Keep every existing bind as it is: `bind.dev` for `/dev/kvm`, `/dev/nvidia*`, `/dev/dri` and `/dev/udmabuf`, and `/sys` read-only.
+2. Add this to that app's nixpak config: the Wayland socket, and **not** Hyprland's IPC directory. `sloth` is nixpak's helper, already in scope in nixpak app modules. Keep every existing bind as it is: `bind.dev` for `/dev/kvm`, `/dev/nvidia*`, `/dev/dri` and `/dev/udmabuf`, and `/sys` read-only.
 
    ```nix
    bubblewrap.bind.rw = [
      # the live session's Wayland socket, at the same path inside ($XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, e.g. /run/user/1001/wayland-1)
      (sloth.concat [ sloth.runtimeDir "/" (sloth.envOr "WAYLAND_DISPLAY" "wayland-1") ])
-     # Hyprland's IPC sockets, for hyprctl ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock)
-     (sloth.concat' sloth.runtimeDir "/hypr")
    ];
    bubblewrap.env = {
      # already inherited today (clearEnv is off); explicit so it survives a clearEnv = true later
      WAYLAND_DISPLAY = sloth.env "WAYLAND_DISPLAY";
-     HYPRLAND_INSTANCE_SIGNATURE = sloth.env "HYPRLAND_INSTANCE_SIGNATURE";
    };
    ```
 
    - `bind.rw` is a list, so these entries merge with the app's existing ones.
    - The sandbox's `XDG_RUNTIME_DIR` is the same path as the host's (`/run/user/<uid>`), so the socket appears where preflight and `run-guest.sh --wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"` look.
    - nixpak's `bubblewrap.sockets.wayland = true` binds the same socket read-only, which is also enough to connect. The explicit read-write bind above is what was asked for.
-   - The `hypr/` bind is needed only for `hyprctl` from inside, meaning `hyprctl monitors all` and toggling `leasable`. The rig's launcher needs only the Wayland socket. If the user wants to keep `dispatch exec` out of the sandbox, drop the second entry and run `hyprctl` themselves.
+
+3. **Leave `$XDG_RUNTIME_DIR/hypr/` out.** Everything Group B runs needs only the Wayland socket: the launcher, the backend and the probes. The `hypr/` directory is Hyprland's IPC, and through it `hyprctl dispatch exec <cmd>` has Hyprland run any command on the host, as the user, outside the sandbox, and `hyprctl keyword` rewrites the live config -- binding it ends the sandbox, not widens it. What it would be used for from inside, `hyprctl monitors all` to see which monitor is leasable and toggling `leasable`, the user can do from a terminal on the desktop (section 4). Only if the user, told exactly that, asks for it separately, add to the same app:
+
+   ```nix
+   bubblewrap.bind.rw = [
+     # Hyprland's IPC sockets, for hyprctl ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock)
+     (sloth.concat' sloth.runtimeDir "/hypr")
+   ];
+   bubblewrap.env.HYPRLAND_INSTANCE_SIGNATURE = sloth.env "HYPRLAND_INSTANCE_SIGNATURE";
+   ```
 
 ## 6. `nvidia_drm.modeset=1`
 

@@ -1,7 +1,7 @@
-From 3ae189fb8f3cb40e191b6e77df1aec4a8a884934 Mon Sep 17 00:00:00 2001
+From a1b49ea7ec59d2810cbfc7ebb3c838a9611389eb Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 01:44:55 +0000
-Subject: [PATCH 1/6] vhost_user_frontend: check every backend mapping against
+Subject: [PATCH 1/9] vhost_user_frontend: check every backend mapping against
  its region
 
 A vhost-user backend is another process, and may be a compromised one.
@@ -26,6 +26,9 @@ covers, as mmap takes it.
 Also:
 - unmap everything the backend mapped on device reset, which the
   vhost-user spec asks of the front-end and was a TODO here;
+- and when the backend's request channel closes or the backend hangs up:
+  nothing will withdraw those mappings any more, and each keeps one of the
+  backend's files -- device memory, for a GPU -- in reach of the guest;
 - a refused request no longer stops the worker (and with it the VM): the
   refusal has already gone back to the backend as the reply, and the
   channel is still in step.
@@ -35,8 +38,8 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
  .../src/virtio/vhost_user_frontend/handler.rs | 260 +++++++++++-------
  devices/src/virtio/vhost_user_frontend/mod.rs |  18 +-
- .../src/virtio/vhost_user_frontend/worker.rs  |   7 +
- 3 files changed, 178 insertions(+), 107 deletions(-)
+ .../src/virtio/vhost_user_frontend/worker.rs  |  16 ++
+ 3 files changed, 187 insertions(+), 107 deletions(-)
 
 diff --git a/devices/src/virtio/vhost_user_frontend/handler.rs b/devices/src/virtio/vhost_user_frontend/handler.rs
 index 3678a8e..3c210e2 100644
@@ -414,11 +417,17 @@ index e80d755..a2f7874 100644
  
      fn expose_shmem_descriptors_with_viommu(&self) -> bool {
 diff --git a/devices/src/virtio/vhost_user_frontend/worker.rs b/devices/src/virtio/vhost_user_frontend/worker.rs
-index 4e89747..68bed7b 100644
+index 4e89747..a56d397 100644
 --- a/devices/src/virtio/vhost_user_frontend/worker.rs
 +++ b/devices/src/virtio/vhost_user_frontend/worker.rs
-@@ -114,6 +114,13 @@ impl Worker {
+@@ -112,8 +112,19 @@ impl Worker {
+                                 let _ = wait_ctx.delete(backend_req_handler.get_read_notifier());
+                                 #[cfg(target_os = "windows")]
                                  let _ = wait_ctx.delete(backend_req_handler.get_close_notifier());
++                                // Nothing will withdraw what the backend mapped now, and each
++                                // mapping keeps a file of the backend's -- device memory, for
++                                // virtio-nvgpu -- in reach of the guest.
++                                backend_req_handler.frontend_mut().unmap_all();
                                  self.backend_req_handler = None;
                              }
 +                            // The handler refused the request and the refusal has been sent
@@ -431,6 +440,25 @@ index 4e89747..68bed7b 100644
                              Err(e) => return Err(e).context("failed to handle vhost-user request"),
                          }
                      }
+@@ -126,6 +137,7 @@ impl Worker {
+                         info!("backend req handler connection closed");
+                         let _ = wait_ctx.delete(backend_req_handler.get_read_notifier());
+                         let _ = wait_ctx.delete(backend_req_handler.get_close_notifier());
++                        backend_req_handler.frontend_mut().unmap_all();
+                         self.backend_req_handler = None;
+                     }
+                     Token::BackendCloseNotify => {
+@@ -136,6 +148,10 @@ impl Worker {
+                             warn!("event besides hungup should not be notified");
+                             continue;
+                         }
++                        // As above: the backend is gone, so its mappings go too.
++                        if let Some(handler) = self.backend_req_handler.as_mut() {
++                            handler.frontend_mut().unmap_all();
++                        }
+                         bail!("Backend device disconnected early");
+                     }
+                 }
 -- 
 2.55.0
 

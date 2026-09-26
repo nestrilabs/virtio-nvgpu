@@ -194,9 +194,11 @@ nested inside the headless sway
 
 ## crosvm
 
-Every Group A stage but A2's `--allow-compute` half also runs under crosvm,
-with its sandbox on: add
-`--vmm crosvm` (or set `NVGPU_VMM_KIND=crosvm`). The kernel, image, probes,
+Every Group A stage also runs under crosvm, with its sandbox on: add
+`--vmm crosvm` (or set `NVGPU_VMM_KIND=crosvm`). A2's `--allow-compute` half
+needs a crosvm with the UVM aperture (patches `0007`-`0009`, branch
+`virtio-nvgpu-compute`); the launcher refuses `--allow-compute` with a crosvm
+whose `run --help` does not name the `nvgpu-uvm-aperture`. The kernel, image, probes,
 backend and logs are the same; `<tag>.json` records crosvm's command line,
 as it has no config file.
 
@@ -212,8 +214,16 @@ NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 scripts/rig-app-check.sh \
 ```
 
 `.rig/src/crosvm` is upstream crosvm (c0474109d64d, 2026-09-25) on branch
-`virtio-nvgpu`, with the four patches in `patches/crosvm/`; README.md,
-"What a VMM must do", says what each is for. It is built static and without
+`virtio-nvgpu`, with patches `0001`-`0006` of `patches/crosvm/`;
+`.rig/src/crosvm-compute` is a worktree on branch `virtio-nvgpu-compute`,
+all nine (patches/README.md says what each is for). The compute build goes
+to its own binary, so the graphics one is left alone:
+
+```sh
+CROSVM_SRC=.rig/src/crosvm-compute CROSVM_OUT=.rig/bin/crosvm-compute \
+  CARGO_TARGET_DIR=.rig/target-crosvm-compute scripts/rig-build-crosvm.sh
+NVGPU_VMM=.rig/bin/crosvm-compute scripts/run-guest.sh --vmm crosvm ...
+``` It is built static and without
 crosvm's default features: no virtio-gpu, virgl, virtio-wl, audio, USB or
 network devices.
 
@@ -227,15 +237,17 @@ What crosvm's sandbox does here, unprivileged: every device crosvm emulates
 (the disk, both consoles, rng) runs as a process of its own, each in new
 user, pid, mount and network namespaces with no uid mapped, pivoted into the
 empty `.rig/run/crosvm-empty`, under its seccomp policy (`Seccomp: 2` in
-`/proc/<pid>/status`). The vhost-user frontend stays in crosvm's main
-process, as upstream has it; the launcher starts that process in a user and
-network namespace of its own (`NVGPU_VMM_NETNS=0` does not). No seccomp
-policy and no minijail setting changed for virtio-nvgpu. `NVGPU_CROSVM_SANDBOX=off`
-runs `--disable-sandbox`, and says so at the top of the console log.
+`/proc/<pid>/status`). With `0009` so does the nvgpu vhost-user frontend,
+under `vhost_user_frontend_device` (the `vu-nvgpu` process); without it the
+frontend stays in crosvm's main process, as upstream has it. The launcher
+starts the main process in a user and network namespace of its own
+(`NVGPU_VMM_NETNS=0` does not), and its summary line says
+`nvgpu frontend jailed` when it is. `NVGPU_CROSVM_SANDBOX=off` runs
+`--disable-sandbox`, and says so at the top of the console log; the
+frontend is then in the main process, and the main process's checks
+(SECURITY.md §16) still hold.
 
-Not under crosvm yet: `--allow-compute` (the launcher refuses it: crosvm
-publishes one shared memory region per device, so there is no UVM aperture,
-and the guest reports no compute), a virtiofs share, and the root layout.
+Not under crosvm yet: a virtiofs share, and the root layout.
 
 Results on the 5090 (2026-09-26), against nesbox's from the regression
 before the hardening merge (nesbox `stage1` and `render` re-run on this tree
@@ -260,27 +272,44 @@ Chromium needs `NVGPU_SLOT=40` to get to chrome://gpu when it runs alone;
 at 25 s its capture is still the black window it opens with, under either
 VMM.
 
-### What compute would need from crosvm
+### Compute under crosvm
 
-The UVM aperture (ARCHITECTURE.md §5): a second shared memory region, where
-each UVM semaphore pool is mapped at the host address UVM demands. crosvm
-would need:
+Built (`0007`-`0009`), unit-tested, not yet run on the GPU. The aperture is
+region 2 after the window in the window's 64-bit BAR (2 GiB in all with
+compute), with a shared-memory capability of its own. The jailed frontend
+checks each pool and hands it to the main process, which checks it again,
+maps `/dev/nvidia-uvm` at the pool's own address over the band it reserved
+at start-up ([4 GiB, 32 TiB)), checks the pages with `mincore`, and adds the
+slot; withdrawal removes the slot, then puts the reservation back
+(SECURITY.md §16). What to run, in this order, each against nesbox's result
+on the same tree:
 
-- more than one shared memory region per virtio-pci device (a second BAR
-  and `VirtioPciShmCap`, and a mapper per region); today
-  `VirtioDevice::get_shared_memory_region` returns one;
-- a mapping that is placed at a host address the backend names (the file
-  offset is that address): `MAP_FIXED_NOREPLACE` in crosvm's own address
-  space, never over anything crosvm has, and only inside a band reserved
-  for it up front (nesbox holds [4 GiB, 32 TiB)), then a memory slot of its
-  own at the aperture offset. crosvm's prepared-region arena cannot do this:
-  it maps into a reservation crosvm chose. It is a new `VmMemorySource`
-  kind, checked as the window's are, and one KVM memory slot per pool
-  (about 0.7 ms to add, 2 ms to remove, once per CUDA context);
-- withdrawal in the other order: the slot, then the mapping;
-- no seccomp change as long as this stays in the main process, as the
-  window's placement does; nothing for memory registered by its pages,
-  which needs only the memory table crosvm already sends.
+```sh
+V=NVGPU_VMM=.rig/bin/crosvm-compute
+env $V scripts/run-guest.sh --vmm crosvm stage1 cvc-s1
+env $V NVGPU_COMPUTE=1 scripts/run-guest.sh --vmm crosvm render cvc-render   # cuda-smoke too
+NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none env $V NVGPU_COMPUTE=1 \
+  scripts/run-guest.sh --vmm crosvm secneg cvc-sec
+env $V scripts/run-guest.sh --vmm crosvm render cvc-render-nocompute       # graphics only, as before
+```
+
+and a CUDA workload of more than one context (the render probe's
+`cuda-smoke` is one): each context maps a pool, and the pools of two
+processes must be placed and withdrawn without leaving anything behind.
+What to look at besides the probes' results:
+
+- the launcher's summary says `nvgpu frontend jailed`, and
+  `/proc/<vu-nvgpu pid>/status` shows `Seccomp: 2` and `NoNewPrivs: 1`;
+- crosvm's log (the console log) has `nvgpu: reserved the UVM pool band`
+  and `nvgpu: nvidia-uvm is character major N`, then an `nvgpu uvm: ...
+  at aperture offset` line per pool and a `dropped` line per withdrawal, and
+  no `refused a memory request` line in a run that passes;
+- the guest's dmesg names the UVM aperture (`UVM aperture at ...,
+  1073741824 bytes`) and does not warn that it is not write-back;
+- no `SIGSYS`/`seccomp` kill of the `vu-nvgpu` process (the host's
+  `dmesg`/audit log has one line per kill, if any);
+- without `NVGPU_COMPUTE=1` the BAR is 1 GiB and there is one
+  shared-memory capability, as before.
 
 ## Group B: takes one monitor, desktop keeps running
 
