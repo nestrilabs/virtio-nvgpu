@@ -110,7 +110,6 @@ const WARN_CONTROL_OS_EVENT: u32 = 2;
 const WARN_ALLOC_EVENT_FD: u32 = 3;
 const WARN_EVENT_BUFFER: u32 = 4;
 const WARN_SURFACE_FD: u32 = 5;
-const WARN_OSDESC_ABANDONED: u32 = 6;
 const WARN_I2_CMD: u32 = 16;
 const WARN_I2_MALFORMED: u32 = 17;
 const WARN_I2_UNNAMED: u32 = 18;
@@ -149,6 +148,17 @@ extern "C" {
     fn nvgpu_rs_page_phys(pages: *mut c_void, i: u64) -> u64;
     fn nvgpu_rs_osdesc_keep(nfd: *mut c_void, id: u64, pages: *mut c_void, npages: u64, write: bool);
     fn nvgpu_rs_osdesc_unpin(pages: *mut c_void, npages: u64, write: bool);
+    fn nvgpu_rs_osdesc_send(
+        nfd: *mut c_void,
+        req: *const c_void,
+        req_len: usize,
+        resp: *mut c_void,
+        resp_len: usize,
+        used: *mut u32,
+        pages: *mut c_void,
+        npages: u64,
+        write: bool,
+    ) -> c_int;
 
     fn nvgpu_rs_i2_fd_in(
         call: *mut c_void,
@@ -451,7 +461,6 @@ impl rm::Env for RmEnv {
             rm::Warn::AllocEventFd { class, fd } => (WARN_ALLOC_EVENT_FD, u64::from(class), fd as u64),
             rm::Warn::EventBufferOsEvent { val } => (WARN_EVENT_BUFFER, 0, val),
             rm::Warn::SurfaceFd { fd } => (WARN_SURFACE_FD, 0, fd as u64),
-            rm::Warn::OsDescAbandoned { pages } => (WARN_OSDESC_ABANDONED, 0, pages),
         };
         // SAFETY: logs; reads the live file's device.
         unsafe { nvgpu_rs_warn(self.nfd, code, a, b) };
@@ -515,6 +524,33 @@ impl osdesc::Env for RmEnv {
 
     fn unpin(&mut self, pin: KPin) {
         drop(pin);
+    }
+
+    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], mut pin: KPin) -> (Result<u32, Errno>, Option<KPin>) {
+        let mut used = 0u32;
+        // SAFETY: as for send_recv; `pages` is the array
+        // nvgpu_rs_osdesc_pin() filled with `npages` pinned pages, which
+        // the call takes over only when it says so (-EINTR, -ETIMEDOUT).
+        let r = unsafe {
+            nvgpu_rs_osdesc_send(
+                self.nfd,
+                req.as_ptr().cast(),
+                req.len(),
+                resp.as_mut_ptr().cast(),
+                resp.len(),
+                &mut used,
+                pin.pages,
+                pin.npages,
+                pin.write,
+            )
+        };
+        if i2::abandons(r) {
+            // The transport's now: `pin` no longer names them, so its drop
+            // does nothing.
+            pin.pages = ptr::null_mut();
+            return (Err(r), None);
+        }
+        (if r < 0 { Err(r) } else { Ok(used) }, Some(pin))
     }
 }
 

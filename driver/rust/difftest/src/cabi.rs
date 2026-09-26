@@ -233,6 +233,11 @@ pub extern "C" fn dt_unpin(n: u64, write: bool) {
     with(|w| w.events.push(Ev::Unpin { n, write }));
 }
 
+#[no_mangle]
+pub extern "C" fn dt_hand_over(n: u64, write: bool) {
+    with(|w| w.events.push(Ev::HandOver { n, write }));
+}
+
 /// # Safety
 /// `fmt` is a C string.
 #[no_mangle]

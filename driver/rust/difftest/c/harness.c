@@ -30,6 +30,7 @@ void dt_reap(void);
 int dt_pin(u64 start, u64 npages, bool write, u64 *phys);
 void dt_keep(u64 id, u64 npages, bool write);
 void dt_unpin(u64 npages, bool write);
+void dt_hand_over(u64 npages, bool write);
 void dt_warn(const char *fmt);
 bool dt_compat(void);
 int dt_xfer(const void *req, size_t req_len, void *resp, size_t resp_len,
@@ -271,6 +272,19 @@ void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write) {
   dt_unpin(n, write);
   harness_kfree(pages);
+}
+
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write) {
+  int r = nvgpu_send_recv_used(dev, req, req_len, resp, resp_len, used);
+
+  /* Abandoned: the pins are the transport's (nvgpu_osdesc.c). */
+  if (r == -ETIMEDOUT || r == -EINTR) {
+    dt_hand_over(npages, write);
+    harness_kfree(pages);
+  }
+  return r;
 }
 
 /* ── devices and calls, for the test ── */

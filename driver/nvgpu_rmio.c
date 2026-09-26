@@ -1861,17 +1861,12 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   h->flags = cpu_to_le32(c->write ? NVGPU_OSDESC_F_WRITE : 0);
   nvgpu_osdesc_runs(pages, npages, (struct nvgpu_osdesc_run *)(h + 1));
 
-  ret = nvgpu_send_recv_used(dev, req, (int)req_len, resp, (int)resp_len,
-                             &used);
+  ret = nvgpu_osdesc_send(dev, req, (int)req_len, resp, (int)resp_len, &used,
+                          pages, npages, c->write);
   kvfree(req);
   req = NULL;
   if (ret == -EINTR || ret == -ETIMEDOUT) {
-    /* It may reach RM yet, and nothing will say so: pinned until remove(). */
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: an OS-descriptor registration was "
-                         "abandoned in flight; its %lu pages stay pinned\n",
-                         npages);
-    nvgpu_osdesc_keep(dev, 0, pages, npages, c->write);
+    /* The pins went with the request (nvgpu_osdesc_send()). */
     kfree(resp);
     return ret;
   }

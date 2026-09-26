@@ -235,6 +235,9 @@ struct nvgpu_device {
    */
   struct mutex osdesc_lock;
   struct list_head osdescs;
+  /* Late replies to abandoned registrations read before their waiter had
+   * handed the pins over (struct nvgpu_osdesc_late). */
+  struct list_head osdesc_late;
   unsigned int osdesc_count;
   u64 osdesc_ack;
 #define NVGPU_OSDESC_EARLY 64
@@ -759,6 +762,15 @@ int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
 int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
                             void *resp, int resp_len, u32 *used_len,
                             void (*release)(void *arg), void *arg);
+/*
+ * nvgpu_send_recv_used(), saying whether the request reached the ring
+ * (`*sent`) and under which request id (`*req_id`, 0 if it never got one):
+ * what a caller that hands something over on -EINTR/-ETIMEDOUT needs to know
+ * to tell a request the host may still run from one it never will.
+ */
+int nvgpu_send_recv_sent(struct nvgpu_device *dev, void *req, int req_len,
+                         void *resp, int resp_len, u32 *used_len, bool *sent,
+                         u32 *req_id);
 /* Does a response of `used` bytes contain all of [off, off + len)? */
 static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
   return off <= used && len <= used - off;
@@ -799,10 +811,24 @@ bool nvgpu_osdesc_ok(const struct nvgpu_device *dev);
  * `pages` (FOLL_LONGTERM, FOLL_WRITE for `write`), as RM would; 0 or -errno. */
 int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
                      struct page **pages);
-/* Keep them pinned under registration `id` until a reap names it (0: until
- * remove()); the list and the array are then nvgpu_osdesc.c's. */
+/* Keep them pinned under registration `id` (non-zero) until a reap names
+ * it; the list and the array are then nvgpu_osdesc.c's. */
 void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
                        unsigned long npages, bool write);
+/*
+ * Send a registration whose pages are pinned: nvgpu_send_recv_used(), except
+ * that on -EINTR and -ETIMEDOUT the pins are no longer the caller's. A
+ * request that never reached the ring had them unpinned at once; one that
+ * did keeps them under its request id until its late reply says what RM
+ * registered (nvgpu_osdesc_late()), or remove(). On any other return they
+ * are still the caller's.
+ */
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write);
+/* The transport's reaper: request `req_id`, a registration its caller gave
+ * up on, came back naming registration `id` (0: none was made). */
+void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id);
 /* Unpin them (dirtied for `write`) and free the array. */
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 

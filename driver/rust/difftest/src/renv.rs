@@ -94,9 +94,6 @@ pub fn rm_warn_fmt(w: rm::Warn) -> &'static str {
             "virtio-gpu-nv: NV_EVENT_BUFFER names OS event 0x%llx, which is not one of our devices\n"
         }
         rm::Warn::SurfaceFd { .. } => "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one of ours\n",
-        rm::Warn::OsDescAbandoned { .. } => {
-            "virtio-gpu-nv: an OS-descriptor registration was abandoned in flight; its %lu pages stay pinned\n"
-        }
     }
 }
 
@@ -211,6 +208,17 @@ impl osdesc::Env for RmEnv<'_> {
 
     fn unpin(&mut self, pin: RPin) {
         self.w.events.push(Ev::Unpin { n: pin.pas.len() as u64, write: pin.write });
+    }
+
+    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], pin: RPin) -> (Result<u32, Errno>, Option<RPin>) {
+        let r = rm::Env::send_recv(self, req, resp);
+        match r {
+            Err(e) if i2::abandons(e) => {
+                self.w.events.push(Ev::HandOver { n: pin.pas.len() as u64, write: pin.write });
+                (r, None)
+            }
+            _ => (r, Some(pin)),
+        }
     }
 }
 

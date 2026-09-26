@@ -67,6 +67,9 @@ int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
 void nvgpu_osdesc_keep(struct nvgpu_device *dev, u64 id, struct page **pages,
                        unsigned long npages, bool write);
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
+int nvgpu_osdesc_send(struct nvgpu_device *dev, void *req, int req_len,
+                      void *resp, int resp_len, u32 *used,
+                      struct page **pages, unsigned long npages, bool write);
 
 struct nvgpu_tbuf;
 struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp);

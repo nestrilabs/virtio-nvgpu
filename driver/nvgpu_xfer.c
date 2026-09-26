@@ -478,7 +478,7 @@ void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
  */
 static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                         struct nvgpu_tbuf *resp, u32 flags, u32 *used_len,
-                        struct nvgpu_times *tm, bool *sent) {
+                        struct nvgpu_times *tm, bool *sent, u32 *req_id) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct scatterlist *sgs[2];
   struct nvgpu_msg_hdr hdr;
@@ -492,6 +492,8 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
 
   if (sent)
     *sent = false;
+  if (req_id)
+    *req_id = 0;
   if (used_len)
     *used_len = 0;
   if (!xf)
@@ -530,6 +532,8 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   do {
     id = (u32)atomic_inc_return(&xf->next_id);
   } while (!id);
+  if (req_id)
+    *req_id = id;
   nvgpu_tbuf_read(req, 0, &hdr, sizeof(hdr));
   hdr.req_id = cpu_to_le32(id);
   nvgpu_tbuf_write(req, 0, &hdr, sizeof(hdr));
@@ -678,7 +682,7 @@ unsent:
 
 int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                struct nvgpu_tbuf *resp, u32 flags, u32 *used_len) {
-  return __nvgpu_xfer(dev, req, resp, flags, used_len, NULL, NULL);
+  return __nvgpu_xfer(dev, req, resp, flags, used_len, NULL, NULL, NULL);
 }
 
 /*
@@ -688,8 +692,8 @@ int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
 static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
                               size_t req_len, void *resp, size_t resp_len,
                               u32 flags, u32 *used_len, struct nvgpu_times *tm,
-                              bool *sent, void (*release)(void *arg),
-                              void *arg) {
+                              bool *sent, u32 *req_id,
+                              void (*release)(void *arg), void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
   struct nvgpu_tbuf *rq, *rs;
   size_t posted = resp_len;
@@ -698,6 +702,8 @@ static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
 
   if (sent)
     *sent = false;
+  if (req_id)
+    *req_id = 0;
   if (used_len)
     *used_len = 0;
   if (!xf) {
@@ -722,7 +728,7 @@ static int nvgpu_call_holding(struct nvgpu_device *dev, const void *req,
   }
   nvgpu_tbuf_write(rq, 0, req, req_len);
 
-  ret = __nvgpu_xfer(dev, rq, rs, flags, &used, tm, sent);
+  ret = __nvgpu_xfer(dev, rq, rs, flags, &used, tm, sent, req_id);
   if (ret == -ETIMEDOUT || ret == -EINTR)
     return ret; /* the transport owns rq and rs now */
   if (!ret) {
@@ -741,7 +747,7 @@ static int nvgpu_call(struct nvgpu_device *dev, const void *req,
                       size_t req_len, void *resp, size_t resp_len, u32 flags,
                       u32 *used_len, struct nvgpu_times *tm, bool *sent) {
   return nvgpu_call_holding(dev, req, req_len, resp, resp_len, flags,
-                            used_len, tm, sent, NULL, NULL);
+                            used_len, tm, sent, NULL, NULL, NULL);
 }
 
 int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
@@ -760,7 +766,19 @@ int nvgpu_send_recv_holding(struct nvgpu_device *dev, void *req, int req_len,
     return -EINVAL;
   }
   return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
-                            NULL, NULL, release, arg);
+                            NULL, NULL, NULL, release, arg);
+}
+
+int nvgpu_send_recv_sent(struct nvgpu_device *dev, void *req, int req_len,
+                         void *resp, int resp_len, u32 *used_len, bool *sent,
+                         u32 *req_id) {
+  if (req_len <= 0 || resp_len <= 0) {
+    *sent = false;
+    *req_id = 0;
+    return -EINVAL;
+  }
+  return nvgpu_call_holding(dev, req, req_len, resp, resp_len, 0, used_len,
+                            NULL, sent, req_id, NULL, NULL);
 }
 
 int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
@@ -1085,6 +1103,39 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
 }
 
 /*
+ * An OS-descriptor registration (NVGPU_DEEP_PAGE_LIST): which registration
+ * the late reply names, 0 for none -- refused, failed, or a backend that
+ * names none -- so the pins its waiter handed over are kept under it or let
+ * go (nvgpu_osdesc_late()). The same reading as nvgpu_osdesc_register()'s.
+ */
+static unsigned int nvgpu_reap_osdesc(struct nvgpu_device *dev,
+                                      struct nvgpu_req *r, u32 used,
+                                      const struct nvgpu_msg_hdr *ah) {
+  struct nvgpu_ioctl_req q;
+  struct nvgpu_ioctl_resp a;
+  u32 data_len, nested_len;
+  __le64 id = 0;
+
+  if (nvgpu_tbuf_read(r->req, 0, &q, sizeof(q)) ||
+      le32_to_cpu(q.deep_ptr_offset) != NVGPU_DEEP_PAGE_LIST)
+    return 0;
+  if ((s32)le32_to_cpu(ah->status) >= 0 &&
+      nvgpu_resp_has(used, 0, sizeof(a)) &&
+      !nvgpu_tbuf_read(r->resp, 0, &a, sizeof(a))) {
+    data_len = le32_to_cpu(a.data_len);
+    nested_len = data_len ? le32_to_cpu(a.nested_len) : 0;
+    if (data_len && le32_to_cpu(a.deep_len) == sizeof(id) &&
+        nvgpu_resp_has(used, sizeof(a) + (size_t)data_len + nested_len,
+                       sizeof(id)) &&
+        nvgpu_tbuf_read(r->resp, sizeof(a) + (size_t)data_len + nested_len,
+                        &id, sizeof(id)))
+      id = 0;
+  }
+  nvgpu_osdesc_late(dev, le32_to_cpu(q.hdr.req_id), le64_to_cpu(id));
+  return 1;
+}
+
+/*
  * A reply whose caller gave up. Whatever it created on the backend has no
  * owner in the guest and would stay open until the session resets -- for a
  * CREATE_LEASE, that is a host lessee holding a CRTC nobody can lease again.
@@ -1100,11 +1151,18 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
       nvgpu_tbuf_read(r->resp, 0, &ah, sizeof(ah)) ||
       nvgpu_tbuf_read(r->req, 0, &qh, sizeof(qh)))
     return;
+  /*
+   * A registration of the caller's pages, answered after its waiter left: the
+   * pins it kept for it are this reply's to settle (nvgpu_osdesc.c). Before
+   * the status, which says whether RM ever saw it.
+   */
+  if (le32_to_cpu(qh.msg_type) == NVGPU_MSG_IOCTL)
+    closed += nvgpu_reap_osdesc(dev, r, used, &ah);
   if ((s32)le32_to_cpu(ah.status) < 0) {
     /* Refused before it ran -- the backend sets a status on nothing else,
      * bar a call whose session a reset already emptied: nothing was made,
      * but an IOCTL2's consumed handles are still open there. */
-    closed = nvgpu_release_consumed(dev, r->req);
+    closed += nvgpu_release_consumed(dev, r->req);
     goto out;
   }
 

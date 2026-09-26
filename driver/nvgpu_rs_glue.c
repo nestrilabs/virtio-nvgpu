@@ -197,12 +197,6 @@ void nvgpu_rs_warn(struct nvgpu_fd *nfd, u32 code, u64 a, u64 b) {
         "of ours\n",
         (s32)b);
     break;
-  case NVGPU_RS_WARN_OSDESC_ABANDONED:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: an OS-descriptor registration was "
-                         "abandoned in flight; its %llu pages stay pinned\n",
-                         b);
-    break;
   }
 }
 
@@ -232,6 +226,15 @@ void nvgpu_rs_osdesc_keep(struct nvgpu_fd *nfd, u64 id, void *pages,
 
 void nvgpu_rs_osdesc_unpin(void *pages, u64 npages, bool write) {
   nvgpu_osdesc_unpin(pages, npages, write);
+}
+
+int nvgpu_rs_osdesc_send(struct nvgpu_fd *nfd, const void *req,
+                         size_t req_len, void *resp, size_t resp_len, u32 *used,
+                         void *pages, u64 npages, bool write) {
+  if (req_len > INT_MAX || resp_len > INT_MAX)
+    return -E2BIG;
+  return nvgpu_osdesc_send(nfd->dev, (void *)req, (int)req_len, resp,
+                           (int)resp_len, used, pages, npages, write);
 }
 
 /* ───────── IOCTL2 ───────── */

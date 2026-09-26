@@ -114,7 +114,6 @@ static_assert(offsetof(struct nvgpu_sioctl, field) == 28, "sioctl.field");
 #define NVGPU_RS_WARN_ALLOC_EVENT_FD 3   /* class, descriptor */
 #define NVGPU_RS_WARN_EVENT_BUFFER 4     /* -, value */
 #define NVGPU_RS_WARN_SURFACE_FD 5       /* -, descriptor */
-#define NVGPU_RS_WARN_OSDESC_ABANDONED 6 /* -, pages */
 #define NVGPU_RS_WARN_I2_CMD 16          /* caller's cmd, entry's cmd, size */
 #define NVGPU_RS_WARN_I2_MALFORMED 17    /* used, fds, GEM handles */
 #define NVGPU_RS_WARN_I2_UNNAMED 18
@@ -176,6 +175,10 @@ u64 nvgpu_rs_page_phys(void *pages, u64 i);
 void nvgpu_rs_osdesc_keep(struct nvgpu_fd *nfd, u64 id, void *pages,
                           u64 npages, bool write);
 void nvgpu_rs_osdesc_unpin(void *pages, u64 npages, bool write);
+/* nvgpu_osdesc_send(): on -EINTR/-ETIMEDOUT `pages` are the transport's. */
+int nvgpu_rs_osdesc_send(struct nvgpu_fd *nfd, const void *req,
+                         size_t req_len, void *resp, size_t resp_len, u32 *used,
+                         void *pages, u64 npages, bool write);
 
 /* IOCTL2: the hooks, with call->st and call->ret as C sees them. */
 int nvgpu_rs_i2_fd_in(struct nvgpu_i2_call *call, void *st, s32 *ret, u32 buf,

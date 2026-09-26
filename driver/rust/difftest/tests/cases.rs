@@ -346,6 +346,20 @@ fn memory_the_caller_has_is_registered_by_its_pages() {
     assert!(sends(&o).is_empty());
     assert_eq!(le32(mem(&o, ARG), 40), 0x1e);
 
+    // A registration whose caller gave up after it went out: the pins go
+    // with the request, for its late reply to settle (nvgpu_osdesc_late()),
+    // neither kept under no id until remove() nor unpinned under RM.
+    for err in [-4, -110] {
+        let mut w = world();
+        w.fail = vec![err];
+        let call = alloc_memory(va, 0x2fff, &mut w);
+        let o = run(d.clone(), w, call);
+        assert_eq!(o.ret, i64::from(err));
+        let ev = &o.world.events;
+        assert!(matches!(ev.last(), Some(Ev::HandOver { n: 4, write: true })), "{ev:?}");
+        assert!(!ev.iter().any(|e| matches!(e, Ev::Keep { .. } | Ev::Unpin { .. })));
+    }
+
     // A range within a page of 2^64 is not zero pages: it is not ours at
     // all, and goes the usual way (the C registered it with no pages).
     let mut w = world();
