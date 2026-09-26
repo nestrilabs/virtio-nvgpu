@@ -21,7 +21,7 @@
 //! the queue thread in CLOSE, the event pump when it stops watching (it holds
 //! a duplicate of every watched file), an executor finishing a call under
 //! the backend mutex. Each of those waiting on a modeset stalls the whole VM
-//! -- every RM call, every event -- which is what DESIGN.md §2.5 says the
+//! -- every RM call, every event -- which is what ARCHITECTURE.md §10 says the
 //! queue thread never does. So those drops come here instead: one thread,
 //! `nvgpu-closer`, that does nothing but drop what it is handed, in order.
 //! Anything whose drop closes a descriptor can be sent (an `OwnedFd`, a

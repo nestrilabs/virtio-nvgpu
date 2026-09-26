@@ -92,7 +92,7 @@ powers off. A watchdog powers off a probe that overruns its budget.
 | `export.sh` | 7, guest side: the compositor + `nvgpu-wl-guest --export`; PASS when a host client's window appears | `--kms-card --wayland-export PATH` |
 | `secneg.sh` | security negatives: `sec-negative.sh`, plus the KMS tests on the card or on a lease | any; KMS tests need a card or lease |
 | `shell.sh` | an interactive shell on `hvc0` | any |
-| `nodev.sh` | none: the image with **no** virtio-nvgpu device (QEMU/TCG, `.rig/tcg-smoke.sh`). insmod/rmmod, the NVIDIA userspace failing cleanly (`nvidia-smi`, `vulkaninfo` finding the ICD, `cuda-smoke`), `nvgpu-wl-guest`, the module's probe-failure path on a virtio-rng decoy (`nvgpu_decoy=0` skips it). FAILs on purpose when a device is there | QEMU, no backend |
+| `nodev.sh` | none: the image with **no** virtio-nvgpu device (QEMU/TCG, the rig's own smoke script). insmod/rmmod, the NVIDIA userspace failing cleanly (`nvidia-smi`, `vulkaninfo` finding the ICD, `cuda-smoke`), `nvgpu-wl-guest`, the module's probe-failure path on a virtio-rng decoy (`nvgpu_decoy=0` skips it). FAILs on purpose when a device is there | QEMU, no backend |
 
 Arguments are kernel command-line tokens (`nvgpu_<key>=<value>`; with
 `run-guest.sh`, put them in `NVGPU_CMDLINE_EXTRA`):

@@ -1488,7 +1488,8 @@ def extract(version, src, source_info):
 
 
 # --------------------------------------------------------------------------
-# 610.57.04 against the research report (scratchpad research/nvkms.md §5).
+# 610.57.04 against an independent hand measurement taken while the display work
+# was designed (probes against the 610.57.04 headers; the notes are not shipped).
 #
 # These numbers were measured independently (a hand-written offsetof program
 # against the same headers) before this extractor existed. They are checked so
@@ -1570,7 +1571,7 @@ RESEARCH_610_OFFSETS = [
 ]
 
 
-# nvidia-drm, from research/nvdrm.md §2 (also measured with a hand-written
+# nvidia-drm, from the same hand measurement (also measured with a hand-written
 # probe): name -> (absolute nr, cmd, size, {field: offset}).
 RESEARCH_610_DRM = {
     "GET_CRTC_CRC32": (0x40, 0xc0086440, 8, {}),
@@ -1708,8 +1709,8 @@ def check_research_610(doc):
                 problems.append(f"nvidia-drm {name} {path}: extracted {got.get(path)}, "
                                 f"research {off}")
     if problems:
-        raise ExtractError("610.57.04 disagrees with research/nvkms.md §5 or "
-                           "research/nvdrm.md §2:\n  " + "\n  ".join(problems))
+        raise ExtractError("610.57.04 disagrees with the independent hand "
+                           "measurement of its NVKMS and nvidia-drm layouts:\n  " + "\n  ".join(problems))
 
 
 # --------------------------------------------------------------------------

@@ -25,8 +25,8 @@ virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
 # The Rust when CONFIG_VIRTIO_GPU_NV_RUST=y (Kconfig), or NVGPU_RUST=1 on the
 # command line; NVGPU_RUST=0 insists on the C. Both export the same functions
 # (nvgpu.h), so nothing else changes, and `modinfo -F parsers` says which a
-# module has. The C stays -- it is the difftest's oracle, and what a kernel
-# without Rust builds -- until the Rust has passed the hardware regression.
+# module has. The Rust build has passed the hardware regression; the C stays,
+# as the difftest's oracle and what a kernel without Rust builds.
 ifeq ($(CONFIG_VIRTIO_GPU_NV_RUST),y)
 NVGPU_RUST ?= 1
 endif

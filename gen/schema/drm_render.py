@@ -4,7 +4,7 @@
 Layouts from Linux 7.2.7 include/uapi/drm/drm.h; handlers in
 drivers/gpu/drm/drm_syncobj.c. All of them are fence schemas: the FENCES
 workstream's policy hook decides whether and how each may run (waits become
-timeout-0 polls there, DESIGN §6), and until it does the backend refuses them.
+timeout-0 polls there, ARCHITECTURE.md §12), and until it does the backend refuses them.
 Syncobj handles are per host file and cross as they are; only the descriptor
 fields are translated.
 """

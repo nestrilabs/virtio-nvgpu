@@ -76,7 +76,7 @@ FD_KINDS = {
     'dmabuf': K_DMABUF,
 }
 
-# Event types a guest may declare interest in (DESIGN §5): what a display
+# Event types a guest may declare interest in (ARCHITECTURE.md §13): what a display
 # client needs, and nothing a flood of which it could not drain.
 EVENTS_ALLOWED = [
     'NVKMS_EVENT_TYPE_DPY_CHANGED',

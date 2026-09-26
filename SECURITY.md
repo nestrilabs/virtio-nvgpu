@@ -1890,7 +1890,7 @@ concurrent isolation branch is rewriting.
 ### Backend isolation (branch `fix-backend`)
 
 A review of the backend for cross-VM and app-to-app reach and for denial of
-service (`.rig/notes/review-2026-09-26/backend.md`, numbered as there). The
+service (the review's own notes, not shipped; numbered as there). The
 items below are the ones branch `fix-backend` took; the rest -- 8, 15-18 and
 the logging and cleanup items -- are the hardening branch's. Each was checked
 against the code and, where RM's behaviour decides it, NVIDIA's 610.57.04

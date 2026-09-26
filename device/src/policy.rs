@@ -115,7 +115,7 @@ impl BackendHooks {
     //
     // Syncobj and nvidia-drm fence calls (policy::FENCE) and ATOMIC's fence
     // properties. Fence objects are the host's and the guest holds proxies
-    // (DESIGN §6), so creating, exporting, importing and signalling them is
+    // (ARCHITECTURE.md §12), so creating, exporting, importing and signalling them is
     // forwarded as it is. A wait is not: forwarded as it stands it would park
     // a host thread for as long as the guest asked, so every wait becomes a
     // poll and the guest sleeps on a shared eventfd registration instead

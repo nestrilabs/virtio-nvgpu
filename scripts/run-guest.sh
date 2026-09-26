@@ -8,7 +8,7 @@
 #               crosvm is unprivileged (rig layout), and takes --allow-compute
 #               only if it has the UVM aperture (the virtio-nvgpu-compute
 #               branch), see "crosvm" below
-#   probe-name  a script under /opt/nvgpu in the guest rootfs, e.g. probeQ.sh;
+#   probe-name  a script under /opt/nvgpu in the guest rootfs, e.g. stage1.sh;
 #               in the rig layout a bare name gets .sh added (stage1 ->
 #               /opt/nvgpu/stage1.sh)
 #   tag         names the log and config, so runs do not overwrite each other

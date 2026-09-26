@@ -8,8 +8,8 @@
  * to act on the guest's request: no host-kernel out-of-bounds read, no foreign
  * client dup'd, no VMM pointer followed, no other tenant's pixels scanned out.
  * The strong proof of each refusal is a backend unit test that asserts the host
- * ioctl was never issued (verification NVK_VERIFICATION.md §5.1, security
- * FINDINGS.md); this program is the end-to-end confirmation that the same
+ * ioctl was never issued (docs/review/NVK_VERIFICATION.md §5.1, and
+ * docs/review/FINDINGS.md); this program is the end-to-end confirmation that the same
  * refusal is wired all the way from a guest process. sec-negative.sh runs it
  * inside the guest and prints the guest dmesg tail after (the guest must
  * survive); the operator checks the host side -- host dmesg clean and the

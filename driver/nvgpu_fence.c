@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * virtio-gpu-nv: fences (DESIGN §6, R:fences Design A).
+ * virtio-gpu-nv: fences (ARCHITECTURE.md §12).
  *
  * Every fence object a guest process holds is the host's. A semaphore-surface
  * fence is signalled by the host's RM from a GPU interrupt, a KMS out-fence by
@@ -12,7 +12,7 @@
  *    dma_fence that signals (with the host's error, if any) when the host's
  *    does. It has to be a real sync_file: every guest-kernel consumer takes
  *    one through sync_file_get_fence(), and NVIDIA's userspace runs
- *    SYNC_IOC_MERGE and FILE_INFO on them (R:fences §2.1), which then need no
+ *    SYNC_IOC_MERGE and FILE_INFO on them, which then need no
  *    round trip at all;
  *  - a host syncobj handle is the same number in the guest: each guest DRM
  *    file stands for exactly one host render-node file, and syncobj handles
@@ -475,7 +475,7 @@ static int nvgpu_fence_unwrap_ex(struct nvgpu_device *dev, struct dma_fence *f,
 
   /*
    * NVIDIA's userspace merges its own render fences with SYNC_IOC_MERGE
-   * before handing one on (R:fences §2.1), so a dma_fence_array of our
+   * before handing one on, so a dma_fence_array of our
    * proxies is the common case, not a curiosity. Its unsignalled components,
    * if all ours, merge on the host into one fence the host consumer can
    * take; the array itself exists only here. However many there are: the
@@ -540,9 +540,8 @@ static int nvgpu_fence_unwrap_ex(struct nvgpu_device *dev, struct dma_fence *f,
   /*
    * A fence the host has no counterpart of: another guest driver's, sw_sync,
    * a guest-CPU fence. The host cannot wait on it, so the guest does, here,
-   * before the host is told there is nothing to wait for (R:fences §3.7,
-   * step 4). Interruptible and unbounded, like the native waits on such a
-   * fence; its error, if it has one, is not carried over. Native never
+   * before the host is told there is nothing to wait for. Interruptible
+   * and unbounded, like the native waits on such a fence; its error, if it has one, is not carried over. Native never
    * blocks here -- the host kernel takes a callback -- which is what 0x56
    * now does too; syncobj IMPORT_SYNC_FILE and a committing IN_FENCE_FD
    * still wait.

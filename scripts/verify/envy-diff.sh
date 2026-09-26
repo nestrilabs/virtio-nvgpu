@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Diff a bare-metal capture against a guest capture (NVK_VERIFICATION.md §5.4a/b).
+# Diff a bare-metal capture against a guest capture (docs/review/NVK_VERIFICATION.md §5.4a/b).
 # The two runs differ legitimately only in address-like values, so before diffing
 # we normalise those away:
 #   - keep only AFTER IOCTL lines (the state after each call);
@@ -81,7 +81,7 @@ else
     tail -n +3 "$tmp/seq.diff"
     echo "  --- $(grep -c '^[<>]' "$tmp/seq.diff") differing line(s) ---"
     echo "  Expected: handle values, PTR, FD, times. A class/control/status"
-    echo "  difference is a real divergence (NVK_VERIFICATION.md §5.4a)."
+    echo "  difference is a real divergence (docs/review/NVK_VERIFICATION.md §5.4a)."
 fi
 
 echo

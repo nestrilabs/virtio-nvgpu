@@ -8,7 +8,7 @@ those headers, so a transcription slip is a build failure rather than a
 pointer at the wrong offset.
 
 Every KMS entry runs on the file's serial executor: nearly all of them take
-modeset locks, and the queue thread must never wait on one (DESIGN §2.5).
+modeset locks, and the queue thread must never wait on one (ARCHITECTURE.md §10).
 
 Refused here by absence, on every class: GEM_CLOSE/FLINK/OPEN, PRIME_*,
 AUTH/GET_MAGIC (guest-local); MAP_DUMB and DESTROY_DUMB (answered from the

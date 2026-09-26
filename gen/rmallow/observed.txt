@@ -1,6 +1,6 @@
 # RM calls served on hardware: 106 runs of Vulkan, GL, EGL, CUDA, Firefox,
 # Chromium, mpv, gamescope and nvidia-smi (the backend's teardown tallies,
-# rm_classes and rm_controls, collected on the rig; .rig/notes/rm-observed.txt).
+# rm_classes and rm_controls, collected on the rig; the raw per-run lists are the rig's, not shipped).
 # Every one a release has and serves an unprivileged caller is allowed by
 # gen/rmallow_extract.py's policy (render fails otherwise). Hex, space-separated.
 # escapes: 22

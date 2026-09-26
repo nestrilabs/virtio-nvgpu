@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * virtio-gpu-nv: KMS on a guest DRM file (DESIGN §4).
+ * virtio-gpu-nv: KMS on a guest DRM file (ARCHITECTURE.md §11).
  *
  * Every guest DRM file stands in front of a host *render* file, which owns the
  * file's GEM objects and serves its render-node ioctls. Some files also have a

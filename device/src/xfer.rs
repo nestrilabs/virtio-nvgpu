@@ -600,7 +600,7 @@ impl Hooks for DefaultHooks {}
 
 /// What `Hooks::before` does unless overridden:
 /// - fence schemas are refused until FENCES decides how each may run (waits
-///   must not park a host thread, DESIGN §6);
+///   must not park a host thread, ARCHITECTURE.md §12);
 /// - GRANT_PERMISSIONS and REVOKE_PERMISSIONS only of type MODESET (2): a
 ///   SUB_OWNER grant blanks every head on the GPU and hands the whole device
 ///   to the grantee, and nvidia-drm never looks at the lease to scope it
@@ -1111,7 +1111,7 @@ struct Walk<'a> {
     slots: Vec<Slot>,
 }
 
-/// The largest response any session negotiates (DESIGN §2.1, with indirect
+/// The largest response any session negotiates (ARCHITECTURE.md §10, with indirect
 /// descriptors). IN bytes are bounded by the request that carries them; OUT-
 /// only buffers are allocated on the guest's word alone, so their total is
 /// bounded here, before the transport can compare `response_len()` with its

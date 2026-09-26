@@ -870,7 +870,7 @@ mod tests {
         let Kind::Ptr { max, .. } = t.fields(set_mode.fields)[0].kind else {
             unreachable!()
         };
-        assert_eq!(max, 186_784, "research/nvkms.md §5");
+        assert_eq!(max, 186_784, "the hand measurement of 610.57.04 (gen/nvkms_extract.py)");
     }
 
     #[test]

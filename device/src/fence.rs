@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Fences on the backend: what a guest's syncobj and semaphore-surface calls
 //! may do to a host thread, and the shared wait registrations that let the
-//! guest sleep on a syncobj point without one (DESIGN §6, R:fences §3.5).
+//! guest sleep on a syncobj point without one (ARCHITECTURE.md §12).
 //!
 //! Fence objects live on the host (Design A): a guest sync_file is a proxy for
 //! a host sync_file, a guest syncobj handle *is* the host handle in the file's

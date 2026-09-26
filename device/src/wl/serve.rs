@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The dispatcher's half of the Wayland channel: `OPEN(DEV_WAYLAND)`,
 //! `WL_SEND`, `WL_RECV` and the end of a channel, over the session's handle
-//! table (DESIGN §7).
+//! table (ARCHITECTURE.md §14).
 //!
 //! A channel is a backend handle of kind `Wayland`. What the table holds under
 //! it is not the compositor socket -- that belongs to the connection's reader
@@ -165,7 +165,7 @@ impl SendOps for TableSend<'_> {
     fn prime_export(&mut self, owner: u32, gem: u32) -> io::Result<OwnedFd> {
         match self.handles.get(owner) {
             // Only a render file: a guest GEM proxy lives nowhere else (a KMS
-            // file holds only an executor's temporaries, DESIGN §2.5), and a
+            // file holds only an executor's temporaries, ARCHITECTURE.md §10), and a
             // PRIME export on a lease or card file would be one of the host
             // compositor's framebuffer objects by number.
             Some((fd, HandleKind::DriRender(_))) => hostfd::prime_export(fd.as_raw_fd(), gem),

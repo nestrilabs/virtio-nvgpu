@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Capture one side of the bare-metal-vs-guest differential (NVK_VERIFICATION.md
+# Capture one side of the bare-metal-vs-guest differential (docs/review/NVK_VERIFICATION.md
 # §5.4): run a workload under envyhooks, keeping the RM ioctl trace and the
 # pushbuffer dumps. Run it once on bare metal and once in the guest, with the
 # SAME driver version and the SAME binary, then compare with envy-diff.sh.

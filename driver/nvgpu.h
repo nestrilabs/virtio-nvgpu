@@ -535,7 +535,7 @@ struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
 /* ───────── nvgpu_kms.c ───────── */
 
 /*
- * The KMS side of a guest DRM file (DESIGN §4). A file has one if it is an
+ * The KMS side of a guest DRM file (ARCHITECTURE.md §11). A file has one if it is an
  * adopted host lease, or a primary-node file on a backend offering card nodes
  * (NVGPU_BCAP_KMS_CARD), whose host card file is then opened lazily. Called
  * from nvgpu_drm_open() once the render handle is open; consumes a pending
@@ -616,7 +616,7 @@ struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
 /* ───────── nvgpu_fence.c ───────── */
 
 /*
- * Fences live on the host (DESIGN §6): a guest sync_file this driver makes
+ * Fences live on the host (ARCHITECTURE.md §12): a guest sync_file this driver makes
  * wraps an nvgpu host fence, a proxy dma_fence for a host sync_file that
  * signals (with the host's error, if any) when the host's does.
  */

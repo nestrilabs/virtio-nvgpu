@@ -11,7 +11,7 @@ size.
 Refused by absence: 0x42 GEM_IMPORT_USERSPACE_MEMORY (pins pages at an
 address in the *caller's* mm, nvidia-drm-gem-user-memory.c:185 -- the backend's
 -- and makes a GEM object with pMemory NULL), 0x45/0x46 PRIME fence contexts
-(unused by 610 userspace, R:fences §1.2), 0x4a GEM_MAP_OFFSET, 0x4e
+(unused by 610 userspace), 0x4a GEM_MAP_OFFSET, 0x4e
 GEM_IDENTIFY_OBJECT and 0x58 GET_DRM_FILE_UNIQUE_ID (answered by the guest),
 0x59-0x5c (not registered).
 
