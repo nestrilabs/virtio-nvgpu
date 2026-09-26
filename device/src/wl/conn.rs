@@ -824,11 +824,15 @@ fn push_final(s: &Shared, st: &mut State, u: Unit) {
 
 /// End the connection on a protocol error: the guest is told why.
 fn fail(s: &Shared, st: &mut State, f: Fatal) {
+    // Guest text: quoted and escaped, and cut short (the engine made it
+    // printable already), and the logger meters this line like any other
+    // a guest can cause (ratelimit.rs).
+    let text = wlwire::engine::printable(&f.message, 256);
     match f.blame {
         Blame::Channel | Blame::Remote => {
-            log::warn!("wayland: guest protocol error, closing: {}", f.message)
+            log::warn!("wayland: guest protocol error, closing: {text:?}")
         }
-        Blame::Local => log::warn!("wayland: compositor protocol error, closing: {}", f.message),
+        Blame::Local => log::warn!("wayland: compositor protocol error, closing: {text:?}"),
     }
     st.engine.drop_channel_output();
     if st.engine.local_is_client() {

@@ -89,10 +89,24 @@ pub struct Totals {
     /// The most bytes one client has been seen not to have read (bounded
     /// by `LOCAL_OUT_MAX` and one received frame).
     pub peak_unread: u64,
+    /// The first [`MAX_ERRORS`] connections' fatal errors.
     pub errors: Vec<String>,
+    /// Every connection's.
+    pub error_count: u64,
 }
 
+/// Fatal errors kept in [`Totals::errors`]: every client can cause one, and
+/// the daemon runs as long as the guest does.
+pub const MAX_ERRORS: usize = 32;
+
 impl Totals {
+    fn error(&mut self, e: String) {
+        self.error_count += 1;
+        if self.errors.len() < MAX_ERRORS {
+            self.errors.push(e);
+        }
+    }
+
     fn add(&mut self, e: &Engine) {
         let s = &e.stats;
         self.msgs_to_host += s.msgs_to_channel;
@@ -135,6 +149,75 @@ const RECV_BYTES: usize = 256 * 1024;
 /// stuck client, and so does this: after [`STUCK_FOR`] over the line.
 const LOCAL_OUT_MAX: usize = 4 << 20;
 const STUCK_FOR: Duration = Duration::from_secs(30);
+
+/// Lines a client can cause (its protocol errors, its socket's): at most
+/// [`LOG_BURST`] each [`LOG_WINDOW`], a line the same as the one before is
+/// counted rather than repeated, and what is dropped is said once the window
+/// ends. Every guest process can connect, and the daemon's stderr is the
+/// guest journal.
+struct LogLimit {
+    window: Instant,
+    lines: u32,
+    dropped: u64,
+    last: String,
+    same: u64,
+}
+
+const LOG_BURST: u32 = 20;
+const LOG_WINDOW: Duration = Duration::from_secs(10);
+
+impl LogLimit {
+    fn new() -> Self {
+        Self {
+            window: Instant::now(),
+            lines: 0,
+            dropped: 0,
+            last: String::new(),
+            same: 0,
+        }
+    }
+
+    /// What to print for `line` at `now`.
+    fn lines(&mut self, line: String, now: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        if now.saturating_duration_since(self.window) >= LOG_WINDOW {
+            if self.dropped > 0 {
+                out.push(format!(
+                    "nvgpu-wl-guest: ({} lines dropped by the log limit)",
+                    self.dropped
+                ));
+            }
+            self.window = now;
+            self.lines = 0;
+            self.dropped = 0;
+        }
+        if line == self.last {
+            self.same += 1;
+            return out;
+        }
+        if self.same > 0 {
+            out.push(format!(
+                "nvgpu-wl-guest: (the line before, {} more times)",
+                self.same
+            ));
+            self.same = 0;
+        }
+        self.last.clone_from(&line);
+        if self.lines >= LOG_BURST {
+            self.dropped += 1;
+            return out;
+        }
+        self.lines += 1;
+        out.push(line);
+        out
+    }
+
+    fn say(&mut self, line: String) {
+        for l in self.lines(line, Instant::now()) {
+            eprintln!("{l}");
+        }
+    }
+}
 
 /// The process at the other end of a client socket (SO_PEERCRED), in the
 /// daemon's PID namespace; `None` when the kernel cannot say.
@@ -207,6 +290,7 @@ pub struct Daemon {
     hello_caps: u32,
     stop: Arc<AtomicBool>,
     totals: Arc<Mutex<Totals>>,
+    log: LogLimit,
 }
 
 fn epoll_ctl(ep: RawFd, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
@@ -273,6 +357,7 @@ impl Daemon {
             hello_caps: 0,
             stop: Arc::new(AtomicBool::new(false)),
             totals: Arc::new(Mutex::new(Totals::default())),
+            log: LogLimit::new(),
         };
         if d.info.max_frame < frame::MIN_FRAME {
             return Err(io::Error::other(format!(
@@ -555,7 +640,8 @@ impl Daemon {
                 } {
                     Ok(ch) => self.add_client(s, ch, Local::Client),
                     Err(e) => {
-                        eprintln!("nvgpu-wl-guest: cannot open a channel to the host: {e}");
+                        self.log
+                            .say(format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"));
                         let err = Fatal {
                             object: 1,
                             code: wlwire::engine::ERR_IMPLEMENTATION,
@@ -585,10 +671,10 @@ impl Daemon {
             };
             match UnixStream::connect(&target) {
                 Ok(s) => self.add_client(s, ch, Local::Server),
-                Err(e) => eprintln!(
+                Err(e) => self.log.say(format!(
                     "nvgpu-wl-guest: cannot reach the guest compositor at {}: {e}",
                     target.display()
-                ),
+                )),
             }
         }
     }
@@ -597,15 +683,16 @@ impl Daemon {
         let Some(c) = self.clients[slot].as_mut() else {
             return;
         };
+        // Peer text: printable already (the engine's), quoted here.
+        let text = wlwire::engine::printable(&f.message, 256);
         self.totals
             .lock()
             .unwrap()
-            .errors
-            .push(format!("{:?}: {}", f.blame, f.message));
-        eprintln!(
-            "nvgpu-wl-guest: closing a connection: {:?}: {}",
-            f.blame, f.message
-        );
+            .error(format!("{:?}: {text}", f.blame));
+        self.log.say(format!(
+            "nvgpu-wl-guest: closing a connection: {:?}: {text:?}",
+            f.blame
+        ));
         match (c.engine.local_is_client(), f.blame) {
             // Our client gets the error it earned, or the host's verdict.
             (true, _) => {
@@ -701,7 +788,8 @@ impl Daemon {
     fn write_local(&mut self, slot: usize) {
         let c = self.clients[slot].as_mut().unwrap();
         if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-            eprintln!("nvgpu-wl-guest: writing to a client: {e}");
+            self.log
+                .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
             c.closing = true;
         }
     }
@@ -736,7 +824,8 @@ impl Daemon {
                 Err(e) => {
                     // The host ended the connection; its reason, if any, is
                     // waiting in the channel.
-                    eprintln!("nvgpu-wl-guest: the host refused a frame: {e}");
+                    self.log
+                        .say(format!("nvgpu-wl-guest: the host refused a frame: {e}"));
                     c.tx.clear();
                     self.read_channel(slot);
                     if let Some(c) = self.clients[slot].as_mut() {
@@ -770,7 +859,7 @@ impl Daemon {
             let r = match c.chan.recv(max, card, render) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("nvgpu-wl-guest: channel: {e}");
+                    self.log.say(format!("nvgpu-wl-guest: channel: {e}"));
                     c.closing = true;
                     return;
                 }
@@ -785,7 +874,8 @@ impl Daemon {
                 }
                 let c = self.clients[slot].as_mut().unwrap();
                 if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-                    eprintln!("nvgpu-wl-guest: writing to a client: {e}");
+                    self.log
+                        .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
                     c.closing = true;
                 }
                 let unread = c.engine.local_out_len() as u64;
@@ -840,11 +930,11 @@ impl Daemon {
         if behind {
             let since = *c.stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= STUCK_FOR {
-                eprintln!(
+                self.log.say(format!(
                     "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
                     c.engine.local_out_len(),
                     STUCK_FOR.as_secs()
-                );
+                ));
                 self.close(slot);
                 return;
             }
@@ -1312,5 +1402,34 @@ mod tests {
             d.clients.iter().all(|c| c.is_none()),
             "the client holding {sent} descriptors is closed"
         );
+    }
+
+    /// A client's errors cost the guest journal a bounded number of lines,
+    /// and the daemon's totals a bounded list: the same line again is
+    /// counted, not repeated, and past the burst lines are dropped and said
+    /// to be. Before, every one was printed and kept.
+    #[test]
+    fn what_clients_cause_is_logged_and_kept_within_bounds() {
+        let mut l = LogLimit::new();
+        let t0 = Instant::now();
+        let mut printed = 0;
+        for _ in 0..1000 {
+            printed += l.lines("closing: same".into(), t0).len();
+        }
+        assert_eq!(printed, 1);
+        let mut printed = Vec::new();
+        for i in 0..1000 {
+            printed.extend(l.lines(format!("closing: {i}"), t0));
+        }
+        assert!(printed.len() <= LOG_BURST as usize + 1, "{}", printed.len());
+        assert!(printed[0].contains("999 more times"), "{printed:?}");
+        let later = l.lines("closing: after".into(), t0 + LOG_WINDOW);
+        assert!(later[0].contains("lines dropped"), "{later:?}");
+        assert_eq!(later.last().unwrap(), "closing: after");
+        let mut t = Totals::default();
+        for i in 0..1000 {
+            t.error(format!("{i}"));
+        }
+        assert_eq!((t.errors.len(), t.error_count), (MAX_ERRORS, 1000));
     }
 }

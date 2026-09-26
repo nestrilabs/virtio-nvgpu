@@ -109,8 +109,39 @@ pub enum Blame {
 pub struct Fatal {
     pub object: u32,
     pub code: u32,
+    /// Printable and at most [`MAX_FATAL_TEXT`] bytes, whatever a peer put
+    /// in it (`printable`).
     pub message: String,
     pub blame: Blame,
+}
+
+/// The longest error text the engine makes, or takes from the far side.
+pub const MAX_FATAL_TEXT: usize = 512;
+
+/// `s` as it may be shown to a person: control characters (a terminal's
+/// escape sequences, a newline starting a fake log line) and the invisible
+/// formatting ones (bidirectional overrides) escaped, and cut to `max`
+/// bytes. Error text carries what a peer sent -- an interface name it bound,
+/// the far side's ERROR record verbatim -- and ends up in logs, and in
+/// `wl_display.error` to a client that prints it.
+pub fn printable(s: &str, max: usize) -> String {
+    let mut o = String::with_capacity(s.len().min(max));
+    for c in s.chars() {
+        let hidden = c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        let before = o.len();
+        if hidden {
+            o.extend(c.escape_default());
+        } else {
+            o.push(c);
+        }
+        if o.len() > max {
+            o.truncate(before);
+            o.push_str("...");
+            break;
+        }
+    }
+    o
 }
 
 impl Fatal {
@@ -118,7 +149,7 @@ impl Fatal {
         Self {
             object,
             code,
-            message: message.into(),
+            message: printable(&message.into(), MAX_FATAL_TEXT),
             blame,
         }
     }

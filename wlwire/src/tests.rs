@@ -2599,3 +2599,37 @@ fn unfinished_blobs_are_charged_and_dropped_when_nothing_takes_them() {
     .unwrap();
     assert_eq!(vm.used().0, 0);
 }
+
+/// Error text a peer controls -- the far side's ERROR record, an interface
+/// name it bound -- is escaped and bounded before it reaches a log or a
+/// client's wl_display.error: a terminal escape, a newline starting a fake
+/// log line or a bidirectional override arrives as text. Before, the ERROR
+/// payload was taken verbatim.
+#[test]
+fn error_text_from_a_peer_arrives_printable_and_bounded() {
+    let mut p = Pair::new(Policy::default());
+    let evil = format!(
+        "\u{1b}]0;owned\u{7}\u{1b}[2J\nERROR: fake line\u{202e}{}",
+        "x".repeat(10_000)
+    );
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_ERROR, 1, 3, evil.as_bytes()),
+        descs: vec![],
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    let e = p.g.from_channel(&f, fds, &mut p.gp).unwrap_err();
+    assert_eq!(e.blame, Blame::Remote);
+    assert!(e.message.len() <= MAX_FATAL_TEXT + 3, "{}", e.message.len());
+    assert!(!e.message.chars().any(|c| c.is_control() || c == '\u{202e}'));
+    assert!(e.message.starts_with("\\u{1b}]0;owned\\u{7}"), "{}", e.message);
+    // An interface name the guest bound, in the host's error.
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6)]);
+    let bind = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+        .uint(1)
+        .generic_new_id("wl_compositor\n[fake] x", 1, 3)
+        .finish();
+    let e = raw_to_host(&mut p, bind, None).unwrap_err();
+    assert!(e.message.contains("wl_compositor\\n[fake] x"), "{}", e.message);
+    assert!(!e.message.chars().any(char::is_control));
+}
