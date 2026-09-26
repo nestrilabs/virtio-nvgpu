@@ -67,9 +67,6 @@ struct nvgpu_dri_dev {
   /* Index into nvgpu_device.cards of this device's host card node, or -1. */
   int card_index;
   struct nvgpu_device *dev;
-  /* sysfs drm tree under the PCI device — required by Vulkan ICD */
-  struct kobject *drm_kobj;      /* .../pci_addr/drm          */
-  struct kobject *drm_node_kobj; /* .../pci_addr/drm/<name>   */
 };
 
 /* A host card node (GET_SYS_FILES section 3, struct nvgpu_card_record). */

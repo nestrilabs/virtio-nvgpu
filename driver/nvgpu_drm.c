@@ -10,6 +10,7 @@
 
 #include <drm/drm.h>
 #include <linux/atomic.h>
+#include <linux/compat.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/fcntl.h>
@@ -1853,7 +1854,7 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
  *                                         on any other node.
  */
 static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
-                                       unsigned long arg) {
+                                       unsigned long arg, bool compat) {
   struct drm_file *file = filp->private_data;
   struct nvgpu_fd *nfd;
   unsigned int nr = _IOC_NR(cmd);
@@ -1901,13 +1902,21 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
      * boundary, and turns up much later as a client that stopped asking.
      */
     {
-      long ret = drm_ioctl(filp, cmd, arg);
+      long ret;
 
+#ifdef CONFIG_COMPAT
+      /* The core's 32-bit layouts (VERSION, GET_UNIQUE, ...) are the core's
+       * to translate, as for any DRM driver. */
+      if (compat)
+        ret = drm_compat_ioctl(filp, cmd, arg);
+      else
+#endif
+        ret = drm_ioctl(filp, cmd, arg);
       if (ret < 0)
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
-                             "locally with %ld\n",
-                             nr, ret);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: core DRM ioctl nr=0x%02x answered "
+                            "locally with %ld\n",
+                            nr, ret);
       return ret;
     }
   }
@@ -1930,10 +1939,36 @@ static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
 
   if (!file || !drm_dev_enter(file->minor->dev, &idx))
     return -ENODEV;
-  ret = __nvgpu_drm_unlocked_ioctl(filp, cmd, arg);
+  ret = __nvgpu_drm_unlocked_ioctl(filp, cmd, arg, false);
   drm_dev_exit(idx);
   return ret;
 }
+
+#ifdef CONFIG_COMPAT
+/*
+ * A 32-bit caller. nvidia-drm's own fops take compat_ioctl = drm_compat_ioctl
+ * (nvidia-drm-drv.c): the core translates its own ioctls whose layout
+ * differs in 32 bits, and hands everything else -- the driver range, whose
+ * structs carry pointers as u64 so no layout differs -- to the native
+ * handler as it is. So here: the core's ioctls that the core answers go
+ * through drm_compat_ioctl(); the ones forwarded (the driver range, KMS and
+ * syncobj calls, RM) go the native way with the pointer widened, the IOCTL2
+ * interpreter reading in_compat_syscall() where a layout does differ.
+ */
+static long nvgpu_drm_compat_ioctl(struct file *filp, unsigned int cmd,
+                                   unsigned long arg) {
+  struct drm_file *file = filp->private_data;
+  long ret;
+  int idx;
+
+  if (!file || !drm_dev_enter(file->minor->dev, &idx))
+    return -ENODEV;
+  ret = __nvgpu_drm_unlocked_ioctl(
+      filp, cmd, (unsigned long)compat_ptr((compat_uptr_t)arg), true);
+  drm_dev_exit(idx);
+  return ret;
+}
+#endif
 
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
@@ -1943,7 +1978,9 @@ static const struct file_operations nvgpu_drm_fops = {
     .open = drm_open,
     .release = nvgpu_drm_release,
     .unlocked_ioctl = nvgpu_drm_unlocked_ioctl,
-    .compat_ioctl = nvgpu_drm_unlocked_ioctl,
+#ifdef CONFIG_COMPAT
+    .compat_ioctl = nvgpu_drm_compat_ioctl,
+#endif
     .mmap = drm_gem_mmap,
     .poll = drm_poll,
     .read = drm_read,
@@ -1993,6 +2030,39 @@ static const struct drm_driver nvgpu_drm_driver = {
     .patchlevel = 0,
 };
 
+/*
+ * The fake PCI device a DRI record's GPU is: the root whose address is the
+ * config-space GPU slot with the record's minor. With several GPUs each node
+ * must hang off its own -- the ICD matches a node to an RM device through
+ * that parent -- where every one was hung off the first root. The first
+ * registered root is the last resort, as before, for a record that names no
+ * slot (a single-GPU backend that numbers it otherwise); NULL if none.
+ */
+static struct nvgpu_pci_root *nvgpu_dri_root(struct nvgpu_device *dev,
+                                             const struct nvgpu_dri_dev *dri) {
+  struct nvgpu_pci_root *first = NULL;
+  u32 nslots = min_t(u32, dev->num_gpus, ARRAY_SIZE(dev->gpu_slots));
+  int ri;
+  u32 gi;
+
+  for (ri = 0; ri < dev->num_pci_roots; ri++) {
+    struct nvgpu_pci_root *root = &dev->pci_roots[ri];
+
+    if (!root->registered || !root->pdev)
+      continue;
+    if (!first)
+      first = root;
+    for (gi = 0; gi < nslots; gi++) {
+      const struct virtio_gpu_nv_gpu_slot *s = &dev->gpu_slots[gi];
+
+      if (!strncmp(s->pci_addr, root->slot.pci_addr, sizeof(s->pci_addr)) &&
+          le32_to_cpu(s->minor) == dri->slot_index)
+        return root;
+    }
+  }
+  return first;
+}
+
 int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
 
@@ -2006,41 +2076,16 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
 
     /*
-     * Find the pci_dev that owns this DRI device so we can:
-     *   a) Use it as the parent of the device_create() call — this causes
-     *      the kernel to create /sys/dev/char/M:N/device → pci_dev, which
-     *      is what Vulkan/EGL reads when it traverses the sysfs char-dev tree.
-     *   b) Create drm/<name> kobjects under the PCI device, which gives
-     *      /sys/bus/pci/devices/<addr>/drm/<name> — required by the NVIDIA
-     *      Vulkan ICD when it enumerates display engines.
-     *
-     * We match by gpu_id (minor number) against the GPU slots in config space.
+     * The pci_dev this DRI device's GPU is, as its parent: the kernel then
+     * makes /sys/dev/char/M:N/device -> pci_dev and
+     * /sys/bus/pci/devices/<addr>/drm/<name>, which is what Vulkan/EGL walk.
      */
     struct device *pci_parent = &dev->vdev->dev; /* fallback */
-    struct kobject *pci_kobj = NULL;
+    struct nvgpu_pci_root *root = nvgpu_dri_root(dev, dri);
     struct drm_device *drm;
-    int gi;
 
-    for (gi = 0; gi < dev->num_pci_roots; gi++) {
-      struct nvgpu_pci_root *root = &dev->pci_roots[gi];
-
-      if (!root->registered || !root->pdev)
-        continue;
-
-      /* Match: the DRI device belongs to this GPU if the GPU's minor number
-       * (which equals the /dev/nvidia<minor> index) matches the gpu_id field
-       * set from the host.  gpu_id is the 32-bit RM client GPU identifier,
-       * but we stored minor there from the VMM side — see device.rs. */
-      {
-        u32 slot_minor = le32_to_cpu(dev->gpu_slots[gi].minor);
-        if (slot_minor != dri->slot_index && gi != 0)
-          continue; /* only fall through for GPU 0 as a last resort */
-      }
-
+    if (root)
       pci_parent = &root->pdev->dev;
-      pci_kobj = &root->pdev->dev.kobj;
-      break;
-    }
 
     /*
      * No sysfs is built by hand here any more.
