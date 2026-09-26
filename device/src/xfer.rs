@@ -140,8 +140,12 @@ pub struct KmsFileState {
 
 #[derive(Default)]
 struct KmsInner {
-    prop_names: HashMap<u32, [u8; 32]>,
+    /// Property id -> (name, flags), from GETPROPERTY.
+    prop_names: HashMap<u32, ([u8; 32], u32)>,
 }
+
+/// DRM_MODE_PROP_BLOB (drm_mode.h): the property's value is a blob id.
+const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 
 /// What the KMS files of one VM share: every framebuffer they made and
 /// have not removed, by id, with the file ([`KmsFileState::serial`]) that
@@ -180,6 +184,13 @@ struct VmKmsInner {
     /// Framebuffer id -> scanout calls between their check of it and the
     /// end of their ioctl.
     in_use: HashMap<u32, usize>,
+    /// Property blobs a file of this VM made (CREATEPROPBLOB) and has not
+    /// destroyed, with the file.
+    blobs: HashMap<u32, u64>,
+    /// The blob each blob property of an object a file of this VM can see
+    /// held when the host last said (OBJ_GETPROPERTIES, GETCONNECTOR): (file,
+    /// object, property) -> blob.
+    seen_blobs: HashMap<(u64, u32, u32), u32>,
     /// Host files whose framebuffers a call in flight still names, with
     /// those ids: closed once none is in use.
     parked: Vec<(Vec<u32>, Box<dyn Send>)>,
@@ -244,6 +255,19 @@ impl VmKms {
         v.owner.clear();
         v.retired.clear();
         v.probed.clear();
+        v.blobs.clear();
+        v.seen_blobs.clear();
+    }
+
+    /// Whether GETPROPBLOB may read blob `id`: one a file of this VM made,
+    /// or the value of a blob property of an object a file of this VM can
+    /// see, as the host last reported it. Blob ids are the device's and a
+    /// lease does not cover blobs (drm_mode_object_lease_required): read by
+    /// number, any other VM's MODE_ID and damage clips, and the host
+    /// desktop's, were the guest's to read (review 2026-09-26, backend 12).
+    pub fn blob_readable(&self, id: u32) -> bool {
+        let v = self.lock();
+        v.blobs.contains_key(&id) || v.seen_blobs.values().any(|&b| b == id)
     }
 
     /// `id`, named as a scanout source by a call about to run: whether some
@@ -396,6 +420,43 @@ impl KmsFileState {
         id == 0 || self.vm.made_here(id)
     }
 
+    /// A CREATEPROPBLOB through this file made blob `id`.
+    fn add_blob(&self, id: u32) {
+        let mut v = self.vm.lock();
+        if !v.retired.contains(&self.serial) {
+            v.blobs.insert(id, self.serial);
+        }
+    }
+
+    /// DESTROYPROPBLOB of `id`, about to run: its records go first, as
+    /// for RMFB (only the file that made a blob may destroy it,
+    /// drm_property.c:880). Whether it was this file's.
+    fn take_blob(&self, id: u32) -> bool {
+        let mut v = self.vm.lock();
+        if v.blobs.get(&id) != Some(&self.serial) {
+            return false;
+        }
+        v.blobs.remove(&id);
+        v.seen_blobs.retain(|_, b| *b != id);
+        true
+    }
+
+    /// What the host reported of object `obj`'s blob properties through
+    /// this file: `(property, blob)`, 0 for none.
+    fn saw_blobs(&self, obj: u32, props: &[(u32, u32)]) {
+        let mut v = self.vm.lock();
+        if v.retired.contains(&self.serial) {
+            return;
+        }
+        for &(prop, blob) in props {
+            if blob == 0 {
+                v.seen_blobs.remove(&(self.serial, obj, prop));
+            } else {
+                v.seen_blobs.insert((self.serial, obj, prop), blob);
+            }
+        }
+    }
+
     /// `may_scan_out`, for a call about to run: the id is then in use in
     /// `uses` (see [`VmKms`]).
     pub fn claim_scan_out(&self, id: u32, uses: &mut FbUses) -> bool {
@@ -438,6 +499,10 @@ impl KmsFileState {
             .map(|(&id, _)| id)
             .collect();
         v.owner.retain(|_, s| *s != me);
+        // The host destroys a file's blobs as it closes
+        // (drm_property_destroy_user_blobs).
+        v.blobs.retain(|_, s| *s != me);
+        v.seen_blobs.retain(|&(s, _, _), _| s != me);
         v.retired.insert(me);
         mine
     }
@@ -1495,6 +1560,7 @@ impl Prepared {
         }
         self.check_fb_sources()?;
         self.check_props(target_fd)?;
+        let destroying = self.check_blob()?;
         // In the call's arena, which outlives the ioctl.
         self.limit_forced_probe(std::time::Instant::now())?;
         let hooks = self.hooks.clone();
@@ -1526,9 +1592,13 @@ impl Prepared {
             if let (Some(fb), Some(k)) = (removing, &self.kms) {
                 k.add_fb(fb);
             }
+            if let (Some(blob), Some(k)) = (destroying, &self.kms) {
+                k.add_blob(blob);
+            }
             return Ok(ret);
         }
         self.track_fbs(target_fd);
+        self.track_blobs(target_fd);
         self.take_fd_outs(target_fd);
         if let Err(e) = self.gems_out(target_fd) {
             for (_, _, fd) in self.fd_outs.drain(..) {
@@ -1757,6 +1827,11 @@ impl Prepared {
     /// cached for the file. A property the host does not know is refused: the
     /// host would refuse the call anyway, and "unknown" is not "plain".
     fn prop_name(&self, fd: RawFd, id: u32) -> Result<[u8; 32], Errno> {
+        self.prop_info(fd, id).map(|(name, _)| name)
+    }
+
+    /// Property `id`'s name and flags, as `prop_name`.
+    fn prop_info(&self, fd: RawFd, id: u32) -> Result<([u8; 32], u32), Errno> {
         if let Some(n) = self
             .kms
             .as_ref()
@@ -1776,10 +1851,77 @@ impl Prepared {
             return Err(-r);
         }
         let name: [u8; 32] = a.bytes(top)[24..56].try_into().unwrap();
+        let flags = rd(a.bytes(top), 20, 4) as u32;
         if let Some(k) = &self.kms {
-            k.lock().prop_names.insert(id, name);
+            k.lock().prop_names.insert(id, (name, flags));
         }
-        Ok(name)
+        Ok((name, flags))
+    }
+
+    /// GETPROPBLOB may read only a blob this VM made or can see
+    /// ([`VmKms::blob_readable`]); ENOENT, the host's own answer for a blob
+    /// that is not there, otherwise. DESTROYPROPBLOB takes the blob's
+    /// records before it runs.
+    fn check_blob(&self) -> Result<Option<u32>, Errno> {
+        let id = || rd(self.bytes(0), 0, 4) as u32;
+        match self.entry.name {
+            "GETPROPBLOB" => {
+                let id = id();
+                if self.kms.as_ref().is_some_and(|k| k.vm.blob_readable(id)) {
+                    return Ok(None);
+                }
+                log::warn!(
+                    "GETPROPBLOB on handle {} of blob {id}, which no file of this VM made or \
+                     can see; refused",
+                    self.target
+                );
+                Err(libc::ENOENT)
+            }
+            "DESTROYPROPBLOB" => {
+                let id = id();
+                Ok(self.kms.as_ref().filter(|k| k.take_blob(id)).map(|_| id))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// After a successful call: the blob CREATEPROPBLOB made, and the blob
+    /// properties OBJ_GETPROPERTIES or GETCONNECTOR reported.
+    fn track_blobs(&mut self, target_fd: RawFd) {
+        let Some(k) = self.kms.clone() else { return };
+        // (count_props, object id, props_ptr, prop_values_ptr).
+        let (count, obj, props, values) = match self.entry.name {
+            "CREATEPROPBLOB" => {
+                // drm_mode_create_blob.blob_id @12.
+                k.add_blob(rd(self.bytes(0), 12, 4) as u32);
+                return;
+            }
+            // drm_mode_obj_get_properties.
+            "OBJ_GETPROPERTIES" => (16, 20, 0, 8),
+            // drm_mode_get_connector.
+            "GETCONNECTOR" => (36, 48, 16, 24),
+            _ => return,
+        };
+        let arg = self.bytes(0);
+        let (n, obj) = (rd(arg, count, 4) as usize, rd(arg, obj, 4) as u32);
+        let (Some(pb), Some(vb)) = (self.pointee(0, props), self.pointee(0, values)) else {
+            return;
+        };
+        let (ids, vals) = (self.bytes(pb).to_vec(), self.bytes(vb).to_vec());
+        // As many as the host wrote: the count it returns, as far as both
+        // arrays reach.
+        let n = n.min(ids.len() / 4).min(vals.len() / 8);
+        let mut blobs = Vec::new();
+        for i in 0..n {
+            let prop = rd(&ids, 4 * i, 4) as u32;
+            match self.prop_info(target_fd, prop) {
+                Ok((_, flags)) if flags & DRM_MODE_PROP_BLOB != 0 => {
+                    blobs.push((prop, rd(&vals, 8 * i, 8) as u32));
+                }
+                _ => {}
+            }
+        }
+        k.saw_blobs(obj, &blobs);
     }
 
     /// Put every GEM_IN object into the target file, validate it, and write
@@ -2232,6 +2374,8 @@ mod tests {
         dmabufs: HashMap<RawFd, u64>,
         next_fd: RawFd,
         props: HashMap<u32, &'static str>,
+        /// GETPROPERTY's flags, by property (0 if absent).
+        prop_flags: HashMap<u32, u32>,
         log: Vec<String>,
     }
 
@@ -2360,6 +2504,8 @@ mod tests {
                             return -libc::ENOENT;
                         };
                         arg.bytes()[24..24 + name.len()].copy_from_slice(name.as_bytes());
+                        let flags = k.prop_flags.get(&id).copied().unwrap_or(0);
+                        arg.bytes()[20..24].copy_from_slice(&flags.to_le_bytes());
                         0
                     }
                     _ => {
@@ -3703,6 +3849,93 @@ mod tests {
         f.vm.close_after(vec![42], Box::new(Closed(closed.clone())));
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
         assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ── property blobs (review 2026-09-26, backend 12) ──
+
+    fn getpropblob(id: u32) -> Rq {
+        Rq::new(iowr(0xac, 16)).buf(16, Some(&arg(16, &[(0, 4, id as u64)])))
+    }
+
+    fn obj_getproperties(obj: u32, count: u32) -> Rq {
+        let a = arg(
+            32,
+            &[
+                (0, 8, 0x100),
+                (8, 8, 0x200),
+                (16, 4, count as u64),
+                (20, 4, obj as u64),
+            ],
+        );
+        Rq::new(iowr(0xb9, 32))
+            .buf(32, Some(&a))
+            .buf(4 * count, None)
+            .buf(8 * count, None)
+    }
+
+    /// Blob ids are the device's and a lease does not cover them: any other
+    /// VM's MODE_ID or damage clips, or the host desktop's, read by number.
+    /// A blob is readable when this VM made it, or the host reported it as
+    /// the value of a blob property of an object this VM sees -- what
+    /// drm_info and modetest read, MODE_ID of their own CRTC.
+    #[test]
+    fn getpropblob_reads_only_blobs_this_vm_made_or_sees() {
+        let h = h();
+        {
+            let mut k = h.sys.k();
+            k.props.insert(20, "MODE_ID");
+            k.prop_flags.insert(20, DRM_MODE_PROP_BLOB);
+            k.props.insert(21, "ACTIVE");
+        }
+        let blob_read = |h: &H, id| {
+            h.sys.log();
+            let r = h.kms(&getpropblob(id)).unwrap().ret;
+            (r, reached_host(h))
+        };
+        assert_eq!(blob_read(&h, 66), (-libc::ENOENT, false), "another tenant's");
+
+        // OBJ_GETPROPERTIES of our CRTC 5: MODE_ID is blob 66, ACTIVE is 67.
+        h.sys.on_ioctl(|_, _, cmd, arg| {
+            let top = arg.addr();
+            match cmd & 0xff {
+                0xb9 => {
+                    let (ids, vals) = (peek(arg, top, 0, 8), peek(arg, top, 8, 8));
+                    for (i, (p, v)) in [(20u64, 66u64), (21, 67)].into_iter().enumerate() {
+                        arg.poke(ids + 4 * i as u64, 4, p);
+                        arg.poke(vals + 8 * i as u64, 8, v);
+                    }
+                    poke(arg, top, 16, 4, 2);
+                    0
+                }
+                // CREATEPROPBLOB: blob 70.
+                0xbd => {
+                    poke(arg, top, 12, 4, 70);
+                    0
+                }
+                _ => 0,
+            }
+        });
+        assert_eq!(h.kms(&obj_getproperties(5, 2)).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 66), (0, true), "MODE_ID of our own CRTC");
+        assert_eq!(
+            blob_read(&h, 67),
+            (-libc::ENOENT, false),
+            "a value of a property that is no blob"
+        );
+
+        // One of our own, until it is destroyed.
+        let data = [7u8; 8];
+        let create = Rq::new(iowr(0xbd, 16))
+            .buf(16, Some(&arg(16, &[(0, 8, 0x100), (8, 4, 8)])))
+            .buf(8, Some(&data));
+        assert_eq!(h.kms(&create).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 70), (0, true));
+        let destroy = Rq::new(iowr(0xbe, 4)).buf(4, Some(&70u32.to_le_bytes()));
+        assert_eq!(h.kms(&destroy).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 70), (-libc::ENOENT, false));
+        // And what a file made or saw goes with it.
+        h.kms.as_ref().unwrap().retire();
+        assert!(!h.kms.as_ref().unwrap().vm.blob_readable(66));
     }
 
     // ── forced connector probes (S-8) ──
