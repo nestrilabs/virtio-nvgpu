@@ -232,6 +232,9 @@ struct KmsCall {
     op: KmsOp,
     generation: u64,
     req_id: u32,
+    /// The guest process that asked: what OPEN_KMS opens is charged to it
+    /// (quota.rs), whoever the backend served in the meantime.
+    owner: crate::quota::Owner,
 }
 
 enum KmsOp {
@@ -694,6 +697,7 @@ impl NvidiaBackend {
                 op,
                 generation: self.session.generation,
                 req_id: self.current_req_id,
+                owner: self.current_owner,
             }))));
         }
         let (res, created) = self.run_host_op(op).inspect_err(|e| {
@@ -1037,7 +1041,14 @@ impl NvidiaBackend {
                     crate::closer::close(fd);
                     (0, Vec::new())
                 }
-                Some(Ok(fd)) => match self.insert(fd, HandleKind::DrmCard(card)) {
+                // Charged to the process that asked, not to whichever one
+                // the queue thread served last (review 2026-09-26, backend
+                // 10).
+                Some(Ok(fd)) => match self
+                    .handles
+                    .insert_for(fd, HandleKind::DrmCard(card), k.owner)
+                    .map_err(|e| e.errno())
+                {
                     Ok(h) => {
                         log::info!("OPEN_KMS: {path} -> handle {h}");
                         (h as u64, vec![h])
@@ -1651,7 +1662,67 @@ mod tests {
             },
             generation: be.generation(),
             req_id: 7,
+            owner: crate::quota::Owner::Unknown,
         }))
+    }
+
+    /// OPEN_KMS finishes on the queue thread after the executor opened the
+    /// card, and other processes' messages are served meanwhile: the card
+    /// file is the asking process's, against its share of the handle table.
+    #[test]
+    fn an_open_kms_is_charged_to_the_process_that_asked() {
+        let mut be = backend();
+        be.set_config(BackendConfig {
+            kms_card: true,
+            ..BackendConfig::default()
+        });
+        let req = HelloReq {
+            proto: PROTO_V2,
+            flags: HELLO_F_FRESH,
+            guest_caps: GCAP_PROC_ID,
+            uvm_aperture_mib: 0,
+        };
+        call(&mut be, MsgType::Hello, 0, bytes_of(&req));
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let proc = |tgid| crate::quota::Owner::Proc { tgid, start_ns: 1 };
+        let from = |op: u32, args: &[u64], tgid: u32| {
+            let mut r = HostOpReq {
+                op,
+                nargs: args.len() as u32,
+                args: [0; OP_MAX_ARGS],
+            };
+            r.args[..args.len()].copy_from_slice(args);
+            let mut body = bytes_of(&r).to_vec();
+            body.extend_from_slice(bytes_of(&ProcId {
+                start_ns: 1,
+                tgid,
+                euid: 0,
+            }));
+            msg(MsgType::HostOp, 0, &body)
+        };
+        let Outcome::Ioctl2(mut p) = be.serve(&from(OP_OPEN_KMS, &[render as u64, 0], 10), 4096)
+        else {
+            panic!("OPEN_KMS answered on the queue thread")
+        };
+        // The executor opened the card (a pipe here).
+        let (r, _w) = pipe_ends();
+        let Pending::Kms(k) = &mut p.0 else {
+            panic!("an OPEN_KMS job")
+        };
+        let KmsOp::Open { opened, .. } = &mut k.op else {
+            panic!("an OPEN_KMS job")
+        };
+        *opened = Some(Ok(r));
+        // Another process is served meanwhile.
+        let Outcome::Reply(_) = be.serve(&from(OP_NEW_EVENTFD, &[], 11), 4096) else {
+            panic!("NEW_EVENTFD is answered inline")
+        };
+        let reply = be.finish_ioctl2(p);
+        assert_eq!(status(&reply.bytes), 0);
+        let h = read::<HostOpResp>(&reply.bytes[HDR..]).unwrap().res[0] as u32;
+        assert_eq!(be.handles.kind(h), Some(HandleKind::DrmCard(0)));
+        assert_eq!(be.handles.owner(h), proc(10));
+        assert_eq!(be.handles.held_by(proc(11)), 1, "only its eventfd");
     }
 
     /// What OPEN_KMS opened is adopted only when the job finishes, and only
