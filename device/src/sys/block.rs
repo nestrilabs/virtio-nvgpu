@@ -157,10 +157,13 @@ pub struct Arena {
     last: Option<i32>,
 }
 
-// SAFETY: every block is owned outright (a GuardedBuf, which is Send, or a
-// boxed slice), every span holds only `Send + Sync` keep-alives, and the
-// addresses in slots point into those. Moving the arena moves them all.
-unsafe impl Send for Arena {}
+// Send by what it holds -- guarded buffers (Send, guarded.rs), boxed
+// slices, spans of `Send + Sync` keep-alives -- so an IOCTL2 prepared on the
+// queue thread can run on an executor's (xfer.rs).
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<Arena>();
+};
 
 impl Arena {
     pub fn new() -> Self {

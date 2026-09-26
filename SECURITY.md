@@ -1295,7 +1295,7 @@ targets run against a stricter fake host.
 **Where `unsafe` is.** Before, 376 uses of the keyword in 37 files: 333 in
 `device` (the dispatcher, the window, OS descriptors, the sandbox, the pump,
 the fakes of most test modules), 31 in `wlwire`, 12 in the guest daemon.
-Now 173 in 10 files, 15 of them test- or fuzz-only:
+Now 172 in 10 files, 15 of them test- or fuzz-only:
 
 | module | what |
 |---|---|
@@ -1353,6 +1353,15 @@ flags; UNMAP_MEMORY's and UPDATE_DEVICE_MAPPING_INFO's keys; and in IOCTL2
 every schema pointer, descriptor and GEM field, declared as the walk meets
 it (before, the guest's pointer bytes sat in the host's copy until
 `aim_pointers` overwrote them).
+
+The fuzz targets' fake host now follows a pointer only into the call's own
+blocks (`Arg::reach`), which caught one regression in the first commit of
+this work (`f4cd317`): a single deep pointer the guest placed across a pointer RM
+follows (FIFO_GET_CHANNELLIST's at 8 and 16, the deep one at 12) had the
+scrub skip the overlapped field, so RM would have read four bytes of the
+guest's and four of an address of ours as one pointer. The old in-place
+scrub zeroed it by the order of its writes. Such a call is now refused
+(`scrub_control`, EINVAL), with a unit test.
 
 What went with it: a lifetime bug class (a relocated buffer dropped before
 the call -- `_idle_segs` was held alive by name), an address leaking back

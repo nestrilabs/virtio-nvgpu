@@ -3501,6 +3501,81 @@ mod tests {
 
     // ── odds and ends ──
 
+    /// The walk declares every pointer, descriptor and GEM field in the
+    /// call's arena, and the arena refuses a field over another: so no two
+    /// such fields of one struct (arrays spelled out) may overlap unless
+    /// their conditions cannot both hold -- in every table, every release.
+    #[test]
+    fn no_two_declared_fields_of_any_schema_overlap() {
+        fn declared(k: &Kind) -> bool {
+            matches!(
+                k,
+                Kind::Ptr { .. }
+                    | Kind::FdIn { .. }
+                    | Kind::FdOut { .. }
+                    | Kind::GemIn { .. }
+                    | Kind::GemOut
+            )
+        }
+        fn exclusive(a: Option<schema::Cond>, b: Option<schema::Cond>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) if a.off == b.off && a.mask == b.mask => {
+                    (!a.ne && !b.ne && a.value != b.value) || (a.value == b.value && a.ne != b.ne)
+                }
+                _ => false,
+            }
+        }
+        /// (offset, width, condition) of each declared field of `span` at
+        /// `base`, arrays walked element by element.
+        fn fields(t: &Table, span: Span, base: u32, out: &mut Vec<(u32, u32, Option<schema::Cond>, &'static str)>) {
+            for f in t.fields(span) {
+                if let Kind::Array {
+                    count,
+                    stride,
+                    children,
+                    ..
+                } = f.kind
+                {
+                    for e in 0..count {
+                        fields(t, children, base + f.off + e * stride, out);
+                    }
+                } else if declared(&f.kind) {
+                    out.push((base + f.off, f.width(), f.cond, f.name));
+                }
+            }
+        }
+        fn check(t: &Table, span: Span, what: &str) {
+            let mut fs = Vec::new();
+            fields(t, span, 0, &mut fs);
+            for (i, a) in fs.iter().enumerate() {
+                for b in &fs[i + 1..] {
+                    let overlap = a.0 < b.0 + b.1 && b.0 < a.0 + a.1;
+                    assert!(
+                        !overlap || exclusive(a.2, b.2),
+                        "{}: {what}: {} and {} overlap",
+                        t.name,
+                        a.3,
+                        b.3
+                    );
+                }
+            }
+            for f in t.fields(span) {
+                if let Kind::Ptr { children, .. } = f.kind {
+                    if children.len > 0 {
+                        check(t, children, f.name);
+                    }
+                }
+            }
+        }
+        let mut tables = vec![schema::DRM_TABLE];
+        tables.extend(abi::schema::MODESET_TABLES.iter().copied());
+        for t in tables {
+            for e in t.ioctls {
+                check(t, e.fields, e.name);
+            }
+        }
+    }
+
     #[test]
     fn a_call_without_an_argument_hands_the_host_null() {
         let h = h();

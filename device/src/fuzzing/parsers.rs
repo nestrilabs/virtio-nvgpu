@@ -256,12 +256,17 @@ pub fn pointer_scrub(b: &mut Bytes) {
         let mut a = Arena::new();
         if let Ok(top) = a.block(&params, params.len()) {
             if plan.declare(&mut a, top, &|_| None).is_ok() {
-                for &(off, _) in &plan.slots {
+                let mut want = params.clone();
+                for &(off, s) in &plan.slots {
                     assert_eq!(rd64(a.bytes(top), off), 0, "escape {cmd:#x}: {off} left for RM");
+                    // An OUT address is the host's answer, and the host
+                    // here wrote nothing.
+                    if s == guestptr::TopSlot::Out {
+                        want[off..off + 8].fill(0);
+                    }
                 }
-                // Whatever was taken out is given back (nothing was
-                // written by a host).
-                assert_eq!(a.reply(top), params);
+                // Whatever else was taken out is given back.
+                assert_eq!(a.reply(top), want);
             }
         }
     }
@@ -270,7 +275,7 @@ pub fn pointer_scrub(b: &mut Bytes) {
     let Ok(nb) = a.block(&nested, nested.len()) else {
         return;
     };
-    guestptr::scrub_control(ctl, &mut a, nb, &[]);
+    guestptr::scrub_control(ctl, &mut a, nb, &[]).expect("nothing else declared");
     for &off in guestptr::control_pointers(ctl) {
         if off + 8 <= nested.len() {
             assert_eq!(

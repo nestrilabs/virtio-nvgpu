@@ -476,7 +476,17 @@ pub(crate) fn control_pointers(cmd: u32) -> &'static [usize] {
 /// NV_ERR_INVALID_ARGUMENT (param_copy.c:43-53), the status a native caller
 /// with a bad pointer would get. An offset past the block's end is one this
 /// release's layout does not have.
-pub(crate) fn scrub_control(cmd: u32, a: &mut Arena, nested: BufId, relocated: &[usize]) {
+///
+/// A pointer RM follows that overlaps a field already declared -- a deep
+/// pointer the guest placed across it, say -- refuses the call (EINVAL):
+/// what RM would read there is partly the guest's bytes and partly an
+/// address of ours, which is neither. Found by the `backend_v2` target.
+pub(crate) fn scrub_control(
+    cmd: u32,
+    a: &mut Arena,
+    nested: BufId,
+    relocated: &[usize],
+) -> Result<(), Errno> {
     let len = a.len(nested);
     for &off in control_pointers(cmd) {
         if relocated.contains(&off) || off + 8 > len {
@@ -487,11 +497,17 @@ pub(crate) fn scrub_control(cmd: u32, a: &mut Arena, nested: BufId, relocated: &
                 "RM control {cmd:#010x}: pointer at {off} was not sent with the data it \
                  addresses; zeroed rather than handed to the host"
             ),
-            // A field the call's own translation already declared (a
-            // descriptor, say) holds nothing of the guest's either.
-            _ => {}
+            Ok(_) => {}
+            Err(_) => {
+                log::warn!(
+                    "RM control {cmd:#010x}: the pointer at {off} overlaps another field of \
+                     the call; refused"
+                );
+                return Err(libc::EINVAL);
+            }
         }
     }
+    Ok(())
 }
 
 // ───────────────────────────── UVM ─────────────────────────────
@@ -664,7 +680,7 @@ mod tests {
     fn scrubbed(cmd: u32, n: &[u8], relocated: &[usize]) -> (Vec<u8>, Vec<u8>) {
         let mut a = Arena::new();
         let b = a.block(n, n.len()).unwrap();
-        scrub_control(cmd, &mut a, b, relocated);
+        scrub_control(cmd, &mut a, b, relocated).unwrap();
         (a.bytes(b).to_vec(), a.reply(b))
     }
 
@@ -1310,6 +1326,29 @@ mod backend_tests {
         );
         assert_eq!(st, -libc::EINVAL);
         assert!(seen().is_empty());
+    }
+
+    /// Fuzzing (`backend_v2`, `dind`): a deep pointer the guest places
+    /// across a pointer RM follows (FIFO_GET_CHANNELLIST's at 8 and 16, the
+    /// deep one at 12) would have RM read four bytes of the guest's and four
+    /// of our address as one pointer. Refused before anything is built.
+    #[test]
+    fn a_deep_pointer_across_a_pointer_rm_follows_never_reaches_rm() {
+        let (mut be, h) = ctl();
+        let mut nested = vec![0u8; 24];
+        nested[..4].copy_from_slice(&2u32.to_le_bytes());
+        nested[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        nested[16..24].copy_from_slice(&GUEST_PTR2.to_le_bytes());
+        let (st, _) = v1(
+            &mut be,
+            h,
+            CONTROL,
+            &nvos54(CHANNELLIST, GUEST_PTR, 24),
+            &nested,
+            Some((12, &[0u8; 8])),
+        );
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty(), "RM never saw it");
     }
 
     /// Fuzzing (`backend_v2`): FIFO_GET_CHANNELLIST's parameters sent 23

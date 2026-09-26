@@ -3529,7 +3529,10 @@ impl NvidiaBackend {
                 Some(s) => s.offsets(),
                 None => deep.map(|(o, _)| o).into_iter().collect(),
             };
-            crate::guestptr::scrub_control(word(outer_in, 8), &mut a, nb, &relocated);
+            if let Err(e) = crate::guestptr::scrub_control(word(outer_in, 8), &mut a, nb, &relocated)
+            {
+                return fail(self, resp_buf, Status::IoctlFailed, e);
+            }
         }
 
         // The top-level block's pointer at the parameters, and the call.
