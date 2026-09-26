@@ -642,6 +642,13 @@ pub trait Finisher {
     fn adopt(&mut self, fd: OwnedFd) -> (u32, HandleKind);
     /// Close a handle the guest passed with `I2_FD_CONSUME`.
     fn close_handle(&mut self, handle: u32);
+    /// Whether what the call did may still be recorded: false once the
+    /// file it ran on has closed, or the session it ran in is gone -- a
+    /// record made then would outlive what it describes, or land in a
+    /// session that knows nothing of it (review 2026-09-26, backend 9).
+    fn records(&self) -> bool {
+        true
+    }
 }
 
 // ───────────────────────────── prepared call ─────────────────────────────
@@ -703,6 +710,9 @@ pub struct Prepared {
     fb_uses: FbUses,
     /// A forced connector probe this call makes: (card, connector, when).
     probing: Option<(u32, u32, std::time::Instant)>,
+    /// What the call did may be recorded (`Finisher::records`), for the
+    /// hooks.
+    records: bool,
     /// What `Hooks::before` asked `Hooks::at_run` to check again.
     run_gate: Option<u64>,
     /// `Hooks::before` answered the call itself (`answer_locally`): the
@@ -775,6 +785,7 @@ pub fn prepare(
         kms: None,
         fb_uses: FbUses::default(),
         probing: None,
+        records: true,
         run_gate: None,
         local: None,
         hooks: env.hooks(),
@@ -873,11 +884,18 @@ impl Prepared {
         // a record it makes of one (an NVKMS grant file) is then dropped by
         // that handle's close like any other, rather than outliving it.
         let (hooks, ret) = (self.hooks.clone(), self.ret);
+        self.records = f.records();
         hooks.after(&mut self, ret);
         for h in std::mem::take(&mut self.consumed) {
             f.close_handle(h);
         }
         self.response(&fd_recs)
+    }
+
+    /// Whether a hook's `after` may record what the call did
+    /// (`Finisher::records`): its reply may still be rewritten either way.
+    pub fn records(&self) -> bool {
+        self.records
     }
 
     /// The host copy of buffer `i` (0 = the ioctl argument), for policy hooks

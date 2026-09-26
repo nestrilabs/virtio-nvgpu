@@ -618,8 +618,15 @@ impl NvkmsPolicy {
         }
         let fds: Vec<u32> = p.fd_in_handles().map(|(_, _, h)| h).collect();
         let mut st = self.lock();
+        // A call that finished after its file closed, or after a session
+        // reset, records nothing: its grants were revoked with the file
+        // (forget_handle), and a REVOKE's forgetting belongs to a session
+        // that is gone. Its reply is still rewritten below.
+        let records = p.records();
         if p.policy() & (policy::GRANT | policy::REVOKE) != 0 {
-            st.drm_record(p.name(), p.target(), p.buffer(0).unwrap_or(&[]), &fds);
+            if records {
+                st.drm_record(p.name(), p.target(), p.buffer(0).unwrap_or(&[]), &fds);
+            }
             return;
         }
         let name = p.name().strip_prefix("NVKMS_").unwrap_or(p.name());
@@ -632,7 +639,7 @@ impl NvkmsPolicy {
             }
         }
         let target = p.target();
-        if let Some(params) = p.buffer(1) {
+        if let Some(params) = p.buffer(1).filter(|_| records) {
             st.record(lo, name, target, params, &fds);
         }
     }

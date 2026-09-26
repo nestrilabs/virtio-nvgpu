@@ -398,9 +398,15 @@ struct BackendFinisher<'a> {
     /// The guest process they are charged to: the owner of the file the
     /// call ran on (quota.rs).
     owner: crate::quota::Owner,
+    /// The file the call ran on is still the guest's, unburied.
+    target_live: bool,
 }
 
 impl xfer::Finisher for BackendFinisher<'_> {
+    fn records(&self) -> bool {
+        !self.stale && self.target_live
+    }
+
     /// Every descriptor the backend holds: the guest's, in the handle table,
     /// and its own -- the vhost-user socket, guest memory, the pump, the
     /// vrings' eventfds, the window memfd, the cached signalled sync_file --
@@ -971,12 +977,14 @@ impl NvidiaBackend {
         // handle granted is gone on the host (kms.rs, "lease ends").
         let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);
         let nodes = self.host_nodes();
+        let target_live = self.handles.kind(target).is_some() && !self.handles.is_buried(target);
         let mut fin = BackendFinisher {
             backend: self,
             cards: &nodes.cards,
             stale,
             created: Vec::new(),
             owner,
+            target_live,
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
