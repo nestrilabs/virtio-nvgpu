@@ -1168,7 +1168,6 @@ static int nvgpu_kms_out_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
  */
 struct nvgpu_kms_actx {
   struct nvgpu_kms_call *kc;
-  struct nvgpu_atomic_out *out;
 };
 
 static int nvgpu_kms_a_obj(void *ctx, u32 obj, u32 *crtc) {
@@ -1188,9 +1187,6 @@ static int nvgpu_kms_a_in_fence(void *ctx, void *st, u32 buf, u32 off,
   struct nvgpu_kms_actx *a = ctx;
 
   a->kc->call.st = st;
-  /* Set by the parse before any hook: a TEST_ONLY commit's fences are only
-   * checked (nvgpu_kms_in_fence). */
-  a->kc->commit = a->out->commit;
   return nvgpu_kms_in_fence(a->kc, buf, off, fd);
 }
 
@@ -1230,10 +1226,22 @@ static const struct nvgpu_atomic_ops nvgpu_kms_atomic_ops = {
 /* Before an atomic commit goes: its events and its fences. */
 static int nvgpu_kms_atomic(struct nvgpu_kms_call *kc) {
   struct nvgpu_atomic_out out = {};
-  struct nvgpu_kms_actx a = {.kc = kc, .out = &out};
+  struct nvgpu_kms_actx a = {.kc = kc};
   void *st = kc->call.st;
+  u32 len;
+  u8 *b0 = nvgpu_i2_buf(&kc->call, 0, &len);
   int ret;
 
+  /*
+   * Commit or TEST_ONLY, before any hook runs, from the same copy the parse
+   * reads: a TEST_ONLY commit's in-fences are only checked
+   * (nvgpu_kms_in_fence()), a real one's bridged. It was read from the
+   * parse's out struct, which the Rust parse filled in only once it had
+   * finished -- so every real commit's IN_FENCE_FD went to the host as -1.
+   */
+  kc->commit = b0 && len >= NVGPU_ATOMIC_SIZE &&
+               !(get_unaligned_le32(b0 + NVGPU_ATOMIC_FLAGS) &
+                 NVGPU_ATOMIC_TEST_ONLY);
   ret = nvgpu_atomic_parse(&kc->call,
                            kc->kf->dev->backend_caps & NVGPU_BCAP_FENCES,
                            &nvgpu_kms_atomic_ops, &a, &out);

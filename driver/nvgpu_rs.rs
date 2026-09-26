@@ -1028,13 +1028,22 @@ pub struct AtomicOut {
 const _: () = assert!(core::mem::size_of::<AtomicOut>() == 8);
 const _: () = assert!(core::mem::size_of::<AtomicOps>() == 6 * core::mem::size_of::<usize>());
 
-/// The hooks of one parse.
+/// The hooks of one parse, and the C's `struct nvgpu_atomic_out`, which a
+/// hook may read (through its context) while the parse runs: only ever
+/// written through the raw pointer, never held as a reference across a hook.
 struct AtomicEnv<'a> {
     ops: &'a AtomicOps,
     ctx: *mut c_void,
+    out: *mut AtomicOut,
 }
 
 impl atomic::Env<KStore> for AtomicEnv<'_> {
+    fn begin(&mut self, commit: bool) {
+        // SAFETY: `out` is the caller's live struct nvgpu_atomic_out (the
+        // nvgpu_rs_atomic_parse contract); no reference to it is held.
+        unsafe { ptr::addr_of_mut!((*self.out).commit).write(commit) };
+    }
+
     fn obj_class(&mut self, obj: u32) -> (i32, u32) {
         let mut crtc = 0u32;
         // SAFETY: nvgpu_kms.c's hook, on the context it passed with it,
@@ -1086,16 +1095,23 @@ pub unsafe extern "C" fn nvgpu_rs_atomic_parse(
     ctx: *mut c_void,
     out: *mut c_void,
 ) -> c_int {
+    let out = out.cast::<AtomicOut>();
     // SAFETY: the caller's contract.
-    let (Some(st), Some(ops), Some(out)) = (unsafe { hook_state(st) }, unsafe { ops.cast::<AtomicOps>().as_ref() }, unsafe {
-        out.cast::<AtomicOut>().as_mut()
-    }) else {
+    let (Some(st), Some(ops)) = (unsafe { hook_state(st) }, unsafe { ops.cast::<AtomicOps>().as_ref() }) else {
         return -EINVAL;
     };
-    let mut o = atomic::Out { commit: out.commit, values_buf: out.values_buf };
-    let mut env = AtomicEnv { ops, ctx };
+    if out.is_null() {
+        return -EINVAL;
+    }
+    // SAFETY: `out` is a live struct nvgpu_atomic_out; read and written by
+    // value, as the hooks may read it while the parse runs (AtomicEnv).
+    let mut o = unsafe { atomic::Out { commit: ptr::addr_of!((*out).commit).read(), values_buf: ptr::addr_of!((*out).values_buf).read() } };
+    let mut env = AtomicEnv { ops, ctx, out };
     let r = atomic::parse(st, &mut env, fences, &mut o);
-    out.commit = o.commit;
-    out.values_buf = o.values_buf;
+    // SAFETY: as above.
+    unsafe {
+        ptr::addr_of_mut!((*out).commit).write(o.commit);
+        ptr::addr_of_mut!((*out).values_buf).write(o.values_buf);
+    }
     r
 }

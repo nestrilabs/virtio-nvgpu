@@ -320,17 +320,22 @@ impl CallBufs for RCall<'_> {
 
     fn atomic(&mut self, w: &mut World, fences: bool) -> (i32, bool, u32) {
         let mut out = atomic::Out::default();
-        let r = atomic::parse(self.0, &mut AEnv { w }, fences, &mut out);
+        let r = atomic::parse(self.0, &mut AEnv { w, commit: false }, fences, &mut out);
         (r, out.commit, out.values_buf)
     }
 }
 
-/// The atomic parse's hooks, over the world.
+/// The atomic parse's hooks, over the world, and what the parse has said
+/// about the commit (`begin`), as the kernel's hook reads it.
 struct AEnv<'a> {
     w: &'a mut World,
+    commit: bool,
 }
 
 impl atomic::Env<RStore> for AEnv<'_> {
+    fn begin(&mut self, commit: bool) {
+        self.commit = commit;
+    }
     fn obj_class(&mut self, obj: u32) -> (i32, u32) {
         hooks::a_obj(self.w, obj)
     }
@@ -338,7 +343,7 @@ impl atomic::Env<RStore> for AEnv<'_> {
         hooks::a_prop(self.w, id)
     }
     fn in_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, fd: i64) -> i32 {
-        hooks::a_in_fence(self.w, &mut RCall(st), buf, off, fd)
+        hooks::a_in_fence(self.w, &mut RCall(st), buf, off, fd, self.commit)
     }
     fn out_fence(&mut self, st: &mut State<RStore>, buf: u32, off: u32, uptr: u64) -> i32 {
         hooks::a_out_fence(self.w, &mut RCall(st), buf, off, uptr)

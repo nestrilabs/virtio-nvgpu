@@ -521,11 +521,20 @@ static const struct nvgpu_atomic_ops harness_atomic_ops = {
     .reserve = dt_a_reserve,
 };
 
+/* The parse in progress's out struct, as a hook sees it (nvgpu_kms.c's read
+ * it from its context): what out->commit says while a hook runs. */
+static __thread struct nvgpu_atomic_out *harness_out;
+
+bool harness_atomic_commit(void) { return harness_out && harness_out->commit; }
+
 int harness_atomic(struct nvgpu_i2_call *call, bool fences, void *ctx,
                    bool *commit, u32 *values_buf) {
   struct nvgpu_atomic_out out = {};
-  int r = nvgpu_atomic_parse(call, fences, &harness_atomic_ops, ctx, &out);
+  int r;
 
+  harness_out = &out;
+  r = nvgpu_atomic_parse(call, fences, &harness_atomic_ops, ctx, &out);
+  harness_out = NULL;
   *commit = out.commit;
   *values_buf = out.values_buf;
   return r;

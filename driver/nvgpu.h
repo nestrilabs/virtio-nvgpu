@@ -1071,7 +1071,9 @@ struct nvgpu_atomic_out {
 /*
  * From the ATOMIC special's phase 0: walk the commit's arrays in the call's
  * kernel copies, asking `ops` what its objects and properties are, reserving
- * the flip events and bridging the fences. 0 or -errno.
+ * the flip events and bridging the fences. 0 or -errno. `out->commit` is
+ * written before any hook runs (both implementations; the difftest checks
+ * what a hook sees), `out->values_buf` by the end.
  */
 int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
                        const struct nvgpu_atomic_ops *ops, void *ctx,

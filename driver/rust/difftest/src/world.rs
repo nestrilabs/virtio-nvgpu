@@ -42,7 +42,8 @@ pub enum Hook {
     Phase { phase: i32 },
     AObj { obj: u32 },
     AProp { id: u32 },
-    AInFence { buf: u32, off: u32, fd: i64 },
+    /// `commit`: what the parse had said about the commit by then.
+    AInFence { buf: u32, off: u32, fd: i64, commit: bool },
     AOutFence { buf: u32, off: u32, uptr: u64 },
     ALearn { obj: u32, crtc: u32 },
     AReserve { crtc: u32, user_data: u64 },

@@ -571,10 +571,20 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
     put(&mut a, 32, V, 8);
     put(&mut a, 48, 0xabcd, 8);
     w.mem.insert(ARG, a);
+    let test_only = {
+        let mut w = w.clone();
+        let mut a = w.mem[&ARG].clone();
+        put(&mut a, 0, 0x100, 4);
+        w.mem.insert(ARG, a);
+        w
+    };
     let o = run(dev(0, vec![]), w, Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg: ARG, render: 5, xflags: 0 });
     let hooks: Vec<Hook> = o.world.events.iter().filter_map(|e| if let Ev::Hook(h) = e { Some(h.clone()) } else { None }).collect();
     assert!(hooks.contains(&Hook::ALearn { obj: 2, crtc: 6 }));
-    assert!(hooks.contains(&Hook::AInFence { buf: 4, off: 8, fd: 7 }));
+    // The hook sees a real commit: a TEST_ONLY one's fences are only
+    // checked. (The Rust parse said so only once it had finished, and every
+    // IN_FENCE_FD went to the host as -1.)
+    assert!(hooks.contains(&Hook::AInFence { buf: 4, off: 8, fd: 7, commit: true }));
     assert!(hooks.contains(&Hook::AOutFence { buf: 4, off: 16, uptr: OUT }));
     let reserved: Vec<u32> =
         hooks.iter().filter_map(|h| if let Hook::AReserve { crtc, .. } = h { Some(*crtc) } else { None }).collect();
@@ -584,4 +594,8 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
     // The request carries the in-fence's record and the out-fence's dyn.
     let s = &sends(&o)[0];
     assert_eq!((le32(s, 28), le32(s, 36)), (1, 1));
+
+    // TEST_ONLY: the hook knows that too.
+    let o = run(dev(0, vec![]), test_only, Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg: ARG, render: 5, xflags: 0 });
+    assert!(o.world.events.contains(&Ev::Hook(Hook::AInFence { buf: 4, off: 8, fd: 7, commit: false })));
 }

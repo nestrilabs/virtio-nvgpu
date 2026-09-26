@@ -40,6 +40,11 @@ pub const KOBJ_CRTC: i32 = 1;
 
 /// What the parse asks of the module (`struct nvgpu_atomic_ops`).
 pub trait Env<S: Store> {
+    /// Whether the commit is a real one (not TEST_ONLY), as soon as that is
+    /// known and before any other hook runs: the fence hooks act on it (a
+    /// TEST_ONLY commit's in-fences are only checked). The C parse writes
+    /// `out->commit` there; here it is said.
+    fn begin(&mut self, commit: bool);
     /// `NVGPU_KOBJ_*` and the CRTC a non-CRTC is on (0: not known), or a
     /// negative errno.
     fn obj_class(&mut self, obj: u32) -> (i32, u32);
@@ -109,6 +114,7 @@ pub fn parse<S: Store, E: Env<S>>(st: &mut State<S>, env: &mut E, fences: bool, 
     let flags = w32(st, 0, FLAGS as u64);
     let count = w32(st, 0, COUNT_OBJS as u64);
     out.commit = flags & TEST_ONLY == 0;
+    env.begin(out.commit);
     let events = flags & FLIP_EVENT != 0 && out.commit;
     // Without the fence bridge a fence property is the backend's to refuse,
     // from its own copy; there is nothing to look up for it here.
