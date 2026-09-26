@@ -888,7 +888,7 @@ fix commit and the code. S-35, which a later review of the RM path opened
 | S-2 | high | Wayland shm capped only per connection | `86553c1`, `de95ad3` | fixed |
 | S-3 | high | no per-VM cap on Wayland channels | `de95ad3` | fixed |
 | S-4 | high | shm memfds: host OOM the OOM killer cannot attribute | `86553c1`, `de95ad3` | fixed; refusing SHM_SYNC before commit, and a cgroup in the launcher, not done |
-| S-5 | high | a root backend makes every guest process an RM administrator | `b3c126b`, `ae182ab` | fixed; class 0x3f refused by the RM allowlist (§12); forcing non-privileged RM clients, not done |
+| S-5 | high | a root backend makes every guest process an RM administrator | `b3c126b`, `ae182ab` | fixed; class 0x3f allocatable (the Vulkan driver makes one) but its BAR0 mapping is RM-admin only and the backend is never admin; forcing non-privileged RM clients, not done |
 | S-6 | medium | KMS commits can scan out any host framebuffer | `19c3186` | fixed |
 | S-7 | medium | channels are full compositor clients, with no per-VM cap | `de95ad3` | **partly**: channel cap and queue budget done; per-interface object caps, a CONNECT rate limit and RLIMIT_NOFILE not |
 | S-8 | medium | forced EDID reads hold `nvkms_lock` from up to 16 executors | `429d57c` | **partly**: probes rate-limited; one executor lane per class and a lower ALLOC_DEVICE cap not done |
@@ -981,8 +981,9 @@ In rough order of weight.
    window; nothing bounds the backend's memory as a whole. A guest process
    that forks enough can still take a pool, a share at a time.
 6. **Open items after the fixes.**
-   - **Backend posture.** Class 0x3f is refused by the RM allowlist (§12),
-     but non-privileged RM clients are not forced, which matters only if the
+   - **Backend posture.** Class 0x3f (RegisterMemory) is on the RM
+     allowlist (§12), since the Vulkan driver allocates one; RM maps its BAR0
+     only for an admin client, which the backend never is. Non-privileged RM clients are not forced, which matters only if the
      backend is ever given
      CAP_SYS_ADMIN. There is no `--socket-fd`. PID namespaces are left to the
      launcher. EXPORT_TO_DMABUF_FD is refused, so NVIDIA's GBM RM export path
@@ -1236,8 +1237,10 @@ release:
    ALLOC_NON_PRIVILEGED. RM refuses the backend the rest anyway; not
    forwarding them keeps their lookup paths, and any bug before RM's check,
    out of reach, and holds if the backend is ever privileged. Class 0x3f,
-   NV01_MEMORY_LOCAL_PRIVILEGED (BAR0 to an administrator), is not on the
-   list: S-5's open half (§8).
+   NV01_MEMORY_LOCAL_PRIVILEGED, is the exception: RM lets any user allocate
+   it and the Vulkan driver does (vulkaninfo fails without it); the BAR0
+   mapping that makes it dangerous RM gives only an admin client, and the
+   backend is never one (S-5, §8).
 3. It names no host resource the backend does not translate: every field of
    the parameters, nested structs included, that is a descriptor, a process
    id or an OS event refuses the control unless the backend translates it

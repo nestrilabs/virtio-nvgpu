@@ -375,6 +375,13 @@ WORKLOAD_CLASSES = [
     # VID_HEAP_CONTROL's HW_ALLOC makes one (surface compression and zcull
     # resources); what GL's heap calls are is not counted, so it stays.
     "NV01_MEMORY_HW_RESOURCES",
+    # RegisterMemory: the Vulkan driver allocates one by ALLOC_MEMORY (seen on
+    # the rig once the list enforced; vulkaninfo fails without it). RM lets
+    # any user allocate it (RS_FLAGS_ALLOC_NON_PRIVILEGED); what makes it
+    # dangerous is a CPU mapping of BAR0, which RM gives only an admin client
+    # (mapping_cpu.c, ADDR_REGMEM: rmclientIsAdmin) -- and the backend is
+    # never one: posture.rs refuses root and CAP_SYS_ADMIN.
+    "NV01_MEMORY_LOCAL_PRIVILEGED",
 ]
 
 # Refused whatever else says: each names a host resource the backend does

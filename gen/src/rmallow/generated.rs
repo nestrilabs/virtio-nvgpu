@@ -322,6 +322,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL
@@ -641,6 +642,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL
@@ -986,6 +988,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL
@@ -1331,6 +1334,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL
@@ -1676,6 +1680,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL
@@ -2026,6 +2031,7 @@ pub static RELEASES: &[Release] = &[
             0x0002, // NV01_CONTEXT_DMA
             0x0005, // NV01_EVENT
             0x003e, // NV01_MEMORY_SYSTEM
+            0x003f, // NV01_MEMORY_LOCAL_PRIVILEGED
             0x0040, // NV01_MEMORY_LOCAL_USER
             0x0041, // NV01_ROOT_CLIENT
             0x0070, // NV01_MEMORY_VIRTUAL

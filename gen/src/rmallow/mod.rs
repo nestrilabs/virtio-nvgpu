@@ -225,7 +225,6 @@ mod tests {
                 (0x0078, "NV01_EVENT_KERNEL_CALLBACK"),
                 (0x007e, "NV01_EVENT_KERNEL_CALLBACK_EX"),
                 (0x0081, "NV01_MEMORY_LIST_SYSTEM"),
-                (0x003f, "NV01_MEMORY_LOCAL_PRIVILEGED"),
                 (0x00f1, "NV_IMEX_SESSION"),
                 (0x00fd, "NV_MEMORY_MULTICAST_FABRIC"),
                 (0x0092, "NV0092_RG_LINE_CALLBACK"),
