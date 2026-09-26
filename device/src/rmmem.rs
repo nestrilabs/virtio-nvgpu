@@ -270,12 +270,12 @@ impl Tree {
     }
 
     fn unlink(&mut self, c: u32, h: u32) {
-        if let Some(p) = self.parent.remove(&(c, h)) {
-            if let Some(v) = self.children.get_mut(&(c, p)) {
-                v.retain(|&x| x != h);
-                if v.is_empty() {
-                    self.children.remove(&(c, p));
-                }
+        if let Some(p) = self.parent.remove(&(c, h))
+            && let Some(v) = self.children.get_mut(&(c, p))
+        {
+            v.retain(|&x| x != h);
+            if v.is_empty() {
+                self.children.remove(&(c, p));
             }
         }
     }

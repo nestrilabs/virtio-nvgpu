@@ -2107,35 +2107,35 @@ impl NvidiaBackend {
         // placement that is already there rather than a second copy of it,
         // and count the reference, so the first MUNMAP does not pull it from
         // under the second user.
-        if let Some(&id) = self.dri_maps.get(&(handle, fd_offset)) {
-            if let Some(live) = self.live_maps.get_mut(&id) {
-                // No more than the placement holds. The guest maps as many
-                // bytes as it asked for from the placement's offset, so a
-                // second MMAP of the same file asking for more than the first
-                // would reach past this extent into the window's next ones --
-                // another guest process's device memory -- or into unplaced
-                // window, whose first touch stops the VM. The recorded path
-                // refuses the same (`handle_mmap`).
-                let mapped = live.length.div_ceil(4096) * 4096;
-                if size > mapped {
-                    log::warn!(
-                        "mmap on handle {handle}: {size:#x} bytes asked of a {mapped:#x}-byte \
-                         placement already made at file offset {fd_offset:#x}; refused"
-                    );
-                    return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
-                }
-                live.refs += 1;
-                let (offset, length) = (live.region.offset, live.length);
-                let (pgprot, writable) = (live.region.pgprot, live.writable);
-                return self.write_mmap_resp(
-                    resp_buf,
-                    offset,
-                    length.div_ceil(4096) * 4096,
-                    id,
-                    pgprot,
-                    writable,
+        if let Some(&id) = self.dri_maps.get(&(handle, fd_offset))
+            && let Some(live) = self.live_maps.get_mut(&id)
+        {
+            // No more than the placement holds. The guest maps as many
+            // bytes as it asked for from the placement's offset, so a
+            // second MMAP of the same file asking for more than the first
+            // would reach past this extent into the window's next ones --
+            // another guest process's device memory -- or into unplaced
+            // window, whose first touch stops the VM. The recorded path
+            // refuses the same (`handle_mmap`).
+            let mapped = live.length.div_ceil(4096) * 4096;
+            if size > mapped {
+                log::warn!(
+                    "mmap on handle {handle}: {size:#x} bytes asked of a {mapped:#x}-byte \
+                     placement already made at file offset {fd_offset:#x}; refused"
                 );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
             }
+            live.refs += 1;
+            let (offset, length) = (live.region.offset, live.length);
+            let (pgprot, writable) = (live.region.pgprot, live.writable);
+            return self.write_mmap_resp(
+                resp_buf,
+                offset,
+                length.div_ceil(4096) * 4096,
+                id,
+                pgprot,
+                writable,
+            );
         }
 
         let length = size.max(4096);

@@ -268,15 +268,14 @@ pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
     };
     if st.st_mode & libc::S_IFMT == libc::S_IFCHR {
         let (major, minor) = (libc::major(st.st_rdev), libc::minor(st.st_rdev));
-        if major == DRM_MAJOR && minor < DRM_PRIMARY_MINOR_LIMIT {
-            if let Some(i) = cards
+        if major == DRM_MAJOR
+            && minor < DRM_PRIMARY_MINOR_LIMIT
+            && let Some(i) = cards
                 .iter()
                 .position(|c| c.major == major && c.minor == minor)
-            {
-                if drm_driver_name(raw).as_deref() == Some("nvidia-drm") {
-                    return HandleKind::DrmLease(i as u32);
-                }
-            }
+            && drm_driver_name(raw).as_deref() == Some("nvidia-drm")
+        {
+            return HandleKind::DrmLease(i as u32);
         }
         // Any other character device -- another GPU's node, a render node
         // from outside, a tty -- is nothing the guest may reach through us.

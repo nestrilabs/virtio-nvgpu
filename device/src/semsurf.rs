@@ -901,15 +901,14 @@ impl NvidiaBackend {
         match escape {
             NV_ESC_RM_ALLOC => {
                 let is_client = word(param_in, 12).is_some_and(|c| ROOT_CLASSES.contains(&c));
-                if let Some(out) = reply_params(resp, n).filter(|_| is_client) {
-                    if word(out, 40) == Some(0) {
-                        if let Some(h) = word(out, 8).filter(|&h| h != 0) {
-                            // Its maker, the calling guest process when the
-                            // guest says (rmshare.rs).
-                            self.semsurf
-                                .client_allocated_by(issuer, h, self.current_proc);
-                        }
-                    }
+                if let Some(out) = reply_params(resp, n).filter(|_| is_client)
+                    && word(out, 40) == Some(0)
+                    && let Some(h) = word(out, 8).filter(|&h| h != 0)
+                {
+                    // Its maker, the calling guest process when the guest
+                    // says (rmshare.rs).
+                    self.semsurf
+                        .client_allocated_by(issuer, h, self.current_proc);
                 }
             }
             // NVOS00 {hRoot, hObjectParent, hObjectOld, status}: freeing the
@@ -943,14 +942,12 @@ impl NvidiaBackend {
             // Status}: `fd` is our handle as the guest sent it (restored in
             // the reply), -1 for none.
             NV_ESC_ALLOC_OS_EVENT => {
-                if let Some(out) = reply_params(resp, n) {
-                    if let (Some(c), Some(fd), Some(0)) =
+                if let Some(out) = reply_params(resp, n)
+                    && let (Some(c), Some(fd), Some(0)) =
                         (word(out, 0), word(out, 8), word(out, 12))
-                    {
-                        if (fd as i32) >= 0 {
-                            self.semsurf.os_event_allocated(issuer, c, fd);
-                        }
-                    }
+                    && (fd as i32) >= 0
+                {
+                    self.semsurf.os_event_allocated(issuer, c, fd);
                 }
             }
             // The same for an OS event: forgotten when RM freed it, or when

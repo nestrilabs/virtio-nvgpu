@@ -291,10 +291,10 @@ fn coherent_display_only(lo: &NvkmsLayout, params: &mut [u8]) {
     let at = lo.alloc_reply_coherency as usize;
     for modes in [at, at + 2] {
         // NvKmsDispIOCoherencyModes: NvBool coherent, then noncoherent.
-        if params.get(modes) == Some(&1) {
-            if let Some(nc) = params.get_mut(modes + 1) {
-                *nc = 0;
-            }
+        if params.get(modes) == Some(&1)
+            && let Some(nc) = params.get_mut(modes + 1)
+        {
+            *nc = 0;
         }
     }
 }
@@ -634,10 +634,11 @@ impl NvkmsPolicy {
         let Ok((lo, _)) = Self::layout(&st) else {
             return;
         };
-        if name == "ALLOC_DEVICE" && !self.keep_display_coherency.load(Ordering::Relaxed) {
-            if let Some(mut params) = p.buffer_mut(1) {
-                coherent_display_only(lo, &mut params);
-            }
+        if name == "ALLOC_DEVICE"
+            && !self.keep_display_coherency.load(Ordering::Relaxed)
+            && let Some(mut params) = p.buffer_mut(1)
+        {
+            coherent_display_only(lo, &mut params);
         }
         let target = p.target();
         if let Some(params) = p.buffer(1).filter(|_| records) {
@@ -660,10 +661,10 @@ impl NvkmsPolicy {
             return;
         };
         let Ok(cmd) = rd32(msg, 0) else { return };
-        if table.lookup_nvkms(cmd).map(|e| e.name) == Some("NVKMS_ALLOC_DEVICE") {
-            if let Some(params) = msg.get_mut(16..) {
-                coherent_display_only(lo, params);
-            }
+        if table.lookup_nvkms(cmd).map(|e| e.name) == Some("NVKMS_ALLOC_DEVICE")
+            && let Some(params) = msg.get_mut(16..)
+        {
+            coherent_display_only(lo, params);
         }
     }
 
@@ -712,10 +713,9 @@ impl NvkmsPolicy {
         if matches!(
             name,
             "ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"
-        ) {
-            if let Some(params) = msg.get(16..) {
-                st.record(lo, name, target, params, &[]);
-            }
+        ) && let Some(params) = msg.get(16..)
+        {
+            st.record(lo, name, target, params, &[]);
         }
     }
 
@@ -823,14 +823,12 @@ impl State {
             }
             "SET_LAYER_POSITION" if gated => self.layers_granted(lo, call.target, params)?,
             "SET_MODE" => self.set_mode(lo, call, params)?,
-            "ACQUIRE_PERMISSIONS" => {
-                // A grant we did not see made cannot be tracked, so it
-                // cannot be revoked here when it is revoked on the host.
-                if !call.fds.iter().all(|g| self.grant_fds.contains_key(g)) {
-                    return Err(refuse(format_args!(
-                        "ACQUIRE_PERMISSIONS names a file nothing we saw granted to"
-                    )));
-                }
+            // A grant we did not see made cannot be tracked, so it cannot be
+            // revoked here when it is revoked on the host.
+            "ACQUIRE_PERMISSIONS" if !call.fds.iter().all(|g| self.grant_fds.contains_key(g)) => {
+                return Err(refuse(format_args!(
+                    "ACQUIRE_PERMISSIONS names a file nothing we saw granted to"
+                )));
             }
             _ => {}
         }

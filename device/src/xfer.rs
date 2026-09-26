@@ -621,10 +621,10 @@ pub fn default_before(p: &Prepared) -> Result<(), Errno> {
     } else {
         None
     };
-    if let Some(off) = type_at {
-        if rd(p.bytes(0), off, 4) != NV_DRM_PERMISSIONS_TYPE_MODESET {
-            return Err(libc::EPERM);
-        }
+    if let Some(off) = type_at
+        && rd(p.bytes(0), off, 4) != NV_DRM_PERMISSIONS_TYPE_MODESET
+    {
+        return Err(libc::EPERM);
     }
     Ok(())
 }
@@ -1362,7 +1362,7 @@ impl Prepared {
     /// An 8-byte prop_values slot a fence record may name.
     fn fence_slot(&self, buf: u32, off: u32) -> bool {
         self.prop_values_buf() == Some(buf as usize)
-            && off % 8 == 0
+            && off.is_multiple_of(8)
             && (off as usize) + 8 <= self.bytes(buf as usize).len()
     }
 
@@ -1446,12 +1446,13 @@ impl Prepared {
                 // target file itself, keeps it there, and names it by that
                 // handle (SEMSURF_FENCE_ATTACH, driver/nvgpu_fence.c).
                 return Err(libc::EINVAL);
-            } else if !self.owners.contains_key(&owner) {
+            } else if let std::collections::hash_map::Entry::Vacant(slot) = self.owners.entry(owner)
+            {
                 let (fd, kind) = env.dup_handle(owner).ok_or(libc::EBADF)?;
                 if !matches!(kind, HandleKind::DriRender(_)) {
                     return Err(libc::EINVAL);
                 }
-                self.owners.insert(owner, fd);
+                slot.insert(fd);
             }
             self.gem_ins.push(GemInRec { slot, owner, gem });
         }
@@ -1573,10 +1574,10 @@ impl Prepared {
             .call(&*sys, target_fd, u64::from(self.entry.cmd), top);
         // The host has the framebuffers it was named (or refused them).
         self.fb_uses.release();
-        if let (Some((card, connector, at)), Some(k)) = (self.probing, &self.kms) {
-            if ret < 0 {
-                k.vm.probe_refused(card, connector, at);
-            }
+        if let (Some((card, connector, at)), Some(k)) = (self.probing, &self.kms)
+            && ret < 0
+        {
+            k.vm.probe_refused(card, connector, at);
         }
         drop(gate);
         for h in temps {
@@ -1991,10 +1992,10 @@ impl Prepared {
         // fb_id @0 of drm_mode_fb_cmd, drm_mode_fb_cmd2, RMFB's u32, closefb.
         // A removal was recorded before the call (`forget_removed_fb`).
         let fb = rd(self.bytes(0), 0, 4) as u32;
-        if let Some(k) = &self.kms {
-            if pol & policy::FB_CREATE != 0 {
-                k.add_fb(fb);
-            }
+        if let Some(k) = &self.kms
+            && pol & policy::FB_CREATE != 0
+        {
+            k.add_fb(fb);
         }
         if pol & policy::FB_READ != 0 && !self.kms.as_ref().is_some_and(|k| k.owns_fb(fb)) {
             let mut closed = HashSet::new();
@@ -4142,10 +4143,10 @@ mod tests {
                 }
             }
             for f in t.fields(span) {
-                if let Kind::Ptr { children, .. } = f.kind {
-                    if children.len > 0 {
-                        check(t, children, f.name);
-                    }
+                if let Kind::Ptr { children, .. } = f.kind
+                    && children.len > 0
+                {
+                    check(t, children, f.name);
                 }
             }
         }

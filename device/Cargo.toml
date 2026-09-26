@@ -75,3 +75,8 @@ required-features = ["test-bins"]
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing` (device/src/fuzzing, fuzz/).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.clippy]
+# A record of a wire struct is read by field offsets into its slice
+# (`r[OFF..OFF + 4]`), which `as_chunks`' arrays would not make clearer.
+chunks_exact_to_as_chunks = "allow"

@@ -484,7 +484,7 @@ pub(crate) fn parse_runs(call: &Call, deep: &[u8]) -> Result<Vec<(u64, u64)>, Er
         if rd32(deep, at + 12) != Some(0) {
             return refuse(format!("run {i}: reserved bits"));
         }
-        if gpa % PAGE != 0 || pages == 0 {
+        if !gpa.is_multiple_of(PAGE) || pages == 0 {
             return refuse(format!("run {i}: {pages} pages at {gpa:#x}"));
         }
         if gpa.checked_add(pages * PAGE).is_none() {
@@ -1724,7 +1724,7 @@ mod tests {
             list(w | 2, &[(0x1000, 2)]),          // unknown flag
             list(w, &[(0x1800, 2)]),              // unaligned
             list(w, &[(0x1000, 0), (0x2000, 2)]), // an empty run
-            list(w, &[(u64::MAX & !0xfff, 2)]),   // wraps
+            list(w, &[(!0xfff_u64, 2)]),          // wraps
             list(w, &[]),                         // none
         ] {
             assert_eq!(parse_runs(&c, &bad), Err(libc::EINVAL), "{bad:?}");
@@ -2758,12 +2758,7 @@ mod backend_tests {
         let ctl = vm.ctl;
         // 256 KiB is past low RAM; 3 GiB is the PCI hole, where a window
         // or an aperture would be.
-        for gpa in [
-            PAGES * PAGE,
-            3 << 30,
-            HIGH + PAGES * PAGE,
-            u64::MAX & !(PAGE - 1),
-        ] {
+        for gpa in [PAGES * PAGE, 3 << 30, HIGH + PAGES * PAGE, !(PAGE - 1)] {
             let (st, ..) = ioctl(
                 &mut vm.be,
                 ctl,
