@@ -19,8 +19,10 @@
 //! shows up here as a refused request or a wrong byte in user memory, rather
 //! than in a guest.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, HashMap};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use protocol::messages::*;
@@ -31,6 +33,7 @@ use crate::privfd::PrivateFd;
 use crate::pump::PumpCmd;
 use crate::schema::{self, CopyBack, Dir, Field, Ioctl, Kind, Len, Span, Table};
 use crate::session::Outcome;
+use crate::sys::block::Arg;
 use crate::xfer::Sys;
 
 // ───────────────────────── the guest, transliterated ─────────────────────────
@@ -739,14 +742,15 @@ fn file_of(fd: RawFd) -> String {
         .to_string()
 }
 
-unsafe fn peek(p: *const u8, off: usize, width: usize) -> u64 {
-    let mut v = [0u8; 8];
-    unsafe { std::ptr::copy_nonoverlapping(p.add(off), v.as_mut_ptr(), width) };
-    u64::from_le_bytes(v)
+/// The `width`-byte word `off` bytes past `p` in the call's memory, as the
+/// kernel reads it (`p`: the argument's address, or a pointer read out of a
+/// block of the call).
+fn peek(a: &Arg<'_>, p: u64, off: usize, width: usize) -> u64 {
+    a.peek(p + off as u64, width)
 }
 
-unsafe fn poke(p: *mut u8, off: usize, width: usize, v: u64) {
-    unsafe { std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p.add(off), width) };
+fn poke(a: &mut Arg<'_>, p: u64, off: usize, width: usize, v: u64) {
+    a.poke(p + off as u64, width, v)
 }
 
 const PRIME_HANDLE_TO_FD: u32 = 0xc00c_642d;
@@ -768,27 +772,30 @@ const DROP_MASTER: u32 = 0x0000_641f;
 const GETPROPERTY: u32 = 0xc040_64aa;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 
-impl Sys for Fake {
-    fn ioctl(&self, fd: RawFd, cmd: u32, arg: *mut u8) -> i32 {
+impl crate::sys::block::Kernel for Fake {
+    fn ioctl(&self, fd: RawFd, cmd: u64, arg: &mut Arg<'_>) -> i32 {
+        let cmd = cmd as u32;
         let mut k = self.0.lock().unwrap();
         let file = file_of(fd);
-        // SAFETY: `arg` is the buffer xfer built for `cmd`; every pointer in
-        // it aims at another of its buffers (or is NULL).
-        unsafe {
+        // `arg` is the buffer xfer built for `cmd`; every pointer in it aims
+        // at another of its buffers (or is NULL), and peek and poke fail on
+        // anything else.
+        let top = arg.addr();
+        {
             match cmd {
                 PRIME_HANDLE_TO_FD => {
-                    let h = peek(arg, 0, 4) as u32;
+                    let h = peek(arg, top, 0, 4) as u32;
                     let Some(&obj) = k.gems.get(&file).and_then(|g| g.get(&h)) else {
                         return -libc::ENOENT;
                     };
                     k.next_dmabuf += 1;
                     let d = 900_000 + k.next_dmabuf;
                     k.dmabufs.insert(d, obj);
-                    poke(arg, 8, 4, d as u64);
+                    poke(arg, top, 8, 4, d as u64);
                     0
                 }
                 PRIME_FD_TO_HANDLE => {
-                    let Some(&obj) = k.dmabufs.get(&(peek(arg, 8, 4) as RawFd)) else {
+                    let Some(&obj) = k.dmabufs.get(&(peek(arg, top, 8, 4) as RawFd)) else {
                         return -libc::EBADF;
                     };
                     let g = k.gems.entry(file).or_default();
@@ -797,11 +804,11 @@ impl Sys for Fake {
                         None => (1..).find(|h| !g.contains_key(h)).unwrap(),
                     };
                     g.insert(h, obj);
-                    poke(arg, 0, 4, h as u64);
+                    poke(arg, top, 0, 4, h as u64);
                     0
                 }
                 GEM_CLOSE => {
-                    let h = peek(arg, 0, 4) as u32;
+                    let h = peek(arg, top, 0, 4) as u32;
                     match k.gems.get_mut(&file).and_then(|g| g.remove(&h)) {
                         Some(_) => 0,
                         None => -libc::EINVAL,
@@ -811,7 +818,7 @@ impl Sys for Fake {
                 // (nvidia-drm-gem.c:310-345): the type of whatever the handle
                 // names in this file, UNKNOWN for a handle it does not hold.
                 IDENTIFY => {
-                    let h = peek(arg, 0, 4) as u32;
+                    let h = peek(arg, top, 0, 4) as u32;
                     let t = match k.gems.get(&file).and_then(|g| g.get(&h)) {
                         Some(obj) => k
                             .types
@@ -820,7 +827,7 @@ impl Sys for Fake {
                             .unwrap_or(hostfd::NV_GEM_OBJECT_NVKMS),
                         None => hostfd::NV_GEM_OBJECT_UNKNOWN,
                     };
-                    poke(arg, 4, 4, u64::from(t));
+                    poke(arg, top, 4, 4, u64::from(t));
                     0
                 }
                 // drm_mode_get_lease_ioctl with count_objects 0: the count
@@ -828,10 +835,10 @@ impl Sys for Fake {
                 // lessor is no longer master (drm_ioctl.c:746).
                 GET_LEASE if file == "e2e-kms" => {
                     k.lease_probes += 1;
-                    assert_eq!(peek(arg, 0, 4), 0, "a count, never the ids");
+                    assert_eq!(peek(arg, top, 0, 4), 0, "a count, never the ids");
                     match k.lease {
-                        LeaseState::Held => poke(arg, 0, 4, 3),
-                        LeaseState::Revoked => poke(arg, 0, 4, 0),
+                        LeaseState::Held => poke(arg, top, 0, 4, 3),
+                        LeaseState::Revoked => poke(arg, top, 0, 4, 0),
                         LeaseState::LessorNotMaster | LeaseState::LessorGone => {
                             return -libc::EACCES;
                         }
@@ -843,14 +850,14 @@ impl Sys for Fake {
                 // through drm_lease_held (drm_mode_config.c:131-172).
                 GETRESOURCES if file == "e2e-kms" && k.lease != LeaseState::Held => {
                     k.lease_probes += 1;
-                    assert!((0..48).all(|i| *arg.add(i) == 0), "counts only");
+                    assert!(arg.bytes()[..48].iter().all(|&b| b == 0), "counts only");
                     let (crtcs, connectors) = match k.lease {
                         LeaseState::LessorNotMaster => (2, 3),
                         _ => (0, 0),
                     };
-                    poke(arg, 36, 4, crtcs);
-                    poke(arg, 40, 4, connectors);
-                    poke(arg, 44, 4, 1);
+                    poke(arg, top, 36, 4, crtcs);
+                    poke(arg, top, 40, 4, connectors);
+                    poke(arg, top, 44, 4, 1);
                     0
                 }
                 _ => {
@@ -861,7 +868,13 @@ impl Sys for Fake {
         }
     }
 
-    fn close(&self, fd: RawFd) {
+}
+
+impl Sys for Fake {
+    fn close(&self, fd: OwnedFd) {
+        // A number of the fake's, or a lease eventfd the test keeps: the
+        // fake closes nothing.
+        let fd = fd.into_raw_fd();
         self.0.lock().unwrap().dmabufs.remove(&fd);
     }
 
@@ -871,57 +884,58 @@ impl Sys for Fake {
 }
 
 /// The ioctls the tests make, as the host kernel answers them.
-unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 {
-    unsafe {
+fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: &mut Arg<'_>) -> i32 {
+    let top = arg.addr();
+    {
         match (file, cmd) {
             // drm_mode_getresources: each list gets min(count, actual) ids,
             // and every count becomes the actual one.
             ("e2e-kms", GETRESOURCES) => {
                 let lists: [&[u32]; 4] = [&[], &[41, 42], &[51, 52, 53], &[61]];
                 for (i, ids) in lists.iter().enumerate() {
-                    let p = peek(arg, 8 * i, 8) as *mut u8;
-                    let room = peek(arg, 32 + 4 * i, 4) as usize;
+                    let p = peek(arg, top, 8 * i, 8);
+                    let room = peek(arg, top, 32 + 4 * i, 4) as usize;
                     for (j, id) in ids.iter().enumerate().take(room) {
-                        assert!(!p.is_null(), "a non-zero count always has a buffer");
-                        poke(p, 4 * j, 4, u64::from(*id));
+                        assert!(p != 0, "a non-zero count always has a buffer");
+                        poke(arg, p, 4 * j, 4, u64::from(*id));
                     }
-                    poke(arg, 32 + 4 * i, 4, ids.len() as u64);
+                    poke(arg, top, 32 + 4 * i, 4, ids.len() as u64);
                 }
-                poke(arg, 48, 4, 320);
+                poke(arg, top, 48, 4, 320);
                 0
             }
             // Framebuffers are made from GEM handles of the lease file itself:
             // the proxies' objects, re-homed there for this job.
             ("e2e-kms", ADDFB2) => {
                 for plane in 0..2 {
-                    let h = peek(arg, 20 + 4 * plane, 4) as u32;
+                    let h = peek(arg, top, 20 + 4 * plane, 4) as u32;
                     if !k.gems.get("e2e-kms").is_some_and(|g| g.contains_key(&h)) {
                         return -libc::ENOENT;
                     }
                 }
                 let id = 77 + k.fbs.len() as u32;
-                k.fbs.push((id, peek(arg, 12, 4) as u32));
-                poke(arg, 0, 4, u64::from(id));
+                k.fbs.push((id, peek(arg, top, 12, 4) as u32));
+                poke(arg, top, 0, 4, u64::from(id));
                 0
             }
             ("e2e-kms", CREATE_LEASE) => {
-                let ids = peek(arg, 0, 8) as *const u8;
-                let n = peek(arg, 8, 4) as usize;
+                let ids = peek(arg, top, 0, 8);
+                let n = peek(arg, top, 8, 4) as usize;
                 assert_eq!(n, 2);
-                assert_eq!(peek(ids, 0, 4), 41);
-                assert_eq!(peek(ids, 4, 4), 51);
+                assert_eq!(peek(arg, ids, 0, 4), 41);
+                assert_eq!(peek(arg, ids, 4, 4), 51);
                 let fd = match k.lease_fd {
                     Some(fd) => fd,
                     None => hostfd::new_eventfd().unwrap().into_raw_fd(),
                 };
-                poke(arg, 16, 4, 9);
-                poke(arg, 20, 4, fd as u32 as u64);
+                poke(arg, top, 16, 4, 9);
+                poke(arg, top, 20, 4, fd as u32 as u64);
                 0
             }
             // drm_syncobj_wait_ioctl with a zero timeout: nothing signalled,
             // so -ETIME at once (drm_syncobj.c:1156-1159).
             ("e2e-render", SYNCOBJ_WAIT) => {
-                k.wait_timeout = Some(peek(arg, 8, 8) as i64);
+                k.wait_timeout = Some(peek(arg, top, 8, 8) as i64);
                 -libc::ETIME
             }
             // drm_setmaster_ioctl / drm_dropmaster_ioctl on a card: no
@@ -930,25 +944,25 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
             // drm_mode_revoke_lease_ioctl: the lessee's objects go
             // (drm_lease.c:700-730); the lessee file stays open.
             ("e2e-card", REVOKE_LEASE) => {
-                assert_eq!(peek(arg, 0, 4), 9, "the lessee id the guest named");
+                assert_eq!(peek(arg, top, 0, 4), 9, "the lessee id the guest named");
                 k.lease = LeaseState::Revoked;
                 0
             }
             // drm_mode_getproperty with every count 0: name and flags only
             // (drm_property.c:458), which is how the guest classifies an id.
             (_, GETPROPERTY) => {
-                assert_eq!(peek(arg, 0, 8), 0, "no values pointer");
-                assert_eq!(peek(arg, 8, 8), 0, "no enum pointer");
-                let name = match peek(arg, 16, 4) {
+                assert_eq!(peek(arg, top, 0, 8), 0, "no values pointer");
+                assert_eq!(peek(arg, top, 8, 8), 0, "no enum pointer");
+                let name = match peek(arg, top, 16, 4) {
                     7 => &b"IN_FENCE_FD"[..],
                     8 => b"CRTC_ID",
                     _ => return -libc::ENOENT,
                 };
-                std::ptr::copy_nonoverlapping(name.as_ptr(), arg.add(24), name.len());
+                arg.bytes()[24..24 + name.len()].copy_from_slice(name);
                 0
             }
             ("e2e-kms", GRANT) => {
-                let fd = peek(arg, 0, 4) as i32;
+                let fd = peek(arg, top, 0, 4) as i32;
                 assert!(
                     file_of(fd).starts_with("e2e-modeset"),
                     "the modeset file, by our number"
@@ -964,52 +978,55 @@ unsafe fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: *mut u8) -> i32 
 /// NVKMS 610.57.04 as the tests use it (offsets: gen/nvkms/610.57.04.json).
 /// Every failure is -EPERM, with the reply half written all the same
 /// (nvidia-modeset-linux.c:1539, nvkms.c:5220-5243).
-unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
-    unsafe {
-        let (cmd, size) = (peek(arg, 0, 4) as u32, peek(arg, 4, 4) as u32);
-        let p = peek(arg, 8, 8) as *mut u8;
+fn nvkms_ioctl(k: &mut Kernel, arg: &mut Arg<'_>) -> i32 {
+    let top = arg.addr();
+    {
+        let (cmd, size) = (peek(arg, top, 0, 4) as u32, peek(arg, top, 4, 4) as u32);
+        let p = peek(arg, top, 8, 8);
         k.nvkms.push(cmd);
         match (cmd, size) {
             // ALLOC_DEVICE: deviceHandle 1, disp 0 is 0x100.
             (0, 1440) => {
-                poke(p, 628, 4, 1);
-                poke(p, 644, 4, 0x100);
+                poke(arg, p, 628, 4, 1);
+                poke(arg, p, 644, 4, 0x100);
                 0
             }
             // VALIDATE_MODE: five bytes of pInfoString, and a failure.
             (8, 656) => {
-                let s = peek(p, 296, 8) as *mut u8;
-                assert!(!s.is_null(), "a buffer of infoStringSize bytes");
-                std::ptr::copy_nonoverlapping(b"hello".as_ptr(), s, 5);
-                poke(p, 456, 4, 5);
+                let s = peek(arg, p, 296, 8);
+                assert!(s != 0, "a buffer of infoStringSize bytes");
+                assert!(arg.write(s, b"hello"));
+                poke(arg, p, 456, 4, 5);
                 -libc::EPERM
             }
             // QUERY_DPY_DYNAMIC_DATA: the reply half (2072 on) memset and
             // filled (nvkms-dpy.c:3068), here with one byte.
             (6, 37168) => {
-                std::ptr::write_bytes(p.add(2072), 0x42, 37168 - 2072);
+                assert!(arg.write(p + 2072, &vec![0x42; 37168 - 2072]));
                 0
             }
             (11, 20) => 0, // MOVE_CURSOR
             // FLIP of one head: what each layer's awaken reached the host as.
-            (15, 3104) if peek(p, 16, 4) == 1 => {
-                let heads = peek(p, 8, 8) as *const u8;
-                k.flip_awaken = (0..8).map(|l| *heads.add(216 + l * 592 + 52)).collect();
+            (15, 3104) if peek(arg, p, 16, 4) == 1 => {
+                let heads = peek(arg, p, 8, 8);
+                k.flip_awaken = (0..8)
+                    .map(|l| peek(arg, heads, 216 + l * 592 + 52, 1) as u8)
+                    .collect();
                 0
             }
             // FLIP: two heads, head 0 with an input LUT, head 1 with an
             // output one; refused, with a flipResult.
             (15, 3104) => {
-                let heads = peek(p, 8, 8) as *const u8;
-                assert_eq!(peek(p, 16, 4), 2);
-                assert_eq!(peek(heads, 4, 4), 5, "head 0's head");
-                assert_eq!(peek(heads, 4952 + 4, 4), 6, "head 1's head");
-                let in0 = peek(heads, 88, 8) as *const u8;
-                let out1 = peek(heads, 4952 + 104, 8) as *const u8;
-                assert_eq!((peek(heads, 104, 8), peek(heads, 4952 + 88, 8)), (0, 0));
-                assert_eq!((*in0, *in0.add(LUT - 1)), (0x11, 0x11));
-                assert_eq!((*out1, *out1.add(LUT - 1)), (0x22, 0x22));
-                poke(p, 28, 4, 0x77);
+                let heads = peek(arg, p, 8, 8);
+                assert_eq!(peek(arg, p, 16, 4), 2);
+                assert_eq!(peek(arg, heads, 4, 4), 5, "head 0's head");
+                assert_eq!(peek(arg, heads, 4952 + 4, 4), 6, "head 1's head");
+                let in0 = peek(arg, heads, 88, 8);
+                let out1 = peek(arg, heads, 4952 + 104, 8);
+                assert_eq!((peek(arg, heads, 104, 8), peek(arg, heads, 4952 + 88, 8)), (0, 0));
+                assert_eq!((peek(arg, in0, 0, 1), peek(arg, in0, LUT - 1, 1)), (0x11, 0x11));
+                assert_eq!((peek(arg, out1, 0, 1), peek(arg, out1, LUT - 1, 1)), (0x22, 0x22));
+                poke(arg, p, 28, 4, 0x77);
                 -libc::EPERM
             }
             // REGISTER_SURFACE: format 19 (Y8___U8V8_N420) has two planes,
@@ -1017,25 +1034,25 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
             (17, 152) => {
                 // useFd == FALSE names RM handles, which a user client may
                 // not (nvkms.c:2727-2730).
-                if peek(p, 4, 1) == 0 {
+                if peek(arg, p, 4, 1) == 0 {
                     return -libc::EPERM;
                 }
                 for plane in [16, 48] {
-                    let fd = peek(p, plane, 4) as i32;
+                    let fd = peek(arg, p, plane, 4) as i32;
                     assert_eq!(file_of(fd), "e2e-ctl", "plane at {plane}");
                 }
-                assert_eq!(peek(p, 80, 4), 0, "the unused third plane");
-                poke(p, 144, 4, 0x55);
+                assert_eq!(peek(arg, p, 80, 4), 0, "the unused third plane");
+                poke(arg, p, 144, 4, 0x55);
                 0
             }
             // ACQUIRE_PERMISSIONS of a grant file: MODESET on head 1 for
             // dpy bit 3.
             (41, 28) => {
-                let fd = peek(p, 0, 4) as i32;
+                let fd = peek(arg, p, 0, 4) as i32;
                 assert_eq!(file_of(fd), "e2e-modeset-grant");
-                poke(p, 4, 4, 1);
-                poke(p, 8, 4, 2);
-                poke(p, 12 + 4, 4, 1 << 3);
+                poke(arg, p, 4, 4, 1);
+                poke(arg, p, 8, 4, 2);
+                poke(arg, p, 12 + 4, 4, 1 << 3);
                 0
             }
             _ => -libc::EPERM,
@@ -1046,11 +1063,7 @@ unsafe fn nvkms_ioctl(k: &mut Kernel, arg: *mut u8) -> i32 {
 // ───────────────────────────── the tests ─────────────────────────────
 
 fn memfd(name: &std::ffi::CStr) -> OwnedFd {
-    // SAFETY: a NUL-terminated name; the result is owned below.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    assert!(fd >= 0);
-    // SAFETY: a descriptor memfd_create just returned.
-    unsafe { OwnedFd::from_raw_fd(fd) }
+    crate::sys::fd::memfd(name, libc::MFD_CLOEXEC).unwrap()
 }
 
 struct World {
@@ -1392,7 +1405,7 @@ fn a_descriptor_the_backend_already_holds_is_never_adopted() {
         );
         // SAFETY: F_GETFD only asks whether the number is still open.
         assert!(
-            unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+            crate::sys::fd::is_open(fd),
             "and it was not closed"
         );
     }

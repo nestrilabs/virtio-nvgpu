@@ -576,6 +576,21 @@ static int nvgpu_mmap(struct file *filp, struct vm_area_struct *vma) {
    * writable, the first write would reach KVM as a fault on a read-only host
    * mapping it cannot resolve, and stop the whole VM.
    */
+  /*
+   * No more of the window than the placement holds. What follows it is the
+   * next extent -- another process's device memory -- or unplaced window,
+   * whose first touch stops the VM; a backend that answered a larger vma
+   * with a smaller placement would hand this process either.
+   */
+  if (size > le64_to_cpu(resp->size)) {
+    dev_warn_ratelimited(&nfd->dev->vdev->dev,
+                         "virtio-gpu-nv: a %llu-byte mapping of a %llu-byte "
+                         "placement refused\n",
+                         size, le64_to_cpu(resp->size));
+    ret = -EINVAL;
+    goto out;
+  }
+
   if (nfd->dev->v2 && (resp->flags & NVGPU_MMAP_F_READ_ONLY)) {
     vm_flags_clear(vma, VM_WRITE | VM_MAYWRITE);
     vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);

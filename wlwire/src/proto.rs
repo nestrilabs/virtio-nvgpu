@@ -1,7 +1,10 @@
 //! The protocol tables, generated at build time from `protocols/*.xml` (see
 //! `build.rs`), and the types they are made of.
 
+#![forbid(unsafe_code)]
+
 /// Index into [`INTERFACES`].
+
 pub type IfaceId = u16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

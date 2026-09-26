@@ -25,6 +25,8 @@
 //! ring is still the one it came from; jobs already running finish and find
 //! their results discarded by the epoch or session check at completion.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 

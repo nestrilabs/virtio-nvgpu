@@ -21,6 +21,8 @@
 //! that broke the rules, and `wp_drm_lease_device_v1.released`, which the
 //! protocol promises and Hyprland 0.56 never sends.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;

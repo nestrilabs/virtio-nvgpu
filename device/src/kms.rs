@@ -35,8 +35,12 @@
 //! (no `NL_CFG_F_NONROOT_SEND`), and a message whose sender port is not 0 is
 //! ignored anyway.
 
+#![forbid(unsafe_code)]
+
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+
+use crate::sys::block::Arena;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -176,14 +180,21 @@ impl HotplugListener {
         sink: impl Fn(PumpCmd) + Send + 'static,
         tick: Option<Tick>,
     ) -> io::Result<Self> {
-        let sock = uevent_socket()?;
-        // SAFETY: plain syscall; the result is owned below.
-        let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if stop < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a descriptor eventfd() just returned.
-        let stop = PrivateFd::new(unsafe { OwnedFd::from_raw_fd(stop) });
+        Self::spawn_ticking_on(uevent_socket()?, cards, sink, tick)
+    }
+
+    /// `spawn_ticking` on a socket [`uevent_socket`] made earlier: the
+    /// backend makes it before its sandbox puts it in a network namespace
+    /// of its own, where no uevent would arrive (device::sandbox).
+    pub fn spawn_ticking_on(
+        sock: PrivateFd,
+        cards: Vec<CardNode>,
+        sink: impl Fn(PumpCmd) + Send + 'static,
+        tick: Option<Tick>,
+    ) -> io::Result<Self> {
+        let stop = PrivateFd::new(crate::sys::fd::eventfd(
+            libc::EFD_CLOEXEC | libc::EFD_NONBLOCK,
+        )?);
         let stop_rx = stop.try_clone()?;
         let alarm = Arc::new(LeaseAlarm::new()?);
         let alarm_rx = alarm.clone();
@@ -206,15 +217,7 @@ impl HotplugListener {
 
 impl Drop for HotplugListener {
     fn drop(&mut self) {
-        let one: u64 = 1;
-        // SAFETY: writes 8 bytes from a local to an eventfd this owns.
-        unsafe {
-            libc::write(
-                self.stop.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            )
-        };
+        crate::sys::fd::eventfd_signal(self.stop.as_raw_fd());
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -222,49 +225,16 @@ impl Drop for HotplugListener {
 }
 
 /// A non-blocking socket on the kernel uevent group.
-fn uevent_socket() -> io::Result<PrivateFd> {
-    // SAFETY: plain syscall; the result is owned below.
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            libc::NETLINK_KOBJECT_UEVENT,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor socket() just returned.
-    let sock = PrivateFd::new(unsafe { OwnedFd::from_raw_fd(fd) });
-    // Best effort: without it only a large burst is at risk, and ENOBUFS then
-    // tells us so.
-    // SAFETY: setsockopt with a local int of the size given.
-    unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &RCVBUF as *const libc::c_int as *const libc::c_void,
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    // SAFETY: an all-zero sockaddr_nl is valid; the fields that matter are
-    // set below.
-    let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    sa.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    sa.nl_groups = UEVENT_GROUP_KERNEL;
-    // SAFETY: binds to a sockaddr_nl of the size given.
-    let r = unsafe {
-        libc::bind(
-            sock.as_raw_fd(),
-            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
-            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(sock)
+///
+/// Of the network namespace it is made in, which keeps it: the kernel
+/// broadcasts uevents only to namespaces of the initial user namespace.
+pub fn uevent_socket() -> io::Result<PrivateFd> {
+    // A bigger receive buffer is best effort: without it only a large burst
+    // is at risk, and ENOBUFS then tells us so.
+    Ok(PrivateFd::new(crate::sys::net::uevent_socket(
+        UEVENT_GROUP_KERNEL,
+        RCVBUF,
+    )?))
 }
 
 /// What one receive produced.
@@ -281,35 +251,16 @@ enum Recv {
 }
 
 fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<Recv> {
-    // SAFETY: an all-zero sockaddr_nl is valid for the kernel to fill.
-    let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    let mut sa_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-    // SAFETY: receives into a buffer and a sockaddr this function owns, of
-    // the sizes given.
-    let n = unsafe {
-        libc::recvfrom(
-            fd,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-            0,
-            &mut sa as *mut libc::sockaddr_nl as *mut libc::sockaddr,
-            &mut sa_len,
-        )
-    };
-    if n < 0 {
-        let e = io::Error::last_os_error();
-        return match e.raw_os_error() {
+    match crate::sys::net::recv_from(fd, buf) {
+        Ok((n, 0)) => Ok(Recv::Kernel(n)),
+        Ok(_) => Ok(Recv::Foreign),
+        Err(e) => match e.raw_os_error() {
             Some(libc::EAGAIN) => Ok(Recv::Empty),
             Some(libc::EINTR) => recv(fd, buf),
             Some(libc::ENOBUFS) => Ok(Recv::Overrun),
             _ => Err(e),
-        };
+        },
     }
-    Ok(if sa.nl_pid == 0 {
-        Recv::Kernel(n as usize)
-    } else {
-        Recv::Foreign
-    })
 }
 
 fn listen(
@@ -348,13 +299,11 @@ fn listen(
         let timeout = tick.as_ref().map_or(-1, |t| {
             t.every.saturating_sub(last_tick.elapsed()).as_millis() as libc::c_int
         });
-        // SAFETY: polls three pollfds this function owns.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) };
-        if r < 0 {
-            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        if let Err(e) = crate::sys::fd::poll(&mut fds, timeout) {
+            if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            log::error!("hotplug: poll: {}", io::Error::last_os_error());
+            log::error!("hotplug: poll: {e}");
             return;
         }
         if fds[1].revents != 0 {
@@ -500,8 +449,19 @@ pub enum LeaseState {
 /// say (a descriptor that is no DRM file, say). Both calls are counts only;
 /// nothing is written through a pointer.
 pub fn lease_state(sys: &dyn xfer::Sys, fd: RawFd) -> Result<LeaseState, xfer::Errno> {
-    let mut arg = [0u8; 16];
-    let r = sys.ioctl(fd, DRM_IOCTL_MODE_GET_LEASE, arg.as_mut_ptr());
+    // Every id-list pointer declared, and so NULL (sys/block.rs).
+    let counts = |cmd: u32, len: usize, ptrs: &[usize]| -> (i32, Vec<u8>) {
+        let mut a = Arena::new();
+        let top = a.small(&vec![0u8; len]);
+        for &p in ptrs {
+            if let Err(e) = a.ptr(top, p) {
+                return (-e, Vec::new());
+            }
+        }
+        let r = a.call(sys, fd, u64::from(cmd), top);
+        (r, a.bytes(top).to_vec())
+    };
+    let (r, arg) = counts(DRM_IOCTL_MODE_GET_LEASE, 16, &[8]);
     let count = |a: &[u8], off: usize| u32::from_le_bytes(a[off..off + 4].try_into().unwrap());
     match r {
         0.. if count(&arg, 0) != 0 => return Ok(LeaseState::Holds),
@@ -509,8 +469,7 @@ pub fn lease_state(sys: &dyn xfer::Sys, fd: RawFd) -> Result<LeaseState, xfer::E
         _ if -r == libc::EACCES => {}
         _ => return Err(-r),
     }
-    let mut res = [0u8; 64];
-    let r = sys.ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, res.as_mut_ptr());
+    let (r, res) = counts(DRM_IOCTL_MODE_GETRESOURCES, 64, &[0, 8, 16, 24]);
     if r < 0 {
         return Err(-r);
     }
@@ -533,27 +492,11 @@ impl LeaseAlarm {
     }
 
     pub fn ring(&self) {
-        let one: u64 = 1;
-        // SAFETY: writes 8 bytes from a local to an eventfd this owns.
-        unsafe {
-            libc::write(
-                self.0.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            )
-        };
+        crate::sys::fd::eventfd_signal(self.0.as_raw_fd());
     }
 
     fn clear(&self) {
-        let mut v: u64 = 0;
-        // SAFETY: reads 8 bytes into a local from a non-blocking eventfd.
-        unsafe {
-            libc::read(
-                self.0.as_raw_fd(),
-                &mut v as *mut u64 as *mut libc::c_void,
-                8,
-            )
-        };
+        crate::sys::fd::eventfd_drain(self.0.as_raw_fd());
     }
 }
 
@@ -594,12 +537,17 @@ pub const NV_GET_CRTC_CRC32_V2: u32 = 0xc01c_644c;
 pub fn is_lessee(sys: &dyn xfer::Sys, fd: RawFd) -> bool {
     let mut arg = [0u8; 24];
     arg[8..12].copy_from_slice(&1u32.to_le_bytes());
-    let r = sys.ioctl(fd, DRM_IOCTL_MODE_CREATE_LEASE, arg.as_mut_ptr());
+    // object_ids declared, and so NULL; the lessee's fd declared out.
+    let mut a = Arena::new();
+    let top = a.small(&arg);
+    if a.ptr(top, 0).and_then(|_| a.fd_out(top, 20, 4)).is_err() {
+        return false;
+    }
+    let r = a.call(sys, fd, u64::from(DRM_IOCTL_MODE_CREATE_LEASE), top);
     if r >= 0 {
         // Cannot happen with a NULL object list; if a kernel ever made a
         // lease of it, the lessee file is ours and must not stay open.
-        let lessee = i32::from_le_bytes(arg[20..24].try_into().unwrap());
-        if lessee >= 0 {
+        if let Some(lessee) = a.claim_fd(top, 20) {
             sys.close(lessee);
         }
         return false;
@@ -735,6 +683,7 @@ impl NvidiaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::{IntoRawFd, OwnedFd};
     use std::sync::mpsc;
 
     fn card(name: &str, minor: u32) -> CardNode {
@@ -925,8 +874,7 @@ mod tests {
         // descriptor (semsurf's RM files, another listener) by the time this
         // looks. A registration this listener leaked is one whose number is
         // closed; a number that is open again belongs to whoever reopened it.
-        // SAFETY: F_GETFD on a number, open or not, touches nothing.
-        let open_again = unsafe { libc::fcntl(stop, libc::F_GETFD) } >= 0;
+        let open_again = crate::sys::fd::is_open(stop);
         assert!(
             !crate::privfd::is_private(stop) || open_again,
             "the listener closed its stop descriptor and left it registered"
@@ -946,36 +894,12 @@ mod tests {
                 return;
             }
         };
-        // SAFETY: an all-zero sockaddr_nl is valid for the kernel to fill.
-        let mut me: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        let mut len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        // SAFETY: getsockname into a local of the size given.
-        let r = unsafe {
-            libc::getsockname(
-                rx.as_raw_fd(),
-                &mut me as *mut libc::sockaddr_nl as *mut libc::sockaddr,
-                &mut len,
-            )
-        };
-        assert_eq!(r, 0);
-        let mut to: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        to.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        to.nl_pid = me.nl_pid;
+        let port = crate::sys::net::local_port(rx.as_raw_fd()).unwrap();
         let msg = uevent("change", HOTPLUG);
-        // SAFETY: sends a buffer this test owns to a sockaddr of the size given.
-        let sent = unsafe {
-            libc::sendto(
-                tx.as_raw_fd(),
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                0,
-                &to as *const libc::sockaddr_nl as *const libc::sockaddr,
-                size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
+        let sent = crate::sys::net::send_to(tx.as_raw_fd(), port, &msg);
         let mut buf = vec![0u8; MSG_MAX];
-        if sent < 0 {
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        if let Err(e) = sent {
+            assert_eq!(e.raw_os_error(), Some(libc::EPERM));
             return;
         }
         let mut got = recv(rx.as_raw_fd(), &mut buf).unwrap();
@@ -998,12 +922,12 @@ mod tests {
     /// its lease still holds.
     struct LeaseSys(Result<u32, i32>, (u32, u32));
 
-    impl xfer::Sys for LeaseSys {
-        fn ioctl(&self, _: RawFd, cmd: u32, arg: *mut u8) -> i32 {
-            match cmd {
+    impl crate::sys::block::Kernel for LeaseSys {
+        fn ioctl(&self, _: RawFd, cmd: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+            match cmd as u32 {
                 DRM_IOCTL_MODE_GET_LEASE => {
-                    // SAFETY: lease_state passes its 16-byte argument.
-                    let a = unsafe { std::slice::from_raw_parts_mut(arg, 16) };
+                    // lease_state passes its 16-byte argument.
+                    let a = &mut arg.bytes()[..16];
                     assert!(a.iter().all(|&b| b == 0), "count only: no ids pointer");
                     match self.0 {
                         Ok(n) => {
@@ -1014,8 +938,8 @@ mod tests {
                     }
                 }
                 DRM_IOCTL_MODE_GETRESOURCES => {
-                    // SAFETY: lease_state passes its 64-byte argument.
-                    let a = unsafe { std::slice::from_raw_parts_mut(arg, 64) };
+                    // lease_state passes its 64-byte argument.
+                    let a = &mut arg.bytes()[..64];
                     assert!(a.iter().all(|&b| b == 0), "counts only: no id lists");
                     a[36..40].copy_from_slice(&self.1.0.to_le_bytes());
                     a[40..44].copy_from_slice(&self.1.1.to_le_bytes());
@@ -1025,7 +949,10 @@ mod tests {
                 _ => panic!("unexpected ioctl {cmd:#x}"),
             }
         }
-        fn close(&self, _: RawFd) {}
+    }
+
+    impl xfer::Sys for LeaseSys {
+        fn close(&self, _: OwnedFd) {}
         fn size_of(&self, _: RawFd) -> i64 {
             0
         }
@@ -1036,11 +963,11 @@ mod tests {
     /// that is not (-EACCES).
     struct CreateLeaseSys(i32, std::sync::Mutex<Vec<RawFd>>);
 
-    impl xfer::Sys for CreateLeaseSys {
-        fn ioctl(&self, _: RawFd, cmd: u32, arg: *mut u8) -> i32 {
-            assert_eq!(cmd, DRM_IOCTL_MODE_CREATE_LEASE);
-            // SAFETY: is_lessee passes its 24-byte argument.
-            let a = unsafe { std::slice::from_raw_parts_mut(arg, 24) };
+    impl crate::sys::block::Kernel for CreateLeaseSys {
+        fn ioctl(&self, _: RawFd, cmd: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+            assert_eq!(cmd as u32, DRM_IOCTL_MODE_CREATE_LEASE);
+            // is_lessee passes its 24-byte argument.
+            let a = &mut arg.bytes()[..24];
             assert_eq!(&a[..8], &[0; 8], "no object list: nothing to lease");
             assert_eq!(&a[8..16], &[1, 0, 0, 0, 0, 0, 0, 0], "one object, no flags");
             if self.0 >= 0 {
@@ -1049,8 +976,12 @@ mod tests {
             }
             self.0
         }
-        fn close(&self, fd: RawFd) {
-            self.1.lock().unwrap().push(fd);
+    }
+
+    impl xfer::Sys for CreateLeaseSys {
+        fn close(&self, fd: OwnedFd) {
+            // A number of the fake's: nothing to close.
+            self.1.lock().unwrap().push(fd.into_raw_fd());
         }
         fn size_of(&self, _: RawFd) -> i64 {
             0

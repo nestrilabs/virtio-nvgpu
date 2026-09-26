@@ -9,6 +9,8 @@
 //! Everything is parameterised by a root directory so it can be tested against
 //! a fixture tree. On a real host that root is [`PROC_NVIDIA`].
 
+#![forbid(unsafe_code)]
+
 use crate::virtio::GpuSlot;
 use std::path::Path;
 

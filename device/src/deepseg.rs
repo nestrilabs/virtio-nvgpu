@@ -21,10 +21,12 @@
 //! given, and the buffers are guarded (`guarded.rs`) all the same. Anything
 //! else refuses the whole call, before anything reaches the host.
 
+#![forbid(unsafe_code)]
+
 use abi::rmctrl::DeepPtr;
 use protocol::messages::{DEEP_SEGS_MAX, DEEP_SEGS_MAX_BYTES, DeepSeg, DeepSegHdr};
 
-use crate::guarded::GuardedBuf;
+use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 
 /// A refusal: the errno the guest's ioctl returns.
 pub type Errno = i32;
@@ -39,14 +41,13 @@ fn rd32(b: &[u8], off: usize) -> u32 {
 struct Seg {
     /// Where the pointer sits in the block.
     ptr: usize,
-    /// The caller's value there, for the reply.
-    guest: [u8; 8],
-    buf: GuardedBuf,
+    /// The block of the call's arena it addresses.
+    buf: BufId,
     len: usize,
 }
 
-/// The buffers one call's segments were given. They must outlive the host
-/// call: each is what a pointer in the block now addresses.
+/// The blocks one call's segments were given, in the call's arena: each is
+/// what a pointer in the block now addresses.
 pub(crate) struct Segments {
     table: Vec<u8>,
     segs: Vec<Seg>,
@@ -54,14 +55,15 @@ pub(crate) struct Segments {
 
 impl Segments {
     /// Check the guest's segmented deep block, `deep`, against `rules` --
-    /// the pointers RM follows in `block` and how much it copies through
-    /// each -- and point each pointer it names at a buffer of ours holding
-    /// the guest's bytes. `block` is the backend's copy, the bytes the host
-    /// will read. On `Err` nothing in `block` has changed.
+    /// the pointers RM follows in `block` (a block of `a`, the bytes the host
+    /// will read) and how much it copies through each -- and give each
+    /// pointer it names a block of `a` holding the guest's bytes. On `Err`
+    /// nothing in `a` has changed.
     pub(crate) fn relocate(
         what: &str,
         rules: &[DeepPtr],
-        block: &mut [u8],
+        a: &mut Arena,
+        block: BufId,
         deep: &[u8],
     ) -> Result<Self, Errno> {
         let refuse = |why: String| {
@@ -82,6 +84,7 @@ impl Segments {
         if deep.len() < table_end {
             return refuse(format!("{count} segments in {} bytes", deep.len()));
         }
+        let bytes = a.bytes(block);
         let mut plan: Vec<(usize, usize)> = Vec::with_capacity(count as usize);
         let mut total = 0usize;
         for i in 0..count as usize {
@@ -93,17 +96,17 @@ impl Segments {
             if plan.iter().any(|&(p, _)| p == ptr) {
                 return refuse(format!("the pointer at {ptr} twice"));
             }
-            let Some(set) = block.get(ptr..ptr + 8) else {
+            let Some(set) = bytes.get(ptr..ptr + 8) else {
                 return refuse(format!(
                     "the pointer at {ptr} is past the {}-byte block",
-                    block.len()
+                    bytes.len()
                 ));
             };
             if set.iter().all(|&b| b == 0) {
                 return refuse(format!("the pointer at {ptr} is null"));
             }
             // RM's own size, from the block it will be handed.
-            match rule.size(block) {
+            match rule.size(bytes) {
                 Some(want) if want as usize == len && len > 0 => {}
                 want => {
                     return refuse(format!(
@@ -124,25 +127,15 @@ impl Segments {
             ));
         }
 
+        // Only now, when nothing about the guest's bytes can fail.
         let mut segs = Vec::with_capacity(plan.len());
         let mut at = table_end;
         for (ptr, len) in plan {
-            let mut buf = GuardedBuf::new(len).ok_or(libc::ENOMEM)?;
-            buf.as_mut_slice().copy_from_slice(&deep[at..at + len]);
+            let buf = a.block(&deep[at..at + len], len)?;
             at += len;
-            let mut guest = [0u8; 8];
-            guest.copy_from_slice(&block[ptr..ptr + 8]);
-            segs.push(Seg {
-                ptr,
-                guest,
-                buf,
-                len,
-            });
-        }
-        // Only now, when nothing can fail.
-        for s in &mut segs {
-            let host = s.buf.as_mut_ptr() as u64;
-            block[s.ptr..s.ptr + 8].copy_from_slice(&host.to_le_bytes());
+            a.slot(block, ptr, 8, SlotKind::Ptr, Restore::Yes)?;
+            a.point(block, ptr, buf)?;
+            segs.push(Seg { ptr, buf, len });
         }
         Ok(Self {
             table: deep[..table_end].to_vec(),
@@ -155,27 +148,12 @@ impl Segments {
         self.segs.iter().map(|s| s.ptr).collect()
     }
 
-    /// The caller's values of the pointers relocated, by offset.
-    pub(crate) fn saved(&self) -> impl Iterator<Item = (usize, [u8; 8])> + '_ {
-        self.segs.iter().map(|s| (s.ptr, s.guest))
-    }
-
-    /// Put the caller's pointers back into `block`, the parameters as the
-    /// host left them.
-    pub(crate) fn restore(&self, block: &mut [u8]) {
-        for (off, v) in self.saved() {
-            if let Some(f) = block.get_mut(off..off + 8) {
-                f.copy_from_slice(&v);
-            }
-        }
-    }
-
     /// The reply's deep block: laid out as the request's, with each
-    /// segment's bytes as the host left them.
-    pub(crate) fn reply(&self) -> Vec<u8> {
+    /// segment's bytes as the host left them in `a`.
+    pub(crate) fn reply(&self, a: &Arena) -> Vec<u8> {
         let mut out = self.table.clone();
         for s in &self.segs {
-            out.extend_from_slice(&s.buf.as_slice()[..s.len]);
+            out.extend_from_slice(&a.bytes(s.buf)[..s.len]);
         }
         out
     }
@@ -215,22 +193,29 @@ mod tests {
         abi::rmctrl::deep_control(0x0080_170d).unwrap().ptrs
     }
 
+    /// `relocate` on an arena block holding `p`: the arena and the block.
+    fn relocate(p: &[u8], deep: &[u8]) -> (Result<Segments, Errno>, Arena, BufId) {
+        let mut a = Arena::new();
+        let b = a.block(p, p.len()).unwrap();
+        let r = Segments::relocate("t", rules(), &mut a, b, deep);
+        (r, a, b)
+    }
+
     #[test]
     fn each_pointer_gets_its_own_buffer_with_the_guests_bytes() {
-        let mut p = channellist(2);
+        let p = channellist(2);
         let deep = build(&[(8, &[1, 0, 0, 0, 2, 0, 0, 0]), (16, &[9; 8])]);
-        let s = Segments::relocate("t", rules(), &mut p, &deep).unwrap();
-        let a = u64::from_le_bytes(p[8..16].try_into().unwrap());
-        let b = u64::from_le_bytes(p[16..24].try_into().unwrap());
-        assert!(a != GUEST && b != GUEST + 0x100 && a != b);
-        // SAFETY: the two buffers `s` owns, eight bytes each.
-        unsafe {
-            assert_eq!(*(a as *const [u8; 8]), [1, 0, 0, 0, 2, 0, 0, 0]);
-            assert_eq!(*(b as *const [u8; 8]), [9; 8]);
-        }
-        assert_eq!(s.reply(), deep);
-        s.restore(&mut p);
-        assert_eq!(p, channellist(2));
+        let (s, a, b) = relocate(&p, &deep);
+        let s = s.unwrap();
+        let host = a.bytes(b);
+        let x = u64::from_le_bytes(host[8..16].try_into().unwrap());
+        let y = u64::from_le_bytes(host[16..24].try_into().unwrap());
+        assert!(x != GUEST && y != GUEST + 0x100 && x != y && x != 0 && y != 0);
+        // Each segment's block holds the guest's bytes, and the reply
+        // carries them back laid out as sent.
+        assert_eq!(s.reply(&a), deep);
+        // The caller's own pointers come back, never ours.
+        assert_eq!(a.reply(b), channellist(2));
     }
 
     #[test]
@@ -250,38 +235,30 @@ mod tests {
                 (8, &[0; 8]),
             ]),
         ] {
-            let mut p = channellist(2);
-            assert_eq!(
-                Segments::relocate("t", rules(), &mut p, &deep).err(),
-                Some(libc::EINVAL),
-                "{deep:?}"
-            );
-            assert_eq!(p, channellist(2));
+            let p = channellist(2);
+            let (r, a, b) = relocate(&p, &deep);
+            assert_eq!(r.err(), Some(libc::EINVAL), "{deep:?}");
+            assert_eq!(a.bytes(b), &channellist(2)[..]);
         }
         // Bytes that do not add up to the table.
         let mut deep = build(&[(8, &[0; 8])]);
         deep.push(0);
-        let mut p = channellist(2);
-        assert!(Segments::relocate("t", rules(), &mut p, &deep).is_err());
+        assert!(relocate(&channellist(2), &deep).0.is_err());
         // A segment for a pointer the caller left null.
         let mut p = channellist(2);
         p[16..24].fill(0);
         let deep = build(&[(16, &[0; 8])]);
-        assert!(Segments::relocate("t", rules(), &mut p, &deep).is_err());
+        assert!(relocate(&p, &deep).0.is_err());
         // A count RM would refuse (0) sizes nothing to send.
-        let mut p = channellist(0);
-        assert!(Segments::relocate("t", rules(), &mut p, &build(&[(8, &[])])).is_err());
+        assert!(relocate(&channellist(0), &build(&[(8, &[])])).0.is_err());
     }
 
     #[test]
     fn the_total_is_bounded() {
         let n = DEEP_SEGS_MAX_BYTES / 4 / 2 + 1;
-        let mut p = channellist(n);
+        let p = channellist(n);
         let a = vec![0u8; n as usize * 4];
         let deep = build(&[(8, &a), (16, &a)]);
-        assert_eq!(
-            Segments::relocate("t", rules(), &mut p, &deep).err(),
-            Some(libc::EINVAL)
-        );
+        assert_eq!(relocate(&p, &deep).0.err(), Some(libc::EINVAL));
     }
 }

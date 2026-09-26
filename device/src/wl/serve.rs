@@ -21,6 +21,8 @@
 //! file must be a card-node file of our own GPU, `hostfd::classify`) before it
 //! is put in the table for the guest to adopt.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -522,13 +524,7 @@ impl NvidiaBackend {
         };
         let resp = conn.send(frame_bytes, &mut ops)?;
         let mut bytes = hdr(MsgType::WlSend, handle, 0, self.current_req_id);
-        // SAFETY: a plain-old-data wire struct viewed as its bytes.
-        bytes.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(
-                (&resp as *const WlSendResp).cast::<u8>(),
-                size_of::<WlSendResp>(),
-            )
-        });
+        bytes.extend_from_slice(crate::sys::pod::bytes(&resp));
         Ok(Reply {
             bytes,
             ..Reply::default()
@@ -536,12 +532,7 @@ impl NvidiaBackend {
     }
 
     fn wl_recv(&mut self, handle: u32, payload: &[u8], cap: usize) -> Result<Reply, i32> {
-        if payload.len() < size_of::<WlRecvReq>() {
-            return Err(libc::EINVAL);
-        }
-        // SAFETY: at least size_of::<WlRecvReq>() bytes, and the struct is
-        // two u32s, valid for any bit pattern.
-        let req = unsafe { (payload.as_ptr() as *const WlRecvReq).read_unaligned() };
+        let req: WlRecvReq = crate::sys::pod::read(payload, 0).ok_or(libc::EINVAL)?;
         self.wl_conn(handle)?;
         // What comes out of the queue is gone from it: a frame that then did
         // not fit the guest's buffer would be records and descriptors lost

@@ -1,0 +1,98 @@
+[package]
+name = "nvgpu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+device = { path = "../device", features = ["vhost-user"] }
+
+# Not part of the main workspace: cargo fuzz builds it with nightly and
+# sanitizers, and `--cfg fuzzing` for every crate (device/src/fuzzing).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "backend"
+path = "fuzz_targets/backend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backend_v2"
+path = "fuzz_targets/backend_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deepseg"
+path = "fuzz_targets/deepseg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "osdesc"
+path = "fuzz_targets/osdesc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rmshare"
+path = "fuzz_targets/rmshare.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nvkms"
+path = "fuzz_targets/nvkms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guestptr"
+path = "fuzz_targets/guestptr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "misc"
+path = "fuzz_targets/misc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wl_engine"
+path = "fuzz_targets/wl_engine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wl_codec"
+path = "fuzz_targets/wl_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vring"
+path = "fuzz_targets/vring.rs"
+test = false
+doc = false
+bench = false

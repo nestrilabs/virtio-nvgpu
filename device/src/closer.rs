@@ -31,6 +31,8 @@
 //! card opened as master right after the previous master closed -- waits for
 //! the closer to be idle first ([`wait_idle`], OPEN_KMS on its executor).
 
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Condvar, Mutex, OnceLock};

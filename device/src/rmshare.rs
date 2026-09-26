@@ -56,6 +56,8 @@
 //! itself succeeding, as for the controls in rmctl.rs: the caller sees what
 //! it would natively for a share or a duplicate RM will not allow.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use abi::ioctl::{NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL, NV_ESC_RM_DUP_OBJECT, NV_ESC_RM_SHARE};
@@ -1420,6 +1422,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
     fn the_cap_counts_lists_and_grants() {
         let mut o = Ownership::default();
         let grant = policy(RS_SHARE_TYPE_CLIENT, RS_SHARE_ACTION_FLAG_COMPOSE, PEER);
@@ -1627,10 +1631,9 @@ mod backend_tests {
 
     /// A host RM that allocates clients with fresh handles and answers
     /// NV_OK to everything else.
-    unsafe fn fake_rm(_: RawFd, request: u64, arg: *mut u8) -> i32 {
+    fn fake_rm(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
         let request = request as u32;
-        // SAFETY: the HostIoctl contract, `arg` holds _IOC_SIZE bytes.
-        let a = unsafe { std::slice::from_raw_parts_mut(arg, hostfd::ioc_size(request)) };
+        let a = &mut arg.bytes()[..hostfd::ioc_size(request)];
         let nr = hostfd::ioc_nr(request);
         SEEN.with(|s| s.borrow_mut().push((nr, rd32(a, 0).unwrap())));
         let status = match nr {
@@ -1895,6 +1898,9 @@ mod backend_tests {
     fn a_guest_that_cannot_say_who_calls_fails_closed() {
         // No GCAP_PROC_ID: no process ids, and none can be asked for.
         let (mut be, f1, f2) = vm(0);
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, None);
         let b = alloc_client(&mut be, f2, None);
         assert_eq!(be.semsurf.owner_of(a), None);
@@ -2149,6 +2155,9 @@ mod backend_tests {
     #[test]
     fn a_second_client_named_in_parameters_must_be_this_vms() {
         let (mut be, f1, _) = vm(FULL);
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         // A device sharing a host client's VA space.
         let dev = |share: u32| words(&[(4, share)], 56);
@@ -2188,6 +2197,9 @@ mod backend_tests {
     #[test]
     fn a_second_client_is_held_to_rms_rule_for_its_field() {
         let (mut be, f1, f2) = vm(FULL);
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let me = pid(10);
         let a = alloc_client(&mut be, f1, Some(me));
         let mine_too = alloc_client(&mut be, f2, Some(me));
@@ -2277,6 +2289,9 @@ mod backend_tests {
         // GCAP_PROC_ID alone: the process, no euid, and no caller on
         // controls.
         let (mut be, f1, f2) = vm(GCAP_PROC_ID);
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let me = pid(10);
         let a = alloc_client(&mut be, f1, Some(me));
         let mine_too = alloc_client(&mut be, f2, Some(me));
@@ -2391,6 +2406,9 @@ mod backend_tests {
     #[test]
     fn channels_of_another_vms_clients_are_not_disabled() {
         let (mut be, f1, _) = vm(FULL);
+        // This module's gate alone: the RM allowlist in front of it
+        // (rmallow.rs) refuses these calls first, and is tested there.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_110b), (24, 536)], 32);
         let list = |c: u32| words(&[(4, 1), (24, c), (280, 0xc4a)], 536);

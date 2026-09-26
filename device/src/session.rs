@@ -22,6 +22,8 @@
 //! adopts what the host produced and builds the response, under the mutex
 //! again.
 
+#![forbid(unsafe_code)]
+
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -159,11 +161,7 @@ pub fn monotonic_ns() -> u64 {
 }
 
 fn clock_ns(clock: libc::clockid_t) -> u64 {
-    // SAFETY: an all-zero timespec is valid and clock_gettime overwrites it.
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    // SAFETY: plain syscall into a local.
-    unsafe { libc::clock_gettime(clock, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    crate::sys::proc::clock_ns(clock)
 }
 
 /// What serving one request produced.
@@ -295,21 +293,18 @@ impl KmsCall {
 /// Open a card node for KMS: O_NONBLOCK, as every DRM-class file the pump
 /// reads is (hostfd::set_nonblock).
 fn open_card(path: &str) -> Result<OwnedFd, i32> {
-    let c = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
-    // SAFETY: a NUL-terminated path; the descriptor is owned below.
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
-        )
+    // Fuzzing (device/src/fuzzing): no real device is ever opened.
+    #[cfg(fuzzing)]
+    let path = {
+        let _ = path;
+        "/dev/null"
     };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        log::warn!("OPEN_KMS: {path}: {e}");
-        return Err(errno_of(&e));
-    }
-    // SAFETY: a descriptor open() just returned.
-    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+    crate::sys::fd::open_path(path, libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK).map_err(
+        |e| {
+            log::warn!("OPEN_KMS: {path}: {e}");
+            errno_of(&e)
+        },
+    )
 }
 
 /// An IOCTL2 between `prepare` and `finish`.
@@ -462,18 +457,12 @@ pub(crate) fn hdr(t: MsgType, handle: u32, status: i32, req_id: u32) -> Vec<u8> 
     b
 }
 
-fn read<T: Copy + Default>(payload: &[u8]) -> Option<T> {
-    if payload.len() < size_of::<T>() {
-        return None;
-    }
-    // SAFETY: `payload` holds at least size_of::<T>() bytes, and every T used
-    // here is a plain-old-data wire struct valid for any bit pattern.
-    Some(unsafe { (payload.as_ptr() as *const T).read_unaligned() })
+fn read<T: crate::sys::pod::Pod + Copy>(payload: &[u8]) -> Option<T> {
+    crate::sys::pod::read(payload, 0)
 }
 
-fn bytes_of<T: Copy>(v: &T) -> &[u8] {
-    // SAFETY: a wire struct viewed as its bytes, for exactly its size.
-    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
+fn bytes_of<T: crate::sys::pod::Pod>(v: &T) -> &[u8] {
+    crate::sys::pod::bytes(v)
 }
 
 fn errno_of(e: &std::io::Error) -> i32 {
@@ -1094,7 +1083,6 @@ mod tests {
     use super::*;
     use crate::hostfd::CardNode;
     use crate::pump::WatchMode;
-    use std::os::fd::FromRawFd;
 
     fn msg(t: MsgType, handle: u32, body: &[u8]) -> Vec<u8> {
         let mut v = hdr(t, handle, 0, 0x55);
@@ -1124,13 +1112,7 @@ mod tests {
     }
 
     fn devnull() -> OwnedFd {
-        // SAFETY: a NUL-terminated path; ownership passes to the OwnedFd.
-        unsafe {
-            OwnedFd::from_raw_fd(libc::open(
-                c"/dev/null".as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC,
-            ))
-        }
+        crate::sys::fd::open(c"/dev/null", libc::O_RDONLY | libc::O_CLOEXEC).unwrap()
     }
 
     fn backend() -> NvidiaBackend {
@@ -1163,6 +1145,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri's clocks start at zero")]
     fn time_sync_carries_realtime_and_raw_when_the_guest_has_room() {
         let mut be = backend();
         assert_eq!(status(&hello(&mut be, 0)), 0);
@@ -1609,11 +1593,7 @@ mod tests {
     }
 
     fn pipe_ends() -> (OwnedFd, OwnedFd) {
-        let mut p = [0i32; 2];
-        // SAFETY: `p` receives the two new descriptors.
-        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: descriptors pipe2 just returned.
-        unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) }
+        crate::sys::fd::pipe2(libc::O_CLOEXEC).unwrap()
     }
 
     fn opened(be: &NvidiaBackend, fd: OwnedFd) -> PendingIoctl2 {
@@ -1642,9 +1622,11 @@ mod tests {
         assert!(reply.created.is_empty());
         assert_eq!(be.handle_count(), 0);
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
-        // SAFETY: a one-byte write from a live array.
-        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-        assert_eq!(n, -1, "closed, not adopted");
+        let n = crate::sys::fd::write(&w, b"x");
+        assert!(
+            n.is_err() || crate::testfd::only_end_here(w.as_fd()),
+            "closed, not adopted"
+        );
 
         let (r, _w) = pipe_ends();
         let p = opened(&be, r);

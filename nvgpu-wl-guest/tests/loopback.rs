@@ -17,6 +17,8 @@
 //! PATH, so it is ignored by default; `scripts/wl-loopback-test.sh` provides
 //! them with nix and runs it.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};

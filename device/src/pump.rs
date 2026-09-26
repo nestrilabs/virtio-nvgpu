@@ -51,9 +51,11 @@
 //!   enables notifications on the queue whenever it finds none posted -- with
 //!   EVENT_IDX the guest otherwise never kicks at all.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
@@ -497,10 +499,9 @@ impl PumpHandle {
 
     /// The guest posted event buffers: flush whatever is waiting for one.
     pub fn kick(&self) {
-        let one = 1u64.to_ne_bytes();
-        // SAFETY: an 8-byte write to an eventfd we own. EAGAIN (counter
-        // saturated) means a wake is already pending, which is all we want.
-        unsafe { libc::write(self.wake.as_raw_fd(), one.as_ptr().cast(), 8) };
+        // EAGAIN (counter saturated) means a wake is already pending, which
+        // is all we want.
+        crate::sys::fd::eventfd_signal(self.wake.as_raw_fd());
     }
 }
 
@@ -538,17 +539,10 @@ impl<Q: EventQueue + 'static> Pump<Q> {
 
 impl<Q: EventQueue> Pump<Q> {
     pub fn new(queue: Q) -> io::Result<(Self, PumpHandle)> {
-        // SAFETY: plain syscalls; both results are owned below.
-        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if epfd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let epfd = PrivateFd::new(unsafe { OwnedFd::from_raw_fd(epfd) });
-        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if wake < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let wake = Arc::new(PrivateFd::new(unsafe { OwnedFd::from_raw_fd(wake) }));
+        let epfd = PrivateFd::new(crate::sys::fd::epoll_create()?);
+        let wake = Arc::new(PrivateFd::new(crate::sys::fd::eventfd(
+            libc::EFD_CLOEXEC | libc::EFD_NONBLOCK,
+        )?));
         let (tx, rx) = channel();
         let pump = Self {
             epfd,
@@ -572,9 +566,7 @@ impl<Q: EventQueue> Pump<Q> {
     }
 
     fn ctl(&self, op: i32, fd: RawFd, events: u32, data: u64) -> bool {
-        let mut ev = libc::epoll_event { events, u64: data };
-        // SAFETY: `ev` outlives the call; epoll copies it.
-        unsafe { libc::epoll_ctl(self.epfd.as_raw_fd(), op, fd, &mut ev) == 0 }
+        crate::sys::fd::epoll_ctl(self.epfd.as_raw_fd(), op, fd, events, data).is_ok()
     }
 
     fn arm(&self, handle: u32, w: &Watched) -> bool {
@@ -629,19 +621,14 @@ impl<Q: EventQueue> Pump<Q> {
 
     fn step_with_timeout(&mut self, timeout_ms: i32) -> bool {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
-        // SAFETY: `events` is writable for its whole length.
-        let n = unsafe {
-            libc::epoll_wait(
-                self.epfd.as_raw_fd(),
-                events.as_mut_ptr(),
-                events.len() as i32,
-                timeout_ms,
-            )
+        let n = match crate::sys::fd::epoll_wait(self.epfd.as_raw_fd(), &mut events, timeout_ms) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => 0,
+            Err(e) => {
+                log::error!("event pump: epoll_wait: {e}");
+                return false;
+            }
         };
-        if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            log::error!("event pump: epoll_wait: {}", io::Error::last_os_error());
-            return false;
-        }
 
         // Instructions first: a descriptor closed on the queue thread must
         // leave the set before it can be reported again.
@@ -649,14 +636,12 @@ impl<Q: EventQueue> Pump<Q> {
             return false;
         }
 
-        for ev in events.iter().take(n.max(0) as usize) {
+        for ev in events.iter().take(n) {
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
             let data = { ev.u64 };
             if data == WAKE {
-                let mut b = [0u8; 8];
-                // SAFETY: an 8-byte read from our own non-blocking eventfd.
-                unsafe { libc::read(self.wake.as_raw_fd(), b.as_mut_ptr().cast(), 8) };
+                crate::sys::fd::eventfd_drain(self.wake.as_raw_fd());
                 continue;
             }
             self.on_ready(data as u32);
@@ -741,10 +726,8 @@ impl<Q: EventQueue> Pump<Q> {
                 consume,
             } => {
                 if consume && readable(fd) {
-                    let mut b = [0u8; 8];
-                    // SAFETY: an 8-byte read from an eventfd after poll said
-                    // it would not block.
-                    unsafe { libc::read(fd, b.as_mut_ptr().cast(), 8) };
+                    // Poll said the read would not block.
+                    crate::sys::fd::eventfd_drain(fd);
                 }
                 self.outbox.ready(cookie);
                 if oneshot {
@@ -789,13 +772,13 @@ impl<Q: EventQueue> Pump<Q> {
             if !readable(fd) {
                 return;
             }
-            // SAFETY: `buf` is DRM_READ_MAX bytes; poll said this will not
-            // block, and the file is O_NONBLOCK besides.
-            let n = unsafe { libc::read(fd, self.buf.as_mut_ptr().cast(), self.buf.len()) };
-            if n <= 0 {
-                return;
-            }
-            let bytes = self.buf[..n as usize].to_vec();
+            // Poll said this will not block, and the file is O_NONBLOCK
+            // besides.
+            let n = match crate::sys::fd::read_raw(fd, &mut self.buf) {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let bytes = self.buf[..n].to_vec();
             self.outbox.drm(handle, &bytes);
         }
     }
@@ -864,13 +847,7 @@ impl<Q: EventQueue> Pump<Q> {
 
 /// Whether reading `fd` would return something now.
 fn readable(fd: RawFd) -> bool {
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one pollfd, zero timeout.
-    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & libc::POLLIN != 0 }
+    crate::sys::fd::readable(fd, 0)
 }
 
 #[cfg(test)]
@@ -1078,19 +1055,11 @@ mod tests {
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
-        let mut p = [0i32; 2];
-        // SAFETY: `p` receives the two new descriptors.
-        assert_eq!(
-            unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) }
+        crate::sys::fd::pipe2(libc::O_CLOEXEC | libc::O_NONBLOCK).unwrap()
     }
 
     fn write_all(fd: &OwnedFd, b: &[u8]) {
-        // SAFETY: writing from a live slice.
-        let n = unsafe { libc::write(fd.as_raw_fd(), b.as_ptr().cast(), b.len()) };
-        assert_eq!(n as usize, b.len());
+        assert_eq!(crate::sys::fd::write(fd, b).unwrap(), b.len());
     }
 
     #[test]
@@ -1223,8 +1192,7 @@ mod tests {
 
         // Drained: the next sweep drops it, and nothing is left to poll.
         let mut b = [0u8; 1];
-        // SAFETY: a one-byte read from the pump's copy of the pipe.
-        unsafe { libc::read(pump.watches[&7].fd.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        let _ = crate::sys::fd::read_raw(pump.watches[&7].fd.as_raw_fd(), &mut b);
         pump.sweep();
         assert!(pump.stale.is_empty());
     }
@@ -1247,10 +1215,11 @@ mod tests {
         pump.step_with_timeout(0);
         assert!(crate::closer::wait_idle(Duration::from_secs(5)));
         // With the only read end closed, a write finds no reader.
-        // SAFETY: a one-byte write from a live array.
-        let n = unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-        assert_eq!(n, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPIPE));
+        match crate::sys::fd::write(&w, b"x") {
+            // A forked test child's copy (testfd.rs).
+            Ok(_) => assert!(crate::testfd::only_end_here(std::os::fd::AsFd::as_fd(&w))),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
+        }
     }
 
     #[test]

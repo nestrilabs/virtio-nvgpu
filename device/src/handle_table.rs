@@ -47,6 +47,8 @@
 //! processes that hold little (quota.rs). A process past its share gets
 //! EMFILE; the others do not.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
@@ -351,13 +353,9 @@ mod tests {
         assert!(!t.is_buried(h));
     }
     use protocol::messages::DeviceKind;
-    use std::os::fd::FromRawFd;
 
     fn make_fd() -> OwnedFd {
-        // SAFETY: a NUL-terminated path; the fd is owned by the returned value.
-        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        assert!(raw >= 0);
-        unsafe { OwnedFd::from_raw_fd(raw) }
+        crate::sys::fd::open(c"/dev/null", libc::O_RDONLY | libc::O_CLOEXEC).unwrap()
     }
 
     const CTL: HandleKind = HandleKind::Dev(DeviceKind::Ctl);
@@ -427,22 +425,16 @@ mod tests {
         // this test keeps: the read end sees EOF exactly when every write
         // end is closed. Asking whether the number is still open instead
         // raced with other test threads reusing it.
-        let mut ends = [0; 2];
-        // SAFETY: pipe2 into a local array of two.
-        assert_eq!(
-            unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        // SAFETY: both descriptors were just created and are owned here.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let (read, write) = crate::sys::fd::pipe2(libc::O_CLOEXEC | libc::O_NONBLOCK).unwrap();
         let err = t.insert(write, CTL).unwrap_err();
         assert_eq!(err.errno(), libc::EMFILE);
         // The refused descriptor was closed, not leaked.
         let mut b = [0u8; 1];
-        // SAFETY: a read of at most one byte into a local.
-        let n = unsafe { libc::read(read.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
-        assert_eq!(n, 0, "EOF: no write end is left open");
+        let n = crate::sys::fd::read(&read, &mut b);
+        assert!(
+            matches!(n, Ok(0)) || crate::testfd::only_end_here(read.as_fd()),
+            "EOF: no write end is left open"
+        );
         // Space comes back when a handle goes.
         let h = t.handles()[0];
         t.remove(h).unwrap();
@@ -505,7 +497,7 @@ mod tests {
         let (dup, kind) = t.dup(h).unwrap();
         assert_eq!(kind, CTL);
         t.remove(h).unwrap();
-        assert!(unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_GETFD) } >= 0);
+        assert!(crate::sys::fd::is_open(dup.as_raw_fd()));
     }
 
     #[test]

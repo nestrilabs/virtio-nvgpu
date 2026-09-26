@@ -9,6 +9,8 @@
 //! that must not come apart: restoring the SHM backing, and returning the
 //! extent to its zone. Doing only the first is what made the allocator leak.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 
 use crate::shm::ShmRegion;

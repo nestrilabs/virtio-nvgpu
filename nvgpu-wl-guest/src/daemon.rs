@@ -14,9 +14,11 @@
 //! buffer. The channel is read whenever it is readable, and what it yields is
 //! written to the local peer as fast as the peer takes it.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -130,23 +132,9 @@ const STUCK_FOR: Duration = Duration::from_secs(30);
 /// The process at the other end of a client socket (SO_PEERCRED), in the
 /// daemon's PID namespace; `None` when the kernel cannot say.
 fn peer_pid(s: &UnixStream) -> Option<i32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: getsockopt into a local of the size given.
-    let r = unsafe {
-        libc::getsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    (r == 0 && cred.pid > 0).then_some(cred.pid)
+    crate::sys::peer_cred(s.as_raw_fd())
+        .map(|c| c.pid)
+        .filter(|&pid| pid > 0)
 }
 
 /// The guest kernel as the engine's platform: dma-bufs and DRM files are its
@@ -215,45 +203,12 @@ pub struct Daemon {
 }
 
 fn epoll_ctl(ep: RawFd, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
-    let mut ev = libc::epoll_event { events, u64: token };
-    let r = unsafe { libc::epoll_ctl(ep, op, fd, &mut ev) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    crate::sys::epoll_ctl(ep, op, fd, events, token)
 }
 
 /// A DRM node of ours: `DRM_IOCTL_VERSION` says "nvidia-drm".
 fn is_nvidia_drm(fd: RawFd) -> bool {
-    #[repr(C)]
-    struct DrmVersion {
-        major: i32,
-        minor: i32,
-        patch: i32,
-        name_len: usize,
-        name: *mut u8,
-        date_len: usize,
-        date: *mut u8,
-        desc_len: usize,
-        desc: *mut u8,
-    }
-    let mut name = [0u8; 32];
-    let mut v = DrmVersion {
-        major: 0,
-        minor: 0,
-        patch: 0,
-        name_len: name.len(),
-        name: name.as_mut_ptr(),
-        date_len: 0,
-        date: std::ptr::null_mut(),
-        desc_len: 0,
-        desc: std::ptr::null_mut(),
-    };
-    // DRM_IOCTL_VERSION = _IOWR('d', 0x00, struct drm_version)
-    let req = (3u64 << 30) | ((size_of::<DrmVersion>() as u64) << 16) | ((b'd' as u64) << 8);
-    let r = unsafe { libc::ioctl(fd, req as _, &mut v) };
-    r == 0 && name.starts_with(b"nvidia-drm")
+    crate::sys::drm_driver_name(fd).is_some_and(|n| n.starts_with(b"nvidia-drm"))
 }
 
 /// Open the first of `prefix*` in /dev/dri that is ours (or `explicit`).
@@ -275,20 +230,16 @@ fn open_node(explicit: Option<&Path>, prefix: &str) -> Option<OwnedFd> {
         }
     };
     for p in candidates {
-        let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) else {
+        // Read-write, close-on-exec (std's default).
+        let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(&p) else {
             continue;
         };
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            continue;
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = OwnedFd::from(f);
         if is_nvidia_drm(fd.as_raw_fd()) {
             if prefix == "card" {
                 // The first opener of a card node becomes the guest core's
                 // master; a template must never keep that from a compositor.
-                // DRM_IOCTL_DROP_MASTER = _IO('d', 0x1f).
-                unsafe { libc::ioctl(fd.as_raw_fd(), ((b'd' as u64) << 8 | 0x1f) as _) };
+                crate::sys::drop_master(fd.as_raw_fd());
             }
             return Some(fd);
         }
@@ -299,11 +250,7 @@ fn open_node(explicit: Option<&Path>, prefix: &str) -> Option<OwnedFd> {
 impl Daemon {
     pub fn new(cfg: Config, mut conn: Box<dyn Connector>) -> io::Result<Daemon> {
         let info = conn.info()?;
-        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if ep < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let ep = unsafe { OwnedFd::from_raw_fd(ep) };
+        let ep = crate::sys::epoll_create()?;
         let mut d = Daemon {
             clock: Arc::new(AtomicI64::new(info.clock_offset_ns)),
             last_clock: Instant::now(),
@@ -416,24 +363,13 @@ impl Daemon {
             max_wait_ms
         };
         let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 64];
-        let n = unsafe {
-            libc::epoll_wait(
-                self.ep.as_raw_fd(),
-                evs.as_mut_ptr(),
-                evs.len() as i32,
-                timeout,
-            )
+        let n = match crate::sys::epoll_wait(self.ep.as_raw_fd(), &mut evs, timeout) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+            Err(e) => return Err(e),
         };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted {
-                Ok(())
-            } else {
-                Err(e)
-            };
-        }
         let mut touched = Vec::new();
-        for ev in &evs[..n as usize] {
+        for ev in &evs[..n] {
             let (tok, events) = (ev.u64, ev.events);
             match tok {
                 TOK_LISTENER => self.accept(),

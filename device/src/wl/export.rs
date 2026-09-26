@@ -8,6 +8,8 @@
 //! compositor is as trusted as the VM, which is to say not at all, and only
 //! this user's own programs are meant to be its clients.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -30,30 +32,28 @@ pub struct WlExport {
     ready: OwnedFd,
     stop: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Bound but not yet accepting ([`WlExport::bind_idle`]).
+    idle: Mutex<Option<UnixListener>>,
 }
 
 fn peer_uid(s: &UnixStream) -> io::Result<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let r = unsafe {
-        libc::getsockopt(
-            s.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
+    Ok(crate::sys::fd::peer_cred(s.as_raw_fd())?.uid)
 }
 
 impl WlExport {
     /// Listen on `path` (replacing a stale socket there). Returns the listener
     /// and a duplicate of its readiness eventfd.
     pub fn bind(path: &Path) -> io::Result<(Arc<WlExport>, OwnedFd)> {
+        let (e, ready) = Self::bind_idle(path)?;
+        e.start()?;
+        Ok((e, ready))
+    }
+
+    /// `bind` without the accepting thread, which [`WlExport::start`] starts:
+    /// the backend binds before its sandbox, which leaves it no directory to
+    /// create a socket in, and starts threads after, since a user namespace
+    /// is entered only by a process with one (device::sandbox).
+    pub fn bind_idle(path: &Path) -> io::Result<(Arc<WlExport>, OwnedFd)> {
         match std::fs::symlink_metadata(path) {
             Ok(m) if m.file_type().is_socket_like() => std::fs::remove_file(path)?,
             Ok(_) => {
@@ -77,13 +77,23 @@ impl WlExport {
             ready,
             stop: AtomicBool::new(false),
             thread: Mutex::new(None),
+            idle: Mutex::new(None),
         });
-        let e2 = e.clone();
+        *e.idle.lock().unwrap() = Some(l);
+        Ok((e, ready_dup))
+    }
+
+    /// Start accepting on a listener [`WlExport::bind_idle`] bound. Once.
+    pub fn start(self: &Arc<Self>) -> io::Result<()> {
+        let Some(l) = self.idle.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return Ok(());
+        };
+        let e2 = self.clone();
         let t = std::thread::Builder::new()
             .name("nvgpu-wl-export".into())
             .spawn(move || accept_loop(e2, l))?;
-        *e.thread.lock().unwrap() = Some(t);
-        Ok((e, ready_dup))
+        *self.thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(t);
+        Ok(())
     }
 
     /// The next host connection, if any (OPEN(DEV_WAYLAND, WL_OPEN_ACCEPT)).
@@ -123,7 +133,7 @@ impl SocketLike for std::fs::FileType {
 }
 
 fn accept_loop(e: Arc<WlExport>, l: UnixListener) {
-    let me = unsafe { libc::getuid() };
+    let me = crate::sys::proc::uid();
     for s in l.incoming() {
         if e.stop.load(Ordering::Relaxed) {
             return;

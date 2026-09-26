@@ -64,11 +64,123 @@ met real hardware ([`TESTING.md`](../TESTING.md)).
 | `src/posture.rs` | refusing root and `CAP_SYS_ADMIN`, dropping capabilities, the socket's directory and path |
 | `src/ratelimit.rs`, `src/tally.rs` | a rate limit per log call site, and bounded RM class and control tallies |
 | `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and a replay of real mapping lifetimes against the allocator; `WindowPlacer`, what a transport implements to place into the window and the UVM aperture |
-| `src/guarded.rs` | host-written buffers with a guard page behind them |
+| `src/sys/` | every `unsafe` of the crate, and nothing else (`scripts/check-unsafe.sh`; every other module is `#![forbid(unsafe_code)]`): the arena that builds each host call's parameter blocks from the guest's bytes and the backend's own pointers and descriptors (`block.rs`), the one `ioctl` (`ioctl.rs`), the guarded buffers the host writes into (`guarded.rs`), owned mappings with checked `MAP_FIXED` (`mem.rs`), descriptors, netlink, process and sandbox calls (`fd.rs`, `net.rs`, `proc.rs`), wire structs as bytes (`pod.rs`); SECURITY.md §14 |
 | `src/virtio.rs` | device config and feature layout, asserted against `driver/nvgpu_wire.h` |
+| `src/vring.rs` | a control-queue chain as the vhost-user transport takes it: summed before it is read, gathered, the reply scattered back (feature `vhost-user`) |
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
 | `src/i2_e2e.rs` | test only: `driver/nvgpu_i2.c` transliterated to Rust, run against the whole backend |
+| `src/fuzzing/` | fuzzing only (`--cfg fuzzing`, never in the backend): the fuzz targets' entry points and the fake host they run against; see "Fuzzing" below |
+| `src/fuzz_seeds.rs` | test only: with `NVGPU_FUZZ_SEEDS` set, every session a unit test serves is written out as a seed for the `backend` targets |
 | `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`) |
 | `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, guest RAM handed to the backend from each memory table, and every command-line flag (`--help`) |
 | `bin/nvgpu-userspace.rs` | stages the host's NVIDIA user-mode driver for a guest to mount |
 | `bin/test-harness.rs`, `bin/test_client.rs` | an early socket harness and its client |
+
+## Fuzzing
+
+`scripts/fuzz.sh` (its header has every command) builds and runs a
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) target for each place
+the host takes bytes from the guest or a Wayland peer, on a pinned nightly
+with AddressSanitizer, each in a bubblewrap sandbox with a `/dev` of its own.
+The targets are in `fuzz/` (a workspace of its own); what they drive is
+`src/fuzzing/`, compiled only under `--cfg fuzzing`.
+
+```
+scripts/fuzz.sh seeds            # build, record seeds from the unit tests
+scripts/fuzz.sh run 1800         # every target, 30 minutes, side by side
+scripts/fuzz.sh triage backend   # what each finding is
+scripts/fuzz.sh repro backend fuzz/artifacts/backend/crash-...
+scripts/fuzz.sh stats            # how far the backend corpora reach
+scripts/fuzz.sh miri
+```
+
+| target | what the input is | what is checked beyond "no panic" |
+|---|---|---|
+| `backend` | a configuration byte (v2 or not, compute, guest RAM, process ids, compositor mode, fences, driver release), then whole messages as the guest's driver queues them, each with its response capacity; files of every kind already open | see below |
+| `backend_v2` | the same, always a v2 session with compute, guest RAM and 610.57.04 | as `backend` |
+| `vring` | guest memory holding a control queue: descriptor table, available ring, buffers; walked by `virtio-queue`, taken apart by `vring.rs`, served, the reply scattered back | as `backend`, and a reply never past the chain's writable bytes |
+| `deepseg` | a deep-segment block for one of RM's measured controls | each relocated pointer is a buffer of ours holding exactly the guest's bytes, RM's own size; a refusal changes nothing |
+| `osdesc` | an OS-descriptor call and its page list | the runs are the list; the mapping RM gets is those guest pages, in order |
+| `rmshare` | share and duplicate parameters, named-client tables, locally answered controls; or a sequence of ownership operations | a forgotten client is in no list; no duplicate between two processes nothing shares; the grant count is the lists' |
+| `nvkms` | v1 NVKMS messages against every release's policy | |
+| `guestptr` | RM escapes, controls and UVM blocks; IDLE_CHANNELS lists | no pointer RM follows is left holding a guest value; the caller reads its own values back |
+| `misc` | fence rewrites, uevents, KMS property names | |
+| `wl_engine` | a sequence of: app and compositor messages (raw, or built from the protocol tables against live objects, with descriptors of every class), channel frames into either end (raw, or built from any record type: Wayland, stream data, EOF, credit, SHM_SYNC, blob, error, hangup), moving what is queued across, stream readiness | no descriptor left open once both ends are dropped |
+| `wl_codec` | a frame, and a message against any signature | |
+
+The `backend` targets run the whole dispatcher (`serve`, IOCTL2's
+`execute` and `finish`) against a fake host (`src/fuzzing/host.rs`): RM,
+UVM, NVKMS and nvidia-drm as far as their parameter blocks go. Every pointer
+the real driver would follow is followed, for as many bytes as it would
+copy, against the regions of the call's own arena (`src/sys/block.rs`,
+`Arg::reach`): a pointer that starts in none of them -- any 8 bytes of the
+input, a small number, any other memory of the process -- is a finding, and
+a copy that runs past a block and its slack is the EFAULT the guard pages of
+`sys/guarded.rs` turn it into. OS-descriptor registrations are
+checked page by page against an independent reading of the page list, over
+guest RAM whose every word holds its own address. IOCTL2's host calls walk
+the schema tables as the kernel walks the struct. The window and the UVM
+aperture are a fake VMM that refuses a placement outside them, over another,
+of one of the backend's private descriptors, or a UVM pool outside UVM's
+band; after teardown nothing may be left placed and no descriptor open.
+Replies may not exceed their capacity or carry an address the host was
+handed.
+
+Nothing reaches a device: under `cfg(fuzzing)` every path the backend opens
+is `/dev/null` (`nvidia.rs`, `session.rs`, `semsurf.rs`, `hostfd.rs`), the
+harness refuses to start where `/dev/nvidiactl` exists, and the script's
+sandbox has none.
+
+The corpora start from the unit tests: `scripts/fuzz.sh seeds` runs them
+with `NVGPU_FUZZ_SEEDS` set, and every session is a seed (again with its
+first handle as each kind of file the harness holds, and as a control queue
+for `vring`). That is most of the depth: from nothing the dispatcher target
+reached 2,300 edges in a minute; from the tests, 15,000.
+
+### What it found
+
+Four campaigns, every target side by side (about 20 worker processes,
+AddressSanitizer on): 10, 25, 30 and 25 minutes, the harness corrected
+between them. The dispatcher pair ran about 30 million inputs, the
+control queue 9 million, the Wayland engine 130 million, the parsers
+between 70 million and 2 billion each.
+
+- **A guest pointer reached RM** (critical; `20434fa`). The size field RM
+  copies a control's parameters by was left as the guest wrote it, and the
+  buffer made as long as what was sent. Sent one byte short of a pointer
+  field, the parameters had RM read the guest's seven bytes over a zero of
+  the buffer's slack -- an address of the guest's choosing in the backend,
+  which the pointer scrub, reading only what was sent, never saw; RM copies
+  in from it and out to it. The size the host copies must now be exactly
+  what was sent (or zero, where the host takes the class's own), on every
+  nested path. Found as a two-byte pointer, 0x4000, by `backend_v2`.
+- `serve` answered a request too short for a header, or of no known type,
+  with a 16-byte header whatever capacity the guest posted. The vhost-user
+  transport never posts less, but `serve` promises no reply past `cap`;
+  fixed for every path (`0b320bb`).
+
+Everything else reported was the harness's own mistake, corrected: no other
+crash, overflow, leak, stray placement or guest pointer.
+
+## Miri
+
+`scripts/fuzz.sh miri` runs every unit test of `device` and `wlwire` under
+Miri, one per process, since Miri stops at the first system call it cannot
+model. It models files, pipes, eventfds and anonymous memory; not memfds,
+file-backed mappings, Unix sockets or device ioctls, so most of the
+backend's tests end there, and are counted, not failed. Under `cfg(miri)`
+the shared window's backing, `GuardedBuf` (Miri's own bounds checks stand
+in for the guard page) and `wlwire`'s memfd, seals and holes have stand-ins,
+so the allocator, the deep and nested buffers, and the Wayland engine's shm,
+blob and stream paths run. A test Miri cannot run for another reason says
+why in a `cfg_attr(miri, ignore = ...)`. Of 624 tests, 463 run to the end
+(46 of `wlwire`'s 52, 417 of `device`'s 572), 128 stop at something Miri
+cannot model, and 33 are ignored with their reason.
+
+It found one thing, in ten tests (`5e62911`): every v1 path handed the host a pointer
+taken from a slice of the guest's length, and the nested block's address
+was taken before the writes that relocate its pointers. Under Stacked
+Borrows the first covers only the guest's bytes, while the host copies
+`_IOC_SIZE`, and the second is invalidated before the call. Not known to
+miscompile, but undefined; now the host is handed the whole buffer
+(`host_call`) and the address is taken last.

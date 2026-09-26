@@ -31,6 +31,8 @@
 //! to a minute), so one slow moment of the compositor does not hide leasing for
 //! the life of the backend.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -253,12 +255,7 @@ impl Probe {
             if left.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
             }
-            let mut p = libc::pollfd {
-                fd: self.sock.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe { libc::poll(&mut p, 1, left.as_millis() as i32) };
+            crate::sys::fd::readable(self.sock.as_raw_fd(), left.as_millis() as i32);
             let mut got = Vec::new();
             match sys::recv_with_fds(self.sock.as_raw_fd(), &mut chunk, &mut got) {
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),

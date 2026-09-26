@@ -17,6 +17,7 @@ There are several, each with its own generator:
 | `nvkms/*.json` | `nvkms_extract.py` | NVKMS and nvidia-drm ioctl layouts, per release | [NVKMS and nvidia-drm layouts](#nvkms-and-nvidia-drm-layouts) |
 | `rmctrl/*.json` → `src/rmctrl/generated.rs`, `../driver/gen/nvgpu_rm_deep.h` | `rmctrl_extract.py` | where RM follows a pointer inside a control's parameters, and how much it copies through it, per release | [RM control pointers](#rm-control-pointers) |
 | `uvm/*.json` | `uvm_extract.py` | UVM parameter block sizes and descriptor offsets, per release | [UVM parameter blocks](#uvm-parameter-blocks) |
+| `rmallow/*.json` → `src/rmallow/generated.rs` | `rmallow_extract.py` | the RM allowlist: which controls and classes a guest may reach, per release | [RM allowlist](#rm-allowlist) |
 | `../driver/gen/nvgpu_rmalloc_classes.h`, `nvgpu_v1v2_rewrites.h` | `nvgpu_gen.py` | the guest module's RM class and rewrite tables | — |
 
 The profiles key off a range of releases; the NVKMS, nvidia-drm, RM control and
@@ -220,3 +221,63 @@ would get. Besides the six measured releases (the three ABI profiles,
 595.99.02, 610.57.04 and 615.71.09), `VERSIONS` has the four where it found a
 change (550.40.53, 565.57.01, 580.65.06, 590.44.01). Sources are
 cached in `$UVM_EXTRACT_CACHE` (default `$TMPDIR/ogkm-uvm`).
+
+## RM allowlist
+
+`rmallow_extract.py` decides which RM_CONTROL commands and RM_ALLOC classes
+reach the host's RM at all; `device/src/rmallow.rs` answers everything else
+before RM sees it, as RM answers a call it does not implement. Default deny,
+per release.
+
+The measured half, per release, from the tag's sources: every exported
+control of every NVOC class (`src/nvidia/generated/g_*_nvoc.c`: method id,
+RMCTRL flags read with that release's own `control.h` values -- they moved
+between 535 and 580 -- the exporting class, and its parameter type, sized by
+a C probe against the SDK headers); its FINN name; the deprecated V1
+controls RM converts first, each with the V2 it becomes; what DEFERRED_API
+may bundle; whether the parameters (nested structs included) carry a
+pointer, a descriptor, a process id or an OS event; every class of
+`resource_list.h` with its RS flags and implementing NVOC class, and whether
+any GPU the release drives has it (`g_gpu_class_list.c`); and the escape
+blocks' class, function and status offsets from `nvos.h`.
+
+The judgement half is `POLICY` in the script. A control or class is allowed
+only if RM would serve it to an unprivileged process (NON_PRIVILEGED, and not
+PRIVILEGED, KERNEL_PRIVILEGED or INTERNAL; for classes ALLOC_NON_PRIVILEGED),
+it names no host resource the backend does not translate, and a workload
+asks for it:
+
+- **observed**: `rmallow/observed.txt`, every control and class RM served
+  across the rig's 106 hardware runs (Vulkan, GL, EGL, CUDA, Firefox,
+  Chromium, mpv, gamescope, nvidia-smi);
+- **own object**: every user-callable control of an object the guest itself
+  allocated and RM confines to it (channel, channel group, context share,
+  graphics context, memory, VA space, memory mapper, semaphore surface, user
+  shared data, context DMA), with two scheduling controls left out; and for
+  classes, every user-allocatable class of the NVOC classes observed --
+  which is how every architecture's channel, usermode, 3D, compute, copy,
+  NVDEC, NVENC, NVJPG and OFA classes come in, filtered to those some GPU
+  the release drives has;
+- **workload**: named controls and classes for NVENC, NVDEC, Vulkan Video,
+  graphics and compute paths not yet run, read from gVisor nvproxy's
+  compute, utility, graphics and video lists as a hint.
+
+Controls RM hands to GSP-RM without a CPU-side table -- the GSS legacy ones
+(bit 15 of the command) and every control of an NV2081_BINAPI object -- have
+no name or size in the open sources; only the observed ones are allowed, by
+number.
+
+```sh
+./rmallow_extract.py all       # fetch + measure every release, render
+./rmallow_extract.py check     # re-measure and fail if gen/rmallow/ is stale
+./rmallow_extract.py render    # gen/rmallow/*.json + policy -> src/rmallow/generated.rs
+./rmallow_extract.py report    # allowed and refused counts per release, by reason
+```
+
+`render` is pure Python, and the Rust test
+`the_checked_in_table_is_what_the_extractor_renders` runs it, so a policy
+edit that was not rendered and committed fails the tests; `render` also fails
+if the policy names a control or class no release has, or refuses an
+observed call RM would serve. A host between two releases gets the older
+list; parameter sizes are held to RM's only on a release measured exactly.
+Sources are cached in `$RMALLOW_EXTRACT_CACHE` (default `$TMPDIR/ogkm-rmallow`).

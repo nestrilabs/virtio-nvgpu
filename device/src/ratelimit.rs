@@ -22,6 +22,8 @@
 //! never gets here, so turning on `debug` for a chase is not throttled by
 //! lines that were never printed before.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -183,6 +185,8 @@ mod tests {
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "timing: Miri runs far slower than the refill")]
     fn one_noisy_site_does_not_silence_another() {
         use log::Log;
         let l = RateLimited::new(Sink(Mutex::new(Vec::new())));

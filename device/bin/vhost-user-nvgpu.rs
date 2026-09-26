@@ -36,8 +36,10 @@
 //!   run on per-file executors (`device::exec`), which complete their own
 //!   chains.
 
+#![forbid(unsafe_code)]
+
 use std::fs::File;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -53,6 +55,7 @@ use device::session::{
     BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, PendingIoctl2, Reply,
 };
 use device::shm::WindowPlacer;
+use device::vring::{gather, layout, scatter};
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use device::wl::export::WlExport;
 use device::wl::{LeaseThrottle, WlConfig, WlLimits};
@@ -71,8 +74,8 @@ use virtio_bindings::bindings::virtio_ring::{
 };
 use virtio_queue::{Error as VirtQueError, QueueOwnedT, QueueT};
 use vm_memory::{
-    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryBackend,
-    GuestMemoryMmap, GuestMemoryRegion,
+    GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend, GuestMemoryMmap,
+    GuestMemoryRegion,
 };
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
@@ -117,6 +120,19 @@ struct Args {
     #[arg(long)]
     permissive_abi: bool,
 
+    /// What to do with an RM control or class the host release's allowlist
+    /// lacks: `enforce` refuses it before the host's RM sees it, as RM
+    /// answers a call it does not implement; `log` logs it with RM's name
+    /// for it and forwards it anyway.
+    ///
+    /// `log` is for finding out what a new workload needs (the teardown
+    /// report lists everything it would have refused); like
+    /// `--permissive-abi`, it hands a guest the parts of RM nobody has
+    /// vetted, so it is not a way to run one. `--permissive-abi` does not
+    /// change this gate.
+    #[arg(long, value_name = "MODE", default_value = "enforce")]
+    rm_allowlist: device::rmallow::Mode,
+
     /// Serve CUDA and other compute: `/dev/nvidia-uvm` (with UVM's
     /// multi-process sharing mode and the UVM aperture, where the VMM maps
     /// semaphore pools at guest-chosen addresses in its own address space),
@@ -139,6 +155,18 @@ struct Args {
     /// caches memory the GPU does not snoop.
     #[arg(long)]
     keep_guest_coherency: bool,
+
+    /// The process sandbox (device::sandbox): a network namespace of its
+    /// own, Landlock confining it to the GPU's nodes and what it reads at
+    /// run time, a seccomp syscall allowlist, RLIMIT_CORE 0. Installed before
+    /// the first guest message; a layer the host kernel lacks is reported as
+    /// DEGRADED and the backend runs without it.
+    ///
+    /// `off` is for finding out whether the sandbox is what broke something,
+    /// never for running a guest: a backend taken over is then everything
+    /// its uid is.
+    #[arg(long, value_name = "on|off", default_value_t = device::sandbox::Mode::On)]
+    sandbox: device::sandbox::Mode,
 
     /// Compositor-VM mode: offer the host's card nodes to the guest, so a
     /// guest compositor can drive the display.
@@ -225,11 +253,10 @@ impl WindowPlacer for VhostWindow {
                 0
             },
         };
-        // SAFETY: the descriptor is owned by the handle table for the whole of
-        // this call, and is only borrowed to be sent.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        // The descriptor is owned by the handle table for the whole of this
+        // call, and is only sent by number.
         self.0
-            .shmem_map(&req, &borrowed)
+            .shmem_map(&req, &fd)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
@@ -261,11 +288,10 @@ impl WindowPlacer for VhostWindow {
         addr: u64,
     ) -> device::error::Result<()> {
         let req = uvm_mmap_msg(aperture_offset, len, addr);
-        // SAFETY: as in `place`: the handle table owns the descriptor for the
-        // whole of this call.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        // As in `place`: the handle table owns the descriptor for the whole
+        // of this call.
         self.0
-            .shmem_map(&req, &borrowed)
+            .shmem_map(&req, &fd)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
@@ -336,7 +362,9 @@ impl Wayland {
         // start, not a guest -ENODEV later.
         let export = match &args.wayland_export {
             Some(p) => {
-                let x = WlExport::bind(p).map_err(|e| {
+                // Bound here, before the sandbox leaves no directory to make a
+                // socket in; its thread starts after (`start_export`).
+                let x = WlExport::bind_idle(p).map_err(|e| {
                     anyhow::anyhow!("--wayland-export {}: cannot listen: {e}", p.display())
                 })?;
                 log::info!("wayland export: host clients connect at {}", p.display());
@@ -563,93 +591,11 @@ struct Taken {
     cap: usize,
 }
 
-/// What a chain's descriptors add up to, before anything is read.
-#[derive(Debug, PartialEq, Eq)]
-struct Layout {
-    readable: Vec<(GuestAddress, u32)>,
-    req_len: usize,
-    writable: Vec<(GuestAddress, u32)>,
-    cap: usize,
-}
-
-/// Sum a chain's descriptors: `(write_only, addr, len)` in chain order.
-///
-/// `Err(Layout)` -- with no readable descriptors kept -- when the request is
-/// larger than `max_req`, found before a byte of it is copied: the lengths are
-/// the guest's, and the old loop allocated each one as it came. Writable
-/// capacity is counted in full; the caller refuses a response it cannot hold.
-fn layout(
-    descs: impl Iterator<Item = (bool, GuestAddress, u32)>,
-    max_req: usize,
-) -> Result<Layout, Layout> {
-    let mut l = Layout {
-        readable: Vec::new(),
-        req_len: 0,
-        writable: Vec::new(),
-        cap: 0,
-    };
-    let mut too_big = false;
-    for (write_only, addr, len) in descs {
-        if write_only {
-            l.cap = l.cap.saturating_add(len as usize);
-            l.writable.push((addr, len));
-        } else if !too_big {
-            l.req_len = l.req_len.saturating_add(len as usize);
-            if l.req_len > max_req {
-                too_big = true;
-                l.readable.clear();
-            } else {
-                l.readable.push((addr, len));
-            }
-        }
-    }
-    if too_big { Err(l) } else { Ok(l) }
-}
-
-/// Copy `bytes` over the writable descriptors in order. Returns what was
-/// written, which is what the used ring reports.
-fn scatter<G: GuestMemory>(mem: &G, writable: &[(GuestAddress, u32)], bytes: &[u8]) -> usize {
-    let mut off = 0;
-    for &(addr, len) in writable {
-        if off == bytes.len() {
-            break;
-        }
-        let n = (len as usize).min(bytes.len() - off);
-        if let Err(e) = mem.write_slice(&bytes[off..off + n], addr) {
-            log::warn!("writing a response into guest memory at {:#x}: {e}", addr.0);
-            break;
-        }
-        off += n;
-    }
-    off
-}
-
-/// Read a request out of its readable descriptors.
-fn gather<G: GuestMemory>(
-    mem: &G,
-    readable: &[(GuestAddress, u32)],
-    len: usize,
-) -> Option<Vec<u8>> {
-    let mut req = vec![0u8; len];
-    let mut off = 0;
-    for &(addr, n) in readable {
-        let n = n as usize;
-        if let Err(e) = mem.read_slice(&mut req[off..off + n], addr) {
-            log::warn!("reading a request from guest memory at {:#x}: {e}", addr.0);
-            return None;
-        }
-        off += n;
-    }
-    Some(req)
-}
-
 /// A bare error header for a request the transport refuses on its own.
 fn transport_error(errno: i32) -> Reply {
     let hdr = MsgHeader::err(MsgType::Ioctl, errno);
     // The wire form is the struct's bytes, which is what the driver reads.
-    let p = &hdr as *const MsgHeader as *const u8;
-    // SAFETY: a plain-old-data header viewed as its 16 bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(p, HDR) }.to_vec();
+    let bytes = device::sys::pod::bytes(&hdr)[..HDR].to_vec();
     Reply {
         bytes,
         ..Reply::default()
@@ -808,6 +754,7 @@ impl NvGpuBackend {
     fn new(
         proc_nvidia: &Path,
         abi_policy: device::nvidia::AbiPolicy,
+        rm_allowlist: device::rmallow::Mode,
         config: BackendConfig,
         wayland: Wayland,
     ) -> anyhow::Result<Self> {
@@ -826,6 +773,7 @@ impl NvGpuBackend {
 
         let mut nvidia = NvidiaBackend::with_default_zones();
         nvidia.set_abi_policy(abi_policy);
+        nvidia.set_rm_allowlist(rm_allowlist);
         nvidia.set_config(config);
         nvidia.set_host_driver_version(&version);
         nvidia.set_wayland(wayland.cfg);
@@ -1164,8 +1112,7 @@ fn main() -> anyhow::Result<()> {
 
     // Before any thread exists: capabilities are per thread
     // (device::posture, S-5).
-    // SAFETY: plain syscalls.
-    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    let (uid, euid) = (device::sys::proc::uid(), device::sys::proc::euid());
     let caps = posture::Caps::current()?;
     log::info!("credentials: uid {uid}, euid {euid}, capabilities {caps}");
     if let Some(why) = posture::too_privileged(euid, &caps) {
@@ -1187,8 +1134,7 @@ fn main() -> anyhow::Result<()> {
     posture::set_undumpable().map_err(|e| anyhow::anyhow!("PR_SET_DUMPABLE: {e}"))?;
     // Nothing this process creates is for anyone else: the vhost-user
     // socket among others.
-    // SAFETY: plain syscall.
-    unsafe { libc::umask(0o077) };
+    device::sys::proc::umask(0o077);
     log::info!(
         "capabilities now {}, no_new_privs set",
         posture::Caps::current()?
@@ -1209,6 +1155,11 @@ fn main() -> anyhow::Result<()> {
     };
     posture::clear_socket_path(&socket, euid)
         .map_err(|e| anyhow::anyhow!("socket {}: {e}", socket.display()))?;
+    // Bound now: the sandbox below leaves no directory writable. Not
+    // unlinking first -- the path was just cleared, and a socket someone
+    // else put there since makes the bind fail rather than be shared.
+    let mut listener = vhost::vhost_user::Listener::new(&socket, false)
+        .map_err(|e| anyhow::anyhow!("listen on {}: {e}", socket.display()))?;
 
     log::info!(
         "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
@@ -1225,6 +1176,66 @@ fn main() -> anyhow::Result<()> {
     // behind, and a host client connecting to it would wait on a backend that
     // is gone.
     let _export = ExportGuard(wayland.export.as_ref().map(|(x, _)| x.clone()));
+
+    // What the sandbox would put out of reach is opened first: the uevent
+    // socket (a network namespace of the backend's own hears none), and
+    // the descriptor limit (the handle table is sized from it).
+    let uevents = if args.kms_card || args.wayland_lease {
+        match device::kms::uevent_socket() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("no host hotplug events: uevent socket: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let nofile = posture::raise_nofile()
+        .map_err(|e| log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"))
+        .ok();
+
+    // The sandbox, while this is the only thread (device::sandbox).
+    match args.sandbox {
+        device::sandbox::Mode::On => {
+            let gpus: Vec<String> = host::gpu_slots(&args.proc_nvidia)
+                .iter()
+                .map(|g| {
+                    let end = g
+                        .pci_addr
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(g.pci_addr.len());
+                    String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
+                })
+                .collect();
+            let plan = device::sandbox::Plan::backend(
+                &device::sandbox::BackendPaths {
+                    proc_nvidia: &args.proc_nvidia,
+                    gpus,
+                    compute: args.allow_compute,
+                    kms_card: args.kms_card,
+                    wayland_socket: args.wayland_socket.as_deref(),
+                    export_socket: args.wayland_export.as_deref(),
+                },
+                Path::new("/dev"),
+                Path::new("/sys"),
+            );
+            let report = device::sandbox::apply(&plan);
+            report.log();
+            if report.complete() {
+                log::info!("sandbox: every layer in force");
+            }
+        }
+        device::sandbox::Mode::Off => log::warn!(
+            "sandbox: DEGRADED: --sandbox=off: no network namespace, Landlock or seccomp; \
+             a backend taken over is everything uid {euid} is. For diagnosis only"
+        ),
+    }
+    if let Some((x, _)) = &wayland.export {
+        x.start()
+            .map_err(|e| anyhow::anyhow!("--wayland-export: accept thread: {e}"))?;
+    }
     let config = BackendConfig {
         kms_card: args.kms_card,
         wayland_socket: args.wayland_socket,
@@ -1249,6 +1260,7 @@ fn main() -> anyhow::Result<()> {
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
         abi_policy,
+        args.rm_allowlist,
         config,
         wayland,
     )?));
@@ -1288,24 +1300,29 @@ fn main() -> anyhow::Result<()> {
                 ticker.forward(cmds);
             }),
         };
-        let listener = device::kms::HotplugListener::spawn_ticking(
-            cards,
-            move |c| {
-                if let PumpCmd::Hotplug { card, flags } = c
-                    && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
-                {
-                    let mut be = sink.nvidia.lock().unwrap();
-                    be.check_leases(Some(card));
-                    let cmds = be.take_pump_cmds();
-                    drop(be);
-                    sink.forward(cmds);
-                }
-                if to_guest {
-                    sink.forward(vec![c]);
-                }
-            },
-            Some(tick),
-        );
+        let listener = uevents
+            .ok_or_else(|| std::io::Error::other("no uevent socket"))
+            .and_then(|sock| {
+                device::kms::HotplugListener::spawn_ticking_on(
+                    sock,
+                    cards,
+                    move |c| {
+                        if let PumpCmd::Hotplug { card, flags } = c
+                            && flags & protocol::messages::EV_HOTPLUG_F_LEASE != 0
+                        {
+                            let mut be = sink.nvidia.lock().unwrap();
+                            be.check_leases(Some(card));
+                            let cmds = be.take_pump_cmds();
+                            drop(be);
+                            sink.forward(cmds);
+                        }
+                        if to_guest {
+                            sink.forward(vec![c]);
+                        }
+                    },
+                    Some(tick),
+                )
+            });
         if let Ok(l) = &listener {
             shared
                 .nvidia
@@ -1338,16 +1355,15 @@ fn main() -> anyhow::Result<()> {
              objects by handle. Remove the registry override (NVreg_RegistryDwords) and \
              reload the driver"
         ),
-        Err(e) => log::warn!("could not ask the host's RM whether it validates clients strictly: {e}"),
-    }
-    // Every guest process's descriptors are this process's: take the whole
-    // of the hard limit, and size the handle table from it (B1).
-    match posture::raise_nofile() {
-        Ok(n) => {
-            let shared = backend.read().expect("backend lock").shared.clone();
-            shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
+        Err(e) => {
+            log::warn!("could not ask the host's RM whether it validates clients strictly: {e}")
         }
-        Err(e) => log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"),
+    }
+    // Every guest process's descriptors are this process's: the whole of the
+    // hard limit, taken before the sandbox, sizes the handle table (B1).
+    if let Some(n) = nofile {
+        let shared = backend.read().expect("backend lock").shared.clone();
+        shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
     }
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
@@ -1356,12 +1372,21 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("create daemon: {e:?}"))?;
 
-    // The path was cleared above (posture::clear_socket_path); serve's own
-    // removal finds nothing, and if someone else's socket appeared since,
-    // the bind fails rather than sharing the path.
-    daemon
-        .serve(&socket)
-        .map_err(|e| anyhow::anyhow!("serve {}: {e:?}", socket.display()))?;
+    // `VhostUserDaemon::serve` on the listener bound before the sandbox: one
+    // connection, served until the VMM hangs up, and the ring workers told
+    // to stop whatever the outcome. A disconnect or a partial message is how
+    // a guest ends, not an error.
+    let served = daemon.start(&mut listener).and_then(|()| daemon.wait());
+    for h in daemon.get_epoll_handlers() {
+        h.send_exit_event();
+    }
+    match served {
+        Ok(())
+        | Err(vhost_user_backend::Error::HandleRequest(
+            vhost::vhost_user::Error::Disconnected | vhost::vhost_user::Error::PartialMessage,
+        )) => {}
+        Err(e) => anyhow::bail!("serve {}: {e:?}", socket.display()),
+    }
 
     backend
         .read()
@@ -1379,73 +1404,8 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn a(x: u64) -> GuestAddress {
-        GuestAddress(x)
-    }
-
-    #[test]
-    fn a_request_is_gathered_from_every_readable_descriptor() {
-        let l = layout(
-            [
-                (false, a(0), 16),
-                (false, a(100), 40),
-                (true, a(200), 64),
-                (true, a(400), 64),
-            ]
-            .into_iter(),
-            1024,
-        )
-        .unwrap();
-        assert_eq!(l.req_len, 56);
-        assert_eq!(l.readable.len(), 2);
-        assert_eq!(l.cap, 128);
-        assert_eq!(l.writable, vec![(a(200), 64), (a(400), 64)]);
-    }
-
-    #[test]
-    fn a_request_over_the_limit_is_refused_before_it_is_read() {
-        let l = layout(
-            [
-                (false, a(0), 600),
-                (false, a(1000), 600),
-                (true, a(2000), 16),
-            ]
-            .into_iter(),
-            1024,
-        )
-        .unwrap_err();
-        assert!(l.readable.is_empty(), "nothing of it is kept to be read");
-        assert_eq!(l.cap, 16, "there is still somewhere to say so");
-    }
-
     fn memory() -> GuestMemoryMmap {
-        GuestMemoryMmap::from_ranges(&[(a(0), 0x10000)]).unwrap()
-    }
-
-    #[test]
-    fn a_response_is_scattered_across_every_writable_descriptor() {
-        let mem = memory();
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let n = scatter(
-            &mem,
-            &[(a(0x1000), 30), (a(0x3000), 50), (a(0x5000), 50)],
-            &bytes,
-        );
-        assert_eq!(n, 100);
-        let mut back = vec![0u8; 100];
-        mem.read_slice(&mut back[..30], a(0x1000)).unwrap();
-        mem.read_slice(&mut back[30..80], a(0x3000)).unwrap();
-        mem.read_slice(&mut back[80..], a(0x5000)).unwrap();
-        assert_eq!(back, bytes);
-    }
-
-    #[test]
-    fn gather_reads_descriptors_in_order() {
-        let mem = memory();
-        mem.write_slice(b"hello ", a(0x100)).unwrap();
-        mem.write_slice(b"world", a(0x900)).unwrap();
-        let req = gather(&mem, &[(a(0x100), 6), (a(0x900), 5)], 11).unwrap();
-        assert_eq!(req, b"hello world");
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
     }
 
     /// A UVM placement reaches the VMM as SHMEM_MAP on region 2 with the
@@ -1462,8 +1422,7 @@ mod tests {
         struct Vmm(StdMutex<Vec<(&'static str, u8, u64, u64, u64, u64, bool)>>);
         impl VhostUserFrontendReqHandler for Vmm {
             fn shmem_map(&self, r: &M, fd: &dyn std::os::fd::AsRawFd) -> HandlerResult<u64> {
-                // SAFETY: fcntl on a descriptor the crate holds for this call.
-                let open = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0;
+                let open = device::sys::fd::is_open(fd.as_raw_fd());
                 let (id, fo, so, len, fl) = (r.shmid, r.fd_offset, r.shm_offset, r.len, r.flags);
                 self.0
                     .lock()
@@ -1484,10 +1443,8 @@ mod tests {
         let vmm = Arc::new(Vmm::default());
         let mut frontend = FrontendReqHandler::new(vmm.clone()).unwrap();
         frontend.set_reply_ack_flag(true);
-        // SAFETY: dup of the frontend's end, owned by the stream from here.
-        let tx = unsafe {
-            <UnixStream as std::os::fd::FromRawFd>::from_raw_fd(libc::dup(frontend.get_tx_raw_fd()))
-        };
+        // A dup of the frontend's end, owned by the stream from here.
+        let tx = UnixStream::from(device::sys::fd::dup_raw(frontend.get_tx_raw_fd()).unwrap());
         let backend = Backend::from_stream(tx);
         backend.set_reply_ack_flag(true);
         backend.set_shmem_flag(true);
@@ -1519,11 +1476,7 @@ mod tests {
     /// has to know them for exactly as long as the ring holds them.
     #[test]
     fn a_rings_eventfds_are_private_while_it_holds_them() {
-        use std::os::fd::FromRawFd;
-        let eventfd = || {
-            // SAFETY: plain syscall; the descriptor is owned by the File.
-            unsafe { File::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) }
-        };
+        let eventfd = || File::from(device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap());
         let v: Vring = VringT::new(GuestMemoryAtomic::new(memory()), 256).unwrap();
         let (kick, call) = (eventfd(), eventfd());
         let (k, c) = (kick.as_raw_fd(), call.as_raw_fd());

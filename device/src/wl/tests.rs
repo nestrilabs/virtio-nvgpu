@@ -1,6 +1,8 @@
 //! The host side against a fake compositor: a real socket, real threads, and
 //! the guest's half played by a guest-side engine.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
@@ -306,12 +308,7 @@ fn the_guest_sees_only_allowed_globals_at_clamped_versions() {
     let (b, _) = g.recv_until(sync_done);
     assert_eq!(global_names(&b), vec!["wl_compositor"]);
     // Nothing more queued: the readiness eventfd is clear.
-    let mut p = libc::pollfd {
-        fd: ready.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 0);
+    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 0), false);
 }
 
 #[test]
@@ -385,12 +382,7 @@ fn the_compositor_socket_is_drained_while_the_guest_is_not_reading() {
     server
         .write_all(&all)
         .expect("the compositor's writes must never block on us");
-    let mut p = libc::pollfd {
-        fd: ready.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(unsafe { libc::poll(&mut p, 1, 1000) }, 1);
+    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 1000), true);
     let (b, _) = g.recv_until(|b, _| b.len() >= all.len());
     assert_eq!(b.len(), all.len());
 }
@@ -551,12 +543,7 @@ fn the_export_socket_is_private_and_hands_over_connections() {
     );
     assert!(x.accept_pending().is_none());
     let _c = UnixStream::connect(&path).unwrap();
-    let mut p = libc::pollfd {
-        fd: ready.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(unsafe { libc::poll(&mut p, 1, 2000) }, 1);
+    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 2000), true);
     let s = x.accept_pending().expect("our own uid is accepted");
     // The accepted connection becomes a channel facing a client.
     let (conn, _r) = WlConn::from_export(s, &WlConfig::new(&path), Arc::new(FakeHost)).unwrap();

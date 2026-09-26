@@ -40,6 +40,8 @@
 //! points) is served by the same registrations; the guest signals its own
 //! eventfd when the shared one fires. The ioctl itself is never forwarded.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
@@ -49,6 +51,7 @@ use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
+use crate::sys::block::{Arena, BufId};
 use crate::xfer::Errno;
 
 /// Registrations that have not fired, per VM. Each holds two backend
@@ -199,15 +202,15 @@ impl SyncobjHost for HostSyncobj {
         // u64 point; }
         let mut arg = [0u8; 24];
         arg[0..4].copy_from_slice(&syncobj.to_le_bytes());
-        arg[8..12].copy_from_slice(&(-1i32).to_le_bytes());
-        drm_ioctl(render, hostfd::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut arg)?;
-        let fd = i32::from_le_bytes(arg[8..12].try_into().unwrap());
-        if fd < 0 {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
-        }
-        // SAFETY: the kernel just installed `fd` for us (drm_syncobj_get_fd,
-        // drm_syncobj.c:687, with O_CLOEXEC); nothing else owns it.
-        Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+        // The kernel installs the descriptor it writes at 8 for us
+        // (drm_syncobj_get_fd, drm_syncobj.c:687, with O_CLOEXEC).
+        let mut a = Arena::new();
+        let top = a.small(&arg);
+        a.fd_out(top, 8, 4)
+            .map_err(io::Error::from_raw_os_error)?;
+        drm_ioctl(render, hostfd::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut a, top)?;
+        a.claim_fd(top, 8)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn register(
@@ -225,22 +228,21 @@ impl SyncobjHost for HostSyncobj {
         arg[4..8].copy_from_slice(&flags.to_le_bytes());
         arg[8..16].copy_from_slice(&point.to_le_bytes());
         arg[16..20].copy_from_slice(&eventfd.to_le_bytes());
-        drm_ioctl(render, SYNCOBJ_EVENTFD, &mut arg)
+        let mut a = Arena::new();
+        let top = a.small(&arg);
+        drm_ioctl(render, SYNCOBJ_EVENTFD, &mut a, top)
     }
 }
 
-fn drm_ioctl(fd: RawFd, cmd: u32, arg: &mut [u8]) -> io::Result<()> {
-    debug_assert_eq!(arg.len(), hostfd::ioc_size(cmd));
-    loop {
-        // SAFETY: `arg` is exactly _IOC_SIZE(cmd) bytes and holds no pointer.
-        let r = unsafe { libc::ioctl(fd, cmd as libc::Ioctl, arg.as_mut_ptr()) };
-        if r >= 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(e);
-        }
+/// A DRM call on `fd`, its argument block `top` of `a` (exactly
+/// _IOC_SIZE(cmd) bytes, no pointer in it), retried across signals.
+fn drm_ioctl(fd: RawFd, cmd: u32, a: &mut Arena, top: BufId) -> io::Result<()> {
+    debug_assert_eq!(a.len(top), hostfd::ioc_size(cmd));
+    let r = a.call(&crate::sys::ioctl::HostRetry, fd, u64::from(cmd), top);
+    if r < 0 {
+        Err(io::Error::from_raw_os_error(-r))
+    } else {
+        Ok(())
     }
 }
 
@@ -493,13 +495,7 @@ fn errno(e: &io::Error) -> Errno {
 
 /// Whether an eventfd has been signalled: readable, without draining it.
 fn fired(fd: RawFd) -> bool {
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one pollfd, zero timeout.
-    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & libc::POLLIN != 0 }
+    crate::sys::fd::readable(fd, 0)
 }
 
 // ─────────────────────────────── the backend ───────────────────────────────
@@ -555,14 +551,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
-    use std::os::fd::FromRawFd;
 
     fn devnull() -> OwnedFd {
-        // SAFETY: a NUL-terminated path; the result is owned below.
-        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        assert!(fd >= 0);
-        // SAFETY: a descriptor open() just returned.
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        crate::sys::fd::open(c"/dev/null", libc::O_RDONLY | libc::O_CLOEXEC).unwrap()
     }
 
     /// A host with syncobjs 1..=9, recording registrations, and able to fire
@@ -606,8 +597,7 @@ mod tests {
         fn fire(&self, i: usize) {
             let fd = self.registered.borrow()[i].3;
             let one = 1u64.to_ne_bytes();
-            // SAFETY: an 8-byte write to an eventfd the registration holds.
-            assert_eq!(unsafe { libc::write(fd, one.as_ptr().cast(), 8) }, 8);
+            assert_eq!(crate::sys::fd::write_raw(fd, &one).unwrap(), 8);
         }
     }
 

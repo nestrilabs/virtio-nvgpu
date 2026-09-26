@@ -48,6 +48,17 @@
 #                       terminal, off otherwise. NVGPU_TIMEOUT then defaults
 #                       to 3600.
 #   NVGPU_USER          root only: who the backend runs as (see below)
+#   NVGPU_SANDBOX       on (default) or off: the backend's process sandbox
+#                       (device/src/sandbox.rs; off is for diagnosis only)
+#   NVGPU_VM_SLOTS      root only: how many pool slots to look through (64)
+#   NVGPU_VMM_JAIL      root only: auto (default), on or off -- the VMM under
+#                       nesbox's jailer, as its slot's uid (see below)
+#   NVGPU_JAILER        root only: the jailer binary (default: beside the VMM)
+#   NVGPU_JAIL_ROOT     root only: a jail image to use instead of the one built
+#                       for the run (nesbox's build/output/jail); nesbox must be
+#                       at /usr/bin/nesbox in it
+#   NVGPU_VMM_NETNS     unprivileged only: 1 (default) has nesbox leave the
+#                       host's network ("unshare-network"); 0 does not
 #
 # Safety knobs, for a GPU that also drives the desktop (.rig/SAFETY-NOTES.md):
 #   NVGPU_MEMORY_MAX    e.g. 12G: run the launcher, backend and VMM in a
@@ -103,36 +114,81 @@
 # kernel, one DMA away -- and the backend refuses to start that way
 # (device/src/posture.rs).
 #
-# Run as root, the script starts it as $NVGPU_USER, with the groups of the
-# device nodes it opens and nothing else:
+# Run as root, each VM takes a slot of its own from a pool of host users, so
+# that no two VMs are one host principal (SECURITY.md, "One uid per VM", says
+# what that separates and what it does not). Slot N is two users:
 #
-#   useradd --system --no-create-home --shell /usr/sbin/nologin nvgpu
+#   for i in 0 1 2 3; do
+#     useradd --system --no-create-home --shell /usr/sbin/nologin --user-group nvgpu-vm$i
+#     useradd --system --no-create-home --shell /usr/sbin/nologin -g nvgpu-vm$i nvgpu-vmm$i
+#   done
 #
-# (/dev/nvidia* is 0666; render and card nodes are group render and video;
-# /dev/udmabuf is group kvm.) setpriv hands it those groups, no capabilities
-# and no_new_privs; the backend drops whatever it is given anyway.
+# (NixOS: users.users."nvgpu-vm0" = { isSystemUser = true; group = "nvgpu-vm0"; },
+# users.groups."nvgpu-vm0" = {}, users.users."nvgpu-vmm0" = { isSystemUser =
+# true; group = "nvgpu-vm0"; }, and so on.)
 #
-# Which user: "nvgpu" by default. With --wayland-socket it is the socket's
-# owner instead -- the backend is then a client of that user's compositor
-# like any of the user's own programs, and the socket's directory
+# nvgpu-vmN runs the slot's backend, with the groups of the device nodes it
+# opens and nothing else -- setpriv hands them over, so the account needs no
+# membership (/dev/nvidia* is 0666; render and card nodes are group render and
+# video; /dev/udmabuf is group kvm) -- no capabilities and no_new_privs; the
+# backend drops whatever it is given anyway. nvgpu-vmmN runs the slot's VMM
+# under nesbox's jailer, in group nvgpu-vmN and no other: the backend's socket
+# is made 0660 in that group, which is how the VMM reaches it and all it
+# reaches of the backend's. A slot is free when no run holds its lock
+# (/run/nvgpu-slots/N.lock) and neither of its users has a live process; the
+# first free one is taken, and none free stops the run. Pools are counted from
+# nvgpu-vm0 up to the first missing user, at most NVGPU_VM_SLOTS.
+#
+# Which user the backend is: slot N's nvgpu-vmN. With --wayland-socket it is
+# the socket's owner instead -- the backend is then a client of that user's
+# compositor like any of the user's own programs, and the socket's directory
 # ($XDG_RUNTIME_DIR, 0700) lets no one else in anyway. With --wayland-export
 # (and no --wayland-socket) it is the owner of the directory the export
 # socket goes in, since the backend accepts only clients of its own uid
-# (device/src/wl/export.rs). NVGPU_USER overrides all of these.
-# NVGPU_USER=root runs it as root, which it refuses unless
-# NVGPU_ALLOW_ROOT_UNSAFE=1 as well: that passes --allow-root-unsafe, and
-# every guest process is then an RM administrator. Only for ruling the
-# credentials out while chasing something, never for a guest you do not
-# trust.
+# (device/src/wl/export.rs). In those two modes every VM's backend is that
+# one user, and what keeps them apart is the backend's sandbox (Landlock's
+# signal and socket scoping, ABI 6 and 9) and its being undumpable; the VMM
+# still takes a slot. NVGPU_USER overrides all of these, and makes every VM
+# started with it one user, which is said. NVGPU_USER=root runs it as root,
+# which it refuses unless NVGPU_ALLOW_ROOT_UNSAFE=1 as well: that passes
+# --allow-root-unsafe, and every guest process is then an RM administrator.
+# Only for ruling the credentials out while chasing something, never for a
+# guest you do not trust. A host with no pool but the older single user
+# "nvgpu" runs every backend as that user, with a warning each time.
 #
-# Run as an ordinary user, the backend is that user: nobody else is
-# available without privilege, and it is who owns the compositor socket and
-# the export directory anyway. setpriv still gives it no_new_privs and empty
-# inheritable and ambient capability sets. It cannot change the uid, the
-# groups or the bounding set -- all three need privilege -- so the backend
-# keeps the user's own supplementary groups: a group that is root in all but
-# name (docker, libvirt, disk) is then within reach of anything that takes
-# the backend over, and rig-preflight.sh warns about those.
+# The VMM, run as root: under nesbox's jailer (tools/jailer in nesbox; built
+# with `cargo build --release -p jailer`, and found beside the VMM binary or
+# at NVGPU_JAILER), chrooted into a jail image built for the run -- nesbox
+# itself, and virtiofsd with its libraries when there is a share -- with the
+# config's kernel, disk, socket and share bound in, as the slot's nvgpu-vmmN.
+# The jailer clears supplementary groups, so /dev/kvm must be 0666 (systemd's
+# default). The disk must be writable by that user: a per-run copy is made
+# for it (NVGPU_COPY_ROOTFS defaults to 1 here), and an image booted in place
+# must already be. NVGPU_VMM_JAIL=off runs the VMM as root, as before; auto
+# does the same, with a warning, where there is no jailer or no pool.
+#
+# Both halves run as root in network namespaces of their own (unshare --net):
+# neither needs a network, the vhost-user socket is a path, and a namespace
+# made by root still hears the kernel's uevents. NVGPU_SANDBOX=off leaves the
+# backend in the host's.
+#
+# Run as an ordinary user, one VM's backend and VMM are that user: nobody
+# else is available without privilege, and it is who owns the compositor
+# socket and the export directory anyway. setpriv still gives the backend
+# no_new_privs and empty inheritable and ambient capability sets. It cannot
+# change the uid, the groups or the bounding set -- all three need privilege
+# -- so the backend keeps the user's own supplementary groups: a group that is
+# root in all but name (docker, libvirt, disk) is then within reach of
+# anything that takes the backend over, and rig-preflight.sh warns about
+# those. The backend's sandbox still applies: it enters a user and network
+# namespace of its own (where unprivileged user namespaces are allowed), and
+# Landlock and seccomp confine it. nesbox leaves the host's network the same
+# way ("unshare-network"). What sharing the uid loses, against a slot of its
+# own: the VMM (seccomp, but no Landlock) can open whatever the user can, and
+# can signal the user's processes and, on a host with kernel.yama.ptrace_scope
+# 0, trace them; RM's security token -- the uid -- is the user's own, the same
+# as every GPU program on the desktop; and two VMs started by one user are one
+# principal to RM and to the kernel. Keep a rig for one VM at a time.
 set -euo pipefail
 
 usage() {
@@ -245,6 +301,20 @@ done
 # Compute is the backend's to serve and the probe's to expect: one switch for
 # both (guest-image/probes/render.sh reads nvgpu_compute).
 [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
+SANDBOX=${NVGPU_SANDBOX:-on}
+case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
+SANDBOX_GIVEN=0
+prev=
+for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
+    case $a in --sandbox=*) SANDBOX=${a#--sandbox=} SANDBOX_GIVEN=1 ;; esac
+    [ "$prev" = --sandbox ] && SANDBOX=$a SANDBOX_GIVEN=1
+    prev=$a
+done
+if [ "$SANDBOX" = off ]; then
+    [ "$SANDBOX_GIVEN" = 1 ] || BACKEND_ARGS+=(--sandbox=off)
+    echo "run-guest: WARNING: the backend's sandbox is off (NVGPU_SANDBOX=off): for" \
+        "diagnosis only" >&2
+fi
 
 PROBE=${POSITIONAL[0]}
 TAG=${POSITIONAL[1]:-$(date +%H%M%S)}
@@ -282,7 +352,9 @@ else
     LOGS=${NVGPU_LOGS:-/root/logs}
     VCPUS=${NVGPU_VCPUS:-2}
     MEM_MIB=${NVGPU_MEM_MIB:-2048}
-    COPY_ROOTFS=${NVGPU_COPY_ROOTFS:-0}
+    # Booted in place, unless the VMM is jailed (below): its user must be
+    # able to write the disk, and a copy is made its own.
+    COPY_ROOTFS=${NVGPU_COPY_ROOTFS:-auto}
     # Unset means the share this layout always had; set but empty means none.
     NVIDIA_SHARE=${NVGPU_NVIDIA_SHARE-/var/lib/nvgpu}
 fi
@@ -385,10 +457,59 @@ if [ "$KMS_CARD" = 1 ] && [ "${NVGPU_KMS_CARD_FORCE:-}" != 1 ]; then
             "(TESTING-RIG.md group C); NVGPU_KMS_CARD_FORCE=1 if that socket is stale"
 fi
 
+# ── A slot of the pool: this VM's own host users ────────────────────────────
+#
+# Taken first, as root, so that nothing below can mistake another VM's
+# processes for this one's. The lock is held by this launcher for the run; a
+# launcher killed outright lets go of it while its VM may still run, which is
+# why a slot whose users have live processes is not free either. Children
+# are started with the lock's descriptor closed ({SLOT_FD}>&- below).
+SLOT=
+VMM_USER=
+SLOT_GROUP=
+exec {SLOT_FD}</dev/null
+if [ $PRIV = root ]; then
+    mkdir -p /run/nvgpu-slots
+    chmod 0700 /run/nvgpu-slots
+    MAX_SLOTS=${NVGPU_VM_SLOTS:-64}
+    [[ $MAX_SLOTS =~ ^[0-9]+$ ]] || die "NVGPU_VM_SLOTS=$MAX_SLOTS: a number"
+    for ((i = 0; i < MAX_SLOTS; i++)); do
+        id "nvgpu-vm$i" >/dev/null 2>&1 || break
+        exec {SLOT_FD}>&-
+        exec {SLOT_FD}>>"/run/nvgpu-slots/$i.lock"
+        flock -n "$SLOT_FD" || continue
+        if pgrep -u "nvgpu-vm$i" >/dev/null ||
+            { id "nvgpu-vmm$i" >/dev/null 2>&1 && pgrep -u "nvgpu-vmm$i" >/dev/null; }; then
+            echo "run-guest: slot $i is unlocked but its users still run something; skipping it" >&2
+            continue
+        fi
+        SLOT=$i
+        break
+    done
+    if [ -z "$SLOT" ]; then
+        exec {SLOT_FD}>&-
+        exec {SLOT_FD}</dev/null
+        if [ "$i" -gt 0 ]; then
+            die "all $i slots of the pool (nvgpu-vm0..nvgpu-vm$((i - 1))) are in use"
+        fi
+    else
+        SLOT_GROUP=nvgpu-vm$SLOT
+        getent group "$SLOT_GROUP" >/dev/null ||
+            die "no group $SLOT_GROUP: make the pool's users with --user-group (the top of $0)"
+        if id "nvgpu-vmm$SLOT" >/dev/null 2>&1; then
+            VMM_USER=nvgpu-vmm$SLOT
+            [ "$(id -gn "$VMM_USER")" = "$SLOT_GROUP" ] ||
+                die "$VMM_USER's group is $(id -gn "$VMM_USER"), not $SLOT_GROUP (the top of $0)"
+        fi
+        echo "run-guest: slot $SLOT (nvgpu-vm$SLOT${VMM_USER:+, $VMM_USER})" >&2
+    fi
+fi
+
 # ── Who the backend runs as ──────────────────────────────────────────────────
 if [ $PRIV = root ]; then
     if [ -n "${NVGPU_USER:-}" ]; then
-        :
+        echo "run-guest: NVGPU_USER=$NVGPU_USER: every backend started this way is that one" \
+            "user, and those VMs are one principal to the host" >&2
     elif [ -n "$WL_SOCK" ]; then
         NVGPU_USER=$(stat -c %U "$WL_SOCK") || {
             echo "--wayland-socket $WL_SOCK: no such socket" >&2
@@ -399,8 +520,15 @@ if [ $PRIV = root ]; then
             echo "--wayland-export $WL_EXPORT: no such directory" >&2
             exit 1
         }
-    else
+    elif [ -n "$SLOT" ]; then
+        NVGPU_USER=nvgpu-vm$SLOT
+    elif id nvgpu >/dev/null 2>&1; then
         NVGPU_USER=nvgpu
+        echo "run-guest: WARNING: no pool of VM users (nvgpu-vm0, ...); every VM's backend" \
+            "is the one user nvgpu, and can signal the others, read their files and share" \
+            "RM's security token. Make the pool: the top of $0" >&2
+    else
+        die "no user to run the backend as: make the pool of VM users (the top of $0)"
     fi
     id "$NVGPU_USER" >/dev/null 2>&1 || {
         echo "no user $NVGPU_USER to run the backend as; see the top of $0" >&2
@@ -449,6 +577,54 @@ else
     AS_BACKEND=(setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all)
 fi
 
+# As root, the backend's network namespace is made here, where that needs no
+# user namespace and the namespace still hears the kernel's uevents; the
+# backend finds only loopback and keeps it (device/src/sandbox.rs).
+# Unprivileged, the backend makes its own.
+BACKEND_NETNS=()
+if [ $PRIV = root ] && [ "$SANDBOX" = on ]; then
+    BACKEND_NETNS=(unshare --net --)
+fi
+
+# ── Who the VMM runs as ──────────────────────────────────────────────────────
+#
+# As root: the slot's nvgpu-vmmN, under nesbox's jailer, in a network
+# namespace of its own. nesbox's own "unshare-network" cannot be used there:
+# the kernel refuses a user namespace to a chrooted process.
+VMM_JAIL=off
+VMM_NETNS=()
+VMM_OWN_NETNS=false
+if [ $PRIV = root ]; then
+    VMM_JAIL=${NVGPU_VMM_JAIL:-auto}
+    case $VMM_JAIL in auto | on | off) ;; *) die "NVGPU_VMM_JAIL=$VMM_JAIL: auto, on or off" ;; esac
+    JAILER=${NVGPU_JAILER:-$(dirname -- "$VMM")/jailer}
+    why=
+    if [ "$VMM_JAIL" != off ]; then
+        if [ -z "$VMM_USER" ]; then
+            why="no pool slot with a VMM user (nvgpu-vmmN; the top of $0)"
+        elif [ ! -x "$JAILER" ]; then
+            why="no jailer at $JAILER (NVGPU_JAILER; cargo build --release -p jailer in nesbox)"
+        elif [ "$(stat -L -c %a /dev/kvm 2>/dev/null)" != 666 ]; then
+            why="/dev/kvm is not 0666, and the jailer clears supplementary groups"
+        fi
+    fi
+    if [ "$VMM_JAIL" = off ]; then
+        echo "run-guest: WARNING: the VMM runs as root (NVGPU_VMM_JAIL=off)" >&2
+    elif [ -n "$why" ]; then
+        [ "$VMM_JAIL" = on ] && die "NVGPU_VMM_JAIL=on: $why"
+        echo "run-guest: WARNING: the VMM runs as root, unjailed: $why" >&2
+        VMM_JAIL=off
+    else
+        VMM_JAIL=on
+    fi
+    VMM_NETNS=(unshare --net --)
+elif [ "${NVGPU_VMM_NETNS:-1}" = 1 ]; then
+    VMM_OWN_NETNS=true
+fi
+if [ "$COPY_ROOTFS" = auto ]; then
+    if [ "$VMM_JAIL" = on ]; then COPY_ROOTFS=1; else COPY_ROOTFS=0; fi
+fi
+
 # The compositor's socket has to be one the backend's user can connect to;
 # better to say so here than as a failed CONNECT from inside the guest.
 if [ -n "$WL_SOCK" ] && [ ${#AS_BACKEND[@]} -gt 0 ] &&
@@ -494,6 +670,7 @@ VMM_PID=
 RUN=
 DISK_COPY=
 TTY_STATE=
+JAIL_BUILT=
 # Whether $1 is still this run's process: its command line names $2 (the
 # run's config for the VMM, its socket for the backend). A child that exited
 # during the run has been reaped, and its pid may since be someone else's.
@@ -513,6 +690,7 @@ cleanup() {
         kill "$BACKEND" 2>/dev/null || true
     fi
     [ -z "$RUN" ] || rm -rf "$RUN"
+    [ -z "$JAIL_BUILT" ] || rm -rf "$JAIL_BUILT"
     if [ -n "$DISK_COPY" ]; then
         if [ "${NVGPU_KEEP_ROOTFS:-0}" = 1 ]; then
             echo "rootfs:  $DISK_COPY (kept)"
@@ -571,6 +749,16 @@ if [ "$COPY_ROOTFS" = 1 ]; then
 else
     DISK=$ROOTFS
 fi
+# A jailed VMM opens the disk as its slot's user: the copy is made its own,
+# and an image booted in place must be already.
+if [ "$VMM_JAIL" = on ]; then
+    if [ -n "$DISK_COPY" ]; then
+        chown "$VMM_USER:$SLOT_GROUP" "$DISK_COPY"
+        chmod 0600 "$DISK_COPY"
+    elif [ "$(stat -c %U "$DISK")" != "$VMM_USER" ]; then
+        die "$DISK is booted in place (NVGPU_COPY_ROOTFS=0) but is not $VMM_USER's to write"
+    fi
+fi
 
 # ── The VMM's config ─────────────────────────────────────────────────────────
 #
@@ -602,9 +790,55 @@ cat > "$CFG" <<JSON
     { "drive_id": "rootfs", "path_on_host": $(json_str "$DISK"), "is_root_device": true, "is_read_only": false }
   ],
   "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEM_MIB },
-  "gpu-forward": { "socket": $(json_str "$SOCK") }$SHARES
+  "gpu-forward": { "socket": $(json_str "$SOCK") },
+  "unshare-network": $VMM_OWN_NETNS$SHARES
 }
 JSON
+
+# ── The VMM's jail ───────────────────────────────────────────────────────────
+#
+# The jail image is the jailer's read-only lower layer: here nesbox (at
+# /usr/bin/nesbox, where the jailer looks) and, for a share, virtiofsd, each
+# with the loader and libraries it names, at their own paths. Everything the
+# config names -- kernel, disk, socket, share, the config itself -- the jailer
+# binds in at the same path. NVGPU_JAIL_ROOT uses a materialized image instead.
+jail_add() {
+    local src=$1 dst=$2 out lib
+    install -D -m 0755 -- "$src" "$JAIL_ROOT$dst"
+    command -v ldd >/dev/null || die "no ldd to find what $src links against; NVGPU_JAIL_ROOT"
+    out=$(ldd -- "$src" 2>&1) || true
+    case $out in *"not a dynamic executable"* | *"statically linked"*) return 0 ;; esac
+    while read -r lib; do
+        [ -n "$lib" ] && [ ! -e "$JAIL_ROOT$lib" ] || continue
+        install -D -m 0755 -- "$(realpath -- "$lib")" "$JAIL_ROOT$lib"
+    done < <(printf '%s\n' "$out" | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }')
+    if [ -e /etc/ld.so.cache ] && [ ! -e "$JAIL_ROOT/etc/ld.so.cache" ]; then
+        install -D -m 0644 /etc/ld.so.cache "$JAIL_ROOT/etc/ld.so.cache"
+    fi
+}
+JAIL_ROOT=
+if [ "$VMM_JAIL" = on ]; then
+    if [ -n "${NVGPU_JAIL_ROOT:-}" ]; then
+        JAIL_ROOT=$NVGPU_JAIL_ROOT
+        [ -x "$JAIL_ROOT/usr/bin/nesbox" ] || die "NVGPU_JAIL_ROOT=$JAIL_ROOT has no usr/bin/nesbox"
+    else
+        JAIL_ROOT=$(mktemp -d /run/nvgpu-jail.XXXXXX)
+        JAIL_BUILT=$JAIL_ROOT
+        chmod 0755 "$JAIL_ROOT"
+        jail_add "$VMM" /usr/bin/nesbox
+        if [ -n "$NVIDIA_SHARE" ]; then
+            VFS=${NESBOX_VIRTIOFSD:-$(command -v virtiofsd || true)}
+            [ -n "$VFS" ] || die "a share needs virtiofsd in the jail, and none is on PATH (NESBOX_VIRTIOFSD)"
+            VFS=$(realpath -- "$VFS")
+            jail_add "$VFS" "$VFS"
+            export NESBOX_VIRTIOFSD=$VFS
+        fi
+    fi
+    VMM_CMD=("${VMM_NETNS[@]}" "$JAILER" --config "$CFG" --jail-root "$JAIL_ROOT"
+        --uid "$(id -u "$VMM_USER")" --gid "$(getent group "$SLOT_GROUP" | cut -d: -f3)")
+else
+    VMM_CMD=("${VMM_NETNS[@]}" "$VMM" "$CFG")
+fi
 
 # ── The backend ──────────────────────────────────────────────────────────────
 #
@@ -613,9 +847,9 @@ JSON
 BLOG=$LOGS/$TAG.backend.log
 CONSOLE=$LOGS/$TAG.console.log
 echo "backend: as $NVGPU_USER ($PRIV, $LAYOUT layout)${BACKEND_ARGS[*]:+, with ${BACKEND_ARGS[*]}}" >&2
-RUST_LOG=${RUST_LOG:-info} "${AS_BACKEND[@]}" \
+RUST_LOG=${RUST_LOG:-info} "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
     "$BACKEND_EXE" --socket "$SOCK" "${BACKEND_ARGS[@]}" \
-    > "$BLOG" 2>&1 &
+    {SLOT_FD}>&- > "$BLOG" 2>&1 &
 BACKEND=$!
 
 # The backend must be listening before the VMM connects, and the socket must
@@ -631,6 +865,13 @@ kill -0 "$BACKEND" 2>/dev/null || { echo "backend exited; see $BLOG" >&2; tail -
     echo "$SOCK is not owned by $NVGPU_USER; refusing to connect" >&2
     exit 1
 }
+# The jailed VMM is another user, in the slot's group: the socket is opened
+# to that group, which holds no one else. (The jailer binds the socket file
+# alone into the jail, so its directory stays the backend's.)
+if [ "$VMM_JAIL" = on ]; then
+    chgrp "$SLOT_GROUP" "$SOCK"
+    chmod 0660 "$SOCK"
+fi
 
 # ── The guest ────────────────────────────────────────────────────────────────
 #
@@ -640,6 +881,9 @@ kill -0 "$BACKEND" 2>/dev/null || { echo "backend exited; see $BLOG" >&2; tail -
 # is waited for, so that an interrupt here reaches the cleanup, which stops
 # it, instead of leaving it to run out its timeout.
 echo "guest:   $PROBE on $(basename -- "$DISK"), $VCPUS vCPU / $MEM_MIB MiB, ${TIMEOUT}s" >&2
+if [ "$VMM_JAIL" = on ]; then
+    echo "vmm:     as $VMM_USER under $JAILER, jail $JAIL_ROOT, own network namespace" >&2
+fi
 if [ "$INTERACTIVE" = 1 ]; then
     # The terminal is the guest's console; the log still gets everything.
     # --foreground: timeout otherwise moves itself and nesbox into a process
@@ -649,12 +893,12 @@ if [ "$INTERACTIVE" = 1 ]; then
     echo "guest console on this terminal; exit the guest's shell to power off" >&2
     TTY_STATE=$(stty -g 2>/dev/null) || TTY_STATE=
     : > "$CONSOLE"
-    timeout --foreground -k 10 "$TIMEOUT" "$VMM" "$CFG" <&0 > "$CONSOLE" 2>&1 &
+    timeout --foreground -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- <&0 > "$CONSOLE" 2>&1 &
     VMM_PID=$!
     tail -n +1 -f --pid="$VMM_PID" "$CONSOLE" &
     TAIL_PID=$!
 else
-    timeout -k 10 "$TIMEOUT" "$VMM" "$CFG" < /dev/null > "$CONSOLE" 2>&1 &
+    timeout -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- < /dev/null > "$CONSOLE" 2>&1 &
     VMM_PID=$!
     TAIL_PID=
 fi

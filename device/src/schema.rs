@@ -7,6 +7,8 @@
 //! a class runs on, and whether a handle may stand in a descriptor field. The
 //! interpreter that walks an entry over a request is `xfer.rs`.
 
+#![forbid(unsafe_code)]
+
 use protocol::messages::DeviceKind;
 
 use crate::hostfd::HandleKind;

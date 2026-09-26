@@ -7,6 +7,8 @@
 //! descriptors, and a segment's descriptors go with its first byte -- which is
 //! before the messages that consume them, as the receiver requires.
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};

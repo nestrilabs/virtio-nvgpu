@@ -32,6 +32,8 @@
 //! Every method may be called with the backend mutex held: the reader thread
 //! never takes it, and the ops traits are called only from the caller's thread.
 
+#![forbid(unsafe_code)]
+
 pub mod conn;
 pub mod export;
 pub mod probe;

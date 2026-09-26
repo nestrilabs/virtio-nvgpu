@@ -2,9 +2,11 @@
 //! frames the same way (the loopback test puts the backend's own connection
 //! object here, in process).
 
+#![forbid(unsafe_code)]
+
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 use wlwire::engine::DevPair;
@@ -95,13 +97,8 @@ pub struct DevChannel {
     rbuf: Vec<u8>,
 }
 
-fn ioctl<T>(f: &File, req: libc::c_ulong, arg: &mut T) -> io::Result<()> {
-    let r = unsafe { libc::ioctl(f.as_raw_fd(), req as _, arg as *mut T) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn ioctl<T: crate::sys::Plain>(f: &File, req: libc::c_ulong, arg: &mut T) -> io::Result<()> {
+    crate::sys::ioctl_plain(f, req, arg)
 }
 
 impl DevConnector {
@@ -172,13 +169,11 @@ impl Channel for DevChannel {
     fn send(&mut self, frame: &mut [u8], fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
         fill_fds(frame, fds);
         let mut x = uapi::Xfer {
-            frame: frame.as_ptr() as u64,
-            len: frame.len() as u32,
             card_fd: -1,
             render_fd: -1,
             ..Default::default()
         };
-        match ioctl(&self.file, uapi::IOC_SEND, &mut x) {
+        match crate::sys::xfer(&self.file, uapi::IOC_SEND, frame, &mut x) {
             Ok(()) => Ok(Sent::Accepted { backlog: x.backlog }),
             Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(Sent::Busy),
             Err(e) => Err(e),
@@ -195,14 +190,12 @@ impl Channel for DevChannel {
             self.rbuf.resize(max, 0);
         }
         let mut x = uapi::Xfer {
-            frame: self.rbuf.as_mut_ptr() as u64,
-            len: max as u32,
             max_desc: frame::MAX_DESC as u32,
             card_fd: card.unwrap_or(-1),
             render_fd: render.unwrap_or(-1),
             ..Default::default()
         };
-        ioctl(&self.file, uapi::IOC_RECV, &mut x)?;
+        crate::sys::xfer(&self.file, uapi::IOC_RECV, &mut self.rbuf[..max], &mut x)?;
         let buf = self.rbuf[..(x.len as usize).min(max)].to_vec();
         let mut fds = Vec::new();
         if buf.len() >= frame::FRAME_HDR_LEN {
@@ -213,7 +206,7 @@ impl Channel for DevChannel {
                     break;
                 };
                 let d = Desc::read(b);
-                fds.push((d.fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(d.fd) }));
+                fds.push(crate::sys::received_fd(d.fd));
             }
         }
         Ok(Received {

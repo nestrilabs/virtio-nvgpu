@@ -11,8 +11,10 @@
 //! Placing the buffer hard against an unmapped page turns the same mistake into
 //! a fault on the offending write, in the call that made it, while the log line
 //! naming that call is still the last one printed.
-
-use std::ptr;
+//!
+//! Only `sys` hands the buffer's address to anything: the rest of the crate
+//! reads and writes it as a slice, and gives it to the host as a block of a
+//! [`super::block::Arena`].
 
 pub struct GuardedBuf {
     base: *mut u8,
@@ -31,16 +33,16 @@ pub struct GuardedBuf {
 // mapping are not tied to the thread that created them.
 //
 // This is what lets an IOCTL2 (`xfer::Prepared`, which holds its host buffers
-// in GuardedBufs) be prepared on the queue thread and executed on a per-file
-// executor thread. A pointer to the buffer does reach the host kernel during
-// `execute`, but only for the length of the ioctl call, on the thread that
-// owns the Prepared at that moment.
+// in an Arena of GuardedBufs) be prepared on the queue thread and executed on
+// a per-file executor thread. A pointer to the buffer does reach the host
+// kernel during `execute`, but only for the length of the ioctl call, on the
+// thread that owns the Prepared at that moment.
 unsafe impl Send for GuardedBuf {}
 
 const PAGE: usize = 4096;
 
 /// Readable bytes after the buffer, standing in for the caller's own memory.
-const SLACK: usize = 4096;
+pub(super) const SLACK: usize = 4096;
 
 impl GuardedBuf {
     /// A buffer of `len` bytes, followed by a page of readable slack and then a
@@ -65,11 +67,40 @@ impl GuardedBuf {
         if len == 0 {
             return None;
         }
+        #[cfg(miri)]
+        return Self::heap(len);
+        #[cfg(not(miri))]
+        Self::mapped(len)
+    }
+
+    /// Miri cannot make a PROT_NONE page, and needs none: it faults an access
+    /// past any allocation itself. The same layout, from the heap.
+    #[cfg(miri)]
+    fn heap(len: usize) -> Option<Self> {
+        let mapped = ((len + SLACK).div_ceil(PAGE) + 1) * PAGE;
+        let layout = std::alloc::Layout::from_size_align(mapped - PAGE, PAGE).ok()?;
+        // SAFETY: a non-zero size.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some(Self {
+            base,
+            mapped,
+            offset: 0,
+            len,
+        })
+    }
+
+    #[cfg(not(miri))]
+    fn mapped(len: usize) -> Option<Self> {
         let pages = (len + SLACK).div_ceil(PAGE);
         let mapped = (pages + 1) * PAGE;
+        // SAFETY: a fresh anonymous mapping at an address the kernel chooses;
+        // nothing else can refer to it yet.
         let base = unsafe {
             libc::mmap(
-                ptr::null_mut(),
+                std::ptr::null_mut(),
                 mapped,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -82,8 +113,11 @@ impl GuardedBuf {
         }
         let base = base as *mut u8;
         // The last page is the guard.
+        // SAFETY: `pages * PAGE` is inside the `mapped` bytes just mapped.
         let guard = unsafe { base.add(pages * PAGE) };
+        // SAFETY: the last page of the mapping made above.
         if unsafe { libc::mprotect(guard as *mut libc::c_void, PAGE, libc::PROT_NONE) } != 0 {
+            // SAFETY: the mapping made above, which nothing else knows of.
             unsafe { libc::munmap(base as *mut libc::c_void, mapped) };
             return None;
         }
@@ -95,16 +129,37 @@ impl GuardedBuf {
         })
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    /// The buffer's address, for the host: only `sys` hands it out.
+    pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
+        // SAFETY: `offset` is 0, inside the mapping.
         unsafe { self.base.add(self.offset) }
     }
 
+    /// Bytes readable and writable from the start: the buffer and its slack.
+    pub(super) fn reach(&self) -> usize {
+        self.mapped - PAGE - self.offset
+    }
+
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len` bytes from `base + offset` are mapped read-write for
+        // as long as `self` lives, and only borrows of `self` reach them.
         unsafe { std::slice::from_raw_parts(self.base.add(self.offset), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as `as_slice`, and `&mut self` makes the borrow unique.
         unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset), self.len) }
+    }
+
+    /// The buffer and the slack after it, for tests of what a driver that
+    /// writes a little past the declared size finds there.
+    #[cfg(test)]
+    pub(crate) fn with_slack(&mut self) -> &mut [u8] {
+        let n = self.reach();
+        // SAFETY: `reach()` bytes from the start are mapped read-write (the
+        // slack pages come before the guard), and `&mut self` makes the
+        // borrow unique.
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(self.offset), n) }
     }
 
     pub fn len(&self) -> usize {
@@ -118,7 +173,18 @@ impl GuardedBuf {
 
 impl Drop for GuardedBuf {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.base as *mut libc::c_void, self.mapped) };
+        #[cfg(miri)]
+        {
+            let layout = std::alloc::Layout::from_size_align(self.mapped - PAGE, PAGE).unwrap();
+            // SAFETY: allocated in `new` with this layout, freed once.
+            unsafe { std::alloc::dealloc(self.base, layout) };
+        }
+        // SAFETY: the mapping made in `new`, unmapped exactly once; no borrow
+        // of `self` outlives it.
+        #[cfg(not(miri))]
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.mapped)
+        };
     }
 }
 
@@ -133,11 +199,13 @@ mod tests {
         assert_eq!(b.as_slice()[99], 0xab);
         // A driver that writes a little past the declared size finds memory
         // there, as it would on the calling side.
-        unsafe { b.as_mut_ptr().add(100).write(0xcd) };
-        unsafe { assert_eq!(b.as_mut_ptr().add(SLACK - 1).read(), 0) };
+        let s = b.with_slack();
+        s[100] = 0xcd;
+        assert_eq!(s[SLACK - 1], 0);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "under Miri the guard is Miri's own bounds check")]
     fn a_gross_overrun_still_has_a_guard_behind_it() {
         let b = GuardedBuf::new(100).expect("mapped");
         let guard = b.base as usize + b.mapped - PAGE;

@@ -15,7 +15,10 @@
 //! Adding a protocol is: vendor its XML under `protocols/`, add its global to
 //! `GLOBALS`, and -- only if the build says so -- one line to `FD_POLICY`.
 
+#![forbid(unsafe_code)]
+
 /// What a descriptor argument is, and so how it crosses the VM boundary.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum FdClass {

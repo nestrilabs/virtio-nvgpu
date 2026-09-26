@@ -26,14 +26,16 @@
 //! Workstream SCHEMA owns this file; workstream BACKEND calls it. The API
 //! below is the agreed contract.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use protocol::messages::{I2_DYN_OUT_FENCE, I2_FD_CONSUME, I2_MAX_BUFS, I2_MAX_RECS};
 
-use crate::guarded::GuardedBuf;
 use crate::hostfd::HandleKind;
+use crate::sys::block::{Arena, Arg, BufId, DataMut, Kernel, Restore, SlotKind};
 use crate::schema::{
     self, Dir, Exec, Field, Ioctl, Kind, Len, SchemaClass, Span, Special, Table, policy,
 };
@@ -46,12 +48,12 @@ pub type Errno = i32;
 
 /// The system calls the interpreter makes on host descriptors. A trait so the
 /// whole of `execute` -- re-homing, validation, the ioctl, adoption -- can be
-/// tested against a fake kernel.
-pub trait Sys: Send + Sync {
-    /// `ioctl(2)`: its non-negative result, or -errno.
-    fn ioctl(&self, fd: RawFd, cmd: u32, arg: *mut u8) -> i32;
-    /// Close a descriptor this module created (never one it was lent).
-    fn close(&self, fd: RawFd);
+/// tested against a fake kernel. The ioctl itself is `Kernel`'s, and takes
+/// only an argument an arena built (sys/block.rs).
+pub trait Sys: Kernel {
+    /// Give back a descriptor the host made for this module that nothing
+    /// keeps.
+    fn close(&self, fd: OwnedFd);
     /// `lseek(fd, 0, SEEK_END)`, which is a dma-buf's size; or -errno.
     fn size_of(&self, fd: RawFd) -> i64;
 }
@@ -59,40 +61,23 @@ pub trait Sys: Send + Sync {
 /// The real thing.
 pub struct HostSys;
 
-impl Sys for HostSys {
-    fn ioctl(&self, fd: RawFd, cmd: u32, arg: *mut u8) -> i32 {
-        loop {
-            // SAFETY: `arg` is a buffer this module built for `cmd`, with every
-            // pointer inside it aimed at another buffer it owns (or NULL).
-            let r = unsafe { libc::ioctl(fd, cmd as libc::c_ulong, arg) };
-            if r >= 0 {
-                return r;
-            }
-            let e = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            // A signal is not the call's answer; libdrm's drmIoctl() retries the
-            // same way. Nothing here waits long enough to need interrupting.
-            if e != libc::EINTR {
-                return -e;
-            }
-        }
+impl Kernel for HostSys {
+    fn ioctl(&self, fd: RawFd, request: u64, arg: &mut Arg<'_>) -> i32 {
+        // A signal is not the call's answer; libdrm's drmIoctl() retries the
+        // same way. Nothing here waits long enough to need interrupting.
+        crate::sys::ioctl::HostRetry.ioctl(fd, request, arg)
     }
+}
 
-    fn close(&self, fd: RawFd) {
-        // SAFETY: only descriptors this module received from the kernel.
-        unsafe { libc::close(fd) };
+impl Sys for HostSys {
+    fn close(&self, fd: OwnedFd) {
+        drop(fd);
     }
 
     fn size_of(&self, fd: RawFd) -> i64 {
-        // SAFETY: plain syscall on a descriptor this module owns.
-        let r = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-        if r < 0 {
-            -(std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO) as i64)
-        } else {
-            r
+        match crate::sys::fd::size(fd) {
+            Ok(n) => n as i64,
+            Err(e) => -(e.raw_os_error().unwrap_or(libc::EIO) as i64),
         }
     }
 }
@@ -404,7 +389,7 @@ pub fn default_before(p: &Prepared) -> Result<(), Errno> {
         None
     };
     if let Some(off) = type_at {
-        if rd(p.bufs[0].bytes(), off, 4) != NV_DRM_PERMISSIONS_TYPE_MODESET {
+        if rd(p.bytes(0), off, 4) != NV_DRM_PERMISSIONS_TYPE_MODESET {
             return Err(libc::EPERM);
         }
     }
@@ -426,24 +411,10 @@ pub trait Finisher {
 
 // ───────────────────────────── prepared call ─────────────────────────────
 
-/// One buffer of the request: its host copy, and where the pointer to it is.
+/// One buffer of the request: its host copy, a block of the call's arena.
 struct HostBuf {
-    mem: Option<GuardedBuf>,
+    id: BufId,
     dir: Dir,
-}
-
-impl HostBuf {
-    fn bytes(&self) -> &[u8] {
-        self.mem.as_ref().map_or(&[], |m| m.as_slice())
-    }
-
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        self.mem.as_mut().map_or(&mut [], |m| m.as_mut_slice())
-    }
-
-    fn addr(&mut self) -> u64 {
-        self.mem.as_mut().map_or(0, |m| m.as_mut_ptr() as u64)
-    }
 }
 
 /// A schema position the walk reached, with the guest's value there.
@@ -476,6 +447,11 @@ pub struct Prepared {
     class: SchemaClass,
     target: u32,
     target_kind: HandleKind,
+    /// Every block the host is handed: the argument, the buffers its
+    /// pointers reach, the out-fence words and the probe scratch
+    /// (sys/block.rs). Every schema field that is a pointer, a descriptor or
+    /// a GEM handle is declared in it, so none holds a guest byte.
+    arena: Arena,
     bufs: Vec<HostBuf>,
     slots: Vec<Slot>,
     fd_ins: Vec<FdInRec>,
@@ -485,7 +461,7 @@ pub struct Prepared {
     render_fd: Option<OwnedFd>,
     /// ATOMIC: IN_FENCE_FD records (in `fd_ins`, slot None) and OUT_FENCE
     /// offsets in prop_values, with the s32 the kernel writes once executed.
-    fence_outs: Vec<(usize, Option<GuardedBuf>)>,
+    fence_outs: Vec<(usize, Option<BufId>)>,
     kms: Option<Arc<KmsFileState>>,
     /// What `Hooks::before` asked `Hooks::at_run` to check again.
     run_gate: Option<u64>,
@@ -497,14 +473,14 @@ pub struct Prepared {
     ret: i32,
     executed: bool,
     /// Descriptors the host produced at schema positions, not yet adopted.
-    fd_outs: Vec<(usize, usize, RawFd)>,
+    fd_outs: Vec<(usize, usize, OwnedFd)>,
     /// (buf, off, gem in the render file, size) for the response.
     gem_outs: Vec<(usize, usize, u32, u64)>,
 }
 
 /// A call is prepared on the queue thread and may run on an executor thread
 /// (session.rs, `PendingIoctl2`), so it must be `Send`. Everything in it is
-/// owned outright -- guarded buffers (see the SAFETY note on `GuardedBuf`),
+/// owned outright -- an arena of guarded buffers (sys/block.rs),
 /// descriptors, `Arc`s of `Send + Sync` state -- and this keeps it that way.
 const _: fn() = || {
     fn send<T: Send>() {}
@@ -533,6 +509,7 @@ pub fn prepare(
         req: &req,
         cursor: 0,
         out_only: 0,
+        arena: Arena::new(),
         bufs: Vec::new(),
         slots: Vec::new(),
     };
@@ -546,6 +523,7 @@ pub fn prepare(
         class,
         target,
         target_kind,
+        arena: w.arena,
         bufs: w.bufs,
         slots: w.slots,
         fd_ins: Vec::new(),
@@ -574,7 +552,7 @@ pub fn prepare(
     if class == SchemaClass::Kms {
         p.kms = env.kms_state(target);
     }
-    p.aim_pointers();
+    p.aim_pointers()?;
     if entry.policy != 0 {
         let hooks = p.hooks.clone();
         hooks.before(&mut p)?;
@@ -631,19 +609,21 @@ impl Prepared {
     pub fn finish_with(mut self, f: &mut dyn Finisher) -> Vec<u8> {
         let mut fd_recs = Vec::new();
         for (buf, off, fd) in std::mem::take(&mut self.fd_outs) {
-            if f.is_backend_fd(fd) {
+            if f.is_backend_fd(fd.as_raw_fd()) {
                 log::error!(
-                    "IOCTL2 {}: the host left fd {fd} at a descriptor-out field, \
+                    "IOCTL2 {}: the host left fd {} at a descriptor-out field, \
                      and the backend already holds it; not adopted",
-                    self.entry.name
+                    self.entry.name,
+                    fd.as_raw_fd()
                 );
+                // Not ours to close either: the number is the backend's.
+                let _ = fd.into_raw_fd();
                 continue;
             }
-            // SAFETY: the kernel installed `fd` in our table for this call
-            // (a schema FD_OUT position that started at -1), nothing else
-            // holds it (checked above and in `take_fd_outs`), and it is owned
-            // exactly once from here on.
-            let (handle, kind) = f.adopt(unsafe { OwnedFd::from_raw_fd(fd) });
+            // The kernel installed it for us for this call (a schema FD_OUT
+            // position that started at -1, claimed from the arena), nothing
+            // else holds it (checked above and in `take_fd_outs`).
+            let (handle, kind) = f.adopt(fd);
             fd_recs.push([buf as u32, off as u32, handle, kind.wire()]);
         }
         // The hook first, while every handle the call named is still open:
@@ -660,13 +640,28 @@ impl Prepared {
     /// The host copy of buffer `i` (0 = the ioctl argument), for policy hooks
     /// that inspect a request before it runs or a reply after.
     pub fn buffer(&self, i: usize) -> Option<&[u8]> {
-        self.bufs.get(i).map(|b| b.bytes())
+        self.bufs.get(i).map(|b| self.arena.bytes(b.id))
     }
 
     /// Mutable access for policy hooks that sanitise a request (e.g. clearing
-    /// NVKMS override flags) before `execute`.
-    pub fn buffer_mut(&mut self, i: usize) -> Option<&mut [u8]> {
-        self.bufs.get_mut(i).map(|b| b.bytes_mut())
+    /// NVKMS override flags) before `execute`: data only -- a pointer,
+    /// descriptor or GEM field is put back as it was when the view ends.
+    pub fn buffer_mut(&mut self, i: usize) -> Option<DataMut<'_>> {
+        let id = self.bufs.get(i)?.id;
+        self.arena.data_mut(id)
+    }
+
+    /// What the host writes into buffer `i` at `off`, for a test standing in
+    /// for it after the call.
+    #[cfg(test)]
+    pub(crate) fn host_writes(&mut self, i: usize, off: usize, bytes: &[u8]) {
+        let id = self.bufs[i].id;
+        self.arena.host_writes(id, off, bytes);
+    }
+
+    /// Buffer `i`'s bytes (empty for one that does not exist).
+    fn bytes(&self, i: usize) -> &[u8] {
+        self.bufs.get(i).map_or(&[], |b| self.arena.bytes(b.id))
     }
 
     /// The ioctl number being run.
@@ -753,7 +748,7 @@ impl Prepared {
             .bufs
             .iter()
             .filter(|b| b.dir.has_out())
-            .map(|b| pad8(b.bytes().len()))
+            .map(|b| pad8(self.arena.len(b.id)))
             .sum();
         let fds =
             self.slots_of(|k| matches!(k, Kind::FdOut { .. })).count() + self.fence_outs.len();
@@ -869,6 +864,7 @@ struct Walk<'a> {
     cursor: usize,
     /// Bytes of OUT-only buffers so far: allocated here, sent by nobody.
     out_only: usize,
+    arena: Arena,
     bufs: Vec<HostBuf>,
     slots: Vec<Slot>,
 }
@@ -909,19 +905,15 @@ impl Walk<'_> {
                 return Err(libc::E2BIG);
             }
         }
-        let mut mem = if len == 0 {
-            None
-        } else {
-            Some(GuardedBuf::new(len).ok_or(libc::ENOMEM)?)
-        };
-        if dir.has_in() {
-            if let Some(m) = mem.as_mut() {
-                m.as_mut_slice()
-                    .copy_from_slice(&self.req.data[self.cursor..self.cursor + len]);
-            }
+        let init = if dir.has_in() {
+            let b = &self.req.data[self.cursor..self.cursor + len];
             self.cursor = end;
-        }
-        self.bufs.push(HostBuf { mem, dir });
+            b
+        } else {
+            &[]
+        };
+        let id = self.arena.block(init, len)?;
+        self.bufs.push(HostBuf { id, dir });
         Ok(i)
     }
 
@@ -941,7 +933,7 @@ impl Walk<'_> {
             let at = base + f.off as usize;
             // Inside the struct by construction (schema_gen.py checks it);
             // checked again because a table bug must not read out of bounds.
-            if at + f.width() as usize > self.bufs[buf].bytes().len() {
+            if at + f.width() as usize > self.arena.len(self.bufs[buf].id) {
                 return Err(libc::EINVAL);
             }
             match f.kind {
@@ -953,7 +945,12 @@ impl Walk<'_> {
                     children,
                     ..
                 } => {
-                    let guest = self.read(buf, at, 8)?;
+                    // Taken out of the host's copy as it is found: from here
+                    // the field holds 0 until the backend points it at a
+                    // buffer of the call (`aim_pointers`), and the caller's
+                    // value is only the reply's.
+                    let id = self.bufs[buf].id;
+                    let guest = self.arena.slot(id, at, 8, SlotKind::Ptr, Restore::Yes)?;
                     let n = self.length(buf, base, len, max, &created, span)?;
                     let slot = self.slots.len();
                     self.slots.push(Slot {
@@ -1003,7 +1000,37 @@ impl Walk<'_> {
                     }
                 }
                 _ => {
-                    let guest = self.read(buf, at, f.width() as usize)?;
+                    let width = f.width() as usize;
+                    let id = self.bufs[buf].id;
+                    // Descriptors and GEM handles are the backend's to fill
+                    // (the caller's go back in the reply, or -1 for a
+                    // descriptor, which only the guest can fill); anything
+                    // else is data, read where it is.
+                    let guest = match f.kind {
+                        Kind::FdIn { .. } => self.arena.slot(
+                            id,
+                            at,
+                            width,
+                            SlotKind::Fd,
+                            Restore::To(u64::MAX),
+                        )?,
+                        Kind::FdOut { .. } => self.arena.slot(
+                            id,
+                            at,
+                            width,
+                            SlotKind::FdOut,
+                            Restore::To(u64::MAX),
+                        )?,
+                        Kind::GemIn { .. } => {
+                            self.arena
+                                .slot(id, at, width, SlotKind::Value, Restore::Yes)?
+                        }
+                        Kind::GemOut => {
+                            self.arena
+                                .slot(id, at, width, SlotKind::Value, Restore::No)?
+                        }
+                        _ => self.read(buf, at, width)?,
+                    };
                     self.slots.push(Slot {
                         field: f,
                         buf,
@@ -1036,8 +1063,9 @@ impl Walk<'_> {
             Len::Sum { field, elem } => {
                 let local = (field - span.first) as usize;
                 let total = match created.get(local).copied().flatten() {
-                    Some(b) => self.bufs[b]
-                        .bytes()
+                    Some(b) => self
+                        .arena
+                        .bytes(self.bufs[b].id)
                         .chunks_exact(4)
                         .map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap())))
                         .sum::<u64>(),
@@ -1058,7 +1086,7 @@ impl Walk<'_> {
     }
 
     fn read(&self, buf: usize, off: usize, width: usize) -> Result<u64, Errno> {
-        let b = self.bufs[buf].bytes();
+        let b = self.arena.bytes(self.bufs[buf].id);
         if off + width > b.len() {
             return Err(libc::EINVAL);
         }
@@ -1096,7 +1124,7 @@ impl Prepared {
     fn fence_slot(&self, buf: u32, off: u32) -> bool {
         self.prop_values_buf() == Some(buf as usize)
             && off % 8 == 0
-            && (off as usize) + 8 <= self.bufs[buf as usize].bytes().len()
+            && (off as usize) + 8 <= self.bytes(buf as usize).len()
     }
 
     /// Every descriptor field has exactly one record naming a handle of an
@@ -1136,13 +1164,15 @@ impl Prepared {
             let Kind::FdIn { width, none, .. } = self.slots[i].field.kind else {
                 unreachable!()
             };
+            let (b, o) = (self.bufs[self.slots[i].buf].id, self.slots[i].off);
             match self.fd_ins.iter().find(|r| r.slot == Some(i)) {
-                Some(r) => {
-                    let fd = r.fd.as_raw_fd() as i64 as u64;
-                    let (b, o) = (self.slots[i].buf, self.slots[i].off);
-                    wr(self.bufs[b].bytes_mut(), o, width as usize, fd);
+                Some(r) => self.arena.set_fd(b, o, r.fd.as_fd())?,
+                None if sext(self.slots[i].guest, width) == i64::from(none) => {
+                    // The "none" value, as the kernel is to read it.
+                    if none < 0 {
+                        self.arena.set_no_fd(b, o, i64::from(none))?;
+                    }
                 }
-                None if sext(self.slots[i].guest, width) == i64::from(none) => {}
                 // A raw number would be looked up in the backend's own table.
                 None => return Err(libc::EINVAL),
             }
@@ -1217,13 +1247,23 @@ impl Prepared {
         if self.entry.policy & policy::FB_PLANES == 0 {
             return Ok(());
         }
-        // drm_mode_fb_cmd2: pixel_format @12, handles[4] @20.
-        let a = self.bufs[0].bytes();
-        let planes = schema::format_planes(rd(a, 12, 4) as u32) as usize;
-        if (planes..4).any(|i| rd(a, 20 + 4 * i, 4) != 0) {
+        // drm_mode_fb_cmd2: pixel_format @12, handles[4] @20 -- as the guest
+        // sent them: a handle field is the backend's to fill in the host's
+        // copy.
+        let planes = schema::format_planes(self.sent(0, 12, 4) as u32) as usize;
+        if (planes..4).any(|i| self.sent(0, 20 + 4 * i, 4) != 0) {
             return Err(libc::EINVAL);
         }
         Ok(())
+    }
+
+    /// The `width`-byte field at `off` of buffer `buf` as the guest sent it:
+    /// its value taken out of a declared field, or the data there.
+    fn sent(&self, buf: usize, off: usize, width: usize) -> u64 {
+        let id = self.bufs[buf].id;
+        self.arena
+            .guest(id, off)
+            .unwrap_or_else(|| rd(self.arena.bytes(id), off, width))
     }
 
     fn take_render(&mut self, env: &dyn Env, render: u32) -> Result<(), Errno> {
@@ -1244,20 +1284,19 @@ impl Prepared {
         Ok(())
     }
 
-    /// Every pointer the schema names now points at our buffer or is NULL;
-    /// every descriptor-out field starts at -1 and every GEM-out field at 0,
-    /// so what is there afterwards is what the kernel wrote.
-    fn aim_pointers(&mut self) {
+    /// Every pointer the schema names now points at our buffer or is NULL
+    /// (it was declared, and so NULL, from the moment the walk found it);
+    /// every descriptor-out field starts at -1 and every GEM-out field at 0
+    /// (their declarations), so what is there afterwards is what the kernel
+    /// wrote.
+    fn aim_pointers(&mut self) -> Result<(), Errno> {
         for i in 0..self.slots.len() {
-            let (b, o) = (self.slots[i].buf, self.slots[i].off);
-            let (width, v) = match self.slots[i].field.kind {
-                Kind::Ptr { .. } => (8, self.slots[i].target.map_or(0, |t| self.bufs[t].addr())),
-                Kind::FdOut { width } => (width as usize, u64::MAX),
-                Kind::GemOut => (4, 0),
-                _ => continue,
-            };
-            wr(self.bufs[b].bytes_mut(), o, width, v);
+            if let (Kind::Ptr { .. }, Some(t)) = (self.slots[i].field.kind, self.slots[i].target) {
+                let (b, o) = (self.bufs[self.slots[i].buf].id, self.slots[i].off);
+                self.arena.point(b, o, self.bufs[t].id)?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -1278,8 +1317,8 @@ impl Prepared {
         }
         self.check_fb_sources()?;
         self.check_props(target_fd)?;
-        // Held until the ioctl has returned: the kernel may write there.
-        let _scratch = self.limit_forced_probe(std::time::Instant::now())?;
+        // In the call's arena, which outlives the ioctl.
+        self.limit_forced_probe(std::time::Instant::now())?;
         let hooks = self.hooks.clone();
         let gate = match self.run_gate {
             Some(_) => hooks.at_run(self)?,
@@ -1287,8 +1326,11 @@ impl Prepared {
         };
         let temps = self.gems_in(target_fd)?;
         let removing = self.forget_removed_fb();
-        let arg = self.bufs[0].addr() as *mut u8;
-        let ret = self.sys.ioctl(target_fd, self.entry.cmd, arg);
+        let sys = self.sys.clone();
+        let top = self.bufs[0].id;
+        let ret = self
+            .arena
+            .call(&*sys, target_fd, u64::from(self.entry.cmd), top);
         drop(gate);
         for h in temps {
             self.gem_close(target_fd, h);
@@ -1350,7 +1392,7 @@ impl Prepared {
         let Some(off) = Self::fb_source_at(self.entry.name) else {
             return Ok(());
         };
-        let fb = rd(self.bufs[0].bytes(), off, 4) as u32;
+        let fb = rd(self.bytes(0), off, 4) as u32;
         if (self.entry.name == "SETCRTC" && fb == u32::MAX) || self.fb_usable(fb) {
             return Ok(());
         }
@@ -1374,41 +1416,42 @@ impl Prepared {
     /// fits (into that buffer, which nobody reads), and writes the real
     /// count back, which is all a count_modes 0 caller gets anyway. The
     /// guest's own modes_ptr (NULL: it asked for no modes) goes back in
-    /// place as for every pointer. Returns the buffer, to outlive the call.
-    fn limit_forced_probe(&mut self, now: std::time::Instant) -> Result<Option<GuardedBuf>, Errno> {
+    /// place as for every pointer. The buffer is the call arena's, and
+    /// outlives the call.
+    fn limit_forced_probe(&mut self, now: std::time::Instant) -> Result<(), Errno> {
         const COUNT_MODES: usize = 32;
         const MODES_PTR: usize = 8;
         const CONNECTOR_ID: usize = 48;
         const MODEINFO: usize = 68;
         if self.entry.name != "GETCONNECTOR" {
-            return Ok(None);
+            return Ok(());
         }
         let card = match self.target_kind {
             HandleKind::DrmCard(c) | HandleKind::DrmLease(c) => c,
-            _ => return Ok(None),
+            _ => return Ok(()),
         };
-        let arg = self.bufs[0].bytes();
+        let arg = self.bytes(0);
         if rd(arg, COUNT_MODES, 4) != 0 {
-            return Ok(None);
+            return Ok(());
         }
         let connector = rd(arg, CONNECTOR_ID, 4) as u32;
         let Some(k) = &self.kms else {
-            return Ok(None);
+            return Ok(());
         };
         if k.vm.may_probe(card, connector, now) {
-            return Ok(None);
+            return Ok(());
         }
-        let mut scratch = GuardedBuf::new(MODEINFO).ok_or(libc::ENOMEM)?;
-        let at = scratch.as_mut_ptr() as u64;
-        let arg = self.bufs[0].bytes_mut();
-        wr(arg, COUNT_MODES, 4, 1);
-        wr(arg, MODES_PTR, 8, at);
+        let scratch = self.arena.block(&[], MODEINFO)?;
+        let top = self.bufs[0].id;
+        self.arena.write(top, COUNT_MODES, &1u32.to_le_bytes())?;
+        // modes_ptr is a schema pointer, declared by the walk.
+        self.arena.point(top, MODES_PTR, scratch)?;
         log::debug!(
             "GETCONNECTOR {connector} on handle {}: probed less than {:?} ago; reported, not probed",
             self.target,
             CONNECTOR_PROBE_EVERY
         );
-        Ok(Some(scratch))
+        Ok(())
     }
 
     /// RMFB/CLOSEFB: the record goes before the call, so no scanout call on
@@ -1420,7 +1463,7 @@ impl Prepared {
             return None;
         }
         // fb_id @0 of RMFB's u32 and drm_mode_closefb.
-        let fb = rd(self.bufs[0].bytes(), 0, 4) as u32;
+        let fb = rd(self.bytes(0), 0, 4) as u32;
         self.kms.as_ref().filter(|k| k.take_fb(fb)).map(|_| fb)
     }
 
@@ -1434,7 +1477,7 @@ impl Prepared {
         if self.entry.policy & policy::SETPROP != 0 {
             // drm_mode_connector_set_property / drm_mode_obj_set_property:
             // prop_id @8 in both.
-            let id = rd(self.bufs[0].bytes(), 8, 4) as u32;
+            let id = rd(self.bytes(0), 8, 4) as u32;
             let name = self.prop_name(fd, id)?;
             if self.hooks.prop_kind(trim(&name)) != PropKind::Plain {
                 return Err(libc::EINVAL);
@@ -1442,7 +1485,7 @@ impl Prepared {
             // value @0: the same framebuffer rule as ATOMIC's, or the
             // legacy setter is the way round it (S-6).
             if Self::is_fb_prop(trim(&name))
-                && !self.fb_usable(rd(self.bufs[0].bytes(), 0, 4) as u32)
+                && !self.fb_usable(rd(self.bytes(0), 0, 4) as u32)
             {
                 return Err(libc::EPERM);
             }
@@ -1456,14 +1499,14 @@ impl Prepared {
             .find(|s| s.buf == 0 && s.field.name == "props_ptr")
             .and_then(|s| s.target)
             .ok_or(libc::EINVAL)?;
-        let ids: Vec<u32> = self.bufs[props]
-            .bytes()
+        let ids: Vec<u32> = self
+            .bytes(props)
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         for (i, id) in ids.into_iter().enumerate() {
             let off = 8 * i;
-            let value = rd(self.bufs[values].bytes(), off, 8);
+            let value = rd(self.bytes(values), off, 8);
             let fd_rec = self
                 .fd_ins
                 .iter()
@@ -1494,19 +1537,22 @@ impl Prepared {
                 let hooks = self.hooks.clone();
                 hooks.atomic_fence_prop(self, kind, trim(&name))?;
             }
-            let slot = &mut self.bufs[values].bytes_mut()[off..off + 8];
+            // The value becomes a field of the backend's: a descriptor of
+            // its own, or the address of an s32 of the call's.
+            let vid = self.bufs[values].id;
             match (kind, fd_rec, out_rec) {
                 (PropKind::FenceFd, Some(r), None) => {
-                    let host = self.fd_ins[r].fd.as_raw_fd() as i64;
-                    slot.copy_from_slice(&host.to_le_bytes());
+                    self.arena.fd(vid, off, 8)?;
+                    self.arena.set_fd(vid, off, self.fd_ins[r].fd.as_fd())?;
                 }
                 (PropKind::OutPtr, None, Some(r)) => {
                     // The kernel writes -1 here when the property is set
                     // (drm_atomic_uapi.c:473) and the sync_file's number once
                     // it is installed (1404); ours until finish adopts it.
-                    let mut s32 = GuardedBuf::new(4).ok_or(libc::ENOMEM)?;
-                    s32.as_mut_slice().copy_from_slice(&(-1i32).to_le_bytes());
-                    slot.copy_from_slice(&(s32.as_mut_ptr() as u64).to_le_bytes());
+                    let s32 = self.arena.block(&[], 4)?;
+                    self.arena.fd_out(s32, 0, 4)?;
+                    self.arena.ptr(vid, off)?;
+                    self.arena.point(vid, off, s32)?;
                     self.fence_outs[r].1 = Some(s32);
                 }
                 // A value with no record, or a record of the wrong kind.
@@ -1531,13 +1577,16 @@ impl Prepared {
         }
         let mut arg = [0u8; 64];
         wr(&mut arg, 16, 4, u64::from(id));
-        let r = self
-            .sys
-            .ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, arg.as_mut_ptr());
+        // values_ptr and enum_blob_ptr: declared, and so NULL.
+        let mut a = Arena::new();
+        let top = a.small(&arg);
+        a.ptr(top, 0)?;
+        a.ptr(top, 8)?;
+        let r = a.call(&*self.sys, fd, u64::from(DRM_IOCTL_MODE_GETPROPERTY), top);
         if r < 0 {
             return Err(-r);
         }
-        let name: [u8; 32] = arg[24..56].try_into().unwrap();
+        let name: [u8; 32] = a.bytes(top)[24..56].try_into().unwrap();
         if let Some(k) = &self.kms {
             k.lock().prop_names.insert(id, name);
         }
@@ -1567,7 +1616,7 @@ impl Prepared {
                 } else {
                     let owner_fd = self.owners[&owner].as_raw_fd();
                     let dmabuf = self.prime_export(owner_fd, gem)?;
-                    let imported = self.prime_import(target_fd, dmabuf);
+                    let imported = self.prime_import(target_fd, dmabuf.as_raw_fd());
                     self.sys.close(dmabuf);
                     let h = imported?;
                     temps.push(h);
@@ -1588,8 +1637,13 @@ impl Prepared {
             })();
             match r {
                 Ok(h) => {
-                    let (b, o) = (self.slots[slot].buf, self.slots[slot].off);
-                    wr(self.bufs[b].bytes_mut(), o, 4, u64::from(h));
+                    let (b, o) = (self.bufs[self.slots[slot].buf].id, self.slots[slot].off);
+                    if let Err(e) = self.arena.set_value(b, o, u64::from(h)) {
+                        for h in temps {
+                            self.gem_close(target_fd, h);
+                        }
+                        return Err(e);
+                    }
                 }
                 Err(e) => {
                     for h in temps {
@@ -1611,7 +1665,7 @@ impl Prepared {
         }
         // fb_id @0 of drm_mode_fb_cmd, drm_mode_fb_cmd2, RMFB's u32, closefb.
         // A removal was recorded before the call (`forget_removed_fb`).
-        let fb = rd(self.bufs[0].bytes(), 0, 4) as u32;
+        let fb = rd(self.bytes(0), 0, 4) as u32;
         if let Some(k) = &self.kms {
             if pol & policy::FB_CREATE != 0 {
                 k.add_fb(fb);
@@ -1623,12 +1677,12 @@ impl Prepared {
                 .slots_of(|k| matches!(k, Kind::GemOut))
                 .collect::<Vec<_>>()
             {
-                let (b, o) = (self.slots[i].buf, self.slots[i].off);
-                let h = rd(self.bufs[b].bytes(), o, 4) as u32;
+                let (b, o) = (self.bufs[self.slots[i].buf].id, self.slots[i].off);
+                let h = rd(self.arena.bytes(b), o, 4) as u32;
                 if h != 0 && closed.insert(h) {
                     self.gem_close(target_fd, h);
                 }
-                wr(self.bufs[b].bytes_mut(), o, 4, 0);
+                let _ = self.arena.set_value(b, o, 0);
             }
         }
     }
@@ -1646,24 +1700,27 @@ impl Prepared {
                 unreachable!()
             };
             let (b, o) = (self.slots[i].buf, self.slots[i].off);
+            let id = self.bufs[b].id;
             found.push((
                 b,
                 o,
-                sext(rd(self.bufs[b].bytes(), o, width as usize), width),
+                (id, o),
+                sext(rd(self.arena.bytes(id), o, width as usize), width),
             ));
         }
         if let Some(values) = self.prop_values_buf() {
             for (off, s32) in &self.fence_outs {
-                if let Some(s) = s32 {
+                if let Some(s) = *s32 {
                     found.push((
                         values,
                         *off,
-                        i64::from(rd(s.as_slice(), 0, 4) as u32 as i32),
+                        (s, 0),
+                        i64::from(rd(self.arena.bytes(s), 0, 4) as u32 as i32),
                     ));
                 }
             }
         }
-        for (b, o, v) in found {
+        for (b, o, (at, at_off), v) in found {
             if v < 0 {
                 continue;
             }
@@ -1678,7 +1735,11 @@ impl Prepared {
                 );
                 continue;
             }
-            self.fd_outs.push((b, o, v as RawFd));
+            // Written by the host into a field that held -1: its own, and
+            // now ours.
+            if let Some(fd) = self.arena.claim_fd(at, at_off) {
+                self.fd_outs.push((b, o, fd));
+            }
         }
     }
 
@@ -1702,7 +1763,7 @@ impl Prepared {
         let mut failed = None;
         for &i in &slots {
             let (b, o) = (self.slots[i].buf, self.slots[i].off);
-            let h = rd(self.bufs[b].bytes(), o, 4) as u32;
+            let h = rd(self.bytes(b), o, 4) as u32;
             if h == 0 {
                 continue;
             }
@@ -1731,7 +1792,8 @@ impl Prepared {
                     }
                 },
             };
-            wr(self.bufs[b].bytes_mut(), o, 4, u64::from(moved.0));
+            let id = self.bufs[b].id;
+            let _ = self.arena.set_value(id, o, u64::from(moved.0));
             self.gem_outs.push((b, o, moved.0, moved.1));
         }
         if let Some(e) = failed {
@@ -1743,8 +1805,8 @@ impl Prepared {
                 }
             }
             for &i in &slots {
-                let (b, o) = (self.slots[i].buf, self.slots[i].off);
-                wr(self.bufs[b].bytes_mut(), o, 4, 0);
+                let (b, o) = (self.bufs[self.slots[i].buf].id, self.slots[i].off);
+                let _ = self.arena.set_value(b, o, 0);
             }
             self.gem_outs.clear();
             return Err(e);
@@ -1763,8 +1825,8 @@ impl Prepared {
     fn move_to_render(&self, target_fd: RawFd, h: u32) -> Result<(u32, u64), Errno> {
         let render = self.render_fd.as_ref().ok_or(libc::EINVAL)?.as_raw_fd();
         let dmabuf = self.prime_export(target_fd, h)?;
-        let size = self.sys.size_of(dmabuf);
-        let imported = self.prime_import(render, dmabuf);
+        let size = self.sys.size_of(dmabuf.as_raw_fd());
+        let imported = self.prime_import(render, dmabuf.as_raw_fd());
         self.sys.close(dmabuf);
         let rh = imported?;
         if size < 0 {
@@ -1778,26 +1840,30 @@ impl Prepared {
     // drm_gem_close {u32 handle; u32 pad},
     // drm_nvidia_gem_identify_object_params {u32 handle; u32 object_type}.
 
-    fn prime_export(&self, fd: RawFd, gem: u32) -> Result<RawFd, Errno> {
-        let mut a = [0u8; 12];
-        wr(&mut a, 0, 4, u64::from(gem));
-        wr(&mut a, 4, 4, u64::from(DRM_CLOEXEC));
-        wr(&mut a, 8, 4, u64::MAX);
-        let r = self
-            .sys
-            .ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, a.as_mut_ptr());
+    /// A DRM call of the backend's own on `fd`: `a` (the whole argument,
+    /// data only) sent and read back.
+    fn flat(&self, fd: RawFd, cmd: u32, a: &mut [u8]) -> i32 {
+        crate::sys::block::flat(&*self.sys, fd, u64::from(cmd), a)
+    }
+
+    fn prime_export(&self, fd: RawFd, gem: u32) -> Result<OwnedFd, Errno> {
+        let mut b = [0u8; 12];
+        wr(&mut b, 0, 4, u64::from(gem));
+        wr(&mut b, 4, 4, u64::from(DRM_CLOEXEC));
+        let mut a = Arena::new();
+        let top = a.small(&b);
+        a.fd_out(top, 8, 4)?;
+        let r = a.call(&*self.sys, fd, u64::from(DRM_IOCTL_PRIME_HANDLE_TO_FD), top);
         if r < 0 {
             return Err(-r);
         }
-        Ok(rd(&a, 8, 4) as u32 as i32)
+        a.claim_fd(top, 8).ok_or(libc::EIO)
     }
 
     fn prime_import(&self, fd: RawFd, dmabuf: RawFd) -> Result<u32, Errno> {
         let mut a = [0u8; 12];
         wr(&mut a, 8, 4, dmabuf as u32 as u64);
-        let r = self
-            .sys
-            .ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, a.as_mut_ptr());
+        let r = self.flat(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut a);
         if r < 0 {
             return Err(-r);
         }
@@ -1807,7 +1873,7 @@ impl Prepared {
     fn gem_close(&self, fd: RawFd, gem: u32) {
         let mut a = [0u8; 8];
         wr(&mut a, 0, 4, u64::from(gem));
-        let r = self.sys.ioctl(fd, DRM_IOCTL_GEM_CLOSE, a.as_mut_ptr());
+        let r = self.flat(fd, DRM_IOCTL_GEM_CLOSE, &mut a);
         if r < 0 {
             log::warn!(
                 "IOCTL2 {}: GEM_CLOSE of {gem} failed: {}",
@@ -1820,9 +1886,7 @@ impl Prepared {
     fn identify(&self, fd: RawFd, gem: u32) -> Result<u64, Errno> {
         let mut a = [0u8; 8];
         wr(&mut a, 0, 4, u64::from(gem));
-        let r = self
-            .sys
-            .ioctl(fd, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, a.as_mut_ptr());
+        let r = self.flat(fd, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, &mut a);
         if r < 0 {
             return Err(-r);
         }
@@ -1837,19 +1901,11 @@ impl Prepared {
     /// GEM handles; -1 in every descriptor field, which only it can fill --
     /// and lay out `Ioctl2Resp`, the OUT bytes, the fd and GEM records.
     fn response(&mut self, fd_recs: &[[u32; 4]]) -> Vec<u8> {
-        for i in 0..self.slots.len() {
-            let (b, o, guest) = (self.slots[i].buf, self.slots[i].off, self.slots[i].guest);
-            let (width, v) = match self.slots[i].field.kind {
-                Kind::Ptr { .. } => (8, guest),
-                Kind::GemIn { .. } => (4, guest),
-                Kind::FdIn { width, .. } | Kind::FdOut { width } => (width as usize, u64::MAX),
-                _ => continue,
-            };
-            wr(self.bufs[b].bytes_mut(), o, width, v);
-        }
+        // Each buffer's reply copy (sys/block.rs) carries the guest's own
+        // pointers and GEM handles, and -1 in every descriptor field.
         let mut data = Vec::new();
         for b in self.bufs.iter().filter(|b| b.dir.has_out()) {
-            data.extend_from_slice(b.bytes());
+            data.extend_from_slice(&self.arena.reply(b.id));
             data.resize(pad8(data.len()), 0);
         }
         let mut out = Vec::with_capacity(self.response_len());
@@ -1963,17 +2019,18 @@ mod tests {
         0xc000_0000 | size << 16 | (b'd' as u32) << 8 | nr
     }
 
-    unsafe fn peek(p: *const u8, off: usize, width: usize) -> u64 {
-        let mut v = [0u8; 8];
-        unsafe { std::ptr::copy_nonoverlapping(p.add(off), v.as_mut_ptr(), width) };
-        u64::from_le_bytes(v)
+    /// The `width`-byte word `off` bytes past `p` in the call's memory, as
+    /// the kernel reads it (`p`: the argument's address, `arg.addr()`, or a
+    /// pointer read out of a block).
+    fn peek(a: &Arg<'_>, p: u64, off: usize, width: usize) -> u64 {
+        a.peek(p + off as u64, width)
     }
 
-    unsafe fn poke(p: *mut u8, off: usize, width: usize, v: u64) {
-        unsafe { std::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p.add(off), width) };
+    fn poke(a: &mut Arg<'_>, p: u64, off: usize, width: usize, v: u64) {
+        a.poke(p + off as u64, width, v)
     }
 
-    type Main = Box<dyn FnMut(&mut Kernel, u32, u32, *mut u8) -> i32 + Send>;
+    type Main = Box<dyn FnMut(&mut Kernel, u32, u32, &mut Arg<'_>) -> i32 + Send>;
 
     #[derive(Default)]
     struct Kernel {
@@ -2024,7 +2081,10 @@ mod tests {
             })
         }
 
-        fn on_ioctl(&self, f: impl FnMut(&mut Kernel, u32, u32, *mut u8) -> i32 + Send + 'static) {
+        fn on_ioctl(
+            &self,
+            f: impl FnMut(&mut Kernel, u32, u32, &mut Arg<'_>) -> i32 + Send + 'static,
+        ) {
             *self.main.lock().unwrap() = Box::new(f);
         }
 
@@ -2037,28 +2097,30 @@ mod tests {
         }
     }
 
-    impl Sys for FakeSys {
-        fn ioctl(&self, fd: RawFd, cmd: u32, arg: *mut u8) -> i32 {
+    impl crate::sys::block::Kernel for FakeSys {
+        fn ioctl(&self, fd: RawFd, cmd: u64, arg: &mut Arg<'_>) -> i32 {
+            let cmd = cmd as u32;
             let mut k = self.k();
             let Some(&file) = k.files.get(&fd) else {
                 return -libc::EBADF;
             };
-            unsafe {
+            let top = arg.addr();
+            {
                 match cmd {
                     DRM_IOCTL_PRIME_HANDLE_TO_FD => {
-                        let h = peek(arg, 0, 4) as u32;
+                        let h = peek(arg, top, 0, 4) as u32;
                         let Some(obj) = k.obj(file, h) else {
                             return -libc::ENOENT;
                         };
                         let dmabuf = k.next_fd;
                         k.next_fd += 1;
                         k.dmabufs.insert(dmabuf, obj);
-                        poke(arg, 8, 4, dmabuf as u64);
+                        poke(arg, top, 8, 4, dmabuf as u64);
                         k.log.push(format!("export {file}:{h}"));
                         0
                     }
                     DRM_IOCTL_PRIME_FD_TO_HANDLE => {
-                        let Some(&obj) = k.dmabufs.get(&(peek(arg, 8, 4) as RawFd)) else {
+                        let Some(&obj) = k.dmabufs.get(&(peek(arg, top, 8, 4) as RawFd)) else {
                             return -libc::EBADF;
                         };
                         // drm_prime.c:304: the handle the file already has.
@@ -2067,12 +2129,12 @@ mod tests {
                             (1..).find(|h| !used.contains_key(h)).unwrap()
                         });
                         k.gems.entry(file).or_default().insert(h, obj);
-                        poke(arg, 0, 4, h as u64);
+                        poke(arg, top, 0, 4, h as u64);
                         k.log.push(format!("import {file}:{h}"));
                         0
                     }
                     DRM_IOCTL_GEM_CLOSE => {
-                        let h = peek(arg, 0, 4) as u32;
+                        let h = peek(arg, top, 0, 4) as u32;
                         k.log.push(format!("close {file}:{h}"));
                         match k.gems.get_mut(&file).and_then(|g| g.remove(&h)) {
                             Some(_) => 0,
@@ -2080,21 +2142,21 @@ mod tests {
                         }
                     }
                     DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT => {
-                        let h = peek(arg, 0, 4) as u32;
+                        let h = peek(arg, top, 0, 4) as u32;
                         k.log.push(format!("identify {file}:{h}"));
                         let Some(obj) = k.obj(file, h) else {
                             return -libc::ENOENT;
                         };
-                        poke(arg, 4, 4, k.objects[&obj].0);
+                        poke(arg, top, 4, 4, k.objects[&obj].0);
                         0
                     }
                     DRM_IOCTL_MODE_GETPROPERTY => {
-                        let id = peek(arg, 16, 4) as u32;
+                        let id = peek(arg, top, 16, 4) as u32;
                         k.log.push(format!("getprop {id}"));
                         let Some(name) = k.props.get(&id) else {
                             return -libc::ENOENT;
                         };
-                        std::ptr::copy_nonoverlapping(name.as_ptr(), arg.add(24), name.len());
+                        arg.bytes()[24..24 + name.len()].copy_from_slice(name.as_bytes());
                         0
                     }
                     _ => {
@@ -2105,7 +2167,12 @@ mod tests {
             }
         }
 
-        fn close(&self, fd: RawFd) {
+    }
+
+    impl Sys for FakeSys {
+        fn close(&self, fd: OwnedFd) {
+            // A number of the fake kernel's: nothing to close.
+            let fd = fd.into_raw_fd();
             let mut k = self.k();
             k.dmabufs.remove(&fd);
             k.log.push(format!("closefd {fd}"));
@@ -2446,17 +2513,18 @@ mod tests {
             .buf(64, Some(&a))
             .buf(8, None)
             .buf(4, None);
-        h.sys.on_ioctl(|_, _, _, arg| unsafe {
-            assert_eq!(peek(arg, 0, 8), 0, "NULL stays NULL");
-            assert_eq!(peek(arg, 8, 8), 0, "an empty list is handed over as NULL");
-            let conn = peek(arg, 16, 8) as *mut u8;
-            let enc = peek(arg, 24, 8) as *mut u8;
-            assert!(!conn.is_null() && !enc.is_null());
-            poke(conn, 0, 4, 71);
-            poke(conn, 4, 4, 72);
-            poke(enc, 0, 4, 81);
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
+            assert_eq!(peek(arg, top, 0, 8), 0, "NULL stays NULL");
+            assert_eq!(peek(arg, top, 8, 8), 0, "an empty list is handed over as NULL");
+            let conn = peek(arg, top, 16, 8);
+            let enc = peek(arg, top, 24, 8);
+            assert!(conn != 0 && enc != 0);
+            poke(arg, conn, 0, 4, 71);
+            poke(arg, conn, 4, 4, 72);
+            poke(arg, enc, 0, 4, 81);
             for (i, n) in [0u64, 0, 2, 1].iter().enumerate() {
-                poke(arg, 32 + 4 * i, 4, *n);
+                poke(arg, top, 32 + 4 * i, 4, *n);
             }
             0
         });
@@ -2504,7 +2572,8 @@ mod tests {
         let a = arg(104, &[(0, 8, 0xdead_0000), (8, 4, 4)]);
         let rq = Rq::new(iowr(0xa1, 104)).buf(104, Some(&a));
         h.sys.on_ioctl(|_, _, _, arg| {
-            assert_eq!(unsafe { peek(arg, 0, 8) }, 0);
+            let top = arg.addr();
+            assert_eq!(peek(arg, top, 0, 8), 0);
             0
         });
         let r = h.kms(&rq).unwrap();
@@ -2572,6 +2641,7 @@ mod tests {
             req: &req,
             cursor: 0,
             out_only: 0,
+            arena: Arena::new(),
             bufs: Vec::new(),
             slots: Vec::new(),
         };
@@ -2595,16 +2665,17 @@ mod tests {
             .buf(32, Some(&import_nvkms(28)))
             .buf(28, Some(&params))
             .fd(1, 0, CTL, 0);
-        h.sys.on_ioctl(|k, _, _, arg| unsafe {
-            let p = peek(arg, 8, 8) as *const u8;
-            let memfd = peek(p, 0, 4) as RawFd;
+        h.sys.on_ioctl(|k, _, _, arg| {
+            let top = arg.addr();
+            let p = peek(arg, top, 8, 8);
+            let memfd = peek(arg, p, 0, 4) as RawFd;
             assert_eq!(
                 k.files.get(&memfd),
                 Some(&CTL),
                 "a dup of the nvidiactl handle"
             );
-            assert_eq!(peek(arg, 24, 4), 0, "a GEM-out field starts at 0");
-            poke(arg, 24, 4, 5);
+            assert_eq!(peek(arg, top, 24, 4), 0, "a GEM-out field starts at 0");
+            poke(arg, top, 24, 4, 5);
             0
         });
         let r = h.run(SchemaClass::Render, RENDER, &rq).unwrap();
@@ -2644,7 +2715,8 @@ mod tests {
             .buf(12, Some(&grant(7, 2)))
             .fd(0, 0, MODESET, 0);
         h.sys.on_ioctl(|k, _, _, arg| {
-            let fd = unsafe { peek(arg, 0, 4) } as RawFd;
+            let top = arg.addr();
+            let fd = peek(arg, top, 0, 4) as RawFd;
             assert_eq!(k.files.get(&fd), Some(&MODESET));
             0
         });
@@ -2780,9 +2852,10 @@ mod tests {
     fn a_descriptor_the_host_makes_at_a_schema_position_is_adopted() {
         let h = h();
         let fd = fresh_fd();
-        h.sys.on_ioctl(move |_, _, _, arg| unsafe {
-            assert_eq!(peek(arg, 20, 4) as u32 as i32, -1, "starts at -1");
-            poke(arg, 20, 4, fd as u64);
+        h.sys.on_ioctl(move |_, _, _, arg| {
+            let top = arg.addr();
+            assert_eq!(peek(arg, top, 20, 4) as u32 as i32, -1, "starts at -1");
+            poke(arg, top, 20, 4, fd as u64);
             0
         });
         let mut fin = Fin::default();
@@ -2806,8 +2879,9 @@ mod tests {
         h.sys.on_ioctl(|_, _, _, _| 0);
         assert!(h.kms(&create_lease()).unwrap().fds.is_empty());
         // A failed call adopts nothing, whatever is there.
-        h.sys.on_ioctl(|_, _, _, arg| unsafe {
-            poke(arg, 20, 4, 3);
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
+            poke(arg, top, 20, 4, 3);
             -libc::EINVAL
         });
         let r = h.kms(&create_lease()).unwrap();
@@ -2815,15 +2889,18 @@ mod tests {
         assert!(r.fds.is_empty());
         // The call's own target.
         let target = h.target_fds[&KMS].as_raw_fd();
-        h.sys.on_ioctl(move |_, _, _, arg| unsafe {
-            poke(arg, 20, 4, target as u64);
+        h.sys.on_ioctl(move |_, _, _, arg| {
+            let top = arg.addr();
+            poke(arg, top, 20, 4, target as u64);
             0
         });
         assert!(h.kms(&create_lease()).unwrap().fds.is_empty());
         // One the backend already holds.
-        let fd = fresh_fd();
-        h.sys.on_ioctl(move |_, _, _, arg| unsafe {
-            poke(arg, 20, 4, fd as u64);
+        let held = File::open("/dev/null").unwrap();
+        let fd = held.as_raw_fd();
+        h.sys.on_ioctl(move |_, _, _, arg| {
+            let top = arg.addr();
+            poke(arg, top, 20, 4, fd as u64);
             0
         });
         let mut fin = Fin::default();
@@ -2832,7 +2909,9 @@ mod tests {
             .run_with(SchemaClass::Kms, KMS, &create_lease(), &mut fin)
             .unwrap();
         assert!(r.fds.is_empty() && fin.adopted.is_empty());
-        unsafe { libc::close(fd) };
+        // Still open: not adopted, and not closed either.
+        assert!(crate::sys::fd::is_open(fd));
+        drop(held);
     }
 
     // ── GEM in ──
@@ -2859,11 +2938,12 @@ mod tests {
             .buf(104, Some(&addfb2(NV12, [9, 9, 0, 0])))
             .gem(0, 20, RENDER, 3)
             .gem(0, 24, RENDER, 3);
-        h.sys.on_ioctl(|k, file, _, arg| unsafe {
-            let (a, b) = (peek(arg, 20, 4) as u32, peek(arg, 24, 4) as u32);
+        h.sys.on_ioctl(|k, file, _, arg| {
+            let top = arg.addr();
+            let (a, b) = (peek(arg, top, 20, 4) as u32, peek(arg, top, 24, 4) as u32);
             assert_eq!(a, b, "one object, one temporary");
             assert_eq!(k.obj(file, a), Some(100));
-            poke(arg, 0, 4, 42);
+            poke(arg, top, 0, 4, 42);
             0
         });
         let r = h.kms(&rq).unwrap();
@@ -2974,9 +3054,10 @@ mod tests {
     fn getfb_answers_with_a_render_handle_only_for_the_files_own_framebuffer() {
         let h = h();
         h.kms.as_ref().unwrap().add_fb(42);
-        h.sys.on_ioctl(|k, file, _, arg| unsafe {
+        h.sys.on_ioctl(|k, file, _, arg| {
+            let top = arg.addr();
             k.object(file, 7, 200, NV_GEM_OBJECT_NVKMS, 8192);
-            poke(arg, 24, 4, 7);
+            poke(arg, top, 24, 4, 7);
             0
         });
         let r = h.kms(&getfb(42)).unwrap();
@@ -3011,10 +3092,11 @@ mod tests {
     fn getfb2_moves_an_object_shared_by_planes_once() {
         let h = h();
         h.kms.as_ref().unwrap().add_fb(42);
-        h.sys.on_ioctl(|k, file, _, arg| unsafe {
+        h.sys.on_ioctl(|k, file, _, arg| {
+            let top = arg.addr();
             k.object(file, 5, 300, NV_GEM_OBJECT_NVKMS, 4096);
-            poke(arg, 20, 4, 5);
-            poke(arg, 24, 4, 5);
+            poke(arg, top, 20, 4, 5);
+            poke(arg, top, 24, 4, 5);
             0
         });
         let rq = Rq::new(iowr(0xce, 104)).buf(104, Some(&arg(104, &[(0, 4, 42)])));
@@ -3033,9 +3115,10 @@ mod tests {
     #[test]
     fn a_failed_move_fails_the_call_and_leaves_nothing_behind() {
         let h = h();
-        h.sys.on_ioctl(|_, _, _, arg| unsafe {
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
             // A handle the export cannot find.
-            poke(arg, 16, 4, 5);
+            poke(arg, top, 16, 4, 5);
             0
         });
         let a = arg(32, &[(0, 4, 64), (4, 4, 64), (8, 4, 32)]);
@@ -3092,9 +3175,10 @@ mod tests {
         h.kms.as_ref().unwrap().add_fb(9);
         h.kms.as_ref().unwrap().add_fb(8);
         let rq = atomic(&[(1, 9), (4, 3), (1, 8), (4, 2), (4, 1)], &[2, 3]);
-        h.sys.on_ioctl(|_, _, _, arg| unsafe {
-            let ids = peek(arg, 24, 8) as *const u8;
-            assert_eq!(peek(ids, 16, 4), 4, "the fifth id is where it should be");
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
+            let ids = peek(arg, top, 24, 8);
+            assert_eq!(peek(arg, ids, 16, 4), 4, "the fifth id is where it should be");
             0
         });
         assert_eq!(h.kms(&rq).unwrap().ret, 0);
@@ -3144,14 +3228,15 @@ mod tests {
         let rq = atomic(&[(2, 5), (3, 0x7777_0000)], &[2])
             .fd(4, 0, SYNC, 0)
             .dyn_(4, 8);
-        h.sys.on_ioctl(move |k, _, _, arg| unsafe {
-            let values = peek(arg, 32, 8) as *const u8;
-            let in_fd = peek(values, 0, 8) as RawFd;
+        h.sys.on_ioctl(move |k, _, _, arg| {
+            let top = arg.addr();
+            let values = peek(arg, top, 32, 8);
+            let in_fd = peek(arg, values, 0, 8) as RawFd;
             assert_eq!(k.files.get(&in_fd), Some(&SYNC));
-            let s32 = peek(values, 8, 8) as *mut u8;
-            assert_ne!(s32 as u64, 0x7777_0000, "never the guest's pointer");
-            assert_eq!(peek(s32, 0, 4) as u32 as i32, -1);
-            poke(s32, 0, 4, out_fd as u64);
+            let s32 = peek(arg, values, 8, 8);
+            assert_ne!(s32, 0x7777_0000, "never the guest's pointer");
+            assert_eq!(peek(arg, s32, 0, 4) as u32 as i32, -1);
+            poke(arg, s32, 0, 4, out_fd as u64);
             0
         });
         let mut fin = Fin::default();
@@ -3328,14 +3413,15 @@ mod tests {
         let h = h();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
-        h.sys.on_ioctl(move |_, _, _, arg| unsafe {
-            let (count, ptr) = (peek(arg, 32, 4), peek(arg, 8, 8));
+        h.sys.on_ioctl(move |_, _, _, arg| {
+            let top = arg.addr();
+            let (count, ptr) = (peek(arg, top, 32, 4), peek(arg, top, 8, 8));
             log.lock().unwrap().push((count, ptr != 0));
             if count >= 1 && ptr != 0 {
                 // One mode, and room for one: the kernel copies it.
-                poke(ptr as *mut u8, 0, 4, 0xdead);
+                poke(arg, ptr, 0, 4, 0xdead);
             }
-            poke(arg, 32, 4, 1);
+            poke(arg, top, 32, 4, 1);
             0
         });
         for _ in 0..2 {
@@ -3390,12 +3476,13 @@ mod tests {
             "no table for this host"
         );
         h.version = Some(DriverVersion::new(610, 57, 4));
-        h.sys.on_ioctl(|_, _, cmd, arg| unsafe {
+        h.sys.on_ioctl(|_, _, cmd, arg| {
+            let top = arg.addr();
             assert_eq!(cmd, schema::NVKMS_IOCTL_IOWR);
-            assert_eq!(peek(arg, 4, 4), 44);
-            let p = peek(arg, 8, 8) as *mut u8;
-            assert_eq!(peek(p, 8, 4), 3, "the request half is the guest's");
-            poke(p, 12, 4, 0x5555);
+            assert_eq!(peek(arg, top, 4, 4), 44);
+            let p = peek(arg, top, 8, 8);
+            assert_eq!(peek(arg, p, 8, 4), 3, "the request half is the guest's");
+            poke(arg, p, 12, 4, 0x5555);
             0
         });
         let r = modeset(&h, &rq).unwrap();
@@ -3414,11 +3501,86 @@ mod tests {
 
     // ── odds and ends ──
 
+    /// The walk declares every pointer, descriptor and GEM field in the
+    /// call's arena, and the arena refuses a field over another: so no two
+    /// such fields of one struct (arrays spelled out) may overlap unless
+    /// their conditions cannot both hold -- in every table, every release.
+    #[test]
+    fn no_two_declared_fields_of_any_schema_overlap() {
+        fn declared(k: &Kind) -> bool {
+            matches!(
+                k,
+                Kind::Ptr { .. }
+                    | Kind::FdIn { .. }
+                    | Kind::FdOut { .. }
+                    | Kind::GemIn { .. }
+                    | Kind::GemOut
+            )
+        }
+        fn exclusive(a: Option<schema::Cond>, b: Option<schema::Cond>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) if a.off == b.off && a.mask == b.mask => {
+                    (!a.ne && !b.ne && a.value != b.value) || (a.value == b.value && a.ne != b.ne)
+                }
+                _ => false,
+            }
+        }
+        /// (offset, width, condition) of each declared field of `span` at
+        /// `base`, arrays walked element by element.
+        fn fields(t: &Table, span: Span, base: u32, out: &mut Vec<(u32, u32, Option<schema::Cond>, &'static str)>) {
+            for f in t.fields(span) {
+                if let Kind::Array {
+                    count,
+                    stride,
+                    children,
+                    ..
+                } = f.kind
+                {
+                    for e in 0..count {
+                        fields(t, children, base + f.off + e * stride, out);
+                    }
+                } else if declared(&f.kind) {
+                    out.push((base + f.off, f.width(), f.cond, f.name));
+                }
+            }
+        }
+        fn check(t: &Table, span: Span, what: &str) {
+            let mut fs = Vec::new();
+            fields(t, span, 0, &mut fs);
+            for (i, a) in fs.iter().enumerate() {
+                for b in &fs[i + 1..] {
+                    let overlap = a.0 < b.0 + b.1 && b.0 < a.0 + a.1;
+                    assert!(
+                        !overlap || exclusive(a.2, b.2),
+                        "{}: {what}: {} and {} overlap",
+                        t.name,
+                        a.3,
+                        b.3
+                    );
+                }
+            }
+            for f in t.fields(span) {
+                if let Kind::Ptr { children, .. } = f.kind {
+                    if children.len > 0 {
+                        check(t, children, f.name);
+                    }
+                }
+            }
+        }
+        let mut tables = vec![schema::DRM_TABLE];
+        tables.extend(abi::schema::MODESET_TABLES.iter().copied());
+        for t in tables {
+            for e in t.ioctls {
+                check(t, e.fields, e.name);
+            }
+        }
+    }
+
     #[test]
     fn a_call_without_an_argument_hands_the_host_null() {
         let h = h();
         h.sys.on_ioctl(|_, _, _, arg| {
-            assert!(arg.is_null());
+            assert_eq!(arg.addr(), 0);
             0
         });
         let rq = Rq::new(0x0000_6444).buf(0, None);

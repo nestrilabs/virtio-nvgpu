@@ -1,13 +1,14 @@
 // crates/device/src/shm.rs
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::ptr;
+use std::os::fd::RawFd;
+use std::sync::Arc;
 
 use crate::error::{DeviceError, Result};
-use crate::privfd::PrivateFd;
 use crate::quota::{Ledger, Owner, Share};
+use crate::sys::mem::Window;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,17 +220,10 @@ pub struct ShmAllocator {
     wc: Zone,
     wb: Zone,
 
-    /// Base pointer for MAP_FIXED operations.
-    /// Initially points to the memfd mmap (self-owned fallback).
-    /// Overridden to the guest memory HVA via set_base_ptr().
-    base_ptr: *mut u8,
-
-    /// Self-owned memfd mapping — used as fallback when no external
-    /// base pointer is provided (e.g., unit tests). Registered as the
-    /// backend's own descriptor (`privfd`), so no IOCTL2 can adopt it.
-    memfd: Option<PrivateFd>,
-    memfd_ptr: *mut u8,
-    memfd_size: u64,
+    /// The window's own backing, a memfd mapped whole (sys::mem::Window),
+    /// which an extent goes back to when it is freed. The guest's view of
+    /// the window is the VMM's mapping; this one is the backend's.
+    window: Arc<Window>,
 
     total_size: u64,
 
@@ -238,8 +232,6 @@ pub struct ShmAllocator {
     owners: std::collections::HashMap<u64, (Owner, u64)>,
 }
 
-unsafe impl Send for ShmAllocator {}
-unsafe impl Sync for ShmAllocator {}
 
 impl ShmAllocator {
     pub fn new(cfg: ZoneConfig) -> Self {
@@ -250,41 +242,9 @@ impl ShmAllocator {
         let total = cfg.total();
         assert!(total > 0);
 
-        // Create a memfd as fallback backing (used for tests and
-        // before set_base_ptr is called).
-        let name = CString::new("virtio-gpu-nv-shm").unwrap();
-        let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(
-            raw_fd >= 0,
-            "memfd_create failed: {}",
-            std::io::Error::last_os_error()
-        );
-        let memfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-        let ret = unsafe { libc::ftruncate(memfd.as_raw_fd(), total as libc::off_t) };
-        assert_eq!(
-            ret,
-            0,
-            "ftruncate failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        let memfd_ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                total as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                memfd.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(
-            memfd_ptr,
-            libc::MAP_FAILED,
-            "mmap SHM BAR failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let window = Arc::new(Window::new(total as usize).unwrap_or_else(|e| {
+            panic!("the shared window's backing ({total:#x} bytes): {e}")
+        }));
 
         let uc_base = 0;
         let wc_base = cfg.uc_size;
@@ -294,10 +254,7 @@ impl ShmAllocator {
             uc: Zone::new(uc_base, cfg.uc_size),
             wc: Zone::new(wc_base, cfg.wc_size),
             wb: Zone::new(wb_base, cfg.wb_size),
-            base_ptr: memfd_ptr as *mut u8,
-            memfd: Some(PrivateFd::new(memfd)),
-            memfd_ptr: memfd_ptr as *mut u8,
-            memfd_size: total,
+            window,
             total_size: total,
             owners: std::collections::HashMap::new(),
         }
@@ -305,16 +262,6 @@ impl ShmAllocator {
 
     pub fn with_default_zones() -> Self {
         Self::new(ZoneConfig::default_1gib())
-    }
-
-    /// Override the base pointer used for MAP_FIXED operations.
-    pub fn set_base_ptr(&mut self, ptr: *mut u8) {
-        log::info!(
-            "ShmAllocator: base_ptr updated from {:?} to {:?}",
-            self.base_ptr,
-            ptr
-        );
-        self.base_ptr = ptr;
     }
 
     pub fn alloc(&mut self, length: u64, pgprot: PgprotKind) -> Result<ShmRegion> {
@@ -383,7 +330,7 @@ impl ShmAllocator {
         // Put the memfd back under this range before the extent can be handed
         // to another mapping; the guest keeps the whole window mapped, so the
         // range must never be left without backing.
-        unsafe { self.unmap_host_fd(region.offset, len)? };
+        self.unmap_host_fd(region.offset, len)?;
 
         let zone = match region.pgprot {
             PgprotKind::Uncached => &mut self.uc,
@@ -426,78 +373,40 @@ impl ShmAllocator {
         (self.uc.largest_free(), self.wc.largest_free(), self.wb.largest_free())
     }
 
+    /// Place `length` bytes of `host_fd` at `shm_offset` of the window's
+    /// local backing.
     pub fn map_host_fd(&self, shm_offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
-        let target = unsafe { self.base_ptr.add(shm_offset as usize) as *mut libc::c_void };
-
-        let ptr = unsafe {
-            libc::mmap(
-                target,
-                length as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                host_fd,
-                0, // nvidia mmap handler uses context list, not offset
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            let err = std::io::Error::last_os_error();
-            log::error!(
-                "SHM map_host_fd: mmap(shm_offset=0x{:x}, len=0x{:x}, fd={}, failed: {}",
-                shm_offset,
-                length,
-                host_fd,
-                err
-            );
-            return Err(DeviceError::Io(err));
-        }
-        Ok(())
+        self.window
+            .place(shm_offset, length, host_fd, 0, true)
+            .map_err(|err| {
+                log::error!(
+                    "SHM map_host_fd: mmap(shm_offset=0x{:x}, len=0x{:x}, fd={}, failed: {}",
+                    shm_offset,
+                    length,
+                    host_fd,
+                    err
+                );
+                DeviceError::Io(err)
+            })
     }
 
-    /// Tear down a host fd overlay from the SHM region, restoring memfd backing.
-    pub unsafe fn unmap_host_fd(&self, offset: u64, length: u64) -> Result<()> {
-        let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
-
+    /// Tear down a host fd overlay from the SHM region, restoring memfd
+    /// backing. MAP_FIXED replaces the old mapping atomically -- no window
+    /// of invalid pages.
+    pub fn unmap_host_fd(&self, offset: u64, length: u64) -> Result<()> {
         log::debug!(
             "SHM unmap_host_fd: restoring memfd at offset=0x{:x} len=0x{:x}",
             offset,
             length
         );
-
-        let memfd_raw = self.memfd_raw();
-        if memfd_raw >= 0 {
-            // Overlay the memfd back onto this range, replacing the host fd mapping.
-            // MAP_FIXED atomically replaces the old mapping — no window of invalid pages.
-            let ptr = unsafe {
-                libc::mmap(
-                    target,
-                    length as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_FIXED,
-                    memfd_raw,
-                    offset as libc::off_t,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                let err = std::io::Error::last_os_error();
-                log::error!(
-                    "SHM unmap_host_fd: memfd restore failed at offset=0x{:x}: {}",
-                    offset,
-                    err
-                );
-                return Err(DeviceError::Io(err));
-            }
-        } else {
-            // No memfd — this shouldn't happen in practice, but handle it
-            // by just unmapping. The guest will see a hole (SIGBUS on access).
-            log::warn!("SHM unmap_host_fd: no memfd, falling back to munmap");
-            let ret = unsafe { libc::munmap(target, length as usize) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                log::error!("SHM unmap_host_fd: munmap failed: {}", err);
-                return Err(DeviceError::Io(err));
-            }
-        }
-
+        self.window.restore(offset, length).map_err(|err| {
+            log::error!(
+                "SHM unmap_host_fd: memfd restore failed at offset=0x{:x}: {}",
+                offset,
+                err
+            );
+            DeviceError::Io(err)
+        })?;
         log::info!(
             "SHM unmap_host_fd: restored backing at offset=0x{:x} len=0x{:x}",
             offset,
@@ -507,11 +416,12 @@ impl ShmAllocator {
     }
 
     pub fn memfd_raw(&self) -> RawFd {
-        self.memfd.as_ref().map_or(-1, |fd| fd.as_raw_fd())
+        self.window.memfd_raw()
     }
 
-    pub fn base_ptr(&self) -> *mut u8 {
-        self.base_ptr
+    /// The window's local backing.
+    pub fn window(&self) -> Arc<Window> {
+        self.window.clone()
     }
 
     pub fn uc_zone_offset(&self) -> u64 {
@@ -525,22 +435,6 @@ impl ShmAllocator {
     }
     pub fn total_size(&self) -> u64 {
         self.total_size
-    }
-}
-
-impl Drop for ShmAllocator {
-    fn drop(&mut self) {
-        // Only unmap the memfd mapping, not the guest memory.
-        if !self.memfd_ptr.is_null() {
-            unsafe {
-                libc::munmap(
-                    self.memfd_ptr as *mut libc::c_void,
-                    self.memfd_size as usize,
-                );
-            }
-            self.memfd_ptr = ptr::null_mut();
-        }
-        // OwnedFd drops the memfd automatically.
     }
 }
 
@@ -570,6 +464,7 @@ mod tests {
     /// kept for processes that hold at most a sixteenth: the one that took
     /// its half cannot take another's first mapping (B2).
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn one_guest_process_cannot_map_the_whole_zone() {
         let mib = 1u64 << 20;
         let mut a = ShmAllocator::new(ZoneConfig {
@@ -608,7 +503,7 @@ mod tests {
     fn memfd_is_valid() {
         let a = small_alloc();
         assert!(a.memfd_raw() >= 0);
-        assert!(!a.base_ptr().is_null());
+        assert!(a.window().addr() != 0);
         assert_eq!(a.total_size(), 4096 * 8);
     }
 
@@ -648,47 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn set_base_ptr_changes_target() {
-        let mut a = small_alloc();
-        let original = a.base_ptr();
-        let fake_ptr = 0xDEAD_0000 as *mut u8;
-        a.set_base_ptr(fake_ptr);
-        assert_eq!(a.base_ptr(), fake_ptr);
-        assert_ne!(a.base_ptr(), original);
-    }
 
-    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn map_host_fd_with_memfd_fallback() {
         // Tests using the default memfd-backed base_ptr (no set_base_ptr call)
         let mut a = small_alloc();
         let region = a.alloc(4096, PgprotKind::WriteCombine).unwrap();
 
-        let name = CString::new("test-host-fd").unwrap();
-        let host_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(host_fd >= 0);
-        unsafe {
-            libc::ftruncate(host_fd, 4096);
-            let tmp = libc::mmap(
-                ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                host_fd,
-                0,
-            );
-            assert_ne!(tmp, libc::MAP_FAILED);
-            *(tmp as *mut u8) = 0x42;
-            libc::munmap(tmp, 4096);
-        }
+        let host_fd = crate::sys::fd::memfd(c"test-host-fd", libc::MFD_CLOEXEC).unwrap();
+        crate::sys::fd::ftruncate(&host_fd, 4096).unwrap();
+        crate::sys::mem::Mapping::shared(&host_fd, 4096, 0, true)
+            .unwrap()
+            .write(0, &[0x42]);
 
-        a.map_host_fd(region.offset, 4096, host_fd).unwrap();
+        a.map_host_fd(region.offset, 4096, std::os::fd::AsRawFd::as_raw_fd(&host_fd))
+            .unwrap();
 
-        unsafe {
-            let val = *a.base_ptr().add(region.offset as usize);
-            assert_eq!(val, 0x42);
-        }
-
-        unsafe { libc::close(host_fd) };
+        assert_eq!(a.window().read(region.offset, 1), [0x42]);
     }
 }
 
@@ -767,62 +638,39 @@ pub trait WindowPlacer: Send {
 /// every placement assumed before, and the placement then fails on its own.
 pub fn host_mapping_writable(fd: RawFd, len: u64, fd_offset: u64) -> bool {
     let len = align_up(len.max(1), PAGE_SIZE) as usize;
-    // SAFETY: a fresh mapping at an address the kernel chooses; nothing reads
-    // or writes through it, and it is unmapped below.
-    let p = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            fd_offset as libc::off_t,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        return true;
-    }
-    // SAFETY: `p` is the mapping made above, `len` bytes long.
-    let rc = unsafe { libc::mprotect(p, len, libc::PROT_READ | libc::PROT_WRITE) };
-    let err = std::io::Error::last_os_error().raw_os_error();
-    // SAFETY: as above; nothing else refers to it.
-    unsafe { libc::munmap(p, len) };
-    !(rc != 0 && err == Some(libc::EACCES))
+    crate::sys::mem::probe_writable(fd, len, fd_offset).unwrap_or(true)
 }
 
 #[cfg(test)]
 mod probe_tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
 
     fn memfd(len: u64) -> OwnedFd {
-        let name = CString::new("probe").unwrap();
-        // SAFETY: plain syscalls; ownership of the new fd passes to OwnedFd.
-        unsafe {
-            let fd = libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC);
-            assert!(fd >= 0);
-            assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
-            OwnedFd::from_raw_fd(fd)
-        }
+        let fd = crate::sys::fd::memfd(c"probe", libc::MFD_CLOEXEC).unwrap();
+        crate::sys::fd::ftruncate(&fd, len).unwrap();
+        fd
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_file_opened_read_only_is_probed_read_only_and_a_writable_one_writable() {
         let rw = memfd(8192);
         assert!(host_mapping_writable(rw.as_raw_fd(), 5000, 0));
-        let path = CString::new(format!("/proc/self/fd/{}", rw.as_raw_fd())).unwrap();
-        // SAFETY: reopening our own memfd read-only.
-        let ro = unsafe {
-            OwnedFd::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC))
-        };
+        let ro = crate::sys::fd::open_path(
+            &format!("/proc/self/fd/{}", rw.as_raw_fd()),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+        .unwrap();
         assert!(!host_mapping_writable(ro.as_raw_fd(), 4096, 4096));
     }
 
     #[test]
+
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn a_file_that_cannot_be_mapped_at_all_is_left_to_the_placement() {
-        let null = CString::new("/dev/null").unwrap();
-        // SAFETY: opening /dev/null.
-        let fd = unsafe { OwnedFd::from_raw_fd(libc::open(null.as_ptr(), libc::O_RDONLY)) };
+        let fd = crate::sys::fd::open(c"/dev/null", libc::O_RDONLY).unwrap();
         assert!(host_mapping_writable(fd.as_raw_fd(), 4096, 0));
     }
 }

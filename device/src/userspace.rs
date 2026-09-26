@@ -57,6 +57,8 @@
 //! Both are filtered by [`Capability`] rather than by name, so a driver that
 //! adds a new firmware file does not need a change here.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};

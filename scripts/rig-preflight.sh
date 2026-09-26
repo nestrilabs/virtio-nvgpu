@@ -80,7 +80,7 @@ for g in ${MYGROUPS//,/ }; do
 done
 if [ ${#risky[@]} -gt 0 ]; then
     warn "user is in ${risky[*]}: the backend inherits these groups, and each is root-equivalent"
-    hint "run the rig as a user without them, or as root with the nvgpu system user (run-guest.sh as root)"
+    hint "run the rig as a user without them, or as root with a pool of VM users (run-guest.sh as root)"
 else
     ok "no root-equivalent supplementary groups ($MYGROUPS)"
 fi
@@ -89,6 +89,27 @@ if command -v setpriv >/dev/null && setpriv --no-new-privs --inh-caps=-all --amb
 else
     fail "setpriv missing or refuses --no-new-privs --inh-caps=-all --ambient-caps=-all"
     hint "util-linux provides setpriv; run-guest.sh starts the backend through it"
+fi
+# The backend's sandbox (device/src/sandbox.rs) and nesbox's unshare-network
+# both enter a user and network namespace of their own, unprivileged; the
+# backend's also wants Landlock. Without them each still runs, and says
+# "sandbox: DEGRADED" in its log.
+if command -v unshare >/dev/null && unshare --user --map-current-user --net true 2>/dev/null; then
+    ok "unprivileged user and network namespaces work (the backend's and nesbox's network isolation)"
+else
+    warn "cannot unshare a user and network namespace unprivileged: the backend and nesbox keep the host's network"
+    hint "user.max_user_namespaces, kernel.unprivileged_userns_clone or an AppArmor userns restriction; or NVGPU_VMM_NETNS=0 for nesbox"
+fi
+if [ -r /sys/kernel/security/lsm ]; then
+    case ",$(cat /sys/kernel/security/lsm)," in
+        *,landlock,*) ok "Landlock is enabled (the backend confines its filesystem access with it)" ;;
+        *)
+            warn "Landlock is not among the active LSMs: the backend can open every file $ME can"
+            hint "boot with landlock in lsm= (CONFIG_SECURITY_LANDLOCK)"
+            ;;
+    esac
+else
+    warn "cannot read /sys/kernel/security/lsm to tell whether Landlock is on"
 fi
 if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
     ok "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR (the backend's socket directory goes here)"
