@@ -160,7 +160,6 @@ backend, connected to the host's compositor. `wlwire/` is the code they share
 unprivileged helper process per guest, holding the device descriptors so that a
 compromised backend, which maps all of the guest's memory, does not hold them. Today the backend holds them itself — as
 an unprivileged process, which it insists on being (§17).
-[`isolate/`](isolate/) is the design.
 
 ---
 

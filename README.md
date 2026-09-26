@@ -302,7 +302,6 @@ both.
 | [`device/`](device/) | **Apache-2.0** | The virtio device, as a Rust crate with **no VMM in its dependency list**. Every VMM concern is a trait. Also the vhost-user backend binary, and the host half of the Wayland proxy. |
 | [`wlwire/`](wlwire/) | **Apache-2.0** | The Wayland proxy's shared half: a codec generated from vendored protocol XML, the allowlist it is checked against at build time, the channel's frame format, and the translation engine both ends run. |
 | [`nvgpu-wl-guest/`](nvgpu-wl-guest/) | **Apache-2.0** | The guest daemon of the Wayland proxy. Guest clients connect to it as to a compositor. |
-| [`isolate/`](isolate/) | **Apache-2.0** | **A design note, not code yet.** The sandboxed per-guest helper that will hold the real device FDs. Today the backend holds them itself. |
 | [`gen/`](gen/) | — | Generated tables: the ABI profiles, the IOCTL2 schema both halves interpret, NVKMS and nvidia-drm layouts, RM control pointers and UVM block sizes, each measured per driver release. Checked in *and* reproducible. |
 | [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0-or-later** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
 | [`patches/`](patches/) | the patched project's | Patches to Hyprland and aquamarine that let the host lease a desktop monitor to a guest, and to crosvm to run the device as a vhost-user frontend. |
@@ -327,7 +326,8 @@ One thing that will **not** be a trait: the isolate. The intended design runs
 one sandboxed helper process per guest process, so adopting it eventually means
 inheriting a **process model**, not just a library dependency. That helper is
 not written — the backend holds the device descriptors itself today — and
-[`isolate/`](isolate/) is where the design lives until it is.
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Future work: the isolate", is where
+the design lives until it is.
 
 ### What a VMM must do, over vhost-user
 
@@ -511,7 +511,8 @@ events, and hotplug.
 **Isolate — not built yet.** The plan is a sandboxed helper per guest process,
 holding the real device FDs and issuing the `ioctl(2)` calls. Today the backend
 does that itself, unprivileged but in one process per VM.
-[`isolate/`](isolate/) holds the design and no code.
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Future work: the isolate", has the
+design.
 
 ```text
 ┌─ Guest ─────────────────────────────────────────────────┐

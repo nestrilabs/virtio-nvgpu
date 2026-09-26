@@ -1008,7 +1008,7 @@ In rough order of weight.
      memory-slot ioctl); its tighter vCPU filter is defined but never
      installed, and if it were, the window-request thread a vCPU spawns at
      DRIVER_OK would inherit it without `clone` or `mincore`.
-4. **The isolate is not built.** `isolate/README.md` describes one helper per
+4. **The isolate is not built.** ARCHITECTURE.md, "Future work", describes one helper per
    guest process holding the descriptors. The display paths share objects
    across a VM's processes (a compositor holds its clients' buffers) through
    one VM-wide handle table, so a helper per VM is probably the first one to
