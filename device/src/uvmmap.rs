@@ -230,7 +230,7 @@ impl UvmMaps {
     pub fn record(&mut self, handle: u32, base: u64, len: u64) -> (bool, Option<Withdraw>) {
         let stale = self.forget(handle, base);
         if len == 0 || len > MAX_LEN {
-            log::info!("uvm: pool {base:#x}+{len:#x} of handle {handle} is not mappable here");
+            log::debug!("uvm: pool {base:#x}+{len:#x} of handle {handle} is not mappable here");
             return (false, stale);
         }
         let of_file = self.ranges.range((handle, 0)..=(handle, u64::MAX)).count();
@@ -295,7 +295,7 @@ impl UvmMaps {
             .iter()
             .any(|(&(_, b), o)| o.placed.is_some() && b < end && base < b.saturating_add(o.len));
         if clash {
-            log::info!("uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it");
+            log::debug!("uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it");
             return Err(libc::ENOMEM);
         }
         let owner = self.owner(handle);

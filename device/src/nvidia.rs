@@ -1885,7 +1885,7 @@ impl NvidiaBackend {
         let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
             Ok(p) => p,
             Err(errno) => {
-                log::info!(
+                log::debug!(
                     "mmap of UVM handle {handle} at {base:#x}+{len:#x} (prot {}) refused: {}",
                     req.prot,
                     std::io::Error::from_raw_os_error(errno)
@@ -1915,7 +1915,7 @@ impl NvidiaBackend {
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
                 }
                 self.uvm_maps.commit(handle, base, aperture_off, id);
-                log::info!(
+                log::debug!(
                     "mmap of UVM handle {handle}: pool {base:#x}+{len:#x} at aperture \
                      {aperture_off:#x}, id {id}"
                 );
@@ -2155,7 +2155,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
-        log::info!(
+        log::debug!(
             "mmap on handle {handle}: placed {length:#x} bytes at window offset {:#x} \
              with no arming recorded here",
             region.offset
@@ -3144,17 +3144,6 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
-                if _other == 0x5E {
-                    log::warn!("0x5E hit DEFAULT arm instead of dedicated handler!");
-                }
-                if _other == 0x00 {
-                    log::debug!(
-                        "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
-                        self.current_handle,
-                        request,
-                        &param_in[..std::cmp::min(param_in.len(), 16)]
-                    );
-                }
                 let n = self.dispatch_simple(cookie, host_fd, request, param_in, &plan, resp_buf);
                 // RM_FREE of a client: no longer one 0x54 may name.
                 self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
@@ -3600,25 +3589,12 @@ impl NvidiaBackend {
             let cmd = word(outer, NVOS54_CMD);
             let params_size = word(outer, NVOS54_PARAMS_SIZE);
             let status = word(outer, NVOS54_STATUS);
-            if status == NV_OK {
-                log::debug!("RM_CONTROL cmd=0x{cmd:08x} paramsSize={params_size} -> NV_OK");
-            } else {
-                // A refusal tells us nothing on its own; the argument RM
-                // objected to is in the params. Show the head of them.
-                let head: Vec<String> = a
-                    .bytes(nb)
-                    .iter()
-                    .take(64)
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                log::warn!(
-                    "RM_CONTROL cmd=0x{:08x} paramsSize={} -> status=0x{:08x}\n  params[0..64]: {}",
-                    cmd,
-                    params_size,
-                    status,
-                    head.join(" ")
-                );
-            }
+            // RM refusing a control is routine (userspace probes), and its
+            // parameters may hold host addresses and the guest's data: the
+            // command and status only, at debug.
+            log::debug!(
+                "RM_CONTROL cmd=0x{cmd:08x} paramsSize={params_size} -> status=0x{status:08x}"
+            );
         }
         if escape == 0x2b && param_in.len() >= 48 {
             log::debug!(
@@ -4150,14 +4126,6 @@ impl NvidiaBackend {
             param_in.len()
         );
 
-        // Debug logging for Vulkan-critical ioctls
-        let log_response = escape == 0xd2  // NV_ESC_CHECK_VERSION_STR
-            || escape == 0xc8  // NV_ESC_CARD_INFO
-            || escape == 0xd6  // NV_ESC_SYS_PARAMS
-            || escape == 0xd7  // NV_ESC_QUERY_DEVICE_INTR
-            || escape == 0x2b // NV_ESC_RM_ALLOC (hClient)
-            || escape == 0x2a; // NV_ESC_RM_CONTROL
-
         let n_in = param_in.len();
         let mut a = Arena::new();
         let top = match self.top_block(&mut a, request, param_in, plan) {
@@ -4230,83 +4198,8 @@ impl NvidiaBackend {
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if first_ok {
-            if escape == 0xd2 {
-                self.learn_driver_version(&param_buf);
-            }
-            if log_response {
-                let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
-                match escape {
-                    0xd2 => {
-                        // NV_ESC_CHECK_VERSION_STR - version string at offset 0
-                        let version = String::from_utf8_lossy(preview);
-                        log::info!("CHECK_VERSION_STR response: {:?}", version);
-                    }
-                    0xc8 => {
-                        log::info!("CARD_INFO response[0..128]: {:02x?}", preview);
-                    }
-                    0xd6 => {
-                        log::info!("SYS_PARAMS response[0..128]: {:02x?}", preview);
-                    }
-                    0x2a => {
-                        // RM_CONTROL - log first few bytes of params
-                        let status = if param_buf.len() >= 4 {
-                            u32::from_le_bytes([
-                                param_buf[0],
-                                param_buf[1],
-                                param_buf[2],
-                                param_buf[3],
-                            ])
-                        } else {
-                            0
-                        };
-                        log::info!(
-                            "RM_CONTROL response: status={:#x}, data[4..32]={:02x?}",
-                            status,
-                            &param_buf[4..std::cmp::min(32, param_buf.len())]
-                        );
-                    }
-                    0x2b => {
-                        // RM_ALLOC - log first few bytes
-                        let status = if param_buf.len() >= 4 {
-                            u32::from_le_bytes([
-                                param_buf[0],
-                                param_buf[1],
-                                param_buf[2],
-                                param_buf[3],
-                            ])
-                        } else {
-                            0
-                        };
-                        log::info!(
-                            "RM_ALLOC response: status={:#x}, data[4..32]={:02x?}",
-                            status,
-                            &param_buf[4..std::cmp::min(32, param_buf.len())]
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            if escape == 0x57 || escape == 0x58 {
-                log::info!(
-                    "MAP/UNMAP_DMA(0x{:02x}): response[{}]={:02x?}",
-                    escape,
-                    param_buf.len(),
-                    &param_buf[..std::cmp::min(param_buf.len(), 64)]
-                );
-            }
-            // Only on NVIDIA's own magic. 0x4a is VID_HEAP_CONTROL there and
-            // GEM_MAP_OFFSET on the DRM node, and logging the second under the
-            // first's name makes a buffer-sharing run look like an allocator
-            // storm -- which it did, for as long as it took to count the
-            // namespaces separately.
-            if escape == 0x4a && ((request >> 8) & 0xFF) as u32 == b'F' as u32 {
-                log::info!(
-                    "VID_HEAP_CONTROL: response[{}]={:02x?}",
-                    param_buf.len(),
-                    &param_buf[..std::cmp::min(param_buf.len(), 184)]
-                );
-            }
+        if first_ok && escape == 0xd2 {
+            self.learn_driver_version(&param_buf);
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
@@ -4596,7 +4489,7 @@ impl NvidiaBackend {
         // VM (see `shm::host_mapping_writable`).
         let writable = crate::shm::host_mapping_writable(host_map_fd, length, 0);
         if !writable {
-            log::info!(
+            log::debug!(
                 "NV_ESC_RM_MAP_MEMORY: client {h_client:#x} memory {h_memory:#x} is read-only \
                  on the host; placed read-only"
             );

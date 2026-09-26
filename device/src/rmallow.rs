@@ -358,13 +358,13 @@ impl RmAllow {
             .refused_controls
             .lines(|c| format!("{}({c:#010x})", rmallow::control_name(c).unwrap_or("?")))
         {
-            log::info!("RM allowlist {verb} control(s): {line}");
+            log::warn!("RM allowlist {verb} control(s): {line}");
         }
         for line in self
             .refused_classes
             .lines(|c| format!("{}({c:#06x})", rmallow::class_name(c).unwrap_or("?")))
         {
-            log::info!("RM allowlist {verb} class(es): {line}");
+            log::warn!("RM allowlist {verb} class(es): {line}");
         }
     }
 }

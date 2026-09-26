@@ -1016,7 +1016,7 @@ impl NvidiaBackend {
                 }
                 Some(Ok(fd)) => match self.insert(fd, HandleKind::DrmCard(card)) {
                     Ok(h) => {
-                        log::info!("OPEN_KMS: {path} -> handle {h}");
+                        log::debug!("OPEN_KMS: {path} -> handle {h}");
                         (h as u64, vec![h])
                     }
                     Err(e) => return self.error_reply(e),

@@ -39,6 +39,10 @@ struct Bucket {
     tokens: f64,
     last: Instant,
     suppressed: u64,
+    /// The site's level and module, for a report of what it dropped made
+    /// when no line of its own follows (`flush`).
+    level: log::Level,
+    module: Option<&'static str>,
 }
 
 impl Bucket {
@@ -47,6 +51,8 @@ impl Bucket {
             tokens: BURST,
             last: now,
             suppressed: 0,
+            level: log::Level::Warn,
+            module: None,
         }
     }
 
@@ -90,10 +96,42 @@ impl<L: log::Log> RateLimited<L> {
             return Some(0);
         };
         let mut sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
-        sites
-            .entry((file, line))
-            .or_insert_with(|| Bucket::new(now))
-            .admit(now)
+        let b = sites.entry((file, line)).or_insert_with(|| Bucket::new(now));
+        b.level = record.level();
+        b.module = record.module_path_static();
+        b.admit(now)
+    }
+
+    /// Say how many lines each site dropped since its last one went out:
+    /// a site that went quiet after its burst would otherwise never say.
+    pub fn report_suppressed(&self) {
+        let pending: Vec<_> = {
+            let mut sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
+            let mut v: Vec<_> = sites
+                .iter_mut()
+                .filter(|(_, b)| b.suppressed > 0)
+                .map(|(&(file, line), b)| {
+                    (file, line, b.level, b.module, std::mem::take(&mut b.suppressed))
+                })
+                .collect();
+            v.sort_unstable_by_key(|&(f, l, ..)| (f, l));
+            v
+        };
+        for (file, line, level, module, dropped) in pending {
+            self.inner.log(
+                &log::Record::builder()
+                    .level(level)
+                    .target(module.unwrap_or("ratelimit"))
+                    .file_static(Some(file))
+                    .line(Some(line))
+                    .module_path_static(module)
+                    .args(format_args!(
+                        "({dropped} similar line(s) from here dropped by the log rate limit, \
+                         and none since)"
+                    ))
+                    .build(),
+            );
+        }
     }
 }
 
@@ -126,7 +164,11 @@ impl<L: log::Log> log::Log for RateLimited<L> {
         self.inner.log(record);
     }
 
+    /// Reports what each site dropped (`report_suppressed`), then flushes:
+    /// the backend flushes at teardown, so the last word on a noisy guest
+    /// is how noisy it was.
     fn flush(&self) {
+        self.report_suppressed();
         self.inner.flush();
     }
 }
@@ -203,6 +245,31 @@ mod tests {
             "{noisy}"
         );
         assert_eq!(got.last().map(String::as_str), Some("other"));
+    }
+
+    /// A site that went quiet after its burst says, at the flush, how many
+    /// it dropped -- once.
+    #[test]
+    #[cfg_attr(miri, ignore = "timing: Miri runs far slower than the refill")]
+    fn a_flush_reports_what_a_quiet_site_dropped() {
+        use log::Log;
+        let l = RateLimited::new(Sink(Mutex::new(Vec::new())));
+        for _ in 0..(BURST as usize + 7) {
+            l.log(&record(40, log::Level::Warn, format_args!("refused")));
+        }
+        l.log(&record(41, log::Level::Warn, format_args!("once")));
+        l.flush();
+        let got = l.inner.0.lock().unwrap().clone();
+        let report: Vec<_> = got.iter().filter(|s| s.contains("dropped")).collect();
+        assert_eq!(report.len(), 1, "{got:?}");
+        // A slow run may refill a line or two; never more than were sent.
+        let n: u64 = report[0].trim_start_matches('(').split(' ').next().unwrap().parse().unwrap();
+        assert!((1..=7).contains(&n), "{}", report[0]);
+        assert!(report[0].contains("none since"));
+        drop(got);
+        l.flush();
+        let again = l.inner.0.lock().unwrap();
+        assert_eq!(again.iter().filter(|s| s.contains("dropped")).count(), 1);
     }
 
     #[test]

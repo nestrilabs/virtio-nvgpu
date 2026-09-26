@@ -1296,9 +1296,11 @@ fn release_gate(version: &str, allow_unmeasured: bool) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     // Every call site metered (device::ratelimit): most of what is logged
-    // here is something a guest did, and a guest can do it in a loop.
+    // here is something a guest did, and a guest can do it in a loop. Warnings
+    // and up unless RUST_LOG says otherwise: the start-up lines worth keeping
+    // (the tables, the sandbox, the diagnostic flags) are warnings.
     let logger =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).build();
     let max_level = logger.filter();
     log::set_boxed_logger(Box::new(device::ratelimit::RateLimited::new(logger)))
         .expect("the logger is set once, first thing");
@@ -1610,6 +1612,8 @@ fn main() -> anyhow::Result<()> {
         .lock()
         .expect("nvidia lock")
         .teardown();
+    // What the log rate limit dropped and nothing reported since.
+    log::logger().flush();
     log::info!("backend exited");
     Ok(())
 }

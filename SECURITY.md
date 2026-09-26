@@ -1575,3 +1575,18 @@ announced as `DIAGNOSTIC: <flag>: <what it takes away>` on stderr, whatever
 the log level, and in the log. `scripts/run-guest.sh` adds `--diagnostic`
 only when one of them reached the backend's arguments (after `--`, or from
 `NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`).
+
+**What the log holds.** The raw dumps are gone: the CARD_INFO reply (BAR
+physical addresses), SYS_PARAMS, RM_CONTROL and RM_ALLOC replies (whose
+`&param_buf[4..]` also panicked on a block shorter than 4), MAP/UNMAP_DMA and
+VID_HEAP_CONTROL replies, all at info, and the 64 parameter bytes of every
+control RM refused, at warning (host addresses, and a guest's data, in the
+host's log). A refused control is now its command and status, at debug.
+The per-call info lines a guest can drive (UVM and window placements,
+read-only mappings, OPEN_KMS, SHM restores) are debug; the RM allowlist's
+teardown report of what it refused is a warning. The default level is
+`warn`, so the start-up lines worth reading (the tables chosen, the sandbox
+layers not in force, the diagnostic flags) are what a production log holds.
+The rate limit (`device/src/ratelimit.rs`) already said how many lines a
+site dropped when its next line went out; a site that went quiet after its
+burst now says so at teardown too.

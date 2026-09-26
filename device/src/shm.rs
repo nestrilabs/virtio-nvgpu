@@ -407,7 +407,7 @@ impl ShmAllocator {
             );
             DeviceError::Io(err)
         })?;
-        log::info!(
+        log::debug!(
             "SHM unmap_host_fd: restored backing at offset=0x{:x} len=0x{:x}",
             offset,
             length
