@@ -12,7 +12,8 @@
 #               /opt/nvgpu/stage1.sh)
 #   tag         names the log and config, so runs do not overwrite each other
 #   backend-args  anything else for the backend, as is (--permissive-abi,
-#               --keep-guest-coherency, ...; see vhost-user-nvgpu --help)
+#               --keep-guest-coherency, ...; see vhost-user-nvgpu --help);
+#               --permissive-abi and --rm-allowlist=log are said aloud
 #
 # Display options, passed through to the backend (TESTING.md has which mode
 # wants which, TESTING-RIG.md which of them are safe next to a live desktop):
@@ -52,11 +53,17 @@
 #                       for the shell probe and nvgpu_hold=1 when stdin is a
 #                       terminal, off otherwise. NVGPU_TIMEOUT then defaults
 #                       to 3600.
+#   NVGPU_PREFIX        root only: where the root layout's tree is (see below);
+#                       as root, this or NVGPU_RIG must be given
 #   NVGPU_USER          root only: who the backend runs as (see below)
 #   NVGPU_SANDBOX       on (default) or off: the backend's process sandbox
-#                       (device/src/sandbox.rs; off is for diagnosis only)
+#                       (device/src/sandbox.rs; off is for diagnosis only, and
+#                       as root needs NVGPU_DIAGNOSTIC=1)
+#   NVGPU_DIAGNOSTIC=1  root only: allow what is for diagnosis alone --
+#                       NVGPU_SANDBOX=off, NVGPU_ALLOW_ROOT_UNSAFE=1 -- which
+#                       a root run otherwise refuses
 #   NVGPU_VM_SLOTS      root only: how many pool slots to look through (64)
-#   NVGPU_VMM_JAIL      root only: auto (default), on or off -- the VMM under
+#   NVGPU_VMM_JAIL      root only: on (default), auto or off -- the VMM under
 #                       nesbox's jailer, as its slot's uid (see below)
 #   NVGPU_JAILER        root only: the jailer binary (default: beside the VMM)
 #   NVGPU_JAIL_ROOT     root only: a jail image to use instead of the one built
@@ -102,11 +109,24 @@
 # Two ways to run it, picked by who runs it.
 #
 # As root, on the GPU box -- the original layout. It expects the tree laid
-# out as:
-#   /root/vhost-user-nvgpu          backend binary
-#   /root/nesbox/target/release/nesbox
-#   /root/kernel/vmlinux, /root/guest/rootfs.ext4
-# (NVGPU_RIG, or the single-path overrides, point it elsewhere.)
+# out under NVGPU_PREFIX (/root, as it always was) as:
+#   $NVGPU_PREFIX/vhost-user-nvgpu          backend binary
+#   $NVGPU_PREFIX/nesbox/target/release/nesbox
+#   $NVGPU_PREFIX/kernel/vmlinux, $NVGPU_PREFIX/guest/rootfs.ext4
+#   $NVGPU_PREFIX/logs
+# (NVGPU_RIG, or the single-path overrides, point it elsewhere.) The layout is
+# never assumed: as root, NVGPU_PREFIX or NVGPU_RIG must be set, so that a
+# sudo from someone's checkout does not quietly run what is under /root.
+#
+# As root, this launcher runs, reads and writes only root's files: itself,
+# the backend, the VMM, the jailer and virtiofsd, the kernel, the rootfs, the
+# share, the jail image and the logs directory must each be root's, and so
+# must every directory above them, none writable by group or others (a
+# sticky one aside). Anything else is refused: whoever could change one of
+# them could have root run, read or overwrite something of their choosing --
+# a rig of the user's own, a launcher in a user's checkout. Install a copy
+# (sudo install -D -o root -g root -m 0755 scripts/run-guest.sh
+# /root/bin/run-guest.sh) and a root-owned tree for it.
 #
 # As an ordinary user, with the rig layout (TESTING-RIG.md): the user needs
 # /dev/kvm and the NVIDIA nodes, and nothing here needs root. Paths come from
@@ -161,10 +181,10 @@
 # signal and socket scoping, ABI 6 and 9) and its being undumpable; the VMM
 # still takes a slot. NVGPU_USER overrides all of these, and makes every VM
 # started with it one user, which is said. NVGPU_USER=root runs it as root,
-# which it refuses unless NVGPU_ALLOW_ROOT_UNSAFE=1 as well: that passes
-# --allow-root-unsafe, and every guest process is then an RM administrator.
-# Only for ruling the credentials out while chasing something, never for a
-# guest you do not trust. A host with no pool but the older single user
+# which it refuses unless NVGPU_ALLOW_ROOT_UNSAFE=1 and NVGPU_DIAGNOSTIC=1 as
+# well: that passes --allow-root-unsafe, and every guest process is then an
+# RM administrator. Only for ruling the credentials out while chasing
+# something, never for a guest you do not trust. A host with no pool but the older single user
 # "nvgpu" runs every backend as that user, with a warning each time.
 #
 # The VMM, run as root: under nesbox's jailer (tools/jailer in nesbox; built
@@ -175,8 +195,16 @@
 # The jailer clears supplementary groups, so /dev/kvm must be 0666 (systemd's
 # default). The disk must be writable by that user: a per-run copy is made
 # for it (NVGPU_COPY_ROOTFS defaults to 1 here), and an image booted in place
-# must already be. NVGPU_VMM_JAIL=off runs the VMM as root, as before; auto
-# does the same, with a warning, where there is no jailer or no pool.
+# must already be. Without a jailer, a pool or a 0666 /dev/kvm the run is
+# refused; NVGPU_VMM_JAIL=off runs the VMM as root, as before, and auto does
+# the same, with a warning, where one of them is missing.
+#
+# The socket's directory is the backend user's while the backend binds its
+# socket, and root's from then on: the launcher checks the socket there, and
+# opens it to the slot's group, only once nobody but root can rename, replace
+# or link anything in it (the backend's user could otherwise swap the socket
+# for a symlink to a file of root's, and have root give that to the slot's
+# group).
 #
 # Both halves run as root in network namespaces of their own (unshare --net):
 # neither needs a network, the vhost-user socket is a path, and a namespace
@@ -273,6 +301,30 @@ re() {
     printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'
 }
 
+# root_owned PATH WHAT: print PATH with every symlink resolved, once it and
+# every directory above it are root's and writable by no one else (a sticky
+# directory aside: in one, only an entry's owner may rename or remove it).
+# Used as root, for everything root runs, reads or writes: then nobody but
+# root can change what the path names between this check and its use.
+root_owned() {
+    local p d st uid mode
+    p=$(realpath -e -- "$1" 2>/dev/null) || die "$2 $1 does not exist"
+    d=$p
+    while :; do
+        st=$(stat -c '%u %a' -- "$d") || die "$2: cannot stat $d"
+        uid=${st% *} mode=${st#* }
+        [ "$uid" = 0 ] ||
+            die "$2 $1: $d is not root's (uid $uid); as root, this launcher runs, reads and" \
+                "writes only root's files (the header of $0)"
+        if [ $((8#$mode & 8#022)) -ne 0 ] && { [ ! -d "$d" ] || [ $((8#$mode & 8#1000)) -eq 0 ]; }; then
+            die "$2 $1: $d is writable by others than root (mode $mode)"
+        fi
+        [ "$d" = / ] && break
+        d=$(dirname -- "$d")
+    done
+    printf '%s\n' "$p"
+}
+
 BACKEND_ARGS=()
 WL_SOCK=
 WL_EXPORT=
@@ -349,10 +401,19 @@ case $CROSVM_SANDBOX in on | off) ;; *) die "NVGPU_CROSVM_SANDBOX=$CROSVM_SANDBO
 SANDBOX=${NVGPU_SANDBOX:-on}
 case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
 SANDBOX_GIVEN=0
+PERMISSIVE_ABI=0
+RM_ALLOWLIST_LOG=0
+ALLOW_ROOT_ARG=0
 prev=
 for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
-    case $a in --sandbox=*) SANDBOX=${a#--sandbox=} SANDBOX_GIVEN=1 ;; esac
+    case $a in
+        --sandbox=*) SANDBOX=${a#--sandbox=} SANDBOX_GIVEN=1 ;;
+        --permissive-abi) PERMISSIVE_ABI=1 ;;
+        --rm-allowlist=log) RM_ALLOWLIST_LOG=1 ;;
+        --allow-root-unsafe) ALLOW_ROOT_ARG=1 ;;
+    esac
     [ "$prev" = --sandbox ] && SANDBOX=$a SANDBOX_GIVEN=1
+    [ "$prev" = --rm-allowlist ] && [ "$a" = log ] && RM_ALLOWLIST_LOG=1
     prev=$a
 done
 if [ "$SANDBOX" = off ]; then
@@ -360,6 +421,14 @@ if [ "$SANDBOX" = off ]; then
     echo "run-guest: WARNING: the backend's sandbox is off (NVGPU_SANDBOX=off): for" \
         "diagnosis only" >&2
 fi
+# Passed through as asked, but never quietly: each forwards what the backend
+# would otherwise refuse.
+[ "$PERMISSIVE_ABI" = 0 ] ||
+    echo "run-guest: WARNING: --permissive-abi: ioctls with no ABI profile are forwarded" \
+        "unchecked; for finding what a new driver needs, never for a guest you do not trust" >&2
+[ "$RM_ALLOWLIST_LOG" = 0 ] ||
+    echo "run-guest: WARNING: --rm-allowlist=log: RM controls and classes off the allowlist" \
+        "reach the host's RM, logged instead of refused; for diagnosis only" >&2
 
 PROBE=${POSITIONAL[0]}
 TAG=${POSITIONAL[1]:-$(date +%H%M%S)}
@@ -390,11 +459,15 @@ if [ -n "${NVGPU_RIG:-}" ] || [ $PRIV = user ]; then
 else
     LAYOUT=root
     RIG=
-    BACKEND_BIN=${NVGPU_BACKEND:-/root/vhost-user-nvgpu}
-    VMM=${NVGPU_VMM:-/root/nesbox/target/release/nesbox}
-    KERNEL=${NVGPU_KERNEL:-/root/kernel/vmlinux}
-    ROOTFS=${NVGPU_ROOTFS:-/root/guest/rootfs.ext4}
-    LOGS=${NVGPU_LOGS:-/root/logs}
+    [ -n "${NVGPU_PREFIX:-}" ] ||
+        die "as root, name the tree: NVGPU_PREFIX (the root layout, e.g. /root) or" \
+            "NVGPU_RIG (a rig of root's); see the header of $0"
+    PREFIX=${NVGPU_PREFIX%/}
+    BACKEND_BIN=${NVGPU_BACKEND:-$PREFIX/vhost-user-nvgpu}
+    VMM=${NVGPU_VMM:-$PREFIX/nesbox/target/release/nesbox}
+    KERNEL=${NVGPU_KERNEL:-$PREFIX/kernel/vmlinux}
+    ROOTFS=${NVGPU_ROOTFS:-$PREFIX/guest/rootfs.ext4}
+    LOGS=${NVGPU_LOGS:-$PREFIX/logs}
     VCPUS=${NVGPU_VCPUS:-2}
     MEM_MIB=${NVGPU_MEM_MIB:-2048}
     # Booted in place, unless the VMM is jailed (below): its user must be
@@ -403,6 +476,25 @@ else
     # Unset means the share this layout always had; set but empty means none.
     NVIDIA_SHARE=${NVGPU_NVIDIA_SHARE-/var/lib/nvgpu}
 fi
+
+# ── What is for diagnosis alone, as root ─────────────────────────────────────
+#
+# A root run is the one other people's guests get, so the switches that take
+# a layer of confinement away are refused there unless asked for as what they
+# are. (An option meaning the same sets NVGPU_DIAGNOSTIC=1 before this.)
+DIAGNOSTIC=${NVGPU_DIAGNOSTIC:-0}
+case $DIAGNOSTIC in 0 | 1) ;; *) die "NVGPU_DIAGNOSTIC=$DIAGNOSTIC: 0 or 1" ;; esac
+if [ $PRIV = root ] && [ "$DIAGNOSTIC" != 1 ]; then
+    [ "$SANDBOX" = on ] ||
+        die "the backend's sandbox off (NVGPU_SANDBOX=off, --sandbox=off) as root is for" \
+            "diagnosis only: NVGPU_DIAGNOSTIC=1 as well"
+    [ "${NVGPU_ALLOW_ROOT_UNSAFE:-}" != 1 ] && [ "$ALLOW_ROOT_ARG" = 0 ] ||
+        die "a root backend (NVGPU_ALLOW_ROOT_UNSAFE=1, --allow-root-unsafe) is for" \
+            "diagnosis only: NVGPU_DIAGNOSTIC=1 as well"
+fi
+[ "$DIAGNOSTIC" = 0 ] ||
+    echo "run-guest: WARNING: NVGPU_DIAGNOSTIC=1: a diagnostic run, not one to keep" >&2
+
 if [ "$VMM_KIND" = crosvm ]; then
     [ $PRIV = user ] ||
         die "--vmm crosvm runs unprivileged only for now; the header says what root would need"
@@ -458,6 +550,35 @@ if [ -n "$NVIDIA_SHARE" ]; then
     if [ -z "${NESBOX_VIRTIOFSD:-}" ] && [ -n "$RIG" ] && [ -x "$RIG/bin/virtiofsd" ]; then
         export NESBOX_VIRTIOFSD=$RIG/bin/virtiofsd
     fi
+fi
+
+# ── As root, only root's files ───────────────────────────────────────────────
+#
+# The header says why. Each path is replaced by its resolved form, which from
+# here on only root can change.
+if [ $PRIV = root ]; then
+    root_owned "$0" "the launcher" >/dev/null
+    BACKEND_BIN=$(root_owned "$BACKEND_BIN" "the backend")
+    VMM=$(root_owned "$VMM" "the VMM")
+    KERNEL=$(root_owned "$KERNEL" "the guest kernel")
+    ROOTFS=$(root_owned "$ROOTFS" "the rootfs")
+    if [ -n "$NVIDIA_SHARE" ]; then
+        NVIDIA_SHARE=$(root_owned "$NVIDIA_SHARE" "the share (NVGPU_NVIDIA_SHARE)")
+        # What nesbox would start for it: its NESBOX_VIRTIOFSD, or the one on
+        # PATH, named explicitly from here on.
+        VFS=${NESBOX_VIRTIOFSD:-$(command -v virtiofsd || true)}
+        if [ -n "$VFS" ]; then
+            NESBOX_VIRTIOFSD=$(root_owned "$VFS" "virtiofsd (NESBOX_VIRTIOFSD)")
+            export NESBOX_VIRTIOFSD
+        fi
+    fi
+    # The logs directory is made if missing, so its nearest existing
+    # ancestor is checked first.
+    d=$LOGS
+    while [ ! -e "$d" ]; do d=$(dirname -- "$d"); done
+    root_owned "$d" "the logs directory's parent" >/dev/null
+    mkdir -p -- "$LOGS"
+    LOGS=$(root_owned "$LOGS" "the logs directory")
 fi
 
 # ── crosvm: the host GPU's PCI address has to be free in the guest ──────────
@@ -641,7 +762,7 @@ if [ $PRIV = root ]; then
     if [ "$BACKEND_UID" = 0 ]; then
         [ "${NVGPU_ALLOW_ROOT_UNSAFE:-}" = 1 ] || {
             echo "refusing to run the backend as root: every guest process would be an" \
-                "RM administrator. NVGPU_ALLOW_ROOT_UNSAFE=1 if you mean it." >&2
+                "RM administrator. NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 if you mean it." >&2
             exit 1
         }
         echo "WARNING: backend runs as root (NVGPU_ALLOW_ROOT_UNSAFE=1)" >&2
@@ -682,8 +803,8 @@ VMM_JAIL=off
 VMM_NETNS=()
 VMM_OWN_NETNS=false
 if [ $PRIV = root ]; then
-    VMM_JAIL=${NVGPU_VMM_JAIL:-auto}
-    case $VMM_JAIL in auto | on | off) ;; *) die "NVGPU_VMM_JAIL=$VMM_JAIL: auto, on or off" ;; esac
+    VMM_JAIL=${NVGPU_VMM_JAIL:-on}
+    case $VMM_JAIL in auto | on | off) ;; *) die "NVGPU_VMM_JAIL=$VMM_JAIL: on, auto or off" ;; esac
     JAILER=${NVGPU_JAILER:-$(dirname -- "$VMM")/jailer}
     why=
     if [ "$VMM_JAIL" != off ]; then
@@ -698,11 +819,15 @@ if [ $PRIV = root ]; then
     if [ "$VMM_JAIL" = off ]; then
         echo "run-guest: WARNING: the VMM runs as root (NVGPU_VMM_JAIL=off)" >&2
     elif [ -n "$why" ]; then
-        [ "$VMM_JAIL" = on ] && die "NVGPU_VMM_JAIL=on: $why"
+        [ "$VMM_JAIL" = on ] &&
+            die "the VMM would run as root, unjailed: $why (NVGPU_VMM_JAIL=auto or off to" \
+                "allow that)"
         echo "run-guest: WARNING: the VMM runs as root, unjailed: $why" >&2
         VMM_JAIL=off
     else
         VMM_JAIL=on
+        # Run by root, so root's alone.
+        JAILER=$(root_owned "$JAILER" "the jailer (NVGPU_JAILER)")
     fi
     VMM_NETNS=(unshare --net --)
 elif [ "${NVGPU_VMM_NETNS:-1}" = 1 ]; then
@@ -738,21 +863,27 @@ fi
 
 # ── A stale backend or VMM holds the GPU and confuses the logs ───────────────
 #
-# Only ours: processes of the backend's user started from exactly this
-# launcher's backend binary and socket directory, and VMMs of the invoking
-# user started from this VMM binary with a config in this logs directory.
-# The patterns are anchored at the start of the command line, so an editor
-# or a grep with the path in its arguments is not one of them.
-if [ $PRIV = root ]; then
-    pkill -u "$NVGPU_USER" -f '^/run/nvgpu\.[^/ ]+/vhost-user-nvgpu --socket /run/nvgpu\.' || true
-else
-    RUN_PARENT=${XDG_RUNTIME_DIR:-$RIG/run}
+# Unprivileged, the rig is one VM at a time (the header), and a stale one of
+# its own is killed: processes of this user started from exactly this
+# launcher's backend binary and socket directory, and VMMs started from this
+# VMM binary with a config in this logs directory. The patterns are anchored
+# at the start of the command line, so an editor or a grep with the path in
+# its arguments is not one of them.
+#
+# As root, nothing is killed by pattern. Other VMs run beside this one: their
+# backends may be the same user as this one's (the compositor's owner with
+# --wayland-socket, the export directory's with --wayland-export, NVGPU_USER),
+# and their VMMs root (NVGPU_VMM_JAIL=off), so any pattern for "a backend" or
+# "a VMM" reaches them too. And there is nothing of this run's own to find: a
+# slot is taken only when its users run nothing (above).
+RUN_PARENT=${XDG_RUNTIME_DIR:-$RIG/run}
+if [ $PRIV = user ]; then
     pkill -u "$(id -u)" -f "^$(re "$BACKEND_BIN") --socket $(re "$RUN_PARENT")/nvgpu-run\." || true
-fi
-if [ "$VMM_KIND" = crosvm ]; then
-    pkill -u "$(id -u)" -f "^$(re "$VMM") run .*--vhost-user type=nvgpu,socket=$(re "$RUN_PARENT")/nvgpu-run\." || true
-else
-    pkill -u "$(id -u)" -f "^$(re "$VMM") $(re "$LOGS")/[^/ ]+\.json" || true
+    if [ "$VMM_KIND" = crosvm ]; then
+        pkill -u "$(id -u)" -f "^$(re "$VMM") run .*--vhost-user type=nvgpu,socket=$(re "$RUN_PARENT")/nvgpu-run\." || true
+    else
+        pkill -u "$(id -u)" -f "^$(re "$VMM") $(re "$LOGS")/[^/ ]+\.json" || true
+    fi
 fi
 
 # ── Cleanup, however the run ends ────────────────────────────────────────────
@@ -955,7 +1086,7 @@ jail_add() {
 JAIL_ROOT=
 if [ "$VMM_JAIL" = on ]; then
     if [ -n "${NVGPU_JAIL_ROOT:-}" ]; then
-        JAIL_ROOT=$NVGPU_JAIL_ROOT
+        JAIL_ROOT=$(root_owned "$NVGPU_JAIL_ROOT" "the jail image (NVGPU_JAIL_ROOT)")
         [ -x "$JAIL_ROOT/usr/bin/nesbox" ] || die "NVGPU_JAIL_ROOT=$JAIL_ROOT has no usr/bin/nesbox"
     else
         JAIL_ROOT=$(mktemp -d /run/nvgpu-jail.XXXXXX)
@@ -1005,17 +1136,28 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 kill -0 "$BACKEND" 2>/dev/null || { echo "backend exited; see $BLOG" >&2; tail -n 5 "$BLOG" >&2; exit 1; }
+# As root: the directory is root's from here on (0711: the backend's user may
+# still reach its binary in it, but no longer rename, replace or link
+# anything there), so what is checked below is what the VMM connects to and
+# what root changes. $RUN itself lies in /run, which only root can change.
+if [ $PRIV = root ]; then
+    chown root:root -- "$RUN"
+    chmod 0711 -- "$RUN"
+fi
+# The socket must be the backend's, a socket, and not a link to one: anything
+# else at that path is not ours to connect to (or, as root, to open to a group).
+[ ! -L "$SOCK" ] || { echo "$SOCK is a symbolic link, not the backend's socket; refusing it" >&2; exit 1; }
 [ -S "$SOCK" ] || { echo "backend never created $SOCK; see $BLOG" >&2; exit 1; }
-[ "$(stat -c %u "$SOCK")" = "$BACKEND_UID" ] || {
+[ "$(stat -c %u -- "$SOCK")" = "$BACKEND_UID" ] || {
     echo "$SOCK is not owned by $NVGPU_USER; refusing to connect" >&2
     exit 1
 }
 # The jailed VMM is another user, in the slot's group: the socket is opened
 # to that group, which holds no one else. (The jailer binds the socket file
-# alone into the jail, so its directory stays the backend's.)
+# alone into the jail.) -h and the checks above: never through a link.
 if [ "$VMM_JAIL" = on ]; then
-    chgrp "$SLOT_GROUP" "$SOCK"
-    chmod 0660 "$SOCK"
+    chgrp -h -- "$SLOT_GROUP" "$SOCK"
+    chmod 0660 -- "$SOCK"
 fi
 
 # ── The guest ────────────────────────────────────────────────────────────────
