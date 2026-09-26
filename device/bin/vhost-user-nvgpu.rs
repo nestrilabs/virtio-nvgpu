@@ -1716,6 +1716,8 @@ mod tests {
                 .lines()
                 .any(|l| l.trim_start().starts_with("--permissive-abi"))
         );
+    }
+
     /// What a thread hands the pump is handed over before the backend is let
     /// go, so the next thread to take the backend cannot get its own
     /// instructions to the pump first (review 2026-09-26, backend 11).

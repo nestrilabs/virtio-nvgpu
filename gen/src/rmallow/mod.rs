@@ -134,7 +134,7 @@ mod tests {
     /// forwards any size to GSP-RM; the older GSS entries have none.
     #[test]
     fn measured_gss_legacy_controls_carry_their_size() {
-        let (r, exact) = release_for(DriverVersion::new(595, 99, 2));
+        let (r, exact) = release_for(DriverVersion::new(595, 99, 2)).expect("595.99.02 is measured");
         assert!(exact);
         for (cmd, size) in [
             (0x2080_8163, 4),
