@@ -237,6 +237,9 @@ struct KmsCall {
     op: KmsOp,
     generation: u64,
     req_id: u32,
+    /// The guest process that asked: what OPEN_KMS opens is charged to it
+    /// (quota.rs), whoever the backend served in the meantime.
+    owner: crate::quota::Owner,
 }
 
 enum KmsOp {
@@ -403,9 +406,15 @@ struct BackendFinisher<'a> {
     /// The guest process they are charged to: the owner of the file the
     /// call ran on (quota.rs).
     owner: crate::quota::Owner,
+    /// The file the call ran on is still the guest's, unburied.
+    target_live: bool,
 }
 
 impl xfer::Finisher for BackendFinisher<'_> {
+    fn records(&self) -> bool {
+        !self.stale && self.target_live
+    }
+
     /// Every descriptor the backend holds: the guest's, in the handle table,
     /// and its own -- the vhost-user socket, guest memory, the pump, the
     /// vrings' eventfds, the window memfd, the cached signalled sync_file --
@@ -693,6 +702,7 @@ impl NvidiaBackend {
                 op,
                 generation: self.session.generation,
                 req_id: self.current_req_id,
+                owner: self.current_owner,
             }))));
         }
         let (res, created) = self.run_host_op(op).inspect_err(|e| {
@@ -731,6 +741,21 @@ impl NvidiaBackend {
         let io = |e: std::io::Error| errno_of(&e);
         match op {
             HostOp::PrimeExport { file, gem } => {
+                // A fence context is counted against its file's and the
+                // session's caps until its GEM handle closes (semsurf.rs),
+                // and each holds a host kthread, a timer and an NVKMS
+                // duplicate. A dma-buf of it would keep all that alive past
+                // the close, uncounted, as often as the guest liked.
+                // Nothing needs one: the object has no pages to share
+                // (nv_fence_context_gem_ops has no sg table), and the guest
+                // driver refuses to export one itself
+                // (nvgpu_fence_ctx_export).
+                if self.semsurf.is_ctx(file, gem) {
+                    log::warn!(
+                        "PRIME export of GEM {gem} of handle {file}, a fence context; refused"
+                    );
+                    return Err(libc::EINVAL);
+                }
                 let dmabuf = hostfd::prime_export(self.raw(file)?, gem).map_err(io)?;
                 let size = hostfd::dmabuf_size(dmabuf.as_raw_fd()).unwrap_or(0);
                 let h = self.insert(dmabuf, HandleKind::Dmabuf)?;
@@ -961,12 +986,14 @@ impl NvidiaBackend {
         // handle granted is gone on the host (kms.rs, "lease ends").
         let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);
         let nodes = self.host_nodes();
+        let target_live = self.handles.kind(target).is_some() && !self.handles.is_buried(target);
         let mut fin = BackendFinisher {
             backend: self,
             cards: &nodes.cards,
             stale,
             created: Vec::new(),
             owner,
+            target_live,
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
@@ -1019,7 +1046,14 @@ impl NvidiaBackend {
                     crate::closer::close(fd);
                     (0, Vec::new())
                 }
-                Some(Ok(fd)) => match self.insert(fd, HandleKind::DrmCard(card)) {
+                // Charged to the process that asked, not to whichever one
+                // the queue thread served last (review 2026-09-26, backend
+                // 10).
+                Some(Ok(fd)) => match self
+                    .handles
+                    .insert_for(fd, HandleKind::DrmCard(card), k.owner)
+                    .map_err(|e| e.errno())
+                {
                     Ok(h) => {
                         log::debug!("OPEN_KMS: {path} -> handle {h}");
                         (h as u64, vec![h])
@@ -1499,6 +1533,29 @@ mod tests {
         assert!(be.handles.kind(ev).is_none());
     }
 
+    /// A dma-buf of a fence context would keep it alive -- a host kthread,
+    /// a timer, an NVKMS duplicate -- after its GEM_CLOSE gave its slot back
+    /// to the caps (semsurf.rs): the export is refused before the host is
+    /// asked, and any other object of the file still goes.
+    #[test]
+    fn a_fence_context_is_never_exported() {
+        let mut be = backend();
+        hello(&mut be, HELLO_F_FRESH);
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        be.semsurf.render_opened(render, 0);
+        be.semsurf.ctx_made_for_test(render, 7);
+        assert_eq!(
+            host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 7]).0,
+            -libc::EINVAL
+        );
+        assert_eq!(be.semsurf.ctx_counts(render), (1, 1));
+        // Another GEM of the file reaches the host (/dev/null: no ioctls).
+        assert_eq!(
+            host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 8]).0,
+            -libc::ENOTTY
+        );
+    }
+
     #[test]
     fn ioctl2_refuses_targets_without_a_schema_class_and_non_render_render_fields() {
         let mut be = backend();
@@ -1610,7 +1667,67 @@ mod tests {
             },
             generation: be.generation(),
             req_id: 7,
+            owner: crate::quota::Owner::Unknown,
         }))
+    }
+
+    /// OPEN_KMS finishes on the queue thread after the executor opened the
+    /// card, and other processes' messages are served meanwhile: the card
+    /// file is the asking process's, against its share of the handle table.
+    #[test]
+    fn an_open_kms_is_charged_to_the_process_that_asked() {
+        let mut be = backend();
+        be.set_config(BackendConfig {
+            kms_card: true,
+            ..BackendConfig::default()
+        });
+        let req = HelloReq {
+            proto: PROTO_V2,
+            flags: HELLO_F_FRESH,
+            guest_caps: GCAP_PROC_ID,
+            uvm_aperture_mib: 0,
+        };
+        call(&mut be, MsgType::Hello, 0, bytes_of(&req));
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let proc = |tgid| crate::quota::Owner::Proc { tgid, start_ns: 1 };
+        let from = |op: u32, args: &[u64], tgid: u32| {
+            let mut r = HostOpReq {
+                op,
+                nargs: args.len() as u32,
+                args: [0; OP_MAX_ARGS],
+            };
+            r.args[..args.len()].copy_from_slice(args);
+            let mut body = bytes_of(&r).to_vec();
+            body.extend_from_slice(bytes_of(&ProcId {
+                start_ns: 1,
+                tgid,
+                euid: 0,
+            }));
+            msg(MsgType::HostOp, 0, &body)
+        };
+        let Outcome::Ioctl2(mut p) = be.serve(&from(OP_OPEN_KMS, &[render as u64, 0], 10), 4096)
+        else {
+            panic!("OPEN_KMS answered on the queue thread")
+        };
+        // The executor opened the card (a pipe here).
+        let (r, _w) = pipe_ends();
+        let Pending::Kms(k) = &mut p.0 else {
+            panic!("an OPEN_KMS job")
+        };
+        let KmsOp::Open { opened, .. } = &mut k.op else {
+            panic!("an OPEN_KMS job")
+        };
+        *opened = Some(Ok(r));
+        // Another process is served meanwhile.
+        let Outcome::Reply(_) = be.serve(&from(OP_NEW_EVENTFD, &[], 11), 4096) else {
+            panic!("NEW_EVENTFD is answered inline")
+        };
+        let reply = be.finish_ioctl2(p);
+        assert_eq!(status(&reply.bytes), 0);
+        let h = read::<HostOpResp>(&reply.bytes[HDR..]).unwrap().res[0] as u32;
+        assert_eq!(be.handles.kind(h), Some(HandleKind::DrmCard(0)));
+        assert_eq!(be.handles.owner(h), proc(10));
+        assert_eq!(be.handles.held_by(proc(11)), 1, "only its eventfd");
     }
 
     /// What OPEN_KMS opened is adopted only when the job finishes, and only

@@ -666,10 +666,15 @@ impl NvidiaBackend {
         };
         // Its framebuffers stop being the VM's before the host file (and
         // with it every id that file made) can go (S-6).
-        self.forget_kms_state(h);
+        let fbs = self.forget_kms_state(h);
+        let owner = self.handles.owner(h);
         match self.handles.bury(h, stub) {
-            // A lease file's last close is a master drop (closer.rs).
-            Ok(old) => crate::closer::close(old),
+            // A lease file's last close is a master drop (closer.rs), after
+            // any call in flight that names its framebuffers; counted
+            // against the table until then.
+            Ok(old) => self
+                .vm_kms
+                .close_after(fbs, Box::new(self.handles.closing(old, owner))),
             Err(e) => {
                 log::warn!("lease handle {h}: {e}");
                 return;

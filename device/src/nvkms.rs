@@ -159,6 +159,8 @@ const GATED: &[&str] = &[
 /// In between, the last reply is the answer (see `State::dpy_probe`).
 const PROBE_EVERY_GRANTED: Duration = Duration::from_secs(1);
 const PROBE_EVERY_OTHER: Duration = Duration::from_secs(30);
+/// How many dpys' last probe the VM keeps: far more than a host has.
+const DPY_PROBES_KEPT: usize = 256;
 
 /// Only a guest that owns the display (`--kms-card`): device-wide state
 /// with no permission check in NVKMS.
@@ -616,8 +618,15 @@ impl NvkmsPolicy {
         }
         let fds: Vec<u32> = p.fd_in_handles().map(|(_, _, h)| h).collect();
         let mut st = self.lock();
+        // A call that finished after its file closed, or after a session
+        // reset, records nothing: its grants were revoked with the file
+        // (forget_handle), and a REVOKE's forgetting belongs to a session
+        // that is gone. Its reply is still rewritten below.
+        let records = p.records();
         if p.policy() & (policy::GRANT | policy::REVOKE) != 0 {
-            st.drm_record(p.name(), p.target(), p.buffer(0).unwrap_or(&[]), &fds);
+            if records {
+                st.drm_record(p.name(), p.target(), p.buffer(0).unwrap_or(&[]), &fds);
+            }
             return;
         }
         let name = p.name().strip_prefix("NVKMS_").unwrap_or(p.name());
@@ -630,7 +639,7 @@ impl NvkmsPolicy {
             }
         }
         let target = p.target();
-        if let Some(params) = p.buffer(1) {
+        if let Some(params) = p.buffer(1).filter(|_| records) {
             st.record(lo, name, target, params, &fds);
         }
     }
@@ -1000,6 +1009,16 @@ impl State {
         } else {
             PROBE_EVERY_OTHER
         };
+        // The dpyId is the guest's: a record of every one it names, with
+        // no reply because the host refused them, grew without bound. Past
+        // DPY_PROBES_KEPT the ones never answered go (review 2026-09-26,
+        // backend 6); a dpy the host has answered for keeps its limit.
+        if self.dpy_probes.len() >= DPY_PROBES_KEPT && !self.dpy_probes.contains_key(&key) {
+            self.dpy_probes.retain(|_, p| p.reply.is_some());
+            if self.dpy_probes.len() >= DPY_PROBES_KEPT {
+                return false;
+            }
+        }
         let probe = match self.dpy_probes.entry(key) {
             // The first: this one goes to the host.
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -1779,6 +1798,29 @@ mod tests {
         let mut q = dyn_query(v, DPY);
         assert!(p.probe(M + 1, &mut q, t0 + Duration::from_millis(1)));
         assert_eq!(reply_byte(v, &q), 7);
+    }
+
+    /// The dpyId is the guest's, and a record was kept of every one it
+    /// named: bounded now, the ones the host never answered going first.
+    #[test]
+    fn probes_of_dpys_the_host_never_answers_are_not_kept_without_bound() {
+        let v = v610();
+        let p = granted(v);
+        let t0 = Instant::now();
+        let mut q = dyn_query(v, DPY);
+        assert!(!p.probe(M, &mut q, t0));
+        p.answer(v, M, &mut q, 0x5a);
+        for i in 0..4 * DPY_PROBES_KEPT as u32 {
+            // Made-up dpyIds, which the host refuses.
+            let mut q = dyn_query(v, 0x1_0000 + i);
+            p.probe(M, &mut q, t0);
+        }
+        assert!(p.lock().dpy_probes.len() <= DPY_PROBES_KEPT);
+        let mut again = dyn_query(v, DPY);
+        assert!(
+            p.probe(M, &mut again, t0 + PROBE_EVERY_GRANTED / 2),
+            "the answered dpy keeps its limit"
+        );
     }
 
     #[test]

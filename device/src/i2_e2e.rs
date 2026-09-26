@@ -1833,6 +1833,47 @@ fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() 
     assert_eq!(r, Ok(0));
 }
 
+/// A GRANT_PERMISSIONS still running when its lease file closed -- or when
+/// the session was reset -- records nothing once it finishes: the close
+/// revoked what was granted through the file (nvidia-drm's postclose, and
+/// the backend's forget_handle), and a record made after would have the
+/// backend asking about a lease that is gone for as long as it runs, or
+/// carry an old session's grant into the new one (review 2026-09-26,
+/// backend 9).
+#[test]
+fn a_grant_that_finishes_after_its_file_closed_records_nothing() {
+    for reset in [false, true] {
+        let mut w = nvkms_world();
+        let grant = w.be.adopt_for_test(
+            memfd(c"e2e-modeset-grant"),
+            HandleKind::Dev(DeviceKind::Modeset),
+        );
+        let (kms, modeset) = (w.kms, w.modeset);
+        nvkms_call(&mut w, 0, &[0u8; 1440]);
+        assert_eq!(w.nvkms(modeset, 0x1000), Ok(0), "ALLOC_DEVICE");
+        let mut g = vec![0u8; 12];
+        wr(&mut g, 0, 4, 5);
+        wr(&mut g, 4, 4, 1 << 3);
+        wr(&mut g, 8, 4, 2);
+        w.mem.put(0x5000, &g);
+        w.hooks.fds.insert(5, (grant, 0));
+        let render = w.render;
+        let call = Guest::gather(&mut w.mem, schema::Class::Kms, kms, render, GRANT, 0x5000)
+            .unwrap();
+        let _ = w.send_with(call, 0, |be| {
+            if reset {
+                be.session_reset("test");
+            } else {
+                be.close_handle(kms).unwrap();
+            }
+        });
+        assert!(
+            !w.be.nvkms.granting_handles().contains(&kms),
+            "reset {reset}: nothing is recorded for the file"
+        );
+    }
+}
+
 /// The host takes a lease back without a word to the lessee's file -- the
 /// lessor revokes it, or closes -- and the file stays open, and after the
 /// lessor's close nvidia-drm still holds the grant on it. The backend asks

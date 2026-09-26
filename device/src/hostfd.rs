@@ -248,12 +248,18 @@ fn making_fd(fd: RawFd, cmd: u32, bytes: &[u8], fd_out: usize) -> io::Result<Own
 /// ioctl numbers mean different things to i915 -- running nvidia-drm's
 /// GEM_IDENTIFY_OBJECT on one would be running something else entirely.
 ///
-/// Everything else is named by `/proc/self/fd`, which is the kernel's own
-/// statement: `anon_inode:<name>` for anonymous inodes (fs/anon_inodes.c:74-
-/// 78 prints the name given to `anon_inode_getfile`), `/dmabuf:<name>` for
-/// dma-bufs (drivers/dma-buf/dma-buf.c:150-164, `dmabuffs_dname`) and
-/// `/memfd:<name> (deleted)` for memfds. A descriptor that is none of these is
-/// `Other`: the guest may hold it and close it, never use it.
+/// Everything else is named by the filesystem it is on (`fstatfs`'s
+/// `f_type`, which only the kernel sets) and, within that, by
+/// `/proc/self/fd`: `anon_inode:<name>` for anonymous inodes
+/// (fs/anon_inodes.c:74-78 prints the name given to `anon_inode_getfile`),
+/// `/dmabuf:<name>` on the dma-buf filesystem (drivers/dma-buf/dma-buf.c:
+/// 150-164, `dmabuffs_dname`) and `/memfd:<name> (deleted)` on shmem or
+/// hugetlbfs for memfds. The link text alone is a path: a process of the
+/// backend's uid with a mount namespace of its own -- an export-mode peer --
+/// could hand over a FUSE file at `/dmabuf:x`, and the backend's first read
+/// of it would wait on that process (review 2026-09-26, backend 13). A
+/// descriptor that is none of these is `Other`: the guest may hold it and
+/// close it, never use it.
 pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
     let raw = fd.as_raw_fd();
     let Ok(st) = crate::sys::fd::fstat(raw) else {
@@ -275,23 +281,36 @@ pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
         // from outside, a tty -- is nothing the guest may reach through us.
         return HandleKind::Other;
     }
+    let Ok(fs) = crate::sys::fd::fstatfs_type(raw) else {
+        return HandleKind::Other;
+    };
     let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{raw}")) else {
         return HandleKind::Other;
     };
-    kind_from_link(&target.to_string_lossy())
+    kind_from_link(fs, &target.to_string_lossy())
 }
 
-/// The anonymous-inode half of [`classify`], by the `/proc/self/fd` link text.
-fn kind_from_link(link: &str) -> HandleKind {
-    match link {
-        "anon_inode:sync_file" => HandleKind::SyncFile,
+/// Filesystem magic numbers (include/uapi/linux/magic.h).
+const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
+const DMA_BUF_MAGIC: i64 = 0x444d_4142;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
+
+/// The rest of [`classify`]: the filesystem `fs` a file is on, and within
+/// it the `/proc/self/fd` link text.
+fn kind_from_link(fs: i64, link: &str) -> HandleKind {
+    match (fs, link) {
+        (ANON_INODE_FS_MAGIC, "anon_inode:sync_file") => HandleKind::SyncFile,
         // drm_syncobj.c:673 names the file "syncobj_file"; the bare name is
         // accepted in case a kernel ever shortens it.
-        "anon_inode:syncobj_file" | "anon_inode:syncobj" => HandleKind::Syncobj,
-        "anon_inode:dmabuf" => HandleKind::Dmabuf,
-        "anon_inode:[eventfd]" => HandleKind::Eventfd,
-        l if l.starts_with("/dmabuf:") => HandleKind::Dmabuf,
-        l if l.starts_with("/memfd:") => HandleKind::Memfd,
+        (ANON_INODE_FS_MAGIC, "anon_inode:syncobj_file" | "anon_inode:syncobj") => {
+            HandleKind::Syncobj
+        }
+        // A kernel before the dma-buf filesystem.
+        (ANON_INODE_FS_MAGIC, "anon_inode:dmabuf") => HandleKind::Dmabuf,
+        (ANON_INODE_FS_MAGIC, "anon_inode:[eventfd]") => HandleKind::Eventfd,
+        (DMA_BUF_MAGIC, l) if l.starts_with("/dmabuf:") => HandleKind::Dmabuf,
+        (TMPFS_MAGIC | HUGETLBFS_MAGIC, l) if l.starts_with("/memfd:") => HandleKind::Memfd,
         _ => HandleKind::Other,
     }
 }
@@ -917,17 +936,86 @@ mod tests {
 
     #[test]
     fn anonymous_inode_links_name_their_kinds() {
-        assert_eq!(kind_from_link("anon_inode:sync_file"), HandleKind::SyncFile);
+        const ANON: i64 = ANON_INODE_FS_MAGIC;
+        assert_eq!(kind_from_link(ANON, "anon_inode:sync_file"), HandleKind::SyncFile);
         assert_eq!(
-            kind_from_link("anon_inode:syncobj_file"),
+            kind_from_link(ANON, "anon_inode:syncobj_file"),
             HandleKind::Syncobj
         );
-        assert_eq!(kind_from_link("/dmabuf:"), HandleKind::Dmabuf);
-        assert_eq!(kind_from_link("/dmabuf:scanout"), HandleKind::Dmabuf);
-        assert_eq!(kind_from_link("anon_inode:dmabuf"), HandleKind::Dmabuf);
-        assert_eq!(kind_from_link("/memfd:wl_shm (deleted)"), HandleKind::Memfd);
-        assert_eq!(kind_from_link("anon_inode:[eventpoll]"), HandleKind::Other);
-        assert_eq!(kind_from_link("socket:[1234]"), HandleKind::Other);
+        assert_eq!(kind_from_link(DMA_BUF_MAGIC, "/dmabuf:"), HandleKind::Dmabuf);
+        assert_eq!(kind_from_link(DMA_BUF_MAGIC, "/dmabuf:scanout"), HandleKind::Dmabuf);
+        assert_eq!(kind_from_link(ANON, "anon_inode:dmabuf"), HandleKind::Dmabuf);
+        assert_eq!(
+            kind_from_link(TMPFS_MAGIC, "/memfd:wl_shm (deleted)"),
+            HandleKind::Memfd
+        );
+        assert_eq!(kind_from_link(HUGETLBFS_MAGIC, "/memfd:big (deleted)"), HandleKind::Memfd);
+        assert_eq!(kind_from_link(ANON, "anon_inode:[eventpoll]"), HandleKind::Other);
+        assert_eq!(kind_from_link(0x534f_434b, "socket:[1234]"), HandleKind::Other);
+        // The link text is a path: on the wrong filesystem it names nothing.
+        const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+        assert_eq!(kind_from_link(FUSE_SUPER_MAGIC, "/dmabuf:x"), HandleKind::Other);
+        assert_eq!(kind_from_link(FUSE_SUPER_MAGIC, "/memfd:x (deleted)"), HandleKind::Other);
+        assert_eq!(kind_from_link(TMPFS_MAGIC, "anon_inode:sync_file"), HandleKind::Other);
+    }
+
+    /// The kinds of real descriptors, as the kernel makes them.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri models no fstatfs")]
+    fn real_descriptors_are_what_the_kernel_says() {
+        let m = crate::sys::fd::memfd(c"classify", libc::MFD_CLOEXEC).unwrap();
+        assert_eq!(classify(m.as_fd(), &[]), HandleKind::Memfd);
+        let e = new_eventfd().unwrap();
+        assert_eq!(classify(e.as_fd(), &[]), HandleKind::Eventfd);
+    }
+
+    /// A process of the backend's uid with a mount namespace of its own --
+    /// an export-mode peer -- names its files as it likes: here a plain
+    /// tmpfs file whose `/proc/self/fd` link reads `/dmabuf:x/f`. It was
+    /// classified a dma-buf; a FUSE file there would have had the backend's
+    /// first read of it wait on its maker (review 2026-09-26, backend 13).
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri runs no processes")]
+    fn a_file_named_like_a_dmabuf_is_not_one() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("nvgpu-classify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display();
+        // A tmpfs of its own, `dmabuf:x/f` in it, held open as fd 3, made
+        // the root; then its pid, and a wait until told to go.
+        let script = format!(
+            "mount -t tmpfs none {d} && mkdir {d}/dmabuf:x {d}/old && echo hi > {d}/dmabuf:x/f \
+             && exec 3<{d}/dmabuf:x/f && cd {d} && pivot_root . old && echo $$ && read x"
+        );
+        let child = Command::new("unshare")
+            .args(["-Urm", "sh", "-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            eprintln!("SKIPPED a_file_named_like_a_dmabuf_is_not_one: no unshare");
+            return;
+        };
+        let mut line = String::new();
+        let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            eprintln!(
+                "SKIPPED a_file_named_like_a_dmabuf_is_not_one: no user or mount namespace here"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir(&dir);
+            return;
+        };
+        let f = std::fs::File::open(format!("/proc/{pid}/fd/3")).unwrap();
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
+        assert!(link.to_string_lossy().starts_with("/dmabuf:"), "{link:?}");
+        assert_eq!(classify(f.as_fd(), &[]), HandleKind::Other);
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

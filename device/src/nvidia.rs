@@ -1364,9 +1364,11 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.rmmem.clear();
-        for (_, k) in self.kms_states.drain() {
-            k.retire();
-        }
+        let mut kms_fbs: std::collections::HashMap<u32, Vec<u32>> = self
+            .kms_states
+            .drain()
+            .map(|(h, k)| (h, k.retire()))
+            .collect();
         self.vm_kms.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
@@ -1399,8 +1401,17 @@ impl NvidiaBackend {
             log::info!("release_all: closing {} host file(s)", handles.len());
         }
         for h in handles {
+            let owner = self.handles.owner(h);
             if let Ok((fd, kind)) = self.handles.remove(h) {
-                crate::closer::close_fd(fd, kind);
+                if !crate::closer::slow(kind) {
+                    drop(fd);
+                    continue;
+                }
+                let fd = self.handles.closing(fd, owner);
+                match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
+                    Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
+                    None => crate::closer::close(fd),
+                }
             }
         }
     }
@@ -2382,6 +2393,7 @@ impl NvidiaBackend {
     /// guest file may still have one mapped (see [`LiveMap`]). Only the lookup
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
+        let owner = self.handles.owner(handle);
         let (fd, kind) = self.handles.remove(handle)?;
         // Its UVM pools leave the VMM while `fd` is still open here, so the
         // file's last reference, and UVM's teardown of it, stay ours.
@@ -2412,7 +2424,7 @@ impl NvidiaBackend {
         self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, "close");
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
-        self.forget_kms_state(handle);
+        let fbs = self.forget_kms_state(handle);
         // A render file's syncobj numbers die with it and a later file may
         // get the same handle number: its waits must never join these (S-13).
         if matches!(kind, HandleKind::DriRender(_)) {
@@ -2423,18 +2435,29 @@ impl NvidiaBackend {
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         // A display file's last close can wait on a modeset; not here, on
-        // the queue thread under the backend mutex (closer.rs, S-33).
-        crate::closer::close_fd(fd, kind);
+        // the queue thread under the backend mutex (closer.rs, S-33). One
+        // whose framebuffers a call in flight names closes after it (S-6).
+        // Counted against the table until it is closed (handle_table.rs).
+        if !crate::closer::slow(kind) {
+            drop(fd);
+        } else if fbs.is_empty() {
+            crate::closer::close(self.handles.closing(fd, owner));
+        } else {
+            self.vm_kms
+                .close_after(fbs, Box::new(self.handles.closing(fd, owner)));
+        }
         Ok(())
     }
 
     /// Drop KMS handle `handle`'s per-file state, and with it every
     /// framebuffer it made from the VM's scanout sources: before the host
-    /// file closes and its ids can go to someone else (S-6).
-    pub(crate) fn forget_kms_state(&mut self, handle: u32) {
-        if let Some(k) = self.kms_states.remove(&handle) {
-            k.retire();
-        }
+    /// file closes and its ids can go to someone else (S-6). Returns those
+    /// ids: the host file must close through `vm_kms.close_after`.
+    pub(crate) fn forget_kms_state(&mut self, handle: u32) -> Vec<u32> {
+        self.kms_states
+            .remove(&handle)
+            .map(|k| k.retire())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
@@ -3494,7 +3517,19 @@ impl NvidiaBackend {
         // guard page (EFAULT), never into our heap. Only the bytes the guest
         // asked for go back.
         let mut deep: Option<(usize, BufId)> = None;
-        if let Some((ptr_off, bytes)) = deep_in {
+        // A deep block RM never follows a pointer to: its bytes go back as
+        // they came (see below).
+        let mut deep_unread: Option<&[u8]> = None;
+        if let Some((ptr_off, _)) = deep_in {
+            // Only an RM control's parameters hold a pointer the guest sends
+            // one block for. On anything else -- an RM_ALLOC, whose classes
+            // with pointers are refused outright (guestptr.rs), nvidia-drm's
+            // import and export -- the address written below would reach
+            // the host as data.
+            if !(rm && escape == abi::ioctl::NV_ESC_RM_CONTROL) {
+                log::warn!("ioctl {request:#x}: a deep block on a call that takes none; refused");
+                return fail(self, resp_buf, Status::IoctlFailed, libc::EINVAL);
+            }
             // Controls whose pointers stay zeroed (ACPI methods among
             // them; abi::rmctrl::ZEROED_CONTROLS) take no deep block.
             if rm && escape == abi::ioctl::NV_ESC_RM_CONTROL && abi::rmctrl::zeroed(word(outer_in, 8))
@@ -3512,6 +3547,27 @@ impl NvidiaBackend {
                 );
                 return fail(self, resp_buf, Status::InvalidMsgType, libc::EINVAL);
             }
+        }
+        // The block's address goes only where RM follows a pointer in this
+        // control's parameters (the measured tables, guestptr.rs). Anywhere
+        // else it would reach RM as data: SET_ZBC_COLOR_CLEAR stored it in
+        // the GPU-wide ZBC table, where any tenant reads it back -- an
+        // address of this process, and a clear color of the guest's making.
+        // RM does not read the field as a pointer, so there is nothing to
+        // copy: the field keeps the guest's bytes, as does the block, which
+        // goes back unchanged -- what a native caller's buffer holds after
+        // a call that never touched it (V1 GPU_GET_ID_INFO's szName, which
+        // the guest driver still carries one for).
+        if let Some((ptr_off, bytes)) =
+            deep_in.filter(|&(o, _)| !crate::guestptr::control_pointers(word(outer_in, 8)).contains(&o))
+        {
+            log::debug!(
+                "RM control {:#010x}: a deep block for {ptr_off}, where RM follows no pointer; \
+                 not relocated",
+                word(outer_in, 8)
+            );
+            deep_unread = Some(bytes);
+        } else if let Some((ptr_off, bytes)) = deep_in {
             let db = match a.block(bytes, bytes.len().max(DEEP_BUF_FLOOR)) {
                 Ok(b) => b,
                 Err(e) => return fail(self, resp_buf, Status::IoctlFailed, e),
@@ -3619,6 +3675,9 @@ impl NvidiaBackend {
         let deep_reply = deep_in.map_or(0, |(_, b)| b.len());
         if let Some((_, db)) = deep {
             combined.extend_from_slice(&a.bytes(db)[..deep_reply]);
+        }
+        if let Some(bytes) = deep_unread {
+            combined.extend_from_slice(bytes);
         }
         self.write_ioctl_resp_deep(resp_buf, cookie, &combined, deep_reply)
     }
@@ -3954,7 +4013,10 @@ impl NvidiaBackend {
             );
             return Err(libc::EPERM);
         }
-        self.osdesc.uvm_admit(client, memory)?;
+        let (base, len) = (rd64(0).unwrap_or(0), rd64(8).unwrap_or(0));
+        let file = self.current_handle;
+        self.osdesc
+            .uvm_admit(file, self.handles.owner(file), client, memory, base, len)?;
         // UVM_MAP_EXTERNAL_ALLOCATION_PARAMS: base, length, offset, then
         // perGpuAttributes[] at 24 (36 bytes each, the UUID first), and
         // gpuAttributesCount just before rmCtrlFd.
@@ -3970,11 +4032,13 @@ impl NvidiaBackend {
             })
             .collect();
         Ok(Some(crate::osdesc::UvmMap {
-            base: rd64(0).unwrap_or(0),
-            len: rd64(8).unwrap_or(0),
+            base,
+            len,
             gpus,
             client,
             memory,
+            // rmStatus, after rmCtrlFd, hClient and hMemory.
+            status_at: fd_off + 12,
         }))
     }
 
@@ -4013,13 +4077,26 @@ impl NvidiaBackend {
         match cmd {
             UVM_MAP_EXTERNAL_ALLOCATION => {
                 let Some(m) = map else { return };
-                // Held whatever UVM answered: it can fail the call after
-                // making every mapping (its wait for the page-table writes),
-                // and then leaves them up. A mapping never made is held
-                // until its range is freed or its file closes: late, not
-                // early.
-                self.osdesc
-                    .uvm_mapped(handle, m.base, m.len, &m.gpus, m.client, m.memory);
+                // Held when UVM made it: NV_OK, or a failure of its wait for
+                // the page-table writes, after which it leaves every mapping
+                // up -- a channel's RC or ECC error, or the GPU gone
+                // (uvm_map_external_allocation, uvm_channel_get_status).
+                // Every other failure is answered before anything is mapped,
+                // or after tearing down what the call made; and with no
+                // answer at all the call never reached UVM. A mapping held
+                // that was never made lasts until its range is freed or its
+                // file closes (it lies in a recorded range, uvm_admit): late,
+                // not early.
+                const NV_ERR_ECC_ERROR: u32 = 0x0b;
+                const NV_ERR_GPU_IS_LOST: u32 = 0x0f;
+                const NV_ERR_RC_ERROR: u32 = 0x60;
+                if let Some(0 | NV_ERR_ECC_ERROR | NV_ERR_GPU_IS_LOST | NV_ERR_RC_ERROR) =
+                    status(m.status_at)
+                {
+                    let owner = self.handles.owner(handle);
+                    self.osdesc
+                        .uvm_mapped(handle, owner, m.base, m.len, &m.gpus, m.client, m.memory);
+                }
             }
             UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
                 self.osdesc.uvm_range_made(handle, word(0), word(8));
@@ -8217,5 +8294,214 @@ mod share_tests {
             be.modeset_open_refused(p(9)).is_some(),
             "the VM cap is still the outer bound"
         );
+    }
+}
+
+/// Where a deep block's address may go (review 2026-09-26, backend 7).
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+    use abi::ioctl::*;
+    use std::cell::RefCell;
+
+    /// A call RM saw: what it was (control or class), and the parameters'
+    /// words at 0 and 8 as RM read them, each with whether it is an address
+    /// in the call's own memory.
+    type Seen = (u32, [(u64, bool); 2]);
+
+    std::thread_local! {
+        static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn seen() -> Vec<Seen> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// RM: note the first two words of the parameters as the host reads
+    /// them, answer NV_OK.
+    fn fake_rm(_fd: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        let (b, others) = arg.split();
+        let escape = (request & 0xff) as u32;
+        let (what, status) = match escape {
+            NV_ESC_RM_CONTROL => (u32::from_le_bytes(b[8..12].try_into().unwrap()), 28),
+            NV_ESC_RM_ALLOC => (u32::from_le_bytes(b[12..16].try_into().unwrap()), 40),
+            _ => return 0,
+        };
+        let p = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let word = |at: u64| {
+            let v = others.peek(p + at, 8);
+            (v, others.reach(v, 1).is_some())
+        };
+        SEEN.with(|s| s.borrow_mut().push((what, [word(0), word(8)])));
+        b[status..status + 4].fill(0);
+        0
+    }
+
+    fn backend() -> (NvidiaBackend, u32) {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        // This path's own rule: the allowlist in front of it is tested
+        // with rmallow.rs.
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
+        let null: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let ctl = be.adopt_for_test(null, HandleKind::Dev(DeviceKind::Ctl));
+        (be, ctl)
+    }
+
+    /// A v1 call: `outer`, its `nested` parameters, and a deep block the
+    /// guest says the pointer at `deep_at` of them addresses. The reply's
+    /// status, and what follows the IoctlResp.
+    fn call(
+        be: &mut NvidiaBackend,
+        on: u32,
+        cmd: u32,
+        outer: &[u8],
+        nested: &[u8],
+        deep: (u32, &[u8]),
+    ) -> (i32, Vec<u8>) {
+        let mut req = vec![0u8; size_of::<MsgHeader>()];
+        write_struct(
+            &mut req,
+            &MsgHeader {
+                msg_type: MsgType::Ioctl as u32,
+                handle: on,
+                status: 0,
+                req_id: 0,
+            },
+        );
+        let at = req.len();
+        req.resize(at + size_of::<IoctlReq>(), 0);
+        write_struct(
+            &mut req[at..],
+            &IoctlReq {
+                cmd,
+                data_len: outer.len() as u32,
+                nested_offset: outer.len() as u32,
+                nested_len: nested.len() as u32,
+                deep_ptr_offset: deep.0,
+                deep_len: deep.1.len() as u32,
+            },
+        );
+        req.extend_from_slice(outer);
+        req.extend_from_slice(nested);
+        req.extend_from_slice(deep.1);
+        let mut resp = vec![0u8; 8192];
+        let n = be.dispatch(&req, &mut resp);
+        let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
+        let st = read_struct::<MsgHeader>(&resp, 0).status;
+        (st, resp[body.min(n)..n].to_vec())
+    }
+
+    fn control(cmd: u32, size: u32) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o[8..12].copy_from_slice(&cmd.to_le_bytes());
+        o[16..24].copy_from_slice(&0x7000u64.to_le_bytes());
+        o[24..28].copy_from_slice(&size.to_le_bytes());
+        o
+    }
+
+    const GUEST_PTR: u64 = 0x7fff_1234_5678;
+
+    /// SET_ZBC_COLOR_CLEAR keeps no pointer: an address written into its
+    /// color words went to RM as a clear color, into the GPU-wide ZBC
+    /// table any tenant reads -- an address of this process.
+    #[test]
+    fn a_deep_block_puts_no_address_where_rm_follows_no_pointer() {
+        const SET_ZBC_COLOR_CLEAR: u32 = 0x9096_0101;
+        assert!(crate::guestptr::control_pointers(SET_ZBC_COLOR_CLEAR).is_empty());
+        let (mut be, ctl) = backend();
+        let mut nested = [0u8; 44];
+        nested[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        let deep = [0xabu8; 16];
+        let cmd = _IOWR(NV_ESC_RM_CONTROL, 32) as u32;
+        let outer = control(SET_ZBC_COLOR_CLEAR, 44);
+        let (st, back) = call(&mut be, ctl, cmd, &outer, &nested, (8, &deep));
+        assert_eq!(st, 0);
+        let s = seen();
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            s[0].1[1],
+            (GUEST_PTR, false),
+            "RM reads the guest's own bytes there, never an address of ours"
+        );
+        // The caller's parameters and block come back as sent.
+        assert_eq!(&back[32..32 + 44], &nested);
+        assert_eq!(&back[32 + 44..], &deep);
+
+        // Where RM does follow one (GET_SURFACE_INFO's list), it is
+        // relocated as before.
+        const GET_SURFACE_INFO: u32 = 0x0041_0110;
+        assert_eq!(crate::guestptr::control_pointers(GET_SURFACE_INFO), &[8]);
+        let mut nested = [0u8; 16];
+        nested[0..4].copy_from_slice(&2u32.to_le_bytes());
+        nested[8..16].copy_from_slice(&GUEST_PTR.to_le_bytes());
+        let outer = control(GET_SURFACE_INFO, 16);
+        let (st, back) = call(&mut be, ctl, cmd, &outer, &nested, (8, &deep));
+        assert_eq!(st, 0);
+        let s = seen();
+        assert!(s[0].1[1].1, "the list: a block of the call");
+        assert_eq!(&back[32 + 8..32 + 16], &GUEST_PTR.to_le_bytes());
+    }
+
+    /// No RM_ALLOC class takes a deep block (classes whose parameters hold
+    /// pointers are refused, guestptr.rs): one sent is refused, and RM is
+    /// not asked.
+    #[test]
+    fn an_allocation_takes_no_deep_block() {
+        let (mut be, ctl) = backend();
+        let mut outer = [0u8; 48];
+        outer[0..4].copy_from_slice(&0xc1d0_0001u32.to_le_bytes());
+        outer[12..16].copy_from_slice(&0x0080u32.to_le_bytes());
+        outer[16..24].copy_from_slice(&0x7000u64.to_le_bytes());
+        outer[32..36].copy_from_slice(&56u32.to_le_bytes());
+        let nested = [0u8; 56];
+        let cmd = _IOWR(NV_ESC_RM_ALLOC, 48) as u32;
+        let (st, _) = call(&mut be, ctl, cmd, &outer, &nested, (8, &[1u8; 8]));
+        assert_eq!(st, -libc::EINVAL);
+        assert!(seen().is_empty());
+        let (st, _) = call(&mut be, ctl, cmd, &outer, &nested, (0, &[]));
+        assert_eq!(st, 0, "without one it goes");
+        assert_eq!(seen().len(), 1);
+    }
+}
+
+/// Descriptors on their way to the closer (review 2026-09-26, backend 14).
+#[cfg(test)]
+mod closing_tests {
+    use super::*;
+
+    /// Holds the closer until told to go on (or two seconds pass).
+    struct Hold(std::sync::mpsc::Receiver<()>);
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+
+    /// A display file's last close waits on the closer, and while it does
+    /// the host file is open. The handle table let it go at CLOSE, so a
+    /// guest opening and closing render nodes while the closer was stuck
+    /// on a modeset queued host files without bound. They count against
+    /// the table until they are closed.
+    #[test]
+    fn files_still_closing_count_against_the_handle_table() {
+        let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let mut be = NvidiaBackend::for_test();
+        be.handles.set_limit(64);
+        let (go, wait) = std::sync::mpsc::channel();
+        crate::closer::close(Hold(wait));
+        let hs: Vec<u32> = (0..64)
+            .map(|_| be.adopt_for_test(devnull(), HandleKind::DriRender(0)))
+            .collect();
+        for h in hs {
+            be.close_handle(h).unwrap();
+        }
+        assert_eq!(be.handle_count(), 0);
+        let r = be.handles.insert(devnull(), HandleKind::Eventfd);
+        go.send(()).unwrap();
+        assert!(r.is_err(), "64 host files are still open");
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert!(be.handles.insert(devnull(), HandleKind::Eventfd).is_ok());
     }
 }

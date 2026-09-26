@@ -780,6 +780,8 @@ pub(crate) struct UvmMap {
     pub gpus: Vec<GpuUuid>,
     pub client: u32,
     pub memory: u32,
+    /// Where UVM leaves its status in the block.
+    pub status_at: usize,
 }
 
 // ─────────────────────────── The registry ───────────────────────────
@@ -833,6 +835,8 @@ struct UvmHold {
     /// The guest's UVM file. None once that file closed without the
     /// mapping coming down: it lasts until the session does.
     file: Option<u32>,
+    /// The guest process that file is charged to (quota.rs).
+    owner: crate::quota::Owner,
     base: u64,
     len: u64,
     /// The GPUs it is mapped on.
@@ -841,9 +845,23 @@ struct UvmHold {
 }
 
 impl UvmHold {
+    /// Whether it lies in `[base, base + len)`. The guest chose both
+    /// lengths: the ends are computed without wrapping (a mapping whose end
+    /// would wrap lies in nothing).
     fn within(&self, base: u64, len: u64) -> bool {
-        self.base >= base && self.base + self.len <= base.saturating_add(len)
+        self.base >= base
+            && self
+                .base
+                .checked_add(self.len)
+                .is_some_and(|e| e <= base.saturating_add(len))
     }
+}
+
+/// How the VM's UVM external mappings of registered memory are split among
+/// its guest processes (quota.rs): one that filled the VM's bound with
+/// mappings refused every other process's.
+fn uvm_share(limit: usize) -> crate::quota::Share {
+    crate::quota::Share::quarter(limit as u64, 16)
 }
 
 #[derive(Debug)]
@@ -1239,14 +1257,53 @@ impl OsDesc {
 
     // ── nvidia-uvm external mappings ──
 
-    /// Whether UVM file `file` may map `(client, memory)` as an external
-    /// allocation: always, unless it is registered memory and the VM holds
-    /// as many such mappings as it may (ENOMEM).
-    pub(crate) fn uvm_admit(&self, client: u32, memory: u32) -> Result<(), Errno> {
-        if self.holds(client, memory) && self.uvm.len() >= self.limits.uvm_maps_per_vm {
+    /// Whether UVM file `file`, charged to `owner`, may map `(client,
+    /// memory)` at `[base, base + len)` as an external allocation: always,
+    /// unless it is registered memory. Then the range must lie in an
+    /// external range this file made and the backend recorded -- where UVM
+    /// can map it at all (uvm_map_external_allocation: NV_ERR_INVALID_ADDRESS
+    /// elsewhere), and where a UVM_FREE of the range, or the file's close,
+    /// takes what the mapping holds (EINVAL); and the VM, and the process,
+    /// must hold fewer such mappings than they may (ENOMEM).
+    pub(crate) fn uvm_admit(
+        &self,
+        file: u32,
+        owner: crate::quota::Owner,
+        client: u32,
+        memory: u32,
+        base: u64,
+        len: u64,
+    ) -> Result<(), Errno> {
+        if !self.holds(client, memory) {
+            return Ok(());
+        }
+        let inside = base.checked_add(len).is_some_and(|end| {
+            self.uvm_ranges.get(&file).is_some_and(|r| {
+                r.range(..=base)
+                    .next_back()
+                    .is_some_and(|(&b, &l)| b.checked_add(l).is_some_and(|e| end <= e))
+            })
+        });
+        if !inside {
+            log::warn!(
+                "UVM external mapping of registered memory {client:#x}/{memory:#x} at \
+                 {base:#x}+{len:#x} refused: no external range of handle {file} recorded there"
+            );
+            return Err(libc::EINVAL);
+        }
+        let limit = self.limits.uvm_maps_per_vm;
+        let of_owner = self.uvm.iter().filter(|h| h.owner == owner).count();
+        if let Err(why) = crate::quota::admits(
+            &uvm_share(limit),
+            owner,
+            of_owner as u64,
+            1,
+            self.uvm.len() as u64,
+            limit as u64,
+        ) {
             log::warn!(
                 "UVM external mapping of registered memory {client:#x}/{memory:#x} refused: \
-                 the VM holds {} already",
+                 the VM holds {}, guest process {owner:?} {of_owner} ({why:?})",
                 self.uvm.len()
             );
             return Err(libc::ENOMEM);
@@ -1254,14 +1311,15 @@ impl OsDesc {
         Ok(())
     }
 
-    /// UVM file `file` mapped `(client, memory)` at `[base, base + len)` on
-    /// `gpus` (MAP_EXTERNAL_ALLOCATION), or may have -- UVM can fail the
-    /// call with every mapping made, waiting for the page-table writes
-    /// (uvm_api_map_external_allocation), so a failure counts too: every
-    /// registration the memory holds is held by the mapping as well.
+    /// UVM file `file` (charged to `owner`) mapped `(client, memory)` at
+    /// `[base, base + len)` on `gpus` (MAP_EXTERNAL_ALLOCATION): every
+    /// registration the memory holds is held by the mapping as well. The
+    /// caller says when UVM made it (nvidia.rs, `osdesc_uvm_after`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn uvm_mapped(
         &mut self,
         file: u32,
+        owner: crate::quota::Owner,
         base: u64,
         len: u64,
         gpus: &[GpuUuid],
@@ -1281,6 +1339,7 @@ impl OsDesc {
                 r.uvm += 1;
                 self.uvm.push(UvmHold {
                     file: Some(file),
+                    owner,
                     base,
                     len,
                     gpus: gpus.to_vec(),
@@ -1885,6 +1944,7 @@ mod tests {
 
     const G1: GpuUuid = [1; 16];
     const G2: GpuUuid = [2; 16];
+    const U: crate::quota::Owner = crate::quota::Owner::Unknown;
 
     #[test]
     fn a_uvm_mapping_holds_a_registration_past_its_handle_until_every_gpu_unmaps_it() {
@@ -1892,9 +1952,9 @@ mod tests {
         let mut o = OsDesc::default();
         let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
         // Mapped on two GPUs by UVM file 7, at 1 MiB.
-        o.uvm_mapped(7, 1 << 20, 2 * PAGE, &[G1, G2], 0xc1, 0x10);
+        o.uvm_mapped(7, U, 1 << 20, 2 * PAGE, &[G1, G2], 0xc1, 0x10);
         // Memory nothing registered is not held.
-        o.uvm_mapped(7, 4 << 20, PAGE, &[G1], 0xc1, 0x99);
+        o.uvm_mapped(7, U, 4 << 20, PAGE, &[G1], 0xc1, 0x99);
         assert_eq!(o.uvm_held(), 1);
         o.freed(0xc1, 0x10);
         assert_eq!(o.reap(0), (0, vec![]), "UVM still has it");
@@ -1917,7 +1977,7 @@ mod tests {
         let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
         o.uvm_range_made(7, 1 << 20, 4 << 20);
         o.uvm_range_made(7, 8 << 20, 1 << 20);
-        o.uvm_mapped(7, 2 << 20, PAGE, &[G1], 0xc1, 0x10);
+        o.uvm_mapped(7, U, 2 << 20, PAGE, &[G1], 0xc1, 0x10);
         assert_eq!(o.uvm_ranges_held(7), vec![(1 << 20, 4 << 20)]);
         assert_eq!(o.uvm_maps_held(7), vec![(2 << 20, PAGE, G1)]);
         o.freed(0xc1, 0x10);
@@ -1936,12 +1996,12 @@ mod tests {
         let ram = ram();
         let mut o = OsDesc::default();
         let a = o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
-        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        o.uvm_mapped(7, U, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
         o.uvm_unmapped(7, 1 << 20, PAGE, &G1);
         assert_eq!(o.reap(0).1, Vec::<u64>::new(), "RM's handle still holds it");
         // A duplicate mapped holds it as the original would.
         o.duplicated(0xc1, 0x10, 0xc2, 0x20, 0xd2);
-        o.uvm_mapped(9, 1 << 20, PAGE, &[G1], 0xc2, 0x20);
+        o.uvm_mapped(9, U, 1 << 20, PAGE, &[G1], 0xc2, 0x20);
         o.freed(0xc1, 0xc1);
         o.freed(0xc2, 0xc2);
         assert_eq!(o.reap(0).1, Vec::<u64>::new());
@@ -1957,7 +2017,7 @@ mod tests {
         let mut o = OsDesc::default();
         o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
         o.uvm_range_made(7, 1 << 20, 4 << 20);
-        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        o.uvm_mapped(7, U, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
         o.freed(0xc1, 0x10);
         o.uvm_file_closed(7);
         assert!(o.uvm_files().is_empty() && o.uvm_ranges.is_empty());
@@ -1979,13 +2039,68 @@ mod tests {
             ..Limits::default()
         });
         o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
-        assert_eq!(o.uvm_admit(0xc1, 0x10), Ok(()));
-        o.uvm_mapped(7, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
-        assert_eq!(o.uvm_admit(0xc1, 0x10), Err(libc::ENOMEM));
-        assert_eq!(o.uvm_admit(0xc1, 0x99), Ok(()), "memory nothing registered");
         o.uvm_range_made(7, 1 << 20, 1 << 20);
         o.uvm_range_made(7, 4 << 20, 1 << 20);
         assert_eq!(o.uvm_range_count, 1);
+        let admit = |o: &OsDesc, memory| o.uvm_admit(7, U, 0xc1, memory, 1 << 20, PAGE);
+        assert_eq!(admit(&o, 0x10), Ok(()));
+        o.uvm_mapped(7, U, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+        assert_eq!(admit(&o, 0x10), Err(libc::ENOMEM));
+        assert_eq!(admit(&o, 0x99), Ok(()), "memory nothing registered");
+    }
+
+    /// A mapping of registered memory is held until its range is freed or
+    /// its file closes, so it must lie in a range the backend recorded: a
+    /// guest calling MAP_EXTERNAL_ALLOCATION anywhere else left holds that
+    /// nothing took down, and one process that filled the VM's bound with
+    /// them refused every other's (review 2026-09-26, backend 4).
+    #[test]
+    fn a_uvm_mapping_of_registered_memory_lies_in_a_recorded_range_and_a_process_share() {
+        use crate::quota::Owner;
+        let ram = ram();
+        let mut o = OsDesc::with_limits(Limits {
+            uvm_maps_per_vm: 64,
+            ..Limits::default()
+        });
+        o.add(1, 0xc1, 0x10, 0xd0, pinned(&ram, &[(LOW, 1)]));
+        let (a, b) = (
+            Owner::Proc {
+                tgid: 1,
+                start_ns: 1,
+            },
+            Owner::Proc {
+                tgid: 2,
+                start_ns: 1,
+            },
+        );
+        o.uvm_range_made(7, 1 << 20, 4 << 20);
+        o.uvm_range_made(8, 1 << 20, 4 << 20);
+        let admit = |o: &OsDesc, file, owner, base, len| o.uvm_admit(file, owner, 0xc1, 0x10, base, len);
+        // Outside every range, across a range's end, in another file's, or
+        // wrapping.
+        assert_eq!(admit(&o, 7, a, 8 << 20, PAGE), Err(libc::EINVAL));
+        assert_eq!(admit(&o, 7, a, 4 << 20, 2 << 20), Err(libc::EINVAL));
+        assert_eq!(admit(&o, 9, a, 1 << 20, PAGE), Err(libc::EINVAL));
+        assert_eq!(admit(&o, 7, a, 1 << 20, u64::MAX), Err(libc::EINVAL));
+        assert_eq!(admit(&o, 7, a, 1 << 20, 4 << 20), Ok(()));
+        // A quarter of the VM's bound per process.
+        let mut made = 0;
+        while admit(&o, 7, a, 1 << 20, PAGE).is_ok() {
+            o.uvm_mapped(7, a, 1 << 20, PAGE, &[G1], 0xc1, 0x10);
+            made += 1;
+        }
+        assert_eq!(made, 16);
+        assert_eq!(admit(&o, 7, a, 1 << 20, PAGE), Err(libc::ENOMEM));
+        assert_eq!(admit(&o, 8, b, 1 << 20, PAGE), Ok(()), "another process");
+        // Freeing the range takes them all.
+        o.uvm_range_freed(7, 1 << 20);
+        assert_eq!(o.uvm_held(), 0);
+        // A hold whose end would wrap lies in no range, and frees nothing
+        // it does not.
+        o.uvm_range_made(7, 1 << 20, 4 << 20);
+        o.uvm_mapped(7, a, u64::MAX - 8, PAGE, &[G1], 0xc1, 0x10);
+        o.uvm_range_freed(7, 1 << 20);
+        assert_eq!(o.uvm_held(), 1);
     }
 
     #[test]
@@ -3163,21 +3278,40 @@ mod backend_tests {
         assert_eq!(reap(&mut vm.be, ack).1, vec![id]);
     }
 
-    /// A mapping UVM failed still holds the memory -- UVM can fail one
-    /// with the mappings made -- until its range is freed; one of memory
+    /// A mapping of registered memory is held when UVM made it: on NV_OK,
+    /// and on the failures of its wait for the page-table writes, which
+    /// leave every mapping up (an RC error here) -- until its range is
+    /// freed. Refused (an invalid argument), UVM made nothing, and nothing
+    /// is held; outside every range this file made, UVM would refuse it,
+    /// and it never gets there (review 2026-09-26, backend 4). One of memory
     /// nothing registered is not followed; ALLOC_DEVICE_P2P of registered
     /// memory never reaches UVM.
     #[test]
-    fn a_uvm_mapping_of_registered_memory_holds_it_whatever_uvm_answered() {
+    fn a_uvm_mapping_of_registered_memory_is_held_when_uvm_made_it() {
         let (mut vm, uvm) = vm_610();
         let (_, id) = register(&mut vm);
         create_range(&mut vm, uvm, UVA, 4 << 20);
+        seen();
         UVM_STATUS.with(|s| s.set(0x1f));
         assert_eq!(
             map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]),
             (0, 0x1f)
         );
+        assert_eq!(vm.be.osdesc.uvm_held(), 0, "NV_ERR_INVALID_ARGUMENT made nothing");
+        UVM_STATUS.with(|s| s.set(0x60));
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]),
+            (0, 0x60)
+        );
+        assert_eq!(vm.be.osdesc.uvm_held(), 1, "NV_ERR_RC_ERROR left it up");
         UVM_STATUS.with(|s| s.set(0));
+        assert_eq!(seen().len(), 2);
+        assert_eq!(
+            map_external(&mut vm, uvm, UVA + (8 << 20), PAGE, HANDLE, &[G1]).0,
+            -libc::EINVAL,
+            "no range there"
+        );
+        assert!(seen().is_empty());
         assert_eq!(
             map_external(&mut vm, uvm, UVA, PAGE, 0x5000_0099, &[G1]),
             (0, 0)

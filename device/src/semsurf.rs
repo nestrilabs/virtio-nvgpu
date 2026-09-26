@@ -246,11 +246,11 @@ impl SemsurfPolicy {
         self.lock().own.owners.get(&h_client).copied()
     }
 
-    /// RM_FREE of an object that is not a client was asked for: its share
+    /// RM_FREE of an object that is not a client was done: its share
     /// policy goes with it, and the grants of every other object of the
     /// client, which may have gone with it (rmshare.rs,
-    /// `Ownership::object_freed`; forgotten whatever RM answered, as for
-    /// clients).
+    /// `Ownership::object_freed`; semsurf_track_rm says when a free counts,
+    /// as for clients).
     pub fn object_freed(&self, h_client: u32, object: u32) {
         self.lock().own.object_freed(h_client, object);
     }
@@ -284,10 +284,11 @@ impl SemsurfPolicy {
         self.lock().own.named_ok(caller, own, n)
     }
 
-    /// RM_FREE of a client was asked for. Forgotten whatever RM answered: a
-    /// client kept past a free it survived only costs the guest a refusal,
-    /// one kept past a free it did not would let the next owner of the
-    /// number be named. Its OS events go with it (escape.c:521-527).
+    /// RM_FREE of a client was done: RM said so, or it came through the
+    /// file the client was made on (semsurf_track_rm), whatever RM answered
+    /// then -- a client kept past a free it survived only costs its owner a
+    /// refusal, one kept past a free it did not would let the next owner of
+    /// the number be named. Its OS events go with it (escape.c:521-527).
     pub fn client_freed(&self, h_client: u32) {
         let mut g = self.lock();
         g.clients.remove(&h_client);
@@ -309,8 +310,14 @@ impl SemsurfPolicy {
         self.lock().os_events.insert((h_client, event), issuer);
     }
 
-    /// FREE_OS_EVENT was asked for (forgotten whatever RM answered, as for
-    /// clients).
+    /// The file ALLOC_OS_EVENT for `(h_client, event)` was issued on, if it
+    /// is live.
+    pub fn os_event_issuer(&self, h_client: u32, event: u32) -> Option<u32> {
+        self.lock().os_events.get(&(h_client, event)).copied()
+    }
+
+    /// FREE_OS_EVENT of `(h_client, event)` was done (semsurf_track_rm
+    /// says when that is).
     pub fn os_event_freed(&self, h_client: u32, event: u32) {
         self.lock().os_events.remove(&(h_client, event));
     }
@@ -361,6 +368,21 @@ impl SemsurfPolicy {
                 g.ctxs.remove(&render);
             }
         }
+    }
+
+    /// Whether GEM handle `gem` of render file `render` is a live fence
+    /// context.
+    pub fn is_ctx(&self, render: u32, gem: u32) -> bool {
+        self.lock()
+            .ctxs
+            .get(&render)
+            .is_some_and(|s| s.contains(&gem))
+    }
+
+    /// A fence context `gem` on `render`, as a successful 0x54 records one.
+    #[cfg(test)]
+    pub(crate) fn ctx_made_for_test(&self, render: u32, gem: u32) {
+        self.lock().ctxs.entry(render).or_default().insert(gem);
     }
 
     /// Live fence contexts of `render`, and of the session.
@@ -889,9 +911,24 @@ impl NvidiaBackend {
             }
             // NVOS00 {hRoot, hObjectParent, hObjectOld, status}: freeing the
             // root frees the client; any other object takes its share
-            // policy with it (rmshare.rs).
+            // policy with it (rmshare.rs). Forgotten when RM says it freed
+            // it, or when the free came through the file the client was made
+            // on whatever RM said (a client kept past a free it did not
+            // survive would let the next owner of the number be named). A
+            // free RM refused from any other file -- another guest process
+            // naming this one's client, which RM's per-file validation turns
+            // away -- changes nothing: forgotten, the owner's duplicates,
+            // fence contexts and grants would be refused from then on.
             NV_ESC_RM_FREE => {
                 if let (Some(root), Some(old)) = (word(param_in, 0), word(param_in, 8)) {
+                    let freed = reply_params(resp, n).and_then(|out| word(out, 12)) == Some(0);
+                    if !freed && self.semsurf.issuer_of(root) != Some(issuer) {
+                        log::debug!(
+                            "RM_FREE of {root:#x}/{old:#x} through handle {issuer}, which did \
+                             not make the client, was not done by RM; records kept"
+                        );
+                        return;
+                    }
                     if root == old {
                         self.semsurf.client_freed(root);
                     } else {
@@ -913,9 +950,14 @@ impl NvidiaBackend {
                     }
                 }
             }
+            // The same for an OS event: forgotten when RM freed it, or when
+            // the free came through the file it was made on.
             NV_ESC_FREE_OS_EVENT => {
                 if let (Some(c), Some(fd)) = (word(param_in, 0), word(param_in, 8)) {
-                    self.semsurf.os_event_freed(c, fd);
+                    let freed = reply_params(resp, n).and_then(|out| word(out, 12)) == Some(0);
+                    if freed || self.semsurf.os_event_issuer(c, fd) == Some(issuer) {
+                        self.semsurf.os_event_freed(c, fd);
+                    }
                 }
             }
             _ => {}
@@ -1507,6 +1549,12 @@ mod backend_tests {
         static SEEN: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
     }
 
+    std::thread_local! {
+        /// The RM status the fake host answers RM_FREE and FREE_OS_EVENT
+        /// with on this test's thread (NV_OK unless a test says otherwise).
+        static FREE_STATUS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     fn seen() -> Vec<(u32, u64)> {
         SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
@@ -1545,6 +1593,15 @@ mod backend_tests {
             (b'F', 0xce) => {
                 note(0xce, u64::from(word(a, 8)));
                 a[12..16].fill(0);
+            }
+            (b'F', 0xcf) => {
+                note(0xcf, u64::from(word(a, 8)));
+                let st = FREE_STATUS.with(|s| s.get());
+                a[12..16].copy_from_slice(&st.to_le_bytes());
+            }
+            (b'F', 0x29) => {
+                let st = FREE_STATUS.with(|s| s.get());
+                a[12..16].copy_from_slice(&st.to_le_bytes());
             }
             _ => {}
         }
@@ -1618,8 +1675,12 @@ mod backend_tests {
         assert_eq!(status(&r), 0);
     }
 
-    /// ALLOC_OS_EVENT of `event` (our handle for the file) under CLIENT.
+    /// ALLOC_OS_EVENT of `event` (our handle for the file) under CLIENT,
+    /// allocated through `on` first if the VM has not got it.
     fn alloc_os_event(be: &mut NvidiaBackend, on: u32, event: u32) {
+        if !be.semsurf.owns_client(CLIENT) {
+            alloc_client(be, on);
+        }
         let mut p = [0u8; 16];
         p[0..4].copy_from_slice(&CLIENT.to_le_bytes());
         p[8..12].copy_from_slice(&event.to_le_bytes());
@@ -1718,8 +1779,8 @@ mod backend_tests {
         let host_fd = be.handles.get_raw(ctl).unwrap() as u64;
         assert_eq!(
             seen(),
-            vec![(0xce, host_fd)],
-            "only the OS event reached it"
+            vec![(0xce, host_fd), (0xcf, host_fd)],
+            "only the OS event and its free reached it"
         );
     }
 
@@ -1789,6 +1850,117 @@ mod backend_tests {
             let l = l.unwrap();
             assert!(l.stride >= 8 && l.max_submitted + 8 <= l.stride, "{l:?}");
         }
+    }
+
+    fn os_event(client: u32, event: u32) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&client.to_le_bytes());
+        p[8..12].copy_from_slice(&event.to_le_bytes());
+        p
+    }
+
+    /// The RM status word at `at` of a v1 reply's parameters (after the
+    /// header and IoctlResp).
+    fn rm_status_at(resp: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(resp[28 + at..28 + at + 4].try_into().unwrap())
+    }
+
+    /// RM keeps OS events in one host-wide list keyed by (hClient, fd), and
+    /// checks neither (osapi.c allocate_os_event, free_os_event): another
+    /// VM's client and a descriptor number of ours would free that VM's
+    /// event, or take the key its next one needs. The client must be this
+    /// VM's; RM is never asked otherwise.
+    #[test]
+    fn an_os_event_call_naming_another_vms_client_never_reaches_rm() {
+        let (mut be, ctl) = backend();
+        let neighbour = CLIENT + 1;
+        for cmd in [ALLOC_OS_EVENT, FREE_OS_EVENT] {
+            let r = v1(&mut be, ctl, cmd, &os_event(neighbour, ctl), &[]);
+            assert_eq!(status(&r), 0, "the ioctl succeeds, as RM's refusals do");
+            assert_eq!(
+                rm_status_at(&r, 12),
+                crate::rmshare::NV_ERR_INSUFFICIENT_PERMISSIONS,
+                "{cmd:#x}"
+            );
+            // The caller's own values come back.
+            assert_eq!(&r[28..40], &os_event(neighbour, ctl)[..12]);
+        }
+        assert!(seen().is_empty(), "RM was never asked");
+        assert!(!be.semsurf.os_event_live(neighbour, ctl));
+
+        // The VM's own client goes through, both ways.
+        alloc_client(&mut be, ctl);
+        let host_fd = be.handles.get_raw(ctl).unwrap() as u64;
+        let r = v1(&mut be, ctl, ALLOC_OS_EVENT, &os_event(CLIENT, ctl), &[]);
+        assert_eq!((status(&r), rm_status_at(&r, 12)), (0, 0));
+        let r = v1(&mut be, ctl, FREE_OS_EVENT, &os_event(CLIENT, ctl), &[]);
+        assert_eq!((status(&r), rm_status_at(&r, 12)), (0, 0));
+        assert_eq!(seen(), vec![(0xce, host_fd), (0xcf, host_fd)]);
+    }
+
+    /// Another guest process's RM_FREE of this one's client, which RM turns
+    /// away (it was made on another file), must not wipe what the backend
+    /// knows of the client: its owner's duplicates, fence contexts, OS
+    /// events and grants would all be refused from then on.
+    #[test]
+    fn a_free_rm_refused_from_another_file_leaves_the_client_its_owners() {
+        const NV_ERR_INVALID_OBJECT_HANDLE: u32 = 0x33;
+        let (mut be, ctl) = backend();
+        let null: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let other = be.adopt_for_test(null, HandleKind::Dev(DeviceKind::Ctl));
+        alloc_client(&mut be, ctl);
+        alloc_os_event(&mut be, ctl, ctl);
+        let grant = crate::rmshare::Policy {
+            target: CLIENT + 7,
+            mask: crate::rmshare::RS_ACCESS_DUP_OBJECT_BIT,
+            kind: crate::rmshare::RS_SHARE_TYPE_CLIENT,
+            action: 0,
+        };
+        be.semsurf.shared(CLIENT, 0x5e5, &grant);
+        let free = |client: u32, object: u32| {
+            let mut f = [0u8; 16];
+            f[0..4].copy_from_slice(&client.to_le_bytes());
+            f[8..12].copy_from_slice(&object.to_le_bytes());
+            f
+        };
+        let grants = |be: &NvidiaBackend| {
+            be.semsurf
+                .lock()
+                .own
+                .grants
+                .get(&(CLIENT, 0x5e5))
+                .map_or(0, Vec::len)
+        };
+        assert_eq!(grants(&be), 1);
+
+        FREE_STATUS.with(|s| s.set(NV_ERR_INVALID_OBJECT_HANDLE));
+        // Refused by RM, from the other file: nothing is forgotten.
+        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, 0x5e6), &[])), 0);
+        assert_eq!(grants(&be), 1, "an object RM did not free takes no grants");
+        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert!(be.semsurf.owns_client(CLIENT), "a client RM did not free");
+        assert!(be.semsurf.os_event_live(CLIENT, ctl));
+        let r = v1(&mut be, other, FREE_OS_EVENT, &os_event(CLIENT, ctl), &[]);
+        assert_eq!(status(&r), 0);
+        assert!(
+            be.semsurf.os_event_live(CLIENT, ctl),
+            "an event RM did not free, freed from another file"
+        );
+
+        // From the file the client was made on, it is gone whatever RM said.
+        let r = v1(&mut be, ctl, FREE_OS_EVENT, &os_event(CLIENT, ctl), &[]);
+        assert_eq!(status(&r), 0);
+        assert!(!be.semsurf.os_event_live(CLIENT, ctl));
+        assert_eq!(status(&v1(&mut be, ctl, FREE, &free(CLIENT, 0x5e6), &[])), 0);
+        assert_eq!(grants(&be), 0);
+        assert_eq!(status(&v1(&mut be, ctl, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert!(!be.semsurf.owns_client(CLIENT));
+
+        // And from any file once RM says it freed it.
+        FREE_STATUS.with(|s| s.set(0));
+        alloc_client(&mut be, ctl);
+        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert!(!be.semsurf.owns_client(CLIENT));
     }
 
     #[test]

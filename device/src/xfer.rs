@@ -137,8 +137,12 @@ pub struct KmsFileState {
 
 #[derive(Default)]
 struct KmsInner {
-    prop_names: HashMap<u32, [u8; 32]>,
+    /// Property id -> (name, flags), from GETPROPERTY.
+    prop_names: HashMap<u32, ([u8; 32], u32)>,
 }
+
+/// DRM_MODE_PROP_BLOB (drm_mode.h): the property's value is a blob id.
+const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 
 /// What the KMS files of one VM share: every framebuffer they made and
 /// have not removed, by id, with the file ([`KmsFileState::serial`]) that
@@ -152,9 +156,20 @@ struct KmsInner {
 /// close. A file that is retired never records anything again, so an ADDFB
 /// finishing on it after the close cannot leave an id behind that outlives
 /// the host framebuffer.
+///
+/// And an id stays the VM's framebuffer for as long as a call that checked
+/// it may still hand it to the host: between a scanout call's check and the
+/// end of its ioctl the id is in use ([`FbUses`]), an RMFB or CLOSEFB of it
+/// waits for that before it runs, and the host file that made it closes
+/// only after ([`VmKms::close_after`]). Without that, an id freed on
+/// another executor in between could be the next framebuffer anyone on the
+/// host made -- the kernel hands out the lowest free id -- and the call
+/// would show it (review 2026-09-26, backend 5).
 #[derive(Default)]
 pub struct VmKms {
     inner: Mutex<VmKmsInner>,
+    /// Signalled when a framebuffer stops being in use.
+    idle: std::sync::Condvar,
 }
 
 #[derive(Default)]
@@ -163,7 +178,52 @@ struct VmKmsInner {
     retired: HashSet<u64>,
     /// (card, connector id) -> the last forced probe.
     probed: HashMap<(u32, u32), std::time::Instant>,
+    /// Framebuffer id -> scanout calls between their check of it and the
+    /// end of their ioctl.
+    in_use: HashMap<u32, usize>,
+    /// Property blobs a file of this VM made (CREATEPROPBLOB) and has not
+    /// destroyed, with the file.
+    blobs: HashMap<u32, u64>,
+    /// The blob each blob property of an object a file of this VM can see
+    /// held when the host last said (OBJ_GETPROPERTIES, GETCONNECTOR): (file,
+    /// object, property) -> blob.
+    seen_blobs: HashMap<(u64, u32, u32), u32>,
+    /// Host files whose framebuffers a call in flight still names, with
+    /// those ids: closed once none is in use.
+    parked: Vec<(Vec<u32>, Box<dyn Send>)>,
 }
+
+/// How long an RMFB or CLOSEFB waits for calls in flight that named its
+/// framebuffer. They looked it up in the kernel at their very start, and
+/// from then on hold it by reference, so this is only ever the time between
+/// the check and the ioctl; past it the removal goes ahead, and says so.
+const FB_IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The framebuffer ids a call named as scanout sources and was allowed,
+/// in use until it is dropped (after the call's ioctl).
+#[derive(Default)]
+pub struct FbUses {
+    vm: Option<Arc<VmKms>>,
+    ids: Vec<u32>,
+}
+
+impl FbUses {
+    fn release(&mut self) {
+        if let Some(vm) = self.vm.take() {
+            vm.release(&std::mem::take(&mut self.ids));
+        }
+    }
+}
+
+impl Drop for FbUses {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// How many connectors' last probe the VM keeps (see
+/// [`VmKms::may_probe`]): far more than a host has.
+pub const PROBES_KEPT: usize = 256;
 
 /// How often the VM may have the host probe one connector (GETCONNECTOR
 /// with count_modes 0); see `Prepared::limit_forced_probe`.
@@ -185,24 +245,141 @@ impl VmKms {
     }
 
     /// Forget every record: the session is gone, and with it every file.
+    /// What is in use stays counted, and parked files parked, until the
+    /// calls still running from before let go.
     pub fn clear(&self) {
         let mut v = self.lock();
         v.owner.clear();
         v.retired.clear();
         v.probed.clear();
+        v.blobs.clear();
+        v.seen_blobs.clear();
+    }
+
+    /// Whether GETPROPBLOB may read blob `id`: one a file of this VM made,
+    /// or the value of a blob property of an object a file of this VM can
+    /// see, as the host last reported it. Blob ids are the device's and a
+    /// lease does not cover blobs (drm_mode_object_lease_required): read by
+    /// number, any other VM's MODE_ID and damage clips, and the host
+    /// desktop's, were the guest's to read (review 2026-09-26, backend 12).
+    pub fn blob_readable(&self, id: u32) -> bool {
+        let v = self.lock();
+        v.blobs.contains_key(&id) || v.seen_blobs.values().any(|&b| b == id)
+    }
+
+    /// `id`, named as a scanout source by a call about to run: whether some
+    /// file of this VM made it (0, none, always passes); if so it is in use
+    /// in `uses` from now until `uses` is dropped.
+    fn claim(self: &Arc<Self>, id: u32, uses: &mut FbUses) -> bool {
+        if id == 0 {
+            return true;
+        }
+        let mut v = self.lock();
+        if !v.owner.contains_key(&id) {
+            return false;
+        }
+        *v.in_use.entry(id).or_insert(0) += 1;
+        drop(v);
+        uses.vm.get_or_insert_with(|| self.clone());
+        uses.ids.push(id);
+        true
+    }
+
+    fn release(&self, ids: &[u32]) {
+        let ready = {
+            let mut v = self.lock();
+            for id in ids {
+                if let Some(n) = v.in_use.get_mut(id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        v.in_use.remove(id);
+                    }
+                }
+            }
+            let parked = std::mem::take(&mut v.parked);
+            let (ready, still): (Vec<_>, Vec<_>) = parked
+                .into_iter()
+                .partition(|(ids, _)| ids.iter().all(|i| !v.in_use.contains_key(i)));
+            v.parked = still;
+            ready
+        };
+        self.idle.notify_all();
+        for (_, item) in ready {
+            crate::closer::close(item);
+        }
+    }
+
+    /// Close `file` -- a host KMS file of this VM, whose framebuffers `fbs`
+    /// the backend has just stopped counting as the VM's -- on the closer
+    /// thread, once no call in flight names any of them.
+    pub fn close_after(&self, fbs: Vec<u32>, file: Box<dyn Send>) {
+        let mut v = self.lock();
+        let busy: Vec<u32> = fbs
+            .into_iter()
+            .filter(|id| v.in_use.contains_key(id))
+            .collect();
+        if busy.is_empty() {
+            drop(v);
+            crate::closer::close(file);
+            return;
+        }
+        log::debug!("a KMS file closes once no call in flight names framebuffers {busy:?}");
+        v.parked.push((busy, file));
+    }
+
+    /// Wait, at most [`FB_IN_USE_WAIT`], until no call in flight names
+    /// `id`.
+    fn wait_unused(&self, id: u32) {
+        let v = self.lock();
+        let (v, t) = self
+            .idle
+            .wait_timeout_while(v, FB_IN_USE_WAIT, |v| v.in_use.contains_key(&id))
+            .unwrap_or_else(|e| e.into_inner());
+        drop(v);
+        if t.timed_out() {
+            log::warn!(
+                "framebuffer {id}: a call that named it is still running after {:?}; removed \
+                 anyway",
+                FB_IN_USE_WAIT
+            );
+        }
     }
 
     /// Whether connector `connector` of card `card` may be probed at `now`
     /// (and if so, that it was): once per [`CONNECTOR_PROBE_EVERY`] across
     /// every file of the VM, since connector ids are the device's.
+    ///
+    /// The id is the guest's: the host's refusal takes the record back
+    /// ([`VmKms::probe_refused`]), so only connectors the host serves stay
+    /// recorded, and past [`PROBES_KEPT`] records the ones older than the
+    /// window, which say nothing, go first (review 2026-09-26, backend 6).
     pub fn may_probe(&self, card: u32, connector: u32, now: std::time::Instant) -> bool {
         let mut v = self.lock();
+        if v.probed.len() >= PROBES_KEPT && !v.probed.contains_key(&(card, connector)) {
+            v.probed
+                .retain(|_, &mut t| now.saturating_duration_since(t) < CONNECTOR_PROBE_EVERY);
+            if v.probed.len() >= PROBES_KEPT {
+                // As many connectors probed this very window as a host has
+                // no need of: this one is reported, not probed.
+                return false;
+            }
+        }
         let last = v.probed.entry((card, connector)).or_insert(now);
         if *last == now || now.duration_since(*last) >= CONNECTOR_PROBE_EVERY {
             *last = now;
             return true;
         }
         false
+    }
+
+    /// The host refused the probe `may_probe` let through at `at`: no such
+    /// connector, or not one this file may see. Its record goes, unless a
+    /// later probe has made it since.
+    pub fn probe_refused(&self, card: u32, connector: u32, at: std::time::Instant) {
+        let mut v = self.lock();
+        if v.probed.get(&(card, connector)) == Some(&at) {
+            v.probed.remove(&(card, connector));
+        }
     }
 }
 
@@ -240,6 +417,49 @@ impl KmsFileState {
         id == 0 || self.vm.made_here(id)
     }
 
+    /// A CREATEPROPBLOB through this file made blob `id`.
+    fn add_blob(&self, id: u32) {
+        let mut v = self.vm.lock();
+        if !v.retired.contains(&self.serial) {
+            v.blobs.insert(id, self.serial);
+        }
+    }
+
+    /// DESTROYPROPBLOB of `id`, about to run: its records go first, as
+    /// for RMFB (only the file that made a blob may destroy it,
+    /// drm_property.c:880). Whether it was this file's.
+    fn take_blob(&self, id: u32) -> bool {
+        let mut v = self.vm.lock();
+        if v.blobs.get(&id) != Some(&self.serial) {
+            return false;
+        }
+        v.blobs.remove(&id);
+        v.seen_blobs.retain(|_, b| *b != id);
+        true
+    }
+
+    /// What the host reported of object `obj`'s blob properties through
+    /// this file: `(property, blob)`, 0 for none.
+    fn saw_blobs(&self, obj: u32, props: &[(u32, u32)]) {
+        let mut v = self.vm.lock();
+        if v.retired.contains(&self.serial) {
+            return;
+        }
+        for &(prop, blob) in props {
+            if blob == 0 {
+                v.seen_blobs.remove(&(self.serial, obj, prop));
+            } else {
+                v.seen_blobs.insert((self.serial, obj, prop), blob);
+            }
+        }
+    }
+
+    /// `may_scan_out`, for a call about to run: the id is then in use in
+    /// `uses` (see [`VmKms`]).
+    pub fn claim_scan_out(&self, id: u32, uses: &mut FbUses) -> bool {
+        self.vm.claim(id, uses)
+    }
+
     /// Record framebuffer `id` as this file's, unless the file is retired.
     pub fn add_fb(&self, id: u32) {
         let mut v = self.vm.lock();
@@ -248,11 +468,14 @@ impl KmsFileState {
         }
     }
 
-    /// Take `id` out if it is this file's; whether it was.
+    /// Take `id` out if it is this file's, and wait until no call in
+    /// flight names it; whether it was.
     fn take_fb(&self, id: u32) -> bool {
         let mut v = self.vm.lock();
         if v.owner.get(&id) == Some(&self.serial) {
             v.owner.remove(&id);
+            drop(v);
+            self.vm.wait_unused(id);
             true
         } else {
             false
@@ -261,12 +484,24 @@ impl KmsFileState {
 
     /// The backend has let go of this file's handle: none of its
     /// framebuffers is the VM's any more, and nothing it makes from now on
-    /// will be. Idempotent.
-    pub fn retire(&self) {
+    /// will be. Idempotent. Returns the ids it had, for the file's close to
+    /// wait on ([`VmKms::close_after`]).
+    pub fn retire(&self) -> Vec<u32> {
         let mut v = self.vm.lock();
         let me = self.serial;
+        let mine: Vec<u32> = v
+            .owner
+            .iter()
+            .filter(|&(_, s)| *s == me)
+            .map(|(&id, _)| id)
+            .collect();
         v.owner.retain(|_, s| *s != me);
+        // The host destroys a file's blobs as it closes
+        // (drm_property_destroy_user_blobs).
+        v.blobs.retain(|_, s| *s != me);
+        v.seen_blobs.retain(|&(s, _, _), _| s != me);
         v.retired.insert(me);
+        mine
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, KmsInner> {
@@ -404,6 +639,13 @@ pub trait Finisher {
     fn adopt(&mut self, fd: OwnedFd) -> (u32, HandleKind);
     /// Close a handle the guest passed with `I2_FD_CONSUME`.
     fn close_handle(&mut self, handle: u32);
+    /// Whether what the call did may still be recorded: false once the
+    /// file it ran on has closed, or the session it ran in is gone -- a
+    /// record made then would outlive what it describes, or land in a
+    /// session that knows nothing of it (review 2026-09-26, backend 9).
+    fn records(&self) -> bool {
+        true
+    }
 }
 
 // ───────────────────────────── prepared call ─────────────────────────────
@@ -460,6 +702,14 @@ pub struct Prepared {
     /// offsets in prop_values, with the s32 the kernel writes once executed.
     fence_outs: Vec<(usize, Option<BufId>)>,
     kms: Option<Arc<KmsFileState>>,
+    /// The framebuffers this call names as scanout sources, in use from
+    /// their check to the end of the ioctl ([`VmKms`]).
+    fb_uses: FbUses,
+    /// A forced connector probe this call makes: (card, connector, when).
+    probing: Option<(u32, u32, std::time::Instant)>,
+    /// What the call did may be recorded (`Finisher::records`), for the
+    /// hooks.
+    records: bool,
     /// What `Hooks::before` asked `Hooks::at_run` to check again.
     run_gate: Option<u64>,
     /// `Hooks::before` answered the call itself (`answer_locally`): the
@@ -530,6 +780,9 @@ pub fn prepare(
         render_fd: None,
         fence_outs: Vec::new(),
         kms: None,
+        fb_uses: FbUses::default(),
+        probing: None,
+        records: true,
         run_gate: None,
         local: None,
         hooks: env.hooks(),
@@ -577,6 +830,7 @@ impl Prepared {
                 Ok(r) => r,
                 Err(e) => -e,
             };
+            self.fb_uses.release();
         }
         self.ret
     }
@@ -610,11 +864,18 @@ impl Prepared {
         // a record it makes of one (an NVKMS grant file) is then dropped by
         // that handle's close like any other, rather than outliving it.
         let (hooks, ret) = (self.hooks.clone(), self.ret);
+        self.records = f.records();
         hooks.after(&mut self, ret);
         for h in std::mem::take(&mut self.consumed) {
             f.close_handle(h);
         }
         self.response(&fd_recs)
+    }
+
+    /// Whether a hook's `after` may record what the call did
+    /// (`Finisher::records`): its reply may still be rewritten either way.
+    pub fn records(&self) -> bool {
+        self.records
     }
 
     /// The host copy of buffer `i` (0 = the ioctl argument), for policy hooks
@@ -1297,6 +1558,7 @@ impl Prepared {
         }
         self.check_fb_sources()?;
         self.check_props(target_fd)?;
+        let destroying = self.check_blob()?;
         // In the call's arena, which outlives the ioctl.
         self.limit_forced_probe(std::time::Instant::now())?;
         let hooks = self.hooks.clone();
@@ -1311,6 +1573,13 @@ impl Prepared {
         let ret = self
             .arena
             .call(&*sys, target_fd, u64::from(self.entry.cmd), top);
+        // The host has the framebuffers it was named (or refused them).
+        self.fb_uses.release();
+        if let (Some((card, connector, at)), Some(k)) = (self.probing, &self.kms) {
+            if ret < 0 {
+                k.vm.probe_refused(card, connector, at);
+            }
+        }
         drop(gate);
         for h in temps {
             self.gem_close(target_fd, h);
@@ -1321,9 +1590,13 @@ impl Prepared {
             if let (Some(fb), Some(k)) = (removing, &self.kms) {
                 k.add_fb(fb);
             }
+            if let (Some(blob), Some(k)) = (destroying, &self.kms) {
+                k.add_blob(blob);
+            }
             return Ok(ret);
         }
         self.track_fbs(target_fd);
+        self.track_blobs(target_fd);
         self.take_fd_outs(target_fd);
         if let Err(e) = self.gems_out(target_fd) {
             for (_, _, fd) in self.fd_outs.drain(..) {
@@ -1361,14 +1634,17 @@ impl Prepared {
     /// otherwise, before the host sees the call. The kernel reads the id as
     /// a u32 whatever width it travels in (drm_framebuffer_lookup), so that
     /// is what is checked.
-    fn fb_usable(&self, id: u32) -> bool {
-        self.kms.as_ref().map_or(id == 0, |k| k.may_scan_out(id))
+    fn fb_usable(&mut self, id: u32) -> bool {
+        match &self.kms {
+            Some(k) => k.claim_scan_out(id, &mut self.fb_uses),
+            None => id == 0,
+        }
     }
 
     /// The legacy scanout calls' fb_id fields. SETCRTC's -1 keeps the CRTC's
     /// current framebuffer (drm_crtc.c:760), which is one the call's own
     /// CRTC already shows.
-    fn check_fb_sources(&self) -> Result<(), Errno> {
+    fn check_fb_sources(&mut self) -> Result<(), Errno> {
         let Some(off) = Self::fb_source_at(self.entry.name) else {
             return Ok(());
         };
@@ -1419,6 +1695,7 @@ impl Prepared {
             return Ok(());
         };
         if k.vm.may_probe(card, connector, now) {
+            self.probing = Some((card, connector, now));
             return Ok(());
         }
         let scratch = self.arena.block(&[], MODEINFO)?;
@@ -1548,6 +1825,11 @@ impl Prepared {
     /// cached for the file. A property the host does not know is refused: the
     /// host would refuse the call anyway, and "unknown" is not "plain".
     fn prop_name(&self, fd: RawFd, id: u32) -> Result<[u8; 32], Errno> {
+        self.prop_info(fd, id).map(|(name, _)| name)
+    }
+
+    /// Property `id`'s name and flags, as `prop_name`.
+    fn prop_info(&self, fd: RawFd, id: u32) -> Result<([u8; 32], u32), Errno> {
         if let Some(n) = self
             .kms
             .as_ref()
@@ -1567,10 +1849,77 @@ impl Prepared {
             return Err(-r);
         }
         let name: [u8; 32] = a.bytes(top)[24..56].try_into().unwrap();
+        let flags = rd(a.bytes(top), 20, 4) as u32;
         if let Some(k) = &self.kms {
-            k.lock().prop_names.insert(id, name);
+            k.lock().prop_names.insert(id, (name, flags));
         }
-        Ok(name)
+        Ok((name, flags))
+    }
+
+    /// GETPROPBLOB may read only a blob this VM made or can see
+    /// ([`VmKms::blob_readable`]); ENOENT, the host's own answer for a blob
+    /// that is not there, otherwise. DESTROYPROPBLOB takes the blob's
+    /// records before it runs.
+    fn check_blob(&self) -> Result<Option<u32>, Errno> {
+        let id = || rd(self.bytes(0), 0, 4) as u32;
+        match self.entry.name {
+            "GETPROPBLOB" => {
+                let id = id();
+                if self.kms.as_ref().is_some_and(|k| k.vm.blob_readable(id)) {
+                    return Ok(None);
+                }
+                log::warn!(
+                    "GETPROPBLOB on handle {} of blob {id}, which no file of this VM made or \
+                     can see; refused",
+                    self.target
+                );
+                Err(libc::ENOENT)
+            }
+            "DESTROYPROPBLOB" => {
+                let id = id();
+                Ok(self.kms.as_ref().filter(|k| k.take_blob(id)).map(|_| id))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// After a successful call: the blob CREATEPROPBLOB made, and the blob
+    /// properties OBJ_GETPROPERTIES or GETCONNECTOR reported.
+    fn track_blobs(&mut self, target_fd: RawFd) {
+        let Some(k) = self.kms.clone() else { return };
+        // (count_props, object id, props_ptr, prop_values_ptr).
+        let (count, obj, props, values) = match self.entry.name {
+            "CREATEPROPBLOB" => {
+                // drm_mode_create_blob.blob_id @12.
+                k.add_blob(rd(self.bytes(0), 12, 4) as u32);
+                return;
+            }
+            // drm_mode_obj_get_properties.
+            "OBJ_GETPROPERTIES" => (16, 20, 0, 8),
+            // drm_mode_get_connector.
+            "GETCONNECTOR" => (36, 48, 16, 24),
+            _ => return,
+        };
+        let arg = self.bytes(0);
+        let (n, obj) = (rd(arg, count, 4) as usize, rd(arg, obj, 4) as u32);
+        let (Some(pb), Some(vb)) = (self.pointee(0, props), self.pointee(0, values)) else {
+            return;
+        };
+        let (ids, vals) = (self.bytes(pb).to_vec(), self.bytes(vb).to_vec());
+        // As many as the host wrote: the count it returns, as far as both
+        // arrays reach.
+        let n = n.min(ids.len() / 4).min(vals.len() / 8);
+        let mut blobs = Vec::new();
+        for i in 0..n {
+            let prop = rd(&ids, 4 * i, 4) as u32;
+            match self.prop_info(target_fd, prop) {
+                Ok((_, flags)) if flags & DRM_MODE_PROP_BLOB != 0 => {
+                    blobs.push((prop, rd(&vals, 8 * i, 8) as u32));
+                }
+                _ => {}
+            }
+        }
+        k.saw_blobs(obj, &blobs);
     }
 
     /// Put every GEM_IN object into the target file, validate it, and write
@@ -2023,6 +2372,8 @@ mod tests {
         dmabufs: HashMap<RawFd, u64>,
         next_fd: RawFd,
         props: HashMap<u32, &'static str>,
+        /// GETPROPERTY's flags, by property (0 if absent).
+        prop_flags: HashMap<u32, u32>,
         log: Vec<String>,
     }
 
@@ -2045,9 +2396,14 @@ mod tests {
         }
     }
 
+    type Pre = Arc<dyn Fn(u32) + Send + Sync>;
+
     struct FakeSys {
         k: Mutex<Kernel>,
         main: Mutex<Main>,
+        /// Run first, holding nothing, on every ioctl: where a test holds a
+        /// call inside the host while another runs.
+        pre: Mutex<Option<Pre>>,
     }
 
     impl FakeSys {
@@ -2058,7 +2414,12 @@ mod tests {
                     ..Kernel::default()
                 }),
                 main: Mutex::new(Box::new(|_, _, _, _| 0)),
+                pre: Mutex::new(None),
             })
+        }
+
+        fn before_ioctl(&self, f: impl Fn(u32) + Send + Sync + 'static) {
+            *self.pre.lock().unwrap() = Some(Arc::new(f));
         }
 
         fn on_ioctl(
@@ -2080,6 +2441,10 @@ mod tests {
     impl crate::sys::block::Kernel for FakeSys {
         fn ioctl(&self, fd: RawFd, cmd: u64, arg: &mut Arg<'_>) -> i32 {
             let cmd = cmd as u32;
+            let pre = self.pre.lock().unwrap().clone();
+            if let Some(pre) = pre {
+                pre(cmd);
+            }
             let mut k = self.k();
             let Some(&file) = k.files.get(&fd) else {
                 return -libc::EBADF;
@@ -2137,6 +2502,8 @@ mod tests {
                             return -libc::ENOENT;
                         };
                         arg.bytes()[24..24 + name.len()].copy_from_slice(name.as_bytes());
+                        let flags = k.prop_flags.get(&id).copied().unwrap_or(0);
+                        arg.bytes()[20..24].copy_from_slice(&flags.to_le_bytes());
                         0
                     }
                     _ => {
@@ -3382,6 +3749,193 @@ mod tests {
         assert!(!k.may_scan_out(42));
     }
 
+    /// A PAGE_FLIP of the owner's framebuffer, on another file, held in the
+    /// host after its check; the file whose framebuffer it is, and a guard
+    /// that lets it go on.
+    struct InFlight {
+        owner: Arc<KmsFileState>,
+        vm: Arc<VmKms>,
+        go: std::sync::mpsc::Sender<()>,
+        flip: std::thread::JoinHandle<i32>,
+    }
+
+    fn flip_in_flight(h: &mut H, fb: u32) -> InFlight {
+        let vm = Arc::new(VmKms::new());
+        let owner = Arc::new(KmsFileState::in_vm(vm.clone()));
+        owner.add_fb(fb);
+        h.kms = Some(Arc::new(KmsFileState::in_vm(vm.clone())));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let flip = iowr(0xb0, 24);
+        h.sys.before_ioctl(move |cmd| {
+            if cmd == flip {
+                entered_tx.send(()).unwrap();
+                let _ = go_rx.lock().unwrap().recv();
+            }
+        });
+        let mut p = h.prepare(SchemaClass::Kms, KMS, &page_flip(fb)).unwrap();
+        let fd = h.target_fds[&KMS].as_raw_fd();
+        let flip = std::thread::spawn(move || p.execute(fd));
+        entered_rx.recv().unwrap();
+        InFlight {
+            owner,
+            vm,
+            go,
+            flip,
+        }
+    }
+
+    /// S-6's check and the host's lookup are not one step: an RMFB of the
+    /// same id on another executor in between freed it, and the kernel
+    /// hands the lowest free id to the next framebuffer anyone on the host
+    /// makes -- which the flip would then show. The RMFB now waits for the
+    /// flip (review 2026-09-26, backend 5).
+    #[test]
+    fn a_framebuffer_a_call_in_flight_named_is_not_removed_under_it() {
+        let mut h = h();
+        let f = flip_in_flight(&mut h, 42);
+        let owner = H {
+            sys: h.sys.clone(),
+            hooks: h.hooks.clone(),
+            kms: Some(f.owner.clone()),
+            version: None,
+            target_fds: HashMap::new(),
+        };
+        let rmfb = Rq::new(iowr(0xaf, 4)).buf(4, Some(&[42, 0, 0, 0]));
+        let mut p = owner.prepare(SchemaClass::Kms, OTHER_KMS, &rmfb).unwrap();
+        let fd = h.target_fds[&OTHER_KMS].as_raw_fd();
+        let rm = std::thread::spawn(move || p.execute(fd));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let removed = format!("ioctl {OTHER_KMS} {:#x}", iowr(0xaf, 4));
+        assert!(
+            !h.sys.log().contains(&removed),
+            "the RMFB waits while the flip that named 42 runs"
+        );
+        assert!(!f.vm.made_here(42), "and nothing new may name it meanwhile");
+        f.go.send(()).unwrap();
+        assert_eq!(f.flip.join().unwrap(), 0);
+        assert_eq!(rm.join().unwrap(), 0);
+        assert!(h.sys.log().contains(&removed));
+    }
+
+    /// The same for the close of the file that made it: the host frees a
+    /// file's framebuffers when it closes, so the file closes only once the
+    /// flip is done.
+    #[test]
+    fn the_file_that_made_a_framebuffer_a_call_in_flight_named_closes_after_it() {
+        struct Closed(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Closed {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut h = h();
+        let f = flip_in_flight(&mut h, 42);
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fbs = f.owner.retire();
+        assert_eq!(fbs, vec![42]);
+        f.vm.close_after(fbs, Box::new(Closed(closed.clone())));
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst), "parked");
+        f.go.send(()).unwrap();
+        f.flip.join().unwrap();
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+        // A file whose framebuffers nothing names closes at once.
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        f.vm.close_after(vec![42], Box::new(Closed(closed.clone())));
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ── property blobs (review 2026-09-26, backend 12) ──
+
+    fn getpropblob(id: u32) -> Rq {
+        Rq::new(iowr(0xac, 16)).buf(16, Some(&arg(16, &[(0, 4, id as u64)])))
+    }
+
+    fn obj_getproperties(obj: u32, count: u32) -> Rq {
+        let a = arg(
+            32,
+            &[
+                (0, 8, 0x100),
+                (8, 8, 0x200),
+                (16, 4, count as u64),
+                (20, 4, obj as u64),
+            ],
+        );
+        Rq::new(iowr(0xb9, 32))
+            .buf(32, Some(&a))
+            .buf(4 * count, None)
+            .buf(8 * count, None)
+    }
+
+    /// Blob ids are the device's and a lease does not cover them: any other
+    /// VM's MODE_ID or damage clips, or the host desktop's, read by number.
+    /// A blob is readable when this VM made it, or the host reported it as
+    /// the value of a blob property of an object this VM sees -- what
+    /// drm_info and modetest read, MODE_ID of their own CRTC.
+    #[test]
+    fn getpropblob_reads_only_blobs_this_vm_made_or_sees() {
+        let h = h();
+        {
+            let mut k = h.sys.k();
+            k.props.insert(20, "MODE_ID");
+            k.prop_flags.insert(20, DRM_MODE_PROP_BLOB);
+            k.props.insert(21, "ACTIVE");
+        }
+        let blob_read = |h: &H, id| {
+            h.sys.log();
+            let r = h.kms(&getpropblob(id)).unwrap().ret;
+            (r, reached_host(h))
+        };
+        assert_eq!(blob_read(&h, 66), (-libc::ENOENT, false), "another tenant's");
+
+        // OBJ_GETPROPERTIES of our CRTC 5: MODE_ID is blob 66, ACTIVE is 67.
+        h.sys.on_ioctl(|_, _, cmd, arg| {
+            let top = arg.addr();
+            match cmd & 0xff {
+                0xb9 => {
+                    let (ids, vals) = (peek(arg, top, 0, 8), peek(arg, top, 8, 8));
+                    for (i, (p, v)) in [(20u64, 66u64), (21, 67)].into_iter().enumerate() {
+                        arg.poke(ids + 4 * i as u64, 4, p);
+                        arg.poke(vals + 8 * i as u64, 8, v);
+                    }
+                    poke(arg, top, 16, 4, 2);
+                    0
+                }
+                // CREATEPROPBLOB: blob 70.
+                0xbd => {
+                    poke(arg, top, 12, 4, 70);
+                    0
+                }
+                _ => 0,
+            }
+        });
+        assert_eq!(h.kms(&obj_getproperties(5, 2)).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 66), (0, true), "MODE_ID of our own CRTC");
+        assert_eq!(
+            blob_read(&h, 67),
+            (-libc::ENOENT, false),
+            "a value of a property that is no blob"
+        );
+
+        // One of our own, until it is destroyed.
+        let data = [7u8; 8];
+        let create = Rq::new(iowr(0xbd, 16))
+            .buf(16, Some(&arg(16, &[(0, 8, 0x100), (8, 4, 8)])))
+            .buf(8, Some(&data));
+        assert_eq!(h.kms(&create).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 70), (0, true));
+        let destroy = Rq::new(iowr(0xbe, 4)).buf(4, Some(&70u32.to_le_bytes()));
+        assert_eq!(h.kms(&destroy).unwrap().ret, 0);
+        assert_eq!(blob_read(&h, 70), (-libc::ENOENT, false));
+        // And what a file made or saw goes with it.
+        h.kms.as_ref().unwrap().retire();
+        assert!(!h.kms.as_ref().unwrap().vm.blob_readable(66));
+    }
+
     // ── forced connector probes (S-8) ──
 
     fn getconnector(connector: u32) -> Rq {
@@ -3430,6 +3984,34 @@ mod tests {
             "another card's connector 7 is another"
         );
         assert!(vm.may_probe(0, 7, t0 + CONNECTOR_PROBE_EVERY));
+    }
+
+    /// Connector ids are the guest's: every GETCONNECTOR of a made-up one
+    /// used to leave a record behind, and the map grew without bound. A
+    /// probe the host refuses keeps none, and the records are bounded.
+    #[test]
+    fn a_probe_of_a_connector_the_host_refuses_leaves_no_record() {
+        let h = h();
+        h.sys.on_ioctl(|_, _, _, arg| {
+            let top = arg.addr();
+            if peek(arg, top, 48, 4) == 7 { 0 } else { -libc::ENOENT }
+        });
+        for c in 1000..1100 {
+            assert_eq!(h.kms(&getconnector(c)).unwrap().ret, -libc::ENOENT);
+        }
+        assert_eq!(h.kms(&getconnector(7)).unwrap().ret, 0);
+        let vm = &h.kms.as_ref().unwrap().vm;
+        assert_eq!(vm.lock().probed.len(), 1, "only the connector the host served");
+
+        let vm = VmKms::new();
+        let t0 = std::time::Instant::now();
+        for c in 0..PROBES_KEPT as u32 {
+            assert!(vm.may_probe(0, c, t0));
+        }
+        assert!(!vm.may_probe(0, 9999, t0), "full of this window's probes");
+        let later = t0 + CONNECTOR_PROBE_EVERY;
+        assert!(vm.may_probe(0, 9999, later), "the stale ones make room");
+        assert_eq!(vm.lock().probed.len(), 1);
     }
 
     // ── NVKMS ──
