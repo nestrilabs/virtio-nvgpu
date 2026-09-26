@@ -12,6 +12,8 @@
 #                     full build puts the nix-built ones back, identical)
 #   --module PATH     the guest module to install (default .rig/kernel/nvgpu.ko)
 #   --out PATH        the image (default .rig/guest/rootfs.ext4)
+#   NVGPU_RIG=DIR     the rig directory (default the repo's .rig), as for
+#                     scripts/run-guest.sh
 #   --headroom MIB    free space in the image beyond its contents (default 1024)
 #   --keep-staging    leave .rig/guest/staging after a full build
 #
@@ -34,7 +36,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-RIG="$REPO/.rig"
+RIG="${NVGPU_RIG:-$REPO/.rig}"
 G="$RIG/guest"
 LOGDIR="$RIG/logs/guest-image"
 
