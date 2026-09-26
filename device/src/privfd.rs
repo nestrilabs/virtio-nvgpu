@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Descriptors the backend holds for itself, as opposed to on a guest's behalf.
 //!
 //! An IOCTL2 can make the host kernel hand back a descriptor (CREATE_LEASE's

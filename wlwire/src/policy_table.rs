@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The hand-written half of the proxy's knowledge: which globals a guest may
 //! see, and what every descriptor they can carry is.
 //!

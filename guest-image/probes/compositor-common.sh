@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # shellcheck shell=bash
 # A guest compositor on a guest card node, for compositor.sh and export.sh:
 # sway (default) or Hyprland (nvgpu_comp=hyprland, what TESTING.md stage 6

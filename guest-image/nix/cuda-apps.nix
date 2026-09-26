@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # nvgpu-nbody (../apps/cuda): a CUDA runtime program for the application
 # pass, built with nvcc for the rig's card (sm_120, plus PTX). Only nvcc and
 # the CUDA runtime: NVIDIA's samples and saxpy need cuBLAS, cuFFT, cuSPARSE and

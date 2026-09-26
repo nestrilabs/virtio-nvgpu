@@ -1,4 +1,5 @@
-// crates/abi/src/ioctl.rs
+// SPDX-License-Identifier: Apache-2.0
+// gen/src/ioctl.rs
 //
 // NV_ESC_* ioctl number constants and helpers.
 //

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Netlink: the kernel's uevent broadcast (kms.rs's hotplug listener).
 
 use std::io;

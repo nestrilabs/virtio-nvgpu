@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # NixOS module: run Hyprland with virtio-nvgpu's DRM-lease patches (a `leasable` monitor rule), linked against a
 # patched aquamarine.
 #

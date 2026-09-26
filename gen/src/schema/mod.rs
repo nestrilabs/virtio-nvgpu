@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The IOCTL2 schema: for every ioctl a guest may run through IOCTL2, what
 //! its argument points at and where its descriptors and GEM handles are.
 //!

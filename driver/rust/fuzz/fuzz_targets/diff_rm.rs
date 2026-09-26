@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! RM escapes, UVM and v1 NVKMS commands: the C and the Rust must agree on a
 //! scenario the fuzzer's bytes lay out.
 #![no_main]

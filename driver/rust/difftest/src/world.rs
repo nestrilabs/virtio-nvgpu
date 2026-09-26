@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The world both implementations run in: the caller's memory, its
 //! descriptor table, the backend, the hooks, pinning -- and a log of every
 //! effect either has on it, which is what the test compares.

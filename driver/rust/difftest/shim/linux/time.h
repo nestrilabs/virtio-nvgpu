@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef DIFFTEST_LINUX_TIME_H
 #define DIFFTEST_LINUX_TIME_H
 #include <time.h>

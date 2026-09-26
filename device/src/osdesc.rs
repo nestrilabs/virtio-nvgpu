@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Memory the guest already has, registered with RM by its guest-physical
 //! pages.
 //!

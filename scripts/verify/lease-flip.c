@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * lease-flip.c -- light up a leased connector and measure flip pacing.
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Wire structs as bytes and back.
 //!
 //! The protocol's messages (protocol::messages) and the virtio config space

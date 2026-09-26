@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build lease-flip if needed, then light up a leased output and measure flip
 # pacing. Run inside the guest.
 #

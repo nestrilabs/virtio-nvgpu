@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What the guest driver expects to find on the bus.
 //!
 //! Every constant and layout here is a contract with `driver/nvgpu_wire.h`,

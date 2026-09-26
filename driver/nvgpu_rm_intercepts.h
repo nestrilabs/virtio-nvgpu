@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * nvgpu_rm_intercepts.h — RM_CONTROL commands intercepted in the guest
  *

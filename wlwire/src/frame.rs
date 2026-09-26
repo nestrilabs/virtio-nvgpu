@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The frame format of the Wayland channel: what a WL_SEND request and a
 //! WL_RECV response carry after their `MsgHeader`, and what `/dev/nvgpu-wl`
 //! SEND/RECV take from and give to the guest daemon.

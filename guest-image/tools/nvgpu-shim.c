@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * libnvgpu-shim.so -- LD_PRELOAD glue so stock KMS tools can drive a lease.
  *

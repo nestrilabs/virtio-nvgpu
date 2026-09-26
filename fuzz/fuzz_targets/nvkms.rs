@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The NVKMS policy on v1 messages (device/src/nvkms.rs).
 #![no_main]
 

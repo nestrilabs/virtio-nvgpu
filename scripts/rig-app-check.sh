@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Run the guest's application pass (guest-image/probes/apps.sh) against a
 # host compositor, and do the host's half of it: find each app's window,
 # capture it, and (headless sway only) type, click and copy into it.

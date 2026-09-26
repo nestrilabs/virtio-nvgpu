@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Is this host ready to run the rig? Checks what an unprivileged
 # scripts/run-guest.sh needs, one line each:
 #

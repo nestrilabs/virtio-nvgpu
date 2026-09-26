@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Wire constants (`driver/nvgpu_wire.h`), errno values, and little-endian
 //! field access that cannot panic.
 

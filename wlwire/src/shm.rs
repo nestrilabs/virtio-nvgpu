@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `wl_shm`, stage 1: the server's side owns a memfd per pool, and the
 //! client's side copies into it at every commit that shows a buffer.
 //!

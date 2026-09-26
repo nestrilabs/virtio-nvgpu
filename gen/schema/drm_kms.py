@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """DRM core KMS ioctls, run on a host card node or lease (class KMS).
 
 Layouts and fill rules are Linux 7.2.7's (include/uapi/drm/drm.h,

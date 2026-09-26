@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A buffer the host driver writes into, with a guard page behind it.
 //!
 //! Two buffers in the forwarding path are handed to the NVIDIA driver as a

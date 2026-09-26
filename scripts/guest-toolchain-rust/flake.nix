@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 {
   # The guest kernel's toolchain with Rust: the pinned C toolchain the rig's
   # guest kernel is built with (.rig/kernel/toolchain, the same nixpkgs), plus

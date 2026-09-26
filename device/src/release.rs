@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Which tables a host driver release gets, and whether each was measured
 //! at it.
 //!

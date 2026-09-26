@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Fail if `unsafe`, or anything that makes a raw address, appears outside the
 # modules allowed to hold it -- the `sys` module of each crate:
 #

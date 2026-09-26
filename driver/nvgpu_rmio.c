@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * The protocol-v1 IOCTL message, in C: RM escapes (flat ones, RM_CONTROL with
  * its nested block, intercepts and deep pointers, RM_ALLOC, IDLE_CHANNELS),

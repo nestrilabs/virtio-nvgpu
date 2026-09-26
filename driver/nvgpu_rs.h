@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The narrow ABI between the module's C and its Rust parsers (NVGPU_RUST=1).
  *

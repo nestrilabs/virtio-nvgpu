@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * gl-then-vk -- a GL context, then a Vulkan device in the same process, then
  * GL again. Chromium's GPU process does exactly this when chrome://gpu asks

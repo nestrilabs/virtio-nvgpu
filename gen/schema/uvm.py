@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """UVM parameter blocks, one table per range of host driver releases.
 
 Not IOCTL2 schema: nvidia-uvm's parameters are flat (the commands that

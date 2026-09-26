@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What this host's NVIDIA driver looks like, as the guest needs to be told.
 //!
 //! The guest driver reads a version string and a GPU table out of config

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * vk-acquire-display -- the VK_EXT_acquire_drm_display path, end to end.
  *

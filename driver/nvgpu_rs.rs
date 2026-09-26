@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 
 //! virtio-gpu-nv's untrusted-input parsers, in Rust (`NVGPU_RUST=1`).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The protocol-v1 IOCTL message: RM escapes (flat ones, RM_CONTROL with its
 //! nested block, its intercepts and deep pointers, RM_ALLOC, IDLE_CHANNELS),
 //! ioctls carrying a descriptor at a fixed offset, and a v1 backend's NVKMS

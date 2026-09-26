@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The Rust core alone on raw bytes (debug assertions on, so an arithmetic
 //! overflow is a crash here even where the kernel build would wrap): an
 //! ioctl number, an argument and up to eight more regions of memory at

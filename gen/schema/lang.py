@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """The ioctl schema language both IOCTL2 interpreters are generated from.
 
 An entry describes one ioctl completely enough for a party that trusts none

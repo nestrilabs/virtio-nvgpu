@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * nvgpu-poweroff -- end the VM from PID 1 without an init system.
  *

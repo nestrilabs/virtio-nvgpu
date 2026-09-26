@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Wayland proxy's shared half: the codec generated from protocol XML, the
 //! allowlist and descriptor policy it is checked against at build time, the
 //! frame format of the guest↔host channel, and the translation engine both

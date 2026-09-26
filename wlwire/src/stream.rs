@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pipes, as credit-controlled byte streams.
 //!
 //! Every pipe in the allowed protocols is a write end handed to a peer that

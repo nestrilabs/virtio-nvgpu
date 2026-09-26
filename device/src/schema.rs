@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Runtime types for the ioctl schemas both halves share (protocol v2).
 //!
 //! The tables themselves are generated from `gen/schema/` into

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The guest module's untrusted-input parsers, as a host crate.
 //!
 //! Everything in [`guest`] is also compiled into the guest kernel module

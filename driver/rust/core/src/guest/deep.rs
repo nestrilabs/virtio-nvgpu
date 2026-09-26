@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Deep segments: several pointers of one RM parameter block, each sent with
 //! what it addresses (`NVGPU_DEEP_SEGMENTED`, `nvgpu_wire.h`).
 //!

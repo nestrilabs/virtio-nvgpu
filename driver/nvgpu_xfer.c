@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: the transport -- request contexts on the control queue,
  * transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, and

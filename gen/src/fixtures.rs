@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Checking generated tables against a real driver.
 //!
 //! `gen/fixtures/*.tsv` records the ioctl parameter sizes actually observed on

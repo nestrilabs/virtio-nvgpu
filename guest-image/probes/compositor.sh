@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 6: compositor-VM mode. The guest drives the host card
 # directly. Launch with --kms-card, and no compositor on the host card.
 #   nvgpu_card=PATH          the guest card node (default: the first /dev/dri/card*)

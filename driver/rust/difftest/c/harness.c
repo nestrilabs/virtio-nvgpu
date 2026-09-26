@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * The kernel around the module's C parsers, for the differential test: every
  * service nvgpu_i2.c and nvgpu_rmio.c call (the caller's memory, allocation,

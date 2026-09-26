@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The IOCTL2 schema, as the guest's tables lay it out.
 //!
 //! The tables are C (`driver/gen/nvgpu_schema.h`, generated with the

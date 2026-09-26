@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 4 (and stage 9's lease round trip): the host compositor
 # leases an output; the guest takes the lease through nvgpu-wl-guest with
 # nvgpu-lease and drives it with ordinary KMS. Launch with --wayland-socket

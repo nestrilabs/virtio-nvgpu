@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """NVKMS commands (class MODESET), one table per host driver release.
 
 The ioctl itself is always NVKMS_IOCTL_IOWR, _IOWR('m', 0, 16), whose

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The backend's parsers one at a time, each against what it promises.
 //!
 //! The first byte picks the parser; the rest is its input. Where a parser

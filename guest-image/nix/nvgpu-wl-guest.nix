@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # The guest Wayland daemon, from this repo's workspace.
 #
 # nvgpuSrc is the filtered copy mkimage.sh stages (Cargo.toml, Cargo.lock and

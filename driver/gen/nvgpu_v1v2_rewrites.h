@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * nvgpu_v1v2_rewrites.h — auto-generated from NVIDIA driver 595.58.03
  *

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: NVIDIA GPU ioctl proxy for libkrun VMs.
  *

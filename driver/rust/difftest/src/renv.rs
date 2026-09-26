@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The Rust side: the core's traits implemented over the same world the C
 //! harness serves, doing what `driver/nvgpu_rs.rs` and `nvgpu_rs_glue.c` do
 //! in the kernel. The module's own tables (deep controls, V1V2 rewrites,

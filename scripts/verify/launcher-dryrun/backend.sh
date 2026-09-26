@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Stand-in for vhost-user-nvgpu: binds the socket it is given and waits, or,
 # with DRY_ATTACK=1, puts a symlink to a root-owned socket there instead -- what
 # a compromised backend user could do in a directory it owns.

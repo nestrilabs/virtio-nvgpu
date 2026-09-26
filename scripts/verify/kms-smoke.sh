@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # modetest smoke for a guest KMS device: enumerate, then drive it. Use it in
 # compositor-VM mode (--kms-card, a guest card node) or on an adopted lease fd's
 # device path. It leans on libdrm's `modetest`; get it with

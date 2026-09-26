@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Which host files a guest needs in order to drive the forwarded GPU.
 //!
 //! The guest runs NVIDIA's real user-mode libraries, and those libraries must

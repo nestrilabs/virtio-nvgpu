@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Stage the host's NVIDIA user-mode driver for a guest to mount.
 //!
 //! A guest image must not carry its own copy of the driver userspace: the

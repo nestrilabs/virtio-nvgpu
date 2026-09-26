@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The IOCTL2 schema: what an ioctl's argument points at, and where its
  * descriptors and GEM handles are, for the guest's interpreter (nvgpu_i2.c).

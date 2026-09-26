@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # shellcheck shell=bash
 # Shared by every probe. Source it; do not run it.
 #

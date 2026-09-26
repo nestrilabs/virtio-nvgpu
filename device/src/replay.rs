@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Replaying real mapping lifetimes against the SHM allocator.
 //!
 //! `device/fixtures/mapping-replay.tsv` is the sequence of

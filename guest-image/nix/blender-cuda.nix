@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Blender with Cycles' CUDA and OptiX devices, for the application pass's
 # compute slot (apps.sh blendercuda). nixpkgs' cached blender has neither:
 # its cudaSupport switch also rebuilds OpenSubdiv, OpenImageDenoise and

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Shared helpers for the verify scripts: finding a C toolchain and libdrm's
 # headers, whether we are on a dev box with nix or inside a guest with a plain
 # toolchain. Source it; do not run it.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build the rig's host-side helpers into .rig/bin (vptr: a persistent virtual
 # pointer for the headless compositor).
 set -euo pipefail

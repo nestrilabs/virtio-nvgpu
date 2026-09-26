@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The control queue as the guest can write it: descriptor table, available
 //! ring and every buffer, all bytes of the input, walked by `virtio-queue`
 //! and taken apart by `vring.rs` exactly as the vhost-user transport's

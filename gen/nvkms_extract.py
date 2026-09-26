@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Extract the NVKMS and nvidia-drm ioctl layouts of NVIDIA driver releases.
 
 /dev/nvidia-modeset takes one ioctl whose argument names a command and a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IOCTL2: the C interpreter and the Rust one must agree on a call the
 //! fuzzer's bytes lay out by the schema.
 #![no_main]

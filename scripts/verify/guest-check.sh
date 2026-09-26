@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # The first thing to run inside a guest: is the transport up, are the nodes
 # there, and do the driver's own libraries advertise the extensions the display
 # paths need? It changes nothing and drives no display, so it is safe to run any

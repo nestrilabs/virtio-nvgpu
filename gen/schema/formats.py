@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pixel formats with more than one plane, and how many.
 
 POL_FB_PLANES needs the plane count of an ADDFB2 pixel_format to know which

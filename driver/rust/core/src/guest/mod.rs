@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The parsers, shared by the host crate and the kernel module.
 //!
 //! Every function here takes bytes that were copied out of the caller once

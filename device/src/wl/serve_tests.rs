@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Wayland channel through the dispatcher: OPEN(DEV_WAYLAND), WL_SEND,
 //! WL_RECV and CLOSE as the guest kernel sends them, served by
 //! `NvidiaBackend::serve` against a fake compositor on a real socket.

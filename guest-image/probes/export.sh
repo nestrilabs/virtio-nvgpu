@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 7, the guest side: a compositor on the guest card (compositor-VM
 # mode) and nvgpu-wl-guest --export carrying host clients to it. Launch with
 # --kms-card --wayland-export /path/sock, then on the host, while this runs:

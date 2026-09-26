@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The dispatcher's half of the Wayland channel: `OPEN(DEV_WAYLAND)`,
 //! `WL_SEND`, `WL_RECV` and the end of a channel, over the session's handle
 //! table (DESIGN §7).

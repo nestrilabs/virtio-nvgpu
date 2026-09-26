@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The guest daemon's event loop: one thread, one epoll set.
 //!
 //! Normal mode: guest applications connect to our socket

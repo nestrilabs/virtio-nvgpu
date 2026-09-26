@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The IOCTL2 hooks, written once and run by both implementations: what
 //! nvgpu_kms.c, nvgpu_fence.c and nvgpu_nvkms.c do, reduced to answers that
 //! are a function of their arguments and a seed, including the ones that

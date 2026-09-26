@@ -1,4 +1,5 @@
-// crates/device/src/lib.rs
+// SPDX-License-Identifier: Apache-2.0
+// device/src/lib.rs
 //
 // VMM backend for virtio-gpu-nv.
 //

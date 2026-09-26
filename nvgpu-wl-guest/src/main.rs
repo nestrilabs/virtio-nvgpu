@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! nvgpu-wl-guest [--socket NAME|PATH] [--device PATH] [--card PATH]
 //!                [--export NAME|PATH] [--render PATH]
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What the host kernel is handed: parameter blocks built, never patched.
 //!
 //! Every ioctl the backend makes goes through an [`Arena`]. An arena owns

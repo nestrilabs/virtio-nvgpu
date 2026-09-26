@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The host side of the Wayland proxy (protocol v2, DESIGN §7).
 //!
 //! A guest client's connection is one backend handle of kind `Wayland`: a

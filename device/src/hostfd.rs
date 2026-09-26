@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What a host descriptor is, and helper operations on them (protocol v2).
 //!
 //! Every descriptor the backend holds lives in the handle table under a

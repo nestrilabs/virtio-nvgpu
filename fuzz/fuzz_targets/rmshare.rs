@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! RM share/duplicate parsing, the named-client tables, RM controls answered locally (device/src/rmshare.rs, rmctl.rs), and the ownership state.
 #![no_main]
 

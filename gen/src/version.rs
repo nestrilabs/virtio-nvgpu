@@ -1,4 +1,5 @@
-// crates/abi/src/version.rs
+// SPDX-License-Identifier: Apache-2.0
+// gen/src/version.rs
 //
 // NVIDIA driver version representation and parsing.
 //

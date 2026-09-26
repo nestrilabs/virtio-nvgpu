@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Deep segments (device/src/deepseg.rs).
 #![no_main]
 

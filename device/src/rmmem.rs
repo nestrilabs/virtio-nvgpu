@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What the backend knows about the memory behind RM handles, and the
 //! coherency rewrite that lets a guest cache system memory safely.
 //!

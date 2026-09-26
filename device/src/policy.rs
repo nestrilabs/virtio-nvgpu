@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Backend policy for IOCTL2: the decisions `xfer` leaves to its caller.
 //!
 //! `xfer` enforces what a schema can state -- lengths, pointers, descriptor

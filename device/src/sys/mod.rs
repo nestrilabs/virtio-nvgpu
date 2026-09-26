@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Everything in this crate that is `unsafe`, and nothing else.
 //!
 //! The rest of the crate is `#![forbid(unsafe_code)]` (lib.rs, and each

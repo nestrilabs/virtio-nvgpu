@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! What the backend process is allowed to be: its privileges and its socket.
 //!
 //! **Privileges** (S-5). Every host driver the backend forwards to decides a

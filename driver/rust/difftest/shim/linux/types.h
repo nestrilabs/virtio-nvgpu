@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Userspace stand-ins for the kernel headers the module's parsers include,
  * so that the C (nvgpu_i2.c, nvgpu_rmio.c, nvgpu_schema.c) compiles as it

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # The unprivileged path, as this user, with the same stubs: nothing of the
 # root-only checks applies, and a stale backend of the rig's own is still killed.
 set -u

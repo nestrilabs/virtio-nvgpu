@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 3 (and stage 8's first check): guest clients of the host
 # compositor through nvgpu-wl-guest. Launch with --wayland-socket.
 #   nvgpu_secs=S     how long each timed client runs (default 10)

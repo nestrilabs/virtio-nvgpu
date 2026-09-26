@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The whole dispatcher, fed a guest's messages.
 //!
 //! Input: a configuration byte, a byte of host mood, then messages, each a

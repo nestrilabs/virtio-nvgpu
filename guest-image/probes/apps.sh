@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Real applications through the Wayland proxy, one at a time, each for a slot
 # the host side (scripts/rig-app-check.sh) watches: it waits for the line
 #   APP_START <name>

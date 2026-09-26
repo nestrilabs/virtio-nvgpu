@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Runs as root of a user namespace, in its own mount and pid namespaces, chrooted
 # into a tmpfs root that holds a root-owned rig: two launchers (the old, e513ba9,
 # and the new), stub binaries, and a fake pool of slot users. The namespace maps

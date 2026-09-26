@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The event pump: host readiness and DRM events, carried to the guest.
 //!
 //! The event queue is the one place the host speaks first. The guest posts

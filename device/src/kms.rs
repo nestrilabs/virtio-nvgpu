@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! KMS on the backend, beyond what the IOCTL2 interpreter (`xfer`) does for
 //! every call: how a property is classified by its name, and the host card
 //! hotplug listener.

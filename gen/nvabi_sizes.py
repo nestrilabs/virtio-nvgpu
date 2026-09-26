@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Compute NVIDIA driver struct sizes from gVisor's pkg/abi/nvgpu.
 
 gVisor is a Bazel project: `go build` on it fails without generated code, so

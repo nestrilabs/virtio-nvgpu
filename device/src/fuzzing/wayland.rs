@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Wayland engine (`wlwire`), both ends, both directions.
 //!
 //! A guest engine facing an app and a host engine facing the compositor,

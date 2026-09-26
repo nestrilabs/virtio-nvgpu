@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Rendering without a display: the NVIDIA 595.99.02 userspace in the guest
 # drives the host GPU through RM/UVM forwarding. nvidia-smi, Vulkan, EGL, and
 # the CUDA driver API (with a kernel launch). Any display mode.

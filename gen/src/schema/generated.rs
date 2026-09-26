@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The IOCTL2 schema tables, for the backend's interpreter (device/src/xfer.rs).
 // The guest's copy is driver/gen/nvgpu_schema.h; both are generated from
 // gen/schema/*.py by gen/schema_gen.py. DO NOT EDIT -- regenerate.

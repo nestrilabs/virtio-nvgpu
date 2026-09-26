@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * The generated IOCTL2 schema and UVM tables (gen/nvgpu_schema.h), and which
  * of them a host gets. The tables are the module's one copy: the C

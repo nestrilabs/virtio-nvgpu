@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Properties of the Rust core on arbitrary input (proptest), and the
 //! differential test on seeds proptest chooses and shrinks.
 

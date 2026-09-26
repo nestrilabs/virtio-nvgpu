@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build .rig/bin/crosvm: crosvm with patches/crosvm applied (the virtio-nvgpu
 # branch of .rig/src/crosvm), static like .rig/bin/nesbox, and without the
 # default features (no virtio-gpu, virgl, virtio-wl, audio, usb or net):

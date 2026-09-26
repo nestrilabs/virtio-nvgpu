@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build the guest kernel and the guest module against it.
 #
 # Why this exists: the first guest kernel was built by hand on one machine and

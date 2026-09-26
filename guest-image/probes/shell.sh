@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # An interactive shell on the console, with the environment the probes use
 # and the module loaded. Exit the shell to power off.
 #   nvgpu_wl=1        also start nvgpu-wl-guest (Wayland modes)

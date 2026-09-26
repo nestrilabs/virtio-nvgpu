@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * egl-fence -- does EGL_ANDROID_native_fence_sync work? Creates a context on
  * the surfaceless platform (or the device platform), clears, flushes, makes a

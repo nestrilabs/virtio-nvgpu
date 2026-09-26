@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-2.0-only
 #
 # Two ways to build this module: in-tree (how libkrunfw builds it), selected
 # by CONFIG_VIRTIO_GPU_NV, and out-of-tree through the front end at the end.

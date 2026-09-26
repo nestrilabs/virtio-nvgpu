@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * virtio-gpu-nv: state and prototypes shared between the objects that make up
  * virtio_gpu_nv.ko. Anything used by one file only stays in that file.

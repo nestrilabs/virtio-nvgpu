@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One proxied connection to the host compositor.
 //!
 //! **Eager draining.** Hyprland gives each client a 1 MiB output buffer and

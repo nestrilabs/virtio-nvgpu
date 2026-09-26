@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Boot a guest against the vhost-user backend and keep both sides' output.
 #
 # Usage: run-guest.sh [--vmm nesbox|crosvm] [display options] <probe-name> [tag]

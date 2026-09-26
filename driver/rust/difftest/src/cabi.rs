@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The C side: the module's parsers and the harness, as Rust sees them, and
 //! the `dt_*` callbacks through which the harness reaches the world of the
 //! run in progress.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ATOMIC: the C atomic parse (nvgpu_atomic.c) and the Rust one must agree
 //! on a commit the fuzzer's bytes lay out, through both interpreters.
 #![no_main]

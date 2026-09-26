@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Measure the parameter block of every UVM command the backend lets through.
 
 nvidia-uvm's ioctl numbers carry no size: UVM_IOCTL_BASE(n) is plain n, and

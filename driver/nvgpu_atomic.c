@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * An atomic commit's arrays, as the caller laid them out: which objects it
  * sets which properties on, and so which CRTCs the commit carries (for their

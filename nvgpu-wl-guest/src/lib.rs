@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! nvgpu-wl-guest: guest applications as clients of the host compositor.
 //!
 //! Listens where a Wayland compositor would (`$XDG_RUNTIME_DIR/wayland-0`),

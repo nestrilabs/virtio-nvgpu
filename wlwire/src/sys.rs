@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The handful of system calls both ends need, over `libc`, so the guest
 //! daemon stays a small static binary.
 //!

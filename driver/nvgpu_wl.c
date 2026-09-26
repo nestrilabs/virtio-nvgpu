@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: the /dev/nvgpu-wl misc device, the guest end of the Wayland
  * channel (DESIGN §7; UAPI in uapi/nvgpu_wl.h).

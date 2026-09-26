@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Run one command line, given base64-encoded on the kernel command line, with
 # the environment the probes use and the module loaded; then power off. For
 # chasing a failure without a probe of its own:

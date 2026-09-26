@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Test-only: whether this process still holds the other end of a pipe.
 //!
 //! A test that checks the backend closed its end of a pipe asks the kernel:

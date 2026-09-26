@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # A dry run of scripts/run-guest.sh, root and unprivileged, with stub binaries:
 # no KVM, no GPU, no root. The root half runs in a user namespace (one uid,
 # mapped to 0), chrooted into a tmpfs holding a root-owned rig, and compares

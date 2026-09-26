@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A fake backend: answers a request with a reply that is a function of the
 //! request's bytes and a seed, so both implementations, sending the same
 //! bytes, read the same answer. Mostly well formed, sometimes not, as a

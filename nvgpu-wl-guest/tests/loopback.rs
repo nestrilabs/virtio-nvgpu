@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! End to end, minus the VM: real clients → the guest daemon → an in-process
 //! channel → the backend's `WlConn` → a real headless compositor.
 //!

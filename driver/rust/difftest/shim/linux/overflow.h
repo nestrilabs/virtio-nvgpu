@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef DIFFTEST_LINUX_OVERFLOW_H
 #define DIFFTEST_LINUX_OVERFLOW_H
 #define check_add_overflow(a, b, d) __builtin_add_overflow(a, b, d)

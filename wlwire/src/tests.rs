@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Unit tests for the codec, the object table, the closure check, the frame
 //! format, the policy, and the engine end to end (a guest engine facing a
 //! client wired to a host engine facing a compositor, both in memory).

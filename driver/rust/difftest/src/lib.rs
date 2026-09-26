@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The differential test: the guest module's C parsers (`nvgpu_i2.c`,
 //! `nvgpu_rmio.c`, compiled as they are against a userspace shim) and their
 //! Rust port (`driver/rust/core`) run on the same inputs, in the same world,

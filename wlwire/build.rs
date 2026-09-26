@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Generates the codec's tables from the vendored protocol XML, and refuses to
 //! build if the allowlist is not closed (see `src/closure.rs`).
 //!

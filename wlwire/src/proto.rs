@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The protocol tables, generated at build time from `protocols/*.xml` (see
 //! `build.rs`), and the types they are made of.
 

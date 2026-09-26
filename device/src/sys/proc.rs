@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The process: identity, privileges, limits, and the sandbox's system calls
 //! (namespaces, Landlock, seccomp). Every function takes plain values or
 //! locals it builds itself; none hands the kernel memory of its caller's

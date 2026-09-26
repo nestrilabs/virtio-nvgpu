@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! One end of one proxied connection: everything between a local Wayland
 //! socket and the channel to the other side of the VM boundary.
 //!

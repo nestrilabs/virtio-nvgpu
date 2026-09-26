@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The pointer scrub of RM escapes, controls and UVM, and IDLE_CHANNELS lists (device/src/guestptr.rs).
 #![no_main]
 

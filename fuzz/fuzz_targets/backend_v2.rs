@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The dispatcher with a v2 session always said HELLO, compute and guest RAM on: IOCTL2, HOST_OP, WATCH, OS descriptors, the UVM aperture.
 #![no_main]
 

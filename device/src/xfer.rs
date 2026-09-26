@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! IOCTL2: the schema-driven vectored ioctl (protocol v2).
 //!
 //! The guest sends an ioctl's argument and every buffer a pointer in it

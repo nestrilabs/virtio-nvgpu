@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * sec-negative.c -- the guest half of the display-passthrough security tests.
  *

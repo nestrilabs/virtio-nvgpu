@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The channel frame decoder and the Wayland wire decoder.
 #![no_main]
 

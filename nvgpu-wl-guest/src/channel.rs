@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The channel to the host: `/dev/nvgpu-wl`, or anything else that moves
 //! frames the same way (the loopback test puts the backend's own connection
 //! object here, in process).

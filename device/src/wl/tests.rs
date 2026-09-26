@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The host side against a fake compositor: a real socket, real threads, and
 //! the guest's half played by a guest-side engine.
 

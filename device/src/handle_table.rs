@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Backend handles: the only names a guest has for host descriptors.
 //!
 //! --- Handle lifecycle and ungraceful teardown ---

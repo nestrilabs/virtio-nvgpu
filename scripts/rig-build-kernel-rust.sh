@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Rig: the guest kernel with CONFIG_RUST, and the guest module with its
 # untrusted-input parsers in Rust (NVGPU_RUST=1). A separate build from
 # .rig/build-kernel.sh's, whose outputs it never touches:

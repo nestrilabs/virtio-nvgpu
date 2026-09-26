@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The UVM ranges a guest may map, and where in the UVM aperture they are.
 //!
 //! `cuCtxCreate` makes a UVM semaphore pool (UVM_ALLOC_SEMAPHORE_POOL, at a

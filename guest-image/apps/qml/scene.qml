@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // A Qt Quick scene for the application pass (apps.sh qml, qmlvk): rotating
 // rectangles, and the scene graph's API and frame rate on screen and in the log.
 import QtQuick

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """nvidia-drm's own ioctls (DRM_COMMAND_BASE + n), 610.57.04.
 
 Layouts from kernel-open/nvidia-drm/nv_drm_common_ioctl.h, handlers from

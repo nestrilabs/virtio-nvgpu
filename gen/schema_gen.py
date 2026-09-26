@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """schema_gen.py -- emit the IOCTL2 schema tables for both interpreters.
 
 One source (gen/schema/*.py), two outputs that must never disagree:
@@ -355,7 +356,7 @@ def build():
 # ─────────────────────────────── C emission ───────────────────────────────
 
 C_PREAMBLE = '''\
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * The IOCTL2 schema: what an ioctl's argument points at, and where its
  * descriptors and GEM handles are, for the guest's interpreter (nvgpu_i2.c).
@@ -690,6 +691,7 @@ def emit_c_uvm():
 # ────────────────────────────── Rust emission ──────────────────────────────
 
 RS_PREAMBLE = '''\
+// SPDX-License-Identifier: Apache-2.0
 // The IOCTL2 schema tables, for the backend's interpreter (device/src/xfer.rs).
 // The guest's copy is driver/gen/nvgpu_schema.h; both are generated from
 // gen/schema/*.py by gen/schema_gen.py. DO NOT EDIT -- regenerate.

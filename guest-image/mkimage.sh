@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Build the guest root filesystem image: .rig/guest/rootfs.ext4.
 #
 # Usage: guest-image/mkimage.sh [options]

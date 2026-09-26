@@ -1,4 +1,5 @@
-// crates/device/src/shm.rs
+// SPDX-License-Identifier: Apache-2.0
+// device/src/shm.rs
 
 #![forbid(unsafe_code)]
 

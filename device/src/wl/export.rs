@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Export mode (`--wayland-export PATH`): host clients reach a compositor
 //! running in the guest.
 //!

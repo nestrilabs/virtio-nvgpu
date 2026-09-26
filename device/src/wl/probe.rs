@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Which of the compositor's lease devices are for our GPU.
 //!
 //! `wp_drm_lease_device_v1` is one global per DRM device the compositor

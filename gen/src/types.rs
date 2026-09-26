@@ -1,4 +1,5 @@
-// crates/abi/src/types.rs
+// SPDX-License-Identifier: Apache-2.0
+// gen/src/types.rs
 //
 // Common NVIDIA types shared across ioctl structs.
 // Ported from gVisor pkg/abi/nvgpu/nvgpu.go.

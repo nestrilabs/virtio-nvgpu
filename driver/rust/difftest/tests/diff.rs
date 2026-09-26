@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The C parsers and the Rust core, side by side, on generated scenarios.
 //! `DIFFTEST_ITERS` sets how many per family (default 4000);
 //! `DIFFTEST_SEED` runs one seed, for a failure's reproduction.

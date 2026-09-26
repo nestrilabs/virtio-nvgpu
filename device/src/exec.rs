@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-file serial executors for host calls that may wait.
 //!
 //! The queue thread serves every guest request in ring order, so anything it

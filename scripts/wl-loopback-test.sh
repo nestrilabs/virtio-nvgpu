@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Run the Wayland proxy end to end without a VM: real clients (wayland-info,
 # weston-presentation-shm, wl-copy/wl-paste, foot) → the guest daemon → an
 # in-process channel → the backend's WlConn (directly, and again through the

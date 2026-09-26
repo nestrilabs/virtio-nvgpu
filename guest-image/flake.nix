@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 {
   # The guest root filesystem for on-device tests of virtio-nvgpu.
   #

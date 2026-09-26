@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The schema-driven IOCTL2 interpreter: gathers a caller's buffers per the
 //! schema, builds the request, and reads the reply back into the caller's
 //! memory by the kernel's own copy-back rules. A line-for-line port of

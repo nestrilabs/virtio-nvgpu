@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The fake host kernel: RM, UVM, NVKMS and nvidia-drm, as far as what they
 //! read and write through a parameter block goes.
 //!

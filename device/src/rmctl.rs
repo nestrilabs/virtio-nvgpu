@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! RM controls the backend answers itself, without asking the host.
 //!
 //! An RM control the host release's allowlist has (`rmallow.rs`) is one any

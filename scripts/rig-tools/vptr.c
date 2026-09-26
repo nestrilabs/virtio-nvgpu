@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * vptr -- one virtual pointer that lives as long as the program, driven from
  * stdin, for the rig's headless compositor (scripts/rig-app-check.sh).

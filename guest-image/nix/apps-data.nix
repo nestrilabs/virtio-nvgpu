@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # What the application pass (probes/apps.sh) opens, at /opt/nvgpu/apps:
 # the pieces under ../apps (test pages, a Godot project, a QML scene, an
 # Electron app, Blender scripts), and media made here with ffmpeg so the guest

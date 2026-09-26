@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Deep segments: several pointers of one parameter block, each sent with
 //! the bytes it addresses.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Which path an ioctl on one of the `/dev/nvidia*` files (or a DRM file's
 //! driver range) takes: `nvgpu_ioctl_fd()` and `nvgpu_uvm_ioctl()`.
 //!

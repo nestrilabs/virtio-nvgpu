@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Seeds for the `backend` fuzz targets, recorded from the unit tests.
 //!
 //! Test only, and only with `NVGPU_FUZZ_SEEDS=<dir>` set (`scripts/fuzz.sh

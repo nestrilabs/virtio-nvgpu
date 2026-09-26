@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory the caller already has, registered with RM by its guest-physical
 //! pages (`driver/nvgpu_osdesc.c`, whose pinning, unpinning and reaping stay
 //! C): which of the three calls a block is, the range it asks RM to pin, the

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Blender with its UI (apps.sh blender, blendervk): the GPU module's account
 # of the backend and renderer, then one EEVEE frame rendered from the UI.
 import bpy, gpu, time

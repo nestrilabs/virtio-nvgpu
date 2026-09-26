@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: fences (DESIGN §6, R:fences Design A).
  *

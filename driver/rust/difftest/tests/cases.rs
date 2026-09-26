@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The C behaviour's cases, stated: each runs through both implementations
 //! (which must agree, as in diff.rs) and then checks what they did against
 //! what the C has always done -- the requests byte for byte where it

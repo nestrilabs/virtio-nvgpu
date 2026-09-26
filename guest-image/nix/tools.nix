@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # The small C programs the probes need that nixpkgs does not have, and the
 # repo's two verify helpers (sec-negative, lease-flip) built against nix's
 # libdrm so they match the guest's glibc.

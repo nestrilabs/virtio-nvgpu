@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A vhost-user backend serving `NvidiaBackend` to a guest.
 //!
 //! The guest driver (`driver/nvgpu_main.c`) binds virtio device ID 45 and

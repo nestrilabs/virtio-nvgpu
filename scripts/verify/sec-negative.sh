@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Run the security negative tests inside the guest, and show the guest survived.
 #
 # Each check fires one ioctl a hostile guest would use to reach past its VM and

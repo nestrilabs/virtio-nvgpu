@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # A compositor of the rig's own, with no monitor, for the Wayland stages that
 # must not touch the live desktop.
 #

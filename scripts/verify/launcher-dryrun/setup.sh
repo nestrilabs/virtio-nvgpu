@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Run with: unshare --user --map-root-user --mount --pid --fork bash setup.sh <old> <new>
 # Builds a tmpfs root with a root-owned rig and chroots into it to run inside.sh.
 # NixOS: the tools come from /run/current-system and /nix.

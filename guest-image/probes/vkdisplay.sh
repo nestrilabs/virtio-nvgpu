@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 5: VK_EXT_acquire_drm_display / VK_KHR_display on a leased
 # output. Launch as for lease.sh (--wayland-socket ... --wayland-lease, a
 # leasable monitor), or in compositor-VM mode (--kms-card), where the guest

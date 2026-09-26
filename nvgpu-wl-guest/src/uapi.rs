@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Mirror of `driver/uapi/nvgpu_wl.h`, field for field, with the same sizes
 //! asserted. The frame layout itself is `wlwire::frame`, which the header's
 //! frame structs mirror in turn.

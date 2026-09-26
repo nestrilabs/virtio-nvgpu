@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The host kernel's `ioctl`, reachable only with an argument an
 //! [`Arena`](super::block::Arena) built.
 

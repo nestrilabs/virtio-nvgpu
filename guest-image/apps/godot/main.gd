@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 extends Node3D
 
 var t := 0.0

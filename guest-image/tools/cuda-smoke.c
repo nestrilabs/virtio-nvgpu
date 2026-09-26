@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * cuda-smoke -- the CUDA driver API end to end, with no CUDA toolkit.
  *

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Wayland wire format: one message is `u32 object`, `u32 (size << 16 |
 //! opcode)`, then the arguments, every one a multiple of four bytes, in host
 //! byte order (libwayland `connection.c`). Strings and arrays are a u32 length

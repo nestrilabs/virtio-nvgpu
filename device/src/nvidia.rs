@@ -1,4 +1,5 @@
-// crates/device/src/nvidia.rs
+// SPDX-License-Identifier: Apache-2.0
+// device/src/nvidia.rs
 
 #![forbid(unsafe_code)]
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef DIFFTEST_LINUX_MM_H
 #define DIFFTEST_LINUX_MM_H
 #include <linux/slab.h>

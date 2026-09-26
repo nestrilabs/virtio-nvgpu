@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 nvgpu_gen.py — Generate virtio-gpu-nv guest driver tables from
                NVIDIA open-gpu-kernel-modules source tree.
@@ -384,7 +385,7 @@ def emit_rmalloc_header(
         driver_version: str,
 ):
     lines = [
-        '/* SPDX-License-Identifier: GPL-2.0 */',
+        '/* SPDX-License-Identifier: GPL-2.0-only */',
         '/*',
         f' * nvgpu_rmalloc_classes.h — auto-generated from NVIDIA driver {driver_version}',
         ' *',
@@ -905,7 +906,7 @@ def emit_v1v2_header(
         driver_version: str,
 ):
     lines = [
-        '/* SPDX-License-Identifier: GPL-2.0 */',
+        '/* SPDX-License-Identifier: GPL-2.0-only */',
         '/*',
         f' * nvgpu_v1v2_rewrites.h — auto-generated from NVIDIA driver {driver_version}',
         ' *',

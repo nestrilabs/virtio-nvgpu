@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # /dev/nvgpu-wl*, the guest end of the virtio-nvgpu Wayland channel.
 #
 # Every open of it is a client of the host's compositor (or, in export mode,

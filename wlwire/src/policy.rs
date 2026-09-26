@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The allowlist at run time: which advertised globals a guest sees, and at
 //! what version.
 //!

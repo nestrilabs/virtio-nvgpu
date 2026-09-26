@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Where RM follows user pointers inside RM_CONTROL parameters, measured.
 //!
 //! `generated.rs` is rendered by `gen/rmctrl_extract.py` from the

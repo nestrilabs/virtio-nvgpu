@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Descriptors: every system call on one that is not an ioctl.
 //!
 //! Each function returns what it makes as an `OwnedFd` (so it is closed

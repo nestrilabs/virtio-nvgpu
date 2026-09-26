@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Guest processes' shares of the VM-wide budgets.
 //!
 //! One backend serves every process of a guest, and most of what it holds

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Diff a bare-metal capture against a guest capture (NVK_VERIFICATION.md §5.4a/b).
 # The two runs differ legitimately only in address-like values, so before diffing
 # we normalise those away:

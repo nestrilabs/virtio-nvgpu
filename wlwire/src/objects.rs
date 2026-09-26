@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Which object id is which interface, per connection, mirrored from both
 //! directions of traffic the way libwayland keeps it on each end.
 //!

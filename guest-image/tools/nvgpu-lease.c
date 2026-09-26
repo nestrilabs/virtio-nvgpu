@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /*
  * nvgpu-lease -- take a DRM lease from the Wayland compositor and hand it to a
  * KMS program.

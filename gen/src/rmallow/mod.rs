@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Which RM controls and classes a guest may reach, per release.
 //!
 //! `generated.rs` is rendered by `gen/rmallow_extract.py` from the

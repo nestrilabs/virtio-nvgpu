@@ -1,4 +1,5 @@
-// crates/protocol/src/messages.rs
+// SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-or-later
+// protocol/src/messages.rs
 //
 // Wire message types for virtio-gpu-nv.
 //

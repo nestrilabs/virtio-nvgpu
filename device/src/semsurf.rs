@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Semaphore surfaces, and the RM objects a VM owns that name them.
 //!
 //! nvidia-drm's SEMSURF_FENCE_CTX_CREATE (0x54) is the one fence call whose

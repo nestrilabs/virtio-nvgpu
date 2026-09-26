@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Mappings: every `mmap`, `munmap` and `mprotect` the backend makes, each
 //! owned by a type that unmaps it exactly once, and every `MAP_FIXED` checked
 //! to land inside a range that type owns.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * The C around the Rust parsers (NVGPU_RUST=1): nvgpu.h's IOCTL2 API on top
  * of nvgpu_rs.rs, and the services the Rust calls back (nvgpu_rs.h). Nothing

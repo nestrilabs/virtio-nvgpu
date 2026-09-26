@@ -1,4 +1,5 @@
-// crates/protocol/src/lib.rs
+// SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-or-later
+// protocol/src/lib.rs
 //
 // Wire protocol shared between the VMM backend (Rust) and the guest kernel
 // driver (C).  Every type here has a matching definition in

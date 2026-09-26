@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # TESTING.md stage 1 (and 0.1): the module loads, HELLO negotiates protocol v2,
 # the nodes are there, and the driver's own libraries advertise the extensions
 # the later stages need (scripts/verify/guest-check.sh). Any display mode.

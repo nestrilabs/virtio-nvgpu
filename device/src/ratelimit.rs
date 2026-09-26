@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Log lines a guest can cause, at a rate the host can afford.
 //!
 //! Most of what the backend logs is a guest's doing: a refused NVKMS command,

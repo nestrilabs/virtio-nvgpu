@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Run a command on the host the way the guest runs it, to tell a failure of
 # ours from one the app has natively: the guest image's own NVIDIA userspace
 # (its /run/opengl-driver, the same 595.99.02 files, pinned the way

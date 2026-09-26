@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Protocol v2 on the backend: the session, and the messages only it serves.
 //!
 //! A *session* is one guest driver instance's view of this backend: its

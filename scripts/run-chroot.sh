@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Run a command against the real driver, inside the guest's own rootfs.
 #
 # This is the control for every guest experiment: same userspace, same

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Cycles in the background (apps.sh cycles): one frame of the default scene on
 # the device named after "--" (CUDA, OPTIX or CPU), with the devices Cycles
 # found and the time it took.

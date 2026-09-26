@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 config VIRTIO_GPU_NV
 	tristate "Virtio NVIDIA GPU proxy driver"
 	depends on VIRTIO && DRM && PCI

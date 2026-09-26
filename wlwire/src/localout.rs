@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bytes and descriptors on their way to the local Wayland peer.
 //!
 //! libwayland receives descriptors into a FIFO that messages draw from as they

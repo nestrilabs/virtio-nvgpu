@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Default deny for RM: only known controls and classes reach the host's RM.
 //!
 //! The backend is a client of the host's RM like any other user process, and

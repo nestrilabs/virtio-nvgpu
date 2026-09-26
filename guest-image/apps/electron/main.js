@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // An Electron app for the application pass (apps.sh electron): the WebGL and
 // video page in a BrowserWindow, and Electron's own account of its GPU
 // process (getGPUFeatureStatus, getGPUInfo) on stdout.

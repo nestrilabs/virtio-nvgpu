@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * nvgpu_rmalloc_classes.h — auto-generated from NVIDIA driver 595.58.03
  *

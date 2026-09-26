@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // A CUDA runtime program for the application pass (apps.sh cuda), beyond
 // cuda-smoke's driver-API round trip: device properties, a vector add checked
 // on the host, pinned and pageable host<->device bandwidth, and an all-pairs

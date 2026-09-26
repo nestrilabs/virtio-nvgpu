@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """DRM core syncobj ioctls, run on the file's host render node (class RENDER).
 
 Layouts from Linux 7.2.7 include/uapi/drm/drm.h; handlers in

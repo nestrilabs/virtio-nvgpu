@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # shellcheck shell=bash
 # The guest's environment: sourced by probe-common.sh and by /etc/profile.
 #

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The build-time closure check, kept free of any dependency so `build.rs` can
 //! compile it as well as the library (whose tests exercise it on small
 //! hand-made protocols).

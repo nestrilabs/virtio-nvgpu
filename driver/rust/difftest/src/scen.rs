@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Scenarios: a device, a world and one call, generated from a seed; running
 //! one through each implementation; and comparing what each did.
 

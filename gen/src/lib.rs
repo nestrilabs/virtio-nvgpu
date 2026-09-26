@@ -1,4 +1,5 @@
-// crates/abi/src/lib.rs
+// SPDX-License-Identifier: Apache-2.0
+// gen/src/lib.rs
 //
 // NVIDIA kernel driver ABI definitions.
 //

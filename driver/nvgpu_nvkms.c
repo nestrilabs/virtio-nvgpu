@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: /dev/nvidia-modeset on protocol v2 -- NVKMS through the
  * schema-driven IOCTL2 interpreter, and the readiness NVKMS clients poll.

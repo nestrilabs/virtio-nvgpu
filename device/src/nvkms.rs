@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! NVKMS policy: what a guest may do through `/dev/nvidia-modeset`, and
 //! through nvidia-drm's GRANT/REVOKE_PERMISSIONS, to a display the host
 //! compositor is driving.

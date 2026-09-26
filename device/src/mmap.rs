@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Active guest mappings.
 //!
 //! One entry per live `NV_ESC_RM_MAP_MEMORY`, keyed by the SHM offset that was

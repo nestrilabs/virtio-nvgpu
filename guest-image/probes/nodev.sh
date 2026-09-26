@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # The image without the device: what can be checked with no virtio-nvgpu
 # device behind the guest (QEMU under TCG, or nesbox without --gpu-forward).
 # Every check here expects the device to be ABSENT and passes when things

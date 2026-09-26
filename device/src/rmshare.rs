@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! RM objects between clients: who may share one, duplicate one, or name
 //! another client at all.
 //!

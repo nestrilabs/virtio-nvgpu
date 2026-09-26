@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Every `unsafe` of the guest daemon (lib.rs and main.rs forbid it
 //! elsewhere; scripts/check-unsafe.sh holds the tree to that): the ioctls
 //! of `/dev/nvgpu-wl` and of a DRM node, epoll, and a descriptor's peer.

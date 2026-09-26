@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Small read-only files copied by value: keymaps, dma-buf format tables, ICC
 //! profiles.
 //!

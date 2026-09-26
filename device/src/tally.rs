@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Counting keys a guest chooses, in bounded memory.
 //!
 //! The backend counts every RM class and control command a workload uses

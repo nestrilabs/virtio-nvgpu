@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Fuzz every place the host parses what a guest (or a Wayland peer) sent, and
 # run Miri over the unsafe-heavy unit tests. device/README.md, "Fuzzing".
 #

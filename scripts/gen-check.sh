@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # Re-measure every checked-in table under gen/ from NVIDIA's (and gVisor's)
 # sources, and fail if any is not what its extractor produces now.
 #

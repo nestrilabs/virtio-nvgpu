@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Fuzzing entry points, and the fake host they run against.
 //!
 //! Compiled only with `--cfg fuzzing`, which `cargo fuzz` passes to every

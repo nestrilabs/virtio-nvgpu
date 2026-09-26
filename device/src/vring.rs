@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A request's descriptor chain, as the vhost-user transport takes it off
 //! the control queue: summed before a byte is read, gathered from guest
 //! memory, and the reply scattered back.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # NVIDIA's userspace at exactly the host's release, built by nixpkgs' own
 # machinery (nvidiaPackages.mkDriver), and the /run/opengl-driver tree the
 # nix-built loaders read.
