@@ -1187,11 +1187,16 @@ mod tests {
         let end = forked(|| {
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let t = std::thread::spawn(move || rx.recv().ok());
+            // Unchanged, not 0: a build sandbox (Nix's) may have filtered
+            // the test process before it started. The filter count where
+            // the kernel reports one (5.9 on), else the mode.
+            let filters = || status_field("Seccomp_filters:").or_else(|| status_field("Seccomp:"));
+            let seccomp_before = filters();
             let r = apply(&Plan::default());
             let none = [&r.network, &r.limits, &r.landlock, &r.seccomp]
                 .iter()
                 .all(|l| matches!(l, Layer::Degraded(s) if s.contains("threads already")));
-            let unfiltered = status_field("Seccomp:").as_deref() == Some("0");
+            let unfiltered = filters() == seccomp_before;
             drop(tx);
             let _ = t.join();
             if r.complete() {

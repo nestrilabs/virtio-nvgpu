@@ -2,7 +2,10 @@
 
 **This is the plan for the box with the GPU.** Nothing here runs in CI or on a
 machine without a card: it drives real NVIDIA hardware, a real host compositor,
-and real monitors. It is written to be run in order — each stage assumes the one
+and real monitors. What runs without one is `scripts/ci.sh` (formatting, lints,
+the unit and end-to-end tests, the guest module builds, fuzzing, Miri, the
+Wayland loopback and the generated tables' check against their sources), and
+the root flake's `checks`. It is written to be run in order — each stage assumes the one
 before it passed — and every stage says what to type, what a pass looks like, and
 what to grab when it does not.
 

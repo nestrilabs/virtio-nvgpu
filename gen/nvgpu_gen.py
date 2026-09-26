@@ -4,11 +4,17 @@ nvgpu_gen.py — Generate virtio-gpu-nv guest driver tables from
                NVIDIA open-gpu-kernel-modules source tree.
 
 Usage:
-    python3 nvgpu_gen.py --src /path/to/open-gpu-kernel-modules --out /path/to/output/ --phase <all|rmalloc|v1v2>
+    python3 nvgpu_gen.py --src /path/to/open-gpu-kernel-modules --out /path/to/output/ --phase <all|rmalloc|v1v2|multiptr>
 
-Phase 1: rmalloc classes (hClass → param size)
-Phase 2: V1→V2 rewrite table
-Phase 3: multi-pointer detection (TODO)
+Phase 1: rmalloc classes (hClass → param size): driver/gen/nvgpu_rmalloc_classes.h
+Phase 2: V1→V2 rewrite table: driver/gen/nvgpu_v1v2_rewrites.h
+Phase 3: a report of controls with more than one embedded pointer
+         (multi_pointer_commands.txt, not checked in: the backend's
+         gen/rmctrl tables, and deep segments, are what carry those now)
+
+The checked-in headers are generated from 595.58.03, and
+scripts/gen-check.sh regenerates them from that release's sources and fails
+if they differ. NVGPU_GEN_KEEP_PROBES=1 keeps the C probes it compiles.
 """
 
 import argparse
@@ -193,23 +199,31 @@ def find_header_for_type(src_root: Path, type_name: str) -> Optional[Path]:
         src_root / "kernel-open" / "common" / "inc",
     ]
 
-    # Match "typedef struct ... { ... } TYPE_NAME;"
-    # or just "typedef struct TYPE_NAME {"
+    # The header that defines it: "typedef struct TYPE_NAME {", "} TYPE_NAME;"
+    # or "typedef OTHER TYPE_NAME;". A header that only mentions the name (a
+    # comment in a ctrl header, a deprecated alias) comes second, and files are
+    # searched in sorted order, so the answer does not depend on the order the
+    # file system lists them in.
+    name = re.escape(type_name)
     patterns = [
-        re.compile(rf'\b{re.escape(type_name)}\b'),
+        re.compile(rf'typedef\s+struct\s+{name}\b|\}}\s*{name}\s*;|typedef\s+\w+\s+{name}\s*;'),
+        re.compile(rf'\b{name}\b'),
     ]
 
+    files = []
     for search_dir in search_dirs:
-        if not search_dir.exists():
+        if search_dir.exists():
+            files.extend(sorted(search_dir.rglob("*.h")))
+    contents = []
+    for hfile in files:
+        try:
+            contents.append((hfile, hfile.read_text(errors='replace')))
+        except Exception:
             continue
-        for hfile in search_dir.rglob("*.h"):
-            try:
-                content = hfile.read_text(errors='replace')
-            except Exception:
-                continue
-            for pat in patterns:
-                if pat.search(content):
-                    return hfile
+    for pat in patterns:
+        for hfile, content in contents:
+            if pat.search(content):
+                return hfile
     return None
 
 
@@ -317,10 +331,11 @@ def resolve_param_sizes_via_compile(
         with open(src_file, 'w') as f:
             f.write(probe_src)
 
-        # Also save a copy for debugging
-        debug_copy = Path("nvgpu_gen_probe.c")
-        debug_copy.write_text(probe_src)
-        print(f"  Wrote probe source to {debug_copy} for debugging")
+        # A copy to debug with, only when asked: never into the tree by default.
+        if os.environ.get("NVGPU_GEN_KEEP_PROBES"):
+            debug_copy = Path("nvgpu_gen_probe.c")
+            debug_copy.write_text(probe_src)
+            print(f"  Wrote probe source to {debug_copy} for debugging")
 
         inc_flags = []
         for d in include_dirs:
@@ -839,9 +854,10 @@ def resolve_v1v2_details_via_compile(
         with open(src_file, 'w') as f:
             f.write(probe_src)
 
-        debug_copy = Path("nvgpu_gen_probe_v1v2.c")
-        debug_copy.write_text(probe_src)
-        print(f"  Wrote V1V2 probe source to {debug_copy} for debugging")
+        if os.environ.get("NVGPU_GEN_KEEP_PROBES"):
+            debug_copy = Path("nvgpu_gen_probe_v1v2.c")
+            debug_copy.write_text(probe_src)
+            print(f"  Wrote V1V2 probe source to {debug_copy} for debugging")
 
         inc_flags = []
         for d in include_dirs:
