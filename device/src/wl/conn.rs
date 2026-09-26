@@ -14,6 +14,15 @@
 //! not reading, and the daemon stops reading its client until the backlog
 //! drains -- the client's own libwayland buffer is where it waits.
 //!
+//! **Export mode** faces a host client, whose commits and blobs the engine
+//! reads here and carries to the guest compositor. Those are not drained
+//! eagerly: the engine reads them only as the guest's queue has room
+//! ([`EXPORT_QUEUE`]), and takes no more of the client's input while
+//! [`wlwire::engine::CHANNEL_HIGH_WATER`] bytes wait for the channel; the
+//! rest waits in the client's socket, as it would for a slow compositor. A
+//! client that commits its whole pool every frame costs the backend a queue's
+//! worth, not a pool per commit.
+//!
 //! **Readiness** is an eventfd, readable while anything is queued for the
 //! guest (records, or the HANGUP that ends the connection).
 //!
@@ -210,6 +219,23 @@ impl QueueBudget {
     }
 }
 
+/// A guest process's share of the queue budget, as the engine's stream sinks
+/// draw on it: bytes a guest sends into a pipe the compositor's side has not
+/// read yet are host memory the guest decides, like its unread output.
+struct OwnerQueue {
+    queue: Arc<QueueBudget>,
+    owner: crate::quota::Owner,
+}
+
+impl wlwire::stream::ByteBudget for OwnerQueue {
+    fn take(&self, n: usize) -> bool {
+        self.queue.take(self.owner, n)
+    }
+    fn give(&self, n: usize) {
+        self.queue.give(self.owner, n)
+    }
+}
+
 /// Limits over every Wayland channel of one VM (one backend). Cloning shares
 /// the budgets.
 #[derive(Clone, Debug)]
@@ -246,9 +272,11 @@ pub struct WlLimits {
 /// before anything in it is looked at: the guest daemon keeps the frame and
 /// retries it (as it does for a compositor that is not reading), so the
 /// client's request is delayed, never lost or reordered, and the compositor
-/// still creates and owns every lease object. How long a lease is then held
-/// is not limited: holding the output is what a lease is for, and the host
-/// takes it back by un-marking the monitor leasable or closing the VM.
+/// still creates and owns every lease object. Every submit of a frame must fit
+/// the rate, not only its first, and a frame with more submits than `burst`
+/// could never fit and ends the connection. How long a lease is then held is
+/// not limited: holding the output is what a lease is for, and the host takes
+/// it back by un-marking the monitor leasable or closing the VM.
 #[derive(Debug)]
 pub struct LeaseThrottle {
     interval: Duration,
@@ -258,6 +286,15 @@ pub struct LeaseThrottle {
     due: Mutex<Option<Instant>>,
     /// A refusal was logged since the last admission.
     logged: AtomicBool,
+}
+
+/// Why [`LeaseThrottle::admit`] said no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    /// The frame's submits fit the rate once this has passed.
+    Wait(Duration),
+    /// More submits in one frame than the burst: they never fit.
+    OverBurst,
 }
 
 impl LeaseThrottle {
@@ -274,18 +311,24 @@ impl LeaseThrottle {
         }
     }
 
-    /// Admit `n` submits at `now`, or say how long until one may go.
-    pub fn admit(&self, n: usize, now: Instant) -> Result<(), Duration> {
+    /// Admit `n` submits at `now`, all of them or none: the last of them must
+    /// conform to the rate, not only the first.
+    pub fn admit(&self, n: usize, now: Instant) -> Result<(), LeaseRefusal> {
         if n == 0 || self.interval.is_zero() {
             return Ok(());
         }
+        if n > self.burst as usize {
+            return Err(LeaseRefusal::OverBurst);
+        }
+        let n = n as u32;
         let mut due = self.due.lock().unwrap_or_else(|p| p.into_inner());
         let t = due.map_or(now, |d| d.max(now));
         let early = self.interval * (self.burst - 1);
-        if t > now + early {
-            return Err(t - early - now);
+        let last = t + self.interval * (n - 1);
+        if last > now + early {
+            return Err(LeaseRefusal::Wait(last - early - now));
         }
-        *due = Some(t + self.interval * n.min(u32::MAX as usize) as u32);
+        *due = Some(t + self.interval * n);
         self.logged.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -333,6 +376,10 @@ impl Default for WlLimits {
         )
     }
 }
+
+/// Export mode: bytes queued for the guest past which the engine's pending
+/// commits and blobs are left unread until the guest takes some.
+pub const EXPORT_QUEUE: usize = 8 << 20;
 
 struct State {
     engine: Engine,
@@ -510,6 +557,10 @@ impl WlConn {
         if let Some(b) = &cfg.owner_shm {
             engine.set_shm_budget(b.clone());
         }
+        engine.set_stream_budget(Arc::new(OwnerQueue {
+            queue: cfg.limits.queue.clone(),
+            owner: cfg.owner,
+        }));
         engine.hello(0);
         let ready = sys::eventfd()?;
         let wake = sys::eventfd()?;
@@ -569,21 +620,45 @@ impl WlConn {
         // Lease requests at the VM's rate (`LeaseThrottle`): a frame with one
         // too many waits whole, like one for a compositor that is not reading.
         let submits = st.engine.lease_submits(frame_bytes);
-        if let Err(wait) = s.cfg.limits.lease.admit(submits, Instant::now()) {
-            if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
-                log::info!(
-                    "wayland: the guest asks for leases faster than one per {:?}; \
-                     holding its next request for {wait:?}",
-                    s.cfg.limits.lease.interval
-                );
+        match s.cfg.limits.lease.admit(submits, Instant::now()) {
+            Ok(()) => {}
+            Err(LeaseRefusal::Wait(wait)) => {
+                if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        "wayland: the guest asks for leases faster than one per {:?}; \
+                         holding its next request for {wait:?}",
+                        s.cfg.limits.lease.interval
+                    );
+                }
+                return Err(libc::EAGAIN);
             }
-            return Err(libc::EAGAIN);
+            Err(LeaseRefusal::OverBurst) => {
+                fail(
+                    s,
+                    &mut st,
+                    Fatal {
+                        object: 1,
+                        code: wlwire::engine::ERR_IMPLEMENTATION,
+                        message: format!(
+                            "{submits} lease submits in one frame, more than the {} the VM may \
+                             make at once",
+                            s.cfg.limits.lease.burst
+                        ),
+                        blame: Blame::Channel,
+                    },
+                );
+                return Err(libc::EPROTO);
+            }
         }
+        // And the engine lets through no more than were counted: a submit
+        // the count missed ends the connection instead of passing the rate.
+        st.engine.allow_lease_submits(Some(submits));
         let mut plat = HostPlat {
             host: &*s.host,
             send: Some(ops),
         };
         let r = st.engine.from_channel(frame_bytes, Vec::new(), &mut plat);
+        st.engine.allow_lease_submits(Some(0));
         if let Err(f) = r {
             fail(s, &mut st, f);
             return Err(libc::EPROTO);
@@ -645,6 +720,12 @@ impl WlConn {
             d.write(&mut b);
             f[at..at + frame::DESC_LEN].copy_from_slice(&b);
         }
+        if st.engine.local_is_client() {
+            // Export mode: what the host client sent waits in the engine
+            // for room here, and its input for the engine to take more.
+            collect(s, &mut st);
+            sys::eventfd_signal(s.wake.as_raw_fd());
+        }
         if st.to_guest.is_empty() {
             sys::eventfd_clear(s.ready.as_raw_fd());
         }
@@ -681,14 +762,25 @@ impl Drop for WlConn {
 /// connection's limit and the VM's budget. Past either the connection is
 /// dropped, and what it had queued with it: kept, it would pin memory until
 /// the guest closes the handle, for a guest that has shown it is not reading.
+/// In export mode only what fits [`EXPORT_QUEUE`] is taken, and the rest of
+/// what the host client sent waits in the engine, unread.
 fn collect(s: &Shared, st: &mut State) {
-    let units = st.engine.take_units();
-    if units.is_empty() {
-        return;
-    }
     // HANGUP is queued: the guest stops at it, so nothing after it is ever
     // read, and keeping it would only hold memory (and descriptors).
     if st.closed {
+        st.engine.drop_channel_output();
+        return;
+    }
+    let units = if st.engine.local_is_client() {
+        let room = export_room(s, st);
+        if room == 0 {
+            return;
+        }
+        st.engine.take_units_upto(room)
+    } else {
+        st.engine.take_units()
+    };
+    if units.is_empty() {
         return;
     }
     let n: usize = units.iter().map(|u| u.bytes()).sum();
@@ -714,6 +806,13 @@ fn collect(s: &Shared, st: &mut State) {
     sys::eventfd_signal(s.ready.as_raw_fd());
 }
 
+/// Export mode: bytes the guest queue may still take from the engine.
+fn export_room(s: &Shared, st: &State) -> usize {
+    EXPORT_QUEUE
+        .min(s.cfg.max_queue / 2)
+        .saturating_sub(st.to_guest_bytes)
+}
+
 /// Queue a record that ends the connection (ERROR, HANGUP): small, and owed
 /// to the guest whatever the budget says.
 fn push_final(s: &Shared, st: &mut State, u: Unit) {
@@ -725,13 +824,17 @@ fn push_final(s: &Shared, st: &mut State, u: Unit) {
 
 /// End the connection on a protocol error: the guest is told why.
 fn fail(s: &Shared, st: &mut State, f: Fatal) {
+    // Guest text: quoted and escaped, and cut short (the engine made it
+    // printable already), and the logger meters this line like any other
+    // a guest can cause (ratelimit.rs).
+    let text = wlwire::engine::printable(&f.message, 256);
     match f.blame {
         Blame::Channel | Blame::Remote => {
-            log::warn!("wayland: guest protocol error, closing: {}", f.message)
+            log::warn!("wayland: guest protocol error, closing: {text:?}")
         }
-        Blame::Local => log::warn!("wayland: compositor protocol error, closing: {}", f.message),
+        Blame::Local => log::warn!("wayland: compositor protocol error, closing: {text:?}"),
     }
-    let _ = st.engine.take_units();
+    st.engine.drop_channel_output();
     if st.engine.local_is_client() {
         // Export mode: the host client is the one to tell, as libwayland
         // would have.
@@ -777,27 +880,45 @@ fn reader(s: Arc<Shared>) {
     let mut inbuf: Vec<u8> = Vec::new();
     let mut infds: VecDeque<OwnedFd> = VecDeque::new();
     loop {
-        let (want_out, streams, closed) = {
-            let st = lock(&s);
+        let (want_out, streams, closed, blocked) = {
+            let mut st = lock(&s);
             if st.stop {
                 return;
+            }
+            // Export mode: input the engine left when the guest's queue
+            // was full, taken now that there may be room.
+            if !st.closed && !inbuf.is_empty() && !st.engine.input_blocked() {
+                let mut plat = HostPlat {
+                    host: &*s.host,
+                    send: None,
+                };
+                match st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
+                    Ok(()) => collect(&s, &mut st),
+                    Err(f) => fail(&s, &mut st, f),
+                }
             }
             (
                 st.engine.local_out_len() > 0,
                 st.engine.stream_interest(),
                 st.closed,
+                st.engine.input_blocked(),
             )
         };
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(2 + streams.len());
         let mut ev = 0;
         if !closed {
-            ev |= libc::POLLIN;
+            // Not readable while the engine takes no input: the client
+            // waits in its socket. Nor watched at all then unless there is
+            // output, or its hangup would wake every poll.
+            if !blocked {
+                ev |= libc::POLLIN;
+            }
             if want_out {
                 ev |= libc::POLLOUT;
             }
         }
         pfds.push(libc::pollfd {
-            fd: if closed { -1 } else { sock },
+            fd: if closed || ev == 0 { -1 } else { sock },
             events: ev,
             revents: 0,
         });
@@ -831,15 +952,19 @@ fn reader(s: Arc<Shared>) {
             sys::eventfd_clear(s.wake.as_raw_fd());
         }
         let rev = pfds[0].revents;
-        if !closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if !closed && !blocked && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             // Read until the socket is empty: never leave the compositor's
             // buffer to fill.
             loop {
                 let mut fds = Vec::new();
                 let r = sys::recv_with_fds(sock, &mut buf, &mut fds);
+                let mut overflow = false;
                 if let Ok(n @ 1..) = r {
                     inbuf.extend_from_slice(&buf[..n]);
                     infds.extend(fds);
+                    // Descriptors no message has taken, held for ever
+                    // otherwise; libwayland closes the connection too.
+                    overflow = infds.len() > wlwire::wire::MAX_FDS_QUEUED;
                     // Lease-device globals are answered here, before the
                     // engine's registry filter asks and with no lock held: a
                     // probe can take seconds, and the connection's lock is
@@ -859,6 +984,23 @@ fn reader(s: Arc<Shared>) {
                 if st.closed {
                     break;
                 }
+                if overflow {
+                    infds.clear();
+                    fail(
+                        &s,
+                        &mut st,
+                        Fatal {
+                            object: 1,
+                            code: wlwire::engine::ERR_NO_MEMORY,
+                            message: format!(
+                                "more than {} file descriptors that no message takes",
+                                wlwire::wire::MAX_FDS_QUEUED
+                            ),
+                            blame: Blame::Local,
+                        },
+                    );
+                    break;
+                }
                 match r {
                     Ok(0) => {
                         hangup(&s, &mut st, 0);
@@ -874,7 +1016,8 @@ fn reader(s: Arc<Shared>) {
                             break;
                         }
                         collect(&s, &mut st);
-                        if st.closed {
+                        // Export mode: read no more than the engine takes.
+                        if st.closed || st.engine.input_blocked() {
                             break;
                         }
                     }
@@ -892,10 +1035,19 @@ fn reader(s: Arc<Shared>) {
         if st.stop {
             return;
         }
-        if !st.closed && rev & libc::POLLOUT != 0 {
-            if let Err(e) = st.engine.local_out().flush(sock) {
-                hangup(&s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
-            }
+        // A blocked socket is watched for output alone, and its hangup is
+        // found by the write.
+        let out_ready = if blocked {
+            libc::POLLOUT | libc::POLLHUP | libc::POLLERR
+        } else {
+            libc::POLLOUT
+        };
+        if !st.closed
+            && want_out
+            && rev & out_ready != 0
+            && let Err(e) = st.engine.local_out().flush(sock)
+        {
+            hangup(&s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
         }
         for (i, p) in streams.iter().zip(&pfds[2..]) {
             if p.revents != 0 {
@@ -912,6 +1064,14 @@ fn reader(s: Arc<Shared>) {
 #[cfg(test)]
 pub(crate) fn sock_fd(c: &WlConn) -> std::os::fd::RawFd {
     c.shared.sock.as_raw_fd()
+}
+
+/// Bytes queued for the guest, and whether the engine takes no more of the
+/// local peer's input, for tests.
+#[cfg(test)]
+pub(crate) fn export_state(c: &WlConn) -> (usize, bool) {
+    let st = lock(&c.shared);
+    (st.to_guest_bytes, st.engine.input_blocked())
 }
 
 #[cfg(test)]

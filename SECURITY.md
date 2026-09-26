@@ -661,7 +661,15 @@ most once a second per connector.
 
 - A guest sees the compositor's lease device only with `--wayland-lease`, and
   only when a probe shows that device hands out files of this GPU.
-- A lease file must classify as a lessee of this GPU.
+- A DRM file the compositor sends (the lease device's `drm_fd`, a lease)
+  is carried only if it is a primary-node file of this GPU
+  (`hostfd::classify`: major 226 below minor 128, nvidia-drm, one of this
+  GPU's card nodes). That does not make it a lessee: the `drm_fd` is a plain
+  file of the card, and classification cannot tell the two apart. What
+  either may do is held by the gates above -- no SET_MASTER or DROP_MASTER
+  on it, framebuffers the VM made, the NVKMS grants -- and by the CRC gate,
+  which asks the kernel whether the file really is a lessee
+  (`kms.rs`, `crc_gate`).
 - The backend asks about leases on a timer and when the compositor hangs up.
   A lease that has ended for good has its file closed and its NVKMS grants
   forgotten.
@@ -1937,3 +1945,47 @@ window's device check against every descriptor the backend really places
 (RM mappings, DRM objects, leases), compute (the UVM major and the
 `mincore` access check as the VMM's user), and crosvm's ioevents at the
 reported addresses (a guest that moves BAR 0 would now fail activation).
+
+---
+
+
+### The Wayland proxy
+
+A review of `wlwire`, `nvgpu-wl-guest` and `device/src/wl` against a guest
+(and, in export mode, a host client) trying to take more than its share.
+Each finding below was confirmed in the code, and each fix has a test that
+fails without it. Branch `fix-wayland`.
+
+| # | severity | what | fix |
+|---|---|---|---|
+| 1 | medium-high | The lease throttle checked only the first submit of a frame: a frame of a thousand submits went through on a full bucket, each a blocking modeset of a desktop monitor on the compositor's thread. The count made ahead of the engine also missed a registry made by `get_registry` in the same frame. | Every submit of a frame must fit the rate; more than the burst in one frame ends the connection. The count follows every `new_id` through the protocol tables, and the engine lets through no more submits than were counted and admitted (`allow_lease_submits`): a miss is fatal, not a bypass. `d08b673` |
+| 2 | medium | The guest daemon read the whole buffer at every damaged commit, framed all of a client's input at once, and put no byte cap on a client's buffers: a client with a sparse 2 GiB pool committing in a loop grew the daemon, and every client with it, without bound. `set_icc_file` did the same at 16 MiB a message, and export mode in the backend with a host client's commits (dropping the connection past `max_queue`). | The client's side charges its buffers to `MAX_POOL_BYTES` as the server's side does. Commit copies and blobs are read a record at a time as frames are made (`SyncJob`, `BlobJob`, `take_units_upto`). The engine takes no more of a client's input with 4 MiB queued for the channel (`CHANNEL_HIGH_WATER`); the daemon frames a frame at a time and takes more as the host drains; export mode reads a host client only as the guest's queue has room (`EXPORT_QUEUE`). `2465bd1` |
+| 3 | medium | The daemon queued every descriptor a client sent, and the backend's reader every one its peer sent, though only messages that carry one take one. | Past 1024 untaken (libwayland's own ring, `MAX_FDS_QUEUED`) the client, or the backend's connection, is closed. `9b9a274` |
+| 4 | medium | Stream sinks held up to 256 KiB each, 256 streams a connection, and unfinished blobs up to 16 x 16 MiB of memfd pages that never expired: 64 MiB a connection outside every per-VM budget, times 64 connections. | A sink grants a share that shrinks as streams are added (`WINDOW` for sixteen, 4 MiB among more, 16 KiB at least), sent in the stream's descriptor to a peer that says `HELLO_STREAM_WINDOW`; what sinks hold is charged to the guest process's share of the VM queue budget, and past it the stream ends with `ENOBUFS`. Unfinished blobs are charged to the VM's and the process's shm budgets, and dropped if the record after them does not take them. An 8 MiB selection still crosses each way in about 220 ms (loopback test, sway). `062d8ea` |
+| 5 | low | Error text a peer controls -- a far side's ERROR record, an interface name it bound -- went verbatim into the backend's log, the daemon's stderr and, in export mode, a host client's `wl_display.error`. | Fatal text is escaped (control and bidirectional-formatting characters) and cut to 512 bytes in the engine; the backend logs it quoted, through its per-site rate limit (`ratelimit.rs`); the daemon's client-caused lines are limited to 20 per 10 s with repeats counted, and its error list to 32. `ccce467` |
+| 6 | low | Shm pools and a client's blobs were read with `pread` on the thread serving the connection (in export mode, under the lock WL_SEND and WL_RECV take): a file on FUSE stalled it for as long as its server liked. | A pool must be a regular file on tmpfs or hugetlbfs (every memfd is), or the client gets `wl_shm.error.invalid_fd`; a client's blob from anything else is sent as an invalid descriptor. `ac5cec3` |
+
+Cleanups from the same review: the export socket is bound in a private
+0700 directory and renamed into place, and a socket at the path is
+replaced only if it is ours; its accept loop waits after `EMFILE` instead
+of spinning (`bcb8617`). The `ext_image_copy_capture` value rewrite, of a
+protocol the allowlist hides, is gone, and a test holds every rewrite to
+what the allowlist reaches (`5201973`). §5 now says what lease-file
+classification does and does not establish. Clippy is clean on these
+crates (`e296fac`).
+
+**Fuzzing.** `wl_engine` now runs export mode as well as normal mode, sends
+every frame into the host engine through `lease_submits` and a
+`LeaseThrottle` on a clock the input moves, and checks after every
+operation that neither engine holds more memory than its budgets allow
+(`Engine::held_bytes`), that no more submits reach the compositor than were
+admitted, and that the throttle never admits past its burst and rate nor
+refuses once its named wait has passed. Five minutes each on 2026-09-26
+(`scripts/fuzz.sh run 300`, three workers): `wl_engine` about 10 million
+runs, `wl_codec` 174 million, no finding. The memory oracle was checked by
+hand against a bound of 16 KiB, which a single blob chunk trips.
+
+**Still open.** W3's guest-image side (`apps.sh` adds the app user to
+`nvgpu-wl`) is outside this branch. A client may still hold a sink's share
+of the queue budget by never reading its pipe, as it may hold a queue by
+never reading its socket; both are its own process's share.

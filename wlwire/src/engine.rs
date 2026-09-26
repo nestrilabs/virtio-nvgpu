@@ -28,14 +28,14 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use crate::blob::Blobs;
+use crate::blob::{BlobJob, Blobs};
 use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
 use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::{Shm, ShmBudget};
-use crate::stream::{Interest, Streams};
+use crate::shm::{Shm, ShmBudget, SyncJob};
+use crate::stream::{ByteBudget, Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
 
@@ -46,6 +46,8 @@ pub const ERR_NO_MEMORY: u32 = 2;
 pub const ERR_IMPLEMENTATION: u32 = 3;
 /// `wp_linux_drm_syncobj_manager_v1.error.invalid_timeline`.
 pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
+/// `wl_shm.error.invalid_fd`.
+pub const ERR_SHM_INVALID_FD: u32 = 2;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -53,6 +55,31 @@ const CLOCK_MONOTONIC_RAW: u32 = 4;
 /// A WAYLAND record is closed at this many bytes or descriptors.
 const WL_REC_BYTES: usize = 16 * 1024;
 const WL_REC_DESCS: usize = 28;
+
+/// Bytes queued for the channel past which a local client's input is left
+/// unread ([`Engine::from_local`]): the default for an engine facing a
+/// client. Counted with what commits and blobs still have to read, which
+/// costs nothing until read but is what the channel will have to carry.
+pub const CHANNEL_HIGH_WATER: usize = 4 << 20;
+
+/// Something queued for the channel: a record ready to go, or the rest of a
+/// commit's copy or of a blob, read as the channel takes it.
+enum Out {
+    Unit(Unit),
+    Shm(SyncJob),
+    Blob(BlobJob),
+}
+
+impl Out {
+    /// Bytes this will put on the channel (a job's payload bytes).
+    fn bytes(&self) -> usize {
+        match self {
+            Out::Unit(u) => u.bytes(),
+            Out::Shm(j) => j.remaining() as usize,
+            Out::Blob(j) => j.remaining() as usize,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -84,8 +111,39 @@ pub enum Blame {
 pub struct Fatal {
     pub object: u32,
     pub code: u32,
+    /// Printable and at most [`MAX_FATAL_TEXT`] bytes, whatever a peer put
+    /// in it (`printable`).
     pub message: String,
     pub blame: Blame,
+}
+
+/// The longest error text the engine makes, or takes from the far side.
+pub const MAX_FATAL_TEXT: usize = 512;
+
+/// `s` as it may be shown to a person: control characters (a terminal's
+/// escape sequences, a newline starting a fake log line) and the invisible
+/// formatting ones (bidirectional overrides) escaped, and cut to `max`
+/// bytes. Error text carries what a peer sent -- an interface name it bound,
+/// the far side's ERROR record verbatim -- and ends up in logs, and in
+/// `wl_display.error` to a client that prints it.
+pub fn printable(s: &str, max: usize) -> String {
+    let mut o = String::with_capacity(s.len().min(max));
+    for c in s.chars() {
+        let hidden = c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        let before = o.len();
+        if hidden {
+            o.extend(c.escape_default());
+        } else {
+            o.push(c);
+        }
+        if o.len() > max {
+            o.truncate(before);
+            o.push_str("...");
+            break;
+        }
+    }
+    o
 }
 
 impl Fatal {
@@ -93,7 +151,7 @@ impl Fatal {
         Self {
             object,
             code,
-            message: message.into(),
+            message: printable(&message.into(), MAX_FATAL_TEXT),
             blame,
         }
     }
@@ -204,6 +262,8 @@ pub struct Stats {
     pub time_rewrites: u64,
     pub released_synthesised: u64,
     pub placeholders: u64,
+    /// `wp_drm_lease_request_v1.submit` requests let through from the channel.
+    pub lease_submits: u64,
 }
 
 #[derive(Default)]
@@ -232,7 +292,11 @@ pub struct Engine {
     shm: Shm,
     blobs: Blobs,
     streams: Streams,
-    out_channel: VecDeque<Unit>,
+    out_channel: VecDeque<Out>,
+    /// What `out_channel` will put on the channel, in bytes.
+    out_bytes: usize,
+    /// Past this many bytes for the channel, `from_local` stops.
+    input_limit: Option<usize>,
     wl_bytes: Vec<u8>,
     wl_descs: Vec<DescOut>,
     out_local: LocalOut,
@@ -242,12 +306,15 @@ pub struct Engine {
     release_pending: HashSet<u32>,
     released_seen: HashSet<u32>,
     hangup: bool,
+    /// Lease submits the channel may still carry (`allow_lease_submits`).
+    lease_allowance: Option<usize>,
     pub stats: Stats,
 }
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         let host = cfg.side == Side::Host;
+        let input_limit = (cfg.local == Local::Client).then_some(CHANNEL_HIGH_WATER);
         Self {
             cfg,
             objects: Objects::new(),
@@ -256,6 +323,8 @@ impl Engine {
             blobs: Blobs::new(host),
             streams: Streams::new(host),
             out_channel: VecDeque::new(),
+            out_bytes: 0,
+            input_limit,
             wl_bytes: Vec::new(),
             wl_descs: Vec::new(),
             out_local: LocalOut::default(),
@@ -268,6 +337,7 @@ impl Engine {
             release_pending: HashSet::new(),
             released_seen: HashSet::new(),
             hangup: false,
+            lease_allowance: None,
             stats: Stats::default(),
         }
     }
@@ -276,7 +346,7 @@ impl Engine {
     pub fn hello(&mut self, caps: u32) {
         let h = Hello {
             version: frame::WL_PROTO_VERSION,
-            caps,
+            caps: caps | frame::HELLO_STREAM_WINDOW,
         };
         self.push_unit(Unit {
             rec: record(frame::REC_HELLO, 0, 0, &h.encode()),
@@ -298,17 +368,51 @@ impl Engine {
     /// multiply what a guest can make the host hold. Called again, a further
     /// budget is added (a guest process's, beside the VM's).
     pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+        self.blobs.add_budget(b.clone());
         self.shm.set_shared_budget(b);
+    }
+
+    /// Charge what stream sinks hold for their readers to `b` as well: the
+    /// backend's queue budget, by guest process. Called again, a further one.
+    pub fn set_stream_budget(&mut self, b: Arc<dyn ByteBudget>) {
+        self.streams.add_budget(b);
+    }
+
+    /// Bytes this engine holds in memory for either side: records made for
+    /// the channel, output for the local peer, what stream sinks hold, and
+    /// unfinished blobs (memfd pages). What commits and blobs still have to
+    /// read is not held yet, and is not counted.
+    pub fn held_bytes(&self) -> usize {
+        let made: usize = self
+            .out_channel
+            .iter()
+            .map(|o| match o {
+                Out::Unit(u) => u.bytes(),
+                Out::Shm(_) | Out::Blob(_) => 0,
+            })
+            .sum();
+        made + self.wl_bytes.len()
+            + self.out_local.len()
+            + self.streams.held()
+            + self.blobs.held() as usize
     }
 
     /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
     /// channel carries, looked at before the frame is let in: the backend
     /// rate-limits them, since the compositor answers every lease of a
     /// desktop monitor with blocking modesets (releasing it, and taking it
-    /// back when the lease ends). A lease request created in the same frame
-    /// counts, and so does a device bound in it. Nothing is changed, and a
-    /// frame that does not decode counts none (`from_channel` refuses it).
-    /// Costs nothing on a connection that was never offered a lease device.
+    /// back when the lease ends). Nothing is changed, and a frame that does
+    /// not decode counts none (`from_channel` refuses it). Costs nothing on a
+    /// connection that was never offered a lease device.
+    ///
+    /// This is an estimate made ahead of the engine, and it is not trusted:
+    /// every object the frame creates is followed through the protocol tables
+    /// as [`Engine::message`] follows it (a registry from
+    /// `wl_display.get_registry`, a device from a bind, a request from
+    /// `create_lease_request`, anything else by its signature), and what the
+    /// engine then lets through is held to it ([`Engine::allow_lease_submits`]):
+    /// a submit the count missed ends the connection rather than reaching the
+    /// compositor unthrottled.
     pub fn lease_submits(&self, bytes: &[u8]) -> usize {
         if !self
             .registry
@@ -321,8 +425,6 @@ impl Engine {
         let Ok(f) = frame::decode(bytes) else {
             return 0;
         };
-        let bind =
-            &iface(proto::WL_REGISTRY).messages(Dir::Request)[op::wl_registry::REQ_BIND as usize];
         let mut fresh: HashMap<u32, IfaceId> = HashMap::new();
         let mut n = 0;
         for r in f.records().filter(|r| r.ty == frame::REC_WAYLAND) {
@@ -334,44 +436,49 @@ impl Engine {
                 }
                 let m = &p[..size];
                 p = &p[size..];
-                let ifc = fresh.get(&h.object).copied().or_else(|| {
+                let Some(ifc) = fresh.get(&h.object).copied().or_else(|| {
                     self.objects
                         .get(h.object)
                         .filter(|o| !o.zombie)
                         .map(|o| o.iface)
-                });
-                let new_id = || match m.get(8..12) {
-                    Some(b) => u32::from_ne_bytes(b.try_into().unwrap()),
-                    None => 0,
+                }) else {
+                    // The engine refuses this message and the frame with it.
+                    continue;
                 };
-                match (ifc, h.opcode) {
-                    (Some(proto::WL_REGISTRY), op::wl_registry::REQ_BIND) => {
-                        if let Ok(a) = wire::parse(bind, m) {
-                            if let Val::NewId {
-                                id,
-                                iface: Some(b"wp_drm_lease_device_v1"),
-                                ..
-                            } = a[1].val
-                            {
-                                fresh.insert(id, proto::WP_DRM_LEASE_DEVICE_V1);
-                            }
+                if ifc == proto::WP_DRM_LEASE_REQUEST_V1
+                    && h.opcode == op::wp_drm_lease_request_v1::REQ_SUBMIT
+                {
+                    n += 1;
+                }
+                let Some(desc) = iface(ifc).messages(Dir::Request).get(h.opcode as usize) else {
+                    continue;
+                };
+                let Ok(args) = wire::parse(desc, m) else {
+                    continue;
+                };
+                for (a, at) in desc.args.iter().zip(args.iter()) {
+                    if let Val::NewId {
+                        id, iface: name, ..
+                    } = at.val
+                    {
+                        let ni = a.iface.or_else(|| name.and_then(proto::iface_by_name));
+                        if let Some(ni) = ni {
+                            fresh.insert(id, ni);
                         }
                     }
-                    (
-                        Some(proto::WP_DRM_LEASE_DEVICE_V1),
-                        op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST,
-                    ) => {
-                        fresh.insert(new_id(), proto::WP_DRM_LEASE_REQUEST_V1);
-                    }
-                    (
-                        Some(proto::WP_DRM_LEASE_REQUEST_V1),
-                        op::wp_drm_lease_request_v1::REQ_SUBMIT,
-                    ) => n += 1,
-                    _ => {}
                 }
             }
         }
         n
+    }
+
+    /// Hold the next frames from the channel to `n` lease submits between
+    /// them, or to none with `Some(0)`; `None` (the default) lets any number
+    /// through. The backend sets this to what [`Engine::lease_submits`]
+    /// counted and its throttle admitted, before each frame: a submit past it
+    /// is fatal.
+    pub fn allow_lease_submits(&mut self, n: Option<usize>) {
+        self.lease_allowance = n;
     }
 
     /// The connection is over: let go at once of what only a live connection
@@ -382,6 +489,18 @@ impl Engine {
     pub fn shed(&mut self) {
         self.shm.clear();
         self.blobs.clear();
+        self.streams.clear();
+        self.drop_channel_output();
+    }
+
+    /// Forget what is queued for the channel, without reading what commits
+    /// and blobs still had to read: the connection is ending, and nobody
+    /// will take it.
+    pub fn drop_channel_output(&mut self) {
+        self.out_channel.clear();
+        self.out_bytes = 0;
+        self.wl_bytes.clear();
+        self.wl_descs.clear();
     }
 
     /// The far side has gone (HANGUP received).
@@ -402,14 +521,84 @@ impl Engine {
         self.out_local.len()
     }
 
-    /// Everything queued for the channel, in order.
+    /// Everything queued for the channel, in order, read now.
     pub fn take_units(&mut self) -> VecDeque<Unit> {
+        self.take_units_upto(usize::MAX)
+    }
+
+    /// What is queued for the channel, in order, until about `max` bytes are
+    /// taken (always at least one record, if any is queued). Commits' copies
+    /// and blobs are read here, a record at a time, so what is not taken yet
+    /// costs nothing but a descriptor.
+    pub fn take_units_upto(&mut self, max: usize) -> VecDeque<Unit> {
         self.flush_wayland();
-        std::mem::take(&mut self.out_channel)
+        let mut out = VecDeque::new();
+        let mut n = 0;
+        while n < max || out.is_empty() {
+            let Some(front) = self.out_channel.front_mut() else {
+                break;
+            };
+            let next = match front {
+                Out::Unit(_) => None,
+                Out::Shm(j) => {
+                    let r = j.next_unit();
+                    if let Some((_, got)) = &r {
+                        self.shm.sync_bytes += *got as u64;
+                    }
+                    Some(r)
+                }
+                Out::Blob(j) => Some(j.next_unit()),
+            };
+            match next {
+                // A record ready to go.
+                None => {
+                    let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
+                        unreachable!()
+                    };
+                    self.out_bytes -= u.bytes();
+                    n += u.bytes();
+                    out.push_back(u);
+                }
+                // A job's next record.
+                Some(Some((u, got))) => {
+                    self.out_bytes -= got;
+                    n += u.bytes();
+                    out.push_back(u);
+                }
+                // A job done, or cut short.
+                Some(None) => {
+                    let j = self.out_channel.pop_front().unwrap();
+                    self.out_bytes -= j.bytes();
+                }
+            }
+        }
+        out
     }
 
     pub fn has_channel_output(&self) -> bool {
         !self.out_channel.is_empty() || !self.wl_bytes.is_empty()
+    }
+
+    /// Bytes queued for the channel, read or still to be read.
+    pub fn channel_backlog(&self) -> usize {
+        self.out_bytes + self.wl_bytes.len()
+    }
+
+    /// Stop taking the local peer's input while more than `limit` bytes are
+    /// queued for the channel (`None`: never). An engine facing a client
+    /// starts at [`CHANNEL_HIGH_WATER`], one facing a compositor at `None`:
+    /// a compositor's output is drained as it comes (its own buffer for us
+    /// is small, and full, it drops us).
+    pub fn set_input_limit(&mut self, limit: Option<usize>) {
+        self.input_limit = limit;
+    }
+
+    /// `from_local` would take nothing now: the channel has the limit's
+    /// worth queued. The rest of the input waits where it is (the caller's
+    /// buffer, then the socket) until the channel takes some.
+    pub fn input_blocked(&self) -> bool {
+        self.input_limit
+            .is_some_and(|l| self.channel_backlog() >= l)
     }
 
     pub fn objects(&self) -> &Objects {
@@ -445,8 +634,13 @@ impl Engine {
     }
 
     fn push_unit(&mut self, u: Unit) {
+        self.push_out(Out::Unit(u));
+    }
+
+    fn push_out(&mut self, o: Out) {
         self.flush_wayland();
-        self.out_channel.push_back(u);
+        self.out_bytes += o.bytes();
+        self.out_channel.push_back(o);
     }
 
     fn flush_wayland(&mut self) {
@@ -456,7 +650,9 @@ impl Engine {
         let descs = std::mem::take(&mut self.wl_descs);
         let rec = record(frame::REC_WAYLAND, 0, descs.len() as u32, &self.wl_bytes);
         self.wl_bytes.clear();
-        self.out_channel.push_back(Unit { rec, descs });
+        let u = Unit { rec, descs };
+        self.out_bytes += u.bytes();
+        self.out_channel.push_back(Out::Unit(u));
     }
 
     fn push_wayland(&mut self, msg: &[u8], descs: Vec<DescOut>) {
@@ -481,7 +677,10 @@ impl Engine {
     /// Parse every complete message at the front of `data` (bytes read from
     /// the local socket) with the descriptors received alongside, translate
     /// them, and queue the result for the channel. A partial message is left
-    /// in `data` for the next read.
+    /// in `data` for the next read, and so is everything after the message
+    /// that brought the channel's queue to the input limit
+    /// ([`Engine::input_blocked`]): the caller calls again once the channel
+    /// has taken some, whether or not more was read.
     pub fn from_local(
         &mut self,
         data: &mut Vec<u8>,
@@ -491,11 +690,14 @@ impl Engine {
         let dir = self.local_dir();
         let mut off = 0;
         let res = loop {
+            if self.input_blocked() {
+                break Ok(());
+            }
             let Some(h) = peek_header(&data[off..]) else {
                 break Ok(());
             };
             let size = h.size as usize;
-            if size < 8 || size > MAX_MSG || size % 4 != 0 {
+            if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
                 break Err(Fatal::new(
                     Blame::Local,
                     h.object,
@@ -548,6 +750,8 @@ impl Engine {
                     let h = Hello::decode(r.payload).ok_or_else(|| chan("short HELLO"))?;
                     self.peer_caps = h.caps;
                     self.got_hello = true;
+                    self.streams
+                        .set_peer_windows(h.caps & frame::HELLO_STREAM_WINDOW != 0);
                     if self.cfg.side == Side::Host {
                         self.cfg.policy.drm_file = h.caps & frame::HELLO_G_DRM_FILE != 0;
                         // Explicit sync needs both ends: fences served here
@@ -565,7 +769,10 @@ impl Engine {
                         let h = peek_header(p)
                             .ok_or_else(|| chan("partial message in WAYLAND record"))?;
                         let size = h.size as usize;
-                        if size < 8 || size > MAX_MSG || size % 4 != 0 || size > p.len() {
+                        if !(8..=MAX_MSG).contains(&size)
+                            || !size.is_multiple_of(4)
+                            || size > p.len()
+                        {
                             return Err(chan("bad message size in WAYLAND record"));
                         }
                         self.message(
@@ -582,6 +789,7 @@ impl Engine {
                             "WAYLAND record descriptor count disagrees with its messages",
                         ));
                     }
+                    self.blobs.expire();
                 }
                 frame::REC_STREAM_DATA => {
                     let mut out = Vec::new();
@@ -807,6 +1015,7 @@ impl Engine {
         let mut out_descs: Vec<DescOut> = Vec::new();
         let mut out_fds: Vec<OwnedFd> = Vec::new();
         let mut pre_units: Vec<Unit> = Vec::new();
+        let mut pre_job: Option<Out> = None;
         if desc.nfds > 0 {
             let class = desc.fd.ok_or_else(|| {
                 err(
@@ -836,8 +1045,19 @@ impl Engine {
                                     ));
                                 }
                             };
+                            // Read at every commit, on the thread that
+                            // serves the rest of the connection: memory,
+                            // not a file whose server decides how long a
+                            // read takes (sys::is_shmem).
+                            if !sys::is_shmem(fd.as_raw_fd()) {
+                                return Err(err(
+                                    ERR_SHM_INVALID_FD,
+                                    "an shm pool must be a memfd or a file on tmpfs".into(),
+                                ));
+                            }
                             // The client's own memory, but a descriptor
-                            // held here: only the count is charged.
+                            // held here: its count, and what its buffers
+                            // cover, are charged.
                             let charge = self
                                 .shm
                                 .charge()
@@ -861,12 +1081,25 @@ impl Engine {
                             if let Some(o) = offset_arg {
                                 edits.push((args[o as usize].off, 0));
                             }
-                            match self.blobs.send(&fd, off, len, &mut pre_units) {
-                                Some(id) => DescOut::plain(Desc {
-                                    a: id,
-                                    c: len,
-                                    ..Desc::new(frame::DESC_BLOB)
-                                }),
+                            // A client's file is read as the channel takes
+                            // it, as a pool is: memory only. A compositor's
+                            // (a keymap) is trusted to be readable.
+                            let readable =
+                                self.cfg.local == Local::Server || sys::is_shmem(fd.as_raw_fd());
+                            let sent = if readable {
+                                self.blobs.send(fd, off, len, &mut pre_units)
+                            } else {
+                                None
+                            };
+                            match sent {
+                                Some((id, job)) => {
+                                    pre_job = job.map(Out::Blob);
+                                    DescOut::plain(Desc {
+                                        a: id,
+                                        c: len,
+                                        ..Desc::new(frame::DESC_BLOB)
+                                    })
+                                }
                                 None => DescOut::plain(Desc::invalid(frame::DESC_BLOB)),
                             }
                         }
@@ -878,8 +1111,9 @@ impl Engine {
                                 ));
                             }
                             match self.streams.add_sink(fd) {
-                                Ok(id) => DescOut::plain(Desc {
+                                Ok((id, first)) => DescOut::plain(Desc {
                                     a: id,
+                                    b: first,
                                     ..Desc::new(frame::DESC_STREAM)
                                 }),
                                 Err(_) => DescOut::plain(Desc::invalid(frame::DESC_STREAM)),
@@ -976,7 +1210,7 @@ impl Engine {
                                 )
                             }
                             FdKind::Stream => {
-                                Some(self.streams.add_source(d.a).map_err(|e| {
+                                Some(self.streams.add_source(d.a, d.b).map_err(|e| {
                                     err(ERR_IMPLEMENTATION, format!("stream: {e:?}"))
                                 })?)
                             }
@@ -1023,7 +1257,7 @@ impl Engine {
         let client_side = self.cfg.local == Local::Client;
         let server_side = !client_side;
         let obj_id = h.object;
-        let mut commit_sync: Vec<Unit> = Vec::new();
+        let mut commit_sync: Option<SyncJob> = None;
         if dir == Dir::Request {
             match (obj.iface, h.opcode) {
                 (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_CREATE_BUFFER) => {
@@ -1041,12 +1275,12 @@ impl Engine {
                         })?;
                 }
                 (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_RESIZE) => {
-                    if let Val::Int(s) = args[0].val {
-                        if s > 0 {
-                            self.shm
-                                .resize(obj_id, s as u64, server_side)
-                                .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
-                        }
+                    if let Val::Int(s) = args[0].val
+                        && s > 0
+                    {
+                        self.shm
+                            .resize(obj_id, s as u64, server_side)
+                            .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
                     }
                 }
                 (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) if client_side => {
@@ -1065,11 +1299,26 @@ impl Engine {
                 (proto::WL_SURFACE, op::wl_surface::REQ_COMMIT) => {
                     self.stats.commits += 1;
                     if client_side {
-                        self.shm.commit(obj_id, &mut commit_sync);
+                        commit_sync = self.shm.commit(obj_id);
                     }
                 }
                 (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {
                     self.release_pending.insert(obj_id);
+                }
+                (proto::WP_DRM_LEASE_REQUEST_V1, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                    if !from_local =>
+                {
+                    match &mut self.lease_allowance {
+                        None => {}
+                        Some(0) => {
+                            return Err(err(
+                                ERR_IMPLEMENTATION,
+                                "a lease submit the rate limit did not admit".into(),
+                            ));
+                        }
+                        Some(k) => *k -= 1,
+                    }
+                    self.stats.lease_submits += 1;
                 }
                 _ => {}
             }
@@ -1081,22 +1330,17 @@ impl Engine {
         if dir == Dir::Event
             && obj.iface == proto::WL_DISPLAY
             && h.opcode == op::wl_display::EVT_DELETE_ID
+            && let Val::Uint(id) = args[0].val
+            && self.cfg.synth_released
+            && !from_local
+            && self.release_pending.remove(&id)
+            && !self.released_seen.remove(&id)
+            && self
+                .objects
+                .get(id)
+                .is_some_and(|o| !o.zombie && o.iface == proto::WP_DRM_LEASE_DEVICE_V1)
         {
-            if let Val::Uint(id) = args[0].val {
-                if self.cfg.synth_released
-                    && !from_local
-                    && self.release_pending.remove(&id)
-                    && !self.released_seen.remove(&id)
-                    && self
-                        .objects
-                        .get(id)
-                        .is_some_and(|o| !o.zombie && o.iface == proto::WP_DRM_LEASE_DEVICE_V1)
-                {
-                    synth = Some(
-                        MsgBuilder::new(id, op::wp_drm_lease_device_v1::EVT_RELEASED).finish(),
-                    );
-                }
-            }
+            synth = Some(MsgBuilder::new(id, op::wp_drm_lease_device_v1::EVT_RELEASED).finish());
         }
         if dir == Dir::Event
             && obj.iface == proto::WP_DRM_LEASE_DEVICE_V1
@@ -1127,13 +1371,12 @@ impl Engine {
         if dir == Dir::Event
             && obj.iface == proto::WL_DISPLAY
             && h.opcode == op::wl_display::EVT_DELETE_ID
+            && let Val::Uint(id) = args[0].val
         {
-            if let Val::Uint(id) = args[0].val {
-                self.objects.delete_id(id);
-                self.shm.forget(id);
-                self.release_pending.remove(&id);
-                self.released_seen.remove(&id);
-            }
+            self.objects.delete_id(id);
+            self.shm.forget(id);
+            self.release_pending.remove(&id);
+            self.released_seen.remove(&id);
         }
 
         drop(args);
@@ -1145,8 +1388,11 @@ impl Engine {
             for u in pre_units {
                 self.push_unit(u);
             }
-            for u in commit_sync {
-                self.push_unit(u);
+            if let Some(j) = pre_job {
+                self.push_out(j);
+            }
+            if let Some(j) = commit_sync {
+                self.push_out(Out::Shm(j));
             }
             self.push_wayland(&msg, out_descs);
         } else {
@@ -1174,30 +1420,30 @@ impl Engine {
             }
             RewriteKind::DevT(i) => {
                 let at = &args[i as usize];
-                if let Val::Array(a) = at.val {
-                    if a.len() == 8 {
-                        let dev = u64::from_ne_bytes(a.try_into().unwrap());
-                        let mm = major_minor(dev);
-                        let mapped = rw
-                            .devmap
-                            .iter()
-                            .find(|p| {
-                                if to_guest {
-                                    p.host == mm
-                                } else {
-                                    p.guest == mm
-                                }
-                            })
-                            .map(|p| if to_guest { p.guest } else { p.host });
-                        // A node with no counterpart (another GPU of the
-                        // host's, say) must not alias one of ours: 0 says
-                        // "unknown device" rather than naming the wrong one.
-                        let new = mapped.map(|(ma, mi)| makedev(ma, mi)).unwrap_or(0);
-                        let b = new.to_ne_bytes();
-                        edits.push((at.off + 4, u32::from_ne_bytes(b[0..4].try_into().unwrap())));
-                        edits.push((at.off + 8, u32::from_ne_bytes(b[4..8].try_into().unwrap())));
-                        self.stats.devt_rewrites += 1;
-                    }
+                if let Val::Array(a) = at.val
+                    && a.len() == 8
+                {
+                    let dev = u64::from_ne_bytes(a.try_into().unwrap());
+                    let mm = major_minor(dev);
+                    let mapped = rw
+                        .devmap
+                        .iter()
+                        .find(|p| {
+                            if to_guest {
+                                p.host == mm
+                            } else {
+                                p.guest == mm
+                            }
+                        })
+                        .map(|p| if to_guest { p.guest } else { p.host });
+                    // A node with no counterpart (another GPU of the host's,
+                    // say) must not alias one of ours: 0 says "unknown
+                    // device" rather than naming the wrong one.
+                    let new = mapped.map(|(ma, mi)| makedev(ma, mi)).unwrap_or(0);
+                    let b = new.to_ne_bytes();
+                    edits.push((at.off + 4, u32::from_ne_bytes(b[0..4].try_into().unwrap())));
+                    edits.push((at.off + 8, u32::from_ne_bytes(b[4..8].try_into().unwrap())));
+                    self.stats.devt_rewrites += 1;
                 }
             }
             RewriteKind::Timestamp {

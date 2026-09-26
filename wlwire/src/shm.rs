@@ -45,9 +45,17 @@
 //! guest can open as many connections as it is allowed channels. A pool counts
 //! against the pool count from before its memfd exists until the last
 //! reference to it (its own id, or a buffer made from it) is gone; its size is
-//! held only to what the protocol can say, an `int32`. The client's side
-//! charges only the count: its pools are the client's own memory, but each is
-//! a descriptor held here.
+//! held only to what the protocol can say, an `int32`.
+//!
+//! **The client's side** charges its buffers the same way, to the same
+//! per-connection limit, though its pools are the client's own memory and
+//! nothing is punched there: what its buffers cover is what a commit copies,
+//! and a buffer the server's side would refuse is refused here first, with
+//! the client told why, rather than read and carried across only to be
+//! refused there. The copy itself is made lazily ([`SyncJob`]): a commit
+//! queues where to read, and the bytes are read a record at a time as the
+//! channel takes them, so what a commit costs this side is one record, not
+//! the buffer.
 
 #![forbid(unsafe_code)]
 
@@ -69,9 +77,12 @@ pub struct Pool {
     pub size: AtomicU64,
     /// What this pool holds of its budgets, given back when it goes.
     charge: Charge,
-    /// Server side: the pages of our memfd some live buffer covers, which
-    /// are what the pool is charged for. `None` on the client's side.
-    held: Option<Mutex<Extents>>,
+    /// The pages of the pool some live buffer covers, which are what the
+    /// pool is charged for.
+    held: Mutex<Extents>,
+    /// Server side: pages no live buffer covers any more are punched out of
+    /// our memfd. The client's pool is the client's and is never written.
+    punch: bool,
 }
 
 impl Pool {
@@ -84,11 +95,8 @@ impl Pool {
     /// A buffer over `[off, off + len)` is made: charge the pages of it no
     /// live buffer covers yet, or refuse it and take nothing.
     fn hold(&self, off: u64, len: u64) -> Result<(), ShmError> {
-        let Some(held) = &self.held else {
-            return Ok(());
-        };
         let (a, b) = Self::pages(off, len);
-        let mut ext = held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ext = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if !self.charge.grow(ext.uncovered(a, b) * sys::page_size()) {
             return Err(ShmError::TooBig);
         }
@@ -97,18 +105,19 @@ impl Pool {
     }
 
     /// A buffer over `[off, off + len)` is gone: punch out the pages no live
-    /// buffer covers any more, and give back their charge. Pages the kernel
-    /// would not punch stay charged, until the pool goes.
+    /// buffer covers any more (server side), and give back their charge.
+    /// Pages the kernel would not punch stay charged, until the pool goes.
     fn release(&self, off: u64, len: u64) {
-        let Some(held) = &self.held else {
-            return;
-        };
         let (a, b) = Self::pages(off, len);
         let pg = sys::page_size();
-        let freed = held.lock().unwrap_or_else(|e| e.into_inner()).remove(a, b);
+        let freed = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(a, b);
         for (x, y) in freed {
             let (at, n) = (x * pg, (y - x) * pg);
-            if sys::punch_hole(self.fd.as_raw_fd(), at, n).is_ok() {
+            if !self.punch || sys::punch_hole(self.fd.as_raw_fd(), at, n).is_ok() {
                 self.charge.shrink(n);
             }
         }
@@ -241,7 +250,7 @@ impl ShmBudget {
     }
 
     /// Both or neither: a charge that would pass either limit takes nothing.
-    fn take(&self, bytes: u64, pools: u64) -> bool {
+    pub(crate) fn take(&self, bytes: u64, pools: u64) -> bool {
         let add = |c: &AtomicU64, n: u64, max: u64| {
             c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
                 u.checked_add(n).filter(|&t| t <= max)
@@ -258,7 +267,7 @@ impl ShmBudget {
         true
     }
 
-    fn give(&self, bytes: u64, pools: u64) {
+    pub(crate) fn give(&self, bytes: u64, pools: u64) {
         self.bytes.fetch_sub(bytes, Ordering::AcqRel);
         self.pools.fetch_sub(pools, Ordering::AcqRel);
     }
@@ -464,8 +473,8 @@ impl Shm {
     }
 
     /// A pool of `size` bytes, over `fd`: on the server's side our memfd,
-    /// whose buffers are charged by what they cover, on the client's the
-    /// client's own descriptor.
+    /// on the client's the client's own descriptor. Either way its buffers
+    /// are charged by what they cover.
     pub fn add_pool(&mut self, id: u32, fd: OwnedFd, size: u64, charge: Charge, server_side: bool) {
         self.pools.insert(
             id,
@@ -473,7 +482,8 @@ impl Shm {
                 fd,
                 size: AtomicU64::new(size),
                 charge,
-                held: server_side.then(Mutex::default),
+                held: Mutex::default(),
+                punch: server_side,
             }),
         );
     }
@@ -499,8 +509,8 @@ impl Shm {
         Ok(())
     }
 
-    /// `wl_shm_pool.create_buffer`. On the server's side the pages it covers
-    /// that no other live buffer of the pool does are charged now, and past a
+    /// `wl_shm_pool.create_buffer`. The pages it covers that no other live
+    /// buffer of the pool does are charged now, on either side, and past a
     /// budget it is `TooBig` and not made. Negative or overflowing geometry,
     /// or a buffer that does not fit its pool, is left for the compositor to
     /// refuse; it is simply not tracked here, so a commit of it copies
@@ -553,12 +563,11 @@ impl Shm {
         s.damage_rows = union(s.damage_rows, (a, b));
     }
 
-    /// `wl_surface.commit` on the client's side: queue the SHM_SYNC records
-    /// the commit needs, in `out`, to go before it.
-    pub fn commit(&mut self, surface: u32, out: &mut Vec<Unit>) {
-        let Some(s) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
+    /// `wl_surface.commit` on the client's side: what the commit needs copied
+    /// ahead of it, as a job the channel reads from when it has room
+    /// ([`SyncJob`]), not as bytes read now.
+    pub fn commit(&mut self, surface: u32) -> Option<SyncJob> {
+        let s = self.surfaces.get_mut(&surface)?;
         if let Some(b) = s.pending.take() {
             s.current = b;
             if b != 0 && self.buffers.contains_key(&b) {
@@ -576,9 +585,7 @@ impl Shm {
             }
         }
         let cur = s.current;
-        let Some(buf) = self.buffers.get_mut(&cur) else {
-            return;
-        };
+        let buf = self.buffers.get_mut(&cur)?;
         let range = if !buf.synced {
             Some((0, buf.height))
         } else {
@@ -586,31 +593,25 @@ impl Shm {
         };
         buf.synced = true;
         buf.dirty = None;
-        let Some((y0, y1)) = range else { return };
+        let (y0, y1) = range?;
         let (y0, y1) = (y0.min(buf.height), y1.min(buf.height));
         if y0 >= y1 {
-            return;
+            return None;
         }
         let pool_size = buf.pool.size.load(Ordering::Relaxed);
         let start = y0 * buf.stride;
         let end = (y1 * buf.stride).min(pool_size.saturating_sub(buf.offset));
-        let mut off = start;
-        let mut chunk = vec![0u8; MAX_REC_PAYLOAD];
-        while off < end {
-            let n = ((end - off) as usize).min(MAX_REC_PAYLOAD);
-            let got = sys::pread_full(buf.pool.fd.as_raw_fd(), &mut chunk[..n], buf.offset + off)
-                .unwrap_or(0);
-            if got == 0 {
-                break;
-            }
-            out.push(Unit {
-                rec: record(REC_SHM_SYNC, cur, off as u32, &chunk[..got]),
-                descs: Vec::new(),
-            });
-            self.sync_bytes += got as u64;
-            off += got as u64;
+        if start >= end {
+            return None;
         }
         self.syncs += 1;
+        Some(SyncJob {
+            pool: buf.pool.clone(),
+            buffer: cur,
+            base: buf.offset,
+            off: start,
+            end,
+        })
     }
 
     /// An SHM_SYNC record on the server's side: store the bytes, within a
@@ -631,6 +632,54 @@ impl Shm {
         self.sync_bytes += bytes.len() as u64;
         self.syncs += 1;
         Ok(())
+    }
+}
+
+/// The copy one commit needs, made as the channel takes it: bytes
+/// `[off, end)` of buffer `buffer`, which starts at `base` in its pool, as
+/// `SHM_SYNC` records. The pool is held (not the buffer: the client may
+/// destroy that once it has committed), so the read still has its
+/// descriptor. Reading later than the commit is as good as reading at it:
+/// the client may not touch a committed buffer until the compositor
+/// releases it, and the compositor has not seen the commit yet.
+pub struct SyncJob {
+    pool: Arc<Pool>,
+    buffer: u32,
+    base: u64,
+    off: u64,
+    end: u64,
+}
+
+impl SyncJob {
+    /// Bytes still to read.
+    pub fn remaining(&self) -> u64 {
+        self.end - self.off
+    }
+
+    /// The next record, and how many bytes of the buffer it carries; `None`
+    /// once done, or where the client's file ends short (it truncated its
+    /// own pool: the compositor keeps what it had there).
+    pub fn next_unit(&mut self) -> Option<(Unit, usize)> {
+        if self.off >= self.end {
+            return None;
+        }
+        let n = ((self.end - self.off) as usize).min(MAX_REC_PAYLOAD);
+        let mut chunk = vec![0u8; n];
+        let got = sys::pread_full(self.pool.fd.as_raw_fd(), &mut chunk, self.base + self.off)
+            .unwrap_or(0);
+        if got == 0 {
+            self.off = self.end;
+            return None;
+        }
+        let u = Unit {
+            rec: record(REC_SHM_SYNC, self.buffer, self.off as u32, &chunk[..got]),
+            descs: Vec::new(),
+        };
+        self.off += got as u64;
+        if got < n {
+            self.off = self.end;
+        }
+        Some((u, got))
     }
 }
 

@@ -13,6 +13,13 @@
 //! frame is kept and retried, and the local peer waits in its own socket
 //! buffer. The channel is read whenever it is readable, and what it yields is
 //! written to the local peer as fast as the peer takes it.
+//!
+//! What the daemon holds for the channel is one frame's worth per client, not
+//! what the client's input comes to: the engine reads commits' copies and
+//! blobs only as frames are made ([`Engine::take_units_upto`]), and stops
+//! taking the client's input once [`wlwire::engine::CHANNEL_HIGH_WATER`]
+//! bytes wait for the channel. What it has read and not taken stays in the
+//! client's input buffer, and is taken as the channel drains ([`Daemon::drive`]).
 
 #![forbid(unsafe_code)]
 
@@ -82,10 +89,24 @@ pub struct Totals {
     /// The most bytes one client has been seen not to have read (bounded
     /// by `LOCAL_OUT_MAX` and one received frame).
     pub peak_unread: u64,
+    /// The first [`MAX_ERRORS`] connections' fatal errors.
     pub errors: Vec<String>,
+    /// Every connection's.
+    pub error_count: u64,
 }
 
+/// Fatal errors kept in [`Totals::errors`]: every client can cause one, and
+/// the daemon runs as long as the guest does.
+pub const MAX_ERRORS: usize = 32;
+
 impl Totals {
+    fn error(&mut self, e: String) {
+        self.error_count += 1;
+        if self.errors.len() < MAX_ERRORS {
+            self.errors.push(e);
+        }
+    }
+
     fn add(&mut self, e: &Engine) {
         let s = &e.stats;
         self.msgs_to_host += s.msgs_to_channel;
@@ -118,6 +139,7 @@ const SUB_STREAM: u64 = 1 << 31;
 /// What one RECV asks the host for (at least `frame::MIN_FRAME`, at most
 /// what HELLO allows).
 const RECV_BYTES: usize = 256 * 1024;
+const _: () = assert!(RECV_BYTES >= frame::MIN_FRAME);
 
 /// Bytes the daemon holds for one client that has not read them. Past this
 /// the client's channel is not read any more until it catches up: its
@@ -128,6 +150,75 @@ const RECV_BYTES: usize = 256 * 1024;
 /// stuck client, and so does this: after [`STUCK_FOR`] over the line.
 const LOCAL_OUT_MAX: usize = 4 << 20;
 const STUCK_FOR: Duration = Duration::from_secs(30);
+
+/// Lines a client can cause (its protocol errors, its socket's): at most
+/// [`LOG_BURST`] each [`LOG_WINDOW`], a line the same as the one before is
+/// counted rather than repeated, and what is dropped is said once the window
+/// ends. Every guest process can connect, and the daemon's stderr is the
+/// guest journal.
+struct LogLimit {
+    window: Instant,
+    lines: u32,
+    dropped: u64,
+    last: String,
+    same: u64,
+}
+
+const LOG_BURST: u32 = 20;
+const LOG_WINDOW: Duration = Duration::from_secs(10);
+
+impl LogLimit {
+    fn new() -> Self {
+        Self {
+            window: Instant::now(),
+            lines: 0,
+            dropped: 0,
+            last: String::new(),
+            same: 0,
+        }
+    }
+
+    /// What to print for `line` at `now`.
+    fn lines(&mut self, line: String, now: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        if now.saturating_duration_since(self.window) >= LOG_WINDOW {
+            if self.dropped > 0 {
+                out.push(format!(
+                    "nvgpu-wl-guest: ({} lines dropped by the log limit)",
+                    self.dropped
+                ));
+            }
+            self.window = now;
+            self.lines = 0;
+            self.dropped = 0;
+        }
+        if line == self.last {
+            self.same += 1;
+            return out;
+        }
+        if self.same > 0 {
+            out.push(format!(
+                "nvgpu-wl-guest: (the line before, {} more times)",
+                self.same
+            ));
+            self.same = 0;
+        }
+        self.last.clone_from(&line);
+        if self.lines >= LOG_BURST {
+            self.dropped += 1;
+            return out;
+        }
+        self.lines += 1;
+        out.push(line);
+        out
+    }
+
+    fn say(&mut self, line: String) {
+        for l in self.lines(line, Instant::now()) {
+            eprintln!("{l}");
+        }
+    }
+}
 
 /// The process at the other end of a client socket (SO_PEERCRED), in the
 /// daemon's PID namespace; `None` when the kernel cannot say.
@@ -200,6 +291,7 @@ pub struct Daemon {
     hello_caps: u32,
     stop: Arc<AtomicBool>,
     totals: Arc<Mutex<Totals>>,
+    log: LogLimit,
 }
 
 fn epoll_ctl(ep: RawFd, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
@@ -266,6 +358,7 @@ impl Daemon {
             hello_caps: 0,
             stop: Arc::new(AtomicBool::new(false)),
             totals: Arc::new(Mutex::new(Totals::default())),
+            log: LogLimit::new(),
         };
         if d.info.max_frame < frame::MIN_FRAME {
             return Err(io::Error::other(format!(
@@ -419,7 +512,7 @@ impl Daemon {
                                 let wr = events & (libc::EPOLLOUT | libc::EPOLLERR) as u32 != 0;
                                 c.engine.stream_io(id, rd, wr);
                             }
-                            self.pump_tx(slot);
+                            self.drive(slot);
                         }
                         _ => {}
                     }
@@ -433,7 +526,7 @@ impl Daemon {
                 .as_ref()
                 .is_some_and(|c| !c.tx.is_empty())
             {
-                self.pump_tx(slot);
+                self.drive(slot);
                 touched.push(slot);
             }
             // A client that has fallen behind is looked at every turn, so
@@ -482,6 +575,9 @@ impl Daemon {
             return;
         }
         let mut engine = Engine::new(self.engine_config(local));
+        // A guest compositor's output is paced by the channel too (export
+        // mode): its peer is the host client, behind the channel.
+        engine.set_input_limit(Some(wlwire::engine::CHANNEL_HIGH_WATER));
         engine.hello(self.hello_caps);
         let slot = match self.clients.iter().position(|c| c.is_none()) {
             Some(s) => s,
@@ -526,7 +622,7 @@ impl Daemon {
             closing: false,
         });
         self.totals.lock().unwrap().clients += 1;
-        self.pump_tx(slot);
+        self.drive(slot);
         // The channel may already be readable (the host's HELLO).
         self.read_channel(slot);
         self.sync(slot);
@@ -545,7 +641,9 @@ impl Daemon {
                 } {
                     Ok(ch) => self.add_client(s, ch, Local::Client),
                     Err(e) => {
-                        eprintln!("nvgpu-wl-guest: cannot open a channel to the host: {e}");
+                        self.log.say(format!(
+                            "nvgpu-wl-guest: cannot open a channel to the host: {e}"
+                        ));
                         let err = Fatal {
                             object: 1,
                             code: wlwire::engine::ERR_IMPLEMENTATION,
@@ -575,10 +673,10 @@ impl Daemon {
             };
             match UnixStream::connect(&target) {
                 Ok(s) => self.add_client(s, ch, Local::Server),
-                Err(e) => eprintln!(
+                Err(e) => self.log.say(format!(
                     "nvgpu-wl-guest: cannot reach the guest compositor at {}: {e}",
                     target.display()
-                ),
+                )),
             }
         }
     }
@@ -587,15 +685,16 @@ impl Daemon {
         let Some(c) = self.clients[slot].as_mut() else {
             return;
         };
+        // Peer text: printable already (the engine's), quoted here.
+        let text = wlwire::engine::printable(&f.message, 256);
         self.totals
             .lock()
             .unwrap()
-            .errors
-            .push(format!("{:?}: {}", f.blame, f.message));
-        eprintln!(
-            "nvgpu-wl-guest: closing a connection: {:?}: {}",
-            f.blame, f.message
-        );
+            .error(format!("{:?}: {text}", f.blame));
+        self.log.say(format!(
+            "nvgpu-wl-guest: closing a connection: {:?}: {text:?}",
+            f.blame
+        ));
         match (c.engine.local_is_client(), f.blame) {
             // Our client gets the error it earned, or the host's verdict.
             (true, _) => {
@@ -618,7 +717,7 @@ impl Daemon {
         let mut buf = vec![0u8; 64 * 1024];
         for _ in 0..16 {
             let c = self.clients[slot].as_mut().unwrap();
-            if c.closing || !c.tx.is_empty() {
+            if c.closing || !c.tx.is_empty() || c.engine.input_blocked() {
                 break;
             }
             let mut fds = Vec::new();
@@ -630,17 +729,22 @@ impl Daemon {
                 Ok(n) => {
                     c.inbuf.extend_from_slice(&buf[..n]);
                     c.infds.extend(fds);
-                    let Client {
-                        engine,
-                        inbuf,
-                        infds,
-                        ..
-                    } = c;
-                    if let Err(f) = engine.from_local(inbuf, infds, &mut GuestPlat) {
+                    if c.infds.len() > wlwire::wire::MAX_FDS_QUEUED {
+                        // As libwayland does with a client that overflows
+                        // its descriptor ring.
+                        let f = Fatal {
+                            object: 1,
+                            code: wlwire::engine::ERR_NO_MEMORY,
+                            message: format!(
+                                "more than {} file descriptors sent that no request takes",
+                                wlwire::wire::MAX_FDS_QUEUED
+                            ),
+                            blame: Blame::Local,
+                        };
                         self.fatal(slot, f);
                         break;
                     }
-                    self.pump_tx(slot);
+                    self.drive(slot);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -652,35 +756,78 @@ impl Daemon {
         }
     }
 
+    /// Send what the client's engine has for the host, and take more of the
+    /// client's input as the channel takes it, until the host is busy, the
+    /// engine's input limit is reached, or the input is used up.
+    fn drive(&mut self, slot: usize) {
+        loop {
+            self.pump_tx(slot);
+            let Some(c) = self.clients[slot].as_mut() else {
+                return;
+            };
+            if c.closing || !c.tx.is_empty() || c.inbuf.is_empty() {
+                return;
+            }
+            let before = c.inbuf.len();
+            let Client {
+                engine,
+                inbuf,
+                infds,
+                ..
+            } = c;
+            if let Err(f) = engine.from_local(inbuf, infds, &mut GuestPlat) {
+                self.fatal(slot, f);
+                return;
+            }
+            let c = self.clients[slot].as_mut().unwrap();
+            // Only part of a message is left, or nothing was taken.
+            if c.inbuf.len() == before && !c.engine.has_channel_output() {
+                return;
+            }
+        }
+    }
+
     fn write_local(&mut self, slot: usize) {
         let c = self.clients[slot].as_mut().unwrap();
         if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-            eprintln!("nvgpu-wl-guest: writing to a client: {e}");
+            self.log
+                .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
             c.closing = true;
         }
     }
 
-    /// Frame whatever the engine has for the host and send it, in order.
+    /// Frame what the engine has for the host and send it, in order, a
+    /// frame's worth at a time: until the host is busy (the frame is kept,
+    /// and retried) or nothing is left.
     fn pump_tx(&mut self, slot: usize) {
         let max = self.info.max_frame;
         let Some(c) = self.clients[slot].as_mut() else {
             return;
         };
-        let mut units: VecDeque<Unit> = c.engine.take_units();
-        while !units.is_empty() {
-            let (f, fds) = frame::pack(&mut units, max, frame::MAX_DESC, false);
-            c.tx.push_back((f, fds));
-        }
-        while let Some((f, fds)) = c.tx.front_mut() {
+        loop {
+            if c.tx.is_empty() {
+                let mut units: VecDeque<Unit> = c.engine.take_units_upto(max);
+                if units.is_empty() {
+                    return;
+                }
+                while !units.is_empty() {
+                    let (f, fds) = frame::pack(&mut units, max, frame::MAX_DESC, false);
+                    c.tx.push_back((f, fds));
+                }
+            }
+            let Some((f, fds)) = c.tx.front_mut() else {
+                return;
+            };
             match c.chan.send(f, fds) {
                 Ok(Sent::Accepted { .. }) => {
                     c.tx.pop_front();
                 }
-                Ok(Sent::Busy) => break,
+                Ok(Sent::Busy) => return,
                 Err(e) => {
                     // The host ended the connection; its reason, if any, is
                     // waiting in the channel.
-                    eprintln!("nvgpu-wl-guest: the host refused a frame: {e}");
+                    self.log
+                        .say(format!("nvgpu-wl-guest: the host refused a frame: {e}"));
                     c.tx.clear();
                     self.read_channel(slot);
                     if let Some(c) = self.clients[slot].as_mut() {
@@ -714,7 +861,7 @@ impl Daemon {
             let r = match c.chan.recv(max, card, render) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("nvgpu-wl-guest: channel: {e}");
+                    self.log.say(format!("nvgpu-wl-guest: channel: {e}"));
                     c.closing = true;
                     return;
                 }
@@ -729,7 +876,8 @@ impl Daemon {
                 }
                 let c = self.clients[slot].as_mut().unwrap();
                 if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-                    eprintln!("nvgpu-wl-guest: writing to a client: {e}");
+                    self.log
+                        .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
                     c.closing = true;
                 }
                 let unread = c.engine.local_out_len() as u64;
@@ -737,7 +885,7 @@ impl Daemon {
                     let mut t = self.totals.lock().unwrap();
                     t.peak_unread = t.peak_unread.max(unread);
                 }
-                self.pump_tx(slot);
+                self.drive(slot);
             }
             let Some(c) = self.clients[slot].as_mut() else {
                 return;
@@ -784,11 +932,11 @@ impl Daemon {
         if behind {
             let since = *c.stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= STUCK_FOR {
-                eprintln!(
+                self.log.say(format!(
                     "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
                     c.engine.local_out_len(),
                     STUCK_FOR.as_secs()
-                );
+                ));
                 self.close(slot);
                 return;
             }
@@ -933,7 +1081,6 @@ mod tests {
         d.turn(100).unwrap();
         // The first receive is made as the client is added.
         assert_eq!(asked.load(Ordering::Relaxed), RECV_BYTES);
-        assert!(RECV_BYTES >= frame::MIN_FRAME);
     }
 
     #[test]
@@ -970,5 +1117,324 @@ mod tests {
             retried <= 2,
             "{retried} SENDs retried for a client that is gone"
         );
+    }
+
+    /// A host scripted by the test: frames are taken or refused as busy as
+    /// the test says, and what it pushes is received.
+    #[derive(Clone)]
+    struct Script {
+        busy: Arc<AtomicBool>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        inbox: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        ready: Arc<OwnedFd>,
+    }
+
+    impl Script {
+        fn new() -> Self {
+            Self {
+                busy: Arc::new(AtomicBool::new(false)),
+                sent: Arc::new(Mutex::new(Vec::new())),
+                inbox: Arc::new(Mutex::new(VecDeque::new())),
+                ready: Arc::new(sys::eventfd().unwrap()),
+            }
+        }
+
+        /// The host says `units`.
+        fn push(&self, units: Vec<Unit>) {
+            let mut q: VecDeque<Unit> = units.into();
+            let (f, _) = frame::pack(&mut q, 1 << 20, 256, false);
+            self.inbox.lock().unwrap().push_back(f);
+            sys::eventfd_signal(self.ready.as_raw_fd());
+        }
+
+        /// Every record the daemon's frames carried, as (type, id, payload).
+        fn records(&self) -> Vec<(u16, u32, Vec<u8>)> {
+            let sent = self.sent.lock().unwrap();
+            let mut v = Vec::new();
+            for f in sent.iter() {
+                let f = frame::decode(f).unwrap();
+                for r in f.records() {
+                    v.push((r.ty, r.id, r.payload.to_vec()));
+                }
+            }
+            v
+        }
+    }
+
+    struct ScriptChannel(Script);
+
+    impl Channel for ScriptChannel {
+        fn send(&mut self, f: &mut [u8], _fds: &[Option<OwnedFd>]) -> io::Result<Sent> {
+            if self.0.busy.load(Ordering::Relaxed) {
+                return Ok(Sent::Busy);
+            }
+            self.0.sent.lock().unwrap().push(f.to_vec());
+            Ok(Sent::Accepted { backlog: 0 })
+        }
+        fn recv(
+            &mut self,
+            _max: usize,
+            _c: Option<RawFd>,
+            _r: Option<RawFd>,
+        ) -> io::Result<Received> {
+            let mut inbox = self.0.inbox.lock().unwrap();
+            let frame = match inbox.pop_front() {
+                Some(f) => f,
+                None => frame::pack(&mut VecDeque::new(), frame::MIN_FRAME, 0, false).0,
+            };
+            if inbox.is_empty() {
+                sys::eventfd_clear(self.0.ready.as_raw_fd());
+            }
+            Ok(Received {
+                frame,
+                fds: Vec::new(),
+                more: !inbox.is_empty(),
+            })
+        }
+        fn poll_fd(&self) -> RawFd {
+            self.0.ready.as_raw_fd()
+        }
+    }
+
+    struct ScriptHost(Script);
+
+    impl Connector for ScriptHost {
+        fn info(&mut self) -> io::Result<HostInfo> {
+            Ok(HostInfo {
+                caps: uapi::CAP_WAYLAND,
+                clock_offset_ns: 0,
+                max_frame: 256 * 1024,
+                devmap: Vec::new(),
+            })
+        }
+        fn connect(&mut self, _mode: u32) -> io::Result<Box<dyn Channel>> {
+            Ok(Box::new(ScriptChannel(self.0.clone())))
+        }
+    }
+
+    use wlwire::proto::op;
+    use wlwire::wire::MsgBuilder;
+
+    /// A daemon with one client whose registry offers wl_compositor and
+    /// wl_shm, bound as 3 and 4.
+    fn scripted(tag: &str) -> (Daemon, Script, UnixStream) {
+        let sock = socket_in_tmp(tag);
+        let script = Script::new();
+        let mut d = Daemon::new(Config::new(&sock), Box::new(ScriptHost(script.clone()))).unwrap();
+        let mut client = UnixStream::connect(&sock).unwrap();
+        d.turn(100).unwrap();
+        use std::io::Write;
+        client
+            .write_all(
+                &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                    .new_id(2)
+                    .finish(),
+            )
+            .unwrap();
+        d.turn(100).unwrap();
+        let hello = frame::Hello {
+            version: frame::WL_PROTO_VERSION,
+            caps: 0,
+        };
+        let globals = [
+            MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+                .uint(1)
+                .string(Some("wl_compositor"))
+                .uint(4)
+                .finish(),
+            MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+                .uint(2)
+                .string(Some("wl_shm"))
+                .uint(1)
+                .finish(),
+        ]
+        .concat();
+        script.push(vec![
+            Unit {
+                rec: frame::record(frame::REC_HELLO, 0, 0, &hello.encode()),
+                descs: Vec::new(),
+            },
+            Unit {
+                rec: frame::record(frame::REC_WAYLAND, 0, 0, &globals),
+                descs: Vec::new(),
+            },
+        ]);
+        d.turn(100).unwrap();
+        client
+            .write_all(
+                &[
+                    MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                        .uint(1)
+                        .generic_new_id("wl_compositor", 4, 3)
+                        .finish(),
+                    MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                        .uint(2)
+                        .generic_new_id("wl_shm", 1, 4)
+                        .finish(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+        d.turn(100).unwrap();
+        (d, script, client)
+    }
+
+    fn the_client(d: &Daemon) -> &Client {
+        d.clients
+            .iter()
+            .flatten()
+            .next()
+            .expect("the client is open")
+    }
+
+    /// A client committing a large buffer over and over, to a host that is
+    /// busy: the daemon holds a frame for it, not the buffer per commit, and
+    /// what the client sent after is taken, in order, once the host drains.
+    /// Before, the whole of every commit was read and framed at once.
+    #[test]
+    fn a_client_committing_a_large_buffer_to_a_busy_host_costs_the_daemon_a_frame() {
+        let (mut d, script, mut client) = scripted("commit");
+        use std::io::Write;
+        let (stride, height) = (4096i32, 4096i32); // 16 MiB
+        let pool = sys::memfd(c"pool", (stride * height) as u64).unwrap();
+        let setup = [
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(5)
+                .finish(),
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(6)
+                .int(stride * height)
+                .finish(),
+            MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(7)
+                .int(0)
+                .int(stride / 4)
+                .int(height)
+                .int(stride)
+                .uint(0)
+                .finish(),
+        ]
+        .concat();
+        sys::send_with_fds(client.as_raw_fd(), &setup, &[pool.as_raw_fd()]).unwrap();
+        d.turn(100).unwrap();
+        script.busy.store(true, Ordering::Relaxed);
+        let mut frames = vec![
+            MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+                .object(7)
+                .int(0)
+                .int(0)
+                .finish(),
+            MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish(),
+        ];
+        for _ in 0..3 {
+            frames.push(
+                MsgBuilder::new(5, op::wl_surface::REQ_DAMAGE)
+                    .int(0)
+                    .int(0)
+                    .int(i32::MAX)
+                    .int(i32::MAX)
+                    .finish(),
+            );
+            frames.push(MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish());
+        }
+        let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish();
+        frames.push(sync.clone());
+        client.write_all(&frames.concat()).unwrap();
+        for _ in 0..5 {
+            d.turn(10).unwrap();
+        }
+        let c = the_client(&d);
+        let held: usize = c.tx.iter().map(|(f, _)| f.len()).sum();
+        assert!(
+            held <= 2 * 256 * 1024,
+            "{held} bytes framed for a busy host"
+        );
+        assert!(c.engine.input_blocked());
+        assert!(
+            c.inbuf.ends_with(&sync),
+            "what follows waits in the input buffer"
+        );
+        // The host drains: everything goes, in order, with no more input.
+        script.busy.store(false, Ordering::Relaxed);
+        for _ in 0..50 {
+            d.turn(10).unwrap();
+            if the_client(&d).inbuf.is_empty() && the_client(&d).tx.is_empty() {
+                break;
+            }
+        }
+        let recs = script.records();
+        let synced: usize = recs
+            .iter()
+            .filter(|r| r.0 == frame::REC_SHM_SYNC)
+            .map(|r| r.2.len())
+            .sum();
+        assert_eq!(synced, 4 * (stride * height) as usize);
+        let last = recs
+            .iter()
+            .rev()
+            .find(|r| r.0 == frame::REC_WAYLAND)
+            .unwrap();
+        assert!(last.2.ends_with(&sync), "the sync went last");
+    }
+
+    /// Descriptors sent beside messages that take none are not held for
+    /// ever: past libwayland's own ring the client is closed, as libwayland
+    /// closes it. Before, the daemon kept every one.
+    #[test]
+    fn a_client_sending_descriptors_no_request_takes_is_closed() {
+        let (mut d, _script, client) = scripted("fds");
+        let e = sys::eventfd().unwrap();
+        let fds = [e.as_raw_fd(); 28];
+        let mut sent = 0;
+        let mut id = 100;
+        while sent <= wlwire::wire::MAX_FDS_QUEUED {
+            let m = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+                .new_id(id)
+                .finish();
+            id += 1;
+            if sys::send_with_fds(client.as_raw_fd(), &m, &fds).is_err() {
+                break;
+            }
+            sent += fds.len();
+            d.turn(0).unwrap();
+        }
+        for _ in 0..10 {
+            d.turn(10).unwrap();
+        }
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the client holding {sent} descriptors is closed"
+        );
+    }
+
+    /// A client's errors cost the guest journal a bounded number of lines,
+    /// and the daemon's totals a bounded list: the same line again is
+    /// counted, not repeated, and past the burst lines are dropped and said
+    /// to be. Before, every one was printed and kept.
+    #[test]
+    fn what_clients_cause_is_logged_and_kept_within_bounds() {
+        let mut l = LogLimit::new();
+        let t0 = Instant::now();
+        let mut printed = 0;
+        for _ in 0..1000 {
+            printed += l.lines("closing: same".into(), t0).len();
+        }
+        assert_eq!(printed, 1);
+        let mut printed = Vec::new();
+        for i in 0..1000 {
+            printed.extend(l.lines(format!("closing: {i}"), t0));
+        }
+        assert!(printed.len() <= LOG_BURST as usize + 1, "{}", printed.len());
+        assert!(printed[0].contains("999 more times"), "{printed:?}");
+        let later = l.lines("closing: after".into(), t0 + LOG_WINDOW);
+        assert!(later[0].contains("lines dropped"), "{later:?}");
+        assert_eq!(later.last().unwrap(), "closing: after");
+        let mut t = Totals::default();
+        for i in 0..1000 {
+            t.error(format!("{i}"));
+        }
+        assert_eq!((t.errors.len(), t.error_count), (MAX_ERRORS, 1000));
     }
 }

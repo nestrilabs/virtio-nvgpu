@@ -14,27 +14,80 @@
 //!   descriptors of any kind, into either end -- the guest's frames into the
 //!   host engine are the boundary that matters most;
 //! - moving what each end has queued across, as the channel would;
-//! - stream readiness.
+//! - stream readiness;
+//! - time passing, for the lease throttle.
+//!
+//! The configuration byte picks normal mode (the guest faces an app, the host
+//! a compositor) or export mode (the guest faces a compositor, the host a
+//! host client), fences, DRM files, the lease device, and the lease rate.
+//! Every frame into the host engine goes as `WlConn::send` sends it: its
+//! lease submits counted (`Engine::lease_submits`), admitted by a
+//! `LeaseThrottle` on a clock the input moves, and held to that count.
 //!
 //! A `Fatal` from an end is that connection closed, and ends the run, as it
 //! would the connection. Anything else wrong -- a panic, a descriptor still
-//! open after both ends are dropped, memory without bound -- is the finding.
+//! open after both ends are dropped -- is the finding, and so is:
+//!
+//! - an engine holding more memory than its budgets allow
+//!   (`Engine::held_bytes`, after every operation);
+//! - more lease submits reaching the compositor than the throttle admitted,
+//!   or the throttle admitting more than its burst and rate allow, or still
+//!   refusing once the wait it named has passed.
 
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use wlwire::engine::{DevPair, Engine, EngineConfig, Local, Platform, Rewrites, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::proto::{self, ArgKind, Dir};
 use wlwire::shm::ShmBudget;
+use wlwire::stream::ByteBudget;
 use wlwire::wire::{MsgBuilder, SERVER_ID_START};
 
 use super::Bytes;
+use crate::wl::{LeaseRefusal, LeaseThrottle};
+
+/// What the host engine may hold: its process's shm budget (unfinished
+/// blobs), its stream budget, and what one operation's input can make
+/// before the next pump (at most 128 operations of at most 1 MiB each, and
+/// much less in practice).
+const HOST_HELD: usize = (16 << 20) + STREAM_BUDGET + (32 << 20);
+/// The guest engine has no shared budgets: unfinished blobs to their
+/// per-connection limit, stream sinks to theirs, and the same slack.
+const GUEST_HELD: usize = (64 << 20) + (16 << 20) + (32 << 20);
+/// The host's stream sinks, as the backend's queue budget share would be.
+const STREAM_BUDGET: usize = 8 << 20;
+
+/// A byte budget for the host's stream sinks.
+struct Budget(Mutex<usize>, usize);
+
+impl Budget {
+    fn used(&self) -> usize {
+        *self.0.lock().unwrap()
+    }
+}
+
+impl ByteBudget for Budget {
+    fn take(&self, n: usize) -> bool {
+        let mut u = self.0.lock().unwrap();
+        match u.checked_add(n).filter(|&t| t <= self.1) {
+            Some(t) => {
+                *u = t;
+                true
+            }
+            None => false,
+        }
+    }
+    fn give(&self, n: usize) {
+        *self.0.lock().unwrap() -= n;
+    }
+}
 
 struct Plat;
 
@@ -104,9 +157,23 @@ struct Pair {
     h: Engine,
     /// The last client id the app used, and server id the compositor did.
     ids: (u32, u32),
+    /// Export mode: the guest faces a compositor, the host a client.
+    export: bool,
+    lease: LeaseThrottle,
+    interval: Duration,
+    burst: u32,
+    /// The throttle's clock: a fixed start, and how far the input moved it.
+    t0: Instant,
+    elapsed: Duration,
+    /// Submits the throttle admitted.
+    admitted: u64,
+    streams: Arc<Budget>,
 }
 
-fn engines(cfg: u8) -> Pair {
+fn engines(cfg: u8, rate: u8) -> Pair {
+    let export = cfg & 0x10 != 0;
+    let interval = Duration::from_millis(250 * u64::from(rate % 8 + 1));
+    let burst = u32::from(rate >> 3) % 4 + 1;
     let rewrites = Rewrites {
         devmap: vec![DevPair {
             host: (226, 129),
@@ -114,28 +181,35 @@ fn engines(cfg: u8) -> Pair {
         }],
         clock_offset: Arc::new(AtomicI64::new(i64::from(cfg as i8) * 1_000_000)),
     };
+    // Normal mode as the daemon and WlConn::open make them; export mode as
+    // the daemon's export side and WlConn::from_export do.
     let mut g = Engine::new(EngineConfig {
         side: Side::Guest,
-        local: Local::Client,
+        local: if export { Local::Server } else { Local::Client },
         policy: Policy {
-            drm_file: true,
+            drm_file: !export,
             lease: LeaseGate::Allow,
-            fences: cfg & 2 != 0,
+            fences: !export && cfg & 2 != 0,
         },
         rewrites: Some(rewrites),
-        synth_released: true,
+        synth_released: !export,
     });
+    g.set_input_limit(Some(wlwire::engine::CHANNEL_HIGH_WATER));
     let mut h = Engine::new(EngineConfig {
         side: Side::Host,
-        local: Local::Server,
-        policy: Policy {
-            drm_file: cfg & 4 != 0,
-            lease: if cfg & 8 != 0 {
-                LeaseGate::Allow
-            } else {
-                LeaseGate::Deny
-            },
-            fences: cfg & 2 != 0,
+        local: if export { Local::Client } else { Local::Server },
+        policy: if export {
+            Policy::default()
+        } else {
+            Policy {
+                drm_file: cfg & 4 != 0,
+                lease: if cfg & 8 != 0 {
+                    LeaseGate::Allow
+                } else {
+                    LeaseGate::Deny
+                },
+                fences: cfg & 2 != 0,
+            }
         },
         rewrites: None,
         synth_released: false,
@@ -143,19 +217,31 @@ fn engines(cfg: u8) -> Pair {
     // The VM's budget and a process's, as the backend gives every connection.
     h.set_shm_budget(Arc::new(ShmBudget::new(64 << 20, 64)));
     h.set_shm_budget(Arc::new(ShmBudget::new(16 << 20, 16)));
-    g.hello(
+    let streams = Arc::new(Budget(Mutex::new(0), STREAM_BUDGET));
+    h.set_stream_budget(streams.clone());
+    g.hello(if export {
+        frame::HELLO_G_DMABUF_IMPORT
+    } else {
         frame::HELLO_G_DRM_FILE
             | if cfg & 2 != 0 {
                 frame::HELLO_G_SYNCOBJ
             } else {
                 0
-            },
-    );
+            }
+    });
     h.hello(0);
     Pair {
         g,
         h,
         ids: (2, SERVER_ID_START),
+        export,
+        lease: LeaseThrottle::new(interval, burst),
+        interval,
+        burst,
+        t0: Instant::now(),
+        elapsed: Duration::ZERO,
+        admitted: 0,
+        streams,
     }
 }
 
@@ -244,8 +330,11 @@ fn record_frame(b: &mut Bytes) -> (Vec<u8>, Vec<Option<OwnedFd>>) {
     let mut q = VecDeque::new();
     for _ in 0..(b.u8() % 4 + 1) {
         let ty = u16::from(b.u8() % 10);
-        let (id, arg) = (b.u32() % 64, b.u32());
-        let n = b.u16() as usize % 8192;
+        // Ids of either side's half (streams and blobs are the sender's),
+        // payloads up to a record's most.
+        let half = if b.u8() & 1 != 0 { 0x8000_0000 } else { 0 };
+        let (id, arg) = (b.u32() % 64 | half, b.u32());
+        let n = b.u16() as usize;
         let payload = b.take(n).to_vec();
         let descs = (0..b.u8() % 4)
             .map(|_| {
@@ -268,17 +357,89 @@ fn record_frame(b: &mut Bytes) -> (Vec<u8>, Vec<Option<OwnedFd>>) {
 }
 
 impl Pair {
-    /// Move everything queued on either side across until quiet (bounded).
+    /// Directions of what each end's local peer sends: (guest's, host's).
+    fn local_dirs(&self) -> (Dir, Dir) {
+        if self.export {
+            (Dir::Event, Dir::Request)
+        } else {
+            (Dir::Request, Dir::Event)
+        }
+    }
+
+    /// A frame into the host engine, as `WlConn::send` takes it: its lease
+    /// submits admitted first (retried once the throttle's wait has passed,
+    /// as the daemon retries on EAGAIN), and the engine held to them.
+    fn to_host(&mut self, f: &[u8], fds: Vec<Option<OwnedFd>>) -> bool {
+        let n = self.h.lease_submits(f);
+        match self.lease.admit(n, self.t0 + self.elapsed) {
+            Ok(()) => {}
+            Err(LeaseRefusal::OverBurst) => {
+                assert!(
+                    n > self.burst as usize,
+                    "{n} submits refused as over a burst of {}",
+                    self.burst
+                );
+                return false;
+            }
+            Err(LeaseRefusal::Wait(w)) => {
+                assert!(w > Duration::ZERO);
+                self.elapsed += w;
+                assert_eq!(
+                    self.lease.admit(n, self.t0 + self.elapsed),
+                    Ok(()),
+                    "{n} submits still refused after the wait the throttle named"
+                );
+            }
+        }
+        self.admitted += n as u64;
+        // GCRA: never more than the burst, plus one per interval since.
+        let allowed = u64::from(self.burst)
+            + (self.elapsed.as_nanos() / self.interval.as_nanos()) as u64;
+        assert!(
+            self.admitted <= allowed,
+            "{} submits admitted in {:?} at {:?} a burst of {}",
+            self.admitted,
+            self.elapsed,
+            self.interval,
+            self.burst
+        );
+        self.h.allow_lease_submits(Some(n));
+        let ok = self.h.from_channel(f, fds, &mut Plat).is_ok();
+        self.h.allow_lease_submits(Some(0));
+        assert!(
+            self.h.stats.lease_submits <= self.admitted,
+            "{} submits reached the compositor, {} admitted",
+            self.h.stats.lease_submits,
+            self.admitted
+        );
+        ok
+    }
+
+    /// Neither engine holds more than its budgets allow.
+    fn check_memory(&self) {
+        let (g, h) = (self.g.held_bytes(), self.h.held_bytes());
+        assert!(h <= HOST_HELD, "the host engine holds {h} bytes");
+        assert!(g <= GUEST_HELD, "the guest engine holds {g} bytes");
+        assert!(self.streams.used() <= STREAM_BUDGET);
+    }
+
+    /// Move everything queued on either side across until quiet (bounded),
+    /// a frame at a time as the daemon and the backend take it.
     fn pump(&mut self) -> bool {
         for _ in 0..16 {
             let mut moved = false;
-            let mut q = self.g.take_units();
-            while !q.is_empty() {
-                let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
-                if self.h.from_channel(&f, fds, &mut Plat).is_err() {
-                    return false;
+            loop {
+                let mut q = self.g.take_units_upto(1 << 20);
+                if q.is_empty() {
+                    break;
                 }
-                moved = true;
+                while !q.is_empty() {
+                    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+                    if !self.to_host(&f, fds) {
+                        return false;
+                    }
+                    moved = true;
+                }
             }
             let mut q = self.h.take_units();
             while !q.is_empty() {
@@ -308,14 +469,16 @@ pub fn run(data: &[u8]) {
     let fds_before = super::open_fds();
     {
         let mut b = Bytes::new(data);
-        let mut p = engines(b.u8());
+        let (cfg, rate) = (b.u8(), b.u8());
+        let mut p = engines(cfg, rate);
         if !p.pump() {
             return;
         }
         let mut n = 0;
         while !b.is_empty() && n < 128 {
             n += 1;
-            let ok = match b.u8() % 8 {
+            let (gdir, hdir) = p.local_dirs();
+            let ok = match b.u8() % 9 {
                 // The app, raw bytes.
                 0 => {
                     let mut data = b.chunk(4096).to_vec();
@@ -327,7 +490,7 @@ pub fn run(data: &[u8]) {
                 // The app, a message of the protocol.
                 1 => {
                     let mut fds = VecDeque::new();
-                    let m = build(&mut b, p.g.objects(), Dir::Request, &mut p.ids, &mut fds);
+                    let m = build(&mut b, p.g.objects(), gdir, &mut p.ids, &mut fds);
                     match m {
                         Some(mut m) => p.g.from_local(&mut m, &mut fds, &mut Plat).is_ok(),
                         None => true,
@@ -344,7 +507,7 @@ pub fn run(data: &[u8]) {
                 // The compositor, a message of the protocol.
                 3 => {
                     let mut fds = VecDeque::new();
-                    let m = build(&mut b, p.h.objects(), Dir::Event, &mut p.ids, &mut fds);
+                    let m = build(&mut b, p.h.objects(), hdir, &mut p.ids, &mut fds);
                     match m {
                         Some(mut m) => p.h.from_local(&mut m, &mut fds, &mut Plat).is_ok(),
                         None => true,
@@ -353,12 +516,12 @@ pub fn run(data: &[u8]) {
                 // The guest's channel into the host engine: raw, then built.
                 4 => {
                     let f = b.chunk(1 << 16).to_vec();
-                    p.h.from_channel(&f, Vec::new(), &mut Plat).is_ok()
+                    p.to_host(&f, Vec::new())
                 }
                 5 => {
                     let (f, fds) = record_frame(&mut b);
                     if b.u8() & 1 == 0 {
-                        p.h.from_channel(&f, fds, &mut Plat).is_ok()
+                        p.to_host(&f, fds)
                     } else {
                         let fds = fds
                             .into_iter()
@@ -368,6 +531,11 @@ pub fn run(data: &[u8]) {
                     }
                 }
                 6 => p.pump(),
+                // Time passes: up to about a minute, for the throttle.
+                7 => {
+                    p.elapsed += Duration::from_millis(u64::from(b.u16()));
+                    true
+                }
                 _ => {
                     let side = b.u8();
                     let e = if side & 1 == 0 { &mut p.g } else { &mut p.h };
@@ -380,11 +548,13 @@ pub fn run(data: &[u8]) {
                     true
                 }
             };
+            p.check_memory();
             if !ok {
                 break;
             }
         }
         let _ = p.pump();
+        p.check_memory();
         let _ = (p.g.shm_stats(), p.h.blob_stats(), p.h.stream_stats());
     }
     let fds_after = super::open_fds();

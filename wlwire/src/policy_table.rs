@@ -243,11 +243,6 @@ pub const REWRITES: &[(&str, &str, Rewrite)] = &[
         Rewrite::DevT { arg: "device" },
     ),
     (
-        "ext_image_copy_capture_session_v1",
-        "dmabuf_device",
-        Rewrite::DevT { arg: "device" },
-    ),
-    (
         "wp_presentation_feedback",
         "presented",
         Rewrite::Timestamp {

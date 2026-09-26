@@ -341,11 +341,9 @@ fn the_closure_check_refuses_bad_policy_lines_and_unknown_interfaces() {
     assert!(errs.iter().any(|e| e.contains("ghost")), "{errs:?}");
 }
 
-#[test]
-fn the_vendored_allowlist_is_closed() {
-    // build.rs already refused to build otherwise; this keeps the claim next
-    // to the tests and exercises the real tables.
-    let model: Vec<ModelIface> = proto::INTERFACES
+/// The generated tables, as the closure check models them.
+fn vendored_model() -> Vec<ModelIface> {
+    proto::INTERFACES
         .iter()
         .map(|i| {
             let conv = |x: &proto::Message| ModelMsg {
@@ -364,7 +362,14 @@ fn the_vendored_allowlist_is_closed() {
                 events: i.events.iter().map(conv).collect(),
             }
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn the_vendored_allowlist_is_closed() {
+    // build.rs already refused to build otherwise; this keeps the claim next
+    // to the tests and exercises the real tables.
+    let model = vendored_model();
     let globals: Vec<&str> = crate::policy_table::GLOBALS
         .iter()
         .map(|g| g.interface)
@@ -614,14 +619,19 @@ impl Pair {
         }
     }
 
+    /// The client's messages, taken as the channel drains (the engine stops
+    /// taking input with a channel's worth queued).
     fn client_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
         let mut data: Vec<u8> = msgs.concat();
         let mut fds: VecDeque<OwnedFd> = fds.into();
-        let r = self.g.from_local(&mut data, &mut fds, &mut self.gp);
-        if r.is_ok() {
+        loop {
+            let before = data.len();
+            self.g.from_local(&mut data, &mut fds, &mut self.gp)?;
             self.pump();
+            if data.is_empty() || data.len() == before {
+                return Ok(());
+            }
         }
-        r
     }
 
     fn server_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
@@ -1581,7 +1591,7 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
 fn a_stream_that_overruns_its_credit_is_a_protocol_error() {
     let mut s = crate::stream::Streams::new(false);
     let (_rd, wr) = sys::pipe().unwrap();
-    let id = s.add_sink(wr).unwrap();
+    let (id, _) = s.add_sink(wr).unwrap();
     let mut out = Vec::new();
     let big = vec![0u8; crate::stream::WINDOW + 1];
     // The pipe fills (64 KiB) and the rest is held; past the window it is an error.
@@ -1974,6 +1984,68 @@ fn lease_submits_are_counted_in_a_frame_before_it_is_let_in() {
     assert_eq!(p.h.lease_submits(b"not a frame"), 0);
 }
 
+/// A registry the frame itself creates is followed like any other object:
+/// get_registry, bind through it, create a request and submit, all in one
+/// frame, count one (they counted none, and went past the throttle).
+#[test]
+fn lease_submits_through_a_registry_made_in_the_same_frame_are_counted() {
+    let mut p = Pair::new(Policy {
+        drm_file: false,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    let msgs = vec![
+        MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(9)
+            .finish(),
+        MsgBuilder::new(9, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 10)
+            .finish(),
+        MsgBuilder::new(10, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+            .new_id(11)
+            .finish(),
+        MsgBuilder::new(11, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+            .new_id(12)
+            .finish(),
+    ];
+    assert_eq!(p.h.lease_submits(&wayland_frame(&msgs)), 1);
+}
+
+/// What the engine lets through is held to what was counted and admitted:
+/// a submit past it ends the connection rather than reaching the compositor.
+#[test]
+fn a_submit_past_the_admitted_count_is_fatal() {
+    let mut p = Pair::new(Policy {
+        drm_file: true,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    p.bind(1, "wp_drm_lease_device_v1", 1, 3).unwrap();
+    let submit = |req: u32| {
+        vec![
+            MsgBuilder::new(3, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(req + 1)
+                .finish(),
+        ]
+    };
+    p.h.allow_lease_submits(Some(1));
+    p.h.from_channel(&wayland_frame(&submit(4)), vec![], &mut p.hp)
+        .unwrap();
+    assert_eq!(p.h.stats.lease_submits, 1);
+    let e = p
+        .h
+        .from_channel(&wayland_frame(&submit(6)), vec![], &mut p.hp)
+        .unwrap_err();
+    assert_eq!(e.blame, Blame::Channel);
+    assert_eq!(p.h.stats.lease_submits, 1);
+}
+
 #[test]
 fn a_lease_device_released_without_the_event_gets_one_synthesised() {
     let mut p = Pair::new(Policy {
@@ -2235,4 +2307,419 @@ fn dev_t_encoding_matches_glibc() {
     assert_eq!(makedev(226, 128), 0xe280);
     assert_eq!(major_minor(makedev(4095, 1 << 20)), (4095, 1 << 20));
     assert_eq!(major_minor(makedev(0x12345, 0xabcdef)), (0x12345, 0xabcdef));
+}
+
+/// wl_shm bound as 4 and wl_compositor as 3, a surface 7, and pool 5 over
+/// `pool` (`size` bytes as the client claims it).
+fn shm_client(p: &mut Pair, pool: OwnedFd, size: i32) {
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(size)
+                .finish(),
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(7)
+                .finish(),
+        ],
+        vec![pool],
+    )
+    .unwrap();
+}
+
+fn shm_buffer(pool: u32, id: u32, offset: i32, height: i32, stride: i32) -> Vec<u8> {
+    MsgBuilder::new(pool, op::wl_shm_pool::REQ_CREATE_BUFFER)
+        .new_id(id)
+        .int(offset)
+        .int(stride / 4)
+        .int(height)
+        .int(stride)
+        .uint(0)
+        .finish()
+}
+
+/// The client's side charges what its buffers cover as the server's side
+/// does, so a buffer the host would refuse is refused before the daemon
+/// reads a byte of it, and the client is told. Before, the client's side
+/// took any buffer its pool's claimed size allowed, and read all of it at
+/// every commit.
+#[test]
+fn a_client_side_buffer_past_the_connections_bytes_is_refused_before_it_is_read() {
+    let mut p = Pair::new(Policy::default());
+    // Sparse: a client's claim costs the client nothing.
+    shm_client(&mut p, sys::memfd(c"t", 0).unwrap(), i32::MAX);
+    p.client_sends(&[shm_buffer(5, 10, 0, 8192, 65536)], vec![])
+        .unwrap();
+    let e = p
+        .client_sends(&[shm_buffer(5, 11, 1 << 30, 8192, 65536)], vec![])
+        .unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(e.blame, Blame::Local);
+}
+
+/// A commit costs the client's side one record at a time, not the buffer:
+/// the copy is read as the channel takes it, and the client's input after a
+/// commit that fills the channel's queue waits until the channel drains.
+#[test]
+fn a_commit_is_read_as_the_channel_takes_it_and_input_waits_behind_it() {
+    let mut p = Pair::new(Policy::default());
+    let (stride, height) = (4096i32, 2048i32); // 8 MiB
+    let size = (stride * height) as usize;
+    let pixels: Vec<u8> = (0..size).map(|i| (i / 4096) as u8 ^ i as u8).collect();
+    shm_client(&mut p, memfd_with(&pixels), size as i32);
+    p.client_sends(&[shm_buffer(5, 6, 0, height, stride)], vec![])
+        .unwrap();
+    let (_, mut fds) = p.at_server();
+    let host_pool = fds.pop().unwrap();
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(20)
+        .finish();
+    let mut data = [
+        MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
+            .object(6)
+            .int(0)
+            .int(0)
+            .finish(),
+        MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish(),
+        sync.clone(),
+    ]
+    .concat();
+    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
+        .unwrap();
+    // The commit went in; what follows it waits for the channel.
+    assert_eq!(data, sync, "input past a full channel queue is left");
+    assert!(p.g.input_blocked());
+    assert!(p.g.channel_backlog() >= size);
+    // A frame's worth is read, not the buffer.
+    let mut q = p.g.take_units_upto(256 * 1024);
+    let taken: usize = q.iter().map(|u| u.bytes()).sum();
+    assert!(taken <= 256 * 1024 + 2 * frame::MAX_REC_PAYLOAD, "{taken}");
+    while !q.is_empty() {
+        let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+        p.h.from_channel(&f, fds, &mut p.hp).unwrap();
+    }
+    p.pump();
+    assert!(!p.g.input_blocked());
+    assert_eq!(read_all(&host_pool), pixels);
+    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
+        .unwrap();
+    assert!(data.is_empty());
+    p.pump();
+    let (msgs, _) = p.at_server();
+    assert_eq!(split(&msgs).last(), Some(&sync));
+}
+
+/// A blob is read as the channel takes it too: the first record at once
+/// (all of a keymap), the rest as frames are made.
+#[test]
+fn a_large_blob_is_read_a_record_at_a_time() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wp_color_manager_v1", 1)]);
+    p.bind(1, "wp_color_manager_v1", 1, 3).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wp_color_manager_v1::REQ_CREATE_ICC_CREATOR)
+                .new_id(4)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let icc: Vec<u8> = (0..(4 << 20)).map(|i: u32| (i * 7) as u8).collect();
+    let mut data = MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+        .uint(0)
+        .uint(icc.len() as u32)
+        .finish();
+    let mut fds = VecDeque::from([memfd_with(&icc)]);
+    p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+    assert!(p.g.channel_backlog() >= icc.len());
+    let mut q = p.g.take_units_upto(1);
+    assert_eq!(q.len(), 1, "one record");
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut p.hp).unwrap();
+    p.pump();
+    let (_, fds) = p.at_server();
+    assert_eq!(read_all(&fds[0]), icc);
+}
+
+/// Sinks grant less the more of them are open: one transfer at full speed,
+/// many together a bounded total. Before, every sink granted `WINDOW`, and
+/// 256 streams held 64 MiB per connection.
+#[test]
+fn sinks_grant_less_as_more_streams_are_open() {
+    use crate::stream::{MIN_WINDOW, SINK_TOTAL, WINDOW, window};
+    assert_eq!(window(1), WINDOW);
+    assert_eq!(window(crate::stream::MAX_STREAMS), MIN_WINDOW);
+    assert!(window(crate::stream::MAX_STREAMS) * crate::stream::MAX_STREAMS <= SINK_TOTAL);
+    let mut s = crate::stream::Streams::new(false);
+    s.set_peer_windows(true);
+    let mut pipes = Vec::new();
+    let mut total = 0;
+    for i in 1..=64 {
+        let (rd, wr) = sys::pipe().unwrap();
+        let (_, first) = s.add_sink(wr).unwrap();
+        assert_eq!(first as usize, window(i));
+        total += first as usize;
+        pipes.push(rd);
+    }
+    assert!(total <= 10 << 20, "{total} granted to 64 streams");
+    // A peer that does not take the grant from the descriptor starts at
+    // WINDOW, and is told nothing.
+    let mut old = crate::stream::Streams::new(false);
+    let (_rd, wr) = sys::pipe().unwrap();
+    assert_eq!(old.add_sink(wr).unwrap().1, 0);
+}
+
+/// A sink gives credit back only up to its share of what sinks may hold
+/// now, counting what waits in it: with 32 streams open, a sink that took a
+/// full window and wrote a pipe's worth grants nothing more until it drains.
+#[test]
+#[cfg_attr(miri, ignore = "Miri's pipes are unbounded")]
+fn a_sink_credits_back_no_more_than_its_share() {
+    let mut s = crate::stream::Streams::new(false);
+    let mut keep = Vec::new();
+    let mut first = None;
+    for _ in 0..32 {
+        let (rd, wr) = sys::pipe().unwrap();
+        let (id, _) = s.add_sink(wr).unwrap();
+        first.get_or_insert((id, rd.try_clone().unwrap()));
+        keep.push(rd);
+    }
+    let (id, rd) = first.unwrap();
+    let mut out = Vec::new();
+    // An old peer's first window, all of it.
+    s.data(id, &vec![7u8; crate::stream::WINDOW], &mut out).unwrap();
+    let credit = |out: &[frame::Unit]| -> u32 {
+        out.iter()
+            .filter_map(|u| {
+                let f = frame::Records { buf: &u.rec }.next()?.ok()?;
+                (f.ty == frame::REC_STREAM_CREDIT).then_some(f.arg)
+            })
+            .sum()
+    };
+    assert_eq!(credit(&out), 0, "more waits here than a share");
+    // The reader drains; the sink writes the rest and grants its share.
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0;
+    for _ in 0..16 {
+        sys::set_nonblock(rd.as_raw_fd()).unwrap();
+        while let Ok(n @ 1..) = sys::read(rd.as_raw_fd(), &mut buf) {
+            got += n;
+        }
+        out.clear();
+        s.io(id, false, true, &mut out);
+        if got == crate::stream::WINDOW {
+            break;
+        }
+    }
+    assert_eq!(got, crate::stream::WINDOW);
+    let share = crate::stream::window(32) as u32;
+    assert!(credit(&out) <= share, "{} > {share}", credit(&out));
+}
+
+struct Budget(std::sync::atomic::AtomicUsize, usize);
+impl crate::stream::ByteBudget for Budget {
+    fn take(&self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::*;
+        self.0
+            .fetch_update(AcqRel, Acquire, |u| (u + n <= self.1).then_some(u + n))
+            .is_ok()
+    }
+    fn give(&self, n: usize) {
+        self.0.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// What sinks hold is charged to the owner's budget; data past it ends that
+/// stream with ENOBUFS, and the connection goes on.
+#[test]
+#[cfg_attr(miri, ignore = "Miri's pipes are unbounded")]
+fn a_sink_past_the_budget_ends_its_stream_not_the_connection() {
+    let b = Arc::new(Budget(Default::default(), 100 * 1024));
+    let mut s = crate::stream::Streams::new(false);
+    s.add_budget(b.clone());
+    let (_rd, wr) = sys::pipe().unwrap();
+    let (id, _) = s.add_sink(wr).unwrap();
+    let mut out = Vec::new();
+    // A pipe's worth goes through; the rest waits here, charged.
+    s.data(id, &vec![1u8; 96 * 1024], &mut out).unwrap();
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), s.held());
+    assert!(s.held() > 0);
+    out.clear();
+    s.data(id, &vec![1u8; 96 * 1024], &mut out).unwrap();
+    let eof = out
+        .iter()
+        .filter_map(|u| frame::Records { buf: &u.rec }.next()?.ok())
+        .find(|r| r.ty == frame::REC_STREAM_EOF)
+        .expect("the stream is ended");
+    assert_eq!(eof.arg, libc::ENOBUFS as u32);
+    assert!(s.is_empty());
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// Unfinished blobs are memfd pages this side holds: charged to the shm
+/// budgets as their chunks arrive, and dropped, charge and all, when the
+/// WAYLAND record after them does not take them. Before, they were charged
+/// to nothing, and held until the connection ended.
+#[test]
+fn unfinished_blobs_are_charged_and_dropped_when_nothing_takes_them() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 20, 64));
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    let chunk = |id: u32, off: u32, n: usize| frame::Unit {
+        rec: frame::record(frame::REC_BLOB, id, off, &vec![3u8; n]),
+        descs: vec![],
+    };
+    let send = |p: &mut Pair, units: Vec<frame::Unit>| {
+        let mut q: VecDeque<frame::Unit> = units.into();
+        let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+        p.h.from_channel(&f, fds, &mut TestPlat::default())
+    };
+    let c = frame::MAX_REC_PAYLOAD;
+    send(&mut p, (0..8).map(|i| chunk(1, (i * c) as u32, c)).collect()).unwrap();
+    assert_eq!(vm.used().0, 8 * c as u64);
+    // Past the VM's budget: refused.
+    let more: Vec<frame::Unit> = (0..9).map(|i| chunk(3, (i * c) as u32, c)).collect();
+    assert!(send(&mut p, more).is_err());
+    drop(p);
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    assert_eq!(vm.used().0, 0, "a connection's blobs go with it");
+    send(&mut p, vec![chunk(1, 0, c)]).unwrap();
+    assert_eq!(vm.used().0, c as u64);
+    // A WAYLAND record that does not take it: gone.
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(30)
+        .finish();
+    send(
+        &mut p,
+        vec![frame::Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 0, &sync),
+            descs: vec![],
+        }],
+    )
+    .unwrap();
+    assert_eq!(vm.used().0, 0);
+}
+
+/// Error text a peer controls -- the far side's ERROR record, an interface
+/// name it bound -- is escaped and bounded before it reaches a log or a
+/// client's wl_display.error: a terminal escape, a newline starting a fake
+/// log line or a bidirectional override arrives as text. Before, the ERROR
+/// payload was taken verbatim.
+#[test]
+fn error_text_from_a_peer_arrives_printable_and_bounded() {
+    let mut p = Pair::new(Policy::default());
+    let evil = format!(
+        "\u{1b}]0;owned\u{7}\u{1b}[2J\nERROR: fake line\u{202e}{}",
+        "x".repeat(10_000)
+    );
+    let mut q = VecDeque::from([frame::Unit {
+        rec: frame::record(frame::REC_ERROR, 1, 3, evil.as_bytes()),
+        descs: vec![],
+    }]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    let e = p.g.from_channel(&f, fds, &mut p.gp).unwrap_err();
+    assert_eq!(e.blame, Blame::Remote);
+    assert!(e.message.len() <= MAX_FATAL_TEXT + 3, "{}", e.message.len());
+    assert!(!e.message.chars().any(|c| c.is_control() || c == '\u{202e}'));
+    assert!(e.message.starts_with("\\u{1b}]0;owned\\u{7}"), "{}", e.message);
+    // An interface name the guest bound, in the host's error.
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6)]);
+    let bind = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+        .uint(1)
+        .generic_new_id("wl_compositor\n[fake] x", 1, 3)
+        .finish();
+    let e = raw_to_host(&mut p, bind, None).unwrap_err();
+    assert!(e.message.contains("wl_compositor\\n[fake] x"), "{}", e.message);
+    assert!(!e.message.chars().any(char::is_control));
+}
+
+/// Shm pools and a client's blobs are read on the connection's own thread
+/// (the backend's, under its lock): only memory is taken, never a file whose
+/// server decides how long a read takes (FUSE), nor something that is not a
+/// file at all. Before, any descriptor was taken and read.
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no fstatfs")]
+fn a_pool_or_a_clients_blob_must_be_memory() {
+    // Not memory: an eventfd, and a file on the source tree's filesystem
+    // (unless that is tmpfs too).
+    let file: OwnedFd = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .unwrap()
+        .into();
+    let on_disk = !sys::is_shmem(file.as_raw_fd());
+    assert!(sys::is_shmem(sys::memfd(c"t", 0).unwrap().as_raw_fd()));
+    let mut not_memory: Vec<OwnedFd> = vec![sys::eventfd().unwrap()];
+    if on_disk {
+        not_memory.push(file);
+    }
+    for fd in not_memory {
+        let mut p = Pair::new(Policy::default());
+        p.registry(&[(2, "wl_shm", 2)]);
+        p.bind(2, "wl_shm", 2, 4).unwrap();
+        let e = p
+            .client_sends(
+                &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                    .new_id(5)
+                    .int(4096)
+                    .finish()],
+                vec![fd],
+            )
+            .unwrap_err();
+        assert_eq!((e.object, e.code), (4, ERR_SHM_INVALID_FD));
+        assert_eq!(e.blame, Blame::Local);
+    }
+    // A blob from such a file goes as an invalid descriptor: the compositor
+    // gets a placeholder, and the connection goes on.
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wp_color_manager_v1", 1)]);
+    p.bind(1, "wp_color_manager_v1", 1, 3).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wp_color_manager_v1::REQ_CREATE_ICC_CREATOR)
+                .new_id(4)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let (rd, _wr) = sys::pipe().unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+                .uint(0)
+                .uint(10)
+                .finish(),
+        ],
+        vec![rd],
+    )
+    .unwrap();
+    let (_, fds) = p.at_server();
+    assert_eq!(fds.len(), 1);
+    assert_eq!(sys::file_size(fds[0].as_raw_fd()).unwrap(), 0, "a placeholder");
+    assert_eq!(p.h.stats.placeholders, 1);
+}
+
+/// A value rewrite is of a message the allowlist can reach; one of anything
+/// else is dead code that reads as a promise (ext_image_copy_capture's was:
+/// every capture protocol is hidden).
+#[test]
+fn every_rewrite_is_of_an_interface_the_allowlist_reaches() {
+    let model = vendored_model();
+    let mut reach = std::collections::BTreeSet::new();
+    for g in crate::policy_table::GLOBALS {
+        reach.extend(closure::reachable(&model, g.interface).unwrap());
+    }
+    reach.insert("wl_display".to_string());
+    reach.insert("wl_registry".to_string());
+    for (iface, msg, _) in crate::policy_table::REWRITES {
+        assert!(
+            reach.contains(*iface),
+            "{iface}.{msg} is rewritten but never reached"
+        );
+    }
 }

@@ -105,7 +105,7 @@ scripts/fuzz.sh miri
 | `nvkms` | v1 NVKMS messages against every release's policy | |
 | `guestptr` | RM escapes, controls and UVM blocks; IDLE_CHANNELS lists | no pointer RM follows is left holding a guest value; the caller reads its own values back |
 | `misc` | fence rewrites, uevents, KMS property names | |
-| `wl_engine` | a sequence of: app and compositor messages (raw, or built from the protocol tables against live objects, with descriptors of every class), channel frames into either end (raw, or built from any record type: Wayland, stream data, EOF, credit, SHM_SYNC, blob, error, hangup), moving what is queued across, stream readiness | no descriptor left open once both ends are dropped |
+| `wl_engine` | a configuration byte (normal or export mode, fences, DRM files, the lease device) and a lease rate, then a sequence of: app and compositor messages (raw, or built from the protocol tables against live objects, with descriptors of every class), channel frames into either end (raw, or built from any record type: Wayland, stream data, EOF, credit, SHM_SYNC, blob, error, hangup), moving what is queued across, stream readiness, time passing; frames into the host go through `lease_submits` and a `LeaseThrottle` as `WlConn::send` sends them | no descriptor left open once both ends are dropped; neither engine holds more than its budgets allow (`Engine::held_bytes`); no more lease submits reach the compositor than were admitted, and the throttle keeps to its burst and rate |
 | `wl_codec` | a frame, and a message against any signature | |
 
 The `backend` targets run the whole dispatcher (`serve`, IOCTL2's

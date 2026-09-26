@@ -18,7 +18,7 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
+use super::conn::{HostFds, LeaseRefusal, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
 use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;
@@ -308,7 +308,7 @@ fn the_guest_sees_only_allowed_globals_at_clamped_versions() {
     let (b, _) = g.recv_until(sync_done);
     assert_eq!(global_names(&b), vec!["wl_compositor"]);
     // Nothing more queued: the readiness eventfd is clear.
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 0), false);
+    assert!(!crate::sys::fd::readable(ready.as_raw_fd(), 0));
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn the_compositor_socket_is_drained_while_the_guest_is_not_reading() {
     server
         .write_all(&all)
         .expect("the compositor's writes must never block on us");
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 1000), true);
+    assert!(crate::sys::fd::readable(ready.as_raw_fd(), 1000));
     let (b, _) = g.recv_until(|b, _| b.len() >= all.len());
     assert_eq!(b.len(), all.len());
 }
@@ -543,7 +543,7 @@ fn the_export_socket_is_private_and_hands_over_connections() {
     );
     assert!(x.accept_pending().is_none());
     let _c = UnixStream::connect(&path).unwrap();
-    assert_eq!(crate::sys::fd::readable(ready.as_raw_fd(), 2000), true);
+    assert!(crate::sys::fd::readable(ready.as_raw_fd(), 2000));
     let s = x.accept_pending().expect("our own uid is accepted");
     // The accepted connection becomes a channel facing a client.
     let (conn, _r) = WlConn::from_export(s, &WlConfig::new(&path), Arc::new(FakeHost)).unwrap();
@@ -566,7 +566,7 @@ fn recv_refuses_a_buffer_too_small_for_a_record() {
 }
 
 /// Poll until `f` holds, or fail after 5 s.
-fn until(what: &str, f: impl Fn() -> bool) {
+fn until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !f() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -783,8 +783,8 @@ fn lease_submits_go_at_the_vms_rate_after_a_short_burst() {
         th.admit(1, t0).unwrap();
     }
     // The fourth waits out one interval.
-    assert_eq!(th.admit(1, t0), Err(5 * s));
-    assert_eq!(th.admit(1, t0 + 2 * s), Err(3 * s));
+    assert_eq!(th.admit(1, t0), Err(LeaseRefusal::Wait(5 * s)));
+    assert_eq!(th.admit(1, t0 + 2 * s), Err(LeaseRefusal::Wait(3 * s)));
     th.admit(1, t0 + 5 * s).unwrap();
     assert!(th.admit(1, t0 + 6 * s).is_err());
     // A frame without submits is never held; a quiet spell refills the burst.
@@ -850,4 +850,303 @@ fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
     std::thread::sleep(Duration::from_millis(320));
     g.conn.send(&c, &mut g.ops).unwrap();
     assert!(!g.conn.is_closed());
+}
+
+/// A frame's submits are admitted all or none, each at the rate: two in one
+/// frame after two alone take the third and fourth place of a burst of three,
+/// and the fourth does not fit. A frame of more than the burst never fits
+/// (before, only the first submit of a frame was checked, and a frame of a
+/// thousand went through on a full bucket).
+#[test]
+fn every_submit_of_a_frame_must_fit_the_rate_not_only_the_first() {
+    let s = Duration::from_secs(1);
+    let th = LeaseThrottle::new(5 * s, 3);
+    let t0 = Instant::now();
+    assert_eq!(th.admit(1000, t0), Err(LeaseRefusal::OverBurst));
+    assert_eq!(th.admit(4, t0), Err(LeaseRefusal::OverBurst));
+    th.admit(2, t0).unwrap();
+    // One left of the burst: a pair waits until both fit.
+    assert_eq!(th.admit(2, t0), Err(LeaseRefusal::Wait(5 * s)));
+    th.admit(1, t0).unwrap();
+    assert_eq!(th.admit(1, t0), Err(LeaseRefusal::Wait(5 * s)));
+    // A full bucket takes the whole burst at once, and no more after it.
+    th.admit(3, t0 + 60 * s).unwrap();
+    assert!(th.admit(1, t0 + 60 * s).is_err());
+}
+
+/// The count made ahead of the engine follows a registry the same frame
+/// creates: get_registry, bind, create_lease_request, submit, in one frame,
+/// on a connection that already has a lease device of its own.
+#[test]
+fn a_submit_through_a_registry_made_in_the_same_frame_is_counted() {
+    let dir = tmpdir("lease-fresh-registry");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_secs(60), 1);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    let frame_of = |registry: u32, dev: u32| {
+        let data = [
+            MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(registry)
+                .finish(),
+            MsgBuilder::new(registry, op::wl_registry::REQ_BIND)
+                .uint(40)
+                .generic_new_id("wp_drm_lease_device_v1", 1, dev)
+                .finish(),
+            MsgBuilder::new(dev, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(dev + 1)
+                .finish(),
+            MsgBuilder::new(dev + 1, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(dev + 2)
+                .finish(),
+        ]
+        .concat();
+        // The guest's engine has not seen the global on this registry; the
+        // host's has (the first registry's), and the frame is what counts.
+        let mut q = VecDeque::from([frame::Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 0, &data),
+            descs: vec![],
+        }]);
+        frame::pack(&mut q, 1 << 20, 256, false).0
+    };
+    let a = frame_of(10, 11);
+    let b = frame_of(20, 21);
+    g.conn.send(&a, &mut g.ops).unwrap();
+    // A burst of one: the second submit waits, whatever registry it came by.
+    assert_eq!(g.conn.send(&b, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    assert!(!g.conn.is_closed());
+}
+
+/// More submits in one frame than the burst allows ends the connection: they
+/// could never fit, and holding the frame would hold the client for ever.
+#[test]
+fn a_frame_of_more_submits_than_the_burst_ends_the_connection() {
+    let dir = tmpdir("lease-overburst");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_secs(60), 2);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    g.client(
+        &[MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(40)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 5)
+            .finish()],
+        vec![],
+    );
+    let mut msgs = Vec::new();
+    for i in 0..3u32 {
+        let req = 10 + 2 * i;
+        msgs.push(
+            MsgBuilder::new(5, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+        );
+        msgs.push(
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(req + 1)
+                .finish(),
+        );
+    }
+    let mut data = msgs.concat();
+    g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+        .unwrap();
+    let mut q = g.e.take_units();
+    let f = frame::pack(&mut q, 1 << 20, 256, false).0;
+    assert_eq!(g.conn.send(&f, &mut g.ops).unwrap_err(), libc::EPROTO);
+    assert!(g.conn.is_closed());
+}
+
+/// Export mode: the host client's messages go to the backend's engine as a
+/// guest compositor would get them; `units` from the guest compositor come
+/// back through WL_SEND.
+fn export_send(conn: &WlConn, units: Vec<frame::Unit>) {
+    let mut q: VecDeque<frame::Unit> = units.into();
+    let (f, _) = frame::pack(&mut q, 1 << 20, 256, false);
+    conn.send(&f, &mut Ops::default()).unwrap();
+}
+
+/// A host client in export mode committing a large buffer faster than the
+/// guest reads: the backend holds the guest queue's share, reads the rest of
+/// the client's commits only as the guest takes what it has, and keeps the
+/// connection. Before, every commit was read into the queue as it came, and
+/// past the connection's `max_queue` the connection was dropped.
+#[test]
+fn an_export_client_committing_faster_than_the_guest_reads_waits_and_is_kept() {
+    let (mut host_client, ours) = UnixStream::pair().unwrap();
+    let cfg = WlConfig::new("/nonexistent");
+    let (conn, _r) = WlConn::from_export(ours, &cfg, Arc::new(FakeHost)).unwrap();
+    host_client
+        .write_all(
+            &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(2)
+                .finish(),
+        )
+        .unwrap();
+    until("the registry is made", || conn.stats().msgs_to_channel >= 1);
+    let hello = frame::Hello {
+        version: frame::WL_PROTO_VERSION,
+        caps: frame::HELLO_G_DMABUF_IMPORT,
+    };
+    let globals = [
+        MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(1)
+            .string(Some("wl_compositor"))
+            .uint(4)
+            .finish(),
+        MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(2)
+            .string(Some("wl_shm"))
+            .uint(1)
+            .finish(),
+    ]
+    .concat();
+    export_send(
+        &conn,
+        vec![
+            frame::Unit {
+                rec: frame::record(frame::REC_HELLO, 0, 0, &hello.encode()),
+                descs: vec![],
+            },
+            frame::Unit {
+                rec: frame::record(frame::REC_WAYLAND, 0, 0, &globals),
+                descs: vec![],
+            },
+        ],
+    );
+    let (stride, height) = (4096i32, 2048i32); // 8 MiB
+    let size = (stride * height) as usize;
+    let pool = sys::memfd(c"pool", size as u64).unwrap();
+    let setup = [
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wl_compositor", 4, 3)
+            .finish(),
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(2)
+            .generic_new_id("wl_shm", 1, 4)
+            .finish(),
+        MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+            .new_id(5)
+            .finish(),
+        MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(6)
+            .int(size as i32)
+            .finish(),
+        MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(7)
+            .int(0)
+            .int(stride / 4)
+            .int(height)
+            .int(stride)
+            .uint(0)
+            .finish(),
+        MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+            .object(7)
+            .int(0)
+            .int(0)
+            .finish(),
+    ]
+    .concat();
+    sys::send_with_fds(host_client.as_raw_fd(), &setup, &[pool.as_raw_fd()]).unwrap();
+    const COMMITS: usize = 10;
+    let mut commits = Vec::new();
+    for _ in 0..COMMITS {
+        commits.push(
+            MsgBuilder::new(5, op::wl_surface::REQ_DAMAGE)
+                .int(0)
+                .int(0)
+                .int(i32::MAX)
+                .int(i32::MAX)
+                .finish(),
+        );
+        commits.push(MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish());
+    }
+    host_client.set_nonblocking(true).unwrap();
+    let commits = commits.concat();
+    let mut written = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // The backend stops taking the client's input: it waits in the socket.
+    until("the engine stops taking input", || {
+        if written < commits.len()
+            && let Ok(n) = host_client.write(&commits[written..])
+        {
+            written += n;
+        }
+        super::conn::export_state(&conn).1
+    });
+    assert!(Instant::now() < deadline);
+    let (queued, _) = super::conn::export_state(&conn);
+    assert!(!conn.is_closed(), "the connection is kept");
+    assert!(
+        queued <= super::conn::EXPORT_QUEUE + frame::MIN_FRAME,
+        "{queued} bytes queued for the guest"
+    );
+    // The guest reads; every commit's copy arrives, and the connection stays.
+    let mut synced = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while synced < COMMITS * size {
+        assert!(
+            Instant::now() < deadline,
+            "{synced} of {} bytes arrived",
+            COMMITS * size
+        );
+        if written < commits.len()
+            && let Ok(n) = host_client.write(&commits[written..])
+        {
+            written += n;
+        }
+        let f = conn.recv(4 << 20, 256, &mut Ops::default()).unwrap();
+        let d = frame::decode(&f).unwrap();
+        for r in d.records() {
+            assert_ne!(r.ty, frame::REC_HANGUP, "the connection ended");
+            if r.ty == frame::REC_SHM_SYNC {
+                synced += r.payload.len();
+            }
+        }
+        if d.records.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(synced, COMMITS * size);
+    assert!(!conn.is_closed());
+}
+
+/// The local peer's descriptors that no message takes are not held for
+/// ever: past libwayland's own ring the connection ends (here a host client
+/// in export mode; the compositor's socket is read the same way). Before,
+/// the reader kept every one.
+#[test]
+fn a_peer_sending_descriptors_no_message_takes_is_disconnected() {
+    let (host_client, ours) = UnixStream::pair().unwrap();
+    let (conn, _r) =
+        WlConn::from_export(ours, &WlConfig::new("/nonexistent"), Arc::new(FakeHost)).unwrap();
+    let e = sys::eventfd().unwrap();
+    let fds = [e.as_raw_fd(); 28];
+    for id in 0..(wlwire::wire::MAX_FDS_QUEUED / 28 + 2) as u32 {
+        let m = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(100 + id)
+            .finish();
+        if sys::send_with_fds(host_client.as_raw_fd(), &m, &fds).is_err() {
+            break;
+        }
+    }
+    until("the connection ends", || conn.is_closed());
 }
