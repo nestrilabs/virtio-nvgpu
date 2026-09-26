@@ -137,23 +137,6 @@ static const struct nvgpu_gem_nested_desc nvgpu_gem_export_dmabuf = {
     .size_field_offset = NVGPU_GEM_NO_FIELD,
 };
 
-/*
- * struct drm_version — UAPI, stable since DRM was upstreamed.
- * Copy of include/uapi/drm/drm.h:struct drm_version so we need
- * no DRM kernel headers.
- */
-struct nvgpu_drm_version {
-  int version_major;
-  int version_minor;
-  int version_patchlevel;
-  size_t name_len;
-  char __user *name;
-  size_t date_len;
-  char __user *date;
-  size_t desc_len;
-  char __user *desc;
-};
-
 struct drm_nvidia_get_dev_info_params {
   __u32 gpu_id;
   __u32 mig_device;
@@ -214,23 +197,22 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
    * (nvidia-drm-fence.c:1316-1318) and the device failed to create.
    *
    *   supports_alloc     GEM_ALLOC_NVKMS_MEMORY, GEM_MAP_OFFSET,
-   *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d); also
-   *                      turned off by claim_alloc=0 to tell a GEM problem
-   *                      from everything else in one boot
+   *                      GEM_EXPORT_DMABUF_MEMORY (0x0b, 0x0a, 0x0d): the
+   *                      host's
    *   supports_sync_fd   with fences on, the semsurf bit: nvidia-drm sets
    *   supports_semsurf   both from one condition, so no userspace has seen
    *                      one without the other, and 0x54..0x57 are forwarded
-   *                      (nvgpu_fence.c). With fences off, semsurf is 0 (no
-   *                      0x54) and sync_fd only with claim_sync_fd.
+   *                      (nvgpu_fence.c). With fences off (a v1 backend),
+   *                      neither: 0x54 is not served, nor the PRIME fence
+   *                      pair behind sync_fd (0x45, 0x46).
    *
    * The page kinds are "only valid if supports_alloc is true"
-   * (nv_drm_common_ioctl.h:219-221) and the host zeroes them when it is not,
-   * so they are zeroed here when this node turns it off -- but only in a
-   * layout that has the bit: 535's and 545.23's report the kinds without one
-   * (supports_alloc there is the backend's DMABUF_SUPPORTED answer, which
-   * says the same thing), and a caller in those gets them as the host said.
+   * (nv_drm_common_ioctl.h:219-221) and the host zeroes them when it is not;
+   * zeroed here too when it is not set, in a layout that has the bit: 535's
+   * and 545.23's report the kinds without one (supports_alloc there is the
+   * backend's DMABUF_SUPPORTED answer, which says the same thing), and a
+   * caller in those gets them as the host said.
    */
-  r.supports_alloc = nvgpu_claim_alloc && r.supports_alloc;
   if (want >= 32 && !r.supports_alloc) {
     r.generic_page_kind = 0;
     r.page_kind_generation = 0;
@@ -239,7 +221,7 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
   if (nvgpu_fences_enabled(nfd->dev)) {
     r.supports_sync_fd = r.supports_semsurf;
   } else {
-    r.supports_sync_fd = nvgpu_claim_sync_fd && r.supports_sync_fd;
+    r.supports_sync_fd = 0;
     r.supports_semsurf = 0;
   }
 
@@ -256,11 +238,9 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
    *   VK_EXT_external_memory_dma_buf absent
    *   vkcube: "Could not find both graphics and present queues"
    *
-   * This was invisible for as long as there was one test box, because its
-   * NVIDIA card was card0 on the host and card0 in the guest, and passing
-   * the host's number through was indistinguishable from getting it right.
-   * The second box has an integrated GPU, so its NVIDIA node is card1 --
-   * and nothing presented.
+   * The two numbers agree only where the host's NVIDIA card is its card0; on
+   * a host with an integrated GPU as well it is card1, and passing the
+   * host's number through left nothing able to present.
    */
   if (file && file->minor && file->minor->dev && file->minor->dev->primary)
     r.primary_index = file->minor->dev->primary->index;
@@ -301,10 +281,9 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
 }
 
 /*
- * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
- * nodes.
+ * nvgpu_drm_handle_ioctl — nvidia-drm's driver range on our /dev/dri/..
+ * nodes (DRM_IOCTL_VERSION is the core's, from nvgpu_drm_driver's fields).
  *
- * DRM_IOCTL_VERSION  (nr=0x00) — core ioctl, returns name="nvidia-drm"
  * GET_DEV_INFO       (nr=0x43) — the host's record, in the caller's layout
  * FENCE_SUPPORTED    (nr=0x44) — -EINVAL: 0x45/0x46 are not forwarded
  * DMABUF_SUPPORTED   (nr=0x4f) — the host's answer (supports_alloc)
@@ -317,38 +296,6 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
                                    unsigned long arg) {
   unsigned int nr = _IOC_NR(cmd);
   void __user *uarg = (void __user *)arg;
-
-  /* ── DRM_IOCTL_VERSION (type='d', nr=0x00) ── */
-  if (nr == 0x00) {
-    struct nvgpu_drm_version v;
-
-    if (copy_from_user(&v, uarg, sizeof(v)))
-      return -EFAULT;
-
-    v.version_major = 0;
-    v.version_minor = 1;
-    v.version_patchlevel = 0;
-
-#define FILL_DRM_STR(field, str)                                               \
-  do {                                                                         \
-    const char *_s = (str);                                                    \
-    size_t _sl = strlen(_s);                                                   \
-    if (v.field##_len >= _sl && v.field)                                       \
-      if (copy_to_user(v.field, _s, _sl))                                      \
-        return -EFAULT;                                                        \
-    v.field##_len = _sl;                                                       \
-  } while (0)
-
-    FILL_DRM_STR(name, "nvidia-drm");
-    FILL_DRM_STR(date, "20240101");
-    FILL_DRM_STR(desc, "NVIDIA DRM stub");
-#undef FILL_DRM_STR
-
-    if (copy_to_user(uarg, &v, sizeof(v)))
-      return -EFAULT;
-
-    return 0;
-  }
 
   /* ── Driver ioctls: DRM_COMMAND_BASE .. DRM_COMMAND_END ── */
   if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_END)
@@ -555,11 +502,11 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
      * is the ICD asking for something the node cannot do yet, and -ENOTTY on
      * its own turns up much later as a device that would not initialise.
      */
-    dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: unhandled nvidia-drm ioctl "
-                         "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
-                         nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
-                         _IOC_DIR(cmd));
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: unhandled nvidia-drm ioctl "
+                        "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
+                        nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
+                        _IOC_DIR(cmd));
     return -ENOTTY;
   }
 }
@@ -1203,10 +1150,10 @@ int nvgpu_gem_proxy_create(struct drm_file *file, struct nvgpu_fd *owner,
                            NVGPU_GEM_OBJECT_NVKMS);
   if (IS_ERR(ng)) {
     if (PTR_ERR(ng) == -EEXIST)
-      dev_warn_ratelimited(&owner->dev->vdev->dev,
-                           "virtio-gpu-nv: host GEM handle %u of file %u "
-                           "already has a proxy; not making a second\n",
-                           host_handle, owner->handle);
+      dev_dbg_ratelimited(&owner->dev->vdev->dev,
+                          "virtio-gpu-nv: host GEM handle %u of file %u "
+                          "already has a proxy; not making a second\n",
+                          host_handle, owner->handle);
     return PTR_ERR(ng);
   }
 
@@ -1475,10 +1422,10 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
    * out of the wrong offset would forward a plausible-looking address.
    */
   if (sz != d->size) {
-    dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                         "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
-                         "bytes, this driver knows it as %u\n",
-                         _IOC_NR(cmd), sz, d->size);
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x carries %u "
+                        "bytes, this driver knows it as %u\n",
+                        _IOC_NR(cmd), sz, d->size);
     return -EINVAL;
   }
 
@@ -1570,10 +1517,10 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
 
       ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle);
       if (ret) {
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
-                             "fd %d, which is not one of our devices\n",
-                             _IOC_NR(cmd), guest_fd);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
+                            "fd %d, which is not one of our devices\n",
+                            _IOC_NR(cmd), guest_fd);
         goto out;
       }
       put_unaligned_le32(handle, nested + d->fd_offset);
@@ -2146,10 +2093,10 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
 
     dri->drm = drm;
     dri->registered = true;
-    dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
-             "gpu_id=0x%x\n",
-             dri->name, dri->major, dri->minor, dri->dev_info[0]);
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
+            "gpu_id=0x%x\n",
+            dri->name, dri->major, dri->minor, dri->dev_info[0]);
   }
 
   return 0;

@@ -156,8 +156,7 @@ pub fn run_c(s: &Scenario, world: World) -> Outcome {
             Outcome { ret, call_ret: None, world: w }
         }
         Call::Modeset { cmd, arg } => {
-            let sz = (cmd >> 16) & 0x3fff;
-            let (ret, w) = cabi::in_world(world, || unsafe { cabi::nvgpu_ioctl_modeset(cd.nfd, cmd, arg, sz) });
+            let (ret, w) = cabi::in_world(world, || unsafe { cabi::nvgpu_ioctl_modeset(cd.nfd, cmd, arg) });
             Outcome { ret, call_ret: None, world: w }
         }
         Call::I2 { sclass, cmd, uarg, render, xflags } => {

@@ -101,12 +101,31 @@ static void nvgpu_wl_dev_free(struct kref *ref) {
  * export mode, a host program's compositor), and a guest's clients only ever
  * talk to the daemon's socket, so only the daemon's account needs the node:
  * root:root 0660 by default, and a group for the daemon from udev
- * (scripts/70-nvgpu-wl.rules). 0666 is the old, open behaviour.
+ * (scripts/70-nvgpu-wl.rules). A mode that gives "other" anything is
+ * refused (the module does not load with it): that would make every guest
+ * process a client of the host's compositor.
  */
 static ushort nvgpu_wl_mode = 0660;
-module_param_named(wl_mode, nvgpu_wl_mode, ushort, 0444);
-MODULE_PARM_DESC(wl_mode, "permissions of /dev/nvgpu-wl* (default 0660; "
-                          "the group comes from udev)");
+
+static int nvgpu_wl_mode_set(const char *val, const struct kernel_param *kp) {
+  u16 mode;
+  int ret = kstrtou16(val, 0, &mode);
+
+  if (ret)
+    return ret;
+  if (mode & ~0770)
+    return -EINVAL;
+  *(ushort *)kp->arg = mode;
+  return 0;
+}
+
+static const struct kernel_param_ops nvgpu_wl_mode_ops = {
+    .set = nvgpu_wl_mode_set,
+    .get = param_get_ushort,
+};
+module_param_cb(wl_mode, &nvgpu_wl_mode_ops, &nvgpu_wl_mode, 0444);
+MODULE_PARM_DESC(wl_mode, "permissions of /dev/nvgpu-wl* (default 0660, "
+                          "within 0770; the group comes from udev)");
 
 static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
 static DEFINE_MUTEX(nvgpu_wl_devs_lock);
@@ -440,9 +459,9 @@ static void nvgpu_wl_resolve_dmabuf(struct nvgpu_device *dev,
   if (IS_ERR(buf))
     goto invalid;
   if (nvgpu_dmabuf_to_host(dev, buf, &owner, &gem) < 0) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: wayland: a client's dma-buf is not "
-                         "one of ours; the host gets a placeholder\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: wayland: a client's dma-buf is not "
+                        "one of ours; the host gets a placeholder\n");
     dma_buf_put(buf);
     goto invalid;
   }
@@ -480,10 +499,10 @@ static void nvgpu_wl_resolve_syncobj(struct nvgpu_device *dev,
     goto invalid;
   f = nvgpu_hostfile_fget(dev, d->fd, NVGPU_HK_SYNCOBJ, &handle);
   if (IS_ERR(f)) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: wayland: a client's syncobj is not "
-                         "one of ours; its connection ends with "
-                         "invalid_timeline\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: wayland: a client's syncobj is not "
+                        "one of ours; its connection ends with "
+                        "invalid_timeline\n");
     goto invalid;
   }
   d->a = handle;
@@ -667,9 +686,9 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
 
   tmpl = card_fd >= 0 ? fget(card_fd) : NULL;
   if (!tmpl) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: wayland: a DRM file arrived with no "
-                         "card template to clone; dropping it\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: wayland: a DRM file arrived with no "
+                        "card template to clone; dropping it\n");
     nvgpu_close_handle(dev, handle);
     return -EBADF;
   }
@@ -682,9 +701,9 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
    */
   tn = nvgpu_drm_file_nfd(tmpl);
   if (!tn || tn->dev != dev) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: wayland: the card template is not a "
-                         "DRM file of this device; dropping a DRM file\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: wayland: the card template is not a "
+                        "DRM file of this device; dropping a DRM file\n");
     fput(tmpl);
     nvgpu_close_handle(dev, handle);
     return -EBADF;
@@ -903,10 +922,10 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
       }
       if (fd < 0 && (d.kind == NVGPU_WL_DESC_DRM_FILE ||
                      d.kind == NVGPU_WL_DESC_DMABUF)) {
-        dev_warn_ratelimited(&dev->vdev->dev,
-                             "virtio-gpu-nv: wayland: could not make a guest "
-                             "file of a host descriptor (kind %u): %d\n",
-                             d.kind, fd);
+        dev_dbg_ratelimited(&dev->vdev->dev,
+                            "virtio-gpu-nv: wayland: could not make a guest "
+                            "file of a host descriptor (kind %u): %d\n",
+                            d.kind, fd);
         d.flags |= NVGPU_WL_DESC_F_INVALID;
         fd = -1;
       }

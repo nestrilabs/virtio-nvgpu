@@ -177,32 +177,32 @@ void nvgpu_rs_warn(struct nvgpu_fd *nfd, u32 code, u64 a, u64 b) {
 
   switch (code) {
   case NVGPU_RS_WARN_CONTROL_FD:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM control 0x%x names fd %d, "
-                         "which is not one of our devices\n",
-                         (u32)a, (s32)b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                        "which is not one of our devices\n",
+                        (u32)a, (s32)b);
     break;
   case NVGPU_RS_WARN_CONTROL_OS_EVENT:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM control 0x%x names OS event "
-                         "0x%llx, which is not one of our devices\n",
-                         (u32)a, b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM control 0x%x names OS event "
+                        "0x%llx, which is not one of our devices\n",
+                        (u32)a, b);
     break;
   case NVGPU_RS_WARN_ALLOC_EVENT_FD:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
-                         "names fd %d, which is not one of our "
-                         "devices\n",
-                         (u32)a, (s32)b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                        "names fd %d, which is not one of our "
+                        "devices\n",
+                        (u32)a, (s32)b);
     break;
   case NVGPU_RS_WARN_EVENT_BUFFER:
-    dev_warn_ratelimited(d,
-                         "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
-                         "0x%llx, which is not one of our devices\n",
-                         b);
+    dev_dbg_ratelimited(d,
+                        "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                        "0x%llx, which is not one of our devices\n",
+                        b);
     break;
   case NVGPU_RS_WARN_SURFACE_FD:
-    dev_warn_ratelimited(
+    dev_dbg_ratelimited(
         d,
         "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
         "of ours\n",

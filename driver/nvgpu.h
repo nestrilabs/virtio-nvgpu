@@ -35,10 +35,6 @@ struct nvgpu_kms_file;
 
 struct nvgpu_device;
 
-/* Module parameters read outside nvgpu_main.c; see their definitions there. */
-extern int nvgpu_claim_alloc;
-extern int nvgpu_claim_sync_fd;
-
 /* struct drm_nvidia_get_dev_info_params is nine u32s. */
 #define NVGPU_DEV_INFO_WORDS 9
 /* name_len, major, minor, slot_index, then the dev_info words. */
@@ -422,7 +418,7 @@ long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
 long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                         unsigned long arg);
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                         void __user *uarg, u32 sz);
+                         void __user *uarg);
 
 /* ───────── nvgpu_main.c ───────── */
 

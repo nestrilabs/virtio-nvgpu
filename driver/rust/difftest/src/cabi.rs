@@ -100,7 +100,7 @@ extern "C" {
 
     pub fn nvgpu_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
     pub fn nvgpu_uvm_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
-    pub fn nvgpu_ioctl_modeset(nfd: *mut CFd, cmd: c_uint, uarg: u64, sz: u32) -> c_long;
+    pub fn nvgpu_ioctl_modeset(nfd: *mut CFd, cmd: c_uint, uarg: u64) -> c_long;
     pub fn nvgpu_i2_has_schema(dev: *mut CDev, sclass: u32, cmd: c_uint, prefix: *const c_void, len: usize) -> bool;
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;

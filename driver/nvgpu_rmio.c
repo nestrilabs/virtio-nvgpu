@@ -3,7 +3,7 @@
  * The protocol-v1 IOCTL message, in C: RM escapes (flat ones, RM_CONTROL with
  * its nested block, intercepts and deep pointers, RM_ALLOC, IDLE_CHANNELS),
  * ioctls that carry a descriptor at a fixed offset, UVM, and a v1 backend's
- * NVKMS commands. Moved here from nvgpu_main.c unchanged.
+ * NVKMS commands.
  *
  * This is the C implementation of what driver/rust/core/src/guest/rm.rs and
  * dispatch.rs implement in Rust; the Makefile builds one or the other
@@ -35,8 +35,6 @@
 #define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_DUP_OBJECT 0x34
 #define NV_ESC_RM_IDLE_CHANNELS 0x41
-/* UVM_INITIALIZE ioctl nr */
-#define UVM_INITIALIZE_NR 0x30
 
 /*
  * RM control commands that name an open file by descriptor inside their
@@ -584,9 +582,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * This used to be handled by swapping the command for an inline "V2"
    * variant that has no pointer. That bound us to the struct layouts of one
    * driver release: against any other it sent requests of the wrong size and
-   * shape, and some V2 variants are not served at all, which is what ended
-   * every Vulkan run here -- RM answered NV_ERR_INVALID_ARGUMENT to a command
-   * userspace had never asked for.
+   * shape, and some V2 variants are not served at all -- RM answered
+   * NV_ERR_INVALID_ARGUMENT to a command userspace had never asked for, and
+   * Vulkan failed to start.
    *
    * The backend already solves this one level up: it allocates a host buffer
    * for the top-level pointer, copies the guest's bytes in, points the struct
@@ -716,10 +714,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       memcpy(&nested_fd, slot, sizeof(nested_fd));
       if (nested_fd != -1) {
         if (nvgpu_handle_for_fd(nfd->dev, nested_fd, &handle)) {
-          dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                               "virtio-gpu-nv: RM control 0x%x names fd %d, "
-                               "which is not one of our devices\n",
-                               ctl_cmd, nested_fd);
+          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                              "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                              "which is not one of our devices\n",
+                              ctl_cmd, nested_fd);
           ret = -EBADF;
           goto out;
         }
@@ -739,10 +737,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
                                      os_event_off,
                                  &os_event_val);
       if (ret) {
-        dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: RM control 0x%x names OS event "
-                             "0x%llx, which is not one of our devices\n",
-                             ctl_cmd, os_event_val);
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: RM control 0x%x names OS event "
+                            "0x%llx, which is not one of our devices\n",
+                            ctl_cmd, os_event_val);
         goto out;
       }
     } else {
@@ -1039,9 +1037,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
      * it, and answers NV_ERR_OBJECT_NOT_FOUND.
      *
      * Userspace reports that as "Failed to allocate semaphore event" and
-     * abandons the device, which is what ended every run here after
-     * enumeration started working: four allocations of these two classes fail,
-     * and nothing else in the run does.
+     * abandons the device.
      *
      * NV0005_ALLOC_PARAMETERS keeps the descriptor in `data` at offset 16.
      * Rewrite it the way the fixed-position path does: to the handle the
@@ -1068,11 +1064,11 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
            * backend as a number it reads as a handle of its own.
            */
           if (nvgpu_handle_for_fd(nfd->dev, event_fd, &handle)) {
-            dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                                 "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
-                                 "names fd %d, which is not one of our "
-                                 "devices\n",
-                                 hclass, event_fd);
+            dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                                "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                                "names fd %d, which is not one of our "
+                                "devices\n",
+                                hclass, event_fd);
             ret = -EBADF;
             goto out;
           }
@@ -1088,10 +1084,10 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
                                        NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
                                    &os_event_val);
         if (ret) {
-          dev_warn_ratelimited(&nfd->dev->vdev->dev,
-                               "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
-                               "0x%llx, which is not one of our devices\n",
-                               os_event_val);
+          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                              "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                              "0x%llx, which is not one of our devices\n",
+                              os_event_val);
           goto out;
         }
         os_event = true;
@@ -1477,7 +1473,8 @@ struct nvidia_modeset_outer {
  * type and size.
  */
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                         void __user *uarg, u32 sz) {
+                         void __user *uarg) {
+  u32 sz = _IOC_SIZE(cmd);
   struct nvidia_modeset_outer outer;
   void __user *user_nested;
   u32 nested_size;
@@ -1550,10 +1547,9 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
      * VK_EXT_external_memory_dma_buf, and a client is left unable to present
      * with no error anywhere that names the cause.
      *
-     * This is rung 8 on a second path. The GEM import was translated when it
-     * was found; this one is reached instead on driver 615, where the ICD
-     * registers the surface with NVKMS directly rather than through the DRM
-     * node, which is why one box presented and the other did not.
+     * The same translation as the DRM node's GEM import (nvgpu_drm.c), on
+     * the path driver 615's ICD takes instead: it registers the surface with
+     * NVKMS directly rather than through the DRM node.
      *
      * struct NvKmsRegisterSurfaceRequest:
      *   0  NvKmsDeviceHandle deviceHandle
@@ -1586,7 +1582,7 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
            * Refused, not forwarded: the backend would read the caller's
            * number as one of its handles -- another process's file.
            */
-          dev_warn_ratelimited(
+          dev_dbg_ratelimited(
               &nfd->dev->vdev->dev,
               "virtio-gpu-nv: REGISTER_SURFACE names fd %d, which is not one "
               "of ours\n",

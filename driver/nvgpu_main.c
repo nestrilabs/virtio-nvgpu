@@ -51,7 +51,6 @@
 #include "gen/nvgpu_rmalloc_classes.h"
 #include "gen/nvgpu_schema.h"
 #include "gen/nvgpu_v1v2_rewrites.h"
-#include "nvgpu_rm_intercepts.h"
 #include "nvgpu.h"
 
 /*
@@ -75,80 +74,6 @@ extern struct kset *module_kset;
 /* The shared memory region device memory is placed in, id 1. */
 #define NVGPU_SHM_ID 1
 
-/*
- * Which capability bits GET_DEV_INFO claims. Parameters rather than constants
- * because what the ICD asks for next depends on them, and the cost of being
- * wrong is a device that will not initialise -- cheaper to sweep than to
- * rebuild. Each is ANDed with the host's own bit (nvgpu_drm_get_dev_info), so
- * it can only take a capability away, never claim one the host lacks.
- */
-/*
- * supports_alloc is on by default now, because the ioctls behind it work: a
- * Wayland client presents and 616 frames were encoded and decoded clean with
- * it set. It stays a parameter so it can be turned off to tell a GEM problem
- * from everything else in one boot.
- */
-int nvgpu_claim_alloc = 1;
-module_param_named(claim_alloc, nvgpu_claim_alloc, int, 0444);
-MODULE_PARM_DESC(claim_alloc, "GET_DEV_INFO reports supports_alloc");
-/*
- * supports_sync_fd stays off: PRIME_FENCE_CONTEXT_CREATE and
- * GEM_PRIME_FENCE_ATTACH (0x05, 0x06) are still not forwarded. Nothing has
- * asked for them -- no unhandled-ioctl line names either -- so the encode path
- * does not need them, and claiming a capability nothing serves is what rung 5
- * cost us.
- */
-int nvgpu_claim_sync_fd;
-module_param_named(claim_sync_fd, nvgpu_claim_sync_fd, int, 0444);
-MODULE_PARM_DESC(claim_sync_fd, "GET_DEV_INFO reports supports_sync_fd");
-
-/*
- * Whether a wait on one of these descriptors can wait.
- *
- * On, `.poll` reports nothing until the host says a descriptor is readable, so
- * NVIDIA's user-mode driver sleeps between frames the way it does on bare
- * metal. Off, there is no `.poll` state to consult and the VFS reports every
- * descriptor ready -- the old behaviour, which spun.
- *
- * Measured on an RTX 3060, unpaced at ~100 fps: a guest cost 12.26 s of CPU
- * over a 12 s run with this off, and 0.64 s with it on, for the same frame
- * rate. The host itself costs 0.40 s. It is a parameter because the trade is
- * not free -- a paced encode run gives up ~11% of its frames to the wake, see
- * the write-up -- and because a switch is how the next person re-takes both
- * numbers without a rebuild.
- */
-static int nvgpu_poll_events = 1;
-module_param_named(poll_events, nvgpu_poll_events, int, 0444);
-MODULE_PARM_DESC(poll_events, "a wait on a device descriptor really waits");
-
-/*
- * Microseconds to look for the event before sleeping for it.
- *
- * Sleeping is not cheap here. The wake has to travel the host's epoll, the
- * event queue, an interrupt and a halted vCPU, and measured end to end that is
- * ~0.35 ms -- against 0.049 ms for a whole frame at cost 0. So a guest that
- * sleeps on every frame pays more in wake than it spends drawing, which is how
- * an encode run lost ~11% of its frames.
- *
- * Spinning first is the usual answer to that, and it was measured here rather
- * than assumed: **it does not help, and it is off.** At 80, 300 and 600 us the
- * late-frame count in a paced encode run went 33, 49 and 62 out of ~550, against
- * 53 with no spin at all -- noise, not a trend -- while CPU went from 0.39 s to
- * 0.99 s over a 12 s run. The waits that hurt are not the short ones.
- *
- * Kept as a knob because it is the obvious thing to try, and a number beats
- * trying it again.
- */
-static int nvgpu_poll_spin_us;
-module_param_named(poll_spin_us, nvgpu_poll_spin_us, int, 0644);
-MODULE_PARM_DESC(poll_spin_us, "microseconds to spin before sleeping for an event");
-
-struct nvgpu_numa_attr {
-  struct kobj_attribute kattr;
-  struct nvgpu_device *dev;
-  char *(*get_buf)(struct nvgpu_device *);
-};
-
 /* class for device_create() */
 static struct class *nvgpu_class;
 
@@ -157,9 +82,11 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 /*
  * poll() on a device descriptor.
  *
- * Reports nothing until the host says otherwise, which is the whole point:
- * without this the VFS reported every one of these descriptors as permanently
- * ready and the user-mode driver's wait never waited.
+ * Reports nothing until the host says a descriptor is readable (the event
+ * queue sets `pending`), so NVIDIA's user-mode driver sleeps between frames
+ * the way it does on bare metal. A file_operations with no .poll is reported
+ * ready by the VFS every time, and the driver's wait never waited: it spun,
+ * a whole core per guest.
  */
 static __poll_t nvgpu_poll_mask(struct file *filp,
                                 struct poll_table_struct *wait,
@@ -169,36 +96,12 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
   if (!nfd)
     return EPOLLERR;
 
-  /* Off: no state to consult, so say what the VFS said before this existed. */
-  if (!nvgpu_poll_events)
-    return EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM;
-
-  /*
-   * A caller that passed a poll_table means to sleep if this says nothing, and
-   * that sleep is what costs 0.35 ms. Look for the event first: an event that
-   * arrives inside the spin is reported without the guest ever leaving the
-   * CPU. A caller polling with no intention of sleeping passes no table and
-   * gets the plain answer.
-   */
-  if (wait && nvgpu_poll_spin_us > 0 && !atomic_read(&nfd->pending)) {
-    ktime_t deadline = ktime_add_us(ktime_get(), nvgpu_poll_spin_us);
-
-    while (!atomic_read(&nfd->pending)) {
-      if (ktime_after(ktime_get(), deadline))
-        break;
-      if (need_resched() || signal_pending(current))
-        break;
-      cpu_relax();
-    }
-  }
-
   poll_wait(filp, &nfd->wq, wait);
 
   /*
-   * Taken, not read. Leaving it set until an ioctl consumed it was tried and
-   * measured: a caller that polls without consuming then finds it ready every
-   * time, which is the spin this whole path exists to end -- CPU went straight
-   * back to a full core. One report per event it is.
+   * Taken, not read: a caller that polls without consuming would otherwise
+   * find it ready every time, which is the spin this path exists to end. One
+   * report per event.
    */
   if (atomic_xchg(&nfd->pending, 0))
     return ready;
@@ -917,18 +820,14 @@ static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
                                 unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
   unsigned int ioc_type = _IOC_TYPE(cmd);
-  unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
-
-  if (sz > 65536)
-    return -EINVAL;
 
   /* nvidia-modeset ioctls use type 0x6d ('m'); a v2 backend takes them
    * through the schema (nvgpu_nvkms.c), a v1 one as a flat block. */
   if (ioc_type == 0x6d) {
     if (nfd->dev->v2)
       return nvgpu_nvkms_ioctl(nfd, cmd, uarg);
-    return nvgpu_ioctl_modeset(nfd, cmd, uarg, sz);
+    return nvgpu_ioctl_modeset(nfd, cmd, uarg);
   }
 
   /* Anything else (unlikely) falls back to the standard path */
@@ -956,47 +855,6 @@ struct nvgpu_fd *nvgpu_fd_from_file(struct file *f) {
 }
 
 /* ───────── /proc/driver/nvidia ───────── */
-
-static int nvgpu_proc_version_show(struct seq_file *m, void *v) {
-  struct nvgpu_device *dev = m->private;
-
-  seq_printf(m,
-             "NVRM version: NVIDIA UNIX x86_64 Kernel Module  %s\n"
-             "GCC version:  gcc version 12.2.0\n",
-             dev->driver_version);
-  return 0;
-}
-
-static int nvgpu_proc_version_open(struct inode *inode, struct file *filp) {
-  return single_open(filp, nvgpu_proc_version_show, pde_data(inode));
-}
-
-static const struct proc_ops nvgpu_proc_version_ops = {
-    .proc_open = nvgpu_proc_version_open,
-    .proc_read = seq_read,
-    .proc_lseek = seq_lseek,
-    .proc_release = single_release,
-};
-
-static int nvgpu_proc_params_show(struct seq_file *m, void *v) {
-  struct nvgpu_device *dev = m->private;
-
-  seq_printf(m, "NVreg_EnablePCIeGen3=1\n"
-                "NVreg_MemoryPoolSize=0\n");
-  (void)dev;
-  return 0;
-}
-
-static int nvgpu_proc_params_open(struct inode *inode, struct file *filp) {
-  return single_open(filp, nvgpu_proc_params_show, pde_data(inode));
-}
-
-static const struct proc_ops nvgpu_proc_params_ops = {
-    .proc_open = nvgpu_proc_params_open,
-    .proc_read = seq_read,
-    .proc_lseek = seq_lseek,
-    .proc_release = single_release,
-};
 
 /* Generic heap-backed proc file — used for all passthrough files */
 struct nvgpu_proc_buf {
@@ -1395,8 +1253,8 @@ static int nvgpu_pci_init(struct nvgpu_device *dev) {
       }
     }
 
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered fake PCI device %s\n",
-             root->slot.pci_addr);
+    dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: registered fake PCI device %s\n",
+            root->slot.pci_addr);
   }
 
   return err;
@@ -1492,9 +1350,9 @@ static const u8 *nvgpu_parse_card_section(struct nvgpu_device *dev,
                "one this guest keeps or already has a card\n",
                c->name, render_index);
 
-    dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: host card node %s (%u:%u) for DRI record %u\n",
-             c->name, c->major, c->minor, render_index);
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: host card node %s (%u:%u) for DRI record %u\n",
+            c->name, c->major, c->minor, render_index);
     dev->num_card_recs++;
   }
   return p;
@@ -1734,11 +1592,11 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       dev->dri_devs[idx].dev_info_size = sizeof(info);
       dev->num_dri_devs++;
 
-      dev_info(&dev->vdev->dev,
-               "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
-               "page kind %u/%u, sector layout %u\n",
-               dev->dri_devs[idx].name, major, minor, slot_index, info[0],
-               info[4], info[5], info[6]);
+      dev_dbg(&dev->vdev->dev,
+              "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
+              "page kind %u/%u, sector layout %u\n",
+              dev->dri_devs[idx].name, major, minor, slot_index, info[0],
+              info[4], info[5], info[6]);
       p += name_len;
     }
     dri_complete = i == num_dri;
@@ -1867,13 +1725,13 @@ static void nvgpu_module_sysfs_cleanup(void) {
   }
 }
 
-/* ── nvidia-caps fops — proxy to host like everything else ── */
-
+/*
+ * /dev/nvidia-caps/nvidia-cap*: files to be opened and handed to RM as proof
+ * of a capability (MIG config and monitor), as nvidia.ko's nv-caps.c makes
+ * them -- open and release and nothing else, so an ioctl on one is -ENOTTY
+ * natively and here. (This answered 0 to every ioctl number.)
+ */
 static int nvgpu_caps_open(struct inode *inode, struct file *filp) {
-  /* caps devices are read-only capability checks.
-   * NVIDIA userspace opens them, does a few ioctls, closes.
-   * For now return success with a NULL private_data —
-   * if actual ioctls are needed we'll add VMM proxying. */
   filp->private_data = NULL;
   return 0;
 }
@@ -1882,19 +1740,10 @@ static int nvgpu_caps_release(struct inode *inode, struct file *filp) {
   return 0;
 }
 
-static long nvgpu_caps_ioctl(struct file *filp, unsigned int cmd,
-                             unsigned long arg) {
-  /* Most caps ioctls just query capability bits.
-   * Return 0 (success) — tells userspace "no special capabilities"
-   * which is correct for a non-MIG single GPU. */
-  return 0;
-}
-
 static const struct file_operations nvgpu_caps_fops = {
     .owner = THIS_MODULE,
     .open = nvgpu_caps_open,
     .release = nvgpu_caps_release,
-    .unlocked_ioctl = nvgpu_caps_ioctl,
 };
 
 static struct class *nvgpu_caps_class;
@@ -2040,10 +1889,10 @@ static int nvgpu_probe(struct virtio_device *vdev) {
       /* Safety: ensure pci_addr is NUL-terminated before logging */
       dev->gpu_slots[i].pci_addr[15] = '\0';
 
-      dev_info(&vdev->dev,
-               "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
-               dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
-               le32_to_cpu(dev->gpu_slots[i].info_len));
+      dev_dbg(&vdev->dev,
+              "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
+              dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
+              le32_to_cpu(dev->gpu_slots[i].info_len));
     }
   }
 
@@ -2061,8 +1910,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
                            sizeof(dev->fd_translations[0]));
   }
 
-  dev_info(&vdev->dev, "virtio-gpu-nv: %u fd-translation ioctl(s) registered\n",
-           dev->num_fd_translations);
+  dev_dbg(&vdev->dev, "virtio-gpu-nv: %u fd-translation ioctl(s) registered\n",
+          dev->num_fd_translations);
 
   /* Ensure virtio is running before we open devices */
   virtio_device_ready(vdev);
@@ -2395,5 +2244,12 @@ module_init(nvgpu_init);
 module_exit(nvgpu_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("libkrun-nv contributors");
+MODULE_AUTHOR("Jacob Root");
 MODULE_DESCRIPTION("virtio-gpu-nv: NVIDIA GPU sharing for VMs via ioctl proxy");
+/* Which implementation parses what guest processes hand the module
+ * (driver/Makefile, NVGPU_RUST; modinfo -F parsers). */
+#ifdef NVGPU_RUST
+MODULE_INFO(parsers, "rust");
+#else
+MODULE_INFO(parsers, "c");
+#endif

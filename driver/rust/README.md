@@ -12,9 +12,14 @@ time:
 make -C driver KDIR=<a CONFIG_RUST=y kernel's build tree> NVGPU_RUST=1
 ```
 
-`NVGPU_RUST=0` (the default) builds the C (`nvgpu_i2.c`, `nvgpu_rmio.c`) as
-before. The C stays the default until the Rust build has passed the hardware
-regression (below).
+`NVGPU_RUST=0` (the default out of tree) builds the C (`nvgpu_i2.c`,
+`nvgpu_rmio.c`, `nvgpu_atomic.c`). In a kernel tree, `CONFIG_VIRTIO_GPU_NV_RUST`
+(Kconfig, depends on `CONFIG_RUST`) selects the Rust. `NVGPU_RUST=1` against a
+kernel without `CONFIG_RUST` is a build error, and the module records which it
+has (`modinfo -F parsers`). The Makefile refuses to link a `nvgpu_rs.o` that
+names a panic symbol. The C stays the default until the Rust build has passed
+the hardware regression (below), and stays buildable after -- it is the
+difftest's oracle, and what a kernel without Rust builds.
 
 ## What is in Rust, and what is not
 
@@ -118,19 +123,18 @@ symbol of the kernel's own Rust -- having no panic path, it needs no panic
 handler and no `core` -- so it would also load into the C kernel of the same
 vermagic; that is not what was tested.)
 
-## Where it differs from the C, on purpose
+## Where it differed from the C
 
-- **Read once.** RM_CONTROL's nested block is copied once and the V1V2
-  count and pointer, the TIME_CORRELATION clock, the descriptors in it and
-  the request are all that copy (the C read the V1V2 block twice, and the
-  clock byte apart from the block); IDLE_CHANNELS' block likewise (the C
-  read it twice when it fell back to the flat form); an escape that may
-  register memory by its pages is copied once and the same bytes go to
-  whichever path it takes (the C read the class word, then the block). With
-  no other thread writing the caller's memory, the results are the same.
-- **Unreadable before decided.** TIME_CORRELATION reads its whole block
-  before refusing a TSC clock: a block that is not all readable is
-  `-EFAULT`, where the C read one byte and answered NOT_SUPPORTED.
+Nothing now, on purpose. The port read each block of the caller's once --
+RM_CONTROL's nested block for the V1V2 count and pointer, the
+TIME_CORRELATION clock (whole, before refusing a TSC clock: `-EFAULT` for a
+block that does not all read) and the request; IDLE_CHANNELS' block for its
+flat fallback; an escape that may register memory by its pages for
+whichever path it takes -- where the C read the V1V2 block twice, the clock
+byte and the class word apart from what it then sent, and IDLE_CHANNELS
+twice. The C reads each once too since the 2026-09-26 review (SECURITY.md
+§17), and the difftest's one recognised difference is gone.
+
 Fixed in both since, each with a case in `difftest/tests/cases.rs` that
 fails against the earlier C: a size with a NULL pointer (RM_CONTROL,
 RM_ALLOC, v1 NVKMS) sent that much uninitialised guest kernel heap, and now
@@ -139,6 +143,14 @@ of width 1 or 2, and the walk refuses a descriptor or GEM field of a width
 the generator refuses; a GEM handle named again after a failing `gem_out`
 hook was closed while an earlier proxy owned it; V1V2's count times 8
 wrapped in u32; a v1 NVKMS call read and wrote 16 bytes whatever its size.
+And from the 2026-09-26 review: an OS-descriptor registration abandoned in
+flight hands its pins to the transport (`osdesc::Env::send_pinned`) instead
+of keeping them under id 0 until remove(); a call that could be answered
+with more descriptors than the state holds is refused before it is sent;
+and the ATOMIC parse says commit/TEST_ONLY before any hook
+(`atomic::Env::begin`), which the Rust wrapper once said only after the
+parse -- so a hook reading it saw every commit as TEST_ONLY. The difftest
+records what each in-fence hook sees.
 
 ## When the Rust has passed
 

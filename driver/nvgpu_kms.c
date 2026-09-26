@@ -519,10 +519,10 @@ static int nvgpu_kms_swap(struct nvgpu_kms_file *kf) {
   kf->retired = old;
   kf->host_master_ok = true;
   nvgpu_kms_publish(kf, h);
-  dev_info(&kf->dev->vdev->dev,
-           "virtio-gpu-nv: host card file %u was opened while another file "
-           "was master and can never be; guest master now drives %u\n",
-           old, h);
+  dev_dbg(&kf->dev->vdev->dev,
+          "virtio-gpu-nv: host card file %u was opened while another file "
+          "was master and can never be; guest master now drives %u\n",
+          old, h);
   return 0;
 }
 
@@ -688,17 +688,17 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
    * one (hostfd.rs classify()).
    */
   if (!drm_is_primary_client(tfile) || !dri || dri->dev != dev) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: a host DRM file can only be adopted "
-                         "through a card-node file of the same GPU\n");
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: a host DRM file can only be adopted "
+                        "through a card-node file of the same GPU\n");
     ret = -EINVAL;
     goto close;
   }
   if (kind != NVGPU_HK_DRM_LEASE) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: refusing to adopt backend handle %u "
-                         "of kind %u as a DRM file: only leases are\n",
-                         kms_handle, kind);
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: refusing to adopt backend handle %u "
+                        "of kind %u as a DRM file: only leases are\n",
+                        kms_handle, kind);
     ret = -EINVAL;
     goto close;
   }
@@ -1303,10 +1303,10 @@ static int nvgpu_kms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   }
   fput(f);
   if (ret)
-    dev_warn_ratelimited(&kc->kf->dev->vdev->dev,
-                         "virtio-gpu-nv: KMS ioctl nr=0x%02x names fd %lld, "
-                         "which is not the kind of device it takes\n",
-                         _IOC_NR(call->cmd), user_value);
+    dev_dbg_ratelimited(&kc->kf->dev->vdev->dev,
+                        "virtio-gpu-nv: KMS ioctl nr=0x%02x names fd %lld, "
+                        "which is not the kind of device it takes\n",
+                        _IOC_NR(call->cmd), user_value);
   return ret;
 }
 

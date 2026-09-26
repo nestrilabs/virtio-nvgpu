@@ -62,13 +62,9 @@ if ! grep -q ' T nvgpu_rs_i2_ioctl$' <<<"$SYMS" ||
     echo "FAIL: $KO does not have the Rust parsers in place of the C" >&2
     exit 1
 fi
-# And they cannot panic: no path in them reaches a Rust panic (an overflow
-# check, a bounds check, an unwrap), which in the kernel is a BUG().
-UNDEF="$(in_toolchain nm -u "$K/mod/nvgpu_rs.o")"
-if grep -i 'panic' <<<"$UNDEF"; then
-    echo "FAIL: nvgpu_rs.o has a panic path (above)" >&2
-    exit 1
-fi
+# That they cannot panic -- no path in them reaches a Rust panic, which in
+# the kernel is a BUG() -- driver/Makefile checks before it links them
+# (nvgpu_rs.nopanic), so a module built at all has passed it.
 
 if ! in_toolchain readelf -n "$K/build/vmlinux" | grep -q 'Xen.*0x00000012'; then
     echo "FAIL: vmlinux has no PVH entry note" >&2

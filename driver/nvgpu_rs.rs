@@ -585,7 +585,7 @@ pub unsafe extern "C" fn nvgpu_uvm_ioctl_fd(nfd: *mut c_void, cmd: c_uint, arg: 
 ///
 /// As [`nvgpu_ioctl_fd`].
 #[no_mangle]
-pub unsafe extern "C" fn nvgpu_ioctl_modeset(nfd: *mut c_void, cmd: c_uint, uarg: *mut c_void, _sz: u32) -> c_long {
+pub unsafe extern "C" fn nvgpu_ioctl_modeset(nfd: *mut c_void, cmd: c_uint, uarg: *mut c_void) -> c_long {
     // SAFETY: the caller's contract.
     let mut env = unsafe { RmEnv::new(nfd) };
     c_long::from(rm::modeset_v1(&mut env, cmd, uarg as u64))

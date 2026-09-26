@@ -654,10 +654,10 @@ static int nvgpu_fence_hook_fd_out(struct nvgpu_i2_call *call, u32 buf,
   int fd;
 
   if (kind != p->want_kind) {
-    dev_warn_ratelimited(&call->dev->vdev->dev,
-                         "virtio-gpu-nv: the host made a descriptor of kind "
-                         "%u where kind %u was due; refused\n",
-                         kind, p->want_kind);
+    dev_dbg_ratelimited(&call->dev->vdev->dev,
+                        "virtio-gpu-nv: the host made a descriptor of kind "
+                        "%u where kind %u was due; refused\n",
+                        kind, p->want_kind);
     return -EPROTO;
   }
   if (kind == NVGPU_HK_SYNC_FILE && p->want_fence) {
@@ -1171,10 +1171,10 @@ static int nvgpu_sowait_arm(struct nvgpu_sowait_wait *w) {
                          w->points ? w->points[i] : 0, w->reg_flags);
     if (IS_ERR(s)) {
       if (PTR_ERR(s) != -EAGAIN)
-        dev_warn_ratelimited(&w->p.nfd->dev->vdev->dev,
-                             "virtio-gpu-nv: no wait registration for "
-                             "syncobj %u: %ld; polling instead\n",
-                             w->handles[i], PTR_ERR(s));
+        dev_dbg_ratelimited(&w->p.nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: no wait registration for "
+                            "syncobj %u: %ld; polling instead\n",
+                            w->handles[i], PTR_ERR(s));
       return PTR_ERR(s);
     }
     w->regs[i] = s;
@@ -1977,10 +1977,10 @@ out_free:
 out:
   mutex_unlock(&nvgpu_rehome_lock);
   if (ret)
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: cannot move object %u of file %u "
-                         "into file %u for SEMSURF_FENCE_ATTACH: %d\n",
-                         ng->host_handle, ng->owner_handle, file->handle, ret);
+    dev_dbg_ratelimited(&dev->vdev->dev,
+                        "virtio-gpu-nv: cannot move object %u of file %u "
+                        "into file %u for SEMSURF_FENCE_ATTACH: %d\n",
+                        ng->host_handle, ng->owner_handle, file->handle, ret);
   return ret;
 }
 
@@ -2164,10 +2164,10 @@ static void nvgpu_semsurf_defer_work(struct work_struct *work) {
 
   ret = nvgpu_semsurf_wait_signalled(ctx, d->cmd, &d->a);
   if (ret)
-    dev_warn_ratelimited(&ctx->dev->vdev->dev,
-                         "virtio-gpu-nv: SEMSURF_FENCE_WAIT after a guest "
-                         "fence signalled: the host refused it (%ld)\n",
-                         ret);
+    dev_dbg_ratelimited(&ctx->dev->vdev->dev,
+                        "virtio-gpu-nv: SEMSURF_FENCE_WAIT after a guest "
+                        "fence signalled: the host refused it (%ld)\n",
+                        ret);
   drm_gem_object_put(&ctx->base);
   dma_fence_put(d->fence);
   kfree(d);
@@ -2278,10 +2278,10 @@ static void nvgpu_semsurf_mirror(struct nvgpu_fence_ctx *ctx,
   if (p.fence)
     dma_fence_put(p.fence);
   if (ret)
-    dev_warn_ratelimited(&ctx->dev->vdev->dev,
-                         "virtio-gpu-nv: SEMSURF_FENCE_ATTACH done, but not "
-                         "mirrored into the guest buffer's resv: %ld\n",
-                         ret);
+    dev_dbg_ratelimited(&ctx->dev->vdev->dev,
+                        "virtio-gpu-nv: SEMSURF_FENCE_ATTACH done, but not "
+                        "mirrored into the guest buffer's resv: %ld\n",
+                        ret);
 }
 
 long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
