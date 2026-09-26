@@ -1119,6 +1119,13 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
   struct nvgpu_gem_object *ng;
   int ret;
 
+  /* A size from the host's reply, which PAGE_ALIGN() must not wrap to 0. */
+  if (size > SIZE_MAX - PAGE_SIZE + 1) {
+    /* Ours to close, unless a proxy (alive or dying) holds the number. */
+    if (!xa_load(&owner->gem_index, host_handle))
+      nvgpu_gem_close(owner->dev, owner->handle, host_handle);
+    return ERR_PTR(-E2BIG);
+  }
   size = PAGE_ALIGN(size);
   if (!size)
     size = PAGE_SIZE;

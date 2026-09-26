@@ -55,6 +55,9 @@
 MODULE_IMPORT_NS("DMA_BUF");
 
 #define NVGPU_WL_MAX_DEVS 8
+/* The largest host buffer imported as a guest dma-buf: far past any
+ * framebuffer, and far below what PAGE_ALIGN() could wrap. */
+#define NVGPU_WL_MAX_IMPORT (1ull << 36)
 
 /*
  * One /dev/nvgpu-wl per virtio device. Refcounted: remove deregisters the
@@ -496,6 +499,32 @@ invalid:
   d->fd = -1;
 }
 
+/*
+ * What a SEND's descriptors named, held until the host is done with the
+ * request: the dma-bufs (and with them the proxies whose (owner, gem) went)
+ * and the syncobj files (and with them their handles). Carried by the
+ * request buffer (nvgpu_tbuf_on_free()), so a SEND its caller gave up on
+ * keeps them until its late reply, or until it is known never to run.
+ */
+struct nvgpu_wl_held {
+  u32 n;
+  struct dma_buf **bufs;
+  struct file **files;
+};
+
+static void nvgpu_wl_held_release(void *arg) {
+  struct nvgpu_wl_held *h = arg;
+  u32 i;
+
+  for (i = 0; i < h->n; i++) {
+    if (h->bufs[i])
+      dma_buf_put(h->bufs[i]);
+    if (h->files[i])
+      fput(h->files[i]);
+  }
+  kfree(h);
+}
+
 static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->dev;
   const size_t H = sizeof(struct nvgpu_msg_hdr);
@@ -504,8 +533,7 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_wl_frame_hdr fh;
   struct nvgpu_wl_send_resp sr;
   struct nvgpu_tbuf *req = NULL, *resp = NULL;
-  struct dma_buf **held = NULL;
-  struct file **held_files = NULL;
+  struct nvgpu_wl_held *held = NULL;
   u32 ndesc = 0, used = 0, i;
   s32 status;
   long ret;
@@ -537,12 +565,18 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
 
   ndesc = le16_to_cpu((__le16)fh.ndesc);
   if (ndesc) {
-    held = kcalloc(ndesc, sizeof(*held), GFP_KERNEL);
-    held_files = kcalloc(ndesc, sizeof(*held_files), GFP_KERNEL);
-    if (!held || !held_files) {
+    /* One allocation: the struct, then the two arrays. */
+    held = kzalloc(sizeof(*held) + 2 * (size_t)ndesc * sizeof(void *),
+                   GFP_KERNEL);
+    if (!held) {
       ret = -ENOMEM;
       goto out;
     }
+    held->n = ndesc;
+    held->bufs = (struct dma_buf **)(held + 1);
+    held->files = (struct file **)(held->bufs + ndesc);
+    /* Released with the request from here, whatever becomes of it. */
+    nvgpu_tbuf_on_free(req, nvgpu_wl_held_release, held);
   }
   for (i = 0; i < ndesc; i++) {
     struct nvgpu_wl_desc d;
@@ -552,7 +586,7 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
       goto out;
     switch (d.kind) {
     case NVGPU_WL_DESC_DMABUF:
-      nvgpu_wl_resolve_dmabuf(dev, &d, &held[i]);
+      nvgpu_wl_resolve_dmabuf(dev, &d, &held->bufs[i]);
       break;
     case NVGPU_WL_DESC_SHM_POOL:
     case NVGPU_WL_DESC_BLOB:
@@ -566,7 +600,7 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
     case NVGPU_WL_DESC_SYNCOBJ:
       /* Explicit sync: the host offers the global only when we said
        * NVGPU_WL_CAP_SYNCOBJ, so without fences no syncobj is ours. */
-      nvgpu_wl_resolve_syncobj(dev, &d, &held_files[i]);
+      nvgpu_wl_resolve_syncobj(dev, &d, &held->files[i]);
       break;
     default:
       /* DRM files never go guest → host, and nothing else exists. */
@@ -580,7 +614,8 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
 
   ret = nvgpu_xfer(dev, req, resp, 0, &used);
   if (ret == -ETIMEDOUT || ret == -EINTR) {
-    /* The transport owns the buffers now (nvgpu.h). */
+    /* The transport owns the buffers now (nvgpu.h), and with the request
+     * what it names: the host may still export those objects. */
     req = NULL;
     resp = NULL;
     goto out;
@@ -609,18 +644,7 @@ static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
     ret = -EFAULT;
 
 out:
-  if (held) {
-    for (i = 0; i < ndesc; i++)
-      if (held[i])
-        dma_buf_put(held[i]);
-    kfree(held);
-  }
-  if (held_files) {
-    for (i = 0; i < ndesc; i++)
-      if (held_files[i])
-        fput(held_files[i]);
-    kfree(held_files);
-  }
+  /* Frees `held` too, the host being done with the request. */
   if (req)
     nvgpu_tbuf_free(req);
   if (resp)
@@ -704,6 +728,21 @@ again:
   ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 3);
   if (ret < 0)
     goto out;
+  /*
+   * The backend's answer, checked before anything is made of it: a GEM
+   * handle is a non-zero u32 (none can be closed that is not), and a size
+   * is what a proxy can stand for (PAGE_ALIGN() must not wrap it).
+   */
+  if (!res[0] || res[0] > U32_MAX) {
+    ret = -EPROTO;
+    goto out;
+  }
+  if (!res[1] || res[1] > NVGPU_WL_MAX_IMPORT) {
+    if (!xa_load(&nfd->gem_index, (u32)res[0]))
+      nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    ret = -EPROTO;
+    goto out;
+  }
   /*
    * res[2] is what the host says the object is. A host client's buffer from
    * another device -- an iGPU's, a udmabuf, a v4l2 frame -- is a dma-buf
@@ -829,8 +868,12 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   ret = nvgpu_tbuf_read(resp, H, &fh, sizeof(fh));
   if (!ret)
     ret = nvgpu_wl_frame_check(&fh, flen, max_desc);
-  if (ret)
+  if (ret) {
+    /* A frame not taken is lost to the channel, but the backend handles in
+     * its descriptors (a lease among them) must still be let go. */
+    nvgpu_wl_reap_recv(dev, resp, used);
     goto out;
+  }
 
   ndesc = le16_to_cpu((__le16)fh.ndesc);
   if (ndesc) {
