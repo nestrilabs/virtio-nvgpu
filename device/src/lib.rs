@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // device/src/lib.rs
 //
-// VMM backend for virtio-gpu-nv.
+// The virtio-nvgpu device, with no VMM in its dependency list (README.md).
 //
-// Integrates with libkrun's virtio device infrastructure.  The backend holds
-// real host file descriptors for `/dev/nvidia*` and dispatches messages
-// received from the guest driver over virtqueues.
+// The backend holds the real host file descriptors for `/dev/nvidia*` and the
+// DRM nodes and dispatches the messages the guest driver sends over the
+// virtqueues; a VMM adopts it through the traits here, or runs the
+// vhost-user backend binary (`bin/vhost-user-nvgpu.rs`).
 
 // Every `unsafe` of the crate is in `sys` (sys/mod.rs); scripts/check-unsafe.sh
 // holds the tree to that, and each other module forbids it outright.

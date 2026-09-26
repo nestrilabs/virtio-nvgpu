@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! IOCTL2 end to end, as close as it gets without a VM: the guest's
 //! interpreter against the whole backend.
 //!

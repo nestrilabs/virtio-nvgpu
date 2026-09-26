@@ -297,13 +297,13 @@ both.
 
 | directory | license | what it is |
 | --- | --- | --- |
-| [`driver/`](driver/) | **GPL-2.0** | Guest kernel module. Registers `/dev/nvidia*`, the DRM nodes and `/dev/nvgpu-wl`, forwards ioctl and mmap over the virtqueue. Deliberately not ABI-aware: what an ioctl carries comes from generated tables. |
+| [`driver/`](driver/) | **GPL-2.0-only** | Guest kernel module. Registers `/dev/nvidia*`, the DRM nodes and `/dev/nvgpu-wl`, forwards ioctl and mmap over the virtqueue. Deliberately not ABI-aware: what an ioctl carries comes from generated tables. |
 | [`device/`](device/) | **Apache-2.0** | The virtio device, as a Rust crate with **no VMM in its dependency list**. Every VMM concern is a trait. Also the vhost-user backend binary, and the host half of the Wayland proxy. |
 | [`wlwire/`](wlwire/) | **Apache-2.0** | The Wayland proxy's shared half: a codec generated from vendored protocol XML, the allowlist it is checked against at build time, the channel's frame format, and the translation engine both ends run. |
 | [`nvgpu-wl-guest/`](nvgpu-wl-guest/) | **Apache-2.0** | The guest daemon of the Wayland proxy. Guest clients connect to it as to a compositor. |
 | [`isolate/`](isolate/) | **Apache-2.0** | **A design note, not code yet.** The sandboxed per-guest helper that will hold the real device FDs. Today the backend holds them itself. |
 | [`gen/`](gen/) | — | Generated tables: the ABI profiles, the IOCTL2 schema both halves interpret, NVKMS and nvidia-drm layouts, RM control pointers and UVM block sizes, each measured per driver release. Checked in *and* reproducible. |
-| [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0+** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
+| [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0-or-later** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
 | [`patches/`](patches/) | the patched project's | Patches to Hyprland and aquamarine that let the host lease a desktop monitor to a guest, and to crosvm to run the device as a vhost-user frontend. |
 | [`scripts/`](scripts/) | — | The guest launcher, the guest's udev rule for `/dev/nvgpu-wl`, the Wayland loopback test, and [`scripts/verify/`](scripts/verify/), the helpers [`TESTING.md`](TESTING.md) runs on the GPU box. |
 
@@ -814,7 +814,10 @@ Full texts: [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0),
 [`LICENSE-GPL-2.0`](LICENSE-GPL-2.0),
 [`LICENSE-BSD-3-Clause`](LICENSE-BSD-3-Clause).
 
-Code ported from other projects keeps its original terms.
+Code ported from other projects keeps its original terms; [`NOTICE`](NOTICE)
+says what comes from gVisor's nvproxy, NVIDIA's open-gpu-kernel-modules and
+the vendored Wayland protocols. Every source file names its licence in an
+`SPDX-License-Identifier` line.
 
 ## See also
 
