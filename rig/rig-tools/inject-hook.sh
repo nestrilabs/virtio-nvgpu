@@ -11,8 +11,10 @@
 #
 # The helper keeps its connection -- and so the ids -- until the backend hangs
 # up at the end of the run, or NVGPU_INJECT_HOLD seconds (600), painting the
-# live buffer meanwhile. NVGPU_INJECT_ARGS adds arguments (--size, --buffers,
-# --frames). Its output goes to NVGPU_HOOK_LOG.
+# live buffer meanwhile, and running NVGPU_INJECT_PINGPONG (200) frames of
+# explicit sync with the guest. NVGPU_INJECT_ARGS adds arguments (--size,
+# --buffers, --frames). Its output goes to NVGPU_HOOK_LOG, the explicit-sync
+# timings at the end of the run.
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
@@ -36,7 +38,7 @@ setsid nix shell "$OD" -c env \
     __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="$OD/share/egl/egl_external_platform.d" \
     GBM_BACKENDS_PATH="$OD/lib/gbm" \
     "$BIN" --socket "$NVGPU_INJECT_SOCKET" --out "$OUT" --hold "${NVGPU_INJECT_HOLD:-600}" \
-    ${NVGPU_INJECT_ARGS:-} </dev/null >"$LOG" 2>&1 &
+    --pingpong "${NVGPU_INJECT_PINGPONG:-200}" ${NVGPU_INJECT_ARGS:-} </dev/null >"$LOG" 2>&1 &
 PID=$!
 for _ in $(seq 1 600); do
     [ -s "$OUT" ] && break

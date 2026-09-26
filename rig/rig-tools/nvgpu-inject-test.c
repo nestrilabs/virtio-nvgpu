@@ -16,6 +16,8 @@
  *   nvgpu_cap_live=ID:TOKEN              a buffer repainted every frame while
  *                                        this runs (--hold)
  *   nvgpu_cap_released=ID:TOKEN          an id imported and then RELEASEd
+ *   nvgpu_cap_sync=ID:TOKEN:SID:STOKEN:N a buffer and a syncobj (IMPORT_SYNCOBJ)
+ *                                        for N frames of explicit sync
  *
  * It also checks the refusals it can cause itself: a memfd (not a dma-buf,
  * EBADF), a udmabuf (another device's memory, ENODEV) when /dev/udmabuf can
@@ -23,6 +25,7 @@
  *
  * Usage: nvgpu-inject-test --socket PATH [--render PATH] [--size WxH]
  *          [--buffers N] [--frames N] [--hold SECS] [--out FILE]
+ *          [--pingpong N]
  *
  *   --buffers N  buffers to inject (default 4), plus the live one
  *   --frames N   frames painted round-robin into them (default 240), timed
@@ -30,6 +33,12 @@
  *                live buffer at 60 Hz, or until the backend hangs up
  *   --out FILE   write the command-line words there (a line), after the
  *                buffers are imported; the rig's hook waits for it
+ *   --pingpong N while holding, N frames of explicit sync with the guest: a
+ *                syncobj is injected with one more buffer; frame k is
+ *                painted, glFinish()ed and announced at timeline point 2k-1,
+ *                and frame k+1 painted only once the guest has signalled 2k.
+ *                The time from announcing a frame to its release is printed
+ *                (the round trip of the notification, and the guest's read)
  *
  * Needs NVIDIA's EGL and GBM (rig/rig-tools/inject-hook.sh runs it with the
  * guest image's copy of the host's userspace).
@@ -54,13 +63,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <drm/drm.h>
+
 #include "../guest-image/tools/capture-pattern.h"
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 #define XR24 FOURCC('X', 'R', '2', '4')
 
 /* protocol/src/inject.rs, little-endian on a little-endian host. */
-enum { INJ_VERSION = 1, INJ_OP_HELLO = 1, INJ_OP_IMPORT = 2, INJ_OP_RELEASE = 3 };
+enum { INJ_VERSION = 1, INJ_OP_HELLO = 1, INJ_OP_IMPORT = 2, INJ_OP_RELEASE = 3, INJ_OP_IMPORT_SYNCOBJ = 4 };
 struct inj_hello {
 	uint32_t op, version, flags, reserved;
 };
@@ -72,12 +83,15 @@ struct inj_import {
 struct inj_release {
 	uint32_t op, id;
 };
+struct inj_import_syncobj {
+	uint32_t op, flags;
+};
 struct inj_reply {
 	uint32_t op;
 	int32_t status;
 	uint32_t id, version;
 	uint8_t token[16];
-	uint32_t max_buffers, reserved;
+	uint32_t max_buffers, max_syncobjs;
 	uint64_t max_bytes;
 };
 _Static_assert(sizeof(struct inj_hello) == 16, "hello");
@@ -227,7 +241,7 @@ int main(int argc, char **argv)
 {
 	const char *sock_path = NULL, *render_path = "/dev/dri/renderD128", *out_path = NULL;
 	uint32_t w = 1280, h = 720;
-	int nbuf = 4, frames = 240, hold = 0;
+	int nbuf = 4, frames = 240, hold = 0, pingpong = 0;
 	for (int i = 1; i < argc; i++) {
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 		if (!strcmp(argv[i], "--socket") && v)
@@ -244,6 +258,8 @@ int main(int argc, char **argv)
 			hold = atoi(v), i++;
 		else if (!strcmp(argv[i], "--out") && v)
 			out_path = v, i++;
+		else if (!strcmp(argv[i], "--pingpong") && v)
+			pingpong = atoi(v), i++;
 		else {
 			fprintf(stderr, "usage: see the head of %s's source\n", argv[0]);
 			return 2;
@@ -289,7 +305,8 @@ int main(int argc, char **argv)
 			render_mods[nr++] = mods[i];
 	CHECK(nr > 0, "EGL renders XRGB8888 with %d modifier(s)", nr);
 
-	int total = nbuf + 2; /* + the live buffer, + the one released */
+	/* + the live buffer, + the explicit-sync one, + the one released */
+	int total = nbuf + 3;
 	struct buf *bufs = calloc((size_t)total, sizeof *bufs);
 	gl_setup();
 	for (int i = 0; i < total; i++) {
@@ -394,6 +411,35 @@ int main(int argc, char **argv)
 	struct inj_release rel = {.op = INJ_OP_RELEASE, .id = released->id};
 	CHECK(roundtrip(s, &rel, sizeof rel, -1, &r, NULL) == 0 && r.status == 0, "RELEASE of id %u", released->id);
 
+	/* The explicit-sync buffer's syncobj: a timeline on the helper's own
+	 * render file, handed to the backend as a syncobj file. */
+	struct buf *syncbuf = &bufs[nbuf + 1];
+	uint32_t sync_handle = 0, sync_id = 0;
+	uint8_t sync_token[16] = {0};
+	if (pingpong > 0) {
+		struct drm_syncobj_create sc = {0};
+		struct drm_syncobj_handle sh = {0};
+		if (ioctl(drm, DRM_IOCTL_SYNCOBJ_CREATE, &sc) == 0) {
+			sh.handle = sc.handle;
+			if (ioctl(drm, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &sh) == 0) {
+				struct inj_import_syncobj is = {.op = INJ_OP_IMPORT_SYNCOBJ};
+				if (roundtrip(s, &is, sizeof is, sh.fd, &r, NULL) == 0 && r.status == 0) {
+					sync_handle = sc.handle;
+					sync_id = r.id;
+					memcpy(sync_token, r.token, 16);
+				}
+				close(sh.fd);
+			}
+		}
+		CHECK(sync_id != 0, "IMPORT_SYNCOBJ of a timeline syncobj (status %d)", r.status);
+		/* A memfd is no syncobj. */
+		int nf = memfd_create("not-a-syncobj", MFD_CLOEXEC);
+		struct inj_import_syncobj is = {.op = INJ_OP_IMPORT_SYNCOBJ};
+		CHECK(roundtrip(s, &is, sizeof is, nf, &r, NULL) == 0 && r.status == -EBADF,
+		      "a memfd is refused as no syncobj (status %d)", r.status);
+		close(nf);
+	}
+
 	/* ── paint: frames round-robin, timed to glFinish ── */
 	double *lat = calloc((size_t)frames, sizeof(double));
 	double t_all = now_us();
@@ -437,6 +483,13 @@ int main(int argc, char **argv)
 	hex(released->token, tok);
 	n += snprintf(line + n, sizeof line - (size_t)n, " nvgpu_cap_released=%u:%s nvgpu_cap_size=%ux%u",
 		      released->id, tok, w, h);
+	if (sync_id) {
+		char stok[33];
+		hex(syncbuf->token, tok);
+		hex(sync_token, stok);
+		n += snprintf(line + n, sizeof line - (size_t)n, " nvgpu_cap_sync=%u:%s:%u:%s:%d", syncbuf->id, tok,
+			      sync_id, stok, pingpong);
+	}
 	printf("%s\n", line);
 	fflush(stdout);
 	if (out_path) {
@@ -454,15 +507,77 @@ int main(int argc, char **argv)
 	/* ── hold: keep the ids, repaint the live buffer ── */
 	double end = now_us() + hold * 1e6;
 	int live = 1;
+	/* Explicit sync: frame k announced at 2k-1, released at 2k. */
+	int pk = 0;
+	double announced = 0, *rtt = pingpong > 0 ? calloc((size_t)pingpong, sizeof(double)) : NULL;
+	double last_live = 0;
+	if (sync_id) {
+		pk = 1;
+		paint(syncbuf, w, h, pk);
+		glFinish();
+		uint64_t pt = 1;
+		struct drm_syncobj_timeline_array sig = {.handles = (uintptr_t)&sync_handle,
+							 .points = (uintptr_t)&pt,
+							 .count_handles = 1};
+		ioctl(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &sig);
+		announced = now_us();
+	}
 	while (now_us() < end) {
 		struct pollfd p = {.fd = s, .events = POLLIN};
-		if (poll(&p, 1, 16) > 0 && (p.revents & (POLLHUP | POLLERR | POLLIN))) {
+		if (poll(&p, 1, 0) > 0 && (p.revents & (POLLHUP | POLLERR | POLLIN))) {
 			fprintf(stderr, "inject-test: the backend hung up\n");
 			break;
 		}
-		paint(&bufs[nbuf], w, h, live++);
-		glFinish();
+		if (pk > 0 && pk <= pingpong) {
+			/* Sleep in the release wait itself (16 ms at most), so its
+			 * signal is seen when it comes. */
+			uint64_t pt = 2ull * (uint64_t)pk;
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			struct drm_syncobj_timeline_wait wt = {
+				.handles = (uintptr_t)&sync_handle,
+				.points = (uintptr_t)&pt,
+				.timeout_nsec = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + 16000000,
+				.count_handles = 1,
+				.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT};
+			if (ioctl(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wt) == 0) {
+				rtt[pk - 1] = now_us() - announced;
+				if (++pk <= pingpong) {
+					paint(syncbuf, w, h, pk);
+					glFinish();
+					uint64_t ap = 2ull * (uint64_t)pk - 1;
+					struct drm_syncobj_timeline_array sig = {.handles = (uintptr_t)&sync_handle,
+										 .points = (uintptr_t)&ap,
+										 .count_handles = 1};
+					ioctl(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &sig);
+					announced = now_us();
+				} else {
+					/* The first frame waited for the guest to boot. */
+					int half = pingpong / 2, m = pingpong - half - 1;
+					if (m > 0) {
+						qsort(rtt + 1, (size_t)(half > 1 ? half - 1 : 0), sizeof(double), cmp_d);
+						qsort(rtt + half, (size_t)(pingpong - half), sizeof(double), cmp_d);
+						fprintf(stderr,
+							"inject-test: ok   explicit sync: %d frames announced and released; "
+							"announce to release, guest reading each frame: median %.0f us; "
+							"guest only waiting and signalling: median %.0f us, p99 %.0f us\n",
+							pingpong, half > 1 ? rtt[1 + (half - 1) / 2] : 0.0,
+							rtt[half + (pingpong - half) / 2],
+							rtt[half + (pingpong - half) * 99 / 100]);
+					}
+				}
+			}
+		} else {
+			usleep(1000);
+		}
+		if (now_us() - last_live >= 16000) {
+			paint(&bufs[nbuf], w, h, live++);
+			glFinish();
+			last_live = now_us();
+		}
 	}
+	if (pk > 0 && pk <= pingpong)
+		fprintf(stderr, "inject-test: explicit sync: %d of %d frames released\n", pk - 1, pingpong);
 	fprintf(stderr, "inject-test: done after %d live frames\n", live - 1);
 	close(s);
 	return failures ? 1 : 0;

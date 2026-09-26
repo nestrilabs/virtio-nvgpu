@@ -20,6 +20,7 @@
  * Usage: nvgpu-capture-import --id N --token HEX32 [--frame F] [--fnv HEX]
  *          [--render PATH] [--node PATH] [--no-egl] [--no-vk]
  *          [--expect-errno E] [--watch MS] [--no-cpu]
+ *          [--sync ID:TOKEN --pingpong N]
  *   --frame F      the frame the host painted last into this buffer; without
  *                  it the frame is read from pixel (0,0) and the rest of the
  *                  image checked against it
@@ -32,6 +33,11 @@
  *                  keeps painting it): the frame must have moved on, without
  *                  a new OPEN; a read of a frame half painted is counted as
  *                  a tear (there is no sync in this first cut)
+ *   --sync ID:TOKEN --pingpong N
+ *                  explicit sync with the helper's injected syncobj
+ *                  (OPEN_SYNCOBJ): N frames, each waited for at its acquire
+ *                  point (2k-1), read, and released (2k); see pingpong();
+ *                  with --expect-sync-errno E, OPEN_SYNCOBJ must fail so
  * Output: "capture-import: ok|FAIL <what>" lines, then "ALL PASS" or
  * "FAILED"; exit 0 only when everything passed.
  */
@@ -50,6 +56,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <drm/drm.h>
 #include <vulkan/vulkan.h>
 
 #include "capture-pattern.h"
@@ -70,6 +77,15 @@ struct nvgpu_capture_open {
 };
 _Static_assert(sizeof(struct nvgpu_capture_open) == 104, "uapi size");
 #define NVGPU_CAPTURE_IOC_OPEN _IOWR('C', 0x40, struct nvgpu_capture_open)
+struct nvgpu_capture_open_syncobj {
+	int32_t render_fd;
+	uint32_t id;
+	uint8_t token[16];
+	uint32_t flags;
+	uint32_t handle;
+};
+_Static_assert(sizeof(struct nvgpu_capture_open_syncobj) == 32, "uapi size");
+#define NVGPU_CAPTURE_IOC_OPEN_SYNCOBJ _IOWR('C', 0x41, struct nvgpu_capture_open_syncobj)
 
 /* drm_nvidia_gem_map_offset_params, answered by the guest module. */
 struct gem_map_offset {
@@ -77,15 +93,7 @@ struct gem_map_offset {
 	uint64_t offset;
 };
 #define DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET _IOWR('d', 0x4a, struct gem_map_offset)
-struct prime_handle {
-	uint32_t handle, flags;
-	int32_t fd;
-};
-#define DRM_IOCTL_PRIME_FD_TO_HANDLE _IOWR('d', 0x2e, struct prime_handle)
-struct gem_close {
-	uint32_t handle, pad;
-};
-#define DRM_IOCTL_GEM_CLOSE _IOW('d', 0x09, struct gem_close)
+/* PRIME_FD_TO_HANDLE, GEM_CLOSE and the syncobj ioctls: <drm/drm.h>. */
 
 #define FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 
@@ -162,7 +170,7 @@ static void cpu_checks(int render, const struct nvgpu_capture_open *o)
 
 	/* The same object through the render node: a handle for it in this
 	 * file, the node's offset for it, and a writable mapping of that. */
-	struct prime_handle ph = {.fd = o->dmabuf_fd};
+	struct drm_prime_handle ph = {.fd = o->dmabuf_fd};
 	if (ioctl(render, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
 		OK(0, "PRIME_FD_TO_HANDLE of the dma-buf on the render node (%s)", strerror(errno));
 		return;
@@ -182,7 +190,7 @@ static void cpu_checks(int render, const struct nvgpu_capture_open *o)
 		if (p != MAP_FAILED)
 			munmap(p, len);
 	}
-	struct gem_close gc = {.handle = ph.handle};
+	struct drm_gem_close gc = {.handle = ph.handle};
 	ioctl(render, DRM_IOCTL_GEM_CLOSE, &gc);
 }
 
@@ -417,16 +425,44 @@ static uint32_t mem_type(struct vk *v, uint32_t bits, VkMemoryPropertyFlags want
 	return UINT32_MAX;
 }
 
-/* The imported image, copied into a host-visible buffer: RGBA bytes. */
-static uint8_t *vk_read(struct vk *v, const struct nvgpu_capture_open *o, double *us)
-{
+/* An imported image and what copies it into a host-visible buffer. */
+struct vkimg {
+	VkImage image;
+	VkDeviceMemory mem, bmem;
+	VkBuffer buf;
+	VkCommandBuffer cb;
+	VkFence fence;
+	VkDeviceSize bytes;
 	int swap;
-	VkFormat fmt = vk_format(o->fourcc, &swap);
+};
+
+static void vk_free(struct vk *v, struct vkimg *m)
+{
+	if (m->fence)
+		vkDestroyFence(v->dev, m->fence, NULL);
+	if (m->cb)
+		vkFreeCommandBuffers(v->dev, v->pool, 1, &m->cb);
+	if (m->buf)
+		vkDestroyBuffer(v->dev, m->buf, NULL);
+	if (m->bmem)
+		vkFreeMemory(v->dev, m->bmem, NULL);
+	if (m->image)
+		vkDestroyImage(v->dev, m->image, NULL);
+	if (m->mem)
+		vkFreeMemory(v->dev, m->mem, NULL);
+	memset(m, 0, sizeof(*m));
+}
+
+/* Import the dma-buf as an image with its modifier, and record the copy of
+ * it into a host-visible buffer, once. 0, or -1 having said why. */
+static int vk_import(struct vk *v, const struct nvgpu_capture_open *o, struct vkimg *m)
+{
+	memset(m, 0, sizeof(*m));
+	VkFormat fmt = vk_format(o->fourcc, &m->swap);
 	if (fmt == VK_FORMAT_UNDEFINED) {
 		OK(0, "Vulkan: fourcc 0x%08x has no format here", o->fourcc);
-		return NULL;
+		return -1;
 	}
-	double t0 = now_us();
 	VkSubresourceLayout layout = {.offset = o->offsets[0], .rowPitch = o->strides[0]};
 	VkImageDrmFormatModifierExplicitCreateInfoEXT mod = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
@@ -447,24 +483,25 @@ static uint8_t *vk_read(struct vk *v, const struct nvgpu_capture_open *o, double
 				 .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
 				 .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 				 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-	VkImage image;
-	VkResult r = vkCreateImage(v->dev, &ici, NULL, &image);
+	VkResult r = vkCreateImage(v->dev, &ici, NULL, &m->image);
 	if (r != VK_SUCCESS) {
 		OK(0, "Vulkan: an image of modifier 0x%016llx (%d)", (unsigned long long)o->modifier, r);
-		return NULL;
+		m->image = VK_NULL_HANDLE;
+		return -1;
 	}
 	VkMemoryFdPropertiesKHR fp = {.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
 	r = v->fd_props(v->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, o->dmabuf_fd, &fp);
 	VkMemoryRequirements req;
-	vkGetImageMemoryRequirements(v->dev, image, &req);
+	vkGetImageMemoryRequirements(v->dev, m->image, &req);
 	uint32_t mt = mem_type(v, req.memoryTypeBits & fp.memoryTypeBits, 0);
 	if (r != VK_SUCCESS || mt == UINT32_MAX) {
 		OK(0, "Vulkan: a memory type for the dma-buf (%d, fd bits 0x%x, image bits 0x%x)", r,
 		   fp.memoryTypeBits, req.memoryTypeBits);
-		return NULL;
+		vk_free(v, m);
+		return -1;
 	}
 	VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-					     .image = image};
+					     .image = m->image};
 	VkImportMemoryFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
 				       .pNext = &ded,
 				       .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -473,43 +510,40 @@ static uint8_t *vk_read(struct vk *v, const struct nvgpu_capture_open *o, double
 				    .pNext = &imp,
 				    .allocationSize = o->size > req.size ? o->size : req.size,
 				    .memoryTypeIndex = mt};
-	VkDeviceMemory mem;
-	r = vkAllocateMemory(v->dev, &mai, NULL, &mem);
+	r = vkAllocateMemory(v->dev, &mai, NULL, &m->mem);
 	if (r != VK_SUCCESS) {
 		OK(0, "Vulkan: import of the dma-buf (%d)", r);
 		close(imp.fd);
-		return NULL;
+		m->mem = VK_NULL_HANDLE;
+		vk_free(v, m);
+		return -1;
 	}
-	vkBindImageMemory(v->dev, image, mem, 0);
+	vkBindImageMemory(v->dev, m->image, m->mem, 0);
 
-	VkDeviceSize bytes = (VkDeviceSize)o->width * o->height * 4;
+	m->bytes = (VkDeviceSize)o->width * o->height * 4;
 	VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-				  .size = bytes,
+				  .size = m->bytes,
 				  .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-	VkBuffer buf;
-	vkCreateBuffer(v->dev, &bci, NULL, &buf);
+	vkCreateBuffer(v->dev, &bci, NULL, &m->buf);
 	VkMemoryRequirements breq;
-	vkGetBufferMemoryRequirements(v->dev, buf, &breq);
+	vkGetBufferMemoryRequirements(v->dev, m->buf, &breq);
 	VkMemoryAllocateInfo bai = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.allocationSize = breq.size,
 		.memoryTypeIndex = mem_type(v, breq.memoryTypeBits,
 					    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-	VkDeviceMemory bmem;
-	vkAllocateMemory(v->dev, &bai, NULL, &bmem);
-	vkBindBufferMemory(v->dev, buf, bmem, 0);
+	vkAllocateMemory(v->dev, &bai, NULL, &m->bmem);
+	vkBindBufferMemory(v->dev, m->buf, m->bmem, 0);
 
 	VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 					   .commandPool = v->pool,
 					   .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 					   .commandBufferCount = 1};
-	VkCommandBuffer cb;
-	vkAllocateCommandBuffers(v->dev, &cai, &cb);
-	VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-				       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-	vkBeginCommandBuffer(cb, &bi);
+	vkAllocateCommandBuffers(v->dev, &cai, &m->cb);
+	VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	vkBeginCommandBuffer(m->cb, &bi);
 	/* The contents are the host's: from GENERAL, which keeps them, not from
-	 * UNDEFINED, which may discard them. */
+	 * UNDEFINED, which may discard them; and back to GENERAL after. */
 	VkImageMemoryBarrier bar = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = 0,
 				    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
@@ -517,45 +551,161 @@ static uint8_t *vk_read(struct vk *v, const struct nvgpu_capture_open *o, double
 				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 				    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 				    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-				    .image = image,
+				    .image = m->image,
 				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-			     NULL, 1, &bar);
+	vkCmdPipelineBarrier(m->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
+			     0, NULL, 1, &bar);
 	VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 				  .imageExtent = {o->width, o->height, 1}};
-	vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
-	vkEndCommandBuffer(cb);
+	vkCmdCopyImageToBuffer(m->cb, m->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m->buf, 1, &copy);
+	bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	bar.dstAccessMask = 0;
+	bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	vkCmdPipelineBarrier(m->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+			     NULL, 0, NULL, 1, &bar);
+	vkEndCommandBuffer(m->cb);
 	VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-	VkFence fence;
-	vkCreateFence(v->dev, &fci, NULL, &fence);
-	VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
-	r = vkQueueSubmit(v->q, 1, &si, fence);
+	vkCreateFence(v->dev, &fci, NULL, &m->fence);
+	return 0;
+}
+
+/* One copy of the image: its RGBA bytes (malloc'd), or NULL. */
+static uint8_t *vk_copy(struct vk *v, struct vkimg *m)
+{
+	vkResetFences(v->dev, 1, &m->fence);
+	VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &m->cb};
+	VkResult r = vkQueueSubmit(v->q, 1, &si, m->fence);
 	if (r == VK_SUCCESS)
-		r = vkWaitForFences(v->dev, 1, &fence, VK_TRUE, 5000000000ull);
-	*us = now_us() - t0;
-	uint8_t *out = NULL;
-	if (r == VK_SUCCESS) {
-		void *p;
-		vkMapMemory(v->dev, bmem, 0, bytes, 0, &p);
-		out = malloc(bytes);
-		memcpy(out, p, bytes);
-		vkUnmapMemory(v->dev, bmem);
-		if (swap)
-			for (VkDeviceSize i = 0; i < bytes; i += 4) {
-				uint8_t t = out[i];
-				out[i] = out[i + 2];
-				out[i + 2] = t;
-			}
-	} else {
+		r = vkWaitForFences(v->dev, 1, &m->fence, VK_TRUE, 5000000000ull);
+	if (r != VK_SUCCESS) {
 		OK(0, "Vulkan: the copy (%d)", r);
+		return NULL;
 	}
-	vkDestroyFence(v->dev, fence, NULL);
-	vkFreeCommandBuffers(v->dev, v->pool, 1, &cb);
-	vkDestroyBuffer(v->dev, buf, NULL);
-	vkFreeMemory(v->dev, bmem, NULL);
-	vkDestroyImage(v->dev, image, NULL);
-	vkFreeMemory(v->dev, mem, NULL);
+	void *p;
+	vkMapMemory(v->dev, m->bmem, 0, m->bytes, 0, &p);
+	uint8_t *out = malloc(m->bytes);
+	memcpy(out, p, m->bytes);
+	vkUnmapMemory(v->dev, m->bmem);
+	if (m->swap)
+		for (VkDeviceSize i = 0; i < m->bytes; i += 4) {
+			uint8_t t = out[i];
+			out[i] = out[i + 2];
+			out[i + 2] = t;
+		}
 	return out;
+}
+
+/* The imported image, copied once into a host-visible buffer: RGBA bytes. */
+static uint8_t *vk_read(struct vk *v, const struct nvgpu_capture_open *o, double *us)
+{
+	struct vkimg m;
+	double t0 = now_us();
+	if (vk_import(v, o, &m))
+		return NULL;
+	uint8_t *out = vk_copy(v, &m);
+	*us = now_us() - t0;
+	vk_free(v, &m);
+	return out;
+}
+
+/* ─────────────────── explicit sync: the helper's syncobj ─────────────────── */
+
+/*
+ * The first cut's second step, as a guest capture daemon would run it: the
+ * helper signals point 2k-1 when frame k is in the buffer (acquire), the
+ * guest waits for it, reads the frame, and signals 2k (release); the helper
+ * paints frame k+1 only after 2k. Every read must then be one whole frame,
+ * the right one. The first half of the frames is checked pixel for pixel;
+ * the second only waits and signals, which is what the notification itself
+ * costs (the helper times both).
+ */
+static void pingpong(int cap, int render, const struct nvgpu_capture_open *o, uint32_t sync_id,
+		     const uint8_t sync_token[16], int n, int expect_errno)
+{
+	struct nvgpu_capture_open_syncobj so = {.render_fd = render, .id = sync_id};
+	memcpy(so.token, sync_token, 16);
+	int r = ioctl(cap, NVGPU_CAPTURE_IOC_OPEN_SYNCOBJ, &so);
+	if (expect_errno) {
+		OK(r && errno == expect_errno, "OPEN_SYNCOBJ of id %u refused with errno %d, as expected %d",
+		   sync_id, r ? errno : 0, expect_errno);
+		return;
+	}
+	if (r) {
+		OK(0, "OPEN_SYNCOBJ of id %u (%s)", sync_id, strerror(errno));
+		return;
+	}
+	OK(so.handle != 0, "OPEN_SYNCOBJ of id %u: syncobj handle %u in the render file", sync_id, so.handle);
+	struct vk v = {0};
+	struct vkimg m;
+	if (vk_init(&v) || vk_import(&v, o, &m)) {
+		OK(0, "Vulkan: the sync buffer's import");
+		return;
+	}
+	int bad_frames = 0, torn = 0, checked = 0;
+	double wait_us = 0, check_us = 0, signal_us = 0;
+	int k;
+	for (k = 1; k <= n; k++) {
+		uint64_t acquire = 2ull * k - 1, release = 2ull * k;
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		/* The first frame waits for the helper to start; the rest are
+		 * a frame apart. */
+		int64_t deadline = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + (k == 1 ? 60 : 5) * 1000000000ll;
+		struct drm_syncobj_timeline_wait w = {.handles = (uintptr_t)&so.handle,
+						      .points = (uintptr_t)&acquire,
+						      .timeout_nsec = deadline,
+						      .count_handles = 1,
+						      .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT};
+		double t0 = now_us();
+		if (ioctl(render, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w)) {
+			OK(0, "explicit sync: waiting for acquire point %llu (%s)", (unsigned long long)acquire,
+			   strerror(errno));
+			break;
+		}
+		double t1 = now_us();
+		if (k > 1)
+			wait_us += t1 - t0;
+		if (k <= n / 2) {
+			uint8_t *px = vk_copy(&v, &m);
+			if (!px)
+				break;
+			int f = frame_of(px);
+			if (f != (k & 255))
+				bad_frames++;
+			else if (cap_mismatches(px, o->width, o->height, o->width * 4, (uint32_t)f))
+				torn++;
+			checked++;
+			free(px);
+		}
+		double t2 = now_us();
+		if (k <= n / 2)
+			check_us += t2 - t1;
+		struct drm_syncobj_timeline_array sig = {.handles = (uintptr_t)&so.handle,
+							 .points = (uintptr_t)&release,
+							 .count_handles = 1};
+		if (ioctl(render, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &sig)) {
+			OK(0, "explicit sync: signalling release point %llu (%s)", (unsigned long long)release,
+			   strerror(errno));
+			break;
+		}
+		signal_us += now_us() - t2;
+	}
+	int done = k - 1;
+	OK(done == n, "explicit sync: %d of %d frames acquired and released through the helper's syncobj", done, n);
+	OK(checked > 0 && bad_frames == 0 && torn == 0,
+	   "explicit sync: %d frames read after their acquire point: %d not the frame signalled, %d torn", checked,
+	   bad_frames, torn);
+	if (done > 1)
+		printf("capture-import: note explicit sync: per frame, wait for acquire %.0f us (the helper's "
+		       "paint included), frame check %.0f us, signal release %.0f us\n",
+		       wait_us / (done - 1), checked ? check_us / checked : 0.0, signal_us / done);
+	struct drm_syncobj_destroy d = {.handle = so.handle};
+	ioctl(render, DRM_IOCTL_SYNCOBJ_DESTROY, &d);
+	vk_free(&v, &m);
+	vkDestroyCommandPool(v.dev, v.pool, NULL);
+	vkDestroyDevice(v.dev, NULL);
+	vkDestroyInstance(v.inst, NULL);
 }
 
 static void vk_check(const struct nvgpu_capture_open *o, int frame, uint32_t fnv, int watch_ms)
@@ -622,7 +772,9 @@ int main(int argc, char **argv)
 	const char *node = "/dev/nvgpu-capture", *render_path = "/dev/dri/renderD128";
 	struct nvgpu_capture_open o = {0};
 	int frame = -1, no_egl = 0, no_vk = 0, no_cpu = 0, expect_errno = 0, watch = 0, have_token = 0;
-	uint32_t fnv = 0;
+	int pp = 0, expect_sync_errno = 0;
+	uint32_t fnv = 0, sync_id = 0;
+	uint8_t sync_token[16] = {0};
 	for (int i = 1; i < argc; i++) {
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 		if (!strcmp(argv[i], "--id") && v)
@@ -647,6 +799,15 @@ int main(int argc, char **argv)
 			no_vk = 1;
 		else if (!strcmp(argv[i], "--no-cpu"))
 			no_cpu = 1;
+		else if (!strcmp(argv[i], "--sync") && v && strchr(v, ':')) {
+			sync_id = (uint32_t)strtoul(v, NULL, 0);
+			if (hex_token(strchr(v, ':') + 1, sync_token))
+				return 2;
+			i++;
+		} else if (!strcmp(argv[i], "--pingpong") && v)
+			pp = atoi(v), i++;
+		else if (!strcmp(argv[i], "--expect-sync-errno") && v)
+			expect_sync_errno = atoi(v), i++;
 		else {
 			fprintf(stderr, "usage: see the head of %s's source\n", argv[0]);
 			return 2;
@@ -681,6 +842,10 @@ int main(int argc, char **argv)
 	   (const char *)&o.fourcc, (unsigned long long)o.modifier, o.nplanes, o.offsets[0], o.strides[0],
 	   (unsigned long long)o.size);
 	OK((fcntl(o.dmabuf_fd, F_GETFL) & O_ACCMODE) == O_RDONLY, "the dma-buf is open read-only");
+	if (pp > 0) {
+		pingpong(cap, render, &o, sync_id, sync_token, pp, expect_sync_errno);
+		goto out;
+	}
 	if (!no_cpu)
 		cpu_checks(render, &o);
 	if (!no_egl)

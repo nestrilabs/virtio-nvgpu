@@ -11,6 +11,7 @@
 # whose hook puts the helper's ids and tokens on the command line:
 #   nvgpu_cap=ID:TOKEN:FRAME:FNV,...  nvgpu_cap_live=ID:TOKEN
 #   nvgpu_cap_released=ID:TOKEN       nvgpu_cap_size=WxH
+#   nvgpu_cap_sync=ID:TOKEN:SYNCID:SYNCTOKEN:N  (explicit sync, N frames)
 . /opt/nvgpu/probe-common.sh
 probe_init capture 240
 
@@ -84,6 +85,19 @@ if load_module; then
             "$IMPORT" --id "${live%%:*}" --token "${live#*:}" --no-egl --watch 500
     else
         skip "no nvgpu_cap_live="
+    fi
+
+    section "explicit sync"
+    sync=$(arg cap_sync)
+    if [ -n "$sync" ]; then
+        IFS=: read -r id tok sid stok n <<<"$sync"
+        step "$n frames through the helper's syncobj: acquire, read, release" 120 \
+            "$IMPORT" --id "$id" --token "$tok" --sync "$sid:$stok" --pingpong "$n"
+        step "the syncobj with a wrong token: ENOENT" 20 \
+            "$IMPORT" --id "$id" --token "$tok" --sync "$sid:${stok%?}$([ "${stok: -1}" = f ] && echo 0 || echo f)" \
+            --pingpong 1 --expect-sync-errno 2
+    else
+        skip "no nvgpu_cap_sync="
     fi
 
     section "guest log"
