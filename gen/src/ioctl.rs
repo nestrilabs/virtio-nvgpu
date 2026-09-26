@@ -23,7 +23,7 @@
 
 const NV_IOCTL_BASE: u32 = 200;
 
-pub const NV_ESC_CARD_INFO: u32 = NV_IOCTL_BASE + 0; // 200 = 0xC8
+pub const NV_ESC_CARD_INFO: u32 = NV_IOCTL_BASE; // 200 = 0xC8
 pub const NV_ESC_REGISTER_FD: u32 = NV_IOCTL_BASE + 1; // 201 = 0xC9
 pub const NV_ESC_ALLOC_OS_EVENT: u32 = NV_IOCTL_BASE + 6; // 206 = 0xCE
 pub const NV_ESC_FREE_OS_EVENT: u32 = NV_IOCTL_BASE + 7; // 207 = 0xCF

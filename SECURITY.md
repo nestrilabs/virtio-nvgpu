@@ -1643,3 +1643,17 @@ tag scan (whose comparison had rotted: it no longer ran), the schema render,
 and with `GVISOR=` the ABI profiles, against the sources over the network.
 On 2026-09-26 every table matched, and gVisor master regenerates the three
 profiles unchanged.
+
+**Dead code and lint.** What bypassed a check and nothing called is gone:
+`xfer::Prepared::finish` adopted host descriptors without asking whether the
+number was already the backend's and without closing consumed handles (the
+backend always used `finish_with`). The constructors that make policy state
+with no owner -- `semsurf`'s `render_opened`/`client_allocated`,
+`BackendHooks::new`/`shared`/`Default` -- are test-only, so production code
+cannot build hooks sharing no state with the backend. The RM allowlist's
+NVOS21 branch for RM_ALLOC is gone (every profile admits only NVOS64; a
+32-byte block is refused as too short), with dead constants, an unused test
+helper and orphaned doc comments. `cargo clippy --all-targets` is clean
+outside the Wayland files (another branch) and hostfd, nvkms, osdesc,
+semsurf, xfer and one site of nvidia.rs's `map_unrecorded`, which a
+concurrent isolation branch is rewriting.

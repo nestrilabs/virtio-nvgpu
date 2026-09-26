@@ -320,8 +320,10 @@ pub fn decode(f: &[u8]) -> Result<Frame<'_>, FrameError> {
         return Err(FrameError::Length);
     }
     let descs = f[FRAME_HDR_LEN..dend]
-        .chunks_exact(DESC_LEN)
-        .map(Desc::read)
+        .as_chunks::<DESC_LEN>()
+        .0
+        .iter()
+        .map(|d| Desc::read(d))
         .collect();
     let records = &f[dend..];
     // Validate the record chain up front so consumers can iterate without

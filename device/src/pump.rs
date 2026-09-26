@@ -323,7 +323,7 @@ impl Outbox {
                     let backlog = self.drm.get(&h).map(Vec::as_slice).unwrap_or(&[]);
                     let limit = space.saturating_sub(REC).min(DRM_READ_MAX);
                     let take = match whole_events(backlog, limit) {
-                        Ok(0) if out.len() == HDR && backlog.len() >= 8 => {
+                        Some(0) if out.len() == HDR && backlog.len() >= 8 => {
                             // Not even the first event fits an empty buffer.
                             // No kernel event is anywhere near this size; drop
                             // it rather than wedge the queue behind it.
@@ -335,9 +335,9 @@ impl Outbox {
                             self.drain_drm(h, len.clamp(8, backlog.len()));
                             continue;
                         }
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(()) => {
+                        Some(0) => break,
+                        Some(n) => n,
+                        None => {
                             log::warn!(
                                 "event pump: malformed DRM event stream on handle {h}; \
                                  dropped {} bytes",
@@ -426,21 +426,21 @@ fn event_len(buf: &[u8]) -> usize {
 }
 
 /// How many leading bytes of `buf` are whole `struct drm_event`s totalling at
-/// most `limit`. `Err` for a stream whose headers make no sense (a length
+/// most `limit`. `None` for a stream whose headers make no sense (a length
 /// shorter than the header itself), which the kernel never produces.
-pub fn whole_events(buf: &[u8], limit: usize) -> Result<usize, ()> {
+pub fn whole_events(buf: &[u8], limit: usize) -> Option<usize> {
     let mut off = 0;
     while buf.len() - off >= 8 {
         let len = event_len(&buf[off..]);
         if len < 8 {
-            return Err(());
+            return None;
         }
         if off + len > limit || off + len > buf.len() {
             break;
         }
         off += len;
     }
-    Ok(off)
+    Some(off)
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +660,10 @@ impl<Q: EventQueue> Pump<Q> {
         loop {
             match self.rx.try_recv() {
                 Ok(PumpCmd::Watch { handle, fd, mode }) => {
-                    if let Some(old) = self.unwatch(handle) {
-                        if old.cookie() != mode.cookie() {
-                            self.outbox.forget(handle, old.cookie());
-                        }
+                    if let Some(old) = self.unwatch(handle)
+                        && old.cookie() != mode.cookie()
+                    {
+                        self.outbox.forget(handle, old.cookie());
                     }
                     let w = Watched {
                         fd: PrivateFd::new(fd),
@@ -984,13 +984,13 @@ mod tests {
     #[test]
     fn whole_events_stops_at_the_limit_and_rejects_nonsense() {
         let s = [drm_event(1, 32), drm_event(1, 32)].concat();
-        assert_eq!(whole_events(&s, 64), Ok(64));
-        assert_eq!(whole_events(&s, 63), Ok(32));
-        assert_eq!(whole_events(&s, 31), Ok(0));
-        assert_eq!(whole_events(&s[..40], 64), Ok(32), "a partial tail is left");
+        assert_eq!(whole_events(&s, 64), Some(64));
+        assert_eq!(whole_events(&s, 63), Some(32));
+        assert_eq!(whole_events(&s, 31), Some(0));
+        assert_eq!(whole_events(&s[..40], 64), Some(32), "a partial tail is left");
         let mut short = drm_event(1, 8);
         short[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert_eq!(whole_events(&short, 64), Err(()));
+        assert_eq!(whole_events(&short, 64), None);
     }
 
     #[test]

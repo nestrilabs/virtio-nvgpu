@@ -285,7 +285,12 @@ impl UvmMaps {
         let Some(end) = base.checked_add(len) else {
             return Err(libc::EINVAL);
         };
-        if base < HVA_MIN || end > HVA_MAX || len > MAX_LEN || base % PAGE != 0 || len % PAGE != 0 {
+        if base < HVA_MIN
+            || end > HVA_MAX
+            || len > MAX_LEN
+            || !base.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+        {
             return Err(libc::EINVAL);
         }
         // One address space in the VMM for all of them. Refused as any
@@ -529,7 +534,7 @@ mod tests {
             // A legacy (bottom-up) mmap layout starts at a third of the
             // 47-bit space, where the VMM's own mappings would be.
             (((1u64 << 47) / 3) & !(MB2 - 1), false),
-            (u64::MAX & !4095, false),
+            (!4095, false),
         ] {
             m.record(1, base, MB2);
             let r = m.plan_mmap(1, base, MB2, 3);

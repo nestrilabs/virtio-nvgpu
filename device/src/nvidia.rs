@@ -1411,13 +1411,13 @@ impl NvidiaBackend {
         // Emptied rather than unmapped: a hole would leave the memory slot
         // covering a range that reaches no mapping at all, and a stray access
         // there faults the VMM rather than the guest.
-        if let Some(window) = self.window.as_ref() {
-            if let Err(e) = window.withdraw(region.offset, length) {
-                log::warn!(
-                    "{why}: the window would not give back {:#x}+{length:#x}: {e}",
-                    region.offset
-                );
-            }
+        if let Some(window) = self.window.as_ref()
+            && let Err(e) = window.withdraw(region.offset, length)
+        {
+            log::warn!(
+                "{why}: the window would not give back {:#x}+{length:#x}: {e}",
+                region.offset
+            );
         }
         if let Err(e) = self.shm.free(region) {
             log::warn!("{why}: freeing window region {:#x}: {e}", region.offset);
@@ -1651,11 +1651,11 @@ impl NvidiaBackend {
             }
         };
 
-        if kind == HandleKind::Dev(DeviceKind::Modeset) {
-            if let Some(why) = self.modeset_open_refused(self.current_owner) {
-                log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
-                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
-            }
+        if kind == HandleKind::Dev(DeviceKind::Modeset)
+            && let Some(why) = self.modeset_open_refused(self.current_owner)
+        {
+            log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
+            return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
         }
         let nodes = self.host_nodes();
         let path = match device_path_with(req.device_type, &nodes.dri) {
@@ -2263,10 +2263,10 @@ impl NvidiaBackend {
             .live_maps
             .remove(&req.mapping_id)
             .expect("looked up above");
-        if let Some(key) = live.key {
-            if self.dri_maps.get(&key) == Some(&req.mapping_id) {
-                self.dri_maps.remove(&key);
-            }
+        if let Some(key) = live.key
+            && self.dri_maps.get(&key) == Some(&req.mapping_id)
+        {
+            self.dri_maps.remove(&key);
         }
         self.release_extent(&live.region, live.length, "munmap");
         log::debug!(
@@ -5304,7 +5304,7 @@ mod tests {
     #[test]
     fn short_request_rejected() {
         let mut be = NvidiaBackend::for_test();
-        be.dispatch(&[0u8; 4], &mut vec![0u8; 32]);
+        be.dispatch(&[0u8; 4], &mut [0u8; 32]);
         // just must not panic
     }
 
@@ -5790,8 +5790,10 @@ mod tests {
             );
             let n = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
             let listed: Vec<u32> = out[4..4 + 4 * n.min(NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE)]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
                 .collect();
             let class = *USERMODE_CLASSES
                 .iter()
@@ -6977,9 +6979,12 @@ mod mapping_tests {
         0
     }
 
-    /// Records every placement, with whether it was asked to be writable.
+    /// One placement: what, where, and whether it was asked to be writable.
+    type Placement = (&'static str, u64, bool);
+
+    /// Records every placement.
     #[derive(Clone, Default)]
-    struct RecWindow(Arc<std::sync::Mutex<Vec<(&'static str, u64, bool)>>>);
+    struct RecWindow(Arc<std::sync::Mutex<Vec<Placement>>>);
 
     impl crate::shm::WindowPlacer for RecWindow {
         fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, w: bool) -> Result<()> {

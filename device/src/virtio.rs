@@ -13,7 +13,6 @@
 /// Must match `VIRTIO_ID_GPU_NV` in `driver/nvgpu_wire.h`. This said 0x8042
 /// while the driver bound 45, so a device advertising it would never have been
 /// probed by its own guest driver.
-
 pub const VIRTIO_ID_GPU_NV: u32 = 45;
 
 /// Virtqueue count.

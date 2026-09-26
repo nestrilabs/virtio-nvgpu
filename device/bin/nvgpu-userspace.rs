@@ -192,22 +192,22 @@ fn main() -> Result<()> {
     // nearly all of it is there.
     let mut found = found;
 
-    if let (Some(m), Some(t)) = (&manifest_version, &target) {
-        if m != t && !args.allow_version_mismatch {
-            let swapped = retarget(&entries, m, t);
-            let (f2, _) = resolve(&swapped, &caps, &search);
-            // Only accept the swap if that build is really installed. A
-            // target with nothing on disk must fail loudly below, not quietly
-            // produce a share with three files in it.
-            if f2.len() * 10 >= found.len() * 9 {
-                println!(
-                    "manifest describes driver {m}; the loaded module is {t} -- \
-                     retargeted onto {t} ({} of {} entries found)",
-                    f2.len(),
-                    found.len()
-                );
-                found = f2;
-            }
+    if let (Some(m), Some(t)) = (&manifest_version, &target)
+        && m != t && !args.allow_version_mismatch
+    {
+        let swapped = retarget(&entries, m, t);
+        let (f2, _) = resolve(&swapped, &caps, &search);
+        // Only accept the swap if that build is really installed. A
+        // target with nothing on disk must fail loudly below, not quietly
+        // produce a share with three files in it.
+        if f2.len() * 10 >= found.len() * 9 {
+            println!(
+                "manifest describes driver {m}; the loaded module is {t} -- \
+                 retargeted onto {t} ({} of {} entries found)",
+                f2.len(),
+                found.len()
+            );
+            found = f2;
         }
     }
 
@@ -228,20 +228,20 @@ fn main() -> Result<()> {
     // the one failure here that does not look like one: it mounts, every
     // forwarded ioctl returns 0, and the caller gives up deep inside a library
     // that is a different build from the kernel module it is talking to.
-    if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version) {
-        if staged != loaded && !args.allow_version_mismatch {
-            anyhow::bail!(
-                "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
-                 The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
-                 find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
-                 or not where this looks for it.\n\n\
-                 Install the userspace matching the loaded module, or pass \n\
-                 --driver-version to name a build that is present. \n\
-                 --allow-version-mismatch stages the manifest's own build anyway; see \n\
-                 decision 0070 for why that is not the default.",
-                args.manifest.display()
-            );
-        }
+    if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version)
+        && staged != loaded && !args.allow_version_mismatch
+    {
+        anyhow::bail!(
+            "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
+             The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
+             find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
+             or not where this looks for it.\n\n\
+             Install the userspace matching the loaded module, or pass \n\
+             --driver-version to name a build that is present. \n\
+             --allow-version-mismatch stages the manifest's own build anyway; see \n\
+             decision 0070 for why that is not the default.",
+            args.manifest.display()
+        );
     }
 
     // A stale share is worse than no share: it would hold libraries from a

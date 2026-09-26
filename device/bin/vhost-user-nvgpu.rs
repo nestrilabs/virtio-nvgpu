@@ -505,10 +505,10 @@ impl<M: GuestAddressSpace + 'static> EpochVring<M> {
         }
         let mut fds = self.eventfds.lock().unwrap();
         set(file);
-        if let Some(old) = std::mem::replace(&mut fds[slot], new) {
-            if Some(old) != new {
-                privfd::unregister(old);
-            }
+        if let Some(old) = std::mem::replace(&mut fds[slot], new)
+            && Some(old) != new
+        {
+            privfd::unregister(old);
         }
     }
 }
@@ -1722,8 +1722,10 @@ mod tests {
         use vhost::vhost_user::message::VhostUserMMap as M;
         use vhost::vhost_user::{FrontendReqHandler, HandlerResult};
 
+        /// What, shm id, fd offset, shm offset, length, flags, fd open.
+        type Request = (&'static str, u8, u64, u64, u64, u64, bool);
         #[derive(Default)]
-        struct Vmm(StdMutex<Vec<(&'static str, u8, u64, u64, u64, u64, bool)>>);
+        struct Vmm(StdMutex<Vec<Request>>);
         impl VhostUserFrontendReqHandler for Vmm {
             fn shmem_map(&self, r: &M, fd: &dyn std::os::fd::AsRawFd) -> HandlerResult<u64> {
                 let open = device::sys::fd::is_open(fd.as_raw_fd());

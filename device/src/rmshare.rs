@@ -1265,8 +1265,10 @@ mod tests {
         // own: 0x55 may be 0x56's parent, whose list RM would read.
         assert_eq!(o.dup_verdict(live, PEER, OWNER, 0x56), OtherProcess);
         // A grant without DUP_OBJECT does not open anything.
-        let mut o2 = Ownership::default();
-        o2.owners = o.owners.clone();
+        let mut o2 = Ownership {
+            owners: o.owners.clone(),
+            ..Default::default()
+        };
         o2.shared(
             OWNER,
             0x55,
