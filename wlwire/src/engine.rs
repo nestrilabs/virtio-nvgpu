@@ -35,7 +35,7 @@ use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
 use crate::shm::{Shm, ShmBudget, SyncJob};
-use crate::stream::{Interest, Streams};
+use crate::stream::{ByteBudget, Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
 
@@ -313,7 +313,7 @@ impl Engine {
     pub fn hello(&mut self, caps: u32) {
         let h = Hello {
             version: frame::WL_PROTO_VERSION,
-            caps,
+            caps: caps | frame::HELLO_STREAM_WINDOW,
         };
         self.push_unit(Unit {
             rec: record(frame::REC_HELLO, 0, 0, &h.encode()),
@@ -335,7 +335,33 @@ impl Engine {
     /// multiply what a guest can make the host hold. Called again, a further
     /// budget is added (a guest process's, beside the VM's).
     pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+        self.blobs.add_budget(b.clone());
         self.shm.set_shared_budget(b);
+    }
+
+    /// Charge what stream sinks hold for their readers to `b` as well: the
+    /// backend's queue budget, by guest process. Called again, a further one.
+    pub fn set_stream_budget(&mut self, b: Arc<dyn ByteBudget>) {
+        self.streams.add_budget(b);
+    }
+
+    /// Bytes this engine holds in memory for either side: records made for
+    /// the channel, output for the local peer, what stream sinks hold, and
+    /// unfinished blobs (memfd pages). What commits and blobs still have to
+    /// read is not held yet, and is not counted.
+    pub fn held_bytes(&self) -> usize {
+        let made: usize = self
+            .out_channel
+            .iter()
+            .map(|o| match o {
+                Out::Unit(u) => u.bytes(),
+                Out::Shm(_) | Out::Blob(_) => 0,
+            })
+            .sum();
+        made + self.wl_bytes.len()
+            + self.out_local.len()
+            + self.streams.held()
+            + self.blobs.held() as usize
     }
 
     /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
@@ -427,6 +453,7 @@ impl Engine {
     pub fn shed(&mut self) {
         self.shm.clear();
         self.blobs.clear();
+        self.streams.clear();
         self.drop_channel_output();
     }
 
@@ -687,6 +714,8 @@ impl Engine {
                     let h = Hello::decode(r.payload).ok_or_else(|| chan("short HELLO"))?;
                     self.peer_caps = h.caps;
                     self.got_hello = true;
+                    self.streams
+                        .set_peer_windows(h.caps & frame::HELLO_STREAM_WINDOW != 0);
                     if self.cfg.side == Side::Host {
                         self.cfg.policy.drm_file = h.caps & frame::HELLO_G_DRM_FILE != 0;
                         // Explicit sync needs both ends: fences served here
@@ -721,6 +750,7 @@ impl Engine {
                             "WAYLAND record descriptor count disagrees with its messages",
                         ));
                     }
+                    self.blobs.expire();
                 }
                 frame::REC_STREAM_DATA => {
                     let mut out = Vec::new();
@@ -1021,8 +1051,9 @@ impl Engine {
                                 ));
                             }
                             match self.streams.add_sink(fd) {
-                                Ok(id) => DescOut::plain(Desc {
+                                Ok((id, first)) => DescOut::plain(Desc {
                                     a: id,
+                                    b: first,
                                     ..Desc::new(frame::DESC_STREAM)
                                 }),
                                 Err(_) => DescOut::plain(Desc::invalid(frame::DESC_STREAM)),
@@ -1119,7 +1150,7 @@ impl Engine {
                                 )
                             }
                             FdKind::Stream => {
-                                Some(self.streams.add_source(d.a).map_err(|e| {
+                                Some(self.streams.add_source(d.a, d.b).map_err(|e| {
                                     err(ERR_IMPLEMENTATION, format!("stream: {e:?}"))
                                 })?)
                             }

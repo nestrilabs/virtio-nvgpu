@@ -18,8 +18,10 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_BLOB, Unit, record};
+use crate::shm::ShmBudget;
 use crate::sys;
 
 /// Largest blob either side will carry. Keymaps are tens of KiB and format
@@ -32,6 +34,12 @@ const MAX_PENDING: u64 = 4 * MAX_BLOB;
 /// until this process runs out of descriptors. A sender's chunks come just
 /// ahead of the message that names the blob (`send`), so an honest peer has
 /// one or two in flight.
+///
+/// The memfds' pages are charged to the owner's shm budgets (the VM's and
+/// the guest process's, on the backend) as chunks arrive, and a blob is
+/// dropped, charge and all, if the `WAYLAND` record after its chunks does
+/// not take it: that is where its sender puts the message that names it
+/// ([`Blobs::expire`]).
 pub const MAX_INCOMING: usize = 16;
 
 struct Incoming {
@@ -44,6 +52,7 @@ pub struct Blobs {
     next: u32,
     incoming: HashMap<u32, Incoming>,
     pending_bytes: u64,
+    budgets: Vec<Arc<ShmBudget>>,
     pub sent: u64,
     pub received: u64,
 }
@@ -62,6 +71,13 @@ pub enum BlobError {
     Io,
 }
 
+/// What unfinished blobs held goes back to the budgets however they go.
+impl Drop for Blobs {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 impl Blobs {
     pub fn new(host_side: bool) -> Self {
         Self {
@@ -69,6 +85,7 @@ impl Blobs {
             next: 1,
             incoming: HashMap::new(),
             pending_bytes: 0,
+            budgets: Vec::new(),
             sent: 0,
             received: 0,
         }
@@ -136,21 +153,46 @@ impl Blobs {
         if off as u64 != inc.have {
             return Err(BlobError::OutOfOrder(id));
         }
-        if inc.have + bytes.len() as u64 > MAX_BLOB
-            || self.pending_bytes + bytes.len() as u64 > MAX_PENDING
-        {
+        let n = bytes.len() as u64;
+        if inc.have + n > MAX_BLOB || self.pending_bytes + n > MAX_PENDING {
             return Err(BlobError::TooBig(id));
         }
-        sys::pwrite_full(inc.fd.as_raw_fd(), bytes, inc.have).map_err(|_| BlobError::Io)?;
-        inc.have += bytes.len() as u64;
-        self.pending_bytes += bytes.len() as u64;
+        if !charge(&self.budgets, n) {
+            return Err(BlobError::TooBig(id));
+        }
+        if sys::pwrite_full(inc.fd.as_raw_fd(), bytes, inc.have).is_err() {
+            uncharge(&self.budgets, n);
+            return Err(BlobError::Io);
+        }
+        inc.have += n;
+        self.pending_bytes += n;
         Ok(())
+    }
+
+    /// Draw on `b` too for what unfinished blobs hold.
+    pub fn add_budget(&mut self, b: Arc<ShmBudget>) {
+        self.budgets.push(b);
+    }
+
+    /// Bytes unfinished blobs hold.
+    pub fn held(&self) -> u64 {
+        self.pending_bytes
     }
 
     /// Drop every unfinished blob (the connection is over).
     pub fn clear(&mut self) {
         self.incoming.clear();
+        uncharge(&self.budgets, self.pending_bytes);
         self.pending_bytes = 0;
+    }
+
+    /// A `WAYLAND` record is done: any blob it did not take is one no
+    /// message will (its sender puts the message right after the chunks),
+    /// and goes.
+    pub fn expire(&mut self) {
+        if !self.incoming.is_empty() {
+            self.clear();
+        }
     }
 
     /// The finished blob `id`, which must be exactly `len` bytes, sealed and
@@ -166,6 +208,7 @@ impl Blobs {
             None => return Err(BlobError::BadId(id)),
         };
         self.pending_bytes -= inc.have;
+        uncharge(&self.budgets, inc.have);
         if inc.have != len {
             return Err(BlobError::Incomplete(id));
         }
@@ -207,6 +250,25 @@ impl BlobJob {
         };
         self.pos += n as u64;
         Some((u, n))
+    }
+}
+
+/// `n` bytes from every budget, or from none.
+fn charge(budgets: &[Arc<ShmBudget>], n: u64) -> bool {
+    for (i, b) in budgets.iter().enumerate() {
+        if !b.take(n, 0) {
+            uncharge(&budgets[..i], n);
+            return false;
+        }
+    }
+    true
+}
+
+fn uncharge(budgets: &[Arc<ShmBudget>], n: u64) {
+    if n > 0 {
+        for b in budgets {
+            b.give(n, 0);
+        }
     }
 }
 

@@ -455,6 +455,29 @@ fn run(mut c: Command, secs: u64) -> (bool, String, String) {
     }
 }
 
+/// Run to completion with a deadline, stdout into `out`; whether it
+/// succeeded. For output larger than a pipe holds.
+fn run_to_file(mut c: Command, out: &Path, secs: u64) -> bool {
+    let f = std::fs::File::create(out).unwrap();
+    let mut child = c
+        .stdout(Stdio::from(f))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st.success();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A keyboard for the headless seat, straight on the compositor (not through
 /// the proxy): a virtual keyboard with a keymap, held while the connection
 /// lives. Without one the seat has no keyboard, clients get no keymap, and
@@ -702,6 +725,53 @@ fn against_sway(via: Via, tag: &str) {
     };
     assert_eq!(pasted, "hello from the guest");
     drop(guest_copy);
+
+    // ── a large selection, both ways: 8 MiB through the streams' credit ──
+    let big: Vec<u8> = (0..8u32 << 20)
+        .map(|i| b"abcdefghijklmnopqrstuvwxyz0123456789\n"[(i % 37) as usize])
+        .collect();
+    let src = dir.join("big.txt");
+    std::fs::write(&src, &big).unwrap();
+    for (from, to, what) in [
+        (&host_sock, &proxy, "host to guest"),
+        (&proxy, &host_sock, "guest to host"),
+    ] {
+        let copy = Kill(
+            client(
+                "wl-copy",
+                &["--foreground", "--type", "text/plain"],
+                from,
+                &dir,
+            )
+            .stdin(Stdio::from(std::fs::File::open(&src).unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        );
+        let out = dir.join("pasted.txt");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        loop {
+            let ok = run_to_file(
+                client("wl-paste", &["-n", "--type", "text/plain"], to, &dir),
+                &out,
+                20,
+            );
+            let got = std::fs::read(&out).unwrap_or_default();
+            if ok && got == big {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the 8 MiB selection did not arrive whole ({} bytes)",
+                got.len()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        println!("clipboard, 8 MiB {what}: {:?}", started.elapsed());
+        drop(copy);
+    }
     let t = settle(&d, |t| t.streams >= 2);
     println!(
         "clipboard: {} streams, {} bytes in, {} bytes out",

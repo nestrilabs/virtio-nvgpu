@@ -14,19 +14,50 @@
 //! through an unbounded buffer here. End of data is explicit (`STREAM_EOF`
 //! from the source) rather than guessed from a short read, and a sink whose
 //! reader went away tells the source to stop the same way.
+//!
+//! **What a sink may hold.** Every byte a source sends waits in its sink
+//! until the local reader takes it, so the sink's grants are what the far
+//! side can make this side hold. They shrink as streams are added: a sink
+//! grants [`window`] of the open sinks, `WINDOW` for the first sixteen and
+//! [`SINK_TOTAL`] shared among more, down to [`MIN_WINDOW`] -- one transfer
+//! runs at full speed, and 256 at once hold 4 MiB, not 64. The first grant
+//! rides in the stream's descriptor (`b`) when both ends said
+//! [`HELLO_STREAM_WINDOW`](crate::frame::HELLO_STREAM_WINDOW); an older peer
+//! starts at `WINDOW`, and later grants shrink either way. What sinks hold is
+//! also charged to the budgets the owner gives ([`ByteBudget`]: the backend's
+//! per-VM queue, by guest process), and a sink whose data the budget refuses
+//! ends its stream (`ENOBUFS`), not the connection.
 
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 
 use crate::frame::{REC_STREAM_CREDIT, REC_STREAM_DATA, REC_STREAM_EOF, Unit, record};
 use crate::sys;
 
-/// Bytes a source may send before the sink acknowledges any.
+/// Bytes a source may send before the sink acknowledges any, at most.
 pub const WINDOW: usize = 256 * 1024;
+/// What a connection's sinks are granted together once there are more than
+/// `SINK_TOTAL / WINDOW` of them.
+pub const SINK_TOTAL: usize = 4 << 20;
+/// The least a sink grants, however many there are.
+pub const MIN_WINDOW: usize = 16 * 1024;
 const CHUNK: usize = 64 * 1024;
+
+/// A sink's credit with `n` sinks open.
+pub fn window(n: usize) -> usize {
+    (SINK_TOTAL / n.max(1)).clamp(MIN_WINDOW, WINDOW)
+}
+
+/// Bytes shared with other connections that sinks' pending data is charged
+/// to, all or nothing.
+pub trait ByteBudget: Send + Sync {
+    fn take(&self, n: usize) -> bool;
+    fn give(&self, n: usize);
+}
 /// Open streams per connection. A clipboard transfer is one; a peer asking
 /// for thousands is only after this side's descriptors.
 pub const MAX_STREAMS: usize = 256;
@@ -40,7 +71,8 @@ enum Kind {
         wr: OwnedFd,
         pending: VecDeque<u8>,
         eof: bool,
-        uncredited: usize,
+        /// Credit the source holds: what it may still send.
+        granted: usize,
     },
 }
 
@@ -50,6 +82,11 @@ pub struct Streams {
     /// bit 31 clear, the host's set.
     host_side: bool,
     next: u32,
+    /// The peer takes a sink's first grant from its descriptor.
+    peer_windows: bool,
+    /// Sinks open.
+    sinks: usize,
+    budgets: Vec<Arc<dyn ByteBudget>>,
     pub bytes_out: u64,
     pub bytes_in: u64,
     pub opened: u64,
@@ -74,15 +111,83 @@ pub enum StreamError {
     TooMany,
 }
 
+/// What sinks held goes back to the budgets however the streams go.
+impl Drop for Streams {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 impl Streams {
     pub fn new(host_side: bool) -> Self {
         Self {
             map: HashMap::new(),
             host_side,
             next: 1,
+            peer_windows: false,
+            sinks: 0,
+            budgets: Vec::new(),
             bytes_out: 0,
             bytes_in: 0,
             opened: 0,
+        }
+    }
+
+    /// The peer said `HELLO_STREAM_WINDOW`: sinks made from now on grant
+    /// [`window`] from the start, in their descriptor.
+    pub fn set_peer_windows(&mut self, on: bool) {
+        self.peer_windows = on;
+    }
+
+    /// Charge what sinks hold to `b` too.
+    pub fn add_budget(&mut self, b: Arc<dyn ByteBudget>) {
+        self.budgets.push(b);
+    }
+
+    fn take_budget(&self, n: usize) -> bool {
+        for (i, b) in self.budgets.iter().enumerate() {
+            if !b.take(n) {
+                for done in &self.budgets[..i] {
+                    done.give(n);
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn give_budget(&self, n: usize) {
+        if n > 0 {
+            for b in &self.budgets {
+                b.give(n);
+            }
+        }
+    }
+
+    /// Bytes sinks hold for their readers.
+    pub fn held(&self) -> usize {
+        self.map
+            .values()
+            .map(|k| match k {
+                Kind::Sink { pending, .. } => pending.len(),
+                Kind::Source { .. } => 0,
+            })
+            .sum()
+    }
+
+    /// Close every stream (the connection is over), giving back what sinks
+    /// held.
+    pub fn clear(&mut self) {
+        let ids: Vec<u32> = self.map.keys().copied().collect();
+        for id in ids {
+            self.remove(id);
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(Kind::Sink { pending, .. }) = self.map.remove(&id) {
+            self.sinks -= 1;
+            self.give_budget(pending.len());
         }
     }
 
@@ -98,8 +203,10 @@ impl Streams {
         self.map.is_empty()
     }
 
-    /// A write end arrived from the local peer: become its sink.
-    pub fn add_sink(&mut self, wr: OwnedFd) -> io::Result<u32> {
+    /// A write end arrived from the local peer: become its sink. Returns
+    /// the stream id and, for a peer that takes it, the first grant for the
+    /// descriptor (0 for one that starts at `WINDOW`).
+    pub fn add_sink(&mut self, wr: OwnedFd) -> io::Result<(u32, u32)> {
         if self.map.len() >= MAX_STREAMS {
             return Err(io::Error::other("too many streams"));
         }
@@ -111,30 +218,42 @@ impl Streams {
                 break id;
             }
         };
+        self.sinks += 1;
+        let (granted, said) = if self.peer_windows {
+            let w = window(self.sinks);
+            (w, w as u32)
+        } else {
+            (WINDOW, 0)
+        };
         self.map.insert(
             id,
             Kind::Sink {
                 wr,
                 pending: VecDeque::new(),
                 eof: false,
-                uncredited: 0,
+                granted,
             },
         );
         self.opened += 1;
-        Ok(id)
+        Ok((id, said))
     }
 
-    /// The far side is sink `id`: make the pipe, keep the read end, and return
-    /// the write end for the local peer.
-    pub fn add_source(&mut self, id: u32) -> Result<OwnedFd, StreamError> {
+    /// The far side is sink `id`, which grants `first` bytes to begin with
+    /// (0: `WINDOW`, an older sink): make the pipe, keep the read end, and
+    /// return the write end for the local peer.
+    pub fn add_source(&mut self, id: u32, first: u32) -> Result<OwnedFd, StreamError> {
         if self.ours(id) || id & 0x7fff_ffff == 0 || self.map.contains_key(&id) {
             return Err(StreamError::BadId(id));
         }
         if self.map.len() >= MAX_STREAMS {
             return Err(StreamError::TooMany);
         }
+        let credit = match first as usize {
+            0 => WINDOW,
+            n => n.min(WINDOW),
+        };
         let (rd, wr) = sys::pipe().map_err(|_| StreamError::BadId(id))?;
-        self.map.insert(id, Kind::Source { rd, credit: WINDOW });
+        self.map.insert(id, Kind::Source { rd, credit });
         self.opened += 1;
         Ok(wr)
     }
@@ -161,14 +280,31 @@ impl Streams {
 
     /// STREAM_DATA from the channel.
     pub fn data(&mut self, id: u32, bytes: &[u8], out: &mut Vec<Unit>) -> Result<(), StreamError> {
-        let Some(Kind::Sink { pending, .. }) = self.map.get_mut(&id) else {
+        let Some(Kind::Sink { granted, .. }) = self.map.get(&id) else {
             // Closed here already (its reader went away); the source will
             // stop when our EOF reaches it.
             return Ok(());
         };
-        if pending.len() + bytes.len() > WINDOW {
+        if bytes.len() > *granted {
             return Err(StreamError::Overrun(id));
         }
+        if !self.take_budget(bytes.len()) {
+            // The VM's share for this is spent: this transfer ends, and the
+            // connection with the rest of its streams goes on.
+            out.push(Unit {
+                rec: record(REC_STREAM_EOF, id, libc::ENOBUFS as u32, &[]),
+                descs: Vec::new(),
+            });
+            self.remove(id);
+            return Ok(());
+        }
+        let Some(Kind::Sink {
+            pending, granted, ..
+        }) = self.map.get_mut(&id)
+        else {
+            unreachable!()
+        };
+        *granted -= bytes.len();
         pending.extend(bytes);
         self.bytes_in += bytes.len() as u64;
         self.io(id, false, true, out);
@@ -183,7 +319,7 @@ impl Streams {
                 self.io(id, false, true, out);
             }
             Some(Kind::Source { .. }) => {
-                self.map.remove(&id);
+                self.remove(id);
             }
             None => {}
         }
@@ -198,6 +334,8 @@ impl Streams {
     /// Do whatever I/O the stream is ready for; queue records in `out`.
     pub fn io(&mut self, id: u32, readable: bool, writable: bool, out: &mut Vec<Unit>) {
         let mut remove = false;
+        let mut written = 0;
+        let target = window(self.sinks);
         match self.map.get_mut(&id) {
             Some(Kind::Source { rd, credit }) if readable && *credit > 0 => {
                 let mut buf = vec![0u8; (*credit).min(CHUNK)];
@@ -234,14 +372,14 @@ impl Streams {
                 wr,
                 pending,
                 eof,
-                uncredited,
+                granted,
             }) if writable => {
                 while !pending.is_empty() {
                     let (a, _) = pending.as_slices();
                     match sys::write(wr.as_raw_fd(), a) {
                         Ok(n) => {
                             pending.drain(..n);
-                            *uncredited += n;
+                            written += n;
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -258,13 +396,16 @@ impl Streams {
                     }
                 }
                 if !remove {
-                    if *uncredited > 0 && (*uncredited >= WINDOW / 4 || pending.is_empty()) && !*eof
-                    {
+                    // Credit back up to what a sink may hold now, which is
+                    // less the more streams are open: what the source holds
+                    // and what waits here, together.
+                    let room = target.saturating_sub(*granted + pending.len());
+                    if room > 0 && (room >= target / 4 || pending.is_empty()) && !*eof {
                         out.push(Unit {
-                            rec: record(REC_STREAM_CREDIT, id, *uncredited as u32, &[]),
+                            rec: record(REC_STREAM_CREDIT, id, room as u32, &[]),
                             descs: Vec::new(),
                         });
-                        *uncredited = 0;
+                        *granted += room;
                     }
                     if *eof && pending.is_empty() {
                         remove = true;
@@ -273,8 +414,9 @@ impl Streams {
             }
             _ => {}
         }
+        self.give_budget(written);
         if remove {
-            self.map.remove(&id);
+            self.remove(id);
         }
     }
 }

@@ -219,6 +219,23 @@ impl QueueBudget {
     }
 }
 
+/// A guest process's share of the queue budget, as the engine's stream sinks
+/// draw on it: bytes a guest sends into a pipe the compositor's side has not
+/// read yet are host memory the guest decides, like its unread output.
+struct OwnerQueue {
+    queue: Arc<QueueBudget>,
+    owner: crate::quota::Owner,
+}
+
+impl wlwire::stream::ByteBudget for OwnerQueue {
+    fn take(&self, n: usize) -> bool {
+        self.queue.take(self.owner, n)
+    }
+    fn give(&self, n: usize) {
+        self.queue.give(self.owner, n)
+    }
+}
+
 /// Limits over every Wayland channel of one VM (one backend). Cloning shares
 /// the budgets.
 #[derive(Clone, Debug)]
@@ -540,6 +557,10 @@ impl WlConn {
         if let Some(b) = &cfg.owner_shm {
             engine.set_shm_budget(b.clone());
         }
+        engine.set_stream_budget(Arc::new(OwnerQueue {
+            queue: cfg.limits.queue.clone(),
+            owner: cfg.owner,
+        }));
         engine.hello(0);
         let ready = sys::eventfd()?;
         let wake = sys::eventfd()?;

@@ -29,7 +29,7 @@
 //! | `DMABUF` | daemon: `fd` = the client's dma-buf; kernel: `a`,`b` = the proxy's (owner handle, host GEM), `fd` = -1 | backend: `a` = a Dmabuf backend handle, `c` = size; kernel imports it and sets `fd` |
 //! | `SHM_POOL` | `c` = pool size; the far side creates the memfd | same (export mode) |
 //! | `BLOB` | `a` = blob id, `c` = length; bytes in earlier `BLOB` records | same |
-//! | `STREAM` | `a` = stream id; the far side makes a pipe | same |
+//! | `STREAM` | `a` = stream id, `b` = the sink's first credit (0: `WINDOW`; only to a peer that said `HELLO_STREAM_WINDOW`); the far side makes a pipe | same |
 //! | `DRM_FILE` | refused | backend: `a` = backend handle, `b` = its `HK_*`; kernel adopts it and sets `fd` |
 //! | `SYNCOBJ` | daemon: `fd` = the client's syncobj; kernel: `a` = the backend `Syncobj` handle behind it (a host-handle file), `fd` = -1 | not carried (export mode hides the global) |
 //!
@@ -106,6 +106,10 @@ pub const HELLO_G_DMABUF_IMPORT: u32 = 1 << 1;
 /// backend handle of its host syncobj (the backend serves fences), so
 /// `wp_linux_drm_syncobj_manager_v1` can be offered.
 pub const HELLO_G_SYNCOBJ: u32 = 1 << 2;
+/// HELLO caps, either way: a stream's source takes the sink's first credit
+/// from its descriptor (`b`), so a sink may grant less than `WINDOW`
+/// (`stream.rs`).
+pub const HELLO_STREAM_WINDOW: u32 = 1 << 8;
 
 /// OPEN(DEV_WAYLAND) flags, chosen by the guest kernel from the daemon's
 /// CONNECT: a connection to the host compositor; the export listener's

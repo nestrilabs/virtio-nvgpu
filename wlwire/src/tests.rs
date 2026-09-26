@@ -1586,7 +1586,7 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
 fn a_stream_that_overruns_its_credit_is_a_protocol_error() {
     let mut s = crate::stream::Streams::new(false);
     let (_rd, wr) = sys::pipe().unwrap();
-    let id = s.add_sink(wr).unwrap();
+    let (id, _) = s.add_sink(wr).unwrap();
     let mut out = Vec::new();
     let big = vec![0u8; crate::stream::WINDOW + 1];
     // The pipe fills (64 KiB) and the rest is held; past the window it is an error.
@@ -2438,4 +2438,164 @@ fn a_large_blob_is_read_a_record_at_a_time() {
     p.pump();
     let (_, fds) = p.at_server();
     assert_eq!(read_all(&fds[0]), icc);
+}
+
+/// Sinks grant less the more of them are open: one transfer at full speed,
+/// many together a bounded total. Before, every sink granted `WINDOW`, and
+/// 256 streams held 64 MiB per connection.
+#[test]
+fn sinks_grant_less_as_more_streams_are_open() {
+    use crate::stream::{MIN_WINDOW, SINK_TOTAL, WINDOW, window};
+    assert_eq!(window(1), WINDOW);
+    assert_eq!(window(crate::stream::MAX_STREAMS), MIN_WINDOW);
+    assert!(window(crate::stream::MAX_STREAMS) * crate::stream::MAX_STREAMS <= SINK_TOTAL);
+    let mut s = crate::stream::Streams::new(false);
+    s.set_peer_windows(true);
+    let mut pipes = Vec::new();
+    let mut total = 0;
+    for i in 1..=64 {
+        let (rd, wr) = sys::pipe().unwrap();
+        let (_, first) = s.add_sink(wr).unwrap();
+        assert_eq!(first as usize, window(i));
+        total += first as usize;
+        pipes.push(rd);
+    }
+    assert!(total <= 10 << 20, "{total} granted to 64 streams");
+    // A peer that does not take the grant from the descriptor starts at
+    // WINDOW, and is told nothing.
+    let mut old = crate::stream::Streams::new(false);
+    let (_rd, wr) = sys::pipe().unwrap();
+    assert_eq!(old.add_sink(wr).unwrap().1, 0);
+}
+
+/// A sink gives credit back only up to its share of what sinks may hold
+/// now, counting what waits in it: with 32 streams open, a sink that took a
+/// full window and wrote a pipe's worth grants nothing more until it drains.
+#[test]
+#[cfg_attr(miri, ignore = "Miri's pipes are unbounded")]
+fn a_sink_credits_back_no_more_than_its_share() {
+    let mut s = crate::stream::Streams::new(false);
+    let mut keep = Vec::new();
+    let mut first = None;
+    for _ in 0..32 {
+        let (rd, wr) = sys::pipe().unwrap();
+        let (id, _) = s.add_sink(wr).unwrap();
+        first.get_or_insert((id, rd.try_clone().unwrap()));
+        keep.push(rd);
+    }
+    let (id, rd) = first.unwrap();
+    let mut out = Vec::new();
+    // An old peer's first window, all of it.
+    s.data(id, &vec![7u8; crate::stream::WINDOW], &mut out).unwrap();
+    let credit = |out: &[frame::Unit]| -> u32 {
+        out.iter()
+            .filter_map(|u| {
+                let f = frame::Records { buf: &u.rec }.next()?.ok()?;
+                (f.ty == frame::REC_STREAM_CREDIT).then_some(f.arg)
+            })
+            .sum()
+    };
+    assert_eq!(credit(&out), 0, "more waits here than a share");
+    // The reader drains; the sink writes the rest and grants its share.
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0;
+    for _ in 0..16 {
+        sys::set_nonblock(rd.as_raw_fd()).unwrap();
+        while let Ok(n @ 1..) = sys::read(rd.as_raw_fd(), &mut buf) {
+            got += n;
+        }
+        out.clear();
+        s.io(id, false, true, &mut out);
+        if got == crate::stream::WINDOW {
+            break;
+        }
+    }
+    assert_eq!(got, crate::stream::WINDOW);
+    let share = crate::stream::window(32) as u32;
+    assert!(credit(&out) <= share, "{} > {share}", credit(&out));
+}
+
+struct Budget(std::sync::atomic::AtomicUsize, usize);
+impl crate::stream::ByteBudget for Budget {
+    fn take(&self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::*;
+        self.0
+            .fetch_update(AcqRel, Acquire, |u| (u + n <= self.1).then_some(u + n))
+            .is_ok()
+    }
+    fn give(&self, n: usize) {
+        self.0.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// What sinks hold is charged to the owner's budget; data past it ends that
+/// stream with ENOBUFS, and the connection goes on.
+#[test]
+#[cfg_attr(miri, ignore = "Miri's pipes are unbounded")]
+fn a_sink_past_the_budget_ends_its_stream_not_the_connection() {
+    let b = Arc::new(Budget(Default::default(), 100 * 1024));
+    let mut s = crate::stream::Streams::new(false);
+    s.add_budget(b.clone());
+    let (_rd, wr) = sys::pipe().unwrap();
+    let (id, _) = s.add_sink(wr).unwrap();
+    let mut out = Vec::new();
+    // A pipe's worth goes through; the rest waits here, charged.
+    s.data(id, &vec![1u8; 96 * 1024], &mut out).unwrap();
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), s.held());
+    assert!(s.held() > 0);
+    out.clear();
+    s.data(id, &vec![1u8; 96 * 1024], &mut out).unwrap();
+    let eof = out
+        .iter()
+        .filter_map(|u| frame::Records { buf: &u.rec }.next()?.ok())
+        .find(|r| r.ty == frame::REC_STREAM_EOF)
+        .expect("the stream is ended");
+    assert_eq!(eof.arg, libc::ENOBUFS as u32);
+    assert!(s.is_empty());
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// Unfinished blobs are memfd pages this side holds: charged to the shm
+/// budgets as their chunks arrive, and dropped, charge and all, when the
+/// WAYLAND record after them does not take them. Before, they were charged
+/// to nothing, and held until the connection ended.
+#[test]
+fn unfinished_blobs_are_charged_and_dropped_when_nothing_takes_them() {
+    let vm = Arc::new(crate::shm::ShmBudget::new(1 << 20, 64));
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    let chunk = |id: u32, off: u32, n: usize| frame::Unit {
+        rec: frame::record(frame::REC_BLOB, id, off, &vec![3u8; n]),
+        descs: vec![],
+    };
+    let send = |p: &mut Pair, units: Vec<frame::Unit>| {
+        let mut q: VecDeque<frame::Unit> = units.into();
+        let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+        p.h.from_channel(&f, fds, &mut TestPlat::default())
+    };
+    let c = frame::MAX_REC_PAYLOAD;
+    send(&mut p, (0..8).map(|i| chunk(1, (i * c) as u32, c)).collect()).unwrap();
+    assert_eq!(vm.used().0, 8 * c as u64);
+    // Past the VM's budget: refused.
+    let more: Vec<frame::Unit> = (0..9).map(|i| chunk(3, (i * c) as u32, c)).collect();
+    assert!(send(&mut p, more).is_err());
+    drop(p);
+    let mut p = Pair::new(Policy::default());
+    p.h.set_shm_budget(vm.clone());
+    assert_eq!(vm.used().0, 0, "a connection's blobs go with it");
+    send(&mut p, vec![chunk(1, 0, c)]).unwrap();
+    assert_eq!(vm.used().0, c as u64);
+    // A WAYLAND record that does not take it: gone.
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(30)
+        .finish();
+    send(
+        &mut p,
+        vec![frame::Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 0, &sync),
+            descs: vec![],
+        }],
+    )
+    .unwrap();
+    assert_eq!(vm.used().0, 0);
 }
