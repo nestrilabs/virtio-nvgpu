@@ -25,3 +25,6 @@ modules.order
 .vscode/
 .idea/
 scripts/verify/bin/
+
+# The NixOS config agent's host-specific brief (kept out of the repository)
+NIXOS-AGENT.md
