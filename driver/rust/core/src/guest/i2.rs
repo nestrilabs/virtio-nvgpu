@@ -24,8 +24,8 @@ use super::schema::{
     SLEN_NVKMS_PARAMS, SLEN_PLANES, SLEN_SUM, SSPECIAL_ATOMIC,
 };
 use super::wire::{
-    align8, copy, le32, le64, le_n, put_le, Errno, E2BIG, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM, ENOTTY,
-    EPROTO, ETIMEDOUT, HDR_LEN, I2_FD_CONSUME, I2_GEM_OUT_LEN, I2_MAX_BUFS, I2_MAX_RECS,
+    align8, copy, le32, le64, le_n, put_le, Errno, E2BIG, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM,
+    ENOTTY, EPROTO, ETIMEDOUT, HDR_LEN, I2_FD_CONSUME, I2_GEM_OUT_LEN, I2_MAX_BUFS, I2_MAX_RECS,
     I2_REC_LEN, I2_REQ_LEN, I2_RESP_LEN, MAX_ERRNO, MSG_IOCTL2,
 };
 
@@ -122,15 +122,30 @@ pub trait Env<S: Store> {
     type TBuf;
 
     /// `ops->fd_in`: `(ret, handle, flags)`. -EINVAL without the hook.
-    fn fd_in(&mut self, st: &mut State<S>, buf: u32, off: u32, value: i64, kinds: u32) -> (i32, u32, u32);
+    fn fd_in(
+        &mut self,
+        st: &mut State<S>,
+        buf: u32,
+        off: u32,
+        value: i64,
+        kinds: u32,
+    ) -> (i32, u32, u32);
     /// `ops->gem_in`: `(ret, owner, gem)`. -EINVAL without the hook.
     fn gem_in(&mut self, st: &mut State<S>, buf: u32, off: u32, guest: u32) -> (i32, u32, u32);
     /// `ops->fd_out`: `(ret, the caller's new descriptor)`. -EINVAL without
     /// the hook.
-    fn fd_out(&mut self, st: &mut State<S>, buf: u32, off: u32, handle: u32, kind: u32) -> (i32, i64);
+    fn fd_out(
+        &mut self,
+        st: &mut State<S>,
+        buf: u32,
+        off: u32,
+        handle: u32,
+        kind: u32,
+    ) -> (i32, i64);
     /// `ops->gem_out`: `(ret, the caller's new GEM handle)`. -EINVAL without
     /// the hook.
-    fn gem_out(&mut self, st: &mut State<S>, buf: u32, off: u32, gem: u32, size: u64) -> (i32, u32);
+    fn gem_out(&mut self, st: &mut State<S>, buf: u32, off: u32, gem: u32, size: u64)
+        -> (i32, u32);
     /// `ops->special`; 0 without the hook.
     fn special(&mut self, st: &mut State<S>, id: u32, phase: i32) -> i32;
     /// `ops->phase`; 0 without the hook.
@@ -341,12 +356,18 @@ impl<S: Store> State<S> {
     /// Where the walk found fields of kind `kind` (`NVGPU_SF_*`), as
     /// `(buffer, offset)`.
     pub fn positions(&self, kind: u8) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.slots().iter().filter(move |s| s.kind == kind).map(|s| (s.buf, s.off))
+        self.slots()
+            .iter()
+            .filter(move |s| s.kind == kind)
+            .map(|s| (s.buf, s.off))
     }
 
     /// Where the dyn records added so far point, as `(buffer, offset)`.
     pub fn dyn_positions(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.dyns.iter().take(idx(self.ndyn)).map(|d| (d.0[1], d.0[2]))
+        self.dyns
+            .iter()
+            .take(idx(self.ndyn))
+            .map(|d| (d.0[1], d.0[2]))
     }
 
     /// `nvgpu_i2_buf()`: the kernel copy of buffer `buf`, `None` for one the
@@ -374,7 +395,11 @@ impl<S: Store> State<S> {
     /// (ATOMIC's prop_values). 0 or -EINVAL.
     pub fn add_dyn(&mut self, kind: u32, buf: u32, off: u32, len: u32) -> i32 {
         let blen = self.buf_len(buf);
-        if idx(self.ndyn) >= I2_MAX_RECS || buf >= self.nbuf || blen < 8 || off > blen.wrapping_sub(8) {
+        if idx(self.ndyn) >= I2_MAX_RECS
+            || buf >= self.nbuf
+            || blen < 8
+            || off > blen.wrapping_sub(8)
+        {
             return -EINVAL;
         }
         match self.dyns.get_mut(idx(self.ndyn)) {
@@ -388,7 +413,11 @@ impl<S: Store> State<S> {
     /// `nvgpu_i2_add_fd()`: an fd record. 0 or -EINVAL.
     pub fn add_fd(&mut self, buf: u32, off: u32, handle: u32, flags: u32) -> i32 {
         let blen = self.buf_len(buf);
-        if idx(self.nfd) >= I2_MAX_RECS || buf >= self.nbuf || blen < 4 || off > blen.wrapping_sub(4) {
+        if idx(self.nfd) >= I2_MAX_RECS
+            || buf >= self.nbuf
+            || blen < 4
+            || off > blen.wrapping_sub(4)
+        {
             return -EINVAL;
         }
         match self.fd.get_mut(idx(self.nfd)) {
@@ -433,7 +462,12 @@ impl<S: Store> State<S> {
         let n = self.nbuf;
         let len32 = u32::try_from(len).map_err(|_| -E2BIG)?;
         if let Some(kb) = self.buf.get_mut(idx(n)) {
-            *kb = KBuf { len: len32, dir, uptr, ..KBuf::default() };
+            *kb = KBuf {
+                len: len32,
+                dir,
+                uptr,
+                ..KBuf::default()
+            };
         }
         if len32 != 0 {
             self.store.alloc(idx(n), idx(len32))?;
@@ -448,7 +482,14 @@ impl<S: Store> State<S> {
 
     fn add_slot(&mut self, f: u32, fd: &SField, b: u32, off: u32, orig: u64) -> Result<(), Errno> {
         let s = self.slot.get_mut(idx(self.nslot)).ok_or(-E2BIG)?;
-        *s = Slot { f, kind: fd.kind, width: fd.width, buf: b, off, orig };
+        *s = Slot {
+            f,
+            kind: fd.kind,
+            width: fd.width,
+            buf: b,
+            off,
+            orig,
+        };
         self.nslot = self.nslot.saturating_add(1);
         Ok(())
     }
@@ -459,7 +500,14 @@ impl<S: Store> State<S> {
 
     /// `nvgpu_i2_len()`: a pointer's length in bytes, from the kernel copy of
     /// its struct. Mirrors `Walk::length` in device/src/xfer.rs.
-    fn len(&self, f: &SField, b: u32, base: u32, first: u16, created: &[i32; MAX_LIST]) -> Result<u64, Errno> {
+    fn len(
+        &self,
+        f: &SField,
+        b: u32,
+        base: u32,
+        first: u16,
+        created: &[i32; MAX_LIST],
+    ) -> Result<u64, Errno> {
         match f.len_kind {
             SLEN_CONST => Ok(u64::from(f.len_a)),
             SLEN_COUNT => {
@@ -471,7 +519,10 @@ impl<S: Store> State<S> {
                 // regardless.
                 let first = u32::from(first);
                 let src = if f.len_a >= first {
-                    created.get(idx(f.len_a.wrapping_sub(first))).copied().unwrap_or(-1)
+                    created
+                        .get(idx(f.len_a.wrapping_sub(first)))
+                        .copied()
+                        .unwrap_or(-1)
                 } else {
                     -1
                 };
@@ -500,7 +551,15 @@ impl<S: Store> State<S> {
     /// fields from `first`, of the struct at `base` in buffer `b`. Pointers
     /// get buffers depth first, in field order, exactly as the backend's
     /// `Walk::list` assigns them.
-    fn walk(&mut self, t: &Table<'_>, b: u32, base: u32, first: u16, n: u16, depth: u32) -> Result<(), Errno> {
+    fn walk(
+        &mut self,
+        t: &Table<'_>,
+        b: u32,
+        base: u32,
+        first: u16,
+        n: u16,
+        depth: u32,
+    ) -> Result<(), Errno> {
         if depth > MAX_DEPTH || usize::from(n) > MAX_LIST {
             return Err(-EINVAL);
         }
@@ -553,7 +612,8 @@ impl<S: Store> State<S> {
                         kb.pbase = base;
                     }
                     if matches!(f.cb_kind, SCB_PARTIAL | SCB_ALL_OR_NOTHING | SCB_EXACT) {
-                        let sent = self.rd(b, base.wrapping_add(f.cb_off), u32::from(f.cb_width))?;
+                        let sent =
+                            self.rd(b, base.wrapping_add(f.cb_off), u32::from(f.cb_width))?;
                         if let Some(kb) = self.buf.get_mut(idx(nb)) {
                             kb.sent = sent;
                         }
@@ -619,7 +679,12 @@ impl<S: Store> State<S> {
     }
 
     /// `nvgpu_i2_gather()`: find the entry, copy the argument, walk it.
-    fn gather<E: Env<S>>(&mut self, env: &mut E, set: &SchemaSet<'_>, a: &Args) -> Result<(), Errno> {
+    fn gather<E: Env<S>>(
+        &mut self,
+        env: &mut E,
+        set: &SchemaSet<'_>,
+        a: &Args,
+    ) -> Result<(), Errno> {
         let size = ioc_size(a.cmd);
         let mut dir = 0u8;
         if ioc_dir(a.cmd) & 1 != 0 {
@@ -635,7 +700,11 @@ impl<S: Store> State<S> {
             self.entry = e;
             let entry = set.table(w).ioctls.get(e).ok_or(-ENOTTY)?;
             if entry.cmd != a.cmd {
-                env.warn(Warn::CmdSize { entry, cmd: a.cmd, size });
+                env.warn(Warn::CmdSize {
+                    entry,
+                    cmd: a.cmd,
+                    size,
+                });
                 return Err(-EINVAL);
             }
         } else if a.cmd != NVKMS_IOCTL_IOWR {
@@ -656,7 +725,9 @@ impl<S: Store> State<S> {
         }
         self.new_buf(u64::from(size), dir, a.uarg)?;
         if a.sclass == SCLASS_MODESET {
-            let (w, e) = set.lookup(a.sclass, a.cmd, self.store.buf(0)).ok_or(-ENOTTY)?;
+            let (w, e) = set
+                .lookup(a.sclass, a.cmd, self.store.buf(0))
+                .ok_or(-ENOTTY)?;
             self.which = w;
             self.entry = e;
         }
@@ -697,7 +768,11 @@ impl<S: Store> State<S> {
             env.tbuf_write(tb, off, &kb.len.to_le_bytes())?;
             off = off.saturating_add(4);
         }
-        for (recs, n) in [(&self.fd, self.nfd), (&self.gem, self.ngem), (&self.dyns, self.ndyn)] {
+        for (recs, n) in [
+            (&self.fd, self.nfd),
+            (&self.gem, self.ngem),
+            (&self.dyns, self.ndyn),
+        ] {
             for r in recs.iter().take(idx(n)) {
                 let mut b = [0u8; I2_REC_LEN];
                 for (c, w) in b.chunks_exact_mut(4).zip(r.0) {
@@ -715,18 +790,27 @@ impl<S: Store> State<S> {
             let len = idx(kb.len);
             let pad = idx(align8(u64::from(kb.len)) as u32).saturating_sub(len);
             env.tbuf_write(tb, off, self.store.buf(i))?;
-            env.tbuf_write(tb, off.saturating_add(len), [0u8; 8].get(..pad).unwrap_or(&[]))?;
+            env.tbuf_write(
+                tb,
+                off.saturating_add(len),
+                [0u8; 8].get(..pad).unwrap_or(&[]),
+            )?;
             off = off.saturating_add(len).saturating_add(pad);
         }
         Ok(())
     }
 
     fn at_slot(&self, kind: u8, b: u32, off: u32) -> bool {
-        self.slots().iter().any(|s| s.kind == kind && s.buf == b && s.off == off)
+        self.slots()
+            .iter()
+            .any(|s| s.kind == kind && s.buf == b && s.off == off)
     }
 
     fn at_dyn(&self, b: u32, off: u32) -> bool {
-        self.dyns.iter().take(idx(self.ndyn)).any(|d| d.0[1] == b && d.0[2] == off)
+        self.dyns
+            .iter()
+            .take(idx(self.ndyn))
+            .any(|d| d.0[1] == b && d.0[2] == off)
     }
 
     /// `nvgpu_i2_drop_outs()`: every handle a reply created and nobody will
@@ -740,7 +824,12 @@ impl<S: Store> State<S> {
         let gemo = self.gemo.get(..idx(self.ngemo)).unwrap_or(&[]);
         for i in idx(gem_from)..gemo.len() {
             let Some(o) = gemo.get(i) else { break };
-            if !gemo.get(..i).unwrap_or(&[]).iter().any(|p| p.handle == o.handle) {
+            if !gemo
+                .get(..i)
+                .unwrap_or(&[])
+                .iter()
+                .any(|p| p.handle == o.handle)
+            {
                 env.gem_close(o.handle);
             }
         }
@@ -840,7 +929,11 @@ impl<S: Store> State<S> {
         if status != 0 {
             // Refused before the call ran: nothing was consumed or created.
             self.drop_consumed(env);
-            return Err(if (-MAX_ERRNO..0).contains(&status) { status } else { -EPROTO });
+            return Err(if (-MAX_ERRNO..0).contains(&status) {
+                status
+            } else {
+                -EPROTO
+            });
         }
         if usedz < h.len() {
             return Err(-EPROTO);
@@ -860,7 +953,12 @@ impl<S: Store> State<S> {
             || u64::from(used) < need
             || ret < -MAX_ERRNO
         {
-            env.warn(Warn::Malformed { entry, used, nfd, ngem });
+            env.warn(Warn::Malformed {
+                entry,
+                used,
+                nfd,
+                ngem,
+            });
             return Err(-EPROTO);
         }
 
@@ -870,7 +968,8 @@ impl<S: Store> State<S> {
             if kb.dir & SDIR_OUT == 0 {
                 continue;
             }
-            env.tbuf_read(tb, off, self.store.buf_mut(i)).map_err(|_| -EPROTO)?;
+            env.tbuf_read(tb, off, self.store.buf_mut(i))
+                .map_err(|_| -EPROTO)?;
             off = off.saturating_add(align8(u64::from(kb.len)) as usize);
         }
         for i in 0..nfd {
@@ -882,7 +981,13 @@ impl<S: Store> State<S> {
             }
             let w = |j: usize| le32(&r, j.saturating_mul(4)).unwrap_or(0);
             if let Some(o) = self.fdo.get_mut(idx(i)) {
-                *o = Out { buf: w(0), off: w(1), handle: w(2), kind: w(3), size: 0 };
+                *o = Out {
+                    buf: w(0),
+                    off: w(1),
+                    handle: w(2),
+                    kind: w(3),
+                    size: 0,
+                };
             }
             off = off.saturating_add(I2_REC_LEN);
         }
@@ -896,7 +1001,13 @@ impl<S: Store> State<S> {
             }
             let w = |j: usize| le32(&r, j.saturating_mul(4)).unwrap_or(0);
             if let Some(o) = self.gemo.get_mut(idx(i)) {
-                *o = Out { buf: w(0), off: w(1), handle: w(2), kind: 0, size: le64(&r, 16).unwrap_or(0) };
+                *o = Out {
+                    buf: w(0),
+                    off: w(1),
+                    handle: w(2),
+                    kind: 0,
+                    size: le64(&r, 16).unwrap_or(0),
+                };
             }
             off = off.saturating_add(I2_GEM_OUT_LEN);
         }
@@ -906,7 +1017,12 @@ impl<S: Store> State<S> {
         for i in 0..idx(self.nfdo) {
             let o = self.fdo.get(i).copied().unwrap_or_default();
             ok = self.at_slot(SF_FD_OUT, o.buf, o.off) || self.at_dyn(o.buf, o.off);
-            ok = ok && !self.fdo.iter().take(i).any(|p| p.buf == o.buf && p.off == o.off);
+            ok = ok
+                && !self
+                    .fdo
+                    .iter()
+                    .take(i)
+                    .any(|p| p.buf == o.buf && p.off == o.off);
             if !ok {
                 break;
             }
@@ -917,7 +1033,12 @@ impl<S: Store> State<S> {
             }
             let o = self.gemo.get(i).copied().unwrap_or_default();
             ok = o.handle != 0 && self.at_slot(SF_GEM_OUT, o.buf, o.off);
-            ok = ok && !self.gemo.iter().take(i).any(|p| p.buf == o.buf && p.off == o.off);
+            ok = ok
+                && !self
+                    .gemo
+                    .iter()
+                    .take(i)
+                    .any(|p| p.buf == o.buf && p.off == o.off);
         }
         if !ok {
             env.warn(Warn::Unnamed { entry });
@@ -1012,9 +1133,18 @@ impl<S: Store> State<S> {
                 continue;
             }
             if kb.has_f {
-                let Some(f) = t.fields.get(idx(kb.f)) else { continue };
-                if matches!(f.cb_kind, SCB_PARTIAL | SCB_ALL_OR_NOTHING | SCB_EXACT | SCB_WRITTEN) {
-                    match self.rd(kb.parent, kb.pbase.wrapping_add(f.cb_off), u32::from(f.cb_width)) {
+                let Some(f) = t.fields.get(idx(kb.f)) else {
+                    continue;
+                };
+                if matches!(
+                    f.cb_kind,
+                    SCB_PARTIAL | SCB_ALL_OR_NOTHING | SCB_EXACT | SCB_WRITTEN
+                ) {
+                    match self.rd(
+                        kb.parent,
+                        kb.pbase.wrapping_add(f.cb_off),
+                        u32::from(f.cb_width),
+                    ) {
                         Ok(v) => left = v,
                         Err(_) => continue,
                     }
@@ -1024,7 +1154,11 @@ impl<S: Store> State<S> {
             if end <= start {
                 continue;
             }
-            if self.store.copy_out(i, kb.uptr, idx(start as u32), idx(end as u32)).is_err() {
+            if self
+                .store
+                .copy_out(i, kb.uptr, idx(start as u32), idx(end as u32))
+                .is_err()
+            {
                 fault = Err(-EFAULT);
             }
         }
@@ -1066,7 +1200,12 @@ pub fn has_schema(set: &SchemaSet<'_>, sclass: u32, cmd: u32, prefix: &[u8]) -> 
 /// GEM outputs. Returns the host ioctl's result (0 or -errno) or a
 /// transport or validation -errno. (Whether the device speaks v2 at all is
 /// the caller's to check first.)
-pub fn run<S: Store, E: Env<S>>(env: &mut E, st: &mut State<S>, set: &SchemaSet<'_>, a: &Args) -> i32 {
+pub fn run<S: Store, E: Env<S>>(
+    env: &mut E,
+    st: &mut State<S>,
+    set: &SchemaSet<'_>,
+    a: &Args,
+) -> i32 {
     st.reset(a);
     if let Err(e) = st.gather(env, set, a) {
         return e;
@@ -1187,7 +1326,12 @@ pub fn abandons(err: Errno) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::guest::schema::{SIoctl, SCB_PARTIAL, SCLASS_KMS, SDIR_OUT};
@@ -1239,9 +1383,26 @@ mod tests {
                 cb_arg: 4,
                 ..SField::default()
             },
-            SField { off: 12, kind: SF_FD_IN, width: 4, none_value: -1, kinds: 7, ..SField::default() },
-            SField { off: 16, kind: SF_GEM_IN, width: 4, ..SField::default() },
-            SField { off: 20, kind: SF_FD_OUT, width: 4, ..SField::default() },
+            SField {
+                off: 12,
+                kind: SF_FD_IN,
+                width: 4,
+                none_value: -1,
+                kinds: 7,
+                ..SField::default()
+            },
+            SField {
+                off: 16,
+                kind: SF_GEM_IN,
+                width: 4,
+                ..SField::default()
+            },
+            SField {
+                off: 20,
+                kind: SF_FD_OUT,
+                width: 4,
+                ..SField::default()
+            },
         ];
         (ioctls, fields)
     }
@@ -1282,7 +1443,9 @@ mod tests {
         }
         fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
             let src = self.bufs[&i][start..end].to_vec();
-            self.region(uptr + start as u64, end - start).ok_or(-EFAULT)?.copy_from_slice(&src);
+            self.region(uptr + start as u64, end - start)
+                .ok_or(-EFAULT)?
+                .copy_from_slice(&src);
             Ok(())
         }
     }
@@ -1326,7 +1489,9 @@ mod tests {
             Some(vec![0; len])
         }
         fn tbuf_write(&mut self, tb: &mut Vec<u8>, off: usize, src: &[u8]) -> Result<(), Errno> {
-            tb.get_mut(off..off + src.len()).ok_or(-EINVAL)?.copy_from_slice(src);
+            tb.get_mut(off..off + src.len())
+                .ok_or(-EINVAL)?
+                .copy_from_slice(src);
             Ok(())
         }
         fn tbuf_read(&mut self, tb: &Vec<u8>, off: usize, dst: &mut [u8]) -> Result<(), Errno> {
@@ -1339,7 +1504,11 @@ mod tests {
             let r = (self.reply)(&req);
             let n = r.len().min(resp.len());
             resp[..n].copy_from_slice(&r[..n]);
-            Xfer::Done { req, resp, used: n as u32 }
+            Xfer::Done {
+                req,
+                resp,
+                used: n as u32,
+            }
         }
         fn warn(&mut self, _: Warn<'_>) {}
     }
@@ -1359,12 +1528,23 @@ mod tests {
 
     fn run_with(a: Vec<u8>, reply: fn(&[u8]) -> Vec<u8>) -> (i32, Box<State<Mem>>, Fake) {
         let (ioctls, fields) = table();
-        let set = SchemaSet { drm: Table { ioctls: &ioctls, fields: &fields, planes: &[] }, modeset: None };
+        let set = SchemaSet {
+            drm: Table {
+                ioctls: &ioctls,
+                fields: &fields,
+                planes: &[],
+            },
+            modeset: None,
+        };
         let mut mem = Mem::default();
         mem.user.insert(ARG, a);
         mem.user.insert(LIST, vec![0xee; 16]);
         let mut st = Box::new(State::new(mem));
-        let mut env = Fake { reply, sent: Vec::new(), closed: Vec::new() };
+        let mut env = Fake {
+            reply,
+            sent: Vec::new(),
+            closed: Vec::new(),
+        };
         let args = Args {
             sclass: SCLASS_KMS,
             cmd: iowr(0xa0, 32),
@@ -1399,7 +1579,10 @@ mod tests {
         // Header; cmd, flags, nbuf 2, nfd 1, ngem 1, ndyn 0, IN bytes 32,
         // render 8; the buffer lengths; the records; the argument.
         assert_eq!(&q[..16], &words(&[MSG_IOCTL2, 7, 0, 0])[..]);
-        assert_eq!(&q[16..48], &words(&[iowr(0xa0, 32), 0, 2, 1, 1, 0, 32, 8])[..]);
+        assert_eq!(
+            &q[16..48],
+            &words(&[iowr(0xa0, 32), 0, 2, 1, 1, 0, 32, 8])[..]
+        );
         assert_eq!(&q[48..56], &words(&[32, 16])[..]);
         assert_eq!(&q[56..72], &words(&[0, 12, 103, I2_FD_CONSUME])[..]);
         assert_eq!(&q[72..88], &words(&[0, 16, 9, 1005])[..]);
@@ -1443,9 +1626,20 @@ mod tests {
         // An argument that is not there; another size of a known number;
         // an unknown number.
         let (ioctls, fields) = table();
-        let set = SchemaSet { drm: Table { ioctls: &ioctls, fields: &fields, planes: &[] }, modeset: None };
+        let set = SchemaSet {
+            drm: Table {
+                ioctls: &ioctls,
+                fields: &fields,
+                planes: &[],
+            },
+            modeset: None,
+        };
         let mut st = Box::new(State::new(Mem::default()));
-        let mut env = Fake { reply: good, sent: Vec::new(), closed: Vec::new() };
+        let mut env = Fake {
+            reply: good,
+            sent: Vec::new(),
+            closed: Vec::new(),
+        };
         let args = Args {
             sclass: SCLASS_KMS,
             cmd: iowr(0xa0, 32),
@@ -1455,9 +1649,15 @@ mod tests {
             ..Args::default()
         };
         assert_eq!(run(&mut env, &mut st, &set, &args), -EFAULT);
-        let args = Args { cmd: iowr(0xa0, 24), ..args };
+        let args = Args {
+            cmd: iowr(0xa0, 24),
+            ..args
+        };
         assert_eq!(run(&mut env, &mut st, &set, &args), -EINVAL);
-        let args = Args { cmd: iowr(0xa1, 32), ..args };
+        let args = Args {
+            cmd: iowr(0xa1, 32),
+            ..args
+        };
         assert_eq!(run(&mut env, &mut st, &set, &args), -ENOTTY);
     }
 
@@ -1491,17 +1691,55 @@ mod tests {
 
     #[test]
     fn copy_extents_follow_the_kernels_fill_rules() {
-        let f = |cb_kind, cb_off, cb_arg| SField { cb_kind, cb_off, cb_arg, ..SField::default() };
-        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, 0, 0, 0), (0, 64));
-        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, -1, 0, 0), (0, 0));
-        assert_eq!(copy_extent(&f(SCB_FULL, 0, 0), SDIR_INOUT, 64, -1, 0, 0), (0, 64));
-        assert_eq!(copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, 3, 5), (0, 24));
-        assert_eq!(copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, u64::MAX, u64::MAX), (0, 64));
-        assert_eq!(copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 3, 5), (0, 0));
-        assert_eq!(copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 5, 3), (0, 24));
-        assert_eq!(copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 5), (0, 64));
-        assert_eq!(copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 4), (0, 0));
-        assert_eq!(copy_extent(&f(SCB_RANGE, 16, 32), SDIR_OUT, 40, -1, 0, 0), (16, 40));
-        assert_eq!(copy_extent(&f(SCB_WRITTEN, 0, 0), SDIR_OUT, 64, -1, 0, 10), (0, 10));
+        let f = |cb_kind, cb_off, cb_arg| SField {
+            cb_kind,
+            cb_off,
+            cb_arg,
+            ..SField::default()
+        };
+        assert_eq!(
+            copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, 0, 0, 0),
+            (0, 64)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_FULL, 0, 0), SDIR_OUT, 64, -1, 0, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_FULL, 0, 0), SDIR_INOUT, 64, -1, 0, 0),
+            (0, 64)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, 3, 5),
+            (0, 24)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_PARTIAL, 0, 8), SDIR_OUT, 64, 0, u64::MAX, u64::MAX),
+            (0, 64)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 3, 5),
+            (0, 0)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_ALL_OR_NOTHING, 0, 8), SDIR_OUT, 64, 0, 5, 3),
+            (0, 24)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 5),
+            (0, 64)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_EXACT, 0, 0), SDIR_OUT, 64, 0, 5, 4),
+            (0, 0)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_RANGE, 16, 32), SDIR_OUT, 40, -1, 0, 0),
+            (16, 40)
+        );
+        assert_eq!(
+            copy_extent(&f(SCB_WRITTEN, 0, 0), SDIR_OUT, 64, -1, 0, 10),
+            (0, 10)
+        );
     }
 }

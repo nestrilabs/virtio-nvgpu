@@ -35,20 +35,66 @@ pub enum Ev {
 /// An IOCTL2 hook call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hook {
-    FdIn { buf: u32, off: u32, v: i64, kinds: u32 },
-    GemIn { buf: u32, off: u32, guest: u32 },
-    FdOut { buf: u32, off: u32, handle: u32, kind: u32 },
-    GemOut { buf: u32, off: u32, gem: u32, size: u64 },
-    Special { id: u32, phase: i32 },
-    Phase { phase: i32 },
-    AObj { obj: u32 },
-    AProp { id: u32 },
+    FdIn {
+        buf: u32,
+        off: u32,
+        v: i64,
+        kinds: u32,
+    },
+    GemIn {
+        buf: u32,
+        off: u32,
+        guest: u32,
+    },
+    FdOut {
+        buf: u32,
+        off: u32,
+        handle: u32,
+        kind: u32,
+    },
+    GemOut {
+        buf: u32,
+        off: u32,
+        gem: u32,
+        size: u64,
+    },
+    Special {
+        id: u32,
+        phase: i32,
+    },
+    Phase {
+        phase: i32,
+    },
+    AObj {
+        obj: u32,
+    },
+    AProp {
+        id: u32,
+    },
     /// `commit`: what the parse had said about the commit by then.
-    AInFence { buf: u32, off: u32, fd: i64, commit: bool },
-    AOutFence { buf: u32, off: u32, uptr: u64 },
-    ALearn { obj: u32, crtc: u32 },
-    AReserve { crtc: u32, user_data: u64 },
-    AtomicOut { commit: bool, values_buf: u32 },
+    AInFence {
+        buf: u32,
+        off: u32,
+        fd: i64,
+        commit: bool,
+    },
+    AOutFence {
+        buf: u32,
+        off: u32,
+        uptr: u64,
+    },
+    ALearn {
+        obj: u32,
+        crtc: u32,
+    },
+    AReserve {
+        crtc: u32,
+        user_data: u64,
+    },
+    AtomicOut {
+        commit: bool,
+        values_buf: u32,
+    },
 }
 
 /// A deterministic generator (SplitMix64), or, for the fuzzer, the fuzzer's
@@ -238,7 +284,11 @@ impl World {
         let mut v = Vec::with_capacity(n as usize);
         for _ in 0..n {
             v.push(pa);
-            pa = if rng.chance(1, 4) { 0x1_0000_0000 + (rng.below(1 << 20) << 12) } else { pa + 4096 };
+            pa = if rng.chance(1, 4) {
+                0x1_0000_0000 + (rng.below(1 << 20) << 12)
+            } else {
+                pa + 4096
+            };
         }
         Some(v)
     }

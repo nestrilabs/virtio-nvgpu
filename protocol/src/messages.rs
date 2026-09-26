@@ -997,8 +997,14 @@ mod tests {
         };
         assert_eq!(define("NVGPU_DEEP_SEGMENTED"), u64::from(DEEP_SEGMENTED));
         assert_eq!(define("NVGPU_DEEP_SEGS_MAX"), u64::from(DEEP_SEGS_MAX));
-        assert_eq!(define("NVGPU_DEEP_SEGS_MAX_BYTES"), u64::from(DEEP_SEGS_MAX_BYTES));
-        assert_eq!(define("NVGPU_IDLE_CHANNELS_MAX"), u64::from(IDLE_CHANNELS_MAX));
+        assert_eq!(
+            define("NVGPU_DEEP_SEGS_MAX_BYTES"),
+            u64::from(DEEP_SEGS_MAX_BYTES)
+        );
+        assert_eq!(
+            define("NVGPU_IDLE_CHANNELS_MAX"),
+            u64::from(IDLE_CHANNELS_MAX)
+        );
         assert_eq!(define("NVGPU_BCAP_DEEP_SEGS"), u64::from(BCAP_DEEP_SEGS));
         assert_eq!(define("NVGPU_SHM_ID_UVM"), u64::from(SHM_ID_UVM));
         assert_eq!(define("NVGPU_BCAP_UVM_MAP"), u64::from(BCAP_UVM_MAP));
@@ -1071,7 +1077,10 @@ mod tests {
         assert_eq!(DeviceKind::from_device_type(3), Some(DeviceKind::Gpu(3)));
         assert_eq!(DeviceKind::from_device_type(255), Some(DeviceKind::Ctl));
         assert_eq!(DeviceKind::from_device_type(256), Some(DeviceKind::Uvm));
-        assert_eq!(DeviceKind::from_device_type(257), Some(DeviceKind::UvmTools));
+        assert_eq!(
+            DeviceKind::from_device_type(257),
+            Some(DeviceKind::UvmTools)
+        );
         assert_eq!(DeviceKind::from_device_type(258), Some(DeviceKind::Modeset));
     }
 
@@ -1088,7 +1097,10 @@ mod tests {
             Some(DeviceKind::Dri(3))
         );
         assert_eq!(DeviceKind::from_device_type(300), None);
-        assert_eq!(DeviceKind::from_device_type(DEV_WAYLAND), Some(DeviceKind::Wayland));
+        assert_eq!(
+            DeviceKind::from_device_type(DEV_WAYLAND),
+            Some(DeviceKind::Wayland)
+        );
         assert_eq!(
             DeviceKind::from_device_type(DEV_DRI_CARD_BASE + 1),
             Some(DeviceKind::DriCard(1))

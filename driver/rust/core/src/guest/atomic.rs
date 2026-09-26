@@ -107,7 +107,12 @@ fn add_crtc(crtcs: &mut [u32; MAX_EVENTS], n: &mut usize, crtc: u32) {
 /// `nvgpu_atomic_parse()`: walk the commit's arrays in the call's kernel
 /// copies, asking `env` what its objects and properties are, reserving the
 /// flip events and bridging the fences. 0 or a negative errno.
-pub fn parse<S: Store, E: Env<S>>(st: &mut State<S>, env: &mut E, fences: bool, out: &mut Out) -> i32 {
+pub fn parse<S: Store, E: Env<S>>(
+    st: &mut State<S>,
+    env: &mut E,
+    fences: bool,
+    out: &mut Out,
+) -> i32 {
     let Some(len0) = blen(st, 0) else { return 0 };
     if len0 < SIZE as u64 {
         return 0;
@@ -129,8 +134,16 @@ pub fn parse<S: Store, E: Env<S>>(st: &mut State<S>, env: &mut E, fences: bool, 
         idx = idx.saturating_add(1);
         i
     };
-    let bobjs = if w64(st, 0, OBJS_PTR as u64) != 0 { next() } else { 0 };
-    let bcp = if w64(st, 0, COUNT_PROPS_PTR as u64) != 0 { next() } else { 0 };
+    let bobjs = if w64(st, 0, OBJS_PTR as u64) != 0 {
+        next()
+    } else {
+        0
+    };
+    let bcp = if w64(st, 0, COUNT_PROPS_PTR as u64) != 0 {
+        next()
+    } else {
+        0
+    };
     if bobjs == 0 || bcp == 0 {
         return 0; // the host faults on it; nothing will be made
     }
@@ -142,8 +155,16 @@ pub fn parse<S: Store, E: Env<S>>(st: &mut State<S>, env: &mut E, fences: bool, 
     for o in 0..u64::from(count) {
         sum = sum.saturating_add(u64::from(w32(st, bcp, o.saturating_mul(4))));
     }
-    let bprops = if sum != 0 && w64(st, 0, PROPS_PTR as u64) != 0 { next() } else { 0 };
-    let bvals = if sum != 0 && w64(st, 0, VALUES_PTR as u64) != 0 { next() } else { 0 };
+    let bprops = if sum != 0 && w64(st, 0, PROPS_PTR as u64) != 0 {
+        next()
+    } else {
+        0
+    };
+    let bvals = if sum != 0 && w64(st, 0, VALUES_PTR as u64) != 0 {
+        next()
+    } else {
+        0
+    };
     if sum != 0 {
         let lp = if bprops != 0 { blen(st, bprops) } else { None };
         let lv = if bvals != 0 { blen(st, bvals) } else { None };

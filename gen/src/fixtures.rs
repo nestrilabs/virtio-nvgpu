@@ -26,7 +26,7 @@
 mod tests {
     use crate::ioctl;
     use crate::version::DriverVersion;
-    use crate::versions::{lookup, table_for, IoctlEntry, IoctlKind};
+    use crate::versions::{IoctlEntry, IoctlKind, lookup, table_for};
 
     /// `(name, observed_size, call_count)`; size `-1` means it varied.
     fn parse(tsv: &str) -> Vec<(&str, i64, u64)> {
@@ -36,7 +36,11 @@ mod tests {
                 let mut f = l.split('\t');
                 let name = f.next().expect("escape name");
                 let size = f.next().expect("size").parse().expect("size is an integer");
-                let count = f.next().expect("count").parse().expect("count is an integer");
+                let count = f
+                    .next()
+                    .expect("count")
+                    .parse()
+                    .expect("count is an integer");
                 (name, size, count)
             })
             .collect()
@@ -116,7 +120,10 @@ mod tests {
         }
 
         // Guard against the fixture silently emptying out.
-        assert!(checked >= 15, "only {checked} sizes were actually compared for {hw}");
+        assert!(
+            checked >= 15,
+            "only {checked} sizes were actually compared for {hw}"
+        );
     }
 
     /// Nothing the hardware used is missing from the table it resolves to.
@@ -127,7 +134,10 @@ mod tests {
             .filter(|(name, _, _)| escape_of(name).is_none_or(|e| lookup(table, e).is_none()))
             .map(|(name, _, count)| format!("{name} ({count} calls)"))
             .collect();
-        assert!(missing.is_empty(), "escapes seen on hardware but unhandled: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "escapes seen on hardware but unhandled: {missing:?}"
+        );
     }
 
     #[test]
@@ -161,10 +171,10 @@ mod tests {
             "615.71.09 now has a profile of its own, so the A2000 fixture no longer \
              exercises range selection -- point it at a version that does, or drop this test"
         );
-        assert!(std::ptr::eq(
-            table_of(v),
-            table_of(DriverVersion::new(595, 71, 5))
-        ), "615.71.09 should resolve to the 595.71.05 table");
+        assert!(
+            std::ptr::eq(table_of(v), table_of(DriverVersion::new(595, 71, 5))),
+            "615.71.09 should resolve to the 595.71.05 table"
+        );
     }
 
     /// The strongest claim the two captures support together: a T4 on
@@ -191,6 +201,9 @@ mod tests {
             shared += 1;
         }
 
-        assert!(shared >= 20, "only {shared} escapes were common to both captures");
+        assert!(
+            shared >= 20,
+            "only {shared} escapes were common to both captures"
+        );
     }
 }

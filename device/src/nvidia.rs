@@ -5,13 +5,12 @@
 
 use protocol::messages::*;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 #[cfg(any(test, fuzzing))]
 use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
 
 use crate::error::{DeviceError, Result};
-use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
 use crate::nvkms::{self, NvkmsPolicy};
@@ -21,6 +20,7 @@ use crate::pump::{PumpCmd, WatchMode};
 use crate::semsurf::SemsurfPolicy;
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
+use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
 
 // ============================================================
@@ -291,8 +291,8 @@ fn host_dev_info(path: &str) -> Option<([u32; NV_DEV_INFO_WORDS], u32)> {
         &mut bytes,
     );
     // No argument; the return value is the whole answer.
-    let modeset =
-        crate::sys::ioctl::no_arg(fd.as_raw_fd(), DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED).is_ok_and(|r| r == 0);
+    let modeset = crate::sys::ioctl::no_arg(fd.as_raw_fd(), DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED)
+        .is_ok_and(|r| r == 0);
     drop(fd);
     if rc != 0 {
         log::warn!(
@@ -2715,7 +2715,12 @@ impl NvidiaBackend {
                         ireq.cmd,
                         self.current_handle
                     );
-                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::EPERM,
+                    );
                 }
                 let init_flags_mask = self
                     .driver
@@ -2758,10 +2763,9 @@ impl NvidiaBackend {
                 // our descriptor for the call and the handle again in the
                 // reply.
                 match self.uvm_fd_in(ireq.cmd, params) {
-                    Ok(Some((off, handle))) => plan.slots.push((
-                        off,
-                        crate::guestptr::TopSlot::Handle { handle, width: 4 },
-                    )),
+                    Ok(Some((off, handle))) => plan
+                        .slots
+                        .push((off, crate::guestptr::TopSlot::Handle { handle, width: 4 })),
                     Ok(None) => {}
                     Err(errno) => {
                         return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
@@ -2794,7 +2798,8 @@ impl NvidiaBackend {
                     );
                 }
                 if ireq.cmd == crate::guestptr::UVM_INITIALIZE
-                    && init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS == 0
+                    && init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS
+                        == 0
                 {
                     self.uvm_pageable_off(host_fd, resp_buf, n);
                 }
@@ -3070,9 +3075,8 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // FD-carrying ioctls — need handle translation
             // ---------------------------------------------------------------
-            NV_ESC_REGISTER_FD => self.dispatch_fd_carrying(
-                cookie, host_fd, request, escape, param_in, &plan, resp_buf,
-            ),
+            NV_ESC_REGISTER_FD => self
+                .dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, &plan, resp_buf),
             // The OS events RM calls may name later (semsurf.rs).
             NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
                 let n = self.dispatch_fd_carrying(
@@ -3082,9 +3086,8 @@ impl NvidiaBackend {
                 n
             }
 
-            NV_ESC_RM_ALLOC_MEMORY => self.dispatch_fd_carrying(
-                cookie, host_fd, request, escape, param_in, &plan, resp_buf,
-            ),
+            NV_ESC_RM_ALLOC_MEMORY => self
+                .dispatch_fd_carrying(cookie, host_fd, request, escape, param_in, &plan, resp_buf),
 
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, request, param_in, &plan, resp_buf)
@@ -3131,8 +3134,8 @@ impl NvidiaBackend {
             }
             NV_ESC_RM_CONTROL => {
                 let n = self.dispatch_nested(
-                    cookie, host_fd, request, param_in, &plan, resp_buf, 32, 16, 24, deep_in,
-                    None, deep_segs,
+                    cookie, host_fd, request, param_in, &plan, resp_buf, 32, 16, 24, deep_in, None,
+                    deep_segs,
                 );
                 // Counted here rather than in the forwarder, which holds only a
                 // shared borrow. NVOS54: hClient, hObject, cmd at byte 8.
@@ -3150,8 +3153,8 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             NV_ESC_RM_ALLOC => {
                 let n = self.dispatch_nested(
-                    cookie, host_fd, request, param_in, &plan, resp_buf, 48, 16, 32, deep_in,
-                    None, None,
+                    cookie, host_fd, request, param_in, &plan, resp_buf, 48, 16, 32, deep_in, None,
+                    None,
                 );
                 // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12,
                 // status at 40. As for controls, only what RM made.
@@ -3399,9 +3402,8 @@ impl NvidiaBackend {
             let h_class = word(outer_in, 12);
             const NV0005_DATA: usize = 16;
             if matches!(h_class, 0x05 | 0x79) && nested_size >= NV0005_DATA + 4 {
-                let guest = i32::from_le_bytes(
-                    nested_in[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap(),
-                );
+                let guest =
+                    i32::from_le_bytes(nested_in[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
                 let set = match self.dev_fd(guest as u32) {
                     Ok(fd) => a
                         .fd(nb, NV0005_DATA, 4)
@@ -3465,7 +3467,9 @@ impl NvidiaBackend {
                     match self.ctl_fd(guest as u32) {
                         Ok(fd) => a.fd(nb, at, 4).and_then(|_| a.set_fd(nb, at, fd)),
                         Err(_) => {
-                            log::warn!("RM control {cmd:#x}: {guest} is no control file of this VM");
+                            log::warn!(
+                                "RM control {cmd:#x}: {guest} is no control file of this VM"
+                            );
                             return fail(self, resp_buf, Status::BadHandle, libc::EBADF);
                         }
                     }
@@ -3533,7 +3537,9 @@ impl NvidiaBackend {
             }
             // Controls whose pointers stay zeroed (ACPI methods among
             // them; abi::rmctrl::ZEROED_CONTROLS) take no deep block.
-            if rm && escape == abi::ioctl::NV_ESC_RM_CONTROL && abi::rmctrl::zeroed(word(outer_in, 8))
+            if rm
+                && escape == abi::ioctl::NV_ESC_RM_CONTROL
+                && abi::rmctrl::zeroed(word(outer_in, 8))
             {
                 log::warn!(
                     "RM control {:#010x}: a deep block for a control whose pointers are never \
@@ -3559,8 +3565,8 @@ impl NvidiaBackend {
         // goes back unchanged -- what a native caller's buffer holds after
         // a call that never touched it (V1 GPU_GET_ID_INFO's szName, which
         // the guest driver still carries one for).
-        if let Some((ptr_off, bytes)) =
-            deep_in.filter(|&(o, _)| !crate::guestptr::control_pointers(word(outer_in, 8)).contains(&o))
+        if let Some((ptr_off, bytes)) = deep_in
+            .filter(|&(o, _)| !crate::guestptr::control_pointers(word(outer_in, 8)).contains(&o))
         {
             log::debug!(
                 "RM control {:#010x}: a deep block for {ptr_off}, where RM follows no pointer; \
@@ -3620,7 +3626,8 @@ impl NvidiaBackend {
                 Some(s) => s.offsets(),
                 None => deep.map(|(o, _)| o).into_iter().collect(),
             };
-            if let Err(e) = crate::guestptr::scrub_control(word(outer_in, 8), &mut a, nb, &relocated)
+            if let Err(e) =
+                crate::guestptr::scrub_control(word(outer_in, 8), &mut a, nb, &relocated)
             {
                 return fail(self, resp_buf, Status::IoctlFailed, e);
             }
@@ -4227,7 +4234,9 @@ impl NvidiaBackend {
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR && (request >> 8) & 0xFF == u64::from(b'F') {
+        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR
+            && (request >> 8) & 0xFF == u64::from(b'F')
+        {
             self.learn_driver_version(&param_buf);
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
@@ -4295,14 +4304,16 @@ impl NvidiaBackend {
         // and holding our descriptor of the handle's file (or -1), and the
         // plan's fields.
         let mut a = Arena::new();
-        let built = self.top_block(&mut a, request, param_in, plan).and_then(|top| {
-            a.fd(top, fd_offset, 4)?;
-            match host_embedded {
-                Some(fd) => a.set_fd(top, fd_offset, fd)?,
-                None => a.set_no_fd(top, fd_offset, -1)?,
-            }
-            Ok(top)
-        });
+        let built = self
+            .top_block(&mut a, request, param_in, plan)
+            .and_then(|top| {
+                a.fd(top, fd_offset, 4)?;
+                match host_embedded {
+                    Some(fd) => a.set_fd(top, fd_offset, fd)?,
+                    None => a.set_no_fd(top, fd_offset, -1)?,
+                }
+                Ok(top)
+            });
         let top = match built {
             Ok(t) => t,
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
@@ -4457,11 +4468,13 @@ impl NvidiaBackend {
         // The host's copy: the guest's NVOS33, the descriptor field holding
         // our descriptor of that file, pLinearAddress (the plan's) held at 0.
         let mut a = Arena::new();
-        let built = self.top_block(&mut a, request, param_in, plan).and_then(|top| {
-            a.fd(top, FD_OFFSET, 4)?;
-            a.set_fd(top, FD_OFFSET, host_map)?;
-            Ok(top)
-        });
+        let built = self
+            .top_block(&mut a, request, param_in, plan)
+            .and_then(|top| {
+                a.fd(top, FD_OFFSET, 4)?;
+                a.set_fd(top, FD_OFFSET, host_map)?;
+                Ok(top)
+            });
         let top = match built {
             Ok(t) => t,
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
@@ -6925,7 +6938,10 @@ mod tests {
         let card = be.adopt_for_test(r, HandleKind::DrmCard(0));
         be.close_handle(card).unwrap();
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
-        assert!(crate::sys::fd::write(&w, b"x").is_err(), "the read end is closed");
+        assert!(
+            crate::sys::fd::write(&w, b"x").is_err(),
+            "the read end is closed"
+        );
     }
 
     /// S-24: a control that lists the host's GPU processes never reaches
@@ -8285,7 +8301,10 @@ mod share_tests {
                 be.handles.insert_for(devnull(), modeset, p(t)).unwrap();
             }
         }
-        assert!(be.modeset_open_refused(p(9)).is_none(), "a newcomer gets one");
+        assert!(
+            be.modeset_open_refused(p(9)).is_none(),
+            "a newcomer gets one"
+        );
         for _ in 0..8 {
             if be.modeset_open_refused(Owner::Unknown).is_none() {
                 be.handles.insert(devnull(), modeset).unwrap();

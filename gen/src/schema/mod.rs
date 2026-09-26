@@ -755,7 +755,11 @@ mod tests {
         for t in UVM_TABLES {
             assert_eq!(t.versions.0, next, "{} starts where the last ended", t.name);
             assert!(t.versions.0 <= t.versions.1);
-            next = DriverVersion::new(t.versions.1.major, t.versions.1.minor, t.versions.1.patch + 1);
+            next = DriverVersion::new(
+                t.versions.1.major,
+                t.versions.1.minor,
+                t.versions.1.patch + 1,
+            );
             assert!(t.cmds.windows(2).all(|w| w[0].cmd < w[1].cmd), "{}", t.name);
             for c in t.cmds {
                 assert!(c.size <= 0x3000, "{}: {}", t.name, c.name);
@@ -785,7 +789,10 @@ mod tests {
         assert_eq!(size(v(550, 40, 7), 33), Some(1200));
         assert_eq!(size(v(550, 54, 14), 33), Some(9264));
         // A two-part release is its .0 (version.rs).
-        assert_eq!(size(DriverVersion::parse("550.67").unwrap(), 33), Some(9264));
+        assert_eq!(
+            size(DriverVersion::parse("550.67").unwrap(), 33),
+            Some(9264)
+        );
         // UVM_INITIALIZE is 16 bytes whatever its number's 0x3000 says, and
         // DEINITIALIZE takes nothing.
         assert_eq!(size(v(610, 57, 4), 0x3000_0001), Some(16));
@@ -870,7 +877,10 @@ mod tests {
         let Kind::Ptr { max, .. } = t.fields(set_mode.fields)[0].kind else {
             unreachable!()
         };
-        assert_eq!(max, 186_784, "the hand measurement of 610.57.04 (gen/nvkms_extract.py)");
+        assert_eq!(
+            max, 186_784,
+            "the hand measurement of 610.57.04 (gen/nvkms_extract.py)"
+        );
     }
 
     #[test]

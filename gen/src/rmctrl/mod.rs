@@ -82,7 +82,10 @@ mod tests {
             ("generated.rs", gen_dir.join("src/rmctrl/generated.rs")),
             // The guest's copy of the deep rows: both halves are rendered from
             // the same measurements, so this is also the test that they agree.
-            ("nvgpu_rm_deep.h", gen_dir.join("../driver/gen/nvgpu_rm_deep.h")),
+            (
+                "nvgpu_rm_deep.h",
+                gen_dir.join("../driver/gen/nvgpu_rm_deep.h"),
+            ),
         ] {
             let fresh = std::fs::read(out.join(rendered)).expect("rendered");
             let checked_in = std::fs::read(&checked_in).expect("checked in");
@@ -172,7 +175,11 @@ mod tests {
             [(16, 12), (24, 12), (32, 12)]
         );
         assert_eq!(
-            (IDLE_CHANNELS_FLAGS, IDLE_CHANNELS_LIST_BITS, IDLE_CHANNELS_LIST),
+            (
+                IDLE_CHANNELS_FLAGS,
+                IDLE_CHANNELS_LIST_BITS,
+                IDLE_CHANNELS_LIST
+            ),
             (40, (4, 7), 0)
         );
     }

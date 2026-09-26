@@ -22,7 +22,9 @@ impl Kernel for Host {
         // beyond the declared fields is what the ABI tables say it does not.
         let r = unsafe { libc::ioctl(fd, request as libc::Ioctl, arg.as_mut_ptr()) };
         if r < 0 {
-            -io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+            -io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
         } else {
             r
         }

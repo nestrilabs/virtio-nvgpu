@@ -394,8 +394,8 @@ impl Pair {
         }
         self.admitted += n as u64;
         // GCRA: never more than the burst, plus one per interval since.
-        let allowed = u64::from(self.burst)
-            + (self.elapsed.as_nanos() / self.interval.as_nanos()) as u64;
+        let allowed =
+            u64::from(self.burst) + (self.elapsed.as_nanos() / self.interval.as_nanos()) as u64;
         assert!(
             self.admitted <= allowed,
             "{} submits admitted in {:?} at {:?} a burst of {}",

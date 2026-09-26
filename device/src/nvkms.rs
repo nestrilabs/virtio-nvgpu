@@ -597,8 +597,8 @@ impl NvkmsPolicy {
         }
         let mut params = p.buffer_mut(1).ok_or(libc::EINVAL)?;
         st.check(lo, name, &call, &mut params)?;
-        let local =
-            name == "QUERY_DPY_DYNAMIC_DATA" && st.dpy_probe(lo, &call, &mut params, Instant::now());
+        let local = name == "QUERY_DPY_DYNAMIC_DATA"
+            && st.dpy_probe(lo, &call, &mut params, Instant::now());
         drop(params);
         if local {
             p.answer_locally(0);

@@ -16,9 +16,9 @@
 
 use std::any::Any;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
 #[cfg(miri)]
 use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::sync::Arc;
 
 const PAGE: usize = 4096;
@@ -570,7 +570,10 @@ mod tests {
         let r = Arc::new(Reservation::new(2 * PAGE).unwrap());
         r.map_file(0, PAGE, &f, PAGE as u64, false).unwrap();
         assert_eq!(r.span().read(0, 6), b"second");
-        assert!(r.map_file(PAGE, 2 * PAGE, &f, 0, false).is_err(), "past its end");
+        assert!(
+            r.map_file(PAGE, 2 * PAGE, &f, 0, false).is_err(),
+            "past its end"
+        );
         assert!(r.map_file(1, PAGE, &f, 0, false).is_err(), "unaligned");
         let base = r.addr();
         drop(r);
@@ -591,6 +594,9 @@ mod tests {
         assert_eq!(w.read_u32(PAGE as u64), 0x42);
         w.restore(PAGE as u64, PAGE as u64).unwrap();
         assert_eq!(w.read_u32(PAGE as u64), 0);
-        assert!(w.place(3 * PAGE as u64, 2 * PAGE as u64, f.as_raw_fd(), 0, true).is_err());
+        assert!(
+            w.place(3 * PAGE as u64, 2 * PAGE as u64, f.as_raw_fd(), 0, true)
+                .is_err()
+        );
     }
 }

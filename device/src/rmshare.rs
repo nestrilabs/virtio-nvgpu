@@ -993,8 +993,7 @@ impl NvidiaBackend {
             // `event->nvfp`), which is the one the caller then polls, a file of
             // its own and not the one its client was made on.
             NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
-                let Some(client) = rd32(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE)
-                else {
+                let Some(client) = rd32(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE) else {
                     log::warn!("OS event call ({escape:#04x}) too short to name its client");
                     return Err(Refuse::Errno(libc::EINVAL));
                 };
@@ -1460,7 +1459,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
     fn the_cap_counts_lists_and_grants() {
         let mut o = Ownership::default();

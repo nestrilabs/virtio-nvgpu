@@ -46,5 +46,6 @@ mod serve_tests;
 mod tests;
 
 pub use conn::{
-    HostFds, LeaseRefusal, LeaseThrottle, QueueBudget, RecvOps, SendOps, WlConfig, WlConn, WlLimits};
+    HostFds, LeaseRefusal, LeaseThrottle, QueueBudget, RecvOps, SendOps, WlConfig, WlConn, WlLimits,
+};
 pub use serve::WlState;

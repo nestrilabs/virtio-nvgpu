@@ -403,7 +403,6 @@ mod ll {
 
     pub const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
     pub const SCOPE_SIGNAL: u64 = 1 << 1;
-
 }
 
 /// The Landlock ABI this kernel speaks, or why none.
@@ -495,15 +494,12 @@ fn landlock(plan: &Plan) -> Layer {
         }
     };
     let fs = handled_fs(abi);
-    let ruleset = match crate::sys::proc::landlock_ruleset(
-        fs,
-        handled_net(abi),
-        scoped(abi),
-        attr_size(abi),
-    ) {
-        Ok(fd) => fd,
-        Err(e) => return Layer::Degraded(format!("landlock_create_ruleset (ABI {abi}): {e}")),
-    };
+    let ruleset =
+        match crate::sys::proc::landlock_ruleset(fs, handled_net(abi), scoped(abi), attr_size(abi))
+        {
+            Ok(fd) => fd,
+            Err(e) => return Layer::Degraded(format!("landlock_create_ruleset (ABI {abi}): {e}")),
+        };
 
     let rules = plan
         .devices
@@ -915,7 +911,8 @@ fn verify(r: &mut Report) {
     }
     if r.landlock.is_enforced() {
         // The root directory is never on the plan.
-        if crate::sys::fd::open(c"/", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC).is_ok() {
+        if crate::sys::fd::open(c"/", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC).is_ok()
+        {
             r.landlock = Layer::Degraded("installed, but / still opens".into());
         }
     }

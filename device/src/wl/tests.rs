@@ -19,7 +19,9 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, LeaseRefusal, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
+use super::conn::{
+    HostFds, LeaseRefusal, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd,
+};
 use super::export::WlExport;
 use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;

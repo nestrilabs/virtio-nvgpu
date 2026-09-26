@@ -1252,7 +1252,10 @@ fn overlapping_buffers_are_charged_once() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri files are not sparse: st_blocks after a punched hole"
+)]
 fn the_last_buffer_over_a_page_punches_it_out_and_gives_its_charge_back() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
     let mut p = shm_pair(&vm);
@@ -1288,7 +1291,10 @@ fn the_last_buffer_over_a_page_punches_it_out_and_gives_its_charge_back() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri files are not sparse: st_blocks after a punched hole"
+)]
 fn shm_sync_outside_every_live_buffer_is_refused() {
     let vm = Arc::new(crate::shm::ShmBudget::new(1 << 30, 64));
     let fresh = || {
@@ -1326,7 +1332,10 @@ fn shm_sync_outside_every_live_buffer_is_refused() {
 /// `wl_buffer` and making a new one each time. The pool is larger than the
 /// VM's budget, and the buffer travels further than the budget too.
 #[test]
-#[cfg_attr(miri, ignore = "Miri files are not sparse: st_blocks after a punched hole")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri files are not sparse: st_blocks after a punched hole"
+)]
 fn foot_scrolls_through_a_pool_larger_than_the_budget() {
     let budget: u64 = 8 << 20;
     let vm = Arc::new(crate::shm::ShmBudget::new(budget, 64));
@@ -1588,7 +1597,10 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore = "Miri's pipes are unbounded: nothing is held back to overrun")]
+#[cfg_attr(
+    miri,
+    ignore = "Miri's pipes are unbounded: nothing is held back to overrun"
+)]
 fn a_stream_that_overruns_its_credit_is_a_protocol_error() {
     let mut s = crate::stream::Streams::new(false);
     let (_rd, wr) = sys::pipe().unwrap();
@@ -2039,10 +2051,9 @@ fn a_submit_past_the_admitted_count_is_fatal() {
     p.h.from_channel(&wayland_frame(&submit(4)), vec![], &mut p.hp)
         .unwrap();
     assert_eq!(p.h.stats.lease_submits, 1);
-    let e = p
-        .h
-        .from_channel(&wayland_frame(&submit(6)), vec![], &mut p.hp)
-        .unwrap_err();
+    let e =
+        p.h.from_channel(&wayland_frame(&submit(6)), vec![], &mut p.hp)
+            .unwrap_err();
     assert_eq!(e.blame, Blame::Channel);
     assert_eq!(p.h.stats.lease_submits, 1);
 }
@@ -2492,7 +2503,8 @@ fn a_sink_credits_back_no_more_than_its_share() {
     let (id, rd) = first.unwrap();
     let mut out = Vec::new();
     // An old peer's first window, all of it.
-    s.data(id, &vec![7u8; crate::stream::WINDOW], &mut out).unwrap();
+    s.data(id, &vec![7u8; crate::stream::WINDOW], &mut out)
+        .unwrap();
     let credit = |out: &[frame::Unit]| -> u32 {
         out.iter()
             .filter_map(|u| {
@@ -2580,7 +2592,11 @@ fn unfinished_blobs_are_charged_and_dropped_when_nothing_takes_them() {
         p.h.from_channel(&f, fds, &mut TestPlat::default())
     };
     let c = frame::MAX_REC_PAYLOAD;
-    send(&mut p, (0..8).map(|i| chunk(1, (i * c) as u32, c)).collect()).unwrap();
+    send(
+        &mut p,
+        (0..8).map(|i| chunk(1, (i * c) as u32, c)).collect(),
+    )
+    .unwrap();
     assert_eq!(vm.used().0, 8 * c as u64);
     // Past the VM's budget: refused.
     let more: Vec<frame::Unit> = (0..9).map(|i| chunk(3, (i * c) as u32, c)).collect();
@@ -2627,7 +2643,11 @@ fn error_text_from_a_peer_arrives_printable_and_bounded() {
     assert_eq!(e.blame, Blame::Remote);
     assert!(e.message.len() <= MAX_FATAL_TEXT + 3, "{}", e.message.len());
     assert!(!e.message.chars().any(|c| c.is_control() || c == '\u{202e}'));
-    assert!(e.message.starts_with("\\u{1b}]0;owned\\u{7}"), "{}", e.message);
+    assert!(
+        e.message.starts_with("\\u{1b}]0;owned\\u{7}"),
+        "{}",
+        e.message
+    );
     // An interface name the guest bound, in the host's error.
     let mut p = Pair::new(Policy::default());
     p.registry(&[(1, "wl_compositor", 6)]);
@@ -2636,7 +2656,11 @@ fn error_text_from_a_peer_arrives_printable_and_bounded() {
         .generic_new_id("wl_compositor\n[fake] x", 1, 3)
         .finish();
     let e = raw_to_host(&mut p, bind, None).unwrap_err();
-    assert!(e.message.contains("wl_compositor\\n[fake] x"), "{}", e.message);
+    assert!(
+        e.message.contains("wl_compositor\\n[fake] x"),
+        "{}",
+        e.message
+    );
     assert!(!e.message.chars().any(char::is_control));
 }
 
@@ -2701,7 +2725,11 @@ fn a_pool_or_a_clients_blob_must_be_memory() {
     .unwrap();
     let (_, fds) = p.at_server();
     assert_eq!(fds.len(), 1);
-    assert_eq!(sys::file_size(fds[0].as_raw_fd()).unwrap(), 0, "a placeholder");
+    assert_eq!(
+        sys::file_size(fds[0].as_raw_fd()).unwrap(),
+        0,
+        "a placeholder"
+    );
     assert_eq!(p.h.stats.placeholders, 1);
 }
 

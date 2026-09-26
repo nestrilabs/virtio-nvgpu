@@ -98,7 +98,10 @@ impl Coverage {
 
     /// Every table measured at this release.
     pub fn measured(&self) -> bool {
-        self.rmallow.measured() && self.abi.measured() && self.nvkms.measured() && self.uvm.measured()
+        self.rmallow.measured()
+            && self.abi.measured()
+            && self.nvkms.measured()
+            && self.uvm.measured()
     }
 
     /// Whether the backend can run at all, if told to run unmeasured: every

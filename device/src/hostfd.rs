@@ -807,21 +807,21 @@ fn udmabuf_signaled_sync_file() -> io::Result<OwnedFd> {
     // (drivers/dma-buf/udmabuf.c, `udmabuf_create`), and a whole page.
     crate::sys::fd::ftruncate(&memfd, 4096)?;
     crate::sys::fd::add_seals(&memfd, libc::F_SEAL_SHRINK)?;
-    let dmabuf = crate::sys::ioctl::udmabuf_create(
-        dev.as_fd(),
-        memfd.as_fd(),
-        4096,
-        UDMABUF_FLAGS_CLOEXEC,
-    )?;
+    let dmabuf =
+        crate::sys::ioctl::udmabuf_create(dev.as_fd(), memfd.as_fd(), 4096, UDMABUF_FLAGS_CLOEXEC)?;
     let mut export = [0u8; 8];
     export[0..4].copy_from_slice(&DMA_BUF_SYNC_RW.to_le_bytes());
-    making_fd(dmabuf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export, 4)
+    making_fd(
+        dmabuf.as_raw_fd(),
+        DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+        &export,
+        4,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     fn fence_info(status: i32, ts: u64) -> Vec<u8> {
         let mut r = vec![0u8; SYNC_FENCE_INFO_SIZE];
@@ -903,7 +903,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd to classify by")]
     fn an_eventfd_classifies_as_an_eventfd() {
         let fd = new_eventfd().unwrap();
@@ -911,7 +910,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_memfd_classifies_as_a_memfd() {
         let fd = crate::sys::fd::memfd(c"keymap", libc::MFD_CLOEXEC).unwrap();
@@ -938,26 +936,56 @@ mod tests {
     #[test]
     fn anonymous_inode_links_name_their_kinds() {
         const ANON: i64 = ANON_INODE_FS_MAGIC;
-        assert_eq!(kind_from_link(ANON, "anon_inode:sync_file"), HandleKind::SyncFile);
+        assert_eq!(
+            kind_from_link(ANON, "anon_inode:sync_file"),
+            HandleKind::SyncFile
+        );
         assert_eq!(
             kind_from_link(ANON, "anon_inode:syncobj_file"),
             HandleKind::Syncobj
         );
-        assert_eq!(kind_from_link(DMA_BUF_MAGIC, "/dmabuf:"), HandleKind::Dmabuf);
-        assert_eq!(kind_from_link(DMA_BUF_MAGIC, "/dmabuf:scanout"), HandleKind::Dmabuf);
-        assert_eq!(kind_from_link(ANON, "anon_inode:dmabuf"), HandleKind::Dmabuf);
+        assert_eq!(
+            kind_from_link(DMA_BUF_MAGIC, "/dmabuf:"),
+            HandleKind::Dmabuf
+        );
+        assert_eq!(
+            kind_from_link(DMA_BUF_MAGIC, "/dmabuf:scanout"),
+            HandleKind::Dmabuf
+        );
+        assert_eq!(
+            kind_from_link(ANON, "anon_inode:dmabuf"),
+            HandleKind::Dmabuf
+        );
         assert_eq!(
             kind_from_link(TMPFS_MAGIC, "/memfd:wl_shm (deleted)"),
             HandleKind::Memfd
         );
-        assert_eq!(kind_from_link(HUGETLBFS_MAGIC, "/memfd:big (deleted)"), HandleKind::Memfd);
-        assert_eq!(kind_from_link(ANON, "anon_inode:[eventpoll]"), HandleKind::Other);
-        assert_eq!(kind_from_link(0x534f_434b, "socket:[1234]"), HandleKind::Other);
+        assert_eq!(
+            kind_from_link(HUGETLBFS_MAGIC, "/memfd:big (deleted)"),
+            HandleKind::Memfd
+        );
+        assert_eq!(
+            kind_from_link(ANON, "anon_inode:[eventpoll]"),
+            HandleKind::Other
+        );
+        assert_eq!(
+            kind_from_link(0x534f_434b, "socket:[1234]"),
+            HandleKind::Other
+        );
         // The link text is a path: on the wrong filesystem it names nothing.
         const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
-        assert_eq!(kind_from_link(FUSE_SUPER_MAGIC, "/dmabuf:x"), HandleKind::Other);
-        assert_eq!(kind_from_link(FUSE_SUPER_MAGIC, "/memfd:x (deleted)"), HandleKind::Other);
-        assert_eq!(kind_from_link(TMPFS_MAGIC, "anon_inode:sync_file"), HandleKind::Other);
+        assert_eq!(
+            kind_from_link(FUSE_SUPER_MAGIC, "/dmabuf:x"),
+            HandleKind::Other
+        );
+        assert_eq!(
+            kind_from_link(FUSE_SUPER_MAGIC, "/memfd:x (deleted)"),
+            HandleKind::Other
+        );
+        assert_eq!(
+            kind_from_link(TMPFS_MAGIC, "anon_inode:sync_file"),
+            HandleKind::Other
+        );
     }
 
     /// The kinds of real descriptors, as the kernel makes them.
@@ -1020,7 +1048,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no F_GETFL on this file")]
     fn nonblock_is_set_on_request() {
         let fd = open_path("/dev/null", libc::O_RDONLY).unwrap();

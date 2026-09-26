@@ -722,10 +722,12 @@ impl NvidiaBackend {
     }
 
     fn insert(&mut self, fd: OwnedFd, kind: HandleKind) -> Result<u32, i32> {
-        self.handles.insert_for(fd, kind, self.current_owner).map_err(|e| {
-            log::warn!("handle table full; refusing a new {kind:?}");
-            e.errno()
-        })
+        self.handles
+            .insert_for(fd, kind, self.current_owner)
+            .map_err(|e| {
+                log::warn!("handle table full; refusing a new {kind:?}");
+                e.errno()
+            })
     }
 
     fn raw(&self, h: u32) -> Result<i32, i32> {
@@ -1192,7 +1194,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri's clocks start at zero")]
     fn time_sync_carries_realtime_and_raw_when_the_guest_has_room() {
         let mut be = backend();
@@ -1491,7 +1492,10 @@ mod tests {
                 euid: 0,
             }));
             let r = call(be, MsgType::HostOp, 0, &body);
-            (status(&r), read::<HostOpResp>(&r[HDR..]).unwrap_or_default())
+            (
+                status(&r),
+                read::<HostOpResp>(&r[HDR..]).unwrap_or_default(),
+            )
         };
         let mut made = 0;
         while op(&mut be, 10).0 == 0 {

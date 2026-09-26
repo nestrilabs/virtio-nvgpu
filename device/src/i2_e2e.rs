@@ -334,7 +334,14 @@ struct GuestEnv<'a> {
 impl<'a> Env<Bufs<'a>> for GuestEnv<'_> {
     type TBuf = Vec<u8>;
 
-    fn fd_in(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, value: i64, _: u32) -> (i32, u32, u32) {
+    fn fd_in(
+        &mut self,
+        _: &mut State<Bufs<'a>>,
+        _: u32,
+        _: u32,
+        value: i64,
+        _: u32,
+    ) -> (i32, u32, u32) {
         match self.hooks.fds.get(&value) {
             Some(&(handle, flags)) => (0, handle, flags),
             None => (-libc::EBADF, 0, 0),
@@ -348,12 +355,26 @@ impl<'a> Env<Bufs<'a>> for GuestEnv<'_> {
         }
     }
 
-    fn fd_out(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, handle: u32, kind: u32) -> (i32, i64) {
+    fn fd_out(
+        &mut self,
+        _: &mut State<Bufs<'a>>,
+        _: u32,
+        _: u32,
+        handle: u32,
+        kind: u32,
+    ) -> (i32, i64) {
         self.hooks.fd_outs.push((handle, kind));
         (0, 99 + self.hooks.fd_outs.len() as i64)
     }
 
-    fn gem_out(&mut self, _: &mut State<Bufs<'a>>, _: u32, _: u32, gem: u32, size: u64) -> (i32, u32) {
+    fn gem_out(
+        &mut self,
+        _: &mut State<Bufs<'a>>,
+        _: u32,
+        _: u32,
+        gem: u32,
+        size: u64,
+    ) -> (i32, u32) {
         self.hooks.gem_outs.push((gem, size));
         (0, 199 + self.hooks.gem_outs.len() as u32)
     }
@@ -604,7 +625,6 @@ impl crate::sys::block::Kernel for Fake {
             }
         }
     }
-
 }
 
 impl Sys for Fake {
@@ -760,9 +780,18 @@ fn nvkms_ioctl(k: &mut Kernel, arg: &mut Arg<'_>) -> i32 {
                 assert_eq!(peek(arg, heads, 4952 + 4, 4), 6, "head 1's head");
                 let in0 = peek(arg, heads, 88, 8);
                 let out1 = peek(arg, heads, 4952 + 104, 8);
-                assert_eq!((peek(arg, heads, 104, 8), peek(arg, heads, 4952 + 88, 8)), (0, 0));
-                assert_eq!((peek(arg, in0, 0, 1), peek(arg, in0, LUT - 1, 1)), (0x11, 0x11));
-                assert_eq!((peek(arg, out1, 0, 1), peek(arg, out1, LUT - 1, 1)), (0x22, 0x22));
+                assert_eq!(
+                    (peek(arg, heads, 104, 8), peek(arg, heads, 4952 + 88, 8)),
+                    (0, 0)
+                );
+                assert_eq!(
+                    (peek(arg, in0, 0, 1), peek(arg, in0, LUT - 1, 1)),
+                    (0x11, 0x11)
+                );
+                assert_eq!(
+                    (peek(arg, out1, 0, 1), peek(arg, out1, LUT - 1, 1)),
+                    (0x22, 0x22)
+                );
                 poke(arg, p, 28, 4, 0x77);
                 -libc::EPERM
             }
@@ -1168,10 +1197,7 @@ fn a_descriptor_the_backend_already_holds_is_never_adopted() {
             "the caller hears of no fd"
         );
         // SAFETY: F_GETFD only asks whether the number is still open.
-        assert!(
-            crate::sys::fd::is_open(fd),
-            "and it was not closed"
-        );
+        assert!(crate::sys::fd::is_open(fd), "and it was not closed");
     }
 }
 

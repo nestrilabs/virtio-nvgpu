@@ -351,7 +351,6 @@ fn the_syncobj_global_is_offered_with_fences_served_and_a_guest_that_can_name_sy
 }
 
 #[test]
-
 #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd names")]
 fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
     let mut t = HandleTable::new();
@@ -375,7 +374,6 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
 }
 
 #[test]
-
 #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd names")]
 fn a_compositor_descriptor_is_adopted_only_if_it_is_what_its_desc_says() {
     let mut t = HandleTable::new();
@@ -599,7 +597,10 @@ fn export_mode_listens_and_accepts_host_clients_as_channels() {
 
     let _client = UnixStream::connect(&path).unwrap();
     let (fd, _) = be.handles.get(listen).unwrap();
-    assert!(crate::sys::fd::readable(fd.as_raw_fd(), 2000), "LISTEN readable");
+    assert!(
+        crate::sys::fd::readable(fd.as_raw_fd(), 2000),
+        "LISTEN readable"
+    );
     let (st, chan) = open(&mut be, frame::WL_OPEN_ACCEPT);
     assert_eq!(st, 0);
     assert!(be.wl_is_open(chan));
@@ -666,7 +667,10 @@ fn one_guest_process_cannot_take_every_wayland_channel() {
         guest_caps: GCAP_PROC_ID,
         ..Default::default()
     };
-    assert_eq!(status(&call(&mut be, MsgType::Hello, 0, bytes_of(&req), 4096)), 0);
+    assert_eq!(
+        status(&call(&mut be, MsgType::Hello, 0, bytes_of(&req), 4096)),
+        0
+    );
     let mut mine = 0;
     while open_for(&mut be, 7).0 == 0 {
         mine += 1;

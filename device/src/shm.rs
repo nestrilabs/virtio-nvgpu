@@ -233,7 +233,6 @@ pub struct ShmAllocator {
     owners: std::collections::HashMap<u64, (Owner, u64)>,
 }
 
-
 impl ShmAllocator {
     pub fn new(cfg: ZoneConfig) -> Self {
         assert_eq!(cfg.uc_size % 4096, 0);
@@ -243,9 +242,10 @@ impl ShmAllocator {
         let total = cfg.total();
         assert!(total > 0);
 
-        let window = Arc::new(Window::new(total as usize).unwrap_or_else(|e| {
-            panic!("the shared window's backing ({total:#x} bytes): {e}")
-        }));
+        let window = Arc::new(
+            Window::new(total as usize)
+                .unwrap_or_else(|e| panic!("the shared window's backing ({total:#x} bytes): {e}")),
+        );
 
         let uc_base = 0;
         let wc_base = cfg.uc_size;
@@ -271,7 +271,12 @@ impl ShmAllocator {
 
     /// An extent of `length` in the `pgprot` zone, charged to `owner`,
     /// which may hold only its share of the zone (quota.rs).
-    pub fn alloc_for(&mut self, length: u64, pgprot: PgprotKind, owner: Owner) -> Result<ShmRegion> {
+    pub fn alloc_for(
+        &mut self,
+        length: u64,
+        pgprot: PgprotKind,
+        owner: Owner,
+    ) -> Result<ShmRegion> {
         let zone = match pgprot {
             PgprotKind::Uncached => &mut self.uc,
             PgprotKind::WriteCombine => &mut self.wc,
@@ -280,7 +285,9 @@ impl ShmAllocator {
 
         let want = align_up(length, PAGE_SIZE);
         let in_use = zone.size - zone.free_bytes();
-        if let Err(why) = zone.held.admits(&zone.share, owner, want, in_use, zone.size)
+        if let Err(why) = zone
+            .held
+            .admits(&zone.share, owner, want, in_use, zone.size)
             && why != crate::quota::Over::Pool
         {
             return Err(DeviceError::Io(std::io::Error::new(
@@ -366,12 +373,20 @@ impl ShmAllocator {
 
     /// Free bytes remaining in each zone, as `(uc, wc, wb)`.
     pub fn free_bytes(&self) -> (u64, u64, u64) {
-        (self.uc.free_bytes(), self.wc.free_bytes(), self.wb.free_bytes())
+        (
+            self.uc.free_bytes(),
+            self.wc.free_bytes(),
+            self.wb.free_bytes(),
+        )
     }
 
     /// Largest single allocation each zone could still satisfy.
     pub fn largest_free(&self) -> (u64, u64, u64) {
-        (self.uc.largest_free(), self.wc.largest_free(), self.wb.largest_free())
+        (
+            self.uc.largest_free(),
+            self.wc.largest_free(),
+            self.wb.largest_free(),
+        )
     }
 
     /// Place `length` bytes of `host_fd` at `shm_offset` of the window's
@@ -484,7 +499,10 @@ mod tests {
         assert_eq!(a.held_by(wc, p(1)), 128 * mib);
         // A second process takes what is left down to the reserve (32 MiB).
         let second = a.alloc_for(96 * mib, wc, p(2)).unwrap();
-        assert!(a.alloc_for(4096, wc, p(2)).is_err(), "the reserve is not its");
+        assert!(
+            a.alloc_for(4096, wc, p(2)).is_err(),
+            "the reserve is not its"
+        );
         // A third, holding nothing, still gets its first mapping, up to the
         // floor of 16 MiB.
         let third = a.alloc_for(16 * mib, wc, p(3)).unwrap();
@@ -544,7 +562,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn map_host_fd_with_memfd_fallback() {
         // Tests using the default memfd-backed base_ptr (no set_base_ptr call)
@@ -557,8 +574,12 @@ mod tests {
             .unwrap()
             .write(0, &[0x42]);
 
-        a.map_host_fd(region.offset, 4096, std::os::fd::AsRawFd::as_raw_fd(&host_fd))
-            .unwrap();
+        a.map_host_fd(
+            region.offset,
+            4096,
+            std::os::fd::AsRawFd::as_raw_fd(&host_fd),
+        )
+        .unwrap();
 
         assert_eq!(a.window().read(region.offset, 1), [0x42]);
     }
@@ -588,8 +609,14 @@ pub trait WindowPlacer: Send {
     /// position in a file. A DRM object is the exception: GEM_MAP_OFFSET hands
     /// out a file offset and the memory is only reachable by mapping the node
     /// there.
-    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, fd_offset: u64, writable: bool)
-        -> Result<()>;
+    fn place(
+        &self,
+        shm_offset: u64,
+        len: u64,
+        fd: RawFd,
+        fd_offset: u64,
+        writable: bool,
+    ) -> Result<()>;
 
     /// Return a range to empty. Not an unmap: leaving a hole would let a later
     /// access reach no mapping at all in a range the memory slot still covers.
@@ -654,7 +681,6 @@ mod probe_tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
     fn a_file_opened_read_only_is_probed_read_only_and_a_writable_one_writable() {
         let rw = memfd(8192);
@@ -668,7 +694,6 @@ mod probe_tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn a_file_that_cannot_be_mapped_at_all_is_left_to_the_placement() {
         let fd = crate::sys::fd::open(c"/dev/null", libc::O_RDONLY).unwrap();

@@ -16,8 +16,8 @@
 
 use super::rm;
 use super::wire::{
-    copy, has, ioctl_req_header, le32, le64, put32, sum, Errno, IoctlResp, DEEP_PAGE_LIST, EFAULT, EIO, ENOMEM,
-    OSDESC_F_WRITE, OSDESC_MAX_PAGES, OSDESC_MAX_RUNS, IOCTL_REQ_LEN, IOCTL_RESP_LEN,
+    copy, has, ioctl_req_header, le32, le64, put32, sum, Errno, IoctlResp, DEEP_PAGE_LIST, EFAULT,
+    EIO, ENOMEM, IOCTL_REQ_LEN, IOCTL_RESP_LEN, OSDESC_F_WRITE, OSDESC_MAX_PAGES, OSDESC_MAX_RUNS,
 };
 
 /// `NV_ESC_RM_ALLOC_MEMORY`.
@@ -202,7 +202,8 @@ pub fn describe<M: super::deep::UserMem + ?Sized>(mem: &mut M, nr: u32, outer: &
             c.va = q(n, OSD_DESCRIPTOR);
             limit = q(n, OSD_LIMIT);
             // osdescConstruct takes either as read-only (os_desc_mem.c:75).
-            c.write = w(n, OSD_ATTR2) & ATTR2_USER_READ_ONLY == 0 && w(n, OSD_FLAGS) & OS32_FLAGS_USER_READ_ONLY == 0;
+            c.write = w(n, OSD_ATTR2) & ATTR2_USER_READ_ONLY == 0
+                && w(n, OSD_FLAGS) & OS32_FLAGS_USER_READ_ONLY == 0;
             c.status_at = OS64_STATUS;
         }
     }
@@ -227,12 +228,19 @@ pub fn describe<M: super::deep::UserMem + ?Sized>(mem: &mut M, nr: u32, outer: &
 /// run and answers how many there are, or `None` past
 /// `NVGPU_OSDESC_MAX_RUNS` (`nvgpu_osdesc_runs()`, which counts them all
 /// first; so does this, `out` being told the count is too high only after).
-pub fn runs(npages: u64, phys: &mut dyn FnMut(u64) -> u64, out: &mut dyn FnMut(u64, u64)) -> Option<u64> {
+pub fn runs(
+    npages: u64,
+    phys: &mut dyn FnMut(u64) -> u64,
+    out: &mut dyn FnMut(u64, u64),
+) -> Option<u64> {
     let mut n: u64 = 0;
     let (mut gpa, mut len) = (0u64, 0u64);
     for i in 0..npages {
         let pa = phys(i);
-        if len != 0 && Some(pa) == gpa.checked_add(len.saturating_mul(PAGE_SIZE)) && len < u64::from(u32::MAX) {
+        if len != 0
+            && Some(pa) == gpa.checked_add(len.saturating_mul(PAGE_SIZE))
+            && len < u64::from(u32::MAX)
+        {
             len = len.saturating_add(1);
             continue;
         }
@@ -277,7 +285,12 @@ pub trait Env: rm::Env {
     /// was abandoned ([`i2::abandons`](super::i2::abandons)): then they are
     /// the transport's -- unpinned at once if the request never reached the
     /// ring, else kept until its late reply says what RM registered.
-    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], pin: Self::Pin) -> (Result<u32, Errno>, Option<Self::Pin>);
+    fn send_pinned(
+        &mut self,
+        req: &[u8],
+        resp: &mut [u8],
+        pin: Self::Pin,
+    ) -> (Result<u32, Errno>, Option<Self::Pin>);
     /// Unpin them now.
     fn unpin(&mut self, pin: Self::Pin);
 }
@@ -296,7 +309,10 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
         Err(PinError::NotPinned) => {
             // RM would have failed to pin them too: its status, in a call
             // that succeeded, as natively.
-            return match env.copy_to_user(uarg.wrapping_add(c.status_at as u64), &NV_ERR_INVALID_ADDRESS.to_le_bytes()) {
+            return match env.copy_to_user(
+                uarg.wrapping_add(c.status_at as u64),
+                &NV_ERR_INVALID_ADDRESS.to_le_bytes(),
+            ) {
                 Ok(()) => 0,
                 Err(_) => -EFAULT,
             };
@@ -323,7 +339,11 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
             env.handle(),
             cmd,
             c.outer_len as u32,
-            if c.nested_len != 0 { c.outer_len as u32 } else { 0 },
+            if c.nested_len != 0 {
+                c.outer_len as u32
+            } else {
+                0
+            },
             c.nested_len as u32,
             DEEP_PAGE_LIST,
             deep_len as u32,
@@ -375,9 +395,19 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
     let usedz = used as usize;
     let r = resp.as_ref();
     let data_len = h.data_len as usize;
-    let (nested_len, deep_len) = if data_len != 0 { (h.nested_len as usize, h.deep_len as usize) } else { (0, 0) };
-    let at = IOCTL_RESP_LEN.saturating_add(data_len).saturating_add(nested_len);
-    let id = if deep_len == 8 && has(usedz, at, 8) { le64(r, at).unwrap_or(0) } else { 0 };
+    let (nested_len, deep_len) = if data_len != 0 {
+        (h.nested_len as usize, h.deep_len as usize)
+    } else {
+        (0, 0)
+    };
+    let at = IOCTL_RESP_LEN
+        .saturating_add(data_len)
+        .saturating_add(nested_len);
+    let id = if deep_len == 8 && has(usedz, at, 8) {
+        le64(r, at).unwrap_or(0)
+    } else {
+        0
+    };
     if id != 0 {
         // Registered: RM has the pages until a reap says otherwise.
         env.keep(id, pin);
@@ -386,15 +416,20 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
     }
 
     // The caller's block back, its own address in it, and RM's status.
-    if data_len != c.outer_len || nested_len != c.nested_len || !has(usedz, IOCTL_RESP_LEN, params) {
+    if data_len != c.outer_len || nested_len != c.nested_len || !has(usedz, IOCTL_RESP_LEN, params)
+    {
         return -EIO;
     }
-    let back = r.get(IOCTL_RESP_LEN..sum(&[IOCTL_RESP_LEN, c.outer_len])).unwrap_or(&[]);
+    let back = r
+        .get(IOCTL_RESP_LEN..sum(&[IOCTL_RESP_LEN, c.outer_len]))
+        .unwrap_or(&[]);
     if env.copy_to_user(uarg, back).is_err() {
         return -EFAULT;
     }
     if c.nested_len != 0 {
-        let nb = r.get(sum(&[IOCTL_RESP_LEN, c.outer_len])..sum(&[IOCTL_RESP_LEN, params])).unwrap_or(&[]);
+        let nb = r
+            .get(sum(&[IOCTL_RESP_LEN, c.outer_len])..sum(&[IOCTL_RESP_LEN, params]))
+            .unwrap_or(&[]);
         if env.copy_to_user(c.unested, nb).is_err() {
             return -EFAULT;
         }
@@ -418,7 +453,12 @@ pub fn ioctl<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, outer: &[u8]) ->
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use std::vec::Vec;
@@ -444,12 +484,21 @@ mod tests {
 
     #[test]
     fn describes_alloc_memory() {
-        let Described::Ours(c) = describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0x1234, 0x2000, 0)) else {
+        let Described::Ours(c) =
+            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0x1234, 0x2000, 0))
+        else {
             panic!("not ours")
         };
-        assert_eq!((c.va, c.size, c.write, c.status_at), (0x1234, 0x2001, true, OS02_STATUS));
+        assert_eq!(
+            (c.va, c.size, c.write, c.status_at),
+            (0x1234, 0x2001, true, OS02_STATUS)
+        );
         assert_eq!(c.pages(), (0x234, 3));
-        let Described::Ours(c) = describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, 0, OS02_USER_READ_ONLY)) else {
+        let Described::Ours(c) = describe(
+            &mut NoMem,
+            ESC_RM_ALLOC_MEMORY,
+            &os02(0, 0, OS02_USER_READ_ONLY),
+        ) else {
             panic!("not ours")
         };
         assert!(!c.write);
@@ -460,41 +509,82 @@ mod tests {
     fn refuses_what_is_not_a_registration() {
         let mut b = os02(0x1000, 0xfff, 0);
         b[OS02_CLASS] = 0x70;
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &b), Described::NotOurs));
-        // Wrong size for the call.
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0x1000, 0xfff, 0)[..48]), Described::NotOurs));
-        // A range that wraps, and one past the page budget.
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(u64::MAX, 0, 0)), Described::NotOurs));
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, u64::MAX, 0)), Described::NotOurs));
         assert!(matches!(
-            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, OSDESC_MAX_PAGES * PAGE_SIZE, 0)),
+            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &b),
+            Described::NotOurs
+        ));
+        // Wrong size for the call.
+        assert!(matches!(
+            describe(
+                &mut NoMem,
+                ESC_RM_ALLOC_MEMORY,
+                &os02(0x1000, 0xfff, 0)[..48]
+            ),
+            Described::NotOurs
+        ));
+        // A range that wraps, and one past the page budget.
+        assert!(matches!(
+            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(u64::MAX, 0, 0)),
             Described::NotOurs
         ));
         assert!(matches!(
-            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, OSDESC_MAX_PAGES * PAGE_SIZE - 1, 0)),
+            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, u64::MAX, 0)),
+            Described::NotOurs
+        ));
+        assert!(matches!(
+            describe(
+                &mut NoMem,
+                ESC_RM_ALLOC_MEMORY,
+                &os02(0, OSDESC_MAX_PAGES * PAGE_SIZE, 0)
+            ),
+            Described::NotOurs
+        ));
+        assert!(matches!(
+            describe(
+                &mut NoMem,
+                ESC_RM_ALLOC_MEMORY,
+                &os02(0, OSDESC_MAX_PAGES * PAGE_SIZE - 1, 0)
+            ),
             Described::Ours(_)
         ));
         // Within a page of 2^64: the page count must not round to zero.
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, u64::MAX - 1, 0)), Described::NotOurs));
+        assert!(matches!(
+            describe(&mut NoMem, ESC_RM_ALLOC_MEMORY, &os02(0, u64::MAX - 1, 0)),
+            Described::NotOurs
+        ));
         // RM_ALLOC's parameters are read through the caller's memory.
         let mut a = [0u8; OS64_SIZE];
         a[OS64_CLASS..OS64_CLASS + 4].copy_from_slice(&CLASS_OS_DESCRIPTOR.to_le_bytes());
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC, &a), Described::NotOurs));
+        assert!(matches!(
+            describe(&mut NoMem, ESC_RM_ALLOC, &a),
+            Described::NotOurs
+        ));
         a[OS64_PARAMS] = 1;
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC, &a), Described::Failed(e) if e == -EFAULT));
+        assert!(
+            matches!(describe(&mut NoMem, ESC_RM_ALLOC, &a), Described::Failed(e) if e == -EFAULT)
+        );
         a[OS64_PARAMS_SIZE] = 41;
-        assert!(matches!(describe(&mut NoMem, ESC_RM_ALLOC, &a), Described::NotOurs));
+        assert!(matches!(
+            describe(&mut NoMem, ESC_RM_ALLOC, &a),
+            Described::NotOurs
+        ));
     }
 
     #[test]
     fn coalesces_runs() {
         let pas = [0x10000u64, 0x11000, 0x12000, 0x20000, 0x5000, 0x6000];
         let mut got = Vec::new();
-        let n = runs(pas.len() as u64, &mut |i| pas[i as usize], &mut |g, l| got.push((g, l)));
+        let n = runs(pas.len() as u64, &mut |i| pas[i as usize], &mut |g, l| {
+            got.push((g, l))
+        });
         assert_eq!(n, Some(3));
         assert_eq!(got, [(0x10000, 3), (0x20000, 1), (0x5000, 2)]);
         // Every page apart: one run each, and past the limit, none.
-        let n = runs(OSDESC_MAX_RUNS + 1, &mut |i| i * 2 * PAGE_SIZE, &mut |_, _| {});
+        let n = runs(
+            OSDESC_MAX_RUNS + 1,
+            &mut |i| i * 2 * PAGE_SIZE,
+            &mut |_, _| {},
+        );
         assert_eq!(n, None);
         let n = runs(OSDESC_MAX_RUNS, &mut |i| i * 2 * PAGE_SIZE, &mut |_, _| {});
         assert_eq!(n, Some(OSDESC_MAX_RUNS));

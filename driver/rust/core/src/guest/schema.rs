@@ -248,7 +248,11 @@ impl<'t> SchemaSet<'t> {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 
@@ -275,31 +279,70 @@ mod tests {
             io(0xc018_6400 | 0x43, SCLASS_RENDER, 0),
         ];
         let set = SchemaSet {
-            drm: Table { ioctls: &drm, fields: &[], planes: &[] },
+            drm: Table {
+                ioctls: &drm,
+                fields: &[],
+                planes: &[],
+            },
             modeset: None,
         };
         // Same type and nr, other size: the first with that nr.
-        assert_eq!(set.lookup(SCLASS_KMS, 0xc020_6442, &[]), Some((Which::Drm, 0)));
-        assert_eq!(set.lookup(SCLASS_KMS, 0xc018_6442, &[]), Some((Which::Drm, 1)));
+        assert_eq!(
+            set.lookup(SCLASS_KMS, 0xc020_6442, &[]),
+            Some((Which::Drm, 0))
+        );
+        assert_eq!(
+            set.lookup(SCLASS_KMS, 0xc018_6442, &[]),
+            Some((Which::Drm, 1))
+        );
         // Another class's entry is not ours.
         assert_eq!(set.lookup(SCLASS_KMS, 0xc018_6443, &[]), None);
-        assert_eq!(set.lookup(SCLASS_RENDER, 0xc018_6443, &[]), Some((Which::Drm, 2)));
+        assert_eq!(
+            set.lookup(SCLASS_RENDER, 0xc018_6443, &[]),
+            Some((Which::Drm, 2))
+        );
         // No NVKMS table: nothing for MODESET.
-        assert_eq!(set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[1, 0, 0, 0]), None);
+        assert_eq!(
+            set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[1, 0, 0, 0]),
+            None
+        );
     }
 
     #[test]
     fn lookup_nvkms_by_command() {
         let drm = [io(1, SCLASS_KMS, 0)];
-        let ms = [io(NVKMS_IOCTL_IOWR, SCLASS_MODESET, 7), io(NVKMS_IOCTL_IOWR, SCLASS_MODESET, 16)];
+        let ms = [
+            io(NVKMS_IOCTL_IOWR, SCLASS_MODESET, 7),
+            io(NVKMS_IOCTL_IOWR, SCLASS_MODESET, 16),
+        ];
         let set = SchemaSet {
-            drm: Table { ioctls: &drm, fields: &[], planes: &[] },
-            modeset: Some(Table { ioctls: &ms, fields: &[], planes: &[] }),
+            drm: Table {
+                ioctls: &drm,
+                fields: &[],
+                planes: &[],
+            },
+            modeset: Some(Table {
+                ioctls: &ms,
+                fields: &[],
+                planes: &[],
+            }),
         };
-        assert_eq!(set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[16, 0, 0, 0, 9]), Some((Which::Modeset, 1)));
-        assert_eq!(set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[17, 0, 0, 0]), None);
+        assert_eq!(
+            set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[16, 0, 0, 0, 9]),
+            Some((Which::Modeset, 1))
+        );
+        assert_eq!(
+            set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[17, 0, 0, 0]),
+            None
+        );
         // A prefix too short to hold the command, or another number.
-        assert_eq!(set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[16, 0, 0]), None);
-        assert_eq!(set.lookup(SCLASS_MODESET, 0xc010_6d01, &[16, 0, 0, 0]), None);
+        assert_eq!(
+            set.lookup(SCLASS_MODESET, NVKMS_IOCTL_IOWR, &[16, 0, 0]),
+            None
+        );
+        assert_eq!(
+            set.lookup(SCLASS_MODESET, 0xc010_6d01, &[16, 0, 0, 0]),
+            None
+        );
     }
 }

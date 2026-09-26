@@ -21,8 +21,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
-    load_manifest, loaded_driver_version, resolve, retarget, staged_driver_version, Capability,
-    DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH,
+    Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH, load_manifest,
+    loaded_driver_version, resolve, retarget, staged_driver_version,
 };
 use std::path::{Path, PathBuf};
 
@@ -38,7 +38,11 @@ struct Args {
     stage: Option<PathBuf>,
 
     /// Which capabilities to carry: utility, compute, graphics, video.
-    #[arg(long, value_delimiter = ',', default_value = "utility,compute,graphics,video")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "utility,compute,graphics,video"
+    )]
     caps: Vec<String>,
 
     /// List every file, not just the totals.
@@ -162,7 +166,11 @@ fn main() -> Result<()> {
 
     if args.verbose {
         for r in &found {
-            println!("  {:<10} {}", r.entry.kind.to_string(), r.guest_path.display());
+            println!(
+                "  {:<10} {}",
+                r.entry.kind.to_string(),
+                r.guest_path.display()
+            );
         }
     }
 
@@ -194,7 +202,8 @@ fn main() -> Result<()> {
     let mut found = found;
 
     if let (Some(m), Some(t)) = (&manifest_version, &target)
-        && m != t && !args.allow_version_mismatch
+        && m != t
+        && !args.allow_version_mismatch
     {
         let swapped = retarget(&entries, m, t);
         let (f2, _) = resolve(&swapped, &caps, &search);
@@ -230,7 +239,8 @@ fn main() -> Result<()> {
     // forwarded ioctl returns 0, and the caller gives up deep inside a library
     // that is a different build from the kernel module it is talking to.
     if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version)
-        && staged != loaded && !args.allow_version_mismatch
+        && staged != loaded
+        && !args.allow_version_mismatch
     {
         anyhow::bail!(
             "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
@@ -254,8 +264,11 @@ fn main() -> Result<()> {
     // must not be the way someone finds that out.
     clear_previous_share(&root)?;
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
-    std::fs::write(root.join(SHARE_MARKER), b"staged by nvgpu-userspace; cleared by it on the next --stage\n")
-        .with_context(|| format!("marking {} as a share", root.display()))?;
+    std::fs::write(
+        root.join(SHARE_MARKER),
+        b"staged by nvgpu-userspace; cleared by it on the next --stage\n",
+    )
+    .with_context(|| format!("marking {} as a share", root.display()))?;
 
     // Which file names the share will actually contain. A symlink entry is
     // only worth staging if whatever it points at is one of them.

@@ -33,10 +33,10 @@ use std::sync::{Arc, Mutex};
 use protocol::messages::{I2_DYN_OUT_FENCE, I2_FD_CONSUME, I2_MAX_BUFS, I2_MAX_RECS};
 
 use crate::hostfd::HandleKind;
-use crate::sys::block::{Arena, Arg, BufId, DataMut, Kernel, Restore, SlotKind};
 use crate::schema::{
     self, Dir, Exec, Field, Ioctl, Kind, Len, SchemaClass, Span, Special, Table, policy,
 };
+use crate::sys::block::{Arena, Arg, BufId, DataMut, Kernel, Restore, SlotKind};
 
 /// Why a request was refused before reaching the host. Carried back to the
 /// guest as a negative errno in the response header.
@@ -1249,13 +1249,10 @@ impl Walk<'_> {
                     // descriptor, which only the guest can fill); anything
                     // else is data, read where it is.
                     let guest = match f.kind {
-                        Kind::FdIn { .. } => self.arena.slot(
-                            id,
-                            at,
-                            width,
-                            SlotKind::Fd,
-                            Restore::To(u64::MAX),
-                        )?,
+                        Kind::FdIn { .. } => {
+                            self.arena
+                                .slot(id, at, width, SlotKind::Fd, Restore::To(u64::MAX))?
+                        }
                         Kind::FdOut { .. } => self.arena.slot(
                             id,
                             at,
@@ -1742,9 +1739,7 @@ impl Prepared {
             }
             // value @0: the same framebuffer rule as ATOMIC's, or the
             // legacy setter is the way round it (S-6).
-            if Self::is_fb_prop(trim(&name))
-                && !self.fb_usable(rd(self.bytes(0), 0, 4) as u32)
-            {
+            if Self::is_fb_prop(trim(&name)) && !self.fb_usable(rd(self.bytes(0), 0, 4) as u32) {
                 return Err(libc::EPERM);
             }
         }
@@ -2514,7 +2509,6 @@ mod tests {
                 }
             }
         }
-
     }
 
     impl Sys for FakeSys {
@@ -2864,7 +2858,11 @@ mod tests {
         h.sys.on_ioctl(|_, _, _, arg| {
             let top = arg.addr();
             assert_eq!(peek(arg, top, 0, 8), 0, "NULL stays NULL");
-            assert_eq!(peek(arg, top, 8, 8), 0, "an empty list is handed over as NULL");
+            assert_eq!(
+                peek(arg, top, 8, 8),
+                0,
+                "an empty list is handed over as NULL"
+            );
             let conn = peek(arg, top, 16, 8);
             let enc = peek(arg, top, 24, 8);
             assert!(conn != 0 && enc != 0);
@@ -3526,7 +3524,11 @@ mod tests {
         h.sys.on_ioctl(|_, _, _, arg| {
             let top = arg.addr();
             let ids = peek(arg, top, 24, 8);
-            assert_eq!(peek(arg, ids, 16, 4), 4, "the fifth id is where it should be");
+            assert_eq!(
+                peek(arg, ids, 16, 4),
+                4,
+                "the fifth id is where it should be"
+            );
             0
         });
         assert_eq!(h.kms(&rq).unwrap().ret, 0);
@@ -3891,7 +3893,11 @@ mod tests {
             let r = h.kms(&getpropblob(id)).unwrap().ret;
             (r, reached_host(h))
         };
-        assert_eq!(blob_read(&h, 66), (-libc::ENOENT, false), "another tenant's");
+        assert_eq!(
+            blob_read(&h, 66),
+            (-libc::ENOENT, false),
+            "another tenant's"
+        );
 
         // OBJ_GETPROPERTIES of our CRTC 5: MODE_ID is blob 66, ACTIVE is 67.
         h.sys.on_ioctl(|_, _, cmd, arg| {
@@ -3995,14 +4001,22 @@ mod tests {
         let h = h();
         h.sys.on_ioctl(|_, _, _, arg| {
             let top = arg.addr();
-            if peek(arg, top, 48, 4) == 7 { 0 } else { -libc::ENOENT }
+            if peek(arg, top, 48, 4) == 7 {
+                0
+            } else {
+                -libc::ENOENT
+            }
         });
         for c in 1000..1100 {
             assert_eq!(h.kms(&getconnector(c)).unwrap().ret, -libc::ENOENT);
         }
         assert_eq!(h.kms(&getconnector(7)).unwrap().ret, 0);
         let vm = &h.kms.as_ref().unwrap().vm;
-        assert_eq!(vm.lock().probed.len(), 1, "only the connector the host served");
+        assert_eq!(
+            vm.lock().probed.len(),
+            1,
+            "only the connector the host served"
+        );
 
         let vm = VmKms::new();
         let t0 = std::time::Instant::now();
@@ -4090,7 +4104,12 @@ mod tests {
         }
         /// (offset, width, condition) of each declared field of `span` at
         /// `base`, arrays walked element by element.
-        fn fields(t: &Table, span: Span, base: u32, out: &mut Vec<(u32, u32, Option<schema::Cond>, &'static str)>) {
+        fn fields(
+            t: &Table,
+            span: Span,
+            base: u32,
+            out: &mut Vec<(u32, u32, Option<schema::Cond>, &'static str)>,
+        ) {
             for f in t.fields(span) {
                 if let Kind::Array {
                     count,

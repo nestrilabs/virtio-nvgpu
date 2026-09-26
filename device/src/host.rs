@@ -30,7 +30,9 @@ pub fn driver_version(root: &Path) -> Option<String> {
     text.split_whitespace()
         .find(|w| {
             let mut parts = w.split('.');
-            let ok = |p: Option<&str>| p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            let ok = |p: Option<&str>| {
+                p.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            };
             ok(parts.next()) && ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
         })
         .map(str::to_string)
@@ -70,7 +72,7 @@ pub fn gpu_slots(root: &Path) -> Vec<GpuSlot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::{VirtioGpuNvConfig, MAX_GPUS};
+    use crate::virtio::{MAX_GPUS, VirtioGpuNvConfig};
     use std::path::PathBuf;
 
     struct Fixture(PathBuf);
@@ -185,7 +187,10 @@ mod tests {
         let version = driver_version(f.path()).expect("a version");
         let cfg = VirtioGpuNvConfig::new(&version, &gpu_slots(f.path()));
         let n = cfg.num_gpus;
-        assert!(n >= 1 && n as usize <= MAX_GPUS, "driver rejects num_gpus={n}");
+        assert!(
+            n >= 1 && n as usize <= MAX_GPUS,
+            "driver rejects num_gpus={n}"
+        );
         assert_eq!(&cfg.as_bytes()[0..9], b"615.71.09");
     }
 }

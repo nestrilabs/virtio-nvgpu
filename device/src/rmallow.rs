@@ -261,7 +261,9 @@ impl RmAllow {
                 // size refusal raises.
                 let sent_size = rd32(top_block, rmallow::NVOS54_PARAMS_SIZE).unwrap_or(0);
                 let want = self.release.control(cmd).and_then(|e| e.size).unwrap_or(0);
-                format!("sent with a parameter size RM does not take ({sent_size} bytes; RM takes {want})")
+                format!(
+                    "sent with a parameter size RM does not take ({sent_size} bytes; RM takes {want})"
+                )
             }
             _ => "not in the allowlist".to_string(),
         };

@@ -364,7 +364,12 @@ fn fake_answer(
             } else {
                 // RM copies the class's own size; the block is at least what
                 // the caller said it is.
-                if !follow(arg, params, u64::from(psize.max(1)).min(4096), "RM_ALLOC params") {
+                if !follow(
+                    arg,
+                    params,
+                    u64::from(psize.max(1)).min(4096),
+                    "RM_ALLOC params",
+                ) {
                     return -libc::EFAULT;
                 }
             }
@@ -566,7 +571,15 @@ fn walk(
                 for i in 0..count {
                     let at = off + (i * stride) as usize;
                     if at + stride as usize <= len {
-                        walk(arg, t, base + at as u64, stride as usize, children, depth + 1, 0);
+                        walk(
+                            arg,
+                            t,
+                            base + at as u64,
+                            stride as usize,
+                            children,
+                            depth + 1,
+                            0,
+                        );
                     }
                 }
             }
@@ -625,7 +638,12 @@ impl crate::sys::block::Kernel for FakeSys {
                     ST.with(|s| s.borrow_mut().call = inner.name.to_string());
                     walk(arg, t, top, size, inner.fields, 0, nsize);
                 } else {
-                    let _ = follow(arg, rd64(&a, 8), u64::from(nsize), "NvKmsIoctlParams.address");
+                    let _ = follow(
+                        arg,
+                        rd64(&a, 8),
+                        u64::from(nsize),
+                        "NvKmsIoctlParams.address",
+                    );
                 }
             } else {
                 walk(arg, t, top, size, e.fields, 0, 0);

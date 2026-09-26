@@ -19,7 +19,11 @@ fuzz_target!(|data: &[u8]| {
     let mut w = World {
         fds: FDS.iter().copied().collect(),
         clock: Some(12345),
-        hooks: Hooks { mask: knobs & 0x3f, seed: u64::from(knobs), fail_gem: None },
+        hooks: Hooks {
+            mask: knobs & 0x3f,
+            seed: u64::from(knobs),
+            fail_gem: None,
+        },
         chaos: u64::from((knobs >> 6) & 7),
         backend_seed: u64::from(knobs),
         ..World::default()
@@ -42,10 +46,24 @@ fuzz_target!(|data: &[u8]| {
     };
     let call = match (knobs >> 20) & 3 {
         0 => Call::Fd { cmd, arg: 0x10000 },
-        1 => Call::Uvm { cmd: cmd & 0xff, arg: 0x10000 },
+        1 => Call::Uvm {
+            cmd: cmd & 0xff,
+            arg: 0x10000,
+        },
         2 => Call::Modeset { cmd, arg: 0x10000 },
-        _ => Call::I2 { sclass: 1 + (knobs >> 22) % 3, cmd, uarg: 0x10000, render: 5, xflags: 0 },
+        _ => Call::I2 {
+            sclass: 1 + (knobs >> 22) % 3,
+            cmd,
+            uarg: 0x10000,
+            render: 5,
+            xflags: 0,
+        },
     };
-    let s = Scenario { seed: 0, dev, world: w, call };
+    let s = Scenario {
+        seed: 0,
+        dev,
+        world: w,
+        call,
+    };
     let _ = scen::run_rust(&s);
 });

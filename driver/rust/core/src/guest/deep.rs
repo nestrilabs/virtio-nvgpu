@@ -118,7 +118,9 @@ pub fn plan(ctl: &Control, blk: &[u8]) -> Plan {
     let nptrs = usize::try_from(ctl.nptrs).unwrap_or(usize::MAX);
     for p in ctl.ptrs.iter().take(nptrs) {
         // A pointer this release's block does not have.
-        let Some(uptr) = le64(blk, usize::from(p.ptr)) else { continue };
+        let Some(uptr) = le64(blk, usize::from(p.ptr)) else {
+            continue;
+        };
         let Some(size) = size(p, blk) else { continue };
         if uptr == 0 || size == 0 {
             continue;
@@ -128,13 +130,22 @@ pub fn plan(ctl: &Control, blk: &[u8]) -> Plan {
         }
         total = total.saturating_add(size);
         if let Some(s) = plan.seg.get_mut(plan.n as usize) {
-            *s = Seg { uptr, ptr: u32::from(p.ptr), len: size, flags: p.flags };
+            *s = Seg {
+                uptr,
+                ptr: u32::from(p.ptr),
+                len: size,
+                flags: p.flags,
+            };
         }
         plan.n = plan.n.saturating_add(1);
     }
     if plan.n != 0 {
         // 8 + 4 * 8 + 1 MiB at most.
-        plan.bytes = plan.n.saturating_mul(8).saturating_add(8).saturating_add(total);
+        plan.bytes = plan
+            .n
+            .saturating_mul(8)
+            .saturating_add(8)
+            .saturating_add(total);
     }
     plan
 }
@@ -195,7 +206,11 @@ pub fn copy_back<M: UserMem + ?Sized>(plan: &Plan, mem: &mut M, src: &[u8]) -> R
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
     use std::vec;
@@ -203,13 +218,30 @@ mod tests {
 
     /// FIFO_GET_CHANNELLIST, as gen/nvgpu_rm_deep.h has it.
     fn channellist() -> Control {
-        let c = |off| Count { offset: off, width: 4 };
+        let c = |off| Count {
+            offset: off,
+            width: 4,
+        };
         Control {
             cmd: 0x0080_170d,
             nptrs: 2,
             ptrs: [
-                Ptr { ptr: 8, flags: DEEP_IN, ncounts: 1, counts: [c(0), Count::default()], scale: 1, elem: 4 },
-                Ptr { ptr: 16, flags: DEEP_IN | DEEP_OUT, ncounts: 1, counts: [c(0), Count::default()], scale: 1, elem: 4 },
+                Ptr {
+                    ptr: 8,
+                    flags: DEEP_IN,
+                    ncounts: 1,
+                    counts: [c(0), Count::default()],
+                    scale: 1,
+                    elem: 4,
+                },
+                Ptr {
+                    ptr: 16,
+                    flags: DEEP_IN | DEEP_OUT,
+                    ncounts: 1,
+                    counts: [c(0), Count::default()],
+                    scale: 1,
+                    elem: 4,
+                },
                 Ptr::default(),
                 Ptr::default(),
             ],
@@ -229,8 +261,24 @@ mod tests {
         let p = plan(&channellist(), &blk(3, 0x1000, 0x2000));
         assert_eq!(p.n, 2);
         assert_eq!(p.bytes, 8 + 16 + 24);
-        assert_eq!(p.seg[0], Seg { uptr: 0x1000, ptr: 8, len: 12, flags: DEEP_IN });
-        assert_eq!(p.seg[1], Seg { uptr: 0x2000, ptr: 16, len: 12, flags: DEEP_IN | DEEP_OUT });
+        assert_eq!(
+            p.seg[0],
+            Seg {
+                uptr: 0x1000,
+                ptr: 8,
+                len: 12,
+                flags: DEEP_IN
+            }
+        );
+        assert_eq!(
+            p.seg[1],
+            Seg {
+                uptr: 0x2000,
+                ptr: 16,
+                len: 12,
+                flags: DEEP_IN | DEEP_OUT
+            }
+        );
         // A NULL pointer gets no segment; a zero count none at all.
         assert_eq!(plan(&channellist(), &blk(3, 0, 0x2000)).n, 1);
         assert_eq!(plan(&channellist(), &blk(0, 0x1000, 0x2000)).n, 0);
@@ -250,8 +298,18 @@ mod tests {
     #[test]
     fn counts_multiply_in_u32() {
         // P2P_CAPS: counts at 128 twice, squared in NvU32.
-        let c = Count { offset: 128, width: 4 };
-        let p = Ptr { ptr: 160, flags: DEEP_OUT, ncounts: 2, counts: [c, c], scale: 1, elem: 4 };
+        let c = Count {
+            offset: 128,
+            width: 4,
+        };
+        let p = Ptr {
+            ptr: 160,
+            flags: DEEP_OUT,
+            ncounts: 2,
+            counts: [c, c],
+            scale: 1,
+            elem: 4,
+        };
         let mut b = vec![0u8; 176];
         b[128..132].copy_from_slice(&0x1_0000u32.to_le_bytes());
         // 0x10000^2 wraps to 0 in u32: size 0, no segment.
@@ -259,7 +317,16 @@ mod tests {
         b[128..132].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(size(&p, &b), Some(256));
         // A count width RM does not have.
-        let bad = Ptr { counts: [Count { offset: 0, width: 3 }, c], ..p };
+        let bad = Ptr {
+            counts: [
+                Count {
+                    offset: 0,
+                    width: 3,
+                },
+                c,
+            ],
+            ..p
+        };
         assert_eq!(size(&bad, &b), None);
     }
 }

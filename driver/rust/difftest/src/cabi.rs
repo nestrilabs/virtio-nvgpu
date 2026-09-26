@@ -102,11 +102,23 @@ extern "C" {
     pub fn nvgpu_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
     pub fn nvgpu_uvm_ioctl_fd(nfd: *mut CFd, cmd: c_uint, arg: u64) -> c_long;
     pub fn nvgpu_ioctl_modeset(nfd: *mut CFd, cmd: c_uint, uarg: u64) -> c_long;
-    pub fn nvgpu_i2_has_schema(dev: *mut CDev, sclass: u32, cmd: c_uint, prefix: *const c_void, len: usize) -> bool;
+    pub fn nvgpu_i2_has_schema(
+        dev: *mut CDev,
+        sclass: u32,
+        cmd: c_uint,
+        prefix: *const c_void,
+        len: usize,
+    ) -> bool;
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;
     fn nvgpu_i2_add_fd(call: *mut c_void, buf: u32, off: u32, handle: u32, flags: u32) -> c_int;
-    fn harness_atomic(call: *mut c_void, fences: bool, ctx: *mut c_void, commit: *mut bool, values_buf: *mut u32) -> c_int;
+    fn harness_atomic(
+        call: *mut c_void,
+        fences: bool,
+        ctx: *mut c_void,
+        commit: *mut bool,
+        values_buf: *mut u32,
+    ) -> c_int;
     fn harness_atomic_commit() -> bool;
 }
 
@@ -154,8 +166,19 @@ pub unsafe extern "C" fn dt_copy_to_user(to: u64, from: *const u8, n: usize) -> 
 /// # Safety
 /// As the transport's contract.
 #[no_mangle]
-pub unsafe extern "C" fn dt_send_recv(req: *const u8, req_len: usize, resp: *mut u8, resp_len: usize, used: *mut u32) -> c_int {
-    let (req, resp) = unsafe { (std::slice::from_raw_parts(req, req_len), std::slice::from_raw_parts_mut(resp, resp_len)) };
+pub unsafe extern "C" fn dt_send_recv(
+    req: *const u8,
+    req_len: usize,
+    resp: *mut u8,
+    resp_len: usize,
+    used: *mut u32,
+) -> c_int {
+    let (req, resp) = unsafe {
+        (
+            std::slice::from_raw_parts(req, req_len),
+            std::slice::from_raw_parts_mut(resp, resp_len),
+        )
+    };
     match with(|w| backend::serve(w, req, resp)) {
         Ok(u) => {
             unsafe { *used = u };
@@ -168,7 +191,14 @@ pub unsafe extern "C" fn dt_send_recv(req: *const u8, req_len: usize, resp: *mut
 /// # Safety
 /// As [`dt_send_recv`].
 #[no_mangle]
-pub unsafe extern "C" fn dt_xfer(req: *const u8, req_len: usize, resp: *mut u8, resp_len: usize, flags: u32, used: *mut u32) -> c_int {
+pub unsafe extern "C" fn dt_xfer(
+    req: *const u8,
+    req_len: usize,
+    resp: *mut u8,
+    resp_len: usize,
+    flags: u32,
+    used: *mut u32,
+) -> c_int {
     with(|w| w.events.push(Ev::XferFlags(flags)));
     unsafe { dt_send_recv(req, req_len, resp, resp_len, used) }
 }
@@ -244,7 +274,9 @@ pub extern "C" fn dt_hand_over(n: u64, write: bool) {
 /// `fmt` is a C string.
 #[no_mangle]
 pub unsafe extern "C" fn dt_warn(fmt: *const c_char) {
-    let s = unsafe { CStr::from_ptr(fmt) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(fmt) }
+        .to_string_lossy()
+        .into_owned();
     with(|w| w.events.push(Ev::Warn(s)));
 }
 
@@ -301,7 +333,13 @@ impl CallBufs for CCall {
         let mut ctx = ACtx { w, call: self.0 };
         let (mut commit, mut values_buf) = (false, 0u32);
         let r = unsafe {
-            harness_atomic(self.0, fences, (&raw mut ctx).cast(), &mut commit, &mut values_buf)
+            harness_atomic(
+                self.0,
+                fences,
+                (&raw mut ctx).cast(),
+                &mut commit,
+                &mut values_buf,
+            )
         };
         (r, commit, values_buf)
     }
@@ -332,7 +370,13 @@ pub extern "C" fn dt_a_prop(ctx: *mut c_void, id: u32) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn dt_a_in_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, off: u32, fd: i64) -> c_int {
+pub extern "C" fn dt_a_in_fence(
+    ctx: *mut c_void,
+    _st: *mut c_void,
+    buf: u32,
+    off: u32,
+    fd: i64,
+) -> c_int {
     let a = actx(ctx);
     // What the parse has said about the commit by now.
     let commit = unsafe { harness_atomic_commit() };
@@ -340,7 +384,13 @@ pub extern "C" fn dt_a_in_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, of
 }
 
 #[no_mangle]
-pub extern "C" fn dt_a_out_fence(ctx: *mut c_void, _st: *mut c_void, buf: u32, off: u32, uptr: u64) -> c_int {
+pub extern "C" fn dt_a_out_fence(
+    ctx: *mut c_void,
+    _st: *mut c_void,
+    buf: u32,
+    off: u32,
+    uptr: u64,
+) -> c_int {
     let a = actx(ctx);
     hooks::a_out_fence(a.w, &mut CCall(a.call), buf, off, uptr)
 }
@@ -358,7 +408,15 @@ pub extern "C" fn dt_a_reserve(ctx: *mut c_void, crtc: u32, user_data: u64) -> c
 /// # Safety
 /// The hook's out-parameters are writable.
 #[no_mangle]
-pub unsafe extern "C" fn dt_fd_in(_call: *mut c_void, buf: u32, off: u32, v: i64, kinds: u32, handle: *mut u32, flags: *mut u32) -> c_int {
+pub unsafe extern "C" fn dt_fd_in(
+    _call: *mut c_void,
+    buf: u32,
+    off: u32,
+    v: i64,
+    kinds: u32,
+    handle: *mut u32,
+    flags: *mut u32,
+) -> c_int {
     let (r, h, f) = with(|w| hooks::fd_in(w, buf, off, v, kinds));
     unsafe {
         *handle = h;
@@ -370,7 +428,14 @@ pub unsafe extern "C" fn dt_fd_in(_call: *mut c_void, buf: u32, off: u32, v: i64
 /// # Safety
 /// As [`dt_fd_in`].
 #[no_mangle]
-pub unsafe extern "C" fn dt_gem_in(_call: *mut c_void, buf: u32, off: u32, guest: u32, owner: *mut u32, gem: *mut u32) -> c_int {
+pub unsafe extern "C" fn dt_gem_in(
+    _call: *mut c_void,
+    buf: u32,
+    off: u32,
+    guest: u32,
+    owner: *mut u32,
+    gem: *mut u32,
+) -> c_int {
     let (r, o, g) = with(|w| hooks::gem_in(w, buf, off, guest));
     unsafe {
         *owner = o;
@@ -382,7 +447,14 @@ pub unsafe extern "C" fn dt_gem_in(_call: *mut c_void, buf: u32, off: u32, guest
 /// # Safety
 /// As [`dt_fd_in`].
 #[no_mangle]
-pub unsafe extern "C" fn dt_fd_out(_call: *mut c_void, buf: u32, off: u32, handle: u32, kind: u32, v: *mut i64) -> c_int {
+pub unsafe extern "C" fn dt_fd_out(
+    _call: *mut c_void,
+    buf: u32,
+    off: u32,
+    handle: u32,
+    kind: u32,
+    v: *mut i64,
+) -> c_int {
     let (r, x) = with(|w| hooks::fd_out(w, buf, off, handle, kind));
     unsafe { *v = x };
     r
@@ -391,7 +463,14 @@ pub unsafe extern "C" fn dt_fd_out(_call: *mut c_void, buf: u32, off: u32, handl
 /// # Safety
 /// As [`dt_fd_in`].
 #[no_mangle]
-pub unsafe extern "C" fn dt_gem_out(_call: *mut c_void, buf: u32, off: u32, gem: u32, size: u64, guest: *mut u32) -> c_int {
+pub unsafe extern "C" fn dt_gem_out(
+    _call: *mut c_void,
+    buf: u32,
+    off: u32,
+    gem: u32,
+    size: u64,
+    guest: *mut u32,
+) -> c_int {
     let (r, g) = with(|w| hooks::gem_out(w, buf, off, gem, size));
     unsafe { *guest = g };
     r

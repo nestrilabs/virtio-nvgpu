@@ -133,7 +133,14 @@ pub enum Over {
 /// May `o`, which holds `held`, take `n` more units of a pool of `size`,
 /// `in_use` of which are taken? For pools that count what each owner holds
 /// themselves.
-pub fn admits(share: &Share, o: Owner, held: u64, n: u64, in_use: u64, size: u64) -> Result<(), Over> {
+pub fn admits(
+    share: &Share,
+    o: Owner,
+    held: u64,
+    n: u64,
+    in_use: u64,
+    size: u64,
+) -> Result<(), Over> {
     let after = in_use.saturating_add(n);
     if after > size {
         return Err(Over::Pool);

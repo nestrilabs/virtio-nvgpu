@@ -410,7 +410,10 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // Whatever the guest never took is off the VM's queue budget.
         let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
-        self.cfg.limits.queue.give(self.cfg.owner, st.to_guest_bytes);
+        self.cfg
+            .limits
+            .queue
+            .give(self.cfg.owner, st.to_guest_bytes);
     }
 }
 
@@ -698,7 +701,10 @@ impl WlConn {
             true,
         );
         let left: usize = st.to_guest.iter().map(|u| u.bytes()).sum();
-        s.cfg.limits.queue.give(s.cfg.owner, st.to_guest_bytes - left);
+        s.cfg
+            .limits
+            .queue
+            .give(s.cfg.owner, st.to_guest_bytes - left);
         st.to_guest_bytes = left;
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
@@ -1101,7 +1107,10 @@ mod budget_tests {
         assert_eq!(q.held_by(a), 128);
         // Another process still queues, down to the last quarter...
         assert!(q.take(b, 64));
-        assert!(!q.take(b, 64), "the last quarter is not for one holding a quarter");
+        assert!(
+            !q.take(b, 64),
+            "the last quarter is not for one holding a quarter"
+        );
         // ...which is kept for a process that holds little.
         let c = Owner::Proc {
             tgid: 3,

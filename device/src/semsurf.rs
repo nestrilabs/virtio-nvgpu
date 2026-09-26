@@ -455,7 +455,9 @@ impl SemsurfPolicy {
             );
             return Err(libc::ENOSPC);
         }
-        log::debug!("SEMSURF_FENCE_CTX_CREATE on handle {target}: {mine} in the file, {all} in the session before this one");
+        log::debug!(
+            "SEMSURF_FENCE_CTX_CREATE on handle {target}: {mine} in the file, {all} in the session before this one"
+        );
         Ok(())
     }
 
@@ -1936,9 +1938,15 @@ mod backend_tests {
 
         FREE_STATUS.with(|s| s.set(NV_ERR_INVALID_OBJECT_HANDLE));
         // Refused by RM, from the other file: nothing is forgotten.
-        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, 0x5e6), &[])), 0);
+        assert_eq!(
+            status(&v1(&mut be, other, FREE, &free(CLIENT, 0x5e6), &[])),
+            0
+        );
         assert_eq!(grants(&be), 1, "an object RM did not free takes no grants");
-        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert_eq!(
+            status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])),
+            0
+        );
         assert!(be.semsurf.owns_client(CLIENT), "a client RM did not free");
         assert!(be.semsurf.os_event_live(CLIENT, ctl));
         let r = v1(&mut be, other, FREE_OS_EVENT, &os_event(CLIENT, ctl), &[]);
@@ -1952,15 +1960,24 @@ mod backend_tests {
         let r = v1(&mut be, ctl, FREE_OS_EVENT, &os_event(CLIENT, ctl), &[]);
         assert_eq!(status(&r), 0);
         assert!(!be.semsurf.os_event_live(CLIENT, ctl));
-        assert_eq!(status(&v1(&mut be, ctl, FREE, &free(CLIENT, 0x5e6), &[])), 0);
+        assert_eq!(
+            status(&v1(&mut be, ctl, FREE, &free(CLIENT, 0x5e6), &[])),
+            0
+        );
         assert_eq!(grants(&be), 0);
-        assert_eq!(status(&v1(&mut be, ctl, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert_eq!(
+            status(&v1(&mut be, ctl, FREE, &free(CLIENT, CLIENT), &[])),
+            0
+        );
         assert!(!be.semsurf.owns_client(CLIENT));
 
         // And from any file once RM says it freed it.
         FREE_STATUS.with(|s| s.set(0));
         alloc_client(&mut be, ctl);
-        assert_eq!(status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])), 0);
+        assert_eq!(
+            status(&v1(&mut be, other, FREE, &free(CLIENT, CLIENT), &[])),
+            0
+        );
         assert!(!be.semsurf.owns_client(CLIENT));
     }
 

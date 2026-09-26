@@ -8,13 +8,15 @@ use std::rc::Rc;
 
 use nvgpu_guest_core::guest::i2::{self, State};
 use nvgpu_guest_core::guest::schema::{
-    SField, SchemaSet, SCLASS_MODESET, SF_ARRAY, SF_FD_IN, SF_GEM_IN, SF_PTR, SFF_COND, SLEN_CONST, SLEN_COUNT,
-    SLEN_NVKMS_PARAMS, SLEN_PLANES,
+    SField, SchemaSet, SCLASS_MODESET, SFF_COND, SF_ARRAY, SF_FD_IN, SF_GEM_IN, SF_PTR, SLEN_CONST,
+    SLEN_COUNT, SLEN_NVKMS_PARAMS, SLEN_PLANES,
 };
 use nvgpu_guest_core::guest::{dispatch, rm};
 
 use crate::cabi;
-use crate::renv::{self, Dev, I2Env, RStore, BCAP_DEEP_SEGS, BCAP_OS_DESC, BCAP_PROC_EUID, BCAP_PROC_ID};
+use crate::renv::{
+    self, Dev, I2Env, RStore, BCAP_DEEP_SEGS, BCAP_OS_DESC, BCAP_PROC_EUID, BCAP_PROC_ID,
+};
 use crate::world::{Ev, Hooks, Rng, World};
 
 /// The device a scenario runs on.
@@ -41,7 +43,13 @@ pub enum Call {
     /// `nvgpu_ioctl_modeset()` (a v1 backend's NVKMS command).
     Modeset { cmd: u32, arg: u64 },
     /// `nvgpu_i2_ioctl()`.
-    I2 { sclass: u32, cmd: u32, uarg: u64, render: u32, xflags: u32 },
+    I2 {
+        sclass: u32,
+        cmd: u32,
+        uarg: u64,
+        render: u32,
+        xflags: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +80,16 @@ impl CDevice {
         let nr: Vec<u32> = d.fdt.iter().map(|x| x.0).collect();
         let pl: Vec<u32> = d.fdt.iter().map(|x| x.1).collect();
         let dev = unsafe {
-            cabi::harness_dev(v.as_ptr(), d.v2, d.caps, d.max_req, d.max_resp, nr.as_ptr(), pl.as_ptr(), nr.len() as u32)
+            cabi::harness_dev(
+                v.as_ptr(),
+                d.v2,
+                d.caps,
+                d.max_req,
+                d.max_resp,
+                nr.as_ptr(),
+                pl.as_ptr(),
+                nr.len() as u32,
+            )
         };
         if d.bad_schema {
             unsafe { cabi::harness_dev_bad_schema(dev) };
@@ -82,7 +99,14 @@ impl CDevice {
     }
 
     fn rdev(&self, d: &DevSpec) -> Dev {
-        Dev { dev: self.dev, v2: d.v2, caps: d.caps, version: d.version.clone(), fdt: d.fdt.clone(), handle: d.handle }
+        Dev {
+            dev: self.dev,
+            v2: d.v2,
+            caps: d.caps,
+            version: d.version.clone(),
+            fdt: d.fdt.clone(),
+            handle: d.handle,
+        }
     }
 }
 
@@ -103,25 +127,50 @@ pub fn run_rust(s: &Scenario) -> Outcome {
     match s.call {
         Call::Fd { cmd, arg } => {
             let ret = dispatch::ioctl_fd(&mut renv::RmEnv { w: &mut w, d: &d }, cmd, arg);
-            Outcome { ret: i64::from(ret), call_ret: None, world: w }
+            Outcome {
+                ret: i64::from(ret),
+                call_ret: None,
+                world: w,
+            }
         }
         Call::Uvm { cmd, arg } => {
             let ret = dispatch::uvm_ioctl(&mut renv::RmEnv { w: &mut w, d: &d }, cmd, arg);
-            Outcome { ret: i64::from(ret), call_ret: None, world: w }
+            Outcome {
+                ret: i64::from(ret),
+                call_ret: None,
+                world: w,
+            }
         }
         Call::Modeset { cmd, arg } => {
             let ret = rm::modeset_v1(&mut renv::RmEnv { w: &mut w, d: &d }, cmd, arg);
-            Outcome { ret: i64::from(ret), call_ret: None, world: w }
+            Outcome {
+                ret: i64::from(ret),
+                call_ret: None,
+                world: w,
+            }
         }
-        Call::I2 { sclass, cmd, uarg, render, xflags } => {
+        Call::I2 {
+            sclass,
+            cmd,
+            uarg,
+            render,
+            xflags,
+        } => {
             if !s.dev.v2 {
-                return Outcome { ret: -95, call_ret: Some(0), world: w };
+                return Outcome {
+                    ret: -95,
+                    call_ret: Some(0),
+                    world: w,
+                };
             }
             let set = renv::tables(&d);
             let compat = w.compat;
             let shared = Rc::new(RefCell::new(w));
             let mut st = Box::new(State::new(RStore::new(shared.clone())));
-            let mut env = I2Env { w: shared.clone(), render };
+            let mut env = I2Env {
+                w: shared.clone(),
+                render,
+            };
             let args = i2::Args {
                 sclass,
                 cmd,
@@ -137,8 +186,14 @@ pub fn run_rust(s: &Scenario) -> Outcome {
             let call_ret = st.ret;
             drop(st);
             drop(env);
-            let w = Rc::try_unwrap(shared).expect("world still shared").into_inner();
-            Outcome { ret: i64::from(ret), call_ret: Some(call_ret), world: w }
+            let w = Rc::try_unwrap(shared)
+                .expect("world still shared")
+                .into_inner();
+            Outcome {
+                ret: i64::from(ret),
+                call_ret: Some(call_ret),
+                world: w,
+            }
         }
     }
 }
@@ -149,24 +204,62 @@ pub fn run_c(s: &Scenario, world: World) -> Outcome {
     let cd = CDevice::new(&s.dev);
     match s.call {
         Call::Fd { cmd, arg } => {
-            let (ret, w) = cabi::in_world(world, || unsafe { cabi::nvgpu_ioctl_fd(cd.nfd, cmd, arg) });
-            Outcome { ret, call_ret: None, world: w }
+            let (ret, w) =
+                cabi::in_world(world, || unsafe { cabi::nvgpu_ioctl_fd(cd.nfd, cmd, arg) });
+            Outcome {
+                ret,
+                call_ret: None,
+                world: w,
+            }
         }
         Call::Uvm { cmd, arg } => {
-            let (ret, w) = cabi::in_world(world, || unsafe { cabi::nvgpu_uvm_ioctl_fd(cd.nfd, cmd, arg) });
-            Outcome { ret, call_ret: None, world: w }
+            let (ret, w) = cabi::in_world(world, || unsafe {
+                cabi::nvgpu_uvm_ioctl_fd(cd.nfd, cmd, arg)
+            });
+            Outcome {
+                ret,
+                call_ret: None,
+                world: w,
+            }
         }
         Call::Modeset { cmd, arg } => {
-            let (ret, w) = cabi::in_world(world, || unsafe { cabi::nvgpu_ioctl_modeset(cd.nfd, cmd, arg) });
-            Outcome { ret, call_ret: None, world: w }
+            let (ret, w) = cabi::in_world(world, || unsafe {
+                cabi::nvgpu_ioctl_modeset(cd.nfd, cmd, arg)
+            });
+            Outcome {
+                ret,
+                call_ret: None,
+                world: w,
+            }
         }
-        Call::I2 { sclass, cmd, uarg, render, xflags } => {
+        Call::I2 {
+            sclass,
+            cmd,
+            uarg,
+            render,
+            xflags,
+        } => {
             let mask = world.hooks.mask;
             let mut call_ret = 0i32;
             let (ret, w) = cabi::in_world(world, || unsafe {
-                cabi::harness_i2(cd.dev, sclass, cmd, uarg, s.dev.handle, render, xflags, false, mask, &mut call_ret)
+                cabi::harness_i2(
+                    cd.dev,
+                    sclass,
+                    cmd,
+                    uarg,
+                    s.dev.handle,
+                    render,
+                    xflags,
+                    false,
+                    mask,
+                    &mut call_ret,
+                )
             });
-            Outcome { ret, call_ret: Some(call_ret), world: w }
+            Outcome {
+                ret,
+                call_ret: Some(call_ret),
+                world: w,
+            }
         }
     }
 }
@@ -186,7 +279,10 @@ pub fn diff(s: &Scenario) -> Result<Outcome, String> {
     cw.shape = r.world.shape.clone();
     let c = run_c(s, cw);
     if c.world.canary {
-        return Err(format!("seed {:#x}: the C wrote past the end of an allocation", s.seed));
+        return Err(format!(
+            "seed {:#x}: the C wrote past the end of an allocation",
+            s.seed
+        ));
     }
     if intended(s, &c, &r).is_some() {
         return Ok(r);
@@ -196,10 +292,19 @@ pub fn diff(s: &Scenario) -> Result<Outcome, String> {
         why.push(format!("returned C {} Rust {}", c.ret, r.ret));
     }
     if c.call_ret != r.call_ret {
-        why.push(format!("call->ret C {:?} Rust {:?}", c.call_ret, r.call_ret));
+        why.push(format!(
+            "call->ret C {:?} Rust {:?}",
+            c.call_ret, r.call_ret
+        ));
     }
     if c.world.events != r.world.events {
-        let i = c.world.events.iter().zip(&r.world.events).take_while(|(a, b)| a == b).count();
+        let i = c
+            .world
+            .events
+            .iter()
+            .zip(&r.world.events)
+            .take_while(|(a, b)| a == b)
+            .count();
         why.push(format!(
             "events differ at {} of {}/{}:\n  C    {:?}\n  Rust {:?}",
             i,
@@ -210,21 +315,39 @@ pub fn diff(s: &Scenario) -> Result<Outcome, String> {
         ));
     }
     if c.world.mem != r.world.mem {
-        for (a, (x, y)) in c.world.mem.iter().zip(r.world.mem.values()).map(|((a, x), y)| (a, (x, y))) {
+        for (a, (x, y)) in c
+            .world
+            .mem
+            .iter()
+            .zip(r.world.mem.values())
+            .map(|((a, x), y)| (a, (x, y)))
+        {
             if x != y {
                 let j = x.iter().zip(y).take_while(|(p, q)| p == q).count();
-                why.push(format!("memory at {a:#x}+{j} differs: C {:?} Rust {:?}", &x[j..(j + 8).min(x.len())], &y[j..(j + 8).min(y.len())]));
+                why.push(format!(
+                    "memory at {a:#x}+{j} differs: C {:?} Rust {:?}",
+                    &x[j..(j + 8).min(x.len())],
+                    &y[j..(j + 8).min(y.len())]
+                ));
                 break;
             }
         }
     }
     if std::env::var_os("DIFFTEST_VERBOSE").is_some() {
-        why.push(format!("\n  C ret {} events {:#?}\n  Rust ret {} events {:#?}", c.ret, c.world.events, r.ret, r.world.events));
+        why.push(format!(
+            "\n  C ret {} events {:#?}\n  Rust ret {} events {:#?}",
+            c.ret, c.world.events, r.ret, r.world.events
+        ));
     }
     if why.is_empty() {
         Ok(r)
     } else {
-        Err(format!("seed {:#x} {:?}: {}", s.seed, s.call, why.join("; ")))
+        Err(format!(
+            "seed {:#x} {:?}: {}",
+            s.seed,
+            s.call,
+            why.join("; ")
+        ))
     }
 }
 
@@ -238,7 +361,10 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(world: World) -> Layout {
-        Layout { next: 0x7f00_0000_0000, world }
+        Layout {
+            next: 0x7f00_0000_0000,
+            world,
+        }
     }
 
     /// A region of `bytes`, somewhere; its address.
@@ -288,7 +414,16 @@ pub const FDS: [(i32, u32); 5] = [(3, 101), (4, 102), (7, 103), (10, 200), (12, 
 
 /// A device and a world, from `r`.
 pub fn base(r: &mut Rng, seed: u64) -> (DevSpec, World) {
-    let version = r.pick(&["610.57.04", "595.71.05", "580.178.04", "535.129.03", "615.71.09", "banana"]).to_string();
+    let version = r
+        .pick(&[
+            "610.57.04",
+            "595.71.05",
+            "580.178.04",
+            "535.129.03",
+            "615.71.09",
+            "banana",
+        ])
+        .to_string();
     let mut caps = 0;
     for b in [BCAP_DEEP_SEGS, BCAP_PROC_ID, BCAP_OS_DESC, BCAP_PROC_EUID] {
         if r.chance(3, 4) {
@@ -327,9 +462,21 @@ pub fn base(r: &mut Rng, seed: u64) -> (DevSpec, World) {
         chaos: r.pick(&[0, 0, 1, 2, 4, 8]),
         pin_fails: r.chance(1, 10),
         pin_seed: r.next(),
-        clock: if r.chance(3, 4) { Some(r.below(1 << 40) as i64 - (1 << 39)) } else { None },
+        clock: if r.chance(3, 4) {
+            Some(r.below(1 << 40) as i64 - (1 << 39))
+        } else {
+            None
+        },
         compat: r.chance(1, 10),
-        hooks: Hooks { mask: if r.chance(4, 5) { 0x3f } else { r.below(64) as u32 }, seed: r.next(), fail_gem: None },
+        hooks: Hooks {
+            mask: if r.chance(4, 5) {
+                0x3f
+            } else {
+                r.below(64) as u32
+            },
+            seed: r.next(),
+            fail_gem: None,
+        },
         ..World::default()
     };
     world.proc_id.copy_from_slice(&r.bytes(16));
@@ -338,7 +485,19 @@ pub fn base(r: &mut Rng, seed: u64) -> (DevSpec, World) {
 }
 
 fn some_fd(r: &mut Rng) -> i64 {
-    r.pick(&[3i64, 4, 7, 10, -1, -2, -5, 99, 0, 1000, i64::from(i32::MAX) + 5])
+    r.pick(&[
+        3i64,
+        4,
+        7,
+        10,
+        -1,
+        -2,
+        -5,
+        99,
+        0,
+        1000,
+        i64::from(i32::MAX) + 5,
+    ])
 }
 
 /// An RM escape, UVM command or v1 NVKMS command.
@@ -358,7 +517,11 @@ pub fn gen_rm_from(mut r: Rng, seed: u64) -> Scenario {
         7 => gen_vid_heap(&mut r, &mut m),
         8 => {
             // UVM.
-            let cmd = if r.chance(1, 2) { 1 + r.below(0x50) as u32 } else { r.next() as u32 };
+            let cmd = if r.chance(1, 2) {
+                1 + r.below(0x50) as u32
+            } else {
+                r.next() as u32
+            };
             let mut b = r.bytes(128);
             for o in [0usize, 4, 8, 12, 60] {
                 if r.chance(1, 3) {
@@ -379,10 +542,17 @@ pub fn gen_rm_from(mut r: Rng, seed: u64) -> Scenario {
             let mut nested = r.bytes(size.min(4096) as usize);
             put(&mut nested, 4, 4, r.below(3));
             put(&mut nested, 16, 4, some_fd(&mut r) as u64);
-            let p = if r.chance(1, 8) { 0 } else { m.put(&mut r, nested) };
+            let p = if r.chance(1, 8) {
+                0
+            } else {
+                m.put(&mut r, nested)
+            };
             put(&mut outer, 8, 8, p);
             let arg = m.put(&mut r, outer);
-            Call::Modeset { cmd: ioc(3, 0x6d, 0, r.pick(&[16, 16, 8])), arg }
+            Call::Modeset {
+                cmd: ioc(3, 0x6d, 0, r.pick(&[16, 16, 8])),
+                arg,
+            }
         }
         _ => {
             // Anything else: flat, or a descriptor at a fixed offset.
@@ -396,27 +566,55 @@ pub fn gen_rm_from(mut r: Rng, seed: u64) -> Scenario {
                     put(&mut b, o, 4, some_fd(&mut r) as u64);
                 }
             }
-            let arg = if r.chance(1, 10) { m.hole() } else { m.put(&mut r, b) };
-            Call::Fd { cmd: ioc(r.pick(&[3, 1, 2, 0]), ty, nr, size), arg }
+            let arg = if r.chance(1, 10) {
+                m.hole()
+            } else {
+                m.put(&mut r, b)
+            };
+            Call::Fd {
+                cmd: ioc(r.pick(&[3, 1, 2, 0]), ty, nr, size),
+                arg,
+            }
         }
     };
-    Scenario { seed, dev, world: m.world, call }
+    Scenario {
+        seed,
+        dev,
+        world: m.world,
+        call,
+    }
 }
 
 /// RM controls with something to say about their parameters.
 const CONTROLS: &[u32] = &[
     0x0000_0101, // GET_BUILD_VERSION
     0x2080_0406, // TIME_CORRELATION
-    0x0000_3d05, 0x0000_3d06, 0x0000_3d08, 0x0000_3d0a, 0x0000_3d0b, 0x0000_3d0c, // OS_UNIX
-    0x00da_0003, 0x00da_0005, // semaphore surface waiters
-    0x0080_170d, 0x0000_0127, // deep segments
-    0x0080_1102, 0x2080_0101, 0x0000_0202, 0x2080_0803, 0xa0bc_0101, // V1V2 table
+    0x0000_3d05,
+    0x0000_3d06,
+    0x0000_3d08,
+    0x0000_3d0a,
+    0x0000_3d0b,
+    0x0000_3d0c, // OS_UNIX
+    0x00da_0003,
+    0x00da_0005, // semaphore surface waiters
+    0x0080_170d,
+    0x0000_0127, // deep segments
+    0x0080_1102,
+    0x2080_0101,
+    0x0000_0202,
+    0x2080_0803,
+    0xa0bc_0101, // V1V2 table
     0x0041_0110, // deep-only
-    0x2080_0110, 0x0000_0000,
+    0x2080_0110,
+    0x0000_0000,
 ];
 
 fn gen_control(r: &mut Rng, m: &mut Layout) -> Call {
-    let ctl = if r.chance(9, 10) { r.pick(CONTROLS) } else { r.next() as u32 };
+    let ctl = if r.chance(9, 10) {
+        r.pick(CONTROLS)
+    } else {
+        r.next() as u32
+    };
     let size = match ctl {
         0x0000_0101 => 40,
         0x2080_0406 => 8 + 16 * 16,
@@ -442,7 +640,11 @@ fn gen_control(r: &mut Rng, m: &mut Layout) -> Call {
             n[0] = r.pick(&[0x01u8, 0x02, 0x03, 0x11, 0x13, 0x0f]);
             n[1] = r.pick(&[0u8, 1, 2, 16, 17, 255]);
             for i in 0..16 {
-                let v = if r.chance(1, 4) { r.below(1000) } else { r.below(1 << 50) };
+                let v = if r.chance(1, 4) {
+                    r.below(1000)
+                } else {
+                    r.below(1 << 50)
+                };
                 put(&mut n, 8 + i * 16, 8, v);
             }
         }
@@ -459,7 +661,12 @@ fn gen_control(r: &mut Rng, m: &mut Layout) -> Call {
                 n.resize(32, 0);
             }
             for o in [16usize, 24] {
-                put(&mut n, o, 8, r.pick(&[0u64, 3, 4, 99, 1 << 40, 0x7fff_ffff, 0x8000_0000]));
+                put(
+                    &mut n,
+                    o,
+                    8,
+                    r.pick(&[0u64, 3, 4, 99, 1 << 40, 0x7fff_ffff, 0x8000_0000]),
+                );
             }
         }
         0x0080_170d => {
@@ -500,11 +707,20 @@ fn gen_control(r: &mut Rng, m: &mut Layout) -> Call {
         2 => (1 << 20) + 1,
         _ => size,
     };
-    let np = if r.chance(1, 12) { 0 } else if r.chance(1, 12) { m.hole() } else { m.put(r, n) };
+    let np = if r.chance(1, 12) {
+        0
+    } else if r.chance(1, 12) {
+        m.hole()
+    } else {
+        m.put(r, n)
+    };
     put(&mut p, 16, 8, np);
     put(&mut p, 24, 4, nsize as u64);
     let arg = m.put(r, p);
-    Call::Fd { cmd: ioc(3, b'F', 0x2a, r.pick(&[32, 32, 32, 16, 48])), arg }
+    Call::Fd {
+        cmd: ioc(3, b'F', 0x2a, r.pick(&[32, 32, 32, 16, 48])),
+        arg,
+    }
 }
 
 fn gen_alloc(r: &mut Rng, m: &mut Layout) -> Call {
@@ -524,7 +740,12 @@ fn gen_alloc(r: &mut Rng, m: &mut Layout) -> Call {
             put(&mut n, 32, 4, r.pick(&[0u64, 0, 1]));
             let va = r.pick(&[0x1000u64, 0x7000_1234, 0, u64::MAX - 0x100]);
             put(&mut n, 16, 8, va);
-            put(&mut n, 24, 8, r.pick(&[0u64, 0xfff, 0x5000, u64::MAX - 1, u64::MAX]));
+            put(
+                &mut n,
+                24,
+                8,
+                r.pick(&[0u64, 0xfff, 0x5000, u64::MAX - 1, u64::MAX]),
+            );
         }
         _ => {}
     }
@@ -533,9 +754,17 @@ fn gen_alloc(r: &mut Rng, m: &mut Layout) -> Call {
     put(&mut p, 12, 4, u64::from(class));
     let np = if r.chance(1, 10) { 0 } else { m.put(r, n) };
     put(&mut p, 16, 8, np);
-    put(&mut p, 32, 4, r.pick(&[0u64, size as u64, 40, 3, (1 << 20) + 5]));
+    put(
+        &mut p,
+        32,
+        4,
+        r.pick(&[0u64, size as u64, 40, 3, (1 << 20) + 5]),
+    );
     let arg = m.put(r, p);
-    Call::Fd { cmd: ioc(3, b'F', 0x2b, r.pick(&[48, 48, 48, 44, 64])), arg }
+    Call::Fd {
+        cmd: ioc(3, b'F', 0x2b, r.pick(&[48, 48, 48, 44, 64])),
+        arg,
+    }
 }
 
 fn gen_idle(r: &mut Rng, m: &mut Layout) -> Call {
@@ -548,7 +777,10 @@ fn gen_idle(r: &mut Rng, m: &mut Layout) -> Call {
         put(&mut p, o, 8, q);
     }
     let arg = m.put(r, p);
-    Call::Fd { cmd: ioc(3, b'F', 0x41, r.pick(&[56, 56, 48])), arg }
+    Call::Fd {
+        cmd: ioc(3, b'F', 0x41, r.pick(&[56, 56, 48])),
+        arg,
+    }
 }
 
 fn osdesc_range(r: &mut Rng, m: &mut Layout) -> (u64, u64) {
@@ -586,7 +818,10 @@ fn gen_alloc_memory(r: &mut Rng, m: &mut Layout) -> Call {
     put(&mut p, 32, 8, limit);
     put(&mut p, 48, 4, some_fd(r) as u64);
     let arg = m.put(r, p);
-    Call::Fd { cmd: ioc(3, b'F', 0x27, r.pick(&[56, 56, 48])), arg }
+    Call::Fd {
+        cmd: ioc(3, b'F', 0x27, r.pick(&[56, 56, 48])),
+        arg,
+    }
 }
 
 fn gen_vid_heap(r: &mut Rng, m: &mut Layout) -> Call {
@@ -598,7 +833,10 @@ fn gen_vid_heap(r: &mut Rng, m: &mut Layout) -> Call {
     put(&mut p, 72, 8, limit);
     put(&mut p, 80, 4, if r.chance(4, 5) { 0 } else { 2 });
     let arg = m.put(r, p);
-    Call::Fd { cmd: ioc(3, b'F', 0x4a, r.pick(&[184, 184, 180])), arg }
+    Call::Fd {
+        cmd: ioc(3, b'F', 0x4a, r.pick(&[184, 184, 180])),
+        arg,
+    }
 }
 
 /// An IOCTL2 call, laid out by the schema: pointers to buffers of the
@@ -619,7 +857,11 @@ pub fn gen_i2_from(mut r: Rng, seed: u64) -> Scenario {
     let mut m = Layout::new(world);
 
     let modeset = set.modeset.is_some() && r.chance(1, 3);
-    let t = if modeset { set.modeset.unwrap() } else { set.drm };
+    let t = if modeset {
+        set.modeset.unwrap()
+    } else {
+        set.drm
+    };
     let e = t.ioctls[r.below(t.ioctls.len() as u64) as usize];
     let mut cmd = e.cmd;
     let mut sclass = u32::from(e.sclass);
@@ -638,46 +880,126 @@ pub fn gen_i2_from(mut r: Rng, seed: u64) -> Scenario {
         }
     }
     if modeset && sclass == SCLASS_MODESET {
-        put(&mut arg, 0, 4, u64::from(if r.chance(9, 10) { e.nvkms_cmd } else { r.below(40) as u32 }));
+        put(
+            &mut arg,
+            0,
+            4,
+            u64::from(if r.chance(9, 10) {
+                e.nvkms_cmd
+            } else {
+                r.below(40) as u32
+            }),
+        );
     }
-    fill(&mut r, &mut m, &set, modeset, &mut arg, 0, e.field, e.nfield, 0);
-    let uarg = if r.chance(1, 30) { m.hole() } else { m.put(&mut r, arg) };
-    let render = if r.chance(1, 2) { dev.handle } else { dev.handle + 1 };
+    fill(
+        &mut r, &mut m, &set, modeset, &mut arg, 0, e.field, e.nfield, 0,
+    );
+    let uarg = if r.chance(1, 30) {
+        m.hole()
+    } else {
+        m.put(&mut r, arg)
+    };
+    let render = if r.chance(1, 2) {
+        dev.handle
+    } else {
+        dev.handle + 1
+    };
     let xflags = r.below(2) as u32;
-    Scenario { seed, dev, world: m.world, call: Call::I2 { sclass, cmd, uarg, render, xflags } }
+    Scenario {
+        seed,
+        dev,
+        world: m.world,
+        call: Call::I2 {
+            sclass,
+            cmd,
+            uarg,
+            render,
+            xflags,
+        },
+    }
 }
 
 /// Lay out the fields `first..first + n` of the struct at `base` in `b`.
 #[allow(clippy::too_many_arguments)]
-fn fill(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool, b: &mut [u8], base: usize, first: u16, n: u16, depth: u32) {
-    let t = if modeset { set.modeset.unwrap() } else { set.drm };
+fn fill(
+    r: &mut Rng,
+    m: &mut Layout,
+    set: &SchemaSet<'static>,
+    modeset: bool,
+    b: &mut [u8],
+    base: usize,
+    first: u16,
+    n: u16,
+    depth: u32,
+) {
+    let t = if modeset {
+        set.modeset.unwrap()
+    } else {
+        set.drm
+    };
     if depth > 5 {
         return;
     }
     for i in 0..n as usize {
-        let Some(f) = t.fields.get(first as usize + i).copied() else { return };
+        let Some(f) = t.fields.get(first as usize + i).copied() else {
+            return;
+        };
         let at = base + f.off as usize;
         if f.flags & SFF_COND != 0 {
-            let v = if r.chance(2, 3) { f.cond_value } else { r.next() as u32 & f.cond_mask };
-            let cur = b.get(base + f.cond_off as usize..base + f.cond_off as usize + 4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()));
-            put(b, base + f.cond_off as usize, 4, u64::from((cur & !f.cond_mask) | v));
+            let v = if r.chance(2, 3) {
+                f.cond_value
+            } else {
+                r.next() as u32 & f.cond_mask
+            };
+            let cur = b
+                .get(base + f.cond_off as usize..base + f.cond_off as usize + 4)
+                .map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()));
+            put(
+                b,
+                base + f.cond_off as usize,
+                4,
+                u64::from((cur & !f.cond_mask) | v),
+            );
         }
         match f.kind {
             SF_PTR => fill_ptr(r, m, set, modeset, b, base, &f, depth),
             SF_ARRAY => {
                 let mut ne = f.count as u64;
                 if f.len_kind == SLEN_COUNT {
-                    ne = if r.chance(1, 4) { u64::from(f.count) + r.below(3) } else { r.below(u64::from(f.count) + 1) };
+                    ne = if r.chance(1, 4) {
+                        u64::from(f.count) + r.below(3)
+                    } else {
+                        r.below(u64::from(f.count) + 1)
+                    };
                     put(b, base + f.len_a as usize, f.len_width as usize, ne);
                 } else if f.len_kind == SLEN_PLANES {
-                    put(b, base + f.len_a as usize, 4, r.below(t.planes.len() as u64 + 2));
+                    put(
+                        b,
+                        base + f.len_a as usize,
+                        4,
+                        r.below(t.planes.len() as u64 + 2),
+                    );
                 }
                 for e in 0..ne.min(u64::from(f.count)) {
-                    fill(r, m, set, modeset, b, at + (e as usize) * f.stride as usize, f.child, f.nchild, depth + 1);
+                    fill(
+                        r,
+                        m,
+                        set,
+                        modeset,
+                        b,
+                        at + (e as usize) * f.stride as usize,
+                        f.child,
+                        f.nchild,
+                        depth + 1,
+                    );
                 }
             }
             SF_FD_IN => {
-                let v = if r.chance(1, 4) { i64::from(f.none_value) } else { some_fd(r) };
+                let v = if r.chance(1, 4) {
+                    i64::from(f.none_value)
+                } else {
+                    some_fd(r)
+                };
                 put(b, at, f.width as usize, v as u64);
             }
             SF_GEM_IN => put(b, at, 4, r.pick(&[0u64, 1, 2, 3, 14, 22, 33])),
@@ -687,7 +1009,16 @@ fn fill(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool, b:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fill_ptr(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool, b: &mut [u8], base: usize, f: &SField, depth: u32) {
+fn fill_ptr(
+    r: &mut Rng,
+    m: &mut Layout,
+    set: &SchemaSet<'static>,
+    modeset: bool,
+    b: &mut [u8],
+    base: usize,
+    f: &SField,
+    depth: u32,
+) {
     let at = base + f.off as usize;
     let len: u64 = match f.len_kind {
         SLEN_CONST => u64::from(f.len_a),
@@ -705,7 +1036,11 @@ fn fill_ptr(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool
             n.saturating_mul(u64::from(f.len_elem))
         }
         SLEN_NVKMS_PARAMS => {
-            let n = if r.chance(9, 10) { u64::from(f.max) } else { r.below(u64::from(f.max) + 16) };
+            let n = if r.chance(9, 10) {
+                u64::from(f.max)
+            } else {
+                r.below(u64::from(f.max) + 16)
+            };
             put(b, base + 4, 4, n);
             n
         }
@@ -726,7 +1061,17 @@ fn fill_ptr(r: &mut Rng, m: &mut Layout, set: &SchemaSet<'static>, modeset: bool
     }
     if f.nchild != 0 && f.stride != 0 {
         for e in 0..(len / u64::from(f.stride)).min(8) {
-            fill(r, m, set, modeset, &mut child, (e * u64::from(f.stride)) as usize, f.child, f.nchild, depth + 1);
+            fill(
+                r,
+                m,
+                set,
+                modeset,
+                &mut child,
+                (e * u64::from(f.stride)) as usize,
+                f.child,
+                f.nchild,
+                depth + 1,
+            );
         }
     }
     let p = match r.below(16) {
@@ -777,7 +1122,11 @@ pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
     let mut cps = Vec::new();
     for _ in 0..count {
         let any = r.below(1 << 20) as u32;
-        let obj = if big { r.pick(&[1u32, 2, 4, 5]) } else { r.pick(&[1u32, 2, 3, 4, 5, 6, 9, 12, 13, 0xdead, any]) };
+        let obj = if big {
+            r.pick(&[1u32, 2, 4, 5])
+        } else {
+            r.pick(&[1u32, 2, 3, 4, 5, 6, 9, 12, 13, 0xdead, any])
+        };
         objs.extend_from_slice(&obj.to_le_bytes());
         let n = match r.below(12) {
             _ if big => 1 + r.below(8) as u32,
@@ -787,12 +1136,19 @@ pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
         };
         cps.extend_from_slice(&n.to_le_bytes());
     }
-    let sum: u64 = cps.chunks(4).map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap()))).sum();
+    let sum: u64 = cps
+        .chunks(4)
+        .map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap())))
+        .sum();
     let mut props = Vec::new();
     let mut vals = Vec::new();
     for _ in 0..sum.min(4096) {
         let any = r.below(1000) as u32;
-        let id = if big { r.pick(&[1u32, 5, 9, 2, 4, 8]) } else { r.pick(&[1u32, 2, 3, 4, 5, 6, 7, 8, 21, 32, any]) };
+        let id = if big {
+            r.pick(&[1u32, 5, 9, 2, 4, 8])
+        } else {
+            r.pick(&[1u32, 2, 3, 4, 5, 6, 7, 8, 21, 32, any])
+        };
         props.extend_from_slice(&id.to_le_bytes());
         let v: u64 = match r.below(9) {
             0 => 0,
@@ -811,7 +1167,12 @@ pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
     let flags = r.pick(&[0u32, 1, 0x100, 0x101, 0x201, 0x200]);
     put(&mut a, 0, 4, u64::from(flags));
     let wrong = r.chance(1, 12);
-    put(&mut a, 4, 4, u64::from(if wrong { count + 1 } else { count }));
+    put(
+        &mut a,
+        4,
+        4,
+        u64::from(if wrong { count + 1 } else { count }),
+    );
     let ptr = |r: &mut Rng, m: &mut Layout, b: Vec<u8>| -> u64 {
         match r.below(20) {
             0 => 0,
@@ -833,6 +1194,12 @@ pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
         seed,
         dev,
         world: m.world,
-        call: Call::I2 { sclass: 2, cmd: 0xc038_64bc, uarg, render: 5, xflags: 0 },
+        call: Call::I2 {
+            sclass: 2,
+            cmd: 0xc038_64bc,
+            uarg,
+            render: 5,
+            xflags: 0,
+        },
     }
 }

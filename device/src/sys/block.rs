@@ -785,7 +785,11 @@ mod tests {
         assert_eq!(a.write(top, 12, &[0; 8]), Err(libc::EINVAL));
         assert_eq!(a.write(top, 23, &[0]), Err(libc::EINVAL));
         assert_eq!(a.write(top, 24, &[0; 8]), Ok(()));
-        assert_eq!(a.write(top, 28, &[0; 8]), Err(libc::EINVAL), "past the block");
+        assert_eq!(
+            a.write(top, 28, &[0; 8]),
+            Err(libc::EINVAL),
+            "past the block"
+        );
         // Nor can a slot be declared twice, or over another.
         assert!(a.ptr(top, 16).is_err());
         assert!(a.value(top, 20, 4, Restore::No).is_err());

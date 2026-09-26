@@ -9,7 +9,8 @@ use crate::world::{hash, Ev, Rng, World};
 const HDR: usize = 16;
 
 fn le32(b: &[u8], off: usize) -> u32 {
-    b.get(off..off + 4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()))
+    b.get(off..off + 4)
+        .map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()))
 }
 
 fn put32(b: &mut Vec<u8>, v: u32) {
@@ -96,7 +97,11 @@ fn ioctl_reply(w: &mut World, rng: &mut Rng, req: &[u8]) -> Vec<u8> {
     // RM_CONTROL / RM_ALLOC report RM's own status in the block.
     if data_len >= 32 && rng.chance(3, 4) {
         let at = if data_len == 48 { 40 } else { 28 };
-        let st: u32 = if rng.chance(4, 5) { 0 } else { rng.pick(&[0x1e, 0x56, 0x1f]) };
+        let st: u32 = if rng.chance(4, 5) {
+            0
+        } else {
+            rng.pick(&[0x1e, 0x56, 0x1f])
+        };
         data[at..at + 4].copy_from_slice(&st.to_le_bytes());
     }
     for b in [&mut data, &mut nested, &mut deep] {
@@ -150,7 +155,11 @@ fn i2_reply(w: &mut World, rng: &mut Rng, _req: &[u8]) -> Vec<u8> {
     let chaos = w.chaos;
     let odd = |rng: &mut Rng| chaos > 0 && rng.chance(chaos, 40);
 
-    let ret: i32 = if rng.chance(3, 4) { 0 } else { rng.pick(&[-22, -2, -13, -4096]) };
+    let ret: i32 = if rng.chance(3, 4) {
+        0
+    } else {
+        rng.pick(&[-22, -2, -13, -4096])
+    };
     let mut data = Vec::new();
     for &(len, dir) in &shape.bufs {
         if dir & 2 == 0 {
@@ -159,7 +168,11 @@ fn i2_reply(w: &mut World, rng: &mut Rng, _req: &[u8]) -> Vec<u8> {
         // Counts the host writes back are mostly small: word by word.
         let mut b = Vec::with_capacity(len as usize + 4);
         while b.len() < len as usize {
-            let w: u32 = if rng.chance(3, 4) { rng.below(6) as u32 } else { rng.next() as u32 };
+            let w: u32 = if rng.chance(3, 4) {
+                rng.below(6) as u32
+            } else {
+                rng.next() as u32
+            };
             b.extend_from_slice(&w.to_le_bytes());
         }
         b.truncate(len as usize);
@@ -169,14 +182,22 @@ fn i2_reply(w: &mut World, rng: &mut Rng, _req: &[u8]) -> Vec<u8> {
     let mut fds = Vec::new();
     for &(buf, off) in &shape.fd_out {
         if rng.chance(2, 3) {
-            let h = if rng.chance(1, 8) { 0 } else { 1 + rng.below(40) as u32 };
+            let h = if rng.chance(1, 8) {
+                0
+            } else {
+                1 + rng.below(40) as u32
+            };
             fds.push((buf, off, h, rng.pick(&[1u32, 2, 5, 6])));
         }
     }
     let mut gems = Vec::new();
     for &(buf, off) in &shape.gem_out {
         if rng.chance(2, 3) {
-            let h = if rng.chance(1, 10) { 0 } else { 1 + rng.below(4) as u32 };
+            let h = if rng.chance(1, 10) {
+                0
+            } else {
+                1 + rng.below(4) as u32
+            };
             gems.push((buf, off, h, rng.below(1 << 20)));
         }
     }

@@ -96,8 +96,7 @@ pub fn dumpable() -> i32 {
 /// PR_SET_DUMPABLE.
 pub fn set_dumpable(on: bool) -> io::Result<()> {
     // SAFETY: integer arguments.
-    cvt(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, libc::c_ulong::from(on), 0, 0, 0) })
-        .map(|_| ())
+    cvt(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, libc::c_ulong::from(on), 0, 0, 0) }).map(|_| ())
 }
 
 /// PR_GET_NO_NEW_PRIVS.

@@ -53,7 +53,11 @@ pub fn deep_segments(b: &mut Bytes) {
         return;
     };
     match deepseg::Segments::relocate("fuzz", c.ptrs, &mut a, blk, deep) {
-        Err(_) => assert_eq!(a.bytes(blk), &block[..], "a refused relocation changed the block"),
+        Err(_) => assert_eq!(
+            a.bytes(blk),
+            &block[..],
+            "a refused relocation changed the block"
+        ),
         Ok(segs) => {
             // The segments as the guest laid them out, read independently,
             // and read through the pointers as RM would (`Follow`).
@@ -84,7 +88,11 @@ pub fn deep_segments(b: &mut Bytes) {
                 let follow = Follow(expect);
                 assert!(a.call(&follow, -1, 0, blk) >= 0, "a segment not mapped");
             }
-            assert_eq!(a.reply(blk), block, "the reply gives the caller's block back");
+            assert_eq!(
+                a.reply(blk),
+                block,
+                "the reply gives the caller's block back"
+            );
             assert_eq!(
                 segs.reply(&a),
                 deep,
@@ -259,7 +267,11 @@ pub fn pointer_scrub(b: &mut Bytes) {
             if plan.declare(&mut a, top, &|_| None).is_ok() {
                 let mut want = params.clone();
                 for &(off, s) in &plan.slots {
-                    assert_eq!(rd64(a.bytes(top), off), 0, "escape {cmd:#x}: {off} left for RM");
+                    assert_eq!(
+                        rd64(a.bytes(top), off),
+                        0,
+                        "escape {cmd:#x}: {off} left for RM"
+                    );
                     // An OUT address is the host's answer, and the host
                     // here wrote nothing.
                     if s == guestptr::TopSlot::Out {
@@ -286,7 +298,11 @@ pub fn pointer_scrub(b: &mut Bytes) {
             );
         }
     }
-    assert_eq!(a.reply(nb), nested, "the caller reads its own pointers back");
+    assert_eq!(
+        a.reply(nb),
+        nested,
+        "the caller reads its own pointers back"
+    );
     let init_mask = b.u64();
     let _ = guestptr::uvm_gate(ctl & 1 != 0, cmd, &nested, init_mask);
 }

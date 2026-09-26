@@ -20,8 +20,14 @@ mod tests {
 
     #[derive(Debug)]
     enum Ev {
-        Map { id: u32, length: u64, zone: PgprotKind },
-        Unmap { id: u32 },
+        Map {
+            id: u32,
+            length: u64,
+            zone: PgprotKind,
+        },
+        Unmap {
+            id: u32,
+        },
     }
 
     struct Workload {
@@ -39,7 +45,10 @@ mod tests {
             }
             let f: Vec<&str> = line.split('\t').collect();
             match f[0] {
-                "W" => out.push(Workload { name: f[1].to_string(), events: Vec::new() }),
+                "W" => out.push(Workload {
+                    name: f[1].to_string(),
+                    events: Vec::new(),
+                }),
                 "M" => {
                     let zone = match f[3] {
                         "uc" => PgprotKind::Uncached,
@@ -64,11 +73,7 @@ mod tests {
 
     /// Run one workload's map/unmap sequence. Returns the regions still live at
     /// the end -- a process that exits without unmapping is the normal case.
-    fn run(
-        shm: &mut ShmAllocator,
-        w: &Workload,
-        iteration: usize,
-    ) -> Vec<ShmRegion> {
+    fn run(shm: &mut ShmAllocator, w: &Workload, iteration: usize) -> Vec<ShmRegion> {
         let mut live: HashMap<u32, ShmRegion> = HashMap::new();
         for ev in &w.events {
             match ev {
@@ -98,7 +103,11 @@ mod tests {
     #[test]
     fn fixture_parses_into_three_workloads() {
         let w = workloads();
-        assert_eq!(w.len(), 3, "expected vulkaninfo, cuda-kernel and nvenc-h264");
+        assert_eq!(
+            w.len(),
+            3,
+            "expected vulkaninfo, cuda-kernel and nvenc-h264"
+        );
         assert!(w.iter().all(|w| !w.events.is_empty()));
     }
 
@@ -154,7 +163,11 @@ mod tests {
                 shm.free(&region).expect("teardown free");
             }
         }
-        assert_eq!(before, shm.free_bytes(), "zones did not return to their initial free size");
+        assert_eq!(
+            before,
+            shm.free_bytes(),
+            "zones did not return to their initial free size"
+        );
     }
 
     /// Fragmentation check: repeated cycles must not whittle down the largest

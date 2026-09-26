@@ -214,9 +214,8 @@ const HIGH: u64 = 1 << 32;
 /// `host::ram_word` of their own guest-physical address.
 pub fn guest_ram() -> GuestRam {
     use crate::sys::mem::Mapping;
-    let file = std::fs::File::from(
-        crate::sys::fd::memfd(c"fuzz-guest-ram", libc::MFD_CLOEXEC).unwrap(),
-    );
+    let file =
+        std::fs::File::from(crate::sys::fd::memfd(c"fuzz-guest-ram", libc::MFD_CLOEXEC).unwrap());
     let len = ((LOW_PAGES + HIGH_PAGES) * 4096) as usize;
     file.set_len(len as u64).unwrap();
     let base = Mapping::shared(&file, len, 0, true).unwrap();

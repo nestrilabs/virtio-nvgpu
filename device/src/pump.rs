@@ -988,7 +988,11 @@ mod tests {
         assert_eq!(whole_events(&s, 64), Some(64));
         assert_eq!(whole_events(&s, 63), Some(32));
         assert_eq!(whole_events(&s, 31), Some(0));
-        assert_eq!(whole_events(&s[..40], 64), Some(32), "a partial tail is left");
+        assert_eq!(
+            whole_events(&s[..40], 64),
+            Some(32),
+            "a partial tail is left"
+        );
         let mut short = drm_event(1, 8);
         short[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert_eq!(whole_events(&short, 64), None);

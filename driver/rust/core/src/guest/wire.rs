@@ -227,7 +227,10 @@ impl IoctlResp {
         }
         let status = le32(resp, 8)? as i32;
         if !has(used, 0, IOCTL_RESP_LEN) {
-            return Some(IoctlResp { status, ..IoctlResp::default() });
+            return Some(IoctlResp {
+                status,
+                ..IoctlResp::default()
+            });
         }
         Some(IoctlResp {
             status,
@@ -246,7 +249,11 @@ pub fn has(used: usize, off: usize, len: usize) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::unwrap_used)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 

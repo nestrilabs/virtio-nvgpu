@@ -60,7 +60,12 @@ pub fn gem_in(w: &mut World, buf: u32, off: u32, guest: u32) -> (i32, u32, u32) 
 }
 
 pub fn fd_out(w: &mut World, buf: u32, off: u32, handle: u32, kind: u32) -> (i32, i64) {
-    w.events.push(Ev::Hook(Hook::FdOut { buf, off, handle, kind }));
+    w.events.push(Ev::Hook(Hook::FdOut {
+        buf,
+        off,
+        handle,
+        kind,
+    }));
     let mut r = rng(w, &[3, u64::from(handle), u64::from(kind)]);
     if r.chance(1, 10) {
         return (-24, -1);
@@ -69,7 +74,12 @@ pub fn fd_out(w: &mut World, buf: u32, off: u32, handle: u32, kind: u32) -> (i32
 }
 
 pub fn gem_out(w: &mut World, buf: u32, off: u32, gem: u32, size: u64) -> (i32, u32) {
-    w.events.push(Ev::Hook(Hook::GemOut { buf, off, gem, size }));
+    w.events.push(Ev::Hook(Hook::GemOut {
+        buf,
+        off,
+        gem,
+        size,
+    }));
     let mut r = rng(w, &[4, u64::from(gem)]);
     if w.hooks.fail_gem == Some(gem) {
         return (-12, 0);
@@ -87,7 +97,8 @@ pub fn special(w: &mut World, c: &mut dyn CallBufs, id: u32, phase: i32) -> i32 
     w.events.push(Ev::Hook(Hook::Special { id, phase }));
     if let (Some(fences), 1, 0) = (w.atomic, id, phase) {
         let (r, commit, values_buf) = c.atomic(w, fences);
-        w.events.push(Ev::Hook(Hook::AtomicOut { commit, values_buf }));
+        w.events
+            .push(Ev::Hook(Hook::AtomicOut { commit, values_buf }));
         return r;
     }
     let mut r = rng(w, &[5, u64::from(id), phase as u64]);
@@ -103,7 +114,12 @@ pub fn special(w: &mut World, c: &mut dyn CallBufs, id: u32, phase: i32) -> i32 
         if r.chance(1, 2) {
             let buf = r.below(3) as u32;
             let off = (r.below(u64::from(len) + 4) as u32) & !3;
-            let x = c.add_fd(buf, off, 4242, if r.chance(1, 2) { I2_FD_CONSUME } else { 0 });
+            let x = c.add_fd(
+                buf,
+                off,
+                4242,
+                if r.chance(1, 2) { I2_FD_CONSUME } else { 0 },
+            );
             if x != 0 && r.chance(1, 2) {
                 return x;
             }
@@ -168,13 +184,27 @@ pub fn a_prop(w: &mut World, id: u32) -> i32 {
 /// a record for one of ours, -EBADF otherwise. `commit` is what the parse
 /// had said about the commit when the hook ran (nvgpu_atomic_parse()'s
 /// `out->commit`, `atomic::Env::begin`), which the kernel's hook acts on.
-pub fn a_in_fence(w: &mut World, c: &mut dyn CallBufs, buf: u32, off: u32, fd: i64, commit: bool) -> i32 {
-    w.events.push(Ev::Hook(Hook::AInFence { buf, off, fd, commit }));
+pub fn a_in_fence(
+    w: &mut World,
+    c: &mut dyn CallBufs,
+    buf: u32,
+    off: u32,
+    fd: i64,
+    commit: bool,
+) -> i32 {
+    w.events.push(Ev::Hook(Hook::AInFence {
+        buf,
+        off,
+        fd,
+        commit,
+    }));
     if fd < 0 || fd > i64::from(i32::MAX) {
         return -EINVAL;
     }
     if fd == 4 {
-        let Some(vals) = c.buf(buf) else { return -EINVAL };
+        let Some(vals) = c.buf(buf) else {
+            return -EINVAL;
+        };
         let off = off as usize;
         if off > vals.len() || vals.len() - off < 8 {
             return -EINVAL;

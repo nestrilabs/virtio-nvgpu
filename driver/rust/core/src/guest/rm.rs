@@ -17,8 +17,9 @@
 
 use super::deep::{self, UserMem};
 use super::wire::{
-    has, ioctl_req_header, le32, le64, put32, put64, sum, Errno, FillFrom, IoctlResp, DEEP_SEGMENTED, EBADF,
-    EFAULT, EINVAL, EIO, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX, IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
+    has, ioctl_req_header, le32, le64, put32, put64, sum, Errno, FillFrom, IoctlResp,
+    DEEP_SEGMENTED, EBADF, EFAULT, EINVAL, EIO, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX,
+    IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
 };
 
 /// NV_IOCTL_MAGIC, the type byte of every RM escape.
@@ -207,7 +208,10 @@ pub trait Env: UserMem {
 /// GET_SURFACE_INFO: `{u32 surfaceInfoListSize, pad, NvP64 surfaceInfoList}`,
 /// entries of eight bytes.
 pub fn deep_only(cmd: u32) -> Option<V1V2> {
-    (cmd == 0x0041_0110).then_some(V1V2 { v1_userptr_offset: 8, info_style: true })
+    (cmd == 0x0041_0110).then_some(V1V2 {
+        v1_userptr_offset: 8,
+        info_style: true,
+    })
 }
 
 fn ioc_type(cmd: u32) -> u32 {
@@ -237,7 +241,11 @@ fn part_ref(buf: &[u8], at: usize, len: usize) -> Result<&[u8], Errno> {
 
 /// Send `req` and read the reply's header; -EIO for a reply shorter than a
 /// header, as every path here has it.
-fn round_trip<E: Env + ?Sized>(env: &mut E, req: &[u8], resp: &mut [u8]) -> Result<(IoctlResp, usize), Errno> {
+fn round_trip<E: Env + ?Sized>(
+    env: &mut E,
+    req: &[u8],
+    resp: &mut [u8],
+) -> Result<(IoctlResp, usize), Errno> {
     let used = env.send_recv(req, resp)?;
     let h = IoctlResp::parse(resp, used).ok_or(-EIO)?;
     Ok((h, used as usize))
@@ -265,17 +273,31 @@ pub fn simple_bytes<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, data: &[u
     }
 }
 
-fn simple_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, data: &[u8]) -> Result<i32, Errno> {
+fn simple_inner<E: Env + ?Sized>(
+    env: &mut E,
+    cmd: u32,
+    uarg: u64,
+    data: &[u8],
+) -> Result<i32, Errno> {
     let sz = data.len();
     // RM_DUP_OBJECT carries the calling process after the struct.
-    let proc = ioc_type(cmd) == RM_IOCTL_TYPE && ioc_nr(cmd) == ESC_RM_DUP_OBJECT && env.caps().proc_ids;
+    let proc =
+        ioc_type(cmd) == RM_IOCTL_TYPE && ioc_nr(cmd) == ESC_RM_DUP_OBJECT && env.caps().proc_ids;
     let req_total = sum(&[IOCTL_REQ_LEN, sz, if proc { PROC_ID_LEN } else { 0 }]);
     let resp_max = sum(&[IOCTL_RESP_LEN, sz]);
     let mut req = alloc(env, req_total)?;
     let mut resp = alloc(env, resp_max)?;
     {
         let r = req.as_mut();
-        part(r, 0, IOCTL_REQ_LEN)?.fill_from(&ioctl_req_header(env.handle(), cmd, sz as u32, 0, 0, 0, 0));
+        part(r, 0, IOCTL_REQ_LEN)?.fill_from(&ioctl_req_header(
+            env.handle(),
+            cmd,
+            sz as u32,
+            0,
+            0,
+            0,
+            0,
+        ));
         part(r, IOCTL_REQ_LEN, sz)?.fill_from(data);
         if proc {
             let id = env.proc_id();
@@ -309,7 +331,13 @@ impl<T: UserMem + ?Sized> CopyOut for T {}
 /// descriptor becomes the backend's handle for that file on the way out
 /// (-1 passes as it is, any other negative is refused), and comes back on
 /// every reply that carries the struct.
-pub fn translate_fd<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, payload_offset: u32) -> i32 {
+pub fn translate_fd<E: Env + ?Sized>(
+    env: &mut E,
+    cmd: u32,
+    uarg: u64,
+    sz: u32,
+    payload_offset: u32,
+) -> i32 {
     match translate_fd_inner(env, cmd, uarg, sz, payload_offset, None) {
         Ok(r) | Err(r) => r,
     }
@@ -317,8 +345,21 @@ pub fn translate_fd<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, 
 
 /// [`translate_fd`] for an argument already copied in (`data`, `_IOC_SIZE`
 /// bytes), which is what is sent.
-pub fn translate_fd_bytes<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, data: &[u8], payload_offset: u32) -> i32 {
-    match translate_fd_inner(env, cmd, uarg, data.len() as u32, payload_offset, Some(data)) {
+pub fn translate_fd_bytes<E: Env + ?Sized>(
+    env: &mut E,
+    cmd: u32,
+    uarg: u64,
+    data: &[u8],
+    payload_offset: u32,
+) -> i32 {
+    match translate_fd_inner(
+        env,
+        cmd,
+        uarg,
+        data.len() as u32,
+        payload_offset,
+        Some(data),
+    ) {
         Ok(r) | Err(r) => r,
     }
 }
@@ -356,7 +397,15 @@ fn translate_fd_inner<E: Env + ?Sized>(
             let handle = env.handle_for_fd(guest_fd)?;
             put32(r, sum(&[IOCTL_REQ_LEN, po]), handle);
         }
-        part(r, 0, IOCTL_REQ_LEN)?.fill_from(&ioctl_req_header(env.handle(), cmd, sz as u32, 0, 0, 0, 0));
+        part(r, 0, IOCTL_REQ_LEN)?.fill_from(&ioctl_req_header(
+            env.handle(),
+            cmd,
+            sz as u32,
+            0,
+            0,
+            0,
+            0,
+        ));
     }
     let (h, used) = round_trip(env, req.as_ref(), resp.as_mut())?;
     let mut ret = h.status;
@@ -378,9 +427,10 @@ fn unix_fd_offset(ctl: u32) -> Option<usize> {
     match ctl {
         RM_EXPORT_OBJECT_TO_FD => Some(16),
         RM_CREATE_EXPORT_OBJECT_FD => Some(72),
-        RM_IMPORT_OBJECT_FROM_FD | RM_GET_EXPORT_OBJECT_INFO | RM_EXPORT_OBJECTS_TO_FD | RM_IMPORT_OBJECTS_FROM_FD => {
-            Some(0)
-        }
+        RM_IMPORT_OBJECT_FROM_FD
+        | RM_GET_EXPORT_OBJECT_INFO
+        | RM_EXPORT_OBJECTS_TO_FD
+        | RM_IMPORT_OBJECTS_FROM_FD => Some(0),
         _ => None,
     }
 }
@@ -413,7 +463,10 @@ fn os_event_in<E: Env + ?Sized>(env: &mut E, slot: &mut [u8]) -> Result<u64, (Er
 
 /// `nvgpu_set_nvos54_status()`: RM's status in the caller's NVOS54.
 fn set_status<E: Env + ?Sized>(env: &mut E, uarg: u64, status: u32) -> i32 {
-    match env.copy_to_user(uarg.wrapping_add(NVOS54_STATUS as u64), &status.to_le_bytes()) {
+    match env.copy_to_user(
+        uarg.wrapping_add(NVOS54_STATUS as u64),
+        &status.to_le_bytes(),
+    ) {
         Ok(()) => 0,
         Err(_) => -EFAULT,
     }
@@ -422,7 +475,12 @@ fn set_status<E: Env + ?Sized>(env: &mut E, uarg: u64, status: u32) -> i32 {
 /// `nvgpu_intercept_get_build_version()`: SYSTEM_GET_BUILD_VERSION, whose
 /// three string pointers the backend cannot follow, answered here from the
 /// host's version string.
-fn get_build_version<E: Env + ?Sized>(env: &mut E, uarg: u64, user_nested: u64, nested_size: u32) -> i32 {
+fn get_build_version<E: Env + ?Sized>(
+    env: &mut E,
+    uarg: u64,
+    user_nested: u64,
+    nested_size: u32,
+) -> i32 {
     const V1_TOTAL: usize = 40;
     if user_nested == 0 || (nested_size as usize) < V1_TOTAL {
         return -EINVAL;
@@ -432,7 +490,11 @@ fn get_build_version<E: Env + ?Sized>(env: &mut E, uarg: u64, user_nested: u64, 
         return -EFAULT;
     }
     let size_of_strings = le32(&v1, 0).unwrap_or(0);
-    let ptrs = [le64(&v1, 8).unwrap_or(0), le64(&v1, 16).unwrap_or(0), le64(&v1, 24).unwrap_or(0)];
+    let ptrs = [
+        le64(&v1, 8).unwrap_or(0),
+        le64(&v1, 16).unwrap_or(0),
+        le64(&v1, 24).unwrap_or(0),
+    ];
 
     let mut ver = [0u8; 33];
     let dv = env.driver_version();
@@ -479,7 +541,11 @@ fn rebase_time_correlation<E: Env + ?Sized>(env: &mut E, p: &mut [u8]) {
         return;
     }
     let id = p.get(TCI_CLK_ID).copied().unwrap_or(0);
-    let mut n = p.get(TCI_SAMPLE_COUNT).copied().unwrap_or(0).min(TCI_MAX_SAMPLES);
+    let mut n = p
+        .get(TCI_SAMPLE_COUNT)
+        .copied()
+        .unwrap_or(0)
+        .min(TCI_MAX_SAMPLES);
     if (id >> 4) & 0xf != TCI_PROC_CPU {
         return;
     }
@@ -510,7 +576,12 @@ pub fn rm_control<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) ->
     }
 }
 
-fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) -> Result<i32, Errno> {
+fn rm_control_inner<E: Env + ?Sized>(
+    env: &mut E,
+    cmd: u32,
+    uarg: u64,
+    sz: u32,
+) -> Result<i32, Errno> {
     if (sz as usize) < NVOS54_SIZE {
         return Err(-EINVAL);
     }
@@ -555,13 +626,21 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
 
     // A second-level pointer, carried rather than rewritten: where it sits
     // and how much it addresses.
-    let mut rw = if has_nested { env.v1v2(ctl_cmd).or_else(|| deep_only(ctl_cmd)) } else { None };
+    let mut rw = if has_nested {
+        env.v1v2(ctl_cmd).or_else(|| deep_only(ctl_cmd))
+    } else {
+        None
+    };
     let mut deep_user_ptr: u64 = 0;
     let mut deep_ptr_offset: u32 = 0;
     let mut deep_len: u32 = 0;
 
     // Or several, as deep segments.
-    let ctl_deep = if has_nested && env.caps().deep_segs { env.deep_control(ctl_cmd) } else { None };
+    let ctl_deep = if has_nested && env.caps().deep_segs {
+        env.deep_control(ctl_cmd)
+    } else {
+        None
+    };
     let mut plan = deep::Plan::default();
     if let Some(ctl) = ctl_deep {
         rw = None;
@@ -580,7 +659,11 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
             // eight bytes for the list-style commands, plain bytes for the
             // caps tables. NvU32 arithmetic, as the C has it.
             // Past u32, too large: no deep block, below.
-            deep_len = if rw.info_style { count.saturating_mul(8) } else { count };
+            deep_len = if rw.info_style {
+                count.saturating_mul(8)
+            } else {
+                count
+            };
             deep_ptr_offset = rw.v1_userptr_offset;
             if deep_user_ptr == 0 || deep_len == 0 || deep_len > DEEP_MAX {
                 deep_user_ptr = 0;
@@ -593,7 +676,13 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
     // The calling process after the blocks.
     let proc = env.caps().proc_euid;
     let dl = deep_len as usize;
-    let req_total = sum(&[IOCTL_REQ_LEN, NVOS54_SIZE, nz, dl, if proc { PROC_ID_LEN } else { 0 }]);
+    let req_total = sum(&[
+        IOCTL_REQ_LEN,
+        NVOS54_SIZE,
+        nz,
+        dl,
+        if proc { PROC_ID_LEN } else { 0 },
+    ]);
     let resp_max = sum(&[IOCTL_RESP_LEN, NVOS54_SIZE, nz, dl]);
     let mut req = alloc(env, req_total)?;
     let mut resp = alloc(env, resp_max)?;
@@ -679,7 +768,8 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
         return Ok(ret);
     }
     let r = resp.as_mut();
-    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVOS54_SIZE)?).map_err(|_| -EFAULT)?;
+    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVOS54_SIZE)?)
+        .map_err(|_| -EFAULT)?;
 
     let rn = IOCTL_RESP_LEN + NVOS54_SIZE;
     if user_nested != 0 && h.nested_len > 0 {
@@ -712,7 +802,9 @@ fn rm_control_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32) 
         }
     } else if deep_len > 0 && h.deep_len > 0 {
         let copy_back = dl.min(h.deep_len as usize);
-        if has(used, at, copy_back) && env.copy_to_user_failed(deep_user_ptr, part_ref(r, at, copy_back)?) {
+        if has(used, at, copy_back)
+            && env.copy_to_user_failed(deep_user_ptr, part_ref(r, at, copy_back)?)
+        {
             ret = -EFAULT;
         }
     }
@@ -734,7 +826,10 @@ pub fn idle_channels<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32)
     let flags = le32(&params, IDLE_CHANNELS_FLAGS).unwrap_or(0);
     let mask = (1u32 << (IDLE_CHANNELS_LIST_HI - IDLE_CHANNELS_LIST_LO + 1)) - 1;
     let channel = (flags >> IDLE_CHANNELS_LIST_LO) & mask;
-    let count_at = rule.ptrs.first().map_or(0, |p| usize::from(p.counts[0].offset));
+    let count_at = rule
+        .ptrs
+        .first()
+        .map_or(0, |p| usize::from(p.counts[0].offset));
     let count = le32(&params, count_at).unwrap_or(0);
     // The block already read is the one sent, whichever way it goes.
     if channel != IDLE_CHANNELS_LIST || count == 0 || count > IDLE_CHANNELS_MAX {
@@ -772,7 +867,11 @@ fn idle_channels_segmented<E: Env + ?Sized>(
         ));
         part(r, IOCTL_REQ_LEN, IDLE_CHANNELS_SIZE)?.fill_from(params);
     }
-    deep::fill(plan, env, part(req.as_mut(), IOCTL_REQ_LEN + IDLE_CHANNELS_SIZE, bytes)?)?;
+    deep::fill(
+        plan,
+        env,
+        part(req.as_mut(), IOCTL_REQ_LEN + IDLE_CHANNELS_SIZE, bytes)?,
+    )?;
     let (h, used) = round_trip(env, req.as_ref(), resp.as_mut())?;
     let mut ret = h.status;
     // RM only reads the arrays: the block, with RM's status, is all that
@@ -804,7 +903,13 @@ pub fn rm_alloc_bytes<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, data: &
     }
 }
 
-fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, data: Option<&[u8]>) -> Result<i32, Errno> {
+fn rm_alloc_inner<E: Env + ?Sized>(
+    env: &mut E,
+    cmd: u32,
+    uarg: u64,
+    sz: u32,
+    data: Option<&[u8]>,
+) -> Result<i32, Errno> {
     if (sz as usize) < NVOS64_SIZE {
         return Err(-EINVAL);
     }
@@ -836,7 +941,12 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
     }
     let nz = nested_size as usize;
     let proc = env.caps().proc_ids;
-    let req_total = sum(&[IOCTL_REQ_LEN, NVOS64_SIZE, nz, if proc { PROC_ID_LEN } else { 0 }]);
+    let req_total = sum(&[
+        IOCTL_REQ_LEN,
+        NVOS64_SIZE,
+        nz,
+        if proc { PROC_ID_LEN } else { 0 },
+    ]);
     let resp_max = sum(&[IOCTL_RESP_LEN, NVOS64_SIZE, nz]);
     let mut req = alloc(env, req_total)?;
     let mut resp = alloc(env, resp_max)?;
@@ -868,7 +978,8 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
         // An event object names the file the event is delivered on inside
         // these parameters: NV0005_ALLOC_PARAMETERS.data at 16, swapped for
         // the backend's handle for that file.
-        if (hclass == CLASS_EVENT || hclass == CLASS_EVENT_OS_EVENT) && nz >= NV0005_DATA_OFFSET + 4 {
+        if (hclass == CLASS_EVENT || hclass == CLASS_EVENT_OS_EVENT) && nz >= NV0005_DATA_OFFSET + 4
+        {
             event_fd = le32(r, at + NV0005_DATA_OFFSET).unwrap_or(0) as i32;
             // -1 is "no descriptor"; any other negative is refused.
             if event_fd < -1 {
@@ -880,7 +991,10 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
                         put32(r, at + NV0005_DATA_OFFSET, h);
                     }
                     Err(_) => {
-                        env.warn(Warn::AllocEventFd { class: hclass, fd: event_fd });
+                        env.warn(Warn::AllocEventFd {
+                            class: hclass,
+                            fd: event_fd,
+                        });
                         return Err(-EBADF);
                     }
                 }
@@ -909,7 +1023,8 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
     if caller_psize != 0 {
         put32(r, IOCTL_RESP_LEN + 32, caller_psize);
     }
-    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVOS64_SIZE)?).map_err(|_| -EFAULT)?;
+    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVOS64_SIZE)?)
+        .map_err(|_| -EFAULT)?;
 
     if user_alloc != 0 && h.nested_len > 0 {
         let copy_back = nz.min(h.nested_len as usize);
@@ -925,7 +1040,9 @@ fn rm_alloc_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, sz: u32, da
         if event_fd >= 0 && copy_back >= NV0005_DATA_OFFSET + 4 {
             put32(r, rn + NV0005_DATA_OFFSET, event_fd as u32);
         }
-        if has(used, rn, copy_back) && env.copy_to_user_failed(user_alloc, part_ref(r, rn, copy_back)?) {
+        if has(used, rn, copy_back)
+            && env.copy_to_user_failed(user_alloc, part_ref(r, rn, copy_back)?)
+        {
             ret = -EFAULT;
         }
     }
@@ -1002,11 +1119,14 @@ fn modeset_v1_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64) -> Result
         return Ok(ret);
     }
     let r = resp.as_ref();
-    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVKMS_OUTER_SIZE)?).map_err(|_| -EFAULT)?;
+    env.copy_to_user(uarg, part_ref(r, IOCTL_RESP_LEN, NVKMS_OUTER_SIZE)?)
+        .map_err(|_| -EFAULT)?;
     if user_nested != 0 && h.nested_len > 0 {
         let copy_back = nz.min(h.nested_len as usize);
         let rn = IOCTL_RESP_LEN + NVKMS_OUTER_SIZE;
-        if has(used, rn, copy_back) && env.copy_to_user_failed(user_nested, part_ref(r, rn, copy_back)?) {
+        if has(used, rn, copy_back)
+            && env.copy_to_user_failed(user_nested, part_ref(r, rn, copy_back)?)
+        {
             ret = -EFAULT;
         }
     }

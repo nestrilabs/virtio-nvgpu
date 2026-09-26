@@ -213,11 +213,7 @@ impl Probe {
 
     /// Read events until `callback.done`, handing each to `f` with the
     /// descriptors it carries.
-    fn until_done(
-        &mut self,
-        callback: u32,
-        f: &mut OnEvent<'_>,
-    ) -> io::Result<()> {
+    fn until_done(&mut self, callback: u32, f: &mut OnEvent<'_>) -> io::Result<()> {
         let deadline = Instant::now() + TIMEOUT;
         let mut chunk = vec![0u8; 16 * 1024];
         loop {
@@ -259,7 +255,9 @@ impl Probe {
                         Some(Val::Str(Some(m))) => String::from_utf8_lossy(m).into_owned(),
                         _ => String::new(),
                     };
-                    return Err(io::Error::other(format!("the compositor refused the probe: {what}")));
+                    return Err(io::Error::other(format!(
+                        "the compositor refused the probe: {what}"
+                    )));
                 }
                 f(h.object, h.opcode, &args, fds);
             }
@@ -404,7 +402,10 @@ mod tests {
                         (o, 0) if o == registry => word(size - 4),
                         _ => panic!("unexpected request {obj}/{opc}"),
                     };
-                    assert!(id <= next, "new id {id} skips past {next}: libwayland disconnects");
+                    assert!(
+                        id <= next,
+                        "new id {id} skips past {next}: libwayland disconnects"
+                    );
                     next = next.max(id + 1);
                     let out = match (obj, opc) {
                         (1, 1) => {
@@ -415,8 +416,13 @@ mod tests {
                             let mut m = Vec::new();
                             if devices.is_empty() && registry != 0 {
                                 for name in [7, 9] {
-                                    m.extend(MsgBuilder::new(registry, 0).uint(name)
-                                        .string(Some("wp_drm_lease_device_v1")).uint(1).finish());
+                                    m.extend(
+                                        MsgBuilder::new(registry, 0)
+                                            .uint(name)
+                                            .string(Some("wp_drm_lease_device_v1"))
+                                            .uint(1)
+                                            .finish(),
+                                    );
                                 }
                             }
                             m.extend(MsgBuilder::new(id, 0).uint(0).finish());
@@ -451,4 +457,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

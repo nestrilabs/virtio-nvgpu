@@ -226,10 +226,13 @@ impl RecvOps for TableRecv<'_> {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
         }
-        let h = self.handles.insert_for(fd, kind, self.owner).map_err(|full| {
-            log::warn!("wayland: handle table full; a {kind:?} from the compositor is dropped");
-            io::Error::from_raw_os_error(full.errno())
-        })?;
+        let h = self
+            .handles
+            .insert_for(fd, kind, self.owner)
+            .map_err(|full| {
+                log::warn!("wayland: handle table full; a {kind:?} from the compositor is dropped");
+                io::Error::from_raw_os_error(full.errno())
+            })?;
         self.created.push(h);
         Ok((h, kind.wire()))
     }

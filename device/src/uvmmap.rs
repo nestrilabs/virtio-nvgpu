@@ -96,8 +96,10 @@ pub const BYTES_SHARE: crate::quota::Share = crate::quota::Share {
     reserve: 32 << 20,
     floor: 8 << 20,
 };
-pub const RANGES_SHARE: crate::quota::Share = crate::quota::Share::quarter(RANGES_PER_VM as u64, 16);
-pub const POOL_BYTES_SHARE: crate::quota::Share = crate::quota::Share::quarter(POOL_BYTES_PER_VM, 8 << 20);
+pub const RANGES_SHARE: crate::quota::Share =
+    crate::quota::Share::quarter(RANGES_PER_VM as u64, 16);
+pub const POOL_BYTES_SHARE: crate::quota::Share =
+    crate::quota::Share::quarter(POOL_BYTES_PER_VM, 8 << 20);
 
 /// UVM_ALLOC_SEMAPHORE_POOL and UVM_FREE (uvm_ioctl.h).
 pub const ALLOC_SEMAPHORE_POOL: u32 = 68;
@@ -195,11 +197,14 @@ impl UvmMaps {
     /// then, whether or not it is ever mapped (F1). The errno on refusal.
     pub fn admit_pool(&self, handle: u32, len: u64) -> Result<(), i32> {
         if len == 0 || len > MAX_LEN {
-            log::warn!("uvm: a {len:#x}-byte pool on handle {handle} refused (at most {MAX_LEN:#x})");
+            log::warn!(
+                "uvm: a {len:#x}-byte pool on handle {handle} refused (at most {MAX_LEN:#x})"
+            );
             return Err(libc::EINVAL);
         }
         let owner = self.owner(handle);
-        let (mut file_n, mut file_b, mut own_n, mut own_b, mut vm_b) = (0usize, 0u64, 0u64, 0u64, 0u64);
+        let (mut file_n, mut file_b, mut own_n, mut own_b, mut vm_b) =
+            (0usize, 0u64, 0u64, 0u64, 0u64);
         for (&(h, _), r) in &self.ranges {
             vm_b += r.len;
             if h == handle {
@@ -214,8 +219,24 @@ impl UvmMaps {
         let vm_n = self.ranges.len();
         if file_n >= RANGES_PER_FILE
             || file_b + len > POOL_BYTES_PER_FILE
-            || admits(&RANGES_SHARE, owner, own_n, 1, vm_n as u64, RANGES_PER_VM as u64).is_err()
-            || admits(&POOL_BYTES_SHARE, owner, own_b, len, vm_b, POOL_BYTES_PER_VM).is_err()
+            || admits(
+                &RANGES_SHARE,
+                owner,
+                own_n,
+                1,
+                vm_n as u64,
+                RANGES_PER_VM as u64,
+            )
+            .is_err()
+            || admits(
+                &POOL_BYTES_SHARE,
+                owner,
+                own_b,
+                len,
+                vm_b,
+                POOL_BYTES_PER_VM,
+            )
+            .is_err()
         {
             log::warn!(
                 "uvm: a {len:#x}-byte pool on handle {handle} refused: the file has {file_n} \
@@ -304,7 +325,9 @@ impl UvmMaps {
             .iter()
             .any(|(&(_, b), o)| o.placed.is_some() && b < end && base < b.saturating_add(o.len));
         if clash {
-            log::debug!("uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it");
+            log::debug!(
+                "uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it"
+            );
             return Err(libc::ENOMEM);
         }
         let owner = self.owner(handle);
@@ -328,7 +351,15 @@ impl UvmMaps {
             || vm_n >= MAPS_PER_VM
             || file_b + len > BYTES_PER_FILE
             || vm_b + len > BYTES_PER_VM
-            || admits(&MAPS_SHARE, owner, own_n, 1, vm_n as u64, MAPS_PER_VM as u64).is_err()
+            || admits(
+                &MAPS_SHARE,
+                owner,
+                own_n,
+                1,
+                vm_n as u64,
+                MAPS_PER_VM as u64,
+            )
+            .is_err()
             || admits(&BYTES_SHARE, owner, own_b, len, vm_b, BYTES_PER_VM).is_err()
         {
             log::warn!(
@@ -558,7 +589,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
     fn recorded_ranges_are_bounded_per_file_and_per_vm() {
         let mut m = maps(APERTURE_MAX);
@@ -780,8 +810,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(placed as usize, MAPS_PER_FILE, "one process's share, over four files");
+        assert_eq!(
+            placed as usize, MAPS_PER_FILE,
+            "one process's share, over four files"
+        );
         m.record(9, X, MB2);
-        assert!(matches!(m.plan_mmap(9, X, MB2, 3), Ok(MmapPlan::New { .. })));
+        assert!(matches!(
+            m.plan_mmap(9, X, MB2, 3),
+            Ok(MmapPlan::New { .. })
+        ));
     }
 }

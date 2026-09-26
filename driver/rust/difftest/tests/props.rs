@@ -9,16 +9,31 @@ use nvgpu_guest_difftest::scen;
 use proptest::prelude::*;
 
 fn ptr_strategy() -> impl Strategy<Value = Ptr> {
-    (0u16..300, 0u8..4, 0u8..4, prop::array::uniform2((0u16..300, 0u8..9)), 0u32..3, 0u32..9).prop_map(
-        |(ptr, flags, ncounts, c, scale, elem)| Ptr {
+    (
+        0u16..300,
+        0u8..4,
+        0u8..4,
+        prop::array::uniform2((0u16..300, 0u8..9)),
+        0u32..3,
+        0u32..9,
+    )
+        .prop_map(|(ptr, flags, ncounts, c, scale, elem)| Ptr {
             ptr,
             flags,
             ncounts,
-            counts: [Count { offset: c[0].0, width: c[0].1 }, Count { offset: c[1].0, width: c[1].1 }],
+            counts: [
+                Count {
+                    offset: c[0].0,
+                    width: c[0].1,
+                },
+                Count {
+                    offset: c[1].0,
+                    width: c[1].1,
+                },
+            ],
             scale,
             elem,
-        },
-    )
+        })
 }
 
 struct NoMem;

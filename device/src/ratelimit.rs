@@ -97,7 +97,9 @@ impl<L: log::Log> RateLimited<L> {
             return Some(0);
         };
         let mut sites = self.sites.lock().unwrap_or_else(|p| p.into_inner());
-        let b = sites.entry((file, line)).or_insert_with(|| Bucket::new(now));
+        let b = sites
+            .entry((file, line))
+            .or_insert_with(|| Bucket::new(now));
         b.level = record.level();
         b.module = record.module_path_static();
         b.admit(now)
@@ -112,7 +114,13 @@ impl<L: log::Log> RateLimited<L> {
                 .iter_mut()
                 .filter(|(_, b)| b.suppressed > 0)
                 .map(|(&(file, line), b)| {
-                    (file, line, b.level, b.module, std::mem::take(&mut b.suppressed))
+                    (
+                        file,
+                        line,
+                        b.level,
+                        b.module,
+                        std::mem::take(&mut b.suppressed),
+                    )
                 })
                 .collect();
             v.sort_unstable_by_key(|&(f, l, ..)| (f, l));
@@ -228,7 +236,6 @@ mod tests {
     }
 
     #[test]
-
     #[cfg_attr(miri, ignore = "timing: Miri runs far slower than the refill")]
     fn one_noisy_site_does_not_silence_another() {
         use log::Log;
@@ -264,7 +271,13 @@ mod tests {
         let report: Vec<_> = got.iter().filter(|s| s.contains("dropped")).collect();
         assert_eq!(report.len(), 1, "{got:?}");
         // A slow run may refill a line or two; never more than were sent.
-        let n: u64 = report[0].trim_start_matches('(').split(' ').next().unwrap().parse().unwrap();
+        let n: u64 = report[0]
+            .trim_start_matches('(')
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!((1..=7).contains(&n), "{}", report[0]);
         assert!(report[0].contains("none since"));
         drop(got);

@@ -718,11 +718,7 @@ mod tests {
         for class in REFUSED_ALLOC_CLASSES {
             let mut p = vec![0u8; 48];
             put32(&mut p, OS64_CLASS, class);
-            assert_eq!(
-                rm_escape(ALLOC, &p),
-                Err(libc::EPERM),
-                "class {class:#x}"
-            );
+            assert_eq!(rm_escape(ALLOC, &p), Err(libc::EPERM), "class {class:#x}");
         }
         let mut p = vec![0u8; 48];
         put32(&mut p, OS64_CLASS, 0x3e);
@@ -770,11 +766,7 @@ mod tests {
         for class in 0x81..=0x83 {
             let mut p = vec![0u8; 56];
             put32(&mut p, OS02_CLASS, class);
-            assert_eq!(
-                rm_escape(ALLOC_MEMORY, &p),
-                Err(libc::EPERM),
-                "{class:#x}"
-            );
+            assert_eq!(rm_escape(ALLOC_MEMORY, &p), Err(libc::EPERM), "{class:#x}");
         }
     }
 
@@ -784,7 +776,11 @@ mod tests {
         put32(&mut p, OS02_CLASS, 0x3e);
         put64(&mut p, OS02_MEMORY, 0x1234_5000);
         let plan = rm_escape(ALLOC_MEMORY, &p).unwrap();
-        assert_eq!(plan.slots, [(OS02_MEMORY, TopSlot::Out)], "the host's answer goes back");
+        assert_eq!(
+            plan.slots,
+            [(OS02_MEMORY, TopSlot::Out)],
+            "the host's answer goes back"
+        );
         assert_eq!(rd64(&built(&plan, &p).0, OS02_MEMORY), Some(0));
 
         let mut p = vec![0u8; 56];
@@ -852,7 +848,10 @@ mod tests {
             (rd64(&host, 8), rd64(&host, 16), rd64(&host, 24)),
             (Some(0), Some(0x2000), Some(0))
         );
-        assert_eq!((rd64(&reply, 8), rd64(&reply, 24)), (Some(0x1000), Some(0x3000)));
+        assert_eq!(
+            (rd64(&reply, 8), rd64(&reply, 24)),
+            (Some(0x1000), Some(0x3000))
+        );
     }
 
     #[test]
@@ -923,7 +922,11 @@ mod tests {
             let (host, reply) = built(&uvm_gate(false, UVM_INITIALIZE, &p, mask).unwrap(), &p);
             assert_eq!(rd64(&host, 0), Some(want), "mask {mask:#x}");
             assert_ne!(want & UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE, 0);
-            assert_eq!(rd64(&reply, 0), Some(0), "the caller reads back its own flags");
+            assert_eq!(
+                rd64(&reply, 0),
+                Some(0),
+                "the caller reads back its own flags"
+            );
         }
         // A release without it (none measured) is not handed the bit.
         let p = vec![0u8; 16];
@@ -968,8 +971,10 @@ mod tests {
         let tables = abi::schema::UVM_TABLES;
         // Some commands are only in older releases (range groups), so it is
         // every release's commands together that must be the list.
-        let measured: BTreeSet<u32> =
-            tables.iter().flat_map(|t| t.cmds.iter().map(|c| c.cmd)).collect();
+        let measured: BTreeSet<u32> = tables
+            .iter()
+            .flat_map(|t| t.cmds.iter().map(|c| c.cmd))
+            .collect();
         assert_eq!(allowed, measured);
         for t in tables {
             for c in t.cmds {
@@ -1088,7 +1093,11 @@ mod backend_tests {
         let b = o
             .read(p, 4 * count)
             .expect("a block of the call, as long as RM copies");
-        b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
     }
 
     fn fake_host(
@@ -1122,7 +1131,14 @@ mod backend_tests {
                 let arrays = [8, 16]
                     .map(|off| {
                         let p = word64(&n, off);
-                        (p, if p == 0 { vec![] } else { read_u32s(&others, p, count) })
+                        (
+                            p,
+                            if p == 0 {
+                                vec![]
+                            } else {
+                                read_u32s(&others, p, count)
+                            },
+                        )
                     })
                     .to_vec();
                 let out = word64(&n, 16);
@@ -1145,7 +1161,9 @@ mod backend_tests {
                 if params != 0 {
                     assert!(params != GUEST_PTR, "the guest's params pointer reached RM");
                     // The backend's nested block, `size` bytes.
-                    let n = others.read(params, size as usize).expect("the nested block");
+                    let n = others
+                        .read(params, size as usize)
+                        .expect("the nested block");
                     for off in [8, 16, 24] {
                         if off + 8 <= n.len() {
                             let p = word64(&n, off);
@@ -1182,13 +1200,24 @@ mod backend_tests {
                         arrays: [16, 24, 32]
                             .map(|off| {
                                 let p = word64(a, off);
-                                (p, if p == 0 { vec![] } else { read_u32s(&others, p, count) })
+                                (
+                                    p,
+                                    if p == 0 {
+                                        vec![]
+                                    } else {
+                                        read_u32s(&others, p, count)
+                                    },
+                                )
                             })
                             .to_vec(),
                     }
                 } else {
                     for off in [16, 24, 32] {
-                        assert_eq!(word64(a, off), 0, "IDLE_CHANNELS pointer at {off} reached RM");
+                        assert_eq!(
+                            word64(a, off),
+                            0,
+                            "IDLE_CHANNELS pointer at {off} reached RM"
+                        );
                     }
                     Seen::Other(request as u64)
                 }
@@ -1530,7 +1559,10 @@ mod backend_tests {
         let back = &reply[56..];
         assert_eq!(&back[..24], &deep[..24], "the table as sent");
         assert_eq!(&back[24..36], &handles[..]);
-        assert_eq!(&back[36..], &u32s(&[0xc0de_0000, 0xc0de_0001, 0xc0de_0002])[..]);
+        assert_eq!(
+            &back[36..],
+            &u32s(&[0xc0de_0000, 0xc0de_0001, 0xc0de_0002])[..]
+        );
     }
 
     /// The backend sizes every segment itself, from the parameters RM is
@@ -1783,7 +1815,11 @@ mod backend_tests {
         assert_eq!(st, 0);
         assert_eq!(seen().len(), 1, "it reached the host");
         for off in [16, 24, 32] {
-            assert_eq!(word64(&reply, off), GUEST_PTR, "the caller's pointer at {off}");
+            assert_eq!(
+                word64(&reply, off),
+                GUEST_PTR,
+                "the caller's pointer at {off}"
+            );
         }
     }
 
@@ -1821,7 +1857,11 @@ mod backend_tests {
             seen(),
             vec![Seen::UvmInit { flags: 0x3 }, Seen::UvmPageable]
         );
-        assert_eq!(word64(&reply, 0), 0x2, "the caller reads back its own flags");
+        assert_eq!(
+            word64(&reply, 0),
+            0x2,
+            "the caller reads back its own flags"
+        );
         assert_eq!(&reply[8..12], &[0; 4], "NV_OK");
         // And the file takes the next call.
         assert_eq!(v1(&mut be, h, 39, &[0u8; 8], &[], None).0, 0);
@@ -1839,7 +1879,11 @@ mod backend_tests {
         let (st, reply) = v1(&mut be, h, UVM_INITIALIZE, &[0u8; 16], &[], None);
         PAGEABLE.with(|p| p.set(false));
         assert_eq!(st, 0);
-        assert_eq!(&reply[8..12], &0x56u32.to_le_bytes(), "NV_ERR_NOT_SUPPORTED");
+        assert_eq!(
+            &reply[8..12],
+            &0x56u32.to_le_bytes(),
+            "NV_ERR_NOT_SUPPORTED"
+        );
         seen();
         assert_eq!(v1(&mut be, h, 39, &[0u8; 8], &[], None).0, -libc::EPERM);
         // MM_INITIALIZE on a second file, naming the refused one.

@@ -2076,7 +2076,8 @@ mod tests {
         );
         o.uvm_range_made(7, 1 << 20, 4 << 20);
         o.uvm_range_made(8, 1 << 20, 4 << 20);
-        let admit = |o: &OsDesc, file, owner, base, len| o.uvm_admit(file, owner, 0xc1, 0x10, base, len);
+        let admit =
+            |o: &OsDesc, file, owner, base, len| o.uvm_admit(file, owner, 0xc1, 0x10, base, len);
         // Outside every range, across a range's end, in another file's, or
         // wrapping.
         assert_eq!(admit(&o, 7, a, 8 << 20, PAGE), Err(libc::EINVAL));
@@ -3141,7 +3142,9 @@ mod backend_tests {
         const OTHER: u32 = 0xc1d0_0002;
         let (mut vm, uvm) = vm_610();
         let null = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
-        let other_ctl = vm.be.adopt_for_test(null(), HandleKind::Dev(DeviceKind::Ctl));
+        let other_ctl = vm
+            .be
+            .adopt_for_test(null(), HandleKind::Dev(DeviceKind::Ctl));
         vm.be.semsurf.client_allocated(other_ctl, OTHER);
         let v = abi::version::DriverVersion::parse(DRIVER);
         let map_off = crate::uvmfd::field(v, UVM_MAP_EXTERNAL_ALLOCATION)
@@ -3172,9 +3175,17 @@ mod backend_tests {
             (map(ctl, 0xc1d0_0077), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
             (map(u32::MAX, CLIENT), UVM_MAP_EXTERNAL_ALLOCATION, map_at),
             (vaspace(ctl, OTHER), REGISTER_GPU_VASPACE, va_off + 12),
-            (vaspace(other_ctl, CLIENT), REGISTER_GPU_VASPACE, va_off + 12),
+            (
+                vaspace(other_ctl, CLIENT),
+                REGISTER_GPU_VASPACE,
+                va_off + 12,
+            ),
         ] {
-            assert_eq!(uvm_ioctl(&mut vm, uvm, cmd, &p, at).0, -libc::EPERM, "cmd {cmd}");
+            assert_eq!(
+                uvm_ioctl(&mut vm, uvm, cmd, &p, at).0,
+                -libc::EPERM,
+                "cmd {cmd}"
+            );
         }
         assert_eq!(seen(), vec![], "UVM was asked");
         // Each client through the file it was made on: UVM is asked.
@@ -3298,7 +3309,11 @@ mod backend_tests {
             map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]),
             (0, 0x1f)
         );
-        assert_eq!(vm.be.osdesc.uvm_held(), 0, "NV_ERR_INVALID_ARGUMENT made nothing");
+        assert_eq!(
+            vm.be.osdesc.uvm_held(),
+            0,
+            "NV_ERR_INVALID_ARGUMENT made nothing"
+        );
         UVM_STATUS.with(|s| s.set(0x60));
         assert_eq!(
             map_external(&mut vm, uvm, UVA, PAGE, HANDLE, &[G1]),

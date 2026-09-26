@@ -539,7 +539,10 @@ mod tests {
         assert!(t.insert_for(make_fd(), CTL, a).is_ok());
         // A guest that does not say is held to the table alone.
         assert!(t.insert(make_fd(), CTL).is_ok());
-        assert_eq!(t.owner(t.handles().into_iter().max().unwrap()), Owner::Unknown);
+        assert_eq!(
+            t.owner(t.handles().into_iter().max().unwrap()),
+            Owner::Unknown
+        );
         t.drain_all();
         assert_eq!(t.held_by(a), 0);
     }

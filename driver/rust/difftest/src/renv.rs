@@ -62,15 +62,25 @@ impl UserMem for RmEnv<'_> {
 }
 
 fn deep(c: &CDeep) -> deep::Control {
-    let mut out = deep::Control { cmd: c.cmd, nptrs: c.nptrs, ..Default::default() };
+    let mut out = deep::Control {
+        cmd: c.cmd,
+        nptrs: c.nptrs,
+        ..Default::default()
+    };
     for (o, p) in out.ptrs.iter_mut().zip(c.ptrs.iter()) {
         *o = deep::Ptr {
             ptr: p.ptr as u16,
             flags: p.flags as u8,
             ncounts: p.ncounts as u8,
             counts: [
-                deep::Count { offset: p.count_off[0] as u16, width: p.count_width[0] as u8 },
-                deep::Count { offset: p.count_off[1] as u16, width: p.count_width[1] as u8 },
+                deep::Count {
+                    offset: p.count_off[0] as u16,
+                    width: p.count_width[0] as u8,
+                },
+                deep::Count {
+                    offset: p.count_off[1] as u16,
+                    width: p.count_width[1] as u8,
+                },
             ],
             scale: p.scale,
             elem: p.elem,
@@ -141,7 +151,8 @@ impl rm::Env for RmEnv<'_> {
     }
 
     fn clock_to_guest(&mut self, clk: rm::Clock, host_ns: i64) -> Option<i64> {
-        self.w.clock_to_guest(clk == rm::Clock::MonotonicRaw, host_ns)
+        self.w
+            .clock_to_guest(clk == rm::Clock::MonotonicRaw, host_ns)
     }
 
     fn deep_control(&self, cmd: u32) -> Option<deep::Control> {
@@ -157,8 +168,10 @@ impl rm::Env for RmEnv<'_> {
 
     fn v1v2(&self, cmd: u32) -> Option<rm::V1V2> {
         let (mut off, mut info) = (0u32, false);
-        unsafe { cabi::harness_v1v2(cmd, &mut off, &mut info) }
-            .then_some(rm::V1V2 { v1_userptr_offset: off, info_style: info })
+        unsafe { cabi::harness_v1v2(cmd, &mut off, &mut info) }.then_some(rm::V1V2 {
+            v1_userptr_offset: off,
+            info_style: info,
+        })
     }
 
     fn class_param_size(&self, hclass: u32) -> u32 {
@@ -166,7 +179,12 @@ impl rm::Env for RmEnv<'_> {
     }
 
     fn fd_translation(&self, key: u32) -> Option<u32> {
-        self.d.fdt.iter().take(16).find(|(nr, _)| *nr == key).map(|&(_, p)| p)
+        self.d
+            .fdt
+            .iter()
+            .take(16)
+            .find(|(nr, _)| *nr == key)
+            .map(|&(_, p)| p)
     }
 
     fn uvm_size(&self, cmd: u32) -> Option<u32> {
@@ -196,7 +214,10 @@ impl osdesc::Env for RmEnv<'_> {
     }
 
     fn pin(&mut self, start: u64, npages: u64, write: bool) -> Result<RPin, PinError> {
-        self.w.pin(start, npages, write).map(|pas| RPin { pas, write }).ok_or(PinError::NotPinned)
+        self.w
+            .pin(start, npages, write)
+            .map(|pas| RPin { pas, write })
+            .ok_or(PinError::NotPinned)
     }
 
     fn page_phys(&self, pin: &RPin, i: u64) -> u64 {
@@ -204,18 +225,33 @@ impl osdesc::Env for RmEnv<'_> {
     }
 
     fn keep(&mut self, id: u64, pin: RPin) {
-        self.w.events.push(Ev::Keep { id, n: pin.pas.len() as u64, write: pin.write });
+        self.w.events.push(Ev::Keep {
+            id,
+            n: pin.pas.len() as u64,
+            write: pin.write,
+        });
     }
 
     fn unpin(&mut self, pin: RPin) {
-        self.w.events.push(Ev::Unpin { n: pin.pas.len() as u64, write: pin.write });
+        self.w.events.push(Ev::Unpin {
+            n: pin.pas.len() as u64,
+            write: pin.write,
+        });
     }
 
-    fn send_pinned(&mut self, req: &[u8], resp: &mut [u8], pin: RPin) -> (Result<u32, Errno>, Option<RPin>) {
+    fn send_pinned(
+        &mut self,
+        req: &[u8],
+        resp: &mut [u8],
+        pin: RPin,
+    ) -> (Result<u32, Errno>, Option<RPin>) {
         let r = rm::Env::send_recv(self, req, resp);
         match r {
             Err(e) if i2::abandons(e) => {
-                self.w.events.push(Ev::HandOver { n: pin.pas.len() as u64, write: pin.write });
+                self.w.events.push(Ev::HandOver {
+                    n: pin.pas.len() as u64,
+                    write: pin.write,
+                });
                 (r, None)
             }
             _ => (r, Some(pin)),
@@ -233,11 +269,18 @@ pub fn tables(d: &Dev) -> SchemaSet<'static> {
             Table {
                 ioctls: std::slice::from_raw_parts(t.ioctls, t.nioctls as usize),
                 fields: std::slice::from_raw_parts(t.fields, t.nfields as usize),
-                planes: if t.planes.is_null() { &[] } else { std::slice::from_raw_parts(t.planes, t.nplanes as usize) },
+                planes: if t.planes.is_null() {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(t.planes, t.nplanes as usize)
+                },
             }
         }
     }
-    SchemaSet { drm: table(&t.drm), modeset: (t.has_modeset != 0).then(|| table(&t.modeset)) }
+    SchemaSet {
+        drm: table(&t.drm),
+        modeset: (t.has_modeset != 0).then(|| table(&t.modeset)),
+    }
 }
 
 /// An IOCTL2's buffers, over the shared world.
@@ -248,7 +291,10 @@ pub struct RStore {
 
 impl RStore {
     pub fn new(w: Rc<RefCell<World>>) -> RStore {
-        RStore { w, bufs: vec![None; 256] }
+        RStore {
+            w,
+            bufs: vec![None; 256],
+        }
     }
 }
 
@@ -277,12 +323,19 @@ impl Store for RStore {
     }
 
     fn buf_mut(&mut self, i: usize) -> &mut [u8] {
-        self.bufs.get_mut(i).and_then(|b| b.as_deref_mut()).unwrap_or(&mut [])
+        self.bufs
+            .get_mut(i)
+            .and_then(|b| b.as_deref_mut())
+            .unwrap_or(&mut [])
     }
 
     fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
         let src = self.buf(i).get(start..end).ok_or(-14)?.to_vec();
-        if self.w.borrow_mut().copy_to_user(uptr.wrapping_add(start as u64), &src) {
+        if self
+            .w
+            .borrow_mut()
+            .copy_to_user(uptr.wrapping_add(start as u64), &src)
+        {
             Ok(())
         } else {
             Err(-14)
@@ -379,28 +432,55 @@ impl I2Env {
 impl i2::Env<RStore> for I2Env {
     type TBuf = Vec<u8>;
 
-    fn fd_in(&mut self, _st: &mut State<RStore>, buf: u32, off: u32, value: i64, kinds: u32) -> (i32, u32, u32) {
+    fn fd_in(
+        &mut self,
+        _st: &mut State<RStore>,
+        buf: u32,
+        off: u32,
+        value: i64,
+        kinds: u32,
+    ) -> (i32, u32, u32) {
         if !self.has(0) {
             return (-22, 0, 0);
         }
         hooks::fd_in(&mut self.w.borrow_mut(), buf, off, value, kinds)
     }
 
-    fn gem_in(&mut self, _st: &mut State<RStore>, buf: u32, off: u32, guest: u32) -> (i32, u32, u32) {
+    fn gem_in(
+        &mut self,
+        _st: &mut State<RStore>,
+        buf: u32,
+        off: u32,
+        guest: u32,
+    ) -> (i32, u32, u32) {
         if !self.has(1) {
             return (-22, 0, 0);
         }
         hooks::gem_in(&mut self.w.borrow_mut(), buf, off, guest)
     }
 
-    fn fd_out(&mut self, _st: &mut State<RStore>, buf: u32, off: u32, handle: u32, kind: u32) -> (i32, i64) {
+    fn fd_out(
+        &mut self,
+        _st: &mut State<RStore>,
+        buf: u32,
+        off: u32,
+        handle: u32,
+        kind: u32,
+    ) -> (i32, i64) {
         if !self.has(2) {
             return (-22, -1);
         }
         hooks::fd_out(&mut self.w.borrow_mut(), buf, off, handle, kind)
     }
 
-    fn gem_out(&mut self, _st: &mut State<RStore>, buf: u32, off: u32, gem: u32, size: u64) -> (i32, u32) {
+    fn gem_out(
+        &mut self,
+        _st: &mut State<RStore>,
+        buf: u32,
+        off: u32,
+        gem: u32,
+        size: u64,
+    ) -> (i32, u32) {
         if !self.has(3) {
             return (-22, 0);
         }
@@ -437,7 +517,10 @@ impl i2::Env<RStore> for I2Env {
     }
 
     fn gem_close(&mut self, gem: u32) {
-        self.w.borrow_mut().events.push(Ev::GemClose(self.render, gem));
+        self.w
+            .borrow_mut()
+            .events
+            .push(Ev::GemClose(self.render, gem));
     }
 
     fn tbuf_alloc(&mut self, len: usize) -> Option<Vec<u8>> {

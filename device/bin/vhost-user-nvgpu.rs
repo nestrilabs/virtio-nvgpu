@@ -56,8 +56,8 @@ use device::session::{
     BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, PendingIoctl2, Reply,
 };
 use device::shm::WindowPlacer;
-use device::vring::{gather, layout, scatter};
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use device::vring::{gather, layout, scatter};
 use device::wl::export::WlExport;
 use device::wl::{LeaseThrottle, WlConfig, WlLimits};
 use protocol::messages::{MsgHeader, MsgType, SHM_ID_UVM};
@@ -1662,9 +1662,11 @@ mod tests {
     #[test]
     fn a_diagnostic_flag_needs_diagnostic() {
         assert!(check_diagnostic(&args(&[]), false).unwrap().is_empty());
-        assert!(check_diagnostic(&args(&["--rm-allowlist=enforce", "--sandbox=on"]), false)
-            .unwrap()
-            .is_empty());
+        assert!(
+            check_diagnostic(&args(&["--rm-allowlist=enforce", "--sandbox=on"]), false)
+                .unwrap()
+                .is_empty()
+        );
         for flag in [
             &["--allow-root-unsafe"][..],
             &["--proc-nvidia", "/tmp/fixture"],
@@ -1675,7 +1677,9 @@ mod tests {
             &["--sandbox=off"],
             &["--allow-unmeasured-release"],
         ] {
-            let e = check_diagnostic(&args(flag), false).unwrap_err().to_string();
+            let e = check_diagnostic(&args(flag), false)
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("--diagnostic"), "{flag:?}: {e}");
             let with: Vec<&str> = flag.iter().copied().chain(["--diagnostic"]).collect();
             let lines = check_diagnostic(&args(&with), false).unwrap();
@@ -1686,7 +1690,10 @@ mod tests {
         let e = check_diagnostic(&args(&["--permissive-abi", "--sandbox=off"]), false)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("--permissive-abi, --sandbox=off are diagnostic"), "{e}");
+        assert!(
+            e.contains("--permissive-abi, --sandbox=off are diagnostic"),
+            "{e}"
+        );
     }
 
     /// `--help` shows none of them unless asked with --diagnostic.
@@ -1707,7 +1714,10 @@ mod tests {
                 "{hidden}"
             );
         }
-        assert!(help.lines().any(|l| l.trim_start().starts_with("--diagnostic")));
+        assert!(
+            help.lines()
+                .any(|l| l.trim_start().starts_with("--diagnostic"))
+        );
         let shown = Args::command()
             .mut_args(|a| a.hide(false))
             .render_long_help()

@@ -104,20 +104,34 @@ fn main() {
     fs::create_dir_all(&out).expect("OUT_DIR/c");
 
     let real = fs::read_to_string(driver.join("nvgpu.h")).expect("driver/nvgpu.h");
-    let start = real.find("/* ── IOCTL2 interpreter").expect("nvgpu.h's IOCTL2 section");
+    let start = real
+        .find("/* ── IOCTL2 interpreter")
+        .expect("nvgpu.h's IOCTL2 section");
     fs::write(out.join("nvgpu.h"), format!("{PREAMBLE}{}", &real[start..])).expect("nvgpu.h");
 
     // The sources are copied next to the generated nvgpu.h, so that their
     // `#include "nvgpu.h"` finds it before the real one.
     let mut files = Vec::new();
-    for f in ["nvgpu_i2.c", "nvgpu_rmio.c", "nvgpu_schema.c", "nvgpu_atomic.c"] {
+    for f in [
+        "nvgpu_i2.c",
+        "nvgpu_rmio.c",
+        "nvgpu_schema.c",
+        "nvgpu_atomic.c",
+    ] {
         fs::copy(driver.join(f), out.join(f)).expect(f);
         files.push(out.join(f));
         println!("cargo:rerun-if-changed={}", driver.join(f).display());
     }
     fs::copy(manifest.join("c/harness.c"), out.join("harness.c")).expect("harness.c");
     files.push(out.join("harness.c"));
-    for d in ["nvgpu.h", "nvgpu_wire.h", "nvgpu_rm_intercepts.h", "gen", "../driver/rust/difftest/c", "../driver/rust/difftest/shim"] {
+    for d in [
+        "nvgpu.h",
+        "nvgpu_wire.h",
+        "nvgpu_rm_intercepts.h",
+        "gen",
+        "../driver/rust/difftest/c",
+        "../driver/rust/difftest/shim",
+    ] {
         println!("cargo:rerun-if-changed={}", driver.join(d).display());
     }
 
