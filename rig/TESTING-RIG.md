@@ -561,6 +561,19 @@ Results (RTX 5090, 595.99.02, 2026-09-26, sandbox on):
 | explicit sync, announce to release, guest only waiting and signalling | median 55 us, p99 133 us | median 45 us, p99 109 us |
 | the same with the guest reading each frame back through Vulkan | 1.2 ms (720p) | 4.4 ms (1440p) |
 
+The rest of the regression on the same backend and images (`--inject` off),
+and the capture probe with the Rust parsers (`NVGPU_KERNEL`, `NVGPU_ROOTFS`
+of the Rust build):
+
+| probe | nesbox, C module | nesbox, Rust module | crosvm (compute build) |
+|---|---|---|---|
+| `capture` | 16/0/0 (2560x1440) | 16/0/0 | 16/0/0 (1280x720) |
+| `stage1` | 6/0/0 | 6/0/0 | 6/0/0 |
+| `render` | 9/0/1 | 9/0/1 | 9/0/1 |
+| `render`, `NVGPU_COMPUTE=1` | 9/0/1, cuda-smoke PASS | 9/0/1, cuda-smoke PASS | 9/0/1, cuda-smoke PASS |
+| `wayland`, headless sway | 11/0/3 | 11/0/3 | 11/0/3 |
+| `secneg`, `kms=none` | ctl + render 10 passed, 5 skipped | the same | the same |
+
 **With a real screen share.** The tests never open the host's picker.
 `rig/rig-tools/portal-identify.sh`, run by the desktop's user on the
 desktop (not in a sandbox without the session bus and PipeWire), asks the
