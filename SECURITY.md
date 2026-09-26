@@ -1628,3 +1628,18 @@ copy of the protocol, is deleted. `nvgpu-userspace --stage DIR` ran
 `remove_dir_all(DIR)` on whatever it was given; it now clears only a
 directory that is empty or holds the marker it writes into every share it
 stages, never through a symlink.
+
+**The generators fail closed.** `rmctrl_extract.py` left out, silently, a
+control RM's pointer tables name whose command macro the release's headers
+do not define; a control left out is one whose pointer reaches RM as the
+guest's bytes. Now any such name stops the extraction unless it is in
+`UNDEFINED_IN_HEADERS` with its reason (one: `NV0000_CTRL_CMD_OS_GET_CAPS`,
+whose case RM itself compiles only if the macro exists). `nvabi_gen.py`
+wrote `param_size: None` -- no size check -- for an escape whose struct it
+could not lay out; that, and a fixed-size escape with no struct, now stop
+it (only nvproxy's byte-copied escapes are variable length). Nothing ran the
+extractors' `check` modes; `scripts/gen-check.sh` runs all of them, the UVM
+tag scan (whose comparison had rotted: it no longer ran), the schema render,
+and with `GVISOR=` the ABI profiles, against the sources over the network.
+On 2026-09-26 every table matched, and gVisor master regenerates the three
+profiles unchanged.

@@ -145,11 +145,19 @@ def main():
             continue
         st = tparam or structs_by_esc.get(esc)
         size = None
+        # `None` is "variable length, no size check": right for the escapes
+        # nvproxy copies as bytes, and a hole anywhere else. So a struct
+        # whose layout cannot be computed, or a fixed-size escape with no
+        # struct, stops the generator rather than writing a `None`.
         if st:
             try:
                 size = layout(st, gs, consts)[0]
             except (KeyError, ValueError) as e:
-                print(f"warning: {esc}: {e}", file=sys.stderr)
+                sys.exit(f"error: {esc}: the layout of {st} cannot be computed ({e}); "
+                         "a profile without its size would forward it unchecked")
+        elif kind != "Bytes":
+            sys.exit(f"error: {esc}: handled by {fn} as {kind}, but no parameter struct "
+                     "was found for it")
         rows.append((esc, num, kind, st, size))
 
     maj, mnr, pat = target

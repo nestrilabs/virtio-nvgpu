@@ -159,6 +159,17 @@ LEFT_ZEROED = {
         "PRIVILEGED and RM_TEST_ONLY_CODE (0x100044)",
 }
 
+# Controls RM's pointer tables name whose command macro a release's headers
+# do not define: left out of the table (there is no number to key them by),
+# which is safe only because nothing can send a control that has no number
+# in the release it runs on. Each checked by hand; any other name missing
+# stops `extract`.
+UNDEFINED_IN_HEADERS = {
+    "NV0000_CTRL_CMD_OS_GET_CAPS":
+        "embedded_param_copy.c guards its cases with #ifdef NV0000_CTRL_CMD_OS_GET_CAPS "
+        "and no header defines it: RM compiles no such case and has no such control",
+}
+
 # Every RM file that calls a user-copy primitive, and what accounts for it.
 # A release where this set differs fails: a new file may be a new handler
 # that follows a pointer in a control's parameters.
@@ -689,10 +700,23 @@ def extract(version, root, source):
                                        check=True).stdout.splitlines():
                 n, v = line.split()
                 refused[n] = int(v)
+    # A control RM's tables name with a pointer in its parameters, whose
+    # command macro this release's headers do not define, would be left out
+    # of the table -- and a control left out is one whose pointer reaches RM
+    # as the guest's bytes. Only the names below, each checked by hand, may
+    # be missing; any other stops the extraction.
+    missing = sorted(name for name, *_ in rows if name not in got)
+    unexplained = [n for n in missing if n not in UNDEFINED_IN_HEADERS]
+    if unexplained:
+        raise ExtractError(
+            f"{version}: controls with pointer parameters in RM's tables, but no command "
+            f"macro in this release's headers: {unexplained}. Find why (an #ifdef, a "
+            f"renamed macro) and either probe them or add them to UNDEFINED_IN_HEADERS "
+            f"with the reason")
     controls = []
     for name, _, _, rules in rows:
         if name not in got:
-            continue  # not defined by this release's headers (an #ifdef'd case)
+            continue  # UNDEFINED_IN_HEADERS: checked above
         g = got[name]
         pointers = []
         for p in g["fields"]:

@@ -365,8 +365,8 @@ def cmd_scan(args):
         if k < first:
             continue
         base = [v for v in measured if version_key(v) <= k][-1]
-        commands, _ = measure(fetch(t, args.cache))
-        if json.dumps(commands, sort_keys=True) != tables[base]:
+        commands, _, mask = measure(fetch(t, args.cache))
+        if table_of({"commands": commands, "init_flags_mask": mask}) != tables[base]:
             print(f"{t}: differs from {base}, the measured release it would take",
                   file=sys.stderr)
             bad += 1
