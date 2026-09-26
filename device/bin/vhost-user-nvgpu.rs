@@ -42,7 +42,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use clap::Parser;
 use device::exec::ExecPool;
@@ -646,11 +646,33 @@ impl Shared {
         if cmds.is_empty() {
             return;
         }
-        let mut p = self.pump.lock().unwrap();
+        let p = self.pump.lock().unwrap();
+        Self::hand_over(p, cmds);
+    }
+
+    fn hand_over(mut p: MutexGuard<'_, PumpState>, cmds: Vec<PumpCmd>) {
         match p.handle.as_ref() {
             Some(h) => cmds.into_iter().for_each(|c| h.send(c)),
             None => p.queued.extend(cmds),
         }
+    }
+
+    /// Forward what the backend `be` has for the pump, and let go of it.
+    /// The pump's lock is taken before the backend's is let go: whichever
+    /// thread takes the backend next forwards what it makes after these,
+    /// never before. Forwarded after the backend was let go, a CLOSE's
+    /// Unwatch on one thread could reach the pump ahead of the Watch an
+    /// earlier call on another made, and the pump then held its duplicate
+    /// of the closed file -- a DRM master, a lease -- for as long as the
+    /// session lasted (review 2026-09-26, backend 11).
+    fn forward_from(&self, mut be: MutexGuard<'_, NvidiaBackend>) {
+        let cmds = be.take_pump_cmds();
+        if cmds.is_empty() {
+            return;
+        }
+        let p = self.pump.lock().unwrap();
+        drop(be);
+        Self::hand_over(p, cmds);
     }
 
     /// Finish an executed IOCTL2 under the backend lock, and forward what
@@ -659,9 +681,7 @@ impl Shared {
     fn finish(&self, p: PendingIoctl2) -> Reply {
         let mut be = self.nvidia.lock().unwrap();
         let reply = be.finish_ioctl2(p);
-        let cmds = be.take_pump_cmds();
-        drop(be);
-        self.forward(cmds);
+        self.forward_from(be);
         reply
     }
 
@@ -681,9 +701,7 @@ impl Shared {
             if !reply.created.is_empty() {
                 let mut be = self.nvidia.lock().unwrap();
                 be.close_handles(&reply.created);
-                let cmds = be.take_pump_cmds();
-                drop(be);
-                self.forward(cmds);
+                self.forward_from(be);
             }
             return;
         }
@@ -851,9 +869,7 @@ impl NvGpuBackend {
         let before = be.generation();
         let outcome = be.serve(req, cap);
         let reset = be.generation() != before;
-        let cmds = be.take_pump_cmds();
-        drop(be);
-        self.shared.forward(cmds);
+        self.shared.forward_from(be);
         if reset {
             self.shared.pool.cancel_pending();
         }
@@ -1012,9 +1028,7 @@ impl VhostUserBackendMut for NvGpuBackend {
     fn reset_device(&mut self) {
         let mut be = self.shared.nvidia.lock().unwrap();
         be.session_reset("device reset");
-        let cmds = be.take_pump_cmds();
-        drop(be);
-        self.shared.forward(cmds);
+        self.shared.forward_from(be);
         self.shared.pool.cancel_pending();
     }
 
@@ -1320,9 +1334,7 @@ fn main() -> anyhow::Result<()> {
             run: Box::new(move || {
                 let mut be = ticker.nvidia.lock().unwrap();
                 be.recheck_granting_leases();
-                let cmds = be.take_pump_cmds();
-                drop(be);
-                ticker.forward(cmds);
+                ticker.forward_from(be);
             }),
         };
         let listener = uevents
@@ -1337,9 +1349,7 @@ fn main() -> anyhow::Result<()> {
                         {
                             let mut be = sink.nvidia.lock().unwrap();
                             be.check_leases(Some(card));
-                            let cmds = be.take_pump_cmds();
-                            drop(be);
-                            sink.forward(cmds);
+                            sink.forward_from(be);
                         }
                         if to_guest {
                             sink.forward(vec![c]);
@@ -1448,6 +1458,56 @@ mod tests {
     }
 
     use super::*;
+
+    /// What a thread hands the pump is handed over before the backend is let
+    /// go, so the next thread to take the backend cannot get its own
+    /// instructions to the pump first (review 2026-09-26, backend 11).
+    #[test]
+    fn pump_instructions_are_handed_over_before_the_backend_is_let_go() {
+        let shared = Arc::new(Shared {
+            nvidia: Mutex::new(NvidiaBackend::with_default_zones()),
+            mem: RwLock::new(None),
+            pool: ExecPool::default(),
+            pump: Mutex::new(PumpState::default()),
+        });
+        // A fresh HELLO leaves the pump a Reset and two SetV2s.
+        {
+            use protocol::messages::{HELLO_F_FRESH, HelloReq, PROTO_V2};
+            let hello = HelloReq {
+                proto: PROTO_V2,
+                flags: HELLO_F_FRESH,
+                guest_caps: 0,
+                uvm_aperture_mib: 0,
+            };
+            let hdr = MsgHeader {
+                msg_type: MsgType::Hello as u32,
+                handle: 0,
+                status: 0,
+                req_id: 0,
+            };
+            let mut req = device::sys::pod::bytes(&hdr).to_vec();
+            req.extend_from_slice(device::sys::pod::bytes(&hello));
+            let _ = shared.nvidia.lock().unwrap().serve(&req, 4096);
+        }
+        // The pump is busy: the forwarding thread must wait for it with the
+        // backend still held.
+        let pump = shared.pump.lock().unwrap();
+        let s = shared.clone();
+        let t = std::thread::spawn(move || {
+            let be = s.nvidia.lock().unwrap();
+            s.forward_from(be);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            shared.nvidia.try_lock().is_err(),
+            "the backend is held until the pump has what it was told"
+        );
+        drop(pump);
+        t.join().unwrap();
+        let queued = &shared.pump.lock().unwrap().queued;
+        assert!(matches!(queued[0], PumpCmd::Reset), "in order");
+        assert!(shared.nvidia.try_lock().is_ok());
+    }
 
     fn memory() -> GuestMemoryMmap {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
