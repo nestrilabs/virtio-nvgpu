@@ -221,8 +221,7 @@ impl SyncobjHost for HostSyncobj {
         // (drm_syncobj_get_fd, drm_syncobj.c:687, with O_CLOEXEC).
         let mut a = Arena::new();
         let top = a.small(&arg);
-        a.fd_out(top, 8, 4)
-            .map_err(io::Error::from_raw_os_error)?;
+        a.fd_out(top, 8, 4).map_err(io::Error::from_raw_os_error)?;
         drm_ioctl(render, hostfd::DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut a, top)?;
         a.claim_fd(top, 8)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
@@ -392,10 +391,8 @@ impl Registrations {
                     self.importers.insert(render);
                 }
             },
-            "SYNCOBJ_FD_TO_HANDLE" => {
-                if word(arg, 4).is_none_or(|f| f & SYNC_FILE_MODE == 0) {
-                    self.importers.insert(render);
-                }
+            "SYNCOBJ_FD_TO_HANDLE" if word(arg, 4).is_none_or(|f| f & SYNC_FILE_MODE == 0) => {
+                self.importers.insert(render);
             }
             _ => {}
         }
@@ -406,7 +403,13 @@ impl Registrations {
     /// and with it the last way to reach a private syncobj: its orphans are
     /// dropped, and the syncobj with its kernel entries goes with our file.
     /// One that failed leaves the handle, and so the orphans, as they were.
-    pub fn after_ioctl2(&mut self, render: u32, name: &str, arg: Option<&[u8]>, result: Option<i32>) {
+    pub fn after_ioctl2(
+        &mut self,
+        render: u32,
+        name: &str,
+        arg: Option<&[u8]>,
+        result: Option<i32>,
+    ) {
         if name != "SYNCOBJ_DESTROY" || result != Some(0) {
             return;
         }
@@ -471,7 +474,12 @@ impl Registrations {
     pub fn orphan_file(&mut self, render: u32) {
         let now = Instant::now();
         let importer = self.importers.remove(&render);
-        let keys: Vec<RegKey> = self.regs.keys().filter(|k| k.render == render).copied().collect();
+        let keys: Vec<RegKey> = self
+            .regs
+            .keys()
+            .filter(|k| k.render == render)
+            .copied()
+            .collect();
         for k in keys {
             if let Some(r) = self.regs.remove(&k) {
                 self.orphans.push(r);
@@ -1066,17 +1074,29 @@ mod tests {
         let (mut t, mut r) = (Table::default(), Registrations::with_cap(64));
         let share = Share::quarter(64, 1).per_owner as u32;
         for i in 0..share {
-            let k = RegKey { point: u64::from(i), ..key(1, 0, 0) };
+            let k = RegKey {
+                point: u64::from(i),
+                ..key(1, 0, 0)
+            };
             assert_eq!(
                 r.watch_by(&host, &mut t, 3, k, (2 << 32) | u64::from(i), p(1)),
                 Ok(Watched::New)
             );
         }
-        let k = RegKey { point: 999, ..key(1, 0, 0) };
-        assert_eq!(r.watch_by(&host, &mut t, 3, k, 3 << 32, p(1)), Err(libc::EAGAIN));
+        let k = RegKey {
+            point: 999,
+            ..key(1, 0, 0)
+        };
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, k, 3 << 32, p(1)),
+            Err(libc::EAGAIN)
+        );
         assert_eq!(r.held_by(p(1)), u64::from(share));
         // Another process is not affected, and joining is free.
-        assert_eq!(r.watch_by(&host, &mut t, 3, k, 3 << 32, p(2)), Ok(Watched::New));
+        assert_eq!(
+            r.watch_by(&host, &mut t, 3, k, 3 << 32, p(2)),
+            Ok(Watched::New)
+        );
         assert_eq!(
             r.watch_by(&host, &mut t, 3, k, 4 << 32, p(1)),
             Ok(Watched::Joined(3 << 32))
@@ -1095,7 +1115,8 @@ mod tests {
         let host = Host::default();
         // A share of one.
         let (mut t, mut r) = (Table::default(), Registrations::with_cap(4));
-        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
         destroy(&mut r, 1, 0);
         assert!(r.is_empty());
         assert_eq!(r.held_by(p(1)), 0);
@@ -1114,7 +1135,8 @@ mod tests {
         // syncobj (if any) lives on, and so does the kernel entry.
         let host = Host::default();
         let (mut t, mut r) = (Table::default(), Registrations::default());
-        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
         destroy(&mut r, 1, -libc::EINVAL);
         assert_eq!(r.len(), 1);
         assert_eq!(r.held_by(p(1)), 1);
@@ -1126,8 +1148,10 @@ mod tests {
         // holder can keep it alive, and a dropped entry would be uncounted.
         let host = Host::default();
         let (mut t, mut r) = (Table::default(), Registrations::default());
-        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1)).unwrap();
-        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1))
+            .unwrap();
         r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(1, 0)));
         // A sync_file export moves a fence, not the syncobj.
         r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(2, 1)));
@@ -1142,7 +1166,8 @@ mod tests {
 
         // An importing file's syncobjs may all be someone else's.
         let mut r = Registrations::default();
-        r.watch_by(&host, &mut t, 3, key(3, 5, 0), 1 << 40, p(1)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(3, 5, 0), 1 << 40, p(1))
+            .unwrap();
         r.before_ioctl2(20, "SYNCOBJ_FD_TO_HANDLE", Some(&handle_arg(0, 0)));
         destroy(&mut r, 3, 0);
         assert_eq!(r.len(), 1);
@@ -1154,9 +1179,12 @@ mod tests {
     fn closing_a_file_drops_what_only_it_could_reach() {
         let host = Host::default();
         let (mut t, mut r) = (Table::default(), Registrations::default());
-        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1)).unwrap();
-        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1)).unwrap();
-        r.watch_by(&host, &mut t, 3, key(3, 5, 0), C3, p(1)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(1, 5, 0), C1, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), C2, p(1))
+            .unwrap();
+        r.watch_by(&host, &mut t, 3, key(3, 5, 0), C3, p(1))
+            .unwrap();
         r.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(2, 0)));
         // A DESTROY that failed left handle 3 an orphan; the close takes it.
         destroy(&mut r, 3, -libc::EINVAL);
@@ -1167,13 +1195,16 @@ mod tests {
         // whose destroy of syncobj 2 is not the old file's syncobj 2. Nor is
         // a new private syncobj under an exported one's old number.
         let mut r2 = Registrations::default();
-        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 41, p(1)).unwrap();
+        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 41, p(1))
+            .unwrap();
         r2.before_ioctl2(20, "SYNCOBJ_HANDLE_TO_FD", Some(&handle_arg(4, 0)));
         destroy(&mut r2, 4, 0);
-        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 42, p(1)).unwrap();
+        r2.watch_by(&host, &mut t, 3, key(4, 5, 0), 1 << 42, p(1))
+            .unwrap();
         destroy(&mut r2, 4, 0);
         assert_eq!(r2.len(), 1, "the exported one's orphan stays");
-        r.watch_by(&host, &mut t, 3, key(2, 5, 0), 1 << 40, p(2)).unwrap();
+        r.watch_by(&host, &mut t, 3, key(2, 5, 0), 1 << 40, p(2))
+            .unwrap();
         destroy(&mut r, 2, 0);
         assert_eq!(r.len(), 1);
         assert_eq!((r.held_by(p(1)), r.held_by(p(2))), (1, 0));
