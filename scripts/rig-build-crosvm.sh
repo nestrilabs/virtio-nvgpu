@@ -7,6 +7,7 @@
 # Usage: scripts/rig-build-crosvm.sh [extra cargo args]
 #   NVGPU_RIG      the rig (default: the repo's .rig)
 #   CROSVM_SRC     the crosvm checkout (default: $NVGPU_RIG/src/crosvm)
+#   CROSVM_OUT     where the binary goes (default: $NVGPU_RIG/bin/crosvm)
 #
 # First time:
 #   git clone https://chromium.googlesource.com/crosvm/crosvm .rig/src/crosvm
@@ -21,7 +22,8 @@ set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
 SRC=${CROSVM_SRC:-$RIG/src/crosvm}
-[ -d "$SRC/.git" ] || { echo "no crosvm checkout at $SRC (see the top of $0)" >&2; exit 1; }
+OUT=${CROSVM_OUT:-$RIG/bin/crosvm}
+[ -e "$SRC/.git" ] || { echo "no crosvm checkout at $SRC (see the top of $0)" >&2; exit 1; }
 
 git -C "$SRC" submodule update --init --depth 1 third_party/minijail
 sed -i 's#@/bin/echo -e#@printf "%s\\n"#' "$SRC/third_party/minijail/Makefile"
@@ -49,5 +51,5 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc nixpkgs#pkg-config nixpkgs#pro
     export RUSTFLAGS="-C target-feature=+crt-static -L $GS -L $CAPA"
     cargo build --release --target x86_64-unknown-linux-gnu --no-default-features "$@"
 ' bash "$@"
-install -m 0755 "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/crosvm" "$RIG/bin/crosvm"
-echo "installed $RIG/bin/crosvm"
+install -m 0755 "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/crosvm" "$OUT"
+echo "installed $OUT"

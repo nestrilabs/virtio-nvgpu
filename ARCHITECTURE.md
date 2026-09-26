@@ -327,14 +327,19 @@ When the guest maps a pool, the backend checks it is one this very file was
 seen to create, asked for exactly, and hands the VMM the file with the
 existing SHMEM_MAP request on a second shared-memory region, the **UVM
 aperture** (region 2). The VMM maps the file at the pool's own address in its
-own address space, refusing to replace anything already there, checks the
-pages are really present, and gives that range a memory slot inside the
-aperture at an offset the backend chose. The guest maps its vma from there,
+own address space, never over anything of its own (nesbox with
+`MAP_FIXED_NOREPLACE`; crosvm over a band it reserved for pools at start-up,
+from its main process, after its jailed frontend and then the main process
+have checked the request), checks the pages are really present, and gives
+that range a memory slot inside the aperture at an offset the backend chose. The guest maps its vma from there,
 write-back. Taking it out goes the other way round: the slot first, then the
 mapping, so the guest never has a slot over nothing.
 
 A second region rather than more window because the window is one slot over
-one reservation, and a pool's host address is not ours to choose. One slot
+one reservation, and a pool's host address is not ours to choose. nesbox
+gives the aperture a BAR of its own; crosvm puts it after the window in the
+window's BAR, with a capability of its own. The guest looks regions up by id
+and does not care which. One slot
 per pool because the address is fixed per pool; a slot costs about 0.7 ms to
 add and 2 ms to remove, once per CUDA context. UVM itself keeps the pages
 alive: it refuses to free a pool that is still mapped, and the VMM's mapping

@@ -1,0 +1,2256 @@
+From e7b866fbe3ea4bca908c87f55169fd5b8236aba0 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 06:09:50 +0000
+Subject: [PATCH 7/9] vm_control: hold virtio-nvgpu's memory tubes, and map UVM
+ pools
+
+virtio-nvgpu's memory requests reach the main process over its two
+VmMemoryRequest tubes. Nothing the device process says is taken on trust:
+sys::linux::nvgpu holds each tube to what the device needs, against the BAR
+layout the PCI transport reports from the main process before the device
+process is made (SharedMemoryBarLayout).
+
+The shared memory tube may prepare region 1 (the window) -- only the window,
+not the whole BAR -- map descriptors into it and unmap only what it mapped.
+A window mapping must be a descriptor, at its own allocation, page-aligned,
+inside the window, clear of its other mappings, coherent, at most 16384 at
+once, from an NVIDIA device (major 195) or a DRM node (226) -- the only files
+the backend places there -- and writable only if opened read-write. Anything
+else a VmMemoryRequest can ask -- another allocation, a guest physical
+address, a non-descriptor source, ballooning, ioevents -- is refused. The
+ioevent tube may register ioevents and nothing else.
+
+Two new requests place CUDA's UVM semaphore pools in region 2, the UVM
+aperture: RegisterUvmPool maps a UVM file at the host address that is its
+file offset (UVM takes no other), checks the pages are present with mincore,
+and gives it a KVM memory slot at an aperture offset; UnregisterUvmPool takes
+the slot away, then the mapping. The main process checks the address is
+page-aligned and in [4 GiB, 32 TiB), the length non-zero, whole pages and at
+most 64 MiB, the offset inside the aperture it laid out and clear of live
+pools, the file offset equal to the address, the descriptor really
+/dev/nvidia-uvm (minor 0 of the major /proc/devices gives, or its
+/proc/self/fd link) opened read-write, and at most 64 pools and 256 MiB per
+device. Withdrawal must name a live pool exactly. When the tube goes away,
+every pool and window mapping it made is withdrawn. Refusals are logged,
+the first eight and then every 1024th. Unrestricted tubes refuse both.
+
+reserve_uvm_band reserves [4 GiB, 32 TiB) PROT_NONE, MAP_NORESERVE, before
+anything else can be placed there. A pool is then mapped with MAP_FIXED over
+that reservation only (a range the band tracks: never a live pool, never a
+range left unknown by a failure), and withdrawal puts the reservation back
+in the same step. A failed placement refills any hole it left (checked
+against /proc/self/maps) or never maps there again. UVM does not take a
+mapping moved in with mremap (its offset must equal the address at mmap
+time, and a semaphore pool's vm_open disables a moved vma), so the window's
+map-then-move placement cannot be used; without the band a pool is mapped
+with MAP_FIXED_NOREPLACE.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ vm_control/src/any_control_tube.rs |    9 +
+ vm_control/src/api.rs              |   31 +
+ vm_control/src/lib.rs              |   57 +
+ vm_control/src/nvgpu.rs            |   26 +
+ vm_control/src/sys/linux.rs        |   23 +-
+ vm_control/src/sys/linux/nvgpu.rs  | 1957 ++++++++++++++++++++++++++++
+ 6 files changed, 2102 insertions(+), 1 deletion(-)
+ create mode 100644 vm_control/src/nvgpu.rs
+ create mode 100644 vm_control/src/sys/linux/nvgpu.rs
+
+diff --git a/vm_control/src/any_control_tube.rs b/vm_control/src/any_control_tube.rs
+index 4a8c239..d6da300 100644
+--- a/vm_control/src/any_control_tube.rs
++++ b/vm_control/src/any_control_tube.rs
+@@ -23,6 +23,15 @@ pub enum AnyControlTube {
+     IrqTube(Tube),
+     // Sends `PvClockCommand`.
+     PvClock(Tube),
++    /// Receives `VmMemoryRequest`, held to what one device needs (see
++    /// `sys::linux::nvgpu::VmMemoryTubeRestriction`).
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    RestrictedVmMemoryTube {
++        tube: Tube,
++        /// Whether the other end of the tube is in another process.
++        remote_peer: bool,
++        restriction: crate::sys::linux::nvgpu::VmMemoryTubeRestriction,
++    },
+     // Sends `SndControlCommand`.
+     Snd(Tube),
+     /// Receives `VmRequest`.
+diff --git a/vm_control/src/api.rs b/vm_control/src/api.rs
+index 5f04d72..987f8fa 100644
+--- a/vm_control/src/api.rs
++++ b/vm_control/src/api.rs
+@@ -171,6 +171,37 @@ impl VmMemoryClient {
+         }))
+     }
+ 
++    /// Map a UVM semaphore pool at its own host address and give it a memory slot at `offset`
++    /// in `alloc`. See `VmMemoryRequest::RegisterUvmPool`.
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    pub fn register_uvm_pool(
++        &self,
++        descriptor: base::SafeDescriptor,
++        host_address: u64,
++        size: u64,
++        alloc: Alloc,
++        offset: u64,
++    ) -> Result<()> {
++        self.request_unit(&VmMemoryRequest::RegisterUvmPool {
++            descriptor,
++            host_address,
++            file_offset: host_address,
++            size,
++            alloc,
++            offset,
++        })
++    }
++
++    /// Undo `register_uvm_pool` for the pool at `offset`, `size` bytes long.
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    pub fn unregister_uvm_pool(&self, alloc: Alloc, offset: u64, size: u64) -> Result<()> {
++        self.request_unit(&VmMemoryRequest::UnregisterUvmPool {
++            alloc,
++            offset,
++            size,
++        })
++    }
++
+     pub fn balloon_target_reached(&self, size: u64) -> Result<()> {
+         self.request_unit(&VmMemoryRequest::BalloonTargetReached { size })
+     }
+diff --git a/vm_control/src/lib.rs b/vm_control/src/lib.rs
+index 0387a13..5581984 100644
+--- a/vm_control/src/lib.rs
++++ b/vm_control/src/lib.rs
+@@ -23,6 +23,7 @@ pub use device_id::PlatformDeviceId;
+ #[cfg(feature = "gdb")]
+ pub mod gdb;
+ pub mod gpu;
++pub mod nvgpu;
+ 
+ use base::debug;
+ #[cfg(any(target_os = "android", target_os = "linux"))]
+@@ -550,6 +551,34 @@ impl VmMemorySource {
+     }
+ }
+ 
++/// Where a device's shared memory regions sit in the one BAR that holds them, as the PCI transport
++/// laid them out. The main process uses it to hold a device's memory requests to the regions it
++/// really has, whatever the device process says (see `sys::linux::nvgpu`).
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct SharedMemoryBarLayout {
++    /// The BAR's allocation.
++    pub alloc: Alloc,
++    /// The BAR's size.
++    pub size: u64,
++    /// Each region: its shared memory id, its offset in the BAR and its length.
++    pub regions: Vec<(u8, u64, u64)>,
++}
++
++impl SharedMemoryBarLayout {
++    /// The offset and length of region `id`.
++    pub fn region(&self, id: u8) -> Option<(u64, u64)> {
++        self.regions
++            .iter()
++            .find(|(i, _, _)| *i == id)
++            .map(|&(_, offset, len)| (offset, len))
++    }
++}
++
++/// Filled in once, by the PCI transport in the main process when it lays out the device's BAR --
++/// before the device is moved into a process of its own -- and read by the main process
++/// afterwards. A device process's copy is its own and changes nothing here.
++pub type SharedMemoryLayoutReport = Arc<std::sync::OnceLock<SharedMemoryBarLayout>>;
++
+ /// Destination of a `VmMemoryRequest::RegisterMemory` mapping in guest address space.
+ #[derive(Serialize, Deserialize)]
+ pub enum VmMemoryDestination {
+@@ -633,6 +662,28 @@ pub enum VmMemoryRequest {
+     UnregisterMemory(VmMemoryRegionId),
+     /// Register an eventfd with raw guest memory address.
+     IoEventRaw(IoEventUpdateRequest),
++    /// Map `size` bytes of a UVM file at host address `host_address` of this process, which is
++    /// also the file offset (UVM maps a semaphore pool only there), check its pages are present,
++    /// and give it a memory slot of its own at `offset` in `alloc`. Served only for a
++    /// virtio-nvgpu device's tube, against the region the main process laid out for it; refused
++    /// everywhere else. See `sys::linux::nvgpu`.
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    RegisterUvmPool {
++        descriptor: SafeDescriptor,
++        host_address: u64,
++        file_offset: u64,
++        size: u64,
++        alloc: Alloc,
++        offset: u64,
++    },
++    /// Undo `RegisterUvmPool` for the pool at exactly `offset` and `size`: the slot first, then
++    /// the mapping.
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    UnregisterUvmPool {
++        alloc: Alloc,
++        offset: u64,
++        size: u64,
++    },
+ }
+ 
+ /// Struct for managing `VmMemoryRequest`s IOMMU related state.
+@@ -1084,6 +1135,12 @@ impl VmMemoryRequest {
+                     Err(e) => VmMemoryResponse::Err(e.into()),
+                 }
+             }
++            // Only a tube the main process holds to virtio-nvgpu's regions serves these
++            // (`sys::linux::nvgpu::NvgpuTubeState`); it never gets here.
++            #[cfg(any(target_os = "android", target_os = "linux"))]
++            RegisterUvmPool { .. } | UnregisterUvmPool { .. } => {
++                VmMemoryResponse::Err(anyhow::Error::new(SysError::new(EPERM)).into())
++            }
+             IoEventRaw(request) => {
+                 let res = if request.register {
+                     vm.register_ioevent(
+diff --git a/vm_control/src/nvgpu.rs b/vm_control/src/nvgpu.rs
+new file mode 100644
+index 0000000..5e51b98
+--- /dev/null
++++ b/vm_control/src/nvgpu.rs
+@@ -0,0 +1,26 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! virtio-nvgpu's shared memory regions and the bounds on its UVM aperture, which the device's
++//! vhost-user frontend checks first and the main process checks again (`sys::linux::nvgpu`).
++
++/// virtio-nvgpu's window: where the backend places device memory.
++pub const NVGPU_SHM_ID_WINDOW: u8 = 1;
++/// virtio-nvgpu's UVM aperture: where UVM semaphore pools get a memory slot each.
++pub const NVGPU_SHM_ID_UVM: u8 = 2;
++
++/// The host address band a pool must lie in: [4 GiB, 32 TiB). The backend and the guest driver
++/// hold pools to the same band.
++pub const UVM_HVA_MIN: u64 = 1 << 32;
++pub const UVM_HVA_MAX: u64 = 1 << 45;
++/// The largest pool. A semaphore pool is a few megabytes.
++pub const UVM_POOL_MAX_LEN: u64 = 64 << 20;
++/// Pools placed at once per device. Each costs a KVM memory slot.
++pub const UVM_MAX_POOLS: usize = 64;
++/// Bytes of pool placed at once per device.
++pub const UVM_MAX_POOL_BYTES: u64 = 256 << 20;
++/// The most of the aperture pools are placed in.
++pub const UVM_APERTURE_MAX: u64 = 1 << 30;
++/// The boundary a pool's aperture offset is on (the backend's placement unit).
++pub const UVM_APERTURE_ALIGN: u64 = 2 << 20;
+diff --git a/vm_control/src/sys/linux.rs b/vm_control/src/sys/linux.rs
+index c3594f3..4992ece 100644
+--- a/vm_control/src/sys/linux.rs
++++ b/vm_control/src/sys/linux.rs
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ pub(crate) mod gpu;
++pub mod nvgpu;
+ 
+ use std::path::Path;
+ use std::sync::LazyLock;
+@@ -187,13 +188,33 @@ pub fn prepare_shared_memory_region(
+     allocator: &mut SystemAllocator,
+     alloc: Alloc,
+     cache: MemCacheType,
++) -> Result<VmMappedMemoryRegion, SysError> {
++    prepare_shared_memory_region_len(vm, allocator, alloc, cache, None)
++}
++
++/// As `prepare_shared_memory_region`, for the first `len` bytes of the allocation only (all of it
++/// when `None`): a BAR that holds more than one shared memory region prepares the first, and the
++/// rest are mapped some other way.
++pub fn prepare_shared_memory_region_len(
++    vm: &dyn Vm,
++    allocator: &mut SystemAllocator,
++    alloc: Alloc,
++    cache: MemCacheType,
++    len: Option<u64>,
+ ) -> Result<VmMappedMemoryRegion, SysError> {
+     if !matches!(alloc, Alloc::PciBar { .. }) {
+         return Err(SysError::new(EINVAL));
+     }
+     match allocator.mmio_allocator_any().get(&alloc) {
+         Some((range, _)) => {
+-            let size: usize = match range.len().and_then(|x| x.try_into().ok()) {
++            let full = range.len();
++            let size = match (full, len) {
++                (Some(full), Some(len)) if len <= full && len > 0 => Some(len),
++                (Some(_), Some(_)) => return Err(SysError::new(EINVAL)),
++                (full, None) => full,
++                (None, Some(_)) => None,
++            };
++            let size: usize = match size.and_then(|x| x.try_into().ok()) {
+                 Some(v) => v,
+                 None => return Err(SysError::new(ERANGE)),
+             };
+diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
+new file mode 100644
+index 0000000..d5bc11e
+--- /dev/null
++++ b/vm_control/src/sys/linux/nvgpu.rs
+@@ -0,0 +1,1957 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! What the main process lets a virtio-nvgpu device ask of it, and the UVM aperture.
++//!
++//! The device's vhost-user frontend may run in a process of its own. Its memory requests reach
++//! this process over the device's two `VmMemoryRequest` tubes, and nothing it says is taken on
++//! trust: each tube is held to what the device needs, against the BAR the PCI transport laid out
++//! here before the device process was made (`SharedMemoryBarLayout`).
++//!
++//! **The shared memory tube** may prepare region 1 (the window) and map descriptors into it, and
++//! unmap only what it mapped. Every mapping must lie inside the window, page-aligned, clear of the
++//! tube's other mappings, from a descriptor that is an NVIDIA device or a DRM node (the only files
++//! the backend places there), and writable only if that descriptor was opened for writing. It may
++//! also place UVM semaphore pools in region 2, the UVM aperture (below). Anything else --
++//! another allocation, a guest physical address, a source that is not a descriptor, ballooning,
++//! ioevents -- is refused.
++//!
++//! **The ioevent tube** may register and unregister ioevents, nothing else.
++//!
++//! **The UVM aperture.** A CUDA context maps a UVM semaphore pool at a host address equal to its
++//! file offset (UVM takes it nowhere else, `uvm.c` `uvm_mmap`), and that address is the guest's
++//! choice. So the pool is mapped in this process at exactly that address and given a memory slot
++//! of its own at an offset in region 2. The address must lie in [4 GiB, 32 TiB), where a 64-bit
++//! process has nothing of its own (its executable and heap sit at two-thirds of the 47-bit space,
++//! its mappings grow down from below the stack, or, under a legacy layout, up from a third of
++//! it). With `reserve_uvm_band` that band is also reserved, `PROT_NONE`, before anything else can
++//! be placed there, so a pool can never land on this process's own memory nor fail because this
++//! process happened to have something at its address. A pool is then mapped over the reservation
++//! (`MAP_FIXED` over a range this module owns and tracks, never over anything else), and on
++//! withdrawal the reservation is put back in the same step. Without the reservation a pool is
++//! mapped with `MAP_FIXED_NOREPLACE`. UVM will not take a mapping moved into place with
++//! `mremap` (its offset must equal the address at mmap time, and a semaphore pool's `vm_open`
++//! disables a moved mapping), so the window's map-then-move placement cannot be used.
++//!
++//! A slot is added only once the pages are known to be present (UVM can accept a mapping and
++//! insert nothing when it cannot take its power-management lock) and is removed before the
++//! mapping goes. Pools are bounded per device: 64 at once, 256 MiB in all, 64 MiB each. When the
++//! device's tube goes away, every pool it placed is withdrawn here.
++
++use std::collections::BTreeMap;
++use std::fs::File;
++use std::io;
++use std::os::unix::fs::MetadataExt;
++use std::sync::Mutex;
++
++use base::error;
++use base::info;
++use base::warn;
++use base::AsRawDescriptor;
++use base::MappedRegion;
++use base::Protection;
++use base::SafeDescriptor;
++use hypervisor::MemCacheType;
++use hypervisor::MemSlot;
++use hypervisor::Vm;
++use resources::Alloc;
++use resources::SystemAllocator;
++use serde::Deserialize;
++use serde::Serialize;
++use vm_memory::GuestAddress;
++
++use crate::SharedMemoryBarLayout;
++use crate::SharedMemoryLayoutReport;
++use crate::VmMemoryDestination;
++use crate::VmMemoryRegionId;
++use crate::VmMemoryRegionState;
++use crate::VmMemoryRequest;
++use crate::VmMemoryResponse;
++use crate::VmMemorySource;
++
++pub use crate::nvgpu::NVGPU_SHM_ID_UVM;
++pub use crate::nvgpu::NVGPU_SHM_ID_WINDOW;
++pub use crate::nvgpu::UVM_APERTURE_MAX;
++pub use crate::nvgpu::UVM_HVA_MAX;
++pub use crate::nvgpu::UVM_HVA_MIN;
++pub use crate::nvgpu::UVM_MAX_POOLS;
++pub use crate::nvgpu::UVM_MAX_POOL_BYTES;
++pub use crate::nvgpu::UVM_POOL_MAX_LEN;
++
++/// Live window mappings per device. Without a prepared window each costs a KVM memory slot, and
++/// with one a mapping of this process's; either way the device must not be able to use them all.
++pub const WINDOW_MAX_MAPPINGS: usize = 16384;
++
++/// `/dev/nvidia*`: every GPU, `nvidiactl` and `nvidia-modeset`.
++const NVIDIA_MAJOR: u32 = 195;
++/// DRM card and render nodes.
++const DRM_MAJOR: u32 = 226;
++
++/// How a virtio-nvgpu device's tube is held, as `run_control` receives it.
++pub enum VmMemoryTubeRestriction {
++    /// The tube its shared memory is mapped through, held to the BAR the PCI transport reports
++    /// into this cell.
++    NvgpuSharedMemory(SharedMemoryLayoutReport),
++    /// The tube its ioevents are registered through.
++    NvgpuIoEvents,
++}
++
++impl VmMemoryTubeRestriction {
++    /// The policy, once the BAR has been laid out. A shared memory tube whose BAR was never laid
++    /// out gets a policy that refuses everything.
++    pub fn resolve(&self) -> NvgpuTubePolicy {
++        match self {
++            Self::NvgpuSharedMemory(report) => NvgpuTubePolicy::SharedMemory(report.get().cloned()),
++            Self::NvgpuIoEvents => NvgpuTubePolicy::IoEvents,
++        }
++    }
++}
++
++/// What a restricted tube may ask for.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub enum NvgpuTubePolicy {
++    /// Region 1 and region 2 of this BAR, as described above; `None` for nothing at all.
++    SharedMemory(Option<SharedMemoryBarLayout>),
++    /// Ioevents only.
++    IoEvents,
++}
++
++/// The two regions, checked.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Regions {
++    alloc: Alloc,
++    /// BAR offset and length.
++    window: (u64, u64),
++    aperture: Option<(u64, u64)>,
++}
++
++impl Regions {
++    fn from_layout(layout: &SharedMemoryBarLayout) -> Option<Regions> {
++        let page = base::pagesize() as u64;
++        let fits = |(offset, len): (u64, u64)| {
++            offset % page == 0
++                && len > 0
++                && offset
++                    .checked_add(len)
++                    .is_some_and(|end| end <= layout.size)
++        };
++        let window = layout.region(NVGPU_SHM_ID_WINDOW).filter(|&w| fits(w))?;
++        // The window is prepared as one arena from the start of the BAR.
++        if window.0 != 0 {
++            return None;
++        }
++        let aperture = layout
++            .region(NVGPU_SHM_ID_UVM)
++            .map(|(offset, len)| (offset, len.min(UVM_APERTURE_MAX) & !(page - 1)))
++            .filter(|&a| fits(a) && (a.0 >= window.0 + window.1 || a.0 + a.1 <= window.0));
++        Some(Regions {
++            alloc: layout.alloc,
++            window,
++            aperture,
++        })
++    }
++}
++
++/// What a descriptor is, as far as the checks here care.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum FdKind {
++    NvidiaDevice,
++    Drm,
++    Uvm,
++    Other,
++}
++
++fn dev_major(rdev: u64) -> u32 {
++    (((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff)) as u32
++}
++
++fn dev_minor(rdev: u64) -> u32 {
++    (((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff)) as u32
++}
++
++fn classify(mode: u32, rdev: u64, uvm_major: Option<u32>) -> FdKind {
++    if mode & libc::S_IFMT != libc::S_IFCHR {
++        return FdKind::Other;
++    }
++    match dev_major(rdev) {
++        NVIDIA_MAJOR => FdKind::NvidiaDevice,
++        DRM_MAJOR => FdKind::Drm,
++        // nvidia-uvm is minor 0 of its major; minor 1 is nvidia-uvm-tools.
++        m if Some(m) == uvm_major && dev_minor(rdev) == 0 => FdKind::Uvm,
++        _ => FdKind::Other,
++    }
++}
++
++/// The major of `name` among the character devices in `/proc/devices`.
++fn parse_char_major(proc_devices: &str, name: &str) -> Option<u32> {
++    let mut in_char = false;
++    for line in proc_devices.lines() {
++        match line.trim() {
++            "Character devices:" => in_char = true,
++            "Block devices:" => in_char = false,
++            l if in_char => {
++                let mut it = l.split_whitespace();
++                if let (Some(major), Some(n), None) = (it.next(), it.next(), it.next()) {
++                    if n == name {
++                        return major.parse().ok();
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++    None
++}
++
++static UVM_MAJOR: Mutex<Option<u32>> = Mutex::new(None);
++
++/// Find nvidia-uvm's major now, if its module is loaded. Called at startup; if it was not
++/// loaded then, the first pool looks again.
++pub fn probe_host() -> Option<u32> {
++    let major = std::fs::read_to_string("/proc/devices")
++        .ok()
++        .and_then(|s| parse_char_major(&s, "nvidia-uvm"));
++    if major.is_some() {
++        *UVM_MAJOR.lock().unwrap_or_else(|e| e.into_inner()) = major;
++    }
++    major
++}
++
++fn uvm_major() -> Option<u32> {
++    let cached = *UVM_MAJOR.lock().unwrap_or_else(|e| e.into_inner());
++    cached.or_else(probe_host)
++}
++
++/// The descriptor's kind and its access mode (`O_ACCMODE` of its flags).
++fn describe(fd: &SafeDescriptor) -> io::Result<(FdKind, i32)> {
++    let file = File::from(fd.try_clone().map_err(io::Error::from)?);
++    let meta = file.metadata()?;
++    // SAFETY: F_GETFL reads the flags of a descriptor this function holds; nothing is written.
++    let flags = unsafe { libc::fcntl(file.as_raw_descriptor(), libc::F_GETFL) };
++    if flags < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let mut kind = classify(meta.mode(), meta.rdev(), uvm_major());
++    if kind == FdKind::Other && meta.mode() & libc::S_IFMT == libc::S_IFCHR && uvm_major().is_none()
++    {
++        // No nvidia-uvm in /proc/devices (another mount namespace's procfs): its path, then.
++        let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_descriptor()));
++        if link.is_ok_and(|p| p.as_os_str() == "/dev/nvidia-uvm") {
++            kind = FdKind::Uvm;
++        }
++    }
++    Ok((kind, flags & libc::O_ACCMODE))
++}
++
++/// Whether a descriptor of `kind`, opened with `accmode`, may be mapped `writable` into the
++/// window. The backend places only the NVIDIA devices and DRM nodes there.
++fn window_fd_allowed(kind: FdKind, accmode: i32, writable: bool) -> bool {
++    matches!(kind, FdKind::NvidiaDevice | FdKind::Drm)
++        && match accmode {
++            libc::O_RDWR => true,
++            libc::O_RDONLY => !writable,
++            _ => false,
++        }
++}
++
++/// Whether a descriptor of `kind`, opened with `accmode`, may be mapped as a pool: nvidia-uvm
++/// itself, read-write (UVM maps a pool shared and writable only).
++fn uvm_fd_allowed(kind: FdKind, accmode: i32) -> bool {
++    kind == FdKind::Uvm && accmode == libc::O_RDWR
++}
++
++fn check_window_fd(fd: &SafeDescriptor, writable: bool) -> Result<(), i32> {
++    match describe(fd) {
++        Ok((kind, accmode)) if window_fd_allowed(kind, accmode, writable) => Ok(()),
++        Ok(_) => Err(libc::EPERM),
++        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EBADF)),
++    }
++}
++
++fn check_uvm_fd(fd: &SafeDescriptor) -> Result<(), i32> {
++    match describe(fd) {
++        Ok((kind, accmode)) if uvm_fd_allowed(kind, accmode) => Ok(()),
++        Ok(_) => Err(libc::EPERM),
++        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EBADF)),
++    }
++}
++
++/// Whether every page of `[addr, addr + len)` has a page behind it.
++fn resident(addr: u64, len: u64) -> io::Result<bool> {
++    let page = base::pagesize() as u64;
++    let mut vec = vec![0u8; len.div_ceil(page) as usize];
++    // SAFETY: `vec` has one byte per page of the range, as mincore writes; the range is only
++    // looked at.
++    let rc = unsafe {
++        libc::mincore(
++            addr as *mut libc::c_void,
++            len as usize,
++            vec.as_mut_ptr() as *mut libc::c_uchar,
++        )
++    };
++    if rc != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(vec.iter().all(|b| b & 1 != 0))
++}
++
++/// Whether `[addr, addr + len)` is covered, without a gap, by anonymous `PROT_NONE` private
++/// mappings: what the band's reservation looks like in `/proc/self/maps`.
++fn is_reservation(addr: u64, len: u64) -> bool {
++    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
++        return false;
++    };
++    let end = addr + len;
++    let mut next = addr;
++    for line in maps.lines() {
++        let mut f = line.split_whitespace();
++        let (Some(range), Some(perms), Some(_off), Some(_dev), Some(inode)) =
++            (f.next(), f.next(), f.next(), f.next(), f.next())
++        else {
++            continue;
++        };
++        let Some((s, e)) = range.split_once('-') else {
++            continue;
++        };
++        let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) else {
++            continue;
++        };
++        if e <= next || s >= end {
++            continue;
++        }
++        if s > next || perms != "---p" || inode != "0" || f.next().is_some() {
++            return false;
++        }
++        next = e;
++        if next >= end {
++            return true;
++        }
++    }
++    false
++}
++
++/// The host address band pools are placed in, and what is placed there.
++pub struct UvmBand {
++    min: u64,
++    max: u64,
++    /// Whether all of `[min, max)` was reserved at startup.
++    reserved: bool,
++    /// Host address to length, for every pool mapped now, by any device.
++    live: BTreeMap<u64, u64>,
++    /// Ranges a failed placement or withdrawal left in a state this module no longer knows, and
++    /// so never maps over again.
++    tainted: Vec<(u64, u64)>,
++}
++
++/// This process's band.
++pub static UVM_BAND: Mutex<UvmBand> = Mutex::new(UvmBand::new(UVM_HVA_MIN, UVM_HVA_MAX));
++
++const RESERVE_FLAGS: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
++
++/// Reserve this process's band, `PROT_NONE`, before anything else is placed in it. Call once, in
++/// the main process, before any thread or device process is started. Without it pools are mapped
++/// with `MAP_FIXED_NOREPLACE` and can collide with whatever else this process has there.
++pub fn reserve_uvm_band() -> io::Result<()> {
++    UVM_BAND.lock().unwrap_or_else(|e| e.into_inner()).reserve()
++}
++
++impl UvmBand {
++    pub const fn new(min: u64, max: u64) -> UvmBand {
++        UvmBand {
++            min,
++            max,
++            reserved: false,
++            live: BTreeMap::new(),
++            tainted: Vec::new(),
++        }
++    }
++
++    /// Reserve `[min, max)`: `PROT_NONE`, not accounted, and only if nothing is there yet.
++    pub fn reserve(&mut self) -> io::Result<()> {
++        if self.reserved {
++            return Ok(());
++        }
++        let len = (self.max - self.min) as usize;
++        // SAFETY: MAP_FIXED_NOREPLACE never displaces an existing mapping; the kernel refuses
++        // with EEXIST instead. A PROT_NONE anonymous mapping gives access to nothing.
++        let p = unsafe {
++            libc::mmap(
++                self.min as *mut libc::c_void,
++                len,
++                libc::PROT_NONE,
++                RESERVE_FLAGS | libc::MAP_FIXED_NOREPLACE,
++                -1,
++                0,
++            )
++        };
++        if p == libc::MAP_FAILED {
++            return Err(io::Error::last_os_error());
++        }
++        if p as u64 != self.min {
++            // A kernel before 4.17 takes the flag as a hint. Not ours to keep.
++            // SAFETY: the mapping just made, at the address the kernel gave.
++            unsafe { libc::munmap(p, len) };
++            return Err(io::Error::from_raw_os_error(libc::EEXIST));
++        }
++        self.reserved = true;
++        Ok(())
++    }
++
++    pub fn is_reserved(&self) -> bool {
++        self.reserved
++    }
++
++    fn overlaps(&self, addr: u64, len: u64) -> bool {
++        let hit = |s: u64, l: u64| s < addr + len && addr < s + l;
++        self.live
++            .range(..addr + len)
++            .next_back()
++            .is_some_and(|(&s, &l)| hit(s, l))
++            || self.tainted.iter().any(|&(s, l)| hit(s, l))
++    }
++
++    /// Map `len` bytes of `fd` at `addr`, which is also the file offset, and check its pages are
++    /// present. On any error nothing of it is left mapped.
++    fn place(
++        band: &'static Mutex<UvmBand>,
++        fd: &SafeDescriptor,
++        addr: u64,
++        len: u64,
++    ) -> io::Result<UvmPoolMapping> {
++        let mut b = band.lock().unwrap_or_else(|e| e.into_inner());
++        if addr < b.min || addr.checked_add(len).is_none_or(|end| end > b.max) {
++            return Err(io::Error::from_raw_os_error(libc::EINVAL));
++        }
++        if b.overlaps(addr, len) {
++            return Err(io::Error::from_raw_os_error(libc::EEXIST));
++        }
++        let fixed = if b.reserved {
++            libc::MAP_FIXED
++        } else {
++            libc::MAP_FIXED_NOREPLACE
++        };
++        // SAFETY: with the band reserved, `[addr, addr + len)` lies in the reservation, holds no
++        // live pool and is not tainted (both checked above under the band's lock), so what
++        // MAP_FIXED replaces is only reservation this module owns, which nothing refers to.
++        // Without it, NOREPLACE never displaces anything.
++        let p = unsafe {
++            libc::mmap(
++                addr as *mut libc::c_void,
++                len as usize,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED | fixed,
++                fd.as_raw_descriptor(),
++                addr as libc::off_t,
++            )
++        };
++        if p == libc::MAP_FAILED {
++            let e = io::Error::last_os_error();
++            if b.reserved {
++                b.repair(addr, len);
++            }
++            return Err(e);
++        }
++        if p as u64 != addr {
++            // Only a pre-4.17 kernel, which reads NOREPLACE as a hint, gets here.
++            // SAFETY: the mapping just made, at the address the kernel gave.
++            unsafe { libc::munmap(p, len as usize) };
++            return Err(io::Error::from_raw_os_error(libc::EEXIST));
++        }
++        b.live.insert(addr, len);
++        // UVM can accept the mapping and insert nothing (when it cannot take its
++        // power-management lock it disables the vma and reports success). A slot over that would
++        // stop the VM the first time the guest touched it.
++        match resident(addr, len) {
++            Ok(true) => {}
++            Ok(false) => {
++                b.release(addr, len);
++                return Err(io::Error::from_raw_os_error(libc::EFAULT));
++            }
++            Err(e) => {
++                b.release(addr, len);
++                return Err(e);
++            }
++        }
++        Ok(UvmPoolMapping { band, addr, len })
++    }
++
++    /// After a failed `MAP_FIXED` over the reservation: the kernel either put the reservation
++    /// back or left the range unmapped. Fill a hole; if the range holds anything but the
++    /// reservation, never map over it again.
++    fn repair(&mut self, addr: u64, len: u64) {
++        // SAFETY: NOREPLACE never displaces an existing mapping.
++        let p = unsafe {
++            libc::mmap(
++                addr as *mut libc::c_void,
++                len as usize,
++                libc::PROT_NONE,
++                RESERVE_FLAGS | libc::MAP_FIXED_NOREPLACE,
++                -1,
++                0,
++            )
++        };
++        if p != libc::MAP_FAILED && p as u64 == addr {
++            return;
++        }
++        if p != libc::MAP_FAILED {
++            // SAFETY: the mapping just made, at the address the kernel gave.
++            unsafe { libc::munmap(p, len as usize) };
++        }
++        if !is_reservation(addr, len) {
++            error!(
++                "nvgpu uvm: {:#x}+{:#x} is no longer reserved after a failed placement; never \
++                 placing there again",
++                addr, len
++            );
++            self.tainted.push((addr, len));
++        }
++    }
++
++    /// Take a pool's mapping away, putting the reservation back in the same step.
++    fn release(&mut self, addr: u64, len: u64) {
++        self.live.remove(&addr);
++        if self.reserved {
++            // SAFETY: `[addr, addr + len)` is a pool this band placed; its slot is gone (or was
++            // never made), so nothing refers to it. An anonymous PROT_NONE mapping replaces it.
++            let p = unsafe {
++                libc::mmap(
++                    addr as *mut libc::c_void,
++                    len as usize,
++                    libc::PROT_NONE,
++                    RESERVE_FLAGS | libc::MAP_FIXED,
++                    -1,
++                    0,
++                )
++            };
++            if p != libc::MAP_FAILED && p as u64 == addr {
++                return;
++            }
++            error!(
++                "nvgpu uvm: could not put the reservation back over {:#x}+{:#x}: {}",
++                addr,
++                len,
++                io::Error::last_os_error()
++            );
++            self.tainted.push((addr, len));
++        }
++        // SAFETY: as above; the pool's mapping, which nothing refers to.
++        if unsafe { libc::munmap(addr as *mut libc::c_void, len as usize) } != 0 {
++            warn!(
++                "nvgpu uvm: munmap {:#x}+{:#x}: {}",
++                addr,
++                len,
++                io::Error::last_os_error()
++            );
++        }
++    }
++}
++
++/// A pool mapped at its own address. Dropping it takes the mapping away.
++pub struct UvmPoolMapping {
++    band: &'static Mutex<UvmBand>,
++    addr: u64,
++    len: u64,
++}
++
++// SAFETY: `addr..addr + len` is a mapping this object owns: `UvmBand::place` made it, the band
++// records it as live so nothing else is placed over it, and only `drop` takes it away.
++unsafe impl MappedRegion for UvmPoolMapping {
++    fn as_ptr(&self) -> *mut u8 {
++        self.addr as *mut u8
++    }
++
++    fn size(&self) -> usize {
++        self.len as usize
++    }
++}
++
++impl Drop for UvmPoolMapping {
++    fn drop(&mut self) {
++        self.band
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .release(self.addr, self.len);
++    }
++}
++
++/// What a pool needs from the VM: where its offset is in guest physical memory, and slots.
++pub trait PoolHost {
++    fn guest_address(&mut self, alloc: Alloc, offset: u64, size: u64) -> Option<u64>;
++    fn add_slot(&mut self, gpa: u64, region: Box<dyn MappedRegion>) -> base::Result<MemSlot>;
++    fn remove_slot(&mut self, slot: MemSlot) -> base::Result<Box<dyn MappedRegion>>;
++}
++
++/// The real VM.
++pub struct VmPoolHost<'a> {
++    pub vm: &'a dyn Vm,
++    pub allocator: &'a mut SystemAllocator,
++}
++
++impl PoolHost for VmPoolHost<'_> {
++    fn guest_address(&mut self, alloc: Alloc, offset: u64, size: u64) -> Option<u64> {
++        self.allocator
++            .mmio_allocator_any()
++            .address_from_pci_offset(alloc, offset, size)
++            .ok()
++    }
++
++    fn add_slot(&mut self, gpa: u64, region: Box<dyn MappedRegion>) -> base::Result<MemSlot> {
++        self.vm.add_memory_region(
++            GuestAddress(gpa),
++            region,
++            false,
++            false,
++            MemCacheType::CacheCoherent,
++        )
++    }
++
++    fn remove_slot(&mut self, slot: MemSlot) -> base::Result<Box<dyn MappedRegion>> {
++        self.vm.remove_memory_region(slot)
++    }
++}
++
++/// What to do with a request from a restricted tube.
++pub enum NvgpuVerdict {
++    /// Refused, or done here: send this.
++    Respond(VmMemoryResponse),
++    /// Allowed: execute it as any other, then hand the response to `NvgpuTubeState::note`.
++    Execute(VmMemoryRequest, Pending),
++}
++
++/// What an executed request changes in a tube's record.
++pub enum Pending {
++    Nothing,
++    Register { offset: u64, len: u64 },
++    Unregister(VmMemoryRegionId),
++}
++
++enum Admission {
++    Refuse(i32, String),
++    Execute(VmMemoryRequest, Pending),
++    Prepare(Regions, MemCacheType),
++    MapPool {
++        descriptor: SafeDescriptor,
++        host_address: u64,
++        size: u64,
++        offset: u64,
++    },
++    UnmapPool {
++        offset: u64,
++        size: u64,
++    },
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Pool {
++    host_address: u64,
++    len: u64,
++    slot: MemSlot,
++}
++
++enum Role {
++    SharedMemory(Option<Regions>),
++    IoEvents,
++}
++
++/// One restricted tube's record: what it has mapped, and how many refusals it has had.
++pub struct NvgpuTubeState {
++    role: Role,
++    /// Window mappings, BAR offset to length (in whole pages).
++    window: BTreeMap<u64, u64>,
++    /// The region id each window mapping was registered under, to its BAR offset.
++    window_ids: BTreeMap<VmMemoryRegionId, u64>,
++    /// Pools, by BAR offset.
++    pools: BTreeMap<u64, Pool>,
++    pool_bytes: u64,
++    refusals: u64,
++    band: &'static Mutex<UvmBand>,
++    window_fd_check: fn(&SafeDescriptor, bool) -> Result<(), i32>,
++    uvm_fd_check: fn(&SafeDescriptor) -> Result<(), i32>,
++}
++
++fn err_response(errno: i32) -> VmMemoryResponse {
++    VmMemoryResponse::Err(anyhow::Error::new(base::Error::new(errno)).into())
++}
++
++impl NvgpuTubeState {
++    pub fn new(policy: NvgpuTubePolicy) -> NvgpuTubeState {
++        let role = match policy {
++            NvgpuTubePolicy::SharedMemory(layout) => {
++                let regions = layout.as_ref().and_then(Regions::from_layout);
++                if regions.is_none() {
++                    error!(
++                        "nvgpu: no usable shared memory layout ({:?}); every request of this \
++                         device's shared memory tube will be refused",
++                        layout
++                    );
++                }
++                Role::SharedMemory(regions)
++            }
++            NvgpuTubePolicy::IoEvents => Role::IoEvents,
++        };
++        NvgpuTubeState {
++            role,
++            window: BTreeMap::new(),
++            window_ids: BTreeMap::new(),
++            pools: BTreeMap::new(),
++            pool_bytes: 0,
++            refusals: 0,
++            band: &UVM_BAND,
++            window_fd_check: check_window_fd,
++            uvm_fd_check: check_uvm_fd,
++        }
++    }
++
++    /// Serve one request from this tube.
++    pub fn handle(
++        &mut self,
++        request: VmMemoryRequest,
++        vm: &dyn Vm,
++        allocator: &mut SystemAllocator,
++        region_state: &mut VmMemoryRegionState,
++    ) -> NvgpuVerdict {
++        let mut host = VmPoolHost { vm, allocator };
++        match self.admit(request) {
++            Admission::Refuse(errno, why) => NvgpuVerdict::Respond(self.refuse(errno, why)),
++            Admission::Execute(request, pending) => NvgpuVerdict::Execute(request, pending),
++            Admission::Prepare(regions, cache) => {
++                NvgpuVerdict::Respond(Self::prepare(regions, cache, &mut host, region_state))
++            }
++            Admission::MapPool {
++                descriptor,
++                host_address,
++                size,
++                offset,
++            } => NvgpuVerdict::Respond(self.map_pool(
++                &descriptor,
++                host_address,
++                size,
++                offset,
++                &mut host,
++            )),
++            Admission::UnmapPool { offset, size } => {
++                NvgpuVerdict::Respond(self.unmap_pool(offset, size, &mut host))
++            }
++        }
++    }
++
++    /// Record what an executed request did.
++    pub fn note(&mut self, pending: Pending, response: &VmMemoryResponse) {
++        match pending {
++            Pending::Nothing => {}
++            Pending::Register { offset, len } => {
++                if let VmMemoryResponse::RegisterMemory { region_id, .. } = response {
++                    self.window.insert(offset, len);
++                    self.window_ids.insert(*region_id, offset);
++                }
++            }
++            // Whatever the answer, the main process's own record of it is gone.
++            Pending::Unregister(id) => {
++                if let Some(offset) = self.window_ids.remove(&id) {
++                    self.window.remove(&offset);
++                }
++            }
++        }
++    }
++
++    /// The tube has gone -- its device process ended -- so nothing will withdraw what it placed:
++    /// withdraw every pool (slot first) and every window mapping here.
++    pub fn teardown(
++        &mut self,
++        vm: &dyn Vm,
++        allocator: &mut SystemAllocator,
++        region_state: &mut VmMemoryRegionState,
++    ) {
++        self.teardown_pools(&mut VmPoolHost { vm, allocator });
++        for id in self.take_window_ids() {
++            let res = match region_state.registered_memory.remove(&id) {
++                Some(crate::RegisteredMemory::DynamicMapping { slot }) => {
++                    vm.remove_memory_region(slot).map(drop)
++                }
++                Some(crate::RegisteredMemory::FixedMapping { slot, offset, size }) => {
++                    vm.remove_mapping(slot, offset, size)
++                }
++                None => Ok(()),
++            };
++            if let Err(e) = res {
++                warn!("nvgpu: teardown: window mapping {:?}: {}", id, e);
++            }
++        }
++    }
++
++    fn teardown_pools(&mut self, host: &mut dyn PoolHost) {
++        let pools: Vec<(u64, Pool)> = self.pools.iter().map(|(&o, &p)| (o, p)).collect();
++        for (offset, pool) in pools {
++            if let VmMemoryResponse::Err(e) = self.unmap_pool(offset, pool.len, host) {
++                warn!("nvgpu uvm: teardown: pool at {:#x}: {}", offset, e);
++            }
++        }
++    }
++
++    fn take_window_ids(&mut self) -> Vec<VmMemoryRegionId> {
++        self.window.clear();
++        std::mem::take(&mut self.window_ids).into_keys().collect()
++    }
++
++    fn refuse(&mut self, errno: i32, why: String) -> VmMemoryResponse {
++        self.refusals += 1;
++        let n = self.refusals;
++        if n <= 8 || n % 1024 == 0 {
++            warn!(
++                "nvgpu: refused a memory request from the device ({}; {} refused so far)",
++                why, n
++            );
++        }
++        err_response(errno)
++    }
++
++    fn admit(&mut self, request: VmMemoryRequest) -> Admission {
++        let regions = match &self.role {
++            Role::IoEvents => {
++                return match request {
++                    VmMemoryRequest::IoEventRaw(_) => Admission::Execute(request, Pending::Nothing),
++                    _ => Admission::Refuse(
++                        libc::EPERM,
++                        "the ioevent tube asked for something other than an ioevent".into(),
++                    ),
++                };
++            }
++            Role::SharedMemory(None) => {
++                return Admission::Refuse(libc::ENODEV, "no shared memory layout".into())
++            }
++            Role::SharedMemory(Some(r)) => *r,
++        };
++        match request {
++            VmMemoryRequest::PrepareSharedMemoryRegion { alloc, cache } => {
++                if alloc != regions.alloc || cache != MemCacheType::CacheCoherent {
++                    return Admission::Refuse(
++                        libc::EPERM,
++                        format!("prepare of {:?} ({:?})", alloc, cache),
++                    );
++                }
++                Admission::Prepare(regions, cache)
++            }
++            VmMemoryRequest::RegisterMemory {
++                source,
++                dest,
++                prot,
++                cache,
++            } => match self.check_window_mapping(&regions, &source, &dest, prot, cache) {
++                Ok((offset, len)) => Admission::Execute(
++                    VmMemoryRequest::RegisterMemory {
++                        source,
++                        dest,
++                        prot,
++                        cache,
++                    },
++                    Pending::Register { offset, len },
++                ),
++                Err((errno, why)) => Admission::Refuse(errno, why),
++            },
++            VmMemoryRequest::UnregisterMemory(id) => {
++                if self.window_ids.contains_key(&id) {
++                    Admission::Execute(
++                        VmMemoryRequest::UnregisterMemory(id),
++                        Pending::Unregister(id),
++                    )
++                } else {
++                    Admission::Refuse(libc::ENOENT, format!("unregister of {:?}, not its own", id))
++                }
++            }
++            VmMemoryRequest::RegisterUvmPool {
++                descriptor,
++                host_address,
++                file_offset,
++                size,
++                alloc,
++                offset,
++            } => match self.check_pool(
++                &regions,
++                &descriptor,
++                host_address,
++                file_offset,
++                size,
++                alloc,
++                offset,
++            ) {
++                Ok(()) => Admission::MapPool {
++                    descriptor,
++                    host_address,
++                    size,
++                    offset,
++                },
++                Err((errno, why)) => Admission::Refuse(errno, why),
++            },
++            VmMemoryRequest::UnregisterUvmPool {
++                alloc,
++                offset,
++                size,
++            } => {
++                if alloc != regions.alloc || self.pools.get(&offset).is_none_or(|p| p.len != size) {
++                    return Admission::Refuse(
++                        libc::ENOENT,
++                        format!("pool unmap {:#x}+{:#x}: no such pool", offset, size),
++                    );
++                }
++                Admission::UnmapPool { offset, size }
++            }
++            _ => Admission::Refuse(
++                libc::EPERM,
++                "the shared memory tube asked for something it has no use for".into(),
++            ),
++        }
++    }
++
++    /// A window mapping is allowed: returns its BAR offset and length in whole pages.
++    fn check_window_mapping(
++        &self,
++        regions: &Regions,
++        source: &VmMemorySource,
++        dest: &VmMemoryDestination,
++        prot: Protection,
++        cache: MemCacheType,
++    ) -> Result<(u64, u64), (i32, String)> {
++        let page = base::pagesize() as u64;
++        let VmMemorySource::Descriptor {
++            descriptor,
++            offset: fd_offset,
++            size,
++        } = source
++        else {
++            return Err((libc::EPERM, format!("window mapping from {}", source)));
++        };
++        let VmMemoryDestination::ExistingAllocation { allocation, offset } = *dest else {
++            return Err((
++                libc::EPERM,
++                "window mapping at a guest physical address".into(),
++            ));
++        };
++        let writable = if prot == Protection::read_write() {
++            true
++        } else if prot == Protection::read() {
++            false
++        } else {
++            return Err((libc::EPERM, format!("window mapping with {:?}", prot)));
++        };
++        if allocation != regions.alloc || cache != MemCacheType::CacheCoherent {
++            return Err((
++                libc::EPERM,
++                format!("window mapping into {:?} ({:?})", allocation, cache),
++            ));
++        }
++        let (w_off, w_len) = regions.window;
++        let len = size.checked_next_multiple_of(page).unwrap_or(0);
++        if *size == 0
++            || len == 0
++            || offset % page != 0
++            || fd_offset % page != 0
++            || fd_offset.checked_add(len).is_none()
++            || offset < w_off
++            || offset
++                .checked_add(len)
++                .is_none_or(|end| end > w_off + w_len)
++        {
++            return Err((
++                libc::EINVAL,
++                format!(
++                    "window mapping {:#x}+{:#x} (file offset {:#x}) outside the {:#x}-byte window",
++                    offset, size, fd_offset, w_len
++                ),
++            ));
++        }
++        if let Some((&s, &l)) = self.window.range(..offset + len).next_back() {
++            if s + l > offset {
++                return Err((
++                    libc::EEXIST,
++                    format!(
++                        "window mapping {:#x}+{:#x} overlaps {:#x}+{:#x}",
++                        offset, len, s, l
++                    ),
++                ));
++            }
++        }
++        if self.window.len() >= WINDOW_MAX_MAPPINGS {
++            return Err((libc::ENOSPC, "too many window mappings".into()));
++        }
++        if let Err(errno) = (self.window_fd_check)(descriptor, writable) {
++            return Err((
++                errno,
++                format!(
++                    "window mapping of a descriptor that is not an NVIDIA device or DRM node \
++                     opened for {}",
++                    if writable { "writing" } else { "reading" }
++                ),
++            ));
++        }
++        Ok((offset, len))
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn check_pool(
++        &self,
++        regions: &Regions,
++        descriptor: &SafeDescriptor,
++        host_address: u64,
++        file_offset: u64,
++        size: u64,
++        alloc: Alloc,
++        offset: u64,
++    ) -> Result<(), (i32, String)> {
++        let page = base::pagesize() as u64;
++        let Some((a_off, a_len)) = regions.aperture else {
++            return Err((libc::ENODEV, "pool without a UVM aperture".into()));
++        };
++        let what = format!(
++            "pool {:#x}+{:#x} at aperture {:#x}",
++            host_address, size, offset
++        );
++        if alloc != regions.alloc {
++            return Err((libc::EPERM, format!("{} into {:?}", what, alloc)));
++        }
++        // UVM's own rule: the offset is the address.
++        if file_offset != host_address {
++            return Err((
++                libc::EINVAL,
++                format!(
++                    "{}: file offset {:#x} is not its address",
++                    what, file_offset
++                ),
++            ));
++        }
++        if size == 0
++            || size % page != 0
++            || size > UVM_POOL_MAX_LEN
++            || host_address % page != 0
++            || host_address < UVM_HVA_MIN
++            || host_address
++                .checked_add(size)
++                .is_none_or(|end| end > UVM_HVA_MAX)
++            || offset % page != 0
++            || offset < a_off
++            || offset
++                .checked_add(size)
++                .is_none_or(|end| end > a_off + a_len)
++        {
++            return Err((libc::EINVAL, format!("{}: out of bounds", what)));
++        }
++        let hit = |s: u64, l: u64, a: u64, b: u64| s < a + b && a < s + l;
++        if self.pools.iter().any(|(&o, p)| {
++            hit(o, p.len, offset, size) || hit(p.host_address, p.len, host_address, size)
++        }) {
++            return Err((libc::EEXIST, format!("{}: overlaps a live pool", what)));
++        }
++        if self.pools.len() >= UVM_MAX_POOLS || self.pool_bytes + size > UVM_MAX_POOL_BYTES {
++            return Err((libc::ENOSPC, format!("{}: pool limits reached", what)));
++        }
++        if let Err(errno) = (self.uvm_fd_check)(descriptor) {
++            return Err((
++                errno,
++                format!(
++                    "{}: the descriptor is not /dev/nvidia-uvm opened read-write",
++                    what
++                ),
++            ));
++        }
++        Ok(())
++    }
++
++    fn prepare(
++        regions: Regions,
++        cache: MemCacheType,
++        host: &mut VmPoolHost,
++        region_state: &mut VmMemoryRegionState,
++    ) -> VmMemoryResponse {
++        if !super::should_prepare_memory_region()
++            || region_state.mapped_regions.contains_key(&regions.alloc)
++        {
++            return VmMemoryResponse::Ok;
++        }
++        // The window alone: the aperture's slots are the pools'.
++        match super::prepare_shared_memory_region_len(
++            host.vm,
++            host.allocator,
++            regions.alloc,
++            cache,
++            Some(regions.window.1),
++        ) {
++            Ok(region) => {
++                region_state.mapped_regions.insert(regions.alloc, region);
++                VmMemoryResponse::Ok
++            }
++            Err(e) => VmMemoryResponse::Err(anyhow::Error::new(e).into()),
++        }
++    }
++
++    fn map_pool(
++        &mut self,
++        descriptor: &SafeDescriptor,
++        host_address: u64,
++        size: u64,
++        offset: u64,
++        host: &mut dyn PoolHost,
++    ) -> VmMemoryResponse {
++        let Role::SharedMemory(Some(regions)) = self.role else {
++            return err_response(libc::ENODEV);
++        };
++        let Some(gpa) = host.guest_address(regions.alloc, offset, size) else {
++            return self.refuse(
++                libc::EINVAL,
++                format!("pool at {:#x}: no guest address", offset),
++            );
++        };
++        let mapping = match UvmBand::place(self.band, descriptor, host_address, size) {
++            Ok(m) => m,
++            Err(e) => {
++                return self.refuse(
++                    e.raw_os_error().unwrap_or(libc::EIO),
++                    format!("pool {:#x}+{:#x} not mapped: {}", host_address, size, e),
++                )
++            }
++        };
++        // On failure the mapping is dropped, which puts the reservation back.
++        let slot = match host.add_slot(gpa, Box::new(mapping)) {
++            Ok(slot) => slot,
++            Err(e) => {
++                warn!(
++                    "nvgpu uvm: no memory slot for {:#x}+{:#x}: {}",
++                    host_address, size, e
++                );
++                return err_response(libc::EIO);
++            }
++        };
++        self.pools.insert(
++            offset,
++            Pool {
++                host_address,
++                len: size,
++                slot,
++            },
++        );
++        self.pool_bytes += size;
++        info!(
++            "nvgpu uvm: {:#x}+{:#x} at aperture offset {:#x} (guest {:#x})",
++            host_address, size, offset, gpa
++        );
++        VmMemoryResponse::Ok
++    }
++
++    /// Remove one pool's slot, then its mapping. If the slot cannot be removed the mapping stays:
++    /// a slot over nothing would stop the VM, a stale slot over live pages only wastes them.
++    fn unmap_pool(&mut self, offset: u64, size: u64, host: &mut dyn PoolHost) -> VmMemoryResponse {
++        let Some(pool) = self.pools.get(&offset).copied().filter(|p| p.len == size) else {
++            return err_response(libc::ENOENT);
++        };
++        match host.remove_slot(pool.slot) {
++            Ok(region) => {
++                // The slot is gone; now the mapping.
++                drop(region);
++                self.pools.remove(&offset);
++                self.pool_bytes -= pool.len;
++                info!(
++                    "nvgpu uvm: dropped {:#x}+{:#x} at aperture offset {:#x}",
++                    pool.host_address, pool.len, offset
++                );
++                VmMemoryResponse::Ok
++            }
++            Err(e) => {
++                warn!(
++                    "nvgpu uvm: slot for aperture offset {:#x} not removed, mapping kept: {}",
++                    offset, e
++                );
++                err_response(libc::EIO)
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::os::fd::FromRawFd;
++    use std::os::fd::OwnedFd;
++    use std::sync::atomic::AtomicU64;
++    use std::sync::atomic::Ordering;
++    use std::sync::Arc;
++
++    use base::FromRawDescriptor;
++    use hypervisor::Datamatch;
++
++    use super::*;
++    use crate::IoEventUpdateRequest;
++
++    const MIB: u64 = 1 << 20;
++    const ALLOC: Alloc = Alloc::PciBar {
++        bus: 0,
++        dev: 3,
++        func: 0,
++        bar: 2,
++    };
++    /// Guest physical base of the fake BAR.
++    const BAR_GPA: u64 = 0x80_0000_0000;
++
++    fn layout(aperture: bool) -> SharedMemoryBarLayout {
++        let mut regions = vec![(NVGPU_SHM_ID_WINDOW, 0, 1 << 30)];
++        if aperture {
++            regions.push((NVGPU_SHM_ID_UVM, 1 << 30, 1 << 30));
++        }
++        SharedMemoryBarLayout {
++            alloc: ALLOC,
++            size: 2 << 30,
++            regions,
++        }
++    }
++
++    /// A test band of its own, 1 GiB, at an address no other test uses.
++    fn band() -> (&'static Mutex<UvmBand>, u64) {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        // 2 GiB apart, so two tests' reservations never touch.
++        let base = 0x100_0000_0000 + NEXT.fetch_add(1, Ordering::SeqCst) * (2 << 30);
++        let band: &'static Mutex<UvmBand> =
++            Box::leak(Box::new(Mutex::new(UvmBand::new(base, base + (1 << 30)))));
++        (band, base)
++    }
++
++    fn state(aperture: bool) -> NvgpuTubeState {
++        let mut s = NvgpuTubeState::new(NvgpuTubePolicy::SharedMemory(Some(layout(aperture))));
++        s.window_fd_check = |_, _| Ok(());
++        s.uvm_fd_check = |_| Ok(());
++        s
++    }
++
++    /// A memfd whose pages at `[at, at + len)` exist when `populate`, standing in for a UVM file
++    /// whose pool is populated. Sparse everywhere else.
++    fn pool_file(at: u64, len: u64, populate: bool) -> SafeDescriptor {
++        let name = std::ffi::CString::new("uvm-pool").unwrap();
++        // SAFETY: a plain syscall; the descriptor is owned below.
++        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
++        assert!(fd >= 0);
++        // SAFETY: just created, and owned by nothing else.
++        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
++        let file = File::from(fd);
++        file.set_len(at + len).unwrap();
++        if populate {
++            use std::os::unix::fs::FileExt;
++            file.write_all_at(&vec![0xa5u8; len as usize], at).unwrap();
++        }
++        SafeDescriptor::from(file)
++    }
++
++    fn devnull() -> SafeDescriptor {
++        SafeDescriptor::from(File::open("/dev/null").unwrap())
++    }
++
++    fn register(offset: u64, size: u64, fd_offset: u64) -> VmMemoryRequest {
++        VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::Descriptor {
++                descriptor: devnull(),
++                offset: fd_offset,
++                size,
++            },
++            dest: VmMemoryDestination::ExistingAllocation {
++                allocation: ALLOC,
++                offset,
++            },
++            prot: Protection::read_write(),
++            cache: MemCacheType::CacheCoherent,
++        }
++    }
++
++    fn errno(a: &Admission) -> Option<i32> {
++        match a {
++            Admission::Refuse(e, _) => Some(*e),
++            _ => None,
++        }
++    }
++
++    /// Admit `r` and, if it would be executed, record it as having succeeded.
++    fn admit_ok(s: &mut NvgpuTubeState, r: VmMemoryRequest) -> Option<i32> {
++        match s.admit(r) {
++            Admission::Execute(_, Pending::Register { offset, len }) => {
++                s.note(
++                    Pending::Register { offset, len },
++                    &VmMemoryResponse::RegisterMemory {
++                        region_id: VmMemoryRegionId(GuestAddress(BAR_GPA + offset)),
++                        slot: 1,
++                    },
++                );
++                None
++            }
++            a => errno(&a),
++        }
++    }
++
++    #[test]
++    fn window_mappings_are_held_to_the_window() {
++        let mut s = state(true);
++        let page = base::pagesize() as u64;
++        // Inside, and a length that is not whole pages.
++        assert_eq!(admit_ok(&mut s, register(0, 0xc50, 0)), None);
++        assert_eq!(admit_ok(&mut s, register((1 << 30) - MIB, MIB, 0)), None);
++        // Past the window (into the aperture), wrapping, unaligned, empty.
++        assert_eq!(
++            admit_ok(&mut s, register(1 << 30, page, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register((1 << 30) - page, 2 * page, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register(u64::MAX - page + 1, page, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register(8 * MIB + 1, page, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register(8 * MIB, page, 1)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register(8 * MIB, 0, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            admit_ok(&mut s, register(8 * MIB, page, u64::MAX - page + 1)),
++            Some(libc::EINVAL)
++        );
++        // Overlapping a live mapping (the 0xc50 bytes cover a whole page).
++        assert_eq!(admit_ok(&mut s, register(0, page, 0)), Some(libc::EEXIST));
++        assert_eq!(admit_ok(&mut s, register(page, page, 0)), None);
++    }
++
++    #[test]
++    fn window_mappings_must_name_this_bar_and_a_descriptor() {
++        let mut s = state(true);
++        let other = Alloc::PciBar {
++            bus: 0,
++            dev: 4,
++            func: 0,
++            bar: 2,
++        };
++        let r = VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::Descriptor {
++                descriptor: devnull(),
++                offset: 0,
++                size: 4096,
++            },
++            dest: VmMemoryDestination::ExistingAllocation {
++                allocation: other,
++                offset: 0,
++            },
++            prot: Protection::read_write(),
++            cache: MemCacheType::CacheCoherent,
++        };
++        assert_eq!(errno(&s.admit(r)), Some(libc::EPERM));
++        let r = VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::Descriptor {
++                descriptor: devnull(),
++                offset: 0,
++                size: 4096,
++            },
++            dest: VmMemoryDestination::GuestPhysicalAddress(0x1000_0000),
++            prot: Protection::read_write(),
++            cache: MemCacheType::CacheCoherent,
++        };
++        assert_eq!(errno(&s.admit(r)), Some(libc::EPERM));
++        let r = VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::ExternalMapping {
++                ptr: 0x1000,
++                size: 4096,
++            },
++            dest: VmMemoryDestination::ExistingAllocation {
++                allocation: ALLOC,
++                offset: 0,
++            },
++            prot: Protection::read_write(),
++            cache: MemCacheType::CacheCoherent,
++        };
++        assert_eq!(errno(&s.admit(r)), Some(libc::EPERM));
++        let r = VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::Descriptor {
++                descriptor: devnull(),
++                offset: 0,
++                size: 4096,
++            },
++            dest: VmMemoryDestination::ExistingAllocation {
++                allocation: ALLOC,
++                offset: 0,
++            },
++            prot: Protection::read_write(),
++            cache: MemCacheType::CacheNonCoherent,
++        };
++        assert_eq!(errno(&s.admit(r)), Some(libc::EPERM));
++    }
++
++    #[test]
++    fn window_descriptors_must_be_nvidia_or_drm_and_opened_to_match() {
++        // The real check: /dev/null is a character device of major 1.
++        let mut s = NvgpuTubeState::new(NvgpuTubePolicy::SharedMemory(Some(layout(true))));
++        assert_eq!(admit_ok(&mut s, register(0, 4096, 0)), Some(libc::EPERM));
++        // A memfd is not a device at all.
++        let r = VmMemoryRequest::RegisterMemory {
++            source: VmMemorySource::Descriptor {
++                descriptor: pool_file(0, 4096, true),
++                offset: 0,
++                size: 4096,
++            },
++            dest: VmMemoryDestination::ExistingAllocation {
++                allocation: ALLOC,
++                offset: 0,
++            },
++            prot: Protection::read(),
++            cache: MemCacheType::CacheCoherent,
++        };
++        assert_eq!(errno(&s.admit(r)), Some(libc::EPERM));
++
++        let chr = libc::S_IFCHR | 0o666;
++        let dev = |major: u64, minor: u64| (major << 8) | minor;
++        assert_eq!(classify(chr, dev(195, 0), Some(511)), FdKind::NvidiaDevice);
++        assert_eq!(
++            classify(chr, dev(195, 255), Some(511)),
++            FdKind::NvidiaDevice
++        );
++        assert_eq!(classify(chr, dev(226, 128), Some(511)), FdKind::Drm);
++        assert_eq!(classify(chr, dev(1, 3), Some(511)), FdKind::Other);
++        // A block device or regular file with the same numbers is not one.
++        assert_eq!(
++            classify(libc::S_IFBLK | 0o666, dev(195, 0), None),
++            FdKind::Other
++        );
++        assert_eq!(
++            classify(libc::S_IFREG | 0o666, dev(226, 0), None),
++            FdKind::Other
++        );
++        // Majors above 255 are split across rdev.
++        let big = ((511u64 & 0xfff) << 8) | ((511u64 & !0xfff) << 32);
++        assert_eq!(classify(chr, big, Some(511)), FdKind::Uvm);
++        assert_eq!(classify(chr, big | 1, Some(511)), FdKind::Other); // nvidia-uvm-tools
++        assert_eq!(classify(chr, big, None), FdKind::Other);
++
++        for kind in [FdKind::NvidiaDevice, FdKind::Drm] {
++            assert!(window_fd_allowed(kind, libc::O_RDWR, true));
++            assert!(window_fd_allowed(kind, libc::O_RDWR, false));
++            assert!(window_fd_allowed(kind, libc::O_RDONLY, false));
++            assert!(!window_fd_allowed(kind, libc::O_RDONLY, true));
++            assert!(!window_fd_allowed(kind, libc::O_WRONLY, false));
++        }
++        assert!(!window_fd_allowed(FdKind::Uvm, libc::O_RDWR, true));
++        assert!(!window_fd_allowed(FdKind::Other, libc::O_RDWR, true));
++        assert!(uvm_fd_allowed(FdKind::Uvm, libc::O_RDWR));
++        assert!(!uvm_fd_allowed(FdKind::Uvm, libc::O_RDONLY));
++        assert!(!uvm_fd_allowed(FdKind::NvidiaDevice, libc::O_RDWR));
++    }
++
++    #[test]
++    fn proc_devices_gives_the_uvm_major() {
++        let text = "Character devices:\n  1 mem\n195 nvidia\n226 drm\n507 nvidia-uvm\n\
++                    508 nvidia-uvm-tools\n\nBlock devices:\n  8 sd\n 99 nvidia-uvm\n";
++        assert_eq!(parse_char_major(text, "nvidia-uvm"), Some(507));
++        assert_eq!(parse_char_major(text, "nvidia"), Some(195));
++        assert_eq!(
++            parse_char_major("Block devices:\n507 nvidia-uvm\n", "nvidia-uvm"),
++            None
++        );
++    }
++
++    #[test]
++    fn unregister_only_its_own() {
++        let mut s = state(true);
++        assert_eq!(admit_ok(&mut s, register(0, 4096, 0)), None);
++        let theirs = VmMemoryRegionId(GuestAddress(0x1234_0000));
++        assert_eq!(
++            errno(&s.admit(VmMemoryRequest::UnregisterMemory(theirs))),
++            Some(libc::ENOENT)
++        );
++        let mine = VmMemoryRegionId(GuestAddress(BAR_GPA));
++        match s.admit(VmMemoryRequest::UnregisterMemory(mine)) {
++            Admission::Execute(_, p) => s.note(p, &VmMemoryResponse::Ok),
++            _ => panic!("own unregister refused"),
++        }
++        // Gone, and its place is free again.
++        assert_eq!(
++            errno(&s.admit(VmMemoryRequest::UnregisterMemory(mine))),
++            Some(libc::ENOENT)
++        );
++        assert_eq!(admit_ok(&mut s, register(0, 4096, 0)), None);
++    }
++
++    #[test]
++    fn nothing_else_is_served() {
++        let mut s = state(true);
++        let io = || {
++            VmMemoryRequest::IoEventRaw(IoEventUpdateRequest {
++                event: base::Event::new().unwrap(),
++                addr: 0x1000,
++                datamatch: Datamatch::AnyLength,
++                register: true,
++            })
++        };
++        assert_eq!(errno(&s.admit(io())), Some(libc::EPERM));
++        assert_eq!(
++            errno(&s.admit(VmMemoryRequest::DynamicallyFreeMemoryRanges {
++                ranges: vec![(GuestAddress(0), 4096)]
++            })),
++            Some(libc::EPERM)
++        );
++        assert_eq!(
++            errno(&s.admit(VmMemoryRequest::BalloonTargetReached { size: 0 })),
++            Some(libc::EPERM)
++        );
++        let other = Alloc::PciBar {
++            bus: 0,
++            dev: 4,
++            func: 0,
++            bar: 2,
++        };
++        assert_eq!(
++            errno(&s.admit(VmMemoryRequest::PrepareSharedMemoryRegion {
++                alloc: other,
++                cache: MemCacheType::CacheCoherent
++            })),
++            Some(libc::EPERM)
++        );
++        assert!(matches!(
++            s.admit(VmMemoryRequest::PrepareSharedMemoryRegion {
++                alloc: ALLOC,
++                cache: MemCacheType::CacheCoherent
++            }),
++            Admission::Prepare(r, _) if r.window == (0, 1 << 30)
++        ));
++
++        // The ioevent tube: ioevents and nothing else.
++        let mut io_tube = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents);
++        assert!(matches!(io_tube.admit(io()), Admission::Execute(..)));
++        assert_eq!(
++            errno(&io_tube.admit(register(0, 4096, 0))),
++            Some(libc::EPERM)
++        );
++
++        // A tube whose layout never arrived: nothing.
++        let mut none = NvgpuTubeState::new(NvgpuTubePolicy::SharedMemory(None));
++        assert_eq!(errno(&none.admit(register(0, 4096, 0))), Some(libc::ENODEV));
++    }
++
++    #[test]
++    fn layouts_are_checked() {
++        let good = Regions::from_layout(&layout(true)).unwrap();
++        assert_eq!(good.aperture, Some((1 << 30, 1 << 30)));
++        assert_eq!(Regions::from_layout(&layout(false)).unwrap().aperture, None);
++        // An aperture over the window, or past the BAR, is none.
++        let mut l = layout(true);
++        l.regions[1] = (NVGPU_SHM_ID_UVM, 1 << 29, 1 << 30);
++        assert_eq!(Regions::from_layout(&l).unwrap().aperture, None);
++        let mut l = layout(true);
++        l.regions[1] = (NVGPU_SHM_ID_UVM, 1 << 30, 2 << 30);
++        l.size = 2 << 30;
++        // Clamped to 1 GiB, which fits.
++        assert_eq!(
++            Regions::from_layout(&l).unwrap().aperture,
++            Some((1 << 30, 1 << 30))
++        );
++        let mut l = layout(true);
++        l.size = 1 << 30;
++        assert_eq!(Regions::from_layout(&l).unwrap().aperture, None);
++        // No window, no layout.
++        let mut l = layout(true);
++        l.regions.remove(0);
++        assert_eq!(Regions::from_layout(&l), None);
++    }
++
++    /// A slot table that checks the pool is still mapped whenever its slot goes.
++    #[derive(Default, Clone)]
++    struct FakeHost {
++        log: Arc<Mutex<Vec<String>>>,
++        fail_add: bool,
++        fail_remove: bool,
++        next: Arc<AtomicU64>,
++        slots: Arc<Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>>,
++    }
++
++    impl PoolHost for FakeHost {
++        fn guest_address(&mut self, alloc: Alloc, offset: u64, size: u64) -> Option<u64> {
++            (alloc == ALLOC && offset + size <= 2 << 30).then_some(BAR_GPA + offset)
++        }
++        fn add_slot(&mut self, gpa: u64, region: Box<dyn MappedRegion>) -> base::Result<MemSlot> {
++            if self.fail_add {
++                return Err(base::Error::new(libc::ENOSPC));
++            }
++            let mut slots = self.slots.lock().unwrap();
++            let slot = self.next.fetch_add(1, Ordering::SeqCst) as MemSlot + 100;
++            self.log.lock().unwrap().push(format!(
++                "add {:#x} -> {:#x}+{:#x}",
++                gpa,
++                region.as_ptr() as u64,
++                region.size()
++            ));
++            slots.insert(slot, region);
++            Ok(slot)
++        }
++        fn remove_slot(&mut self, slot: MemSlot) -> base::Result<Box<dyn MappedRegion>> {
++            if self.fail_remove {
++                return Err(base::Error::new(libc::EBUSY));
++            }
++            let region = self.slots.lock().unwrap().remove(&slot).unwrap();
++            // The slot must go while the pages are still mapped.
++            assert!(resident(region.as_ptr() as u64, region.size() as u64).unwrap());
++            self.log.lock().unwrap().push(format!("remove {}", slot));
++            Ok(region)
++        }
++    }
++
++    fn pool_req(fd: SafeDescriptor, hva: u64, size: u64, offset: u64) -> VmMemoryRequest {
++        VmMemoryRequest::RegisterUvmPool {
++            descriptor: fd,
++            host_address: hva,
++            file_offset: hva,
++            size,
++            alloc: ALLOC,
++            offset,
++        }
++    }
++
++    /// Admit and run a pool request against `host`.
++    fn run(s: &mut NvgpuTubeState, r: VmMemoryRequest, host: &mut FakeHost) -> Option<i32> {
++        let resp = match s.admit(r) {
++            Admission::Refuse(e, _) => return Some(e),
++            Admission::MapPool {
++                descriptor,
++                host_address,
++                size,
++                offset,
++            } => s.map_pool(&descriptor, host_address, size, offset, host),
++            Admission::UnmapPool { offset, size } => s.unmap_pool(offset, size, host),
++            _ => panic!("not a pool request"),
++        };
++        match resp {
++            VmMemoryResponse::Ok => None,
++            VmMemoryResponse::Err(e) => Some(
++                e.0.downcast_ref::<base::Error>()
++                    .map(|e| e.errno())
++                    .unwrap_or(-1),
++            ),
++            _ => Some(-2),
++        }
++    }
++
++    fn mapped(addr: u64, len: u64) -> bool {
++        resident(addr, len).is_ok()
++    }
++
++    fn pool_bounds(reserved: bool) {
++        let (band, base) = band();
++        if reserved {
++            band.lock().unwrap().reserve().unwrap();
++        }
++        let mut s = state(true);
++        s.band = band;
++        let mut host = FakeHost::default();
++        let ap = 1u64 << 30;
++        let page = base::pagesize() as u64;
++        let hva = base + 16 * MIB;
++
++        // The accept case: mapped at its address, a slot at its offset.
++        let f = pool_file(hva, 2 * MIB, true);
++        assert_eq!(run(&mut s, pool_req(f, hva, 2 * MIB, ap), &mut host), None);
++        assert!(resident(hva, 2 * MIB).unwrap());
++        assert_eq!(
++            host.log.lock().unwrap().last().unwrap(),
++            &format!("add {:#x} -> {:#x}+{:#x}", BAR_GPA + ap, hva, 2 * MIB)
++        );
++
++        let f = || pool_file(hva, 2 * MIB, true);
++        // Its file offset must be its address.
++        let mut r = pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + 4 * MIB);
++        if let VmMemoryRequest::RegisterUvmPool { file_offset, .. } = &mut r {
++            *file_offset = hva;
++        }
++        assert_eq!(run(&mut s, r, &mut host), Some(libc::EINVAL));
++        // Outside the band, unaligned, empty, too long, outside the aperture, in the window.
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), UVM_HVA_MIN - 2 * MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), UVM_HVA_MAX - MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB + 1, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB + 1, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 0, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 128 * MIB, 128 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + ap - MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB, ap - 2 * MIB),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + page / 2),
++                &mut host
++            ),
++            Some(libc::EINVAL)
++        );
++        // Another allocation.
++        let mut r = pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + 4 * MIB);
++        if let VmMemoryRequest::RegisterUvmPool { alloc, .. } = &mut r {
++            *alloc = Alloc::PciBar {
++                bus: 0,
++                dev: 4,
++                func: 0,
++                bar: 2,
++            };
++        }
++        assert_eq!(run(&mut s, r, &mut host), Some(libc::EPERM));
++        // Over a live pool, by offset or by address.
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + MIB),
++                &mut host
++            ),
++            Some(libc::EEXIST)
++        );
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EEXIST)
++        );
++        // A descriptor that is not nvidia-uvm.
++        s.uvm_fd_check = check_uvm_fd;
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f(), hva + 4 * MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EPERM)
++        );
++        s.uvm_fd_check = |_| Ok(());
++        // Pages not present: nothing left behind.
++        let sparse = pool_file(hva + 4 * MIB, 2 * MIB, false);
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(sparse, hva + 4 * MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EFAULT)
++        );
++        assert_eq!(mapped(hva + 4 * MIB, 2 * MIB), reserved);
++        assert!(!resident(hva + 4 * MIB, 2 * MIB).unwrap_or(false));
++        // No slot: nothing left behind either.
++        host.fail_add = true;
++        let f2 = pool_file(hva + 4 * MIB, 2 * MIB, true);
++        assert_eq!(
++            run(
++                &mut s,
++                pool_req(f2, hva + 4 * MIB, 2 * MIB, ap + 4 * MIB),
++                &mut host
++            ),
++            Some(libc::EIO)
++        );
++        assert_eq!(mapped(hva + 4 * MIB, 2 * MIB), reserved);
++        host.fail_add = false;
++        // Only the first pool is placed.
++        assert_eq!(s.pools.len(), 1);
++        assert_eq!(band.lock().unwrap().live.len(), 1);
++
++        // Withdrawal must name it exactly.
++        let unmap = |offset, size| VmMemoryRequest::UnregisterUvmPool {
++            alloc: ALLOC,
++            offset,
++            size,
++        };
++        assert_eq!(run(&mut s, unmap(ap, MIB), &mut host), Some(libc::ENOENT));
++        assert_eq!(
++            run(&mut s, unmap(ap + MIB, 2 * MIB), &mut host),
++            Some(libc::ENOENT)
++        );
++        // A slot that will not go keeps its mapping.
++        host.fail_remove = true;
++        assert_eq!(run(&mut s, unmap(ap, 2 * MIB), &mut host), Some(libc::EIO));
++        assert!(resident(hva, 2 * MIB).unwrap());
++        host.fail_remove = false;
++        assert_eq!(run(&mut s, unmap(ap, 2 * MIB), &mut host), None);
++        assert_eq!(host.log.lock().unwrap().last().unwrap(), "remove 100");
++        // Slot first (FakeHost checked), then the mapping; with a band, the reservation is back.
++        assert_eq!(mapped(hva, 2 * MIB), reserved);
++        if reserved {
++            assert!(is_reservation(hva, 2 * MIB));
++        }
++        assert!(s.pools.is_empty() && s.pool_bytes == 0);
++        assert!(band.lock().unwrap().live.is_empty());
++        assert_eq!(
++            run(&mut s, unmap(ap, 2 * MIB), &mut host),
++            Some(libc::ENOENT)
++        );
++    }
++
++    #[test]
++    fn pools_without_a_band() {
++        pool_bounds(false);
++    }
++
++    #[test]
++    fn pools_in_a_reserved_band() {
++        pool_bounds(true);
++    }
++
++    #[test]
++    fn pool_limits_and_teardown() {
++        let (band, base) = band();
++        band.lock().unwrap().reserve().unwrap();
++        let mut s = state(true);
++        s.band = band;
++        let mut host = FakeHost::default();
++        let ap = 1u64 << 30;
++        // One file for all of them, populated where each pool goes.
++        let file_len = 512 * MIB;
++        let file = pool_file(base, file_len, true);
++        let req =
++            |at: u64, size: u64| pool_req(file.try_clone().unwrap(), base + at, size, ap + at);
++        // Bytes: 256 MiB in all, in 32 pools of 8 MiB.
++        let len = 8 * MIB;
++        for i in 0..UVM_MAX_POOL_BYTES / len {
++            assert_eq!(
++                run(&mut s, req(i * len, len), &mut host),
++                None,
++                "pool {}",
++                i
++            );
++        }
++        assert_eq!(s.pools.len(), 32);
++        assert_eq!(
++            run(&mut s, req(UVM_MAX_POOL_BYTES, len), &mut host),
++            Some(libc::ENOSPC)
++        );
++        // Teardown withdraws them all, slot by slot, and puts the reservation back.
++        s.teardown_pools(&mut host);
++        assert!(s.pools.is_empty() && s.pool_bytes == 0);
++        assert!(host.slots.lock().unwrap().is_empty());
++        assert!(is_reservation(base, 1 << 30));
++        assert!(band.lock().unwrap().live.is_empty());
++
++        // Count: 64 at once, however small.
++        let page = base::pagesize() as u64;
++        for i in 0..UVM_MAX_POOLS as u64 {
++            assert_eq!(
++                run(&mut s, req(i * MIB, page), &mut host),
++                None,
++                "pool {}",
++                i
++            );
++        }
++        assert_eq!(
++            run(&mut s, req(256 * MIB, page), &mut host),
++            Some(libc::ENOSPC)
++        );
++        s.teardown_pools(&mut host);
++        assert!(is_reservation(base, 1 << 30));
++    }
++
++    #[test]
++    fn a_placement_the_file_refuses_leaves_the_band_reserved() {
++        let (band, base) = band();
++        band.lock().unwrap().reserve().unwrap();
++        // A pipe cannot be mapped: MAP_FIXED over the reservation fails in the file's mmap.
++        let mut fds = [0; 2];
++        // SAFETY: a plain syscall writing two descriptors into `fds`.
++        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
++        // SAFETY: just created and owned by nothing else.
++        let (r, _w) = unsafe {
++            (
++                SafeDescriptor::from_raw_descriptor(fds[0]),
++                SafeDescriptor::from_raw_descriptor(fds[1]),
++            )
++        };
++        let hva = base + 64 * MIB;
++        assert!(UvmBand::place(band, &r, hva, 2 * MIB).is_err());
++        assert!(is_reservation(base, 1 << 30));
++        assert!(band.lock().unwrap().tainted.is_empty());
++    }
++
++    #[test]
++    fn a_band_is_not_reserved_over_something() {
++        let (band, base) = band();
++        // Something of ours in the middle of it.
++        // SAFETY: an anonymous mapping at a free address of this test's band.
++        let p = unsafe {
++            libc::mmap(
++                (base + 256 * MIB) as *mut libc::c_void,
++                4096,
++                libc::PROT_READ,
++                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
++                -1,
++                0,
++            )
++        };
++        assert_eq!(p as u64, base + 256 * MIB);
++        assert!(band.lock().unwrap().reserve().is_err());
++        assert!(!band.lock().unwrap().is_reserved());
++        // SAFETY: the mapping made above.
++        unsafe { libc::munmap(p, 4096) };
++    }
++
++    #[test]
++    fn maps_parsing_finds_a_reservation() {
++        let (band, base) = band();
++        assert!(!is_reservation(base, MIB));
++        band.lock().unwrap().reserve().unwrap();
++        assert!(is_reservation(base, MIB));
++        assert!(is_reservation(base, 1 << 30));
++        assert!(!is_reservation(base, (1 << 30) + 4096));
++    }
++}
+-- 
+2.55.0
+

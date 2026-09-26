@@ -4,8 +4,9 @@
 # Usage: run-guest.sh [--vmm nesbox|crosvm] [display options] <probe-name> [tag]
 #                     [-- backend-args...]
 #   --vmm       which VMM boots the guest (default nesbox, or NVGPU_VMM_KIND);
-#               crosvm is unprivileged (rig layout) and graphics-only (no
-#               --allow-compute), see "crosvm" below
+#               crosvm is unprivileged (rig layout), and takes --allow-compute
+#               only if it has the UVM aperture (the virtio-nvgpu-compute
+#               branch), see "crosvm" below
 #   probe-name  a script under /opt/nvgpu in the guest rootfs, e.g. probeQ.sh;
 #               in the rig layout a bare name gets .sh added (stage1 ->
 #               /opt/nvgpu/stage1.sh)
@@ -207,10 +208,13 @@
 # line it was given. Unprivileged, crosvm runs with its sandbox: every device
 # it emulates itself (disk, consoles, rng) is a process of its own in a
 # minijail -- user, pid, mount and network namespaces, pivoted into an empty
-# directory (the rig's run/crosvm-empty), under its seccomp policy -- while
-# the vhost-user frontend stays in crosvm's main process, as upstream has it:
-# it walks no queue, and places the backend's mappings only after checking
-# each against the window (patches/crosvm). With NVGPU_VMM_NETNS=1 the main
+# directory (the rig's run/crosvm-empty), under its seccomp policy -- and so,
+# with patches/crosvm 0007-0009, is the nvgpu vhost-user frontend: it checks
+# the backend's mapping requests and passes them to the main process, which
+# checks each again against the regions it laid out and makes it (window
+# mappings; with --allow-compute, UVM pools in the aperture). A crosvm without
+# those patches keeps the frontend in its main process, as upstream has it,
+# and takes no --allow-compute. With NVGPU_VMM_NETNS=1 the main
 # process is started in a user and network namespace of its own (unshare),
 # the counterpart of nesbox's "unshare-network". No virtiofs share: crosvm's
 # has no read-only mode, so NVGPU_NVIDIA_SHARE must be empty.
@@ -404,10 +408,6 @@ if [ "$VMM_KIND" = crosvm ]; then
         die "--vmm crosvm runs unprivileged only for now; the header says what root would need"
     [ -z "$NVIDIA_SHARE" ] ||
         die "--vmm crosvm has no read-only virtiofs share; NVGPU_NVIDIA_SHARE must be empty"
-    # crosvm publishes the window alone, not the UVM aperture: the guest would
-    # get a UVM device whose pools it cannot map, and CUDA would fail late.
-    [ "$COMPUTE" = 0 ] ||
-        die "--vmm crosvm serves graphics only (no UVM aperture yet); drop --allow-compute"
 fi
 CMDLINE_EXTRA=${NVGPU_CMDLINE_EXTRA:-}
 case " $CMDLINE_EXTRA " in
@@ -486,6 +486,14 @@ if [ "$VMM_KIND" = crosvm ]; then
     [ "$CROSVM_NO_HP" = 1 ] ||
         echo "run-guest: note: $VMM has no --no-pci-hotplug-port; its hot-plug root port" \
             "takes PCI bus 1" >&2
+    # Compute needs the UVM aperture (patches/crosvm 0007-0009), which the
+    # help of --vhost-user names. A crosvm without it publishes the window
+    # alone: the guest would get a UVM device whose pools it cannot map, and
+    # CUDA would fail late.
+    case $CROSVM_HELP in *nvgpu-uvm-aperture*) CROSVM_UVM=1 ;; *) CROSVM_UVM=0 ;; esac
+    [ "$COMPUTE" = 0 ] || [ "$CROSVM_UVM" = 1 ] ||
+        die "--allow-compute: $VMM has no UVM aperture; build the virtio-nvgpu-compute" \
+            "branch (patches/crosvm 0007-0009) or drop --allow-compute"
 fi
 mkdir -p "$LOGS"
 
@@ -1022,7 +1030,7 @@ if [ "$VMM_JAIL" = on ]; then
     echo "vmm:     as $VMM_USER under $JAILER, jail $JAIL_ROOT, own network namespace" >&2
 fi
 if [ "$VMM_KIND" = crosvm ]; then
-    echo "vmm:     crosvm, sandbox $CROSVM_SANDBOX$([ "$VMM_OWN_NETNS" = true ] && echo ', own user and network namespace')" >&2
+    echo "vmm:     crosvm, sandbox $CROSVM_SANDBOX$([ "$CROSVM_SANDBOX" = on ] && [ "$CROSVM_UVM" = 1 ] && echo ', nvgpu frontend jailed')$([ "$VMM_OWN_NETNS" = true ] && echo ', own user and network namespace')" >&2
 fi
 # The console log starts with what the reader must know before the guest's
 # first line: a VMM without its sandbox.

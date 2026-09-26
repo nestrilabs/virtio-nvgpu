@@ -1,7 +1,7 @@
 From 9d1bbb4f76e51aa29452735d97f70d335b6b1271 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 01:45:11 +0000
-Subject: [PATCH 2/6] devices: virtio-nvgpu as a vhost-user device type
+Subject: [PATCH 2/9] devices: virtio-nvgpu as a vhost-user device type
 
 `--vhost-user type=nvgpu,socket=PATH` connects a virtio-nvgpu backend
 (NVIDIA driver calls forwarded to the host; virtio device ID 45, not one

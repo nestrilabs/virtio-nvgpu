@@ -1,7 +1,7 @@
 From 8832fbbc19a88a5880bf1052ea7453a58fb8109d Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 01:54:00 +0000
-Subject: [PATCH 4/6] vhost_user_frontend: tests for the backend mapping checks
+Subject: [PATCH 4/9] vhost_user_frontend: tests for the backend mapping checks
 
 Against a mapper that records what reaches it: mappings inside the region
 (a partial last page included) pass and nothing else does -- past the

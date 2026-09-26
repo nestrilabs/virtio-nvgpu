@@ -331,23 +331,34 @@ must:
 - For compute only, the **UVM aperture** (region 2): see
   [`ARCHITECTURE.md`](ARCHITECTURE.md) §5, "The UVM aperture". A VMM
   without it runs every graphics path, and the guest reports no compute.
+  The guest finds each region by its id, so the aperture may have a BAR of
+  its own or follow the window in the window's BAR, with a capability of
+  its own. Each pool is mapped at the host address its file offset names,
+  in [4 GiB, 32 TiB), without replacing anything of the VMM's, and given a
+  memory slot only once its pages are present; the slot goes before the
+  mapping.
 
-Two VMMs do this today. **nesbox** (`.rig/src/nesbox`, branch
-`virtio-nvgpu-v2`) has its own frontend for the device, with the UVM
-aperture. **crosvm** takes the patches in
-[`patches/crosvm/`](patches/crosvm/), three small changes and their tests: a vhost-user device type
-`nvgpu` (class 0xff0000, indirect descriptors, region 1 only, and only
-`SHMEM_MAP` of the backend's mapping requests); every backend mapping
-checked against its region, overlaps and stray unmaps refused, mappings
-dropped on reset; and `--no-pci-hotplug-port`, as crosvm otherwise puts an
-empty hot-plug root port on PCI bus 1. crosvm needed nothing new in the
-protocol: its vhost-user fork already implements the upstream
-`GET_SHMEM_CONFIG`, `SHMEM_MAP` and `SHMEM_UNMAP` messages byte for byte as
-rust-vmm does; the backend now answers `GET_SHMEM_CONFIG`, which nesbox
-never asks. It runs with its own sandbox on: every device crosvm emulates is
-a minijail'd process with its seccomp policy, none of which had to change,
-and the vhost-user frontend stays in crosvm's main process, as upstream has
-it. How to run it: [`TESTING-RIG.md`](TESTING-RIG.md), "crosvm".
+Two VMMs do this today, both with the UVM aperture (crosvm's has not yet run on
+the GPU). **nesbox**
+(`.rig/src/nesbox`, branch `virtio-nvgpu-v2`) has its own frontend for the
+device. **crosvm** takes the patches in [`patches/crosvm/`](patches/crosvm/):
+a vhost-user device type `nvgpu` (class 0xff0000, indirect descriptors, only
+`SHMEM_MAP` of the backend's mapping requests); every backend mapping checked
+against its region, overlaps and stray unmaps refused, mappings dropped on
+reset; `--no-pci-hotplug-port`, as crosvm otherwise puts an empty hot-plug
+root port on PCI bus 1; the UVM aperture after the window in the window's
+BAR; and, with its sandbox on, the nvgpu frontend in a jailed process of its
+own under a seccomp policy of its own, whose every mapping request the main
+process checks again against the regions it laid out -- NVIDIA and DRM
+descriptors only in the window, `/dev/nvidia-uvm` pools only in the aperture,
+per-device limits -- before it maps anything (SECURITY.md §16). crosvm
+reserves the pools' host address band at start-up, so nothing of its own is
+ever there. crosvm needed nothing new in the protocol: its vhost-user fork
+already implements the upstream `GET_SHMEM_CONFIG`, `SHMEM_MAP` and
+`SHMEM_UNMAP` messages byte for byte as rust-vmm does; the backend answers
+`GET_SHMEM_CONFIG`, which nesbox never asks. Every other device crosvm
+emulates is a minijail'd process with its seccomp policy, none of which
+changed. How to run it: [`TESTING-RIG.md`](TESTING-RIG.md), "crosvm".
 
 ---
 

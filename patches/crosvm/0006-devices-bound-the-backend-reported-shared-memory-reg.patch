@@ -1,7 +1,7 @@
 From ce21899ac18fbbf597377ef27fadac7406a2e57f Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 03:30:07 +0000
-Subject: [PATCH 6/6] devices: bound the backend-reported shared memory region
+Subject: [PATCH 6/9] devices: bound the backend-reported shared memory region
  size
 
 A vhost-user device's shared memory region length comes from the backend,

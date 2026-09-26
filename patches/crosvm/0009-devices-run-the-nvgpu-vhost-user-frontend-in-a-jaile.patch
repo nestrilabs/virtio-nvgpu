@@ -1,0 +1,781 @@
+From 9ec675b91069dc7cca4d47d3a08b1b2125a8905f Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 06:09:50 +0000
+Subject: [PATCH 9/9] devices: run the nvgpu vhost-user frontend in a jailed
+ process
+
+A vhost-user frontend runs in crosvm's main process: the virtqueues are the
+backend's. virtio-nvgpu's frontend also serves the backend's requests to
+map its descriptors into the guest, and the main process is not
+seccomp-confined, so with the sandbox on the nvgpu frontend now runs in a
+minijail'd process of its own like every device crosvm emulates, under a
+policy of its own (vhost_user_frontend_device: common_device.policy, plus
+getrandom, prctl PR_SET_NAME/PR_SET_PDEATHSIG, and open/openat refused with
+ENOENT -- no socket, no ioctl beyond the common vmm-swap ones). Its mapping
+requests go to the main process over the device's VmMemoryRequest tube, as a
+jailed virtio-gpu's do; the main process checks each again and makes it. The
+child makes no KVM call and maps nothing into guest memory. Other vhost-user
+types keep upstream's behaviour. keep_rds names what the child needs: its
+backend socket, the backend request channel, the crash tube and the memory
+tube.
+
+The test forks a real frontend under the embedded policy, keeping only its
+keep_rds and what every device process is handed, against a fake backend
+process and a fake main process: it reads the config, activates, forwards
+window mappings and a UVM pool, refuses a pool outside the band itself, and
+resets, withdrawing both. A second test checks the policy stops a socket, an
+ioctl, and refuses an open. VmRequester is exported with test-util for it.
+
+run --help names the nvgpu-uvm-aperture, for a launcher to detect.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ devices/Cargo.toml                            |   7 +
+ devices/src/virtio/mod.rs                     |   2 +
+ devices/src/virtio/vhost_user_frontend/mod.rs |  13 +-
+ devices/src/virtio/virtio_pci_device.rs       |   6 +-
+ devices/tests/vhost_user_frontend_seccomp.rs  | 486 ++++++++++++++++++
+ .../aarch64/vhost_user_frontend_device.policy |  17 +
+ .../riscv64/vhost_user_frontend_device.policy |  17 +
+ .../x86_64/vhost_user_frontend_device.policy  |  18 +
+ src/crosvm/cmdline.rs                         |   2 +
+ src/crosvm/sys/linux.rs                       |   1 +
+ src/crosvm/sys/linux/device_helpers.rs        |  17 +-
+ third_party/vmm_vhost/src/frontend_server.rs  |   5 +
+ 12 files changed, 586 insertions(+), 5 deletions(-)
+ create mode 100644 devices/tests/vhost_user_frontend_seccomp.rs
+ create mode 100644 jail/seccomp/aarch64/vhost_user_frontend_device.policy
+ create mode 100644 jail/seccomp/riscv64/vhost_user_frontend_device.policy
+ create mode 100644 jail/seccomp/x86_64/vhost_user_frontend_device.policy
+
+diff --git a/devices/Cargo.toml b/devices/Cargo.toml
+index c057101..16636e6 100644
+--- a/devices/Cargo.toml
++++ b/devices/Cargo.toml
+@@ -5,6 +5,13 @@ authors = ["The ChromiumOS Authors"]
+ edition = "2021"
+ license = "BSD-3-Clause"
+ 
++# Forks a jailed process, which needs a single-threaded test binary.
++[[test]]
++name = "vhost_user_frontend_seccomp"
++path = "tests/vhost_user_frontend_seccomp.rs"
++harness = false
++required-features = ["test-util"]
++
+ [features]
+ android_display = ["gpu_display/android_display"]
+ android_display_stub = ["gpu_display/android_display_stub"]
+diff --git a/devices/src/virtio/mod.rs b/devices/src/virtio/mod.rs
+index f23055f..7e0afd8 100644
+--- a/devices/src/virtio/mod.rs
++++ b/devices/src/virtio/mod.rs
+@@ -83,6 +83,8 @@ pub use self::virtio_pci_device::PciCapabilityType;
+ pub use self::virtio_pci_device::VirtioPciCap;
+ pub use self::virtio_pci_device::VirtioPciDevice;
+ pub use self::virtio_pci_device::VirtioPciShmCap;
++#[cfg(feature = "test-util")]
++pub use self::virtio_pci_device::VmRequester;
+ #[cfg(feature = "pvclock")]
+ pub use self::DeviceType::Pvclock;
+ 
+diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
+index fb7180a..4bb7415 100644
+--- a/devices/src/virtio/vhost_user_frontend/mod.rs
++++ b/devices/src/virtio/vhost_user_frontend/mod.rs
+@@ -409,8 +409,19 @@ impl VirtioDevice for VhostUserFrontend {
+         format!("vu-{}", self.device_type())
+     }
+ 
++    /// What a device process must keep when this frontend is jailed: its connection to the
++    /// backend, the channel the backend's requests come on, the tube a crash is reported on,
++    /// and the shared memory mapper's tube to the main process.
+     fn keep_rds(&self) -> Vec<RawDescriptor> {
+-        Vec::new()
++        let mut rds = vec![
++            self.backend_client.get_read_notifier().as_raw_descriptor(),
++            self.vm_evt_wrtube.as_raw_descriptor(),
++        ];
++        if let Some(handler) = &self.backend_req_handler {
++            rds.push(handler.as_raw_descriptor());
++            rds.extend(handler.frontend().mapper_descriptor());
++        }
++        rds
+     }
+ 
+     fn device_type(&self) -> DeviceType {
+diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
+index 019b2b4..288ac38 100644
+--- a/devices/src/virtio/virtio_pci_device.rs
++++ b/devices/src/virtio/virtio_pci_device.rs
+@@ -1535,7 +1535,9 @@ impl Suspendable for VirtioPciDevice {
+     }
+ }
+ 
+-struct VmRequester {
++/// The shared memory mapper a virtio-pci device is given: each mapping is a request to the main
++/// process over the device's memory tube.
++pub struct VmRequester {
+     vm_memory_client: VmMemoryClient,
+     alloc: Alloc,
+     mappings: BTreeMap<u64, VmMemoryRegionId>,
+@@ -1544,7 +1546,7 @@ struct VmRequester {
+ }
+ 
+ impl VmRequester {
+-    fn new(
++    pub fn new(
+         vm_memory_client: VmMemoryClient,
+         alloc: Alloc,
+         prepare_type: SharedMemoryPrepareType,
+diff --git a/devices/tests/vhost_user_frontend_seccomp.rs b/devices/tests/vhost_user_frontend_seccomp.rs
+new file mode 100644
+index 0000000..57b14c6
+--- /dev/null
++++ b/devices/tests/vhost_user_frontend_seccomp.rs
+@@ -0,0 +1,486 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! A virtio-nvgpu vhost-user frontend does its work in a process of its own under the seccomp
++//! policy crosvm jails it with (`vhost_user_frontend_device`), keeping only the descriptors it
++//! says it needs.
++//!
++//! Three processes, as in crosvm: this one plays the main process (it makes the frontend, gives it
++//! a real `VmRequester` over a memory tube, and answers that tube); a forked one is the backend,
++//! which serves the frontend and sends it shared memory requests on both regions; and the frontend
++//! runs in a jailed child, where it reads the device config, activates, forwards the backend's
++//! window mappings and UVM pools to the main process, and resets. A syscall the policy lacks kills
++//! the child with SIGSYS; a descriptor missing from `keep_rds` fails it.
++//!
++//! Forking needs a single-threaded process, so this runs without the test harness.
++
++#[cfg(any(target_os = "android", target_os = "linux"))]
++mod test {
++    use std::fs::File;
++    use std::os::fd::AsFd;
++    use std::sync::Arc;
++    use std::sync::Mutex;
++
++    use base::AsRawDescriptor;
++    use base::AsRawDescriptors;
++    use base::Event;
++    use base::RawDescriptor;
++    use base::SafeDescriptor;
++    use base::Tube;
++    use devices::virtio::DeviceType;
++    use devices::virtio::Interrupt;
++    use devices::virtio::QueueConfig;
++    use devices::virtio::SharedMemoryPrepareType;
++    use devices::virtio::VhostUserFrontend;
++    use devices::virtio::VirtioDevice;
++    use devices::virtio::VmRequester;
++    use hypervisor::MemCacheType;
++    use resources::Alloc;
++    use vm_control::api::VmMemoryClient;
++    use vm_control::VmMemoryRegionId;
++    use vm_control::VmMemoryRequest;
++    use vm_control::VmMemoryResponse;
++    use vm_memory::GuestAddress;
++    use vm_memory::GuestMemory;
++    use vmm_vhost::message::*;
++    use vmm_vhost::Backend;
++    use vmm_vhost::BackendServer;
++    use vmm_vhost::Connection;
++    use vmm_vhost::Frontend;
++    use vmm_vhost::FrontendClient;
++    use vmm_vhost::SharedMemoryRegion;
++    use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
++
++    const MIB: u64 = 1 << 20;
++    const ALLOC: Alloc = Alloc::PciBar {
++        bus: 0,
++        dev: 5,
++        func: 0,
++        bar: 2,
++    };
++
++    /// The backend: every request answered, and the channel for its own requests kept.
++    struct FakeBackend {
++        req: Arc<Mutex<Option<FrontendClient>>>,
++    }
++
++    type R<T> = vmm_vhost::Result<T>;
++
++    impl Backend for FakeBackend {
++        fn set_owner(&mut self) -> R<()> {
++            Ok(())
++        }
++        fn reset_owner(&mut self) -> R<()> {
++            Ok(())
++        }
++        fn get_features(&mut self) -> R<u64> {
++            Ok(1 << VHOST_USER_F_PROTOCOL_FEATURES
++                | 1 << virtio_sys::virtio_config::VIRTIO_F_VERSION_1)
++        }
++        fn set_features(&mut self, _: u64) -> R<()> {
++            Ok(())
++        }
++        fn set_mem_table(&mut self, _: &[VhostUserMemoryRegion], _: Vec<File>) -> R<()> {
++            Ok(())
++        }
++        fn set_vring_num(&mut self, _: u32, _: u32) -> R<()> {
++            Ok(())
++        }
++        fn set_vring_addr(
++            &mut self,
++            _: u32,
++            _: VhostUserVringAddrFlags,
++            _: u64,
++            _: u64,
++            _: u64,
++            _: u64,
++        ) -> R<()> {
++            Ok(())
++        }
++        fn set_vring_base(&mut self, _: u32, _: u32) -> R<()> {
++            Ok(())
++        }
++        fn get_vring_base(&mut self, index: u32) -> R<VhostUserVringState> {
++            Ok(VhostUserVringState::new(index, 0))
++        }
++        fn set_vring_kick(&mut self, _: u8, _: Option<File>) -> R<()> {
++            Ok(())
++        }
++        fn set_vring_call(&mut self, _: u8, _: Option<File>) -> R<()> {
++            Ok(())
++        }
++        fn set_vring_err(&mut self, _: u8, _: Option<File>) -> R<()> {
++            Ok(())
++        }
++        fn get_protocol_features(&mut self) -> R<VhostUserProtocolFeatures> {
++            Ok(VhostUserProtocolFeatures::CONFIG
++                | VhostUserProtocolFeatures::MQ
++                | VhostUserProtocolFeatures::BACKEND_REQ
++                | VhostUserProtocolFeatures::SHMEM
++                | VhostUserProtocolFeatures::REPLY_ACK)
++        }
++        fn set_protocol_features(&mut self, _: u64) -> R<()> {
++            Ok(())
++        }
++        fn get_queue_num(&mut self) -> R<u64> {
++            Ok(2)
++        }
++        fn set_vring_enable(&mut self, _: u32, _: bool) -> R<()> {
++            Ok(())
++        }
++        fn get_config(&mut self, _: u32, size: u32, _: VhostUserConfigFlags) -> R<Vec<u8>> {
++            Ok(vec![0x5a; size as usize])
++        }
++        fn set_config(&mut self, _: u32, _: &[u8], _: VhostUserConfigFlags) -> R<()> {
++            Ok(())
++        }
++        fn set_backend_req_fd(&mut self, conn: Connection) {
++            *self.req.lock().unwrap() = Some(FrontendClient::new(conn, true));
++        }
++        fn get_inflight_fd(&mut self, _: &VhostUserInflight) -> R<(VhostUserInflight, File)> {
++            Err(vmm_vhost::Error::InvalidOperation)
++        }
++        fn set_inflight_fd(&mut self, _: &VhostUserInflight, _: File) -> R<()> {
++            Err(vmm_vhost::Error::InvalidOperation)
++        }
++        fn get_max_mem_slots(&mut self) -> R<u64> {
++            Ok(0)
++        }
++        fn add_mem_region(&mut self, _: &VhostUserSingleMemoryRegion, _: File) -> R<()> {
++            Ok(())
++        }
++        fn remove_mem_region(&mut self, _: &VhostUserSingleMemoryRegion) -> R<()> {
++            Ok(())
++        }
++        fn set_device_state_fd(
++            &mut self,
++            _: VhostUserTransferDirection,
++            _: VhostUserMigrationPhase,
++            _: File,
++        ) -> R<Option<File>> {
++            Err(vmm_vhost::Error::InvalidOperation)
++        }
++        fn check_device_state(&mut self) -> R<()> {
++            Err(vmm_vhost::Error::InvalidOperation)
++        }
++        fn get_shmem_config(&mut self) -> R<Vec<SharedMemoryRegion>> {
++            Ok(vec![
++                SharedMemoryRegion {
++                    id: 1,
++                    length: 1 << 30,
++                },
++                SharedMemoryRegion {
++                    id: 2,
++                    length: 1 << 30,
++                },
++            ])
++        }
++    }
++
++    fn memfd(len: u64) -> SafeDescriptor {
++        let shm = base::SharedMemory::new("test", len).unwrap();
++        SafeDescriptor::from(shm)
++    }
++
++    fn mmap_msg(shmid: u8, shm_offset: u64, len: u64, fd_offset: u64) -> VhostUserMMap {
++        VhostUserMMap {
++            shmid,
++            fd_offset,
++            shm_offset,
++            len,
++            flags: VhostUserMMapFlags::MAP_RW,
++            ..Default::default()
++        }
++    }
++
++    /// What the backend does once told to: map in the window, place a pool, take the first window
++    /// mapping away again, and map another, which the frontend's reset takes away later.
++    fn backend_requests(client: &mut FrontendClient) -> Result<(), String> {
++        let hva = 8u64 << 30;
++        client
++            .shmem_map(&mmap_msg(1, 0, 2 * MIB, 0), &memfd(2 * MIB))
++            .map_err(|e| format!("window map: {e}"))?;
++        client
++            .shmem_map(&mmap_msg(2, 0, 2 * MIB, hva), &memfd(4096))
++            .map_err(|e| format!("pool map: {e}"))?;
++        client
++            .shmem_unmap(&mmap_msg(1, 0, 2 * MIB, 0))
++            .map_err(|e| format!("window unmap: {e}"))?;
++        client
++            .shmem_map(&mmap_msg(1, 4 * MIB, MIB, 0), &memfd(MIB))
++            .map_err(|e| format!("second window map: {e}"))?;
++        // Refused by the frontend itself, before the main process hears of it: outside the band.
++        if client
++            .shmem_map(&mmap_msg(2, 2 * MIB, 2 * MIB, 4096), &memfd(4096))
++            .is_ok()
++        {
++            return Err("a pool outside the band was accepted".into());
++        }
++        Ok(())
++    }
++
++    /// The backend process: serves the frontend on one thread, and on command sends its requests.
++    fn run_backend(conn: Connection, ctl: Tube) {
++        let req = Arc::new(Mutex::new(None));
++        let mut server = BackendServer::new(conn, FakeBackend { req: req.clone() });
++        std::thread::spawn(move || {
++            while let Ok((hdr, files)) = server.recv_header() {
++                if server.process_message(hdr, files).is_err() {
++                    break;
++                }
++            }
++        });
++        loop {
++            match ctl.recv::<String>().unwrap().as_str() {
++                "go" => {
++                    let mut guard = req.lock().unwrap();
++                    let client = guard.as_mut().expect("no backend request channel");
++                    ctl.send(&backend_requests(client).err().unwrap_or_default())
++                        .unwrap();
++                }
++                _ => return,
++            }
++        }
++    }
++
++    /// What reached the main process, in order.
++    fn describe(r: &VmMemoryRequest) -> String {
++        match r {
++            VmMemoryRequest::PrepareSharedMemoryRegion { .. } => "prepare".into(),
++            VmMemoryRequest::RegisterMemory { dest, .. } => match dest {
++                vm_control::VmMemoryDestination::ExistingAllocation { offset, .. } => {
++                    format!("map {offset:#x}")
++                }
++                _ => "map elsewhere".into(),
++            },
++            VmMemoryRequest::UnregisterMemory(VmMemoryRegionId(a)) => format!("unmap {:#x}", a.0),
++            VmMemoryRequest::RegisterUvmPool {
++                host_address,
++                size,
++                offset,
++                ..
++            } => format!("pool {host_address:#x}+{size:#x} at {offset:#x}"),
++            VmMemoryRequest::UnregisterUvmPool { offset, size, .. } => {
++                format!("unpool {offset:#x}+{size:#x}")
++            }
++            _ => "other".into(),
++        }
++    }
++
++    /// The main process's side of the memory tube: everything succeeds, and is written down.
++    fn serve_memory_tube(tube: Tube, log: Arc<Mutex<Vec<String>>>) {
++        while let Ok(r) = tube.recv::<VmMemoryRequest>() {
++            log.lock().unwrap().push(describe(&r));
++            let response = match r {
++                VmMemoryRequest::RegisterMemory { dest, .. } => match dest {
++                    vm_control::VmMemoryDestination::ExistingAllocation { offset, .. } => {
++                        VmMemoryResponse::RegisterMemory {
++                            region_id: VmMemoryRegionId(GuestAddress(offset)),
++                            slot: 7,
++                        }
++                    }
++                    _ => VmMemoryResponse::Ok,
++                },
++                _ => VmMemoryResponse::Ok,
++            };
++            tube.send(&response).unwrap();
++        }
++    }
++
++    fn open_fds() -> Vec<RawDescriptor> {
++        let listed: Vec<RawDescriptor> = std::fs::read_dir("/proc/self/fd")
++            .unwrap()
++            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
++            .collect();
++        // Not the directory's own descriptor, closed by now.
++        listed
++            .into_iter()
++            // SAFETY: F_GETFD only asks whether the descriptor is open.
++            .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
++            .collect()
++    }
++
++    /// Say which syscall the policy refused, rather than only dying of it.
++    extern "C" fn on_sigsys(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
++        // SAFETY: the kernel hands a SIGSYS handler a siginfo whose _sigsys member holds the
++        // syscall number at this offset on 64-bit Linux; write and _exit are async-signal-safe.
++        unsafe {
++            let nr = *((info as *const u8).add(24) as *const libc::c_int);
++            let msg = format!("jailed frontend: syscall {nr} is not in the policy\n");
++            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
++            libc::_exit(3);
++        }
++    }
++
++    pub fn jailed_frontend_runs_under_its_policy() {
++        // The backend, forked while this process has no threads.
++        let (front_conn, back_conn) = Connection::pair().unwrap();
++        let (backend_ctl, backend_ctl_child) = Tube::pair().unwrap();
++        let backend = jail::fork_process(
++            minijail::Minijail::new().unwrap(),
++            vec![
++                back_conn.as_raw_descriptor(),
++                backend_ctl_child.as_raw_descriptor(),
++                2,
++            ],
++            Some("fake-backend".into()),
++            move || run_backend(back_conn, backend_ctl_child),
++        )
++        .unwrap();
++
++        // What the jailed process inherits besides the frontend's own: what the transport and
++        // crosvm hand every device process (guest memory, its interrupt, stderr for logs), made
++        // before the frontend.
++        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
++        let interrupt = Interrupt::new_for_test_with_msix();
++        let (ctl, ctl_child) = Tube::pair().unwrap();
++        let baseline = open_fds();
++
++        let (main_tube, device_tube) = Tube::pair().unwrap();
++        let (vm_evt_wrtube, _vm_evt_rdtube) = Tube::directional_pair().unwrap();
++        let mut frontend = VhostUserFrontend::new(
++            DeviceType::Nvgpu,
++            1 << virtio_sys::virtio_config::VIRTIO_F_VERSION_1,
++            front_conn,
++            vm_evt_wrtube,
++            None,
++            None,
++            true,
++        )
++        .unwrap();
++        // As the transport does, in the main process before the fork.
++        let window = frontend.get_shared_memory_region().expect("no window");
++        assert_eq!((window.id, window.length), (1, 1 << 30));
++        let extra = frontend.get_extra_shared_memory_regions();
++        assert_eq!(extra.len(), 1);
++        assert_eq!((extra[0].id, extra[0].length), (2, 1 << 30));
++        frontend.set_shared_memory_mapper(Box::new(VmRequester::new(
++            VmMemoryClient::new(device_tube),
++            ALLOC,
++            SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheCoherent),
++        )));
++
++        let mut keep = baseline.clone();
++        keep.extend(frontend.keep_rds());
++        keep.extend(mem.as_raw_descriptors());
++        keep.push(ctl_child.as_raw_descriptor());
++
++        let mut jail = minijail::Minijail::new().unwrap();
++        // minijail's own complaints to stderr, not syslog.
++        jail.log_to_fd(
++            std::os::fd::OwnedFd::from(std::io::stderr().as_fd().try_clone_to_owned().unwrap()),
++            libc::LOG_INFO,
++        );
++        jail::set_embedded_bpf_program(&mut jail, "vhost_user_frontend_device").unwrap();
++        jail.no_new_privs();
++        jail.use_seccomp_filter();
++
++        // SAFETY: installs a handler that only writes and exits; nothing else handles SIGSYS.
++        unsafe {
++            let mut sa: libc::sigaction = std::mem::zeroed();
++            sa.sa_sigaction = on_sigsys as usize;
++            sa.sa_flags = libc::SA_SIGINFO;
++            libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut());
++        }
++
++        let child = jail::fork_process(jail, keep, Some("vu-nvgpu".into()), move || {
++            let mut config = [0u8; 64];
++            frontend.read_config(0, &mut config);
++            assert_eq!(config, [0x5a; 64]);
++            frontend.ack_features(1 << virtio_sys::virtio_config::VIRTIO_F_VERSION_1);
++            let mut queues = std::collections::BTreeMap::new();
++            for i in 0..2 {
++                let mut q = QueueConfig::new(0x10, 0);
++                q.set_ready(true);
++                queues.insert(
++                    i,
++                    q.activate(&mem, Event::new().unwrap(), interrupt.clone())
++                        .unwrap(),
++                );
++            }
++            frontend.activate(mem, interrupt, queues).unwrap();
++            ctl_child.send(&"activated".to_string()).unwrap();
++            assert_eq!(ctl_child.recv::<String>().unwrap(), "reset");
++            frontend.reset().unwrap();
++            ctl_child.send(&"reset".to_string()).unwrap();
++        })
++        .unwrap();
++
++        // Now this process may have threads: the main process's end of the memory tube.
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let server = std::thread::spawn({
++            let log = log.clone();
++            move || serve_memory_tube(main_tube, log)
++        });
++
++        assert_eq!(ctl.recv::<String>().unwrap(), "activated");
++        backend_ctl.send(&"go".to_string()).unwrap();
++        let err = backend_ctl.recv::<String>().unwrap();
++        assert!(err.is_empty(), "backend: {err}");
++        ctl.send(&"reset".to_string()).unwrap();
++        assert_eq!(ctl.recv::<String>().unwrap(), "reset");
++        let status = child.wait().unwrap();
++        assert_eq!(status, 0, "the jailed frontend exited with {status}");
++        server.join().unwrap();
++
++        let log = log.lock().unwrap().clone();
++        assert_eq!(
++            log,
++            vec![
++                "prepare".to_string(),
++                format!("map {:#x}", 0),
++                // The aperture sits after the 1 GiB window in the BAR.
++                format!("pool {:#x}+{:#x} at {:#x}", 8u64 << 30, 2 * MIB, 1u64 << 30),
++                format!("unmap {:#x}", 0),
++                format!("map {:#x}", 4 * MIB),
++                // The reset: whatever is still mapped, window and pool.
++                format!("unmap {:#x}", 4 * MIB),
++                format!("unpool {:#x}+{:#x}", 1u64 << 30, 2 * MIB),
++            ]
++        );
++
++        backend_ctl.send(&"exit".to_string()).unwrap();
++        assert_eq!(backend.wait().unwrap(), 0);
++        println!("jailed_frontend_runs_under_its_policy: ok");
++    }
++
++    /// The policy is really in force: under it, a socket or a KVM-style ioctl stops the process.
++    pub fn the_policy_refuses_what_the_frontend_never_does() {
++        for (what, call) in [
++            (
++                "socket",
++                (|| {
++                    // SAFETY: a plain syscall; the policy stops it.
++                    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
++                }) as fn(),
++            ),
++            ("ioctl", || {
++                // KVM_CREATE_VM on stderr: an ioctl the policy has no rule for.
++                // SAFETY: a plain syscall; the policy stops it.
++                unsafe { libc::ioctl(2, 0xae01, 0) };
++            }),
++            ("open", || {
++                // Refused with ENOENT, not stopped: the process goes on.
++                assert!(File::open("/proc/self/maps").is_err());
++                // SAFETY: a plain syscall; the policy stops it.
++                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
++            }),
++        ] {
++            let mut jail = minijail::Minijail::new().unwrap();
++            jail::set_embedded_bpf_program(&mut jail, "vhost_user_frontend_device").unwrap();
++            jail.no_new_privs();
++            jail.use_seccomp_filter();
++            let child = jail::fork_process(jail, vec![2], None, move || call()).unwrap();
++            // on_sigsys exits 3.
++            assert_eq!(child.wait().unwrap(), 3, "{what} was not stopped");
++        }
++        println!("the_policy_refuses_what_the_frontend_never_does: ok");
++    }
++}
++
++fn main() {
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    test::jailed_frontend_runs_under_its_policy();
++    test::the_policy_refuses_what_the_frontend_never_does();
++}
+diff --git a/jail/seccomp/aarch64/vhost_user_frontend_device.policy b/jail/seccomp/aarch64/vhost_user_frontend_device.policy
+new file mode 100644
+index 0000000..ed4e2cb
+--- /dev/null
++++ b/jail/seccomp/aarch64/vhost_user_frontend_device.policy
+@@ -0,0 +1,17 @@
++# Copyright 2026 The ChromiumOS Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# A vhost-user frontend in a process of its own (virtio-nvgpu's). It speaks the vhost-user
++# protocol to its backend over the socket it was given, serves the backend's requests to map
++# descriptors into the device's shared memory by passing them to the main process over its memory
++# tube, and answers the transport over the device tubes. It opens no file, makes no KVM call and
++# maps nothing into guest memory: the main process checks each mapping again and makes it.
++# Nothing beyond common_device.policy but what rng_device.policy also has: no ioctl but the
++# common vmm-swap ones, no socket, no open.
++
++@include /usr/share/policy/crosvm/common_device.policy
++
++getrandom: 1
++openat: return ENOENT
++prctl: arg0 == PR_SET_NAME || arg0 == PR_SET_PDEATHSIG
+diff --git a/jail/seccomp/riscv64/vhost_user_frontend_device.policy b/jail/seccomp/riscv64/vhost_user_frontend_device.policy
+new file mode 100644
+index 0000000..ed4e2cb
+--- /dev/null
++++ b/jail/seccomp/riscv64/vhost_user_frontend_device.policy
+@@ -0,0 +1,17 @@
++# Copyright 2026 The ChromiumOS Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# A vhost-user frontend in a process of its own (virtio-nvgpu's). It speaks the vhost-user
++# protocol to its backend over the socket it was given, serves the backend's requests to map
++# descriptors into the device's shared memory by passing them to the main process over its memory
++# tube, and answers the transport over the device tubes. It opens no file, makes no KVM call and
++# maps nothing into guest memory: the main process checks each mapping again and makes it.
++# Nothing beyond common_device.policy but what rng_device.policy also has: no ioctl but the
++# common vmm-swap ones, no socket, no open.
++
++@include /usr/share/policy/crosvm/common_device.policy
++
++getrandom: 1
++openat: return ENOENT
++prctl: arg0 == PR_SET_NAME || arg0 == PR_SET_PDEATHSIG
+diff --git a/jail/seccomp/x86_64/vhost_user_frontend_device.policy b/jail/seccomp/x86_64/vhost_user_frontend_device.policy
+new file mode 100644
+index 0000000..8affcab
+--- /dev/null
++++ b/jail/seccomp/x86_64/vhost_user_frontend_device.policy
+@@ -0,0 +1,18 @@
++# Copyright 2026 The ChromiumOS Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++# A vhost-user frontend in a process of its own (virtio-nvgpu's). It speaks the vhost-user
++# protocol to its backend over the socket it was given, serves the backend's requests to map
++# descriptors into the device's shared memory by passing them to the main process over its memory
++# tube, and answers the transport over the device tubes. It opens no file, makes no KVM call and
++# maps nothing into guest memory: the main process checks each mapping again and makes it.
++# Nothing beyond common_device.policy but what rng_device.policy also has: no ioctl but the
++# common vmm-swap ones, no socket, no open.
++
++@include /usr/share/policy/crosvm/common_device.policy
++
++getrandom: 1
++open: return ENOENT
++openat: return ENOENT
++prctl: arg0 == PR_SET_NAME || arg0 == PR_SET_PDEATHSIG
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index e3d31de..21825e1 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -2199,6 +2199,8 @@ pub struct RunCommand {
+     ///     socket=SOCKET_PATH - Path to vhost-user socket.
+     ///     max-queue-size=NUM - Limit maximum queue size (must be a power of two).
+     ///     pci-address=ADDR - Preferred PCI address, e.g. "00:01.0".
++    /// type=nvgpu publishes the backend's window and, when it reports
++    /// one, its nvgpu-uvm-aperture (CUDA); its frontend runs jailed.
+     pub vhost_user: Vec<VhostUserFrontendOption>,
+ 
+     #[argh(option)]
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 8c09f13..0239346 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -886,6 +886,7 @@ fn create_virtio_devices(
+             "vhost_user",
+             create_vhost_user_frontend(
+                 cfg.protection_type,
++                cfg.jail_config.as_ref(),
+                 opt,
+                 cfg.vhost_user_connect_timeout_ms,
+                 vm_evt_wrtube.try_clone()?,
+diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
+index d29febb..c8434e7 100644
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -49,6 +49,7 @@ use devices::virtio::pvclock::PvClock;
+ use devices::virtio::vfio_wrapper::VfioWrapper;
+ use devices::virtio::vhost_user_backend::VhostUserDeviceBuilder;
+ use devices::virtio::vhost_user_backend::VhostUserVsockDevice;
++use devices::virtio::DeviceType;
+ use devices::virtio::MemSlotConfig;
+ use devices::virtio::PmemConfig;
+ use devices::virtio::VhostUserFrontend;
+@@ -299,6 +300,7 @@ fn vhost_user_connection(
+ 
+ pub fn create_vhost_user_frontend(
+     protection_type: ProtectionType,
++    jail_config: Option<&JailConfig>,
+     opt: &VhostUserFrontendOption,
+     connect_timeout_ms: Option<u64>,
+     vm_evt_wrtube: base::SendTube,
+@@ -321,10 +323,21 @@ pub fn create_vhost_user_frontend(
+     )
+     .context("failed to set up vhost-user frontend")?;
+ 
++    // Upstream runs a vhost-user frontend in the main process: the virtqueues are the backend's.
++    // virtio-nvgpu's frontend is jailed like any device crosvm emulates, as it serves the
++    // backend's requests to map its descriptors into the guest: the child checks them, and hands
++    // them to the main process over the device's memory tube, which checks them again
++    // (vm_control::sys::linux::nvgpu). The child never makes a KVM call or maps guest memory
++    // itself.
++    let jail = if opt.type_ == DeviceType::Nvgpu {
++        simple_jail(jail_config, "vhost_user_frontend_device")?
++    } else {
++        None
++    };
++
+     Ok(VirtioDeviceStub {
+         dev: Box::new(dev),
+-        // no sandbox here because virtqueue handling is exported to a different process.
+-        jail: None,
++        jail,
+     })
+ }
+ 
+diff --git a/third_party/vmm_vhost/src/frontend_server.rs b/third_party/vmm_vhost/src/frontend_server.rs
+index ee6cc22..061a5fb 100644
+--- a/third_party/vmm_vhost/src/frontend_server.rs
++++ b/third_party/vmm_vhost/src/frontend_server.rs
+@@ -77,6 +77,11 @@ impl<S: Frontend> FrontendServer<S> {
+         self.reply_ack_negotiated = enable;
+     }
+ 
++    /// Get the underlying frontend
++    pub fn frontend(&self) -> &S {
++        &self.frontend
++    }
++
+     /// Get the underlying frontend
+     pub fn frontend_mut(&mut self) -> &mut S {
+         &mut self.frontend
+-- 
+2.55.0
+

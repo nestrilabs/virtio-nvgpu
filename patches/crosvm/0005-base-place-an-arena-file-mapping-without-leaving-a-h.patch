@@ -1,7 +1,7 @@
 From 5f349a17b30ee468206b960356dc252874787d00 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 03:30:07 +0000
-Subject: [PATCH 5/6] base: place an arena file mapping without leaving a hole
+Subject: [PATCH 5/9] base: place an arena file mapping without leaving a hole
  on failure
 
 MemoryMappingArena placed a file mapping with a single mmap(MAP_FIXED)

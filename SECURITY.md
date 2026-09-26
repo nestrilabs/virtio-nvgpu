@@ -243,15 +243,18 @@ guest's choice. What bounds it:
   two-thirds of the 47-bit space (85 TiB), and its mappings grow down from
   below the stack or, under a legacy layout (an unlimited stack rlimit), up
   from a third of it (42.7 TiB), which the 64 TiB top the band once had
-  reached. The backend, the VMM and the guest driver all check the band, and
-  the VMM maps with `MAP_FIXED_NOREPLACE`, so a collision fails rather than
-  replacing anything. Two of the guest's own pools at one address are
-  refused by the backend before the VMM is asked, with ENOMEM as any
-  placement is (it was EEXIST). That does not hide everything (§11, B5 and
-  F3): a refusal where the caller's budgets had room still says the address
-  is taken -- by another guest process's pool, which one process can so find
-  and squat on, or by the VMM's mapping of guest RAM, which with several GiB
-  of RAM can lie in the band.
+  reached. The backend, the VMM and the guest driver all check the band.
+  nesbox maps with `MAP_FIXED_NOREPLACE`, so a collision fails rather than
+  replacing anything. crosvm reserves the whole band `PROT_NONE` at start-up,
+  before it maps guest RAM or anything else, and maps a pool over its own
+  reservation only, putting the reservation back when the pool goes (§16):
+  nothing of crosvm's can be in the band. Two of the guest's own pools at one
+  address are refused by the backend before the VMM is asked, with ENOMEM as
+  any placement is (it was EEXIST). That does not hide everything (§11, B5
+  and F3): a refusal where the caller's budgets had room still says the
+  address is taken -- by another guest process's pool, which one process can
+  so find and squat on, or, under nesbox, by the VMM's mapping of guest RAM,
+  which with several GiB of RAM can lie in the band.
 - **No descriptor kept.** The UVM file travels to the VMM on the vhost-user
   request channel and its copy is closed when the request returns; the
   mapping's own file reference is all the VMM holds, and it goes with the
@@ -1146,7 +1149,7 @@ In priority order. Cost is a judgement, not a measurement.
    structs per release.
 10. **What the `harden` audit left open (§11).** (A uid per VM in the
    launcher is done.) The UVM aperture carved out of the VMM's address space before
-   guest RAM is mapped (F3); a caller's process on IOCTL2 (R4); fair queuing
+   guest RAM is mapped (F3; done for crosvm, §16, open for nesbox); a caller's process on IOCTL2 (R4); fair queuing
    per guest file (B6); the remaining VM-wide pools split per process (B7);
    a security context per Wayland channel (W4).
 
@@ -1187,7 +1190,7 @@ run on the GPU.
 | W2 | medium | app vs app | the daemon's per-client output buffer had no bound: a client flooding requests whose replies it never read grew the daemon until the OOM killer took it, and every client with it | `b5980e5` | fixed: at 4 MiB unread the daemon stops reading that client's channel, and closes a client that stays behind for 30 s; the output waits in the backend, on that client's share (loopback test) |
 | W3 | medium | app vs app | at the VM's queue budget the connection whose output crossed it was dropped, often an innocent one; the rig's app pass (`6263e20`, on `display-passthrough`) puts the app user in `nvgpu-wl`, so any app can hold raw channels it never reads | `b5980e5` | fixed in the backend: the queue budget is per process, so the connection that crosses its share is its own. **To do on merge**: `guest-image/probes/apps.sh` (`nvgpu_user=1`) must not add the app user to `nvgpu-wl`; run the daemon setgid `nvgpu-wl` (as `scripts/70-nvgpu-wl.rules` now says) or as an account of its own. `harden` does not have that commit |
 | F2 | low | app vs app | export/import to a descriptor is a second way to move an RM object between clients, outside the DUP_OBJECT gate | -- | native strength, documented (§6): after R1/R2 the descriptor must be a control file the caller has open, which another process can only have handed it |
-| F3 | low | host surface | the aperture band [4 GiB, 32 TiB) can hold the VMM's mapping of a large guest RAM: a pool there fails, and says the address is taken | -- | open. It would take the VMM reserving the band (PROT_NONE, MAP_NORESERVE) before it maps guest RAM, and placing pools over its own reservation; a change to nesbox's start-up order that needs a run to trust |
+| F3 | low | host surface | the aperture band [4 GiB, 32 TiB) can hold the VMM's mapping of a large guest RAM: a pool there fails, and says the address is taken | crosvm `patches/crosvm/0007`, `0008` | **fixed for crosvm, open for nesbox.** crosvm reserves the band (PROT_NONE, MAP_NORESERVE) at the start of `run_config`, before it maps guest RAM, and maps each pool with MAP_FIXED over its own reservation (§16); UVM refuses a pool moved in with mremap, so the window's map-then-move cannot be used. nesbox would need the same change to its start-up order, and a run to trust |
 | F4 | low | host surface | CARD_INFO, ATTACH_GPUS_TO_FD and NUMA_INFO pass with no size check | -- | unchanged (§3): the argument is never smaller than `_IOC_SIZE`, and ATTACH_GPUS_TO_FD, read again (nv.c), carries GPU ids only, no descriptor, once per file |
 | R4 | low | app vs app | SEMSURF_FENCE_CTX_CREATE accepts any client of the VM, not the caller's own | -- | open, native strength (KAPI dups at kernel privilege). It needs the caller's process on IOCTL2, which carries none; the render file's opener is not the same thing |
 | R5 | low | app vs app | negative descriptor values other than -1 forwarded, read by the backend as handles | `fc7a58b` | fixed: refused in the guest and the backend |
@@ -1487,23 +1490,111 @@ already safe (`MAP_FIXED_NOREPLACE`, a slot only on success).
 region the backend reported (overflow-checked, page-aligned offsets,
 overlaps refused, unmaps must name a live mapping, reset unmaps all); GPU and
 external maps are refused for the nvgpu type; a region size above 64 GiB is
-an error, not a panic; a refused request no longer stops the VM. No seccomp
-or minijail policy changed.
+an error, not a panic; a refused request no longer stops the VM. That is the
+frontend's own check, and since `0007`-`0009` the main process checks every
+request again, trusting nothing the frontend says.
 
-**Where the mapping requests run.** crosvm jails each device it emulates in
-a process of its own with a seccomp policy, but a vhost-user *frontend* runs
-in its main process, which upstream does not seccomp-confine; the launcher
-adds a user and network namespace and pivots into an empty root. nesbox
-installs one baseline seccomp filter on every thread, including the one
-that serves these requests. So for this device's mapping path nesbox is the
-more confined of the two; for everything else crosvm emulates, crosvm is.
-The backend -- where guest bytes are parsed -- is the same process, uid and
-sandbox under both.
+**Where the mapping requests run.** Upstream, a vhost-user *frontend* runs
+in crosvm's main process, which crosvm does not seccomp-confine (the
+launcher adds a user and network namespace). With `0009` and the sandbox on,
+the nvgpu frontend runs in a process of its own, jailed like every device
+crosvm emulates -- user, pid, mount and network namespaces, pivoted into an
+empty directory -- under a seccomp policy of its own,
+`vhost_user_frontend_device`: crosvm's `common_device.policy` (the syscalls
+every jailed device has: memory, futexes, epoll, eventfds, pipes,
+`sendmsg`/`recvmsg` on the descriptors it holds, the vmm-swap `userfaultfd`
+ioctls) plus `getrandom` and `prctl(PR_SET_NAME, PR_SET_PDEATHSIG)`, with
+`open`/`openat` refused. No socket, no other ioctl, no KVM call: it maps
+nothing into the guest itself. It keeps only its backend socket, the
+backend's request channel, its crash tube and its memory tube, and passes
+each mapping to the main process as a `VmMemoryRequest`, as a jailed
+virtio-gpu does. A test forks the real frontend under that policy against a
+fake backend and main process and runs it through config, activation,
+window and pool mappings and a reset; another checks the policy stops a
+socket and an ioctl. Other vhost-user types keep upstream's in-process
+frontend. The KVM calls and the final `mmap` stay in the main process: KVM
+refuses VM ioctls from any process but the VM's creator, and a memory slot
+points into that process's memory. The child can still `mmap` the
+descriptors the backend hands it into its own memory (crosvm's device
+policies allow shared file mappings, which the transport needs); that
+reaches the same driver `mmap` handlers the main process calls anyway.
+`NVGPU_CROSVM_SANDBOX=off` (`--disable-sandbox`) puts the frontend back in
+the main process; the main process's checks below hold either way. Against
+nesbox: the code that parses the backend's requests is now more confined
+under crosvm (a jailed process with a narrow policy, against nesbox's one
+baseline filter on every thread), while the process that makes the KVM
+calls and the final mappings -- the main process in both -- has no seccomp
+filter under crosvm and nesbox's baseline one under nesbox.
 
-**Compute** runs under nesbox only: crosvm publishes one shared-memory
-region per device, and the UVM aperture needs a second with mappings at
-host addresses the backend names. The launcher refuses `--allow-compute`
-with `--vmm crosvm`.
+**What the main process checks** (`vm_control::sys::linux::nvgpu`, `0007`).
+The nvgpu device's two memory tubes are held to what the device needs,
+against the BAR layout the PCI transport reported from the main process
+before the device process was made; a tube whose layout never arrived gets
+nothing.
+
+- *Its ioevent tube* registers and unregisters ioevents, nothing else. (Its
+  address is not held to the device's BAR: a compromised device process
+  could steal another device's doorbell in the same VM. Upstream lets any
+  device's tube do that and much more -- register memory anywhere,
+  balloon -- which this tube no longer can.)
+- *Its shared memory tube* may prepare region 1, the window -- the window
+  alone, not the whole BAR, so the aperture's slots never overlap it -- and
+  map into it only: a descriptor (no other source), at its own BAR's
+  allocation (no guest physical address, no other device's BAR), coherent,
+  page-aligned, non-empty, inside the window, overflow-checked, clear of
+  its other live mappings, at most 16,384 at once; from a character device
+  of major 195 (`/dev/nvidia*`) or 226 (DRM) -- the only descriptors the
+  backend places there (`nvidia.rs`: RM_MAP_MEMORY's `/dev/nvidiaN`, and an
+  mmap of an NVIDIA device or DRM node, `handle_mmap`) -- and writable only
+  if the descriptor was opened read-write. It may unmap only what it mapped.
+  Ballooning, `MmapAndRegisterMemory`, ioevents and external mappings are
+  refused.
+- *UVM pools* (region 2, compute only): the host address page-aligned and
+  in [4 GiB, 32 TiB), the file offset equal to it (UVM's own rule), the
+  length non-zero, whole pages and at most 64 MiB, the BAR offset inside
+  region 2 as the main process laid it out and clear of every live pool (by
+  offset and by host address), at most 64 pools and 256 MiB per device, and
+  the descriptor `/dev/nvidia-uvm` itself -- a character device of
+  nvidia-uvm's major (from `/proc/devices`) and minor 0, not
+  `nvidia-uvm-tools` -- opened read-write. The pool is mapped over the
+  band's reservation (below), `mincore` must show every page present or it
+  is unmapped and refused, and only then is its KVM memory slot added.
+  Withdrawal must name a live pool exactly: the slot goes first, then the
+  mapping. When the device's tube goes away (its process ended), every pool
+  and window mapping it made is withdrawn by the main process.
+- Every refusal fails the backend's `SHMEM_MAP`, not the VM, and is logged
+  (the first eight per tube, then every 1024th).
+
+**The band (F3).** With an nvgpu device, crosvm reserves [4 GiB, 32 TiB)
+`PROT_NONE`, `MAP_NORESERVE`, at the start of `run_config`, before guest RAM
+or anything else is mapped: one VMA, not charged to overcommit (no
+`VM_WRITE`), 28 TiB of address space against the 128 TiB a 47-bit process
+has (an `RLIMIT_AS` would have to allow it). If it cannot be reserved, the
+main process logs so and maps pools with `MAP_FIXED_NOREPLACE`, as nesbox
+does. UVM will not take the window's atomic placement (map anywhere, then
+`mremap` into place): it maps a pool only where the address equals the file
+offset at `mmap` time, and a semaphore pool's `vm_open` disables a moved
+vma (`uvm.c`). So a pool is mapped with `MAP_FIXED` over the reservation --
+only over a range the band records as reservation: never a live pool (the
+band tracks every one, across devices) and never a range a failure left
+unknown. UVM expects `MAP_FIXED` (it disables rather than fails a vma when
+it cannot take its power-management lock, "to safely handle MAP_FIXED"),
+and `mincore` catches that case. If the file's `mmap` fails the kernel may
+leave the range unmapped; the main process fills it again at once, or, if
+`/proc/self/maps` shows anything but reservation there, never places there
+again. On withdrawal the reservation is put back over the pool in the same
+`mmap`. The hole is never guest-visible: the slot is added only after
+success. UVM's mappings are `VM_DONTCOPY`, so a device process forked later
+gets none of them.
+
+**Compute** runs under both VMMs. crosvm publishes region 2 after the
+window in the same 64-bit prefetchable BAR, each region with its own
+shared-memory capability, when the backend reports it (only with
+`--allow-compute`); the guest driver finds regions by id. The launcher
+allows `--allow-compute` with `--vmm crosvm` only when the binary's
+`run --help` names the `nvgpu-uvm-aperture`. The crosvm side has unit tests
+for every check above and the seccomp test; it has not yet run on the GPU
+(TESTING-RIG.md, "crosvm").
 
 **The GPU's PCI address.** The guest puts its fake PCI device at the host
 GPU's address, because NVIDIA's userspace matches what RM reports against

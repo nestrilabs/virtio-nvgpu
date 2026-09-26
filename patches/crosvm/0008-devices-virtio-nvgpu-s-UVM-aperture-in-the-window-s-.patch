@@ -1,0 +1,1487 @@
+From cf482d09ee52876dc48b553cbbc5698855322963 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 06:09:50 +0000
+Subject: [PATCH 8/9] devices: virtio-nvgpu's UVM aperture, in the window's BAR
+
+A virtio-pci device can now publish more than one shared memory region:
+VirtioDevice::get_extra_shared_memory_regions (empty by default, so no other
+device changes) lists regions published after the one
+get_shared_memory_region returns, in the same 64-bit prefetchable BAR, each
+with its own VIRTIO_PCI_CAP_SHARED_MEMORY_CFG capability at its own offset
+(shared_memory_bar_layout: each region on a boundary of its own size, at most
+1 GiB; one region is laid out exactly as before). The guest finds regions by
+id (virtio_get_shm_region), so its driver needs nothing new. The transport
+reports the layout it allocated -- from the main process, before the device
+is moved into a process of its own -- for the main process to hold the
+device's requests to (vm_control's SharedMemoryBarLayout).
+
+The nvgpu vhost-user frontend publishes region 2, the UVM aperture (at most
+1 GiB), after the window when the backend's GET_SHMEM_CONFIG reports it,
+which vhost-user-nvgpu does only with --allow-compute. Its backend request
+handler keeps a record per region and checks a SHMEM_MAP on the aperture as
+a UVM semaphore pool first -- shared read-write, a whole number of pages up
+to 64 MiB, at a host address (its file offset) in [4 GiB, 32 TiB), at an
+aperture offset on the backend's 2 MiB boundary, clear of every live pool in
+the aperture and in host memory, at most 64 pools and 256 MiB -- and passes
+it to the mapper as a pool (SharedMemoryMapper::add_uvm_pool_mapping, whose
+default refuses), which VmRequester sends to the main process as
+RegisterUvmPool. A reset withdraws pools as it does window mappings.
+
+The main process holds virtio-nvgpu's shared memory and ioevent tubes to
+what the device needs (vm_control::sys::linux::nvgpu), withdraws what a
+device placed when its tube goes away, and, when a vhost-user device is of
+type nvgpu, reserves the UVM pool band [4 GiB, 32 TiB) at the start of
+run_config and finds nvidia-uvm's major in /proc/devices.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ devices/src/virtio/mod.rs                     |   1 +
+ .../src/virtio/vhost_user_frontend/handler.rs | 456 +++++++++++++++---
+ devices/src/virtio/vhost_user_frontend/mod.rs |  68 ++-
+ devices/src/virtio/virtio_device.rs           | 112 +++++
+ devices/src/virtio/virtio_pci_device.rs       | 119 ++++-
+ src/crosvm/sys/linux.rs                       | 170 ++++++-
+ src/crosvm/sys/linux/device_helpers.rs        |   4 +
+ 7 files changed, 818 insertions(+), 112 deletions(-)
+
+diff --git a/devices/src/virtio/mod.rs b/devices/src/virtio/mod.rs
+index fd3f42d..f23055f 100644
+--- a/devices/src/virtio/mod.rs
++++ b/devices/src/virtio/mod.rs
+@@ -74,6 +74,7 @@ pub use self::queue::QueueConfig;
+ pub use self::vhost_user_frontend::VhostUserFrontend;
+ #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
+ pub use self::video::VideoDevice;
++pub use self::virtio_device::shared_memory_bar_layout;
+ pub use self::virtio_device::SharedMemoryMapper;
+ pub use self::virtio_device::SharedMemoryPrepareType;
+ pub use self::virtio_device::VirtioDevice;
+diff --git a/devices/src/virtio/vhost_user_frontend/handler.rs b/devices/src/virtio/vhost_user_frontend/handler.rs
+index bca22b3..61bb140 100644
+--- a/devices/src/virtio/vhost_user_frontend/handler.rs
++++ b/devices/src/virtio/vhost_user_frontend/handler.rs
+@@ -11,6 +11,7 @@ use base::AsRawDescriptor;
+ use base::Protection;
+ use base::SafeDescriptor;
+ use hypervisor::MemCacheType;
++use vm_control::nvgpu;
+ use vm_control::VmMemorySource;
+ use vmm_vhost::message::VhostUserExternalMapMsg;
+ use vmm_vhost::message::VhostUserGpuMapMsg;
+@@ -27,16 +28,26 @@ use crate::virtio::SharedMemoryMapper;
+ 
+ pub(crate) type BackendReqHandler = FrontendServer<BackendReqHandlerImpl>;
+ 
+-struct SharedMapperState {
+-    mapper: Box<dyn SharedMemoryMapper>,
++/// One shared memory region the backend maps into.
++struct RegionState {
+     shmid: u8,
+     /// Length of the region the guest sees, as the backend reported it.
+     length: u64,
+-    /// Live mappings, offset -> length. The mapper keys mappings by offset
+-    /// alone, and a later mapping silently replaces the host pages under an
+-    /// earlier one, so an overlap would leave an unmap tearing down pages it
+-    /// never mapped. Overlaps are refused instead.
+-    mappings: BTreeMap<u64, u64>,
++    /// Where the region starts in the BAR the mapper addresses.
++    bar_offset: u64,
++    /// virtio-nvgpu's UVM aperture: each mapping is a UVM semaphore pool, mapped at its own host
++    /// address by the process that owns the VM and given a memory slot of its own.
++    uvm: bool,
++    /// Live mappings, offset -> (length, the host address of a pool). The mapper keys mappings
++    /// by offset alone, and a later mapping silently replaces the host pages under an earlier
++    /// one, so an overlap would leave an unmap tearing down pages it never mapped. Overlaps are
++    /// refused instead.
++    mappings: BTreeMap<u64, (u64, u64)>,
++}
++
++struct SharedMapperState {
++    mapper: Box<dyn SharedMemoryMapper>,
++    regions: Vec<RegionState>,
+ }
+ 
+ /// The end of the pages `[offset, offset + len)` touches, or `None` on overflow.
+@@ -45,15 +56,11 @@ fn page_end(offset: u64, len: u64) -> Option<u64> {
+     offset.checked_add(len)?.checked_next_multiple_of(page)
+ }
+ 
+-impl SharedMapperState {
+-    fn check_shmid(&self, shmid: u8) -> HandlerResult<()> {
+-        if shmid != self.shmid {
+-            error!("bad shmid {}, expected {}", shmid, self.shmid);
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-        }
+-        Ok(())
+-    }
++fn errno(e: i32) -> std::io::Error {
++    std::io::Error::from_raw_os_error(e)
++}
+ 
++impl RegionState {
+     /// Whether `[offset, offset + len)` may be mapped: at page-aligned
+     /// offsets, inside the region, and clear of every live mapping. A length
+     /// that is not a whole number of pages maps its last page whole, as mmap
+@@ -78,53 +85,152 @@ impl SharedMapperState {
+                      outside the {:#x}-byte region {}",
+                     offset, len, fd_offset, self.length, self.shmid
+                 );
+-                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++                return Err(errno(libc::EINVAL));
+             }
+         };
+-        if let Some((&start, &l)) = self.mappings.range(..end).next_back() {
++        if let Some((&start, &(l, _))) = self.mappings.range(..end).next_back() {
+             if page_end(start, l).is_some_and(|e| e > offset) {
+                 error!(
+                     "refusing mapping {:#x}+{:#x}: overlaps {:#x}+{:#x} in region {}",
+                     offset, len, start, l, self.shmid
+                 );
+-                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
++                return Err(errno(libc::EEXIST));
+             }
+         }
+         Ok(())
+     }
+ 
++    /// Whether a UVM pool may be placed: shared and writable (UVM maps a pool no other way), at a
++    /// host address -- its file offset -- in the band nothing else of the VMM's is in, a whole
++    /// number of pages no longer than a pool can be, at an aperture offset on the backend's
++    /// placement boundary, inside the aperture, clear of every live pool both in the aperture and
++    /// in host memory, and within the per-device limits. The process that owns the VM checks all
++    /// of it again against its own record, and the descriptor too.
++    fn check_new_pool(&self, req: &VhostUserMMap) -> HandlerResult<()> {
++        let page = base::pagesize() as u64;
++        // Copied out: the message is packed.
++        let (hva, offset, len, flags) = (req.fd_offset, req.shm_offset, req.len, req.flags);
++        if flags != VhostUserMMapFlags::MAP_RW
++            || len == 0
++            || len % page != 0
++            || len > nvgpu::UVM_POOL_MAX_LEN
++            || hva % page != 0
++            || hva < nvgpu::UVM_HVA_MIN
++            || hva
++                .checked_add(len)
++                .is_none_or(|end| end > nvgpu::UVM_HVA_MAX)
++            || offset % nvgpu::UVM_APERTURE_ALIGN != 0
++            || offset.checked_add(len).is_none_or(|end| end > self.length)
++        {
++            error!(
++                "refusing UVM pool {:#x}+{:#x} at aperture offset {:#x} (flags {:?}): out of bounds",
++                hva, len, offset, flags
++            );
++            return Err(errno(libc::EINVAL));
++        }
++        let hit = |s: u64, l: u64, a: u64| s < a + len && a < s + l;
++        if self
++            .mappings
++            .iter()
++            .any(|(&o, &(l, h))| hit(o, l, offset) || hit(h, l, hva))
++        {
++            error!(
++                "refusing UVM pool {:#x}+{:#x} at aperture offset {:#x}: overlaps a live pool",
++                hva, len, offset
++            );
++            return Err(errno(libc::EEXIST));
++        }
++        let bytes: u64 = self.mappings.values().map(|&(l, _)| l).sum();
++        if self.mappings.len() >= nvgpu::UVM_MAX_POOLS || bytes + len > nvgpu::UVM_MAX_POOL_BYTES {
++            error!(
++                "refusing UVM pool {:#x}+{:#x}: {} pools, {:#x} bytes already placed",
++                hva,
++                len,
++                self.mappings.len(),
++                bytes
++            );
++            return Err(errno(libc::ENOSPC));
++        }
++        Ok(())
++    }
++}
++
++impl SharedMapperState {
++    fn index(&self, shmid: u8) -> HandlerResult<usize> {
++        self.regions
++            .iter()
++            .position(|r| r.shmid == shmid)
++            .ok_or_else(|| {
++                error!("bad shmid {}", shmid);
++                errno(libc::EINVAL)
++            })
++    }
++
+     fn add(
+         &mut self,
++        index: usize,
+         source: VmMemorySource,
+         offset: u64,
+         len: u64,
+         prot: Protection,
+     ) -> HandlerResult<()> {
++        let region = &mut self.regions[index];
+         self.mapper
+-            .add_mapping(source, offset, prot, MemCacheType::CacheCoherent)
++            .add_mapping(
++                source,
++                region.bar_offset + offset,
++                prot,
++                MemCacheType::CacheCoherent,
++            )
+             .map_err(|e| {
+                 error!("failed to create mapping {:?}", e);
+                 std::io::Error::other(e.context("add mapping"))
+             })?;
+-        self.mappings.insert(offset, len);
++        region.mappings.insert(offset, (len, 0));
++        Ok(())
++    }
++
++    fn add_pool(
++        &mut self,
++        index: usize,
++        descriptor: SafeDescriptor,
++        hva: u64,
++        offset: u64,
++        len: u64,
++    ) -> HandlerResult<()> {
++        let region = &mut self.regions[index];
++        self.mapper
++            .add_uvm_pool_mapping(descriptor, hva, len, region.bar_offset + offset)
++            .map_err(|e| {
++                error!("failed to map UVM pool {:#x}+{:#x}: {:#}", hva, len, e);
++                std::io::Error::other(e.context("add UVM pool mapping"))
++            })?;
++        region.mappings.insert(offset, (len, hva));
+         Ok(())
+     }
+ 
+     /// Removes the mapping at exactly `offset`, which must have been made with
+     /// exactly `len`: the mapper can only take a mapping away whole.
+-    fn remove(&mut self, offset: u64, len: u64) -> HandlerResult<()> {
+-        if self.mappings.get(&offset) != Some(&len) {
++    fn remove(&mut self, index: usize, offset: u64, len: u64) -> HandlerResult<()> {
++        let region = &mut self.regions[index];
++        if region.mappings.get(&offset).map(|&(l, _)| l) != Some(len) {
+             error!(
+                 "refusing unmap {:#x}+{:#x} in region {}: no such mapping",
+-                offset, len, self.shmid
++                offset, len, region.shmid
+             );
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++            return Err(errno(libc::EINVAL));
++        }
++        let at = region.bar_offset + offset;
++        if region.uvm {
++            self.mapper.remove_uvm_pool_mapping(at, len)
++        } else {
++            self.mapper.remove_mapping(at)
+         }
+-        self.mapper.remove_mapping(offset).map_err(|e| {
++        .map_err(|e| {
+             error!("failed to remove mapping {:?}", e);
+             std::io::Error::other(e.context("remove memory mapping based on shm offset"))
+         })?;
+-        self.mappings.remove(&offset);
++        region.mappings.remove(&offset);
+         Ok(())
+     }
+ }
+@@ -133,6 +239,7 @@ pub struct BackendReqHandlerImpl {
+     interrupt: Option<Interrupt>,
+     shared_mapper_state: Option<SharedMapperState>,
+     is_remote_backend: bool,
++    device_type: DeviceType,
+     /// Whether the backend may use GPU_MAP and EXTERNAL_MAP as well as
+     /// SHMEM_MAP. A device that only ever has file descriptors mapped is not
+     /// offered the others.
+@@ -145,6 +252,7 @@ impl BackendReqHandlerImpl {
+             interrupt: None,
+             shared_mapper_state: None,
+             is_remote_backend,
++            device_type,
+             allow_gpu_maps: device_type != DeviceType::Nvgpu,
+         }
+     }
+@@ -153,31 +261,56 @@ impl BackendReqHandlerImpl {
+         self.interrupt = Some(interrupt);
+     }
+ 
++    /// The mapper addresses the one BAR every region is in; each region comes with the offset
++    /// the transport put it at.
+     pub(crate) fn set_shared_mapper_state(
+         &mut self,
+         mapper: Box<dyn SharedMemoryMapper>,
+-        region: SharedMemoryRegion,
++        regions: Vec<(SharedMemoryRegion, u64)>,
+     ) {
++        let device_type = self.device_type;
+         self.shared_mapper_state = Some(SharedMapperState {
+             mapper,
+-            shmid: region.id,
+-            length: region.length,
+-            mappings: BTreeMap::new(),
++            regions: regions
++                .into_iter()
++                .map(|(region, bar_offset)| RegionState {
++                    shmid: region.id,
++                    length: region.length,
++                    bar_offset,
++                    uvm: device_type == DeviceType::Nvgpu && region.id == nvgpu::NVGPU_SHM_ID_UVM,
++                    mappings: BTreeMap::new(),
++                })
++                .collect(),
+         });
+     }
+ 
++    /// The descriptor of the mapper's channel, if it has one: a device process must keep it.
++    pub(crate) fn mapper_descriptor(&self) -> Option<base::RawDescriptor> {
++        self.shared_mapper_state
++            .as_ref()
++            .and_then(|s| s.mapper.as_raw_descriptor())
++    }
++
+     /// Takes down every mapping the backend made. The vhost-user
+     /// specification has the front-end do this across a device reset.
+     pub(crate) fn unmap_all(&mut self) {
+         let Some(state) = self.shared_mapper_state.as_mut() else {
+             return;
+         };
+-        for (offset, len) in std::mem::take(&mut state.mappings) {
+-            if let Err(e) = state.mapper.remove_mapping(offset) {
+-                warn!(
+-                    "reset: failed to remove mapping {:#x}+{:#x}: {:#}",
+-                    offset, len, e
+-                );
++        for region in state.regions.iter_mut() {
++            for (offset, (len, _)) in std::mem::take(&mut region.mappings) {
++                let at = region.bar_offset + offset;
++                let res = if region.uvm {
++                    state.mapper.remove_uvm_pool_mapping(at, len)
++                } else {
++                    state.mapper.remove_mapping(at)
++                };
++                if let Err(e) = res {
++                    warn!(
++                        "reset: failed to remove mapping {:#x}+{:#x} in region {}: {:#}",
++                        offset, len, region.shmid, e
++                    );
++                }
+             }
+         }
+     }
+@@ -186,7 +319,7 @@ impl BackendReqHandlerImpl {
+         if self.allow_gpu_maps {
+             Ok(())
+         } else {
+-            Err(std::io::Error::from_raw_os_error(libc::EPERM))
++            Err(errno(libc::EPERM))
+         }
+     }
+ }
+@@ -196,12 +329,16 @@ impl Frontend for BackendReqHandlerImpl {
+         let state = self
+             .shared_mapper_state
+             .as_mut()
+-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        state.check_shmid(req.shmid)?;
+-        state.check_new_mapping(req.shm_offset, req.len, req.fd_offset)?;
++            .ok_or_else(|| errno(libc::EINVAL))?;
++        let index = state.index(req.shmid)?;
++        let descriptor = || SafeDescriptor::try_from(fd).map_err(|_| errno(libc::EIO));
++        if state.regions[index].uvm {
++            state.regions[index].check_new_pool(req)?;
++            return state.add_pool(index, descriptor()?, req.fd_offset, req.shm_offset, req.len);
++        }
++        state.regions[index].check_new_mapping(req.shm_offset, req.len, req.fd_offset)?;
+         let source = VmMemorySource::Descriptor {
+-            descriptor: SafeDescriptor::try_from(fd)
+-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
++            descriptor: descriptor()?,
+             offset: req.fd_offset,
+             size: req.len,
+         };
+@@ -210,16 +347,16 @@ impl Frontend for BackendReqHandlerImpl {
+         } else {
+             Protection::read()
+         };
+-        state.add(source, req.shm_offset, req.len, prot)
++        state.add(index, source, req.shm_offset, req.len, prot)
+     }
+ 
+     fn shmem_unmap(&mut self, req: &VhostUserMMap) -> HandlerResult<()> {
+         let state = self
+             .shared_mapper_state
+             .as_mut()
+-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        state.check_shmid(req.shmid)?;
+-        state.remove(req.shm_offset, req.len)
++            .ok_or_else(|| errno(libc::EINVAL))?;
++        let index = state.index(req.shmid)?;
++        state.remove(index, req.shm_offset, req.len)
+     }
+ 
+     fn gpu_map(
+@@ -231,19 +368,27 @@ impl Frontend for BackendReqHandlerImpl {
+         let state = self
+             .shared_mapper_state
+             .as_mut()
+-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        state.check_shmid(req.shmid)?;
+-        state.check_new_mapping(req.shm_offset, req.len, 0)?;
++            .ok_or_else(|| errno(libc::EINVAL))?;
++        let index = state.index(req.shmid)?;
++        if state.regions[index].uvm {
++            return Err(errno(libc::EPERM));
++        }
++        state.regions[index].check_new_mapping(req.shm_offset, req.len, 0)?;
+         let source = VmMemorySource::Vulkan {
+-            descriptor: SafeDescriptor::try_from(descriptor)
+-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
++            descriptor: SafeDescriptor::try_from(descriptor).map_err(|_| errno(libc::EIO))?,
+             handle_type: req.handle_type,
+             memory_idx: req.memory_idx,
+             device_uuid: req.device_uuid,
+             driver_uuid: req.driver_uuid,
+             size: req.len,
+         };
+-        state.add(source, req.shm_offset, req.len, Protection::read_write())
++        state.add(
++            index,
++            source,
++            req.shm_offset,
++            req.len,
++            Protection::read_write(),
++        )
+     }
+ 
+     fn external_map(&mut self, req: &VhostUserExternalMapMsg) -> HandlerResult<()> {
+@@ -251,20 +396,29 @@ impl Frontend for BackendReqHandlerImpl {
+         // Only allow EXTERNAL_MAP when the backend is in-process because it contains raw pointers
+         // that can't be trusted between processes.
+         if self.is_remote_backend {
+-            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
++            return Err(errno(libc::EPERM));
+         }
+ 
+         let state = self
+             .shared_mapper_state
+             .as_mut()
+-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        state.check_shmid(req.shmid)?;
+-        state.check_new_mapping(req.shm_offset, req.len, 0)?;
++            .ok_or_else(|| errno(libc::EINVAL))?;
++        let index = state.index(req.shmid)?;
++        if state.regions[index].uvm {
++            return Err(errno(libc::EPERM));
++        }
++        state.regions[index].check_new_mapping(req.shm_offset, req.len, 0)?;
+         let source = VmMemorySource::ExternalMapping {
+             ptr: req.ptr,
+             size: req.len,
+         };
+-        state.add(source, req.shm_offset, req.len, Protection::read_write())
++        state.add(
++            index,
++            source,
++            req.shm_offset,
++            req.len,
++            Protection::read_write(),
++        )
+     }
+ 
+     fn handle_config_change(&mut self) -> HandlerResult<()> {
+@@ -276,7 +430,7 @@ impl Frontend for BackendReqHandlerImpl {
+             }
+             None => {
+                 error!("cannot send interrupt");
+-                Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
++                Err(errno(libc::ENOSYS))
+             }
+         }
+     }
+@@ -300,7 +454,11 @@ mod tests {
+     #[derive(Clone, Default)]
+     struct Log(Arc<Mutex<Vec<(bool, u64)>>>);
+ 
+-    struct FakeMapper(Log);
++    /// What reached the mapper's pool methods, in order.
++    #[derive(Clone, Default)]
++    struct PoolLog(Arc<Mutex<Vec<String>>>);
++
++    struct FakeMapper(Log, PoolLog);
+ 
+     impl SharedMemoryMapper for FakeMapper {
+         fn add_mapping(
+@@ -318,19 +476,193 @@ mod tests {
+             self.0 .0.lock().unwrap().push((false, offset));
+             Ok(())
+         }
++
++        fn add_uvm_pool_mapping(
++            &mut self,
++            _descriptor: SafeDescriptor,
++            host_address: u64,
++            size: u64,
++            offset: u64,
++        ) -> anyhow::Result<()> {
++            self.1 .0.lock().unwrap().push(format!(
++                "map {:#x}+{:#x} at {:#x}",
++                host_address, size, offset
++            ));
++            Ok(())
++        }
++
++        fn remove_uvm_pool_mapping(&mut self, offset: u64, size: u64) -> anyhow::Result<()> {
++            self.1
++                 .0
++                .lock()
++                .unwrap()
++                .push(format!("unmap {:#x}+{:#x}", offset, size));
++            Ok(())
++        }
+     }
+ 
+     fn handler(device_type: DeviceType) -> (BackendReqHandlerImpl, Log) {
++        let (h, log, _) = handler_with(device_type, false);
++        (h, log)
++    }
++
++    /// Where the aperture starts in the fake BAR.
++    const AP: u64 = 32 * MIB;
++
++    fn handler_with(
++        device_type: DeviceType,
++        aperture: bool,
++    ) -> (BackendReqHandlerImpl, Log, PoolLog) {
+         let log = Log::default();
++        let pools = PoolLog::default();
+         let mut h = BackendReqHandlerImpl::new(true, device_type);
+-        h.set_shared_mapper_state(
+-            Box::new(FakeMapper(log.clone())),
++        let mut regions = vec![(
+             SharedMemoryRegion {
+                 id: 1,
+                 length: 16 * MIB,
+             },
++            0,
++        )];
++        if aperture {
++            regions.push((
++                SharedMemoryRegion {
++                    id: 2,
++                    length: 1 << 30,
++                },
++                AP,
++            ));
++        }
++        h.set_shared_mapper_state(Box::new(FakeMapper(log.clone(), pools.clone())), regions);
++        (h, log, pools)
++    }
++
++    fn pool(hva: u64, offset: u64, len: u64) -> VhostUserMMap {
++        VhostUserMMap {
++            shmid: 2,
++            fd_offset: hva,
++            shm_offset: offset,
++            len,
++            flags: VhostUserMMapFlags::MAP_RW,
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn nvgpu_pools_are_checked_then_placed_at_their_bar_offset() {
++        let (mut h, log, pools) = handler_with(DeviceType::Nvgpu, true);
++        let page = base::pagesize() as u64;
++        let hva = 8u64 << 30;
++        // The accept case: the pool's address, length and BAR offset reach the mapper.
++        assert_eq!(map(&mut h, &pool(hva, 0, 2 * MIB)), None);
++        assert_eq!(
++            pools.0.lock().unwrap().last().unwrap(),
++            &format!("map {:#x}+{:#x} at {:#x}", hva, 2 * MIB, AP)
+         );
+-        (h, log)
++        // Refused: not shared read-write, empty, not whole pages, too long, unaligned address,
++        // outside the band, off the placement boundary, outside the aperture.
++        let mut ro = pool(hva + 4 * MIB, 4 * MIB, 2 * MIB);
++        ro.flags = VhostUserMMapFlags::empty();
++        assert_eq!(map(&mut h, &ro), Some(libc::EINVAL));
++        for bad in [
++            pool(hva + 4 * MIB, 4 * MIB, 0),
++            pool(hva + 4 * MIB, 4 * MIB, page + 1),
++            pool(hva + 128 * MIB, 128 * MIB, 128 * MIB),
++            pool(hva + 4 * MIB + page / 2, 4 * MIB, 2 * MIB),
++            pool(nvgpu::UVM_HVA_MIN - 2 * MIB, 4 * MIB, 2 * MIB),
++            pool(nvgpu::UVM_HVA_MAX - MIB, 4 * MIB, 2 * MIB),
++            pool(hva + 4 * MIB, 4 * MIB + page, 2 * MIB),
++            pool(hva + 4 * MIB, (1 << 30) - MIB, 2 * MIB),
++            pool(hva + 4 * MIB, u64::MAX - MIB + 1, 2 * MIB),
++        ] {
++            assert_eq!(map(&mut h, &bad), Some(libc::EINVAL), "{:#x?}", {
++                let (a, b, c) = (bad.fd_offset, bad.shm_offset, bad.len);
++                (a, b, c)
++            });
++        }
++        // Over the live pool, in the aperture or in host memory.
++        assert_eq!(
++            map(&mut h, &pool(hva + 4 * MIB, 0, 2 * MIB)),
++            Some(libc::EEXIST)
++        );
++        assert_eq!(
++            map(&mut h, &pool(hva + MIB, 4 * MIB, 2 * MIB)),
++            Some(libc::EEXIST)
++        );
++        // Nothing but the first reached the mapper, and nothing went to the window.
++        assert_eq!(pools.0.lock().unwrap().len(), 1);
++        assert!(log.0.lock().unwrap().is_empty());
++        // A window mapping still lands at its own offset.
++        assert_eq!(map(&mut h, &req(MIB, MIB, 0)), None);
++        assert_eq!(*log.0.lock().unwrap(), vec![(true, MIB)]);
++
++        // Withdrawal names the pool exactly, and reaches the mapper as a pool.
++        let unmap = |h: &mut BackendReqHandlerImpl, r: VhostUserMMap| {
++            h.shmem_unmap(&r)
++                .err()
++                .map(|e| e.raw_os_error().unwrap_or(-1))
++        };
++        assert_eq!(unmap(&mut h, pool(0, 0, MIB)), Some(libc::EINVAL));
++        assert_eq!(unmap(&mut h, pool(0, 0, 2 * MIB)), None);
++        assert_eq!(
++            pools.0.lock().unwrap().last().unwrap(),
++            &format!("unmap {:#x}+{:#x}", AP, 2 * MIB)
++        );
++        assert_eq!(unmap(&mut h, pool(0, 0, 2 * MIB)), Some(libc::EINVAL));
++    }
++
++    #[test]
++    fn nvgpu_pools_are_bounded_and_go_on_reset() {
++        let (mut h, _log, pools) = handler_with(DeviceType::Nvgpu, true);
++        let page = base::pagesize() as u64;
++        let hva = 8u64 << 30;
++        // 256 MiB in all.
++        for i in 0..32u64 {
++            assert_eq!(
++                map(&mut h, &pool(hva + i * 8 * MIB, i * 8 * MIB, 8 * MIB)),
++                None
++            );
++        }
++        assert_eq!(
++            map(&mut h, &pool(hva + 512 * MIB, 512 * MIB, 8 * MIB)),
++            Some(libc::ENOSPC)
++        );
++        h.unmap_all();
++        assert_eq!(
++            pools
++                .0
++                .lock()
++                .unwrap()
++                .iter()
++                .filter(|l| l.starts_with("unmap"))
++                .count(),
++            32
++        );
++        // 64 at once.
++        for i in 0..64u64 {
++            assert_eq!(
++                map(&mut h, &pool(hva + i * 2 * MIB, i * 2 * MIB, page)),
++                None
++            );
++        }
++        assert_eq!(
++            map(&mut h, &pool(hva + 512 * MIB, 512 * MIB, page)),
++            Some(libc::ENOSPC)
++        );
++    }
++
++    #[test]
++    fn only_nvgpu_region_2_is_an_aperture() {
++        // Another device type's region 2 is a region like any other.
++        let (mut h, log, pools) = handler_with(DeviceType::Gpu, true);
++        let mut r = req(MIB, MIB, 0);
++        r.shmid = 2;
++        assert_eq!(map(&mut h, &r), None);
++        assert_eq!(*log.0.lock().unwrap(), vec![(true, AP + MIB)]);
++        assert!(pools.0.lock().unwrap().is_empty());
++        // Without an aperture, an nvgpu pool is refused.
++        let (mut h, _log, pools) = handler_with(DeviceType::Nvgpu, false);
++        assert_eq!(map(&mut h, &pool(8 << 30, 0, 2 * MIB)), Some(libc::EINVAL));
++        assert!(pools.0.lock().unwrap().is_empty());
+     }
+ 
+     fn req(shm_offset: u64, len: u64, fd_offset: u64) -> VhostUserMMap {
+diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
+index 2eae2ab..fb7180a 100644
+--- a/devices/src/virtio/vhost_user_frontend/mod.rs
++++ b/devices/src/virtio/vhost_user_frontend/mod.rs
+@@ -40,6 +40,7 @@ use vmm_vhost::VringConfigData;
+ use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
+ 
+ use crate::virtio::device_constants::VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK;
++use crate::virtio::shared_memory_bar_layout;
+ use crate::virtio::vhost_user_frontend::error::Error;
+ use crate::virtio::vhost_user_frontend::error::Result;
+ use crate::virtio::vhost_user_frontend::handler::BackendReqHandler;
+@@ -70,6 +71,8 @@ pub struct VhostUserFrontend {
+     backend_req_handler: Option<BackendReqHandler>,
+     // Shared memory region info. IPC result from backend is saved with outer Option.
+     shmem_region: RefCell<Option<Option<SharedMemoryRegion>>>,
++    // Regions published after `shmem_region` in the same BAR (virtio-nvgpu's UVM aperture).
++    extra_shmem_regions: RefCell<Vec<SharedMemoryRegion>>,
+ 
+     queue_sizes: Vec<u16>,
+     expose_shmem_descriptors_with_viommu: bool,
+@@ -83,7 +86,9 @@ pub struct VhostUserFrontend {
+ }
+ 
+ /// virtio-nvgpu's window: the shared memory region its guest driver maps device memory through.
+-const NVGPU_SHM_ID_WINDOW: u8 = 1;
++const NVGPU_SHM_ID_WINDOW: u8 = vm_control::nvgpu::NVGPU_SHM_ID_WINDOW;
++/// virtio-nvgpu's UVM aperture, where CUDA's semaphore pools are mapped.
++const NVGPU_SHM_ID_UVM: u8 = vm_control::nvgpu::NVGPU_SHM_ID_UVM;
+ 
+ /// Ring features a device type's backend may negotiate with the guest beyond the common ones.
+ ///
+@@ -247,6 +252,7 @@ impl VhostUserFrontend {
+             protocol_features,
+             backend_req_handler,
+             shmem_region: RefCell::new(None),
++            extra_shmem_regions: RefCell::new(Vec::new()),
+             queue_sizes,
+             expose_shmem_descriptors_with_viommu: device_type == DeviceType::Gpu,
+             pci_address,
+@@ -554,23 +560,41 @@ impl VirtioDevice for VhostUserFrontend {
+             0 => None,
+             1 => Some(regions[0]),
+             // virtio-nvgpu's region 1 is the window every guest maps GPU memory through; its
+-            // region 2, the UVM aperture, only CUDA uses. The PCI transport publishes one region
+-            // per device, so the window is published and the guest finds no aperture, which it
+-            // reads as no compute.
++            // region 2, the UVM aperture, only CUDA uses, and only a backend started with compute
++            // reports it. Both go in the one BAR, the aperture after the window.
+             n if self.device_type == DeviceType::Nvgpu => {
+-                let window = regions.iter().find(|r| r.id == NVGPU_SHM_ID_WINDOW).copied();
+-                if window.is_some() {
+-                    warn!(
+-                        "vhost-user nvgpu backend reported {} shared memory regions; only \
+-                         region {} is published",
+-                        n, NVGPU_SHM_ID_WINDOW
+-                    );
+-                } else {
++                let window = regions
++                    .iter()
++                    .find(|r| r.id == NVGPU_SHM_ID_WINDOW)
++                    .copied();
++                let page = base::pagesize() as u64;
++                let aperture = regions
++                    .iter()
++                    .find(|r| r.id == NVGPU_SHM_ID_UVM)
++                    .map(|r| SharedMemoryRegion {
++                        id: r.id,
++                        length: r.length.min(vm_control::nvgpu::UVM_APERTURE_MAX) & !(page - 1),
++                    })
++                    .filter(|r| r.length > 0);
++                let others = regions
++                    .iter()
++                    .filter(|r| r.id != NVGPU_SHM_ID_WINDOW && r.id != NVGPU_SHM_ID_UVM)
++                    .count();
++                if window.is_none() {
+                     error!(
+                         "vhost-user nvgpu backend reported {} shared memory regions and no \
+                          region {}",
+                         n, NVGPU_SHM_ID_WINDOW
+                     );
++                } else if others > 0 {
++                    warn!(
++                        "vhost-user nvgpu backend reported {} shared memory regions; only \
++                         regions {} and {} are published",
++                        n, NVGPU_SHM_ID_WINDOW, NVGPU_SHM_ID_UVM
++                    );
++                }
++                if window.is_some() {
++                    *self.extra_shmem_regions.borrow_mut() = aperture.into_iter().collect();
+                 }
+                 window
+             }
+@@ -586,6 +610,12 @@ impl VirtioDevice for VhostUserFrontend {
+         region
+     }
+ 
++    fn get_extra_shared_memory_regions(&self) -> Vec<SharedMemoryRegion> {
++        // Filled in when the backend's regions were first asked for.
++        let _ = self.get_shared_memory_region();
++        self.extra_shmem_regions.borrow().clone()
++    }
++
+     fn set_shared_memory_mapper(&mut self, mapper: Box<dyn SharedMemoryMapper>) {
+         // Return error if backend request handler is not available. This indicates
+         // that `VhostUserProtocolFeatures::BACKEND_REQ` is not negotiated.
+@@ -599,10 +629,22 @@ impl VirtioDevice for VhostUserFrontend {
+ 
+         // The virtio framework will only call this if get_shared_memory_region returned a region
+         let region = self.shmem_region.borrow().flatten().expect("missing shmid");
++        let regions: Vec<SharedMemoryRegion> = std::iter::once(region)
++            .chain(self.extra_shmem_regions.borrow().iter().copied())
++            .collect();
++        // Where the transport put each of them in the BAR (it laid it out the same way, and
++        // failed to allocate it if they did not fit).
++        let Some((offsets, _)) = shared_memory_bar_layout(&regions, u64::MAX) else {
++            error!(
++                "shared memory regions of {} bytes have no layout",
++                regions.iter().map(|r| r.length).sum::<u64>()
++            );
++            return;
++        };
+ 
+         backend_req_handler
+             .frontend_mut()
+-            .set_shared_mapper_state(mapper, region);
++            .set_shared_mapper_state(mapper, regions.into_iter().zip(offsets).collect());
+     }
+ 
+     fn expose_shmem_descriptors_with_viommu(&self) -> bool {
+diff --git a/devices/src/virtio/virtio_device.rs b/devices/src/virtio/virtio_device.rs
+index 4b65748..2bd2c00 100644
+--- a/devices/src/virtio/virtio_device.rs
++++ b/devices/src/virtio/virtio_device.rs
+@@ -31,6 +31,31 @@ pub enum SharedMemoryPrepareType {
+     DynamicPerMapping,
+ }
+ 
++/// Where each of a device's shared memory regions goes in the one BAR that holds them all: the
++/// first at 0, each next one on a boundary of its own size (a power of two, at most 1 GiB, at least
++/// a page). Returns the offsets and the BAR's size, a power of two; `None` if they would not fit in
++/// `max_bar` bytes. One region is at 0 in a BAR of its length rounded up to a power of two, as it
++/// always was.
++pub fn shared_memory_bar_layout(
++    regions: &[SharedMemoryRegion],
++    max_bar: u64,
++) -> Option<(Vec<u64>, u64)> {
++    let page = base::pagesize() as u64;
++    let mut end = 0u64;
++    let mut offsets = Vec::with_capacity(regions.len());
++    for region in regions {
++        let align = region
++            .length
++            .checked_next_power_of_two()?
++            .clamp(page, 1 << 30);
++        let offset = end.checked_next_multiple_of(align)?;
++        offsets.push(offset);
++        end = offset.checked_add(region.length)?;
++    }
++    let size = end.checked_next_power_of_two()?;
++    (size <= max_bar).then_some((offsets, size))
++}
++
+ /// Trait for mapping memory into the device's shared memory region.
+ pub trait SharedMemoryMapper: Send {
+     /// Maps the given |source| into the shared memory region at |offset|.
+@@ -45,6 +70,28 @@ pub trait SharedMemoryMapper: Send {
+     /// Removes the mapping beginning at |offset|.
+     fn remove_mapping(&mut self, offset: u64) -> Result<()>;
+ 
++    /// Maps a UVM semaphore pool for virtio-nvgpu's UVM aperture: `size` bytes of `descriptor`
++    /// at host address `host_address` of the process that owns the VM -- also the file offset,
++    /// as UVM maps a pool only there -- given a memory slot of its own at `offset` of the shared
++    /// memory BAR. The process that owns the VM checks the request against the region it laid
++    /// out itself.
++    fn add_uvm_pool_mapping(
++        &mut self,
++        descriptor: base::SafeDescriptor,
++        host_address: u64,
++        size: u64,
++        offset: u64,
++    ) -> Result<()> {
++        let _ = (descriptor, host_address, size, offset);
++        Err(anyhow!("this shared memory mapper cannot map UVM pools"))
++    }
++
++    /// Removes the pool mapped at `offset`, `size` bytes long: its slot, then its mapping.
++    fn remove_uvm_pool_mapping(&mut self, offset: u64, size: u64) -> Result<()> {
++        let _ = (offset, size);
++        Err(anyhow!("this shared memory mapper cannot map UVM pools"))
++    }
++
+     fn as_raw_descriptor(&self) -> Option<RawDescriptor> {
+         None
+     }
+@@ -174,6 +221,13 @@ pub trait VirtioDevice: Send {
+         None
+     }
+ 
++    /// Shared memory regions besides the one `get_shared_memory_region` returns, published in
++    /// the same BAR after it, each where `shared_memory_bar_layout` puts it. Only asked when
++    /// `get_shared_memory_region` returns one. The mapper addresses the whole BAR.
++    fn get_extra_shared_memory_regions(&self) -> Vec<SharedMemoryRegion> {
++        Vec::new()
++    }
++
+     /// If true, VFIO passthrough devices can access descriptors mapped into
+     /// this region by mapping the corresponding addresses from this device's
+     /// PCI bar into their IO address space with virtio-iommu.
+@@ -386,3 +440,61 @@ macro_rules! suspendable_virtio_tests {
+         }
+     };
+ }
++
++#[cfg(test)]
++mod layout_tests {
++    use super::shared_memory_bar_layout;
++    use super::SharedMemoryRegion;
++
++    const MIB: u64 = 1 << 20;
++    const GIB: u64 = 1 << 30;
++
++    fn r(id: u8, length: u64) -> SharedMemoryRegion {
++        SharedMemoryRegion { id, length }
++    }
++
++    #[test]
++    fn one_region_is_laid_out_as_it_always_was() {
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, GIB)], 64 * GIB),
++            Some((vec![0], GIB))
++        );
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, 3 * MIB)], 64 * GIB),
++            Some((vec![0], 4 * MIB))
++        );
++    }
++
++    #[test]
++    fn regions_follow_each_other_on_their_own_boundary() {
++        // virtio-nvgpu with compute: the window, then the aperture.
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, GIB), r(2, GIB)], 64 * GIB),
++            Some((vec![0, GIB], 2 * GIB))
++        );
++        // A small region after a large one, and a large one after a small one.
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, GIB), r(2, 3 * MIB)], 64 * GIB),
++            Some((vec![0, GIB], 2 * GIB))
++        );
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, 3 * MIB), r(2, GIB)], 64 * GIB),
++            Some((vec![0, GIB], 2 * GIB))
++        );
++        // Regions past 1 GiB are aligned to 1 GiB, not to their size.
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, MIB), r(2, 4 * GIB)], 64 * GIB),
++            Some((vec![0, GIB], 8 * GIB))
++        );
++    }
++
++    #[test]
++    fn a_layout_past_the_limit_or_overflowing_is_none() {
++        assert_eq!(shared_memory_bar_layout(&[r(1, GIB), r(2, GIB)], GIB), None);
++        assert_eq!(shared_memory_bar_layout(&[r(1, u64::MAX)], u64::MAX), None);
++        assert_eq!(
++            shared_memory_bar_layout(&[r(1, GIB), r(2, u64::MAX - GIB)], u64::MAX),
++            None
++        );
++    }
++}
+diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
+index 644ea40..019b2b4 100644
+--- a/devices/src/virtio/virtio_pci_device.rs
++++ b/devices/src/virtio/virtio_pci_device.rs
+@@ -13,6 +13,7 @@ use anyhow::Context;
+ use base::debug;
+ use base::error;
+ use base::trace;
++use base::warn;
+ use base::AsRawDescriptor;
+ use base::AsRawDescriptors;
+ use base::Event;
+@@ -45,6 +46,8 @@ use virtio_sys::virtio_config::VIRTIO_CONFIG_S_NEEDS_RESET;
+ use virtio_sys::virtio_config::VIRTIO_CONFIG_S_SUSPEND;
+ use vm_control::api::VmMemoryClient;
+ use vm_control::PciId;
++use vm_control::SharedMemoryBarLayout;
++use vm_control::SharedMemoryLayoutReport;
+ use vm_control::VmMemoryDestination;
+ use vm_control::VmMemoryRegionId;
+ use vm_control::VmMemorySource;
+@@ -325,6 +328,10 @@ pub struct VirtioPciDevice {
+     // API client for registration of ioevents when PCI BAR reprogramming is detected.
+     ioevent_vm_memory_client: VmMemoryClient,
+ 
++    // Where the shared memory BAR's layout is reported, for the main process to hold the
++    // device's memory requests to it.
++    shared_memory_layout_report: Option<SharedMemoryLayoutReport>,
++
+     // State only present while asleep.
+     sleep_state: Option<SleepState>,
+ 
+@@ -542,11 +549,28 @@ impl VirtioPciDevice {
+             iommu: None,
+             shared_memory_vm_memory_client,
+             ioevent_vm_memory_client,
++            shared_memory_layout_report: None,
+             sleep_state: None,
+             vm_control_tube: Arc::new(Mutex::new(vm_control_tube)),
+         })
+     }
+ 
++    /// Report the shared memory BAR's layout into `report` when it is allocated, which happens in
++    /// the main process before the device is moved into a process of its own.
++    pub fn report_shared_memory_layout(&mut self, report: SharedMemoryLayoutReport) {
++        self.shared_memory_layout_report = Some(report);
++    }
++
++    /// Every shared memory region the device has: the one it always had, then any extra ones.
++    fn shared_memory_regions(&self) -> Vec<SharedMemoryRegion> {
++        match self.device.get_shared_memory_region() {
++            None => Vec::new(),
++            Some(first) => std::iter::once(first)
++                .chain(self.device.get_extra_shared_memory_regions())
++                .collect(),
++        }
++    }
++
+     fn is_driver_ready(&self) -> bool {
+         let ready_bits = (VIRTIO_CONFIG_S_ACKNOWLEDGE
+             | VIRTIO_CONFIG_S_DRIVER
+@@ -845,14 +869,23 @@ impl PciDevice for VirtioPciDevice {
+ 
+     fn register_device_capabilities(&mut self) -> std::result::Result<(), PciDeviceError> {
+         let mut caps = self.device.get_device_caps();
+-        if let Some(region) = self.device.get_shared_memory_region() {
+-            caps.push(Box::new(VirtioPciShmCap::new(
+-                PciCapabilityType::SharedMemoryConfig,
+-                SHMEM_BAR_NUM as u8,
+-                0,
+-                region.length,
+-                region.id,
+-            )));
++        let regions = self.shared_memory_regions();
++        if !regions.is_empty() {
++            // Checked when the BAR was allocated, before this.
++            let (offsets, _) = shared_memory_bar_layout(&regions, MAX_SHARED_MEMORY_REGION_SIZE)
++                .ok_or(PciDeviceError::SharedMemoryRegionTooLarge(
++                    regions.iter().map(|r| r.length).sum(),
++                    MAX_SHARED_MEMORY_REGION_SIZE,
++                ))?;
++            for (region, offset) in regions.iter().zip(offsets) {
++                caps.push(Box::new(VirtioPciShmCap::new(
++                    PciCapabilityType::SharedMemoryConfig,
++                    SHMEM_BAR_NUM as u8,
++                    offset,
++                    region.length,
++                    region.id,
++                )));
++            }
+         }
+ 
+         for cap in caps {
+@@ -1093,24 +1126,26 @@ where
+     let configs = if !configs.is_empty() {
+         configs
+     } else {
+-        let region = match virtio_pci_device.device.get_shared_memory_region() {
+-            None => return Ok(Vec::new()),
+-            Some(r) => r,
+-        };
+-        // The region length comes from the device, which for a vhost-user device
++        let regions = virtio_pci_device.shared_memory_regions();
++        if regions.is_empty() {
++            return Ok(Vec::new());
++        }
++        // The region lengths come from the device, which for a vhost-user device
+         // means the backend -- a separate, less-trusted process. A wild value
+         // would round up to an absurd BAR and either abort the VM (the former
+         // `expect`) or reserve a preposterous slice of the address space. Cap it
+-        // and fail cleanly instead.
+-        let bar_size = match region.length.checked_next_power_of_two() {
+-            Some(size) if size <= MAX_SHARED_MEMORY_REGION_SIZE => size,
+-            _ => {
+-                return Err(PciDeviceError::SharedMemoryRegionTooLarge(
+-                    region.length,
+-                    MAX_SHARED_MEMORY_REGION_SIZE,
+-                ));
+-            }
+-        };
++        // and fail cleanly instead. Every region goes in the one BAR, each at the
++        // offset its capability names.
++        let (offsets, bar_size) =
++            match shared_memory_bar_layout(&regions, MAX_SHARED_MEMORY_REGION_SIZE) {
++                Some(layout) => layout,
++                None => {
++                    return Err(PciDeviceError::SharedMemoryRegionTooLarge(
++                        regions.iter().fold(0u64, |a, r| a.saturating_add(r.length)),
++                        MAX_SHARED_MEMORY_REGION_SIZE,
++                    ));
++                }
++            };
+         let config = PciBarConfiguration::new(
+             SHMEM_BAR_NUM,
+             bar_size,
+@@ -1145,6 +1180,24 @@ where
+             .device
+             .set_shared_memory_mapper(vm_requester);
+ 
++        if let Some(report) = &virtio_pci_device.shared_memory_layout_report {
++            let layout = SharedMemoryBarLayout {
++                alloc,
++                size: bar_size,
++                regions: regions
++                    .iter()
++                    .zip(&offsets)
++                    .map(|(r, &offset)| (r.id, offset, r.length))
++                    .collect(),
++            };
++            if report.set(layout).is_err() {
++                warn!(
++                    "{}: shared memory layout already reported",
++                    virtio_pci_device.debug_label()
++                );
++            }
++        }
++
+         vec![config]
+     };
+     let mut ranges = vec![];
+@@ -1565,6 +1618,26 @@ impl SharedMemoryMapper for VmRequester {
+             .context("unregister_memory failed")
+     }
+ 
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    fn add_uvm_pool_mapping(
++        &mut self,
++        descriptor: base::SafeDescriptor,
++        host_address: u64,
++        size: u64,
++        offset: u64,
++    ) -> anyhow::Result<()> {
++        self.vm_memory_client
++            .register_uvm_pool(descriptor, host_address, size, self.alloc, offset)
++            .context("register_uvm_pool failed")
++    }
++
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    fn remove_uvm_pool_mapping(&mut self, offset: u64, size: u64) -> anyhow::Result<()> {
++        self.vm_memory_client
++            .unregister_uvm_pool(self.alloc, offset, size)
++            .context("unregister_uvm_pool failed")
++    }
++
+     fn as_raw_descriptor(&self) -> Option<RawDescriptor> {
+         Some(self.vm_memory_client.as_raw_descriptor())
+     }
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 36a71ee..8c09f13 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -102,6 +102,7 @@ use devices::virtio::vhost_user_backend::VhostUserConnectionTrait;
+ use devices::virtio::vhost_user_backend::VhostUserListener;
+ #[cfg(feature = "balloon")]
+ use devices::virtio::BalloonFeatures;
++use devices::virtio::DeviceType;
+ use devices::virtio::VirtioDevice;
+ use devices::virtio::VirtioDeviceType;
+ use devices::Bus;
+@@ -183,6 +184,9 @@ use swap::SwapController;
+ use sync::Condvar;
+ use sync::Mutex;
+ use vm_control::api::VmMemoryClient;
++use vm_control::sys::linux::nvgpu::NvgpuTubeState;
++use vm_control::sys::linux::nvgpu::NvgpuVerdict;
++use vm_control::sys::linux::nvgpu::VmMemoryTubeRestriction;
+ use vm_control::*;
+ use vm_memory::FileBackedMappingParameters;
+ use vm_memory::GuestAddress;
+@@ -1083,14 +1087,27 @@ fn create_devices(
+         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+         add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
+ 
++        // virtio-nvgpu's memory requests are held, here in the main process, to the BAR the
++        // transport lays out for it, whether or not its frontend is jailed
++        // (vm_control::sys::linux::nvgpu).
++        let layout_report: Option<SharedMemoryLayoutReport> =
++            (stub.dev.device_type() == DeviceType::Nvgpu).then(Default::default);
++
+         let shared_memory_tube = if stub.dev.get_shared_memory_region().is_some() {
+             let (host_tube, device_tube) =
+                 Tube::pair().context("failed to create shared memory tube")?;
+-            add_control_tube(AnyControlTube::VmMemoryTube {
+-                tube: host_tube,
+-                expose_with_viommu: stub.dev.expose_shmem_descriptors_with_viommu(),
+-                remote_peer: stub.jail.is_some(),
+-            });
++            match &layout_report {
++                Some(report) => add_control_tube(AnyControlTube::RestrictedVmMemoryTube {
++                    tube: host_tube,
++                    remote_peer: stub.jail.is_some(),
++                    restriction: VmMemoryTubeRestriction::NvgpuSharedMemory(report.clone()),
++                }),
++                None => add_control_tube(AnyControlTube::VmMemoryTube {
++                    tube: host_tube,
++                    expose_with_viommu: stub.dev.expose_shmem_descriptors_with_viommu(),
++                    remote_peer: stub.jail.is_some(),
++                }),
++            }
+             Some(device_tube)
+         } else {
+             None
+@@ -1098,17 +1115,25 @@ fn create_devices(
+ 
+         let (ioevent_host_tube, ioevent_device_tube) =
+             Tube::pair().context("failed to create ioevent tube")?;
+-        add_control_tube(AnyControlTube::VmMemoryTube {
+-            tube: ioevent_host_tube,
+-            expose_with_viommu: false,
+-            remote_peer: stub.jail.is_some(),
+-        });
++        if layout_report.is_some() {
++            add_control_tube(AnyControlTube::RestrictedVmMemoryTube {
++                tube: ioevent_host_tube,
++                remote_peer: stub.jail.is_some(),
++                restriction: VmMemoryTubeRestriction::NvgpuIoEvents,
++            });
++        } else {
++            add_control_tube(AnyControlTube::VmMemoryTube {
++                tube: ioevent_host_tube,
++                expose_with_viommu: false,
++                remote_peer: stub.jail.is_some(),
++            });
++        }
+ 
+         let (host_tube, device_tube) =
+             Tube::pair().context("failed to create device control tube")?;
+         add_control_tube(AnyControlTube::Device(host_tube));
+ 
+-        let dev = VirtioPciDevice::new(
++        let mut dev = VirtioPciDevice::new(
+             vm.get_memory().clone(),
+             stub.dev,
+             msi_device_tube,
+@@ -1118,6 +1143,9 @@ fn create_devices(
+             device_tube,
+         )
+         .context("failed to create virtio pci dev")?;
++        if let Some(report) = layout_report {
++            dev.report_shared_memory_layout(report);
++        }
+ 
+         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, stub.jail));
+     }
+@@ -2136,7 +2164,35 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
+     None
+ }
+ 
++/// virtio-nvgpu's UVM aperture maps each CUDA semaphore pool at a host address the guest chose,
++/// in [4 GiB, 32 TiB): reserve that band now, before anything of this process can be placed in it
++/// (vm_control::sys::linux::nvgpu). If it cannot be reserved, pools are still mapped, with
++/// MAP_FIXED_NOREPLACE, and one can collide with memory of ours that is in the band.
++fn reserve_nvgpu_uvm_band() {
++    match vm_control::sys::linux::nvgpu::reserve_uvm_band() {
++        Ok(()) => info!(
++            "nvgpu: reserved the UVM pool band [{:#x}, {:#x})",
++            vm_control::nvgpu::UVM_HVA_MIN,
++            vm_control::nvgpu::UVM_HVA_MAX
++        ),
++        Err(e) => warn!(
++            "nvgpu: could not reserve the UVM pool band [{:#x}, {:#x}): {}; pools will be \
++             mapped without it",
++            vm_control::nvgpu::UVM_HVA_MIN,
++            vm_control::nvgpu::UVM_HVA_MAX,
++            e
++        ),
++    }
++    match vm_control::sys::linux::nvgpu::probe_host() {
++        Some(major) => info!("nvgpu: nvidia-uvm is character major {}", major),
++        None => info!("nvgpu: nvidia-uvm is not loaded now; the first UVM pool will look again"),
++    }
++}
++
+ pub fn run_config(cfg: Config) -> Result<ExitState> {
++    if cfg.vhost_user.iter().any(|o| o.type_ == DeviceType::Nvgpu) {
++        reserve_nvgpu_uvm_band();
++    }
+     let components = setup_vm_components(&cfg)?;
+ 
+     let hypervisor = cfg
+@@ -3321,6 +3377,17 @@ fn process_vm_request(
+             tube,
+             expose_with_viommu,
+             remote_peer,
++            policy: None,
++        }),
++        AnyControlTube::RestrictedVmMemoryTube {
++            tube,
++            remote_peer,
++            restriction,
++        } => add_vm_memory_control_tubes.push(VmMemoryTube {
++            tube,
++            expose_with_viommu: false,
++            remote_peer,
++            policy: Some(restriction.resolve()),
+         }),
+         AnyControlTube::VmMsync(t) => add_tubes.push(TaggedControlTube::VmMsync(t)),
+     };
+@@ -3623,6 +3690,17 @@ fn handle_device_control_request(
+             tube,
+             expose_with_viommu,
+             remote_peer,
++            policy: None,
++        }),
++        AnyControlTube::RestrictedVmMemoryTube {
++            tube,
++            remote_peer,
++            restriction,
++        } => add_vm_memory_control_tubes.push(VmMemoryTube {
++            tube,
++            expose_with_viommu: false,
++            remote_peer,
++            policy: Some(restriction.resolve()),
+         }),
+         AnyControlTube::VmMsync(t) => add_tubes.push(TaggedControlTube::VmMsync(t)),
+     };
+@@ -3934,6 +4012,18 @@ fn run_control(
+                 tube,
+                 expose_with_viommu,
+                 remote_peer,
++                policy: None,
++            }),
++            // Resolved now: the device's BAR was laid out when the VM was built.
++            AnyControlTube::RestrictedVmMemoryTube {
++                tube,
++                remote_peer,
++                restriction,
++            } => vm_memory_control_tubes.push(VmMemoryTube {
++                tube,
++                expose_with_viommu: false,
++                remote_peer,
++                policy: Some(restriction.resolve()),
+             }),
+             AnyControlTube::VmMsync(t) => control_tubes.push(TaggedControlTube::VmMsync(t)),
+         }
+@@ -4286,6 +4376,7 @@ fn run_control(
+         tube: vm_memory_control_tube1,
+         expose_with_viommu: false,
+         remote_peer: false,
++        policy: None,
+     });
+     let vm_memory_control_client = VmMemoryClient::new(vm_memory_control_tube_2);
+     let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
+@@ -5041,9 +5132,14 @@ fn vm_memory_handler_thread(
+     let wait_ctx =
+         WaitContext::build_with(&[(handler_control.get_read_notifier(), Token::HandlerControl)])
+             .context("failed to build wait context")?;
++    // Tubes held to what one device needs (virtio-nvgpu's), and what each has mapped.
++    let mut restricted: BTreeMap<usize, NvgpuTubeState> = BTreeMap::new();
+     let mut control_tubes = BTreeMap::from_iter(control_tubes.into_iter().enumerate());
+     let mut next_control_id = control_tubes.len();
+-    for (id, socket) in control_tubes.iter() {
++    for (id, socket) in control_tubes.iter_mut() {
++        if let Some(policy) = socket.policy.take() {
++            restricted.insert(*id, NvgpuTubeState::new(policy));
++        }
+         wait_ctx
+             .add(socket.as_ref(), Token::VmControl { id: *id })
+             .context("failed to add descriptor to wait context")?;
+@@ -5069,9 +5165,12 @@ fn vm_memory_handler_thread(
+                     Ok(request) => match request {
+                         VmMemoryHandlerRequest::Exit => break 'wait,
+                         VmMemoryHandlerRequest::AddControlTubes(tubes) => {
+-                            for socket in tubes {
++                            for mut socket in tubes {
+                                 let id = next_control_id;
+                                 next_control_id += 1;
++                                if let Some(policy) = socket.policy.take() {
++                                    restricted.insert(id, NvgpuTubeState::new(policy));
++                                }
+                                 wait_ctx
+                                     .add(socket.get_read_notifier(), Token::VmControl { id })
+                                     .context(
+@@ -5094,14 +5193,40 @@ fn vm_memory_handler_thread(
+                         tube,
+                         expose_with_viommu,
+                         remote_peer,
++                        ..
+                     }) = control_tubes.get(&id)
+                     {
+                         match tube.recv::<VmMemoryRequest>() {
+                             Ok(request) => {
++                                let mut sys_allocator = sys_allocator_mutex.lock();
++                                // A restricted tube's request is checked first, and what it
++                                // does is recorded; some it serves itself.
++                                let (request, pending) = match restricted.get_mut(&id) {
++                                    Some(state) => match state.handle(
++                                        request,
++                                        &*vm,
++                                        &mut sys_allocator,
++                                        &mut region_state,
++                                    ) {
++                                        NvgpuVerdict::Respond(response) => {
++                                            if let Err(e) = tube.send(&response) {
++                                                error!(
++                                                    "failed to send VmMemoryControlResponse: {}",
++                                                    e
++                                                );
++                                            }
++                                            continue;
++                                        }
++                                        NvgpuVerdict::Execute(request, pending) => {
++                                            (request, Some(pending))
++                                        }
++                                    },
++                                    None => (request, None),
++                                };
+                                 let response = request.execute(
+                                     tube,
+                                     &*vm,
+-                                    &mut sys_allocator_mutex.lock(),
++                                    &mut sys_allocator,
+                                     #[cfg(feature = "gpu")]
+                                     &mut gralloc,
+                                     if *expose_with_viommu {
+@@ -5112,6 +5237,12 @@ fn vm_memory_handler_thread(
+                                     &mut region_state,
+                                     *remote_peer,
+                                 );
++                                drop(sys_allocator);
++                                if let (Some(pending), Some(state)) =
++                                    (pending, restricted.get_mut(&id))
++                                {
++                                    state.note(pending, &response);
++                                }
+                                 if let Err(e) = tube.send(&response) {
+                                     error!("failed to send VmMemoryControlResponse: {}", e);
+                                 }
+@@ -5141,6 +5272,17 @@ fn vm_memory_handler_thread(
+                 None
+             },
+         )?;
++        // A restricted tube that has gone -- its device process ended -- can no longer withdraw
++        // what it placed; the main process does, trusting nothing it last said.
++        let gone: Vec<usize> = restricted
++            .keys()
++            .filter(|id| !control_tubes.contains_key(id))
++            .copied()
++            .collect();
++        for id in gone {
++            let mut state = restricted.remove(&id).expect("listed above");
++            state.teardown(&*vm, &mut sys_allocator_mutex.lock(), &mut region_state);
++        }
+         if events
+             .iter()
+             .any(|e| e.is_hungup && !e.is_readable && matches!(e.token, Token::HandlerControl))
+diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
+index bdc36fd..d29febb 100644
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -122,6 +122,10 @@ pub struct VmMemoryTube {
+     pub expose_with_viommu: bool,
+     /// Whether the other end of the tube is in another separate process.
+     pub remote_peer: bool,
++    /// What the tube is held to, for a device whose requests the main process checks (see
++    /// vm_control::sys::linux::nvgpu); `None` for anything a `VmMemoryRequest` can ask.
++    #[serde(default)]
++    pub policy: Option<vm_control::sys::linux::nvgpu::NvgpuTubePolicy>,
+ }
+ 
+ impl AsRef<Tube> for VmMemoryTube {
+-- 
+2.55.0
+
