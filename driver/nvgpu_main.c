@@ -676,14 +676,39 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev,
 
 void nvgpu_fd_get(struct nvgpu_fd *nfd) { refcount_inc(&nfd->ref); }
 
-void nvgpu_dev_get(struct nvgpu_device *dev) { kref_get(&dev->ref); }
+void nvgpu_dev_get(struct nvgpu_device *dev) { kobject_get(&dev->kobj); }
 
-static void nvgpu_dev_release(struct kref *ref) {
-  kfree(container_of(ref, struct nvgpu_device, ref));
+/*
+ * The last reference: every open file, mapping, fence and character device
+ * inode is done with the device. Only memory goes here -- the transport's
+ * state, and the virtio device, kept for the lines logged against it.
+ */
+static void nvgpu_dev_release(struct kobject *kobj) {
+  struct nvgpu_device *dev = container_of(kobj, struct nvgpu_device, kobj);
+
+  nvgpu_xfer_free(dev);
+  put_device(&dev->vdev->dev);
+  kfree(dev);
 }
 
-void nvgpu_dev_put(struct nvgpu_device *dev) {
-  kref_put(&dev->ref, nvgpu_dev_release);
+static const struct kobj_type nvgpu_dev_ktype = {
+    .release = nvgpu_dev_release,
+};
+
+void nvgpu_dev_put(struct nvgpu_device *dev) { kobject_put(&dev->kobj); }
+
+/*
+ * A character device embedded in the device: its kobject holds the device
+ * from cdev_add() until the last inode's cdev_put(), which comes after the
+ * file's release and so after its own device reference is gone.
+ */
+static int nvgpu_cdev_add(struct nvgpu_device *dev, struct cdev *c,
+                          const struct file_operations *fops, dev_t devno,
+                          unsigned int count) {
+  cdev_init(c, fops);
+  c->owner = THIS_MODULE;
+  cdev_set_parent(c, &dev->kobj);
+  return cdev_add(c, devno, count);
 }
 
 /*
@@ -773,8 +798,15 @@ static int nvgpu_ctl_open(struct inode *inode, struct file *filp) {
   return nvgpu_open_common(inode, filp, NVGPU_DEV_CTL);
 }
 
+/*
+ * One character device for both UVM nodes, told apart by minor, as
+ * nvidia-uvm does: 0 is /dev/nvidia-uvm, 1 /dev/nvidia-uvm-tools, which the
+ * backend opens as the host's own tools node (profilers, uvm_tools.c).
+ */
 static int nvgpu_uvm_open(struct inode *inode, struct file *filp) {
-  return nvgpu_open_common(inode, filp, NVGPU_DEV_UVM);
+  return nvgpu_open_common(inode, filp,
+                           iminor(inode) == 1 ? NVGPU_DEV_UVM_TOOLS
+                                              : NVGPU_DEV_UVM);
 }
 
 static int nvgpu_release(struct inode *inode, struct file *filp) {
@@ -1886,9 +1918,8 @@ static void nvgpu_caps_init(struct nvgpu_device *dev) {
   }
   cls->devnode = nvgpu_caps_devnode;
 
-  cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
-  dev->cdev_caps.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_caps, dev->caps_devno, 2);
+  ret = nvgpu_cdev_add(dev, &dev->cdev_caps, &nvgpu_caps_fops, dev->caps_devno,
+                       2);
   if (ret) {
     dev_warn(&dev->vdev->dev,
              "virtio-gpu-nv: cannot add the nvidia-caps cdev: %d\n", ret);
@@ -1934,8 +1965,10 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev = kzalloc(sizeof(*dev), GFP_KERNEL);
   if (!dev)
     return -ENOMEM;
-  kref_init(&dev->ref);
+  kobject_init(&dev->kobj, &nvgpu_dev_ktype);
 
+  /* For the lines logged against it by whatever outlives remove(). */
+  get_device(&vdev->dev);
   dev->vdev = vdev;
   vdev->priv = dev;
   INIT_LIST_HEAD(&dev->fds);
@@ -2057,9 +2090,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     goto err_class;
 
   for (i = 0; i < (int)dev->num_gpus; i++) {
-    cdev_init(&dev->cdev_gpu[i], &nvgpu_gpu_fops);
-    dev->cdev_gpu[i].owner = THIS_MODULE;
-    ret = cdev_add(&dev->cdev_gpu[i], MKDEV(NV_MAJOR, i), 1);
+    ret = nvgpu_cdev_add(dev, &dev->cdev_gpu[i], &nvgpu_gpu_fops,
+                         MKDEV(NV_MAJOR, i), 1);
     if (ret)
       goto err_gpu_cdevs;
     device_create(nvgpu_class, &vdev->dev, MKDEV(NV_MAJOR, i), NULL, "nvidia%d",
@@ -2071,9 +2103,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (ret)
     goto err_gpu_cdevs;
 
-  cdev_init(&dev->cdev_ctl, &nvgpu_ctl_fops);
-  dev->cdev_ctl.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_ctl, MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
+  ret = nvgpu_cdev_add(dev, &dev->cdev_ctl, &nvgpu_ctl_fops,
+                       MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
   if (ret)
     goto err_ctl_region;
 
@@ -2090,9 +2121,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     if (ret)
       goto err_ctl_cdev;
 
-    cdev_init(&dev->cdev_uvm, &nvgpu_uvm_fops);
-    dev->cdev_uvm.owner = THIS_MODULE;
-    ret = cdev_add(&dev->cdev_uvm, dev->uvm_devno, 1);
+    ret = nvgpu_cdev_add(dev, &dev->cdev_uvm, &nvgpu_uvm_fops, dev->uvm_devno,
+                         2);
     if (ret) {
       unregister_chrdev_region(dev->uvm_devno, 2);
       goto err_ctl_cdev;
@@ -2114,9 +2144,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (ret)
     goto err_uvm_cdev;
 
-  cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
-  dev->cdev_modeset.owner = THIS_MODULE;
-  ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
+  ret = nvgpu_cdev_add(dev, &dev->cdev_modeset, &nvgpu_modeset_fops,
+                       dev->modeset_devno, 1);
   if (ret)
     goto err_modeset_region;
 

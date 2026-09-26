@@ -142,12 +142,16 @@ struct nvgpu_device {
    * Everything that names this struct and can outlive remove() holds a
    * reference (nvgpu_dev_get()): an open file of any of our nodes, a
    * Wayland device, a guest file standing for a backend handle, a host
-   * fence's and a syncobj wait's event consumer, an RM mapping's vmas.
-   * remove() drops the probe's, and the last put frees it. After remove()
-   * the transport is gone (xfer and events NULL), so what they still do
-   * with it fails -ENODEV instead of touching freed memory (S-26).
+   * fence's and a syncobj wait's event consumer, an RM mapping's vmas --
+   * and each character device below, whose kobject is parented here
+   * (cdev_set_parent()), so the cdevs embedded in this struct outlive the
+   * last cdev_put() of an inode. remove() drops the probe's, and the last
+   * put frees it, with the transport's state and a reference on the virtio
+   * device held for its log lines. After remove() the transport is dead
+   * (nvgpu_xfer_dead()), not freed, so what still uses it fails -ENODEV
+   * instead of touching freed memory (S-26). Never added to sysfs.
    */
-  struct kref ref;
+  struct kobject kobj;
   /*
    * Where the VMM placed the window, read out of this device's own shared
    * memory region. Zero-length when the VMM offers none, in which case device
@@ -792,8 +796,11 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev);
 void nvgpu_xfer_quiesce(struct nvgpu_device *dev);
 /* Remove, after the device reset: fail waiters, reclaim every buffer. */
 void nvgpu_xfer_reclaim(struct nvgpu_device *dev);
-/* After del_vqs (remove, or a probe that failed): free what init allocated. */
+/* After del_vqs (remove, or a probe that failed): stop the work queue. The
+ * state stays, dead, for whatever still holds the device. */
 void nvgpu_xfer_destroy(struct nvgpu_device *dev);
+/* The device's last reference: free what init allocated. Any context. */
+void nvgpu_xfer_free(struct nvgpu_device *dev);
 void nvgpu_ctrl_vq_cb(struct virtqueue *vq);
 void nvgpu_event_vq_cb(struct virtqueue *vq);
 

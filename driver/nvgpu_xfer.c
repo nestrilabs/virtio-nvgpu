@@ -1902,6 +1902,9 @@ int nvgpu_ev_register(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c,
 
   if (!ev || !c->deliver)
     return -EINVAL;
+  /* Nothing will ever be delivered again. */
+  if (nvgpu_xfer_dead(dev))
+    return -ENODEV;
   spin_lock_irqsave(&ev->lock, flags);
   c->key = key;
   hash_add(ev->consumers, &c->node, key);
@@ -1931,7 +1934,9 @@ void nvgpu_ev_unregister(struct nvgpu_device *dev,
 u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev) {
   struct nvgpu_events *ev = dev->events;
 
-  return ev ? (u64)atomic64_inc_return(&ev->next_cookie) : 0;
+  if (!ev || nvgpu_xfer_dead(dev))
+    return 0;
+  return (u64)atomic64_inc_return(&ev->next_cookie);
 }
 
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
@@ -2042,8 +2047,8 @@ int nvgpu_xfer_init(struct nvgpu_device *dev) {
 
 /*
  * Whether nothing sent from here will ever be answered: after a reset or
- * remove(). For sleepers the transport cannot wake itself. Callers are
- * inside drm_dev_enter() or otherwise before nvgpu_xfer_destroy().
+ * remove(). For sleepers the transport cannot wake itself. Any holder of a
+ * device reference may ask: the state lives until the last one goes.
  */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = READ_ONCE(dev->xfer);
@@ -2101,17 +2106,35 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
     }
 }
 
+/*
+ * The queue goes; the state stays, dead, for whatever still holds the device
+ * (an open file, a fence, a mapping): each of them finds nvgpu_xfer_dead()
+ * rather than freed memory, and every path that could still queue work
+ * checks that under xf->lock first (nvgpu_queue_close()), or ran on a
+ * virtqueue that is gone (the callbacks, hotplug).
+ */
 void nvgpu_xfer_destroy(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+
+  if (!xf)
+    return;
+  spin_lock_irqsave(&xf->lock, flags);
+  xf->dead = true;
+  spin_unlock_irqrestore(&xf->lock, flags);
+  cancel_delayed_work_sync(&xf->sync_work);
+  if (xf->wq) {
+    destroy_workqueue(xf->wq);
+    xf->wq = NULL;
+  }
+}
+
+void nvgpu_xfer_free(struct nvgpu_device *dev) {
   struct nvgpu_events *ev = dev->events;
   int i;
 
-  if (xf) {
-    cancel_delayed_work_sync(&xf->sync_work);
-    destroy_workqueue(xf->wq);
-    kfree(xf);
-    dev->xfer = NULL;
-  }
+  kfree(dev->xfer);
+  dev->xfer = NULL;
   if (ev) {
     for (i = 0; i < NVGPU_EVENT_BUFS; i++)
       kfree(ev->bufs[i]);
