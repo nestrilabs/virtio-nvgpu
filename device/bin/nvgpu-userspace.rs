@@ -29,7 +29,9 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(about = "Stage the host NVIDIA user-mode driver for a guest")]
 struct Args {
-    /// The driver's file manifest.
+    /// The driver's file manifest, NVIDIA's `sandboxutils-filelist.json`.
+    /// Where the driver is not installed under /usr (NixOS, say), point this
+    /// at the one in the driver package's `share/nvidia/files.d/`.
     #[arg(long, default_value = DEFAULT_MANIFEST)]
     manifest: PathBuf,
 
