@@ -341,11 +341,9 @@ fn the_closure_check_refuses_bad_policy_lines_and_unknown_interfaces() {
     assert!(errs.iter().any(|e| e.contains("ghost")), "{errs:?}");
 }
 
-#[test]
-fn the_vendored_allowlist_is_closed() {
-    // build.rs already refused to build otherwise; this keeps the claim next
-    // to the tests and exercises the real tables.
-    let model: Vec<ModelIface> = proto::INTERFACES
+/// The generated tables, as the closure check models them.
+fn vendored_model() -> Vec<ModelIface> {
+    proto::INTERFACES
         .iter()
         .map(|i| {
             let conv = |x: &proto::Message| ModelMsg {
@@ -364,7 +362,14 @@ fn the_vendored_allowlist_is_closed() {
                 events: i.events.iter().map(conv).collect(),
             }
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn the_vendored_allowlist_is_closed() {
+    // build.rs already refused to build otherwise; this keeps the claim next
+    // to the tests and exercises the real tables.
+    let model = vendored_model();
     let globals: Vec<&str> = crate::policy_table::GLOBALS
         .iter()
         .map(|g| g.interface)
@@ -2697,4 +2702,24 @@ fn a_pool_or_a_clients_blob_must_be_memory() {
     assert_eq!(fds.len(), 1);
     assert_eq!(sys::file_size(fds[0].as_raw_fd()).unwrap(), 0, "a placeholder");
     assert_eq!(p.h.stats.placeholders, 1);
+}
+
+/// A value rewrite is of a message the allowlist can reach; one of anything
+/// else is dead code that reads as a promise (ext_image_copy_capture's was:
+/// every capture protocol is hidden).
+#[test]
+fn every_rewrite_is_of_an_interface_the_allowlist_reaches() {
+    let model = vendored_model();
+    let mut reach = std::collections::BTreeSet::new();
+    for g in crate::policy_table::GLOBALS {
+        reach.extend(closure::reachable(&model, g.interface).unwrap());
+    }
+    reach.insert("wl_display".to_string());
+    reach.insert("wl_registry".to_string());
+    for (iface, msg, _) in crate::policy_table::REWRITES {
+        assert!(
+            reach.contains(*iface),
+            "{iface}.{msg} is rewritten but never reached"
+        );
+    }
 }
