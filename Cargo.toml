@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
 members = [
     "wlwire",
     "nvgpu-wl-guest",
@@ -10,8 +9,8 @@ members = [
     "driver/rust/core",
     "driver/rust/difftest",
 ]
-# cargo-fuzz targets: a workspace of their own, built with nightly.
-exclude = ["driver/rust/fuzz"]
+# cargo-fuzz targets: workspaces of their own, built with nightly.
+exclude = ["fuzz", "driver/rust/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
