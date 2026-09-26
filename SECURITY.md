@@ -1289,7 +1289,7 @@ Nothing of it has run on the GPU; the fuzzers run with no device at all.
 ## 14. Memory safety: `unsafe` in one module, host blocks built
 
 Branch `dind`. A change of structure, not of behaviour: every test that
-passed passes (715, 4 skipped), the guest module is untouched, and the fuzz
+passed passes (717 with the new ones, 4 skipped), the guest module is untouched, and the fuzz
 targets run against a stricter fake host.
 
 **Where `unsafe` is.** Before, 376 uses of the keyword in 37 files: 333 in
