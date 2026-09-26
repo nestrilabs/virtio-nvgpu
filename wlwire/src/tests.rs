@@ -1974,6 +1974,68 @@ fn lease_submits_are_counted_in_a_frame_before_it_is_let_in() {
     assert_eq!(p.h.lease_submits(b"not a frame"), 0);
 }
 
+/// A registry the frame itself creates is followed like any other object:
+/// get_registry, bind through it, create a request and submit, all in one
+/// frame, count one (they counted none, and went past the throttle).
+#[test]
+fn lease_submits_through_a_registry_made_in_the_same_frame_are_counted() {
+    let mut p = Pair::new(Policy {
+        drm_file: false,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    let msgs = vec![
+        MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+            .new_id(9)
+            .finish(),
+        MsgBuilder::new(9, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 10)
+            .finish(),
+        MsgBuilder::new(10, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+            .new_id(11)
+            .finish(),
+        MsgBuilder::new(11, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+            .new_id(12)
+            .finish(),
+    ];
+    assert_eq!(p.h.lease_submits(&wayland_frame(&msgs)), 1);
+}
+
+/// What the engine lets through is held to what was counted and admitted:
+/// a submit past it ends the connection rather than reaching the compositor.
+#[test]
+fn a_submit_past_the_admitted_count_is_fatal() {
+    let mut p = Pair::new(Policy {
+        drm_file: true,
+        lease: LeaseGate::Allow,
+        fences: false,
+    });
+    p.registry(&[(1, "wp_drm_lease_device_v1", 1)]);
+    p.bind(1, "wp_drm_lease_device_v1", 1, 3).unwrap();
+    let submit = |req: u32| {
+        vec![
+            MsgBuilder::new(3, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(req + 1)
+                .finish(),
+        ]
+    };
+    p.h.allow_lease_submits(Some(1));
+    p.h.from_channel(&wayland_frame(&submit(4)), vec![], &mut p.hp)
+        .unwrap();
+    assert_eq!(p.h.stats.lease_submits, 1);
+    let e = p
+        .h
+        .from_channel(&wayland_frame(&submit(6)), vec![], &mut p.hp)
+        .unwrap_err();
+    assert_eq!(e.blame, Blame::Channel);
+    assert_eq!(p.h.stats.lease_submits, 1);
+}
+
 #[test]
 fn a_lease_device_released_without_the_event_gets_one_synthesised() {
     let mut p = Pair::new(Policy {

@@ -246,9 +246,11 @@ pub struct WlLimits {
 /// before anything in it is looked at: the guest daemon keeps the frame and
 /// retries it (as it does for a compositor that is not reading), so the
 /// client's request is delayed, never lost or reordered, and the compositor
-/// still creates and owns every lease object. How long a lease is then held
-/// is not limited: holding the output is what a lease is for, and the host
-/// takes it back by un-marking the monitor leasable or closing the VM.
+/// still creates and owns every lease object. Every submit of a frame must fit
+/// the rate, not only its first, and a frame with more submits than `burst`
+/// could never fit and ends the connection. How long a lease is then held is
+/// not limited: holding the output is what a lease is for, and the host takes
+/// it back by un-marking the monitor leasable or closing the VM.
 #[derive(Debug)]
 pub struct LeaseThrottle {
     interval: Duration,
@@ -258,6 +260,15 @@ pub struct LeaseThrottle {
     due: Mutex<Option<Instant>>,
     /// A refusal was logged since the last admission.
     logged: AtomicBool,
+}
+
+/// Why [`LeaseThrottle::admit`] said no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRefusal {
+    /// The frame's submits fit the rate once this has passed.
+    Wait(Duration),
+    /// More submits in one frame than the burst: they never fit.
+    OverBurst,
 }
 
 impl LeaseThrottle {
@@ -274,18 +285,24 @@ impl LeaseThrottle {
         }
     }
 
-    /// Admit `n` submits at `now`, or say how long until one may go.
-    pub fn admit(&self, n: usize, now: Instant) -> Result<(), Duration> {
+    /// Admit `n` submits at `now`, all of them or none: the last of them must
+    /// conform to the rate, not only the first.
+    pub fn admit(&self, n: usize, now: Instant) -> Result<(), LeaseRefusal> {
         if n == 0 || self.interval.is_zero() {
             return Ok(());
         }
+        if n > self.burst as usize {
+            return Err(LeaseRefusal::OverBurst);
+        }
+        let n = n as u32;
         let mut due = self.due.lock().unwrap_or_else(|p| p.into_inner());
         let t = due.map_or(now, |d| d.max(now));
         let early = self.interval * (self.burst - 1);
-        if t > now + early {
-            return Err(t - early - now);
+        let last = t + self.interval * (n - 1);
+        if last > now + early {
+            return Err(LeaseRefusal::Wait(last - early - now));
         }
-        *due = Some(t + self.interval * n.min(u32::MAX as usize) as u32);
+        *due = Some(t + self.interval * n);
         self.logged.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -569,21 +586,45 @@ impl WlConn {
         // Lease requests at the VM's rate (`LeaseThrottle`): a frame with one
         // too many waits whole, like one for a compositor that is not reading.
         let submits = st.engine.lease_submits(frame_bytes);
-        if let Err(wait) = s.cfg.limits.lease.admit(submits, Instant::now()) {
-            if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
-                log::info!(
-                    "wayland: the guest asks for leases faster than one per {:?}; \
-                     holding its next request for {wait:?}",
-                    s.cfg.limits.lease.interval
-                );
+        match s.cfg.limits.lease.admit(submits, Instant::now()) {
+            Ok(()) => {}
+            Err(LeaseRefusal::Wait(wait)) => {
+                if !s.cfg.limits.lease.logged.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        "wayland: the guest asks for leases faster than one per {:?}; \
+                         holding its next request for {wait:?}",
+                        s.cfg.limits.lease.interval
+                    );
+                }
+                return Err(libc::EAGAIN);
             }
-            return Err(libc::EAGAIN);
+            Err(LeaseRefusal::OverBurst) => {
+                fail(
+                    s,
+                    &mut st,
+                    Fatal {
+                        object: 1,
+                        code: wlwire::engine::ERR_IMPLEMENTATION,
+                        message: format!(
+                            "{submits} lease submits in one frame, more than the {} the VM may \
+                             make at once",
+                            s.cfg.limits.lease.burst
+                        ),
+                        blame: Blame::Channel,
+                    },
+                );
+                return Err(libc::EPROTO);
+            }
         }
+        // And the engine lets through no more than were counted: a submit
+        // the count missed ends the connection instead of passing the rate.
+        st.engine.allow_lease_submits(Some(submits));
         let mut plat = HostPlat {
             host: &*s.host,
             send: Some(ops),
         };
         let r = st.engine.from_channel(frame_bytes, Vec::new(), &mut plat);
+        st.engine.allow_lease_submits(Some(0));
         if let Err(f) = r {
             fail(s, &mut st, f);
             return Err(libc::EPROTO);

@@ -204,6 +204,8 @@ pub struct Stats {
     pub time_rewrites: u64,
     pub released_synthesised: u64,
     pub placeholders: u64,
+    /// `wp_drm_lease_request_v1.submit` requests let through from the channel.
+    pub lease_submits: u64,
 }
 
 #[derive(Default)]
@@ -242,6 +244,8 @@ pub struct Engine {
     release_pending: HashSet<u32>,
     released_seen: HashSet<u32>,
     hangup: bool,
+    /// Lease submits the channel may still carry (`allow_lease_submits`).
+    lease_allowance: Option<usize>,
     pub stats: Stats,
 }
 
@@ -268,6 +272,7 @@ impl Engine {
             release_pending: HashSet::new(),
             released_seen: HashSet::new(),
             hangup: false,
+            lease_allowance: None,
             stats: Stats::default(),
         }
     }
@@ -305,10 +310,18 @@ impl Engine {
     /// channel carries, looked at before the frame is let in: the backend
     /// rate-limits them, since the compositor answers every lease of a
     /// desktop monitor with blocking modesets (releasing it, and taking it
-    /// back when the lease ends). A lease request created in the same frame
-    /// counts, and so does a device bound in it. Nothing is changed, and a
-    /// frame that does not decode counts none (`from_channel` refuses it).
-    /// Costs nothing on a connection that was never offered a lease device.
+    /// back when the lease ends). Nothing is changed, and a frame that does
+    /// not decode counts none (`from_channel` refuses it). Costs nothing on a
+    /// connection that was never offered a lease device.
+    ///
+    /// This is an estimate made ahead of the engine, and it is not trusted:
+    /// every object the frame creates is followed through the protocol tables
+    /// as [`Engine::message`] follows it (a registry from
+    /// `wl_display.get_registry`, a device from a bind, a request from
+    /// `create_lease_request`, anything else by its signature), and what the
+    /// engine then lets through is held to it ([`Engine::allow_lease_submits`]):
+    /// a submit the count missed ends the connection rather than reaching the
+    /// compositor unthrottled.
     pub fn lease_submits(&self, bytes: &[u8]) -> usize {
         if !self
             .registry
@@ -321,8 +334,6 @@ impl Engine {
         let Ok(f) = frame::decode(bytes) else {
             return 0;
         };
-        let bind =
-            &iface(proto::WL_REGISTRY).messages(Dir::Request)[op::wl_registry::REQ_BIND as usize];
         let mut fresh: HashMap<u32, IfaceId> = HashMap::new();
         let mut n = 0;
         for r in f.records().filter(|r| r.ty == frame::REC_WAYLAND) {
@@ -334,44 +345,46 @@ impl Engine {
                 }
                 let m = &p[..size];
                 p = &p[size..];
-                let ifc = fresh.get(&h.object).copied().or_else(|| {
+                let Some(ifc) = fresh.get(&h.object).copied().or_else(|| {
                     self.objects
                         .get(h.object)
                         .filter(|o| !o.zombie)
                         .map(|o| o.iface)
-                });
-                let new_id = || match m.get(8..12) {
-                    Some(b) => u32::from_ne_bytes(b.try_into().unwrap()),
-                    None => 0,
+                }) else {
+                    // The engine refuses this message and the frame with it.
+                    continue;
                 };
-                match (ifc, h.opcode) {
-                    (Some(proto::WL_REGISTRY), op::wl_registry::REQ_BIND) => {
-                        if let Ok(a) = wire::parse(bind, m) {
-                            if let Val::NewId {
-                                id,
-                                iface: Some(b"wp_drm_lease_device_v1"),
-                                ..
-                            } = a[1].val
-                            {
-                                fresh.insert(id, proto::WP_DRM_LEASE_DEVICE_V1);
-                            }
+                if ifc == proto::WP_DRM_LEASE_REQUEST_V1
+                    && h.opcode == op::wp_drm_lease_request_v1::REQ_SUBMIT
+                {
+                    n += 1;
+                }
+                let Some(desc) = iface(ifc).messages(Dir::Request).get(h.opcode as usize) else {
+                    continue;
+                };
+                let Ok(args) = wire::parse(desc, m) else {
+                    continue;
+                };
+                for (a, at) in desc.args.iter().zip(args.iter()) {
+                    if let Val::NewId { id, iface: name, .. } = at.val {
+                        let ni = a.iface.or_else(|| name.and_then(proto::iface_by_name));
+                        if let Some(ni) = ni {
+                            fresh.insert(id, ni);
                         }
                     }
-                    (
-                        Some(proto::WP_DRM_LEASE_DEVICE_V1),
-                        op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST,
-                    ) => {
-                        fresh.insert(new_id(), proto::WP_DRM_LEASE_REQUEST_V1);
-                    }
-                    (
-                        Some(proto::WP_DRM_LEASE_REQUEST_V1),
-                        op::wp_drm_lease_request_v1::REQ_SUBMIT,
-                    ) => n += 1,
-                    _ => {}
                 }
             }
         }
         n
+    }
+
+    /// Hold the next frames from the channel to `n` lease submits between
+    /// them, or to none with `Some(0)`; `None` (the default) lets any number
+    /// through. The backend sets this to what [`Engine::lease_submits`]
+    /// counted and its throttle admitted, before each frame: a submit past it
+    /// is fatal.
+    pub fn allow_lease_submits(&mut self, n: Option<usize>) {
+        self.lease_allowance = n;
     }
 
     /// The connection is over: let go at once of what only a live connection
@@ -1070,6 +1083,21 @@ impl Engine {
                 }
                 (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {
                     self.release_pending.insert(obj_id);
+                }
+                (proto::WP_DRM_LEASE_REQUEST_V1, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                    if !from_local =>
+                {
+                    match &mut self.lease_allowance {
+                        None => {}
+                        Some(0) => {
+                            return Err(err(
+                                ERR_IMPLEMENTATION,
+                                "a lease submit the rate limit did not admit".into(),
+                            ));
+                        }
+                        Some(k) => *k -= 1,
+                    }
+                    self.stats.lease_submits += 1;
                 }
                 _ => {}
             }

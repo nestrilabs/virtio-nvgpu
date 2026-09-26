@@ -18,7 +18,7 @@ use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
 use wlwire::wire::{self, MsgBuilder, Val, peek_header};
 
-use super::conn::{HostFds, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
+use super::conn::{HostFds, LeaseRefusal, LeaseThrottle, RecvOps, SendOps, WlConfig, WlConn, WlLimits, sock_fd};
 use super::export::WlExport;
 use super::probe::LeaseCache;
 use crate::hostfd::HandleKind;
@@ -783,8 +783,8 @@ fn lease_submits_go_at_the_vms_rate_after_a_short_burst() {
         th.admit(1, t0).unwrap();
     }
     // The fourth waits out one interval.
-    assert_eq!(th.admit(1, t0), Err(5 * s));
-    assert_eq!(th.admit(1, t0 + 2 * s), Err(3 * s));
+    assert_eq!(th.admit(1, t0), Err(LeaseRefusal::Wait(5 * s)));
+    assert_eq!(th.admit(1, t0 + 2 * s), Err(LeaseRefusal::Wait(3 * s)));
     th.admit(1, t0 + 5 * s).unwrap();
     assert!(th.admit(1, t0 + 6 * s).is_err());
     // A frame without submits is never held; a quiet spell refills the burst.
@@ -850,4 +850,126 @@ fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
     std::thread::sleep(Duration::from_millis(320));
     g.conn.send(&c, &mut g.ops).unwrap();
     assert!(!g.conn.is_closed());
+}
+
+/// A frame's submits are admitted all or none, each at the rate: two in one
+/// frame after two alone take the third and fourth place of a burst of three,
+/// and the fourth does not fit. A frame of more than the burst never fits
+/// (before, only the first submit of a frame was checked, and a frame of a
+/// thousand went through on a full bucket).
+#[test]
+fn every_submit_of_a_frame_must_fit_the_rate_not_only_the_first() {
+    let s = Duration::from_secs(1);
+    let th = LeaseThrottle::new(5 * s, 3);
+    let t0 = Instant::now();
+    assert_eq!(th.admit(1000, t0), Err(LeaseRefusal::OverBurst));
+    assert_eq!(th.admit(4, t0), Err(LeaseRefusal::OverBurst));
+    th.admit(2, t0).unwrap();
+    // One left of the burst: a pair waits until both fit.
+    assert_eq!(th.admit(2, t0), Err(LeaseRefusal::Wait(5 * s)));
+    th.admit(1, t0).unwrap();
+    assert_eq!(th.admit(1, t0), Err(LeaseRefusal::Wait(5 * s)));
+    // A full bucket takes the whole burst at once, and no more after it.
+    th.admit(3, t0 + 60 * s).unwrap();
+    assert!(th.admit(1, t0 + 60 * s).is_err());
+}
+
+/// The count made ahead of the engine follows a registry the same frame
+/// creates: get_registry, bind, create_lease_request, submit, in one frame,
+/// on a connection that already has a lease device of its own.
+#[test]
+fn a_submit_through_a_registry_made_in_the_same_frame_is_counted() {
+    let dir = tmpdir("lease-fresh-registry");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_secs(60), 1);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    let frame_of = |registry: u32, dev: u32| {
+        let data = [
+            MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(registry)
+                .finish(),
+            MsgBuilder::new(registry, op::wl_registry::REQ_BIND)
+                .uint(40)
+                .generic_new_id("wp_drm_lease_device_v1", 1, dev)
+                .finish(),
+            MsgBuilder::new(dev, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(dev + 1)
+                .finish(),
+            MsgBuilder::new(dev + 1, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(dev + 2)
+                .finish(),
+        ]
+        .concat();
+        // The guest's engine has not seen the global on this registry; the
+        // host's has (the first registry's), and the frame is what counts.
+        let mut q = VecDeque::from([frame::Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 0, &data),
+            descs: vec![],
+        }]);
+        frame::pack(&mut q, 1 << 20, 256, false).0
+    };
+    let a = frame_of(10, 11);
+    let b = frame_of(20, 21);
+    g.conn.send(&a, &mut g.ops).unwrap();
+    // A burst of one: the second submit waits, whatever registry it came by.
+    assert_eq!(g.conn.send(&b, &mut g.ops).unwrap_err(), libc::EAGAIN);
+    assert!(!g.conn.is_closed());
+}
+
+/// More submits in one frame than the burst allows ends the connection: they
+/// could never fit, and holding the frame would hold the client for ever.
+#[test]
+fn a_frame_of_more_submits_than_the_burst_ends_the_connection() {
+    let dir = tmpdir("lease-overburst");
+    let sock = dir.join("wl");
+    fake_compositor(
+        sock.clone(),
+        vec![(40, "wp_drm_lease_device_v1", 1)],
+        vec![(40, "lease-ours")],
+    );
+    let mut cfg = WlConfig::new(&sock);
+    cfg.allow_lease = true;
+    cfg.limits = WlLimits::default().with_lease_rate(Duration::from_secs(60), 2);
+    let (conn, _r) = WlConn::open(&cfg, Arc::new(FakeHost)).unwrap();
+    let mut g = Guest::new(conn, true);
+    g.client(&get_registry(), vec![]);
+    g.recv_until(sync_done);
+    g.client(
+        &[MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(40)
+            .generic_new_id("wp_drm_lease_device_v1", 1, 5)
+            .finish()],
+        vec![],
+    );
+    let mut msgs = Vec::new();
+    for i in 0..3u32 {
+        let req = 10 + 2 * i;
+        msgs.push(
+            MsgBuilder::new(5, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
+                .new_id(req)
+                .finish(),
+        );
+        msgs.push(
+            MsgBuilder::new(req, op::wp_drm_lease_request_v1::REQ_SUBMIT)
+                .new_id(req + 1)
+                .finish(),
+        );
+    }
+    let mut data = msgs.concat();
+    g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+        .unwrap();
+    let mut q = g.e.take_units();
+    let f = frame::pack(&mut q, 1 << 20, 256, false).0;
+    assert_eq!(g.conn.send(&f, &mut g.ops).unwrap_err(), libc::EPROTO);
+    assert!(g.conn.is_closed());
 }
