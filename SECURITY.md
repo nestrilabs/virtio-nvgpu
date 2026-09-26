@@ -1946,8 +1946,6 @@ window's device check against every descriptor the backend really places
 `mincore` access check as the VMM's user), and crosvm's ioevents at the
 reported addresses (a guest that moves BAR 0 would now fail activation).
 
----
-
 
 ### The Wayland proxy
 
