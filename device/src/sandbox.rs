@@ -641,6 +641,9 @@ fn plain() -> Vec<libc::c_long> {
         libc::SYS_newfstatat,
         libc::SYS_statx,
         libc::SYS_readlinkat,
+        // Which filesystem a descriptor handed over is on (hostfd.rs,
+        // classify).
+        libc::SYS_fstatfs,
         libc::SYS_getdents64,
         // Waiting.
         libc::SYS_ppoll,
