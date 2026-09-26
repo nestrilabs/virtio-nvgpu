@@ -143,6 +143,9 @@ const DUP_OBJECT: usize = 8;
 const DUP_CLIENT_SRC: usize = 12;
 const DUP_OBJECT_SRC: usize = 16;
 const DUP_STATUS: usize = 24;
+/// hObjectParent, at 4 in NVOS64, NVOS32 and NVOS02 alike, and NVOS55's
+/// hParent.
+const PARENT: usize = 4;
 /// NVOS00 (RM_FREE).
 const FREE_SIZE: usize = 16;
 const FREE_ROOT: usize = 0;
@@ -220,6 +223,14 @@ enum Record {
 pub(crate) struct RmMem {
     coherent: bool,
     objects: HashMap<(u32, u32), Mem>,
+    /// Which object each object RM made for this VM was made under, so a
+    /// free takes the records of everything RM frees with it: the objects
+    /// under the one freed, however deep (resource server frees a subtree),
+    /// most of which -- a device, a subdevice -- hold no memory of their
+    /// own. Without it their records outlived them, a guest process freeing
+    /// devices in a loop filled `objects`, and every other process's memory
+    /// went unrecorded (review 2026-09-26, backend 19).
+    tree: Tree,
     /// Guest file handle -> what an ALLOC_MEMORY armed on it.
     armed: HashMap<u32, Mem>,
     full_warned: bool,
@@ -230,9 +241,67 @@ impl Default for RmMem {
         Self {
             coherent: true,
             objects: HashMap::new(),
+            tree: Tree::default(),
             armed: HashMap::new(),
             full_warned: false,
         }
+    }
+}
+
+/// Every object's parent, by (hClient, handle), and each parent's children.
+#[derive(Debug, Default)]
+struct Tree {
+    parent: HashMap<(u32, u32), u32>,
+    children: HashMap<(u32, u32), Vec<u32>>,
+}
+
+impl Tree {
+    /// `(c, h)` was made under `p`. Past [`MAX_OBJECTS`] links nothing
+    /// more is linked: a later free then leaves those records behind, as
+    /// before, until their client goes.
+    fn link(&mut self, c: u32, h: u32, p: u32) {
+        self.unlink(c, h);
+        if h == p || self.parent.len() >= MAX_OBJECTS {
+            return;
+        }
+        self.parent.insert((c, h), p);
+        self.children.entry((c, p)).or_default().push(h);
+    }
+
+    fn unlink(&mut self, c: u32, h: u32) {
+        if let Some(p) = self.parent.remove(&(c, h)) {
+            if let Some(v) = self.children.get_mut(&(c, p)) {
+                v.retain(|&x| x != h);
+                if v.is_empty() {
+                    self.children.remove(&(c, p));
+                }
+            }
+        }
+    }
+
+    /// `(c, h)` and everything under it, taken out: the handles RM frees
+    /// with it. Each handle is visited once, whatever the links say.
+    fn take_subtree(&mut self, c: u32, h: u32) -> Vec<u32> {
+        self.unlink(c, h);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![h];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            out.push(x);
+            for y in self.children.remove(&(c, x)).unwrap_or_default() {
+                self.parent.remove(&(c, y));
+                stack.push(y);
+            }
+        }
+        out
+    }
+
+    fn forget_clients(&mut self, gone: impl Fn(u32) -> bool) {
+        self.parent.retain(|&(c, _), _| !gone(c));
+        self.children.retain(|&(c, _), _| !gone(c));
     }
 }
 
@@ -304,12 +373,14 @@ impl RmMem {
             return;
         }
         self.objects.retain(|(c, _), _| !gone.contains(c));
+        self.tree.forget_clients(|c| gone.contains(&c));
     }
 
     /// Session reset: every client is gone with the files that held them.
     pub(crate) fn clear(&mut self) {
         self.objects.clear();
         self.armed.clear();
+        self.tree = Tree::default();
     }
 
     /// COHERENCY for a new system-memory allocation asking for `asked`:
@@ -552,6 +623,9 @@ impl RmMem {
                     return;
                 }
                 self.set(c, h, mem);
+                if let Some(parent) = rd32(reply, PARENT) {
+                    self.tree.link(c, h, parent);
+                }
                 if let (Some(fd), Some(m)) = (armed_on, mem) {
                     self.armed.insert(fd, m);
                 }
@@ -563,6 +637,8 @@ impl RmMem {
                 let get = |o| rd32(reply, o).unwrap_or(0);
                 let src = self.lookup(get(DUP_CLIENT_SRC), get(DUP_OBJECT_SRC));
                 self.set(get(DUP_CLIENT), get(DUP_OBJECT), src);
+                self.tree
+                    .link(get(DUP_CLIENT), get(DUP_OBJECT), get(PARENT));
             }
             Record::Free => {
                 if rd32(reply, FREE_STATUS) != Some(0) {
@@ -575,8 +651,12 @@ impl RmMem {
                 if old == root {
                     // The client, and with it everything it held.
                     self.objects.retain(|&(c, _), _| c != root);
+                    self.tree.forget_clients(|c| c == root);
                 } else {
-                    self.objects.remove(&(root, old));
+                    // The object, and everything RM frees under it.
+                    for h in self.tree.take_subtree(root, old) {
+                        self.objects.remove(&(root, h));
+                    }
                 }
             }
         }
@@ -1041,6 +1121,40 @@ mod tests {
         assert!(m.lookup(CLIENT, 0x60).is_some(), "another file's close");
         m.forget_fd(7, &[CLIENT]);
         assert_eq!(m.lookup(CLIENT, 0x60), None);
+    }
+
+    /// RM frees an object's whole subtree with it: the records of memory
+    /// under a freed device go too, through a subdevice that holds none.
+    #[test]
+    fn freeing_a_parent_drops_the_records_of_everything_under_it() {
+        let mut m = RmMem::default();
+        let alloc = |m: &mut RmMem, h: u32, parent: u32, class: u32| {
+            let mut b = vec![0u8; ALLOC_OUTER + 8];
+            put(&mut b, ALLOC_ROOT, CLIENT);
+            put(&mut b, PARENT, parent);
+            put(&mut b, ALLOC_NEW, h);
+            put(&mut b, ALLOC_CLASS, class);
+            run(m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+        };
+        alloc(&mut m, 0x10, CLIENT, 0x80); // device
+        alloc(&mut m, 0x11, 0x10, 0x2080); // subdevice
+        for (h, parent) in [(0x12, 0x11), (0x13, 0x10), (0x20, CLIENT)] {
+            let mut b = sysmem_alloc(h, 0, 0);
+            put(&mut b, PARENT, parent);
+            run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+            assert!(m.lookup(CLIENT, h).is_some());
+        }
+        let mut f = vec![0u8; FREE_SIZE];
+        put(&mut f, FREE_ROOT, CLIENT);
+        put(&mut f, FREE_OLD, 0x10);
+        run(&mut m, NV_ESC_RM_FREE, &f, Some(FREE_STATUS));
+        assert_eq!(m.lookup(CLIENT, 0x12), None, "under the subdevice");
+        assert_eq!(m.lookup(CLIENT, 0x13), None, "under the device");
+        assert!(
+            m.lookup(CLIENT, 0x20).is_some(),
+            "memory under the client itself is not the device's"
+        );
+        assert!(m.tree.parent.len() == 1 && m.tree.children.len() == 1);
     }
 
     #[test]
