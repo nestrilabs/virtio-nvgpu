@@ -18,6 +18,7 @@
 
 pub mod channel;
 pub mod daemon;
+pub mod log;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod uapi;

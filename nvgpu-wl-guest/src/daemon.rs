@@ -38,6 +38,8 @@ use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::sys;
 
+use crate::log::{self, Level};
+
 use crate::channel::{Channel, Connector, HostInfo, Sent};
 use crate::uapi;
 
@@ -214,7 +216,12 @@ impl LogLimit {
         out
     }
 
-    fn say(&mut self, line: String) {
+    /// Print `line` at `level`, within the limit. A line the level hides
+    /// is not counted against it.
+    fn say(&mut self, level: Level, line: String) {
+        if !log::enabled(level) {
+            return;
+        }
         for l in self.lines(line, Instant::now()) {
             eprintln!("{l}");
         }
@@ -642,9 +649,10 @@ impl Daemon {
                 } {
                     Ok(ch) => self.add_client(s, ch, Local::Client),
                     Err(e) => {
-                        self.log.say(format!(
-                            "nvgpu-wl-guest: cannot open a channel to the host: {e}"
-                        ));
+                        self.log.say(
+                            Level::Warn,
+                            format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"),
+                        );
                         let err = Fatal {
                             object: 1,
                             code: wlwire::engine::ERR_IMPLEMENTATION,
@@ -656,7 +664,7 @@ impl Daemon {
                 },
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    eprintln!("nvgpu-wl-guest: accept: {e}");
+                    log::say(Level::Error, &format!("nvgpu-wl-guest: accept: {e}"));
                     return;
                 }
             }
@@ -674,10 +682,13 @@ impl Daemon {
             };
             match UnixStream::connect(&target) {
                 Ok(s) => self.add_client(s, ch, Local::Server),
-                Err(e) => self.log.say(format!(
-                    "nvgpu-wl-guest: cannot reach the guest compositor at {}: {e}",
-                    target.display()
-                )),
+                Err(e) => self.log.say(
+                    Level::Warn,
+                    format!(
+                        "nvgpu-wl-guest: cannot reach the guest compositor at {}: {e}",
+                        target.display()
+                    ),
+                ),
             }
         }
     }
@@ -692,10 +703,13 @@ impl Daemon {
             .lock()
             .unwrap()
             .error(format!("{:?}: {text}", f.blame));
-        self.log.say(format!(
-            "nvgpu-wl-guest: closing a connection: {:?}: {text:?}",
-            f.blame
-        ));
+        self.log.say(
+            Level::Warn,
+            format!(
+                "nvgpu-wl-guest: closing a connection: {:?}: {text:?}",
+                f.blame
+            ),
+        );
         match (c.engine.local_is_client(), f.blame) {
             // Our client gets the error it earned, or the host's verdict.
             (true, _) => {
@@ -791,8 +805,10 @@ impl Daemon {
     fn write_local(&mut self, slot: usize) {
         let c = self.clients[slot].as_mut().unwrap();
         if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-            self.log
-                .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
+            self.log.say(
+                Level::Warn,
+                format!("nvgpu-wl-guest: writing to a client: {e}"),
+            );
             c.closing = true;
         }
     }
@@ -827,8 +843,10 @@ impl Daemon {
                 Err(e) => {
                     // The host ended the connection; its reason, if any, is
                     // waiting in the channel.
-                    self.log
-                        .say(format!("nvgpu-wl-guest: the host refused a frame: {e}"));
+                    self.log.say(
+                        Level::Warn,
+                        format!("nvgpu-wl-guest: the host refused a frame: {e}"),
+                    );
                     c.tx.clear();
                     self.read_channel(slot);
                     if let Some(c) = self.clients[slot].as_mut() {
@@ -862,7 +880,8 @@ impl Daemon {
             let r = match c.chan.recv(max, card, render) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.log.say(format!("nvgpu-wl-guest: channel: {e}"));
+                    self.log
+                        .say(Level::Warn, format!("nvgpu-wl-guest: channel: {e}"));
                     c.closing = true;
                     return;
                 }
@@ -877,8 +896,10 @@ impl Daemon {
                 }
                 let c = self.clients[slot].as_mut().unwrap();
                 if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
-                    self.log
-                        .say(format!("nvgpu-wl-guest: writing to a client: {e}"));
+                    self.log.say(
+                        Level::Warn,
+                        format!("nvgpu-wl-guest: writing to a client: {e}"),
+                    );
                     c.closing = true;
                 }
                 let unread = c.engine.local_out_len() as u64;
@@ -933,11 +954,14 @@ impl Daemon {
         if behind {
             let since = *c.stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= STUCK_FOR {
-                self.log.say(format!(
-                    "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
-                    c.engine.local_out_len(),
-                    STUCK_FOR.as_secs()
-                ));
+                self.log.say(
+                    Level::Warn,
+                    format!(
+                        "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
+                        c.engine.local_out_len(),
+                        STUCK_FOR.as_secs()
+                    ),
+                );
                 self.close(slot);
                 return;
             }
