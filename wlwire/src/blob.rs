@@ -3,7 +3,11 @@
 //!
 //! The sending side reads the bytes the message says (the size argument, from
 //! the offset argument if there is one) and sends them as `BLOB` chunks ahead
-//! of the message; the receiving side assembles them into a memfd, seals it
+//! of the message: the first chunk at once, which is all of a keymap or a
+//! format table and says the file can be read at all, and the rest as the
+//! channel takes them ([`BlobJob`]), so a 16 MiB ICC profile costs the sender
+//! one chunk at a time, not 16 MiB per message. The receiving side assembles
+//! them into a memfd, seals it
 //! (no growing, shrinking or writing -- a client may map a keymap and trust
 //! its size) and hands that over in place of the original. Nothing inside is
 //! reinterpreted: a format table's indices stay valid because the table is
@@ -70,28 +74,44 @@ impl Blobs {
         }
     }
 
-    /// Read `len` bytes at `off` of `fd` and queue them as BLOB records.
-    /// Returns the blob id, or `None` if the file cannot be read or is too
-    /// large (the caller sends an invalid descriptor instead).
-    pub fn send(&mut self, fd: &OwnedFd, off: u64, len: u64, out: &mut Vec<Unit>) -> Option<u32> {
+    /// Send `len` bytes at `off` of `fd` as BLOB records: the first chunk is
+    /// read now, into `out`, and the rest is left to the returned job, if
+    /// any. Returns the blob id, or `None` if the file cannot be read or is
+    /// too large (the caller sends an invalid descriptor instead).
+    pub fn send(
+        &mut self,
+        fd: OwnedFd,
+        off: u64,
+        len: u64,
+        out: &mut Vec<Unit>,
+    ) -> Option<(u32, Option<BlobJob>)> {
         if len > MAX_BLOB {
             return None;
         }
-        let mut data = vec![0u8; len as usize];
-        // A file shorter than the size claimed keeps its zero tail, as a
-        // private mapping past EOF would not -- but the receiver sees the
-        // length it was promised.
-        sys::pread_full(fd.as_raw_fd(), &mut data, off).ok()?;
         let id = (self.next & 0x7fff_ffff) | if self.host_side { 0x8000_0000 } else { 0 };
+        let mut job = BlobJob {
+            fd,
+            id,
+            src: off,
+            len,
+            pos: 0,
+        };
+        // The first read says whether the file can be read at all: a pipe,
+        // a directory or a write-only descriptor is refused here, before
+        // the message is committed to naming the blob.
+        let n = (len as usize).min(MAX_REC_PAYLOAD);
+        let mut first = vec![0u8; n];
+        sys::pread_full(job.fd.as_raw_fd(), &mut first, off).ok()?;
         self.next = self.next.wrapping_add(1).max(1);
-        for (i, c) in data.chunks(MAX_REC_PAYLOAD).enumerate() {
+        self.sent += 1;
+        if n > 0 {
             out.push(Unit {
-                rec: record(REC_BLOB, id, (i * MAX_REC_PAYLOAD) as u32, c),
+                rec: record(REC_BLOB, id, 0, &first),
                 descs: Vec::new(),
             });
         }
-        self.sent += 1;
-        Some(id)
+        job.pos = n as u64;
+        Some((id, (job.remaining() > 0).then_some(job)))
     }
 
     /// A BLOB chunk from the channel.
@@ -152,6 +172,41 @@ impl Blobs {
         sys::seal_readonly(inc.fd.as_raw_fd()).map_err(|_| BlobError::Io)?;
         self.received += 1;
         Ok(inc.fd)
+    }
+}
+
+/// The rest of a blob being sent: bytes `[pos, len)` of the file, from
+/// `src` in it, read a chunk at a time as the channel takes them. The
+/// receiver was promised `len` bytes: a file shorter than that, or one that
+/// stops reading, gives zeros for the rest, as its first chunk did.
+pub struct BlobJob {
+    fd: OwnedFd,
+    id: u32,
+    src: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl BlobJob {
+    /// Bytes still to send.
+    pub fn remaining(&self) -> u64 {
+        self.len - self.pos
+    }
+
+    /// The next BLOB record, and how many bytes it carries; `None` once done.
+    pub fn next_unit(&mut self) -> Option<(Unit, usize)> {
+        if self.pos >= self.len {
+            return None;
+        }
+        let n = ((self.len - self.pos) as usize).min(MAX_REC_PAYLOAD);
+        let mut chunk = vec![0u8; n];
+        let _ = sys::pread_full(self.fd.as_raw_fd(), &mut chunk, self.src + self.pos);
+        let u = Unit {
+            rec: record(REC_BLOB, self.id, self.pos as u32, &chunk),
+            descs: Vec::new(),
+        };
+        self.pos += n as u64;
+        Some((u, n))
     }
 }
 

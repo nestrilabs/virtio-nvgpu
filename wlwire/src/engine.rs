@@ -28,13 +28,13 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use crate::blob::Blobs;
+use crate::blob::{BlobJob, Blobs};
 use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
 use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::{Shm, ShmBudget};
+use crate::shm::{Shm, ShmBudget, SyncJob};
 use crate::stream::{Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
@@ -53,6 +53,31 @@ const CLOCK_MONOTONIC_RAW: u32 = 4;
 /// A WAYLAND record is closed at this many bytes or descriptors.
 const WL_REC_BYTES: usize = 16 * 1024;
 const WL_REC_DESCS: usize = 28;
+
+/// Bytes queued for the channel past which a local client's input is left
+/// unread ([`Engine::from_local`]): the default for an engine facing a
+/// client. Counted with what commits and blobs still have to read, which
+/// costs nothing until read but is what the channel will have to carry.
+pub const CHANNEL_HIGH_WATER: usize = 4 << 20;
+
+/// Something queued for the channel: a record ready to go, or the rest of a
+/// commit's copy or of a blob, read as the channel takes it.
+enum Out {
+    Unit(Unit),
+    Shm(SyncJob),
+    Blob(BlobJob),
+}
+
+impl Out {
+    /// Bytes this will put on the channel (a job's payload bytes).
+    fn bytes(&self) -> usize {
+        match self {
+            Out::Unit(u) => u.bytes(),
+            Out::Shm(j) => j.remaining() as usize,
+            Out::Blob(j) => j.remaining() as usize,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -234,7 +259,11 @@ pub struct Engine {
     shm: Shm,
     blobs: Blobs,
     streams: Streams,
-    out_channel: VecDeque<Unit>,
+    out_channel: VecDeque<Out>,
+    /// What `out_channel` will put on the channel, in bytes.
+    out_bytes: usize,
+    /// Past this many bytes for the channel, `from_local` stops.
+    input_limit: Option<usize>,
     wl_bytes: Vec<u8>,
     wl_descs: Vec<DescOut>,
     out_local: LocalOut,
@@ -252,6 +281,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         let host = cfg.side == Side::Host;
+        let input_limit = (cfg.local == Local::Client).then_some(CHANNEL_HIGH_WATER);
         Self {
             cfg,
             objects: Objects::new(),
@@ -260,6 +290,8 @@ impl Engine {
             blobs: Blobs::new(host),
             streams: Streams::new(host),
             out_channel: VecDeque::new(),
+            out_bytes: 0,
+            input_limit,
             wl_bytes: Vec::new(),
             wl_descs: Vec::new(),
             out_local: LocalOut::default(),
@@ -395,6 +427,17 @@ impl Engine {
     pub fn shed(&mut self) {
         self.shm.clear();
         self.blobs.clear();
+        self.drop_channel_output();
+    }
+
+    /// Forget what is queued for the channel, without reading what commits
+    /// and blobs still had to read: the connection is ending, and nobody
+    /// will take it.
+    pub fn drop_channel_output(&mut self) {
+        self.out_channel.clear();
+        self.out_bytes = 0;
+        self.wl_bytes.clear();
+        self.wl_descs.clear();
     }
 
     /// The far side has gone (HANGUP received).
@@ -415,14 +458,84 @@ impl Engine {
         self.out_local.len()
     }
 
-    /// Everything queued for the channel, in order.
+    /// Everything queued for the channel, in order, read now.
     pub fn take_units(&mut self) -> VecDeque<Unit> {
+        self.take_units_upto(usize::MAX)
+    }
+
+    /// What is queued for the channel, in order, until about `max` bytes are
+    /// taken (always at least one record, if any is queued). Commits' copies
+    /// and blobs are read here, a record at a time, so what is not taken yet
+    /// costs nothing but a descriptor.
+    pub fn take_units_upto(&mut self, max: usize) -> VecDeque<Unit> {
         self.flush_wayland();
-        std::mem::take(&mut self.out_channel)
+        let mut out = VecDeque::new();
+        let mut n = 0;
+        while n < max || out.is_empty() {
+            let Some(front) = self.out_channel.front_mut() else {
+                break;
+            };
+            let next = match front {
+                Out::Unit(_) => None,
+                Out::Shm(j) => {
+                    let r = j.next_unit();
+                    if let Some((_, got)) = &r {
+                        self.shm.sync_bytes += *got as u64;
+                    }
+                    Some(r)
+                }
+                Out::Blob(j) => Some(j.next_unit()),
+            };
+            match next {
+                // A record ready to go.
+                None => {
+                    let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
+                        unreachable!()
+                    };
+                    self.out_bytes -= u.bytes();
+                    n += u.bytes();
+                    out.push_back(u);
+                }
+                // A job's next record.
+                Some(Some((u, got))) => {
+                    self.out_bytes -= got;
+                    n += u.bytes();
+                    out.push_back(u);
+                }
+                // A job done, or cut short.
+                Some(None) => {
+                    let j = self.out_channel.pop_front().unwrap();
+                    self.out_bytes -= j.bytes();
+                }
+            }
+        }
+        out
     }
 
     pub fn has_channel_output(&self) -> bool {
         !self.out_channel.is_empty() || !self.wl_bytes.is_empty()
+    }
+
+    /// Bytes queued for the channel, read or still to be read.
+    pub fn channel_backlog(&self) -> usize {
+        self.out_bytes + self.wl_bytes.len()
+    }
+
+    /// Stop taking the local peer's input while more than `limit` bytes are
+    /// queued for the channel (`None`: never). An engine facing a client
+    /// starts at [`CHANNEL_HIGH_WATER`], one facing a compositor at `None`:
+    /// a compositor's output is drained as it comes (its own buffer for us
+    /// is small, and full, it drops us).
+    pub fn set_input_limit(&mut self, limit: Option<usize>) {
+        self.input_limit = limit;
+    }
+
+    /// `from_local` would take nothing now: the channel has the limit's
+    /// worth queued. The rest of the input waits where it is (the caller's
+    /// buffer, then the socket) until the channel takes some.
+    pub fn input_blocked(&self) -> bool {
+        self.input_limit
+            .is_some_and(|l| self.channel_backlog() >= l)
     }
 
     pub fn objects(&self) -> &Objects {
@@ -458,8 +571,13 @@ impl Engine {
     }
 
     fn push_unit(&mut self, u: Unit) {
+        self.push_out(Out::Unit(u));
+    }
+
+    fn push_out(&mut self, o: Out) {
         self.flush_wayland();
-        self.out_channel.push_back(u);
+        self.out_bytes += o.bytes();
+        self.out_channel.push_back(o);
     }
 
     fn flush_wayland(&mut self) {
@@ -469,7 +587,9 @@ impl Engine {
         let descs = std::mem::take(&mut self.wl_descs);
         let rec = record(frame::REC_WAYLAND, 0, descs.len() as u32, &self.wl_bytes);
         self.wl_bytes.clear();
-        self.out_channel.push_back(Unit { rec, descs });
+        let u = Unit { rec, descs };
+        self.out_bytes += u.bytes();
+        self.out_channel.push_back(Out::Unit(u));
     }
 
     fn push_wayland(&mut self, msg: &[u8], descs: Vec<DescOut>) {
@@ -494,7 +614,10 @@ impl Engine {
     /// Parse every complete message at the front of `data` (bytes read from
     /// the local socket) with the descriptors received alongside, translate
     /// them, and queue the result for the channel. A partial message is left
-    /// in `data` for the next read.
+    /// in `data` for the next read, and so is everything after the message
+    /// that brought the channel's queue to the input limit
+    /// ([`Engine::input_blocked`]): the caller calls again once the channel
+    /// has taken some, whether or not more was read.
     pub fn from_local(
         &mut self,
         data: &mut Vec<u8>,
@@ -504,6 +627,9 @@ impl Engine {
         let dir = self.local_dir();
         let mut off = 0;
         let res = loop {
+            if self.input_blocked() {
+                break Ok(());
+            }
             let Some(h) = peek_header(&data[off..]) else {
                 break Ok(());
             };
@@ -820,6 +946,7 @@ impl Engine {
         let mut out_descs: Vec<DescOut> = Vec::new();
         let mut out_fds: Vec<OwnedFd> = Vec::new();
         let mut pre_units: Vec<Unit> = Vec::new();
+        let mut pre_job: Option<Out> = None;
         if desc.nfds > 0 {
             let class = desc.fd.ok_or_else(|| {
                 err(
@@ -874,12 +1001,15 @@ impl Engine {
                             if let Some(o) = offset_arg {
                                 edits.push((args[o as usize].off, 0));
                             }
-                            match self.blobs.send(&fd, off, len, &mut pre_units) {
-                                Some(id) => DescOut::plain(Desc {
-                                    a: id,
-                                    c: len,
-                                    ..Desc::new(frame::DESC_BLOB)
-                                }),
+                            match self.blobs.send(fd, off, len, &mut pre_units) {
+                                Some((id, job)) => {
+                                    pre_job = job.map(Out::Blob);
+                                    DescOut::plain(Desc {
+                                        a: id,
+                                        c: len,
+                                        ..Desc::new(frame::DESC_BLOB)
+                                    })
+                                }
                                 None => DescOut::plain(Desc::invalid(frame::DESC_BLOB)),
                             }
                         }
@@ -1036,7 +1166,7 @@ impl Engine {
         let client_side = self.cfg.local == Local::Client;
         let server_side = !client_side;
         let obj_id = h.object;
-        let mut commit_sync: Vec<Unit> = Vec::new();
+        let mut commit_sync: Option<SyncJob> = None;
         if dir == Dir::Request {
             match (obj.iface, h.opcode) {
                 (proto::WL_SHM_POOL, op::wl_shm_pool::REQ_CREATE_BUFFER) => {
@@ -1078,7 +1208,7 @@ impl Engine {
                 (proto::WL_SURFACE, op::wl_surface::REQ_COMMIT) => {
                     self.stats.commits += 1;
                     if client_side {
-                        self.shm.commit(obj_id, &mut commit_sync);
+                        commit_sync = self.shm.commit(obj_id);
                     }
                 }
                 (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {
@@ -1173,8 +1303,11 @@ impl Engine {
             for u in pre_units {
                 self.push_unit(u);
             }
-            for u in commit_sync {
-                self.push_unit(u);
+            if let Some(j) = pre_job {
+                self.push_out(j);
+            }
+            if let Some(j) = commit_sync {
+                self.push_out(Out::Shm(j));
             }
             self.push_wayland(&msg, out_descs);
         } else {

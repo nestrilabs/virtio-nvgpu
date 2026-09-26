@@ -566,7 +566,7 @@ fn recv_refuses_a_buffer_too_small_for_a_record() {
 }
 
 /// Poll until `f` holds, or fail after 5 s.
-fn until(what: &str, f: impl Fn() -> bool) {
+fn until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !f() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -972,4 +972,159 @@ fn a_frame_of_more_submits_than_the_burst_ends_the_connection() {
     let f = frame::pack(&mut q, 1 << 20, 256, false).0;
     assert_eq!(g.conn.send(&f, &mut g.ops).unwrap_err(), libc::EPROTO);
     assert!(g.conn.is_closed());
+}
+
+/// Export mode: the host client's messages go to the backend's engine as a
+/// guest compositor would get them; `units` from the guest compositor come
+/// back through WL_SEND.
+fn export_send(conn: &WlConn, units: Vec<frame::Unit>) {
+    let mut q: VecDeque<frame::Unit> = units.into();
+    let (f, _) = frame::pack(&mut q, 1 << 20, 256, false);
+    conn.send(&f, &mut Ops::default()).unwrap();
+}
+
+/// A host client in export mode committing a large buffer faster than the
+/// guest reads: the backend holds the guest queue's share, reads the rest of
+/// the client's commits only as the guest takes what it has, and keeps the
+/// connection. Before, every commit was read into the queue as it came, and
+/// past the connection's `max_queue` the connection was dropped.
+#[test]
+fn an_export_client_committing_faster_than_the_guest_reads_waits_and_is_kept() {
+    let (mut host_client, ours) = UnixStream::pair().unwrap();
+    let cfg = WlConfig::new("/nonexistent");
+    let (conn, _r) = WlConn::from_export(ours, &cfg, Arc::new(FakeHost)).unwrap();
+    host_client
+        .write_all(
+            &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                .new_id(2)
+                .finish(),
+        )
+        .unwrap();
+    until("the registry is made", || conn.stats().msgs_to_channel >= 1);
+    let hello = frame::Hello {
+        version: frame::WL_PROTO_VERSION,
+        caps: frame::HELLO_G_DMABUF_IMPORT,
+    };
+    let globals = [
+        MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(1)
+            .string(Some("wl_compositor"))
+            .uint(4)
+            .finish(),
+        MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+            .uint(2)
+            .string(Some("wl_shm"))
+            .uint(1)
+            .finish(),
+    ]
+    .concat();
+    export_send(
+        &conn,
+        vec![
+            frame::Unit {
+                rec: frame::record(frame::REC_HELLO, 0, 0, &hello.encode()),
+                descs: vec![],
+            },
+            frame::Unit {
+                rec: frame::record(frame::REC_WAYLAND, 0, 0, &globals),
+                descs: vec![],
+            },
+        ],
+    );
+    let (stride, height) = (4096i32, 2048i32); // 8 MiB
+    let size = (stride * height) as usize;
+    let pool = sys::memfd(c"pool", size as u64).unwrap();
+    let setup = [
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(1)
+            .generic_new_id("wl_compositor", 4, 3)
+            .finish(),
+        MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+            .uint(2)
+            .generic_new_id("wl_shm", 1, 4)
+            .finish(),
+        MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+            .new_id(5)
+            .finish(),
+        MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(6)
+            .int(size as i32)
+            .finish(),
+        MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(7)
+            .int(0)
+            .int(stride / 4)
+            .int(height)
+            .int(stride)
+            .uint(0)
+            .finish(),
+        MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+            .object(7)
+            .int(0)
+            .int(0)
+            .finish(),
+    ]
+    .concat();
+    sys::send_with_fds(host_client.as_raw_fd(), &setup, &[pool.as_raw_fd()]).unwrap();
+    const COMMITS: usize = 10;
+    let mut commits = Vec::new();
+    for _ in 0..COMMITS {
+        commits.push(
+            MsgBuilder::new(5, op::wl_surface::REQ_DAMAGE)
+                .int(0)
+                .int(0)
+                .int(i32::MAX)
+                .int(i32::MAX)
+                .finish(),
+        );
+        commits.push(MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish());
+    }
+    host_client.set_nonblocking(true).unwrap();
+    let commits = commits.concat();
+    let mut written = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // The backend stops taking the client's input: it waits in the socket.
+    until("the engine stops taking input", || {
+        if written < commits.len() {
+            if let Ok(n) = host_client.write(&commits[written..]) {
+                written += n;
+            }
+        }
+        super::conn::export_state(&conn).1
+    });
+    assert!(Instant::now() < deadline);
+    let (queued, _) = super::conn::export_state(&conn);
+    assert!(!conn.is_closed(), "the connection is kept");
+    assert!(
+        queued <= super::conn::EXPORT_QUEUE + frame::MIN_FRAME,
+        "{queued} bytes queued for the guest"
+    );
+    // The guest reads; every commit's copy arrives, and the connection stays.
+    let mut synced = 0;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while synced < COMMITS * size {
+        assert!(
+            Instant::now() < deadline,
+            "{synced} of {} bytes arrived",
+            COMMITS * size
+        );
+        if written < commits.len() {
+            if let Ok(n) = host_client.write(&commits[written..]) {
+                written += n;
+            }
+        }
+        let f = conn.recv(4 << 20, 256, &mut Ops::default()).unwrap();
+        let d = frame::decode(&f).unwrap();
+        for r in d.records() {
+            assert_ne!(r.ty, frame::REC_HANGUP, "the connection ended");
+            if r.ty == frame::REC_SHM_SYNC {
+                synced += r.payload.len();
+            }
+        }
+        if d.records.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(synced, COMMITS * size);
+    assert!(!conn.is_closed());
 }

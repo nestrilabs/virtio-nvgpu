@@ -14,6 +14,15 @@
 //! not reading, and the daemon stops reading its client until the backlog
 //! drains -- the client's own libwayland buffer is where it waits.
 //!
+//! **Export mode** faces a host client, whose commits and blobs the engine
+//! reads here and carries to the guest compositor. Those are not drained
+//! eagerly: the engine reads them only as the guest's queue has room
+//! ([`EXPORT_QUEUE`]), and takes no more of the client's input while
+//! [`wlwire::engine::CHANNEL_HIGH_WATER`] bytes wait for the channel; the
+//! rest waits in the client's socket, as it would for a slow compositor. A
+//! client that commits its whole pool every frame costs the backend a queue's
+//! worth, not a pool per commit.
+//!
 //! **Readiness** is an eventfd, readable while anything is queued for the
 //! guest (records, or the HANGUP that ends the connection).
 //!
@@ -351,6 +360,10 @@ impl Default for WlLimits {
     }
 }
 
+/// Export mode: bytes queued for the guest past which the engine's pending
+/// commits and blobs are left unread until the guest takes some.
+pub const EXPORT_QUEUE: usize = 8 << 20;
+
 struct State {
     engine: Engine,
     to_guest: VecDeque<Unit>,
@@ -686,6 +699,12 @@ impl WlConn {
             d.write(&mut b);
             f[at..at + frame::DESC_LEN].copy_from_slice(&b);
         }
+        if st.engine.local_is_client() {
+            // Export mode: what the host client sent waits in the engine
+            // for room here, and its input for the engine to take more.
+            collect(s, &mut st);
+            sys::eventfd_signal(s.wake.as_raw_fd());
+        }
         if st.to_guest.is_empty() {
             sys::eventfd_clear(s.ready.as_raw_fd());
         }
@@ -722,14 +741,25 @@ impl Drop for WlConn {
 /// connection's limit and the VM's budget. Past either the connection is
 /// dropped, and what it had queued with it: kept, it would pin memory until
 /// the guest closes the handle, for a guest that has shown it is not reading.
+/// In export mode only what fits [`EXPORT_QUEUE`] is taken, and the rest of
+/// what the host client sent waits in the engine, unread.
 fn collect(s: &Shared, st: &mut State) {
-    let units = st.engine.take_units();
-    if units.is_empty() {
-        return;
-    }
     // HANGUP is queued: the guest stops at it, so nothing after it is ever
     // read, and keeping it would only hold memory (and descriptors).
     if st.closed {
+        st.engine.drop_channel_output();
+        return;
+    }
+    let units = if st.engine.local_is_client() {
+        let room = export_room(s, st);
+        if room == 0 {
+            return;
+        }
+        st.engine.take_units_upto(room)
+    } else {
+        st.engine.take_units()
+    };
+    if units.is_empty() {
         return;
     }
     let n: usize = units.iter().map(|u| u.bytes()).sum();
@@ -755,6 +785,13 @@ fn collect(s: &Shared, st: &mut State) {
     sys::eventfd_signal(s.ready.as_raw_fd());
 }
 
+/// Export mode: bytes the guest queue may still take from the engine.
+fn export_room(s: &Shared, st: &State) -> usize {
+    EXPORT_QUEUE
+        .min(s.cfg.max_queue / 2)
+        .saturating_sub(st.to_guest_bytes)
+}
+
 /// Queue a record that ends the connection (ERROR, HANGUP): small, and owed
 /// to the guest whatever the budget says.
 fn push_final(s: &Shared, st: &mut State, u: Unit) {
@@ -772,7 +809,7 @@ fn fail(s: &Shared, st: &mut State, f: Fatal) {
         }
         Blame::Local => log::warn!("wayland: compositor protocol error, closing: {}", f.message),
     }
-    let _ = st.engine.take_units();
+    st.engine.drop_channel_output();
     if st.engine.local_is_client() {
         // Export mode: the host client is the one to tell, as libwayland
         // would have.
@@ -818,27 +855,45 @@ fn reader(s: Arc<Shared>) {
     let mut inbuf: Vec<u8> = Vec::new();
     let mut infds: VecDeque<OwnedFd> = VecDeque::new();
     loop {
-        let (want_out, streams, closed) = {
-            let st = lock(&s);
+        let (want_out, streams, closed, blocked) = {
+            let mut st = lock(&s);
             if st.stop {
                 return;
+            }
+            // Export mode: input the engine left when the guest's queue
+            // was full, taken now that there may be room.
+            if !st.closed && !inbuf.is_empty() && !st.engine.input_blocked() {
+                let mut plat = HostPlat {
+                    host: &*s.host,
+                    send: None,
+                };
+                match st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
+                    Ok(()) => collect(&s, &mut st),
+                    Err(f) => fail(&s, &mut st, f),
+                }
             }
             (
                 st.engine.local_out_len() > 0,
                 st.engine.stream_interest(),
                 st.closed,
+                st.engine.input_blocked(),
             )
         };
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(2 + streams.len());
         let mut ev = 0;
         if !closed {
-            ev |= libc::POLLIN;
+            // Not readable while the engine takes no input: the client
+            // waits in its socket. Nor watched at all then unless there is
+            // output, or its hangup would wake every poll.
+            if !blocked {
+                ev |= libc::POLLIN;
+            }
             if want_out {
                 ev |= libc::POLLOUT;
             }
         }
         pfds.push(libc::pollfd {
-            fd: if closed { -1 } else { sock },
+            fd: if closed || ev == 0 { -1 } else { sock },
             events: ev,
             revents: 0,
         });
@@ -872,7 +927,7 @@ fn reader(s: Arc<Shared>) {
             sys::eventfd_clear(s.wake.as_raw_fd());
         }
         let rev = pfds[0].revents;
-        if !closed && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if !closed && !blocked && rev & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             // Read until the socket is empty: never leave the compositor's
             // buffer to fill.
             loop {
@@ -915,7 +970,8 @@ fn reader(s: Arc<Shared>) {
                             break;
                         }
                         collect(&s, &mut st);
-                        if st.closed {
+                        // Export mode: read no more than the engine takes.
+                        if st.closed || st.engine.input_blocked() {
                             break;
                         }
                     }
@@ -933,7 +989,14 @@ fn reader(s: Arc<Shared>) {
         if st.stop {
             return;
         }
-        if !st.closed && rev & libc::POLLOUT != 0 {
+        // A blocked socket is watched for output alone, and its hangup is
+        // found by the write.
+        let out_ready = if blocked {
+            libc::POLLOUT | libc::POLLHUP | libc::POLLERR
+        } else {
+            libc::POLLOUT
+        };
+        if !st.closed && want_out && rev & out_ready != 0 {
             if let Err(e) = st.engine.local_out().flush(sock) {
                 hangup(&s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
             }
@@ -953,6 +1016,14 @@ fn reader(s: Arc<Shared>) {
 #[cfg(test)]
 pub(crate) fn sock_fd(c: &WlConn) -> std::os::fd::RawFd {
     c.shared.sock.as_raw_fd()
+}
+
+/// Bytes queued for the guest, and whether the engine takes no more of the
+/// local peer's input, for tests.
+#[cfg(test)]
+pub(crate) fn export_state(c: &WlConn) -> (usize, bool) {
+    let st = lock(&c.shared);
+    (st.to_guest_bytes, st.engine.input_blocked())
 }
 
 #[cfg(test)]

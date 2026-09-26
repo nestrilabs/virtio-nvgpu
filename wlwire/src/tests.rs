@@ -614,14 +614,19 @@ impl Pair {
         }
     }
 
+    /// The client's messages, taken as the channel drains (the engine stops
+    /// taking input with a channel's worth queued).
     fn client_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
         let mut data: Vec<u8> = msgs.concat();
         let mut fds: VecDeque<OwnedFd> = fds.into();
-        let r = self.g.from_local(&mut data, &mut fds, &mut self.gp);
-        if r.is_ok() {
+        loop {
+            let before = data.len();
+            self.g.from_local(&mut data, &mut fds, &mut self.gp)?;
             self.pump();
+            if data.is_empty() || data.len() == before {
+                return Ok(());
+            }
         }
-        r
     }
 
     fn server_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
@@ -2297,4 +2302,140 @@ fn dev_t_encoding_matches_glibc() {
     assert_eq!(makedev(226, 128), 0xe280);
     assert_eq!(major_minor(makedev(4095, 1 << 20)), (4095, 1 << 20));
     assert_eq!(major_minor(makedev(0x12345, 0xabcdef)), (0x12345, 0xabcdef));
+}
+
+/// wl_shm bound as 4 and wl_compositor as 3, a surface 7, and pool 5 over
+/// `pool` (`size` bytes as the client claims it).
+fn shm_client(p: &mut Pair, pool: OwnedFd, size: i32) {
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(size)
+                .finish(),
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(7)
+                .finish(),
+        ],
+        vec![pool],
+    )
+    .unwrap();
+}
+
+fn shm_buffer(pool: u32, id: u32, offset: i32, height: i32, stride: i32) -> Vec<u8> {
+    MsgBuilder::new(pool, op::wl_shm_pool::REQ_CREATE_BUFFER)
+        .new_id(id)
+        .int(offset)
+        .int(stride / 4)
+        .int(height)
+        .int(stride)
+        .uint(0)
+        .finish()
+}
+
+/// The client's side charges what its buffers cover as the server's side
+/// does, so a buffer the host would refuse is refused before the daemon
+/// reads a byte of it, and the client is told. Before, the client's side
+/// took any buffer its pool's claimed size allowed, and read all of it at
+/// every commit.
+#[test]
+fn a_client_side_buffer_past_the_connections_bytes_is_refused_before_it_is_read() {
+    let mut p = Pair::new(Policy::default());
+    // Sparse: a client's claim costs the client nothing.
+    shm_client(&mut p, sys::memfd(c"t", 0).unwrap(), i32::MAX);
+    p.client_sends(&[shm_buffer(5, 10, 0, 8192, 65536)], vec![])
+        .unwrap();
+    let e = p
+        .client_sends(&[shm_buffer(5, 11, 1 << 30, 8192, 65536)], vec![])
+        .unwrap_err();
+    assert_eq!(e.code, ERR_NO_MEMORY);
+    assert_eq!(e.blame, Blame::Local);
+}
+
+/// A commit costs the client's side one record at a time, not the buffer:
+/// the copy is read as the channel takes it, and the client's input after a
+/// commit that fills the channel's queue waits until the channel drains.
+#[test]
+fn a_commit_is_read_as_the_channel_takes_it_and_input_waits_behind_it() {
+    let mut p = Pair::new(Policy::default());
+    let (stride, height) = (4096i32, 2048i32); // 8 MiB
+    let size = (stride * height) as usize;
+    let pixels: Vec<u8> = (0..size).map(|i| (i / 4096) as u8 ^ i as u8).collect();
+    shm_client(&mut p, memfd_with(&pixels), size as i32);
+    p.client_sends(&[shm_buffer(5, 6, 0, height, stride)], vec![])
+        .unwrap();
+    let (_, mut fds) = p.at_server();
+    let host_pool = fds.pop().unwrap();
+    let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(20)
+        .finish();
+    let mut data = [
+        MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
+            .object(6)
+            .int(0)
+            .int(0)
+            .finish(),
+        MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish(),
+        sync.clone(),
+    ]
+    .concat();
+    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
+        .unwrap();
+    // The commit went in; what follows it waits for the channel.
+    assert_eq!(data, sync, "input past a full channel queue is left");
+    assert!(p.g.input_blocked());
+    assert!(p.g.channel_backlog() >= size);
+    // A frame's worth is read, not the buffer.
+    let mut q = p.g.take_units_upto(256 * 1024);
+    let taken: usize = q.iter().map(|u| u.bytes()).sum();
+    assert!(taken <= 256 * 1024 + 2 * frame::MAX_REC_PAYLOAD, "{taken}");
+    while !q.is_empty() {
+        let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+        p.h.from_channel(&f, fds, &mut p.hp).unwrap();
+    }
+    p.pump();
+    assert!(!p.g.input_blocked());
+    assert_eq!(read_all(&host_pool), pixels);
+    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
+        .unwrap();
+    assert!(data.is_empty());
+    p.pump();
+    let (msgs, _) = p.at_server();
+    assert_eq!(split(&msgs).last(), Some(&sync));
+}
+
+/// A blob is read as the channel takes it too: the first record at once
+/// (all of a keymap), the rest as frames are made.
+#[test]
+fn a_large_blob_is_read_a_record_at_a_time() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wp_color_manager_v1", 1)]);
+    p.bind(1, "wp_color_manager_v1", 1, 3).unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wp_color_manager_v1::REQ_CREATE_ICC_CREATOR)
+                .new_id(4)
+                .finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let icc: Vec<u8> = (0..(4 << 20)).map(|i: u32| (i * 7) as u8).collect();
+    let mut data = MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+        .uint(0)
+        .uint(icc.len() as u32)
+        .finish();
+    let mut fds = VecDeque::from([memfd_with(&icc)]);
+    p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+    assert!(p.g.channel_backlog() >= icc.len());
+    let mut q = p.g.take_units_upto(1);
+    assert_eq!(q.len(), 1, "one record");
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut p.hp).unwrap();
+    p.pump();
+    let (_, fds) = p.at_server();
+    assert_eq!(read_all(&fds[0]), icc);
 }
