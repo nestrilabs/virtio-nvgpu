@@ -230,6 +230,23 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     wayland_export: Option<PathBuf>,
 
+    /// Accept host buffers to inject into the guest here, from a capture
+    /// helper running as `--inject-uid` (SECURITY.md §18).
+    ///
+    /// A SOCK_SEQPACKET socket, bound 0600 in a private directory and
+    /// renamed into place; open it to the helper's group once it exists
+    /// (contrib/systemd/nvgpu-socket-open). Each dma-buf the helper sends
+    /// must be nvidia-drm memory of this GPU; a guest process that knows the
+    /// id and token IMPORT answered opens it read-only for the CPU. Off by
+    /// default: without it the guest has no /dev/nvgpu-capture.
+    #[arg(long, value_name = "PATH", requires = "inject_uid")]
+    inject_socket: Option<PathBuf>,
+
+    /// The only uid whose connections to `--inject-socket` are served
+    /// (SO_PEERCRED): the VM's capture helper, a user of its own.
+    #[arg(long, value_name = "UID", requires = "inject_socket")]
+    inject_uid: Option<u32>,
+
     /// Wayland channels one VM may have open at once (guest clients, or
     /// accepted host clients in export mode). Each is a client of the host
     /// compositor with a thread and a few descriptors here; past the limit
@@ -1394,6 +1411,32 @@ fn main() -> anyhow::Result<()> {
     // behind, and a host client connecting to it would wait on a backend that
     // is gone.
     let _export = ExportGuard(wayland.export.as_ref().map(|(x, _)| x.clone()));
+    // Bound now, like the export socket: the sandbox leaves no directory to
+    // make a socket in. Its threads start after the sandbox.
+    let inject = match (&args.inject_socket, args.inject_uid) {
+        (Some(p), Some(uid)) => {
+            if uid == 0 {
+                log::warn!(
+                    "--inject-uid 0: root's processes may inject; give the capture helper a \
+                     user of its own"
+                );
+            }
+            let registry = Arc::new(device::inject::Registry::new(Arc::new(
+                device::inject::SysInjectHost::for_this_host(),
+            )));
+            let s = device::inject::InjectServer::bind_idle(p, uid, registry).map_err(|e| {
+                anyhow::anyhow!("--inject-socket {}: cannot listen: {e}", p.display())
+            })?;
+            log::info!(
+                "inject: uid {uid} may inject buffers at {} (at most {} buffers, {} MiB)",
+                p.display(),
+                device::inject::MAX_BUFFERS,
+                device::inject::MAX_BYTES >> 20
+            );
+            Some(s)
+        }
+        _ => None,
+    };
 
     // What the sandbox would put out of reach is opened first: the uevent
     // socket (a network namespace of the backend's own hears none), and
@@ -1464,6 +1507,10 @@ fn main() -> anyhow::Result<()> {
         x.start()
             .map_err(|e| anyhow::anyhow!("--wayland-export: accept thread: {e}"))?;
     }
+    if let Some(s) = &inject {
+        s.start()
+            .map_err(|e| anyhow::anyhow!("--inject-socket: accept thread: {e}"))?;
+    }
     let config = BackendConfig {
         kms_card: args.kms_card,
         wayland_socket: args.wayland_socket,
@@ -1493,6 +1540,14 @@ fn main() -> anyhow::Result<()> {
         wayland,
         args.allow_unmeasured_release,
     )?));
+    if let Some(s) = &inject {
+        let shared = backend.read().expect("backend lock").shared.clone();
+        shared
+            .nvidia
+            .lock()
+            .expect("nvidia lock")
+            .set_inject(Some(s.registry().clone()));
+    }
     if args.keep_guest_coherency {
         let shared = backend.read().expect("backend lock").shared.clone();
         shared

@@ -330,6 +330,7 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_PROC_ID (1u << 8)     /* nvgpu_proc_id on RM_ALLOC, RM_DUP   */
 #define NVGPU_BCAP_PROC_EUID (1u << 9)   /* ... with euid, and on RM_CONTROL    */
 #define NVGPU_BCAP_COMPUTE (1u << 10)    /* UVM served (--allow-compute)        */
+#define NVGPU_BCAP_INJECT (1u << 11)     /* injected host buffers (INJECT_OPEN) */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
@@ -545,6 +546,12 @@ struct nvgpu_unwatch_req {
  * only then, so a lost reply is answered again. */
 #define NVGPU_OP_OSDESC_REAP 11
 #define NVGPU_OSDESC_REAP_MAX 256
+/* (render file, id, token[0..8], token[8..16]) -> (gem, size, type), then an
+ * nvgpu_inject_info after the nvgpu_host_op_resp: a buffer the host's capture
+ * helper injected, imported into the render file (protocol/src/messages.rs,
+ * OP_INJECT_OPEN). -ENOENT for an id that is not live or a token that does
+ * not match, alike. Only with NVGPU_BCAP_INJECT. */
+#define NVGPU_OP_INJECT_OPEN 12
 
 #define NVGPU_OP_MAX_ARGS 6
 #define NVGPU_OP_MAX_RES 4
@@ -559,6 +566,20 @@ struct nvgpu_host_op_resp {
   __le32 nres;
   __le32 pad;
   __le64 res[NVGPU_OP_MAX_RES];
+} __packed;
+
+/* What INJECT_OPEN says of the buffer (protocol/src/inject.rs, InjectInfo):
+ * what the helper's IMPORT gave, as the backend checked it. */
+struct nvgpu_inject_info {
+  __le32 width;
+  __le32 height;
+  __le32 fourcc;
+  __le32 nplanes;
+  __le64 modifier;
+  __le32 offsets[4];
+  __le32 strides[4];
+  __le32 flags; /* bit 0: rows bottom to top */
+  __le32 reserved;
 } __packed;
 
 /* ── EVENT_DATA records (host → guest) ──
@@ -640,6 +661,7 @@ static_assert(sizeof(struct nvgpu_watch_req) == 16, "watch");
 static_assert(sizeof(struct nvgpu_unwatch_req) == 8, "unwatch");
 static_assert(sizeof(struct nvgpu_host_op_req) == 56, "host op req");
 static_assert(sizeof(struct nvgpu_host_op_resp) == 40, "host op resp");
+static_assert(sizeof(struct nvgpu_inject_info) == 64, "inject info");
 static_assert(sizeof(struct nvgpu_osdesc_hdr) == 8, "osdesc hdr");
 static_assert(sizeof(struct nvgpu_osdesc_run) == 16, "osdesc run");
 static_assert(sizeof(struct nvgpu_proc_id) == 16, "proc id");

@@ -612,6 +612,9 @@ pub struct NvidiaBackend {
     pub(crate) guest_ram: Option<crate::osdesc::GuestRam>,
     /// Memory the guest registered with RM by its pages (osdesc.rs).
     pub(crate) osdesc: crate::osdesc::OsDesc,
+    /// Host buffers a capture helper injected (`--inject-socket`), and the
+    /// handles INJECT_OPEN made of them (inject.rs).
+    pub(crate) inject: crate::inject::BackendInject,
 }
 
 /// A fake host driver for tests: what the forwarding paths hand the host,
@@ -955,6 +958,17 @@ fn node_dev(name: &str) -> Option<(u32, u32)> {
 /// compositor-VM mode (GET_SYS_FILES section 3, HOST_OP OPEN_KMS). The list is
 /// kept in every mode because classification needs it: a lease fd is ours
 /// only if it is one of these cards.
+/// The render nodes' names (`renderD128`), in the order a guest's render
+/// indices name them (`HostNodes::dri`): the capture helper's buffers are
+/// checked against the same numbering (inject.rs).
+pub fn host_render_names() -> Vec<String> {
+    enumerate_host_nodes()
+        .dri
+        .into_iter()
+        .map(|d| d.name)
+        .collect()
+}
+
 fn enumerate_host_nodes() -> HostNodes {
     let mut nodes = HostNodes::default();
     for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
@@ -1085,6 +1099,7 @@ impl NvidiaBackend {
             rmmem: crate::rmmem::RmMem::default(),
             guest_ram: None,
             osdesc: crate::osdesc::OsDesc::default(),
+            inject: crate::inject::BackendInject::default(),
         }
     }
 
@@ -1375,6 +1390,7 @@ impl NvidiaBackend {
         self.syncobj_regs.clear();
         self.uvm_refused.clear();
         self.nvkms.reset();
+        self.inject.reset();
         // Every UVM mapping of a registration is taken down, and every
         // client holding one freed on the file it was made on, before any
         // file closes (osdesc.rs); then the records go.
@@ -2125,6 +2141,15 @@ impl NvidiaBackend {
                 );
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
             }
+            // A placement made writable before the range was an injected
+            // buffer's (a stale id since reused) is not handed out again.
+            if live.writable && drm && self.inject.read_only(fd_offset, size.max(4096)) {
+                log::warn!(
+                    "mmap on handle {handle}: a writable placement at file offset \
+                     {fd_offset:#x} is now an injected buffer's; refused"
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EACCES);
+            }
             live.refs += 1;
             let (offset, length) = (live.region.offset, live.length);
             let (pgprot, writable) = (live.region.pgprot, live.writable);
@@ -2139,7 +2164,11 @@ impl NvidiaBackend {
         }
 
         let length = size.max(4096);
-        let writable = crate::shm::host_mapping_writable(host_fd, length, fd_offset);
+        // An injected buffer's range is placed read-only, whichever of the
+        // VM's files maps it (inject.rs): the guest's CPU does not write
+        // into the host's capture buffers.
+        let injected = drm && self.inject.read_only(fd_offset, length);
+        let writable = !injected && crate::shm::host_mapping_writable(host_fd, length, fd_offset);
         let region = match self.alloc_zone(length, pgprot, self.handles.owner(handle)) {
             Ok(r) => r,
             Err(e) => {
@@ -2168,8 +2197,13 @@ impl NvidiaBackend {
 
         log::debug!(
             "mmap on handle {handle}: placed {length:#x} bytes at window offset {:#x} \
-             with no arming recorded here",
-            region.offset
+             with no arming recorded here{}",
+            region.offset,
+            if injected {
+                ", read-only (injected)"
+            } else {
+                ""
+            }
         );
 
         let (offset, pgprot) = (region.offset, region.pgprot);
@@ -2433,6 +2467,7 @@ impl NvidiaBackend {
         }
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
+        self.inject.file_closed(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         // A display file's last close can wait on a modeset; not here, on
@@ -2822,6 +2857,7 @@ impl NvidiaBackend {
                 {
                     let gem = u32::from_le_bytes(param_in[..4].try_into().unwrap());
                     self.semsurf.gem_closed(self.current_handle, gem);
+                    self.inject.gem_closed(self.current_handle, gem);
                 }
                 return n;
             }

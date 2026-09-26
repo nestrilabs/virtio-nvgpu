@@ -25,6 +25,7 @@
 
 pub mod backend;
 pub mod host;
+pub mod inject;
 pub mod parsers;
 #[cfg(feature = "vhost-user")]
 pub mod vring;

@@ -16,6 +16,7 @@
 
 #![no_std]
 
+pub mod inject;
 pub mod messages;
 
 pub use messages::*;

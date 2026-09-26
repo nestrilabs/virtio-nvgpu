@@ -38,7 +38,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FUZZ="$ROOT/fuzz"
-TARGETS=(backend backend_v2 vring deepseg osdesc rmshare nvkms guestptr misc wl_engine wl_codec)
+TARGETS=(backend backend_v2 vring deepseg osdesc rmshare nvkms guestptr misc wl_engine wl_codec inject)
 # Worker processes per target: the stateful targets are slow and deep.
 declare -A WEIGHT=([backend]=4 [backend_v2]=4 [vring]=2 [wl_engine]=3)
 

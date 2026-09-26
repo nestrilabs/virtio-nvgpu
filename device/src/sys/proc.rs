@@ -50,6 +50,27 @@ pub fn ppid() -> i32 {
     unsafe { libc::getppid() }
 }
 
+/// Fill `buf` from the kernel's random pool (`getrandom(2)`, flags 0: it
+/// blocks only before the pool is first seeded, long past by the time a
+/// backend runs).
+pub fn getrandom(buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        // SAFETY: the kernel writes at most `rest.len()` bytes into `rest`.
+        let n = unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
 /// `kill(pid, sig)`.
 pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     // SAFETY: integer arguments.

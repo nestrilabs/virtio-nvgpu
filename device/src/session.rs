@@ -577,6 +577,9 @@ impl NvidiaBackend {
         if self.session.proc_euid {
             backend_caps |= BCAP_PROC_EUID;
         }
+        if self.inject.registry().is_some() {
+            backend_caps |= BCAP_INJECT;
+        }
         let resp = HelloResp {
             proto: PROTO_V2,
             backend_caps,
@@ -684,6 +687,20 @@ impl NvidiaBackend {
         let op = hostfd::check_host_op(&req, &|h| handles.kind(h), cards).inspect_err(|e| {
             log::warn!("HOST_OP {} refused before running: errno {e}", req.op);
         })?;
+        // A buffer the capture helper injected: its description goes after
+        // the fixed reply (inject.rs).
+        if let HostOp::InjectOpen { file, id, token } = op {
+            let (res, info) = self.inject_open(file, id, &token)?;
+            let mut resp = HostOpResp {
+                nres: res.len() as u32,
+                pad: 0,
+                res: [0; OP_MAX_RES],
+            };
+            resp.res[..res.len()].copy_from_slice(&res);
+            let mut body = bytes_of(&resp).to_vec();
+            body.extend_from_slice(&info.to_bytes());
+            return Ok(Outcome::Reply(self.ok_reply(0, &body)));
+        }
         // The two that can wait on the display go to an executor (KmsCall).
         let kms = match op {
             HostOp::OpenKms { card, .. } => Some(KmsOp::Open {
@@ -834,6 +851,7 @@ impl NvidiaBackend {
             HostOp::OpenKms { .. } | HostOp::DropIfMaster { .. } => {
                 unreachable!("serve_host_op sends these to an executor")
             }
+            HostOp::InjectOpen { .. } => unreachable!("serve_host_op answers it itself"),
             HostOp::SyncobjWatch { key, cookie } => Ok((self.syncobj_watch(key, cookie)?, vec![])),
             HostOp::CloseMany { handles } => {
                 let closed = handles

@@ -630,6 +630,9 @@ pub const BCAP_PROC_EUID: u32 = 1 << 9;
 /// makes no UVM device: to NVIDIA's userspace, a host whose nvidia-uvm is not
 /// loaded.
 pub const BCAP_COMPUTE: u32 = 1 << 10;
+/// Host buffers a helper injected may be opened ([`OP_INJECT_OPEN`];
+/// `--inject-socket`). Without it the guest makes no `/dev/nvgpu-capture`.
+pub const BCAP_INJECT: u32 = 1 << 11;
 
 /// `HelloReq::guest_caps` bits.
 ///
@@ -857,6 +860,15 @@ pub const OP_SYNCOBJ_WATCH: u32 = 10;
 pub const OP_OSDESC_REAP: u32 = 11;
 /// Most ids one reap reply names.
 pub const OSDESC_REAP_MAX: u32 = 256;
+/// `(render file, id, token[0..8], token[8..16]) -> (gem, size, type)`, then
+/// an [`crate::inject::InjectInfo`] (64 bytes) after the [`HostOpResp`]: a
+/// buffer the host's capture helper injected (`--inject-socket`,
+/// device/src/inject.rs), imported into the render file as a GEM handle the
+/// guest makes a proxy of. The token is the one IMPORT gave the helper, as
+/// two little-endian words; an id that is not live, or a token that does
+/// not match, is -ENOENT either way. `type` is always 0 (NVKMS): nothing
+/// else is injected. Only with [`BCAP_INJECT`].
+pub const OP_INJECT_OPEN: u32 = 12;
 
 pub const OP_MAX_ARGS: usize = 6;
 pub const OP_MAX_RES: usize = 4;
@@ -1037,6 +1049,9 @@ mod tests {
         assert_eq!(define("NVGPU_BCAP_PROC_EUID"), u64::from(BCAP_PROC_EUID));
         assert_eq!(define("NVGPU_GCAP_PROC_EUID"), u64::from(GCAP_PROC_EUID));
         assert_eq!(define("NVGPU_BCAP_COMPUTE"), u64::from(BCAP_COMPUTE));
+        assert_eq!(define("NVGPU_BCAP_INJECT"), u64::from(BCAP_INJECT));
+        assert_eq!(define("NVGPU_OP_INJECT_OPEN"), u64::from(OP_INJECT_OPEN));
+        assert!(h.contains("static_assert(sizeof(struct nvgpu_inject_info) == 64"));
         // Every capability bit is distinct, on each side.
         let bcaps = [
             BCAP_KMS_CARD,
@@ -1050,6 +1065,7 @@ mod tests {
             BCAP_PROC_ID,
             BCAP_PROC_EUID,
             BCAP_COMPUTE,
+            BCAP_INJECT,
         ];
         assert_eq!(
             bcaps.iter().fold(0, |a, b| a | b).count_ones() as usize,

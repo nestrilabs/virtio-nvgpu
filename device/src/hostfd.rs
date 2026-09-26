@@ -292,7 +292,7 @@ pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
 
 /// Filesystem magic numbers (include/uapi/linux/magic.h).
 const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
-const DMA_BUF_MAGIC: i64 = 0x444d_4142;
+pub(crate) const DMA_BUF_MAGIC: i64 = 0x444d_4142;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
 
@@ -408,16 +408,42 @@ pub fn watch_mode(kind: HandleKind, flags: u32, cookie: u64) -> Result<WatchMode
 /// refused rather than truncated into some other handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostOp {
-    PrimeExport { file: u32, gem: u32 },
-    DmabufImport { file: u32, dmabuf: u32 },
-    SyncMerge { fences: Vec<u32> },
+    PrimeExport {
+        file: u32,
+        gem: u32,
+    },
+    DmabufImport {
+        file: u32,
+        dmabuf: u32,
+    },
+    SyncMerge {
+        fences: Vec<u32>,
+    },
     NewEventfd,
-    FdKind { handle: u32 },
+    FdKind {
+        handle: u32,
+    },
     SignaledSyncFile,
-    OpenKms { render: u32, card: u32 },
-    DropIfMaster { card: u32 },
-    CloseMany { handles: Vec<u32> },
-    SyncobjWatch { key: RegKey, cookie: u64 },
+    OpenKms {
+        render: u32,
+        card: u32,
+    },
+    DropIfMaster {
+        card: u32,
+    },
+    CloseMany {
+        handles: Vec<u32>,
+    },
+    SyncobjWatch {
+        key: RegKey,
+        cookie: u64,
+    },
+    /// A buffer the capture helper injected (inject.rs).
+    InjectOpen {
+        file: u32,
+        id: u32,
+        token: [u8; 16],
+    },
 }
 
 /// Most handles SYNC_MERGE and CLOSE_MANY take: `args[0]` is the count and
@@ -540,6 +566,17 @@ pub fn check_host_op(
                 cookie: args[4],
             })
         }
+        OP_INJECT_OPEN => {
+            want(4)?;
+            let (file, _) = of_kind(args[0], &is_render)?;
+            // An id is a u32; a larger number names none (ENOENT, as a
+            // wrong token would be).
+            let id = u32::try_from(args[1]).map_err(|_| libc::ENOENT)?;
+            let mut token = [0u8; 16];
+            token[..8].copy_from_slice(&args[2].to_le_bytes());
+            token[8..].copy_from_slice(&args[3].to_le_bytes());
+            Ok(HostOp::InjectOpen { file, id, token })
+        }
         _ => Err(libc::EINVAL),
     }
 }
@@ -583,6 +620,20 @@ pub fn gem_identify(render: RawFd, gem: u32) -> io::Result<u32> {
     p[0..4].copy_from_slice(&gem.to_le_bytes());
     flat(render, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, &mut p)?;
     Ok(u32::from_le_bytes(p[4..8].try_into().unwrap()))
+}
+
+/// `DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET`: `{u32 handle; u32 pad; u64 offset}`.
+pub const DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET: u32 = ioc(IOC_RW, b'd', 0x4a, 16);
+
+/// `DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET` on `gem` in `render`: the object's
+/// fake mmap offset. It is the object's (its `drm_vma_node`), not the
+/// file's: every file holding a handle to one object gets the same number,
+/// and may map it (inject.rs keys read-only placements on it).
+pub fn gem_map_offset(render: RawFd, gem: u32) -> io::Result<u64> {
+    let mut p = [0u8; 16];
+    p[0..4].copy_from_slice(&gem.to_le_bytes());
+    flat(render, DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET, &mut p)?;
+    Ok(u64::from_le_bytes(p[8..16].try_into().unwrap()))
 }
 
 /// The object type a DMABUF_IMPORT reports, from IDENTIFY on the imported
@@ -853,6 +904,7 @@ mod tests {
     #[test]
     fn identify_has_nvidia_drms_number() {
         assert_eq!(DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, 0xC008_644E);
+        assert_eq!(DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET, 0xC010_644A);
     }
 
     #[test]

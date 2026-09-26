@@ -99,3 +99,10 @@ path = "fuzz_targets/vring.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "inject"
+path = "fuzz_targets/inject.rs"
+test = false
+doc = false
+bench = false
