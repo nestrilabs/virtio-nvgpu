@@ -1,0 +1,82 @@
+From ce21899ac18fbbf597377ef27fadac7406a2e57f Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 03:30:07 +0000
+Subject: [PATCH 6/6] devices: bound the backend-reported shared memory region
+ size
+
+A vhost-user device's shared memory region length comes from the backend,
+a separate and less-trusted process. allocate_device_bars rounded it up
+with `.checked_next_power_of_two().expect("bar too large")`, so a wild
+value aborted the VM, and a merely large one reserved a preposterous
+slice of the 64-bit MMIO space. Cap it at 64 GiB (the virtio-nvgpu window
+is 1 GiB) and return a clean PciDeviceError instead of panicking.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ devices/src/pci/pci_device.rs           |  3 +++
+ devices/src/virtio/virtio_pci_device.rs | 25 +++++++++++++++++++++----
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/devices/src/pci/pci_device.rs b/devices/src/pci/pci_device.rs
+index 0933280..057a612 100644
+--- a/devices/src/pci/pci_device.rs
++++ b/devices/src/pci/pci_device.rs
+@@ -120,6 +120,9 @@ pub enum Error {
+     /// PCI Bus window allocation failure.
+     #[error("failed to allocate window for PCI bus: {0}")]
+     PciBusWindowAllocationFailure(String),
++    /// A backend reported a shared memory region larger than is allowed.
++    #[error("shared memory region size {0:#x} exceeds the maximum {1:#x}")]
++    SharedMemoryRegionTooLarge(u64, u64),
+     /// Size of zero encountered
+     #[error("Size of zero detected")]
+     SizeZero,
+diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
+index e5b64af..644ea40 100644
+--- a/devices/src/virtio/virtio_pci_device.rs
++++ b/devices/src/virtio/virtio_pci_device.rs
+@@ -281,6 +281,12 @@ const VIRTIO_PCI_REVISION_ID: u8 = 1;
+ const CAPABILITIES_BAR_NUM: usize = 0;
+ const SHMEM_BAR_NUM: usize = 2;
+ 
++/// Largest shared memory region (and thus BAR) a device may ask for. The region
++/// length is device-reported -- for a vhost-user device, by the backend -- so it
++/// is bounded rather than trusted: 64 GiB is far above any real use (the
++/// virtio-nvgpu window is 1 GiB) and well within the 64-bit MMIO layout.
++const MAX_SHARED_MEMORY_REGION_SIZE: u64 = 64 << 30;
++
+ struct QueueEvent {
+     event: Event,
+     ioevent_registered: bool,
+@@ -1091,12 +1097,23 @@ where
+             None => return Ok(Vec::new()),
+             Some(r) => r,
+         };
++        // The region length comes from the device, which for a vhost-user device
++        // means the backend -- a separate, less-trusted process. A wild value
++        // would round up to an absurd BAR and either abort the VM (the former
++        // `expect`) or reserve a preposterous slice of the address space. Cap it
++        // and fail cleanly instead.
++        let bar_size = match region.length.checked_next_power_of_two() {
++            Some(size) if size <= MAX_SHARED_MEMORY_REGION_SIZE => size,
++            _ => {
++                return Err(PciDeviceError::SharedMemoryRegionTooLarge(
++                    region.length,
++                    MAX_SHARED_MEMORY_REGION_SIZE,
++                ));
++            }
++        };
+         let config = PciBarConfiguration::new(
+             SHMEM_BAR_NUM,
+-            region
+-                .length
+-                .checked_next_power_of_two()
+-                .expect("bar too large"),
++            bar_size,
+             PciBarRegionType::Memory64BitRegion,
+             PciBarPrefetchable::Prefetchable,
+         );
+-- 
+2.55.0
+
