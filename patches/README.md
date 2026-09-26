@@ -7,8 +7,25 @@ monitor too.
 
 | Patch | Against | What it does |
 |---|---|---|
-| `hyprland/0001-lease-desktop-outputs.patch` | Hyprland 0.56.0 (`e368c13c`) | `leasable` monitor rule; Hyprland lets go of a leased monitor and takes it back when the lease ends; sends `released`; fixes to the lease protocol |
+| `hyprland/0001-lease-desktop-outputs.patch` | Hyprland `main` at `e368c13c` (0.56.0 + 203 commits, `v0.56.0-203-ge368c13c`) | `leasable` monitor rule; Hyprland lets go of a leased monitor and takes it back when the lease ends; sends `released`; fixes to the lease protocol |
+| `hyprland/0001-lease-desktop-outputs-efb5099.patch` | Hyprland 0.56.2 (`efb50993`, tag `v0.56.2`, branch `v0.56.2-b`) | the same, rebased; also parses `leasable` in the hyprlang config (`monitor = …, leasable, 1`, `monitorv2 { leasable = 1 }`) |
 | `aquamarine/0001-keep-leased-crtcs.patch` | aquamarine 0.15.1 (`f31c47a`) | stops aquamarine from reassigning, VT-restoring or restating a leased CRTC |
+| `aquamarine/0001-keep-leased-crtcs-1a10fe2.patch` | aquamarine `1a10fe26` (0.14.0 + 6), which Hyprland's flake pins at `efb50993` | the same, rebased (no code change) |
+
+Which pair to use:
+
+| Hyprland | aquamarine it is built with | patches |
+|---|---|---|
+| Hyprland flake at `efb50993` (0.56.2) | `1a10fe26` (its `flake.lock`) | `…-efb5099.patch` + `…-1a10fe2.patch` |
+| nixpkgs `hyprland` 0.56.2 | nixpkgs `aquamarine` 0.15.1 | `…-efb5099.patch` + `0001-keep-leased-crtcs.patch` |
+| Hyprland `main` at `e368c13c` | 0.15.1 | `0001-lease-desktop-outputs.patch` + `0001-keep-leased-crtcs.patch` |
+
+`e368c13c` is not 0.56.0 and not an ancestor of 0.56.2: 0.56.2 is 36 commits on the `v0.56.2-b` release
+branch from the `v0.56.0` tag, `e368c13c` 203 commits on `main` from it. `main` has since moved hyprctl
+to `src/ipc/s1`, added async commits (`CMonitor::m_commitCoordinator`, aquamarine 0.15) and dropped the
+hyprlang config; 0.56.2 has none of these, and the rebased patch is adjusted for that. On NixOS,
+`nixos/hyprland-lease.nix` applies the right pair to whichever Hyprland the config uses
+([`nixos/README.md`](nixos/README.md)).
 
 The Hyprland patch works on its own for the usual case. Without the aquamarine patch, a hotplug while a
 lease is active can hand the leased CRTC to another monitor, whose modeset then takes the display from the
@@ -22,6 +39,19 @@ hl.monitor({ output = "DP-2", mode = "preferred", position = "auto", leasable = 
 
 -- never used by Hyprland, only for the lessee
 hl.monitor({ output = "HDMI-A-1", disabled = true, leasable = true })
+```
+
+With the 0.56.2 patch the hyprlang config (`hyprland.conf`) takes it too:
+
+```ini
+monitor = DP-2, preferred, auto, 1, leasable, 1
+monitor = HDMI-A-1, disable, leasable, 1
+
+monitorv2 {
+    output = HDMI-A-1
+    disabled = 1
+    leasable = 1
+}
 ```
 
 `leasable` defaults to `false`. With no leasable monitor, Hyprland's behaviour is unchanged apart from the
@@ -45,12 +75,14 @@ or offers the connector without a modeset. `hyprctl monitors all` shows `leasabl
 ## Applying
 
 ```sh
-cd hyprland && git am ../patches/hyprland/0001-lease-desktop-outputs.patch
-cd aquamarine && git am ../patches/aquamarine/0001-keep-leased-crtcs.patch
+cd hyprland && git am ../patches/hyprland/0001-lease-desktop-outputs-efb5099.patch     # on efb50993
+cd aquamarine && git am ../patches/aquamarine/0001-keep-leased-crtcs-1a10fe2.patch     # on 1a10fe26
 ```
 
-With Nix, point Hyprland's `aquamarine` flake input at the patched tree, or add the patch to
-`aquamarine.patches` in an overlay. The aquamarine patch changes no headers, so the ABI is unchanged.
+With Nix, `nixos/hyprland-lease.nix` is a NixOS module that does both: it overrides the `aquamarine`
+argument Hyprland was built with (the Hyprland flake takes aquamarine from its own input, not from
+`pkgs`, so an overlay on `pkgs.aquamarine` would miss it) and appends the Hyprland patch. The aquamarine
+patch changes no headers, so the ABI is unchanged.
 
 # crosvm
 

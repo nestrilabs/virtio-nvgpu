@@ -294,7 +294,7 @@ the desktop keeps running. Pick a monitor you can lose, and prefer
 hl.monitor({ output = "DP-2", disabled = true, leasable = true })
 ```
 
-`hyprctl monitors all` shows `leasable: 1` for it. The launcher must see the
+`hyprctl monitors all` shows `leasable: true` for it. The launcher must see the
 session's socket. Outside the sandbox that means running from a terminal in the
 desktop. Inside the sandbox it means binding `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
 in: the sandbox's own runtime directory is a different one, and preflight will
