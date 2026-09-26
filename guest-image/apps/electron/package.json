@@ -1,0 +1,2 @@
+{ "name": "nvgpu-electron", "productName": "nvgpu-electron", "desktopName": "nvgpu-electron.desktop",
+  "version": "1.0.0", "main": "main.js" }

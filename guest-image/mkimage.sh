@@ -129,7 +129,7 @@ FLAKE="$G/flake"
 log "staging the flake at $FLAKE"
 if [ -d "$FLAKE" ]; then chmod -R u+w "$FLAKE"; rm -rf "$FLAKE"; fi
 mkdir -p "$FLAKE/nvgpu-src/scripts/verify"
-cp -a "$HERE/flake.nix" "$HERE/nix" "$HERE/tools" "$HERE/probes" "$FLAKE/"
+cp -a "$HERE/flake.nix" "$HERE/nix" "$HERE/tools" "$HERE/probes" "$HERE/apps" "$FLAKE/"
 [ -f "$HERE/flake.lock" ] && cp -a "$HERE/flake.lock" "$FLAKE/"
 # The workspace, as cargo needs to see it: every member, never a target/.
 cp -a "$REPO/Cargo.toml" "$REPO/Cargo.lock" "$FLAKE/nvgpu-src/"

@@ -40,6 +40,35 @@
       nvgpu-wl-guest =
         if nvgpuSrc == null then null else import ./nix/nvgpu-wl-guest.nix { inherit pkgs nvgpuSrc; };
 
+      cudaApps = import ./nix/cuda-apps.nix {
+        inherit pkgs;
+        src = ./apps/cuda;
+      };
+
+      appsData = import ./nix/apps-data.nix {
+        inherit pkgs;
+        appsSrc = ./apps;
+      };
+
+      blenderCuda = import ./nix/blender-cuda.nix { inherit pkgs; };
+
+      # Qt Quick's own runtime (the `qml` tool), wrapped like an app so it
+      # finds the Wayland platform plugin and QtQuick's QML modules.
+      qmlRunner = pkgs.stdenv.mkDerivation {
+        name = "nvgpu-qml";
+        dontUnpack = true;
+        nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
+        buildInputs = with pkgs.qt6; [
+          qtbase
+          qtdeclarative
+          qtwayland
+        ];
+        installPhase = ''
+          mkdir -p $out/bin
+          cp ${pkgs.qt6.qtdeclarative}/bin/qml $out/bin/nvgpu-qml
+        '';
+      };
+
       tools = import ./nix/tools.nix {
         inherit pkgs nvgpuSrc;
         toolsSrc = ./tools;
@@ -122,11 +151,31 @@
             wev # the events a client gets (apps.sh pointer)
             wl-clipboard # wl-copy, wl-paste (apps.sh clipboard)
             dbus # dbus-run-session, for the toolkits
+            # The broader application pass (apps.sh; TESTING-RIG.md has the
+            # table): games and engines, creative apps, office and toolkits,
+            # Electron, video decode and encode, and compute.
+            supertuxkart # GL, SDL2, native Wayland
+            neverball # SDL2 + GL, through Xwayland and gamescope
+            godot_4 # Vulkan (Forward+) and GL (compatibility), native Wayland
+            gimp
+            inkscape
+            krita # Qt6, OpenGL canvas
+            libreoffice-fresh # Skia (Vulkan) through Xwayland's gen VCL
+            gnome-text-editor # GTK4: GSK's ngl and vulkan renderers
+            element-desktop # Electron
+            electron
+            ffmpeg-full # NVENC, NVDEC (cuda), Vulkan Video; the test clips
+            libva-utils # vainfo
+            clinfo
+            clpeak
           ])
           ++ [
             weston-clients
             nvidia.bin # nvidia-smi
             tools
+            qmlRunner
+            blenderCuda # the GL/Vulkan UI, and Cycles on CUDA and OptiX
+            cudaApps # nvgpu-nbody
           ]
           ++ lib.optional (nvgpu-wl-guest != null) nvgpu-wl-guest;
         pathsToLink = [
@@ -156,6 +205,7 @@
           nvidiaBin = nvidia.bin;
           nvidiaOut = nvidia.driver.out;
           probes = ./probes;
+          inherit appsData;
           bash = pkgs.bashInteractive;
           coreutils = pkgs.coreutils;
           verifySrc = if nvgpuSrc == null then "" else "${nvgpuSrc}/scripts/verify";
@@ -234,6 +284,13 @@
           for t in $tools/bin/*; do ln -s "$t" opt/nvgpu/bin/; done
           ln -s $tools/lib/libnvgpu-shim.so opt/nvgpu/libnvgpu-shim.so
 
+          # What the application pass opens: test pages and clips, the Godot,
+          # QML, Electron and Blender pieces (nix/apps-data.nix).
+          ln -s $appsData opt/nvgpu/apps
+          # OpenCL's ICD loader looks here for NVIDIA's ICD.
+          mkdir -p etc/OpenCL
+          ln -s /run/opengl-driver/etc/OpenCL/vendors etc/OpenCL/vendors
+
           # The repo's verify scripts, with the helpers already built (the
           # wrappers only build when bin/<helper> is missing).
           if [ -n "$verifySrc" ]; then
@@ -252,6 +309,10 @@
           openglDriver
           tools
           weston-clients
+          appsData
+          blenderCuda
+          qmlRunner
+          cudaApps
           ;
         nvidia-userspace = nvidia.driver;
       }

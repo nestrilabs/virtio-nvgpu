@@ -1,0 +1,38 @@
+[gd_scene load_steps=7 format=3]
+
+[ext_resource type="Script" path="res://main.gd" id="1"]
+
+[sub_resource type="BoxMesh" id="mesh"]
+
+[sub_resource type="StandardMaterial3D" id="mat"]
+albedo_color = Color(0.9, 0.45, 0.1, 1)
+metallic = 0.6
+roughness = 0.3
+
+[sub_resource type="ProceduralSkyMaterial" id="skymat"]
+
+[sub_resource type="Sky" id="sky"]
+sky_material = SubResource("skymat")
+
+[sub_resource type="Environment" id="env"]
+background_mode = 2
+sky = SubResource("sky")
+ssao_enabled = true
+glow_enabled = true
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1")
+
+[node name="Cube" type="MeshInstance3D" parent="."]
+mesh = SubResource("mesh")
+material_override = SubResource("mat")
+
+[node name="Cam" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.97, 0.24, 0, -0.24, 0.97, 0, 1, 4)
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.7, 0.7, 0, -0.7, 0.7, 0, 3, 0)
+shadow_enabled = true
+
+[node name="Env" type="WorldEnvironment" parent="."]
+environment = SubResource("env")

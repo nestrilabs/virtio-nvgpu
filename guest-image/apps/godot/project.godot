@@ -1,0 +1,14 @@
+; A small Godot 4 scene for the application pass (apps.sh godot, godotgl):
+; 400 lit cubes with shadows, SSAO and glow under a procedural sky.
+config_version=5
+
+[application]
+config/name="nvgpu-godot"
+run/main_scene="res://main.tscn"
+
+[display]
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[rendering]
+renderer/rendering_method="forward_plus"

@@ -53,6 +53,9 @@ let
     paths = [
       driver.out
       eglPlatforms
+      # VA-API on NVDEC (through CUDA), for the video slots: libva looks in
+      # /run/opengl-driver/lib/dri, as NixOS's hardware.graphics.extraPackages.
+      pkgs.nvidia-vaapi-driver
     ];
     pathsToLink = [
       "/lib"

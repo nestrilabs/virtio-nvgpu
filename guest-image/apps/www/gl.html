@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>gl pending</title>
+<!-- WebGL 1 and 2, with the renderer each reports, and a video: the page's
+     title carries the verdicts (apps.sh reads it from the browser's log, the
+     host from Hyprland/sway). ?v=<clip> picks the video (default h264.mp4). -->
+<body style="background:#1d3557;color:#f1faee;font:24px sans-serif;margin:24px">
+<h2 style="margin:0 0 8px">virtio-nvgpu: WebGL and video</h2>
+<pre id=o style="font:18px monospace;margin:0 0 8px"></pre>
+<canvas id=c1 width=480 height=270></canvas>
+<canvas id=c2 width=480 height=270></canvas><br>
+<video id=v width=640 height=360 autoplay loop muted playsinline></video>
+<script>
+const o = document.getElementById('o');
+const q = new URLSearchParams(location.search);
+const clip = q.get('v') || 'h264.mp4';
+function info(kind, id) {
+  const g = document.getElementById(id).getContext(kind, {antialias: true});
+  if (!g) return [null, kind + ': off'];
+  const d = g.getExtension('WEBGL_debug_renderer_info');
+  const r = d ? g.getParameter(d.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER);
+  const v = d ? g.getParameter(d.UNMASKED_VENDOR_WEBGL) : g.getParameter(g.VENDOR);
+  return [g, kind + ': ' + v + ' / ' + r];
+}
+const [g1, s1] = info('webgl', 'c1');
+const [g2, s2] = info('webgl2', 'c2');
+let lines = [s1, s2];
+let verdict = 'webgl1=' + (g1 ? 'on' : 'off') + ' webgl2=' + (g2 ? 'on' : 'off') +
+  ' nvidia=' + (/nvidia/i.test(s1 + s2) ? 'yes' : 'no');
+const v = document.getElementById('v');
+v.src = clip;
+let vstate = 'video=pending';
+v.addEventListener('playing', () => { vstate = 'video=playing'; });
+v.addEventListener('error', () => { vstate = 'video=error' + (v.error ? v.error.code : ''); });
+const types = {'h264.mp4': 'video/mp4; codecs="avc1.640028"', 'hevc.mp4': 'video/mp4; codecs="hvc1.1.6.L120.90"',
+               'av1.mp4': 'video/mp4; codecs="av01.0.08M.08"', 'vp9.webm': 'video/webm; codecs="vp09.00.40.08"'};
+let hw = 'powerEfficient=?';
+if (navigator.mediaCapabilities && types[clip]) {
+  const [ct] = types[clip].split(';');
+  navigator.mediaCapabilities.decodingInfo({type: 'file', video: {contentType: types[clip],
+      width: 1920, height: 1080, bitrate: 8000000, framerate: 30}})
+    .then(r => { hw = 'supported=' + r.supported + ' powerEfficient=' + r.powerEfficient; })
+    .catch(e => { hw = 'decodingInfo error ' + e; });
+}
+function prog(g, gl2) {
+  const vs = (gl2 ? '#version 300 es\nin vec2 p;out vec2 u;' : 'attribute vec2 p;varying vec2 u;') +
+    'void main(){u=p;gl_Position=vec4(p,0.,1.);}';
+  const fs = (gl2 ? '#version 300 es\nprecision highp float;in vec2 u;out vec4 f;uniform float t;void main(){f=' :
+                    'precision highp float;varying vec2 u;uniform float t;void main(){gl_FragColor=') +
+    'vec4(.5+.5*sin(t+u.x*6.),.5+.5*sin(t*1.3+u.y*5.),.5+.5*sin(t*.7+(u.x+u.y)*4.),1.);}';
+  const p = g.createProgram();
+  for (const [ty, src] of [[g.VERTEX_SHADER, vs], [g.FRAGMENT_SHADER, fs]]) {
+    const s = g.createShader(ty); g.shaderSource(s, src); g.compileShader(s); g.attachShader(p, s);
+  }
+  g.bindAttribLocation(p, 0, 'p'); g.linkProgram(p); g.useProgram(p);
+  const b = g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER, b);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), g.STATIC_DRAW);
+  g.enableVertexAttribArray(0); g.vertexAttribPointer(0, 2, g.FLOAT, false, 0, 0);
+  return g.getUniformLocation(p, 't');
+}
+const u1 = g1 && prog(g1, false), u2 = g2 && prog(g2, true);
+let n = 0;
+(function f(ts) {
+  const t = (ts || 0) / 1000;
+  for (const [g, u] of [[g1, u1], [g2, u2]]) if (g) { g.uniform1f(u, t); g.drawArrays(g.TRIANGLE_STRIP, 0, 4); }
+  n++;
+  if (n % 30 === 0) {
+    const pq = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+    const vf = pq ? ' vframes=' + pq.totalVideoFrames + ' dropped=' + pq.droppedVideoFrames : '';
+    o.textContent = lines.join('\n') + '\n' + clip + ': ' + vstate + vf + ' ' + hw + '\nframes ' + n;
+    document.title = verdict + ' ' + vstate + vf + ' ' + hw + ' raf=' + n;
+    console.log('NVGPU_PAGE ' + document.title + ' | ' + lines.join(' | '));
+  }
+  requestAnimationFrame(f);
+})();
+</script>
