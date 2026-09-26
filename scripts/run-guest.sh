@@ -459,6 +459,34 @@ if [ -n "$NVIDIA_SHARE" ]; then
         export NESBOX_VIRTIOFSD=$RIG/bin/virtiofsd
     fi
 fi
+
+# ── crosvm: the host GPU's PCI address has to be free in the guest ──────────
+#
+# The guest driver gives each GPU the host's own PCI address, and it cannot
+# make a bus the VMM already has: the guest logs "cannot put the GPU at its
+# host address" and has no GPU device. crosvm's root bus is bus 0, and it puts
+# an empty hot-plug root port on the first free bus, bus 1 -- where most hosts
+# have their GPU -- unless told --no-pci-hotplug-port (patches/crosvm/0003).
+# The GPUs are the ones the backend serves: those nvidia.ko lists.
+CROSVM_NO_HP=0
+if [ "$VMM_KIND" = crosvm ]; then
+    CROSVM_HELP=$("$VMM" run --help 2>&1 || true)
+    case $CROSVM_HELP in *--no-pci-hotplug-port*) CROSVM_NO_HP=1 ;; esac
+    for g in /proc/driver/nvidia/gpus/*; do
+        [[ ${g##*/} =~ ^0000:([0-9a-fA-F]{2}): ]] || continue
+        case $((16#${BASH_REMATCH[1]})) in
+            0) die "the host GPU ${g##*/} is on PCI bus 0, crosvm's root bus in the guest:" \
+                "the guest driver cannot give it that address" ;;
+            1) [ "$CROSVM_NO_HP" = 1 ] ||
+                die "the host GPU ${g##*/} is on PCI bus 1, where $VMM puts its hot-plug" \
+                    "root port, and it has no --no-pci-hotplug-port to leave it out: build" \
+                    "it with patches/crosvm (scripts/rig-build-crosvm.sh)" ;;
+        esac
+    done
+    [ "$CROSVM_NO_HP" = 1 ] ||
+        echo "run-guest: note: $VMM has no --no-pci-hotplug-port; its hot-plug root port" \
+            "takes PCI bus 1" >&2
+fi
 mkdir -p "$LOGS"
 
 # ── The desktop shares this GPU and this memory ──────────────────────────────
@@ -845,16 +873,17 @@ if [ "$VMM_KIND" = crosvm ]; then
     # log, as nesbox has: hvc0 (virtio-console) and COM1 for earlyprintk.
     # The queue size is the backend's: crosvm offers 32768 unless told. No
     # hot-plug root port: crosvm puts it on PCI bus 1, and the guest driver
-    # gives the GPU the host's own PCI address, commonly 0000:01:00.0.
+    # gives the GPU the host's own PCI address, commonly 0000:01:00.0 (a
+    # crosvm without the option was checked above to need none).
     CONSOLE_OPTS=type=stdout,hardware=virtio-console,console
     [ "$INTERACTIVE" = 1 ] && CONSOLE_OPTS=$CONSOLE_OPTS,stdin
     VMM_ARGS=(run --cpus "$VCPUS" --mem "$MEM_MIB"
         --block "path=$DISK"
         --serial "$CONSOLE_OPTS"
         --serial "type=stdout,hardware=serial,num=1,earlycon"
-        --vhost-user "type=nvgpu,socket=$SOCK,max-queue-size=256"
-        --no-pci-hotplug-port
-        -p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
+        --vhost-user "type=nvgpu,socket=$SOCK,max-queue-size=256")
+    [ "$CROSVM_NO_HP" = 0 ] || VMM_ARGS+=(--no-pci-hotplug-port)
+    VMM_ARGS+=(-p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
     case $DISK$SOCK in *,*) die "a comma in $DISK or $SOCK would split crosvm's option" ;; esac
     if [ "$CROSVM_SANDBOX" = on ]; then
         # minijail pivots each device process into an empty directory:

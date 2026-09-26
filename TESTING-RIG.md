@@ -194,13 +194,15 @@ nested inside the headless sway
 
 ## crosvm
 
-Every Group A stage also runs under crosvm, with its sandbox on: add
+Every Group A stage but A2's `--allow-compute` half also runs under crosvm,
+with its sandbox on: add
 `--vmm crosvm` (or set `NVGPU_VMM_KIND=crosvm`). The kernel, image, probes,
 backend and logs are the same; `<tag>.json` records crosvm's command line,
 as it has no config file.
 
 ```sh
 scripts/rig-build-crosvm.sh                     # .rig/src/crosvm -> .rig/bin/crosvm
+                                                # (first time: the top of that script)
 scripts/run-guest.sh --vmm crosvm stage1 cv-s1
 scripts/run-guest.sh --vmm crosvm render cv-render
 scripts/run-guest.sh --vmm crosvm --wayland-socket "$(cat .rig/run/headless-sway.socket)" wayland cv-wl
@@ -214,6 +216,12 @@ NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 scripts/rig-app-check.sh \
 "What a VMM must do", says what each is for. It is built static and without
 crosvm's default features: no virtio-gpu, virgl, virtio-wl, audio, USB or
 network devices.
+
+The guest driver gives the GPU the host's own PCI address, so its bus must
+be free in the guest. The launcher checks before it starts anything: a host
+GPU on bus 0 (crosvm's root bus) is refused, and so is one on bus 1 when
+`.rig/bin/crosvm run --help` has no `--no-pci-hotplug-port` (patch 0003),
+as crosvm's hot-plug root port takes that bus.
 
 What crosvm's sandbox does here, unprivileged: every device crosvm emulates
 (the disk, both consoles, rng) runs as a process of its own, each in new
@@ -242,10 +250,11 @@ match them):
 | apps, as uid 1000 | 19/0/0; captures render; chrome://gpu hardware accelerated, `Sandboxed: true`, one GPU (the 5090) | all PASS |
 
 All but `secneg` ran with `-- --rm-allowlist=log` (for the app pass,
-`NVGPU_APPS_BACKEND_ARGS=--rm-allowlist=log`): on this tree the backend's
-allowlist refuses RM class `NV01_MEMORY_LOCAL_PRIVILEGED` (0x3f) on
-ALLOC_MEMORY, which the 5090's Vulkan driver allocates, so `vulkaninfo`
-fails under either VMM without it. That is the backend's, not the VMM's.
+`NVGPU_APPS_BACKEND_ARGS=--rm-allowlist=log`): the backend they ran then
+refused RM class `NV01_MEMORY_LOCAL_PRIVILEGED` (0x3f) on ALLOC_MEMORY,
+which the 5090's Vulkan driver allocates, so `vulkaninfo` failed under
+either VMM without it. That was the backend's, not the VMM's, and `6d5f0f7`
+put the class on the list: from it on, neither VMM should need the flag.
 
 Chromium needs `NVGPU_SLOT=40` to get to chrome://gpu when it runs alone;
 at 25 s its capture is still the black window it opens with, under either
@@ -272,6 +281,8 @@ would need:
 - no seccomp change as long as this stays in the main process, as the
   window's placement does; nothing for memory registered by its pages,
   which needs only the memory table crosvm already sends.
+
+## Group B: takes one monitor, desktop keeps running
 
 These stages need the **patched Hyprland as the live compositor**
 ([`patches/README.md`](patches/README.md); `.rig/hypr-build` has a build). One

@@ -110,10 +110,12 @@ trap 'kill "${KBS[@]}" $VPTR 2>/dev/null' EXIT
 CONSOLE=$RIG/logs/$TAG.console.log
 N=$(tr ',' '\n' <<<"$APPS" | wc -l)
 say "guest: apps=$APPS slot=${SLOT}s"
+# Split on whitespace only: read -a does not expand a glob in a flag's value.
+read -r -a BACKEND_ARGS <<<"${NVGPU_APPS_BACKEND_ARGS:-}"
 NVGPU_TIMEOUT=$((N * (SLOT + 10) + 90)) \
     NVGPU_CMDLINE_EXTRA="nvgpu_apps=$APPS nvgpu_slot=$SLOT ${NVGPU_APPS_EXTRA:-}" \
     "$REPO/scripts/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" \
-    -- ${NVGPU_APPS_BACKEND_ARGS:-} > "$OUT/run.log" 2>&1 &
+    -- ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"} > "$OUT/run.log" 2>&1 &
 RUN=$!
 
 declare -A host_result
