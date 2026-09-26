@@ -13,7 +13,8 @@ command.
 Every number comes from gen/uvm/<release>.json, which gen/uvm_extract.py
 measures with the compiler against that release's own uvm_ioctl.h. Ranges:
 a table runs from its release to the one before the next measured release,
-and the last to every newer host (the profile rule of gen/schema/nvkms.py).
+and the last to the newest release measured -- not to every newer host, as
+NVKMS's does: nothing has looked at a release past it.
 Measured releases whose tables are the same are one range. Unlike NVKMS's,
 these ranges are not a guess for the releases in between: `uvm_extract.py
 scan` measures every published tag and fails if one differs from the table
@@ -24,7 +25,7 @@ there because it found a change.
 import json
 from pathlib import Path
 
-from .nvkms import LAST, before, version_of
+from .nvkms import before, version_of
 
 DATA = Path(__file__).resolve().parent.parent / 'uvm'
 FORMAT = 'virtio-nvgpu/uvm-params/1'
@@ -75,7 +76,8 @@ def load():
 
 def tables():
     out = []
-    for d in load():
+    releases = load()
+    for d in releases:
         cmds = sorted(d['commands'], key=lambda c: c['cmd'])
         mask = d['init_flags_mask']
         if out and out[-1].commands == cmds and out[-1].init_flags_mask == mask:
@@ -84,7 +86,11 @@ def tables():
                             version_of(d['driver_version']), None, cmds, mask))
     for t, nxt in zip(out, out[1:]):
         t.vmax = before(nxt.vmin)
-    out[-1].vmax = LAST
+    # The last table ends at the newest release measured, not at every newer
+    # one: a release published after it may change a block (590.44.01 did),
+    # and nothing has scanned it. A host past it has no UVM table on either
+    # side, so compute is refused there until it is measured.
+    out[-1].vmax = version_of(releases[-1]['driver_version'])
     return out
 
 

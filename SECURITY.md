@@ -470,7 +470,7 @@ removed, since nothing can say whether RM took it.
 |---|---|---|
 | identity | whoever started it. The shipped `scripts/run-guest.sh` ran it as root, which makes every guest process an RM administrator: all of BAR0 mappable read-write, the register allowlist skipped, and DRM files authenticated. | Refuses to start with euid 0 or CAP_SYS_ADMIN unless `--allow-root-unsafe`. The launcher, as root, gives each VM a slot of a user pool: the backend runs through `setpriv` as `nvgpu-vmN`, in the groups video, render and kvm, with no capabilities and no_new_privs, and the VMM under nesbox's jailer as `nvgpu-vmmN` (below, "One uid per VM"). With `--wayland-socket` the backend runs as the socket's owner (the desktop user), and with `--wayland-export` as the owner of the export socket's directory. Unprivileged (the rig), both are the invoking user. |
 | capabilities | whatever it was given | All dropped before the first thread exists (effective, permitted, inheritable, ambient, and the bounding set where it may), then no_new_privs, undumpable, umask 077. This holds under `--allow-root-unsafe` too, and RM decides administrator by `capable(CAP_SYS_ADMIN)` (`nv-linux.h`), so even then RM sees none. What root keeps is file access by uid. |
-| sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED`; `--sandbox=off` is for diagnosis. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
+| sandbox | none | Before the first guest message and its second thread (`device/src/sandbox.rs`, below): a network namespace of its own; Landlock to the GPU's nodes, `/proc/driver/nvidia`, `/proc/self` and the GPUs' sysfs, read-only but for the nodes, plus the compositor's and its own export socket; a seccomp allowlist of 84 syscalls, 13 with arguments checked, anything else stopping the process; RLIMIT_CORE 0. Each layer the kernel lacks is logged `sandbox: DEGRADED` and stops the start; `--sandbox=best-effort` and `--sandbox=off` are diagnostic flags. No cgroup of its own. RLIMIT_NOFILE is raised to its hard limit at start. The host RM must keep a client to the file it was made on: the backend asks it at start, and refuses to run on one that does not (§11, R3) |
 
 ### Threads and resource caps
 
@@ -502,7 +502,8 @@ listener, the export listener, the uevent socket, and RLIMIT_NOFILE raised.
 | limits | RLIMIT_CORE 0 over undumpable and no_new_privs | -- |
 
 Each start logs one line per layer, `sandbox: DEGRADED: ...` at warning level
-for one not fully in force, and `sandbox: every layer in force` when all are;
+for one not fully in force (and then, with `--sandbox=on`, refuses to start),
+and `sandbox: every layer in force` when all are;
 the unit tests (`sandbox::tests`) fork children that apply the filter, the
 Landlock domain and the whole sandbox, check that the backend's own
 operations still work under them, and that a forbidden call, a process
@@ -1414,8 +1415,8 @@ descriptor field, and an OwnedFd made of a number the kernel did not write.
 sources): a pointer field they miss reaches the host as the guest's bytes,
 exactly as before. Data rewrites are still edits of the host's copy -- the
 coherency attributes (`rmmem.rs`, on a copy before it is built), NVKMS
-policy (`nvkms.rs`), fence waits (`fence::before`), SYS_PARAMS' and
-CHECK_VERSION_STR's command byte -- only unable to reach a declared field.
+policy (`nvkms.rs`), fence waits (`fence::before`) -- only unable to reach a
+declared field. (SYS_PARAMS' and CHECK_VERSION_STR's rewrites are gone, §17.)
 RM's top-level blocks are field offsets (`Plan`), not typed structs. Both
 are roadmap item 9. The raw-descriptor helpers (`read_raw`, `fstat`, ...)
 take numbers: a wrong one is EBADF or another of the backend's own files,
@@ -1513,3 +1514,146 @@ there collides: the guest driver now fails cleanly and names the bridge in
 the way, and `run-guest.sh` refuses a crosvm whose buses would hold the
 address.
 
+
+## 17. The 2026-09-26 review
+
+### Fail closed, and production hardening
+
+**Unmeasured driver releases.** A host release above the newest one
+measured silently ran on the newest release's tables (RM allowlist, ABI
+profile, NVKMS schema, and a UVM table open-ended at 999.999.999), and one
+below the oldest on the oldest's allowlist with no ABI profile, forwarding
+RM escapes unchecked. 580 is the precedent for why that matters: it added
+pointers to two controls the older list let through. Now the backend refuses
+to start unless every table was measured at the host's release
+(`device/src/release.rs`): its own RM allowlist and NVKMS schema, a UVM
+table whose range holds it (the last range now ends at the newest release
+measured, in both the backend's and the guest's copy), and an ABI profile no
+newer than `MEASURED_THROUGH` (`gen/src/versions/mod.rs`; 615.71.09, on
+gVisor's lineage, the A2000 capture, and every measured release's RM escape
+blocks). A version that does not parse is fatal. The tables chosen are named
+on one warning line at every start. `--allow-unmeasured-release` (a
+diagnostic flag) runs a newer or in-between host on the nearest older
+tables, without compute (no UVM table on either side); a host older than
+every release is refused regardless, and inside the backend it gets an
+empty RM allowlist and every RM escape refused. The rig's 595.99.02 is
+measured by all four.
+
+**Start-up fails closed.** Three conditions the backend used to log and run
+through now stop it. A sandbox layer the kernel lacks, or has only in part
+(`sandbox: DEGRADED`), with `--sandbox=on`, the default; the new
+`--sandbox=best-effort` runs with what the kernel has, and it and
+`--sandbox=off` are diagnostic flags. An error asking the host's RM whether it
+keeps clients to their file (`probe_strict_clients`; R3): only an answer of
+yes lets it start. And the seccomp filter is installed with
+`SECCOMP_FILTER_FLAG_TSYNC`, while `sandbox::apply` installs nothing at all
+when the process already has a second thread (or its thread count cannot be
+read): Landlock and the user namespace reach only the calling thread, so a
+thread made before them would have been outside both. Tests: a two-thread
+child gets no layer; a thread made before the filter is stopped by it.
+
+**The release profile.** There was none: a panic unwound one thread, so a
+vring worker's panic stalled its queue and the VM with it, a lock held
+across it was poisoned for the rest, and an executor job left its file
+mid-call. The workspace's `[profile.release]` is now `panic = "abort"`,
+`overflow-checks = true`, thin LTO, one codegen unit, line tables only.
+Nothing outside tests catches an unwind. What `abort()` does -- block
+signals, `tgkill` its own thread with SIGABRT, reset a handler that caught
+it -- is on the seccomp list, and a test panics a filtered child the way a
+release build does (from the main thread and a worker) and sees SIGABRT, not
+the 159 of a violation. The fuzz workspaces have profiles of their own and
+are unchanged; the difftest runs under the new profile (`cargo test
+--release`).
+
+**Diagnostic flags.** `--allow-root-unsafe`, `--proc-nvidia`,
+`--permissive-abi`, `--keep-guest-coherency`, `--rm-allowlist=log`,
+`--sandbox=best-effort|off` and `--allow-unmeasured-release` each take a
+protection away. They are hidden from `--help` (shown with `--diagnostic
+--help`), the backend refuses to start with any of them unless
+`--diagnostic` or `NVGPU_DIAGNOSTIC=1` is given too, and each in effect is
+announced as `DIAGNOSTIC: <flag>: <what it takes away>` on stderr, whatever
+the log level, and in the log. `scripts/run-guest.sh` adds `--diagnostic`
+only when one of them reached the backend's arguments (after `--`, or from
+`NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`).
+
+**What the log holds.** The raw dumps are gone: the CARD_INFO reply (BAR
+physical addresses), SYS_PARAMS, RM_CONTROL and RM_ALLOC replies (whose
+`&param_buf[4..]` also panicked on a block shorter than 4), MAP/UNMAP_DMA and
+VID_HEAP_CONTROL replies, all at info, and the 64 parameter bytes of every
+control RM refused, at warning (host addresses, and a guest's data, in the
+host's log). A refused control is now its command and status, at debug.
+The per-call info lines a guest can drive (UVM and window placements,
+read-only mappings, OPEN_KMS, SHM restores) are debug; the RM allowlist's
+teardown report of what it refused is a warning. The default level is
+`warn`, so the start-up lines worth reading (the tables chosen, the sandbox
+layers not in force, the diagnostic flags) are what a production log holds.
+The rate limit (`device/src/ratelimit.rs`) already said how many lines a
+site dropped when its next line went out; a site that went quiet after its
+burst now says so at teardown too.
+
+**SYS_PARAMS and CHECK_VERSION_STR go as sent.** `NV_ESC_SYS_PARAMS` is
+`{NvU64 memblock_size}`: nvidia.ko keeps the first caller's value (on the
+control device, so host-wide) and answers EBUSY to any other
+(`kernel-open/nvidia/nv.c`). On EBUSY the backend wrote 2 into the value's
+low byte, called again, and on a second EBUSY answered the guest success
+with zeroed parameters; now the host's answer, EBUSY included, is the
+guest's. What remains: a guest whose SYS_PARAMS is the first on the host
+after the driver loads sets that host-wide value. RM uses it only to online
+GPU memory as NUMA on coherent platforms, which this project does not
+support; on a PCIe GPU it changes nothing.
+
+`NV_ESC_CHECK_VERSION_STR` (`nv_ioctl_rm_api_version_t {cmd, reply,
+versionString[64]}`) had its command rewritten to `'2'`, query mode, "based
+on gVisor nvproxy". In query mode RM copies out its own version and returns
+success without comparing (`RmPerformVersionCheck`, `osapi.c`); in the
+strict (`0`) and relaxed (`'1'`) modes userspace sends, it fails a caller
+whose version is not its own. The rewrite was not needed -- gVisor queries
+the host's version once for itself, and the backend reads it from
+`/proc/driver/nvidia/version` -- and what it did was let a guest userspace
+of another release run against this RM, with its structures sized for the
+other release. Userspace must match the host's module, as natively
+(`nvgpu-userspace` stages the host's own); a mismatch now fails in the
+guest as RM's API-mismatch error, with RM's usual `NVRM: API mismatch`
+line (the backend's process name) in the host's kernel log. Test:
+`sys_params_and_check_version_go_as_sent_and_come_back_as_answered`.
+
+**Test binaries.** `test-harness` served a backend on a socket with no
+sandbox and no posture checks, removing whatever was at its socket path
+first (default `/tmp/nv-vhost.sock`); it was built by every `cargo build
+-p device`. It is now built only with `--features test-bins` (which also
+brings in tokio and tracing, no longer dependencies of the backend), and
+clears its path only if it holds this user's socket
+(`posture::clear_socket_path`). `test-client`, which carried its own stale
+copy of the protocol, is deleted. `nvgpu-userspace --stage DIR` ran
+`remove_dir_all(DIR)` on whatever it was given; it now clears only a
+directory that is empty or holds the marker it writes into every share it
+stages, never through a symlink.
+
+**The generators fail closed.** `rmctrl_extract.py` left out, silently, a
+control RM's pointer tables name whose command macro the release's headers
+do not define; a control left out is one whose pointer reaches RM as the
+guest's bytes. Now any such name stops the extraction unless it is in
+`UNDEFINED_IN_HEADERS` with its reason (one: `NV0000_CTRL_CMD_OS_GET_CAPS`,
+whose case RM itself compiles only if the macro exists). `nvabi_gen.py`
+wrote `param_size: None` -- no size check -- for an escape whose struct it
+could not lay out; that, and a fixed-size escape with no struct, now stop
+it (only nvproxy's byte-copied escapes are variable length). Nothing ran the
+extractors' `check` modes; `scripts/gen-check.sh` runs all of them, the UVM
+tag scan (whose comparison had rotted: it no longer ran), the schema render,
+and with `GVISOR=` the ABI profiles, against the sources over the network.
+On 2026-09-26 every table matched, and gVisor master regenerates the three
+profiles unchanged.
+
+**Dead code and lint.** What bypassed a check and nothing called is gone:
+`xfer::Prepared::finish` adopted host descriptors without asking whether the
+number was already the backend's and without closing consumed handles (the
+backend always used `finish_with`). The constructors that make policy state
+with no owner -- `semsurf`'s `render_opened`/`client_allocated`,
+`BackendHooks::new`/`shared`/`Default` -- are test-only, so production code
+cannot build hooks sharing no state with the backend. The RM allowlist's
+NVOS21 branch for RM_ALLOC is gone (every profile admits only NVOS64; a
+32-byte block is refused as too short), with dead constants, an unused test
+helper and orphaned doc comments. `cargo clippy --all-targets` is clean
+outside the Wayland files (another branch) and hostfd, nvkms, osdesc,
+semsurf, xfer and one site of nvidia.rs's `map_unrecorded`, which a
+concurrent isolation branch is rewriting.

@@ -157,8 +157,10 @@ Before the first guest message the backend sandboxes itself
 ([`device/src/sandbox.rs`](device/src/sandbox.rs)): a network namespace of its
 own, Landlock confining it to the GPU's nodes and the few files it reads, and a
 seccomp syscall allowlist that kills on anything else. A layer the host kernel
-lacks is logged as `sandbox: DEGRADED`; `--sandbox=off` (or
-`NVGPU_SANDBOX=off` for the launcher) is for diagnosis only.
+lacks is logged as `sandbox: DEGRADED` and stops the start;
+`--sandbox=best-effort` runs without it and `--sandbox=off` (or
+`NVGPU_SANDBOX=off` for the launcher) without any, both diagnostic flags
+(`--diagnostic`).
 [SECURITY.md](SECURITY.md) §4 has what each layer and the per-VM uid do and do
 not stop.
 

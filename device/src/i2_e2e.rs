@@ -307,8 +307,10 @@ impl Guest {
                 let sum: u64 = if src >= 0 {
                     self.bufs[src as usize]
                         .k
-                        .chunks_exact(4)
-                        .map(|c| u64::from(u32::from_le_bytes(c.try_into().unwrap())))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&c| u64::from(u32::from_le_bytes(c)))
                         .sum()
                 } else {
                     0

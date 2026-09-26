@@ -165,6 +165,9 @@ fn clock_ns(clock: libc::clockid_t) -> u64 {
 }
 
 /// What serving one request produced.
+// One per request, moved once and never held in bulk: boxing the large arm
+// would only add an allocation to every call.
+#[allow(clippy::large_enum_variant)]
 pub enum Outcome {
     /// The response, now.
     Reply(Reply),
@@ -178,6 +181,8 @@ pub enum Outcome {
 /// (see [`KmsCall`]).
 pub struct PendingIoctl2(Pending);
 
+// As `Outcome`: one per call in flight.
+#[allow(clippy::large_enum_variant)]
 enum Pending {
     Ioctl2(Ioctl2Call),
     Kms(KmsCall),
@@ -419,10 +424,10 @@ impl xfer::Finisher for BackendFinisher<'_> {
             return (0, HandleKind::Other);
         }
         let kind = hostfd::classify(fd.as_fd(), self.cards);
-        if kind.is_kms() {
-            if let Err(e) = hostfd::set_nonblock(fd.as_raw_fd()) {
-                log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
-            }
+        if kind.is_kms()
+            && let Err(e) = hostfd::set_nonblock(fd.as_raw_fd())
+        {
+            log::warn!("IOCTL2: cannot make an adopted DRM file non-blocking: {e}");
         }
         match self.backend.handles.insert_for(fd, kind, self.owner) {
             Ok(h) => {
@@ -909,11 +914,11 @@ impl NvidiaBackend {
         // import in this file gets it back: no watch may join a wait on the
         // old syncobj from here on (fence.rs, `Registrations::orphan`; S-13).
         // drm_syncobj_destroy.handle @0.
-        if prepared.name() == "SYNCOBJ_DESTROY" {
-            if let Some(a) = prepared.buffer(0).filter(|a| a.len() >= 4) {
-                let handle = u32::from_le_bytes(a[..4].try_into().unwrap());
-                self.syncobj_regs.orphan(target, handle);
-            }
+        if prepared.name() == "SYNCOBJ_DESTROY"
+            && let Some(a) = prepared.buffer(0).filter(|a| a.len() >= 4)
+        {
+            let handle = u32::from_le_bytes(a[..4].try_into().unwrap());
+            self.syncobj_regs.orphan(target, handle);
         }
         let executor = prepared.wants_executor() || class != SchemaClass::Render;
         Ok(PendingIoctl2(Pending::Ioctl2(Ioctl2Call {
@@ -1016,7 +1021,7 @@ impl NvidiaBackend {
                 }
                 Some(Ok(fd)) => match self.insert(fd, HandleKind::DrmCard(card)) {
                     Ok(h) => {
-                        log::info!("OPEN_KMS: {path} -> handle {h}");
+                        log::debug!("OPEN_KMS: {path} -> handle {h}");
                         (h as u64, vec![h])
                     }
                     Err(e) => return self.error_reply(e),

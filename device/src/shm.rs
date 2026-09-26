@@ -102,34 +102,34 @@ impl Zone {
         }
 
         // Overlap with an existing free extent means this was freed already.
-        if let Some((&ps, &pl)) = self.free.range(..=start).next_back() {
-            if ps + pl > start {
-                return false;
-            }
+        if let Some((&ps, &pl)) = self.free.range(..=start).next_back()
+            && ps + pl > start
+        {
+            return false;
         }
-        if let Some((&ns, _)) = self.free.range(start..).next() {
-            if start + want > ns {
-                return false;
-            }
+        if let Some((&ns, _)) = self.free.range(start..).next()
+            && start + want > ns
+        {
+            return false;
         }
 
         let mut s = start;
         let mut l = want;
 
         // Coalesce with the extent below, if it ends exactly here.
-        if let Some((&ps, &pl)) = self.free.range(..s).next_back() {
-            if ps + pl == s {
-                self.free.remove(&ps);
-                s = ps;
-                l += pl;
-            }
+        if let Some((&ps, &pl)) = self.free.range(..s).next_back()
+            && ps + pl == s
+        {
+            self.free.remove(&ps);
+            s = ps;
+            l += pl;
         }
         // Coalesce with the extent above, if it starts exactly at our end.
-        if let Some((&ns, &nl)) = self.free.range(s + l..).next() {
-            if s + l == ns {
-                self.free.remove(&ns);
-                l += nl;
-            }
+        if let Some((&ns, &nl)) = self.free.range(s + l..).next()
+            && s + l == ns
+        {
+            self.free.remove(&ns);
+            l += nl;
         }
 
         self.free.insert(s, l);
@@ -279,18 +279,18 @@ impl ShmAllocator {
 
         let want = align_up(length, PAGE_SIZE);
         let in_use = zone.size - zone.free_bytes();
-        if let Err(why) = zone.held.admits(&zone.share, owner, want, in_use, zone.size) {
-            if why != crate::quota::Over::Pool {
-                return Err(DeviceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    format!(
-                        "SHM {pgprot:?} zone: guest process {owner:?} holds {:#x} of {:#x} \
-                         bytes and may not take {want:#x} more ({why:?})",
-                        zone.held.held(owner),
-                        zone.size
-                    ),
-                )));
-            }
+        if let Err(why) = zone.held.admits(&zone.share, owner, want, in_use, zone.size)
+            && why != crate::quota::Over::Pool
+        {
+            return Err(DeviceError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "SHM {pgprot:?} zone: guest process {owner:?} holds {:#x} of {:#x} \
+                     bytes and may not take {want:#x} more ({why:?})",
+                    zone.held.held(owner),
+                    zone.size
+                ),
+            )));
         }
         match zone.alloc(length) {
             Some(offset) => {
@@ -407,7 +407,7 @@ impl ShmAllocator {
             );
             DeviceError::Io(err)
         })?;
-        log::info!(
+        log::debug!(
             "SHM unmap_host_fd: restored backing at offset=0x{:x} len=0x{:x}",
             offset,
             length

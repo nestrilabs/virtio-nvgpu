@@ -324,7 +324,10 @@ fn start_sway(dir: &Path) -> (Kill, PathBuf) {
     let cfg = dir.join("sway.cfg");
     std::fs::write(&cfg, "output HEADLESS-1 resolution 800x600\n").unwrap();
     let log = std::fs::File::create(dir.join("sway.log")).unwrap();
-    let child = Command::new(tool("sway"))
+    // Held from here, so a sway that never comes up is killed and reaped
+    // when the assertion below fails too.
+    let child = Kill(
+        Command::new(tool("sway"))
         .arg("-c")
         .arg(&cfg)
         .env("XDG_RUNTIME_DIR", dir)
@@ -336,7 +339,8 @@ fn start_sway(dir: &Path) -> (Kill, PathBuf) {
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()
-        .unwrap();
+        .unwrap(),
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let found = std::fs::read_dir(dir)
@@ -348,7 +352,7 @@ fn start_sway(dir: &Path) -> (Kill, PathBuf) {
                 n.starts_with("wayland-") && !n.ends_with(".lock")
             });
         if let Some(p) = found {
-            return (Kill(child), p);
+            return (child, p);
         }
         assert!(
             Instant::now() < deadline,

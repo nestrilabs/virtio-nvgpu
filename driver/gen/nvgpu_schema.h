@@ -2122,7 +2122,7 @@ static const struct nvgpu_uvm_table nvgpu_uvm_tables[] = {
    .cmds = nvgpu_uvm_v580_65_06, .ncmds = ARRAY_SIZE(nvgpu_uvm_v580_65_06)},
   {.name = "v590_44_01", .vmin = NVGPU_SCHEMA_VERSION(590, 44, 1), .vmax = NVGPU_SCHEMA_VERSION(610, 43, 1),
    .cmds = nvgpu_uvm_v590_44_01, .ncmds = ARRAY_SIZE(nvgpu_uvm_v590_44_01)},
-  {.name = "v610_43_02", .vmin = NVGPU_SCHEMA_VERSION(610, 43, 2), .vmax = NVGPU_SCHEMA_VERSION(999, 999, 999),
+  {.name = "v610_43_02", .vmin = NVGPU_SCHEMA_VERSION(610, 43, 2), .vmax = NVGPU_SCHEMA_VERSION(615, 71, 9),
    .cmds = nvgpu_uvm_v610_43_02, .ncmds = ARRAY_SIZE(nvgpu_uvm_v610_43_02)},
 };
 

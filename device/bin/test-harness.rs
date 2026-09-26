@@ -44,8 +44,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("mock mode: GPU ioctls will fail with EBADF");
     }
 
-    // Remove stale socket file.
-    let _ = std::fs::remove_file(&args.socket_path);
+    // A stale socket of ours goes; anything else at the path is refused.
+    device::posture::clear_socket_path(
+        std::path::Path::new(&args.socket_path),
+        device::sys::proc::euid(),
+    )?;
     let listener = UnixListener::bind(&args.socket_path)
         .unwrap_or_else(|e| panic!("bind {:?}: {}", args.socket_path, e));
 

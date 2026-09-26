@@ -584,7 +584,12 @@ The launcher also takes the Wayland limits, for the stages that push them:
 Anything else goes to the backend after `--`, e.g. the diagnostic flags:
 `--permissive-abi` (forward unchecked ioctls, loudly — for finding what a
 workload needs, never for running one), `--keep-guest-coherency` (caching
-stage), `--proc-nvidia PATH` (test against a fixture tree):
+stage), `--proc-nvidia PATH` (test against a fixture tree). The backend
+refuses each of these, and `--rm-allowlist=log`, `--sandbox=off|best-effort`,
+`--allow-root-unsafe` and `--allow-unmeasured-release`, unless `--diagnostic`
+is given too (they are hidden from its `--help` without it); the launcher adds
+`--diagnostic` when one is passed, or asked for by `NVGPU_SANDBOX=off` or
+`NVGPU_ALLOW_ROOT_UNSAFE=1`:
 
 ```sh
 sudo scripts/run-guest.sh --kms-card probeQ.sh kms1 -- --keep-guest-coherency

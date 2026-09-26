@@ -2096,7 +2096,7 @@ pub static UVM_TABLES: &[UvmTable] = &[
     },
     UvmTable {
         name: "v610_43_02",
-        versions: (DriverVersion::new(610, 43, 2), DriverVersion::new(999, 999, 999)),
+        versions: (DriverVersion::new(610, 43, 2), DriverVersion::new(615, 71, 9)),
         init_flags_mask: 0x7,
         cmds: &[
             UvmCmd { name: "REGISTER_GPU_VASPACE", cmd: 0x00000019, size: 32, fd: Some(UvmFd { offset: 16, of: UvmFdOf::RmCtl }) },

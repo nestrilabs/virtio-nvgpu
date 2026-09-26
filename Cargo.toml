@@ -20,3 +20,16 @@ edition = "2024"
 protocol = { path = "protocol" }
 abi      = { path = "gen" }
 wlwire   = { path = "wlwire" }
+
+# What ships. A panic stops the process rather than one thread: a vring
+# worker that unwound would leave its queue unserved and the VM stalled, a
+# thread holding one of the backend's locks would poison it for the rest, and
+# an executor job would leave its file mid-call (device::exec). The seccomp
+# list permits what abort() does (device::sandbox tests). Arithmetic that
+# overflows is a panic here too, as it is in the tests.
+[profile.release]
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

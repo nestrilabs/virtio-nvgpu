@@ -28,16 +28,16 @@ use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
 
 const MAX_GPU: u8 = 8;
 
-/// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
-///
-/// `status` is the one that matters and the one that is easy to miss: it is
-/// written by RM on the way out and is independent of the ioctl return value.
 /// The floor a second-level buffer is sized to, whatever length the guest
 /// derived for it. See where it is used: the length is read at a table-supplied
 /// offset, the table was generated from a different driver release, and the
 /// cost of it being wrong must not be heap corruption in this process.
 const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
+// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
+//
+// `status` is the one that matters and the one that is easy to miss: it is
+// written by RM on the way out and is independent of the ioctl return value.
 const NVOS54_CMD: usize = 8;
 const NVOS54_PARAMS_SIZE: usize = 24;
 const NVOS54_STATUS: usize = 28;
@@ -1184,7 +1184,6 @@ impl NvidiaBackend {
         self.guest_ram = ram;
     }
 
-    /// How many host descriptors the guest currently holds open.
     /// Whether a placer is attached (the transport's request channel is up).
     pub(crate) fn has_window(&self) -> bool {
         self.window.is_some()
@@ -1412,13 +1411,13 @@ impl NvidiaBackend {
         // Emptied rather than unmapped: a hole would leave the memory slot
         // covering a range that reaches no mapping at all, and a stray access
         // there faults the VMM rather than the guest.
-        if let Some(window) = self.window.as_ref() {
-            if let Err(e) = window.withdraw(region.offset, length) {
-                log::warn!(
-                    "{why}: the window would not give back {:#x}+{length:#x}: {e}",
-                    region.offset
-                );
-            }
+        if let Some(window) = self.window.as_ref()
+            && let Err(e) = window.withdraw(region.offset, length)
+        {
+            log::warn!(
+                "{why}: the window would not give back {:#x}+{length:#x}: {e}",
+                region.offset
+            );
         }
         if let Err(e) = self.shm.free(region) {
             log::warn!("{why}: freeing window region {:#x}: {e}", region.offset);
@@ -1652,11 +1651,11 @@ impl NvidiaBackend {
             }
         };
 
-        if kind == HandleKind::Dev(DeviceKind::Modeset) {
-            if let Some(why) = self.modeset_open_refused(self.current_owner) {
-                log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
-                return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
-            }
+        if kind == HandleKind::Dev(DeviceKind::Modeset)
+            && let Some(why) = self.modeset_open_refused(self.current_owner)
+        {
+            log::warn!("OPEN of /dev/nvidia-modeset refused: {why}");
+            return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::EMFILE);
         }
         let nodes = self.host_nodes();
         let path = match device_path_with(req.device_type, &nodes.dri) {
@@ -1885,7 +1884,7 @@ impl NvidiaBackend {
         let plan = match self.uvm_maps.plan_mmap(handle, base, len, req.prot) {
             Ok(p) => p,
             Err(errno) => {
-                log::info!(
+                log::debug!(
                     "mmap of UVM handle {handle} at {base:#x}+{len:#x} (prot {}) refused: {}",
                     req.prot,
                     std::io::Error::from_raw_os_error(errno)
@@ -1915,7 +1914,7 @@ impl NvidiaBackend {
                     return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
                 }
                 self.uvm_maps.commit(handle, base, aperture_off, id);
-                log::info!(
+                log::debug!(
                     "mmap of UVM handle {handle}: pool {base:#x}+{len:#x} at aperture \
                      {aperture_off:#x}, id {id}"
                 );
@@ -2155,7 +2154,7 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
         }
 
-        log::info!(
+        log::debug!(
             "mmap on handle {handle}: placed {length:#x} bytes at window offset {:#x} \
              with no arming recorded here",
             region.offset
@@ -2264,10 +2263,10 @@ impl NvidiaBackend {
             .live_maps
             .remove(&req.mapping_id)
             .expect("looked up above");
-        if let Some(key) = live.key {
-            if self.dri_maps.get(&key) == Some(&req.mapping_id) {
-                self.dri_maps.remove(&key);
-            }
+        if let Some(key) = live.key
+            && self.dri_maps.get(&key) == Some(&req.mapping_id)
+        {
+            self.dri_maps.remove(&key);
         }
         self.release_extent(&live.region, live.length, "munmap");
         log::debug!(
@@ -2467,10 +2466,16 @@ impl NvidiaBackend {
     /// NVKMS schema exists for this host (`BCAP_NVKMS_TABLE`) -- which the
     /// guest uses to pick its own NVKMS table -- and lets a modeset IOCTL2
     /// find its table before the guest's first CHECK_VERSION_STR.
+    ///
+    /// The transport refuses to start on a version that does not parse, or
+    /// one the tables were not measured at (`crate::release`), before this.
     pub fn set_host_driver_version(&mut self, text: &str) {
         match abi::version::DriverVersion::parse(text) {
             Some(v) => self.set_driver_version(v),
-            None => log::warn!("host driver version {text:?} does not parse; no NVKMS schema"),
+            None => log::error!(
+                "host driver version {text:?} does not parse; no NVKMS schema, and no RM \
+                 escape passes the ABI check"
+            ),
         }
     }
 
@@ -2481,11 +2486,25 @@ impl NvidiaBackend {
         self.config.nvkms_table = crate::schema::modeset_table(v).is_some();
         self.abi = abi::versions::table_for(v);
         match self.abi {
-            Some(t) => log::info!("host driver {v}: ABI profile selected, {} escapes", t.len()),
-            None => log::warn!(
-                "host driver {v} is older than every ABI profile; ioctls will be \
-                 forwarded without size checking"
+            Some(t) => log::debug!("host driver {v}: ABI profile selected, {} escapes", t.len()),
+            None => log::error!(
+                "host driver {v} has no measured ABI profile; every RM escape is refused"
             ),
+        }
+    }
+
+    /// `--allow-unmeasured-release`: a host newer than the ABI profiles were
+    /// measured through is size-checked against the nearest older profile,
+    /// rather than refused outright. After `set_host_driver_version`.
+    pub fn allow_unmeasured_release(&mut self) {
+        if let (Some(v), None) = (self.driver, self.abi) {
+            self.abi = abi::versions::nearest_table_for(v);
+            if self.abi.is_some() {
+                log::warn!(
+                    "host driver {v}: ABI profile of {} (nearest older, unmeasured at {v})",
+                    abi::versions::nearest_profile_version(v).expect("a table has a version")
+                );
+            }
         }
     }
 
@@ -2863,25 +2882,31 @@ impl NvidiaBackend {
         }
 
         // Only NVIDIA's own magic is described by the ABI tables.
+        let host = self
+            .driver
+            .map_or_else(|| "(unknown)".to_string(), |v| v.to_string());
         let refuse = match self.check_abi(escape, ireq.data_len) {
             AbiCheck::SizeMismatch { expected, actual } => {
                 log::warn!(
-                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {} expects \
-                     {expected}",
-                    self.driver.expect("a profile implies a known version")
+                    "escape {escape:#04x}: guest sent {actual} bytes, host driver {host} expects \
+                     {expected}"
                 );
                 true
             }
             AbiCheck::UnknownEscape => {
-                log::warn!(
-                    "escape {escape:#04x} is not in the ABI profile for host driver {}",
-                    self.driver.expect("a profile implies a known version")
-                );
+                log::warn!("escape {escape:#04x} is not in the ABI profile for host driver {host}");
                 true
             }
-            // No profile yet means CHECK_VERSION_STR has not been answered,
-            // which is itself one of the first ioctls a client sends. Refusing
-            // here would refuse the call that makes checking possible at all.
+            // A known host with no profile: one no table was measured at,
+            // which the transport refuses to start on (crate::release). Its
+            // layouts are nobody's to guess.
+            AbiCheck::NoProfile if self.driver.is_some() => {
+                log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
+                true
+            }
+            // No version at all: only a backend built without the transport
+            // (the transport reads it from the driver before any guest
+            // calls), where the guest's CHECK_VERSION_STR teaches it.
             AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
         };
         if refuse {
@@ -3118,17 +3143,6 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
-                if _other == 0x5E {
-                    log::warn!("0x5E hit DEFAULT arm instead of dedicated handler!");
-                }
-                if _other == 0x00 {
-                    log::debug!(
-                        "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
-                        self.current_handle,
-                        request,
-                        &param_in[..std::cmp::min(param_in.len(), 16)]
-                    );
-                }
                 let n = self.dispatch_simple(cookie, host_fd, request, param_in, &plan, resp_buf);
                 // RM_FREE of a client: no longer one 0x54 may name.
                 self.semsurf_track_rm(escape, self.current_handle, param_in, resp_buf, n);
@@ -3574,25 +3588,12 @@ impl NvidiaBackend {
             let cmd = word(outer, NVOS54_CMD);
             let params_size = word(outer, NVOS54_PARAMS_SIZE);
             let status = word(outer, NVOS54_STATUS);
-            if status == NV_OK {
-                log::debug!("RM_CONTROL cmd=0x{cmd:08x} paramsSize={params_size} -> NV_OK");
-            } else {
-                // A refusal tells us nothing on its own; the argument RM
-                // objected to is in the params. Show the head of them.
-                let head: Vec<String> = a
-                    .bytes(nb)
-                    .iter()
-                    .take(64)
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                log::warn!(
-                    "RM_CONTROL cmd=0x{:08x} paramsSize={} -> status=0x{:08x}\n  params[0..64]: {}",
-                    cmd,
-                    params_size,
-                    status,
-                    head.join(" ")
-                );
-            }
+            // RM refusing a control is routine (userspace probes), and its
+            // parameters may hold host addresses and the guest's data: the
+            // command and status only, at debug.
+            log::debug!(
+                "RM_CONTROL cmd=0x{cmd:08x} paramsSize={params_size} -> status=0x{status:08x}"
+            );
         }
         if escape == 0x2b && param_in.len() >= 48 {
             log::debug!(
@@ -4124,14 +4125,6 @@ impl NvidiaBackend {
             param_in.len()
         );
 
-        // Debug logging for Vulkan-critical ioctls
-        let log_response = escape == 0xd2  // NV_ESC_CHECK_VERSION_STR
-            || escape == 0xc8  // NV_ESC_CARD_INFO
-            || escape == 0xd6  // NV_ESC_SYS_PARAMS
-            || escape == 0xd7  // NV_ESC_QUERY_DEVICE_INTR
-            || escape == 0x2b // NV_ESC_RM_ALLOC (hClient)
-            || escape == 0x2a; // NV_ESC_RM_CONTROL
-
         let n_in = param_in.len();
         let mut a = Arena::new();
         let top = match self.top_block(&mut a, request, param_in, plan) {
@@ -4139,148 +4132,25 @@ impl NvidiaBackend {
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
         };
 
-        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry with different Cmd on EBUSY
-        // Some sysparams ioctls return EBUSY when the device is busy, especially
-        // during early initialization. We retry with Cmd=2 (V2) as fallback.
-        let retry_with_v2 = escape == 0xd6 && n_in >= 4 && param_in[0] == 0;
-
-        // ---------------------------------------------------------------
-        // Special handling: NV_ESC_CHECK_VERSION_STR (0xd2)
-        // Based on gVisor nvproxy: Try Cmd='2' first (character '2'),
-        // which triggers version query mode in newer drivers.
-        // ---------------------------------------------------------------
-        if escape == 0xd2 && n_in >= 4 {
-            // Try Cmd='2' first (query mode in newer drivers); leave the
-            // other fields as they are.
-            let _ = a.write(top, 0, b"2");
-        }
-
+        // NV_ESC_SYS_PARAMS and NV_ESC_CHECK_VERSION_STR go as the guest
+        // sent them, and their answers come back as the host gave them
+        // (SECURITY.md §17). SYS_PARAMS carries the caller's memory block
+        // size, which RM keeps from its first caller and answers EBUSY for
+        // any other; this once rewrote the block and made up a success. And
+        // CHECK_VERSION_STR was rewritten to query mode ('2'), in which RM
+        // skips comparing the caller's version with its own: a guest
+        // userspace of another release then ran against this RM unnoticed.
         let rc = self.host_call(&mut a, host_fd, request, top);
-        let first_ok = rc.is_ok();
         if let Err(errno) = rc {
-            // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry on EBUSY
-            if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
-                log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
-                let _ = a.write(top, 0, &[2]); // Try V2
-                if let Err(errno2) = self.host_call(&mut a, host_fd, request, top) {
-                    log::warn!(
-                        "ioctl(0x{:x}/0x{:02x}) retry failed: errno={}",
-                        request,
-                        escape,
-                        errno2
-                    );
-                    // EBUSY means driver is busy but shouldn't cause vulkan failure.
-                    // Synthesize success (like older drivers did) by returning zeros.
-                    log::warn!(
-                        "ioctl(0x{:x}/0x{:02x}) returned EBUSY - synthesizing success",
-                        request,
-                        escape
-                    );
-                    // Return success with zeroed params (simulates what driver returns)
-                    let zeroed = vec![0u8; n_in];
-                    return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
-                }
-                // Success on retry - continue to response handling
-            } else if escape == 0xd6 && errno == libc::EBUSY {
-                // EBUSY but couldn't retry (param[0] != 0) - synthesize success
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) returned EBUSY (no retry) - synthesizing success",
-                    request,
-                    escape
-                );
-                let zeroed = vec![0u8; n_in];
-                return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
-            } else {
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
-                    request,
-                    escape,
-                    errno
-                );
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
-            }
+            log::debug!("ioctl(0x{request:x}/0x{escape:02x}) failed: errno={errno}");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
         // The host's bytes, with the caller's values in every field the plan
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if first_ok {
-            if escape == 0xd2 {
-                self.learn_driver_version(&param_buf);
-            }
-            if log_response {
-                let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
-                match escape {
-                    0xd2 => {
-                        // NV_ESC_CHECK_VERSION_STR - version string at offset 0
-                        let version = String::from_utf8_lossy(preview);
-                        log::info!("CHECK_VERSION_STR response: {:?}", version);
-                    }
-                    0xc8 => {
-                        log::info!("CARD_INFO response[0..128]: {:02x?}", preview);
-                    }
-                    0xd6 => {
-                        log::info!("SYS_PARAMS response[0..128]: {:02x?}", preview);
-                    }
-                    0x2a => {
-                        // RM_CONTROL - log first few bytes of params
-                        let status = if param_buf.len() >= 4 {
-                            u32::from_le_bytes([
-                                param_buf[0],
-                                param_buf[1],
-                                param_buf[2],
-                                param_buf[3],
-                            ])
-                        } else {
-                            0
-                        };
-                        log::info!(
-                            "RM_CONTROL response: status={:#x}, data[4..32]={:02x?}",
-                            status,
-                            &param_buf[4..std::cmp::min(32, param_buf.len())]
-                        );
-                    }
-                    0x2b => {
-                        // RM_ALLOC - log first few bytes
-                        let status = if param_buf.len() >= 4 {
-                            u32::from_le_bytes([
-                                param_buf[0],
-                                param_buf[1],
-                                param_buf[2],
-                                param_buf[3],
-                            ])
-                        } else {
-                            0
-                        };
-                        log::info!(
-                            "RM_ALLOC response: status={:#x}, data[4..32]={:02x?}",
-                            status,
-                            &param_buf[4..std::cmp::min(32, param_buf.len())]
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            if escape == 0x57 || escape == 0x58 {
-                log::info!(
-                    "MAP/UNMAP_DMA(0x{:02x}): response[{}]={:02x?}",
-                    escape,
-                    param_buf.len(),
-                    &param_buf[..std::cmp::min(param_buf.len(), 64)]
-                );
-            }
-            // Only on NVIDIA's own magic. 0x4a is VID_HEAP_CONTROL there and
-            // GEM_MAP_OFFSET on the DRM node, and logging the second under the
-            // first's name makes a buffer-sharing run look like an allocator
-            // storm -- which it did, for as long as it took to count the
-            // namespaces separately.
-            if escape == 0x4a && ((request >> 8) & 0xFF) as u32 == b'F' as u32 {
-                log::info!(
-                    "VID_HEAP_CONTROL: response[{}]={:02x?}",
-                    param_buf.len(),
-                    &param_buf[..std::cmp::min(param_buf.len(), 184)]
-                );
-            }
+        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR && (request >> 8) & 0xFF == u64::from(b'F') {
+            self.learn_driver_version(&param_buf);
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
@@ -4466,7 +4336,6 @@ impl NvidiaBackend {
         plan: &crate::guestptr::Plan<'_>,
         resp_buf: &mut [u8],
     ) -> usize {
-        const _NVOS33_SIZE: usize = 48;
         const WITH_FD_SIZE: usize = 56;
         const FD_OFFSET: usize = 48;
         const LENGTH_OFFSET: usize = 24;
@@ -4570,7 +4439,7 @@ impl NvidiaBackend {
         // VM (see `shm::host_mapping_writable`).
         let writable = crate::shm::host_mapping_writable(host_map_fd, length, 0);
         if !writable {
-            log::info!(
+            log::debug!(
                 "NV_ESC_RM_MAP_MEMORY: client {h_client:#x} memory {h_memory:#x} is read-only \
                  on the host; placed read-only"
             );
@@ -4797,17 +4666,6 @@ impl NvidiaBackend {
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
-    /// The descriptor behind a handle an RM parameter block names, if the
-    /// handle is one of the NVIDIA devices. RM and NVKMS only understand their
-    /// own files; a card, a lease or a sync_file has no business in one of
-    /// their parameter blocks.
-    /// Turn the handle in UVM command `cmd`'s descriptor field (uvmfd.rs)
-    /// into the descriptor it stands for, in `params`, the block the host
-    /// will be handed. `Some((offset, handle))` when one was replaced, for
-    /// the reply; a negative value is UVM's "none" and stays. Anything that
-    /// is not a handle of the kind the field names -- an RM control file, or
-    /// a UVM file -- is refused rather than handed to the host as a number
-    /// in our table.
     /// Whether `len` is the size of UVM command `cmd`'s parameters on the
     /// host's release: EPERM for a command this release has no row for (or
     /// a host with no table at all), EINVAL for another size.
@@ -5380,25 +5238,6 @@ mod tests {
         hdr(MsgType::Close, handle)
     }
 
-    /// A complete `Ioctl` message with no nested block.
-    #[allow(dead_code)]
-    fn ioctl_msg(handle: u64, escape: u32, params: &[u8]) -> Vec<u8> {
-        let mut v = hdr(MsgType::Ioctl, handle);
-        append(
-            &mut v,
-            &IoctlReq {
-                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
-                data_len: params.len() as u32,
-                nested_offset: 0,
-                nested_len: 0,
-                deep_ptr_offset: 0,
-                deep_len: 0,
-            },
-        );
-        v.extend_from_slice(params);
-        v
-    }
-
     fn append<T: crate::sys::pod::Pod>(v: &mut Vec<u8>, val: &T) {
         let start = v.len();
         v.resize(start + size_of::<T>(), 0);
@@ -5465,7 +5304,7 @@ mod tests {
     #[test]
     fn short_request_rejected() {
         let mut be = NvidiaBackend::for_test();
-        be.dispatch(&[0u8; 4], &mut vec![0u8; 32]);
+        be.dispatch(&[0u8; 4], &mut [0u8; 32]);
         // just must not panic
     }
 
@@ -5951,8 +5790,10 @@ mod tests {
             );
             let n = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
             let listed: Vec<u32> = out[4..4 + 4 * n.min(NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE)]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
                 .collect();
             let class = *USERMODE_CLASSES
                 .iter()
@@ -6359,6 +6200,52 @@ mod tests {
         let resp = v1_ioctl(&mut be, uvm, cmd, &[0u8; 8]);
         assert_eq!(parse_resp(&resp).status, -libc::EPERM);
         assert!(forwarded().is_empty());
+    }
+
+    std::thread_local! {
+        /// The command byte CHECK_VERSION_STR reached the fake host with.
+        static VERSION_CMD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// RM's SYS_PARAMS for a memory block size other than its first
+    /// caller's (EBUSY), and its CHECK_VERSION_STR (the reply word set).
+    fn fake_sys_params_busy(_fd: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        match (request & 0xff) as u32 {
+            abi::ioctl::NV_ESC_SYS_PARAMS => -libc::EBUSY,
+            abi::ioctl::NV_ESC_CHECK_VERSION_STR => {
+                VERSION_CMD.with(|c| c.set(Some(arg.bytes()[0])));
+                arg.bytes()[4] = 1;
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// SYS_PARAMS's EBUSY reaches the guest as EBUSY, not a made-up
+    /// success; CHECK_VERSION_STR reaches RM with the guest's own command,
+    /// so RM compares the guest userspace's version with its own.
+    #[test]
+    fn sys_params_and_check_version_go_as_sent_and_come_back_as_answered() {
+        use abi::ioctl::{NV_ESC_CHECK_VERSION_STR, NV_ESC_SYS_PARAMS};
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_sys_params_busy);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+
+        let sys = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_SYS_PARAMS, 8);
+        let resp = v1_ioctl(&mut be, ctl, sys, &(128u64 << 20).to_le_bytes());
+        assert_eq!(parse_resp(&resp).status, -libc::EBUSY);
+
+        let check = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_CHECK_VERSION_STR, 72);
+        for cmd in [0u8, b'1'] {
+            let mut p = vec![0u8; 72];
+            p[0] = cmd;
+            p[8..17].copy_from_slice(b"595.99.02");
+            let resp = v1_ioctl(&mut be, ctl, check, &p);
+            assert_eq!(parse_resp(&resp).status, 0);
+            assert_eq!(VERSION_CMD.with(|c| c.take()), Some(cmd), "not rewritten");
+            assert_eq!(resp[IOCTL_BODY + 4], 1, "the host's reply word");
+        }
     }
 
     #[test]
@@ -7092,9 +6979,12 @@ mod mapping_tests {
         0
     }
 
-    /// Records every placement, with whether it was asked to be writable.
+    /// One placement: what, where, and whether it was asked to be writable.
+    type Placement = (&'static str, u64, bool);
+
+    /// Records every placement.
     #[derive(Clone, Default)]
-    struct RecWindow(Arc<std::sync::Mutex<Vec<(&'static str, u64, bool)>>>);
+    struct RecWindow(Arc<std::sync::Mutex<Vec<Placement>>>);
 
     impl crate::shm::WindowPlacer for RecWindow {
         fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, w: bool) -> Result<()> {

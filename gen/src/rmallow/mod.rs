@@ -10,10 +10,13 @@
 //! translate. The backend refuses everything else before RM sees it
 //! (`device/src/rmallow.rs`).
 //!
-//! A host between two measured releases uses the older one's list, as the
-//! NVKMS and UVM tables do; one older than every release the oldest's, and
-//! one newer the newest's. Parameter sizes are held only on a release
-//! measured exactly: they move between releases.
+//! A host release measured exactly gets its own list; the backend refuses to
+//! start on any other (`device/src/release.rs`) unless told
+//! `--allow-unmeasured-release`, and then a host between two measured
+//! releases, or newer than every one, uses the nearest older one's list, as
+//! the NVKMS tables do. One older than every release has no list at all.
+//! Parameter sizes are held only on a release measured exactly: they move
+//! between releases.
 
 #[rustfmt::skip]
 mod generated;
@@ -26,15 +29,13 @@ fn version_of(r: &Release) -> DriverVersion {
     DriverVersion::new(r.version.0, r.version.1, r.version.2)
 }
 
-/// The release whose list a host running `v` is held to, and whether it was
-/// measured at exactly `v`.
-pub fn release_for(v: DriverVersion) -> (&'static Release, bool) {
-    let r = RELEASES
-        .iter()
-        .rev()
-        .find(|r| version_of(r) <= v)
-        .unwrap_or(&RELEASES[0]);
-    (r, version_of(r) == v)
+/// The release whose list a host running `v` is held to -- the nearest
+/// measured at or below it -- and whether it was measured at exactly `v`.
+/// `None` for a host older than every release measured: nothing below it
+/// describes it, and guessing upwards would hand it controls it may not have.
+pub fn release_for(v: DriverVersion) -> Option<(&'static Release, bool)> {
+    let r = RELEASES.iter().rev().find(|r| version_of(r) <= v)?;
+    Some((r, version_of(r) == v))
 }
 
 impl Release {
@@ -273,7 +274,7 @@ mod tests {
 
     #[test]
     fn every_architectures_channel_and_engine_classes_come_with_the_observed_ones() {
-        let (r, _) = release_for(DriverVersion::new(610, 57, 4));
+        let (r, _) = release_for(DriverVersion::new(610, 57, 4)).unwrap();
         for (class, what) in [
             (0xc46f, "TURING_CHANNEL_GPFIFO_A"),
             (0xc56f, "AMPERE_CHANNEL_GPFIFO_A"),
@@ -298,17 +299,27 @@ mod tests {
     }
 
     #[test]
-    fn a_host_between_releases_uses_the_older_list() {
-        let (r, exact) = release_for(DriverVersion::new(610, 57, 4));
+    fn a_host_between_releases_uses_the_older_list_and_says_it_is_not_exact() {
+        let (r, exact) = release_for(DriverVersion::new(610, 57, 4)).unwrap();
         assert_eq!(r.version(), DriverVersion::new(610, 57, 4));
         assert!(exact);
-        let (r, exact) = release_for(DriverVersion::new(600, 1, 0));
+        // The rig's host.
+        let (r, exact) = release_for(DriverVersion::new(595, 99, 2)).unwrap();
+        assert_eq!(r.version(), DriverVersion::new(595, 99, 2));
+        assert!(exact);
+        let (r, exact) = release_for(DriverVersion::new(600, 1, 0)).unwrap();
         assert_eq!(r.version(), DriverVersion::new(595, 99, 2));
         assert!(!exact);
-        let (r, _) = release_for(DriverVersion::new(470, 0, 0));
-        assert_eq!(r.version(), DriverVersion::new(535, 129, 3));
-        let (r, _) = release_for(DriverVersion::new(999, 0, 0));
+        let (r, exact) = release_for(DriverVersion::new(999, 0, 0)).unwrap();
         assert_eq!(r.version(), RELEASES.last().unwrap().version());
+        assert!(!exact);
+    }
+
+    #[test]
+    fn a_host_older_than_every_release_has_no_list() {
+        assert!(release_for(DriverVersion::new(470, 0, 0)).is_none());
+        assert!(release_for(DriverVersion::new(535, 129, 2)).is_none());
+        assert!(release_for(DriverVersion::new(535, 129, 3)).is_some());
     }
 
     #[test]

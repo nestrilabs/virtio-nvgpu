@@ -687,9 +687,9 @@ pub fn soname(path: &Path) -> Option<String> {
 
     let mut soname_off = None;
     let mut strtab = None;
-    for e in dynbuf.chunks_exact(16) {
-        let tag = i64::from_le_bytes(e[0..8].try_into().expect("16-byte chunk"));
-        let val = u64::from_le_bytes(e[8..16].try_into().expect("16-byte chunk"));
+    for e in dynbuf.as_chunks::<16>().0 {
+        let tag = i64::from_le_bytes(e[0..8].try_into().expect("8 of 16 bytes"));
+        let val = u64::from_le_bytes(e[8..16].try_into().expect("8 of 16 bytes"));
         match tag {
             DT_NULL => break,
             DT_SONAME => soname_off = Some(val),

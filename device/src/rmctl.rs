@@ -31,7 +31,6 @@
 #![forbid(unsafe_code)]
 
 /// Controls that report other RM clients' host PIDs or per-process usage.
-
 pub const HOST_PID_CONTROLS: &[(u32, &str)] = &[
     // PIDs of every client using an object; per-PID video memory.
     (0x2080_018d, "NV2080_CTRL_CMD_GPU_GET_PIDS"),

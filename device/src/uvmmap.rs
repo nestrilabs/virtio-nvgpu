@@ -230,7 +230,7 @@ impl UvmMaps {
     pub fn record(&mut self, handle: u32, base: u64, len: u64) -> (bool, Option<Withdraw>) {
         let stale = self.forget(handle, base);
         if len == 0 || len > MAX_LEN {
-            log::info!("uvm: pool {base:#x}+{len:#x} of handle {handle} is not mappable here");
+            log::debug!("uvm: pool {base:#x}+{len:#x} of handle {handle} is not mappable here");
             return (false, stale);
         }
         let of_file = self.ranges.range((handle, 0)..=(handle, u64::MAX)).count();
@@ -285,7 +285,12 @@ impl UvmMaps {
         let Some(end) = base.checked_add(len) else {
             return Err(libc::EINVAL);
         };
-        if base < HVA_MIN || end > HVA_MAX || len > MAX_LEN || base % PAGE != 0 || len % PAGE != 0 {
+        if base < HVA_MIN
+            || end > HVA_MAX
+            || len > MAX_LEN
+            || !base.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+        {
             return Err(libc::EINVAL);
         }
         // One address space in the VMM for all of them. Refused as any
@@ -295,7 +300,7 @@ impl UvmMaps {
             .iter()
             .any(|(&(_, b), o)| o.placed.is_some() && b < end && base < b.saturating_add(o.len));
         if clash {
-            log::info!("uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it");
+            log::debug!("uvm: mmap of {base:#x}+{len:#x} on handle {handle}: a live pool covers it");
             return Err(libc::ENOMEM);
         }
         let owner = self.owner(handle);
@@ -529,7 +534,7 @@ mod tests {
             // A legacy (bottom-up) mmap layout starts at a third of the
             // 47-bit space, where the VMM's own mappings would be.
             (((1u64 << 47) / 3) & !(MB2 - 1), false),
-            (u64::MAX & !4095, false),
+            (!4095, false),
         ] {
             m.record(1, base, MB2);
             let r = m.plan_mmap(1, base, MB2, 3);

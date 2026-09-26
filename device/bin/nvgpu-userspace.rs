@@ -56,6 +56,41 @@ struct Args {
     allow_version_mismatch: bool,
 }
 
+/// The file that marks a directory as a share this tool staged, and so one
+/// it may clear.
+const SHARE_MARKER: &str = ".nvgpu-userspace-share";
+
+/// Remove a previous share at `root`: nothing there, or an empty directory,
+/// or a directory holding [`SHARE_MARKER`]. Anything else is refused.
+fn clear_previous_share(root: &Path) -> Result<()> {
+    let m = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("{}", root.display())),
+    };
+    anyhow::ensure!(
+        m.is_dir(),
+        "--stage {}: exists and is not a directory (a symlink is not followed); not touching it",
+        root.display()
+    );
+    let empty = std::fs::read_dir(root)
+        .with_context(|| format!("reading {}", root.display()))?
+        .next()
+        .is_none();
+    if empty {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        root.join(SHARE_MARKER).is_file(),
+        "--stage {}: a directory with files in it that nvgpu-userspace did not stage (no {}); \
+         refusing to delete it. Name an empty or new directory",
+        root.display(),
+        SHARE_MARKER
+    );
+    std::fs::remove_dir_all(root)
+        .with_context(|| format!("clearing the previous share at {}", root.display()))
+}
+
 fn capability(name: &str) -> Result<Capability> {
     Ok(match name.trim().to_ascii_lowercase().as_str() {
         "utility" => Capability::Utility,
@@ -157,22 +192,22 @@ fn main() -> Result<()> {
     // nearly all of it is there.
     let mut found = found;
 
-    if let (Some(m), Some(t)) = (&manifest_version, &target) {
-        if m != t && !args.allow_version_mismatch {
-            let swapped = retarget(&entries, m, t);
-            let (f2, _) = resolve(&swapped, &caps, &search);
-            // Only accept the swap if that build is really installed. A
-            // target with nothing on disk must fail loudly below, not quietly
-            // produce a share with three files in it.
-            if f2.len() * 10 >= found.len() * 9 {
-                println!(
-                    "manifest describes driver {m}; the loaded module is {t} -- \
-                     retargeted onto {t} ({} of {} entries found)",
-                    f2.len(),
-                    found.len()
-                );
-                found = f2;
-            }
+    if let (Some(m), Some(t)) = (&manifest_version, &target)
+        && m != t && !args.allow_version_mismatch
+    {
+        let swapped = retarget(&entries, m, t);
+        let (f2, _) = resolve(&swapped, &caps, &search);
+        // Only accept the swap if that build is really installed. A
+        // target with nothing on disk must fail loudly below, not quietly
+        // produce a share with three files in it.
+        if f2.len() * 10 >= found.len() * 9 {
+            println!(
+                "manifest describes driver {m}; the loaded module is {t} -- \
+                 retargeted onto {t} ({} of {} entries found)",
+                f2.len(),
+                found.len()
+            );
+            found = f2;
         }
     }
 
@@ -193,29 +228,33 @@ fn main() -> Result<()> {
     // the one failure here that does not look like one: it mounts, every
     // forwarded ioctl returns 0, and the caller gives up deep inside a library
     // that is a different build from the kernel module it is talking to.
-    if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version) {
-        if staged != loaded && !args.allow_version_mismatch {
-            anyhow::bail!(
-                "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
-                 The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
-                 find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
-                 or not where this looks for it.\n\n\
-                 Install the userspace matching the loaded module, or pass \n\
-                 --driver-version to name a build that is present. \n\
-                 --allow-version-mismatch stages the manifest's own build anyway; see \n\
-                 decision 0070 for why that is not the default.",
-                args.manifest.display()
-            );
-        }
+    if let (Some(staged), Some(loaded)) = (&staged_version, &loaded_version)
+        && staged != loaded && !args.allow_version_mismatch
+    {
+        anyhow::bail!(
+            "refusing to stage driver {staged} while kernel module {loaded} is loaded.\n\n\
+             The manifest at {} describes {staged}, and retargeting onto {loaded} did not \n\
+             find enough of it installed -- so {loaded}'s userspace is not on this host, \n\
+             or not where this looks for it.\n\n\
+             Install the userspace matching the loaded module, or pass \n\
+             --driver-version to name a build that is present. \n\
+             --allow-version-mismatch stages the manifest's own build anyway; see \n\
+             decision 0070 for why that is not the default.",
+            args.manifest.display()
+        );
     }
 
     // A stale share is worse than no share: it would hold libraries from a
     // driver that is no longer loaded, which fails deep inside the guest rather
     // than here.
-    if root.exists() {
-        std::fs::remove_dir_all(&root)
-            .with_context(|| format!("clearing the previous share at {}", root.display()))?;
-    }
+    //
+    // Only a share this tool staged is cleared, though: `--stage` names a
+    // directory to delete recursively, and a typo (`--stage ~`, `--stage /usr`)
+    // must not be the way someone finds that out.
+    clear_previous_share(&root)?;
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    std::fs::write(root.join(SHARE_MARKER), b"staged by nvgpu-userspace; cleared by it on the next --stage\n")
+        .with_context(|| format!("marking {} as a share", root.display()))?;
 
     // Which file names the share will actually contain. A symlink entry is
     // only worth staging if whatever it points at is one of them.
@@ -295,4 +334,47 @@ fn main() -> Result<()> {
     }
     println!("Export it read-only and, in the guest, add its lib/ to the loader path.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nvgpu-userspace-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// `--stage` deletes only what it staged: nothing, an empty directory,
+    /// or one with its marker; never someone's files, never through a link.
+    #[test]
+    fn only_a_share_this_staged_is_cleared() {
+        let none = tmp("none");
+        clear_previous_share(&none).unwrap();
+
+        let empty = tmp("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        clear_previous_share(&empty).unwrap();
+        std::fs::remove_dir(&empty).unwrap();
+
+        let theirs = tmp("theirs");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("thesis.tex"), b"x").unwrap();
+        assert!(clear_previous_share(&theirs).is_err());
+        assert!(theirs.join("thesis.tex").exists());
+
+        let link = tmp("link");
+        std::os::unix::fs::symlink(&theirs, &link).unwrap();
+        assert!(clear_previous_share(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&theirs).unwrap();
+
+        let ours = tmp("ours");
+        std::fs::create_dir_all(ours.join("lib")).unwrap();
+        std::fs::write(ours.join("lib/libcuda.so.1"), b"x").unwrap();
+        std::fs::write(ours.join(SHARE_MARKER), b"").unwrap();
+        clear_previous_share(&ours).unwrap();
+        assert!(!ours.exists());
+    }
 }

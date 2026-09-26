@@ -41,6 +41,7 @@ pub mod privfd;
 pub mod pump;
 pub mod quota;
 pub mod ratelimit;
+pub mod release;
 pub mod replay;
 pub mod rmallow;
 pub mod rmctl;

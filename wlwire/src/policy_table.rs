@@ -18,7 +18,9 @@
 #![forbid(unsafe_code)]
 
 /// What a descriptor argument is, and so how it crosses the VM boundary.
-
+///
+/// (`dead_code` is allowed on these types because build.rs includes this file
+/// as a module of its own and reads only some of each.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum FdClass {

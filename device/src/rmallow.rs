@@ -89,6 +89,19 @@ enum What {
     VidHeap(u32),
 }
 
+/// The list of a host older than every release measured: nothing.
+static NO_RELEASE: Release = Release {
+    version: (0, 0, 0),
+    controls: &[],
+    classes: &[],
+    vidheap: &[],
+    deferred: &[],
+    unserved_controls: &[],
+    unserved_classes: &[],
+    total_controls: 0,
+    total_classes: 0,
+};
+
 /// The gate. One per backend: the host's release, the mode, and counts of
 /// what it refused.
 #[derive(Debug)]
@@ -139,12 +152,24 @@ impl RmAllow {
         self.mode = mode;
     }
 
-    /// Hold the guest to the list of the release the host runs.
+    /// Hold the guest to the list of the release the host runs: its own, or
+    /// the nearest older one's (which the backend starts on only with
+    /// `--allow-unmeasured-release`, `crate::release`). A host older than
+    /// every release measured gets an empty list: nothing reaches its RM.
     pub fn set_driver(&mut self, v: DriverVersion) {
-        let (release, exact) = rmallow::release_for(v);
+        let Some((release, exact)) = rmallow::release_for(v) else {
+            log::error!(
+                "RM allowlist: host driver {v} is older than every release measured ({}); \
+                 every RM control and class is refused",
+                rmallow::RELEASES[0].version()
+            );
+            self.release = &NO_RELEASE;
+            self.exact = false;
+            return;
+        };
         self.release = release;
         self.exact = exact;
-        log::info!(
+        let line = format!(
             "RM allowlist: host driver {v}, list of {}{} ({} of {} controls, {} of {} classes)",
             release.version(),
             if exact {
@@ -157,6 +182,13 @@ impl RmAllow {
             release.classes.len(),
             release.total_classes
         );
+        // The start-up line (crate::release) already names the list; a
+        // nearest-older one is worth saying twice.
+        if exact {
+            log::debug!("{line}");
+        } else {
+            log::warn!("{line}");
+        }
     }
 
     /// Check an RM escape before it reaches the host: `escape` its number,
@@ -167,15 +199,11 @@ impl RmAllow {
         let params = sent.get(top..).unwrap_or(&[]);
         let verdict = match escape {
             NV_ESC_RM_CONTROL => self.control(top_block, params),
+            // NVOS64 in every release measured (the ABI profile refuses any
+            // other size); a shorter block has no status word where RM's is
+            // and is refused as too short.
             NV_ESC_RM_ALLOC => {
-                // NVOS21 and NVOS64 have hClass at one place; the status
-                // follows each.
-                let at = if top == rmallow::NVOS64_SIZE {
-                    rmallow::NVOS64_STATUS
-                } else {
-                    rmallow::NVOS21_STATUS
-                };
-                self.class(top_block, rmallow::NVOS64_H_CLASS, at)
+                self.class(top_block, rmallow::NVOS64_H_CLASS, rmallow::NVOS64_STATUS)
             }
             NV_ESC_RM_ALLOC_MEMORY => {
                 self.class(top_block, rmallow::NVOS02_H_CLASS, rmallow::NVOS02_STATUS)
@@ -332,13 +360,13 @@ impl RmAllow {
             .refused_controls
             .lines(|c| format!("{}({c:#010x})", rmallow::control_name(c).unwrap_or("?")))
         {
-            log::info!("RM allowlist {verb} control(s): {line}");
+            log::warn!("RM allowlist {verb} control(s): {line}");
         }
         for line in self
             .refused_classes
             .lines(|c| format!("{}({c:#06x})", rmallow::class_name(c).unwrap_or("?")))
         {
-            log::info!("RM allowlist {verb} class(es): {line}");
+            log::warn!("RM allowlist {verb} class(es): {line}");
         }
     }
 }
@@ -386,6 +414,21 @@ mod tests {
         }
     }
 
+    /// A host older than every release measured has no list: what the
+    /// newest host lets through is refused there.
+    #[test]
+    fn a_host_older_than_every_release_gets_nothing() {
+        let mut g = RmAllow::new(Mode::Enforce);
+        g.set_driver(DriverVersion::new(470, 256, 2));
+        let ok = nvos54(0x2080_0102, &[0u8; 580]);
+        assert!(g.check(NV_ESC_RM_CONTROL, &ok, 32).is_err());
+        let alloc = with_class(rmallow::NVOS64_SIZE, 0xc56f);
+        assert!(
+            g.check(NV_ESC_RM_ALLOC, &alloc, rmallow::NVOS64_SIZE)
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_parameter_size_rm_does_not_take_is_refused_on_the_release_measured() {
         let mut g = gate();
@@ -422,7 +465,6 @@ mod tests {
         let mut g = gate();
         for (escape, len, status) in [
             (NV_ESC_RM_ALLOC, 48, 40),
-            (NV_ESC_RM_ALLOC, 32, 28),
             (NV_ESC_RM_ALLOC_MEMORY, 56, 40),
             (NV_ESC_RM_ALLOC_OBJECT, 20, 16),
             (NV_ESC_RM_ALLOC_CONTEXT_DMA2, 56, 48),
@@ -440,6 +482,13 @@ mod tests {
         }
         assert_eq!(
             g.check(NV_ESC_RM_ALLOC, &[0u8; 8], 8),
+            Err(Refusal::Errno(libc::EINVAL))
+        );
+        // An NVOS21-sized block (a 32-byte RM_ALLOC, which only
+        // --permissive-abi lets this far) has no status word where NVOS64's
+        // is: too short, whatever its class.
+        assert_eq!(
+            g.check(NV_ESC_RM_ALLOC, &with_class(32, 0x3e), 32),
             Err(Refusal::Errno(libc::EINVAL))
         );
     }

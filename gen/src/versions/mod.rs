@@ -60,19 +60,50 @@ static PROFILES: &[Profile] = &[
     Profile { version: DriverVersion::new(595, 71, 5), table: v595_71_05::table },
 ];
 
+/// The newest host release the last profile is known to describe.
+///
+/// Above it nothing has looked: a release NVIDIA publishes after it may move
+/// an escape's block (580 did: NVOS46 grew to 64 bytes), and a profile that
+/// silently stretched over it would size-check the guest against layouts
+/// nobody measured. Evidence that the 595.71.05 profile holds up to here:
+/// gVisor's nvproxy records no frontend change from 580.65.06 through
+/// 620.30 (checked 2026-09-26); the A2000 capture at 615.71.09
+/// (`fixtures/615.71.09.tsv`) matches it escape for escape; and every
+/// release in `gen/rmallow` measured the RM escape blocks at the sizes it
+/// states (`the_profiles_agree_with_every_measured_releases_escape_blocks`).
+/// Moving this is part of measuring a new release (gen/README.md).
+pub const MEASURED_THROUGH: DriverVersion = DriverVersion::new(615, 71, 9);
+
+/// The profile for `v`, whether or not anything measured `v`.
+fn profile_for(v: DriverVersion) -> Option<&'static Profile> {
+    PROFILES.iter().rev().find(|p| p.version <= v)
+}
+
 /// Select the profile for `v`.
 ///
 /// Profiles key off **ranges, not points**: a release between two known
 /// versions selects the lower profile, which is what keeps the per-release cost
-/// small. A version older than every profile has no table and returns `None` --
-/// guessing downwards would mean forwarding ioctls whose layout we have never
-/// seen.
+/// small. A version older than every profile has no table and returns `None`
+/// -- guessing downwards would mean forwarding ioctls whose layout we have
+/// never seen -- and so does one newer than [`MEASURED_THROUGH`], for the
+/// same reason upwards.
 pub fn table_for(v: DriverVersion) -> Option<&'static [IoctlEntry]> {
-    PROFILES
-        .iter()
-        .rev()
-        .find(|p| p.version <= v)
-        .map(|p| (p.table)())
+    if v > MEASURED_THROUGH {
+        return None;
+    }
+    profile_for(v).map(|p| (p.table)())
+}
+
+/// The nearest profile at or below `v`, measured through `v` or not: what
+/// `--allow-unmeasured-release` runs a newer host on. `None` only below
+/// every profile.
+pub fn nearest_table_for(v: DriverVersion) -> Option<&'static [IoctlEntry]> {
+    profile_for(v).map(|p| (p.table)())
+}
+
+/// The version of the profile [`nearest_table_for`] picks, to name in a log.
+pub fn nearest_profile_version(v: DriverVersion) -> Option<DriverVersion> {
+    profile_for(v).map(|p| p.version)
 }
 
 /// Whether a driver version resolves to a table at all.
@@ -108,9 +139,54 @@ mod tests {
     }
 
     #[test]
-    fn version_above_every_profile_selects_the_highest() {
-        let t = table_for(DriverVersion::new(610, 43, 2)).expect("falls back to 595");
-        assert!(std::ptr::eq(t, v595_71_05::table()));
+    fn a_version_up_to_the_newest_measured_selects_the_highest_profile() {
+        // The rig's host, one between, and the newest release measured.
+        for v in [
+            DriverVersion::new(595, 99, 2),
+            DriverVersion::new(610, 43, 2),
+            MEASURED_THROUGH,
+        ] {
+            let t = table_for(v).expect("falls back to 595");
+            assert!(std::ptr::eq(t, v595_71_05::table()), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_version_above_the_newest_measured_has_no_table_but_a_nearest_one() {
+        for v in [DriverVersion::new(615, 71, 10), DriverVersion::new(620, 30, 0)] {
+            assert!(table_for(v).is_none(), "{v}");
+            assert!(!is_supported(v));
+            let t = nearest_table_for(v).expect("the newest profile");
+            assert!(std::ptr::eq(t, v595_71_05::table()));
+            assert_eq!(
+                nearest_profile_version(v),
+                Some(DriverVersion::new(595, 71, 5))
+            );
+        }
+        assert!(nearest_table_for(DriverVersion::new(470, 0, 0)).is_none());
+    }
+
+    /// Every release `gen/rmallow` measured from NVIDIA's sources has a
+    /// profile, and the profile's sizes for the RM escapes are the block
+    /// sizes measured there.
+    #[test]
+    fn the_profiles_agree_with_every_measured_releases_escape_blocks() {
+        use crate::ioctl::*;
+        use crate::rmallow;
+        for r in rmallow::RELEASES {
+            let v = r.version();
+            assert!(v <= MEASURED_THROUGH, "{v} measured but past MEASURED_THROUGH");
+            let t = table_for(v).unwrap_or_else(|| panic!("{v}: no profile"));
+            for (escape, size) in [
+                (NV_ESC_RM_CONTROL, rmallow::NVOS54_SIZE),
+                (NV_ESC_RM_ALLOC, rmallow::NVOS64_SIZE),
+                (NV_ESC_RM_VID_HEAP_CONTROL, rmallow::NVOS32_SIZE),
+                (NV_ESC_RM_ALLOC_CONTEXT_DMA2, rmallow::NVOS39_SIZE),
+            ] {
+                let e = lookup(t, escape).unwrap_or_else(|| panic!("{v}: {escape:#x}"));
+                assert_eq!(e.param_size, Some(size as u32), "{v}: {escape:#x}");
+            }
+        }
     }
 
     #[test]
