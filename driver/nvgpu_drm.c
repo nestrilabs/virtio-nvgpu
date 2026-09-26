@@ -609,6 +609,25 @@ bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem) {
 }
 
 /*
+ * The host has closed the proxy's handle, or never will (the close was never
+ * sent): the number is the host's to give out again, and an importer waiting
+ * on it (nvgpu_gem_wait_gone()) may ask again. Only our own entry, never a
+ * successor's. Then the owner's reference, which the close needed, and the
+ * tombstone itself. Process context (nvgpu_gem_close_then()).
+ */
+static void nvgpu_gem_tomb_gone(void *arg) {
+  struct nvgpu_gem_object *ng = arg;
+
+  if (ng->owner && ng->host_handle) {
+    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
+    wake_up_all(&nvgpu_gem_gone_wq);
+  }
+  if (ng->owner)
+    nvgpu_fd_put(ng->owner);
+  kfree(ng);
+}
+
+/*
  * The last reference to a proxy is gone, so the host's object can go too.
  *
  * Forwarded on the owner's handle rather than the caller's: the host object
@@ -636,8 +655,6 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   /* The handles SEMSURF_FENCE_ATTACH gave this object in other files go
    * first: each holds the host object too, and a reference on its file. */
   nvgpu_fence_gem_free(ng);
-  if (ng->dev && ng->host_handle)
-    nvgpu_gem_close(ng->dev, ng->owner_handle, ng->host_handle);
 
   /*
    * Give the window space back. The window is a gigabyte and a swapchain is
@@ -652,18 +669,22 @@ static void nvgpu_gem_free(struct drm_gem_object *obj) {
   if (ng->window_valid && ng->mapping_id)
     nvgpu_munmap(ng->dev, ng->owner_handle, ng->mapping_id);
 
-  /* Closed: the number is the host's to give out again, and an importer
-   * waiting on it (nvgpu_gem_wait_gone()) may ask again. Only our own
-   * entry, never a successor's. */
-  if (ng->owner && ng->host_handle) {
-    xa_cmpxchg(&ng->owner->gem_index, ng->host_handle, ng, NULL, 0);
-    wake_up_all(&nvgpu_gem_gone_wq);
-  }
-
   drm_gem_object_release(obj);
-  if (ng->owner)
-    nvgpu_fd_put(ng->owner);
-  kfree(ng);
+
+  /*
+   * The GEM_CLOSE last, and the tombstone stays until the host has really
+   * closed the number (nvgpu_gem_tomb_gone()). Erased when the close was
+   * merely queued -- a fatal signal while the ring was full, no memory --
+   * the index let a GETFB or a PRIME import that got the same number back
+   * make a new proxy for it, which the queued close then closed under it.
+   * Queued always, so the release has one path; the proxy's memory is the
+   * tombstone's until then.
+   */
+  if (ng->dev && ng->host_handle)
+    nvgpu_gem_close_then(ng->dev, ng->owner_handle, ng->host_handle,
+                         nvgpu_gem_tomb_gone, ng);
+  else
+    nvgpu_gem_tomb_gone(ng);
 }
 
 /*

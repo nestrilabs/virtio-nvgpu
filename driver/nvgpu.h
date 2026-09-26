@@ -493,8 +493,10 @@ struct drm_gem_object *nvgpu_gem_proxy_find(struct nvgpu_fd *owner,
                                             u32 host_handle);
 /*
  * One proxy per host handle, until it is closed (S-11): a proxy whose last
- * reference is gone stays in `owner`'s index until its GEM_CLOSE has gone
- * out. A host handle it holds is neither found nor adoptable -- a PRIME
+ * reference is gone stays in `owner`'s index until the host has closed its
+ * handle -- its GEM_CLOSE answered, or known never to run -- not merely until
+ * the close was queued. A host handle it holds is neither found nor
+ * adoptable -- a PRIME
  * import that returns it gets -EAGAIN -- and is nobody else's to close.
  * Whoever meets one waits it out and asks the host again.
  */
@@ -853,6 +855,10 @@ int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
+/* The same, and release(arg) once the host can no longer act on the close:
+ * after its answer, or when it is known never to run. Process context. */
+void nvgpu_gem_close_then(struct nvgpu_device *dev, u32 file_handle, u32 gem,
+                          void (*release)(void *arg), void *arg);
 /*
  * MUNMAP: give back one window placement an MMAP reply handed out, through
  * the handle it was made on. The backend counts a reference per MMAP reply,
