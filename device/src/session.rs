@@ -726,6 +726,21 @@ impl NvidiaBackend {
         let io = |e: std::io::Error| errno_of(&e);
         match op {
             HostOp::PrimeExport { file, gem } => {
+                // A fence context is counted against its file's and the
+                // session's caps until its GEM handle closes (semsurf.rs),
+                // and each holds a host kthread, a timer and an NVKMS
+                // duplicate. A dma-buf of it would keep all that alive past
+                // the close, uncounted, as often as the guest liked.
+                // Nothing needs one: the object has no pages to share
+                // (nv_fence_context_gem_ops has no sg table), and the guest
+                // driver refuses to export one itself
+                // (nvgpu_fence_ctx_export).
+                if self.semsurf.is_ctx(file, gem) {
+                    log::warn!(
+                        "PRIME export of GEM {gem} of handle {file}, a fence context; refused"
+                    );
+                    return Err(libc::EINVAL);
+                }
                 let dmabuf = hostfd::prime_export(self.raw(file)?, gem).map_err(io)?;
                 let size = hostfd::dmabuf_size(dmabuf.as_raw_fd()).unwrap_or(0);
                 let h = self.insert(dmabuf, HandleKind::Dmabuf)?;
@@ -1492,6 +1507,29 @@ mod tests {
         let (st, r) = host_op(&mut be, OP_CLOSE_MANY, &[2, ev as u64, 12345]);
         assert_eq!((st, r.res[0]), (0, 1));
         assert!(be.handles.kind(ev).is_none());
+    }
+
+    /// A dma-buf of a fence context would keep it alive -- a host kthread,
+    /// a timer, an NVKMS duplicate -- after its GEM_CLOSE gave its slot back
+    /// to the caps (semsurf.rs): the export is refused before the host is
+    /// asked, and any other object of the file still goes.
+    #[test]
+    fn a_fence_context_is_never_exported() {
+        let mut be = backend();
+        hello(&mut be, HELLO_F_FRESH);
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        be.semsurf.render_opened(render, 0);
+        be.semsurf.ctx_made_for_test(render, 7);
+        assert_eq!(
+            host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 7]).0,
+            -libc::EINVAL
+        );
+        assert_eq!(be.semsurf.ctx_counts(render), (1, 1));
+        // Another GEM of the file reaches the host (/dev/null: no ioctls).
+        assert_eq!(
+            host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 8]).0,
+            -libc::ENOTTY
+        );
     }
 
     #[test]

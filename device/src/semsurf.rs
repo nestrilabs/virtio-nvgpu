@@ -366,6 +366,21 @@ impl SemsurfPolicy {
         }
     }
 
+    /// Whether GEM handle `gem` of render file `render` is a live fence
+    /// context.
+    pub fn is_ctx(&self, render: u32, gem: u32) -> bool {
+        self.lock()
+            .ctxs
+            .get(&render)
+            .is_some_and(|s| s.contains(&gem))
+    }
+
+    /// A fence context `gem` on `render`, as a successful 0x54 records one.
+    #[cfg(test)]
+    pub(crate) fn ctx_made_for_test(&self, render: u32, gem: u32) {
+        self.lock().ctxs.entry(render).or_default().insert(gem);
+    }
+
     /// Live fence contexts of `render`, and of the session.
     pub fn ctx_counts(&self, render: u32) -> (usize, usize) {
         let g = self.lock();
