@@ -4133,72 +4133,24 @@ impl NvidiaBackend {
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
         };
 
-        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry with different Cmd on EBUSY
-        // Some sysparams ioctls return EBUSY when the device is busy, especially
-        // during early initialization. We retry with Cmd=2 (V2) as fallback.
-        let retry_with_v2 = escape == 0xd6 && n_in >= 4 && param_in[0] == 0;
-
-        // ---------------------------------------------------------------
-        // Special handling: NV_ESC_CHECK_VERSION_STR (0xd2)
-        // Based on gVisor nvproxy: Try Cmd='2' first (character '2'),
-        // which triggers version query mode in newer drivers.
-        // ---------------------------------------------------------------
-        if escape == 0xd2 && n_in >= 4 {
-            // Try Cmd='2' first (query mode in newer drivers); leave the
-            // other fields as they are.
-            let _ = a.write(top, 0, b"2");
-        }
-
+        // NV_ESC_SYS_PARAMS and NV_ESC_CHECK_VERSION_STR go as the guest
+        // sent them, and their answers come back as the host gave them
+        // (SECURITY.md §17). SYS_PARAMS carries the caller's memory block
+        // size, which RM keeps from its first caller and answers EBUSY for
+        // any other; this once rewrote the block and made up a success. And
+        // CHECK_VERSION_STR was rewritten to query mode ('2'), in which RM
+        // skips comparing the caller's version with its own: a guest
+        // userspace of another release then ran against this RM unnoticed.
         let rc = self.host_call(&mut a, host_fd, request, top);
-        let first_ok = rc.is_ok();
         if let Err(errno) = rc {
-            // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry on EBUSY
-            if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
-                log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
-                let _ = a.write(top, 0, &[2]); // Try V2
-                if let Err(errno2) = self.host_call(&mut a, host_fd, request, top) {
-                    log::warn!(
-                        "ioctl(0x{:x}/0x{:02x}) retry failed: errno={}",
-                        request,
-                        escape,
-                        errno2
-                    );
-                    // EBUSY means driver is busy but shouldn't cause vulkan failure.
-                    // Synthesize success (like older drivers did) by returning zeros.
-                    log::warn!(
-                        "ioctl(0x{:x}/0x{:02x}) returned EBUSY - synthesizing success",
-                        request,
-                        escape
-                    );
-                    // Return success with zeroed params (simulates what driver returns)
-                    let zeroed = vec![0u8; n_in];
-                    return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
-                }
-                // Success on retry - continue to response handling
-            } else if escape == 0xd6 && errno == libc::EBUSY {
-                // EBUSY but couldn't retry (param[0] != 0) - synthesize success
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) returned EBUSY (no retry) - synthesizing success",
-                    request,
-                    escape
-                );
-                let zeroed = vec![0u8; n_in];
-                return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
-            } else {
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
-                    request,
-                    escape,
-                    errno
-                );
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
-            }
+            log::debug!("ioctl(0x{request:x}/0x{escape:02x}) failed: errno={errno}");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
         // The host's bytes, with the caller's values in every field the plan
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if first_ok && escape == 0xd2 {
+        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR && (request >> 8) & 0xFF == u64::from(b'F') {
             self.learn_driver_version(&param_buf);
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
@@ -6278,6 +6230,52 @@ mod tests {
         let resp = v1_ioctl(&mut be, uvm, cmd, &[0u8; 8]);
         assert_eq!(parse_resp(&resp).status, -libc::EPERM);
         assert!(forwarded().is_empty());
+    }
+
+    std::thread_local! {
+        /// The command byte CHECK_VERSION_STR reached the fake host with.
+        static VERSION_CMD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// RM's SYS_PARAMS for a memory block size other than its first
+    /// caller's (EBUSY), and its CHECK_VERSION_STR (the reply word set).
+    fn fake_sys_params_busy(_fd: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+        match (request & 0xff) as u32 {
+            abi::ioctl::NV_ESC_SYS_PARAMS => -libc::EBUSY,
+            abi::ioctl::NV_ESC_CHECK_VERSION_STR => {
+                VERSION_CMD.with(|c| c.set(Some(arg.bytes()[0])));
+                arg.bytes()[4] = 1;
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// SYS_PARAMS's EBUSY reaches the guest as EBUSY, not a made-up
+    /// success; CHECK_VERSION_STR reaches RM with the guest's own command,
+    /// so RM compares the guest userspace's version with its own.
+    #[test]
+    fn sys_params_and_check_version_go_as_sent_and_come_back_as_answered() {
+        use abi::ioctl::{NV_ESC_CHECK_VERSION_STR, NV_ESC_SYS_PARAMS};
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(fake_sys_params_busy);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+
+        let sys = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_SYS_PARAMS, 8);
+        let resp = v1_ioctl(&mut be, ctl, sys, &(128u64 << 20).to_le_bytes());
+        assert_eq!(parse_resp(&resp).status, -libc::EBUSY);
+
+        let check = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_CHECK_VERSION_STR, 72);
+        for cmd in [0u8, b'1'] {
+            let mut p = vec![0u8; 72];
+            p[0] = cmd;
+            p[8..17].copy_from_slice(b"595.99.02");
+            let resp = v1_ioctl(&mut be, ctl, check, &p);
+            assert_eq!(parse_resp(&resp).status, 0);
+            assert_eq!(VERSION_CMD.with(|c| c.take()), Some(cmd), "not rewritten");
+            assert_eq!(resp[IOCTL_BODY + 4], 1, "the host's reply word");
+        }
     }
 
     #[test]

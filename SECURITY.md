@@ -1415,8 +1415,8 @@ descriptor field, and an OwnedFd made of a number the kernel did not write.
 sources): a pointer field they miss reaches the host as the guest's bytes,
 exactly as before. Data rewrites are still edits of the host's copy -- the
 coherency attributes (`rmmem.rs`, on a copy before it is built), NVKMS
-policy (`nvkms.rs`), fence waits (`fence::before`), SYS_PARAMS' and
-CHECK_VERSION_STR's command byte -- only unable to reach a declared field.
+policy (`nvkms.rs`), fence waits (`fence::before`) -- only unable to reach a
+declared field. (SYS_PARAMS' and CHECK_VERSION_STR's rewrites are gone, §17.)
 RM's top-level blocks are field offsets (`Plan`), not typed structs. Both
 are roadmap item 9. The raw-descriptor helpers (`read_raw`, `fstat`, ...)
 take numbers: a wrong one is EBADF or another of the backend's own files,
@@ -1590,3 +1590,29 @@ layers not in force, the diagnostic flags) are what a production log holds.
 The rate limit (`device/src/ratelimit.rs`) already said how many lines a
 site dropped when its next line went out; a site that went quiet after its
 burst now says so at teardown too.
+
+**SYS_PARAMS and CHECK_VERSION_STR go as sent.** `NV_ESC_SYS_PARAMS` is
+`{NvU64 memblock_size}`: nvidia.ko keeps the first caller's value (on the
+control device, so host-wide) and answers EBUSY to any other
+(`kernel-open/nvidia/nv.c`). On EBUSY the backend wrote 2 into the value's
+low byte, called again, and on a second EBUSY answered the guest success
+with zeroed parameters; now the host's answer, EBUSY included, is the
+guest's. What remains: a guest whose SYS_PARAMS is the first on the host
+after the driver loads sets that host-wide value. RM uses it only to online
+GPU memory as NUMA on coherent platforms, which this project does not
+support; on a PCIe GPU it changes nothing.
+
+`NV_ESC_CHECK_VERSION_STR` (`nv_ioctl_rm_api_version_t {cmd, reply,
+versionString[64]}`) had its command rewritten to `'2'`, query mode, "based
+on gVisor nvproxy". In query mode RM copies out its own version and returns
+success without comparing (`RmPerformVersionCheck`, `osapi.c`); in the
+strict (`0`) and relaxed (`'1'`) modes userspace sends, it fails a caller
+whose version is not its own. The rewrite was not needed -- gVisor queries
+the host's version once for itself, and the backend reads it from
+`/proc/driver/nvidia/version` -- and what it did was let a guest userspace
+of another release run against this RM, with its structures sized for the
+other release. Userspace must match the host's module, as natively
+(`nvgpu-userspace` stages the host's own); a mismatch now fails in the
+guest as RM's API-mismatch error, with RM's usual `NVRM: API mismatch`
+line (the backend's process name) in the host's kernel log. Test:
+`sys_params_and_check_version_go_as_sent_and_come_back_as_answered`.
