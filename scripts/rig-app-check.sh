@@ -7,6 +7,10 @@
 #   apps  default: every app apps.sh knows
 #   tag   names the run's logs and captures (default apps-HHMMSS)
 #
+# The launcher's environment reaches it as is: NVGPU_VMM_KIND=crosvm runs the
+# pass under crosvm instead of nesbox. NVGPU_APPS_BACKEND_ARGS is split into
+# words and handed to the backend (run-guest.sh's "-- backend-args").
+#
 # Needs scripts/rig-headless-sway.sh running. Everything here talks to that
 # compositor only: the input it injects (virtual keyboard and pointer) and the
 # captures (screencopy) go to the headless sway, never to a desktop session.
@@ -108,7 +112,8 @@ N=$(tr ',' '\n' <<<"$APPS" | wc -l)
 say "guest: apps=$APPS slot=${SLOT}s"
 NVGPU_TIMEOUT=$((N * (SLOT + 10) + 90)) \
     NVGPU_CMDLINE_EXTRA="nvgpu_apps=$APPS nvgpu_slot=$SLOT ${NVGPU_APPS_EXTRA:-}" \
-    "$REPO/scripts/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" > "$OUT/run.log" 2>&1 &
+    "$REPO/scripts/run-guest.sh" --wayland-socket "$SOCK" apps "$TAG" \
+    -- ${NVGPU_APPS_BACKEND_ARGS:-} > "$OUT/run.log" 2>&1 &
 RUN=$!
 
 declare -A host_result

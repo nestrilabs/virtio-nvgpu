@@ -276,7 +276,7 @@ both.
 | [`isolate/`](isolate/) | **Apache-2.0** | **A design note, not code yet.** The sandboxed per-guest helper that will hold the real device FDs. Today the backend holds them itself. |
 | [`gen/`](gen/) | — | Generated tables: the ABI profiles, the IOCTL2 schema both halves interpret, NVKMS and nvidia-drm layouts, RM control pointers and UVM block sizes, each measured per driver release. Checked in *and* reproducible. |
 | [`protocol/`](protocol/) | **BSD-3-Clause OR GPL-2.0+** | Wire format and ABI definitions shared by both halves. Dual licensed so the GPL driver and the Apache crate can include the same headers. |
-| [`patches/`](patches/) | the patched project's | Patches to Hyprland and aquamarine that let the host lease a desktop monitor to a guest. |
+| [`patches/`](patches/) | the patched project's | Patches to Hyprland and aquamarine that let the host lease a desktop monitor to a guest, and to crosvm to run the device as a vhost-user frontend. |
 | [`scripts/`](scripts/) | — | The guest launcher, the guest's udev rule for `/dev/nvgpu-wl`, the Wayland loopback test, and [`scripts/verify/`](scripts/verify/), the helpers [`TESTING.md`](TESTING.md) runs on the GPU box. |
 
 The layout follows [`chromeos/virtio-media`](https://chromium.googlesource.com/chromiumos/platform/virtio-media/),
@@ -299,6 +299,55 @@ one sandboxed helper process per guest process, so adopting it eventually means
 inheriting a **process model**, not just a library dependency. That helper is
 not written — the backend holds the device descriptors itself today — and
 [`isolate/`](isolate/) is where the design lives until it is.
+
+### What a VMM must do, over vhost-user
+
+The backend binary (`vhost-user-nvgpu`) speaks the upstream vhost-user
+protocol as rust-vmm's `vhost` 0.17 implements it. A VMM that is its frontend
+must:
+
+- **Present virtio device ID 45** over virtio-pci, with the **device
+  configuration read from the backend** (`GET_CONFIG`; 4016 bytes) and two
+  queues (`MQ`). Use **PCI class 0xff0000**: a display-class function makes
+  guest userspace see a second GPU (Chromium did).
+- **Pass `VIRTIO_RING_F_INDIRECT_DESC` through** to the guest. Without it
+  requests are held to 256 KiB instead of 4 MiB.
+- **Publish shared memory region 1, 1 GiB**, as a 64-bit prefetchable BAR
+  above 4 GiB with a virtio shared-memory capability, and place what the
+  backend asks for in it: `BACKEND_REQ` plus `SHMEM`, `SHMEM_MAP`/`UNMAP`
+  (backend requests 9 and 10: region id, file offset, region offset,
+  length, read/write flag, the file descriptor with the message), answered
+  when `REPLY_ACK` is negotiated. A VMM that asks for the regions gets them
+  from `GET_SHMEM_CONFIG` (request 44): region 1, and region 2 only with
+  `--allow-compute`. **Check every request** against the region: the
+  backend is another process and may be compromised.
+- **Give the window write-back in the guest's MTRRs** (default type WB with
+  the 32-bit PCI hole UC, on every vCPU), or the guest driver warns that
+  the window "is not write-back in this guest's MTRRs".
+- **Leave the host GPU's PCI bus free in the guest.** The guest driver gives
+  the GPU the host's own PCI address (NVIDIA's userspace looks it up by
+  that), on a PCI host bridge of its own, so a guest with a bridge on that
+  bus number has no GPU device.
+- For compute only, the **UVM aperture** (region 2): see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md) §5, "The UVM aperture". A VMM
+  without it runs every graphics path, and the guest reports no compute.
+
+Two VMMs do this today. **nesbox** (`.rig/src/nesbox`, branch
+`virtio-nvgpu-v2`) has its own frontend for the device, with the UVM
+aperture. **crosvm** takes the patches in
+[`patches/crosvm/`](patches/crosvm/), three small changes and their tests: a vhost-user device type
+`nvgpu` (class 0xff0000, indirect descriptors, region 1 only, and only
+`SHMEM_MAP` of the backend's mapping requests); every backend mapping
+checked against its region, overlaps and stray unmaps refused, mappings
+dropped on reset; and `--no-pci-hotplug-port`, as crosvm otherwise puts an
+empty hot-plug root port on PCI bus 1. crosvm needed nothing new in the
+protocol: its vhost-user fork already implements the upstream
+`GET_SHMEM_CONFIG`, `SHMEM_MAP` and `SHMEM_UNMAP` messages byte for byte as
+rust-vmm does; the backend now answers `GET_SHMEM_CONFIG`, which nesbox
+never asks. It runs with its own sandbox on: every device crosvm emulates is
+a minijail'd process with its seccomp policy, none of which had to change,
+and the vhost-user frontend stays in crosvm's main process, as upstream has
+it. How to run it: [`TESTING-RIG.md`](TESTING-RIG.md), "crosvm".
 
 ---
 

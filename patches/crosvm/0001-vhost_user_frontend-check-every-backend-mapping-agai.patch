@@ -1,0 +1,436 @@
+From 3ae189fb8f3cb40e191b6e77df1aec4a8a884934 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 01:44:55 +0000
+Subject: [PATCH 1/4] vhost_user_frontend: check every backend mapping against
+ its region
+
+A vhost-user backend is another process, and may be a compromised one.
+Until now the frontend passed its SHMEM_MAP, GPU_MAP and EXTERNAL_MAP
+requests to the shared memory mapper with no check of its own: the
+mapper's arena refused a range past the BAR, but nothing refused one past
+the region the backend itself reported (the BAR is that length rounded up
+to a power of two), a mapping that overlaps a live one (the later MAP_FIXED
+silently replaces the earlier one's pages, and unmapping either then tears
+down the other's), or an unmap of a range that was never mapped.
+
+Keep the backend's live mappings in the handler and refuse, before
+anything is placed:
+- a mapping at an offset or file offset that is not page aligned, of
+  length zero, or whose pages reach past the region's length;
+- a mapping that overlaps a live one (EEXIST);
+- an unmap that does not name exactly a live mapping, offset and length.
+
+A length that is not a whole number of pages is taken as the pages it
+covers, as mmap takes it.
+
+Also:
+- unmap everything the backend mapped on device reset, which the
+  vhost-user spec asks of the front-end and was a TODO here;
+- a refused request no longer stops the worker (and with it the VM): the
+  refusal has already gone back to the backend as the reply, and the
+  channel is still in step.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ .../src/virtio/vhost_user_frontend/handler.rs | 260 +++++++++++-------
+ devices/src/virtio/vhost_user_frontend/mod.rs |  18 +-
+ .../src/virtio/vhost_user_frontend/worker.rs  |   7 +
+ 3 files changed, 178 insertions(+), 107 deletions(-)
+
+diff --git a/devices/src/virtio/vhost_user_frontend/handler.rs b/devices/src/virtio/vhost_user_frontend/handler.rs
+index 3678a8e..3c210e2 100644
+--- a/devices/src/virtio/vhost_user_frontend/handler.rs
++++ b/devices/src/virtio/vhost_user_frontend/handler.rs
+@@ -2,8 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++use std::collections::BTreeMap;
++
+ use base::error;
+ use base::info;
++use base::warn;
+ use base::AsRawDescriptor;
+ use base::Protection;
+ use base::SafeDescriptor;
+@@ -16,6 +19,7 @@ use vmm_vhost::message::VhostUserMMapFlags;
+ use vmm_vhost::Frontend;
+ use vmm_vhost::FrontendServer;
+ use vmm_vhost::HandlerResult;
++use vmm_vhost::SharedMemoryRegion;
+ 
+ use crate::virtio::Interrupt;
+ use crate::virtio::SharedMemoryMapper;
+@@ -25,6 +29,103 @@ pub(crate) type BackendReqHandler = FrontendServer<BackendReqHandlerImpl>;
+ struct SharedMapperState {
+     mapper: Box<dyn SharedMemoryMapper>,
+     shmid: u8,
++    /// Length of the region the guest sees, as the backend reported it.
++    length: u64,
++    /// Live mappings, offset -> length. The mapper keys mappings by offset
++    /// alone, and a later mapping silently replaces the host pages under an
++    /// earlier one, so an overlap would leave an unmap tearing down pages it
++    /// never mapped. Overlaps are refused instead.
++    mappings: BTreeMap<u64, u64>,
++}
++
++/// The end of the pages `[offset, offset + len)` touches, or `None` on overflow.
++fn page_end(offset: u64, len: u64) -> Option<u64> {
++    let page = base::pagesize() as u64;
++    offset.checked_add(len)?.checked_next_multiple_of(page)
++}
++
++impl SharedMapperState {
++    fn check_shmid(&self, shmid: u8) -> HandlerResult<()> {
++        if shmid != self.shmid {
++            error!("bad shmid {}, expected {}", shmid, self.shmid);
++            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++        }
++        Ok(())
++    }
++
++    /// Whether `[offset, offset + len)` may be mapped: at page-aligned
++    /// offsets, inside the region, and clear of every live mapping. A length
++    /// that is not a whole number of pages maps its last page whole, as mmap
++    /// does, so the pages it covers are what is checked. The backend is
++    /// another process and may be compromised; nothing it asks for is placed
++    /// until this has held.
++    fn check_new_mapping(&self, offset: u64, len: u64, fd_offset: u64) -> HandlerResult<()> {
++        let page = base::pagesize() as u64;
++        let end = match page_end(offset, len) {
++            Some(end)
++                if len != 0
++                    && offset % page == 0
++                    && fd_offset % page == 0
++                    && fd_offset.checked_add(len).is_some()
++                    && end <= self.length =>
++            {
++                end
++            }
++            _ => {
++                error!(
++                    "refusing mapping {:#x}+{:#x} (file offset {:#x}): not page aligned or \
++                     outside the {:#x}-byte region {}",
++                    offset, len, fd_offset, self.length, self.shmid
++                );
++                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++            }
++        };
++        if let Some((&start, &l)) = self.mappings.range(..end).next_back() {
++            if page_end(start, l).is_some_and(|e| e > offset) {
++                error!(
++                    "refusing mapping {:#x}+{:#x}: overlaps {:#x}+{:#x} in region {}",
++                    offset, len, start, l, self.shmid
++                );
++                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
++            }
++        }
++        Ok(())
++    }
++
++    fn add(
++        &mut self,
++        source: VmMemorySource,
++        offset: u64,
++        len: u64,
++        prot: Protection,
++    ) -> HandlerResult<()> {
++        self.mapper
++            .add_mapping(source, offset, prot, MemCacheType::CacheCoherent)
++            .map_err(|e| {
++                error!("failed to create mapping {:?}", e);
++                std::io::Error::other(e.context("add mapping"))
++            })?;
++        self.mappings.insert(offset, len);
++        Ok(())
++    }
++
++    /// Removes the mapping at exactly `offset`, which must have been made with
++    /// exactly `len`: the mapper can only take a mapping away whole.
++    fn remove(&mut self, offset: u64, len: u64) -> HandlerResult<()> {
++        if self.mappings.get(&offset) != Some(&len) {
++            error!(
++                "refusing unmap {:#x}+{:#x} in region {}: no such mapping",
++                offset, len, self.shmid
++            );
++            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++        }
++        self.mapper.remove_mapping(offset).map_err(|e| {
++            error!("failed to remove mapping {:?}", e);
++            std::io::Error::other(e.context("remove memory mapping based on shm offset"))
++        })?;
++        self.mappings.remove(&offset);
++        Ok(())
++    }
+ }
+ 
+ pub struct BackendReqHandlerImpl {
+@@ -49,67 +150,62 @@ impl BackendReqHandlerImpl {
+     pub(crate) fn set_shared_mapper_state(
+         &mut self,
+         mapper: Box<dyn SharedMemoryMapper>,
+-        shmid: u8,
++        region: SharedMemoryRegion,
+     ) {
+-        self.shared_mapper_state = Some(SharedMapperState { mapper, shmid });
++        self.shared_mapper_state = Some(SharedMapperState {
++            mapper,
++            shmid: region.id,
++            length: region.length,
++            mappings: BTreeMap::new(),
++        });
++    }
++
++    /// Takes down every mapping the backend made. The vhost-user
++    /// specification has the front-end do this across a device reset.
++    pub(crate) fn unmap_all(&mut self) {
++        let Some(state) = self.shared_mapper_state.as_mut() else {
++            return;
++        };
++        for (offset, len) in std::mem::take(&mut state.mappings) {
++            if let Err(e) = state.mapper.remove_mapping(offset) {
++                warn!(
++                    "reset: failed to remove mapping {:#x}+{:#x}: {:#}",
++                    offset, len, e
++                );
++            }
++        }
+     }
+ }
+ 
+ impl Frontend for BackendReqHandlerImpl {
+     fn shmem_map(&mut self, req: &VhostUserMMap, fd: &dyn AsRawDescriptor) -> HandlerResult<()> {
+-        let shared_mapper_state = self
++        let state = self
+             .shared_mapper_state
+             .as_mut()
+             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        if req.shmid != shared_mapper_state.shmid {
+-            error!(
+-                "bad shmid {}, expected {}",
+-                req.shmid, shared_mapper_state.shmid
+-            );
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-        }
+-        shared_mapper_state
+-            .mapper
+-            .add_mapping(
+-                VmMemorySource::Descriptor {
+-                    descriptor: SafeDescriptor::try_from(fd)
+-                        .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
+-                    offset: req.fd_offset,
+-                    size: req.len,
+-                },
+-                req.shm_offset,
+-                if req.flags.contains(VhostUserMMapFlags::MAP_RW) {
+-                    Protection::read_write()
+-                } else {
+-                    Protection::read()
+-                },
+-                MemCacheType::CacheCoherent,
+-            )
+-            .map_err(|e| {
+-                error!("failed to create mapping {:?}", e);
+-                std::io::Error::other(e.context("add descriptor mapping"))
+-            })
++        state.check_shmid(req.shmid)?;
++        state.check_new_mapping(req.shm_offset, req.len, req.fd_offset)?;
++        let source = VmMemorySource::Descriptor {
++            descriptor: SafeDescriptor::try_from(fd)
++                .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
++            offset: req.fd_offset,
++            size: req.len,
++        };
++        let prot = if req.flags.contains(VhostUserMMapFlags::MAP_RW) {
++            Protection::read_write()
++        } else {
++            Protection::read()
++        };
++        state.add(source, req.shm_offset, req.len, prot)
+     }
+ 
+     fn shmem_unmap(&mut self, req: &VhostUserMMap) -> HandlerResult<()> {
+-        let shared_mapper_state = self
++        let state = self
+             .shared_mapper_state
+             .as_mut()
+             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        if req.shmid != shared_mapper_state.shmid {
+-            error!(
+-                "bad shmid {}, expected {}",
+-                req.shmid, shared_mapper_state.shmid
+-            );
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-        }
+-        shared_mapper_state
+-            .mapper
+-            .remove_mapping(req.shm_offset)
+-            .map_err(|e| {
+-                error!("failed to remove mapping {:?}", e);
+-                std::io::Error::other(e.context("remove memory mapping based on shm offset"))
+-            })
++        state.check_shmid(req.shmid)?;
++        state.remove(req.shm_offset, req.len)
+     }
+ 
+     fn gpu_map(
+@@ -117,37 +213,22 @@ impl Frontend for BackendReqHandlerImpl {
+         req: &VhostUserGpuMapMsg,
+         descriptor: &dyn AsRawDescriptor,
+     ) -> HandlerResult<()> {
+-        let shared_mapper_state = self
++        let state = self
+             .shared_mapper_state
+             .as_mut()
+             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        if req.shmid != shared_mapper_state.shmid {
+-            error!(
+-                "bad shmid {}, expected {}",
+-                req.shmid, shared_mapper_state.shmid
+-            );
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-        }
+-        shared_mapper_state
+-            .mapper
+-            .add_mapping(
+-                VmMemorySource::Vulkan {
+-                    descriptor: SafeDescriptor::try_from(descriptor)
+-                        .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
+-                    handle_type: req.handle_type,
+-                    memory_idx: req.memory_idx,
+-                    device_uuid: req.device_uuid,
+-                    driver_uuid: req.driver_uuid,
+-                    size: req.len,
+-                },
+-                req.shm_offset,
+-                Protection::read_write(),
+-                MemCacheType::CacheCoherent,
+-            )
+-            .map_err(|e| {
+-                error!("failed to create mapping {:?}", e);
+-                std::io::Error::other(e.context("add Vulkan source mapping"))
+-            })
++        state.check_shmid(req.shmid)?;
++        state.check_new_mapping(req.shm_offset, req.len, 0)?;
++        let source = VmMemorySource::Vulkan {
++            descriptor: SafeDescriptor::try_from(descriptor)
++                .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?,
++            handle_type: req.handle_type,
++            memory_idx: req.memory_idx,
++            device_uuid: req.device_uuid,
++            driver_uuid: req.driver_uuid,
++            size: req.len,
++        };
++        state.add(source, req.shm_offset, req.len, Protection::read_write())
+     }
+ 
+     fn external_map(&mut self, req: &VhostUserExternalMapMsg) -> HandlerResult<()> {
+@@ -157,32 +238,17 @@ impl Frontend for BackendReqHandlerImpl {
+             return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+         }
+ 
+-        let shared_mapper_state = self
++        let state = self
+             .shared_mapper_state
+             .as_mut()
+             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+-        if req.shmid != shared_mapper_state.shmid {
+-            error!(
+-                "bad shmid {}, expected {}",
+-                req.shmid, shared_mapper_state.shmid
+-            );
+-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-        }
+-        shared_mapper_state
+-            .mapper
+-            .add_mapping(
+-                VmMemorySource::ExternalMapping {
+-                    ptr: req.ptr,
+-                    size: req.len,
+-                },
+-                req.shm_offset,
+-                Protection::read_write(),
+-                MemCacheType::CacheCoherent,
+-            )
+-            .map_err(|e| {
+-                error!("failed to create mapping {:?}", e);
+-                std::io::Error::other(e.context("add external mapping"))
+-            })
++        state.check_shmid(req.shmid)?;
++        state.check_new_mapping(req.shm_offset, req.len, 0)?;
++        let source = VmMemorySource::ExternalMapping {
++            ptr: req.ptr,
++            size: req.len,
++        };
++        state.add(source, req.shm_offset, req.len, Protection::read_write())
+     }
+ 
+     fn handle_config_change(&mut self) -> HandlerResult<()> {
+diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
+index e80d755..a2f7874 100644
+--- a/devices/src/virtio/vhost_user_frontend/mod.rs
++++ b/devices/src/virtio/vhost_user_frontend/mod.rs
+@@ -484,9 +484,6 @@ impl VirtioDevice for VhostUserFrontend {
+     }
+ 
+     fn reset(&mut self) -> anyhow::Result<()> {
+-        // TODO: Reset SHMEM_MAP mappings. The vhost-user spec says "mappings are automatically
+-        // unmapped by the front-end across device reset operation".
+-
+         if let Some(sent_queues) = self.sent_queues.take() {
+             for queue_index in sent_queues.into_keys() {
+                 let _vring_base = self
+@@ -501,6 +498,12 @@ impl VirtioDevice for VhostUserFrontend {
+             self.vm_evt_wrtube = vm_evt_wrtube;
+         }
+ 
++        // The vhost-user spec says "mappings are automatically unmapped by the front-end across
++        // device reset operation".
++        if let Some(handler) = self.backend_req_handler.as_mut() {
++            handler.frontend_mut().unmap_all();
++        }
++
+         Ok(())
+     }
+ 
+@@ -556,16 +559,11 @@ impl VirtioDevice for VhostUserFrontend {
+         };
+ 
+         // The virtio framework will only call this if get_shared_memory_region returned a region
+-        let shmid = self
+-            .shmem_region
+-            .borrow()
+-            .flatten()
+-            .expect("missing shmid")
+-            .id;
++        let region = self.shmem_region.borrow().flatten().expect("missing shmid");
+ 
+         backend_req_handler
+             .frontend_mut()
+-            .set_shared_mapper_state(mapper, shmid);
++            .set_shared_mapper_state(mapper, region);
+     }
+ 
+     fn expose_shmem_descriptors_with_viommu(&self) -> bool {
+diff --git a/devices/src/virtio/vhost_user_frontend/worker.rs b/devices/src/virtio/vhost_user_frontend/worker.rs
+index 4e89747..68bed7b 100644
+--- a/devices/src/virtio/vhost_user_frontend/worker.rs
++++ b/devices/src/virtio/vhost_user_frontend/worker.rs
+@@ -114,6 +114,13 @@ impl Worker {
+                                 let _ = wait_ctx.delete(backend_req_handler.get_close_notifier());
+                                 self.backend_req_handler = None;
+                             }
++                            // The handler refused the request and the refusal has been sent
++                            // back to the backend when it asked for a reply; the channel is
++                            // still in step, and the guest's device keeps working without
++                            // whatever was refused.
++                            Err(VhostError::ReqHandlerError(e)) => {
++                                warn!("vhost-user backend request refused: {}", e);
++                            }
+                             Err(e) => return Err(e).context("failed to handle vhost-user request"),
+                         }
+                     }
+-- 
+2.55.0
+

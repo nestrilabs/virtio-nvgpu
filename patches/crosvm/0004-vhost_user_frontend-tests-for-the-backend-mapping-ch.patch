@@ -1,0 +1,184 @@
+From 8832fbbc19a88a5880bf1052ea7453a58fb8109d Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 01:54:00 +0000
+Subject: [PATCH 4/4] vhost_user_frontend: tests for the backend mapping checks
+
+Against a mapper that records what reaches it: mappings inside the region
+(a partial last page included) pass and nothing else does -- past the
+end, wrapping, unaligned offsets or file offsets, empty, another region;
+overlaps (by the pages a mapping covers) are EEXIST; an unmap must name a
+mapping exactly; a reset takes every mapping down; and a virtio-nvgpu
+backend gets EPERM for EXTERNAL_MAP.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ .../src/virtio/vhost_user_frontend/handler.rs | 155 ++++++++++++++++++
+ 1 file changed, 155 insertions(+)
+
+diff --git a/devices/src/virtio/vhost_user_frontend/handler.rs b/devices/src/virtio/vhost_user_frontend/handler.rs
+index 69d3e1f..bca22b3 100644
+--- a/devices/src/virtio/vhost_user_frontend/handler.rs
++++ b/devices/src/virtio/vhost_user_frontend/handler.rs
+@@ -281,3 +281,158 @@ impl Frontend for BackendReqHandlerImpl {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Arc;
++    use std::sync::Mutex;
++
++    use vmm_vhost::message::VhostUserMMap;
++    use vmm_vhost::message::VhostUserMMapFlags;
++    use vmm_vhost::Frontend;
++    use vmm_vhost::SharedMemoryRegion;
++
++    use super::*;
++
++    const MIB: u64 = 1 << 20;
++
++    /// What reached the mapper: (add, offset) in order.
++    #[derive(Clone, Default)]
++    struct Log(Arc<Mutex<Vec<(bool, u64)>>>);
++
++    struct FakeMapper(Log);
++
++    impl SharedMemoryMapper for FakeMapper {
++        fn add_mapping(
++            &mut self,
++            _source: VmMemorySource,
++            offset: u64,
++            _prot: Protection,
++            _cache: MemCacheType,
++        ) -> anyhow::Result<()> {
++            self.0 .0.lock().unwrap().push((true, offset));
++            Ok(())
++        }
++
++        fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
++            self.0 .0.lock().unwrap().push((false, offset));
++            Ok(())
++        }
++    }
++
++    fn handler(device_type: DeviceType) -> (BackendReqHandlerImpl, Log) {
++        let log = Log::default();
++        let mut h = BackendReqHandlerImpl::new(true, device_type);
++        h.set_shared_mapper_state(
++            Box::new(FakeMapper(log.clone())),
++            SharedMemoryRegion {
++                id: 1,
++                length: 16 * MIB,
++            },
++        );
++        (h, log)
++    }
++
++    fn req(shm_offset: u64, len: u64, fd_offset: u64) -> VhostUserMMap {
++        VhostUserMMap {
++            shmid: 1,
++            fd_offset,
++            shm_offset,
++            len,
++            flags: VhostUserMMapFlags::MAP_RW,
++            ..Default::default()
++        }
++    }
++
++    fn map(h: &mut BackendReqHandlerImpl, r: &VhostUserMMap) -> Option<i32> {
++        let f = std::fs::File::open("/dev/null").unwrap();
++        h.shmem_map(r, &f)
++            .err()
++            .map(|e| e.raw_os_error().unwrap_or(-1))
++    }
++
++    #[test]
++    fn mappings_are_held_to_the_region() {
++        let (mut h, log) = handler(DeviceType::Nvgpu);
++        let page = base::pagesize() as u64;
++        // Inside, and a length that is not whole pages (it maps its pages).
++        assert_eq!(map(&mut h, &req(0, 0xc50, 0)), None);
++        assert_eq!(map(&mut h, &req(15 * MIB, MIB, 0)), None);
++        // Past the end, or wrapping, or not aligned, or empty, or another id.
++        assert_eq!(map(&mut h, &req(16 * MIB, page, 0)), Some(libc::EINVAL));
++        assert_eq!(
++            map(&mut h, &req(15 * MIB + page, MIB, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(
++            map(&mut h, &req(u64::MAX - page + 1, page, 0)),
++            Some(libc::EINVAL)
++        );
++        assert_eq!(map(&mut h, &req(8 * MIB + 1, page, 0)), Some(libc::EINVAL));
++        assert_eq!(map(&mut h, &req(8 * MIB, page, 1)), Some(libc::EINVAL));
++        assert_eq!(map(&mut h, &req(8 * MIB, 0, 0)), Some(libc::EINVAL));
++        assert_eq!(
++            map(&mut h, &req(8 * MIB, page, u64::MAX)),
++            Some(libc::EINVAL)
++        );
++        let mut other = req(8 * MIB, page, 0);
++        other.shmid = 2;
++        assert_eq!(map(&mut h, &other), Some(libc::EINVAL));
++        // Only the two good ones reached the mapper.
++        assert_eq!(*log.0.lock().unwrap(), vec![(true, 0), (true, 15 * MIB)]);
++    }
++
++    #[test]
++    fn overlaps_and_stray_unmaps_are_refused_and_reset_unmaps() {
++        let (mut h, log) = handler(DeviceType::Nvgpu);
++        let page = base::pagesize() as u64;
++        assert_eq!(map(&mut h, &req(MIB, MIB, 0)), None);
++        // The page 0xc50 bytes cover overlaps the next one's start.
++        assert_eq!(map(&mut h, &req(4 * MIB, 0xc50, 0)), None);
++        assert_eq!(map(&mut h, &req(4 * MIB, page, 0)), Some(libc::EEXIST));
++        assert_eq!(map(&mut h, &req(MIB + page, page, 0)), Some(libc::EEXIST));
++        assert_eq!(map(&mut h, &req(0, 2 * MIB, 0)), Some(libc::EEXIST));
++        // Adjacent is fine.
++        assert_eq!(map(&mut h, &req(2 * MIB, page, 0)), None);
++        assert_eq!(map(&mut h, &req(MIB - page, page, 0)), None);
++        // An unmap must name a mapping exactly.
++        let unmap = |h: &mut BackendReqHandlerImpl, o, l| {
++            h.shmem_unmap(&req(o, l, 0))
++                .err()
++                .map(|e| e.raw_os_error().unwrap_or(-1))
++        };
++        assert_eq!(unmap(&mut h, MIB, page), Some(libc::EINVAL));
++        assert_eq!(unmap(&mut h, MIB + page, MIB - page), Some(libc::EINVAL));
++        assert_eq!(unmap(&mut h, 3 * MIB, page), Some(libc::EINVAL));
++        assert_eq!(unmap(&mut h, MIB, MIB), None);
++        assert_eq!(unmap(&mut h, MIB, MIB), Some(libc::EINVAL));
++        // Its place is free again.
++        assert_eq!(map(&mut h, &req(MIB, page, 0)), None);
++        log.0.lock().unwrap().clear();
++        h.unmap_all();
++        let mut removed: Vec<_> = log.0.lock().unwrap().clone();
++        removed.sort();
++        assert_eq!(
++            removed,
++            vec![
++                (false, MIB - page),
++                (false, MIB),
++                (false, 2 * MIB),
++                (false, 4 * MIB)
++            ]
++        );
++        // And nothing is left to overlap.
++        assert_eq!(map(&mut h, &req(0, 16 * MIB, 0)), None);
++    }
++
++    #[test]
++    fn nvgpu_takes_no_gpu_or_external_maps() {
++        let (mut h, log) = handler(DeviceType::Nvgpu);
++        let msg = VhostUserExternalMapMsg::new(1, 0, 4096, 0x1000);
++        assert_eq!(
++            h.external_map(&msg).err().and_then(|e| e.raw_os_error()),
++            Some(libc::EPERM)
++        );
++        assert!(log.0.lock().unwrap().is_empty());
++    }
++}
+-- 
+2.55.0
+
