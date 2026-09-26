@@ -896,6 +896,7 @@ impl crate::nvidia::NvidiaBackend {
             }
             return Err(e);
         }
+        log::debug!("INJECT_OPEN of id {id}: GEM {gem} of render handle {file}");
         Ok((
             vec![
                 u64::from(gem),

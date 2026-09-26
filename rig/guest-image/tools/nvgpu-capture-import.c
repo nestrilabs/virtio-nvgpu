@@ -19,13 +19,15 @@
  *
  * Usage: nvgpu-capture-import --id N --token HEX32 [--frame F] [--fnv HEX]
  *          [--render PATH] [--node PATH] [--no-egl] [--no-vk]
- *          [--expect-errno E] [--watch MS]
+ *          [--expect-errno E] [--watch MS] [--no-cpu]
  *   --frame F      the frame the host painted last into this buffer; without
  *                  it the frame is read from pixel (0,0) and the rest of the
  *                  image checked against it
  *   --fnv HEX      the host's checksum of that frame (nvgpu-inject-test)
  *   --expect-errno the OPEN must fail with this errno (e.g. 2, ENOENT, for a
  *                  wrong token or a released id); nothing else is done
+ *   --no-cpu       skip step 2: no CPU mapping at all, so what 3 and 4 cost
+ *                  the shared window is what a GPU-only consumer costs it
  *   --watch MS     read the buffer through Vulkan again after MS ms (the host
  *                  keeps painting it): the frame must have moved on, without
  *                  a new OPEN; a read of a frame half painted is counted as
@@ -619,7 +621,7 @@ int main(int argc, char **argv)
 {
 	const char *node = "/dev/nvgpu-capture", *render_path = "/dev/dri/renderD128";
 	struct nvgpu_capture_open o = {0};
-	int frame = -1, no_egl = 0, no_vk = 0, expect_errno = 0, watch = 0, have_token = 0;
+	int frame = -1, no_egl = 0, no_vk = 0, no_cpu = 0, expect_errno = 0, watch = 0, have_token = 0;
 	uint32_t fnv = 0;
 	for (int i = 1; i < argc; i++) {
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -643,6 +645,8 @@ int main(int argc, char **argv)
 			no_egl = 1;
 		else if (!strcmp(argv[i], "--no-vk"))
 			no_vk = 1;
+		else if (!strcmp(argv[i], "--no-cpu"))
+			no_cpu = 1;
 		else {
 			fprintf(stderr, "usage: see the head of %s's source\n", argv[0]);
 			return 2;
@@ -677,7 +681,8 @@ int main(int argc, char **argv)
 	   (const char *)&o.fourcc, (unsigned long long)o.modifier, o.nplanes, o.offsets[0], o.strides[0],
 	   (unsigned long long)o.size);
 	OK((fcntl(o.dmabuf_fd, F_GETFL) & O_ACCMODE) == O_RDONLY, "the dma-buf is open read-only");
-	cpu_checks(render, &o);
+	if (!no_cpu)
+		cpu_checks(render, &o);
 	if (!no_egl)
 		egl_check(&o, frame, fnv);
 	if (!no_vk)

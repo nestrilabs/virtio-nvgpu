@@ -50,6 +50,14 @@ if load_module; then
             "$IMPORT" --id "$id" --token "$tok" --frame "$frame" --fnv "$fnv"
     done
 
+    # What a GPU-only consumer (a browser, a compositor) costs the shared
+    # window: the backend's log says whether anything was placed.
+    if [ -n "$first_id" ]; then
+        IFS=: read -r id tok frame fnv <<<"${bufs[0]}"
+        step "GPU-only import of id $id (no CPU mapping)" 60 \
+            "$IMPORT" --id "$id" --token "$tok" --frame "$frame" --fnv "$fnv" --no-cpu
+    fi
+
     section "refusals"
     if [ -n "$first_id" ]; then
         # The token's last digit changed: nothing opens, and the answer is
