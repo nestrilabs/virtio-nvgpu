@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The virtio-nvgpu backend for one VM, as a user of its own: instance N runs
+# as nvgpu-vmN, and the VMM that connects to it runs as nvgpu-vmmN, whose
+# group is nvgpu-vmN (DEPLOY.md, "Per-VM users"). Its socket is
+# /run/nvgpu/vmN/nvgpu.sock, open to that group alone.
+#
+#   systemctl start vhost-user-nvgpu@0.service
+#   # then the VMM, as nvgpu-vmm0, with its vhost-user socket at
+#   # /run/nvgpu/vm0/nvgpu.sock; a VMM unit should say
+#   #   Requires=vhost-user-nvgpu@0.service
+#   #   After=vhost-user-nvgpu@0.service
+#
+# Backend flags per VM go in /etc/virtio-nvgpu/vmN.env as
+# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags").
+# Paths assume the backend at /usr/bin and the socket helper at
+# /usr/libexec/virtio-nvgpu; adjust them (or use nix/module.nix) as installed.
+#
+# What the unit adds to the backend's own sandbox (device/src/sandbox.rs):
+# a cgroup of the VM's own with a memory and task bound and the OOM killer's
+# preference, a network namespace with only loopback (the backend keeps it
+# rather than making one, and it still hears the kernel's uevents), and a
+# read-only view of the file system. The backend needs, at run time: the
+# GPU's nodes (/dev/nvidia*, /dev/dri/renderD*, /dev/dri/card* with
+# --kms-card, /dev/udmabuf, /dev/null), /proc/driver/nvidia, /proc/self,
+# /proc/cpuinfo and the GPUs' directories in /sys, all of which this leaves
+# reachable; its socket directory, which RuntimeDirectory= makes; and, in the
+# Wayland modes, the compositor's socket (DEPLOY.md, "The Wayland modes").
+
+[Unit]
+Description=virtio-nvgpu vhost-user backend for VM %i
+# The host driver must be loaded and nvidia_drm.modeset=1 (DEPLOY.md).
+After=systemd-modules-load.service
+
+[Service]
+Type=exec
+User=nvgpu-vm%i
+Group=nvgpu-vm%i
+# The device nodes' groups: render nodes (render), card nodes (video, only
+# with --kms-card), /dev/udmabuf (kvm). /dev/nvidia* are 0666.
+SupplementaryGroups=video render kvm
+Environment=RUST_LOG=warn
+EnvironmentFile=-/etc/virtio-nvgpu/vm%i.env
+ExecStart=/usr/bin/vhost-user-nvgpu --socket /run/nvgpu/vm%i/nvgpu.sock $NVGPU_BACKEND_ARGS
+# Open the socket to the VMM's group once it exists, as root, after making
+# the directory root's so the backend's user can no longer swap the socket
+# for a link (the same steps as the rig launcher's root mode).
+ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-socket-open /run/nvgpu/vm%i nvgpu-vm%i
+RuntimeDirectory=nvgpu/vm%i
+RuntimeDirectoryMode=0700
+UMask=0077
+
+# A backend that stops takes its VM's device with it; the VMM must be
+# restarted with it, so this is never restarted alone.
+Restart=no
+TimeoutStopSec=10
+
+# Resources. Guest RAM is the VMM's; what the backend itself holds is mostly
+# Wayland shm (--wayland-shm-budget, 1 GiB by default) and queued compositor
+# output (--wayland-queue-budget, 256 MiB): raise MemoryMax with them.
+MemoryMax=2G
+MemorySwapMax=0
+# Up to 16 executors, one reader per Wayland channel (64 by default), the
+# transport, pump, closer and hotplug threads.
+TasksMax=256
+OOMScoreAdjust=500
+LimitCORE=0
+
+# Privileges: none to begin with (the backend also drops them itself and
+# refuses to start as root or with CAP_SYS_ADMIN).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+# AF_NETLINK: the uevent socket (--kms-card, --wayland-lease).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# The file system, read-only but the socket directory; no home directories
+# (the Wayland modes need a drop-in: DEPLOY.md).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateIPC=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+# Not set, on purpose: PrivateDevices= and DevicePolicy=/DeviceAllow= (the
+# backend needs the GPU's nodes; Landlock already holds it to those), and
+# ProtectClock=, which closes the device policy as a side effect;
+# PrivateUsers= (RM, DRM and NVKMS take a guest's privilege from the
+# backend's real uid); ProcSubset=pid (it reads /proc/driver/nvidia).
+
+[Install]
+WantedBy=multi-user.target

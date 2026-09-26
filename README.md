@@ -160,14 +160,15 @@ privilege from the credentials of the process that calls them, and that process
 is the backend: run as root, every guest process would be an RM administrator
 with all of BAR0 mappable — the host kernel, one DMA away. So the backend
 refuses to start as root or with `CAP_SYS_ADMIN` unless told
-`--allow-root-unsafe`, and drops every capability before its first thread in
-any case. [`scripts/run-guest.sh`](scripts/run-guest.sh) starts it through
-`setpriv`, with no capabilities and no supplementary groups but those of
-`video`, `render` and `kvm` the host has: as root, as a user of its own per VM
-(`nvgpu-vm0`, `nvgpu-vm1`, ... from a pool the script's header shows how to
-make, with the VMM under nesbox's jailer as the slot's `nvgpu-vmm0`, ...), or
-in the Wayland modes as the owner of the compositor's socket or of the export
-directory ([Display](#display)). Its socket defaults to
+`--allow-root-unsafe` (a diagnostic flag), and drops every capability before
+its first thread in any case. In production each VM's backend runs as a user
+of its own (`nvgpu-vm0`, `nvgpu-vm1`, ...), with the VMM as the slot's
+`nvgpu-vmm0`, ..., from the shipped systemd unit or NixOS module, in a cgroup
+of its own with a memory bound ([`DEPLOY.md`](DEPLOY.md)); the rig's launcher,
+[`scripts/run-guest.sh`](scripts/run-guest.sh), does the same through
+`setpriv` when run as root, and in the Wayland modes runs it as the owner of
+the compositor's socket or of the export directory ([Display](#display)).
+Its socket defaults to
 `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock`, in a directory only it can enter, because
 whoever listens there is handed the guest's memory.
 
@@ -821,6 +822,9 @@ the vendored Wayland protocols. Every source file names its licence in an
 
 ## See also
 
+- [`DEPLOY.md`](DEPLOY.md) — how to run it: host requirements, what is
+  supported, per-VM users and the systemd unit, the flags, the guest image,
+  what to alert on, and upgrading the host driver.
 - [`BENCHMARKS.md`](BENCHMARKS.md) — what it costs against bare metal, how that
   was measured, and what the numbers do not support.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — how it works, in prose: what crosses

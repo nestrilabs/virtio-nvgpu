@@ -132,8 +132,9 @@ and without `--allow-compute`", §3).
   and, run as root, each VM's backend and VMM are host users of their own
   (§4, "One uid per VM"). What neither touches is the GPU (RM's page tables
   keep VMs apart there) and the host kernel the backend still calls. There is
-  no cgroup of the backend's own (the launcher's `NVGPU_MEMORY_MAX` scope
-  holds the whole run), and the per-guest isolate is not built.
+  a cgroup of the backend's own in the shipped unit (`MemoryMax`,
+  `TasksMax`; [`DEPLOY.md`](DEPLOY.md)), none under the rig's launcher, whose
+  `NVGPU_MEMORY_MAX` scope holds the whole run, and the per-guest isolate is not built.
 - One VM's budgets are split among its guest processes (§11, quota.rs), but
   a guest process that forks is a new process with a share of its own: the
   guest's own process limits are what bound a forking app.
@@ -510,7 +511,7 @@ removed, since nothing can say whether RM took it.
 | display caps | -- | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | the zones, first come first served | each zone (UC 32 MiB, WC 768 MiB, WB 224 MiB) at most half per guest process, the last eighth kept for processes holding at most a sixteenth; a mapping is charged to whoever opened the file it is armed on |
 | Wayland caps | -- | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools, shared by all its connections. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
-| not capped | -- | Memory outside the Wayland and window budgets has no limit, and no cgroup. Several VMs of one backend user share that user's host limits. |
+| not capped | -- | Memory outside the Wayland and window budgets has no limit of the backend's own; the shipped unit (`contrib/systemd/vhost-user-nvgpu@.service`, DEPLOY.md) puts each backend in a cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and `OOMScoreAdjust=500`, the rig's launcher does not. Several VMs of one backend user share that user's host limits. |
 
 ### The backend's sandbox
 
@@ -611,8 +612,9 @@ What a uid per VM does not do:
   user, and share it with the desktop: the VMM, with seccomp but no Landlock,
   can open whatever the user can; RM sees the user's own token; two VMs
   started by one user are one principal. Keep a rig for one VM at a time.
-- **Memory.** No cgroup is keyed to the uid; the launcher's scope
-  (`NVGPU_MEMORY_MAX`) bounds a run.
+- **Memory.** No cgroup is keyed to the uid: the shipped unit's cgroup
+  bounds each backend (DEPLOY.md), and the launcher's scope
+  (`NVGPU_MEMORY_MAX`) bounds a rig run.
 
 ---
 
@@ -923,7 +925,7 @@ fix commit and the code. S-35, which a later review of the RM path opened
 | S-1 | critical | RM control pointers reach RM as guest addresses in the backend | `93283b4`, `c16bddc`, `f8405cf` | fixed (item 2, refusing non-table controls larger than their inline block, was judged unnecessary) |
 | S-2 | high | Wayland shm capped only per connection | `86553c1`, `de95ad3` | fixed |
 | S-3 | high | no per-VM cap on Wayland channels | `de95ad3` | fixed |
-| S-4 | high | shm memfds: host OOM the OOM killer cannot attribute | `86553c1`, `de95ad3` | fixed; refusing SHM_SYNC before commit, and a cgroup in the launcher, not done |
+| S-4 | high | shm memfds: host OOM the OOM killer cannot attribute | `86553c1`, `de95ad3` | fixed; a cgroup per backend is the shipped unit's (DEPLOY.md); refusing SHM_SYNC before commit not done |
 | S-5 | high | a root backend makes every guest process an RM administrator | `b3c126b`, `ae182ab` | fixed; class 0x3f allocatable (the Vulkan driver makes one) but its BAR0 mapping is RM-admin only and the backend is never admin; forcing non-privileged RM clients, not done |
 | S-6 | medium | KMS commits can scan out any host framebuffer | `19c3186` | fixed |
 | S-7 | medium | channels are full compositor clients, with no per-VM cap | `de95ad3` | **partly**: channel cap and queue budget done; per-interface object caps, a CONNECT rate limit and RLIMIT_NOFILE not |
