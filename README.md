@@ -14,8 +14,8 @@ out. The VM has no monitor, and the host keeps the card.
 
 The second is **display**: a guest's frames on the host's own monitors —
 through the host's compositor, through an output it lends the guest, or with
-the guest driving the card. That work is built and tested without a GPU, and
-**has not yet run on one** ([Display](#display)).
+the guest driving the card. The first two have run on an RTX 5090 under both
+supported VMMs; the third has not yet run on hardware ([Display](#display)).
 
 ## Where it stands
 
@@ -58,9 +58,11 @@ Full method, raw runs and the things these numbers do **not** support:
 **Every number in this section predates protocol v2.** It was measured on the
 code before the display work and the security changes that came with it: the
 new transport, a memory type per mapping, guest system memory made cacheable
-and GPU-coherent, the pointer and descriptor scrubbing. None of it has been
-re-run since. The design gives a render loop nothing new to cross, which is a
-reason to expect the same numbers, not a measurement of them.
+and GPU-coherent, the pointer and descriptor scrubbing, the RM allowlist and
+the backend's sandbox. None of it has been re-measured since; the current code
+has been run for function (below), not timed. The design gives a render loop
+nothing new to cross, which is a reason to expect the same numbers, not a
+measurement of them.
 
 ### Several guests on one card
 
@@ -76,22 +78,40 @@ Four is what was run, not a limit found.
 
 ### Driver versions
 
-Measured on **595.99.02**; an A2000 on **615.71.09** renders but is not
-benchmarked. ABI profiles shipped: 535.129.03, 580.178.04, 595.71.05, matched by
-range, with anything older than the first refused. Details below.
+Measured on **595.99.02**, and the current code run there on an RTX 5090; an
+A2000 on **615.71.09** rendered on the code before protocol v2. The backend
+starts only on a host release every one of its tables was measured at:
+535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04 and 615.71.09.
+Details below.
 
 ### What is known to work
 
-Run on the RTX 3060, before protocol v2:
+Run on an **RTX 5090, driver 595.99.02**, on the current code (2026-09-26),
+under both nesbox and crosvm, with the RM allowlist enforcing and the
+backend's sandbox on ([`TESTING-RIG.md`](TESTING-RIG.md)):
 
 - a guest enumerates the card — `nvidia-smi` reports real power and memory, and
   the `deviceUUID` is the host's
-- Vulkan renders: `vulkaninfo` exits 0, offscreen draws are pixel-correct
-- a Wayland client presents through a compositor in the guest
-- NVENC through Vulkan Video, encoding on the client's own device
-- imported buffers are the host's memory, mapped through a shared window
+- Vulkan, OpenGL and EGL render; offscreen draws are pixel-correct
+- CUDA with `--allow-compute`, under nesbox and under crosvm (whose nvgpu
+  frontend runs jailed); without it the guest has no UVM device and CUDA
+  finds no GPU, cleanly
+- guest applications as clients of the live host Hyprland, with a fullscreen
+  guest window scanned out directly; a monitor leased to the guest and driven
+  with KMS; `VK_KHR_display` on that lease; the lease handed back
+- the security negatives, on the control and render nodes and on a leased card
+- about 35 real applications, as an unprivileged guest user with the browsers'
+  sandboxes on, shown on the live desktop: games (SuperTuxKart, Neverball,
+  Godot), Blender (EEVEE, and Cycles on CUDA/OptiX), GIMP, Inkscape, Krita,
+  LibreOffice, Firefox, Chromium, Electron, mpv, ffmpeg with Vulkan Video,
+  NVENC, NVDEC and VA-API, OpenCL
+- the guest module with its parsers in Rust, through the same regression
 
-### Display: built, not yet run
+Run earlier on an RTX 3060 (595.99.02), before protocol v2: every number in
+[`BENCHMARKS.md`](BENCHMARKS.md), four guests on one card, and NVENC through
+Vulkan Video encoding on the client's own device.
+
+### Display
 
 Four ways to put a guest's frames on a monitor the host drives, and explicit
 sync to go with them:
@@ -111,15 +131,13 @@ sync to go with them:
    drives the host's card, and applications on the host or in other VMs reach
    it through the same proxy in *export* mode.
 
-**None of it has run on a GPU or in a VM.** What exists is built and tested
-without either: the backend's unit tests; an end-to-end test that runs a
-function-for-function Rust transliteration of the guest's ioctl interpreter
-against the whole backend and a fake kernel; a loopback that puts real Wayland
-clients through both halves of the proxy to a headless sway or weston; a guest
-module that compiles against the guest kernel and has never been loaded; and
-patched Hyprland and aquamarine that build and pass their own unit tests.
-[`TESTING.md`](TESTING.md) is the plan for the box with the card, stage by
-stage. How to turn each mode on: [Display](#display).
+**Modes 1 to 3 have run on hardware**: an RTX 5090 on 595.99.02, under nesbox
+and crosvm, against the live patched Hyprland (0.56.2), with explicit sync in
+the Wayland mode and a lease handed back and taken again. **Mode 4, and export
+mode, have not**: they need the desktop stopped (TESTING-RIG.md, "Group C").
+No mode has been timed yet.
+[`TESTING.md`](TESTING.md) is the plan, stage by stage; how to turn each mode
+on: [Display](#display).
 
 ### What a guest can reach
 
@@ -217,9 +235,14 @@ What narrows the surface today:
   unprivileged caller; running each backend in its own PID namespace makes RM
   itself show the backend alone
 
+- `RM_ALLOC` classes and RM control commands are **allow-listed per driver
+  release**, default deny: what reaches RM is what NVIDIA's own userspace was
+  seen to use and the sources show to be safe ([`SECURITY.md`](SECURITY.md)
+  §12). The list enforces by default; `--rm-allowlist=log` is a diagnostic
+  flag
+
 What does not, yet:
 
-- `RM_ALLOC` classes and RM control commands are otherwise unfiltered
 - the backend holds the host descriptors itself, in the process that maps the
   guest's memory; the unprivileged per-guest isolate is designed and unbuilt
 - the display paths have open items of their own, listed in
@@ -244,15 +267,18 @@ memory — and for mutually untrusted tenants that or vGPU is still the answer.
 
 ### What is not done
 
-- **any display path on a GPU or in a VM.** All four modes, and explicit sync,
-  are built and unit- or loopback-tested only ([`TESTING.md`](TESTING.md)).
-- **re-measuring on protocol v2.** Every number above predates it.
-- **more than four guests**, or guests doing anything heavier than vkcube at
-  720p. Four share the card evenly; eight has not been tried.
-- **two cards, two driver versions.** RTX 3060 / 595.99.02 is where the numbers
-  come from; an RTX A2000 / 615.71.09 has rendered but is not benchmarked.
-- CUDA is forwarded but untested beyond enumeration; the jailer, per-version
-  driver shares and the multi-tenant envelope are unbuilt.
+- **the compositor-VM and export modes on hardware**, and hotplug: they need
+  the host desktop stopped, and have run only in unit and loopback tests.
+- **re-measuring on protocol v2.** Every number above predates it, and no
+  display path has been timed.
+- **more than four guests**, or several guests doing anything heavier than
+  vkcube at 720p. Four share the card evenly; eight has not been tried.
+- **one driver release on the current code.** 595.99.02 (RTX 5090 and, before
+  protocol v2, RTX 3060) is the only release the current code has run on; the
+  other five releases the backend accepts are served by tables read from
+  NVIDIA's sources, not proven by a run.
+- the per-guest isolate, per-version driver shares and the multi-tenant
+  envelope are unbuilt.
 - the Hyprland patches have no cooldown between leases of a desktop monitor
   (the backend rate-limits a VM's requests instead), and un-marking a monitor
   `leasable` does not end a lease already granted.
@@ -340,9 +366,10 @@ must:
   memory slot only once its pages are present; the slot goes before the
   mapping.
 
-Two VMMs do this today, both with the UVM aperture (crosvm's has not yet run on
-the GPU). **nesbox**
-(`.rig/src/nesbox`, branch `virtio-nvgpu-v2`) has its own frontend for the
+Two VMMs do this today, both with the UVM aperture, and both have run every
+graphics and compute path on the GPU. **nesbox**
+([github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch
+`virtio-nvgpu-v3`, not yet merged upstream) has its own frontend for the
 device. **crosvm** takes the patches in [`patches/crosvm/`](patches/crosvm/):
 a vhost-user device type `nvgpu` (class 0xff0000, indirect descriptors, only
 `SHMEM_MAP` of the backend's mapping requests); every backend mapping checked
@@ -515,9 +542,12 @@ does that itself, unprivileged but in one process per VM.
 
 ## Display
 
-**Nothing in this section has run on a GPU or in a VM.** It says how each mode
-is meant to be turned on; [`TESTING.md`](TESTING.md) is the plan for finding
-out whether it works, and its appendix has the same configuration as a table.
+How each mode is turned on. The Wayland-client mode (with direct scanout and
+explicit sync), the lease and `VK_KHR_display` have run on an RTX 5090 under
+nesbox and crosvm against the live patched Hyprland; the compositor VM and
+export mode have not run on hardware. [`TESTING.md`](TESTING.md) is the test
+plan, and its appendix has the same configuration as a table;
+[`DEPLOY.md`](DEPLOY.md) is how to run it in production.
 
 Every mode needs the host booted with `nvidia_drm.modeset=1`, and a guest
 driver and backend that both speak **protocol v2**. The guest module asks for it
@@ -566,8 +596,8 @@ at each commit that shows the buffer.
 
 ### DRM lease → guest KMS
 
-- **Host:** Hyprland 0.56.0 and aquamarine 0.15.1 with the patches in
-  [`patches/`](patches/), and a monitor marked `leasable`; stock Hyprland
+- **Host:** Hyprland 0.56.2 (`efb50993`) and its aquamarine with the patches
+  in [`patches/`](patches/), and a monitor marked `leasable`; stock Hyprland
   leases only outputs the kernel marks non-desktop. For a guest you do not
   trust, lease a monitor Hyprland itself never uses (`disabled = true,
   leasable = true`). Add `--wayland-lease` to `--wayland-socket`.
@@ -629,12 +659,12 @@ channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
   `cuCtxCreate` registers for itself. RM's OS-descriptor memory is pinned by
   CPU address, which here would be the VMM's, so the guest sends the
   guest-physical pages behind it and the backend maps exactly those (an
-  address alone is still refused). Built and tested against a fake host; not
-  yet run on a GPU
+  address alone is still refused). `--allow-compute` only
 - CUDA ↔ Vulkan/GL interop, zero-copy, GPU-side pointers
 - NVENC encoding from CUDA device pointers; NVDEC decoding
 - **display** on the host's monitors: the four modes under
-  [Display](#display), and explicit sync — built, not yet run on a GPU
+  [Display](#display), and explicit sync — the compositor VM and export mode
+  not yet run on hardware
 
 **Out of scope**
 
@@ -690,56 +720,66 @@ here.
 NVIDIA's kernel driver ABI is not stable; ioctl struct layouts change between
 releases. Support is explicit, and this is the whole list.
 
-**ABI profiles shipped:**
+**The backend starts only on a host release its tables were measured at.**
+Four tables stand between a guest and the host driver, each read from the
+release's own sources (`device/src/release.rs`): the RM allowlist and the
+NVKMS schema, measured at the very release; the ABI profile, a range; and the
+UVM block sizes, a range proven over the releases in it. Today that is:
 
-| profile | covers |
-|---|---|
-| `535.129.03` | 535.129.03 up to the next profile |
-| `580.178.04` | 580.178.04 up to the next profile |
-| `595.71.05` | 595.71.05 and newer |
+| host release | RM allowlist, NVKMS schema | ABI profile | UVM table |
+|---|---|---|---|
+| `535.129.03` | its own | `535.129.03` | its own |
+| `580.178.04` | its own | `580.178.04` | its own |
+| `595.71.05` | its own | `595.71.05` | its own |
+| `595.99.02` | its own | `595.71.05` | its own |
+| `610.57.04` | its own | `595.71.05` | its own |
+| `615.71.09` | its own | `595.71.05` (measured through 615.71.09) | its own |
 
-Profiles key off **ranges, not points**: a release between two profiles uses the
-lower one, and anything newer than the last profile uses the last profile.
-Anything **older than 535.129.03 is refused** rather than guessed at — forwarding
-an ioctl whose layout has never been seen is how you get a plausible wrong
-answer instead of an error.
+Any other release is **refused at start-up**, with a line naming each table
+it lacks. `--allow-unmeasured-release`, a diagnostic flag, runs a newer or
+in-between host on the nearest older tables without compute, and says so at
+every start; a host older than 535.129.03 is refused regardless. Forwarding an
+ioctl whose layout has never been seen is how you get a plausible wrong
+answer instead of an error. Adding a release is described in
+[`DEPLOY.md`](DEPLOY.md), "Upgrading the host driver", and
+[`gen/README.md`](gen/README.md).
 
-A driver much newer than the newest profile is therefore *accepted on the
-assumption that nothing it needs has changed*. That assumption is what a new
-profile exists to replace, and it is the first thing to suspect when a new
-driver misbehaves.
+The guest's NVIDIA userspace must be the host's own release, as it must
+natively: RM refuses a client of another release (`NVRM: API mismatch`).
 
 **Driver versions actually run:**
 
 | version | card | how far it got |
 |---|---|---|
-| **595.99.02** | RTX 3060 | everything — renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
-| **615.71.09** | RTX A2000 | enumerates and renders; not benchmarked, and not re-tested since |
+| **595.99.02** | RTX 5090 | the current code: every graphics and compute path, three display modes, the application pass, under nesbox and crosvm ([`TESTING-RIG.md`](TESTING-RIG.md)) |
+| **595.99.02** | RTX 3060 | the code before protocol v2: renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
+| **615.71.09** | RTX A2000 | the code before protocol v2: enumerates and renders; not benchmarked, and not re-tested since |
 
-Two cards, two versions, one of them thoroughly. Anything else is untested.
-Both ran the code before protocol v2; neither has run a display path.
+Anything else is untested.
 
 ### How a profile is built
 
-The cost is bounded, for three reasons. Profiles key off **ranges, not points**,
-so a release between two known versions selects the lower profile. The struct
+The cost is bounded, for three reasons. ABI profiles key off **ranges, not
+points**, so a new release needs a new profile only when an escape's block
+moved. The struct
 half is **derived mechanically** from NVIDIA's published `open-gpu-kernel-modules`
 at each tag — compile a probe per field, read back `sizeof` and `offsetof` —
 rather than transcribed by hand. And the judgement half, which commands exist and
 which are safe, tracks `nvproxy` upstream.
 
-See [`gen/`](gen/), and `supported_versions()` there for the list in code —
-that function, not this table, is the thing that decides.
+See [`gen/`](gen/), and `Coverage` in `device/src/release.rs` for the rule in
+code — that, not this table, is the thing that decides.
 
 Protocol v2 and the work around it added tables measured per **release**
 rather than per profile: NVKMS and nvidia-drm ioctl layouts, the pointers RM
 follows inside control parameters (both for 535.129.03, 580.178.04, 595.71.05,
 595.99.02, 610.57.04 and 615.71.09), and UVM's parameter block sizes (those six
 and the four releases between them where a size changed). Each is extracted
-from the release's own sources by a script in `gen/`. For NVKMS and UVM a host
-between two measured releases uses the older table, and an NVKMS command whose
-layout moved in the next release measured runs only on a host of exactly its
-table's release; the RM control table is the union of every release's.
+from the release's own sources by a script in `gen/`. Under
+`--allow-unmeasured-release` a host between two measured releases uses the
+older NVKMS table, and an NVKMS command whose layout moved in the next release
+measured runs only on a host of exactly its table's release; the RM control
+pointer table is the union of every release's.
 
 ---
 

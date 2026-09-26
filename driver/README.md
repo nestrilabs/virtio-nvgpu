@@ -41,23 +41,30 @@ licensed so this module can include the same headers the Rust side uses.
 Built out of tree against the guest kernel, or copied/submoduled into a kernel
 tree by whoever is assembling a guest image.
 
-**Protocol v2 is untested in a guest.** The module speaks v2 when the backend
-answers its HELLO, and falls back to v1 — no display features — when it does
-not. The v2 code compiles against the 7.2 guest kernel and has never been
-loaded; its IOCTL2 interpreter is exercised only through a Rust
-transliteration (`device/src/i2_e2e.rs`) that has to be kept in step with
-`nvgpu_i2.c` by hand, and through `rust/difftest`, which runs `nvgpu_i2.c`
-itself against its Rust port.
+**Where it stands.** The module speaks v2 when the backend answers its HELLO,
+and falls back to v1 — no display features — when it does not. It has run on
+Linux 7.2.7 guests on an RTX 5090 (595.99.02), under nesbox and crosvm, built
+both ways (C and Rust parsers): every graphics and compute path, the Wayland
+channel, a lease driven with KMS, `VK_KHR_display`, the security negatives
+and the application pass ([`TESTING-RIG.md`](../TESTING-RIG.md)). The
+compositor-VM mode (the guest driving the host card) has not run on hardware.
+Off the hardware, its IOCTL2 interpreter is exercised end to end against the
+whole backend by `device/src/i2_e2e.rs`, which runs the module's own Rust
+interpreter (`rust/core`), and `rust/difftest` runs `nvgpu_i2.c` itself
+against that Rust port.
 
 **The parsers of guest-process input have a Rust implementation**
 (`NVGPU_RUST=1`, or `CONFIG_VIRTIO_GPU_NV_RUST=y` in-tree, needing a kernel
 with `CONFIG_RUST=y`): the IOCTL2 walk, the
 v1 IOCTL marshalling and descriptor translation, deep segments and the
-OS-descriptor registrations. The C is the default until the Rust has passed
-the hardware regression; [`rust/README.md`](rust/README.md) has what differs,
-how to build and test each, and how to delete the C afterwards.
+OS-descriptor registrations. The Rust build has passed the hardware
+regression; the C stays the out-of-tree default, for kernels built without
+Rust, and as the difftest's oracle. [`rust/README.md`](rust/README.md) has
+what differs, how to build and test each, and how to delete the C
+afterwards.
 
-One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`):
+One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`;
+the test rig installs it in its image as `nvgpu.ko`):
 
 | file | contents |
 |---|---|

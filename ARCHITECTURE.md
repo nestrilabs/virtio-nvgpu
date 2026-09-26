@@ -16,19 +16,23 @@ faster than prose can follow.
 > ([`BENCHMARKS.md`](BENCHMARKS.md)). All of that was measured before
 > protocol v2, and has not been re-measured since.
 >
-> **Built since, and not yet run on a GPU or in a VM:** protocol v2 (§10);
-> guest DRM files that drive a leased output or the host card (§11); fences
-> kept on the host (§12); NVKMS forwarding and its permission gates (§13); the
-> Wayland proxy (§14); a memory type per mapping, and guest system memory made
-> GPU-coherent (§15); direct scanout of guest buffers by the host compositor
-> (§16); and the security changes that came with them
-> ([`SECURITY.md`](SECURITY.md)). The backend's half of each is unit-tested;
-> the Wayland proxy and the ioctl interpreter are also tested end to end
-> without a VM; the guest module compiles and has never been loaded.
-> [`TESTING.md`](TESTING.md) is the plan for the GPU box.
+> **Built since, and run on an RTX 5090 (595.99.02) under nesbox and crosvm,
+> as of 2026-09-26:** protocol v2 (§10); guest DRM files that drive a leased
+> output (§11); fences kept on the host (§12); NVKMS forwarding and its
+> permission gates (§13); the Wayland proxy against the live host compositor
+> (§14); a memory type per mapping, and guest system memory made GPU-coherent
+> (§15); direct scanout of guest buffers by the host compositor (§16); CUDA,
+> with the UVM aperture and memory registered by its pages (§5); the RM
+> allowlist, enforcing; and the security changes that came with them
+> ([`SECURITY.md`](SECURITY.md)). About 35 applications ran on the live
+> desktop ([`TESTING-RIG.md`](TESTING-RIG.md)). None of it has been timed.
 >
-> **Designed but not built:** the isolate, CUDA beyond enumeration, MIG and
-> SR-IOV. Each is called out where it appears.
+> **Built, not yet run on hardware:** a guest driving the host card itself
+> (compositor-VM mode, §11) and export mode (§14), which need the host desktop
+> stopped. [`TESTING.md`](TESTING.md) is the plan.
+>
+> **Designed but not built:** the isolate (Future work, below), MIG and
+> SR-IOV.
 
 ---
 
@@ -137,9 +141,9 @@ Rust implementation (`driver/rust/`, built with `NVGPU_RUST=1` into a kernel
 with `CONFIG_RUST`): a `no_std` core without `unsafe` or a panic path,
 which copies each byte of the caller's once and decides on that copy, around
 which one small file holds the `unsafe` FFI to the C that stays (transport,
-pinning, DRM/KMS hooks). The C is kept, selectable, until the Rust has run
-the hardware regression, and a differential test runs the two on the same
-inputs meanwhile.
+pinning, DRM/KMS hooks). The Rust build has passed the same hardware
+regression as the C. The C is kept, selectable (a kernel without Rust
+builds it), and a differential test runs the two on the same inputs.
 
 **The backend** (`device/`, Apache-2.0, with no VMM in its dependency list)
 holds the real host descriptors, understands the ABI, translates what has to be
@@ -152,7 +156,7 @@ applications connect to as to a compositor, and a host half inside the
 backend, connected to the host's compositor. `wlwire/` is the code they share
 (§14).
 
-**The isolate** is the part that is not built. The intent is one sandboxed,
+**The isolate** is the part that is not built (Future work, below). The intent is one sandboxed,
 unprivileged helper process per guest, holding the device descriptors so that a
 compromised backend, which maps all of the guest's memory, does not hold them. Today the backend holds them itself — as
 an unprivileged process, which it insists on being (§17).
@@ -431,13 +435,15 @@ a poll, with the sleeping done in the guest (§10, §12).
 
 NVIDIA's kernel ABI is not stable: structure layouts change between driver
 releases, and there is no compatibility promise to hold them still. Support is
-therefore explicit per version range — the backend knows which layouts belong
-to which driver, learns the host's version during initialisation, and uses the
-right table. A request whose size does not match what that version expects is
-refused rather than guessed at.
+therefore explicit — the backend knows which layouts belong to which driver,
+learns the host's version during initialisation, and uses the right table. It
+refuses to start on a release its tables were not measured at, and a request
+whose size does not match what that version expects is refused rather than
+guessed at.
 
-Adding a new driver version means diffing the structures against the open
-kernel modules, updating the tables, and naming the range as supported. It is
+Adding a new driver version means extracting the tables from that release's
+open kernel modules, checking them, and naming the release as measured
+([`DEPLOY.md`](DEPLOY.md), "Upgrading the host driver"). It is
 the same maintenance burden `nvproxy` carries, and their work can be followed
 directly.
 
@@ -449,10 +455,12 @@ Protocol v2 and the work around it need layouts that move more often than the
 profiles do, so those are measured per **release**: NVKMS and nvidia-drm ioctl
 layouts, the pointers RM follows inside control parameters and how much it
 copies through each, and UVM's parameter block sizes, each extracted from a
-release's own sources by compiling probes against them. For NVKMS and UVM, a host between two measured
-releases uses the older table, and the NVKMS commands whose layout changed in
-the next measured release run only on the exact release their table came from;
-the RM control table is the union of every release's. The ioctl schema both
+release's own sources by compiling probes against them. Only under
+`--allow-unmeasured-release`, a diagnostic flag, does a host between two
+measured releases use the older tables, and then the NVKMS commands whose
+layout changed in the next measured release run only on the exact release
+their table came from; the RM control pointer table is the union of every
+release's. The ioctl schema both
 halves interpret (§10) is written once and generated into a C table for the
 guest and a Rust table for the backend, and a test fails if either checked-in
 copy is not what the generator writes; the RM copy sizes the guest sends
@@ -470,9 +478,10 @@ the path the measurements come from: a 60 Hz H.264 stream that decodes without
 an error.
 
 The CUDA route — importing a rendered image into CUDA, encoding it with NVENC
-from a GPU pointer — is the one the project was originally designed around, and
-the ioctls it needs are forwarded. It is untested beyond enumeration, and it is
-a second path rather than a fallback.
+from a GPU pointer — is the one the project was originally designed around. It
+needs `--allow-compute` (§5), and it has run: ffmpeg's NVENC and NVDEC through
+CUDA, nvidia-vaapi-driver, Blender's Cycles and a CUDA n-body in a guest, on
+the RTX 5090. It is a second path rather than a fallback.
 
 What is deliberately out of scope is unified memory: `cudaMallocManaged` and
 page-fault-driven migration need fault handling across the VM boundary and
@@ -961,9 +970,10 @@ the modifiers the guest's driver can produce must be the host's, which they
 are, because the guest runs the host's own build of the user-mode driver
 against the host's GPU.
 
-That is the reasoning, from the code and the host driver's sources. Whether the
-host compositor really enters direct scanout for a guest window is stage 3 of
-[`TESTING.md`](TESTING.md), and it has not been run.
+That is the reasoning, from the code and the host driver's sources. On the rig
+it held: with Hyprland's `render:direct_scanout` on, a fullscreen guest
+`weston-simple-egl` was scanned out directly on a desktop monitor, with no
+blocker reported for the whole run (stage 3 of [`TESTING.md`](TESTING.md)).
 
 ---
 
@@ -998,9 +1008,10 @@ host compositor really enters direct scanout for a guest window is stage 3 of
   enforced on the host (§14), and the backend refuses to run with privileges
   the host drivers would hand on to every guest process: RM, DRM and NVKMS take
   a guest's privilege from the backend's credentials, so it will not start as
-  root and drops every capability. What does not, yet: `RM_ALLOC` classes and
-  RM control commands are otherwise unfiltered, and the backend holds the host
-  descriptors itself — the isolate is why that one is in the design at all.
+  root and drops every capability. `RM_ALLOC` classes and RM control
+  commands are allow-listed per release, default deny. What does not, yet:
+  the backend holds the host descriptors itself — the isolate is why that one
+  is in the design at all.
   [`SECURITY.md`](SECURITY.md) has the rest of what is open.
 
   If you need mutually untrusted tenants isolated by hardware, this is not it:
@@ -1014,8 +1025,8 @@ host compositor really enters direct scanout for a guest window is stage 3 of
 - **No cancelling a display call.** A host modeset cannot be interrupted, so a
   guest killed in the middle of one leaves it to finish on its executor; what
   bounds it is the host driver's own timeout.
-- **Display that has not been shown.** Everything from §10 on is built and
-  tested without a GPU. None of it has driven a monitor.
+- **Display modes that have not been shown.** The compositor VM and export
+  mode are built and tested without a GPU; they have not driven a monitor.
 - **A window that must be sized in advance.** It is fixed when the VM is
   created, and a workload that needs more mapped memory than was provisioned
   will fail to map it.
@@ -1030,6 +1041,34 @@ host compositor really enters direct scanout for a guest window is stage 3 of
   UVM file and per guest process, 64 and 256 MiB per VM; pools made at all,
   mapped or not, 256 MiB per file and 1 GiB per VM), and the aperture is
   1 GiB.
+
+---
+
+## Future work: the isolate
+
+A sandboxed helper process, one per guest process, launched from a memfd. It
+would hold the real host `/dev/nvidia*` descriptors and perform the forwarded
+operations, unprivileged, with empty capability sets and `NoNewPrivs`. Today
+the backend holds the host descriptors itself, one backend process per VM.
+What the isolate would add is the split: the descriptors held by a helper per
+guest process rather than by the process that also maps all of the guest's
+memory, so that a compromised backend does not hold them.
+
+It is the part of the design that is **not** a trait the VMM implements. It
+is a runtime artifact, so anyone integrating `virtio-nvgpu` would inherit a
+**process model**, not just a library: a VMM that cannot spawn helper
+processes could not use the device as designed. That is a requirement, stated
+here rather than left to be discovered during integration.
+
+Part of the posture already applies to the backend: it refuses to start as
+root or with `CAP_SYS_ADMIN`, drops every capability and sets `no_new_privs`
+before its first thread (`device/src/posture.rs`), sandboxes itself before
+the first guest message (`device/src/sandbox.rs`), and runs as a user of its
+own per VM ([`DEPLOY.md`](DEPLOY.md)).
+
+The display work adds descriptors an isolate would have to hold too: DRM card
+and lease files, sync files and syncobjs, dma-bufs, and connections to the
+host's Wayland compositor.
 
 ---
 

@@ -9,7 +9,7 @@ DRM ioctls across the VM boundary:
 - the offset of every user pointer, every fd and every GEM handle inside those
   structs, with the rule that says when the kernel reads it and how long the
   pointee is;
-- the fields the backend's NVKMS policy has to read or rewrite (DESIGN §5).
+- the fields the backend's NVKMS policy has to read or rewrite (ARCHITECTURE.md §13).
 
 This is layout **data**, not the IOCTL2 schema. The schema generator reads these
 files and turns them into schema entries. The policy (which commands are
@@ -95,8 +95,10 @@ The extractor refuses to write a file when any of these happens:
   find one there;
 - a struct in `EXHAUSTIVE` (the requests a policy filters field by field:
   `QUERY_DPY_DYNAMIC_DATA`, `ALLOC_DEVICE`) has a member nobody has reviewed;
-- for 610.57.04, the numbers differ from the independent measurements in
-  `research/nvkms.md` §4–5 and `research/nvdrm.md` §2. All of them agree:
+- for 610.57.04, the numbers differ from the independent measurements taken
+  by hand while the display work was designed (hand-written probes against
+  the 610.57.04 headers; the notes are not shipped, the numbers are in the
+  extractor's `check`). All of them agree:
   every command's number, size and halves, the FLIP/SET_MODE/SET_LUT pointer
   offsets and strides, the REGISTER_SURFACE plane fds at 16/48/80, the
   JOIN_SWAP_GROUP member fds at 16+20·i, and every nvidia-drm number, size and

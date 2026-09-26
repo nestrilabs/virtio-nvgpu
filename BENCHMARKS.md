@@ -136,8 +136,13 @@ below, and not a property of the design.
 
 ## Display: not measured yet
 
-Nothing in the display work has run on a GPU, so there is no number for it
-here, and none should be quoted. Three things are worth knowing before one is.
+The display paths now run on hardware -- the Wayland-client mode with direct
+scanout, a lease driven with KMS, and `VK_KHR_display` on an RTX 5090
+(595.99.02), under nesbox and crosvm ([`TESTING-RIG.md`](TESTING-RIG.md)) --
+but none has been timed, so there is no number for them here, and none should
+be quoted. The application pass's frame rates (SuperTuxKart's 116 fps, say)
+are what an app reported, not measurements in the discipline of this file.
+Three things are worth knowing before one is taken.
 
 **What a present should cost is reasoned, not observed.** A render loop still
 crosses nothing. A present, in each mode, is a real call with a real answer:
@@ -206,8 +211,10 @@ slower each run — and that is how a harness bug here cost a full set of number
 - **No claim about a real game.** `nesprobe` is synthetic; the only real
   pipeline here is our own encode chain.
 - **Nothing about protocol v2, or about display.** Every run predates the one
-  and none touched the other.
+  and none touched the other. The current code has run on an RTX 5090 for
+  function, not for time.
 - **One card, one driver.** RTX 3060 at **595.99.02**, which resolves to the
   `595.71.05` ABI profile. An RTX A2000 at **615.71.09** renders but has not
-  been benchmarked. The shipped profiles are 535.129.03, 580.178.04 and
-  595.71.05, and a version older than the first is refused — see the README.
+  been benchmarked. The backend now starts only on a release its tables were
+  measured at (535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04,
+  615.71.09) — see the README.

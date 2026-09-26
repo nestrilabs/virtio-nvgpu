@@ -10,11 +10,12 @@ Hyprland desktop running on the 5090. So there is no spare card and no spare
 monitor. Every stage that does KMS takes a monitor away from the desktop, or
 needs the desktop stopped. The stages are grouped below by that cost.
 
-**Before the first GPU stage, read [`.rig/SAFETY-NOTES.md`](.rig/SAFETY-NOTES.md).**
-It covers what can reach the desktop, the memory and VRAM limits, and what to
-do if the desktop freezes. This host has `panic_on_oops=1` and `panic=0`, so a
-host oops freezes the machine until you power it off. Save your work and keep
-an SSH session open from another machine.
+**Before the first GPU stage, know what can reach the desktop and what to do
+if it freezes.** This host has `panic_on_oops=1` and `panic=0`, so a host oops
+freezes the machine until you power it off. Save your work, keep an SSH
+session open from another machine (the iGPU drives no monitor), and watch
+`journalctl -kf` there for `Xid`, `NVRM` and `nvidia` lines. The rig's own
+notes on this (`.rig/SAFETY-NOTES.md`, git-ignored, host-specific) go further.
 
 ## The rig
 
@@ -27,7 +28,7 @@ Everything is built into `.rig/` (git-ignored), laid out as
 | `.rig/bin/nesbox` | the VMM (release) |
 | `.rig/bin/crosvm` | the other VMM, `--vmm crosvm` (release, static; below, "crosvm") |
 | `.rig/bin/virtiofsd` | only with `NVGPU_NVIDIA_SHARE` |
-| `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it |
+| `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it (Kbuild names it `virtio_gpu_nv.ko`; the rig installs it as `nvgpu.ko`) |
 | `.rig/kernel-rust/vmlinux`, `.rig/kernel-rust/nvgpu.ko` | the same kernel with `CONFIG_RUST=y`, and the module with its parsers in Rust (`NVGPU_RUST=1`), built by `scripts/rig-build-kernel-rust.sh`; to run one, see [`driver/rust/README.md`](driver/rust/README.md) |
 | `.rig/guest/rootfs.ext4` | the golden image: NVIDIA 595.99.02 userspace at `/run/opengl-driver`, probes at `/opt/nvgpu/<name>.sh`, the module at `/opt/nvgpu/nvgpu.ko` |
 | `.rig/logs/` | one `<tag>.{backend.log,console.log,json}` per run |
@@ -87,17 +88,17 @@ nix shell nixpkgs#e2fsprogs -c debugfs -R 'ls -l /opt/nvgpu' .rig/guest/rootfs.e
 | `export` | 7 |
 | `secneg` | the security negatives (`nvgpu_secneg_kms=none|card|lease`) |
 | `shell` | anything without a probe (caching M-2, hotplug): a shell on the console |
-| `nodev` | none: the image without a device, for QEMU (`.rig/tcg-smoke.sh`) and nesbox without `gpu-forward` (`.rig/nesbox-nodev.sh`) |
+| `nodev` | none: the image without a device, for QEMU and for nesbox without `gpu-forward` (the rig's own helpers, below) |
 
 Probe arguments are kernel command-line tokens, passed with
 `NVGPU_CMDLINE_EXTRA="nvgpu_<key>=<value> ..."`.
 
-Before the first real run, `.rig/tcg-smoke.sh` boots the same kernel, image
-and command line under QEMU (TCG, or KVM when `/dev/kvm` is there) without a
-GPU, and `.rig/nesbox-nodev.sh` boots them under nesbox with KVM but no
-`gpu-forward` section, so nesbox's own boot path, disk, console and power-off
-are proven before the device is added (`.rig/RIG.md`). Neither opens anything
-on the host GPU.
+Before the first real run, it is worth booting the same kernel, image and
+command line without a GPU: under QEMU (TCG, or KVM when `/dev/kvm` is there)
+with the `nodev` probe, and under nesbox with KVM but no `gpu-forward` section,
+so the VMM's own boot path, disk, console and power-off are proven before the
+device is added. The dev box keeps its helpers for both in `.rig/` (git-ignored,
+not part of the repository). Neither opens anything on the host GPU.
 
 ## Before anything: preflight
 
@@ -124,7 +125,7 @@ never connect to the live compositor. Run them first, in this order.
 |---|---|---|---|
 | A1 | **1**: HELLO v2, nodes, extensions | `scripts/run-guest.sh stage1 s1` | none |
 | A2 | **2, W1 only**: offscreen render (the envyhooks differential has no probe), twice: without compute (nvidia-smi, Vulkan and EGL with no UVM device; CUDA must find no device and exit cleanly), then with it (CUDA must run) | `scripts/run-guest.sh render s2` then `scripts/run-guest.sh --allow-compute render s2c` | none, then `--allow-compute` |
-| A3 | **security negatives**, ctl + render tests (no `--kms`). Run only after A1 and A2 pass, with your work saved: a regressed fix can oops the host (SAFETY-NOTES risk 2) | `NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh secneg sec` | none |
+| A3 | **security negatives**, ctl + render tests (no `--kms`). Run only after A1 and A2 pass, with your work saved: a regressed fix can oops the host (T1-T3 reach RM and nvidia-drm if the backend's refusal is gone) | `NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none scripts/run-guest.sh secneg sec` | none |
 | A4 | **3** against a **separate headless compositor** | see below | `--wayland-socket <headless socket>` |
 | A5 | **8**: explicit sync (all three parts) | as A4 | `--wayland-socket <headless socket>` |
 | A6 | caching **M-2** (read-only mapping; no probe yet) | `scripts/run-guest.sh shell m2`, by hand | none (`-- --keep-guest-coherency` only to rule the rewrite out) |
@@ -138,9 +139,9 @@ host (`TESTING.md`, "Caching and coherency").
 Stage 3's guest clients need a host compositor. **Do not point them at the
 live Hyprland socket yet.** Hyprland exposes virtual keyboard and pointer,
 screencopy and data-control to any client. The proxy's allowlist hides those
-(`wlwire/src/policy_table.rs`), but the allowlist has never run against a real
-compositor, and it is one of the things these stages test. So the guest gets a
-compositor of its own, where a hole in the allowlist costs nothing:
+(`wlwire/src/policy_table.rs`), and these stages are where it is first shown to
+hold against a real compositor. So the guest gets a compositor of its own,
+where a hole in the allowlist costs nothing:
 
 ```sh
 # terminal 1: sway, headless, rendering on the 5090's render node
@@ -164,8 +165,8 @@ Inside the sandbox there is no `/run/opengl-driver`. The script then points
 EGL, GBM and Vulkan at the host's `graphics-drivers` store path for the loaded
 driver version. It needs no seat and no card node. The plumbing (sway comes
 up, the socket appears, the launcher and backend accept it) was checked with
-`--renderer pixman` in the sandbox. With the NVIDIA renderer it has not run
-yet.
+`--renderer pixman` in the sandbox; A4 and A5 then ran green with the Vulkan
+renderer on the 5090 (results under "crosvm", below).
 
 What a headless compositor **can** check in stage 3:
 
@@ -274,7 +275,11 @@ VMM.
 
 ### Compute under crosvm
 
-Built (`0007`-`0009`), unit-tested, not yet run on the GPU. The aperture is
+Built (`0007`-`0009`), unit-tested, and run on the 5090 (2026-09-26): with
+`.rig/bin/crosvm` built from `virtio-nvgpu-compute`, `render` with
+`NVGPU_COMPUTE=1` passes 9/0/1 with `cuda-smoke` all PASS, and `secneg` with
+compute passes, the frontend jailed (the launcher's summary says `nvgpu
+frontend jailed`); see "Regression of the merged tree", below. The aperture is
 region 2 after the window in the window's 64-bit BAR (2 GiB in all with
 compute), with a shared-memory capability of its own. The jailed frontend
 checks each pool and hands it to the main process, which checks it again,
@@ -343,6 +348,16 @@ Run B1 only after A4 has shown the allowlist holds. Watch the leased monitor
 after each B stage. If it stays dark after the guest lets go, that is the M-9
 FAIL (stage 9). Toggle it back with `hyprctl keyword`/`hyprctl reload`, or
 replug it.
+
+Results on the 5090 (2026-09-26, Hyprland 0.56.2 `efb50993` patched, DP-3
+leasable), under nesbox and crosvm alike: B1 `wayland` 13/0/1, with direct
+scanout confirmed (with `render:direct_scanout` on, a fullscreen guest
+`weston-simple-egl` was scanned out on a desktop monitor, no blocker for the
+whole run); B2 `lease` 9/0/1; B3 `vkdisplay` 8/0/1; B4 `secneg` on the lease
+6/0/0 (inside it, KMS on the lease 15 passed, 0 failed); B5 the lease round
+trip, DP-3 back to Hyprland after each lease. The skips: `kmscube` fails with
+EINVAL and `vkcube --wsi display` crashes, both the same on the host natively.
+B6 (performance) has not run.
 
 ## Application pass on the live desktop
 
@@ -427,8 +442,9 @@ render 10 passed, 5 skipped; KMS on the lease 15 passed, 0 failed), the same
 as nesbox's, which were re-run the same day. After each lease DP-3 went back
 to Hyprland; it was powered off again.
 
-Under crosvm the compute slots are not run: the launcher refuses
-`--allow-compute` there. The video paths that need it are every one that goes
+Under crosvm the compute slots were not run: the pass predates crosvm's
+compute build, and CUDA under crosvm has run only in the regression's `render`
+probe since. The video paths that need compute are every one that goes
 through CUDA: NVENC as ffmpeg drives it (a CUDA context), NVDEC with
 `-hwaccel cuda` and mpv's nvdec, and VA-API (nvidia-vaapi-driver is NVDEC on
 CUDA) in vainfo, mpv, Chromium and Firefox. Vulkan Video, decode and encode,
@@ -477,12 +493,12 @@ Claude sandbox (its Xwayland cannot reach it there), so this was not compared.
 - PyTorch (size), VS Code (Element covers Electron), anything needing the
   network, and the input-driven checks (chrome://gpu, about:support
   scrolling) on the live desktop.
-- The compute slots under crosvm (refused by the launcher, as designed).
+- The compute slots under crosvm (the pass predates crosvm's compute build).
 
 ## Group C: desktop stopped, run from a TTY
 
-The guest drives the card itself (`--kms-card`), so **no host compositor may
-run on the 5090**. Every monitor goes to the guest.
+**Not run yet.** The guest drives the card itself (`--kms-card`), so **no host
+compositor may run on the 5090**. Every monitor goes to the guest.
 
 1. Log out of Hyprland, or stop it. Locking the screen or switching to
    another VT is **not** enough. A compositor that is only switched away has
@@ -503,6 +519,23 @@ and when the VM goes the backend drops the card.
 | C1 | **6**: compositor-VM (guest Hyprland on the host card) | `NVGPU_TIMEOUT=600 NVGPU_CMDLINE_EXTRA="nvgpu_comp=hyprland nvgpu_timeout=560" scripts/run-guest.sh --kms-card compositor s6` | `--kms-card` |
 | C2 | **7**: export mode (host client shown by the guest compositor) | `mkdir -m 0700 -p "$XDG_RUNTIME_DIR/nvgpu-export"`, then `scripts/run-guest.sh --kms-card --wayland-export "$XDG_RUNTIME_DIR/nvgpu-export/wayland-x" export s7` | `--kms-card --wayland-export PATH` (PATH's directory must be yours) |
 | C3 | **9**: hotplug (unplug/replug, or toggle `leasable`) | as C1, probe `shell` (no hotplug probe yet) | `--kms-card` |
+
+## Regression of the merged tree
+
+The tree the 2026-09-26 review fixes were merged into (`integrate`) ran
+Groups A and B on the 5090, three times over, all green, RM allowlist
+enforcing and the backend's sandbox on:
+
+| probe | nesbox, C module | nesbox, Rust module | crosvm (compute build) |
+|---|---|---|---|
+| `stage1` | 6/0/0 | 6/0/0 | 6/0/0 |
+| `render` | 9/0/1 | 9/0/1 | 9/0/1 |
+| `render`, `NVGPU_COMPUTE=1` | 9/0/1, cuda-smoke PASS | 9/0/1, cuda-smoke PASS | 9/0/1, cuda-smoke PASS, frontend jailed |
+| `wayland`, live Hyprland | 13/0/1 | 13/0/1 | 13/0/1 |
+| `secneg`, `kms=none` | ctl + render 10 passed, 5 skipped | the same | the same |
+| `lease` | 9/0/1 | 9/0/1 | 9/0/1 |
+| `vkdisplay` | 8/0/1 | 8/0/1 | 8/0/1 |
+| `secneg`, `kms=lease` | 6/0/0; KMS 15 passed | the same | the same |
 
 ## What to keep from every run
 

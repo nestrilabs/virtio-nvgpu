@@ -1,9 +1,15 @@
 # Host compositor patches
 
-A guest reaches the host display through `wp_drm_lease_device_v1` (DESIGN §0 mode 3): the host compositor
-leases a connector, its CRTC and planes, and the guest drives them through the lease fd. Stock Hyprland
-only leases outputs the kernel marks non-desktop (VR headsets), so these patches let it lease a normal
-monitor too.
+A guest reaches the host display through `wp_drm_lease_device_v1` (the lease mode: README, "Display";
+ARCHITECTURE.md §11): the host compositor leases a connector, its CRTC and planes, and the guest drives
+them through the lease fd. Stock Hyprland only leases outputs the kernel marks non-desktop (VR headsets),
+so these patches let it lease a normal monitor too.
+
+**Status.** The 0.56.2 pair (`…-efb5099.patch` + `…-1a10fe2.patch`) runs as the live desktop compositor
+of the dev box, Hyprland 0.56.2 at `efb50993` from its flake, and carried every lease stage on an RTX 5090
+(TESTING-RIG.md, "Group B"): a desktop monitor leased to a guest, driven with KMS and `VK_KHR_display`,
+and taken back after each lease. The `e368c13c` pair builds and passes Hyprland's and aquamarine's own
+tests, and has not run as a desktop.
 
 | Patch | Against | What it does |
 |---|---|---|
@@ -86,9 +92,9 @@ patch changes no headers, so the ABI is unchanged.
 
 # crosvm
 
-`crosvm/` is a series against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets crosvm be the
-VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; TESTING-RIG.md,
-"crosvm"):
+`crosvm/` is a series of nine patches against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets
+crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; TESTING-RIG.md,
+"crosvm"). All nine have run on an RTX 5090, graphics and compute, the frontend jailed:
 
 | Patch | What it does |
 |---|---|

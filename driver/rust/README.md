@@ -17,8 +17,8 @@ make -C driver KDIR=<a CONFIG_RUST=y kernel's build tree> NVGPU_RUST=1
 (Kconfig, depends on `CONFIG_RUST`) selects the Rust. `NVGPU_RUST=1` against a
 kernel without `CONFIG_RUST` is a build error, and the module records which it
 has (`modinfo -F parsers`). The Makefile refuses to link a `nvgpu_rs.o` that
-names a panic symbol. The C stays the default until the Rust build has passed
-the hardware regression (below), and stays buildable after -- it is the
+names a panic symbol. The Rust build has passed the hardware regression
+(below); the C stays the out-of-tree default and stays buildable -- it is the
 difftest's oracle, and what a kernel without Rust builds.
 
 ## What is in Rust, and what is not
@@ -117,6 +117,10 @@ guest-image/mkimage.sh --module-only --module .rig/kernel-rust/nvgpu.ko \
 NVGPU_KERNEL=.rig/kernel-rust/vmlinux NVGPU_ROOTFS=.rig/guest/rootfs-rust.ext4 \
   scripts/run-guest.sh <probe>
 ```
+
+On 2026-09-26 this ran the whole Group A and B regression on the RTX 5090
+under nesbox, with results identical to the C module's (TESTING-RIG.md,
+"Regression of the merged tree").
 
 Run the Rust module on the kernel it was built against. (It references no
 symbol of the kernel's own Rust -- having no panic path, it needs no panic

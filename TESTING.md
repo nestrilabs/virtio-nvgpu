@@ -6,16 +6,28 @@ and real monitors. It is written to be run in order — each stage assumes the o
 before it passed — and every stage says what to type, what a pass looks like, and
 what to grab when it does not.
 
-The design under test is [`DESIGN.md`'s](DESIGN.md) six display modes; the claims
-each stage is checking come from the on-device plan in the verification notes
-(`NVK_VERIFICATION.md §5`) and the security review (`FINDINGS.md`). The runnable
-helpers live in [`scripts/verify/`](scripts/verify/).
+The design under test is the display modes of the README's "Display" section and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §10–§16; the claims each stage is checking
+come from the on-device plan in the verification review
+([`docs/review/NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5) and
+the security review ([`docs/review/FINDINGS.md`](docs/review/FINDINGS.md)). The
+runnable helpers live in [`scripts/verify/`](scripts/verify/).
 
-Two machines are in scope, and they are not the reference tree:
+**Where it stands (2026-09-26).** Stages 1–5, 8, the lease round trip of 9 and
+the security negatives have run and pass on an **RTX 5090, driver 595.99.02**,
+under nesbox and crosvm, against the live patched Hyprland;
+[`TESTING-RIG.md`](TESTING-RIG.md) has the order they were run in, the results
+and the application pass. Stages 6 and 7 (the compositor VM and export mode),
+hotplug, and the performance stages have not run.
 
+The machines this plan has been used on:
+
+- **RTX 5090, driver 595.99.02** — the dev box, where every stage above ran
+  ([`TESTING-RIG.md`](TESTING-RIG.md)).
 - **RTX 3060, driver 595.99.02** — the box everything in [`BENCHMARKS.md`](BENCHMARKS.md)
-  was measured on.
-- **RTX A2000, driver 615.71.09** — renders, not yet exercised for display.
+  was measured on, before protocol v2.
+- **RTX A2000, driver 615.71.09** — renders (before protocol v2), not yet
+  exercised for display.
 
 The reference driver tree and the envyhooks bindgen target **610.57.04**. That
 mismatch matters for one stage (the envyhooks differential) and is called out
@@ -67,10 +79,10 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   `cat /sys/module/nvidia_drm/parameters/modeset` → `Y`). Without it, NVKMS is
   not available and `supports_semsurf` is 0.
 - **vblank, optionally.** `nvidia_drm.vblank=1` is needed for guest vblank
-  ioctls to deliver events (a documented limit, DESIGN §9). Turn it on for the
+  ioctls to deliver events (a documented limit of nvidia-drm's). Turn it on for the
   lease/compositor-VM stages if vblank waits hang.
 - **the backend must not be root.** RM, DRM and NVKMS all take the guest's
-  privilege from the backend's credentials (`FINDINGS.md` S-5), and the backend
+  privilege from the backend's credentials ([`FINDINGS.md`](docs/review/FINDINGS.md) S-5), and the backend
   refuses to start as root. `scripts/run-guest.sh` runs as root itself (for the
   VMM) and starts the backend through `setpriv` as an unprivileged user, with the
   groups `video`, `render` and `kvm`, no capabilities and `no_new_privs`: a
@@ -170,12 +182,12 @@ line is logged at `info`.
 
 The claim under test is the one the whole project rests on: a guest submits the
 *same* GPU work as bare metal, and display passthrough adds no per-submission
-crossing (`NVK_VERIFICATION.md` U2, U3, M-6, L-7). We prove it by running the same
+crossing ([`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) U2, U3, M-6, L-7). We prove it by running the same
 binary on bare metal and in the guest under envyhooks and diffing the RM ioctl
 sequence and the pushbuffers.
 
 **Precondition:** matching driver versions everywhere (0.1); envyhooks built and
-installed as `$EHKS`; `nv_push_dump` built (`NVK_VERIFICATION.md §5.2 / §5.3`); no
+installed as `$EHKS`; `nv_push_dump` built ([`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.2 / §5.3); no
 other GPU clients.
 
 **Run, once per side, for each of three workloads:**
@@ -224,7 +236,7 @@ backend log. Trace a divergence back to the first differing earlier
 
 ## Stage 3 — Wayland-client mode with direct scanout
 
-The default mode (DESIGN §0.1–0.2): a guest app is a Wayland client of host
+The default mode (README, "Display"; ARCHITECTURE.md §14, §16): a guest app is a Wayland client of host
 Hyprland through the proxy, and a fullscreen buffer reaches the host as the host's
 own NVKMS object, so it is eligible for direct scanout exactly as bare metal is.
 
@@ -268,7 +280,7 @@ modifier`. **Capture:** the `WAYLAND_DEBUG` trace, the Hyprland stdout log, host
 
 ## Stage 4 — DRM lease → guest KMS (kmscube / modetest)
 
-Mode 3 (DESIGN §0.3): the host leases a connector and the guest drives it through
+The lease mode (ARCHITECTURE.md §11): the host leases a connector and the guest drives it through
 the adopted lease fd.
 
 **Host config:** apply the `patches/hyprland` and `patches/aquamarine` patches
@@ -314,7 +326,7 @@ and host `dmesg`.
 
 ## Stage 5 — vkAcquireDrmDisplayEXT / VK_KHR_display
 
-Mode 4 (DESIGN §0.4): the direct Vulkan display path over the same lease plus
+The `VK_KHR_display` mode (ARCHITECTURE.md §13): the direct Vulkan display path over the same lease plus
 nvidia-drm `GRANT_PERMISSIONS(MODESET)`.
 
 **Config:** as stage 4 (a leasable monitor, `--wayland-lease`). Needs
@@ -340,7 +352,7 @@ refused only for SUB_OWNER — see the security stage). **Capture:** the backend
 
 ## Stage 6 — compositor-VM mode (Hyprland in the guest)
 
-Mode 5 (DESIGN §0.5): the guest compositor drives the host card directly; the host
+Compositor-VM mode (ARCHITECTURE.md §11): the guest compositor drives the host card directly; the host
 runs no compositor of its own.
 
 **Host:** no compositor running on the card. **Launch:**
@@ -369,7 +381,7 @@ from the guest compositor.
 
 ## Stage 7 — export mode (apps in a second VM)
 
-Mode 5's other half (DESIGN §0.5, §7): host or second-VM clients reach the guest
+Compositor-VM mode's other half (ARCHITECTURE.md §14): host or second-VM clients reach the guest
 compositor through the proxy in export mode.
 
 **Config:** on the compositor-VM's launch add `--wayland-export /path/sock`
@@ -389,7 +401,7 @@ dmabufs import into the channel's render handle and present. **FAIL:** the clien
 cannot connect (peer-uid refused when it should pass, or vice versa), or its
 buffers do not import. **Capture:** the daemon's stderr, the backend log.
 
-> Export mode widens the attack surface (`FINDINGS.md` S-4, S-10): confirm the
+> Export mode widens the attack surface ([`FINDINGS.md`](docs/review/FINDINGS.md) S-4, S-10): confirm the
 > export socket is 0600 and that a guest process cannot beat the daemon to
 > `ACCEPT`. The security stage covers the guest-reachable refusals.
 
@@ -397,7 +409,7 @@ buffers do not import. **Capture:** the daemon's stderr, the backend log.
 
 ## Stage 8 — explicit sync
 
-DESIGN §6, `NVK_VERIFICATION.md §5.9`: fences live on the host, the guest holds
+ARCHITECTURE.md §12, [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.9: fences live on the host, the guest holds
 proxies, and no host thread parks on a guest wait.
 
 **Config:** `CAP_FENCES` is on by default (the backend reports it in HELLO). The
@@ -427,7 +439,7 @@ host thread is seen parked on a guest wait. **Capture:** backend log at
 
 ## Stage 9 — hotplug and lease round-trip
 
-DESIGN §4.7, §8; `NVK_VERIFICATION.md §5.8`.
+ARCHITECTURE.md §11, [`patches/README.md`](patches/README.md); [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.8.
 
 **Lease round-trip (mode 3/4).** With a leased desktop monitor, take a lease in
 the guest and drive it, then close it:
@@ -451,11 +463,11 @@ backend log (the hotplug listener logs lease re-checks).
 
 ## Security negative tests
 
-The security review (`FINDINGS.md`, and the C-1/H-1/M-10 findings in
-`NVK_VERIFICATION.md §3`) says the backend must turn away a set of guest-reachable
+The security review ([`FINDINGS.md`](docs/review/FINDINGS.md), and the C-1/H-1/M-10 findings in
+[`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §3) says the backend must turn away a set of guest-reachable
 requests that would otherwise reach past the VM. The **authoritative** proof of
 each refusal is a backend unit test that asserts the host ioctl is never issued
-(`NVK_VERIFICATION.md §5.1`, run with `cargo test`). This suite is the
+([`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.1, run with `cargo test`). This suite is the
 **end-to-end** confirmation that the same refusal holds when a real guest process
 makes the request, and that neither the guest nor the host dies doing it.
 
@@ -510,7 +522,7 @@ not an estimate from a log.
 The render loop crosses the VM boundary essentially never — that is the whole
 design, and BENCHMARKS.md already publishes ~0.02 crossings per frame for an
 offscreen load. **Presentation is where a per-present crossing could hide**, and
-this is the number to publish for it (`NVK_VERIFICATION.md` L-7).
+this is the number to publish for it ([`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) L-7).
 
 For the Wayland-present (W2) and display-present (W3) workloads of stage 2, take
 the backend's served-message tally before and after a **30 s run after an 8 s
@@ -554,7 +566,7 @@ discipline as BENCHMARKS.md.
 
 ## Caching and coherency (Intel host only)
 
-`NVK_VERIFICATION.md §5.11–5.12`, findings H-4, M-1, M-2. These failures need an
+[`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.11–5.12, findings H-4, M-1, M-2. These failures need an
 Intel host with the guest-PAT quirk on; on the AMD dev/benchmark boxes only the
 M-1 performance tail shows (slow WB-intended reads through a WC mapping), not the
 H-4 correctness failure.
@@ -602,7 +614,7 @@ is given too (they are hidden from its `--help` without it); the launcher adds
 `NVGPU_ALLOW_ROOT_UNSAFE=1`:
 
 ```sh
-sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card probeQ.sh kms1 -- --keep-guest-coherency
+sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card shell kms1 -- --keep-guest-coherency
 ```
 
 Guest packages the stages assume: NVIDIA userspace (Vulkan ICD, EGL), `nvgpu-wl-guest`,

@@ -156,10 +156,11 @@ fails loudly rather than guess, and `selftest` proves the refusals still fire.
 ```
 
 Releases measured: 535.129.03, 580.178.04 and 595.71.05 (the ABI profiles),
-595.99.02 (the RTX 3060 every benchmark comes from), 610.57.04 (the tree the
-display work was written against) and 615.71.09 (the RTX A2000). A host between
-two uses the older table; an NVKMS command whose layout moved in the next
-release measured runs only on the exact release. Command numbers are never
+595.99.02 (the RTX 3060 every benchmark comes from, and the RTX 5090 the
+current code runs on), 610.57.04 (the tree the display work was written
+against) and 615.71.09 (the RTX A2000). Only with `--allow-unmeasured-release`
+does a host between two use the older table, and then an NVKMS command whose
+layout moved in the next release measured runs only on the exact release. Command numbers are never
 carried from one release to another: REGISTER_SURFACE is 16 in some and 17 in
 others. [`nvkms/README.md`](nvkms/README.md) has the format and the method.
 
@@ -275,8 +276,9 @@ asks for it:
   NVDEC, NVENC, NVJPG and OFA classes come in, filtered to those some GPU
   the release drives has;
 - **workload**: named controls and classes for NVENC, NVDEC, Vulkan Video,
-  graphics and compute paths not yet run, read from gVisor nvproxy's
-  compute, utility, graphics and video lists as a hint.
+  graphics and compute paths, read from gVisor nvproxy's compute, utility,
+  graphics and video lists as a hint before the application pass ran them
+  (SECURITY.md §12, "Added from the application pass").
 
 Controls RM hands to GSP-RM without a CPU-side table -- the GSS legacy ones
 (bit 15 of the command) and every control of an NV2081_BINAPI object -- have
@@ -294,6 +296,7 @@ number.
 `the_checked_in_table_is_what_the_extractor_renders` runs it, so a policy
 edit that was not rendered and committed fails the tests; `render` also fails
 if the policy names a control or class no release has, or refuses an
-observed call RM would serve. A host between two releases gets the older
-list; parameter sizes are held to RM's only on a release measured exactly.
+observed call RM would serve. Only with `--allow-unmeasured-release` does a
+host between two releases get the older list; parameter sizes are held to
+RM's only on a release measured exactly.
 Sources are cached in `$RMALLOW_EXTRACT_CACHE` (default `$TMPDIR/ogkm-rmallow`).

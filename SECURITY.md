@@ -13,13 +13,21 @@ VMMs it runs under, nesbox and crosvm (§16); and by the review of 2026-09-26
 code is the reference: where this document and the code disagree, the code
 is right.
 
-> **Hardware status.** The rig (`TESTING-RIG.md`) runs stage 1, render (with
-> and without CUDA), the Wayland proxy against a headless sway, the security
-> negatives and an application pass on an RTX 5090, under nesbox and crosvm,
-> with the RM allowlist enforcing and the backend's sandbox on. KMS, leases and
-> direct scanout have not run. Statements below about what the host kernel does
-> with a request were read from source (NVIDIA's open modules 610.57.04, Linux
-> 7.2.7) unless a section says it was observed.
+> **Hardware status (2026-09-26).** On an RTX 5090 with 595.99.02, under
+> nesbox and crosvm, with the RM allowlist enforcing (the default) and the
+> backend's sandbox on, the rig (`TESTING-RIG.md`) runs green on the code this
+> document describes: stage 1; render with and without `--allow-compute`
+> (CUDA under both VMMs, crosvm's frontend jailed); the Wayland proxy against
+> a headless sway and against the live patched Hyprland, with direct scanout;
+> a lease driven with KMS, `VK_KHR_display` on it, and the lease round trip;
+> the security negatives on the control and render nodes and on a leased card;
+> the guest module with its parsers in C and in Rust; and about 35
+> applications as an unprivileged guest user. **Not run on hardware:** the
+> compositor-VM and export modes (they need the host desktop stopped), and
+> hotplug. Statements below about what the host kernel does with a request
+> were read from source (NVIDIA's open modules 610.57.04, Linux 7.2.7) unless
+> a section says it was observed. Sections written before a run say where
+> things stood at the time; this note is the current state.
 
 ---
 
@@ -110,11 +118,13 @@ and without `--allow-compute`", §3).
 ### What is still open
 
 - `RM_CONTROL` and `RM_ALLOC` are allow-listed per release (§12), default
-  deny: 215 of 610.57.04's 1,370 controls (plus 30 GSP pass-through numbers
-  seen on hardware) and 96 of its 222 classes reach RM. The list was built
-  from 106 hardware runs and NVIDIA's sources, and has not itself run: a
-  workload it misses breaks with RM's "not supported" and a log line naming
-  the call.
+  deny, and enforcing by default: 215 of 610.57.04's 1,370 controls (plus 30
+  GSP pass-through numbers seen on hardware) and 96 of its 222 classes reach
+  RM. The list was built from 106 hardware runs and NVIDIA's sources, and has
+  run enforcing through the rig's regression and the application pass
+  (Vulkan, GL, EGL, CUDA, NVENC, NVDEC, Vulkan Video, VA-API, OpenCL; §12). A
+  workload it still misses breaks with RM's "not supported" and a log line
+  naming the call.
 - The host NVIDIA driver is in the TCB. There is no IOMMU boundary between
   guest GPU work and the host.
 - The backend sandboxes itself before the first guest message -- a network
@@ -847,7 +857,7 @@ Three reviews, each by independent reviewers, with every claim sent to
 adversarial verifiers who tried to refute it (a fourth, of branch `harden`,
 is §11):
 
-1. **The design** (`DESIGN.md` v1), by four reviewers. v2 resolved their
+1. **The design** (its implementation spec, v1; not shipped), by four reviewers. v2 resolved their
    findings, chiefly by making the backend authoritative from its own
    generated tables rather than from buffer and descriptor lists the guest
    declares. That landed in `a555a99`, together with the v1 gating and the
@@ -869,12 +879,14 @@ the IMEX and fabric classes (`50286f8`).
 
 **Status: of the 34, 30 are fixed and 4 partly fixed. Of the 25, 23 are fixed,
 1 is partly fixed and 1 is open.** "Fixed" means the finding's scenario no
-longer works in the code. None of it has been checked on hardware. No second
-adversarial pass has been run over the fixes: each status is taken from its
+longer works in the code. The fixes have since run on the RTX 5090 in the
+rig's regression, security negatives included, which shows they break no
+workload, not that each scenario is closed. No second adversarial pass has
+been run over the fixes: each status is taken from its
 fix commit and the code. S-35, which a later review of the RM path opened
 (NV_ESC_RM_SHARE forwarded raw), is fixed in the code the same way.
 
-### Verification findings (NVK_VERIFICATION)
+### Verification findings ([NVK_VERIFICATION](docs/review/NVK_VERIFICATION.md))
 
 | id | sev | finding | fix | status |
 |---|---|---|---|---|
@@ -960,14 +972,14 @@ Rejected by the security review:
 
 In rough order of weight.
 
-1. **RM_CONTROL and RM_ALLOC are allow-listed, but the list has not run.**
-   215 of 610.57.04's 1,370 controls and 96 of its 222 classes reach RM
-   (§12); each is checked by RM as it would check a user process without
-   admin rights, and a bug in any of them is a host bug. The list covers
-   what 106 hardware runs used, the other architectures' classes for the
-   same objects, and named NVENC, NVDEC, Vulkan Video and compute paths that
-   have not run. A call it misses fails with RM's own "not supported" and a
-   log line naming it; `--rm-allowlist=log` finds them without failing.
+1. **RM_CONTROL and RM_ALLOC are allow-listed, and what is allowed is still
+   a host surface.** 215 of 610.57.04's 1,370 controls and 96 of its 222
+   classes reach RM (§12); each is checked by RM as it would check a user
+   process without admin rights, and a bug in any of them is a host bug. The
+   list covers what 106 hardware runs and the application pass used, and the
+   other architectures' classes for the same objects. A call it misses fails
+   with RM's own "not supported" and a log line naming it;
+   `--rm-allowlist=log`, a diagnostic flag, finds them without failing.
    24 controls go to GSP-RM with no CPU-side table and no public name; they
    are allowed by number because nvidia-smi and the drivers sent them.
 2. **The host NVIDIA driver is in the TCB.** There is no IOMMU boundary. A bug
@@ -1094,7 +1106,9 @@ In rough order of weight.
     closes keeps the pages pinned until a later free or the session, and
     counts against the registration budgets meanwhile. Exporting registered
     memory (Vulkan's external memory host exported onward, say) fails with
-    EPERM where it works natively. None of it has run on hardware.
+    EPERM where it works natively. CUDA's own registrations (the buffer
+    `cuCtxCreate` registers) have run on the RTX 5090; that shows the holders
+    a workload uses let go as expected, not that the list is complete.
 12. **RM objects between guest processes rest on the guest kernel and on
     reading.** Which guest process made a client, as which euid, and which
     makes a call is the guest kernel's word (§2); a guest module that cannot
@@ -1108,9 +1122,9 @@ In rough order of weight.
     token is the GFID or none) and requires the calling process, which may
     refuse a cross-process tool (a profiler or debugger of another process
     of the same user) that works natively. RM's USER_ROOT bypass of the
-    token checks is not given to guest root. None of it has run on hardware
-    (sec-negative T8 and T10 are the on-device checks), and no workload of
-    the 88 runs issued NV_ESC_RM_SHARE.
+    token checks is not given to guest root. The on-device checks,
+    sec-negative T8 and T10, pass on the RTX 5090; no workload of the 88
+    runs before the application pass issued NV_ESC_RM_SHARE.
 
 ---
 
@@ -1118,15 +1132,17 @@ In rough order of weight.
 
 In priority order. Cost is a judgement, not a measurement.
 
-1. **Run [`TESTING.md`](TESTING.md) on the RTX 3060**, security stages
-   included, after fixing `sec-negative` T1. This comes first because every
-   refusal above is still a claim, and because the allowlist in item 5 needs
-   the workloads run first.
-2. **A memory cgroup per backend.** For example, `systemd-run --scope -p
-   MemoryMax=… -p TasksMax=…` in the launcher, with `oom_score_adj` making the
-   backend the preferred victim. Memfd shmem is charged to the writer's cgroup,
-   so an OOM stays inside the VM that caused it. This covers memory no
-   budget counts, and needs no backend code.
+1. **Run the rest of [`TESTING.md`](TESTING.md)**: the compositor-VM and
+   export modes, hotplug, and the performance stages. Groups A and B, the
+   security negatives included, have run on the RTX 5090
+   (`TESTING-RIG.md`).
+2. **A memory cgroup per backend: done in the shipped unit.**
+   `contrib/systemd/vhost-user-nvgpu@.service` runs each VM's backend in a
+   cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and
+   `OOMScoreAdjust=500`, making the backend the preferred victim
+   ([`DEPLOY.md`](DEPLOY.md)). Memfd shmem is charged to the writer's
+   cgroup, so an OOM stays inside the VM that caused it. The rig's launcher
+   still uses one scope for the whole run (`NVGPU_MEMORY_MAX`).
 3. **One descriptor budget.** RLIMIT_NOFILE is now raised at start and the
    handle table sized from it (§11, B1); what is left is to size one per-VM
    descriptor budget from it. The handle table, blobs,
@@ -1144,16 +1160,16 @@ In priority order. Cost is a judgement, not a measurement.
    content-type. It already has the syncobj manager (and `wl_drm`, which this
    proxy leaves out). Leasing would need a Hyprland patch; explicit sync would
    not.
-5. **Run the RM allowlist (§12).** Done in code, default deny. What is left
-   is running item 1 with it on, reading the teardown's "RM allowlist
-   refused" lines, and growing `WORKLOAD_CONTROLS`/`WORKLOAD_CLASSES` in
-   `gen/rmallow_extract.py` from them -- NVENC, NVDEC and Vulkan Video first,
-   which no run has exercised. After that, holding each control to the
-   classes of the object it is sent to (§12, "What it does not do").
-6. **seccomp and Landlock per backend: done** (§4, "The backend's
-   sandbox"). What is left: run the device stages with it on and extend the
-   list by what they report; an `ioctl` filter by request number per
-   descriptor kind is not possible in a filter, and would take the isolate.
+5. **The RM allowlist (§12): done and run.** Default deny, enforcing, run
+   through Groups A and B and the application pass (NVENC, NVDEC and Vulkan
+   Video included; six controls added from it). What is left: holding each
+   control to the classes of the object it is sent to (§12, "What it does
+   not do"), and growing the list from the teardown's "RM allowlist refused"
+   lines as new workloads meet it.
+6. **seccomp and Landlock per backend: done and run** (§4, "The backend's
+   sandbox"): no run of the regression or the application pass stopped the
+   filter. An `ioctl` filter by request number per descriptor kind is not
+   possible in a filter, and would take the isolate.
 7. **The isolate**: the host descriptors held by an unprivileged helper apart
    from the process that maps guest RAM, so that a parser bug in the backend no
    longer yields the descriptors, and a driver-call bug no longer yields guest
@@ -1193,8 +1209,9 @@ one app could import, overwrite or clear another's exported GPU memory
 through RM controls that name a file by descriptor, and a set of VM-wide
 budgets one app could empty for all the others. Everything was read from
 source (the guest module, the backend, the daemon, NVIDIA 610.57.04); the
-fixes are unit-tested and the guest module builds clean, and none of it has
-run on the GPU.
+fixes are unit-tested and the guest module builds clean. At the time none of
+it had run on the GPU; it has since, in the rig's regression and application
+pass (`TESTING-RIG.md`).
 
 ### Findings
 
@@ -1211,7 +1228,7 @@ run on the GPU.
 | B5 | medium | app vs app | UVM placements, pools and OS-descriptor registrations capped per VM (four files took them); pools of two processes at one address collide in the one VMM address space, with a distinct errno | `6b75a82`, `fbe3f22` | **partly**: every one of those budgets now per process as well (a file's worth, with a reserve); a collision is ENOMEM like any refusal. Not fixable here: one process can still find another's pool address by trying, and squat on the address CUDA would use. UVM maps a pool only at the host address equal to its offset, so every guest process's pools share the VMM's one address space; only per-process VMM address spaces, or a UVM that maps at an offset, would end it |
 | W1 | medium | app vs app | 64 channels per VM, and the daemon opened one per client with no per-peer limit; 1 GiB of shm per VM at 512 MiB a connection | `b5980e5` | fixed: the daemon opens each client's channel with CONNECT_FOR, naming the client (SO_PEERCRED), and the guest module charges the OPEN to it; the backend holds each process to a quarter of the channels, a quarter of the shm (one budget for all its connections) and half of the queue budget |
 | W2 | medium | app vs app | the daemon's per-client output buffer had no bound: a client flooding requests whose replies it never read grew the daemon until the OOM killer took it, and every client with it | `b5980e5` | fixed: at 4 MiB unread the daemon stops reading that client's channel, and closes a client that stays behind for 30 s; the output waits in the backend, on that client's share (loopback test) |
-| W3 | medium | app vs app | at the VM's queue budget the connection whose output crossed it was dropped, often an innocent one; the rig's app pass (`6263e20`, on `display-passthrough`) puts the app user in `nvgpu-wl`, so any app can hold raw channels it never reads | `b5980e5` | fixed in the backend: the queue budget is per process, so the connection that crosses its share is its own. **To do on merge**: `guest-image/probes/apps.sh` (`nvgpu_user=1`) must not add the app user to `nvgpu-wl`; run the daemon setgid `nvgpu-wl` (as `scripts/70-nvgpu-wl.rules` now says) or as an account of its own. `harden` does not have that commit |
+| W3 | medium | app vs app | at the VM's queue budget the connection whose output crossed it was dropped, often an innocent one; the rig's app pass (`6263e20`, on `display-passthrough`) puts the app user in `nvgpu-wl`, so any app can hold raw channels it never reads | `b5980e5` | fixed in the backend: the queue budget is per process, so the connection that crosses its share is its own. The guest-image side is fixed too: `guest-image/probes/apps.sh` (`nvgpu_user=1`) no longer adds the app user to `nvgpu-wl`, and gives the group to the daemon alone (§17, "The Wayland proxy") |
 | F2 | low | app vs app | export/import to a descriptor is a second way to move an RM object between clients, outside the DUP_OBJECT gate | -- | native strength, documented (§6): after R1/R2 the descriptor must be a control file the caller has open, which another process can only have handed it |
 | F3 | low | host surface | the aperture band [4 GiB, 32 TiB) can hold the VMM's own mappings, guest RAM among them, when its stack rlimit is unlimited (or above about 96 TiB: x86 then starts the mmap area near 21 TiB): a pool there fails, and says the address is taken | crosvm `patches/crosvm/0007`, `0008` | **fixed for crosvm, open for nesbox.** crosvm reserves the band (PROT_NONE, MAP_NORESERVE) at the start of `run_config`, before it maps guest RAM, and maps each pool with MAP_FIXED over its own reservation (§16); UVM refuses a pool moved in with mremap, so the window's map-then-move cannot be used. nesbox would need the same change to its start-up order, and a run to trust |
 | F4 | low | host surface | CARD_INFO, ATTACH_GPUS_TO_FD and NUMA_INFO pass with no size check | -- | unchanged (§3): the argument is never smaller than `_IOC_SIZE`, and ATTACH_GPUS_TO_FD, read again (nv.c), carries GPU ids only, no descriptor, once per file |
@@ -1279,7 +1296,8 @@ release:
    work; every user-allocatable class of the kinds observed that some GPU the
    release drives has (so every Turing-to-Blackwell channel, usermode, 3D,
    compute, copy, NVDEC, NVENC, NVJPG and OFA class); and named controls and
-   classes for NVENC, NVDEC, Vulkan Video and compute paths not yet run.
+   classes for NVENC, NVDEC, Vulkan Video and compute paths, read from sources
+   before the application pass ran them (below).
 
 | release | controls allowed / exported | classes allowed / defined |
 |---|---|---|
@@ -1363,10 +1381,10 @@ Vulkan layer) would make such apps fall back instead; not done.
 to: an allowed control sent to an NV2081_BINAPI handle still goes to GSP-RM
 without CPU-RM's size check (the backend holds RM's size itself on a release
 measured exactly). It does not look inside parameters beyond the fields
-above. It has not run: the observed set says what Vulkan, GL, EGL, CUDA and
-the browsers need, but NVENC, NVDEC and Vulkan Video rest on names read from
-sources and gVisor's lists, and a missing one shows up as a failed workload
-with a warning of the form
+above. It has run enforcing through the rig's regression and the application
+pass, which covered Vulkan, GL, EGL, CUDA, the browsers, NVENC, NVDEC, Vulkan
+Video, VA-API and OpenCL; a workload outside those may still meet a missing
+entry, which shows up as a failed workload with a warning of the form
 
     RM control NV2080_CTRL_CMD_… (0x2080…) refused: not in the allowlist of host release 610.57.04
 
@@ -1502,7 +1520,8 @@ An adversarial review of `dind` (at `69c3abc`) for how memory moves between
 the guest, the backend, the VMM, the host kernel and other VMs, against the
 product's requirement: no app less protected from another, no VM less
 protected from another, than natively. Read from source; the fixes are
-unit-tested and the guest module builds clean; none of it has run on a GPU.
+unit-tested and the guest module builds clean; at the time none of it had
+run on a GPU (it has since: `TESTING-RIG.md`).
 
 | id | sev | lens | finding | status |
 |---|---|---|---|---|
@@ -1702,8 +1721,9 @@ shared-memory capability, when the backend reports it (only with
 `--allow-compute`); the guest driver finds regions by id. The launcher
 allows `--allow-compute` with `--vmm crosvm` only when the binary's
 `run --help` names the `nvgpu-uvm-aperture`. The crosvm side has unit tests
-for every check above and the seccomp test; it has not yet run on the GPU
-(TESTING-RIG.md, "crosvm"). The frontend takes the backend's regions by id,
+for every check above and the seccomp test, and has run on the RTX 5090: the
+render probe's CUDA and the security negatives with `--allow-compute`, with
+the frontend jailed (TESTING-RIG.md, "crosvm"). The frontend takes the backend's regions by id,
 however many it reports: a lone region that is not region 1 is no window.
 
 **Hot-plug.** A virtio device's control tube -- its PCI transport's,
@@ -1872,8 +1892,9 @@ service (`.rig/notes/review-2026-09-26/backend.md`, numbered as there). The
 items below are the ones branch `fix-backend` took; the rest -- 8, 15-18 and
 the logging and cleanup items -- are the hardening branch's. Each was checked
 against the code and, where RM's behaviour decides it, NVIDIA's 610.57.04
-sources; each fix has a unit test that fails without it. None has run on a
-GPU.
+sources; each fix has a unit test that fails without it. Each was tested
+against fake kernels first; the hardware regression has run over all of them
+since (below).
 
 | # | sev | finding | status | commit |
 |---|---|---|---|---|
@@ -1892,13 +1913,13 @@ GPU.
 | 14 | low, DoS | a display file handed to the closer was refunded to the handle table at once, so a stuck closer let a guest queue host files without bound, to EMFILE for the whole VM | fixed: counted against the table and the owner's share until the closer has closed it | 69e8306 |
 | 19 | low | (a) `map_unrecorded` reusing a placement keyed (handle, 0) on an RM file; (b) a freed parent left its children's memory records | (a) not a finding: RM keeps one mapping context per file (nv-usermap.c: a second is NV_ERR_STATE_IN_USE), so every mmap of the file maps the same memory. (b) fixed: each object's parent is kept and a free takes the subtree; a guest freeing devices in a loop could fill the table and leave other processes' memory unrecorded | c9ff8ef |
 
-**Needs hardware.** Every one of these ran against fake kernels only. On
-the rig: an application pass with Vulkan and CUDA (OS events on the
-event's own file, #1; fence contexts, #2; frees of clients, #3;
-cuMemHostRegister's UVM mappings, #4); a lease session (drm_info and
-modetest reading MODE_ID, IN_FORMATS and EDID blobs, #12; a compositor's
-RMFB and page flips, #5; GETCONNECTOR probes, #6); descriptors from the
-host compositor, Wayland shm and dma-buf, classified (#13).
+**On hardware.** What each needed was run on the RTX 5090 in the regression
+of the merged tree (nesbox with the C and the Rust module, crosvm with
+compute), all green: Vulkan and CUDA (OS events on the event's own file, #1;
+fence contexts, #2; frees of clients, #3; CUDA's UVM mappings, #4); a lease
+session (the lease and vkdisplay probes read MODE_ID, IN_FORMATS and EDID
+blobs, #12; RMFB and page flips, #5; GETCONNECTOR probes, #6); descriptors
+from the live host compositor, Wayland shm and dma-buf, classified (#13).
 
 ### The VMMs and the launcher
 
@@ -1986,11 +2007,11 @@ Hyprland's IPC by default (`hyprctl dispatch exec` runs anything on the
 host); `envy-capture.sh` makes its output directory with `mktemp -d`;
 `rig-preflight.sh` advises `kernel.sysrq=244`, not 1.
 
-**Needs the GPU:** nesbox-v3 and crosvm-compute through the probes -- the
-window's device check against every descriptor the backend really places
-(RM mappings, DRM objects, leases), compute (the UVM major and the
-`mincore` access check as the VMM's user), and crosvm's ioevents at the
-reported addresses (a guest that moves BAR 0 would now fail activation).
+**On the GPU:** nesbox `virtio-nvgpu-v3` and the crosvm compute build ran the
+probes green on the RTX 5090 -- the window's device check against every
+descriptor the backend really places (RM mappings, DRM objects, leases),
+compute (the UVM major and the `mincore` access check as the VMM's user),
+and crosvm's ioevents at the reported addresses.
 
 
 ### The Wayland proxy
@@ -2029,8 +2050,14 @@ refuses once its named wait has passed. Five minutes each on 2026-09-26
 runs, `wl_codec` 174 million, no finding. The memory oracle was checked by
 hand against a bound of 16 KiB, which a single blob chunk trips.
 
-**Still open.** W3's guest-image side (`apps.sh` adds the app user to
-`nvgpu-wl`) is outside this branch. A client may still hold a sink's share
+**W3's guest-image side: fixed.** `apps.sh` (`nvgpu_user=1`) no longer puts
+the app user in `nvgpu-wl`: the apps are in `video` and `render` only, and
+the daemon alone is started with `nvgpu-wl` added to its groups (checked in
+`guest-image/probes/apps.sh`). The rig runs the daemon as the app's own uid;
+a production guest runs it setgid `nvgpu-wl` or as an account of its own
+([`DEPLOY.md`](DEPLOY.md), "The guest").
+
+**Still open.** A client may still hold a sink's share
 of the queue budget by never reading its pipe, as it may hold a queue by
 never reading its socket; both are its own process's share.
 
@@ -2159,6 +2186,6 @@ names a panic symbol. The module says which parsers it has
 **Not done.** `osdesc_early` is still a ring of 64: a reap that names more
 unrecorded ids than that before their registrations' replies are read
 loses the oldest, whose pins then stay until remove() (a list would let a
-backend grow it without bound). The C parsers stay, the difftest's oracle
-and a kernel without Rust's build, until the Rust build has passed the
-hardware regression.
+backend grow it without bound). The Rust build has passed the hardware
+regression (nesbox, 2026-09-26); the C parsers stay, as the difftest's
+oracle and for a kernel built without Rust.
