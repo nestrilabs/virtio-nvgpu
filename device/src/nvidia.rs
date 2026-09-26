@@ -1365,9 +1365,11 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.rmmem.clear();
-        for (_, k) in self.kms_states.drain() {
-            k.retire();
-        }
+        let mut kms_fbs: std::collections::HashMap<u32, Vec<u32>> = self
+            .kms_states
+            .drain()
+            .map(|(h, k)| (h, k.retire()))
+            .collect();
         self.vm_kms.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
@@ -1401,7 +1403,10 @@ impl NvidiaBackend {
         }
         for h in handles {
             if let Ok((fd, kind)) = self.handles.remove(h) {
-                crate::closer::close_fd(fd, kind);
+                match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
+                    Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
+                    None => crate::closer::close_fd(fd, kind),
+                }
             }
         }
     }
@@ -2413,7 +2418,7 @@ impl NvidiaBackend {
         self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, "close");
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
-        self.forget_kms_state(handle);
+        let fbs = self.forget_kms_state(handle);
         // A render file's syncobj numbers die with it and a later file may
         // get the same handle number: its waits must never join these (S-13).
         if matches!(kind, HandleKind::DriRender(_)) {
@@ -2424,18 +2429,25 @@ impl NvidiaBackend {
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("close handle={handle} ({kind:?})");
         // A display file's last close can wait on a modeset; not here, on
-        // the queue thread under the backend mutex (closer.rs, S-33).
-        crate::closer::close_fd(fd, kind);
+        // the queue thread under the backend mutex (closer.rs, S-33). One
+        // whose framebuffers a call in flight names closes after it (S-6).
+        if fbs.is_empty() {
+            crate::closer::close_fd(fd, kind);
+        } else {
+            self.vm_kms.close_after(fbs, Box::new(fd));
+        }
         Ok(())
     }
 
     /// Drop KMS handle `handle`'s per-file state, and with it every
     /// framebuffer it made from the VM's scanout sources: before the host
-    /// file closes and its ids can go to someone else (S-6).
-    pub(crate) fn forget_kms_state(&mut self, handle: u32) {
-        if let Some(k) = self.kms_states.remove(&handle) {
-            k.retire();
-        }
+    /// file closes and its ids can go to someone else (S-6). Returns those
+    /// ids: the host file must close through `vm_kms.close_after`.
+    pub(crate) fn forget_kms_state(&mut self, handle: u32) -> Vec<u32> {
+        self.kms_states
+            .remove(&handle)
+            .map(|k| k.retire())
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------------
