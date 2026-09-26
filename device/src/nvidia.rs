@@ -28,16 +28,16 @@ use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
 
 const MAX_GPU: u8 = 8;
 
-/// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
-///
-/// `status` is the one that matters and the one that is easy to miss: it is
-/// written by RM on the way out and is independent of the ioctl return value.
 /// The floor a second-level buffer is sized to, whatever length the guest
 /// derived for it. See where it is used: the length is read at a table-supplied
 /// offset, the table was generated from a different driver release, and the
 /// cost of it being wrong must not be heap corruption in this process.
 const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
+// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
+//
+// `status` is the one that matters and the one that is easy to miss: it is
+// written by RM on the way out and is independent of the ioctl return value.
 const NVOS54_CMD: usize = 8;
 const NVOS54_PARAMS_SIZE: usize = 24;
 const NVOS54_STATUS: usize = 28;
@@ -1184,7 +1184,6 @@ impl NvidiaBackend {
         self.guest_ram = ram;
     }
 
-    /// How many host descriptors the guest currently holds open.
     /// Whether a placer is attached (the transport's request channel is up).
     pub(crate) fn has_window(&self) -> bool {
         self.window.is_some()
@@ -4337,7 +4336,6 @@ impl NvidiaBackend {
         plan: &crate::guestptr::Plan<'_>,
         resp_buf: &mut [u8],
     ) -> usize {
-        const _NVOS33_SIZE: usize = 48;
         const WITH_FD_SIZE: usize = 56;
         const FD_OFFSET: usize = 48;
         const LENGTH_OFFSET: usize = 24;
@@ -4668,17 +4666,6 @@ impl NvidiaBackend {
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
-    /// The descriptor behind a handle an RM parameter block names, if the
-    /// handle is one of the NVIDIA devices. RM and NVKMS only understand their
-    /// own files; a card, a lease or a sync_file has no business in one of
-    /// their parameter blocks.
-    /// Turn the handle in UVM command `cmd`'s descriptor field (uvmfd.rs)
-    /// into the descriptor it stands for, in `params`, the block the host
-    /// will be handed. `Some((offset, handle))` when one was replaced, for
-    /// the reply; a negative value is UVM's "none" and stays. Anything that
-    /// is not a handle of the kind the field names -- an RM control file, or
-    /// a UVM file -- is refused rather than handed to the host as a number
-    /// in our table.
     /// Whether `len` is the size of UVM command `cmd`'s parameters on the
     /// host's release: EPERM for a command this release has no row for (or
     /// a host with no table at all), EINVAL for another size.
@@ -5249,25 +5236,6 @@ mod tests {
     /// A complete `Close` message. The handle is the header's.
     fn close_msg(handle: u64) -> Vec<u8> {
         hdr(MsgType::Close, handle)
-    }
-
-    /// A complete `Ioctl` message with no nested block.
-    #[allow(dead_code)]
-    fn ioctl_msg(handle: u64, escape: u32, params: &[u8]) -> Vec<u8> {
-        let mut v = hdr(MsgType::Ioctl, handle);
-        append(
-            &mut v,
-            &IoctlReq {
-                cmd: abi::ioctl::_IOWR(escape, params.len() as u32) as u32,
-                data_len: params.len() as u32,
-                nested_offset: 0,
-                nested_len: 0,
-                deep_ptr_offset: 0,
-                deep_len: 0,
-            },
-        );
-        v.extend_from_slice(params);
-        v
     }
 
     fn append<T: crate::sys::pod::Pod>(v: &mut Vec<u8>, val: &T) {

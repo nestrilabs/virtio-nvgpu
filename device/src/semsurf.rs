@@ -202,7 +202,9 @@ impl SemsurfPolicy {
         self.lock().layouts.insert(dri, layout);
     }
 
-    /// A render node was opened as `handle`.
+    /// A render node was opened as `handle`, by nobody in particular: for
+    /// tests (the backend always names the owner).
+    #[cfg(test)]
     pub fn render_opened(&self, handle: u32, dri: u32) {
         self.render_opened_by(handle, dri, crate::quota::Owner::Unknown);
     }
@@ -214,7 +216,9 @@ impl SemsurfPolicy {
         g.render_owners.insert(handle, owner);
     }
 
-    /// RM_ALLOC of a client class succeeded through `issuer`.
+    /// RM_ALLOC of a client class succeeded through `issuer`, the maker
+    /// unsaid: for tests (the backend passes what the guest said).
+    #[cfg(test)]
     pub fn client_allocated(&self, issuer: u32, h_client: u32) {
         self.client_allocated_by(issuer, h_client, None);
     }

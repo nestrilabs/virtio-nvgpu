@@ -12,11 +12,9 @@
 //! workstream an entry belongs to; the entry's `policy` bits say, and
 //! [`BackendHooks::before`] routes on them.
 //!
-//! Every section below starts out doing exactly what `xfer::DefaultHooks` does
-//! -- refuse fences, allow only MODESET grants and revocations, pass NVKMS
-//! commands that have a table entry -- so installing this object changes
-//! nothing until a section is filled in. A section extends its own methods and
-//! nothing else.
+//! Each section (KMS, FENCES, NVKMS below) keeps to its own methods; the
+//! backend builds the object with the state it shares with them
+//! (`with_state`), and the state-less constructors exist for tests only.
 
 #![forbid(unsafe_code)]
 
@@ -34,7 +32,7 @@ use crate::xfer::{Errno, Hooks, Prepared, PropKind, RunGuard};
 /// Shared between the queue thread (`before`, `after`, under the backend
 /// mutex) and executor threads (`prop_kind`, `atomic_fence_prop`, during
 /// `execute`, without it), so any state a section adds needs its own lock.
-#[derive(Default)]
+#[cfg_attr(test, derive(Default))]
 pub struct BackendHooks {
     /// NVKMS: grant records, fresh files, the host's layout (nvkms.rs).
     /// Shared with the backend, which feeds it the host version and every
@@ -47,18 +45,16 @@ pub struct BackendHooks {
 }
 
 impl BackendHooks {
+    /// With state of its own, shared with no backend: for tests.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// As the `Arc<dyn Hooks>` `xfer::Env::hooks` returns.
+    /// As the `Arc<dyn Hooks>` `xfer::Env::hooks` returns, for tests.
+    #[cfg(test)]
     pub fn shared() -> Arc<dyn Hooks> {
         Arc::new(Self::new())
-    }
-
-    /// With the NVKMS state the backend also holds.
-    pub fn with_nvkms(nvkms: Arc<NvkmsPolicy>) -> Arc<dyn Hooks> {
-        Self::with_state(nvkms, Arc::default())
     }
 
     /// With the NVKMS and semaphore-surface state the backend also holds.

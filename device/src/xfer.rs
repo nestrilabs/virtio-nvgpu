@@ -22,9 +22,6 @@
 //! allowed kind (or the "none" value), every GEM field names an object in the
 //! target file this job put there, and every descriptor-out field starts at -1
 //! so that a value the kernel did not write is never mistaken for one it did.
-//!
-//! Workstream SCHEMA owns this file; workstream BACKEND calls it. The API
-//! below is the agreed contract.
 
 #![forbid(unsafe_code)]
 
@@ -584,28 +581,11 @@ impl Prepared {
         self.ret
     }
 
-    /// Adopt descriptors the host produced at schema positions (via `adopt`,
-    /// which inserts into the handle table and returns (handle, kind)), then
-    /// build the response payload (`Ioctl2Resp` onwards, without MsgHeader).
-    ///
-    /// This form cannot tell whether a descriptor number is one the backend
-    /// already holds, and does not close `I2_FD_CONSUME` handles; the backend
-    /// calls `finish_with`, which does both.
-    pub fn finish(self, adopt: &mut dyn FnMut(OwnedFd) -> (u32, HandleKind)) -> Vec<u8> {
-        struct Only<'a>(&'a mut dyn FnMut(OwnedFd) -> (u32, HandleKind));
-        impl Finisher for Only<'_> {
-            fn is_backend_fd(&self, _: RawFd) -> bool {
-                false
-            }
-            fn adopt(&mut self, fd: OwnedFd) -> (u32, HandleKind) {
-                (self.0)(fd)
-            }
-            fn close_handle(&mut self, _: u32) {}
-        }
-        self.finish_with(&mut Only(adopt))
-    }
-
-    /// `finish`, with the backend's handle table behind it.
+    /// Adopt descriptors the host produced at schema positions into the
+    /// backend's handle table (`f`), refusing any number the backend already
+    /// holds and closing `I2_FD_CONSUME` handles, then build the response
+    /// payload (`Ioctl2Resp` onwards, without MsgHeader). (A `finish` that
+    /// took a bare adopt closure did neither, and nothing called it.)
     pub fn finish_with(mut self, f: &mut dyn Finisher) -> Vec<u8> {
         let mut fd_recs = Vec::new();
         for (buf, off, fd) in std::mem::take(&mut self.fd_outs) {

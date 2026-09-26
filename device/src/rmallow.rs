@@ -199,15 +199,11 @@ impl RmAllow {
         let params = sent.get(top..).unwrap_or(&[]);
         let verdict = match escape {
             NV_ESC_RM_CONTROL => self.control(top_block, params),
+            // NVOS64 in every release measured (the ABI profile refuses any
+            // other size); a shorter block has no status word where RM's is
+            // and is refused as too short.
             NV_ESC_RM_ALLOC => {
-                // NVOS21 and NVOS64 have hClass at one place; the status
-                // follows each.
-                let at = if top == rmallow::NVOS64_SIZE {
-                    rmallow::NVOS64_STATUS
-                } else {
-                    rmallow::NVOS21_STATUS
-                };
-                self.class(top_block, rmallow::NVOS64_H_CLASS, at)
+                self.class(top_block, rmallow::NVOS64_H_CLASS, rmallow::NVOS64_STATUS)
             }
             NV_ESC_RM_ALLOC_MEMORY => {
                 self.class(top_block, rmallow::NVOS02_H_CLASS, rmallow::NVOS02_STATUS)
@@ -463,7 +459,6 @@ mod tests {
         let mut g = gate();
         for (escape, len, status) in [
             (NV_ESC_RM_ALLOC, 48, 40),
-            (NV_ESC_RM_ALLOC, 32, 28),
             (NV_ESC_RM_ALLOC_MEMORY, 56, 40),
             (NV_ESC_RM_ALLOC_OBJECT, 20, 16),
             (NV_ESC_RM_ALLOC_CONTEXT_DMA2, 56, 48),
@@ -481,6 +476,13 @@ mod tests {
         }
         assert_eq!(
             g.check(NV_ESC_RM_ALLOC, &[0u8; 8], 8),
+            Err(Refusal::Errno(libc::EINVAL))
+        );
+        // An NVOS21-sized block (a 32-byte RM_ALLOC, which only
+        // --permissive-abi lets this far) has no status word where NVOS64's
+        // is: too short, whatever its class.
+        assert_eq!(
+            g.check(NV_ESC_RM_ALLOC, &with_class(32, 0x3e), 32),
             Err(Refusal::Errno(libc::EINVAL))
         );
     }
