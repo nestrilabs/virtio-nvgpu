@@ -13,18 +13,12 @@
  *   - Copies results back to the original guest userspace pointers
  *   - Sets NVOS54 status field
  *
- * Commands with working V2 external variants should go in
- * nvgpu_v1v2_rewrites.h instead.
- *
- * ─── Known multi-pointer RM_CONTROL commands ───
- *
- * 0x00000101  SYSTEM_GET_BUILD_VERSION     3 string ptrs    → intercept
- * 0x00000110  SYSTEM_GET_P2P_CAPS_V2       1 array ptr      → TODO
- * 0x20800288  GPU_GET_NVENC_SW_SESSION_INFO 1 array ptr     → TODO
- * 0x20800803  BIOS_GET_NBSI               1 data ptr        → TODO
- * 0x20801210  GR_GET_CTX_BUFFER_INFO       1 array ptr      → TODO
- * 0x20810107  VGPU_MGR_GET_PGPU_INFO       2 ptrs           → TODO (MIG)
- * 0x90960103  SWINTR_GET_INFO              1 array ptr       → TODO
+ * Commands with one second-level pointer go as a deep block
+ * (gen/nvgpu_v1v2_rewrites.h), and those with several as deep segments
+ * (gen/nvgpu_rm_deep.h); only what neither can carry is answered here --
+ * SYSTEM_GET_BUILD_VERSION, whose three string pointers are filled from the
+ * version the backend reported. Anything else the backend refuses by its RM
+ * allowlist.
  *
  * 0x00003d05 was once handled here as OS_GET_CAPS. There is no such command.
  * 0x00003d05 is OS_UNIX_EXPORT_OBJECT_TO_FD, whose parameters are an object
@@ -32,10 +26,6 @@
  * them the other way made an object handle look like a wild address, and
  * answering NV_OK meant the export never happened. It is forwarded now, and the
  * backend translates the descriptor it carries.
- *
- * Most of the TODO commands are only used by advanced tools (MIG manager,
- * nvenc session queries, VBIOS extraction).  nvidia-smi + basic CUDA
- * only needs BUILD_VERSION.
  */
 
 #ifndef NVGPU_RM_INTERCEPTS_H
@@ -147,13 +137,14 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
  * The CPU half of each sample is a host clock: OSTIME is CLOCK_REALTIME in
  * us, PLATFORM_API is CLOCK_MONOTONIC_RAW in ns, TSC is the host's TSC
  * (subdevice_ctrl_timer_kernel.c:354-455; os.c:126-138). The first two are
- * rebased into the guest's clocks on the way back (nvgpu_main.c,
+ * rebased into the guest's clocks on the way back (nvgpu_rmio.c,
  * nvgpu_rebase_time_correlation). The TSC is not: a guest's TSC is the
  * host's plus an offset and, with TSC scaling, times a ratio, and neither is
  * visible from here, so a host TSC value would correlate the GPU clock with a
  * CPU clock the guest cannot read. It is refused the way RM refuses a clock
  * it cannot sample, NV_ERR_NOT_SUPPORTED, and the caller falls back to
- * another source.
+ * another source -- decided on the nested block as read once for the call
+ * (nvgpu_ioctl_rm_control()).
  */
 #define NVGPU_RM_TIME_CORRELATION 0x20800406u
 #define NVGPU_TCI_CLK_ID 0
@@ -170,23 +161,10 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
 #define NVGPU_NV_ERR_NOT_SUPPORTED 0x00000056u
 #define NVGPU_NV_ERR_INVALID_ARGUMENT 0x0000001fu
 
-static inline bool nvgpu_intercept_time_correlation_tsc(void __user *uarg,
-                                                        void __user *user_nested,
-                                                        u32 nested_size,
-                                                        long *ret) {
-  u8 clk_id;
-
-  if (!user_nested || nested_size <= NVGPU_TCI_CLK_ID)
-    return false;
-  if (copy_from_user(&clk_id, user_nested + NVGPU_TCI_CLK_ID, 1)) {
-    *ret = -EFAULT;
-    return true;
-  }
-  if (NVGPU_TCI_PROC(clk_id) != NVGPU_TCI_PROC_CPU ||
-      NVGPU_TCI_SRC(clk_id) != NVGPU_TCI_SRC_TSC)
-    return false;
-  *ret = nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_NOT_SUPPORTED);
-  return true;
+/* A CPU clock id that is the host's TSC. */
+static inline bool nvgpu_tci_is_tsc(u8 clk_id) {
+  return NVGPU_TCI_PROC(clk_id) == NVGPU_TCI_PROC_CPU &&
+         NVGPU_TCI_SRC(clk_id) == NVGPU_TCI_SRC_TSC;
 }
 
 /* ─── Dispatch table ──────────────────────────────────────────────── */
@@ -206,20 +184,6 @@ nvgpu_try_intercept_rm_control(struct nvgpu_fd *nfd, u32 ctl_cmd,
     *ret = nvgpu_intercept_get_build_version(nfd, uarg, user_nested,
                                              nested_size, driver_version);
     return true;
-
-  case NVGPU_RM_TIME_CORRELATION: /* only the TSC source; see above */
-    return nvgpu_intercept_time_correlation_tsc(uarg, user_nested, nested_size,
-                                                ret);
-
-    /*
-     * TODO: Add future intercepts here as needed:
-     *
-     * case 0x00000110: SYSTEM_GET_P2P_CAPS_V2
-     * case 0x20800288: GPU_GET_NVENC_SW_SESSION_INFO
-     * case 0x20800803: BIOS_GET_NBSI
-     * case 0x20801210: GR_GET_CTX_BUFFER_INFO
-     * case 0x90960103: SWINTR_GET_INFO
-     */
 
   default:
     return false;

@@ -161,6 +161,18 @@ fn time_correlation_refuses_the_tsc_and_rebases_the_others() {
     assert!(sends(&o).is_empty());
     assert_eq!(le32(mem(&o, ARG), 28), 0x56); // NV_ERR_NOT_SUPPORTED
 
+    // The block is read whole, once, before the clock is looked at: one that
+    // does not all read is -EFAULT, in both (the C once read the clock byte
+    // alone and answered NOT_SUPPORTED).
+    let mut w = world();
+    let call = control(0x2080_0406, vec![0x02, 1, 0, 0, 0, 0, 0, 0], &mut w);
+    let mut p = w.mem[&ARG].clone();
+    put(&mut p, 24, 4096, 4);
+    w.mem.insert(ARG, p);
+    let o = run(dev(0, vec![]), w, call);
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+
     // OSTIME, microseconds of realtime: moved by the clock offset (1 ms).
     let mut w = world();
     let mut n = vec![0u8; 8 + 2 * 16];

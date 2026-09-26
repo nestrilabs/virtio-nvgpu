@@ -17,4 +17,6 @@ unsigned long harness_copy_to_user(u64 to, const void *from, unsigned long n);
     __r ? -EFAULT : 0;                                                         \
   })
 #define u64_to_user_ptr(x) ((void *)(uintptr_t)(x))
+/* Every address the harness hands out is the world's, a user's. */
+#define access_ok(p, n) ((void)(p), (void)(n), 1)
 #endif

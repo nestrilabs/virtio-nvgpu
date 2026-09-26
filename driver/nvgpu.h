@@ -821,12 +821,16 @@ void nvgpu_osdesc_init(struct nvgpu_device *dev);
 /*
  * An RM escape that registers memory the caller already has (ALLOC_MEMORY or
  * RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, VID_HEAP_CONTROL's
- * ALLOC_OS_DESCRIPTOR): true if it was handled here, with *ret its result.
- * False for anything else, which goes the usual way. nvgpu_rmio.c; with
- * NVGPU_RUST, nvgpu_ioctl_fd() in Rust does this itself.
+ * ALLOC_OS_DESCRIPTOR), on its block `outer` as the caller read it (`sz`
+ * bytes, all of it): true if it was handled here, with *ret its result.
+ * False for anything else, which goes the usual way with the same bytes.
+ * nvgpu_rmio.c; with NVGPU_RUST, nvgpu_ioctl_fd() in Rust does this itself.
  */
 bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                        void __user *uarg, unsigned int sz, long *ret);
+                        void __user *uarg, const void *outer, unsigned int sz,
+                        long *ret);
+/* Whether an escape of number `nr` and size `sz` can be one of the three. */
+bool nvgpu_osdesc_candidate(unsigned int nr, unsigned int sz);
 /* Unpin what RM has let go of. Process context; cheap with nothing pinned. */
 void nvgpu_osdesc_reap(struct nvgpu_device *dev);
 /* remove(), after the reset: unpin everything. */

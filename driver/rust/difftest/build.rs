@@ -59,7 +59,9 @@ bool nvgpu_host_clock_to_guest(struct nvgpu_device *dev, clockid_t clk,
                                s64 host_ns, s64 *guest_ns);
 
 bool nvgpu_osdesc_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                        void __user *uarg, unsigned int sz, long *ret);
+                        void __user *uarg, const void *outer, unsigned int sz,
+                        long *ret);
+bool nvgpu_osdesc_candidate(unsigned int nr, unsigned int sz);
 void nvgpu_osdesc_reap(struct nvgpu_device *dev);
 bool nvgpu_osdesc_ok(const struct nvgpu_device *dev);
 int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,

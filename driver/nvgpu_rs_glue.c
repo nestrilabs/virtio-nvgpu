@@ -25,9 +25,14 @@
 int nvgpu_rs_copy_from(bool kernel, void *dst, u64 src, size_t len) {
   if (!len)
     return 0;
-  /* A call the driver makes itself, on memory it built: the caller wrote
-   * every address in it, so none is a user's to check. */
+  /*
+   * A call the driver makes itself, on memory it built: the caller wrote
+   * every address in it. One in the user range is a user's pointer copied
+   * along and not replaced, which a memcpy would follow: refused.
+   */
   if (kernel) {
+    if (access_ok(u64_to_user_ptr(src), len))
+      return -EFAULT;
     memcpy(dst, (const void *)(uintptr_t)src, len);
     return 0;
   }
@@ -38,6 +43,8 @@ int nvgpu_rs_copy_to(bool kernel, u64 dst, const void *src, size_t len) {
   if (!len)
     return 0;
   if (kernel) {
+    if (access_ok(u64_to_user_ptr(dst), len))
+      return -EFAULT;
     memcpy((void *)(uintptr_t)dst, src, len);
     return 0;
   }

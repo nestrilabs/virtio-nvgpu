@@ -172,21 +172,10 @@ pub fn run_c(s: &Scenario, world: World) -> Outcome {
 }
 
 /// A difference the port makes on purpose (see the report in
-/// driver/rust/README.md), recognised so the rest still has to agree.
-pub fn intended(s: &Scenario, c: &Outcome, r: &Outcome) -> Option<&'static str> {
-    // RM_CONTROL TIME_CORRELATION: the C read one byte of the block to
-    // decide on the TSC refusal and answered NOT_SUPPORTED without reading
-    // the rest; the Rust reads the block once, whole, first, and an
-    // unreadable one is -EFAULT before any decision.
-    if let Call::Fd { cmd, arg } = s.call {
-        if cmd & 0xff == 0x2a && (cmd >> 8) & 0xff == u32::from(b'F') && r.ret == -14 && c.ret == 0 {
-            let mut p = [0u8; 32];
-            let mut w = s.world.clone();
-            if w.copy_from_user(&mut p, arg) && u32::from_le_bytes(p[8..12].try_into().unwrap()) == rm::RM_TIME_CORRELATION {
-                return Some("TIME_CORRELATION of an unreadable block");
-            }
-        }
-    }
+/// driver/rust/README.md), recognised so the rest still has to agree. None
+/// is left: the C reads each block once too, and TIME_CORRELATION's TSC
+/// refusal is decided on the whole block, as in the Rust.
+pub fn intended(_s: &Scenario, _c: &Outcome, _r: &Outcome) -> Option<&'static str> {
     None
 }
 
