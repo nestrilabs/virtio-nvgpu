@@ -1,0 +1,1 @@
+NixOS config agent: read [`patches/nixos/README.md`](patches/nixos/README.md). It says what to copy into the config repo and what to change there: patched Hyprland 0.56.2 and aquamarine, a leasable monitor, Claude's sandbox binds (only with the user's own yes), and checks.
