@@ -40,6 +40,14 @@
 //! RELEASE (and the helper's hangup) only stops new opens. What INJECT_OPEN
 //! has made is bounded per VM and per guest process ([`MAX_OPENS`]).
 //!
+//! **Explicit sync.** IMPORT_SYNCOBJ hands over a DRM syncobj file, at most
+//! [`MAX_SYNCOBJS`] per VM, under an id and a token of its own; HOST_OP
+//! INJECT_OPEN_SYNCOBJ imports it into the caller's render file, whose
+//! handle is the guest's (fences are the host's, fence.rs). What its points
+//! mean is the helper's and the guest daemon's business: the backend reads
+//! none of them, and a guest signalling any point, or none, reaches only the
+//! helper and the stream it serves.
+//!
 //! **Read-only, for the CPU.** Every placement of the object's mmap offset in
 //! the window is made read-only ([`BackendInject::read_only`]), whichever of
 //! the VM's files maps it; the guest module refuses a writable mapping of a
@@ -393,17 +401,28 @@ struct InjectedSyncobj {
     file: OwnedFd,
 }
 
+/// What only the helpers' side touches: the backend's own render files and
+/// the handles ids hold in them. Held for the whole of an IMPORT, an
+/// IMPORT_SYNCOBJ, a RELEASE or a hangup -- kernel calls on the helper's
+/// descriptors included, one of which (the import of another device's
+/// dma-buf) attaches it to its exporter -- and never by INJECT_OPEN, which
+/// takes [`State`] alone, briefly: a helper's slow import stalls its own
+/// connection, not the VM's queue. Always taken before `State`.
+#[derive(Debug, Default)]
+struct Own {
+    /// The backend's own render file of each node, opened on first use.
+    renders: Vec<Option<PrivateFd>>,
+    /// Ids holding each (node, handle) of those files: a dma-buf imported
+    /// twice is one handle there, closed when the last id goes.
+    held: HashMap<(u32, u32), u32>,
+}
+
 #[derive(Debug, Default)]
 struct State {
     live: BTreeMap<u32, Injected>,
     syncobjs: BTreeMap<u32, InjectedSyncobj>,
     next_id: u32,
     bytes: u64,
-    /// The backend's own render file of each node, opened on first use.
-    renders: Vec<Option<PrivateFd>>,
-    /// Ids holding each (node, handle) of those files: a dma-buf imported
-    /// twice is one handle there, closed when the last id goes.
-    held: HashMap<(u32, u32), u32>,
 }
 
 /// What a guest's INJECT_OPEN is given to import.
@@ -417,6 +436,7 @@ pub struct Opened {
 /// One VM's injected buffers.
 pub struct Registry {
     host: Arc<dyn InjectHost>,
+    own: Mutex<Own>,
     state: Mutex<State>,
     max_buffers: usize,
     max_bytes: u64,
@@ -429,6 +449,7 @@ impl std::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("live", &st.live.len())
             .field("bytes", &st.bytes)
+            .field("syncobjs", &st.syncobjs.len())
             .finish()
     }
 }
@@ -441,6 +462,7 @@ impl Registry {
     pub fn with_limits(host: Arc<dyn InjectHost>, max_buffers: usize, max_bytes: u64) -> Self {
         Self {
             host,
+            own: Mutex::new(Own::default()),
             state: Mutex::new(State {
                 next_id: 1,
                 ..State::default()
@@ -464,24 +486,40 @@ impl Registry {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn lock_own(&self) -> MutexGuard<'_, Own> {
+        self.own.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Open the backend's own file of node `gpu`, if it is not yet.
-    fn ensure_render(&self, st: &mut State, gpu: u32) -> io::Result<()> {
+    fn ensure_render(&self, own: &mut Own, gpu: u32) -> io::Result<()> {
         let i = gpu as usize;
-        if st.renders.len() <= i {
-            st.renders.resize_with(i + 1, || None);
+        if own.renders.len() <= i {
+            own.renders.resize_with(i + 1, || None);
         }
-        if st.renders[i].is_none() {
-            st.renders[i] = Some(PrivateFd::new(self.host.open_render(gpu)?));
+        if own.renders[i].is_none() {
+            own.renders[i] = Some(PrivateFd::new(self.host.open_render(gpu)?));
         }
         Ok(())
     }
 
     /// Close handle `gem` of node `gpu`'s file unless an id holds it.
-    fn drop_unheld(&self, st: &mut State, gpu: u32, gem: u32) {
-        if st.held.contains_key(&(gpu, gem)) || self.ensure_render(st, gpu).is_err() {
+    fn drop_unheld(&self, own: &mut Own, gpu: u32, gem: u32) {
+        if own.held.contains_key(&(gpu, gem)) || self.ensure_render(own, gpu).is_err() {
             return;
         }
-        self.host.gem_close(render_fd(st, gpu), gem);
+        self.host.gem_close(render_fd(own, gpu), gem);
+    }
+
+    /// An id's hold on its handle is gone: closed with the last.
+    fn unhold(&self, own: &mut Own, gpu: u32, gem: u32) {
+        let key = (gpu, gem);
+        if let Some(n) = own.held.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                own.held.remove(&key);
+                self.drop_unheld(own, gpu, gem);
+            }
+        }
     }
 
     /// IMPORT from helper connection `peer`: the checked buffer's id and
@@ -500,25 +538,19 @@ impl Registry {
             log::warn!("inject: plane {i} of an IMPORT is not a dma-buf; refused");
             return Err(libc::EBADF);
         }
-        let mut st = self.lock();
-        if st.live.len() >= self.max_buffers {
-            log::warn!(
-                "inject: {} buffers are held already; an IMPORT is refused",
-                st.live.len()
-            );
-            return Err(libc::ENOSPC);
-        }
+        let mut own = self.lock_own();
+        self.room_for_buffer(0)?;
         // Which of this GPU list's devices the memory is NVKMS memory of.
         // nvidia-drm hands a dma-buf of its own device back as the very
         // object it exported (the PRIME self-import); anything else becomes
         // a dma-buf object, which IDENTIFY names as such.
         let mut found = None;
         for gpu in 0..self.host.render_nodes() {
-            if let Err(e) = self.ensure_render(&mut st, gpu) {
+            if let Err(e) = self.ensure_render(&mut own, gpu) {
                 log::warn!("inject: render node {gpu}: {e}");
                 continue;
             }
-            let r = render_fd(&st, gpu);
+            let r = render_fd(&own, gpu);
             let Ok(gem) = self.host.prime_import(r, fds[0].as_fd()) else {
                 continue;
             };
@@ -529,7 +561,7 @@ impl Registry {
                 }
                 t => {
                     log::debug!("inject: on render node {gpu} the buffer identifies as {t:?}");
-                    self.drop_unheld(&mut st, gpu, gem);
+                    self.drop_unheld(&mut own, gpu, gem);
                 }
             }
         }
@@ -539,19 +571,28 @@ impl Registry {
             );
             return Err(libc::ENODEV);
         };
-        let r = self.check_import(&mut st, imp, &fds, gpu, gem);
-        let (size, offset) = match r {
+        let checked = self
+            .check_import(&mut own, imp, &fds, gpu, gem)
+            .and_then(|v| {
+                let mut token = [0u8; 16];
+                self.host.random(&mut token).map_err(|e| {
+                    log::warn!("inject: getrandom: {e}");
+                    libc::EIO
+                })?;
+                Ok((v, token))
+            });
+        let ((size, offset), token) = match checked {
             Ok(v) => v,
             Err(e) => {
-                self.drop_unheld(&mut st, gpu, gem);
+                self.drop_unheld(&mut own, gpu, gem);
                 return Err(e);
             }
         };
-        let mut token = [0u8; 16];
-        if let Err(e) = self.host.random(&mut token) {
-            log::warn!("inject: getrandom: {e}");
-            self.drop_unheld(&mut st, gpu, gem);
-            return Err(libc::EIO);
+        let mut st = self.lock();
+        if let Err(e) = Self::room(&st, self.max_buffers, self.max_bytes, size) {
+            drop(st);
+            self.drop_unheld(&mut own, gpu, gem);
+            return Err(e);
         }
         let id = next_id(&mut st);
         let info = InjectInfo {
@@ -566,7 +607,7 @@ impl Registry {
             reserved: 0,
         };
         let dmabuf = fds.into_iter().next().expect("nplanes >= 1");
-        *st.held.entry((gpu, gem)).or_insert(0) += 1;
+        *own.held.entry((gpu, gem)).or_insert(0) += 1;
         st.bytes += size;
         st.live.insert(
             id,
@@ -591,18 +632,41 @@ impl Registry {
         Ok((id, token))
     }
 
+    /// Whether one more buffer of `size` bytes fits (0: the count alone).
+    fn room_for_buffer(&self, size: u64) -> Result<(), i32> {
+        Self::room(&self.lock(), self.max_buffers, self.max_bytes, size)
+    }
+
+    fn room(st: &State, max_buffers: usize, max_bytes: u64, size: u64) -> Result<(), i32> {
+        if st.live.len() >= max_buffers {
+            log::warn!(
+                "inject: {} buffers are held already; an IMPORT is refused",
+                st.live.len()
+            );
+            return Err(libc::ENOSPC);
+        }
+        if st.bytes.saturating_add(size) > max_bytes {
+            log::warn!(
+                "inject: {} bytes held, {size} more would pass {max_bytes}; refused",
+                st.bytes
+            );
+            return Err(libc::EDQUOT);
+        }
+        Ok(())
+    }
+
     /// The rest of an IMPORT's checks, once plane 0 is known to be handle
     /// `gem` of node `gpu`: its size and offset.
     fn check_import(
         &self,
-        st: &mut State,
+        own: &mut Own,
         imp: &InjImport,
         fds: &[OwnedFd],
         gpu: u32,
         gem: u32,
     ) -> Result<(u64, u64), i32> {
-        self.ensure_render(st, gpu).map_err(|_| libc::EIO)?;
-        let r = render_fd(st, gpu);
+        self.ensure_render(own, gpu).map_err(|_| libc::EIO)?;
+        let r = render_fd(own, gpu);
         // One object: the guest gets one dma-buf and the planes' offsets
         // into it.
         for (p, fd) in fds.iter().enumerate().skip(1) {
@@ -612,7 +676,7 @@ impl Registry {
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             if other != gem {
                 log::warn!("inject: plane {p} is another object than plane 0; refused");
-                if !st.held.contains_key(&(gpu, other)) {
+                if !own.held.contains_key(&(gpu, other)) {
                     self.host.gem_close(r, other);
                 }
                 return Err(libc::EINVAL);
@@ -633,14 +697,7 @@ impl Registry {
             );
             return Err(e);
         }
-        if st.bytes.saturating_add(size) > self.max_bytes {
-            log::warn!(
-                "inject: {} bytes held, {size} more would pass {}; refused",
-                st.bytes,
-                self.max_bytes
-            );
-            return Err(libc::EDQUOT);
-        }
+        self.room_for_buffer(size)?;
         let offset = self
             .host
             .map_offset(r, gem)
@@ -650,6 +707,7 @@ impl Registry {
 
     /// RELEASE from `peer`: only an id it imported (ENOENT otherwise).
     pub fn release(&self, peer: u64, id: u32) -> Result<(), i32> {
+        let mut own = self.lock_own();
         let mut st = self.lock();
         if st.syncobjs.get(&id).is_some_and(|o| o.peer == peer) {
             st.syncobjs.remove(&id);
@@ -659,12 +717,15 @@ impl Registry {
             Some(b) if b.peer == peer => {}
             _ => return Err(libc::ENOENT),
         }
-        self.forget(&mut st, id);
+        let b = forget(&mut st, id).expect("live");
+        drop(st);
+        self.unhold(&mut own, b.gpu, b.gem);
         Ok(())
     }
 
     /// Everything `peer` imported, at its hangup.
     pub fn release_peer(&self, peer: u64) -> usize {
+        let mut own = self.lock_own();
         let mut st = self.lock();
         let ids: Vec<u32> = st
             .live
@@ -672,12 +733,15 @@ impl Registry {
             .filter(|(_, b)| b.peer == peer)
             .map(|(&id, _)| id)
             .collect();
-        for &id in &ids {
-            self.forget(&mut st, id);
-        }
+        let gone: Vec<Injected> = ids.iter().filter_map(|&id| forget(&mut st, id)).collect();
         let before = st.syncobjs.len();
         st.syncobjs.retain(|_, o| o.peer != peer);
-        ids.len() + before - st.syncobjs.len()
+        let n = gone.len() + before - st.syncobjs.len();
+        drop(st);
+        for b in gone {
+            self.unhold(&mut own, b.gpu, b.gem);
+        }
+        n
     }
 
     /// IMPORT_SYNCOBJ from `peer`: the syncobj file's id and token.
@@ -695,19 +759,23 @@ impl Registry {
             log::warn!("inject: an IMPORT_SYNCOBJ's descriptor is not a syncobj file; refused");
             return Err(libc::EBADF);
         }
-        let mut st = self.lock();
-        if st.syncobjs.len() >= self.max_syncobjs {
-            log::warn!(
-                "inject: {} syncobjs are held already; an IMPORT_SYNCOBJ is refused",
-                st.syncobjs.len()
-            );
-            return Err(libc::ENOSPC);
-        }
+        let mut own = self.lock_own();
+        let room = |st: &State| {
+            if st.syncobjs.len() >= self.max_syncobjs {
+                log::warn!(
+                    "inject: {} syncobjs are held already; an IMPORT_SYNCOBJ is refused",
+                    st.syncobjs.len()
+                );
+                return Err(libc::ENOSPC);
+            }
+            Ok(())
+        };
+        room(&self.lock())?;
         // What the kernel says it is: a syncobj file imports (the DRM core
         // checks its file operations), anything else is refused. The handle
         // is not kept: the file keeps the syncobj.
-        self.ensure_render(&mut st, 0).map_err(|_| libc::EIO)?;
-        let r = render_fd(&st, 0);
+        self.ensure_render(&mut own, 0).map_err(|_| libc::EIO)?;
+        let r = render_fd(&own, 0);
         match self.host.syncobj_import(r, file.as_fd()) {
             Ok(h) => self.host.syncobj_destroy(r, h),
             Err(e) => {
@@ -717,6 +785,8 @@ impl Registry {
         }
         let mut token = [0u8; 16];
         self.host.random(&mut token).map_err(|_| libc::EIO)?;
+        let mut st = self.lock();
+        room(&st)?;
         let id = next_id(&mut st);
         st.syncobjs
             .insert(id, InjectedSyncobj { token, peer, file });
@@ -740,21 +810,6 @@ impl Registry {
     /// Syncobj ids held.
     pub fn syncobjs(&self) -> usize {
         self.lock().syncobjs.len()
-    }
-
-    fn forget(&self, st: &mut State, id: u32) {
-        let Some(b) = st.live.remove(&id) else {
-            return;
-        };
-        st.bytes -= b.size;
-        let key = (b.gpu, b.gem);
-        let n = st.held.get_mut(&key).expect("held while live");
-        *n -= 1;
-        if *n == 0 {
-            st.held.remove(&key);
-            self.drop_unheld(st, b.gpu, b.gem);
-        }
-        log::debug!("inject: id {id} released");
     }
 
     /// INJECT_OPEN's lookup: id `id` with token `token`, for a render file
@@ -799,10 +854,18 @@ impl Registry {
     }
 }
 
+/// Take id `id` out of the live buffers, with its bytes.
+fn forget(st: &mut State, id: u32) -> Option<Injected> {
+    let b = st.live.remove(&id)?;
+    st.bytes -= b.size;
+    log::debug!("inject: id {id} released");
+    Some(b)
+}
+
 /// The backend's own file of node `gpu`, once [`Registry::ensure_render`]
 /// has opened it.
-fn render_fd(st: &State, gpu: u32) -> BorrowedFd<'_> {
-    st.renders[gpu as usize]
+fn render_fd(own: &Own, gpu: u32) -> BorrowedFd<'_> {
+    own.renders[gpu as usize]
         .as_ref()
         .expect("opened by ensure_render")
         .as_fd()
@@ -1425,6 +1488,8 @@ pub mod fake {
     pub struct FakeHost {
         st: Mutex<St>,
         pub nodes: u32,
+        /// While set, PRIME imports wait (an exporter slow to attach).
+        stall: (Mutex<bool>, std::sync::Condvar),
     }
 
     fn ino(fd: BorrowedFd<'_>) -> u64 {
@@ -1478,6 +1543,12 @@ pub mod fake {
             self.st().handles.keys().filter(|(r, _)| *r == f).count()
         }
 
+        /// Make PRIME imports wait until `stall(false)`.
+        pub fn stall(&self, on: bool) {
+            *self.stall.0.lock().unwrap() = on;
+            self.stall.1.notify_all();
+        }
+
         /// GEM_CLOSEs so far.
         pub fn closes(&self) -> usize {
             self.st().closed.len()
@@ -1519,6 +1590,11 @@ pub mod fake {
             Ok(self.render_file(index))
         }
         fn prime_import(&self, render: BorrowedFd<'_>, dmabuf: BorrowedFd<'_>) -> io::Result<u32> {
+            let mut g = self.stall.0.lock().unwrap();
+            while *g {
+                g = self.stall.1.wait(g).unwrap();
+            }
+            drop(g);
             let (r, d) = (ino(render), ino(dmabuf));
             let mut st = self.st();
             if !st.files.contains_key(&r) || !st.dmabufs.contains(&d) {
@@ -1746,6 +1822,30 @@ mod tests {
         assert_eq!(imp(&|i| i.nplanes = 2), Err(libc::EINVAL));
         assert_eq!(imp(&|i| i.nplanes = 5), Err(libc::EINVAL));
         assert_eq!(reg.live(), 1);
+    }
+
+    /// A helper whose buffer is slow to import holds up its own connection,
+    /// not a guest's INJECT_OPEN, which the VM's queue thread serves.
+    #[test]
+    fn a_slow_import_does_not_hold_up_an_open() {
+        let (host, reg) = setup();
+        let (id, token) = reg
+            .import(1, &rgb(32, 32), vec![host.dmabuf(obj(4096 * 4, 0))])
+            .unwrap();
+        let reg = Arc::new(reg);
+        host.stall(true);
+        let (h2, r2) = (host.clone(), reg.clone());
+        let t = std::thread::spawn(move || {
+            r2.import(2, &rgb(32, 32), vec![h2.dmabuf(obj(4096 * 4, 0x10000))])
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let t0 = std::time::Instant::now();
+        assert!(reg.open(id, &token, 0).is_ok());
+        assert!(reg.maps_live(0, 1));
+        assert!(t0.elapsed() < std::time::Duration::from_millis(40));
+        host.stall(false);
+        assert!(t.join().unwrap().is_ok());
+        assert_eq!(reg.live(), 2);
     }
 
     #[test]
