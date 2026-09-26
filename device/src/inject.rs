@@ -381,8 +381,9 @@ struct Injected {
     /// its hangup releases it.
     peer: u64,
     info: InjectInfo,
-    /// The dma-buf of plane 0 (every plane is the same object).
-    dmabuf: OwnedFd,
+    /// The dma-buf of plane 0 (every plane is the same object). Private:
+    /// no IOCTL2 may adopt its number (privfd.rs).
+    dmabuf: PrivateFd,
     /// Which render node's device it is memory of.
     gpu: u32,
     /// Its handle in the backend's own file of that node.
@@ -398,7 +399,7 @@ struct InjectedSyncobj {
     token: [u8; 16],
     peer: u64,
     /// The syncobj file, which keeps the syncobj alive while the id lives.
-    file: OwnedFd,
+    file: PrivateFd,
 }
 
 /// What only the helpers' side touches: the backend's own render files and
@@ -428,7 +429,7 @@ struct State {
 /// What a guest's INJECT_OPEN is given to import.
 #[derive(Debug)]
 pub struct Opened {
-    pub dmabuf: OwnedFd,
+    pub dmabuf: PrivateFd,
     pub info: InjectInfo,
     pub size: u64,
 }
@@ -606,7 +607,7 @@ impl Registry {
             flags: imp.flags,
             reserved: 0,
         };
-        let dmabuf = fds.into_iter().next().expect("nplanes >= 1");
+        let dmabuf = PrivateFd::new(fds.into_iter().next().expect("nplanes >= 1"));
         *own.held.entry((gpu, gem)).or_insert(0) += 1;
         st.bytes += size;
         st.live.insert(
@@ -788,6 +789,7 @@ impl Registry {
         let mut st = self.lock();
         room(&st)?;
         let id = next_id(&mut st);
+        let file = PrivateFd::new(file);
         st.syncobjs
             .insert(id, InjectedSyncobj { token, peer, file });
         log::debug!("inject: syncobj id {id}");
@@ -797,7 +799,7 @@ impl Registry {
     /// INJECT_OPEN_SYNCOBJ's lookup: a new descriptor of syncobj id `id`'s
     /// file, for its token (ENOENT alike for a missing id, a buffer's id and
     /// a wrong token).
-    pub fn open_syncobj(&self, id: u32, token: &[u8; 16]) -> Result<OwnedFd, i32> {
+    pub fn open_syncobj(&self, id: u32, token: &[u8; 16]) -> Result<PrivateFd, i32> {
         let st = self.lock();
         let o = st.syncobjs.get(&id);
         let ok = token_eq(o.map_or(&[0xff; 16], |o| &o.token), token) && o.is_some();
@@ -1170,7 +1172,7 @@ struct Shared {
     peers: AtomicUsize,
     next_peer: AtomicU64,
     /// Every live connection, to shut down with the server.
-    conns: Mutex<HashMap<u64, Arc<OwnedFd>>>,
+    conns: Mutex<HashMap<u64, Arc<PrivateFd>>>,
 }
 
 /// The listener and its threads.
@@ -1313,7 +1315,7 @@ fn accept_loop(s: Arc<Shared>, l: Arc<OwnedFd>) {
             continue;
         }
         let peer = s.next_peer.fetch_add(1, Ordering::Relaxed);
-        let conn = Arc::new(conn);
+        let conn = Arc::new(PrivateFd::new(conn));
         s.conns
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1344,12 +1346,12 @@ fn accept_loop(s: Arc<Shared>, l: Arc<OwnedFd>) {
     }
 }
 
-fn reply(conn: &OwnedFd, r: &InjReply) -> bool {
+fn reply(conn: &PrivateFd, r: &InjReply) -> bool {
     crate::sys::net::send_packet(conn.as_raw_fd(), &r.to_bytes(), &[]).is_ok()
 }
 
 /// One helper connection, until it hangs up or breaks the protocol.
-fn serve_peer(s: &Shared, peer: u64, conn: &OwnedFd) {
+fn serve_peer(s: &Shared, peer: u64, conn: &PrivateFd) {
     let mut hello = false;
     let mut buf = [0u8; INJ_MAX_PACKET];
     loop {
@@ -1721,6 +1723,8 @@ mod tests {
         let (id, token) = reg.import(1, &rgb(64, 64), vec![d]).unwrap();
         assert_eq!((reg.live(), reg.bytes()), (1, 64 * 64 * 4));
         let o = reg.open(id, &token, 0).unwrap();
+        // No IOCTL2 may adopt the number of a descriptor held here.
+        assert!(crate::privfd::is_private(o.dmabuf.as_raw_fd()));
         assert_eq!((o.info.width, o.info.height, o.info.fourcc), (64, 64, XR24));
         assert_eq!(o.info.modifier, MODIFIER);
         assert_eq!(o.size, 64 * 64 * 4);
