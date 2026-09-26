@@ -13,6 +13,7 @@ Cargo.lock.bak
 .tmp_versions/
 Module.symvers
 modules.order
+*.nopanic
 
 # ABI generator
 **__pycache__
