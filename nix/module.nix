@@ -9,6 +9,7 @@
 #     package = <a package with bin/vhost-user-nvgpu>;   # the flake's default
 #     slots = 4;                              # VMs that may run at once
 #     vms."0".extraArgs = [ "--allow-compute" ];
+#     vms."0".inject = { enable = true; helperUid = 950; helperGroup = "nvgpu-cap0"; };
 #   };
 #
 # Slot N is two system users: nvgpu-vmN runs the backend
@@ -58,6 +59,26 @@ let
           (DEPLOY.md, "Backend flags"). The diagnostic flags are refused
           without `--diagnostic`; do not ship a configuration that needs it.
         '';
+      };
+      inject = {
+        enable = mkEnableOption ''
+          capture injection for this VM (SECURITY.md §18): the backend listens
+          at /run/nvgpu/vmN/inject.sock for this VM's capture helper, opened
+          to `helperGroup`, and serves only `helperUid` there. Give every VM
+          a helper user of its own: a helper can inject into any VM whose
+          socket admits its uid'';
+        helperUid = mkOption {
+          type = types.ints.positive;
+          description = ''
+            The uid of this VM's capture helper (`--inject-uid`), the one
+            process that may hand the backend screen-share buffers for it.
+            Not the backend's, the VMM's or the desktop user's uid.
+          '';
+        };
+        helperGroup = mkOption {
+          type = types.str;
+          description = "The group the inject socket is opened to: the helper's own.";
+        };
       };
       autoStart = mkOption {
         type = types.bool;
@@ -134,6 +155,14 @@ in
         message = "services.virtio-nvgpu.vms.<n>.extraArgs: give each flag and value as a word of its own, with no whitespace in it";
       }
       {
+        assertion =
+          let
+            uids = map (vm: vm.inject.helperUid) (lib.filter (vm: vm.inject.enable) (lib.attrValues cfg.vms));
+          in
+          lib.length uids == lib.length (lib.unique uids);
+        message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: each VM needs a capture helper user of its own";
+      }
+      {
         # The display paths and the semaphore-surface fences need NVKMS.
         assertion =
           !(lib.elem "nvidia" config.services.xserver.videoDrivers)
@@ -180,7 +209,8 @@ in
             "kvm"
           ];
           ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} --socket /run/nvgpu/vm%i/nvgpu.sock ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS";
-          ExecStartPost = "+${socketOpen} /run/nvgpu/vm%i nvgpu-vm%i";
+          # $NVGPU_INJECT_GROUP, unset, is no argument at all.
+          ExecStartPost = "+${socketOpen} /run/nvgpu/vm%i nvgpu-vm%i $NVGPU_INJECT_GROUP";
           RuntimeDirectory = "nvgpu/vm%i";
           RuntimeDirectoryMode = "0700";
           UMask = "0077";
@@ -225,7 +255,18 @@ in
         overrideStrategy = "asDropin";
         # systemd splits an unbraced $VAR at whitespace and takes quotes in
         # it literally: hence one word per flag, and no spaces in any.
-        environment.NVGPU_BACKEND_ARGS = concatStringsSep " " vm.extraArgs;
+        environment = {
+          NVGPU_BACKEND_ARGS = concatStringsSep " " (
+            vm.extraArgs
+            ++ lib.optionals vm.inject.enable [
+              "--inject-socket"
+              "/run/nvgpu/vm${n}/inject.sock"
+              "--inject-uid"
+              (toString vm.inject.helperUid)
+            ]
+          );
+        }
+        // lib.optionalAttrs vm.inject.enable { NVGPU_INJECT_GROUP = vm.inject.helperGroup; };
         wantedBy = lib.optional vm.autoStart "multi-user.target";
       }
     ) cfg.vms;

@@ -12,7 +12,11 @@
 #   #   After=vhost-user-nvgpu@0.service
 #
 # Backend flags per VM go in /etc/virtio-nvgpu/vmN.env as
-# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags").
+# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags"). For
+# capture injection (DEPLOY.md, "Capture injection") that file also says
+#   NVGPU_BACKEND_ARGS="--inject-socket /run/nvgpu/vmN/inject.sock --inject-uid UID"
+#   NVGPU_INJECT_GROUP=<the VM's capture helper's group>
+# and the socket is opened to that group once the backend has bound it.
 # Paths assume the backend at /usr/bin and the socket helper at
 # /usr/libexec/virtio-nvgpu; adjust them (or use nix/module.nix) as installed.
 #
@@ -45,7 +49,8 @@ ExecStart=/usr/bin/vhost-user-nvgpu --socket /run/nvgpu/vm%i/nvgpu.sock $NVGPU_B
 # Open the socket to the VMM's group once it exists, as root, after making
 # the directory root's so the backend's user can no longer swap the socket
 # for a link (the same steps as the rig launcher's root mode).
-ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-socket-open /run/nvgpu/vm%i nvgpu-vm%i
+# $NVGPU_INJECT_GROUP, unset, is no argument at all.
+ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-socket-open /run/nvgpu/vm%i nvgpu-vm%i $NVGPU_INJECT_GROUP
 RuntimeDirectory=nvgpu/vm%i
 RuntimeDirectoryMode=0700
 UMask=0077
