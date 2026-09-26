@@ -1817,6 +1817,29 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
       return nvgpu_fence_syncobj_ioctl(nfd, file, cmd, arg);
 
     /*
+     * DRM_CAP_DUMB_BUFFER on a file with no KMS side (those went to the host
+     * above). The core answers it only for a DRIVER_MODESET device and says
+     * -EOPNOTSUPP here, which is how nvidia-drm with modeset=0 answers --
+     * and NVIDIA's userspace reads it that way: nvidia-vaapi-driver asks for
+     * exactly this cap to learn whether nvidia_drm.modeset=1 and gives up
+     * when it fails. This node stands for a modeset=1 nvidia-drm (the only
+     * kind the guest's userspace is built for), so it answers as the core
+     * would for a modeset device without dumb buffers: 0, which is true of
+     * this node (MODE_CREATE_DUMB is not served on it). Answered here; the
+     * host sees nothing.
+     */
+    if (cmd == DRM_IOCTL_GET_CAP) {
+      struct drm_get_cap gc;
+
+      if (copy_from_user(&gc, (void __user *)arg, sizeof(gc)))
+        return -EFAULT;
+      if (gc.capability == DRM_CAP_DUMB_BUFFER) {
+        gc.value = 0;
+        return copy_to_user((void __user *)arg, &gc, sizeof(gc)) ? -EFAULT : 0;
+      }
+    }
+
+    /*
      * Core DRM, answered by the core against this node's own state. That is
      * right for VERSION and GET_UNIQUE and wrong for anything that names a GEM
      * object: the objects live in the host's drm_file, so the core looks them
