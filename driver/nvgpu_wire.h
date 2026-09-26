@@ -552,6 +552,10 @@ struct nvgpu_unwatch_req {
  * OP_INJECT_OPEN). -ENOENT for an id that is not live or a token that does
  * not match, alike. Only with NVGPU_BCAP_INJECT. */
 #define NVGPU_OP_INJECT_OPEN 12
+/* (render file, id, token[0..8], token[8..16]) -> (syncobj handle): a syncobj
+ * the capture helper injected, imported into the render file; the handle is
+ * the same number in the guest file (fences are the host's). */
+#define NVGPU_OP_INJECT_OPEN_SYNCOBJ 13
 
 #define NVGPU_OP_MAX_ARGS 6
 #define NVGPU_OP_MAX_RES 4

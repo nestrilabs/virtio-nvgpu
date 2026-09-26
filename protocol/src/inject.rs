@@ -16,8 +16,14 @@
 //   IMPORT   64 bytes, with exactly `nplanes` descriptors (SCM_RIGHTS), one
 //            per plane, in plane order. The same dma-buf may be sent for
 //            several planes; every plane must resolve to one GEM object.
-//   RELEASE  8 bytes. Stops new opens of the id; guests that opened it keep
-//            their references, and the memory lives until the last is gone.
+//   IMPORT_SYNCOBJ
+//            8 bytes, with exactly one descriptor: a DRM syncobj file
+//            (drmSyncobjHandleToFD without EXPORT_SYNC_FILE), for the guest
+//            to wait on and signal points of by value (explicit sync). Its
+//            own id and token, which HOST_OP INJECT_OPEN_SYNCOBJ takes.
+//   RELEASE  8 bytes. Stops new opens of the id (a buffer's or a syncobj's);
+//            guests that opened it keep their references, and the memory
+//            lives until the last is gone.
 //
 // A request that fails is answered with a negative errno in `status` and
 // the connection stays up, except for a malformed packet (wrong size,
@@ -35,6 +41,7 @@ pub const INJ_VERSION: u32 = 1;
 pub const INJ_OP_HELLO: u32 = 1;
 pub const INJ_OP_IMPORT: u32 = 2;
 pub const INJ_OP_RELEASE: u32 = 3;
+pub const INJ_OP_IMPORT_SYNCOBJ: u32 = 4;
 
 /// Planes one buffer may have.
 pub const INJ_MAX_PLANES: usize = 4;
@@ -49,6 +56,7 @@ pub const INJ_F_ALL: u32 = INJ_F_Y_INVERT;
 pub const INJ_HELLO_SIZE: usize = 16;
 pub const INJ_IMPORT_SIZE: usize = 64;
 pub const INJ_RELEASE_SIZE: usize = 8;
+pub const INJ_IMPORT_SYNCOBJ_SIZE: usize = 8;
 pub const INJ_REPLY_SIZE: usize = 48;
 
 /// The largest packet a peer may send; a longer one is truncated by the
@@ -85,21 +93,29 @@ pub struct InjRelease {
     pub id: u32,
 }
 
+/// `{op = IMPORT_SYNCOBJ, flags = 0}`, with the syncobj file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InjImportSyncobj {
+    pub flags: u32,
+}
+
 /// A request, as [`parse_request`] reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InjRequest {
     Hello(InjHello),
     Import(InjImport),
     Release(InjRelease),
+    ImportSyncobj(InjImportSyncobj),
 }
 
 /// The one reply shape: `{op, status, id, version, token[16], max_buffers,
-/// reserved, max_bytes}` at 0, 4, 8, 12, 16, 32, 36, 40.
+/// max_syncobjs, max_bytes}` at 0, 4, 8, 12, 16, 32, 36, 40.
 ///
-/// `op` echoes the request's. `status` is 0 or a negative errno. IMPORT
-/// fills `id` and `token`; HELLO fills `version` and the backend's bounds
-/// (`max_buffers` ids and `max_bytes` bytes of distinct objects at once, per
-/// VM). Everything else is zero.
+/// `op` echoes the request's. `status` is 0 or a negative errno. IMPORT and
+/// IMPORT_SYNCOBJ fill `id` and `token`; HELLO fills `version` and the
+/// backend's bounds, per VM: `max_buffers` buffer ids and `max_bytes` bytes
+/// of them at once, and `max_syncobjs` syncobj ids. Everything else is
+/// zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InjReply {
     pub op: u32,
@@ -108,6 +124,7 @@ pub struct InjReply {
     pub version: u32,
     pub token: [u8; 16],
     pub max_buffers: u32,
+    pub max_syncobjs: u32,
     pub max_bytes: u64,
 }
 
@@ -181,6 +198,14 @@ pub fn parse_request(b: &[u8]) -> Result<InjRequest, InjMalformed> {
             }
             Ok(InjRequest::Release(InjRelease { id: u32_at(b, 4) }))
         }
+        INJ_OP_IMPORT_SYNCOBJ => {
+            if b.len() != INJ_IMPORT_SYNCOBJ_SIZE {
+                return Err(InjMalformed::Size);
+            }
+            Ok(InjRequest::ImportSyncobj(InjImportSyncobj {
+                flags: u32_at(b, 4),
+            }))
+        }
         _ => Err(InjMalformed::Op),
     }
 }
@@ -222,6 +247,15 @@ impl InjRelease {
     }
 }
 
+impl InjImportSyncobj {
+    pub fn to_bytes(&self) -> [u8; INJ_IMPORT_SYNCOBJ_SIZE] {
+        let mut b = [0u8; INJ_IMPORT_SYNCOBJ_SIZE];
+        b[0..4].copy_from_slice(&INJ_OP_IMPORT_SYNCOBJ.to_le_bytes());
+        b[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        b
+    }
+}
+
 impl InjReply {
     pub fn to_bytes(&self) -> [u8; INJ_REPLY_SIZE] {
         let mut b = [0u8; INJ_REPLY_SIZE];
@@ -231,6 +265,7 @@ impl InjReply {
         b[12..16].copy_from_slice(&self.version.to_le_bytes());
         b[16..32].copy_from_slice(&self.token);
         b[32..36].copy_from_slice(&self.max_buffers.to_le_bytes());
+        b[36..40].copy_from_slice(&self.max_syncobjs.to_le_bytes());
         b[40..48].copy_from_slice(&self.max_bytes.to_le_bytes());
         b
     }
@@ -249,6 +284,7 @@ impl InjReply {
             version: u32_at(b, 12),
             token,
             max_buffers: u32_at(b, 32),
+            max_syncobjs: u32_at(b, 36),
             max_bytes: u64_at(b, 40),
         })
     }
@@ -328,6 +364,12 @@ mod tests {
 
         let r = InjRelease { id: 7 };
         assert_eq!(parse_request(&r.to_bytes()), Ok(InjRequest::Release(r)));
+        let so = InjImportSyncobj { flags: 0 };
+        assert_eq!(
+            parse_request(&so.to_bytes()),
+            Ok(InjRequest::ImportSyncobj(so))
+        );
+        assert_eq!(parse_request(&so.to_bytes()[..6]), Err(InjMalformed::Size));
         assert_eq!(parse_request(&[9, 0, 0, 0]), Err(InjMalformed::Op));
         assert_eq!(parse_request(&[]), Err(InjMalformed::Size));
         assert_eq!(parse_request(&[1, 0]), Err(InjMalformed::Size));
@@ -342,6 +384,7 @@ mod tests {
             version: 0,
             token: [0xa5; 16],
             max_buffers: 32,
+            max_syncobjs: 16,
             max_bytes: 1 << 30,
         };
         assert_eq!(InjReply::from_bytes(&r.to_bytes()), Some(r));

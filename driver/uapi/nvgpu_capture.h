@@ -71,8 +71,32 @@ struct nvgpu_capture_open {
 
 #define NVGPU_CAPTURE_IOC_OPEN _IOWR('C', 0x40, struct nvgpu_capture_open)
 
+/*
+ * OPEN_SYNCOBJ: a syncobj the helper injected (explicit sync), imported into
+ * render_fd's file. `handle` is a syncobj handle of that DRM file, used with
+ * the ordinary syncobj ioctls on it (TIMELINE_WAIT, TIMELINE_SIGNAL,
+ * HANDLE_TO_FD for a Vulkan or EGL import). What its points mean is the
+ * helper's and the daemon's protocol; the host trusts none of them. Each call
+ * makes a new handle, as SYNCOBJ_FD_TO_HANDLE does; SYNCOBJ_DESTROY it when
+ * done (the file's close does too). Errors as OPEN's.
+ */
+struct nvgpu_capture_open_syncobj {
+  /* in */
+  __s32 render_fd;
+  __u32 id;
+  __u8 token[16];
+  __u32 flags;
+  /* out */
+  __u32 handle;
+};
+
+#define NVGPU_CAPTURE_IOC_OPEN_SYNCOBJ                                          \
+  _IOWR('C', 0x41, struct nvgpu_capture_open_syncobj)
+
 #ifdef __KERNEL__
 static_assert(sizeof(struct nvgpu_capture_open) == 104, "capture open");
+static_assert(sizeof(struct nvgpu_capture_open_syncobj) == 32,
+              "capture open syncobj");
 #endif
 
 #endif /* _UAPI_NVGPU_CAPTURE_H */

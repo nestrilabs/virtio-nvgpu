@@ -154,6 +154,7 @@ pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = ioc(IOC_RW, b'd', 0x2e, 12);
 pub const DRM_IOCTL_SYNCOBJ_CREATE: u32 = ioc(IOC_RW, b'd', 0xbf, 8);
 pub const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = ioc(IOC_RW, b'd', 0xc0, 8);
 pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = ioc(IOC_RW, b'd', 0xc1, 24);
+pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = ioc(IOC_RW, b'd', 0xc2, 24);
 /// nvidia-drm's GEM_IMPORT_USERSPACE_MEMORY, absolute nr 0x42. See
 /// [`refused_everywhere`].
 pub const DRM_NVIDIA_GEM_IMPORT_USERSPACE_MEMORY_NR: u32 = 0x42;
@@ -444,6 +445,12 @@ pub enum HostOp {
         id: u32,
         token: [u8; 16],
     },
+    /// A syncobj the capture helper injected.
+    InjectOpenSyncobj {
+        file: u32,
+        id: u32,
+        token: [u8; 16],
+    },
 }
 
 /// Most handles SYNC_MERGE and CLOSE_MANY take: `args[0]` is the count and
@@ -566,7 +573,7 @@ pub fn check_host_op(
                 cookie: args[4],
             })
         }
-        OP_INJECT_OPEN => {
+        OP_INJECT_OPEN | OP_INJECT_OPEN_SYNCOBJ => {
             want(4)?;
             let (file, _) = of_kind(args[0], &is_render)?;
             // An id is a u32; a larger number names none (ENOENT, as a
@@ -575,7 +582,11 @@ pub fn check_host_op(
             let mut token = [0u8; 16];
             token[..8].copy_from_slice(&args[2].to_le_bytes());
             token[8..].copy_from_slice(&args[3].to_le_bytes());
-            Ok(HostOp::InjectOpen { file, id, token })
+            Ok(if req.op == OP_INJECT_OPEN {
+                HostOp::InjectOpen { file, id, token }
+            } else {
+                HostOp::InjectOpenSyncobj { file, id, token }
+            })
         }
         _ => Err(libc::EINVAL),
     }
@@ -620,6 +631,24 @@ pub fn gem_identify(render: RawFd, gem: u32) -> io::Result<u32> {
     p[0..4].copy_from_slice(&gem.to_le_bytes());
     flat(render, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, &mut p)?;
     Ok(u32::from_le_bytes(p[4..8].try_into().unwrap()))
+}
+
+/// `DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE` of syncobj file `syncobj` (flags 0: the
+/// syncobj itself, not a fence of it) into `render`: a new handle. The DRM
+/// core takes only a syncobj file (drm_syncobj.c, `drm_syncobj_fd_to_handle`
+/// checks its file operations).
+pub fn syncobj_import(render: RawFd, syncobj: RawFd) -> io::Result<u32> {
+    let mut p = [0u8; 24];
+    p[8..12].copy_from_slice(&syncobj.to_le_bytes());
+    flat(render, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut p)?;
+    Ok(u32::from_le_bytes(p[0..4].try_into().unwrap()))
+}
+
+/// `DRM_IOCTL_SYNCOBJ_DESTROY` of `handle` in `render`.
+pub fn syncobj_destroy(render: RawFd, handle: u32) -> io::Result<()> {
+    let mut p = [0u8; 8];
+    p[0..4].copy_from_slice(&handle.to_le_bytes());
+    flat(render, DRM_IOCTL_SYNCOBJ_DESTROY, &mut p)
 }
 
 /// `DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET`: `{u32 handle; u32 pad; u64 offset}`.

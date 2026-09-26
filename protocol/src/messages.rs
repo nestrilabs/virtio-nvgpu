@@ -869,6 +869,12 @@ pub const OSDESC_REAP_MAX: u32 = 256;
 /// not match, is -ENOENT either way. `type` is always 0 (NVKMS): nothing
 /// else is injected. Only with [`BCAP_INJECT`].
 pub const OP_INJECT_OPEN: u32 = 12;
+/// `(render file, id, token[0..8], token[8..16]) -> (syncobj handle)`: a
+/// syncobj the capture helper injected (IMPORT_SYNCOBJ), imported into the
+/// render file, where the guest's handle is the host's number (fences are
+/// the host's, ARCHITECTURE.md §12). -ENOENT for an id that is not a live
+/// syncobj or a token that does not match. Only with [`BCAP_INJECT`].
+pub const OP_INJECT_OPEN_SYNCOBJ: u32 = 13;
 
 pub const OP_MAX_ARGS: usize = 6;
 pub const OP_MAX_RES: usize = 4;
@@ -1051,6 +1057,10 @@ mod tests {
         assert_eq!(define("NVGPU_BCAP_COMPUTE"), u64::from(BCAP_COMPUTE));
         assert_eq!(define("NVGPU_BCAP_INJECT"), u64::from(BCAP_INJECT));
         assert_eq!(define("NVGPU_OP_INJECT_OPEN"), u64::from(OP_INJECT_OPEN));
+        assert_eq!(
+            define("NVGPU_OP_INJECT_OPEN_SYNCOBJ"),
+            u64::from(OP_INJECT_OPEN_SYNCOBJ)
+        );
         assert!(h.contains("static_assert(sizeof(struct nvgpu_inject_info) == 64"));
         // Every capability bit is distinct, on each side.
         let bcaps = [

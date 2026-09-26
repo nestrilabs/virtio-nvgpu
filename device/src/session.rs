@@ -689,6 +689,16 @@ impl NvidiaBackend {
         })?;
         // A buffer the capture helper injected: its description goes after
         // the fixed reply (inject.rs).
+        if let HostOp::InjectOpenSyncobj { file, id, token } = op {
+            let h = self.inject_open_syncobj(file, id, &token)?;
+            let mut resp = HostOpResp {
+                nres: 1,
+                pad: 0,
+                res: [0; OP_MAX_RES],
+            };
+            resp.res[0] = h;
+            return Ok(Outcome::Reply(self.ok_reply(0, bytes_of(&resp))));
+        }
         if let HostOp::InjectOpen { file, id, token } = op {
             let (res, info) = self.inject_open(file, id, &token)?;
             let mut resp = HostOpResp {
@@ -851,7 +861,9 @@ impl NvidiaBackend {
             HostOp::OpenKms { .. } | HostOp::DropIfMaster { .. } => {
                 unreachable!("serve_host_op sends these to an executor")
             }
-            HostOp::InjectOpen { .. } => unreachable!("serve_host_op answers it itself"),
+            HostOp::InjectOpen { .. } | HostOp::InjectOpenSyncobj { .. } => {
+                unreachable!("serve_host_op answers it itself")
+            }
             HostOp::SyncobjWatch { key, cookie } => Ok((self.syncobj_watch(key, cookie)?, vec![])),
             HostOp::CloseMany { handles } => {
                 let closed = handles

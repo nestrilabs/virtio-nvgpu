@@ -103,6 +103,7 @@ pub fn run(b: &mut Bytes<'_>) {
         let mut renders: Vec<(u32, u32)> = Vec::new();
         let mut known: Vec<(u32, [u8; 16])> = Vec::new();
         let mut kept: Vec<OwnedFd> = Vec::new();
+        let mut syncobjs: Vec<(u32, [u8; 16])> = Vec::new();
 
         let mut steps = 0;
         while !b.is_empty() && steps < 256 {
@@ -124,6 +125,20 @@ pub fn run(b: &mut Bytes<'_>) {
                     }
                     Ok(InjRequest::Release(r)) => {
                         let _ = reg.release(peer, r.id);
+                    }
+                    Ok(InjRequest::ImportSyncobj(so)) => {
+                        let fds: Vec<OwnedFd> = (0..b.u8() % 3)
+                            .map(|_| {
+                                if b.u8() % 4 == 0 {
+                                    host.not_dmabuf()
+                                } else {
+                                    host.syncobj()
+                                }
+                            })
+                            .collect();
+                        if let Ok((id, tok)) = reg.import_syncobj(peer, so.flags, fds) {
+                            syncobjs.push((id, tok));
+                        }
                     }
                     Ok(InjRequest::Hello(_)) | Err(_) => {}
                 },
@@ -178,10 +193,47 @@ pub fn run(b: &mut Bytes<'_>) {
                         call(&mut be, MsgType::Close, h, &[]);
                     }
                 }
-                _ => {
-                    // Any bytes as an INJECT_OPEN.
+                5 if !syncobjs.is_empty() && !renders.is_empty() && b.u8() % 2 == 0 => {
+                    // A syncobj: its token, or one altered.
+                    let (id, mut tok) = syncobjs[b.u8() as usize % syncobjs.len()];
+                    let wrong = b.u8() % 3 == 0;
+                    if wrong {
+                        tok[b.u8() as usize % 16] ^= 1 | b.u8();
+                    }
+                    let (render, _) = renders[b.u8() as usize % renders.len()];
+                    let live = reg.open_syncobj(id, &tok).is_ok();
                     let mut req = HostOpReq {
-                        op: OP_INJECT_OPEN,
+                        op: OP_INJECT_OPEN_SYNCOBJ,
+                        nargs: 4,
+                        args: [0; OP_MAX_ARGS],
+                    };
+                    req.args[0] = u64::from(render);
+                    req.args[1] = u64::from(id);
+                    req.args[2] = u64::from_le_bytes(tok[..8].try_into().unwrap());
+                    req.args[3] = u64::from_le_bytes(tok[8..].try_into().unwrap());
+                    let st = status(&call(
+                        &mut be,
+                        MsgType::HostOp,
+                        0,
+                        crate::sys::pod::bytes(&req),
+                    ));
+                    assert_eq!(
+                        st == 0,
+                        live,
+                        "INJECT_OPEN_SYNCOBJ and the registry disagree: {st}"
+                    );
+                    if wrong {
+                        assert_eq!(st, -libc::ENOENT, "a wrong token opened a syncobj");
+                    }
+                }
+                _ => {
+                    // Any bytes as an INJECT_OPEN or INJECT_OPEN_SYNCOBJ.
+                    let mut req = HostOpReq {
+                        op: if b.u8() % 2 == 0 {
+                            OP_INJECT_OPEN
+                        } else {
+                            OP_INJECT_OPEN_SYNCOBJ
+                        },
                         nargs: u32::from(b.u8() % 8),
                         args: [0; OP_MAX_ARGS],
                     };
@@ -193,13 +245,17 @@ pub fn run(b: &mut Bytes<'_>) {
             }
             assert!(reg.live() <= max_buffers, "past the buffer bound");
             assert!(reg.bytes() <= max_bytes, "past the byte bound");
+            assert!(
+                reg.syncobjs() <= crate::inject::MAX_SYNCOBJS,
+                "past the syncobj bound"
+            );
             assert!(be.inject.opens() as u64 <= MAX_OPENS, "past the open bound");
         }
         // Everything the helper imported goes with it.
         for p in 0..3 {
             reg.release_peer(p);
         }
-        assert_eq!((reg.live(), reg.bytes()), (0, 0));
+        assert_eq!((reg.live(), reg.bytes(), reg.syncobjs()), (0, 0, 0));
         be.session_reset("fuzz end");
         assert_eq!(be.inject.opens(), 0);
     }

@@ -366,6 +366,11 @@ impl Registrations {
         !self.importers.contains(&render) && !self.exported.contains(&(render, syncobj))
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_private_for_test(&self, render: u32, syncobj: u32) -> bool {
+        self.private(render, syncobj)
+    }
+
     /// A render-class IOCTL2 on `render` is about to run, its argument
     /// `arg` (the backend's copy): what it does to a syncobj's reach.
     /// SYNCOBJ_DESTROY orphans the handle's registrations first

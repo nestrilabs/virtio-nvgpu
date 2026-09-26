@@ -6,13 +6,15 @@
  *
  * The host's capture helper injects buffers into the backend; the backend
  * keeps each under an id and a random token, and a guest process that knows
- * both asks here. One ioctl, fixed-size, and nothing parsed but its own
- * struct: HOST_OP INJECT_OPEN imports the host object into the caller's
- * render file on the host, and the GEM handle it answers with becomes a
- * proxy of that file and a dma-buf, exactly as a host client's buffer does
- * in export mode (nvgpu_wl.c, nvgpu_wl_import()). The backend checks the
- * token, the buffer and the caller's share of opens; what this adds is who
- * may ask at all (the node's mode, below) and a dma-buf opened read-only.
+ * both asks here. Two ioctls, fixed-size, and nothing parsed but their own
+ * structs. OPEN: HOST_OP INJECT_OPEN imports the host object into the
+ * caller's render file on the host, and the GEM handle it answers with
+ * becomes a proxy of that file and a dma-buf, exactly as a host client's
+ * buffer does in export mode (nvgpu_wl.c, nvgpu_wl_import()). OPEN_SYNCOBJ:
+ * HOST_OP INJECT_OPEN_SYNCOBJ imports an injected syncobj into the same
+ * file, whose handle numbers are the host's. The backend checks the token,
+ * the object and the caller's share of opens; what this adds is who may ask
+ * at all (the node's mode, below) and a dma-buf opened read-only.
  *
  * The node follows /dev/nvgpu-wl: root:root 0660 by default (capture_mode),
  * a group for the guest's capture daemon from udev
@@ -199,6 +201,53 @@ static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
   return 0;
 }
 
+/*
+ * OPEN_SYNCOBJ: INJECT_OPEN_SYNCOBJ on the render file's handle. The handle
+ * the host answers with is the guest file's own number (nvgpu_fence.c: a
+ * host syncobj handle is the same number in the guest), so there is nothing
+ * to make here: the caller uses it with the ordinary syncobj ioctls. One
+ * whose reply comes after the caller gave up stays in the caller's file
+ * until it closes, as a SYNCOBJ_FD_TO_HANDLE's would.
+ */
+static long nvgpu_capture_open_syncobj_ioctl(struct nvgpu_capture_dev *cd,
+                                             void __user *uarg) {
+  struct nvgpu_device *dev = cd->dev;
+  struct nvgpu_capture_open_syncobj a;
+  struct nvgpu_fd *nfd;
+  struct file *rf;
+  u64 args[4], res[1];
+  int ret;
+
+  if (copy_from_user(&a, uarg, sizeof(a)))
+    return -EFAULT;
+  if (a.flags)
+    return -EINVAL;
+  if (!nvgpu_fences_enabled(dev))
+    return -EOPNOTSUPP;
+  rf = fget(a.render_fd);
+  nfd = rf ? nvgpu_drm_file_nfd(rf) : NULL;
+  if (!nfd || nfd->dev != dev) {
+    if (rf)
+      fput(rf);
+    return -EBADF;
+  }
+  args[0] = nfd->handle;
+  args[1] = a.id;
+  args[2] = get_unaligned_le64(&a.token[0]);
+  args[3] = get_unaligned_le64(&a.token[8]);
+  ret = nvgpu_host_op(dev, NVGPU_OP_INJECT_OPEN_SYNCOBJ, args, 4, res, 1);
+  fput(rf);
+  if (ret < 0)
+    return ret;
+  /* A syncobj handle is a non-zero u32 (idr_alloc from 1). */
+  if (!res[0] || res[0] > U32_MAX)
+    return -EPROTO;
+  a.handle = (u32)res[0];
+  if (copy_to_user(uarg, &a, sizeof(a)))
+    return -EFAULT;
+  return 0;
+}
+
 static int nvgpu_capture_fopen(struct inode *inode, struct file *filp) {
   struct miscdevice *m = filp->private_data;
   struct nvgpu_capture_dev *cd =
@@ -225,6 +274,8 @@ static long nvgpu_capture_ioctl(struct file *filp, unsigned int cmd,
   switch (cmd) {
   case NVGPU_CAPTURE_IOC_OPEN:
     return nvgpu_capture_open_ioctl(cd, (void __user *)arg);
+  case NVGPU_CAPTURE_IOC_OPEN_SYNCOBJ:
+    return nvgpu_capture_open_syncobj_ioctl(cd, (void __user *)arg);
   default:
     return -ENOTTY;
   }

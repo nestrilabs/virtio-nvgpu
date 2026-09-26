@@ -60,8 +60,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use protocol::inject::{
-    INJ_F_ALL, INJ_MAX_PACKET, INJ_OP_HELLO, INJ_OP_IMPORT, INJ_OP_RELEASE, INJ_VERSION, InjImport,
-    InjMalformed, InjReply, InjRequest, InjectInfo, parse_request,
+    INJ_F_ALL, INJ_MAX_PACKET, INJ_OP_HELLO, INJ_OP_IMPORT, INJ_OP_IMPORT_SYNCOBJ, INJ_OP_RELEASE,
+    INJ_VERSION, InjImport, InjMalformed, InjReply, InjRequest, InjectInfo, parse_request,
 };
 
 use crate::hostfd;
@@ -74,6 +74,8 @@ pub const MAX_BUFFERS: usize = 32;
 /// Bytes of injected objects one VM may hold at once: sixteen 2560x1440
 /// ARGB buffers and room to spare.
 pub const MAX_BYTES: u64 = 1 << 30;
+/// Injected syncobjs one VM may hold at once: one or two a stream.
+pub const MAX_SYNCOBJS: usize = 16;
 /// Helper connections at once.
 pub const MAX_PEERS: usize = 4;
 /// The largest width or height accepted.
@@ -273,6 +275,12 @@ pub trait InjectHost: Send + Sync {
     fn map_offset(&self, render: BorrowedFd<'_>, gem: u32) -> io::Result<u64>;
     fn gem_close(&self, render: BorrowedFd<'_>, gem: u32);
     fn random(&self, buf: &mut [u8]) -> io::Result<()>;
+    /// Whether `fd` is a DRM syncobj file (`anon_inode:syncobj_file`,
+    /// `hostfd::classify`).
+    fn is_syncobj(&self, fd: BorrowedFd<'_>) -> bool;
+    /// SYNCOBJ_FD_TO_HANDLE: a new handle in `render` for the syncobj.
+    fn syncobj_import(&self, render: BorrowedFd<'_>, syncobj: BorrowedFd<'_>) -> io::Result<u32>;
+    fn syncobj_destroy(&self, render: BorrowedFd<'_>, handle: u32);
 }
 
 /// The real host: the render nodes `/dev/dri/<name>` of this GPU list.
@@ -342,6 +350,15 @@ impl InjectHost for SysInjectHost {
     fn random(&self, buf: &mut [u8]) -> io::Result<()> {
         crate::sys::proc::getrandom(buf)
     }
+    fn is_syncobj(&self, fd: BorrowedFd<'_>) -> bool {
+        hostfd::classify(fd, &[]) == hostfd::HandleKind::Syncobj
+    }
+    fn syncobj_import(&self, render: BorrowedFd<'_>, syncobj: BorrowedFd<'_>) -> io::Result<u32> {
+        hostfd::syncobj_import(render.as_raw_fd(), syncobj.as_raw_fd())
+    }
+    fn syncobj_destroy(&self, render: BorrowedFd<'_>, handle: u32) {
+        let _ = hostfd::syncobj_destroy(render.as_raw_fd(), handle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +384,19 @@ struct Injected {
     offset: u64,
 }
 
+/// One injected syncobj.
+#[derive(Debug)]
+struct InjectedSyncobj {
+    token: [u8; 16],
+    peer: u64,
+    /// The syncobj file, which keeps the syncobj alive while the id lives.
+    file: OwnedFd,
+}
+
 #[derive(Debug, Default)]
 struct State {
     live: BTreeMap<u32, Injected>,
+    syncobjs: BTreeMap<u32, InjectedSyncobj>,
     next_id: u32,
     bytes: u64,
     /// The backend's own render file of each node, opened on first use.
@@ -393,6 +420,7 @@ pub struct Registry {
     state: Mutex<State>,
     max_buffers: usize,
     max_bytes: u64,
+    max_syncobjs: usize,
 }
 
 impl std::fmt::Debug for Registry {
@@ -419,6 +447,7 @@ impl Registry {
             }),
             max_buffers,
             max_bytes,
+            max_syncobjs: MAX_SYNCOBJS,
         }
     }
 
@@ -426,8 +455,9 @@ impl Registry {
         &self.host
     }
 
-    pub fn limits(&self) -> (usize, u64) {
-        (self.max_buffers, self.max_bytes)
+    /// Buffer ids, their bytes, and syncobj ids, per VM.
+    pub fn limits(&self) -> (usize, u64, usize) {
+        (self.max_buffers, self.max_bytes, self.max_syncobjs)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -621,6 +651,10 @@ impl Registry {
     /// RELEASE from `peer`: only an id it imported (ENOENT otherwise).
     pub fn release(&self, peer: u64, id: u32) -> Result<(), i32> {
         let mut st = self.lock();
+        if st.syncobjs.get(&id).is_some_and(|o| o.peer == peer) {
+            st.syncobjs.remove(&id);
+            return Ok(());
+        }
         match st.live.get(&id) {
             Some(b) if b.peer == peer => {}
             _ => return Err(libc::ENOENT),
@@ -641,7 +675,71 @@ impl Registry {
         for &id in &ids {
             self.forget(&mut st, id);
         }
-        ids.len()
+        let before = st.syncobjs.len();
+        st.syncobjs.retain(|_, o| o.peer != peer);
+        ids.len() + before - st.syncobjs.len()
+    }
+
+    /// IMPORT_SYNCOBJ from `peer`: the syncobj file's id and token.
+    pub fn import_syncobj(
+        &self,
+        peer: u64,
+        flags: u32,
+        fds: Vec<OwnedFd>,
+    ) -> Result<(u32, [u8; 16]), i32> {
+        if flags != 0 || fds.len() != 1 {
+            return Err(libc::EINVAL);
+        }
+        let file = fds.into_iter().next().expect("one");
+        if !self.host.is_syncobj(file.as_fd()) {
+            log::warn!("inject: an IMPORT_SYNCOBJ's descriptor is not a syncobj file; refused");
+            return Err(libc::EBADF);
+        }
+        let mut st = self.lock();
+        if st.syncobjs.len() >= self.max_syncobjs {
+            log::warn!(
+                "inject: {} syncobjs are held already; an IMPORT_SYNCOBJ is refused",
+                st.syncobjs.len()
+            );
+            return Err(libc::ENOSPC);
+        }
+        // What the kernel says it is: a syncobj file imports (the DRM core
+        // checks its file operations), anything else is refused. The handle
+        // is not kept: the file keeps the syncobj.
+        self.ensure_render(&mut st, 0).map_err(|_| libc::EIO)?;
+        let r = render_fd(&st, 0);
+        match self.host.syncobj_import(r, file.as_fd()) {
+            Ok(h) => self.host.syncobj_destroy(r, h),
+            Err(e) => {
+                log::warn!("inject: the kernel refused an IMPORT_SYNCOBJ's syncobj: {e}");
+                return Err(libc::EBADF);
+            }
+        }
+        let mut token = [0u8; 16];
+        self.host.random(&mut token).map_err(|_| libc::EIO)?;
+        let id = next_id(&mut st);
+        st.syncobjs
+            .insert(id, InjectedSyncobj { token, peer, file });
+        log::debug!("inject: syncobj id {id}");
+        Ok((id, token))
+    }
+
+    /// INJECT_OPEN_SYNCOBJ's lookup: a new descriptor of syncobj id `id`'s
+    /// file, for its token (ENOENT alike for a missing id, a buffer's id and
+    /// a wrong token).
+    pub fn open_syncobj(&self, id: u32, token: &[u8; 16]) -> Result<OwnedFd, i32> {
+        let st = self.lock();
+        let o = st.syncobjs.get(&id);
+        let ok = token_eq(o.map_or(&[0xff; 16], |o| &o.token), token) && o.is_some();
+        let Some(o) = o.filter(|_| ok) else {
+            return Err(libc::ENOENT);
+        };
+        o.file.try_clone().map_err(|_| libc::EMFILE)
+    }
+
+    /// Syncobj ids held.
+    pub fn syncobjs(&self) -> usize {
+        self.lock().syncobjs.len()
     }
 
     fn forget(&self, st: &mut State, id: u32) {
@@ -714,7 +812,7 @@ fn next_id(st: &mut State) -> u32 {
     loop {
         let id = st.next_id;
         st.next_id = st.next_id.wrapping_add(1).max(1);
-        if !st.live.contains_key(&id) {
+        if !st.live.contains_key(&id) && !st.syncobjs.contains_key(&id) {
             return id;
         }
     }
@@ -905,6 +1003,45 @@ impl crate::nvidia::NvidiaBackend {
             ],
             opened.info,
         ))
+    }
+}
+
+impl crate::nvidia::NvidiaBackend {
+    /// HOST_OP INJECT_OPEN_SYNCOBJ: import syncobj id `id` into render
+    /// handle `file`'s host file, for a guest that knows its token. The
+    /// handle is the guest file's too (fences are the host's, fence.rs).
+    pub(crate) fn inject_open_syncobj(
+        &mut self,
+        file: u32,
+        id: u32,
+        token: &[u8; 16],
+    ) -> Result<u64, i32> {
+        let reg = self.inject.registry().cloned().ok_or(libc::EOPNOTSUPP)?;
+        if !matches!(
+            self.handles.kind(file),
+            Some(crate::hostfd::HandleKind::DriRender(_))
+        ) {
+            return Err(libc::EBADF);
+        }
+        let syncobj = reg.open_syncobj(id, token).inspect_err(|e| {
+            log::warn!(
+                "INJECT_OPEN_SYNCOBJ of id {id} refused: {}",
+                io::Error::from_raw_os_error(*e)
+            )
+        })?;
+        // The file now holds a syncobj someone else holds too: its handles'
+        // wait registrations wait out their firing rather than go with a
+        // DESTROY (fence.rs, `Registrations::before_ioctl2`), as after any
+        // import of a syncobj file.
+        self.syncobj_regs
+            .before_ioctl2(file, "SYNCOBJ_FD_TO_HANDLE", None);
+        let (render, _) = self.handles.get(file).ok_or(libc::EBADF)?;
+        let h = reg
+            .host()
+            .syncobj_import(render, syncobj.as_fd())
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        log::debug!("INJECT_OPEN_SYNCOBJ of id {id}: handle {h} of render handle {file}");
+        Ok(u64::from(h))
     }
 }
 
@@ -1181,6 +1318,7 @@ fn serve_peer(s: &Shared, peer: u64, conn: &OwnedFd) {
             InjRequest::Hello(_) => (INJ_OP_HELLO, false),
             InjRequest::Import(_) => (INJ_OP_IMPORT, true),
             InjRequest::Release(_) => (INJ_OP_RELEASE, false),
+            InjRequest::ImportSyncobj(_) => (INJ_OP_IMPORT_SYNCOBJ, true),
         };
         if !takes_fds && !p.fds.is_empty() {
             log::warn!("inject: descriptors on a message that takes none; disconnected");
@@ -1208,10 +1346,11 @@ fn serve_peer(s: &Shared, peer: u64, conn: &OwnedFd) {
                     return;
                 }
                 hello = true;
-                let (max_buffers, max_bytes) = s.registry.limits();
+                let (max_buffers, max_bytes, max_syncobjs) = s.registry.limits();
                 r.version = INJ_VERSION;
                 r.max_buffers = max_buffers as u32;
                 r.max_bytes = max_bytes;
+                r.max_syncobjs = max_syncobjs as u32;
             }
             InjRequest::Import(imp) => match s.registry.import(peer, &imp, p.fds) {
                 Ok((id, token)) => {
@@ -1220,6 +1359,15 @@ fn serve_peer(s: &Shared, peer: u64, conn: &OwnedFd) {
                 }
                 Err(e) => r.status = -e,
             },
+            InjRequest::ImportSyncobj(so) => {
+                match s.registry.import_syncobj(peer, so.flags, p.fds) {
+                    Ok((id, token)) => {
+                        r.id = id;
+                        r.token = token;
+                    }
+                    Err(e) => r.status = -e,
+                }
+            }
             InjRequest::Release(rel) => {
                 if let Err(e) = s.registry.release(peer, rel.id) {
                     r.status = -e;
@@ -1267,6 +1415,10 @@ pub mod fake {
         next_gem: u32,
         closed: Vec<(u64, u32)>,
         next_rand: u8,
+        /// Syncobj files, by inode; handles made of them.
+        syncobjs: HashSet<u64>,
+        syncobj_handles: HashMap<(u64, u32), u64>,
+        next_syncobj: u32,
     }
 
     #[derive(Default)]
@@ -1329,6 +1481,24 @@ pub mod fake {
         /// GEM_CLOSEs so far.
         pub fn closes(&self) -> usize {
             self.st().closed.len()
+        }
+
+        /// A new "syncobj file".
+        pub fn syncobj(&self) -> OwnedFd {
+            let fd = crate::sys::fd::memfd(c"fake-syncobj", libc::MFD_CLOEXEC).unwrap();
+            let i = ino(fd.as_fd());
+            self.st().syncobjs.insert(i);
+            fd
+        }
+
+        /// Syncobj handles `file` holds.
+        pub fn syncobjs_in(&self, file: BorrowedFd<'_>) -> usize {
+            let f = ino(file);
+            self.st()
+                .syncobj_handles
+                .keys()
+                .filter(|(r, _)| *r == f)
+                .count()
         }
     }
 
@@ -1401,6 +1571,29 @@ pub mod fake {
                 *b = st.next_rand;
             }
             Ok(())
+        }
+        fn is_syncobj(&self, fd: BorrowedFd<'_>) -> bool {
+            self.st().syncobjs.contains(&ino(fd))
+        }
+        fn syncobj_import(
+            &self,
+            render: BorrowedFd<'_>,
+            syncobj: BorrowedFd<'_>,
+        ) -> io::Result<u32> {
+            let (r, o) = (ino(render), ino(syncobj));
+            let mut st = self.st();
+            if !st.files.contains_key(&r) || !st.syncobjs.contains(&o) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            // A new handle every time, as drm_syncobj_fd_to_handle makes.
+            st.next_syncobj += 1;
+            let h = st.next_syncobj;
+            st.syncobj_handles.insert((r, h), o);
+            Ok(h)
+        }
+        fn syncobj_destroy(&self, render: BorrowedFd<'_>, handle: u32) {
+            let r = ino(render);
+            self.st().syncobj_handles.remove(&(r, handle));
         }
     }
 }
@@ -1906,6 +2099,88 @@ mod tests {
         assert_eq!(host.handles_in(fd), 0);
     }
 
+    #[test]
+    fn a_syncobj_is_injected_opened_with_its_token_and_released() {
+        let (host, reg) = setup();
+        // Only a syncobj file, and exactly one.
+        assert_eq!(
+            reg.import_syncobj(1, 0, vec![host.not_dmabuf()]),
+            Err(libc::EBADF)
+        );
+        assert_eq!(reg.import_syncobj(1, 0, vec![]), Err(libc::EINVAL));
+        assert_eq!(
+            reg.import_syncobj(1, 0, vec![host.syncobj(), host.syncobj()]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            reg.import_syncobj(1, 1, vec![host.syncobj()]),
+            Err(libc::EINVAL)
+        );
+        let (id, token) = reg.import_syncobj(1, 0, vec![host.syncobj()]).unwrap();
+        assert!(reg.open_syncobj(id, &token).is_ok());
+        let mut wrong = token;
+        wrong[0] ^= 1;
+        assert_eq!(reg.open_syncobj(id, &wrong).unwrap_err(), libc::ENOENT);
+        // A syncobj id is no buffer's, and a buffer's no syncobj's.
+        assert_eq!(reg.open(id, &token, 0).unwrap_err(), libc::ENOENT);
+        let (bid, btok) = reg
+            .import(1, &rgb(32, 32), vec![host.dmabuf(obj(4096 * 4, 0))])
+            .unwrap();
+        assert_ne!(bid, id);
+        assert_eq!(reg.open_syncobj(bid, &btok).unwrap_err(), libc::ENOENT);
+        // Only the importer releases it; its hangup does too.
+        assert_eq!(reg.release(2, id), Err(libc::ENOENT));
+        assert_eq!(reg.release(1, id), Ok(()));
+        assert_eq!(reg.open_syncobj(id, &token).unwrap_err(), libc::ENOENT);
+        reg.import_syncobj(1, 0, vec![host.syncobj()]).unwrap();
+        assert_eq!(reg.release_peer(1), 2);
+        assert_eq!(reg.syncobjs(), 0);
+        // Bounded.
+        for _ in 0..MAX_SYNCOBJS {
+            reg.import_syncobj(3, 0, vec![host.syncobj()]).unwrap();
+        }
+        assert_eq!(
+            reg.import_syncobj(3, 0, vec![host.syncobj()]),
+            Err(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn a_guest_opens_an_injected_syncobj_into_its_render_file() {
+        let host = Arc::new(FakeHost::new(1));
+        let reg = Arc::new(Registry::new(host.clone()));
+        let (id, token) = reg.import_syncobj(1, 0, vec![host.syncobj()]).unwrap();
+        let mut be = v2_backend(Some(reg.clone()));
+        let render = be.adopt_for_test(host.render_file(0), HandleKind::DriRender(0));
+        let open = |be: &mut NvidiaBackend, render: u32, token: &[u8; 16]| {
+            let mut req = HostOpReq {
+                op: OP_INJECT_OPEN_SYNCOBJ,
+                nargs: 4,
+                args: [0; OP_MAX_ARGS],
+            };
+            req.args[0] = u64::from(render);
+            req.args[1] = u64::from(id);
+            req.args[2] = u64::from_le_bytes(token[..8].try_into().unwrap());
+            req.args[3] = u64::from_le_bytes(token[8..].try_into().unwrap());
+            let r = call(be, MsgType::HostOp, 0, crate::sys::pod::bytes(&req));
+            let resp: HostOpResp =
+                crate::sys::pod::read(&r, size_of::<MsgHeader>()).unwrap_or_default();
+            (status(&r), resp.res[0])
+        };
+        assert_eq!(open(&mut be, render, &[0; 16]).0, -libc::ENOENT);
+        let (st, h) = open(&mut be, render, &token);
+        assert_eq!(st, 0);
+        assert_ne!(h, 0);
+        let (fd, _) = be.handles.get(render).unwrap();
+        assert_eq!(host.syncobjs_in(fd), 1);
+        // The file is an importer now: its syncobjs' registrations are not
+        // dropped by a DESTROY (fence.rs).
+        assert!(!be.syncobj_regs.is_private_for_test(render, h as u32));
+        // Not on a file that is not a render file.
+        let sync = be.adopt_for_test(host.not_dmabuf(), HandleKind::SyncFile);
+        assert_eq!(open(&mut be, sync, &token).0, -libc::EBADF);
+    }
+
     // ── the socket ──
 
     /// A directory of this test's own (the tests run in parallel).
@@ -1961,6 +2236,7 @@ mod tests {
         let h = roundtrip(&c, &hello_bytes(), &[]).unwrap();
         assert_eq!((h.status, h.version), (0, INJ_VERSION));
         assert_eq!(h.max_buffers as usize, MAX_BUFFERS);
+        assert_eq!(h.max_syncobjs as usize, MAX_SYNCOBJS);
         assert_eq!(h.max_bytes, MAX_BYTES);
         let r = roundtrip(&c, &rgb(32, 32).to_bytes(), &[d.as_raw_fd()]).unwrap();
         assert_eq!((r.op, r.status), (INJ_OP_IMPORT, 0));
