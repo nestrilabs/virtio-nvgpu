@@ -18,13 +18,16 @@
 //!   create (a successful ALLOC_SEMAPHORE_POOL on that handle), asked for
 //!   exactly -- same base, same length, read-write -- on a VA space in
 //!   sharing mode, at a base in [`HVA_MIN`, `HVA_MAX`), [4 GiB, 32 TiB).
-//!   The band holds nothing of the VMM's: its executable and heap sit at
-//!   two-thirds of the 47-bit space (85 TiB), and its mappings grow down
-//!   from below the stack or, under a legacy layout (an unlimited stack
-//!   rlimit), up from a third of it (42.7 TiB) -- which the 64 TiB top this
-//!   band once had would have reached. So the VMM's `MAP_FIXED_NOREPLACE`
-//!   never collides with a mapping of its own, and a guest cannot learn the
-//!   VMM's layout from whether it did.
+//!   The band normally holds nothing of the VMM's: its executable and heap
+//!   sit at two-thirds of the 47-bit space (85 TiB), and its mappings grow
+//!   down from below the stack or, under the legacy layout
+//!   (`vm.legacy_va_layout`), up from a third of it (42.7 TiB) -- which the
+//!   64 TiB top this band once had would have reached. Not with an
+//!   unlimited stack rlimit (or one above about 96 TiB): x86 then starts
+//!   the mmap area near 21 TiB, inside the band, and nesbox's
+//!   `MAP_FIXED_NOREPLACE` can collide with a mapping of its own -- a
+//!   refusal, which says the address is taken (SECURITY.md §11, F3). crosvm
+//!   reserves the band before it maps anything, so there it never does.
 //! - **How much.** Placements per file and per VM, bytes per file and per
 //!   VM, and recorded ranges per file and per VM, all bounded.
 //! - **Where in the aperture.** First fit in [`CHUNK`] granules. An offset is
