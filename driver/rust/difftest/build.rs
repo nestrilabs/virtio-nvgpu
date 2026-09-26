@@ -51,7 +51,7 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                         unsigned long arg);
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
                          void __user *uarg, u32 sz);
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle);
 bool nvgpu_proc_ids(const struct nvgpu_device *dev);
 bool nvgpu_proc_euid(const struct nvgpu_device *dev);
 void nvgpu_proc_id_fill(const struct nvgpu_device *dev, void *dst);

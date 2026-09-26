@@ -219,7 +219,8 @@ out:
  * Zero is "no notification" and passes as it is. The caller's value is
  * saved in `*saved`, for the reply.
  */
-static int nvgpu_rm_os_event_in(void *slot, u64 *saved) {
+static int nvgpu_rm_os_event_in(struct nvgpu_device *dev, void *slot,
+                                u64 *saved) {
   u32 handle;
   u64 v;
 
@@ -227,7 +228,7 @@ static int nvgpu_rm_os_event_in(void *slot, u64 *saved) {
   *saved = v;
   if (!v)
     return 0;
-  if (v > INT_MAX || nvgpu_handle_for_fd((int)v, &handle))
+  if (v > INT_MAX || nvgpu_handle_for_fd(dev, (int)v, &handle))
     return -EBADF;
   v = handle;
   memcpy(slot, &v, sizeof(v));
@@ -709,7 +710,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
       memcpy(&nested_fd, slot, sizeof(nested_fd));
       if (nested_fd != -1) {
-        if (nvgpu_handle_for_fd(nested_fd, &handle)) {
+        if (nvgpu_handle_for_fd(nfd->dev, nested_fd, &handle)) {
           dev_warn_ratelimited(&nfd->dev->vdev->dev,
                                "virtio-gpu-nv: RM control 0x%x names fd %d, "
                                "which is not one of our devices\n",
@@ -728,7 +729,8 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
      */
     os_event_off = nvgpu_rm_os_event_offset(ctl_cmd);
     if (os_event_off >= 0 && nested_size >= os_event_off + sizeof(u64)) {
-      ret = nvgpu_rm_os_event_in(req_buf + sizeof(*req) + sizeof(params) +
+      ret = nvgpu_rm_os_event_in(nfd->dev,
+                                 req_buf + sizeof(*req) + sizeof(params) +
                                      os_event_off,
                                  &os_event_val);
       if (ret) {
@@ -1056,7 +1058,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
            * is always one of our devices. Anything else would reach the
            * backend as a number it reads as a handle of its own.
            */
-          if (nvgpu_handle_for_fd(event_fd, &handle)) {
+          if (nvgpu_handle_for_fd(nfd->dev, event_fd, &handle)) {
             dev_warn_ratelimited(&nfd->dev->vdev->dev,
                                  "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
                                  "names fd %d, which is not one of our "
@@ -1073,7 +1075,7 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       if (hclass == NVGPU_CLASS_EVENT_BUFFER &&
           nested_size >=
               NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64)) {
-        ret = nvgpu_rm_os_event_in(nested +
+        ret = nvgpu_rm_os_event_in(nfd->dev, nested +
                                        NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
                                    &os_event_val);
         if (ret) {
@@ -1205,7 +1207,7 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   }
   if (guest_fd >= 0) {
     /* Resolve guest fd → nvgpu_fd → VMM handle */
-    ret = nvgpu_handle_for_fd(guest_fd, &host_handle);
+    ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &host_handle);
     if (ret)
       goto out;
 
@@ -1549,7 +1551,7 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
 
         memcpy(&guest_fd, nested + NVGPU_NVKMS_SURFACE_FD_OFFSET,
                sizeof(guest_fd));
-        if (nvgpu_handle_for_fd(guest_fd, &handle) == 0) {
+        if (nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle) == 0) {
           u64 as_u64 = handle;
 
           memcpy(nested + NVGPU_NVKMS_SURFACE_FD_OFFSET, &as_u64,

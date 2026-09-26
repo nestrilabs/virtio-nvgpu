@@ -133,7 +133,7 @@ extern "C" {
         resp_len: usize,
         used: *mut u32,
     ) -> c_int;
-    fn nvgpu_handle_for_fd(guest_fd: c_int, handle: *mut u32) -> c_int;
+    fn nvgpu_rs_handle_for_fd(nfd: *mut c_void, guest_fd: c_int, handle: *mut u32) -> c_int;
     fn nvgpu_rs_proc_id(nfd: *mut c_void, dst: *mut c_void);
     fn nvgpu_rs_driver_version(nfd: *mut c_void, len: *mut usize) -> *const c_char;
     fn nvgpu_rs_clock_to_guest(nfd: *mut c_void, raw: u32, host_ns: i64, guest_ns: *mut i64) -> bool;
@@ -369,8 +369,8 @@ impl rm::Env for RmEnv {
     fn handle_for_fd(&mut self, fd: i32) -> Result<u32, Errno> {
         let mut h = 0u32;
         // SAFETY: fget()s a number of the calling process's and writes one
-        // u32 through a pointer to a local.
-        let r = unsafe { nvgpu_handle_for_fd(fd, &mut h) };
+        // u32 through a pointer to a local; `nfd` is the live file.
+        let r = unsafe { nvgpu_rs_handle_for_fd(self.nfd, fd, &mut h) };
         if r != 0 {
             Err(r)
         } else {

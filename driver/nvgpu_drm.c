@@ -26,6 +26,7 @@
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 
+#include <drm/drm_auth.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -1566,7 +1567,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       int guest_fd = (int)get_unaligned_le32(nested + d->fd_offset);
       u32 handle;
 
-      ret = nvgpu_handle_for_fd(guest_fd, &handle);
+      ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle);
       if (ret) {
         dev_warn_ratelimited(&nfd->dev->vdev->dev,
                              "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
@@ -1798,6 +1799,18 @@ static int nvgpu_drm_release(struct inode *inode, struct file *filp) {
   if (file && file->driver_priv)
     nvgpu_drm_detach(file->driver_priv);
   return drm_release(inode, filp);
+}
+
+void nvgpu_drm_drop_master(struct file *f) {
+  struct drm_file *file = f->private_data;
+
+  /*
+   * Through the core's own DROP_MASTER, so its bookkeeping is the one a
+   * user's drop makes; the caller opened the file, which is what the
+   * core's check asks (was_master, same tgid). No argument to copy.
+   */
+  if (file && drm_is_current_master(file))
+    drm_ioctl(f, DRM_IOCTL_DROP_MASTER, 0);
 }
 
 struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {

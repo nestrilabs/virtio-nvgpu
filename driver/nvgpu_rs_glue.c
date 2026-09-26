@@ -67,6 +67,10 @@ u32 nvgpu_rs_caps(struct nvgpu_fd *nfd) {
 
 u32 nvgpu_rs_fd_handle(struct nvgpu_fd *nfd) { return nfd->handle; }
 
+int nvgpu_rs_handle_for_fd(struct nvgpu_fd *nfd, int fd, u32 *handle) {
+  return nvgpu_handle_for_fd(nfd->dev, fd, handle);
+}
+
 int nvgpu_rs_send_recv(struct nvgpu_fd *nfd, const void *req, size_t req_len,
                        void *resp, size_t resp_len, u32 *used) {
   if (req_len > INT_MAX || resp_len > INT_MAX)

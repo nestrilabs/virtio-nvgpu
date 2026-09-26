@@ -309,7 +309,7 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
  * A guest descriptor means nothing on the other side. Anything that names an
  * open file has to name it by the handle the backend issued when we opened it.
  */
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle) {
   struct nvgpu_fd *other;
   struct file *f;
   int ret = 0;
@@ -328,10 +328,12 @@ int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
    * backend handle.
    */
   other = nvgpu_fd_from_file(f);
-  if (other)
+  if (other && other->dev == dev)
     *handle = other->handle;
+  else if (other)
+    ret = -EBADF; /* another device's: its backend's number */
   else
-    ret = nvgpu_hostfile_handle(f, handle);
+    ret = nvgpu_hostfile_handle(dev, f, handle);
   fput(f);
   return ret;
 }
@@ -1170,7 +1172,8 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
     if (path_len == 0)
       break; /* terminator */
 
-    if (p + path_len + content_len > end) {
+    /* Each length against what is left, never their sum past the end. */
+    if (path_len > end - p || content_len > end - p - path_len) {
       dev_warn(&dev->vdev->dev, "virtio-gpu-nv: proc stream truncated\n");
       break;
     }
@@ -1576,7 +1579,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     if (path_len == 0 && content_len == 0)
       break; /* terminator */
 
-    if (p + path_len + content_len > end) {
+    if (path_len > end - p || content_len > end - p - path_len) {
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: sys stream truncated at sysfs section\n");
       break;
@@ -1588,7 +1591,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
     memcpy(path, p, copy_len);
     p += path_len;
 
-    if (p + content_len > end) {
+    if (content_len > end - p) {
       dev_warn(&dev->vdev->dev,
                "virtio-gpu-nv: sys stream truncated at content\n");
       break;
@@ -1614,7 +1617,11 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
          * entries for unrelated PCI devices */
         if (pi == dev->num_pci_roots) {
           int gi;
-          for (gi = 0; gi < (int)dev->num_gpus; gi++) {
+
+          /* The slots config space had: num_gpus may say up to 248. */
+          for (gi = 0; gi < (int)min_t(u32, dev->num_gpus,
+                                       ARRAY_SIZE(dev->gpu_slots));
+               gi++) {
             if (strcmp(dev->gpu_slots[gi].pci_addr, pci_addr) == 0) {
               pi = dev->num_pci_roots;
               if (pi < NVGPU_MAX_PCI_SLOTS) {

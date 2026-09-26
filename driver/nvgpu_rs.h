@@ -156,6 +156,8 @@ void nvgpu_rs_kvfree(void *p);
 /* The protocol-v1 paths, on the calling file. */
 u32 nvgpu_rs_caps(struct nvgpu_fd *nfd);
 u32 nvgpu_rs_fd_handle(struct nvgpu_fd *nfd);
+/* nvgpu_handle_for_fd() on the calling file's device. */
+int nvgpu_rs_handle_for_fd(struct nvgpu_fd *nfd, int fd, u32 *handle);
 int nvgpu_rs_send_recv(struct nvgpu_fd *nfd, const void *req, size_t req_len,
                        void *resp, size_t resp_len, u32 *used);
 void nvgpu_rs_proc_id(struct nvgpu_fd *nfd, void *dst);

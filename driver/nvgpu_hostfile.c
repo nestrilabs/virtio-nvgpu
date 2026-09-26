@@ -99,12 +99,15 @@ int nvgpu_hostfile_install(struct nvgpu_device *dev, u32 handle, u32 kind,
   return fd;
 }
 
-int nvgpu_hostfile_handle(struct file *f, u32 *handle) {
+int nvgpu_hostfile_handle(struct nvgpu_device *dev, struct file *f,
+                          u32 *handle) {
   const struct nvgpu_hostfile *hf;
 
   if (f->f_op != &nvgpu_hostfile_fops)
     return -EBADF;
   hf = f->private_data;
+  if (hf->dev != dev)
+    return -EBADF;
   *handle = hf->handle;
   return 0;
 }

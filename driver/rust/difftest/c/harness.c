@@ -124,7 +124,8 @@ bool in_compat_syscall(void) { return dt_compat(); }
 
 /* ── nvgpu_main.c ── */
 
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle) {
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle) {
+  (void)dev;
   if (guest_fd < 0)
     return -EBADF;
   return dt_handle_for_fd(guest_fd, handle);

@@ -432,12 +432,13 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
 long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
                         void *kbuf, u32 sz);
 /*
- * The backend handle standing for one of this module's open files: an
- * /dev/nvidia* character device, a DRM node of ours (its render handle), or a
- * host-handle file (nvgpu_hostfile_handle()). -EBADF for anything else --
- * never a guess at another driver's private_data.
+ * The backend handle standing for one of this module's open files of device
+ * `dev`: an /dev/nvidia* character device, a DRM node of ours (its render
+ * handle), or a host-handle file (nvgpu_hostfile_handle()). -EBADF for
+ * anything else -- never a guess at another driver's private_data, nor a
+ * handle of another device's backend, which is someone else's number here.
  */
-int nvgpu_handle_for_fd(int guest_fd, u32 *handle);
+int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle);
 /*
  * Whether calls say which guest process makes them (NVGPU_BCAP_PROC_ID),
  * and that process, as struct nvgpu_proc_id at `dst`.
@@ -471,6 +472,9 @@ int nvgpu_dri_init(struct nvgpu_device *dev);
 void nvgpu_dri_cleanup(struct nvgpu_device *dev);
 /* The nvgpu_fd of a DRM file of this driver, else NULL. */
 struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
+/* A DRM file of ours the caller just opened stops being the guest device's
+ * master, if it had become it. */
+void nvgpu_drm_drop_master(struct file *f);
 /*
  * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
  * host file, and return a handle for it in `file`. The proxy takes a
@@ -591,8 +595,10 @@ __poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,
 
 /* ───────── nvgpu_hostfile.c ───────── */
 
-/* The backend handle behind a host-handle file, or -EBADF if `f` is not one. */
-int nvgpu_hostfile_handle(struct file *f, u32 *handle);
+/* The backend handle behind a host-handle file of `dev`, or -EBADF if `f`
+ * is not one. */
+int nvgpu_hostfile_handle(struct nvgpu_device *dev, struct file *f,
+                          u32 *handle);
 /*
  * A backend handle of kind `kind` (NVGPU_HK_*; a host syncobj file, say) as a
  * guest file: its release CLOSEs the handle. `o_flags`: O_CLOEXEC /

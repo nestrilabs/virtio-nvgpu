@@ -745,6 +745,15 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
     ret = -EIO;
     goto close;
   }
+  /*
+   * A clone of a card-node file became the guest device's master if none
+   * was (drm_master_open(), after our open ran): a host lease must not hold
+   * the guest's own master -- a compositor-VM's compositor could then never
+   * take it, and the lease's holder could authenticate others. Dropped
+   * before anyone sees the file; its SET/DROP_MASTER are refused from here,
+   * as a lessee's are (nvgpu_kms_ioctl()).
+   */
+  nvgpu_drm_drop_master(f);
   fd_install(fd, f);
   return fd;
 
@@ -1002,7 +1011,7 @@ static void nvgpu_kms_settle(struct nvgpu_kms_call *kc) {
     xa_store(&kf->objs, kc->learn[i].obj,
              xa_mk_value(NVGPU_KOBJ_OTHER | ((unsigned long)kc->learn[i].crtc
                                              << 2)),
-             GFP_KERNEL);
+             GFP_KERNEL_ACCOUNT);
   if (kc->cap_set && kc->cap < NVGPU_KMS_NCAPS) {
     mutex_lock(&kf->lock);
     kf->caps[kc->cap] = kc->cap_value;
@@ -1047,7 +1056,7 @@ static int nvgpu_kms_prop_class(struct nvgpu_kms_call *kc, u32 id) {
   if (hr)
     return hr; /* an unknown id: the commit would fail on it too */
   kind = nvgpu_kms_prop_kind_of(gp.name);
-  xa_store(&kf->props, id, xa_mk_value(kind), GFP_KERNEL);
+  xa_store(&kf->props, id, xa_mk_value(kind), GFP_KERNEL_ACCOUNT);
   return kind;
 }
 
@@ -1069,10 +1078,16 @@ static int nvgpu_kms_obj_class(struct nvgpu_kms_call *kc, u32 obj,
     if (ret)
       return ret;
     v = hr ? NVGPU_KOBJ_OTHER : NVGPU_KOBJ_CRTC;
-    /* Never over something a commit or GETPLANE taught us meanwhile (-EBUSY
-     * then); a cache that cannot grow (-ENOMEM) just asks again next time. */
-    if ((!hr || hr == -ENOENT) &&
-        xa_insert(&kf->objs, obj, xa_mk_value(v), GFP_KERNEL) == -EBUSY) {
+    /*
+     * Only a CRTC is cached from here: -ENOENT is a plane or a connector,
+     * but also any number at all, and a cache of every id a commit named
+     * would grow without bound. Planes and connectors a commit puts on a
+     * CRTC are learnt when it succeeds. Never over something a commit or
+     * GETPLANE taught us meanwhile (-EBUSY then); a cache that cannot grow
+     * (-ENOMEM) just asks again next time.
+     */
+    if (!hr && xa_insert(&kf->objs, obj, xa_mk_value(v),
+                         GFP_KERNEL_ACCOUNT) == -EBUSY) {
       e = xa_load(&kf->objs, obj);
       if (e)
         v = xa_to_value(e);
@@ -1605,13 +1620,13 @@ static int nvgpu_kms_phase(struct nvgpu_i2_call *call, int phase) {
                xa_mk_value(nvgpu_kms_prop_kind_of(
                    (const char *)b0 +
                    offsetof(struct drm_mode_get_property, name))),
-               GFP_KERNEL);
+               GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETCRTC):
     if (ok)
       xa_store(&kf->objs,
                get_unaligned_le32(b0 + offsetof(struct drm_mode_crtc, crtc_id)),
-               xa_mk_value(NVGPU_KOBJ_CRTC), GFP_KERNEL);
+               xa_mk_value(NVGPU_KOBJ_CRTC), GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETPLANE):
     if (ok)
@@ -1623,7 +1638,7 @@ static int nvgpu_kms_phase(struct nvgpu_i2_call *call, int phase) {
                                 b0 + offsetof(struct drm_mode_get_plane,
                                               crtc_id))
                             << 2)),
-               GFP_KERNEL);
+               GFP_KERNEL_ACCOUNT);
     return 0;
   case NVGPU_KNR(DRM_IOCTL_MODE_GETRESOURCES):
     if (!phase)
@@ -1732,6 +1747,14 @@ bool nvgpu_kms_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
 
   if (!kf || _IOC_TYPE(cmd) != DRM_IOCTL_BASE)
     return false;
+
+  /* An adopted lease is never the guest's master: as a lessee's, its
+   * SET/DROP_MASTER are refused (drm_auth.c, "lessee as master"). */
+  if (kf->adopted && (_IOC_NR(cmd) == NVGPU_KNR(DRM_IOCTL_SET_MASTER) ||
+                      _IOC_NR(cmd) == NVGPU_KNR(DRM_IOCTL_DROP_MASTER))) {
+    *ret = -EINVAL;
+    return true;
+  }
 
   switch (_IOC_NR(cmd)) {
   /* The guest core's: its own node, its own auth domain, its own master
