@@ -5,6 +5,8 @@
 # ... --wayland-lease and a leasable monitor.
 #   nvgpu_connector=NAME   which offered connector (default: the first)
 #   nvgpu_frames=N         flips / frames (default 120 / 300 for kmscube)
+#   nvgpu_flip_hold=S      seconds lease-flip shows its first frame still
+#                          (colour bars), for someone watching (default 3)
 #   nvgpu_lease_gap=S      pause between leases (default 6; the backend spaces
 #                          one VM's lease requests, --wayland-lease-interval)
 #
@@ -30,7 +32,7 @@ fi
 
 section "lease -> lease-flip"
 step "lease-flip on the lease fd, $FRAMES flips" 60 \
-    "${LEASE[@]}" "$NVGPU_VERIFY/lease-flip.sh" --fd '{fd}' --frames "$FRAMES"
+    "${LEASE[@]}" "$NVGPU_VERIFY/lease-flip.sh" --fd '{fd}' --frames "$FRAMES" --hold "$(arg flip_hold 3)"
 
 sleep "$GAP"
 section "lease -> drm_info / modetest"

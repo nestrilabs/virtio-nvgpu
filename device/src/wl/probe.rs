@@ -249,6 +249,13 @@ impl Probe {
                 if h.object == callback && ifc == proto::WL_CALLBACK {
                     return Ok(());
                 }
+                if h.object == 1 && h.opcode == op::wl_display::EVT_ERROR {
+                    let what = match args.get(2).map(|a| a.val) {
+                        Some(Val::Str(Some(m))) => String::from_utf8_lossy(m).into_owned(),
+                        _ => String::new(),
+                    };
+                    return Err(io::Error::other(format!("the compositor refused the probe: {what}")));
+                }
                 f(h.object, h.opcode, &args, fds);
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -308,9 +315,13 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
     if devices.is_empty() {
         return Ok(Vec::new());
     }
+    // New ids in order, with none skipped: libwayland's server takes a
+    // client's new id only if it is at most one past the highest in use
+    // (wl_map_insert_at), and disconnects the client otherwise. 1-3 are the
+    // display, the registry and the first callback.
     let mut by_obj = HashMap::new();
     for (i, name) in devices.iter().enumerate() {
-        let id = 10 + i as u32;
+        let id = 4 + i as u32;
         p.objects.insert(id, proto::WP_DRM_LEASE_DEVICE_V1);
         by_obj.insert(id, *name);
         p.send(
@@ -320,16 +331,17 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
                 .finish(),
         )?;
     }
-    p.objects.insert(4, proto::WL_CALLBACK);
+    let done = 4 + devices.len() as u32;
+    p.objects.insert(done, proto::WL_CALLBACK);
     p.send(
         MsgBuilder::new(1, op::wl_display::REQ_SYNC)
-            .new_id(4)
+            .new_id(done)
             .finish(),
     )?;
     // Only what a drm_fd answered: a device that sent none is not known to
     // be anyone's, and is asked about again later rather than hidden for good.
     let mut result: HashMap<u32, bool> = HashMap::new();
-    p.until_done(4, &mut |obj, opc, _, fds| {
+    p.until_done(done, &mut |obj, opc, _, fds| {
         if opc == op::wp_drm_lease_device_v1::EVT_DRM_FD {
             if let (Some(name), Some(fd)) = (by_obj.get(&obj), fds.first()) {
                 let ours = matches!(host.classify(fd.as_fd()), HandleKind::DrmLease(_));
@@ -339,3 +351,99 @@ pub fn probe(socket: &Path, host: &dyn HostFds) -> io::Result<Vec<(u32, bool)>> 
     })?;
     Ok(result.into_iter().collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::unix::net::UnixListener;
+
+    struct NotOurs;
+    impl HostFds for NotOurs {
+        fn classify(&self, _: BorrowedFd<'_>) -> HandleKind {
+            HandleKind::Other
+        }
+    }
+
+    /// A compositor with two lease devices that holds the client to
+    /// libwayland's rule for new ids, as Hyprland's libwayland does: the
+    /// probe used to bind at 10 while 4 was next, and was disconnected.
+    #[test]
+    fn the_probe_allocates_ids_the_way_libwayland_accepts() {
+        let dir = std::env::temp_dir().join(format!("nvgpu-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wayland-probe");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut next = 2u32; // the next id a client may create
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut registry = 0;
+            let mut devices = Vec::new();
+            loop {
+                while buf.len() >= 8 {
+                    let obj = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+                    let w = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+                    let (size, opc) = ((w >> 16) as usize, (w & 0xffff) as u16);
+                    if buf.len() < size {
+                        break;
+                    }
+                    let msg: Vec<u8> = buf.drain(..size).collect();
+                    let word = |o: usize| u32::from_ne_bytes(msg[o..o + 4].try_into().unwrap());
+                    // get_registry(new_id) / sync(new_id) / bind(name, iface, version, new_id)
+                    let id = match (obj, opc) {
+                        (1, _) => word(8),
+                        (o, 0) if o == registry => word(size - 4),
+                        _ => panic!("unexpected request {obj}/{opc}"),
+                    };
+                    assert!(id <= next, "new id {id} skips past {next}: libwayland disconnects");
+                    next = next.max(id + 1);
+                    let out = match (obj, opc) {
+                        (1, 1) => {
+                            registry = id;
+                            Vec::new()
+                        }
+                        (1, 0) => {
+                            let mut m = Vec::new();
+                            if devices.is_empty() && registry != 0 {
+                                for name in [7, 9] {
+                                    m.extend(MsgBuilder::new(registry, 0).uint(name)
+                                        .string(Some("wp_drm_lease_device_v1")).uint(1).finish());
+                                }
+                            }
+                            m.extend(MsgBuilder::new(id, 0).uint(0).finish());
+                            m
+                        }
+                        _ => {
+                            devices.push(id);
+                            let (r, _w) = std::io::pipe().unwrap();
+                            let m = MsgBuilder::new(id, 0).finish();
+                            sys::send_with_fds(c.as_raw_fd(), &m, &[r.as_raw_fd()]).unwrap();
+                            Vec::new()
+                        }
+                    };
+                    if !out.is_empty() {
+                        sys::send_with_fds(c.as_raw_fd(), &out, &[]).unwrap();
+                    }
+                    if devices.len() == 2 && obj == 1 && opc == 0 && id > 3 {
+                        return devices;
+                    }
+                }
+                let n = c.read(&mut chunk).unwrap();
+                if n == 0 {
+                    return devices;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        });
+        let mut got = probe(&path, &NotOurs).unwrap();
+        got.sort();
+        assert_eq!(got, vec![(7, false), (9, false)]);
+        assert_eq!(server.join().unwrap(), vec![4, 5]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
