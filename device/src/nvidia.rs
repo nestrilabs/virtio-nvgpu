@@ -1402,10 +1402,16 @@ impl NvidiaBackend {
             log::info!("release_all: closing {} host file(s)", handles.len());
         }
         for h in handles {
+            let owner = self.handles.owner(h);
             if let Ok((fd, kind)) = self.handles.remove(h) {
+                if !crate::closer::slow(kind) {
+                    drop(fd);
+                    continue;
+                }
+                let fd = self.handles.closing(fd, owner);
                 match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
                     Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
-                    None => crate::closer::close_fd(fd, kind),
+                    None => crate::closer::close(fd),
                 }
             }
         }
@@ -2388,6 +2394,7 @@ impl NvidiaBackend {
     /// guest file may still have one mapped (see [`LiveMap`]). Only the lookup
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
+        let owner = self.handles.owner(handle);
         let (fd, kind) = self.handles.remove(handle)?;
         // Its UVM pools leave the VMM while `fd` is still open here, so the
         // file's last reference, and UVM's teardown of it, stay ours.
@@ -2431,10 +2438,14 @@ impl NvidiaBackend {
         // A display file's last close can wait on a modeset; not here, on
         // the queue thread under the backend mutex (closer.rs, S-33). One
         // whose framebuffers a call in flight names closes after it (S-6).
-        if fbs.is_empty() {
-            crate::closer::close_fd(fd, kind);
+        // Counted against the table until it is closed (handle_table.rs).
+        if !crate::closer::slow(kind) {
+            drop(fd);
+        } else if fbs.is_empty() {
+            crate::closer::close(self.handles.closing(fd, owner));
         } else {
-            self.vm_kms.close_after(fbs, Box::new(fd));
+            self.vm_kms
+                .close_after(fbs, Box::new(self.handles.closing(fd, owner)));
         }
         Ok(())
     }
@@ -8561,5 +8572,46 @@ mod deep_tests {
         let (st, _) = call(&mut be, ctl, cmd, &outer, &nested, (0, &[]));
         assert_eq!(st, 0, "without one it goes");
         assert_eq!(seen().len(), 1);
+    }
+}
+
+/// Descriptors on their way to the closer (review 2026-09-26, backend 14).
+#[cfg(test)]
+mod closing_tests {
+    use super::*;
+
+    /// Holds the closer until told to go on (or two seconds pass).
+    struct Hold(std::sync::mpsc::Receiver<()>);
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+
+    /// A display file's last close waits on the closer, and while it does
+    /// the host file is open. The handle table let it go at CLOSE, so a
+    /// guest opening and closing render nodes while the closer was stuck
+    /// on a modeset queued host files without bound. They count against
+    /// the table until they are closed.
+    #[test]
+    fn files_still_closing_count_against_the_handle_table() {
+        let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let mut be = NvidiaBackend::for_test();
+        be.handles.set_limit(64);
+        let (go, wait) = std::sync::mpsc::channel();
+        crate::closer::close(Hold(wait));
+        let hs: Vec<u32> = (0..64)
+            .map(|_| be.adopt_for_test(devnull(), HandleKind::DriRender(0)))
+            .collect();
+        for h in hs {
+            be.close_handle(h).unwrap();
+        }
+        assert_eq!(be.handle_count(), 0);
+        let r = be.handles.insert(devnull(), HandleKind::Eventfd);
+        go.send(()).unwrap();
+        assert!(r.is_err(), "64 host files are still open");
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert!(be.handles.insert(devnull(), HandleKind::Eventfd).is_ok());
     }
 }

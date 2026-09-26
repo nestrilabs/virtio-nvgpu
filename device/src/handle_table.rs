@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex};
 
 use crate::error::{DeviceError, Result};
 use crate::hostfd::HandleKind;
@@ -113,6 +114,44 @@ pub struct HandleTable {
     /// What each guest process holds, and how much it may.
     held: Ledger,
     share: Share,
+    /// Descriptors let go of here and handed to the closer, not yet closed.
+    closing: Arc<Mutex<Closing>>,
+}
+
+/// Descriptors the table let go of that the closer (closer.rs) has not yet
+/// closed: still open on the host, so still counted against the table and
+/// their process's share. Refunded as a handle was removed, they were
+/// counted nowhere, and a guest process opening and closing display files
+/// while the closer waited on a modeset queued them without bound, until
+/// the backend itself ran out of descriptors -- for every process of the VM
+/// (review 2026-09-26, backend 14).
+#[derive(Default)]
+struct Closing {
+    held: Ledger,
+    total: u64,
+}
+
+impl Closing {
+    fn lock(c: &Mutex<Closing>) -> std::sync::MutexGuard<'_, Closing> {
+        c.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A descriptor on its way to the closer, still counted: `item` is dropped
+/// (closed) first, then the count goes.
+pub struct Closed<T> {
+    item: Option<T>,
+    closing: Arc<Mutex<Closing>>,
+    owner: Owner,
+}
+
+impl<T> Drop for Closed<T> {
+    fn drop(&mut self) {
+        drop(self.item.take());
+        let mut c = Closing::lock(&self.closing);
+        c.held.refund(self.owner, 1);
+        c.total = c.total.saturating_sub(1);
+    }
 }
 
 impl HandleTable {
@@ -129,6 +168,7 @@ impl HandleTable {
             limit,
             held: Ledger::default(),
             share: Self::share_of(limit),
+            closing: Arc::default(),
         }
     }
 
@@ -164,19 +204,28 @@ impl HandleTable {
         kind: HandleKind,
         owner: Owner,
     ) -> std::result::Result<u32, TableFull> {
-        if let Err(why) = self.held.admits(
+        let (closing, closing_total) = {
+            let c = Closing::lock(&self.closing);
+            (c.held.held(owner), c.total)
+        };
+        if let Err(why) = crate::quota::admits(
             &self.share,
             owner,
+            self.held.held(owner) + closing,
             1,
-            self.table.len() as u64,
+            self.table.len() as u64 + closing_total,
             self.limit as u64,
         ) {
             if why != crate::quota::Over::Pool {
                 log::warn!(
-                    "handle table: guest process {owner:?} holds {} of {} handles ({why:?}); \
-                     refusing a {kind:?}",
+                    "handle table: guest process {owner:?} holds {} of {} handles, {closing} \
+                     more still closing ({why:?}); refusing a {kind:?}",
                     self.held.held(owner),
                     self.limit
+                );
+            } else if closing_total > 0 {
+                log::warn!(
+                    "handle table: full, {closing_total} of it still closing; refusing a {kind:?}"
                 );
             }
             return Err(TableFull);
@@ -269,6 +318,20 @@ impl HandleTable {
     /// it is answered ENODEV, as a file whose device went away is.
     pub fn is_buried(&self, handle: u32) -> bool {
         self.table.get(&handle).is_some_and(|e| e.buried)
+    }
+
+    /// `item` -- the descriptor of a handle just removed, charged to
+    /// `owner`, on its way to the closer -- counted against the table and
+    /// `owner`'s share until it is dropped.
+    pub fn closing<T>(&self, item: T, owner: Owner) -> Closed<T> {
+        let mut c = Closing::lock(&self.closing);
+        c.held.charge(owner, 1);
+        c.total += 1;
+        Closed {
+            item: Some(item),
+            closing: self.closing.clone(),
+            owner,
+        }
     }
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).
