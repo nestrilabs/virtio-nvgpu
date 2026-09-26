@@ -64,6 +64,8 @@ VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; TES
 | `0002-devices-virtio-nvgpu-as-a-vhost-user-device-type.patch` | `--vhost-user type=nvgpu`: virtio ID 45, PCI class 0xff0000, indirect descriptors passed through, region 1 published when the backend reports more, `GPU_MAP` and `EXTERNAL_MAP` refused |
 | `0003-x86_64-no-pci-hotplug-port.patch` | `--no-pci-hotplug-port`: no empty hot-plug root port on PCI bus 1, which the guest driver needs for the GPU's host address |
 | `0004-vhost_user_frontend-tests-for-the-backend-mapping-ch.patch` | unit tests for 0001 and 0002 |
+| `0005-base-place-an-arena-file-mapping-without-leaving-a-h.patch` | a file mapping into the shared-memory arena is placed atomically (map elsewhere, then `mremap(MREMAP_FIXED)`), so a descriptor the backend hands over that cannot be mapped fails without punching a hole in the KVM-slot-backed arena; with a `/proc/self/maps` test |
+| `0006-devices-bound-the-backend-reported-shared-memory-reg.patch` | the backend-reported shared memory region size is capped (64 GiB) and refused cleanly, instead of a `next_power_of_two().expect()` that a wild value would panic on |
 
 To apply and build: the top of `scripts/rig-build-crosvm.sh`. No seccomp policy and no minijail
 setting changes: the vhost-user frontend runs in crosvm's main process, as upstream has it.

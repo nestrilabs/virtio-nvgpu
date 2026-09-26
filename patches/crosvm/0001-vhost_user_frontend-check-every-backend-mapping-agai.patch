@@ -1,7 +1,7 @@
 From 3ae189fb8f3cb40e191b6e77df1aec4a8a884934 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 01:44:55 +0000
-Subject: [PATCH 1/4] vhost_user_frontend: check every backend mapping against
+Subject: [PATCH 1/6] vhost_user_frontend: check every backend mapping against
  its region
 
 A vhost-user backend is another process, and may be a compromised one.

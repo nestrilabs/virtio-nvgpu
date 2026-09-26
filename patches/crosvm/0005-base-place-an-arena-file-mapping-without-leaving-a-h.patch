@@ -1,0 +1,198 @@
+From 5f349a17b30ee468206b960356dc252874787d00 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Sat, 26 Sep 2026 03:30:07 +0000
+Subject: [PATCH 5/6] base: place an arena file mapping without leaving a hole
+ on failure
+
+MemoryMappingArena placed a file mapping with a single mmap(MAP_FIXED)
+over the arena. mmap(MAP_FIXED) unmaps the target range before it calls
+the file's own mmap operation, so a descriptor whose file cannot be
+mapped (a pipe or a socket), a bad file offset, or a writable request on
+a read-only descriptor fails *after* the reservation there is gone,
+leaving a hole. crosvm's vhost-user shared-memory arena is covered by a
+KVM memory slot, so an unrelated mmap that later lands in that hole
+becomes memory the guest reads and writes through the slot -- a
+guest-to-VMM exposure a compromised (or buggy) vhost-user backend can
+steer into by handing over such a descriptor.
+
+Place the fd at an address the kernel picks first, where a failure leaves
+the arena untouched, then move it over the target atomically with
+mremap(MREMAP_FIXED). Should the move itself fail (it unmaps the
+destination first), restore the arena's reservation over the range as
+PROT_NONE so a stray access faults here rather than reading whatever
+lands next. Anonymous fixed mappings -- the path `remove` uses to
+re-reserve on unmap -- have no such failure-after-unmap and are left as
+they were. A test forces the pipe-fd failure and asserts, via
+/proc/self/maps, that the arena keeps every page.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ base/src/sys/linux/mmap.rs | 145 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 129 insertions(+), 16 deletions(-)
+
+diff --git a/base/src/sys/linux/mmap.rs b/base/src/sys/linux/mmap.rs
+index 371cfea..8f78476 100644
+--- a/base/src/sys/linux/mmap.rs
++++ b/base/src/sys/linux/mmap.rs
+@@ -758,23 +758,74 @@ impl MemoryMappingArena {
+         }
+         validate_includes_range(self.size(), offset, size)?;
+ 
+-        // SAFETY:
+-        // This is safe since the range has been validated.
+-        let mmap = unsafe {
+-            match fd {
+-                Some((fd, fd_offset)) => MemoryMapping::from_descriptor_offset_protection_fixed(
+-                    self.addr.add(offset),
+-                    fd,
+-                    size,
+-                    fd_offset,
+-                    prot,
+-                )?,
+-                None => MemoryMapping::new_protection_fixed(self.addr.add(offset), size, prot)?,
++        // SAFETY: the range has been validated to lie within this arena, which
++        // this struct owns.
++        let target = unsafe { self.addr.add(offset) };
++
++        match fd {
++            Some((fd, fd_offset)) => {
++                // A file mapping is placed in two steps, not with one MAP_FIXED
++                // over the arena. mmap(MAP_FIXED) unmaps the target range *before*
++                // it invokes the file's own mmap operation, so a descriptor whose
++                // file cannot be mapped (a pipe or a socket), a bad file offset, or
++                // a writable request on a read-only descriptor would fail after the
++                // arena's reservation there was already gone -- leaving a hole an
++                // unrelated mmap could later fill, memory a guest would then reach
++                // through a KVM slot laid over this arena. Instead map the fd at an
++                // address the kernel picks, where a failure leaves the arena
++                // untouched, then move it over the target atomically with mremap.
++                let tmp = MemoryMapping::from_fd_offset_protection(fd, size, fd_offset, prot)?;
++                // SAFETY: `tmp` owns a live mapping of `size` bytes, and
++                // `target..target+size` is inside this arena. On success the
++                // mapping moves to `target` and `tmp`'s address is left empty; on
++                // failure mremap leaves the source mapping intact.
++                let ret = unsafe {
++                    libc::mremap(
++                        tmp.as_ptr() as *mut libc::c_void,
++                        size,
++                        size,
++                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
++                        target as *mut libc::c_void,
++                    )
++                };
++                if ret == libc::MAP_FAILED {
++                    let err = ErrnoError::last();
++                    // mremap(MREMAP_FIXED) unmaps the destination before it moves,
++                    // so a failed move leaves a hole there. Restore the arena's
++                    // reservation over it (PROT_NONE, so a stray access faults here
++                    // rather than reading whatever lands next) before returning.
++                    // `tmp` is then dropped, unmapping the untouched source.
++                    // SAFETY: `target..target+size` is inside this arena.
++                    unsafe {
++                        libc::mmap64(
++                            target as *mut libc::c_void,
++                            size,
++                            libc::PROT_NONE,
++                            libc::MAP_PRIVATE
++                                | libc::MAP_ANONYMOUS
++                                | libc::MAP_FIXED
++                                | libc::MAP_NORESERVE,
++                            -1,
++                            0,
++                        );
++                    }
++                    return Err(Error::SystemCallFailed(err));
++                }
++                // The mapping now lives at `target`; `tmp`'s address is empty, so
++                // its Drop must not run -- it would unmap whatever now sits there.
++                std::mem::forget(tmp);
+             }
+-        };
+-
+-        // This mapping will get automatically removed when we drop the whole arena.
+-        std::mem::forget(mmap);
++            None => {
++                // Anonymous fixed mappings have no file operation that can fail
++                // after the target is unmapped, so a MAP_FIXED here does not leave
++                // a hole. This is also the path `remove` uses to re-reserve.
++                // SAFETY: the range has been validated to lie within this arena.
++                let mmap = unsafe { MemoryMapping::new_protection_fixed(target, size, prot)? };
++                // This mapping will get automatically removed when we drop the
++                // whole arena.
++                std::mem::forget(mmap);
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -1194,4 +1245,66 @@ mod tests {
+             e => panic!("unexpected error: {e}"),
+         }
+     }
++
++    /// Whether `[start, start + len)` is fully covered by mappings, i.e. has no
++    /// hole, per `/proc/self/maps` (whose lines are in ascending address order).
++    fn fully_mapped(start: usize, len: usize) -> bool {
++        let end = start + len;
++        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
++        let mut covered = start;
++        for line in maps.lines() {
++            let range = line.split_whitespace().next().unwrap();
++            let (s, e) = range.split_once('-').unwrap();
++            let s = usize::from_str_radix(s, 16).unwrap();
++            let e = usize::from_str_radix(e, 16).unwrap();
++            if e <= covered {
++                continue;
++            }
++            if s > covered {
++                return false; // a gap opens before this mapping
++            }
++            covered = e;
++            if covered >= end {
++                return true;
++            }
++        }
++        covered >= end
++    }
++
++    /// A file mapping that fails must not leave a hole in the arena: the failed
++    /// range has to stay mapped (as a reservation), or an unrelated mmap could
++    /// later fill it and become reachable through a KVM slot over the arena.
++    #[test]
++    fn arena_failed_fd_mapping_leaves_no_hole() {
++        let ps = pagesize();
++        let mut m = MemoryMappingArena::new_protection(4 * ps, Protection::read_write()).unwrap();
++        let base = m.as_ptr() as usize;
++        assert!(fully_mapped(base, 4 * ps));
++
++        // A pipe read end has no file mmap operation: mapping it fails in the
++        // kernel, historically after the fixed target range was unmapped.
++        let mut fds = [0; 2];
++        // SAFETY: `fds` is a valid array of two ints.
++        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
++        let pipe_r = Descriptor(fds[0]);
++        // SAFETY: `fds[1]` is a fresh owned fd we are done with.
++        unsafe { libc::close(fds[1]) };
++
++        let res = m.add_fd_offset_protection(ps, ps, &pipe_r, 0, Protection::read_write());
++        assert!(res.is_err(), "mapping a pipe fd should fail");
++        // The whole arena, the failed middle page included, is still mapped.
++        assert!(
++            fully_mapped(base, 4 * ps),
++            "a failed fd mapping punched a hole in the arena"
++        );
++
++        // A good mapping still lands, and unmapping it re-reserves (no hole).
++        let good = tempfile().unwrap();
++        good.set_len(ps as u64).unwrap();
++        m.add_fd_offset_protection(ps, ps, &good, 0, Protection::read_write())
++            .expect("a mappable fd should place");
++        assert!(fully_mapped(base, 4 * ps));
++        m.remove(ps, ps).expect("remove should succeed");
++        assert!(fully_mapped(base, 4 * ps), "unmap left a hole");
++    }
+ }
+-- 
+2.55.0
+
