@@ -407,7 +407,7 @@ demonstrates that Vulkan and NVENC work **without** `/dev/nvidia-drm` or
 `/dev/nvidia-modeset`.
 
 **[`nvkvm-pv`](https://github.com/reindertpelsma/nvkvm-pv)** by Reindert Pelsma
-— the same design, reached first: NVIDIA's own guest userspace over forwarded RM
+— the same design, reached independently: NVIDIA's own guest userspace over forwarded RM
 calls to the host driver. Much of how `virtio-nvgpu` handles mappings, events
 and driver quirks was checked against it. Its sibling
 **[`kayfabe`](https://github.com/reindertpelsma/kayfabe)** takes the other
