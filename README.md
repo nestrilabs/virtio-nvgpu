@@ -406,6 +406,13 @@ logic (`pkg/sentry/devices/nvproxy`) are the primary reference. `nvproxy` also
 demonstrates that Vulkan and NVENC work **without** `/dev/nvidia-drm` or
 `/dev/nvidia-modeset`.
 
+**[`nvkvm-pv`](https://github.com/reindertpelsma/nvkvm-pv)** by Reindert Pelsma
+— the same design, reached first: NVIDIA's own guest userspace over forwarded RM
+calls to the host driver. Much of how `virtio-nvgpu` handles mappings, events
+and driver quirks was checked against it. Its sibling
+**[`kayfabe`](https://github.com/reindertpelsma/kayfabe)** takes the other
+route, emulating the PCI/GSP-facing device so the stock driver runs unmodified.
+
 **`chromeos/virtio-media`** — the layout template. A GPL guest driver beside a
 VMM-agnostic Rust device crate, with every VMM concern behind a trait.
 
