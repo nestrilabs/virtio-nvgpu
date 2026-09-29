@@ -27,9 +27,9 @@
 //!   records (the backend does; the IOCTL2 executors, off its lock, do not,
 //!   and rely on the taint, which catches the same objects).
 //! - **After:** the dma-buf is not an injected capture buffer's, by file
-//!   identity (inject.rs `Taint`). That also catches an injected object
-//!   reached through another handle. A capture buffer is the guest's to
-//!   read, never the host's to show (SECURITY.md §18).
+//!   identity (inject/registry.rs `Taint`). That also catches an injected
+//!   object reached through another handle. A capture buffer is the guest's
+//!   to read, never the host's to show (SECURITY.md §18).
 //!
 //! A refusal is EINVAL on every path.
 

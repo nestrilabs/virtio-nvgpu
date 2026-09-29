@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The sockets the backend binds at a path of the operator's choosing: the
 //! Wayland export socket (`wl/export.rs`) and the capture helper's
-//! (`inject.rs`).
+//! (`inject/server.rs`).
 //!
 //! Each is bound so that nobody can connect in the moment before its mode is
 //! set: in a new directory only we can enter, made 0600 there, and renamed

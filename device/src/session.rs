@@ -726,7 +726,7 @@ impl NvidiaBackend {
             log::warn!("HOST_OP {} refused before running: errno {e}", req.op);
         })?;
         // A buffer the capture helper injected: its description goes after
-        // the fixed reply (inject.rs).
+        // the fixed reply (inject/backend.rs).
         if let HostOp::InjectOpenSyncobj { file, id, token } = op {
             let h = self.inject_open_syncobj(file, id, &token)?;
             let mut resp = HostOpResp {

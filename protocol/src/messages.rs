@@ -878,7 +878,7 @@ pub const OSDESC_REAP_MAX: u32 = 256;
 /// `(render file, id, token[0..8], token[8..16]) -> (gem, size, type)`, then
 /// an [`crate::inject::InjectInfo`] (64 bytes) after the [`HostOpResp`]: a
 /// buffer the host's capture helper injected (`--inject-socket`,
-/// device/src/inject.rs), imported into the render file as a GEM handle the
+/// device/src/inject/), imported into the render file as a GEM handle the
 /// guest makes a proxy of. The token is the one IMPORT gave the helper, as
 /// two little-endian words; an id that is not live, or a token that does
 /// not match, is -ENOENT either way. `type` is always 0 (NVKMS): nothing

@@ -3372,7 +3372,7 @@ mod tests {
     }
 
     /// A re-home whose export the hooks refuse (an injected capture buffer,
-    /// inject.rs) runs nothing and leaves nothing in the KMS file.
+    /// inject/) runs nothing and leaves nothing in the KMS file.
     #[test]
     fn a_rehome_the_hooks_refuse_never_reaches_addfb() {
         struct NoExport;

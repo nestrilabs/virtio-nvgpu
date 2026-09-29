@@ -2283,7 +2283,7 @@ deployment.
 | the guest (kernel and daemon) | nothing | ids are the helper's to make; a guest names one with a token it can only have been told |
 | other host users | nothing | the socket is 0600, opened to the helper's group by root after start, and served only to `--inject-uid` (`SO_PEERCRED`) |
 
-**What the backend checks** (`device/src/inject.rs`, each with a unit test
+**What the backend checks** (`device/src/inject/`, each with a unit test
 against a fake nvidia-drm, and the `inject` fuzz target):
 
 - The packet: `SOCK_SEQPACKET`, exactly the size of its op (16, 64 or 8

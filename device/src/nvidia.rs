@@ -671,10 +671,10 @@ pub struct NvidiaBackend {
     /// Memory the guest registered with RM by its pages (osdesc.rs).
     pub(crate) osdesc: crate::osdesc::OsDesc,
     /// Host buffers a capture helper injected (`--inject-socket`), and the
-    /// handles INJECT_OPEN made of them (inject.rs).
+    /// handles INJECT_OPEN made of them (inject/backend.rs).
     pub(crate) inject: crate::inject::BackendInject,
     /// The injected objects' dma-bufs, which no export may hand out
-    /// (inject.rs, `Taint`); shared with the IOCTL2 hooks.
+    /// (inject/registry.rs, `Taint`); shared with the IOCTL2 hooks.
     pub(crate) inject_taint: crate::inject::SharedTaint,
 }
 
@@ -1032,7 +1032,7 @@ fn node_dev(name: &str) -> Option<(u32, u32)> {
 /// only if it is one of these cards.
 /// The render nodes' names (`renderD128`), in the order a guest's render
 /// indices name them (`HostNodes::dri`): the capture helper's buffers are
-/// checked against the same numbering (inject.rs).
+/// checked against the same numbering (inject/host.rs).
 pub fn host_render_names() -> Vec<String> {
     enumerate_host_nodes()
         .dri
@@ -2301,8 +2301,8 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
         }
         // An injected buffer's range is placed read-only, whichever of the
-        // VM's files maps it (inject.rs): the guest's CPU does not write
-        // into the host's capture buffers.
+        // VM's files maps it (inject/backend.rs): the guest's CPU does not
+        // write into the host's capture buffers.
         let injected = drm && self.inject.read_only(fd_offset, length);
         let writable = !injected && crate::shm::host_mapping_writable(host_fd, length, fd_offset);
         let region = match self.alloc_zone(length, pgprot, self.handles.owner(handle)) {

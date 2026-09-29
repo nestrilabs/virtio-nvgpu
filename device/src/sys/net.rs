@@ -114,7 +114,7 @@ pub fn send_to(fd: RawFd, port: u32, msg: &[u8]) -> io::Result<usize> {
     }
 }
 
-// ─────────────── the capture-injection socket (inject.rs) ───────────────
+// ─────────── the capture-injection socket (inject/server.rs) ───────────
 
 fn unix_addr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     use std::os::unix::ffi::OsStrExt;

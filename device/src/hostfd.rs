@@ -531,7 +531,7 @@ pub enum HostOp {
         key: RegKey,
         cookie: u64,
     },
-    /// A buffer the capture helper injected (inject.rs).
+    /// A buffer the capture helper injected (inject/).
     InjectOpen {
         file: u32,
         id: u32,
@@ -749,7 +749,7 @@ pub const DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET: u32 = ioc(IOC_RW, b'd', 0x4a, 16);
 /// `DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET` on `gem` in `render`: the object's
 /// fake mmap offset. It is the object's (its `drm_vma_node`), not the
 /// file's: every file holding a handle to one object gets the same number,
-/// and may map it (inject.rs keys read-only placements on it).
+/// and may map it (inject/backend.rs keys read-only placements on it).
 pub fn gem_map_offset(render: RawFd, gem: u32) -> io::Result<u64> {
     let mut p = [0u8; 16];
     p[0..4].copy_from_slice(&gem.to_le_bytes());

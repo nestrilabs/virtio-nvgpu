@@ -43,7 +43,7 @@ pub struct BackendHooks {
     /// RM clients, its live contexts; semsurf.rs). Shared with the backend,
     /// which feeds it from the RM path and every handle it opens and closes.
     semsurf: Arc<SemsurfPolicy>,
-    /// Capture injection: the dma-bufs no re-home may export (inject.rs).
+    /// Capture injection: the dma-bufs no re-home may export (inject/).
     inject_taint: crate::inject::SharedTaint,
 }
 
@@ -77,7 +77,8 @@ impl BackendHooks {
         }
     }
 
-    /// With the backend's taint set (inject.rs), as its `Arc<dyn Hooks>`.
+    /// With the backend's taint set (inject/registry.rs), as its
+    /// `Arc<dyn Hooks>`.
     pub fn with_inject_taint(mut self, t: crate::inject::SharedTaint) -> Arc<dyn Hooks> {
         self.inject_taint = t;
         Arc::new(self)
