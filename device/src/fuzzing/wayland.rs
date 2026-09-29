@@ -448,7 +448,7 @@ impl Pair {
                 if q.is_empty() {
                     // Nothing left to take is nothing left counted: a count
                     // that outlives its queue blocks the app's input for
-                    // good (the 2026-09-29 review, S2).
+                    // good.
                     assert_eq!(self.g.channel_backlog(), 0, "a backlog with nothing queued");
                     break;
                 }

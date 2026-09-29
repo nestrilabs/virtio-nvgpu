@@ -226,13 +226,13 @@ impl QueueBudget {
 /// may hold of its bytes and of its pool count, with the last part of both
 /// kept for processes that hold little.
 ///
-/// A flat quarter each, with no reserve, let four processes -- one that
-/// forked three times -- take the whole VM's pools or bytes, at no cost to
-/// themselves (sparse buffers are charged by the pages they cover, never
-/// written), and every other process's first pool was then fatal to it (the
-/// 2026-09-29 review, S5). Now it takes four at their full share to reach
-/// the reserve, and a process holding at most the floor can still make its
-/// first pools and buffers out of that.
+/// Without the reserve, four processes -- one that forked three times --
+/// could take the whole VM's pools or bytes at their full shares, at no
+/// cost to themselves (sparse buffers are charged by the pages they cover,
+/// never written), and every other process's first pool would then be
+/// fatal to it. With it, four at their full share leave the reserve, and a
+/// process holding at most the floor can still make its first pools and
+/// buffers out of that.
 #[derive(Debug)]
 pub struct ShmShares {
     vm: Arc<ShmBudget>,
@@ -1171,7 +1171,7 @@ mod budget_tests {
     /// leave the reserve, and a fifth still makes its first pools and
     /// buffers out of it. Before, each process had a flat quarter and no
     /// reserve: four took everything, and every other process's first pool
-    /// was refused, which is fatal to it (the 2026-09-29 review, S5).
+    /// was refused, which is fatal to it.
     #[test]
     fn four_processes_at_their_share_leave_room_for_a_fifth() {
         let limits = WlLimits::new(64, 1 << 30, 1 << 20);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The daemon's descriptors, shared among its clients (the 2026-09-29
-//! review, S3), at a descriptor limit scaled down from a session's usual
-//! 1024. A file of its own: the limit is the whole test process's.
+//! The daemon's descriptors, shared among its clients, at a descriptor
+//! limit scaled down from a session's usual 1024. A file of its own: the
+//! limit is the whole test process's.
 
 #![forbid(unsafe_code)]
 

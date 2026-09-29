@@ -230,11 +230,11 @@ impl LogLimit {
     }
 }
 
-/// A [`LogLimit`] per call site, as the backend meters its lines: one limit
-/// for the whole daemon let one client's errors use up the burst, and the
-/// lines other clients caused (or the daemon's own, on accept) were dropped
-/// (the 2026-09-29 review, S11). A site is a line's fixed part, so what one
-/// client causes over and over can hide only more of the same.
+/// A [`LogLimit`] per call site, as the backend meters its lines: with one
+/// limit for the whole daemon, one client's errors would use up the burst,
+/// and the lines other clients caused (or the daemon's own, on accept) would
+/// be dropped. A site is a line's fixed part, so what one client causes over
+/// and over can hide only more of the same.
 struct Logs {
     sites: HashMap<&'static str, LogLimit>,
 }
@@ -365,10 +365,9 @@ fn lock_path(path: &Path) -> PathBuf {
 
 /// Take the socket name `path` as libwayland takes one (wl_display_add_socket):
 /// lock `<path>.lock` first, and only then remove what is at `path`, a
-/// socket its owner left behind. Before, the daemon removed whatever was
-/// there and bound: a second daemon, or a compositor on the same name, lost
-/// its socket to it, and the first daemon's exit removed the second's (the
-/// 2026-09-29 review, S10).
+/// socket its owner left behind. Removing whatever was there and binding
+/// would take the socket of a second daemon, or of a compositor on the same
+/// name, and the first daemon's exit would remove the second's.
 fn take_socket(path: &Path) -> io::Result<(std::fs::File, PathBuf)> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let lp = lock_path(path);
@@ -640,7 +639,7 @@ impl Daemon {
                                 // round trip each, until the host's compositor
                                 // drained -- or for good, had the engine's
                                 // count of its backlog ever outlived the
-                                // backlog (the 2026-09-29 review, S2). Nobody
+                                // backlog. Nobody
                                 // is left to read the replies to those frames,
                                 // and closing the channel ends the host's side
                                 // of the client anyway (libwayland-server
@@ -940,8 +939,8 @@ impl Daemon {
             // (NVGPU_WL_IOC_CONNECT_FOR). The kernel finds the process by
             // its pid, so what it charged is the client's only if the client
             // was still there after: a pid is given to another process only
-            // once its own has exited (the 2026-09-29 review, S7). A client
-            // that has, whichever process was charged, is dropped.
+            // once its own has exited. A client that has, whichever process
+            // was charged, is dropped.
             let ch = match owner {
                 Owner::Pid(pid) => self.conn.connect_for(pid),
                 Owner::Conn(_) => self.conn.connect(uapi::CONNECT),
@@ -978,9 +977,9 @@ impl Daemon {
                 Err(_) => return,
             };
             // Without waiting: a guest compositor whose backlog is full
-            // would otherwise stall this thread, and every client with it
-            // (the 2026-09-29 review, S12). The host client it was for is
-            // turned away rather than kept waiting.
+            // would otherwise stall this thread, and every client with it.
+            // The host client it was for is turned away rather than kept
+            // waiting.
             match crate::sys::connect_nonblocking(&target) {
                 Ok(s) => {
                     // Each is a host client, which the guest kernel cannot
@@ -1022,8 +1021,8 @@ impl Daemon {
         // Our client gets the error it earned, or the host's verdict, after
         // what it already has (Engine::end_with): written straight to the
         // socket after a flush that stopped inside an event, it would land
-        // in the middle of that event (the 2026-09-29 review, S8). What
-        // the socket does not take now goes when the slot closes (sync).
+        // in the middle of that event. What the socket does not take now
+        // goes when the slot closes (sync).
         let record = c.engine.end_with(&f);
         let _ = c.engine.local_out().flush(c.sock.as_raw_fd());
         // The guest compositor broke the protocol: tell the host client.
@@ -1344,11 +1343,10 @@ impl Daemon {
 /// level-triggered, and taken out of epoll otherwise: epoll reports an error
 /// or a hangup whatever it was asked for, so a sink whose reader went away
 /// with nothing to write, or a source with no credit whose writer went away,
-/// would otherwise wake the daemon on every wait until the far side moved
-/// (the 2026-09-29 review, S4). Streams the engine has ended are taken out
-/// before their descriptors close: a sink's descriptor shares its open file
-/// with the client that sent it, and a registration left behind would outlive
-/// the close (S9).
+/// would otherwise wake the daemon on every wait until the far side moved.
+/// Streams the engine has ended are taken out before their descriptors
+/// close: a sink's descriptor shares its open file with the client that sent
+/// it, and a registration left behind would outlive the close.
 fn sync_streams(ep: RawFd, base: u64, c: &mut Client) {
     for fd in c.engine.take_closed_streams() {
         if c.streams.remove(&fd.as_raw_fd()).is_some() {
@@ -1945,7 +1943,7 @@ mod tests {
     /// which epoll always reports, for a stream the engine wants nothing of.
     /// The daemon stops watching such a stream rather than waking for it.
     /// Before, it re-armed every stream on every turn it touched, and spun
-    /// until the host's source sent something (the 2026-09-29 review, S4).
+    /// until the host's source sent something.
     #[test]
     fn a_stream_whose_reader_is_gone_does_not_spin_the_daemon() {
         let (mut d, _script, client) = with_an_offer("sink");
@@ -2009,8 +2007,7 @@ mod tests {
     /// charged to the client's process in the daemon's stream budget, and
     /// counts as unread for the stuck-client rule; it is given back when
     /// the stream ends. Before, the daemon's sinks were unbudgeted: about
-    /// 15 MiB per connection, and a process could hold 16 connections (the
-    /// 2026-09-29 review, S6).
+    /// 15 MiB per connection, and a process could hold 16 connections.
     #[test]
     fn what_sinks_hold_is_charged_to_the_clients_process() {
         let (mut d, script, client) = with_an_offer("sinkbudget");
@@ -2098,9 +2095,9 @@ mod tests {
     /// event, never in the middle of one. Before, the error was written
     /// straight to the socket after a flush that could stop inside an
     /// event, and a client reading at the same time -- which frees the
-    /// room the error then fits in -- read it as that event's arguments
-    /// (the 2026-09-29 review, S8). The race is between two system calls
-    /// of the daemon, so it is tried a number of times.
+    /// room the error then fits in -- read it as that event's arguments.
+    /// The race is between two system calls of the daemon, so it is tried
+    /// a number of times.
     #[test]
     fn a_fatal_error_never_lands_in_the_middle_of_an_event() {
         use std::io::{Read, Write};
@@ -2222,8 +2219,8 @@ mod tests {
     /// One call site's burst is its own: a client whose errors use up the
     /// limit of the line that closes connections hides no other line. Before,
     /// one limit for the whole daemon dropped every other line too, the
-    /// accept failures that say the daemon is out of descriptors among them
-    /// (the 2026-09-29 review, S11).
+    /// accept failures that say the daemon is out of descriptors among
+    /// them.
     #[test]
     fn one_call_sites_lines_do_not_crowd_out_anothers() {
         let mut l = Logs::new();
@@ -2299,7 +2296,7 @@ mod tests {
     /// channel is left charged to the daemon or to a process that reused
     /// its pid. Before, CONNECT_FOR was asked for by pid number alone, and
     /// a process the kernel could not find fell back to a plain CONNECT
-    /// charged to the daemon (the 2026-09-29 review, S7).
+    /// charged to the daemon.
     #[test]
     fn a_client_whose_process_is_gone_gets_no_channel() {
         let sock = socket_in_tmp("gone");
@@ -2339,7 +2336,7 @@ mod tests {
     /// the first keeps its socket; the socket and its lock go with the
     /// daemon that holds them, and a socket left behind by one that was
     /// killed is taken over. Before, the second removed the first's socket
-    /// and bound its own (the 2026-09-29 review, S10).
+    /// and bound its own.
     #[test]
     fn a_socket_name_is_taken_under_its_lock() {
         let sock = socket_in_tmp("lock");
@@ -2400,7 +2397,7 @@ mod tests {
     /// Export mode, a guest compositor whose backlog is full: the host
     /// client is turned away and the daemon goes on. Before, the connect
     /// blocked the daemon's only thread until the compositor accepted, and
-    /// every other client with it (the 2026-09-29 review, S12).
+    /// every other client with it.
     #[test]
     fn a_guest_compositor_with_a_full_backlog_does_not_stall_the_daemon() {
         let target = socket_in_tmp("full");

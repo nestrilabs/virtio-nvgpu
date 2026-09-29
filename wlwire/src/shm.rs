@@ -453,9 +453,9 @@ impl Shm {
     /// natively, and a compositor that reads shm when it paints rather than
     /// at commit (wlroots' pixman renderer) goes on reading those pages until
     /// the surface commits something else. Punched now, it would paint
-    /// zeros (the 2026-09-29 review, C3). So the buffer, its pages and their
-    /// charge stay with the surface until its next attach is committed, or
-    /// the surface goes: one buffer per surface at most.
+    /// zeros. So the buffer, its pages and their charge stay with the
+    /// surface until its next attach is committed, or the surface goes: one
+    /// buffer per surface at most.
     pub fn forget(&mut self, id: u32) {
         self.pools.remove(&id);
         if let Some(buf) = self.buffers.remove(&id) {

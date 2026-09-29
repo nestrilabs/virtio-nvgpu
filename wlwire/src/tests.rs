@@ -954,7 +954,7 @@ fn an_engine_counts_the_descriptors_it_holds() {
 /// on its object. Before, every error named the object the message did,
 /// so a client told "invalid object 99" could not dispatch the error at
 /// all (it knows no 99), and `no_memory` on `wl_shm` read as
-/// `wl_shm.error.invalid_fd` (the 2026-09-29 review, C2).
+/// `wl_shm.error.invalid_fd`.
 #[test]
 fn errors_are_posted_on_the_object_libwayland_posts_them_on() {
     let setup = || {
@@ -1190,7 +1190,7 @@ fn seat_v1(side: Side) -> Engine {
 /// would take it natively; before, the guest client was killed for the
 /// compositor's mistake. From a guest's compositor to a host client (export
 /// mode) it is still refused: a host process would call past the end of a
-/// listener made for the object's version (the 2026-09-29 review, C4).
+/// listener made for the object's version.
 #[test]
 fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
     let name = MsgBuilder::new(3, op::wl_seat::EVT_NAME)
@@ -1226,7 +1226,7 @@ fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
 /// the compositor's pool until the surface commits something else, as
 /// natively (destroying a wl_buffer leaves the pool alone): a compositor
 /// that reads shm when it paints goes on reading them. Before, they were
-/// punched at the destroy, and it painted zeros (the 2026-09-29 review, C3).
+/// punched at the destroy, and it painted zeros.
 #[test]
 fn a_destroyed_buffer_keeps_its_pages_while_its_surface_shows_it() {
     let mut p = Pair::new(Policy::default());
@@ -1377,8 +1377,7 @@ fn commit_a_truncated_pool(left: u64) -> Pair {
 /// on the channel's backlog is given back however short the read came, so
 /// the backlog drains and its later requests are taken. Before, only the
 /// bytes read were given back, and the rest of the buffer stayed counted for
-/// good: past the input limit, the client's input was never read again
-/// (the 2026-09-29 review, S2).
+/// good: past the input limit, the client's input was never read again.
 #[test]
 fn a_client_that_truncates_its_pool_gets_a_short_copy_and_is_not_wedged() {
     for left in [0, 4096, 5 << 20] {

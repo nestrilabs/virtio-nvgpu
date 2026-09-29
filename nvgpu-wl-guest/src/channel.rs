@@ -160,8 +160,8 @@ impl Connector for DevConnector {
                 self.connect(uapi::CONNECT)
             }
             // ESRCH, the client's process gone before the kernel looked it
-            // up, is refused: charged to the daemon, it would have been a
-            // channel nobody's share bounds (the 2026-09-29 review, S7).
+            // up, is refused: charged to the daemon, it would be a channel
+            // nobody's share bounds.
             Err(e) => Err(e),
         }
     }

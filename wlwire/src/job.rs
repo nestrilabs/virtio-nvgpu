@@ -14,9 +14,9 @@
 //! blob pads with zeros (the receiver was promised its size). The engine does
 //! not need to know which: it counts what a step took off `remaining`, not
 //! what the step says it read, so however a job ends, what was counted for it
-//! is given back. Counting by the bytes read instead left a truncated pool's
-//! commit charged for good, and the client's input blocked behind a backlog
-//! that was never going to drain (the 2026-09-29 review, S2).
+//! is given back. Counted by the bytes read instead, a truncated pool's
+//! commit would stay charged for good, and the client's input blocked
+//! behind a backlog that was never going to drain.
 
 #![forbid(unsafe_code)]
 

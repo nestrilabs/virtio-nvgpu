@@ -963,9 +963,9 @@ impl Engine {
         // parity. One from a guest's compositor on its way to a host client
         // (export mode) is still refused: the host client would call past
         // the end of a listener made for the object's version, and what a
-        // guest can make a host process call is what must not cross (the
-        // 2026-09-29 review, C4). The message is parsed by its signature
-        // either way, so its descriptors are counted.
+        // guest can make a host process call is what must not cross. The
+        // message is parsed by its signature either way, so its descriptors
+        // are counted.
         let from_host_compositor =
             (self.cfg.side == Side::Host) == (self.cfg.local == Local::Server);
         if desc.since > obj.version && !(dir == Dir::Event && from_host_compositor) {

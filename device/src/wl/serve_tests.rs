@@ -327,7 +327,7 @@ fn gate<'a>(
 
 /// A fence context named in a DMABUF descriptor is refused before the
 /// host is asked, as HOST_OP PRIME_EXPORT refuses it: the export gate is
-/// one (review 2026-09-29, wayland S1).
+/// one (exportgate.rs).
 #[test]
 fn a_fence_context_never_goes_to_the_compositor() {
     let mut t = HandleTable::new();
