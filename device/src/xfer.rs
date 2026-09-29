@@ -589,6 +589,14 @@ pub trait Hooks: Send + Sync {
         Ok(None)
     }
 
+    /// Whether a re-home may export `gem` of guest file `file` at all:
+    /// asked before the export; Err refuses the call. On the thread that
+    /// runs the call.
+    fn may_export(&self, file: u32, gem: u32) -> Result<(), Errno> {
+        let _ = (file, gem);
+        Ok(())
+    }
+
     /// Whether a dma-buf a re-home has just exported may be imported
     /// elsewhere; false refuses the call (EINVAL). On the thread that runs
     /// the call.
@@ -1949,7 +1957,7 @@ impl Prepared {
                     h
                 } else {
                     let owner_fd = self.owners[&owner].as_raw_fd();
-                    let dmabuf = self.prime_export(owner_fd, gem)?;
+                    let dmabuf = self.prime_export(owner, owner_fd, gem)?;
                     let imported = self.prime_import(target_fd, dmabuf.as_raw_fd());
                     self.sys.close(dmabuf);
                     let h = imported?;
@@ -2158,7 +2166,7 @@ impl Prepared {
 
     fn move_to_render(&self, target_fd: RawFd, h: u32) -> Result<(u32, u64), Errno> {
         let render = self.render_fd.as_ref().ok_or(libc::EINVAL)?.as_raw_fd();
-        let dmabuf = self.prime_export(target_fd, h)?;
+        let dmabuf = self.prime_export(self.target, target_fd, h)?;
         let size = self.sys.size_of(dmabuf.as_raw_fd());
         let imported = self.prime_import(render, dmabuf.as_raw_fd());
         self.sys.close(dmabuf);
@@ -2180,7 +2188,10 @@ impl Prepared {
         crate::sys::block::flat(&*self.sys, fd, u64::from(cmd), a)
     }
 
-    fn prime_export(&self, fd: RawFd, gem: u32) -> Result<OwnedFd, Errno> {
+    /// `gem` of guest file `file` (host descriptor `fd`) as a dma-buf, if
+    /// the export gate lets it leave (exportgate.rs, through the hooks).
+    fn prime_export(&self, file: u32, fd: RawFd, gem: u32) -> Result<OwnedFd, Errno> {
+        self.hooks.may_export(file, gem)?;
         let mut b = [0u8; 12];
         wr(&mut b, 0, 4, u64::from(gem));
         wr(&mut b, 4, 4, u64::from(DRM_CLOEXEC));
@@ -3361,6 +3372,29 @@ mod tests {
         assert!(!log.iter().any(|l| l.starts_with("ioctl")), "{log:?}");
         assert!(!log.iter().any(|l| l.starts_with("import")), "{log:?}");
         assert!(h.sys.k().gems.get(&KMS).is_none_or(|g| g.is_empty()));
+    }
+
+    /// A fence context is never re-homed: the backend's hooks ask the one
+    /// export gate before the export (exportgate.rs; review 2026-09-29,
+    /// wayland S1 and R1).
+    #[test]
+    fn a_fence_context_is_never_rehomed() {
+        let semsurf = Arc::new(crate::semsurf::SemsurfPolicy::default());
+        semsurf.ctx_made_for_test(RENDER, 3);
+        let mut h = h();
+        h.hooks = crate::policy::BackendHooks::with_state(Default::default(), semsurf)
+            .with_inject_taint(Default::default());
+        h.sys
+            .k()
+            .object(RENDER, 3, 100, NV_GEM_OBJECT_NVKMS, 1 << 20);
+        let rq = Rq::new(ADDFB2)
+            .buf(104, Some(&addfb2(XRGB8888, [9, 0, 0, 0])))
+            .gem(0, 20, RENDER, 3);
+        let r = h.kms(&rq).unwrap();
+        assert_eq!(r.ret, -libc::EINVAL);
+        let log = h.sys.log();
+        assert!(!log.iter().any(|l| l.starts_with("export")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("ioctl")), "{log:?}");
     }
 
     #[test]

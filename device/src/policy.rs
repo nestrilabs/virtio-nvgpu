@@ -69,6 +69,14 @@ impl BackendHooks {
         }
     }
 
+    fn export_gate(&self) -> crate::exportgate::ExportGate<'_> {
+        crate::exportgate::ExportGate {
+            semsurf: &self.semsurf,
+            injected: None,
+            taint: &self.inject_taint,
+        }
+    }
+
     /// With the backend's taint set (inject.rs), as its `Arc<dyn Hooks>`.
     pub fn with_inject_taint(mut self, t: crate::inject::SharedTaint) -> Arc<dyn Hooks> {
         self.inject_taint = t;
@@ -181,11 +189,19 @@ impl BackendHooks {
 }
 
 impl Hooks for BackendHooks {
-    /// A re-home (an ADDFB's object moved into a KMS file) exports no
-    /// injected object: a capture buffer is the guest's to read, never a
-    /// framebuffer of the host's display (SECURITY.md §18).
+    /// A re-home (an ADDFB's object moved into a KMS file) exports no fence
+    /// context: the one export gate (exportgate.rs), without INJECT_OPEN's
+    /// records, which live under the backend's lock; the taint below
+    /// catches the same objects.
+    fn may_export(&self, file: u32, gem: u32) -> Result<(), Errno> {
+        self.export_gate().may_export(file, gem)
+    }
+
+    /// A re-home exports no injected object: a capture buffer is the
+    /// guest's to read, never a framebuffer of the host's display
+    /// (SECURITY.md §18).
     fn exportable(&self, dmabuf: std::os::fd::BorrowedFd<'_>) -> bool {
-        crate::inject::exportable(&self.inject_taint, dmabuf)
+        self.export_gate().may_leave(dmabuf).is_ok()
     }
 
     fn prop_kind(&self, name: &[u8]) -> PropKind {

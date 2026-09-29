@@ -303,15 +303,48 @@ fn a_dmabuf_is_exported_only_on_a_render_handle_of_the_session() {
         .unwrap();
     let null = crate::sys::fd::open(c"/dev/null", libc::O_RDWR | libc::O_CLOEXEC).unwrap();
     let render = t.insert(null, HandleKind::DriRender(0)).unwrap();
+    let (semsurf, taint) = Default::default();
     let mut ops = TableSend {
         handles: &t,
-        taint: None,
+        gate: gate(&semsurf, &taint),
     };
     let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
     assert_eq!(e(ops.prime_export(ev, 1)), Some(libc::EBADF));
     assert_eq!(e(ops.prime_export(12345, 1)), Some(libc::EBADF));
     // A render handle reaches the host: /dev/null answers the ioctl itself.
     assert_eq!(e(ops.prime_export(render, 1)), Some(libc::ENOTTY));
+}
+
+fn gate<'a>(
+    semsurf: &'a crate::semsurf::SemsurfPolicy,
+    taint: &'a crate::inject::SharedTaint,
+) -> crate::exportgate::ExportGate<'a> {
+    crate::exportgate::ExportGate {
+        semsurf,
+        injected: None,
+        taint,
+    }
+}
+
+/// A fence context named in a DMABUF descriptor is refused before the
+/// host is asked, as HOST_OP PRIME_EXPORT refuses it: the export gate is
+/// one (review 2026-09-29, wayland S1).
+#[test]
+fn a_fence_context_never_goes_to_the_compositor() {
+    let mut t = HandleTable::new();
+    let null = crate::sys::fd::open(c"/dev/null", libc::O_RDWR | libc::O_CLOEXEC).unwrap();
+    let render = t.insert(null, HandleKind::DriRender(0)).unwrap();
+    let semsurf = crate::semsurf::SemsurfPolicy::default();
+    semsurf.ctx_made_for_test(render, 7);
+    let taint = crate::inject::SharedTaint::default();
+    let mut ops = TableSend {
+        handles: &t,
+        gate: gate(&semsurf, &taint),
+    };
+    let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
+    assert_eq!(e(ops.prime_export(render, 7)), Some(libc::EINVAL));
+    // Another GEM of the same file still reaches the host.
+    assert_eq!(e(ops.prime_export(render, 8)), Some(libc::ENOTTY));
 }
 
 /// Explicit sync is offered when this backend serves fences (BCAP_FENCES,
@@ -364,9 +397,10 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
     let so = t
         .insert(sys::memfd(c"syncobj", 0).unwrap(), HandleKind::Syncobj)
         .unwrap();
+    let (semsurf, taint) = Default::default();
     let mut ops = TableSend {
         handles: &t,
-        taint: None,
+        gate: gate(&semsurf, &taint),
     };
     let fd = ops.syncobj(so).unwrap();
     let link = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();

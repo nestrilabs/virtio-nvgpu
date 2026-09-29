@@ -790,34 +790,12 @@ impl NvidiaBackend {
         let io = |e: std::io::Error| errno_of(&e);
         match op {
             HostOp::PrimeExport { file, gem } => {
-                // A fence context is counted against its file's and the
-                // session's caps until its GEM handle closes (semsurf.rs),
-                // and each holds a host kthread, a timer and an NVKMS
-                // duplicate. A dma-buf of it would keep all that alive past
-                // the close, uncounted, as often as the guest liked.
-                // Nothing needs one: the object has no pages to share
-                // (nv_fence_context_gem_ops has no sg table), and the guest
-                // driver refuses to export one itself
-                // (nvgpu_fence_ctx_export).
-                if self.semsurf.is_ctx(file, gem) {
-                    log::warn!(
-                        "PRIME export of GEM {gem} of handle {file}, a fence context; refused"
-                    );
-                    return Err(libc::EINVAL);
-                }
-                // An injected capture buffer stays the guest's to read: its
-                // dma-buf is the helper's, and exported it would bypass the
-                // open's bounds and read-only tracking, and could go to the
-                // host compositor (SECURITY.md §18).
-                if !self.inject.exportable_handle(file, gem) {
-                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
-                    return Err(libc::EINVAL);
-                }
+                // Not a fence context, not an injected capture buffer: the
+                // one gate every export path asks (exportgate.rs).
+                let gate = self.export_gate();
+                gate.may_export(file, gem)?;
                 let dmabuf = hostfd::prime_export(self.raw(file)?, gem).map_err(io)?;
-                if !crate::inject::exportable(&self.inject_taint, dmabuf.as_fd()) {
-                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
-                    return Err(libc::EINVAL);
-                }
+                self.export_gate().may_leave(dmabuf.as_fd())?;
                 let size = hostfd::dmabuf_size(dmabuf.as_raw_fd()).unwrap_or(0);
                 let h = self.insert(dmabuf, HandleKind::Dmabuf)?;
                 Ok((vec![h as u64, size], vec![h]))

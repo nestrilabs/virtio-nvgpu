@@ -5271,6 +5271,17 @@ impl NvidiaBackend {
         }
     }
 
+    /// The one gate every export of a guest GEM object asks
+    /// (exportgate.rs): HOST_OP PRIME_EXPORT and the Wayland dma-buf path
+    /// here, the IOCTL2 re-home through its hooks.
+    pub(crate) fn export_gate(&self) -> crate::exportgate::ExportGate<'_> {
+        crate::exportgate::ExportGate {
+            semsurf: &self.semsurf,
+            injected: Some(&self.inject),
+            taint: &self.inject_taint,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Response helpers
     // ------------------------------------------------------------------

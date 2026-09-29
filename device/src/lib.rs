@@ -17,6 +17,7 @@ pub mod closer;
 pub mod deepseg;
 pub mod error;
 pub mod exec;
+pub mod exportgate;
 pub mod fence;
 #[cfg(test)]
 mod fuzz_seeds;
