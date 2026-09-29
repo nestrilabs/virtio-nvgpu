@@ -2128,6 +2128,18 @@ fn main() -> anyhow::Result<()> {
         for (addr, config) in pci_config {
             be.set_pci_config(&addr, config);
         }
+        if let Some(s) = &inject {
+            be.set_inject(Some(s.registry().clone()));
+        }
+        if args.keep_guest_coherency {
+            be.set_guest_coherency(false);
+        }
+        // Every guest process's descriptors are this process's: the whole
+        // of the hard limit, taken before the sandbox, sizes the handle
+        // table (B1).
+        if let Some(n) = nofile {
+            be.set_nofile(n);
+        }
     }
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
@@ -2137,22 +2149,6 @@ fn main() -> anyhow::Result<()> {
         nvgpu.queue_poll.as_micros()
     );
     let backend = Arc::new(RwLock::new(nvgpu));
-    if let Some(s) = &inject {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared
-            .nvidia
-            .lock()
-            .expect("nvidia lock")
-            .set_inject(Some(s.registry().clone()));
-    }
-    if args.keep_guest_coherency {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared
-            .nvidia
-            .lock()
-            .expect("nvidia lock")
-            .set_guest_coherency(false);
-    }
     device::rmmem::warn_if_guest_pat_ignored(!args.keep_guest_coherency);
     // Host connector and lease changes of the host's cards, which arrive only
     // as uevents (device::kms). The guest hears of them only in
@@ -2237,12 +2233,6 @@ fn main() -> anyhow::Result<()> {
              the file it was made on ({e}); without that, one guest process could use \
              another's RM objects by handle"
         ),
-    }
-    // Every guest process's descriptors are this process's: the whole of the
-    // hard limit, taken before the sandbox, sizes the handle table (B1).
-    if let Some(n) = nofile {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
     }
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
