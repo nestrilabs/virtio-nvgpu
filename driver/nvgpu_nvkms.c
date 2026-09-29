@@ -151,7 +151,10 @@ static int nvgpu_nvkms_dmabuf(struct nvgpu_device *dev, int fd, u32 *handle,
   dma_buf_put(buf);
   if (ret < 0)
     return ret;
-  *handle = res[0];
+  /* A handle is nonzero and 32-bit, as every other HOST_OP result site
+   * checks; this one took any u64 (the 2026-09-29 review, C11). */
+  if (!nvgpu_res_u32(res[0], handle))
+    return -EPROTO;
   *flags = NVGPU_I2_FD_CONSUME;
   return 0;
 }

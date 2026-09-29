@@ -236,6 +236,14 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
   unsigned int n = 0;
 
   BUILD_BUG_ON(sizeof(r) != NVGPU_DEV_INFO_WORDS * sizeof(u32));
+  /*
+   * drm_ioctl() copies back only where the caller's command says OUT, and
+   * _IOC_SIZE bytes of it (drm_ioctl.c:866-871): an _IO or _IOW caller, or
+   * one of size 0, gets 0 and nothing written. This wrote the answer for an
+   * _IOW, and refused size 0.
+   */
+  if (!(_IOC_DIR(cmd) & _IOC_READ) || !want)
+    return 0;
   if (want != 20 && want != 28 && want != 32 && want < 36)
     return -EINVAL;
   memcpy(&r, dri->dev_info, sizeof(r));
@@ -463,21 +471,10 @@ static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
                                    struct drm_file *file, unsigned int cmd,
                                    void *k) {
   switch (_IOC_NR(cmd) - DRM_COMMAND_BASE) {
-  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID: {
-    /*
-     * A number that tells one open of this node from another. The ICD asks
-     * for it once a device has been created and uses it to recognise its own
-     * file; nothing outside this guest ever sees it, so a counter is a real
-     * answer rather than a stub, and it must not restart while the module is
-     * loaded or two live files would claim the same id.
-     */
-    static atomic64_t next_unique_id = ATOMIC64_INIT(1);
-
-    if (!nfd->drm_unique_id)
-      nfd->drm_unique_id = (u64)atomic64_inc_return(&next_unique_id);
+  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID:
+    /* Fixed at open (nvgpu_drm_open()), as nvidia-drm's is. */
     put_unaligned(nfd->drm_unique_id, (u64 *)k);
     return 0;
-  }
 
   /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c). */
   case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
@@ -1697,6 +1694,17 @@ out:
  * `name` is what the ICD compares against, so it is the host driver's name and
  * not this module's.
  */
+/*
+ * GET_DRM_FILE_UNIQUE_ID's answer: a number that tells one open of a node
+ * from another. The ICD asks for it once a device has been created and uses
+ * it to recognise its own file; nothing outside this guest ever sees it, so a
+ * counter is a real answer rather than a stub, and it must not restart while
+ * the module is loaded or two live files would claim the same id. Given at
+ * open: assigned on first ask, two threads asking at once on a new file could
+ * each be told a different one (the 2026-09-29 review, S8).
+ */
+static atomic64_t nvgpu_drm_next_unique_id = ATOMIC64_INIT(0);
+
 static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   struct nvgpu_dri_dev *dri = drm->dev_private;
   struct nvgpu_device *dev;
@@ -1721,6 +1729,7 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
 
   nfd->dev = dev;
   nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
+  nfd->drm_unique_id = (u64)atomic64_inc_return(&nvgpu_drm_next_unique_id);
   /* The file's own reference; GEM proxies it owns add theirs. */
   refcount_set(&nfd->ref, 1);
 

@@ -608,10 +608,35 @@ def next_event_valid(tables):
     return offs.pop()
 
 
+def c_drm_cmds(t):
+    """The DRM table's full ioctl numbers, by name, for the guest code that
+    builds a native command itself (the syncobj paths in nvgpu_fence.c, the
+    dumb-buffer pair in nvgpu_kms.c) to static_assert its kernel's numbers
+    against: a guest kernel whose struct grew would otherwise have every such
+    call refused at run time for its size, with only a warning to say why."""
+    seen = {}
+    lines = ['/* The DRM entries\' full ioctl numbers (direction and size '
+             'included), for the',
+             ' * guest code that builds a native command itself to assert its '
+             'kernel\'s',
+             ' * numbers against. */']
+    for e, _ in t.entries:
+        if e.name in seen:
+            if seen[e.name] != e.cmd:
+                fail('drm', f'{e.name} twice, with different numbers')
+            continue
+        seen[e.name] = e.cmd
+        lines.append(f'#define NVGPU_SCHEMA_CMD_{e.name} 0x{e.cmd:08x}u')
+    return '\n'.join(lines) + '\n\n'
+
+
 def emit_c(tables, max_depth):
-    out = [C_PREAMBLE.format(max_list=MAX_LIST, max_depth=max_depth,
-                             nvkms_iowr=NVKMS_IOCTL_IOWR,
-                             next_event_valid=next_event_valid(tables))]
+    pre = C_PREAMBLE.format(max_list=MAX_LIST, max_depth=max_depth,
+                            nvkms_iowr=NVKMS_IOCTL_IOWR,
+                            next_event_valid=next_event_valid(tables))
+    guard = '#ifdef NVGPU_SCHEMA_TABLES\n'
+    head, _, _ = pre.rpartition(guard)
+    out = [head + c_drm_cmds(tables[0]) + guard]
     for t in tables:
         sym = c_sym(t)
         if t.planes:

@@ -28,6 +28,17 @@
 
 #include "nvgpu_wire.h"
 
+/*
+ * x86-64 only (Kconfig's `depends on X86_64`, which an out-of-tree build
+ * never reads, hence this): the fake PCI bus embeds x86's struct pci_sysdata,
+ * the 32-bit refusals (ADDFB2's) are right only where drm_ioc32.c converts
+ * what it does on x86, and memory registered by its pages goes as runs of
+ * 4 KiB pages, which the Rust parsers count in too (osdesc.rs PAGE_SIZE).
+ */
+#ifndef CONFIG_X86_64
+#error "virtio-gpu-nv supports x86-64 guests only (driver/Kconfig)"
+#endif
+
 struct drm_file;
 struct nvgpu_kms_file;
 
@@ -273,8 +284,7 @@ struct nvgpu_fd {
    */
   atomic_t armed;
   struct list_head node; /* dev->fds, for finding this by handle */
-  /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
-   * "not yet asked", which is why the counter starts at one. */
+  /* DRM files: the answer to GET_DRM_FILE_UNIQUE_ID, given at open, from 1. */
   u64 drm_unique_id;
   /*
    * Lifetime of `handle`. The opener holds one reference, and for a DRM file
@@ -962,6 +972,14 @@ void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id);
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 
 /* ── HOST_OP / WATCH / CLOSE ── */
+/* A HOST_OP result that names a backend handle: nonzero and 32-bit, into
+ * *h; false for anything else, which the caller answers -EPROTO. */
+static inline bool nvgpu_res_u32(u64 v, u32 *h) {
+  if (!v || v > U32_MAX)
+    return false;
+  *h = (u32)v;
+  return true;
+}
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
                   u32 nargs, u64 *res, u32 nres);
 /*
@@ -1227,8 +1245,10 @@ struct nvgpu_atomic_out {
  * From the ATOMIC special's phase 0: walk the commit's arrays in the call's
  * kernel copies, asking `ops` what its objects and properties are, reserving
  * the flip events and bridging the fences. 0 or -errno. `out->commit` is
- * written before any hook runs (both implementations; the difftest checks
- * what a hook sees), `out->values_buf` by the end.
+ * written before any hook runs (both implementations: the C at once, the
+ * Rust through atomic::Env::begin; the difftest checks what a hook sees),
+ * and is the flag's one source -- nvgpu_kms.c's hooks read it through their
+ * context; `out->values_buf` by the end.
  */
 int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
                        const struct nvgpu_atomic_ops *ops, void *ctx,

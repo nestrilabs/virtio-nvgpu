@@ -75,6 +75,7 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
+#include "gen/nvgpu_schema.h"
 #include "nvgpu.h"
 
 bool nvgpu_fences_enabled(struct nvgpu_device *dev) {
@@ -1784,6 +1785,31 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
   memcpy(karg, &a, sizeof(a));
   return ret;
 }
+
+/*
+ * The native commands and the structs this file builds are this kernel's
+ * (drm.h), and the host's schema must agree: the interpreter refuses any
+ * size but the schema's, so a guest kernel whose drm_syncobj_* grew would
+ * have every syncobj call fail -EINVAL at run time, with one warning line to
+ * say why. Asserted here instead, at build time, number (and so size) and
+ * all (the 2026-09-29 review, C3).
+ */
+#define NVGPU_SYNCOBJ_SCHEMA(name)                                             \
+  static_assert(DRM_IOCTL_##name == NVGPU_SCHEMA_CMD_##name,                  \
+                "DRM_IOCTL_" #name " differs from the IOCTL2 schema's")
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_CREATE);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_DESTROY);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_HANDLE_TO_FD);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_FD_TO_HANDLE);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_WAIT);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_RESET);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_SIGNAL);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_TIMELINE_WAIT);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_QUERY);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_TRANSFER);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_TIMELINE_SIGNAL);
+NVGPU_SYNCOBJ_SCHEMA(SYNCOBJ_EVENTFD);
+#undef NVGPU_SYNCOBJ_SCHEMA
 
 unsigned int nvgpu_fence_syncobj_cmd(unsigned int cmd) {
   static const unsigned int native[] = {
