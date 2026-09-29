@@ -220,7 +220,7 @@ int nvgpu_proc_init(struct nvgpu_device *dev) {
     /*
      * Only under /proc/driver/nvidia, which remove() takes down whole: an
      * entry anywhere else would outlive its data. The backend sends nothing
-     * else (device/src/nvidia.rs prefixes every path).
+     * else (device/src/nvidia/hostnodes.rs prefixes every path).
      */
     if (rec.path_len <= sizeof(NVGPU_PROC_ROOT) ||
         memcmp(rec.path, NVGPU_PROC_ROOT "/", sizeof(NVGPU_PROC_ROOT))) {

@@ -1430,7 +1430,7 @@ int nvgpu_unwatch(struct nvgpu_device *dev, u32 handle) {
  * a lease -- is closed now rather than surviving a guest reboot.
  *
  * An old backend answers -EPROTO, as it does to any message it does not know
- * (nvidia.rs:658-662), and the guest simply stays on v1: nothing in v2 is
+ * (device/src/session.rs), and the guest simply stays on v1: nothing in v2 is
  * needed for what v1 already does.
  */
 void nvgpu_xfer_hello(struct nvgpu_device *dev) {

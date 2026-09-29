@@ -556,7 +556,7 @@ impl Registrations {
             return Err(libc::EINVAL);
         }
         // Cookies at or below u32::MAX name legacy watches by handle (the
-        // guest routes them to an nvgpu_fd, nvgpu_xfer.c nvgpu_ev_record).
+        // guest routes them to an nvgpu_fd, nvgpu_events.c nvgpu_ev_record).
         if cookie <= u64::from(u32::MAX) {
             return Err(libc::EINVAL);
         }

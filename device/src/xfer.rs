@@ -1048,7 +1048,7 @@ impl Prepared {
                 // -- so the close would take the handle from under the guest
                 // proxy that owns it. The guest moves such an object into the
                 // target file itself, keeps it there, and names it by that
-                // handle (SEMSURF_FENCE_ATTACH, driver/nvgpu_fence.c).
+                // handle (SEMSURF_FENCE_ATTACH, driver/nvgpu_semsurf.c).
                 return Err(libc::EINVAL);
             } else if let std::collections::hash_map::Entry::Vacant(slot) = self.owners.entry(owner)
             {

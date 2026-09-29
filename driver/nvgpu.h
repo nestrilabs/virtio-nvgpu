@@ -576,7 +576,7 @@ void nvgpu_fd_put(struct nvgpu_fd *nfd);
  * GET_PROC_FILES, and GET_SYS_FILES' first section, are records of
  * {le32 path_len, le32 content_len, path, content}, unaligned, in a stream
  * with no header that ends where the device stopped writing, or at a record
- * with both lengths 0 (device/src/nvidia.rs, handle_get_files()).
+ * with both lengths 0 (device/src/nvidia/hostnodes.rs, handle_get_files()).
  */
 struct nvgpu_file_rec {
   const u8 *path;

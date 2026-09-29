@@ -26,7 +26,7 @@
 //! polling fallback (R:hyprguest §9). So [`HotplugListener`] listens on the
 //! kernel's uevent netlink group, picks out `change` events of our card nodes
 //! by major:minor, and hands them to the pump as `EV_HOTPLUG`, which the guest
-//! turns back into the same uevents on its own card (nvgpu_xfer.c).
+//! turns back into the same uevents on its own card (nvgpu_events.c).
 //!
 //! Joining the group needs no privilege: the uevent socket is created with
 //! `NL_CFG_F_NONROOT_RECV` (lib/kobject_uevent.c:779), which is what

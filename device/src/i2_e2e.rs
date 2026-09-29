@@ -1254,7 +1254,7 @@ fn a_syncobj_wait_reaches_the_host_as_a_poll_and_an_eventfd_never_does() {
     // SYNCOBJ_WAIT with a timeout far in the future, on one handle: the
     // backend's FENCES policy (policy.rs, fence.rs) hands the host a zero
     // timeout, and the host's -ETIME comes back as the call's answer -- the
-    // guest then sleeps on a registration of its own (nvgpu_fence.c).
+    // guest then sleeps on a registration of its own (nvgpu_syncobj.c).
     let mut w = world();
     let render = w.render;
     let mut a = vec![0u8; 40];

@@ -1382,7 +1382,7 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  *
  * Same 2-level serialisation pattern as RM_CONTROL/RM_ALLOC.
  * The backend gives the pointer at offset 8 a host address of its own for
- * the call (device/src/nvidia.rs, the NVKMS v1 path).
+ * the call (device/src/nvidia/v1.rs, serve_nvkms_v1).
  */
 
 /* NvKmsIoctlCommand: the one that names memory by a descriptor. */
