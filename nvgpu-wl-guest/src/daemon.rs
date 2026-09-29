@@ -227,14 +227,38 @@ impl LogLimit {
         out.push(line);
         out
     }
+}
 
-    /// Print `line` at `level`, within the limit. A line the level hides
-    /// is not counted against it.
-    fn say(&mut self, level: Level, line: String) {
+/// A [`LogLimit`] per call site, as the backend meters its lines: one limit
+/// for the whole daemon let one client's errors use up the burst, and the
+/// lines other clients caused (or the daemon's own, on accept) were dropped
+/// (the 2026-09-29 review, S11). A site is a line's fixed part, so what one
+/// client causes over and over can hide only more of the same.
+struct Logs {
+    sites: HashMap<&'static str, LogLimit>,
+}
+
+impl Logs {
+    fn new() -> Self {
+        Self {
+            sites: HashMap::new(),
+        }
+    }
+
+    /// What to print for `line` from `site` at `now`.
+    fn lines(&mut self, site: &'static str, line: String, now: Instant) -> Vec<String> {
+        self.sites
+            .entry(site)
+            .or_insert_with(LogLimit::new)
+            .lines(line, now)
+    }
+
+    /// Print `line` from `site` at `level`, within that site's limit.
+    fn say(&mut self, site: &'static str, level: Level, line: String) {
         if !log::enabled(level) {
             return;
         }
-        for l in self.lines(line, Instant::now()) {
+        for l in self.lines(site, line, Instant::now()) {
             eprintln!("{l}");
         }
     }
@@ -314,7 +338,7 @@ pub struct Daemon {
     hello_caps: u32,
     stop: Arc<AtomicBool>,
     totals: Arc<Mutex<Totals>>,
-    log: LogLimit,
+    log: Logs,
     /// Descriptors clients may hold between them, and how they are shared.
     fd_budget: u64,
     fd_share: Share,
@@ -325,6 +349,65 @@ pub struct Daemon {
     stream_bytes: Arc<budget::Bytes>,
     /// For owners the kernel cannot name.
     next_conn: u64,
+    /// Normal mode: the socket's lock file, flocked while the daemon runs,
+    /// and its path.
+    lock: Option<(std::fs::File, PathBuf)>,
+}
+
+/// The lock file a socket at `path` is taken under: libwayland's name for
+/// it, so the daemon and a compositor in the guest keep off each other's.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Take the socket name `path` as libwayland takes one (wl_display_add_socket):
+/// lock `<path>.lock` first, and only then remove what is at `path`, a
+/// socket its owner left behind. Before, the daemon removed whatever was
+/// there and bound: a second daemon, or a compositor on the same name, lost
+/// its socket to it, and the first daemon's exit removed the second's (the
+/// 2026-09-29 review, S10).
+fn take_socket(path: &Path) -> io::Result<(std::fs::File, PathBuf)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let lp = lock_path(path);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o660)
+        .open(&lp)?;
+    if lock.try_lock().is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "{} is in use: {} is locked (another nvgpu-wl-guest, or a compositor)",
+                path.display(),
+                lp.display()
+            ),
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        // A socket (or anything) its owner could write to, as libwayland
+        // decides; one that is not is left, and bind says why.
+        Ok(m) if m.permissions().mode() & 0o220 != 0 => std::fs::remove_file(path)?,
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok((lock, lp))
+}
+
+/// The socket and its lock go with the daemon that holds them, and only
+/// with it.
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some((_, lp)) = &self.lock {
+            let _ = std::fs::remove_file(&self.cfg.listen);
+            let _ = std::fs::remove_file(lp);
+        }
+    }
 }
 
 /// Descriptors the daemon keeps for itself, outside what clients may hold:
@@ -403,6 +486,7 @@ impl Daemon {
             listen_paused: None,
             stream_bytes: budget::Bytes::new(STREAM_BUDGET),
             next_conn: 0,
+            lock: None,
             clock: Arc::new(AtomicI64::new(info.clock_offset_ns)),
             last_clock: Instant::now(),
             info,
@@ -417,7 +501,7 @@ impl Daemon {
             hello_caps: 0,
             stop: Arc::new(AtomicBool::new(false)),
             totals: Arc::new(Mutex::new(Totals::default())),
-            log: LogLimit::new(),
+            log: Logs::new(),
         };
         if d.info.max_frame < frame::MIN_FRAME {
             return Err(io::Error::other(format!(
@@ -463,7 +547,7 @@ impl Daemon {
             if d.info.caps & uapi::CAP_SYNCOBJ != 0 {
                 d.hello_caps |= frame::HELLO_G_SYNCOBJ;
             }
-            let _ = std::fs::remove_file(&d.cfg.listen);
+            d.lock = Some(take_socket(&d.cfg.listen)?);
             let l = UnixListener::bind(&d.cfg.listen)?;
             l.set_nonblocking(true)?;
             epoll_ctl(
@@ -782,6 +866,7 @@ impl Daemon {
             // backlog until some other client lets go of descriptors.
             if self.fds_in_use(None).0 + FD_PER_CLIENT > self.fd_budget {
                 self.log.say(
+                    "fd budget",
                     Level::Warn,
                     format!(
                         "nvgpu-wl-guest: clients hold the daemon's {} descriptors; \
@@ -801,8 +886,11 @@ impl Daemon {
                     // stays in the backlog and every accept fails at once:
                     // the listener rests rather than spin, and the line is
                     // metered like any a client can cause.
-                    self.log
-                        .say(Level::Warn, format!("nvgpu-wl-guest: accept: {e}"));
+                    self.log.say(
+                        "accept",
+                        Level::Warn,
+                        format!("nvgpu-wl-guest: accept: {e}"),
+                    );
                     if matches!(
                         e.raw_os_error(),
                         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
@@ -812,15 +900,27 @@ impl Daemon {
                     return;
                 }
             };
-            let owner = match peer_pid(&s) {
-                Some(pid) => Owner::Pid(pid),
+            // The client's process, held by a pidfd (SO_PEERPIDFD), which
+            // names it and never a later process given its pid.
+            let (owner, pidfd) = match peer_pid(&s) {
+                Some(pid) => match crate::sys::peer_pidfd(s.as_raw_fd(), pid) {
+                    // Gone already (a kernel may give a pidfd for a process
+                    // that has exited): nobody to charge or serve.
+                    Ok(fd) if crate::sys::pidfd_exited(fd.as_raw_fd()) => continue,
+                    Ok(fd) => (Owner::Pid(pid), Some(fd)),
+                    // Gone already: nobody to charge, and nobody to serve.
+                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
+                    // A kernel without pidfds: the pid alone, as before.
+                    Err(_) => (Owner::Pid(pid), None),
+                },
                 None => {
                     self.next_conn += 1;
-                    Owner::Conn(self.next_conn)
+                    (Owner::Conn(self.next_conn), None)
                 }
             };
             if let Err((why, held)) = self.fds_admit(owner, FD_PER_CLIENT) {
                 self.log.say(
+                    "fd share",
                     Level::Warn,
                     format!(
                         "nvgpu-wl-guest: {owner:?} holds {held} of the daemon's {} descriptors \
@@ -837,15 +937,24 @@ impl Daemon {
             }
             // Charged to the client, not to the daemon: each guest process
             // holds only a share of the VM's channels and their budgets
-            // (NVGPU_WL_IOC_CONNECT_FOR).
+            // (NVGPU_WL_IOC_CONNECT_FOR). The kernel finds the process by
+            // its pid, so what it charged is the client's only if the client
+            // was still there after: a pid is given to another process only
+            // once its own has exited (the 2026-09-29 review, S7). A client
+            // that has, whichever process was charged, is dropped.
             let ch = match owner {
                 Owner::Pid(pid) => self.conn.connect_for(pid),
                 Owner::Conn(_) => self.conn.connect(uapi::CONNECT),
             };
+            let gone = pidfd
+                .as_ref()
+                .is_some_and(|p| crate::sys::pidfd_exited(p.as_raw_fd()));
             match ch {
+                Ok(_) if gone => {}
                 Ok(ch) => self.add_client(s, ch, Local::Client, owner),
                 Err(e) => {
                     self.log.say(
+                        "host channel",
                         Level::Warn,
                         format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"),
                     );
@@ -868,7 +977,11 @@ impl Daemon {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            match UnixStream::connect(&target) {
+            // Without waiting: a guest compositor whose backlog is full
+            // would otherwise stall this thread, and every client with it
+            // (the 2026-09-29 review, S12). The host client it was for is
+            // turned away rather than kept waiting.
+            match crate::sys::connect_nonblocking(&target) {
                 Ok(s) => {
                     // Each is a host client, which the guest kernel cannot
                     // name: an owner of its own.
@@ -877,6 +990,7 @@ impl Daemon {
                     self.add_client(s, ch, Local::Server, owner)
                 }
                 Err(e) => self.log.say(
+                    "export connect",
                     Level::Warn,
                     format!(
                         "nvgpu-wl-guest: cannot reach the guest compositor at {}: {e}",
@@ -898,6 +1012,7 @@ impl Daemon {
             .unwrap()
             .error(format!("{:?}: {text}", f.blame));
         self.log.say(
+            "closing",
             Level::Warn,
             format!(
                 "nvgpu-wl-guest: closing a connection: {:?}: {text:?}",
@@ -1031,6 +1146,7 @@ impl Daemon {
         let c = self.clients[slot].as_mut().unwrap();
         if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
             self.log.say(
+                "write",
                 Level::Warn,
                 format!("nvgpu-wl-guest: writing to a client: {e}"),
             );
@@ -1069,6 +1185,7 @@ impl Daemon {
                     // The host ended the connection; its reason, if any, is
                     // waiting in the channel.
                     self.log.say(
+                        "host refused",
                         Level::Warn,
                         format!("nvgpu-wl-guest: the host refused a frame: {e}"),
                     );
@@ -1107,8 +1224,11 @@ impl Daemon {
             let r = match c.chan.recv(max, card, render) {
                 Ok(r) => r,
                 Err(e) => {
-                    self.log
-                        .say(Level::Warn, format!("nvgpu-wl-guest: channel: {e}"));
+                    self.log.say(
+                        "channel",
+                        Level::Warn,
+                        format!("nvgpu-wl-guest: channel: {e}"),
+                    );
                     c.closing = true;
                     return;
                 }
@@ -1124,6 +1244,7 @@ impl Daemon {
                 let c = self.clients[slot].as_mut().unwrap();
                 if let Err(e) = c.engine.local_out().flush(c.sock.as_raw_fd()) {
                     self.log.say(
+                        "write",
                         Level::Warn,
                         format!("nvgpu-wl-guest: writing to a client: {e}"),
                     );
@@ -1183,6 +1304,7 @@ impl Daemon {
             let since = *c.stuck_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= STUCK_FOR {
                 self.log.say(
+                    "stuck",
                     Level::Warn,
                     format!(
                         "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
@@ -2115,5 +2237,208 @@ mod tests {
             t.error(format!("{i}"));
         }
         assert_eq!((t.errors.len(), t.error_count), (MAX_ERRORS, 1000));
+    }
+
+    /// One call site's burst is its own: a client whose errors use up the
+    /// limit of the line that closes connections hides no other line. Before,
+    /// one limit for the whole daemon dropped every other line too, the
+    /// accept failures that say the daemon is out of descriptors among them
+    /// (the 2026-09-29 review, S11).
+    #[test]
+    fn one_call_sites_lines_do_not_crowd_out_anothers() {
+        let mut l = Logs::new();
+        let t0 = Instant::now();
+        for i in 0..100 {
+            l.lines("closing", format!("closing: {i}"), t0);
+        }
+        assert!(l.lines("closing", "closing: more".into(), t0).is_empty());
+        assert_eq!(
+            l.lines("accept", "accept: out of descriptors".into(), t0),
+            vec!["accept: out of descriptors".to_string()]
+        );
+    }
+
+    /// A child of this test process, run for `role` against `sock`: it
+    /// connects, and exits at once or when killed.
+    const CHILD: &str = "NVWL_DAEMON_TEST_CHILD";
+
+    #[test]
+    fn a_child_that_connects() {
+        let Ok(v) = std::env::var(CHILD) else { return };
+        let (role, sock) = v.split_once(':').unwrap();
+        let _s = UnixStream::connect(sock).unwrap();
+        if role == "stay" {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    fn child(role: &str, sock: &Path) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "daemon::tests::a_child_that_connects"])
+            .env(CHILD, format!("{role}:{}", sock.display()))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// A host that records what the daemon opens, and runs `during` in the
+    /// middle of a CONNECT_FOR.
+    struct Recording {
+        opened: Arc<Mutex<Vec<String>>>,
+        during: Arc<Mutex<Option<std::process::Child>>>,
+    }
+
+    impl Connector for Recording {
+        fn info(&mut self) -> io::Result<HostInfo> {
+            BusyHost {
+                max_frame: 256 * 1024,
+                ..Default::default()
+            }
+            .info()
+        }
+        fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>> {
+            self.opened.lock().unwrap().push(format!("connect {mode}"));
+            BusyHost::default().connect(mode)
+        }
+        fn connect_for(&mut self, pid: i32) -> io::Result<Box<dyn Channel>> {
+            self.opened
+                .lock()
+                .unwrap()
+                .push(format!("connect_for {pid}"));
+            // The client's process goes while the kernel looks it up.
+            if let Some(mut c) = self.during.lock().unwrap().take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            BusyHost::default().connect(uapi::CONNECT)
+        }
+    }
+
+    /// A client whose process is gone by the time the daemon asks the
+    /// kernel for its channel -- before, or during -- is dropped, and no
+    /// channel is left charged to the daemon or to a process that reused
+    /// its pid. Before, CONNECT_FOR was asked for by pid number alone, and
+    /// a process the kernel could not find fell back to a plain CONNECT
+    /// charged to the daemon (the 2026-09-29 review, S7).
+    #[test]
+    fn a_client_whose_process_is_gone_gets_no_channel() {
+        let sock = socket_in_tmp("gone");
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let during = Arc::new(Mutex::new(None));
+        let mut d = Daemon::new(
+            Config::new(&sock),
+            Box::new(Recording {
+                opened: opened.clone(),
+                during: during.clone(),
+            }),
+        )
+        .unwrap();
+        // Gone before the accept.
+        assert!(child("go", &sock).wait().unwrap().success());
+        d.turn(100).unwrap();
+        assert!(opened.lock().unwrap().is_empty(), "{:?}", opened.lock());
+        assert!(d.clients.iter().all(|c| c.is_none()));
+        // Gone during CONNECT_FOR: asked for, and let go of.
+        let c = child("stay", &sock);
+        let pid = c.id();
+        *during.lock().unwrap() = Some(c);
+        for _ in 0..50 {
+            d.turn(20).unwrap();
+            if !opened.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(*opened.lock().unwrap(), vec![format!("connect_for {pid}")]);
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the client was dropped"
+        );
+    }
+
+    /// A second daemon on a socket name one already serves is refused, and
+    /// the first keeps its socket; the socket and its lock go with the
+    /// daemon that holds them, and a socket left behind by one that was
+    /// killed is taken over. Before, the second removed the first's socket
+    /// and bound its own (the 2026-09-29 review, S10).
+    #[test]
+    fn a_socket_name_is_taken_under_its_lock() {
+        let sock = socket_in_tmp("lock");
+        let host = || {
+            Box::new(BusyHost {
+                max_frame: 256 * 1024,
+                ..Default::default()
+            })
+        };
+        let mut first = Daemon::new(Config::new(&sock), host()).unwrap();
+        let e = Daemon::new(Config::new(&sock), host())
+            .err()
+            .expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
+        let _c = UnixStream::connect(&sock).unwrap();
+        first.turn(100).unwrap();
+        assert_eq!(
+            first.snapshot().clients,
+            1,
+            "the first still has its socket"
+        );
+        drop(first);
+        assert!(!sock.exists() && !lock_path(&sock).exists());
+        // One killed without removing its socket.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+        let mut again = Daemon::new(Config::new(&sock), host()).unwrap();
+        let _c = UnixStream::connect(&sock).unwrap();
+        again.turn(100).unwrap();
+        assert_eq!(again.snapshot().clients, 1);
+    }
+
+    /// A host whose export socket always has a client waiting.
+    struct ExportHost;
+
+    impl Connector for ExportHost {
+        fn info(&mut self) -> io::Result<HostInfo> {
+            Ok(HostInfo {
+                caps: uapi::CAP_EXPORT,
+                clock_offset_ns: 0,
+                max_frame: 256 * 1024,
+                devmap: Vec::new(),
+            })
+        }
+        fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>> {
+            let ready = sys::eventfd()?;
+            if mode == uapi::LISTEN {
+                sys::eventfd_signal(ready.as_raw_fd());
+            }
+            Ok(Box::new(BusyChannel {
+                sends: Default::default(),
+                asked: Default::default(),
+                ready,
+            }))
+        }
+    }
+
+    /// Export mode, a guest compositor whose backlog is full: the host
+    /// client is turned away and the daemon goes on. Before, the connect
+    /// blocked the daemon's only thread until the compositor accepted, and
+    /// every other client with it (the 2026-09-29 review, S12).
+    #[test]
+    fn a_guest_compositor_with_a_full_backlog_does_not_stall_the_daemon() {
+        let target = socket_in_tmp("full");
+        let own = socket_in_tmp("fullown");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _l = crate::sys::listen_unix(&target, 0).unwrap();
+            // The one connection a backlog of 0 holds.
+            let _first = UnixStream::connect(&target).unwrap();
+            let mut cfg = Config::new(&own);
+            cfg.export_to = Some(target.clone());
+            let mut d = Daemon::new(cfg, Box::new(ExportHost)).unwrap();
+            d.turn(100).unwrap();
+            let _ = tx.send(d.snapshot().clients);
+        });
+        let clients = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the daemon's turn came back");
+        assert_eq!(clients, 0, "the host client was turned away");
     }
 }

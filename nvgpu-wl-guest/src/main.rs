@@ -139,9 +139,7 @@ fn main() {
         }
         stop.store(true, Ordering::Relaxed);
         d.run().map_err(|e| e.to_string())?;
-        if cfg.export_to.is_none() {
-            let _ = std::fs::remove_file(&cfg.listen);
-        }
+        // Dropping the daemon removes its socket and the socket's lock.
         Ok(())
     };
     if let Err(e) = run() {

@@ -63,7 +63,8 @@ pub trait Connector {
     fn connect(&mut self, mode: u32) -> io::Result<Box<dyn Channel>>;
     /// A connection to the host compositor for the client process `pid`,
     /// charged to it rather than to the daemon. A kernel that predates it is
-    /// asked for a plain CONNECT.
+    /// asked for a plain CONNECT; a process the kernel cannot find is
+    /// refused (`ESRCH`).
     fn connect_for(&mut self, _pid: i32) -> io::Result<Box<dyn Channel>> {
         self.connect(uapi::CONNECT)
     }
@@ -156,11 +157,16 @@ impl Connector for DevConnector {
                 file,
                 rbuf: Vec::new(),
             })),
-            // An older kernel, or a client already gone: the daemon's own.
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTTY | libc::ESRCH)) => {
+            // A kernel that predates CONNECT_FOR: the daemon's own, and every
+            // client shares the daemon's share of the VM's channels, as
+            // before it existed.
+            Err(e) if e.raw_os_error() == Some(libc::ENOTTY) => {
                 drop(file);
                 self.connect(uapi::CONNECT)
             }
+            // ESRCH, the client's process gone before the kernel looked it
+            // up, is refused: charged to the daemon, it would have been a
+            // channel nobody's share bounds (the 2026-09-29 review, S7).
             Err(e) => Err(e),
         }
     }
