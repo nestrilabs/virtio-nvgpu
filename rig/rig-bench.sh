@@ -25,8 +25,8 @@
 #
 # Results: $NVGPU_RIG/logs/bench/<tag>/<mode>-<n>.bench, the BENCH lines;
 # for a guest also <mode>-<n>.cpu, the backend's and the VMM's CPU time per
-# suite group (sampled from /proc every 100 ms, charged by the host time at
-# which each group's BENCH-SECTION line reached the console), and
+# suite group (sampled from /proc every 100 ms, charged by when each group's
+# BENCH-SECTION lines say it began and ended), and
 # <mode>-<n>.pacing, both sides' pacing counters. rig/bench-stats.py makes
 # the table.
 set -uo pipefail
@@ -57,9 +57,18 @@ stat_ticks() { # the utime + stime of a process, all its threads, in clock ticks
     [ -n "$1" ] && awk '{ sub(/^.*\) /, ""); print $12 + $13 }' "/proc/$1/stat" 2>/dev/null || echo 0
 }
 
+# The image's media and scripts, where the suite finds them natively.
+phys() { for b in "$HOME/.local/share/nix/root" ""; do [ -e "$b$1" ] && { echo "$b$1"; return; }; done; echo "$1"; }
+APPS=$(readlink "$(phys "$(readlink "$RIG/guest/result")")/opt/nvgpu/apps")
+
 run_native() { # run_native N
+    # Without XDG_DATA_DIRS, as the guest's probes run: `nix shell` points it
+    # at the image's share/, where MangoHud's and gamescope's implicit Vulkan
+    # layers are, which the guest's loader never finds (vulkaninfo took twice
+    # as long natively with them).
     # shellcheck disable=SC2086 # the groups are words
-    "$REPO/rig/rig-native-run.sh" --timeout "$BUDGET" -- "$SUITE" $GROUPS_ >"$OUT/native-$1.log" 2>&1
+    "$REPO/rig/rig-native-run.sh" --timeout "$BUDGET" -- env -u XDG_DATA_DIRS NVGPU_APPS="$APPS" \
+        "$SUITE" $GROUPS_ >"$OUT/native-$1.log" 2>&1
     grep -a '^BENCH' "$OUT/native-$1.log" >"$OUT/native-$1.bench"
 }
 
@@ -89,7 +98,7 @@ run_vm() { # run_vm N
     local sampler=$!
     (
         for i in $(seq 1 100); do [ -e "$console" ] && break; sleep 0.2; done
-        tail -n +1 -F --pid="$launcher" "$console" 2>/dev/null | tr -d '\r' | while IFS= read -r l; do
+        tail -s 0.05 -n +1 -F --pid="$launcher" "$console" 2>/dev/null | tr -d '\r' | while IFS= read -r l; do
             case $l in *BENCH-SECTION*) echo "$(date +%s.%N) ${l#*BENCH-SECTION }" ;; esac
         done
     ) >"$OUT/vm-$1.sections" &
@@ -102,16 +111,7 @@ run_vm() { # run_vm N
         tr -d '\r' <"$console" | sed -n '/^BENCH_PACING_BEGIN/,/^BENCH_PACING_END/p' | sed '1d;$d' | sed 's/^/guest: /'
         grep -a 'pacing:' "$RIG/logs/$tag.backend.log" | sed 's/^.*\] //'
     } >"$OUT/vm-$1.pacing"
-    # CPU per section: ticks at the section's end less at its begin.
-    local hz; hz=$(getconf CLK_TCK)
-    awk -v hz="$hz" '
-        FNR == NR { t[++n] = $1; b[n] = $2; v[n] = $3; next }
-        function at(x, arr,   i) { for (i = 1; i <= n; i++) if (t[i] >= x) return arr[i]; return arr[n] }
-        $2 == "begin" { s[$3] = $1 }
-        $2 == "end" && ($3 in s) {
-            dt = $1 - s[$3]
-            printf "BENCH cpu.%s_backend %.1f %%\nBENCH cpu.%s_vmm %.1f %%\n", $3, (at($1, b) - at(s[$3], b)) / hz / dt * 100, $3, (at($1, v) - at(s[$3], v)) / hz / dt * 100
-        }' "$OUT/vm-$1.samples" "$OUT/vm-$1.sections" >"$OUT/vm-$1.cpu"
+    python3 "$REPO/rig/bench-cpu.py" "$OUT/vm-$1.samples" "$OUT/vm-$1.sections" >"$OUT/vm-$1.cpu"
     cat "$OUT/vm-$1.cpu" >>"$OUT/vm-$1.bench"
     cp "$RIG/logs/$tag.backend.log" "$OUT/vm-$1.backend.log" 2>/dev/null
     cp "$console" "$OUT/vm-$1.console.log" 2>/dev/null
