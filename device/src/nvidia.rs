@@ -5404,7 +5404,7 @@ impl NvidiaBackend {
         let hdr = MsgHeader {
             msg_type: self.current_msg as u32,
             handle,
-            status,
+            status: crate::session::wire_status(status),
             req_id: self.current_req_id,
         };
         write_struct(resp_buf, &hdr)
@@ -5477,7 +5477,7 @@ impl NvidiaBackend {
             &MsgHeader {
                 msg_type: self.current_msg as u32,
                 handle: self.current_handle,
-                status,
+                status: crate::session::wire_status(status),
                 req_id: self.current_req_id,
             },
         );

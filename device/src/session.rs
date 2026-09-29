@@ -470,9 +470,23 @@ pub(crate) fn hdr(t: MsgType, handle: u32, status: i32, req_id: u32) -> Vec<u8> 
     let mut b = Vec::with_capacity(HDR);
     b.extend_from_slice(&(t as u32).to_le_bytes());
     b.extend_from_slice(&handle.to_le_bytes());
-    b.extend_from_slice(&status.to_le_bytes());
+    b.extend_from_slice(&wire_status(status).to_le_bytes());
     b.extend_from_slice(&req_id.to_le_bytes());
     b
+}
+
+/// A reply's status as it may go on the wire: 0, or an errno the kernel
+/// knows (-1 to -MAX_ERRNO); anything else -- a positive value, which the
+/// guest's v1 paths hand straight to userspace as an ioctl's result -- is
+/// EPROTO, as the guest's IOCTL2 path already clamps it (review 2026-09-29
+/// parity #40, the backend's half).
+pub(crate) fn wire_status(status: i32) -> i32 {
+    const MAX_ERRNO: i32 = 4095;
+    if status == 0 || (-MAX_ERRNO..0).contains(&status) {
+        status
+    } else {
+        -libc::EPROTO
+    }
 }
 
 fn read<T: crate::sys::pod::Pod + Copy>(payload: &[u8]) -> Option<T> {
@@ -1240,6 +1254,12 @@ mod tests {
 
     #[test]
     fn v2_messages_are_refused_until_hello_as_an_old_backend_would() {
+        // (And a status is never one the guest could take for a result.)
+        assert_eq!(wire_status(0), 0);
+        assert_eq!(wire_status(-libc::EINVAL), -libc::EINVAL);
+        for bad in [1, 4096 * 2, -4096, i32::MIN, -i32::MAX] {
+            assert_eq!(wire_status(bad), -libc::EPROTO, "{bad}");
+        }
         let mut be = backend();
         let r = call(&mut be, MsgType::TimeSync, 0, &[]);
         assert_eq!(status(&r), -libc::EPROTO);

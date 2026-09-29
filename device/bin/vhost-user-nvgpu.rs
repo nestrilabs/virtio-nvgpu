@@ -2443,14 +2443,19 @@ mod tests {
         let mut be = test_backend();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let s2 = seen.clone();
+        // Open before the scan, and so registered by it: the start sees
+        // that done. (A descriptor the start opens itself is no test here:
+        // the scan takes every other test thread's too, and one of those
+        // numbers may come back.)
+        let plumbing = device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap();
+        let raw = plumbing.as_raw_fd();
         be.after_scan.push(Box::new(move || {
-            // A peer's descriptor, as an accept thread would take one.
-            let fd = device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap();
-            s2.lock().unwrap().push(privfd::is_private(fd.as_raw_fd()));
+            s2.lock().unwrap().push(privfd::is_private(raw));
         }));
         assert!(seen.lock().unwrap().is_empty(), "not before the scan");
         be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![false]);
+        assert_eq!(*seen.lock().unwrap(), vec![true], "after it");
+        drop(plumbing);
         be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1, "once");
     }
