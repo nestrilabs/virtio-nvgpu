@@ -472,6 +472,49 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
 
 /* The driver range past its three special cases, on the kernel copy `k` of
  * the argument, `cmd` the native command (nvgpu_drm_driver_cmd()). */
+/*
+ * GEM_ALLOC_NVKMS_MEMORY is flat -- every field is a value -- so the whole
+ * struct goes across and the answer comes back into it; the host's handle
+ * never reaches userspace, a proxy stands in for it.
+ */
+static long nvgpu_gem_alloc_nvkms(struct nvgpu_fd *nfd, struct drm_file *file,
+                                  unsigned int cmd, void *k) {
+  /*
+   * u32 handle OUT, u8 block_linear, u8 compressible, u16 pad,
+   * u64 memory_size IN, u32 flags, u32 pad
+   */
+  struct {
+    __u32 handle;
+    __u8 block_linear;
+    __u8 compressible;
+    __u16 pad0;
+    __u64 memory_size;
+    __u32 flags;
+    __u32 pad1;
+  } p;
+  u32 guest_handle;
+  long ret;
+
+  BUILD_BUG_ON(sizeof(p) != 24);
+  /* A copy of its own: a failed call leaves the caller's bytes as they
+   * were, never a host handle number. */
+  memcpy(&p, k, sizeof(p));
+  ret = nvgpu_ioctl_flat(nfd->dev, nfd->handle, cmd, &p, sizeof(p),
+                         NVGPU_FLAT_WHOLE, NULL);
+  if (ret < 0)
+    return ret;
+
+  /* On failure the proxy code has closed the host handle already. */
+  ret = nvgpu_gem_proxy_create_new(file, nfd, p.handle, p.memory_size,
+                                   &guest_handle);
+  if (ret)
+    return ret;
+
+  p.handle = guest_handle;
+  memcpy(k, &p, sizeof(p));
+  return 0;
+}
+
 static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
                                    struct drm_file *file, unsigned int cmd,
                                    void *k) {
@@ -519,49 +562,9 @@ static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
     return 0;
   }
 
-  /*
-   * ── GEM: forwarded to the host's render node ──
-   *
-   * ALLOC is flat -- every field is a value -- so the whole struct goes
-   * across and the answer comes back into it.
-   */
-  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: {
-    /*
-     * u32 handle OUT, u8 block_linear, u8 compressible, u16 pad,
-     * u64 memory_size IN, u32 flags, u32 pad
-     */
-    struct {
-      __u32 handle;
-      __u8 block_linear;
-      __u8 compressible;
-      __u16 pad0;
-      __u64 memory_size;
-      __u32 flags;
-      __u32 pad1;
-    } p;
-    u32 guest_handle;
-    long ret;
-
-    BUILD_BUG_ON(sizeof(p) != 24);
-    /* A copy of its own: a failed call leaves the caller's bytes as they
-     * were, never a host handle number. */
-    memcpy(&p, k, sizeof(p));
-    ret = nvgpu_ioctl_flat(nfd->dev, nfd->handle, cmd, &p, sizeof(p),
-                           NVGPU_FLAT_WHOLE, NULL);
-    if (ret < 0)
-      return ret;
-
-    /* The host's handle never reaches userspace; a proxy stands in for it.
-     * On failure the proxy code has closed the host handle already. */
-    ret = nvgpu_gem_proxy_create_new(file, nfd, p.handle, p.memory_size,
-                                     &guest_handle);
-    if (ret)
-      return ret;
-
-    p.handle = guest_handle;
-    memcpy(k, &p, sizeof(p));
-    return 0;
-  }
+  /* ── GEM: forwarded to the host's render node ── */
+  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY:
+    return nvgpu_gem_alloc_nvkms(nfd, file, cmd, k);
 
   /*
    * These two carry a pointer to an NVKMS parameter block. The guest's
@@ -1478,6 +1481,90 @@ static long nvgpu_gem_identify(struct drm_file *file, void *karg) {
  * in the length being a u64, which is why they are described by a
  * nvgpu_gem_nested_desc rather than hard-coded.
  */
+/*
+ * NVKMS names the memory by an open file. Our descriptor is not the
+ * backend's, so it goes across as the handle the backend issued when we
+ * opened that file, and the backend turns it back into one of its own
+ * descriptors before making the call -- the same round trip
+ * EXPORT_OBJECT_TO_FD already makes for RM. The guest's own value is put
+ * back by the backend before it answers, so userspace reads back the
+ * descriptor it passed. `nested` is the request's copy of the block.
+ */
+static int nvgpu_gem_nested_fd_in(struct nvgpu_fd *nfd, unsigned int cmd,
+                                  const struct nvgpu_gem_nested_desc *d,
+                                  void *nested, u32 nested_size) {
+  int guest_fd, ret;
+  u32 handle;
+
+  if (d->fd_offset == NVGPU_GEM_NO_FD || nested_size < (u32)d->fd_offset + 4)
+    return 0;
+  guest_fd = (int)get_unaligned_le32(nested + d->fd_offset);
+  ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle);
+  if (ret) {
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
+                        "fd %d, which is not one of our devices\n",
+                        _IOC_NR(cmd), guest_fd);
+    return ret;
+  }
+  put_unaligned_le32(handle, nested + d->fd_offset);
+  return 0;
+}
+
+/*
+ * A reply whose status is not an errno: nothing goes back (-EPROTO), but a
+ * positive one is not a refusal, and a GEM handle the host made for the
+ * caller would stay open in the render file `fwd_handle` until it closes.
+ * Closed here, unless it is a proxy's (a handle the file already had, S-11).
+ */
+static void nvgpu_gem_nested_unread(struct nvgpu_fd *nfd,
+                                    const struct nvgpu_gem_nested_desc *d,
+                                    u32 fwd_handle, const u8 *resp_buf,
+                                    const struct nvgpu_ioctl_reply *r) {
+  u32 h;
+
+  if (r->raw <= 0 || !d->handle_is_out ||
+      d->handle_offset == NVGPU_GEM_NO_FIELD || r->data_len > d->size ||
+      (u32)d->handle_offset + 4 > r->data_len ||
+      !nvgpu_resp_has(r->used, sizeof(struct nvgpu_ioctl_resp), r->data_len))
+    return;
+  h = get_unaligned_le32(resp_buf + sizeof(struct nvgpu_ioctl_resp) +
+                         d->handle_offset);
+  if (h && !nvgpu_gem_handle_held(nfd->dev, fwd_handle, h))
+    nvgpu_gem_close(nfd->dev, fwd_handle, h);
+}
+
+/*
+ * The GEM handle in the reply's outer struct `out`, as the caller is to read
+ * it. A handle the host made gets a proxy before the caller sees anything:
+ * the host's handle means nothing in this guest, and the core's PRIME and
+ * GEM_CLOSE paths need an object of ours to work on (0, or the proxy's
+ * failure, which has closed the host handle already). A handle the caller
+ * passed is given back as it passed it, not as the host's.
+ */
+static int nvgpu_gem_nested_handle_out(struct nvgpu_fd *nfd,
+                                       struct drm_file *file,
+                                       const struct nvgpu_gem_nested_desc *d,
+                                       u8 *out, u32 caller_handle) {
+  u32 host_handle, guest_handle;
+  u64 obj_size = 0;
+  int ret;
+
+  if (!d->handle_is_out) {
+    put_unaligned_le32(caller_handle, out + d->handle_offset);
+    return 0;
+  }
+  host_handle = get_unaligned_le32(out + d->handle_offset);
+  if (d->size_field_offset != NVGPU_GEM_NO_FIELD)
+    obj_size = get_unaligned_le64(out + d->size_field_offset);
+  ret = nvgpu_gem_proxy_create_new(file, nfd, host_handle, (size_t)obj_size,
+                                   &guest_handle);
+  if (ret)
+    return ret;
+  put_unaligned_le32(guest_handle, out + d->handle_offset);
+  return 0;
+}
+
 static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
                                        struct drm_file *file, unsigned int cmd,
                                        void *karg,
@@ -1570,33 +1657,10 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       ret = -EFAULT;
       goto out;
     }
-
-    /*
-     * NVKMS names the memory by an open file. Our descriptor is not the
-     * backend's, so it goes across as the handle the backend issued when we
-     * opened that file, and the backend turns it back into one of its own
-     * descriptors before making the call -- the same round trip
-     * EXPORT_OBJECT_TO_FD already makes for RM.
-     *
-     * The guest's own value is put back by the backend before it answers, so
-     * userspace reads back the descriptor it passed.
-     */
-    if (d->fd_offset != NVGPU_GEM_NO_FD &&
-        nested_size >= (u32)d->fd_offset + 4) {
-      void *nested = req_buf + sizeof(*req) + d->size;
-      int guest_fd = (int)get_unaligned_le32(nested + d->fd_offset);
-      u32 handle;
-
-      ret = nvgpu_handle_for_fd(nfd->dev, guest_fd, &handle);
-      if (ret) {
-        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                            "virtio-gpu-nv: nvidia-drm ioctl nr=0x%02x names "
-                            "fd %d, which is not one of our devices\n",
-                            _IOC_NR(cmd), guest_fd);
-        goto out;
-      }
-      put_unaligned_le32(handle, nested + d->fd_offset);
-    }
+    ret = nvgpu_gem_nested_fd_in(nfd, cmd, d, req_buf + sizeof(*req) + d->size,
+                                 nested_size);
+    if (ret)
+      goto out;
   }
 
   if (held) {
@@ -1611,22 +1675,8 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   if (ret < 0)
     goto out;
   ret = nvgpu_ioctl_reply_parse(resp_buf, used, &r);
-  /*
-   * A status that is not an errno: nothing goes back (-EPROTO), but a
-   * positive one is not a refusal, and a GEM handle the host made for the
-   * caller would stay open in the render file until it closes. Closed here,
-   * unless it is a proxy's (a handle the file already had, S-11).
-   */
-  if (ret == -EPROTO && r.raw > 0 && d->handle_is_out &&
-      d->handle_offset != NVGPU_GEM_NO_FIELD && r.data_len <= d->size &&
-      (u32)d->handle_offset + 4 <= r.data_len &&
-      nvgpu_resp_has(used, sizeof(struct nvgpu_ioctl_resp), r.data_len)) {
-    u32 h = get_unaligned_le32(resp_buf + sizeof(struct nvgpu_ioctl_resp) +
-                               d->handle_offset);
-
-    if (h && !nvgpu_gem_handle_held(nfd->dev, fwd_handle, h))
-      nvgpu_gem_close(nfd->dev, fwd_handle, h);
-  }
+  if (ret == -EPROTO)
+    nvgpu_gem_nested_unread(nfd, d, fwd_handle, resp_buf, &r);
   if (ret < 0)
     goto out;
 
@@ -1646,35 +1696,14 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
     u8 *out = resp_buf + sizeof(*resp);
 
     if (d->handle_offset != NVGPU_GEM_NO_FIELD && ret >= 0) {
-      if (d->handle_is_out) {
-        /*
-         * The host made an object. Stand a proxy in front of it before the
-         * caller sees anything: the host's handle means nothing in this
-         * guest, and the core's PRIME and GEM_CLOSE paths need an object of
-         * ours to work on.
-         */
-        u32 host_handle = get_unaligned_le32(out + d->handle_offset);
-        u64 obj_size = 0;
-        u32 guest_handle;
-        int cret;
+      int cret = nvgpu_gem_nested_handle_out(nfd, file, d, out,
+                                             caller_handle);
 
-        if (d->size_field_offset != NVGPU_GEM_NO_FIELD)
-          obj_size = get_unaligned_le64(out + d->size_field_offset);
-
-        /* A failure has closed the host handle already. */
-        cret = nvgpu_gem_proxy_create_new(file, nfd, host_handle,
-                                          (size_t)obj_size, &guest_handle);
-        if (cret) {
-          ret = cret;
-          goto out;
-        }
-        put_unaligned_le32(guest_handle, out + d->handle_offset);
-      } else {
-        /* The caller reads back the handle it passed, not the host's. */
-        put_unaligned_le32(caller_handle, out + d->handle_offset);
+      if (cret) {
+        ret = cret;
+        goto out;
       }
     }
-
     memcpy(karg, out, data_len);
   }
 
