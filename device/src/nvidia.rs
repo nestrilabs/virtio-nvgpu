@@ -5012,7 +5012,11 @@ impl NvidiaBackend {
         let built = self
             .top_block(&mut a, request, param_in, &crate::guestptr::Plan::default())
             .and_then(|top| {
-                a.value(top, 16, 8, Restore::No)?;
+                // RM does not write NVOS34.pLinearAddress and nvidia.ko
+                // copies the block back, so the caller reads its own value,
+                // as on the not-found path and as L-6 did for
+                // UPDATE_DEVICE_MAPPING_INFO (review 2026-09-29 2.4).
+                a.value(top, 16, 8, Restore::Yes)?;
                 a.set_value(top, 16, entry.host_p_linear_address)?;
                 Ok(top)
             });
@@ -5029,7 +5033,7 @@ impl NvidiaBackend {
             self.active_maps.insert(entry.region.offset, entry);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
-        let mut param_buf = a.reply(top)[..param_in.len()].to_vec();
+        let param_buf = a.reply(top)[..param_in.len()].to_vec();
         drop(a);
 
         let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
@@ -5054,8 +5058,6 @@ impl NvidiaBackend {
             self.active_maps.insert(entry.region.offset, entry);
         }
 
-        // Zero pLinearAddress in response — guest doesn't need it
-        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
@@ -7982,6 +7984,32 @@ mod mapping_tests {
     /// window offset, find none, and leave the extent charged until the
     /// memory was freed; now the zone ends exactly where it started, and so
     /// does the host.
+    /// UNMAP_MEMORY gives the caller its own pLinearAddress back, found or
+    /// not: RM does not write it and nvidia.ko copies the block back
+    /// (review 2026-09-29 2.4). The found path zeroed it.
+    #[test]
+    fn an_unmap_gives_the_caller_its_own_address_back() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let (_, _, off) = e.map_as(ctl, p(1), VIDMEM);
+        let unmap = |e: &mut Env, linear: u64| {
+            let mut q = vec![0u8; 32];
+            put(&mut q, 0, CLIENT);
+            put(&mut q, 4, DEVICE);
+            put(&mut q, 8, VIDMEM);
+            q[16..24].copy_from_slice(&linear.to_le_bytes());
+            let back = e.call(ctl, NV_ESC_RM_UNMAP_MEMORY, &q, &[]);
+            (
+                rd(&back, 24),
+                u64::from_le_bytes(back[16..24].try_into().unwrap()),
+            )
+        };
+        assert_eq!(unmap(&mut e, off), (0, off), "found");
+        assert!(host_maps().is_empty());
+        let (_, again) = unmap(&mut e, off);
+        assert_eq!(again, off, "not found");
+    }
+
     #[test]
     fn an_unmap_by_the_address_an_update_gave_returns_the_zone_exactly() {
         let mut e = env();
