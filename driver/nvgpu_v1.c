@@ -8,14 +8,13 @@
  * and the difftest compiles this file with the C parsers, so both read a
  * reply alike.
  *
- * The status is sanitised here, once: a reply's status is the backend's word
- * on what the call returned, 0 or a negative errno. Anything else -- positive,
- * or below -MAX_ERRNO -- would reach the caller as an ioctl result no native
- * driver returns (a positive one is not even an error to the C library), so it
- * fails the call with -EPROTO, its payload unread, as IOCTL2 treats one
- * (nvgpu_i2.c) -- a reply this side does not understand, like one too short
- * to hold a header (-EIO). Before this each copy of the exchange returned the
- * raw s32, and some copied the payload back beside it.
+ * The status is sanitised here, once for every v1 path: a reply's status is
+ * the backend's word on what the call returned, 0 or a negative errno.
+ * Anything else (nvgpu_status_valid()) would reach the caller as an ioctl
+ * result no native driver returns (a positive one is not even an error to the
+ * C library), so it fails the call with -EPROTO, its payload unread, as IOCTL2
+ * treats one -- a reply this side does not understand, like one too short to
+ * hold a header (-EIO).
  */
 
 #include <linux/err.h>
@@ -55,7 +54,7 @@ int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
     r->nested_len = le32_to_cpu(h->nested_len);
     r->deep_len = le32_to_cpu(h->deep_len);
   }
-  if (status > 0 || status < -MAX_ERRNO) {
+  if (!nvgpu_status_valid(status)) {
     r->status = -EPROTO;
     return -EPROTO;
   }

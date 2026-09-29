@@ -10,6 +10,7 @@
 #include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/completion.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/kobject.h>
 #include <linux/kref.h>
@@ -18,6 +19,7 @@
 #include <linux/pci.h>
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
@@ -1103,6 +1105,45 @@ u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev);
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle);
 
 /* ── IOCTL2 interpreter (nvgpu_i2.c) ── */
+
+/*
+ * A reply header's status is the backend's word on what the call returned: 0
+ * or a -errno. Anything else -- positive, or below -MAX_ERRNO -- would reach
+ * the caller as an ioctl result no native driver returns, so every reader of
+ * a status fails it with -EPROTO (IOCTL2 here and in nvgpu_kms.c, the v1
+ * exchange in nvgpu_v1.c, the fixed messages in nvgpu_xfer.c).
+ */
+static inline bool nvgpu_status_valid(s32 status) {
+  return status <= 0 && status >= -MAX_ERRNO;
+}
+
+/*
+ * The fixed head of an IOCTL2 request and of its reply. The interpreter
+ * builds the one and reads the other (nvgpu_i2.c; i2.rs's build() and
+ * parse()), and so does nvgpu_kms.c for the calls it makes of its own.
+ */
+struct nvgpu_i2_head {
+  struct nvgpu_msg_hdr hdr;
+  struct nvgpu_i2_req req;
+} __packed;
+
+struct nvgpu_i2_rhead {
+  struct nvgpu_msg_hdr hdr;
+  struct nvgpu_i2_resp resp;
+} __packed;
+
+/* Everything of the head but the record counts, which start at 0. */
+static inline void nvgpu_i2_head_init(struct nvgpu_i2_head *h, u32 handle,
+                                      unsigned int cmd, u32 render, u32 nbuf,
+                                      u32 data_len) {
+  memset(h, 0, sizeof(*h));
+  h->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL2);
+  h->hdr.handle = cpu_to_le32(handle);
+  h->req.cmd = cpu_to_le32(cmd);
+  h->req.nbuf = cpu_to_le32(nbuf);
+  h->req.data_len = cpu_to_le32(data_len);
+  h->req.render = cpu_to_le32(render);
+}
 
 /* Schema classes: which kind of host file the call targets. */
 #define NVGPU_SCLASS_RENDER 1

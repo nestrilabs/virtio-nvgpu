@@ -1030,8 +1030,7 @@ int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
 
 /*
  * Status of a reply that must at least carry a header: 0 or a -errno, and
- * -EPROTO for anything else, which no call of ours may return (as
- * nvgpu_ioctl_reply_parse() and IOCTL2 have it).
+ * -EPROTO for anything else (nvgpu_status_valid()).
  */
 static int nvgpu_hdr_status(const void *resp, u32 used) {
   const struct nvgpu_msg_hdr *h = resp;
@@ -1040,7 +1039,7 @@ static int nvgpu_hdr_status(const void *resp, u32 used) {
   if (used < sizeof(*h))
     return -EIO;
   status = (s32)le32_to_cpu(h->status);
-  return status > 0 || status < -MAX_ERRNO ? -EPROTO : status;
+  return nvgpu_status_valid(status) ? status : -EPROTO;
 }
 
 /* ───────── CLOSE, GEM_CLOSE and their async twins ───────── */
@@ -1579,18 +1578,22 @@ static void nvgpu_req_reap_work(struct work_struct *work) {
 
 /* ───────── HOST_OP, WATCH, UNWATCH ───────── */
 
-int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
-                  u32 nargs, u64 *res, u32 nres) {
+/*
+ * One HOST_OP into `resp` (`resp_len` bytes: the header, the fixed part, and
+ * whatever tail the caller has room for), its results into res[0..nres).
+ * 0 with *used the bytes the device wrote, or -errno.
+ */
+static int nvgpu_host_op_into(struct nvgpu_device *dev, u32 op,
+                              const u64 *args, u32 nargs, u64 *res, u32 nres,
+                              void *resp, size_t resp_len, u32 *used) {
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_req body;
     struct nvgpu_proc_id proc;
   } __packed req = {};
-  struct {
-    struct nvgpu_msg_hdr hdr;
-    struct nvgpu_host_op_resp body;
-  } __packed resp;
-  u32 used, got, i, req_len = sizeof(req);
+  const struct nvgpu_host_op_resp *a =
+      (const void *)((u8 *)resp + sizeof(struct nvgpu_msg_hdr));
+  u32 got, i, req_len = sizeof(req);
   int ret;
 
   if (!dev->v2)
@@ -1609,82 +1612,58 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   else
     req_len -= sizeof(req.proc);
 
-  ret = nvgpu_call(dev, &req, req_len, &resp, sizeof(resp), 0, &used,
-                   NULL, NULL);
+  ret = nvgpu_call(dev, &req, req_len, resp, resp_len, 0, used, NULL, NULL);
   if (ret)
     return ret;
-  ret = nvgpu_hdr_status(&resp, used);
+  ret = nvgpu_hdr_status(resp, *used);
   if (ret == -EPROTO)
-    nvgpu_host_op_unread(dev, op, args, nargs, &resp.hdr, &resp.body, used);
+    nvgpu_host_op_unread(dev, op, args, nargs, resp, a, *used);
   if (ret < 0)
     return ret;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp)))
+  if (!nvgpu_resp_has(*used, 0, sizeof(struct nvgpu_msg_hdr) + sizeof(*a)))
     return -EIO;
 
-  got = min_t(u32, le32_to_cpu(resp.body.nres), NVGPU_OP_MAX_RES);
+  got = min_t(u32, le32_to_cpu(a->nres), NVGPU_OP_MAX_RES);
   for (i = 0; i < nres; i++)
-    res[i] = i < got ? le64_to_cpu(resp.body.res[i]) : 0;
+    res[i] = i < got ? le64_to_cpu(a->res[i]) : 0;
   return 0;
+}
+
+int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
+                  u32 nargs, u64 *res, u32 nres) {
+  struct {
+    struct nvgpu_msg_hdr hdr;
+    struct nvgpu_host_op_resp body;
+  } __packed resp;
+  u32 used;
+
+  return nvgpu_host_op_into(dev, op, args, nargs, res, nres, &resp,
+                            sizeof(resp), &used);
 }
 
 int nvgpu_host_op_tail(struct nvgpu_device *dev, u32 op, const u64 *args,
                        u32 nargs, u64 *res, u32 nres, void *tail,
                        u32 tail_len, u32 *tail_used) {
-  struct {
-    struct nvgpu_msg_hdr hdr;
-    struct nvgpu_host_op_req body;
-    struct nvgpu_proc_id proc;
-  } __packed req = {};
   const size_t fixed =
       sizeof(struct nvgpu_msg_hdr) + sizeof(struct nvgpu_host_op_resp);
-  const struct nvgpu_host_op_resp *a;
-  u32 used, got, i, req_len = sizeof(req);
+  u32 used;
   u8 *resp;
   int ret;
 
   *tail_used = 0;
   if (!dev->v2)
     return -EOPNOTSUPP;
-  if (nargs > NVGPU_OP_MAX_ARGS || nres > NVGPU_OP_MAX_RES ||
-      tail_len > PAGE_SIZE)
+  if (tail_len > PAGE_SIZE)
     return -EINVAL;
   resp = kzalloc(fixed + tail_len, GFP_KERNEL);
   if (!resp)
     return -ENOMEM;
-
-  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HOST_OP);
-  req.body.op = cpu_to_le32(op);
-  req.body.nargs = cpu_to_le32(nargs);
-  for (i = 0; i < nargs; i++)
-    req.body.args[i] = cpu_to_le64(args[i]);
-  if (nvgpu_proc_ids(dev))
-    nvgpu_proc_id_fill(dev, &req.proc);
-  else
-    req_len -= sizeof(req.proc);
-
-  ret = nvgpu_call(dev, &req, req_len, resp, fixed + tail_len, 0, &used,
-                   NULL, NULL);
-  if (ret)
-    goto out;
-  ret = nvgpu_hdr_status(resp, used);
-  if (ret == -EPROTO)
-    nvgpu_host_op_unread(dev, op, args, nargs, (const void *)resp,
-                         (const void *)(resp + sizeof(struct nvgpu_msg_hdr)),
-                         used);
-  if (ret < 0)
-    goto out;
-  if (!nvgpu_resp_has(used, 0, fixed)) {
-    ret = -EIO;
-    goto out;
+  ret = nvgpu_host_op_into(dev, op, args, nargs, res, nres, resp,
+                           fixed + tail_len, &used);
+  if (!ret) {
+    *tail_used = min_t(u32, used - fixed, tail_len);
+    memcpy(tail, resp + fixed, *tail_used);
   }
-  a = (const void *)(resp + sizeof(struct nvgpu_msg_hdr));
-  got = min_t(u32, le32_to_cpu(a->nres), NVGPU_OP_MAX_RES);
-  for (i = 0; i < nres; i++)
-    res[i] = i < got ? le64_to_cpu(a->res[i]) : 0;
-  *tail_used = min_t(u32, used - fixed, tail_len);
-  memcpy(tail, resp + fixed, *tail_used);
-  ret = 0;
-out:
   kfree(resp);
   return ret;
 }

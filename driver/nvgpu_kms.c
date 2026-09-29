@@ -250,16 +250,6 @@ static inline struct nvgpu_kms_call *to_kms_call(struct nvgpu_i2_call *call) {
  * the interpreter would build. Run on the file's executor like every KMS call.
  */
 
-struct nvgpu_kms_i2_head {
-  struct nvgpu_msg_hdr hdr;
-  struct nvgpu_i2_req req;
-} __packed;
-
-struct nvgpu_kms_i2_rhead {
-  struct nvgpu_msg_hdr hdr;
-  struct nvgpu_i2_resp resp;
-} __packed;
-
 /*
  * Returns 0 with the host's result in *host_ret (and `arg` updated from the
  * reply for an ioctl that reads back), or a transport/refusal -errno.
@@ -271,8 +261,8 @@ static int nvgpu_kms_raw(struct nvgpu_kms_file *kf, u32 handle,
   u32 size = _IOC_SIZE(cmd), pad = ALIGN(size, 8);
   u32 in = (_IOC_DIR(cmd) & _IOC_WRITE) ? pad : 0;
   u32 out = (_IOC_DIR(cmd) & _IOC_READ) ? pad : 0;
-  struct nvgpu_kms_i2_head h = {};
-  struct nvgpu_kms_i2_rhead rh;
+  struct nvgpu_i2_head h;
+  struct nvgpu_i2_rhead rh;
   struct nvgpu_tbuf *req, *resp;
   __le32 blen = cpu_to_le32(size);
   u32 used = 0;
@@ -288,12 +278,7 @@ static int nvgpu_kms_raw(struct nvgpu_kms_file *kf, u32 handle,
     goto out;
   }
 
-  h.hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL2);
-  h.hdr.handle = cpu_to_le32(handle);
-  h.req.cmd = cpu_to_le32(cmd);
-  h.req.nbuf = cpu_to_le32(1);
-  h.req.data_len = cpu_to_le32(in);
-  h.req.render = cpu_to_le32(kf->nfd->handle);
+  nvgpu_i2_head_init(&h, handle, cmd, kf->nfd->handle, 1, in);
   ret = nvgpu_tbuf_write(req, 0, &h, sizeof(h));
   if (!ret)
     ret = nvgpu_tbuf_write(req, sizeof(h), &blen, 4);
@@ -318,7 +303,7 @@ static int nvgpu_kms_raw(struct nvgpu_kms_file *kf, u32 handle,
   }
   status = (s32)le32_to_cpu(rh.hdr.status);
   if (status) {
-    ret = status < 0 && status >= -MAX_ERRNO ? status : -EPROTO;
+    ret = nvgpu_status_valid(status) ? status : -EPROTO;
     goto out;
   }
   /* None of these ever makes a descriptor or a GEM handle; a reply saying

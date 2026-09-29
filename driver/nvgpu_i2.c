@@ -626,32 +626,18 @@ static u32 nvgpu_i2_count(const struct nvgpu_i2_state *st, u8 kind) {
 
 /* ───────── the request and the reply ───────── */
 
-struct nvgpu_i2_head {
-  struct nvgpu_msg_hdr hdr;
-  struct nvgpu_i2_req req;
-} __packed;
-
-struct nvgpu_i2_rhead {
-  struct nvgpu_msg_hdr hdr;
-  struct nvgpu_i2_resp resp;
-} __packed;
-
 static int nvgpu_i2_build(struct nvgpu_i2_call *call, struct nvgpu_tbuf *tb) {
   struct nvgpu_i2_state *st = call->st;
-  struct nvgpu_i2_head h = {};
+  struct nvgpu_i2_head h;
   size_t off = 0;
   u32 i;
   int ret;
 
-  h.hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL2);
-  h.hdr.handle = cpu_to_le32(call->handle);
-  h.req.cmd = cpu_to_le32(call->cmd);
-  h.req.nbuf = cpu_to_le32(st->nbuf);
+  nvgpu_i2_head_init(&h, call->handle, call->cmd, call->render, st->nbuf,
+                     st->in_bytes);
   h.req.nfd = cpu_to_le32(st->nfd);
   h.req.ngem = cpu_to_le32(st->ngem);
   h.req.ndyn = cpu_to_le32(st->ndyn);
-  h.req.data_len = cpu_to_le32(st->in_bytes);
-  h.req.render = cpu_to_le32(call->render);
 
   ret = nvgpu_tbuf_write(tb, off, &h, sizeof(h));
   off += sizeof(h);
@@ -756,7 +742,7 @@ static int nvgpu_i2_parse(struct nvgpu_i2_call *call, struct nvgpu_tbuf *tb,
   if (status) {
     /* Refused before the call ran: nothing was consumed or created. */
     nvgpu_i2_drop_consumed(call);
-    return status < 0 && status >= -MAX_ERRNO ? status : -EPROTO;
+    return nvgpu_status_valid(status) ? status : -EPROTO;
   }
   if (used < sizeof(h) || nvgpu_tbuf_read(tb, 0, &h, sizeof(h)))
     return -EPROTO;
