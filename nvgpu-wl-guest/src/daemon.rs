@@ -15,8 +15,9 @@
 //! buffer. The channel is read whenever it is readable, and what it yields is
 //! written to the local peer as fast as the peer takes it.
 //!
-//! What the daemon holds for the channel is one frame's worth per client, not
-//! what the client's input comes to: the engine reads commits' copies and
+//! What the daemon holds for the channel is at most two frames per client
+//! (what `take_units_upto` returns for one frame's worth can run a record
+//! over), not what the client's input comes to: the engine reads commits' copies and
 //! blobs only as frames are made ([`Engine::take_units_upto`]), and stops
 //! taking the client's input once [`wlwire::engine::CHANNEL_HIGH_WATER`]
 //! bytes wait for the channel. What it has read and not taken stays in the
@@ -485,18 +486,23 @@ impl Daemon {
                         SUB_SOCK => {
                             let gone = events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
                             let c = self.clients[slot].as_mut().unwrap();
-                            if gone && !c.tx.is_empty() {
+                            if gone && (!c.tx.is_empty() || c.engine.input_blocked()) {
                                 // The client is gone with frames still waiting
-                                // for a busy host. read_local will not read
-                                // while they wait, so the EOF that closes the
-                                // slot would never be seen, and HUP cannot be
-                                // masked: every epoll_wait would return at once
-                                // and retry the SEND, at 100% CPU and a
-                                // virtqueue round trip each, until the host's
-                                // compositor drained. Nobody is left to read
-                                // the replies to those frames, and closing the
-                                // channel ends the host's side of the client
-                                // anyway.
+                                // for a busy host, or with input the engine
+                                // is not taking yet. read_local will not read
+                                // then, so the EOF that closes the slot would
+                                // never be seen, and HUP cannot be masked:
+                                // every epoll_wait would return at once and
+                                // retry the SEND, at 100% CPU and a virtqueue
+                                // round trip each, until the host's compositor
+                                // drained -- or for good, had the engine's
+                                // count of its backlog ever outlived the
+                                // backlog (the 2026-09-29 review, S2). Nobody
+                                // is left to read the replies to those frames,
+                                // and closing the channel ends the host's side
+                                // of the client anyway (libwayland-server
+                                // destroys a client on HUP too, unread input
+                                // and all).
                                 c.tx.clear();
                                 c.closing = true;
                             } else if events
@@ -934,13 +940,14 @@ impl Daemon {
             return;
         }
         let base = (slot as u64) << 32;
-        // Nothing of the client's is read while frames wait for the host, so
-        // nothing that says "readable" is asked for then either: not EPOLLIN,
-        // and not EPOLLRDHUP, which a client that shut down only its writing
-        // side would report on every wait. A client that is gone altogether
-        // still wakes us with EPOLLHUP, which cannot be masked (turn).
+        // Nothing of the client's is read while frames wait for the host, or
+        // while the engine takes no more input (read_local), so nothing that
+        // says "readable" is asked for then either: not EPOLLIN, and not
+        // EPOLLRDHUP, which a client that shut down only its writing side
+        // would report on every wait. A client that is gone altogether still
+        // wakes us with EPOLLHUP, which cannot be masked (turn).
         let mut want = 0;
-        if c.tx.is_empty() {
+        if c.tx.is_empty() && !c.engine.input_blocked() {
             want |= (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
         }
         if c.engine.local_out_len() > 0 {
@@ -1402,6 +1409,96 @@ mod tests {
             .find(|r| r.0 == frame::REC_WAYLAND)
             .unwrap();
         assert!(last.2.ends_with(&sync), "the sync went last");
+    }
+
+    /// Turns the daemon makes in `ms` with nothing to do: an idle one waits
+    /// out each turn's 100 ms, a spinning one returns at once.
+    fn turns_in(d: &mut Daemon, ms: u128) -> usize {
+        let t = Instant::now();
+        let mut n = 0;
+        while t.elapsed().as_millis() < ms {
+            d.turn(100).unwrap();
+            n += 1;
+        }
+        n
+    }
+
+    /// A client that truncates its own pool before a commit's copy is read
+    /// gets a short copy and goes on: what it sends after is taken, the
+    /// daemon idles, and when it hangs up its slot and channel close. Before,
+    /// the copy's unread rest stayed counted for good (wlwire's S2): its
+    /// input was never read again, every epoll_wait returned at once, and
+    /// the slot, the channel and the host's compositor client outlived it.
+    #[test]
+    fn a_client_that_truncates_its_pool_is_not_wedged_and_is_closed_when_it_goes() {
+        let (mut d, script, mut client) = scripted("truncate");
+        use std::io::Write;
+        let (stride, height) = (4096i32, 2048i32); // 8 MiB
+        let pool = sys::memfd(c"pool", (stride * height) as u64).unwrap();
+        let setup = [
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(5)
+                .finish(),
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(6)
+                .int(stride * height)
+                .finish(),
+            MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(7)
+                .int(0)
+                .int(stride / 4)
+                .int(height)
+                .int(stride)
+                .uint(0)
+                .finish(),
+        ]
+        .concat();
+        sys::send_with_fds(client.as_raw_fd(), &setup, &[pool.as_raw_fd()]).unwrap();
+        d.turn(100).unwrap();
+        sys::ftruncate(pool.as_raw_fd(), 0).unwrap();
+        let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish();
+        client
+            .write_all(
+                &[
+                    MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+                        .object(7)
+                        .int(0)
+                        .int(0)
+                        .finish(),
+                    MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish(),
+                    sync.clone(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            d.turn(50).unwrap();
+        }
+        let c = the_client(&d);
+        let wedged = !c.inbuf.is_empty() || c.engine.input_blocked();
+        let recs = script.records();
+        let last = recs
+            .iter()
+            .rev()
+            .find(|r| r.0 == frame::REC_WAYLAND)
+            .unwrap();
+        let synced = last.2.ends_with(&sync);
+        let idle = turns_in(&mut d, 300);
+        drop(client);
+        let after = turns_in(&mut d, 300);
+        // The daemon's own part first: whatever the engine's count says, a
+        // client whose input is not taken is not polled for it, and one
+        // that hangs up is closed.
+        assert!(idle < 30, "{idle} turns in 300 ms: the daemon spins");
+        assert!(after < 30, "{after} turns in 300 ms after the client went");
+        assert!(
+            d.clients.iter().all(|c| c.is_none()),
+            "the slot of a client that hung up is closed"
+        );
+        assert!(!wedged, "the client's input is no longer taken");
+        assert!(synced, "the sync after the commit reached the host");
     }
 
     /// Descriptors sent beside messages that take none are not held for
