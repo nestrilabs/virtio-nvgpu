@@ -19,7 +19,9 @@
 //! What must not happen, and what the structure below is for:
 //!
 //! - **Unbounded memory.** Readiness and fence records are coalesced per
-//!   cookie, so their number is bounded by the number of watches. DRM bytes
+//!   cookie, and a one-shot record not yet delivered goes when its handle is
+//!   watched under another cookie or closed ([`Pump::fired`]), so their
+//!   number is bounded by the number of handles. DRM bytes
 //!   are bounded per handle by [`DRM_BUDGET`]: over it the pump stops reading
 //!   that file and takes it out of epoll, so the host kernel's own per-file
 //!   `event_space` (4 KiB, drm_file.c:158) applies backpressure to whoever
@@ -271,6 +273,17 @@ impl Outbox {
             self.fence.remove(&c);
         }
         self.drm.remove(&handle);
+        for k in &gone {
+            self.queued.remove(k);
+        }
+        self.order.retain(|k| !gone.contains(k));
+    }
+
+    /// Drop a readiness or fence record queued under `cookie`: its handle
+    /// is watched under another now, or gone.
+    pub fn forget_cookie(&mut self, cookie: u64) {
+        let gone = [Key::Ready(cookie), Key::Fence(cookie)];
+        self.fence.remove(&cookie);
         for k in &gone {
             self.queued.remove(k);
         }
@@ -548,6 +561,12 @@ pub struct Pump<Q: EventQueue> {
     /// Swept handles reported readable that may still be: the only ones the
     /// sweep polls.
     stale: HashSet<u32>,
+    /// Handles whose one-shot watch fired, with the cookie its record may
+    /// still be queued under. The cookie is the guest's: without this, a
+    /// guest re-watching one signalled sync_file under a fresh cookie each
+    /// time, and posting no buffers, grew the outbox by a record a watch
+    /// with no bound (review 2026-09-29 1.11).
+    fired: HashMap<u32, u64>,
     last_sweep: Instant,
     buf: Vec<u8>,
 }
@@ -584,6 +603,7 @@ impl<Q: EventQueue> Pump<Q> {
             watches: HashMap::new(),
             paused: HashSet::new(),
             stale: HashSet::new(),
+            fired: HashMap::new(),
             last_sweep: Instant::now(),
             buf: vec![0u8; DRM_READ_MAX],
         };
@@ -700,6 +720,11 @@ impl<Q: EventQueue> Pump<Q> {
                     {
                         self.outbox.forget(handle, old.cookie());
                     }
+                    if let Some(c) = self.fired.remove(&handle)
+                        && Some(c) != mode.cookie()
+                    {
+                        self.outbox.forget_cookie(c);
+                    }
                     let w = Watched {
                         fd: PrivateFd::new(fd),
                         mode,
@@ -721,12 +746,16 @@ impl<Q: EventQueue> Pump<Q> {
                 Ok(PumpCmd::Unwatch { handle }) => {
                     let cookie = self.unwatch(handle).and_then(|m| m.cookie());
                     self.outbox.forget(handle, cookie);
+                    if let Some(c) = self.fired.remove(&handle) {
+                        self.outbox.forget_cookie(c);
+                    }
                 }
                 Ok(PumpCmd::SetV2(v2)) => self.outbox.set_v2(v2),
                 Ok(PumpCmd::Reset) => {
                     for h in self.watches.keys().copied().collect::<Vec<_>>() {
                         self.unwatch(h);
                     }
+                    self.fired.clear();
                     self.outbox.clear();
                 }
                 Ok(PumpCmd::Arm { handle }) => self.arm_legacy(handle),
@@ -802,6 +831,7 @@ impl<Q: EventQueue> Pump<Q> {
                 self.outbox.ready(cookie);
                 if oneshot {
                     self.unwatch(handle);
+                    self.fired.insert(handle, cookie);
                 }
             }
             WatchMode::Fence { cookie } => {
@@ -820,6 +850,7 @@ impl<Q: EventQueue> Pump<Q> {
                 }
                 self.outbox.fence_at(cookie, status, signalled_at);
                 self.unwatch(handle);
+                self.fired.insert(handle, cookie);
             }
             WatchMode::Drm => self.read_drm(handle),
         }
@@ -1386,6 +1417,34 @@ mod tests {
             Ok(_) => assert!(crate::testfd::only_end_here(std::os::fd::AsFd::as_fd(&w))),
             Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EPIPE)),
         }
+    }
+
+    /// A guest re-watching one signalled handle under a fresh cookie each
+    /// time, and posting no buffers, queues one record, not one a watch;
+    /// and closing the handle takes it (review 2026-09-29 1.11).
+    #[test]
+    fn re_watching_a_fired_handle_under_new_cookies_queues_no_more_records() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let (r, w) = pipe();
+        write_all(&w, b"x");
+        for cookie in (1u64 << 33)..(1 << 33) + 100 {
+            h.send(PumpCmd::Watch {
+                handle: 9,
+                fd: r.try_clone().unwrap(),
+                mode: WatchMode::Ready {
+                    cookie,
+                    oneshot: true,
+                    consume: false,
+                },
+            });
+            pump.step_with_timeout(0);
+        }
+        assert_eq!(pump.outbox.order.len(), 1, "the last cookie's record only");
+        h.send(PumpCmd::Unwatch { handle: 9 });
+        pump.step_with_timeout(0);
+        assert!(pump.outbox.is_empty());
     }
 
     #[test]

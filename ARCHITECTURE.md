@@ -622,8 +622,10 @@ waits for the closer to be idle first.
 **Events with payloads.** In v2 the event queue carries records instead of a
 bare handle: readiness, a fence's completion and status, raw DRM events read
 from a card or lease file, and hotplug. Nothing about it may grow without
-bound. Readiness and fence records are coalesced per watch, so there are never
-more of them than there are watches. Undelivered DRM events are held to 4 KiB
+bound. Readiness and fence records are coalesced per watch, and a one-shot
+record not yet delivered goes when its handle is watched again under another
+cookie or closed, so there are never more of them than there are handles.
+Undelivered DRM events are held to 4 KiB
 per file; past that the backend stops reading the file, and the host kernel's
 own per-file event space pushes back on whoever queues events there — exactly
 what happens to a native client that stops reading. Dropping them instead would
