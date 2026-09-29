@@ -47,18 +47,24 @@ SESSION=${XDG_RUNTIME_DIR:-}/${WAYLAND_DISPLAY:-}
 [ -S "$SESSION" ] || { echo "no session socket at $SESSION" >&2; exit 1; }
 hyprctl -j version >/dev/null 2>&1 || { echo "hyprctl cannot reach Hyprland" >&2; exit 1; }
 
+TARGET=
 case $WL in
-    vkcube) CMD='vkcube --wsi wayland' ;;
-    vkcube-mbox) CMD='vkcube --wsi wayland --present_mode 1' ;;
-    vkmark) CMD='vkmark --winsys wayland --run-forever -b shading' ;;
-    stk) CMD="supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed" ;;
-    gamescope) CMD='gamescope -W 1920 -H 1080 -- vkcube' ;;
+    vkcube) CMD='mangohud vkcube --wsi wayland' ;;
+    vkcube-mbox) CMD='mangohud vkcube --wsi wayland --present_mode 1' ;;
+    vkmark) CMD='mangohud vkmark --winsys wayland --run-forever -b shading' ;;
+    stk) CMD="mangohud supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed" ;;
+    # MangoHud in the game only. gamescope without CAP_SYS_NICE, as a user
+    # runs it: as the guest's root it asks for a realtime queue, whose RM
+    # control (FIFO_RUNLIST_SET_SCHED_POLICY) the backend refuses, and
+    # vkCreateDevice fails. (Natively it cannot start in the Claude sandbox:
+    # rig/TESTING-RIG.md.)
+    gamescope) CMD='setpriv --bounding-set=-sys_nice --inh-caps=-sys_nice -- gamescope -W 1920 -H 1080 -- mangohud vkcube' ;;
     *) echo "unknown workload $WL" >&2; exit 2 ;;
 esac
 # MangoHud: every frame, the smallest overlay (fps only: with no overlay at
 # all, no_display, 0.8.4 never starts the log), a log that starts after the
 # warm-up and lasts SECS. The wrapper preloads its GL shim and enables the
-# Vulkan layer for the process and its children (gamescope's vkcube).
+# Vulkan layer for the process and its children.
 MH="fps_only,log_interval=0,autostart_log=$WARM,log_duration=$SECS"
 TOTAL=$((WARM + SECS + 6))
 
@@ -73,7 +79,7 @@ RULE=nvgpu-framepace
 FS=true
 [ "${NVGPU_FP_FULLSCREEN:-1}" = 1 ] || FS=false
 # vkcube and vkmark set no app_id: they are matched by title.
-lua "hl.window_rule({ name = \"$RULE\", enabled = true, match = { class = [[^(vkcube|vkmark|supertuxkart|SuperTuxKart|gamescope)\$]] }, workspace = \"$WS silent\", no_initial_focus = true })"
+lua "hl.window_rule({ name = \"$RULE\", enabled = true, match = { class = [[^(vkcube|vkmark|\.?supertuxkart.*|SuperTuxKart|gamescope)\$]] }, workspace = \"$WS silent\", no_initial_focus = true })"
 lua "hl.window_rule({ name = \"$RULE-t\", enabled = true, match = { title = [[^(vkcube|vkmark.*|SuperTuxKart.*)\$]] }, workspace = \"$WS silent\", no_initial_focus = true })"
 cleanup() {
     lua "hl.window_rule({ name = \"$RULE\", enabled = false })"
@@ -95,17 +101,19 @@ run_native() { # run_native N
     # A home of its own for the app: SuperTuxKart and MangoHud read and write
     # there. (Not nix's: a chroot store lives under the caller's HOME.)
     MANGOHUD_CONFIG="$MH,output_folder=$d" \
-        "$REPO/rig/rig-native-run.sh" --live --timeout "$TOTAL" -- env HOME="$home" mangohud sh -c "$CMD" \
+        "$REPO/rig/rig-native-run.sh" --live --timeout "$TOTAL" -- env HOME="$home" sh -c "$CMD" \
         >"$d/app.log" 2>&1
     rm -rf -- "$home"
     local f
-    f=$(ls "$d"/*.csv 2>/dev/null | grep -v _summary | head -n 1)
+    # (A program whose name starts with a dot, as a nix wrapper's does, makes
+    # a hidden file.)
+    f=$(find "$d" -maxdepth 1 -name '*.csv' ! -name '*_summary.csv' | head -n 1)
     [ -n "$f" ] && cp "$f" "$OUT/$WL-native-$1.csv"
 }
 
 run_vm() { # run_vm N
     local tag=fp-$TAG-$WL-$1 gcmd
-    gcmd="mkdir -p /tmp/fp; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL mangohud sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(ls /tmp/fp/*.csv | grep -v _summary | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; tail -n 20 /tmp/fp/app.log; true"
+    gcmd="mkdir -p /tmp/fp; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(find /tmp/fp -maxdepth 1 -name \"*.csv\" ! -name \"*_summary.csv\" | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; tail -n 20 /tmp/fp/app.log; true"
     local extra=()
     [ -n "${NVGPU_FP_BACKEND_ARGS:-}" ] && read -r -a extra <<<"$NVGPU_FP_BACKEND_ARGS"
     NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((TOTAL + 90))} \
@@ -131,7 +139,11 @@ place() {
         [ -n "$a" ] && break
         sleep 0.5
     done
-    [ -n "$a" ] || { echo "no window on workspace $WS" >>"$OUT/placement.log"; return; }
+    [ -n "$a" ] || {
+        echo "no window on workspace $WS; the clients:" >>"$OUT/placement.log"
+        hyprctl -j clients | jq -c '.[] | {class, title, workspace: .workspace.name}' >>"$OUT/placement.log"
+        return
+    }
     [ "$FS" = true ] && lua "hl.dispatch(hl.dsp.window.fullscreen_state({ internal = 2, client = 2, window = \"address:$a\" }))"
     sleep $((WARM + 2))
     {
@@ -158,12 +170,12 @@ for n in $(seq 1 "$RUNS"); do
     f=$OUT/$WL-$MODE-$n.csv
     if [ -s "$f" ]; then
         files+=("$f")
-        python3 "$REPO/rig/framepace-stats.py" --hz "$HZ" "$f" | tee -a "$OUT/summary.txt"
+        python3 "$REPO/rig/framepace-stats.py" --hz "${TARGET:-$HZ}" "$f" | tee -a "$OUT/summary.txt"
     else
         echo "$WL $MODE run $n: no frame log" | tee -a "$OUT/summary.txt"
     fi
     sleep 2
 done
 [ ${#files[@]} -gt 1 ] &&
-    python3 "$REPO/rig/framepace-stats.py" --hz "$HZ" --label "$WL-$MODE" "${files[@]}" | tail -n 2 | tee -a "$OUT/summary.txt"
+    python3 "$REPO/rig/framepace-stats.py" --hz "${TARGET:-$HZ}" --label "$WL-$MODE" "${files[@]}" | tail -n 2 | tee -a "$OUT/summary.txt"
 exit 0
