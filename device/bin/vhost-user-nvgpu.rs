@@ -881,6 +881,9 @@ impl EventQueue for VringEventQueue {
 // The backend
 // ---------------------------------------------------------------------------
 
+/// Something to start once the process's descriptors are registered.
+type AfterScan = Box<dyn FnOnce() + Send + Sync>;
+
 struct NvGpuBackend {
     shared: Arc<Shared>,
     event_idx: bool,
@@ -891,6 +894,12 @@ struct NvGpuBackend {
     mem_fds: Vec<RawFd>,
     /// Whether the library's own descriptors have been registered yet.
     scanned_fds: bool,
+    /// Threads that open descriptors of their own -- the Wayland export and
+    /// inject accept threads -- started only once the scan is done: a peer
+    /// or helper descriptor open at the scan was registered as the
+    /// backend's own for good, and once closed its number, handed back by
+    /// a later IOCTL2, was refused adoption (review 2026-09-29 1.14).
+    after_scan: Vec<AfterScan>,
     /// `--allow-compute`, for the regions GET_SHMEM_CONFIG reports.
     allow_compute: bool,
     /// The window the allocator was made with, which GET_SHMEM_CONFIG
@@ -981,6 +990,7 @@ impl NvGpuBackend {
             max_resp: MAX_XFER_DIRECT as usize,
             mem_fds: Vec::new(),
             scanned_fds: false,
+            after_scan: Vec::new(),
             allow_compute,
             window,
             queue_poll: std::time::Duration::ZERO,
@@ -1282,7 +1292,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             self.scanned_fds = true;
             let be = self.shared.nvidia.lock().unwrap();
             let n = privfd::register_process_fds(&|fd| be.owns_fd(fd));
+            drop(be);
             log::info!("{n} descriptor(s) of the transport registered as the backend's own");
+            for start in self.after_scan.drain(..) {
+                start();
+            }
         }
         Ok(())
     }
@@ -1648,7 +1662,7 @@ fn main() -> anyhow::Result<()> {
                 device::inject::MAX_BUFFERS,
                 device::inject::MAX_BYTES >> 20
             );
-            Some(s)
+            Some(Arc::new(s))
         }
         _ => None,
     };
@@ -1731,13 +1745,25 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--pacing-stats: {e}"))?;
         log::warn!("pacing: counters logged every {secs} s while the guest is busy");
     }
+    // The accept threads start once the transport's descriptors are
+    // registered (`NvGpuBackend::after_scan`): until then, connections wait
+    // in the listeners' backlog.
+    let mut after_scan: Vec<AfterScan> = Vec::new();
     if let Some((x, _)) = &wayland.export {
-        x.start()
-            .map_err(|e| anyhow::anyhow!("--wayland-export: accept thread: {e}"))?;
+        let x = x.clone();
+        after_scan.push(Box::new(move || {
+            if let Err(e) = x.start() {
+                log::error!("--wayland-export: accept thread: {e}");
+            }
+        }));
     }
     if let Some(s) = &inject {
-        s.start()
-            .map_err(|e| anyhow::anyhow!("--inject-socket: accept thread: {e}"))?;
+        let s = s.clone();
+        after_scan.push(Box::new(move || {
+            if let Err(e) = s.start() {
+                log::error!("--inject-socket: accept thread: {e}");
+            }
+        }));
     }
     let config = BackendConfig {
         kms_card: args.kms_card,
@@ -1769,6 +1795,7 @@ fn main() -> anyhow::Result<()> {
         args.allow_unmeasured_release,
         window,
     )?;
+    nvgpu.after_scan = after_scan;
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
     log::info!(
@@ -2199,6 +2226,44 @@ mod tests {
                 ("unmap", 2, 0, 0x40_0000, 0x20_0000, 0, false),
             ]
         );
+    }
+
+    /// The threads that open descriptors of their own start once the
+    /// process's descriptors are registered, never before: what they open is
+    /// then never taken for the backend's own (review 2026-09-29 1.14).
+    #[test]
+    fn accept_threads_start_after_the_descriptor_scan() {
+        use std::sync::Mutex as StdMutex;
+        let mut be = NvGpuBackend {
+            shared: Arc::new(Shared {
+                nvidia: Mutex::new(NvidiaBackend::with_zone_config(ZoneConfig::default_256mib())),
+                mem: RwLock::new(None),
+                pool: ExecPool::default(),
+                pump: Mutex::new(PumpState::default()),
+            }),
+            event_idx: false,
+            config: VirtioGpuNvConfig::new("595.99.02", &[]),
+            max_req: MAX_XFER_DIRECT as usize,
+            max_resp: MAX_XFER_DIRECT as usize,
+            mem_fds: Vec::new(),
+            scanned_fds: false,
+            after_scan: Vec::new(),
+            allow_compute: false,
+            window: ZoneConfig::default_256mib(),
+            queue_poll: std::time::Duration::ZERO,
+        };
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s2 = seen.clone();
+        be.after_scan.push(Box::new(move || {
+            // A peer's descriptor, as an accept thread would take one.
+            let fd = device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap();
+            s2.lock().unwrap().push(privfd::is_private(fd.as_raw_fd()));
+        }));
+        assert!(seen.lock().unwrap().is_empty(), "not before the scan");
+        be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![false]);
+        be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "once");
     }
 
     /// A vring's eventfds are in no handle table, so the private registry
