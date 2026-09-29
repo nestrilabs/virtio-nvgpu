@@ -140,8 +140,10 @@
 #   NVGPU_LOG_MAX_MIB   the most of each log (<tag>.backend.log,
 #                       <tag>.console.log) kept, in MiB (default 64): the guest
 #                       writes the console, and a guest that writes it in a
-#                       loop would otherwise fill the logs' filesystem; past
-#                       it, the rest is read and dropped, and the VM runs on
+#                       loop would otherwise fill the logs' filesystem. Past
+#                       it, the backend's log drops the rest; the console's
+#                       stops the VM (it is written directly, not through a
+#                       pipe, which stalled guests)
 #   NVGPU_OOM_SCORE_ADJ oom_score_adj for the launcher, backend and VMM
 #                       (default 1000: the OOM killer takes the VM before the
 #                       compositor; empty leaves it alone)
@@ -1502,12 +1504,14 @@ if [ "$VMM_KIND" = crosvm ]; then
     echo "vmm:     crosvm, sandbox $CROSVM_SANDBOX$([ "$CROSVM_SANDBOX" = on ] && [ "$CROSVM_UVM" = 1 ] && echo ', nvgpu frontend jailed')$([ "$VMM_OWN_NETNS" = true ] && echo ', own user and network namespace')" >&2
 fi
 # The console log starts with what the reader must know before the guest's
-# first line: a VMM without its sandbox. Everything after it comes through
-# a capped writer (NVGPU_LOG_MAX_MIB).
+# first line: a VMM without its sandbox. The VMM appends to it directly: a
+# pipe through a capped writer, as the backend's log has, stalled guests
+# (their console output slowed, and a guest thread writing to hvc0 held up
+# a GPU client's calls; mpv hung within a second). Its size is bounded
+# instead by console_watch, which stops the VM past NVGPU_LOG_MAX_MIB.
 : > "$CONSOLE"
 [ -z "$CROSVM_NOTE" ] || printf '%s\n' "$CROSVM_NOTE" >> "$CONSOLE"
-exec {CON_W}> >(exec {SLOT_FD}>&- {TAG_FD}>&-; capped "$CONSOLE")
-CON_WRITER=$!
+exec {CON_W}>>"$CONSOLE"
 if [ "$INTERACTIVE" = 1 ]; then
     # The terminal is the guest's console; the log still gets everything.
     # --foreground: timeout otherwise moves itself and nesbox into a process
@@ -1528,12 +1532,26 @@ else
     TAIL_PID=
 fi
 exec {CON_W}>&-
+# console_watch: the guest writes the console log; past LOG_MAX bytes the VM
+# is stopped (TERM to the VMM's timeout), so no guest fills the filesystem.
+(
+    exec {SLOT_FD}>&- {TAG_FD}>&-
+    while kill -0 "$VMM_PID" 2>/dev/null; do
+        if [ "$(stat -c %s "$CONSOLE" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+            printf '\n[run-guest: the console log passed NVGPU_LOG_MAX_MIB=%s; the VM was stopped]\n' \
+                "$LOG_MAX_MIB" >> "$CONSOLE"
+            kill -TERM "$VMM_PID" 2>/dev/null
+            break
+        fi
+        sleep 2
+    done
+) &
+CON_WATCH=$!
 RC=0
 wait "$VMM_PID" || RC=$?
 VMM_PID=
-# The console's writer ends once nothing holds the pipe (the VMM's helpers,
-# virtiofsd, may outlive it by a moment); the log is whole after that.
-wait "$CON_WRITER" 2>/dev/null || true
+kill "$CON_WATCH" 2>/dev/null || true
+wait "$CON_WATCH" 2>/dev/null || true
 [ -z "$TAIL_PID" ] || wait "$TAIL_PID" 2>/dev/null || true
 if [ -n "$TTY_STATE" ]; then
     stty "$TTY_STATE" 2>/dev/null || true
@@ -1556,6 +1574,11 @@ echo "config:  $CFG"
 # their own, some of them expected (cuda-smoke says FAIL where a probe wants
 # it to fail). The console comes through a terminal, so lines end in \r;
 # what is echoed from it goes through clean first (the guest wrote it).
+# console_watch stopped the VM: whatever the console says, the run failed.
+if grep -a -q -F "[run-guest: the console log passed NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB; the VM was stopped]" "$CONSOLE"; then
+    echo "result: FAIL (the console log passed NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB; the VM was stopped)"
+    exit 1
+fi
 DONE=$(grep -a -E '^NVGPU_PROBE_DONE ' "$CONSOLE" | tail -n 1 | clean || true)
 if [ -n "$DONE" ]; then
     grep -a -E '^\[[A-Za-z0-9_-]+\] FAIL ' "$CONSOLE" | clean | head -n 20 | sed 's/^/  /' || true

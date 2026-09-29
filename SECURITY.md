@@ -2884,9 +2884,12 @@ descriptor 3 named `vhost-user`, running from a `0:711` directory, and no
 change of ownership but the socket's group and the disk copy's.
 
 **The console log was unbounded** (H2, low-medium). A guest writing its
-console in a loop filled root's logs filesystem. Both logs now go through a
-writer that keeps `NVGPU_LOG_MAX_MIB` (64) and reads and drops the rest,
-and the backend and the VMM hold a pipe, not the file. (The units' journald
+console in a loop filled root's logs filesystem. The backend's log goes
+through a writer that keeps `NVGPU_LOG_MAX_MIB` (64) and reads and drops
+the rest; the backend holds a pipe, not the file. The VMM writes the
+console log directly -- through the same pipe, guests stalled (mpv's
+Vulkan output froze within a second, found by the app pass) -- and a
+watchdog stops the VM once the log passes the limit. (The units' journald
 already capped and rate-limited.)
 
 **Diagnostic flags went through as root unannounced** (H3, low-medium). The
