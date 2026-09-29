@@ -736,7 +736,12 @@ impl Daemon {
 
     fn read_local(&mut self, slot: usize) {
         let mut buf = vec![0u8; 64 * 1024];
-        for _ in 0..16 {
+        // A few reads a turn, not until the socket is empty: a client that
+        // writes as fast as it is read would otherwise have a megabyte of
+        // requests taken before the channel is read again, and the host's
+        // replies -- and the deletes that free the ids those requests take
+        // -- wait behind them. Level-triggered, the rest is next turn's.
+        for _ in 0..4 {
             let c = self.clients[slot].as_mut().unwrap();
             if c.closing || !c.tx.is_empty() || c.engine.input_blocked() {
                 break;
