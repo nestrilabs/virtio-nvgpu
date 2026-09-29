@@ -107,6 +107,10 @@ struct Entry {
     owner: Owner,
 }
 
+/// The largest handle issued: a descriptor field read as an i32 must not
+/// see it negative.
+const MAX_ISSUED: u32 = i32::MAX as u32;
+
 pub struct HandleTable {
     /// Where the search for the next free value starts.
     next: u32,
@@ -231,12 +235,20 @@ impl HandleTable {
             }
             return Err(TableFull);
         }
-        // Terminates: fewer than 2^32 - 2 values are live, so some candidate
-        // is free, and in practice the first one almost always is.
+        // Handles are issued in [1, i32::MAX]. The guest's structs carry a
+        // handle in a descriptor field, where RM, UVM and the guest module
+        // read it as a signed int: a handle past i32::MAX reads as a
+        // negative descriptor there, and after 2^31 opens and closes every
+        // new file of the VM failed its event, fd and UVM registrations
+        // (review 2026-09-29 1.2).
+        //
+        // Terminates: at most MAX_HANDLES values are live, far fewer than
+        // i32::MAX, so some candidate is free, and in practice the first
+        // one almost always is.
         loop {
             let h = self.next;
-            self.next = self.next.wrapping_add(1);
-            if h == 0 || h == u32::MAX || self.table.contains_key(&h) {
+            self.next = if h >= MAX_ISSUED { 1 } else { h + 1 };
+            if h == 0 || h > MAX_ISSUED || self.table.contains_key(&h) {
                 continue;
             }
             self.table.insert(
@@ -473,11 +485,25 @@ mod tests {
         let live = t.insert(make_fd(), CTL).unwrap();
         assert_eq!(live, 1);
         // Force the cursor to the top of the space.
-        t.next = u32::MAX - 1;
-        assert_eq!(t.insert(make_fd(), CTL).unwrap(), u32::MAX - 1);
-        // u32::MAX and 0 are never issued, and 1 is live: the next one is 2.
+        t.next = i32::MAX as u32 - 1;
+        assert_eq!(t.insert(make_fd(), CTL).unwrap(), i32::MAX as u32 - 1);
+        assert_eq!(t.insert(make_fd(), CTL).unwrap(), i32::MAX as u32);
+        // Nothing past i32::MAX, 0 is never issued, and 1 is live: the next
+        // one is 2.
         assert_eq!(t.insert(make_fd(), CTL).unwrap(), 2);
         assert!(t.kind(0).is_none() && t.kind(u32::MAX).is_none());
+    }
+
+    /// A handle is never negative as an i32: the guest's structs carry it
+    /// in descriptor fields read as signed ints (review 2026-09-29 1.2).
+    #[test]
+    fn no_handle_reads_as_a_negative_descriptor() {
+        let mut t = HandleTable::new();
+        for start in [0x8000_0000, u32::MAX - 1, u32::MAX, 0xC000_0000] {
+            t.next = start;
+            let h = t.insert(make_fd(), CTL).unwrap();
+            assert!((h as i32) > 0, "{start:#x} issued {h:#x}");
+        }
     }
 
     #[test]
