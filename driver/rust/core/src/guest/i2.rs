@@ -1696,7 +1696,11 @@ mod tests {
             iowr(0xa0, 0),
             iowr(0xa0, 32) & !(1 << 31),
         ] {
-            assert_eq!(native_cmd(&set, SCLASS_KMS, cmd), iowr(0xa0, 32), "{cmd:#x}");
+            assert_eq!(
+                native_cmd(&set, SCLASS_KMS, cmd),
+                iowr(0xa0, 32),
+                "{cmd:#x}"
+            );
         }
         // Another number, class or type; NVKMS never.
         assert_eq!(native_cmd(&set, SCLASS_KMS, iowr(0xa1, 32)), 0);

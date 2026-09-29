@@ -739,8 +739,8 @@ static int nvgpu_release(struct inode *inode, struct file *filp) {
  * 4 GiB, which a 64-bit process's can be too), so the backend sees nothing
  * new. What does differ is its address space, which caps what it can map:
  * UVM's semaphore pools only above 4 GiB (nvgpu_mmap_uvm_check()), so a
- * 32-bit UVM client gets its ioctls and not its pools -- 32-bit CUDA is gone
- * natively too. The nvidia-caps nodes answer no ioctl at all, as nv-caps.c's
+ * 32-bit UVM client gets its ioctls and not its pools, nor a CUDA context
+ * (CUDA 12 dropped 32-bit applications). The nvidia-caps nodes answer no ioctl at all, as nv-caps.c's
  * do. Without these every 32-bit ioctl (Steam's client, a 32-bit game's GL
  * and Vulkan driver) was -ENOTTY.
  */

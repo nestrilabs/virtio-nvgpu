@@ -54,7 +54,13 @@ fn ioc(dir: u32, ty: u8, nr: u32, size: u32) -> u32 {
 /// inside it) or a number no entry has.
 #[test]
 fn a_callers_size_or_direction_is_normalised_to_the_schemas_command() {
-    for version in ["535.129.03", "580.178.04", "595.71.05", "610.57.04", "615.71.09"] {
+    for version in [
+        "535.129.03",
+        "580.178.04",
+        "595.71.05",
+        "610.57.04",
+        "615.71.09",
+    ] {
         let d = dev(version);
         let set = scen::tables_for(&d);
         let mut seen = 0;

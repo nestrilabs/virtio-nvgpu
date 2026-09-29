@@ -130,9 +130,28 @@ never connect to the live compositor. Run them first, in this order.
 | A5 | **8**: explicit sync (all three parts) | as A4 | `--wayland-socket <headless socket>` |
 | A6 | caching **M-2** (read-only mapping; no probe yet) | `rig/run-guest.sh shell m2`, by hand | none (`-- --keep-guest-coherency` only to rule the rewrite out) |
 | A7 | performance, W1 crossings; W2 crossings against the headless compositor | as A2 / A4 | as A2 / A4 |
+| A8 | **compat**: DRM ioctls at older and newer struct sizes, and 32-bit processes (below) | `rig/run-guest.sh compat cmp` | none |
 
 H-4 and M-1 in the caching stage are Intel-only and cannot occur on this AMD
 host (`TESTING.md`, "Caching and coherency").
+
+### Compat: struct sizes and 32-bit processes (A8)
+
+`probes/compat.sh` needs an image built since the `drm-compat2` branch (it
+has NVIDIA's 32-bit userspace at `/run/opengl-driver-32` and the i686
+tools); an older one fails its first 32-bit check and says to rebuild. No
+display, no compute, no KMS: the same cost as A2.
+
+| check | what it shows |
+|---|---|
+| `nvgpu-drm-compat` | SYNCOBJ_HANDLE_TO_FD / FD_TO_HANDLE with the 16-byte `drm_syncobj_handle` (the Steam runtime's libdrm) and a 32-byte one work as the native 24-byte call does -- same kind of file, same syncobj, EXPORT/IMPORT_SYNC_FILE too -- and nothing past the caller's struct is written; SYNCOBJ_WAIT (32 bytes) and TIMELINE_WAIT (40) from before `deadline_nsec` answer as the native sizes do. Exit 77 (SKIP) on a backend without fences |
+| `nvgpu-drm-compat-32` | the same from a 32-bit process: the DRM node's compat path, and DRM_IOCTL_VERSION through the core's compat conversion |
+| `nvgpu-rm-smoke`, `nvgpu-rm-smoke-32` | an RM client on `/dev/nvidiactl` from each width (NV01_ROOT_CLIENT, GET_ATTACHED_IDS, GET_BUILD_VERSION with its string pointers below 4 GiB, RM_FREE) and nvidia-drm GET_DEV_INFO; their `RESULT` lines must match |
+| `vulkaninfo-32 --summary`, `eglinfo-32 -B` | NVIDIA's 32-bit Vulkan ICD and EGL vendor, with the loaders pinned to them |
+
+The C module is in the image; the Rust one goes in with
+`mkimage.sh --module-only --module <.ko> --out <image>` as for any probe.
+Afterwards, host `dmesg` clean and the backend still serving, as for A3.
 
 ### The headless compositor (A4, A5, A7)
 

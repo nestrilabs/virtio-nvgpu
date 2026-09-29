@@ -373,6 +373,20 @@ nodes (`/dev/nvidiactl`, `/dev/nvidia0...`, `/dev/nvidia-modeset`,
 `/dev/nvidia-uvm` with compute, a DRM card and render node per GPU); render
 nodes to group `render`, card nodes to `video`, as usual.
 
+**32-bit clients** (Steam's client, 32-bit games' GL and Vulkan) need
+nothing from the host beyond what 64-bit ones do: the module answers their
+ioctls on every node, as nvidia.ko does, and takes DRM structs of the size
+their older headers have (a 16-byte `drm_syncobj_handle`) as `drm_ioctl()`
+does ([`driver/README.md`](driver/README.md)). The guest image needs a
+kernel with `CONFIG_IA32_EMULATION` (the one `scripts/build-guest-kernel.sh`
+builds has it) and NVIDIA's 32-bit userspace of the same release: on NixOS
+`hardware.graphics.enable32Bit = true` with the NVIDIA package's `lib32`
+in `extraPackages32`, which is what `/run/opengl-driver-32` then holds (the
+rig image builds the same, `rig/guest-image/nix/nvidia.nix`). A 32-bit
+CUDA context is not served (the toolkit dropped 32-bit applications with
+CUDA 12): a 32-bit process cannot map a UVM semaphore pool, which lives
+above 4 GiB -- so neither is 32-bit NVENC/NVDEC through a CUDA context.
+
 **The Wayland daemon.** `nvgpu-wl-guest` runs in each session and serves
 `$XDG_RUNTIME_DIR/wayland-0` to the session's applications. It alone may open
 `/dev/nvgpu-wl`: every open is a client of the host's compositor, and the

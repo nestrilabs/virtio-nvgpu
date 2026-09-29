@@ -26,7 +26,7 @@ difftest's oracle, and what a kernel without Rust builds.
 | Rust (`core/src/guest/`) | replaces (C) |
 |---|---|
 | `i2.rs` — the IOCTL2 schema walk, the request, the reply, copy-back by the kernel's fill rules | `nvgpu_i2.c` |
-| `schema.rs` — the tables' layout (the tables stay the generated C, read in place) and the entry lookup | `nvgpu_i2_lookup()` |
+| `schema.rs` — the tables' layout (the tables stay the generated C, read in place) and the entry lookup, which also names the native command a DRM caller's argument is normalised to (`i2::native_cmd`) | `nvgpu_i2_lookup()`, `nvgpu_i2_native_cmd()` |
 | `dispatch.rs` — which path an ioctl on a `/dev/nvidia*` file or a DRM file's driver range takes; UVM | `nvgpu_ioctl_fd()`, `nvgpu_uvm_ioctl()` |
 | `rm.rs` — flat escapes, RM_CONTROL (GET_BUILD_VERSION and TIME_CORRELATION intercepts, OS_UNIX and OS-event descriptors, V1V2 deep pointers, the clock rebase), RM_ALLOC (event descriptors, class sizes), IDLE_CHANNELS, descriptor translation at a fixed offset, a v1 backend's NVKMS commands | `nvgpu_rmio.c` |
 | `deep.rs` — deep segments: the plan, the block, the copy-back | `nvgpu_deep_*()` |
