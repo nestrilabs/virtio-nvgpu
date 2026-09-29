@@ -191,7 +191,10 @@ impl Registry {
             return Err(libc::EBADF);
         }
         let mut own = self.lock_own();
-        self.room_for_buffer(0)?;
+        // No kernel call for a VM already at its count. What the buffer adds
+        // is checked once its size is known, under the lock the id is made
+        // under.
+        self.room_for_one()?;
         // Which of this GPU list's devices the memory is NVKMS memory of.
         // nvidia-drm hands a dma-buf of its own device back as the very
         // object it exported (the PRIME self-import); anything else becomes
@@ -314,9 +317,9 @@ impl Registry {
         &self.taint
     }
 
-    /// Whether one more buffer of `size` bytes fits (0: the count alone).
-    fn room_for_buffer(&self, size: u64) -> Result<(), i32> {
-        Self::room(&self.lock(), self.max_buffers, self.max_bytes, size)
+    /// Whether the count leaves room for one more buffer, whatever its size.
+    fn room_for_one(&self) -> Result<(), i32> {
+        Self::room(&self.lock(), self.max_buffers, self.max_bytes, 0)
     }
 
     fn room(st: &State, max_buffers: usize, max_bytes: u64, size: u64) -> Result<(), i32> {
@@ -379,7 +382,6 @@ impl Registry {
             );
             return Err(e);
         }
-        self.room_for_buffer(size)?;
         let offset = self
             .host
             .map_offset(r, gem)
