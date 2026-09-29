@@ -29,6 +29,8 @@
 #   NVGPU_FP_SECS    seconds logged (default 20)
 #   NVGPU_FP_BACKEND_ARGS  words for the backend (run-guest.sh's -- args)
 #   NVGPU_FP_FULLSCREEN=0  leave the window as the app made it
+#   NVGPU_FP_GUEST_PRE  a guest shell command run before the workload (such
+#                    as a module parameter written through /sys/module)
 #   NVGPU_FP_LOAD    stress-ng arguments for a host load that runs through
 #                    each run (a busy desktop, reproducibly), e.g.
 #                    "--cpu 32 --cpu-load 50"
@@ -40,7 +42,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
 export NVGPU_RIG=$RIG
-[ $# -ge 3 ] || { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 WL=$1 MODE=$2 TAG=$3 RUNS=${4:-3} FIRST=${5:-1}
 MON=${NVGPU_FP_MON:-DP-3}
 WARM=${NVGPU_FP_WARM:-6}
@@ -94,7 +96,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 {
     echo "# $(date -Is) $WL $MODE on $MON (${HZ} Hz, workspace $WS), render:direct_scanout=$DS"
-    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-} load=${NVGPU_FP_LOAD:-}"
+    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-} load=${NVGPU_FP_LOAD:-} guest-pre=${NVGPU_FP_GUEST_PRE:-}"
 } >>"$OUT/summary.txt"
 
 run_native() { # run_native N
@@ -117,7 +119,7 @@ run_native() { # run_native N
 
 run_vm() { # run_vm N
     local tag=fp-$TAG-$WL-$1 gcmd
-    gcmd="mkdir -p /tmp/fp; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(find /tmp/fp -maxdepth 1 -name \"*.csv\" ! -name \"*_summary.csv\" | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; echo FP_PACING_BEGIN; cat /sys/module/virtio_gpu_nv/parameters/pacing 2>/dev/null; echo FP_PACING_END; tail -n 20 /tmp/fp/app.log; true"
+    gcmd="mkdir -p /tmp/fp; ${NVGPU_FP_GUEST_PRE:-true}; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(find /tmp/fp -maxdepth 1 -name \"*.csv\" ! -name \"*_summary.csv\" | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; echo FP_PACING_BEGIN; cat /sys/module/virtio_gpu_nv/parameters/pacing 2>/dev/null; echo FP_PACING_END; tail -n 20 /tmp/fp/app.log; true"
     local extra=()
     [ -n "${NVGPU_FP_BACKEND_ARGS:-}" ] && read -r -a extra <<<"$NVGPU_FP_BACKEND_ARGS"
     # How the host scheduled the VMM's and the backend's threads while the

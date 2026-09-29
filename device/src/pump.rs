@@ -92,6 +92,12 @@ pub enum WatchMode {
     /// did: `EVENT_READY(handle)` to a v1 guest, `EV_READY` with cookie =
     /// handle to a v2 one.
     Legacy,
+    /// [`WatchMode::Legacy`] for an RM device handle of a guest that arms
+    /// its readiness (`BCAP_ARMED_READY`): reported once per
+    /// [`PumpCmd::Arm`], not on every host event. RM posts dozens of events
+    /// a frame on descriptors nobody in the guest polls; each was a record
+    /// and, most of the time, a guest interrupt.
+    LegacyArmed,
     /// `EV_READY` with the WATCH cookie. `consume` drains an eventfd's counter
     /// when reporting it, so the level sweep does not report it again.
     Ready {
@@ -117,7 +123,7 @@ impl WatchMode {
     fn cookie(self) -> Option<u64> {
         match self {
             Self::Ready { cookie, .. } | Self::Fence { cookie } => Some(cookie),
-            Self::Legacy | Self::Drm => None,
+            Self::Legacy | Self::LegacyArmed | Self::Drm => None,
         }
     }
 }
@@ -142,6 +148,9 @@ pub enum PumpCmd {
     Reset,
     /// A card was hotplugged or its lease state changed (`EV_HOTPLUG_F_*`).
     Hotplug { card: u32, flags: u32 },
+    /// The guest waits on [`WatchMode::LegacyArmed`] handle `handle`:
+    /// report it once more.
+    Arm { handle: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -313,8 +322,10 @@ impl Outbox {
                     }
                     PACING.ev_fence.fetch_add(1, Relaxed);
                     if ts != 0 {
+                        // Only a plausible one: some host fences carry a
+                        // timestamp that is not CLOCK_MONOTONIC's.
                         let now = crate::session::monotonic_ns();
-                        if now >= ts {
+                        if now >= ts && now - ts < 10_000_000_000 {
                             PACING.fence_delivery.record_ns(now - ts);
                         }
                     }
@@ -492,6 +503,13 @@ struct Watched {
     /// backend holds that is in no handle table, so registered as private.
     fd: PrivateFd,
     mode: WatchMode,
+    /// [`WatchMode::LegacyArmed`]: the guest waits on it, so the next event
+    /// is reported.
+    armed: bool,
+    /// [`WatchMode::LegacyArmed`]: an event came while it was not armed. Its
+    /// descriptor's own readiness cannot say so afterwards -- polling RM's
+    /// file takes its dataless-event flag -- so this does.
+    dirty: bool,
 }
 
 /// How the backend and the transport talk to a running pump.
@@ -685,6 +703,8 @@ impl<Q: EventQueue> Pump<Q> {
                     let w = Watched {
                         fd: PrivateFd::new(fd),
                         mode,
+                        armed: false,
+                        dirty: false,
                     };
                     if self.arm(handle, &w) {
                         self.watches.insert(handle, w);
@@ -709,6 +729,7 @@ impl<Q: EventQueue> Pump<Q> {
                     }
                     self.outbox.clear();
                 }
+                Ok(PumpCmd::Arm { handle }) => self.arm_legacy(handle),
                 Ok(PumpCmd::Hotplug { card, flags }) => self.outbox.hotplug(card, flags),
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
@@ -726,17 +747,49 @@ impl<Q: EventQueue> Pump<Q> {
         }
     }
 
-    fn on_ready(&mut self, handle: u32) {
-        let Some(w) = self.watches.get(&handle) else {
+    /// The guest waits on [`WatchMode::LegacyArmed`] handle `handle`: an
+    /// event it has not been told of goes out now, else the next one will.
+    fn arm_legacy(&mut self, handle: u32) {
+        let Some(w) = self.watches.get_mut(&handle) else {
             return;
         };
+        if w.mode != WatchMode::LegacyArmed {
+            return;
+        }
+        PACING.arms.fetch_add(1, Relaxed);
+        if w.dirty || readable(w.fd.as_raw_fd()) {
+            w.dirty = false;
+            w.armed = false;
+            self.outbox.ready_legacy(handle);
+        } else {
+            w.armed = true;
+        }
+    }
+
+    fn on_ready(&mut self, handle: u32) {
+        let Some(w) = self.watches.get_mut(&handle) else {
+            return;
+        };
+        if w.mode == WatchMode::LegacyArmed {
+            // Once per arm. Not swept: an event while unarmed is
+            // remembered instead, and the arm looks at the descriptor too.
+            if w.armed {
+                w.armed = false;
+                w.dirty = false;
+                self.outbox.ready_legacy(handle);
+            } else {
+                w.dirty = true;
+                PACING.ev_unarmed.fetch_add(1, Relaxed);
+            }
+            return;
+        }
         let (fd, mode) = (w.fd.as_raw_fd(), w.mode);
         if mode.swept() {
             // Reported; the sweep looks again until it finds it drained.
             self.stale.insert(handle);
         }
         match mode {
-            WatchMode::Legacy => self.outbox.ready_legacy(handle),
+            WatchMode::Legacy | WatchMode::LegacyArmed => self.outbox.ready_legacy(handle),
             WatchMode::Ready {
                 cookie,
                 oneshot,
@@ -1106,6 +1159,92 @@ mod tests {
             q.take(),
             vec![hdr_bytes(MsgType::EventReady, 12, 0).to_vec()]
         );
+    }
+
+    fn drain(fd: &OwnedFd) {
+        let mut b = [0u8; 64];
+        while crate::sys::fd::read_raw(fd.as_raw_fd(), &mut b).is_ok_and(|n| n > 0) {}
+    }
+
+    fn legacy_reports(q: &FakeQueue, handle: u32) -> usize {
+        q.take()
+            .iter()
+            .flat_map(|m| records(m))
+            .filter(|(k, c, _)| *k == EV_READY && *c == handle as u64)
+            .count()
+    }
+
+    /// Armed readiness (BCAP_ARMED_READY): an RM descriptor's events go
+    /// out once per arm. Nobody waiting, nothing is sent however many come;
+    /// the arm then reports at once what came meanwhile, and after a report
+    /// the next event waits for the next arm.
+    #[test]
+    fn armed_readiness_reports_once_per_arm_and_remembers_what_came_unarmed() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 12,
+            fd: r.try_clone().unwrap(),
+            mode: WatchMode::LegacyArmed,
+        });
+        q.post(16, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        // Nobody waits: a burst of events sends nothing, and is no sweep's.
+        for _ in 0..5 {
+            write_all(&w, b"x");
+            pump.step_with_timeout(0);
+        }
+        assert_eq!(legacy_reports(&q, 12), 0);
+        assert!(pump.stale.is_empty());
+        // Even drained on the host (RM's poll takes its dataless flag), the
+        // arm reports what came unarmed.
+        drain(&r);
+        h.send(PumpCmd::Arm { handle: 12 });
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 12), 1);
+        // Reported: disarmed until the next arm.
+        write_all(&w, b"x");
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 12), 0);
+        drain(&r);
+        h.send(PumpCmd::Arm { handle: 12 });
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 12), 1, "the event after the report");
+        // Armed with nothing new: the next event is reported, once.
+        h.send(PumpCmd::Arm { handle: 12 });
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 12), 0);
+        write_all(&w, b"x");
+        pump.step_with_timeout(0);
+        write_all(&w, b"x");
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 12), 1);
+    }
+
+    /// A plain legacy watch (an older guest, the modeset device, a Wayland
+    /// channel) reports every event, as before, and an arm of it is ignored.
+    #[test]
+    fn a_plain_legacy_watch_reports_every_event_and_ignores_arms() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 7,
+            fd: r.try_clone().unwrap(),
+            mode: WatchMode::Legacy,
+        });
+        q.post(16, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        h.send(PumpCmd::Arm { handle: 7 });
+        for _ in 0..3 {
+            write_all(&w, b"x");
+            pump.step_with_timeout(0);
+            drain(&r);
+        }
+        assert_eq!(legacy_reports(&q, 7), 3);
     }
 
     /// The backpressure the spec asks for: with no buffers posted the pump

@@ -331,11 +331,13 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_PROC_EUID (1u << 9)   /* ... with euid, and on RM_CONTROL    */
 #define NVGPU_BCAP_COMPUTE (1u << 10)    /* UVM served (--allow-compute)        */
 #define NVGPU_BCAP_INJECT (1u << 11)     /* injected host buffers (INJECT_OPEN) */
+#define NVGPU_BCAP_ARMED_READY (1u << 12) /* legacy readiness once per W_ARM  */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
 #define NVGPU_GCAP_PROC_ID (1u << 1)      /* can send nvgpu_proc_id        */
 #define NVGPU_GCAP_PROC_EUID (1u << 2)    /* ... with the caller's euid     */
+#define NVGPU_GCAP_ARMS_READY (1u << 3)   /* arms legacy readiness (W_ARM)  */
 
 /*
  * The guest process an IOCTL is made by. With NVGPU_BCAP_PROC_ID, every
@@ -512,6 +514,9 @@ struct nvgpu_i2_gem_out {
 #define NVGPU_W_FENCE (1u << 1) /* SyncFile: report EV_FENCE with its status */
 #define NVGPU_W_DRM (1u << 2)   /* DRM card/lease: read events, EV_DRM       */
 #define NVGPU_W_READY (1u << 3) /* readiness only, EV_READY                  */
+/* Alone, with NVGPU_BCAP_ARMED_READY: a device handle's next readiness (at
+ * once if an event came since the last report). */
+#define NVGPU_W_ARM (1u << 4)
 
 struct nvgpu_watch_req {
   __le32 handle;

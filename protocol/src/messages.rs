@@ -633,6 +633,10 @@ pub const BCAP_COMPUTE: u32 = 1 << 10;
 /// Host buffers a helper injected may be opened ([`OP_INJECT_OPEN`];
 /// `--inject-socket`). Without it the guest makes no `/dev/nvgpu-capture`.
 pub const BCAP_INJECT: u32 = 1 << 11;
+/// Readiness of a device handle's host descriptor (the legacy watch every
+/// OPEN makes, RM's event queue) is reported once per [`W_ARM`], not once
+/// per host event. Offered only to a guest that said [`GCAP_ARMS_READY`].
+pub const BCAP_ARMED_READY: u32 = 1 << 12;
 
 /// `HelloReq::guest_caps` bits.
 ///
@@ -645,6 +649,10 @@ pub const GCAP_PROC_ID: u32 = 1 << 1;
 /// The guest's [`ProcId`] carries the caller's effective uid, and it can send
 /// one on every RM control ([`BCAP_PROC_EUID`]).
 pub const GCAP_PROC_EUID: u32 = 1 << 2;
+/// The guest arms each report of a device handle's readiness with a
+/// [`W_ARM`] WATCH when something of its own waits on the handle
+/// ([`BCAP_ARMED_READY`]).
+pub const GCAP_ARMS_READY: u32 = 1 << 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -813,6 +821,10 @@ pub const W_ONESHOT: u32 = 1 << 0;
 pub const W_FENCE: u32 = 1 << 1;
 pub const W_DRM: u32 = 1 << 2;
 pub const W_READY: u32 = 1 << 3;
+/// Alone, with [`BCAP_ARMED_READY`]: report the device handle's readiness
+/// once more -- at once if its host descriptor had an event since the last
+/// report, else at its next one.
+pub const W_ARM: u32 = 1 << 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -1039,6 +1051,13 @@ mod tests {
             u64::from(MMAP_F_READ_ONLY)
         );
         assert_eq!(define("NVGPU_BCAP_OS_DESC"), u64::from(BCAP_OS_DESC));
+        assert_eq!(
+            define("NVGPU_BCAP_ARMED_READY"),
+            u64::from(BCAP_ARMED_READY)
+        );
+        assert_eq!(define("NVGPU_GCAP_ARMS_READY"), u64::from(GCAP_ARMS_READY));
+        assert_eq!(define("NVGPU_W_ARM"), u64::from(W_ARM));
+        assert_eq!(define("NVGPU_W_READY"), u64::from(W_READY));
         assert_eq!(define("NVGPU_DEEP_PAGE_LIST"), u64::from(DEEP_PAGE_LIST));
         assert_eq!(define("NVGPU_OSDESC_F_WRITE"), u64::from(OSDESC_F_WRITE));
         assert_eq!(define("NVGPU_OSDESC_MAX_RUNS"), u64::from(OSDESC_MAX_RUNS));

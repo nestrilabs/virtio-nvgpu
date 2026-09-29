@@ -94,6 +94,7 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
                                 struct poll_table_struct *wait,
                                 __poll_t ready) {
   struct nvgpu_fd *nfd = filp->private_data;
+  __poll_t ready_now = 0;
 
   if (!nfd)
     return EPOLLERR;
@@ -105,9 +106,23 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
    * find it ready every time, which is the spin this path exists to end. One
    * report per event.
    */
-  if (atomic_xchg(&nfd->pending, 0))
-    return ready;
-  return 0;
+  nvgpu_pace_inc(NVGPU_PACE_POLLS);
+  if (atomic_xchg(&nfd->pending, 0)) {
+    nvgpu_pace_inc(NVGPU_PACE_POLLS_READY);
+    ready_now = ready;
+  }
+  /*
+   * With armed readiness the backend reports one event per arm: whoever
+   * polls either sleeps now or will poll again for the next event, so the
+   * next one is asked for here, once until it comes. Cleared by delivery
+   * (nvgpu_event_deliver) before `pending` is set, so an arm is never lost
+   * between the two.
+   */
+  if ((nfd->dev->backend_caps & NVGPU_BCAP_ARMED_READY) &&
+      !atomic_xchg(&nfd->armed, 1) &&
+      !nvgpu_arm_ready_async(nfd->dev, nfd->handle))
+    atomic_set(&nfd->armed, 0);
+  return ready_now;
 }
 
 static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
@@ -565,6 +580,7 @@ void nvgpu_fd_register(struct nvgpu_device *dev, struct nvgpu_fd *nfd) {
 
   init_waitqueue_head(&nfd->wq);
   atomic_set(&nfd->pending, 0);
+  atomic_set(&nfd->armed, 0);
   spin_lock_irqsave(&dev->fds_lock, flags);
   list_add(&nfd->node, &dev->fds);
   spin_unlock_irqrestore(&dev->fds_lock, flags);

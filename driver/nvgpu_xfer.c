@@ -451,7 +451,8 @@ static int nvgpu_pace_get(char *buf, const struct kernel_param *kp) {
   static const char *const ctr[NVGPU_PACE_CTRS] = {
       "sowait_waits", "sowait_polls",  "sowait_sleeps",
       "sowait_woken", "sowait_naps",   "sowait_overcap",
-      "ev_batches",   "ev_records",    "ev_legacy"};
+      "ev_batches",   "ev_records",    "ev_legacy",
+      "ev_legacy_set", "rm_polls",     "rm_polls_ready"};
   int n = 0, i;
 
   for (i = 0; i < NVGPU_PACE_TYPES; i++) {
@@ -483,6 +484,31 @@ MODULE_PARM_DESC(pacing, "frame-pacing counters: round trips per message "
                          "type, their latency, syncobj waits, events");
 
 /* ───────── Control queue ───────── */
+
+/*
+ * How long a caller spins for its reply before it sleeps, in microseconds.
+ * Most replies come back in 5-20 us (the backend's service time is a few);
+ * sleeping for one costs the reply an interrupt that has to wake a task,
+ * and often a vCPU that halted meanwhile -- a few microseconds each, on
+ * every one of the dozen or so round trips a presented frame makes. A
+ * spinning vCPU does not halt, so it costs the host no more than KVM's own
+ * halt polling would have. 0 sleeps at once, as before. Executor-class
+ * requests (a commit, a modeset) never spin: they take milliseconds.
+ */
+static unsigned int nvgpu_rt_spin_us = 20;
+module_param_named(rt_spin_us, nvgpu_rt_spin_us, uint, 0644);
+MODULE_PARM_DESC(rt_spin_us, "microseconds to spin for a reply before "
+                             "sleeping (default 20, 0 never spins)");
+
+/*
+ * Whether HELLO offers to arm device readiness (NVGPU_GCAP_ARMS_READY): the
+ * backend then reports an RM descriptor's events once per wait here instead
+ * of once per event. 0 is for measuring what that saves.
+ */
+static bool nvgpu_arm_ready = true;
+module_param_named(arm_ready, nvgpu_arm_ready, bool, 0444);
+MODULE_PARM_DESC(arm_ready, "arm RM descriptor readiness per wait (default "
+                            "on; takes effect at HELLO)");
 
 struct nvgpu_times {
   u64 t0; /* just before the request went on the ring */
@@ -689,6 +715,20 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   if (kick)
     virtqueue_notify(dev->ctrl_vq);
 
+  if (!(flags & NVGPU_XF_EXECUTOR)) {
+    u32 spin_us = READ_ONCE(nvgpu_rt_spin_us);
+
+    if (spin_us) {
+      u64 until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
+
+      /* The callback completes it from the interrupt, which still comes;
+       * this only keeps the caller on its CPU meanwhile. */
+      while (!completion_done(&r->done) && !need_resched() &&
+             ktime_get_ns() < until)
+        cpu_relax();
+    }
+  }
+
   wret = wait_for_completion_killable_timeout(
       &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
                                             : NVGPU_INLINE_TIMEOUT);
@@ -886,6 +926,7 @@ enum nvgpu_close_what {
   NVGPU_CLOSE_HANDLE, /* CLOSE `handle` */
   NVGPU_CLOSE_GEM,    /* GEM_CLOSE `id` in the file `handle` */
   NVGPU_CLOSE_MUNMAP, /* MUNMAP mapping `id`, made through `handle` */
+  NVGPU_ARM_READY,    /* WATCH `handle` with NVGPU_W_ARM (not a close) */
 };
 
 struct nvgpu_close_work {
@@ -900,7 +941,7 @@ struct nvgpu_close_work {
   void *arg;
 };
 
-static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
+static bool nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
                               enum nvgpu_close_what what,
                               void (*release)(void *arg), void *arg);
 
@@ -1018,6 +1059,10 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
   case NVGPU_CLOSE_MUNMAP:
     __nvgpu_munmap(cw->dev, cw->handle, cw->id, false);
     break;
+  case NVGPU_ARM_READY:
+    /* A handle closed meanwhile answers EBADF, which is fine. */
+    nvgpu_watch(cw->dev, cw->handle, NVGPU_W_ARM, 0);
+    break;
   }
   kfree(cw);
   module_put(THIS_MODULE);
@@ -1031,7 +1076,7 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
  * `release` (NVGPU_CLOSE_GEM only) runs here when the close is never queued,
  * so a caller passing one must be in process context.
  */
-static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
+static bool nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
                               enum nvgpu_close_what what,
                               void (*release)(void *arg), void *arg) {
   struct nvgpu_xfer *xf = dev->xfer;
@@ -1066,16 +1111,21 @@ static void nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
   __module_get(THIS_MODULE);
   queue_work(xf->wq, &cw->work);
   spin_unlock_irqrestore(&xf->lock, flags);
-  return;
+  return true;
 
 unqueued:
   /* Nothing will send it now, so nothing will act on it either. */
   if (release)
     release(arg);
+  return false;
 }
 
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle) {
   nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE, NULL, NULL);
+}
+
+bool nvgpu_arm_ready_async(struct nvgpu_device *dev, u32 handle) {
+  return nvgpu_queue_close(dev, handle, 0, NVGPU_ARM_READY, NULL, NULL);
 }
 
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
@@ -1704,6 +1754,11 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
    * nvgpu_proc_id_fill).
    */
   guest_caps = NVGPU_GCAP_PROC_ID | NVGPU_GCAP_PROC_EUID;
+  /* Readiness of a device descriptor once per wait on it (nvgpu_poll_mask),
+   * not once per host event: RM posts dozens a frame that nobody here
+   * waits for. */
+  if (nvgpu_arm_ready)
+    guest_caps |= NVGPU_GCAP_ARMS_READY;
   /* The backend hands out aperture offsets in 2 MiB granules, so a smaller
    * aperture is none. */
   if (dev->uvm_aperture.len >= SZ_2M) {
@@ -1788,7 +1843,10 @@ static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle) {
   spin_lock_irqsave(&dev->fds_lock, flags);
   list_for_each_entry(nfd, &dev->fds, node) {
     if (nfd->handle == handle) {
-      atomic_set(&nfd->pending, 1);
+      /* This report answers the arm; the next poll arms again. */
+      atomic_set(&nfd->armed, 0);
+      if (!atomic_xchg(&nfd->pending, 1))
+        nvgpu_pace_inc(NVGPU_PACE_EV_LEGACY_SET);
       wake_up_interruptible(&nfd->wq);
       break;
     }

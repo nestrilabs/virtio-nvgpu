@@ -1759,10 +1759,17 @@ impl NvidiaBackend {
             }
         };
         if let Some(fd) = watch {
+            // Once per guest wait for a guest that arms RM readiness
+            // (BCAP_ARMED_READY); every host event otherwise.
+            let mode = if self.session.armed_ready && kind.readiness_is_armed() {
+                WatchMode::LegacyArmed
+            } else {
+                WatchMode::Legacy
+            };
             self.pump_cmds.push(PumpCmd::Watch {
                 handle: guest_handle,
                 fd,
-                mode: WatchMode::Legacy,
+                mode,
             });
         }
         self.created.push(guest_handle);

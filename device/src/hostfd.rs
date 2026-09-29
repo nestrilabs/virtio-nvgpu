@@ -47,6 +47,18 @@ pub enum HandleKind {
 }
 
 impl HandleKind {
+    /// Whether this handle's legacy readiness is armed per guest wait for a
+    /// guest that arms it (`BCAP_ARMED_READY`, pump.rs `LegacyArmed`): the
+    /// RM devices, which a guest waits on with poll() alone. Not the modeset
+    /// device, whose readiness is NVKMS's event queue (consumed by its own
+    /// ioctl, nvgpu_nvkms.c), nor a Wayland channel.
+    pub fn readiness_is_armed(self) -> bool {
+        matches!(
+            self,
+            Self::Dev(DeviceKind::Ctl | DeviceKind::Gpu(_) | DeviceKind::Uvm | DeviceKind::UvmTools)
+        )
+    }
+
     /// The `HK_*` wire value.
     pub fn wire(self) -> u32 {
         match self {

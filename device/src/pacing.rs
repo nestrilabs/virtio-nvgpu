@@ -209,6 +209,17 @@ pub struct Counters {
     pub no_buffer: AtomicU64,
     /// Sweeps the pump ran (each at most one a millisecond).
     pub sweeps: AtomicU64,
+    /// Kicks on the event queue (the guest handing buffers back after the
+    /// pump asked for one).
+    pub event_kicks: AtomicU64,
+    /// Chains the queue thread found by looking at the ring after a drain
+    /// (`--queue-poll-us`), each a guest kick and a wakeup saved.
+    pub queue_polled: AtomicU64,
+    /// Armed-readiness mode: the guest's arms, and host events on legacy
+    /// handles nobody waited on (each a record, and often a guest
+    /// interrupt, that did not have to be sent).
+    pub arms: AtomicU64,
+    pub ev_unarmed: AtomicU64,
     /// IOCTL2s by schema name.
     ioctl2_names: Mutex<BTreeMap<&'static str, [u64; 2]>>,
 }
@@ -237,6 +248,10 @@ impl Counters {
             pump_delivery: Hist::new(),
             no_buffer: AtomicU64::new(0),
             sweeps: AtomicU64::new(0),
+            event_kicks: AtomicU64::new(0),
+            queue_polled: AtomicU64::new(0),
+            arms: AtomicU64::new(0),
+            ev_unarmed: AtomicU64::new(0),
             ioctl2_names: Mutex::new(BTreeMap::new()),
         }
     }
@@ -301,6 +316,8 @@ impl Counters {
             pump_delivery: self.pump_delivery.snap(),
             no_buffer: load(&self.no_buffer),
             sweeps: load(&self.sweeps),
+            kicks: [load(&self.event_kicks), load(&self.queue_polled)],
+            armed: [load(&self.arms), load(&self.ev_unarmed)],
             ioctl2_names: self
                 .ioctl2_names
                 .lock()
@@ -337,6 +354,10 @@ pub struct Snap {
     pub pump_delivery: HistSnap,
     pub no_buffer: u64,
     pub sweeps: u64,
+    /// event-queue kicks, chains found by polling the control ring
+    pub kicks: [u64; 2],
+    /// arms, legacy events while unarmed (not sent)
+    pub armed: [u64; 2],
     pub ioctl2_names: BTreeMap<&'static str, [u64; 2]>,
 }
 
@@ -449,7 +470,8 @@ pub fn summary(prev: Option<&Snap>, now: &Snap, start: Instant) -> Vec<String> {
     };
     out.push(format!(
         "pacing: events: readiness on an edge {:.0}/s, found by the sweep {:.0}/s ({:.0} sweeps/s); \
-         records ready={:.0}/s fence={:.0}/s drm={:.0}/s; no guest buffer {}",
+         records ready={:.0}/s fence={:.0}/s drm={:.0}/s; no guest buffer {}; event-queue kicks \
+         {:.0}/s; chains found by polling the ring {:.0}/s",
         rate(e[0]),
         rate(e[1]),
         rate(d(now.sweeps, prev.map(|p| p.sweeps))),
@@ -457,6 +479,13 @@ pub fn summary(prev: Option<&Snap>, now: &Snap, start: Instant) -> Vec<String> {
         rate(e[3]),
         rate(e[4]),
         d(now.no_buffer, prev.map(|p| p.no_buffer)),
+        rate(d(now.kicks[0], prev.map(|p| p.kicks[0]))),
+        rate(d(now.kicks[1], prev.map(|p| p.kicks[1]))),
+    ));
+    out.push(format!(
+        "pacing: legacy readiness: arms {:.0}/s, events nobody waited on {:.0}/s (not sent)",
+        rate(d(now.armed[0], prev.map(|p| p.armed[0]))),
+        rate(d(now.armed[1], prev.map(|p| p.armed[1]))),
     ));
     out.push(format!("pacing: fence signalled -> queued: {}", fd.fmt()));
     out.push(format!("pacing: pump woke -> queued: {}", pd.fmt()));

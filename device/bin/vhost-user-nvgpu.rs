@@ -204,6 +204,16 @@ struct Args {
     #[arg(long, value_name = "SECS")]
     pacing_stats: Option<u64>,
 
+    /// Microseconds the queue thread keeps looking at the control ring after
+    /// draining it, before it asks the guest to kick again (0: not at all).
+    /// A guest process presenting a frame sends a dozen requests one after
+    /// another; one that arrives while the thread still looks costs the
+    /// guest no kick (a VM exit) and this thread no wakeup. The price is
+    /// that much CPU after each burst: at most a core's worth under a
+    /// guest that never stops sending (DEPLOY.md, "Frame pacing").
+    #[arg(long, value_name = "US", default_value_t = 0)]
+    queue_poll_us: u64,
+
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
     ///
@@ -822,6 +832,13 @@ impl EventQueue for VringEventQueue {
             };
             chain
         };
+        // Buffers in hand: the guest need not kick as it posts more. Without
+        // EVENT_IDX it otherwise kicks on every buffer it hands back -- an
+        // exit, and a wakeup of the worker and of this thread, per batch of
+        // events; `want_kick` asks again when they run out. (With EVENT_IDX
+        // this is a no-op: the guest kicks only past the avail event that
+        // `want_kick` sets.)
+        let _ = ring.get_queue_mut().disable_notification(&*mem);
         let head = chain.head_index();
         let writable: Vec<(GuestAddress, u32)> = chain
             .filter(|d| d.is_write_only())
@@ -866,6 +883,8 @@ struct NvGpuBackend {
     /// The window the allocator was made with, which GET_SHMEM_CONFIG
     /// reports.
     window: ZoneConfig,
+    /// `--queue-poll-us`.
+    queue_poll: std::time::Duration,
 }
 
 impl NvGpuBackend {
@@ -951,7 +970,40 @@ impl NvGpuBackend {
             scanned_fds: false,
             allow_compute,
             window,
+            queue_poll: std::time::Duration::ZERO,
         })
+    }
+
+    /// Look at the control ring for up to `--queue-poll-us` for a chain the
+    /// guest posted after the last drain, notifications still off. True as
+    /// soon as there is one.
+    fn poll_for_more(&self, vring: &Vring) -> bool {
+        if self.queue_poll.is_zero() {
+            return false;
+        }
+        let Some(atomic) = self.shared.mem.read().unwrap().clone() else {
+            return false;
+        };
+        let mem = atomic.memory();
+        let until = std::time::Instant::now() + self.queue_poll;
+        loop {
+            {
+                let ring = vring.get_ref();
+                let q = ring.get_queue();
+                if q.avail_idx(&*mem, Ordering::Acquire)
+                    .is_ok_and(|a| a != std::num::Wrapping(q.next_avail()))
+                {
+                    device::pacing::PACING
+                        .queue_polled
+                        .fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Start the event pump on first use: it needs guest memory and the event
@@ -1245,6 +1297,9 @@ impl VhostUserBackendMut for NvGpuBackend {
         // so it is told to flush what it holds now rather than at its next
         // sweep.
         if device_event as usize == EVENT_QUEUE {
+            device::pacing::PACING
+                .event_kicks
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(h) = self.shared.pump.lock().unwrap().handle.as_ref() {
                 h.kick();
             }
@@ -1252,12 +1307,18 @@ impl VhostUserBackendMut for NvGpuBackend {
         }
 
         let vring = &vrings[device_event as usize];
-        if self.event_idx {
+        // With --queue-poll-us the drain loop runs whatever was negotiated:
+        // without EVENT_IDX, disabling sets VRING_USED_F_NO_NOTIFY, and the
+        // guest does not kick while this thread still looks.
+        if self.event_idx || !self.queue_poll.is_zero() {
             // With EVENT_IDX the guest suppresses notifications, so re-arm and
             // drain again rather than waiting for a kick that will not come.
             loop {
                 vring.disable_notification().ok();
                 self.process(vring)?;
+                if self.poll_for_more(vring) {
+                    continue;
+                }
                 if !vring.enable_notification().unwrap_or(false) {
                     break;
                 }
@@ -1677,7 +1738,7 @@ fn main() -> anyhow::Result<()> {
              run no compositor on this host"
         );
     }
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(
+    let mut nvgpu = NvGpuBackend::new(
         &args.proc_nvidia,
         abi_policy,
         args.rm_allowlist,
@@ -1685,7 +1746,17 @@ fn main() -> anyhow::Result<()> {
         wayland,
         args.allow_unmeasured_release,
         window,
-    )?));
+    )?;
+    // Past a millisecond it is a core spent for nothing a kick would not do.
+    nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
+    if !nvgpu.queue_poll.is_zero() {
+        log::warn!(
+            "--queue-poll-us {}: the queue thread looks at the control ring that long after \
+             each drain",
+            nvgpu.queue_poll.as_micros()
+        );
+    }
+    let backend = Arc::new(RwLock::new(nvgpu));
     if let Some(s) = &inject {
         let shared = backend.read().expect("backend lock").shared.clone();
         shared

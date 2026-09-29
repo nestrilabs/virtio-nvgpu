@@ -268,6 +268,13 @@ struct nvgpu_fd {
    */
   wait_queue_head_t wq;
   atomic_t pending;
+  /*
+   * With NVGPU_BCAP_ARMED_READY: an arm (W_ARM) was sent and its report has
+   * not come. The backend then reports one event per arm, so a poller that
+   * finds nothing pending arms before it sleeps, and one that takes a
+   * report arms for the next.
+   */
+  atomic_t armed;
   struct list_head node; /* dev->fds, for finding this by handle */
   /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
    * "not yet asked", which is why the counter starts at one. */
@@ -467,6 +474,9 @@ enum nvgpu_pace_ctr {
   NVGPU_PACE_EV_BATCHES,  /* event-queue buffers taken back */
   NVGPU_PACE_EV_RECORDS,  /* records in them */
   NVGPU_PACE_EV_LEGACY,   /* legacy readiness (RM event fds) among them */
+  NVGPU_PACE_EV_LEGACY_SET, /* ... that set `pending` (it was clear) */
+  NVGPU_PACE_POLLS,       /* poll()s of an RM descriptor */
+  NVGPU_PACE_POLLS_READY, /* ... that took a pending report */
   NVGPU_PACE_CTRS
 };
 void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
@@ -947,6 +957,9 @@ int nvgpu_close_handle(struct nvgpu_device *dev, u32 handle);
 int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 /* From any context: queued on a workqueue that holds a module reference. */
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
+/* A W_ARM of `handle`, sent from a work item: poll() cannot wait for it.
+ * False if it could not be queued. */
+bool nvgpu_arm_ready_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
 /* The same, and release(arg) once the host can no longer act on the close:

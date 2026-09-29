@@ -117,6 +117,9 @@ pub struct Session {
     pub proc_euid: bool,
     /// A guest that does not has been told of in the log, once a session.
     pub proc_ids_noted: bool,
+    /// The guest arms legacy readiness (HELLO's GCAP_ARMS_READY,
+    /// BCAP_ARMED_READY): one report per W_ARM.
+    pub armed_ready: bool,
 }
 
 /// A response, ready to be written into the chain it answers.
@@ -549,6 +552,7 @@ impl NvidiaBackend {
             self.session_reset("a new guest driver instance said HELLO");
         }
         self.session.v2 = true;
+        self.session.armed_ready = req.guest_caps & GCAP_ARMS_READY != 0;
         self.pump_cmds.push(PumpCmd::SetV2(true));
         let num_cards = if self.config.kms_card {
             self.host_nodes().cards.len() as u32
@@ -579,6 +583,12 @@ impl NvidiaBackend {
         }
         if self.inject.registry().is_some() {
             backend_caps |= BCAP_INJECT;
+        }
+        // Legacy readiness once per arm, for a guest that arms it: the host
+        // events nobody in the guest waits on -- most of them, in a render
+        // loop -- stop costing a record and an interrupt each.
+        if self.session.armed_ready {
+            backend_caps |= BCAP_ARMED_READY;
         }
         let resp = HelloResp {
             proto: PROTO_V2,
@@ -636,6 +646,16 @@ impl NvidiaBackend {
     fn serve_watch(&mut self, payload: &[u8]) -> Result<Reply, i32> {
         let req = read::<WatchReq>(payload).ok_or(libc::EINVAL)?;
         let kind = self.handles.kind(req.handle).ok_or(libc::EBADF)?;
+        if req.flags == W_ARM {
+            // An RM device handle's armed legacy watch, which OPEN made.
+            if !self.session.armed_ready || !kind.readiness_is_armed() {
+                return Err(libc::EINVAL);
+            }
+            self.pump_cmds.push(PumpCmd::Arm {
+                handle: req.handle,
+            });
+            return Ok(self.ok_reply(0, &[]));
+        }
         let mode = hostfd::watch_mode(kind, req.flags, req.cookie).inspect_err(|_| {
             log::warn!(
                 "WATCH handle {} ({kind:?}) with flags {:#x}: not a watch this kind supports",
@@ -1434,6 +1454,64 @@ mod tests {
         let cmds = be.take_pump_cmds();
         assert!(matches!(cmds[0], PumpCmd::Reset));
         assert!(matches!(cmds.last(), Some(PumpCmd::SetV2(true))));
+    }
+
+    /// Armed readiness is offered only to a guest that arms, and an arm is
+    /// taken only then and only on a device handle (the kind with a legacy
+    /// watch); it reaches the pump as an Arm.
+    #[test]
+    fn an_arm_is_taken_only_from_a_guest_that_arms_and_only_on_a_device_handle() {
+        let caps = |be: &mut NvidiaBackend, gcap: u32| {
+            let req = HelloReq {
+                proto: PROTO_V2,
+                flags: HELLO_F_FRESH,
+                guest_caps: gcap,
+                uvm_aperture_mib: 0,
+            };
+            let r = call(be, MsgType::Hello, 0, bytes_of(&req));
+            assert_eq!(status(&r), 0);
+            read::<HelloResp>(&r[HDR..]).unwrap().backend_caps
+        };
+        let arm = |h| WatchReq {
+            handle: h,
+            flags: W_ARM,
+            cookie: 0,
+        };
+        let mut be = backend();
+        assert_eq!(caps(&mut be, 0) & BCAP_ARMED_READY, 0);
+        let dev = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        assert_eq!(
+            status(&call(&mut be, MsgType::Watch, 0, bytes_of(&arm(dev)))),
+            -libc::EINVAL,
+            "an arm from a guest that did not say it arms"
+        );
+
+        assert_ne!(caps(&mut be, GCAP_ARMS_READY) & BCAP_ARMED_READY, 0);
+        be.take_pump_cmds();
+        let dev = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let ev = be.adopt_for_test(hostfd::new_eventfd().unwrap(), HandleKind::Eventfd);
+        // The modeset device's readiness is NVKMS's event queue, consumed
+        // its own way (nvgpu_nvkms.c): never armed.
+        let modeset = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Modeset));
+        for h in [ev, modeset] {
+            assert_eq!(
+                status(&call(&mut be, MsgType::Watch, 0, bytes_of(&arm(h)))),
+                -libc::EINVAL
+            );
+        }
+        assert_eq!(
+            status(&call(&mut be, MsgType::Watch, 0, bytes_of(&arm(999)))),
+            -libc::EBADF
+        );
+        assert!(be.take_pump_cmds().is_empty());
+        assert_eq!(
+            status(&call(&mut be, MsgType::Watch, 0, bytes_of(&arm(dev)))),
+            0
+        );
+        assert!(matches!(
+            be.take_pump_cmds()[..],
+            [PumpCmd::Arm { handle }] if handle == dev
+        ));
     }
 
     #[test]
