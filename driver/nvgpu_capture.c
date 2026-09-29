@@ -27,7 +27,6 @@
 #include <linux/dma-buf.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
-#include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -37,55 +36,25 @@
 #include "nvgpu.h"
 #include "uapi/nvgpu_capture.h"
 
-#define NVGPU_CAPTURE_MAX_DEVS 8
 /* The largest buffer a proxy is made for: as nvgpu_wl.c's imports. */
 #define NVGPU_CAPTURE_MAX_SIZE (1ull << 36)
 
+/* Nothing for "other" (nvgpu_misc_mode_ops): every guest process could try
+ * tokens. */
 static ushort nvgpu_capture_mode = 0660;
-
-static int nvgpu_capture_mode_set(const char *val,
-                                  const struct kernel_param *kp) {
-  u16 mode;
-  int ret = kstrtou16(val, 0, &mode);
-
-  if (ret)
-    return ret;
-  /* Nothing for "other": every guest process could try tokens. */
-  if (mode & ~0770)
-    return -EINVAL;
-  *(ushort *)kp->arg = mode;
-  return 0;
-}
-
-static const struct kernel_param_ops nvgpu_capture_mode_ops = {
-    .set = nvgpu_capture_mode_set,
-    .get = param_get_ushort,
-};
-module_param_cb(capture_mode, &nvgpu_capture_mode_ops, &nvgpu_capture_mode,
+module_param_cb(capture_mode, &nvgpu_misc_mode_ops, &nvgpu_capture_mode,
                 0444);
 MODULE_PARM_DESC(capture_mode, "permissions of /dev/nvgpu-capture* (default "
                                "0660, within 0770; the group comes from udev)");
 
-/*
- * One node per virtio device, refcounted as nvgpu_wl.c's: files opened
- * before remove() still name it, and it holds the nvgpu_device they use.
- */
+/* The device's one node (nvgpu_misc.c: files opened before remove() still
+ * name it, and it holds the nvgpu_device they use). */
 struct nvgpu_capture_dev {
-  struct miscdevice misc;
-  struct nvgpu_device *dev;
-  struct kref ref;
-  char name[20];
+  struct nvgpu_misc_node node;
 };
 
-static struct nvgpu_capture_dev *nvgpu_capture_devs[NVGPU_CAPTURE_MAX_DEVS];
-static DEFINE_MUTEX(nvgpu_capture_devs_lock);
-
-static void nvgpu_capture_dev_free(struct kref *ref) {
-  struct nvgpu_capture_dev *cd =
-      container_of(ref, struct nvgpu_capture_dev, ref);
-
-  nvgpu_dev_put(cd->dev);
-  kfree(cd);
+static void nvgpu_capture_dev_free(struct nvgpu_misc_node *node) {
+  kfree(container_of(node, struct nvgpu_capture_dev, node));
 }
 
 /*
@@ -164,7 +133,7 @@ again:
 
 static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
                                      void __user *uarg) {
-  struct nvgpu_device *dev = cd->dev;
+  struct nvgpu_device *dev = cd->node.dev;
   struct nvgpu_capture_open a;
   struct nvgpu_fd *nfd;
   struct dma_buf *buf;
@@ -227,7 +196,7 @@ static long nvgpu_capture_open_ioctl(struct nvgpu_capture_dev *cd,
  */
 static long nvgpu_capture_open_syncobj_ioctl(struct nvgpu_capture_dev *cd,
                                              void __user *uarg) {
-  struct nvgpu_device *dev = cd->dev;
+  struct nvgpu_device *dev = cd->node.dev;
   struct nvgpu_capture_open_syncobj a;
   struct nvgpu_fd *nfd;
   struct file *rf;
@@ -264,21 +233,19 @@ static long nvgpu_capture_open_syncobj_ioctl(struct nvgpu_capture_dev *cd,
 }
 
 static int nvgpu_capture_fopen(struct inode *inode, struct file *filp) {
-  struct miscdevice *m = filp->private_data;
-  struct nvgpu_capture_dev *cd =
-      container_of(m, struct nvgpu_capture_dev, misc);
+  struct nvgpu_misc_node *node = nvgpu_misc_node_open(filp);
 
-  if (!cd->dev->v2)
+  if (!node->dev->v2)
     return -ENODEV;
-  kref_get(&cd->ref); /* under misc_mtx, as nvgpu_wl_open() */
-  filp->private_data = cd;
+  nvgpu_misc_node_get(node); /* under misc_mtx (nvgpu_misc.c) */
+  filp->private_data = container_of(node, struct nvgpu_capture_dev, node);
   return 0;
 }
 
 static int nvgpu_capture_release(struct inode *inode, struct file *filp) {
   struct nvgpu_capture_dev *cd = filp->private_data;
 
-  kref_put(&cd->ref, nvgpu_capture_dev_free);
+  nvgpu_misc_node_put(&cd->node);
   return 0;
 }
 
@@ -307,7 +274,7 @@ static const struct file_operations nvgpu_capture_fops = {
 
 int nvgpu_capture_init(struct nvgpu_device *dev) {
   struct nvgpu_capture_dev *cd;
-  int slot, ret;
+  int ret;
 
   if (!dev->v2 || !(dev->backend_caps & NVGPU_BCAP_INJECT))
     return 0;
@@ -315,54 +282,21 @@ int nvgpu_capture_init(struct nvgpu_device *dev) {
   cd = kzalloc(sizeof(*cd), GFP_KERNEL);
   if (!cd)
     return -ENOMEM;
-
-  mutex_lock(&nvgpu_capture_devs_lock);
-  for (slot = 0; slot < NVGPU_CAPTURE_MAX_DEVS && nvgpu_capture_devs[slot];
-       slot++)
-    ;
-  if (slot == NVGPU_CAPTURE_MAX_DEVS) {
-    mutex_unlock(&nvgpu_capture_devs_lock);
-    kfree(cd);
-    return -ENOSPC;
-  }
-  if (slot == 0)
-    strscpy(cd->name, "nvgpu-capture", sizeof(cd->name));
-  else
-    snprintf(cd->name, sizeof(cd->name), "nvgpu-capture%d", slot);
-  cd->dev = dev;
-  nvgpu_dev_get(dev);
-  kref_init(&cd->ref);
-  cd->misc.minor = MISC_DYNAMIC_MINOR;
-  cd->misc.name = cd->name;
-  cd->misc.fops = &nvgpu_capture_fops;
-  cd->misc.parent = &dev->vdev->dev;
-  cd->misc.mode = nvgpu_capture_mode & 0777;
-  ret = misc_register(&cd->misc);
-  if (ret) {
-    mutex_unlock(&nvgpu_capture_devs_lock);
-    kref_put(&cd->ref, nvgpu_capture_dev_free);
+  ret = nvgpu_misc_node_register(&cd->node, dev, "nvgpu-capture",
+                                 nvgpu_capture_mode, &nvgpu_capture_fops,
+                                 nvgpu_capture_dev_free);
+  if (ret)
     return ret;
-  }
-  nvgpu_capture_devs[slot] = cd;
-  mutex_unlock(&nvgpu_capture_devs_lock);
+  dev->capture_node = &cd->node;
   dev_info(&dev->vdev->dev,
            "virtio-gpu-nv: /dev/%s for the host's capture helper\n",
-           cd->name);
+           cd->node.misc.name);
   return 0;
 }
 
 void nvgpu_capture_cleanup(struct nvgpu_device *dev) {
-  int slot;
-
-  mutex_lock(&nvgpu_capture_devs_lock);
-  for (slot = 0; slot < NVGPU_CAPTURE_MAX_DEVS; slot++) {
-    struct nvgpu_capture_dev *cd = nvgpu_capture_devs[slot];
-
-    if (!cd || cd->dev != dev)
-      continue;
-    misc_deregister(&cd->misc);
-    nvgpu_capture_devs[slot] = NULL;
-    kref_put(&cd->ref, nvgpu_capture_dev_free);
-  }
-  mutex_unlock(&nvgpu_capture_devs_lock);
+  if (!dev->capture_node)
+    return;
+  nvgpu_misc_node_unregister(dev->capture_node);
+  dev->capture_node = NULL;
 }

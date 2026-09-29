@@ -36,7 +36,6 @@
 #include <linux/dma-buf.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
-#include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/pid.h>
@@ -54,27 +53,19 @@
 
 MODULE_IMPORT_NS("DMA_BUF");
 
-#define NVGPU_WL_MAX_DEVS 8
 /* The largest host buffer imported as a guest dma-buf: far past any
  * framebuffer, and far below what PAGE_ALIGN() could wrap. */
 #define NVGPU_WL_MAX_IMPORT (1ull << 36)
 
 /*
- * One /dev/nvgpu-wl per virtio device. Refcounted: remove deregisters the
- * misc device, but files opened before that still name this struct until
- * they are released. The open takes its reference under misc_mtx, which
- * misc_deregister() also takes (drivers/char/misc.c:125-165, 284-293), so no
- * open can find it once cleanup has dropped the initial one. And it holds
- * the nvgpu_device, which such a file's release and ioctls use, until it
- * goes itself: remove() alone would free it under them (S-26).
+ * The device's one /dev/nvgpu-wl. Refcounted (nvgpu_misc.c): remove
+ * deregisters the node, but files opened before that still name this struct
+ * until they are released, and it holds the nvgpu_device they use.
  */
 struct nvgpu_wl_file;
 
 struct nvgpu_wl_dev {
-  struct miscdevice misc;
-  struct nvgpu_device *dev;
-  struct kref ref;
-  char name[16];
+  struct nvgpu_misc_node node;
   /*
    * Export mode: the file holding the one LISTEN channel, and the effective
    * uid it was made with, which is the only one that may ACCEPT (besides
@@ -88,11 +79,10 @@ struct nvgpu_wl_dev {
   kuid_t listener_euid;
 };
 
-static void nvgpu_wl_dev_free(struct kref *ref) {
-  struct nvgpu_wl_dev *wl = container_of(ref, struct nvgpu_wl_dev, ref);
+static void nvgpu_wl_dev_free(struct nvgpu_misc_node *node) {
+  struct nvgpu_wl_dev *wl = container_of(node, struct nvgpu_wl_dev, node);
 
   mutex_destroy(&wl->listen_lock);
-  nvgpu_dev_put(wl->dev);
   kfree(wl);
 }
 
@@ -103,32 +93,12 @@ static void nvgpu_wl_dev_free(struct kref *ref) {
  * root:root 0660 by default, and a group for the daemon from udev
  * (contrib/udev/70-nvgpu-wl.rules). A mode that gives "other" anything is
  * refused (the module does not load with it): that would make every guest
- * process a client of the host's compositor.
+ * process a client of the host's compositor (nvgpu_misc_mode_ops).
  */
 static ushort nvgpu_wl_mode = 0660;
-
-static int nvgpu_wl_mode_set(const char *val, const struct kernel_param *kp) {
-  u16 mode;
-  int ret = kstrtou16(val, 0, &mode);
-
-  if (ret)
-    return ret;
-  if (mode & ~0770)
-    return -EINVAL;
-  *(ushort *)kp->arg = mode;
-  return 0;
-}
-
-static const struct kernel_param_ops nvgpu_wl_mode_ops = {
-    .set = nvgpu_wl_mode_set,
-    .get = param_get_ushort,
-};
-module_param_cb(wl_mode, &nvgpu_wl_mode_ops, &nvgpu_wl_mode, 0444);
+module_param_cb(wl_mode, &nvgpu_misc_mode_ops, &nvgpu_wl_mode, 0444);
 MODULE_PARM_DESC(wl_mode, "permissions of /dev/nvgpu-wl* (default 0660, "
                           "within 0770; the group comes from udev)");
-
-static struct nvgpu_wl_dev *nvgpu_wl_devs[NVGPU_WL_MAX_DEVS];
-static DEFINE_MUTEX(nvgpu_wl_devs_lock);
 
 struct nvgpu_wl_file {
   /* Handle, waitqueue and `pending`, and the registry entry legacy
@@ -209,7 +179,7 @@ static int nvgpu_wl_frame_check(const struct nvgpu_wl_frame_hdr *h, u32 len,
 /* ── HELLO ── */
 
 static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
-  struct nvgpu_device *dev = wf->wl->dev;
+  struct nvgpu_device *dev = wf->wl->node.dev;
   struct nvgpu_wl_hello *h;
   s64 now;
   int i, n = 0;
@@ -338,7 +308,7 @@ static void nvgpu_wl_export_unclaim(struct nvgpu_wl_file *wf) {
 static long nvgpu_wl_bind(struct nvgpu_wl_file *wf,
                           const struct nvgpu_wl_connect *cp,
                           struct task_struct *peer) {
-  struct nvgpu_device *dev = wf->wl->dev;
+  struct nvgpu_device *dev = wf->wl->node.dev;
   struct nvgpu_wl_connect c = *cp;
   struct nvgpu_open_req_proc reqp = {};
   struct nvgpu_open_req *req = &reqp.req;
@@ -545,7 +515,7 @@ static void nvgpu_wl_held_release(void *arg) {
 }
 
 static long nvgpu_wl_send(struct nvgpu_wl_file *wf, void __user *uarg) {
-  struct nvgpu_device *dev = wf->wl->dev;
+  struct nvgpu_device *dev = wf->wl->node.dev;
   const size_t H = sizeof(struct nvgpu_msg_hdr);
   struct nvgpu_wl_xfer x;
   struct nvgpu_msg_hdr hdr = {};
@@ -808,7 +778,7 @@ static unsigned int nvgpu_wl_reap_recv_from(struct nvgpu_device *dev,
                                             u32 used, u32 first);
 
 static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
-  struct nvgpu_device *dev = wf->wl->dev;
+  struct nvgpu_device *dev = wf->wl->node.dev;
   const size_t H = sizeof(struct nvgpu_msg_hdr);
   struct nvgpu_wl_xfer x;
   struct nvgpu_msg_hdr hdr = {};
@@ -1003,17 +973,16 @@ out:
 /* ── file operations ── */
 
 static int nvgpu_wl_open(struct inode *inode, struct file *filp) {
-  struct miscdevice *m = filp->private_data;
-  struct nvgpu_wl_dev *wl = container_of(m, struct nvgpu_wl_dev, misc);
+  struct nvgpu_misc_node *node = nvgpu_misc_node_open(filp);
   struct nvgpu_wl_file *wf;
 
-  if (!wl->dev->v2)
+  if (!node->dev->v2)
     return -ENODEV;
   wf = kzalloc(sizeof(*wf), GFP_KERNEL);
   if (!wf)
     return -ENOMEM;
-  kref_get(&wl->ref); /* under misc_mtx: see struct nvgpu_wl_dev */
-  wf->wl = wl;
+  nvgpu_misc_node_get(node); /* under misc_mtx (nvgpu_misc.c) */
+  wf->wl = container_of(node, struct nvgpu_wl_dev, node);
   mutex_init(&wf->lock);
   init_waitqueue_head(&wf->nfd.wq);
   filp->private_data = wf;
@@ -1022,7 +991,7 @@ static int nvgpu_wl_open(struct inode *inode, struct file *filp) {
 
 static int nvgpu_wl_release(struct inode *inode, struct file *filp) {
   struct nvgpu_wl_file *wf = filp->private_data;
-  struct nvgpu_device *dev = wf->wl->dev;
+  struct nvgpu_device *dev = wf->wl->node.dev;
 
   if (wf->bound) {
     /* Nothing can wake us once these return; then the host connection. */
@@ -1034,7 +1003,7 @@ static int nvgpu_wl_release(struct inode *inode, struct file *filp) {
   if (wf->rbuf)
     nvgpu_tbuf_free(wf->rbuf);
   mutex_destroy(&wf->lock);
-  kref_put(&wf->wl->ref, nvgpu_wl_dev_free);
+  nvgpu_misc_node_put(&wf->wl->node);
   kfree(wf);
   return 0;
 }
@@ -1109,7 +1078,7 @@ static const struct file_operations nvgpu_wl_fops = {
 
 int nvgpu_wl_init(struct nvgpu_device *dev) {
   struct nvgpu_wl_dev *wl;
-  int slot, ret;
+  int ret;
 
   if (!dev->v2 ||
       !(dev->backend_caps & (NVGPU_BCAP_WAYLAND | NVGPU_BCAP_WL_EXPORT)))
@@ -1118,27 +1087,7 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
   wl = kzalloc(sizeof(*wl), GFP_KERNEL);
   if (!wl)
     return -ENOMEM;
-
-  mutex_lock(&nvgpu_wl_devs_lock);
-  for (slot = 0; slot < NVGPU_WL_MAX_DEVS && nvgpu_wl_devs[slot]; slot++)
-    ;
-  if (slot == NVGPU_WL_MAX_DEVS) {
-    mutex_unlock(&nvgpu_wl_devs_lock);
-    kfree(wl);
-    return -ENOSPC;
-  }
-  if (slot == 0)
-    strscpy(wl->name, "nvgpu-wl", sizeof(wl->name));
-  else
-    snprintf(wl->name, sizeof(wl->name), "nvgpu-wl%d", slot);
-  wl->dev = dev;
-  nvgpu_dev_get(dev);
-  kref_init(&wl->ref);
   mutex_init(&wl->listen_lock);
-  wl->misc.minor = MISC_DYNAMIC_MINOR;
-  wl->misc.name = wl->name;
-  wl->misc.fops = &nvgpu_wl_fops;
-  wl->misc.parent = &dev->vdev->dev;
   /*
    * Not like /dev/nvidia* and the render node, which any guest process may
    * use: a channel makes its opener a client of the host's compositor (host
@@ -1147,19 +1096,16 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
    * clients reach it through the daemon's socket, which sits in theirs; the
    * node is for the daemon (wl_mode above).
    */
-  wl->misc.mode = nvgpu_wl_mode & 0777;
-  ret = misc_register(&wl->misc);
+  ret = nvgpu_misc_node_register(&wl->node, dev, "nvgpu-wl", nvgpu_wl_mode,
+                                 &nvgpu_wl_fops, nvgpu_wl_dev_free);
   if (ret) {
-    mutex_unlock(&nvgpu_wl_devs_lock);
-    dev_warn(&dev->vdev->dev, "virtio-gpu-nv: /dev/%s: misc_register: %d\n",
-             wl->name, ret);
-    kref_put(&wl->ref, nvgpu_wl_dev_free);
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: /dev/nvgpu-wl: misc_register: %d\n", ret);
     return ret;
   }
-  nvgpu_wl_devs[slot] = wl;
-  mutex_unlock(&nvgpu_wl_devs_lock);
+  dev->wl_node = &wl->node;
   dev_info(&dev->vdev->dev, "virtio-gpu-nv: /dev/%s for the host compositor\n",
-           wl->name);
+           wl->node.misc.name);
   return 0;
 }
 
@@ -1208,17 +1154,8 @@ static unsigned int nvgpu_wl_reap_recv_from(struct nvgpu_device *dev,
 }
 
 void nvgpu_wl_cleanup(struct nvgpu_device *dev) {
-  int slot;
-
-  mutex_lock(&nvgpu_wl_devs_lock);
-  for (slot = 0; slot < NVGPU_WL_MAX_DEVS; slot++) {
-    struct nvgpu_wl_dev *wl = nvgpu_wl_devs[slot];
-
-    if (!wl || wl->dev != dev)
-      continue;
-    misc_deregister(&wl->misc);
-    nvgpu_wl_devs[slot] = NULL;
-    kref_put(&wl->ref, nvgpu_wl_dev_free);
-  }
-  mutex_unlock(&nvgpu_wl_devs_lock);
+  if (!dev->wl_node)
+    return;
+  nvgpu_misc_node_unregister(dev->wl_node);
+  dev->wl_node = NULL;
 }

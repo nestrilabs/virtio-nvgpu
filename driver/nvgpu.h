@@ -15,6 +15,7 @@
 #include <linux/kobject.h>
 #include <linux/kref.h>
 #include <linux/list.h>
+#include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/refcount.h>
@@ -258,6 +259,10 @@ struct nvgpu_device {
 
   /* /proc/driver/nvidia's files' data (nvgpu_main.c, struct nvgpu_proc_buf). */
   struct list_head proc_bufs;
+
+  /* /dev/nvgpu-wl and /dev/nvgpu-capture, when registered (nvgpu_misc.c). */
+  struct nvgpu_misc_node *wl_node;
+  struct nvgpu_misc_node *capture_node;
 };
 
 /*
@@ -827,6 +832,36 @@ void nvgpu_fence_drain(void);
 /* The transport of `dev` is dead: signal its host fences with -ENODEV and
  * its SYNCOBJ_EVENTFD subscribers, and wake its syncobj waiters. */
 void nvgpu_fence_device_dead(struct nvgpu_device *dev);
+
+/* ───────── nvgpu_misc.c ───────── */
+
+/*
+ * A misc node of a device besides the NVIDIA ones (/dev/nvgpu-wl,
+ * /dev/nvgpu-capture), embedded in its subsystem's own struct. Refcounted:
+ * registration holds one reference, and each open file one more (taken in
+ * its open, under misc_mtx, so none is taken after unregister). The node
+ * holds a reference on `dev` until its last put, which then calls `free` on
+ * it.
+ */
+struct nvgpu_misc_node {
+  struct miscdevice misc;
+  struct nvgpu_device *dev;
+  struct kref ref;
+  void (*free)(struct nvgpu_misc_node *node);
+};
+/* For a node's mode parameter: within 0770, nothing for "other". */
+extern const struct kernel_param_ops nvgpu_misc_mode_ops;
+/* Register `node` as /dev/`name`; on failure it has been put (and freed). */
+int nvgpu_misc_node_register(struct nvgpu_misc_node *node,
+                             struct nvgpu_device *dev, const char *name,
+                             ushort mode, const struct file_operations *fops,
+                             void (*free)(struct nvgpu_misc_node *node));
+/* remove(): no new opens, and registration's reference dropped. */
+void nvgpu_misc_node_unregister(struct nvgpu_misc_node *node);
+/* In a node's .open: the node, whose reference the file then takes. */
+struct nvgpu_misc_node *nvgpu_misc_node_open(struct file *filp);
+void nvgpu_misc_node_get(struct nvgpu_misc_node *node);
+void nvgpu_misc_node_put(struct nvgpu_misc_node *node);
 
 /* ───────── nvgpu_capture.c ───────── */
 

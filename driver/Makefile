@@ -11,7 +11,8 @@ obj-$(CONFIG_VIRTIO_GPU_NV) += virtio_gpu_nv.o
 # which is the module's own name, so the core is nvgpu_main.c.
 virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
                    nvgpu_kms.o nvgpu_fence.o nvgpu_nvkms.o nvgpu_wl.o \
-                   nvgpu_capture.o nvgpu_osdesc.o nvgpu_xfer.o nvgpu_v1.o
+                   nvgpu_capture.o nvgpu_misc.o nvgpu_osdesc.o nvgpu_xfer.o \
+                   nvgpu_v1.o
 
 # Which implementation parses what a guest process hands the module -- the
 # IOCTL2 schema walk, RM escapes' parameter blocks and deep segments, OS
