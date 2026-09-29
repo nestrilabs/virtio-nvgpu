@@ -3468,7 +3468,8 @@ impl NvidiaBackend {
             }
             if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
                 log::warn!("nested ioctl(0x{request:x}) no-params failed: errno={errno}");
-                return fail(self, resp_buf, Status::IoctlFailed, errno);
+                let back = a.reply(top)[..outer_size].to_vec();
+                return self.write_failed_resp(resp_buf, cookie, &back, errno);
             }
             let outer = &a.bytes(top)[..outer_size];
             if escape == 0x2a {
@@ -3774,7 +3775,11 @@ impl NvidiaBackend {
         }
         if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
             log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
-            return fail(self, resp_buf, Status::IoctlFailed, errno);
+            // The block and its parameters as the host left them; no deep
+            // block, which the guest reads only from a success.
+            let mut back = a.reply(top)[..outer_size].to_vec();
+            back.extend_from_slice(&a.reply(nb));
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
 
         // RM reports two different things in two different places, and only
@@ -4373,7 +4378,8 @@ impl NvidiaBackend {
         let rc = self.host_call(&mut a, host_fd, request, top);
         if let Err(errno) = rc {
             log::debug!("ioctl(0x{request:x}/0x{escape:02x}) failed: errno={errno}");
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let back = a.reply(top)[..n_in].to_vec();
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
         // The host's bytes, with the caller's values in every field the plan
         // declared; only what the guest sent goes back.
@@ -4464,7 +4470,8 @@ impl NvidiaBackend {
             } else {
                 log::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
             }
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let back = a.reply(top)[..param_in.len()].to_vec();
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
 
         // The guest's handle back in place of our descriptor. It is not
@@ -5357,6 +5364,39 @@ impl NvidiaBackend {
         param_out: &[u8],
         deep_len: usize,
     ) -> usize {
+        self.write_ioctl_resp_status(resp_buf, cookie, param_out, deep_len, 0)
+    }
+
+    /// A host call that failed with `errno`, answered as nvidia.ko answers
+    /// it: the errno, and the argument block as the host left it, which
+    /// nv.c copies out on every error but EFAULT (nv.c:2869-2878) and
+    /// drm_ioctl unconditionally. So a caller reads what RM wrote before
+    /// failing -- CHECK_VERSION_STR's reply word and RM's own version
+    /// string on a mismatch, which libnvidia prints (review 2026-09-29 2.1,
+    /// parity #23). The guest copies bytes that come with a negative
+    /// status (nvgpu_rmio.c).
+    fn write_failed_resp(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_out: &[u8],
+        errno: i32,
+    ) -> usize {
+        let errno = errno.saturating_abs();
+        if errno == 0 || errno == libc::EFAULT || param_out.is_empty() {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+        self.write_ioctl_resp_status(resp_buf, cookie, param_out, 0, -errno)
+    }
+
+    fn write_ioctl_resp_status(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_out: &[u8],
+        deep_len: usize,
+        status: i32,
+    ) -> usize {
         let data_len = (self.current_data_len as usize).min(param_out.len());
         let deep_len = deep_len.min(param_out.len() - data_len);
         let nested_len = param_out.len() - data_len - deep_len;
@@ -5372,7 +5412,7 @@ impl NvidiaBackend {
             &MsgHeader {
                 msg_type: self.current_msg as u32,
                 handle: self.current_handle,
-                status: 0,
+                status,
                 req_id: self.current_req_id,
             },
         );
@@ -6736,6 +6776,45 @@ mod tests {
             assert_eq!(VERSION_CMD.with(|c| c.take()), Some(cmd), "not rewritten");
             assert_eq!(resp[IOCTL_BODY + 4], 1, "the host's reply word");
         }
+    }
+
+    /// CHECK_VERSION_STR that RM fails: the guest reads RM's reply word
+    /// and its version string with the errno, as nvidia.ko copies the block
+    /// out on failure, and libnvidia can say which versions disagree
+    /// (review 2026-09-29 2.1, parity #23). EFAULT copies nothing.
+    #[test]
+    fn a_failed_call_comes_back_with_the_block_as_the_host_left_it() {
+        use abi::ioctl::NV_ESC_CHECK_VERSION_STR;
+        fn mismatch(_: RawFd, _: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+            let b = arg.bytes();
+            b[4] = 1;
+            b[8..72].fill(0);
+            b[8..17].copy_from_slice(b"595.99.02");
+            -libc::EINVAL
+        }
+        fn fault(_: RawFd, _: u64, _: &mut crate::sys::block::Arg<'_>) -> i32 {
+            -libc::EFAULT
+        }
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(mismatch);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let check = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_CHECK_VERSION_STR, 72);
+        let mut p = vec![0u8; 72];
+        p[0] = b'1';
+        p[8..17].copy_from_slice(b"580.95.05");
+        let resp = v1_ioctl(&mut be, ctl, check, &p);
+        assert_eq!(parse_resp(&resp).status, -libc::EINVAL);
+        assert_eq!(resp[IOCTL_BODY + 4], 1, "RM's reply word");
+        assert_eq!(
+            &resp[IOCTL_BODY + 8..IOCTL_BODY + 17],
+            b"595.99.02",
+            "RM's version"
+        );
+        be.set_host_ioctl_for_test(fault);
+        let resp = v1_ioctl(&mut be, ctl, check, &p);
+        assert_eq!(parse_resp(&resp).status, -libc::EFAULT);
+        assert_eq!(resp.len(), size_of::<MsgHeader>(), "a bare header");
     }
 
     #[test]
