@@ -364,7 +364,7 @@ judges three things before RM sees the call (`device/src/rmshare.rs`):
 A refusal is RM's own answer to a caller without the right,
 NV_ERR_INSUFFICIENT_PERMISSIONS in the parameters' status with the ioctl
 succeeding, as for the host-PID controls. A block too short to hold the
-fields is EINVAL.
+fields is RM's NV_ERR_INVALID_ARGUMENT in the status (§22).
 
 Only the guest kernel knows which guest process makes a call, and as whom.
 The guest module says, when the backend asks for it in HELLO
@@ -1133,10 +1133,11 @@ In rough order of weight.
      convincing host login screen.
    - A guest client in Wayland mode reads the host clipboard when focused.
    - An export-mode peer is driven by the guest.
-8. **A host driver older than 535.129.03** gets no RM profile. The backend
-   then forwards RM escapes with no size check and logs a warning
-   (`set_driver_version`, `device/src/nvidia.rs`). It does not refuse them.
-   Pointer scrubbing still applies, and UVM and NVKMS fail closed there.
+8. **A host driver older than 535.129.03** gets no RM profile. The
+   transport refuses to start on it (`release_gate`), and inside the
+   backend every RM escape with no profile -- or with no host version set
+   at all, as a library user might leave it -- is refused (EINVAL); the
+   version is never learned from a guest's CHECK_VERSION_STR (§22).
 9. **The on-device negative test has a hole.** In
    `rig/verify/sec-negative.c`, the VID_HEAP_CONTROL half of T1 sets
    function 8 where ALLOC_OS_DESCRIPTOR is 27 (`nvos.h`), and sends a
@@ -1894,7 +1895,8 @@ the host's version once for itself, and the backend reads it from
 of another release run against this RM, with its structures sized for the
 other release. Userspace must match the host's module, as natively
 (`nvgpu-userspace` stages the host's own); a mismatch now fails in the
-guest as RM's API-mismatch error, with RM's usual `NVRM: API mismatch`
+guest as RM's API-mismatch error -- since §22 with RM's reply word and
+version string copied back as nvidia.ko copies them -- with RM's usual `NVRM: API mismatch`
 line (the backend's process name) in the host's kernel log. Test:
 `sys_params_and_check_version_go_as_sent_and_come_back_as_answered`.
 
@@ -1963,7 +1965,7 @@ since (below).
 | 10 | low | an OPEN_KMS card file was charged to whichever process the queue thread served last | fixed: the owner is taken when the call is served | f41a67b |
 | 11 | low | pump instructions were forwarded after the backend lock was dropped, so a CLOSE's Unwatch could overtake an earlier Watch and leave the pump a duplicate of a closed file (a master, a lease) | fixed: the pump's lock is taken before the backend's is let go, at every site | 2643f5d |
 | 12 | low, cross-VM | GETPROPBLOB read any blob by id: other VMs' MODE_ID and damage clips, the host desktop's EDIDs | fixed: only blobs a file of this VM made (until destroyed or closed) or saw as the value of a blob property of an object it can see (OBJ_GETPROPERTIES, GETCONNECTOR); ENOENT otherwise. A blob reported and freed since stays readable until asked again: another tenant would have to get that very id meanwhile | 20dbc70 |
-| 13 | low | descriptors were classified by their `/proc/self/fd` link text, a path: a same-uid process with a mount namespace of its own could pass a FUSE file at `/dmabuf:x` and stall the reader | fixed: by `fstatfs`'s f_type first (anon_inodefs, the dma-buf fs, shmem or hugetlbfs), then the link; fstatfs added to the seccomp list | d97cfe1 |
+| 13 | low | descriptors were classified by their `/proc/self/fd` link text, a path: a same-uid process with a mount namespace of its own could pass a FUSE file at `/dmabuf:x` and stall the reader | fixed in part: by `fstatfs`'s f_type first, then the link -- but `fstat` and `fstatfs` themselves still asked a FUSE server; fully fixed in §22 (cached `statx`, filesystem by device, dma-buf by fdinfo) | d97cfe1, §22 |
 | 14 | low, DoS | a display file handed to the closer was refunded to the handle table at once, so a stuck closer let a guest queue host files without bound, to EMFILE for the whole VM | fixed: counted against the table and the owner's share until the closer has closed it | 69e8306 |
 | 19 | low | (a) `map_unrecorded` reusing a placement keyed (handle, 0) on an RM file; (b) a freed parent left its children's memory records | (a) not a finding: RM keeps one mapping context per file (nv-usermap.c: a second is NV_ERR_STATE_IN_USE), so every mmap of the file maps the same memory. (b) fixed: each object's parent is kept and a free takes the subtree; a guest freeing devices in a loop could fill the table and leave other processes' memory unrecorded | c9ff8ef |
 
@@ -2702,8 +2704,11 @@ guest RAM, nothing about what they may do; `taskset` and `chrt` run before
 the backend's sandbox and the VMM's jail, which are unchanged. The launcher's
 default 100 µs EEVDF slice for the VMM's and backend's threads changes how
 soon they run after waking, not their share of the CPU (their weight is
-the default one), and it is the launcher's to set: nothing in the guest can
-change it.
+the default one). The backend sets its own threads' slice from
+`--sched-slice-us` (default 100; 0 keeps the one it started with), keeping
+a fair policy the launcher or unit chose and leaving a real-time one alone;
+a launcher with a slice of its own passes it there too (§22). Nothing in the
+guest can change it.
 crosvm's `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`) gives up
 the per-vCPU core-scheduling cookies crosvm sets by default, which keep an
 SMT sibling from running another task while a vCPU runs: a mitigation for
@@ -2758,8 +2763,10 @@ the change is on the host's side of a check.
 **The guest's reply polling** (`driver/nvgpu_xfer.c`). While callers spin
 for their replies (`rt_spin_us`, §20) and none sleeps for one, the control
 queue's interrupt is off and the spinning callers take replies off the ring
-themselves. Guest-internal: the host sees fewer interrupts to deliver and
-nothing else. Every ring operation stays under the transport's lock, as the
+themselves. The host sees fewer interrupts to deliver only since the
+backend honours the guest's suppression (§22): before, it signalled every
+completion however the guest asked, and the gain measured here was the spin
+alone. Nothing else changes on the host. Every ring operation stays under the transport's lock, as the
 interrupt handler's always was. A caller about to sleep for its reply -- an
 executor-class request, or one that spun out -- turns the interrupt back on
 first and takes whatever arrived while it was off (the virtio core's
@@ -2799,3 +2806,59 @@ placement it has made, after answering it. What this adds and does not:
   made (patch 0007) and which holds the VM; the jailed frontend is
   unchanged. nesbox does it in the VMM process; the call is an `ioctl`,
   which both VMMs' filters already allow.
+
+## 22. The 2026-09-29 review
+
+A read-only review of `display-passthrough` at 416dc54, in five parts
+(backend, guest module, Wayland and injection, VMMs and deployment,
+native parity). Finding numbers are the review's: `1.x` and `2.x` from its
+backend part, `#n` from its parity table, `S1`/`R1` from its Wayland part.
+
+### Backend
+
+| finding | what | status | commit |
+|---|---|---|---|
+| 1.1 (high) | an app's RM_MAP_MEMORY length near u64::MAX overflowed the window's `align_up` and aborted the backend for the whole VM | fixed: checked rounding, a length larger than any zone refused before a reservation, as RM's NV_ERR_NO_MEMORY | 3dde74c |
+| 1.10 | the same overflow from a guest kernel's MMAP size | fixed with 1.1 | 3dde74c |
+| 1.2 | past 2^31 handle allocations a handle read as a negative descriptor, failing event, fd and UVM registrations VM-wide | fixed: handles issued in [1, i32::MAX] | 284ef3c |
+| S1, R1 (high) | the Wayland dma-buf path and the IOCTL2 re-home PRIME-exported fence contexts, bypassing the 09-26 fix | fixed: one export gate (`device/src/exportgate.rs`) asked by HOST_OP, WL_SEND and the re-home: no fence context, no INJECT_OPEN handle, no tainted dma-buf | 2e4dfaa |
+| 1.3 | with `--allow-compute`, a client allocated under a registration's object handle released the registration while RM still pinned its pages | fixed: root classes end no registration | d85a279 |
+| 1.19 (in part) | a registration answered with object 0 could end another | fixed: object 0 ends nothing; both go with their client | d85a279 |
+| 1.4 | a fence context over registered memory was a holder osdesc did not know | fixed, failing closed: 0x54 over a surface that holds a registration is EPERM | c605af3 |
+| 1.5 | a KMS call finishing after a session reset recorded a blob under a dead serial, readable once the id was reused | fixed: reset keeps the retired marks; a file's drop purges its blobs | 35b47e0 |
+| 1.6 | syncobj-watch eventfd handles were charged to no process | fixed: charged to the watcher | c8b5700 |
+| 1.7 | classification still called `fstat`/`fstatfs`, which a FUSE server answers on its own schedule (§17 #13 incomplete) | fixed: cached `statx`, filesystem by device against the kernel's own mounts, dma-buf by fdinfo | 5726dff |
+| 1.8 | the OS-descriptor mapped-run and external-range budgets were per VM only | fixed: a quarter per process | e4de813 |
+| 1.9 | a blob property could be committed to another tenant's blob id | fixed: 0, or a blob this VM made or sees | f6ad038 |
+| 1.11 | the pump's outbox grew by a record a re-watch under a fresh cookie | fixed: a fired one-shot record goes on re-watch or close | 8c5506d |
+| 1.12 | modeset files still closing did not count against the NVKMS open caps | fixed | bb0eae7 |
+| 1.13 | a refused `MAP_FIXED` file mapping left a hole the owner later unmapped whole | fixed: map anywhere, `mremap(MREMAP_FIXED)` into place | 386a4c2 |
+| 1.14 | the private-descriptor scan could take the accept threads' peer descriptors | fixed: those threads start after the scan | 5dab3bb |
+| 1.15 | with no host version set, RM escapes went unchecked and the guest's CHECK_VERSION_STR chose the profile | fixed: never learned from a guest; no version refuses every RM escape outside tests; test-harness reads the host's | 18f4be9 |
+| 1.16 | a v1 reply's room was checked after the host call | fixed: the least a success returns is checked first | e00592e |
+| 1.17 | an event's parameters too short for its descriptor skipped the translation | fixed: EINVAL, as OS_UNIX | 1ea62b9 |
+| 1.18 | the always-refused classes held on RM_ALLOC only | fixed: ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 too | 8555606 |
+| 1.19 (rest) | IDLE_CHANNELS clients, pointer-table unions, generator scans | open (phase 2) | |
+| 1.20 | GPU-wide-state controls, revocation under the mutex, IOCTL2 duplicate drops, loopback-only netns, UNMAP keyed by opener | open: documentation and decisions for phase 3 | |
+| 2.1, #23 | a failed host ioctl came back with no parameters, so a CHECK_VERSION_STR mismatch hid RM's version | fixed: the block as the host left it, with the errno (EFAULT excepted) | 120eea7 |
+| 2.2 | the backend ignored EVENT_IDX and NO_INTERRUPT (§21's claim did not hold) | fixed: an interrupt only when the guest asks | d50b5c5 |
+| 2.3 | `--sched-slice-us` reset a unit's batch or idle policy | fixed: the policy is kept, a real-time one left alone; the launcher passes its slice through the flag | 1ea77f9 |
+| 2.4 | RM_UNMAP_MEMORY zeroed the caller's pLinearAddress when found | fixed: the caller's own, found or not | fd02302 |
+| 2.5 | rewritten request fields echoed back altered | open (phase 2, with typed replies) | |
+| 2.6 | DRI count, `abs` on i32::MIN, protocol distinctness, the unmeasured-release log, a short named-client block's status | fixed | f81fee3, 18f4be9, 32d70a3 |
+| #14 | the guest's PCI config space held only the 64 bytes an unprivileged reader gets | fixed: `--pci-config-dir`, a root launcher's snapshot, used only if it is of the same device | a73e1a2 |
+| #29 | budget refusals on RM and UVM escapes were errnos | fixed: RM's statuses in the caller's block (NO_MEMORY, NOT_SUPPORTED, UVM's rmStatus) | 3dde74c, da05be7 |
+| #31, #32 | an unserved UVM command and a foreign ioctl type were EPERM | fixed: ENOSYS, and the device's own EINVAL or ENOTTY | cf17437 |
+| #40 | a positive header status would reach userspace as a result | fixed: every header 0 or -1..-4095, else EPROTO | af599c1 |
+| — | the ring workers had no exit event, so a backend whose VMM hung up never exited | fixed | 2f09bb6 |
+| — | a helper of the VMM's own uid could inject | fixed: the VMM's uid is refused (not with `--allow-inject-self`) | c880911 |
+
+Every fix has a test that fails without it. On the RTX 5090 (595.99.02,
+sandbox on, allowlist enforcing), under nesbox and crosvm alike: `stage1`
+6/0/0, `compat` 12/0/0, `render` with compute 9/0/1 with `cuda-smoke` all
+PASS, `wayland` on the live Hyprland 13/0/1, `secneg` 10 passed 5 skipped,
+`lease` 9/0/1, `vkdisplay` 8/0/1, `secneg` on the lease 6/0/0 (KMS 15
+passed), and the live app batch (glxgears, vkmark, stk, chromeanim) 11/0/0.
+The PCI config path was shown with a synthetic snapshot (the rig has no
+root): the guest's `lspci -vvv` reads `Capabilities: [40] Null` without it
+and the snapshot's PCIe capability and link with it.
