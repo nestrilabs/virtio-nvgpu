@@ -850,6 +850,14 @@ fn v1_route(kind: HandleKind, cmd: u32, data_len: u32) -> std::result::Result<V1
         HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) if ty == b'F' => Ok(V1Route::Rm),
         HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) if ty == 0 => Ok(V1Route::Uvm),
         HandleKind::Dev(DeviceKind::Modeset) if ty == b'm' => Ok(V1Route::Nvkms),
+        // Another type on an NVIDIA device gets the device's own answer
+        // (review 2026-09-29 parity #32): nvidia.ko's nv_validate_ioctls
+        // says EINVAL (nv.c:2488-2491), nvidia-modeset ENOTTY for any
+        // command but its one (nvidia-modeset-linux.c:1953-1955), and UVM
+        // ENOSYS for a command it has no route for (uvm_test.c).
+        HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) => Err(libc::EINVAL),
+        HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) => Err(libc::ENOSYS),
+        HandleKind::Dev(DeviceKind::Modeset) => Err(libc::ENOTTY),
         HandleKind::DriRender(_) => match cmd {
             DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY => sized(
                 32,
@@ -5136,7 +5144,9 @@ impl NvidiaBackend {
                 "UVM command {cmd:#x} refused: not in the UVM table of host driver {:?}",
                 self.driver
             );
-            return Err(libc::EPERM);
+            // UVM's own answer to a command it has no route for (uvm.c,
+            // uvm_test_ioctl), not a permission (parity #31).
+            return Err(libc::ENOSYS);
         };
         if len != c.size as usize {
             log::warn!(
@@ -6958,20 +6968,17 @@ mod tests {
         let m = hostfd::ioc(hostfd::IOC_RW, b'm', 0, 16);
         // RM's frontend and nvidia-modeset both dispatch on the number alone,
         // so a foreign type byte would reach them as one of their own
-        // commands, unchecked.
-        for (h, cmd) in [
-            (ctl, d),
-            (ctl, m),
-            (modeset, d),
-            (uvm, m),
-            (ctl, 0x3000_0001),
+        // commands, unchecked. Each is refused with the device's own answer
+        // to a command it does not know (parity #32).
+        for (h, cmd, errno) in [
+            (ctl, d, libc::EINVAL),
+            (ctl, m, libc::EINVAL),
+            (modeset, d, libc::ENOTTY),
+            (uvm, m, libc::ENOSYS),
+            (ctl, 0x3000_0001, libc::EINVAL),
         ] {
             let r = v1_ioctl(&mut be, h, cmd, &[0u8; 24]);
-            assert_eq!(
-                parse_resp(&r).status,
-                -libc::EPERM,
-                "handle {h} cmd {cmd:#x}"
-            );
+            assert_eq!(parse_resp(&r).status, -errno, "handle {h} cmd {cmd:#x}");
         }
         assert!(forwarded().is_empty());
     }
@@ -7504,13 +7511,13 @@ mod tests {
         // DISCARD (80) came in 580.65.06; 535 has no such command.
         let (mut be, uvm) = uvm_backend("535.129.03");
         let r = v1_ioctl(&mut be, uvm, 80, &[0u8; 32]);
-        assert_eq!(parse_resp(&r).status, -libc::EPERM);
+        assert_eq!(parse_resp(&r).status, -libc::ENOSYS, "UVM's own answer");
         // And a host with no table refuses them all.
         let mut be = NvidiaBackend::for_test();
         be.set_host_ioctl_for_test(fake_uvm);
         let uvm = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
         let r = v1_ioctl(&mut be, uvm, 34, &[0u8; 16]);
-        assert_eq!(parse_resp(&r).status, -libc::EPERM);
+        assert_eq!(parse_resp(&r).status, -libc::ENOSYS);
     }
 
     /// S-33: a display file's handle-table descriptor is closed by the

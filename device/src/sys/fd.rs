@@ -354,9 +354,15 @@ mod tests {
         let mut b = [0u8; 8];
         assert_eq!(read(&r, &mut b).unwrap(), 5);
         assert_eq!(&b[..5], b"nvgpu");
-        let n = w.as_raw_fd();
+        // Closed once: the read end sees EOF, or EAGAIN while a forked test
+        // child still holds a copy (testfd.rs). Asking whether the number
+        // was still open raced with other test threads reusing it.
+        set_nonblock(r.as_raw_fd()).unwrap();
         drop(w);
-        assert!(!is_open(n) || n == r.as_raw_fd());
+        match read(&r, &mut b) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EAGAIN)),
+        }
     }
 
     #[test]
