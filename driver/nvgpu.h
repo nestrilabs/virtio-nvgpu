@@ -257,7 +257,7 @@ struct nvgpu_device {
   unsigned int osdesc_early_next;
   bool osdesc_dead;
 
-  /* /proc/driver/nvidia's files' data (nvgpu_main.c, struct nvgpu_proc_buf). */
+  /* /proc/driver/nvidia's files' data (nvgpu_procfs.c, struct nvgpu_proc_buf). */
   struct list_head proc_bufs;
 
   /* /dev/nvgpu-wl and /dev/nvgpu-capture, when registered (nvgpu_misc.c). */
@@ -569,6 +569,40 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_get(struct nvgpu_fd *nfd);
 /* Drops a reference; the last one CLOSEs the backend handle and frees. */
 void nvgpu_fd_put(struct nvgpu_fd *nfd);
+
+/* ───────── nvgpu_procfs.c ───────── */
+
+/*
+ * GET_PROC_FILES, and GET_SYS_FILES' first section, are records of
+ * {le32 path_len, le32 content_len, path, content}, unaligned, in a stream
+ * with no header that ends where the device stopped writing, or at a record
+ * with both lengths 0 (device/src/nvidia.rs, handle_get_files()).
+ */
+struct nvgpu_file_rec {
+  const u8 *path;
+  const u8 *content;
+  u32 path_len;
+  u32 content_len;
+};
+/*
+ * The record at *p, with *p moved past it: true. False at the terminator (*p
+ * past it), at the end of the stream, or for a record that runs past `end`:
+ * then *truncated, *p past its lengths, and nothing of it read.
+ */
+bool nvgpu_file_rec_next(const u8 **p, const u8 *end,
+                         struct nvgpu_file_rec *r, bool *truncated);
+/* /proc/driver/nvidia from GET_PROC_FILES (probe; -ENOMEM is fatal). */
+int nvgpu_proc_init(struct nvgpu_device *dev);
+/* Take /proc/driver/nvidia down, readers waited out, then free its data. */
+void nvgpu_proc_cleanup(struct nvgpu_device *dev);
+
+/* ───────── nvgpu_pci.c ───────── */
+
+/* GET_SYS_FILES: the GPUs' config space, the DRI devices, the host cards. */
+int nvgpu_fetch_sys_files(struct nvgpu_device *dev);
+/* The fake PCI bus and device of each GPU whose config space came. */
+int nvgpu_pci_init(struct nvgpu_device *dev);
+void nvgpu_pci_cleanup(struct nvgpu_device *dev);
 
 /* ───────── nvgpu_drm.c ───────── */
 
