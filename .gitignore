@@ -50,3 +50,6 @@ rig/verify/bin/
 NIXOS-AGENT.md
 # Briefs exchanged with the NixOS-side agent (host-specific; not shipped)
 virtio-nvgpu-*.md
+
+# The worktree-local outputs of a build: modules, images.
+/.rig-out/

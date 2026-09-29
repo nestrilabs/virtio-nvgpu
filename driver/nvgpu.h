@@ -469,6 +469,37 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
  * master, if it had become it. */
 void nvgpu_drm_drop_master(struct file *f);
 /*
+ * A DRM ioctl's argument as drm_ioctl() hands it to a handler
+ * (drm_ioctl.c:848-915). The handler is picked by the ioctl's number alone,
+ * whatever size and direction the caller's command says, and runs on a kernel
+ * copy at least as large as the native struct: the caller's _IOC_SIZE bytes
+ * copied in where both its command and the native one say IN, the rest
+ * zeroed; afterwards the caller's _IOC_SIZE bytes copied back where both say
+ * OUT, whatever the handler returned. A caller built against an older,
+ * shorter struct (a 16-byte drm_syncobj_handle, before `point`) gets the
+ * native call with the new fields zero; one built against a longer struct
+ * gets its tail back as it sent it (zeroed, where nothing went IN). The
+ * handler and the host see `cmd`, the native number, and nothing else: no
+ * size a native caller could not send reaches the backend.
+ *
+ * Bounded as the core bounds it: _IOC_SIZE is 14 bits, so at most 16 KiB,
+ * on the stack up to 128 bytes, kmalloc()ed past that.
+ */
+struct nvgpu_drm_arg {
+  unsigned int cmd; /* native: what the handler and the host see */
+  void *k;          /* max(caller's size, native size) bytes */
+  void __user *u;
+  u32 out;          /* bytes copied back */
+  u64 stack[16];
+};
+/* Copy in; on failure (-ENOMEM, -EFAULT) nothing is left to free. */
+int nvgpu_drm_arg_in(struct nvgpu_drm_arg *a, unsigned int ucmd,
+                     unsigned int ncmd, void __user *u);
+/* Copy back (-EFAULT replaces `ret` if that fails) and free. */
+long nvgpu_drm_arg_out(struct nvgpu_drm_arg *a, long ret);
+/* Free without copying back: the call was not ours after all. */
+void nvgpu_drm_arg_drop(struct nvgpu_drm_arg *a);
+/*
  * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
  * host file, and return a handle for it in `file`. The proxy takes a
  * reference on `owner`. On failure the host handle has already been closed
@@ -664,13 +695,20 @@ int nvgpu_fence_unwrap_fd(struct nvgpu_device *dev, int fd, u32 *handle,
                           bool *owned, struct dma_fence **ref);
 /* dma_fence_put() as a release callback (nvgpu_i2_hold()). */
 void nvgpu_fence_put_ref(void *fence);
-/* The core syncobj ioctls (0xBF-0xCF), when nvgpu_fences_enabled(). */
-bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd);
+/*
+ * The core syncobj ioctls (0xBF-0xCF), when nvgpu_fences_enabled(): the
+ * native command of the one numbered as `cmd` is (this kernel's, which the
+ * render schema must agree with), 0 if `cmd` is none of them.
+ */
+unsigned int nvgpu_fence_syncobj_cmd(unsigned int cmd);
+/* Run on the kernel copy (struct nvgpu_drm_arg): `cmd` is the native one. */
 long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
-                               unsigned int cmd, unsigned long arg);
-/* nvidia-drm SEMSURF_FENCE_* (0x54-0x57), when nvgpu_fences_enabled(). */
+                               unsigned int cmd, void *karg);
+/* nvidia-drm SEMSURF_FENCE_* (0x54-0x57): the native command, as above. */
+unsigned int nvgpu_fence_semsurf_cmd(unsigned int nr);
+/* When nvgpu_fences_enabled(), on the kernel copy as above. */
 long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
-                               unsigned int cmd, void __user *uarg);
+                               unsigned int cmd, void *karg);
 /* A GEM proxy is going: close what SEMSURF_FENCE_ATTACH moved into other
  * files for it. */
 void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
@@ -1015,6 +1053,12 @@ struct nvgpu_i2_call {
    * userspace what the native ioctl would have.
    */
   bool kernel;
+  /*
+   * `uarg` alone is a kernel address: the argument, copied in by the DRM
+   * node's entry as drm_ioctl() does (struct nvgpu_drm_arg), with every
+   * pointer in it the caller's. Its copy-back lands in that kernel copy.
+   */
+  bool karg;
   const struct nvgpu_i2_ops *ops;
   void *priv;
   /* filled in: */
@@ -1035,6 +1079,14 @@ int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
                          unsigned int cmd, const void *arg_prefix,
                          size_t prefix_len);
+/*
+ * The DRM-class entry numbered as `cmd` (by type and number, the one of
+ * exactly `cmd` if there is one, as the interpreter looks it up): its own
+ * command, the native size and direction, which the caller's argument is
+ * normalised to (struct nvgpu_drm_arg); 0 if there is none.
+ */
+unsigned int nvgpu_i2_native_cmd(struct nvgpu_device *dev, u32 sclass,
+                                 unsigned int cmd);
 /*
  * Run an ioctl through IOCTL2: find the schema, gather the caller's buffers,
  * translate fd/GEM fields through the hooks, send, copy every OUT buffer back

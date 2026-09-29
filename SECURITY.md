@@ -725,7 +725,7 @@ type. One listener is allowed per export.
 
 | node | dev | HEAD |
 |---|---|---|
-| `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` | 0666 | 0666, unchanged: any guest user reaches everything §3 lists. The two UVM nodes exist only when the backend runs with `--allow-compute` |
+| `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset` | 0666 | 0666, unchanged: any guest user reaches everything §3 lists, from a 64- or a 32-bit process (below). The two UVM nodes exist only when the backend runs with `--allow-compute` |
 | `/dev/nvidia-caps/*` | 0444 | 0444 |
 | DRM node | a hand-made character device, 0666 | a real DRM device per host render node, whose render and primary nodes the guest's DRM core makes. Syncobjs are enabled only when the backend serves fences, and the primary node drives KMS only when the backend offers `--kms-card`. |
 | `/dev/nvgpu-wl[N]` | -- | root:root 0660 by default (module parameter `wl_mode`, which refuses any mode giving "other" access), with `contrib/udev/70-nvgpu-wl.rules` giving it to group `nvgpu-wl` for the daemon, which is to be setgid (or its own account), never an application's group. Five ioctls: HELLO, CONNECT, CONNECT_FOR (a connection charged to the client process the daemon names), SEND and RECV. One LISTEN per device, and ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN. The daemon holds at most 4 MiB a client has not read, and closes a client that stays that far behind for 30 s. |
@@ -787,6 +787,53 @@ of this file's. And it needs a reply from the backend, which the guest does
 not write. The ATOMIC special's parsing of the commit's arrays is in Rust
 too (`nvgpu_atomic.c` in C); what it asks of `nvgpu_kms.c` -- object and
 property classes, the fence bridge, event reservations -- stays C.
+
+**32-bit processes, and DRM structs of another size** (branch
+`drm-compat2`). Two kinds of caller the native kernel serves reach the
+guest module now, and neither brings the backend a byte it could not
+already be sent:
+
+- *32-bit processes on the NVIDIA nodes.* `/dev/nvidiactl`,
+  `/dev/nvidiaN`, `/dev/nvidia-modeset` and the two UVM nodes take
+  `compat_ioctl = compat_ptr_ioctl`: the native handler, the pointer
+  widened. nvidia.ko, nvidia-modeset and nvidia-uvm do the same -- each sets
+  `.compat_ioctl` to its `.unlocked_ioctl` (nv.c:251-261,
+  nvidia-modeset-linux.c:2015-2025, uvm.c:1074-1084, uvm_tools.c:2774-2784,
+  595.99.02), because RM, NVKMS and UVM parameter structs are fixed-width
+  with 8-byte-aligned `NvP64`/`NvU64` fields, so a 32-bit caller's struct
+  is the 64-bit one; none of the three reads `in_compat_syscall()`. A
+  32-bit process's ioctl is a 64-bit process's with its pointers below
+  4 GiB, which a 64-bit process can send too: the module's parsers (C and
+  Rust) take every pointer as a u64 and copy through it, whatever its
+  value, and nothing in them, in OS-descriptor pinning or in deep segments
+  assumes an address above 4 GiB. What the backend holds each call to --
+  the RM allowlist's LP64 parameter sizes, the UVM table's sizes -- is what
+  RM and UVM check natively, so a 32-bit build whose struct differed would
+  be refused in the guest as on bare metal. The one thing a 32-bit process
+  cannot do is map a UVM semaphore pool, which the module places only in
+  [4 GiB, 32 TiB) (`nvgpu_mmap_uvm_check()`), so it gets no CUDA context
+  (CUDA 12 dropped 32-bit applications). The DRM node already had its compat path (the core's ioctls through
+  `drm_compat_ioctl()`, as nvidia-drm), and `/dev/nvgpu-wl` and
+  `/dev/nvgpu-capture` had `compat_ptr_ioctl` with layouts identical at
+  both widths (every `__u64` at an 8-byte offset, sizes multiples of 8);
+  `/dev/nvidia-caps/*` answer no ioctl, as nv-caps.c's.
+- *DRM ioctls whose struct grew.* The DRM node takes every ioctl it serves
+  (nvidia-drm's range, syncobjs, semaphore-surface fences, a KMS file's
+  KMS calls, the dumb-buffer pair) by its number alone and runs it on the
+  caller's argument normalised as `drm_ioctl()` does
+  (`nvgpu_drm_arg_in()`, drm_ioctl.c:848-915): the caller's size copied
+  in where both its command and the native one say IN, zero-extended to
+  the native struct, and the caller's size copied back, bounded by the
+  14-bit size field (at most 16 KiB, on the stack up to 128 bytes). A
+  16-byte `drm_syncobj_handle` (the Steam runtime's libdrm) used to get
+  -EINVAL; now it is the native call with `point` zero. The handler and
+  the backend see only the **native** command -- the kernel's own for
+  syncobjs and dumb buffers, the release's schema entry for KMS
+  (`nvgpu_i2_native_cmd()`, C and Rust, the difftest holding them equal),
+  nvidia-drm's header for its range -- and the IOCTL2 interpreter still
+  refuses any other size, so the backend is sent exactly the sizes a
+  native-size caller sends. Only GET_DEV_INFO keeps its own rule: its four
+  layouts differ in the middle, so each caller is answered in its own.
 
 Which host surfaces each display mode turns on:
 

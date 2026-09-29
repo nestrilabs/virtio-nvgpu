@@ -75,7 +75,7 @@ the test rig installs it in its image as `nvgpu.ko`):
 | `nvgpu_main.c` | probe/remove, virtqueues, `/dev/nvidia*` cdevs, mmap with each placement's memory type and writability (UVM semaphore pools from the UVM aperture, shared memory region 2, found before HELLO and offered in it, at host addresses in [4 GiB, 32 TiB) only), `/proc`, sysfs, fake PCI, v1 nvidia-modeset |
 | `nvgpu_rmio.c` | the protocol-v1 IOCTL message, in C: the ioctl dispatcher for `/dev/nvidia*` and DRM driver-range calls, RM forwarding (descriptors and OS events translated to backend handles, deep pointers and deep segments, GPU/CPU time correlation moved into the guest's clocks, the calling process on RM_ALLOC and RM_DUP_OBJECT), UVM, v1 nvidia-modeset, and what reads an OS-descriptor registration and builds its page list. Built with `NVGPU_RUST=0` (the default) |
 | `nvgpu_osdesc.c` | memory the caller already has, registered with RM by its pages: ALLOC_MEMORY and RM_ALLOC of the OS-descriptor class and VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR pin the caller's range as RM would and send its guest-physical runs; the pins last until a reap (HOST_OP OSDESC_REAP) names the registration, or remove(); a registration abandoned in flight keeps them under its request id until its late reply names what RM registered, and one never sent unpins at once |
-| `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls |
+| `nvgpu_drm.c` | DRM device registration, GEM proxies, PRIME, nvidia-drm driver-range ioctls, and every DRM ioctl's argument normalised as `drm_ioctl()` does (`nvgpu_drm_arg_in()`) |
 | `nvgpu_xfer.c` | protocol v2 transport: request contexts and transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, the event queue and its consumer registry, EV_HOTPLUG uevents |
 | `nvgpu_i2.c` | the schema-driven IOCTL2 interpreter, in C: gathers a caller's buffers per `gen/nvgpu_schema.h`, translates descriptors and GEM handles through per-caller hooks, copies replies back by the kernel's own rules. Built with `NVGPU_RUST=0` |
 | `nvgpu_schema.c` | the generated IOCTL2 and UVM tables' one copy, and which a host gets |
@@ -96,6 +96,42 @@ Other files: `Makefile` and `Kconfig` (in-tree and out-of-tree builds),
 against, as `make savedefconfig` writes it: copy it to a build tree's
 `.config` and run `make olddefconfig` for the whole of it;
 `scripts/build-guest-kernel.sh` makes and records it).
+
+## Callers of another width or another struct size
+
+The native kernel serves two kinds of caller the module did not, and it
+serves them the native way now (SECURITY.md §6 has why neither sends the
+backend anything new):
+
+- **32-bit processes** on `/dev/nvidiactl`, `/dev/nvidiaN`,
+  `/dev/nvidia-modeset`, `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`:
+  `.compat_ioctl = compat_ptr_ioctl`, the native handler, as nvidia.ko,
+  nvidia-modeset and nvidia-uvm each set theirs (RM, NVKMS and UVM structs
+  are one layout at both widths). Without it every such ioctl was
+  `-ENOTTY`: Steam's client, a 32-bit game's GL and Vulkan driver. A 32-bit
+  UVM client gets its ioctls but no semaphore pool, which is mapped only
+  above 4 GiB, so no CUDA context (CUDA 12 dropped 32-bit applications). The DRM node's compat path
+  sends the core's ioctls through `drm_compat_ioctl()`, as nvidia-drm does,
+  and refuses the two KMS ioctls whose compat layouts the core converts
+  (WAIT_VBLANK, ADDFB2) rather than misread them. `/dev/nvgpu-wl` and
+  `/dev/nvgpu-capture` have `compat_ptr_ioctl` too: their structs are the
+  same at both widths.
+- **DRM structs of another size** than this kernel's, from older or newer
+  headers (a 16-byte `drm_syncobj_handle`, before `point`: the Steam
+  runtime's libdrm). Every DRM ioctl the node answers or forwards itself --
+  nvidia-drm's range, syncobjs, semaphore-surface fences, a KMS file's KMS
+  calls, the dumb-buffer pair, GET_CAP -- is taken by its number and run on
+  the caller's argument normalised as `drm_ioctl()` does
+  (`nvgpu_drm_arg_in()` in `nvgpu_drm.c`): the caller's bytes in,
+  zero-extended to the native struct, the caller's size back; the handler
+  and the host see the native command only (the kernel's for syncobjs, the
+  release's schema entry for KMS, `nvgpu_i2_native_cmd()`). The IOCTL2
+  interpreter runs on that kernel copy (`nvgpu_i2_call.karg`) and still
+  refuses any size but the schema's. GET_DEV_INFO keeps answering each of
+  its four layouts in its own.
+
+`rig/guest-image/probes/compat.sh` tests both on hardware
+([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md), A8).
 
 ## Module parameters
 

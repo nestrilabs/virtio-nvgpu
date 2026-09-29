@@ -37,6 +37,58 @@
 
 #include "nvgpu.h"
 
+/* ───────── a DRM ioctl's argument, as drm_ioctl() takes it ───────── */
+
+/*
+ * drm_ioctl.c:848-915, for the ioctls this node answers or forwards itself
+ * rather than through drm_ioctl() (which does the same for those it keeps).
+ * Every DRM ioctl the node serves goes through here: nvidia-drm's range,
+ * syncobjs, a KMS file's KMS calls, the dumb-buffer pair; so a struct that
+ * grew (drm_syncobj_handle's `point`, 16 -> 24 bytes) reaches its handler
+ * the way the native kernel hands it over, whichever size the caller's
+ * headers had.
+ */
+int nvgpu_drm_arg_in(struct nvgpu_drm_arg *a, unsigned int ucmd,
+                     unsigned int ncmd, void __user *u) {
+  u32 in = _IOC_SIZE(ucmd), ksize;
+
+  BUILD_BUG_ON(sizeof(a->stack) != 128);
+  a->cmd = ncmd;
+  a->u = u;
+  a->out = _IOC_SIZE(ucmd);
+  if (!(ucmd & ncmd & IOC_IN))
+    in = 0;
+  if (!(ucmd & ncmd & IOC_OUT))
+    a->out = 0;
+  ksize = max3(in, a->out, (u32)_IOC_SIZE(ncmd));
+  if (ksize <= sizeof(a->stack)) {
+    a->k = a->stack;
+  } else {
+    a->k = kmalloc(ksize, GFP_KERNEL);
+    if (!a->k)
+      return -ENOMEM;
+  }
+  if (copy_from_user(a->k, u, in)) {
+    nvgpu_drm_arg_drop(a);
+    return -EFAULT;
+  }
+  memset((u8 *)a->k + in, 0, ksize - in);
+  return 0;
+}
+
+long nvgpu_drm_arg_out(struct nvgpu_drm_arg *a, long ret) {
+  if (copy_to_user(a->u, a->k, a->out))
+    ret = -EFAULT;
+  nvgpu_drm_arg_drop(a);
+  return ret;
+}
+
+void nvgpu_drm_arg_drop(struct nvgpu_drm_arg *a) {
+  if (a->k != a->stack)
+    kfree(a->k);
+  a->k = NULL;
+}
+
 /* ───────── nvidia-drm stub — no DRM subsystem headers needed ───────── */
 
 /*
@@ -51,14 +103,14 @@
 
 static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
                                        struct drm_file *file, unsigned int cmd,
-                                       void __user *uarg,
+                                       void *karg,
                                        const struct nvgpu_gem_nested_desc *d);
 
 /* Defined below; named here because the ioctls that test it come first. */
 static const struct drm_gem_object_funcs nvgpu_gem_funcs;
 static const struct file_operations nvgpu_drm_fops;
 
-static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg);
+static long nvgpu_gem_identify(struct drm_file *file, void *karg);
 static int nvgpu_gem_proxy_create_new(struct drm_file *file,
                                       struct nvgpu_fd *owner, u32 host_handle,
                                       size_t size, u32 *guest_handle);
@@ -281,12 +333,57 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
 }
 
 /*
+ * The native command of each nvidia-drm ioctl this node answers or forwards
+ * outside IOCTL2 (nv_drm_common_ioctl.h), which a caller's argument is
+ * normalised to (struct nvgpu_drm_arg); 0 for the rest. GET_DEV_INFO is not
+ * here: its layouts differ in the middle, not at the end, so it answers each
+ * caller in its own (nvgpu_drm_get_dev_info()). FENCE_SUPPORTED and
+ * DMABUF_SUPPORTED are _IO and touch no memory.
+ */
+static unsigned int nvgpu_drm_driver_cmd(unsigned int nr) {
+#define NVGPU_DRV_IOWR(n, sz)                                                  \
+  _IOC(_IOC_READ | _IOC_WRITE, DRM_IOCTL_BASE, DRM_COMMAND_BASE + (n), (sz))
+  switch (nr - DRM_COMMAND_BASE) {
+  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID, 8);
+  case DRM_NVIDIA_GEM_IDENTIFY_OBJECT:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_IDENTIFY_OBJECT, 8);
+  case DRM_NVIDIA_GEM_MAP_OFFSET:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_MAP_OFFSET, 16);
+  case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY, 24);
+  case DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY,
+                          nvgpu_gem_import_nvkms.size);
+  case DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY,
+                          nvgpu_gem_export_dmabuf.size);
+  case DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY:
+    return NVGPU_DRV_IOWR(DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+                          nvgpu_gem_export_dmabuf.size);
+  case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
+  case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
+  case DRM_NVIDIA_SEMSURF_FENCE_WAIT:
+  case DRM_NVIDIA_SEMSURF_FENCE_ATTACH:
+    return nvgpu_fence_semsurf_cmd(nr);
+  }
+#undef NVGPU_DRV_IOWR
+  return 0;
+}
+
+static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
+                                   struct drm_file *file, unsigned int cmd,
+                                   void *k);
+
+/*
  * nvgpu_drm_handle_ioctl — nvidia-drm's driver range on our /dev/dri/..
  * nodes (DRM_IOCTL_VERSION is the core's, from nvgpu_drm_driver's fields).
  *
  * GET_DEV_INFO       (nr=0x43) — the host's record, in the caller's layout
  * FENCE_SUPPORTED    (nr=0x44) — -EINVAL: 0x45/0x46 are not forwarded
  * DMABUF_SUPPORTED   (nr=0x4f) — the host's answer (supports_alloc)
+ * the rest of nvgpu_drm_driver_cmd()'s — on the caller's argument normalised
+ *                    as drm_ioctl() would (nvgpu_drm_arg_in())
  *
  * Everything else → -ENOTTY.
  */
@@ -294,37 +391,18 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
                                    struct nvgpu_dri_dev *dri,
                                    struct drm_file *file, unsigned int cmd,
                                    unsigned long arg) {
-  unsigned int nr = _IOC_NR(cmd);
+  unsigned int nr = _IOC_NR(cmd), ncmd;
   void __user *uarg = (void __user *)arg;
+  struct nvgpu_drm_arg a;
+  long ret;
 
   /* ── Driver ioctls: DRM_COMMAND_BASE .. DRM_COMMAND_END ── */
   if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_END)
     return -ENOTTY;
 
   switch (nr - DRM_COMMAND_BASE) {
-
   case DRM_NVIDIA_GET_DEV_INFO:
     return nvgpu_drm_get_dev_info(nfd, dri, file, cmd, uarg);
-
-  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID: {
-    /*
-     * A number that tells one open of this node from another. The ICD asks
-     * for it once a device has been created and uses it to recognise its own
-     * file; nothing outside this guest ever sees it, so a counter is a real
-     * answer rather than a stub, and it must not restart while the module is
-     * loaded or two live files would claim the same id.
-     */
-    static atomic64_t next_unique_id = ATOMIC64_INIT(1);
-    u64 id;
-
-    if (!nfd->drm_unique_id)
-      nfd->drm_unique_id = (u64)atomic64_inc_return(&next_unique_id);
-    id = nfd->drm_unique_id;
-
-    if (copy_to_user(uarg, &id, sizeof(id)))
-      return -EFAULT;
-    return 0;
-  }
 
   /*
    * FENCE_SUPPORTED answers for the PRIME fence pair behind it,
@@ -348,29 +426,68 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
    */
   case DRM_NVIDIA_DMABUF_SUPPORTED:
     return dri->dev_info[3] ? 0 : -EINVAL;
+  }
 
-  /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c).
-   * Only with the backend serving fences; GET_DEV_INFO says they exist only
-   * then, and only when the host's node says so too. */
+  ncmd = nvgpu_drm_driver_cmd(nr);
+  if (!ncmd || !file) {
+    /*
+     * Named rather than silently refused. An ioctl this stub does not answer
+     * is the ICD asking for something the node cannot do yet, and -ENOTTY on
+     * its own turns up much later as a device that would not initialise.
+     */
+    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                        "virtio-gpu-nv: unhandled nvidia-drm ioctl "
+                        "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
+                        nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
+                        _IOC_DIR(cmd));
+    return -ENOTTY;
+  }
+  /* Semaphore-surface fences only with the backend serving them;
+   * GET_DEV_INFO says they exist only then. */
+  if (nr - DRM_COMMAND_BASE >= DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE &&
+      nr - DRM_COMMAND_BASE <= DRM_NVIDIA_SEMSURF_FENCE_ATTACH &&
+      !nvgpu_fences_enabled(nfd->dev))
+    return -ENOTTY;
+
+  ret = nvgpu_drm_arg_in(&a, cmd, ncmd, uarg);
+  if (ret)
+    return ret;
+  ret = nvgpu_drm_driver_ioctl(nfd, file, a.cmd, a.k);
+  return nvgpu_drm_arg_out(&a, ret);
+}
+
+/* The driver range past its three special cases, on the kernel copy `k` of
+ * the argument, `cmd` the native command (nvgpu_drm_driver_cmd()). */
+static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
+                                   struct drm_file *file, unsigned int cmd,
+                                   void *k) {
+  switch (_IOC_NR(cmd) - DRM_COMMAND_BASE) {
+  case DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID: {
+    /*
+     * A number that tells one open of this node from another. The ICD asks
+     * for it once a device has been created and uses it to recognise its own
+     * file; nothing outside this guest ever sees it, so a counter is a real
+     * answer rather than a stub, and it must not restart while the module is
+     * loaded or two live files would claim the same id.
+     */
+    static atomic64_t next_unique_id = ATOMIC64_INIT(1);
+
+    if (!nfd->drm_unique_id)
+      nfd->drm_unique_id = (u64)atomic64_inc_return(&next_unique_id);
+    put_unaligned(nfd->drm_unique_id, (u64 *)k);
+    return 0;
+  }
+
+  /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c). */
   case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_WAIT:
   case DRM_NVIDIA_SEMSURF_FENCE_ATTACH:
-    if (!file || !nvgpu_fences_enabled(nfd->dev))
-      return -ENOTTY;
-    return nvgpu_fence_semsurf_ioctl(nfd, file, cmd, uarg);
+    return nvgpu_fence_semsurf_ioctl(nfd, file, cmd, k);
 
-  /*
-   * ── GEM: forwarded to the host's render node ──
-   *
-   * These three are flat -- every field is a value -- so the whole struct
-   * goes across and the answer comes back into it.
-   */
+  /* Answered from the proxy; see nvgpu_gem_identify(). */
   case DRM_NVIDIA_GEM_IDENTIFY_OBJECT:
-    /* Answered from the proxy; see nvgpu_gem_identify(). */
-    if (!file)
-      return -ENOTTY;
-    return nvgpu_gem_identify(file, uarg);
+    return nvgpu_gem_identify(file, k);
 
   case DRM_NVIDIA_GEM_MAP_OFFSET: {
     /*
@@ -388,37 +505,23 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
       __u32 handle;
       __u32 pad;
       __u64 offset;
-    } p;
-    struct drm_gem_object *obj;
+    } *p = k;
+    u64 offset;
     int ret;
 
-    if (!file)
-      return -ENOTTY;
-    if (_IOC_SIZE(cmd) != sizeof(p))
-      return -EINVAL;
-    if (copy_from_user(&p, uarg, sizeof(p)))
-      return -EFAULT;
-
-    obj = drm_gem_object_lookup(file, p.handle);
-    if (!obj)
-      return -ENOENT;
-    if (obj->funcs != &nvgpu_gem_funcs) {
-      drm_gem_object_put(obj);
-      return -ENOENT;
-    }
-
-    ret = drm_gem_create_mmap_offset(obj);
-    if (!ret)
-      p.offset = drm_vma_node_offset_addr(&obj->vma_node);
-    drm_gem_object_put(obj);
+    ret = nvgpu_gem_mmap_offset(file, p->handle, &offset);
     if (ret)
       return ret;
-
-    if (copy_to_user(uarg, &p, sizeof(p)))
-      return -EFAULT;
+    p->offset = offset;
     return 0;
   }
 
+  /*
+   * ── GEM: forwarded to the host's render node ──
+   *
+   * ALLOC is flat -- every field is a value -- so the whole struct goes
+   * across and the answer comes back into it.
+   */
   case DRM_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: {
     /*
      * u32 handle OUT, u8 block_linear, u8 compressible, u16 pad,
@@ -436,13 +539,10 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
     u32 guest_handle;
     long ret;
 
-    if (!file)
-      return -ENOTTY;
-    if (_IOC_SIZE(cmd) != sizeof(p))
-      return -EINVAL;
-    if (copy_from_user(&p, uarg, sizeof(p)))
-      return -EFAULT;
-
+    BUILD_BUG_ON(sizeof(p) != 24);
+    /* A copy of its own: a failed call leaves the caller's bytes as they
+     * were, never a host handle number. */
+    memcpy(&p, k, sizeof(p));
     ret = nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, cmd, &p, sizeof(p));
     if (ret < 0)
       return ret;
@@ -455,8 +555,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
       return ret;
 
     p.handle = guest_handle;
-    if (copy_to_user(uarg, &p, sizeof(p)))
-      return -EFAULT;
+    memcpy(k, &p, sizeof(p));
     return 0;
   }
 
@@ -467,15 +566,11 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
    * nvidia-modeset, which is why both go through one forwarder.
    */
   case DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY:
-    if (!file)
-      return -ENOTTY;
-    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, k,
                                       &nvgpu_gem_import_nvkms);
 
   case DRM_NVIDIA_GEM_EXPORT_DMABUF_MEMORY:
-    if (!file)
-      return -ENOTTY;
-    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, k,
                                       &nvgpu_gem_export_dmabuf);
 
   /*
@@ -491,24 +586,10 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
    * says what is behind it, and neither is any use without the other.
    */
   case DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY:
-    if (!file)
-      return -ENOTTY;
-    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, uarg,
+    return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, k,
                                       &nvgpu_gem_export_dmabuf);
-
-  default:
-    /*
-     * Named rather than silently refused. An ioctl this stub does not answer
-     * is the ICD asking for something the node cannot do yet, and -ENOTTY on
-     * its own turns up much later as a device that would not initialise.
-     */
-    dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                        "virtio-gpu-nv: unhandled nvidia-drm ioctl "
-                        "nr=0x%02x (DRM_NVIDIA_%u) size=%u dir=%u\n",
-                        nr, nr - DRM_COMMAND_BASE, _IOC_SIZE(cmd),
-                        _IOC_DIR(cmd));
-    return -ENOTTY;
   }
+  return -ENOTTY;
 }
 
 /* Woken whenever a dying proxy leaves its owner's gem_index. */
@@ -1371,26 +1452,20 @@ int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
  * would be about a handle the importing file does not hold. Unknown for
  * anything that is not ours, which is what the host driver reports too.
  */
-static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg) {
+static long nvgpu_gem_identify(struct drm_file *file, void *karg) {
   struct {
     __u32 handle;
     __u32 object_type;
-  } p;
+  } *p = karg;
   struct drm_gem_object *obj;
 
-  if (copy_from_user(&p, uarg, sizeof(p)))
-    return -EFAULT;
-
-  obj = drm_gem_object_lookup(file, p.handle);
+  obj = drm_gem_object_lookup(file, p->handle);
   if (obj && obj->funcs == &nvgpu_gem_funcs)
-    p.object_type = to_nvgpu_gem(obj)->obj_type;
+    p->object_type = to_nvgpu_gem(obj)->obj_type;
   else
-    p.object_type = NVGPU_GEM_OBJECT_UNKNOWN;
+    p->object_type = NVGPU_GEM_OBJECT_UNKNOWN;
   if (obj)
     drm_gem_object_put(obj);
-
-  if (copy_to_user(uarg, &p, sizeof(p)))
-    return -EFAULT;
   return 0;
 }
 
@@ -1409,7 +1484,7 @@ static long nvgpu_gem_identify(struct drm_file *file, void __user *uarg) {
  */
 static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
                                        struct drm_file *file, unsigned int cmd,
-                                       void __user *uarg,
+                                       void *karg,
                                        const struct nvgpu_gem_nested_desc *d) {
   u8 outer[NVGPU_GEM_OUTER_MAX];
   void __user *user_nested;
@@ -1426,11 +1501,9 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   struct drm_gem_object *held = NULL;
 
   /*
-   * The caller's struct has to be the one this descriptor describes, or the
-   * pointer is not where we are about to read it from. Named rather than
-   * clamped: a size that is not the expected one means the guest's userspace
-   * driver and this table disagree about a UAPI struct, and reading a pointer
-   * out of the wrong offset would forward a plausible-looking address.
+   * The argument has been normalised to this descriptor's size
+   * (nvgpu_drm_driver_cmd()), so this holds unless the two disagree, which
+   * would put the pointer somewhere other than where it is about to be read.
    */
   if (sz != d->size) {
     dev_dbg_ratelimited(&nfd->dev->vdev->dev,
@@ -1449,8 +1522,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       d->ptr_offset + 8 > d->size || d->size_offset + 8 > d->size)
     return -EINVAL;
 
-  if (copy_from_user(outer, uarg, d->size))
-    return -EFAULT;
+  memcpy(outer, karg, d->size);
 
   user_nested = (void __user *)(unsigned long)get_unaligned_le64(
       outer + d->ptr_offset);
@@ -1604,8 +1676,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
       }
     }
 
-    if (copy_to_user(uarg, out, data_len))
-      ret = -EFAULT;
+    memcpy(karg, out, data_len);
   }
 
   if (user_nested && nested_size > 0 && nested_len > 0) {
@@ -1810,6 +1881,12 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
  *                                         left to drm_ioctl().
  *   type 'F'                              NVIDIA RM, proxied to the host like
  *                                         on any other node.
+ *
+ * Every type-'d' ioctl is taken by its number alone, as drm_ioctl() takes
+ * one. The ones answered or forwarded here (the driver range, syncobjs, a
+ * KMS file's KMS calls) run on the caller's argument normalised to the
+ * native struct (nvgpu_drm_arg_in()), so the handler and the host see only
+ * the native command; the rest go to drm_ioctl(), which does the same.
  */
 static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
                                        unsigned long arg, bool compat) {
@@ -1846,8 +1923,17 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
      * Only with the backend serving them; otherwise the core answers, and
      * with DRIVER_SYNCOBJ cleared for this device it answers -EOPNOTSUPP.
      */
-    if (nvgpu_fence_is_syncobj_ioctl(cmd) && nvgpu_fences_enabled(nfd->dev))
-      return nvgpu_fence_syncobj_ioctl(nfd, file, cmd, arg);
+    if (nvgpu_fence_syncobj_cmd(cmd) && nvgpu_fences_enabled(nfd->dev)) {
+      struct nvgpu_drm_arg a;
+      long ret;
+
+      ret = nvgpu_drm_arg_in(&a, cmd, nvgpu_fence_syncobj_cmd(cmd),
+                             (void __user *)arg);
+      if (ret)
+        return ret;
+      ret = nvgpu_fence_syncobj_ioctl(nfd, file, a.cmd, a.k);
+      return nvgpu_drm_arg_out(&a, ret);
+    }
 
     /*
      * DRM_CAP_DUMB_BUFFER on a file with no KMS side (those went to the host
@@ -1861,15 +1947,21 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
      * this node (MODE_CREATE_DUMB is not served on it). Answered here; the
      * host sees nothing.
      */
-    if (cmd == DRM_IOCTL_GET_CAP) {
-      struct drm_get_cap gc;
+    if (nr == _IOC_NR(DRM_IOCTL_GET_CAP)) {
+      struct nvgpu_drm_arg a;
+      struct drm_get_cap *gc;
+      long ret;
 
-      if (copy_from_user(&gc, (void __user *)arg, sizeof(gc)))
-        return -EFAULT;
-      if (gc.capability == DRM_CAP_DUMB_BUFFER) {
-        gc.value = 0;
-        return copy_to_user((void __user *)arg, &gc, sizeof(gc)) ? -EFAULT : 0;
+      ret = nvgpu_drm_arg_in(&a, cmd, DRM_IOCTL_GET_CAP, (void __user *)arg);
+      if (ret)
+        return ret;
+      gc = a.k;
+      if (gc->capability == DRM_CAP_DUMB_BUFFER) {
+        gc->value = 0;
+        return nvgpu_drm_arg_out(&a, 0);
       }
+      /* Any other is the core's, which reads the caller's argument itself. */
+      nvgpu_drm_arg_drop(&a);
     }
 
     /*
