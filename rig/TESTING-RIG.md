@@ -733,6 +733,20 @@ rig/bench-stats.py native='.rig/logs/bench/n/*.bench' nesbox='.rig/logs/bench/g/
 NVGPU_BENCH_GROUPS=micro NVGPU_BENCH_BACKEND_ARGS="--queue-poll-us 0" rig/rig-bench.sh vm qp0 3
 ```
 
+The regression of branch `perf` on its installed backend, VMMs (nesbox
+`virtio-nvgpu-v5`, crosvm with `patches/crosvm/0010`), image and modules
+(2026-09-29, sandbox on, allowlist enforcing), under nesbox and crosvm, each
+with the C and the Rust module: `stage1` 6/0/0, `compat` 12/0/0, `render`
+with compute 9/0/1 (cuda-smoke PASS), the map churn 400/400, `secneg`
+(kms=none) 10 passed, 5 skipped, `wayland` on the live Hyprland 13/0/1,
+`lease` 9/0/1, `vkdisplay` 8/0/1, `secneg` on the lease 15 passed. The
+application pass's glxgears, vkmark, glmark2, SuperTuxKart, Chromium, mpv,
+CUDA n-body, NVENC, NVDEC and Cycles, as uid 1000 with compute: 33/0/0 under
+each VMM. One earlier `compat` run (crosvm, Rust module, before the final
+module) failed its EXPORT_SYNC_FILE check once -- a sync_file not signalled
+within 1 s -- and did not recur in 14 fresh boots, 200 runs in one guest,
+or the final regression; the same image's predecessor passed 8 of 8.
+
 Each guest run also writes the backend's and the VMM's CPU per group
 (`vm-N.cpu`, from `/proc` every 100 ms), both sides' pacing counters
 (`vm-N.pacing`) and the backend's log. A run takes about four minutes;
