@@ -233,6 +233,15 @@ void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id) {
     nvgpu_osdesc_free(found);
 }
 
+/*
+ * The page runs on the wire, and the Rust parsers' page count (osdesc.rs
+ * PAGE_SIZE), are 4 KiB pages; the pins here are the kernel's. The two agree
+ * only on a 4 KiB kernel, which Kconfig's x86-64 is (the 2026-09-29 review,
+ * C1): with 16 KiB pages the Rust would have counted four times the pages
+ * the C pins, and pinned past the range.
+ */
+static_assert(PAGE_SIZE == SZ_4K, "osdesc runs are 4 KiB pages");
+
 /* Pin the `npages` pages from `start`, all of them, into `pages`. */
 int nvgpu_osdesc_pin(unsigned long start, unsigned long npages, bool write,
                      struct page **pages) {

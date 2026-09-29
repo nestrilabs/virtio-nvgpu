@@ -18,8 +18,8 @@
 use super::deep::{self, UserMem};
 use super::wire::{
     has, ioctl_req_header, le32, le64, put32, put64, sum, Errno, FillFrom, IoctlResp,
-    DEEP_SEGMENTED, EBADF, EFAULT, EINVAL, EIO, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX,
-    IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
+    DEEP_SEGMENTED, EBADF, EFAULT, EINVAL, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX, IOCTL_REQ_LEN,
+    IOCTL_RESP_LEN, PROC_ID_LEN,
 };
 
 /// NV_IOCTL_MAGIC, the type byte of every RM escape.
@@ -239,15 +239,16 @@ fn part_ref(buf: &[u8], at: usize, len: usize) -> Result<&[u8], Errno> {
     buf.get(at..end).ok_or(-EFAULT)
 }
 
-/// Send `req` and read the reply's header; -EIO for a reply shorter than a
-/// header, as every path here has it.
+/// `nvgpu_ioctl_exchange()`: send `req` and read the reply's header; -EIO
+/// for a reply shorter than a header and -EPROTO for a status that is not
+/// an errno ([`IoctlResp::parse`]), as every path here has it.
 fn round_trip<E: Env + ?Sized>(
     env: &mut E,
     req: &[u8],
     resp: &mut [u8],
 ) -> Result<(IoctlResp, usize), Errno> {
     let used = env.send_recv(req, resp)?;
-    let h = IoctlResp::parse(resp, used).ok_or(-EIO)?;
+    let h = IoctlResp::parse(resp, used)?;
     Ok((h, used as usize))
 }
 

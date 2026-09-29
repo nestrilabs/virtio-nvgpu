@@ -21,6 +21,8 @@
 /* ── the Rust world (src/lib.rs) ── */
 int dt_copy_from_user(void *to, u64 from, size_t n);
 int dt_copy_to_user(u64 to, const void *from, size_t n);
+void dt_kread(void *to, u64 from, size_t n);
+void dt_kwrite(u64 to, const void *from, size_t n);
 int dt_send_recv(const void *req, size_t req_len, void *resp, size_t resp_len,
                  u32 *used);
 int dt_handle_for_fd(int fd, u32 *handle);
@@ -450,9 +452,17 @@ static int h_phase(struct nvgpu_i2_call *call, int phase) {
 
 /* Bit n of `mask` gives the call hook n: fd_in, gem_in, fd_out, gem_out,
  * special, phase. */
+void harness_kread(void *dst, u64 src, unsigned long n) {
+  dt_kread(dst, src, n);
+}
+
+void harness_kwrite(u64 dst, const void *src, unsigned long n) {
+  dt_kwrite(dst, src, n);
+}
+
 long harness_i2(struct nvgpu_device *dev, u32 sclass, u32 cmd, u64 uarg,
-                u32 handle, u32 render, u32 xflags, bool kernel, u32 mask,
-                s32 *ret_out) {
+                u32 handle, u32 render, u32 xflags, bool kernel, bool karg,
+                u32 mask, s32 *ret_out) {
   struct nvgpu_i2_ops ops = {
       .fd_in = mask & 1 ? h_fd_in : NULL,
       .gem_in = mask & 2 ? h_gem_in : NULL,
@@ -470,6 +480,7 @@ long harness_i2(struct nvgpu_device *dev, u32 sclass, u32 cmd, u64 uarg,
       .uarg = (void __user *)(uintptr_t)uarg,
       .xflags = xflags,
       .kernel = kernel,
+      .karg = karg,
       .ops = &ops,
   };
   long r = nvgpu_i2_ioctl(&call);

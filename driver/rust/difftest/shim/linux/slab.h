@@ -12,6 +12,7 @@ void harness_kfree(const void *p);
 #define kmalloc(n, gfp) harness_kmalloc(n)
 #define kzalloc(n, gfp) harness_kzalloc(n)
 #define kvzalloc(n, gfp) harness_kzalloc(n)
+#define kvmalloc(n, gfp) harness_kmalloc(n)
 #define kvmalloc_array(n, s, gfp) harness_kvmalloc_array(n, s)
 #define kfree(p) harness_kfree(p)
 #define kvfree(p) harness_kfree(p)

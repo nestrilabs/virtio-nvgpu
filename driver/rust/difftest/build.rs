@@ -91,6 +91,23 @@ int nvgpu_send_recv_used(struct nvgpu_device *dev, void *req, int req_len,
 static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
   return off <= used && len <= used - off;
 }
+struct nvgpu_ioctl_reply {
+  s32 status;
+  s32 raw;
+  u32 used;
+  bool full;
+  u32 data_len;
+  u32 nested_len;
+  u32 deep_len;
+};
+void nvgpu_ioctl_req_init(struct nvgpu_ioctl_req *req, u32 handle, u32 cmd,
+                          u32 data_len, u32 nested_off, u32 nested_len,
+                          u32 deep_off, u32 deep_len);
+int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
+                            struct nvgpu_ioctl_reply *r);
+int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
+                         void *resp, size_t resp_max,
+                         struct nvgpu_ioctl_reply *r);
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
@@ -117,6 +134,7 @@ fn main() {
         "nvgpu_rmio.c",
         "nvgpu_schema.c",
         "nvgpu_atomic.c",
+        "nvgpu_v1.c",
     ] {
         fs::copy(driver.join(f), out.join(f)).expect(f);
         files.push(out.join(f));

@@ -28,6 +28,17 @@
 
 #include "nvgpu_wire.h"
 
+/*
+ * x86-64 only (Kconfig's `depends on X86_64`, which an out-of-tree build
+ * never reads, hence this): the fake PCI bus embeds x86's struct pci_sysdata,
+ * the 32-bit refusals (ADDFB2's) are right only where drm_ioc32.c converts
+ * what it does on x86, and memory registered by its pages goes as runs of
+ * 4 KiB pages, which the Rust parsers count in too (osdesc.rs PAGE_SIZE).
+ */
+#ifndef CONFIG_X86_64
+#error "virtio-gpu-nv supports x86-64 guests only (driver/Kconfig)"
+#endif
+
 struct drm_file;
 struct nvgpu_kms_file;
 
@@ -96,29 +107,23 @@ struct nvgpu_pci_slot {
 };
 
 /*
- * The PCI core reads a bus's sysdata as the architecture's own type. On x86
- * that is `struct pci_sysdata`, and the fields below have to line up with the
- * front of it:
+ * The PCI core reads a bus's sysdata as the architecture's own type, which on
+ * x86 is `struct pci_sysdata`: pci_domain_nr() its `domain`, pcibus_to_node()
+ * its `node`, pci_host_bridge_msi_domain() its `fwnode`, the ACPI glue its
+ * `companion`. So the bus's sysdata is a whole one, embedded here, the rest
+ * of it zero.
  *
- *     struct pci_sysdata { int domain; int node; ... };
- *
- * `domain` was mirrored here from the start, for pci_domain_nr(). `node` was
- * not, and everything after `domain` in this struct was therefore read as the
- * bus's NUMA node -- that is, the first four bytes of the PCI address string,
- * "0000", or 0x30303030. It went unnoticed because it is only ever read under
- * CONFIG_NUMA, which the guest kernel did not have; turn it on and the first
- * allocation the DRM core makes against this device oopses in ___slab_alloc,
- * indexing a node array a billion entries past its end.
- *
- * Mirrored rather than embedded so the struct stays buildable where
- * `struct pci_sysdata` is not the arch's sysdata type; the layout is what
- * matters, and a wrong one is silent.
+ * It used to be mirrored, and a mirror goes wrong silently. First only
+ * `domain`: everything after it was read as the NUMA node -- "0000" of the
+ * PCI address string, 0x30303030 -- which oopsed in ___slab_alloc as soon as
+ * CONFIG_NUMA was on. Then `domain` and `node` only, with `companion`,
+ * `iommu` and `fwnode` falling on the address string and the config space
+ * (the 2026-09-29 review, #19): harmless while nothing matched on them, and
+ * a pointer of "0x...10de" to any IRQ domain that did. The module is x86-64
+ * only (Kconfig), so the arch's own type is the one to use.
  */
 struct nvgpu_pci_root {
-  int domain; /* MUST be first — x86 pci_domain_nr()
-               * reads domain from sysdata offset 0 */
-  int node;   /* MUST be second — x86 pcibus_to_node()
-               * reads the NUMA node from sysdata offset 4 */
+  struct pci_sysdata sd; /* bus->sysdata; container_of() gets the rest */
   struct nvgpu_pci_slot slot;
   struct nvgpu_device *nvdev; /* back pointer        */
   struct pci_host_bridge *bridge;
@@ -166,10 +171,10 @@ struct nvgpu_device {
   struct cdev cdev_gpu[248]; /* /dev/nvidia0 … nvidia247 */
   struct cdev cdev_ctl;      /* /dev/nvidiactl            */
   struct cdev cdev_uvm;      /* /dev/nvidia-uvm           */
-  dev_t uvm_devno;           /* dynamic major for UVM     */
+  dev_t uvm_devno;           /* dynamic major, minors 0-1 */
   bool uvm_registered;       /* UVM served: nvgpu_uvm_offered() */
   struct cdev cdev_caps;     /* /dev/nvidia-caps */
-  dev_t caps_devno;          /* dynamic major for nvidia-caps */
+  dev_t caps_devno;          /* dynamic major, minors 1-2 */
   struct cdev cdev_modeset;  /* /dev/nvidia-modeset */
   dev_t modeset_devno;
 
@@ -188,6 +193,13 @@ struct nvgpu_device {
   /* Every open descriptor, so an event naming a handle can find its file. */
   struct list_head fds;
   spinlock_t fds_lock;
+  /*
+   * DRM files by render handle, from open until their last nvgpu_fd_put()
+   * -- past release, while proxies keep the render handle: the reaper asks
+   * whether a host GEM handle is a proxy's (nvgpu_gem_handle_held()), and a
+   * released file's proxies are just as alive as an open one's.
+   */
+  struct xarray renders;
 
   /* ── DRI device nodes ── */
 #define NVGPU_MAX_DRI_DEVS 8
@@ -241,6 +253,9 @@ struct nvgpu_device {
   u64 osdesc_early[NVGPU_OSDESC_EARLY];
   unsigned int osdesc_early_next;
   bool osdesc_dead;
+
+  /* /proc/driver/nvidia's files' data (nvgpu_main.c, struct nvgpu_proc_buf). */
+  struct list_head proc_bufs;
 };
 
 /*
@@ -276,8 +291,7 @@ struct nvgpu_fd {
    */
   atomic_t armed;
   struct list_head node; /* dev->fds, for finding this by handle */
-  /* Answer to GET_DRM_FILE_UNIQUE_ID, assigned on first ask. Zero means
-   * "not yet asked", which is why the counter starts at one. */
+  /* DRM files: the answer to GET_DRM_FILE_UNIQUE_ID, given at open, from 1. */
   u64 drm_unique_id;
   /*
    * Lifetime of `handle`. The opener holds one reference, and for a DRM file
@@ -327,7 +341,7 @@ struct nvgpu_fd {
  * A GEM parameter struct that carries a userspace pointer, described well
  * enough to forward: where the pointer sits and where the length beside it
  * does. Both are u64. A struct with no pointer is not described here at all --
- * it goes through nvgpu_ioctl_simple(), which copies the whole thing.
+ * it goes through nvgpu_ioctl_flat_h(), which copies the whole thing.
  */
 struct nvgpu_gem_nested_desc {
   u32 size;        /* sizeof the parameter struct */
@@ -411,6 +425,9 @@ struct nvgpu_gem_object {
   u8 caching;     /* NVGPU_MMAP_CACHE_*, from the placement's reply */
   bool read_only; /* the host maps it read-only (NVGPU_MMAP_F_READ_ONLY) */
   bool window_valid;
+  /* SEMSURF_FENCE_ATTACH moved it into another file at least once, so its
+   * free has re-homes to close (nvgpu_fence_gem_free()). */
+  bool rehomed;
 };
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
@@ -418,7 +435,8 @@ struct nvgpu_gem_object {
 /* ───────── nvgpu_rmio.c, or nvgpu_rs.rs with NVGPU_RUST ─────────
  *
  * The protocol-v1 IOCTL message: an ioctl on a /dev/nvidia* file (or a DRM
- * file's driver range), a UVM command, and a v1 backend's NVKMS command.
+ * file's RM ioctl, of any type but 'd'), a UVM command, and a v1 backend's
+ * NVKMS command.
  */
 
 long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
@@ -426,6 +444,36 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                         unsigned long arg);
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
                          void __user *uarg);
+
+/* ───────── nvgpu_v1.c: the v1 IOCTL exchange, both builds ───────── */
+
+/* A v1 IOCTL reply's header, as far as the device wrote it. */
+struct nvgpu_ioctl_reply {
+  s32 status; /* 0 or a -errno in [-MAX_ERRNO, -1]: the host call's result */
+  s32 raw;    /* the status as the backend sent it */
+  u32 used;   /* bytes the device wrote */
+  bool full;  /* the whole nvgpu_ioctl_resp is there; else the lengths are 0 */
+  u32 data_len;
+  u32 nested_len;
+  u32 deep_len;
+};
+void nvgpu_ioctl_req_init(struct nvgpu_ioctl_req *req, u32 handle, u32 cmd,
+                          u32 data_len, u32 nested_off, u32 nested_len,
+                          u32 deep_off, u32 deep_len);
+/*
+ * Read a reply of `used` bytes: 0 and *r, -EIO for less than a header, or
+ * -EPROTO for a status that is neither 0 nor an errno. Nothing of an -EPROTO
+ * reply goes back to the caller; *r is filled all the same (r->raw, the
+ * lengths) for the one path that must still account for what the backend
+ * may have made: an OS-descriptor registration's pins.
+ */
+int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
+                            struct nvgpu_ioctl_reply *r);
+/* nvgpu_send_recv_used() and nvgpu_ioctl_reply_parse(): a transport error,
+ * -EIO, -EPROTO, or 0 with the reply in *r. */
+int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
+                         void *resp, size_t resp_max,
+                         struct nvgpu_ioctl_reply *r);
 
 /* ───────── nvgpu_main.c ───────── */
 
@@ -455,11 +503,13 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
                              struct nvgpu_open_req_proc *r);
 /* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
+/* nvgpu_xfer.c: nothing sent will be answered (after a reset, remove()). */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);
+/* nvgpu_fence.c: every guest syncobj waiter looks again. */
 void nvgpu_fence_wake_waiters(void);
 
 /*
- * Frame-pacing counters (nvgpu_xfer.c; ARCHITECTURE.md, "Frame pacing"):
+ * Frame-pacing counters, nvgpu_xfer.c's (ARCHITECTURE.md, "Frame pacing"):
  * relaxed atomics, always kept, read as root from
  * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
  * nvgpu_fence.c count themselves here too.
@@ -480,6 +530,17 @@ enum nvgpu_pace_ctr {
   NVGPU_PACE_CTRS
 };
 void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
+/*
+ * The module's own work queues (nvgpu_main.c), made at init and destroyed at
+ * exit after the driver is unregistered: destroy_workqueue() waits for an
+ * item still running, so no item returns into module text after it is gone
+ * -- which the system queues did not guarantee for items that hold no module
+ * reference, or drop the last one (S3, 2026-09-29). nvgpu_wq: short,
+ * high-priority items (W_ARM, a fence proxy's WATCH); nvgpu_long_wq: items
+ * that make round trips (a semaphore-surface wait's second half).
+ */
+extern struct workqueue_struct *nvgpu_wq;
+extern struct workqueue_struct *nvgpu_long_wq;
 void nvgpu_dev_get(struct nvgpu_device *dev);
 /* Any context: the last put only frees memory. */
 void nvgpu_dev_put(struct nvgpu_device *dev);
@@ -580,18 +641,17 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
                          u32 *owner, u32 *gem);
 /*
  * Host GEM @host_gem, just imported into the render handle of @drm_filp (a
- * DRM file of ours), as a new guest dma-buf descriptor (@o_flags: O_CLOEXEC |
- * O_RDWR), or -errno. @obj_type is the host's IDENTIFY answer for it
+ * DRM file of ours), as a new guest dma-buf (@o_flags: O_CLOEXEC | O_RDWR),
+ * not yet a descriptor: the caller installs it (dma_buf_fd(), or fd_install()
+ * of buf->file) once nothing else can fail, or dma_buf_put()s it. An ERR_PTR
+ * on failure. @obj_type is the host's IDENTIFY answer for it
  * (NVGPU_GEM_OBJECT_*), which a new proxy reports. Owns @host_gem unless it
- * returns -EBADF (not our file).
+ * returns -EBADF (not our file) or -EAGAIN (a dying proxy's handle: wait it
+ * out with nvgpu_gem_wait_gone() and import again).
  */
-/* The same, as the dma-buf itself (an ERR_PTR on failure), for a caller
- * that installs the descriptor only once nothing else can fail. */
 struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
                                            u32 host_gem, u64 size,
                                            u32 obj_type, int o_flags);
-int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           u32 obj_type, int o_flags);
 
 /* Guest handle in `file` -> the proxy itself, referenced (drop it with
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
@@ -642,6 +702,14 @@ void nvgpu_kms_master_drop(struct drm_file *file);
  */
 int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
                          int o_flags);
+/*
+ * The same, as the new file itself (an ERR_PTR on failure, with the same
+ * ownership of `kms_handle`: ERR_PTR(-EBADF) exactly when `tmpl` is not a
+ * card file of ours), for a caller that installs its descriptor only once
+ * nothing else can fail (nvgpu_wl.c's RECV).
+ */
+struct file *nvgpu_adopt_drm_filp(struct file *tmpl, u32 kms_handle,
+                                  u32 kind, int o_flags);
 
 /* ───────── nvgpu_nvkms.c ───────── */
 
@@ -747,6 +815,9 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
 void nvgpu_fence_file_release(struct nvgpu_fd *nfd);
 /* Retire the event consumers buried so far (remove(), module exit). */
 void nvgpu_fence_drain(void);
+/* The transport of `dev` is dead: signal its host fences with -ENODEV and
+ * its SYNCOBJ_EVENTFD subscribers, and wake its syncobj waiters. */
+void nvgpu_fence_device_dead(struct nvgpu_device *dev);
 
 /* ───────── nvgpu_capture.c ───────── */
 
@@ -935,6 +1006,14 @@ void nvgpu_osdesc_late(struct nvgpu_device *dev, u32 req_id, u64 id);
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write);
 
 /* ── HOST_OP / WATCH / CLOSE ── */
+/* A HOST_OP result that names a backend handle: nonzero and 32-bit, into
+ * *h; false for anything else, which the caller answers -EPROTO. */
+static inline bool nvgpu_res_u32(u64 v, u32 *h) {
+  if (!v || v > U32_MAX)
+    return false;
+  *h = (u32)v;
+  return true;
+}
 int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
                   u32 nargs, u64 *res, u32 nres);
 /*
@@ -957,9 +1036,9 @@ int nvgpu_close_handle(struct nvgpu_device *dev, u32 handle);
 int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 /* From any context: queued on a workqueue that holds a module reference. */
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
-/* A W_ARM of `handle`, sent from a work item: poll() cannot wait for it.
- * False if it could not be queued. */
-bool nvgpu_arm_ready_async(struct nvgpu_device *dev, u32 handle);
+/* A W_ARM of `nfd`'s handle, sent from a work item on nvgpu_wq: poll()
+ * cannot wait for it. False if it could not be queued. Process context. */
+bool nvgpu_arm_ready_async(struct nvgpu_fd *nfd);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
 /* The same, and release(arg) once the host can no longer act on the close:
@@ -1108,6 +1187,13 @@ struct nvgpu_i2_call {
 int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
                   void *obj);
 
+/*
+ * For an fd_in hook: whether a file of ours of `device_type` (NVGPU_DEV_*)
+ * may stand in a descriptor field that allows `kinds` (NVGPU_SKIND*), as the
+ * backend's schema::kind_allowed() decides it. nvgpu_schema.c.
+ */
+bool nvgpu_fd_kind_allowed(u32 device_type, u32 kinds);
+
 /* Is there a schema for this call? (Used to decide whether to intercept.) */
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
                          unsigned int cmd, const void *arg_prefix,
@@ -1193,8 +1279,10 @@ struct nvgpu_atomic_out {
  * From the ATOMIC special's phase 0: walk the commit's arrays in the call's
  * kernel copies, asking `ops` what its objects and properties are, reserving
  * the flip events and bridging the fences. 0 or -errno. `out->commit` is
- * written before any hook runs (both implementations; the difftest checks
- * what a hook sees), `out->values_buf` by the end.
+ * written before any hook runs (both implementations: the C at once, the
+ * Rust through atomic::Env::begin; the difftest checks what a hook sees),
+ * and is the flag's one source -- nvgpu_kms.c's hooks read it through their
+ * context; `out->values_buf` by the end.
  */
 int nvgpu_atomic_parse(struct nvgpu_i2_call *call, bool fences,
                        const struct nvgpu_atomic_ops *ops, void *ctx,

@@ -189,6 +189,18 @@ static bool nvgpu_i2_kernel_range(const void __user *p, size_t len) {
   return !access_ok(p, len);
 }
 
+/*
+ * Such a buffer's bytes, copied as kernel memory. Plain memcpy()s, named so
+ * the difftest's shim can give them its model of kernel memory and so run
+ * the .kernel / .karg paths against the Rust (its KStore does the same
+ * through nvgpu_rs_copy_from() / _to()).
+ */
+#ifndef nvgpu_i2_kread
+#define nvgpu_i2_kread(dst, src, len)                                          \
+  memcpy(dst, (const void __force *)(src), len)
+#define nvgpu_i2_kwrite(dst, src, len) memcpy((void __force *)(dst), src, len)
+#endif
+
 /* A little-endian unsigned field of 1, 2, 4 or 8 bytes (NVKMS counts come
  * as narrow as SET_SWAP_GROUP_CLIP_LIST's u16 nClips). */
 static int nvgpu_i2_rd(const struct nvgpu_i2_state *st, u32 b, u32 off,
@@ -287,7 +299,7 @@ static int nvgpu_i2_new_buf(struct nvgpu_device *dev,
   if (kb->kern) {
     if (!nvgpu_i2_kernel_range(uptr, len))
       return -EFAULT;
-    memcpy(kb->k, (const void __force *)uptr, len);
+    nvgpu_i2_kread(kb->k, uptr, len);
     return 0;
   }
   if (copy_from_user(kb->k, uptr, len))
@@ -990,7 +1002,7 @@ static int nvgpu_i2_copy_back(struct nvgpu_i2_call *call) {
       continue;
     if (kb->kern) {
       if (nvgpu_i2_kernel_range(kb->uptr + start, end - start))
-        memcpy((void __force *)kb->uptr + start, kb->k + start, end - start);
+        nvgpu_i2_kwrite(kb->uptr + start, kb->k + start, end - start);
       else
         fault = -EFAULT;
     } else if (copy_to_user(kb->uptr + start, kb->k + start, end - start)) {

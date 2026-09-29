@@ -92,6 +92,8 @@
 /* How long a blocking WAIT_VBLANK waits: the core's own bound
  * (drm_vblank.c:1850), after which it answers -EBUSY. */
 #define NVGPU_KMS_VBLANK_WAIT_MS 3000
+/* ... looking every this often whether the transport has died. */
+#define NVGPU_KMS_VBLANK_SLICE_MS 50
 
 /*
  * user_data of the EVENT form a blocking WAIT_VBLANK is sent as: a tag in the
@@ -665,18 +667,18 @@ int nvgpu_kms_open(struct nvgpu_dri_dev *dri, struct drm_file *file,
   return 0;
 }
 
-int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
-                         int o_flags) {
+struct file *nvgpu_adopt_drm_filp(struct file *tmpl, u32 kms_handle,
+                                  u32 kind, int o_flags) {
   struct nvgpu_fd *tnfd = tmpl ? nvgpu_drm_file_nfd(tmpl) : NULL;
   struct nvgpu_dri_dev *dri;
   struct nvgpu_device *dev;
   struct drm_file *tfile;
   struct file *f;
   bool consumed;
-  int fd, ret;
+  int ret;
 
   if (!tnfd)
-    return -EBADF;
+    return ERR_PTR(-EBADF);
   dev = tnfd->dev;
   tfile = tmpl->private_data;
   dri = tfile->minor->dev->dev_private;
@@ -703,14 +705,6 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
     goto close;
   }
 
-  /* The descriptor first, so that nothing can fail once the clone holds the
-   * handle but an fd_install(). */
-  fd = get_unused_fd_flags(o_flags & O_CLOEXEC);
-  if (fd < 0) {
-    ret = fd;
-    goto close;
-  }
-
   mutex_lock(&nvgpu_adopt_lock);
   nvgpu_adopt.dri = dri;
   nvgpu_adopt.handle = kms_handle;
@@ -730,18 +724,16 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
   mutex_unlock(&nvgpu_adopt_lock);
 
   if (IS_ERR(f)) {
-    put_unused_fd(fd);
     ret = PTR_ERR(f);
     /* Taken and then let go by the failed clone's own release. */
     if (consumed)
-      return ret == -EBADF ? -EIO : ret;
+      return ERR_PTR(ret == -EBADF ? -EIO : ret);
     goto close;
   }
   if (!consumed) {
     /* Our node's open always runs nvgpu_drm_open(), which either takes the
      * slot or fails; an open that did neither is not ours to hand out. */
     fput(f);
-    put_unused_fd(fd);
     ret = -EIO;
     goto close;
   }
@@ -754,12 +746,35 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
    * as a lessee's are (nvgpu_kms_ioctl()).
    */
   nvgpu_drm_drop_master(f);
-  fd_install(fd, f);
-  return fd;
+  return f;
 
 close:
   nvgpu_close_handle(dev, kms_handle);
-  return ret == -EBADF ? -EIO : ret;
+  return ERR_PTR(ret == -EBADF ? -EIO : ret);
+}
+
+int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
+                         int o_flags) {
+  struct nvgpu_fd *tnfd = tmpl ? nvgpu_drm_file_nfd(tmpl) : NULL;
+  struct file *f;
+  int fd;
+
+  if (!tnfd)
+    return -EBADF;
+  /* The descriptor first, so that nothing can fail once the clone holds the
+   * handle but an fd_install(). */
+  fd = get_unused_fd_flags(o_flags & O_CLOEXEC);
+  if (fd < 0) {
+    nvgpu_close_handle(tnfd->dev, kms_handle);
+    return fd;
+  }
+  f = nvgpu_adopt_drm_filp(tmpl, kms_handle, kind, o_flags);
+  if (IS_ERR(f)) {
+    put_unused_fd(fd);
+    return PTR_ERR(f);
+  }
+  fd_install(fd, f);
+  return fd;
 }
 
 /* ───────── events ───────── */
@@ -1190,6 +1205,10 @@ static int nvgpu_kms_out_fence(struct nvgpu_kms_call *kc, u32 buf, u32 off,
  */
 struct nvgpu_kms_actx {
   struct nvgpu_kms_call *kc;
+  /* The parse's answer: `commit` is written before any hook runs, by
+   * either implementation (nvgpu_atomic_parse()), and is the one source of
+   * the flag. */
+  const struct nvgpu_atomic_out *out;
 };
 
 static int nvgpu_kms_a_obj(void *ctx, u32 obj, u32 *crtc) {
@@ -1209,6 +1228,7 @@ static int nvgpu_kms_a_in_fence(void *ctx, void *st, u32 buf, u32 off,
   struct nvgpu_kms_actx *a = ctx;
 
   a->kc->call.st = st;
+  a->kc->commit = a->out->commit;
   return nvgpu_kms_in_fence(a->kc, buf, off, fd);
 }
 
@@ -1248,22 +1268,21 @@ static const struct nvgpu_atomic_ops nvgpu_kms_atomic_ops = {
 /* Before an atomic commit goes: its events and its fences. */
 static int nvgpu_kms_atomic(struct nvgpu_kms_call *kc) {
   struct nvgpu_atomic_out out = {};
-  struct nvgpu_kms_actx a = {.kc = kc};
+  struct nvgpu_kms_actx a = {.kc = kc, .out = &out};
   void *st = kc->call.st;
-  u32 len;
-  u8 *b0 = nvgpu_i2_buf(&kc->call, 0, &len);
   int ret;
 
   /*
-   * Commit or TEST_ONLY, before any hook runs, from the same copy the parse
-   * reads: a TEST_ONLY commit's in-fences are only checked
-   * (nvgpu_kms_in_fence()), a real one's bridged. It was read from the
-   * parse's out struct, which the Rust parse filled in only once it had
-   * finished -- so every real commit's IN_FENCE_FD went to the host as -1.
+   * Commit or TEST_ONLY is the parse's to say, in `out.commit`, which both
+   * implementations write before any hook runs: a TEST_ONLY commit's
+   * in-fences are only checked (nvgpu_kms_in_fence()), a real one's
+   * bridged, and the in-fence hook reads it there. (The Rust parse once
+   * said it only when it had finished, and every real commit's IN_FENCE_FD
+   * went to the host as -1; this file then computed the flag a second
+   * time, from the same bytes. One source now, and the difftest records
+   * what each hook sees.)
    */
-  kc->commit = b0 && len >= NVGPU_ATOMIC_SIZE &&
-               !(get_unaligned_le32(b0 + NVGPU_ATOMIC_FLAGS) &
-                 NVGPU_ATOMIC_TEST_ONLY);
+  kc->commit = false;
   ret = nvgpu_atomic_parse(&kc->call,
                            kc->kf->dev->backend_caps & NVGPU_BCAP_FENCES,
                            &nvgpu_kms_atomic_ops, &a, &out);
@@ -1292,12 +1311,7 @@ static int nvgpu_kms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
     return -EBADF;
   o = nvgpu_fd_from_file(f);
   if (o && o->dev == kc->kf->dev &&
-      (((kinds & NVGPU_SKIND_DEV_MODESET) &&
-        o->device_type == NVGPU_DEV_MODESET) ||
-       ((kinds & NVGPU_SKIND_DEV_CTL) && o->device_type == NVGPU_DEV_CTL) ||
-       ((kinds & NVGPU_SKIND_DEV_GPU) && o->device_type < NVGPU_DEV_CTL) ||
-       ((kinds & NVGPU_SKIND(NVGPU_HK_DEV)) &&
-        o->device_type < NVGPU_DEV_DRI_BASE))) {
+      nvgpu_fd_kind_allowed(o->device_type, kinds)) {
     *handle = o->handle;
     ret = 0;
   }
@@ -1486,6 +1500,7 @@ static void nvgpu_kms_reply_tv(struct nvgpu_device *dev, u8 *b0) {
  */
 static int nvgpu_kms_vblank_done(struct nvgpu_kms_call *kc, u8 *b0) {
   struct nvgpu_i2_call *call = &kc->call;
+  unsigned long deadline;
   long left;
 
   if (!kc->waiting) {
@@ -1498,8 +1513,28 @@ static int nvgpu_kms_vblank_done(struct nvgpu_kms_call *kc, u8 *b0) {
     put_unaligned_le64(kc->vbl_signal, b0 + 8);
     return 0;
   }
-  left = wait_for_completion_interruptible_timeout(
-      &kc->wait.done, msecs_to_jiffies(NVGPU_KMS_VBLANK_WAIT_MS));
+  /*
+   * In slices, each ending with a look at the transport: once it is dead no
+   * event will complete this, and remove()'s drm_dev_unplug() waits for the
+   * ioctl to leave (S7, 2026-09-29) -- 3 s of it, or a slice of it now.
+   */
+  deadline = jiffies + msecs_to_jiffies(NVGPU_KMS_VBLANK_WAIT_MS);
+  for (;;) {
+    long slice = min_t(long, (long)(deadline - jiffies),
+                       (long)msecs_to_jiffies(NVGPU_KMS_VBLANK_SLICE_MS));
+
+    left = slice > 0
+               ? wait_for_completion_interruptible_timeout(&kc->wait.done,
+                                                           slice)
+               : 0;
+    if (left || slice <= 0)
+      break;
+    if (nvgpu_xfer_dead(kc->kf->dev)) {
+      put_unaligned_le64(kc->vbl_signal, b0 + 8);
+      call->ret = -ENODEV;
+      return 0;
+    }
+  }
   if (left > 0) {
     /* Translated when it arrived. */
     put_unaligned_le32(kc->wait.ev.sequence, b0 + 4);

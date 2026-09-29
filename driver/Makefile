@@ -11,30 +11,59 @@ obj-$(CONFIG_VIRTIO_GPU_NV) += virtio_gpu_nv.o
 # which is the module's own name, so the core is nvgpu_main.c.
 virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
                    nvgpu_kms.o nvgpu_fence.o nvgpu_nvkms.o nvgpu_wl.o \
-                   nvgpu_capture.o nvgpu_osdesc.o nvgpu_xfer.o
+                   nvgpu_capture.o nvgpu_osdesc.o nvgpu_xfer.o nvgpu_v1.o
 
 # Which implementation parses what a guest process hands the module -- the
 # IOCTL2 schema walk, RM escapes' parameter blocks and deep segments, OS
 # descriptor registrations, ATOMIC commits:
 #
-#   the C     nvgpu_i2.c, nvgpu_rmio.c, nvgpu_atomic.c
 #   the Rust  nvgpu_rs.rs, which compiles driver/rust/core (no unsafe, no
 #             kernel dependency) into the module, and nvgpu_rs_glue.c, the C
-#             it calls. Needs a kernel built with CONFIG_RUST=y.
+#             it calls. Needs a kernel built with CONFIG_RUST=y. The default
+#             wherever the kernel has Rust: it has passed the hardware
+#             regression, and it is the stronger boundary (SECURITY.md §6).
+#   the C     nvgpu_i2.c, nvgpu_rmio.c, nvgpu_atomic.c: the fallback for a
+#             kernel without Rust, and the difftest's oracle. Fixes only.
 #
-# The Rust when CONFIG_VIRTIO_GPU_NV_RUST=y (Kconfig), or NVGPU_RUST=1 on the
-# command line; NVGPU_RUST=0 insists on the C. Both export the same functions
+# Chosen, unless NVGPU_RUST says (on the command line or in the environment):
+#   in a kernel tree   by Kconfig, CONFIG_VIRTIO_GPU_NV_RUST (default y
+#                      when CONFIG_RUST=y);
+#   out of tree        by the target kernel: the Rust if it has CONFIG_RUST=y
+#                      and the rustc at hand is the one it was built with
+#                      (CONFIG_RUSTC_VERSION_TEXT -- a Rust object links only
+#                      against its own compiler's kernel crates), else the C,
+#                      with a warning saying why when the kernel has Rust.
+# NVGPU_RUST=1 insists on the Rust (an error without CONFIG_RUST, or without
+# the kernel's rustc), and NVGPU_RUST=0 on the C, which the module then says
+# at load on a kernel that has Rust. Both export the same functions
 # (nvgpu.h), so nothing else changes, and `modinfo -F parsers` says which a
-# module has. The Rust build has passed the hardware regression; the C stays,
-# as the difftest's oracle and what a kernel without Rust builds.
-ifeq ($(CONFIG_VIRTIO_GPU_NV_RUST),y)
-NVGPU_RUST ?= 1
+# module has.
+# (The kernel's own RUSTC_VERSION_TEXT is exported only to config targets.)
+NVGPU_RUSTC_TEXT := $(if $(filter y,$(CONFIG_RUST)),$(subst $(pound),,$(shell $(RUSTC) --version 2>/dev/null)))
+NVGPU_RUSTC_OK := $(and $(NVGPU_RUSTC_TEXT),$(if $(subst $(CONFIG_RUSTC_VERSION_TEXT),,$(NVGPU_RUSTC_TEXT)),,1))
+ifeq ($(origin NVGPU_RUST),undefined)
+ifneq ($(KBUILD_EXTMOD),)
+ifneq ($(NVGPU_RUSTC_OK),)
+NVGPU_RUST := 1
+else
+NVGPU_RUST := 0
+ifeq ($(CONFIG_RUST),y)
+$(warning this kernel has Rust, but the rustc at hand ('$(NVGPU_RUSTC_TEXT)') is not the one it was built with ('$(CONFIG_RUSTC_VERSION_TEXT)'): building the C parsers. Build in the kernel's Rust toolchain (scripts/guest-toolchain-rust) for the Rust ones, the default)
 endif
-NVGPU_RUST ?= 0
+endif
+else
+NVGPU_RUST := $(if $(filter y,$(CONFIG_VIRTIO_GPU_NV_RUST)),1,0)
+endif
+endif
 
 ifeq ($(NVGPU_RUST),1)
 ifneq ($(CONFIG_RUST),y)
 $(error NVGPU_RUST=1 needs a kernel built with CONFIG_RUST=y)
+endif
+# A different rustc fails in the kernel's own Makefiles, on crates it cannot
+# read (E0514); said here instead.
+ifeq ($(NVGPU_RUSTC_OK),)
+$(error NVGPU_RUST=1, and the rustc at hand ('$(NVGPU_RUSTC_TEXT)') is not the one this kernel was built with ('$(CONFIG_RUSTC_VERSION_TEXT)'): build in the kernel's Rust toolchain (scripts/guest-toolchain-rust))
 endif
 virtio_gpu_nv-y += nvgpu_rs.o nvgpu_rs_glue.o
 ccflags-y += -DNVGPU_RUST
@@ -58,7 +87,10 @@ else
 
 # Out-of-tree, for loading into a test guest without rebuilding its kernel:
 #
-#	make -C driver KDIR=/lib/modules/$(uname -r)/build [NVGPU_RUST=1]
+#	make -C driver KDIR=/lib/modules/$(uname -r)/build [NVGPU_RUST=0|1]
+#
+# (the Rust parsers when that kernel has CONFIG_RUST=y, unless NVGPU_RUST=0;
+# see above).
 #
 # KDIR must be the build tree of the kernel the module will be *loaded* into,
 # which for a guest test is the guest's kernel, not the host's.

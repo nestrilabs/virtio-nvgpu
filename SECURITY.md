@@ -2237,7 +2237,12 @@ tools node); `/dev/nvidia-caps/*` answer no ioctl, as nv-caps.c's do.
 **Cleanup.** Dead code removed; the experiment switches `poll_events`,
 `poll_spin_us`, `claim_alloc`, `claim_sync_fd` are gone; `wl_mode` refuses a
 mode giving "other" anything; lines a guest process can cause are
-`dev_dbg_ratelimited`, the host's device details at probe `dev_dbg`;
+`dev_dbg_ratelimited`, the host's device details at probe `dev_dbg` -- with
+three rate-limited warnings kept on purpose, each naming a condition an
+operator should see: a thread killed while its request was in flight
+(`nvgpu_xfer.c`), GET_DEV_INFO asked in another release's layout
+(`nvgpu_drm.c`: guest userspace and host driver differ), and an ATOMIC
+out-fence's write-back faulting (`nvgpu_kms.c`);
 Kconfig is a tristate depending on VIRTIO, DRM and PCI with
 `VIRTIO_GPU_NV_RUST`, and the Makefile refuses to link a Rust object that
 names a panic symbol. The module says which parsers it has
@@ -2766,8 +2771,13 @@ the change is on the host's side of a check.
 for their replies (`rt_spin_us`, §20) and none sleeps for one, the control
 queue's interrupt is off and the spinning callers take replies off the ring
 themselves. Guest-internal: the host sees fewer interrupts to deliver and
-nothing else. Every ring operation stays under the transport's lock, as the
-interrupt handler's always was. A caller about to sleep for its reply -- an
+nothing else. Every ring operation that adds, harvests or toggles the
+interrupt (`add_sgs`, `get_buf`, `disable_cb`, `enable_cb`) stays under the
+transport's lock, as the interrupt handler's always did; the two that run
+outside it are safe by design -- `virtqueue_notify()`, which the virtio core
+allows unlocked, and reclaim's `virtqueue_detach_unused_buf()`, which runs
+after the device reset and after `dead` has excluded every harvester. A
+caller about to sleep for its reply -- an
 executor-class request, or one that spun out -- turns the interrupt back on
 first and takes whatever arrived while it was off (the virtio core's
 `enable_cb` reports it), and no spinner turns it off while anyone sleeps: a
@@ -2980,11 +2990,11 @@ virtiofsd); crosvm `0010`'s spare vCPU under `--host-cpu-topology`, and
 prefault speed unchanged.
 
 
+### Wayland
+
 A review of the Wayland proxy, capture injection and the guest daemon at
 `416dc54`, each finding checked against the code before it was fixed, and
 the review's reproductions made tests that fail without their fix.
-
-### Wayland
 
 `wlwire`, `nvgpu-wl-guest` and `device/src/wl`, branch `fix29-wayland`. S1
 -- the Wayland path's PRIME export of a fence context's GEM (§17 row 2) --
@@ -3065,3 +3075,141 @@ the three "all or none" charge loops and the per-owner policies (the daemon's
 `budget.rs` repeats `quota.rs`'s rule because it cannot link the backend);
 R3, the engine owning local input, which the backend reader's lease probe
 reading the raw input makes less than natural; R6-R9.
+
+A read-only review of `display-passthrough` at `416dc54`, in parts; each
+part's fixes are on a branch of their own. Its notes are in the rig
+(`.rig/notes/review-2026-09-29/`).
+
+### Guest module
+
+Branch `fix29-driver`. The review found no kernel memory corruption, info
+leak or cross-process reach in the module: every length taken from a caller
+or the backend was bounded before use. What it did find, all Low or Info,
+and what was done:
+
+**Security (app vs app, kernel integrity, races).**
+
+- **S1. A failed W_ARM disarmed a file for good.** An arm that failed before
+  or at the backend left `armed` set, and no report would ever clear it:
+  every later poll armed nothing, and the file's RM event waits ran to their
+  timeouts. The arm now holds its file, and any failure but `-EBADF` (the
+  handle is gone) or `-ETIMEDOUT` (the request still arrives) makes the file
+  ready, so the next poll arms again. Only the caller's own file was ever
+  affected.
+- **S2. The reaper could close a live proxy's host handle.** It asked
+  whether a host GEM handle was a proxy's by walking the open files, which
+  lose a file at release while its proxies -- held by whoever it shared
+  buffers with -- live on; a late reply naming one of their handles was
+  then closed under them. DRM files are now found by render handle in
+  `dev->renders` until their last reference.
+- **S3. Work items could outlive the module text.** The async fence WATCH
+  and the semaphore-surface defer ran on system queues holding no module
+  reference (the WATCH could drop the module's last). They run on the
+  module's own queues, which `module_exit` destroys after the driver is
+  unregistered, waiting them out. Root-only (`rmmod` racing a last put).
+- **S4. WL RECV installed descriptors before its copy-out** and took them
+  back with `close_fd()` by number, which another thread of the daemon may
+  have closed and seen reused; and a RECV that stopped early leaked the
+  backend handles of the descriptors it never reached (a lease among them
+  keeps an output leased). Descriptors are now reserved, built as files and
+  installed only after the copy-out, as capture's always were; the rest of
+  a frame's handles are closed on any early exit.
+- **S5. A fence proxy's WATCH could reach the backend after its CLOSE.** The
+  WATCH was queued before the proxy owned its handle for good; a later
+  failure handed the handle back to a caller whose CLOSE went by another
+  queue. Harmless while backend handles are monotonic, a cross-app fence
+  theft if they were ever reused. The WATCH now goes only once the proxy
+  owns the handle (after `fd_install()`, or when the call keeps the fence).
+- **S6. Latency interference.** W_ARM queued behind every process's CLOSE,
+  GEM_CLOSE, MUNMAP and reaper items on the transport's ordered queue, some
+  of them a synchronous CLOSE and an osdesc reap; and every GEM proxy free
+  in the VM took one global mutex a re-home holds across HOST_OPs. W_ARM
+  runs on the module's own unordered high-priority queue, and a proxy's free
+  takes the mutex only if it was ever re-homed.
+- **S7. Master hooks under the DRM core's `master_mutex`.** Accepted, and
+  stated here: in compositor-VM mode (not yet run on hardware) `master_set`
+  and `master_drop` make OPEN_KMS, DROP_IF_MASTER and SET_MASTER round trips
+  (up to 60 s each while the backend stalls) under the core's lock, so a
+  stalled backend holds every guest open of the card node and every
+  SET/DROP_MASTER behind it -- the guest's own compositor and nothing else;
+  no other VM and no host state waits. The emulated blocking WAIT_VBLANK,
+  which `remove()`'s `drm_dev_unplug()` waited out for up to 3 s, now looks
+  at the transport every 50 ms and answers `-ENODEV` once it is dead.
+- **S8. GET_DRM_FILE_UNIQUE_ID** was assigned on first ask, racily; it is
+  given at open, as nvidia-drm's is.
+
+**Correctness and native parity.**
+
+- **C1.** Nothing restricted the module to x86-64 with 4 KiB pages, where
+  the Rust counts registered memory in 4 KiB pages while the C pins kernel
+  pages. Kconfig depends on `X86_64`, an out-of-tree build for anything else
+  stops at `nvgpu.h`, and `nvgpu_osdesc.c` asserts the page size.
+- **C2.** The C parsers kmalloc'd request and reply blocks of up to 1 MiB
+  (order 8), which a fragmented guest fails with a page-allocation warning
+  any user can cause; they are kvmalloc'd, as the Rust's are.
+- **C3.** The syncobj commands and structs the fence code builds are the
+  guest kernel's, and nothing tied them to the schema the interpreter holds
+  them to. The generator emits the DRM table's numbers
+  (`NVGPU_SCHEMA_CMD_*`) and the fence code asserts them at build time.
+- **C4.** The difftest never drove the `karg` path (the DRM entry's kernel
+  copy of the argument as buffer 0). It does now: the shim splits the
+  address space as x86-64 does, and cases cover a kernel argument, one at a
+  user address (refused), and a user pointer into the kernel half (refused).
+- **C5.** The ATOMIC commit/TEST_ONLY flag had two sources; the parse's
+  `out->commit`, written before any hook in both builds, is now the only one.
+- **C6.** `/dev/nvidia-modeset` sent any ioctl type but NVKMS's down the RM
+  path; it answers `-ENOTTY`, as `nvkms_ioctl` does, and its mmap `-EPERM`,
+  as `nvkms_mmap` does.
+- **C7, #66.** `/dev/nvidia-uvm` had a `.poll` that never became ready (the
+  backend cannot epoll the host's UVM file); it has none, as `uvm_fops`, so
+  the VFS reports it ready. `/dev/nvidia-uvm-tools` has its own fops, with a
+  `.poll` and no `.mmap`, as `uvm_tools_fops`.
+- **C8.** GET_DEV_INFO wrote its answer for an `_IOW` caller and refused
+  size 0; it follows `drm_ioctl()`'s copy-back rule.
+- **C9.** `/proc/driver/nvidia`'s buffers leaked on remove and on a refused
+  `proc_create_data()`; they are freed after the subtree is taken down.
+- **C10.** A second virtio-gpu-nv device failed half-way through probe; it
+  is refused first, with a line saying the module serves one per guest.
+- **C11.** NVKMS's PRIME_EXPORT result was not checked like every other
+  HOST_OP result (nonzero, 32-bit); it is.
+
+**From the parity review.**
+
+- **#40, B1.** The v1 IOCTL exchange was written out nine times, and each
+  copy returned the backend's status raw: a positive value, or one past
+  `-MAX_ERRNO`, reached the caller as an ioctl result no native driver
+  returns, with the payload copied back beside it. One exchange
+  (`nvgpu_v1.c`, compiled into the difftest too) and its Rust twin
+  (`wire::IoctlResp::parse`) now fail such a reply with `-EPROTO`, unread,
+  as IOCTL2 always did. Defence in depth: only a faulty backend sends one.
+- **B6.** The KMS and NVKMS descriptor hooks each re-implemented the
+  backend's `kind_allowed()`, and the copies disagreed (NVKMS's ignored the
+  GPU and any-device bits). One `nvgpu_fd_kind_allowed()`, and its Rust
+  twin, held equal to each other by the difftest and to the host's cases by
+  a unit test.
+- **#62, #65.** After a reset or `remove()` no event comes, and fence
+  proxies were never signalled: a sync_file poll, an IN_FENCE_FD or a
+  SYNCOBJ_EVENTFD waited forever. The dead transport now signals every
+  proxy with `-ENODEV` and every eventfd subscriber, and every RM, modeset
+  and DRM file's poll answers `EPOLLHUP | EPOLLERR`, as a lost GPU's does.
+- **#64.** RM nodes report events as `EPOLLPRI | EPOLLIN`, as `nv.c` does.
+- **#47.** mmap of an RM node at a nonzero offset is `-EINVAL`, as
+  `nv-mmap.c` has it; it silently mapped from the start before.
+- **#4, #17, #19.** nvidia-uvm and nvidia-caps take dynamic majors, as
+  theirs do (the fixed 237 and 240 sat in the dynamic range, where a clash
+  failed the probe); `/sys/module/nvidia_uvm` exists only with
+  `/dev/nvidia-uvm`; and the fake PCI bus's sysdata is a whole x86
+  `struct pci_sysdata` instead of a mirror of its first two fields, whose
+  `companion`, `iommu` and `fwnode` fell on the PCI address and config space.
+
+**The parsers' default.** The Rust parsers are now what a kernel with Rust
+gets unless `NVGPU_RUST=0` says otherwise, and the guest kernel the project
+builds has Rust (`driver/guest-kernel.defconfig`). The C stays, frozen, as
+the fallback for a kernel without Rust and as the difftest's oracle; a C
+module on a Rust kernel says so at load.
+
+**Tests.** The difftest (cases for #40 and the karg path; B6 over every
+device type and kind bit), the Rust core's unit tests, and the builds of
+both modules without a warning. The rest -- the dead-transport path, the
+polls, the majors, the work queues, WL RECV -- is verified by reading and
+waits for the hardware regression.

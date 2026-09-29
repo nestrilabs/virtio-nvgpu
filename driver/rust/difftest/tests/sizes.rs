@@ -137,6 +137,7 @@ fn the_interpreter_takes_only_the_native_size() {
                 uarg: ARG,
                 render: 5,
                 xflags: 0,
+                karg: false,
             },
         };
         let o = scen::diff(&s).unwrap_or_else(|e| panic!("{e}"));

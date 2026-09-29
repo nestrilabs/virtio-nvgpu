@@ -95,6 +95,7 @@ extern "C" {
         render: u32,
         xflags: u32,
         kernel: bool,
+        karg: bool,
         mask: u32,
         ret_out: *mut i32,
     ) -> c_long;
@@ -110,6 +111,7 @@ extern "C" {
         len: usize,
     ) -> bool;
     pub fn nvgpu_i2_native_cmd(dev: *mut CDev, sclass: u32, cmd: c_uint) -> c_uint;
+    pub fn nvgpu_fd_kind_allowed(device_type: u32, kinds: u32) -> bool;
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;
     fn nvgpu_i2_add_fd(call: *mut c_void, buf: u32, off: u32, handle: u32, flags: u32) -> c_int;
@@ -162,6 +164,22 @@ pub unsafe extern "C" fn dt_copy_to_user(to: u64, from: *const u8, n: usize) -> 
     } else {
         -14
     }
+}
+
+/// # Safety
+/// C passes `n` writable bytes at `to`.
+#[no_mangle]
+pub unsafe extern "C" fn dt_kread(to: *mut u8, from: u64, n: usize) {
+    let dst = unsafe { std::slice::from_raw_parts_mut(to, n) };
+    with(|w| w.kread(dst, from));
+}
+
+/// # Safety
+/// C passes `n` readable bytes at `from`.
+#[no_mangle]
+pub unsafe extern "C" fn dt_kwrite(to: u64, from: *const u8, n: usize) {
+    let src = unsafe { std::slice::from_raw_parts(from, n) };
+    with(|w| w.kwrite(to, src));
 }
 
 /// # Safety

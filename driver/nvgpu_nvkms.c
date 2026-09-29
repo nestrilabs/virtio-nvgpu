@@ -44,7 +44,8 @@
  *
  * Nothing here ever issues an ioctl of its own on a modeset file: the first
  * one makes it an "ioctl" file forever, useless as a grant or unicast file
- * (nvkms.c:1291-1342). v1 guests keep nvgpu_ioctl_modeset() in nvgpu_main.c.
+ * (nvkms.c:1291-1342). v1 guests keep nvgpu_ioctl_modeset() (nvgpu_rmio.c,
+ * or rm.rs's modeset_v1 in the Rust build).
  */
 
 #include <linux/dma-buf.h>
@@ -119,16 +120,6 @@ static void nvgpu_nvkms_identify(struct nvgpu_i2_call *call) {
   nc->next_event = !strcmp(e->name, "NVKMS_GET_NEXT_EVENT");
 }
 
-/* One of our /dev/nvidia* character-device files of @type on this device. */
-static struct nvgpu_fd *nvgpu_nvkms_chardev(struct nvgpu_device *dev,
-                                            struct file *f, u32 type) {
-  struct nvgpu_fd *nfd = nvgpu_fd_from_file(f);
-
-  if (!nfd || nfd->dev != dev || nfd->device_type != type)
-    return NULL;
-  return nfd;
-}
-
 /*
  * A dma-buf of one of our GEM proxies, exported by the backend from the
  * proxy's owner file for this one call: the host's NVKMS imports it with
@@ -161,7 +152,10 @@ static int nvgpu_nvkms_dmabuf(struct nvgpu_device *dev, int fd, u32 *handle,
   dma_buf_put(buf);
   if (ret < 0)
     return ret;
-  *handle = res[0];
+  /* A handle is nonzero and 32-bit, as every other HOST_OP result site
+   * checks; this one took any u64 (the 2026-09-29 review, C11). */
+  if (!nvgpu_res_u32(res[0], handle))
+    return -EPROTO;
   *flags = NVGPU_I2_FD_CONSUME;
   return 0;
 }
@@ -180,10 +174,10 @@ static int nvgpu_nvkms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   f = fget(user_value);
   if (!f)
     goto bad;
-  if (kinds & NVGPU_SKIND_DEV_MODESET)
-    nfd = nvgpu_nvkms_chardev(dev, f, NVGPU_DEV_MODESET);
-  if (!nfd && (kinds & NVGPU_SKIND_DEV_CTL))
-    nfd = nvgpu_nvkms_chardev(dev, f, NVGPU_DEV_CTL);
+  nfd = nvgpu_fd_from_file(f);
+  if (nfd && (nfd->dev != dev ||
+              !nvgpu_fd_kind_allowed(nfd->device_type, kinds)))
+    nfd = NULL;
   if (nfd) {
     *handle = nfd->handle;
     /*
@@ -318,6 +312,9 @@ long nvgpu_nvkms_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
 __poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,
                           struct poll_table_struct *wait) {
   poll_wait(filp, &nfd->wq, wait);
+  /* The backend is gone: no event will come (nvgpu_poll_mask()). */
+  if (nvgpu_xfer_dead(nfd->dev))
+    return EPOLLHUP | EPOLLERR;
   return atomic_read(&nfd->pending) != NVGPU_NVKMS_IDLE
              ? EPOLLIN | EPOLLPRI | EPOLLRDNORM
              : 0;

@@ -57,6 +57,7 @@ fuzz_target!(|data: &[u8]| {
             uarg: 0x10000,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     };
     let s = Scenario {

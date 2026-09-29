@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config VIRTIO_GPU_NV
 	tristate "Virtio NVIDIA GPU proxy driver"
-	depends on VIRTIO && DRM && PCI
+	depends on VIRTIO && DRM && PCI && X86_64
 	select SYNC_FILE
 	help
 	  Provides /dev/nvidia* device files inside the VM that forward ioctls
@@ -13,9 +13,14 @@ config VIRTIO_GPU_NV
 	  Required for CUDA, Vulkan, NVENC and NVDEC inside a VM whose VMM
 	  offers the virtio-gpu-nv device. If unsure, say N.
 
+	  x86-64 guests only, with 4 KiB pages: the page runs sent for memory
+	  registered by its pages are 4 KiB ones, the fake PCI bus's sysdata is
+	  x86's struct pci_sysdata, and the 32-bit ioctl refusals are x86's.
+
 config VIRTIO_GPU_NV_RUST
 	bool "Parse guest-process input in Rust"
 	depends on VIRTIO_GPU_NV && RUST
+	default y
 	help
 	  Build the code that reads what a guest process hands the driver --
 	  the IOCTL2 schema walk, RM escapes and their nested blocks, deep
@@ -24,4 +29,8 @@ config VIRTIO_GPU_NV_RUST
 	  instead of the C one. The module says which it has in modinfo
 	  ("parsers"). See driver/rust/README.md.
 
-	  If unsure, say N.
+	  The Rust has passed the hardware regression and is the default
+	  wherever the kernel has Rust; the C is the fallback for a kernel
+	  without it.
+
+	  If unsure, say Y.

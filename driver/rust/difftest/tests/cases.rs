@@ -7,7 +7,7 @@
 use nvgpu_guest_difftest::cabi;
 use nvgpu_guest_difftest::renv::{BCAP_DEEP_SEGS, BCAP_OS_DESC, BCAP_PROC_ID};
 use nvgpu_guest_difftest::scen::{self, Call, DevSpec, Outcome, Scenario, FDS};
-use nvgpu_guest_difftest::world::{Ev, Hooks, World};
+use nvgpu_guest_difftest::world::{Ev, Hooks, World, KARG};
 
 const ARG: u64 = 0x7f00_0000_0000;
 const NESTED: u64 = 0x7f00_0001_0000;
@@ -443,6 +443,30 @@ fn memory_the_caller_has_is_registered_by_its_pages() {
     assert_eq!(pages, 4);
     assert_eq!(le32(mem(&o, ARG), 0), 0x55);
 
+    // A status that is not an errno: -EPROTO and nothing back, but the pins
+    // are kept under the id the reply names, as the late-reply reaper reads
+    // it -- RM may hold the pages. One below -MAX_ERRNO is a refusal.
+    for (bad, kept) in [(5i32, true), (i32::MAX, true), (-4096, false)] {
+        let mut w = world();
+        let call = alloc_memory(va, 0x2fff, &mut w);
+        let arg = w.mem[&ARG].clone();
+        let mut back = arg.clone();
+        put(&mut back, 0, 0x55, 4);
+        w.canned = vec![reply(bad, &back, &[], &77u64.to_le_bytes())];
+        let o = run(d.clone(), w, call);
+        assert_eq!(o.ret, -71, "status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..], "status {bad}");
+        let last = o.world.events.last().cloned();
+        if kept {
+            assert!(
+                matches!(last, Some(Ev::Keep { id: 77, n: 4, .. })),
+                "{last:?}"
+            );
+        } else {
+            assert!(matches!(last, Some(Ev::Unpin { n: 4, .. })), "{last:?}");
+        }
+    }
+
     // Pages that would not pin: RM's own answer, in a call that succeeded.
     let mut w = world();
     w.pin_fails = true;
@@ -531,6 +555,7 @@ fn getresources_copies_back_what_the_kernel_would() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert_eq!(o.ret, 0);
@@ -549,6 +574,83 @@ fn getresources_copies_back_what_the_kernel_would() {
     );
     assert_eq!(le32(mem(&o, ARG), 32), 1);
     assert_eq!(le32(mem(&o, ARG), 48), 1920);
+}
+
+fn i2_karg(cmd: u32, uarg: u64) -> Call {
+    Call::I2 {
+        sclass: 1,
+        cmd,
+        uarg,
+        render: 5,
+        xflags: 0,
+        karg: true,
+    }
+}
+
+#[test]
+fn an_argument_the_drm_entry_copied_in_is_read_and_written_as_kernel_memory() {
+    // .karg (the DRM node's entry normalised the caller's argument into a
+    // kernel copy, nvgpu_drm_arg_in()): buffer 0 is read from and written
+    // back to that kernel memory; what it points at is still the caller's.
+    // SYNCOBJ_CREATE: the handle comes back into the kernel copy.
+    let create = 0xc008_64bf;
+    let mut w = world();
+    w.hooks.mask = 0;
+    w.mem.insert(KARG, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+    w.canned = vec![i2_reply(0, 1, &[9, 0, 0, 0, 1, 0, 0, 0])];
+    let o = run(dev(0, vec![]), w, i2_karg(create, KARG));
+    assert_eq!(o.ret, 0);
+    assert_eq!(le32(&sends(&o)[0], 16), create);
+    assert_eq!(mem(&o, KARG), &[9, 0, 0, 0, 1, 0, 0, 0]);
+
+    // SYNCOBJ_QUERY: the handles read from, and the points written to, the
+    // caller's own memory; the argument itself goes back to the kernel copy.
+    let query = 0xc018_64cb;
+    let mut w = world();
+    w.hooks.mask = 0;
+    let mut arg = vec![0u8; 24];
+    put(&mut arg, 0, A, 8);
+    put(&mut arg, 8, B, 8);
+    put(&mut arg, 16, 2, 4);
+    w.mem.insert(KARG, arg.clone());
+    w.mem.insert(A, vec![1, 0, 0, 0, 2, 0, 0, 0]);
+    w.mem.insert(B, vec![0xee; 16]);
+    let mut data = arg.clone();
+    data.extend_from_slice(&[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    w.canned = vec![i2_reply(0, 3, &data)];
+    let o = run(dev(0, vec![]), w, i2_karg(query, KARG));
+    assert_eq!(o.ret, 0);
+    assert_eq!(
+        mem(&o, B),
+        &[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(mem(&o, KARG), &arg[..]);
+    assert_eq!(mem(&o, A), &[1, 0, 0, 0, 2, 0, 0, 0]);
+
+    // An argument .karg says is kernel memory, at a user address: the
+    // kernel copy refuses it (access_ok), nothing is sent.
+    let mut w = world();
+    w.hooks.mask = 0;
+    w.mem.insert(ARG, vec![0u8; 8]);
+    let o = run(dev(0, vec![]), w, i2_karg(create, ARG));
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+
+    // A pointer in it to the kernel half: the caller's, so copy_from_user()
+    // refuses it -- no kernel memory is read for a user's pointer.
+    let mut w = world();
+    w.hooks.mask = 0;
+    let mut arg = vec![0u8; 24];
+    put(&mut arg, 0, KARG + 0x1000, 8);
+    put(&mut arg, 8, B, 8);
+    put(&mut arg, 16, 2, 4);
+    w.mem.insert(KARG, arg.clone());
+    w.mem.insert(KARG + 0x1000, vec![1u8; 8]);
+    w.mem.insert(B, vec![0xee; 16]);
+    let o = run(dev(0, vec![]), w, i2_karg(query, KARG));
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+    assert_eq!(mem(&o, KARG), &arg[..]);
 }
 
 /// Both implementations with kmalloc() bytes not zeroed but 0xaa, so a
@@ -648,6 +750,94 @@ fn a_v1v2_count_that_wraps_carries_no_deep_block() {
 }
 
 #[test]
+fn a_status_that_is_not_an_errno_is_eproto_and_nothing_comes_back() {
+    // The backend's status is 0 or a -errno. Anything else was returned from
+    // the ioctl as it was -- a positive "result" no native driver gives, or
+    // an errno past MAX_ERRNO -- and the flat path copied the block back
+    // beside it. Now: -EPROTO, and the caller's memory as it was.
+    for bad in [1i32, 5, i32::MAX, -4096, i32::MIN] {
+        // A flat escape (nvgpu_ioctl_simple).
+        let mut w = world();
+        let arg = vec![0x11u8; 24];
+        w.mem.insert(ARG, arg.clone());
+        w.canned = vec![reply(bad, &[0x99; 24], &[], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x50, 24),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "flat, status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..], "flat, status {bad}");
+
+        // RM_CONTROL, whose struct and nested block come back on any status.
+        let mut w = world();
+        let call = control(0x2080_0101, vec![0x22; 16], &mut w);
+        let params = w.mem[&ARG].clone();
+        w.canned = vec![reply(bad, &[0x99; 32], &[0x98; 16], &[])];
+        let o = run(dev(0, vec![]), w, call);
+        assert_eq!(o.ret, -71, "control, status {bad}");
+        assert_eq!(mem(&o, ARG), &params[..]);
+        assert_eq!(mem(&o, NESTED), &[0x22; 16][..]);
+
+        // A descriptor at a fixed offset (nvgpu_ioctl_translate_fd).
+        let mut w = world();
+        let mut arg = vec![0u8; 56];
+        put(&mut arg, 48, 3, 4);
+        w.mem.insert(ARG, arg.clone());
+        w.canned = vec![reply(bad, &[0x99; 56], &[], &[])];
+        let o = run(
+            dev(0, vec![(0x27, 48)]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x27, 56),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "fd, status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..]);
+
+        // A v1 backend's NVKMS command.
+        let mut w = world();
+        let mut outer = vec![0u8; 16];
+        put(&mut outer, 0, 3, 4);
+        put(&mut outer, 4, 8, 4);
+        put(&mut outer, 8, NESTED, 8);
+        w.mem.insert(ARG, outer.clone());
+        w.mem.insert(NESTED, vec![0x33; 8]);
+        w.canned = vec![reply(bad, &[0x99; 16], &[0x98; 8], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Modeset {
+                cmd: ioc(3, 0x6d, 0, 16),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "nvkms, status {bad}");
+        assert_eq!(mem(&o, ARG), &outer[..]);
+        assert_eq!(mem(&o, NESTED), &[0x33; 8][..]);
+    }
+    // The errnos at either end still pass as they are.
+    for good in [-1i32, -4095] {
+        let mut w = world();
+        w.mem.insert(ARG, vec![0x11u8; 24]);
+        w.canned = vec![reply(good, &[], &[], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x50, 24),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, i64::from(good));
+    }
+}
+
+#[test]
 fn nvkms_takes_its_one_ioctl_only() {
     // Another size, or another number: -ENOTTY, as nvkms_ioctl, with nothing
     // read or written (the C read and wrote 16 bytes whatever the size).
@@ -683,6 +873,7 @@ fn a_field_of_a_width_the_generator_refuses_is_refused() {
                 uarg: ARG,
                 render: 5,
                 xflags: 0,
+                karg: false,
             },
         );
         assert_eq!(o.ret, -22, "{cmd:#x}");
@@ -726,6 +917,7 @@ fn a_failed_gem_proxy_closes_no_handle_another_proxy_owns() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert_eq!(o.ret, -12);
@@ -802,6 +994,7 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     let hooks: Vec<Hook> = o
@@ -861,6 +1054,7 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert!(o.world.events.contains(&Ev::Hook(Hook::AInFence {

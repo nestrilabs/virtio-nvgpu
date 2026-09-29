@@ -58,3 +58,38 @@ const struct nvgpu_uvm_table *nvgpu_uvm_select(const char *driver_version) {
       return &nvgpu_uvm_tables[i];
   return NULL;
 }
+
+/*
+ * Whether a file of ours of `device_type` (NVGPU_DEV_*: its backend handle's
+ * kind follows from it) may stand in a descriptor field that allows `kinds`
+ * (NVGPU_SKIND*): device/src/schema.rs kind_allowed(), bit for bit -- the
+ * handle kind's own bit, or the NVGPU_SKIND_DEV_* bit of the one device it
+ * is. The one test the KMS and NVKMS hooks make; they had a copy each, and
+ * the copies disagreed (NVKMS's ignored the GPU and any-device bits). The
+ * Rust twin is schema::fd_kind_allowed(); the difftest holds them equal.
+ */
+bool nvgpu_fd_kind_allowed(u32 device_type, u32 kinds) {
+  u32 hk, dev_bit = 0;
+
+  if (device_type < NVGPU_DEV_CTL) {
+    hk = NVGPU_HK_DEV;
+    dev_bit = NVGPU_SKIND_DEV_GPU;
+  } else if (device_type == NVGPU_DEV_CTL) {
+    hk = NVGPU_HK_DEV;
+    dev_bit = NVGPU_SKIND_DEV_CTL;
+  } else if (device_type == NVGPU_DEV_MODESET) {
+    hk = NVGPU_HK_DEV;
+    dev_bit = NVGPU_SKIND_DEV_MODESET;
+  } else if (device_type == NVGPU_DEV_UVM ||
+             device_type == NVGPU_DEV_UVM_TOOLS) {
+    hk = NVGPU_HK_DEV;
+  } else if (device_type == NVGPU_DEV_WAYLAND) {
+    hk = NVGPU_HK_WAYLAND;
+  } else if (device_type >= NVGPU_DEV_DRI_BASE &&
+             device_type < NVGPU_DEV_DRI_CARD_BASE) {
+    hk = NVGPU_HK_DRI_RENDER;
+  } else {
+    return false;
+  }
+  return (kinds & NVGPU_SKIND(hk)) || (kinds & dev_bit);
+}

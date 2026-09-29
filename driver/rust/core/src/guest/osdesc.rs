@@ -17,7 +17,8 @@
 use super::rm;
 use super::wire::{
     copy, has, ioctl_req_header, le32, le64, put32, sum, Errno, IoctlResp, DEEP_PAGE_LIST, EFAULT,
-    EIO, ENOMEM, IOCTL_REQ_LEN, IOCTL_RESP_LEN, OSDESC_F_WRITE, OSDESC_MAX_PAGES, OSDESC_MAX_RUNS,
+    EIO, ENOMEM, EPROTO, IOCTL_REQ_LEN, IOCTL_RESP_LEN, MAX_ERRNO, OSDESC_F_WRITE,
+    OSDESC_MAX_PAGES, OSDESC_MAX_RUNS,
 };
 
 /// `NV_ESC_RM_ALLOC_MEMORY`.
@@ -382,16 +383,26 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
         }
         (Ok(_), None) => return -EIO,
     };
-    let Some(h) = IoctlResp::parse(resp.as_ref(), used) else {
-        env.unpin(pin);
-        return -EIO;
+    // Whether RM may hold the pages is the raw status's to say, as the
+    // C's reaper reads a late reply: one that is not an errno fails the
+    // call (-EPROTO, nothing back) but keeps its pins under the id it names.
+    let h = match IoctlResp::parse_raw(resp.as_ref(), used) {
+        Ok(h) => h,
+        Err(e) => {
+            env.unpin(pin);
+            return e;
+        }
     };
-    let ret = h.status;
-    if ret < 0 {
+    if h.status < 0 {
         // Refused before RM saw it.
         env.unpin(pin);
-        return ret;
+        return if h.status < -MAX_ERRNO {
+            -EPROTO
+        } else {
+            h.status
+        };
     }
+    let ret = h.status;
     let usedz = used as usize;
     let r = resp.as_ref();
     let data_len = h.data_len as usize;
@@ -413,6 +424,9 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
         env.keep(id, pin);
     } else {
         env.unpin(pin);
+    }
+    if ret > 0 {
+        return -EPROTO;
     }
 
     // The caller's block back, its own address in it, and RM's status.
