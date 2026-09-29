@@ -1,0 +1,18 @@
+; SPDX-License-Identifier: Apache-2.0
+; Heavy Godot 4 scenes for rig/rig-heavy.sh (rig/heavy/heavy-run.sh): the
+; scene is built in main.gd, chosen by the HEAVY_SCENE environment variable
+; (gpu: GPU-bound lighting; draws: CPU-bound draw calls).
+config_version=5
+
+[application]
+config/name="nvgpu-heavy"
+run/main_scene="res://main.tscn"
+run/delta_smoothing=false
+
+[display]
+window/size/viewport_width=1920
+window/size/viewport_height=1080
+window/vsync/vsync_mode=0
+
+[rendering]
+renderer/rendering_method="forward_plus"

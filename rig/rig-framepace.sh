@@ -7,6 +7,8 @@
 #
 # Usage: rig/rig-framepace.sh <workload> <native|vm> <tag> [runs [first]]
 #   workload  vkcube        vkcube, FIFO (vsync), native Wayland
+#             stk-ultra     SuperTuxKart's profile race, every effect on (vsync)
+#             stk-ultra-novsync  the same, swap interval 0 (MangoHud gl_vsync=0)
 #             vkcube-mbox   vkcube --present_mode 1 (mailbox)
 #             vkmark        vkmark's `shading` scene, FIFO
 #             stk           SuperTuxKart's profile race (GL, SDL2, Wayland)
@@ -61,6 +63,12 @@ case $WL in
     vkcube-mbox) CMD='mangohud vkcube --wsi wayland --present_mode 1' ;;
     vkmark) CMD='mangohud vkmark --winsys wayland --run-forever -b shading' ;;
     stk) CMD="mangohud supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed" ;;
+    # The same race with every effect on (rig/heavy's stk-ultra; GPU-bound
+    # at about 200 fps at 3840x2160 on a 5090), vsync on, and with MangoHud
+    # turning the swap interval to 0.
+    stk-ultra | stk-ultra-novsync)
+        CMD="mangohud supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed --enable-glow --enable-light-shaft --enable-dof --enable-motion-blur --enable-mlaa --enable-ssao --enable-ibl --enable-hd-textures --enable-dynamic-lights --shadows=2 --anisotropic=16"
+        ;;
     # MangoHud in the game only. gamescope without CAP_SYS_NICE, as a user
     # runs it: as the guest's root it asks for a realtime queue, whose RM
     # control (FIFO_RUNLIST_SET_SCHED_POLICY) the backend refuses, and
@@ -74,6 +82,7 @@ esac
 # warm-up and lasts SECS. The wrapper preloads its GL shim and enables the
 # Vulkan layer for the process and its children.
 MH="fps_only,log_interval=0,autostart_log=$WARM,log_duration=$SECS"
+[ "$WL" = stk-ultra-novsync ] && MH="$MH,gl_vsync=0"
 TOTAL=$((WARM + SECS + 6))
 
 # ---- the monitor ------------------------------------------------------------

@@ -35,6 +35,11 @@
  *              munmap + RM_UNMAP_MEMORY + close as well (map_unmap) (us)
  *   wl-shm     a wl_shm client committing full 1920x1080 frames as fast as
  *              the compositor releases them, for 5 s (frames/s, CPU)
+ *   vk-stream  texture streaming: a frame of fresh staging allocations
+ *              filled by the CPU, a copy submit and a render submit joined
+ *              by a semaphore, two frames in flight (frame times, and what
+ *              the CPU spent where); vk-stream-pool, the same from staging
+ *              memory kept mapped. Only by name, for rig/rig-heavy.sh
  *
  * Output: one line per figure, "BENCH <test>.<figure> <value> <unit>", so a
  * harness can grep them; anything else is commentary. Exit status is the
@@ -565,6 +570,172 @@ static int t_vk_cost(void) {
   vkFreeCommandBuffers(vk.dev, vk.pool, 1, &cb);
   return 0;
 }
+
+/*
+ * Texture streaming, a frame at a time, as an engine does it without a
+ * sub-allocator: each frame allocates NVGPU_BENCH_STREAM_ALLOCS (default 4)
+ * fresh host-visible staging buffers of 256 KiB to 2 MiB, maps and fills
+ * them from the CPU, copies them into device-local memory on one submit,
+ * and renders on a second that waits for the first through a binary
+ * semaphore, with a fence per frame and two frames in flight: the oldest
+ * frame's fence is waited for (a wait that may sleep) and its staging
+ * buffers freed before the next frame is built. The GPU work is one
+ * 1920x1080 triangle of dialled cost (vk-cost's 1024, about 0.6 ms).
+ * vk-stream-pool is the same frame with each slot's staging memory
+ * allocated once and kept mapped: the difference is what allocating,
+ * mapping and first-touching memory costs a frame.
+ * 2 s of warm-up, then 10 s measured; every frame's time (ms) goes to
+ * $NVGPU_BENCH_FRAMES (default /tmp/nvgpu-bench-stream.txt).
+ */
+static int vk_stream(int pool) {
+  enum { W = 1920, H = 1080, SLOTS = 2, MAXA = 32 };
+  static const VkDeviceSize sizes[] = {256u << 10, 512u << 10, 1u << 20, 2u << 20};
+  static double ft[200000];
+  const char *test = pool ? "vk-stream-pool" : "vk-stream";
+  const char *e = getenv("NVGPU_BENCH_STREAM_ALLOCS");
+  int na = e ? atoi(e) : 4;
+  if (na < 1 || na > MAXA)
+    na = 4;
+  const uint32_t cost = 1024;
+  struct vkbuf stage[SLOTS][MAXA], dst;
+  VkCommandBuffer xcb[SLOTS], rcb[SLOTS];
+  VkFence fence[SLOTS];
+  VkSemaphore sem[SLOTS];
+  int busy[SLOTS] = {0};
+  VkImage img;
+  VkDeviceMemory mem;
+  VkImageView view;
+  VkPipelineLayout pl;
+  VkPipeline pipe;
+  VkDeviceSize total = 0;
+
+  if (vk_ready() || vk_target(W, H, &img, &mem, &view) ||
+      vk_pipeline(bench_full_vs, sizeof(bench_full_vs), bench_cost_fs, sizeof(bench_cost_fs),
+                  VK_SHADER_STAGE_FRAGMENT_BIT, 4, W, H, &pl, &pipe))
+    return -1;
+  for (int a = 0; a < na; a++)
+    total += sizes[a % 4];
+  if (vk_buf(&dst, total, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 0))
+    return -1;
+  memset(stage, 0, sizeof(stage));
+  for (int s = 0; s < SLOTS; s++) {
+    VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vk_cb(&xcb[s]) || vk_cb(&rcb[s]) || vk_fence(&fence[s]))
+      return -1;
+    VK(vkCreateSemaphore(vk.dev, &sci, NULL, &sem[s]));
+    if (pool)
+      for (int a = 0; a < na; a++)
+        if (vk_buf(&stage[s][a], sizes[a % 4], VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1))
+          return -1;
+  }
+  /* The render pass is the same every frame. */
+  for (int s = 0; s < SLOTS; s++) {
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VK(vkBeginCommandBuffer(rcb[s], &bi));
+    vk_begin_render(rcb[s], img, view, W, H);
+    vkCmdBindPipeline(rcb[s], VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdPushConstants(rcb[s], pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &cost);
+    vkCmdDraw(rcb[s], 3, 1, 0, 0);
+    vkCmdEndRendering(rcb[s]);
+    VK(vkEndCommandBuffer(rcb[s]));
+  }
+  double start = now_s(), warm = start + 2.0, end = warm + 10.0, t = start, prev = start;
+  double t_alloc = 0, t_wait = 0, t_fill = 0;
+  int n = 0, fr = 0;
+  while (t < end && n < 200000) {
+    int s = fr % SLOTS;
+    double a0 = now_s();
+    if (busy[s]) {
+      VK(vkWaitForFences(vk.dev, 1, &fence[s], VK_TRUE, UINT64_MAX));
+      VK(vkResetFences(vk.dev, 1, &fence[s]));
+      busy[s] = 0;
+    }
+    double a1 = now_s();
+    if (!pool)
+      for (int a = 0; a < na; a++) {
+        vk_buf_free(&stage[s][a]);
+        if (vk_buf(&stage[s][a], sizes[a % 4],
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1))
+          return -1;
+      }
+    double a2 = now_s();
+    for (int a = 0; a < na; a++)
+      memset(stage[s][a].p, (fr + a) & 0xff, sizes[a % 4]);
+    double a3 = now_s();
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VK(vkResetCommandBuffer(xcb[s], 0));
+    VK(vkBeginCommandBuffer(xcb[s], &bi));
+    VkDeviceSize off = 0;
+    for (int a = 0; a < na; a++) {
+      VkBufferCopy c = {0, off, sizes[a % 4]};
+      vkCmdCopyBuffer(xcb[s], stage[s][a].b, dst.b, 1, &c);
+      off += sizes[a % 4];
+    }
+    VK(vkEndCommandBuffer(xcb[s]));
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    VkSubmitInfo si[2] = {{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                           .commandBufferCount = 1,
+                           .pCommandBuffers = &xcb[s],
+                           .signalSemaphoreCount = 1,
+                           .pSignalSemaphores = &sem[s]},
+                          {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                           .waitSemaphoreCount = 1,
+                           .pWaitSemaphores = &sem[s],
+                           .pWaitDstStageMask = &ws,
+                           .commandBufferCount = 1,
+                           .pCommandBuffers = &rcb[s]}};
+    VK(vkQueueSubmit(vk.q, 1, &si[0], VK_NULL_HANDLE));
+    VK(vkQueueSubmit(vk.q, 1, &si[1], fence[s]));
+    busy[s] = 1;
+    fr++;
+    t = now_s();
+    if (prev >= warm) {
+      ft[n++] = t - prev;
+      t_wait += a1 - a0;
+      t_alloc += a2 - a1;
+      t_fill += a3 - a2;
+    }
+    prev = t;
+  }
+  VK(vkDeviceWaitIdle(vk.dev));
+  const char *path = getenv("NVGPU_BENCH_FRAMES");
+  FILE *fo = fopen(path ? path : "/tmp/nvgpu-bench-stream.txt", "w");
+  if (fo) {
+    for (int i = 0; i < n; i++)
+      fprintf(fo, "%.4f\n", ft[i] * 1e3);
+    fclose(fo);
+  }
+  if (n) {
+    bench(test, "fps", n / (t - warm), "frames/s");
+    bench(test, "wait_per_frame", t_wait / n * 1e3, "ms");
+    bench(test, "alloc_map_per_frame", t_alloc / n * 1e3, "ms");
+    bench(test, "fill_per_frame", t_fill / n * 1e3, "ms");
+    bench(test, "fill_rate", (double)total * n / t_fill / 1e9, "GB/s");
+    stats(test, "frame", ft, n, 1e3, "ms");
+  }
+  for (int s = 0; s < SLOTS; s++) {
+    for (int a = 0; a < na; a++)
+      vk_buf_free(&stage[s][a]);
+    vkDestroySemaphore(vk.dev, sem[s], NULL);
+    vkDestroyFence(vk.dev, fence[s], NULL);
+    vkFreeCommandBuffers(vk.dev, vk.pool, 1, &xcb[s]);
+    vkFreeCommandBuffers(vk.dev, vk.pool, 1, &rcb[s]);
+  }
+  vk_buf_free(&dst);
+  vkDestroyPipeline(vk.dev, pipe, NULL);
+  vkDestroyPipelineLayout(vk.dev, pl, NULL);
+  vkDestroyImageView(vk.dev, view, NULL);
+  vkDestroyImage(vk.dev, img, NULL);
+  vkFreeMemory(vk.dev, mem, NULL);
+  return 0;
+}
+
+static int t_vk_stream(void) { return vk_stream(0); }
+static int t_vk_stream_pool(void) { return vk_stream(1); }
 
 static const struct {
   const char *name;
@@ -1200,6 +1371,8 @@ static const struct {
     {"vk-alloc", t_vk_alloc, 'v'}, {"vk-copy", t_vk_copy, 'v'},     {"vk-cpu", t_vk_cpu, 'v'},
     {"gl-init", t_gl_init, 'g'},   {"gl-xfer", t_gl_xfer, 'g'},     {"gl-draws", t_gl_draws, 'g'},
     {"rm-ctl", t_rm_ctl, 'r'},     {"rm-map", t_rm_map, 'r'},       {"wl-shm", t_wl_shm, 'w'},
+    /* Only by name: rig/rig-heavy.sh's, not the suite's. */
+    {"vk-stream", t_vk_stream, 's'}, {"vk-stream-pool", t_vk_stream_pool, 's'},
 };
 #define NTESTS (sizeof(tests) / sizeof(tests[0]))
 
@@ -1216,7 +1389,7 @@ int main(int argc, char **argv) {
     int ran = 0;
     for (unsigned i = 0; i < NTESTS; i++) {
       int match = !strcmp(argv[a], tests[i].name) ||
-                  (!strcmp(argv[a], "all") && tests[i].group != 'w') ||
+                  (!strcmp(argv[a], "all") && tests[i].group != 'w' && tests[i].group != 's') ||
                   (!strcmp(argv[a], "vk") && tests[i].group == 'v') ||
                   (!strcmp(argv[a], "gl") && tests[i].group == 'g') ||
                   (!strcmp(argv[a], "rm") && tests[i].group == 'r') ||
