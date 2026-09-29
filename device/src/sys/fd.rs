@@ -178,6 +178,44 @@ pub fn seek_data(fd: RawFd, off: u64) -> io::Result<u64> {
     }
 }
 
+/// What `statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC)` says of a
+/// descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedStat {
+    /// The file type bits of the mode (`S_IFMT`).
+    pub kind: u32,
+    /// The device a special file is, as (major, minor).
+    pub rdev: (u32, u32),
+    /// The device of the filesystem the file is on, as (major, minor).
+    pub dev: (u32, u32),
+}
+
+/// A descriptor's type, rdev and filesystem device, from the attributes the
+/// kernel has cached: AT_STATX_DONT_SYNC tells a network or FUSE filesystem
+/// not to ask its server (fs/fuse/dir.c, `fuse_update_get_attr`), so a
+/// descriptor from outside cannot make the caller wait on whoever serves
+/// it. `fstat` and `fstatfs` can.
+pub fn statx_cached(fd: RawFd) -> io::Result<CachedStat> {
+    // SAFETY: an all-zero `statx` is a valid value for statx to overwrite.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is a NUL-terminated empty string, and `st` a live,
+    // writable statx.
+    cvt(unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE,
+            &mut st,
+        )
+    })?;
+    Ok(CachedStat {
+        kind: u32::from(st.stx_mode) & libc::S_IFMT,
+        rdev: (st.stx_rdev_major, st.stx_rdev_minor),
+        dev: (st.stx_dev_major, st.stx_dev_minor),
+    })
+}
+
 /// `fstat(fd)`.
 pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     // SAFETY: an all-zero `stat` is a valid value for fstat to overwrite.
