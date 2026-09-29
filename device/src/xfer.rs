@@ -1972,56 +1972,52 @@ impl Prepared {
     /// (nvidia-drm-fb.c:113), so the handle is closed right after. Nothing is
     /// cached, so nothing can go stale (RV:rehome).
     fn gems_in(&mut self, target_fd: RawFd) -> Result<Vec<u32>, Errno> {
-        let mut temps: Vec<u32> = Vec::new();
+        let mut temps = Vec::new();
+        match self.home_gems(target_fd, &mut temps) {
+            Ok(()) => Ok(temps),
+            Err(e) => {
+                for h in temps {
+                    self.gem_close(target_fd, h);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `gems_in`'s work: each handle it imports is in `temps` as soon as it
+    /// exists, for the caller to close however this ends.
+    fn home_gems(&mut self, target_fd: RawFd, temps: &mut Vec<u32>) -> Result<(), Errno> {
         let mut homed: HashMap<(u32, u32), u32> = HashMap::new();
         for i in 0..self.gem_ins.len() {
             let GemInRec { slot, owner, gem } = self.gem_ins[i];
-            let r = (|| -> Result<u32, Errno> {
-                let h = if owner == self.target {
-                    gem
-                } else if let Some(&h) = homed.get(&(owner, gem)) {
-                    h
-                } else {
-                    let owner_fd = self.owners[&owner].as_raw_fd();
-                    let dmabuf = self.prime_export(owner, owner_fd, gem)?;
-                    let imported = self.prime_import(target_fd, dmabuf.as_raw_fd());
-                    self.sys.close(dmabuf);
-                    let h = imported?;
-                    temps.push(h);
-                    homed.insert((owner, gem), h);
-                    h
-                };
-                if let Kind::GemIn {
-                    validate_nvkms: true,
-                } = self.slots[slot].field.kind
-                {
-                    // In the same job as the ioctl, on a handle only this job
-                    // knows: nothing can swap the object in between.
-                    if self.identify(target_fd, h)? != NV_GEM_OBJECT_NVKMS {
-                        return Err(libc::EINVAL);
-                    }
-                }
-                Ok(h)
-            })();
-            match r {
-                Ok(h) => {
-                    let (b, o) = (self.bufs[self.slots[slot].buf].id, self.slots[slot].off);
-                    if let Err(e) = self.arena.set_value(b, o, u64::from(h)) {
-                        for h in temps {
-                            self.gem_close(target_fd, h);
-                        }
-                        return Err(e);
-                    }
-                }
-                Err(e) => {
-                    for h in temps {
-                        self.gem_close(target_fd, h);
-                    }
-                    return Err(e);
+            let h = if owner == self.target {
+                gem
+            } else if let Some(&h) = homed.get(&(owner, gem)) {
+                h
+            } else {
+                let owner_fd = self.owners[&owner].as_raw_fd();
+                let dmabuf = self.prime_export(owner, owner_fd, gem)?;
+                let imported = self.prime_import(target_fd, dmabuf.as_raw_fd());
+                self.sys.close(dmabuf);
+                let h = imported?;
+                temps.push(h);
+                homed.insert((owner, gem), h);
+                h
+            };
+            if let Kind::GemIn {
+                validate_nvkms: true,
+            } = self.slots[slot].field.kind
+            {
+                // In the same job as the ioctl, on a handle only this job
+                // knows: nothing can swap the object in between.
+                if self.identify(target_fd, h)? != NV_GEM_OBJECT_NVKMS {
+                    return Err(libc::EINVAL);
                 }
             }
+            let (b, o) = (self.bufs[self.slots[slot].buf].id, self.slots[slot].off);
+            self.arena.set_value(b, o, u64::from(h))?;
         }
-        Ok(temps)
+        Ok(())
     }
 
     /// Framebuffer ownership, and GETFB's answer to a framebuffer that is not

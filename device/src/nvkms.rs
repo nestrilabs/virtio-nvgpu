@@ -639,6 +639,16 @@ impl NvkmsPolicy {
         }
     }
 
+    /// The layout, and the command's name without its `NVKMS_`, of the v1
+    /// call in `msg` (its NvKmsIoctlParams first), if this host's table
+    /// knows it.
+    fn v1_entry(st: &State, msg: &[u8]) -> Option<(&'static NvkmsLayout, &'static str)> {
+        let (lo, _) = Self::layout(st).ok()?;
+        let table = st.version.and_then(schema::modeset_table)?;
+        let name = table.lookup_nvkms(rd32(msg, 0).ok()?)?.name;
+        Some((lo, name.strip_prefix("NVKMS_").unwrap_or(name)))
+    }
+
     /// The reply to a v1 call `v1_before` let through: the 16-byte
     /// NvKmsIoctlParams and the params block, as `msg` was. Only
     /// ALLOC_DEVICE's reply is rewritten (see `after`); v1 records nothing.
@@ -647,14 +657,7 @@ impl NvkmsPolicy {
             return;
         }
         let st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
-            return;
-        };
-        let Ok(cmd) = rd32(msg, 0) else { return };
-        if table.lookup_nvkms(cmd).map(|e| e.name) == Some("NVKMS_ALLOC_DEVICE")
+        if let Some((lo, "ALLOC_DEVICE")) = Self::v1_entry(&st, msg)
             && let Some(params) = msg.get_mut(16..)
         {
             coherent_display_only(lo, params);
@@ -666,16 +669,9 @@ impl NvkmsPolicy {
     /// (the reply is in `msg`, and the host is not asked).
     pub fn v1_cached(&self, target: u32, msg: &mut [u8]) -> bool {
         let mut st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
+        let Some((lo, "QUERY_DPY_DYNAMIC_DATA")) = Self::v1_entry(&st, msg) else {
             return false;
         };
-        let Ok(cmd) = rd32(msg, 0) else { return false };
-        if table.lookup_nvkms(cmd).map(|e| e.name) != Some("NVKMS_QUERY_DPY_DYNAMIC_DATA") {
-            return false;
-        }
         let call = Call {
             target,
             fds: &[],
@@ -692,21 +688,9 @@ impl NvkmsPolicy {
     /// GET_NEXT_EVENT returns (`State::record`). Grants cannot travel v1.
     pub fn v1_record(&self, target: u32, msg: &[u8]) {
         let mut st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
-            return;
-        };
-        let Ok(cmd) = rd32(msg, 0) else { return };
-        let Some(name) = table.lookup_nvkms(cmd).map(|e| e.name) else {
-            return;
-        };
-        let name = name.strip_prefix("NVKMS_").unwrap_or(name);
-        if matches!(
-            name,
-            "ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"
-        ) && let Some(params) = msg.get(16..)
+        if let Some((lo, name @ ("ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"))) =
+            Self::v1_entry(&st, msg)
+            && let Some(params) = msg.get(16..)
         {
             st.record(lo, name, target, params, &[]);
         }
