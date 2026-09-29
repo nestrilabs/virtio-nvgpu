@@ -36,7 +36,7 @@ use crate::hostfd::{self, CardNode, HandleKind};
 use crate::kms::LeaseAlarm;
 use crate::nvidia::NvidiaBackend;
 use crate::pump::{PumpCmd, WatchMode};
-use crate::session::{Reply, hdr};
+use crate::session::Reply;
 use crate::wl::conn::{HostFds, RecvOps, SendOps, WlConfig, WlConn, WlLimits};
 use crate::wl::export::WlExport;
 use wlwire::frame;
@@ -513,12 +513,12 @@ impl NvidiaBackend {
             gate: self.export_gate(),
         };
         let resp = conn.send(frame_bytes, &mut ops)?;
-        let mut bytes = hdr(MsgType::WlSend, handle, 0, self.current_req_id);
-        bytes.extend_from_slice(crate::sys::pod::bytes(&resp));
-        Ok(Reply {
-            bytes,
-            ..Reply::default()
-        })
+        Ok(Reply::ok(
+            MsgType::WlSend,
+            handle,
+            self.current_req_id,
+            crate::sys::pod::bytes(&resp),
+        ))
     }
 
     fn wl_recv(&mut self, handle: u32, payload: &[u8], cap: usize) -> Result<Reply, i32> {
@@ -559,14 +559,11 @@ impl NvidiaBackend {
         };
         let f = conn.recv(req.max_bytes, req.max_desc, &mut ops)?;
         let created = ops.created;
-        let mut bytes = hdr(MsgType::WlRecv, handle, 0, self.current_req_id);
-        bytes.extend_from_slice(&f);
         Ok(Reply {
-            bytes,
-            stamp_at: None,
             // If this reply never reaches the guest (its ring was reset under
             // it) nobody else knows these handles: the transport closes them.
             created,
+            ..Reply::ok(MsgType::WlRecv, handle, self.current_req_id, &f)
         })
     }
 }
