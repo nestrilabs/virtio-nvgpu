@@ -932,8 +932,11 @@ unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
 
 /* ═════════════════════════ Protocol v2 internal API ═════════════════════════
  *
- * Ownership: nvgpu_xfer.c (transport, HELLO, TIME_SYNC, HOST_OP, WATCH, event
- * dispatch), nvgpu_i2.c (the schema-driven IOCTL2 interpreter),
+ * Ownership: nvgpu_xfer.c (transport, HELLO, HOST_OP, WATCH, CLOSE),
+ * nvgpu_tbuf.c (transport buffers), nvgpu_clock.c (TIME_SYNC and the host's
+ * clock), nvgpu_events.c (event dispatch and the consumer registry; the
+ * state they share is nvgpu_xfer.h), nvgpu_i2.c (the schema-driven IOCTL2
+ * interpreter),
  * nvgpu_hostfile.c (backend handles as guest files), nvgpu_kms.c,
  * nvgpu_fence.c, nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are nvgpu_wire.h.
  */
