@@ -1548,9 +1548,8 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
     // Teardown
     //
-    // Called by the VMM on:
-    //   - normal VM shutdown (virtio device reset before exit)
-    //   - ungraceful VM exit (SIGKILL, crash, libkrun teardown)
+    // Called by the transport once the VMM has gone: a VM that shut down,
+    // or one that exited without shutting its device down (SIGKILL, crash).
     //
     // Draining the handle table closes every host fd, which triggers the
     // host NVIDIA driver's fd-release path and frees all RM objects.
@@ -1669,12 +1668,6 @@ impl NvidiaBackend {
             self.release_extent(&e.region, e.shm_length, "session end");
         }
         self.rmmem.clear();
-        let mut kms_fbs: std::collections::HashMap<u32, Vec<u32>> = self
-            .kms_states
-            .drain()
-            .map(|(h, k)| (h, k.retire()))
-            .collect();
-        self.vm_kms.clear();
         self.wl_forget_all();
         self.syncobj_regs.clear();
         self.uvm_refused.clear();
@@ -1700,26 +1693,22 @@ impl NvidiaBackend {
         }
         self.osdesc.clear();
         self.semsurf.reset();
-        // As in close_handle: display files close on the closer thread, not
-        // under the backend mutex a reset holds (S-33).
+        // Then every file, as a CLOSE ends it: what is left of it here goes
+        // (the VM-wide records above are empty by now), a display file
+        // closes on the closer thread, not under the backend mutex a reset
+        // holds (S-33), and after any call in flight that names its
+        // framebuffers (S-6).
         let handles = self.handles.handles();
         if !handles.is_empty() {
             log::info!("release_all: closing {} host file(s)", handles.len());
         }
         for h in handles {
-            let owner = self.handles.owner(h);
-            if let Ok((fd, kind)) = self.handles.remove(h) {
-                if !crate::closer::slow(kind) {
-                    drop(fd);
-                    continue;
-                }
-                let fd = self.handles.closing(fd, owner, kind);
-                match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
-                    Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
-                    None => crate::closer::close(fd),
-                }
-            }
+            let _ = self.retire_handle(h, "session end");
         }
+        for (_, k) in self.kms_states.drain() {
+            k.retire();
+        }
+        self.vm_kms.clear();
     }
 
     /// Withdraw a placement from the window and return its extent. Called
@@ -2744,26 +2733,32 @@ impl NvidiaBackend {
     /// guest file may still have one mapped (see [`LiveMap`]). Only the lookup
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
+        self.retire_handle(handle, "close")
+    }
+
+    /// Everything a handle's end does, whatever ends it (`why`): a CLOSE, or
+    /// the session's (`release_all`), which does the VM-wide parts first.
+    fn retire_handle(&mut self, handle: u32, why: &str) -> Result<()> {
         let owner = self.handles.owner(handle);
         let (fd, kind) = self.handles.remove(handle)?;
         // Its UVM pools leave the VMM while `fd` is still open here, so the
         // file's last reference, and UVM's teardown of it, stay ours.
         for w in self.uvm_maps.take_handle(handle) {
-            self.withdraw_uvm(w, "close");
+            self.withdraw_uvm(w, why);
         }
         self.uvm_refused.remove(&handle);
         // Registered memory its external mappings hold is taken down while
         // the file is ours, and only then may the guest unpin it (osdesc.rs).
         if kind == HandleKind::Dev(DeviceKind::Uvm) {
-            self.osdesc_uvm_close(fd.as_raw_fd(), handle, "close");
+            self.osdesc_uvm_close(fd.as_raw_fd(), handle, why);
         }
         for entry in self.active_maps.take_for_fd(handle) {
             log::debug!(
-                "close handle={handle}: releasing mapping at SHM {:#x}+{:#x}",
+                "{why} of handle {handle}: releasing mapping at SHM {:#x}+{:#x}",
                 entry.region.offset,
                 entry.region.length
             );
-            self.end_rm_mapping(entry, "close");
+            self.end_rm_mapping(entry, why);
         }
         // The one client set (semsurf.rs) says which RM clients died with
         // this file; the memory records drop what those held.
@@ -2772,7 +2767,7 @@ impl NvidiaBackend {
         // here, while the file is ours: RM lets go of the pages now, not
         // whenever the file's last reference goes, and only then is the guest
         // told it may unpin them (osdesc.rs).
-        self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, "close");
+        self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, why);
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         let fbs = self.forget_kms_state(handle);
@@ -2785,7 +2780,7 @@ impl NvidiaBackend {
         self.nvkms.forget_handle(handle);
         self.inject.file_closed(handle);
         self.pump_cmds.push(PumpCmd::Unwatch { handle });
-        log::debug!("close handle={handle} ({kind:?})");
+        log::debug!("{why} of handle {handle} ({kind:?})");
         // A display file's last close can wait on a modeset; not here, on
         // the queue thread under the backend mutex (closer.rs, S-33). One
         // whose framebuffers a call in flight names closes after it (S-6).
