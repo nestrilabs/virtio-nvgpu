@@ -643,7 +643,7 @@ stderr and in the log at every start. None is for running a tenant:
 | `--rm-allowlist log` | the RM allowlist: what it would refuse is logged and forwarded |
 | `--sandbox best-effort`, `--sandbox off` | the refusal to run with a sandbox layer missing; all of the sandbox |
 | `--allow-unmeasured-release` | the exact-measured-release rule |
-| `--allow-inject-self` | the refusal of an `--inject-uid` that is the backend's own uid (every process of that user could inject into the VM); the rig's, which is one user |
+| `--allow-inject-self` | the refusal of an `--inject-uid` that is the backend's own uid, and of a helper connection from the VMM's uid (every process of that user could inject into the VM); the rig's, which is one user |
 
 `RUST_LOG` sets the log level (`warn` by default, which is what production
 should keep: the start-up lines worth reading are warnings, and every call

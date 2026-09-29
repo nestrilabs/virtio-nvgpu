@@ -152,11 +152,13 @@ full account, and its "Summary" the short one; this is shorter still.
 - **The backend runs unprivileged**, because RM, DRM and NVKMS take a
   guest's privilege from its credentials: it refuses root and
   `CAP_SYS_ADMIN`, drops every capability, sandboxes itself (a network
-  namespace, Landlock, seccomp) before the first guest message, and runs as
-  a user of its own per VM ([`DEPLOY.md`](DEPLOY.md)).
+  namespace, Landlock, seccomp) before the first guest message, and, run
+  as root, is a user of its own per VM ([`DEPLOY.md`](DEPLOY.md); not in
+  the Wayland modes, where it is the desktop user).
 - **Compute is opt-in** (`--allow-compute`): without it the guest has no
   UVM device and no memory registered by its pages.
-- RM objects stay with the guest process that made them, the display paths
+- RM objects stay with the guest process that made them, unless shared as
+  RM would allow between two host processes; the display paths
   are held to leases, grants and the VM's own framebuffers, and the Wayland
   allowlist is enforced on the host.
 - Not done: the per-guest isolate, so the backend holds the host
