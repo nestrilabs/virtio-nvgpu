@@ -134,6 +134,10 @@ pub struct HandleTable {
 struct Closing {
     held: Ledger,
     total: u64,
+    /// Of those, modeset files, which count against the VM's and each
+    /// process's NVKMS opens too (review 2026-09-29 1.12).
+    modeset_held: Ledger,
+    modeset_total: u64,
 }
 
 impl Closing {
@@ -148,6 +152,7 @@ pub struct Closed<T> {
     item: Option<T>,
     closing: Arc<Mutex<Closing>>,
     owner: Owner,
+    modeset: bool,
 }
 
 impl<T> Drop for Closed<T> {
@@ -156,6 +161,10 @@ impl<T> Drop for Closed<T> {
         let mut c = Closing::lock(&self.closing);
         c.held.refund(self.owner, 1);
         c.total = c.total.saturating_sub(1);
+        if self.modeset {
+            c.modeset_held.refund(self.owner, 1);
+            c.modeset_total = c.modeset_total.saturating_sub(1);
+        }
     }
 }
 
@@ -333,18 +342,30 @@ impl HandleTable {
         self.table.get(&handle).is_some_and(|e| e.buried)
     }
 
-    /// `item` -- the descriptor of a handle just removed, charged to
-    /// `owner`, on its way to the closer -- counted against the table and
-    /// `owner`'s share until it is dropped.
-    pub fn closing<T>(&self, item: T, owner: Owner) -> Closed<T> {
+    /// `item` -- the descriptor of a handle of `kind` just removed,
+    /// charged to `owner`, on its way to the closer -- counted against the
+    /// table and `owner`'s share until it is dropped.
+    pub fn closing<T>(&self, item: T, owner: Owner, kind: HandleKind) -> Closed<T> {
+        let modeset = kind == HandleKind::Dev(protocol::messages::DeviceKind::Modeset);
         let mut c = Closing::lock(&self.closing);
         c.held.charge(owner, 1);
         c.total += 1;
+        if modeset {
+            c.modeset_held.charge(owner, 1);
+            c.modeset_total += 1;
+        }
         Closed {
             item: Some(item),
             closing: self.closing.clone(),
             owner,
+            modeset,
         }
+    }
+
+    /// Modeset files still closing: the VM's, and `owner`'s.
+    pub fn closing_modesets(&self, owner: Owner) -> (u64, u64) {
+        let c = Closing::lock(&self.closing);
+        (c.modeset_total, c.modeset_held.held(owner))
     }
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).

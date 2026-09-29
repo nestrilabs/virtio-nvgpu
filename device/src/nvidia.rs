@@ -1465,7 +1465,7 @@ impl NvidiaBackend {
                     drop(fd);
                     continue;
                 }
-                let fd = self.handles.closing(fd, owner);
+                let fd = self.handles.closing(fd, owner, kind);
                 match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
                     Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
                     None => crate::closer::close(fd),
@@ -1794,7 +1794,11 @@ impl NvidiaBackend {
     /// them ([`nvkms::MODESET_SHARE`], B4).
     pub(crate) fn modeset_open_refused(&self, owner: crate::quota::Owner) -> Option<String> {
         let kind = HandleKind::Dev(DeviceKind::Modeset);
-        let (mut open, mut mine) = (0usize, 0usize);
+        // Files still closing are still open on the host: with the closer
+        // stalled on a modeset, one process looping open/close held far
+        // more than the cap (review 2026-09-29 1.12).
+        let (closing, closing_mine) = self.handles.closing_modesets(owner);
+        let (mut open, mut mine) = (closing as usize, closing_mine as usize);
         for h in self.handles.handles() {
             if self.handles.kind(h) == Some(kind) {
                 open += 1;
@@ -2545,10 +2549,10 @@ impl NvidiaBackend {
         if !crate::closer::slow(kind) {
             drop(fd);
         } else if fbs.is_empty() {
-            crate::closer::close(self.handles.closing(fd, owner));
+            crate::closer::close(self.handles.closing(fd, owner, kind));
         } else {
             self.vm_kms
-                .close_after(fbs, Box::new(self.handles.closing(fd, owner)));
+                .close_after(fbs, Box::new(self.handles.closing(fd, owner, kind)));
         }
         Ok(())
     }
@@ -9239,5 +9243,31 @@ mod closing_tests {
         assert!(r.is_err(), "64 host files are still open");
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
         assert!(be.handles.insert(devnull(), HandleKind::Eventfd).is_ok());
+    }
+
+    /// Modeset files still closing count against the NVKMS open caps: with
+    /// the closer stalled on a modeset, one process looping open/close held
+    /// far more than 64 host NVKMS opens (review 2026-09-29 1.12).
+    #[test]
+    fn modeset_files_still_closing_count_against_the_nvkms_caps() {
+        let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let p = crate::quota::Owner::Proc {
+            tgid: 77,
+            start_ns: 1,
+        };
+        let mut be = NvidiaBackend::for_test();
+        let modeset = HandleKind::Dev(DeviceKind::Modeset);
+        let (go, wait) = std::sync::mpsc::channel();
+        crate::closer::close(Hold(wait));
+        let mut n = 0;
+        while be.modeset_open_refused(p).is_none() {
+            let h = be.adopt_for_test_as(devnull(), modeset, p);
+            be.close_handle(h).unwrap();
+            n += 1;
+            assert!(n <= nvkms::MAX_MODESET_OPENS, "no cap while closing");
+        }
+        go.send(()).unwrap();
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert_eq!(be.modeset_open_refused(p), None, "closed, the room is back");
     }
 }
