@@ -247,11 +247,13 @@ impl VmKms {
 
     /// Forget every record: the session is gone, and with it every file.
     /// What is in use stays counted, and parked files parked, until the
-    /// calls still running from before let go.
+    /// calls still running from before let go. So do the retired marks:
+    /// a call made before the reset may still be running on a retired
+    /// file, and must record nothing when it finishes; each mark goes with
+    /// its file's last reference (review 2026-09-29 1.5).
     pub fn clear(&self) {
         let mut v = self.lock();
         v.owner.clear();
-        v.retired.clear();
         v.probed.clear();
         v.blobs.clear();
         v.seen_blobs.clear();
@@ -517,6 +519,8 @@ impl Drop for KmsFileState {
         let mut v = self.vm.lock();
         let me = self.serial;
         v.owner.retain(|_, s| *s != me);
+        v.blobs.retain(|_, s| *s != me);
+        v.seen_blobs.retain(|&(s, _, _), _| s != me);
         v.retired.remove(&me);
     }
 }
@@ -3804,6 +3808,30 @@ mod tests {
         // A call still finishing on the retired file records nothing.
         other.add_fb(44);
         assert!(!vm.made_here(44));
+    }
+
+    /// A session reset while a KMS call is still running: the call
+    /// finishes on a retired file and records nothing, even though the
+    /// reset forgot every record; and whatever a file did record goes with
+    /// its last reference (review 2026-09-29 1.5).
+    #[test]
+    fn a_call_finishing_after_a_reset_records_no_blob_or_framebuffer() {
+        let vm = Arc::new(VmKms::new());
+        let f = KmsFileState::in_vm(vm.clone());
+        f.retire();
+        vm.clear();
+        f.add_blob(5);
+        f.saw_blobs(31, &[(7, 6)]);
+        f.add_fb(44);
+        assert!(!vm.blob_readable(5) && !vm.blob_readable(6));
+        assert!(!vm.made_here(44));
+
+        let g = KmsFileState::in_vm(vm.clone());
+        g.add_blob(8);
+        g.saw_blobs(31, &[(7, 9)]);
+        assert!(vm.blob_readable(8) && vm.blob_readable(9));
+        drop(g);
+        assert!(!vm.blob_readable(8) && !vm.blob_readable(9));
     }
 
     #[test]
