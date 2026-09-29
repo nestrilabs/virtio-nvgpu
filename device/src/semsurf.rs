@@ -1491,7 +1491,10 @@ mod tests {
         ) -> Result<(), String> {
             assert_eq!((cmd, params.len()), (0x201, 128));
             if self.strict && fd != self.opened.borrow()[0] {
-                return Err("RM status 0x1a".into()); // NV_ERR_INVALID_CLIENT
+                return Err(format!(
+                    "RM status {:#x}",
+                    crate::nvos::NV_ERR_INVALID_CLIENT
+                ));
             }
             Ok(())
         }

@@ -1568,7 +1568,7 @@ use crate::hostfd::{
     DRM_IOCTL_PRIME_HANDLE_TO_FD,
 };
 const DRM_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
-const NV_GEM_OBJECT_NVKMS: u64 = 0;
+const NV_GEM_OBJECT_NVKMS: u64 = crate::hostfd::NV_GEM_OBJECT_NVKMS as u64;
 
 impl Prepared {
     fn run(&mut self, target_fd: RawFd) -> Result<i32, Errno> {
@@ -2537,10 +2537,15 @@ mod tests {
                     DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT => {
                         let h = peek(arg, top, 0, 4) as u32;
                         k.log.push(format!("identify {file}:{h}"));
-                        let Some(obj) = k.obj(file, h) else {
-                            return -libc::ENOENT;
-                        };
-                        poke(arg, top, 4, 4, k.objects[&obj].0);
+                        // An unknown handle is answered, not refused:
+                        // nvidia-drm says OBJECT_UNKNOWN
+                        // (nv_drm_gem_identify_object_ioctl).
+                        let ty = k
+                            .obj(file, h)
+                            .map_or(u64::from(crate::hostfd::NV_GEM_OBJECT_UNKNOWN), |obj| {
+                                k.objects[&obj].0
+                            });
+                        poke(arg, top, 4, 4, ty);
                         0
                     }
                     DRM_IOCTL_MODE_GETPROPERTY => {
