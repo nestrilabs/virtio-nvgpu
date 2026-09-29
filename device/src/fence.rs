@@ -265,9 +265,10 @@ fn drm_ioctl(fd: RawFd, cmd: u32, a: &mut Arena, top: BufId) -> io::Result<()> {
 /// Where a registration's eventfd is watched from: the handle table and the
 /// event pump, which the backend owns.
 pub trait RegTable {
-    /// Give `eventfd` a handle and have the pump report it once, as EV_READY
-    /// with `cookie`, when it becomes readable.
-    fn publish(&mut self, eventfd: OwnedFd, cookie: u64) -> Result<u32, Errno>;
+    /// Give `eventfd` a handle, charged to guest process `owner`, and have
+    /// the pump report it once, as EV_READY with `cookie`, when it becomes
+    /// readable.
+    fn publish(&mut self, eventfd: OwnedFd, cookie: u64, owner: Owner) -> Result<u32, Errno>;
     /// Take that handle back.
     fn retire(&mut self, handle: u32);
 }
@@ -527,6 +528,10 @@ impl Registrations {
     /// the legacy (handle) range or one another live registration reports
     /// under; EAGAIN over the cap; ENOENT for a syncobj the file does not
     /// have; otherwise what the host says.
+    ///
+    /// Charged to no process: for tests. The backend names the process
+    /// ([`Registrations::watch_by`]).
+    #[cfg(test)]
     pub fn watch(
         &mut self,
         host: &dyn SyncobjHost,
@@ -613,7 +618,11 @@ impl Registrations {
         // Watched before it is registered: the kernel may signal it inside
         // the ioctl (a point already signalled, drm_syncobj.c:1447-1453), and
         // the pump's watch looks at the descriptor once when it is armed.
-        let handle = table.publish(dup, cookie)?;
+        // The handle is charged to the process too: a retired
+        // registration's stays open for the grace, and uncharged, a
+        // process looping on signalled points filled the table past its
+        // share (review 2026-09-29 1.6).
+        let handle = table.publish(dup, cookie, owner)?;
         if let Err(e) = host.register(
             render_fd,
             key.syncobj,
@@ -708,11 +717,11 @@ fn fired(fd: RawFd) -> bool {
 // ─────────────────────────────── the backend ───────────────────────────────
 
 impl RegTable for NvidiaBackend {
-    fn publish(&mut self, eventfd: OwnedFd, cookie: u64) -> Result<u32, Errno> {
+    fn publish(&mut self, eventfd: OwnedFd, cookie: u64, owner: Owner) -> Result<u32, Errno> {
         let pump = eventfd.try_clone().map_err(|e| errno(&e))?;
         let handle = self
             .handles
-            .insert(eventfd, HandleKind::Eventfd)
+            .insert_for(eventfd, HandleKind::Eventfd, owner)
             .map_err(|e| e.errno())?;
         self.pump_cmds.push(PumpCmd::Watch {
             handle,
@@ -830,7 +839,7 @@ mod tests {
     }
 
     impl RegTable for Table {
-        fn publish(&mut self, _: OwnedFd, cookie: u64) -> Result<u32, Errno> {
+        fn publish(&mut self, _: OwnedFd, cookie: u64, _: Owner) -> Result<u32, Errno> {
             if self.full {
                 return Err(libc::EMFILE);
             }
@@ -1303,7 +1312,7 @@ mod tests {
         }
         struct OrderTable<'a>(&'a RefCell<Vec<&'static str>>);
         impl RegTable for OrderTable<'_> {
-            fn publish(&mut self, _: OwnedFd, _: u64) -> Result<u32, Errno> {
+            fn publish(&mut self, _: OwnedFd, _: u64, _: Owner) -> Result<u32, Errno> {
                 self.0.borrow_mut().push("publish");
                 Ok(1)
             }
@@ -1334,8 +1343,15 @@ mod tests {
     #[test]
     fn a_published_eventfd_is_watched_once_and_not_drained() {
         let mut be = NvidiaBackend::for_test();
-        let h = be.publish(hostfd::new_eventfd().unwrap(), C1).unwrap();
+        let p = Owner::Proc {
+            tgid: 7,
+            start_ns: 1,
+        };
+        let h = be.publish(hostfd::new_eventfd().unwrap(), C1, p).unwrap();
         assert_eq!(be.handles.kind(h), Some(HandleKind::Eventfd));
+        // Charged to the process that asked (review 2026-09-29 1.6).
+        assert_eq!(be.handles.owner(h), p);
+        assert_eq!(be.handles.held_by(p), 1);
         let cmds = be.take_pump_cmds();
         assert!(matches!(
             cmds.as_slice(),
