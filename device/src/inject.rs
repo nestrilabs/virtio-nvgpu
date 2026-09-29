@@ -17,8 +17,10 @@
 //!
 //! **Who may inject.** Only peers whose `SO_PEERCRED` uid is `--inject-uid`,
 //! at most [`MAX_PEERS`] at once. The socket is bound in a private directory
-//! and renamed into place, 0600, like the export socket; the operator opens
-//! it to the helper's group (contrib/systemd/nvgpu-socket-open). The backend
+//! and renamed into place, 0600, like the export socket, for the operator to
+//! open to the helper's group; or systemd binds it, open to that group, and
+//! hands it over ([`InjectServer::from_listener`];
+//! contrib/systemd/vhost-user-nvgpu-inject@.socket). The backend
 //! cannot know whether the user consented to what the helper sends: the
 //! helper uid is trusted for that, and for nothing else (SECURITY.md §18).
 //!

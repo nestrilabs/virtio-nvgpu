@@ -1636,7 +1636,7 @@ and moving it in would replace up to a gigabyte past the checked range --
 nesbox takes only NVIDIA and DRM character devices into the window (below),
 crosvm's arena refuses hugetlbfs.
 
-**nesbox** (`virtio-devices/src/nvgpu.rs`, branch `virtio-nvgpu-v3`): a
+**nesbox** (`virtio-devices/src/nvgpu.rs`, branch `virtio-nvgpu-v3` and later): a
 window placement must be an NVIDIA device (character major 195) or a DRM
 node (226), opened read-write if the mapping is writable -- the only files
 the backend places there -- page-aligned (its length taken as whole pages),
@@ -1855,7 +1855,9 @@ protection away. They are hidden from `--help` (shown with `--diagnostic
 announced as `DIAGNOSTIC: <flag>: <what it takes away>` on stderr, whatever
 the log level, and in the log. `rig/run-guest.sh` adds `--diagnostic`
 only when one of them reached the backend's arguments (after `--`, or from
-`NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`).
+`NVGPU_SANDBOX=off` or `NVGPU_ALLOW_ROOT_UNSAFE=1`); since §22, as root it
+refuses every one of them without `NVGPU_DIAGNOSTIC=1`, and it says each on
+the terminal.
 
 **What the log holds.** The raw dumps are gone: the CARD_INFO reply (BAR
 physical addresses), SYS_PARAMS, RM_CONTROL and RM_ALLOC replies (whose
@@ -2435,9 +2437,10 @@ its exporter for a moment); keep its four connections and threads.
 
 **Could not:** be root or the backend's own uid (the backend refuses
 either as `--inject-uid`, the latter but for the diagnostic
-`--allow-inject-self` a one-user rig needs; the NixOS module also refuses
-the VM's backend and VMM uids where they are fixed, and one helper uid for
-two VMs); reach another VM (another backend, another uid); make the
+`--allow-inject-self` a one-user rig needs; the NixOS module, which fixes
+the pool's uids, also refuses any VM's backend or VMM uid, a login user's,
+a helper group that is shared, a pool group or holds anyone but the helper,
+and one helper uid or group for two VMs, §22); reach another VM (another backend, another uid); make the
 backend open, map or write anything (it imports, identifies, sizes and
 keeps descriptors it was given; nothing is mapped into the backend); reach
 guest memory, the window or the virtqueue; stall the VM: its imports hold
@@ -2780,10 +2783,15 @@ placement it has made, after answering it. What this adds and does not:
   mapped, with the same permissions (KVM maps as a read fault would, so it
   never makes a mapping writable that a guest write would not). It gives the
   guest no memory, no address and no access it did not have;
-- the extra vCPU is not the guest's: its APIC id is past every one the ACPI
-  tables list, so the guest never starts it, nothing ever runs it (no
-  `KVM_RUN`), and an interrupt the guest sends it is never delivered to
-  anything. It shares the guest's TDP root (the same CPUID, so the same
+- the extra vCPU is not the guest's: its id, which is its APIC id, is past
+  every guest vCPU's -- nesbox's are 0 to n-1 and it is n; crosvm's are the
+  host's APIC ids under `--host-cpu-topology`, and it is the largest of them
+  plus one (§22, C3) -- so it is past every one the ACPI tables list, the
+  guest never starts it, nothing ever runs it (no `KVM_RUN`), and an
+  interrupt the guest sends it is never delivered to anything. Both VMMs
+  make it only for an nvgpu device, only when KVM has
+  `KVM_CAP_PRE_FAULT_MEMORY`, and stop trying at the first ENOSYS, ENOTTY or
+  EOPNOTSUPP. It shares the guest's TDP root (the same CPUID, so the same
   paging depth), which is the point: nothing else about KVM's view of the VM
   changes;
 - a range withdrawn before its turn is `PROT_NONE` reservation again, which
@@ -2799,3 +2807,170 @@ placement it has made, after answering it. What this adds and does not:
   made (patch 0007) and which holds the VM; the jailed frontend is
   unchanged. nesbox does it in the VMM process; the call is an `ioctl`,
   which both VMMs' filters already allow.
+
+## 22. The 2026-09-29 review
+
+A final review of the branch before it is merged, by area.
+
+### VMMs and deployment
+
+What a review of nesbox `virtio-nvgpu-v5`, the crosvm series (`0001`-`0010`),
+`rig/run-guest.sh`, `contrib/systemd`, `nix/module.nix` and CI found, and
+what was done. nesbox: branch `virtio-nvgpu-v6` (81a6c21, 10e96cc, fc65689).
+crosvm: `0007` and `0010`, regenerated. Nothing here was run on the GPU;
+what needs it is listed at the end.
+
+**A root backend's binary and socket were its user's to swap** (H1,
+medium). As root, the launcher gave the run's directory to the backend's
+user until the socket was bound, and put the backend's binary in it. When
+that user has other live processes -- the desktop user with
+`--wayland-socket`, the export directory's owner with `--wayland-export`,
+anyone named by `NVGPU_USER` -- one of them could rename its own program
+over the binary during the disk copy or the jail build (setpriv then ran it
+as the backend, unsandboxed, handed the guest's RAM), or put a socket of its
+own at the path before root closed the directory (the jailed VMM then
+connected to it). `nvgpu-socket-open` had the same window. Now nobody but
+root ever owns the socket or its directory:
+
+- the backend takes a listening socket handed to it: systemd's socket
+  activation (`LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES`; `vhost-user` and
+  `inject`) or `--socket-fd N`. Each is claimed once, made close-on-exec and
+  blocking, and must be a listening `AF_UNIX` socket of its protocol's type
+  (`device/src/sys/inherit.rs`; tests of the naming rules and the checks);
+- `vhost-user-nvgpu@.socket` binds `/run/nvgpu/vmN/nvgpu.sock`, root's and
+  0660 to `nvgpu-vmN`, in a directory of root's (0711), and
+  `vhost-user-nvgpu-inject@.socket` the capture helper's, 0660 to its group.
+  `nvgpu-socket-open`, its root `ExecStartPost=` and its 10 s wait are gone;
+- as root, the launcher's run directory, with the binary's copy in it, is
+  root's 0711 from the start, and root binds the socket
+  (`systemd-socket-activate`, which execs the backend with it once the VMM
+  connects; the socket must now be root's).
+
+What stays: a backend user with other live processes can still signal the
+backend (its own VM's availability), and, where `kernel.yama.ptrace_scope`
+is 0, trace it in the moment between exec and its first
+`PR_SET_DUMPABLE(0)`. Pool users have neither; keep the shared-user modes
+for a single desktop. The launcher's dry run shows the backend handed
+descriptor 3 named `vhost-user`, running from a `0:711` directory, and no
+change of ownership but the socket's group and the disk copy's.
+
+**The console log was unbounded** (H2, low-medium). A guest writing its
+console in a loop filled root's logs filesystem. Both logs now go through a
+writer that keeps `NVGPU_LOG_MAX_MIB` (64) and reads and drops the rest,
+and the backend and the VMM hold a pipe, not the file. (The units' journald
+already capped and rate-limited.)
+
+**Diagnostic flags went through as root unannounced** (H3, low-medium). The
+launcher added `--diagnostic` for any of them, which is the backend's
+second opt-in, but asked for `NVGPU_DIAGNOSTIC=1` only for the sandbox and
+root. As root each now needs it, and each in effect is said on the
+terminal, as root or not.
+
+**The module's helper-uid check was vacuous** (H4, low-medium). Its users
+had no fixed uids, so the check against the VM's own backend and VMM uids
+compared with null. The pool now has fixed ids (`uidBase`, 64000: slot N is
+uidBase+2N and uidBase+2N+1, group uidBase+2N), and the assertions refuse: a
+helper uid of any slot or of a login user; a helper group that does not
+exist, is a pool or shared group, or holds anyone but the helper; one
+helper or group for two VMs; anyone else in a slot's group; pool users with
+other groups; another user on a pool id. `checks.module-eval` tries each
+with a configuration it must refuse. Not done: the backend refusing an
+inject peer whose uid is the one that connected the vhost-user socket (a
+run-time check of the same rule).
+
+**Guest text reached root's terminal raw** (H5, low). What the launcher
+echoes from the console (the verdict, FAIL lines) now loses its control
+characters but tab and newline; an escape sequence in a verdict line
+reaches the terminal as text.
+
+**The root launcher trusted its environment** (H6, low). As root it now
+starts again under `env -i` with its own variables, `RUST_LOG`, `TERM`,
+`NESBOX_VIRTIOFSD` (checked as a path), the two the desktop warnings read,
+and a PATH of root's directories; every library it puts in the VMM's jail
+must be root's. The first shell still ran with what sudo let through: keep
+sudo's `env_reset`.
+
+**Two root runs with one tag shared their files** (H7, low). A pool run's
+files now carry its slot (`<tag>.vmN`), and a run whose `<tag>.json`
+another live run holds (flock) is refused, in every mode.
+
+**The nesbox jail showed the host's `/proc` and `/sys`** (H8, low). The
+jailer (`virtio-nvgpu-v6`) mounts a `/proc` of the jail's own with
+`hidepid=invisible` (not `subset=pid`: nesbox reads `/proc/devices` for the
+UVM major), so the jailed user sees only its own processes, and binds only
+`/sys/fs/cgroup`, `/sys/kernel/mm/transparent_hugepage` and
+`/sys/devices/system/cpu` (with a network device, `/sys/class/net` and
+`/sys/devices/virtual/net`; a virgl `gpu` device still gets all of `/sys`,
+which Mesa walks). It refuses a kernel that does not know `invisible`
+(before 5.8) rather than change the host's `/proc`.
+
+**The backend unit could be tighter** (H9, low). Added, each against what
+the backend does: `RestrictNamespaces=yes` (the unit's `PrivateNetwork=`
+gives it a namespace with only loopback, which it keeps; it unshares
+nothing), `KeyringMode=private`, `ProtectHostname=yes`,
+`ProtectKernelLogs=yes`, `NoExecPaths=/` with `ExecPaths=` the binary and
+the library directories (it never execs). Left out, and said why in the
+unit: `RemoveIPC=` (`PrivateIPC=` already keeps System V IPC and queues its
+own, and under a login user it would remove that user's shared memory),
+`SystemCallFilter=` (the backend installs its own allowlist).
+
+**The 100 µs slice** (H10): nothing to fix -- it changes when a thread runs,
+not its share. The VMM templates carry a commented `CPUWeight=` for a VMM
+that must never beat the desktop (§20).
+
+**`Requires=` left a VMM running on a dead backend** (C1, low-medium).
+Every place that tells a VMM unit what to say now says `BindsTo=`, and
+`contrib/systemd` has two VMM templates, `nvgpu-vmm-nesbox@.service` (the
+jailer as root, the unit's network namespace) and
+`nvgpu-vmm-crosvm@.service` (`nvgpu-vmmN`, its sandbox on, so no
+`RestrictNamespaces=`), not yet run.
+
+**DEPLOY's nesbox recipe could not start** (C2, low-medium): a chrooted
+process gets no user namespace, so under the jailer the network namespace is
+the unit's; `"unshare-network": true` is for unjailed runs.
+
+**crosvm's prefault vCPU id could be a guest vCPU's** (C3, low). Under
+`--host-cpu-topology` KVM's vCPU ids are host APIC ids, and `vcpu_count`
+could be one of them. The spare vCPU is now the largest guest id plus one,
+made before the guest's vCPUs (`0010`; a test of the review's 4-7 case).
+nesbox's ids are 0 to n-1 and the spare n: no collision (§21 said this
+wrongly for crosvm).
+
+**The Wayland drop-in lost to the environment file** (C4, low): systemd
+lets `EnvironmentFile=` override `Environment=`. The units take
+`$NVGPU_WAYLAND_ARGS` beside `$NVGPU_BACKEND_ARGS`, both from the file, and
+the module has `vms.<n>.wayland`.
+
+**crosvm pins the ioevents to BAR0's first address** (C5, low, not
+changed): a guest kernel that moves BAR0 before the driver binds has its
+ioevents refused, and the device goes NEEDS_RESET. It fails closed; DEPLOY
+says not to boot a guest with `pci=realloc`. Following a move would need
+the transport to report it after the one-time layout report.
+
+**The two VMMs made the prefault vCPU under different rules** (C6, low):
+both now make it only for an nvgpu device and only with the capability, and
+stop at the first ENOSYS, ENOTTY or EOPNOTSUPP. **Both logged every UVM
+pool at info** (C7, low): debug, as the backend's guest-driven lines are.
+**Nothing said a VMM ignored the window's size** (C8, low): the backend now
+warns once, at the memory table, when the window is not 1 GiB and the VMM
+never asked `GET_SHMEM_CONFIG`.
+
+**CI missed the deployment** (C10, B9): `scripts/ci.sh fast` (and `deploy`
+alone) now evaluates the module with every option and each configuration
+it must refuse, compares its units with `contrib/systemd`'s key by key,
+runs `systemd-analyze verify` over the units, applies `patches/crosvm` in
+order to `c0474109d64d`, runs the launcher's dry run, and shellchecks the
+launcher. Five rig script bugs made some results weaker than reported: the
+dry run's stale-backend case was never set up, `apps.sh` counted a dead
+Wayland daemon as FAIL then PASS, preflight assumed a 1 GiB window,
+`rig-bench.sh` and `rig-framepace.sh` could sample another user's backend,
+and `rig-build-kernel-rust.sh` read `RIG`. All fixed.
+
+**Not yet run on hardware:** a root run of the launcher (the backend
+started by `systemd-socket-activate` when the jailed nesbox connects; the
+capped console under a real guest); the socket-activated units, with and
+without the inject socket (whose descriptor reaches the backend through
+`Service=`); the VMM templates; nesbox `v6`'s jail (no other user's
+processes in its `/proc`, the UVM major still found, cgroup placement,
+virtiofsd); crosvm `0010`'s spare vCPU under `--host-cpu-topology`, and
+prefault speed unchanged.
