@@ -66,7 +66,8 @@ against that Rust port.
 kernel has `CONFIG_RUST=y`: the IOCTL2 walk, the v1 IOCTL marshalling and
 descriptor translation, deep segments, the OS-descriptor registrations and
 ATOMIC commits. Out of tree the Makefile picks them when the target kernel
-has Rust and the C otherwise; in a kernel tree `CONFIG_VIRTIO_GPU_NV_RUST`
+has Rust and the rustc it was built with is at hand, and the C otherwise
+(with a warning, when the kernel has Rust but the rustc differs); in a kernel tree `CONFIG_VIRTIO_GPU_NV_RUST`
 does (default `y` with `CONFIG_RUST`). `NVGPU_RUST=1` insists on the Rust,
 `NVGPU_RUST=0` on the C, which the module then says at load on a kernel
 with Rust. The Rust passed the whole hardware regression on 2026-09-26 and

@@ -93,6 +93,7 @@ static inline bool nvgpu_resp_has(u32 used, size_t off, size_t len) {
 }
 struct nvgpu_ioctl_reply {
   s32 status;
+  s32 raw;
   u32 used;
   bool full;
   u32 data_len;

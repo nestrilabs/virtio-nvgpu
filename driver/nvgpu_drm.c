@@ -1607,6 +1607,22 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   if (ret < 0)
     goto out;
   ret = nvgpu_ioctl_reply_parse(resp_buf, used, &r);
+  /*
+   * A status that is not an errno: nothing goes back (-EPROTO), but a
+   * positive one is not a refusal, and a GEM handle the host made for the
+   * caller would stay open in the render file until it closes. Closed here,
+   * unless it is a proxy's (a handle the file already had, S-11).
+   */
+  if (ret == -EPROTO && r.raw > 0 && d->handle_is_out &&
+      d->handle_offset != NVGPU_GEM_NO_FIELD && r.data_len <= d->size &&
+      (u32)d->handle_offset + 4 <= r.data_len &&
+      nvgpu_resp_has(used, sizeof(struct nvgpu_ioctl_resp), r.data_len)) {
+    u32 h = get_unaligned_le32(resp_buf + sizeof(struct nvgpu_ioctl_resp) +
+                               d->handle_offset);
+
+    if (h && !nvgpu_gem_handle_held(nfd->dev, fwd_handle, h))
+      nvgpu_gem_close(nfd->dev, fwd_handle, h);
+  }
   if (ret < 0)
     goto out;
 

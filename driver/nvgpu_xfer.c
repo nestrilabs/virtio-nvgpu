@@ -1396,21 +1396,17 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
   return n;
 }
 
-/* HOST_OP: which results are handles the backend now holds for us. */
-static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
-                                       struct nvgpu_req *r, u32 used) {
-  const size_t base = sizeof(struct nvgpu_msg_hdr);
-  struct nvgpu_host_op_req q;
-  struct nvgpu_host_op_resp a;
-  u64 res0;
-
-  if (!nvgpu_resp_has(used, base, sizeof(a)) ||
-      nvgpu_tbuf_read(r->resp, base, &a, sizeof(a)) ||
-      nvgpu_tbuf_read(r->req, base, &q, sizeof(q)) || !le32_to_cpu(a.nres))
+/*
+ * A HOST_OP that ran but whose results nobody will use -- its caller gave up,
+ * or the reply's status was not an errno (nvgpu_hdr_status()'s -EPROTO):
+ * close what op `op` (first argument `arg0`) made, the handle in `res0`.
+ * 1 if it closed something.
+ */
+static unsigned int nvgpu_host_op_drop(struct nvgpu_device *dev, u32 op,
+                                       u64 arg0, u64 res0) {
+  if (!res0 || res0 > U32_MAX)
     return 0;
-  res0 = le64_to_cpu(a.res[0]);
-
-  switch (le32_to_cpu(q.op)) {
+  switch (op) {
   case NVGPU_OP_PRIME_EXPORT:
   case NVGPU_OP_SYNC_MERGE:
   case NVGPU_OP_NEW_EVENTFD:
@@ -1423,14 +1419,46 @@ static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
     /* A GEM handle in the render file named by the first argument -- unless
      * the file already had one for the buffer, which the host then returns
      * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
-    if (nvgpu_gem_handle_held(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0))
+    if (nvgpu_gem_handle_held(dev, (u32)arg0, (u32)res0))
       return 0;
-    __nvgpu_gem_close(dev, (u32)le64_to_cpu(q.args[0]), (u32)res0, true,
-                      NULL, NULL);
+    __nvgpu_gem_close(dev, (u32)arg0, (u32)res0, true, NULL, NULL);
     return 1;
   default:
     return 0;
   }
+}
+
+/* HOST_OP: which results are handles the backend now holds for us. */
+static unsigned int nvgpu_reap_host_op(struct nvgpu_device *dev,
+                                       struct nvgpu_req *r, u32 used) {
+  const size_t base = sizeof(struct nvgpu_msg_hdr);
+  struct nvgpu_host_op_req q;
+  struct nvgpu_host_op_resp a;
+
+  if (!nvgpu_resp_has(used, base, sizeof(a)) ||
+      nvgpu_tbuf_read(r->resp, base, &a, sizeof(a)) ||
+      nvgpu_tbuf_read(r->req, base, &q, sizeof(q)) || !le32_to_cpu(a.nres))
+    return 0;
+  return nvgpu_host_op_drop(dev, le32_to_cpu(q.op), le64_to_cpu(q.args[0]),
+                            le64_to_cpu(a.res[0]));
+}
+
+/*
+ * A HOST_OP answered with a status that is not an errno: nothing of it is
+ * used (-EPROTO), but it ran as far as the backend says -- a positive status
+ * is not a refusal, which the reaper reads the same way -- so what it made
+ * is closed rather than left open until the session resets.
+ */
+static void nvgpu_host_op_unread(struct nvgpu_device *dev, u32 op,
+                                 const u64 *args, u32 nargs,
+                                 const struct nvgpu_msg_hdr *h,
+                                 const struct nvgpu_host_op_resp *a,
+                                 u32 used) {
+  if ((s32)le32_to_cpu(h->status) <= 0 || !nargs ||
+      !nvgpu_resp_has(used, 0, sizeof(*h) + sizeof(*a)) ||
+      !le32_to_cpu(a->nres))
+    return;
+  nvgpu_host_op_drop(dev, op, args[0], le64_to_cpu(a->res[0]));
 }
 
 /*
@@ -1586,6 +1614,8 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   if (ret)
     return ret;
   ret = nvgpu_hdr_status(&resp, used);
+  if (ret == -EPROTO)
+    nvgpu_host_op_unread(dev, op, args, nargs, &resp.hdr, &resp.body, used);
   if (ret < 0)
     return ret;
   if (!nvgpu_resp_has(used, 0, sizeof(resp)))
@@ -1637,6 +1667,10 @@ int nvgpu_host_op_tail(struct nvgpu_device *dev, u32 op, const u64 *args,
   if (ret)
     goto out;
   ret = nvgpu_hdr_status(resp, used);
+  if (ret == -EPROTO)
+    nvgpu_host_op_unread(dev, op, args, nargs, (const void *)resp,
+                         (const void *)(resp + sizeof(struct nvgpu_msg_hdr)),
+                         used);
   if (ret < 0)
     goto out;
   if (!nvgpu_resp_has(used, 0, fixed)) {

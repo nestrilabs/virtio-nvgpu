@@ -450,6 +450,7 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
 /* A v1 IOCTL reply's header, as far as the device wrote it. */
 struct nvgpu_ioctl_reply {
   s32 status; /* 0 or a -errno in [-MAX_ERRNO, -1]: the host call's result */
+  s32 raw;    /* the status as the backend sent it */
   u32 used;   /* bytes the device wrote */
   bool full;  /* the whole nvgpu_ioctl_resp is there; else the lengths are 0 */
   u32 data_len;
@@ -461,8 +462,10 @@ void nvgpu_ioctl_req_init(struct nvgpu_ioctl_req *req, u32 handle, u32 cmd,
                           u32 deep_off, u32 deep_len);
 /*
  * Read a reply of `used` bytes: 0 and *r, -EIO for less than a header, or
- * -EPROTO for a status that is neither 0 nor an errno (nothing of it is to be
- * read then).
+ * -EPROTO for a status that is neither 0 nor an errno. Nothing of an -EPROTO
+ * reply goes back to the caller; *r is filled all the same (r->raw, the
+ * lengths) for the one path that must still account for what the backend
+ * may have made: an OS-descriptor registration's pins.
  */
 int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
                             struct nvgpu_ioctl_reply *r);

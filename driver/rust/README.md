@@ -14,11 +14,12 @@ make -C driver KDIR=<a kernel's build tree> NVGPU_RUST=0       # the C
 ```
 
 Out of tree the Makefile takes the Rust when the target kernel has
-`CONFIG_RUST=y` and the C (`nvgpu_i2.c`, `nvgpu_rmio.c`, `nvgpu_atomic.c`)
-otherwise; in a kernel tree `CONFIG_VIRTIO_GPU_NV_RUST` (Kconfig, depends on
+`CONFIG_RUST=y` and the `rustc` at hand is the one it was built with
+(`CONFIG_RUSTC_VERSION_TEXT`), and the C (`nvgpu_i2.c`, `nvgpu_rmio.c`,
+`nvgpu_atomic.c`) otherwise, with a warning when the kernel has Rust; in a kernel tree `CONFIG_VIRTIO_GPU_NV_RUST` (Kconfig, depends on
 `CONFIG_RUST`, `default y`) decides. `NVGPU_RUST=1` insists on the Rust (a
-build error against a kernel without `CONFIG_RUST`, and a plain one when no
-`rustc` is on `PATH`), `NVGPU_RUST=0` on the C, which the module then says at
+build error against a kernel without `CONFIG_RUST`, and a plain one when the
+`rustc` at hand is not the kernel's), `NVGPU_RUST=0` on the C, which the module then says at
 load on a kernel with Rust. The module records which it has (`modinfo -F
 parsers`). The Makefile refuses to link a `nvgpu_rs.o` that names a panic
 symbol. `scripts/build-guest-kernel.sh` builds a `CONFIG_RUST=y` kernel and

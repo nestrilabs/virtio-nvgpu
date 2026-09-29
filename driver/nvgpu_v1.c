@@ -47,16 +47,19 @@ int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
   if (!nvgpu_resp_has(used, 0, sizeof(h->hdr)))
     return -EIO;
   status = (s32)le32_to_cpu(h->hdr.status);
-  if (status > 0 || status < -MAX_ERRNO)
-    return -EPROTO;
   r->used = used;
-  r->status = status;
+  r->raw = status;
   if (nvgpu_resp_has(used, 0, sizeof(*h))) {
     r->full = true;
     r->data_len = le32_to_cpu(h->data_len);
     r->nested_len = le32_to_cpu(h->nested_len);
     r->deep_len = le32_to_cpu(h->deep_len);
   }
+  if (status > 0 || status < -MAX_ERRNO) {
+    r->status = -EPROTO;
+    return -EPROTO;
+  }
+  r->status = status;
   return 0;
 }
 

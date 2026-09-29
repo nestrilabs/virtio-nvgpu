@@ -1787,12 +1787,20 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   }
   if (ret < 0)
     goto unpin;
+  /*
+   * Whether RM may hold the pages is the backend's raw status's to say, as
+   * the reaper of a late reply reads it (nvgpu_reap_osdesc(): any status
+   * >= 0 names the registration): one that is not an errno fails the call
+   * with -EPROTO and nothing goes back, but its pins are kept under the id it
+   * names -- unpinned, pages RM still has could be reused under it.
+   */
   ret = nvgpu_ioctl_reply_parse(resp, used, &r);
-  if (ret < 0)
+  if (ret == -EIO)
     goto unpin;
-  ret = r.status;
-  if (ret < 0)
-    goto unpin; /* refused before RM saw it */
+  if (r.raw < 0) {
+    ret = r.status; /* refused before RM saw it: -errno, or -EPROTO */
+    goto unpin;
+  }
 
   data_len = r.data_len;
   nested_len = data_len ? r.nested_len : 0;
@@ -1806,6 +1814,8 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   else
     nvgpu_osdesc_unpin(pages, npages, c->write);
   pages = NULL;
+  if (ret)
+    goto out; /* -EPROTO: a positive status */
 
   /* The caller's block back, its own address in it, and RM's status. */
   if (data_len != c->outer_len || nested_len != c->nested_len ||

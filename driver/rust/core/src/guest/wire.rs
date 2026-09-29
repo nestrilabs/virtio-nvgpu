@@ -223,14 +223,23 @@ impl IoctlResp {
     /// for a status that is neither 0 nor an errno in `[-MAX_ERRNO, -1]`,
     /// which no native call returns (nothing of such a reply is read).
     pub fn parse(resp: &[u8], used: u32) -> Result<IoctlResp, Errno> {
+        let h = Self::parse_raw(resp, used)?;
+        if !(-MAX_ERRNO..=0).contains(&h.status) {
+            return Err(-EPROTO);
+        }
+        Ok(h)
+    }
+
+    /// [`parse`](Self::parse) with the status as the backend sent it (the
+    /// C's `r->raw`): for the one path that must account for what a reply
+    /// with a status that is not an errno may still have made, an
+    /// OS-descriptor registration's pins. -EIO for less than a header.
+    pub fn parse_raw(resp: &[u8], used: u32) -> Result<IoctlResp, Errno> {
         let used = usize::try_from(used).map_err(|_| -EIO)?;
         if !has(used, 0, HDR_LEN) {
             return Err(-EIO);
         }
         let status = le32(resp, 8).ok_or(-EIO)? as i32;
-        if !(-MAX_ERRNO..=0).contains(&status) {
-            return Err(-EPROTO);
-        }
         if !has(used, 0, IOCTL_RESP_LEN) {
             return Ok(IoctlResp {
                 status,

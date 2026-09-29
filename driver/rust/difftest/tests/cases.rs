@@ -443,6 +443,30 @@ fn memory_the_caller_has_is_registered_by_its_pages() {
     assert_eq!(pages, 4);
     assert_eq!(le32(mem(&o, ARG), 0), 0x55);
 
+    // A status that is not an errno: -EPROTO and nothing back, but the pins
+    // are kept under the id the reply names, as the late-reply reaper reads
+    // it -- RM may hold the pages. One below -MAX_ERRNO is a refusal.
+    for (bad, kept) in [(5i32, true), (i32::MAX, true), (-4096, false)] {
+        let mut w = world();
+        let call = alloc_memory(va, 0x2fff, &mut w);
+        let arg = w.mem[&ARG].clone();
+        let mut back = arg.clone();
+        put(&mut back, 0, 0x55, 4);
+        w.canned = vec![reply(bad, &back, &[], &77u64.to_le_bytes())];
+        let o = run(d.clone(), w, call);
+        assert_eq!(o.ret, -71, "status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..], "status {bad}");
+        let last = o.world.events.last().cloned();
+        if kept {
+            assert!(
+                matches!(last, Some(Ev::Keep { id: 77, n: 4, .. })),
+                "{last:?}"
+            );
+        } else {
+            assert!(matches!(last, Some(Ev::Unpin { n: 4, .. })), "{last:?}");
+        }
+    }
+
     // Pages that would not pin: RM's own answer, in a call that succeeded.
     let mut w = world();
     w.pin_fails = true;

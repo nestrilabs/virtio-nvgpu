@@ -28,16 +28,29 @@ virtio_gpu_nv-y := nvgpu_main.o nvgpu_schema.o nvgpu_drm.o nvgpu_hostfile.o \
 # Chosen, unless NVGPU_RUST says (on the command line or in the environment):
 #   in a kernel tree   by Kconfig, CONFIG_VIRTIO_GPU_NV_RUST (default y
 #                      when CONFIG_RUST=y);
-#   out of tree        by the target kernel: the Rust if it has CONFIG_RUST=y,
-#                      else the C.
-# NVGPU_RUST=1 insists on the Rust (an error without CONFIG_RUST), and
-# NVGPU_RUST=0 on the C, which the module then says at load on a kernel that
-# has Rust. Both export the same functions (nvgpu.h), so nothing else
-# changes, and `modinfo -F parsers` says which a module has.
+#   out of tree        by the target kernel: the Rust if it has CONFIG_RUST=y
+#                      and the rustc at hand is the one it was built with
+#                      (CONFIG_RUSTC_VERSION_TEXT -- a Rust object links only
+#                      against its own compiler's kernel crates), else the C,
+#                      with a warning saying why when the kernel has Rust.
+# NVGPU_RUST=1 insists on the Rust (an error without CONFIG_RUST, or without
+# the kernel's rustc), and NVGPU_RUST=0 on the C, which the module then says
+# at load on a kernel that has Rust. Both export the same functions
+# (nvgpu.h), so nothing else changes, and `modinfo -F parsers` says which a
+# module has.
+# (The kernel's own RUSTC_VERSION_TEXT is exported only to config targets.)
+NVGPU_RUSTC_TEXT := $(if $(filter y,$(CONFIG_RUST)),$(subst $(pound),,$(shell $(RUSTC) --version 2>/dev/null)))
+NVGPU_RUSTC_OK := $(and $(NVGPU_RUSTC_TEXT),$(if $(subst $(CONFIG_RUSTC_VERSION_TEXT),,$(NVGPU_RUSTC_TEXT)),,1))
 ifeq ($(origin NVGPU_RUST),undefined)
 ifneq ($(KBUILD_EXTMOD),)
-NVGPU_RUST := $(if $(filter y,$(CONFIG_RUST)),1,0)
-NVGPU_RUST_AUTO := 1
+ifneq ($(NVGPU_RUSTC_OK),)
+NVGPU_RUST := 1
+else
+NVGPU_RUST := 0
+ifeq ($(CONFIG_RUST),y)
+$(warning this kernel has Rust, but the rustc at hand ('$(NVGPU_RUSTC_TEXT)') is not the one it was built with ('$(CONFIG_RUSTC_VERSION_TEXT)'): building the C parsers. Build in the kernel's Rust toolchain (scripts/guest-toolchain-rust) for the Rust ones, the default)
+endif
+endif
 else
 NVGPU_RUST := $(if $(filter y,$(CONFIG_VIRTIO_GPU_NV_RUST)),1,0)
 endif
@@ -47,15 +60,10 @@ ifeq ($(NVGPU_RUST),1)
 ifneq ($(CONFIG_RUST),y)
 $(error NVGPU_RUST=1 needs a kernel built with CONFIG_RUST=y)
 endif
-# The kernel's own Rust toolchain has to be at hand: a kernel with Rust makes
-# the Rust parsers the default, and a builder without rustc gets this rather
-# than the kernel's errors.
-ifeq ($(shell command -v $(RUSTC) 2>/dev/null),)
-ifeq ($(NVGPU_RUST_AUTO),1)
-$(error the Rust parsers are the default on this kernel (CONFIG_RUST=y), and there is no $(RUSTC) on PATH: build in the kernel's Rust toolchain (scripts/guest-toolchain-rust), or pass NVGPU_RUST=0 for the C parsers)
-else
-$(error NVGPU_RUST=1, and there is no $(RUSTC) on PATH: build in the kernel's Rust toolchain (scripts/guest-toolchain-rust))
-endif
+# A different rustc fails in the kernel's own Makefiles, on crates it cannot
+# read (E0514); said here instead.
+ifeq ($(NVGPU_RUSTC_OK),)
+$(error NVGPU_RUST=1, and the rustc at hand ('$(NVGPU_RUSTC_TEXT)') is not the one this kernel was built with ('$(CONFIG_RUSTC_VERSION_TEXT)'): build in the kernel's Rust toolchain (scripts/guest-toolchain-rust))
 endif
 virtio_gpu_nv-y += nvgpu_rs.o nvgpu_rs_glue.o
 ccflags-y += -DNVGPU_RUST
