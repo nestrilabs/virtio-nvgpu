@@ -157,7 +157,8 @@ pub fn printable(s: &str, max: usize) -> String {
 }
 
 impl Fatal {
-    fn new(blame: Blame, object: u32, code: u32, message: impl Into<String>) -> Self {
+    /// `message` is made printable here, whoever made it.
+    pub fn new(blame: Blame, object: u32, code: u32, message: impl Into<String>) -> Self {
         Self {
             object,
             code,
@@ -511,6 +512,20 @@ impl Engine {
         self.out_bytes = 0;
         self.wl_bytes.clear();
         self.wl_descs.clear();
+    }
+
+    /// End the connection with `f`: nothing more goes to the channel, a
+    /// local client is told why with `wl_display.error` -- queued after
+    /// what it already has, so it lands after the last whole message and
+    /// never inside one that was partly written -- and the ERROR record for
+    /// the far side is returned, for the caller to send if the far side is
+    /// to know. What the local peer is owed still has to be flushed.
+    pub fn end_with(&mut self, f: &Fatal) -> Unit {
+        self.drop_channel_output();
+        if self.cfg.local == Local::Client {
+            self.out_local.push(&f.display_error(), Vec::new());
+        }
+        f.record()
     }
 
     /// The far side has gone (HANGUP received).

@@ -640,16 +640,16 @@ impl WlConn {
                 fail(
                     s,
                     &mut st,
-                    Fatal {
-                        object: 1,
-                        code: wlwire::engine::ERR_IMPLEMENTATION,
-                        message: format!(
+                    Fatal::new(
+                        Blame::Channel,
+                        1,
+                        wlwire::engine::ERR_IMPLEMENTATION,
+                        format!(
                             "{submits} lease submits in one frame, more than the {} the VM may \
                              make at once",
                             s.cfg.limits.lease.burst
                         ),
-                        blame: Blame::Channel,
-                    },
+                    ),
                 );
                 return Err(libc::EPROTO);
             }
@@ -841,14 +841,13 @@ fn fail(s: &Shared, st: &mut State, f: Fatal) {
         }
         Blame::Local => log::warn!("wayland: compositor protocol error, closing: {text:?}"),
     }
-    st.engine.drop_channel_output();
+    // Export mode: the host client is the one to tell, as libwayland would
+    // have, after whatever it already has (Engine::end_with).
+    let record = st.engine.end_with(&f);
     if st.engine.local_is_client() {
-        // Export mode: the host client is the one to tell, as libwayland
-        // would have.
-        st.engine.local_out().push(&f.display_error(), Vec::new());
         let _ = st.engine.local_out().flush(s.sock.as_raw_fd());
     }
-    push_final(s, st, f.record());
+    push_final(s, st, record);
     hangup(s, st, libc::EPROTO);
 }
 
@@ -999,15 +998,15 @@ fn reader(s: Arc<Shared>) {
                     fail(
                         &s,
                         &mut st,
-                        Fatal {
-                            object: 1,
-                            code: wlwire::engine::ERR_NO_MEMORY,
-                            message: format!(
+                        Fatal::new(
+                            Blame::Local,
+                            1,
+                            wlwire::engine::ERR_NO_MEMORY,
+                            format!(
                                 "more than {} file descriptors that no message takes",
                                 wlwire::wire::MAX_FDS_QUEUED
                             ),
-                            blame: Blame::Local,
-                        },
+                        ),
                     );
                     break;
                 }

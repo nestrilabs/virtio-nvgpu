@@ -660,12 +660,12 @@ impl Daemon {
                             Level::Warn,
                             format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"),
                         );
-                        let err = Fatal {
-                            object: 1,
-                            code: wlwire::engine::ERR_IMPLEMENTATION,
-                            message: format!("virtio-nvgpu: no host channel: {e}"),
-                            blame: Blame::Remote,
-                        };
+                        let err = Fatal::new(
+                            Blame::Remote,
+                            1,
+                            wlwire::engine::ERR_IMPLEMENTATION,
+                            format!("virtio-nvgpu: no host channel: {e}"),
+                        );
                         let _ = sys::send_with_fds(s.as_raw_fd(), &err.display_error(), &[]);
                     }
                 },
@@ -717,21 +717,20 @@ impl Daemon {
                 f.blame
             ),
         );
-        match (c.engine.local_is_client(), f.blame) {
-            // Our client gets the error it earned, or the host's verdict.
-            (true, _) => {
-                let _ = c.engine.local_out().flush(c.sock.as_raw_fd());
-                let _ = sys::send_with_fds(c.sock.as_raw_fd(), &f.display_error(), &[]);
-            }
-            // The guest compositor broke the protocol: tell the host client.
-            (false, Blame::Local) => {
-                let mut q = VecDeque::from([f.record()]);
-                let (mut fr, fds) =
-                    frame::pack(&mut q, self.info.max_frame, frame::MAX_DESC, false);
-                let _ = c.chan.send(&mut fr, &fds);
-            }
-            (false, _) => {}
+        // Our client gets the error it earned, or the host's verdict, after
+        // what it already has (Engine::end_with): written straight to the
+        // socket after a flush that stopped inside an event, it would land
+        // in the middle of that event (the 2026-09-29 review, S8). What
+        // the socket does not take now goes when the slot closes (sync).
+        let record = c.engine.end_with(&f);
+        let _ = c.engine.local_out().flush(c.sock.as_raw_fd());
+        // The guest compositor broke the protocol: tell the host client.
+        if !c.engine.local_is_client() && f.blame == Blame::Local {
+            let mut q = VecDeque::from([record]);
+            let (mut fr, fds) = frame::pack(&mut q, self.info.max_frame, frame::MAX_DESC, false);
+            let _ = c.chan.send(&mut fr, &fds);
         }
+        c.tx.clear();
         c.closing = true;
     }
 
@@ -754,15 +753,15 @@ impl Daemon {
                     if c.infds.len() > wlwire::wire::MAX_FDS_QUEUED {
                         // As libwayland does with a client that overflows
                         // its descriptor ring.
-                        let f = Fatal {
-                            object: 1,
-                            code: wlwire::engine::ERR_NO_MEMORY,
-                            message: format!(
+                        let f = Fatal::new(
+                            Blame::Local,
+                            1,
+                            wlwire::engine::ERR_NO_MEMORY,
+                            format!(
                                 "more than {} file descriptors sent that no request takes",
                                 wlwire::wire::MAX_FDS_QUEUED
                             ),
-                            blame: Blame::Local,
-                        };
+                        );
                         self.fatal(slot, f);
                         break;
                     }
@@ -881,7 +880,9 @@ impl Daemon {
             };
             // A client that is not reading gets nothing more from the host
             // until it does (LOCAL_OUT_MAX); sync stops watching the channel.
-            if c.engine.local_out_len() >= LOCAL_OUT_MAX {
+            // One being closed gets nothing more at all: whatever it was
+            // told last (a wl_display.error) stays the last thing it reads.
+            if c.closing || c.engine.local_out_len() >= LOCAL_OUT_MAX {
                 return;
             }
             let r = match c.chan.recv(max, card, render) {
@@ -1690,6 +1691,115 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("tfd:"))
             .count()
+    }
+
+    /// Whole messages of `got` as the client's libwayland would parse them,
+    /// each a registry global or `wl_display.error`; the stream may end
+    /// inside the last one, when the daemon closed a client whose socket
+    /// was full. The number of errors.
+    fn globals_then_an_error(got: &[u8]) -> usize {
+        let mut p = got;
+        let mut errors = 0;
+        while let Some(h) = wlwire::wire::peek_header(p) {
+            if (h.size as usize) > p.len() {
+                break;
+            }
+            let (m, rest) = p.split_at(h.size as usize);
+            p = rest;
+            let ifc = match (h.object, h.opcode) {
+                (2, op::wl_registry::EVT_GLOBAL) => wlwire::proto::WL_REGISTRY,
+                (1, op::wl_display::EVT_ERROR) => wlwire::proto::WL_DISPLAY,
+                _ => panic!(
+                    "a message on {}/{}: the stream is corrupt",
+                    h.object, h.opcode
+                ),
+            };
+            assert_eq!(errors, 0, "a message after the error");
+            let desc =
+                &wlwire::proto::iface(ifc).messages(wlwire::proto::Dir::Event)[h.opcode as usize];
+            let args = wlwire::wire::parse(desc, m).expect("a whole message that parses");
+            if ifc == wlwire::proto::WL_DISPLAY {
+                errors += 1;
+                assert_eq!(args[1].val, wlwire::wire::Val::Uint(0), "invalid_object");
+            } else {
+                // What `scripted` offered, and the flood.
+                let name = args[1].val;
+                assert!(
+                    [&b"wl_compositor"[..], b"wl_shm"]
+                        .iter()
+                        .any(|n| name == wlwire::wire::Val::Str(Some(n))),
+                    "the stream is corrupt: {name:?}"
+                );
+            }
+        }
+        errors
+    }
+
+    /// A client that breaks the protocol while the daemon is part-way
+    /// through writing it an event gets the error after the last whole
+    /// event, never in the middle of one. Before, the error was written
+    /// straight to the socket after a flush that could stop inside an
+    /// event, and a client reading at the same time -- which frees the
+    /// room the error then fits in -- read it as that event's arguments
+    /// (the 2026-09-29 review, S8). The race is between two system calls
+    /// of the daemon, so it is tried a number of times.
+    #[test]
+    fn a_fatal_error_never_lands_in_the_middle_of_an_event() {
+        use std::io::{Read, Write};
+        let global = |n: u32| {
+            MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+                .uint(n)
+                .string(Some("wl_compositor"))
+                .uint(4)
+                .finish()
+        };
+        // About 400 KiB of events: more than the socket holds.
+        let flood = || -> Vec<Unit> {
+            (0..25)
+                .map(|r| Unit {
+                    rec: frame::record(
+                        frame::REC_WAYLAND,
+                        0,
+                        0,
+                        &(0..512)
+                            .map(|i| global(100 + r * 512 + i))
+                            .collect::<Vec<_>>()
+                            .concat(),
+                    ),
+                    descs: Vec::new(),
+                })
+                .collect()
+        };
+        let mut delivered = 0;
+        for round in 0..40 {
+            let (mut d, script, client) = scripted(&format!("midmsg{round}"));
+            let mut reader = client.try_clone().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let t = std::thread::spawn(move || {
+                let mut got = Vec::new();
+                let _ = reader.read_to_end(&mut got);
+                got
+            });
+            script.push(flood());
+            for _ in 0..round % 3 {
+                d.turn(0).unwrap();
+            }
+            (&client)
+                .write_all(&MsgBuilder::new(99, 0).finish())
+                .unwrap();
+            for _ in 0..100 {
+                d.turn(5).unwrap();
+                if d.clients.iter().all(|c| c.is_none()) {
+                    break;
+                }
+            }
+            assert!(d.clients.iter().all(|c| c.is_none()));
+            drop(client);
+            delivered += globals_then_an_error(&t.join().unwrap());
+        }
+        assert!(delivered > 0, "the error reached some of the clients");
     }
 
     /// Descriptors sent beside messages that take none are not held for
