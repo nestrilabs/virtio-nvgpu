@@ -119,6 +119,22 @@ impl Drop for CDevice {
     }
 }
 
+/// The schema set the C device for `d` selects.
+pub fn tables_for(d: &DevSpec) -> SchemaSet<'static> {
+    let cd = CDevice::new(d);
+    renv::tables(&cd.rdev(d))
+}
+
+/// The native command both implementations normalise a DRM-node caller's
+/// `cmd` to (`nvgpu_i2_native_cmd()`, `i2::native_cmd()`) on device `d`:
+/// (C, Rust).
+pub fn native_cmd(d: &DevSpec, sclass: u32, cmd: u32) -> (u32, u32) {
+    let cd = CDevice::new(d);
+    let set = renv::tables(&cd.rdev(d));
+    let c = unsafe { cabi::nvgpu_i2_native_cmd(cd.dev, sclass, cmd) };
+    (c, i2::native_cmd(&set, sclass, cmd))
+}
+
 /// Run the scenario through the Rust core.
 pub fn run_rust(s: &Scenario) -> Outcome {
     let cd = CDevice::new(&s.dev);
@@ -868,6 +884,19 @@ pub fn gen_i2_from(mut r: Rng, seed: u64) -> Scenario {
     if r.chance(1, 20) {
         // A size or direction the schema does not have.
         cmd ^= r.pick(&[1u32 << 16, 1 << 30, 1 << 31]);
+    }
+    if r.chance(1, 20) {
+        // A caller's struct from older or newer headers: shorter or longer
+        // than the schema's. The DRM node normalises it before the
+        // interpreter (nvgpu_drm_arg_in()); the interpreter itself still
+        // takes the native size only.
+        let size = (cmd >> 16) & 0x3fff;
+        let other = if r.chance(1, 2) {
+            size.saturating_sub(8)
+        } else {
+            (size + 8).min(0x3fff)
+        };
+        cmd = (cmd & !(0x3fff << 16)) | (other << 16);
     }
     if r.chance(1, 40) {
         sclass = r.pick(&[1u32, 2, 3]);

@@ -109,6 +109,7 @@ extern "C" {
         prefix: *const c_void,
         len: usize,
     ) -> bool;
+    pub fn nvgpu_i2_native_cmd(dev: *mut CDev, sclass: u32, cmd: c_uint) -> c_uint;
     fn nvgpu_i2_buf(call: *mut c_void, buf: u32, len: *mut u32) -> *mut u8;
     fn nvgpu_i2_add_dyn(call: *mut c_void, kind: u32, buf: u32, off: u32, len: u32) -> c_int;
     fn nvgpu_i2_add_fd(call: *mut c_void, buf: u32, off: u32, handle: u32, flags: u32) -> c_int;

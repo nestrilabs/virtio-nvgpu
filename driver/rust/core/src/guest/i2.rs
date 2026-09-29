@@ -1677,6 +1677,35 @@ mod tests {
     }
 
     #[test]
+    fn a_callers_size_or_direction_finds_the_native_command() {
+        let (ioctls, fields) = table();
+        let set = SchemaSet {
+            drm: Table {
+                ioctls: &ioctls,
+                fields: &fields,
+                planes: &[],
+            },
+            modeset: None,
+        };
+        // Shorter, longer, another direction: the entry's own command, which
+        // is what the DRM node normalises the argument to.
+        for cmd in [
+            iowr(0xa0, 32),
+            iowr(0xa0, 24),
+            iowr(0xa0, 40),
+            iowr(0xa0, 0),
+            iowr(0xa0, 32) & !(1 << 31),
+        ] {
+            assert_eq!(native_cmd(&set, SCLASS_KMS, cmd), iowr(0xa0, 32), "{cmd:#x}");
+        }
+        // Another number, class or type; NVKMS never.
+        assert_eq!(native_cmd(&set, SCLASS_KMS, iowr(0xa1, 32)), 0);
+        assert_eq!(native_cmd(&set, SCLASS_RENDER, iowr(0xa0, 32)), 0);
+        assert_eq!(native_cmd(&set, SCLASS_KMS, iowr(0xa0, 32) ^ (1 << 8)), 0);
+        assert_eq!(native_cmd(&set, SCLASS_MODESET, NVKMS_IOCTL_IOWR), 0);
+    }
+
+    #[test]
     fn a_null_pointer_or_an_empty_list_gets_no_buffer() {
         for (p, n) in [(0u64, 4u32), (LIST, 0)] {
             let (_, _, env) = run_with(arg(p, n, -1, 0), good);
