@@ -250,6 +250,25 @@ And anything that fails to give space back fails *later*, in whatever mapping
 happens to be next, which is why the accounting is explicit rather than
 implicit.
 
+The window's size is the backend's to choose (`--window-size`, 1 GiB by
+default) and the VMM's to follow: the backend answers GET_SHMEM_CONFIG from
+the same zone configuration its allocator was made with, and both VMMs size
+the region from that answer. It has three zones, one per memory type --
+uncached for registers, write-combining for video memory, write-back for
+system memory -- and each guest process may hold only a share of each
+(`--window-owner-share`, half by default), so one process cannot starve the
+others of mappings (DEPLOY.md, "Sizing the window").
+
+An RM mapping is known to the guest by two addresses in turn. RM_MAP_MEMORY
+returns a cookie -- here the window offset, never the host's address -- and
+the library, once it has mapped the file, tells RM where with
+UPDATE_DEVICE_MAPPING_INFO and names the mapping by that virtual address from
+then on, unmap included. The backend records each mapping's latest address
+and finds it by the RM object, the process and the address together; the
+host is handed only its own address throughout. A map is one transaction:
+the window extent is reserved before RM is asked, and a mapping that cannot
+be placed is undone on the host.
+
 Memory the guest already has travels the other way, and **cannot be handed
 to the GPU by address.** RM registers existing memory by CPU address — an
 NV01_MEMORY_SYSTEM_OS_DESCRIPTOR object (through RM_ALLOC or ALLOC_MEMORY)
@@ -1151,8 +1170,9 @@ injection"; the rig's `nvgpu-inject-test` and `nvgpu-capture-import`
 - **Display modes that have not been shown.** The compositor VM and export
   mode are built and tested without a GPU; they have not driven a monitor.
 - **A window that must be sized in advance.** It is fixed when the VM is
-  created, and a workload that needs more mapped memory than was provisioned
-  will fail to map it.
+  created (`--window-size`), and a workload that needs more mapped memory
+  than was provisioned will fail to map it; the backend logs each zone's
+  peak when the VM stops, to size it by.
 - **One address space for every UVM pool of a VM.** Each pool the guest maps
   sits at its own address in the VMM (§5), so two guest processes whose pools
   overlap cannot both be mapped: the second CUDA context fails with ENOMEM

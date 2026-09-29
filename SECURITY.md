@@ -9,7 +9,8 @@ audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
 the fuzzing of branch `fuzz` (§13), the memory-safety structure of
 branch `dind` (§14), the review of `dind` for memory passing (§15), and the
 VMMs it runs under, nesbox and crosvm (§16); by the review of 2026-09-26
-(§17); and by capture injection (§18). It is written for the project's owner. The
+(§17); by capture injection (§18); and by the window's size and share, with the
+RM mapping fixes that came with them (§19). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -509,7 +510,7 @@ removed, since nothing can say whether RM took it.
 | RM counters | one map entry per distinct guest value, unbounded | counted only when RM said NV_OK, at most 4,096 keys (`device/src/tally.rs`) |
 | logs | unbounded; the launcher wrote them to an unrotated file | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
 | display caps | -- | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
-| window | the zones, first come first served | each zone (UC 32 MiB, WC 768 MiB, WB 224 MiB) at most half per guest process, the last eighth kept for processes holding at most a sixteenth; a mapping is charged to whoever opened the file it is armed on |
+| window | the zones, first come first served | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth (§19); a mapping is charged to whoever opened the file it is armed on |
 | Wayland caps | -- | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools, shared by all its connections. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
 | not capped | -- | Memory outside the Wayland and window budgets has no limit of the backend's own; the shipped unit (`contrib/systemd/vhost-user-nvgpu@.service`, DEPLOY.md) puts each backend in a cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and `OOMScoreAdjust=500`, the rig's launcher does not. Several VMs of one backend user share that user's host limits. |
 
@@ -2449,3 +2450,138 @@ reply its caller abandoned leaves its GEM or syncobj handle in the caller's
 file until it closes; a real portal stream was not injected by the project
 (the tests may not open the host's picker): `rig/rig-tools/portal-identify.sh`
 checks one, for the owner to run.
+
+---
+
+## 19. The window's size and share
+
+Branch `window-config2`. Two defects in how RM mappings were tracked, which
+made a game's process run out of its share of the window with the window
+not full, and two flags for VMs that need more window than the default:
+`--window-size` and `--window-owner-share`. Reported from a deployment (Prism
+Launcher / Minecraft on an RTX 5090: about 950 refusals of the form `SHM
+WriteCombine zone: guest process ... holds 0x17f82000 of 0x30000000 bytes
+and may not take 0x200000 more (Owner)`, then Xid 69).
+
+### The two defects
+
+**UPDATE_DEVICE_MAPPING_INFO was not followed.** The NVIDIA library maps
+a file an RM_MAP_MEMORY armed and then tells RM where
+(`RmUpdateDeviceMappingInfo`, osapi.c: RM moves its record of the mapping
+from `pOld` to `pNew`); from then on it names the mapping by that virtual
+address, in a later UPDATE and in RM_UNMAP_MEMORY. The backend translated
+`pOld` by `(client, memory)` alone -- which of two mappings of one object
+it moved was whichever it found first -- and never recorded `pNew`, so
+the unmap, which it looked up by the window offset alone, missed (`UNMAP_MEMORY:
+no mapping for pLinearAddress=0x7f...`), and the extent stayed charged to
+the process until the file it was armed on closed. The rig's own logs had
+6,448 such misses in 225 of 306 runs, every one a guest virtual address;
+there, they were at application exit and the files closed right after. A
+client that keeps the files (`rig/guest-image/tools/nvgpu-map-churn.c`
+does, mapping 2 MiB of video memory and unmapping it by address in a loop)
+was refused after exactly 192 iterations with the report's own line, its
+share (0x18000000 of 0x30000000) full of mappings it had unmapped.
+
+Now (`mmap.rs` `MmapContext::find`): an entry records the process that
+made it (the owner of the file the map ran on) and the address its last
+accepted UPDATE gave it. UPDATE and UNMAP find a mapping by `(client,
+memory, process, address)`, the address matched against the recorded
+virtual address first and the window offset second -- never by an address
+alone, and never another process's: RM itself answers both only for the
+calling process's mappings (`serverutilMappingFilterCurrentUserProc`), and
+every call reaches it from the backend's one process, so the filter is
+kept here. An UPDATE whose `pOld` names none of the caller's mappings of
+the object moves its only one, as before, and with two it guesses nothing
+(RM is handed 0 and says so). A later UPDATE to the same address takes it
+from a stale entry. RM is still handed only the backend's own address, as
+both `pOld` and `pNew`; a guest address never reaches it. The same
+churn, 400 iterations, finished with the zone's peak at one mapping (2
+MiB).
+
+**RM_MAP_MEMORY was not transactional.** The extent was allocated after
+RM had mapped, and a refused extent returned ENOMEM with the host mapping
+made and recorded nowhere until the memory was freed. Now the extent is
+reserved first, in the zone the mapping will most likely need (rmmem's
+records; video memory is WC), so a refusal leaves the host with nothing
+mapped. RM's answer decides the type: another type moves the reservation,
+and if it does not fit there, or the VMM will not place it, or there is no
+window, the host's mapping is undone with RM_UNMAP_MEMORY at the host's
+address. The file stays spent (a host file carries one mapping in its life)
+until the guest closes it.
+
+Neither defect gave one process reach into another's memory: the lookups
+were keyed by the caller's own client, and RM refused a call about another
+client's objects. Both were availability, within one VM.
+
+### The flags
+
+`--window-size <MiB>` (default 1024) and `--window-owner-share <percent>`
+(default 50) make the one `ZoneConfig` that sizes the allocator and answers
+the VMM's GET_SHMEM_CONFIG, so the guest-visible region and the allocator
+cannot disagree. Refused at start, with the reason: not a multiple of 64
+MiB, under 256 MiB, a share outside 1-95 %, or the window with the UVM
+aperture (with `--allow-compute`) past crosvm's 64 GiB shared-region cap.
+nesbox (branch `virtio-nvgpu-v4`) asks the backend for the size and refuses
+one past 32 GiB, what fits its 64-bit MMIO window beside the aperture;
+before v4 it published 1 GiB whatever the backend said, and the rig's
+launcher refuses that pairing. crosvm sized its BAR from the backend
+already (the next power of two; 16 GiB plus the aperture is a 32 GiB BAR).
+The guest takes the size from the shared-memory capability.
+
+The zones: UC stays at 32 MiB, and WC and WB split the rest 24:7, as in the
+default (DEPLOY.md, "Sizing the window", has the measurements behind it).
+At 1024 MiB this is exactly the default's UC 32, WC 768, WB 224 MiB.
+
+### What a larger share gives up
+
+A share is `Share::percent(size, p)` (quota.rs): an owner may hold `p` %
+of a zone, and the last eighth is kept for owners holding at most a
+sixteenth -- exactly `Share::half` at 50. Past 87.5 % the reserve shrinks
+to what is left beside a whole share, and the floor with it, so the share
+asked for can be had.
+
+| window, share | WC zone | one process | reserve | each other process, in the reserve | processes to fill it to the reserve |
+|---|---|---|---|---|---|
+| 1 GiB, 50 % | 768 MiB | 384 MiB | 96 MiB | 48 MiB | 2 |
+| 4 GiB, 75 % | 3148 MiB | 2361 MiB | 394 MiB | 197 MiB | 2 |
+| 16 GiB, 90 % | 12660 MiB | 11394 MiB | 1266 MiB | 791 MiB | 1 |
+
+From 88 %, one process can take a zone down to its reserve, and every
+other process of the VM keeps only the reserve, each at most the floor of
+it -- still more, at 16 GiB, than a whole default share. This is
+availability within one guest only: each VM has its own backend, window
+and zones, and nothing one VM's processes hold is charged to another VM.
+It is the operator's choice for a VM that runs one heavy application.
+
+### What a larger window costs the host
+
+- **BAR1.** Video memory a guest CPU-maps is mapped through the GPU's BAR1,
+  which the host's desktop and every other VM share; the window bounds how
+  much one VM can hold at once (its WC zone: 12.4 GiB at 16 GiB). The window
+  is the per-VM cap; there is no host-wide one, as natively there is none
+  per process, and a cross-VM budget would be a channel between VMs'
+  backends, which this design has none of. The backend warns at start when
+  the WC zone is more than half of a GPU's BAR1 (read from sysfs). The RTX
+  5090's BAR1 is 32 GiB with resizable BAR; without it 256 MiB, and even
+  the default window then warns. Video memory itself was never bounded by
+  the window, only how much of it is mapped at once.
+- **Host memory.** The backend's copy of the window is a sparse memfd its
+  own pages never fill (`MemoryMax=2G` is unaffected). nesbox reserves the
+  guest-visible window `PROT_NONE`, so it costs nothing until a placement.
+  crosvm's is shared anonymous memory: pages of it a guest touches with
+  nothing placed there are faulted in and charged to the VMM's cgroup, up to
+  the window's size -- as guest RAM is -- so its memory limit must cover
+  guest RAM plus the window (DEPLOY.md). Only a guest kernel touches such
+  pages; no guest driver path does.
+
+### Tests and hardware
+
+Unit tests against a fake RM that tracks its mappings and finds them by
+object and address: map, UPDATE, unmap by the virtual address returns the
+zone and the process's share exactly; two mappings of one object; another
+process's address and window offset name nothing; a refused extent makes
+no host mapping and no charge; a retyped mapping moves zone or is undone;
+a refused placement undoes both. `Share::percent` against `half` at 50,
+and its reserve; every window size from 256 MiB to 64 GiB in whole 2 MiB
+zones; the flags' refusals; GET_SHMEM_CONFIG from the flags; nesbox's
+window from the backend's size.

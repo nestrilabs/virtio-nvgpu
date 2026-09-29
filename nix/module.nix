@@ -18,7 +18,11 @@
 # is contrib/systemd/vhost-user-nvgpu@.service, said in Nix; keep the two in
 # step. Nothing here starts a VMM: give its unit
 #   requires = [ "vhost-user-nvgpu@N.service" ]; after = [ same ];
-# and User = "nvgpu-vmmN".
+# and User = "nvgpu-vmmN". For a compute VM (--allow-compute), that unit also
+# needs the mincore syscall (not in @system-service) and, under a device
+# policy, DeviceAllow "/dev/nvidia-uvm w": the VMM checks each UVM pool with
+# mincore, which the kernel answers only for a file it may write. A device
+# policy names major 195 "char-nvidia" (DEPLOY.md, "Per-VM users").
 {
   config,
   lib,

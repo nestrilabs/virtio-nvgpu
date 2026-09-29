@@ -164,9 +164,36 @@ and a network namespace of its own:
   exists and is empty. crosvm publishes the UVM aperture when the backend
   reports it (`--allow-compute`).
 
-Both need `/dev/kvm` for the VMM user. Guest RAM is committed at boot; the
-shared window adds up to 1 GiB (sparse), and with compute the UVM aperture
-another 1 GiB.
+Both need `/dev/kvm` for the VMM user, and both take the shared window's
+size from the backend (GET_SHMEM_CONFIG): crosvm always has, nesbox from
+branch `virtio-nvgpu-v4` (an older nesbox publishes 1 GiB whatever the
+backend's `--window-size` says, and every placement past it fails). Guest
+RAM is committed at boot. The window is the configured size (`--window-size`,
+1 GiB by default), and with compute the UVM aperture another 1 GiB; what
+the window costs in host memory depends on the VMM ("Sizing the window").
+
+**The VMM of a compute VM** (`--allow-compute`) checks each UVM pool the
+backend places with `mincore` on its own descriptor of `/dev/nvidia-uvm`
+before giving the pool a memory slot (crosvm's `patches/crosvm/0007`,
+nesbox's `fds.rs`). Two things a unit can take away break every pool with
+EACCES:
+
+- the `mincore` syscall, which is not in systemd's `@system-service` set:
+  a VMM unit with `SystemCallFilter=@system-service` needs `mincore` added;
+- **write** access to `/dev/nvidia-uvm` in the device cgroup: the check
+  runs `access("/proc/self/fd/N", W_OK)`, and the kernel's
+  `can_do_mincore` asks `file_permission(MAY_WRITE)`; both go through
+  `devcgroup_inode_permission`. Under `DevicePolicy=closed`, give
+  `DeviceAllow=/dev/nvidia-uvm w` (write alone is enough; the check goes
+  through the descriptor the backend sent, so the path itself can stay
+  hidden with `InaccessiblePaths=`).
+
+**Device cgroup names.** NVIDIA's open kernel modules register character
+major 195 as `nvidia` in `/proc/devices`, not `nvidia-frontend`: a unit that
+restricts devices must say `DeviceAllow=char-nvidia` (or the nodes by path),
+and `char-nvidia-frontend` alone denies `/dev/nvidia0`. The shipped
+backend unit sets no device policy (Landlock holds the backend to the GPU's
+nodes), so it is unaffected; a VMM unit that adds one is not.
 
 **The Wayland modes.** With `--wayland-socket` the backend connects to the
 host compositor's socket, which lives in the desktop user's
@@ -195,6 +222,88 @@ patched Hyprland and a monitor marked `leasable` ([`patches/`](patches/)).
 Export mode admits only host clients of the backend's own uid, so there it
 is run as the owner of the export socket's directory; like the compositor VM
 it has not run on hardware.
+
+## Sizing the window
+
+Device memory a guest process maps for the CPU is placed in the VM's
+**shared window**, in one of three zones by the memory type the host maps
+it with: uncached (registers, the usermode doorbell), write-combining (video
+memory, through BAR1) and write-back (GPU-coherent system memory). A mapping
+that the zone, or the process's share of it, cannot take fails with ENOMEM
+(`SHM alloc failed` in the backend's log); a write-back one falls back to
+write-combining first, which is correct but slow to read. The default, 1 GiB
+at half a zone per process, is enough for every application the project has
+run; a VM for one heavy application (a large game, a big 3D scene) can be
+given more with `--window-size` and `--window-owner-share`.
+
+**What the zones get.** UC stays at 32 MiB, and WC and WB split the rest
+24:7 as the default does:
+
+| `--window-size` | UC | WC | WB |
+|---|---|---|---|
+| 256 | 8 | 192 | 56 |
+| 1024 (default) | 32 | 768 | 224 |
+| 4096 | 32 | 3148 | 916 |
+| 16384 | 32 | 12660 | 3692 |
+
+**What applications use**, the most in use at once, on an RTX 5090 (595.99.02)
+under nesbox, one VM per application, as an unprivileged guest user (MiB;
+the backend logs the same line, `window use:`, when the VM stops):
+
+| application | UC | WC | WB | largest mapping |
+|---|---|---|---|---|
+| SuperTuxKart (GL) | 0.1 | 4.5 | 34.6 | 4 |
+| SuperTuxKart in gamescope | 0.4 | 15.5 | 60.2 | 7.9 |
+| Blender EEVEE, GL | 0.1 | 29.0 | 86.3 | 21.3 |
+| Blender EEVEE, Vulkan | 0.1 | 34.5 | 82.7 | 32 |
+| glmark2 | 0.1 | 2.5 | 4.3 | 2 |
+| vkmark | 0.1 | 2.5 | 14.2 | 2 |
+| Chromium, animation | 0.1 | 2.5 | 23.2 | 4 |
+| render probe with CUDA | 0.1 | 2.0 | 54.0 | 40 |
+
+UC never passed half a MiB, so it does not grow. Every application here used
+more write-back than write-combining, and Blender's 86 MiB is three quarters
+of a process's default WB share, so WB keeps its proportion rather than
+staying put; WC takes most of the growth because it has to hold its own
+and WB's overflow, and because the one workload known to exhaust a default
+window did it in WC (a Minecraft launcher on this GPU, in part through a
+backend defect since fixed, SECURITY.md §19). On an older T4, CUDA peaked
+at 68 MiB and an NVENC encode at 116 MiB, before system memory was told
+apart from video memory.
+
+**Choosing it.** Keep the default unless the backend logs `SHM alloc
+failed` for a VM, or its `window use:` line shows a process near its share
+(`by one process` against half the zone). Then raise `--window-size` in
+steps of 64 MiB; `--window-owner-share` above 50 lets one process have
+most of each zone, which suits a VM that runs one application and takes
+from the VM's other processes the chance to map much at once
+(SECURITY.md §19: from 88 %, one process can leave the others only the
+reserve).
+
+**What it costs the host.**
+
+- *BAR1.* Video memory a guest maps is mapped through the GPU's BAR1, which
+  the host's desktop and every other VM share. One VM can hold at most its
+  WC zone there. The backend warns at start when that is more than half of
+  a GPU's BAR1 (`nvidia-smi -q -d MEMORY`, "BAR1 Memory Usage"; 32 GiB on an
+  RTX 5090 with resizable BAR, 256 MiB without it). Keep the WC zones of
+  the VMs that run at once, plus the desktop's own use, below the BAR1
+  total. VRAM itself is not bounded by the window, only how much of it is
+  CPU-mapped at once.
+- *Host memory.* The backend's copy of the window is a sparse memfd that
+  its own pages never fill: the backend's `MemoryMax=2G` needs no change.
+  nesbox reserves the guest-visible window `PROT_NONE`: it costs nothing
+  but the placements, which are device memory. crosvm's is shared anonymous
+  memory: a page of it the guest touches with nothing placed there is
+  faulted in and charged, like guest RAM, to the VMM's cgroup, up to the
+  window's size. No guest driver path does that, but a guest kernel can, so
+  under crosvm size the VMM's `MemoryMax` as guest RAM plus the window (plus
+  its own overhead).
+- *Address space.* crosvm puts the window and the UVM aperture in one BAR,
+  the next power of two above both (16 GiB plus the aperture is a 32 GiB
+  BAR) and refuses past 64 GiB; nesbox puts each in a BAR of its own in a
+  64 GiB MMIO window and refuses a window past 32 GiB. Both refuse at start,
+  with the size named.
 
 ## Capture injection
 
@@ -309,6 +418,8 @@ shows the diagnostic ones too.
 |---|---|---|
 | `--socket PATH` | `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` | the vhost-user socket; whoever connects gets the guest's memory. A file already there is removed only if it is this uid's socket |
 | `--allow-compute` | off | serve CUDA and other compute: `/dev/nvidia-uvm`, the UVM aperture, memory registered by its pages. Graphics, Vulkan Video and display need none of it |
+| `--window-size MIB` | 1024 | the shared window: how much GPU memory the VM's processes can have CPU-mapped at once. A multiple of 64, at least 256; with `--allow-compute` at most 64512 (window and aperture share crosvm's 64 GiB region cap), else 65536; nesbox takes at most 32768. Refused at start otherwise ("Sizing the window") |
+| `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md §19) |
 | `--kms-card` | off | compositor-VM mode: offer the host's card nodes to the guest. Only for a host with no compositor of its own. Not run on hardware |
 | `--wayland-socket PATH` | none | the host compositor's socket, for the Wayland proxy |
 | `--wayland-lease` | off | offer the compositor's `wp_drm_lease_device_v1` (this GPU's card only) |

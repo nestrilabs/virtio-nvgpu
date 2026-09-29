@@ -12,7 +12,11 @@
 #   #   After=vhost-user-nvgpu@0.service
 #
 # Backend flags per VM go in /etc/virtio-nvgpu/vmN.env as
-# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags"). For
+# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags"); a VM
+# for one heavy application might say
+#   NVGPU_BACKEND_ARGS="--window-size 16384 --window-owner-share 90"
+# (DEPLOY.md, "Sizing the window": the VMM follows the size, and under
+# crosvm its MemoryMax must cover guest RAM plus the window). For
 # capture injection (DEPLOY.md, "Capture injection") that file also says
 #   NVGPU_BACKEND_ARGS="--inject-socket /run/nvgpu/vmN/inject.sock --inject-uid UID"
 #   NVGPU_INJECT_GROUP=<the VM's capture helper's group>
@@ -96,7 +100,10 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectProc=invisible
 # Not set, on purpose: PrivateDevices= and DevicePolicy=/DeviceAllow= (the
-# backend needs the GPU's nodes; Landlock already holds it to those), and
+# backend needs the GPU's nodes; Landlock already holds it to those; a unit
+# that adds a device policy must name major 195 as char-nvidia, which is what
+# the open modules register in /proc/devices -- char-nvidia-frontend alone
+# denies /dev/nvidia0), and
 # ProtectClock=, which closes the device policy as a side effect;
 # PrivateUsers= (RM, DRM and NVKMS take a guest's privilege from the
 # backend's real uid); ProcSubset=pid (it reads /proc/driver/nvidia).

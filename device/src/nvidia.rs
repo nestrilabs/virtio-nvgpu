@@ -476,8 +476,11 @@ pub struct NvidiaBackend {
     /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
     ///
     /// The SHM offset is written into pLinearAddress in the response to the
-    /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
-    /// This gives us a unique, unambiguous lookup key without leaking host VAs.
+    /// guest, and userspace quotes it until UPDATE_DEVICE_MAPPING_INFO gives
+    /// the mapping the virtual address it was mapped at, and that address
+    /// after (in UPDATE and RM_UNMAP_MEMORY); an entry answers to both, for
+    /// its own RM object and process only (`MmapContext::find`). No host
+    /// address reaches the guest.
     ///
     /// Each entry owns its extent, and is the only record that does: the
     /// extent is released when RM_UNMAP_MEMORY succeeds, when the handle that
