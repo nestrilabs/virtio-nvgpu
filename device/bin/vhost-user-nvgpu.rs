@@ -218,12 +218,17 @@ struct Args {
     queue_poll_us: u64,
 
     /// The EEVDF slice of every backend thread, in microseconds (100 to
-    /// 100000; 0 keeps the host's default, about 3 ms). A shorter slice
+    /// 100000; 0 keeps the slice the process started with: the host's
+    /// default, about 3 ms, or the launcher's). A shorter slice
     /// gets the queue thread and the event pump back onto a busy CPU sooner
     /// after they wake, at the same share of the CPU: on a loaded host it
     /// is what keeps a guest's frames on their vblanks (DEPLOY.md, "Frame
     /// pacing"). Set at start, before any thread exists, so all inherit it;
-    /// needs no privilege, and a kernel before 6.12 keeps its default.
+    /// needs no privilege, and a kernel before 6.12 keeps its default. The
+    /// policy stays as the launcher set it (SCHED_BATCH, SCHED_IDLE), and a
+    /// real-time one is left alone; 0 leaves whatever slice the launcher
+    /// gave (a launcher that sets one should pass it here too, as
+    /// rig/run-guest.sh passes NVGPU_SLICE_US).
     #[arg(long, value_name = "US", default_value_t = 100)]
     sched_slice_us: u64,
 
@@ -1610,10 +1615,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Before any thread exists, so that every one inherits it.
+    // 0 keeps what the launcher or the host set; so does a policy that is
+    // not a fair one (device::sys::proc::set_sched_slice).
     if args.sched_slice_us != 0 {
         let us = args.sched_slice_us.clamp(100, 100_000);
         match device::sys::proc::set_sched_slice(us * 1000) {
-            Ok(()) => log::info!("--sched-slice-us {us}: every backend thread's EEVDF slice"),
+            Ok(true) => log::info!("--sched-slice-us {us}: every backend thread's EEVDF slice"),
+            Ok(false) => log::info!(
+                "--sched-slice-us {us}: not a fair scheduling policy; the launcher's stays"
+            ),
             Err(e) => log::warn!("--sched-slice-us {us}: {e}; the host's default slice stays"),
         }
     }
