@@ -437,6 +437,47 @@ fn a_frame_round_trips_with_its_descriptors_in_order() {
     assert_eq!(recs[1].arg, 2);
 }
 
+/// A record filled in place is byte for byte the record of what was written,
+/// whether the fill took all it was offered, part of it, or nothing.
+#[test]
+fn a_record_filled_in_place_is_the_record_of_its_payload() {
+    for (cap, n) in [(0, 0), (5, 5), (64, 64), (64, 13), (64, 0), (100, 99)] {
+        let payload: Vec<u8> = (0..n as u8).map(|i| i.wrapping_mul(7) | 1).collect();
+        let got = frame::record_with(frame::REC_SHM_SYNC, 3, 40, cap, |buf| {
+            buf[..n].copy_from_slice(&payload);
+            // What a short read leaves past its end must not survive.
+            buf[n..].fill(0xee);
+            n
+        });
+        assert_eq!(
+            got,
+            frame::record(frame::REC_SHM_SYNC, 3, 40, &payload),
+            "cap {cap}, wrote {n}"
+        );
+    }
+}
+
+/// The frame of many records is their concatenation after the descriptor
+/// table, in order, however they are packed.
+#[test]
+fn a_packed_frame_carries_every_record_in_order() {
+    let mut q = VecDeque::new();
+    let mut want = Vec::new();
+    for i in 0..40u32 {
+        let r = frame::record(frame::REC_SHM_SYNC, i, i * 3, &vec![i as u8; (i as usize) * 37]);
+        want.extend_from_slice(&r);
+        q.push_back(frame::Unit {
+            rec: r,
+            descs: vec![],
+        });
+    }
+    let (f, _) = frame::pack(&mut q, 1 << 20, 256, false);
+    assert!(q.is_empty());
+    assert_eq!(&f[frame::FRAME_HDR_LEN..], &want[..]);
+    let d = frame::decode(&f).unwrap();
+    assert_eq!(d.records().count(), 40);
+}
+
 #[test]
 fn packing_stops_at_the_byte_and_descriptor_limits_and_says_more() {
     let mut q = VecDeque::new();

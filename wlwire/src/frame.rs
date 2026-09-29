@@ -217,6 +217,31 @@ pub fn record(ty: u16, id: u32, arg: u32, payload: &[u8]) -> Vec<u8> {
     r
 }
 
+/// Encode one record whose payload `fill` writes in place, into up to `cap`
+/// bytes, returning how many it wrote: the same bytes as [`record`] of what
+/// it wrote, without copying the payload a second time. A bulk payload -- a
+/// shared-memory buffer's rows -- is read straight into the record.
+pub fn record_with(
+    ty: u16,
+    id: u32,
+    arg: u32,
+    cap: usize,
+    fill: impl FnOnce(&mut [u8]) -> usize,
+) -> Vec<u8> {
+    let mut r = vec![0u8; REC_HDR_LEN + pad8(cap)];
+    let n = fill(&mut r[REC_HDR_LEN..REC_HDR_LEN + cap]).min(cap);
+    r[0..2].copy_from_slice(&ty.to_le_bytes());
+    r[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+    r[8..12].copy_from_slice(&id.to_le_bytes());
+    r[12..16].copy_from_slice(&arg.to_le_bytes());
+    if n < cap {
+        // A shorter payload's padding is zero, as `record`'s is.
+        r.truncate(REC_HDR_LEN + pad8(n));
+        r[REC_HDR_LEN + n..].fill(0);
+    }
+    r
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hello {
     pub version: u32,
@@ -254,7 +279,10 @@ pub fn pack(
     let max_desc = max_desc.min(MAX_DESC);
     let mut descs: Vec<Desc> = Vec::new();
     let mut fds = Vec::new();
-    let mut recs = Vec::new();
+    // The records are taken first and copied once, straight into the frame
+    // after its descriptor table: a frame is up to 4 MiB of pixels.
+    let mut recs: Vec<Vec<u8>> = Vec::new();
+    let mut rec_len = 0;
     let mut used = FRAME_HDR_LEN;
     while let Some(u) = q.front() {
         if used + u.bytes() > max_bytes || descs.len() + u.descs.len() > max_desc {
@@ -262,7 +290,8 @@ pub fn pack(
         }
         let u = q.pop_front().unwrap();
         used += u.bytes();
-        recs.extend_from_slice(&u.rec);
+        rec_len += u.rec.len();
+        recs.push(u.rec);
         for d in u.descs {
             descs.push(d.desc);
             fds.push(d.fd);
@@ -277,12 +306,14 @@ pub fn pack(
     f.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
     f.extend_from_slice(&FRAME_VERSION.to_le_bytes());
     f.extend_from_slice(&(descs.len() as u16).to_le_bytes());
-    f.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+    f.extend_from_slice(&(rec_len as u32).to_le_bytes());
     f.extend_from_slice(&flags.to_le_bytes());
     for d in &descs {
         d.write(&mut f);
     }
-    f.extend_from_slice(&recs);
+    for r in &recs {
+        f.extend_from_slice(r);
+    }
     (f, fds)
 }
 

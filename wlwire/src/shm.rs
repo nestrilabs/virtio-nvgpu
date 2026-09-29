@@ -65,7 +65,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record};
+use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record_with};
 use crate::sys;
 
 /// The largest pool the protocol can make or resize to: its size is an
@@ -665,15 +665,19 @@ impl SyncJob {
             return None;
         }
         let n = ((self.end - self.off) as usize).min(MAX_REC_PAYLOAD);
-        let mut chunk = vec![0u8; n];
-        let got = sys::pread_full(self.pool.fd.as_raw_fd(), &mut chunk, self.base + self.off)
-            .unwrap_or(0);
+        let (fd, at) = (self.pool.fd.as_raw_fd(), self.base + self.off);
+        let mut got = 0;
+        // Read straight into the record: one copy of the pixels, not two.
+        let rec = record_with(REC_SHM_SYNC, self.buffer, self.off as u32, n, |buf| {
+            got = sys::pread_full(fd, buf, at).unwrap_or(0);
+            got
+        });
         if got == 0 {
             self.off = self.end;
             return None;
         }
         let u = Unit {
-            rec: record(REC_SHM_SYNC, self.buffer, self.off as u32, &chunk[..got]),
+            rec,
             descs: Vec::new(),
         };
         self.off += got as u64;
