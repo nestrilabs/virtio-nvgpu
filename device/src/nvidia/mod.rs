@@ -463,9 +463,9 @@ impl NvidiaBackend {
 
     /// Give the backend somewhere to place device memory.
     ///
-    /// Until this is called every `RM_MAP_MEMORY` still succeeds on the host --
-    /// the mapping is real -- but the `mmap` that follows is refused, because
-    /// there is no address in the guest that names it.
+    /// Until this is called there is no address in the guest that could
+    /// name device memory: `RM_MAP_MEMORY` is answered NOT_SUPPORTED, the
+    /// host's mapping undone, and an MMAP is refused ENOTSUP.
     pub fn set_window(&mut self, placer: Box<dyn crate::shm::WindowPlacer>) {
         self.window = Some(placer);
     }
@@ -595,8 +595,9 @@ impl NvidiaBackend {
                     .join(" ")
             );
         }
-        // The whole forwarded surface, by namespace. A filter has to cover all
-        // of these, and today only 'F' has a table to check against at all.
+        // The whole forwarded surface, by namespace: what each namespace's
+        // table (the RM allowlist, the v1 routes, the IOCTL2 schemas, the UVM
+        // tables) let through.
         if !self.ioctls_by_ns.is_empty() {
             let mut by_ns: std::collections::BTreeMap<char, Vec<String>> = Default::default();
             for ((ns, nr), n) in &self.ioctls_by_ns {

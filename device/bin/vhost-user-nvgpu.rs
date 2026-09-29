@@ -342,7 +342,8 @@ struct Args {
     /// Wayland channels one VM may have open at once (guest clients, or
     /// accepted host clients in export mode). Each is a client of the host
     /// compositor with a thread and a few descriptors here; past the limit
-    /// the guest's CONNECT fails with EMFILE.
+    /// the guest's CONNECT fails with EMFILE. One guest process may have a
+    /// quarter of them, and the last eighth only while it has at most two.
     #[arg(long, value_name = "N", default_value_t = WlLimits::DEFAULT_MAX_CONNS)]
     wayland_max_conns: usize,
 
@@ -350,13 +351,15 @@ struct Args {
     /// over all its connections (each connection is also held to 512 MiB):
     /// what their live buffers cover, not how large their pools are. The
     /// pages are memfds the host OOM killer does not count as this process's;
-    /// a buffer past the budget is a wl_display.error for its client.
+    /// a buffer past the budget is a wl_display.error for its client. One
+    /// guest process's connections may hold a quarter of it, with the last
+    /// sixteenth kept for processes that hold little.
     #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_SHM_BYTES >> 20)]
     wayland_shm_budget: u64,
 
     /// MiB of compositor output one VM may leave unread, over all its
-    /// connections (each is also held to 64 MiB); the connection that passes
-    /// it is dropped.
+    /// connections (each is also held to 64 MiB), and one guest process's
+    /// connections half of it; the connection that passes it is dropped.
     #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_QUEUE_BYTES >> 20)]
     wayland_queue_budget: usize,
 }
@@ -1085,9 +1088,7 @@ impl NvGpuBackend {
                 pump: Mutex::new(PumpState::default()),
             }),
             event_idx: false,
-            // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
-            // -- 100 ioctls and one mmap in the captured trace -- so a guest
-            // can enumerate the GPU before the shared window exists.
+            // The GPUs the guest sees, and which ioctls carry a descriptor.
             config: VirtioGpuNvConfig::new(&version, &gpus),
             max_req: MAX_XFER_DIRECT as usize,
             max_resp: MAX_XFER_DIRECT as usize,
@@ -1586,7 +1587,6 @@ fn diagnostic_flags(args: &Args) -> Vec<(&'static str, &'static str)> {
     v
 }
 
-/// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
 /// The capture helper is a user of its own: not root, which is every user,
 /// and not the backend's own uid, which is every process of the VM's backend
 /// user (in the Wayland modes, the desktop's) -- unless the diagnostic
@@ -1604,6 +1604,7 @@ fn inject_uid_ok(uid: u32, own: u32, allow_self: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
 fn check_diagnostic(args: &Args, env: bool) -> anyhow::Result<Vec<String>> {
     let flags = diagnostic_flags(args);
     if flags.is_empty() {
@@ -2213,8 +2214,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    // vhost_user_backend::Error does not implement std::error::Error, so it
-    // cannot ride `?` on its own.
     // What keeps one guest process, and one VM, from another's RM clients is
     // RM's strict client validation, which a host registry key can turn off
     // (device::semsurf::probe_strict_clients, R3). Asked before anything is
@@ -2234,6 +2233,8 @@ fn main() -> anyhow::Result<()> {
              another's RM objects by handle"
         ),
     }
+    // vhost_user_backend::Error does not implement std::error::Error, so it
+    // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
         backend.clone(),

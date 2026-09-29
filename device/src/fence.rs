@@ -68,7 +68,7 @@ use crate::quota::{Charge, Owner, Pool, Share};
 use crate::sys::block::{Arena, BufId};
 use crate::xfer::Errno;
 
-/// Registrations that have not fired, per VM. Each holds two backend
+/// Registrations that have not fired, per VM. Each holds three backend
 /// descriptors (the eventfd, twice: the table's and ours; and the syncobj
 /// file) and one host kernel entry with an eventfd context. A compositor has
 /// a handful outstanding per surface; this is far above any honest workload

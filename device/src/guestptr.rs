@@ -56,9 +56,11 @@
 //!   segment the backend sizes itself (`deepseg.rs`); every other pointer
 //!   field of the command is zeroed, which RM answers as a missing buffer,
 //!   and the controls in `abi::rmctrl::ZEROED_CONTROLS` (ACPI methods among
-//!   them) take no deep block at all. Two commands carry
-//!   pointers the table cannot name one by one (a union selected by a type
-//!   field, an array of per-op pointers) and are refused.
+//!   them) take no deep block at all. Three commands
+//!   (`abi::rmctrl::REFUSED_CONTROLS`) carry pointers the table cannot name
+//!   one by one (I2C_TRANSACTION's union selected by a type field,
+//!   READ_SURFACE's and WRITE_SURFACE's arrays of per-op pointers) and are
+//!   refused.
 //! - **UVM** (`uvm_gate`): nvidia-uvm works on the calling process's address
 //!   space, which is the backend's. Pageable memory access is forced off in
 //!   UVM_INITIALIZE (so neither HMM nor ATS can let the GPU fault in the

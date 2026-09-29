@@ -444,8 +444,7 @@ impl Prepared {
     /// Adopt descriptors the host produced at schema positions into the
     /// backend's handle table (`f`), refusing any number the backend already
     /// holds and closing `I2_FD_CONSUME` handles, then build the response
-    /// payload (`Ioctl2Resp` onwards, without MsgHeader). (A `finish` that
-    /// took a bare adopt closure did neither, and nothing called it.)
+    /// payload (`Ioctl2Resp` onwards, without MsgHeader).
     pub fn finish_with(mut self, f: &mut dyn Finisher) -> Vec<u8> {
         let mut fd_recs = Vec::new();
         for (buf, off, fd) in std::mem::take(&mut self.fd_outs) {
@@ -526,7 +525,6 @@ impl Prepared {
         self.entry.name
     }
 
-    /// The `schema::policy` bits of the entry.
     /// Ask `Hooks::at_run` to check `revocations` again when the call runs (see
     /// there). For `Hooks::before`.
     pub fn set_run_gate(&mut self, revocations: u64) {
@@ -552,6 +550,7 @@ impl Prepared {
         self.local
     }
 
+    /// The `schema::policy` bits of the entry.
     pub fn policy(&self) -> u32 {
         self.entry.policy
     }
@@ -587,7 +586,7 @@ impl Prepared {
             .and_then(|s| s.target)
     }
 
-    /// The most the response `finish` builds can take (exact unless the host
+    /// The most the response `finish_with` builds can take (exact unless the host
     /// left fewer descriptors or GEM handles than the schema has room for),
     /// so the transport can refuse -EMSGSIZE before executing.
     pub fn response_len(&self) -> usize {

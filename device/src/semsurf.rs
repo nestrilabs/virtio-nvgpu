@@ -30,7 +30,7 @@
 //!   mem_mgr_ctrl.c:748-750) -- is EOPNOTSUPP, which is also what the host
 //!   answers a 0x54 it cannot serve (nvidia-drm-fence.c:1316-1318);
 //! - **the client is this VM's**: one allocated through our RM path and not
-//!   freed since ([`SemsurfPolicy::client_allocated`]);
+//!   freed since ([`SemsurfPolicy::client_allocated_by`]);
 //! - **there is room**: each context costs a host kthread, a timer, an NVKMS
 //!   dup and a kernel mapping (nvidia-drm-fence.c:1233-1310,
 //!   nvidia-drm-os-interface.c:166-176), none of it bounded by the host, so

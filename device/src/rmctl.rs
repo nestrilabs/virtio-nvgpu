@@ -26,8 +26,11 @@
 //! NV_ERR_INSUFFICIENT_PERMISSIONS in the NVOS54 status with the call itself
 //! succeeding: the caller sees the refusal RM gives an unprivileged caller
 //! natively, not a failed ioctl.
-//! Command numbers are FINN interface ids and the same in 535.129.03,
-//! 580.95.05, 595.58.03 and 610.57.04.
+//! Command numbers are FINN interface ids, each the same in every release
+//! gen/rmallow measured that exports it (535.129.03 through 615.71.09):
+//! GPUACCT_GET_PROC_ACCOUNTING_INFO_V2 is exported from 610, and
+//! FB_GET_CLIENT_ALLOCATION_INFO by none of them, though its header has
+//! it (0x20801349 in 595.99.02).
 
 #![forbid(unsafe_code)]
 

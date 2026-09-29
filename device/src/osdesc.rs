@@ -1407,7 +1407,7 @@ impl OsDesc {
 
     /// UVM file `file` made an external range (CREATE_EXTERNAL_RANGE
     /// succeeded). Past the VM's bound it is not recorded, and a mapping of
-    /// registered memory inside it is held until its file closes.
+    /// registered memory inside it is refused (`uvm_admit`).
     #[cfg(test)]
     pub(crate) fn uvm_range_made(&mut self, file: u32, base: u64, len: u64) {
         self.uvm_range_made_by(file, base, len, crate::quota::Owner::Unknown);
@@ -1445,8 +1445,8 @@ impl OsDesc {
             if !self.uvm_ranges_warned {
                 self.uvm_ranges_warned = true;
                 log::warn!(
-                    "UVM external ranges: {} recorded; registered memory mapped in a later \
-                     one stays pinned until its UVM file closes",
+                    "UVM external ranges: {} recorded; registered memory may not be mapped \
+                     in a later one",
                     self.uvm_range_count
                 );
             }

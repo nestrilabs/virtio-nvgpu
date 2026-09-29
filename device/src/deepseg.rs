@@ -55,8 +55,10 @@ impl Segments {
     /// Check the guest's segmented deep block, `deep`, against `rules` --
     /// the pointers RM follows in `block` (a block of `a`, the bytes the host
     /// will read) and how much it copies through each -- and give each
-    /// pointer it names a block of `a` holding the guest's bytes. On `Err`
-    /// nothing in `a` has changed.
+    /// pointer it names a block of `a` holding the guest's bytes. A block
+    /// the guest got wrong is refused before anything in `a` changes; an
+    /// arena error while the segments are made can leave some of them in
+    /// `a`, which the caller drops with the call.
     pub(crate) fn relocate(
         what: &str,
         rules: &[DeepPtr],

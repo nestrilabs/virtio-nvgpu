@@ -58,7 +58,8 @@ pub enum MsgType {
     /// **Host → guest**, on the event queue: the descriptor named by
     /// `MsgHeader::handle` has something to report.
     ///
-    /// The only message that travels this way. NVIDIA's user-mode driver waits
+    /// One of the two messages that travel this way (the other is
+    /// [`MsgType::EventData`]). NVIDIA's user-mode driver waits
     /// for the GPU by polling the descriptor an RM event is delivered on; the
     /// host driver takes the interrupt and makes *its* descriptor readable, and
     /// this carries that edge across so the guest's can do the same. Without

@@ -538,6 +538,17 @@ pub(super) fn node_dev(name: &str) -> Option<(u32, u32)> {
     parsed
 }
 
+/// The render nodes' names (`renderD128`), in the order a guest's render
+/// indices name them (`HostNodes::dri`): the capture helper's buffers are
+/// checked against the same numbering (inject.rs).
+pub fn host_render_names() -> Vec<String> {
+    enumerate_host_nodes()
+        .dri
+        .into_iter()
+        .map(|d| d.name)
+        .collect()
+}
+
 /// The render and card nodes the host's GPUs own.
 ///
 /// Taken from `/sys/bus/pci/devices/<addr>/drm`, which is the kernel's own
@@ -551,17 +562,6 @@ pub(super) fn node_dev(name: &str) -> Option<(u32, u32)> {
 /// compositor-VM mode (GET_SYS_FILES section 3, HOST_OP OPEN_KMS). The list is
 /// kept in every mode because classification needs it: a lease fd is ours
 /// only if it is one of these cards.
-/// The render nodes' names (`renderD128`), in the order a guest's render
-/// indices name them (`HostNodes::dri`): the capture helper's buffers are
-/// checked against the same numbering (inject.rs).
-pub fn host_render_names() -> Vec<String> {
-    enumerate_host_nodes()
-        .dri
-        .into_iter()
-        .map(|d| d.name)
-        .collect()
-}
-
 pub(super) fn enumerate_host_nodes() -> HostNodes {
     let mut nodes = HostNodes::default();
     for (index, slot) in crate::host::gpu_slots(std::path::Path::new(FileTree::Proc.root()))
