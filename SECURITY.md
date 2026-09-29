@@ -25,18 +25,18 @@ the thing to fix.
 - **Sources.** Statements about what the host kernel does with a request were
   read from source (NVIDIA's open kernel modules 610.57.04, Linux 7.2.7)
   unless a section says it was observed.
-- **Hardware.** The last regression on hardware ran on an RTX 5090 with
-  595.99.02 on 2026-09-29, under nesbox and crosvm, with the backend's
-  sandbox on and the RM allowlist enforcing (`rig/TESTING-RIG.md`,
-  "Benchmarks", and README.md, "What is known to work"). It covered the
-  2026-09-29 review's backend fixes. It did not cover that review's VMM,
-  deployment and guest-module fixes, nor the restructuring after them (the
-  backend's `nvidia/` and `inject/` modules, the guest module's split files,
-  the launcher's pieces): the code this document describes has passed
-  `scripts/ci.sh` and has not yet run on the GPU as a whole. Never run on
-  hardware: the compositor-VM and export modes (they need the host desktop
-  stopped) and hotplug. "How the claims are tested" says what each claim
-  rests on.
+- **Hardware.** `rig/TESTING-RIG.md`, "Where the runs stand", is the dated
+  record of every run, and README.md, "What is known to work", the summary.
+  The last regression on hardware ran on an RTX 5090 with 595.99.02 on
+  2026-09-29, under nesbox and crosvm, with the backend's sandbox on and the
+  RM allowlist enforcing. It covered the 2026-09-29 review's backend fixes.
+  It did not cover that review's VMM, deployment and guest-module fixes, nor
+  the restructuring after them (the backend's `nvidia/` and `inject/`
+  modules, the guest module's split files, the launcher's pieces): the code
+  this document describes has passed `scripts/ci.sh` and has not yet run on
+  the GPU as a whole. Never run on hardware: the compositor-VM and export
+  modes (they need the host desktop stopped) and hotplug. "How the claims
+  are tested" says what each claim rests on.
 
 ## 2. Summary
 
@@ -49,8 +49,10 @@ in the trusted computing base ("Threat model").
   host GPU surface"). RM escapes are size-checked against a profile chosen
   at start. RM controls and classes are on a default-deny list per release
   ("The RM allowlist"). NVKMS and DRM calls go through generated schemas.
-  Every pointer the host would follow is relocated to a buffer of the
-  backend's or zeroed, and every descriptor becomes the backend's own.
+  Every pointer field the backend's tables name is relocated to a buffer
+  of the backend's or zeroed, and every descriptor field they name becomes
+  the backend's own; what the tables miss reaches the host as the guest's
+  bytes ("Memory safety", open item 11).
 - **Compute paths** -- UVM, the UVM aperture, memory registered by its
   pages -- only with `--allow-compute` ("Compute is opt-in").
 - **The host display and compositor**, only in the display modes the
@@ -1803,7 +1805,13 @@ allocation canaries) holds the two equal.
 
 The module is built for x86-64 with 4 KiB pages only (Kconfig depends on
 `X86_64`; an out-of-tree build for anything else stops at `nvgpu.h`), and it
-serves one virtio-gpu-nv device per guest.
+serves one virtio-gpu-nv device per guest. Every line a guest process can
+cause in the guest's kernel log is rate-limited, most at debug level
+(`dev_dbg_ratelimited`); the warnings kept name conditions an operator
+should see, among them a thread killed while its request was in flight
+(`nvgpu_xfer.c`) and GET_DEV_INFO asked in another release's layout
+(`nvgpu_drm.c`: guest userspace and host driver differ). The host's device
+details at probe are `dev_dbg`.
 
 ### 32-bit processes, and DRM structs of another size
 
@@ -1960,12 +1968,14 @@ reset, a removal) nothing here touches the queue.
   ("The RM allowlist"), and RM's parameter size for each control on a
   release measured exactly;
 - sizes, from the RM profile, the UVM tables and the DRM and NVKMS schemas;
-- that no guest pointer reaches the host, since every field the host would
-  follow is relocated to a buffer of the backend's or zeroed, and a buffer
-  for several pointers of one block is exactly the size RM will copy,
-  computed by the backend from that block (`device/src/deepseg.rs`);
-- that every descriptor field names a handle of an allowed kind, and becomes
-  the backend's own descriptor;
+- that no guest pointer the tables name reaches the host: every such field
+  is relocated to a buffer of the backend's or zeroed, and a buffer for
+  several pointers of one block is exactly the size RM will copy, computed
+  by the backend from that block (`device/src/deepseg.rs`). A pointer field
+  the tables miss reaches the host as the guest's bytes ("Memory safety");
+- that every descriptor field the tables name names a handle of an allowed
+  kind, and becomes the backend's own descriptor (the ones no table names
+  are open item 11);
 - every refusal in "The host GPU surface";
 - the NVKMS grants and gates, framebuffer ownership, KMS master, the CRC gate
   and the property rules in "NVKMS, KMS and leases";
@@ -2676,6 +2686,10 @@ crosvm's arena refuses hugetlbfs.
 
 ### A.8 The 2026-09-26 review
 
+A review of the guest module, the backend, the Wayland proxy and the VMM
+launchers, each finding checked before it was fixed. The hardware status
+at the time:
+
 > **Hardware status (2026-09-26).** On an RTX 5090 with 595.99.02, under
 > nesbox and crosvm, with the RM allowlist enforcing (the default) and the
 > backend's sandbox on, the rig (`rig/TESTING-RIG.md`) runs green on the code this
@@ -2690,7 +2704,7 @@ crosvm's arena refuses hugetlbfs.
 > hotplug. Statements below about what the host kernel does with a request
 > were read from source (NVIDIA's open modules 610.57.04, Linux 7.2.7) unless
 > a section says it was observed. Sections written before a run say where
-> things stood at the time; this note is the current state.
+> things stood at the time; this note was the state then.
 
 #### Fail closed, and production hardening
 
@@ -3019,11 +3033,6 @@ backend's side only: the guest daemon's sinks were unbudgeted until the
 2026-09-29 review (WL-S6).
 
 #### The guest module (`driver/`)
-
-A review of the guest module, the backend, the Wayland proxy and the VMM
-launchers, each finding checked before it was fixed.
-
-### The guest module (`driver/`)
 
 Every finding below was confirmed in the code before the fix; where a parser
 has both implementations, both were fixed and `driver/rust/difftest` agrees.
@@ -3925,7 +3934,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | L-4 | low | a proxy fence's timestamp is its delivery time | `6bf6cad` | fixed; whether anything reads it is to be confirmed on device |
 | L-5 | low | FENCE_SUPPORTED answers yes | `4c0f556` | fixed |
 | L-6 | low | UPDATE_DEVICE_MAPPING_INFO zeroes the caller's addresses | `8f6a075` | fixed |
-| L-7 | low | "no crossings per frame" measured only without presenting | -- | open: needs the per-present measurement |
+| L-7 | low | "no crossings per frame" measured only without presenting | -- | partly: the Wayland mode measured, 17 round trips per presented frame (DEPLOY.md, "Frame pacing"); no other display path (open item 22) |
 | L-8 | low | stale proxy-size comment | `388288c` | fixed |
 | L-9 | low | useSyncpt refused when not specified | `b6d58a8`, `3d6e281` | fixed |
 
@@ -3950,7 +3959,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | S-15 | medium | EXPORT_TO_DMABUF_FD forwarded raw | `db4d736` | fixed by refusal; translation is future work |
 | S-16 | low | blobs hold memfds with no count limit | `86553c1` | **partly**: count cap done; one descriptor budget and RLIMIT_NOFILE not |
 | S-17 | low | RM counter maps grow without bound | `d773f45` | fixed |
-| S-18 | low | no per-session channel limit | `de95ad3` | fixed |
+| S-18 | low | no per-session channel limit | `de95ad3` | fixed; its optional item 3, backpressure towards the compositor, not done (open item 13) |
 | S-19 | low | a guest can seize a leasable monitor, or churn it | `6e4c501` | churn fixed; holding is by design |
 | S-20 | low | guest-triggered log flooding | `d773f45` | fixed |
 | S-21 | low | the 1 ms sweep scales with open handles | `07971a3` | fixed |
@@ -3958,7 +3967,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | S-23 | low | `/tmp/nvgpu.sock` can be squatted | `b3c126b` | fixed |
 | S-24 | low | host PIDs of every GPU client readable | `32fd293` | fixed by answering locally; a PID namespace is the real fix |
 | S-25 | low | GEM-in drops the proxy reference before the host call | `bc2fcc1` | fixed |
-| S-26 | low | device removal leaves objects pointing at freed memory | `3e930d3` | **partly**: calls in flight during teardown are unguarded, and window pages stay mapped |
+| S-26 | low | device removal leaves objects pointing at freed memory | `3e930d3` | **partly**: calls in flight at removal are guarded since the device's lifetime was fixed (A.8, "The guest module"); window pages stay mapped after removal (open item 12) |
 | S-27 | low | executor pool loses a wake-up | `7dad490` | fixed |
 | S-28 | low | a failed lease probe hides the device for good | `5cf36ad` | fixed |
 | S-29 | low | guest daemon busy-loops on a hung-up client | `2e003c5` | fixed |
