@@ -8,36 +8,10 @@ This document explains the design. It contains no code: the code is in
 [`wlwire/`](wlwire/) and [`nvgpu-wl-guest/`](nvgpu-wl-guest/), and it moves
 faster than prose can follow.
 
-> **Built and measured, as of 2026-09-24:** the forwarding path, the shared
-> memory window, the DRM render node, buffer sharing between a client and a
-> compositor inside the guest, the event queue that lets a guest wait, and
-> encoding on the GPU. A guest renders, presents and encodes H.264, costs
-> within 2% of bare metal, and four guests share one card evenly
-> ([`BENCHMARKS.md`](BENCHMARKS.md)). All of that was measured before
-> protocol v2, on an RTX 3060, and measured again on the current code, on an
-> RTX 5090, on 2026-09-29 (the same file).
->
-> **Built since, and run on an RTX 5090 (595.99.02) under nesbox and crosvm,
-> as of 2026-09-26:** protocol v2 (§10); guest DRM files that drive a leased
-> output (§11); fences kept on the host (§12); NVKMS forwarding and its
-> permission gates (§13); the Wayland proxy against the live host compositor
-> (§14); a memory type per mapping, and guest system memory made GPU-coherent
-> (§15); direct scanout of guest buffers by the host compositor (§16); host
-> screen-capture buffers injected into a guest without a copy (§17); CUDA,
-> with the UVM aperture and memory registered by its pages (§5); the RM
-> allowlist, enforcing; and the security changes that came with them
-> ([`SECURITY.md`](SECURITY.md)). About 35 applications ran on the live
-> desktop ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)). Frame pacing on a
-> monitor and the cost of each path against bare metal were measured on
-> 2026-09-29 ([`DEPLOY.md`](DEPLOY.md), "Frame pacing";
-> [`BENCHMARKS.md`](BENCHMARKS.md)).
->
-> **Built, not yet run on hardware:** a guest driving the host card itself
-> (compositor-VM mode, §11) and export mode (§14), which need the host desktop
-> stopped. [`TESTING.md`](TESTING.md) is the plan.
->
-> **Designed but not built:** the isolate (Future work, below), MIG and
-> SR-IOV.
+What has run on hardware, and what has not, is kept in one place: the README's
+"What is known to work", with the dated runs in
+[`rig/TESTING-RIG.md`](rig/TESTING-RIG.md). The isolate (below, "Future
+work: the isolate"), MIG and SR-IOV are designed but not built.
 
 ---
 
@@ -163,10 +137,35 @@ applications connect to as to a compositor, and a host half inside the
 backend, connected to the host's compositor. `wlwire/` is the code they share
 (§14).
 
-**The isolate** is the part that is not built (Future work, below). The intent is one sandboxed,
-unprivileged helper process per guest, holding the device descriptors so that a
-compromised backend, which maps all of the guest's memory, does not hold them. Today the backend holds them itself — as
-an unprivileged process, which it insists on being (§18).
+**The isolate** is the part that is not built ("Future work: the isolate",
+below). The intent is one sandboxed, unprivileged helper process per guest,
+holding the device descriptors so that a compromised backend, which maps all
+of the guest's memory, does not hold them. Today the backend holds them
+itself — as an unprivileged process, which it insists on being ("Future
+work: the isolate").
+
+### Where each piece lives
+
+The file tables of [`device/README.md`](device/README.md) and
+[`driver/README.md`](driver/README.md) are the full lists; this is the map.
+
+| piece | where |
+|---|---|
+| the backend's dispatcher | `device/src/nvidia/`: the entry point and the VM's state (`mod.rs`), the v1 IOCTL parsed once and routed by handle kind (`v1.rs`), RM escapes and their gates (`rm.rs`), RM mappings (`rmmap.rs`), window and aperture placements (`placement.rs`), UVM (`uvm.rs`), the host's DRM nodes and file streams (`hostnodes.rs`) |
+| RM's ABI as the backend reads it | `device/src/nvos.rs` (escape field offsets, measured per release), `le.rs` (bounded little-endian reads) |
+| protocol v2 and IOCTL2 | `device/src/session.rs`, `xfer.rs`, `schema.rs`, `policy.rs`; KMS state in `kms_state.rs` and `kms.rs`; NVKMS in `nvkms.rs`; fences in `fence.rs` and `semsurf.rs` |
+| per-process shares | `device/src/quota.rs`: a `Share` of each pool per guest process, and a `Pool` whose units are a `Charge` given back when whatever holds them drops it |
+| capture injection | `device/src/inject/`, `protocol/src/inject.rs`, the guest's `driver/nvgpu_capture.c` |
+| sockets bound at a path, and handed over | `device/src/sockpath.rs` (export and inject sockets), `device/src/sys/inherit.rs` (socket activation, `--socket-fd`) |
+| the Wayland proxy | `wlwire/` (the engine both ends run, the codec, frames, streams, blobs, lazy reads `job.rs`, local input `localin.rs`, all-or-none budgets `budget.rs`), `device/src/wl/` (the host half), `nvgpu-wl-guest/` (the guest daemon, with its own per-client budgets in `budget.rs`) |
+| the wire | `protocol/src/messages.rs` (Rust), `driver/nvgpu_wire.h` (C), held equal by `protocol/src/cheader.rs`, which reads the C header in the tests |
+| the guest module's transport | `driver/nvgpu_xfer.c` with `nvgpu_xfer.h`, `nvgpu_tbuf.c`, `nvgpu_clock.c`, `nvgpu_events.c`; the v1 exchange in `nvgpu_v1.c` |
+| the guest module's nodes | `nvgpu_main.c` (the NVIDIA cdevs), `nvgpu_procfs.c`, `nvgpu_pci.c`, `nvgpu_drm.c` and `nvgpu_gem.c` (DRM and GEM proxies), `nvgpu_kms.c`, `nvgpu_nvkms.c`, `nvgpu_fence.c` with `nvgpu_syncobj.c` and `nvgpu_semsurf.c`, `nvgpu_misc.c` (what `/dev/nvgpu-wl` and `/dev/nvgpu-capture` share) |
+| the guest module's parsers | `driver/rust/` (the default), or `nvgpu_i2.c`, `nvgpu_rmio.c`, `nvgpu_atomic.c` (C) |
+| generated tables | `gen/` |
+| deployment | `contrib/systemd/` (the units' one text), `nix/units.nix` (the same units for a backend in the Nix store), `nix/module.nix` (the NixOS module) |
+| the test rig | `rig/run-guest.sh` with its pieces in `rig/launcher/`, `rig/lib.sh` (what the rig's other host scripts share), `rig/guest-image/`, `rig/verify/` |
+| checks | `scripts/ci.sh`, and in it `scripts/vmm-parity.py` (each VMM's limits on the backend's mapping requests against the backend's own) |
 
 ---
 
@@ -274,6 +273,8 @@ and finds it by the RM object, the process and the address together; the
 host is handed only its own address throughout. A map is one transaction:
 the window extent is reserved before RM is asked, and a mapping that cannot
 be placed is undone on the host.
+
+### Registered memory
 
 Memory the guest already has travels the other way, and **cannot be handed
 to the GPU by address.** RM registers existing memory by CPU address — an
@@ -385,7 +386,7 @@ BCAP_UVM_MAP nor BCAP_OS_DESC, and says so in HELLO (no `BCAP_COMPUTE`); the
 guest driver then makes no UVM device and does not register the
 `nvidia-uvm` major, which NVIDIA's userspace reads as a host whose
 nvidia-uvm is not loaded. Vulkan, OpenGL, EGL, Vulkan Video and the display
-paths use RM, NVKMS and nvidia-drm and none of this (SECURITY.md, "Compute").
+paths use RM, NVKMS and nvidia-drm and none of this (SECURITY.md, "Compute is opt-in").
 `rig/run-guest.sh --allow-compute` (or `NVGPU_COMPUTE=1`) turns it on
 for a run.
 
@@ -447,7 +448,7 @@ most expensive thing that can happen.
 
 The cost of doing it properly is that a wake crosses the boundary: the host's
 poll, the queue, an interrupt, and a vCPU that may have gone idle. On an RTX
-5090 a Vulkan fence a guest sleeps on costs about 15 µs more than natively
+5090 a Vulkan fence a guest sleeps on costs about 16 µs more than natively
 (BENCHMARKS.md). That is nothing against a 16.7 ms frame and a third of a
 frame that barely exists, which is exactly what the benchmark shows.
 
@@ -1081,8 +1082,8 @@ NVIDIA device, a duplicate NVKMS object of this one, which the backend
 tells from the object itself by exporting it back: only the helper's own
 object exports as the helper's own dma-buf. The layout the
 helper describes must fit the object. Ids and bytes are bounded per VM,
-and a helper's hangup releases everything it injected. SECURITY.md §18 has
-every check and bound.
+and a helper's hangup releases everything it injected. SECURITY.md,
+"Capture injection", has every check and bound.
 
 **What the guest gets.** INJECT_OPEN names an id and its token and a guest
 file's render handle; the backend imports the object into that file's host
@@ -1097,7 +1098,7 @@ its own on the host), which needs **no window space** at all. Only a CPU
 mapping places it in the window (§5), and every placement of an injected
 buffer is read-only. The GPU's access cannot be made read-only: NVIDIA's
 imports are read-write, so a guest can scribble on its own stream's
-buffers, which nobody else reads (SECURITY.md §18).
+buffers, which nobody else reads (SECURITY.md, "Capture injection").
 
 **Why a socket and a node of their own**, rather than a channel class of
 `/dev/nvgpu-wl`. The Wayland proxy is the most parsing-heavy path the backend
@@ -1173,33 +1174,24 @@ injection"; the rig's `nvgpu-inject-test` and `nvgpu-capture-import`
   comparison, and gVisor is explicit that it reduces attack surface rather than
   providing an isolation boundary.
 
-  What narrows the surface here: ioctls the ABI profile does not describe are
-  **refused**, not forwarded, and no guest pointer reaches the host driver as
-  a pointer — every field the host would follow is pointed at a buffer of the
-  backend's or zeroed, and what cannot be made so is refused
-  (`device/src/guestptr.rs`); UVM runs with pageable memory access off and
-  only its range-, handle- and GPU-level commands. RM shares stay inside the
-  VM, and a duplicate or a second client named in parameters must be the VM's
-  own (§4). IOCTL2 holds every display
-  call to the backend's own table (§10), NVKMS is held to grants (§13), a lease
-  may scan out only its own VM's framebuffers (§11), the Wayland allowlist is
-  enforced on the host (§14), and the backend refuses to run with privileges
-  the host drivers would hand on to every guest process: RM, DRM and NVKMS take
-  a guest's privilege from the backend's credentials, so it will not start as
-  root and drops every capability. `RM_ALLOC` classes and RM control
-  commands are allow-listed per release, default deny. What does not, yet:
-  the backend holds the host descriptors itself — the isolate is why that one
-  is in the design at all.
-  [`SECURITY.md`](SECURITY.md) has the rest of what is open.
+  What narrows that surface -- the backend's own tables for every call, no
+  guest pointer reaching the host as a pointer, the RM allowlist, the
+  unprivileged and sandboxed backend -- and what is still open is
+  [`SECURITY.md`](SECURITY.md)'s, "Summary" and "The host GPU surface". The
+  largest open item is structural: the backend holds the host descriptors
+  itself, in the process that maps guest memory; the isolate (below) is why
+  that one is in the design at all.
 
   If you need mutually untrusted tenants isolated by hardware, this is not it:
   one card per guest with an IOMMU, or vGPU.
 - **Four guests, so far.** Four have shared one card evenly
   ([`BENCHMARKS.md`](BENCHMARKS.md)); more has not been tried.
 - **No unified memory**, and no MIG or SR-IOV.
-- **Nothing the guest already has can be given to the GPU** (§5), and RM's own
-  dma-buf export is refused, because it would put the new dma-buf in the
-  backend's descriptor table.
+- **Memory the guest already has reaches the GPU only by its pages**, never
+  by its address, and only with `--allow-compute` ("Registered memory", §5);
+  it is never exported onward (an RM export or UVM P2P naming it is
+  refused). RM's own dma-buf export is refused outright, because it would
+  put the new dma-buf in the backend's descriptor table.
 - **No cancelling a display call.** A host modeset cannot be interrupted, so a
   guest killed in the middle of one leaves it to finish on its executor; what
   bounds it is the host driver's own timeout.
@@ -1223,7 +1215,7 @@ injection"; the rig's `nvgpu-inject-test` and `nvgpu-capture-import`
 
 ---
 
-## Future work: the isolate
+## 19. Future work: the isolate
 
 A sandboxed helper process, one per guest process, launched from a memfd. It
 would hold the real host `/dev/nvidia*` descriptors and perform the forwarded
@@ -1251,7 +1243,7 @@ host's Wayland compositor.
 
 ---
 
-## 19. Prior art
+## 20. Prior art
 
 **gVisor `nvproxy`** is the direct ancestor: it established that forwarding the
 NVIDIA kernel ABI is viable, and its versioned ABI tables are the model for §8.
