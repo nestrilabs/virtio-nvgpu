@@ -971,6 +971,16 @@ impl OsDesc {
         self.by_key.contains_key(&Key { client, object })
     }
 
+    /// `(client, object)` holds a registration, as far as `holds` is
+    /// concerned.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&mut self, client: u32, object: u32) {
+        self.by_key
+            .entry(Key { client, object })
+            .or_default()
+            .push(u64::MAX);
+    }
+
     /// Guest file `file` is charged to `owner` (quota.rs).
     pub(crate) fn set_file_owner(&mut self, file: u32, owner: crate::quota::Owner) {
         if owner == crate::quota::Owner::Unknown {

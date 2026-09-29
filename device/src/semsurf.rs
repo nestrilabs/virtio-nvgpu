@@ -476,6 +476,16 @@ impl SemsurfPolicy {
         self.admit(p.target(), index, params)
     }
 
+    /// The RM client and semaphore surface a 0x54 names, from the
+    /// backend's copy of the call; None for any other call.
+    pub fn ctx_surface(p: &Prepared) -> Option<(u32, u32)> {
+        if p.cmd() != SEMSURF_FENCE_CTX_CREATE {
+            return None;
+        }
+        let params = p.pointee(0, CTX_PARAMS_PTR_AT).and_then(|b| p.buffer(b))?;
+        Some((rd(params, 0, 4)? as u32, rd(params, 4, 4)? as u32))
+    }
+
     /// `Hooks::after` for 0x54: count the context it made. Only for a
     /// render handle still live, so a call that finished after a reset (or
     /// after its file closed) leaves no count behind for a later handle of

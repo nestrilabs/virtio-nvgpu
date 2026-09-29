@@ -960,6 +960,21 @@ impl NvidiaBackend {
             self.recheck_granting_leases();
         }
         let prepared = xfer::prepare(&BackendEnv { backend: self }, class, target, kind, payload)?;
+        // A fence context over memory registered by its pages (osdesc.rs)
+        // would be a holder of it the registration does not know: NVKMS
+        // duplicates the surface and kernel-maps its memory, and would go
+        // on writing into the pages after the guest unpinned them for
+        // another process. Refused, as the cheap fail-closed answer (review
+        // 2026-09-29 1.4).
+        if let Some((client, surface)) = crate::semsurf::SemsurfPolicy::ctx_surface(&prepared)
+            && self.osdesc.holds(client, surface)
+        {
+            log::warn!(
+                "SEMSURF_FENCE_CTX_CREATE on handle {target}: surface {client:#x}/{surface:#x} \
+                 holds memory registered by its pages; refused"
+            );
+            return Err(libc::EPERM);
+        }
         // The whole reply must fit what the guest posted, and that is known
         // now: response_len() is exact up to descriptors and GEM handles the
         // host might not produce. A call that ran and then could not answer
@@ -1664,6 +1679,62 @@ mod tests {
             host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 8]).0,
             -libc::ENOTTY
         );
+    }
+
+    /// A fence context over a semaphore surface that holds memory
+    /// registered by its pages never reaches the host: NVKMS would be a
+    /// holder of the pages the registration does not know (review
+    /// 2026-09-29 1.4). Another surface of the same client does.
+    #[test]
+    fn a_fence_context_over_registered_memory_is_refused() {
+        const CLIENT: u32 = 0xc1d0_0001;
+        let mut be = backend();
+        hello(&mut be, HELLO_F_FRESH);
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        be.semsurf.render_opened(render, 0);
+        be.semsurf.set_layout(
+            0,
+            crate::semsurf::Layout {
+                stride: 32,
+                max_submitted: 24,
+            },
+        );
+        be.semsurf.client_allocated(render, CLIENT);
+        be.osdesc.held_for_test(CLIENT, 0x5e5);
+        let ctx = |surface: u32| {
+            let mut block = [0u8; 16];
+            block[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+            block[4..8].copy_from_slice(&surface.to_le_bytes());
+            block[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            let mut arg = [0u8; 32];
+            arg[8..16].copy_from_slice(&0x7000u64.to_le_bytes());
+            arg[16..24].copy_from_slice(&16u64.to_le_bytes());
+            let mut p = Vec::new();
+            for v in [
+                crate::semsurf::SEMSURF_FENCE_CTX_CREATE,
+                0,
+                2,
+                0,
+                0,
+                0,
+                48,
+                render,
+            ] {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            for n in [32u32, 16] {
+                p.extend_from_slice(&n.to_le_bytes());
+            }
+            p.extend_from_slice(&arg);
+            p.extend_from_slice(&block);
+            p
+        };
+        be.current_handle = render;
+        assert_eq!(
+            be.prepare_ioctl2(&ctx(0x5e5), 4096).err(),
+            Some(libc::EPERM)
+        );
+        assert!(be.prepare_ioctl2(&ctx(0x5e6), 4096).is_ok());
     }
 
     #[test]
