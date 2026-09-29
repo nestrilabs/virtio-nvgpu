@@ -14,7 +14,8 @@ faster than prose can follow.
 > encoding on the GPU. A guest renders, presents and encodes H.264, costs
 > within 2% of bare metal, and four guests share one card evenly
 > ([`BENCHMARKS.md`](BENCHMARKS.md)). All of that was measured before
-> protocol v2, and has not been re-measured since.
+> protocol v2, on an RTX 3060, and measured again on the current code, on an
+> RTX 5090, on 2026-09-29 (the same file).
 >
 > **Built since, and run on an RTX 5090 (595.99.02) under nesbox and crosvm,
 > as of 2026-09-26:** protocol v2 (§10); guest DRM files that drive a leased
@@ -26,7 +27,10 @@ faster than prose can follow.
 > with the UVM aperture and memory registered by its pages (§5); the RM
 > allowlist, enforcing; and the security changes that came with them
 > ([`SECURITY.md`](SECURITY.md)). About 35 applications ran on the live
-> desktop ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)). None of it has been timed.
+> desktop ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)). Frame pacing on a
+> monitor and the cost of each path against bare metal were measured on
+> 2026-09-29 ([`DEPLOY.md`](DEPLOY.md), "Frame pacing";
+> [`BENCHMARKS.md`](BENCHMARKS.md)).
 >
 > **Built, not yet run on hardware:** a guest driving the host card itself
 > (compositor-VM mode, §11) and export mode (§14), which need the host desktop
@@ -439,10 +443,11 @@ frames slightly faster than bare metal. It reads as a performance win. It is a
 core per guest, and on a machine whose business is guests per host, it is the
 most expensive thing that can happen.
 
-The cost of doing it properly is that a wake now takes about a third of a
-millisecond — the host's poll, the queue, an interrupt, and a vCPU that has
-gone idle. That is nothing against a 16.7 ms frame and everything against a
-0.05 ms one, which is exactly what the benchmark shows.
+The cost of doing it properly is that a wake crosses the boundary: the host's
+poll, the queue, an interrupt, and a vCPU that may have gone idle. On an RTX
+5090 a Vulkan fence a guest sleeps on costs about 15 µs more than natively
+(BENCHMARKS.md). That is nothing against a 16.7 ms frame and a third of a
+frame that barely exists, which is exactly what the benchmark shows.
 
 Protocol v2 carries more on the same wake — a fence's status, a flip event —
 and turns every wait a guest could otherwise ask a host thread to sit in into

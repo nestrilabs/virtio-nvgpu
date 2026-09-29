@@ -55,14 +55,15 @@ all of it device setup.
 Full method, raw runs and the things these numbers do **not** support:
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
-**Every number in this section predates protocol v2.** It was measured on the
-code before the display work and the security changes that came with it: the
-new transport, a memory type per mapping, guest system memory made cacheable
-and GPU-coherent, the pointer and descriptor scrubbing, the RM allowlist and
-the backend's sandbox. None of it has been re-measured since; the current code
-has been run for function (below), not timed. The design gives a render loop
-nothing new to cross, which is a reason to expect the same numbers, not a
-measurement of them.
+**Those numbers are an RTX 3060's, on the code before protocol v2.** The
+current code was measured again on an RTX 5090 (2026-09-29, the same
+programs natively and in nesbox and crosvm guests,
+[`BENCHMARKS.md`](BENCHMARKS.md)): frames of a millisecond or more within
+3% of bare metal, 4.7 ms and above within 1%; CUDA, OpenCL, NVDEC, NVENC and
+every copy between host and GPU at native speed. What crosses to the host
+costs a round trip each -- an RM call about 2 µs more than natively, a CPU
+mapping of GPU memory about twice as long, a wait that sleeps 12-16 µs more --
+so starting a Vulkan device takes about 1.4 times as long.
 
 ### Several guests on one card
 
@@ -713,7 +714,9 @@ objects on the host, and is turned away before the host driver sees it:
 Measured, on one card, by one synthetic load, before protocol v2 — see
 [`BENCHMARKS.md`](BENCHMARKS.md) for the method and the raw runs, and for what
 this does not support (it does not support a comparison with any other
-hypervisor, because none was run).
+hypervisor, because none was run). The current code, re-measured on an RTX
+5090 across rendering, compute, memory, video, start-up and the control path,
+keeps the GPU-bound and CPU rows below; its full table is in the same file.
 
 | | virtio-nvgpu, measured | Venus, by design |
 | --- | --- | --- |
