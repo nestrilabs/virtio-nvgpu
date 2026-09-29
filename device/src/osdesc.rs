@@ -113,6 +113,7 @@ use protocol::messages::{
 };
 
 use crate::hostfd;
+use crate::le;
 #[cfg(test)]
 use crate::nvos::{
     NV_ERR_NO_MEMORY, NVOS02_STATUS, NVOS02_WITH_FD_FD, NVOS32_ALLOC_OS_DESC_H_MEMORY,
@@ -255,14 +256,6 @@ pub(crate) enum Shape {
     RmAlloc,
 }
 
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-fn rd64(b: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
-}
-
 /// What one of the three calls asks RM to pin, read from the block the host
 /// will be handed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,17 +292,17 @@ pub(crate) fn shape_of(cmd: u32, outer: &[u8]) -> Option<Shape> {
     }
     match hostfd::ioc_nr(cmd) {
         NV_ESC_RM_ALLOC_MEMORY
-            if rd32(outer, NVOS02_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
+            if le::u32_at(outer, NVOS02_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
         {
             Some(Shape::AllocMemory)
         }
         NV_ESC_RM_VID_HEAP_CONTROL
-            if rd32(outer, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR) =>
+            if le::u32_at(outer, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR) =>
         {
             Some(Shape::VidHeap)
         }
         NV_ESC_RM_ALLOC
-            if rd32(outer, NVOS64_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
+            if le::u32_at(outer, NVOS64_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
         {
             Some(Shape::RmAlloc)
         }
@@ -341,41 +334,41 @@ pub(crate) fn describe(cmd: u32, outer: &[u8], nested: &[u8]) -> Result<Call, Er
             // second such call -- or any ALLOC_MEMORY that makes an object
             // under a zero handle -- would end its registration while RM
             // still holds the pages.
-            if rd32(outer, NVOS02_H_OBJECT_NEW) == Some(0) {
+            if le::u32_at(outer, NVOS02_H_OBJECT_NEW) == Some(0) {
                 return refuse("a zero hObjectNew", libc::EINVAL);
             }
             // RmAllocOsDescriptor: ALLOC_USER_READ_ONLY makes ATTR2
             // PROTECTION_USER read-only, which RmCreateOsDescriptor pins for
             // (escape.c:260-261, 161).
-            let flags = rd32(outer, NVOS02_FLAGS).unwrap_or(0);
+            let flags = le::u32_at(outer, NVOS02_FLAGS).unwrap_or(0);
             (
-                rd64(outer, NVOS02_P_MEMORY),
-                rd64(outer, NVOS02_LIMIT),
+                le::u64_at(outer, NVOS02_P_MEMORY),
+                le::u64_at(outer, NVOS02_LIMIT),
                 flags & NVOS02_FLAGS_ALLOC_USER_READ_ONLY == 0,
-                rd32(outer, NVOS02_H_ROOT),
-                rd32(outer, NVOS02_H_OBJECT_PARENT),
+                le::u32_at(outer, NVOS02_H_ROOT),
+                le::u32_at(outer, NVOS02_H_OBJECT_PARENT),
             )
         }
         Shape::VidHeap => {
             if !size_is(NVOS32_SIZE) || !nested.is_empty() {
                 return refuse("not NVOS32", libc::EINVAL);
             }
-            if rd32(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE)
+            if le::u32_at(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE)
                 != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS)
             {
                 return refuse("a descriptor that is not a virtual address", libc::EPERM);
             }
-            let attr2 = rd32(outer, NVOS32_ALLOC_OS_DESC_ATTR2).unwrap_or(0);
+            let attr2 = le::u32_at(outer, NVOS32_ALLOC_OS_DESC_ATTR2).unwrap_or(0);
             (
-                rd64(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR),
-                rd64(outer, NVOS32_ALLOC_OS_DESC_LIMIT),
+                le::u64_at(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR),
+                le::u64_at(outer, NVOS32_ALLOC_OS_DESC_LIMIT),
                 attr2 & ATTR2_PROTECTION_USER_READ_ONLY == 0,
-                rd32(outer, NVOS32_H_ROOT),
-                rd32(outer, NVOS32_H_OBJECT_PARENT),
+                le::u32_at(outer, NVOS32_H_ROOT),
+                le::u32_at(outer, NVOS32_H_OBJECT_PARENT),
             )
         }
         Shape::RmAlloc => {
-            let size = rd32(outer, NVOS64_PARAMS_SIZE).unwrap_or(u32::MAX) as usize;
+            let size = le::u32_at(outer, NVOS64_PARAMS_SIZE).unwrap_or(u32::MAX) as usize;
             if !size_is(NVOS64_SIZE)
                 || nested.len() != NV_OS_DESC_MEMORY_ALLOCATION_SIZE
                 || !(size == 0 || size == NV_OS_DESC_MEMORY_ALLOCATION_SIZE)
@@ -385,21 +378,21 @@ pub(crate) fn describe(cmd: u32, outer: &[u8], nested: &[u8]) -> Result<Call, Er
                     libc::EINVAL,
                 );
             }
-            if rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE)
+            if le::u32_at(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE)
                 != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS)
             {
                 return refuse("a descriptor that is not a virtual address", libc::EPERM);
             }
             // osdescConstruct: either marks it read-only (os_desc_mem.c:75-84).
-            let attr2 = rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_ATTR2).unwrap_or(0);
-            let flags = rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_FLAGS).unwrap_or(0);
+            let attr2 = le::u32_at(nested, NV_OS_DESC_MEMORY_ALLOCATION_ATTR2).unwrap_or(0);
+            let flags = le::u32_at(nested, NV_OS_DESC_MEMORY_ALLOCATION_FLAGS).unwrap_or(0);
             (
-                rd64(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR),
-                rd64(nested, NV_OS_DESC_MEMORY_ALLOCATION_LIMIT),
+                le::u64_at(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR),
+                le::u64_at(nested, NV_OS_DESC_MEMORY_ALLOCATION_LIMIT),
                 attr2 & ATTR2_PROTECTION_USER_READ_ONLY == 0
                     && flags & NVOS32_ALLOC_FLAGS_USER_READ_ONLY == 0,
-                rd32(outer, NVOS64_H_ROOT),
-                rd32(outer, NVOS64_H_OBJECT_PARENT),
+                le::u32_at(outer, NVOS64_H_ROOT),
+                le::u32_at(outer, NVOS64_H_OBJECT_PARENT),
             )
         }
     };
@@ -435,7 +428,7 @@ pub(crate) fn parse_runs(call: &Call, deep: &[u8]) -> Result<Vec<(u64, u64)>, Er
     };
     const HDR: usize = size_of::<OsDescHdr>();
     const RUN: usize = size_of::<OsDescRun>();
-    let (Some(nruns), Some(flags)) = (rd32(deep, 0), rd32(deep, 4)) else {
+    let (Some(nruns), Some(flags)) = (le::u32_at(deep, 0), le::u32_at(deep, 4)) else {
         return refuse(format!("{} bytes, no header", deep.len()));
     };
     if nruns == 0 || nruns > OSDESC_MAX_RUNS {
@@ -458,9 +451,9 @@ pub(crate) fn parse_runs(call: &Call, deep: &[u8]) -> Result<Vec<(u64, u64)>, Er
     let mut total = 0u64;
     for i in 0..nruns as usize {
         let at = HDR + i * RUN;
-        let gpa = rd64(deep, at).unwrap_or(0);
-        let pages = u64::from(rd32(deep, at + 8).unwrap_or(0));
-        if rd32(deep, at + 12) != Some(0) {
+        let gpa = le::u64_at(deep, at).unwrap_or(0);
+        let pages = u64::from(le::u32_at(deep, at + 8).unwrap_or(0));
+        if le::u32_at(deep, at + 12) != Some(0) {
             return refuse(format!("run {i}: reserved bits"));
         }
         if !gpa.is_multiple_of(PAGE) || pages == 0 {
@@ -720,14 +713,12 @@ pub(crate) const EXPORT_MEM: u32 = 0x00e0_0101;
 /// control. A block too short for its layout names every word in it.
 pub(crate) fn exported(cmd: u32, params: &[u8]) -> Option<Vec<u32>> {
     let words = |from: usize, n: usize| -> Vec<u32> {
-        (0..n).filter_map(|i| rd32(params, from + 4 * i)).collect()
+        (0..n)
+            .filter_map(|i| le::u32_at(params, from + 4 * i))
+            .collect()
     };
     let every = || words(0, params.len() / 4);
-    let count16 = |off: usize| {
-        params
-            .get(off..off + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-    };
+    let count16 = |off: usize| le::uint_at(params, off, 2).map(|n| n as usize);
     Some(match cmd {
         // NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS: object.type,
         // .rmObject.{hDevice, hParent, hObject} (hObject at 12), fd, flags.

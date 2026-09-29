@@ -41,6 +41,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
+use crate::le;
 use crate::sys::block::Arena;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -463,7 +464,7 @@ pub fn lease_state(sys: &dyn xfer::Sys, fd: RawFd) -> Result<LeaseState, xfer::E
         (r, a.bytes(top).to_vec())
     };
     let (r, arg) = counts(DRM_IOCTL_MODE_GET_LEASE, 16, &[8]);
-    let count = |a: &[u8], off: usize| u32::from_le_bytes(a[off..off + 4].try_into().unwrap());
+    let count = |a: &[u8], off: usize| le::u32_at(a, off).unwrap_or(0);
     match r {
         0.. if count(&arg, 0) != 0 => return Ok(LeaseState::Holds),
         0.. => return Ok(LeaseState::Empty),

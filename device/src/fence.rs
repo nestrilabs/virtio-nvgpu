@@ -60,6 +60,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
+use crate::le;
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
@@ -144,10 +145,7 @@ pub fn before(cmd: u32, arg: &mut [u8]) -> Result<(), Errno> {
         SYNCOBJ_WAIT => zero(arg, WAIT_TIMEOUT_AT),
         SYNCOBJ_TIMELINE_WAIT => zero(arg, TIMELINE_WAIT_TIMEOUT_AT),
         SYNCOBJ_TRANSFER => {
-            let flags = arg
-                .get(TRANSFER_FLAGS_AT..TRANSFER_FLAGS_AT + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                .ok_or(libc::EINVAL)?;
+            let flags = le::u32_at(arg, TRANSFER_FLAGS_AT).ok_or(libc::EINVAL)?;
             if flags & WAIT_FOR_SUBMIT != 0 {
                 log::warn!(
                     "SYNCOBJ_TRANSFER with WAIT_FOR_SUBMIT would park a host thread for up to \
@@ -334,8 +332,7 @@ impl Default for Registrations {
 const SYNC_FILE_MODE: u32 = 1 << 0;
 
 fn word(arg: Option<&[u8]>, at: usize) -> Option<u32> {
-    arg.and_then(|a| a.get(at..at + 4))
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    le::u32_at(arg?, at)
 }
 
 impl Registrations {

@@ -26,9 +26,9 @@ pub fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     bytes(b, at).map(u64::from_le_bytes)
 }
 
-/// An unsigned word of `width` bytes (1 to 8), zero-extended.
+/// An unsigned word of `width` bytes (at most 8), zero-extended.
 pub fn uint_at(b: &[u8], at: usize, width: usize) -> Option<u64> {
-    if !(1..=8).contains(&width) {
+    if width > 8 {
         return None;
     }
     let s = b.get(at..at.checked_add(width)?)?;
@@ -67,7 +67,8 @@ mod tests {
         assert_eq!(uint_at(&b, 4, 2), Some(2));
         assert_eq!(uint_at(&b, 8, 1), Some(0xff));
         assert_eq!(uint_at(&b, 0, 9), None);
-        assert_eq!(uint_at(&b, 0, 0), None);
+        assert_eq!(uint_at(&b, 9, 0), Some(0));
+        assert_eq!(uint_at(&b, 10, 0), None);
         assert_eq!(put_u32(&mut b, 6, 7), None);
         assert_eq!(b[6..], [0, 0, 0xff]);
         assert_eq!(put_u64(&mut b, usize::MAX, 7), None);

@@ -101,6 +101,7 @@ use std::time::{Duration, Instant};
 
 use abi::version::DriverVersion;
 
+use crate::le;
 use crate::schema::{self, Kind, NvkmsLayout, NvkmsPermArr, NvkmsTarget, policy};
 use crate::xfer::{Errno, Prepared};
 
@@ -299,22 +300,17 @@ fn coherent_display_only(lo: &NvkmsLayout, params: &mut [u8]) {
     }
 }
 
+/// A field the table places outside the block is the block's refusal.
 fn rd(b: &[u8], off: usize, width: usize) -> Result<u64, Errno> {
-    let s = b.get(off..off + width).ok_or(libc::EINVAL)?;
-    let mut v = [0u8; 8];
-    v[..width].copy_from_slice(s);
-    Ok(u64::from_le_bytes(v))
+    le::uint_at(b, off, width).ok_or(libc::EINVAL)
 }
 
 fn rd32(b: &[u8], off: u32) -> Result<u32, Errno> {
-    Ok(rd(b, off as usize, 4)? as u32)
+    le::u32_at(b, off as usize).ok_or(libc::EINVAL)
 }
 
 fn wr32(b: &mut [u8], off: u32, v: u32) -> Result<(), Errno> {
-    b.get_mut(off as usize..off as usize + 4)
-        .ok_or(libc::EINVAL)?
-        .copy_from_slice(&v.to_le_bytes());
-    Ok(())
+    le::put_u32(b, off as usize, v).ok_or(libc::EINVAL)
 }
 
 fn zero(b: &mut [u8], ranges: &[(u32, u32)]) -> Result<(), Errno> {

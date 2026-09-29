@@ -62,6 +62,7 @@ use abi::ioctl::{
     NV_ESC_RM_MAP_MEMORY_DMA, NV_ESC_RM_VID_HEAP_CONTROL,
 };
 
+use crate::le;
 use crate::nvos::{
     NV_CONTEXT_DMA_ALLOCATION_FLAGS, NV_CONTEXT_DMA_ALLOCATION_H_MEMORY, NV_MEMORY_ALLOCATION_ATTR,
     NV_MEMORY_ALLOCATION_ATTR2, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVOS00_H_OBJECT_OLD,
@@ -275,26 +276,18 @@ impl Tree {
     }
 }
 
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-fn wr32(b: &mut [u8], off: usize, v: u32) {
-    if let Some(s) = b.get_mut(off..off + 4) {
-        s.copy_from_slice(&v.to_le_bytes());
-    }
-}
-
 impl Pending {
     /// Replace `mask` bits of the word at `off` with `bits`, remembering the
     /// caller's, if they differ.
     fn rewrite(&mut self, params: &mut [u8], off: usize, mask: u32, bits: u32) {
-        let Some(w) = rd32(params, off) else { return };
+        let Some(w) = le::u32_at(params, off) else {
+            return;
+        };
         if w & mask == bits & mask {
             return;
         }
         self.restore.push((off, mask, w & mask));
-        wr32(params, off, (w & !mask) | (bits & mask));
+        let _ = le::put_u32(params, off, (w & !mask) | (bits & mask));
     }
 }
 
@@ -373,7 +366,7 @@ impl RmMem {
         let mut p = Pending::default();
         match escape {
             NV_ESC_RM_ALLOC if params.len() >= NVOS64_SIZE => {
-                let class = rd32(params, NVOS64_H_CLASS).unwrap_or(0);
+                let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
                 let mem = if class == NV01_MEMORY_SYSTEM {
                     self.alloc_sysmem(
                         &mut p,
@@ -404,13 +397,14 @@ impl RmMem {
                 // (hMemory, flags, attr, attr2) of the three allocating
                 // functions: ALLOC_SIZE, ALLOC_TILED_PITCH_HEIGHT,
                 // ALLOC_SIZE_RANGE (nvos.h:690-800).
-                let at = match rd32(params, NVOS32_FUNCTION) {
+                let at = match le::u32_at(params, NVOS32_FUNCTION) {
                     Some(2) => Some((44, 52, 56, 144)),
                     Some(6) => Some((44, 52, 64, 144)),
                     Some(14) => Some((44, 52, 56, 136)),
                     _ => None,
                 };
-                if rd32(params, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR) {
+                if le::u32_at(params, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR)
+                {
                     p.record = Record::New {
                         client: NVOS32_H_ROOT,
                         handle: NVOS32_ALLOC_OS_DESC_H_MEMORY,
@@ -420,8 +414,9 @@ impl RmMem {
                         is_client: false,
                     };
                 } else if let Some((handle, flags, attr, attr2)) = at {
-                    let a = rd32(params, attr).unwrap_or(0);
-                    let virt = rd32(params, flags).unwrap_or(0) & NVOS32_ALLOC_FLAGS_VIRTUAL != 0;
+                    let a = le::u32_at(params, attr).unwrap_or(0);
+                    let virt =
+                        le::u32_at(params, flags).unwrap_or(0) & NVOS32_ALLOC_FLAGS_VIRTUAL != 0;
                     let vidmem = (a >> ATTR_LOCATION_SHIFT) & 3 == ATTR_LOCATION_VIDMEM;
                     let mem = if virt || vidmem {
                         None
@@ -439,8 +434,8 @@ impl RmMem {
                 }
             }
             NV_ESC_RM_ALLOC_MEMORY if params.len() >= NVOS02_WITH_FD_SIZE => {
-                let class = rd32(params, NVOS02_H_CLASS).unwrap_or(0);
-                let flags = rd32(params, NVOS02_FLAGS).unwrap_or(0);
+                let class = le::u32_at(params, NVOS02_H_CLASS).unwrap_or(0);
+                let flags = le::u32_at(params, NVOS02_FLAGS).unwrap_or(0);
                 let mem = if class == NV01_MEMORY_SYSTEM
                     && (flags >> OS02_LOCATION_SHIFT) & 0xf == OS02_LOCATION_PCI
                 {
@@ -466,7 +461,7 @@ impl RmMem {
                     None
                 };
                 // Only NV01_MEMORY_SYSTEM arms a mapping (escape.c:415-431).
-                let fd = rd32(params, NVOS02_WITH_FD_FD)
+                let fd = le::u32_at(params, NVOS02_WITH_FD_FD)
                     .filter(|&fd| fd as i32 >= 0 && class == NV01_MEMORY_SYSTEM);
                 p.record = Record::New {
                     client: NVOS02_H_ROOT,
@@ -482,8 +477,8 @@ impl RmMem {
                 // has cached is what the GPU reads. Only system memory:
                 // vidmem ignores the flag (gm107 :429-430), and leaving it
                 // alone keeps those mappings byte-identical to native.
-                let client = rd32(params, NVOS46_H_CLIENT).unwrap_or(0);
-                let mem = rd32(params, NVOS46_H_MEMORY).unwrap_or(0);
+                let client = le::u32_at(params, NVOS46_H_CLIENT).unwrap_or(0);
+                let mem = le::u32_at(params, NVOS46_H_MEMORY).unwrap_or(0);
                 if self.coherent && matches!(self.lookup(client, mem), Some(Mem::Sysmem { .. })) {
                     p.rewrite(params, NVOS46_FLAGS, OS46_CACHE_SNOOP, OS46_CACHE_SNOOP);
                 }
@@ -522,8 +517,8 @@ impl RmMem {
         attr: usize,
         attr2: usize,
     ) -> Option<Mem> {
-        let a = rd32(params, attr)?;
-        let a2 = rd32(params, attr2)?;
+        let a = le::u32_at(params, attr)?;
+        let a2 = le::u32_at(params, attr2)?;
         let display = a2 & (ATTR2_ISO_YES | ATTR2_NISO_DISPLAY_YES) != 0;
         let asked = ((a & ATTR_COHERENCY_MASK) >> ATTR_COHERENCY_SHIFT) as u8;
         let (coherency, rewritten) = self.coherency_for(asked, display);
@@ -545,8 +540,8 @@ impl RmMem {
     /// A client's own context DMA over memory made coherent here snoops. It
     /// chose NVOS03 CACHE_SNOOP to match the memory it thinks it has.
     fn ctxdma(&self, p: &mut Pending, params: &mut [u8]) {
-        let client = rd32(params, NVOS64_H_ROOT).unwrap_or(0);
-        let Some(mem) = rd32(params, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_H_MEMORY) else {
+        let client = le::u32_at(params, NVOS64_H_ROOT).unwrap_or(0);
+        let Some(mem) = le::u32_at(params, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_H_MEMORY) else {
             return;
         };
         if let Some(Mem::Sysmem {
@@ -567,8 +562,8 @@ impl RmMem {
     /// record what succeeded. `reply` has the same layout as the parameters.
     pub(crate) fn after(&mut self, p: Pending, reply: &mut [u8]) {
         for (off, mask, bits) in p.restore {
-            if let Some(w) = rd32(reply, off) {
-                wr32(reply, off, (w & !mask) | bits);
+            if let Some(w) = le::u32_at(reply, off) {
+                let _ = le::put_u32(reply, off, (w & !mask) | bits);
             }
         }
         match p.record {
@@ -581,10 +576,11 @@ impl RmMem {
                 armed_on,
                 is_client,
             } => {
-                if rd32(reply, status) != Some(0) {
+                if le::u32_at(reply, status) != Some(0) {
                     return;
                 }
-                let (Some(c), Some(h)) = (rd32(reply, client), rd32(reply, handle)) else {
+                let (Some(c), Some(h)) = (le::u32_at(reply, client), le::u32_at(reply, handle))
+                else {
                     return;
                 };
                 if is_client {
@@ -593,7 +589,7 @@ impl RmMem {
                     return;
                 }
                 self.set(c, h, mem);
-                if let Some(parent) = rd32(reply, PARENT) {
+                if let Some(parent) = le::u32_at(reply, PARENT) {
                     self.tree.link(c, h, parent);
                 }
                 if let (Some(fd), Some(m)) = (armed_on, mem) {
@@ -601,22 +597,22 @@ impl RmMem {
                 }
             }
             Record::Dup => {
-                if rd32(reply, NVOS55_STATUS) != Some(0) {
+                if le::u32_at(reply, NVOS55_STATUS) != Some(0) {
                     return;
                 }
-                let get = |o| rd32(reply, o).unwrap_or(0);
+                let get = |o| le::u32_at(reply, o).unwrap_or(0);
                 let src = self.lookup(get(NVOS55_H_CLIENT_SRC), get(NVOS55_H_OBJECT_SRC));
                 self.set(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), src);
                 self.tree
                     .link(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), get(PARENT));
             }
             Record::Free => {
-                if rd32(reply, NVOS00_STATUS) != Some(0) {
+                if le::u32_at(reply, NVOS00_STATUS) != Some(0) {
                     return;
                 }
                 let (root, old) = (
-                    rd32(reply, NVOS00_H_ROOT).unwrap_or(0),
-                    rd32(reply, NVOS00_H_OBJECT_OLD).unwrap_or(0),
+                    le::u32_at(reply, NVOS00_H_ROOT).unwrap_or(0),
+                    le::u32_at(reply, NVOS00_H_OBJECT_OLD).unwrap_or(0),
                 );
                 if old == root {
                     // The client, and with it everything it held.
@@ -697,6 +693,7 @@ pub fn warn_if_guest_pat_ignored(coherent: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::le::u32_at as rd32;
 
     const CLIENT: u32 = 0xc1d0_0001;
 

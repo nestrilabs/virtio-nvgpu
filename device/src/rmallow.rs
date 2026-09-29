@@ -41,6 +41,7 @@ use abi::ioctl::*;
 use abi::rmallow::{self, Release};
 use abi::version::DriverVersion;
 
+use crate::le;
 #[cfg(test)]
 use crate::nvos::NVOS64_SIZE;
 use crate::nvos::{
@@ -119,10 +120,6 @@ impl Default for RmAllow {
     fn default() -> Self {
         Self::new(Mode::default())
     }
-}
-
-fn rd32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
 impl RmAllow {
@@ -207,7 +204,8 @@ impl RmAllow {
             NV_ESC_RM_ALLOC_OBJECT => self.class(top_block, NVOS05_H_CLASS, NVOS05_STATUS),
             NV_ESC_RM_ALLOC_CONTEXT_DMA2 => self.class(top_block, NVOS39_H_CLASS, NVOS39_STATUS),
             NV_ESC_RM_VID_HEAP_CONTROL => {
-                let f = rd32(top_block, NVOS32_FUNCTION).ok_or(Refusal::Errno(libc::EINVAL))?;
+                let f =
+                    le::u32_at(top_block, NVOS32_FUNCTION).ok_or(Refusal::Errno(libc::EINVAL))?;
                 if self.release.vidheap(f) {
                     Ok(())
                 } else {
@@ -249,7 +247,7 @@ impl RmAllow {
             {
                 // Both sizes: which caller sends what is the question a
                 // size refusal raises.
-                let sent_size = rd32(top_block, NVOS54_PARAMS_SIZE).unwrap_or(0);
+                let sent_size = le::u32_at(top_block, NVOS54_PARAMS_SIZE).unwrap_or(0);
                 let want = self.release.control(cmd).and_then(|e| e.size).unwrap_or(0);
                 format!(
                     "sent with a parameter size RM does not take ({sent_size} bytes; RM takes {want})"
@@ -278,8 +276,8 @@ impl RmAllow {
 
     fn control(&self, top: &[u8], params: &[u8]) -> Result<(), (What, Refusal)> {
         let short = |w| (w, Refusal::Errno(libc::EINVAL));
-        let cmd = rd32(top, NVOS54_CMD).ok_or_else(|| short(What::Control(0)))?;
-        let size = rd32(top, NVOS54_PARAMS_SIZE).ok_or_else(|| short(What::Control(cmd)))?;
+        let cmd = le::u32_at(top, NVOS54_CMD).ok_or_else(|| short(What::Control(0)))?;
+        let size = le::u32_at(top, NVOS54_PARAMS_SIZE).ok_or_else(|| short(What::Control(cmd)))?;
         let status = NVOS54_STATUS;
         if top.len() < status + 4 {
             return Err(short(What::Control(cmd)));
@@ -315,7 +313,8 @@ impl RmAllow {
         // privilege, from the bundle it keeps: RM runs only its own few,
         // and each must be one the guest may call now.
         if DEFERRED_API_CONTROLS.contains(&cmd) {
-            let inner = rd32(params, DEFERRED_API_CMD).ok_or_else(|| short(What::Control(cmd)))?;
+            let inner =
+                le::u32_at(params, DEFERRED_API_CMD).ok_or_else(|| short(What::Control(cmd)))?;
             if !self.release.deferred(inner) || self.release.control(inner).is_none() {
                 return Err(unsupported(inner));
             }
@@ -324,7 +323,8 @@ impl RmAllow {
     }
 
     fn class(&self, top: &[u8], class_at: usize, status: usize) -> Result<(), (What, Refusal)> {
-        let class = rd32(top, class_at).ok_or((What::Class(0), Refusal::Errno(libc::EINVAL)))?;
+        let class =
+            le::u32_at(top, class_at).ok_or((What::Class(0), Refusal::Errno(libc::EINVAL)))?;
         if top.len() < status + 4 {
             return Err((What::Class(class), Refusal::Errno(libc::EINVAL)));
         }

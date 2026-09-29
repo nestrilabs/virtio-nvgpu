@@ -59,15 +59,10 @@ impl Owner {
         if !proc_ids {
             return Owner::Unknown;
         }
-        let Some(b) = payload.get(at..at + size_of::<ProcId>()) else {
-            return Owner::Unknown;
-        };
-        let id = ProcId {
-            start_ns: u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            tgid: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            euid: u32::from_le_bytes(b[12..16].try_into().unwrap()),
-        };
-        Owner::from_wire(&id)
+        match crate::sys::pod::read::<ProcId>(payload, at) {
+            Some(id) => Owner::from_wire(&id),
+            None => Owner::Unknown,
+        }
     }
 }
 

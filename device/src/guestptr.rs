@@ -77,6 +77,7 @@ use std::os::fd::BorrowedFd;
 use abi::ioctl::*;
 
 use crate::hostfd;
+use crate::le;
 #[cfg(test)]
 use crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
 use crate::nvos::{
@@ -179,14 +180,6 @@ impl Plan<'_> {
     }
 }
 
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-fn rd64(b: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
-}
-
 // ───────────────────────────── RM escapes ─────────────────────────────
 
 /// Classes no guest may have the backend allocate, because their parameters
@@ -271,8 +264,8 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         // it goes, with the pointers zeroed; a list is still refused.
         NV_ESC_RM_IDLE_CHANNELS => {
             sized(56)?;
-            let num = rd32(params, 12).unwrap_or(0);
-            let flags = rd32(params, 40).unwrap_or(0);
+            let num = le::u32_at(params, 12).unwrap_or(0);
+            let flags = le::u32_at(params, 40).unwrap_or(0);
             if (flags >> 4) & 0xf == 0 && num != 0 {
                 log::warn!(
                     "RM_IDLE_CHANNELS refused: a list of {num} channels is three arrays the \
@@ -314,7 +307,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         }
         NV_ESC_RM_ALLOC => {
             sized(NVOS64_SIZE)?;
-            let class = rd32(params, NVOS64_H_CLASS).unwrap_or(0);
+            let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
             if REFUSED_ALLOC_CLASSES.contains(&class) {
                 log::warn!("RM_ALLOC of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
@@ -331,7 +324,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
             } else {
                 NVOS39_H_CLASS
             };
-            let class = rd32(params, at).ok_or(libc::EINVAL)?;
+            let class = le::u32_at(params, at).ok_or(libc::EINVAL)?;
             if REFUSED_ALLOC_CLASSES.contains(&class) {
                 log::warn!("RM escape {escape:#04x} of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
@@ -339,7 +332,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         }
         NV_ESC_RM_CONTROL => {
             sized(NVOS54_SIZE)?;
-            let ctl = rd32(params, NVOS54_CMD).unwrap_or(0);
+            let ctl = le::u32_at(params, NVOS54_CMD).unwrap_or(0);
             if abi::rmctrl::refused(ctl) {
                 log::warn!(
                     "RM control {ctl:#010x} refused: its pointers cannot be named one by one"
@@ -349,7 +342,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         }
         NV_ESC_RM_ALLOC_MEMORY => {
             sized(NVOS02_WITH_FD_SIZE)?;
-            let class = rd32(params, NVOS02_H_CLASS).unwrap_or(0);
+            let class = le::u32_at(params, NVOS02_H_CLASS).unwrap_or(0);
             if REFUSED_ALLOC_MEMORY_CLASSES.contains(&class) {
                 log::warn!("ALLOC_MEMORY of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
@@ -360,7 +353,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         }
         NV_ESC_RM_VID_HEAP_CONTROL => {
             sized(NVOS32_SIZE)?;
-            match rd32(params, NVOS32_FUNCTION).unwrap_or(0) {
+            match le::u32_at(params, NVOS32_FUNCTION).unwrap_or(0) {
                 NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR => {
                     log::warn!("VID_HEAP_CONTROL ALLOC_OS_DESCRIPTOR refused (guestptr.rs)");
                     return Err(libc::EPERM);
@@ -418,10 +411,10 @@ pub(crate) fn idle_channels_list<'g>(
         return Err(libc::EINVAL);
     }
     let count = IDLE_CHANNELS.ptrs[0].counts[0].offset;
-    let num = rd32(params, count).unwrap_or(0);
+    let num = le::u32_at(params, count).unwrap_or(0);
     let (lo, hi) = IDLE_CHANNELS_LIST_BITS;
     let channel =
-        (rd32(params, IDLE_CHANNELS_FLAGS).unwrap_or(0) >> lo) & ((1 << (hi - lo + 1)) - 1);
+        (le::u32_at(params, IDLE_CHANNELS_FLAGS).unwrap_or(0) >> lo) & ((1 << (hi - lo + 1)) - 1);
     // Only a list reads the arrays: segments for anything else are not a
     // mistake to paper over.
     if channel != IDLE_CHANNELS_LIST || num == 0 {
@@ -615,7 +608,7 @@ pub(crate) fn uvm_gate(
     let mut plan = Plan::default();
     if cmd == UVM_INITIALIZE {
         // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
-        let Some(flags) = rd64(params, 0) else {
+        let Some(flags) = le::u64_at(params, 0) else {
             return Err(libc::EINVAL);
         };
         // Sharing mode on top: one VA-space shape for every guest, whether or
@@ -651,6 +644,7 @@ pub(crate) fn uvm_gate(
 mod tests {
     use super::*;
     use crate::hostfd::{IOC_RW, ioc};
+    use crate::le::u64_at as rd64;
     use abi::rmctrl::{CONTROL_POINTERS, REFUSED_CONTROLS};
 
     fn put32(b: &mut [u8], off: usize, v: u32) {

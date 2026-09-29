@@ -67,6 +67,7 @@ use abi::ioctl::{
 };
 pub use protocol::messages::ProcId;
 
+use crate::le;
 use crate::nvos::{
     DEFERRED_API_BUNDLE, DEFERRED_API_CMD, DEFERRED_API_CONTROLS, DEFERRED_API_H_CLIENT_VA,
     NV_ERR_INSUFFICIENT_PERMISSIONS, NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_ARGUMENT,
@@ -108,10 +109,6 @@ pub const CTRL_SHARE_OBJECT: u32 = 0x0000_0d06;
 /// list included.
 pub const GRANT_CAP: usize = 4096;
 
-fn rd32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-
 /// An `RS_SHARE_POLICY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -125,11 +122,11 @@ impl Policy {
     /// The 12-byte policy at `at` in `b`: `{target, accessMask, type (u16),
     /// action (u8)}` (rs_access.h; the same in 595.99.02 and 610.57.04).
     pub fn read(b: &[u8], at: usize) -> Option<Self> {
-        let p = b.get(at..at + 12)?;
+        let p = b.get(at..at.checked_add(12)?)?;
         Some(Self {
-            target: rd32(p, 0)?,
-            mask: rd32(p, 4)?,
-            kind: u16::from_le_bytes([p[8], p[9]]),
+            target: le::u32_at(p, 0)?,
+            mask: le::u32_at(p, 4)?,
+            kind: le::uint_at(p, 8, 2)? as u16,
             action: p[10],
         })
     }
@@ -287,9 +284,9 @@ pub enum DupVerdict {
 /// NV_ESC_RM_DUP_OBJECT's `(hClient, hClientSrc, hObjectSrc)`.
 pub fn dup_names(params: &[u8]) -> Option<(u32, u32, u32)> {
     Some((
-        rd32(params, 0)?,
-        rd32(params, NVOS55_H_CLIENT_SRC)?,
-        rd32(params, NVOS55_H_OBJECT_SRC)?,
+        le::u32_at(params, 0)?,
+        le::u32_at(params, NVOS55_H_CLIENT_SRC)?,
+        le::u32_at(params, NVOS55_H_OBJECT_SRC)?,
     ))
 }
 
@@ -527,7 +524,7 @@ fn named_list(
     name: &'static str,
     rule: Rule,
 ) -> Result<Vec<Named>, &'static str> {
-    let n = rd32(b, count).ok_or(name)? as usize;
+    let n = le::u32_at(b, count).ok_or(name)? as usize;
     if n > max {
         return Err(name);
     }
@@ -569,7 +566,7 @@ pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<Named>, &'static str
             &[f(DEFERRED_API_H_CLIENT_VA, Rule::Process)],
             "NV5080_CTRL_CMD_DEFERRED_API",
         )?;
-        let inner = rd32(params, DEFERRED_API_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
+        let inner = le::u32_at(params, DEFERRED_API_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
         let bundle = params.get(DEFERRED_API_BUNDLE..).unwrap_or(&[]);
         if let Some(r) = control_fields(inner, bundle) {
             out.extend(r?);
@@ -582,12 +579,12 @@ pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<Named>, &'static str
 fn named(b: &[u8], fields: &[Field], name: &'static str) -> Result<Vec<Named>, &'static str> {
     let mut out = Vec::new();
     for fl in fields {
-        let h = rd32(b, fl.at).ok_or(name)?;
+        let h = le::u32_at(b, fl.at).ok_or(name)?;
         if h == 0 {
             continue;
         }
         let obj = match fl.rule {
-            Rule::Shared { obj, .. } => rd32(b, obj).ok_or(name)?,
+            Rule::Shared { obj, .. } => le::u32_at(b, obj).ok_or(name)?,
             _ => 0,
         };
         out.push(Named {
@@ -607,16 +604,16 @@ fn named(b: &[u8], fields: &[Field], name: &'static str) -> Result<Vec<Named>, &
 pub fn share_of(escape: u32, params: &[u8]) -> Option<(u32, u32, Policy)> {
     match escape {
         NV_ESC_RM_SHARE => Some((
-            rd32(params, 0)?,
-            rd32(params, NVOS57_H_OBJECT)?,
+            le::u32_at(params, 0)?,
+            le::u32_at(params, NVOS57_H_OBJECT)?,
             Policy::read(params, NVOS57_SHARE_POLICY)?,
         )),
         NV_ESC_RM_CONTROL => {
-            let client = rd32(params, 0)?;
+            let client = le::u32_at(params, 0)?;
             let ctl = params.get(NVOS54_SIZE..)?;
-            match rd32(params, NVOS54_CMD)? {
+            match le::u32_at(params, NVOS54_CMD)? {
                 CTRL_SET_INHERITED_SHARE_POLICY => Some((client, client, Policy::read(ctl, 0)?)),
-                CTRL_SHARE_OBJECT => Some((client, rd32(ctl, 0)?, Policy::read(ctl, 4)?)),
+                CTRL_SHARE_OBJECT => Some((client, le::u32_at(ctl, 0)?, Policy::read(ctl, 4)?)),
                 _ => None,
             }
         }
@@ -826,15 +823,11 @@ impl NvidiaBackend {
             NV_ESC_RM_DUP_OBJECT => true,
             NV_ESC_RM_CONTROL => euid,
             NV_ESC_RM_ALLOC => {
-                rd32(params, NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c))
+                le::u32_at(params, NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c))
             }
             _ => false,
         };
-        let id = trailer.get(..size_of::<ProcId>()).map(|b| ProcId {
-            start_ns: u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            tgid: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            euid: u32::from_le_bytes(b[12..16].try_into().unwrap()),
-        });
+        let id = crate::sys::pod::read::<ProcId>(trailer, 0);
         match id {
             Some(id) => Ok(Some(Caller::from_wire(&id, euid))),
             None if needed => {
@@ -863,7 +856,7 @@ impl NvidiaBackend {
         let shares = escape == NV_ESC_RM_SHARE
             || (escape == NV_ESC_RM_CONTROL
                 && matches!(
-                    rd32(params, NVOS54_CMD),
+                    le::u32_at(params, NVOS54_CMD),
                     Some(CTRL_SET_INHERITED_SHARE_POLICY | CTRL_SHARE_OBJECT)
                 ));
         if shares && (share.is_none() || (escape == NV_ESC_RM_SHARE && params.len() < NVOS57_SIZE))
@@ -920,15 +913,15 @@ impl NvidiaBackend {
                 }
             }
             NV_ESC_RM_ALLOC => {
-                let own = rd32(params, 0).unwrap_or(0);
-                let class = rd32(params, NVOS64_H_CLASS).unwrap_or(0);
+                let own = le::u32_at(params, 0).unwrap_or(0);
+                let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
                 let nested = params.get(NVOS64_SIZE..).unwrap_or(&[]);
                 self.named_clients_ok(own, caller, alloc_named(class, nested))
                     .map_err(Refuse::Status)?;
             }
             NV_ESC_RM_CONTROL => {
-                let own = rd32(params, 0).unwrap_or(0);
-                let cmd = rd32(params, NVOS54_CMD).unwrap_or(0);
+                let own = le::u32_at(params, 0).unwrap_or(0);
+                let cmd = le::u32_at(params, NVOS54_CMD).unwrap_or(0);
                 let ctl = params.get(NVOS54_SIZE..).unwrap_or(&[]);
                 self.named_clients_ok(own, caller, control_named(cmd, ctl))
                     .map_err(Refuse::Status)?;
@@ -946,7 +939,8 @@ impl NvidiaBackend {
             // `event->nvfp`), which is the one the caller then polls, a file of
             // its own and not the one its client was made on.
             NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
-                let Some(client) = rd32(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE) else {
+                let Some(client) = le::u32_at(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE)
+                else {
                     log::warn!("OS event call ({escape:#04x}) too short to name its client");
                     return Err(Refuse::Errno(libc::EINVAL));
                 };
@@ -1023,7 +1017,7 @@ impl NvidiaBackend {
         let Some((owner, object, p)) = pending.share else {
             return;
         };
-        if status_at(escape).and_then(|at| rd32(reply, at)) == Some(0) {
+        if status_at(escape).and_then(|at| le::u32_at(reply, at)) == Some(0) {
             self.semsurf.shared(owner, object, &p);
         }
     }
@@ -1588,6 +1582,7 @@ mod tests {
 mod backend_tests {
     use super::*;
     use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
+    use crate::le::u32_at as rd32;
     use protocol::messages::{
         BCAP_PROC_EUID, BCAP_PROC_ID, DeviceKind, GCAP_PROC_EUID, GCAP_PROC_ID, HELLO_F_FRESH,
         HelloReq, MsgType, PROTO_V2, ProcId,

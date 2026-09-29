@@ -23,6 +23,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use protocol::messages::*;
 
 use crate::fence::RegKey;
+use crate::le;
 use crate::pump::WatchMode;
 
 /// The kind of a backend handle. Wire value in `HK_*` (protocol::messages).
@@ -863,20 +864,8 @@ pub fn sync_file_signalled(fd: RawFd) -> io::Result<(i32, u64)> {
 fn latest_signal(infos: &[u8]) -> u64 {
     infos
         .chunks_exact(SYNC_FENCE_INFO_SIZE)
-        .filter(|r| {
-            i32::from_le_bytes(
-                r[SYNC_FENCE_INFO_STATUS..SYNC_FENCE_INFO_STATUS + 4]
-                    .try_into()
-                    .unwrap(),
-            ) == 1
-        })
-        .map(|r| {
-            u64::from_le_bytes(
-                r[SYNC_FENCE_INFO_TIMESTAMP..SYNC_FENCE_INFO_TIMESTAMP + 8]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
+        .filter(|r| le::i32_at(r, SYNC_FENCE_INFO_STATUS) == Some(1))
+        .filter_map(|r| le::u64_at(r, SYNC_FENCE_INFO_TIMESTAMP))
         .max()
         .unwrap_or(0)
 }
