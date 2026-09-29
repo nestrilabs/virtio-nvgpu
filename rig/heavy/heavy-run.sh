@@ -99,8 +99,11 @@ EOF
 
 stk() { # <preset> <renderer> <w> <h>
     stk_config "$@"
-    local t0=$SECONDS
-    "${MANGO[@]}" supertuxkart --benchmark >"$OUT/app.log" 2>&1
+    local t0=$SECONDS lim=()
+    # HEAVY_STK_TIMEOUT: kill the game itself after that many seconds (a
+    # loop of start-ups; not a measurement).
+    [ -n "${HEAVY_STK_TIMEOUT:-}" ] && lim=(timeout -s KILL "$HEAVY_STK_TIMEOUT")
+    ${lim[@]+"${lim[@]}"} "${MANGO[@]}" supertuxkart --benchmark >"$OUT/app.log" 2>&1
     meta "exit=$? wall_s=$((SECONDS - t0))"
     local d=$XDG_CONFIG_HOME/supertuxkart/config-0.10 prof ms
     prof=$(grep -a 'Profiler: Frame count' "$OUT/app.log" | tail -n 1)
