@@ -150,6 +150,7 @@ int main(int argc, char **argv) {
   int done = 0, unmap_failed = 0;
   for (int i = 0; i < iterations; i++) {
     struct mem_alloc m = {0};
+    m.owner = 0x6e766d63;                   /* any but 0, ~0 and RM's own */
     m.type = 0;                             /* NVOS32_TYPE_IMAGE */
     m.attr = (0u << 25) | (1u << 23);       /* LOCATION_VIDMEM, PAGE_SIZE_4KB */
     m.size = len;
