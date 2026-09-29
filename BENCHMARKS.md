@@ -20,12 +20,19 @@ The short version, on an RTX 5090 with the current code:
   in a device the host serves.
 - **Start-up is set-up**: thousands of those calls, so a Vulkan device takes
   about 1.4 times as long to create, and CUDA's first context 1.3 times.
+- **Games and renderers** ([Heavy workloads](#heavy-workloads)): GPU-bound
+  ones run at native speed under nesbox, lows included, and pace like the
+  host on a 240 Hz monitor. A game presenting a thousand frames a second
+  loses 8-14% to explicit sync's eleven round trips a frame, and a frame
+  that writes freshly allocated staging memory runs at a quarter of native
+  speed, a page fault a page.
 
 [Table](#native-against-a-guest) ·
 [How it was measured](#how-it-was-measured) ·
 [Where the time went](#where-the-time-went) ·
 [What remains](#what-remains-and-why) ·
 [What these numbers do not support](#what-these-numbers-do-not-support) ·
+[Heavy workloads](#heavy-workloads) ·
 [Earlier, on an RTX 3060](#earlier-an-rtx-3060-before-protocol-v2) ·
 [Re-taking these](#re-taking-these)
 
@@ -308,10 +315,228 @@ touch of its own memory runs at 0.4 GB/s against nesbox's 8
   on an RTX 3060, on the code before protocol v2 (below).
 - **No other hypervisor.** nesbox and crosvm run the same device; nothing
   here compares this project with Venus, vGPU or passthrough.
-- **Nothing presented.** Frame pacing on a monitor is in DEPLOY.md, "Frame
-  pacing" (measured the same day, before this work).
-- **Synthetic loads**, and Blender. No game was timed here; SuperTuxKart's
-  frame pacing is in DEPLOY.md.
+- **Nothing presented** in the table above. Frame pacing on a monitor is in
+  DEPLOY.md, "Frame pacing", and one heavy game's in "Heavy workloads".
+- **Synthetic loads** in the table above; games, an engine, Blender and a
+  streaming loop are in "Heavy workloads".
+
+## Heavy workloads
+
+RTX 5090, 595.99.02, Ryzen 9 9950X, 2026-09-29. Games, an engine, a
+renderer and a texture-streaming loop, each run unpaced (vsync off, no frame
+cap) against the rig's headless sway, and every frame's time recorded the
+same way natively and in a guest (`rig/rig-heavy.sh`; rig/TESTING-RIG.md,
+"Heavy workloads"): MangoHud's present-to-present time for SuperTuxKart,
+the programs' own clocks for Godot, Blender and `vk-stream`. The code is
+`display-passthrough` at `f462409` with the backend, nesbox and crosvm it
+installed; the guest has 4 vCPUs, 8 GiB and `--allow-compute` (Godot's
+Forward+ needs UVM), the backend its defaults, sandbox on, RM allowlist
+enforcing. Three runs of each, interleaved, mean ± half the range; Blender
+two. **1% low** and **0.1% low** are the average rate over the slowest 1%
+and 0.1% of frames. **×native** is native's rate over the guest's.
+**native, 4 CPUs** is the same program confined to as many CPUs as the
+guest has (`taskset -c 0-3`), which separates what the guest's CPU count
+costs from what the device costs.
+
+**GPU-bound.** SuperTuxKart 1.5's `--benchmark` (a replayed race) at
+3840x2160 with every effect on (dynamic lights, 2048 shadows, SSAO, glow,
+light shafts, DoF, motion blur, MLAA, HD textures); Godot 4.7 Forward+ at
+3840x2160 with SDFGI, volumetric fog, SSAO, SSIL, SSR and 48 shadowed omni
+lights over 900 meshes; Blender 5 EEVEE, 1920x1080 at 64 samples, 150
+subdivided meshes, ray tracing and volumetrics, from its UI (s a frame).
+
+| workload | figure | native | nesbox | ×native | crosvm | ×native |
+|---|---|---|---|---|---|---|
+| SuperTuxKart, 4K ultra | avg fps | 198.9 ± 3.2 | 198.7 ± 4.4 | 1.00 | 197.4 ± 3.8 | 1.01 |
+| | 1% / 0.1% low | 121.5 / 64.5 | 129.9 / 77.3 | | 97.0 / 31.4 | |
+| | p99 / p99.9 ms | 6.73 / 9.59 | 6.37 / 10.25 | | 6.73 / 16.45 | |
+| Godot, SDFGI 4K | avg fps | 228.7 ± 4.1 | 229.8 ± 5.2 | 1.00 | 225.7 ± 6.8 | 1.01 |
+| | 1% / 0.1% low | 181.6 / 159.4 | 190.6 / 174.8 | | 151.4 / 119.4 | |
+| Blender EEVEE, GL | s a frame | 2.56 | 2.56 | 1.00 | 3.04 | 1.19 |
+| Blender EEVEE, Vulkan | s a frame | 2.47 | -- (hangs, below) | | 2.77 (1 of 2) | 1.12 |
+
+Blender ran with a 16 GiB window (`NVGPU_WINDOW_MIB=16384
+NVGPU_WINDOW_SHARE=90`); at the default it does not run (4, below).
+
+**CPU- and present-bound.** The same SuperTuxKart race at 1280x720 on the
+legacy pipeline with every effect off (GL), and at 3840x2160 on its Vulkan
+renderer, which has no advanced pipeline and so is light too; Godot's
+"draws" scene, 20,000 meshes of 64 shapes and 97 materials the renderer
+cannot merge, at 1280x720.
+
+| workload | figure | native | native, 4 CPUs | nesbox | ×native (4 CPUs) | crosvm | ×native (4 CPUs) |
+|---|---|---|---|---|---|---|---|
+| SuperTuxKart 720p, GL | avg fps | 1201 ± 30 | 1176 ± 2 | 1088 ± 6 | 1.10 (1.08) | 979 ± 6 | 1.23 (1.20) |
+| | p50 / p99 ms | 0.780 / 1.58 | 0.806 / 1.53 | 0.843 / 1.54 | | 0.950 / 2.08 | |
+| | 1% / 0.1% low | 419 / 144 | 442 / 147 | 560 / 282 | | 336 / 172 | |
+| SuperTuxKart 4K, Vulkan | avg fps | 1499 ± 6 | 1374 ± 7 | 1203 ± 11 | 1.25 (1.14) | 986 ± 20 | 1.52 (1.39) |
+| | p50 / p99 ms | 0.628 / 1.07 | 0.689 / 1.13 | 0.797 / 1.24 | | 0.913 / 2.82 | |
+| Godot, 20,000 draws, Vulkan | avg fps | 112.5 ± 1.7 | 116.5 ± 1.9 | 108.5 ± 6.4 | 1.04 (1.07) | 101.8 ± 6.5 | 1.11 (1.14) |
+| | 1% low | 91.5 | 93.3 | 78.0 ± 30 | | 67.9 | |
+
+The guest's 1% and 0.1% lows at 720p are better than native's: natively
+the race's heaviest stretches run on more threads than the guest has, and
+the frame time varies twice as much (CV 1.07 against 0.47). Godot's GL
+"draws" scene has no row: it is bimodal natively too (61 or 28 fps from one
+run to the next).
+
+**Streaming.** `nvgpu-bench vk-stream`, a frame as an engine without a
+sub-allocator streams textures: four fresh host-visible staging buffers of
+256 KiB to 2 MiB allocated, mapped and written by the CPU, copied on one
+submit, 0.6 ms of GPU work on a second submit that waits on the first
+through a semaphore, two frames in flight. `vk-stream-pool` is the same
+frame from staging memory allocated once and kept mapped.
+
+| workload | figure | native | nesbox | ×native | crosvm | ×native |
+|---|---|---|---|---|---|---|
+| vk-stream | avg fps | 781 ± 7 | 212 ± 11 | 3.69 | 206 ± 8 | 3.79 |
+| | CPU a frame: allocate + map / first write | 1.17 / 0.20 ms | 2.08 / 3.76 ms | | | |
+| vk-stream-pool | avg fps | 1126 ± 4 | 1130 ± 1 | 1.00 | 1128 ± 1 | 1.00 |
+
+**On a monitor.** The same SuperTuxKart race with every effect on
+(`rig/rig-framepace.sh stk-ultra`, the profile race on "lighthouse") on
+DP-3 at 3840x2160 and 240 Hz, vsync on, through Hyprland's composition
+(`render:direct_scanout` off), two 20 s logs each: native 240.0 fps, p99
+4.47 ms, p99.9 5.06 ms; nesbox 240.0 fps, p99 4.47 ms, p99.9 5.07 ms; no
+frame missed a vblank either way.
+
+### Where the time went
+
+**1. GPU-bound frames run at native speed.** At 4-5 ms a frame a guest
+under nesbox is within 1% of native, and so are its lows; on a monitor it
+paces exactly as the host does. A frame crosses to the host about 17 times
+(ten IOCTL2s of explicit sync, two closes, two fence watches, a Wayland
+message each way): at 200 frames a second, off the GPU's critical path.
+
+**2. Explicit sync costs about 80 µs a frame** (the largest per-frame cost
+left). NVIDIA's EGL and Vulkan Wayland paths make eleven synchronous DRM
+calls a present: two binary syncobjs created, transferred into and
+destroyed, a semaphore-surface fence made and exported, one imported and
+waited on, the release point waited for (`pacing: ioctl2:`). Each is a
+round trip from the presenting thread, 7.0-7.5 µs under nesbox at a
+thousand frames a second, 12 under crosvm. Against the program on four
+CPUs that is the whole gap: SuperTuxKart at 720p loses 8% to it, and on its
+Vulkan renderer, which presents 1,370 times a second, 14%; the median
+frame is 40 and 110 µs longer. The backend's timing report (`pacing:
+ioctl2 time`, new here) splits each call: of about 55 µs of backend time a
+frame, the host ioctls are 15; preparing a call (the schema walk, copies,
+translation, policy) is 0.7-2 µs; classifying the descriptor the two
+exporting calls produce is 2.8 µs each (a `statx` and a `readlink` of
+`/proc/self/fd`); and every call handed its duplicate of the target file to
+the closer thread. That hand-off is now skipped when the handle table
+provably still holds the file: IOCTL2 service 5.1 -> 4.6 µs, the guest's
+round trip 7.5 -> 7.0 µs, which is inside the frame rate's run-to-run
+spread. The calls come one at a time from NVIDIA's userspace, each using
+the last one's result, so nothing below it can batch them.
+
+**3. The first write to fresh system memory faults once a page** (the
+largest loss measured). Streaming through fresh staging memory runs at a
+quarter of native speed; from memory kept mapped, at native speed. A frame
+spends 1.2 ms natively and 2.1 ms in a guest allocating and mapping its four
+buffers (each map a request to the VMM, above), but 0.2 ms natively and 3.8 ms in a
+guest writing them: 1.05 GB/s against 19.7, a second-level page fault on
+every 4 KiB page. The cause, read in Linux 7.2.7 and open-gpu-kernel-modules
+595.99.02: the driver maps its system memory into the VMM with
+`vm_insert_page` (kernel-open/nvidia/nv-mmap.c `nvidia_mmap_sysmem()`),
+on order-0 pages it allocated itself, whose `folio->mapping` is NULL. With
+`CONFIG_SECRETMEM` (on here) GUP-fast refuses such a folio (mm/gup.c
+`gup_fast_folio_allowed()`), and KVM maps a read fault -- which
+`KVM_PRE_FAULT_MEMORY` is -- writable only if GUP-fast with `FOLL_WRITE`
+succeeds (virt/kvm/kvm_main.c `hva_to_pfn_fast()`, `hva_to_pfn_slow()`).
+So the prefault maps these pages read-only and each first write takes the
+slow path. Video memory (a PFNMAP, whose writability KVM reads from the
+PTE) and compound pages (the driver's allocations of order above 0,
+kernel-open/nvidia/nv-vm.c `nv_compute_gfp_mask()`) are not affected.
+
+**4. The default window is too small for a heavy application.** Blender's
+EEVEE scene maps more write-combined and write-back memory than one process
+may hold in the default 1 GiB window (384 MiB of the WC zone and 112 MiB
+of the WB zone at the default 50% share): the backend refuses the mappings
+(`SHM WriteCombine zone: guest process ... may not take`), Blender's Vulkan
+backend reports staging buffers it cannot allocate, and Blender segfaults
+on either backend. With a 16 GiB window at 90% it runs. DEPLOY.md, "Sizing
+the window", has the sizes.
+
+**5. crosvm stalls where nesbox does not.** Under crosvm the GPU-bound runs
+keep their average and lose their lows: SuperTuxKart's 0.1% low is 31 fps
+against nesbox's 77 and native's 65, from a dozen frames of 20-40 ms in
+bursts where nesbox and native have one or none, and every Blender GL run
+has one frame of about 6 s. Its crossings cost more (an IOCTL2 round trip
+of 11.9 µs against 7.4, with a long tail: 21,000 calls over 64 µs in one
+run against 800). Core scheduling explains the CPU-bound gap but not the
+stalls: with `NVGPU_CROSVM_CORE_SCHED=0` SuperTuxKart on Vulkan went from
+986 to 1,150 fps (nesbox 1,203), and the 4K race's 0.1% low only from 31 to
+39.
+
+**6. The event pump wakes for events nobody waits on.** A Vulkan game's
+driver posts about 125,000 events a second on its device files; none reach
+the guest, but the pump wakes for each (`pacing: legacy readiness ...
+events nobody waited on`), and the backend used 45% of a core for a
+1,200 fps Vulkan game against 32% for GL at the same rate. Taking an
+unarmed descriptor out of epoll would save that, but not simply: NVIDIA's
+`poll` clears a dataless event as it reports it, and epoll polls a
+descriptor twice when it is added or modified with an event pending
+(fs/eventpoll.c `ep_insert()` or `ep_modify()`, then
+`ep_send_events()`), so an event arriving as the descriptor is re-armed
+would be lost, and a guest waiting on it would hang.
+
+### Failures met on the way
+
+- **SuperTuxKart's Vulkan renderer aborts natively too.** "vkQueueSubmit
+  failed" at the start of the race, then "Aborting SuperTuxKart": 1 of 20
+  guest runs, and 3 of 6 native runs confined to four CPUs (none of 6
+  unconfined). It is the program's or the driver's, made likelier by fewer
+  CPUs, not the device's. An aborted process can go on rendering; the
+  harness kills what is left of a native run before the next.
+- **FIFO_DISABLE_CHANNELS is refused, and that is benign.** NVIDIA's Vulkan
+  driver brackets about half a millisecond of queue set-up with
+  `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` on its own client's 16 channels
+  (seen natively with `rig/heavy/rmlog.c`, an LD_PRELOAD logger of RM
+  controls). The RM allowlist refuses it, which the driver sees as
+  NV_ERR_NOT_SUPPORTED -- what CPU-RM itself answers on a GPU without
+  GSP -- and copes with. Thirty start-ups in one guest with it refused and
+  thirty with it forwarded (`--rm-allowlist=log`) all reached the race.
+  It stays refused.
+- **Blender's Vulkan backend hangs in a guest.** With the 16 GiB window,
+  4 of 8 guest runs under either VMM stopped after a frame, with nothing
+  crossing to the host but readiness arms until the watchdog; 0 of 5 native
+  runs did. Not explained; a probe that dumps the waiting threads' kernel
+  stacks after two minutes did not catch one in
+  three tries.
+- **Godot's GL scene hung once as it exited** (1 of 8 guest runs, crosvm),
+  with no message crossing to the host until the watchdog. Not reproduced.
+
+### What would close the rest
+
+In the order of what each would buy:
+
+1. **Map fresh system memory writable up front** (3: 3.7 times on
+   streaming). Either a host kernel whose `KVM_PRE_FAULT_MEMORY` can map for
+   write, or whose GUP-fast accepts a driver's unmapped order-0 folio for a
+   non-pinning get; or RM allocating host-visible system memory in 64 KiB
+   pages or larger, which the driver then allocates as compound pages that
+   GUP-fast accepts. The last could be the backend's, by rewriting the
+   allocation's page-size attribute, at the cost of rounding and of
+   higher-order allocations that can fail under fragmentation; it belongs
+   in the backend's RM allocation path (`device/src/nvidia/rm.rs`).
+2. **Find the Blender Vulkan hang** (a correctness item): the waiting
+   threads' stacks, and which event the guest waits for.
+3. **Cut the backend's cost per IOCTL2** (2: up to about 40 µs a frame, 5%
+   at a thousand frames a second). A cheaper exact classification of
+   exported descriptors (a `readlinkat` on a directory descriptor kept for
+   `/proc/self/fd`, 0.3 µs of the readlink's 1.0 in a microbenchmark, and no
+   allocation), and a leaner prepare and finish for the schema's plain
+   syncobj calls.
+4. **Post the calls whose answer nothing waits for.** SYNCOBJ_DESTROY's
+   only failure is a bad handle; sent without waiting, as closes already
+   are (`nvgpu_close_handle_async()`), it would save two round trips a frame
+   (about 10 µs). A guest driver and protocol change.
+5. **crosvm's stalls** (5): not core scheduling; the next step is to see
+   what its vCPU threads wait on during one.
+6. **Size the window for the workload** (4): a desktop VM that runs
+   creative applications wants 4 GiB or more.
+7. **Quiet the pump** (6): host CPU rather than frame time, and only with
+   the double-poll race solved.
 
 ## Earlier: an RTX 3060, before protocol v2
 
@@ -356,3 +581,6 @@ Each guest run also records the backend's and the VMM's CPU per group, both
 sides' pacing counters, and the backend's log (rig/TESTING-RIG.md,
 "Benchmarks"). **Check for a stray VM and a running build before believing
 anything**: either moves every figure, and looks like an ordinary result.
+The heavy workloads are `rig/rig-heavy.sh`'s (rig/TESTING-RIG.md, "Heavy
+workloads"); a game process left over from an aborted run loads every run
+after it the same way.

@@ -873,8 +873,28 @@ whose `ioctl2 time` line splits each IOCTL2's backend time into preparing
 and the host ioctl, both sides' pacing counters, and the backend's and the
 VMM's CPU over the run. Interleave native and guest runs and build
 nothing meanwhile, as for the benchmarks. For a monitor,
-`rig/rig-framepace.sh stk-ultra` and `stk-ultra-novsync` run the same
-effects on DP-3.
+`rig/rig-framepace.sh stk-ultra` runs the same effects on DP-3 with vsync.
+
+Known, and not ours:
+
+- **SuperTuxKart 1.5's Vulkan renderer aborts natively.** "vkQueueSubmit
+  failed", then "Aborting SuperTuxKart", at the start of the race: 3 of 6
+  native runs on four CPUs (`NVGPU_HEAVY_NATIVE_CPUS=0-3`), none of 6
+  unconfined, and 1 of 20 in a guest. An aborted process can go on
+  rendering on the compositor; `rig-heavy.sh` kills whatever is left of the
+  image's programs after each native run, and says so in the run's log.
+- **The RM allowlist's refusal of `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS`
+  is benign.** Every Vulkan run logs it twice at start-up. The driver
+  brackets half a millisecond of queue set-up with it on its own channels
+  natively (`rig/heavy/rmlog.c`, an LD_PRELOAD logger of RM controls, shows
+  the calls), sees the refusal as NV_ERR_NOT_SUPPORTED, and copes: thirty
+  start-ups in one guest refused and thirty forwarded (`--rm-allowlist=log`)
+  all reached the race. It stays refused.
+
+Not explained yet: Blender's Vulkan backend (`blender-vk`, 16 GiB window)
+hung in 4 of 8 guest runs under either VMM, none of 5 native, with nothing
+but readiness arms crossing to the host (BENCHMARKS.md, "Heavy
+workloads").
 
 ## What to keep from every run
 
