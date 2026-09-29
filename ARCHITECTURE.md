@@ -1174,9 +1174,10 @@ injection"; the rig's `nvgpu-inject-test` and `nvgpu-capture-import`
   comparison, and gVisor is explicit that it reduces attack surface rather than
   providing an isolation boundary.
 
-  What narrows that surface -- the backend's own tables for every call, no
-  guest pointer reaching the host as a pointer, the RM allowlist, the
-  unprivileged and sandboxed backend -- and what is still open is
+  What narrows that surface -- the backend's own tables for every call,
+  every pointer field those tables name relocated or zeroed, the RM
+  allowlist, the unprivileged and sandboxed backend -- and what is still
+  open is
   [`SECURITY.md`](SECURITY.md)'s, "Summary" and "The host GPU surface". The
   largest open item is structural: the backend holds the host descriptors
   itself, in the process that maps guest memory; the isolate (below) is why

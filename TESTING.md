@@ -114,8 +114,8 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   `NVGPU_SANDBOX=off`, `NVGPU_ALLOW_ROOT_UNSAFE=1` and every diagnostic
   backend flag also need `NVGPU_DIAGNOSTIC=1`. As root the launcher binds the
   backend's socket itself (`systemd-socket-activate`) and hands it over, so
-  the backend in the tree must be one that takes it (`LISTEN_FDS`, from the
-  2026-09-29 review on: SECURITY.md, "The backend's socket"); it starts when the VMM connects.
+  the backend in the tree must be one that takes it (`LISTEN_FDS`: SECURITY.md,
+  "The backend's socket"); it starts when the VMM connects.
 
 ### 0.4 Tools
 

@@ -32,9 +32,19 @@ Two halves, with different risk:
 - **The judgement half** — which commands exist, and which are safe to expose —
   follows gVisor's `nvproxy` upstream.
 
-Profiles key off **ranges, not points**: a driver release between two known
-versions selects the lower profile rather than requiring a new row. This is why
-the per-release cost is small rather than open-ended.
+The ABI profiles key off **ranges, not points**: a driver release between two
+known versions selects the lower profile rather than requiring a new row. The
+other tables do not: the backend starts only on a release every table was
+measured at (DEPLOY.md, "The exact-measured-release rule"), so a new host
+release still needs its NVKMS, RM control, UVM and allowlist tables ("A new
+host release", below).
+
+**Reference release.** The project reads NVIDIA's sources at
+`open-gpu-kernel-modules` 610.57.04, the tree the display work was written
+against, unless a table says otherwise. A citation names its release
+(CONTRIBUTING.md, "Comments and documentation"); an older one that does
+not may be of 595.99.02 or of 610.57.04, so check its line numbers against
+both.
 
 The generator must stay runnable by someone who does not work on this project.
 

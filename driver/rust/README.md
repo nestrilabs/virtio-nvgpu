@@ -144,45 +144,44 @@ vermagic; that is not what was tested.)
 
 ## Where it differed from the C
 
-Nothing now, on purpose. The port read each block of the caller's once --
-RM_CONTROL's nested block for the V1V2 count and pointer, the
-TIME_CORRELATION clock (whole, before refusing a TSC clock: `-EFAULT` for a
-block that does not all read) and the request; IDLE_CHANNELS' block for its
-flat fallback; an escape that may register memory by its pages for
-whichever path it takes -- where the C read the V1V2 block twice, the clock
-byte and the class word apart from what it then sent, and IDLE_CHANNELS
-twice. The C reads each once too since the 2026-09-26 review (SECURITY.md,
-Appendix A), and the difftest's one recognised difference is gone.
+Nothing, on purpose; the difftest holds the two equal. Both read each block
+of the caller's once and decide on that copy: RM_CONTROL's nested block for
+the V1V2 count and pointer, the TIME_CORRELATION clock (whole, before
+refusing a TSC clock: `-EFAULT` for a block that does not all read) and the
+request; IDLE_CHANNELS' block for its flat fallback; and an escape that may
+register memory by its pages, for whichever path it takes. The C once read
+several of these twice; SECURITY.md, Appendix A, has that history.
 
-Fixed in both since, each with a case in `difftest/tests/cases.rs` that
-fails against the earlier C: a size with a NULL pointer (RM_CONTROL,
-RM_ALLOC, v1 NVKMS) sent that much uninitialised guest kernel heap, and now
-gets the native driver's answer; `nvgpu_i2_wr()` wrote 4 bytes for a field
-of width 1 or 2, and the walk refuses a descriptor or GEM field of a width
-the generator refuses; a GEM handle named again after a failing `gem_out`
-hook was closed while an earlier proxy owned it; V1V2's count times 8
-wrapped in u32; a v1 NVKMS call read and wrote 16 bytes whatever its size.
-And from the 2026-09-26 review: an OS-descriptor registration abandoned in
-flight hands its pins to the transport (`osdesc::Env::send_pinned`) instead
-of keeping them under id 0 until remove(); a call that could be answered
-with more descriptors than the state holds is refused before it is sent;
-and the ATOMIC parse says commit/TEST_ONLY before any hook
-(`atomic::Env::begin`), which the Rust wrapper once said only after the
-parse -- so a hook reading it saw every commit as TEST_ONLY. The difftest
-records what each in-fence hook sees. That flag, `out->commit`, is the only
-source of commit-or-TEST_ONLY since the 2026-09-29 review: `nvgpu_kms.c`'s
-in-fence hook reads it through its context, where it once computed the same
-thing a second time from the same bytes.
+What else both do, each with a case in `difftest/tests/cases.rs` that the
+older C failed:
 
-From the 2026-09-29 review, in both: a v1 reply whose status is neither 0
-nor an errno is `-EPROTO`, with nothing of it read (`nvgpu_v1.c`,
-`wire::IoctlResp::parse`), where each path returned the raw status; and the
-C's large blocks are `kvmalloc`'d, as the Rust's always were.
+- a size with a NULL pointer (RM_CONTROL, RM_ALLOC, v1 NVKMS) gets the
+  native driver's answer, not that much uninitialised guest kernel heap;
+- the IOCTL2 walk refuses a descriptor or GEM field of a width the generator
+  refuses (`nvgpu_i2_wr()` wrote 4 bytes for a field of width 1 or 2);
+- a GEM handle named again after a failing `gem_out` hook is not closed
+  while an earlier proxy owns it;
+- V1V2's count times 8 is checked, not wrapped in u32;
+- a v1 NVKMS call is `-ENOTTY` unless it is NVKMS_IOCTL_CMD with its 16
+  bytes, as `nvkms_ioctl` answers (it read and wrote 16 bytes whatever its
+  ioctl's size);
+- an OS-descriptor registration abandoned in flight hands its pins to the
+  transport (`osdesc::Env::send_pinned`) instead of keeping them under id 0
+  until remove();
+- a call that could be answered with more descriptors than the state holds
+  is refused before it is sent;
+- the ATOMIC parse says commit/TEST_ONLY before any hook
+  (`atomic::Env::begin`), and that flag, `out->commit`, is the only source
+  of commit-or-TEST_ONLY: `nvgpu_kms.c`'s in-fence hook reads it through its
+  context. The difftest records what each in-fence hook sees;
+- a v1 reply whose status is neither 0 nor an errno is `-EPROTO`, with
+  nothing of it read (`nvgpu_v1.c`, `wire::IoctlResp::parse`);
+- the C's large blocks are `kvmalloc`'d, as the Rust's are.
 
 ## Retiring the C
 
-The Rust has passed, and is the default wherever the kernel has Rust (the
-2026-09-29 review). The C stays for one more step: the fallback for a guest
+The Rust has passed the hardware regression, and is the default wherever
+the kernel has Rust. The C stays for one more step: the fallback for a guest
 kernel without `CONFIG_RUST` (a distribution kernel, or a toolchain that
 does not match the kernel's), and the difftest's oracle. Once no supported
 guest kernel lacks Rust: delete `nvgpu_i2.c`, `nvgpu_rmio.c` and
