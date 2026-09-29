@@ -55,7 +55,9 @@ impl HandleKind {
     pub fn readiness_is_armed(self) -> bool {
         matches!(
             self,
-            Self::Dev(DeviceKind::Ctl | DeviceKind::Gpu(_) | DeviceKind::Uvm | DeviceKind::UvmTools)
+            Self::Dev(
+                DeviceKind::Ctl | DeviceKind::Gpu(_) | DeviceKind::Uvm | DeviceKind::UvmTools
+            )
         )
     }
 

@@ -259,13 +259,21 @@ impl Counters {
     /// A message of type `t` (its wire value) was answered, `t0` being when
     /// its chain was taken off the ring.
     pub fn served(&self, t: u32, t0: Instant) {
-        let i = if (t as usize) < MSG_KINDS { t as usize } else { 0 };
+        let i = if (t as usize) < MSG_KINDS {
+            t as usize
+        } else {
+            0
+        };
         self.msgs[i].fetch_add(1, Relaxed);
         self.service[i].since(t0);
     }
 
     pub fn host_op(&self, op: u32) {
-        let i = if (op as usize) < HOST_OPS { op as usize } else { 0 };
+        let i = if (op as usize) < HOST_OPS {
+            op as usize
+        } else {
+            0
+        };
         self.host_ops[i].fetch_add(1, Relaxed);
     }
 
@@ -494,7 +502,10 @@ pub fn summary(prev: Option<&Snap>, now: &Snap, start: Instant) -> Vec<String> {
         .ioctl2_names
         .iter()
         .map(|(k, v)| {
-            let p = prev.and_then(|p| p.ioctl2_names.get(k)).copied().unwrap_or([0, 0]);
+            let p = prev
+                .and_then(|p| p.ioctl2_names.get(k))
+                .copied()
+                .unwrap_or([0, 0]);
             (v[0].saturating_sub(p[0]), *k, v[1].saturating_sub(p[1]))
         })
         .filter(|(n, _, _)| *n != 0)

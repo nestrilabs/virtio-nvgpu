@@ -9,8 +9,9 @@ audit of branch `harden` (§11), the RM allowlist of branch `rmallow` (§12),
 the fuzzing of branch `fuzz` (§13), the memory-safety structure of
 branch `dind` (§14), the review of `dind` for memory passing (§15), and the
 VMMs it runs under, nesbox and crosvm (§16); by the review of 2026-09-26
-(§17); by capture injection (§18); and by the window's size and share, with the
-RM mapping fixes that came with them (§19). It is written for the project's owner. The
+(§17); by capture injection (§18); by the window's size and share, with the
+RM mapping fixes that came with them (§19); and by the frame-pacing changes
+(§20). It is written for the project's owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -2645,3 +2646,66 @@ gamescope), Blender GL and Vulkan, glmark2, vkmark and Chromium in one VM,
 churn reproduced the report against the backend before the fix and ran
 400/400 after it. A 48 GiB window was refused by nesbox with its size named,
 and the backend warned that its WC zone was more than half of BAR1.
+
+## 20. Frame pacing
+
+Branch `frame-timing`. Games in a guest paced worse than natively; what was
+found and changed is in DEPLOY.md, "Frame pacing". This section is what the
+changes do to the boundary. None lifts a cap: the syncobj wait registrations
+of §17 (1,024 per VM, a quarter per process) were never reached in any run
+(the counters below say so: no wait went over them, none backed off), and
+they stand as they were.
+
+**Armed readiness** (`GCAP_ARMS_READY`, `BCAP_ARMED_READY`, `W_ARM`). A guest
+that says it arms an RM device's readiness gets one report per `W_ARM`
+instead of one per host event. A `W_ARM` is a WATCH naming one of the
+guest's own handles; it is refused unless the session negotiated it and
+the handle is an RM device (control, GPU or UVM file -- not the modeset
+device, not a Wayland channel), and it costs the backend a pump
+instruction and two booleans per watch that already exist. A guest that
+arms nothing, or arms wrongly, gets fewer reports on its own files; it
+reaches nobody else's, and the host descriptors are polled as before. A
+guest that does not negotiate it keeps a report per event.
+
+**`--queue-poll-us`** (off by default). The queue thread keeps looking at
+the control ring for up to that long (capped at 1 ms) after draining it.
+It is CPU the backend spends for the guest, as the drain itself is: a guest
+that keeps sending keeps the thread busy either way, and the poll adds at
+most the cap after each burst. It reads only the ring's avail index, which
+the transport already reads. Leave it off where host CPU is shared tightly
+between tenants.
+
+**The guest's reply spin** (`rt_spin_us`, default 20 µs, 1 ms at most) and
+**asynchronous fence WATCH** (`async_fence_watch`) are guest-internal. A
+proxy's WATCH sent from a work item holds a reference to the proxy, so its
+handle cannot be closed ahead of it; a WATCH the backend refuses signals the
+proxy with the error, where the call used to fail -- a guest fence never
+waits forever on a report that will not come.
+
+**The event queue** no longer asks the guest to kick while the pump holds
+buffers (it asks again when it runs out, as before): fewer guest exits, the
+same delivery.
+
+**Counters.** `device::pacing` is fixed-size relaxed atomics, and the IOCTL2
+table is keyed by the schema's own static names (a closed set), so a guest
+cannot grow it; the report is logged at teardown at `warn` (rate-limited, as
+every call site) and, with `--pacing-stats`, periodically. The guest's
+counters are readable by root alone (`/sys/module/virtio_gpu_nv/parameters/
+pacing`, 0400): they count every process's calls as they happen, which an
+unprivileged process should not be able to watch.
+
+**The launcher's placement knobs** (`NVGPU_CPU_AFFINITY`, `NVGPU_VCPU_PINS`,
+`NVGPU_IO_AFFINITY`, `NVGPU_BACKEND_CPUS`, `NVGPU_HUGEPAGES`,
+`NVGPU_SLICE_US`) change where and when threads run and which pages back
+guest RAM, nothing about what they may do; `taskset` and `chrt` run before
+the backend's sandbox and the VMM's jail, which are unchanged. The launcher's
+default 100 µs EEVDF slice for the VMM's and backend's threads changes how
+soon they run after waking, not their share of the CPU (their weight is
+the default one), and it is the launcher's to set: nothing in the guest can
+change it.
+crosvm's `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`) gives up
+the per-vCPU core-scheduling cookies crosvm sets by default, which keep an
+SMT sibling from running another task while a vCPU runs: a mitigation for
+cross-thread side channels (L1TF/MDS-class) between the guest and host
+tasks on the sibling. The launcher keeps crosvm's default; turn it off
+only where no other tenant shares the cores.

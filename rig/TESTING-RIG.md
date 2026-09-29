@@ -663,6 +663,48 @@ map with `SHM WriteCombine zone: guest process ... holds 0x18000000 of
 0x30000000 bytes and may not take 0x200000 more (Owner)`, every unmap having
 missed; the fixed one ran 400/400 with the WC peak at 2 MiB.
 
+## Frame pacing
+
+`rig/rig-framepace.sh` runs one workload natively (`rig-native-run.sh
+--live`: the guest image's programs and NVIDIA userspace on the host) or in
+a guest (`run-guest.sh ... run`, against the live session), on one
+monitor's workspace, fullscreen, with MangoHud (in the image since this
+branch, the same build both ways) logging every frame's present interval.
+`rig/framepace-stats.py` reads the logs: mean, p50, p99, p99.9 and the
+frames longer than 1.5x the refresh period, each of which missed a vblank.
+
+```sh
+# the same workload, native then in a guest, three runs each, on DP-3 (240 Hz)
+rig/rig-framepace.sh vkcube native fp1          # vkcube-mbox, vkmark, stk, gamescope
+rig/rig-framepace.sh vkcube vm fp1
+# a busy desktop, reproducibly: a stress-ng load through every run
+NVGPU_FP_LOAD="--cpu 32 --cpu-load 60" rig/rig-framepace.sh stk vm fp-load
+# a guest module parameter, a backend flag, a placement
+NVGPU_FP_GUEST_PRE="echo 0 > /sys/module/virtio_gpu_nv/parameters/rt_spin_us" \
+  NVGPU_FP_BACKEND_ARGS=--queue-poll-us=0 NVGPU_CPU_AFFINITY=8-15 \
+  rig/rig-framepace.sh stk vm fp-ablate
+```
+
+The window goes to the monitor's active workspace silently (a window rule
+on the workloads' classes and titles) and is made fullscreen by its address;
+focus stays where it was and nothing is typed. The monitor (DP-3 by default,
+an OLED) is powered only while a run measures. For each guest run, beside
+the CSV: both sides' pacing counters (`<wl>-vm-<n>.pacing.txt`: the guest
+driver's round-trip and wake histograms, syncobj waits and event counts,
+and the backend's teardown report), and how the host scheduled the VMM's
+and backend's threads while the log ran (`<wl>-vm-<n>.sched.txt`, from
+`rig/framepace-sched.py`: CPU, run-queue wait, preemptions per thread
+group). `placement.log` has where each window was and whether the monitor
+scanned it out directly.
+
+gamescope does not start natively inside the Claude sandbox (its Xwayland
+fails authorisation there, with or without a network namespace of its
+own), so it has guest runs only. In the guest it runs without
+`CAP_SYS_NICE`, as a user runs it: as root it asks for a realtime queue,
+whose RM control the allowlist refuses.
+
+Results are in DEPLOY.md, "Frame pacing".
+
 ## What to keep from every run
 
 The launcher writes three files per run:

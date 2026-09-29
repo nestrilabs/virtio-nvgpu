@@ -651,9 +651,7 @@ impl NvidiaBackend {
             if !self.session.armed_ready || !kind.readiness_is_armed() {
                 return Err(libc::EINVAL);
             }
-            self.pump_cmds.push(PumpCmd::Arm {
-                handle: req.handle,
-            });
+            self.pump_cmds.push(PumpCmd::Arm { handle: req.handle });
             return Ok(self.ok_reply(0, &[]));
         }
         let mode = hostfd::watch_mode(kind, req.flags, req.cookie).inspect_err(|_| {
