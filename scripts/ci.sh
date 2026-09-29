@@ -7,7 +7,10 @@
 #   fast     no GPU, no network beyond crates and the flake's nixpkgs,
 #            minutes: rustfmt, clippy with -D warnings over the workspace and
 #            all targets, the workspace's tests with the vhost-user backend,
-#            the unsafe-confinement check, the NixOS module's patches against
+#            the unsafe-confinement check, the comment policy's mechanical
+#            part (scripts/check-comments.sh: no line numbers into our own
+#            code, no review rounds and no doc sections by number in
+#            comments; CONTRIBUTING.md), the NixOS module's patches against
 #            the patches they stand for, the scripts' syntax (and shellcheck
 #            of the launcher and its dry run), and the deployment:
 #            nix/module.nix evaluated with its assertions tried, the units it
@@ -260,6 +263,7 @@ fast() {
     step "clippy -D warnings" clippy_check
     step "cargo test (workspace, vhost-user)" test_check
     step "unsafe confinement" scripts/check-unsafe.sh
+    step "comment policy" scripts/check-comments.sh
     step "patches/nixos match their sources" nixos_patches_check
     deploy
 }
