@@ -7,10 +7,13 @@
 
 use super::*;
 
-/// The floor a second-level buffer is sized to, whatever length the guest
-/// derived for it. See where it is used: the length is read at a table-supplied
-/// offset, the table was generated from a different driver release, and the
-/// cost of it being wrong must not be heap corruption in this process.
+/// The least a single deep block is given, whatever length the guest sent
+/// for it. RM copies through the pointer what the control's own parameters
+/// say, which for a single block the backend does not work out (for deep
+/// segments it does, deepseg.rs): a copy longer than the guest's bytes lands
+/// in the block's zeroed tail, and one past the floor and the page of slack
+/// after it at the guard page (sys/guarded.rs), which the host answers
+/// EFAULT.
 pub(super) const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
 /// The key at `key_at` of an RM reply's parameters when RM's status word at
