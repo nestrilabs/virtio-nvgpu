@@ -139,32 +139,6 @@ pub struct MsgHeader {
     pub req_id: u32,
 }
 
-impl MsgHeader {
-    /// A success response carrying `handle`.
-    pub fn ok(msg_type: MsgType, handle: u32) -> Self {
-        Self {
-            msg_type: msg_type as u32,
-            handle,
-            status: 0,
-            req_id: 0,
-        }
-    }
-
-    /// A failure response. `errno` is given as a positive number and stored
-    /// negated, which is the one direction that is easy to get wrong.
-    ///
-    /// Saturating: `i32::MIN` has no positive twin, and `abs` aborts on it
-    /// under the release profile (review 2026-09-29 2.6).
-    pub fn err(msg_type: MsgType, errno: i32) -> Self {
-        Self {
-            msg_type: msg_type as u32,
-            handle: 0,
-            status: -errno.saturating_abs(),
-            req_id: 0,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Device identification
 // ---------------------------------------------------------------------------
@@ -1006,15 +980,6 @@ mod tests {
 
     use super::*;
 
-    /// A failure's errno is stored negated, and `i32::MIN` does not abort
-    /// (review 2026-09-29 2.6).
-    #[test]
-    fn an_error_header_negates_any_errno() {
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, 22).status, -22);
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, -22).status, -22);
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, i32::MIN).status, -i32::MAX);
-    }
-
     fn wire_header() -> crate::cheader::Header {
         crate::cheader::Header::parse(include_str!("../../driver/nvgpu_wire.h"))
     }
@@ -1441,18 +1406,6 @@ mod tests {
             DeviceKind::from_device_type(DEV_DRI_CARD_BASE - 1),
             Some(DeviceKind::Dri(DEV_DRI_CARD_BASE - 1 - DEV_DRI_BASE))
         );
-    }
-
-    /// The driver tests `(s32)status < 0`. An unsigned error code stored here
-    /// reads back as success and the guest proceeds on a failed call.
-    #[test]
-    fn an_error_status_is_negative() {
-        let h = MsgHeader::err(MsgType::Open, 2);
-        assert_eq!(h.status, -2);
-        assert!(h.status < 0);
-        assert_eq!(MsgHeader::err(MsgType::Open, -2).status, -2);
-        assert_eq!(MsgHeader::ok(MsgType::Open, 7).status, 0);
-        assert_eq!(MsgHeader::ok(MsgType::Open, 7).handle, 7);
     }
 
     #[test]

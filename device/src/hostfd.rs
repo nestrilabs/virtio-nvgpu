@@ -538,6 +538,11 @@ pub enum HostOp {
         id: u32,
         token: [u8; 16],
     },
+    /// Releases of memory registered by its pages after `ack`, the last the
+    /// guest has unpinned (osdesc.rs).
+    OsdescReap {
+        ack: u64,
+    },
     /// A syncobj the capture helper injected.
     InjectOpenSyncobj {
         file: u32,
@@ -665,6 +670,10 @@ pub fn check_host_op(
                 key,
                 cookie: args[4],
             })
+        }
+        OP_OSDESC_REAP => {
+            want(1)?;
+            Ok(HostOp::OsdescReap { ack: args[0] })
         }
         OP_INJECT_OPEN | OP_INJECT_OPEN_SYNCOBJ => {
             want(4)?;

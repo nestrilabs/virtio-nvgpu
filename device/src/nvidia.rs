@@ -23,6 +23,7 @@ use crate::semsurf::SemsurfPolicy;
 use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
 use crate::sys::block::{Arena, BufId, Restore, SlotKind};
+use crate::sys::pod;
 use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
 
 // ============================================================
@@ -863,6 +864,114 @@ pub enum AbiCheck {
     /// The guest disagrees with the host ABI about this struct's size.
     SizeMismatch { expected: u32, actual: u32 },
 }
+/// A v1 IOCTL as the guest sent it, its blocks told apart once.
+struct V1Request<'a> {
+    ireq: IoctlReq,
+    /// The top-level block and the nested one after it.
+    params: &'a [u8],
+    deep: Deep<'a>,
+    /// What follows the blocks: the calling process, from a guest that says
+    /// (rmshare.rs).
+    trailer: &'a [u8],
+}
+
+/// What follows a v1 IOCTL's nested block.
+#[derive(Clone, Copy)]
+enum Deep<'a> {
+    None,
+    /// What the pointer at `ptr` inside the nested block refers to. The
+    /// guest cannot send an address that means anything here, so it sends
+    /// the bytes and says where the pointer sits; the call gives them a host
+    /// address, and the reply carries them back.
+    Single {
+        ptr: usize,
+        bytes: &'a [u8],
+    },
+    /// DEEP_SEGMENTED: what several pointers refer to, one segment each
+    /// (deepseg.rs).
+    Segments(&'a [u8]),
+    /// DEEP_PAGE_LIST: the guest-physical pages of memory the caller
+    /// registers with RM (osdesc.rs).
+    PageList(&'a [u8]),
+}
+
+impl<'a> Deep<'a> {
+    fn bytes(self) -> &'a [u8] {
+        match self {
+            Deep::None => &[],
+            Deep::Single { bytes, .. } | Deep::Segments(bytes) | Deep::PageList(bytes) => bytes,
+        }
+    }
+}
+
+impl<'a> V1Request<'a> {
+    /// `payload` (after the header) read as a v1 IOCTL. EPROTO for one too
+    /// short to be one, EINVAL for blocks longer than what was sent or a
+    /// deep block the call cannot have: only an RM control's parameters and
+    /// IDLE_CHANNELS' top-level block are read as segments, and a page list
+    /// only on the three calls that register memory. Either is refused
+    /// rather than ignored, so a guest never believes pointers were carried
+    /// that were not.
+    fn parse(payload: &'a [u8]) -> std::result::Result<Self, i32> {
+        use abi::ioctl::*;
+        let ireq = pod::read::<IoctlReq>(payload, 0).ok_or(libc::EPROTO)?;
+        // The guest sends the top-level struct and the block any pointer in
+        // it refers to, back to back.
+        let body = &payload[size_of::<IoctlReq>()..];
+        let nested_end = ireq.data_len as usize + ireq.nested_len as usize;
+        let want = nested_end + ireq.deep_len as usize;
+        if body.len() < want {
+            log::warn!(
+                "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
+                ireq.cmd,
+                body.len()
+            );
+            return Err(libc::EINVAL);
+        }
+        let bytes = &body[nested_end..want];
+        let rm = hostfd::ioc_type(ireq.cmd) == b'F';
+        let nr = hostfd::ioc_nr(ireq.cmd);
+        let deep = match ireq.deep_ptr_offset {
+            _ if ireq.deep_len == 0 => Deep::None,
+            DEEP_SEGMENTED => {
+                if !rm || !matches!(nr, NV_ESC_RM_CONTROL | NV_ESC_RM_IDLE_CHANNELS) {
+                    log::warn!(
+                        "ioctl cmd={:#x}: deep segments on a call that has none",
+                        ireq.cmd
+                    );
+                    return Err(libc::EINVAL);
+                }
+                Deep::Segments(bytes)
+            }
+            DEEP_PAGE_LIST => {
+                if !rm
+                    || !matches!(
+                        nr,
+                        NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY | NV_ESC_RM_VID_HEAP_CONTROL
+                    )
+                {
+                    log::warn!(
+                        "ioctl cmd={:#x}: a page list on a call that registers no memory",
+                        ireq.cmd
+                    );
+                    return Err(libc::EINVAL);
+                }
+                Deep::PageList(bytes)
+            }
+            ptr => Deep::Single {
+                ptr: ptr as usize,
+                bytes,
+            },
+        };
+        Ok(Self {
+            ireq,
+            params: &body[..nested_end],
+            deep,
+            trailer: &body[want..],
+        })
+    }
+}
+
 /// Where a v1 IOCTL goes, once it is allowed at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum V1Route {
@@ -1670,13 +1779,12 @@ impl NvidiaBackend {
         // The mode is configuration, which the transport may set at any
         // point before the first message; the NVKMS policy reads its copy.
         self.nvkms.set_kms_card(self.config.kms_card);
-        if req_buf.len() < size_of::<MsgHeader>() {
+        let Some(hdr) = pod::read::<MsgHeader>(req_buf, 0) else {
             self.current_msg = MsgType::Ioctl;
             self.current_req_id = 0;
             let r = self.error_reply(libc::EPROTO);
             return Outcome::Reply(self.fit(r, cap));
-        }
-        let hdr = read_struct::<MsgHeader>(req_buf, 0);
+        };
         self.current_req_id = hdr.req_id;
 
         let Some(msg_type) = MsgType::from_u32(hdr.msg_type) else {
@@ -1820,10 +1928,9 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     fn handle_open(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
-        if payload.len() < size_of::<OpenReq>() {
+        let Some(req) = pod::read::<OpenReq>(payload, 0) else {
             return self.write_error(resp_buf, libc::ENODEV);
-        }
-        let req = read_struct::<OpenReq>(payload, 0);
+        };
 
         let kind = match DeviceKind::from_device_type(req.device_type) {
             // Cards are reached only through HOST_OP OPEN_KMS, which ties the
@@ -1972,10 +2079,9 @@ impl NvidiaBackend {
     /// only has to find the region that cookie belongs to and hand back where
     /// it sits.
     fn handle_mmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
-        if payload.len() < size_of::<MmapReq>() {
+        let Some(req) = pod::read::<MmapReq>(payload, 0) else {
             return self.write_error(resp_buf, libc::EINVAL);
-        }
-        let req = read_struct::<MmapReq>(payload, 0);
+        };
 
         // Only files that have device memory to place: the NVIDIA devices and
         // DRM nodes. A sync_file, a dmabuf or a compositor's memfd reached
@@ -2483,10 +2589,9 @@ impl NvidiaBackend {
     }
 
     fn handle_munmap(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
-        if payload.len() < size_of::<MunmapReq>() {
+        let Some(req) = pod::read::<MunmapReq>(payload, 0) else {
             return self.write_error(resp_buf, libc::EINVAL);
-        }
-        let req = read_struct::<MunmapReq>(payload, 0);
+        };
 
         // A UVM pool in the aperture: the last of its MMAP replies given back
         // takes it out. Only the handle that mapped it can.
@@ -2818,79 +2923,25 @@ impl NvidiaBackend {
 
     /// A v1 IOCTL whose reply may be at most `cap` bytes.
     fn serve_ioctl(&mut self, payload: &[u8], cap: usize) -> V1 {
-        if payload.len() < size_of::<IoctlReq>() {
-            return Err(libc::EPROTO);
-        }
-        let ireq = read_struct::<IoctlReq>(payload, 0);
-
-        // The guest sends the top-level struct and the block any pointer in it
-        // refers to, back to back. The handlers below already expect that
-        // layout, so the two lengths only need adding up here.
-        let body = &payload[size_of::<IoctlReq>()..];
-        let want = ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
-        if body.len() < want {
-            log::warn!(
-                "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
-                ireq.cmd,
-                body.len()
-            );
-            return Err(libc::EINVAL);
-        }
-        let nested_end = ireq.data_len as usize + ireq.nested_len as usize;
-        let param_in = &body[..nested_end];
-
-        // What a pointer inside the nested block refers to. The guest cannot
-        // send an address that means anything here, so it sends the bytes and
-        // says where the pointer sits; the call below gives them a host
-        // address, and the reply carries them back.
-        //
-        // Or, marked DEEP_SEGMENTED, what several pointers refer to, one
-        // segment each (deepseg.rs). Only an RM control's parameters and
-        // IDLE_CHANNELS' top-level block are read that way; a segmented
-        // block on any other call is refused rather than ignored, so a guest
-        // never believes pointers were carried that were not.
-        let segmented = ireq.deep_len > 0 && ireq.deep_ptr_offset == DEEP_SEGMENTED;
-        // Or, marked DEEP_PAGE_LIST, the guest-physical pages of memory the
-        // caller registers with RM (osdesc.rs): only on the three calls that
-        // register it.
-        let listed = ireq.deep_len > 0 && ireq.deep_ptr_offset == DEEP_PAGE_LIST;
-        let page_list: Option<&[u8]> = listed.then(|| &body[nested_end..want]);
-        if listed
-            && (hostfd::ioc_type(ireq.cmd) != b'F'
-                || !matches!(
-                    hostfd::ioc_nr(ireq.cmd),
-                    abi::ioctl::NV_ESC_RM_ALLOC
-                        | abi::ioctl::NV_ESC_RM_ALLOC_MEMORY
-                        | abi::ioctl::NV_ESC_RM_VID_HEAP_CONTROL
-                ))
-        {
-            log::warn!(
-                "ioctl cmd={:#x}: a page list on a call that registers no memory",
-                ireq.cmd
-            );
-            return Err(libc::EINVAL);
-        }
-        let deep_in: Option<(usize, &[u8])> = if ireq.deep_len > 0 && !segmented && !listed {
-            Some((ireq.deep_ptr_offset as usize, &body[nested_end..want]))
-        } else {
-            None
+        let V1Request {
+            ireq,
+            params: param_in,
+            deep,
+            trailer,
+        } = V1Request::parse(payload)?;
+        let deep_in = match deep {
+            Deep::Single { ptr, bytes } => Some((ptr, bytes)),
+            _ => None,
         };
-        let deep_segs: Option<&[u8]> = segmented.then(|| &body[nested_end..want]);
-        if segmented {
-            let nr = hostfd::ioc_nr(ireq.cmd);
-            if hostfd::ioc_type(ireq.cmd) != b'F'
-                || !matches!(
-                    nr,
-                    abi::ioctl::NV_ESC_RM_CONTROL | abi::ioctl::NV_ESC_RM_IDLE_CHANNELS
-                )
-            {
-                log::warn!(
-                    "ioctl cmd={:#x}: deep segments on a call that has none",
-                    ireq.cmd
-                );
-                return Err(libc::EINVAL);
-            }
-        }
+        let deep_segs = match deep {
+            Deep::Segments(b) => Some(b),
+            _ => None,
+        };
+        let page_list = match deep {
+            Deep::PageList(b) => Some(b),
+            _ => None,
+        };
+        let deep_bytes = deep.bytes();
 
         // Room for the answer, before anything is asked of the host: a
         // success comes back with at least the top-level struct and nested
@@ -2900,8 +2951,8 @@ impl NvidiaBackend {
         // (review 2026-09-29 1.16).
         let least = size_of::<MsgHeader>()
             + size_of::<IoctlResp>()
-            + nested_end
-            + if listed { 8 } else { 0 };
+            + param_in.len()
+            + if page_list.is_some() { 8 } else { 0 };
         if cap < least {
             log::warn!(
                 "ioctl cmd={:#x}: a reply of at least {least} bytes does not fit the {cap} posted",
@@ -3207,7 +3258,7 @@ impl NvidiaBackend {
             let answered_here = escape == NV_ESC_RM_CONTROL
                 && (crate::rmctl::unix_refused(param_in).is_some()
                     || crate::rmctl::host_pid_control(param_in).is_some());
-            let sent = &body[..nested_end];
+            let sent = param_in;
             if !answered_here
                 && let Err(r) = self.rmallow.check(escape, sent, ireq.data_len as usize)
             {
@@ -3215,9 +3266,8 @@ impl NvidiaBackend {
                     crate::rmallow::Refusal::Errno(errno) => Err(errno),
                     crate::rmallow::Refusal::Status { at, status } => {
                         let mut out = nvos::with_status(sent, at, status);
-                        let deep = &body[nested_end..want];
-                        out.extend_from_slice(deep);
-                        Ok(IoctlOut::deep(out, deep.len()))
+                        out.extend_from_slice(deep_bytes);
+                        Ok(IoctlOut::deep(out, deep_bytes.len()))
                     }
                 };
             }
@@ -3255,17 +3305,16 @@ impl NvidiaBackend {
         self.current_proc = None;
         let mut share_pending = crate::rmshare::Pending::default();
         if ioc_type == b'F' as u32 {
-            let sent = &body[..nested_end];
-            self.current_proc = self.rm_proc_id(escape, sent, &body[want..])?;
+            let sent = param_in;
+            self.current_proc = self.rm_proc_id(escape, sent, trailer)?;
             match self.rm_share_gate(escape, sent, self.current_proc) {
                 Ok(p) => share_pending = p,
                 Err(crate::rmshare::Refuse::Errno(errno)) => return Err(errno),
                 Err(crate::rmshare::Refuse::Status(status)) => {
                     let at = crate::rmshare::status_at(escape).unwrap_or(0);
                     let mut out = nvos::with_status(sent, at, status);
-                    let deep = &body[nested_end..want];
-                    out.extend_from_slice(deep);
-                    return Ok(IoctlOut::deep(out, deep.len()));
+                    out.extend_from_slice(deep_bytes);
+                    return Ok(IoctlOut::deep(out, deep_bytes.len()));
                 }
             }
         }
@@ -5333,18 +5382,16 @@ impl NvidiaBackend {
     // Response helpers
     // ------------------------------------------------------------------
 
-    /// Write a bare response header.
+    /// Write a bare response header (nothing, if it does not fit).
     fn write_hdr(&self, resp_buf: &mut [u8], handle: u32, status: i32) -> usize {
-        if resp_buf.len() < size_of::<MsgHeader>() {
-            return 0;
+        let h = crate::session::hdr(self.current_msg, handle, status, self.current_req_id);
+        match resp_buf.get_mut(..h.len()) {
+            Some(to) => {
+                to.copy_from_slice(&h);
+                h.len()
+            }
+            None => 0,
         }
-        let hdr = MsgHeader {
-            msg_type: self.current_msg as u32,
-            handle,
-            status: crate::session::wire_status(status),
-            req_id: self.current_req_id,
-        };
-        write_struct(resp_buf, &hdr)
     }
 
     /// Write a v1 IOCTL's outcome, the one place it is serialised: a refusal
@@ -5391,16 +5438,7 @@ impl NvidiaBackend {
             return self.write_error(resp_buf, libc::ENOSPC);
         }
 
-        let mut off = 0;
-        off += write_struct(
-            &mut resp_buf[off..],
-            &MsgHeader {
-                msg_type: self.current_msg as u32,
-                handle: self.current_handle,
-                status: crate::session::wire_status(status),
-                req_id: self.current_req_id,
-            },
-        );
+        let mut off = self.write_hdr(resp_buf, self.current_handle, status);
         off += write_struct(
             &mut resp_buf[off..],
             &IoctlResp {
@@ -5454,6 +5492,7 @@ impl Drop for NvidiaBackend {
 // Serialisation helpers
 // ============================================================
 
+#[cfg(test)]
 fn read_struct<T: crate::sys::pod::Pod + Copy>(buf: &[u8], offset: usize) -> T {
     crate::sys::pod::read(buf, offset).expect("a buffer long enough for the struct")
 }

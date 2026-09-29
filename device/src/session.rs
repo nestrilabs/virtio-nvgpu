@@ -137,6 +137,26 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// A bare header refusing message `t` (request `req_id`) with `errno`,
+    /// given positive and stored negated.
+    pub fn error(t: MsgType, req_id: u32, errno: i32) -> Self {
+        debug_assert!(errno > 0, "an error reply with errno {errno}");
+        Reply {
+            bytes: hdr(t, 0, -errno.saturating_abs(), req_id),
+            ..Reply::default()
+        }
+    }
+
+    /// A success of message `t`: the header carrying `handle`, then `body`.
+    pub fn ok(t: MsgType, handle: u32, req_id: u32, body: &[u8]) -> Self {
+        let mut bytes = hdr(t, handle, 0, req_id);
+        bytes.extend_from_slice(body);
+        Reply {
+            bytes,
+            ..Reply::default()
+        }
+    }
+
     /// Write the monotonic clock at `stamp_at`, if this reply wants one, and
     /// `CLOCK_REALTIME` and `CLOCK_MONOTONIC_RAW` after it when the reply has
     /// room for them (TimeSyncResp2). Read back to back, so the guest can take
@@ -277,10 +297,7 @@ impl KmsCall {
             KmsOp::DropIfMaster { fd, .. } => crate::closer::close(fd),
             KmsOp::Open { .. } => {}
         }
-        Reply {
-            bytes: hdr(MsgType::HostOp, 0, -libc::ECANCELED, self.req_id),
-            ..Reply::default()
-        }
+        Reply::error(MsgType::HostOp, self.req_id, libc::ECANCELED)
     }
 
     fn execute(&mut self) {
@@ -347,10 +364,7 @@ impl Ioctl2Call {
     /// The answer for a call that a session reset withdrew before it ran.
     /// Consumes the call, closing every descriptor it held.
     fn cancelled_reply(self) -> Reply {
-        Reply {
-            bytes: hdr(MsgType::Ioctl2, 0, -libc::ECANCELED, self.req_id),
-            ..Reply::default()
-        }
+        Reply::error(MsgType::Ioctl2, self.req_id, libc::ECANCELED)
     }
 
     fn execute(&mut self) {
@@ -501,27 +515,30 @@ fn errno_of(e: &std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
 }
 
+/// A HOST_OP reply's body: `res`, at most [`OP_MAX_RES`] results, then
+/// `tail`, what an op says after its fixed reply.
+fn host_op_body(res: &[u64], tail: &[u8]) -> Vec<u8> {
+    debug_assert!(res.len() <= OP_MAX_RES, "{} HOST_OP results", res.len());
+    let n = res.len().min(OP_MAX_RES);
+    let mut resp = HostOpResp {
+        nres: n as u32,
+        pad: 0,
+        res: [0; OP_MAX_RES],
+    };
+    resp.res[..n].copy_from_slice(&res[..n]);
+    let mut body = bytes_of(&resp).to_vec();
+    body.extend_from_slice(tail);
+    body
+}
+
 impl NvidiaBackend {
     /// A failure response to the message being served.
     pub(crate) fn error_reply(&self, errno: i32) -> Reply {
-        Reply {
-            bytes: hdr(
-                self.current_msg,
-                0,
-                -errno.saturating_abs(),
-                self.current_req_id,
-            ),
-            ..Reply::default()
-        }
+        Reply::error(self.current_msg, self.current_req_id, errno)
     }
 
     fn ok_reply(&self, handle: u32, body: &[u8]) -> Reply {
-        let mut bytes = hdr(self.current_msg, handle, 0, self.current_req_id);
-        bytes.extend_from_slice(body);
-        Reply {
-            bytes,
-            ..Reply::default()
-        }
+        Reply::ok(self.current_msg, handle, self.current_req_id, body)
     }
 
     /// Serve one of the messages only a v2 session may send.
@@ -699,54 +716,29 @@ impl NvidiaBackend {
     fn serve_host_op(&mut self, payload: &[u8]) -> Result<Outcome, i32> {
         let req = read::<HostOpReq>(payload).ok_or(libc::EINVAL)?;
         crate::pacing::PACING.host_op(req.op);
-        // Releases of memory registered by its pages: a list, after the
-        // fixed reply (osdesc.rs).
-        if req.op == OP_OSDESC_REAP {
-            if req.nargs != 1 {
-                return Err(libc::EINVAL);
-            }
-            let (last, ids) = self.osdesc_reap(req.args[0]);
-            let mut resp = HostOpResp {
-                nres: 2,
-                pad: 0,
-                res: [0; OP_MAX_RES],
-            };
-            resp.res[0] = last;
-            resp.res[1] = ids.len() as u64;
-            let mut body = bytes_of(&resp).to_vec();
-            for id in ids {
-                body.extend_from_slice(&id.to_le_bytes());
-            }
-            return Ok(Outcome::Reply(self.ok_reply(0, &body)));
-        }
         let nodes = self.host_nodes();
         let cards = self.config.kms_card.then_some(nodes.cards.as_slice());
         let handles = &self.handles;
         let op = hostfd::check_host_op(&req, &|h| handles.kind(h), cards).inspect_err(|e| {
             log::warn!("HOST_OP {} refused before running: errno {e}", req.op);
         })?;
+        // Releases of memory registered by its pages: a list, after the
+        // fixed reply (osdesc.rs).
+        if let HostOp::OsdescReap { ack } = op {
+            let (last, ids) = self.osdesc_reap(ack);
+            let tail: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            let body = host_op_body(&[last, ids.len() as u64], &tail);
+            return Ok(Outcome::Reply(self.ok_reply(0, &body)));
+        }
         // A buffer the capture helper injected: its description goes after
         // the fixed reply (inject.rs).
         if let HostOp::InjectOpenSyncobj { file, id, token } = op {
             let h = self.inject_open_syncobj(file, id, &token)?;
-            let mut resp = HostOpResp {
-                nres: 1,
-                pad: 0,
-                res: [0; OP_MAX_RES],
-            };
-            resp.res[0] = h;
-            return Ok(Outcome::Reply(self.ok_reply(0, bytes_of(&resp))));
+            return Ok(Outcome::Reply(self.ok_reply(0, &host_op_body(&[h], &[]))));
         }
         if let HostOp::InjectOpen { file, id, token } = op {
             let (res, info) = self.inject_open(file, id, &token)?;
-            let mut resp = HostOpResp {
-                nres: res.len() as u32,
-                pad: 0,
-                res: [0; OP_MAX_RES],
-            };
-            resp.res[..res.len()].copy_from_slice(&res);
-            let mut body = bytes_of(&resp).to_vec();
-            body.extend_from_slice(&info.to_bytes());
+            let body = host_op_body(&res, &info.to_bytes());
             return Ok(Outcome::Reply(self.ok_reply(0, &body)));
         }
         // The two that can wait on the display go to an executor (KmsCall).
@@ -774,15 +766,9 @@ impl NvidiaBackend {
         let (res, created) = self.run_host_op(op).inspect_err(|e| {
             log::warn!("HOST_OP {} failed on the host: errno {e}", req.op);
         })?;
-        let mut resp = HostOpResp {
-            nres: res.len() as u32,
-            pad: 0,
-            res: [0; OP_MAX_RES],
-        };
-        resp.res[..res.len()].copy_from_slice(&res);
         Ok(Outcome::Reply(Reply {
             created,
-            ..self.ok_reply(0, bytes_of(&resp))
+            ..self.ok_reply(0, &host_op_body(&res, &[]))
         }))
     }
 
@@ -889,7 +875,9 @@ impl NvidiaBackend {
             HostOp::OpenKms { .. } | HostOp::DropIfMaster { .. } => {
                 unreachable!("serve_host_op sends these to an executor")
             }
-            HostOp::InjectOpen { .. } | HostOp::InjectOpenSyncobj { .. } => {
+            HostOp::InjectOpen { .. }
+            | HostOp::InjectOpenSyncobj { .. }
+            | HostOp::OsdescReap { .. } => {
                 unreachable!("serve_host_op answers it itself")
             }
             HostOp::SyncobjWatch { key, cookie } => Ok((self.syncobj_watch(key, cookie)?, vec![])),
@@ -1103,12 +1091,9 @@ impl NvidiaBackend {
         if revoked_lease {
             self.check_leases(None);
         }
-        let mut bytes = hdr(MsgType::Ioctl2, target, 0, req_id);
-        bytes.extend_from_slice(&body);
         Reply {
-            bytes,
-            stamp_at: None,
             created,
+            ..Reply::ok(MsgType::Ioctl2, target, req_id, &body)
         }
     }
 
@@ -1152,15 +1137,9 @@ impl NvidiaBackend {
             log::info!("HOST_OP finished after a session reset; discarded");
             return self.error_reply(libc::ECANCELED);
         }
-        let mut resp = HostOpResp {
-            nres: 1,
-            pad: 0,
-            res: [0; OP_MAX_RES],
-        };
-        resp.res[0] = res;
         Reply {
             created,
-            ..self.ok_reply(0, bytes_of(&resp))
+            ..self.ok_reply(0, &host_op_body(&[res], &[]))
         }
     }
 
@@ -1215,6 +1194,20 @@ mod tests {
 
     fn status(resp: &[u8]) -> i32 {
         i32::from_le_bytes(resp[8..12].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_host_op_reply_is_its_results_then_its_tail() {
+        let b = host_op_body(&[7, 9], &[1, 2, 3]);
+        let r: HostOpResp = read(&b).unwrap();
+        assert_eq!((r.nres, r.res), (2, [7, 9, 0, 0]));
+        assert_eq!(&b[size_of::<HostOpResp>()..], &[1, 2, 3]);
+        let e = Reply::error(MsgType::HostOp, 5, libc::EPERM);
+        assert_eq!(e.bytes, hdr(MsgType::HostOp, 0, -libc::EPERM, 5));
+        assert_eq!(status(&e.bytes), -libc::EPERM);
+        let ok = Reply::ok(MsgType::HostOp, 3, 5, &b);
+        assert_eq!(&ok.bytes[..HDR], &hdr(MsgType::HostOp, 3, 0, 5)[..]);
+        assert_eq!(&ok.bytes[HDR..], &b[..]);
     }
 
     fn call(be: &mut NvidiaBackend, t: MsgType, handle: u32, body: &[u8]) -> Vec<u8> {

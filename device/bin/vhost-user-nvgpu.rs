@@ -746,13 +746,7 @@ struct Taken {
 
 /// A bare error header for a request the transport refuses on its own.
 fn transport_error(errno: i32) -> Reply {
-    let hdr = MsgHeader::err(MsgType::Ioctl, errno);
-    // The wire form is the struct's bytes, which is what the driver reads.
-    let bytes = device::sys::pod::bytes(&hdr)[..HDR].to_vec();
-    Reply {
-        bytes,
-        ..Reply::default()
-    }
+    Reply::error(MsgType::Ioctl, 0, errno)
 }
 
 // ---------------------------------------------------------------------------
