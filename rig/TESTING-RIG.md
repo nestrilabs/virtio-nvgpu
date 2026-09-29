@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-29 | `492f29b` (branch `integrate30`): the review's fixes and the restructuring after them | Groups A and B under nesbox (C and Rust modules) and crosvm, and two batches of live applications | "Regression of the restructured tree" |
 | 2026-09-29 | the 2026-09-29 review's backend fixes | Groups A and B under nesbox and crosvm, and a batch of live applications | "Regression of the 2026-09-29 review's backend fixes" |
 | 2026-09-29 | branch `perf` (nesbox `virtio-nvgpu-v5`, crosvm with `0010`) | Groups A and B under both VMMs, C and Rust modules, the benchmarks, part of the application pass | "Benchmarks" |
 | 2026-09-29 | branch `frame-timing` | frame pacing on a 240 Hz monitor, natively and in a guest; Group A and B1 (nesbox) | "Frame pacing" |
@@ -38,9 +39,7 @@ Not run on hardware: Group C (the compositor VM and export mode), hotplug,
 B6 (per-present crossings on a lease); a root run of the launcher, the
 socket-activated units and the VMM templates of `contrib/systemd`, nesbox
 `virtio-nvgpu-v6`'s jail, and crosvm `0010`'s spare vCPU under
-`--host-cpu-topology`. The structural changes after the 2026-09-29 review's
-fixes (the dispatcher and the capture injection split into modules, the
-launcher in pieces) have passed `scripts/ci.sh`, not yet a hardware run.
+`--host-cpu-topology`.
 
 ## The rig
 
@@ -660,6 +659,36 @@ enforcing and the backend's sandbox on:
 | `lease` | 9/0/1 | 9/0/1 | 9/0/1 |
 | `vkdisplay` | 8/0/1 | 8/0/1 | 8/0/1 |
 | `secneg`, `kms=lease` | 6/0/0; KMS 15 passed | the same | the same |
+
+## Regression of the restructured tree
+
+2026-09-29, `492f29b` (branch `integrate30`): the 2026-09-29 review's fixes
+and the restructuring after them (the backend's `nvidia/` and `inject/`
+modules, the guest module's split files, the launcher in `rig/launcher/`),
+with the backend, both guest modules and the images built from that commit.
+Unprivileged launcher, nesbox `virtio-nvgpu-v6` and crosvm with `0001`-`0010`.
+
+| probe | nesbox, C parsers | nesbox, Rust parsers | crosvm |
+|---|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 | 6/0/0 |
+| compat | 12/0/0 | 12/0/0 | 12/0/0 |
+| render | 9/0/1 | 9/0/1 | 9/0/1 |
+| render with CUDA (`--allow-compute`) | 9/0/1, cuda-smoke ALL PASS | 9/0/1, ALL PASS | 9/0/1, ALL PASS |
+| map churn (`nvgpu-map-churn 400 2`) | 3/0/0 | 3/0/0 | 3/0/0 |
+| wayland (live Hyprland) | 13/0/1 | 13/0/1 | 13/0/1 |
+| secneg | 3/0/1 (10 passed, 5 skipped) | same | same |
+| lease | 9/0/1 | 9/0/1 | 9/0/1 |
+| vkdisplay | 8/0/1 | 8/0/1 | 8/0/1 |
+| secneg with KMS (on a lease) | 6/0/0 (15 passed) | same | same |
+
+Counts are pass/fail/skip. Live applications (`rig/rig-app-check.sh --live`):
+glxgears, gamescope, GTK, Qt, Firefox, mpv, vkmark, SuperTuxKart, Blender and
+a Chromium animation under nesbox, 18 checks passed and none failed; CUDA,
+Cycles, NVENC, mpv with VA-API and mpv under crosvm with `--allow-compute`,
+23 passed and none failed. Earlier on the same day, the launcher's piped
+console froze mpv's Vulkan output within a second; the launcher now has the
+VMM write its console log directly, with a watchdog for the size cap, and
+mpv passes under both VMMs.
 
 ## Regression of the 2026-09-29 review's backend fixes
 

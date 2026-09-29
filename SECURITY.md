@@ -28,13 +28,11 @@ the thing to fix.
 - **Hardware.** `rig/TESTING-RIG.md`, "Where the runs stand", is the dated
   record of every run, and README.md, "What is known to work", the summary.
   The last regression on hardware ran on an RTX 5090 with 595.99.02 on
-  2026-09-29, under nesbox and crosvm, with the backend's sandbox on and the
-  RM allowlist enforcing. It covered the 2026-09-29 review's backend fixes.
-  It did not cover that review's VMM, deployment and guest-module fixes, nor
-  the restructuring after them (the backend's `nvidia/` and `inject/`
-  modules, the guest module's split files, the launcher's pieces): the code
-  this document describes has passed `scripts/ci.sh` and has not yet run on
-  the GPU as a whole. Never run on hardware: the compositor-VM and export
+  2026-09-29, on `492f29b` (the 2026-09-29 review's fixes and the
+  restructuring after them), under nesbox with the C and the Rust parsers
+  and under crosvm, with the backend's sandbox on and the RM allowlist
+  enforcing. Never run on hardware: a root run of the launcher, the
+  socket-activated units, the compositor-VM and export
   modes (they need the host desktop stopped) and hotplug. "How the claims
   are tested" says what each claim rests on.
 
