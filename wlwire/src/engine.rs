@@ -956,7 +956,20 @@ impl Engine {
                 format!("{} has no {:?} opcode {}", ifc.name, dir, h.opcode),
             )
         })?;
-        if desc.since > obj.version {
+        // A request newer than its object is refused, as libwayland-server
+        // refuses it. An event is not checked by libwayland-client (only
+        // that its interface has the opcode), so one from the host's
+        // compositor is passed on as it would reach the client natively:
+        // killing the guest client for a compositor's mistake is not
+        // parity. One from a guest's compositor on its way to a host client
+        // (export mode) is still refused: the host client would call past
+        // the end of a listener made for the object's version, and what a
+        // guest can make a host process call is what must not cross (the
+        // 2026-09-29 review, C4). The message is parsed by its signature
+        // either way, so its descriptors are counted.
+        let from_host_compositor =
+            (self.cfg.side == Side::Host) == (self.cfg.local == Local::Server);
+        if desc.since > obj.version && !(dir == Dir::Event && from_host_compositor) {
             return Err(err(
                 ERR_INVALID_METHOD,
                 format!(

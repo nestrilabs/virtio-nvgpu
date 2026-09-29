@@ -1109,6 +1109,75 @@ fn shm_contents_reach_the_host_memfd_at_commit_and_only_the_damage_after() {
     );
 }
 
+/// An engine facing a client, on `side`, with wl_seat v1 bound as 3 from a
+/// compositor that offers v9.
+fn seat_v1(side: Side) -> Engine {
+    let mut e = Engine::new(EngineConfig {
+        side,
+        local: Local::Client,
+        policy: Policy::default(),
+        rewrites: None,
+        synth_released: false,
+    });
+    let mut plat = TestPlat::default();
+    let mut m = MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+        .new_id(2)
+        .finish();
+    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
+        .unwrap();
+    let g = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wl_seat"))
+        .uint(9)
+        .finish();
+    e.from_channel(&wayland_frame(&[g]), vec![], &mut plat)
+        .unwrap();
+    let mut m = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+        .uint(1)
+        .generic_new_id("wl_seat", 1, 3)
+        .finish();
+    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
+        .unwrap();
+    e
+}
+
+/// An event newer than its object's version is passed on from the host's
+/// compositor, as libwayland-client, which checks no version for events,
+/// would take it natively; before, the guest client was killed for the
+/// compositor's mistake. From a guest's compositor to a host client (export
+/// mode) it is still refused: a host process would call past the end of a
+/// listener made for the object's version (the 2026-09-29 review, C4).
+#[test]
+fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
+    let name = MsgBuilder::new(3, op::wl_seat::EVT_NAME)
+        .string(Some("seat0"))
+        .finish();
+    let mut g = seat_v1(Side::Guest);
+    g.from_channel(
+        &wayland_frame(&[name.clone()]),
+        vec![],
+        &mut TestPlat::default(),
+    )
+    .unwrap();
+    let (msgs, _) = flatten(g.local_out().drain());
+    assert!(msgs.ends_with(&name));
+    let mut h = seat_v1(Side::Host);
+    let e = h
+        .from_channel(
+            &wayland_frame(&[name.clone()]),
+            vec![],
+            &mut TestPlat::default(),
+        )
+        .unwrap_err();
+    assert!(e.message.contains("needs version 2"), "{}", e.message);
+    // A request newer than its object is refused either way.
+    let mut m = MsgBuilder::new(3, op::wl_seat::REQ_RELEASE).finish();
+    let e = g
+        .from_local(&mut m, &mut VecDeque::new(), &mut TestPlat::default())
+        .unwrap_err();
+    assert!(e.message.contains("needs version 5"), "{}", e.message);
+}
+
 /// A buffer destroyed while its surface still shows it keeps its pages in
 /// the compositor's pool until the surface commits something else, as
 /// natively (destroying a wl_buffer leaves the pool alone): a compositor
