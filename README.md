@@ -309,7 +309,7 @@ both.
 | [`scripts/`](scripts/) | **Apache-2.0** | The project's own tooling: `ci.sh` (the checks, in tiers), `check-unsafe.sh`, `fuzz.sh`, `gen-check.sh` (every generated table against its sources), `build-guest-kernel.sh` (the guest kernel and module), the Wayland loopback test. |
 | [`contrib/`](contrib/) | **Apache-2.0** | What a deployment installs: the systemd unit per VM and its socket helper, and the guest's udev rule for `/dev/nvgpu-wl` ([`DEPLOY.md`](DEPLOY.md)). |
 | [`nix/`](nix/) | **Apache-2.0** | The NixOS module for the backend: per-VM users and the unit. The root `flake.nix` packages the backend and the daemon and runs the fast checks. |
-| [`rig/`](rig/) | **Apache-2.0** | The dev box's test rig, not for production: the launcher (`run-guest.sh`), preflight, the test guest image (`guest-image/`), the on-device helpers (`verify/`), and [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md). Its data lives in `.rig/`, git-ignored. |
+| [`rig/`](rig/) | **Apache-2.0** | The dev box's test rig, not for production: the launcher (`run-guest.sh`, and its pieces in `launcher/`), preflight, the test guest image (`guest-image/`), the on-device helpers (`verify/`), and [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md). Its data lives in `.rig/`, git-ignored. |
 | [`docs/review/`](docs/review/) | — | Review records the security documents cite by finding id. |
 
 The layout follows [`chromeos/virtio-media`](https://chromium.googlesource.com/chromiumos/platform/virtio-media/),

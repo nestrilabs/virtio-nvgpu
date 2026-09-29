@@ -6,9 +6,9 @@
 #
 # crosvm (--vmm crosvm, rig layout: bin/crosvm, built with all of
 # patches/crosvm applied by rig/rig-build-crosvm.sh): the same kernel, disk,
-# console log, probe and backend; the guest's device is crosvm's vhost-user frontend
-# of type nvgpu. crosvm has no config file, so <tag>.json records the command
-# line it was given. Unprivileged, crosvm runs with its sandbox: every device
+# console log, probe and backend; the guest's device is crosvm's vhost-user
+# frontend of type nvgpu. crosvm has no config file, so <tag>.json records
+# the command line it was given. Unprivileged, crosvm runs with its sandbox: every device
 # it emulates itself (disk, consoles, rng) is a process of its own in a
 # minijail -- user, pid, mount and network namespaces, pivoted into an empty
 # directory (the rig's run/crosvm-empty), under its seccomp policy -- and so,

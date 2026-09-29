@@ -8,7 +8,8 @@
 # the slot's group through a symlink the backend's user put where its socket
 # should be -- then checks the root-only refusals (no layout named, a
 # diagnostic switch without NVGPU_DIAGNOSTIC=1, a path someone else can
-# write or does not belong to root, no jailer) and what the 2026-09-29 review
+# write or does not belong to root -- the launcher's pieces, rig/launcher,
+# included -- no jailer) and what the 2026-09-29 review
 # asked of it (SECURITY.md §22): root binds the backend's socket and hands it
 # over, and never gives the run's directory to the backend's user (H1); a
 # diagnostic backend flag needs NVGPU_DIAGNOSTIC=1 and is said on the
