@@ -1532,18 +1532,26 @@ else
     TAIL_PID=
 fi
 exec {CON_W}>&-
+# console_over: whether the console log has passed LOG_MAX bytes; if so it
+# is cut back to them and says so, once.
+CON_CAP_LINE="[run-guest: the console log passed NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB; the VM was stopped]"
+console_over() {
+    [ "$(stat -c %s "$CONSOLE" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ] || return 1
+    truncate -s "$LOG_MAX" "$CONSOLE"
+    printf '\n%s\n' "$CON_CAP_LINE" >> "$CONSOLE"
+}
 # console_watch: the guest writes the console log; past LOG_MAX bytes the VM
-# is stopped (TERM to the VMM's timeout), so no guest fills the filesystem.
+# is stopped (TERM to the VMM's timeout) and the log cut back, so no guest
+# fills the filesystem. What a guest writes between two looks is cut too
+# (console_over again once the VMM is gone).
 (
     exec {SLOT_FD}>&- {TAG_FD}>&-
     while kill -0 "$VMM_PID" 2>/dev/null; do
-        if [ "$(stat -c %s "$CONSOLE" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
-            printf '\n[run-guest: the console log passed NVGPU_LOG_MAX_MIB=%s; the VM was stopped]\n' \
-                "$LOG_MAX_MIB" >> "$CONSOLE"
+        if console_over; then
             kill -TERM "$VMM_PID" 2>/dev/null
             break
         fi
-        sleep 2
+        sleep 0.5
     done
 ) &
 CON_WATCH=$!
@@ -1552,6 +1560,7 @@ wait "$VMM_PID" || RC=$?
 VMM_PID=
 kill "$CON_WATCH" 2>/dev/null || true
 wait "$CON_WATCH" 2>/dev/null || true
+grep -a -q -F "$CON_CAP_LINE" "$CONSOLE" || console_over || true
 [ -z "$TAIL_PID" ] || wait "$TAIL_PID" 2>/dev/null || true
 if [ -n "$TTY_STATE" ]; then
     stty "$TTY_STATE" 2>/dev/null || true
@@ -1575,7 +1584,7 @@ echo "config:  $CFG"
 # it to fail). The console comes through a terminal, so lines end in \r;
 # what is echoed from it goes through clean first (the guest wrote it).
 # console_watch stopped the VM: whatever the console says, the run failed.
-if grep -a -q -F "[run-guest: the console log passed NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB; the VM was stopped]" "$CONSOLE"; then
+if grep -a -q -F "$CON_CAP_LINE" "$CONSOLE"; then
     echo "result: FAIL (the console log passed NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB; the VM was stopped)"
     exit 1
 fi

@@ -110,7 +110,7 @@ echo "  (a root run's files carry its slot: $(cd /rig/logs && printf '%s ' benig
 
 echo "== new: H2: a guest that floods its console, with NVGPU_LOG_MAX_MIB=1"
 LINES_SHOWN=2 run run-guest.new.sh flood NVGPU_LOG_MAX_MIB=1
-echo "  console log: $(stat -c %s /rig/logs/flood.vm0.console.log) bytes; $(grep -ac 'NVGPU_LOG_MAX_MIB=1; the rest was dropped' /rig/logs/flood.vm0.console.log) cap line"
+echo "  console log: $(stat -c %s /rig/logs/flood.vm0.console.log) bytes; $(grep -ac 'the console log passed NVGPU_LOG_MAX_MIB=1; the VM was stopped' /rig/logs/flood.vm0.console.log) cap line"
 
 echo "== new: H5: a verdict line with a terminal escape sequence in it"
 LINES_SHOWN=40 run run-guest.new.sh esc | grep -E 'exit|probe:'
