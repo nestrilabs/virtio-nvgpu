@@ -157,6 +157,40 @@ fn a_malformed_message_is_refused_with_the_reason() {
     assert_eq!(wire::parse(cp, &m).unwrap_err(), WireError::Null);
 }
 
+/// A buffer is walked whole message by whole message: a partial one waits,
+/// and a size no message may have is refused as soon as its header is in,
+/// however little of the rest has arrived.
+#[test]
+fn messages_are_taken_whole_and_a_bad_size_ends_the_walk() {
+    let a = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+        .new_id(5)
+        .finish();
+    let b = MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+        .new_id(6)
+        .finish();
+    let two = [a.clone(), b.clone()].concat();
+    let mut it = wire::Messages::new(&two[..two.len() - 1]);
+    let (h, m) = it.next().unwrap().unwrap();
+    assert_eq!(
+        (h.object, h.opcode, m),
+        (1, op::wl_display::REQ_SYNC, &a[..])
+    );
+    assert!(it.next().is_none(), "the second is not all there");
+    assert_eq!((it.consumed(), it.rest()), (a.len(), &b[..b.len() - 1]));
+    assert_eq!(wire::whole_message(&two[..4]), Ok(None));
+
+    for size in [4u32, 10, (wire::MAX_MSG + 4) as u32] {
+        let mut bad = a.clone();
+        bad[4..8].copy_from_slice(&(size << 16).to_ne_bytes());
+        let buf = [a.clone(), bad[..8].to_vec()].concat();
+        let mut it = wire::Messages::new(&buf);
+        assert!(it.next().unwrap().is_ok());
+        assert_eq!(it.next(), Some(Err(WireError::BadSize)), "size {size}");
+        assert_eq!(it.next(), None);
+        assert_eq!(it.rest(), &bad[..8]);
+    }
+}
+
 #[test]
 fn descriptor_counts_and_classes_come_from_the_policy_table() {
     let keymap = msg_desc(proto::WL_KEYBOARD, Dir::Event, op::wl_keyboard::EVT_KEYMAP);

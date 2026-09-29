@@ -41,7 +41,7 @@ use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
 use crate::shm::{Shm, ShmCharge, SyncJob};
 use crate::stream::{ByteBudget, Interest, Streams};
 use crate::sys;
-use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
+use crate::wire::{self, At, MsgBuilder, Val, peek_header, put_word};
 
 /// `wl_display.error` codes.
 pub const ERR_INVALID_OBJECT: u32 = 0;
@@ -475,14 +475,10 @@ impl Engine {
         let mut fresh: HashMap<u32, IfaceId> = HashMap::new();
         let mut n = 0;
         for r in f.records().filter(|r| r.ty == frame::REC_WAYLAND) {
-            let mut p = r.payload;
-            while let Some(h) = peek_header(p) {
-                let size = h.size as usize;
-                if size < 8 || size > p.len() {
-                    break;
-                }
-                let m = &p[..size];
-                p = &p[size..];
+            // A message of a bad size ends the count of its record, as it
+            // ends the frame in the engine before anything after it is let
+            // through.
+            for (h, m) in wire::Messages::new(r.payload).map_while(Result::ok) {
                 let Some(ifc) = fresh.get(&h.object).copied().or_else(|| {
                     self.objects
                         .get(h.object)
@@ -766,32 +762,31 @@ impl Engine {
         plat: &mut dyn Platform,
     ) -> Result<(), Fatal> {
         let dir = self.local_dir();
-        let mut off = 0;
+        let mut msgs = wire::Messages::new(data);
         let res = loop {
             if self.input_blocked() {
                 break Ok(());
             }
-            let Some(h) = peek_header(&data[off..]) else {
-                break Ok(());
-            };
-            let size = h.size as usize;
-            if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
-                break Err(Fatal::new(
-                    Blame::Local,
-                    1,
-                    ERR_INVALID_METHOD,
-                    "bad message size",
-                ));
-            }
-            if data.len() - off < size {
-                break Ok(());
-            }
-            let msg = data[off..off + size].to_vec();
-            off += size;
-            if let Err(e) = self.message(dir, true, msg, &mut FdSrc::Local(fds), plat) {
-                break Err(e);
+            match msgs.next() {
+                None => break Ok(()),
+                Some(Err(_)) => {
+                    break Err(Fatal::new(
+                        Blame::Local,
+                        1,
+                        ERR_INVALID_METHOD,
+                        "bad message size",
+                    ));
+                }
+                Some(Ok((_, m))) => {
+                    if let Err(e) =
+                        self.message(dir, true, m.to_vec(), &mut FdSrc::Local(fds), plat)
+                    {
+                        break Err(e);
+                    }
+                }
             }
         };
+        let off = msgs.consumed();
         data.drain(..off);
         res
     }
@@ -842,25 +837,20 @@ impl Engine {
                 }
                 frame::REC_WAYLAND => {
                     let before = descs.len();
-                    let mut p = r.payload;
-                    while !p.is_empty() {
-                        let h = peek_header(p)
-                            .ok_or_else(|| chan("partial message in WAYLAND record"))?;
-                        let size = h.size as usize;
-                        if !(8..=MAX_MSG).contains(&size)
-                            || !size.is_multiple_of(4)
-                            || size > p.len()
-                        {
-                            return Err(chan("bad message size in WAYLAND record"));
-                        }
+                    // Whole messages only, every one of them a good size.
+                    let mut msgs = wire::Messages::new(r.payload);
+                    for m in &mut msgs {
+                        let (_, m) = m.map_err(|_| chan("bad message size in WAYLAND record"))?;
                         self.message(
                             dir,
                             false,
-                            p[..size].to_vec(),
+                            m.to_vec(),
                             &mut FdSrc::Channel(&mut descs),
                             plat,
                         )?;
-                        p = &p[size..];
+                    }
+                    if !msgs.rest().is_empty() {
+                        return Err(chan("partial message in WAYLAND record"));
                     }
                     if before - descs.len() != r.arg as usize {
                         return Err(chan(

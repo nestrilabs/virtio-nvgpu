@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use wlwire::proto::{self, Dir, IfaceId, iface, op};
 use wlwire::sys;
-use wlwire::wire::{self, MsgBuilder, Val, peek_header};
+use wlwire::wire::{self, MsgBuilder, Val};
 
 /// What [`Probe::until_done`] hands each event to: (object, opcode,
 /// arguments, descriptors).
@@ -164,17 +164,11 @@ impl LeaseCache {
 /// registries is the engine's to know, under the lock this runs outside of;
 /// a message of another object that happens to match costs only a probe,
 /// and the filter still asks by the registry's own global.
-pub fn lease_globals(mut buf: &[u8]) -> Vec<u32> {
+pub fn lease_globals(buf: &[u8]) -> Vec<u32> {
     const NAME: &[u8] = b"wp_drm_lease_device_v1\0";
     let mut out = Vec::new();
-    while let Some(h) = peek_header(buf) {
-        let size = h.size as usize;
-        if size < 8 || size > buf.len() {
-            break;
-        }
-        let m = &buf[..size];
-        buf = &buf[size..];
-        if h.opcode != op::wl_registry::EVT_GLOBAL || size < 16 {
+    for (h, m) in wire::Messages::new(buf).map_while(Result::ok) {
+        if h.opcode != op::wl_registry::EVT_GLOBAL || m.len() < 16 {
             continue;
         }
         let word = |at: usize| u32::from_ne_bytes(m[at..at + 4].try_into().unwrap());
@@ -217,15 +211,10 @@ impl Probe {
         let deadline = Instant::now() + TIMEOUT;
         let mut chunk = vec![0u8; 16 * 1024];
         loop {
-            while let Some(h) = peek_header(&self.buf) {
-                let size = h.size as usize;
-                if !(8..=wire::MAX_MSG).contains(&size) {
-                    return Err(io::Error::other("bad message from the compositor"));
-                }
-                if self.buf.len() < size {
-                    break;
-                }
-                let msg: Vec<u8> = self.buf.drain(..size).collect();
+            while let Some(h) = wire::whole_message(&self.buf)
+                .map_err(|_| io::Error::other("bad message from the compositor"))?
+            {
+                let msg: Vec<u8> = self.buf.drain(..h.size as usize).collect();
                 let Some(&ifc) = self.objects.get(&h.object) else {
                     return Err(io::Error::other("event for an unknown object"));
                 };

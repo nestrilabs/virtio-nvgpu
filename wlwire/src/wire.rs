@@ -49,6 +49,75 @@ pub fn peek_header(buf: &[u8]) -> Option<Header> {
     })
 }
 
+/// The header of the message at the front of `buf` once all of it is there:
+/// `Ok(None)` while it is not (fewer than 8 bytes, or fewer than its size
+/// says), and `BadSize` as soon as the header shows a size no message may
+/// have -- below 8, above [`MAX_MSG`], or not a multiple of 4 -- which no
+/// amount of further input makes whole.
+pub fn whole_message(buf: &[u8]) -> Result<Option<Header>, WireError> {
+    let Some(h) = peek_header(buf) else {
+        return Ok(None);
+    };
+    let size = h.size as usize;
+    if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
+        return Err(WireError::BadSize);
+    }
+    Ok((buf.len() >= size).then_some(h))
+}
+
+/// The whole messages at the front of a buffer, in order, each with its
+/// header ([`whole_message`]). It ends at a partial message, which
+/// [`Messages::rest`] then starts with, and after yielding `BadSize` once for
+/// a message whose size is bad, which `rest` starts with too.
+pub struct Messages<'a> {
+    buf: &'a [u8],
+    used: usize,
+    broken: bool,
+}
+
+impl<'a> Messages<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            used: 0,
+            broken: false,
+        }
+    }
+
+    /// Bytes of the whole messages yielded so far.
+    pub fn consumed(&self) -> usize {
+        self.used
+    }
+
+    /// What follows them.
+    pub fn rest(&self) -> &'a [u8] {
+        &self.buf[self.used..]
+    }
+}
+
+impl<'a> Iterator for Messages<'a> {
+    type Item = Result<(Header, &'a [u8]), WireError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.broken {
+            return None;
+        }
+        let rest = self.rest();
+        match whole_message(rest) {
+            Ok(Some(h)) => {
+                let m = &rest[..h.size as usize];
+                self.used += m.len();
+                Some(Ok((h, m)))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.broken = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
     /// Size field below 8, above 4096, or not a multiple of 4.
