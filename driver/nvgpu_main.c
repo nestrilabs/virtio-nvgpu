@@ -2427,6 +2427,12 @@ static int __init nvgpu_init(void) {
     pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
             virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
   }
+#if !defined(NVGPU_RUST) && IS_ENABLED(CONFIG_RUST)
+  /* The C parsers were asked for (NVGPU_RUST=0) on a kernel that has Rust,
+   * where the Rust ones are the default (driver/Makefile). */
+  pr_notice("virtio-gpu-nv: built with the C parsers; the Rust ones are the "
+            "default on this kernel (driver/rust/README.md)\n");
+#endif
   nvgpu_wq = alloc_workqueue("nvgpu", WQ_HIGHPRI, 0);
   nvgpu_long_wq = alloc_workqueue("nvgpu-long", WQ_UNBOUND, 0);
   if (!nvgpu_wq || !nvgpu_long_wq) {

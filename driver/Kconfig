@@ -20,6 +20,7 @@ config VIRTIO_GPU_NV
 config VIRTIO_GPU_NV_RUST
 	bool "Parse guest-process input in Rust"
 	depends on VIRTIO_GPU_NV && RUST
+	default y
 	help
 	  Build the code that reads what a guest process hands the driver --
 	  the IOCTL2 schema walk, RM escapes and their nested blocks, deep
@@ -28,4 +29,8 @@ config VIRTIO_GPU_NV_RUST
 	  instead of the C one. The module says which it has in modinfo
 	  ("parsers"). See driver/rust/README.md.
 
-	  If unsure, say N.
+	  The Rust has passed the hardware regression and is the default
+	  wherever the kernel has Rust; the C is the fallback for a kernel
+	  without it.
+
+	  If unsure, say Y.

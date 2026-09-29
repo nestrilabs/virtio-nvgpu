@@ -11,8 +11,9 @@
 #            and the scripts' syntax. The root flake's checks.x86_64-linux
 #            runs the Rust half of it (`nix flake check`).
 #   kernel   the guest module, C and Rust parsers, against a guest kernel's
-#            build tree: no warning allowed, and the Rust object may name no
-#            panic symbol (driver/Makefile). Needs
+#            build tree: no warning allowed, the Rust object may name no
+#            panic symbol (driver/Makefile), and with no NVGPU_RUST a Rust
+#            kernel's module has the Rust parsers. Needs
 #              KDIR       a kernel build tree to build the C against
 #              KDIR_RUST  a CONFIG_RUST=y build tree (skipped when unset)
 #            and, if the build tools are not on PATH, KERNEL_TOOLCHAIN and
@@ -112,21 +113,32 @@ fast() {
 # ── kernel ───────────────────────────────────────────────────────────────────
 
 # Build driver/ in a scratch copy against $1 (a kernel build tree), with
-# $2 (NVGPU_RUST=0|1), in the dev shell of flake $3 if given.
+# $2 (NVGPU_RUST=0|1, or "" for the Makefile's own choice), in the dev shell
+# of flake $3 if given; with $4, the module must say it has those parsers
+# (modinfo's "parsers": c or rust).
 module_build() {
-    local kdir=$1 rust=$2 toolchain=${3:-} work log rc=0
+    local kdir=$1 rust=$2 toolchain=${3:-} want=${4:-} work log rc=0 got mk
     work=$(mktemp -d)
     cp -r driver "$work/driver"
     log=$work/build.log
+    mk=(make -C "$work/driver" KDIR="$kdir")
+    [ -n "$rust" ] && mk+=(NVGPU_RUST="$rust")
     if [ -n "$toolchain" ]; then
-        nix develop "path:$toolchain" -c make -C "$work/driver" KDIR="$kdir" NVGPU_RUST="$rust" >"$log" 2>&1 || rc=1
+        nix develop "path:$toolchain" -c "${mk[@]}" >"$log" 2>&1 || rc=1
     else
-        make -C "$work/driver" KDIR="$kdir" NVGPU_RUST="$rust" >"$log" 2>&1 || rc=1
+        "${mk[@]}" >"$log" 2>&1 || rc=1
     fi
     if [ $rc = 0 ] && grep -Ei 'warning|error|undefined' "$log" >&2; then
         rc=1
     fi
     [ $rc = 0 ] && [ -f "$work/driver/virtio_gpu_nv.ko" ] || { tail -40 "$log" >&2; rc=1; }
+    if [ $rc = 0 ] && [ -n "$want" ]; then
+        got=$(grep -ao 'parsers=[a-z]*' "$work/driver/virtio_gpu_nv.ko" | head -1)
+        if [ "$got" != "parsers=$want" ]; then
+            echo "the module has ${got:-no parsers tag}, not parsers=$want" >&2
+            rc=1
+        fi
+    fi
     rm -rf "$work"
     return $rc
 }
@@ -137,9 +149,12 @@ kernel() {
         failed+=("kernel: KDIR unset")
         return
     fi
-    step "guest module, C parsers" module_build "$KDIR" 0 "${KERNEL_TOOLCHAIN:-}"
+    step "guest module, C parsers" module_build "$KDIR" 0 "${KERNEL_TOOLCHAIN:-}" c
     if [ -n "${KDIR_RUST:-}" ]; then
-        step "guest module, Rust parsers" module_build "$KDIR_RUST" 1 "${KERNEL_TOOLCHAIN_RUST:-}"
+        step "guest module, Rust parsers" module_build "$KDIR_RUST" 1 "${KERNEL_TOOLCHAIN_RUST:-}" rust
+        # The Makefile's own choice: the Rust on a kernel with CONFIG_RUST.
+        step "guest module, default parsers on a Rust kernel" module_build "$KDIR_RUST" "" "${KERNEL_TOOLCHAIN_RUST:-}" rust
+        step "guest module, C parsers on a Rust kernel (NVGPU_RUST=0)" module_build "$KDIR_RUST" 0 "${KERNEL_TOOLCHAIN_RUST:-}" c
     else
         echo "== guest module, Rust parsers: skipped (KDIR_RUST unset)" >&2
     fi

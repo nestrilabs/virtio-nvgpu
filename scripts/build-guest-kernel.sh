@@ -21,10 +21,22 @@
 # MODULE_DIR=<dir> builds the module from a copy of driver/ kept in <dir>
 # instead of in driver/ itself, so the working tree gets no build products.
 #
-# NVGPU_RUST=1 builds a kernel with CONFIG_RUST and the module with its
-# parsers in Rust (driver/rust/, NVGPU_RUST=1 in driver/Makefile) instead of
-# C. It needs rustc, bindgen and RUST_LIB_SRC in the environment: run it in
-# scripts/guest-toolchain-rust (the rig does: .rig/build-kernel-rust.sh).
+# The kernel has CONFIG_RUST, and the module its untrusted-input parsers in
+# Rust (driver/rust/), which is the module's default on such a kernel
+# (driver/Makefile): the Rust passed the whole hardware regression on
+# 2026-09-26 and is the stronger boundary (SECURITY.md §6), so the kernel the
+# project ships a guest with is one it can build. It needs rustc, bindgen and
+# RUST_LIB_SRC in the environment: run it in scripts/guest-toolchain-rust
+# (the rig does: rig/rig-build-kernel-rust.sh).
+#
+# NVGPU_RUST=0 builds a kernel without Rust and the module with its C
+# parsers instead -- the fallback, for a guest kernel that cannot have Rust,
+# and for testing it -- in either toolchain (the rig's C one is
+# .rig/kernel/toolchain). Its config is not recorded.
+#
+# CONFIG_ONLY=1 stops once the .config is made (and recorded, for the
+# default build): what a change to the options below needs, without building
+# a kernel.
 set -euo pipefail
 
 usage="usage: build-guest-kernel.sh <linux-source-dir> [jobs] [build-dir]"
@@ -40,6 +52,11 @@ if [ -n "$OUT" ]; then
     KMAKE+=(O="$OUT")
 fi
 KTREE="${OUT:-$SRC}"
+RUST="${NVGPU_RUST:-1}"
+case "$RUST" in
+0 | 1) ;;
+*) echo "NVGPU_RUST must be 0 or 1" >&2; exit 2 ;;
+esac
 
 "${KMAKE[@]}" -j"$JOBS" defconfig
 
@@ -159,15 +176,34 @@ enable CONFIG_IKCONFIG_PROC
 
 # The module's untrusted-input parsers in Rust (driver/rust/). Rust needs no
 # MODVERSIONS (unset above by defconfig) and no BTF (disabled above).
-if [ "${NVGPU_RUST:-0}" = 1 ]; then
+if [ "$RUST" = 1 ]; then
     enable CONFIG_RUST
+else
+    disable CONFIG_RUST
 fi
 
 "${KMAKE[@]}" olddefconfig
-if [ "${NVGPU_RUST:-0}" = 1 ] && ! grep -q '^CONFIG_RUST=y' "$KTREE/.config"; then
-    echo "CONFIG_RUST did not stick: no usable Rust toolchain?" >&2
+if [ "$RUST" = 1 ] && ! grep -q '^CONFIG_RUST=y' "$KTREE/.config"; then
+    echo "CONFIG_RUST did not stick: no usable Rust toolchain? Run this in" >&2
+    echo "scripts/guest-toolchain-rust, or NVGPU_RUST=0 for a kernel without Rust" >&2
     "${KMAKE[@]}" rustavailable >&2 || true
     exit 1
+fi
+
+# The recorded config is the default build's, as a savedefconfig (only what
+# differs from the defaults: `cp driver/guest-kernel.defconfig $O/.config &&
+# make olddefconfig` gives the whole .config back, in the Rust toolchain); a
+# C-only build's stays in its tree.
+record_config() {
+    if [ "$RUST" = 1 ]; then
+        "${KMAKE[@]}" savedefconfig
+        cp "$KTREE/defconfig" "$HERE/driver/guest-kernel.defconfig"
+        echo "== config recorded at driver/guest-kernel.defconfig"
+    fi
+}
+if [ "${CONFIG_ONLY:-0}" = 1 ]; then
+    record_config
+    exit 0
 fi
 # `modules` as well as `vmlinux`, not `modules_prepare`: modpost resolves the
 # module's symbols against the kernel's Module.symvers, and only a real module
@@ -190,14 +226,7 @@ fi
 # A Module.symvers carried in from another tree would be consulted first.
 rm -f "$MOD/Module.symvers"
 make -C "$MOD" KDIR="$KTREE" clean
-make -C "$MOD" KDIR="$KTREE" NVGPU_RUST="${NVGPU_RUST:-0}"
+make -C "$MOD" KDIR="$KTREE" NVGPU_RUST="$RUST"
 
-# The recorded config is the C build's, as a savedefconfig (only what differs
-# from the defaults: `cp driver/guest-kernel.defconfig $O/.config && make
-# olddefconfig` gives the whole .config back); a Rust build's stays in its tree.
-if [ "${NVGPU_RUST:-0}" != 1 ]; then
-    "${KMAKE[@]}" savedefconfig
-    cp "$KTREE/defconfig" "$HERE/driver/guest-kernel.defconfig"
-fi
-echo "== module: $MOD/virtio_gpu_nv.ko"
-[ "${NVGPU_RUST:-0}" = 1 ] || echo "== config recorded at driver/guest-kernel.defconfig"
+record_config
+echo "== module: $MOD/virtio_gpu_nv.ko ($([ "$RUST" = 1 ] && echo Rust || echo C) parsers)"
