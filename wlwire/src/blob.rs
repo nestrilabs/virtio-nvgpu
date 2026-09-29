@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_BLOB, Unit, record};
 use crate::job::Job;
-use crate::shm::ShmBudget;
+use crate::shm::ShmCharge;
 use crate::sys;
 
 /// Largest blob either side will carry. Keymaps are tens of KiB and format
@@ -54,7 +54,7 @@ pub struct Blobs {
     next: u32,
     incoming: HashMap<u32, Incoming>,
     pending_bytes: u64,
-    budgets: Vec<Arc<ShmBudget>>,
+    budgets: Vec<Arc<dyn ShmCharge>>,
     pub sent: u64,
     pub received: u64,
 }
@@ -172,7 +172,7 @@ impl Blobs {
     }
 
     /// Draw on `b` too for what unfinished blobs hold.
-    pub fn add_budget(&mut self, b: Arc<ShmBudget>) {
+    pub fn add_budget(&mut self, b: Arc<dyn ShmCharge>) {
         self.budgets.push(b);
     }
 
@@ -261,7 +261,7 @@ impl Job for BlobJob {
 }
 
 /// `n` bytes from every budget, or from none.
-fn charge(budgets: &[Arc<ShmBudget>], n: u64) -> bool {
+fn charge(budgets: &[Arc<dyn ShmCharge>], n: u64) -> bool {
     for (i, b) in budgets.iter().enumerate() {
         if !b.take(n, 0) {
             uncharge(&budgets[..i], n);
@@ -271,7 +271,7 @@ fn charge(budgets: &[Arc<ShmBudget>], n: u64) -> bool {
     true
 }
 
-fn uncharge(budgets: &[Arc<ShmBudget>], n: u64) {
+fn uncharge(budgets: &[Arc<dyn ShmCharge>], n: u64) {
     if n > 0 {
         for b in budgets {
             b.give(n, 0);

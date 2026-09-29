@@ -276,18 +276,38 @@ impl ShmBudget {
     }
 }
 
+/// Something shm pools and their memory are charged to besides the
+/// connection's own limits: a [`ShmBudget`], or an owner's share of one
+/// (the backend's per-guest-process share of the VM's, which keeps a last
+/// part for processes that hold little). Both of a charge or neither.
+pub trait ShmCharge: Send + Sync {
+    /// `bytes` and `pools` more, or nothing.
+    fn take(&self, bytes: u64, pools: u64) -> bool;
+    /// `bytes` and `pools`, taken before, back.
+    fn give(&self, bytes: u64, pools: u64);
+}
+
+impl ShmCharge for ShmBudget {
+    fn take(&self, bytes: u64, pools: u64) -> bool {
+        ShmBudget::take(self, bytes, pools)
+    }
+    fn give(&self, bytes: u64, pools: u64) {
+        ShmBudget::give(self, bytes, pools)
+    }
+}
+
 /// One pool's share of its budgets: one pool of the count, and the bytes its
 /// live buffers cover. Made before the pool (so a refused pool never has a
 /// memfd), owned by it after, and given back by `Drop` -- once, whichever way
 /// the pool goes.
 pub struct Charge {
-    budgets: Vec<Arc<ShmBudget>>,
+    budgets: Vec<Arc<dyn ShmCharge>>,
     bytes: AtomicU64,
 }
 
 impl Charge {
     /// Take one pool from every budget, or from none.
-    fn take(budgets: Vec<Arc<ShmBudget>>) -> Result<Charge, ShmError> {
+    fn take(budgets: Vec<Arc<dyn ShmCharge>>) -> Result<Charge, ShmError> {
         for (i, b) in budgets.iter().enumerate() {
             if !b.take(0, 1) {
                 for done in &budgets[..i] {
@@ -392,7 +412,7 @@ pub struct Shm {
     conn: Arc<ShmBudget>,
     /// Budgets shared with other connections: the VM's, and the guest
     /// process's the connection is for, if the owner of the engine set them.
-    shared: Vec<Arc<ShmBudget>>,
+    shared: Vec<Arc<dyn ShmCharge>>,
     pub sync_bytes: u64,
     pub syncs: u64,
 }
@@ -459,7 +479,7 @@ impl Shm {
     /// Draw on a budget other connections share too (the VM's, a guest
     /// process's), beside this connection's own and any set before. Pools
     /// already made keep what they were charged to.
-    pub fn set_shared_budget(&mut self, b: Arc<ShmBudget>) {
+    pub fn set_shared_budget(&mut self, b: Arc<dyn ShmCharge>) {
         self.shared.push(b);
     }
 
@@ -477,7 +497,7 @@ impl Shm {
     /// charged by the buffers made from it. `TooMany` if this connection or
     /// the VM is at its limit, and then nothing is taken.
     pub fn charge(&self) -> Result<Charge, ShmError> {
-        let mut budgets = vec![self.conn.clone()];
+        let mut budgets: Vec<Arc<dyn ShmCharge>> = vec![self.conn.clone()];
         budgets.extend(self.shared.iter().cloned());
         Charge::take(budgets)
     }

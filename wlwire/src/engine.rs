@@ -36,7 +36,7 @@ use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::{Shm, ShmBudget, SyncJob};
+use crate::shm::{Shm, ShmCharge, SyncJob};
 use crate::stream::{ByteBudget, Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
@@ -394,7 +394,7 @@ impl Engine {
     /// connection of a VM the same one, so the number of connections does not
     /// multiply what a guest can make the host hold. Called again, a further
     /// budget is added (a guest process's, beside the VM's).
-    pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+    pub fn set_shm_budget(&mut self, b: Arc<dyn ShmCharge>) {
         self.blobs.add_budget(b.clone());
         self.shm.set_shared_budget(b);
     }
