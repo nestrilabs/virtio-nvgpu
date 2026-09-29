@@ -2429,7 +2429,8 @@ static int __init nvgpu_init(void) {
   pr_notice("virtio-gpu-nv: built with the C parsers; the Rust ones are the "
             "default on this kernel (driver/rust/README.md)\n");
 #endif
-  nvgpu_wq = alloc_workqueue("nvgpu", WQ_HIGHPRI, 0);
+  /* Per-CPU, as system_highpri_wq is; 7.x wants that said (WQ_PERCPU). */
+  nvgpu_wq = alloc_workqueue("nvgpu", WQ_HIGHPRI | WQ_PERCPU, 0);
   nvgpu_long_wq = alloc_workqueue("nvgpu-long", WQ_UNBOUND, 0);
   if (!nvgpu_wq || !nvgpu_long_wq) {
     nvgpu_wq_destroy();
