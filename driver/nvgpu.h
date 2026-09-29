@@ -96,29 +96,23 @@ struct nvgpu_pci_slot {
 };
 
 /*
- * The PCI core reads a bus's sysdata as the architecture's own type. On x86
- * that is `struct pci_sysdata`, and the fields below have to line up with the
- * front of it:
+ * The PCI core reads a bus's sysdata as the architecture's own type, which on
+ * x86 is `struct pci_sysdata`: pci_domain_nr() its `domain`, pcibus_to_node()
+ * its `node`, pci_host_bridge_msi_domain() its `fwnode`, the ACPI glue its
+ * `companion`. So the bus's sysdata is a whole one, embedded here, the rest
+ * of it zero.
  *
- *     struct pci_sysdata { int domain; int node; ... };
- *
- * `domain` was mirrored here from the start, for pci_domain_nr(). `node` was
- * not, and everything after `domain` in this struct was therefore read as the
- * bus's NUMA node -- that is, the first four bytes of the PCI address string,
- * "0000", or 0x30303030. It went unnoticed because it is only ever read under
- * CONFIG_NUMA, which the guest kernel did not have; turn it on and the first
- * allocation the DRM core makes against this device oopses in ___slab_alloc,
- * indexing a node array a billion entries past its end.
- *
- * Mirrored rather than embedded so the struct stays buildable where
- * `struct pci_sysdata` is not the arch's sysdata type; the layout is what
- * matters, and a wrong one is silent.
+ * It used to be mirrored, and a mirror goes wrong silently. First only
+ * `domain`: everything after it was read as the NUMA node -- "0000" of the
+ * PCI address string, 0x30303030 -- which oopsed in ___slab_alloc as soon as
+ * CONFIG_NUMA was on. Then `domain` and `node` only, with `companion`,
+ * `iommu` and `fwnode` falling on the address string and the config space
+ * (the 2026-09-29 review, #19): harmless while nothing matched on them, and
+ * a pointer of "0x...10de" to any IRQ domain that did. The module is x86-64
+ * only (Kconfig), so the arch's own type is the one to use.
  */
 struct nvgpu_pci_root {
-  int domain; /* MUST be first — x86 pci_domain_nr()
-               * reads domain from sysdata offset 0 */
-  int node;   /* MUST be second — x86 pcibus_to_node()
-               * reads the NUMA node from sysdata offset 4 */
+  struct pci_sysdata sd; /* bus->sysdata; container_of() gets the rest */
   struct nvgpu_pci_slot slot;
   struct nvgpu_device *nvdev; /* back pointer        */
   struct pci_host_bridge *bridge;
@@ -166,10 +160,10 @@ struct nvgpu_device {
   struct cdev cdev_gpu[248]; /* /dev/nvidia0 … nvidia247 */
   struct cdev cdev_ctl;      /* /dev/nvidiactl            */
   struct cdev cdev_uvm;      /* /dev/nvidia-uvm           */
-  dev_t uvm_devno;           /* dynamic major for UVM     */
+  dev_t uvm_devno;           /* dynamic major, minors 0-1 */
   bool uvm_registered;       /* UVM served: nvgpu_uvm_offered() */
   struct cdev cdev_caps;     /* /dev/nvidia-caps */
-  dev_t caps_devno;          /* dynamic major for nvidia-caps */
+  dev_t caps_devno;          /* dynamic major, minors 1-2 */
   struct cdev cdev_modeset;  /* /dev/nvidia-modeset */
   dev_t modeset_devno;
 
@@ -241,6 +235,9 @@ struct nvgpu_device {
   u64 osdesc_early[NVGPU_OSDESC_EARLY];
   unsigned int osdesc_early_next;
   bool osdesc_dead;
+
+  /* /proc/driver/nvidia's files' data (nvgpu_main.c, struct nvgpu_proc_buf). */
+  struct list_head proc_bufs;
 };
 
 /*
