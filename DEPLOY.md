@@ -26,6 +26,13 @@ start without every layer in force (`sandbox: DEGRADED`):
 - `/dev/udmabuf` (`CONFIG_UDMABUF`, the `udmabuf` module) for the Wayland
   modes' shm buffers.
 
+For the VMMs: crosvm's sandbox puts every device it emulates, and the nvgpu
+frontend, in a minijail with a user namespace of its own, even as root
+(`jail/src/helpers.rs`), so crosvm needs unprivileged user namespaces too,
+and a crosvm unit must not set `RestrictNamespaces=`. nesbox's jailer needs
+Linux 5.8 or later (it mounts a `/proc` of the jail's own with
+`hidepid=invisible`, `virtio-nvgpu-v6`).
+
 **The NVIDIA driver.** NVIDIA's **open** kernel modules, at a release the
 backend's tables were measured at (below), with **`nvidia_drm.modeset=1`**:
 NVKMS is how a buffer becomes shareable and what the display paths and
@@ -94,7 +101,7 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 
 | | nesbox | crosvm |
 |---|---|---|
-| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v3` (not yet merged upstream) | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0009` |
+| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v6` (not yet merged upstream; `v5` and later size the window from the backend and prefault it, `v6` adds the jailer's own `/proc` and `/sys`) | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0010` (`0010`, the prefault, is optional: performance only) |
 | graphics (Vulkan, GL, EGL, Vulkan Video) | run on hardware | run on hardware |
 | `--allow-compute` (CUDA, NVENC/NVDEC through CUDA, OpenCL) | run on hardware | run on hardware (needs `0007`-`0009`; its nvgpu frontend runs jailed) |
 | Wayland client of the host compositor, direct scanout | run on hardware | run on hardware |
@@ -133,36 +140,63 @@ for i in 0 1 2 3; do
 done
 ```
 
-On NixOS, [`nix/module.nix`](nix/module.nix) declares the pool, the groups
-and the unit (`services.virtio-nvgpu = { enable = true; package = ...; slots
-= 4; }`; the root flake's `nixosModules.default` sets the package).
+On NixOS, [`nix/module.nix`](nix/module.nix) declares the pool, with fixed
+ids (`uidBase`, 64000 by default: slot N's backend user and group are
+64000+2N, its VMM user 64000+2N+1), the groups, the socket units and the
+unit (`services.virtio-nvgpu = { enable = true; package = ...; slots = 4;
+}`; the root flake's `nixosModules.default` sets the package). Its
+assertions refuse a slot's group with anyone else in it, a pool user with
+other groups, and another user on a pool id.
 
 **The backend.** [`contrib/systemd/vhost-user-nvgpu@.service`](contrib/systemd/vhost-user-nvgpu@.service),
-instance N, runs `vhost-user-nvgpu --socket /run/nvgpu/vmN/nvgpu.sock` as
-`nvgpu-vmN` in a cgroup of its own (`MemoryMax=2G`, `MemorySwapMax=0`,
-`TasksMax=256`, `OOMScoreAdjust=500`, `LimitCORE=0`, `Restart=no`), with no
-capabilities, `NoNewPrivileges`, a network namespace of its own, and the file
-system read-only (`ProtectSystem=strict`, `ProtectHome=yes`). Its
-`ExecStartPost` helper, [`contrib/systemd/nvgpu-socket-open`](contrib/systemd/nvgpu-socket-open)
-(install it at `/usr/libexec/virtio-nvgpu/`), makes the socket's directory
-root's and opens the socket to the slot's group once the backend has bound
-it. Per-VM flags go in `/etc/virtio-nvgpu/vmN.env` as
-`NVGPU_BACKEND_ARGS="--allow-compute"` (one word per flag: systemd splits
-the variable at spaces). Raise `MemoryMax` with `--wayland-shm-budget` and
-`--wayland-queue-budget`. The backend is never restarted alone: the VM's
-device goes with it, so restart the VMM with it.
+instance N, runs `vhost-user-nvgpu` as `nvgpu-vmN` in a cgroup of its own
+(`MemoryMax=2G`, `MemorySwapMax=0`, `TasksMax=256`, `OOMScoreAdjust=500`,
+`LimitCORE=0`, `Restart=no`), with no capabilities, `NoNewPrivileges`, a
+network namespace of its own, no namespaces of its making
+(`RestrictNamespaces=yes`), the file system read-only
+(`ProtectSystem=strict`, `ProtectHome=yes`) and nothing executable but
+itself and its libraries (`NoExecPaths=/`). Its socket is
+[`vhost-user-nvgpu@.socket`](contrib/systemd/vhost-user-nvgpu@.socket)'s:
+systemd binds `/run/nvgpu/vmN/nvgpu.sock`, root's and 0660 to the slot's
+group, in a directory of root's, and hands it to the backend (socket
+activation; the backend takes `LISTEN_FDS`, or `--socket-fd N`). The
+backend's user owns neither the socket nor its directory, so nothing else
+running as that user can replace the socket or intercept the VMM's
+connection (SECURITY.md §22). The service starts the socket unit
+(`Requires=`); install both. Per-VM flags go in `/etc/virtio-nvgpu/vmN.env`
+as `NVGPU_BACKEND_ARGS="--allow-compute"` (one word per flag: systemd
+splits the variable at spaces). Raise `MemoryMax` with
+`--wayland-shm-budget` and `--wayland-queue-budget`. The backend is never
+restarted alone: the VM's device goes with it, so restart the VMM with it.
 
 **The VMM**, as `nvgpu-vmmN`, with a unit that has
-`Requires=vhost-user-nvgpu@N.service` and `After=vhost-user-nvgpu@N.service`
-and a network namespace of its own:
+`BindsTo=vhost-user-nvgpu@N.service` and `After=vhost-user-nvgpu@N.service`
+and a network namespace of its own. `BindsTo=`, not `Requires=`: a backend
+that stops on its own -- a panic, a seccomp kill (exit 159), the OOM killer
+-- does not stop a unit that only requires it, and the VM would run on with
+a dead device. [`contrib/systemd/nvgpu-vmm-nesbox@.service`](contrib/systemd/nvgpu-vmm-nesbox@.service)
+and [`nvgpu-vmm-crosvm@.service`](contrib/systemd/nvgpu-vmm-crosvm@.service)
+are such units, templates that have passed `systemd-analyze verify` and not
+yet run on hardware:
 
-- nesbox, a config with `"gpu-forward": { "socket": "/run/nvgpu/vmN/nvgpu.sock" }`,
-  under nesbox's jailer, with `"unshare-network": true` or a network
-  namespace from its unit;
+- nesbox, a config with `"gpu-forward": { "socket": "/run/nvgpu/vmN/nvgpu.sock" }`
+  and `"unshare-network": false`, under nesbox's jailer, in the unit's
+  network namespace (`PrivateNetwork=yes`). The jailer chroots, and the
+  kernel refuses a user namespace to a chrooted process, so nesbox's own
+  `"unshare-network": true` cannot start under it (it exits with EPERM): it
+  is for unjailed runs only. The unit starts the jailer as root (it becomes
+  `nvgpu-vmmN` itself), and the jailer clears supplementary groups, so
+  `/dev/kvm` must be 0666 (systemd's default rule);
 - crosvm, `crosvm run ... --vhost-user type=nvgpu,socket=/run/nvgpu/vmN/nvgpu.sock,max-queue-size=256 --no-pci-hotplug-port`,
   with its sandbox on (the default) and a `--pivot-root` directory that
   exists and is empty. crosvm publishes the UVM aperture when the backend
-  reports it (`--allow-compute`).
+  reports it (`--allow-compute`). Its main process accepts the device's
+  queue-notification ioevents only at the addresses BAR0 had when the BARs
+  were laid out: a guest kernel that reassigns BARs before the driver binds
+  (`pci=realloc`, or a resource conflict) has them refused, and the device
+  is marked NEEDS_RESET. That fails closed, and Linux keeps
+  firmware-assigned BARs by default: do not boot a guest with
+  `pci=realloc`.
 
 Both need `/dev/kvm` for the VMM user, and both take the shared window's
 size from the backend (GET_SHMEM_CONFIG): crosvm always has, nesbox from
@@ -215,8 +249,20 @@ setfacl -m u:nvgpu-vm0:rw /run/user/1000/wayland-1
 [Service]
 ProtectHome=tmpfs
 BindReadOnlyPaths=/run/user/1000/wayland-1
-Environment="NVGPU_BACKEND_ARGS=--wayland-socket /run/user/1000/wayland-1"
 ```
+
+and the flags in the VM's environment file, beside its others -- not in the
+drop-in: systemd lets an `EnvironmentFile=` override `Environment=`, so a
+drop-in's flags are lost the moment the VM has a `vm0.env`:
+
+```sh
+# /etc/virtio-nvgpu/vm0.env
+NVGPU_BACKEND_ARGS="--allow-compute"
+NVGPU_WAYLAND_ARGS="--wayland-socket /run/user/1000/wayland-1 --wayland-lease"
+```
+
+On NixOS, `services.virtio-nvgpu.vms."0".wayland = { socket =
+"/run/user/1000/wayland-1"; lease = true; }` does all three.
 
 The compositor makes its socket anew each session, so the ACL goes with
 it: set it from the session's own start-up. The rig's launcher instead runs
@@ -239,7 +285,8 @@ that the zone, or the process's share of it, cannot take fails with ENOMEM
 write-combining first, which is correct but slow to read. The default, 1 GiB
 at half a zone per process, is enough for every application the project has
 run; a VM for one heavy application (a large game, a big 3D scene) can be
-given more with `--window-size` and `--window-owner-share`.
+given more with `--window-size` and `--window-owner-share` (on NixOS,
+`services.virtio-nvgpu.vms."N".windowMiB` and `.windowOwnerShare`).
 
 **What the zones get.** UC stays at 32 MiB, and WC and WB split the rest
 24:7 as the default does:
@@ -381,7 +428,7 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   backend's threads (the backend sets its own, `--sched-slice-us 100`; the
   rig launcher runs both under `chrt --other --sched-runtime 100000 0`,
   `NVGPU_SLICE_US`; a VMM unit should put the same `chrt` in front of its
-  `ExecStart`), the backend's `--queue-poll-us 50`, and the guest module's
+  `ExecStart`, as contrib/systemd's templates do), the backend's `--queue-poll-us 50`, and the guest module's
   defaults (`rt_spin_us=20`, `arm_ready=1`, `async_fence_watch=1`).
 - **Do not pin or confine the vCPUs on a host whose other work can land on
   the same CPUs.** Under the load above, `NVGPU_CPU_AFFINITY=8-15` (one CCD)
@@ -435,19 +482,33 @@ rig's `rig/rig-tools/nvgpu-inject-test.c` and
 
 **Host side.** Each VM that shares screens gets a helper user of its own
 (never the backend's, the VMM's, or the desktop user's uid, and never one
-shared with another VM: whoever has a VM's helper uid can inject into it).
-In `/etc/virtio-nvgpu/vmN.env`:
+shared with another VM: whoever has a VM's helper uid can inject into it),
+and a group of its own with the helper alone in it. The socket is
+[`vhost-user-nvgpu-inject@.socket`](contrib/systemd/vhost-user-nvgpu-inject@.socket)'s:
+systemd binds `/run/nvgpu/vmN/inject.sock`, root's and 0660 to the group
+`nvgpu-capN` (a drop-in's `SocketGroup=` names another), and hands it to the
+backend. In `/etc/virtio-nvgpu/vmN.env`:
 
 ```sh
-NVGPU_BACKEND_ARGS="--inject-socket /run/nvgpu/vmN/inject.sock --inject-uid 950"
-NVGPU_INJECT_GROUP=nvgpu-cap0     # the helper's group: the socket is opened to it
+NVGPU_BACKEND_ARGS="--inject-uid 950"
 ```
 
-or, on NixOS, `services.virtio-nvgpu.vms."N".inject = { enable = true;
-helperUid = 950; helperGroup = "nvgpu-cap0"; }`. The backend binds the socket
-0600 before its sandbox; the unit's `nvgpu-socket-open` makes it 0660 in
-that group once it exists. The helper then runs as that user, in that
-group, with the portal and PipeWire of the desktop session it serves.
+and the backend's unit pulls the socket in:
+
+```ini
+# /etc/systemd/system/vhost-user-nvgpu@N.service.d/inject.conf
+[Unit]
+Requires=vhost-user-nvgpu-inject@N.socket
+```
+
+On NixOS, `services.virtio-nvgpu.vms."N".inject = { enable = true;
+helperUid = 950; helperGroup = "nvgpu-cap0"; }`, and the module refuses a
+helper uid of the pool or of a login user, a helper group that does not
+exist, is a pool or shared group (wheel, users, video, ...) or holds anyone
+but the helper, and one helper or group for two VMs. The backend serves the
+socket only for its `--inject-uid`, and refuses to start with the socket
+and no `--inject-uid`. The helper runs as that user, in that group, with the
+portal and PipeWire of the desktop session it serves.
 
 **The helper's side of the socket** (`protocol/src/inject.rs` is
 normative): `AF_UNIX`, `SOCK_SEQPACKET`, one request per packet, each
@@ -535,7 +596,8 @@ shows the diagnostic ones too.
 
 | flag | default | what it does |
 |---|---|---|
-| `--socket PATH` | `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` | the vhost-user socket; whoever connects gets the guest's memory. A file already there is removed only if it is this uid's socket |
+| `--socket PATH` | `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` | the vhost-user socket; whoever connects gets the guest's memory. A file already there is removed only if it is this uid's socket. Not with the units: systemd binds the socket and hands it over (`LISTEN_FDS`, descriptors named `vhost-user` and `inject`) |
+| `--socket-fd N` | none | serve the vhost-user socket already listening on descriptor N, bound by whoever started the backend (the root launcher does this) |
 | `--allow-compute` | off | serve CUDA and other compute: `/dev/nvidia-uvm`, the UVM aperture, memory registered by its pages. Graphics, Vulkan Video and display need none of it |
 | `--window-size MIB` | 1024 | the shared window: how much GPU memory the VM's processes can have CPU-mapped at once. A multiple of 64, at least 256; with `--allow-compute` at most 64512 (window and aperture share crosvm's 64 GiB region cap), else 65536; nesbox takes at most 32768. Refused at start otherwise ("Sizing the window") |
 | `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md §19) |
@@ -550,8 +612,8 @@ shows the diagnostic ones too.
 | `--queue-poll-us US` | 50 | how long the queue thread keeps looking at the control ring after draining it (0 to 1000): requests that arrive meanwhile cost the guest no kick ("Frame pacing") |
 | `--sched-slice-us US` | 100 | every backend thread's EEVDF slice, set at start (100-100000; 0 keeps the host's ~3 ms): how soon the queue thread and the pump run again after waking on a busy host ("Frame pacing") |
 | `--pacing-stats SECS` | none | log the frame-pacing counters every SECS while the guest is busy (also `NVGPU_PACING_STATS`); they are logged once at teardown regardless |
-| `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection") |
-| `--inject-uid UID` | none | the only uid `--inject-socket` serves: the VM's capture helper |
+| `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection"); the units hand the socket over instead |
+| `--inject-uid UID` | none | the only uid the inject socket serves: the VM's capture helper |
 | `--rm-allowlist enforce` | `enforce` | the RM allowlist; `log` is diagnostic |
 | `--sandbox on` | `on` | the process sandbox; `best-effort` and `off` are diagnostic |
 | `--diagnostic` | off | allow the diagnostic flags below (or `NVGPU_DIAGNOSTIC=1`) |
@@ -689,6 +751,7 @@ In the backend's log (the unit's journal):
 | `RM control ... refused: not in the allowlist of host release ...`, `RM class ... refused`, and the teardown's `RM allowlist ... refused` summary | a guest workload asked for an RM call outside the allowlist: a missing entry, or a probe |
 | `handle table full`, `OS descriptor ... refused: over the ...` | a guest at a budget: one app starving others, or misbehaving |
 | `Intel host: KVM ignores guest PAT ...` | display memory may be incoherent on this Intel host |
+| `the VMM never asked the shared window's size (GET_SHMEM_CONFIG) ...` | a VMM older than the window it serves (nesbox before `virtio-nvgpu-v4`): placements past 1 GiB will fail |
 | `NVKMS: ...; refused`, `OPEN of ... refused`, `... refused (guestptr.rs)` | a guest asked for something the policy refuses: expected occasionally, a pattern is worth a look |
 | `inject: refusing a connection from uid ...` | something other than the VM's capture helper reached its inject socket: the socket's group is wrong, or a probe |
 | `inject: ... is not nvidia-drm (NVKMS) memory of this GPU; refused` | the helper got a stream from another device (a desktop on another GPU) or shared memory: that stream cannot be injected, only copied |

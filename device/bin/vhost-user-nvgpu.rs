@@ -111,6 +111,18 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
 
+    /// Serve the vhost-user socket already listening on descriptor N,
+    /// bound by whoever started the backend (root, as the rig launcher does)
+    /// instead of `--socket`.
+    ///
+    /// Under systemd's socket activation (`LISTEN_FDS`, a descriptor named
+    /// `vhost-user`, and one named `inject` for `--inject-uid`) nothing needs
+    /// saying: the units in contrib/systemd do that. Either way the backend
+    /// needs no directory of its own for the socket, and its user can neither
+    /// replace the socket nor intercept the VMM's connection.
+    #[arg(long, value_name = "N", conflicts_with = "socket")]
+    socket_fd: Option<i32>,
+
     /// Start even as root or with CAP_SYS_ADMIN.
     ///
     /// RM, DRM and NVKMS take a guest's privilege from the backend's
@@ -290,17 +302,20 @@ struct Args {
     /// helper running as `--inject-uid` (SECURITY.md §18).
     ///
     /// A SOCK_SEQPACKET socket, bound 0600 in a private directory and
-    /// renamed into place; open it to the helper's group once it exists
-    /// (contrib/systemd/nvgpu-socket-open). Each dma-buf the helper sends
+    /// renamed into place; open it to the helper's group once it exists.
+    /// The systemd units bind it instead (contrib/systemd,
+    /// vhost-user-nvgpu-inject@.socket), open to that group from the start,
+    /// and hand it over: then give `--inject-uid` alone. Each dma-buf the helper sends
     /// must be nvidia-drm memory of this GPU; a guest process that knows the
     /// id and token IMPORT answered opens it read-only for the CPU. Off by
     /// default: without it the guest has no /dev/nvgpu-capture.
     #[arg(long, value_name = "PATH", requires = "inject_uid")]
     inject_socket: Option<PathBuf>,
 
-    /// The only uid whose connections to `--inject-socket` are served
-    /// (SO_PEERCRED): the VM's capture helper, a user of its own.
-    #[arg(long, value_name = "UID", requires = "inject_socket")]
+    /// The only uid whose connections to `--inject-socket` (or to the
+    /// socket-activated `inject` socket) are served (SO_PEERCRED): the VM's
+    /// capture helper, a user of its own.
+    #[arg(long, value_name = "UID")]
     inject_uid: Option<u32>,
 
     /// Let `--inject-uid` be the backend's own uid: every process of the
@@ -1242,6 +1257,7 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
+        SHMEM_CONFIG_ASKED.store(true, Ordering::Relaxed);
         Ok(shmem_config(&self.window, self.allow_compute))
     }
 
@@ -1280,6 +1296,21 @@ impl VhostUserBackendMut for NvGpuBackend {
         }
         if !self.scanned_fds {
             self.scanned_fds = true;
+            // A VMM that never asked the window's size publishes its own
+            // (nesbox before virtio-nvgpu-v4: 1 GiB), and every placement
+            // past it then fails on its own as `SHM alloc failed`. Said once,
+            // here, where the memory table shows the VMM is past setting up.
+            if self.window.total() != ZoneConfig::default_1gib().total()
+                && !SHMEM_CONFIG_ASKED.load(Ordering::Relaxed)
+            {
+                log::warn!(
+                    "the VMM never asked the shared window's size (GET_SHMEM_CONFIG), and the \
+                     window is {} MiB, not the 1024 a VMM assumes: placements past what it \
+                     published will fail. Upgrade the VMM (nesbox virtio-nvgpu-v4 or later), \
+                     or leave --window-size at 1024",
+                    self.window.total() >> 20
+                );
+            }
             let be = self.shared.nvidia.lock().unwrap();
             let n = privfd::register_process_fds(&|fd| be.owns_fd(fd));
             log::info!("{n} descriptor(s) of the transport registered as the backend's own");
@@ -1507,6 +1538,151 @@ fn release_gate(version: &str, allow_unmeasured: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the VMM has asked GET_SHMEM_CONFIG on this connection (the
+/// backend serves one).
+static SHMEM_CONFIG_ASKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What an inherited listening socket is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handed {
+    VhostUser,
+    Inject,
+}
+
+/// Which descriptors systemd's socket activation hands this process, and
+/// for what (sd_listen_fds(3)): none unless `LISTEN_PID` is this process;
+/// then `LISTEN_FDS` of them from descriptor 3, named by `LISTEN_FDNAMES`
+/// (`FileDescriptorName=` in the socket unit). A lone unnamed one is the
+/// vhost-user socket; two or more must be named `vhost-user` and `inject`.
+/// Anything else is refused rather than guessed at.
+fn listen_fds(
+    pid: i32,
+    listen_pid: Option<&str>,
+    listen_fds: Option<&str>,
+    names: Option<&str>,
+) -> anyhow::Result<Vec<(RawFd, Handed)>> {
+    if listen_pid.and_then(|p| p.parse::<i32>().ok()) != Some(pid) {
+        return Ok(Vec::new());
+    }
+    let n: usize = listen_fds
+        .and_then(|n| n.parse().ok())
+        .filter(|&n| n <= 2)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "LISTEN_FDS={}: socket activation hands the backend its vhost-user socket, and \
+                 its inject socket at most",
+                listen_fds.unwrap_or("")
+            )
+        })?;
+    let names: Vec<&str> = names.map(|s| s.split(':').collect()).unwrap_or_default();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let fd = 3 + i as RawFd;
+        let role = match names.get(i).copied() {
+            Some("vhost-user") => Handed::VhostUser,
+            Some("inject") => Handed::Inject,
+            None | Some("") | Some("unknown") if n == 1 => Handed::VhostUser,
+            other => anyhow::bail!(
+                "socket activation: descriptor {fd} is named {:?}; name the sockets \
+                 FileDescriptorName=vhost-user and FileDescriptorName=inject \
+                 (contrib/systemd)",
+                other.unwrap_or("")
+            ),
+        };
+        if out.iter().any(|&(_, r)| r == role) {
+            anyhow::bail!("socket activation: two descriptors named for {role:?}");
+        }
+        out.push((fd, role));
+    }
+    Ok(out)
+}
+
+/// The listening sockets this backend was handed rather than binding its
+/// own, the vhost-user one with how it came, for the log.
+struct Inherited {
+    vhost_user: Option<(OwnedFd, String)>,
+    inject: Option<OwnedFd>,
+}
+
+/// `--socket-fd N`, and systemd's socket activation (`listen_fds`): each
+/// descriptor claimed and checked to be a listening `AF_UNIX` socket of the
+/// type its protocol takes; the activation variables then removed from the
+/// environment. Called while the process has one thread, before it opens
+/// anything.
+fn inherited_sockets(args: &Args) -> anyhow::Result<Inherited> {
+    let var = |k: &str| std::env::var(k).ok();
+    let handed = listen_fds(
+        device::sys::proc::pid(),
+        var("LISTEN_PID").as_deref(),
+        var("LISTEN_FDS").as_deref(),
+        var("LISTEN_FDNAMES").as_deref(),
+    )?;
+    // Unset whether or not they were ours: they describe this exec only.
+    if !device::sys::inherit::unset_env(&["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"]) {
+        log::debug!("socket activation: environment left as it was (more than one thread)");
+    }
+    let take = |fd: RawFd, ty: i32, what: &str| -> anyhow::Result<OwnedFd> {
+        let owned = device::sys::inherit::claim(fd)
+            .map_err(|e| anyhow::anyhow!("{what}: descriptor {fd}: {e}"))?;
+        let k = device::sys::inherit::socket_kind(std::os::fd::AsFd::as_fd(&owned))
+            .map_err(|e| anyhow::anyhow!("{what}: descriptor {fd}: {e}"))?;
+        if k.domain != libc::AF_UNIX || k.ty != ty || !k.listening {
+            anyhow::bail!(
+                "{what}: descriptor {fd} is not a listening AF_UNIX {} socket",
+                if ty == libc::SOCK_STREAM {
+                    "SOCK_STREAM"
+                } else {
+                    "SOCK_SEQPACKET"
+                }
+            );
+        }
+        Ok(owned)
+    };
+    let mut out = Inherited {
+        vhost_user: None,
+        inject: None,
+    };
+    for (fd, role) in handed {
+        match role {
+            Handed::VhostUser => {
+                out.vhost_user = Some((
+                    take(fd, libc::SOCK_STREAM, "socket activation")?,
+                    format!("descriptor {fd} (socket activation)"),
+                ))
+            }
+            Handed::Inject => {
+                out.inject = Some(take(fd, libc::SOCK_SEQPACKET, "socket activation")?)
+            }
+        }
+    }
+    if let Some(fd) = args.socket_fd {
+        if out.vhost_user.is_some() {
+            anyhow::bail!("--socket-fd {fd} and a socket-activated vhost-user socket: one of them");
+        }
+        out.vhost_user = Some((
+            take(fd, libc::SOCK_STREAM, "--socket-fd")?,
+            format!("descriptor {fd} (--socket-fd)"),
+        ));
+    }
+    if out.vhost_user.is_some() && args.socket.is_some() {
+        anyhow::bail!("--socket and a socket-activated vhost-user socket: one of them");
+    }
+    match (&out.inject, &args.inject_socket, args.inject_uid) {
+        (Some(_), Some(_), _) => {
+            anyhow::bail!("--inject-socket and a socket-activated inject socket: one of them")
+        }
+        (Some(_), None, None) => {
+            anyhow::bail!("a socket-activated inject socket needs --inject-uid")
+        }
+        (None, None, Some(_)) => anyhow::bail!(
+            "--inject-uid needs --inject-socket, or an inject socket from socket activation"
+        ),
+        _ => {}
+    }
+    Ok(out)
+}
+
 /// The window `--window-size` and `--window-owner-share` ask for, beside
 /// the UVM aperture when compute is served, or why not.
 fn window_config(args: &Args) -> anyhow::Result<ZoneConfig> {
@@ -1537,6 +1713,9 @@ fn main() -> anyhow::Result<()> {
         eprintln!("vhost-user-nvgpu: {line}");
         log::warn!("{line}");
     }
+    // Sockets handed over at exec: claimed while this is the only thread
+    // and before anything is opened.
+    let inherited = inherited_sockets(&args)?;
     // The window, from the flags: refused here, before anything is opened,
     // if it cannot be had. The allocator and GET_SHMEM_CONFIG both take it.
     let window = window_config(&args)?;
@@ -1595,31 +1774,41 @@ fn main() -> anyhow::Result<()> {
         posture::Caps::current()?
     );
 
-    let socket = match &args.socket {
-        Some(p) => p.clone(),
+    // A socket handed over is served as it is: whoever bound it (root,
+    // systemd) chose its path, owner and mode, and dropping it unlinks
+    // nothing.
+    let (mut listener, socket) = match inherited.vhost_user {
+        Some((fd, what)) => (
+            vhost::vhost_user::Listener::from(std::os::unix::net::UnixListener::from(fd)),
+            what,
+        ),
         None => {
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-            let p = posture::default_socket(runtime.as_deref()).ok_or_else(|| {
-                anyhow::anyhow!("no --socket given and no XDG_RUNTIME_DIR to put one in")
-            })?;
-            let dir = p.parent().expect("the default has a directory");
-            posture::private_dir(dir, euid)
-                .map_err(|e| anyhow::anyhow!("socket directory: {e}"))?;
-            p
+            let socket = match &args.socket {
+                Some(p) => p.clone(),
+                None => {
+                    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+                    let p = posture::default_socket(runtime.as_deref()).ok_or_else(|| {
+                        anyhow::anyhow!("no --socket given and no XDG_RUNTIME_DIR to put one in")
+                    })?;
+                    let dir = p.parent().expect("the default has a directory");
+                    posture::private_dir(dir, euid)
+                        .map_err(|e| anyhow::anyhow!("socket directory: {e}"))?;
+                    p
+                }
+            };
+            posture::clear_socket_path(&socket, euid)
+                .map_err(|e| anyhow::anyhow!("socket {}: {e}", socket.display()))?;
+            // Bound now: the sandbox below leaves no directory writable. Not
+            // unlinking first -- the path was just cleared, and a socket
+            // someone else put there since makes the bind fail rather than
+            // be shared.
+            let l = vhost::vhost_user::Listener::new(&socket, false)
+                .map_err(|e| anyhow::anyhow!("listen on {}: {e}", socket.display()))?;
+            (l, socket.display().to_string())
         }
     };
-    posture::clear_socket_path(&socket, euid)
-        .map_err(|e| anyhow::anyhow!("socket {}: {e}", socket.display()))?;
-    // Bound now: the sandbox below leaves no directory writable. Not
-    // unlinking first -- the path was just cleared, and a socket someone
-    // else put there since makes the bind fail rather than be shared.
-    let mut listener = vhost::vhost_user::Listener::new(&socket, false)
-        .map_err(|e| anyhow::anyhow!("listen on {}: {e}", socket.display()))?;
 
-    log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",
-        socket.display()
-    );
+    log::info!("virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {socket}");
 
     let abi_policy = if args.permissive_abi {
         device::nvidia::AbiPolicy::Permissive
@@ -1633,18 +1822,30 @@ fn main() -> anyhow::Result<()> {
     let _export = ExportGuard(wayland.export.as_ref().map(|(x, _)| x.clone()));
     // Bound now, like the export socket: the sandbox leaves no directory to
     // make a socket in. Its threads start after the sandbox.
-    let inject = match (&args.inject_socket, args.inject_uid) {
-        (Some(p), Some(uid)) => {
+    // Or handed over, bound by systemd (inherited_sockets checked the
+    // combination).
+    let inject = match (inherited.inject, &args.inject_socket, args.inject_uid) {
+        (fd, p, Some(uid)) if fd.is_some() || p.is_some() => {
             inject_uid_ok(uid, device::sys::proc::uid(), args.allow_inject_self)?;
             let registry = Arc::new(device::inject::Registry::new(Arc::new(
                 device::inject::SysInjectHost::for_this_host(),
             )));
-            let s = device::inject::InjectServer::bind_idle(p, uid, registry).map_err(|e| {
-                anyhow::anyhow!("--inject-socket {}: cannot listen: {e}", p.display())
-            })?;
+            let s = match (fd, p) {
+                (Some(fd), _) => device::inject::InjectServer::from_listener(
+                    fd,
+                    PathBuf::from("(socket activation)"),
+                    uid,
+                    registry,
+                ),
+                (None, Some(p)) => device::inject::InjectServer::bind_idle(p, uid, registry)
+                    .map_err(|e| {
+                        anyhow::anyhow!("--inject-socket {}: cannot listen: {e}", p.display())
+                    })?,
+                (None, None) => unreachable!("guarded above"),
+            };
             log::info!(
                 "inject: uid {uid} may inject buffers at {} (at most {} buffers, {} MiB)",
-                p.display(),
+                s.path().display(),
                 device::inject::MAX_BUFFERS,
                 device::inject::MAX_BYTES >> 20
             );
@@ -1904,7 +2105,7 @@ fn main() -> anyhow::Result<()> {
         | Err(vhost_user_backend::Error::HandleRequest(
             vhost::vhost_user::Error::Disconnected | vhost::vhost_user::Error::PartialMessage,
         )) => {}
-        Err(e) => anyhow::bail!("serve {}: {e:?}", socket.display()),
+        Err(e) => anyhow::bail!("serve {socket}: {e:?}"),
     }
 
     backend
@@ -1988,6 +2189,59 @@ mod tests {
 
     fn args(a: &[&str]) -> Args {
         Args::try_parse_from(std::iter::once("vhost-user-nvgpu").chain(a.iter().copied())).unwrap()
+    }
+
+    /// sd_listen_fds(3): nothing unless LISTEN_PID is this process; a lone
+    /// unnamed descriptor is the vhost-user socket; two must be named; no
+    /// more than two, no name twice, no name it does not know.
+    #[test]
+    fn socket_activation_hands_over_only_what_it_names() {
+        use Handed::*;
+        assert!(listen_fds(7, None, Some("1"), None).unwrap().is_empty());
+        assert!(
+            listen_fds(7, Some("8"), Some("1"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            listen_fds(7, Some("7"), Some("1"), None).unwrap(),
+            [(3, VhostUser)]
+        );
+        assert_eq!(
+            listen_fds(7, Some("7"), Some("1"), Some("unknown")).unwrap(),
+            [(3, VhostUser)]
+        );
+        assert_eq!(
+            listen_fds(7, Some("7"), Some("2"), Some("inject:vhost-user")).unwrap(),
+            [(3, Inject), (4, VhostUser)]
+        );
+        assert!(listen_fds(7, Some("7"), Some("2"), None).is_err());
+        assert!(listen_fds(7, Some("7"), Some("2"), Some("vhost-user:vhost-user")).is_err());
+        assert!(listen_fds(7, Some("7"), Some("1"), Some("nvgpu.socket")).is_err());
+        assert!(listen_fds(7, Some("7"), Some("3"), None).is_err());
+        assert!(listen_fds(7, Some("7"), Some("x"), None).is_err());
+        assert!(
+            listen_fds(7, Some("7"), Some("0"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// --socket-fd stands for --socket; --inject-uid alone parses (the
+    /// inject socket may come from socket activation) and is checked at start.
+    #[test]
+    fn socket_fd_is_instead_of_socket() {
+        assert_eq!(args(&["--socket-fd", "3"]).socket_fd, Some(3));
+        assert!(
+            Args::try_parse_from(["vhost-user-nvgpu", "--socket", "/x", "--socket-fd", "3"])
+                .is_err()
+        );
+        let a = args(&["--inject-uid", "950"]);
+        let e = inherited_sockets(&a)
+            .err()
+            .expect("no inject socket")
+            .to_string();
+        assert!(e.contains("--inject-uid needs"), "{e}");
     }
 
     /// Every diagnostic flag is refused alone and announced with

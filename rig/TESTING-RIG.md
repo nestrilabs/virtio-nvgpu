@@ -25,7 +25,7 @@ Everything is built into `.rig/` (git-ignored), laid out as
 | path | what |
 |---|---|
 | `.rig/bin/vhost-user-nvgpu` | the backend (release) |
-| `.rig/bin/nesbox` | the VMM (release) |
+| `.rig/bin/nesbox` | the VMM (release, static; nesbox's `virtio-nvgpu-v5` or later, and with it its `jailer` for root runs; `.rig/bin/nesbox-v6` and `jailer-v6` are `virtio-nvgpu-v6`, the 2026-09-29 review's) |
 | `.rig/bin/crosvm` | the other VMM, `--vmm crosvm` (release, static; below, "crosvm") |
 | `.rig/bin/virtiofsd` | only with `NVGPU_NVIDIA_SHARE` |
 | `.rig/kernel/vmlinux`, `.rig/kernel/nvgpu.ko` | guest kernel 7.2.7 (ELF `vmlinux`: nesbox enters it at `startup_64` with a `boot_params` page; QEMU, for the TCG smoke, through its PVH note), and the module built against it (Kbuild names it `virtio_gpu_nv.ko`; the rig installs it as `nvgpu.ko`) |
@@ -216,9 +216,9 @@ nested inside the headless sway
 
 Every Group A stage also runs under crosvm, with its sandbox on: add
 `--vmm crosvm` (or set `NVGPU_VMM_KIND=crosvm`). A2's `--allow-compute` half
-needs a crosvm with the UVM aperture (patches `0007`-`0009`, branch
-`virtio-nvgpu-compute`); the launcher refuses `--allow-compute` with a crosvm
-whose `run --help` does not name the `nvgpu-uvm-aperture`. The kernel, image, probes,
+needs a crosvm with the UVM aperture (patches `0007`-`0009`); the launcher
+refuses `--allow-compute` with a crosvm whose `run --help` does not name the
+`nvgpu-uvm-aperture`. The kernel, image, probes,
 backend and logs are the same; `<tag>.json` records crosvm's command line,
 as it has no config file.
 
@@ -233,19 +233,27 @@ NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 rig/rig-app-check.sh \
   typing,pointer,clipboard,glxgears,gamescope,gtk,qt,firefox,mpv,vkmark,chromegpu cv-apps
 ```
 
-`.rig/src/crosvm` is upstream crosvm (c0474109d64d, 2026-09-25) on branch
-`virtio-nvgpu`, with patches `0001`-`0006` of `patches/crosvm/`;
-`.rig/src/crosvm-compute` is a worktree on branch `virtio-nvgpu-compute`,
-all nine (patches/README.md says what each is for). The compute build goes
-to its own binary, so the graphics one is left alone:
+Build crosvm from upstream (c0474109d64d, 2026-09-25) with the whole series,
+all ten patches of `patches/crosvm/` (patches/README.md says what each is
+for; `scripts/ci.sh deploy` checks they still apply), on a branch of its
+own:
 
 ```sh
-CROSVM_SRC=.rig/src/crosvm-compute CROSVM_OUT=.rig/bin/crosvm-compute \
-  CARGO_TARGET_DIR=.rig/target-crosvm-compute rig/rig-build-crosvm.sh
-NVGPU_VMM=.rig/bin/crosvm-compute rig/run-guest.sh --vmm crosvm ...
-``` It is built static and without
-crosvm's default features: no virtio-gpu, virgl, virtio-wl, audio, USB or
-network devices.
+git -C .rig/src/crosvm checkout -b virtio-nvgpu-series c0474109d64d
+git -C .rig/src/crosvm am "$PWD"/patches/crosvm/*.patch
+CROSVM_OUT=.rig/bin/crosvm CARGO_TARGET_DIR=.rig/target-crosvm rig/rig-build-crosvm.sh
+```
+
+The branches already in `.rig/src` are older: `.rig/src/crosvm`'s
+`virtio-nvgpu` has `0001`-`0006`, `.rig/src/crosvm-compute` (a worktree) has
+`virtio-nvgpu-compute` with `0001`-`0009` as first written and
+`virtio-nvgpu-compute-fixed` with them regenerated; none has `0010` (the
+prefault) or the 2026-09-29 review's changes to `0007` and `0010`. Built
+from the series applied as above, the review's build is `.rig/bin/crosvm-p11`.
+`CROSVM_SRC` and `CROSVM_OUT` build another checkout to another binary, so
+the one in use is left alone. It is built static and without crosvm's
+default features: no virtio-gpu, virgl, virtio-wl, audio, USB or network
+devices.
 
 The guest driver gives the GPU the host's own PCI address, so its bus must
 be free in the guest. The launcher checks before it starts anything: a host
@@ -295,7 +303,7 @@ VMM.
 ### Compute under crosvm
 
 Built (`0007`-`0009`), unit-tested, and run on the 5090 (2026-09-26): with
-`.rig/bin/crosvm` built from `virtio-nvgpu-compute`, `render` with
+`.rig/bin/crosvm` built from `virtio-nvgpu-compute` (`0001`-`0009`), `render` with
 `NVGPU_COMPUTE=1` passes 9/0/1 with `cuda-smoke` all PASS, and `secneg` with
 compute passes, the frontend jailed (the launcher's summary says `nvgpu
 frontend jailed`); see "Regression of the merged tree", below. The aperture is

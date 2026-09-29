@@ -12,21 +12,26 @@
 #     vms."0".inject = { enable = true; helperUid = 950; helperGroup = "nvgpu-cap0"; };
 #   };
 #
-# Slot N is two system users: nvgpu-vmN runs the backend
-# (vhost-user-nvgpu@N.service), and nvgpu-vmmN, in group nvgpu-vmN and no
-# other, is for the VMM, which connects to /run/nvgpu/vmN/nvgpu.sock. The unit
-# is contrib/systemd/vhost-user-nvgpu@.service, said in Nix; keep the two in
-# step. Nothing here starts a VMM: give its unit
-#   requires = [ "vhost-user-nvgpu@N.service" ]; after = [ same ];
-# and User = "nvgpu-vmmN". For a compute VM (--allow-compute), that unit also
-# needs the mincore syscall (not in @system-service) and, under a device
-# policy, DeviceAllow "/dev/nvidia-uvm w": the VMM checks each UVM pool with
-# mincore, which the kernel answers only for a file it may write. A device
-# policy names major 195 "char-nvidia" (DEPLOY.md, "Per-VM users").
+# Slot N is two system users with fixed ids: nvgpu-vmN (uid uidBase+2N, the
+# backend, vhost-user-nvgpu@N.service) and nvgpu-vmmN (uid uidBase+2N+1, the
+# VMM), both in group nvgpu-vmN (gid uidBase+2N) and no other. The VMM
+# connects to /run/nvgpu/vmN/nvgpu.sock, which vhost-user-nvgpu@N.socket
+# binds, root's and open to that group, and hands to the backend (socket
+# activation): the backend's user owns neither the socket nor its directory.
+# The units are contrib/systemd's, said in Nix; scripts/ci.sh compares the
+# two. Nothing here starts a VMM: give its unit
+#   bindsTo = [ "vhost-user-nvgpu@N.service" ]; after = [ same ];
+# (bindsTo, not requires: a backend that dies on its own must take the VMM
+# with it) and User = "nvgpu-vmmN", or use contrib/systemd's
+# nvgpu-vmm-nesbox@.service and nvgpu-vmm-crosvm@.service. For a compute VM
+# (--allow-compute), that unit also needs the mincore syscall (not in
+# @system-service) and, under a device policy, DeviceAllow "/dev/nvidia-uvm
+# w": the VMM checks each UVM pool with mincore, which the kernel answers only
+# for a file it may write. A device policy names major 195 "char-nvidia"
+# (DEPLOY.md, "Per-VM users").
 {
   config,
   lib,
-  pkgs,
   ...
 }:
 let
@@ -46,8 +51,45 @@ let
   cfg = config.services.virtio-nvgpu;
   ids = genList toString cfg.slots;
 
-  socketOpen = pkgs.writeShellScript "nvgpu-socket-open" (
-    builtins.readFile ../contrib/systemd/nvgpu-socket-open
+  # Slot n's ids: the backend's uid and the group's gid are base+2n, the
+  # VMM's uid base+2n+1.
+  backendUid = n: cfg.uidBase + 2 * lib.toInt n;
+  vmmUid = n: backendUid n + 1;
+  poolUids = lib.concatMap (n: [
+    (backendUid n)
+    (vmmUid n)
+  ]) ids;
+  poolUsers = lib.concatMap (n: [
+    "nvgpu-vm${n}"
+    "nvgpu-vmm${n}"
+  ]) ids;
+  poolGroups = map (n: "nvgpu-vm${n}") ids;
+
+  users = config.users.users;
+  groups = config.users.groups;
+  # Who is in group g: its primary members and those that add it.
+  membersOf =
+    g:
+    lib.attrNames (lib.filterAttrs (_: u: u.group == g || lib.elem g u.extraGroups) users)
+    ++ (groups.${g}.members or [ ]);
+  # Groups every login user, or the whole system, may be in: never a
+  # helper's.
+  sharedGroups = [
+    "root"
+    "wheel"
+    "users"
+    "nogroup"
+    "video"
+    "render"
+    "kvm"
+    "audio"
+    "input"
+    "systemd-journal"
+    "nixbld"
+  ];
+  injecting = lib.filterAttrs (_: vm: vm.inject.enable) cfg.vms;
+  loginUids = lib.filter (u: u != null) (
+    lib.mapAttrsToList (_: u: if u.isNormalUser then u.uid else null) users
   );
 
   vmOptions = {
@@ -91,26 +133,55 @@ let
           only (SECURITY.md, "The window's size and share").
         '';
       };
+      wayland = {
+        socket = mkOption {
+          type = types.nullOr (types.strMatching "^/[^[:space:]]+$");
+          default = null;
+          example = "/run/user/1000/wayland-1";
+          description = ''
+            The host compositor's socket, for the Wayland proxy
+            (`--wayland-socket`; DEPLOY.md, "The Wayland modes"). The unit
+            then hides home directories behind an empty tmpfs and binds this
+            one socket read-only. The VM's user (nvgpu-vmN) still needs an
+            ACL on the socket and search on its directory, set from the
+            desktop session's start-up: the compositor makes the socket anew
+            each session.
+          '';
+        };
+        lease = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Offer the compositor's DRM lease device (`--wayland-lease`; needs
+            the patched Hyprland of patches/ and a monitor marked leasable).
+          '';
+        };
+      };
       inject = {
         enable = mkEnableOption ''
-          capture injection for this VM (SECURITY.md §18): the backend listens
-          at /run/nvgpu/vmN/inject.sock for this VM's capture helper, opened
-          to `helperGroup`, and serves only `helperUid` there. Give every VM
-          a helper user of its own: a helper can inject into any VM whose
-          socket admits its uid'';
+          capture injection for this VM (SECURITY.md §18): the socket unit
+          vhost-user-nvgpu-inject@N.socket binds /run/nvgpu/vmN/inject.sock,
+          root's and open to `helperGroup`, and hands it to the backend, which
+          serves only `helperUid` there. Give every VM a helper user of its
+          own: a helper can inject into any VM whose socket admits its uid'';
         helperUid = mkOption {
           type = types.ints.positive;
           description = ''
             The uid of this VM's capture helper (`--inject-uid`), the one
             process that may hand the backend screen-share buffers for it.
-            Not the backend's, the VMM's or the desktop user's uid.
+            Not a uid of the pool (any slot's backend or VMM), and not a
+            login user's.
           '';
         };
         helperGroup = mkOption {
-          # A group name and nothing else: it reaches the socket helper's
-          # command line through the unit's environment.
+          # A group name and nothing else.
           type = types.strMatching "^[a-z_][a-z0-9_-]*$";
-          description = "The group the inject socket is opened to: the helper's own.";
+          description = ''
+            The group the inject socket is opened to: the helper's own, a
+            group of this configuration's (users.groups) whose only members
+            have `helperUid`. Not a pool group and not a shared one (wheel,
+            users, video, ...).
+          '';
         };
       };
       autoStart = mkOption {
@@ -118,7 +189,7 @@ let
         default = false;
         description = ''
           Start this VM's backend at boot (multi-user.target). Usually the
-          VMM's unit pulls it in instead, with `requires` and `after`.
+          VMM's unit pulls it in instead, with `bindsTo` and `after`.
         '';
       };
     };
@@ -139,6 +210,19 @@ in
       description = ''
         How many VMs may run at once: slot N gets the users nvgpu-vmN (the
         backend) and nvgpu-vmmN (the VMM), in the group nvgpu-vmN.
+      '';
+    };
+
+    uidBase = mkOption {
+      # With at most 256 slots, the last id is at most 65511: below nobody.
+      type = types.ints.between 1000 65000;
+      default = 64000;
+      description = ''
+        The pool's ids: slot N's backend user and group are uidBase+2N, its
+        VMM user uidBase+2N+1. Fixed, so that the assertions that keep a
+        capture helper apart from every VM's users can compare them; move it
+        if another user of this host has one of those ids (an assertion
+        says so).
       '';
     };
 
@@ -182,6 +266,32 @@ in
         message = "services.virtio-nvgpu.vms names a slot at or above services.virtio-nvgpu.slots (${toString cfg.slots})";
       }
       {
+        # The pool's ids are the pool's alone.
+        assertion = lib.all (
+          name:
+          let
+            u = users.${name};
+          in
+          lib.elem name poolUsers || u.uid == null || !(lib.elem u.uid poolUids)
+        ) (lib.attrNames users);
+        message = "services.virtio-nvgpu.uidBase: another user has a uid of the pool (${toString cfg.uidBase} to ${toString (cfg.uidBase + 2 * cfg.slots - 1)}); move uidBase";
+      }
+      {
+        # A slot's group holds its two users and no one else: whoever else
+        # were in it could connect to the VM's backend socket.
+        assertion = lib.all (
+          n:
+          lib.all (m: m == "nvgpu-vm${n}" || m == "nvgpu-vmm${n}") (membersOf "nvgpu-vm${n}")
+        ) ids;
+        message = "services.virtio-nvgpu: a user other than nvgpu-vmN and nvgpu-vmmN is in group nvgpu-vmN, which opens VM N's backend socket to it";
+      }
+      {
+        # And they are in no other group (the backend's device groups come
+        # from its unit, not its account).
+        assertion = lib.all (name: users.${name}.extraGroups == [ ]) poolUsers;
+        message = "services.virtio-nvgpu: the pool's users (nvgpu-vmN, nvgpu-vmmN) must have no extraGroups";
+      }
+      {
         assertion = lib.all (vm: lib.all (a: builtins.match ".*[[:space:]].*" a == null) vm.extraArgs) (
           lib.attrValues cfg.vms
         );
@@ -190,27 +300,44 @@ in
       {
         assertion =
           let
-            uids = map (vm: vm.inject.helperUid) (lib.filter (vm: vm.inject.enable) (lib.attrValues cfg.vms));
+            uids = map (vm: vm.inject.helperUid) (lib.attrValues injecting);
+            gs = map (vm: vm.inject.helperGroup) (lib.attrValues injecting);
           in
-          lib.length uids == lib.length (lib.unique uids);
-        message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: each VM needs a capture helper user of its own";
+          lib.length uids == lib.length (lib.unique uids) && lib.length gs == lib.length (lib.unique gs);
+        message = "services.virtio-nvgpu.vms.<n>.inject: each VM needs a capture helper user, and group, of its own";
       }
       {
-        # Not the VM's backend or VMM user, where their uids are fixed
-        # (the backend refuses its own uid itself, at start).
+        # Not any VM's backend or VMM user (the backend refuses its own uid
+        # itself, at start), nor a login user's.
         assertion = lib.all (
-          n:
+          vm: !(lib.elem vm.inject.helperUid poolUids) && !(lib.elem vm.inject.helperUid loginUids)
+        ) (lib.attrValues injecting);
+        message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: the capture helper must be a user of its own: not a uid of the pool (any VM's backend or VMM user) and not a login user's";
+      }
+      {
+        assertion = lib.all (
+          vm:
           let
-            vm = cfg.vms.${n};
-            fixed = u: if config.users.users ? ${u} then config.users.users.${u}.uid else null;
+            g = vm.inject.helperGroup;
           in
-          !vm.inject.enable
-          || !(lib.elem vm.inject.helperUid [
-            (fixed "nvgpu-vm${n}")
-            (fixed "nvgpu-vmm${n}")
-          ])
-        ) (lib.attrNames cfg.vms);
-        message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: the capture helper must not be the VM's backend or VMM user";
+          groups ? ${g}
+          && builtins.match "nvgpu-vmm?[0-9]+" g == null
+          && !(lib.elem g sharedGroups)
+        ) (lib.attrValues injecting);
+        message = "services.virtio-nvgpu.vms.<n>.inject.helperGroup: a group of this configuration's own (users.groups), not a pool group (nvgpu-vmN) and not a shared one (${concatStringsSep ", " sharedGroups})";
+      }
+      {
+        # Whoever is in the helper's group can connect to the inject socket;
+        # only the helper should.
+        assertion = lib.all (
+          vm:
+          let
+            g = vm.inject.helperGroup;
+          in
+          !(groups ? ${g})
+          || lib.all (m: users ? ${m} && users.${m}.uid == vm.inject.helperUid) (membersOf g)
+        ) (lib.attrValues injecting);
+        message = "services.virtio-nvgpu.vms.<n>.inject.helperGroup: every member of the helper's group must be the helper (a user with uid = helperUid)";
       }
       {
         # The backend refuses any other size at start; say it here, where
@@ -229,13 +356,14 @@ in
       }
     ];
 
-    users.groups = listToAttrs (map (i: nameValuePair "nvgpu-vm${i}" { }) ids);
+    users.groups = listToAttrs (map (i: nameValuePair "nvgpu-vm${i}" { gid = backendUid i; }) ids);
     users.users =
       listToAttrs (
         map (
           i:
           nameValuePair "nvgpu-vm${i}" {
             isSystemUser = true;
+            uid = backendUid i;
             group = "nvgpu-vm${i}";
             description = "virtio-nvgpu backend, VM slot ${i}";
           }
@@ -246,16 +374,59 @@ in
           i:
           nameValuePair "nvgpu-vmm${i}" {
             isSystemUser = true;
+            uid = vmmUid i;
             group = "nvgpu-vm${i}";
             description = "virtio-nvgpu VMM, VM slot ${i}";
           }
         ) ids
       );
 
+    # The vhost-user socket: root's, open to the slot's group, handed to the
+    # backend (contrib/systemd/vhost-user-nvgpu@.socket).
+    systemd.sockets = {
+      "vhost-user-nvgpu@" = {
+        description = "virtio-nvgpu vhost-user socket for VM %i";
+        socketConfig = {
+          ListenStream = "/run/nvgpu/vm%i/nvgpu.sock";
+          SocketUser = "root";
+          SocketGroup = "nvgpu-vm%i";
+          SocketMode = "0660";
+          DirectoryMode = "0711";
+          FileDescriptorName = "vhost-user";
+          Accept = false;
+          RemoveOnStop = true;
+        };
+      };
+    }
+    # The capture helper's, per VM that has one, open to its group
+    # (contrib/systemd/vhost-user-nvgpu-inject@.socket).
+    // mapAttrs' (
+      n: vm:
+      nameValuePair "vhost-user-nvgpu-inject@${n}" {
+        description = "virtio-nvgpu capture-injection socket for VM ${n}";
+        socketConfig = {
+          ListenSequentialPacket = "/run/nvgpu/vm${n}/inject.sock";
+          SocketUser = "root";
+          SocketGroup = vm.inject.helperGroup;
+          SocketMode = "0660";
+          DirectoryMode = "0711";
+          FileDescriptorName = "inject";
+          Accept = false;
+          RemoveOnStop = true;
+          Service = "vhost-user-nvgpu@${n}.service";
+        };
+      }
+    ) injecting;
+
     systemd.services = {
       "vhost-user-nvgpu@" = {
         description = "virtio-nvgpu vhost-user backend for VM %i";
-        after = [ "systemd-modules-load.service" ];
+        requires = [ "vhost-user-nvgpu@%i.socket" ];
+        after = [
+          "systemd-modules-load.service"
+          "vhost-user-nvgpu@%i.socket"
+          "vhost-user-nvgpu-inject@%i.socket"
+        ];
         environment.RUST_LOG = lib.mkDefault "warn";
         serviceConfig = {
           Type = "exec";
@@ -266,11 +437,8 @@ in
             "render"
             "kvm"
           ];
-          ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} --socket /run/nvgpu/vm%i/nvgpu.sock ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS";
-          # $NVGPU_INJECT_GROUP, unset, is no argument at all.
-          ExecStartPost = "+${socketOpen} /run/nvgpu/vm%i nvgpu-vm%i $NVGPU_INJECT_GROUP";
-          RuntimeDirectory = "nvgpu/vm%i";
-          RuntimeDirectoryMode = "0700";
+          # No --socket: the socket is descriptor 3, from the socket unit.
+          ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS";
           UMask = "0077";
 
           Restart = "no";
@@ -294,6 +462,10 @@ in
             "AF_UNIX"
             "AF_NETLINK"
           ];
+          RestrictNamespaces = true;
+          KeyringMode = "private";
+          ProtectHostname = true;
+          ProtectKernelLogs = true;
 
           ProtectSystem = "strict";
           ProtectHome = true;
@@ -304,40 +476,56 @@ in
           ProtectKernelModules = true;
           ProtectControlGroups = true;
           ProtectProc = "invisible";
+          NoExecPaths = [ "/" ];
+          ExecPaths = [ "/nix/store" ];
         };
       };
     }
     // mapAttrs' (
       n: vm:
-      nameValuePair "vhost-user-nvgpu@${n}" {
-        overrideStrategy = "asDropin";
-        # systemd splits an unbraced $VAR at whitespace and takes quotes in
-        # it literally: hence one word per flag, and no spaces in any.
-        environment = {
-          NVGPU_BACKEND_ARGS = concatStringsSep " " (
-            vm.extraArgs
-            ++ lib.optionals (vm.windowMiB != null) [
-              "--window-size"
-              (toString vm.windowMiB)
-            ]
-            ++ lib.optionals (vm.windowOwnerShare != null) [
-              "--window-owner-share"
-              (toString vm.windowOwnerShare)
-            ]
-            ++ lib.optionals vm.inject.enable [
-              "--inject-socket"
-              "/run/nvgpu/vm${n}/inject.sock"
-              "--inject-uid"
-              (toString vm.inject.helperUid)
-            ]
-          );
+      nameValuePair "vhost-user-nvgpu@${n}" (
+        {
+          overrideStrategy = "asDropin";
+          # systemd splits an unbraced $VAR at whitespace and takes quotes in
+          # it literally: hence one word per flag, and no spaces in any.
+          environment = {
+            NVGPU_BACKEND_ARGS = concatStringsSep " " (
+              vm.extraArgs
+              ++ lib.optionals (vm.windowMiB != null) [
+                "--window-size"
+                (toString vm.windowMiB)
+              ]
+              ++ lib.optionals (vm.windowOwnerShare != null) [
+                "--window-owner-share"
+                (toString vm.windowOwnerShare)
+              ]
+              ++ lib.optionals vm.inject.enable [
+                "--inject-uid"
+                (toString vm.inject.helperUid)
+              ]
+            );
+            NVGPU_WAYLAND_ARGS = concatStringsSep " " (
+              lib.optionals (vm.wayland.socket != null) [
+                "--wayland-socket"
+                vm.wayland.socket
+              ]
+              ++ lib.optional vm.wayland.lease "--wayland-lease"
+            );
+          };
+          wantedBy = lib.optional vm.autoStart "multi-user.target";
         }
         // lib.optionalAttrs vm.inject.enable {
-          # A name `helperGroup`'s type holds to [a-z0-9_-]: one word.
-          NVGPU_INJECT_GROUP = vm.inject.helperGroup;
-        };
-        wantedBy = lib.optional vm.autoStart "multi-user.target";
-      }
+          requires = [ "vhost-user-nvgpu-inject@${n}.socket" ];
+        }
+        // lib.optionalAttrs (vm.wayland.socket != null) {
+          # The one socket, and no other file of any home or runtime
+          # directory under /home.
+          serviceConfig = {
+            ProtectHome = "tmpfs";
+            BindReadOnlyPaths = [ vm.wayland.socket ];
+          };
+        }
+      )
     ) cfg.vms;
   };
 }

@@ -6,8 +6,8 @@
 #                     [-- backend-args...]
 #   --vmm       which VMM boots the guest (default nesbox, or NVGPU_VMM_KIND);
 #               crosvm is unprivileged (rig layout), and takes --allow-compute
-#               only if it has the UVM aperture (the virtio-nvgpu-compute
-#               branch), see "crosvm" below
+#               only if it has the UVM aperture (patches/crosvm 0007-0009),
+#               see "crosvm" below
 #   probe-name  a script under /opt/nvgpu in the guest rootfs, e.g. stage1.sh;
 #               in the rig layout a bare name gets .sh added (stage1 ->
 #               /opt/nvgpu/stage1.sh)
@@ -45,7 +45,7 @@
 #   NVGPU_WINDOW_MIB    the shared window in MiB (the backend's --window-size;
 #                       default 1024, a multiple of 64); the VMM takes the size
 #                       from the backend -- nesbox from virtio-nvgpu-v4, which
-#                       is checked for when this is set
+#                       is checked for when it is not 1024
 #   NVGPU_WINDOW_SHARE  the percent of each window zone one guest process may
 #                       hold (the backend's --window-owner-share; default 50)
 #   NVGPU_RIG           the rig directory (bin/ kernel/ guest/ logs/); default
@@ -107,8 +107,10 @@
 #                       (device/src/sandbox.rs; off is for diagnosis only, and
 #                       as root needs NVGPU_DIAGNOSTIC=1)
 #   NVGPU_DIAGNOSTIC=1  root only: allow what is for diagnosis alone --
-#                       NVGPU_SANDBOX=off, NVGPU_ALLOW_ROOT_UNSAFE=1 -- which
-#                       a root run otherwise refuses
+#                       NVGPU_SANDBOX=off, NVGPU_ALLOW_ROOT_UNSAFE=1 and every
+#                       diagnostic backend flag (vhost-user-nvgpu --diagnostic
+#                       --help) -- which a root run otherwise refuses. Each
+#                       one in effect is said on the terminal, as root or not
 #   NVGPU_VM_SLOTS      root only: how many pool slots to look through (64)
 #   NVGPU_VMM_JAIL      root only: on (default), auto or off -- the VMM under
 #                       nesbox's jailer, as its slot's uid (see below)
@@ -135,6 +137,11 @@
 #                       window (NVGPU_WINDOW_MIB), or the run is refused
 #                       (default 4096)
 #   NVGPU_SKIP_MEM_CHECK=1  run even so
+#   NVGPU_LOG_MAX_MIB   the most of each log (<tag>.backend.log,
+#                       <tag>.console.log) kept, in MiB (default 64): the guest
+#                       writes the console, and a guest that writes it in a
+#                       loop would otherwise fill the logs' filesystem; past
+#                       it, the rest is read and dropped, and the VM runs on
 #   NVGPU_OOM_SCORE_ADJ oom_score_adj for the launcher, backend and VMM
 #                       (default 1000: the OOM killer takes the VM before the
 #                       compositor; empty leaves it alone)
@@ -147,7 +154,9 @@
 # off in time.
 # ---
 #
-# Leaves, in the logs directory ($NVGPU_RIG/logs, or /root/logs as root):
+# Leaves, in the logs directory ($NVGPU_RIG/logs, or /root/logs as root);
+# as root, with a pool slot, <tag> is <tag>.vmN, so VMs in two slots never
+# share a name; and a run whose <tag>.json another live run holds is refused:
 #   <tag>.backend.log   everything the backend saw
 #   <tag>.console.log   the guest console
 #   <tag>.json          the config this run used
@@ -247,12 +256,14 @@
 # refused; NVGPU_VMM_JAIL=off runs the VMM as root, as before, and auto does
 # the same, with a warning, where one of them is missing.
 #
-# The socket's directory is the backend user's while the backend binds its
-# socket, and root's from then on: the launcher checks the socket there, and
-# opens it to the slot's group, only once nobody but root can rename, replace
-# or link anything in it (the backend's user could otherwise swap the socket
-# for a symlink to a file of root's, and have root give that to the slot's
-# group).
+# The socket's directory, and the copy of the backend binary in it, are
+# root's (0711) throughout, and never the backend user's: root binds the
+# socket (systemd-socket-activate, which then execs the backend and hands it
+# the socket as systemd's socket activation does) and opens it to the slot's
+# group. The backend's user -- which with --wayland-socket, --wayland-export
+# or NVGPU_USER has other live processes -- can then neither swap the binary
+# before it runs nor put a socket of its own where the VMM connects. The
+# backend starts when the VMM first connects.
 #
 # Both halves run as root in network namespaces of their own (unshare --net):
 # neither needs a network, the vhost-user socket is a path, and a namespace
@@ -277,8 +288,8 @@
 # as every GPU program on the desktop; and two VMs started by one user are one
 # principal to RM and to the kernel. Keep a rig for one VM at a time.
 #
-# crosvm (--vmm crosvm, rig layout: bin/crosvm, built from the virtio-nvgpu
-# branch in .rig/src/crosvm, patches/crosvm/): the same kernel, disk, console
+# crosvm (--vmm crosvm, rig layout: bin/crosvm, built with all of
+# patches/crosvm applied by rig/rig-build-crosvm.sh): the same kernel, disk, console
 # log, probe and backend; the guest's device is crosvm's vhost-user frontend
 # of type nvgpu. crosvm has no config file, so <tag>.json records the command
 # line it was given. Unprivileged, crosvm runs with its sandbox: every device
@@ -302,6 +313,34 @@
 # socket arrangement and the same disk copy as nesbox's jailer gets above. The
 # launcher refuses --vmm crosvm as root until that has been built and run.
 set -euo pipefail
+
+# ── As root, a clean environment ─────────────────────────────────────────────
+#
+# What root runs is named by paths it checks (root_owned, below), but a
+# helper found on a user's PATH, or a library LD_PRELOAD or LD_LIBRARY_PATH
+# names, would be run or loaded all the same (sudo -E, an env_keep rule).
+# So root starts again with only this launcher's own variables, RUST_LOG,
+# TERM, NESBOX_VIRTIOFSD (checked below like any path) and the two the
+# live-desktop warnings read, and a PATH of root's directories.
+CLEAN_PATH=/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin
+if [ "$EUID" = 0 ]; then
+    KEEP=(HOME=/root "PATH=$CLEAN_PATH")
+    DIRTY=0
+    [ "${PATH:-}" = "$CLEAN_PATH" ] || DIRTY=1
+    for v in $(compgen -e); do
+        case $v in
+            NVGPU_* | RUST_LOG | TERM | NESBOX_VIRTIOFSD | XDG_RUNTIME_DIR | WAYLAND_DISPLAY)
+                KEEP+=("$v=${!v}") ;;
+            # What bash itself exports, and what the list above sets.
+            PATH | HOME | PWD | OLDPWD | SHLVL | _) ;;
+            *) DIRTY=1 ;;
+        esac
+    done
+    if [ "$DIRTY" = 1 ]; then
+        [ -x /usr/bin/env ] || { echo "run-guest: no /usr/bin/env to start again with" >&2; exit 1; }
+        exec /usr/bin/env -i "${KEEP[@]}" "$BASH" "$0" "$@"
+    fi
+fi
 
 usage() {
     awk 'NR >= 4 { if (/^# ---/) exit; sub(/^# ?/, ""); print }' "$0" >&2
@@ -342,6 +381,26 @@ json_str() {
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
     printf '"%s"' "$s"
+}
+
+# Text from the guest, or from a log it can write into, made fit for a
+# terminal: control characters but tab and newline dropped, so no escape
+# sequence (a title, an OSC 52 clipboard write) reaches root's terminal.
+clean() {
+    LC_ALL=C tr -d '\000-\010\013-\037\177'
+}
+
+# capped FILE: append standard input to FILE, at most LOG_MAX bytes of it;
+# the rest is read and dropped (the writer is never blocked or killed for
+# it), with one line saying so. The guest writes the console log, and a
+# compromised backend its own: neither may fill the filesystem.
+capped() {
+    head -c "$LOG_MAX" >> "$1"
+    if [ "$(head -c 1 | wc -c)" -gt 0 ]; then
+        printf '\n[run-guest: this log reached NVGPU_LOG_MAX_MIB=%s; the rest was dropped]\n' \
+            "$LOG_MAX_MIB" >> "$1"
+        cat > /dev/null
+    fi
 }
 
 # A literal string as an extended regular expression, for pkill -f.
@@ -465,34 +524,41 @@ fi
 SANDBOX=${NVGPU_SANDBOX:-on}
 case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
 SANDBOX_GIVEN=0
-PERMISSIVE_ABI=0
-RM_ALLOWLIST_LOG=0
 ALLOW_ROOT_ARG=0
 prev=
 for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
     case $a in
         --sandbox=*) SANDBOX=${a#--sandbox=} SANDBOX_GIVEN=1 ;;
-        --permissive-abi) PERMISSIVE_ABI=1 ;;
-        --rm-allowlist=log) RM_ALLOWLIST_LOG=1 ;;
         --allow-root-unsafe) ALLOW_ROOT_ARG=1 ;;
     esac
     [ "$prev" = --sandbox ] && SANDBOX=$a SANDBOX_GIVEN=1
-    [ "$prev" = --rm-allowlist ] && [ "$a" = log ] && RM_ALLOWLIST_LOG=1
     prev=$a
 done
-if [ "$SANDBOX" = off ]; then
-    [ "$SANDBOX_GIVEN" = 1 ] || BACKEND_ARGS+=(--sandbox=off)
-    echo "run-guest: WARNING: the backend's sandbox is off (NVGPU_SANDBOX=off): for" \
-        "diagnosis only" >&2
+if [ "$SANDBOX" = off ] && [ "$SANDBOX_GIVEN" = 0 ]; then
+    BACKEND_ARGS+=(--sandbox=off)
 fi
-# Passed through as asked, but never quietly: each forwards what the backend
-# would otherwise refuse.
-[ "$PERMISSIVE_ABI" = 0 ] ||
-    echo "run-guest: WARNING: --permissive-abi: ioctls with no ABI profile are forwarded" \
-        "unchecked; for finding what a new driver needs, never for a guest you do not trust" >&2
-[ "$RM_ALLOWLIST_LOG" = 0 ] ||
-    echo "run-guest: WARNING: --rm-allowlist=log: RM controls and classes off the allowlist" \
-        "reach the host's RM, logged instead of refused; for diagnosis only" >&2
+
+# The backend's diagnostic flags among BACKEND_ARGS (vhost-user-nvgpu
+# --diagnostic --help), one per line with what each takes away. The backend
+# refuses each without --diagnostic, and the launcher supplies that (below):
+# so the launcher is where each must be asked for as what it is.
+diag_flags() {
+    local prev= a
+    for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
+        case $prev/$a in
+            */--allow-root-unsafe) echo "--allow-root-unsafe: a root backend; every guest process is an RM administrator" ;;
+            */--proc-nvidia | */--proc-nvidia=*) echo "--proc-nvidia: a /proc/driver/nvidia other than the host driver's" ;;
+            */--permissive-abi) echo "--permissive-abi: ioctls with no ABI profile are forwarded unchecked" ;;
+            */--keep-guest-coherency) echo "--keep-guest-coherency: guest system memory is not made GPU-coherent (the Intel PAT cover)" ;;
+            */--allow-unmeasured-release) echo "--allow-unmeasured-release: the host driver may be a release the tables were not measured at" ;;
+            */--allow-inject-self) echo "--allow-inject-self: every process of the backend's user may inject into this VM" ;;
+            */--rm-allowlist=log | --rm-allowlist/log) echo "--rm-allowlist=log: RM calls off the allowlist reach the host's RM, logged instead of refused" ;;
+            */--sandbox=off | --sandbox/off) echo "--sandbox=off: no network namespace, Landlock or seccomp for the backend" ;;
+            */--sandbox=best-effort | --sandbox/best-effort) echo "--sandbox=best-effort: the backend runs with whatever sandbox layers this host lacks missing" ;;
+        esac
+        prev=$a
+    done
+}
 
 PROBE=${POSITIONAL[0]}
 TAG=${POSITIONAL[1]:-$(date +%H%M%S)}
@@ -555,6 +621,10 @@ if [ $PRIV = root ] && [ "$DIAGNOSTIC" != 1 ]; then
     [ "${NVGPU_ALLOW_ROOT_UNSAFE:-}" != 1 ] && [ "$ALLOW_ROOT_ARG" = 0 ] ||
         die "a root backend (NVGPU_ALLOW_ROOT_UNSAFE=1, --allow-root-unsafe) is for" \
             "diagnosis only: NVGPU_DIAGNOSTIC=1 as well"
+    DIAG_ASKED=$(diag_flags | cut -d: -f1 | tr '\n' ' ')
+    [ -z "$DIAG_ASKED" ] ||
+        die "diagnostic backend flags as root (${DIAG_ASKED% }) are for diagnosis only:" \
+            "NVGPU_DIAGNOSTIC=1 as well"
 fi
 [ "$DIAGNOSTIC" = 0 ] ||
     echo "run-guest: WARNING: NVGPU_DIAGNOSTIC=1: a diagnostic run, not one to keep" >&2
@@ -723,8 +793,8 @@ if [ "$VMM_KIND" = crosvm ]; then
     # CUDA would fail late.
     case $CROSVM_HELP in *nvgpu-uvm-aperture*) CROSVM_UVM=1 ;; *) CROSVM_UVM=0 ;; esac
     [ "$COMPUTE" = 0 ] || [ "$CROSVM_UVM" = 1 ] ||
-        die "--allow-compute: $VMM has no UVM aperture; build the virtio-nvgpu-compute" \
-            "branch (patches/crosvm 0007-0009) or drop --allow-compute"
+        die "--allow-compute: $VMM has no UVM aperture; build crosvm with all of" \
+            "patches/crosvm (rig/rig-build-crosvm.sh) or drop --allow-compute"
 fi
 # nesbox before virtio-nvgpu-v4 publishes a 1 GiB window whatever the backend
 # says, and every placement past it then fails on its own. v4 asks the backend
@@ -756,6 +826,10 @@ if [[ $AVAIL_KIB =~ ^[0-9]+$ ]]; then
             "or NVGPU_SKIP_MEM_CHECK=1)"
     fi
 fi
+LOG_MAX_MIB=${NVGPU_LOG_MAX_MIB:-64}
+[[ $LOG_MAX_MIB =~ ^[0-9]+$ ]] && [ "$((10#$LOG_MAX_MIB))" -ge 1 ] ||
+    die "NVGPU_LOG_MAX_MIB=$LOG_MAX_MIB: whole MiB, at least 1"
+LOG_MAX=$((10#$LOG_MAX_MIB * 1024 * 1024))
 OOM_ADJ=${NVGPU_OOM_SCORE_ADJ-1000}
 if [ -n "$OOM_ADJ" ]; then
     [[ $OOM_ADJ =~ ^-?[0-9]+$ ]] || die "NVGPU_OOM_SCORE_ADJ=$OOM_ADJ: -1000 to 1000"
@@ -832,6 +906,20 @@ if [ $PRIV = root ]; then
         echo "run-guest: slot $SLOT (nvgpu-vm$SLOT${VMM_USER:+, $VMM_USER})" >&2
     fi
 fi
+
+# ── This run's name ──────────────────────────────────────────────────────────
+#
+# Two runs with one tag would overwrite each other's disk copy, config and
+# logs, and the later one's cleanup would delete the other's. As root, VMs in
+# different slots run at once, so the slot goes into the name; and whatever
+# the mode, a run whose config another live run holds (flock, for the run's
+# length; children are started with it closed) is refused.
+if [ -n "$SLOT" ]; then
+    TAG=$TAG.vm$SLOT
+fi
+exec {TAG_FD}>>"$LOGS/$TAG.json"
+flock -n "$TAG_FD" ||
+    die "another run with the tag $TAG is running (it holds $LOGS/$TAG.json); give this one another tag"
 
 # ── Who the backend runs as ──────────────────────────────────────────────────
 if [ $PRIV = root ]; then
@@ -1008,6 +1096,7 @@ fi
 
 # ── Cleanup, however the run ends ────────────────────────────────────────────
 BACKEND=
+BACKEND_MARK=
 VMM_PID=
 VMM_MARK=
 RUN=
@@ -1029,7 +1118,7 @@ cleanup() {
     fi
     # nesbox puts the terminal in raw mode; one killed never restores it.
     [ -z "$TTY_STATE" ] || stty "$TTY_STATE" 2>/dev/null || true
-    if [ -n "$BACKEND" ] && still_ours "$BACKEND" "${SOCK:-}"; then
+    if [ -n "$BACKEND" ] && still_ours "$BACKEND" "${BACKEND_MARK:-}"; then
         kill "$BACKEND" 2>/dev/null || true
     fi
     [ -z "$RUN" ] || rm -rf "$RUN"
@@ -1048,21 +1137,30 @@ trap 'exit 143' TERM
 
 # ── The socket's directory ───────────────────────────────────────────────────
 #
-# The socket lives in a fresh directory only the backend's user can enter:
-# whoever listens at the path the VMM connects to receives the guest's
-# memory, so it must not be a fixed name in a shared directory like /tmp,
-# where another user could bind it first. (Without --socket the backend would
-# pick $XDG_RUNTIME_DIR/nvgpu/nvgpu.sock; a directory per run also keeps two
-# runs apart.)
+# The socket lives in a fresh directory no one else can change: whoever
+# listens at the path the VMM connects to receives the guest's memory, so it
+# must not be a fixed name in a shared directory like /tmp, where another
+# user could bind it first. (Without --socket the backend would pick
+# $XDG_RUNTIME_DIR/nvgpu/nvgpu.sock; a directory per run also keeps two runs
+# apart.)
 if [ $PRIV = root ]; then
-    # The VMM, as root, still reaches it. The binary goes in the same
-    # directory, as /root is not the backend user's to read. (root's
+    # Root's, 0711, from the start to the end of the run, and never the
+    # backend user's (the header, and SECURITY.md §22): root binds the socket
+    # in it and hands it to the backend, and the backend's user -- which may
+    # have other live processes -- can neither rename the binary below nor
+    # put a socket of its own where the VMM connects. The binary is copied
+    # here because /root is not the backend user's to read. (root's
     # environment does not describe another user's $XDG_RUNTIME_DIR.)
     RUN=$(mktemp -d /run/nvgpu.XXXXXX)
+    chmod 0711 "$RUN"
     install -m 0755 "$BACKEND_BIN" "$RUN/vhost-user-nvgpu"
     BACKEND_EXE=$RUN/vhost-user-nvgpu
-    chown "$NVGPU_USER:" "$RUN"
-    chmod 0700 "$RUN"
+    # What binds the socket and execs the backend with it (systemd's, run
+    # by root: root's alone).
+    SOCKET_ACTIVATE=$(command -v systemd-socket-activate) ||
+        die "as root the launcher binds the backend's socket itself, with systemd-socket-activate," \
+            "and there is none on PATH"
+    SOCKET_ACTIVATE=$(root_owned "$SOCKET_ACTIVATE" "systemd-socket-activate")
 else
     # Our own runtime directory is already 0700 and ours; without one, the
     # rig's run/ is made so. mktemp -d makes the run's own directory 0700.
@@ -1223,12 +1321,17 @@ jail_add() {
     command -v ldd >/dev/null || die "no ldd to find what $src links against; NVGPU_JAIL_ROOT"
     out=$(ldd -- "$src" 2>&1) || true
     case $out in *"not a dynamic executable"* | *"statically linked"*) return 0 ;; esac
+    # Each library is root's, as everything else root hands the VMM is.
+    local libs real
+    libs=$(printf '%s\n' "$out" | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }')
     while read -r lib; do
         [ -n "$lib" ] && [ ! -e "$JAIL_ROOT$lib" ] || continue
-        install -D -m 0755 -- "$(realpath -- "$lib")" "$JAIL_ROOT$lib"
-    done < <(printf '%s\n' "$out" | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }')
+        real=$(root_owned "$lib" "a library of $src")
+        install -D -m 0755 -- "$real" "$JAIL_ROOT$lib"
+    done <<<"$libs"
     if [ -e /etc/ld.so.cache ] && [ ! -e "$JAIL_ROOT/etc/ld.so.cache" ]; then
-        install -D -m 0644 /etc/ld.so.cache "$JAIL_ROOT/etc/ld.so.cache"
+        real=$(root_owned /etc/ld.so.cache "the loader's cache")
+        install -D -m 0644 -- "$real" "$JAIL_ROOT/etc/ld.so.cache"
     fi
 }
 JAIL_ROOT=
@@ -1273,51 +1376,67 @@ BLOG=$LOGS/$TAG.backend.log
 CONSOLE=$LOGS/$TAG.console.log
 # The backend refuses its diagnostic flags without --diagnostic
 # (vhost-user-nvgpu --diagnostic --help). One here was asked for -- after --,
-# or by NVGPU_SANDBOX=off or NVGPU_ALLOW_ROOT_UNSAFE=1 above -- so say so.
-diag_prev=
-for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
-    case $diag_prev/$a in
-        */--diagnostic) break ;;
-        */--allow-root-unsafe | */--proc-nvidia | */--proc-nvidia=* | */--permissive-abi | \
-            */--keep-guest-coherency | */--allow-unmeasured-release | */--allow-inject-self | \
-            */--rm-allowlist=log | --rm-allowlist/log | \
-            */--sandbox=off | */--sandbox=best-effort | --sandbox/off | --sandbox/best-effort)
-            BACKEND_ARGS+=(--diagnostic)
-            break
-            ;;
-    esac
-    diag_prev=$a
-done
+# or by NVGPU_SANDBOX=off, NVGPU_ALLOW_ROOT_UNSAFE=1 or --inject above, and
+# as root with NVGPU_DIAGNOSTIC=1 -- so say so, each on the terminal: the
+# backend's own DIAGNOSTIC lines go to its log.
+DIAG_LINES=$(diag_flags)
+if [ -n "$DIAG_LINES" ]; then
+    while IFS= read -r l; do
+        echo "run-guest: WARNING: diagnostic flag $l; for diagnosis only" >&2
+    done <<<"$DIAG_LINES"
+    case " ${BACKEND_ARGS[*]} " in *" --diagnostic "*) ;; *) BACKEND_ARGS+=(--diagnostic) ;; esac
+fi
 echo "backend: as $NVGPU_USER ($PRIV, $LAYOUT layout)${BACKEND_ARGS[*]:+, with ${BACKEND_ARGS[*]}}" >&2
 BACKEND_AFFINITY=()
 [ -z "$BACKEND_CPUS" ] || BACKEND_AFFINITY=(taskset -c "$BACKEND_CPUS")
-RUST_LOG=${RUST_LOG:-info} "${SLICE[@]}" "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
-    "$BACKEND_EXE" --socket "$SOCK" "${BACKEND_ARGS[@]}" \
-    {SLOT_FD}>&- > "$BLOG" 2>&1 &
+# Who binds the socket. Unprivileged, the backend, in the run's directory,
+# which is this user's anyway. As root, root: systemd-socket-activate binds
+# it in root's $RUN and, once the VMM connects, execs the rest of the line --
+# the same process, so still $BACKEND -- with the socket as descriptor 3
+# (LISTEN_FDS, as systemd's socket activation passes it). It passes on only
+# the variables it is told to.
+if [ $PRIV = root ]; then
+    BIND=("$SOCKET_ACTIVATE" --fdname=vhost-user -l "$SOCK"
+        -E RUST_LOG -E NVGPU_DIAGNOSTIC -E NVGPU_PACING_STATS --)
+    SOCKET_ARGS=()
+    # What the process's command line names from start to end: the run's
+    # own copy of the binary (the socket is not on the backend's).
+    BACKEND_MARK=$BACKEND_EXE
+else
+    BIND=()
+    SOCKET_ARGS=(--socket "$SOCK")
+    BACKEND_MARK=$SOCK
+fi
+: > "$BLOG"
+exec {BLOG_W}> >(exec {SLOT_FD}>&- {TAG_FD}>&-; capped "$BLOG")
+BLOG_WRITER=$!
+RUST_LOG=${RUST_LOG:-info} "${SLICE[@]}" "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" ${BIND[@]+"${BIND[@]}"} \
+    "${AS_BACKEND[@]}" "$BACKEND_EXE" ${SOCKET_ARGS[@]+"${SOCKET_ARGS[@]}"} "${BACKEND_ARGS[@]}" \
+    {SLOT_FD}>&- {TAG_FD}>&- >&"$BLOG_W" 2>&1 {BLOG_W}>&- &
 BACKEND=$!
+exec {BLOG_W}>&-
 
-# The backend must be listening before the VMM connects, and the socket must
-# be the backend's: anything else at that path is not ours to connect to.
+# The socket must exist before the VMM connects, and be what it should: the
+# backend's (unprivileged) or root's (as root), a socket, and not a link to
+# one -- anything else at that path is not ours to connect to (or, as root,
+# to open to a group). As root nobody else can change $RUN; unprivileged,
+# nobody else can enter it.
 for _ in $(seq 1 50); do
     [ -S "$SOCK" ] && break
     kill -0 "$BACKEND" 2>/dev/null || break
     sleep 0.1
 done
-kill -0 "$BACKEND" 2>/dev/null || { echo "backend exited; see $BLOG" >&2; tail -n 5 "$BLOG" >&2; exit 1; }
-# As root: the directory is root's from here on (0711: the backend's user may
-# still reach its binary in it, but no longer rename, replace or link
-# anything there), so what is checked below is what the VMM connects to and
-# what root changes. $RUN itself lies in /run, which only root can change.
-if [ $PRIV = root ]; then
-    chown root:root -- "$RUN"
-    chmod 0711 -- "$RUN"
+if ! kill -0 "$BACKEND" 2>/dev/null; then
+    wait "$BLOG_WRITER" 2>/dev/null || true
+    echo "backend exited; see $BLOG" >&2
+    tail -n 5 "$BLOG" | clean >&2
+    exit 1
 fi
-# The socket must be the backend's, a socket, and not a link to one: anything
-# else at that path is not ours to connect to (or, as root, to open to a group).
+if [ $PRIV = root ]; then SOCK_UID=0 SOCK_OWNER=root; else SOCK_UID=$BACKEND_UID SOCK_OWNER=$NVGPU_USER; fi
 [ ! -L "$SOCK" ] || { echo "$SOCK is a symbolic link, not the backend's socket; refusing it" >&2; exit 1; }
-[ -S "$SOCK" ] || { echo "backend never created $SOCK; see $BLOG" >&2; exit 1; }
-[ "$(stat -c %u -- "$SOCK")" = "$BACKEND_UID" ] || {
-    echo "$SOCK is not owned by $NVGPU_USER; refusing to connect" >&2
+[ -S "$SOCK" ] || { echo "no socket at $SOCK; see $BLOG" >&2; exit 1; }
+[ "$(stat -c %u -- "$SOCK")" = "$SOCK_UID" ] || {
+    echo "$SOCK is not owned by $SOCK_OWNER; refusing to connect" >&2
     exit 1
 }
 # The jailed VMM is another user, in the slot's group: the socket is opened
@@ -1326,6 +1445,8 @@ fi
 if [ "$VMM_JAIL" = on ]; then
     chgrp -h -- "$SLOT_GROUP" "$SOCK"
     chmod 0660 -- "$SOCK"
+elif [ $PRIV = root ]; then
+    chmod 0600 -- "$SOCK"
 fi
 
 # ── The hook ─────────────────────────────────────────────────────────────────
@@ -1336,7 +1457,7 @@ fi
 if [ -n "${NVGPU_BEFORE_VMM:-}" ]; then
     [ $PRIV = user ] || die "NVGPU_BEFORE_VMM: unprivileged runs only"
     HOOK_WORDS=$(NVGPU_RUN_DIR=$RUN NVGPU_INJECT_SOCKET=$INJECT_SOCK NVGPU_HOOK_LOG=$LOGS/$TAG.hook.log \
-        bash -c "$NVGPU_BEFORE_VMM" | tail -n 1) || die "NVGPU_BEFORE_VMM failed; see $LOGS/$TAG.hook.log"
+        bash -c "$NVGPU_BEFORE_VMM" {TAG_FD}>&- | tail -n 1) || die "NVGPU_BEFORE_VMM failed; see $LOGS/$TAG.hook.log"
     [[ $HOOK_WORDS =~ ^[A-Za-z0-9_.,:=\ -]*$ ]] || die "NVGPU_BEFORE_VMM printed characters a command line cannot take"
     if [ -n "$HOOK_WORDS" ]; then
         echo "hook:    adds to the guest command line: $HOOK_WORDS" >&2
@@ -1364,9 +1485,12 @@ if [ "$VMM_KIND" = crosvm ]; then
     echo "vmm:     crosvm, sandbox $CROSVM_SANDBOX$([ "$CROSVM_SANDBOX" = on ] && [ "$CROSVM_UVM" = 1 ] && echo ', nvgpu frontend jailed')$([ "$VMM_OWN_NETNS" = true ] && echo ', own user and network namespace')" >&2
 fi
 # The console log starts with what the reader must know before the guest's
-# first line: a VMM without its sandbox.
+# first line: a VMM without its sandbox. Everything after it comes through
+# a capped writer (NVGPU_LOG_MAX_MIB).
 : > "$CONSOLE"
 [ -z "$CROSVM_NOTE" ] || printf '%s\n' "$CROSVM_NOTE" >> "$CONSOLE"
+exec {CON_W}> >(exec {SLOT_FD}>&- {TAG_FD}>&-; capped "$CONSOLE")
+CON_WRITER=$!
 if [ "$INTERACTIVE" = 1 ]; then
     # The terminal is the guest's console; the log still gets everything.
     # --foreground: timeout otherwise moves itself and nesbox into a process
@@ -1375,18 +1499,24 @@ if [ "$INTERACTIVE" = 1 ]; then
     # background job of a script otherwise reads /dev/null.
     echo "guest console on this terminal; exit the guest's shell to power off" >&2
     TTY_STATE=$(stty -g 2>/dev/null) || TTY_STATE=
-    timeout --foreground -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- <&0 >> "$CONSOLE" 2>&1 &
+    timeout --foreground -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- {TAG_FD}>&- <&0 \
+        >&"$CON_W" 2>&1 {CON_W}>&- &
     VMM_PID=$!
-    tail -n +1 -f --pid="$VMM_PID" "$CONSOLE" &
+    tail -n +1 -f --pid="$VMM_PID" "$CONSOLE" {CON_W}>&- &
     TAIL_PID=$!
 else
-    timeout -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- < /dev/null >> "$CONSOLE" 2>&1 &
+    timeout -k 10 "$TIMEOUT" "${VMM_CMD[@]}" {SLOT_FD}>&- {TAG_FD}>&- < /dev/null \
+        >&"$CON_W" 2>&1 {CON_W}>&- &
     VMM_PID=$!
     TAIL_PID=
 fi
+exec {CON_W}>&-
 RC=0
 wait "$VMM_PID" || RC=$?
 VMM_PID=
+# The console's writer ends once nothing holds the pipe (the VMM's helpers,
+# virtiofsd, may outlive it by a moment); the log is whole after that.
+wait "$CON_WRITER" 2>/dev/null || true
 [ -z "$TAIL_PID" ] || wait "$TAIL_PID" 2>/dev/null || true
 if [ -n "$TTY_STATE" ]; then
     stty "$TTY_STATE" 2>/dev/null || true
@@ -1407,10 +1537,11 @@ echo "config:  $CFG"
 #   NVGPU_PROBE_DONE probe=<name> result=PASS|FAIL pass=N fail=N skip=N
 # and that line is the result: the tools they run print PASS/FAIL lines of
 # their own, some of them expected (cuda-smoke says FAIL where a probe wants
-# it to fail). The console comes through a terminal, so lines end in \r.
-DONE=$(grep -a -E '^NVGPU_PROBE_DONE ' "$CONSOLE" | tail -n 1 | tr -d '\r' || true)
+# it to fail). The console comes through a terminal, so lines end in \r;
+# what is echoed from it goes through clean first (the guest wrote it).
+DONE=$(grep -a -E '^NVGPU_PROBE_DONE ' "$CONSOLE" | tail -n 1 | clean || true)
 if [ -n "$DONE" ]; then
-    grep -a -E '^\[[A-Za-z0-9_-]+\] FAIL ' "$CONSOLE" | tr -d '\r' | head -n 20 | sed 's/^/  /' || true
+    grep -a -E '^\[[A-Za-z0-9_-]+\] FAIL ' "$CONSOLE" | clean | head -n 20 | sed 's/^/  /' || true
     [ "$BACKEND_ALIVE" = 1 ] || echo "note: the backend had exited by the end of the run; see $BLOG"
     echo "probe:   ${DONE#NVGPU_PROBE_DONE }"
     if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then
@@ -1429,7 +1560,7 @@ fi
 # "FAIL: ..." is.
 NPASS=$(grep -c -E '(^|[^[:alnum:]_])PASS([^[:alnum:]_]|$)' "$CONSOLE" || true)
 NFAIL=$(grep -c -E '(^|[^[:alnum:]_])FAIL([^[:alnum:]_]|$)' "$CONSOLE" || true)
-grep -E '(^|[^[:alnum:]_])FAIL([^[:alnum:]_]|$)' "$CONSOLE" | head -n 20 | sed 's/^/  /' || true
+grep -a -E '(^|[^[:alnum:]_])FAIL([^[:alnum:]_]|$)' "$CONSOLE" | clean | head -n 20 | sed 's/^/  /' || true
 [ "$BACKEND_ALIVE" = 1 ] || echo "note: the backend had exited by the end of the run; see $BLOG"
 if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then
     echo "result: TIMEOUT -- the guest did not power off within ${TIMEOUT}s ($NPASS PASS, $NFAIL FAIL)"

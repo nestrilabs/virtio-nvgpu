@@ -17,8 +17,10 @@
 //!
 //! **Who may inject.** Only peers whose `SO_PEERCRED` uid is `--inject-uid`,
 //! at most [`MAX_PEERS`] at once. The socket is bound in a private directory
-//! and renamed into place, 0600, like the export socket; the operator opens
-//! it to the helper's group (contrib/systemd/nvgpu-socket-open). The backend
+//! and renamed into place, 0600, like the export socket, for the operator to
+//! open to the helper's group; or systemd binds it, open to that group, and
+//! hands it over ([`InjectServer::from_listener`];
+//! contrib/systemd/vhost-user-nvgpu-inject@.socket). The backend
 //! cannot know whether the user consented to what the helper sends: the
 //! helper uid is trusted for that, and for nothing else (SECURITY.md §18).
 //!
@@ -1423,6 +1425,36 @@ impl InjectServer {
 impl Drop for InjectServer {
     fn drop(&mut self) {
         crate::privfd::unregister(self.listener.as_raw_fd());
+    }
+}
+
+impl InjectServer {
+    /// [`InjectServer::bind_idle`] for a socket someone else bound and
+    /// handed over already listening -- systemd's socket activation, whose
+    /// unit sets its path, owner, group and mode (contrib/systemd). `name`
+    /// is only for the log. The caller has checked `listener` is a
+    /// listening `AF_UNIX` `SOCK_SEQPACKET` socket.
+    pub fn from_listener(
+        listener: OwnedFd,
+        name: PathBuf,
+        uid: u32,
+        registry: Arc<Registry>,
+    ) -> Self {
+        crate::privfd::register(listener.as_raw_fd());
+        Self {
+            path: name,
+            shared: Arc::new(Shared {
+                registry,
+                uid,
+                stop: AtomicBool::new(false),
+                peers: AtomicUsize::new(0),
+                next_peer: AtomicU64::new(1),
+                conns: Mutex::new(HashMap::new()),
+            }),
+            listener: Arc::new(listener),
+            idle: Mutex::new(true),
+            thread: Mutex::new(None),
+        }
     }
 }
 

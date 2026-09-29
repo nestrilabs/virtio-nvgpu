@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The capture helper's socket of VM N (SECURITY.md §18; DEPLOY.md, "Capture
+# injection"): bound by systemd, root's and open to the helper's group
+# alone, and handed to vhost-user-nvgpu@N.service as the descriptor named
+# "inject". The backend serves it only for its --inject-uid (SO_PEERCRED),
+# and refuses to start with it and no --inject-uid.
+#
+# The group is nvgpu-capN unless a drop-in says otherwise:
+#   # /etc/systemd/system/vhost-user-nvgpu-inject@0.socket.d/group.conf
+#   [Socket]
+#   SocketGroup=<the VM's capture helper's own group>
+# and the backend's unit pulls it in with a drop-in of its own:
+#   # /etc/systemd/system/vhost-user-nvgpu@0.service.d/inject.conf
+#   [Unit]
+#   Requires=vhost-user-nvgpu-inject@0.socket
+
+[Unit]
+Description=virtio-nvgpu capture-injection socket for VM %i
+
+[Socket]
+ListenSequentialPacket=/run/nvgpu/vm%i/inject.sock
+SocketUser=root
+SocketGroup=nvgpu-cap%i
+SocketMode=0660
+DirectoryMode=0711
+FileDescriptorName=inject
+Accept=no
+RemoveOnStop=yes
+Service=vhost-user-nvgpu@%i.service

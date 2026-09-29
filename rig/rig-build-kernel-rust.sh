@@ -11,7 +11,7 @@
 #   $RIG/kernel-rust/config      the .config it was all built from
 #   $RIG/logs/build-kernel-rust.log
 #
-# RIG defaults to this checkout's .rig; LINUX_SRC to $RIG/src/linux (the rig's
+# NVGPU_RIG (the rig) defaults to this checkout's .rig; LINUX_SRC to $RIG/src/linux (the rig's
 # 7.2.7 tree, which an O= build leaves clean, so two builds may share it). The
 # toolchain is scripts/guest-toolchain-rust: the rig's pinned nixpkgs, plus
 # rustc, bindgen and rust-src.
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RIG="${RIG:-$REPO/.rig}"
+RIG="${NVGPU_RIG:-$REPO/.rig}"
 LINUX_SRC="${LINUX_SRC:-$RIG/src/linux}"
 JOBS="${1:-$(nproc)}"
 K="$RIG/kernel-rust"

@@ -607,6 +607,7 @@ HTML
     esac
 done
 
-wl_daemon_alive && pass "nvgpu-wl-guest still running" || fail "nvgpu-wl-guest died"
+# Records its own PASS or FAIL (probe-common.sh).
+wl_daemon_alive
 cp -r /tmp/apps /var/log/nvgpu/ 2>/dev/null
 finish

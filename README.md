@@ -346,15 +346,24 @@ must:
   guest userspace see a second GPU (Chromium did).
 - **Pass `VIRTIO_RING_F_INDIRECT_DESC` through** to the guest. Without it
   requests are held to 256 KiB instead of 4 MiB.
-- **Publish shared memory region 1, 1 GiB**, as a 64-bit prefetchable BAR
-  above 4 GiB with a virtio shared-memory capability, and place what the
-  backend asks for in it: `BACKEND_REQ` plus `SHMEM`, `SHMEM_MAP`/`UNMAP`
-  (backend requests 9 and 10: region id, file offset, region offset,
-  length, read/write flag, the file descriptor with the message), answered
-  when `REPLY_ACK` is negotiated. A VMM that asks for the regions gets them
-  from `GET_SHMEM_CONFIG` (request 44): region 1, and region 2 only with
-  `--allow-compute`. **Check every request** against the region: the
-  backend is another process and may be compromised.
+- **Publish shared memory region 1, the window, at the size
+  `GET_SHMEM_CONFIG` (request 44) reports for it** -- the backend's
+  `--window-size`, 1 GiB by default and up to 64 GiB -- as a 64-bit
+  prefetchable BAR above 4 GiB with a virtio shared-memory capability, and
+  place what the backend asks for in it: `BACKEND_REQ` plus `SHMEM`,
+  `SHMEM_MAP`/`UNMAP` (backend requests 9 and 10: region id, file offset,
+  region offset, length, read/write flag, the file descriptor with the
+  message), answered when `REPLY_ACK` is negotiated. `GET_SHMEM_CONFIG`
+  reports region 1, and region 2 only with `--allow-compute`; a VMM that
+  assumes 1 GiB instead breaks every VM given a larger window (the backend
+  says so once, at the memory table, when the VMM never asked). **Check
+  every request** against the region: the backend is another process and
+  may be compromised.
+- **Prefault what it places**, where the host kernel has
+  `KVM_PRE_FAULT_MEMORY` (6.11): without it a guest's first write to fresh
+  video memory runs at about a tenth of the host's speed, one second-level
+  fault a page. Both VMMs below do it through a spare vCPU that never runs,
+  with an id past every guest vCPU's (SECURITY.md §21, §22).
 - **Give the window write-back in the guest's MTRRs** (default type WB with
   the 32-bit PCI hole UC, on every vCPU), or the guest driver warns that
   the window "is not write-back in this guest's MTRRs".
@@ -375,7 +384,7 @@ must:
 Two VMMs do this today, both with the UVM aperture, and both have run every
 graphics and compute path on the GPU. **nesbox**
 ([github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch
-`virtio-nvgpu-v3`, not yet merged upstream) has its own frontend for the
+`virtio-nvgpu-v6`, not yet merged upstream) has its own frontend for the
 device. **crosvm** takes the patches in [`patches/crosvm/`](patches/crosvm/):
 a vhost-user device type `nvgpu` (class 0xff0000, indirect descriptors, only
 `SHMEM_MAP` of the backend's mapping requests); every backend mapping checked
@@ -391,7 +400,7 @@ reserves the pools' host address band at start-up, so nothing of its own is
 ever there. crosvm needed nothing new in the protocol: its vhost-user fork
 already implements the upstream `GET_SHMEM_CONFIG`, `SHMEM_MAP` and
 `SHMEM_UNMAP` messages byte for byte as rust-vmm does; the backend answers
-`GET_SHMEM_CONFIG`, which nesbox never asks. Every other device crosvm
+`GET_SHMEM_CONFIG`, which nesbox asks from `virtio-nvgpu-v4`. Every other device crosvm
 emulates is a minijail'd process with its seccomp policy, none of which
 changed. How to run it: [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md), "crosvm".
 

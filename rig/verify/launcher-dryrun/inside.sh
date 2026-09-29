@@ -5,18 +5,24 @@
 # and the new), stub binaries, and a fake pool of slot users. The namespace maps
 # one uid, so every user is uid 0 here: the backend is "root" and needs
 # NVGPU_ALLOW_ROOT_UNSAFE (and, new, NVGPU_DIAGNOSTIC); what is checked --
-# which processes are killed, what the socket's permissions go to -- does not
-# depend on the uids.
+# which processes are killed, what the socket's permissions go to, what the
+# launcher hands the backend and what it changes the ownership of -- does not
+# depend on the uids. (What does -- another process of the backend's user
+# renaming things in a directory that user owns -- cannot be played with one
+# uid; the checks below show the new launcher never gives that user one.)
 set -u
 export PATH=/stubs:/run/current-system/sw/bin
 cd /
-run() { # run <launcher> <tag> [env...]
-    local l=$1 tag=$2; shift 2
-    env -i PATH=$PATH HOME=/root NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_TIMEOUT=3 \
-        NVGPU_OOM_SCORE_ADJ= NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 "$@" \
-        bash "/rig/$l" probe "$tag" > "/rig/logs/$tag.launcher" 2>&1
+run() { # run <launcher> <tag> [env...] [-- launcher args after the tag]
+    local l=$1 tag=$2 envs=() args=()
+    shift 2
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+    [ $# -gt 0 ] && shift && args=("$@")
+    env -i PATH=$PATH HOME=/root NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_TIMEOUT=5 \
+        NVGPU_OOM_SCORE_ADJ= NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 ${envs[@]+"${envs[@]}"} \
+        bash "/rig/$l" probe "$tag" ${args[@]+"${args[@]}"} > "/rig/logs/$tag.launcher" 2>&1
     echo "  exit $?; launcher said:"
-    sed 's/^/    | /' "/rig/logs/$tag.launcher" | grep -v "^    | *$" | head -12
+    sed 's/^/    | /' "/rig/logs/$tag.launcher" | grep -v "^    | *$" | head -n "${LINES_SHOWN:-12}"
 }
 others() { # start another VM's backend and VMM, as a stale-process pattern sees them
     mkdir -p /run/nvgpu.other
@@ -72,3 +78,46 @@ echo "== new: NVGPU_VMM_JAIL defaults to on: no jailer, no run"
 mv /rig/bin/jailer /rig/bin/jailer.away
 run run-guest.new.sh nojailer
 mv /rig/bin/jailer.away /rig/bin/jailer
+
+# ── The 2026-09-29 review (SECURITY.md §22) ──────────────────────────────────
+
+echo "== new: H1: root binds the socket and hands it over; the run's directory is never the backend user's"
+: > /rig/logs/ownership.log
+LINES_SHOWN=4 run run-guest.new.sh h1
+grep -a '^stub backend' /rig/logs/h1.vm0.backend.log | sed 's/^/    /'
+grep -a '^jailer stub: connected' /rig/logs/h1.vm0.console.log | sed 's/^/    /'
+echo "  every change of ownership the launcher made:"
+sed 's/^/    /' /rig/logs/ownership.log
+if grep -q '/run/nvgpu\.[^/ ]*$' /rig/logs/ownership.log; then
+    echo "  FAIL: the run's directory changed hands"
+else
+    echo "  ok: the run's directory stayed root's; only the socket and the disk copy went to the slot"
+fi
+
+echo "== new: H3: a diagnostic backend flag as root, without NVGPU_DIAGNOSTIC=1"
+env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 bash /rig/run-guest.new.sh probe h3a -- \
+    --permissive-abi --keep-guest-coherency 2>&1 | sed 's/^/    | /' | head -3
+echo "== new: H3: with NVGPU_DIAGNOSTIC=1, each one is said on the terminal"
+LINES_SHOWN=40 run run-guest.new.sh h3b -- -- --allow-unmeasured-release --proc-nvidia /x |
+    grep -E 'exit|diagnostic flag'
+
+echo "== new: H7: a second run with a tag a live run holds"
+(flock 9; sleep 4) 9>>/rig/logs/dup.vm0.json &
+sleep 0.3
+run run-guest.new.sh dup
+wait
+echo "  (a root run's files carry its slot: $(cd /rig/logs && printf '%s ' benign.vm0.*))"
+
+echo "== new: H2: a guest that floods its console, with NVGPU_LOG_MAX_MIB=1"
+LINES_SHOWN=2 run run-guest.new.sh flood NVGPU_LOG_MAX_MIB=1
+echo "  console log: $(stat -c %s /rig/logs/flood.vm0.console.log) bytes; $(grep -ac 'NVGPU_LOG_MAX_MIB=1; the rest was dropped' /rig/logs/flood.vm0.console.log) cap line"
+
+echo "== new: H5: a verdict line with a terminal escape sequence in it"
+LINES_SHOWN=40 run run-guest.new.sh esc | grep -E 'exit|probe:'
+echo "  ESC bytes on the launcher's output: $(grep -ac $'\033' /rig/logs/esc.launcher)"
+
+echo "== new: H6: a root launcher started with LD_LIBRARY_PATH, FOO_EVIL and a PATH of the user's"
+LINES_SHOWN=2 run run-guest.new.sh h6 FOO_EVIL=1 LD_LIBRARY_PATH=/home/user
+grep -a '^jailer stub: environment\|^jailer stub: FOO_EVIL' /rig/logs/h6.vm0.console.log | sed 's/^/    /'
+echo "== new: H6: a VMM whose libraries are not root's (/nix is uid 65534 here)"
+LINES_SHOWN=40 run run-guest.new.sh h6lib NVGPU_VMM=/rig/bin/nesbox-dyn | grep -E 'exit|library'
