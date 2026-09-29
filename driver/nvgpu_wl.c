@@ -777,6 +777,46 @@ static unsigned int nvgpu_wl_reap_recv_from(struct nvgpu_device *dev,
                                             const struct nvgpu_tbuf *resp,
                                             u32 used, u32 first);
 
+/*
+ * One descriptor of a RECV reply: a host DRM file or dma-buf (backend handle
+ * d->a) as a guest file under a reserved number, into *f and *fd, not yet
+ * installed. Anything else, or one that cannot be made (whose backend handle
+ * is then closed), is NULL and -1, the latter marked invalid. Either way
+ * d->fd is what the caller is to be told: only descriptors made here are
+ * ever reported as one.
+ */
+static void nvgpu_wl_desc_file(struct nvgpu_device *dev,
+                               const struct nvgpu_wl_xfer *x,
+                               struct nvgpu_wl_desc *d, struct file **f,
+                               int *fd) {
+  *f = NULL;
+  *fd = -1;
+  if (!(d->flags & NVGPU_WL_DESC_F_INVALID) &&
+      (d->kind == NVGPU_WL_DESC_DRM_FILE || d->kind == NVGPU_WL_DESC_DMABUF)) {
+    *fd = get_unused_fd_flags(O_CLOEXEC);
+    if (*fd < 0) {
+      nvgpu_close_handle(dev, d->a);
+      *f = ERR_PTR(*fd);
+    } else if (d->kind == NVGPU_WL_DESC_DRM_FILE) {
+      *f = nvgpu_wl_adopt(dev, x->card_fd, d->a, d->b);
+    } else {
+      *f = nvgpu_wl_import(dev, x->render_fd, d->a);
+    }
+    if (IS_ERR(*f)) {
+      dev_dbg_ratelimited(&dev->vdev->dev,
+                          "virtio-gpu-nv: wayland: could not make a guest "
+                          "file of a host descriptor (kind %u): %ld\n",
+                          d->kind, PTR_ERR(*f));
+      if (*fd >= 0)
+        put_unused_fd(*fd);
+      d->flags |= NVGPU_WL_DESC_F_INVALID;
+      *f = NULL;
+      *fd = -1;
+    }
+  }
+  d->fd = *fd;
+}
+
 static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->node.dev;
   const size_t H = sizeof(struct nvgpu_msg_hdr);
@@ -894,39 +934,11 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   }
   for (i = 0; i < ndesc; i++) {
     struct nvgpu_wl_desc d;
-    struct file *f = NULL;
-    int fd = -1;
 
     ret = nvgpu_wl_desc_get(resp, H, i, &d);
     if (ret)
       goto out_reap;
-    if (!(d.flags & NVGPU_WL_DESC_F_INVALID) &&
-        (d.kind == NVGPU_WL_DESC_DRM_FILE || d.kind == NVGPU_WL_DESC_DMABUF)) {
-      fd = get_unused_fd_flags(O_CLOEXEC);
-      if (fd < 0) {
-        nvgpu_close_handle(dev, d.a);
-        f = ERR_PTR(fd);
-      } else if (d.kind == NVGPU_WL_DESC_DRM_FILE) {
-        f = nvgpu_wl_adopt(dev, x.card_fd, d.a, d.b);
-      } else {
-        f = nvgpu_wl_import(dev, x.render_fd, d.a);
-      }
-      if (IS_ERR(f)) {
-        dev_dbg_ratelimited(&dev->vdev->dev,
-                            "virtio-gpu-nv: wayland: could not make a guest "
-                            "file of a host descriptor (kind %u): %ld\n",
-                            d.kind, PTR_ERR(f));
-        if (fd >= 0)
-          put_unused_fd(fd);
-        d.flags |= NVGPU_WL_DESC_F_INVALID;
-        f = NULL;
-        fd = -1;
-      }
-    }
-    /* Only descriptors made here are ever reported as one. */
-    d.fd = fd;
-    files[i] = f;
-    fds[i] = fd;
+    nvgpu_wl_desc_file(dev, &x, &d, &files[i], &fds[i]);
     ret = nvgpu_wl_desc_put(resp, H, i, &d);
     if (ret) {
       i++;
