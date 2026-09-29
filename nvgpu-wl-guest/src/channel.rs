@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 use wlwire::engine::DevPair;
-use wlwire::frame::{self, Desc};
+use wlwire::frame;
 
 use crate::uapi;
 
@@ -74,12 +74,7 @@ pub trait Connector {
 pub fn fill_fds(frame: &mut [u8], fds: &[Option<OwnedFd>]) {
     for (i, fd) in fds.iter().enumerate() {
         if let Some(fd) = fd {
-            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-            let mut d = Desc::read(&frame[at..at + frame::DESC_LEN]);
-            d.fd = fd.as_raw_fd();
-            let mut b = Vec::with_capacity(frame::DESC_LEN);
-            d.write(&mut b);
-            frame[at..at + frame::DESC_LEN].copy_from_slice(&b);
+            frame::patch_desc(frame, i, |d| d.fd = fd.as_raw_fd());
         }
     }
 }
@@ -208,11 +203,9 @@ impl Channel for DevChannel {
         if buf.len() >= frame::FRAME_HDR_LEN {
             let n = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
             for i in 0..n {
-                let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-                let Some(b) = buf.get(at..at + frame::DESC_LEN) else {
+                let Some(d) = frame::desc_at(&buf, i) else {
                     break;
                 };
-                let d = Desc::read(b);
                 fds.push(crate::sys::received_fd(d.fd));
             }
         }

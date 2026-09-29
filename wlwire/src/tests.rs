@@ -459,7 +459,7 @@ fn a_frame_round_trips_with_its_descriptors_in_order() {
             }),
         ],
     });
-    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, true);
+    let (mut f, fds) = frame::pack(&mut q, 1 << 20, 256, true);
     assert!(q.is_empty());
     assert_eq!(fds.len(), 2);
     let d = frame::decode(&f).unwrap();
@@ -470,6 +470,18 @@ fn a_frame_round_trips_with_its_descriptors_in_order() {
     assert_eq!(recs.len(), 2);
     assert_eq!(recs[0].payload, b"abc");
     assert_eq!(recs[1].arg, 2);
+    // What a transport fills in changes that entry alone, in place.
+    frame::patch_desc(&mut f, 1, |d| {
+        d.fd = 42;
+        d.flags |= frame::DESC_F_INVALID;
+    });
+    frame::patch_desc(&mut f, 2, |d| d.a = 7);
+    let d = frame::decode(&f).unwrap();
+    assert_eq!(frame::desc_at(&f, 0), Some(d.descs[0]));
+    assert_eq!((d.descs[0].a, d.descs[0].c), (1, 3));
+    assert_eq!((d.descs[1].a, d.descs[1].fd), (9, 42));
+    assert!(d.descs[1].is_invalid());
+    assert_eq!(d.records().count(), 2);
 }
 
 /// A record filled in place is byte for byte the record of what was written,

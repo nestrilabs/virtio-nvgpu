@@ -803,9 +803,7 @@ impl WlConn {
         st.to_guest_bytes = left;
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
-            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-            let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
-            match ops.adopt(fd, d.kind) {
+            frame::patch_desc(&mut f, i, |d| match ops.adopt(fd, d.kind) {
                 Ok((handle, hk)) => {
                     d.a = handle;
                     d.b = hk;
@@ -817,10 +815,7 @@ impl WlConn {
                     );
                     d.flags |= frame::DESC_F_INVALID;
                 }
-            }
-            let mut b = Vec::with_capacity(frame::DESC_LEN);
-            d.write(&mut b);
-            f[at..at + frame::DESC_LEN].copy_from_slice(&b);
+            });
         }
         if st.engine.local_is_client() {
             // Export mode: what the host client sent waits in the engine

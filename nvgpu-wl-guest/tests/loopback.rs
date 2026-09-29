@@ -39,7 +39,7 @@ use nvgpu_wl_guest::channel::{Channel, Connector, HostInfo, Received, Sent};
 use nvgpu_wl_guest::daemon::{Config, Daemon, Totals};
 use nvgpu_wl_guest::uapi;
 use protocol::messages::{DEV_WAYLAND, HELLO_F_FRESH, MsgType, PROTO_V2};
-use wlwire::frame::{self, Desc};
+use wlwire::frame;
 use wlwire::proto::op;
 use wlwire::sys;
 use wlwire::wire::{MsgBuilder, peek_header};
@@ -269,12 +269,7 @@ impl Connector for DispatchConnector {
 fn mark_unresolvable(f: &mut [u8], fds: &[Option<OwnedFd>]) {
     for (i, fd) in fds.iter().enumerate() {
         if fd.is_some() {
-            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-            let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
-            d.flags |= frame::DESC_F_INVALID;
-            let mut b = Vec::new();
-            d.write(&mut b);
-            f[at..at + frame::DESC_LEN].copy_from_slice(&b);
+            frame::patch_desc(f, i, |d| d.flags |= frame::DESC_F_INVALID);
         }
     }
 }
@@ -911,17 +906,14 @@ impl SyncobjKernel {
     fn resolve(&self, f: &mut [u8], fds: &[Option<OwnedFd>]) {
         for (i, fd) in fds.iter().enumerate() {
             let Some(fd) = fd else { continue };
-            let at = frame::FRAME_HDR_LEN + i * frame::DESC_LEN;
-            let mut d = Desc::read(&f[at..at + frame::DESC_LEN]);
             let ino = sys::fstat(fd.as_raw_fd()).unwrap().st_ino;
-            match (d.kind, self.guest.get(&ino)) {
-                (frame::DESC_SYNCOBJ, Some(&h)) => d.a = h,
-                _ => d.flags |= frame::DESC_F_INVALID,
-            }
-            d.fd = -1;
-            let mut b = Vec::new();
-            d.write(&mut b);
-            f[at..at + frame::DESC_LEN].copy_from_slice(&b);
+            frame::patch_desc(f, i, |d| {
+                match (d.kind, self.guest.get(&ino)) {
+                    (frame::DESC_SYNCOBJ, Some(&h)) => d.a = h,
+                    _ => d.flags |= frame::DESC_F_INVALID,
+                }
+                d.fd = -1;
+            });
         }
     }
 }

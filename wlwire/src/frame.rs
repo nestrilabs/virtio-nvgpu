@@ -170,6 +170,30 @@ impl Desc {
     }
 }
 
+/// Entry `i` of a frame's descriptor table, read in place: `None` past the
+/// end of the bytes. Not validated against the header's count.
+pub fn desc_at(frame: &[u8], i: usize) -> Option<Desc> {
+    let at = FRAME_HDR_LEN + i * DESC_LEN;
+    frame.get(at..at + DESC_LEN).map(Desc::read)
+}
+
+/// Change entry `i` of a packed frame's descriptor table in place: what the
+/// transport fills in once it has resolved the descriptor behind it (a
+/// descriptor number for the guest kernel; an adopted handle, or the
+/// invalid flag, for the guest). An entry past the end of the bytes is left
+/// alone -- there is none to change.
+pub fn patch_desc(frame: &mut [u8], i: usize, f: impl FnOnce(&mut Desc)) {
+    let at = FRAME_HDR_LEN + i * DESC_LEN;
+    let Some(b) = frame.get_mut(at..at + DESC_LEN) else {
+        return;
+    };
+    let mut d = Desc::read(b);
+    f(&mut d);
+    let mut out = Vec::with_capacity(DESC_LEN);
+    d.write(&mut out);
+    b.copy_from_slice(&out);
+}
+
 /// A descriptor on its way to the channel. `fd` is what the transport still
 /// has to turn into the desc's fields: the guest kernel (a client dma-buf),
 /// or the backend's handle table (a DRM file or dma-buf received from the
