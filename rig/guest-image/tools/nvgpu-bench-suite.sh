@@ -16,8 +16,8 @@
 #   video    ffmpeg: NVDEC (-hwaccel cuda; compute), Vulkan Video decode,
 #            and NVENC transcodes kept on the GPU (compute)
 #   startup  time to a device, a context and a first presented frame
-#   wl       Wayland throughput: a wl_shm client, an EGL client unsynced,
-#            a Vulkan client in mailbox
+#   wl       Wayland throughput: a wl_shm client, a Vulkan client in
+#            mailbox
 #
 # Each group's lines are bracketed by "BENCH-SECTION begin|end <group>", which
 # the host side uses to charge the backend's and the VMM's CPU to it.
@@ -140,9 +140,8 @@ g_startup() {
 g_wl() {
     has_wl || { echo "BENCH-FAIL wl: no WAYLAND_DISPLAY"; return; }
     nvgpu-bench wl-shm
-    # SIGINT: it stops cleanly and its buffered lines reach the log.
-    timeout -s INT -k 3 14 weston-simple-egl -b > "$T/simple-egl.log" 2>&1
-    awk '/frames in .* seconds/ { v = $(NF-1) } END { if (v) print "BENCH wl.simple_egl_unsynced", v, "fps" }' "$T/simple-egl.log"
+    # (Not weston-simple-egl -b: it ignores SIGINT often enough, natively
+    # too, that its figure came from one run in three.)
     timeout 60 vkmark --winsys wayland -s 1920x1080 --present-mode mailbox -b clear:duration=8 -b cube:duration=8 > "$T/vkmark-wl.log" 2>&1
     awk '/^\[/ && /FPS:/ { s = $1; gsub(/[\[\]]/, "", s); for (i = 1; i < NF; i++) if ($i == "FPS:") print "BENCH wl.vkmark_mailbox_" s, $(i+1), "fps" }' "$T/vkmark-wl.log"
 }

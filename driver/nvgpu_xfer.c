@@ -158,6 +158,11 @@ struct nvgpu_xfer {
   unsigned int vring_size;
   unsigned int max_sg; /* per direction */
 
+  /* Callers spinning for a reply (under `lock`): while there are any, the
+   * control queue's interrupt is off and they take replies off the ring
+   * themselves (nvgpu_ctrl_poll_enter()). */
+  unsigned int pollers;
+
   /* Ring slots executor-class requests may hold between them. */
   atomic_t exec_avail;
   int exec_budget;
@@ -538,39 +543,108 @@ static bool nvgpu_exec_take(struct nvgpu_xfer *xf, u32 units) {
   return true;
 }
 
-void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
-  struct nvgpu_device *dev = vq->vdev->priv;
-  struct nvgpu_xfer *xf = dev->xfer;
+/*
+ * Take every reply the device has returned off the control ring and complete
+ * its request. Under xf->lock; returns the executor budget units the replies
+ * give back (for nvgpu_exec_release(), after the lock), and says whether any
+ * buffer came back (*freed).
+ */
+static u32 nvgpu_ctrl_harvest(struct nvgpu_xfer *xf, struct virtqueue *vq,
+                              bool *freed) {
   u64 now = ktime_get_ns();
   struct nvgpu_req *r;
-  unsigned long flags;
   unsigned int len;
   u32 units = 0;
-  bool freed = false;
 
-  if (!xf)
-    return;
-
-  spin_lock_irqsave(&xf->lock, flags);
   while ((r = virtqueue_get_buf(vq, &len)) != NULL) {
     r->used_len = len;
     r->t1 = now;
     r->completed = true;
     units += r->exec_units;
     r->exec_units = 0;
-    freed = true;
+    *freed = true;
     if (r->abandoned)
       queue_work(xf->wq, &r->work);
     else
       complete(&r->done);
   }
-  if (freed)
+  if (*freed)
     WRITE_ONCE(xf->space_gen, xf->space_gen + 1);
-  spin_unlock_irqrestore(&xf->lock, flags);
+  return units;
+}
 
+static void nvgpu_ctrl_harvested(struct nvgpu_xfer *xf, u32 units,
+                                 bool freed) {
   if (freed)
     wake_up_all(&xf->space_wq);
   nvgpu_exec_release(xf, units);
+}
+
+void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
+  struct nvgpu_device *dev = vq->vdev->priv;
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+  bool freed = false;
+  u32 units;
+
+  if (!xf)
+    return;
+
+  spin_lock_irqsave(&xf->lock, flags);
+  units = nvgpu_ctrl_harvest(xf, vq, &freed);
+  spin_unlock_irqrestore(&xf->lock, flags);
+  nvgpu_ctrl_harvested(xf, units, freed);
+}
+
+/*
+ * A caller spinning for its reply takes replies off the ring itself, and
+ * while any caller spins the control queue's interrupt is off. A reply then
+ * costs the host no eventfd signal and this guest no interrupt -- about a
+ * microsecond of the three or four a round trip takes -- and the caller sees
+ * it as soon as the device writes it. The last caller to stop spinning turns
+ * the interrupt back on and takes whatever arrived meanwhile, so a caller
+ * that sleeps (an executor-class request, or one that spun out) is still
+ * woken, by the next spinner or by the interrupt.
+ */
+static void nvgpu_ctrl_poll_enter(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+
+  spin_lock_irqsave(&xf->lock, flags);
+  /* A dead transport's queue is being taken apart (nvgpu_xfer_reclaim()
+   * sets `dead` under this lock first): nothing here touches it then. */
+  if (!xf->pollers++ && !xf->dead)
+    virtqueue_disable_cb(dev->ctrl_vq);
+  spin_unlock_irqrestore(&xf->lock, flags);
+}
+
+static void nvgpu_ctrl_poll(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+  bool freed = false;
+  u32 units;
+
+  /* Another spinner holds it: it is harvesting for us. */
+  if (!spin_trylock_irqsave(&xf->lock, flags))
+    return;
+  units = xf->dead ? 0 : nvgpu_ctrl_harvest(xf, dev->ctrl_vq, &freed);
+  spin_unlock_irqrestore(&xf->lock, flags);
+  nvgpu_ctrl_harvested(xf, units, freed);
+}
+
+static void nvgpu_ctrl_poll_exit(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+  bool freed = false;
+  u32 units = 0;
+
+  spin_lock_irqsave(&xf->lock, flags);
+  /* The last one out: interrupts back on, and anything that came back
+   * before they were is taken now (enable_cb says so by returning false). */
+  if (!--xf->pollers && !xf->dead && !virtqueue_enable_cb(dev->ctrl_vq))
+    units = nvgpu_ctrl_harvest(xf, dev->ctrl_vq, &freed);
+  spin_unlock_irqrestore(&xf->lock, flags);
+  nvgpu_ctrl_harvested(xf, units, freed);
 }
 
 /*
@@ -721,11 +795,15 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
     if (spin_us) {
       u64 until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
 
-      /* The callback completes it from the interrupt, which still comes;
-       * this only keeps the caller on its CPU meanwhile. */
+      /* Replies are taken off the ring here while this caller spins, the
+       * interrupt off meanwhile (nvgpu_ctrl_poll_enter()). */
+      nvgpu_ctrl_poll_enter(dev);
       while (!completion_done(&r->done) && !need_resched() &&
-             ktime_get_ns() < until)
+             ktime_get_ns() < until) {
+        nvgpu_ctrl_poll(dev);
         cpu_relax();
+      }
+      nvgpu_ctrl_poll_exit(dev);
     }
   }
 
