@@ -841,6 +841,41 @@ Each guest run also writes the backend's and the VMM's CPU per group
 interleave native and guest runs, and build nothing meanwhile: a compile on
 the same CPUs moves every figure.
 
+## Heavy workloads
+
+`rig/rig-heavy.sh` runs games, an engine and a renderer unpaced (vsync
+off, no frame cap) natively or in a guest, against the headless sway (it
+sets the output's mode per workload: 3840x2160 for the GPU-bound ones,
+1280x720 for the CPU-bound ones), and records every frame's time the same
+way both ways; `rig/heavy/heavy-stats.py` makes BENCHMARKS.md's "Heavy
+workloads" rows (average, 1% and 0.1% lows, p50/p99/p99.9, variation).
+The workloads are `rig/heavy/heavy-run.sh`'s; the guest image needs them
+at `/opt/heavy`, which `rig/heavy/mkimage-heavy.sh` puts into a reflink
+copy of a built image in seconds, with an nvgpu-bench that has
+`vk-stream` (`--file`).
+
+```sh
+rig/heavy/mkimage-heavy.sh .rig/guest/rootfs.ext4 /tmp/rootfs.heavy.ext4 \
+    --file <tools>/bin/nvgpu-bench:/opt/heavy/nvgpu-bench:755
+rig/rig-heavy.sh stk-ultra native h 3
+NVGPU_HEAVY_NATIVE_CPUS=0-3 rig/rig-heavy.sh stk-low native h4 3   # as many CPUs as the guest
+NVGPU_ROOTFS=/tmp/rootfs.heavy.ext4 NVGPU_COMPUTE=1 rig/rig-heavy.sh stk-ultra vm hg 3
+NVGPU_ROOTFS=/tmp/rootfs.heavy.ext4 NVGPU_COMPUTE=1 NVGPU_VMM_KIND=crosvm rig/rig-heavy.sh stk-ultra vm hc 3
+# Blender's heavy scene needs a bigger window than the default
+NVGPU_WINDOW_MIB=16384 NVGPU_WINDOW_SHARE=90 NVGPU_ROOTFS=... rig/rig-heavy.sh blender-vk vm hb 2
+rig/heavy/heavy-stats.py native='.rig/logs/heavy/h/stk-ultra-*.frames' nesbox='.rig/logs/heavy/hg/stk-ultra-*.frames'
+```
+
+Guest runs need `NVGPU_COMPUTE=1` for Godot's Forward+ (its ray-tracing
+extensions want UVM; probes/apps.sh, godot). Each guest run keeps the backend's log with
+its periodic pacing report (`NVGPU_PACING_STATS`, 5 s by default here),
+whose `ioctl2 time` line splits each IOCTL2's backend time into preparing
+and the host ioctl, both sides' pacing counters, and the backend's and the
+VMM's CPU over the run. Interleave native and guest runs and build
+nothing meanwhile, as for the benchmarks. For a monitor,
+`rig/rig-framepace.sh stk-ultra` and `stk-ultra-novsync` run the same
+effects on DP-3.
+
 ## What to keep from every run
 
 The launcher writes three files per run:
