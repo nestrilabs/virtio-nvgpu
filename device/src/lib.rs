@@ -65,6 +65,8 @@ pub mod sys;
 pub mod tally;
 #[cfg(test)]
 mod testfd;
+#[cfg(test)]
+mod testing;
 pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;

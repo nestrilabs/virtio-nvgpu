@@ -1780,20 +1780,6 @@ fn update_device_mapping_info_gives_the_callers_addresses_back() {
     assert_eq!(&body[32..36], &[0xaa; 4], "the host's status");
 }
 
-/// An RM that serves one control and one class and turns everything else
-/// down in the status word, as RM does for a command it does not know.
-fn fake_rm_status(_fd: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
-    let a = &mut arg.bytes()[..hostfd::ioc_size(request as u32)];
-    let (key_at, status_at, served) = match hostfd::ioc_nr(request as u32) {
-        0x2a => (8, 28, 0x2080_0101),
-        _ => (12, 40, 0x3e),
-    };
-    let key = u32::from_le_bytes(a[key_at..key_at + 4].try_into().unwrap());
-    let status: u32 = if key == served { 0 } else { 0x56 };
-    a[status_at..status_at + 4].copy_from_slice(&status.to_le_bytes());
-    0
-}
-
 std::thread_local! {
     /// The descriptor the fake UVM was handed in MM_INITIALIZE.
     static UVM_FD_SEEN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
@@ -1933,27 +1919,37 @@ fn a_control_listing_host_pids_is_answered_without_rm() {
 fn only_controls_and_classes_rm_served_are_tallied() {
     let mut be = NvidiaBackend::for_test();
     be.set_host_nodes_for_test(Vec::new(), Vec::new());
-    be.set_host_ioctl_for_test(fake_rm_status);
+    crate::testing::rm::install(&mut be);
+    crate::testing::rm::with(|rm| {
+        rm.only_controls(&[0x2080_0101]);
+        rm.only_classes(&[0x3e]);
+    });
     let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
     let control = hostfd::ioc(hostfd::IOC_RW, b'F', 0x2a, 32);
     let alloc = hostfd::ioc(hostfd::IOC_RW, b'F', 0x2b, 48);
-    for k in 0..200u32 {
-        let mut p = [0u8; 32];
-        p[8..12].copy_from_slice(&(0x1234_0000 + k).to_le_bytes());
-        v1_ioctl(&mut be, ctl, control, &p);
-        let mut p = [0u8; 48];
-        p[12..16].copy_from_slice(&(0x9000 + k).to_le_bytes());
-        v1_ioctl(&mut be, ctl, alloc, &p);
-    }
-    assert!(be.rm_controls.is_empty() && be.rm_classes.is_empty());
-
-    let mut p = [0u8; 32];
-    p[8..12].copy_from_slice(&0x2080_0101u32.to_le_bytes());
-    v1_ioctl(&mut be, ctl, control, &p);
     let mut p = [0u8; 48];
-    p[12..16].copy_from_slice(&0x3eu32.to_le_bytes());
-    v1_ioctl(&mut be, ctl, alloc, &p);
+    p[12..16].copy_from_slice(&NV01_ROOT_CLIENT.to_le_bytes());
+    let r = v1_ioctl(&mut be, ctl, alloc, &p);
+    let client = crate::le::u32_at(&r, 16 + 12 + 8).unwrap();
+    let block = |at: usize, v: u32, len: usize| {
+        let mut p = vec![0u8; len];
+        p[..4].copy_from_slice(&client.to_le_bytes());
+        p[4..8].copy_from_slice(&client.to_le_bytes());
+        p[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        p
+    };
+    for k in 0..200u32 {
+        v1_ioctl(&mut be, ctl, control, &block(8, 0x1234_0000 + k, 32));
+        v1_ioctl(&mut be, ctl, alloc, &block(12, 0x9000 + k, 48));
+    }
+    // Refused by RM, named by nothing it answered: only the client counts.
+    assert!(be.rm_controls.is_empty());
+    assert_eq!(be.rm_classes.get(NV01_ROOT_CLIENT), Some(1));
+    assert_eq!(be.rm_classes.len(), 1);
+
+    v1_ioctl(&mut be, ctl, control, &block(8, 0x2080_0101, 32));
+    v1_ioctl(&mut be, ctl, alloc, &block(12, 0x3e, 48));
     assert_eq!(be.rm_controls.get(0x2080_0101), Some(1));
     assert_eq!(be.rm_classes.get(0x3e), Some(1));
-    assert_eq!((be.rm_controls.len(), be.rm_classes.len()), (1, 1));
+    assert_eq!((be.rm_controls.len(), be.rm_classes.len()), (1, 2));
 }

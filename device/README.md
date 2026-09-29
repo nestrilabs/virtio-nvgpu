@@ -90,6 +90,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
 | `src/i2_e2e.rs` | test only: the guest module's own IOCTL2 interpreter (`nvgpu-guest-core`, a GPL-2.0 dev-dependency) run against the whole backend |
 | `src/testfd.rs` | test only: whether this process still holds the other end of a pipe |
+| `src/testing/rm.rs` | test only: `FakeRm`, a host RM with an object tree that answers ALLOC, CONTROL, FREE, DUP_OBJECT and SHARE with resserv's statuses |
 | `src/fuzzing/` | fuzzing only (`--cfg fuzzing`, never in the backend): the fuzz targets' entry points and the fake host they run against; see "Fuzzing" below |
 | `src/fuzz_seeds.rs` | test only: with `NVGPU_FUZZ_SEEDS` set, every session a unit test serves is written out as a seed for the `backend` targets |
 | `src/inject.rs` | capture injection (`--inject-socket`): the helper's socket (SOCK_SEQPACKET, one uid, four peers), the registry of injected buffers and syncobjs (a dma-buf must import into this GPU's render node as NVKMS memory, its layout fit the object; ids and tokens; 32 buffers, 1 GiB, 16 syncobjs per VM), HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, and the read-only placement of an injected object's mmap range; SECURITY.md §18 |

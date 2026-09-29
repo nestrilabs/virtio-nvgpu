@@ -1581,14 +1581,15 @@ mod tests {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
-    use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
+    use crate::hostfd::{HandleKind, IOC_RW, ioc};
     use crate::le::u32_at as rd32;
+    use crate::nvos::{NV01_DEVICE_0, NV20_SUBDEVICE_0};
+    use crate::testing::rm;
     use protocol::messages::{
         BCAP_PROC_EUID, BCAP_PROC_ID, DeviceKind, GCAP_PROC_EUID, GCAP_PROC_ID, HELLO_F_FRESH,
         HelloReq, MsgType, PROTO_V2, ProcId,
     };
-    use std::cell::{Cell, RefCell};
-    use std::os::fd::{OwnedFd, RawFd};
+    use std::os::fd::OwnedFd;
 
     const ALLOC: u32 = ioc(IOC_RW, b'F', 0x2b, 48);
     const CONTROL: u32 = ioc(IOC_RW, b'F', 0x2a, 32);
@@ -1601,49 +1602,20 @@ mod backend_tests {
     /// Where a v1 reply's parameters start: MsgHeader, IoctlResp.
     const BODY: usize = 16 + 12;
 
-    std::thread_local! {
-        /// (escape, hClient) of every RM call that reached the host.
-        static SEEN: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-        static NEXT_CLIENT: Cell<u32> = const { Cell::new(0xc1d0_0001) };
-    }
-
-    fn seen() -> Vec<(u32, u32)> {
-        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    fn seen() -> Vec<rm::Call> {
+        rm::seen()
     }
 
     fn reached(nr: u32) -> bool {
-        seen().iter().any(|&(n, _)| n == nr)
+        seen().iter().any(|c| c.nr == nr)
     }
 
-    /// A host RM that allocates clients with fresh handles and answers
-    /// NV_OK to everything else.
-    fn fake_rm(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
-        let request = request as u32;
-        let a = &mut arg.bytes()[..hostfd::ioc_size(request)];
-        let nr = hostfd::ioc_nr(request);
-        SEEN.with(|s| s.borrow_mut().push((nr, rd32(a, 0).unwrap())));
-        let status = match nr {
-            0x2b => {
-                if ROOT_CLASSES.contains(&rd32(a, 12).unwrap()) {
-                    let h = NEXT_CLIENT.with(|c| c.replace(c.get() + 1));
-                    a[8..12].copy_from_slice(&h.to_le_bytes());
-                }
-                40
-            }
-            0x2a => 28,
-            0x29 => 12,
-            0x34 => 24,
-            // A share of object 0xbad is one RM turns down.
-            0x35 if rd32(a, 4) == Some(0xbad) => {
-                a[20..24].copy_from_slice(&NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes());
-                return 0;
-            }
-            0x35 => 20,
-            _ => return 0,
-        };
-        a[status..status + 4].fill(0);
-        0
-    }
+    /// The device every client here has, and the subdevice and memory
+    /// objects under it the tests name.
+    const DEVICE: u32 = 0xde7;
+    const SUBDEVICE: u32 = 0x2080;
+    const MEMORY: [u32; 7] = [0x55, 0x66, 0x77, 0x88, 0xbad, 0x3d, 0x3e];
+    const NV01_MEMORY_SYSTEM: u32 = 0x3e;
 
     /// What a current guest module says it can do.
     const FULL: u32 = GCAP_PROC_ID | GCAP_PROC_EUID;
@@ -1654,7 +1626,7 @@ mod backend_tests {
         seen();
         let mut be = NvidiaBackend::for_test();
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
-        be.set_host_ioctl_for_test(fake_rm);
+        rm::install(&mut be);
         let hello = HelloReq {
             proto: PROTO_V2,
             flags: HELLO_F_FRESH,
@@ -1768,17 +1740,25 @@ mod backend_tests {
         b
     }
 
+    /// A client, allocated through the backend, and its device, subdevice
+    /// and memory, made in RM directly.
     fn alloc_client(be: &mut NvidiaBackend, on: u32, by: Option<ProcId>) -> u32 {
         let r = call(be, on, ALLOC, &words(&[(12, 0x41)], 48), &[], by);
         assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
-        rd32(&r, BODY + 8).unwrap()
+        let c = rd32(&r, BODY + 8).unwrap();
+        rm::with(|rm| {
+            rm.alloc(c, c, DEVICE, NV01_DEVICE_0).unwrap();
+            rm.alloc(c, DEVICE, SUBDEVICE, NV20_SUBDEVICE_0).unwrap();
+            for m in MEMORY {
+                rm.alloc(c, DEVICE, m, NV01_MEMORY_SYSTEM).unwrap();
+            }
+        });
+        c
     }
 
+    /// A duplicate of `src`'s `obj` into `dst`, at a handle RM picks.
     fn dup(dst: u32, src: u32, obj: u32) -> Vec<u8> {
-        words(
-            &[(0, dst), (4, dst), (8, 0xd00d), (12, src), (16, obj)],
-            NVOS55_SIZE,
-        )
+        words(&[(0, dst), (4, dst), (12, src), (16, obj)], NVOS55_SIZE)
     }
 
     fn share(owner: u32, obj: u32, kind: u16, action: u8, target: u32) -> Vec<u8> {
@@ -1943,7 +1923,7 @@ mod backend_tests {
             rm_status(&r, NVOS54_STATUS),
             NV_ERR_INSUFFICIENT_PERMISSIONS
         );
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let r = call(&mut be, f1, ALLOC, &outer, &words(&[(4, b)], 56), None);
         assert_eq!(
             rm_status(&r, NVOS64_STATUS),
@@ -2153,6 +2133,11 @@ mod backend_tests {
             NV_ERR_INSUFFICIENT_PERMISSIONS
         );
         // A grant RM refused is not recorded; one on a freed object is gone.
+        rm::with(|rm| {
+            rm.set_hook(|c| {
+                (c.nr == 0x35 && c.object == 0xbad).then_some(NV_ERR_INSUFFICIENT_PERMISSIONS)
+            })
+        });
         let r = call(
             &mut be,
             f1,
@@ -2204,7 +2189,7 @@ mod backend_tests {
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         // A device sharing a host client's VA space.
         let dev = |share: u32| words(&[(4, share)], 56);
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         seen();
         let r = call(&mut be, f1, ALLOC, &outer, &dev(HOST), None);
         assert_eq!(
@@ -2250,7 +2235,7 @@ mod backend_tests {
         let (mut be, f1, _) = vm(FULL);
         be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 6)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 6)], 48);
         seen();
         let r = call(&mut be, f1, ALLOC, &outer, &[0u8; 6], None);
         assert_eq!(rm_status(&r, NVOS64_STATUS), NV_ERR_INVALID_ARGUMENT);
@@ -2272,7 +2257,7 @@ mod backend_tests {
 
         // NV01_DEVICE_0's hClientShare: clientValidate, the security token --
         // the caller's process or its euid.
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let dev = |at: usize, c: u32| words(&[(at, c)], 56);
         for (c, want) in [(mine_too, true), (same_uid, true), (other, false)] {
             let r = call(&mut be, f1, ALLOC, &outer, &dev(4, c), Some(me));
@@ -2368,7 +2353,7 @@ mod backend_tests {
         let a = alloc_client(&mut be, f1, Some(me));
         let mine_too = alloc_client(&mut be, f2, Some(me));
         let same_uid = alloc_client(&mut be, f2, Some(pid_as(20, me.euid)));
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let r = call(
             &mut be,
             f1,
