@@ -137,6 +137,10 @@ impl Status {
     }
 }
 
+/// RM's own statuses for a refusal the backend makes in the status field,
+/// the ioctl itself succeeding (nvstatuscodes.h).
+pub(crate) const NV_ERR_NO_MEMORY: u32 = 0x51;
+
 /// A DRM render node the host owns, as the guest is told about it.
 #[derive(Clone, Debug)]
 pub(crate) struct DriDevice {
@@ -2222,6 +2226,12 @@ impl NvidiaBackend {
         }
 
         let length = size.max(4096);
+        // A size the guest kernel chose, refused before any arithmetic on
+        // it: no zone holds more than its own size.
+        if length > self.shm.largest_zone() {
+            log::warn!("mmap on handle {handle}: {length:#x} bytes is more than any zone holds");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
+        }
         // An injected buffer's range is placed read-only, whichever of the
         // VM's files maps it (inject.rs): the guest's CPU does not write
         // into the host's capture buffers.
@@ -4634,19 +4644,28 @@ impl NvidiaBackend {
         let expected = self.rm_mapping_pgprot_before(h_client, h_memory);
         // A zero length can be given no extent; RM refuses it on its own,
         // and says so in `status`.
+        //
+        // A length no zone could hold -- up to u64::MAX, the guest's to
+        // choose -- is refused before any arithmetic on it. Either refusal
+        // is RM's own out-of-memory answer, NV_ERR_NO_MEMORY in the status
+        // with the ioctl succeeding, which is how libnvidia learns it ran
+        // out; a bare errno reads as a generic OS failure.
         let reserved = if asked == 0 {
             None
         } else {
-            match self.alloc_zone(asked, expected, owner) {
+            let got = if asked > self.shm.largest_zone() {
+                Err(DeviceError::Io(std::io::Error::other(format!(
+                    "{asked:#x} bytes is more than any zone holds"
+                ))))
+            } else {
+                self.alloc_zone(asked, expected, owner)
+            };
+            match got {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::ENOMEM,
-                    );
+                    log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                    let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                    return self.write_ioctl_resp(resp_buf, cookie, &out);
                 }
             }
         };
@@ -8022,8 +8041,8 @@ mod mapping_tests {
         );
         assert_eq!(held, 2 * LEN);
 
-        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
-        assert_ne!(status, 0, "refused");
+        // RM's own out-of-memory answer, in the status (#29).
+        assert_eq!(e.map_as(ctl, p(1), VIDMEM), (0, NV_ERR_NO_MEMORY, 0));
         assert_eq!(host_maps().len(), 2, "RM was never asked");
         assert_eq!(e.be.shm_free_bytes(), free);
         assert_eq!(
@@ -8033,6 +8052,59 @@ mod mapping_tests {
         // Another process still maps.
         let other = process(&mut e, p(2));
         assert_eq!(e.map_as(other, p(2), VIDMEM).1, 0);
+    }
+
+    /// An NVOS33 length near u64::MAX, which any app may send, is refused
+    /// in RM's status before a reservation is tried: rounding it up to a
+    /// page overflowed, and the release profile aborted the backend for
+    /// every process of the VM (review 2026-09-29 1.1). The same for an
+    /// MMAP's size (1.10).
+    #[test]
+    fn a_map_length_near_u64_max_is_refused_not_aborted() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let empty = e.be.shm_free_bytes();
+        for len in [
+            u64::MAX,
+            0xFFFF_FFFF_FFFF_F001,
+            0xFFFF_FFFF_FFFF_F000,
+            1 << 40,
+        ] {
+            let fd =
+                e.be.adopt_for_test_as(memfd(), HandleKind::Dev(DeviceKind::Gpu(0)), p(1));
+            let mut q = vec![0u8; 56];
+            put(&mut q, 0, CLIENT);
+            put(&mut q, 4, DEVICE);
+            put(&mut q, 8, VIDMEM);
+            q[24..32].copy_from_slice(&len.to_le_bytes());
+            put(&mut q, 44, 0x0308_0002);
+            put(&mut q, 48, fd);
+            let (status, back) = e.call_raw(ctl, NV_ESC_RM_MAP_MEMORY, &q, &[]);
+            assert_eq!(status, 0, "{len:#x}");
+            assert_eq!(rd(&back, 40), NV_ERR_NO_MEMORY, "{len:#x}");
+            assert_eq!(back[24..32], len.to_le_bytes(), "the caller's own length");
+            assert_eq!(rd(&back, 48), fd, "the caller's own descriptor");
+        }
+        assert!(host_maps().is_empty(), "RM was never asked");
+        assert_eq!(e.be.shm_free_bytes(), empty);
+
+        // An MMAP of an unrecorded file, sized by the guest kernel.
+        for size in [u64::MAX, 0xFFFF_FFFF_FFFF_F001] {
+            let mut req = msg(MsgType::Mmap, e.ctl);
+            push(
+                &mut req,
+                &MmapReq {
+                    size,
+                    offset: 0,
+                    prot: 3,
+                    padding: 0,
+                },
+            );
+            let mut resp = vec![0u8; 64];
+            e.be.dispatch(&req, &mut resp);
+            assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::ENOMEM);
+        }
+        assert_eq!(e.be.shm_free_bytes(), empty);
     }
 
     /// RM maps with another type than expected: the reservation moves to
