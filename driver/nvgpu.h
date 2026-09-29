@@ -644,6 +644,8 @@ int nvgpu_drm_arg_in(struct nvgpu_drm_arg *a, unsigned int ucmd,
 long nvgpu_drm_arg_out(struct nvgpu_drm_arg *a, long ret);
 /* Free without copying back: the call was not ours after all. */
 void nvgpu_drm_arg_drop(struct nvgpu_drm_arg *a);
+/* ───────── nvgpu_gem.c ───────── */
+
 /*
  * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
  * host file, and return a handle for it in `file`. The proxy takes a
@@ -718,6 +720,16 @@ struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
 struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
                                           u32 guest_handle);
+/* nvgpu_gem_proxy_create() for a host object just made in `owner`'s file,
+ * sized `size` (the nvidia-drm GEM ioctls that make one). */
+int nvgpu_gem_proxy_create_new(struct drm_file *file, struct nvgpu_fd *owner,
+                               u32 host_handle, size_t size,
+                               u32 *guest_handle);
+/* GEM_IDENTIFY_OBJECT, answered from the proxy (its argument's kernel copy). */
+long nvgpu_gem_identify(struct drm_file *file, void *karg);
+/* drm_driver.gem_prime_import. */
+struct drm_gem_object *nvgpu_gem_prime_import(struct drm_device *dev,
+                                              struct dma_buf *buf);
 
 /* ───────── nvgpu_kms.c ───────── */
 

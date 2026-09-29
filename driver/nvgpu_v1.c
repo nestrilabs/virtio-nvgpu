@@ -4,8 +4,8 @@
  * reading of a reply's header, which every v1 path -- the C parsers
  * (nvgpu_rmio.c), the nvidia-drm GEM forwarder (nvgpu_drm.c) -- does the same
  * way, and the flat round trip of a block with no pointer in it
- * (nvgpu_ioctl_flat()), which the C parsers' flat escapes and nvgpu_drm.c's
- * flat nvidia-drm calls both make. The Rust parsers' twins are
+ * (nvgpu_ioctl_flat()), which the C parsers' flat escapes and the flat
+ * nvidia-drm calls (nvgpu_drm.c, nvgpu_gem.c) both make. The Rust parsers' twins are
  * wire::ioctl_req_header(), wire::IoctlResp::parse() and rm.rs's flat path
  * (driver/rust/core), and the difftest compiles this file with the C
  * parsers, so both read a reply alike.

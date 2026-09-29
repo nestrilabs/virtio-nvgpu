@@ -101,7 +101,7 @@ again:
    * Owns the host GEM handle from here: closed on failure, or left to the
    * proxy that already stands for it. Without O_RDWR the dma-buf's file is
    * read-only, so no process can map it writable (the backend's read-only
-   * placement refuses what does get through, nvgpu_drm.c).
+   * placement refuses what does get through, nvgpu_gem.c).
    */
   buf = nvgpu_dmabuf_from_host_buf(rf, gem, res[1], NVGPU_GEM_OBJECT_NVKMS,
                                    O_CLOEXEC);
