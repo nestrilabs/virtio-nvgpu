@@ -44,7 +44,8 @@
  *   records, rec_len bytes: struct nvgpu_wl_rec + payload padded to 8
  *
  * Dual licensed like nvgpu_wire.h, so the Apache-2.0 daemon can mirror it
- * (nvgpu-wl-guest/src/uapi.rs, with the same size asserts).
+ * (nvgpu-wl-guest/src/uapi.rs, which asserts each struct's size and each
+ * ioctl number).
  */
 
 #ifndef _UAPI_NVGPU_WL_H
@@ -91,10 +92,12 @@ struct nvgpu_wl_hello {
 
 /* ── CONNECT ──
  *
- * One LISTEN per device at a time (-EBUSY while another file holds it), and
- * ACCEPT only from the listener's effective uid or CAP_SYS_ADMIN (-EACCES;
- * -ENOTCONN with no listener): whoever accepts a host program becomes its
- * compositor. -EMFILE: the VM has as many channels as its backend allows.
+ * A file connects once (-EBUSY after). One LISTEN per device at a time
+ * (-EBUSY while another file holds it), and ACCEPT only from the listener's
+ * effective uid or CAP_SYS_ADMIN (-EACCES; -ENOTCONN with no listener):
+ * whoever accepts a host program becomes its compositor. -EMFILE: the VM,
+ * or the process the channel is charged to, has as many channels as the
+ * backend allows it.
  */
 
 #define NVGPU_WL_CONNECT 0 /* a new connection to the host compositor        */
@@ -112,9 +115,19 @@ struct nvgpu_wl_connect {
  * the caller's PID namespace) rather than to the daemon. Each guest process
  * may hold only a share of the VM's channels, and of their shm and queue
  * budgets (device/src/quota.rs); charged to the daemon, every client would
- * share one. Mode NVGPU_WL_CONNECT only. -ESRCH when the pid names no
- * process. Whoever may open this device (the daemon's group) may name any
- * process, so no app is to be in that group.
+ * share one. Mode NVGPU_WL_CONNECT only, and flags and pad 0 (-EINVAL
+ * otherwise, and for a pid below 1). -ESRCH when the pid names no process.
+ *
+ * The pid is looked up when the ioctl runs, so the channel is charged to
+ * whichever process has it then. A caller that must not charge a process
+ * given the pid after its client exited holds the client by a pidfd from
+ * before the call, and drops the channel if that process has exited once
+ * the call returns: a pid goes to another process only after its own has
+ * exited, so a client still alive then is the one charged. nvgpu-wl-guest
+ * does this, and refuses the client on -ESRCH; it falls back to a plain
+ * CONNECT, charged to itself, only on -ENOTTY (a kernel without this ioctl).
+ * Whoever may open this device (the daemon's group) may name any process,
+ * so no app is to be in that group.
  */
 struct nvgpu_wl_connect_for {
   __u32 mode;  /* NVGPU_WL_CONNECT */
