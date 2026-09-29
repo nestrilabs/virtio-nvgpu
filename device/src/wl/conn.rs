@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
+use wlwire::localin::LocalIn;
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::shm::{ShmBudget, ShmCharge};
 use wlwire::sys;
@@ -975,10 +976,9 @@ fn reader(s: Arc<Shared>) {
     let mut buf = vec![0u8; 64 * 1024];
     // What the compositor sent that the engine has not taken yet (a partial
     // message), and its descriptors. Only this thread reads the socket, so
-    // neither needs the lock -- which lets the lease-device probe run between
+    // this needs no lock -- which lets the lease-device probe run between
     // the read and the engine without it.
-    let mut inbuf: Vec<u8> = Vec::new();
-    let mut infds: VecDeque<OwnedFd> = VecDeque::new();
+    let mut input = LocalIn::default();
     loop {
         let (want_out, streams, closed, blocked) = {
             let mut st = lock(&s);
@@ -987,12 +987,12 @@ fn reader(s: Arc<Shared>) {
             }
             // Export mode: input the engine left when the guest's queue
             // was full, taken now that there may be room.
-            if !st.closed && !inbuf.is_empty() && !st.engine.input_blocked() {
+            if !st.closed && !input.is_empty() && !st.engine.input_blocked() {
                 let mut plat = HostPlat {
                     host: &*s.host,
                     send: None,
                 };
-                match st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
+                match st.engine.from_local(&mut input, &mut plat) {
                     Ok(()) => collect(&s, &mut st),
                     Err(f) => fail(&s, &mut st, f),
                 }
@@ -1061,20 +1061,18 @@ fn reader(s: Arc<Shared>) {
             loop {
                 let mut fds = Vec::new();
                 let r = sys::recv_with_fds(sock, &mut buf, &mut fds);
-                let mut overflow = false;
+                let mut overflow = Ok(());
                 if let Ok(n @ 1..) = r {
-                    inbuf.extend_from_slice(&buf[..n]);
-                    infds.extend(fds);
                     // Descriptors no message has taken, held for ever
                     // otherwise; libwayland closes the connection too.
-                    overflow = infds.len() > wlwire::wire::MAX_FDS_QUEUED;
+                    overflow = input.push(&buf[..n], fds);
                     // Lease-device globals are answered here, before the
                     // engine's registry filter asks and with no lock held: a
                     // probe can take seconds, and the connection's lock is
                     // what WL_SEND and WL_RECV wait on under the backend
                     // mutex (`probe.rs`).
                     if s.probe_leases {
-                        let names = probe::lease_globals(&inbuf);
+                        let names = probe::lease_globals(input.bytes());
                         if !names.is_empty() {
                             s.cfg.lease_cache.resolve(&s.cfg.socket, &*s.host, &names);
                         }
@@ -1087,21 +1085,9 @@ fn reader(s: Arc<Shared>) {
                 if st.closed {
                     break;
                 }
-                if overflow {
-                    infds.clear();
-                    fail(
-                        &s,
-                        &mut st,
-                        Fatal::new(
-                            Blame::Local,
-                            1,
-                            wlwire::engine::ERR_NO_MEMORY,
-                            format!(
-                                "more than {} file descriptors that no message takes",
-                                wlwire::wire::MAX_FDS_QUEUED
-                            ),
-                        ),
-                    );
+                if let Err(f) = overflow {
+                    input.clear();
+                    fail(&s, &mut st, f);
                     break;
                 }
                 match r {
@@ -1114,7 +1100,7 @@ fn reader(s: Arc<Shared>) {
                             host: &*s.host,
                             send: None,
                         };
-                        if let Err(f) = st.engine.from_local(&mut inbuf, &mut infds, &mut plat) {
+                        if let Err(f) = st.engine.from_local(&mut input, &mut plat) {
                             fail(&s, &mut st, f);
                             break;
                         }

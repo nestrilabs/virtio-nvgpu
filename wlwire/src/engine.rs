@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::blob::{BlobJob, Blobs};
 use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
 use crate::job::Job;
+use crate::localin::LocalIn;
 use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
@@ -180,6 +181,12 @@ impl Fatal {
             message: printable(&message.into(), MAX_FATAL_TEXT),
             blame,
         }
+    }
+
+    /// `wl_display.error.no_memory`, on the display (where libwayland-server
+    /// posts it): the peer made the proxy hold more than it may.
+    pub fn no_memory(blame: Blame, message: impl Into<String>) -> Self {
+        Self::new(blame, 1, ERR_NO_MEMORY, message)
     }
 
     /// `wl_display.error` for a local client.
@@ -748,20 +755,20 @@ impl Engine {
         }
     }
 
-    /// Parse every complete message at the front of `data` (bytes read from
-    /// the local socket) with the descriptors received alongside, translate
-    /// them, and queue the result for the channel. A partial message is left
-    /// in `data` for the next read, and so is everything after the message
-    /// that brought the channel's queue to the input limit
+    /// Parse every complete message at the front of `input` (what was read
+    /// from the local socket, with the descriptors received alongside),
+    /// translate them, and queue the result for the channel. A partial
+    /// message is left in `input` for the next read, and so is everything
+    /// after the message that brought the channel's queue to the input limit
     /// ([`Engine::input_blocked`]): the caller calls again once the channel
     /// has taken some, whether or not more was read.
     pub fn from_local(
         &mut self,
-        data: &mut Vec<u8>,
-        fds: &mut VecDeque<OwnedFd>,
+        input: &mut LocalIn,
         plat: &mut dyn Platform,
     ) -> Result<(), Fatal> {
         let dir = self.local_dir();
+        let LocalIn { data, fds } = input;
         let mut msgs = wire::Messages::new(data);
         let res = loop {
             if self.input_blocked() {

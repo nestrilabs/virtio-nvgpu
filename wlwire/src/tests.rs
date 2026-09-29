@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicI64;
 use crate::closure::{self, ModelIface, ModelMsg};
 use crate::engine::*;
 use crate::frame::{self, Desc, DescOut};
+use crate::localin::LocalIn;
 use crate::objects::{ObjError, Objects};
 use crate::policy::{LeaseGate, Policy};
 use crate::proto::{self, Dir, iface, op};
@@ -707,22 +708,21 @@ impl Pair {
     /// The client's messages, taken as the channel drains (the engine stops
     /// taking input with a channel's worth queued).
     fn client_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
-        let mut data: Vec<u8> = msgs.concat();
-        let mut fds: VecDeque<OwnedFd> = fds.into();
+        let mut input = LocalIn::new(msgs.concat(), fds);
         loop {
-            let before = data.len();
-            self.g.from_local(&mut data, &mut fds, &mut self.gp)?;
+            let before = input.len();
+            self.g.from_local(&mut input, &mut self.gp)?;
             self.pump();
-            if data.is_empty() || data.len() == before {
+            if input.is_empty() || input.len() == before {
                 return Ok(());
             }
         }
     }
 
     fn server_sends(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) -> Result<(), Fatal> {
-        let mut data: Vec<u8> = msgs.concat();
-        let mut fds: VecDeque<OwnedFd> = fds.into();
-        let r = self.h.from_local(&mut data, &mut fds, &mut self.hp);
+        let r = self
+            .h
+            .from_local(&mut LocalIn::new(msgs.concat(), fds), &mut self.hp);
         if r.is_ok() {
             self.pump();
         }
@@ -1154,11 +1154,10 @@ fn seat_v1(side: Side) -> Engine {
         synth_released: false,
     });
     let mut plat = TestPlat::default();
-    let mut m = MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+    let m = MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
         .new_id(2)
         .finish();
-    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
-        .unwrap();
+    e.from_local(&mut LocalIn::new(m, []), &mut plat).unwrap();
     let g = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
         .uint(1)
         .string(Some("wl_seat"))
@@ -1166,12 +1165,11 @@ fn seat_v1(side: Side) -> Engine {
         .finish();
     e.from_channel(&wayland_frame(&[g]), vec![], &mut plat)
         .unwrap();
-    let mut m = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+    let m = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
         .uint(1)
         .generic_new_id("wl_seat", 1, 3)
         .finish();
-    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
-        .unwrap();
+    e.from_local(&mut LocalIn::new(m, []), &mut plat).unwrap();
     e
 }
 
@@ -1205,9 +1203,9 @@ fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
         .unwrap_err();
     assert!(e.message.contains("needs version 2"), "{}", e.message);
     // A request newer than its object is refused either way.
-    let mut m = MsgBuilder::new(3, op::wl_seat::REQ_RELEASE).finish();
+    let m = MsgBuilder::new(3, op::wl_seat::REQ_RELEASE).finish();
     let e = g
-        .from_local(&mut m, &mut VecDeque::new(), &mut TestPlat::default())
+        .from_local(&mut LocalIn::new(m, []), &mut TestPlat::default())
         .unwrap_err();
     assert!(e.message.contains("needs version 5"), "{}", e.message);
 }
@@ -1335,7 +1333,7 @@ fn commit_a_truncated_pool(left: u64) -> Pair {
     .unwrap();
     p.at_server();
     sys::ftruncate(keep.as_raw_fd(), left).unwrap();
-    let mut data = [
+    let data = [
         MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
             .object(7)
             .int(0)
@@ -1347,17 +1345,17 @@ fn commit_a_truncated_pool(left: u64) -> Pair {
             .finish(),
     ]
     .concat();
-    let mut fds = VecDeque::new();
+    let mut input = LocalIn::new(data, []);
     for _ in 0..8 {
-        p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+        p.g.from_local(&mut input, &mut p.gp).unwrap();
         assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
         p.pump();
         assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
     }
     assert!(
-        data.is_empty(),
+        input.is_empty(),
         "{} bytes of input left untaken: the connection is wedged",
-        data.len()
+        input.len()
     );
     p
 }
@@ -2091,12 +2089,12 @@ fn a_descriptor_the_guest_could_not_carry_arrives_as_a_placeholder() {
     });
     let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
     h.from_channel(&f, fds, &mut TestPlat::default()).unwrap();
-    let mut data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+    let data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
         .uint(1)
         .string(Some("zwp_linux_dmabuf_v1"))
         .uint(5)
         .finish();
-    h.from_local(&mut data, &mut VecDeque::new(), &mut TestPlat::default())
+    h.from_local(&mut LocalIn::new(data, []), &mut TestPlat::default())
         .unwrap();
     let m = [
         MsgBuilder::new(2, op::wl_registry::REQ_BIND)
@@ -2156,12 +2154,12 @@ fn a_timeline_nobody_could_name_ends_the_client_with_invalid_timeline_not_a_plac
     }]);
     let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
     h.from_channel(&f, fds, &mut TestPlat::default()).unwrap();
-    let mut data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+    let data = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
         .uint(1)
         .string(Some("wp_linux_drm_syncobj_manager_v1"))
         .uint(1)
         .finish();
-    h.from_local(&mut data, &mut VecDeque::new(), &mut TestPlat::default())
+    h.from_local(&mut LocalIn::new(data, []), &mut TestPlat::default())
         .unwrap();
     h.local_out().drain();
     let m = [
@@ -2814,7 +2812,7 @@ fn a_commit_is_read_as_the_channel_takes_it_and_input_waits_behind_it() {
     let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
         .new_id(20)
         .finish();
-    let mut data = [
+    let data = [
         MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
             .object(6)
             .int(0)
@@ -2824,10 +2822,14 @@ fn a_commit_is_read_as_the_channel_takes_it_and_input_waits_behind_it() {
         sync.clone(),
     ]
     .concat();
-    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
-        .unwrap();
+    let mut input = LocalIn::new(data, []);
+    p.g.from_local(&mut input, &mut p.gp).unwrap();
     // The commit went in; what follows it waits for the channel.
-    assert_eq!(data, sync, "input past a full channel queue is left");
+    assert_eq!(
+        input.bytes(),
+        sync,
+        "input past a full channel queue is left"
+    );
     assert!(p.g.input_blocked());
     assert!(p.g.channel_backlog() >= size);
     // A frame's worth is read, not the buffer.
@@ -2841,9 +2843,8 @@ fn a_commit_is_read_as_the_channel_takes_it_and_input_waits_behind_it() {
     p.pump();
     assert!(!p.g.input_blocked());
     assert_eq!(read_all(&host_pool), pixels);
-    p.g.from_local(&mut data, &mut VecDeque::new(), &mut p.gp)
-        .unwrap();
-    assert!(data.is_empty());
+    p.g.from_local(&mut input, &mut p.gp).unwrap();
+    assert!(input.is_empty());
     p.pump();
     let (msgs, _) = p.at_server();
     assert_eq!(split(&msgs).last(), Some(&sync));
@@ -2866,12 +2867,12 @@ fn a_large_blob_is_read_a_record_at_a_time() {
     )
     .unwrap();
     let icc: Vec<u8> = (0..(4 << 20)).map(|i: u32| (i * 7) as u8).collect();
-    let mut data = MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+    let data = MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
         .uint(0)
         .uint(icc.len() as u32)
         .finish();
-    let mut fds = VecDeque::from([memfd_with(&icc)]);
-    p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+    p.g.from_local(&mut LocalIn::new(data, [memfd_with(&icc)]), &mut p.gp)
+        .unwrap();
     assert!(p.g.channel_backlog() >= icc.len());
     let mut q = p.g.take_units_upto(1);
     assert_eq!(q.len(), 1, "one record");

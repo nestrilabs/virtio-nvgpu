@@ -5,7 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 use protocol::messages::*;
 use wlwire::engine::{Engine, EngineConfig, Local, Side};
 use wlwire::frame::{self, Desc};
+use wlwire::localin::LocalIn;
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::proto::op;
 use wlwire::sys;
@@ -148,9 +148,8 @@ impl Guest {
     }
 
     fn client(&mut self, be: &mut NvidiaBackend, m: &[Vec<u8>]) {
-        let mut data = m.concat();
         self.e
-            .from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+            .from_local(&mut LocalIn::new(m.concat(), []), &mut GuestPlat)
             .unwrap();
         self.flush(be);
     }
@@ -483,7 +482,7 @@ fn a_dmabuf_naming_a_foreign_owner_reaches_the_compositor_as_a_placeholder() {
         )
         .unwrap();
     g.recv_until(&mut be, |b, _| !b.is_empty());
-    let mut data = [
+    let data = [
         MsgBuilder::new(2, op::wl_registry::REQ_BIND)
             .uint(5)
             .generic_new_id("zwp_linux_dmabuf_v1", 4, 3)
@@ -501,8 +500,7 @@ fn a_dmabuf_naming_a_foreign_owner_reaches_the_compositor_as_a_placeholder() {
     ]
     .concat();
     g.e.from_local(
-        &mut data,
-        &mut VecDeque::from([sys::memfd(c"guest-dmabuf", 0).unwrap()]),
+        &mut LocalIn::new(data, [sys::memfd(c"guest-dmabuf", 0).unwrap()]),
         &mut GuestPlat,
     )
     .unwrap();

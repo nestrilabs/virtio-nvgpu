@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Rewrites, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
+use wlwire::localin::LocalIn;
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::sys;
 
@@ -308,8 +309,8 @@ struct Client {
     engine: Engine,
     /// Who what the daemon holds for this client is charged to.
     owner: Owner,
-    inbuf: Vec<u8>,
-    infds: VecDeque<OwnedFd>,
+    /// What the client sent that its engine has not taken yet.
+    input: LocalIn,
     /// Frames the host has not taken yet.
     tx: VecDeque<(Vec<u8>, Vec<Option<OwnedFd>>)>,
     /// Streams in epoll: descriptor → (stream id, events asked for).
@@ -778,8 +779,7 @@ impl Daemon {
             chan,
             engine,
             owner,
-            inbuf: Vec::new(),
-            infds: VecDeque::new(),
+            input: LocalIn::default(),
             tx: VecDeque::new(),
             streams: HashMap::new(),
             sock_events: ev,
@@ -801,7 +801,7 @@ impl Daemon {
         let (mut all, mut mine) = (0, 0);
         for c in self.clients.iter().flatten() {
             let tx: usize = c.tx.iter().map(|(_, f)| f.iter().flatten().count()).sum();
-            let n = FD_PER_CLIENT + (c.infds.len() + tx + c.engine.held_fds()) as u64;
+            let n = FD_PER_CLIENT + (c.input.fds() + tx + c.engine.held_fds()) as u64;
             all += n;
             if Some(c.owner) == o {
                 mine += n;
@@ -1056,46 +1056,32 @@ impl Daemon {
                 }
                 Ok(n) => {
                     let got = fds.len();
-                    c.inbuf.extend_from_slice(&buf[..n]);
-                    c.infds.extend(fds);
+                    // Past libwayland's descriptor ring the client is
+                    // closed, as libwayland closes it (LocalIn::push).
+                    let ring = c.input.push(&buf[..n], fds);
                     let owner = c.owner;
                     // Descriptors come with the read, before anything can
                     // refuse them: counted now, and past the owner's share
-                    // of the daemon's (budget.rs) the client is closed, as
-                    // one past libwayland's ring below. One read adds at
-                    // most FD_SLACK, which the budget leaves room for.
+                    // of the daemon's (budget.rs) the client is closed too.
+                    // One read adds at most FD_SLACK, which the budget
+                    // leaves room for.
                     let over = if got > 0 {
                         self.fds_admit(owner, 0).err()
                     } else {
                         None
                     };
-                    if let Some((why, held)) = over {
-                        let f = Fatal::new(
+                    let refused = match (over, ring) {
+                        (Some((why, held)), _) => Some(Fatal::no_memory(
                             Blame::Local,
-                            1,
-                            wlwire::engine::ERR_NO_MEMORY,
                             format!(
                                 "the client's process holds {held} of the proxy's {} \
                                  descriptors ({why:?})",
                                 self.fd_budget
                             ),
-                        );
-                        self.fatal(slot, f);
-                        break;
-                    }
-                    let c = self.clients[slot].as_mut().unwrap();
-                    if c.infds.len() > wlwire::wire::MAX_FDS_QUEUED {
-                        // As libwayland does with a client that overflows
-                        // its descriptor ring.
-                        let f = Fatal::new(
-                            Blame::Local,
-                            1,
-                            wlwire::engine::ERR_NO_MEMORY,
-                            format!(
-                                "more than {} file descriptors sent that no request takes",
-                                wlwire::wire::MAX_FDS_QUEUED
-                            ),
-                        );
+                        )),
+                        (None, ring) => ring.err(),
+                    };
+                    if let Some(f) = refused {
                         self.fatal(slot, f);
                         break;
                     }
@@ -1120,23 +1106,17 @@ impl Daemon {
             let Some(c) = self.clients[slot].as_mut() else {
                 return;
             };
-            if c.closing || !c.tx.is_empty() || c.inbuf.is_empty() {
+            if c.closing || !c.tx.is_empty() || c.input.is_empty() {
                 return;
             }
-            let before = c.inbuf.len();
-            let Client {
-                engine,
-                inbuf,
-                infds,
-                ..
-            } = c;
-            if let Err(f) = engine.from_local(inbuf, infds, &mut GuestPlat) {
+            let before = c.input.len();
+            if let Err(f) = c.engine.from_local(&mut c.input, &mut GuestPlat) {
                 self.fatal(slot, f);
                 return;
             }
             let c = self.clients[slot].as_mut().unwrap();
             // Only part of a message is left, or nothing was taken.
-            if c.inbuf.len() == before && !c.engine.has_channel_output() {
+            if c.input.len() == before && !c.engine.has_channel_output() {
                 return;
             }
         }
@@ -1768,14 +1748,14 @@ mod tests {
         );
         assert!(c.engine.input_blocked());
         assert!(
-            c.inbuf.ends_with(&sync),
+            c.input.bytes().ends_with(&sync),
             "what follows waits in the input buffer"
         );
         // The host drains: everything goes, in order, with no more input.
         script.busy.store(false, Ordering::Relaxed);
         for _ in 0..50 {
             d.turn(10).unwrap();
-            if the_client(&d).inbuf.is_empty() && the_client(&d).tx.is_empty() {
+            if the_client(&d).input.is_empty() && the_client(&d).tx.is_empty() {
                 break;
             }
         }
@@ -1860,7 +1840,7 @@ mod tests {
             d.turn(50).unwrap();
         }
         let c = the_client(&d);
-        let wedged = !c.inbuf.is_empty() || c.engine.input_blocked();
+        let wedged = !c.input.is_empty() || c.engine.input_blocked();
         let recs = script.records();
         let last = recs
             .iter()

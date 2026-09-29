@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use wlwire::engine::{Engine, EngineConfig, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut};
+use wlwire::localin::LocalIn;
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::proto::{self, Dir, iface, op};
 use wlwire::sys;
@@ -120,10 +121,8 @@ impl Guest {
     }
 
     fn client(&mut self, msgs: &[Vec<u8>], fds: Vec<OwnedFd>) {
-        let mut data = msgs.concat();
-        let mut fds: VecDeque<OwnedFd> = fds.into();
         self.e
-            .from_local(&mut data, &mut fds, &mut GuestPlat)
+            .from_local(&mut LocalIn::new(msgs.concat(), fds), &mut GuestPlat)
             .unwrap();
         self.flush().unwrap();
     }
@@ -411,8 +410,8 @@ fn wl_send_says_eagain_while_the_compositor_is_not_reading() {
                     .finish()
             })
             .collect();
-        let mut data = batch.concat();
-        g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+        let data = batch.concat();
+        g.e.from_local(&mut LocalIn::new(data, []), &mut GuestPlat)
             .unwrap();
         let mut q = g.e.take_units();
         let (f, _) = frame::pack(&mut q, 1 << 20, 256, false);
@@ -829,7 +828,7 @@ fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
     let mut submit = |g: &mut Guest| {
         let (req, lease) = (next, next + 1);
         next += 2;
-        let mut data = [
+        let data = [
             MsgBuilder::new(5, op::wp_drm_lease_device_v1::REQ_CREATE_LEASE_REQUEST)
                 .new_id(req)
                 .finish(),
@@ -838,7 +837,7 @@ fn a_lease_request_past_the_vms_rate_waits_with_eagain_and_goes_later() {
                 .finish(),
         ]
         .concat();
-        g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+        g.e.from_local(&mut LocalIn::new(data, []), &mut GuestPlat)
             .unwrap();
         let mut q = g.e.take_units();
         frame::pack(&mut q, 1 << 20, 256, false).0
@@ -968,8 +967,8 @@ fn a_frame_of_more_submits_than_the_burst_ends_the_connection() {
                 .finish(),
         );
     }
-    let mut data = msgs.concat();
-    g.e.from_local(&mut data, &mut VecDeque::new(), &mut GuestPlat)
+    let data = msgs.concat();
+    g.e.from_local(&mut LocalIn::new(data, []), &mut GuestPlat)
         .unwrap();
     let mut q = g.e.take_units();
     let f = frame::pack(&mut q, 1 << 20, 256, false).0;

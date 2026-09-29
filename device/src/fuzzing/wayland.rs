@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use wlwire::engine::{DevPair, Engine, EngineConfig, Local, Platform, Rewrites, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
+use wlwire::localin::LocalIn;
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::proto::{self, ArgKind, Dir};
 use wlwire::shm::ShmBudget;
@@ -502,35 +503,37 @@ pub fn run(data: &[u8]) {
             let ok = match b.u8() % 9 {
                 // The app, raw bytes.
                 0 => {
-                    let mut data = b.chunk(4096).to_vec();
-                    let mut fds: VecDeque<OwnedFd> = (0..b.u8() % 3)
+                    let data = b.chunk(4096).to_vec();
+                    let fds: VecDeque<OwnedFd> = (0..b.u8() % 3)
                         .map(|_| some_fd(b.u8(), u64::from(b.u16())))
                         .collect();
-                    p.g.from_local(&mut data, &mut fds, &mut Plat).is_ok()
+                    p.g.from_local(&mut LocalIn::new(data, fds), &mut Plat)
+                        .is_ok()
                 }
                 // The app, a message of the protocol.
                 1 => {
                     let mut fds = VecDeque::new();
                     let m = build(&mut b, p.g.objects(), gdir, &mut p.ids, &mut fds);
                     match m {
-                        Some(mut m) => p.g.from_local(&mut m, &mut fds, &mut Plat).is_ok(),
+                        Some(m) => p.g.from_local(&mut LocalIn::new(m, fds), &mut Plat).is_ok(),
                         None => true,
                     }
                 }
                 // The compositor, raw.
                 2 => {
-                    let mut data = b.chunk(4096).to_vec();
-                    let mut fds: VecDeque<OwnedFd> = (0..b.u8() % 3)
+                    let data = b.chunk(4096).to_vec();
+                    let fds: VecDeque<OwnedFd> = (0..b.u8() % 3)
                         .map(|_| some_fd(b.u8(), u64::from(b.u16())))
                         .collect();
-                    p.h.from_local(&mut data, &mut fds, &mut Plat).is_ok()
+                    p.h.from_local(&mut LocalIn::new(data, fds), &mut Plat)
+                        .is_ok()
                 }
                 // The compositor, a message of the protocol.
                 3 => {
                     let mut fds = VecDeque::new();
                     let m = build(&mut b, p.h.objects(), hdir, &mut p.ids, &mut fds);
                     match m {
-                        Some(mut m) => p.h.from_local(&mut m, &mut fds, &mut Plat).is_ok(),
+                        Some(m) => p.h.from_local(&mut LocalIn::new(m, fds), &mut Plat).is_ok(),
                         None => true,
                     }
                 }

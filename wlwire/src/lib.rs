@@ -17,6 +17,7 @@ pub mod closure;
 pub mod engine;
 pub mod frame;
 pub mod job;
+pub mod localin;
 pub mod localout;
 pub mod objects;
 pub mod policy;
