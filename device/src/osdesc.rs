@@ -3135,7 +3135,7 @@ mod backend_tests {
             vmas_per_vm: 64,
             ..Limits::default()
         });
-        let (st, ..) = ioctl(
+        let (st, _, params, _) = ioctl(
             &mut vm.be,
             ctl,
             VID_HEAP,
@@ -3143,8 +3143,13 @@ mod backend_tests {
             &[],
             Some(&list(OSDESC_F_WRITE, &[(LOW, 3)])),
         );
-        assert_eq!(st, -libc::ENOMEM);
+        // RM's own out-of-memory answer in the caller's block, the ioctl
+        // succeeding (review 2026-09-29 parity #29).
+        assert_eq!(st, 0);
+        assert_eq!(rd32(&params, OS32_STATUS), crate::nvidia::NV_ERR_NO_MEMORY);
+        assert_eq!(rd64(&params, OS32_DESCRIPTOR), GUEST_VA, "the caller's own");
         assert!(seen().is_empty());
+        assert_eq!(vm.be.osdesc.live(), 0);
     }
 
     /// The file the client was allocated on closes: the backend frees the

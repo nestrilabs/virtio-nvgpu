@@ -140,6 +140,8 @@ impl Status {
 /// RM's own statuses for a refusal the backend makes in the status field,
 /// the ioctl itself succeeding (nvstatuscodes.h).
 pub(crate) const NV_ERR_NO_MEMORY: u32 = 0x51;
+pub(crate) const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+pub(crate) const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
 
 /// A DRM render node the host owns, as the guest is told about it.
 #[derive(Clone, Debug)]
@@ -2935,8 +2937,16 @@ impl NvidiaBackend {
                     .set_owner(self.current_handle, self.handles.owner(self.current_handle));
                 if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL && params.len() >= 16 {
                     let len = u64::from_le_bytes(params[8..16].try_into().unwrap());
+                    // Refused in rmStatus, 8 bytes from the block's end, the
+                    // ioctl succeeding: UVM's own way to say it (review
+                    // 2026-09-29 parity #29).
                     if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
-                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                        let status = match errno {
+                            libc::ENOMEM => NV_ERR_NO_MEMORY,
+                            _ => NV_ERR_INVALID_ARGUMENT,
+                        };
+                        let out = crate::rmshare::refusal(params, params.len() - 8, status);
+                        return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
                 // The descriptor some commands name another file by
@@ -3929,16 +3939,44 @@ impl NvidiaBackend {
         let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
         self.osdesc
             .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
-        let prepared = od::describe(cmd, outer, nested).and_then(|call| {
-            let runs = od::parse_runs(&call, list)?;
-            let resolved = od::resolve(&ram, &runs)?;
-            self.osdesc
-                .admit(self.current_handle, resolved.bytes(), resolved.vmas())?;
-            Ok((call, resolved.map(call.in_page(), call.writable)?))
-        });
+        // Over a registration budget the answer is RM's own out-of-memory
+        // status at `.1` of the caller's block, the ioctl succeeding, as RM
+        // answers when it cannot pin (review 2026-09-29 parity #29): an
+        // errno read to libnvidia as a generic OS failure.
+        enum Refused {
+            Errno(i32),
+            Budget(usize),
+        }
+        let prepared = od::describe(cmd, outer, nested)
+            .map_err(Refused::Errno)
+            .and_then(|call| {
+                let runs = od::parse_runs(&call, list).map_err(Refused::Errno)?;
+                let resolved = od::resolve(&ram, &runs).map_err(Refused::Errno)?;
+                if self
+                    .osdesc
+                    .admit(self.current_handle, resolved.bytes(), resolved.vmas())
+                    .is_err()
+                {
+                    return Err(Refused::Budget(match call.shape {
+                        Shape::AllocMemory => od::OS02_STATUS,
+                        Shape::VidHeap => od::OS32_STATUS,
+                        Shape::RmAlloc => od::OS64_STATUS,
+                    }));
+                }
+                let pinned = resolved
+                    .map(call.in_page(), call.writable)
+                    .map_err(Refused::Errno)?;
+                Ok((call, pinned))
+            });
         let (call, pinned) = match prepared {
             Ok(p) => p,
-            Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
+            Err(Refused::Budget(at)) => {
+                let out = crate::rmshare::refusal(param_in, at, NV_ERR_NO_MEMORY);
+                return self.write_ioctl_resp(resp_buf, cookie, &out);
+            }
+            Err(Refused::Errno(e)) => {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
+            }
         };
         log::debug!(
             "OS descriptor {cmd:#x}: {:#x} bytes of guest RAM at {:#x} of ours",
@@ -4858,14 +4896,13 @@ impl NvidiaBackend {
                 match self.alloc_zone(length, pgprot, owner) {
                     Ok(r) => r,
                     Err(e) => {
-                        log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                        log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
                         self.undo_rm_map(host_fd, &param_buf, host_p_linear);
-                        return self.write_error_resp(
-                            resp_buf,
-                            Status::IoctlFailed,
-                            cookie,
-                            libc::ENOMEM,
-                        );
+                        // RM's out-of-memory answer, as for a refused
+                        // reservation (#29); the caller's own block.
+                        let out =
+                            crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                        return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
             }
@@ -4883,19 +4920,23 @@ impl NvidiaBackend {
                     "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
                      addressed by the guest"
                 );
-                Err(libc::ENOTSUP)
+                Err(NV_ERR_NOT_SUPPORTED)
             }
             Some(window) => window
                 .place(region.offset, length, host_map_fd, 0, writable)
                 .map_err(|e| {
                     log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
-                    libc::ENOMEM
+                    NV_ERR_NO_MEMORY
                 }),
         };
-        if let Err(errno) = placed {
+        // RM's statuses in the caller's own block, the ioctl succeeding, as
+        // RM answers a mapping it cannot make (#29): an errno reads to
+        // libnvidia as a generic OS failure.
+        if let Err(status) = placed {
             unreserve(self, Some(region));
             self.undo_rm_map(host_fd, &param_buf, host_p_linear);
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, status);
+            return self.write_ioctl_resp(resp_buf, cookie, &out);
         }
 
         log::debug!(
@@ -5165,7 +5206,6 @@ impl NvidiaBackend {
     /// it says the space has it, or cannot say, the guest reads
     /// NV_ERR_NOT_SUPPORTED and the file takes nothing more.
     fn uvm_pageable_off(&mut self, host_fd: RawFd, resp_buf: &mut [u8], n: usize) {
-        const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
         let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
         // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
         let st = body + 8;
@@ -8410,8 +8450,11 @@ mod mapping_tests {
         assert_eq!(e.be.shm_free_bytes().1, wc0, "no write-combining kept");
         let placed = e.window.0.lock().unwrap().len();
 
-        let (status, _, _) = e.map_as(ctl, unknown, UCVID);
-        assert_ne!(status, 0, "no uncached extent left");
+        assert_eq!(
+            e.map_as(ctl, unknown, UCVID),
+            (0, NV_ERR_NO_MEMORY, 0),
+            "no uncached extent left: RM's own answer (#29)"
+        );
         assert_eq!(host_maps().len(), 2, "the third host mapping was undone");
         assert_eq!(e.be.shm_free_bytes().1, wc0, "the reservation went back");
         assert_eq!(e.window.0.lock().unwrap().len(), placed, "nothing placed");
@@ -8425,9 +8468,9 @@ mod mapping_tests {
         let ctl = process(&mut e, p(1));
         let empty = e.be.shm_free_bytes();
         PLACE_FAILS.with(|f| f.set(true));
-        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
+        let refused = e.map_as(ctl, p(1), VIDMEM);
         PLACE_FAILS.with(|f| f.set(false));
-        assert_ne!(status, 0);
+        assert_eq!(refused, (0, NV_ERR_NO_MEMORY, 0), "RM's own answer (#29)");
         assert!(host_maps().is_empty(), "the host's mapping was undone");
         assert_eq!(e.be.shm_free_bytes(), empty);
         assert_eq!(
@@ -8684,6 +8727,29 @@ mod uvm_map_tests {
         fn calls(&self) -> Vec<Call> {
             std::mem::take(&mut *self.vmm.calls.lock().unwrap())
         }
+    }
+
+    /// A pool the budgets refuse is refused as UVM refuses one, in its
+    /// rmStatus with the ioctl succeeding, and UVM is never asked (review
+    /// 2026-09-29 parity #29).
+    #[test]
+    fn a_refused_pool_says_so_in_its_rm_status() {
+        let mut e = env(true);
+        let h = e.uvm();
+        HOST.with(|h| h.borrow_mut().clear());
+        let mut p = vec![0u8; POOL];
+        p[0..8].copy_from_slice(&X.to_le_bytes());
+        for (len, want) in [
+            (0u64, NV_ERR_INVALID_ARGUMENT),
+            (u64::MAX, NV_ERR_INVALID_ARGUMENT),
+        ] {
+            p[8..16].copy_from_slice(&len.to_le_bytes());
+            let r = e.ioctl(h, 68, &p);
+            assert_eq!(status(&r), 0, "{len:#x}");
+            let st = BODY + POOL - 8;
+            assert_eq!(u32::from_le_bytes(r[st..st + 4].try_into().unwrap()), want);
+        }
+        assert!(HOST.with(|h| h.borrow().is_empty()), "UVM was never asked");
     }
 
     #[test]
