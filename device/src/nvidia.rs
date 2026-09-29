@@ -1109,9 +1109,16 @@ impl NvidiaBackend {
         }
     }
 
-    /// Create a backend with the default 256 MiB zone split.
+    /// A backend whose shared window is `cfg`: the one `ZoneConfig` the
+    /// VMM's GET_SHMEM_CONFIG is answered from too (`--window-size`,
+    /// `--window-owner-share`).
+    pub fn with_zone_config(cfg: ZoneConfig) -> Self {
+        Self::new(cfg)
+    }
+
+    /// A backend with the default window (1 GiB, half a zone per process).
     pub fn with_default_zones() -> Self {
-        Self::new(ZoneConfig::default_1gib())
+        Self::with_zone_config(ZoneConfig::default_1gib())
     }
 
     /// Total SHM BAR size (for VMM config space).
@@ -1247,6 +1254,7 @@ impl NvidiaBackend {
             uc_size: 4096 * 2,
             wc_size: 4096 * 4,
             wb_size: 4096 * 2,
+            owner_percent: 50,
         })
     }
 
@@ -1300,6 +1308,10 @@ impl NvidiaBackend {
             self.handles.len(),
             self.active_maps.len()
         );
+        // How much of the window this VM used: what `--window-size` and
+        // `--window-owner-share` are chosen by (DEPLOY.md), so it is kept
+        // at the default log level.
+        log::warn!("window use: {}", self.shm.usage_summary());
         if !self.abi_refused.is_empty() {
             let verb = if self.abi_policy == AbiPolicy::Enforce {
                 "refused"

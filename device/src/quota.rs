@@ -112,6 +112,33 @@ impl Share {
         }
     }
 
+    /// `p` percent of the pool per owner, for a pool an operator has said
+    /// one process may need most of (the window, `--window-owner-share`):
+    /// the last eighth kept for owners holding at most a sixteenth, as in
+    /// [`Share::half`], except that the reserve never takes from what one
+    /// owner was given -- past 87.5 % it shrinks to what is left beside a
+    /// whole share, and the floor with it. At 50 this is `half` exactly.
+    ///
+    /// What a larger share gives up is in [`Share::owners_to_exhaust`]: 2
+    /// owners for 50 up to 87.5 %, 1 from there. Then one process can take
+    /// the pool down to its reserve, and every other process of the VM has
+    /// only the reserve, each at most the floor of it.
+    pub const fn percent(size: u64, p: u8) -> Self {
+        let per_owner = (size as u128 * p as u128 / 100) as u64;
+        let rest = size - if per_owner > size { size } else { per_owner };
+        let reserve = if size / 8 < rest { size / 8 } else { rest };
+        let floor = if size / 16 < reserve {
+            size / 16
+        } else {
+            reserve
+        };
+        Share {
+            per_owner,
+            reserve,
+            floor,
+        }
+    }
+
     /// Owners each holding a full share it takes to leave the pool with
     /// only its reserve.
     pub fn owners_to_exhaust(&self, size: u64) -> u64 {
@@ -254,6 +281,53 @@ mod tests {
         l.charge(p(5), 1);
         assert_eq!(l.admits(&s, p(5), 1, used + 1, 64), Err(Over::Reserve));
         assert_eq!(s.owners_to_exhaust(64), 4);
+    }
+
+    /// `percent(size, 50)` is `half` exactly, whatever the size; above it
+    /// the reserve gives way only past 87.5 %, and from there one owner
+    /// can take the pool down to the reserve.
+    #[test]
+    fn a_percent_share_is_half_at_fifty_and_keeps_its_reserve_reachable() {
+        let mib = 1u64 << 20;
+        for size in [
+            1,
+            7,
+            4096,
+            768 * mib,
+            12288 * mib,
+            64 << 30,
+            (1 << 36) + 4097,
+        ] {
+            assert_eq!(Share::percent(size, 50), Share::half(size), "size {size}");
+        }
+        let size = 12288 * mib;
+        let owners = |p| Share::percent(size, p).owners_to_exhaust(size);
+        assert_eq!(
+            [50, 75, 87, 88, 90, 95].map(owners),
+            [2, 2, 2, 1, 1, 1],
+            "owners it takes to leave only the reserve"
+        );
+        let s = Share::percent(size, 90);
+        assert_eq!(s.reserve, size - s.per_owner, "a whole share is reachable");
+        assert_eq!(s.floor, size / 16);
+        let s = Share::percent(size, 95);
+        assert_eq!(
+            (s.reserve, s.floor),
+            (size - s.per_owner, size - s.per_owner)
+        );
+        // One owner at 90 % takes it to the reserve, and not past it...
+        let s = Share::percent(size, 90);
+        assert_eq!(admits(&s, p(1), 0, s.per_owner, 0, size), Ok(()));
+        assert_eq!(
+            admits(&s, p(1), s.per_owner, 4096, s.per_owner, size),
+            Err(Over::Owner)
+        );
+        // ...and another still takes its first mappings out of the reserve.
+        assert_eq!(admits(&s, p(2), 0, s.floor, s.per_owner, size), Ok(()));
+        assert_eq!(
+            admits(&s, p(2), s.floor, 4096, s.per_owner + s.floor, size),
+            Err(Over::Reserve)
+        );
     }
 
     #[test]

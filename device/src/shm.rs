@@ -52,15 +52,38 @@ struct Zone {
     /// disjoint and coalesced.
     free: BTreeMap<u64, u64>,
     /// Bytes each guest process holds of the zone, and how many it may
-    /// (quota.rs): half the zone, and the last eighth only while it holds
-    /// at most a sixteenth. One process mapping a whole zone left every
-    /// other process of the VM with ENOMEM (B2).
+    /// (quota.rs): by default half the zone, and the last eighth only
+    /// while it holds at most a sixteenth (`--window-owner-share`,
+    /// `Share::percent`). One process mapping a whole zone left every other
+    /// process of the VM with ENOMEM (B2).
     held: Ledger,
     share: Share,
+    /// What the zone has seen, for the teardown summary: operators size the
+    /// window by it.
+    peak: Peak,
+}
+
+/// The most of one zone ever in use, by everyone and by one process, and
+/// what was refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Peak {
+    /// Bytes in use at once.
+    pub used: u64,
+    /// Bytes one guest process held at once.
+    pub one_process: u64,
+    /// The largest single extent.
+    pub largest: u64,
+    /// Extents handed out.
+    pub allocs: u64,
+    /// Requests refused because the process held its share, or only the
+    /// reserve was left (quota.rs), and because no free extent was large
+    /// enough (the zone full, or fragmented).
+    pub refused_share: u64,
+    pub refused_space: u64,
 }
 
 impl Zone {
-    fn new(base: u64, size: u64) -> Self {
+    fn new(base: u64, size: u64, share: Share) -> Self {
         let mut free = BTreeMap::new();
         if size > 0 {
             free.insert(0, size);
@@ -70,7 +93,8 @@ impl Zone {
             size,
             free,
             held: Ledger::default(),
-            share: Share::half(size),
+            share,
+            peak: Peak::default(),
         }
     }
 
@@ -147,13 +171,121 @@ impl Zone {
     }
 }
 
+/// The shared window: its three zones' sizes, and how much of each one
+/// guest process may hold. One value sizes the allocator and answers the
+/// VMM's GET_SHMEM_CONFIG, so the two cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZoneConfig {
     pub uc_size: u64,
     pub wc_size: u64,
     pub wb_size: u64,
+    /// Percent of each zone one guest process may hold
+    /// ([`Share::percent`]); 50 is [`Share::half`].
+    pub owner_percent: u8,
 }
 
+const MIB: u64 = 1 << 20;
+
 impl ZoneConfig {
+    /// `--window-size`'s default, in MiB: [`ZoneConfig::default_1gib`].
+    pub const DEFAULT_MIB: u64 = 1024;
+    /// The smallest window, in MiB: a quarter of the default, whose
+    /// write-combining zone (192 MiB) still holds the largest single
+    /// mapping measured (56 MiB) with a share to spare.
+    pub const MIN_MIB: u64 = 256;
+    /// A window's size is a multiple of this, in MiB, so that every zone of
+    /// [`ZoneConfig::for_window`] is a whole number of 2 MiB pages.
+    pub const ALIGN_MIB: u64 = 64;
+    /// The largest one shared memory region crosvm takes
+    /// (`MAX_SHARED_MEMORY_REGION_SIZE`, patches/crosvm/0006), in MiB. The
+    /// window and the UVM aperture share one BAR there, so the two together
+    /// are held to it.
+    pub const MAX_REGION_MIB: u64 = 64 * 1024;
+    /// `--window-owner-share`'s default, and its bounds, in percent.
+    pub const DEFAULT_OWNER_PERCENT: u8 = 50;
+    pub const MIN_OWNER_PERCENT: u8 = 1;
+    pub const MAX_OWNER_PERCENT: u8 = 95;
+
+    /// The window `--window-size` and `--window-owner-share` ask for, or
+    /// why it cannot be had. `aperture` is the UVM aperture beside it in
+    /// bytes (0 without compute).
+    ///
+    /// How the zones grow past the default's 1 GiB (UC 32, WC 768, WB 224
+    /// MiB): the uncached zone stays at 32 MiB -- it holds registers (a
+    /// 64 KiB doorbell per channel user), whose number follows processes,
+    /// not how much memory they map -- and the write-back zone grows by an
+    /// eighth of what is added, the write-combining zone by the rest. A
+    /// write-back mapping that does not fit falls back to write-combining
+    /// (`NvidiaBackend::alloc_zone`), and never the other way. Below 1 GiB
+    /// all three shrink in proportion. At 1 GiB this is `default_1gib`
+    /// exactly. The numbers behind it are in DEPLOY.md, "Sizing the window".
+    pub fn for_window(
+        mib: u64,
+        owner_percent: u8,
+        aperture: u64,
+    ) -> std::result::Result<Self, String> {
+        if !(Self::MIN_OWNER_PERCENT..=Self::MAX_OWNER_PERCENT).contains(&owner_percent) {
+            return Err(format!(
+                "--window-owner-share {owner_percent}: a guest process's share of each zone is \
+                 {}-{} percent",
+                Self::MIN_OWNER_PERCENT,
+                Self::MAX_OWNER_PERCENT
+            ));
+        }
+        if mib < Self::MIN_MIB || mib % Self::ALIGN_MIB != 0 {
+            return Err(format!(
+                "--window-size {mib}: the window is at least {} MiB and a multiple of {} MiB",
+                Self::MIN_MIB,
+                Self::ALIGN_MIB
+            ));
+        }
+        let region = mib.saturating_mul(MIB).saturating_add(aperture);
+        if region > Self::MAX_REGION_MIB * MIB {
+            return Err(format!(
+                "--window-size {mib}: the window{} would be {} MiB, and crosvm takes at most {} MiB \
+                 of shared memory (MAX_SHARED_MEMORY_REGION_SIZE)",
+                if aperture > 0 {
+                    format!(" and the {} MiB UVM aperture", aperture / MIB)
+                } else {
+                    String::new()
+                },
+                region / MIB,
+                Self::MAX_REGION_MIB
+            ));
+        }
+        let d = Self::default_1gib();
+        let (uc, wb) = if mib >= Self::DEFAULT_MIB {
+            (d.uc_size, d.wb_size + (mib - Self::DEFAULT_MIB) * MIB / 8)
+        } else {
+            (
+                d.uc_size / Self::DEFAULT_MIB * mib,
+                d.wb_size / Self::DEFAULT_MIB * mib,
+            )
+        };
+        let cfg = Self {
+            uc_size: uc,
+            wc_size: mib * MIB - uc - wb,
+            wb_size: wb,
+            owner_percent,
+        };
+        debug_assert!(cfg.zones_aligned());
+        Ok(cfg)
+    }
+
+    /// Whether every zone is a whole number of 2 MiB pages, as the
+    /// allocator places a mapping at any page of its zone and the VMM maps
+    /// the window with huge pages where it can.
+    fn zones_aligned(&self) -> bool {
+        [self.uc_size, self.wc_size, self.wb_size]
+            .iter()
+            .all(|z| z % (2 * MIB) == 0)
+    }
+
+    /// The share of a zone of `size` bytes one guest process may hold.
+    pub fn share(&self, size: u64) -> Share {
+        Share::percent(size, self.owner_percent)
+    }
+
     /// Zone sizes chosen from measured driver behaviour, not guessed.
     ///
     /// Captured traces on a Tesla T4 (580.178.04) show every mapping these
@@ -198,6 +330,7 @@ impl ZoneConfig {
             uc_size: 32 * 1024 * 1024,
             wc_size: 768 * 1024 * 1024,
             wb_size: 224 * 1024 * 1024,
+            owner_percent: Self::DEFAULT_OWNER_PERCENT,
         }
     }
 
@@ -208,6 +341,7 @@ impl ZoneConfig {
             uc_size: 4 * 1024 * 1024,
             wc_size: 128 * 1024 * 1024,
             wb_size: 124 * 1024 * 1024,
+            owner_percent: Self::DEFAULT_OWNER_PERCENT,
         }
     }
 
@@ -227,6 +361,8 @@ pub struct ShmAllocator {
     window: Arc<Window>,
 
     total_size: u64,
+    /// `ZoneConfig::owner_percent`, for the summary.
+    owner_percent: u8,
 
     /// Who each live extent is charged to, and its charged length, by its
     /// offset.
@@ -252,11 +388,12 @@ impl ShmAllocator {
         let wb_base = cfg.uc_size + cfg.wc_size;
 
         Self {
-            uc: Zone::new(uc_base, cfg.uc_size),
-            wc: Zone::new(wc_base, cfg.wc_size),
-            wb: Zone::new(wb_base, cfg.wb_size),
+            uc: Zone::new(uc_base, cfg.uc_size, cfg.share(cfg.uc_size)),
+            wc: Zone::new(wc_base, cfg.wc_size, cfg.share(cfg.wc_size)),
+            wb: Zone::new(wb_base, cfg.wb_size, cfg.share(cfg.wb_size)),
             window,
             total_size: total,
+            owner_percent: cfg.owner_percent,
             owners: std::collections::HashMap::new(),
         }
     }
@@ -290,6 +427,7 @@ impl ShmAllocator {
             .admits(&zone.share, owner, want, in_use, zone.size)
             && why != crate::quota::Over::Pool
         {
+            zone.peak.refused_share += 1;
             return Err(DeviceError::Io(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 format!(
@@ -304,25 +442,68 @@ impl ShmAllocator {
             Some(offset) => {
                 zone.held.charge(owner, want);
                 self.owners.insert(offset, (owner, want));
+                let p = &mut zone.peak;
+                p.used = p.used.max(in_use + want);
+                p.one_process = p.one_process.max(zone.held.held(owner));
+                p.largest = p.largest.max(want);
+                p.allocs += 1;
                 Ok(ShmRegion {
                     offset,
                     length,
                     pgprot,
                 })
             }
-            None => Err(DeviceError::Io(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                format!(
-                    "SHM {:?} zone cannot satisfy {} bytes: {} free in total but \
-                     largest contiguous extent is {} ({} free extents)",
-                    pgprot,
-                    length,
-                    zone.free_bytes(),
-                    zone.largest_free(),
-                    zone.free.len()
-                ),
-            ))),
+            None => {
+                zone.peak.refused_space += 1;
+                Err(DeviceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!(
+                        "SHM {:?} zone cannot satisfy {} bytes: {} free in total but \
+                         largest contiguous extent is {} ({} free extents)",
+                        pgprot,
+                        length,
+                        zone.free_bytes(),
+                        zone.largest_free(),
+                        zone.free.len()
+                    ),
+                )))
+            }
         }
+    }
+
+    /// What each zone has seen since the allocator was made, as
+    /// `(uc, wc, wb)`.
+    pub fn peaks(&self) -> (Peak, Peak, Peak) {
+        (self.uc.peak, self.wc.peak, self.wb.peak)
+    }
+
+    /// One line an operator sizes the window by: each zone's size, the
+    /// most of it in use at once, the most one guest process held, the
+    /// largest mapping, and the refusals. Logged at teardown.
+    pub fn usage_summary(&self) -> String {
+        let mib = |b: u64| b as f64 / MIB as f64;
+        let zone = |name: &str, z: &Zone| {
+            let p = z.peak;
+            format!(
+                "{name} {:.0} MiB: peak {:.1} MiB in use, {:.1} MiB by one process, largest \
+                 {:.1} MiB, {} mappings, refused {} for the share and {} for space",
+                mib(z.size),
+                mib(p.used),
+                mib(p.one_process),
+                mib(p.largest),
+                p.allocs,
+                p.refused_share,
+                p.refused_space
+            )
+        };
+        format!(
+            "window {:.0} MiB, {}% per process: {}; {}; {}",
+            mib(self.total_size),
+            self.owner_percent,
+            zone("UC", &self.uc),
+            zone("WC", &self.wc),
+            zone("WB", &self.wb)
+        )
     }
 
     /// mmap a host fd into the SHM region at the given offset.
@@ -469,6 +650,7 @@ mod tests {
             uc_size: 4096 * 2,
             wc_size: 4096 * 4,
             wb_size: 4096 * 2,
+            owner_percent: 50,
         }
     }
 
@@ -487,6 +669,7 @@ mod tests {
             uc_size: 4096 * 16,
             wc_size: 256 * mib,
             wb_size: 4096 * 16,
+            owner_percent: 50,
         });
         let p = |t: u32| Owner::Proc {
             tgid: t,
@@ -698,5 +881,99 @@ mod probe_tests {
     fn a_file_that_cannot_be_mapped_at_all_is_left_to_the_placement() {
         let fd = crate::sys::fd::open(c"/dev/null", libc::O_RDONLY).unwrap();
         assert!(host_mapping_writable(fd.as_raw_fd(), 4096, 0));
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    const M: u64 = MIB;
+
+    fn zones(c: &ZoneConfig) -> (u64, u64, u64) {
+        (c.uc_size / M, c.wc_size / M, c.wb_size / M)
+    }
+
+    /// The default flags are the default window, exactly.
+    #[test]
+    fn the_default_window_is_todays_split() {
+        let c = ZoneConfig::for_window(ZoneConfig::DEFAULT_MIB, 50, 0).unwrap();
+        assert_eq!(c, ZoneConfig::default_1gib());
+        assert_eq!(zones(&c), (32, 768, 224));
+        assert_eq!(c.share(c.wc_size), Share::half(c.wc_size));
+        // With compute beside it too.
+        assert_eq!(
+            ZoneConfig::for_window(1024, 50, crate::uvmmap::APERTURE_MAX).unwrap(),
+            c
+        );
+    }
+
+    /// UC stays, WB takes an eighth of the growth, WC the rest; below the
+    /// default all three shrink in proportion. Every size allowed gives
+    /// whole 2 MiB zones that add up to it.
+    #[test]
+    fn the_zones_grow_mostly_write_combining() {
+        let at = |mib| zones(&ZoneConfig::for_window(mib, 50, 0).unwrap());
+        assert_eq!(at(256), (8, 192, 56));
+        assert_eq!(at(512), (16, 384, 112));
+        assert_eq!(at(4096), (32, 3456, 608));
+        assert_eq!(at(16384), (32, 14208, 2144));
+        assert_eq!(at(65536), (32, 57216, 8288));
+        for mib in (ZoneConfig::MIN_MIB..=65536).step_by(ZoneConfig::ALIGN_MIB as usize) {
+            let c = ZoneConfig::for_window(mib, 50, 0).unwrap();
+            assert!(c.zones_aligned(), "{mib}: {c:?}");
+            assert_eq!(c.total(), mib * M, "{mib}");
+            assert!(c.wc_size >= c.wb_size && c.wb_size >= c.uc_size, "{mib}");
+        }
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_had_is_refused_with_the_reason() {
+        let err = |mib, p, ap| ZoneConfig::for_window(mib, p, ap).unwrap_err();
+        assert!(err(128, 50, 0).contains("at least 256"));
+        assert!(err(1000, 50, 0).contains("multiple of 64"));
+        assert!(err(0, 50, 0).contains("at least"));
+        assert!(err(1024, 0, 0).contains("1-95"));
+        assert!(err(1024, 96, 0).contains("1-95"));
+        // crosvm's region cap: the window and the aperture together.
+        assert!(ZoneConfig::for_window(65536, 50, 0).is_ok());
+        let e = err(65536, 50, crate::uvmmap::APERTURE_MAX);
+        assert!(
+            e.contains("MAX_SHARED_MEMORY_REGION_SIZE") && e.contains("aperture"),
+            "{e}"
+        );
+        assert!(ZoneConfig::for_window(64512, 50, crate::uvmmap::APERTURE_MAX).is_ok());
+        assert!(err(u64::MAX / 2 & !63, 50, 0).contains("MAX_SHARED"));
+    }
+
+    /// A large share: one process takes nine tenths of a zone, and the
+    /// others still have the rest, each up to the floor.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
+    fn a_large_share_lets_one_process_take_most_of_a_zone() {
+        let c = ZoneConfig::for_window(1024, 90, 0).unwrap();
+        let mut a = ShmAllocator::new(c);
+        let p = |t| Owner::Proc {
+            tgid: t,
+            start_ns: 1,
+        };
+        let wc = PgprotKind::WriteCombine;
+        let s = c.share(c.wc_size);
+        let big = s.per_owner & !(PAGE_SIZE - 1);
+        a.alloc_for(big, wc, p(1)).unwrap();
+        assert!(a.alloc_for(big / 16, wc, p(1)).is_err(), "past its share");
+        let first = a.alloc_for(s.floor & !(PAGE_SIZE - 1), wc, p(2)).unwrap();
+        assert!(a.alloc_for(PAGE_SIZE, wc, p(2)).is_err(), "past the floor");
+        let (_, w, _) = a.peaks();
+        assert_eq!(w.used, big + first.length);
+        assert_eq!(w.one_process, big);
+        assert_eq!(w.largest, big);
+        assert_eq!((w.allocs, w.refused_share, w.refused_space), (2, 2, 0));
+        let line = a.usage_summary();
+        assert!(
+            line.starts_with("window 1024 MiB, 90% per process: UC 32 MiB"),
+            "{line}"
+        );
+        assert!(line.contains("WC 768 MiB: peak"), "{line}");
     }
 }

@@ -332,6 +332,7 @@ impl Vm {
             uc_size: 4096 * 4,
             wc_size: 4096 * 16,
             wb_size: 4096 * 8,
+            owner_percent: 50,
         });
         be.set_host_nodes_for_test(
             vec![DriDevice {

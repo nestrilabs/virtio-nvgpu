@@ -192,6 +192,7 @@ pub fn run(b: &mut Bytes<'_>) {
             uc_size: 4096 * 2,
             wc_size: 4096 * 4,
             wb_size: 4096 * 2,
+            owner_percent: 50,
         });
         let hello = HelloReq {
             proto: PROTO_V2,

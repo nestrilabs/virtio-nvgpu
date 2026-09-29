@@ -55,7 +55,7 @@ use device::pump::{EventQueue, Fill, Pump, PumpCmd, PumpHandle};
 use device::session::{
     BackendConfig, MAX_XFER_DIRECT, MAX_XFER_INDIRECT, Outcome, PendingIoctl2, Reply,
 };
-use device::shm::WindowPlacer;
+use device::shm::{WindowPlacer, ZoneConfig};
 use device::virtio::{EVENT_QUEUE, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
 use device::vring::{gather, layout, scatter};
 use device::wl::export::WlExport;
@@ -171,6 +171,29 @@ struct Args {
     /// "Compute").
     #[arg(long)]
     allow_compute: bool,
+
+    /// The shared window, in MiB: the guest-visible region device memory
+    /// is mapped into, which bounds how much GPU memory this VM's
+    /// processes can have CPU-mapped at once. A multiple of 64, at least
+    /// 256; with `--allow-compute`, at most 63 GiB (it shares crosvm's
+    /// 64 GiB region cap with the 1 GiB UVM aperture), else 64 GiB. nesbox
+    /// takes at most 32 GiB.
+    ///
+    /// Growth goes mostly to the write-combining zone, where video memory
+    /// is mapped: the uncached zone stays at 32 MiB, the write-back zone
+    /// grows by an eighth (DEPLOY.md, "Sizing the window"). The VMM sizes
+    /// its region from the backend (GET_SHMEM_CONFIG). What is CPU-mapped
+    /// also takes BAR1, which the host's desktop and other VMs share.
+    #[arg(long, value_name = "MIB", default_value_t = ZoneConfig::DEFAULT_MIB)]
+    window_size: u64,
+
+    /// The percent of each window zone one guest process may hold,
+    /// 1 to 95. At 50 (the default) two processes are needed to fill a
+    /// zone down to its reserve; from 88, one can (SECURITY.md, "The
+    /// window's size and share"). The reserve and floor keep the last of a
+    /// zone for processes that hold little of it either way.
+    #[arg(long, value_name = "PERCENT", default_value_t = ZoneConfig::DEFAULT_OWNER_PERCENT)]
+    window_owner_share: u8,
 
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
@@ -380,14 +403,15 @@ fn uvm_mmap_msg(aperture_offset: u64, len: u64, addr: u64) -> VhostUserMMap {
 /// match the capability the VMM publishes.
 const NV_SHM_ID: u8 = 1;
 
-/// The shared memory regions this device has, for a VMM that asks
-/// (GET_SHMEM_CONFIG; crosvm does, nesbox sizes both itself): the window,
-/// region 1, as large as the allocator's zones, and with `--allow-compute`
+/// The shared memory regions this device has, for the VMM (GET_SHMEM_CONFIG;
+/// crosvm sizes its BAR by it, and nesbox from virtio-nvgpu-v4 its window):
+/// the window, region 1, as large as the allocator's zones -- the same
+/// `ZoneConfig` the allocator was made from -- and with `--allow-compute`
 /// the UVM aperture, region 2, as large as the backend will place pools in.
 /// Region 0 is the "undefined" id a guest discards, so it is never used.
-fn shmem_config(allow_compute: bool) -> VhostUserShMemConfig {
+fn shmem_config(window: &ZoneConfig, allow_compute: bool) -> VhostUserShMemConfig {
     let mut sizes = [0u64; 3];
-    sizes[usize::from(NV_SHM_ID)] = device::shm::ZoneConfig::default_1gib().total();
+    sizes[usize::from(NV_SHM_ID)] = window.total();
     let mut n = 1;
     if allow_compute {
         sizes[usize::from(SHM_ID_UVM)] = device::uvmmap::APERTURE_MAX;
@@ -830,6 +854,9 @@ struct NvGpuBackend {
     scanned_fds: bool,
     /// `--allow-compute`, for the regions GET_SHMEM_CONFIG reports.
     allow_compute: bool,
+    /// The window the allocator was made with, which GET_SHMEM_CONFIG
+    /// reports.
+    window: ZoneConfig,
 }
 
 impl NvGpuBackend {
@@ -845,6 +872,7 @@ impl NvGpuBackend {
         config: BackendConfig,
         wayland: Wayland,
         allow_unmeasured: bool,
+        window: ZoneConfig,
     ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
@@ -861,7 +889,7 @@ impl NvGpuBackend {
         release_gate(&version, allow_unmeasured)?;
 
         let allow_compute = config.allow_compute;
-        let mut nvidia = NvidiaBackend::with_default_zones();
+        let mut nvidia = NvidiaBackend::with_zone_config(window);
         nvidia.set_abi_policy(abi_policy);
         nvidia.set_rm_allowlist(rm_allowlist);
         nvidia.set_config(config);
@@ -890,6 +918,7 @@ impl NvGpuBackend {
             mem_fds: Vec::new(),
             scanned_fds: false,
             allow_compute,
+            window,
         })
     }
 
@@ -1101,7 +1130,7 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
-        Ok(shmem_config(self.allow_compute))
+        Ok(shmem_config(&self.window, self.allow_compute))
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
@@ -1357,6 +1386,18 @@ fn release_gate(version: &str, allow_unmeasured: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The window `--window-size` and `--window-owner-share` ask for, beside
+/// the UVM aperture when compute is served, or why not.
+fn window_config(args: &Args) -> anyhow::Result<ZoneConfig> {
+    let aperture = if args.allow_compute {
+        device::uvmmap::APERTURE_MAX
+    } else {
+        0
+    };
+    ZoneConfig::for_window(args.window_size, args.window_owner_share, aperture)
+        .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))
+}
+
 fn main() -> anyhow::Result<()> {
     // Every call site metered (device::ratelimit): most of what is logged
     // here is something a guest did, and a guest can do it in a loop. Warnings
@@ -1375,6 +1416,24 @@ fn main() -> anyhow::Result<()> {
         eprintln!("vhost-user-nvgpu: {line}");
         log::warn!("{line}");
     }
+    // The window, from the flags: refused here, before anything is opened,
+    // if it cannot be had. The allocator and GET_SHMEM_CONFIG both take it.
+    let window = window_config(&args)?;
+    // Kept at the default log level when it is not the default window.
+    let level = if window == ZoneConfig::default_1gib() {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    };
+    log::log!(
+        level,
+        "window: {} MiB (UC {} MiB, WC {} MiB, WB {} MiB), {}% of each zone per guest process",
+        window.total() >> 20,
+        window.uc_size >> 20,
+        window.wc_size >> 20,
+        window.wb_size >> 20,
+        window.owner_percent
+    );
 
     // Before any thread exists: capabilities are per thread
     // (device::posture, S-5).
@@ -1565,6 +1624,7 @@ fn main() -> anyhow::Result<()> {
         config,
         wayland,
         args.allow_unmeasured_release,
+        window,
     )?));
     if let Some(s) = &inject {
         let shared = backend.read().expect("backend lock").shared.clone();
@@ -1716,20 +1776,61 @@ mod tests {
     /// region 2 only when compute is served; region 0 never.
     #[test]
     fn shmem_config_names_the_window_and_the_aperture_only_with_compute() {
-        let g = super::shmem_config(false);
+        let w = super::window_config(&args(&[])).unwrap();
+        let g = super::shmem_config(&w, false);
         let (n, sizes) = (g.nregions, g.memory_sizes);
         assert_eq!(n, 1);
         assert_eq!(sizes[0], 0);
         assert_eq!(sizes[1], 1 << 30);
         assert!(sizes[2..].iter().all(|&s| s == 0));
 
-        let c = super::shmem_config(true);
+        let w = super::window_config(&args(&["--allow-compute"])).unwrap();
+        let c = super::shmem_config(&w, true);
         let (n, sizes) = (c.nregions, c.memory_sizes);
         assert_eq!(n, 2);
         assert_eq!(sizes[0], 0);
         assert_eq!(sizes[1], 1 << 30);
         assert_eq!(sizes[2], device::uvmmap::APERTURE_MAX);
         assert!(sizes[3..].iter().all(|&s| s == 0));
+    }
+
+    /// `--window-size` and `--window-owner-share` make the one ZoneConfig
+    /// the allocator and GET_SHMEM_CONFIG are both given; the defaults are
+    /// today's window; a window that cannot be had stops the start.
+    #[test]
+    fn shmem_config_follows_the_window_flags() {
+        let d = super::window_config(&args(&[])).unwrap();
+        assert_eq!(d, ZoneConfig::default_1gib());
+
+        let a = args(&[
+            "--window-size",
+            "16384",
+            "--window-owner-share",
+            "90",
+            "--allow-compute",
+        ]);
+        let w = super::window_config(&a).unwrap();
+        assert_eq!((w.total(), w.owner_percent), (16 << 30, 90));
+        let c = super::shmem_config(&w, true);
+        assert_eq!(c.memory_sizes[1], 16 << 30);
+        assert_eq!(c.memory_sizes[2], device::uvmmap::APERTURE_MAX);
+        let be = NvidiaBackend::with_zone_config(w);
+        assert_eq!(be.shm_total_size(), c.memory_sizes[1]);
+
+        for bad in [
+            &["--window-size", "100"][..],
+            &["--window-size", "1000"],
+            &["--window-owner-share", "0"],
+            &["--window-owner-share", "96"],
+            &["--window-size", "65536", "--allow-compute"],
+        ] {
+            let e = super::window_config(&args(bad)).unwrap_err().to_string();
+            assert!(
+                e.starts_with("refusing to start: --window-"),
+                "{bad:?}: {e}"
+            );
+        }
+        assert!(super::window_config(&args(&["--window-size", "65536"])).is_ok());
     }
 
     use super::*;

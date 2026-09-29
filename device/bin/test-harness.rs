@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         uc_size: uc,
         wc_size: wc,
         wb_size: wb,
+        owner_percent: ZoneConfig::DEFAULT_OWNER_PERCENT,
     };
 
     let backend = Arc::new(Mutex::new(NvidiaBackend::new(cfg)));
