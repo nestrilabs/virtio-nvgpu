@@ -17,6 +17,31 @@ session open from another machine (the iGPU drives no monitor), and watch
 `journalctl -kf` there for `Xid`, `NVRM` and `nvidia` lines. The rig's own
 notes on this (`.rig/SAFETY-NOTES.md`, git-ignored, host-specific) go further.
 
+## Where the runs stand
+
+This file is the dated record of every hardware run; the README's "What is
+known to work" is the summary the other documents link to. Newest first,
+each on an RTX 5090 with 595.99.02, the sandbox on and the RM allowlist
+enforcing:
+
+| date | tree | what ran | section |
+|---|---|---|---|
+| 2026-09-29 | the 2026-09-29 review's backend fixes | Groups A and B under nesbox and crosvm, and a batch of live applications | "Regression of the 2026-09-29 review's backend fixes" |
+| 2026-09-29 | branch `perf` (nesbox `virtio-nvgpu-v5`, crosvm with `0010`) | Groups A and B under both VMMs, C and Rust modules, the benchmarks, part of the application pass | "Benchmarks" |
+| 2026-09-29 | branch `frame-timing` | frame pacing on a 240 Hz monitor, natively and in a guest; Group A and B1 (nesbox) | "Frame pacing" |
+| 2026-09-29 | branch `window-config2` | window sizes 1, 4 and 16 GiB, the map churn, seven applications | "Window size and share" |
+| 2026-09-26 | `integrate`, the 2026-09-26 review's fixes | Groups A and B under both VMMs, C and Rust modules | "Regression of the merged tree" |
+| 2026-09-26 | branch `capture-inject` | capture injection under both VMMs | "Capture injection" |
+| 2026-09-26 | the application pass | about 35 applications on the live desktop | "Application pass on the live desktop" |
+
+Not run on hardware: Group C (the compositor VM and export mode), hotplug,
+B6 (per-present crossings on a lease); a root run of the launcher, the
+socket-activated units and the VMM templates of `contrib/systemd`, nesbox
+`virtio-nvgpu-v6`'s jail, and crosvm `0010`'s spare vCPU under
+`--host-cpu-topology`. The structural changes after the 2026-09-29 review's
+fixes (the dispatcher and the capture injection split into modules, the
+launcher in pieces) have passed `scripts/ci.sh`, not yet a hardware run.
+
 ## The rig
 
 Everything is built into `.rig/` (git-ignored), laid out as
@@ -57,7 +82,7 @@ neither. The other knobs are listed in
 The rig runs one VM, as you: without root there is no other user to be, so
 the backend, nesbox and your desktop share a uid (`rig/run-guest.sh`'s
 header has what that gives up against a root run, where each VM takes users
-of its own from a pool, and SECURITY.md §4 has what the uids separate). What
+of its own from a pool, and SECURITY.md, "One uid per VM", has what the uids separate). What
 still applies: the backend's sandbox -- a user and network namespace of its
 own, Landlock, seccomp (`device/src/sandbox.rs`) -- and nesbox leaving the
 host's network (`"unshare-network"` in the run's config). A missing kernel
@@ -273,7 +298,7 @@ starts the main process in a user and network namespace of its own
 `nvgpu frontend jailed` when it is. `NVGPU_CROSVM_SANDBOX=off` runs
 `--disable-sandbox`, and says so at the top of the console log; the
 frontend is then in the main process, and the main process's checks
-(SECURITY.md §16) still hold.
+(SECURITY.md, "The VMMs") still hold.
 
 Not under crosvm yet: a virtiofs share, and the root layout.
 
@@ -313,7 +338,7 @@ checks each pool and hands it to the main process, which checks it again,
 maps `/dev/nvidia-uvm` at the pool's own address over the band it reserved
 at start-up ([4 GiB, 32 TiB)), checks the pages with `mincore`, and adds the
 slot; withdrawal removes the slot, then puts the reservation back
-(SECURITY.md §16). What to run, in this order, each against nesbox's result
+(SECURITY.md, "The VMMs"). What to run, in this order, each against nesbox's result
 on the same tree:
 
 ```sh
@@ -384,7 +409,9 @@ whole run); B2 `lease` 9/0/1; B3 `vkdisplay` 8/0/1; B4 `secneg` on the lease
 6/0/0 (inside it, KMS on the lease 15 passed, 0 failed); B5 the lease round
 trip, DP-3 back to Hyprland after each lease. The skips: `kmscube` fails with
 EINVAL and `vkcube --wsi display` crashes, both the same on the host natively.
-B6 (performance) has not run.
+B6 (per-present crossings on a lease) has not run. The Wayland present path's
+count (W2) came out of the frame-pacing counters instead: 17 round trips per
+presented frame (DEPLOY.md, "Frame pacing").
 
 ## Application pass on the live desktop
 
@@ -480,13 +507,14 @@ behind it too, through the same session controls.
 
 No run under either VMM stopped the backend's seccomp filter (status 159),
 and no guest oops or host Xid was seen. Refusals and what was done with each
-are in SECURITY.md §12, "Added from the application pass".
+are in SECURITY.md, "The RM allowlist", and the application pass in its
+review history.
 
 ### Fixed on the way
 
 - The CUDA runtime and NVENC: six GSS legacy RM controls the allowlist did
   not have (cudart's clock queries, NVENC's session setup); added, each held
-  to its measured size (`16f9235`, SECURITY.md §12).
+  to its measured size (`16f9235`, SECURITY.md, "The RM allowlist").
 - VA-API: the guest's render node answered DRM_CAP_DUMB_BUFFER with
   -EOPNOTSUPP, which nvidia-vaapi-driver takes for `nvidia_drm.modeset=0`;
   it now answers 0, as a modeset device without dumb buffers (`0202233`).
@@ -632,6 +660,29 @@ enforcing and the backend's sandbox on:
 | `lease` | 9/0/1 | 9/0/1 | 9/0/1 |
 | `vkdisplay` | 8/0/1 | 8/0/1 | 8/0/1 |
 | `secneg`, `kms=lease` | 6/0/0; KMS 15 passed | the same | the same |
+
+## Regression of the 2026-09-29 review's backend fixes
+
+The backend with the 2026-09-29 review's fixes (every one with a test that
+fails without it), under nesbox and crosvm alike, RM allowlist enforcing and
+the backend's sandbox on:
+
+| probe | result |
+|---|---|
+| `stage1` | 6/0/0 |
+| `compat` | 12/0/0 |
+| `render`, `NVGPU_COMPUTE=1` | 9/0/1, cuda-smoke PASS |
+| `wayland`, live Hyprland | 13/0/1 |
+| `secneg`, `kms=none` | ctl + render 10 passed, 5 skipped |
+| `lease` | 9/0/1 |
+| `vkdisplay` | 8/0/1 |
+| `secneg`, `kms=lease` | 6/0/0; KMS 15 passed |
+| live applications (glxgears, vkmark, stk, chromeanim) | 11/0/0 |
+
+The guest's PCI config space from a root snapshot (`--pci-config-dir`) was
+shown with a synthetic snapshot, since the rig has no root: the guest's
+`lspci -vvv` reads `Capabilities: [40] Null` without it, and the snapshot's
+PCIe capability and link with it.
 
 ## Window size and share
 

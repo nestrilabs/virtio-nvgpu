@@ -40,14 +40,25 @@ nvidia-drm's semaphore-surface fences go through. For `--allow-compute`,
 `nvidia_uvm` loaded at boot: the unit's `ProtectKernelModules=` and the
 backend's `no_new_privs` keep it from being loaded on demand. The host RM
 must keep each client to the file it was made on (the default): the backend
-asks at start and refuses to run otherwise (SECURITY.md §11, R3).
+asks at start and refuses to run otherwise (SECURITY.md, R3).
 
 **The exact-measured-release rule.** The backend starts only on a host driver
 release every one of its tables was measured at (`device/src/release.rs`):
 the RM allowlist and the NVKMS schema of that very release, a UVM table whose
 range holds it, and an ABI profile measured through it. Today that is
-**535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04 and 615.71.09**.
-Any other release is refused at start with a line naming what it lacks.
+**535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04 and 615.71.09**:
+
+| host release | RM allowlist, NVKMS schema | ABI profile | UVM table |
+|---|---|---|---|
+| `535.129.03` | its own | `535.129.03` | its own |
+| `580.178.04` | its own | `580.178.04` | its own |
+| `595.71.05` | its own | `595.71.05` | its own |
+| `595.99.02` | its own | `595.71.05` | its own |
+| `610.57.04` | its own | `595.71.05` | its own |
+| `615.71.09` | its own | `595.71.05` (measured through 615.71.09) | its own |
+
+Any other release is refused at start with a line naming what it lacks; a
+host older than 535.129.03 is refused whatever the flags.
 `--allow-unmeasured-release` (diagnostic) runs a newer or in-between host on
 the nearest older tables without compute; it is for getting through an
 upgrade, not for running tenants. The guest's NVIDIA userspace must be the
@@ -55,7 +66,7 @@ host's own release, exactly, as it must natively.
 
 **IOMMU.** The GPU stays with the host's driver, in the host's IOMMU domain;
 the guest gets the driver's interface, not the device, so the IOMMU is not a
-boundary between a guest and the host here (SECURITY.md §2). Leaving DMA
+boundary between a guest and the host here (SECURITY.md, "Threat model"). Leaving DMA
 translation on (`amd_iommu=on` / `intel_iommu=on`, not `iommu=pt`) still
 holds the GPU to what the host driver mapped for it, which is defence in
 depth against a bad GPU page table; nothing in this project needs either
@@ -74,13 +85,9 @@ run so far was on AMD.
 
 A new NVIDIA release is refused until it is measured. Before upgrading a host:
 
-1. Measure the release from its published sources (`gen/README.md`, "A new
-   host release"): `gen/rmallow_extract.py extract`, `gen/nvkms_extract.py
-   extract`, `gen/uvm_extract.py extract` and `scan`, `gen/rmctrl_extract.py
-   extract`, then the renders and `gen/schema_gen.py`; move
-   `MEASURED_THROUGH` in `gen/src/versions/mod.rs` once gVisor's nvproxy (or a
-   capture in `gen/fixtures/`) shows the RM escapes unchanged, or add a
-   profile (`gen/nvabi_gen.py`) if they moved.
+1. Measure the release from its published sources: `gen/README.md`, "A new
+   host release", has the extractors to run and when to move
+   `MEASURED_THROUGH` (or add a profile, `gen/nvabi_gen.py`).
 2. Run `scripts/gen-check.sh` (network access; `GVISOR=<checkout>` to include
    the ABI profiles): every checked-in table must still be what its extractor
    produces.
@@ -89,7 +96,7 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 4. Run the new release on a test host through the application workloads you
    serve, with `--rm-allowlist=log` only there, and read the teardown's
    `RM allowlist ... refused` lines: a control the new release's userspace
-   needs and the allowlist lacks is a policy decision (SECURITY.md §12), not
+   needs and the allowlist lacks is a policy decision (SECURITY.md, "The RM allowlist"), not
    something to allow by default.
 5. Ship the backend and the guest images together, then upgrade the host
    driver and reboot. A backend that starts logs the tables it chose on one
@@ -116,7 +123,7 @@ patched Hyprland 0.56.2 ([`patches/`](patches/)) as the host compositor. The
 compositor-VM and export modes (rig/TESTING-RIG.md, "Group C") need the host
 desktop stopped, and have run only in unit and loopback tests: treat them as
 unsupported until they have run. What each VMM checks of the backend's
-mapping requests: SECURITY.md §16.
+mapping requests: SECURITY.md, "The VMMs".
 
 A VMM other than these two must do what README.md, "What a VMM must do, over
 vhost-user", lists.
@@ -124,7 +131,7 @@ vhost-user", lists.
 ## Per-VM users
 
 Each VM's host processes are users of their own, so that no two VMs are one
-principal to the kernel or to RM (SECURITY.md §4, "One uid per VM"). Slot N
+principal to the kernel or to RM (SECURITY.md, "One uid per VM"). Slot N
 is two system users:
 
 - `nvgpu-vmN`, in group `nvgpu-vmN`: the backend. It needs no supplementary
@@ -167,7 +174,7 @@ group, in a directory of root's, and hands it to the backend (socket
 activation; the backend takes `LISTEN_FDS`, or `--socket-fd N`). The
 backend's user owns neither the socket nor its directory, so nothing else
 running as that user can replace the socket or intercept the VMM's
-connection (SECURITY.md §22). The service starts the socket unit
+connection (SECURITY.md, "The backend's socket"). The service starts the socket unit
 (`Requires=`); install both. Per-VM flags go in `/etc/virtio-nvgpu/vmN.env`
 as `NVGPU_BACKEND_ARGS="--allow-compute"` (one word per flag: systemd
 splits the variable at spaces). Raise `MemoryMax` with
@@ -211,7 +218,7 @@ prefault what they place in the window -- nesbox from branch
 `virtio-nvgpu-v5`, crosvm with `patches/crosvm/0010` -- on a host kernel
 with `KVM_PRE_FAULT_MEMORY` (6.11 or later): without it a guest's first
 write to fresh video memory runs at about a tenth of the host's speed, one
-second-level fault a page (BENCHMARKS.md; SECURITY.md §21). Guest
+second-level fault a page (BENCHMARKS.md; SECURITY.md, "Prefaulting the window"). Guest
 RAM is committed at boot. The window is the configured size (`--window-size`,
 1 GiB by default), and with compute the UVM aperture another 1 GiB; what
 the window costs in host memory depends on the VMM ("Sizing the window").
@@ -324,7 +331,7 @@ of a process's default WB share, so WB keeps its proportion rather than
 staying put; WC takes most of the growth because it has to hold its own
 and WB's overflow, and because the one workload known to exhaust a default
 window did it in WC (a Minecraft launcher on this GPU, in part through a
-backend defect since fixed, SECURITY.md §19). On an older T4, CUDA peaked
+backend defect since fixed, SECURITY.md, "The window's size and share"). On an older T4, CUDA peaked
 at 68 MiB and an NVENC encode at 116 MiB, before system memory was told
 apart from video memory.
 
@@ -334,7 +341,7 @@ failed` for a VM, or its `window use:` line shows a process near its share
 steps of 64 MiB; `--window-owner-share` above 50 lets one process have
 most of each zone, which suits a VM that runs one application and takes
 from the VM's other processes the chance to map much at once
-(SECURITY.md §19: from 88 %, one process can leave the others only the
+(SECURITY.md, "The window's size and share": from 88 %, one process can leave the others only the
 reserve).
 
 **What it costs the host.**
@@ -405,7 +412,7 @@ thread ever polled. The guest also kicked the event queue for every batch it
 handed back, and the queue thread slept between the requests of one
 present. Syncobj waits were not it: they were ready at the first poll or
 woken by their registration; none reached the registration caps
-(SECURITY.md §17) or fell back to the polling backoff, and the pump's 1 ms
+(SECURITY.md, "Resource caps") or fell back to the polling backoff, and the pump's 1 ms
 sweep found almost nothing. Nor was the present path: FIFO pacing on an idle
 host matched native, and so did gamescope's.
 
@@ -453,7 +460,7 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   5 with `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`), and on an
   idle host its mailbox p99 was 1.4 ms against 0.44. It is a side-channel
   mitigation between the guest and host tasks on SMT siblings
-  (SECURITY.md §20): turn it off only on a single-tenant desktop. Even so
+  (SECURITY.md, "Frame pacing"): turn it off only on a single-tenant desktop. Even so
   crosvm ran a mailbox vkcube at about 3,300 fps to nesbox's 4,500.
 - **vCPUs**: 2, 4 and 8 paced the same for these workloads; give a game what
   it uses in parallel, no more.
@@ -478,8 +485,8 @@ vkmark, native gamescope (it cannot start inside the Claude sandbox), a
 
 ## Capture injection
 
-A guest application's screen share, zero-copy (ARCHITECTURE.md §17,
-SECURITY.md §18). The backend provides one primitive: a host buffer made a
+A guest application's screen share, zero-copy (ARCHITECTURE.md and
+SECURITY.md, "Capture injection"). The backend provides one primitive: a host buffer made a
 guest dma-buf. The two programs around it are the integrator's: a **capture
 helper** on the host, one per VM, and a **capture daemon** in the guest. The
 rig's `rig/rig-tools/nvgpu-inject-test.c` and
@@ -605,7 +612,7 @@ shows the diagnostic ones too.
 | `--socket-fd N` | none | serve the vhost-user socket already listening on descriptor N, bound by whoever started the backend (the root launcher does this) |
 | `--allow-compute` | off | serve CUDA and other compute: `/dev/nvidia-uvm`, the UVM aperture, memory registered by its pages. Graphics, Vulkan Video and display need none of it |
 | `--window-size MIB` | 1024 | the shared window: how much GPU memory the VM's processes can have CPU-mapped at once. A multiple of 64, at least 256; with `--allow-compute` at most 64512 (window and aperture share crosvm's 64 GiB region cap), else 65536; nesbox takes at most 32768. Refused at start otherwise ("Sizing the window") |
-| `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md §19) |
+| `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md, "The window's size and share") |
 | `--kms-card` | off | compositor-VM mode: offer the host's card nodes to the guest. Only for a host with no compositor of its own. Not run on hardware |
 | `--wayland-socket PATH` | none | the host compositor's socket, for the Wayland proxy |
 | `--wayland-lease` | off | offer the compositor's `wp_drm_lease_device_v1` (this GPU's card only) |
@@ -746,7 +753,7 @@ as root by default and is not a model for a production image.
   extensions but cannot create a device with them, natively as well; an app
   that enables every one it is offered fails in a graphics-only guest.
 - Two CUDA processes whose UVM semaphore pools want the same host address:
-  the second context fails with ENOMEM (ARCHITECTURE.md §18).
+  the second context fails with ENOMEM (ARCHITECTURE.md, "What this design cannot do").
 - crosvm with a virtiofs share (no read-only mode), and crosvm
   `--allow-compute` without patches `0007`-`0009`.
 - More than four guests on one card has not been tried.

@@ -62,7 +62,7 @@ programs natively and in nesbox and crosvm guests,
 3% of bare metal, 4.7 ms and above within 1%; CUDA, OpenCL, NVDEC, NVENC and
 every copy between host and GPU at native speed. What crosses to the host
 costs a round trip each -- an RM call about 2 µs more than natively, a CPU
-mapping of GPU memory about twice as long, a wait that sleeps 12-16 µs more --
+mapping of GPU memory about 2-3 times as long, a wait that sleeps 12-16 µs more --
 so starting a Vulkan device takes about 1.4 times as long.
 
 ### Several guests on one card
@@ -77,40 +77,33 @@ once**, each paced at exactly 60 Hz, with no NVENC session limit reached.
 
 Four is what was run, not a limit found.
 
-### Driver versions
-
-Measured on **595.99.02**, and the current code run there on an RTX 5090; an
-A2000 on **615.71.09** rendered on the code before protocol v2. The backend
-starts only on a host release every one of its tables was measured at:
-535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04 and 615.71.09.
-Details below.
-
 ### What is known to work
 
-Run on an **RTX 5090, driver 595.99.02**, on the current code (2026-09-26),
-under both nesbox and crosvm, with the RM allowlist enforcing and the
-backend's sandbox on ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)):
+This is the one status table; [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md),
+"Where the runs stand", has every run with its date and its results. Every
+run below was on an **RTX 5090 with driver 595.99.02**, on an AMD host,
+with the RM allowlist enforcing and the backend's sandbox on, last on
+2026-09-29.
 
-- a guest enumerates the card — `nvidia-smi` reports real power and memory, and
-  the `deviceUUID` is the host's
-- Vulkan, OpenGL and EGL render; offscreen draws are pixel-correct
-- CUDA with `--allow-compute`, under nesbox and under crosvm (whose nvgpu
-  frontend runs jailed); without it the guest has no UVM device and CUDA
-  finds no GPU, cleanly
-- guest applications as clients of the live host Hyprland, with a fullscreen
-  guest window scanned out directly; a monitor leased to the guest and driven
-  with KMS; `VK_KHR_display` on that lease; the lease handed back
-- the security negatives, on the control and render nodes and on a leased card
-- about 35 real applications, as an unprivileged guest user with the browsers'
-  sandboxes on, shown on the live desktop: games (SuperTuxKart, Neverball,
-  Godot), Blender (EEVEE, and Cycles on CUDA/OptiX), GIMP, Inkscape, Krita,
-  LibreOffice, Firefox, Chromium, Electron, mpv, ffmpeg with Vulkan Video,
-  NVENC, NVDEC and VA-API, OpenCL
-- the guest module with its parsers in Rust, through the same regression
+| what | nesbox | crosvm |
+|---|---|---|
+| a guest enumerates the card (`nvidia-smi` with real power and memory, the host's `deviceUUID`); Vulkan, OpenGL and EGL render, offscreen draws pixel-correct | run | run |
+| CUDA with `--allow-compute`; without it no UVM device, and CUDA finds no GPU, cleanly | run | run (the nvgpu frontend jailed) |
+| Wayland client of the live host Hyprland, a fullscreen guest window scanned out directly | run | run |
+| a monitor leased to the guest and driven with KMS, `VK_KHR_display` on it, the lease handed back | run | run |
+| the security negatives, on the control and render nodes and on a leased card | run | run |
+| about 35 applications as an unprivileged guest user, browsers' sandboxes on, on the live desktop: SuperTuxKart, Neverball, Godot, Blender (EEVEE, and Cycles on CUDA and OptiX), GIMP, Inkscape, Krita, LibreOffice, Firefox, Chromium, Electron, mpv, ffmpeg with Vulkan Video, NVENC, NVDEC and VA-API, OpenCL | run | run |
+| capture injection, with the rig's own helper and daemon | run | run |
+| the guest module with its Rust parsers (the default) and its C ones | run | run |
+| frame pacing on a monitor (the Wayland mode) | measured | measured |
+| the compositor VM (`--kms-card`), export mode, hotplug | **not run** | **not run** |
+| a root run of the launcher, the socket-activated units, the VMM templates | **not run** | **not run** |
 
-Run earlier on an RTX 3060 (595.99.02), before protocol v2: every number in
-[`BENCHMARKS.md`](BENCHMARKS.md), four guests on one card, and NVENC through
-Vulkan Video encoding on the client's own device.
+Earlier, on an RTX 3060 (595.99.02) before protocol v2: every number in
+[`BENCHMARKS.md`](BENCHMARKS.md)'s section on it, four guests on one card,
+and NVENC through Vulkan Video encoding on the client's own device. An RTX
+A2000 on 615.71.09 enumerated and rendered on the code before protocol v2.
+The driver releases the backend starts on are in [Driver versions](#driver-versions).
 
 ### Display
 
@@ -132,136 +125,50 @@ sync to go with them:
    drives the host's card, and applications on the host or in other VMs reach
    it through the same proxy in *export* mode.
 
-**Modes 1 to 3 have run on hardware**: an RTX 5090 on 595.99.02, under nesbox
-and crosvm, against the live patched Hyprland (0.56.2), with explicit sync in
-the Wayland mode and a lease handed back and taken again. **Mode 4, and export
-mode, have not**: they need the desktop stopped (rig/TESTING-RIG.md, "Group C").
-No mode has been timed yet.
-[`TESTING.md`](TESTING.md) is the plan, stage by stage; how to turn each mode
-on: [Display](#display).
+**Modes 1 to 3 have run on hardware**, against the live patched Hyprland
+(0.56.2); **mode 4, and export mode, have not**: they need the desktop
+stopped ([What is known to work](#what-is-known-to-work)). Only the Wayland
+mode's frame pacing has been timed ([`DEPLOY.md`](DEPLOY.md), "Frame
+pacing"). [`TESTING.md`](TESTING.md) is the plan, stage by stage; how to
+turn each mode on: [Display](#display).
 
 ### What a guest can reach
 
 Worth stating plainly, because it is the first question a security person asks
 and the honest answer is not "nothing". [`SECURITY.md`](SECURITY.md) is the
-full account; this is the summary.
+full account, and its "Summary" the short one; this is shorter still.
 
-There is **no IOMMU boundary** between guest GPU work and the host. The card
-belongs to the host's NVIDIA driver and sits in the host's IOMMU domain; the
-guest gets the driver's ioctl interface, not the device. What separates a guest
-from host memory is the GPU's own MMU, with page tables RM programs on the
-guest's behalf — so **the host NVIDIA driver is in the TCB**. The guest also
-authors its own command streams, which is exactly why there is no per-submission
-cost. The guest kernel is untrusted: everything that protects the host is
-decided by the backend, from its own tables, never from a layout the guest
-sent.
+- There is **no IOMMU boundary** between guest GPU work and the host. The
+  guest gets the host NVIDIA driver's ioctl interface, not the device, and
+  what separates a guest from host memory is the GPU's own MMU, with page
+  tables RM programs: **the host NVIDIA driver is in the TCB**.
+- The guest kernel is untrusted. Everything that protects the host is
+  decided by the backend, from its own tables, never from a layout the guest
+  sent: ioctls the tables do not describe are refused; every pointer field
+  the tables, measured per release, say the host follows is pointed at a
+  buffer of the backend's or zeroed; guest descriptor numbers are translated
+  or refused, but for a few inside RM control parameters; and RM controls
+  and classes are allow-listed per driver release, default deny.
+- **The backend runs unprivileged**, because RM, DRM and NVKMS take a
+  guest's privilege from its credentials: it refuses root and
+  `CAP_SYS_ADMIN`, drops every capability, sandboxes itself (a network
+  namespace, Landlock, seccomp) before the first guest message, and runs as
+  a user of its own per VM ([`DEPLOY.md`](DEPLOY.md)).
+- **Compute is opt-in** (`--allow-compute`): without it the guest has no
+  UVM device and no memory registered by its pages.
+- RM objects stay with the guest process that made them, the display paths
+  are held to leases, grants and the VM's own framebuffers, and the Wayland
+  allowlist is enforced on the host.
+- Not done: the per-guest isolate, so the backend holds the host
+  descriptors in the process that maps guest memory; the open items are
+  [`SECURITY.md`](SECURITY.md)'s "Open items and residual risk".
 
-**The backend must run unprivileged.** RM, DRM and NVKMS take a guest's
-privilege from the credentials of the process that calls them, and that process
-is the backend: run as root, every guest process would be an RM administrator
-with all of BAR0 mappable — the host kernel, one DMA away. So the backend
-refuses to start as root or with `CAP_SYS_ADMIN` unless told
-`--allow-root-unsafe` (a diagnostic flag), and drops every capability before
-its first thread in any case. In production each VM's backend runs as a user
-of its own (`nvgpu-vm0`, `nvgpu-vm1`, ...), with the VMM as the slot's
-`nvgpu-vmm0`, ..., from the shipped systemd unit or NixOS module, in a cgroup
-of its own with a memory bound ([`DEPLOY.md`](DEPLOY.md)); the rig's launcher,
-[`rig/run-guest.sh`](rig/run-guest.sh), does the same through
-`setpriv` when run as root, and in the Wayland modes runs it as the owner of
-the compositor's socket or of the export directory ([Display](#display)).
-Its socket defaults to
-`$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock`, in a directory only it can enter, because
-whoever listens there is handed the guest's memory.
-
-Before the first guest message the backend sandboxes itself
-([`device/src/sandbox.rs`](device/src/sandbox.rs)): a network namespace of its
-own, Landlock confining it to the GPU's nodes and the few files it reads, and a
-seccomp syscall allowlist that kills on anything else. A layer the host kernel
-lacks is logged as `sandbox: DEGRADED` and stops the start;
-`--sandbox=best-effort` runs without it and `--sandbox=off` (or
-`NVGPU_SANDBOX=off` for the launcher) without any, both diagnostic flags
-(`--diagnostic`).
-[SECURITY.md](SECURITY.md) §4 has what each layer and the per-VM uid do and do
-not stop.
-
-What narrows the surface today:
-
-- ioctls the ABI profile does not describe are **refused**, not forwarded
-  (`--permissive-abi` turns that off for diagnosis, and says so loudly)
-- **no guest pointer reaches the host driver as a pointer.** The backend makes
-  every host call itself, so a pointer the guest left in a parameter block
-  would be an address in the VMM. Each pointer field the host follows -- RM's
-  parameter blocks, the pointers RM follows inside control parameters, the
-  NVKMS and nvidia-drm nested blocks -- is pointed at a buffer of the
-  backend's or zeroed, whatever the ABI policy; escapes whose pointers cannot
-  be relocated (IOCTL_XFER_CMD, IDLE_CHANNELS, ACCESS_REGISTRY, I2C_ACCESS,
-  GET_EVENT_DATA) are refused (`device/src/guestptr.rs`)
-- **compute is opt-in.** Everything only CUDA needs -- `/dev/nvidia-uvm`,
-  UVM's sharing mode and aperture, memory registered by its pages -- is served
-  only with `--allow-compute` (`rig/run-guest.sh --allow-compute`, or
-  `NVGPU_COMPUTE=1`). Without it the guest has no UVM device and CUDA finds no
-  device; Vulkan, OpenGL, EGL, Vulkan Video and display need none of it
-  ([`SECURITY.md`](SECURITY.md), "Compute")
-- **RM objects stay with the guest process that made them.** A duplicate
-  between two clients follows RM's own rule with guest processes in place of
-  the backend's one, and a second client named in parameters is held to RM's
-  rule for that field (the same process, or the same euid where RM checks its
-  security token). The guest kernel says which process and euid make each
-  call; a guest that cannot is refused both (`device/src/rmshare.rs`)
-- **memory the guest registers with the GPU travels as its pages, not its
-  address.** RM pins what an address maps in the calling process -- the
-  VMM -- so the guest driver pins the caller's range and sends the
-  guest-physical pages instead; the backend checks each is guest RAM and hands
-  RM its own mapping of exactly those pages, and the guest keeps them pinned
-  until RM has let go (`device/src/osdesc.rs`; `--allow-compute` only)
-- **guest descriptor numbers are translated, not forwarded.** A file named
-  inside RM escape, UVM, NVKMS or DRM parameters becomes the backend's own
-  descriptor for that file, or the call is refused; a few descriptors inside
-  RM control parameters are not translated yet ([`SECURITY.md`](SECURITY.md))
-- UVM (`--allow-compute` only) runs with pageable memory access forced off, so the GPU cannot fault in
-  the VMM's own pages, and takes only the commands that name UVM's ranges, RM
-  handles or GPU state, each held to a block size measured per release: the
-  tools device, and every command that copies through, pins or populates CPU
-  memory, is refused
-- NVKMS and nvidia-drm go through **per-release tables** and a policy of the
-  backend's own: a guest outside compositor-VM mode flips and sets modes only
-  on heads the host granted it through a lease, and those grants end when the
-  lease does
-- KMS on a lease or card is schema-checked call by call, and a guest may scan
-  out only framebuffers its own VM made — never the host compositor's
-- the Wayland proxy enforces its allowlist **on the host**, whatever the guest
-  daemon did, and bounds what each VM may hold (channels, shared memory,
-  queued output, lease requests)
-- the RM controls that list every GPU process on the host, with PIDs and
-  memory use, are answered by the backend with the refusal RM gives an
-  unprivileged caller; running each backend in its own PID namespace makes RM
-  itself show the backend alone
-
-- `RM_ALLOC` classes and RM control commands are **allow-listed per driver
-  release**, default deny: what reaches RM is what NVIDIA's own userspace was
-  seen to use and the sources show to be safe ([`SECURITY.md`](SECURITY.md)
-  §12). The list enforces by default; `--rm-allowlist=log` is a diagnostic
-  flag
-
-What does not, yet:
-
-- the backend holds the host descriptors itself, in the process that maps the
-  guest's memory; the unprivileged per-guest isolate is designed and unbuilt
-- the display paths have open items of their own, listed in
-  [`SECURITY.md`](SECURITY.md)
-
-**Guest system memory is GPU-coherent now.** RM allocates system memory with
-the CPU cache type the client asks for, uncached by default. On an **Intel**
-host, KVM maps guest RAM write-back whatever the guest's page attributes say,
-unless the VMM disables `KVM_X86_QUIRK_IGNORE_GUEST_PAT` — so a guest would
-cache memory the GPU reads and writes without snooping, and see stale data. The
-backend therefore allocates guest system memory write-back, makes every GPU
-mapping of it snoop, and puts the caller's own bits back in every reply.
-`--keep-guest-coherency` turns that off, for ruling it out while chasing
-something. Display memory is left as its client allocated it (NVKMS's answer
-to which kind to allocate is narrowed to the coherent one), so on Intel the VMM
-should still disable the quirk; the backend says so at startup. AMD's nested
-paging honours the guest's page attributes and needs none of this.
+**Guest system memory is GPU-coherent.** On an Intel host KVM ignores the
+guest's page attributes unless the VMM disables a quirk, so the backend
+makes every GPU mapping of guest system memory snoop; display memory a
+client allocates non-coherent stays exposed there, and the backend says so
+at start ([`ARCHITECTURE.md`](ARCHITECTURE.md), "Memory types, and
+coherency"; the operator's side in [`DEPLOY.md`](DEPLOY.md)).
 
 **This is attack-surface reduction, not hardware isolation.** VFIO passthrough
 with an IOMMU is strictly stronger — it constrains the device to the guest's own
@@ -271,8 +178,9 @@ memory — and for mutually untrusted tenants that or vGPU is still the answer.
 
 - **the compositor-VM and export modes on hardware**, and hotplug: they need
   the host desktop stopped, and have run only in unit and loopback tests.
-- **re-measuring on protocol v2.** Every number above predates it, and no
-  display path has been timed.
+- **per-present crossings on a lease**, and several guests on one card on
+  the current code: the per-present count was taken only for the Wayland
+  mode (17 round trips a frame, [`DEPLOY.md`](DEPLOY.md), "Frame pacing").
 - **more than four guests**, or several guests doing anything heavier than
   vkcube at 720p. Four share the card evenly; eight has not been tried.
 - **one driver release on the current code.** 595.99.02 (RTX 5090 and, before
@@ -363,7 +271,7 @@ must:
   `KVM_PRE_FAULT_MEMORY` (6.11): without it a guest's first write to fresh
   video memory runs at about a tenth of the host's speed, one second-level
   fault a page. Both VMMs below do it through a spare vCPU that never runs,
-  with an id past every guest vCPU's (SECURITY.md §21, §22).
+  with an id past every guest vCPU's (SECURITY.md, "Prefaulting the window").
 - **Give the window write-back in the guest's MTRRs** (default type WB with
   the 32-bit PCI hole UC, on every vCPU), or the guest driver warns that
   the window "is not write-back in this guest's MTRRs".
@@ -372,7 +280,7 @@ must:
   that), on a PCI host bridge of its own, so a guest with a bridge on that
   bus number has no GPU device.
 - For compute only, the **UVM aperture** (region 2): see
-  [`ARCHITECTURE.md`](ARCHITECTURE.md) §5, "The UVM aperture". A VMM
+  [`ARCHITECTURE.md`](ARCHITECTURE.md), "The UVM aperture". A VMM
   without it runs every graphics path, and the guest reports no compute.
   The guest finds each region by its id, so the aperture may have a BAR of
   its own or follow the window in the window's BAR, with a capability of
@@ -384,25 +292,19 @@ must:
 Two VMMs do this today, both with the UVM aperture, and both have run every
 graphics and compute path on the GPU. **nesbox**
 ([github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch
-`virtio-nvgpu-v6`, not yet merged upstream) has its own frontend for the
-device. **crosvm** takes the patches in [`patches/crosvm/`](patches/crosvm/):
-a vhost-user device type `nvgpu` (class 0xff0000, indirect descriptors, only
-`SHMEM_MAP` of the backend's mapping requests); every backend mapping checked
-against its region, overlaps and stray unmaps refused, mappings dropped on
-reset; `--no-pci-hotplug-port`, as crosvm otherwise puts an empty hot-plug
-root port on PCI bus 1; the UVM aperture after the window in the window's
-BAR; and, with its sandbox on, the nvgpu frontend in a jailed process of its
-own under a seccomp policy of its own, whose every mapping request the main
-process checks again against the regions it laid out -- NVIDIA and DRM
-descriptors only in the window, `/dev/nvidia-uvm` pools only in the aperture,
-per-device limits -- before it maps anything (SECURITY.md §16). crosvm
-reserves the pools' host address band at start-up, so nothing of its own is
-ever there. crosvm needed nothing new in the protocol: its vhost-user fork
-already implements the upstream `GET_SHMEM_CONFIG`, `SHMEM_MAP` and
-`SHMEM_UNMAP` messages byte for byte as rust-vmm does; the backend answers
-`GET_SHMEM_CONFIG`, which nesbox asks from `virtio-nvgpu-v4`. Every other device crosvm
-emulates is a minijail'd process with its seccomp policy, none of which
-changed. How to run it: [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md), "crosvm".
+`virtio-nvgpu-v6`, not yet merged upstream; its jail's changes over `v5`
+have not run on hardware) has its own frontend for the device. **crosvm** takes the ten patches in
+[`patches/crosvm/`](patches/crosvm/): a vhost-user device type `nvgpu` whose
+every mapping request the frontend checks against its region, the UVM
+aperture after the window in the window's BAR, and, with crosvm's sandbox
+on, the nvgpu frontend in a jailed process of its own, whose every request
+the main process checks again before it maps anything.
+[`patches/README.md`](patches/README.md) says what each patch does, and
+[`SECURITY.md`](SECURITY.md), "The VMMs", what each VMM checks. crosvm's
+vhost-user fork already implements the upstream `GET_SHMEM_CONFIG`,
+`SHMEM_MAP` and `SHMEM_UNMAP` messages byte for byte as rust-vmm does, so the
+protocol needed nothing new; nesbox asks `GET_SHMEM_CONFIG` from
+`virtio-nvgpu-v4`. How to run it: [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md), "crosvm".
 
 ---
 
@@ -585,19 +487,11 @@ compositor, one host connection per guest client.
   "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"`. The proxy is written against Hyprland
   0.56; the loopback test runs it against headless sway and weston.
 - **Guest:** the daemon, `nvgpu-wl-guest`, serves `$XDG_RUNTIME_DIR/wayland-0`
-  and needs `/dev/nvgpu-wl`, which the module creates `root:root 0660` (module
-  parameter `wl_mode` to change it). Every open of it is a client of the host
-  compositor, so it is meant for the daemon alone:
-
-  ```sh
-  groupadd --system nvgpu-wl
-  usermod -aG nvgpu-wl <the daemon's account>
-  install -m 0644 contrib/udev/70-nvgpu-wl.rules /etc/udev/rules.d/
-  udevadm control --reload && udevadm trigger --subsystem-match=misc
-
-  nvgpu-wl-guest &                      # as that account
-  WAYLAND_DISPLAY=wayland-0 vkcube --wsi wayland
-  ```
+  and needs `/dev/nvgpu-wl`, which the module creates `root:root 0660` and
+  which is for the daemon alone: every open of it is a client of the host
+  compositor. [`DEPLOY.md`](DEPLOY.md), "The guest", has the setup (the
+  daemon setgid `nvgpu-wl`, the udev rule); then
+  `WAYLAND_DISPLAY=wayland-0 vkcube --wsi wayland`.
 
 - **Direct scanout** needs nothing of ours. A guest client's buffer is a host
   GPU object, and the compositor imports the host's own dma-buf of it, so
@@ -654,8 +548,8 @@ and token the helper tells it, as a read-only guest dma-buf through
 `/dev/nvgpu-capture`. PipeWire and the portal stay out of the backend; only
 this GPU's own nvidia-drm memory is taken. The helper and the daemon are
 the integrator's: [`DEPLOY.md`](DEPLOY.md), "Capture injection", has their
-interface, [ARCHITECTURE.md](ARCHITECTURE.md) §17 the design and
-[SECURITY.md](SECURITY.md) §18 what it trusts.
+interface, [ARCHITECTURE.md](ARCHITECTURE.md) the design and
+[SECURITY.md](SECURITY.md) what it trusts, each in its "Capture injection".
 
 ### Explicit sync
 
@@ -668,9 +562,10 @@ mode, yet.
 
 ### Limits
 
-What one VM may hold through the Wayland proxy, all per VM: `--wayland-max-conns`
-channels (64), `--wayland-shm-budget` MiB of shared-memory buffers (1024), and
-`--wayland-queue-budget` MiB of compositor output left unread (256).
+What one VM may hold through the Wayland proxy is bounded per VM and per
+guest process: channels, shared-memory buffers and unread compositor output
+(the flags and their defaults: [`DEPLOY.md`](DEPLOY.md), "Backend flags";
+every cap: [`SECURITY.md`](SECURITY.md), "Resource caps").
 
 ---
 
@@ -725,7 +620,9 @@ Measured, on one card, by one synthetic load, before protocol v2 — see
 this does not support (it does not support a comparison with any other
 hypervisor, because none was run). The current code, re-measured on an RTX
 5090 across rendering, compute, memory, video, start-up and the control path,
-keeps the GPU-bound and CPU rows below; its full table is in the same file.
+keeps the GPU-bound row below; its full table is in the same file. The CPU
+row still rests on the RTX 3060 run: the RTX 5090 tables have no CPU cost
+per frame.
 
 | | virtio-nvgpu, measured | Venus, by design |
 | --- | --- | --- |
@@ -751,29 +648,14 @@ here.
 NVIDIA's kernel driver ABI is not stable; ioctl struct layouts change between
 releases. Support is explicit, and this is the whole list.
 
-**The backend starts only on a host release its tables were measured at.**
-Four tables stand between a guest and the host driver, each read from the
-release's own sources (`device/src/release.rs`): the RM allowlist and the
-NVKMS schema, measured at the very release; the ABI profile, a range; and the
-UVM block sizes, a range proven over the releases in it. Today that is:
-
-| host release | RM allowlist, NVKMS schema | ABI profile | UVM table |
-|---|---|---|---|
-| `535.129.03` | its own | `535.129.03` | its own |
-| `580.178.04` | its own | `580.178.04` | its own |
-| `595.71.05` | its own | `595.71.05` | its own |
-| `595.99.02` | its own | `595.71.05` | its own |
-| `610.57.04` | its own | `595.71.05` | its own |
-| `615.71.09` | its own | `595.71.05` (measured through 615.71.09) | its own |
-
-Any other release is **refused at start-up**, with a line naming each table
-it lacks. `--allow-unmeasured-release`, a diagnostic flag, runs a newer or
-in-between host on the nearest older tables without compute, and says so at
-every start; a host older than 535.129.03 is refused regardless. Forwarding an
-ioctl whose layout has never been seen is how you get a plausible wrong
-answer instead of an error. Adding a release is described in
-[`DEPLOY.md`](DEPLOY.md), "Upgrading the host driver", and
-[`gen/README.md`](gen/README.md).
+**The backend starts only on a host release its tables were measured at**
+-- today 535.129.03, 580.178.04, 595.71.05, 595.99.02, 610.57.04 and
+615.71.09 -- and refuses any other at start-up, with a line naming each table
+it lacks. Forwarding an ioctl whose layout has never been seen is how you get
+a plausible wrong answer instead of an error. Which table each release gets,
+and the diagnostic way through an upgrade, is [`DEPLOY.md`](DEPLOY.md), "The
+exact-measured-release rule"; measuring a new release is
+[`gen/README.md`](gen/README.md), "A new host release".
 
 The guest's NVIDIA userspace must be the host's own release, as it must
 natively: RM refuses a client of another release (`NVRM: API mismatch`).
@@ -783,7 +665,7 @@ natively: RM refuses a client of another release (`NVRM: API mismatch`).
 | version | card | how far it got |
 |---|---|---|
 | **595.99.02** | RTX 5090 | the current code: every graphics and compute path, three display modes, the application pass, under nesbox and crosvm ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)) |
-| **595.99.02** | RTX 3060 | the code before protocol v2: renders, presents, encodes, and every number in [`BENCHMARKS.md`](BENCHMARKS.md) |
+| **595.99.02** | RTX 3060 | the code before protocol v2: renders, presents, encodes, and the numbers of [`BENCHMARKS.md`](BENCHMARKS.md)'s section on it |
 | **615.71.09** | RTX A2000 | the code before protocol v2: enumerates and renders; not benchmarked, and not re-tested since |
 
 Anything else is untested.

@@ -10,23 +10,24 @@ before it passed — and every stage says what to type, what a pass looks like, 
 what to grab when it does not.
 
 The design under test is the display modes of the README's "Display" section and
-[`ARCHITECTURE.md`](ARCHITECTURE.md) §10–§16; the claims each stage is checking
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Protocol v2" to "Direct scanout"; the claims each stage is checking
 come from the on-device plan in the verification review
 ([`docs/review/NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5) and
 the security review ([`docs/review/FINDINGS.md`](docs/review/FINDINGS.md)). The
 runnable helpers live in [`rig/verify/`](rig/verify/).
 
-**Where it stands (2026-09-26).** Stages 1–5, 8, the lease round trip of 9 and
-the security negatives have run and pass on an **RTX 5090, driver 595.99.02**,
-under nesbox and crosvm, against the live patched Hyprland;
-[`rig/TESTING-RIG.md`](rig/TESTING-RIG.md) has the order they were run in, the results
-and the application pass. Stages 6 and 7 (the compositor VM and export mode),
-hotplug, and the performance stages have not run.
+**Where it stands:** the README's "What is known to work", and the dated
+runs in [`rig/TESTING-RIG.md`](rig/TESTING-RIG.md), which also has the order
+the stages run in on the dev box. In short, stages 1–5, 8, the lease round
+trip of 9 and the security negatives pass; stages 6 and 7 (the compositor VM
+and export mode) and hotplug have not run; of the performance stage, only
+the Wayland mode's frame pacing and its round trips per presented frame
+([`DEPLOY.md`](DEPLOY.md), "Frame pacing").
 
 The machines this plan has been used on:
 
-- **RTX 5090, driver 595.99.02** — the dev box, where every stage above ran
-  ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)).
+- **RTX 5090, driver 595.99.02** — the dev box, where every stage that has
+  run ran ([`rig/TESTING-RIG.md`](rig/TESTING-RIG.md)).
 - **RTX 3060, driver 595.99.02** — the box everything in [`BENCHMARKS.md`](BENCHMARKS.md)
   was measured on, before protocol v2.
 - **RTX A2000, driver 615.71.09** — renders (before protocol v2), not yet
@@ -114,7 +115,7 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
   backend flag also need `NVGPU_DIAGNOSTIC=1`. As root the launcher binds the
   backend's socket itself (`systemd-socket-activate`) and hands it over, so
   the backend in the tree must be one that takes it (`LISTEN_FDS`, from the
-  2026-09-29 review on: SECURITY.md §22); it starts when the VMM connects.
+  2026-09-29 review on: SECURITY.md, "The backend's socket"); it starts when the VMM connects.
 
 ### 0.4 Tools
 
@@ -174,7 +175,9 @@ rig/verify/guest-check.sh
 ```
 
 **PASS:** protocol v2 is negotiated, `/dev/nvidiactl`, `/dev/nvidia0`,
-`/dev/nvidia-uvm`, `/dev/nvidia-modeset` and a render node all exist, and
+`/dev/nvidia-modeset` and a render node all exist, `/dev/nvidia-uvm` exists
+exactly when the backend serves compute (`--allow-compute`, bit 10 of the
+caps the HELLO line reports) and not otherwise, and
 `VK_EXT_physical_device_drm` is advertised. `VK_KHR_display` /
 `VK_EXT_acquire_drm_display` (needed only for the direct-display stage) and
 `EGL_ANDROID_native_fence_sync` (explicit-sync EGL clients) are reported as
@@ -244,14 +247,14 @@ backend log. Trace a divergence back to the first differing earlier
 
 ## Stage 3 — Wayland-client mode with direct scanout
 
-The default mode (README, "Display"; ARCHITECTURE.md §14, §16): a guest app is a Wayland client of host
+The default mode (README, "Display"; ARCHITECTURE.md, "The Wayland proxy" and "Direct scanout"): a guest app is a Wayland client of host
 Hyprland through the proxy, and a fullscreen buffer reaches the host as the host's
 own NVKMS object, so it is eligible for direct scanout exactly as bare metal is.
 
 **Host config (Hyprland Lua):**
 
 ```lua
-hl.config({ render = { direct_scanout = 2 } })   -- 2 = auto
+hl.config({ render = { direct_scanout = 1 } })   -- as measured (DEPLOY.md, "Frame pacing")
 hl.config({ debug  = { enable_stdout_logs = true } })
 ```
 
@@ -288,7 +291,7 @@ modifier`. **Capture:** the `WAYLAND_DEBUG` trace, the Hyprland stdout log, host
 
 ## Stage 4 — DRM lease → guest KMS (kmscube / modetest)
 
-The lease mode (ARCHITECTURE.md §11): the host leases a connector and the guest drives it through
+The lease mode (ARCHITECTURE.md, "A guest DRM file, and KMS"): the host leases a connector and the guest drives it through
 the adopted lease fd.
 
 **Host config:** apply the `patches/hyprland` and `patches/aquamarine` patches
@@ -334,7 +337,7 @@ and host `dmesg`.
 
 ## Stage 5 — vkAcquireDrmDisplayEXT / VK_KHR_display
 
-The `VK_KHR_display` mode (ARCHITECTURE.md §13): the direct Vulkan display path over the same lease plus
+The `VK_KHR_display` mode (ARCHITECTURE.md, "NVKMS"): the direct Vulkan display path over the same lease plus
 nvidia-drm `GRANT_PERMISSIONS(MODESET)`.
 
 **Config:** as stage 4 (a leasable monitor, `--wayland-lease`). Needs
@@ -360,7 +363,7 @@ refused only for SUB_OWNER — see the security stage). **Capture:** the backend
 
 ## Stage 6 — compositor-VM mode (Hyprland in the guest)
 
-Compositor-VM mode (ARCHITECTURE.md §11): the guest compositor drives the host card directly; the host
+Compositor-VM mode (ARCHITECTURE.md, "A guest DRM file, and KMS"): the guest compositor drives the host card directly; the host
 runs no compositor of its own.
 
 **Host:** no compositor running on the card. **Launch:**
@@ -389,7 +392,7 @@ from the guest compositor.
 
 ## Stage 7 — export mode (apps in a second VM)
 
-Compositor-VM mode's other half (ARCHITECTURE.md §14): host or second-VM clients reach the guest
+Compositor-VM mode's other half (ARCHITECTURE.md, "The Wayland proxy"): host or second-VM clients reach the guest
 compositor through the proxy in export mode.
 
 **Config:** on the compositor-VM's launch add `--wayland-export /path/sock`
@@ -417,10 +420,10 @@ buffers do not import. **Capture:** the daemon's stderr, the backend log.
 
 ## Stage 8 — explicit sync
 
-ARCHITECTURE.md §12, [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.9: fences live on the host, the guest holds
+ARCHITECTURE.md, "Fences"; [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.9: fences live on the host, the guest holds
 proxies, and no host thread parks on a guest wait.
 
-**Config:** `CAP_FENCES` is on by default (the backend reports it in HELLO). The
+**Config:** `BCAP_FENCES` is on by default (the backend reports it in HELLO). The
 semsurf path needs `nvidia_drm.modeset=1`.
 
 **Run (guest):**
@@ -447,7 +450,7 @@ host thread is seen parked on a guest wait. **Capture:** backend log at
 
 ## Stage 9 — hotplug and lease round-trip
 
-ARCHITECTURE.md §11, [`patches/README.md`](patches/README.md); [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.8.
+ARCHITECTURE.md, "A guest DRM file, and KMS"; [`patches/README.md`](patches/README.md); [`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) §5.8.
 
 **Lease round-trip (mode 3/4).** With a leased desktop monitor, take a lease in
 the guest and drive it, then close it:
@@ -486,19 +489,25 @@ rig/verify/sec-negative.sh                       # ctl + render tests
 rig/verify/sec-negative.sh -- --kms /dev/dri/card1   # add the KMS/lease tests
 ```
 
-The tests, each an ioctl a hostile guest would use:
+The tests, each an ioctl a hostile guest would use (`rig/verify/sec-negative.c`;
+T4-T6 need a KMS or lease file, `--kms`):
 
-| test | what it attempts | refusal expected | finding |
-|---|---|---|---|
-| `os-descriptor RM_ALLOC 0x71` | allocate `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` / `VID_HEAP ALLOC_OS_DESCRIPTOR` | RM would pin memory named by a VMM address; refused by class/function when sent with an address alone (the supported form sends the guest-physical pages, BCAP_OS_DESC) | S-1 (3) |
-| `raw-pointer RM_CONTROL` | an embedded-pointer control with a guest pointer the guest table does not list | backend relocates every `NvP64` to its own buffer, or refuses | S-1 |
-| `semsurf 0x54 huge index` | `SEMSURF_FENCE_CTX_CREATE` with an overflowing `index` | index bounded to the host layout; refused | C-1 |
-| `GRANT_PERMISSIONS SUB_OWNER` | nvidia-drm `0x52` with `type=3` | only `MODESET` allowed; SUB_OWNER refused | H (GRANT) |
-| `ADDFB2 non-NVKMS handle` | scan out a handle not IDENTIFYed as NVKMS | refused | L6, S-6 |
-| `GETFB foreign fb` | fetch a GEM handle for an fb this file did not create | handle returned as 0 | S-6, RV:getfb |
-| `RM_SHARE type ALL` | share an object with every RM client on the host | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS` in the status | S-35 |
-| `DUP other process` | a forked child makes a client and a VA space; the parent duplicates it into its own client | refused before RM (the clients' guest processes differ), `NV_ERR_INSUFFICIENT_PERMISSIONS` | S-35 |
-| `DUP same process` | **positive control**: the same duplicate between two clients of one process, on two files | **made** — a FAIL here is the backend refusing what RM allows, and makes the row above inconclusive | S-35 |
+| test | name in the output | what it attempts | refusal expected | finding |
+|---|---|---|---|---|
+| T1 | `os-descriptor RM_ALLOC 0x71`, `VID_HEAP ALLOC_OS_DESC` | allocate `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` / VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR with an address alone | RM would pin memory named by a VMM address; refused (the supported form sends the guest-physical pages, BCAP_OS_DESC). The VID_HEAP half sends function 8 where ALLOC_OS_DESCRIPTOR is 27, in a block of the wrong size, so it is refused on size and does not test what it names (SECURITY.md, "Open items and residual risk"); the backend's unit test covers the real case | S-1 (3) |
+| T2 | `raw-pointer RM_CONTROL` | an embedded-pointer control with a guest pointer the guest table does not list | backend relocates every `NvP64` to its own buffer, or refuses | S-1 |
+| T3 | `semsurf 0x54 huge index` | `SEMSURF_FENCE_CTX_CREATE` with an overflowing `index` | index bounded to the host layout; refused | C-1 |
+| T4 | `GRANT_PERMISSIONS SUB_OWNER` | nvidia-drm `0x52` with `type=3` | only `MODESET` allowed; SUB_OWNER refused | H (GRANT) |
+| T5 | `ADDFB2 handle never made`, `ADDFB2 closed handle`, `ADDFB2 own dumb buffer` | scan out a handle this file never made, or has closed; and, as a positive control, its own dumb buffer | the first two refused; the dumb buffer **allowed** | L6, S-6 |
+| T6 | `GETFB foreign fb` | fetch a GEM handle for an fb this file did not create | handle returned as 0 | S-6, RV:getfb |
+| T7 | `RM_SHARE type ALL` | share an object with every RM client on the host | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS` in the status | S-35 |
+| T8 | `DUP other process` | a forked child makes a client and a VA space; the parent duplicates it into its own client | refused before RM (the clients' guest processes differ), `NV_ERR_INSUFFICIENT_PERMISSIONS` | S-35 |
+| T9 | `DUP same process` | **positive control**: the same duplicate between two clients of one process, on two files | **made** -- a FAIL here is the backend refusing what RM allows, and makes T8 inconclusive | S-35 |
+| T10 | `second client of another user` | a device sharing the VA space of a client another guest user (uid 65534) made; needs root in the guest | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS`; RM's own refusal counts as a FAIL, since the backend let it through. Its control, a device sharing this process's own client, must not be refused | S-35 |
+| T11 | `import from a foreign fd` | NV0000 OS_UNIX IMPORT_OBJECTS_FROM_FD naming a number not open here, and a file not the device's | EBADF before RM is asked | R1 |
+
+T8 and T10 need a guest module that says which process and euid make each
+call (BCAP_PROC_ID, BCAP_PROC_EUID); without it both are refused anyway.
 
 **PASS:** every test reports `PASS refused` (or `SKIP` where the mode is not
 offered), the program exits 0, and — checked separately — **host `dmesg` is clean
@@ -531,6 +540,11 @@ The render loop crosses the VM boundary essentially never — that is the whole
 design, and BENCHMARKS.md already publishes ~0.02 crossings per frame for an
 offscreen load. **Presentation is where a per-present crossing could hide**, and
 this is the number to publish for it ([`NVK_VERIFICATION.md`](docs/review/NVK_VERIFICATION.md) L-7).
+
+Measured so far for W2 only, through the frame-pacing counters rather than
+the procedure below: 17 round trips per presented frame under the Wayland
+mode ([`DEPLOY.md`](DEPLOY.md), "Frame pacing"). W3, on a lease, has not
+run.
 
 For the Wayland-present (W2) and display-present (W3) workloads of stage 2, take
 the backend's served-message tally before and after a **30 s run after an 8 s
@@ -602,7 +616,7 @@ or out while chasing one of these.
 
 | mode | `run-guest.sh` flags | host | guest |
 |---|---|---|---|
-| Wayland client + direct scanout | `--wayland-socket $SOCK` | Hyprland, `render:direct_scanout=2` | `nvgpu-wl-guest --socket wayland-0` |
+| Wayland client + direct scanout | `--wayland-socket $SOCK` | Hyprland, `render:direct_scanout=1` | `nvgpu-wl-guest --socket wayland-0` |
 | DRM lease → guest KMS | `--wayland-socket $SOCK --wayland-lease` | Hyprland patched, a `leasable` monitor | lease client + kmscube/modetest/`lease-flip` |
 | VK_KHR_display | `--wayland-socket $SOCK --wayland-lease` | as lease | `vkcube --wsi display` |
 | compositor-VM | `--kms-card` | **no** host compositor on the card, `nvidia_drm.modeset=1` | guest Hyprland, `/dev/dri/card*` |
@@ -611,15 +625,14 @@ or out while chasing one of these.
 The launcher also takes the Wayland limits, for the stages that push them:
 `--wayland-max-conns N` (channels per VM, 64), `--wayland-shm-budget MIB` (1024),
 `--wayland-queue-budget MIB` (256) and `--wayland-lease-interval SECS` (5).
-Anything else goes to the backend after `--`, e.g. the diagnostic flags:
-`--permissive-abi` (forward unchecked ioctls, loudly — for finding what a
-workload needs, never for running one), `--keep-guest-coherency` (caching
-stage), `--proc-nvidia PATH` (test against a fixture tree). The backend
-refuses each of these, and `--rm-allowlist=log`, `--sandbox=off|best-effort`,
-`--allow-root-unsafe` and `--allow-unmeasured-release`, unless `--diagnostic`
-is given too (they are hidden from its `--help` without it); the launcher adds
-`--diagnostic` when one is passed, or asked for by `NVGPU_SANDBOX=off` or
-`NVGPU_ALLOW_ROOT_UNSAFE=1`:
+Anything else goes to the backend after `--`, e.g. a diagnostic flag:
+`--keep-guest-coherency` for the caching stage, `--permissive-abi` for
+finding what a workload needs (never for running one). The list of
+diagnostic flags, and the `--diagnostic` each needs, is in
+[`DEPLOY.md`](DEPLOY.md), "Backend flags"; the launcher adds `--diagnostic`
+when one is passed, or asked for by `NVGPU_SANDBOX=off` or
+`NVGPU_ALLOW_ROOT_UNSAFE=1`, and as root needs `NVGPU_DIAGNOSTIC=1` for
+each:
 
 ```sh
 sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh --kms-card shell.sh kms1 -- --keep-guest-coherency
