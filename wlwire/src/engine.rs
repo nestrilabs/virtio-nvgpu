@@ -640,6 +640,12 @@ impl Engine {
         self.streams.interest()
     }
 
+    /// Descriptors of streams that ended, for the caller to stop watching
+    /// before it drops them ([`Streams::take_closed`]).
+    pub fn take_closed_streams(&mut self) -> Vec<OwnedFd> {
+        self.streams.take_closed()
+    }
+
     pub fn stream_io(&mut self, id: u32, readable: bool, writable: bool) {
         let mut out = Vec::new();
         self.streams.io(id, readable, writable, &mut out);

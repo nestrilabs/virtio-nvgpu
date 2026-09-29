@@ -473,6 +473,8 @@ impl Pair {
             assert_eq!(self.h.channel_backlog(), 0, "a backlog with nothing queued");
             drop(self.g.local_out().drain());
             drop(self.h.local_out().drain());
+            drop(self.g.take_closed_streams());
+            drop(self.h.take_closed_streams());
             if !moved {
                 break;
             }

@@ -88,12 +88,18 @@ pub struct Streams {
     /// Sinks open.
     sinks: usize,
     budgets: Vec<Arc<dyn ByteBudget>>,
+    /// Ended streams' descriptors, until [`Streams::take_closed`].
+    closed: Vec<OwnedFd>,
     pub bytes_out: u64,
     pub bytes_in: u64,
     pub opened: u64,
 }
 
-/// What an event loop should wait for on one stream.
+/// What an event loop should wait for on one stream. Neither `read` nor
+/// `write` means nothing: an event loop stops watching the descriptor
+/// altogether then, since epoll reports an error or a hangup whatever it was
+/// asked for, and the stream would wake it for nothing until the far side
+/// moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interest {
     pub id: u32,
@@ -128,6 +134,7 @@ impl Streams {
             peer_windows: false,
             sinks: 0,
             budgets: Vec::new(),
+            closed: Vec::new(),
             bytes_out: 0,
             bytes_in: 0,
             opened: 0,
@@ -186,10 +193,31 @@ impl Streams {
     }
 
     fn remove(&mut self, id: u32) {
-        if let Some(Kind::Sink { pending, .. }) = self.map.remove(&id) {
-            self.sinks -= 1;
-            self.give_budget(pending.len());
+        match self.map.remove(&id) {
+            Some(Kind::Sink { pending, wr, .. }) => {
+                self.sinks -= 1;
+                self.give_budget(pending.len());
+                self.closed.push(wr);
+            }
+            Some(Kind::Source { rd, .. }) => self.closed.push(rd),
+            None => {}
         }
+    }
+
+    /// The descriptors of streams that have ended since the last call, for
+    /// the owner to stop watching and then drop. Held until then because an
+    /// event loop can only take a descriptor out of epoll while it is still
+    /// open, and a sink's shares its open file with the process that sent
+    /// it, so a registration left behind outlives the close (and would be
+    /// reported for good). An owner that polls afresh each time need only
+    /// drop them.
+    pub fn take_closed(&mut self) -> Vec<OwnedFd> {
+        std::mem::take(&mut self.closed)
+    }
+
+    /// Descriptors this holds: open streams' and ended ones not yet taken.
+    pub fn fds(&self) -> usize {
+        self.map.len() + self.closed.len()
     }
 
     fn ours(&self, id: u32) -> bool {

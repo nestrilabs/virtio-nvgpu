@@ -904,6 +904,9 @@ fn reader(s: Arc<Shared>) {
                     Err(f) => fail(&s, &mut st, f),
                 }
             }
+            // Streams that ended: this loop polls afresh each time, so there
+            // is no registration to take out first.
+            drop(st.engine.take_closed_streams());
             (
                 st.engine.local_out_len() > 0,
                 st.engine.stream_interest(),

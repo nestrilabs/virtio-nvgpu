@@ -275,7 +275,8 @@ struct Client {
     infds: VecDeque<OwnedFd>,
     /// Frames the host has not taken yet.
     tx: VecDeque<(Vec<u8>, Vec<Option<OwnedFd>>)>,
-    streams: HashMap<RawFd, u32>,
+    /// Streams in epoll: descriptor → (stream id, events asked for).
+    streams: HashMap<RawFd, (u32, u32)>,
     sock_events: u32,
     /// What the channel is watched for: nothing while the client has
     /// [`LOCAL_OUT_MAX`] unread.
@@ -519,7 +520,7 @@ impl Daemon {
                         s if s & SUB_STREAM != 0 => {
                             let fd = (s & !SUB_STREAM) as RawFd;
                             let c = self.clients[slot].as_mut().unwrap();
-                            if let Some(&id) = c.streams.get(&fd) {
+                            if let Some(&(id, _)) = c.streams.get(&fd) {
                                 let rd = events
                                     & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32
                                     != 0;
@@ -995,34 +996,74 @@ impl Daemon {
             );
             c.sock_events = want;
         }
-        // Streams are registered one-shot and re-armed here: the engine closes
-        // a stream's descriptor itself, and a sink's descriptor shares its
-        // open file with the client that sent it, so epoll would otherwise
-        // keep reporting a registration nobody can remove any more.
-        let interest = c.engine.stream_interest();
-        c.streams = interest.iter().map(|i| (i.fd, i.id)).collect();
-        for i in interest {
-            let mut ev = libc::EPOLLONESHOT as u32;
-            if i.read {
-                ev |= libc::EPOLLIN as u32;
-            }
-            if i.write {
-                ev |= libc::EPOLLOUT as u32;
-            }
-            let tok = base | SUB_STREAM | i.fd as u64;
-            if epoll_ctl(ep, libc::EPOLL_CTL_MOD, i.fd, ev, tok).is_err() {
-                let _ = epoll_ctl(ep, libc::EPOLL_CTL_ADD, i.fd, ev, tok);
-            }
-        }
+        sync_streams(ep, base, c);
     }
 
     fn close(&mut self, slot: usize) {
-        if let Some(c) = self.clients[slot].take() {
+        if let Some(mut c) = self.clients[slot].take() {
             self.totals.lock().unwrap().add(&c.engine);
-            // Dropping the socket, the channel (CLOSE on the host handle) and
-            // the engine's streams removes them from epoll.
+            // Everything of the client's leaves epoll while its descriptor is
+            // still open: closing is not enough when the file is shared, as
+            // a stream's is with the client that sent it (and a channel's
+            // readiness descriptor may be, for another Channel than
+            // /dev/nvgpu-wl's).
+            let ep = self.ep.as_raw_fd();
+            let fds = [c.sock.as_raw_fd(), c.chan.poll_fd()];
+            for fd in fds.into_iter().chain(c.streams.drain().map(|(fd, _)| fd)) {
+                let _ = epoll_ctl(ep, libc::EPOLL_CTL_DEL, fd, 0, 0);
+            }
         }
     }
+}
+
+/// Bring `c`'s streams in epoll up to date with what its engine wants.
+///
+/// A stream is watched only while the engine wants to read or write it,
+/// level-triggered, and taken out of epoll otherwise: epoll reports an error
+/// or a hangup whatever it was asked for, so a sink whose reader went away
+/// with nothing to write, or a source with no credit whose writer went away,
+/// would otherwise wake the daemon on every wait until the far side moved
+/// (the 2026-09-29 review, S4). Streams the engine has ended are taken out
+/// before their descriptors close: a sink's descriptor shares its open file
+/// with the client that sent it, and a registration left behind would outlive
+/// the close (S9).
+fn sync_streams(ep: RawFd, base: u64, c: &mut Client) {
+    for fd in c.engine.take_closed_streams() {
+        if c.streams.remove(&fd.as_raw_fd()).is_some() {
+            let _ = epoll_ctl(ep, libc::EPOLL_CTL_DEL, fd.as_raw_fd(), 0, 0);
+        }
+    }
+    let mut now = HashMap::new();
+    for i in c.engine.stream_interest() {
+        let mut ev = 0;
+        if i.read {
+            ev |= libc::EPOLLIN as u32;
+        }
+        if i.write {
+            ev |= libc::EPOLLOUT as u32;
+        }
+        let tok = base | SUB_STREAM | i.fd as u64;
+        let was = c.streams.remove(&i.fd).map(|(_, e)| e);
+        let op = match (was, ev) {
+            (None, 0) => None,
+            (Some(_), 0) => Some(libc::EPOLL_CTL_DEL),
+            (None, _) => Some(libc::EPOLL_CTL_ADD),
+            (Some(w), _) if w == ev => None,
+            (Some(_), _) => Some(libc::EPOLL_CTL_MOD),
+        };
+        let ok = match op {
+            Some(op) => epoll_ctl(ep, op, i.fd, ev, tok).is_ok(),
+            None => true,
+        };
+        if ev != 0 && ok {
+            now.insert(i.fd, (i.id, ev));
+        }
+    }
+    // Every stream the engine ends comes back through take_closed_streams,
+    // so nothing registered is left over. Were anything, its number could
+    // name another file by now, and is not touched.
+    debug_assert!(c.streams.is_empty(), "a stream left epoll unseen");
+    c.streams = now;
 }
 
 #[cfg(test)]
@@ -1499,6 +1540,156 @@ mod tests {
         );
         assert!(!wedged, "the client's input is no longer taken");
         assert!(synced, "the sync after the commit reached the host");
+    }
+
+    /// A daemon with one client that has a data device (5) and a data offer
+    /// (0xff000000) from the host.
+    fn with_an_offer(tag: &str) -> (Daemon, Script, UnixStream) {
+        let sock = socket_in_tmp(tag);
+        let script = Script::new();
+        let mut d = Daemon::new(Config::new(&sock), Box::new(ScriptHost(script.clone()))).unwrap();
+        let mut client = UnixStream::connect(&sock).unwrap();
+        d.turn(50).unwrap();
+        use std::io::Write;
+        client
+            .write_all(
+                &MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+                    .new_id(2)
+                    .finish(),
+            )
+            .unwrap();
+        d.turn(50).unwrap();
+        let hello = frame::Hello {
+            version: frame::WL_PROTO_VERSION,
+            caps: frame::HELLO_STREAM_WINDOW,
+        };
+        let globals = [
+            MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+                .uint(1)
+                .string(Some("wl_seat"))
+                .uint(1)
+                .finish(),
+            MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+                .uint(2)
+                .string(Some("wl_data_device_manager"))
+                .uint(3)
+                .finish(),
+        ]
+        .concat();
+        script.push(vec![
+            Unit {
+                rec: frame::record(frame::REC_HELLO, 0, 0, &hello.encode()),
+                descs: Vec::new(),
+            },
+            Unit {
+                rec: frame::record(frame::REC_WAYLAND, 0, 0, &globals),
+                descs: Vec::new(),
+            },
+        ]);
+        d.turn(50).unwrap();
+        client
+            .write_all(
+                &[
+                    MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                        .uint(1)
+                        .generic_new_id("wl_seat", 1, 3)
+                        .finish(),
+                    MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+                        .uint(2)
+                        .generic_new_id("wl_data_device_manager", 3, 4)
+                        .finish(),
+                    MsgBuilder::new(4, op::wl_data_device_manager::REQ_GET_DATA_DEVICE)
+                        .new_id(5)
+                        .object(3)
+                        .finish(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+        d.turn(50).unwrap();
+        let offer = MsgBuilder::new(5, op::wl_data_device::EVT_DATA_OFFER)
+            .new_id(0xff00_0000)
+            .finish();
+        script.push(vec![Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 0, &offer),
+            descs: Vec::new(),
+        }]);
+        d.turn(50).unwrap();
+        (d, script, client)
+    }
+
+    /// `wl_data_offer.receive` into a pipe whose reader then goes away,
+    /// with nothing from the host to write: the pipe reports EPOLLERR,
+    /// which epoll always reports, for a stream the engine wants nothing of.
+    /// The daemon stops watching such a stream rather than waking for it.
+    /// Before, it re-armed every stream on every turn it touched, and spun
+    /// until the host's source sent something (the 2026-09-29 review, S4).
+    #[test]
+    fn a_stream_whose_reader_is_gone_does_not_spin_the_daemon() {
+        let (mut d, _script, client) = with_an_offer("sink");
+        let (rd, wr) = sys::pipe().unwrap();
+        let recv = MsgBuilder::new(0xff00_0000, op::wl_data_offer::REQ_RECEIVE)
+            .string(Some("text/plain"))
+            .finish();
+        sys::send_with_fds(client.as_raw_fd(), &recv, &[wr.as_raw_fd()]).unwrap();
+        drop(wr);
+        d.turn(50).unwrap();
+        d.turn(50).unwrap();
+        assert_eq!(the_client(&d).engine.stream_interest().len(), 1);
+        let before = turns_in(&mut d, 300);
+        assert!(
+            before < 30,
+            "{before} turns in 300 ms before the reader went"
+        );
+        drop(rd);
+        let after = turns_in(&mut d, 300);
+        assert!(after < 30, "{after} turns in 300 ms: the daemon spins");
+    }
+
+    /// The streams of a client that goes are taken out of epoll before
+    /// their descriptors close. A sink's descriptor shares its open file
+    /// with the process that sent it, so a registration left behind would
+    /// outlive the slot: it would keep reporting (a pipe with room is
+    /// writable), and to whichever client the slot went to next.
+    #[test]
+    fn the_streams_of_a_client_that_goes_leave_nothing_in_epoll() {
+        let (mut d, script, client) = with_an_offer("sinkgone");
+        let (rd, wr) = sys::pipe().unwrap();
+        let recv = MsgBuilder::new(0xff00_0000, op::wl_data_offer::REQ_RECEIVE)
+            .string(Some("text/plain"))
+            .finish();
+        sys::send_with_fds(client.as_raw_fd(), &recv, &[wr.as_raw_fd()]).unwrap();
+        // The client keeps its copy of the write end, and so the pipe's
+        // open file, as a process that forked would.
+        d.turn(50).unwrap();
+        // The host sends more than the pipe holds, and nobody reads it: the
+        // sink is watched for writing.
+        let id = the_client(&d).engine.stream_interest()[0].id;
+        let data = |_| Unit {
+            rec: frame::record(frame::REC_STREAM_DATA, id, 0, &[7u8; 60_000]),
+            descs: Vec::new(),
+        };
+        script.push((0..2).map(data).collect());
+        d.turn(50).unwrap();
+        assert!(the_client(&d).streams.values().any(|&(_, ev)| ev != 0));
+        drop(client);
+        for _ in 0..3 {
+            d.turn(50).unwrap();
+        }
+        assert!(d.clients.iter().all(|c| c.is_none()));
+        let turns = turns_in(&mut d, 300);
+        assert!(turns < 30, "{turns} turns in 300 ms after the client went");
+        assert_eq!(watched(&d), 1, "only the listener is left in epoll");
+        drop((rd, wr));
+    }
+
+    /// Registrations in the daemon's epoll set (its fdinfo's `tfd:` lines).
+    fn watched(d: &Daemon) -> usize {
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", d.ep.as_raw_fd()))
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("tfd:"))
+            .count()
     }
 
     /// Descriptors sent beside messages that take none are not held for

@@ -644,8 +644,12 @@ impl Pair {
         p
     }
 
-    /// Move everything queued on either side across, until quiet.
+    /// Move everything queued on either side across, until quiet; and close
+    /// the streams either side ended, as its event loop would once it had
+    /// stopped watching them.
     fn pump(&mut self) {
+        drop(self.g.take_closed_streams());
+        drop(self.h.take_closed_streams());
         loop {
             let mut moved = false;
             let mut q = self.g.take_units();
@@ -1722,6 +1726,7 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
         }
         p.pump();
     }
+    p.pump();
     let mut buf = [0u8; 64];
     let n = sys::read(client_rd.as_raw_fd(), &mut buf).unwrap();
     assert_eq!(&buf[..n], b"hello from the host");
