@@ -109,15 +109,8 @@ pub fn set_sched_slice(slice_ns: u64) -> io::Result<()> {
     };
     // SAFETY: the kernel reads `attr.size` bytes of `attr`, which is that
     // large and lives across the call; pid 0 is the calling thread.
-    cvt_l(unsafe {
-        libc::syscall(
-            libc::SYS_sched_setattr,
-            0,
-            &attr as *const SchedAttr,
-            0u32,
-        )
-    })
-    .map(|_| ())
+    cvt_l(unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0u32) })
+        .map(|_| ())
 }
 
 /// `umask(mode)`: the previous mask.
