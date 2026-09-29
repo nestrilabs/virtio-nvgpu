@@ -606,6 +606,44 @@ enforcing and the backend's sandbox on:
 | `vkdisplay` | 8/0/1 | 8/0/1 | 8/0/1 |
 | `secneg`, `kms=lease` | 6/0/0; KMS 15 passed | the same | the same |
 
+## Window size and share
+
+`NVGPU_WINDOW_MIB` and `NVGPU_WINDOW_SHARE` give the backend
+`--window-size` and `--window-owner-share`; the VMM follows the size
+(nesbox from `virtio-nvgpu-v4`, which the launcher checks for). Each run's
+backend log ends with a `window use:` line: each zone's peak, the most one
+process held, the largest mapping and the refusals.
+
+```sh
+NVGPU_WINDOW_MIB=16384 NVGPU_WINDOW_SHARE=90 NVGPU_COMPUTE=1 rig/run-guest.sh render w16
+NVGPU_WINDOW_MIB=16384 NVGPU_WINDOW_SHARE=90 NVGPU_APPS_EXTRA=nvgpu_user=1 \
+  rig/rig-app-check.sh --live stk,stkgs,blender,blendervk,glmark2,vkmark,chromeanim w16-apps
+# the map/UPDATE/unmap-by-address churn (rig/guest-image/tools/nvgpu-map-churn.c)
+NVGPU_CMDLINE_EXTRA="nvgpu_cmd=$(printf %s 'nvgpu-map-churn 400 2' | base64 -w0)" rig/run-guest.sh run churn
+```
+
+Results (RTX 5090, 595.99.02, 2026-09-29, sandbox on, allowlist enforcing):
+
+| run | nesbox | crosvm |
+|---|---|---|
+| default window: `stage1`; `render` with compute; `secneg` (kms=none) | 6/0/0; 9/0/1, cuda-smoke PASS; 10 passed, 5 skipped | 6/0/0 |
+| default window: `wayland`, live Hyprland | 13/0/1 | |
+| 4 GiB / 75 %: `stage1`; `render` with compute | 6/0/0; 9/0/1 | 6/0/0; 9/0/1 |
+| 16 GiB / 90 %: `stage1`; `render` with compute | 6/0/0; 9/0/1 | 6/0/0; 9/0/1 |
+| the seven apps above in one VM, 16 GiB / 90 % | 19/0/0 | 19/0/0 |
+| the same, default window | 19/0/0 | |
+| 48 GiB | refused: "shared window is 0xc00000000 bytes; this device takes whole pages up to 32 GiB" | |
+
+The guest saw a 1, 4 or 16 GiB window in each (`virtio-gpu-nv: window at
+..., N bytes`). No run logged `no mapping for pLinearAddress`, `SHM alloc
+failed` or an Xid. Peaks of the seven-app VM: UC 0.4, WC 34.5, WB 90.3 MiB
+(90.3 by one process: 81 % of its default WB share). Per application,
+DEPLOY.md "Sizing the window". The churn, 400 x 2 MiB at the default window:
+the backend before the fix (`vhost-user-nvgpu.47098c0`) refused the 193rd
+map with `SHM WriteCombine zone: guest process ... holds 0x18000000 of
+0x30000000 bytes and may not take 0x200000 more (Owner)`, every unmap having
+missed; the fixed one ran 400/400 with the WC peak at 2 MiB.
+
 ## What to keep from every run
 
 The launcher writes three files per run:

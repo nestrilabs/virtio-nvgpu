@@ -2585,3 +2585,16 @@ a refused placement undoes both. `Share::percent` against `half` at 50,
 and its reserve; every window size from 256 MiB to 64 GiB in whole 2 MiB
 zones; the flags' refusals; GET_SHMEM_CONFIG from the flags; nesbox's
 window from the backend's size.
+
+On the RTX 5090 (595.99.02), sandbox on, RM allowlist enforcing
+(`rig/TESTING-RIG.md`, "Window size and share"): with the default window,
+`stage1` 6/0/0, `render` with compute 9/0/1 (cuda-smoke), `wayland` on the
+live Hyprland 13/0/1, `secneg` ctl + render 10 passed, 5 skipped; at 4 GiB /
+75 % and 16 GiB / 90 %, `stage1` and `render` with compute under nesbox and
+crosvm, the guest seeing a 4 or 16 GiB window; SuperTuxKart (also in
+gamescope), Blender GL and Vulkan, glmark2, vkmark and Chromium in one VM,
+19/0/0, at 16 GiB / 90 % under both VMMs and at the default. No run logged
+`no mapping for pLinearAddress` or `SHM alloc failed`, and no Xid. The
+churn reproduced the report against the backend before the fix and ran
+400/400 after it. A 48 GiB window was refused by nesbox with its size named,
+and the backend warned that its WC zone was more than half of BAR1.
