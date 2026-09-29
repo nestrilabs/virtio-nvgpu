@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Frame-pacing counters: what crosses the boundary, how often, and how long
-//! each crossing takes on this side (ARCHITECTURE.md, "Frame pacing").
+//! each crossing takes on this side (DEPLOY.md, "Frame pacing").
 //!
 //! A frame of a game in a guest is paced by the round trips on its present
 //! path -- the explicit-sync calls, the fence and syncobj waits, the Wayland

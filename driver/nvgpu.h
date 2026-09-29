@@ -528,7 +528,7 @@ bool nvgpu_xfer_dead(struct nvgpu_device *dev);
 void nvgpu_fence_wake_waiters(void);
 
 /*
- * Frame-pacing counters, nvgpu_xfer.c's (ARCHITECTURE.md, "Frame pacing"):
+ * Frame-pacing counters, nvgpu_xfer.c's (DEPLOY.md, "Frame pacing"):
  * relaxed atomics, always kept, read as root from
  * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
  * nvgpu_syncobj.c count themselves here too.
