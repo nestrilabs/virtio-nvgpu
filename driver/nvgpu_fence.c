@@ -318,10 +318,10 @@ static void nvgpu_fence_watch_fn(struct work_struct *work) {
 
 /*
  * Start watching the proxy's host fence: once it owns its handle for good --
- * installed as a descriptor, or kept by its caller -- and not before.
- * Queued while a failure could still hand the handle back, the
- * WATCH could reach the backend after the caller's CLOSE of the same handle,
- * on another queue. A WATCH that fails signals the proxy with the error
+ * installed as a descriptor, or kept by its caller -- and not before: queued
+ * while a failure could still hand the handle back, the WATCH could reach the
+ * backend after the caller's CLOSE of the same handle, on another queue. A
+ * WATCH that fails signals the proxy with the error
  * (nvgpu_host_fence_unwatched()), sent here or from the work item alike.
  */
 static void nvgpu_host_fence_watch(struct nvgpu_host_fence *f) {

@@ -11,10 +11,10 @@
 //!   (wl/serve.rs `TableSend`), which hands the dma-buf to the compositor;
 //! - an IOCTL2 re-home (xfer.rs), which imports it into a KMS file.
 //!
-//! One gate, so that no path can miss a check another has: separate
-//! copies of the checks once let the Wayland and IOCTL2 paths export a
-//! fence context HOST_OP refused. Every path asks [`ExportGate`], before
-//! the export and after it:
+//! One gate, so that no path can miss a check another makes: with a copy
+//! of the checks per path, a fence context HOST_OP refuses to export would
+//! leave by the Wayland or the IOCTL2 door instead. Every path asks
+//! [`ExportGate`], before the export and after it:
 //!
 //! - **Before:** not a fence context (0x54). A context is counted against
 //!   its file's and the session's caps only until its GEM handle closes

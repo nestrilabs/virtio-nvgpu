@@ -160,9 +160,10 @@ impl NvidiaBackend {
             //
             // No version at all is refused too: the transport reads it from
             // the driver before any guest call, and a library user that set
-            // none (test-harness, an embedding VMM) used to learn it from
+            // none (test-harness, an embedding VMM) must not learn it from
             // the guest's CHECK_VERSION_STR, whose string RM leaves as the
-            // caller sent it -- the guest chose the ABI profile.
+            // caller sent it -- the guest would choose the ABI profile. Only
+            // unit tests and fuzzing may run unversioned (`unversioned_ok`).
             AbiCheck::NoProfile if self.driver.is_none() && self.unversioned_ok() => false,
             AbiCheck::NoProfile => {
                 log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
