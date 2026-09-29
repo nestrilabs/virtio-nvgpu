@@ -80,7 +80,7 @@ run_native() { # run_native N
         bash "$REPO/rig/heavy/heavy-run.sh" "$WLD" "$d" \
         >"$OUT/$WLD-native-$1.log" 2>&1
     # A game that aborts can leave a process behind that goes on rendering
-    # on the compositor (SuperTuxKart's Vulkan renderer did): anything still
+    # on the compositor (SuperTuxKart 1.5 on Vulkan can): anything still
     # running from the image's programs is this run's, and would load the
     # next one.
     if pgrep -u "$(id -u)" -f '^/nix/store/[^ ]*-nvgpu-guest-sw/bin/' >/dev/null; then

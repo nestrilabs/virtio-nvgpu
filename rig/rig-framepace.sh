@@ -7,8 +7,7 @@
 #
 # Usage: rig/rig-framepace.sh <workload> <native|vm> <tag> [runs [first]]
 #   workload  vkcube        vkcube, FIFO (vsync), native Wayland
-#             stk-ultra     SuperTuxKart's profile race, every effect on (vsync)
-#             stk-ultra-novsync  the same, swap interval 0 (MangoHud gl_vsync=0)
+#             stk-ultra     SuperTuxKart's profile race, every effect on (FIFO)
 #             vkcube-mbox   vkcube --present_mode 1 (mailbox)
 #             vkmark        vkmark's `shading` scene, FIFO
 #             stk           SuperTuxKart's profile race (GL, SDL2, Wayland)
@@ -51,6 +50,7 @@ WL=$1 MODE=$2 TAG=$3 RUNS=${4:-3} FIRST=${5:-1}
 MON=${NVGPU_FP_MON:-DP-3}
 WARM=${NVGPU_FP_WARM:-6}
 SECS=${NVGPU_FP_SECS:-20}
+LOGS=${NVGPU_LOGS:-$RIG/logs}
 OUT=$RIG/logs/fp/$TAG
 mkdir -p "$OUT"
 SESSION=${XDG_RUNTIME_DIR:-}/${WAYLAND_DISPLAY:-}
@@ -63,10 +63,10 @@ case $WL in
     vkcube-mbox) CMD='mangohud vkcube --wsi wayland --present_mode 1' ;;
     vkmark) CMD='mangohud vkmark --winsys wayland --run-forever -b shading' ;;
     stk) CMD="mangohud supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed" ;;
-    # The same race with every effect on (rig/heavy's stk-ultra; GPU-bound
-    # at about 200 fps at 3840x2160 on a 5090), vsync on, and with MangoHud
-    # turning the swap interval to 0.
-    stk-ultra | stk-ultra-novsync)
+    # The same race with every effect on (rig/heavy's stk-ultra effects),
+    # vsync on. MangoHud's gl_vsync does not reach this EGL/Wayland path, so
+    # there is no unpaced variant here; rig/rig-heavy.sh has those.
+    stk-ultra)
         CMD="mangohud supertuxkart --no-start-screen --track=lighthouse --numkarts=4 --laps=9 --profile-time=$((WARM + SECS + 20)) --windowed --enable-glow --enable-light-shaft --enable-dof --enable-motion-blur --enable-mlaa --enable-ssao --enable-ibl --enable-hd-textures --enable-dynamic-lights --shadows=2 --anisotropic=16"
         ;;
     # MangoHud in the game only. gamescope without CAP_SYS_NICE, as a user
@@ -82,7 +82,6 @@ esac
 # warm-up and lasts SECS. The wrapper preloads its GL shim and enables the
 # Vulkan layer for the process and its children.
 MH="fps_only,log_interval=0,autostart_log=$WARM,log_duration=$SECS"
-[ "$WL" = stk-ultra-novsync ] && MH="$MH,gl_vsync=0"
 TOTAL=$((WARM + SECS + 6))
 
 # ---- the monitor ------------------------------------------------------------
@@ -142,12 +141,12 @@ run_vm() { # run_vm N
         python3 "$REPO/rig/framepace-sched.py" $((SECS > 6 ? SECS - 4 : 2)) $pids >"$OUT/$WL-vm-$1.sched.txt" 2>&1
     ) &
     rig_run_vm "$tag" "$SESSION" "$TOTAL" "$gcmd" ${extra[@]+"${extra[@]}"} >"$OUT/$WL-vm-$1.launcher.log" 2>&1
-    tr -d '\r' <"$RIG/logs/$tag.console.log" | sed -n '/^FP_CSV_BEGIN/,/^FP_CSV_END/p' | sed '1d;$d' >"$OUT/$WL-vm-$1.csv"
+    tr -d '\r' <"$LOGS/$tag.console.log" | sed -n '/^FP_CSV_BEGIN/,/^FP_CSV_END/p' | sed '1d;$d' >"$OUT/$WL-vm-$1.csv"
     # The two sides' pacing counters: the guest driver's, printed after the
     # log, and the backend's teardown report.
-    rig_pacing "$RIG/logs/$tag.console.log" "$RIG/logs/$tag.backend.log" FP_PACING >"$OUT/$WL-vm-$1.pacing.txt"
-    cp "$RIG/logs/$tag.backend.log" "$OUT/$WL-vm-$1.backend.log" 2>/dev/null
-    cp "$RIG/logs/$tag.console.log" "$OUT/$WL-vm-$1.console.log" 2>/dev/null
+    rig_pacing "$LOGS/$tag.console.log" "$LOGS/$tag.backend.log" FP_PACING >"$OUT/$WL-vm-$1.pacing.txt"
+    cp "$LOGS/$tag.backend.log" "$OUT/$WL-vm-$1.backend.log" 2>/dev/null
+    cp "$LOGS/$tag.console.log" "$OUT/$WL-vm-$1.console.log" 2>/dev/null
     [ -s "$OUT/$WL-vm-$1.csv" ] || rm -f "$OUT/$WL-vm-$1.csv"
 }
 
