@@ -72,10 +72,19 @@ pub struct UvmFdField {
 
 /// The descriptor fields of the host release `v`'s UVM.
 pub fn fields(v: Option<DriverVersion>) -> Vec<UvmFdField> {
-    let Some(t) = v.and_then(uvm_table) else {
-        return Vec::new();
-    };
-    t.cmds
+    all(v).collect()
+}
+
+/// The descriptor field of UVM command `cmd` on release `v`, if it has one.
+/// Looked up in the table as it stands, with nothing built: it is asked
+/// several times for every UVM call.
+pub fn field(v: Option<DriverVersion>, cmd: u32) -> Option<UvmFdField> {
+    all(v).find(|f| f.cmd == cmd)
+}
+
+fn all(v: Option<DriverVersion>) -> impl Iterator<Item = UvmFdField> {
+    v.and_then(uvm_table)
+        .map_or(&[][..], |t| t.cmds)
         .iter()
         .filter_map(|c| {
             let fd = c.fd?;
@@ -89,12 +98,6 @@ pub fn fields(v: Option<DriverVersion>) -> Vec<UvmFdField> {
                 },
             })
         })
-        .collect()
-}
-
-/// The descriptor field of UVM command `cmd` on release `v`, if it has one.
-pub fn field(v: Option<DriverVersion>, cmd: u32) -> Option<UvmFdField> {
-    fields(v).into_iter().find(|f| f.cmd == cmd)
 }
 
 /// The fields as the config's descriptor table carries them: `(nr,

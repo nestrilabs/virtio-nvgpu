@@ -8,7 +8,7 @@
 //! -- and the host copies in from it and out to it on the guest's say-so:
 //! an arbitrary read and write of the VMM. Every forwarding path therefore
 //! either gives each pointer field an address of a buffer the backend owns
-//! (the nested and deep blocks, `nvidia.rs` `dispatch_nested`) or writes 0
+//! (the nested and deep blocks, `nvidia/rm.rs` `dispatch_nested`) or writes 0
 //! there, and restores what the caller had in the reply. What cannot be made
 //! safe that way is refused before it reaches the host.
 //!
@@ -56,9 +56,11 @@
 //!   segment the backend sizes itself (`deepseg.rs`); every other pointer
 //!   field of the command is zeroed, which RM answers as a missing buffer,
 //!   and the controls in `abi::rmctrl::ZEROED_CONTROLS` (ACPI methods among
-//!   them) take no deep block at all. Two commands carry
-//!   pointers the table cannot name one by one (a union selected by a type
-//!   field, an array of per-op pointers) and are refused.
+//!   them) take no deep block at all. Three commands
+//!   (`abi::rmctrl::REFUSED_CONTROLS`) carry pointers the table cannot name
+//!   one by one (I2C_TRANSACTION's union selected by a type field,
+//!   READ_SURFACE's and WRITE_SURFACE's arrays of per-op pointers) and are
+//!   refused.
 //! - **UVM** (`uvm_gate`): nvidia-uvm works on the calling process's address
 //!   space, which is the backend's. Pageable memory access is forced off in
 //!   UVM_INITIALIZE (so neither HMM nor ATS can let the GPU fault in the
@@ -77,6 +79,19 @@ use std::os::fd::BorrowedFd;
 use abi::ioctl::*;
 
 use crate::hostfd;
+use crate::le;
+#[cfg(test)]
+use crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
+use crate::nvos::{
+    NVOS02_H_CLASS, NVOS02_P_MEMORY, NVOS02_WITH_FD_SIZE, NVOS05_H_CLASS,
+    NVOS32_ALLOC_SIZE_ADDRESS, NVOS32_ALLOC_SIZE_RANGE_ADDRESS,
+    NVOS32_ALLOC_TILED_PITCH_HEIGHT_ADDRESS, NVOS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR,
+    NVOS32_FUNCTION_ALLOC_SIZE, NVOS32_FUNCTION_ALLOC_SIZE_RANGE,
+    NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT, NVOS32_FUNCTION_HW_ALLOC,
+    NVOS32_HW_ALLOC_BIND_RESULT_FUNC, NVOS32_HW_ALLOC_P_HANDLE, NVOS32_SIZE,
+    NVOS33_P_LINEAR_ADDRESS, NVOS33_WITH_FD_SIZE, NVOS39_H_CLASS, NVOS54_CMD, NVOS54_SIZE,
+    NVOS64_H_CLASS, NVOS64_P_RIGHTS_REQUESTED, NVOS64_SIZE,
+};
 use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 
 /// A refusal: the errno the guest's ioctl returns.
@@ -167,51 +182,7 @@ impl Plan<'_> {
     }
 }
 
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-fn rd64(b: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
-}
-
 // ───────────────────────────── RM escapes ─────────────────────────────
-
-/// NVOS64 (nvos.h:476-490; 535 through 610 alike).
-const OS64_SIZE: usize = 48;
-const OS64_CLASS: usize = 12;
-const OS64_RIGHTS: usize = 24;
-/// NVOS54.
-const OS54_SIZE: usize = 32;
-const OS54_CMD: usize = 8;
-/// nv_ioctl_nvos02_parameters_with_fd: NVOS02 and the fd after it.
-const OS02_FD_SIZE: usize = 56;
-const OS02_CLASS: usize = 12;
-const OS02_MEMORY: usize = 24;
-/// nv_ioctl_nvos33_parameters_with_fd.
-const OS33_FD_SIZE: usize = 56;
-const OS33_LINEAR: usize = 32;
-/// NVOS32 (nvos.h:665-881).
-const OS32_SIZE: usize = 184;
-const OS32_FUNCTION: usize = 8;
-/// `data.AllocSize.address`, `data.AllocTiledPitchHeight.address`: OUT.
-const OS32_ALLOC_ADDRESS: usize = 120;
-/// `data.AllocSizeRange.address`: OUT.
-const OS32_RANGE_ADDRESS: usize = 128;
-/// `data.HwAlloc.bindResultFunc`, `data.HwAlloc.pHandle`: kept, never called
-/// (hw_resources.c:268-269), but pointers all the same.
-const OS32_HW_BIND: usize = 96;
-const OS32_HW_HANDLE: usize = 104;
-
-const NVOS32_FUNCTION_ALLOC_SIZE: u32 = 2;
-const NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT: u32 = 6;
-const NVOS32_FUNCTION_ALLOC_SIZE_RANGE: u32 = 14;
-const NVOS32_FUNCTION_HW_ALLOC: u32 = 19;
-const NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
-
-/// NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: memory the caller already has, named by
-/// CPU address.
-pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
 
 /// Classes no guest may have the backend allocate, because their parameters
 /// hand RM something the backend cannot vouch for as a pointer or address:
@@ -295,8 +266,8 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         // it goes, with the pointers zeroed; a list is still refused.
         NV_ESC_RM_IDLE_CHANNELS => {
             sized(56)?;
-            let num = rd32(params, 12).unwrap_or(0);
-            let flags = rd32(params, 40).unwrap_or(0);
+            let num = le::u32_at(params, 12).unwrap_or(0);
+            let flags = le::u32_at(params, 40).unwrap_or(0);
             if (flags >> 4) & 0xf == 0 && num != 0 {
                 log::warn!(
                     "RM_IDLE_CHANNELS refused: a list of {num} channels is three arrays the \
@@ -337,13 +308,13 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
             return Err(libc::EOPNOTSUPP);
         }
         NV_ESC_RM_ALLOC => {
-            sized(OS64_SIZE)?;
-            let class = rd32(params, OS64_CLASS).unwrap_or(0);
+            sized(NVOS64_SIZE)?;
+            let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
             if REFUSED_ALLOC_CLASSES.contains(&class) {
                 log::warn!("RM_ALLOC of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
             }
-            plan.zeroed(OS64_RIGHTS);
+            plan.zeroed(NVOS64_P_RIGHTS_REQUESTED);
         }
         // The two older allocation escapes name a class too (NVOS05,
         // NVOS39, hClass at 12 in both): the refused classes are refused
@@ -351,19 +322,19 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         // 2026-09-29 1.18).
         NV_ESC_RM_ALLOC_OBJECT | NV_ESC_RM_ALLOC_CONTEXT_DMA2 => {
             let at = if escape == NV_ESC_RM_ALLOC_OBJECT {
-                abi::rmallow::NVOS05_H_CLASS
+                NVOS05_H_CLASS
             } else {
-                abi::rmallow::NVOS39_H_CLASS
+                NVOS39_H_CLASS
             };
-            let class = rd32(params, at).ok_or(libc::EINVAL)?;
+            let class = le::u32_at(params, at).ok_or(libc::EINVAL)?;
             if REFUSED_ALLOC_CLASSES.contains(&class) {
                 log::warn!("RM escape {escape:#04x} of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
             }
         }
         NV_ESC_RM_CONTROL => {
-            sized(OS54_SIZE)?;
-            let ctl = rd32(params, OS54_CMD).unwrap_or(0);
+            sized(NVOS54_SIZE)?;
+            let ctl = le::u32_at(params, NVOS54_CMD).unwrap_or(0);
             if abi::rmctrl::refused(ctl) {
                 log::warn!(
                     "RM control {ctl:#010x} refused: its pointers cannot be named one by one"
@@ -372,40 +343,46 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
             }
         }
         NV_ESC_RM_ALLOC_MEMORY => {
-            sized(OS02_FD_SIZE)?;
-            let class = rd32(params, OS02_CLASS).unwrap_or(0);
+            sized(NVOS02_WITH_FD_SIZE)?;
+            let class = le::u32_at(params, NVOS02_H_CLASS).unwrap_or(0);
             if REFUSED_ALLOC_MEMORY_CLASSES.contains(&class) {
                 log::warn!("ALLOC_MEMORY of class {class:#x} refused (guestptr.rs)");
                 return Err(libc::EPERM);
             }
             // OUT for every other class: RM writes it and reads nothing
             // (rmapi_deprecated_allocmemory.c:162, 174).
-            plan.out(OS02_MEMORY);
+            plan.out(NVOS02_P_MEMORY);
         }
         NV_ESC_RM_VID_HEAP_CONTROL => {
-            sized(OS32_SIZE)?;
-            match rd32(params, OS32_FUNCTION).unwrap_or(0) {
+            sized(NVOS32_SIZE)?;
+            match le::u32_at(params, NVOS32_FUNCTION).unwrap_or(0) {
                 NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR => {
                     log::warn!("VID_HEAP_CONTROL ALLOC_OS_DESCRIPTOR refused (guestptr.rs)");
                     return Err(libc::EPERM);
                 }
-                NVOS32_FUNCTION_ALLOC_SIZE | NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT => {
-                    plan.out(OS32_ALLOC_ADDRESS);
+                // The allocation's address: OUT.
+                NVOS32_FUNCTION_ALLOC_SIZE => {
+                    plan.out(NVOS32_ALLOC_SIZE_ADDRESS);
+                }
+                NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT => {
+                    plan.out(NVOS32_ALLOC_TILED_PITCH_HEIGHT_ADDRESS);
                 }
                 NVOS32_FUNCTION_ALLOC_SIZE_RANGE => {
-                    plan.out(OS32_RANGE_ADDRESS);
+                    plan.out(NVOS32_ALLOC_SIZE_RANGE_ADDRESS);
                 }
+                // `bindResultFunc` and `pHandle`: kept, never called
+                // (hw_resources.c:268-269), but pointers all the same.
                 NVOS32_FUNCTION_HW_ALLOC => {
-                    plan.zeroed(OS32_HW_BIND);
-                    plan.zeroed(OS32_HW_HANDLE);
+                    plan.zeroed(NVOS32_HW_ALLOC_BIND_RESULT_FUNC);
+                    plan.zeroed(NVOS32_HW_ALLOC_P_HANDLE);
                 }
                 _ => {}
             }
         }
         NV_ESC_RM_MAP_MEMORY => {
-            sized(OS33_FD_SIZE)?;
+            sized(NVOS33_WITH_FD_SIZE)?;
             // OUT: RM writes the mapping's address (Nv04MapMemory).
-            plan.out(OS33_LINEAR);
+            plan.out(NVOS33_P_LINEAR_ADDRESS);
         }
         _ => {}
     }
@@ -436,10 +413,10 @@ pub(crate) fn idle_channels_list<'g>(
         return Err(libc::EINVAL);
     }
     let count = IDLE_CHANNELS.ptrs[0].counts[0].offset;
-    let num = rd32(params, count).unwrap_or(0);
+    let num = le::u32_at(params, count).unwrap_or(0);
     let (lo, hi) = IDLE_CHANNELS_LIST_BITS;
     let channel =
-        (rd32(params, IDLE_CHANNELS_FLAGS).unwrap_or(0) >> lo) & ((1 << (hi - lo + 1)) - 1);
+        (le::u32_at(params, IDLE_CHANNELS_FLAGS).unwrap_or(0) >> lo) & ((1 << (hi - lo + 1)) - 1);
     // Only a list reads the arrays: segments for anything else are not a
     // mistake to paper over.
     if channel != IDLE_CHANNELS_LIST || num == 0 {
@@ -542,7 +519,7 @@ pub const UVM_INIT_FLAGS_DISABLE_HMM: u64 = 0x1;
 /// (uvm_va_space_create, `flags & ~UVM_INIT_FLAGS_MASK`), so it is forced
 /// only where the host's table says the release takes it. Before that,
 /// DISABLE_HMM is the only switch, and ATS the other way in: the backend asks
-/// UVM afterwards whether the VA space has pageable access (nvidia.rs).
+/// UVM afterwards whether the VA space has pageable access (nvidia/uvm.rs).
 pub const UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
 /// UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE (uvm_types.h:67): the VA space
 /// is tied to no process's mm. Then any process may mmap the file
@@ -633,7 +610,7 @@ pub(crate) fn uvm_gate(
     let mut plan = Plan::default();
     if cmd == UVM_INITIALIZE {
         // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
-        let Some(flags) = rd64(params, 0) else {
+        let Some(flags) = le::u64_at(params, 0) else {
             return Err(libc::EINVAL);
         };
         // Sharing mode on top: one VA-space shape for every guest, whether or
@@ -669,6 +646,7 @@ pub(crate) fn uvm_gate(
 mod tests {
     use super::*;
     use crate::hostfd::{IOC_RW, ioc};
+    use crate::le::u64_at as rd64;
     use abi::rmctrl::{CONTROL_POINTERS, REFUSED_CONTROLS};
 
     fn put32(b: &mut [u8], off: usize, v: u32) {
@@ -722,22 +700,25 @@ mod tests {
     #[test]
     fn rights_requested_never_reach_the_host_and_come_back_as_sent() {
         let mut p = vec![0u8; 48];
-        put32(&mut p, OS64_CLASS, 0x41);
-        put64(&mut p, OS64_RIGHTS, 0x7fff_dead_b000);
+        put32(&mut p, NVOS64_H_CLASS, 0x41);
+        put64(&mut p, NVOS64_P_RIGHTS_REQUESTED, 0x7fff_dead_b000);
         let (host, reply) = built(&rm_escape(ALLOC, &p).unwrap(), &p);
-        assert_eq!(rd64(&host, OS64_RIGHTS), Some(0));
-        assert_eq!(rd64(&reply, OS64_RIGHTS), Some(0x7fff_dead_b000));
+        assert_eq!(rd64(&host, NVOS64_P_RIGHTS_REQUESTED), Some(0));
+        assert_eq!(
+            rd64(&reply, NVOS64_P_RIGHTS_REQUESTED),
+            Some(0x7fff_dead_b000)
+        );
     }
 
     #[test]
     fn classes_that_hand_rm_a_cpu_address_or_a_function_are_never_allocated() {
         for class in REFUSED_ALLOC_CLASSES {
             let mut p = vec![0u8; 48];
-            put32(&mut p, OS64_CLASS, class);
+            put32(&mut p, NVOS64_H_CLASS, class);
             assert_eq!(rm_escape(ALLOC, &p), Err(libc::EPERM), "class {class:#x}");
         }
         let mut p = vec![0u8; 48];
-        put32(&mut p, OS64_CLASS, 0x3e);
+        put32(&mut p, NVOS64_H_CLASS, 0x3e);
         assert!(rm_escape(ALLOC, &p).is_ok(), "plain system memory");
     }
 
@@ -766,7 +747,7 @@ mod tests {
     fn imex_sessions_and_fabric_memory_are_never_allocated() {
         for class in [0xf1, 0xf9, 0xfd] {
             let mut p = vec![0u8; 48];
-            put32(&mut p, OS64_CLASS, class);
+            put32(&mut p, NVOS64_H_CLASS, class);
             assert_eq!(rm_escape(ALLOC, &p), Err(libc::EPERM), "class {class:#x}");
         }
     }
@@ -789,17 +770,17 @@ mod tests {
     #[test]
     fn os_descriptor_memory_is_refused_on_every_path() {
         let mut p = vec![0u8; 56];
-        put32(&mut p, OS02_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
-        put64(&mut p, OS02_MEMORY, 0x7f00_0000_0000);
+        put32(&mut p, NVOS02_H_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+        put64(&mut p, NVOS02_P_MEMORY, 0x7f00_0000_0000);
         assert_eq!(rm_escape(ALLOC_MEMORY, &p), Err(libc::EPERM));
 
         let mut p = vec![0u8; 184];
-        put32(&mut p, OS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
+        put32(&mut p, NVOS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
         assert_eq!(rm_escape(VID_HEAP, &p), Err(libc::EPERM));
 
         for class in 0x81..=0x83 {
             let mut p = vec![0u8; 56];
-            put32(&mut p, OS02_CLASS, class);
+            put32(&mut p, NVOS02_H_CLASS, class);
             assert_eq!(rm_escape(ALLOC_MEMORY, &p), Err(libc::EPERM), "{class:#x}");
         }
     }
@@ -807,28 +788,34 @@ mod tests {
     #[test]
     fn output_addresses_go_to_the_host_as_zero() {
         let mut p = vec![0u8; 56];
-        put32(&mut p, OS02_CLASS, 0x3e);
-        put64(&mut p, OS02_MEMORY, 0x1234_5000);
+        put32(&mut p, NVOS02_H_CLASS, 0x3e);
+        put64(&mut p, NVOS02_P_MEMORY, 0x1234_5000);
         let plan = rm_escape(ALLOC_MEMORY, &p).unwrap();
         assert_eq!(
             plan.slots,
-            [(OS02_MEMORY, TopSlot::Out)],
+            [(NVOS02_P_MEMORY, TopSlot::Out)],
             "the host's answer goes back"
         );
-        assert_eq!(rd64(&built(&plan, &p).0, OS02_MEMORY), Some(0));
+        assert_eq!(rd64(&built(&plan, &p).0, NVOS02_P_MEMORY), Some(0));
 
         let mut p = vec![0u8; 56];
-        put64(&mut p, OS33_LINEAR, 0x1234_5000);
+        put64(&mut p, NVOS33_P_LINEAR_ADDRESS, 0x1234_5000);
         let plan = rm_escape(MAP_MEMORY, &p).unwrap();
-        assert_eq!(rd64(&built(&plan, &p).0, OS33_LINEAR), Some(0));
+        assert_eq!(rd64(&built(&plan, &p).0, NVOS33_P_LINEAR_ADDRESS), Some(0));
 
         for (f, off) in [
-            (NVOS32_FUNCTION_ALLOC_SIZE, OS32_ALLOC_ADDRESS),
-            (NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT, OS32_ALLOC_ADDRESS),
-            (NVOS32_FUNCTION_ALLOC_SIZE_RANGE, OS32_RANGE_ADDRESS),
+            (NVOS32_FUNCTION_ALLOC_SIZE, NVOS32_ALLOC_SIZE_ADDRESS),
+            (
+                NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT,
+                NVOS32_ALLOC_TILED_PITCH_HEIGHT_ADDRESS,
+            ),
+            (
+                NVOS32_FUNCTION_ALLOC_SIZE_RANGE,
+                NVOS32_ALLOC_SIZE_RANGE_ADDRESS,
+            ),
         ] {
             let mut p = vec![0u8; 184];
-            put32(&mut p, OS32_FUNCTION, f);
+            put32(&mut p, NVOS32_FUNCTION, f);
             put64(&mut p, off, 0x1234_5000);
             let plan = rm_escape(VID_HEAP, &p).unwrap();
             assert_eq!(rd64(&built(&plan, &p).0, off), Some(0), "function {f}");
@@ -838,16 +825,22 @@ mod tests {
     #[test]
     fn hw_alloc_pointers_are_zeroed_and_given_back() {
         let mut p = vec![0u8; 184];
-        put32(&mut p, OS32_FUNCTION, NVOS32_FUNCTION_HW_ALLOC);
-        put64(&mut p, OS32_HW_BIND, 0xaaaa);
-        put64(&mut p, OS32_HW_HANDLE, 0xbbbb);
+        put32(&mut p, NVOS32_FUNCTION, NVOS32_FUNCTION_HW_ALLOC);
+        put64(&mut p, NVOS32_HW_ALLOC_BIND_RESULT_FUNC, 0xaaaa);
+        put64(&mut p, NVOS32_HW_ALLOC_P_HANDLE, 0xbbbb);
         let (host, reply) = built(&rm_escape(VID_HEAP, &p).unwrap(), &p);
         assert_eq!(
-            (rd64(&host, OS32_HW_BIND), rd64(&host, OS32_HW_HANDLE)),
+            (
+                rd64(&host, NVOS32_HW_ALLOC_BIND_RESULT_FUNC),
+                rd64(&host, NVOS32_HW_ALLOC_P_HANDLE)
+            ),
             (Some(0), Some(0))
         );
         assert_eq!(
-            (rd64(&reply, OS32_HW_BIND), rd64(&reply, OS32_HW_HANDLE)),
+            (
+                rd64(&reply, NVOS32_HW_ALLOC_BIND_RESULT_FUNC),
+                rd64(&reply, NVOS32_HW_ALLOC_P_HANDLE)
+            ),
             (Some(0xaaaa), Some(0xbbbb))
         );
     }
@@ -855,7 +848,7 @@ mod tests {
     #[test]
     fn a_heap_function_without_pointers_is_left_alone() {
         let mut p = vec![0x5au8; 184];
-        put32(&mut p, OS32_FUNCTION, 3); // FREE
+        put32(&mut p, NVOS32_FUNCTION, 3); // FREE
         let plan = rm_escape(VID_HEAP, &p).unwrap();
         assert!(plan.slots.is_empty());
         assert_eq!(built(&plan, &p).0, p);
@@ -865,7 +858,7 @@ mod tests {
     fn controls_whose_pointers_have_no_fixed_place_are_refused() {
         for &(ctl, _) in REFUSED_CONTROLS {
             let mut p = vec![0u8; 32];
-            put32(&mut p, OS54_CMD, ctl);
+            put32(&mut p, NVOS54_CMD, ctl);
             assert_eq!(rm_escape(CONTROL, &p), Err(libc::EPERM), "{ctl:#x}");
         }
     }
@@ -1860,7 +1853,7 @@ mod backend_tests {
     #[test]
     fn uvm_reaches_the_host_without_pageable_access_and_answers_with_the_callers_flags() {
         let (mut be, h) = backend(HandleKind::Dev(DeviceKind::Uvm));
-        // UVM blocks are sized by the host's release (nvidia.rs, uvm_size_ok).
+        // UVM blocks are sized by the host's release (nvidia/uvm.rs, uvm_size_ok).
         be.set_host_driver_version("610.57.04");
         let mut p = vec![0u8; 16];
         p[0..8].copy_from_slice(&0x2u64.to_le_bytes());

@@ -6,3 +6,7 @@ license = "Apache-2.0"
 rust-version.workspace = true
 publish.workspace = true
 description = "NVIDIA driver ABI tables for virtio-nvgpu, measured per driver release: ABI profiles, RM allowlist, RM control pointers, IOCTL2 schema"
+
+[dev-dependencies]
+# The protocol's HK_* kinds, which the schema's FdIn kind bits are.
+protocol = { workspace = true }

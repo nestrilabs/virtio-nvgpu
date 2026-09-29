@@ -104,7 +104,7 @@ pub fn begin(msg: &[u8]) {
         s.taint.clear();
         // Every 8 bytes of the message, and every 5 to 7 bytes zero-extended:
         // a block cut short leaves the host reading the guest's low bytes
-        // over zeros of ours (nvidia.rs, dispatch_nested).
+        // over zeros of ours (nvidia/rm.rs, dispatch_nested).
         for i in 0..msg.len() {
             for n in 5..=8 {
                 let Some(w) = msg.get(i..i + n) else { break };
@@ -350,7 +350,7 @@ fn fake_answer(
             let params = rd64(a, 16);
             let psize = rd32(a, 32);
             let _ = follow(arg, rd64(a, 24), 4, "RM_ALLOC pRightsRequested");
-            if class == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+            if class == crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                 if !follow(arg, params, 40, "OS descriptor params") {
                     return -libc::EFAULT;
                 }
@@ -380,7 +380,7 @@ fn fake_answer(
             put32(a, 40, status);
         }
         (b'F', NV_ESC_RM_ALLOC_MEMORY) if len >= 56 => {
-            if rd32(a, 12) == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+            if rd32(a, 12) == crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                 pinned(
                     arg,
                     rd64(a, 24),
@@ -397,7 +397,7 @@ fn fake_answer(
             put32(a, 40, status);
         }
         (b'F', NV_ESC_RM_VID_HEAP_CONTROL) if len >= 184 => {
-            if rd32(a, 8) == crate::osdesc::NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR {
+            if rd32(a, 8) == crate::nvos::NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR {
                 pinned(
                     arg,
                     rd64(a, 64),

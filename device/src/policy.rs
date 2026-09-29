@@ -88,7 +88,7 @@ impl BackendHooks {
     //
     // Framebuffer tracking (FB_CREATE/FB_REMOVE/FB_READ: GETFB/GETFB2 hand
     // back GEM handles only for the file's own framebuffers, per handle in
-    // `xfer::KmsFileState`, RV:getfb), ADDFB2's unused planes (FB_PLANES) and
+    // `kms_state::KmsFileState`, RV:getfb), ADDFB2's unused planes (FB_PLANES) and
     // the refusal of fence and pointer properties on the legacy setters
     // (SETPROP, RV:setprop) are enforced by `xfer` itself from the entry's
     // bits. What is left to decide here: what counts as a fence or pointer

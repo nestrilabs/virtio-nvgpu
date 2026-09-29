@@ -560,6 +560,7 @@ pub fn probe_writable(fd: RawFd, len: usize, off: u64) -> Option<bool> {
 }
 
 /// Whether any page of `[addr, addr + len)` is mapped in this process.
+#[cfg(test)]
 pub fn any_mapped(addr: u64, len: u64) -> bool {
     let page = PAGE as u64;
     let base = addr & !(page - 1);

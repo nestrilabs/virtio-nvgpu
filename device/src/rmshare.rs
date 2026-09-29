@@ -67,11 +67,14 @@ use abi::ioctl::{
 };
 pub use protocol::messages::ProcId;
 
-pub use crate::rmctl::NV_ERR_INSUFFICIENT_PERMISSIONS;
-
-/// NV_ERR_INSUFFICIENT_RESOURCES (nvstatuscodes.h): more grants than
-/// [`GRANT_CAP`].
-pub const NV_ERR_INSUFFICIENT_RESOURCES: u32 = 0x1a;
+use crate::le;
+use crate::nvos::{
+    DEFERRED_API_BUNDLE, DEFERRED_API_CMD, DEFERRED_API_CONTROLS, DEFERRED_API_H_CLIENT_VA,
+    NV_ERR_INSUFFICIENT_PERMISSIONS, NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_ARGUMENT,
+    NVOS54_CMD, NVOS54_SIZE, NVOS54_STATUS, NVOS55_H_CLIENT_SRC, NVOS55_H_OBJECT_SRC, NVOS55_SIZE,
+    NVOS55_STATUS, NVOS57_H_OBJECT, NVOS57_SHARE_POLICY, NVOS57_SIZE, NVOS57_STATUS,
+    NVOS64_H_CLASS, NVOS64_SIZE, NVOS64_STATUS, OS_EVENT_SIZE, OS_EVENT_STATUS, ROOT_CLASSES,
+};
 
 /// `RS_SHARE_TYPE_*` (rs_access.h), the same in 535 through 610.
 pub const RS_SHARE_TYPE_NONE: u16 = 0;
@@ -93,39 +96,6 @@ pub const RS_SHARE_ACTION_FLAG_COMPOSE: u8 = 1 << 2;
 /// `RS_ACCESS_DUP_OBJECT`, as a bit of an `RS_ACCESS_MASK`'s one limb.
 pub const RS_ACCESS_DUP_OBJECT_BIT: u32 = 1 << 0;
 
-/// NVOS57_PARAMETERS: `{hClient, hObject, RS_SHARE_POLICY sharePolicy,
-/// status}`, 24 bytes; the policy is `{target, accessMask, type (u16),
-/// action (u8)}`, 12 bytes (nvos.h, rs_access.h; the same in 595.99.02 and
-/// 610.57.04).
-pub const OS57_SIZE: usize = 24;
-const OS57_OBJECT: usize = 4;
-const OS57_POLICY: usize = 8;
-pub const OS57_STATUS: usize = 20;
-
-/// NVOS55_PARAMETERS: `{hClient, hParent, hObject, hClientSrc, hObjectSrc,
-/// flags, status}`, 28 bytes.
-pub const OS55_SIZE: usize = 28;
-const OS55_CLIENT_SRC: usize = 12;
-const OS55_OBJECT_SRC: usize = 16;
-pub const OS55_STATUS: usize = 24;
-
-/// NVOS64: the class at 12, the status at 40, 48 bytes; the class
-/// parameters follow.
-const OS64_CLASS: usize = 12;
-pub const OS64_STATUS: usize = 40;
-const OS64_SIZE: usize = 48;
-
-/// NVOS54: the command at 8, the status at 28, 32 bytes; the parameters
-/// follow.
-const OS54_CMD: usize = 8;
-pub const OS54_STATUS: usize = 28;
-const OS54_SIZE: usize = 32;
-
-/// nv_ioctl_{alloc,free}_os_event_t: `{hClient, hDevice, fd, Status}`, 16
-/// bytes (nv-ioctl.h).
-pub const OS_EVENT_SIZE: usize = 16;
-pub const OS_EVENT_STATUS: usize = 12;
-
 /// NV0000_CTRL_CMD_CLIENT_SET_INHERITED_SHARE_POLICY: `{RS_SHARE_POLICY}`,
 /// applied to the calling client itself (cliresCtrlCmdClientSetInherited
 /// SharePolicy: `hObject` is the client).
@@ -139,10 +109,6 @@ pub const CTRL_SHARE_OBJECT: u32 = 0x0000_0d06;
 /// list included.
 pub const GRANT_CAP: usize = 4096;
 
-fn rd32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-
 /// An `RS_SHARE_POLICY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -153,13 +119,14 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The 12-byte policy at `at` in `b`.
+    /// The 12-byte policy at `at` in `b`: `{target, accessMask, type (u16),
+    /// action (u8)}` (rs_access.h; the same in 595.99.02 and 610.57.04).
     pub fn read(b: &[u8], at: usize) -> Option<Self> {
-        let p = b.get(at..at + 12)?;
+        let p = b.get(at..at.checked_add(12)?)?;
         Some(Self {
-            target: rd32(p, 0)?,
-            mask: rd32(p, 4)?,
-            kind: u16::from_le_bytes([p[8], p[9]]),
+            target: le::u32_at(p, 0)?,
+            mask: le::u32_at(p, 4)?,
+            kind: le::uint_at(p, 8, 2)? as u16,
             action: p[10],
         })
     }
@@ -317,9 +284,9 @@ pub enum DupVerdict {
 /// NV_ESC_RM_DUP_OBJECT's `(hClient, hClientSrc, hObjectSrc)`.
 pub fn dup_names(params: &[u8]) -> Option<(u32, u32, u32)> {
     Some((
-        rd32(params, 0)?,
-        rd32(params, OS55_CLIENT_SRC)?,
-        rd32(params, OS55_OBJECT_SRC)?,
+        le::u32_at(params, 0)?,
+        le::u32_at(params, NVOS55_H_CLIENT_SRC)?,
+        le::u32_at(params, NVOS55_H_OBJECT_SRC)?,
     ))
 }
 
@@ -557,7 +524,7 @@ fn named_list(
     name: &'static str,
     rule: Rule,
 ) -> Result<Vec<Named>, &'static str> {
-    let n = rd32(b, count).ok_or(name)? as usize;
+    let n = le::u32_at(b, count).ok_or(name)? as usize;
     if n > max {
         return Err(name);
     }
@@ -576,16 +543,6 @@ fn control_fields(cmd: u32, params: &[u8]) -> Option<Result<Vec<Named>, &'static
         .map(|&(_, name, count, list, max, rule)| named_list(params, count, list, max, name, rule))
 }
 
-/// NV5080_CTRL_CMD_DEFERRED_API and _V2:`{hApiHandle, cmd, flags,
-/// hClientVA, hDeviceVA, union api_bundle}` with the bundle at 24, holding
-/// the parameters of the control `cmd` names, run later at the caller's
-/// privilege (deferred_api.c). `hClientVA` is looked up, never checked:
-/// [`Rule::Process`].
-const DEFERRED_API: [u32; 2] = [0x5080_0101, 0x5080_0103];
-const DEFERRED_CMD: usize = 4;
-const DEFERRED_CLIENT_VA: usize = 12;
-const DEFERRED_BUNDLE: usize = 24;
-
 /// The client handles an RM_ALLOC's class parameters (`nested`, after NVOS64)
 /// name besides the caller's, zeros left out; `Err` names a field the block
 /// is too short to hold. No parameters at all is RM's defaults: none named.
@@ -602,14 +559,15 @@ pub fn alloc_named(class: u32, nested: &[u8]) -> Result<Vec<Named>, &'static str
 /// The client handles an RM control's parameters (`params`, after NVOS54)
 /// name besides the caller's.
 pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<Named>, &'static str> {
-    if DEFERRED_API.contains(&cmd) {
+    // DEFERRED_API's own `hClientVA` is looked up, never checked.
+    if DEFERRED_API_CONTROLS.contains(&cmd) {
         let mut out = named(
             params,
-            &[f(DEFERRED_CLIENT_VA, Rule::Process)],
+            &[f(DEFERRED_API_H_CLIENT_VA, Rule::Process)],
             "NV5080_CTRL_CMD_DEFERRED_API",
         )?;
-        let inner = rd32(params, DEFERRED_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
-        let bundle = params.get(DEFERRED_BUNDLE..).unwrap_or(&[]);
+        let inner = le::u32_at(params, DEFERRED_API_CMD).ok_or("NV5080_CTRL_CMD_DEFERRED_API")?;
+        let bundle = params.get(DEFERRED_API_BUNDLE..).unwrap_or(&[]);
         if let Some(r) = control_fields(inner, bundle) {
             out.extend(r?);
         }
@@ -621,12 +579,12 @@ pub fn control_named(cmd: u32, params: &[u8]) -> Result<Vec<Named>, &'static str
 fn named(b: &[u8], fields: &[Field], name: &'static str) -> Result<Vec<Named>, &'static str> {
     let mut out = Vec::new();
     for fl in fields {
-        let h = rd32(b, fl.at).ok_or(name)?;
+        let h = le::u32_at(b, fl.at).ok_or(name)?;
         if h == 0 {
             continue;
         }
         let obj = match fl.rule {
-            Rule::Shared { obj, .. } => rd32(b, obj).ok_or(name)?,
+            Rule::Shared { obj, .. } => le::u32_at(b, obj).ok_or(name)?,
             _ => 0,
         };
         out.push(Named {
@@ -646,16 +604,16 @@ fn named(b: &[u8], fields: &[Field], name: &'static str) -> Result<Vec<Named>, &
 pub fn share_of(escape: u32, params: &[u8]) -> Option<(u32, u32, Policy)> {
     match escape {
         NV_ESC_RM_SHARE => Some((
-            rd32(params, 0)?,
-            rd32(params, OS57_OBJECT)?,
-            Policy::read(params, OS57_POLICY)?,
+            le::u32_at(params, 0)?,
+            le::u32_at(params, NVOS57_H_OBJECT)?,
+            Policy::read(params, NVOS57_SHARE_POLICY)?,
         )),
         NV_ESC_RM_CONTROL => {
-            let client = rd32(params, 0)?;
-            let ctl = params.get(OS54_SIZE..)?;
-            match rd32(params, OS54_CMD)? {
+            let client = le::u32_at(params, 0)?;
+            let ctl = params.get(NVOS54_SIZE..)?;
+            match le::u32_at(params, NVOS54_CMD)? {
                 CTRL_SET_INHERITED_SHARE_POLICY => Some((client, client, Policy::read(ctl, 0)?)),
-                CTRL_SHARE_OBJECT => Some((client, rd32(ctl, 0)?, Policy::read(ctl, 4)?)),
+                CTRL_SHARE_OBJECT => Some((client, le::u32_at(ctl, 0)?, Policy::read(ctl, 4)?)),
                 _ => None,
             }
         }
@@ -667,10 +625,10 @@ pub fn share_of(escape: u32, params: &[u8]) -> Option<(u32, u32, Policy)> {
 /// refused here.
 pub fn status_at(escape: u32) -> Option<usize> {
     match escape {
-        NV_ESC_RM_SHARE => Some(OS57_STATUS),
-        NV_ESC_RM_DUP_OBJECT => Some(OS55_STATUS),
-        NV_ESC_RM_ALLOC => Some(OS64_STATUS),
-        NV_ESC_RM_CONTROL => Some(OS54_STATUS),
+        NV_ESC_RM_SHARE => Some(NVOS57_STATUS),
+        NV_ESC_RM_DUP_OBJECT => Some(NVOS55_STATUS),
+        NV_ESC_RM_ALLOC => Some(NVOS64_STATUS),
+        NV_ESC_RM_CONTROL => Some(NVOS54_STATUS),
         NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => Some(OS_EVENT_STATUS),
         _ => None,
     }
@@ -829,16 +787,6 @@ impl Ownership {
 
 use crate::nvidia::NvidiaBackend;
 
-/// The reply to a call refused here: the parameters as the guest sent them,
-/// with RM's status for a caller without the right at `status`.
-pub fn refusal(params: &[u8], status_at: usize, status: u32) -> Vec<u8> {
-    let mut out = params.to_vec();
-    if let Some(s) = out.get_mut(status_at..status_at + 4) {
-        s.copy_from_slice(&status.to_le_bytes());
-    }
-    out
-}
-
 /// How the gate turns a call away.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refuse {
@@ -875,15 +823,11 @@ impl NvidiaBackend {
             NV_ESC_RM_DUP_OBJECT => true,
             NV_ESC_RM_CONTROL => euid,
             NV_ESC_RM_ALLOC => {
-                rd32(params, OS64_CLASS).is_some_and(|c| crate::semsurf::ROOT_CLASSES.contains(&c))
+                le::u32_at(params, NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c))
             }
             _ => false,
         };
-        let id = trailer.get(..size_of::<ProcId>()).map(|b| ProcId {
-            start_ns: u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            tgid: u32::from_le_bytes(b[8..12].try_into().unwrap()),
-            euid: u32::from_le_bytes(b[12..16].try_into().unwrap()),
-        });
+        let id = crate::sys::pod::read::<ProcId>(trailer, 0);
         match id {
             Some(id) => Ok(Some(Caller::from_wire(&id, euid))),
             None if needed => {
@@ -912,10 +856,11 @@ impl NvidiaBackend {
         let shares = escape == NV_ESC_RM_SHARE
             || (escape == NV_ESC_RM_CONTROL
                 && matches!(
-                    rd32(params, OS54_CMD),
+                    le::u32_at(params, NVOS54_CMD),
                     Some(CTRL_SET_INHERITED_SHARE_POLICY | CTRL_SHARE_OBJECT)
                 ));
-        if shares && (share.is_none() || (escape == NV_ESC_RM_SHARE && params.len() < OS57_SIZE)) {
+        if shares && (share.is_none() || (escape == NV_ESC_RM_SHARE && params.len() < NVOS57_SIZE))
+        {
             log::warn!("RM share ({escape:#04x}) too short to hold its policy; refused");
             return Err(Refuse::Errno(libc::EINVAL));
         }
@@ -944,7 +889,8 @@ impl NvidiaBackend {
         }
         match escape {
             NV_ESC_RM_DUP_OBJECT => {
-                let Some((dst, src, obj)) = dup_names(params).filter(|_| params.len() >= OS55_SIZE)
+                let Some((dst, src, obj)) =
+                    dup_names(params).filter(|_| params.len() >= NVOS55_SIZE)
                 else {
                     log::warn!("RM_DUP_OBJECT too short to name its clients; refused");
                     return Err(Refuse::Errno(libc::EINVAL));
@@ -967,16 +913,16 @@ impl NvidiaBackend {
                 }
             }
             NV_ESC_RM_ALLOC => {
-                let own = rd32(params, 0).unwrap_or(0);
-                let class = rd32(params, OS64_CLASS).unwrap_or(0);
-                let nested = params.get(OS64_SIZE..).unwrap_or(&[]);
+                let own = le::u32_at(params, 0).unwrap_or(0);
+                let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
+                let nested = params.get(NVOS64_SIZE..).unwrap_or(&[]);
                 self.named_clients_ok(own, caller, alloc_named(class, nested))
                     .map_err(Refuse::Status)?;
             }
             NV_ESC_RM_CONTROL => {
-                let own = rd32(params, 0).unwrap_or(0);
-                let cmd = rd32(params, OS54_CMD).unwrap_or(0);
-                let ctl = params.get(OS54_SIZE..).unwrap_or(&[]);
+                let own = le::u32_at(params, 0).unwrap_or(0);
+                let cmd = le::u32_at(params, NVOS54_CMD).unwrap_or(0);
+                let ctl = params.get(NVOS54_SIZE..).unwrap_or(&[]);
                 self.named_clients_ok(own, caller, control_named(cmd, ctl))
                     .map_err(Refuse::Status)?;
             }
@@ -993,7 +939,8 @@ impl NvidiaBackend {
             // `event->nvfp`), which is the one the caller then polls, a file of
             // its own and not the one its client was made on.
             NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
-                let Some(client) = rd32(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE) else {
+                let Some(client) = le::u32_at(params, 0).filter(|_| params.len() >= OS_EVENT_SIZE)
+                else {
                     log::warn!("OS event call ({escape:#04x}) too short to name its client");
                     return Err(Refuse::Errno(libc::EINVAL));
                 };
@@ -1034,7 +981,7 @@ impl NvidiaBackend {
         // 2026-09-29 2.6): not a permission.
         let named = named.map_err(|what| {
             log::warn!("{what}: parameters too short to hold the client they name; refused");
-            crate::nvidia::NV_ERR_INVALID_ARGUMENT
+            NV_ERR_INVALID_ARGUMENT
         })?;
         for n in named {
             // The caller's own client, as RM treats it: every rule passes.
@@ -1070,7 +1017,7 @@ impl NvidiaBackend {
         let Some((owner, object, p)) = pending.share else {
             return;
         };
-        if status_at(escape).and_then(|at| rd32(reply, at)) == Some(0) {
+        if status_at(escape).and_then(|at| le::u32_at(reply, at)) == Some(0) {
             self.semsurf.shared(owner, object, &p);
         }
     }
@@ -1209,7 +1156,7 @@ mod tests {
 
     #[test]
     fn the_nvos57_policy_is_read_where_rm_keeps_it() {
-        let mut p = [0u8; OS57_SIZE];
+        let mut p = [0u8; NVOS57_SIZE];
         p[0..4].copy_from_slice(&OWNER.to_le_bytes());
         p[4..8].copy_from_slice(&0x55u32.to_le_bytes());
         p[8..12].copy_from_slice(&PEER.to_le_bytes());
@@ -1224,7 +1171,7 @@ mod tests {
         );
         // The controls: SHARE_OBJECT's object at 0 and policy at 4,
         // SET_INHERITED_SHARE_POLICY's policy at 0 on the client itself.
-        let mut c = vec![0u8; OS54_SIZE + 16];
+        let mut c = vec![0u8; NVOS54_SIZE + 16];
         c[0..4].copy_from_slice(&OWNER.to_le_bytes());
         c[8..12].copy_from_slice(&CTRL_SHARE_OBJECT.to_le_bytes());
         c[32..36].copy_from_slice(&0x77u32.to_le_bytes());
@@ -1634,68 +1581,41 @@ mod tests {
 #[cfg(test)]
 mod backend_tests {
     use super::*;
-    use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
+    use crate::hostfd::{HandleKind, IOC_RW, ioc};
+    use crate::le::u32_at as rd32;
+    use crate::nvos::{NV01_DEVICE_0, NV20_SUBDEVICE_0};
+    use crate::testing::rm;
     use protocol::messages::{
         BCAP_PROC_EUID, BCAP_PROC_ID, DeviceKind, GCAP_PROC_EUID, GCAP_PROC_ID, HELLO_F_FRESH,
         HelloReq, MsgType, PROTO_V2, ProcId,
     };
-    use std::cell::{Cell, RefCell};
-    use std::os::fd::{OwnedFd, RawFd};
+    use std::os::fd::OwnedFd;
 
     const ALLOC: u32 = ioc(IOC_RW, b'F', 0x2b, 48);
     const CONTROL: u32 = ioc(IOC_RW, b'F', 0x2a, 32);
     const FREE: u32 = ioc(IOC_RW, b'F', 0x29, 16);
-    const DUP: u32 = ioc(IOC_RW, b'F', 0x34, OS55_SIZE);
-    const SHARE: u32 = ioc(IOC_RW, b'F', 0x35, OS57_SIZE);
+    const DUP: u32 = ioc(IOC_RW, b'F', 0x34, NVOS55_SIZE);
+    const SHARE: u32 = ioc(IOC_RW, b'F', 0x35, NVOS57_SIZE);
     /// A client of the host's that no guest allocated: another VM's backend,
     /// the host compositor, the backend's own private one.
     const HOST: u32 = 0xc1d0_0999;
     /// Where a v1 reply's parameters start: MsgHeader, IoctlResp.
     const BODY: usize = 16 + 12;
 
-    std::thread_local! {
-        /// (escape, hClient) of every RM call that reached the host.
-        static SEEN: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-        static NEXT_CLIENT: Cell<u32> = const { Cell::new(0xc1d0_0001) };
-    }
-
-    fn seen() -> Vec<(u32, u32)> {
-        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    fn seen() -> Vec<rm::Call> {
+        rm::seen()
     }
 
     fn reached(nr: u32) -> bool {
-        seen().iter().any(|&(n, _)| n == nr)
+        seen().iter().any(|c| c.nr == nr)
     }
 
-    /// A host RM that allocates clients with fresh handles and answers
-    /// NV_OK to everything else.
-    fn fake_rm(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
-        let request = request as u32;
-        let a = &mut arg.bytes()[..hostfd::ioc_size(request)];
-        let nr = hostfd::ioc_nr(request);
-        SEEN.with(|s| s.borrow_mut().push((nr, rd32(a, 0).unwrap())));
-        let status = match nr {
-            0x2b => {
-                if crate::semsurf::ROOT_CLASSES.contains(&rd32(a, 12).unwrap()) {
-                    let h = NEXT_CLIENT.with(|c| c.replace(c.get() + 1));
-                    a[8..12].copy_from_slice(&h.to_le_bytes());
-                }
-                40
-            }
-            0x2a => 28,
-            0x29 => 12,
-            0x34 => 24,
-            // A share of object 0xbad is one RM turns down.
-            0x35 if rd32(a, 4) == Some(0xbad) => {
-                a[20..24].copy_from_slice(&NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes());
-                return 0;
-            }
-            0x35 => 20,
-            _ => return 0,
-        };
-        a[status..status + 4].fill(0);
-        0
-    }
+    /// The device every client here has, and the subdevice and memory
+    /// objects under it the tests name.
+    const DEVICE: u32 = 0xde7;
+    const SUBDEVICE: u32 = 0x2080;
+    const MEMORY: [u32; 7] = [0x55, 0x66, 0x77, 0x88, 0xbad, 0x3d, 0x3e];
+    const NV01_MEMORY_SYSTEM: u32 = 0x3e;
 
     /// What a current guest module says it can do.
     const FULL: u32 = GCAP_PROC_ID | GCAP_PROC_EUID;
@@ -1706,7 +1626,7 @@ mod backend_tests {
         seen();
         let mut be = NvidiaBackend::for_test();
         be.set_host_nodes_for_test(Vec::new(), Vec::new());
-        be.set_host_ioctl_for_test(fake_rm);
+        rm::install(&mut be);
         let hello = HelloReq {
             proto: PROTO_V2,
             flags: HELLO_F_FRESH,
@@ -1820,21 +1740,29 @@ mod backend_tests {
         b
     }
 
+    /// A client, allocated through the backend, and its device, subdevice
+    /// and memory, made in RM directly.
     fn alloc_client(be: &mut NvidiaBackend, on: u32, by: Option<ProcId>) -> u32 {
         let r = call(be, on, ALLOC, &words(&[(12, 0x41)], 48), &[], by);
-        assert_eq!(rm_status(&r, OS64_STATUS), 0);
-        rd32(&r, BODY + 8).unwrap()
+        assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
+        let c = rd32(&r, BODY + 8).unwrap();
+        rm::with(|rm| {
+            rm.alloc(c, c, DEVICE, NV01_DEVICE_0).unwrap();
+            rm.alloc(c, DEVICE, SUBDEVICE, NV20_SUBDEVICE_0).unwrap();
+            for m in MEMORY {
+                rm.alloc(c, DEVICE, m, NV01_MEMORY_SYSTEM).unwrap();
+            }
+        });
+        c
     }
 
+    /// A duplicate of `src`'s `obj` into `dst`, at a handle RM picks.
     fn dup(dst: u32, src: u32, obj: u32) -> Vec<u8> {
-        words(
-            &[(0, dst), (4, dst), (8, 0xd00d), (12, src), (16, obj)],
-            OS55_SIZE,
-        )
+        words(&[(0, dst), (4, dst), (12, src), (16, obj)], NVOS55_SIZE)
     }
 
     fn share(owner: u32, obj: u32, kind: u16, action: u8, target: u32) -> Vec<u8> {
-        let mut p = words(&[(0, owner), (4, obj), (8, target), (12, 1)], OS57_SIZE);
+        let mut p = words(&[(0, owner), (4, obj), (8, target), (12, 1)], NVOS57_SIZE);
         p[16..18].copy_from_slice(&kind.to_le_bytes());
         p[18] = action;
         p
@@ -1848,11 +1776,11 @@ mod backend_tests {
         assert_eq!(be.semsurf.owner_of(a), Some(caller(pid(10))));
         seen();
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(10)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         assert!(reached(0x34));
         // Within one client, whoever asks.
         let r = call(&mut be, f1, DUP, &dup(a, a, 0x55), &[], Some(pid(11)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
     }
 
     #[test]
@@ -1870,7 +1798,10 @@ mod backend_tests {
             &[],
             Some(pid(10)),
         );
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x34), "the host never saw it");
         // Nor by the child, into the parent's client (a file the parent
         // passed it): RM's rule is the two clients' makers, not the
@@ -1885,7 +1816,10 @@ mod backend_tests {
             &[],
             Some(pid(20)),
         );
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x34));
         // Nor between two processes of one uid: RM's default is by PID.
         let same_uid = alloc_client(&mut be, f1, Some(pid_as(40, 1010)));
@@ -1897,7 +1831,10 @@ mod backend_tests {
             &[],
             Some(pid(10)),
         );
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         // A client passed on keeps its maker: the parent using the child's
         // file is still not the child.
         let r = call(
@@ -1908,7 +1845,10 @@ mod backend_tests {
             &[],
             Some(pid(30)),
         );
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
     }
 
     #[test]
@@ -1919,16 +1859,25 @@ mod backend_tests {
             let a = alloc_client(&mut be, f1, by);
             seen();
             let r = call(&mut be, f1, DUP, &dup(a, HOST, 1), &[], by);
-            assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+            assert_eq!(
+                rm_status(&r, NVOS55_STATUS),
+                NV_ERR_INSUFFICIENT_PERMISSIONS
+            );
             let r = call(&mut be, f1, DUP, &dup(HOST, a, 1), &[], by);
-            assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+            assert_eq!(
+                rm_status(&r, NVOS55_STATUS),
+                NV_ERR_INSUFFICIENT_PERMISSIONS
+            );
             assert!(!reached(0x34));
             // Freed is foreign too.
             let r = call(&mut be, f1, FREE, &words(&[(0, a), (8, a)], 16), &[], by);
             assert_eq!(errno(&r), 0);
             let b = alloc_client(&mut be, f1, by);
             let r = call(&mut be, f1, DUP, &dup(b, a, 1), &[], by);
-            assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+            assert_eq!(
+                rm_status(&r, NVOS55_STATUS),
+                NV_ERR_INSUFFICIENT_PERMISSIONS
+            );
         }
     }
 
@@ -1945,11 +1894,14 @@ mod backend_tests {
         // Between two clients: refused, where it was let through before.
         seen();
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], None);
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x34));
         // Within one client: nothing to tell apart.
         let r = call(&mut be, f1, DUP, &dup(a, a, 0x55), &[], None);
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         // A grant RM took is RM's own rule, and holds without a process.
         let compose = RS_SHARE_ACTION_FLAG_COMPOSE;
         let r = call(
@@ -1960,21 +1912,27 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], None);
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         // A second client named in parameters: refused, whatever the rule.
         seen();
         let regops = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
         let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, b)], 48), None);
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let r = call(&mut be, f1, ALLOC, &outer, &words(&[(4, b)], 56), None);
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x2a) && !reached(0x2b));
         // Its own client it may name.
         let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
     }
 
     #[test]
@@ -2009,7 +1967,7 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS64_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
     }
 
     #[test]
@@ -2035,7 +1993,7 @@ mod backend_tests {
                 None,
             );
             assert_eq!(
-                rm_status(&r, OS57_STATUS),
+                rm_status(&r, NVOS57_STATUS),
                 NV_ERR_INSUFFICIENT_PERMISSIONS,
                 "type {kind}"
             );
@@ -2050,7 +2008,7 @@ mod backend_tests {
                     &[],
                     None,
                 );
-                assert_eq!(rm_status(&r, OS57_STATUS), 0);
+                assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
                 assert!(reached(0x35), "type {kind} action {action}");
             }
         }
@@ -2060,12 +2018,18 @@ mod backend_tests {
         p[12..14].copy_from_slice(&RS_SHARE_TYPE_ALL.to_le_bytes());
         seen();
         let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         ctl[8..12].copy_from_slice(&CTRL_SET_INHERITED_SHARE_POLICY.to_le_bytes());
         let mut p = vec![0u8; 12];
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_OS_SECURITY_TOKEN.to_le_bytes());
         let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x2a));
     }
 
@@ -2086,10 +2050,13 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         assert!(reached(0x35));
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         // A CLIENT grant to b does, for that object.
         let r = call(
             &mut be,
@@ -2099,12 +2066,15 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         assert!(reached(0x35), "RM holds the grant too");
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x56), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         // Revoked, it is closed again.
         let r = call(
             &mut be,
@@ -2120,9 +2090,12 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         // On the client (SET_INHERITED_SHARE_POLICY), every object of it
         // that has no list of its own -- once 0x55, which has one, is gone.
         let r = call(
@@ -2147,16 +2120,24 @@ mod backend_tests {
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_CLIENT.to_le_bytes());
         p[10] = compose;
         let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x77), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         // A revoke without COMPOSE empties the client's list.
         p[10] = RS_SHARE_ACTION_FLAG_REVOKE;
         let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x77), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         // A grant RM refused is not recorded; one on a freed object is gone.
+        rm::with(|rm| {
+            rm.set_hook(|c| {
+                (c.nr == 0x35 && c.object == 0xbad).then_some(NV_ERR_INSUFFICIENT_PERMISSIONS)
+            })
+        });
         let r = call(
             &mut be,
             f1,
@@ -2165,9 +2146,15 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS57_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let r = call(&mut be, f2, DUP, &dup(b, a, 0xbad), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let r = call(
             &mut be,
             f1,
@@ -2176,7 +2163,7 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(
             &mut be,
             f1,
@@ -2187,7 +2174,10 @@ mod backend_tests {
         );
         assert_eq!(errno(&r), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x88), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
     }
 
     #[test]
@@ -2199,15 +2189,18 @@ mod backend_tests {
         let a = alloc_client(&mut be, f1, Some(pid(10)));
         // A device sharing a host client's VA space.
         let dev = |share: u32| words(&[(4, share)], 56);
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         seen();
         let r = call(&mut be, f1, ALLOC, &outer, &dev(HOST), None);
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x2b));
         let r = call(&mut be, f1, ALLOC, &outer, &dev(a), None);
-        assert_eq!(rm_status(&r, OS64_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
         let r = call(&mut be, f1, ALLOC, &outer, &dev(0), None);
-        assert_eq!(rm_status(&r, OS64_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
         // Register operations on a host client's channel.
         let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
         seen();
@@ -2219,7 +2212,10 @@ mod backend_tests {
             &words(&[(0, HOST)], 48),
             Some(pid(10)),
         );
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x2a));
         let r = call(
             &mut be,
@@ -2229,7 +2225,7 @@ mod backend_tests {
             &words(&[(0, a)], 48),
             Some(pid(10)),
         );
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
     }
 
     /// Parameters too short to hold the client they name are RM's
@@ -2239,13 +2235,10 @@ mod backend_tests {
         let (mut be, f1, _) = vm(FULL);
         be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 6)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 6)], 48);
         seen();
         let r = call(&mut be, f1, ALLOC, &outer, &[0u8; 6], None);
-        assert_eq!(
-            rm_status(&r, OS64_STATUS),
-            crate::nvidia::NV_ERR_INVALID_ARGUMENT
-        );
+        assert_eq!(rm_status(&r, NVOS64_STATUS), NV_ERR_INVALID_ARGUMENT);
         assert!(!reached(0x2b));
     }
 
@@ -2264,21 +2257,24 @@ mod backend_tests {
 
         // NV01_DEVICE_0's hClientShare: clientValidate, the security token --
         // the caller's process or its euid.
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let dev = |at: usize, c: u32| words(&[(at, c)], 56);
         for (c, want) in [(mine_too, true), (same_uid, true), (other, false)] {
             let r = call(&mut be, f1, ALLOC, &outer, &dev(4, c), Some(me));
-            assert_eq!(ok(&r, OS64_STATUS), want, "hClientShare {c:#x}");
+            assert_eq!(ok(&r, NVOS64_STATUS), want, "hClientShare {c:#x}");
         }
         // The token is the caller's: the same call from the other process
         // may name its own client and not mine.
         let r = call(&mut be, f1, ALLOC, &outer, &dev(4, other), Some(pid(30)));
-        assert!(ok(&r, OS64_STATUS));
+        assert!(ok(&r, NVOS64_STATUS));
         // hTargetClient, which RM never checks: the calling process's own.
         let r = call(&mut be, f1, ALLOC, &outer, &dev(8, same_uid), Some(me));
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let r = call(&mut be, f1, ALLOC, &outer, &dev(8, mine_too), Some(me));
-        assert!(ok(&r, OS64_STATUS));
+        assert!(ok(&r, NVOS64_STATUS));
 
         // EXEC_REG_OPS, checked by nothing on the CPU side: the calling
         // process's clients only, not another of its uid.
@@ -2293,7 +2289,7 @@ mod backend_tests {
                 &words(&[(0, c)], 48),
                 Some(me),
             );
-            assert_eq!(ok(&r, OS54_STATUS), want, "regops on {c:#x}");
+            assert_eq!(ok(&r, NVOS54_STATUS), want, "regops on {c:#x}");
             assert_eq!(reached(0x2a), want);
         }
 
@@ -2302,7 +2298,7 @@ mod backend_tests {
         let list = |c: u32| words(&[(0, c), (1024, 1)], 1540);
         for (c, want) in [(same_uid, true), (other, false)] {
             let r = call(&mut be, f1, CONTROL, &q, &list(c), Some(me));
-            assert_eq!(ok(&r, OS54_STATUS), want, "unique id of {c:#x}");
+            assert_eq!(ok(&r, NVOS54_STATUS), want, "unique id of {c:#x}");
         }
 
         // GT200_DEBUGGER: RS_ACCESS_DEBUG on the object, from its list --
@@ -2310,7 +2306,10 @@ mod backend_tests {
         let dbg_outer = words(&[(0, a), (4, a), (8, 0xdb9), (12, 0x83de), (32, 12)], 48);
         let dbg = words(&[(4, same_uid), (8, 0x3d)], 12);
         let r = call(&mut be, f1, ALLOC, &dbg_outer, &dbg, Some(me));
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let mut grant = share(
             same_uid,
             0x3d,
@@ -2320,9 +2319,9 @@ mod backend_tests {
         );
         grant[12..16].copy_from_slice(&RS_ACCESS_DEBUG_BIT.to_le_bytes());
         let r = call(&mut be, f2, SHARE, &grant, &[], None);
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(&mut be, f1, ALLOC, &dbg_outer, &dbg, Some(me));
-        assert!(ok(&r, OS64_STATUS));
+        assert!(ok(&r, NVOS64_STATUS));
         // ...for that object alone.
         let r = call(
             &mut be,
@@ -2332,7 +2331,10 @@ mod backend_tests {
             &words(&[(4, same_uid), (8, 0x3e)], 12),
             Some(me),
         );
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
 
         // A control without the caller, from a guest that said it sends one.
         let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
@@ -2351,7 +2353,7 @@ mod backend_tests {
         let a = alloc_client(&mut be, f1, Some(me));
         let mine_too = alloc_client(&mut be, f2, Some(me));
         let same_uid = alloc_client(&mut be, f2, Some(pid_as(20, me.euid)));
-        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 56)], 48);
+        let outer = words(&[(0, a), (4, a), (12, 0x80), (32, 56)], 48);
         let r = call(
             &mut be,
             f1,
@@ -2360,7 +2362,10 @@ mod backend_tests {
             &words(&[(4, same_uid)], 56),
             Some(me),
         );
-        assert_eq!(rm_status(&r, OS64_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS64_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let r = call(
             &mut be,
             f1,
@@ -2369,7 +2374,7 @@ mod backend_tests {
             &words(&[(4, mine_too)], 56),
             Some(me),
         );
-        assert_eq!(rm_status(&r, OS64_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS64_STATUS), 0);
         // A control carries no caller: another client named is refused, the
         // caller's own is fine.
         let regops = words(&[(0, a), (4, 0x2080), (8, 0x2080_0122), (24, 48)], 32);
@@ -2381,9 +2386,12 @@ mod backend_tests {
             &words(&[(0, mine_too)], 48),
             None,
         );
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         let r = call(&mut be, f1, CONTROL, &regops, &words(&[(0, a)], 48), None);
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
     }
 
     #[test]
@@ -2401,9 +2409,9 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         // The device is freed, 0x55 with it; a new object made at 0x55 is
         // a's own, and not shared.
         let r = call(
@@ -2417,7 +2425,10 @@ mod backend_tests {
         assert_eq!(errno(&r), 0);
         seen();
         let r = call(&mut be, f2, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x34));
         // And a revoke on one object holds against a grant on its client.
         let (mut be, f1, f2) = vm(FULL);
@@ -2436,9 +2447,9 @@ mod backend_tests {
         p[8..10].copy_from_slice(&RS_SHARE_TYPE_CLIENT.to_le_bytes());
         p[10] = compose;
         let r = call(&mut be, f1, CONTROL, &ctl, &p, Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b2, a2, 0x66), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS55_STATUS), 0);
         let r = call(
             &mut be,
             f1,
@@ -2453,9 +2464,12 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         let r = call(&mut be, f2, DUP, &dup(b2, a2, 0x66), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
     }
 
     #[test]
@@ -2469,10 +2483,13 @@ mod backend_tests {
         let list = |c: u32| words(&[(4, 1), (24, c), (280, 0xc4a)], 536);
         seen();
         let r = call(&mut be, f1, CONTROL, &ctl, &list(HOST), Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS54_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
         assert!(!reached(0x2a));
         let r = call(&mut be, f1, CONTROL, &ctl, &list(a), Some(pid(10)));
-        assert_eq!(rm_status(&r, OS54_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
         assert!(reached(0x2a));
     }
 
@@ -2490,11 +2507,14 @@ mod backend_tests {
             &[],
             None,
         );
-        assert_eq!(rm_status(&r, OS57_STATUS), 0);
+        assert_eq!(rm_status(&r, NVOS57_STATUS), 0);
         be.close_handle(f2).unwrap();
         assert_eq!(be.semsurf.owner_of(b), None);
         // A later client RM gives b's number again inherits nothing.
         let r = call(&mut be, f1, DUP, &dup(b, a, 0x55), &[], Some(pid(20)));
-        assert_eq!(rm_status(&r, OS55_STATUS), NV_ERR_INSUFFICIENT_PERMISSIONS);
+        assert_eq!(
+            rm_status(&r, NVOS55_STATUS),
+            NV_ERR_INSUFFICIENT_PERMISSIONS
+        );
     }
 }

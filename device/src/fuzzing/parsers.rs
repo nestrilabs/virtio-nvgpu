@@ -210,7 +210,7 @@ pub fn rm_share(b: &mut Bytes) {
         rmshare::apply_share(&mut list, owner, &p);
     }
     if let Some(at) = rmshare::status_at(escape) {
-        let r = rmshare::refusal(params, at, 0x1b);
+        let r = crate::nvos::with_status(params, at, 0x1b);
         assert_eq!(r.len(), params.len());
     }
     let _ = rmctl::host_pid_control(params);

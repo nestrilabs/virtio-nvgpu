@@ -478,6 +478,7 @@ impl Arena {
     /// than the host copies for the request (`_IOC_SIZE`).
     pub fn call(&mut self, kernel: &dyn Kernel, fd: RawFd, request: u64, top: BufId) -> i32 {
         let size = crate::hostfd::ioc_size(request as u32);
+        #[cfg(any(test, fuzzing))]
         let regions: Vec<(u64, usize)> = self
             .blocks
             .iter_mut()
@@ -499,7 +500,9 @@ impl Arena {
         let mut arg = Arg {
             ptr,
             len: len.min(reach),
+            #[cfg(any(test, fuzzing))]
             regions: &regions,
+            _call: std::marker::PhantomData,
         };
         let r = kernel.ioctl(fd, request, &mut arg);
         self.last = Some(r);
@@ -544,9 +547,11 @@ impl Drop for DataMut<'_> {
 pub struct Arg<'a> {
     ptr: *mut u8,
     len: usize,
-    /// Every range of memory the call's pointers may address.
-    #[cfg_attr(not(any(test, fuzzing)), allow(dead_code))]
+    /// Every range of memory the call's pointers may address, for the
+    /// fake kernels to follow them into.
+    #[cfg(any(test, fuzzing))]
     regions: &'a [(u64, usize)],
+    _call: std::marker::PhantomData<&'a mut ()>,
 }
 
 impl Arg<'_> {

@@ -35,9 +35,12 @@ pub mod hostfd;
 mod i2_e2e;
 pub mod inject;
 pub mod kms;
+pub mod kms_state;
+pub mod le;
 pub mod mmap;
 pub mod nvidia;
 pub mod nvkms;
+pub mod nvos;
 pub mod osdesc;
 pub mod pacing;
 pub mod policy;
@@ -64,6 +67,8 @@ pub mod sys;
 pub mod tally;
 #[cfg(test)]
 mod testfd;
+#[cfg(test)]
+mod testing;
 pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;

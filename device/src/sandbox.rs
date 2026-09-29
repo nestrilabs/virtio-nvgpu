@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     /// On a host with the NVIDIA driver: what the backend reads and opens at
-    /// run time (nvidia.rs's node enumeration, GET_PROC_FILES and
+    /// run time (nvidia/hostnodes.rs's node enumeration, GET_PROC_FILES and
     /// GET_SYS_FILES, a guest's OPEN) stays reachable under the plan, and a
     /// path off it does not. Opens only; no ioctl reaches the driver.
     #[test]
@@ -1340,14 +1340,7 @@ mod tests {
         let proc = Path::new(crate::host::PROC_NVIDIA);
         let gpus: Vec<String> = crate::host::gpu_slots(proc)
             .iter()
-            .map(|g| {
-                let end = g
-                    .pci_addr
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(g.pci_addr.len());
-                String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
-            })
+            .map(|g| g.address())
             .collect();
         if gpus.is_empty() || !Path::new("/dev/nvidiactl").exists() || !landlock_at(5) {
             eprintln!("skipped: no NVIDIA GPU or Landlock ABI 5 here");

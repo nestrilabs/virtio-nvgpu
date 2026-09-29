@@ -200,10 +200,10 @@ mod tests {
             );
             let t = table_for(v).unwrap_or_else(|| panic!("{v}: no profile"));
             for (escape, size) in [
-                (NV_ESC_RM_CONTROL, rmallow::NVOS54_SIZE),
-                (NV_ESC_RM_ALLOC, rmallow::NVOS64_SIZE),
-                (NV_ESC_RM_VID_HEAP_CONTROL, rmallow::NVOS32_SIZE),
-                (NV_ESC_RM_ALLOC_CONTEXT_DMA2, rmallow::NVOS39_SIZE),
+                (NV_ESC_RM_CONTROL, rmallow::nvos::NVOS54_SIZE),
+                (NV_ESC_RM_ALLOC, rmallow::nvos::NVOS64_SIZE),
+                (NV_ESC_RM_VID_HEAP_CONTROL, rmallow::nvos::NVOS32_SIZE),
+                (NV_ESC_RM_ALLOC_CONTEXT_DMA2, rmallow::nvos::NVOS39_SIZE),
             ] {
                 let e = lookup(t, escape).unwrap_or_else(|| panic!("{v}: {escape:#x}"));
                 assert_eq!(e.param_size, Some(size as u32), "{v}: {escape:#x}");

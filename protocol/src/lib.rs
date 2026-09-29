@@ -16,6 +16,8 @@
 
 #![no_std]
 
+#[cfg(any(test, feature = "cheader"))]
+pub mod cheader;
 pub mod inject;
 pub mod messages;
 

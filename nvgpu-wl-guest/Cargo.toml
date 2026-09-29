@@ -22,4 +22,4 @@ libc = "0.2"
 # The loopback test runs the backend's own connection object in process, and
 # the whole dispatcher (NvidiaBackend::serve) in front of it.
 device = { path = "../device" }
-protocol = { workspace = true }
+protocol = { workspace = true, features = ["cheader"] }

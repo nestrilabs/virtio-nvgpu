@@ -44,17 +44,26 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 
 | file | contents |
 |---|---|
-| `src/nvidia.rs` | `NvidiaBackend`: the dispatcher. Opens, closes, v1 ioctls routed by handle kind, RM escapes with nested and deep blocks, mmap placement, GET_PROC/SYS_FILES, and the hooks every other module is called from |
+| `src/nvidia/mod.rs` | `NvidiaBackend`: the dispatcher and the VM's state. Every message's entry point, OPEN and CLOSE (one per-file teardown, `retire_handle`, for a CLOSE and the session's end), the host version and ABI profile, and the hooks every other module is called from |
+| `src/nvidia/v1.rs` | the v1 IOCTL: the request parsed once (`V1Request`, its deep block one of none, single, segments or page list), the route a handle's kind allows (`v1_route`), the flat DRM and NVKMS calls, and the reply serialised once from a typed result (`IoctlOut`, `write_v1`) |
+| `src/nvidia/rm.rs` | RM escapes: the gates (ABI profile, untranslated descriptors, the allowlist, pointers, sharing), parameter blocks behind a pointer with their deep blocks (`dispatch_nested`), and the one reader of the descriptor fields a guest names a file in (`FdField`) |
+| `src/nvidia/rmmap.rs` | RM_MAP_MEMORY, UPDATE_DEVICE_MAPPING_INFO and RM_UNMAP_MEMORY |
+| `src/nvidia/uvm.rs` | v1 UVM commands: sizes, the descriptor and RM client some name, pools and pageable access |
+| `src/nvidia/placement.rs` | MMAP and MUNMAP: window extents, the memory type each placement is mapped with, UVM pools in the aperture |
+| `src/nvidia/hostnodes.rs` | the host's DRM nodes (GET_DEV_INFO, render and card nodes per GPU) and the GET_PROC_FILES/GET_SYS_FILES streams |
 | `src/session.rs` | protocol v2: the session and its reset, HELLO, TIME_SYNC, WATCH, HOST_OP, and IOCTL2 split into prepare, execute and finish so the host ioctl runs without the backend's lock |
-| `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, re-homes GEM handles, and keeps each VM's framebuffer records |
+| `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, and re-homes GEM handles; its KMS stages check calls against `kms_state.rs` and record what they made |
 | `src/schema.rs` | ties the generated schema tables (`abi::schema`) to handle kinds |
 | `src/policy.rs` | `BackendHooks`: the judgements IOCTL2 leaves to its caller, routed to the KMS, fence and NVKMS sections |
+| `src/kms_state.rs` | what the backend keeps of a VM's KMS files: the framebuffers and property blobs each made, the blobs it was shown, framebuffers in use by calls in flight, connector probe times |
 | `src/kms.rs` | KMS properties classified by name, the host hotplug/lease uevent listener, lease re-checks, scanout checksums |
 | `src/nvkms.rs` | NVKMS and nvidia-drm grant policy: grant records, head gates for FLIP and SET_MODE, refusals and rewrites, run-time revocation checks |
 | `src/fence.rs` | syncobj waits turned into polls, and the shared, capped SYNCOBJ_EVENTFD registrations the guest sleeps on |
 | `src/semsurf.rs` | semaphore-surface fence contexts (nvidia-drm 0x54): index bound by the host's layout, the VM's RM clients (with the guest process that made each, and the grants RM took for their objects, for `rmshare.rs`), per-file and per-session caps; OS events named inside RM parameters |
 | `src/rmmem.rs` | records of RM system memory and doorbells, the coherency rewrite, and the Intel guest-PAT warning |
 | `src/rmallow.rs` | the RM allowlist: default deny for RM controls and classes, per host release, from `gen/rmallow` (SECURITY.md §12) |
+| `src/nvos.rs` | RM's escape ABI as the backend reads it: every field offset of the escapes' own blocks (measured per release in `gen/rmallow`, `abi::rmallow::nvos`), the nv-ioctl.h wrappers, the classes named in more than one place, and RM's statuses |
+| `src/le.rs` | little-endian words of a byte block read and written by offset, `None` past the end rather than a panic |
 | `src/release.rs` | which tables a host release gets, and the refusal to start on one they were not measured at |
 | `src/deepseg.rs` | deep segments: the several pointers of one RM parameter block, each sent with the bytes it addresses and relocated to a buffer of the backend's |
 | `src/guestptr.rs` | every pointer the host would follow in RM, NVKMS, nvidia-drm and UVM parameters is relocated or zeroed, or the call refused; memory named by CPU address refused; the UVM command allowlist |
@@ -75,6 +84,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/quota.rs` | guest processes' shares of the VM-wide budgets |
 | `src/error.rs` | the crate's error type |
 | `src/ratelimit.rs`, `src/tally.rs` | a rate limit per log call site, and bounded RM class and control tallies |
+| `src/pacing.rs` | frame-pacing counters: the rate of each kind of message, how long the backend held each, how the guest's waits went, how long a host event took to reach the event queue (ARCHITECTURE.md, "Frame pacing") |
 | `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and (test only) a replay of real mapping lifetimes against the allocator; `WindowPlacer`, what a transport implements to place into the window and the UVM aperture |
 | `src/sys/` | every `unsafe` of the crate, and nothing else (`scripts/check-unsafe.sh`; every other module is `#![forbid(unsafe_code)]`): the arena that builds each host call's parameter blocks from the guest's bytes and the backend's own pointers and descriptors (`block.rs`), the one `ioctl` (`ioctl.rs`), the guarded buffers the host writes into (`guarded.rs`), owned mappings with checked `MAP_FIXED` (`mem.rs`), descriptors, netlink, process and sandbox calls (`fd.rs`, `net.rs`, `proc.rs`), wire structs as bytes (`pod.rs`); SECURITY.md §14 |
 | `src/virtio.rs` | device config and feature layout, asserted against `driver/nvgpu_wire.h` |
@@ -82,6 +92,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
 | `src/i2_e2e.rs` | test only: the guest module's own IOCTL2 interpreter (`nvgpu-guest-core`, a GPL-2.0 dev-dependency) run against the whole backend |
 | `src/testfd.rs` | test only: whether this process still holds the other end of a pipe |
+| `src/testing/rm.rs` | test only: `FakeRm`, a host RM with an object tree that answers ALLOC, CONTROL, FREE, DUP_OBJECT and SHARE with resserv's statuses |
 | `src/fuzzing/` | fuzzing only (`--cfg fuzzing`, never in the backend): the fuzz targets' entry points and the fake host they run against; see "Fuzzing" below |
 | `src/fuzz_seeds.rs` | test only: with `NVGPU_FUZZ_SEEDS` set, every session a unit test serves is written out as a seed for the `backend` targets |
 | `src/inject/` | capture injection (`--inject-socket`): the helper's socket (`server.rs`: SOCK_SEQPACKET, one uid, four peers), the registry of injected buffers and syncobjs (`registry.rs`, `check.rs`: a dma-buf must import into this GPU's render node as NVKMS memory, its layout fit the object; ids and tokens; 32 buffers, 1 GiB, 16 syncobjs per VM), HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, and the read-only placement of an injected object's mmap range (`backend.rs`); SECURITY.md §18 |
@@ -142,7 +153,7 @@ Replies may not exceed their capacity or carry an address the host was
 handed.
 
 Nothing reaches a device: under `cfg(fuzzing)` every path the backend opens
-is `/dev/null` (`nvidia.rs`, `session.rs`, `semsurf.rs`, `hostfd.rs`), the
+is `/dev/null` (`nvidia/`, `session.rs`, `semsurf.rs`, `hostfd.rs`), the
 harness refuses to start where `/dev/nvidiactl` exists, and the script's
 sandbox has none.
 

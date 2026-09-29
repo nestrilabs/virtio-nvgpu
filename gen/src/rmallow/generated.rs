@@ -38,43 +38,124 @@ pub struct Release {
     pub total_classes: usize,
 }
 
-/// Offsets of the escape blocks' fields the gate reads (nvos.h, the
-/// same in every release measured).
-pub const NVOS02_H_CLASS: usize = 12;
-pub const NVOS02_SIZE: usize = 48;
-pub const NVOS02_STATUS: usize = 40;
-pub const NVOS05_H_CLASS: usize = 12;
-pub const NVOS05_SIZE: usize = 20;
-pub const NVOS05_STATUS: usize = 16;
-pub const NVOS21_H_CLASS: usize = 12;
-pub const NVOS21_SIZE: usize = 32;
-pub const NVOS21_STATUS: usize = 28;
-pub const NVOS32_FUNCTION: usize = 8;
-pub const NVOS32_SIZE: usize = 184;
-pub const NVOS32_STATUS: usize = 20;
-pub const NVOS39_H_CLASS: usize = 12;
-pub const NVOS39_SIZE: usize = 56;
-pub const NVOS39_STATUS: usize = 48;
-pub const NVOS54_CMD: usize = 8;
-pub const NVOS54_PARAMS_SIZE: usize = 24;
-pub const NVOS54_SIZE: usize = 32;
-pub const NVOS54_STATUS: usize = 28;
-pub const NVOS64_H_CLASS: usize = 12;
-pub const NVOS64_SIZE: usize = 48;
-pub const NVOS64_STATUS: usize = 40;
+/// The escapes' own blocks (nvos.h), the same in every release measured
+/// (device/src/nvos.rs).
+pub mod nvos {
+    /// Offsets of the fields the backend reads and writes, and sizes.
+    pub const NVOS00_H_OBJECT_OLD: usize = 8;
+    pub const NVOS00_H_OBJECT_PARENT: usize = 4;
+    pub const NVOS00_H_ROOT: usize = 0;
+    pub const NVOS00_SIZE: usize = 16;
+    pub const NVOS00_STATUS: usize = 12;
+    pub const NVOS02_FLAGS: usize = 16;
+    pub const NVOS02_H_CLASS: usize = 12;
+    pub const NVOS02_H_OBJECT_NEW: usize = 8;
+    pub const NVOS02_H_OBJECT_PARENT: usize = 4;
+    pub const NVOS02_H_ROOT: usize = 0;
+    pub const NVOS02_LIMIT: usize = 32;
+    pub const NVOS02_P_MEMORY: usize = 24;
+    pub const NVOS02_SIZE: usize = 48;
+    pub const NVOS02_STATUS: usize = 40;
+    pub const NVOS05_H_CLASS: usize = 12;
+    pub const NVOS05_SIZE: usize = 20;
+    pub const NVOS05_STATUS: usize = 16;
+    pub const NVOS21_H_CLASS: usize = 12;
+    pub const NVOS21_SIZE: usize = 32;
+    pub const NVOS21_STATUS: usize = 28;
+    pub const NVOS32_ALLOC_OS_DESC_ATTR2: usize = 56;
+    pub const NVOS32_ALLOC_OS_DESC_DESCRIPTOR: usize = 64;
+    pub const NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE: usize = 80;
+    pub const NVOS32_ALLOC_OS_DESC_H_MEMORY: usize = 40;
+    pub const NVOS32_ALLOC_OS_DESC_LIMIT: usize = 72;
+    pub const NVOS32_ALLOC_SIZE_ADDRESS: usize = 120;
+    pub const NVOS32_ALLOC_SIZE_RANGE_ADDRESS: usize = 128;
+    pub const NVOS32_ALLOC_TILED_PITCH_HEIGHT_ADDRESS: usize = 120;
+    pub const NVOS32_HW_ALLOC_BIND_RESULT_FUNC: usize = 96;
+    pub const NVOS32_HW_ALLOC_P_HANDLE: usize = 104;
+    pub const NVOS32_FUNCTION: usize = 8;
+    pub const NVOS32_H_OBJECT_PARENT: usize = 4;
+    pub const NVOS32_H_ROOT: usize = 0;
+    pub const NVOS32_SIZE: usize = 184;
+    pub const NVOS32_STATUS: usize = 20;
+    pub const NVOS33_FLAGS: usize = 44;
+    pub const NVOS33_H_CLIENT: usize = 0;
+    pub const NVOS33_H_DEVICE: usize = 4;
+    pub const NVOS33_H_MEMORY: usize = 8;
+    pub const NVOS33_LENGTH: usize = 24;
+    pub const NVOS33_OFFSET: usize = 16;
+    pub const NVOS33_P_LINEAR_ADDRESS: usize = 32;
+    pub const NVOS33_SIZE: usize = 48;
+    pub const NVOS33_STATUS: usize = 40;
+    pub const NVOS34_FLAGS: usize = 28;
+    pub const NVOS34_H_CLIENT: usize = 0;
+    pub const NVOS34_H_DEVICE: usize = 4;
+    pub const NVOS34_H_MEMORY: usize = 8;
+    pub const NVOS34_P_LINEAR_ADDRESS: usize = 16;
+    pub const NVOS34_SIZE: usize = 32;
+    pub const NVOS34_STATUS: usize = 24;
+    pub const NVOS39_H_CLASS: usize = 12;
+    pub const NVOS39_SIZE: usize = 56;
+    pub const NVOS39_STATUS: usize = 48;
+    pub const NVOS54_CMD: usize = 8;
+    pub const NVOS54_FLAGS: usize = 12;
+    pub const NVOS54_H_CLIENT: usize = 0;
+    pub const NVOS54_H_OBJECT: usize = 4;
+    pub const NVOS54_PARAMS: usize = 16;
+    pub const NVOS54_PARAMS_SIZE: usize = 24;
+    pub const NVOS54_SIZE: usize = 32;
+    pub const NVOS54_STATUS: usize = 28;
+    pub const NVOS55_FLAGS: usize = 20;
+    pub const NVOS55_H_CLIENT: usize = 0;
+    pub const NVOS55_H_CLIENT_SRC: usize = 12;
+    pub const NVOS55_H_OBJECT: usize = 8;
+    pub const NVOS55_H_OBJECT_SRC: usize = 16;
+    pub const NVOS55_H_PARENT: usize = 4;
+    pub const NVOS55_SIZE: usize = 28;
+    pub const NVOS55_STATUS: usize = 24;
+    pub const NVOS56_H_CLIENT: usize = 0;
+    pub const NVOS56_H_DEVICE: usize = 4;
+    pub const NVOS56_H_MEMORY: usize = 8;
+    pub const NVOS56_P_NEW_CPU_ADDRESS: usize = 24;
+    pub const NVOS56_P_OLD_CPU_ADDRESS: usize = 16;
+    pub const NVOS56_SIZE: usize = 40;
+    pub const NVOS56_STATUS: usize = 32;
+    pub const NVOS57_H_CLIENT: usize = 0;
+    pub const NVOS57_H_OBJECT: usize = 4;
+    pub const NVOS57_SHARE_POLICY: usize = 8;
+    pub const NVOS57_SIZE: usize = 24;
+    pub const NVOS57_STATUS: usize = 20;
+    pub const NVOS64_FLAGS: usize = 36;
+    pub const NVOS64_H_CLASS: usize = 12;
+    pub const NVOS64_H_OBJECT_NEW: usize = 8;
+    pub const NVOS64_H_OBJECT_PARENT: usize = 4;
+    pub const NVOS64_H_ROOT: usize = 0;
+    pub const NVOS64_P_ALLOC_PARMS: usize = 16;
+    pub const NVOS64_P_RIGHTS_REQUESTED: usize = 24;
+    pub const NVOS64_PARAMS_SIZE: usize = 32;
+    pub const NVOS64_SIZE: usize = 48;
+    pub const NVOS64_STATUS: usize = 40;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_ATTR: usize = 8;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_ATTR2: usize = 12;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR: usize = 16;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE: usize = 32;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_FLAGS: usize = 4;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_LIMIT: usize = 24;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_SIZE: usize = 40;
+    pub const NV_OS_DESC_MEMORY_ALLOCATION_TYPE: usize = 0;
 
-/// NVOS32 function numbers (nvos.h).
-pub const NVOS32_FUNCTION_ALLOC_SIZE: u32 = 2;
-pub const NVOS32_FUNCTION_FREE: u32 = 3;
-pub const NVOS32_FUNCTION_INFO: u32 = 5;
-pub const NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT: u32 = 6;
-pub const NVOS32_FUNCTION_ALLOC_SIZE_RANGE: u32 = 14;
-pub const NVOS32_FUNCTION_REACQUIRE_COMPR: u32 = 15;
-pub const NVOS32_FUNCTION_RELEASE_COMPR: u32 = 16;
-pub const NVOS32_FUNCTION_GET_MEM_ALIGNMENT: u32 = 18;
-pub const NVOS32_FUNCTION_HW_ALLOC: u32 = 19;
-pub const NVOS32_FUNCTION_HW_FREE: u32 = 20;
-pub const NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
+    /// NVOS32 function numbers.
+    pub const NVOS32_FUNCTION_ALLOC_SIZE: u32 = 2;
+    pub const NVOS32_FUNCTION_FREE: u32 = 3;
+    pub const NVOS32_FUNCTION_INFO: u32 = 5;
+    pub const NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT: u32 = 6;
+    pub const NVOS32_FUNCTION_ALLOC_SIZE_RANGE: u32 = 14;
+    pub const NVOS32_FUNCTION_REACQUIRE_COMPR: u32 = 15;
+    pub const NVOS32_FUNCTION_RELEASE_COMPR: u32 = 16;
+    pub const NVOS32_FUNCTION_GET_MEM_ALIGNMENT: u32 = 18;
+    pub const NVOS32_FUNCTION_HW_ALLOC: u32 = 19;
+    pub const NVOS32_FUNCTION_HW_FREE: u32 = 20;
+    pub const NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
+}
 
 /// Every release measured, oldest first.
 pub static RELEASES: &[Release] = &[

@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use protocol::messages::*;
 
+use crate::le;
 use crate::pacing::PACING;
 use crate::privfd::PrivateFd;
 use std::sync::atomic::Ordering::Relaxed;
@@ -459,7 +460,7 @@ fn hdr_bytes(t: MsgType, handle: u32, req_id: u32) -> [u8; HDR] {
 
 /// The length field of the `struct drm_event` at the start of `buf`.
 fn event_len(buf: &[u8]) -> usize {
-    u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize
+    le::u32_at(buf, 4).map_or(0, |n| n as usize)
 }
 
 /// How many leading bytes of `buf` are whole `struct drm_event`s totalling at

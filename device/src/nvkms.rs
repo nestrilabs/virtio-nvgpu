@@ -101,6 +101,7 @@ use std::time::{Duration, Instant};
 
 use abi::version::DriverVersion;
 
+use crate::le;
 use crate::schema::{self, Kind, NvkmsLayout, NvkmsPermArr, NvkmsTarget, policy};
 use crate::xfer::{Errno, Prepared};
 
@@ -113,11 +114,8 @@ pub const MAX_MODESET_OPENS: usize = 64;
 /// the compositor and every EGL and Vulkan window-system path without one.
 /// A process holds at most 16, and the last 8 are kept for processes that
 /// hold at most 2.
-pub const MODESET_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: 16,
-    reserve: 8,
-    floor: 2,
-};
+pub const MODESET_SHARE: crate::quota::Share = crate::quota::Share::custom(16, 8, 2);
+const _: () = assert!(MODESET_SHARE.fits(MAX_MODESET_OPENS as u64));
 
 // NvKmsPermissionsType (nvkms-api.h) and nvidia-drm's own
 // (nv_drm_common_ioctl.h: MODESET 2, SUB_OWNER 3).
@@ -299,22 +297,17 @@ fn coherent_display_only(lo: &NvkmsLayout, params: &mut [u8]) {
     }
 }
 
+/// A field the table places outside the block is the block's refusal.
 fn rd(b: &[u8], off: usize, width: usize) -> Result<u64, Errno> {
-    let s = b.get(off..off + width).ok_or(libc::EINVAL)?;
-    let mut v = [0u8; 8];
-    v[..width].copy_from_slice(s);
-    Ok(u64::from_le_bytes(v))
+    le::uint_at(b, off, width).ok_or(libc::EINVAL)
 }
 
 fn rd32(b: &[u8], off: u32) -> Result<u32, Errno> {
-    Ok(rd(b, off as usize, 4)? as u32)
+    le::u32_at(b, off as usize).ok_or(libc::EINVAL)
 }
 
 fn wr32(b: &mut [u8], off: u32, v: u32) -> Result<(), Errno> {
-    b.get_mut(off as usize..off as usize + 4)
-        .ok_or(libc::EINVAL)?
-        .copy_from_slice(&v.to_le_bytes());
-    Ok(())
+    le::put_u32(b, off as usize, v).ok_or(libc::EINVAL)
 }
 
 fn zero(b: &mut [u8], ranges: &[(u32, u32)]) -> Result<(), Errno> {
@@ -646,6 +639,16 @@ impl NvkmsPolicy {
         }
     }
 
+    /// The layout, and the command's name without its `NVKMS_`, of the v1
+    /// call in `msg` (its NvKmsIoctlParams first), if this host's table
+    /// knows it.
+    fn v1_entry(st: &State, msg: &[u8]) -> Option<(&'static NvkmsLayout, &'static str)> {
+        let (lo, _) = Self::layout(st).ok()?;
+        let table = st.version.and_then(schema::modeset_table)?;
+        let name = table.lookup_nvkms(rd32(msg, 0).ok()?)?.name;
+        Some((lo, name.strip_prefix("NVKMS_").unwrap_or(name)))
+    }
+
     /// The reply to a v1 call `v1_before` let through: the 16-byte
     /// NvKmsIoctlParams and the params block, as `msg` was. Only
     /// ALLOC_DEVICE's reply is rewritten (see `after`); v1 records nothing.
@@ -654,14 +657,7 @@ impl NvkmsPolicy {
             return;
         }
         let st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
-            return;
-        };
-        let Ok(cmd) = rd32(msg, 0) else { return };
-        if table.lookup_nvkms(cmd).map(|e| e.name) == Some("NVKMS_ALLOC_DEVICE")
+        if let Some((lo, "ALLOC_DEVICE")) = Self::v1_entry(&st, msg)
             && let Some(params) = msg.get_mut(16..)
         {
             coherent_display_only(lo, params);
@@ -673,16 +669,9 @@ impl NvkmsPolicy {
     /// (the reply is in `msg`, and the host is not asked).
     pub fn v1_cached(&self, target: u32, msg: &mut [u8]) -> bool {
         let mut st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
+        let Some((lo, "QUERY_DPY_DYNAMIC_DATA")) = Self::v1_entry(&st, msg) else {
             return false;
         };
-        let Ok(cmd) = rd32(msg, 0) else { return false };
-        if table.lookup_nvkms(cmd).map(|e| e.name) != Some("NVKMS_QUERY_DPY_DYNAMIC_DATA") {
-            return false;
-        }
         let call = Call {
             target,
             fds: &[],
@@ -699,21 +688,9 @@ impl NvkmsPolicy {
     /// GET_NEXT_EVENT returns (`State::record`). Grants cannot travel v1.
     pub fn v1_record(&self, target: u32, msg: &[u8]) {
         let mut st = self.lock();
-        let (Ok((lo, _)), Some(table)) = (
-            Self::layout(&st),
-            st.version.and_then(schema::modeset_table),
-        ) else {
-            return;
-        };
-        let Ok(cmd) = rd32(msg, 0) else { return };
-        let Some(name) = table.lookup_nvkms(cmd).map(|e| e.name) else {
-            return;
-        };
-        let name = name.strip_prefix("NVKMS_").unwrap_or(name);
-        if matches!(
-            name,
-            "ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"
-        ) && let Some(params) = msg.get(16..)
+        if let Some((lo, name @ ("ALLOC_DEVICE" | "QUERY_DPY_DYNAMIC_DATA" | "GET_NEXT_EVENT"))) =
+            Self::v1_entry(&st, msg)
+            && let Some(params) = msg.get(16..)
         {
             st.record(lo, name, target, params, &[]);
         }

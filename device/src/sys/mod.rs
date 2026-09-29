@@ -14,8 +14,8 @@
 //!   field declared a pointer, and only another of its blocks. Guest bytes
 //!   are copied in as data; the host block is built, never patched, and the
 //!   reply is a copy with the caller's own values back in place.
-//! - [`ioctl`]: the one `ioctl(2)` with an argument, which takes only an
-//!   argument an arena built.
+//! - [`ioctl`]: `ioctl(2)`, with an argument an arena built, with none, or
+//!   (UDMABUF_CREATE) with the one fixed struct it builds itself.
 //! - [`guarded`]: the buffers the host writes into, hard against a guard
 //!   page.
 //! - [`mem`]: mappings, each owned by a type that unmaps it once, and every

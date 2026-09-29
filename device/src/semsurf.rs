@@ -30,7 +30,7 @@
 //!   mem_mgr_ctrl.c:748-750) -- is EOPNOTSUPP, which is also what the host
 //!   answers a 0x54 it cannot serve (nvidia-drm-fence.c:1316-1318);
 //! - **the client is this VM's**: one allocated through our RM path and not
-//!   freed since ([`SemsurfPolicy::client_allocated`]);
+//!   freed since ([`SemsurfPolicy::client_allocated_by`]);
 //! - **there is room**: each context costs a host kthread, a timer, an NVKMS
 //!   dup and a kernel mapping (nvidia-drm-fence.c:1233-1310,
 //!   nvidia-drm-os-interface.c:166-176), none of it bounded by the host, so
@@ -57,7 +57,17 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::hostfd::{IOC_RW, ioc};
-use crate::nvidia::NvidiaBackend;
+use crate::le;
+use crate::nvidia::{FdAccept, FdField, FdIn, FdNone, NvidiaBackend};
+#[cfg(test)]
+use crate::nvos::NV_ERR_INSUFFICIENT_PERMISSIONS;
+use crate::nvos::{
+    NV01_DEVICE_0, NV01_ROOT_CLIENT, NV20_SUBDEVICE_0, NVOS00_H_OBJECT_OLD, NVOS00_H_ROOT,
+    NVOS00_STATUS, NVOS54_CMD, NVOS54_H_CLIENT, NVOS54_H_OBJECT, NVOS54_PARAMS, NVOS54_PARAMS_SIZE,
+    NVOS54_SIZE, NVOS54_STATUS, NVOS64_H_CLASS, NVOS64_H_OBJECT_NEW, NVOS64_H_OBJECT_PARENT,
+    NVOS64_H_ROOT, NVOS64_P_ALLOC_PARMS, NVOS64_P_RIGHTS_REQUESTED, NVOS64_PARAMS_SIZE,
+    NVOS64_SIZE, NVOS64_STATUS, OS_EVENT_FD, OS_EVENT_H_CLIENT, OS_EVENT_STATUS, ROOT_CLASSES,
+};
 use crate::privfd::PrivateFd;
 use crate::sys::block::{Arena, BufId};
 use crate::xfer::{Errno, Prepared};
@@ -88,16 +98,8 @@ pub const CTX_CAP_PER_SESSION: usize = 256;
 /// process holds at most 96, and the session's last 32 are kept for
 /// processes holding at most 16 -- so one that has its 96 cannot take
 /// another's first device's worth.
-pub const CTX_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: 96,
-    reserve: 32,
-    floor: 16,
-};
-
-/// `NV01_ROOT`, `NV01_ROOT_NON_PRIV`, `NV01_ROOT_CLIENT`: the classes a
-/// client is allocated as (escape.c:473-481 turns all three into the last).
-pub const ROOT_CLASSES: [u32; 3] = [0x0, 0x1, 0x41];
-
+pub const CTX_SHARE: crate::quota::Share = crate::quota::Share::custom(96, 32, 16);
+const _: () = assert!(CTX_SHARE.fits(CTX_CAP_PER_SESSION as u64));
 /// `NV_EVENT_BUFFER`, and where its `notificationHandle` sits.
 pub const NV_EVENT_BUFFER: u32 = 0x90cd;
 const EVENT_BUFFER_NOTIFICATION_AT: usize = 40;
@@ -141,13 +143,6 @@ pub fn check_index(layout: Layout, index: u64, size: u64) -> Result<(), Errno> {
         return Err(libc::EINVAL);
     }
     Ok(())
-}
-
-fn rd(b: &[u8], at: usize, width: usize) -> Option<u64> {
-    let s = b.get(at..at + width)?;
-    let mut w = [0u8; 8];
-    w[..width].copy_from_slice(s);
-    Some(u64::from_le_bytes(w))
 }
 
 // ───────────────────────────── the policy ─────────────────────────────
@@ -409,8 +404,8 @@ impl SemsurfPolicy {
         if params.len() != IMPORT_PARAMS_SIZE {
             return Err(libc::EINVAL);
         }
-        let h_client = rd(params, 0, 4).unwrap_or(0) as u32;
-        let size = rd(params, 8, 8).unwrap_or(0);
+        let h_client = le::u32_at(params, 0).unwrap_or(0);
+        let size = le::u64_at(params, 8).unwrap_or(0);
         if !g.clients.contains_key(&h_client) {
             log::warn!(
                 "SEMSURF_FENCE_CTX_CREATE names RM client {h_client:#x}, which this VM did not \
@@ -465,7 +460,7 @@ impl SemsurfPolicy {
     /// backend's copy of the call.
     pub fn ctx_create_before(&self, p: &mut Prepared) -> Result<(), Errno> {
         let arg = p.buffer(0).ok_or(libc::EINVAL)?;
-        let index = rd(arg, CTX_INDEX_AT, 8).ok_or(libc::EINVAL)?;
+        let index = le::u64_at(arg, CTX_INDEX_AT).ok_or(libc::EINVAL)?;
         // A NULL or empty block gets no buffer (and the host a NULL
         // pointer); KAPI would refuse it, and so do we, before it gets
         // there.
@@ -483,7 +478,7 @@ impl SemsurfPolicy {
             return None;
         }
         let params = p.pointee(0, CTX_PARAMS_PTR_AT).and_then(|b| p.buffer(b))?;
-        Some((rd(params, 0, 4)? as u32, rd(params, 4, 4)? as u32))
+        Some((le::u32_at(params, 0)?, le::u32_at(params, 4)?))
     }
 
     /// `Hooks::after` for 0x54: count the context it made. Only for a
@@ -494,13 +489,13 @@ impl SemsurfPolicy {
         if ret != 0 {
             return;
         }
-        let Some(gem) = p.buffer(0).and_then(|a| rd(a, CTX_HANDLE_AT, 4)) else {
+        let Some(gem) = p.buffer(0).and_then(|a| le::u32_at(a, CTX_HANDLE_AT)) else {
             return;
         };
         let target = p.target();
         let mut g = self.lock();
         if gem != 0 && g.renders.contains_key(&target) {
-            g.ctxs.entry(target).or_default().insert(gem as u32);
+            g.ctxs.entry(target).or_default().insert(gem);
         }
     }
 }
@@ -518,12 +513,14 @@ pub fn os_event_field(
     nested_len: usize,
 ) -> Result<Option<(usize, u32)>, Errno> {
     let off = match escape {
-        0x2a => match rd(outer, 8, 4).map(|c| c as u32) {
+        abi::ioctl::NV_ESC_RM_CONTROL => match le::u32_at(outer, NVOS54_CMD) {
             Some(SEMSURF_REGISTER_WAITER) => 24,
             Some(SEMSURF_UNREGISTER_WAITER) => 16,
             _ => return Ok(None),
         },
-        0x2b if rd(outer, 12, 4) == Some(u64::from(NV_EVENT_BUFFER)) => {
+        abi::ioctl::NV_ESC_RM_ALLOC
+            if le::u32_at(outer, NVOS64_H_CLASS) == Some(NV_EVENT_BUFFER) =>
+        {
             EVENT_BUFFER_NOTIFICATION_AT
         }
         _ => return Ok(None),
@@ -531,7 +528,8 @@ pub fn os_event_field(
     if nested_len < off + 8 {
         return Err(libc::EINVAL);
     }
-    let h_client = rd(outer, 0, 4).ok_or(libc::EINVAL)? as u32;
+    // hClient and hRoot, both first.
+    let h_client = le::u32_at(outer, 0).ok_or(libc::EINVAL)?;
     Ok(Some((off, h_client)))
 }
 
@@ -564,9 +562,6 @@ pub trait Rm {
     ) -> Result<(), String>;
 }
 
-const NV01_ROOT_CLIENT: u32 = 0x41;
-const NV01_DEVICE_0: u32 = 0x80;
-const NV20_SUBDEVICE_0: u32 = 0x2080;
 /// ctrl0000gpu.h:172-185: `{gpuId, gpuFlags, deviceInstance,
 /// subDeviceInstance, sliStatus, boardId, gpuInstance, numaId}`.
 const NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2: u32 = 0x205;
@@ -604,8 +599,8 @@ pub fn query_layout(rm: &dyn Rm, gpu_minor: u32, gpu_id: u32) -> Result<Layout, 
         &mut id,
     )
     .map_err(|e| format!("GPU_GET_ID_INFO_V2 of gpuId {gpu_id:#x}: {e}"))?;
-    let device_instance = rd(&id, 8, 4).unwrap_or(0) as u32;
-    let subdevice_instance = rd(&id, 12, 4).unwrap_or(0) as u32;
+    let device_instance = le::u32_at(&id, 8).unwrap_or(0);
+    let subdevice_instance = le::u32_at(&id, 12).unwrap_or(0);
 
     // NV0080_ALLOC_PARAMETERS {deviceId, ...}: the rest zero is a device
     // with default VA space, as any client makes one.
@@ -630,8 +625,8 @@ pub fn query_layout(rm: &dyn Rm, gpu_minor: u32, gpu_id: u32) -> Result<Layout, 
     )
     .map_err(|e| format!("FB_GET_SEMAPHORE_SURFACE_LAYOUT: {e}"))?;
     Ok(Layout {
-        stride: rd(&layout, 16, 8).unwrap_or(0),
-        max_submitted: rd(&layout, 0, 8).unwrap_or(0),
+        stride: le::u64_at(&layout, 16).unwrap_or(0),
+        max_submitted: le::u64_at(&layout, 0).unwrap_or(0),
     })
 }
 
@@ -687,37 +682,61 @@ pub fn probe_strict_clients(rm: &dyn Rm) -> Result<bool, String> {
 pub struct HostRm;
 
 /// RM_ALLOC and RM_CONTROL, `_IOWR('F', nr, NVOS64/NVOS54)`.
-const NV_ESC_RM_ALLOC_64: u32 = ioc(IOC_RW, b'F', 0x2b, 48);
-const NV_ESC_RM_CONTROL: u32 = ioc(IOC_RW, b'F', 0x2a, 32);
+const RM_ALLOC_IOCTL: u32 = ioc(IOC_RW, b'F', 0x2b, 48);
+const RM_CONTROL_IOCTL: u32 = ioc(IOC_RW, b'F', 0x2a, 32);
 
 /// An NVOS64: `{hRoot, hObjectParent, hObjectNew, hClass, NvP64
 /// pAllocParms, NvP64 pRightsRequested, paramsSize, flags, status}`
 /// (nvos.h:478-490).
-pub fn nvos64(root: u32, parent: u32, class: u32, params: u64, params_size: u32) -> [u8; 48] {
-    let mut a = [0u8; 48];
-    a[0..4].copy_from_slice(&root.to_le_bytes());
-    a[4..8].copy_from_slice(&parent.to_le_bytes());
-    a[12..16].copy_from_slice(&class.to_le_bytes());
-    a[16..24].copy_from_slice(&params.to_le_bytes());
-    a[32..36].copy_from_slice(&params_size.to_le_bytes());
+pub fn nvos64(
+    root: u32,
+    parent: u32,
+    class: u32,
+    params: u64,
+    params_size: u32,
+) -> [u8; NVOS64_SIZE] {
+    let mut a = [0u8; NVOS64_SIZE];
+    for (at, v) in [
+        (NVOS64_H_ROOT, root),
+        (NVOS64_H_OBJECT_PARENT, parent),
+        (NVOS64_H_CLASS, class),
+        (NVOS64_PARAMS_SIZE, params_size),
+    ] {
+        le::put_u32(&mut a, at, v).expect("in the block");
+    }
+    le::put_u64(&mut a, NVOS64_P_ALLOC_PARMS, params).expect("in the block");
     a
 }
 
 /// An NVOS54: `{hClient, hObject, cmd, flags, NvP64 params, paramsSize,
 /// status}` (nvos.h:2230-2239).
-pub fn nvos54(client: u32, object: u32, cmd: u32, params: u64, params_size: u32) -> [u8; 32] {
-    let mut a = [0u8; 32];
-    a[0..4].copy_from_slice(&client.to_le_bytes());
-    a[4..8].copy_from_slice(&object.to_le_bytes());
-    a[8..12].copy_from_slice(&cmd.to_le_bytes());
-    a[16..24].copy_from_slice(&params.to_le_bytes());
-    a[24..28].copy_from_slice(&params_size.to_le_bytes());
+pub fn nvos54(
+    client: u32,
+    object: u32,
+    cmd: u32,
+    params: u64,
+    params_size: u32,
+) -> [u8; NVOS54_SIZE] {
+    let mut a = [0u8; NVOS54_SIZE];
+    for (at, v) in [
+        (NVOS54_H_CLIENT, client),
+        (NVOS54_H_OBJECT, object),
+        (NVOS54_CMD, cmd),
+        (NVOS54_PARAMS_SIZE, params_size),
+    ] {
+        le::put_u32(&mut a, at, v).expect("in the block");
+    }
+    le::put_u64(&mut a, NVOS54_PARAMS, params).expect("in the block");
     a
 }
 
+/// Where NVOS64 and NVOS54 both hold their parameter pointer.
+const PARAMS_AT: usize = NVOS64_P_ALLOC_PARMS;
+const _: () = assert!(PARAMS_AT == NVOS54_PARAMS);
+
 /// RM call `request` on `fd`: `top` (NVOS64 or NVOS54, `_IOC_SIZE` bytes)
-/// with its parameter pointer at 16 aimed at `params` (or null), in an
-/// arena of its own, retried across signals.
+/// with its parameter pointer, at 16 in both, aimed at `params` (or null),
+/// in an arena of its own, retried across signals.
 fn rm_ioctl(
     fd: RawFd,
     request: u32,
@@ -733,7 +752,8 @@ fn rm_ioctl(
     let p = match params {
         Some(b) => {
             let p = a.small(b);
-            a.point(t, 16, p).map_err(|e| format!("layout: {e}"))?;
+            a.point(t, PARAMS_AT, p)
+                .map_err(|e| format!("layout: {e}"))?;
             Some(p)
         }
         None => None,
@@ -781,14 +801,14 @@ impl Rm for HostRm {
         let top = nvos64(root, parent, class, 0, size);
         let (a, t, _) = rm_ioctl(
             ctl,
-            NV_ESC_RM_ALLOC_64,
+            RM_ALLOC_IOCTL,
             &top,
-            &[16, 24],
+            &[NVOS64_P_ALLOC_PARMS, NVOS64_P_RIGHTS_REQUESTED],
             params.is_some().then_some(&page[..]),
         )?;
         let a = a.bytes(t);
-        match rd(a, 40, 4).unwrap_or(0) as u32 {
-            0 => Ok(rd(a, 8, 4).unwrap_or(0) as u32),
+        match le::u32_at(a, NVOS64_STATUS).unwrap_or(0) {
+            0 => Ok(le::u32_at(a, NVOS64_H_OBJECT_NEW).unwrap_or(0)),
             s => Err(format!("RM status {s:#x}")),
         }
     }
@@ -806,15 +826,15 @@ impl Rm for HostRm {
         let top = nvos54(client, object, cmd, 0, params.len() as u32);
         let (a, t, p) = rm_ioctl(
             ctl,
-            NV_ESC_RM_CONTROL,
+            RM_CONTROL_IOCTL,
             &top,
-            &[16],
+            &[NVOS54_PARAMS],
             (!params.is_empty()).then_some(&params[..]),
         )?;
         if let Some(p) = p {
             params.copy_from_slice(a.bytes(p));
         }
-        match rd(a.bytes(t), 28, 4).unwrap_or(0) as u32 {
+        match le::u32_at(a.bytes(t), NVOS54_STATUS).unwrap_or(0) {
             0 => Ok(()),
             s => Err(format!("RM status {s:#x}")),
         }
@@ -822,16 +842,6 @@ impl Rm for HostRm {
 }
 
 // ─────────────────────────────── the backend ───────────────────────────────
-
-/// The params of a successful v1 IOCTL reply the backend wrote into `resp`
-/// (`n` bytes): past the header and `IoctlResp`, or `None` for a failure,
-/// which is a bare header.
-pub(crate) fn reply_params(resp: &[u8], n: usize) -> Option<&[u8]> {
-    use protocol::messages::{IoctlResp, MsgHeader};
-    let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
-    let status = i32::from_le_bytes(resp.get(8..12)?.try_into().ok()?);
-    (status == 0 && n >= body).then(|| &resp[body..n.min(resp.len())])
-}
 
 impl NvidiaBackend {
     /// A render node was opened as `handle`: learn its GPU's semaphore
@@ -864,56 +874,58 @@ impl NvidiaBackend {
             .render_opened_by(handle, dri, self.handles.owner(handle));
     }
 
-    /// The host descriptor for the OS event a guest names at `field` (8
-    /// bytes, the guest's handle for the file) under client `h_client`:
-    /// `None` for 0 (no notification). EBADF for a number that is none of
-    /// our devices, EINVAL for one no live OS event of that client names.
+    /// The OS event a guest names at `at` of `block` (8 bytes, the guest's
+    /// handle for the file) under client `h_client`, and the field: `None`
+    /// for 0 (no notification). EBADF for a number that is none of our
+    /// devices, EINVAL for one no live OS event of that client names.
     pub(crate) fn os_event_fd(
         &self,
         h_client: u32,
-        field: &[u8],
-    ) -> Result<Option<std::os::fd::BorrowedFd<'_>>, Errno> {
-        let v = rd(field, 0, 8).ok_or(libc::EINVAL)?;
-        if v == 0 {
-            return Ok(None);
-        }
-        let handle = u32::try_from(v).map_err(|_| libc::EBADF)?;
-        let fd = match self.handles.get(handle) {
-            Some((fd, crate::hostfd::HandleKind::Dev(_))) => fd,
-            _ => {
-                log::warn!("RM call names OS event handle {v:#x}, which is none of our devices");
-                return Err(libc::EBADF);
-            }
+        block: &[u8],
+        at: usize,
+    ) -> (FdField, Result<FdIn<'_>, Errno>) {
+        let f = FdField {
+            at,
+            width: 8,
+            accept: FdAccept::Device,
+            none: FdNone::Zero,
         };
-        if !self.semsurf.os_event_live(h_client, handle) {
-            log::warn!(
-                "RM call names handle {handle} as an OS event of client {h_client:#x}, and no \
-                 such event is live; refused"
-            );
-            return Err(libc::EINVAL);
-        }
-        Ok(Some(fd))
+        let v = match self.fd_field(block, f) {
+            Err(libc::EBADF) => {
+                log::warn!("RM call names an OS event by a handle that is none of our devices");
+                Err(libc::EBADF)
+            }
+            Ok(FdIn::File { handle, .. }) if !self.semsurf.os_event_live(h_client, handle) => {
+                log::warn!(
+                    "RM call names handle {handle} as an OS event of client {h_client:#x}, and no \
+                     such event is live; refused"
+                );
+                Err(libc::EINVAL)
+            }
+            v => v,
+        };
+        (f, v)
     }
 
-    /// After a v1 RM call on `issuer` answered `resp` (`n` bytes): what it
-    /// allocated or freed that the checks above rest on. `param_in` is what
-    /// the guest sent.
+    /// After a v1 RM call on `issuer` the host served with parameters
+    /// `reply` (none if it did not): what it allocated or freed that the
+    /// checks above rest on. `param_in` is what the guest sent.
     pub(crate) fn semsurf_track_rm(
         &self,
         escape: u32,
         issuer: u32,
         param_in: &[u8],
-        resp: &[u8],
-        n: usize,
+        reply: Option<&[u8]>,
     ) {
         use abi::ioctl::*;
-        let word = |b: &[u8], at: usize| rd(b, at, 4).map(|v| v as u32);
+        let word = le::u32_at;
         match escape {
             NV_ESC_RM_ALLOC => {
-                let is_client = word(param_in, 12).is_some_and(|c| ROOT_CLASSES.contains(&c));
-                if let Some(out) = reply_params(resp, n).filter(|_| is_client)
-                    && word(out, 40) == Some(0)
-                    && let Some(h) = word(out, 8).filter(|&h| h != 0)
+                let is_client =
+                    word(param_in, NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c));
+                if let Some(out) = reply.filter(|_| is_client)
+                    && word(out, NVOS64_STATUS) == Some(0)
+                    && let Some(h) = word(out, NVOS64_H_OBJECT_NEW).filter(|&h| h != 0)
                 {
                     // Its maker, the calling guest process when the guest
                     // says (rmshare.rs).
@@ -932,8 +944,11 @@ impl NvidiaBackend {
             // away -- changes nothing: forgotten, the owner's duplicates,
             // fence contexts and grants would be refused from then on.
             NV_ESC_RM_FREE => {
-                if let (Some(root), Some(old)) = (word(param_in, 0), word(param_in, 8)) {
-                    let freed = reply_params(resp, n).and_then(|out| word(out, 12)) == Some(0);
+                if let (Some(root), Some(old)) = (
+                    word(param_in, NVOS00_H_ROOT),
+                    word(param_in, NVOS00_H_OBJECT_OLD),
+                ) {
+                    let freed = reply.and_then(|out| word(out, NVOS00_STATUS)) == Some(0);
                     if !freed && self.semsurf.issuer_of(root) != Some(issuer) {
                         log::debug!(
                             "RM_FREE of {root:#x}/{old:#x} through handle {issuer}, which did \
@@ -952,9 +967,12 @@ impl NvidiaBackend {
             // Status}: `fd` is our handle as the guest sent it (restored in
             // the reply), -1 for none.
             NV_ESC_ALLOC_OS_EVENT => {
-                if let Some(out) = reply_params(resp, n)
-                    && let (Some(c), Some(fd), Some(0)) =
-                        (word(out, 0), word(out, 8), word(out, 12))
+                if let Some(out) = reply
+                    && let (Some(c), Some(fd), Some(0)) = (
+                        word(out, OS_EVENT_H_CLIENT),
+                        word(out, OS_EVENT_FD),
+                        word(out, OS_EVENT_STATUS),
+                    )
                     && (fd as i32) >= 0
                 {
                     self.semsurf.os_event_allocated(issuer, c, fd);
@@ -963,8 +981,11 @@ impl NvidiaBackend {
             // The same for an OS event: forgotten when RM freed it, or when
             // the free came through the file it was made on.
             NV_ESC_FREE_OS_EVENT => {
-                if let (Some(c), Some(fd)) = (word(param_in, 0), word(param_in, 8)) {
-                    let freed = reply_params(resp, n).and_then(|out| word(out, 12)) == Some(0);
+                if let (Some(c), Some(fd)) = (
+                    word(param_in, OS_EVENT_H_CLIENT),
+                    word(param_in, OS_EVENT_FD),
+                ) {
+                    let freed = reply.and_then(|out| word(out, OS_EVENT_STATUS)) == Some(0);
                     if freed || self.semsurf.os_event_issuer(c, fd) == Some(issuer) {
                         self.semsurf.os_event_freed(c, fd);
                     }
@@ -978,6 +999,10 @@ impl NvidiaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rd(b: &[u8], at: usize, width: usize) -> Option<u64> {
+        le::uint_at(b, at, width)
+    }
     use crate::hostfd::HandleKind;
     use crate::schema::SchemaClass;
     use crate::xfer;
@@ -1463,7 +1488,10 @@ mod tests {
         ) -> Result<(), String> {
             assert_eq!((cmd, params.len()), (0x201, 128));
             if self.strict && fd != self.opened.borrow()[0] {
-                return Err("RM status 0x1a".into()); // NV_ERR_INVALID_CLIENT
+                return Err(format!(
+                    "RM status {:#x}",
+                    crate::nvos::NV_ERR_INVALID_CLIENT
+                ));
             }
             Ok(())
         }
@@ -1536,8 +1564,8 @@ mod tests {
             ],
             [Some(1), Some(2), Some(0x2080_1352), Some(0x99), Some(32)]
         );
-        assert_eq!(NV_ESC_RM_ALLOC_64, 0xc030_462b);
-        assert_eq!(NV_ESC_RM_CONTROL, 0xc020_462a);
+        assert_eq!(RM_ALLOC_IOCTL, 0xc030_462b);
+        assert_eq!(RM_CONTROL_IOCTL, 0xc020_462a);
         assert_eq!(SEMSURF_FENCE_CTX_CREATE, 0xc020_6454);
     }
 }
@@ -1890,7 +1918,7 @@ mod backend_tests {
             assert_eq!(status(&r), 0, "the ioctl succeeds, as RM's refusals do");
             assert_eq!(
                 rm_status_at(&r, 12),
-                crate::rmshare::NV_ERR_INSUFFICIENT_PERMISSIONS,
+                NV_ERR_INSUFFICIENT_PERMISSIONS,
                 "{cmd:#x}"
             );
             // The caller's own values come back.

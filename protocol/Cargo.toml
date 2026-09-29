@@ -6,3 +6,8 @@ license = "BSD-3-Clause OR GPL-2.0-or-later"
 rust-version.workspace = true
 publish.workspace = true
 description = "virtio-nvgpu wire format shared by the backend and the guest driver (driver/nvgpu_wire.h)"
+
+[features]
+# protocol::cheader, the C header reader the wire tests use (device's and
+# nvgpu-wl-guest's too). It needs std; nothing that ships enables it.
+cheader = []

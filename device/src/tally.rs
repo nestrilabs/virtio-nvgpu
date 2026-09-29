@@ -2,13 +2,13 @@
 //! Counting keys a guest chooses, in bounded memory.
 //!
 //! The backend counts every RM class and control command a workload uses
-//! (`nvidia.rs`, `rm_classes` and `rm_controls`): the instrument an RM
-//! allowlist will be written from. Both keys are u32s the guest writes, so a
-//! map with an entry per distinct key is a map a guest can grow by one entry
-//! per call, four billion times over, and print back as one multi-gigabyte
-//! log line at teardown (S-17). Past [`MAX_KEYS`] distinct keys the rest are
-//! counted together, and the report comes out a bounded number of entries per
-//! line.
+//! (`nvidia/`, `rm_classes` and `rm_controls`): the instrument the RM
+//! allowlist (gen/rmallow) was checked against. Both keys are u32s the
+//! guest writes, so a map with an entry per distinct key is a map a guest
+//! can grow by one entry per call, four billion times over, and print back
+//! as one multi-gigabyte log line at teardown (S-17). Past [`MAX_KEYS`]
+//! distinct keys the rest are counted together, and the report comes out a
+//! bounded number of entries per line.
 
 #![forbid(unsafe_code)]
 

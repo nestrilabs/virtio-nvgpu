@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The capture-injection socket's packets and INJECT_OPEN (inject.rs),
+//! The capture-injection socket's packets and INJECT_OPEN (inject/),
 //! against the fake nvidia-drm of `inject::fake`.
 //!
 //! The input is a sequence of operations: a helper packet (built or raw,

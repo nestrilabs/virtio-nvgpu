@@ -26,10 +26,18 @@
 //! NV_ERR_INSUFFICIENT_PERMISSIONS in the NVOS54 status with the call itself
 //! succeeding: the caller sees the refusal RM gives an unprivileged caller
 //! natively, not a failed ioctl.
-//! Command numbers are FINN interface ids and the same in 535.129.03,
-//! 580.95.05, 595.58.03 and 610.57.04.
+//! Command numbers are FINN interface ids, each the same in every release
+//! gen/rmallow measured that exports it (535.129.03 through 615.71.09):
+//! GPUACCT_GET_PROC_ACCOUNTING_INFO_V2 is exported from 610, and
+//! FB_GET_CLIENT_ALLOCATION_INFO by none of them, though its header has
+//! it (0x20801349 in 595.99.02).
 
 #![forbid(unsafe_code)]
+
+use crate::le;
+use crate::nvos::{
+    self, NV_ERR_INSUFFICIENT_PERMISSIONS, NV_ERR_NOT_SUPPORTED, NVOS54_CMD, NVOS54_STATUS,
+};
 
 /// Controls that report other RM clients' host PIDs or per-process usage.
 pub const HOST_PID_CONTROLS: &[(u32, &str)] = &[
@@ -63,18 +71,10 @@ pub const HOST_PID_CONTROLS: &[(u32, &str)] = &[
     (0x0000_0607, "NV0000_CTRL_CMD_NVD_GET_RCERR_RPT"),
 ];
 
-/// NV_ERR_INSUFFICIENT_PERMISSIONS (nvstatuscodes.h).
-pub const NV_ERR_INSUFFICIENT_PERMISSIONS: u32 = 0x1b;
-
-/// NVOS54: `cmd` at 8, `status` at 28, 32 bytes.
-const OS54_CMD: usize = 8;
-const OS54_STATUS: usize = 28;
-const OS54_SIZE: usize = 32;
-
 /// The name of the host-PID control `params` (an NVOS54 block, as sent)
 /// names, if it names one.
 pub fn host_pid_control(params: &[u8]) -> Option<&'static str> {
-    let cmd = u32::from_le_bytes(params.get(OS54_CMD..OS54_CMD + 4)?.try_into().ok()?);
+    let cmd = le::u32_at(params, NVOS54_CMD)?;
     HOST_PID_CONTROLS
         .iter()
         .find(|(c, _)| *c == cmd)
@@ -86,12 +86,7 @@ pub fn host_pid_control(params: &[u8]) -> Option<&'static str> {
 /// same bytes, with the status word saying so. Nothing of the parameters is
 /// written, as RM writes nothing before refusing.
 pub fn refusal(params: &[u8]) -> Vec<u8> {
-    let mut out = params.to_vec();
-    if out.len() >= OS54_SIZE {
-        out[OS54_STATUS..OS54_STATUS + 4]
-            .copy_from_slice(&NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes());
-    }
-    out
+    nvos::with_status(params, NVOS54_STATUS, NV_ERR_INSUFFICIENT_PERMISSIONS)
 }
 
 // ─────────────────────── NV0000's OS_UNIX controls ───────────────────────
@@ -147,13 +142,10 @@ pub fn unix_control(cmd: u32) -> Option<UnixCtl> {
     })
 }
 
-/// NV_ERR_NOT_SUPPORTED (nvstatuscodes.h).
-pub const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
-
 /// The control `params` (an NVOS54 block) names, when it is an OS_UNIX one
 /// the backend refuses: its name.
 pub fn unix_refused(params: &[u8]) -> Option<&'static str> {
-    let cmd = u32::from_le_bytes(params.get(OS54_CMD..OS54_CMD + 4)?.try_into().ok()?);
+    let cmd = le::u32_at(params, NVOS54_CMD)?;
     match unix_control(cmd)? {
         UnixCtl::Refused(name) => Some(name),
         _ => None,
@@ -163,11 +155,7 @@ pub fn unix_refused(params: &[u8]) -> Option<&'static str> {
 /// `params` answered NOT_SUPPORTED, as RM answers a control it does not
 /// serve.
 pub fn unsupported(params: &[u8]) -> Vec<u8> {
-    let mut out = params.to_vec();
-    if out.len() >= OS54_SIZE {
-        out[OS54_STATUS..OS54_STATUS + 4].copy_from_slice(&NV_ERR_NOT_SUPPORTED.to_le_bytes());
-    }
-    out
+    nvos::with_status(params, NVOS54_STATUS, NV_ERR_NOT_SUPPORTED)
 }
 
 #[cfg(test)]
@@ -197,7 +185,7 @@ mod tests {
         assert!(unix_refused(&b).is_some());
         b = unsupported(&b);
         assert_eq!(
-            u32::from_le_bytes(b[OS54_STATUS..OS54_STATUS + 4].try_into().unwrap()),
+            u32::from_le_bytes(b[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap()),
             NV_ERR_NOT_SUPPORTED
         );
         assert!(unix_refused(&nvos54(0x3d0c)).is_none());
@@ -205,7 +193,7 @@ mod tests {
 
     fn nvos54(cmd: u32) -> Vec<u8> {
         let mut b = vec![0u8; 32];
-        b[OS54_CMD..OS54_CMD + 4].copy_from_slice(&cmd.to_le_bytes());
+        b[NVOS54_CMD..NVOS54_CMD + 4].copy_from_slice(&cmd.to_le_bytes());
         b
     }
 

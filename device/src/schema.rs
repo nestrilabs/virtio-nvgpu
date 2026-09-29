@@ -70,6 +70,78 @@ pub fn kind_allowed(kinds: u32, kind: HandleKind) -> bool {
 mod tests {
     use super::*;
 
+    /// The kind bits the schema language writes (gen/schema/lang.py) and the
+    /// guest's generated header declares are the protocol's `HK_*` and
+    /// these `K_DEV_*`: the schema's fields are checked against them here,
+    /// and nothing else holds the three to one another.
+    #[test]
+    fn the_schema_languages_kind_bits_are_the_protocols() {
+        let lang = include_str!("../../gen/schema/lang.py");
+        let mut seen = 0;
+        for line in lang.lines().map(str::trim) {
+            let Some((names, values)) = line.split_once(" = ") else {
+                continue;
+            };
+            let names: Vec<_> = names.split(", ").collect();
+            if !names
+                .iter()
+                .all(|n| n.starts_with("HK_") || n.starts_with("K_"))
+            {
+                continue;
+            }
+            let values: Vec<_> = values.split(", ").collect();
+            assert_eq!(names.len(), values.len(), "{line}");
+            for (name, value) in names.into_iter().zip(values) {
+                let hk = |n: &str| match n {
+                    "HK_DEV" => protocol::HK_DEV,
+                    "HK_DRI_RENDER" => protocol::HK_DRI_RENDER,
+                    "HK_DRM_CARD" => protocol::HK_DRM_CARD,
+                    "HK_DRM_LEASE" => protocol::HK_DRM_LEASE,
+                    "HK_SYNC_FILE" => protocol::HK_SYNC_FILE,
+                    "HK_SYNCOBJ" => protocol::HK_SYNCOBJ,
+                    "HK_DMABUF" => protocol::HK_DMABUF,
+                    "HK_EVENTFD" => protocol::HK_EVENTFD,
+                    "HK_MEMFD" => protocol::HK_MEMFD,
+                    "HK_WAYLAND" => protocol::HK_WAYLAND,
+                    "HK_OTHER" => protocol::HK_OTHER,
+                    _ => panic!("lang.py names {n}, which the protocol lacks"),
+                };
+                let ours = match name {
+                    "K_DEV_CTL" => K_DEV_CTL,
+                    "K_DEV_MODESET" => K_DEV_MODESET,
+                    "K_DEV_GPU" => K_DEV_GPU,
+                    "K_ANY_DEV" => 1 << protocol::HK_DEV,
+                    k if k.starts_with("K_") => 1 << hk(&format!("H{k}")),
+                    h => hk(h),
+                };
+                let theirs = match value.split_once(" << ") {
+                    Some(("1", s)) if s.starts_with("HK_") => 1 << hk(s),
+                    Some(("1", s)) => 1 << s.parse::<u32>().unwrap(),
+                    None => value.parse().unwrap(),
+                    _ => panic!("{line}"),
+                };
+                assert_eq!(ours, theirs, "lang.py {name}");
+                seen += 1;
+            }
+        }
+        // HK_DEV .. HK_MEMFD, five K_ kinds and three K_DEV_ bits.
+        assert_eq!(seen, 17);
+        // The header is mostly tables; its kind defines alone.
+        let defines: String = include_str!("../../driver/gen/nvgpu_schema.h")
+            .lines()
+            .filter(|l| l.starts_with("#define NVGPU_SKIND_DEV_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let h = protocol::cheader::Header::parse(&defines);
+        assert_eq!(h.defines.len(), 3);
+        assert_eq!(h.define("NVGPU_SKIND_DEV_CTL"), u64::from(K_DEV_CTL));
+        assert_eq!(
+            h.define("NVGPU_SKIND_DEV_MODESET"),
+            u64::from(K_DEV_MODESET)
+        );
+        assert_eq!(h.define("NVGPU_SKIND_DEV_GPU"), u64::from(K_DEV_GPU));
+    }
+
     #[test]
     fn a_device_bit_admits_that_device_and_no_other() {
         let ctl = HandleKind::Dev(DeviceKind::Ctl);

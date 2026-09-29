@@ -58,7 +58,8 @@ pub enum MsgType {
     /// **Host → guest**, on the event queue: the descriptor named by
     /// `MsgHeader::handle` has something to report.
     ///
-    /// The only message that travels this way. NVIDIA's user-mode driver waits
+    /// One of the two messages that travel this way (the other is
+    /// [`MsgType::EventData`]). NVIDIA's user-mode driver waits
     /// for the GPU by polling the descriptor an RM event is delivered on; the
     /// host driver takes the interrupt and makes *its* descriptor readable, and
     /// this carries that edge across so the guest's can do the same. Without
@@ -137,32 +138,6 @@ pub struct MsgHeader {
     /// Was padding until protocol v2. A v2 guest puts a non-zero id in every
     /// request and the backend echoes it; zero means "none" (a v1 guest).
     pub req_id: u32,
-}
-
-impl MsgHeader {
-    /// A success response carrying `handle`.
-    pub fn ok(msg_type: MsgType, handle: u32) -> Self {
-        Self {
-            msg_type: msg_type as u32,
-            handle,
-            status: 0,
-            req_id: 0,
-        }
-    }
-
-    /// A failure response. `errno` is given as a positive number and stored
-    /// negated, which is the one direction that is easy to get wrong.
-    ///
-    /// Saturating: `i32::MIN` has no positive twin, and `abs` aborts on it
-    /// under the release profile (review 2026-09-29 2.6).
-    pub fn err(msg_type: MsgType, errno: i32) -> Self {
-        Self {
-            msg_type: msg_type as u32,
-            handle: 0,
-            status: -errno.saturating_abs(),
-            req_id: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,98 +977,367 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
-    /// A failure's errno is stored negated, and `i32::MIN` does not abort
-    /// (review 2026-09-29 2.6).
-    #[test]
-    fn an_error_header_negates_any_errno() {
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, 22).status, -22);
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, -22).status, -22);
-        assert_eq!(MsgHeader::err(MsgType::Ioctl, i32::MIN).status, -i32::MAX);
+    fn wire_header() -> crate::cheader::Header {
+        crate::cheader::Header::parse(include_str!("../../driver/nvgpu_wire.h"))
     }
 
-    /// The deep-segment and UVM-aperture constants are the C header's:
-    /// nothing else checks that the two halves agree on them.
+    /// Every integer the C header defines is one of these, with this value.
+    /// A define added on either side and not here fails
+    /// `every_define_in_the_wire_header_is_mirrored`.
+    const WIRE: &[(&str, u64)] = &[
+        ("NVGPU_MSG_OPEN", MsgType::Open as u64),
+        ("NVGPU_MSG_CLOSE", MsgType::Close as u64),
+        ("NVGPU_MSG_IOCTL", MsgType::Ioctl as u64),
+        ("NVGPU_MSG_MMAP", MsgType::Mmap as u64),
+        ("NVGPU_MSG_MUNMAP", MsgType::Munmap as u64),
+        ("NVGPU_MSG_GET_PROC_FILES", MsgType::GetProcFiles as u64),
+        ("NVGPU_MSG_GET_SYS_FILES", MsgType::GetSysFiles as u64),
+        ("NVGPU_MSG_EVENT_READY", MsgType::EventReady as u64),
+        ("NVGPU_MSG_HELLO", MsgType::Hello as u64),
+        ("NVGPU_MSG_IOCTL2", MsgType::Ioctl2 as u64),
+        ("NVGPU_MSG_TIME_SYNC", MsgType::TimeSync as u64),
+        ("NVGPU_MSG_EVENT_DATA", MsgType::EventData as u64),
+        ("NVGPU_MSG_WATCH", MsgType::Watch as u64),
+        ("NVGPU_MSG_UNWATCH", MsgType::Unwatch as u64),
+        ("NVGPU_MSG_HOST_OP", MsgType::HostOp as u64),
+        ("NVGPU_MSG_WL_SEND", MsgType::WlSend as u64),
+        ("NVGPU_MSG_WL_RECV", MsgType::WlRecv as u64),
+        ("NVGPU_DEV_CTL", DEV_CTL as u64),
+        ("NVGPU_DEV_UVM", DEV_UVM as u64),
+        ("NVGPU_DEV_UVM_TOOLS", DEV_UVM_TOOLS as u64),
+        ("NVGPU_DEV_MODESET", DEV_MODESET as u64),
+        ("NVGPU_DEV_WAYLAND", DEV_WAYLAND as u64),
+        ("NVGPU_DEV_DRI_BASE", DEV_DRI_BASE as u64),
+        ("NVGPU_DEV_DRI_CARD_BASE", DEV_DRI_CARD_BASE as u64),
+        ("NVGPU_DEEP_SEGMENTED", DEEP_SEGMENTED as u64),
+        ("NVGPU_DEEP_SEGS_MAX", DEEP_SEGS_MAX as u64),
+        ("NVGPU_DEEP_SEGS_MAX_BYTES", DEEP_SEGS_MAX_BYTES as u64),
+        ("NVGPU_IDLE_CHANNELS_MAX", IDLE_CHANNELS_MAX as u64),
+        ("NVGPU_DEEP_PAGE_LIST", DEEP_PAGE_LIST as u64),
+        ("NVGPU_OSDESC_F_WRITE", OSDESC_F_WRITE as u64),
+        ("NVGPU_OSDESC_MAX_RUNS", OSDESC_MAX_RUNS as u64),
+        ("NVGPU_OSDESC_MAX_PAGES", OSDESC_MAX_PAGES as u64),
+        ("NVGPU_MMAP_CACHE_DEFAULT", MMAP_CACHE_DEFAULT as u64),
+        ("NVGPU_MMAP_CACHE_WB", MMAP_CACHE_WB as u64),
+        ("NVGPU_MMAP_CACHE_WC", MMAP_CACHE_WC as u64),
+        ("NVGPU_MMAP_CACHE_UC", MMAP_CACHE_UC as u64),
+        ("NVGPU_MMAP_F_READ_ONLY", MMAP_F_READ_ONLY as u64),
+        ("NVGPU_MMAP_F_UVM_APERTURE", MMAP_F_UVM_APERTURE as u64),
+        ("NVGPU_SHM_ID_UVM", SHM_ID_UVM as u64),
+        ("NVGPU_UVM_HVA_MIN", UVM_HVA_MIN),
+        ("NVGPU_UVM_HVA_MAX", UVM_HVA_MAX),
+        ("NVGPU_PROTO_V2", PROTO_V2 as u64),
+        ("NVGPU_HELLO_F_FRESH", HELLO_F_FRESH as u64),
+        ("NVGPU_BCAP_KMS_CARD", BCAP_KMS_CARD as u64),
+        ("NVGPU_BCAP_WAYLAND", BCAP_WAYLAND as u64),
+        ("NVGPU_BCAP_FENCES", BCAP_FENCES as u64),
+        ("NVGPU_BCAP_NVKMS_TABLE", BCAP_NVKMS_TABLE as u64),
+        ("NVGPU_BCAP_WL_EXPORT", BCAP_WL_EXPORT as u64),
+        ("NVGPU_BCAP_DEEP_SEGS", BCAP_DEEP_SEGS as u64),
+        ("NVGPU_BCAP_UVM_MAP", BCAP_UVM_MAP as u64),
+        ("NVGPU_BCAP_OS_DESC", BCAP_OS_DESC as u64),
+        ("NVGPU_BCAP_PROC_ID", BCAP_PROC_ID as u64),
+        ("NVGPU_BCAP_PROC_EUID", BCAP_PROC_EUID as u64),
+        ("NVGPU_BCAP_COMPUTE", BCAP_COMPUTE as u64),
+        ("NVGPU_BCAP_INJECT", BCAP_INJECT as u64),
+        ("NVGPU_BCAP_ARMED_READY", BCAP_ARMED_READY as u64),
+        ("NVGPU_GCAP_UVM_APERTURE", GCAP_UVM_APERTURE as u64),
+        ("NVGPU_GCAP_PROC_ID", GCAP_PROC_ID as u64),
+        ("NVGPU_GCAP_PROC_EUID", GCAP_PROC_EUID as u64),
+        ("NVGPU_GCAP_ARMS_READY", GCAP_ARMS_READY as u64),
+        ("NVGPU_I2_MAX_BUFS", I2_MAX_BUFS as u64),
+        ("NVGPU_I2_MAX_RECS", I2_MAX_RECS as u64),
+        ("NVGPU_I2_FD_CONSUME", I2_FD_CONSUME as u64),
+        ("NVGPU_I2_DYN_OUT_FENCE", I2_DYN_OUT_FENCE as u64),
+        ("NVGPU_HK_DEV", HK_DEV as u64),
+        ("NVGPU_HK_DRI_RENDER", HK_DRI_RENDER as u64),
+        ("NVGPU_HK_DRM_CARD", HK_DRM_CARD as u64),
+        ("NVGPU_HK_DRM_LEASE", HK_DRM_LEASE as u64),
+        ("NVGPU_HK_SYNC_FILE", HK_SYNC_FILE as u64),
+        ("NVGPU_HK_SYNCOBJ", HK_SYNCOBJ as u64),
+        ("NVGPU_HK_DMABUF", HK_DMABUF as u64),
+        ("NVGPU_HK_EVENTFD", HK_EVENTFD as u64),
+        ("NVGPU_HK_MEMFD", HK_MEMFD as u64),
+        ("NVGPU_HK_WAYLAND", HK_WAYLAND as u64),
+        ("NVGPU_HK_OTHER", HK_OTHER as u64),
+        ("NVGPU_W_ONESHOT", W_ONESHOT as u64),
+        ("NVGPU_W_FENCE", W_FENCE as u64),
+        ("NVGPU_W_DRM", W_DRM as u64),
+        ("NVGPU_W_READY", W_READY as u64),
+        ("NVGPU_W_ARM", W_ARM as u64),
+        ("NVGPU_OP_PRIME_EXPORT", OP_PRIME_EXPORT as u64),
+        ("NVGPU_OP_DMABUF_IMPORT", OP_DMABUF_IMPORT as u64),
+        ("NVGPU_OP_SYNC_MERGE", OP_SYNC_MERGE as u64),
+        ("NVGPU_OP_NEW_EVENTFD", OP_NEW_EVENTFD as u64),
+        ("NVGPU_OP_FD_KIND", OP_FD_KIND as u64),
+        ("NVGPU_OP_SIGNALED_SYNC_FILE", OP_SIGNALED_SYNC_FILE as u64),
+        ("NVGPU_OP_OPEN_KMS", OP_OPEN_KMS as u64),
+        ("NVGPU_OP_DROP_IF_MASTER", OP_DROP_IF_MASTER as u64),
+        ("NVGPU_OP_CLOSE_MANY", OP_CLOSE_MANY as u64),
+        ("NVGPU_OP_SYNCOBJ_WATCH", OP_SYNCOBJ_WATCH as u64),
+        ("NVGPU_OP_OSDESC_REAP", OP_OSDESC_REAP as u64),
+        ("NVGPU_OSDESC_REAP_MAX", OSDESC_REAP_MAX as u64),
+        ("NVGPU_OP_INJECT_OPEN", OP_INJECT_OPEN as u64),
+        (
+            "NVGPU_OP_INJECT_OPEN_SYNCOBJ",
+            OP_INJECT_OPEN_SYNCOBJ as u64,
+        ),
+        ("NVGPU_OP_MAX_ARGS", OP_MAX_ARGS as u64),
+        ("NVGPU_OP_MAX_RES", OP_MAX_RES as u64),
+        ("NVGPU_EV_DRM", EV_DRM as u64),
+        ("NVGPU_EV_FENCE", EV_FENCE as u64),
+        ("NVGPU_EV_READY", EV_READY as u64),
+        ("NVGPU_EV_HOTPLUG", EV_HOTPLUG as u64),
+        ("NVGPU_EVENT_BUF_SIZE", EVENT_BUF_SIZE as u64),
+        ("NVGPU_EV_HOTPLUG_F_HOTPLUG", EV_HOTPLUG_F_HOTPLUG as u64),
+        ("NVGPU_EV_HOTPLUG_F_LEASE", EV_HOTPLUG_F_LEASE as u64),
+    ];
+
+    /// Defines of the header this crate does not mirror, and why.
+    const NOT_HERE: &[&str] = &[
+        // The config space's, which device/src/virtio.rs holds and checks
+        // against this header.
+        "VIRTIO_ID_GPU_NV",
+        "NVGPU_FDT_UVM",
+        // The guest's feature table and the config space's `caps`: the
+        // backend offers none of these features and leaves `caps` zero.
+        "VIRTIO_GPU_NV_F_UVM",
+        "VIRTIO_GPU_NV_F_ENCODE",
+        "VIRTIO_GPU_NV_F_GRAPHICS",
+        "NVGPU_CAP_COMPUTE",
+        "NVGPU_CAP_GRAPHICS",
+        "NVGPU_CAP_VIDEO",
+        "NVGPU_CAP_UTILITY",
+    ];
+
+    /// Every integer nvgpu_wire.h defines has its value here, and this table
+    /// names nothing the header lacks: nothing else checks that the two
+    /// halves, which ship separately, agree.
     #[test]
-    fn wire_constants_match_the_driver() {
-        let h = include_str!("../../driver/nvgpu_wire.h");
-        let define = |name: &str| -> u64 {
-            let line = h
-                .lines()
-                .find(|l| l.split_whitespace().take(2).eq(["#define", name]))
-                .unwrap_or_else(|| panic!("{name} not in nvgpu_wire.h"));
-            let v = line.split_once(name).unwrap().1;
-            let v = v.split("/*").next().unwrap().trim();
-            let v = v.trim_start_matches('(').trim_end_matches(')');
-            let (v, shift) = match v.split_once("<<") {
-                Some((a, b)) => (a.trim(), b.trim().parse::<u32>().unwrap()),
-                None => (v, 0),
+    fn every_define_in_the_wire_header_is_mirrored() {
+        let h = wire_header();
+        assert_eq!(h.bare, ["NVGPU_WIRE_H"]);
+        for (name, value) in &h.defines {
+            if NOT_HERE.contains(&name.as_str()) {
+                continue;
+            }
+            let Some((_, ours)) = WIRE.iter().find(|(n, _)| n == name) else {
+                panic!("{name} is not in WIRE");
             };
-            let v = v.trim_end_matches(['u', 'l', 'U', 'L']);
-            let v = match v.strip_prefix("0x") {
-                Some(x) => u64::from_str_radix(x, 16).unwrap(),
-                None => v.parse().unwrap(),
+            assert_eq!(value, ours, "{name}");
+        }
+        for (name, _) in WIRE {
+            assert!(h.defines.contains_key(*name), "{name} is not in the header");
+        }
+        for name in NOT_HERE {
+            assert!(h.defines.contains_key(*name), "{name} is not in the header");
+        }
+    }
+
+    /// Every struct of nvgpu_wire.h is laid out as its mirror here: the same
+    /// size, and each field at the same offset under the same name. Most
+    /// mirrors leave out the leading `hdr` (a `MsgHeader` read separately).
+    #[test]
+    fn every_wire_struct_is_laid_out_as_the_header_says() {
+        use core::mem::{offset_of, size_of};
+        let h = wire_header();
+        // C struct, whether its mirror leaves out `hdr`, mirror's size,
+        // mirror's fields as (name, offset).
+        type Mirror<'a> = (&'a str, bool, usize, &'a [(&'a str, usize)]);
+        macro_rules! mirror {
+            ($c:literal, $hdr:literal, $t:ty, [$($f:ident),* $(,)?]) => {
+                ($c, $hdr, size_of::<$t>(), &[$((stringify!($f), offset_of!($t, $f))),*][..])
             };
-            v << shift
-        };
-        assert_eq!(define("NVGPU_DEEP_SEGMENTED"), u64::from(DEEP_SEGMENTED));
-        assert_eq!(define("NVGPU_DEEP_SEGS_MAX"), u64::from(DEEP_SEGS_MAX));
+        }
+        let mirrors: &[Mirror] = &[
+            mirror!(
+                "nvgpu_msg_hdr",
+                false,
+                MsgHeader,
+                [msg_type, handle, status, req_id]
+            ),
+            mirror!("nvgpu_open_req", true, OpenReq, [device_type, flags]),
+            mirror!("nvgpu_open_resp", true, (), []),
+            mirror!(
+                "nvgpu_ioctl_req",
+                true,
+                IoctlReq,
+                [
+                    cmd,
+                    data_len,
+                    nested_offset,
+                    nested_len,
+                    deep_ptr_offset,
+                    deep_len,
+                ]
+            ),
+            mirror!(
+                "nvgpu_ioctl_resp",
+                true,
+                IoctlResp,
+                [data_len, nested_len, deep_len]
+            ),
+            mirror!("nvgpu_deep_seg_hdr", false, DeepSegHdr, [count, reserved]),
+            mirror!("nvgpu_deep_seg", false, DeepSeg, [ptr_offset, len]),
+            mirror!("nvgpu_osdesc_hdr", false, OsDescHdr, [nruns, flags]),
+            mirror!("nvgpu_osdesc_run", false, OsDescRun, [gpa, pages, reserved]),
+            mirror!(
+                "nvgpu_mmap_req",
+                true,
+                MmapReq,
+                [size, offset, prot, padding]
+            ),
+            mirror!(
+                "nvgpu_mmap_resp",
+                true,
+                MmapResp,
+                [guest_phys_addr, size, mapping_id, caching, flags, reserved,]
+            ),
+            mirror!("nvgpu_munmap_req", true, MunmapReq, [mapping_id, padding]),
+            mirror!("nvgpu_munmap_resp", true, (), []),
+            mirror!(
+                "nvgpu_proc_file_entry",
+                false,
+                FileEntry,
+                [path_len, content_len]
+            ),
+            mirror!("nvgpu_proc_id", false, ProcId, [start_ns, tgid, euid]),
+            mirror!(
+                "nvgpu_hello_req",
+                false,
+                HelloReq,
+                [proto, flags, guest_caps, uvm_aperture_mib,]
+            ),
+            mirror!(
+                "nvgpu_hello_resp",
+                false,
+                HelloResp,
+                [proto, backend_caps, max_req, max_resp, num_cards, reserved,]
+            ),
+            mirror!("nvgpu_time_sync_resp", false, TimeSyncResp, [host_mono_ns]),
+            mirror!(
+                "nvgpu_time_sync_resp2",
+                false,
+                TimeSyncResp2,
+                [host_mono_ns, host_realtime_ns, host_mono_raw_ns, reserved,]
+            ),
+            mirror!(
+                "nvgpu_i2_req",
+                false,
+                Ioctl2Req,
+                [cmd, flags, nbuf, nfd, ngem, ndyn, data_len, render,]
+            ),
+            mirror!(
+                "nvgpu_i2_fd_in",
+                false,
+                Ioctl2FdIn,
+                [buf, off, handle, flags]
+            ),
+            mirror!(
+                "nvgpu_i2_gem_in",
+                false,
+                Ioctl2GemIn,
+                [buf, off, owner, gem]
+            ),
+            mirror!("nvgpu_i2_dyn", false, Ioctl2Dyn, [kind, buf, off, len]),
+            mirror!(
+                "nvgpu_i2_resp",
+                false,
+                Ioctl2Resp,
+                [ret, nbuf, nfd, ngem, data_len, reserved,]
+            ),
+            mirror!(
+                "nvgpu_i2_fd_out",
+                false,
+                Ioctl2FdOut,
+                [buf, off, handle, kind]
+            ),
+            mirror!(
+                "nvgpu_i2_gem_out",
+                false,
+                Ioctl2GemOut,
+                [buf, off, gem, reserved, size]
+            ),
+            mirror!("nvgpu_watch_req", false, WatchReq, [handle, flags, cookie]),
+            mirror!("nvgpu_unwatch_req", false, UnwatchReq, [handle, pad]),
+            mirror!("nvgpu_host_op_req", false, HostOpReq, [op, nargs, args]),
+            mirror!("nvgpu_host_op_resp", false, HostOpResp, [nres, pad, res]),
+            mirror!(
+                "nvgpu_inject_info",
+                false,
+                crate::inject::InjectInfo,
+                [
+                    width, height, fourcc, nplanes, modifier, offsets, strides, flags, reserved,
+                ]
+            ),
+            mirror!("nvgpu_ev_rec", false, EvRec, [kind, len, cookie]),
+            mirror!(
+                "nvgpu_ev_fence",
+                false,
+                EvFence,
+                [status, pad, timestamp_ns]
+            ),
+            mirror!("nvgpu_ev_hotplug", false, EvHotplug, [flags, pad]),
+            mirror!(
+                "nvgpu_card_record",
+                false,
+                CardRecord,
+                [name_len, major, minor, render_index,]
+            ),
+            mirror!("nvgpu_wl_recv_req", false, WlRecvReq, [max_bytes, max_desc]),
+            mirror!("nvgpu_wl_send_resp", false, WlSendResp, [accepted, backlog]),
+        ];
+        // Structs mirrored elsewhere, or not as one struct.
+        let elsewhere = [
+            // device/src/virtio.rs, against this header.
+            "virtio_gpu_nv_gpu_slot",
+            "nvgpu_fd_translation_entry",
+            "virtio_gpu_nv_config",
+            // An OPEN request followed by a ProcId, checked below.
+            "nvgpu_open_req_proc",
+        ];
+        for (name, c) in &h.structs {
+            if elsewhere.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(&(_, hdr, size, fields)) = mirrors.iter().find(|m| m.0 == name) else {
+                panic!("struct {name} has no mirror");
+            };
+            let mut c_fields = c.fields.iter().map(|(n, o)| (n.as_str(), *o)).peekable();
+            let base = if hdr {
+                assert_eq!(c_fields.next(), Some(("hdr", 0)), "{name}");
+                size_of::<MsgHeader>()
+            } else {
+                0
+            };
+            assert_eq!(c.size, base + size, "sizeof(struct {name})");
+            let c_fields: std::vec::Vec<_> = c_fields.map(|(n, o)| (n, o - base)).collect();
+            assert_eq!(c_fields, fields, "struct {name}");
+        }
+        for (name, ..) in mirrors {
+            assert!(
+                h.structs.contains_key(*name),
+                "struct {name} is not in the header"
+            );
+        }
+        let proc_open = h.layout("nvgpu_open_req_proc");
         assert_eq!(
-            define("NVGPU_DEEP_SEGS_MAX_BYTES"),
-            u64::from(DEEP_SEGS_MAX_BYTES)
+            proc_open.offset("proc"),
+            size_of::<MsgHeader>() + size_of::<OpenReq>()
         );
         assert_eq!(
-            define("NVGPU_IDLE_CHANNELS_MAX"),
-            u64::from(IDLE_CHANNELS_MAX)
+            proc_open.size,
+            proc_open.offset("proc") + size_of::<ProcId>()
         );
-        assert_eq!(define("NVGPU_BCAP_DEEP_SEGS"), u64::from(BCAP_DEEP_SEGS));
-        assert_eq!(define("NVGPU_SHM_ID_UVM"), u64::from(SHM_ID_UVM));
-        assert_eq!(define("NVGPU_BCAP_UVM_MAP"), u64::from(BCAP_UVM_MAP));
-        assert_eq!(
-            define("NVGPU_GCAP_UVM_APERTURE"),
-            u64::from(GCAP_UVM_APERTURE)
-        );
-        assert_eq!(
-            define("NVGPU_MMAP_F_UVM_APERTURE"),
-            u64::from(MMAP_F_UVM_APERTURE)
-        );
-        assert_eq!(
-            define("NVGPU_MMAP_F_READ_ONLY"),
-            u64::from(MMAP_F_READ_ONLY)
-        );
-        assert_eq!(define("NVGPU_BCAP_OS_DESC"), u64::from(BCAP_OS_DESC));
-        assert_eq!(
-            define("NVGPU_BCAP_ARMED_READY"),
-            u64::from(BCAP_ARMED_READY)
-        );
-        assert_eq!(define("NVGPU_GCAP_ARMS_READY"), u64::from(GCAP_ARMS_READY));
-        assert_eq!(define("NVGPU_W_ARM"), u64::from(W_ARM));
-        assert_eq!(define("NVGPU_W_READY"), u64::from(W_READY));
-        assert_eq!(define("NVGPU_DEEP_PAGE_LIST"), u64::from(DEEP_PAGE_LIST));
-        assert_eq!(define("NVGPU_OSDESC_F_WRITE"), u64::from(OSDESC_F_WRITE));
-        assert_eq!(define("NVGPU_OSDESC_MAX_RUNS"), u64::from(OSDESC_MAX_RUNS));
-        assert_eq!(
-            define("NVGPU_OSDESC_MAX_PAGES"),
-            u64::from(OSDESC_MAX_PAGES)
-        );
-        assert_eq!(define("NVGPU_OP_OSDESC_REAP"), u64::from(OP_OSDESC_REAP));
-        assert_eq!(define("NVGPU_OSDESC_REAP_MAX"), u64::from(OSDESC_REAP_MAX));
-        assert_eq!(define("NVGPU_UVM_HVA_MIN"), UVM_HVA_MIN);
-        assert_eq!(define("NVGPU_UVM_HVA_MAX"), UVM_HVA_MAX);
-        assert_eq!(define("NVGPU_BCAP_PROC_ID"), u64::from(BCAP_PROC_ID));
-        assert_eq!(define("NVGPU_GCAP_PROC_ID"), u64::from(GCAP_PROC_ID));
-        assert_eq!(define("NVGPU_BCAP_PROC_EUID"), u64::from(BCAP_PROC_EUID));
-        assert_eq!(define("NVGPU_GCAP_PROC_EUID"), u64::from(GCAP_PROC_EUID));
-        assert_eq!(define("NVGPU_BCAP_COMPUTE"), u64::from(BCAP_COMPUTE));
-        assert_eq!(define("NVGPU_BCAP_INJECT"), u64::from(BCAP_INJECT));
-        assert_eq!(define("NVGPU_OP_INJECT_OPEN"), u64::from(OP_INJECT_OPEN));
-        assert_eq!(
-            define("NVGPU_OP_INJECT_OPEN_SYNCOBJ"),
-            u64::from(OP_INJECT_OPEN_SYNCOBJ)
-        );
-        assert!(h.contains("static_assert(sizeof(struct nvgpu_inject_info) == 64"));
-        // Every capability bit is distinct, on each side.
+    }
+
+    /// Every capability bit is distinct, on each side.
+    #[test]
+    fn capability_bits_are_distinct() {
         let bcaps = [
             BCAP_KMS_CARD,
             BCAP_WAYLAND,
@@ -1123,15 +1367,6 @@ mod tests {
             gcaps.iter().fold(0, |a, b| a | b).count_ones() as usize,
             gcaps.len()
         );
-        // The process identity the guest appends, field for field.
-        assert_eq!(size_of::<ProcId>(), 16);
-        assert_eq!(core::mem::offset_of!(ProcId, start_ns), 0);
-        assert_eq!(core::mem::offset_of!(ProcId, tgid), 8);
-        assert_eq!(core::mem::offset_of!(ProcId, euid), 12);
-        assert!(h.contains("static_assert(sizeof(struct nvgpu_proc_id) == 16"));
-        // HELLO's request is still the 16 bytes an older backend reads.
-        assert_eq!(size_of::<HelloReq>(), 16);
-        assert_eq!(core::mem::offset_of!(HelloReq, uvm_aperture_mib), 12);
     }
 
     #[test]
@@ -1172,18 +1407,6 @@ mod tests {
             DeviceKind::from_device_type(DEV_DRI_CARD_BASE - 1),
             Some(DeviceKind::Dri(DEV_DRI_CARD_BASE - 1 - DEV_DRI_BASE))
         );
-    }
-
-    /// The driver tests `(s32)status < 0`. An unsigned error code stored here
-    /// reads back as success and the guest proceeds on a failed call.
-    #[test]
-    fn an_error_status_is_negative() {
-        let h = MsgHeader::err(MsgType::Open, 2);
-        assert_eq!(h.status, -2);
-        assert!(h.status < 0);
-        assert_eq!(MsgHeader::err(MsgType::Open, -2).status, -2);
-        assert_eq!(MsgHeader::ok(MsgType::Open, 7).status, 0);
-        assert_eq!(MsgHeader::ok(MsgType::Open, 7).handle, 7);
     }
 
     #[test]

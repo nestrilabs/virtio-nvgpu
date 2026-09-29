@@ -28,16 +28,13 @@ use abi::rmctrl::DeepPtr;
 use protocol::messages::{DEEP_SEGS_MAX, DEEP_SEGS_MAX_BYTES, DeepSeg, DeepSegHdr};
 
 use crate::sys::block::{Arena, BufId, Restore, SlotKind};
+use crate::sys::pod;
 
 /// A refusal: the errno the guest's ioctl returns.
 pub type Errno = i32;
 
 const HDR: usize = size_of::<DeepSegHdr>();
 const ENTRY: usize = size_of::<DeepSeg>();
-
-fn rd32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().expect("four bytes"))
-}
 
 struct Seg {
     /// Where the pointer sits in the block.
@@ -58,8 +55,10 @@ impl Segments {
     /// Check the guest's segmented deep block, `deep`, against `rules` --
     /// the pointers RM follows in `block` (a block of `a`, the bytes the host
     /// will read) and how much it copies through each -- and give each
-    /// pointer it names a block of `a` holding the guest's bytes. On `Err`
-    /// nothing in `a` has changed.
+    /// pointer it names a block of `a` holding the guest's bytes. A block
+    /// the guest got wrong is refused before anything in `a` changes; an
+    /// arena error while the segments are made can leave some of them in
+    /// `a`, which the caller drops with the call.
     pub(crate) fn relocate(
         what: &str,
         rules: &[DeepPtr],
@@ -71,14 +70,12 @@ impl Segments {
             log::warn!("{what}: deep segments refused: {why}");
             Err(libc::EINVAL)
         };
-        if deep.len() < HDR {
+        let Some(DeepSegHdr { count, reserved }) = pod::read(deep, 0) else {
             return refuse(format!("{} bytes, no header", deep.len()));
-        }
-        let count = rd32(deep, 0);
-        if count == 0 || count > DEEP_SEGS_MAX || rd32(deep, 4) != 0 {
+        };
+        if count == 0 || count > DEEP_SEGS_MAX || reserved != 0 {
             return refuse(format!(
-                "a header of {count} segments, reserved {:#x}",
-                rd32(deep, 4)
+                "a header of {count} segments, reserved {reserved:#x}"
             ));
         }
         let table_end = HDR + count as usize * ENTRY;
@@ -89,8 +86,10 @@ impl Segments {
         let mut plan: Vec<(usize, usize)> = Vec::with_capacity(count as usize);
         let mut total = 0usize;
         for i in 0..count as usize {
-            let at = HDR + i * ENTRY;
-            let (ptr, len) = (rd32(deep, at) as usize, rd32(deep, at + 4) as usize);
+            let Some(DeepSeg { ptr_offset, len }) = pod::read(deep, HDR + i * ENTRY) else {
+                return refuse(format!("segment {i} past the table"));
+            };
+            let (ptr, len) = (ptr_offset as usize, len as usize);
             let Some(rule) = rules.iter().find(|r| r.ptr == ptr) else {
                 return refuse(format!("no pointer RM follows at {ptr}"));
             };

@@ -62,19 +62,23 @@ use abi::ioctl::{
     NV_ESC_RM_MAP_MEMORY_DMA, NV_ESC_RM_VID_HEAP_CONTROL,
 };
 
+use crate::le;
+use crate::nvos::{
+    NV_CONTEXT_DMA_ALLOCATION_FLAGS, NV_CONTEXT_DMA_ALLOCATION_H_MEMORY, NV_MEMORY_ALLOCATION_ATTR,
+    NV_MEMORY_ALLOCATION_ATTR2, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVOS00_H_OBJECT_OLD,
+    NVOS00_H_ROOT, NVOS00_SIZE, NVOS00_STATUS, NVOS02_FLAGS, NVOS02_H_CLASS, NVOS02_H_OBJECT_NEW,
+    NVOS02_H_OBJECT_PARENT, NVOS02_H_ROOT, NVOS02_STATUS, NVOS02_WITH_FD_FD, NVOS02_WITH_FD_SIZE,
+    NVOS32_ALLOC_OS_DESC_H_MEMORY, NVOS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR,
+    NVOS32_H_OBJECT_PARENT, NVOS32_H_ROOT, NVOS32_SIZE, NVOS32_STATUS, NVOS46_FLAGS,
+    NVOS46_H_CLIENT, NVOS46_H_MEMORY, NVOS55_H_CLIENT, NVOS55_H_CLIENT_SRC, NVOS55_H_OBJECT,
+    NVOS55_H_OBJECT_SRC, NVOS55_H_PARENT, NVOS55_SIZE, NVOS55_STATUS, NVOS64_H_CLASS,
+    NVOS64_H_OBJECT_NEW, NVOS64_H_OBJECT_PARENT, NVOS64_H_ROOT, NVOS64_SIZE, NVOS64_STATUS,
+    ROOT_CLASSES,
+};
 use crate::shm::PgprotKind;
 
 const NV01_CONTEXT_DMA: u32 = 0x02;
-/// NV01_ROOT, NV01_ROOT_NON_PRIV, NV01_ROOT_CLIENT: a new RM client, which
-/// lives as long as the file it was allocated on (escape.c:471-481 forces
-/// every one to _CLIENT; the host frees it when that file closes).
-use crate::semsurf::ROOT_CLASSES;
 const NV01_MEMORY_SYSTEM: u32 = 0x3e;
-/// Memory the guest registered by its pages (osdesc.rs).
-use crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR;
-/// VID_HEAP_CONTROL's NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR, and its hMemory.
-const HEAP_ALLOC_OS_DESCRIPTOR: u32 = 27;
-const HEAP_OS_DESC_MEMORY: usize = 40;
 /// VOLTA..BLACKWELL_USERMODE_A: the doorbell aperture, a slice of BAR0
 /// (ADDR_REGMEM, kernel_fifo_gv100.c:371-374), which the host maps UC
 /// whatever the caching type (nv-mmap.c:589-596).
@@ -107,51 +111,14 @@ pub(crate) const COHERENCY_WRITE_BACK: u8 = 5;
 /// not recorded, and their mappings fall back to the old classification.
 const MAX_OBJECTS: usize = 1 << 18;
 
-// Parameter layouts (nvos.h), identical in every release profiled.
-/// NVOS64 (RM_ALLOC, the 48-byte form the guest sends): the class
-/// parameters follow at 48.
-const ALLOC_ROOT: usize = 0;
-const ALLOC_NEW: usize = 8;
-const ALLOC_CLASS: usize = 12;
-const ALLOC_STATUS: usize = 40;
-const ALLOC_OUTER: usize = 48;
-/// NV_MEMORY_ALLOCATION_PARAMS.attr/attr2; NV_CONTEXT_DMA_ALLOCATION_PARAMS.flags/hMemory.
-const MEM_ATTR: usize = 24;
-const MEM_ATTR2: usize = 28;
-const CTXDMA_FLAGS: usize = 4;
-const CTXDMA_MEMORY: usize = 8;
-/// NVOS32 (VID_HEAP_CONTROL, 184 bytes).
-const HEAP_SIZE: usize = 184;
-const HEAP_ROOT: usize = 0;
-const HEAP_FUNCTION: usize = 8;
-const HEAP_STATUS: usize = 20;
-/// NVOS02 with its fd (ALLOC_MEMORY, 56 bytes).
-const OS02_SIZE: usize = 56;
-const OS02_ROOT: usize = 0;
-const OS02_NEW: usize = 8;
-const OS02_CLASS: usize = 12;
-const OS02_FLAGS: usize = 16;
-const OS02_STATUS: usize = 40;
-const OS02_FD: usize = 48;
-/// NVOS46 (MAP_MEMORY_DMA: 56 bytes before 580, 64 since; flags at 32 in both).
-const OS46_CLIENT: usize = 0;
-const OS46_MEMORY: usize = 12;
-const OS46_FLAGS: usize = 32;
-/// NVOS55 (DUP_OBJECT).
-const DUP_SIZE: usize = 28;
-const DUP_CLIENT: usize = 0;
-const DUP_OBJECT: usize = 8;
-const DUP_CLIENT_SRC: usize = 12;
-const DUP_OBJECT_SRC: usize = 16;
-const DUP_STATUS: usize = 24;
 /// hObjectParent, at 4 in NVOS64, NVOS32 and NVOS02 alike, and NVOS55's
 /// hParent.
-const PARENT: usize = 4;
-/// NVOS00 (RM_FREE).
-const FREE_SIZE: usize = 16;
-const FREE_ROOT: usize = 0;
-const FREE_OLD: usize = 8;
-const FREE_STATUS: usize = 12;
+const PARENT: usize = NVOS64_H_OBJECT_PARENT;
+const _: () = assert!(
+    PARENT == NVOS32_H_OBJECT_PARENT
+        && PARENT == NVOS02_H_OBJECT_PARENT
+        && PARENT == NVOS55_H_PARENT
+);
 
 /// What an RM handle names, as far as mapping it goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,8 +177,11 @@ enum Record {
         /// ALLOC_MEMORY arms a mapping on this guest file (escape.c:415-431),
         /// which the mmap that follows arrives on with no RM_MAP_MEMORY.
         armed_on: Option<u32>,
-        /// A new client: nothing to record here. The backend's client set
-        /// (semsurf.rs) says which file it dies with.
+        /// A new client (NV01_ROOT and its kin): nothing to record here. It
+        /// lives as long as the file it was allocated on (escape.c:471-481
+        /// forces every one to _CLIENT; the host frees it when that file
+        /// closes), and the backend's client set (semsurf.rs) says which file
+        /// that is.
         is_client: bool,
     },
     Dup,
@@ -306,26 +276,18 @@ impl Tree {
     }
 }
 
-fn rd32(b: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
-}
-
-fn wr32(b: &mut [u8], off: usize, v: u32) {
-    if let Some(s) = b.get_mut(off..off + 4) {
-        s.copy_from_slice(&v.to_le_bytes());
-    }
-}
-
 impl Pending {
     /// Replace `mask` bits of the word at `off` with `bits`, remembering the
     /// caller's, if they differ.
     fn rewrite(&mut self, params: &mut [u8], off: usize, mask: u32, bits: u32) {
-        let Some(w) = rd32(params, off) else { return };
+        let Some(w) = le::u32_at(params, off) else {
+            return;
+        };
         if w & mask == bits & mask {
             return;
         }
         self.restore.push((off, mask, w & mask));
-        wr32(params, off, (w & !mask) | (bits & mask));
+        let _ = le::put_u32(params, off, (w & !mask) | (bits & mask));
     }
 }
 
@@ -403,14 +365,14 @@ impl RmMem {
     pub(crate) fn before(&self, escape: u32, params: &mut [u8]) -> Pending {
         let mut p = Pending::default();
         match escape {
-            NV_ESC_RM_ALLOC if params.len() >= ALLOC_OUTER => {
-                let class = rd32(params, ALLOC_CLASS).unwrap_or(0);
+            NV_ESC_RM_ALLOC if params.len() >= NVOS64_SIZE => {
+                let class = le::u32_at(params, NVOS64_H_CLASS).unwrap_or(0);
                 let mem = if class == NV01_MEMORY_SYSTEM {
                     self.alloc_sysmem(
                         &mut p,
                         params,
-                        ALLOC_OUTER + MEM_ATTR,
-                        ALLOC_OUTER + MEM_ATTR2,
+                        NVOS64_SIZE + NV_MEMORY_ALLOCATION_ATTR,
+                        NVOS64_SIZE + NV_MEMORY_ALLOCATION_ATTR2,
                     )
                 } else if class == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                     Some(self.registered())
@@ -423,36 +385,38 @@ impl RmMem {
                     None
                 };
                 p.record = Record::New {
-                    client: ALLOC_ROOT,
-                    handle: ALLOC_NEW,
-                    status: ALLOC_STATUS,
+                    client: NVOS64_H_ROOT,
+                    handle: NVOS64_H_OBJECT_NEW,
+                    status: NVOS64_STATUS,
                     mem,
                     armed_on: None,
                     is_client: ROOT_CLASSES.contains(&class),
                 };
             }
-            NV_ESC_RM_VID_HEAP_CONTROL if params.len() >= HEAP_SIZE => {
+            NV_ESC_RM_VID_HEAP_CONTROL if params.len() >= NVOS32_SIZE => {
                 // (hMemory, flags, attr, attr2) of the three allocating
                 // functions: ALLOC_SIZE, ALLOC_TILED_PITCH_HEIGHT,
                 // ALLOC_SIZE_RANGE (nvos.h:690-800).
-                let at = match rd32(params, HEAP_FUNCTION) {
+                let at = match le::u32_at(params, NVOS32_FUNCTION) {
                     Some(2) => Some((44, 52, 56, 144)),
                     Some(6) => Some((44, 52, 64, 144)),
                     Some(14) => Some((44, 52, 56, 136)),
                     _ => None,
                 };
-                if rd32(params, HEAP_FUNCTION) == Some(HEAP_ALLOC_OS_DESCRIPTOR) {
+                if le::u32_at(params, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR)
+                {
                     p.record = Record::New {
-                        client: HEAP_ROOT,
-                        handle: HEAP_OS_DESC_MEMORY,
-                        status: HEAP_STATUS,
+                        client: NVOS32_H_ROOT,
+                        handle: NVOS32_ALLOC_OS_DESC_H_MEMORY,
+                        status: NVOS32_STATUS,
                         mem: Some(self.registered()),
                         armed_on: None,
                         is_client: false,
                     };
                 } else if let Some((handle, flags, attr, attr2)) = at {
-                    let a = rd32(params, attr).unwrap_or(0);
-                    let virt = rd32(params, flags).unwrap_or(0) & NVOS32_ALLOC_FLAGS_VIRTUAL != 0;
+                    let a = le::u32_at(params, attr).unwrap_or(0);
+                    let virt =
+                        le::u32_at(params, flags).unwrap_or(0) & NVOS32_ALLOC_FLAGS_VIRTUAL != 0;
                     let vidmem = (a >> ATTR_LOCATION_SHIFT) & 3 == ATTR_LOCATION_VIDMEM;
                     let mem = if virt || vidmem {
                         None
@@ -460,18 +424,18 @@ impl RmMem {
                         self.alloc_sysmem(&mut p, params, attr, attr2)
                     };
                     p.record = Record::New {
-                        client: HEAP_ROOT,
+                        client: NVOS32_H_ROOT,
                         handle,
-                        status: HEAP_STATUS,
+                        status: NVOS32_STATUS,
                         mem,
                         armed_on: None,
                         is_client: false,
                     };
                 }
             }
-            NV_ESC_RM_ALLOC_MEMORY if params.len() >= OS02_SIZE => {
-                let class = rd32(params, OS02_CLASS).unwrap_or(0);
-                let flags = rd32(params, OS02_FLAGS).unwrap_or(0);
+            NV_ESC_RM_ALLOC_MEMORY if params.len() >= NVOS02_WITH_FD_SIZE => {
+                let class = le::u32_at(params, NVOS02_H_CLASS).unwrap_or(0);
+                let flags = le::u32_at(params, NVOS02_FLAGS).unwrap_or(0);
                 let mem = if class == NV01_MEMORY_SYSTEM
                     && (flags >> OS02_LOCATION_SHIFT) & 0xf == OS02_LOCATION_PCI
                 {
@@ -481,7 +445,7 @@ impl RmMem {
                     if rewritten {
                         p.rewrite(
                             params,
-                            OS02_FLAGS,
+                            NVOS02_FLAGS,
                             OS02_COHERENCY_MASK,
                             (coherency as u32) << OS02_COHERENCY_SHIFT,
                         );
@@ -497,30 +461,30 @@ impl RmMem {
                     None
                 };
                 // Only NV01_MEMORY_SYSTEM arms a mapping (escape.c:415-431).
-                let fd = rd32(params, OS02_FD)
+                let fd = le::u32_at(params, NVOS02_WITH_FD_FD)
                     .filter(|&fd| fd as i32 >= 0 && class == NV01_MEMORY_SYSTEM);
                 p.record = Record::New {
-                    client: OS02_ROOT,
-                    handle: OS02_NEW,
-                    status: OS02_STATUS,
+                    client: NVOS02_H_ROOT,
+                    handle: NVOS02_H_OBJECT_NEW,
+                    status: NVOS02_STATUS,
                     mem,
                     armed_on: fd,
                     is_client: false,
                 };
             }
-            NV_ESC_RM_MAP_MEMORY_DMA if params.len() >= OS46_FLAGS + 4 => {
+            NV_ESC_RM_MAP_MEMORY_DMA if params.len() >= NVOS46_FLAGS + 4 => {
                 // A GPU mapping of system memory snoops, so what the guest
                 // has cached is what the GPU reads. Only system memory:
                 // vidmem ignores the flag (gm107 :429-430), and leaving it
                 // alone keeps those mappings byte-identical to native.
-                let client = rd32(params, OS46_CLIENT).unwrap_or(0);
-                let mem = rd32(params, OS46_MEMORY).unwrap_or(0);
+                let client = le::u32_at(params, NVOS46_H_CLIENT).unwrap_or(0);
+                let mem = le::u32_at(params, NVOS46_H_MEMORY).unwrap_or(0);
                 if self.coherent && matches!(self.lookup(client, mem), Some(Mem::Sysmem { .. })) {
-                    p.rewrite(params, OS46_FLAGS, OS46_CACHE_SNOOP, OS46_CACHE_SNOOP);
+                    p.rewrite(params, NVOS46_FLAGS, OS46_CACHE_SNOOP, OS46_CACHE_SNOOP);
                 }
             }
-            NV_ESC_RM_DUP_OBJECT if params.len() >= DUP_SIZE => p.record = Record::Dup,
-            NV_ESC_RM_FREE if params.len() >= FREE_SIZE => p.record = Record::Free,
+            NV_ESC_RM_DUP_OBJECT if params.len() >= NVOS55_SIZE => p.record = Record::Dup,
+            NV_ESC_RM_FREE if params.len() >= NVOS00_SIZE => p.record = Record::Free,
             _ => {}
         }
         p
@@ -553,8 +517,8 @@ impl RmMem {
         attr: usize,
         attr2: usize,
     ) -> Option<Mem> {
-        let a = rd32(params, attr)?;
-        let a2 = rd32(params, attr2)?;
+        let a = le::u32_at(params, attr)?;
+        let a2 = le::u32_at(params, attr2)?;
         let display = a2 & (ATTR2_ISO_YES | ATTR2_NISO_DISPLAY_YES) != 0;
         let asked = ((a & ATTR_COHERENCY_MASK) >> ATTR_COHERENCY_SHIFT) as u8;
         let (coherency, rewritten) = self.coherency_for(asked, display);
@@ -576,8 +540,8 @@ impl RmMem {
     /// A client's own context DMA over memory made coherent here snoops. It
     /// chose NVOS03 CACHE_SNOOP to match the memory it thinks it has.
     fn ctxdma(&self, p: &mut Pending, params: &mut [u8]) {
-        let client = rd32(params, ALLOC_ROOT).unwrap_or(0);
-        let Some(mem) = rd32(params, ALLOC_OUTER + CTXDMA_MEMORY) else {
+        let client = le::u32_at(params, NVOS64_H_ROOT).unwrap_or(0);
+        let Some(mem) = le::u32_at(params, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_H_MEMORY) else {
             return;
         };
         if let Some(Mem::Sysmem {
@@ -587,7 +551,7 @@ impl RmMem {
         {
             p.rewrite(
                 params,
-                ALLOC_OUTER + CTXDMA_FLAGS,
+                NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS,
                 OS03_CACHE_SNOOP_DISABLE,
                 0,
             );
@@ -598,8 +562,8 @@ impl RmMem {
     /// record what succeeded. `reply` has the same layout as the parameters.
     pub(crate) fn after(&mut self, p: Pending, reply: &mut [u8]) {
         for (off, mask, bits) in p.restore {
-            if let Some(w) = rd32(reply, off) {
-                wr32(reply, off, (w & !mask) | bits);
+            if let Some(w) = le::u32_at(reply, off) {
+                let _ = le::put_u32(reply, off, (w & !mask) | bits);
             }
         }
         match p.record {
@@ -612,10 +576,11 @@ impl RmMem {
                 armed_on,
                 is_client,
             } => {
-                if rd32(reply, status) != Some(0) {
+                if le::u32_at(reply, status) != Some(0) {
                     return;
                 }
-                let (Some(c), Some(h)) = (rd32(reply, client), rd32(reply, handle)) else {
+                let (Some(c), Some(h)) = (le::u32_at(reply, client), le::u32_at(reply, handle))
+                else {
                     return;
                 };
                 if is_client {
@@ -624,7 +589,7 @@ impl RmMem {
                     return;
                 }
                 self.set(c, h, mem);
-                if let Some(parent) = rd32(reply, PARENT) {
+                if let Some(parent) = le::u32_at(reply, PARENT) {
                     self.tree.link(c, h, parent);
                 }
                 if let (Some(fd), Some(m)) = (armed_on, mem) {
@@ -632,22 +597,22 @@ impl RmMem {
                 }
             }
             Record::Dup => {
-                if rd32(reply, DUP_STATUS) != Some(0) {
+                if le::u32_at(reply, NVOS55_STATUS) != Some(0) {
                     return;
                 }
-                let get = |o| rd32(reply, o).unwrap_or(0);
-                let src = self.lookup(get(DUP_CLIENT_SRC), get(DUP_OBJECT_SRC));
-                self.set(get(DUP_CLIENT), get(DUP_OBJECT), src);
+                let get = |o| le::u32_at(reply, o).unwrap_or(0);
+                let src = self.lookup(get(NVOS55_H_CLIENT_SRC), get(NVOS55_H_OBJECT_SRC));
+                self.set(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), src);
                 self.tree
-                    .link(get(DUP_CLIENT), get(DUP_OBJECT), get(PARENT));
+                    .link(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), get(PARENT));
             }
             Record::Free => {
-                if rd32(reply, FREE_STATUS) != Some(0) {
+                if le::u32_at(reply, NVOS00_STATUS) != Some(0) {
                     return;
                 }
                 let (root, old) = (
-                    rd32(reply, FREE_ROOT).unwrap_or(0),
-                    rd32(reply, FREE_OLD).unwrap_or(0),
+                    le::u32_at(reply, NVOS00_H_ROOT).unwrap_or(0),
+                    le::u32_at(reply, NVOS00_H_OBJECT_OLD).unwrap_or(0),
                 );
                 if old == root {
                     // The client, and with it everything it held.
@@ -728,6 +693,7 @@ pub fn warn_if_guest_pat_ignored(coherent: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::le::u32_at as rd32;
 
     const CLIENT: u32 = 0xc1d0_0001;
 
@@ -737,23 +703,23 @@ mod tests {
 
     /// An RM_ALLOC of NV01_MEMORY_SYSTEM as the guest sends it.
     fn sysmem_alloc(handle: u32, coherency: u32, attr2: u32) -> Vec<u8> {
-        let mut b = vec![0u8; ALLOC_OUTER + 128];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, handle);
-        put(&mut b, ALLOC_CLASS, NV01_MEMORY_SYSTEM);
+        let mut b = vec![0u8; NVOS64_SIZE + 128];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, handle);
+        put(&mut b, NVOS64_H_CLASS, NV01_MEMORY_SYSTEM);
         // LOCATION_PCI, PHYSICALITY_NONCONTIGUOUS, some low attr bits the
         // rewrite must leave alone.
         put(
             &mut b,
-            ALLOC_OUTER + MEM_ATTR,
+            NVOS64_SIZE + NV_MEMORY_ALLOCATION_ATTR,
             (coherency << ATTR_COHERENCY_SHIFT) | (1 << ATTR_LOCATION_SHIFT) | 0x15,
         );
-        put(&mut b, ALLOC_OUTER + MEM_ATTR2, attr2);
+        put(&mut b, NVOS64_SIZE + NV_MEMORY_ALLOCATION_ATTR2, attr2);
         b
     }
 
     fn attr(b: &[u8]) -> u32 {
-        rd32(b, ALLOC_OUTER + MEM_ATTR).unwrap()
+        rd32(b, NVOS64_SIZE + NV_MEMORY_ALLOCATION_ATTR).unwrap()
     }
 
     /// Run a call through `before`, a host that succeeds, and `after`, and
@@ -779,7 +745,7 @@ mod tests {
         let mut m = RmMem::default();
         for asked in [0u32, 2] {
             let req = sysmem_alloc(0x100 + asked, asked, 0);
-            let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(ALLOC_STATUS));
+            let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(NVOS64_STATUS));
             assert_eq!(
                 attr(&seen) >> ATTR_COHERENCY_SHIFT,
                 5,
@@ -810,7 +776,7 @@ mod tests {
         let mut m = RmMem::default();
         for (h, attr2) in [(1, ATTR2_ISO_YES), (2, ATTR2_NISO_DISPLAY_YES)] {
             let req = sysmem_alloc(h, 2, attr2);
-            let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(ALLOC_STATUS));
+            let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(NVOS64_STATUS));
             assert_eq!(seen, req, "display allocation reaches the host untouched");
             assert_eq!(
                 m.lookup(CLIENT, h).unwrap().pgprot(),
@@ -824,7 +790,7 @@ mod tests {
         let mut m = RmMem::default();
         m.set_coherent(false);
         let req = sysmem_alloc(7, 0, 0);
-        let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(ALLOC_STATUS));
+        let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &req, Some(NVOS64_STATUS));
         assert_eq!(seen, req);
         assert_eq!(m.lookup(CLIENT, 7).unwrap().pgprot(), PgprotKind::Uncached);
     }
@@ -835,7 +801,7 @@ mod tests {
         let req = sysmem_alloc(9, 0, 0);
         let mut host = req.clone();
         let p = m.before(NV_ESC_RM_ALLOC, &mut host);
-        put(&mut host, ALLOC_STATUS, 0x1f);
+        put(&mut host, NVOS64_STATUS, 0x1f);
         m.after(p, &mut host);
         assert_eq!(m.lookup(CLIENT, 9), None);
         assert_eq!(
@@ -856,9 +822,9 @@ mod tests {
                 (0, false, false),
                 (1, true, false),
             ] {
-                let mut b = vec![0u8; HEAP_SIZE];
-                put(&mut b, HEAP_ROOT, CLIENT);
-                put(&mut b, HEAP_FUNCTION, func);
+                let mut b = vec![0u8; NVOS32_SIZE];
+                put(&mut b, NVOS32_H_ROOT, CLIENT);
+                put(&mut b, NVOS32_FUNCTION, func);
                 put(&mut b, 44, 0x500 + func);
                 put(
                     &mut b,
@@ -866,7 +832,7 @@ mod tests {
                     if virt { NVOS32_ALLOC_FLAGS_VIRTUAL } else { 0 },
                 );
                 put(&mut b, at, loc << ATTR_LOCATION_SHIFT);
-                let (seen, back) = run(&mut m, NV_ESC_RM_VID_HEAP_CONTROL, &b, Some(HEAP_STATUS));
+                let (seen, back) = run(&mut m, NV_ESC_RM_VID_HEAP_CONTROL, &b, Some(NVOS32_STATUS));
                 let coh = rd32(&seen, at).unwrap() >> ATTR_COHERENCY_SHIFT;
                 assert_eq!(
                     coh == 5,
@@ -886,22 +852,22 @@ mod tests {
     #[test]
     fn alloc_memory_is_rewritten_and_arms_the_file_it_names() {
         let mut m = RmMem::default();
-        let mut b = vec![0u8; OS02_SIZE];
-        put(&mut b, OS02_ROOT, CLIENT);
-        put(&mut b, OS02_NEW, 0x77);
-        put(&mut b, OS02_CLASS, NV01_MEMORY_SYSTEM);
+        let mut b = vec![0u8; NVOS02_WITH_FD_SIZE];
+        put(&mut b, NVOS02_H_ROOT, CLIENT);
+        put(&mut b, NVOS02_H_OBJECT_NEW, 0x77);
+        put(&mut b, NVOS02_H_CLASS, NV01_MEMORY_SYSTEM);
         put(
             &mut b,
-            OS02_FLAGS,
+            NVOS02_FLAGS,
             0x8000_0000 | (2 << OS02_COHERENCY_SHIFT),
         );
-        put(&mut b, OS02_FD, 42);
-        let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC_MEMORY, &b, Some(OS02_STATUS));
+        put(&mut b, NVOS02_WITH_FD_FD, 42);
+        let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC_MEMORY, &b, Some(NVOS02_STATUS));
         assert_eq!(
-            rd32(&seen, OS02_FLAGS),
+            rd32(&seen, NVOS02_FLAGS),
             Some(0x8000_0000 | (5 << OS02_COHERENCY_SHIFT))
         );
-        assert_eq!(rd32(&back, OS02_FLAGS), rd32(&b, OS02_FLAGS));
+        assert_eq!(rd32(&back, NVOS02_FLAGS), rd32(&b, NVOS02_FLAGS));
         assert_eq!(m.armed(42).map(Mem::pgprot), Some(PgprotKind::WriteBack));
         m.forget_fd(42, &[]);
         assert_eq!(m.armed(42), None);
@@ -909,9 +875,9 @@ mod tests {
 
     fn map_dma(mem: u32, flags: u32) -> Vec<u8> {
         let mut b = vec![0u8; 64];
-        put(&mut b, OS46_CLIENT, CLIENT);
-        put(&mut b, OS46_MEMORY, mem);
-        put(&mut b, OS46_FLAGS, flags);
+        put(&mut b, NVOS46_H_CLIENT, CLIENT);
+        put(&mut b, NVOS46_H_MEMORY, mem);
+        put(&mut b, NVOS46_FLAGS, flags);
         b
     }
 
@@ -922,23 +888,23 @@ mod tests {
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x10, 0, 0),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
         run(
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x11, 2, ATTR2_ISO_YES),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
         for mem in [0x10, 0x11] {
             let req = map_dma(mem, 0x0000_0001);
             let (seen, back) = run(&mut m, NV_ESC_RM_MAP_MEMORY_DMA, &req, None);
             assert_eq!(
-                rd32(&seen, OS46_FLAGS),
+                rd32(&seen, NVOS46_FLAGS),
                 Some(0x11),
                 "memory {mem:#x} snoops"
             );
-            assert_eq!(rd32(&back, OS46_FLAGS), Some(1));
+            assert_eq!(rd32(&back, NVOS46_FLAGS), Some(1));
         }
         let vidmem = map_dma(0x99, 1);
         let (seen, _) = run(&mut m, NV_ESC_RM_MAP_MEMORY_DMA, &vidmem, None);
@@ -952,22 +918,29 @@ mod tests {
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x20, 0, 0),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
-        let mut b = vec![0u8; ALLOC_OUTER + 32];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, 0x21);
-        put(&mut b, ALLOC_CLASS, NV01_CONTEXT_DMA);
+        let mut b = vec![0u8; NVOS64_SIZE + 32];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, 0x21);
+        put(&mut b, NVOS64_H_CLASS, NV01_CONTEXT_DMA);
         put(
             &mut b,
-            ALLOC_OUTER + CTXDMA_FLAGS,
+            NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS,
             OS03_CACHE_SNOOP_DISABLE | 0x3,
         );
-        put(&mut b, ALLOC_OUTER + CTXDMA_MEMORY, 0x20);
-        let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
-        assert_eq!(rd32(&seen, ALLOC_OUTER + CTXDMA_FLAGS), Some(0x3));
+        put(
+            &mut b,
+            NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_H_MEMORY,
+            0x20,
+        );
+        let (seen, back) = run(&mut m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
         assert_eq!(
-            rd32(&back, ALLOC_OUTER + CTXDMA_FLAGS),
+            rd32(&seen, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS),
+            Some(0x3)
+        );
+        assert_eq!(
+            rd32(&back, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS),
             Some(OS03_CACHE_SNOOP_DISABLE | 0x3)
         );
     }
@@ -976,29 +949,32 @@ mod tests {
     fn registered(m: &mut RmMem) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = Vec::new();
         // RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, attr UNCACHED.
-        let mut b = vec![0u8; ALLOC_OUTER + 40];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, 0x71);
-        put(&mut b, ALLOC_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
-        out.push((b.clone(), run(m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS)).0));
-        // VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR: hMemory at 40.
-        let mut b = vec![0u8; HEAP_SIZE];
-        put(&mut b, HEAP_ROOT, CLIENT);
-        put(&mut b, HEAP_FUNCTION, HEAP_ALLOC_OS_DESCRIPTOR);
-        put(&mut b, HEAP_OS_DESC_MEMORY, 0x72);
+        let mut b = vec![0u8; NVOS64_SIZE + 40];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, 0x71);
+        put(&mut b, NVOS64_H_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
         out.push((
             b.clone(),
-            run(m, NV_ESC_RM_VID_HEAP_CONTROL, &b, Some(HEAP_STATUS)).0,
+            run(m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS)).0,
+        ));
+        // VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR: hMemory at 40.
+        let mut b = vec![0u8; NVOS32_SIZE];
+        put(&mut b, NVOS32_H_ROOT, CLIENT);
+        put(&mut b, NVOS32_FUNCTION, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
+        put(&mut b, NVOS32_ALLOC_OS_DESC_H_MEMORY, 0x72);
+        out.push((
+            b.clone(),
+            run(m, NV_ESC_RM_VID_HEAP_CONTROL, &b, Some(NVOS32_STATUS)).0,
         ));
         // ALLOC_MEMORY, COHERENCY UNCACHED, with a descriptor.
-        let mut b = vec![0u8; OS02_SIZE];
-        put(&mut b, OS02_ROOT, CLIENT);
-        put(&mut b, OS02_NEW, 0x73);
-        put(&mut b, OS02_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
-        put(&mut b, OS02_FD, 42);
+        let mut b = vec![0u8; NVOS02_WITH_FD_SIZE];
+        put(&mut b, NVOS02_H_ROOT, CLIENT);
+        put(&mut b, NVOS02_H_OBJECT_NEW, 0x73);
+        put(&mut b, NVOS02_H_CLASS, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+        put(&mut b, NVOS02_WITH_FD_FD, 42);
         out.push((
             b.clone(),
-            run(m, NV_ESC_RM_ALLOC_MEMORY, &b, Some(OS02_STATUS)).0,
+            run(m, NV_ESC_RM_ALLOC_MEMORY, &b, Some(NVOS02_STATUS)).0,
         ));
         out
     }
@@ -1024,19 +1000,30 @@ mod tests {
             );
             let req = map_dma(h, 0x1);
             let (seen, back) = run(&mut m, NV_ESC_RM_MAP_MEMORY_DMA, &req, None);
-            assert_eq!(rd32(&seen, OS46_FLAGS), Some(0x11), "{h:#x} snoops");
-            assert_eq!(rd32(&back, OS46_FLAGS), Some(0x1));
+            assert_eq!(rd32(&seen, NVOS46_FLAGS), Some(0x11), "{h:#x} snoops");
+            assert_eq!(rd32(&back, NVOS46_FLAGS), Some(0x1));
         }
         assert_eq!(m.armed(42), None, "RM arms no mapping for an OS descriptor");
         // A context DMA over it snoops too.
-        let mut b = vec![0u8; ALLOC_OUTER + 32];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, 0x74);
-        put(&mut b, ALLOC_CLASS, NV01_CONTEXT_DMA);
-        put(&mut b, ALLOC_OUTER + CTXDMA_FLAGS, OS03_CACHE_SNOOP_DISABLE);
-        put(&mut b, ALLOC_OUTER + CTXDMA_MEMORY, 0x71);
-        let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
-        assert_eq!(rd32(&seen, ALLOC_OUTER + CTXDMA_FLAGS), Some(0));
+        let mut b = vec![0u8; NVOS64_SIZE + 32];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, 0x74);
+        put(&mut b, NVOS64_H_CLASS, NV01_CONTEXT_DMA);
+        put(
+            &mut b,
+            NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS,
+            OS03_CACHE_SNOOP_DISABLE,
+        );
+        put(
+            &mut b,
+            NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_H_MEMORY,
+            0x71,
+        );
+        let (seen, _) = run(&mut m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
+        assert_eq!(
+            rd32(&seen, NVOS64_SIZE + NV_CONTEXT_DMA_ALLOCATION_FLAGS),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1052,11 +1039,11 @@ mod tests {
     #[test]
     fn usermode_apertures_are_registers() {
         let mut m = RmMem::default();
-        let mut b = vec![0u8; ALLOC_OUTER];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, 0x30);
-        put(&mut b, ALLOC_CLASS, 0xc461);
-        run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+        let mut b = vec![0u8; NVOS64_SIZE];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, 0x30);
+        put(&mut b, NVOS64_H_CLASS, 0xc461);
+        run(&mut m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
         assert_eq!(
             m.lookup(CLIENT, 0x30).map(Mem::pgprot),
             Some(PgprotKind::Uncached)
@@ -1070,30 +1057,30 @@ mod tests {
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x40, 0, 0),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
-        let mut d = vec![0u8; DUP_SIZE];
-        put(&mut d, DUP_CLIENT, 0xbeef);
-        put(&mut d, DUP_OBJECT, 0x41);
-        put(&mut d, DUP_CLIENT_SRC, CLIENT);
-        put(&mut d, DUP_OBJECT_SRC, 0x40);
-        run(&mut m, NV_ESC_RM_DUP_OBJECT, &d, Some(DUP_STATUS));
+        let mut d = vec![0u8; NVOS55_SIZE];
+        put(&mut d, NVOS55_H_CLIENT, 0xbeef);
+        put(&mut d, NVOS55_H_OBJECT, 0x41);
+        put(&mut d, NVOS55_H_CLIENT_SRC, CLIENT);
+        put(&mut d, NVOS55_H_OBJECT_SRC, 0x40);
+        run(&mut m, NV_ESC_RM_DUP_OBJECT, &d, Some(NVOS55_STATUS));
         assert_eq!(m.lookup(0xbeef, 0x41), m.lookup(CLIENT, 0x40));
         assert!(m.lookup(0xbeef, 0x41).is_some());
 
-        let mut f = vec![0u8; FREE_SIZE];
-        put(&mut f, FREE_ROOT, CLIENT);
-        put(&mut f, FREE_OLD, 0x40);
-        run(&mut m, NV_ESC_RM_FREE, &f, Some(FREE_STATUS));
+        let mut f = vec![0u8; NVOS00_SIZE];
+        put(&mut f, NVOS00_H_ROOT, CLIENT);
+        put(&mut f, NVOS00_H_OBJECT_OLD, 0x40);
+        run(&mut m, NV_ESC_RM_FREE, &f, Some(NVOS00_STATUS));
         assert_eq!(m.lookup(CLIENT, 0x40), None);
         assert!(
             m.lookup(0xbeef, 0x41).is_some(),
             "the duplicate is its own object"
         );
 
-        put(&mut f, FREE_ROOT, 0xbeef);
-        put(&mut f, FREE_OLD, 0xbeef);
-        run(&mut m, NV_ESC_RM_FREE, &f, Some(FREE_STATUS));
+        put(&mut f, NVOS00_H_ROOT, 0xbeef);
+        put(&mut f, NVOS00_H_OBJECT_OLD, 0xbeef);
+        run(&mut m, NV_ESC_RM_FREE, &f, Some(NVOS00_STATUS));
         assert_eq!(
             m.lookup(0xbeef, 0x41),
             None,
@@ -1104,9 +1091,9 @@ mod tests {
     #[test]
     fn closing_the_file_a_client_was_allocated_on_drops_what_it_held() {
         let mut m = RmMem::default();
-        let mut root = vec![0u8; ALLOC_OUTER];
-        put(&mut root, ALLOC_NEW, CLIENT);
-        put(&mut root, ALLOC_CLASS, 0x41);
+        let mut root = vec![0u8; NVOS64_SIZE];
+        put(&mut root, NVOS64_H_OBJECT_NEW, CLIENT);
+        put(&mut root, NVOS64_H_CLASS, 0x41);
         let mut host = root.clone();
         let p = m.before(NV_ESC_RM_ALLOC, &mut host);
         m.after(p, &mut host);
@@ -1115,7 +1102,7 @@ mod tests {
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x60, 0, 0),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
         assert!(m.lookup(CLIENT, 0x60).is_some());
         m.forget_fd(8, &[]);
@@ -1130,25 +1117,25 @@ mod tests {
     fn freeing_a_parent_drops_the_records_of_everything_under_it() {
         let mut m = RmMem::default();
         let alloc = |m: &mut RmMem, h: u32, parent: u32, class: u32| {
-            let mut b = vec![0u8; ALLOC_OUTER + 8];
-            put(&mut b, ALLOC_ROOT, CLIENT);
+            let mut b = vec![0u8; NVOS64_SIZE + 8];
+            put(&mut b, NVOS64_H_ROOT, CLIENT);
             put(&mut b, PARENT, parent);
-            put(&mut b, ALLOC_NEW, h);
-            put(&mut b, ALLOC_CLASS, class);
-            run(m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+            put(&mut b, NVOS64_H_OBJECT_NEW, h);
+            put(&mut b, NVOS64_H_CLASS, class);
+            run(m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
         };
         alloc(&mut m, 0x10, CLIENT, 0x80); // device
         alloc(&mut m, 0x11, 0x10, 0x2080); // subdevice
         for (h, parent) in [(0x12, 0x11), (0x13, 0x10), (0x20, CLIENT)] {
             let mut b = sysmem_alloc(h, 0, 0);
             put(&mut b, PARENT, parent);
-            run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+            run(&mut m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
             assert!(m.lookup(CLIENT, h).is_some());
         }
-        let mut f = vec![0u8; FREE_SIZE];
-        put(&mut f, FREE_ROOT, CLIENT);
-        put(&mut f, FREE_OLD, 0x10);
-        run(&mut m, NV_ESC_RM_FREE, &f, Some(FREE_STATUS));
+        let mut f = vec![0u8; NVOS00_SIZE];
+        put(&mut f, NVOS00_H_ROOT, CLIENT);
+        put(&mut f, NVOS00_H_OBJECT_OLD, 0x10);
+        run(&mut m, NV_ESC_RM_FREE, &f, Some(NVOS00_STATUS));
         assert_eq!(m.lookup(CLIENT, 0x12), None, "under the subdevice");
         assert_eq!(m.lookup(CLIENT, 0x13), None, "under the device");
         assert!(
@@ -1165,13 +1152,13 @@ mod tests {
             &mut m,
             NV_ESC_RM_ALLOC,
             &sysmem_alloc(0x50, 0, 0),
-            Some(ALLOC_STATUS),
+            Some(NVOS64_STATUS),
         );
-        let mut b = vec![0u8; ALLOC_OUTER + 8];
-        put(&mut b, ALLOC_ROOT, CLIENT);
-        put(&mut b, ALLOC_NEW, 0x50);
-        put(&mut b, ALLOC_CLASS, 0x40); // NV01_MEMORY_LOCAL_USER
-        run(&mut m, NV_ESC_RM_ALLOC, &b, Some(ALLOC_STATUS));
+        let mut b = vec![0u8; NVOS64_SIZE + 8];
+        put(&mut b, NVOS64_H_ROOT, CLIENT);
+        put(&mut b, NVOS64_H_OBJECT_NEW, 0x50);
+        put(&mut b, NVOS64_H_CLASS, 0x40); // NV01_MEMORY_LOCAL_USER
+        run(&mut m, NV_ESC_RM_ALLOC, &b, Some(NVOS64_STATUS));
         assert_eq!(m.lookup(CLIENT, 0x50), None);
     }
 }

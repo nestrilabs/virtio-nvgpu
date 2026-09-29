@@ -339,8 +339,8 @@ mod tests {
             assert!(r.classes.len() * 2 < r.total_classes, "{}", r.version());
             // VID_HEAP_CONTROL's OS descriptor path is osdesc.rs's to gate,
             // and it allocates an allowed class; the rest are memory.
-            assert!(r.vidheap(NVOS32_FUNCTION_ALLOC_SIZE));
-            assert!(r.vidheap(NVOS32_FUNCTION_FREE));
+            assert!(r.vidheap(nvos::NVOS32_FUNCTION_ALLOC_SIZE));
+            assert!(r.vidheap(nvos::NVOS32_FUNCTION_FREE));
         }
         assert!(CONTROL_NAMES.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(CLASS_NAMES.windows(2).all(|w| w[0].0 < w[1].0));

@@ -342,7 +342,8 @@ struct Args {
     /// Wayland channels one VM may have open at once (guest clients, or
     /// accepted host clients in export mode). Each is a client of the host
     /// compositor with a thread and a few descriptors here; past the limit
-    /// the guest's CONNECT fails with EMFILE.
+    /// the guest's CONNECT fails with EMFILE. One guest process may have a
+    /// quarter of them, and the last eighth only while it has at most two.
     #[arg(long, value_name = "N", default_value_t = WlLimits::DEFAULT_MAX_CONNS)]
     wayland_max_conns: usize,
 
@@ -350,13 +351,15 @@ struct Args {
     /// over all its connections (each connection is also held to 512 MiB):
     /// what their live buffers cover, not how large their pools are. The
     /// pages are memfds the host OOM killer does not count as this process's;
-    /// a buffer past the budget is a wl_display.error for its client.
+    /// a buffer past the budget is a wl_display.error for its client. One
+    /// guest process's connections may hold a quarter of it, with the last
+    /// sixteenth kept for processes that hold little.
     #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_SHM_BYTES >> 20)]
     wayland_shm_budget: u64,
 
     /// MiB of compositor output one VM may leave unread, over all its
-    /// connections (each is also held to 64 MiB); the connection that passes
-    /// it is dropped.
+    /// connections (each is also held to 64 MiB), and one guest process's
+    /// connections half of it; the connection that passes it is dropped.
     #[arg(long, value_name = "MIB", default_value_t = WlLimits::DEFAULT_QUEUE_BYTES >> 20)]
     wayland_queue_budget: usize,
 }
@@ -746,13 +749,7 @@ struct Taken {
 
 /// A bare error header for a request the transport refuses on its own.
 fn transport_error(errno: i32) -> Reply {
-    let hdr = MsgHeader::err(MsgType::Ioctl, errno);
-    // The wire form is the struct's bytes, which is what the driver reads.
-    let bytes = device::sys::pod::bytes(&hdr)[..HDR].to_vec();
-    Reply {
-        bytes,
-        ..Reply::default()
-    }
+    Reply::error(MsgType::Ioctl, 0, errno)
 }
 
 // ---------------------------------------------------------------------------
@@ -952,12 +949,7 @@ impl EventQueue for VringEventQueue {
 fn read_pci_configs(dir: &Path, gpus: &[device::virtio::GpuSlot]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for g in gpus {
-        let end = g
-            .pci_addr
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(g.pci_addr.len());
-        let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+        let addr = g.address();
         let path = dir.join(&addr);
         match std::fs::read(&path) {
             Ok(b) if b.len() <= 4096 => {
@@ -1061,12 +1053,7 @@ impl NvGpuBackend {
         // start when one VM could take more than half of it (DEPLOY.md,
         // "Sizing the window").
         for g in &gpus {
-            let end = g
-                .pci_addr
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(g.pci_addr.len());
-            let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+            let addr = g.address();
             if let Some(bar1) = host::bar1_len(Path::new("/sys"), &addr)
                 && window.wc_size > bar1 / 2
             {
@@ -1101,9 +1088,7 @@ impl NvGpuBackend {
                 pump: Mutex::new(PumpState::default()),
             }),
             event_idx: false,
-            // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
-            // -- 100 ioctls and one mmap in the captured trace -- so a guest
-            // can enumerate the GPU before the shared window exists.
+            // The GPUs the guest sees, and which ioctls carry a descriptor.
             config: VirtioGpuNvConfig::new(&version, &gpus),
             max_req: MAX_XFER_DIRECT as usize,
             max_resp: MAX_XFER_DIRECT as usize,
@@ -1602,7 +1587,6 @@ fn diagnostic_flags(args: &Args) -> Vec<(&'static str, &'static str)> {
     v
 }
 
-/// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
 /// The capture helper is a user of its own: not root, which is every user,
 /// and not the backend's own uid, which is every process of the VM's backend
 /// user (in the Wayland modes, the desktop's) -- unless the diagnostic
@@ -1620,6 +1604,7 @@ fn inject_uid_ok(uid: u32, own: u32, allow_self: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
 fn check_diagnostic(args: &Args, env: bool) -> anyhow::Result<Vec<String>> {
     let flags = diagnostic_flags(args);
     if flags.is_empty() {
@@ -2034,14 +2019,7 @@ fn main() -> anyhow::Result<()> {
         mode @ (device::sandbox::Mode::On | device::sandbox::Mode::BestEffort) => {
             let gpus: Vec<String> = host::gpu_slots(&args.proc_nvidia)
                 .iter()
-                .map(|g| {
-                    let end = g
-                        .pci_addr
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(g.pci_addr.len());
-                    String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
-                })
+                .map(|g| g.address())
                 .collect();
             let plan = device::sandbox::Plan::backend(
                 &device::sandbox::BackendPaths {
@@ -2151,6 +2129,18 @@ fn main() -> anyhow::Result<()> {
         for (addr, config) in pci_config {
             be.set_pci_config(&addr, config);
         }
+        if let Some(s) = &inject {
+            be.set_inject(Some(s.registry().clone()));
+        }
+        if args.keep_guest_coherency {
+            be.set_guest_coherency(false);
+        }
+        // Every guest process's descriptors are this process's: the whole
+        // of the hard limit, taken before the sandbox, sizes the handle
+        // table (B1).
+        if let Some(n) = nofile {
+            be.set_nofile(n);
+        }
     }
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
@@ -2160,22 +2150,6 @@ fn main() -> anyhow::Result<()> {
         nvgpu.queue_poll.as_micros()
     );
     let backend = Arc::new(RwLock::new(nvgpu));
-    if let Some(s) = &inject {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared
-            .nvidia
-            .lock()
-            .expect("nvidia lock")
-            .set_inject(Some(s.registry().clone()));
-    }
-    if args.keep_guest_coherency {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared
-            .nvidia
-            .lock()
-            .expect("nvidia lock")
-            .set_guest_coherency(false);
-    }
     device::rmmem::warn_if_guest_pat_ignored(!args.keep_guest_coherency);
     // Host connector and lease changes of the host's cards, which arrive only
     // as uevents (device::kms). The guest hears of them only in
@@ -2240,8 +2214,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    // vhost_user_backend::Error does not implement std::error::Error, so it
-    // cannot ride `?` on its own.
     // What keeps one guest process, and one VM, from another's RM clients is
     // RM's strict client validation, which a host registry key can turn off
     // (device::semsurf::probe_strict_clients, R3). Asked before anything is
@@ -2261,12 +2233,8 @@ fn main() -> anyhow::Result<()> {
              another's RM objects by handle"
         ),
     }
-    // Every guest process's descriptors are this process's: the whole of the
-    // hard limit, taken before the sandbox, sizes the handle table (B1).
-    if let Some(n) = nofile {
-        let shared = backend.read().expect("backend lock").shared.clone();
-        shared.nvidia.lock().expect("nvidia lock").set_nofile(n);
-    }
+    // vhost_user_backend::Error does not implement std::error::Error, so it
+    // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(
         "virtio-nvgpu".to_string(),
         backend.clone(),

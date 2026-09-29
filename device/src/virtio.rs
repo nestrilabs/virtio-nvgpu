@@ -79,6 +79,14 @@ impl Default for GpuSlot {
 }
 
 impl GpuSlot {
+    /// The PCI address, as the directory under `/proc/driver/nvidia/gpus`
+    /// and `/sys/bus/pci/devices` names it: up to the first NUL.
+    pub fn address(&self) -> String {
+        let a = &self.pci_addr;
+        let end = a.iter().position(|&b| b == 0).unwrap_or(a.len());
+        String::from_utf8_lossy(&a[..end]).into_owned()
+    }
+
     /// Build a slot, truncating both strings to what the driver can hold.
     ///
     /// Truncating rather than failing is deliberate: a GPU whose information
@@ -204,13 +212,12 @@ impl VirtioGpuNvConfig {
         // ioctl here; otherwise it forwards the guest's own fd number, which
         // means nothing on the host. Publishing none of these is not a
         // degraded mode -- the backend then sees a raw guest fd where it
-        // expects one of its handles and refuses the call ("bad embedded
-        // handle 9", nvidia-smi reporting "Unable to determine the device
-        // handle for GPU0").
+        // expects one of its handles and refuses the call (EBADF, nvidia-smi
+        // reporting "Unable to determine the device handle for GPU0").
         //
         // The list has to agree with the backend's own, in
-        // `nvidia.rs::dispatch_fd_ioctl`, since that is what reads the
-        // rewritten field back out.
+        // `dispatch_fd_carrying` (nvidia/rm.rs) and `dispatch_map_memory`
+        // (nvidia/rmmap.rs), since they read the rewritten field back out.
         //
         // Then the UVM commands that name a file (crate::uvmfd), marked
         // FDT_UVM, with their block sizes; where one of them sits depends on
@@ -276,6 +283,50 @@ mod tests {
             "config is {} bytes; a guest cannot read past 4096",
             size_of::<VirtioGpuNvConfig>()
         );
+    }
+
+    /// The config space, field for field, and the constants of nvgpu_wire.h
+    /// this module holds, as the C header declares them (protocol's tests
+    /// check the rest of the header).
+    #[test]
+    fn config_space_is_laid_out_as_the_header_says() {
+        let h = protocol::cheader::Header::parse(include_str!("../../driver/nvgpu_wire.h"));
+        assert_eq!(h.define("VIRTIO_ID_GPU_NV"), u64::from(VIRTIO_ID_GPU_NV));
+        assert_eq!(h.define("NVGPU_FDT_UVM"), u64::from(crate::uvmfd::FDT_UVM));
+        macro_rules! fields {
+            ($t:ty, [$($f:ident),* $(,)?]) => {
+                (size_of::<$t>(), vec![$((stringify!($f).to_string(), offset_of!($t, $f))),*])
+            };
+        }
+        for (name, (size, fields)) in [
+            (
+                "virtio_gpu_nv_gpu_slot",
+                fields!(GpuSlot, [pci_addr, minor, info_len, padding, info_text]),
+            ),
+            (
+                "nvgpu_fd_translation_entry",
+                fields!(FdTranslation, [nr, payload_offset]),
+            ),
+            (
+                "virtio_gpu_nv_config",
+                fields!(
+                    VirtioGpuNvConfig,
+                    [
+                        driver_version,
+                        num_gpus,
+                        caps,
+                        gpu_device_ids,
+                        gpus,
+                        num_fd_translations,
+                        _pad,
+                        fd_translations,
+                    ]
+                ),
+            ),
+        ] {
+            let c = h.layout(name);
+            assert_eq!((c.size, &c.fields), (size, &fields), "struct {name}");
+        }
     }
 
     /// Every field the driver reads by a fixed offset.

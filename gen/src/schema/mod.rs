@@ -1000,7 +1000,7 @@ mod tests {
             panic!("one fd")
         };
         assert!(matches!(fd.kind, Kind::FdIn { width: 4, kinds, .. }
-            if kinds == K_DEV_CTL | (1 << 7)));
+            if kinds == K_DEV_CTL | (1 << protocol::HK_DMABUF)));
         // A8R8G8B8 is one plane, Y8___U8V8_N420 two, Y8___U8___V8_N420
         // three (nvkms-format.c), and a format nobody knows none.
         assert_eq!(limit.elements(count, 4, t.planes), 1);

@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "abi"
 version = "0.1.0"
+dependencies = [
+ "protocol",
+]
 
 [[package]]
 name = "aho-corasick"

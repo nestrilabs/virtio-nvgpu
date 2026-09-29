@@ -15,7 +15,7 @@
 //! their parameter blocks go -- it follows every pointer the real driver
 //! would, for as many bytes as the real driver would copy, and checks each
 //! against what the guest sent. Nothing reaches a real device: every path
-//! the backend opens becomes `/dev/null` (`nvidia.rs`, `session.rs`,
+//! the backend opens becomes `/dev/null` (`nvidia/`, `session.rs`,
 //! `semsurf.rs`, `hostfd.rs`, under `cfg(fuzzing)`), and [`sandboxed`]
 //! refuses to run where `/dev/nvidiactl` can be opened at all
 //! (`scripts/fuzz.sh` runs every target in a bubblewrap sandbox with a
