@@ -49,4 +49,4 @@ rig/verify/bin/
 # The NixOS config agent's host-specific brief (kept out of the repository)
 NIXOS-AGENT.md
 # Briefs exchanged with the NixOS-side agent (host-specific; not shipped)
-virtio-nvgpu-zero-copy-capture*.md
+virtio-nvgpu-*.md
