@@ -305,18 +305,13 @@ impl FileTree {
             Self::Sys => crate::host::gpu_slots(std::path::Path::new(Self::Proc.root()))
                 .iter()
                 .filter_map(|slot| {
-                    let end = slot
-                        .pci_addr
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(slot.pci_addr.len());
-                    let addr = String::from_utf8_lossy(&slot.pci_addr[..end]);
+                    let addr = slot.address();
                     let rel = format!("bus/pci/devices/{addr}/config");
                     let abs = std::path::Path::new("/sys").join(&rel);
                     match std::fs::read(&abs) {
                         Ok(live) => {
                             let content = pci_config
-                                .get(addr.as_ref())
+                                .get(addr.as_str())
                                 .and_then(|snap| merge_pci_config(&live, snap))
                                 .unwrap_or(live);
                             Some((rel, content))
@@ -573,12 +568,7 @@ pub(super) fn enumerate_host_nodes() -> HostNodes {
         .iter()
         .enumerate()
     {
-        let end = slot
-            .pci_addr
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(slot.pci_addr.len());
-        let addr = String::from_utf8_lossy(&slot.pci_addr[..end]).into_owned();
+        let addr = slot.address();
         let dir = format!("/sys/bus/pci/devices/{addr}/drm");
 
         let Ok(entries) = std::fs::read_dir(&dir) else {

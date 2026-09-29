@@ -79,6 +79,14 @@ impl Default for GpuSlot {
 }
 
 impl GpuSlot {
+    /// The PCI address, as the directory under `/proc/driver/nvidia/gpus`
+    /// and `/sys/bus/pci/devices` names it: up to the first NUL.
+    pub fn address(&self) -> String {
+        let a = &self.pci_addr;
+        let end = a.iter().position(|&b| b == 0).unwrap_or(a.len());
+        String::from_utf8_lossy(&a[..end]).into_owned()
+    }
+
     /// Build a slot, truncating both strings to what the driver can hold.
     ///
     /// Truncating rather than failing is deliberate: a GPU whose information

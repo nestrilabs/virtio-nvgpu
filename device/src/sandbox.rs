@@ -1340,14 +1340,7 @@ mod tests {
         let proc = Path::new(crate::host::PROC_NVIDIA);
         let gpus: Vec<String> = crate::host::gpu_slots(proc)
             .iter()
-            .map(|g| {
-                let end = g
-                    .pci_addr
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(g.pci_addr.len());
-                String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
-            })
+            .map(|g| g.address())
             .collect();
         if gpus.is_empty() || !Path::new("/dev/nvidiactl").exists() || !landlock_at(5) {
             eprintln!("skipped: no NVIDIA GPU or Landlock ABI 5 here");

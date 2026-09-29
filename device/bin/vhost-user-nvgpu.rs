@@ -946,12 +946,7 @@ impl EventQueue for VringEventQueue {
 fn read_pci_configs(dir: &Path, gpus: &[device::virtio::GpuSlot]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for g in gpus {
-        let end = g
-            .pci_addr
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(g.pci_addr.len());
-        let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+        let addr = g.address();
         let path = dir.join(&addr);
         match std::fs::read(&path) {
             Ok(b) if b.len() <= 4096 => {
@@ -1055,12 +1050,7 @@ impl NvGpuBackend {
         // start when one VM could take more than half of it (DEPLOY.md,
         // "Sizing the window").
         for g in &gpus {
-            let end = g
-                .pci_addr
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(g.pci_addr.len());
-            let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+            let addr = g.address();
             if let Some(bar1) = host::bar1_len(Path::new("/sys"), &addr)
                 && window.wc_size > bar1 / 2
             {
@@ -2028,14 +2018,7 @@ fn main() -> anyhow::Result<()> {
         mode @ (device::sandbox::Mode::On | device::sandbox::Mode::BestEffort) => {
             let gpus: Vec<String> = host::gpu_slots(&args.proc_nvidia)
                 .iter()
-                .map(|g| {
-                    let end = g
-                        .pci_addr
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(g.pci_addr.len());
-                    String::from_utf8_lossy(&g.pci_addr[..end]).into_owned()
-                })
+                .map(|g| g.address())
                 .collect();
             let plan = device::sandbox::Plan::backend(
                 &device::sandbox::BackendPaths {
