@@ -36,6 +36,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
+use crate::budget::Budgets;
 use crate::frame::{REC_STREAM_CREDIT, REC_STREAM_DATA, REC_STREAM_EOF, Unit, record};
 use crate::sys;
 
@@ -87,7 +88,7 @@ pub struct Streams {
     peer_windows: bool,
     /// Sinks open.
     sinks: usize,
-    budgets: Vec<Arc<dyn ByteBudget>>,
+    budgets: Budgets<dyn ByteBudget>,
     /// Ended streams' descriptors, until [`Streams::take_closed`].
     closed: Vec<OwnedFd>,
     pub bytes_out: u64,
@@ -133,7 +134,7 @@ impl Streams {
             next: 1,
             peer_windows: false,
             sinks: 0,
-            budgets: Vec::new(),
+            budgets: Budgets::default(),
             closed: Vec::new(),
             bytes_out: 0,
             bytes_in: 0,
@@ -150,26 +151,6 @@ impl Streams {
     /// Charge what sinks hold to `b` too.
     pub fn add_budget(&mut self, b: Arc<dyn ByteBudget>) {
         self.budgets.push(b);
-    }
-
-    fn take_budget(&self, n: usize) -> bool {
-        for (i, b) in self.budgets.iter().enumerate() {
-            if !b.take(n) {
-                for done in &self.budgets[..i] {
-                    done.give(n);
-                }
-                return false;
-            }
-        }
-        true
-    }
-
-    fn give_budget(&self, n: usize) {
-        if n > 0 {
-            for b in &self.budgets {
-                b.give(n);
-            }
-        }
     }
 
     /// Bytes sinks hold for their readers.
@@ -196,7 +177,7 @@ impl Streams {
         match self.map.remove(&id) {
             Some(Kind::Sink { pending, wr, .. }) => {
                 self.sinks -= 1;
-                self.give_budget(pending.len());
+                self.budgets.give(pending.len());
                 self.closed.push(wr);
             }
             Some(Kind::Source { rd, .. }) => self.closed.push(rd),
@@ -317,7 +298,7 @@ impl Streams {
         if bytes.len() > *granted {
             return Err(StreamError::Overrun(id));
         }
-        if !self.take_budget(bytes.len()) {
+        if !self.budgets.take(bytes.len()) {
             // The VM's share for this is spent: this transfer ends, and the
             // connection with the rest of its streams goes on.
             out.push(Unit {
@@ -443,7 +424,7 @@ impl Streams {
             }
             _ => {}
         }
-        self.give_budget(written);
+        self.budgets.give(written);
         if remove {
             self.remove(id);
         }

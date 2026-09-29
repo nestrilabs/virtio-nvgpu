@@ -13,6 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod blob;
+pub mod budget;
 pub mod closure;
 pub mod engine;
 pub mod frame;

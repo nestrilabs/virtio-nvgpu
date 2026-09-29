@@ -21,6 +21,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
+use crate::budget::Budgets;
 use crate::frame::{MAX_REC_PAYLOAD, REC_BLOB, Unit, record};
 use crate::job::Job;
 use crate::shm::ShmCharge;
@@ -54,7 +55,7 @@ pub struct Blobs {
     next: u32,
     incoming: HashMap<u32, Incoming>,
     pending_bytes: u64,
-    budgets: Vec<Arc<dyn ShmCharge>>,
+    budgets: Budgets<dyn ShmCharge>,
     pub sent: u64,
     pub received: u64,
 }
@@ -87,7 +88,7 @@ impl Blobs {
             next: 1,
             incoming: HashMap::new(),
             pending_bytes: 0,
-            budgets: Vec::new(),
+            budgets: Budgets::default(),
             sent: 0,
             received: 0,
         }
@@ -159,11 +160,11 @@ impl Blobs {
         if inc.have + n > MAX_BLOB || self.pending_bytes + n > MAX_PENDING {
             return Err(BlobError::TooBig(id));
         }
-        if !charge(&self.budgets, n) {
+        if !self.budgets.take(n, 0) {
             return Err(BlobError::TooBig(id));
         }
         if sys::pwrite_full(inc.fd.as_raw_fd(), bytes, inc.have).is_err() {
-            uncharge(&self.budgets, n);
+            self.budgets.give(n, 0);
             return Err(BlobError::Io);
         }
         inc.have += n;
@@ -189,7 +190,7 @@ impl Blobs {
     /// Drop every unfinished blob (the connection is over).
     pub fn clear(&mut self) {
         self.incoming.clear();
-        uncharge(&self.budgets, self.pending_bytes);
+        self.budgets.give(self.pending_bytes, 0);
         self.pending_bytes = 0;
     }
 
@@ -215,7 +216,7 @@ impl Blobs {
             None => return Err(BlobError::BadId(id)),
         };
         self.pending_bytes -= inc.have;
-        uncharge(&self.budgets, inc.have);
+        self.budgets.give(inc.have, 0);
         if inc.have != len {
             return Err(BlobError::Incomplete(id));
         }
@@ -257,25 +258,6 @@ impl Job for BlobJob {
         };
         self.pos += n as u64;
         Some((u, n))
-    }
-}
-
-/// `n` bytes from every budget, or from none.
-fn charge(budgets: &[Arc<dyn ShmCharge>], n: u64) -> bool {
-    for (i, b) in budgets.iter().enumerate() {
-        if !b.take(n, 0) {
-            uncharge(&budgets[..i], n);
-            return false;
-        }
-    }
-    true
-}
-
-fn uncharge(budgets: &[Arc<dyn ShmCharge>], n: u64) {
-    if n > 0 {
-        for b in budgets {
-            b.give(n, 0);
-        }
     }
 }
 

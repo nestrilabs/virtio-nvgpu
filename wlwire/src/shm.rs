@@ -68,6 +68,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::budget::Budgets;
 use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record_with};
 use crate::job::Job;
 use crate::sys;
@@ -303,20 +304,15 @@ impl ShmCharge for ShmBudget {
 /// memfd), owned by it after, and given back by `Drop` -- once, whichever way
 /// the pool goes.
 pub struct Charge {
-    budgets: Vec<Arc<dyn ShmCharge>>,
+    budgets: Budgets<dyn ShmCharge>,
     bytes: AtomicU64,
 }
 
 impl Charge {
     /// Take one pool from every budget, or from none.
-    fn take(budgets: Vec<Arc<dyn ShmCharge>>) -> Result<Charge, ShmError> {
-        for (i, b) in budgets.iter().enumerate() {
-            if !b.take(0, 1) {
-                for done in &budgets[..i] {
-                    done.give(0, 1);
-                }
-                return Err(ShmError::TooMany);
-            }
+    fn take(budgets: Budgets<dyn ShmCharge>) -> Result<Charge, ShmError> {
+        if !budgets.take(0, 1) {
+            return Err(ShmError::TooMany);
         }
         Ok(Charge {
             budgets,
@@ -329,13 +325,8 @@ impl Charge {
         if more == 0 {
             return true;
         }
-        for (i, b) in self.budgets.iter().enumerate() {
-            if !b.take(more, 0) {
-                for done in &self.budgets[..i] {
-                    done.give(more, 0);
-                }
-                return false;
-            }
+        if !self.budgets.take(more, 0) {
+            return false;
         }
         self.bytes.fetch_add(more, Ordering::AcqRel);
         true
@@ -343,19 +334,14 @@ impl Charge {
 
     /// `less` bytes, taken before, back to every budget.
     fn shrink(&self, less: u64) {
-        for b in &self.budgets {
-            b.give(less, 0);
-        }
+        self.budgets.give(less, 0);
         self.bytes.fetch_sub(less, Ordering::AcqRel);
     }
 }
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        let bytes = self.bytes.load(Ordering::Acquire);
-        for b in &self.budgets {
-            b.give(bytes, 1);
-        }
+        self.budgets.give(self.bytes.load(Ordering::Acquire), 1);
     }
 }
 
@@ -417,7 +403,7 @@ pub struct Shm {
     conn: Arc<ShmBudget>,
     /// Budgets shared with other connections: the VM's, and the guest
     /// process's the connection is for, if the owner of the engine set them.
-    shared: Vec<Arc<dyn ShmCharge>>,
+    shared: Budgets<dyn ShmCharge>,
     pub sync_bytes: u64,
     pub syncs: u64,
 }
@@ -429,7 +415,7 @@ impl Default for Shm {
             buffers: HashMap::new(),
             surfaces: HashMap::new(),
             conn: Arc::new(ShmBudget::new(MAX_POOL_BYTES, MAX_POOLS)),
-            shared: Vec::new(),
+            shared: Budgets::default(),
             sync_bytes: 0,
             syncs: 0,
         }
@@ -515,8 +501,9 @@ impl Shm {
     /// charged by the buffers made from it. `TooMany` if this connection or
     /// the VM is at its limit, and then nothing is taken.
     pub fn charge(&self) -> Result<Charge, ShmError> {
-        let mut budgets: Vec<Arc<dyn ShmCharge>> = vec![self.conn.clone()];
-        budgets.extend(self.shared.iter().cloned());
+        let mut budgets = Budgets::<dyn ShmCharge>::default();
+        budgets.push(self.conn.clone());
+        budgets.extend(&self.shared);
         Charge::take(budgets)
     }
 

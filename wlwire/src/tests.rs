@@ -2984,6 +2984,48 @@ impl crate::stream::ByteBudget for Budget {
     }
 }
 
+/// A charge one budget refuses is taken from none of them: those before it
+/// give theirs back, and those after are never asked.
+#[test]
+fn budgets_take_from_all_or_none() {
+    use crate::budget::Budgets;
+    use crate::shm::{ShmBudget, ShmCharge};
+    use std::sync::atomic::Ordering::Relaxed;
+    let (a, b, c) = (
+        Arc::new(Budget(Default::default(), 100)),
+        Arc::new(Budget(Default::default(), 50)),
+        Arc::new(Budget(Default::default(), 100)),
+    );
+    let mut bs = Budgets::<dyn crate::stream::ByteBudget>::default();
+    bs.push(a.clone());
+    bs.push(b.clone());
+    bs.push(c.clone());
+    assert!(bs.take(40));
+    assert!(!bs.take(20), "the second is at its limit");
+    assert_eq!(
+        (a.0.load(Relaxed), b.0.load(Relaxed), c.0.load(Relaxed)),
+        (40, 40, 40)
+    );
+    bs.give(40);
+    assert_eq!(
+        (a.0.load(Relaxed), b.0.load(Relaxed), c.0.load(Relaxed)),
+        (0, 0, 0)
+    );
+
+    let (vm, conn) = (
+        Arc::new(ShmBudget::new(1 << 20, 2)),
+        Arc::new(ShmBudget::new(1 << 20, 8)),
+    );
+    let mut shm = Budgets::<dyn ShmCharge>::default();
+    shm.push(conn.clone());
+    shm.push(vm.clone());
+    assert!(shm.take(4096, 1) && shm.take(0, 1));
+    assert!(!shm.take(0, 1), "the VM has no third pool");
+    assert_eq!((conn.used(), vm.used()), ((4096, 2), (4096, 2)));
+    shm.give(4096, 2);
+    assert_eq!((conn.used(), vm.used()), ((0, 0), (0, 0)));
+}
+
 /// What sinks hold is charged to the owner's budget; data past it ends that
 /// stream with ENOBUFS, and the connection goes on.
 #[test]
