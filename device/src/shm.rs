@@ -237,7 +237,7 @@ impl ZoneConfig {
                 Self::MAX_OWNER_PERCENT
             ));
         }
-        if mib < Self::MIN_MIB || mib % Self::ALIGN_MIB != 0 {
+        if mib < Self::MIN_MIB || !mib.is_multiple_of(Self::ALIGN_MIB) {
             return Err(format!(
                 "--window-size {mib}: the window is at least {} MiB and a multiple of {} MiB",
                 Self::MIN_MIB,
@@ -263,7 +263,7 @@ impl ZoneConfig {
         let d = Self::default_1gib();
         let (d_uc, d_wc, d_wb) = (d.uc_size / MIB, d.wc_size / MIB, d.wb_size / MIB);
         let uc = (mib / 32).min(d_uc);
-        let wb = (mib - uc) * d_wb / (d_wc + d_wb) & !1;
+        let wb = ((mib - uc) * d_wb / (d_wc + d_wb)) & !1;
         let (uc, wb) = (uc * MIB, wb * MIB);
         let cfg = Self {
             uc_size: uc,
@@ -281,7 +281,7 @@ impl ZoneConfig {
     fn zones_aligned(&self) -> bool {
         [self.uc_size, self.wc_size, self.wb_size]
             .iter()
-            .all(|z| z % (2 * MIB) == 0)
+            .all(|z| z.is_multiple_of(2 * MIB))
     }
 
     /// The share of a zone of `size` bytes one guest process may hold.
@@ -947,7 +947,7 @@ mod window_tests {
             "{e}"
         );
         assert!(ZoneConfig::for_window(64512, 50, crate::uvmmap::APERTURE_MAX).is_ok());
-        assert!(err(u64::MAX / 2 & !63, 50, 0).contains("MAX_SHARED"));
+        assert!(err((u64::MAX / 2) & !63, 50, 0).contains("MAX_SHARED"));
     }
 
     /// A large share: one process takes nine tenths of a zone, and the

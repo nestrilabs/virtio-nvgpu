@@ -144,6 +144,7 @@ impl Dispatcher {
             uc_size: 4096,
             wc_size: 4096,
             wb_size: 4096,
+            owner_percent: ZoneConfig::DEFAULT_OWNER_PERCENT,
         });
         be.set_wayland(Some(WlConfig::new(host_socket)));
         let d = Arc::new(Dispatcher { be: Mutex::new(be) });
