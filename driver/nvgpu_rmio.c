@@ -131,63 +131,34 @@ static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
 /*
  * nvgpu_ioctl_simple — flat struct, no embedded pointers. `pre`: the block,
  * already copied in whole by a caller that decided on it (NULL: read here).
+ * Back to the caller goes only what the reply carried (nvgpu_ioctl_flat()).
  */
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz,
                                const void *pre) {
   /* RM_DUP_OBJECT carries the calling process after the struct. */
-  bool proc = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT &&
-              nvgpu_proc_ids(nfd->dev);
-  int req_total = sizeof(struct nvgpu_ioctl_req) + sz +
-                  (proc ? sizeof(struct nvgpu_proc_id) : 0);
-  int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
-  void *req_buf, *resp_buf;
-  struct nvgpu_ioctl_req *req;
-  struct nvgpu_ioctl_resp *resp;
-  struct nvgpu_ioctl_reply r;
-  int ret;
-
-  req_buf = kvmalloc(req_total, GFP_KERNEL);
-  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
-  if (!req_buf || !resp_buf) {
-    ret = -ENOMEM;
-    goto out;
-  }
-
-  req = (struct nvgpu_ioctl_req *)req_buf;
-  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sz, 0, 0, 0, 0);
+  u32 flags = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT
+                  ? NVGPU_FLAT_PROC
+                  : 0;
+  void *kbuf = NULL;
+  u32 back;
+  long ret;
 
   if (sz > 0) {
-    if (pre)
-      memcpy(req_buf + sizeof(*req), pre, sz);
-    else if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
-      ret = -EFAULT;
-      goto out;
+    kbuf = kvmalloc(sz, GFP_KERNEL);
+    if (!kbuf)
+      return -ENOMEM;
+    if (pre) {
+      memcpy(kbuf, pre, sz);
+    } else if (copy_from_user(kbuf, uarg, sz)) {
+      kvfree(kbuf);
+      return -EFAULT;
     }
   }
-  if (proc)
-    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sz);
-
-  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &r);
-  if (ret < 0)
-    goto out;
-  ret = r.status;
-
-  /*
-   * Only what the device wrote. A failed call comes back as a bare header,
-   * and before the used length was kept the bytes after it were whatever the
-   * kmalloc'd buffer held -- guest kernel heap, copied out to userspace.
-   */
-  if (sz > 0 && r.data_len && r.data_len <= sz &&
-      nvgpu_resp_has(r.used, sizeof(*resp), r.data_len)) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp), r.data_len))
-      ret = -EFAULT;
-  }
-
-out:
-  kvfree(req_buf);
-  kvfree(resp_buf);
+  ret = nvgpu_ioctl_flat(nfd->dev, nfd->handle, cmd, kbuf, sz, flags, &back);
+  if (back && copy_to_user(uarg, kbuf, back))
+    ret = -EFAULT;
+  kvfree(kbuf);
   return ret;
 }
 

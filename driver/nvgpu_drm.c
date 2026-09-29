@@ -546,7 +546,8 @@ static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
     /* A copy of its own: a failed call leaves the caller's bytes as they
      * were, never a host handle number. */
     memcpy(&p, k, sizeof(p));
-    ret = nvgpu_ioctl_flat_h(nfd->dev, nfd->handle, cmd, &p, sizeof(p));
+    ret = nvgpu_ioctl_flat(nfd->dev, nfd->handle, cmd, &p, sizeof(p),
+                           NVGPU_FLAT_WHOLE, NULL);
     if (ret < 0)
       return ret;
 
@@ -791,8 +792,8 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   }
 
   mo.handle = ng->host_handle;
-  ret = nvgpu_ioctl_flat_h(ng->dev, ng->owner_handle,
-                           NVGPU_IOCTL_GEM_MAP_OFFSET, &mo, sizeof(mo));
+  ret = nvgpu_ioctl_flat(ng->dev, ng->owner_handle, NVGPU_IOCTL_GEM_MAP_OFFSET,
+                         &mo, sizeof(mo), NVGPU_FLAT_WHOLE, NULL);
   if (ret < 0) {
     dev_dbg_ratelimited(&ng->dev->vdev->dev,
                         "virtio-gpu-nv: the host would not give object %u an "

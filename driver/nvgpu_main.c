@@ -849,56 +849,6 @@ static const struct file_operations nvgpu_uvm_tools_fops = {
     .poll = nvgpu_uvm_tools_poll,
 };
 
-/*
- * One flat ioctl round trip on a named backend handle, in and out of a kernel
- * buffer. `handle` rather than an nvgpu_fd because a GEM op forwards on the
- * handle of the file that owns the object, which is not always the caller's.
- */
-long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
-                        unsigned int cmd, void *kbuf, u32 sz) {
-  int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
-  int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
-  void *req_buf = NULL, *resp_buf = NULL;
-  struct nvgpu_ioctl_req *req;
-  struct nvgpu_ioctl_resp *resp;
-  struct nvgpu_ioctl_reply r;
-  long ret;
-
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
-  if (!req_buf || !resp_buf) {
-    ret = -ENOMEM;
-    goto out;
-  }
-
-  req = (struct nvgpu_ioctl_req *)req_buf;
-  nvgpu_ioctl_req_init(req, handle, cmd, sz, 0, 0, 0, 0);
-  memcpy(req_buf + sizeof(*req), kbuf, sz);
-
-  ret = nvgpu_ioctl_exchange(dev, req_buf, req_total, resp_buf, resp_max, &r);
-  if (ret < 0)
-    goto out;
-
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = r.status;
-  if (r.full && r.data_len >= sz &&
-      nvgpu_resp_has(r.used, sizeof(*resp), sz))
-    memcpy(kbuf, resp_buf + sizeof(*resp), sz);
-  else if (ret >= 0)
-    /*
-     * A success that did not carry the struct back: `kbuf` still holds what
-     * was sent, which a caller reading an answer out of it (ALLOC_NVKMS's
-     * handle, MAP_OFFSET's offset) would take for the host's -- a proxy for
-     * a handle number its caller chose.
-     */
-    ret = -EIO;
-
-out:
-  kfree(req_buf);
-  kfree(resp_buf);
-  return ret;
-}
-
 static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
                                 unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;

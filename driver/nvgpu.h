@@ -348,7 +348,7 @@ struct nvgpu_fd {
  * A GEM parameter struct that carries a userspace pointer, described well
  * enough to forward: where the pointer sits and where the length beside it
  * does. Both are u64. A struct with no pointer is not described here at all --
- * it goes through nvgpu_ioctl_flat_h(), which copies the whole thing.
+ * it goes through nvgpu_ioctl_flat(), which copies the whole thing.
  */
 struct nvgpu_gem_nested_desc {
   u32 size;        /* sizeof the parameter struct */
@@ -481,11 +481,24 @@ int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
 int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
                          void *resp, size_t resp_max,
                          struct nvgpu_ioctl_reply *r);
+/* nvgpu_ioctl_flat() flags */
+#define NVGPU_FLAT_PROC (1u << 0)  /* the calling process after the block */
+#define NVGPU_FLAT_WHOLE (1u << 1) /* a success brings all `sz` back, or -EIO */
+/*
+ * One flat v1 IOCTL on backend handle `handle` (rather than an nvgpu_fd: a GEM
+ * op goes to the file that owns the object, not always the caller's): the
+ * `sz` bytes of `buf` out, with NVGPU_FLAT_PROC the calling process after
+ * them if the backend takes it, and back into `buf` what the reply carries,
+ * its length in *back (may be NULL). Without NVGPU_FLAT_WHOLE that is the
+ * reply's block if it is no longer than `sz`, else nothing; with it, all
+ * `sz` bytes or nothing, and a success that brings less back is -EIO. The
+ * host call's status (0 or -errno), or a transport error, -EIO or -EPROTO.
+ */
+long nvgpu_ioctl_flat(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
+                      void *buf, u32 sz, u32 flags, u32 *back);
 
 /* ───────── nvgpu_main.c ───────── */
 
-long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
-                        void *kbuf, u32 sz);
 /*
  * The backend handle standing for one of this module's open files of device
  * `dev`: an /dev/nvidia* character device, a DRM node of ours (its render
