@@ -151,8 +151,8 @@ block that does not all read) and the request; IDLE_CHANNELS' block for its
 flat fallback; an escape that may register memory by its pages for
 whichever path it takes -- where the C read the V1V2 block twice, the clock
 byte and the class word apart from what it then sent, and IDLE_CHANNELS
-twice. The C reads each once too since the 2026-09-26 review (SECURITY.md
-§17), and the difftest's one recognised difference is gone.
+twice. The C reads each once too since the 2026-09-26 review (SECURITY.md,
+Appendix A), and the difftest's one recognised difference is gone.
 
 Fixed in both since, each with a case in `difftest/tests/cases.rs` that
 fails against the earlier C: a size with a NULL pointer (RM_CONTROL,

@@ -28,12 +28,9 @@ rewriting) happens here, driven by the tables in `gen/`.
 The same crate holds the host half of the Wayland proxy (`src/wl/`), and the
 vhost-user backend binary that serves it all to a VMM.
 
-**Where it stands.** The backend runs on an RTX 5090 (595.99.02) under nesbox
-and crosvm: every graphics and compute path, the Wayland proxy against the
-live host compositor, a lease and `VK_KHR_display`, capture injection
-(host buffers into guest EGL and Vulkan, with explicit sync), with the RM
-allowlist enforcing and the sandbox on ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
-compositor-VM and export modes have not met real hardware. The crate's tests
+**Where it stands:** the README's "What is known to work" (what has run on
+hardware, and what has not); the dated runs are in
+[`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md). The crate's tests
 run the dispatcher, the IOCTL2 interpreter, the policies and the Wayland
 connection against fake kernels and a fake compositor; `nvgpu-wl-guest`'s
 loopback test (ignored by default, run by `scripts/wl-loopback-test.sh`)
@@ -51,6 +48,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/nvidia/uvm.rs` | v1 UVM commands: sizes, the descriptor and RM client some name, pools and pageable access |
 | `src/nvidia/placement.rs` | MMAP and MUNMAP: window extents, the memory type each placement is mapped with, UVM pools in the aperture |
 | `src/nvidia/hostnodes.rs` | the host's DRM nodes (GET_DEV_INFO, render and card nodes per GPU) and the GET_PROC_FILES/GET_SYS_FILES streams |
+| `src/nvidia/*_tests.rs`, `src/nvidia/tests.rs` | test only: the dispatcher's tests, by area (ABI, closing, deep blocks, descriptor fields, mappings, sharing, UVM mappings) |
 | `src/session.rs` | protocol v2: the session and its reset, HELLO, TIME_SYNC, WATCH, HOST_OP, and IOCTL2 split into prepare, execute and finish so the host ioctl runs without the backend's lock |
 | `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, and re-homes GEM handles; its KMS stages check calls against `kms_state.rs` and record what they made |
 | `src/schema.rs` | ties the generated schema tables (`abi::schema`) to handle kinds |
@@ -61,7 +59,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/fence.rs` | syncobj waits turned into polls, and the shared, capped SYNCOBJ_EVENTFD registrations the guest sleeps on |
 | `src/semsurf.rs` | semaphore-surface fence contexts (nvidia-drm 0x54): index bound by the host's layout, the VM's RM clients (with the guest process that made each, and the grants RM took for their objects, for `rmshare.rs`), per-file and per-session caps; OS events named inside RM parameters |
 | `src/rmmem.rs` | records of RM system memory and doorbells, the coherency rewrite, and the Intel guest-PAT warning |
-| `src/rmallow.rs` | the RM allowlist: default deny for RM controls and classes, per host release, from `gen/rmallow` (SECURITY.md §12) |
+| `src/rmallow.rs` | the RM allowlist: default deny for RM controls and classes, per host release, from `gen/rmallow` (SECURITY.md, "The RM allowlist") |
 | `src/nvos.rs` | RM's escape ABI as the backend reads it: every field offset of the escapes' own blocks (measured per release in `gen/rmallow`, `abi::rmallow::nvos`), the nv-ioctl.h wrappers, the classes named in more than one place, and RM's statuses |
 | `src/le.rs` | little-endian words of a byte block read and written by offset, `None` past the end rather than a panic |
 | `src/release.rs` | which tables a host release gets, and the refusal to start on one they were not measured at |
@@ -72,6 +70,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/uvmmap.rs` | the UVM semaphore pools a guest may map, and where each sits in the UVM aperture: recorded from UVM's own replies, matched exactly, at host addresses in [4 GiB, 32 TiB), bounded per file and per VM, withdrawn on the last MUNMAP, the file's close and a session reset |
 | `src/rmctl.rs` | RM controls answered without asking RM (the ones that list every GPU process on the host) |
 | `src/rmshare.rs` | RM objects between clients: NV_ESC_RM_SHARE and the NV0000 share controls go to RM only when they narrow or grant inside the VM; RM_DUP_OBJECT's two clients must be the VM's and, for a guest that names the calling process (BCAP_PROC_ID), one guest process's unless a CLIENT grant in the list RM checks covers it (the object's own, or its client's while no other object of it has one; a free drops the client's object grants); a second client named in class or control parameters, lists up to their counts included, must be the VM's. Refusals are RM's NV_ERR_INSUFFICIENT_PERMISSIONS |
+| `src/exportgate.rs` | the one gate every PRIME export of a guest's GEM object passes (HOST_OP PRIME_EXPORT, a Wayland dma-buf, an IOCTL2 re-home): no fence context, no handle INJECT_OPEN made, no dma-buf of an injected buffer |
 | `src/hostfd.rs` | handle kinds, classification of a descriptor by what the kernel says it is, HOST_OP helpers, commands refused on every handle |
 | `src/handle_table.rs` | backend handles: u32, cyclic, bounded |
 | `src/privfd.rs` | the registry of descriptors the backend holds for itself, which an IOCTL2 must never adopt |
@@ -80,23 +79,23 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/pump.rs` | the event pump: v1 EVENT_READY and v2 EVENT_DATA records, DRM event budgets, the level sweep |
 | `src/posture.rs` | refusing root and `CAP_SYS_ADMIN`, dropping capabilities, the socket's directory and path |
 | `src/sockpath.rs` | the sockets bound at a path the operator names (the Wayland export socket, the capture helper's): bound privately and renamed into place 0600, only a stale socket of ours replaced, and an accept loop that rests when out of descriptors |
-| `src/sandbox.rs` | the backend's own sandbox, applied before the first guest message: user and network namespaces, Landlock, the seccomp allowlist (SECURITY.md §4) |
-| `src/quota.rs` | guest processes' shares of the VM-wide budgets |
+| `src/sandbox.rs` | the backend's own sandbox, applied before the first guest message: user and network namespaces, Landlock, the seccomp allowlist (SECURITY.md, "The backend's sandbox") |
+| `src/quota.rs` | guest processes' shares of the VM-wide budgets: a `Share` of a pool per process (`quarter`, `half`, `percent`, or `custom`) with a reserve for processes holding little, a `Ledger` of what each holds, and a `Pool` whose units are a `Charge` given back when whatever holds the resource drops it |
 | `src/error.rs` | the crate's error type |
 | `src/ratelimit.rs`, `src/tally.rs` | a rate limit per log call site, and bounded RM class and control tallies |
-| `src/pacing.rs` | frame-pacing counters: the rate of each kind of message, how long the backend held each, how the guest's waits went, how long a host event took to reach the event queue (ARCHITECTURE.md, "Frame pacing") |
+| `src/pacing.rs` | frame-pacing counters: the rate of each kind of message, how long the backend held each, how the guest's waits went, how long a host event took to reach the event queue (DEPLOY.md, "Frame pacing") |
 | `src/shm.rs`, `src/mmap.rs`, `src/replay.rs` | the shared window's zones and allocator, live mappings, and (test only) a replay of real mapping lifetimes against the allocator; `WindowPlacer`, what a transport implements to place into the window and the UVM aperture |
-| `src/sys/` | every `unsafe` of the crate, and nothing else (`scripts/check-unsafe.sh`; every other module is `#![forbid(unsafe_code)]`): the arena that builds each host call's parameter blocks from the guest's bytes and the backend's own pointers and descriptors (`block.rs`), the one `ioctl` (`ioctl.rs`), the guarded buffers the host writes into (`guarded.rs`), owned mappings with checked `MAP_FIXED` (`mem.rs`), descriptors, netlink, process and sandbox calls (`fd.rs`, `net.rs`, `proc.rs`), wire structs as bytes (`pod.rs`); SECURITY.md §14 |
+| `src/sys/` | every `unsafe` of the crate, and nothing else (`scripts/check-unsafe.sh`; every other module is `#![forbid(unsafe_code)]`): the arena that builds each host call's parameter blocks from the guest's bytes and the backend's own pointers and descriptors (`block.rs`), the one `ioctl` (`ioctl.rs`), the guarded buffers the host writes into (`guarded.rs`), owned mappings with checked `MAP_FIXED` (`mem.rs`), descriptors, netlink, process and sandbox calls (`fd.rs`, `net.rs`, `proc.rs`), wire structs as bytes (`pod.rs`), the listening sockets handed to the backend by socket activation or `--socket-fd` (`inherit.rs`); SECURITY.md, "Memory safety" |
 | `src/virtio.rs` | device config and feature layout, asserted against `driver/nvgpu_wire.h` |
 | `src/vring.rs` | a control-queue chain as the vhost-user transport takes it: summed before it is read, gathered, the reply scattered back (feature `vhost-user`) |
 | `src/host.rs`, `src/userspace.rs` | what the host's driver is (from `/proc/driver/nvidia`), and which host userspace files a guest must mount |
 | `src/i2_e2e.rs` | test only: the guest module's own IOCTL2 interpreter (`nvgpu-guest-core`, a GPL-2.0 dev-dependency) run against the whole backend |
 | `src/testfd.rs` | test only: whether this process still holds the other end of a pipe |
-| `src/testing/rm.rs` | test only: `FakeRm`, a host RM with an object tree that answers ALLOC, CONTROL, FREE, DUP_OBJECT and SHARE with resserv's statuses |
+| `src/testing/` | test only: `FakeRm`, a host RM with an object tree that answers ALLOC, CONTROL, FREE, DUP_OBJECT and SHARE with resserv's statuses |
 | `src/fuzzing/` | fuzzing only (`--cfg fuzzing`, never in the backend): the fuzz targets' entry points and the fake host they run against; see "Fuzzing" below |
 | `src/fuzz_seeds.rs` | test only: with `NVGPU_FUZZ_SEEDS` set, every session a unit test serves is written out as a seed for the `backend` targets |
-| `src/inject/` | capture injection (`--inject-socket`): the helper's socket (`server.rs`: SOCK_SEQPACKET, one uid, four peers), the registry of injected buffers and syncobjs (`registry.rs`, `check.rs`: a dma-buf must import into this GPU's render node as NVKMS memory, its layout fit the object; ids and tokens; 32 buffers, 1 GiB, 16 syncobjs per VM), HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, and the read-only placement of an injected object's mmap range (`backend.rs`); SECURITY.md §18 |
-| `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`) |
+| `src/inject/` | capture injection (`--inject-socket`): the helper's socket (`server.rs`: SOCK_SEQPACKET, one uid, four peers), the registry of injected buffers and syncobjs (`registry.rs`, `check.rs`: a dma-buf must import into this GPU's render node as NVKMS memory, its layout fit the object; ids and tokens; 32 buffers, 1 GiB, 16 syncobjs per VM), HOST_OP INJECT_OPEN and INJECT_OPEN_SYNCOBJ, and the read-only placement of an injected object's mmap range (`backend.rs`); SECURITY.md, "Capture injection" |
+| `src/wl/` | the Wayland proxy's host half: one compositor connection per channel (`conn.rs`), the dispatcher's side (`serve.rs`), which lease devices are this GPU's (`probe.rs`), export mode (`export.rs`); `serve_tests.rs` and `tests.rs` are its tests |
 | `bin/vhost-user-nvgpu.rs` | the vhost-user backend: transport, epochs, executors, pump, hotplug listener, guest RAM handed to the backend from each memory table, and every command-line flag (`--help`) |
 | `bin/nvgpu-userspace.rs` | stages the host's NVIDIA user-mode driver for a guest to mount |
 | `bin/test-harness.rs` | an early socket harness, built only with `--features test-bins` (no sandbox, no posture: development only) |

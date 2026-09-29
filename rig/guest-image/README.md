@@ -26,9 +26,13 @@ file in the image is `root:root`. Nothing is setuid.
 | path | what |
 |---|---|
 | `flake.nix`, `flake.lock` | the pinned nixpkgs and the guest root (`packages.x86_64-linux.guestRoot`) |
-| `nix/nvidia.nix` | 595.99.02 via `nvidiaPackages.mkDriver` (userspace: no module, firmware, settings or persistenced; 64-bit only), and the `/run/opengl-driver` tree: the driver plus egl-wayland, egl-wayland2, egl-gbm and egl-x11. **No mesa**: the guest must use NVIDIA's ICDs and fail loudly without them. |
+| `nix/nvidia.nix` | 595.99.02 via `nvidiaPackages.mkDriver` (userspace: no module, firmware, settings or persistenced; the 32-bit libraries too), and the `/run/opengl-driver` tree: the driver plus egl-wayland, egl-wayland2, egl-gbm and egl-x11; `/run/opengl-driver-32` the same for 32-bit processes. **No mesa**: the guest must use NVIDIA's ICDs and fail loudly without them. |
 | `nix/nvgpu-wl-guest.nix` | the daemon, from the workspace `mkimage.sh` stages |
 | `nix/tools.nix`, `tools/*.c` | the helpers below, plus `sec-negative` and `lease-flip` from `rig/verify` built against nix's libdrm |
+| `nix/tools32.nix` | 32-bit clients for `compat.sh`: `drm-compat.c` and `rm-smoke.c` built i686, and 32-bit `vulkaninfo` and `eglinfo` pinned to NVIDIA's 32-bit ICDs |
+| `nix/apps-data.nix`, `apps/` | what the application pass opens, at `/opt/nvgpu/apps`: test pages, a Godot project, a QML scene, an Electron app, Blender scripts, and media made with ffmpeg at build time |
+| `nix/cuda-apps.nix` | `nvgpu-nbody`, a CUDA runtime program for the application pass |
+| `nix/blender-cuda.nix` | Blender with Cycles' CUDA and OptiX devices, built for the rig's card alone |
 | `probes/*.sh` | the init scripts, installed to `/opt/nvgpu` |
 | `mkimage.sh` | build, stage, image |
 
@@ -93,6 +97,10 @@ powers off. A watchdog powers off a probe that overruns its budget.
 | `vkdisplay.sh` | 5: `vk-acquire-display` on the lease (or the card), then `vkcube --wsi display` | as lease, or `--kms-card` |
 | `compositor.sh` | 6: `guest-check.sh`, `kms-smoke.sh`, `drm_info`, `lease-flip` on the card, then sway (or Hyprland) on it with a client, and a master-arbitration check | `--kms-card` |
 | `export.sh` | 7, guest side: the compositor + `nvgpu-wl-guest --export`; PASS when a host client's window appears | `--kms-card --wayland-export PATH` |
+| `compat.sh` | the compat checks (`rig/TESTING-RIG.md`, A8): DRM ioctls with an older or newer struct size, and 32-bit processes (an RM client, a DRM ioctl, `vulkaninfo-32`, `eglinfo-32`) | any mode |
+| `capture.sh` | capture injection: injected buffers opened through `/dev/nvgpu-capture`, imported into EGL and Vulkan and checked pixel by pixel; no writable CPU mapping; wrong tokens and released ids refused; explicit sync | `--inject`, with `rig/rig-tools/inject-hook.sh` |
+| `apps.sh` | the application pass: real applications through the Wayland proxy, one slot each, watched from the host by `rig/rig-app-check.sh` | `--wayland-socket` |
+| `run.sh` | one command line, base64 in `nvgpu_cmd`, with the probes' environment and the module loaded | any mode |
 | `secneg.sh` | security negatives: `sec-negative.sh`, plus the KMS tests on the card or on a lease | any; KMS tests need a card or lease |
 | `shell.sh` | an interactive shell on `hvc0` | any |
 | `nodev.sh` | none: the image with **no** virtio-nvgpu device (QEMU/TCG, the rig's own smoke script). insmod/rmmod, the NVIDIA userspace failing cleanly (`nvidia-smi`, `vulkaninfo` finding the ICD, `cuda-smoke`), `nvgpu-wl-guest`, the module's probe-failure path on a virtio-rng decoy (`nvgpu_decoy=0` skips it). FAILs on purpose when a device is there | QEMU, no backend |

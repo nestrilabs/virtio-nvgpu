@@ -32,9 +32,13 @@ after an RM_FREE, a close and before the next registration.
 
 It also says which process makes each RM_ALLOC and RM_DUP_OBJECT, to a
 backend that asks (`NVGPU_BCAP_PROC_ID`): 16 bytes after the call's blocks,
-the thread group's leader by its initial-namespace PID and start time. On the
-host every guest process is the backend, so this is how the backend keeps RM
-objects to the guest process that made their client, as RM would
+the thread group's leader by its initial-namespace PID and start time. With
+`NVGPU_BCAP_PROC_EUID` the same 16 bytes carry the caller's effective uid,
+and every RM_CONTROL carries them too. Every OPEN and HOST_OP carries the
+opener after its fixed part, so the handles either makes are charged to that
+process. On the host every guest process is the backend, so this is how the
+backend keeps RM objects to the guest process that made their client, as RM
+would, and holds a second client a call names to RM's rule for it
 (`device/src/rmshare.rs`). The module makes no RM client of its own.
 
 Shared wire-format and ABI definitions live in `protocol/` and are dual
@@ -51,13 +55,10 @@ nvidia.ko's is (the `nvidia` class, major 195, `/proc/driver/nvidia`, the
 (`-EBUSY`, with a line saying why).
 
 **Where it stands.** The module speaks v2 when the backend answers its HELLO,
-and falls back to v1 — no display features — when it does not. It has run on
-Linux 7.2.7 guests on an RTX 5090 (595.99.02), under nesbox and crosvm, built
-both ways (C and Rust parsers): every graphics and compute path, the Wayland
-channel, a lease driven with KMS, `VK_KHR_display`, the security negatives
-and the application pass ([`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md)). The
-compositor-VM mode (the guest driving the host card) has not run on hardware.
-Off the hardware, its IOCTL2 interpreter is exercised end to end against the
+and falls back to v1 — no display features — when it does not. It runs on
+Linux 7.2.7 guests, built both ways (C and Rust parsers); what has run on
+hardware is the README's "What is known to work", and the dated runs are in
+[`rig/TESTING-RIG.md`](../rig/TESTING-RIG.md). Off the hardware, its IOCTL2 interpreter is exercised end to end against the
 whole backend by `device/src/i2_e2e.rs`, which runs the module's own Rust
 interpreter (`rust/core`), and `rust/difftest` runs `nvgpu_i2.c` itself
 against that Rust port.
@@ -71,7 +72,7 @@ has Rust and the rustc it was built with is at hand, and the C otherwise
 does (default `y` with `CONFIG_RUST`). `NVGPU_RUST=1` insists on the Rust,
 `NVGPU_RUST=0` on the C, which the module then says at load on a kernel
 with Rust. The Rust passed the whole hardware regression on 2026-09-26 and
-is the stronger boundary (`SECURITY.md` §6); the C stays, frozen, as the
+is the stronger boundary (`SECURITY.md`, "Inside the guest"); the C stays, frozen, as the
 fallback for a guest kernel without Rust and as the difftest's oracle, and
 `scripts/build-guest-kernel.sh` builds a Rust kernel and module in
 `scripts/guest-toolchain-rust` (and says it builds the C fallback in a
@@ -89,7 +90,7 @@ the test rig installs it in its image as `nvgpu.ko`):
 | `nvgpu_procfs.c` | `/proc/driver/nvidia`, the host's tree as GET_PROC_FILES sends it, served as static files, and the reader of the record streams GET_PROC_FILES and GET_SYS_FILES are made of |
 | `nvgpu_pci.c` | the fake PCI bus and device at the host GPU's own address, serving its config space, and GET_SYS_FILES (config space, DRI devices, host card nodes, GET_DEV_INFO sizes) |
 | `nvgpu_v1.c` | the protocol-v1 IOCTL exchange, in both builds: the request header, the reading of a reply's header, whose status is 0 or an errno (anything else is `-EPROTO`), and the flat round trip of a block with no pointer in it (`nvgpu_ioctl_flat()`: the C parsers' flat escapes, the flat nvidia-drm calls of `nvgpu_drm.c` and `nvgpu_gem.c`); the Rust's twin is `wire::IoctlResp::parse()` |
-| `nvgpu_rmio.c` | the protocol-v1 IOCTL message, in C: the ioctl dispatcher for `/dev/nvidia*` files and a DRM file's RM (non-`'d'`) ioctls, RM forwarding (descriptors and OS events translated to backend handles, deep pointers and deep segments, GPU/CPU time correlation moved into the guest's clocks, the calling process on RM_ALLOC and RM_DUP_OBJECT), UVM, v1 nvidia-modeset, and what reads an OS-descriptor registration and builds its page list. Built with `NVGPU_RUST=0`, or by default on a kernel without Rust |
+| `nvgpu_rmio.c` | the protocol-v1 IOCTL message, in C: the ioctl dispatcher for `/dev/nvidia*` files and a DRM file's RM (non-`'d'`) ioctls, RM forwarding (descriptors and OS events translated to backend handles, deep pointers and deep segments, GPU/CPU time correlation moved into the guest's clocks, the calling process on RM_ALLOC, RM_DUP_OBJECT and, with its euid, RM_CONTROL), UVM, v1 nvidia-modeset, and what reads an OS-descriptor registration and builds its page list. Built with `NVGPU_RUST=0`, or by default on a kernel without Rust |
 | `nvgpu_osdesc.c` | memory the caller already has, registered with RM by its pages: ALLOC_MEMORY and RM_ALLOC of the OS-descriptor class and VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR pin the caller's range as RM would and send its guest-physical runs; the pins last until a reap (HOST_OP OSDESC_REAP) names the registration, or remove(); a registration abandoned in flight keeps them under its request id until its late reply names what RM registered, and one never sent unpins at once |
 | `nvgpu_drm.c` | DRM device registration, open and release, the ioctl entry, nvidia-drm driver-range ioctls (the GEM ones that make and name proxies among them), and every DRM ioctl's argument normalised as `drm_ioctl()` does (`nvgpu_drm_arg_in()`) |
 | `nvgpu_gem.c` | GEM proxies: their lifetime and tombstones, the host's memory reached through the shared window (mmap, vmap, dma-buf export, PRIME import), and the Wayland channel's dma-bufs to and from host objects |
@@ -109,7 +110,7 @@ the test rig installs it in its image as `nvgpu.ko`):
 | `nvgpu_nvkms.c` | `/dev/nvidia-modeset` on protocol v2: NVKMS through IOCTL2 by the host release's own tables, descriptor translation, and the level readiness NVKMS clients poll |
 | `nvgpu_capture.c`, `uapi/nvgpu_capture.h` | `/dev/nvgpu-capture` (only with the backend's `--inject-socket`): OPEN, an injected host buffer by id and token as a read-only guest dma-buf of a GEM proxy, and OPEN_SYNCOBJ, an injected syncobj as a handle of a render file; fixed-size structs, C in both builds |
 | `nvgpu_misc.c` | what `/dev/nvgpu-wl` and `/dev/nvgpu-capture` share: misc-node registration, the node's reference count (an open file keeps it, and it keeps the device), and the mode rule of `wl_mode` and `capture_mode` |
-| `nvgpu_wl.c`, `uapi/nvgpu_wl.h` | `/dev/nvgpu-wl`, the guest end of the Wayland channel: HELLO (device map, clock offset), CONNECT, SEND/RECV frames, and the descriptors only the kernel can name (dma-bufs, syncobjs, adopted DRM files) |
+| `nvgpu_wl.c`, `uapi/nvgpu_wl.h` | `/dev/nvgpu-wl`, the guest end of the Wayland channel: HELLO (device map, clock offset), CONNECT (whose modes LISTEN and ACCEPT serve export mode), CONNECT_FOR (a connection charged to the client process the daemon names), SEND/RECV frames, and the descriptors only the kernel can name (dma-bufs, syncobjs, adopted DRM files) |
 | `nvgpu_rm_intercepts.h`, `gen/nvgpu_rmalloc_classes.h`, `gen/nvgpu_v1v2_rewrites.h` | RM command tables (generated / hand-kept) |
 | `gen/nvgpu_rm_deep.h` | the RM controls, and IDLE_CHANNELS, whose several pointers go as deep segments, and how much RM copies through each; generated by `gen/rmctrl_extract.py` with the backend's copy; never edited by hand |
 | `gen/nvgpu_schema.h` | IOCTL2 schema tables (DRM render/KMS, nvidia-drm, NVKMS per release) and UVM parameter block sizes per release, generated by `gen/schema_gen.py`; never edited by hand |
@@ -125,7 +126,7 @@ does only that).
 ## Callers of another width or another struct size
 
 The native kernel serves two kinds of caller the module did not, and it
-serves them the native way now (SECURITY.md §6 has why neither sends the
+serves them the native way now (SECURITY.md, "Inside the guest", has why neither sends the
 backend anything new):
 
 - **32-bit processes** on `/dev/nvidiactl`, `/dev/nvidiaN`,

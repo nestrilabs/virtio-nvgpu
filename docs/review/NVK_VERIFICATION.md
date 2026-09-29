@@ -2,12 +2,22 @@
 
 > **A review record, not current documentation.** This is the verification
 > review of branch `display-passthrough` at `fbfa3fb` (2026-09-25), kept
-> because [`SECURITY.md`](../../SECURITY.md) §8 and [`TESTING.md`](../../TESTING.md)
+> because [`SECURITY.md`](../../SECURITY.md) and [`TESTING.md`](../../TESTING.md)
 > cite its finding ids and its §5 on-device procedures. File and line
 > references are to that commit; paths prefixed `nv:`, `linux:`, `mesa:`,
 > `ogd:` and `ehk:` are checkouts of NVIDIA's open-gpu-kernel-modules
 > (610.57.04), Linux 7.2.7, Mesa, open-gpu-doc and envyhooks. The status of
-> each finding is in SECURITY.md §8, not here.
+> each finding is in SECURITY.md's finding index, not here. §5 had two
+> sections numbered 5.1 and two 5.2; the first pair is 5.0a and 5.0b now, so
+> that "§5.1" and "§5.2" name the later two, as TESTING.md cites them.
+>
+> Paths and names that have moved since: `scripts/run-guest.sh` is
+> `rig/run-guest.sh`; `device/src/nvidia.rs` is `device/src/nvidia/`
+> (`mod.rs`, `v1.rs`, `rm.rs`, `rmmap.rs`, `placement.rs`, `uvm.rs`,
+> `hostnodes.rs`), `device/src/inject.rs` is `device/src/inject/`, and the
+> guest module's `nvgpu_main.c` was split into several files
+> (`driver/README.md` has the table). `DESIGN.md` and `research/*.md` (cited
+> as `R:` in some code comments) were working notes and were never shipped.
 
 Scope: virtio-nvgpu branch `display-passthrough` at fbfa3fb. The review ran read-only through four lenses: layout/modifiers, sync, memory/caching, and submission/display. Each finding was checked by an adversarial verifier. Only findings whose verdict was `real=true` are listed as discrepancies. The severity given is the verifier's, not the original reviewer's.
 
@@ -381,13 +391,13 @@ Run the steps in order. Each step lists its commands, then its PASS/FAIL criteri
    Today the window range should show `write-combining`.
 
 
-### 5.1 Host-safety fixes (C-1, H-1, H-2, H-3, M-7, M-8, M-10)
+### 5.0a Host-safety fixes (C-1, H-1, H-2, H-3, M-7, M-8, M-10)
 
 Verify these through the backend unit tests added with each fix (§3). Do not exercise the unfixed paths on a live host. After the fixes land, the only on-device check is a regression check: run the normal workloads in §5.2-5.9.
 - PASS: no new EPERM, EINVAL or ENOSPC refusals appear in the backend log for NVIDIA's own userspace.
 - PASS: host `dmesg` stays clean (no `nv_drm_crtc_dequeue_flip` WARN, no semaphore-surface notification-handle errors).
 
-### 5.2 Layout, modifiers and GET_DEV_INFO (L1-L11, M-4, H-5)
+### 5.0b Layout, modifiers and GET_DEV_INFO (L1-L11, M-4, H-5)
 
 1. **Host.** `drm_info -j /dev/dri/cardN > host.json`. Extract IN_FORMATS for each primary plane.
 2. **Guest.**

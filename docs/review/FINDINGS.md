@@ -2,12 +2,23 @@
 
 > **A review record, not current documentation.** This is the security and
 > adversarial review of branch `display-passthrough` at `fbfa3fb`
-> (2026-09-25), kept because [`SECURITY.md`](../../SECURITY.md) §8 and
+> (2026-09-25), kept because [`SECURITY.md`](../../SECURITY.md) and
 > [`TESTING.md`](../../TESTING.md) cite its finding ids. File and line
 > references are to that commit, and "INVENTORY" is the attack-surface
-> inventory the review worked from, which is not shipped (SECURITY.md §3-§7
-> is its current form). The status of each finding is in SECURITY.md §8, not
-> here.
+> inventory the review worked from, which is not shipped (SECURITY.md's
+> Part I is its current form). The status of each finding is in
+> SECURITY.md's finding index, not here. A few references were wrong even at
+> that commit: the `conn.rs:259` and `:334-336` of S-3's evidence are `:213`
+> and `:288-290`, `engine.rs:229` is `:228`, and S-29's `conn.rs:359-362` is
+> off the same way.
+>
+> Paths and names that have moved since: `scripts/run-guest.sh` is
+> `rig/run-guest.sh`; `device/src/nvidia.rs` is `device/src/nvidia/`
+> (`mod.rs`, `v1.rs`, `rm.rs`, `rmmap.rs`, `placement.rs`, `uvm.rs`,
+> `hostnodes.rs`), `device/src/inject.rs` is `device/src/inject/`, and the
+> guest module's `nvgpu_main.c` was split into several files
+> (`driver/README.md` has the table). `DESIGN.md` and `research/*.md` (cited
+> as `R:` in some code comments) were working notes and were never shipped.
 
 ## S-1. [critical] (sec-gpuside) RM_CONTROL embedded pointers the guest driver's table does not list reach host RM with their raw guest values, and RM uses them against the backend's own address space
 - Area: RM escapes (NV_ESC_RM_CONTROL), device/src/nvidia.rs dispatch_nested + driver/nvgpu_main.c nvgpu_ioctl_rm_control
