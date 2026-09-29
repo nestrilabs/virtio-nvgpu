@@ -852,10 +852,11 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
     if buf.len() < 4 {
         return 0;
     }
-    let mut off = 0;
-    buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
-    off += 4;
-
+    // The count is of the records that fit, written once they are known:
+    // a count of every device over fewer records had the guest parse the
+    // card section after them as DRI records (review 2026-09-29 2.6).
+    let mut off = 4;
+    let mut n = 0u32;
     for d in devices {
         // name_len, major, minor, slot_index, then the nine dev_info words.
         let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
@@ -863,6 +864,7 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
             log::warn!("DRI section truncated at {}", d.name);
             break;
         }
+        n += 1;
         for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
             .into_iter()
             .chain(d.dev_info)
@@ -873,6 +875,7 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
         buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
         off += d.name.len();
     }
+    buf[..4].copy_from_slice(&n.to_le_bytes());
     off
 }
 
@@ -5441,7 +5444,7 @@ impl NvidiaBackend {
         errno: i32,
     ) -> usize {
         let e = if errno != 0 {
-            errno.abs()
+            errno.saturating_abs()
         } else {
             status.errno()
         };
@@ -6815,6 +6818,26 @@ mod tests {
         let resp = v1_ioctl(&mut be, ctl, check, &p);
         assert_eq!(parse_resp(&resp).status, -libc::EFAULT);
         assert_eq!(resp.len(), size_of::<MsgHeader>(), "a bare header");
+    }
+
+    /// The DRI section's count is of the records written: a count of every
+    /// device over fewer records had the guest read the card section after
+    /// them as DRI records (review 2026-09-29 2.6).
+    #[test]
+    fn a_truncated_dri_section_counts_only_what_it_holds() {
+        let dev = |name: &str| DriDevice {
+            name: name.into(),
+            major: 226,
+            minor: 128,
+            slot_index: 0,
+            dev_info: [0; NV_DEV_INFO_WORDS],
+            dev_info_size: 0,
+        };
+        let one = 16 + 4 * NV_DEV_INFO_WORDS + "renderD128".len();
+        let mut buf = vec![0u8; 4 + one + 8];
+        let n = write_dri_section(&[dev("renderD128"), dev("renderD129")], &mut buf);
+        assert_eq!(n, 4 + one);
+        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
     }
 
     #[test]

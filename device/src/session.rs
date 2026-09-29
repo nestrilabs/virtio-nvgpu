@@ -491,7 +491,12 @@ impl NvidiaBackend {
     /// A failure response to the message being served.
     pub(crate) fn error_reply(&self, errno: i32) -> Reply {
         Reply {
-            bytes: hdr(self.current_msg, 0, -errno.abs(), self.current_req_id),
+            bytes: hdr(
+                self.current_msg,
+                0,
+                -errno.saturating_abs(),
+                self.current_req_id,
+            ),
             ..Reply::default()
         }
     }
