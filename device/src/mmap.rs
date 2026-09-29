@@ -2,9 +2,15 @@
 //! Active guest mappings.
 //!
 //! One entry per live `NV_ESC_RM_MAP_MEMORY`, keyed by the SHM offset that was
-//! written back into `pLinearAddress`. The guest library stores that value and
-//! echoes it in `NV_ESC_RM_UNMAP_MEMORY`, which gives an unambiguous lookup key
-//! without handing the guest a host address.
+//! written back into `pLinearAddress`. That offset is not the only address a
+//! guest process knows a mapping by: once it has mapped the file, the NVIDIA
+//! library tells RM where, with `NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO`
+//! (`RmUpdateDeviceMappingInfo`, osapi.c, moves the mapping's pLinearAddress
+//! from `pOld` to `pNew`), and from then on names the mapping by that virtual
+//! address -- in a later UPDATE and in `NV_ESC_RM_UNMAP_MEMORY`. So an entry
+//! also records the address its last UPDATE gave it, and both calls look a
+//! mapping up by the RM object, the process and the address together
+//! ([`MmapContext::find`]), never by an address alone.
 //!
 //! The entry owns the `ShmRegion`, because releasing a mapping means two things
 //! that must not come apart: restoring the SHM backing, and returning the
@@ -14,6 +20,7 @@
 
 use std::collections::HashMap;
 
+use crate::quota::Owner;
 use crate::shm::ShmRegion;
 
 /// One live mapping.
@@ -51,6 +58,34 @@ pub struct MmapEntry {
     pub mapping_id: u32,
     /// MMAP replies that handed `mapping_id` out and have not been taken back.
     pub refs: u32,
+    /// The guest process whose RM call made the mapping: the owner of the
+    /// file NV_ESC_RM_MAP_MEMORY ran on. RM answers UPDATE and UNMAP only
+    /// for a mapping the calling process made
+    /// (`serverutilMappingFilterCurrentUserProc`, rs_utils.c); every call
+    /// reaches the host from the backend's one process, so that filter is
+    /// kept here.
+    pub caller: Owner,
+    /// The address the guest process last told RM this mapping is at
+    /// (`pNew` of an UPDATE_DEVICE_MAPPING_INFO RM accepted), or `None`
+    /// until then. The host's own pLinearAddress never changes: it is the
+    /// backend's, and a guest address means nothing on the host.
+    pub guest_va: Option<u64>,
+}
+
+impl MmapEntry {
+    /// Whether a call from `caller` about `h_client`'s `h_memory` names
+    /// this mapping by `addr`: the address an UPDATE recorded (`by_va`),
+    /// or the window offset the map returned.
+    fn answers(&self, h_client: u32, h_memory: u32, caller: Owner, addr: u64, by_va: bool) -> bool {
+        self.h_client == h_client
+            && self.h_memory == h_memory
+            && self.caller == caller
+            && if by_va {
+                self.guest_va == Some(addr)
+            } else {
+                self.region.offset == addr
+            }
+    }
 }
 
 /// Live mappings, indexed by SHM offset.
@@ -148,14 +183,68 @@ impl MmapContext {
         self.entries.values().any(|e| e.map_fd_handle == fd_handle)
     }
 
-    /// Find the mapping for a given client/memory pair.
+    /// The window offset (the key) of the mapping a call from `caller`
+    /// names by `addr`, for `h_client`'s `h_memory`.
     ///
-    /// `NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO` sends an address the guest knows,
-    /// which never matches a host address, so the host `pLinearAddress` has to
-    /// be recovered by identity instead.
-    pub fn find_by_object(&self, h_client: u32, h_memory: u32) -> Option<&MmapEntry> {
+    /// The address is one the guest process knows: the virtual address an
+    /// UPDATE_DEVICE_MAPPING_INFO recorded, looked for first, or the window
+    /// offset the map returned, which the library quotes until it updates
+    /// (and a client that never updates, always). It is matched only
+    /// together with the RM object and the process: two mappings of one
+    /// object have different addresses, and one process's virtual addresses
+    /// say nothing about another's -- a guessed address finds nothing that
+    /// is not the caller's own.
+    pub fn find(&self, h_client: u32, h_memory: u32, caller: Owner, addr: u64) -> Option<u64> {
+        if let Some((&k, _)) = self
+            .entries
+            .iter()
+            .find(|(_, e)| e.answers(h_client, h_memory, caller, addr, true))
+        {
+            return Some(k);
+        }
         self.entries
-            .values()
-            .find(|e| e.h_client == h_client && e.h_memory == h_memory)
+            .get(&addr)
+            .filter(|e| e.answers(h_client, h_memory, caller, addr, false))
+            .map(|_| addr)
+    }
+
+    /// The window offset of `caller`'s one mapping of `h_client`'s
+    /// `h_memory`, if it has exactly one.
+    ///
+    /// For an UPDATE whose `pOld` names none of them: with one mapping there
+    /// is no doubt which the caller means (what this backend assumed of
+    /// every UPDATE before `find`); with two there is, and a guess would
+    /// move the wrong one.
+    pub fn only_mapping_of(&self, h_client: u32, h_memory: u32, caller: Owner) -> Option<u64> {
+        let mut of = self.entries.iter().filter(|(_, e)| {
+            e.h_client == h_client && e.h_memory == h_memory && e.caller == caller
+        });
+        match (of.next(), of.next()) {
+            (Some((&k, _)), None) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// Record that the mapping at window offset `key` is now at `va` in its
+    /// process, as RM does on an UPDATE_DEVICE_MAPPING_INFO.
+    ///
+    /// A process has one mapping at an address at a time, so another of its
+    /// mappings of the same object still recorded there is stale -- its
+    /// range was unmapped and reused with no RM unmap -- and loses the
+    /// address: it answers to its window offset alone, and `va` names
+    /// exactly one mapping.
+    pub fn set_guest_va(&mut self, key: u64, va: u64) -> bool {
+        let Some(e) = self.entries.get(&key).copied() else {
+            return false;
+        };
+        for (k, other) in self.entries.iter_mut() {
+            if *k != key && other.answers(e.h_client, e.h_memory, e.caller, va, true) {
+                other.guest_va = None;
+            }
+        }
+        if let Some(e) = self.entries.get_mut(&key) {
+            e.guest_va = Some(va);
+        }
+        true
     }
 }

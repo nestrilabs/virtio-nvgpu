@@ -1257,6 +1257,19 @@ impl NvidiaBackend {
         self.handles.insert(fd, kind).expect("test table has room")
     }
 
+    /// `adopt_for_test`, as opened by guest process `owner`.
+    #[cfg(test)]
+    pub(crate) fn adopt_for_test_as(
+        &mut self,
+        fd: OwnedFd,
+        kind: HandleKind,
+        owner: crate::quota::Owner,
+    ) -> u32 {
+        self.handles
+            .insert_for(fd, kind, owner)
+            .expect("test table has room")
+    }
+
     /// Replace host node enumeration, which needs real hardware.
     #[cfg(any(test, fuzzing))]
     pub(crate) fn set_host_nodes_for_test(&mut self, dri: Vec<DriDevice>, cards: Vec<CardNode>) {
@@ -2083,6 +2096,20 @@ impl NvidiaBackend {
             // System memory this backend never saw allocated: the old guess.
             (MAPPING_DIRECT, None) => PgprotKind::WriteCombine,
             _ => PgprotKind::Uncached,
+        }
+    }
+
+    /// The memory type an RM_MAP_MEMORY of `h_client`'s `h_memory` will most
+    /// likely be mapped with, known before RM answers: what
+    /// `rm_mapping_pgprot` makes of the answer RM gives for it. Registers
+    /// and system memory we saw allocated are in our records; anything
+    /// else is taken to be video memory, which RM maps through BAR1
+    /// write-combined. A wrong guess costs a second allocation, not a
+    /// wrong type: the reply decides.
+    fn rm_mapping_pgprot_before(&self, h_client: u32, h_memory: u32) -> crate::shm::PgprotKind {
+        match self.rmmem.lookup(h_client, h_memory) {
+            Some(m) => m.pgprot(),
+            None => crate::shm::PgprotKind::WriteCombine,
         }
     }
 
@@ -4378,7 +4405,7 @@ impl NvidiaBackend {
     }
 
     fn dispatch_update_device_mapping_info(
-        &self,
+        &mut self,
         cookie: u64,
         host_fd: RawFd,
         request: u64,
@@ -4408,16 +4435,42 @@ impl NvidiaBackend {
             new_cpu_addr
         );
 
-        // The guest sends SHM offsets or guest VAs. The host RM needs host VAs.
-        // Look up the mapping by scanning active_maps for matching hMemory,
-        // since the guest's "old" address won't match any host address.
+        // Where the library mapped what RM_MAP_MEMORY armed (`pNew`), told
+        // to RM by the address it knew the mapping by until now (`pOld`):
+        // the window offset the map returned, or the address an earlier
+        // UPDATE gave it. RM moves its record of the mapping from one to
+        // the other (osapi.c RmUpdateDeviceMappingInfo), and the library
+        // names the mapping by `pNew` from then on -- UNMAP_MEMORY included.
         //
-        // A mapping we have no record of gets 0, not the guest's value: the
-        // host takes both as addresses in this process (guestptr.rs), and RM
-        // finds no mapping at 0.
-        let mut host_old = 0;
-        if let Some(entry) = self.active_maps.find_by_object(h_client, h_memory) {
-            host_old = entry.host_p_linear_address;
+        // The mapping is found by the object, the process and `pOld`
+        // together (`MmapContext::find`): by the object alone, two mappings
+        // of it were one, and whichever came first was the one moved. If
+        // `pOld` names none of the caller's, and it has exactly one mapping
+        // of the object, that one is meant, as this backend always assumed.
+        let caller = self.current_owner;
+        let key = self
+            .active_maps
+            .find(h_client, h_memory, caller, old_cpu_addr)
+            .or_else(|| {
+                let k = self.active_maps.only_mapping_of(h_client, h_memory, caller);
+                if k.is_some() {
+                    log::debug!(
+                        "UPDATE_DEVICE_MAPPING_INFO: pOld {old_cpu_addr:#x} names no mapping of \
+                         client {h_client:#x} memory {h_memory:#x}; taking its only one"
+                    );
+                }
+                k
+            });
+
+        // The host is handed its own address for the mapping, as both pOld
+        // and pNew: its record stays where the backend's mapping is, which
+        // did not move. A mapping we have no record of gets 0, not the
+        // guest's value: the host takes both as addresses in this process
+        // (guestptr.rs), and RM finds no mapping at 0.
+        let host_old = key
+            .and_then(|k| self.active_maps.find_by_offset(k))
+            .map_or(0, |e| e.host_p_linear_address);
+        if key.is_some() {
             log::debug!(
                 "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
                 old_cpu_addr,
@@ -4455,6 +4508,12 @@ impl NvidiaBackend {
         let param_buf = a.reply(top)[..param_in.len()].to_vec();
         let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
         log::debug!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
+        // What RM would now know the mapping by, once it has said yes.
+        if status == 0
+            && let Some(k) = key
+        {
+            self.active_maps.set_guest_va(k, new_cpu_addr);
+        }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
@@ -4522,14 +4581,68 @@ impl NvidiaBackend {
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
         };
 
-        // --- Step 2: Call host ioctl ---
+        // --- Step 2: reserve the window extent, before RM maps anything ---
+        //
+        // A mapping is one transaction: the extent, the host's mapping and
+        // the placement all happen, or none does. The extent is the part
+        // that can be refused -- the zone is full, or this process holds its
+        // share of it (quota.rs) -- so it comes first, and a refusal leaves
+        // the host with nothing mapped. It used to come after RM, and each
+        // refusal left a host mapping made, recorded nowhere, until the
+        // memory was freed.
+        //
+        // Charged to whoever opened the file the mapping is armed on: the
+        // process that will map it. The zone is the one the mapping will
+        // most likely need (`rm_mapping_pgprot_before`); RM's reply decides,
+        // and a reply that wants another zone moves the reservation there.
+        let owner = match self.handles.owner(guest_fd_handle) {
+            crate::quota::Owner::Unknown => self.current_owner,
+            o => o,
+        };
+        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
+        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
+        let asked = u64::from_le_bytes(
+            param_in[LENGTH_OFFSET..LENGTH_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let expected = self.rm_mapping_pgprot_before(h_client, h_memory);
+        // A zero length can be given no extent; RM refuses it on its own,
+        // and says so in `status`.
+        let reserved = if asked == 0 {
+            None
+        } else {
+            match self.alloc_zone(asked, expected, owner) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOMEM,
+                    );
+                }
+            }
+        };
+        // Give the reservation back, on a path where it will not be used.
+        let unreserve = |be: &mut Self, r: Option<crate::shm::ShmRegion>| {
+            if let Some(r) = r
+                && let Err(e) = be.shm.free(&r)
+            {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
+            }
+        };
+
+        // --- Step 3: Call host ioctl ---
 
         if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
             log::warn!("NV_ESC_RM_MAP_MEMORY: host ioctl failed: errno={}", errno);
+            unreserve(self, reserved);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
 
-        // --- Step 3: Check RM status and read updated fields ---
+        // --- Step 4: Check RM status and read updated fields ---
 
         // The guest handle back in the descriptor field, regardless of status.
         let mut param_buf = a.reply(top)[..param_in.len()].to_vec();
@@ -4544,8 +4657,14 @@ impl NvidiaBackend {
             // RM returned an error status (NV_OK == 0).
             // Forward the params back so the guest can read the status field.
             log::debug!("NV_ESC_RM_MAP_MEMORY: RM status 0x{:x}", rm_status);
+            unreserve(self, reserved);
             return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
         }
+
+        // NVOS33.pLinearAddress: the host's own address for the mapping,
+        // which RM knows it by (in UPDATE_DEVICE_MAPPING_INFO and UNMAP), and
+        // which undoes it if what follows fails.
+        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
 
         let length = u64::from_le_bytes(
             param_buf[LENGTH_OFFSET..LENGTH_OFFSET + 8]
@@ -4559,13 +4678,11 @@ impl NvidiaBackend {
                 .unwrap(),
         );
 
-        // --- Step 4: the memory type the host maps it with ---
+        // --- Step 5: the memory type the host maps it with ---
         //
         // Not the caching type alone: that is real only for video memory (see
         // `rm_mapping_pgprot`), and reading it for everything put system
         // memory and the doorbell registers write-combining.
-        let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
-        let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
         let pgprot = self.rm_mapping_pgprot(flags, h_client, h_memory);
         // And whether it can be written at all: RM makes some mappings
         // read-only, and placing one writable would let a guest write stop the
@@ -4578,44 +4695,57 @@ impl NvidiaBackend {
             );
         }
 
-        // --- Step 5: Allocate SHM region ---
-
-        // Charged to whoever opened the file the mapping is armed on: the
-        // process that will map it.
-        let owner = match self.handles.owner(guest_fd_handle) {
-            crate::quota::Owner::Unknown => self.current_owner,
-            o => o,
-        };
-        let region = match self.alloc_zone(length, pgprot, owner) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        // --- Step 6: the extent RM's answer calls for ---
+        //
+        // Nearly always the reservation. When RM mapped the memory with
+        // another type than expected (or, never seen, another length), the
+        // extent moves to that type's zone; if it does not fit there, the
+        // host's mapping is undone and nothing is left of the call.
+        let region = match reserved {
+            Some(r) if pgprot == expected && length == asked => r,
+            other => {
+                unreserve(self, other);
+                match self.alloc_zone(length, pgprot, owner) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                        self.undo_rm_map(host_fd, &param_buf, host_p_linear);
+                        return self.write_error_resp(
+                            resp_buf,
+                            Status::IoctlFailed,
+                            cookie,
+                            libc::ENOMEM,
+                        );
+                    }
+                }
             }
         };
 
-        // --- Step 6: place the device fd in the window ---
+        // --- Step 7: place the device fd in the window ---
         //
         // Placed by the transport, not here: see `WindowPlacer`. Without one
         // the mapping exists on the host and is unreachable from the guest, so
         // the honest answer is to fail the call rather than return an address
-        // that names nothing.
-        let Some(window) = self.window.as_ref() else {
-            log::warn!(
-                "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
-                 addressed by the guest"
-            );
-            if let Err(e) = self.shm.free(&region) {
-                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
+        // that names nothing -- and to undo the host's mapping with it.
+        let placed = match self.window.as_ref() {
+            None => {
+                log::warn!(
+                    "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
+                     addressed by the guest"
+                );
+                Err(libc::ENOTSUP)
             }
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTSUP);
+            Some(window) => window
+                .place(region.offset, length, host_map_fd, 0, writable)
+                .map_err(|e| {
+                    log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
+                    libc::ENOMEM
+                }),
         };
-        if let Err(e) = window.place(region.offset, length, host_map_fd, 0, writable) {
-            log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
-            if let Err(e) = self.shm.free(&region) {
-                log::warn!("NV_ESC_RM_MAP_MEMORY: freeing the unused region: {e}");
-            }
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        if let Err(errno) = placed {
+            unreserve(self, Some(region));
+            self.undo_rm_map(host_fd, &param_buf, host_p_linear);
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
 
         log::debug!(
@@ -4626,19 +4756,15 @@ impl NvidiaBackend {
             if writable { "" } else { " read-only" }
         );
 
-        // --- Step 6.5: Save host pLinearAddress and record mapping ---
+        // --- Step 8: record the mapping ---
         //
-        // The host wrote its kernel VA into pLinearAddress (offset 32).
-        // We save it for later unmap, then overwrite pLinearAddress with
-        // the SHM offset. The guest library will store this and echo it
-        // back in RM_UNMAP_MEMORY, giving us a unique lookup key.
-
-        // NVOS34.pLinearAddress is documented as "address of application
-        // mapping". We send back what RM_MAP_MEMORY left in the field, which
-        // makes NV_ESC_RM_UNMAP_MEMORY return NV_OK -- but does not release the
-        // mapping: see repeated_map_unmap_does_not_exhaust_the_zone.
-        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
-
+        // The host wrote its own address into pLinearAddress; it is kept for
+        // UPDATE_DEVICE_MAPPING_INFO and UNMAP, and the guest is given the
+        // window offset in its place. The guest library stores that value
+        // and quotes it back until it tells RM where it mapped the file
+        // (UPDATE_DEVICE_MAPPING_INFO), and by that address afterwards; the
+        // entry answers to both (`MmapContext::find`).
+        //
         // The handle is the key the mmap that follows will be found by, so it
         // is the one field worth naming in the log: a mapping that is armed
         // against one file and consumed on another is the whole failure mode.
@@ -4664,6 +4790,8 @@ impl NvidiaBackend {
                 writable,
                 mapping_id: 0,
                 refs: 0,
+                caller: self.current_owner,
+                guest_va: None,
             },
         );
 
@@ -4673,7 +4801,7 @@ impl NvidiaBackend {
         // and the library stores this value to pass back at unmap time.
         param_buf[32..40].copy_from_slice(&region_offset.to_le_bytes());
 
-        // --- Step 7: Respond ---
+        // --- Step 9: Respond ---
         //
         // Only the parameter buffer goes back. The SHM offset and length do not
         // ride along on the ioctl reply: the guest maps by issuing a separate
@@ -4687,6 +4815,51 @@ impl NvidiaBackend {
             length
         );
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+    }
+
+    /// Undo an RM_MAP_MEMORY RM said yes to, when the backend cannot give
+    /// the guest what it mapped (no extent in the zone RM's answer calls
+    /// for, or no placement): NV_ESC_RM_UNMAP_MEMORY of the same object at
+    /// the host's own address, on the same file, as the guest's own unmap
+    /// would be sent. `nvos33` is the reply as RM left it.
+    ///
+    /// The descriptor the mapping was armed on stays spent (a host fd
+    /// carries one mapping in its life, `repeated_map_unmap_does_not_
+    /// exhaust_the_zone`); the guest closes it, as it would after any
+    /// failed map.
+    fn undo_rm_map(&self, host_fd: RawFd, nvos33: &[u8], host_p_linear: u64) {
+        // NVOS34 {hClient, hDevice, hMemory, pad, pLinearAddress, status,
+        // flags}: the object from the map, flags 0 (a user mapping).
+        let mut p = [0u8; 32];
+        p[0..12].copy_from_slice(&nvos33[0..12]);
+        let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, p.len() as u32);
+        let mut a = Arena::new();
+        let built = self
+            .top_block(&mut a, request, &p, &crate::guestptr::Plan::default())
+            .and_then(|top| {
+                a.value(top, 16, 8, Restore::No)?;
+                a.set_value(top, 16, host_p_linear)?;
+                Ok(top)
+            });
+        let status = built.and_then(|top| {
+            self.host_call(&mut a, host_fd, request, top)?;
+            Ok(u32::from_le_bytes(a.reply(top)[24..28].try_into().unwrap()))
+        });
+        match status {
+            Ok(0) => log::info!(
+                "NV_ESC_RM_MAP_MEMORY: undone on the host (client {:#x} memory {:#x})",
+                u32::from_le_bytes(p[0..4].try_into().unwrap()),
+                u32::from_le_bytes(p[8..12].try_into().unwrap()),
+            ),
+            Ok(s) => log::warn!(
+                "NV_ESC_RM_MAP_MEMORY: the host would not undo the mapping (RM status {s:#x}); \
+                 it lasts until the memory is freed"
+            ),
+            Err(errno) => log::warn!(
+                "NV_ESC_RM_MAP_MEMORY: undoing the mapping on the host failed (errno {errno}); \
+                 it lasts until the memory is freed"
+            ),
+        }
     }
 
     fn dispatch_unmap_memory(
@@ -4705,9 +4878,15 @@ impl NvidiaBackend {
         let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
         let guest_linear = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
 
-        // guest_linear is the SHM offset we wrote into pLinearAddress during map.
-        // Use it as the lookup key.
-        let entry = match self.active_maps.remove(guest_linear) {
+        // guest_linear is what the caller knows the mapping by: the window
+        // offset the map wrote into pLinearAddress, or the address an
+        // UPDATE_DEVICE_MAPPING_INFO moved it to (`MmapContext::find`), for
+        // this object and this process only.
+        let found = self
+            .active_maps
+            .find(h_client, h_memory, self.current_owner, guest_linear)
+            .and_then(|k| self.active_maps.remove(k));
+        let entry = match found {
             Some(e) => e,
             None => {
                 log::warn!(
@@ -4740,8 +4919,9 @@ impl NvidiaBackend {
         };
 
         log::debug!(
-            "UNMAP_MEMORY: shm_off={:#x} → host_va={:#x} (client={:#x}, mem={:#x})",
+            "UNMAP_MEMORY: {:#x} (shm_off={:#x}) → host_va={:#x} (client={:#x}, mem={:#x})",
             guest_linear,
+            entry.region.offset,
             entry.host_p_linear_address,
             h_client,
             h_memory
@@ -4759,14 +4939,14 @@ impl NvidiaBackend {
         let top = match built {
             Ok(t) => t,
             Err(e) => {
-                self.active_maps.insert(guest_linear, entry);
+                self.active_maps.insert(entry.region.offset, entry);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
             }
         };
         if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
             log::warn!("UNMAP_MEMORY: host ioctl failed: errno={}", errno);
             // Restore the entry since unmap didn't happen
-            self.active_maps.insert(guest_linear, entry);
+            self.active_maps.insert(entry.region.offset, entry);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
         let mut param_buf = a.reply(top)[..param_in.len()].to_vec();
@@ -4791,7 +4971,7 @@ impl NvidiaBackend {
                 "UNMAP_MEMORY: host RM status 0x{:x}, restoring mapping",
                 status
             );
-            self.active_maps.insert(guest_linear, entry);
+            self.active_maps.insert(entry.region.offset, entry);
         }
 
         // Zero pLinearAddress in response — guest doesn't need it
@@ -7057,12 +7237,27 @@ mod mapping_tests {
     const SYSMEM: u32 = 0x100;
     const REGS: u32 = 0x200;
     const VIDMEM: u32 = 0x300;
+    /// Video memory RM maps uncached (REFLECTED, UNCACHED): not the
+    /// write-combined type the backend expects of video memory before RM
+    /// answers.
+    const UCVID: u32 = 0x400;
     const LEN: u64 = 4096;
+    /// NV_ERR_OBJECT_NOT_FOUND: RM's answer for an address it has no
+    /// mapping of the object at.
+    const NOT_FOUND: u32 = 0x57;
 
     std::thread_local! {
         /// NV01_MEMORY_SYSTEM attr words the host was handed.
         static HOST_ATTR: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
         static NEXT_VA: Cell<u64> = const { Cell::new(0x7f00_0000_0000) };
+        /// The mappings RM holds, as (hClient, hMemory, pLinearAddress).
+        static HOST_MAPS: RefCell<Vec<(u32, u32, u64)>> = const { RefCell::new(Vec::new()) };
+        /// Whether the fake VMM refuses placements.
+        static PLACE_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn host_maps() -> Vec<(u32, u32, u64)> {
+        HOST_MAPS.with(|m| m.borrow().clone())
     }
 
     fn rd(b: &[u8], off: usize) -> u32 {
@@ -7098,6 +7293,7 @@ mod mapping_tests {
                 match rd(b, 8) {
                     SYSMEM => flags |= 1 << 15,
                     VIDMEM => flags = (flags & !(7 << 23)) | (2 << 15) | (2 << 23),
+                    UCVID => flags = (flags & !(7 << 23)) | (2 << 15) | (1 << 23),
                     _ => {}
                 }
                 put(b, 44, flags);
@@ -7107,9 +7303,36 @@ mod mapping_tests {
                     va
                 });
                 b[32..40].copy_from_slice(&va.to_le_bytes());
+                HOST_MAPS.with(|m| m.borrow_mut().push((rd(b, 0), rd(b, 8), va)));
                 put(b, 40, 0);
             }
-            NV_ESC_RM_UNMAP_MEMORY => put(b, 24, 0),
+            // Both find the mapping by the object and the address, as RM
+            // does (refFindCpuMappingWithFilter), and say so when there is
+            // none.
+            NV_ESC_RM_UNMAP_MEMORY => {
+                let key = (
+                    rd(b, 0),
+                    rd(b, 8),
+                    u64::from_le_bytes(b[16..24].try_into().unwrap()),
+                );
+                let gone = HOST_MAPS.with(|m| {
+                    let mut m = m.borrow_mut();
+                    let at = m.iter().position(|&e| e == key);
+                    at.map(|i| m.remove(i)).is_some()
+                });
+                put(b, 24, if gone { 0 } else { NOT_FOUND });
+            }
+            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => {
+                let old = u64::from_le_bytes(b[16..24].try_into().unwrap());
+                let new = u64::from_le_bytes(b[24..32].try_into().unwrap());
+                let (client, mem) = (rd(b, 0), rd(b, 8));
+                let moved = HOST_MAPS.with(|m| {
+                    let mut m = m.borrow_mut();
+                    let e = m.iter_mut().find(|e| **e == (client, mem, old));
+                    e.map(|e| e.2 = new).is_some()
+                });
+                put(b, 32, if moved { 0 } else { NOT_FOUND });
+            }
             _ => {}
         }
         0
@@ -7124,6 +7347,9 @@ mod mapping_tests {
 
     impl crate::shm::WindowPlacer for RecWindow {
         fn place(&self, off: u64, _len: u64, _fd: RawFd, _fo: u64, w: bool) -> Result<()> {
+            if PLACE_FAILS.with(Cell::get) {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOMEM).into());
+            }
             self.0.lock().unwrap().push(("place", off, w));
             Ok(())
         }
@@ -7209,6 +7435,19 @@ mod mapping_tests {
 
     impl Env {
         fn call(&mut self, handle: u32, escape: u32, outer: &[u8], nested: &[u8]) -> Vec<u8> {
+            let (status, back) = self.call_raw(handle, escape, outer, nested);
+            assert_eq!(status, 0, "escape {escape:#x}");
+            back
+        }
+
+        /// The transport status and the parameters as the guest reads them.
+        fn call_raw(
+            &mut self,
+            handle: u32,
+            escape: u32,
+            outer: &[u8],
+            nested: &[u8],
+        ) -> (i32, Vec<u8>) {
             let mut req = msg(MsgType::Ioctl, handle);
             push(
                 &mut req,
@@ -7225,13 +7464,9 @@ mod mapping_tests {
             req.extend_from_slice(nested);
             let mut resp = vec![0u8; 4096];
             let n = self.be.dispatch(&req, &mut resp);
-            assert_eq!(
-                read_struct::<MsgHeader>(&resp, 0).status,
-                0,
-                "escape {escape:#x}"
-            );
+            let status = read_struct::<MsgHeader>(&resp, 0).status;
             let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
-            resp[body..n].to_vec()
+            (status, resp[body.min(n)..n].to_vec())
         }
 
         /// RM_ALLOC of `class` as `handle`, with `attr` if it is memory.
@@ -7500,6 +7735,258 @@ mod mapping_tests {
         e.be.session_reset("test");
         assert_eq!(e.window.withdrawn(), vec![linear]);
         assert_eq!(e.be.shm_free_bytes(), empty);
+    }
+
+    // ------------------------------------------------------------------
+    // UPDATE_DEVICE_MAPPING_INFO, and a map that cannot finish
+    // ------------------------------------------------------------------
+
+    fn p(tgid: u32) -> crate::quota::Owner {
+        crate::quota::Owner::Proc { tgid, start_ns: 1 }
+    }
+
+    /// A guest process: its own control file, opened by it.
+    fn process(e: &mut Env, owner: crate::quota::Owner) -> u32 {
+        e.be.adopt_for_test_as(memfd(), HandleKind::Dev(DeviceKind::Ctl), owner)
+    }
+
+    impl Env {
+        /// RM_MAP_MEMORY of `mem` on control file `ctl`, armed on a file
+        /// `owner` opened: the transport status, RM's status and the window
+        /// offset the guest reads back.
+        fn map_as(&mut self, ctl: u32, owner: crate::quota::Owner, mem: u32) -> (i32, u32, u64) {
+            let fd = self
+                .be
+                .adopt_for_test_as(memfd(), HandleKind::Dev(DeviceKind::Gpu(0)), owner);
+            let mut p = vec![0u8; 56];
+            put(&mut p, 0, CLIENT);
+            put(&mut p, 4, DEVICE);
+            put(&mut p, 8, mem);
+            p[24..32].copy_from_slice(&LEN.to_le_bytes());
+            put(&mut p, 44, 0x0308_0002);
+            put(&mut p, 48, fd);
+            let (status, back) = self.call_raw(ctl, NV_ESC_RM_MAP_MEMORY, &p, &[]);
+            if status != 0 {
+                return (status, 0, 0);
+            }
+            (
+                0,
+                rd(&back, 40),
+                u64::from_le_bytes(back[32..40].try_into().unwrap()),
+            )
+        }
+
+        /// UPDATE_DEVICE_MAPPING_INFO on `ctl`: RM's status, and the pOld
+        /// and pNew the caller reads back.
+        fn update_on(&mut self, ctl: u32, mem: u32, old: u64, new: u64) -> (u32, u64, u64) {
+            let mut p = vec![0u8; 40];
+            put(&mut p, 0, CLIENT);
+            put(&mut p, 4, DEVICE);
+            put(&mut p, 8, mem);
+            p[16..24].copy_from_slice(&old.to_le_bytes());
+            p[24..32].copy_from_slice(&new.to_le_bytes());
+            let back = self.call(ctl, NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO, &p, &[]);
+            let q = |at: usize| u64::from_le_bytes(back[at..at + 8].try_into().unwrap());
+            (rd(&back, 32), q(16), q(24))
+        }
+
+        /// UNMAP_MEMORY on `ctl` by `linear`: RM's status.
+        fn unmap_on(&mut self, ctl: u32, mem: u32, linear: u64) -> u32 {
+            let mut p = vec![0u8; 32];
+            put(&mut p, 0, CLIENT);
+            put(&mut p, 4, DEVICE);
+            put(&mut p, 8, mem);
+            p[16..24].copy_from_slice(&linear.to_le_bytes());
+            let back = self.call(ctl, NV_ESC_RM_UNMAP_MEMORY, &p, &[]);
+            rd(&back, 24)
+        }
+    }
+
+    /// The Prism stall's leak: the library maps, tells RM the address it
+    /// mapped at, and unmaps by that address. The unmap used to look for a
+    /// window offset, find none, and leave the extent charged until the
+    /// memory was freed; now the zone ends exactly where it started, and so
+    /// does the host.
+    #[test]
+    fn an_unmap_by_the_address_an_update_gave_returns_the_zone_exactly() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let empty = e.be.shm_free_bytes();
+        let held = e.be.shm.held_by(crate::shm::PgprotKind::WriteCombine, p(1));
+
+        let (_, rm, off) = e.map_as(ctl, p(1), VIDMEM);
+        assert_eq!(rm, 0);
+        let va = 0x7d5c_b840_0000;
+        let (status, old, new) = e.update_on(ctl, VIDMEM, off, va);
+        assert_eq!(status, 0, "RM found the mapping by the host's address");
+        assert_eq!((old, new), (off, va), "the caller reads back its own");
+        assert_eq!(host_maps().len(), 1, "the host's mapping did not move");
+        assert_ne!(host_maps()[0].2, va, "no guest address reaches the host");
+
+        assert_eq!(e.unmap_on(ctl, VIDMEM, va), 0, "unmapped by its address");
+        assert_eq!(e.be.shm_free_bytes(), empty, "the zone is where it was");
+        assert_eq!(
+            e.be.shm.held_by(crate::shm::PgprotKind::WriteCombine, p(1)),
+            held,
+            "and so is the process's share"
+        );
+        assert_eq!(e.window.withdrawn(), vec![off]);
+        assert!(host_maps().is_empty(), "and the host holds nothing");
+        assert!(e.be.active_maps.is_empty());
+    }
+
+    /// Two mappings of one object are two entries, told apart by address:
+    /// each UPDATE moves the one it names (a second UPDATE by the address
+    /// the first gave), and each unmap releases its own.
+    #[test]
+    fn two_mappings_of_one_object_are_told_apart_by_address() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let empty = e.be.shm_free_bytes();
+        let (_, _, a) = e.map_as(ctl, p(1), VIDMEM);
+        let (_, _, b) = e.map_as(ctl, p(1), VIDMEM);
+        let (host_a, host_b) = (host_maps()[0].2, host_maps()[1].2);
+        let (va, vb) = (0x7f00_aaaa_0000, 0x7f00_bbbb_0000);
+
+        // The second first: by object alone, the first would have moved.
+        assert_eq!(e.update_on(ctl, VIDMEM, b, vb).0, 0);
+        assert_eq!(e.update_on(ctl, VIDMEM, a, va).0, 0);
+        // The library moves one again (mremap): by the address it gave.
+        let va2 = 0x7f00_cccc_0000;
+        assert_eq!(e.update_on(ctl, VIDMEM, va, va2).0, 0);
+        // An address that is neither, with two to choose from: no guess.
+        assert_eq!(
+            e.update_on(ctl, VIDMEM, 0x1234_5000, 0x7f00_dddd_0000).0,
+            NOT_FOUND
+        );
+
+        assert_eq!(e.unmap_on(ctl, VIDMEM, vb), 0);
+        assert_eq!(e.window.withdrawn(), vec![b], "b's own extent");
+        assert_eq!(
+            host_maps(),
+            vec![(CLIENT, VIDMEM, host_a)],
+            "b's own host mapping"
+        );
+        assert_ne!(host_a, host_b);
+        assert_eq!(e.unmap_on(ctl, VIDMEM, va), NOT_FOUND, "moved on from va");
+        assert_eq!(e.unmap_on(ctl, VIDMEM, va2), 0);
+        assert_eq!(e.window.withdrawn(), vec![b, a]);
+        assert_eq!(e.be.shm_free_bytes(), empty);
+        assert!(host_maps().is_empty());
+    }
+
+    /// One process's virtual addresses are its own: another process that
+    /// quotes one -- the same object, the same address -- finds nothing,
+    /// neither to move nor to unmap, as RM finds only the calling process's
+    /// mappings (serverutilMappingFilterCurrentUserProc). The owner's own
+    /// calls are unaffected.
+    #[test]
+    fn another_processes_address_names_nothing() {
+        let mut e = env();
+        let mine = process(&mut e, p(1));
+        let theirs = process(&mut e, p(2));
+        let (_, _, off) = e.map_as(mine, p(1), VIDMEM);
+        let va = 0x7f00_1000_0000;
+        assert_eq!(e.update_on(mine, VIDMEM, off, va).0, 0);
+        let before = e.be.shm_free_bytes();
+
+        assert_eq!(
+            e.update_on(theirs, VIDMEM, va, 0x7f00_2000_0000).0,
+            NOT_FOUND
+        );
+        assert_eq!(
+            e.update_on(theirs, VIDMEM, off, 0x7f00_2000_0000).0,
+            NOT_FOUND
+        );
+        assert_eq!(e.unmap_on(theirs, VIDMEM, va), NOT_FOUND);
+        assert_eq!(e.unmap_on(theirs, VIDMEM, off), NOT_FOUND);
+        assert_eq!(
+            e.be.shm_free_bytes(),
+            before,
+            "nothing of mine was released"
+        );
+        assert_eq!(host_maps().len(), 1);
+
+        assert_eq!(e.unmap_on(mine, VIDMEM, va), 0);
+        assert!(host_maps().is_empty());
+    }
+
+    /// A process at its share of the zone is refused before RM is asked:
+    /// no host mapping is made, and nothing more is charged. It used to be
+    /// refused after, and each refusal left a host mapping behind.
+    #[test]
+    fn a_refused_extent_leaves_no_host_mapping_and_no_charge() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        // for_test's write-combining zone is four pages: half is two.
+        for _ in 0..2 {
+            assert_eq!(e.map_as(ctl, p(1), VIDMEM).1, 0);
+        }
+        let (free, held) = (
+            e.be.shm_free_bytes(),
+            e.be.shm.held_by(crate::shm::PgprotKind::WriteCombine, p(1)),
+        );
+        assert_eq!(held, 2 * LEN);
+
+        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
+        assert_ne!(status, 0, "refused");
+        assert_eq!(host_maps().len(), 2, "RM was never asked");
+        assert_eq!(e.be.shm_free_bytes(), free);
+        assert_eq!(
+            e.be.shm.held_by(crate::shm::PgprotKind::WriteCombine, p(1)),
+            held
+        );
+        // Another process still maps.
+        let other = process(&mut e, p(2));
+        assert_eq!(e.map_as(other, p(2), VIDMEM).1, 0);
+    }
+
+    /// RM maps with another type than expected: the reservation moves to
+    /// that type's zone, and where that zone is full, the host's mapping is
+    /// undone and nothing of the call is left.
+    #[test]
+    fn a_mapping_rm_types_otherwise_moves_zone_or_is_undone() {
+        let mut e = env();
+        let ctl = process(&mut e, crate::quota::Owner::Unknown);
+        let unknown = crate::quota::Owner::Unknown;
+        let (_, wc0, _) = e.be.shm_free_bytes();
+        // for_test's uncached zone is two pages.
+        for _ in 0..2 {
+            let (_, rm, off) = e.map_as(ctl, unknown, UCVID);
+            assert_eq!(rm, 0);
+            assert!(
+                off < 2 * LEN,
+                "placed uncached, as RM mapped it, at {off:#x}"
+            );
+        }
+        assert_eq!(e.be.shm_free_bytes().1, wc0, "no write-combining kept");
+        let placed = e.window.0.lock().unwrap().len();
+
+        let (status, _, _) = e.map_as(ctl, unknown, UCVID);
+        assert_ne!(status, 0, "no uncached extent left");
+        assert_eq!(host_maps().len(), 2, "the third host mapping was undone");
+        assert_eq!(e.be.shm_free_bytes().1, wc0, "the reservation went back");
+        assert_eq!(e.window.0.lock().unwrap().len(), placed, "nothing placed");
+    }
+
+    /// A placement the VMM refuses undoes the host's mapping and the
+    /// extent both.
+    #[test]
+    fn a_refused_placement_undoes_the_host_mapping_and_the_extent() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let empty = e.be.shm_free_bytes();
+        PLACE_FAILS.with(|f| f.set(true));
+        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
+        PLACE_FAILS.with(|f| f.set(false));
+        assert_ne!(status, 0);
+        assert!(host_maps().is_empty(), "the host's mapping was undone");
+        assert_eq!(e.be.shm_free_bytes(), empty);
+        assert_eq!(
+            e.be.shm.held_by(crate::shm::PgprotKind::WriteCombine, p(1)),
+            0
+        );
+        assert!(e.be.active_maps.is_empty());
     }
 }
 
