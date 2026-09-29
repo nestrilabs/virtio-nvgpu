@@ -218,12 +218,13 @@ memory"), and nothing short of mapping it writable up front, which KVM
 offers no call for, would change that.
 
 **3. A reply interrupt per round trip** (fixed). A guest caller spins up to
-20 µs for its reply (§20), but each reply still came as an interrupt: the
-host signalled an eventfd, KVM injected, the guest's handler took the reply
-off the ring. Now the spinning callers take replies off the ring themselves
-with the control queue's interrupt off while any of them spins (the last one
-out turns it back on). An RM control from a guest: 4.7 -> 3.7 µs; a mailbox
-Vulkan client: +17-21%.
+20 µs for its reply (DEPLOY.md, "Frame pacing"), but each reply still came
+as an interrupt: the host signalled an eventfd, KVM injected, the guest's
+handler took the reply off the ring. Now, while callers spin and none sleeps,
+the spinners take replies off the ring themselves with the control queue's
+interrupt off; a caller that sleeps turns it back on first (SECURITY.md §21).
+Three runs each, the same backend: an RM control from a guest 4.7 -> 3.4 µs,
+a mailbox Vulkan client +30%.
 
 **4. Copies of every `wl_shm` frame** (fewer). A committed 1080p
 shared-memory buffer was copied seven times on its way to the host

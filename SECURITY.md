@@ -2755,17 +2755,18 @@ packed with one copy of its records instead of two. The bytes on the wire
 are unchanged, the backend parses every record as before, and nothing of
 the change is on the host's side of a check.
 
-**The guest's reply polling** (`driver/nvgpu_xfer.c`). While a caller spins
-for its reply (`rt_spin_us`, §20), the control queue's interrupt is off
-and the spinning callers take replies off the ring themselves; the last to
-stop spinning turns the interrupt back on and takes what arrived
-meanwhile. Guest-internal: the host sees fewer interrupts to deliver and
+**The guest's reply polling** (`driver/nvgpu_xfer.c`). While callers spin
+for their replies (`rt_spin_us`, §20) and none sleeps for one, the control
+queue's interrupt is off and the spinning callers take replies off the ring
+themselves. Guest-internal: the host sees fewer interrupts to deliver and
 nothing else. Every ring operation stays under the transport's lock, as the
-interrupt handler's always was; a caller that sleeps -- an executor-class
-request, or one that spun out -- is woken by the next spinner or by the
-interrupt, never by neither (the virtio core's `enable_cb` reports replies
-that arrived while it was off); and once the transport is dead (a reset, a
-removal) nothing here touches the queue.
+interrupt handler's always was. A caller about to sleep for its reply -- an
+executor-class request, or one that spun out -- turns the interrupt back on
+first and takes whatever arrived while it was off (the virtio core's
+`enable_cb` reports it), and no spinner turns it off while anyone sleeps: a
+sleeper is woken by the interrupt, never by a spinner, so a spinner whose
+vCPU the host deschedules delays only itself. Once the transport is dead (a
+reset, a removal) nothing here touches the queue.
 
 **Prefaulting the window** (nesbox `virtio-nvgpu-v5`, crosvm
 `patches/crosvm/0010`). A guest's first touch of each page placed in the

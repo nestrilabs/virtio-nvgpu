@@ -158,10 +158,12 @@ struct nvgpu_xfer {
   unsigned int vring_size;
   unsigned int max_sg; /* per direction */
 
-  /* Callers spinning for a reply (under `lock`): while there are any, the
-   * control queue's interrupt is off and they take replies off the ring
+  /* Callers spinning for a reply, and callers asleep waiting for one (both
+   * under `lock`): while there are spinners and no sleepers, the control
+   * queue's interrupt is off and the spinners take replies off the ring
    * themselves (nvgpu_ctrl_poll_enter()). */
   unsigned int pollers;
+  unsigned int sleepers;
 
   /* Ring slots executor-class requests may hold between them. */
   atomic_t exec_avail;
@@ -598,13 +600,17 @@ void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
 
 /*
  * A caller spinning for its reply takes replies off the ring itself, and
- * while any caller spins the control queue's interrupt is off. A reply then
- * costs the host no eventfd signal and this guest no interrupt -- about a
- * microsecond of the three or four a round trip takes -- and the caller sees
- * it as soon as the device writes it. The last caller to stop spinning turns
- * the interrupt back on and takes whatever arrived meanwhile, so a caller
- * that sleeps (an executor-class request, or one that spun out) is still
- * woken, by the next spinner or by the interrupt.
+ * while callers spin and none sleeps the control queue's interrupt is off. A
+ * reply then costs the host no eventfd signal and this guest no interrupt --
+ * about a microsecond of the three or four a round trip takes -- and the
+ * caller sees it as soon as the device writes it.
+ *
+ * A caller that sleeps for its reply (an executor-class request, or one that
+ * spun out) never depends on a spinner: it turns the interrupt back on
+ * before it sleeps (nvgpu_ctrl_sleep_enter()), and no spinner turns it off
+ * while it sleeps. A spinner whose vCPU the host deschedules, or that this
+ * kernel preempts, delays only itself. The last spinner out turns the
+ * interrupt back on and takes whatever arrived meanwhile.
  */
 static void nvgpu_ctrl_poll_enter(struct nvgpu_device *dev) {
   struct nvgpu_xfer *xf = dev->xfer;
@@ -613,7 +619,7 @@ static void nvgpu_ctrl_poll_enter(struct nvgpu_device *dev) {
   spin_lock_irqsave(&xf->lock, flags);
   /* A dead transport's queue is being taken apart (nvgpu_xfer_reclaim()
    * sets `dead` under this lock first): nothing here touches it then. */
-  if (!xf->pollers++ && !xf->dead)
+  if (!xf->pollers++ && !xf->sleepers && !xf->dead)
     virtqueue_disable_cb(dev->ctrl_vq);
   spin_unlock_irqrestore(&xf->lock, flags);
 }
@@ -630,6 +636,34 @@ static void nvgpu_ctrl_poll(struct nvgpu_device *dev) {
   units = xf->dead ? 0 : nvgpu_ctrl_harvest(xf, dev->ctrl_vq, &freed);
   spin_unlock_irqrestore(&xf->lock, flags);
   nvgpu_ctrl_harvested(xf, units, freed);
+}
+
+/*
+ * About to sleep for a reply: the interrupt must be on, and anything that
+ * arrived while it was off is taken now (enable_cb says so by returning
+ * false), so the reply is the interrupt's to deliver whatever spinners do.
+ */
+static void nvgpu_ctrl_sleep_enter(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+  bool freed = false;
+  u32 units = 0;
+
+  spin_lock_irqsave(&xf->lock, flags);
+  if (!xf->sleepers++ && xf->pollers && !xf->dead &&
+      !virtqueue_enable_cb(dev->ctrl_vq))
+    units = nvgpu_ctrl_harvest(xf, dev->ctrl_vq, &freed);
+  spin_unlock_irqrestore(&xf->lock, flags);
+  nvgpu_ctrl_harvested(xf, units, freed);
+}
+
+static void nvgpu_ctrl_sleep_exit(struct nvgpu_device *dev) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long flags;
+
+  spin_lock_irqsave(&xf->lock, flags);
+  xf->sleepers--;
+  spin_unlock_irqrestore(&xf->lock, flags);
 }
 
 static void nvgpu_ctrl_poll_exit(struct nvgpu_device *dev) {
@@ -664,7 +698,7 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   u64 t0 = 0;
   u32 units = 0, id;
   long wret;
-  bool kick = false;
+  bool kick = false, asleep;
   int ret;
 
   if (sent)
@@ -807,9 +841,15 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
     }
   }
 
+  /* Already answered (usually, after a spin): no sleep to arrange. */
+  asleep = !completion_done(&r->done);
+  if (asleep)
+    nvgpu_ctrl_sleep_enter(dev);
   wret = wait_for_completion_killable_timeout(
       &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
                                             : NVGPU_INLINE_TIMEOUT);
+  if (asleep)
+    nvgpu_ctrl_sleep_exit(dev);
   if (wret <= 0) {
     spin_lock_irqsave(&xf->lock, irqf);
     if (!r->completed) {
