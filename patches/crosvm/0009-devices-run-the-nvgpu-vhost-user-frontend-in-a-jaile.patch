@@ -1,7 +1,7 @@
-From ab7942b0e89f974fc4b2641de35b6c6849a3a033 Mon Sep 17 00:00:00 2001
+From 236cbfd82db65338dbe203cda58e17fa7df5810a Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
-Subject: [PATCH 9/9] devices: run the nvgpu vhost-user frontend in a jailed
+Subject: [PATCH] devices: run the nvgpu vhost-user frontend in a jailed
  process
 
 A vhost-user frontend runs in crosvm's main process: the virtqueues are the
@@ -901,10 +901,10 @@ index 169d38e..9e2cb5a 100644
      pub fn execute(
          &self,
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
-index ebc7a3f..493392a 100644
+index 1b0c27b..3b3315b 100644
 --- a/vm_control/src/sys/linux/nvgpu.rs
 +++ b/vm_control/src/sys/linux/nvgpu.rs
-@@ -2156,6 +2156,29 @@ mod tests {
+@@ -2157,6 +2157,29 @@ mod tests {
          );
      }
  

@@ -1,7 +1,7 @@
-From 46c8c2267e4fe008c858aab8040e0eddc67c7656 Mon Sep 17 00:00:00 2001
+From 09a6d6b307bdbfbf7fc2b118cecef75388dfaa7d Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
-Subject: [PATCH 7/9] vm_control: hold virtio-nvgpu's memory tubes, and map UVM
+Subject: [PATCH] vm_control: hold virtio-nvgpu's memory tubes, and map UVM
  pools
 
 virtio-nvgpu's memory requests reach the main process over its two
@@ -61,8 +61,8 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
  vm_control/src/lib.rs              |   60 +
  vm_control/src/nvgpu.rs            |   26 +
  vm_control/src/sys/linux.rs        |   23 +-
- vm_control/src/sys/linux/nvgpu.rs  | 2206 ++++++++++++++++++++++++++++
- 6 files changed, 2354 insertions(+), 1 deletion(-)
+ vm_control/src/sys/linux/nvgpu.rs  | 2207 ++++++++++++++++++++++++++++
+ 6 files changed, 2355 insertions(+), 1 deletion(-)
  create mode 100644 vm_control/src/nvgpu.rs
  create mode 100644 vm_control/src/sys/linux/nvgpu.rs
 
@@ -301,10 +301,10 @@ index c3594f3..4992ece 100644
              };
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
 new file mode 100644
-index 0000000..ebc7a3f
+index 0000000..1b0c27b
 --- /dev/null
 +++ b/vm_control/src/sys/linux/nvgpu.rs
-@@ -0,0 +1,2206 @@
+@@ -0,0 +1,2207 @@
 +// Copyright 2026 The ChromiumOS Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -355,8 +355,8 @@ index 0000000..ebc7a3f
 +use std::os::unix::fs::MetadataExt;
 +use std::sync::Mutex;
 +
++use base::debug;
 +use base::error;
-+use base::info;
 +use base::warn;
 +use base::AsRawDescriptor;
 +use base::MappedRegion;
@@ -1552,7 +1552,8 @@ index 0000000..ebc7a3f
 +            },
 +        );
 +        self.pool_bytes += size;
-+        info!(
++        // Debug, not info: a guest makes and drops pools as often as it makes CUDA contexts.
++        debug!(
 +            "nvgpu uvm: {:#x}+{:#x} at aperture offset {:#x} (guest {:#x})",
 +            host_address, size, offset, gpa
 +        );
@@ -1571,7 +1572,7 @@ index 0000000..ebc7a3f
 +                drop(region);
 +                self.pools.remove(&offset);
 +                self.pool_bytes -= pool.len;
-+                info!(
++                debug!(
 +                    "nvgpu uvm: dropped {:#x}+{:#x} at aperture offset {:#x}",
 +                    pool.host_address, pool.len, offset
 +                );
