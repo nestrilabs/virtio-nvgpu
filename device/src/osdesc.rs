@@ -2806,6 +2806,41 @@ mod backend_tests {
         assert_eq!(reap(&mut vm.be, 0).1.len(), 1);
     }
 
+    /// A registration whose reply would not fit what the guest posted is
+    /// refused before RM is asked, not after RM has pinned the pages
+    /// (review 2026-09-29 1.16).
+    #[test]
+    fn a_registration_with_no_room_for_its_reply_never_reaches_rm() {
+        let mut vm = vm();
+        let gpu = vm.gpu;
+        let mut body = Vec::new();
+        let outer = os02(GUEST_VA, PAGE, 7);
+        let l = list(OSDESC_F_WRITE, &[(LOW + 5 * PAGE, 1)]);
+        for v in [
+            ALLOC_MEMORY,
+            outer.len() as u32,
+            0,
+            0,
+            DEEP_PAGE_LIST,
+            l.len() as u32,
+        ] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&outer);
+        body.extend_from_slice(&l);
+        let mut req = Vec::new();
+        for v in [MsgType::Ioctl as u32, gpu, 0, 0x55] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req.extend_from_slice(&body);
+        // Room for the struct, not for the registration's id.
+        let mut resp = vec![0u8; size_of::<MsgHeader>() + size_of::<IoctlResp>() + 56 + 4];
+        vm.be.dispatch(&req, &mut resp);
+        assert_eq!(status(&resp), -libc::ENOSPC);
+        assert!(seen().is_empty(), "RM was never asked");
+        assert_eq!(vm.be.osdesc.live(), 0);
+    }
+
     /// Scattered pages across both regions, from an address inside its
     /// first page: RM is handed a range of the backend's own that maps those
     /// pages in list order, at the caller's offset, and reads the guest's

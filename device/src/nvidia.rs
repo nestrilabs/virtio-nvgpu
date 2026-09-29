@@ -2746,6 +2746,25 @@ impl NvidiaBackend {
             }
         }
 
+        // Room for the answer, before anything is asked of the host: a
+        // success comes back with at least the top-level struct and nested
+        // block (and a registration's 8-byte id), and one that did not fit
+        // was answered ENOSPC after RM had acted -- for a registration, with
+        // the pages pinned by RM and the guest unpinning them on the error
+        // (review 2026-09-29 1.16).
+        let least = size_of::<MsgHeader>()
+            + size_of::<IoctlResp>()
+            + nested_end
+            + if listed { 8 } else { 0 };
+        if resp_buf.len() < least {
+            log::warn!(
+                "ioctl cmd={:#x}: a reply of at least {least} bytes does not fit the {} posted",
+                ireq.cmd,
+                resp_buf.len()
+            );
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
+        }
+
         // How much of the response is the top-level struct. The driver copies
         // exactly this much back to userspace and reads any nested block after
         // it, so a wrong split corrupts one or the other.
