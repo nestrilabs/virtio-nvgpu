@@ -13,7 +13,9 @@ use std::sync::Arc;
 use crate::error::{DeviceError, Result};
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
+use crate::le;
 use crate::nvkms::{self, NvkmsPolicy};
+use crate::nvos::{self, *};
 use crate::policy::BackendHooks;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
@@ -35,18 +37,6 @@ const MAX_GPU: u8 = 8;
 /// cost of it being wrong must not be heap corruption in this process.
 const DEEP_BUF_FLOOR: usize = 64 * 1024;
 
-// Field offsets in NVOS54_PARAMETERS, the struct RM_CONTROL carries.
-//
-// `status` is the one that matters and the one that is easy to miss: it is
-// written by RM on the way out and is independent of the ioctl return value.
-const NVOS54_CMD: usize = 8;
-const NVOS54_PARAMS_SIZE: usize = 24;
-const NVOS54_STATUS: usize = 28;
-const NVOS54_TOTAL: usize = 32;
-
-/// `NV_OK`. Every other value is a refusal of some kind.
-const NV_OK: u32 = 0;
-
 /// The key at `key_at` of an RM reply's parameter block (`resp_buf[..n]`,
 /// header first) when the transport answered and RM's status word at
 /// `status_at` is NV_OK.
@@ -56,8 +46,7 @@ fn rm_served(resp_buf: &[u8], n: usize, key_at: usize, status_at: usize) -> Opti
         return None;
     }
     let p = resp_buf.get(body..n)?;
-    let word = |at: usize| Some(u32::from_le_bytes(p.get(at..at + 4)?.try_into().ok()?));
-    (word(status_at)? == NV_OK).then_some(word(key_at)?)
+    (le::u32_at(p, status_at)? == NV_OK).then_some(le::u32_at(p, key_at)?)
 }
 
 /// The host path an `Open` refers to, resolving a render node through the DRI
@@ -136,12 +125,6 @@ impl Status {
         }
     }
 }
-
-/// RM's own statuses for a refusal the backend makes in the status field,
-/// the ioctl itself succeeding (nvstatuscodes.h).
-pub(crate) const NV_ERR_NO_MEMORY: u32 = 0x51;
-pub(crate) const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
-pub(crate) const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
 
 /// A DRM render node the host owns, as the guest is told about it.
 #[derive(Clone, Debug)]
@@ -2945,7 +2928,7 @@ impl NvidiaBackend {
                             libc::ENOMEM => NV_ERR_NO_MEMORY,
                             _ => NV_ERR_INVALID_ARGUMENT,
                         };
-                        let out = crate::rmshare::refusal(params, params.len() - 8, status);
+                        let out = nvos::with_status(params, params.len() - 8, status);
                         return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
@@ -3174,7 +3157,7 @@ impl NvidiaBackend {
                         self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno)
                     }
                     crate::rmallow::Refusal::Status { at, status } => {
-                        let mut out = crate::rmshare::refusal(sent, at, status);
+                        let mut out = nvos::with_status(sent, at, status);
                         let deep = &body[nested_end..want];
                         out.extend_from_slice(deep);
                         self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len())
@@ -3242,7 +3225,7 @@ impl NvidiaBackend {
                 }
                 Err(crate::rmshare::Refuse::Status(status)) => {
                     let at = crate::rmshare::status_at(escape).unwrap_or(0);
-                    let mut out = crate::rmshare::refusal(sent, at, status);
+                    let mut out = nvos::with_status(sent, at, status);
                     let deep = &body[nested_end..want];
                     out.extend_from_slice(deep);
                     return self.write_ioctl_resp_deep(resp_buf, cookie, &out, deep.len());
@@ -3335,11 +3318,10 @@ impl NvidiaBackend {
                     deep_segs,
                 );
                 // Counted here rather than in the forwarder, which holds only a
-                // shared borrow. NVOS54: hClient, hObject, cmd at byte 8.
-                // Only what RM served: the key is the guest's u32, and a count
-                // of what RM turned down is noise an allowlist is not written
-                // from (S-17).
-                if let Some(cmd) = rm_served(resp_buf, n, 8, NVOS54_STATUS) {
+                // shared borrow. Only what RM served: the key is the guest's
+                // u32, and a count of what RM turned down is noise an
+                // allowlist is not written from (S-17).
+                if let Some(cmd) = rm_served(resp_buf, n, NVOS54_CMD, NVOS54_STATUS) {
                     self.rm_controls.add(cmd);
                 }
                 n
@@ -3353,9 +3335,8 @@ impl NvidiaBackend {
                     cookie, host_fd, request, param_in, &plan, resp_buf, 48, 16, 32, deep_in, None,
                     None,
                 );
-                // NVOS64: hRoot, hObjectParent, hObjectNew, hClass at byte 12,
-                // status at 40. As for controls, only what RM made.
-                if let Some(class) = rm_served(resp_buf, n, 12, 40) {
+                // As for controls, only what RM made.
+                if let Some(class) = rm_served(resp_buf, n, NVOS64_H_CLASS, NVOS64_STATUS) {
                     self.rm_classes.add(class);
                 }
                 // A client made here is one 0x54 may name (semsurf.rs).
@@ -3861,7 +3842,7 @@ impl NvidiaBackend {
         // caller believes the status, not the rc. Counting non-zero rc told
         // us every call succeeded while the ICD was reading refusals.
         let outer = a.bytes(top);
-        if escape == 0x2a && outer_size >= NVOS54_TOTAL {
+        if escape == 0x2a && outer_size >= NVOS54_SIZE {
             let cmd = word(outer, NVOS54_CMD);
             let params_size = word(outer, NVOS54_PARAMS_SIZE);
             let status = word(outer, NVOS54_STATUS);
@@ -3958,9 +3939,9 @@ impl NvidiaBackend {
                     .is_err()
                 {
                     return Err(Refused::Budget(match call.shape {
-                        Shape::AllocMemory => od::OS02_STATUS,
-                        Shape::VidHeap => od::OS32_STATUS,
-                        Shape::RmAlloc => od::OS64_STATUS,
+                        Shape::AllocMemory => NVOS02_STATUS,
+                        Shape::VidHeap => NVOS32_STATUS,
+                        Shape::RmAlloc => NVOS64_STATUS,
                     }));
                 }
                 let pinned = resolved
@@ -3971,7 +3952,7 @@ impl NvidiaBackend {
         let (call, pinned) = match prepared {
             Ok(p) => p,
             Err(Refused::Budget(at)) => {
-                let out = crate::rmshare::refusal(param_in, at, NV_ERR_NO_MEMORY);
+                let out = nvos::with_status(param_in, at, NV_ERR_NO_MEMORY);
                 return self.write_ioctl_resp(resp_buf, cookie, &out);
             }
             Err(Refused::Errno(e)) => {
@@ -3998,29 +3979,45 @@ impl NvidiaBackend {
             let top = a.block(outer, ioctl_arg_len(request, outer.len()))?;
             match call.shape {
                 Shape::AllocMemory => {
-                    a.ptr(top, od::OS02_MEMORY)?;
-                    a.point_span(top, od::OS02_MEMORY, &pinned.span, pinned.at)?;
+                    a.ptr(top, NVOS02_P_MEMORY)?;
+                    a.point_span(top, NVOS02_P_MEMORY, &pinned.span, pinned.at)?;
                     // RM reads the descriptor only to arm a mapping of
                     // NV01_MEMORY_SYSTEM (escape.c:415-431); a guest number
                     // goes no further than here.
-                    a.fd(top, od::OS02_FD, 4)?;
-                    a.set_no_fd(top, od::OS02_FD, -1)?;
-                    Ok((top, None, od::OS02_STATUS, od::OS02_NEW))
+                    a.fd(top, NVOS02_WITH_FD_FD, 4)?;
+                    a.set_no_fd(top, NVOS02_WITH_FD_FD, -1)?;
+                    Ok((top, None, NVOS02_STATUS, NVOS02_H_OBJECT_NEW))
                 }
                 Shape::VidHeap => {
-                    a.ptr(top, od::OS32_DESCRIPTOR)?;
-                    a.point_span(top, od::OS32_DESCRIPTOR, &pinned.span, pinned.at)?;
-                    Ok((top, None, od::OS32_STATUS, od::OS32_HMEMORY))
+                    a.ptr(top, NVOS32_ALLOC_OS_DESC_DESCRIPTOR)?;
+                    a.point_span(
+                        top,
+                        NVOS32_ALLOC_OS_DESC_DESCRIPTOR,
+                        &pinned.span,
+                        pinned.at,
+                    )?;
+                    Ok((top, None, NVOS32_STATUS, NVOS32_ALLOC_OS_DESC_H_MEMORY))
                 }
                 Shape::RmAlloc => {
                     let n = a.block(nested, nested.len())?;
-                    a.ptr(n, od::OSD_DESCRIPTOR)?;
-                    a.point_span(n, od::OSD_DESCRIPTOR, &pinned.span, pinned.at)?;
-                    a.slot(top, od::OS64_PARAMS, 8, SlotKind::Ptr, Restore::Yes)?;
-                    a.point(top, od::OS64_PARAMS, n)?;
+                    a.ptr(n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR)?;
+                    a.point_span(
+                        n,
+                        NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR,
+                        &pinned.span,
+                        pinned.at,
+                    )?;
+                    a.slot(top, NVOS64_P_ALLOC_PARMS, 8, SlotKind::Ptr, Restore::Yes)?;
+                    a.point(top, NVOS64_P_ALLOC_PARMS, n)?;
                     // As guestptr::rm_escape: RM grants the default rights.
-                    a.slot(top, od::OS64_RIGHTS, 8, SlotKind::Ptr, Restore::Yes)?;
-                    Ok((top, Some(n), od::OS64_STATUS, od::OS64_NEW))
+                    a.slot(
+                        top,
+                        NVOS64_P_RIGHTS_REQUESTED,
+                        8,
+                        SlotKind::Ptr,
+                        Restore::Yes,
+                    )?;
+                    Ok((top, Some(n), NVOS64_STATUS, NVOS64_H_OBJECT_NEW))
                 }
             }
         })();
@@ -4043,10 +4040,10 @@ impl NvidiaBackend {
         drop(a);
         self.rmmem.after(rm_pending, &mut out);
 
-        let rd = |o: usize| u32::from_le_bytes(out[o..o + 4].try_into().unwrap());
-        let status = rd(status_at);
-        let deep = if status == 0 {
-            let object = rd(handle_at);
+        // Both inside the block the host was handed, whose size the escape's
+        // number fixes (`ioctl_arg_len`).
+        let status = le::u32_at(&out, status_at);
+        let deep = if let (Some(NV_OK), Some(object)) = (status, le::u32_at(&out, handle_at)) {
             let id = self.osdesc.add(
                 self.current_handle,
                 call.client,
@@ -4061,13 +4058,13 @@ impl NvidiaBackend {
                 object
             );
             if call.shape == Shape::RmAlloc {
-                self.rm_classes.add(od::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+                self.rm_classes.add(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
             }
             out.extend_from_slice(&id.to_le_bytes());
             8
         } else {
             // Nothing made, nothing pinned by RM: the range goes now.
-            log::debug!("OS descriptor {cmd:#x}: RM answered {status:#x}; nothing registered");
+            log::debug!("OS descriptor {cmd:#x}: RM answered {status:#x?}; nothing registered");
             drop(pinned);
             0
         };
@@ -4082,42 +4079,50 @@ impl NvidiaBackend {
         if self.osdesc.live() == 0 {
             return;
         }
-        let r = |o: usize| {
-            reply
-                .get(o..o + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        };
+        let r = |o: usize| le::u32_at(reply, o);
+        // NVOS64 and NVOS02 alike: hRoot, hObjectParent, hObjectNew, hClass,
+        // ..., status.
+        const _: () = assert!(
+            NVOS64_H_ROOT == NVOS02_H_ROOT
+                && NVOS64_H_OBJECT_PARENT == NVOS02_H_OBJECT_PARENT
+                && NVOS64_H_OBJECT_NEW == NVOS02_H_OBJECT_NEW
+                && NVOS64_H_CLASS == NVOS02_H_CLASS
+                && NVOS64_STATUS == NVOS02_STATUS
+        );
         match escape {
-            // NVOS00: hRoot, hObjectParent, hObjectOld, status.
-            NV_ESC_RM_FREE if r(12) == Some(0) => {
-                if let (Some(c), Some(o)) = (r(0), r(8)) {
+            NV_ESC_RM_FREE if r(NVOS00_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(o)) = (r(NVOS00_H_ROOT), r(NVOS00_H_OBJECT_OLD)) {
                     self.osdesc.freed(c, o);
                 }
             }
-            // NVOS55: hClient, hParent, hObject, hClientSrc, hObjectSrc,
-            // flags, status.
-            NV_ESC_RM_DUP_OBJECT if r(24) == Some(0) => {
-                if let (Some(c), Some(p), Some(o), Some(sc), Some(so)) =
-                    (r(0), r(4), r(8), r(12), r(16))
-                {
+            NV_ESC_RM_DUP_OBJECT if r(NVOS55_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(p), Some(o), Some(sc), Some(so)) = (
+                    r(NVOS55_H_CLIENT),
+                    r(NVOS55_H_PARENT),
+                    r(NVOS55_H_OBJECT),
+                    r(NVOS55_H_CLIENT_SRC),
+                    r(NVOS55_H_OBJECT_SRC),
+                ) {
                     self.osdesc.duplicated(sc, so, c, o, p);
                 }
             }
-            // NVOS54: hClient, hObject, cmd, ..., status at 28, the
-            // parameters from 32. A semaphore surface holding registered
-            // memory hands the caller duplicates of it (osdesc.rs,
-            // `SEMSURF_REF_MEMORY`): each holds it too.
+            // The parameters follow the NVOS54. A semaphore surface holding
+            // registered memory hands the caller duplicates of it
+            // (osdesc.rs, `SEMSURF_REF_MEMORY`): each holds it too.
             NV_ESC_RM_CONTROL
-                if r(28) == Some(0) && r(8) == Some(crate::osdesc::SEMSURF_REF_MEMORY) =>
+                if r(NVOS54_STATUS) == Some(NV_OK)
+                    && r(NVOS54_CMD) == Some(crate::osdesc::SEMSURF_REF_MEMORY) =>
             {
-                if let (Some(c), Some(o)) = (r(0), r(4))
+                if let (Some(c), Some(o)) = (r(NVOS54_H_CLIENT), r(NVOS54_H_OBJECT))
                     && self.osdesc.holds(c, o)
                 {
-                    let out: Vec<u32> = [32, 36].iter().filter_map(|&at| r(at)).collect();
+                    let out: Vec<u32> = [0, 4]
+                        .iter()
+                        .filter_map(|&at| r(NVOS54_SIZE + at))
+                        .collect();
                     self.osdesc.referenced(c, o, &out);
                 }
             }
-            // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
             // A zero hObjectNew is no handle: RM made the object under one it
             // generated and, through ALLOC_MEMORY, never wrote back.
             //
@@ -4126,23 +4131,26 @@ impl NvidiaBackend {
             // made, and forgetting `(c, o)` would release a registration RM
             // still pins (review 2026-09-29 1.3).
             NV_ESC_RM_ALLOC
-                if r(40) == Some(0)
-                    && r(12).is_some_and(|c| crate::semsurf::ROOT_CLASSES.contains(&c)) => {}
-            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
-                if let (Some(c), Some(p), Some(o)) = (r(0), r(4), r(8))
-                    && o != 0
+                if r(NVOS64_STATUS) == Some(NV_OK)
+                    && r(NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c)) => {}
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(NVOS64_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(p), Some(o)) = (
+                    r(NVOS64_H_ROOT),
+                    r(NVOS64_H_OBJECT_PARENT),
+                    r(NVOS64_H_OBJECT_NEW),
+                ) && o != 0
                 {
                     self.osdesc.reused(c, o);
                     // An object RM keeps a duplicate of registered memory
                     // for, in a client of its own (osdesc.rs,
-                    // `holding_fields`): the class parameters follow
-                    // NVOS64's 48 bytes.
+                    // `holding_fields`): the class parameters follow the
+                    // NVOS64.
                     if escape == NV_ESC_RM_ALLOC
-                        && let Some(class) = r(12)
+                        && let Some(class) = r(NVOS64_H_CLASS)
                     {
                         let named: Vec<u32> = crate::osdesc::holding_fields(class)
                             .iter()
-                            .filter_map(|&off| r(48 + off))
+                            .filter_map(|&off| r(NVOS64_SIZE + off))
                             .collect();
                         if !named.is_empty() {
                             self.osdesc.made_over(c, o, p, &named);
@@ -4169,7 +4177,7 @@ impl NvidiaBackend {
         if ending.is_empty() {
             return;
         }
-        let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, 16);
+        let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, NVOS00_SIZE as u32);
         // Only a client RM says it freed is forgotten. One it would not free
         // (on another file, or a failed call) may still hold the pages, and
         // the guest must not be told it may unpin them: its registrations
@@ -4177,18 +4185,19 @@ impl NvidiaBackend {
         // session -- never early.
         let mut freed = Vec::with_capacity(ending.len());
         for &c in &ending {
-            // NVOS00: the client names itself.
-            let mut p = [0u8; 16];
-            p[0..4].copy_from_slice(&c.to_le_bytes());
-            p[8..12].copy_from_slice(&c.to_le_bytes());
+            // The client names itself.
+            let mut p = [0u8; NVOS00_SIZE];
+            for at in [NVOS00_H_ROOT, NVOS00_H_OBJECT_OLD] {
+                le::put_u32(&mut p, at, c).expect("in the block");
+            }
             let mut a = Arena::new();
             let top = a.small(&p);
             let rc = match self.host_call(&mut a, host_fd, request, top) {
                 Ok(r) => r,
                 Err(e) => -e,
             };
-            let status = u32::from_le_bytes(a.bytes(top)[12..16].try_into().unwrap());
-            if rc < 0 || status != 0 {
+            let status = le::u32_at(a.bytes(top), NVOS00_STATUS).expect("in the block");
+            if rc < 0 || status != NV_OK {
                 log::warn!(
                     "{why}: freeing RM client {c:#x}, which holds registered guest memory: \
                      rc {rc}, status {status:#x}; its registrations stay"
@@ -4206,12 +4215,17 @@ impl NvidiaBackend {
     /// freed, which NVKMS, nvidia-drm or another RM client can import in
     /// turn. Refused (EPERM) rather than followed.
     fn osdesc_export_refused(&self, param_in: &[u8]) -> bool {
-        if self.osdesc.live() == 0 || param_in.len() < 32 {
+        if self.osdesc.live() == 0 {
             return false;
         }
-        let rd = |o: usize| u32::from_le_bytes(param_in[o..o + 4].try_into().unwrap());
-        let (client, cmd) = (rd(0), rd(8));
-        let Some(named) = crate::osdesc::exported(cmd, &param_in[32..]) else {
+        let (Some(client), Some(cmd), Some(params)) = (
+            le::u32_at(param_in, NVOS54_H_CLIENT),
+            le::u32_at(param_in, NVOS54_CMD),
+            param_in.get(NVOS54_SIZE..),
+        ) else {
+            return false;
+        };
+        let Some(named) = crate::osdesc::exported(cmd, params) else {
             return false;
         };
         match named.iter().find(|&&h| self.osdesc.holds(client, h)) {
@@ -4507,14 +4521,9 @@ impl NvidiaBackend {
         use abi::ioctl::*;
 
         let fd_offset: usize = match escape {
-            // nv_ioctl_register_fd_t: ctl_fd is the only field, offset 0.
-            NV_ESC_REGISTER_FD => 0,
-            // nv_ioctl_alloc_os_event_t: hClient(4) + hDevice(4) + fd @ offset 8
-            NV_ESC_ALLOC_OS_EVENT => 8,
-            // nv_ioctl_free_os_event_t: same layout as alloc, fd @ offset 8
-            NV_ESC_FREE_OS_EVENT => 8,
-            // NV_ESC_RM_ALLOC_MEMORY: fd at offset 48
-            NV_ESC_RM_ALLOC_MEMORY => 48,
+            NV_ESC_REGISTER_FD => REGISTER_FD_FD,
+            NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => OS_EVENT_FD,
+            NV_ESC_RM_ALLOC_MEMORY => NVOS02_WITH_FD_FD,
             _ => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY),
         };
 
@@ -4597,14 +4606,14 @@ impl NvidiaBackend {
             param_in.len()
         );
 
-        if param_in.len() < 40 {
+        if param_in.len() < NVOS56_SIZE {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
-
-        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
-        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
-        let old_cpu_addr = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
-        let new_cpu_addr = u64::from_le_bytes(param_in[24..32].try_into().unwrap());
+        let word = |at| le::u32_at(param_in, at).expect("checked above");
+        let addr = |at| le::u64_at(param_in, at).expect("checked above");
+        let (h_client, h_memory) = (word(NVOS56_H_CLIENT), word(NVOS56_H_MEMORY));
+        let old_cpu_addr = addr(NVOS56_P_OLD_CPU_ADDRESS);
+        let new_cpu_addr = addr(NVOS56_P_NEW_CPU_ADDRESS);
 
         log::debug!(
             "UPDATE_DEVICE_MAPPING_INFO: client={:#x} mem={:#x} old={:#x} new={:#x}",
@@ -4667,7 +4676,7 @@ impl NvidiaBackend {
         let built = self
             .top_block(&mut a, request, param_in, &crate::guestptr::Plan::default())
             .and_then(|top| {
-                for off in [16, 24] {
+                for off in [NVOS56_P_OLD_CPU_ADDRESS, NVOS56_P_NEW_CPU_ADDRESS] {
                     a.value(top, off, 8, Restore::Yes)?;
                     a.set_value(top, off, host_old)?;
                 }
@@ -4685,10 +4694,10 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
         let param_buf = a.reply(top)[..param_in.len()].to_vec();
-        let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
+        let status = le::u32_at(&param_buf, NVOS56_STATUS).expect("checked above");
         log::debug!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
         // What RM would now know the mapping by, once it has said yes.
-        if status == 0
+        if status == NV_OK
             && let Some(k) = key
         {
             self.active_maps.set_guest_va(k, new_cpu_addr);
@@ -4705,23 +4714,13 @@ impl NvidiaBackend {
         plan: &crate::guestptr::Plan<'_>,
         resp_buf: &mut [u8],
     ) -> usize {
-        const WITH_FD_SIZE: usize = 56;
-        const FD_OFFSET: usize = 48;
-        const LENGTH_OFFSET: usize = 24;
-        const STATUS_OFFSET: usize = 40;
-        const FLAGS_OFFSET: usize = 44;
-
-        if param_in.len() < WITH_FD_SIZE {
+        if param_in.len() < NVOS33_WITH_FD_SIZE {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
 
         // --- Step 1: Translate embedded FD (guest handle → host fd) ---
 
-        let guest_fd_handle = {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&param_in[FD_OFFSET..FD_OFFSET + 4]);
-            i32::from_le_bytes(b) as u32
-        };
+        let guest_fd_handle = le::u32_at(param_in, NVOS33_WITH_FD_FD).expect("checked above");
 
         let host_map = match self.dev_fd(guest_fd_handle) {
             Ok(fd) => fd,
@@ -4751,8 +4750,8 @@ impl NvidiaBackend {
         let built = self
             .top_block(&mut a, request, param_in, plan)
             .and_then(|top| {
-                a.fd(top, FD_OFFSET, 4)?;
-                a.set_fd(top, FD_OFFSET, host_map)?;
+                a.fd(top, NVOS33_WITH_FD_FD, 4)?;
+                a.set_fd(top, NVOS33_WITH_FD_FD, host_map)?;
                 Ok(top)
             });
         let top = match built {
@@ -4778,13 +4777,9 @@ impl NvidiaBackend {
             crate::quota::Owner::Unknown => self.current_owner,
             o => o,
         };
-        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
-        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
-        let asked = u64::from_le_bytes(
-            param_in[LENGTH_OFFSET..LENGTH_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let word = |at| le::u32_at(param_in, at).expect("checked above");
+        let (h_client, h_memory) = (word(NVOS33_H_CLIENT), word(NVOS33_H_MEMORY));
+        let asked = le::u64_at(param_in, NVOS33_LENGTH).expect("checked above");
         let expected = self.rm_mapping_pgprot_before(h_client, h_memory);
         // A zero length can be given no extent; RM refuses it on its own,
         // and says so in `status`.
@@ -4808,7 +4803,7 @@ impl NvidiaBackend {
                 Ok(r) => Some(r),
                 Err(e) => {
                     log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
-                    let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                    let out = nvos::with_status(param_in, NVOS33_STATUS, NV_ERR_NO_MEMORY);
                     return self.write_ioctl_resp(resp_buf, cookie, &out);
                 }
             }
@@ -4835,13 +4830,10 @@ impl NvidiaBackend {
         // The guest handle back in the descriptor field, regardless of status.
         let mut param_buf = a.reply(top)[..param_in.len()].to_vec();
         drop(a);
-        let rm_status = u32::from_le_bytes(
-            param_buf[STATUS_OFFSET..STATUS_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let reply = |at| le::u32_at(&param_buf, at).expect("the block as sent");
+        let rm_status = reply(NVOS33_STATUS);
 
-        if rm_status != 0 {
+        if rm_status != NV_OK {
             // RM returned an error status (NV_OK == 0).
             // Forward the params back so the guest can read the status field.
             log::debug!("NV_ESC_RM_MAP_MEMORY: RM status 0x{:x}", rm_status);
@@ -4852,19 +4844,10 @@ impl NvidiaBackend {
         // NVOS33.pLinearAddress: the host's own address for the mapping,
         // which RM knows it by (in UPDATE_DEVICE_MAPPING_INFO and UNMAP), and
         // which undoes it if what follows fails.
-        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
-
-        let length = u64::from_le_bytes(
-            param_buf[LENGTH_OFFSET..LENGTH_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-
-        let flags = u32::from_le_bytes(
-            param_buf[FLAGS_OFFSET..FLAGS_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let host_p_linear =
+            le::u64_at(&param_buf, NVOS33_P_LINEAR_ADDRESS).expect("the block as sent");
+        let length = le::u64_at(&param_buf, NVOS33_LENGTH).expect("the block as sent");
+        let flags = reply(NVOS33_FLAGS);
 
         // --- Step 5: the memory type the host maps it with ---
         //
@@ -4900,8 +4883,7 @@ impl NvidiaBackend {
                         self.undo_rm_map(host_fd, &param_buf, host_p_linear);
                         // RM's out-of-memory answer, as for a refused
                         // reservation (#29); the caller's own block.
-                        let out =
-                            crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                        let out = nvos::with_status(param_in, NVOS33_STATUS, NV_ERR_NO_MEMORY);
                         return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
@@ -4935,7 +4917,7 @@ impl NvidiaBackend {
         if let Err(status) = placed {
             unreserve(self, Some(region));
             self.undo_rm_map(host_fd, &param_buf, host_p_linear);
-            let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, status);
+            let out = nvos::with_status(param_in, NVOS33_STATUS, status);
             return self.write_ioctl_resp(resp_buf, cookie, &out);
         }
 
@@ -4990,7 +4972,8 @@ impl NvidiaBackend {
         // the guest sees. It's not a real pointer; the guest driver uses the
         // SHM metadata (shm_offset/shm_length/pgprot in IoctlResp) for mmap,
         // and the library stores this value to pass back at unmap time.
-        param_buf[32..40].copy_from_slice(&region_offset.to_le_bytes());
+        le::put_u64(&mut param_buf, NVOS33_P_LINEAR_ADDRESS, region_offset)
+            .expect("the block as sent");
 
         // --- Step 9: Respond ---
         //
@@ -5019,28 +5002,34 @@ impl NvidiaBackend {
     /// exhaust_the_zone`); the guest closes it, as it would after any
     /// failed map.
     fn undo_rm_map(&self, host_fd: RawFd, nvos33: &[u8], host_p_linear: u64) {
-        // NVOS34 {hClient, hDevice, hMemory, pad, pLinearAddress, status,
-        // flags}: the object from the map, flags 0 (a user mapping).
-        let mut p = [0u8; 32];
-        p[0..12].copy_from_slice(&nvos33[0..12]);
+        // The object from the map, flags 0 (a user mapping).
+        let mut p = [0u8; NVOS34_SIZE];
+        for (to, from) in [
+            (NVOS34_H_CLIENT, NVOS33_H_CLIENT),
+            (NVOS34_H_DEVICE, NVOS33_H_DEVICE),
+            (NVOS34_H_MEMORY, NVOS33_H_MEMORY),
+        ] {
+            let v = le::u32_at(nvos33, from).unwrap_or(0);
+            le::put_u32(&mut p, to, v).expect("in the block");
+        }
         let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_UNMAP_MEMORY, p.len() as u32);
         let mut a = Arena::new();
         let built = self
             .top_block(&mut a, request, &p, &crate::guestptr::Plan::default())
             .and_then(|top| {
-                a.value(top, 16, 8, Restore::No)?;
-                a.set_value(top, 16, host_p_linear)?;
+                a.value(top, NVOS34_P_LINEAR_ADDRESS, 8, Restore::No)?;
+                a.set_value(top, NVOS34_P_LINEAR_ADDRESS, host_p_linear)?;
                 Ok(top)
             });
         let status = built.and_then(|top| {
             self.host_call(&mut a, host_fd, request, top)?;
-            Ok(u32::from_le_bytes(a.reply(top)[24..28].try_into().unwrap()))
+            Ok(le::u32_at(&a.reply(top), NVOS34_STATUS).unwrap_or(0))
         });
         match status {
             Ok(0) => log::info!(
                 "NV_ESC_RM_MAP_MEMORY: undone on the host (client {:#x} memory {:#x})",
-                u32::from_le_bytes(p[0..4].try_into().unwrap()),
-                u32::from_le_bytes(p[8..12].try_into().unwrap()),
+                le::u32_at(&p, NVOS34_H_CLIENT).unwrap_or(0),
+                le::u32_at(&p, NVOS34_H_MEMORY).unwrap_or(0),
             ),
             Ok(s) => log::warn!(
                 "NV_ESC_RM_MAP_MEMORY: the host would not undo the mapping (RM status {s:#x}); \
@@ -5061,13 +5050,12 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        if param_in.len() < 32 {
+        if param_in.len() < NVOS34_SIZE {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
-
-        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
-        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
-        let guest_linear = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
+        let word = |at| le::u32_at(param_in, at).expect("checked above");
+        let (h_client, h_memory) = (word(NVOS34_H_CLIENT), word(NVOS34_H_MEMORY));
+        let guest_linear = le::u64_at(param_in, NVOS34_P_LINEAR_ADDRESS).expect("checked above");
 
         // guest_linear is what the caller knows the mapping by: the window
         // offset the map wrote into pLinearAddress, or the address an
@@ -5095,7 +5083,10 @@ impl NvidiaBackend {
                 let mut a = Arena::new();
                 let built = self
                     .top_block(&mut a, request, param_in, &crate::guestptr::Plan::default())
-                    .and_then(|top| a.value(top, 16, 8, Restore::Yes).map(|_| top));
+                    .and_then(|top| {
+                        a.value(top, NVOS34_P_LINEAR_ADDRESS, 8, Restore::Yes)
+                            .map(|_| top)
+                    });
                 let top = match built {
                     Ok(t) => t,
                     Err(e) => {
@@ -5127,8 +5118,8 @@ impl NvidiaBackend {
                 // copies the block back, so the caller reads its own value,
                 // as on the not-found path and as L-6 did for
                 // UPDATE_DEVICE_MAPPING_INFO (review 2026-09-29 2.4).
-                a.value(top, 16, 8, Restore::Yes)?;
-                a.set_value(top, 16, entry.host_p_linear_address)?;
+                a.value(top, NVOS34_P_LINEAR_ADDRESS, 8, Restore::Yes)?;
+                a.set_value(top, NVOS34_P_LINEAR_ADDRESS, entry.host_p_linear_address)?;
                 Ok(top)
             });
         let top = match built {
@@ -5147,10 +5138,10 @@ impl NvidiaBackend {
         let param_buf = a.reply(top)[..param_in.len()].to_vec();
         drop(a);
 
-        let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
+        let status = le::u32_at(&param_buf, NVOS34_STATUS).expect("checked above");
         log::debug!("UNMAP_MEMORY: host status=0x{:x}", status);
 
-        if status == 0 {
+        if status == NV_OK {
             // Host unmap succeeded -- empty the window range and return the
             // extent to its zone, so the space can serve a later mapping. The
             // withdraw matters as much as the free: without it the VMM keeps
@@ -6381,7 +6372,7 @@ mod tests {
         /// NV_ESC_RM_CONTROL with inline parameters; returns them as RM
         /// left them.
         fn control(&mut self, client: u32, object: u32, cmd: u32, params: &[u8]) -> Vec<u8> {
-            let mut outer = vec![0u8; NVOS54_TOTAL];
+            let mut outer = vec![0u8; NVOS54_SIZE];
             outer[0..4].copy_from_slice(&client.to_le_bytes());
             outer[4..8].copy_from_slice(&object.to_le_bytes());
             outer[NVOS54_CMD..NVOS54_CMD + 4].copy_from_slice(&cmd.to_le_bytes());
@@ -6393,10 +6384,10 @@ mod tests {
             append(
                 &mut req,
                 &IoctlReq {
-                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, NVOS54_TOTAL as u32)
+                    cmd: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_CONTROL, NVOS54_SIZE as u32)
                         as u32,
-                    data_len: NVOS54_TOTAL as u32,
-                    nested_offset: NVOS54_TOTAL as u32,
+                    data_len: NVOS54_SIZE as u32,
+                    nested_offset: NVOS54_SIZE as u32,
                     nested_len: params.len() as u32,
                     deep_ptr_offset: 0,
                     deep_len: 0,
@@ -6408,10 +6399,10 @@ mod tests {
             let mut resp = vec![0u8; 8192];
             self.be.dispatch(&req, &mut resp);
             assert_eq!(parse_resp(&resp).status, 0, "control {cmd:#x}: transport");
-            let out = &resp[IOCTL_BODY..IOCTL_BODY + NVOS54_TOTAL + params.len()];
+            let out = &resp[IOCTL_BODY..IOCTL_BODY + NVOS54_SIZE + params.len()];
             let st = u32::from_le_bytes(out[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
             assert_eq!(st, 0, "control {cmd:#x}: RM status {st:#x}");
-            out[NVOS54_TOTAL..].to_vec()
+            out[NVOS54_SIZE..].to_vec()
         }
 
         /// The newest usermode class the device lists.
@@ -7619,7 +7610,7 @@ mod tests {
         let body = &resp[IOCTL_BODY..];
         assert_eq!(
             &body[28..32],
-            &crate::rmctl::NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes()
+            &crate::nvos::NV_ERR_INSUFFICIENT_PERMISSIONS.to_le_bytes()
         );
         assert_eq!(&body[..28], &p[..28]);
         assert!(be.rm_controls.is_empty());
@@ -9156,7 +9147,7 @@ mod descriptor_field_tests {
             assert_eq!(st, 0, "{cmd:#x}: RM's own answer, not a failed ioctl");
             assert_eq!(
                 status_at(&back, 28),
-                crate::rmallow::NV_ERR_NOT_SUPPORTED,
+                crate::nvos::NV_ERR_NOT_SUPPORTED,
                 "{cmd:#x}"
             );
         }
@@ -9166,7 +9157,7 @@ mod descriptor_field_tests {
         let (_, back) = control(&mut be, ctl, 0x2080_0102, &[0u8; 64]);
         assert_eq!(
             status_at(&back, 28),
-            crate::rmallow::NV_ERR_INVALID_PARAM_STRUCT
+            crate::nvos::NV_ERR_INVALID_PARAM_STRUCT
         );
         assert!(seen().is_empty());
         let (st, _) = control(&mut be, ctl, 0x2080_0102, &[0u8; 580]);
@@ -9179,7 +9170,7 @@ mod descriptor_field_tests {
             assert_eq!(st, 0, "{class:#x}");
             assert_eq!(
                 status_at(&back, 40),
-                crate::rmallow::NV_ERR_INVALID_CLASS,
+                crate::nvos::NV_ERR_INVALID_CLASS,
                 "{class:#x}"
             );
         }
@@ -9207,7 +9198,7 @@ mod descriptor_field_tests {
         be.set_abi_policy(AbiPolicy::Permissive);
         let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
         let (_, back) = control(&mut be, ctl, 0x2080_0112, &[0u8; 4]);
-        assert_eq!(status_at(&back, 28), crate::rmallow::NV_ERR_NOT_SUPPORTED);
+        assert_eq!(status_at(&back, 28), crate::nvos::NV_ERR_NOT_SUPPORTED);
         assert!(seen().is_empty());
     }
 
@@ -9280,7 +9271,7 @@ mod descriptor_field_tests {
             assert_eq!(st, 0, "{cmd:#x}: RM's own answer, not a failed ioctl");
             assert_eq!(
                 u32::from_le_bytes(back[28..32].try_into().unwrap()),
-                crate::rmctl::NV_ERR_NOT_SUPPORTED
+                crate::nvos::NV_ERR_NOT_SUPPORTED
             );
         }
         assert!(seen().is_empty());
@@ -9294,7 +9285,7 @@ mod descriptor_field_tests {
         assert_eq!(st, 0);
         assert_eq!(
             u32::from_le_bytes(back[28..32].try_into().unwrap()),
-            crate::rmctl::NV_ERR_NOT_SUPPORTED
+            crate::nvos::NV_ERR_NOT_SUPPORTED
         );
         assert!(seen().is_empty());
     }

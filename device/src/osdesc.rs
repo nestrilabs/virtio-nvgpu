@@ -113,6 +113,22 @@ use protocol::messages::{
 };
 
 use crate::hostfd;
+#[cfg(test)]
+use crate::nvos::{
+    NV_ERR_NO_MEMORY, NVOS02_STATUS, NVOS02_WITH_FD_FD, NVOS32_ALLOC_OS_DESC_H_MEMORY,
+    NVOS32_STATUS, NVOS64_P_ALLOC_PARMS, NVOS64_P_RIGHTS_REQUESTED, NVOS64_STATUS, ROOT_CLASSES,
+};
+use crate::nvos::{
+    NV_OS_DESC_MEMORY_ALLOCATION_ATTR2, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR,
+    NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE, NV_OS_DESC_MEMORY_ALLOCATION_FLAGS,
+    NV_OS_DESC_MEMORY_ALLOCATION_LIMIT, NV_OS_DESC_MEMORY_ALLOCATION_SIZE,
+    NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVOS02_FLAGS, NVOS02_H_CLASS, NVOS02_H_OBJECT_NEW,
+    NVOS02_H_OBJECT_PARENT, NVOS02_H_ROOT, NVOS02_LIMIT, NVOS02_P_MEMORY, NVOS02_WITH_FD_SIZE,
+    NVOS32_ALLOC_OS_DESC_ATTR2, NVOS32_ALLOC_OS_DESC_DESCRIPTOR,
+    NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE, NVOS32_ALLOC_OS_DESC_LIMIT, NVOS32_FUNCTION,
+    NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR, NVOS32_H_OBJECT_PARENT, NVOS32_H_ROOT, NVOS32_SIZE,
+    NVOS64_H_CLASS, NVOS64_H_OBJECT_PARENT, NVOS64_H_ROOT, NVOS64_PARAMS_SIZE, NVOS64_SIZE,
+};
 use crate::sys::mem::{HostSpan, Reservation};
 
 /// A refusal: the errno the guest's ioctl returns.
@@ -120,9 +136,6 @@ pub type Errno = i32;
 
 pub const PAGE: u64 = 4096;
 
-pub const NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: u32 = 0x71;
-/// NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR.
-pub const NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR: u32 = 27;
 /// NVOS32_DESCRIPTOR_TYPE_VIRTUAL_ADDRESS: the only type taken.
 pub const DESCRIPTOR_TYPE_VIRTUAL_ADDRESS: u32 = 0;
 /// NVOS32_ATTR2_PROTECTION_USER (22:22), READ_ONLY.
@@ -242,46 +255,6 @@ pub(crate) enum Shape {
     RmAlloc,
 }
 
-// NVOS02 (nvos.h:288-298) with its fd.
-pub(crate) const OS02_SIZE: usize = 56;
-const OS02_ROOT: usize = 0;
-const OS02_PARENT: usize = 4;
-pub(crate) const OS02_NEW: usize = 8;
-const OS02_CLASS: usize = 12;
-const OS02_FLAGS: usize = 16;
-pub(crate) const OS02_MEMORY: usize = 24;
-const OS02_LIMIT: usize = 32;
-pub(crate) const OS02_STATUS: usize = 40;
-pub(crate) const OS02_FD: usize = 48;
-// NVOS32 (nvos.h:665-881): data.AllocOsDesc at 40.
-pub(crate) const OS32_SIZE: usize = 184;
-const OS32_ROOT: usize = 0;
-const OS32_PARENT: usize = 4;
-const OS32_FUNCTION: usize = 8;
-pub(crate) const OS32_STATUS: usize = 20;
-pub(crate) const OS32_HMEMORY: usize = 40;
-const OS32_ATTR2: usize = 56;
-pub(crate) const OS32_DESCRIPTOR: usize = 64;
-const OS32_LIMIT: usize = 72;
-const OS32_DESCRIPTOR_TYPE: usize = 80;
-// NVOS64.
-pub(crate) const OS64_SIZE: usize = 48;
-const OS64_ROOT: usize = 0;
-const OS64_PARENT: usize = 4;
-pub(crate) const OS64_NEW: usize = 8;
-const OS64_CLASS: usize = 12;
-pub(crate) const OS64_PARAMS: usize = 16;
-pub(crate) const OS64_RIGHTS: usize = 24;
-const OS64_PARAMS_SIZE: usize = 32;
-pub(crate) const OS64_STATUS: usize = 40;
-// NV_OS_DESC_MEMORY_ALLOCATION_PARAMS (nvos.h:1643-1653).
-pub(crate) const OSDESC_PARAMS_SIZE: usize = 40;
-const OSD_FLAGS: usize = 4;
-const OSD_ATTR2: usize = 12;
-pub(crate) const OSD_DESCRIPTOR: usize = 16;
-const OSD_LIMIT: usize = 24;
-const OSD_DESCRIPTOR_TYPE: usize = 32;
-
 fn rd32(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
@@ -326,16 +299,18 @@ pub(crate) fn shape_of(cmd: u32, outer: &[u8]) -> Option<Shape> {
     }
     match hostfd::ioc_nr(cmd) {
         NV_ESC_RM_ALLOC_MEMORY
-            if rd32(outer, OS02_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
+            if rd32(outer, NVOS02_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
         {
             Some(Shape::AllocMemory)
         }
         NV_ESC_RM_VID_HEAP_CONTROL
-            if rd32(outer, OS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR) =>
+            if rd32(outer, NVOS32_FUNCTION) == Some(NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR) =>
         {
             Some(Shape::VidHeap)
         }
-        NV_ESC_RM_ALLOC if rd32(outer, OS64_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) => {
+        NV_ESC_RM_ALLOC
+            if rd32(outer, NVOS64_H_CLASS) == Some(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR) =>
+        {
             Some(Shape::RmAlloc)
         }
         _ => None,
@@ -357,7 +332,7 @@ pub(crate) fn describe(cmd: u32, outer: &[u8], nested: &[u8]) -> Result<Call, Er
     let size_is = |want: usize| hostfd::ioc_size(cmd) == want && outer.len() == want;
     let (va, limit, writable, client, parent) = match shape {
         Shape::AllocMemory => {
-            if !size_is(OS02_SIZE) || !nested.is_empty() {
+            if !size_is(NVOS02_WITH_FD_SIZE) || !nested.is_empty() {
                 return refuse("not NVOS02 with its fd", libc::EINVAL);
             }
             // A zero handle has RM generate one it never writes back
@@ -366,61 +341,65 @@ pub(crate) fn describe(cmd: u32, outer: &[u8], nested: &[u8]) -> Result<Call, Er
             // second such call -- or any ALLOC_MEMORY that makes an object
             // under a zero handle -- would end its registration while RM
             // still holds the pages.
-            if rd32(outer, OS02_NEW) == Some(0) {
+            if rd32(outer, NVOS02_H_OBJECT_NEW) == Some(0) {
                 return refuse("a zero hObjectNew", libc::EINVAL);
             }
             // RmAllocOsDescriptor: ALLOC_USER_READ_ONLY makes ATTR2
             // PROTECTION_USER read-only, which RmCreateOsDescriptor pins for
             // (escape.c:260-261, 161).
-            let flags = rd32(outer, OS02_FLAGS).unwrap_or(0);
+            let flags = rd32(outer, NVOS02_FLAGS).unwrap_or(0);
             (
-                rd64(outer, OS02_MEMORY),
-                rd64(outer, OS02_LIMIT),
+                rd64(outer, NVOS02_P_MEMORY),
+                rd64(outer, NVOS02_LIMIT),
                 flags & NVOS02_FLAGS_ALLOC_USER_READ_ONLY == 0,
-                rd32(outer, OS02_ROOT),
-                rd32(outer, OS02_PARENT),
+                rd32(outer, NVOS02_H_ROOT),
+                rd32(outer, NVOS02_H_OBJECT_PARENT),
             )
         }
         Shape::VidHeap => {
-            if !size_is(OS32_SIZE) || !nested.is_empty() {
+            if !size_is(NVOS32_SIZE) || !nested.is_empty() {
                 return refuse("not NVOS32", libc::EINVAL);
             }
-            if rd32(outer, OS32_DESCRIPTOR_TYPE) != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS) {
+            if rd32(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE)
+                != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS)
+            {
                 return refuse("a descriptor that is not a virtual address", libc::EPERM);
             }
-            let attr2 = rd32(outer, OS32_ATTR2).unwrap_or(0);
+            let attr2 = rd32(outer, NVOS32_ALLOC_OS_DESC_ATTR2).unwrap_or(0);
             (
-                rd64(outer, OS32_DESCRIPTOR),
-                rd64(outer, OS32_LIMIT),
+                rd64(outer, NVOS32_ALLOC_OS_DESC_DESCRIPTOR),
+                rd64(outer, NVOS32_ALLOC_OS_DESC_LIMIT),
                 attr2 & ATTR2_PROTECTION_USER_READ_ONLY == 0,
-                rd32(outer, OS32_ROOT),
-                rd32(outer, OS32_PARENT),
+                rd32(outer, NVOS32_H_ROOT),
+                rd32(outer, NVOS32_H_OBJECT_PARENT),
             )
         }
         Shape::RmAlloc => {
-            let size = rd32(outer, OS64_PARAMS_SIZE).unwrap_or(u32::MAX) as usize;
-            if !size_is(OS64_SIZE)
-                || nested.len() != OSDESC_PARAMS_SIZE
-                || !(size == 0 || size == OSDESC_PARAMS_SIZE)
+            let size = rd32(outer, NVOS64_PARAMS_SIZE).unwrap_or(u32::MAX) as usize;
+            if !size_is(NVOS64_SIZE)
+                || nested.len() != NV_OS_DESC_MEMORY_ALLOCATION_SIZE
+                || !(size == 0 || size == NV_OS_DESC_MEMORY_ALLOCATION_SIZE)
             {
                 return refuse(
                     "not NVOS64 with NV_OS_DESC_MEMORY_ALLOCATION_PARAMS",
                     libc::EINVAL,
                 );
             }
-            if rd32(nested, OSD_DESCRIPTOR_TYPE) != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS) {
+            if rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE)
+                != Some(DESCRIPTOR_TYPE_VIRTUAL_ADDRESS)
+            {
                 return refuse("a descriptor that is not a virtual address", libc::EPERM);
             }
             // osdescConstruct: either marks it read-only (os_desc_mem.c:75-84).
-            let attr2 = rd32(nested, OSD_ATTR2).unwrap_or(0);
-            let flags = rd32(nested, OSD_FLAGS).unwrap_or(0);
+            let attr2 = rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_ATTR2).unwrap_or(0);
+            let flags = rd32(nested, NV_OS_DESC_MEMORY_ALLOCATION_FLAGS).unwrap_or(0);
             (
-                rd64(nested, OSD_DESCRIPTOR),
-                rd64(nested, OSD_LIMIT),
+                rd64(nested, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR),
+                rd64(nested, NV_OS_DESC_MEMORY_ALLOCATION_LIMIT),
                 attr2 & ATTR2_PROTECTION_USER_READ_ONLY == 0
                     && flags & NVOS32_ALLOC_FLAGS_USER_READ_ONLY == 0,
-                rd32(outer, OS64_ROOT),
-                rd32(outer, OS64_PARENT),
+                rd32(outer, NVOS64_H_ROOT),
+                rd32(outer, NVOS64_H_OBJECT_PARENT),
             )
         }
     };
@@ -1713,11 +1692,11 @@ mod tests {
 
     fn os02(va: u64, size: u64, flags: u32) -> Vec<u8> {
         let mut p = vec![0u8; 56];
-        put32(&mut p, OS02_NEW, 0x5000_0001);
-        put32(&mut p, OS02_CLASS, 0x71);
-        put32(&mut p, OS02_FLAGS, flags);
-        put64(&mut p, OS02_MEMORY, va);
-        put64(&mut p, OS02_LIMIT, size - 1);
+        put32(&mut p, NVOS02_H_OBJECT_NEW, 0x5000_0001);
+        put32(&mut p, NVOS02_H_CLASS, 0x71);
+        put32(&mut p, NVOS02_FLAGS, flags);
+        put64(&mut p, NVOS02_P_MEMORY, va);
+        put64(&mut p, NVOS02_LIMIT, size - 1);
         p
     }
 
@@ -1736,20 +1715,24 @@ mod tests {
         assert!(!c.writable);
 
         let mut p = vec![0u8; 184];
-        put32(&mut p, OS32_FUNCTION, 27);
-        put64(&mut p, OS32_DESCRIPTOR, 0x2000);
-        put64(&mut p, OS32_LIMIT, 0x2fff);
-        put32(&mut p, OS32_ATTR2, 1 << 22);
+        put32(&mut p, NVOS32_FUNCTION, 27);
+        put64(&mut p, NVOS32_ALLOC_OS_DESC_DESCRIPTOR, 0x2000);
+        put64(&mut p, NVOS32_ALLOC_OS_DESC_LIMIT, 0x2fff);
+        put32(&mut p, NVOS32_ALLOC_OS_DESC_ATTR2, 1 << 22);
         let c = describe(VID_HEAP, &p, &[]).unwrap();
         assert_eq!((c.shape, c.pages(), c.writable), (Shape::VidHeap, 3, false));
 
         let mut o = vec![0u8; 48];
-        put32(&mut o, OS64_CLASS, 0x71);
-        put32(&mut o, OS64_PARAMS_SIZE, 40);
+        put32(&mut o, NVOS64_H_CLASS, 0x71);
+        put32(&mut o, NVOS64_PARAMS_SIZE, 40);
         let mut n = vec![0u8; 40];
-        put64(&mut n, OSD_DESCRIPTOR, 0x3000);
-        put64(&mut n, OSD_LIMIT, 0xfff);
-        put32(&mut n, OSD_FLAGS, NVOS32_ALLOC_FLAGS_USER_READ_ONLY);
+        put64(&mut n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR, 0x3000);
+        put64(&mut n, NV_OS_DESC_MEMORY_ALLOCATION_LIMIT, 0xfff);
+        put32(
+            &mut n,
+            NV_OS_DESC_MEMORY_ALLOCATION_FLAGS,
+            NVOS32_ALLOC_FLAGS_USER_READ_ONLY,
+        );
         let c = describe(RM_ALLOC, &o, &n).unwrap();
         assert_eq!((c.shape, c.pages(), c.writable), (Shape::RmAlloc, 1, false));
     }
@@ -1758,13 +1741,13 @@ mod tests {
     fn only_the_virtual_address_descriptor_type_is_taken() {
         for t in 1..=7u32 {
             let mut p = vec![0u8; 184];
-            put32(&mut p, OS32_FUNCTION, 27);
-            put32(&mut p, OS32_DESCRIPTOR_TYPE, t);
+            put32(&mut p, NVOS32_FUNCTION, 27);
+            put32(&mut p, NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE, t);
             assert_eq!(describe(VID_HEAP, &p, &[]), Err(libc::EPERM), "type {t}");
             let mut o = vec![0u8; 48];
-            put32(&mut o, OS64_CLASS, 0x71);
+            put32(&mut o, NVOS64_H_CLASS, 0x71);
             let mut n = vec![0u8; 40];
-            put32(&mut n, OSD_DESCRIPTOR_TYPE, t);
+            put32(&mut n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE, t);
             assert_eq!(describe(RM_ALLOC, &o, &n), Err(libc::EPERM), "type {t}");
         }
     }
@@ -1773,7 +1756,7 @@ mod tests {
     fn calls_that_are_not_exactly_one_of_the_three_are_refused() {
         // Another class, another function, another size, a limit that wraps.
         let mut p = os02(0x1000, 1, 0);
-        put32(&mut p, OS02_CLASS, 0x3e);
+        put32(&mut p, NVOS02_H_CLASS, 0x3e);
         assert_eq!(describe(ALLOC_MEMORY, &p, &[]), Err(libc::EINVAL));
         assert_eq!(
             describe(
@@ -1784,14 +1767,14 @@ mod tests {
             Err(libc::EINVAL)
         );
         let mut p = os02(0x1000, 1, 0);
-        put64(&mut p, OS02_LIMIT, u64::MAX);
+        put64(&mut p, NVOS02_LIMIT, u64::MAX);
         assert_eq!(describe(ALLOC_MEMORY, &p, &[]), Err(libc::EINVAL));
         // A handle RM would generate and never write back.
         let mut p = os02(0x1000, 1, 0);
-        put32(&mut p, OS02_NEW, 0);
+        put32(&mut p, NVOS02_H_OBJECT_NEW, 0);
         assert_eq!(describe(ALLOC_MEMORY, &p, &[]), Err(libc::EINVAL));
         let mut o = vec![0u8; 48];
-        put32(&mut o, OS64_CLASS, 0x71);
+        put32(&mut o, NVOS64_H_CLASS, 0x71);
         assert_eq!(describe(RM_ALLOC, &o, &[0; 32]), Err(libc::EINVAL));
         // More than one registration may name.
         let p = os02(0, (u64::from(OSDESC_MAX_PAGES) + 1) * PAGE, 0);
@@ -2454,23 +2437,23 @@ mod backend_tests {
         let status = STATUS.with(|s| s.get());
         let s = match hostfd::ioc_nr(request) {
             NV_ESC_RM_ALLOC_MEMORY => {
-                let addr = rd64(a, OS02_MEMORY);
+                let addr = rd64(a, NVOS02_P_MEMORY);
                 let bytes = pinned_bytes(&others, addr, rd64(a, 32) + 1);
-                put32(a, OS02_STATUS, status);
+                put32(a, NVOS02_STATUS, status);
                 Seen::Register {
                     nr: NV_ESC_RM_ALLOC_MEMORY,
                     addr,
                     bytes,
-                    fd: rd32(a, OS02_FD) as i32,
+                    fd: rd32(a, NVOS02_WITH_FD_FD) as i32,
                     rights: 0,
                 }
             }
             NV_ESC_RM_VID_HEAP_CONTROL => {
-                let addr = rd64(a, OS32_DESCRIPTOR);
+                let addr = rd64(a, NVOS32_ALLOC_OS_DESC_DESCRIPTOR);
                 let bytes = pinned_bytes(&others, addr, rd64(a, 72) + 1);
-                put32(a, OS32_STATUS, status);
-                if rd32(a, OS32_HMEMORY) == 0 {
-                    put32(a, OS32_HMEMORY, 0xbeef_0001);
+                put32(a, NVOS32_STATUS, status);
+                if rd32(a, NVOS32_ALLOC_OS_DESC_H_MEMORY) == 0 {
+                    put32(a, NVOS32_ALLOC_OS_DESC_H_MEMORY, 0xbeef_0001);
                 }
                 Seen::Register {
                     nr: NV_ESC_RM_VID_HEAP_CONTROL,
@@ -2480,10 +2463,10 @@ mod backend_tests {
                     rights: 0,
                 }
             }
-            NV_ESC_RM_ALLOC if rd32(a, OS64_CLASS) != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR => {
-                put32(a, OS64_STATUS, 0);
+            NV_ESC_RM_ALLOC if rd32(a, NVOS64_H_CLASS) != NV01_MEMORY_SYSTEM_OS_DESCRIPTOR => {
+                put32(a, NVOS64_STATUS, 0);
                 Seen::Alloc {
-                    class: rd32(a, OS64_CLASS),
+                    class: rd32(a, NVOS64_H_CLASS),
                 }
             }
             abi::ioctl::NV_ESC_RM_CONTROL => {
@@ -2495,19 +2478,19 @@ mod backend_tests {
                 Seen::MapDma { flags: rd32(a, 32) }
             }
             NV_ESC_RM_ALLOC => {
-                let params = rd64(a, OS64_PARAMS);
+                let params = rd64(a, NVOS64_P_ALLOC_PARMS);
                 assert!(params != 0 && params.abs_diff(GUEST_VA) > 1 << 30);
                 // The backend's copy of the class parameters.
                 let n = others.read(params, 40).expect("the class parameters");
-                let addr = rd64(&n, OSD_DESCRIPTOR);
+                let addr = rd64(&n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR);
                 let bytes = pinned_bytes(&others, addr, rd64(&n, 24) + 1);
-                put32(a, OS64_STATUS, status);
+                put32(a, NVOS64_STATUS, status);
                 Seen::Register {
                     nr: NV_ESC_RM_ALLOC,
                     addr,
                     bytes,
                     fd: 0,
-                    rights: rd64(a, OS64_RIGHTS),
+                    rights: rd64(a, NVOS64_P_RIGHTS_REQUESTED),
                 }
             }
             abi::ioctl::NV_ESC_RM_FREE => {
@@ -2658,9 +2641,9 @@ mod backend_tests {
         put32(&mut p, 4, DEVICE);
         put32(&mut p, 8, 0x5000_0001);
         put32(&mut p, 12, 0x71);
-        put64(&mut p, OS02_MEMORY, va);
+        put64(&mut p, NVOS02_P_MEMORY, va);
         put64(&mut p, 32, size - 1);
-        put32(&mut p, OS02_FD, fd as u32);
+        put32(&mut p, NVOS02_WITH_FD_FD, fd as u32);
         p
     }
 
@@ -2670,7 +2653,7 @@ mod backend_tests {
         put32(&mut p, 4, DEVICE);
         put32(&mut p, 8, NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR);
         put32(&mut p, 56, attr2);
-        put64(&mut p, OS32_DESCRIPTOR, va);
+        put64(&mut p, NVOS32_ALLOC_OS_DESC_DESCRIPTOR, va);
         put64(&mut p, 72, size - 1);
         put32(&mut p, 80, dtype);
         p
@@ -2682,8 +2665,8 @@ mod backend_tests {
         put32(&mut o, 4, DEVICE);
         put32(&mut o, 8, 0x5000_0002);
         put32(&mut o, 12, 0x71);
-        put64(&mut o, OS64_PARAMS, GUEST_VA + (8 << 20));
-        put64(&mut o, OS64_RIGHTS, GUEST_VA + (9 << 20));
+        put64(&mut o, NVOS64_P_ALLOC_PARMS, GUEST_VA + (8 << 20));
+        put64(&mut o, NVOS64_P_RIGHTS_REQUESTED, GUEST_VA + (9 << 20));
         put32(&mut o, 32, 40);
         o
     }
@@ -2691,7 +2674,7 @@ mod backend_tests {
     fn osd(va: u64, size: u64, attr2: u32) -> Vec<u8> {
         let mut n = vec![0u8; 40];
         put32(&mut n, 12, attr2);
-        put64(&mut n, OSD_DESCRIPTOR, va);
+        put64(&mut n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR, va);
         put64(&mut n, 24, size - 1);
         n
     }
@@ -2749,8 +2732,8 @@ mod backend_tests {
             other => panic!("{other:?}"),
         }
         assert_eq!((resp.data_len, resp.nested_len, resp.deep_len), (56, 0, 8));
-        assert_eq!(rd64(&params, OS02_MEMORY), GUEST_VA);
-        assert_eq!(rd32(&params, OS02_FD), 7);
+        assert_eq!(rd64(&params, NVOS02_P_MEMORY), GUEST_VA);
+        assert_eq!(rd32(&params, NVOS02_WITH_FD_FD), 7);
         assert_eq!(vm.be.osdesc.live(), 1);
         let id = rd64(&deep, 0);
         // RM_FREE of it: released, and a reap names it.
@@ -2782,7 +2765,7 @@ mod backend_tests {
         );
         assert_eq!(st, 0);
         seen();
-        for class in crate::semsurf::ROOT_CLASSES {
+        for class in ROOT_CLASSES {
             let mut o = vec![0u8; 48];
             put32(&mut o, 0, CLIENT);
             put32(&mut o, 8, 0x5000_0001);
@@ -2872,8 +2855,11 @@ mod backend_tests {
             }
             other => panic!("{other:?}"),
         };
-        assert_eq!(rd64(&params, OS32_DESCRIPTOR), GUEST_VA + off);
-        let h_memory = rd32(&params, OS32_HMEMORY);
+        assert_eq!(
+            rd64(&params, NVOS32_ALLOC_OS_DESC_DESCRIPTOR),
+            GUEST_VA + off
+        );
+        let h_memory = rd32(&params, NVOS32_ALLOC_OS_DESC_H_MEMORY);
         assert_eq!(h_memory, 0xbeef_0001);
         let id = rd64(&deep, 0);
         assert!(reserved_live(addr) && mapped(addr, size));
@@ -2973,7 +2959,7 @@ mod backend_tests {
             Some(&list(OSDESC_F_WRITE, &[(LOW, 1), (HIGH, 1)])),
         );
         assert_eq!(st, 0);
-        assert_eq!(rd32(&params, OS32_STATUS), 0x56);
+        assert_eq!(rd32(&params, NVOS32_STATUS), 0x56);
         assert_eq!(resp.deep_len, 0);
         let addr = match &seen()[..] {
             [Seen::Register { addr, .. }] => *addr,
@@ -3146,8 +3132,12 @@ mod backend_tests {
         // RM's own out-of-memory answer in the caller's block, the ioctl
         // succeeding (review 2026-09-29 parity #29).
         assert_eq!(st, 0);
-        assert_eq!(rd32(&params, OS32_STATUS), crate::nvidia::NV_ERR_NO_MEMORY);
-        assert_eq!(rd64(&params, OS32_DESCRIPTOR), GUEST_VA, "the caller's own");
+        assert_eq!(rd32(&params, NVOS32_STATUS), NV_ERR_NO_MEMORY);
+        assert_eq!(
+            rd64(&params, NVOS32_ALLOC_OS_DESC_DESCRIPTOR),
+            GUEST_VA,
+            "the caller's own"
+        );
         assert!(seen().is_empty());
         assert_eq!(vm.be.osdesc.live(), 0);
     }
@@ -3695,7 +3685,7 @@ mod backend_tests {
         put32(&mut o, 4, DEVICE);
         put32(&mut o, 8, 0x5000_0020);
         put32(&mut o, 12, NV_SEMAPHORE_SURFACE);
-        put64(&mut o, OS64_PARAMS, GUEST_VA);
+        put64(&mut o, NVOS64_P_ALLOC_PARMS, GUEST_VA);
         put32(&mut o, 32, 16);
         let mut n = vec![0u8; 16];
         put32(&mut n, 0, HANDLE);
@@ -3726,7 +3716,7 @@ mod backend_tests {
         put32(&mut o, 4, DEVICE);
         put32(&mut o, 8, 0x5000_0020);
         put32(&mut o, 12, NV_SEMAPHORE_SURFACE);
-        put64(&mut o, OS64_PARAMS, GUEST_VA);
+        put64(&mut o, NVOS64_P_ALLOC_PARMS, GUEST_VA);
         put32(&mut o, 32, 16);
         let mut n = vec![0u8; 16];
         put32(&mut n, 0, HANDLE);

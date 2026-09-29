@@ -350,7 +350,7 @@ fn fake_answer(
             let params = rd64(a, 16);
             let psize = rd32(a, 32);
             let _ = follow(arg, rd64(a, 24), 4, "RM_ALLOC pRightsRequested");
-            if class == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+            if class == crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                 if !follow(arg, params, 40, "OS descriptor params") {
                     return -libc::EFAULT;
                 }
@@ -380,7 +380,7 @@ fn fake_answer(
             put32(a, 40, status);
         }
         (b'F', NV_ESC_RM_ALLOC_MEMORY) if len >= 56 => {
-            if rd32(a, 12) == crate::osdesc::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
+            if rd32(a, 12) == crate::nvos::NV01_MEMORY_SYSTEM_OS_DESCRIPTOR {
                 pinned(
                     arg,
                     rd64(a, 24),
@@ -397,7 +397,7 @@ fn fake_answer(
             put32(a, 40, status);
         }
         (b'F', NV_ESC_RM_VID_HEAP_CONTROL) if len >= 184 => {
-            if rd32(a, 8) == crate::osdesc::NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR {
+            if rd32(a, 8) == crate::nvos::NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR {
                 pinned(
                     arg,
                     rd64(a, 64),

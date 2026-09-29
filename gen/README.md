@@ -255,8 +255,10 @@ controls RM converts first, each with the V2 it becomes; what DEFERRED_API
 may bundle; whether the parameters (nested structs included) carry a
 pointer, a descriptor, a process id or an OS event; every class of
 `resource_list.h` with its RS flags and implementing NVOC class, and whether
-any GPU the release drives has it (`g_gpu_class_list.c`); and the escape
-blocks' class, function and status offsets from `nvos.h`.
+any GPU the release drives has it (`g_gpu_class_list.c`); and the offsets
+of every field of the escapes' own blocks the backend reads or writes, from
+`nvos.h` (`OS_BLOCKS`; `abi::rmallow::nvos`, re-exported by
+`device/src/nvos.rs`), which render refuses to emit if a release moved one.
 
 The judgement half is `POLICY` in the script. A control or class is allowed
 only if RM would serve it to an unprivileged process (NON_PRIVILEGED, and not

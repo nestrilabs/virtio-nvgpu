@@ -25,8 +25,9 @@ halves, as the other tables here do:
     its number (g_allclasses.h), the NVOC class implementing it, its
     RS_FLAGS, and whether any GPU this RM supports has it
     (g_gpu_class_list.c);
-  * the parameter-block offsets the backend reads (NVOS02/05/21/32/39/54/64
-    status, class and function fields) from nvos.h, by the same probe.
+  * the parameter-block offsets the backend reads and writes (OS_BLOCKS:
+    the NVOSxx escape blocks and the OS descriptor's class parameters)
+    from nvos.h, by the same probe.
 - **The judgement half** (POLICY below): which of those a guest may use.
   See the comment there; README.md, "RM allowlist", has the reasoning.
 
@@ -836,15 +837,46 @@ def host_fields(idx, ptype):
 
 
 OS_BLOCKS = {
-    # (struct, field): offsets the backend reads of the escapes' own blocks.
-    "NVOS02_PARAMETERS": ["hClass", "status"],
+    # (struct, fields): offsets the backend reads and writes of the escapes'
+    # own blocks (device/src/nvos.rs). A field of a union member is named by
+    # its designator, as offsetof takes it. Only layouts every release
+    # shares: render refuses a release where one moved.
+    "NVOS00_PARAMETERS": ["hRoot", "hObjectParent", "hObjectOld", "status"],
+    "NVOS02_PARAMETERS": ["hRoot", "hObjectParent", "hObjectNew", "hClass", "flags",
+                          "pMemory", "limit", "status"],
     "NVOS05_PARAMETERS": ["hClass", "status"],
     "NVOS21_PARAMETERS": ["hClass", "status"],
-    "NVOS32_PARAMETERS": ["function", "status"],
+    "NVOS32_PARAMETERS": ["hRoot", "hObjectParent", "function", "status",
+                          "data.AllocOsDesc.hMemory", "data.AllocOsDesc.attr2",
+                          "data.AllocOsDesc.descriptor", "data.AllocOsDesc.limit",
+                          "data.AllocOsDesc.descriptorType", "data.AllocSize.address",
+                          "data.AllocTiledPitchHeight.address", "data.AllocSizeRange.address",
+                          "data.HwAlloc.bindResultFunc", "data.HwAlloc.pHandle"],
+    "NVOS33_PARAMETERS": ["hClient", "hDevice", "hMemory", "offset", "length",
+                          "pLinearAddress", "status", "flags"],
+    "NVOS34_PARAMETERS": ["hClient", "hDevice", "hMemory", "pLinearAddress", "status",
+                          "flags"],
     "NVOS39_PARAMETERS": ["hClass", "status"],
-    "NVOS54_PARAMETERS": ["cmd", "paramsSize", "status"],
-    "NVOS64_PARAMETERS": ["hClass", "status"],
+    "NVOS54_PARAMETERS": ["hClient", "hObject", "cmd", "flags", "params", "paramsSize",
+                          "status"],
+    "NVOS55_PARAMETERS": ["hClient", "hParent", "hObject", "hClientSrc", "hObjectSrc",
+                          "flags", "status"],
+    "NVOS56_PARAMETERS": ["hClient", "hDevice", "hMemory", "pOldCpuAddress",
+                          "pNewCpuAddress", "status"],
+    "NVOS57_PARAMETERS": ["hClient", "hObject", "sharePolicy", "status"],
+    "NVOS64_PARAMETERS": ["hRoot", "hObjectParent", "hObjectNew", "hClass", "pAllocParms",
+                          "pRightsRequested", "paramsSize", "flags", "status"],
+    "NV_OS_DESC_MEMORY_ALLOCATION_PARAMS": ["type", "flags", "attr", "attr2", "descriptor",
+                                            "limit", "descriptorType"],
 }
+
+
+def block_const(struct, field):
+    """The Rust name of a block field's offset: NVOS32_PARAMETERS and
+    data.AllocOsDesc.hMemory make NVOS32_ALLOC_OS_DESC_H_MEMORY."""
+    short = re.sub(r"_PARAM(ETER)?S$", "", struct)
+    parts = [p for p in field.split(".") if p != "data"]
+    return "_".join([short] + [re.sub(r"(?<!^)([A-Z])", r"_\1", p).upper() for p in parts])
 
 
 def probe(root, types, workdir):
@@ -1193,18 +1225,19 @@ def render(data, observed):
         "    pub total_classes: usize,",
         "}",
         "",
-        "/// Offsets of the escape blocks' fields the gate reads (nvos.h, the",
-        "/// same in every release measured).",
+        "/// The escapes' own blocks (nvos.h), the same in every release measured",
+        "/// (device/src/nvos.rs).",
+        "pub mod nvos {",
+        "    /// Offsets of the fields the backend reads and writes, and sizes.",
     ]
     for s, fields in sorted(blocks.items()):
-        short = s.replace("_PARAMETERS", "")
         for f, v in sorted(fields.items()):
-            cname = short + "_" + re.sub(r"(?<!^)([A-Z])", r"_\1", f).upper()
-            out.append(f"pub const {cname}: usize = {v};")
+            out.append(f"    pub const {block_const(s, f)}: usize = {v};")
     out.append("")
-    out.append("/// NVOS32 function numbers (nvos.h).")
+    out.append("    /// NVOS32 function numbers.")
     for f, num in sorted(vidheap.items(), key=lambda kv: kv[1]):
-        out.append(f"pub const {f}: u32 = {num};")
+        out.append(f"    pub const {f}: u32 = {num};")
+    out.append("}")
     out.append("")
     out.append("/// Every release measured, oldest first.")
     out.append("pub static RELEASES: &[Release] = &[")
