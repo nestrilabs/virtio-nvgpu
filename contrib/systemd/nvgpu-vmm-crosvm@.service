@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# VM N under crosvm (patches/crosvm applied), as nvgpu-vmmN, against
+# vhost-user-nvgpu@N.service. A template: it has passed `systemd-analyze
+# verify`, not yet a run on hardware (DEPLOY.md, "Per-VM users"); the rig
+# has run crosvm only unprivileged, as the desktop user.
+#
+# In /etc/virtio-nvgpu/vmmN.env, the rest of crosvm's command line, one word
+# per option and value (systemd splits the variable at whitespace and takes
+# no quotes; -p may be given once per kernel parameter), the kernel last:
+#   NVGPU_CROSVM_ARGS=--cpus 4 --mem 4096 --block path=/var/lib/virtio-nvgpu/vm0/rootfs.ext4 -p root=/dev/vda -p rw /var/lib/virtio-nvgpu/vmlinux
+# The disk must be nvgpu-vmmN's to write.
+#
+# crosvm's sandbox stays on: every device it emulates, and the nvgpu
+# frontend, is a process of its own in a minijail with user, pid, mount and
+# network namespaces, pivoted into an empty directory (/var/empty). So this
+# unit must not set RestrictNamespaces= or a SystemCallFilter= (minijail
+# installs each device's own), and the host must allow unprivileged user
+# namespaces.
+
+[Unit]
+Description=virtio-nvgpu VM %i (crosvm)
+# The VM's device is the backend: it goes when the backend goes, however
+# the backend ends (Requires= would leave the VM running without it).
+BindsTo=vhost-user-nvgpu@%i.service
+After=vhost-user-nvgpu@%i.service
+
+[Service]
+Type=exec
+User=nvgpu-vmm%i
+Group=nvgpu-vm%i
+SupplementaryGroups=kvm
+EnvironmentFile=/etc/virtio-nvgpu/vmm%i.env
+# The 100 us EEVDF slice for every VMM thread (DEPLOY.md, "Frame pacing").
+ExecStart=/usr/bin/chrt --other --sched-runtime 100000 0 /usr/bin/crosvm run --vhost-user type=nvgpu,socket=/run/nvgpu/vm%i/nvgpu.sock,max-queue-size=256 --no-pci-hotplug-port --pivot-root /var/empty $NVGPU_CROSVM_ARGS
+Restart=no
+TimeoutStopSec=30
+# Size this as guest RAM plus the backend's window (--window-size, 1 GiB by
+# default) plus about 256 MiB: pages of the window the guest touches with
+# nothing placed there are crosvm's shared memory (DEPLOY.md, "Sizing the
+# window").
+#MemoryMax=
+# A VMM that must never beat the desktop to a CPU: a lower weight, or a
+# slice of its own (SECURITY.md §20).
+#CPUWeight=50
+PrivateNetwork=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=

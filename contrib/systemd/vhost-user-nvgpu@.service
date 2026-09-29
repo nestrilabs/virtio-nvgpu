@@ -2,65 +2,80 @@
 #
 # The virtio-nvgpu backend for one VM, as a user of its own: instance N runs
 # as nvgpu-vmN, and the VMM that connects to it runs as nvgpu-vmmN, whose
-# group is nvgpu-vmN (DEPLOY.md, "Per-VM users"). Its socket is
-# /run/nvgpu/vmN/nvgpu.sock, open to that group alone.
+# group is nvgpu-vmN (DEPLOY.md, "Per-VM users"). Its socket,
+# /run/nvgpu/vmN/nvgpu.sock, is vhost-user-nvgpu@N.socket's: systemd binds
+# it, root's and open to that group alone (0660), in a directory of root's,
+# and hands it to the backend (socket activation). The backend's user owns
+# neither, so it can neither replace the socket nor intercept the VMM's
+# connection, whoever else runs as that user (SECURITY.md §22).
 #
-#   systemctl start vhost-user-nvgpu@0.service
+#   systemctl start vhost-user-nvgpu@0.service    # starts the socket too
 #   # then the VMM, as nvgpu-vmm0, with its vhost-user socket at
-#   # /run/nvgpu/vm0/nvgpu.sock; a VMM unit should say
-#   #   Requires=vhost-user-nvgpu@0.service
+#   # /run/nvgpu/vm0/nvgpu.sock; a VMM unit says
+#   #   BindsTo=vhost-user-nvgpu@0.service
 #   #   After=vhost-user-nvgpu@0.service
+#   # (BindsTo, not Requires: a backend that dies on its own -- a panic, a
+#   # seccomp kill, the OOM killer -- stops the VMM with it; Requires would
+#   # leave the VM running with a dead device). nvgpu-vmm-nesbox@.service and
+#   # nvgpu-vmm-crosvm@.service here are such units.
 #
 # Backend flags per VM go in /etc/virtio-nvgpu/vmN.env as
-# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags"); a VM
-# for one heavy application might say
+# NVGPU_BACKEND_ARGS="--allow-compute ..." (DEPLOY.md, "Backend flags"), and
+# the Wayland modes' as NVGPU_WAYLAND_ARGS="--wayland-socket PATH" in the
+# same file: that file wins over any Environment= a drop-in sets, so every
+# flag goes there. A VM for one heavy application might say
 #   NVGPU_BACKEND_ARGS="--window-size 16384 --window-owner-share 90"
 # (DEPLOY.md, "Sizing the window": the VMM follows the size, and under
-# crosvm its MemoryMax must cover guest RAM plus the window). For
-# capture injection (DEPLOY.md, "Capture injection") that file also says
-#   NVGPU_BACKEND_ARGS="--inject-socket /run/nvgpu/vmN/inject.sock --inject-uid UID"
-#   NVGPU_INJECT_GROUP=<the VM's capture helper's group>
-# and the socket is opened to that group once the backend has bound it.
-# Paths assume the backend at /usr/bin and the socket helper at
-# /usr/libexec/virtio-nvgpu; adjust them (or use nix/module.nix) as installed.
+# crosvm its MemoryMax must cover guest RAM plus the window). For capture
+# injection (DEPLOY.md, "Capture injection") that file says
+#   NVGPU_BACKEND_ARGS="--inject-uid UID"
+# and vhost-user-nvgpu-inject@N.socket binds the helper's socket, open to
+# its group, and hands it over; a drop-in here then says
+#   [Unit]
+#   Requires=vhost-user-nvgpu-inject@N.socket
+# The backend is assumed at /usr/bin; adjust the path (or use
+# nix/module.nix) as installed.
 #
 # What the unit adds to the backend's own sandbox (device/src/sandbox.rs):
 # a cgroup of the VM's own with a memory and task bound and the OOM killer's
 # preference, a network namespace with only loopback (the backend keeps it
 # rather than making one, and it still hears the kernel's uevents), and a
-# read-only view of the file system. The backend needs, at run time: the
-# GPU's nodes (/dev/nvidia*, /dev/dri/renderD*, /dev/dri/card* with
-# --kms-card, /dev/udmabuf, /dev/null), /proc/driver/nvidia, /proc/self,
-# /proc/cpuinfo and the GPUs' directories in /sys, all of which this leaves
-# reachable; its socket directory, which RuntimeDirectory= makes; and, in the
-# Wayland modes, the compositor's socket (DEPLOY.md, "The Wayland modes").
+# read-only view of the file system with nothing executable but the backend
+# and its libraries. The backend needs, at run time: the GPU's nodes
+# (/dev/nvidia*, /dev/dri/renderD*, /dev/dri/card* with --kms-card,
+# /dev/udmabuf, /dev/null), /proc/driver/nvidia, /proc/self, /proc/cpuinfo
+# and the GPUs' directories in /sys, all of which this leaves reachable; its
+# sockets, which it is handed; and, in the Wayland modes, the compositor's
+# socket (DEPLOY.md, "The Wayland modes").
 
 [Unit]
 Description=virtio-nvgpu vhost-user backend for VM %i
 # The host driver must be loaded and nvidia_drm.modeset=1 (DEPLOY.md).
 After=systemd-modules-load.service
+Requires=vhost-user-nvgpu@%i.socket
+After=vhost-user-nvgpu@%i.socket
+# Ordering only: pulled in by the inject drop-in above, where there is one.
+After=vhost-user-nvgpu-inject@%i.socket
 
 [Service]
 Type=exec
 User=nvgpu-vm%i
 Group=nvgpu-vm%i
 # The device nodes' groups: render nodes (render), card nodes (video, only
-# with --kms-card), /dev/udmabuf (kvm). /dev/nvidia* are 0666.
+# with --kms-card), /dev/udmabuf (kvm). /dev/nvidia* are 0666. kvm also
+# opens /dev/kvm to the backend until its sandbox (Landlock) takes that
+# away at start; it never opens it.
 SupplementaryGroups=video render kvm
 Environment=RUST_LOG=warn
 EnvironmentFile=-/etc/virtio-nvgpu/vm%i.env
-ExecStart=/usr/bin/vhost-user-nvgpu --socket /run/nvgpu/vm%i/nvgpu.sock $NVGPU_BACKEND_ARGS
-# Open the socket to the VMM's group once it exists, as root, after making
-# the directory root's so the backend's user can no longer swap the socket
-# for a link (the same steps as the rig launcher's root mode).
-# $NVGPU_INJECT_GROUP, unset, is no argument at all.
-ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-socket-open /run/nvgpu/vm%i nvgpu-vm%i $NVGPU_INJECT_GROUP
-RuntimeDirectory=nvgpu/vm%i
-RuntimeDirectoryMode=0700
+# No --socket: the socket is descriptor 3, from vhost-user-nvgpu@%i.socket.
+# $NVGPU_WAYLAND_ARGS, unset, is no argument at all.
+ExecStart=/usr/bin/vhost-user-nvgpu $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS
 UMask=0077
 
 # A backend that stops takes its VM's device with it; the VMM must be
-# restarted with it, so this is never restarted alone.
+# restarted with it (BindsTo= in the VMM's unit), so this is never
+# restarted alone.
 Restart=no
 TimeoutStopSec=10
 
@@ -87,9 +102,17 @@ SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes
 # AF_NETLINK: the uevent socket (--kms-card, --wayland-lease).
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# No namespaces: PrivateNetwork= below gives the backend one with only
+# loopback, which it keeps rather than making its own (device/src/sandbox.rs).
+# A unit without PrivateNetwork= must allow "user net" here instead.
+RestrictNamespaces=yes
+KeyringMode=private
+ProtectHostname=yes
+ProtectKernelLogs=yes
 
-# The file system, read-only but the socket directory; no home directories
-# (the Wayland modes need a drop-in: DEPLOY.md).
+# The file system, read-only; no home directories (the Wayland modes need a
+# drop-in: DEPLOY.md); nothing executable but the backend and the libraries
+# it maps (it never execs). The paths that do not exist are passed over.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -99,6 +122,8 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectProc=invisible
+NoExecPaths=/
+ExecPaths=/usr/bin/vhost-user-nvgpu -/usr/lib -/usr/lib64 -/lib -/lib64 -/nix/store
 # Not set, on purpose: PrivateDevices= and DevicePolicy=/DeviceAllow= (the
 # backend needs the GPU's nodes; Landlock already holds it to those; a unit
 # that adds a device policy must name major 195 as char-nvidia, which is what
@@ -106,7 +131,11 @@ ProtectProc=invisible
 # denies /dev/nvidia0), and
 # ProtectClock=, which closes the device policy as a side effect;
 # PrivateUsers= (RM, DRM and NVKMS take a guest's privilege from the
-# backend's real uid); ProcSubset=pid (it reads /proc/driver/nvidia).
+# backend's real uid); ProcSubset=pid (it reads /proc/driver/nvidia);
+# RemoveIPC= (PrivateIPC= already keeps its System V IPC and message queues
+# its own, and in a drop-in that runs the backend as a login user -- export
+# mode -- it would remove that user's shared memory when the VM stops);
+# SystemCallFilter= (the backend installs its own allowlist once started).
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The vhost-user socket of VM N's backend (vhost-user-nvgpu@N.service),
+# bound by systemd and handed to the backend as descriptor 3 (socket
+# activation; the backend takes LISTEN_FDS). The socket is root's and open
+# to nvgpu-vmN, the group of the VM's VMM user and no one else's; the
+# directory it is in is root's. Whoever listens here receives the guest's
+# memory, so it is never the backend user's to bind, rename or replace
+# (SECURITY.md §22). The service starts it (Requires=); a connection while
+# the backend is not running starts the backend.
+
+[Unit]
+Description=virtio-nvgpu vhost-user socket for VM %i
+
+[Socket]
+ListenStream=/run/nvgpu/vm%i/nvgpu.sock
+SocketUser=root
+SocketGroup=nvgpu-vm%i
+SocketMode=0660
+DirectoryMode=0711
+FileDescriptorName=vhost-user
+Accept=no
+RemoveOnStop=yes

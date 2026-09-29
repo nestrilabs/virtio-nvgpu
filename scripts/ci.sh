@@ -4,12 +4,21 @@
 #
 # Usage: scripts/ci.sh [fast|kernel|nightly|all]...   (default: fast)
 #
-#   fast     no GPU, no network beyond crates, minutes: rustfmt, clippy with
-#            -D warnings over the workspace and all targets, the workspace's
-#            tests with the vhost-user backend, the unsafe-confinement check,
-#            the NixOS module's patches against the patches they stand for,
-#            and the scripts' syntax. The root flake's checks.x86_64-linux
-#            runs the Rust half of it (`nix flake check`).
+#   fast     no GPU, no network beyond crates and the flake's nixpkgs,
+#            minutes: rustfmt, clippy with -D warnings over the workspace and
+#            all targets, the workspace's tests with the vhost-user backend,
+#            the unsafe-confinement check, the NixOS module's patches against
+#            the patches they stand for, the scripts' syntax (and shellcheck
+#            of the launcher and its dry run), and the deployment:
+#            nix/module.nix evaluated with its assertions tried and its units
+#            compared with contrib/systemd's (checks.module-eval), those
+#            units through `systemd-analyze verify`, patches/crosvm applied
+#            in order to c0474109d64d (from CROSVM_SRC, or the rig's crosvm
+#            checkout; skipped, and said, where there is none), and, on a
+#            NixOS host with user namespaces, the launcher's dry run
+#            (rig/verify/launcher-dryrun). The root flake's
+#            checks.x86_64-linux runs the Rust half and the module's
+#            evaluation (`nix flake check`).
 #   kernel   the guest module, C and Rust parsers, against a guest kernel's
 #            build tree: no warning allowed, and the Rust object may name no
 #            panic symbol (driver/Makefile). Needs
@@ -94,9 +103,95 @@ nixos_patches_check() {
 
 scripts_syntax_check() {
     local rc=0 f
-    for f in $(git ls-files '*.sh' contrib/systemd/nvgpu-socket-open); do
+    for f in $(git ls-files '*.sh'); do
         bash -n "$f" || rc=1
     done
+    # The root launcher and what checks it: warnings are defects there.
+    if command -v shellcheck >/dev/null; then
+        shellcheck -S warning -e SC1007 rig/run-guest.sh rig/verify/launcher-dryrun/*.sh \
+            scripts/verify-units.sh || rc=1
+    else
+        echo "shellcheck: skipped (none on PATH)" >&2
+    fi
+    return $rc
+}
+
+# nix/module.nix evaluated: its assertions refuse what they must, and its
+# units say what contrib/systemd's do (nix/module-test.nix).
+module_eval_check() {
+    nix build --no-link .#checks.x86_64-linux.module-eval
+}
+
+units_check() {
+    if command -v systemd-analyze >/dev/null; then
+        scripts/verify-units.sh
+    else
+        echo "systemd units: skipped (no systemd-analyze)" >&2
+    fi
+}
+
+# patches/crosvm applied in order to the commit it was made against, in a
+# scratch index (no checkout): a series that no longer applies is found
+# here, not by the next person to build it.
+CROSVM_BASE=c0474109d64d
+crosvm_patches_check() {
+    local src=${CROSVM_SRC:-} c w p rc=0
+    if [ -z "$src" ]; then
+        for c in .rig/src/crosvm .rig/src/crosvm-compute; do
+            if [ -e "$c/.git" ] && git -C "$c" cat-file -e "$CROSVM_BASE^{commit}" 2>/dev/null; then
+                src=$c
+                break
+            fi
+        done
+    fi
+    if [ -z "$src" ]; then
+        echo "crosvm patches: skipped (no crosvm checkout with $CROSVM_BASE; set CROSVM_SRC)" >&2
+        return 0
+    fi
+    w=$(mktemp -d)
+    if git clone -q --bare --shared "$src" "$w/git" &&
+        GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git read-tree "$CROSVM_BASE"; then
+        for p in patches/crosvm/*.patch; do
+            GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git apply --cached -- "$p" || {
+                echo "crosvm patches: $p does not apply after the ones before it" >&2
+                rc=1
+                break
+            }
+        done
+    else
+        rc=1
+    fi
+    rm -rf "$w"
+    return $rc
+}
+
+# The launcher's dry run (stubs, a user namespace, the NixOS tools).
+launcher_dryrun_check() {
+    local out
+    if [ ! -e /run/current-system/sw/bin ] || ! unshare --user --map-root-user true 2>/dev/null; then
+        echo "launcher dry run: skipped (needs NixOS and unprivileged user namespaces)" >&2
+        return 0
+    fi
+    out=$(rig/verify/launcher-dryrun/run.sh 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+    # What the new launcher must do (rig/verify/launcher-dryrun/inside.sh).
+    local want=(
+        "stub backend: LISTEN_FDS=1 LISTEN_FDNAMES=vhost-user LISTEN_PID is mine: yes"
+        "ok: the run's directory stayed root's"
+        "are for diagnosis only: NVGPU_DIAGNOSTIC=1 as well"
+        "WARNING: diagnostic flag --allow-unmeasured-release"
+        "another run with the tag dup.vm0 is running"
+        "1 cap line"
+        "ESC bytes on the launcher's output: 0"
+        "jailer stub: environment clean"
+        "is not root's (uid 65534)"
+        "the stale backend: killed"
+        "WARNING: diagnostic flag --permissive-abi"
+    )
+    local w rc=0
+    for w in "${want[@]}"; do
+        grep -qF -- "$w" <<<"$out" || { echo "launcher dry run: no \"$w\"" >&2; rc=1; }
+    done
+    [ $rc = 0 ] || printf '%s\n' "$out" >&2
     return $rc
 }
 
@@ -107,6 +202,10 @@ fast() {
     step "unsafe confinement" scripts/check-unsafe.sh
     step "patches/nixos match their sources" nixos_patches_check
     step "shell syntax" scripts_syntax_check
+    step "NixOS module evaluated" module_eval_check
+    step "systemd units" units_check
+    step "patches/crosvm apply to $CROSVM_BASE" crosvm_patches_check
+    step "launcher dry run" launcher_dryrun_check
 }
 
 # ── kernel ───────────────────────────────────────────────────────────────────

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# VM N under nesbox, as nvgpu-vmmN, against vhost-user-nvgpu@N.service. A
+# template: it has passed `systemd-analyze verify`, not yet a run on
+# hardware (DEPLOY.md, "Per-VM users"); the rig's root launcher
+# (rig/run-guest.sh) is what has run the same arrangement.
+#
+# In /etc/virtio-nvgpu/vmmN.env:
+#   NVGPU_VMM_CONFIG=/etc/virtio-nvgpu/vmN.json   # nesbox's config
+#   NVGPU_JAIL_ROOT=/var/lib/virtio-nvgpu/jail    # the jail image: nesbox at
+#                                                 # usr/bin/nesbox (and
+#                                                 # virtiofsd for a share)
+# The config names the backend's socket, "gpu-forward": { "socket":
+# "/run/nvgpu/vmN/nvgpu.sock" }, and "unshare-network": false -- nesbox
+# cannot make a user namespace once chrooted, so the network namespace is
+# this unit's (PrivateNetwork=). The disk it names must be nvgpu-vmmN's to
+# write.
+#
+# nesbox's jailer (nesbox tools/jailer, Linux 5.8 or later) starts as root:
+# it makes the jail's mount namespace with a /proc of its own
+# (hidepid=invisible) and only the parts of /sys nesbox reads, chroots into
+# the jail image, and becomes nvgpu-vmmN in group nvgpu-vmN with no
+# supplementary group, so /dev/kvm must be 0666 (systemd's default rule).
+# It refuses a uid that has a live process on the host.
+
+[Unit]
+Description=virtio-nvgpu VM %i (nesbox)
+# The VM's device is the backend: it goes when the backend goes, however
+# the backend ends (Requires= would leave the VM running without it).
+BindsTo=vhost-user-nvgpu@%i.service
+After=vhost-user-nvgpu@%i.service
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/virtio-nvgpu/vmm%i.env
+# The 100 us EEVDF slice for every VMM thread (DEPLOY.md, "Frame pacing");
+# the uid and gid by name, which the jailer takes as numbers.
+ExecStart=/bin/sh -c 'exec chrt --other --sched-runtime 100000 0 jailer --config "$NVGPU_VMM_CONFIG" --jail-root "$NVGPU_JAIL_ROOT" --uid "$(id -u nvgpu-vmm%i)" --gid "$(getent group nvgpu-vm%i | cut -d: -f3)"'
+Restart=no
+TimeoutStopSec=30
+# Guest RAM is committed at boot; size this as guest RAM plus about 256 MiB
+# (nesbox leaves the window PROT_NONE until something is placed there).
+#MemoryMax=
+# A VMM that must never beat the desktop to a CPU: a lower weight, or a
+# slice of its own (SECURITY.md §20).
+#CPUWeight=50
+PrivateNetwork=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
