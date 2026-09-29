@@ -1653,6 +1653,20 @@ impl Prepared {
     /// otherwise, before the host sees the call. The kernel reads the id as
     /// a u32 whatever width it travels in (drm_framebuffer_lookup), so that
     /// is what is checked.
+    /// Whether `value` may be set on a property with `flags`: anything for
+    /// a property that is no blob; for a blob property (MODE_ID, GAMMA_LUT,
+    /// CTM, damage clips) none, or a blob this VM made or sees. Blob ids
+    /// are the device's, and a commit of another tenant's id would make
+    /// OBJ_GETPROPERTIES report it and GETPROPBLOB read it -- and a
+    /// TEST_ONLY commit alone says whether it exists and how large it is
+    /// (review 2026-09-29 1.9).
+    fn blob_usable(&self, flags: u32, value: u64) -> bool {
+        flags & DRM_MODE_PROP_BLOB == 0
+            || value == 0
+            || u32::try_from(value)
+                .is_ok_and(|id| self.kms.as_ref().is_some_and(|k| k.vm.blob_readable(id)))
+    }
+
     fn fb_usable(&mut self, id: u32) -> bool {
         match &self.kms {
             Some(k) => k.claim_scan_out(id, &mut self.fb_uses),
@@ -1754,13 +1768,16 @@ impl Prepared {
             // drm_mode_connector_set_property / drm_mode_obj_set_property:
             // prop_id @8 in both.
             let id = rd(self.bytes(0), 8, 4) as u32;
-            let name = self.prop_name(fd, id)?;
+            let (name, flags) = self.prop_info(fd, id)?;
             if self.hooks.prop_kind(trim(&name)) != PropKind::Plain {
                 return Err(libc::EINVAL);
             }
             // value @0: the same framebuffer rule as ATOMIC's, or the
             // legacy setter is the way round it (S-6).
             if Self::is_fb_prop(trim(&name)) && !self.fb_usable(rd(self.bytes(0), 0, 4) as u32) {
+                return Err(libc::EPERM);
+            }
+            if !self.blob_usable(flags, rd(self.bytes(0), 0, 8)) {
                 return Err(libc::EPERM);
             }
         }
@@ -1786,7 +1803,16 @@ impl Prepared {
                 .iter()
                 .position(|r| r.slot.is_none() && r.off == off);
             let out_rec = self.fence_outs.iter().position(|&(o, _)| o == off);
-            let name = self.prop_name(fd, id)?;
+            let (name, flags) = self.prop_info(fd, id)?;
+            if !self.blob_usable(flags, value) {
+                log::warn!(
+                    "ATOMIC on handle {} sets {} to blob {value}, which no file of this VM \
+                     made or sees; refused",
+                    self.target,
+                    String::from_utf8_lossy(trim(&name)),
+                );
+                return Err(libc::EPERM);
+            }
             if Self::is_fb_prop(trim(&name)) && !self.fb_usable(value as u32) {
                 log::warn!(
                     "ATOMIC on handle {} sets {} to framebuffer {}, which no file of this VM \
@@ -1836,16 +1862,12 @@ impl Prepared {
         Ok(())
     }
 
-    /// A property's name, by GETPROPERTY on the target file with every count
-    /// zero (drm_property.c:458: then neither pointer is written). Property
-    /// ids are device-global and fixed for the device's life, so the answer is
-    /// cached for the file. A property the host does not know is refused: the
-    /// host would refuse the call anyway, and "unknown" is not "plain".
-    fn prop_name(&self, fd: RawFd, id: u32) -> Result<[u8; 32], Errno> {
-        self.prop_info(fd, id).map(|(name, _)| name)
-    }
-
-    /// Property `id`'s name and flags, as `prop_name`.
+    /// A property's name and flags, by GETPROPERTY on the target file with
+    /// every count zero (drm_property.c:458: then neither pointer is
+    /// written). Property ids are device-global and fixed for the device's
+    /// life, so the answer is cached for the file. A property the host does
+    /// not know is refused: the host would refuse the call anyway, and
+    /// "unknown" is not "plain".
     fn prop_info(&self, fd: RawFd, id: u32) -> Result<([u8; 32], u32), Errno> {
         if let Some(n) = self
             .kms
@@ -4047,6 +4069,40 @@ mod tests {
         // And what a file made or saw goes with it.
         h.kms.as_ref().unwrap().retire();
         assert!(!h.kms.as_ref().unwrap().vm.blob_readable(66));
+    }
+
+    /// A blob property may be set only to none or a blob this VM made or
+    /// sees: another tenant's MODE_ID committed to our own CRTC would be
+    /// reported back by OBJ_GETPROPERTIES and read by GETPROPBLOB, and a
+    /// TEST_ONLY commit alone tells whether an id exists (review 2026-09-29
+    /// 1.9).
+    #[test]
+    fn a_blob_property_takes_only_a_blob_this_vm_made_or_sees() {
+        let h = h();
+        {
+            let mut k = h.sys.k();
+            k.props.insert(20, "MODE_ID");
+            k.prop_flags.insert(20, DRM_MODE_PROP_BLOB);
+            k.props.insert(21, "ACTIVE");
+        }
+        let commit = |v: u64| h.kms(&atomic(&[(20, v), (21, 66)], &[2])).unwrap().ret;
+        assert_eq!(commit(66), -libc::EPERM, "another tenant's blob");
+        assert_eq!(commit(1 << 32 | 70), -libc::EPERM);
+        assert_eq!(commit(0), 0, "none");
+        h.kms.as_ref().unwrap().add_blob(66);
+        assert_eq!(commit(66), 0, "one of ours");
+        // The legacy setter, value @0 and prop_id @8.
+        let setprop = |v: u64| {
+            let a = arg(
+                24,
+                &[(0, 8, v), (8, 4, 20), (12, 4, 5), (16, 4, 0xcccc_cccc)],
+            );
+            h.kms(&Rq::new(iowr(0xba, 24)).buf(24, Some(&a)))
+                .unwrap()
+                .ret
+        };
+        assert_eq!(setprop(67), -libc::EPERM);
+        assert_eq!(setprop(66), 0);
     }
 
     // ── forced connector probes (S-8) ──
