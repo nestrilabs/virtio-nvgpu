@@ -948,6 +948,50 @@ struct nvgpu_fd *nvgpu_fd_from_file(struct file *f) {
   return nvgpu_drm_file_nfd(f);
 }
 
+/* ───────── The host's files: GET_PROC_FILES, GET_SYS_FILES ───────── */
+
+/*
+ * GET_PROC_FILES, and GET_SYS_FILES' first section, are records of
+ * {le32 path_len, le32 content_len, path, content}, unaligned, in a stream
+ * with no header that ends where the device stopped writing, or at a record
+ * with both lengths 0 (device/src/nvidia.rs, handle_get_files()).
+ */
+struct nvgpu_file_rec {
+  const u8 *path;
+  const u8 *content;
+  u32 path_len;
+  u32 content_len;
+};
+
+/*
+ * The record at *p, with *p moved past it: true. False at the terminator (*p
+ * past it), at the end of the stream, or for a record that runs past `end`:
+ * then *truncated, *p past its lengths, and nothing of it read. Each length is
+ * checked against what is left, never their sum past the end.
+ */
+static bool nvgpu_file_rec_next(const u8 **p, const u8 *end,
+                                struct nvgpu_file_rec *r, bool *truncated) {
+  __le32 raw[2];
+
+  *truncated = false;
+  if (end - *p < (ptrdiff_t)sizeof(raw))
+    return false;
+  memcpy(raw, *p, sizeof(raw));
+  r->path_len = le32_to_cpu(raw[0]);
+  r->content_len = le32_to_cpu(raw[1]);
+  *p += sizeof(raw);
+  if (!r->path_len && !r->content_len)
+    return false;
+  if (r->path_len > end - *p || r->content_len > end - *p - r->path_len) {
+    *truncated = true;
+    return false;
+  }
+  r->path = *p;
+  r->content = *p + r->path_len;
+  *p += r->path_len + r->content_len;
+  return true;
+}
+
 /* ───────── /proc/driver/nvidia ───────── */
 
 /*
@@ -1079,9 +1123,12 @@ static struct proc_dir_entry *nvgpu_proc_mkdir_parents(char *pathbuf,
 
 static int nvgpu_proc_init(struct nvgpu_device *dev) {
   struct nvgpu_msg_hdr *req;
-  u8 *resp_buf, *p, *end;
+  const u8 *p, *end;
+  u8 *resp_buf;
   /* 512 KiB — vastly more than needed, avoids any size guessing */
   const size_t resp_size = 512 * 1024;
+  struct nvgpu_file_rec rec;
+  bool truncated;
   u32 used;
   int ret = 0;
 
@@ -1112,44 +1159,26 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
     goto out;
   }
 
-  /* The stream has no header; what the device wrote is where it ends. */
   p = resp_buf;
   end = resp_buf + used;
 
   nvgpu_dir_cache_reset();
 
-  while (p + 8 <= end) {
-    u32 path_len, content_len;
+  while (nvgpu_file_rec_next(&p, end, &rec, &truncated)) {
     struct nvgpu_proc_buf *buf;
     char *pathbuf, *leaf;
     struct proc_dir_entry *parent = NULL;
-
-    memcpy(&path_len, p, 4);
-    path_len = le32_to_cpu((__le32)path_len);
-    memcpy(&content_len, p + 4, 4);
-    content_len = le32_to_cpu((__le32)content_len);
-    p += 8;
-
-    if (path_len == 0)
-      break; /* terminator */
-
-    /* Each length against what is left, never their sum past the end. */
-    if (path_len > end - p || content_len > end - p - path_len) {
-      dev_warn(&dev->vdev->dev, "virtio-gpu-nv: proc stream truncated\n");
-      break;
-    }
 
     /*
      * Only under /proc/driver/nvidia, which remove() takes down whole: an
      * entry anywhere else would outlive its data. The backend sends nothing
      * else (device/src/nvidia.rs prefixes every path).
      */
-    if (path_len <= sizeof(NVGPU_PROC_ROOT) ||
-        memcmp(p, NVGPU_PROC_ROOT "/", sizeof(NVGPU_PROC_ROOT))) {
+    if (rec.path_len <= sizeof(NVGPU_PROC_ROOT) ||
+        memcmp(rec.path, NVGPU_PROC_ROOT "/", sizeof(NVGPU_PROC_ROOT))) {
       dev_dbg(&dev->vdev->dev,
               "virtio-gpu-nv: a proc file outside " NVGPU_PROC_ROOT
               " skipped\n");
-      p += path_len + content_len;
       continue;
     }
 
@@ -1159,29 +1188,27 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
       goto out;
     }
 
-    buf->data = kmemdup(p + path_len, content_len, GFP_KERNEL);
+    buf->data = kmemdup(rec.content, rec.content_len, GFP_KERNEL);
     if (!buf->data) {
       kfree(buf);
       ret = -ENOMEM;
       goto out;
     }
-    buf->len = content_len;
+    buf->len = rec.content_len;
 
-    pathbuf = kmalloc(path_len + 1, GFP_KERNEL);
+    pathbuf = kmemdup_nul(rec.path, rec.path_len, GFP_KERNEL);
     if (!pathbuf) {
       kfree(buf->data);
       kfree(buf);
       ret = -ENOMEM;
       goto out;
     }
-    memcpy(pathbuf, p, path_len);
-    pathbuf[path_len] = '\0';
 
     parent = nvgpu_proc_mkdir_parents(pathbuf, &leaf);
     if (proc_create_data(leaf, 0444, parent, &nvgpu_proc_buf_ops, buf)) {
       list_add(&buf->node, &dev->proc_bufs);
       dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: /proc/%s (%u bytes)\n",
-              pathbuf, content_len);
+              pathbuf, rec.content_len);
     } else {
       /* A name the proc core refused (a duplicate): nothing reads it. */
       dev_dbg(&dev->vdev->dev, "virtio-gpu-nv: /proc/%s not made\n",
@@ -1191,8 +1218,9 @@ static int nvgpu_proc_init(struct nvgpu_device *dev) {
     }
 
     kfree(pathbuf);
-    p += path_len + content_len;
   }
+  if (truncated)
+    dev_warn(&dev->vdev->dev, "virtio-gpu-nv: proc stream truncated\n");
 
 out:
   kvfree(resp_buf);
@@ -1525,12 +1553,166 @@ static void nvgpu_parse_dev_info_sizes(struct nvgpu_device *dev, const u8 *p,
   }
 }
 
+/*
+ * Section 1, one record: a GPU's config space ("bus/pci/devices/<addr>/config"),
+ * kept for the fake PCI device at that address if the address is one of the
+ * GPU slots the config space named. Other PCI sysfs files (vendor, device...)
+ * the kernel makes itself once the pci_dev is registered; other paths are
+ * skipped.
+ */
+static void nvgpu_sys_file(struct nvgpu_device *dev,
+                           const struct nvgpu_file_rec *rec) {
+  char path[256] = {};
+  char pci_addr[16] = {};
+  char *rest, *slash;
+  int pi, gi;
+
+  /* NUL-terminated, however long the path the backend sent. */
+  memcpy(path, rec->path, min(rec->path_len, (u32)(sizeof(path) - 1)));
+  if (strncmp(path, "bus/pci/devices/", 16) != 0)
+    return;
+  rest = path + 16; /* "<addr>/<filename>" */
+  slash = strchr(rest, '/');
+  if (!slash || strcmp(slash + 1, "config") != 0)
+    return;
+  memcpy(pci_addr, rest, min((size_t)(slash - rest), sizeof(pci_addr) - 1));
+
+  /* Find existing slot or allocate new one */
+  for (pi = 0; pi < dev->num_pci_roots; pi++)
+    if (strcmp(dev->pci_roots[pi].slot.pci_addr, pci_addr) == 0)
+      break;
+
+  /* Match against known GPU slots to avoid creating
+   * entries for unrelated PCI devices */
+  if (pi == dev->num_pci_roots) {
+    /* The slots config space had: num_gpus may say up to 248. */
+    for (gi = 0;
+         gi < (int)min_t(u32, dev->num_gpus, ARRAY_SIZE(dev->gpu_slots));
+         gi++) {
+      struct nvgpu_pci_slot *ps;
+
+      if (strcmp(dev->gpu_slots[gi].pci_addr, pci_addr) != 0)
+        continue;
+      pi = dev->num_pci_roots;
+      if (pi < NVGPU_MAX_PCI_SLOTS) {
+        ps = &dev->pci_roots[pi].slot;
+        memcpy(ps->pci_addr, pci_addr, sizeof(pci_addr));
+        if (nvgpu_parse_pci_addr(pci_addr, &ps->domain, &ps->bus_nr,
+                                 &ps->slot, &ps->func) == 0)
+          dev->num_pci_roots++;
+        else
+          pi = dev->num_pci_roots; /* parse failed */
+      }
+      break;
+    }
+  }
+
+  if (pi < dev->num_pci_roots) {
+    struct nvgpu_pci_slot *ps = &dev->pci_roots[pi].slot;
+    u32 copy = min(rec->content_len, (u32)sizeof(ps->config));
+
+    memcpy(ps->config, rec->content, copy);
+    ps->config_valid = true;
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: stored config space for %s (%u bytes)\n",
+            pci_addr, copy);
+  }
+}
+
+/*
+ * Section 2: the DRI devices, a u32 count and that many records of
+ * {name_len, major, minor, slot_index, dev_info[9]} and the name. Every
+ * record is walked, and only the first NVGPU_MAX_DRI_DEVS kept: section 3
+ * starts after the last one, so stopping early would leave the card records
+ * unreachable. Where section 3 starts, or NULL if this one did not end
+ * whole.
+ */
+static const u8 *nvgpu_parse_dri_section(struct nvgpu_device *dev,
+                                         const u8 *p, const u8 *end) {
+  __le32 raw_num_dri;
+  u32 num_dri, i;
+
+  if (end - p < (ptrdiff_t)sizeof(raw_num_dri)) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: sys stream truncated before DRI section\n");
+    return NULL;
+  }
+  memcpy(&raw_num_dri, p, sizeof(__le32));
+  num_dri = le32_to_cpu(raw_num_dri);
+  p += 4;
+
+  dev->num_dri_devs = 0;
+  for (i = 0; i < num_dri; i++) {
+    __le32 raw_name_len, raw_major, raw_minor, raw_slot, raw_info;
+    u32 name_len, major, minor, slot_index, nl;
+    u32 info[NVGPU_DEV_INFO_WORDS];
+    struct nvgpu_dri_dev *d;
+    int w;
+
+    /* name_len + major + minor + slot_index, then the dev_info words */
+    if (end - p < NVGPU_DRI_RECORD_BYTES) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: DRI section truncated at entry %u\n", i);
+      return NULL;
+    }
+
+    memcpy(&raw_name_len, p, sizeof(__le32));
+    memcpy(&raw_major, p + 4, sizeof(__le32));
+    memcpy(&raw_minor, p + 8, sizeof(__le32));
+    memcpy(&raw_slot, p + 12, sizeof(__le32));
+    name_len = le32_to_cpu(raw_name_len);
+    major = le32_to_cpu(raw_major);
+    minor = le32_to_cpu(raw_minor);
+    slot_index = le32_to_cpu(raw_slot);
+    for (w = 0; w < NVGPU_DEV_INFO_WORDS; w++) {
+      memcpy(&raw_info, p + 16 + 4 * w, sizeof(__le32));
+      info[w] = le32_to_cpu(raw_info);
+    }
+    p += NVGPU_DRI_RECORD_BYTES;
+
+    if (name_len == 0 || name_len > end - p) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: DRI entry %u bad name_len %u\n", i, name_len);
+      return NULL;
+    }
+    if (dev->num_dri_devs >= NVGPU_MAX_DRI_DEVS) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: DRI entry %u is past the %d this driver "
+               "keeps\n",
+               i, NVGPU_MAX_DRI_DEVS);
+      p += name_len;
+      continue;
+    }
+
+    d = &dev->dri_devs[dev->num_dri_devs];
+    nl = min(name_len, (u32)(sizeof(d->name) - 1));
+    memset(d->name, 0, sizeof(d->name));
+    memcpy(d->name, p, nl);
+    d->major = major;
+    d->minor = minor;
+    d->slot_index = slot_index;
+    d->card_index = -1;
+    memcpy(d->dev_info, info, sizeof(info));
+    d->dev_info_size = sizeof(info);
+    dev->num_dri_devs++;
+
+    dev_dbg(&dev->vdev->dev,
+            "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
+            "page kind %u/%u, sector layout %u\n",
+            d->name, major, minor, slot_index, info[0], info[4], info[5],
+            info[6]);
+    p += name_len;
+  }
+  return p;
+}
+
 static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   struct nvgpu_msg_hdr *req;
+  struct nvgpu_file_rec rec;
+  const u8 *p, *end;
   u8 *resp_buf;
-  u8 *p, *end;
   const int resp_max = 128 * 1024;
-  bool dri_complete = false;
+  bool truncated;
   u32 used;
   int ret = 0;
 
@@ -1555,192 +1737,19 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   if (ret < 0)
     goto out;
 
-  /* A headerless stream: it ends where the device stopped writing. */
   p = resp_buf;
   end = resp_buf + used;
 
-  /* ── Section 1: sysfs files ─────────────────────────────────────── */
-  while (p + 8 <= end) {
-    /* memcpy: the stream's fields are not aligned. */
-    __le32 raw_path_len, raw_content_len;
-    u32 path_len, content_len, copy_len;
-    char path[256];
-
-    memcpy(&raw_path_len, p, sizeof(__le32));
-    memcpy(&raw_content_len, p + 4, sizeof(__le32));
-    path_len = le32_to_cpu(raw_path_len);
-    content_len = le32_to_cpu(raw_content_len);
-    p += 8;
-
-    if (path_len == 0 && content_len == 0)
-      break; /* terminator */
-
-    if (path_len > end - p || content_len > end - p - path_len) {
-      dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: sys stream truncated at sysfs section\n");
-      break;
-    }
-
-    /* NUL-terminated, however long the path the backend sent. */
-    memset(path, 0, sizeof(path));
-    copy_len = min(path_len, (u32)(sizeof(path) - 1));
-    memcpy(path, p, copy_len);
-    p += path_len;
-
-    if (content_len > end - p) {
-      dev_warn(&dev->vdev->dev,
-               "virtio-gpu-nv: sys stream truncated at content\n");
-      break;
-    }
-
-    if (strncmp(path, "bus/pci/devices/", 16) == 0) {
-      char *rest = path + 16; /* "<addr>/<filename>" */
-      char *slash = strchr(rest, '/');
-
-      if (slash && strcmp(slash + 1, "config") == 0) {
-        char pci_addr[16] = {};
-        int pi;
-
-        memcpy(pci_addr, rest,
-               min((size_t)(slash - rest), sizeof(pci_addr) - 1));
-
-        /* Find existing slot or allocate new one */
-        for (pi = 0; pi < dev->num_pci_roots; pi++)
-          if (strcmp(dev->pci_roots[pi].slot.pci_addr, pci_addr) == 0)
-            break;
-
-        /* Match against known GPU slots to avoid creating
-         * entries for unrelated PCI devices */
-        if (pi == dev->num_pci_roots) {
-          int gi;
-
-          /* The slots config space had: num_gpus may say up to 248. */
-          for (gi = 0; gi < (int)min_t(u32, dev->num_gpus,
-                                       ARRAY_SIZE(dev->gpu_slots));
-               gi++) {
-            if (strcmp(dev->gpu_slots[gi].pci_addr, pci_addr) == 0) {
-              pi = dev->num_pci_roots;
-              if (pi < NVGPU_MAX_PCI_SLOTS) {
-                memcpy(dev->pci_roots[pi].slot.pci_addr, pci_addr,
-                       sizeof(pci_addr));
-                if (nvgpu_parse_pci_addr(pci_addr,
-                                         &dev->pci_roots[pi].slot.domain,
-                                         &dev->pci_roots[pi].slot.bus_nr,
-                                         &dev->pci_roots[pi].slot.slot,
-                                         &dev->pci_roots[pi].slot.func) == 0)
-                  dev->num_pci_roots++;
-                else
-                  pi = dev->num_pci_roots; /* parse failed */
-              }
-              break;
-            }
-          }
-        }
-
-        if (pi < dev->num_pci_roots) {
-          struct nvgpu_pci_slot *ps = &dev->pci_roots[pi].slot;
-          u32 copy = min(content_len, (u32)sizeof(ps->config));
-          memcpy(ps->config, p, copy);
-          ps->config_valid = true;
-          dev_dbg(&dev->vdev->dev,
-                  "virtio-gpu-nv: stored config space for %s (%u bytes)\n",
-                  pci_addr, copy);
-        }
-      }
-      /* Other PCI sysfs files (vendor, device, etc.) are handled
-       * automatically by the kernel once the pci_dev is registered */
-    }
-    /* Unknown paths silently skipped */
-
-    p += content_len;
-  }
-
-  /* ── Section 2: DRI devices ─────────────────────────────────────── */
-  if (p + 4 > end) {
+  /* Section 1: sysfs files. */
+  while (nvgpu_file_rec_next(&p, end, &rec, &truncated))
+    nvgpu_sys_file(dev, &rec);
+  if (truncated)
     dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: sys stream truncated before DRI section\n");
-    goto out;
-  }
+             "virtio-gpu-nv: sys stream truncated at sysfs section\n");
 
-  {
-    __le32 raw_num_dri;
-    u32 num_dri, i;
-
-    memcpy(&raw_num_dri, p, sizeof(__le32));
-    num_dri = le32_to_cpu(raw_num_dri);
-    p += 4;
-
-    /*
-     * Every record is walked, and only the first NVGPU_MAX_DRI_DEVS kept:
-     * section 3 starts after the last one, so stopping early would leave the
-     * card records unreachable.
-     */
-    dev->num_dri_devs = 0;
-
-    for (i = 0; i < num_dri; i++) {
-      __le32 raw_name_len, raw_major, raw_minor, raw_slot, raw_info;
-      u32 name_len, major, minor, slot_index, nl;
-      u32 info[NVGPU_DEV_INFO_WORDS];
-      int idx, w;
-
-      /* name_len + major + minor + slot_index, then the dev_info words */
-      if (p + NVGPU_DRI_RECORD_BYTES > end) {
-        dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: DRI section truncated at entry %u\n", i);
-        break;
-      }
-
-      memcpy(&raw_name_len, p, sizeof(__le32));
-      memcpy(&raw_major, p + 4, sizeof(__le32));
-      memcpy(&raw_minor, p + 8, sizeof(__le32));
-      memcpy(&raw_slot, p + 12, sizeof(__le32));
-      name_len = le32_to_cpu(raw_name_len);
-      major = le32_to_cpu(raw_major);
-      minor = le32_to_cpu(raw_minor);
-      slot_index = le32_to_cpu(raw_slot);
-      for (w = 0; w < NVGPU_DEV_INFO_WORDS; w++) {
-        memcpy(&raw_info, p + 16 + 4 * w, sizeof(__le32));
-        info[w] = le32_to_cpu(raw_info);
-      }
-      p += NVGPU_DRI_RECORD_BYTES;
-
-      if (name_len == 0 || name_len > end - p) {
-        dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: DRI entry %u bad name_len %u\n", i, name_len);
-        break;
-      }
-      if (dev->num_dri_devs >= NVGPU_MAX_DRI_DEVS) {
-        dev_warn(&dev->vdev->dev,
-                 "virtio-gpu-nv: DRI entry %u is past the %d this driver "
-                 "keeps\n",
-                 i, NVGPU_MAX_DRI_DEVS);
-        p += name_len;
-        continue;
-      }
-
-      idx = dev->num_dri_devs;
-      nl = min(name_len, (u32)(sizeof(dev->dri_devs[idx].name) - 1));
-      memset(dev->dri_devs[idx].name, 0, sizeof(dev->dri_devs[idx].name));
-      memcpy(dev->dri_devs[idx].name, p, nl);
-      dev->dri_devs[idx].major = major;
-      dev->dri_devs[idx].minor = minor;
-      dev->dri_devs[idx].slot_index = slot_index;
-      dev->dri_devs[idx].card_index = -1;
-      memcpy(dev->dri_devs[idx].dev_info, info, sizeof(info));
-      dev->dri_devs[idx].dev_info_size = sizeof(info);
-      dev->num_dri_devs++;
-
-      dev_dbg(&dev->vdev->dev,
-              "virtio-gpu-nv: DRI %s (%u:%u) slot %u, nvidia gpu_id=0x%x, "
-              "page kind %u/%u, sector layout %u\n",
-              dev->dri_devs[idx].name, major, minor, slot_index, info[0],
-              info[4], info[5], info[6]);
-      p += name_len;
-    }
-    dri_complete = i == num_dri;
-  }
-
-  if (dri_complete)
+  /* Sections 2, 3 and 4: DRI devices, card nodes, GET_DEV_INFO sizes. */
+  p = nvgpu_parse_dri_section(dev, p, end);
+  if (p)
     nvgpu_parse_dev_info_sizes(dev, nvgpu_parse_card_section(dev, p, end),
                                end);
 
