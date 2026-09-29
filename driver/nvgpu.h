@@ -10,14 +10,17 @@
 #include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/completion.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/kobject.h>
 #include <linux/kref.h>
 #include <linux/list.h>
+#include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/refcount.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
@@ -254,8 +257,12 @@ struct nvgpu_device {
   unsigned int osdesc_early_next;
   bool osdesc_dead;
 
-  /* /proc/driver/nvidia's files' data (nvgpu_main.c, struct nvgpu_proc_buf). */
+  /* /proc/driver/nvidia's files' data (nvgpu_procfs.c, struct nvgpu_proc_buf). */
   struct list_head proc_bufs;
+
+  /* /dev/nvgpu-wl and /dev/nvgpu-capture, when registered (nvgpu_misc.c). */
+  struct nvgpu_misc_node *wl_node;
+  struct nvgpu_misc_node *capture_node;
 };
 
 /*
@@ -341,7 +348,7 @@ struct nvgpu_fd {
  * A GEM parameter struct that carries a userspace pointer, described well
  * enough to forward: where the pointer sits and where the length beside it
  * does. Both are u64. A struct with no pointer is not described here at all --
- * it goes through nvgpu_ioctl_flat_h(), which copies the whole thing.
+ * it goes through nvgpu_ioctl_flat(), which copies the whole thing.
  */
 struct nvgpu_gem_nested_desc {
   u32 size;        /* sizeof the parameter struct */
@@ -474,11 +481,24 @@ int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
 int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
                          void *resp, size_t resp_max,
                          struct nvgpu_ioctl_reply *r);
+/* nvgpu_ioctl_flat() flags */
+#define NVGPU_FLAT_PROC (1u << 0)  /* the calling process after the block */
+#define NVGPU_FLAT_WHOLE (1u << 1) /* a success brings all `sz` back, or -EIO */
+/*
+ * One flat v1 IOCTL on backend handle `handle` (rather than an nvgpu_fd: a GEM
+ * op goes to the file that owns the object, not always the caller's): the
+ * `sz` bytes of `buf` out, with NVGPU_FLAT_PROC the calling process after
+ * them if the backend takes it, and back into `buf` what the reply carries,
+ * its length in *back (may be NULL). Without NVGPU_FLAT_WHOLE that is the
+ * reply's block if it is no longer than `sz`, else nothing; with it, all
+ * `sz` bytes or nothing, and a success that brings less back is -EIO. The
+ * host call's status (0 or -errno), or a transport error, -EIO or -EPROTO.
+ */
+long nvgpu_ioctl_flat(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
+                      void *buf, u32 sz, u32 flags, u32 *back);
 
 /* ───────── nvgpu_main.c ───────── */
 
-long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
-                        void *kbuf, u32 sz);
 /*
  * The backend handle standing for one of this module's open files of device
  * `dev`: an /dev/nvidia* character device, a DRM node of ours (its render
@@ -505,14 +525,14 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
 /* nvgpu_xfer.c: nothing sent will be answered (after a reset, remove()). */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);
-/* nvgpu_fence.c: every guest syncobj waiter looks again. */
+/* nvgpu_syncobj.c: every guest syncobj waiter looks again. */
 void nvgpu_fence_wake_waiters(void);
 
 /*
  * Frame-pacing counters, nvgpu_xfer.c's (ARCHITECTURE.md, "Frame pacing"):
  * relaxed atomics, always kept, read as root from
  * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
- * nvgpu_fence.c count themselves here too.
+ * nvgpu_syncobj.c count themselves here too.
  */
 enum nvgpu_pace_ctr {
   NVGPU_PACE_SW_WAITS,    /* SYNCOBJ_(TIMELINE_)WAITs with a timeout */
@@ -549,6 +569,40 @@ void nvgpu_fd_unregister(struct nvgpu_device *dev, struct nvgpu_fd *nfd);
 void nvgpu_fd_get(struct nvgpu_fd *nfd);
 /* Drops a reference; the last one CLOSEs the backend handle and frees. */
 void nvgpu_fd_put(struct nvgpu_fd *nfd);
+
+/* ───────── nvgpu_procfs.c ───────── */
+
+/*
+ * GET_PROC_FILES, and GET_SYS_FILES' first section, are records of
+ * {le32 path_len, le32 content_len, path, content}, unaligned, in a stream
+ * with no header that ends where the device stopped writing, or at a record
+ * with both lengths 0 (device/src/nvidia.rs, handle_get_files()).
+ */
+struct nvgpu_file_rec {
+  const u8 *path;
+  const u8 *content;
+  u32 path_len;
+  u32 content_len;
+};
+/*
+ * The record at *p, with *p moved past it: true. False at the terminator (*p
+ * past it), at the end of the stream, or for a record that runs past `end`:
+ * then *truncated, *p past its lengths, and nothing of it read.
+ */
+bool nvgpu_file_rec_next(const u8 **p, const u8 *end,
+                         struct nvgpu_file_rec *r, bool *truncated);
+/* /proc/driver/nvidia from GET_PROC_FILES (probe; -ENOMEM is fatal). */
+int nvgpu_proc_init(struct nvgpu_device *dev);
+/* Take /proc/driver/nvidia down, readers waited out, then free its data. */
+void nvgpu_proc_cleanup(struct nvgpu_device *dev);
+
+/* ───────── nvgpu_pci.c ───────── */
+
+/* GET_SYS_FILES: the GPUs' config space, the DRI devices, the host cards. */
+int nvgpu_fetch_sys_files(struct nvgpu_device *dev);
+/* The fake PCI bus and device of each GPU whose config space came. */
+int nvgpu_pci_init(struct nvgpu_device *dev);
+void nvgpu_pci_cleanup(struct nvgpu_device *dev);
 
 /* ───────── nvgpu_drm.c ───────── */
 
@@ -590,6 +644,8 @@ int nvgpu_drm_arg_in(struct nvgpu_drm_arg *a, unsigned int ucmd,
 long nvgpu_drm_arg_out(struct nvgpu_drm_arg *a, long ret);
 /* Free without copying back: the call was not ours after all. */
 void nvgpu_drm_arg_drop(struct nvgpu_drm_arg *a);
+/* ───────── nvgpu_gem.c ───────── */
+
 /*
  * Stand a guest GEM object in front of host object `host_handle` of `owner`'s
  * host file, and return a handle for it in `file`. The proxy takes a
@@ -628,6 +684,13 @@ int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h);
 /* Whether a proxy, alive or dying, holds host GEM `gem` of backend handle
  * `render` (for the reaper, which has only the numbers). */
 bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem);
+/*
+ * Host GEM handle `gem` of `owner`'s render file, which a reply just named
+ * and nothing is to be made of: GEM_CLOSEd, unless a proxy (alive or dying)
+ * holds the number -- the host hands back the handle a file already has for
+ * an object -- which is then that proxy's to close and nobody else's (S-11).
+ */
+void nvgpu_gem_close_unheld(struct nvgpu_fd *owner, u32 gem);
 /* A proxy's fake mmap offset in this node (MAP_DUMB, GEM_MAP_OFFSET). */
 int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
                           u64 *offset);
@@ -657,6 +720,16 @@ struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
 struct nvgpu_gem_object *nvgpu_gem_lookup(struct drm_file *file,
                                           u32 guest_handle);
+/* nvgpu_gem_proxy_create() for a host object just made in `owner`'s file,
+ * sized `size` (the nvidia-drm GEM ioctls that make one). */
+int nvgpu_gem_proxy_create_new(struct drm_file *file, struct nvgpu_fd *owner,
+                               u32 host_handle, size_t size,
+                               u32 *guest_handle);
+/* GEM_IDENTIFY_OBJECT, answered from the proxy (its argument's kernel copy). */
+long nvgpu_gem_identify(struct drm_file *file, void *karg);
+/* drm_driver.gem_prime_import. */
+struct drm_gem_object *nvgpu_gem_prime_import(struct drm_device *dev,
+                                              struct dma_buf *buf);
 
 /* ───────── nvgpu_kms.c ───────── */
 
@@ -747,12 +820,14 @@ int nvgpu_hostfile_lookup(struct nvgpu_device *dev, int fd, u32 kind,
 struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
                                  u32 *handle);
 
-/* ───────── nvgpu_fence.c ───────── */
+/* ───────── nvgpu_fence.c, nvgpu_syncobj.c, nvgpu_semsurf.c ───────── */
 
 /*
  * Fences live on the host (ARCHITECTURE.md §12): a guest sync_file this driver makes
  * wraps an nvgpu host fence, a proxy dma_fence for a host sync_file that
- * signals (with the host's error, if any) when the host's does.
+ * signals (with the host's error, if any) when the host's does
+ * (nvgpu_fence.c); the syncobj ioctls are nvgpu_syncobj.c's, the
+ * semaphore-surface ones nvgpu_semsurf.c's.
  */
 
 struct dma_fence;
@@ -819,6 +894,36 @@ void nvgpu_fence_drain(void);
  * its SYNCOBJ_EVENTFD subscribers, and wake its syncobj waiters. */
 void nvgpu_fence_device_dead(struct nvgpu_device *dev);
 
+/* ───────── nvgpu_misc.c ───────── */
+
+/*
+ * A misc node of a device besides the NVIDIA ones (/dev/nvgpu-wl,
+ * /dev/nvgpu-capture), embedded in its subsystem's own struct. Refcounted:
+ * registration holds one reference, and each open file one more (taken in
+ * its open, under misc_mtx, so none is taken after unregister). The node
+ * holds a reference on `dev` until its last put, which then calls `free` on
+ * it.
+ */
+struct nvgpu_misc_node {
+  struct miscdevice misc;
+  struct nvgpu_device *dev;
+  struct kref ref;
+  void (*free)(struct nvgpu_misc_node *node);
+};
+/* For a node's mode parameter: within 0770, nothing for "other". */
+extern const struct kernel_param_ops nvgpu_misc_mode_ops;
+/* Register `node` as /dev/`name`; on failure it has been put (and freed). */
+int nvgpu_misc_node_register(struct nvgpu_misc_node *node,
+                             struct nvgpu_device *dev, const char *name,
+                             ushort mode, const struct file_operations *fops,
+                             void (*free)(struct nvgpu_misc_node *node));
+/* remove(): no new opens, and registration's reference dropped. */
+void nvgpu_misc_node_unregister(struct nvgpu_misc_node *node);
+/* In a node's .open: the node, whose reference the file then takes. */
+struct nvgpu_misc_node *nvgpu_misc_node_open(struct file *filp);
+void nvgpu_misc_node_get(struct nvgpu_misc_node *node);
+void nvgpu_misc_node_put(struct nvgpu_misc_node *node);
+
 /* ───────── nvgpu_capture.c ───────── */
 
 /* /dev/nvgpu-capture: probe (after HELLO and nvgpu_dri_init()) and remove. */
@@ -841,10 +946,15 @@ unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
 
 /* ═════════════════════════ Protocol v2 internal API ═════════════════════════
  *
- * Ownership: nvgpu_xfer.c (transport, HELLO, TIME_SYNC, HOST_OP, WATCH, event
- * dispatch), nvgpu_i2.c (the schema-driven IOCTL2 interpreter),
+ * Ownership: nvgpu_xfer.c (transport, HELLO, HOST_OP, WATCH, CLOSE),
+ * nvgpu_tbuf.c (transport buffers), nvgpu_clock.c (TIME_SYNC and the host's
+ * clock), nvgpu_events.c (event dispatch and the consumer registry; the
+ * state they share is nvgpu_xfer.h), nvgpu_i2.c (the schema-driven IOCTL2
+ * interpreter),
  * nvgpu_hostfile.c (backend handles as guest files), nvgpu_kms.c,
- * nvgpu_fence.c, nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are nvgpu_wire.h.
+ * nvgpu_fence.c (with nvgpu_syncobj.c and nvgpu_semsurf.c; nvgpu_fence.h
+ * what they share), nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are
+ * nvgpu_wire.h.
  */
 
 struct nvgpu_xfer;
@@ -1103,6 +1213,45 @@ u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev);
 bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle);
 
 /* ── IOCTL2 interpreter (nvgpu_i2.c) ── */
+
+/*
+ * A reply header's status is the backend's word on what the call returned: 0
+ * or a -errno. Anything else -- positive, or below -MAX_ERRNO -- would reach
+ * the caller as an ioctl result no native driver returns, so every reader of
+ * a status fails it with -EPROTO (IOCTL2 here and in nvgpu_kms.c, the v1
+ * exchange in nvgpu_v1.c, the fixed messages in nvgpu_xfer.c).
+ */
+static inline bool nvgpu_status_valid(s32 status) {
+  return status <= 0 && status >= -MAX_ERRNO;
+}
+
+/*
+ * The fixed head of an IOCTL2 request and of its reply. The interpreter
+ * builds the one and reads the other (nvgpu_i2.c; i2.rs's build() and
+ * parse()), and so does nvgpu_kms.c for the calls it makes of its own.
+ */
+struct nvgpu_i2_head {
+  struct nvgpu_msg_hdr hdr;
+  struct nvgpu_i2_req req;
+} __packed;
+
+struct nvgpu_i2_rhead {
+  struct nvgpu_msg_hdr hdr;
+  struct nvgpu_i2_resp resp;
+} __packed;
+
+/* Everything of the head but the record counts, which start at 0. */
+static inline void nvgpu_i2_head_init(struct nvgpu_i2_head *h, u32 handle,
+                                      unsigned int cmd, u32 render, u32 nbuf,
+                                      u32 data_len) {
+  memset(h, 0, sizeof(*h));
+  h->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL2);
+  h->hdr.handle = cpu_to_le32(handle);
+  h->req.cmd = cpu_to_le32(cmd);
+  h->req.nbuf = cpu_to_le32(nbuf);
+  h->req.data_len = cpu_to_le32(data_len);
+  h->req.render = cpu_to_le32(render);
+}
 
 /* Schema classes: which kind of host file the call targets. */
 #define NVGPU_SCLASS_RENDER 1

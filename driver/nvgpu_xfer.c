@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: the transport -- request contexts on the control queue,
- * transport buffers, HELLO and the host clock, HOST_OP / WATCH / CLOSE, and
- * the event queue with its consumer registry.
+ * HOST_OP / WATCH / CLOSE and their async twins, the reaper of replies
+ * nobody waited for, HELLO, probe and remove. Transport buffers are
+ * nvgpu_tbuf.c's, the host's clock nvgpu_clock.c's, the event queue and its
+ * consumer registry nvgpu_events.c's; the state they share is nvgpu_xfer.h.
  *
  * Lock ordering, outermost first. Nothing here sleeps under any of them.
  *
@@ -32,12 +34,7 @@
  */
 
 #include <drm/drm.h>
-#include <drm/drm_device.h>
-#include <drm/drm_file.h>
-#include <drm/drm_sysfs.h>
 #include <linux/bitops.h>
-#include <linux/hashtable.h>
-#include <linux/kobject.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -50,34 +47,9 @@
 #include <linux/virtio_ring.h>
 #include <linux/workqueue.h>
 
-#include "nvgpu.h"
+#include "nvgpu_xfer.h"
 
 /* ───────── Limits ───────── */
-
-/*
- * Largest piece of a transport buffer. Order 4 is the largest allocation the
- * page allocator still makes readily on a fragmented guest, and 64 KiB pieces
- * put 4 MiB -- the most a v2 backend accepts -- in 64 scatter-gather entries.
- */
-#define NVGPU_TBUF_CHUNK SZ_64K
-#define NVGPU_TBUF_CHUNK_ORDER get_order(NVGPU_TBUF_CHUNK)
-/* Below this a buffer is one kmalloc with its header: most messages are tiny,
- * and a page apiece for a 40-byte CLOSE would be pure overhead. */
-#define NVGPU_TBUF_INLINE_MAX 1024
-
-/*
- * Scatter-gather entries per direction.
- *
- * Without indirect descriptors every entry is a ring slot, and a chain longer
- * than the free slots is refused with -ENOSPC -- forever, if it is longer than
- * the ring (virtio_ring.c:688 WARNs and :706 refuses). 32 a side keeps one
- * request to a quarter of a 256-slot ring. With them the chain takes one slot
- * and its table is allocated per request, so the cap is only there to keep
- * that table to a page and a chain within the ring if the table cannot be had
- * (virtqueue_use_indirect() falls back to direct slots, virtio_ring.c:684).
- */
-#define NVGPU_SG_MAX_DIRECT 32
-#define NVGPU_SG_MAX_INDIRECT 128
 
 /*
  * A v1 backend writes its whole reply into the *last* writable descriptor,
@@ -95,30 +67,11 @@
 #define NVGPU_INLINE_TIMEOUT (30 * HZ)
 #define NVGPU_EXECUTOR_TIMEOUT (60 * HZ)
 
-/* Clock: samples per sync, the RTT we trust, how often, how fast to slew. */
-#define NVGPU_TIME_SAMPLES 8
-#define NVGPU_TIME_RTT_GOOD_NS (200 * NSEC_PER_USEC)
-#define NVGPU_TIME_RESYNC (5 * HZ)
-/* 50 us per second, i.e. one part in 20000. */
-#define NVGPU_TIME_SLEW_DIV 20000
-
-#define NVGPU_EVENT_BUFS 16
-
 /* WATCH cookies start above every u32, so none can be mistaken for a handle
  * in an EV_READY record (legacy watches use cookie == handle). */
 #define NVGPU_COOKIE_BASE (1ull << 32)
 
-/* ───────── State ───────── */
-
-struct nvgpu_tbuf {
-  size_t len;
-  unsigned int nents;
-  bool inline_data; /* the data follows sg[0] in this allocation */
-  /* nvgpu_tbuf_on_free(): run when the buffer is freed, whoever frees it. */
-  void (*release)(void *arg);
-  void *release_arg;
-  struct scatterlist sg[];
-};
+/* ───────── Request contexts ───────── */
 
 /*
  * One control-queue request, and the virtqueue token for it.
@@ -144,273 +97,6 @@ struct nvgpu_req {
   bool abandoned;
   bool dead; /* reclaimed after a device reset: never answered */
 };
-
-struct nvgpu_xfer {
-  struct nvgpu_device *dev;
-  spinlock_t lock;
-  bool dead;
-  /* Bumped whenever the device returns buffers: what an -ENOSPC sleeper
-   * waits to see change. */
-  unsigned long space_gen;
-  wait_queue_head_t space_wq;
-
-  bool indirect;
-  unsigned int vring_size;
-  unsigned int max_sg; /* per direction */
-
-  /* Callers spinning for a reply, and callers asleep waiting for one (both
-   * under `lock`): while there are spinners and no sleepers, the control
-   * queue's interrupt is off and the spinners take replies off the ring
-   * themselves (nvgpu_ctrl_poll_enter()). */
-  unsigned int pollers;
-  unsigned int sleepers;
-
-  /* Ring slots executor-class requests may hold between them. */
-  atomic_t exec_avail;
-  int exec_budget;
-  wait_queue_head_t exec_wq;
-
-  atomic_t next_id;
-  /* Ordered: CLOSEs, reaping of abandoned replies, hotplug uevents and the
-   * clock resync run one at a time, in the order they were queued. */
-  struct workqueue_struct *wq;
-
-  /* host_ns = guest_ns + offset; see nvgpu_clk_offset(). */
-  seqlock_t clk_lock;
-  bool clk_valid;
-  s64 off_base;
-  s64 off_target;
-  u64 clk_anchor;
-  /* The host's CLOCK_REALTIME and CLOCK_MONOTONIC_RAW, each less its
-   * CLOCK_MONOTONIC, as of the last sync (TIME_SYNC's long form); valid only
-   * with clk_ext. See nvgpu_host_clock_to_guest(). */
-  bool clk_ext;
-  s64 host_real_mono;
-  s64 host_raw_mono;
-  struct delayed_work sync_work;
-};
-
-struct nvgpu_events {
-  struct nvgpu_device *dev;
-  spinlock_t lock;
-  DECLARE_HASHTABLE(consumers, 6);
-  atomic64_t next_cookie;
-  spinlock_t vq_lock;
-  void *bufs[NVGPU_EVENT_BUFS];
-  struct work_struct hotplug_work;
-  unsigned long hotplug_pending; /* card indices, NVGPU_EV_HOTPLUG_F_HOTPLUG */
-  unsigned long lease_pending;   /* card indices, NVGPU_EV_HOTPLUG_F_LEASE */
-};
-
-/* ───────── Transport buffers ───────── */
-
-static struct nvgpu_tbuf *nvgpu_tbuf_alloc_sg(size_t len, gfp_t gfp,
-                                              unsigned int max_sg) {
-  struct nvgpu_tbuf *tb;
-  size_t remaining = len;
-  unsigned int n = 0;
-
-  gfp &= ~__GFP_HIGHMEM; /* every piece must have a kernel address */
-  if (!len || !max_sg)
-    return NULL;
-
-  if (len <= NVGPU_TBUF_INLINE_MAX) {
-    tb = kmalloc(struct_size(tb, sg, 1) + len, gfp);
-    if (!tb)
-      return NULL;
-    tb->len = len;
-    tb->nents = 1;
-    tb->inline_data = true;
-    tb->release = NULL;
-    sg_init_one(&tb->sg[0], &tb->sg[1], len);
-    return tb;
-  }
-
-  if (len > (size_t)max_sg * NVGPU_TBUF_CHUNK)
-    return NULL;
-
-  tb = kzalloc(struct_size(tb, sg, max_sg), gfp);
-  if (!tb)
-    return NULL;
-  sg_init_table(tb->sg, max_sg);
-
-  /*
-   * Largest pieces first, falling back an order at a time, but never below
-   * the order at which what is left would no longer fit the entries left:
-   * that one is asked for without __GFP_NORETRY, since failing it fails the
-   * buffer. Each piece's order is get_order() of its length, which is what
-   * nvgpu_tbuf_free() relies on -- a short last piece is allocated at the
-   * order of its own length, not the chunk's.
-   */
-  while (remaining) {
-    size_t need = DIV_ROUND_UP(remaining, max_sg - n);
-    unsigned int lo = get_order(need);
-    unsigned int hi = min_t(unsigned int, get_order(remaining),
-                            NVGPU_TBUF_CHUNK_ORDER);
-    struct page *pg = NULL;
-    unsigned int o;
-    size_t clen;
-
-    if (lo > hi)
-      goto fail;
-    for (o = hi;; o--) {
-      gfp_t g = o > lo ? gfp | __GFP_NORETRY | __GFP_NOWARN : gfp;
-
-      pg = alloc_pages(g, o);
-      if (pg || o == lo)
-        break;
-    }
-    if (!pg)
-      goto fail;
-
-    clen = min_t(size_t, remaining, PAGE_SIZE << o);
-    sg_set_page(&tb->sg[n++], pg, clen, 0);
-    remaining -= clen;
-  }
-
-  if (n < max_sg) {
-    sg_unmark_end(&tb->sg[max_sg - 1]);
-    sg_mark_end(&tb->sg[n - 1]);
-  }
-  tb->nents = n;
-  tb->len = len;
-  return tb;
-
-fail:
-  tb->nents = n;
-  nvgpu_tbuf_free(tb);
-  return NULL;
-}
-
-/*
- * NULL on failure. The entry budget depends on the length, not the device:
- * up to 2 MiB the buffer fits the 32 entries a ring without indirect
- * descriptors allows, and larger buffers can only be sent with them anyway.
- */
-struct nvgpu_tbuf *nvgpu_tbuf_alloc(size_t len, gfp_t gfp) {
-  unsigned int max_sg = len <= (size_t)NVGPU_SG_MAX_DIRECT * NVGPU_TBUF_CHUNK
-                            ? NVGPU_SG_MAX_DIRECT
-                            : NVGPU_SG_MAX_INDIRECT;
-
-  return nvgpu_tbuf_alloc_sg(len, gfp, max_sg);
-}
-
-void nvgpu_tbuf_free(struct nvgpu_tbuf *tb) {
-  unsigned int i;
-
-  if (!tb)
-    return;
-  if (tb->release)
-    tb->release(tb->release_arg);
-  if (!tb->inline_data)
-    for (i = 0; i < tb->nents; i++)
-      __free_pages(sg_page(&tb->sg[i]), get_order(tb->sg[i].length));
-  kfree(tb);
-}
-
-size_t nvgpu_tbuf_len(const struct nvgpu_tbuf *tb) { return tb->len; }
-
-/*
- * What a request's numbers stand for, kept until the request is done with:
- * a request buffer is freed by its caller once the reply is in, or by the
- * transport once a request its caller gave up on (-ETIMEDOUT, -EINTR) has
- * been answered late or is known never to run (nvgpu_req_free_orphan()) --
- * the moment the host can no longer act on what the request names. Always
- * process context. One per buffer.
- */
-void nvgpu_tbuf_on_free(struct nvgpu_tbuf *tb, void (*fn)(void *arg),
-                        void *arg) {
-  WARN_ON(tb->release);
-  tb->release = fn;
-  tb->release_arg = arg;
-}
-
-enum nvgpu_tbuf_op {
-  NVGPU_TB_WRITE,
-  NVGPU_TB_WRITE_USER,
-  NVGPU_TB_READ,
-  NVGPU_TB_READ_USER,
-  NVGPU_TB_ZERO,
-};
-
-/* Walks the pieces [off, off + len) falls in and does `op` on each. */
-static int nvgpu_tbuf_copy(struct nvgpu_tbuf *tb, size_t off, void *kbuf,
-                           void __user *ubuf, size_t len,
-                           enum nvgpu_tbuf_op op) {
-  size_t pos = 0;
-  unsigned int i;
-
-  if (len > tb->len || off > tb->len - len)
-    return -EINVAL;
-
-  for (i = 0; i < tb->nents && len; i++) {
-    size_t seglen = tb->sg[i].length, in, n;
-    u8 *va;
-
-    if (off >= pos + seglen) {
-      pos += seglen;
-      continue;
-    }
-    in = off - pos;
-    n = min(seglen - in, len);
-    va = (u8 *)sg_virt(&tb->sg[i]) + in;
-
-    switch (op) {
-    case NVGPU_TB_WRITE:
-      memcpy(va, kbuf, n);
-      kbuf = (u8 *)kbuf + n;
-      break;
-    case NVGPU_TB_READ:
-      memcpy(kbuf, va, n);
-      kbuf = (u8 *)kbuf + n;
-      break;
-    case NVGPU_TB_WRITE_USER:
-      if (copy_from_user(va, ubuf, n))
-        return -EFAULT;
-      ubuf = (u8 __user *)ubuf + n;
-      break;
-    case NVGPU_TB_READ_USER:
-      if (copy_to_user(ubuf, va, n))
-        return -EFAULT;
-      ubuf = (u8 __user *)ubuf + n;
-      break;
-    case NVGPU_TB_ZERO:
-      memset(va, 0, n);
-      break;
-    }
-    off += n;
-    len -= n;
-    pos += seglen;
-  }
-  return 0;
-}
-
-int nvgpu_tbuf_write(struct nvgpu_tbuf *tb, size_t off, const void *src,
-                     size_t len) {
-  return nvgpu_tbuf_copy(tb, off, (void *)src, NULL, len, NVGPU_TB_WRITE);
-}
-
-int nvgpu_tbuf_write_user(struct nvgpu_tbuf *tb, size_t off,
-                          const void __user *src, size_t len) {
-  return nvgpu_tbuf_copy(tb, off, NULL, (void __user *)src, len,
-                         NVGPU_TB_WRITE_USER);
-}
-
-int nvgpu_tbuf_read(const struct nvgpu_tbuf *tb, size_t off, void *dst,
-                    size_t len) {
-  return nvgpu_tbuf_copy((struct nvgpu_tbuf *)tb, off, dst, NULL, len,
-                         NVGPU_TB_READ);
-}
-
-int nvgpu_tbuf_read_user(const struct nvgpu_tbuf *tb, size_t off,
-                         void __user *dst, size_t len) {
-  return nvgpu_tbuf_copy((struct nvgpu_tbuf *)tb, off, NULL, dst, len,
-                         NVGPU_TB_READ_USER);
-}
-
-int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len) {
-  return nvgpu_tbuf_copy(tb, off, NULL, NULL, len, NVGPU_TB_ZERO);
-}
 
 /* ───────── Frame-pacing counters ───────── */
 
@@ -516,11 +202,6 @@ static bool nvgpu_arm_ready = true;
 module_param_named(arm_ready, nvgpu_arm_ready, bool, 0444);
 MODULE_PARM_DESC(arm_ready, "arm RM descriptor readiness per wait (default "
                             "on; takes effect at HELLO)");
-
-struct nvgpu_times {
-  u64 t0; /* just before the request went on the ring */
-  u64 t1; /* in the callback that took it off */
-};
 
 static void nvgpu_req_reap_work(struct work_struct *work);
 static unsigned int nvgpu_release_consumed(struct nvgpu_device *dev,
@@ -682,6 +363,152 @@ static void nvgpu_ctrl_poll_exit(struct nvgpu_device *dev) {
 }
 
 /*
+ * Put `r` on the control ring: executor budget first, for an executor-class
+ * request, then ring space. 0 once it is on the ring (and the device
+ * notified), with *t0 the time it went on; else -EINTR (a fatal signal while
+ * waiting), -ENODEV (the transport died) or the ring's error, with no budget
+ * held and nothing sent.
+ */
+static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
+                              u32 flags, u64 *t0) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  struct scatterlist *sgs[2] = {r->req->sg, r->resp->sg};
+  unsigned long irqf;
+  bool kick = false;
+  u32 units = 0;
+  int ret;
+
+  /*
+   * Executor-class requests can sit on the ring for seconds (a blocking
+   * commit, a modeset). Cap the slots they hold between them at half the ring
+   * less a margin, so inline requests -- RM calls, CLOSE, HOST_OP -- always
+   * find room.
+   */
+  if (flags & NVGPU_XF_EXECUTOR) {
+    bool took = false;
+
+    units = xf->indirect ? 1 : r->req->nents + r->resp->nents;
+    units = min_t(u32, units, xf->exec_budget);
+    /* The condition's last evaluation is the one that ended the wait, so
+     * `took` says whether units are held -- never on an error return. */
+    if (wait_event_killable(xf->exec_wq,
+                            (took = nvgpu_exec_take(xf, units)) ||
+                                READ_ONCE(xf->dead)))
+      return -EINTR;
+    if (!took)
+      return -ENODEV;
+    r->exec_units = units;
+  }
+
+  /*
+   * A full ring is a reason to wait, never to fail: requests that hold their
+   * slots for seconds are normal now. GFP_ATOMIC because the indirect table,
+   * if there is one, is allocated under the lock; if that allocation fails
+   * the ring falls back to direct slots, and max_sg keeps that possible.
+   */
+  for (;;) {
+    unsigned long gen;
+
+    spin_lock_irqsave(&xf->lock, irqf);
+    if (xf->dead) {
+      spin_unlock_irqrestore(&xf->lock, irqf);
+      ret = -ENODEV;
+      break;
+    }
+    *t0 = ktime_get_ns();
+    ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
+    if (!ret) {
+      kick = virtqueue_kick_prepare(dev->ctrl_vq);
+      spin_unlock_irqrestore(&xf->lock, irqf);
+      break;
+    }
+    gen = xf->space_gen;
+    spin_unlock_irqrestore(&xf->lock, irqf);
+
+    if (ret != -ENOSPC)
+      break;
+    if (wait_event_killable(xf->space_wq,
+                            READ_ONCE(xf->space_gen) != gen ||
+                                READ_ONCE(xf->dead))) {
+      ret = -EINTR;
+      break;
+    }
+  }
+  if (ret) {
+    nvgpu_exec_release(xf, units);
+    return ret;
+  }
+  if (kick)
+    virtqueue_notify(dev->ctrl_vq);
+  return 0;
+}
+
+/*
+ * An inline request's caller spins for its reply, up to rt_spin_us (and 1 ms
+ * at most), giving way when the scheduler wants the CPU. Replies are taken
+ * off the ring here while it spins, the interrupt off meanwhile
+ * (nvgpu_ctrl_poll_enter()).
+ */
+static void nvgpu_xfer_spin(struct nvgpu_device *dev, struct nvgpu_req *r) {
+  u32 spin_us = READ_ONCE(nvgpu_rt_spin_us);
+  u64 until;
+
+  if (!spin_us)
+    return;
+  until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
+  nvgpu_ctrl_poll_enter(dev);
+  while (!completion_done(&r->done) && !need_resched() &&
+         ktime_get_ns() < until) {
+    nvgpu_ctrl_poll(dev);
+    cpu_relax();
+  }
+  nvgpu_ctrl_poll_exit(dev);
+}
+
+/*
+ * Wait for the reply to `r` (request `id`, of type `msg_type`): 0 once it is
+ * answered, and `r` still the caller's. On a timeout or a fatal signal first,
+ * -ETIMEDOUT or -EINTR, and `r` is abandoned: the callback reaps and frees it
+ * when the device returns it.
+ */
+static int nvgpu_xfer_await(struct nvgpu_device *dev, struct nvgpu_req *r,
+                            u32 flags, u32 id, u32 msg_type) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long irqf;
+  bool asleep;
+  long wret;
+
+  /* Already answered (usually, after a spin): no sleep to arrange. */
+  asleep = !completion_done(&r->done);
+  if (asleep)
+    nvgpu_ctrl_sleep_enter(dev);
+  wret = wait_for_completion_killable_timeout(
+      &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
+                                            : NVGPU_INLINE_TIMEOUT);
+  if (asleep)
+    nvgpu_ctrl_sleep_exit(dev);
+  if (wret > 0)
+    return 0;
+
+  spin_lock_irqsave(&xf->lock, irqf);
+  if (r->completed) {
+    spin_unlock_irqrestore(&xf->lock, irqf);
+    return 0;
+  }
+  /* Ours no longer: the callback reaps and frees it when it comes back. */
+  r->abandoned = true;
+  __module_get(THIS_MODULE);
+  spin_unlock_irqrestore(&xf->lock, irqf);
+  dev_warn_ratelimited(&dev->vdev->dev,
+                       "virtio-gpu-nv: request %u (msg_type %u) %s; its "
+                       "buffers stay with the transport until the device "
+                       "returns them\n",
+                       id, msg_type,
+                       wret ? "abandoned on a fatal signal" : "timed out");
+  return wret ? -EINTR : -ETIMEDOUT;
+}
+
+/*
  * The one path every request takes. See nvgpu_xfer() in nvgpu.h for the
  * contract; `sent` says whether the request reached the ring, which is what
  * the CLOSE helpers need to know to fall back to their async twins, and `tm`
@@ -691,14 +518,10 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                         struct nvgpu_tbuf *resp, u32 flags, u32 *used_len,
                         struct nvgpu_times *tm, bool *sent, u32 *req_id) {
   struct nvgpu_xfer *xf = dev->xfer;
-  struct scatterlist *sgs[2];
   struct nvgpu_msg_hdr hdr;
   struct nvgpu_req *r;
-  unsigned long irqf;
   u64 t0 = 0;
-  u32 units = 0, id;
-  long wret;
-  bool kick = false, asleep;
+  u32 id;
   int ret;
 
   if (sent)
@@ -752,122 +575,27 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
    * whatever the page held before. */
   nvgpu_tbuf_zero(resp, 0, resp->len);
 
-  sgs[0] = req->sg;
-  sgs[1] = resp->sg;
-
-  /*
-   * Executor-class requests can sit on the ring for seconds (a blocking
-   * commit, a modeset). Cap the slots they hold between them at half the ring
-   * less a margin, so inline requests -- RM calls, CLOSE, HOST_OP -- always
-   * find room.
-   */
-  if (flags & NVGPU_XF_EXECUTOR) {
-    bool took = false;
-
-    units = xf->indirect ? 1 : req->nents + resp->nents;
-    units = min_t(u32, units, xf->exec_budget);
-    /* The condition's last evaluation is the one that ended the wait, so
-     * `took` says whether units are held -- never on an error return. */
-    if (wait_event_killable(xf->exec_wq,
-                            (took = nvgpu_exec_take(xf, units)) ||
-                                READ_ONCE(xf->dead))) {
-      units = 0;
-      ret = -EINTR;
-      goto unsent;
+  ret = nvgpu_xfer_enqueue(dev, r, flags, &t0);
+  if (ret) {
+    kfree(r);
+    /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h.
+     * Unsent, the backend never saw the request, so what it would have
+     * consumed is released here, as the reaper does for a refused one. */
+    if (ret == -EINTR) {
+      nvgpu_release_consumed(dev, req);
+      nvgpu_tbuf_free(req);
+      nvgpu_tbuf_free(resp);
     }
-    if (!took) {
-      units = 0;
-      ret = -ENODEV;
-      goto unsent;
-    }
-    r->exec_units = units;
+    return ret;
   }
-
-  /*
-   * A full ring is a reason to wait, never to fail: requests that hold their
-   * slots for seconds are normal now. GFP_ATOMIC because the indirect table,
-   * if there is one, is allocated under the lock; if that allocation fails
-   * the ring falls back to direct slots, and max_sg keeps that possible.
-   */
-  for (;;) {
-    unsigned long gen;
-
-    spin_lock_irqsave(&xf->lock, irqf);
-    if (xf->dead) {
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      ret = -ENODEV;
-      goto unsent_units;
-    }
-    t0 = ktime_get_ns();
-    ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
-    if (!ret) {
-      kick = virtqueue_kick_prepare(dev->ctrl_vq);
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      break;
-    }
-    gen = xf->space_gen;
-    spin_unlock_irqrestore(&xf->lock, irqf);
-
-    if (ret != -ENOSPC)
-      goto unsent_units;
-    if (wait_event_killable(xf->space_wq,
-                            READ_ONCE(xf->space_gen) != gen ||
-                                READ_ONCE(xf->dead))) {
-      ret = -EINTR;
-      goto unsent_units;
-    }
-  }
-
   if (sent)
     *sent = true;
-  if (kick)
-    virtqueue_notify(dev->ctrl_vq);
 
-  if (!(flags & NVGPU_XF_EXECUTOR)) {
-    u32 spin_us = READ_ONCE(nvgpu_rt_spin_us);
-
-    if (spin_us) {
-      u64 until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
-
-      /* Replies are taken off the ring here while this caller spins, the
-       * interrupt off meanwhile (nvgpu_ctrl_poll_enter()). */
-      nvgpu_ctrl_poll_enter(dev);
-      while (!completion_done(&r->done) && !need_resched() &&
-             ktime_get_ns() < until) {
-        nvgpu_ctrl_poll(dev);
-        cpu_relax();
-      }
-      nvgpu_ctrl_poll_exit(dev);
-    }
-  }
-
-  /* Already answered (usually, after a spin): no sleep to arrange. */
-  asleep = !completion_done(&r->done);
-  if (asleep)
-    nvgpu_ctrl_sleep_enter(dev);
-  wret = wait_for_completion_killable_timeout(
-      &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
-                                            : NVGPU_INLINE_TIMEOUT);
-  if (asleep)
-    nvgpu_ctrl_sleep_exit(dev);
-  if (wret <= 0) {
-    spin_lock_irqsave(&xf->lock, irqf);
-    if (!r->completed) {
-      /* Ours no longer: the callback reaps and frees it when it comes back. */
-      r->abandoned = true;
-      __module_get(THIS_MODULE);
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: request %u (msg_type %u) %s; its "
-                           "buffers stay with the transport until the device "
-                           "returns them\n",
-                           id, le32_to_cpu(hdr.msg_type),
-                           wret ? "abandoned on a fatal signal"
-                                : "timed out");
-      return wret ? -EINTR : -ETIMEDOUT;
-    }
-    spin_unlock_irqrestore(&xf->lock, irqf);
-  }
+  if (!(flags & NVGPU_XF_EXECUTOR))
+    nvgpu_xfer_spin(dev, r);
+  ret = nvgpu_xfer_await(dev, r, flags, id, le32_to_cpu(hdr.msg_type));
+  if (ret)
+    return ret; /* abandoned: `r` and the buffers are the transport's */
 
   ret = r->dead ? -ENODEV : 0;
   if (!ret)
@@ -900,20 +628,6 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
     tm->t1 = r->t1;
   }
   kfree(r);
-  return ret;
-
-unsent_units:
-  nvgpu_exec_release(xf, units);
-unsent:
-  kfree(r);
-  /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h.
-   * Unsent, the backend never saw the request, so what it would have
-   * consumed is released here, as the reaper does for a refused one. */
-  if (ret == -EINTR) {
-    nvgpu_release_consumed(dev, req);
-    nvgpu_tbuf_free(req);
-    nvgpu_tbuf_free(resp);
-  }
   return ret;
 }
 
@@ -980,9 +694,9 @@ out:
   return ret;
 }
 
-static int nvgpu_call(struct nvgpu_device *dev, const void *req,
-                      size_t req_len, void *resp, size_t resp_len, u32 flags,
-                      u32 *used_len, struct nvgpu_times *tm, bool *sent) {
+int nvgpu_call(struct nvgpu_device *dev, const void *req, size_t req_len,
+               void *resp, size_t resp_len, u32 flags, u32 *used_len,
+               struct nvgpu_times *tm, bool *sent) {
   return nvgpu_call_holding(dev, req, req_len, resp, resp_len, flags,
                             used_len, tm, sent, NULL, NULL, NULL);
 }
@@ -1030,17 +744,16 @@ int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
 
 /*
  * Status of a reply that must at least carry a header: 0 or a -errno, and
- * -EPROTO for anything else, which no call of ours may return (as
- * nvgpu_ioctl_reply_parse() and IOCTL2 have it).
+ * -EPROTO for anything else (nvgpu_status_valid()).
  */
-static int nvgpu_hdr_status(const void *resp, u32 used) {
+int nvgpu_hdr_status(const void *resp, u32 used) {
   const struct nvgpu_msg_hdr *h = resp;
   s32 status;
 
   if (used < sizeof(*h))
     return -EIO;
   status = (s32)le32_to_cpu(h->status);
-  return status > 0 || status < -MAX_ERRNO ? -EPROTO : status;
+  return nvgpu_status_valid(status) ? status : -EPROTO;
 }
 
 /* ───────── CLOSE, GEM_CLOSE and their async twins ───────── */
@@ -1121,10 +834,8 @@ static int __nvgpu_gem_close(struct nvgpu_device *dev, u32 file, u32 gem,
       release(arg);
     return 0;
   }
-  req.io.hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req.io.hdr.handle = cpu_to_le32(file);
-  req.io.cmd = cpu_to_le32(DRM_IOCTL_GEM_CLOSE);
-  req.io.data_len = cpu_to_le32(sizeof(req.arg));
+  nvgpu_ioctl_req_init(&req.io, file, DRM_IOCTL_GEM_CLOSE, sizeof(req.arg), 0,
+                       0, 0, 0);
   req.arg.handle = gem;
   ret = nvgpu_call_holding(dev, &req, sizeof(req), &resp, sizeof(resp), 0,
                            &used, NULL, &sent, NULL, release, arg);
@@ -1404,7 +1115,9 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
  */
 static unsigned int nvgpu_host_op_drop(struct nvgpu_device *dev, u32 op,
                                        u64 arg0, u64 res0) {
-  if (!res0 || res0 > U32_MAX)
+  u32 h;
+
+  if (!nvgpu_res_u32(res0, &h))
     return 0;
   switch (op) {
   case NVGPU_OP_PRIME_EXPORT:
@@ -1412,16 +1125,16 @@ static unsigned int nvgpu_host_op_drop(struct nvgpu_device *dev, u32 op,
   case NVGPU_OP_NEW_EVENTFD:
   case NVGPU_OP_SIGNALED_SYNC_FILE:
   case NVGPU_OP_OPEN_KMS:
-    __nvgpu_close_handle(dev, (u32)res0, true);
+    __nvgpu_close_handle(dev, h, true);
     return 1;
   case NVGPU_OP_DMABUF_IMPORT:
   case NVGPU_OP_INJECT_OPEN:
     /* A GEM handle in the render file named by the first argument -- unless
      * the file already had one for the buffer, which the host then returns
      * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
-    if (nvgpu_gem_handle_held(dev, (u32)arg0, (u32)res0))
+    if (nvgpu_gem_handle_held(dev, (u32)arg0, h))
       return 0;
-    __nvgpu_gem_close(dev, (u32)arg0, (u32)res0, true, NULL, NULL);
+    __nvgpu_gem_close(dev, (u32)arg0, h, true, NULL, NULL);
     return 1;
   default:
     return 0;
@@ -1579,18 +1292,22 @@ static void nvgpu_req_reap_work(struct work_struct *work) {
 
 /* ───────── HOST_OP, WATCH, UNWATCH ───────── */
 
-int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
-                  u32 nargs, u64 *res, u32 nres) {
+/*
+ * One HOST_OP into `resp` (`resp_len` bytes: the header, the fixed part, and
+ * whatever tail the caller has room for), its results into res[0..nres).
+ * 0 with *used the bytes the device wrote, or -errno.
+ */
+static int nvgpu_host_op_into(struct nvgpu_device *dev, u32 op,
+                              const u64 *args, u32 nargs, u64 *res, u32 nres,
+                              void *resp, size_t resp_len, u32 *used) {
   struct {
     struct nvgpu_msg_hdr hdr;
     struct nvgpu_host_op_req body;
     struct nvgpu_proc_id proc;
   } __packed req = {};
-  struct {
-    struct nvgpu_msg_hdr hdr;
-    struct nvgpu_host_op_resp body;
-  } __packed resp;
-  u32 used, got, i, req_len = sizeof(req);
+  const struct nvgpu_host_op_resp *a =
+      (const void *)((u8 *)resp + sizeof(struct nvgpu_msg_hdr));
+  u32 got, i, req_len = sizeof(req);
   int ret;
 
   if (!dev->v2)
@@ -1609,82 +1326,58 @@ int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
   else
     req_len -= sizeof(req.proc);
 
-  ret = nvgpu_call(dev, &req, req_len, &resp, sizeof(resp), 0, &used,
-                   NULL, NULL);
+  ret = nvgpu_call(dev, &req, req_len, resp, resp_len, 0, used, NULL, NULL);
   if (ret)
     return ret;
-  ret = nvgpu_hdr_status(&resp, used);
+  ret = nvgpu_hdr_status(resp, *used);
   if (ret == -EPROTO)
-    nvgpu_host_op_unread(dev, op, args, nargs, &resp.hdr, &resp.body, used);
+    nvgpu_host_op_unread(dev, op, args, nargs, resp, a, *used);
   if (ret < 0)
     return ret;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp)))
+  if (!nvgpu_resp_has(*used, 0, sizeof(struct nvgpu_msg_hdr) + sizeof(*a)))
     return -EIO;
 
-  got = min_t(u32, le32_to_cpu(resp.body.nres), NVGPU_OP_MAX_RES);
+  got = min_t(u32, le32_to_cpu(a->nres), NVGPU_OP_MAX_RES);
   for (i = 0; i < nres; i++)
-    res[i] = i < got ? le64_to_cpu(resp.body.res[i]) : 0;
+    res[i] = i < got ? le64_to_cpu(a->res[i]) : 0;
   return 0;
+}
+
+int nvgpu_host_op(struct nvgpu_device *dev, u32 op, const u64 *args,
+                  u32 nargs, u64 *res, u32 nres) {
+  struct {
+    struct nvgpu_msg_hdr hdr;
+    struct nvgpu_host_op_resp body;
+  } __packed resp;
+  u32 used;
+
+  return nvgpu_host_op_into(dev, op, args, nargs, res, nres, &resp,
+                            sizeof(resp), &used);
 }
 
 int nvgpu_host_op_tail(struct nvgpu_device *dev, u32 op, const u64 *args,
                        u32 nargs, u64 *res, u32 nres, void *tail,
                        u32 tail_len, u32 *tail_used) {
-  struct {
-    struct nvgpu_msg_hdr hdr;
-    struct nvgpu_host_op_req body;
-    struct nvgpu_proc_id proc;
-  } __packed req = {};
   const size_t fixed =
       sizeof(struct nvgpu_msg_hdr) + sizeof(struct nvgpu_host_op_resp);
-  const struct nvgpu_host_op_resp *a;
-  u32 used, got, i, req_len = sizeof(req);
+  u32 used;
   u8 *resp;
   int ret;
 
   *tail_used = 0;
   if (!dev->v2)
     return -EOPNOTSUPP;
-  if (nargs > NVGPU_OP_MAX_ARGS || nres > NVGPU_OP_MAX_RES ||
-      tail_len > PAGE_SIZE)
+  if (tail_len > PAGE_SIZE)
     return -EINVAL;
   resp = kzalloc(fixed + tail_len, GFP_KERNEL);
   if (!resp)
     return -ENOMEM;
-
-  req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_HOST_OP);
-  req.body.op = cpu_to_le32(op);
-  req.body.nargs = cpu_to_le32(nargs);
-  for (i = 0; i < nargs; i++)
-    req.body.args[i] = cpu_to_le64(args[i]);
-  if (nvgpu_proc_ids(dev))
-    nvgpu_proc_id_fill(dev, &req.proc);
-  else
-    req_len -= sizeof(req.proc);
-
-  ret = nvgpu_call(dev, &req, req_len, resp, fixed + tail_len, 0, &used,
-                   NULL, NULL);
-  if (ret)
-    goto out;
-  ret = nvgpu_hdr_status(resp, used);
-  if (ret == -EPROTO)
-    nvgpu_host_op_unread(dev, op, args, nargs, (const void *)resp,
-                         (const void *)(resp + sizeof(struct nvgpu_msg_hdr)),
-                         used);
-  if (ret < 0)
-    goto out;
-  if (!nvgpu_resp_has(used, 0, fixed)) {
-    ret = -EIO;
-    goto out;
+  ret = nvgpu_host_op_into(dev, op, args, nargs, res, nres, resp,
+                           fixed + tail_len, &used);
+  if (!ret) {
+    *tail_used = min_t(u32, used - fixed, tail_len);
+    memcpy(tail, resp + fixed, *tail_used);
   }
-  a = (const void *)(resp + sizeof(struct nvgpu_msg_hdr));
-  got = min_t(u32, le32_to_cpu(a->nres), NVGPU_OP_MAX_RES);
-  for (i = 0; i < nres; i++)
-    res[i] = i < got ? le64_to_cpu(a->res[i]) : 0;
-  *tail_used = min_t(u32, used - fixed, tail_len);
-  memcpy(tail, resp + fixed, *tail_used);
-  ret = 0;
-out:
   kfree(resp);
   return ret;
 }
@@ -1727,199 +1420,6 @@ int nvgpu_unwatch(struct nvgpu_device *dev, u32 handle) {
   ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used,
                    NULL, NULL);
   return ret ? ret : nvgpu_hdr_status(&resp, used);
-}
-
-/* ───────── The host's clock ───────── */
-
-/*
- * Where host timestamps land in the guest's CLOCK_MONOTONIC.
- *
- * Vblank and flip events carry the host's time, and a compositor paces frames
- * by them, so an offset that jumps makes presentation times go backwards.
- * Each resync therefore sets a target, and the offset in use walks from where
- * it was towards it at no more than 50 us per second; two host timestamps a
- * frame apart can then never be translated out of order.
- */
-static s64 nvgpu_slew(s64 base, s64 target, u64 anchor, u64 now) {
-  s64 step = (s64)div_u64(now > anchor ? now - anchor : 0,
-                          NVGPU_TIME_SLEW_DIV);
-  s64 d = target - base;
-
-  if (d > step)
-    return base + step;
-  if (d < -step)
-    return base - step;
-  return target;
-}
-
-static s64 nvgpu_clk_offset(struct nvgpu_xfer *xf, u64 now) {
-  s64 base, target;
-  unsigned int seq;
-  u64 anchor;
-  bool valid;
-
-  do {
-    seq = read_seqbegin(&xf->clk_lock);
-    valid = xf->clk_valid;
-    base = xf->off_base;
-    target = xf->off_target;
-    anchor = xf->clk_anchor;
-  } while (read_seqretry(&xf->clk_lock, seq));
-
-  return valid ? nvgpu_slew(base, target, anchor, now) : 0;
-}
-
-s64 nvgpu_host_to_guest_ns(struct nvgpu_device *dev, s64 host_ns) {
-  if (!dev->xfer)
-    return host_ns;
-  return host_ns - nvgpu_clk_offset(dev->xfer, ktime_get_ns());
-}
-
-/*
- * A host CLOCK_REALTIME or CLOCK_MONOTONIC_RAW reading, in the guest's own
- * clock of the same id. Through the monotonic clocks, whose offset is the
- * slewed one above: host clock -> host monotonic by the host's distance
- * between the two at the last sync, -> guest monotonic, -> guest clock by
- * the guest's distance now. Realtime and monotonic are not the same clock on
- * either side (settimeofday, NTP steps), so no monotonic offset is ever
- * applied to a realtime value directly. False without TIME_SYNC's long form
- * (an older backend), in which case the caller leaves the value alone.
- */
-bool nvgpu_host_clock_to_guest(struct nvgpu_device *dev, clockid_t clk,
-                               s64 host_ns, s64 *guest_ns) {
-  struct nvgpu_xfer *xf = dev->xfer;
-  s64 host_delta, guest_delta, mono;
-  unsigned int seq;
-  bool ext;
-
-  if (!xf)
-    return false;
-  do {
-    seq = read_seqbegin(&xf->clk_lock);
-    ext = xf->clk_valid && xf->clk_ext;
-    host_delta = clk == CLOCK_REALTIME ? xf->host_real_mono : xf->host_raw_mono;
-  } while (read_seqretry(&xf->clk_lock, seq));
-  if (!ext || (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC_RAW))
-    return false;
-
-  mono = nvgpu_host_to_guest_ns(dev, host_ns - host_delta);
-  guest_delta = clk == CLOCK_REALTIME ? ktime_get_real_ns() - ktime_get_ns()
-                                      : ktime_get_raw_ns() - ktime_get_ns();
-  *guest_ns = mono + guest_delta;
-  return true;
-}
-
-s64 nvgpu_guest_to_host_ns(struct nvgpu_device *dev, s64 guest_ns) {
-  if (!dev->xfer)
-    return guest_ns;
-  return guest_ns + nvgpu_clk_offset(dev->xfer, ktime_get_ns());
-}
-
-/*
- * One round trip. The backend stamps its clock just before it hands the
- * chain back, t0 is taken before the request is on the ring and t1 in the
- * callback -- not when the waiter wakes, which would add a scheduler wakeup to
- * one leg only and bias the midpoint by half of it.
- */
-static int nvgpu_time_sample(struct nvgpu_device *dev, s64 *offset,
-                             u64 *rtt, s64 *real_mono, s64 *raw_mono,
-                             bool *ext) {
-  struct nvgpu_msg_hdr req = {};
-  struct {
-    struct nvgpu_msg_hdr hdr;
-    struct nvgpu_time_sync_resp2 body;
-  } __packed resp;
-  struct nvgpu_times tm;
-  u32 used;
-  int ret;
-
-  req.msg_type = cpu_to_le32(NVGPU_MSG_TIME_SYNC);
-  ret = nvgpu_call(dev, &req, sizeof(req), &resp, sizeof(resp), 0, &used, &tm,
-                   NULL);
-  if (ret)
-    return ret;
-  ret = nvgpu_hdr_status(&resp, used);
-  if (ret < 0)
-    return ret;
-  if (!nvgpu_resp_has(used, 0,
-                      sizeof(resp.hdr) + sizeof(struct nvgpu_time_sync_resp)) ||
-      tm.t1 < tm.t0)
-    return -EIO;
-
-  *rtt = tm.t1 - tm.t0;
-  *offset = (s64)le64_to_cpu(resp.body.host_mono_ns) -
-            (s64)(tm.t0 + *rtt / 2);
-  /* The long form, from a backend that knows it: the used length says. */
-  *ext = nvgpu_resp_has(used, 0, sizeof(resp));
-  if (*ext) {
-    *real_mono = (s64)le64_to_cpu(resp.body.host_realtime_ns) -
-                 (s64)le64_to_cpu(resp.body.host_mono_ns);
-    *raw_mono = (s64)le64_to_cpu(resp.body.host_mono_raw_ns) -
-                (s64)le64_to_cpu(resp.body.host_mono_ns);
-  }
-  return 0;
-}
-
-/*
- * Eight samples, keeping the one with the shortest round trip: the tighter
- * the bracket, the less the midpoint can be off. A round trip over 200 us has
- * a vCPU preemption or a busy backend in it; if every sample is that bad the
- * best of them is still the best estimate there is, so it is used anyway.
- */
-static int nvgpu_time_sync(struct nvgpu_device *dev, bool initial) {
-  struct nvgpu_xfer *xf = dev->xfer;
-  u64 best_rtt = U64_MAX, rtt, now;
-  s64 best_off = 0, off, real_mono = 0, raw_mono = 0, best_real = 0,
-      best_raw = 0;
-  bool ext = false, best_ext = false;
-  unsigned long flags;
-  int i, ret = -EIO;
-
-  for (i = 0; i < NVGPU_TIME_SAMPLES; i++) {
-    ret = nvgpu_time_sample(dev, &off, &rtt, &real_mono, &raw_mono, &ext);
-    if (ret)
-      return ret;
-    if (rtt < best_rtt) {
-      best_rtt = rtt;
-      best_off = off;
-      best_ext = ext;
-      best_real = real_mono;
-      best_raw = raw_mono;
-    }
-  }
-  if (best_rtt > NVGPU_TIME_RTT_GOOD_NS)
-    dev_dbg(&dev->vdev->dev,
-            "virtio-gpu-nv: clock sync's best round trip was %llu ns\n",
-            best_rtt);
-
-  write_seqlock_irqsave(&xf->clk_lock, flags);
-  now = ktime_get_ns();
-  if (initial || !xf->clk_valid) {
-    /* Nothing has been translated yet, so a step cannot be seen. */
-    xf->off_base = best_off;
-  } else {
-    xf->off_base = nvgpu_slew(xf->off_base, xf->off_target, xf->clk_anchor,
-                              now);
-  }
-  xf->off_target = best_off;
-  xf->clk_anchor = now;
-  xf->clk_valid = true;
-  xf->clk_ext = best_ext;
-  xf->host_real_mono = best_real;
-  xf->host_raw_mono = best_raw;
-  write_sequnlock_irqrestore(&xf->clk_lock, flags);
-  return 0;
-}
-
-static void nvgpu_time_sync_work(struct work_struct *work) {
-  struct nvgpu_xfer *xf =
-      container_of(to_delayed_work(work), struct nvgpu_xfer, sync_work);
-  int ret = nvgpu_time_sync(xf->dev, false);
-
-  /* A backend that stops knowing the message is not going to learn it. */
-  if (ret == -EPROTO || ret == -ENODEV || READ_ONCE(xf->dead))
-    return;
-  queue_delayed_work(xf->wq, &xf->sync_work, NVGPU_TIME_RESYNC);
 }
 
 /* ───────── HELLO ───────── */
@@ -2024,345 +1524,6 @@ void nvgpu_xfer_hello(struct nvgpu_device *dev) {
     return;
   }
   queue_delayed_work(xf->wq, &xf->sync_work, NVGPU_TIME_RESYNC);
-}
-
-/* ───────── Event queue ───────── */
-
-/*
- * Legacy readiness: the host says a descriptor has something to report. Wake
- * whoever is waiting on it.
- *
- * `pending` is a flag rather than a count: what the waiter does on waking is
- * ask the hardware's own semaphore, so two events and one event mean the same
- * thing to it. A wake with nothing behind it costs a wasted poll, and the host
- * re-sends while the descriptor stays readable, so a lost one costs a
- * millisecond rather than a hang.
- */
-static void nvgpu_event_deliver(struct nvgpu_device *dev, u32 handle) {
-  struct nvgpu_fd *nfd;
-  unsigned long flags;
-
-  spin_lock_irqsave(&dev->fds_lock, flags);
-  list_for_each_entry(nfd, &dev->fds, node) {
-    if (nfd->handle == handle) {
-      /* This report answers the arm; the next poll arms again. */
-      atomic_set(&nfd->armed, 0);
-      if (!atomic_xchg(&nfd->pending, 1))
-        nvgpu_pace_inc(NVGPU_PACE_EV_LEGACY_SET);
-      wake_up_interruptible(&nfd->wq);
-      break;
-    }
-  }
-  spin_unlock_irqrestore(&dev->fds_lock, flags);
-}
-
-/* Every consumer registered under `key`. Caller holds ev->lock. */
-static void nvgpu_ev_call(struct nvgpu_events *ev, u64 key, u32 kind,
-                          u64 cookie, const void *payload, u32 len) {
-  struct nvgpu_ev_consumer *c;
-
-  hash_for_each_possible(ev->consumers, c, node, key)
-    if (c->key == key)
-      c->deliver(c, kind, cookie, payload, len);
-}
-
-/* One record. Caller holds ev->lock; hard IRQ context. */
-static void nvgpu_ev_record(struct nvgpu_device *dev, u32 kind, u64 cookie,
-                            const void *payload, u32 len) {
-  struct nvgpu_events *ev = dev->events;
-
-  nvgpu_pace_inc(NVGPU_PACE_EV_RECORDS);
-  switch (kind) {
-  case NVGPU_EV_DRM:
-    nvgpu_ev_call(ev, NVGPU_EVKEY_HANDLE(cookie), kind, cookie, payload, len);
-    break;
-  case NVGPU_EV_FENCE:
-    nvgpu_ev_call(ev, NVGPU_EVKEY_COOKIE(cookie), kind, cookie, payload, len);
-    break;
-  case NVGPU_EV_READY:
-    if (cookie <= U32_MAX) {
-      /* A legacy watch: every opened handle has one, cookie == handle. */
-      nvgpu_pace_inc(NVGPU_PACE_EV_LEGACY);
-      nvgpu_ev_call(ev, NVGPU_EVKEY_HANDLE(cookie), kind, cookie, payload,
-                    len);
-      nvgpu_event_deliver(dev, (u32)cookie);
-    } else {
-      nvgpu_ev_call(ev, NVGPU_EVKEY_COOKIE(cookie), kind, cookie, payload,
-                    len);
-    }
-    break;
-  case NVGPU_EV_HOTPLUG: {
-    struct nvgpu_ev_hotplug hp = {};
-
-    /* kobject_uevent_env() allocates and takes a mutex, so the uevent
-     * itself is sent from a work item. */
-    memcpy(&hp, payload, min_t(u32, len, sizeof(hp)));
-    if (cookie < BITS_PER_LONG) {
-      if (le32_to_cpu(hp.flags) & NVGPU_EV_HOTPLUG_F_HOTPLUG)
-        set_bit(cookie, &ev->hotplug_pending);
-      if (le32_to_cpu(hp.flags) & NVGPU_EV_HOTPLUG_F_LEASE)
-        set_bit(cookie, &ev->lease_pending);
-      queue_work(dev->xfer->wq, &ev->hotplug_work);
-    }
-    nvgpu_ev_call(ev, NVGPU_EVKEY_CARD(cookie), kind, cookie, payload, len);
-    break;
-  }
-  default:
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: event record of unknown kind %u "
-                         "(%u bytes) dropped\n",
-                         kind, len);
-    break;
-  }
-}
-
-/*
- * One buffer off the event queue. Every length in it is the host's claim, so
- * each is checked against what the device says it wrote before it is used.
- */
-static void nvgpu_event_dispatch(struct nvgpu_device *dev, const u8 *buf,
-                                 u32 len) {
-  struct nvgpu_events *ev = dev->events;
-  const struct nvgpu_msg_hdr *hdr = (const void *)buf;
-  const u8 *p, *end;
-  unsigned long flags;
-  u32 type, payload;
-
-  if (len < sizeof(*hdr)) {
-    if (len)
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: %u-byte event is shorter than a "
-                           "header\n",
-                           len);
-    return;
-  }
-  type = le32_to_cpu(hdr->msg_type);
-
-  if (type == NVGPU_MSG_EVENT_READY) {
-    u32 handle = le32_to_cpu(hdr->handle);
-
-    spin_lock_irqsave(&ev->lock, flags);
-    nvgpu_ev_call(ev, NVGPU_EVKEY_HANDLE(handle), NVGPU_EV_READY, handle, NULL,
-                  0);
-    nvgpu_event_deliver(dev, handle);
-    spin_unlock_irqrestore(&ev->lock, flags);
-    return;
-  }
-  if (type != NVGPU_MSG_EVENT_DATA) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: event queue carried msg_type %u\n",
-                         type);
-    return;
-  }
-
-  payload = le32_to_cpu(hdr->req_id);
-  if (payload > len - sizeof(*hdr)) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: EVENT_DATA claims %u bytes, the "
-                         "device wrote %zu\n",
-                         payload, len - sizeof(*hdr));
-    payload = len - sizeof(*hdr);
-  }
-  p = buf + sizeof(*hdr);
-  end = p + payload;
-
-  nvgpu_pace_inc(NVGPU_PACE_EV_BATCHES);
-  spin_lock_irqsave(&ev->lock, flags);
-  while ((size_t)(end - p) >= sizeof(struct nvgpu_ev_rec)) {
-    const struct nvgpu_ev_rec *rec = (const void *)p;
-    u32 rlen = le32_to_cpu(rec->len);
-    size_t room = end - p - sizeof(*rec);
-
-    if (rlen > room) {
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: event record of %u bytes runs past "
-                           "its buffer (%zu left); rest of batch dropped\n",
-                           rlen, room);
-      break;
-    }
-    nvgpu_ev_record(dev, le32_to_cpu(rec->kind), le64_to_cpu(rec->cookie),
-                    p + sizeof(*rec), rlen);
-    if (ALIGN((size_t)rlen, 8) >= room)
-      break;
-    p += sizeof(*rec) + ALIGN((size_t)rlen, 8);
-  }
-  spin_unlock_irqrestore(&ev->lock, flags);
-}
-
-static int nvgpu_event_post(struct nvgpu_events *ev, void *buf) {
-  struct scatterlist sg;
-
-  sg_init_one(&sg, buf, NVGPU_EVENT_BUF_SIZE);
-  return virtqueue_add_inbuf(ev->dev->event_vq, &sg, 1, buf, GFP_ATOMIC);
-}
-
-/*
- * Only non-sleeping work happens here: registry lookups, waking pollers, and
- * whatever consumers do under the same rule (drm events with GFP_ATOMIC,
- * dma_fence_signal, eventfd_signal). Uevents and CLOSEs go to work items.
- */
-void nvgpu_event_vq_cb(struct virtqueue *vq) {
-  struct nvgpu_device *dev = vq->vdev->priv;
-  struct nvgpu_events *ev = dev->events;
-  unsigned long flags;
-  bool kick = false;
-  unsigned int len;
-  void *buf;
-
-  if (!ev)
-    return;
-
-  for (;;) {
-    int ret;
-
-    spin_lock_irqsave(&ev->vq_lock, flags);
-    buf = virtqueue_get_buf(vq, &len);
-    spin_unlock_irqrestore(&ev->vq_lock, flags);
-    if (!buf)
-      break;
-
-    nvgpu_event_dispatch(dev, buf, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
-    /* Back to zero, as it was posted: what the next batch does not write
-     * reads as nothing, not as this one's records. */
-    memset(buf, 0, min_t(u32, len, NVGPU_EVENT_BUF_SIZE));
-
-    spin_lock_irqsave(&ev->vq_lock, flags);
-    ret = nvgpu_event_post(ev, buf);
-    spin_unlock_irqrestore(&ev->vq_lock, flags);
-    if (ret)
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: event queue would not take a buffer "
-                           "back: %d\n",
-                           ret);
-    else
-      kick = true;
-  }
-
-  if (kick) {
-    spin_lock_irqsave(&ev->vq_lock, flags);
-    kick = virtqueue_kick_prepare(vq);
-    spin_unlock_irqrestore(&ev->vq_lock, flags);
-    if (kick)
-      virtqueue_notify(vq);
-  }
-}
-
-/*
- * EV_HOTPLUG, turned into the uevents a compositor on this side listens for.
- * drm_sysfs_lease_event() is not exported (drm_internal.h), so the LEASE one
- * is built the way it builds it (drm_sysfs.c:423-431).
- */
-static void nvgpu_hotplug_work(struct work_struct *work) {
-  struct nvgpu_events *ev =
-      container_of(work, struct nvgpu_events, hotplug_work);
-  struct nvgpu_device *dev = ev->dev;
-  unsigned long hp = xchg(&ev->hotplug_pending, 0);
-  unsigned long ls = xchg(&ev->lease_pending, 0);
-  unsigned long any = hp | ls;
-  unsigned int i;
-
-  /* Card records without NVGPU_BCAP_KMS_CARD only name host numbers (the
-   * Wayland devmap): no compositor here drives those cards. */
-  if (!(dev->backend_caps & NVGPU_BCAP_KMS_CARD))
-    return;
-
-  for_each_set_bit(i, &any, BITS_PER_LONG) {
-    struct nvgpu_dri_dev *dri;
-    struct drm_device *drm;
-
-    if ((int)i >= dev->num_card_recs ||
-        dev->cards[i].render_index >= (u32)dev->num_dri_devs) {
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: hotplug for card %u, which this "
-                           "guest was never told about\n",
-                           i);
-      continue;
-    }
-    dri = &dev->dri_devs[dev->cards[i].render_index];
-    drm = dri->drm;
-    if (!dri->registered || !drm || !drm->primary)
-      continue;
-
-    if (test_bit(i, &hp))
-      drm_sysfs_hotplug_event(drm);
-    if (test_bit(i, &ls)) {
-      char *envp[] = {"LEASE=1", NULL};
-
-      kobject_uevent_env(&drm->primary->kdev->kobj, KOBJ_CHANGE, envp);
-    }
-  }
-}
-
-/*
- * `c` must not be registered already; zero it before the first registration
- * so that unregistering one that never got this far is harmless. Several
- * consumers may share a key: each gets every record for it and filters on
- * `kind` (a handle key sees EV_DRM and legacy EV_READY alike).
- */
-int nvgpu_ev_register(struct nvgpu_device *dev, struct nvgpu_ev_consumer *c,
-                      u64 key) {
-  struct nvgpu_events *ev = dev->events;
-  unsigned long flags;
-
-  if (!ev || !c->deliver)
-    return -EINVAL;
-  /* Nothing will ever be delivered again. */
-  if (nvgpu_xfer_dead(dev))
-    return -ENODEV;
-  spin_lock_irqsave(&ev->lock, flags);
-  c->key = key;
-  hash_add(ev->consumers, &c->node, key);
-  spin_unlock_irqrestore(&ev->lock, flags);
-  return 0;
-}
-
-/*
- * Delivery happens under the same lock, so once this has taken and dropped it
- * no deliver() is running and none can start: the consumer may be freed.
- * Safe to call on a consumer that was never registered, if it was zeroed.
- */
-void nvgpu_ev_unregister(struct nvgpu_device *dev,
-                         struct nvgpu_ev_consumer *c) {
-  struct nvgpu_events *ev = dev->events;
-  unsigned long flags;
-
-  if (!ev)
-    return;
-  spin_lock_irqsave(&ev->lock, flags);
-  if (!hlist_unhashed(&c->node))
-    hash_del(&c->node);
-  spin_unlock_irqrestore(&ev->lock, flags);
-}
-
-/* 0 once the device is gone, which no WATCH or registration accepts. */
-u64 nvgpu_ev_new_cookie(struct nvgpu_device *dev) {
-  struct nvgpu_events *ev = dev->events;
-
-  if (!ev || nvgpu_xfer_dead(dev))
-    return 0;
-  return (u64)atomic64_inc_return(&ev->next_cookie);
-}
-
-bool nvgpu_fd_detach_drm(struct nvgpu_fd *nfd, u32 *kms_handle) {
-  struct nvgpu_events *ev = nfd->dev->events;
-  unsigned long flags;
-  bool attached;
-
-  if (!ev) {
-    /* The device is gone, and with it every event delivery. */
-    attached = nfd->drm_file != NULL;
-    WRITE_ONCE(nfd->drm_file, NULL);
-    *kms_handle = nfd->kms_handle;
-    nfd->kms_handle = 0;
-    return attached;
-  }
-  spin_lock_irqsave(&ev->lock, flags);
-  attached = nfd->drm_file != NULL;
-  WRITE_ONCE(nfd->drm_file, NULL);
-  *kms_handle = nfd->kms_handle;
-  nfd->kms_handle = 0;
-  spin_unlock_irqrestore(&ev->lock, flags);
-  return attached;
 }
 
 /* ───────── Probe / remove ───────── */

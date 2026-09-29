@@ -2165,7 +2165,7 @@ registrations' accounting in `device/src/fence.rs`.
   process that forks children to make orphans on shared syncobjs and exit
   can still fill the pool (`Share::owners_to_exhaust`, as quota.rs says of
   every pool); the cost is polling latency for the VM's other waits, not
-  host memory. Guest side (nvgpu_fence.c): userspace SYNCOBJ_EVENTFD
+  host memory. Guest side (nvgpu_syncobj.c): userspace SYNCOBJ_EVENTFD
   subscribers are charged per process (a quarter of 4096) and freed,
   unsignalled, when their syncobj handle is destroyed or their file closed,
   as the kernel frees a dead syncobj's entries.

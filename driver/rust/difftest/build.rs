@@ -108,6 +108,10 @@ int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
 int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
                          void *resp, size_t resp_max,
                          struct nvgpu_ioctl_reply *r);
+#define NVGPU_FLAT_PROC (1u << 0)
+#define NVGPU_FLAT_WHOLE (1u << 1)
+long nvgpu_ioctl_flat(struct nvgpu_device *dev, u32 handle, unsigned int cmd,
+                      void *buf, u32 sz, u32 flags, u32 *back);
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);

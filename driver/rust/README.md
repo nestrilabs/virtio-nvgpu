@@ -56,9 +56,11 @@ What stays C, and why:
   `atomic.rs`, which asks `nvgpu_kms.c` (`struct nvgpu_atomic_ops`) what an
   object or a property is -- host queries behind caches -- and has it
   bridge the fences and reserve the events.
-- **The transport, virtio, mmap/window placement, the Wayland device** (`nvgpu_xfer.c`,
-  `nvgpu_main.c`, `nvgpu_wl.c`): as the task set out; the transport's reply
-  reaper (`nvgpu_reap_ioctl2`) reads host input, not guest input.
+- **The transport, virtio, mmap/window placement, the Wayland device**
+  (`nvgpu_xfer.c` and its `nvgpu_tbuf.c`, `nvgpu_clock.c`, `nvgpu_events.c`;
+  `nvgpu_main.c`, `nvgpu_gem.c`, `nvgpu_wl.c`): as the task set out; the
+  transport's reply reaper (`nvgpu_reap_ioctl2`) reads host input, not guest
+  input.
 - **The generated tables** (`gen/*.h`): one copy, the C; Rust reads the
   schema arrays in place through `#[repr(C)]` mirrors whose layout both sides
   assert, and asks the C for the RM tables (deep controls, V1V2, class sizes,

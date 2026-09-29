@@ -131,63 +131,34 @@ static_assert(sizeof(struct NVOS64_PARAMETERS) == 48,
 /*
  * nvgpu_ioctl_simple — flat struct, no embedded pointers. `pre`: the block,
  * already copied in whole by a caller that decided on it (NULL: read here).
+ * Back to the caller goes only what the reply carried (nvgpu_ioctl_flat()).
  */
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz,
                                const void *pre) {
   /* RM_DUP_OBJECT carries the calling process after the struct. */
-  bool proc = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT &&
-              nvgpu_proc_ids(nfd->dev);
-  int req_total = sizeof(struct nvgpu_ioctl_req) + sz +
-                  (proc ? sizeof(struct nvgpu_proc_id) : 0);
-  int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
-  void *req_buf, *resp_buf;
-  struct nvgpu_ioctl_req *req;
-  struct nvgpu_ioctl_resp *resp;
-  struct nvgpu_ioctl_reply r;
-  int ret;
-
-  req_buf = kvmalloc(req_total, GFP_KERNEL);
-  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
-  if (!req_buf || !resp_buf) {
-    ret = -ENOMEM;
-    goto out;
-  }
-
-  req = (struct nvgpu_ioctl_req *)req_buf;
-  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sz, 0, 0, 0, 0);
+  u32 flags = _IOC_TYPE(cmd) == 'F' && _IOC_NR(cmd) == NV_ESC_RM_DUP_OBJECT
+                  ? NVGPU_FLAT_PROC
+                  : 0;
+  void *kbuf = NULL;
+  u32 back;
+  long ret;
 
   if (sz > 0) {
-    if (pre)
-      memcpy(req_buf + sizeof(*req), pre, sz);
-    else if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
-      ret = -EFAULT;
-      goto out;
+    kbuf = kvmalloc(sz, GFP_KERNEL);
+    if (!kbuf)
+      return -ENOMEM;
+    if (pre) {
+      memcpy(kbuf, pre, sz);
+    } else if (copy_from_user(kbuf, uarg, sz)) {
+      kvfree(kbuf);
+      return -EFAULT;
     }
   }
-  if (proc)
-    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sz);
-
-  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &r);
-  if (ret < 0)
-    goto out;
-  ret = r.status;
-
-  /*
-   * Only what the device wrote. A failed call comes back as a bare header,
-   * and before the used length was kept the bytes after it were whatever the
-   * kmalloc'd buffer held -- guest kernel heap, copied out to userspace.
-   */
-  if (sz > 0 && r.data_len && r.data_len <= sz &&
-      nvgpu_resp_has(r.used, sizeof(*resp), r.data_len)) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp), r.data_len))
-      ret = -EFAULT;
-  }
-
-out:
-  kvfree(req_buf);
-  kvfree(resp_buf);
+  ret = nvgpu_ioctl_flat(nfd->dev, nfd->handle, cmd, kbuf, sz, flags, &back);
+  if (back && copy_to_user(uarg, kbuf, back))
+    ret = -EFAULT;
+  kvfree(kbuf);
   return ret;
 }
 
@@ -490,38 +461,231 @@ static void nvgpu_rebase_time_correlation(struct nvgpu_device *dev, u8 *p,
   }
 }
 
+/*
+ * What an RM_CONTROL carries past its NVOS54 block and nested block, and the
+ * caller's values of the fields translated in the nested block, for the
+ * reply.
+ */
+struct nvgpu_rmctl {
+  u32 ctl_cmd;
+  /* A second-level pointer carried alongside the nested block (V1V2). */
+  u64 deep_user_ptr;
+  u32 deep_ptr_offset;
+  u32 deep_len;
+  /* Or several, as deep segments, sized from the nested block. */
+  struct nvgpu_deep_plan plan;
+  /* A descriptor named inside the nested block, and where it sits. */
+  int nested_fd;
+  u32 nested_fd_offset;
+  /* An OS event named inside it (nvgpu_rm_os_event_in), and where. */
+  int os_event_off;
+  u64 os_event_val;
+};
+
+/*
+ * A second-level pointer, carried rather than rewritten.
+ *
+ * Some parameter blocks hold an NvP64 pointing at a buffer of the caller's.
+ * This used to be handled by swapping the command for an inline "V2"
+ * variant that has no pointer. That bound us to the struct layouts of one
+ * driver release: against any other it sent requests of the wrong size and
+ * shape, and some V2 variants are not served at all -- RM answered
+ * NV_ERR_INVALID_ARGUMENT to a command userspace had never asked for, and
+ * Vulkan failed to start.
+ *
+ * The backend already solves this one level up: it allocates a host buffer
+ * for the top-level pointer, copies the guest's bytes in, points the struct
+ * at it, and copies the result back. Doing the same one level deeper sends
+ * the caller's own command through untouched, and needs to know only where
+ * the pointer sits and how much it addresses. Both are properties of the
+ * layout that carries the pointer, which is the stable one.
+ *
+ * Several pointers go as deep segments, each with what it addresses
+ * (nvgpu_deep_plan): the sizes the backend checks are computed from the same
+ * bytes they were planned from, the nested block as read once (`nested`, or
+ * NULL for none).
+ */
+static void nvgpu_rmctl_plan_deep(struct nvgpu_fd *nfd, const u8 *nested,
+                                  u32 nested_size, struct nvgpu_rmctl *c) {
+  const struct nvgpu_v1v2_entry *rw;
+  const struct nvgpu_rm_deep_control *ctl_deep = NULL;
+
+  rw = nested ? nvgpu_find_deep_rewrite(c->ctl_cmd) : NULL;
+  if (nested && nvgpu_deep_segs_ok(nfd->dev))
+    ctl_deep = nvgpu_rm_deep_find(c->ctl_cmd);
+  if (ctl_deep) {
+    rw = NULL;
+    nvgpu_deep_plan(ctl_deep, nested, nested_size, &c->plan);
+    if (c->plan.n) {
+      c->deep_ptr_offset = NVGPU_DEEP_SEGMENTED;
+      c->deep_len = c->plan.bytes;
+    }
+  }
+
+  if (rw && nested_size >= rw->v1_userptr_offset + 8) {
+    u32 count;
+
+    memcpy(&c->deep_user_ptr, nested + rw->v1_userptr_offset, sizeof(u64));
+    memcpy(&count, nested, sizeof(u32));
+
+    /*
+     * The leading field says how much the buffer holds: entries of eight
+     * bytes for the list-style commands, plain bytes for the caps tables.
+     */
+    if (!rw->info_style)
+      c->deep_len = count;
+    else if (check_mul_overflow(count, 8u, &c->deep_len))
+      c->deep_len = U32_MAX; /* too large, below: no deep block */
+    c->deep_ptr_offset = rw->v1_userptr_offset;
+
+    if (!c->deep_user_ptr || c->deep_len == 0 ||
+        c->deep_len > NVGPU_DEEP_MAX) {
+      c->deep_user_ptr = 0;
+      c->deep_ptr_offset = 0;
+      c->deep_len = 0;
+    }
+  }
+}
+
+/*
+ * The descriptor and the OS event the nested block may name, translated in
+ * the request's copy of it (`nested`): 0, or -EBADF for a descriptor that is
+ * not one of our files, or nvgpu_rm_os_event_in()'s refusal.
+ *
+ * Exporting objects to a descriptor, importing them back and asking about an
+ * export name another of our open files inside the nested parameters. The
+ * backend knows that file by the handle it issued, not by our descriptor
+ * number, so swap one for the other here and swap it back on the way out --
+ * userspace gets its own descriptor returned, which is what it passed in.
+ *
+ * A number that is not one of our files is refused here, never sent as it
+ * is: the backend reads the field as one of its handles, and handles are
+ * issued in order, so a small number is likely another process's control
+ * file -- and RM would import that process's exported memory into the
+ * caller's client. -1, which RM refuses itself (os.c), is the one value that
+ * passes unchanged.
+ */
+static int nvgpu_rmctl_translate_in(struct nvgpu_fd *nfd, u8 *nested,
+                                    u32 nested_size, struct nvgpu_rmctl *c) {
+  int unix_fd_off, ret;
+
+  unix_fd_off = nvgpu_rm_unix_fd_offset(c->ctl_cmd);
+  if (unix_fd_off >= 0 && nested_size >= unix_fd_off + sizeof(u32)) {
+    void *slot = nested + unix_fd_off;
+    u32 handle;
+
+    memcpy(&c->nested_fd, slot, sizeof(c->nested_fd));
+    if (c->nested_fd != -1) {
+      if (nvgpu_handle_for_fd(nfd->dev, c->nested_fd, &handle)) {
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: RM control 0x%x names fd %d, "
+                            "which is not one of our devices\n",
+                            c->ctl_cmd, c->nested_fd);
+        return -EBADF;
+      }
+      memcpy(slot, &handle, sizeof(handle));
+      c->nested_fd_offset = unix_fd_off;
+    }
+  }
+
+  /*
+   * A parameter block too short to hold the field is the backend's to
+   * refuse; only one that holds it is translated.
+   */
+  c->os_event_off = nvgpu_rm_os_event_offset(c->ctl_cmd);
+  if (c->os_event_off >= 0 && nested_size >= c->os_event_off + sizeof(u64)) {
+    ret = nvgpu_rm_os_event_in(nfd->dev, nested + c->os_event_off,
+                               &c->os_event_val);
+    if (ret) {
+      dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                          "virtio-gpu-nv: RM control 0x%x names OS event "
+                          "0x%llx, which is not one of our devices\n",
+                          c->ctl_cmd, c->os_event_val);
+      return ret;
+    }
+  } else {
+    c->os_event_off = -1;
+  }
+  return 0;
+}
+
+/*
+ * The reply back to the caller: the NVOS54 block, the nested block (with the
+ * caller's own descriptor and OS event in it, and a time correlation moved
+ * into the guest's clocks), and the deep block or segments -- each only as
+ * far as the device wrote it. `ret` is the call's result so far; the result
+ * to return (-EFAULT for a copy-out that faults).
+ */
+static long nvgpu_rmctl_copy_back(struct nvgpu_fd *nfd, void __user *uarg,
+                                  void __user *user_nested, u32 nested_size,
+                                  u8 *resp_buf,
+                                  const struct nvgpu_ioctl_reply *r,
+                                  const struct nvgpu_rmctl *c, long ret) {
+  const size_t base = sizeof(struct nvgpu_ioctl_resp);
+  const size_t nested_at = base + sizeof(struct NVOS54_PARAMETERS);
+
+  /*
+   * RM's own verdict is in params.status, so a successful reply always
+   * carries the struct back. A failed one is a bare header: nothing to copy,
+   * and the caller's struct is left as it was rather than overwritten.
+   */
+  if (!nvgpu_resp_has(r->used, base, sizeof(struct NVOS54_PARAMETERS)))
+    return ret;
+  if (copy_to_user(uarg, resp_buf + base, sizeof(struct NVOS54_PARAMETERS)))
+    return -EFAULT;
+
+  if (user_nested && r->nested_len > 0) {
+    u32 copy_back = min(nested_size, r->nested_len);
+
+    if (!nvgpu_resp_has(r->used, nested_at, copy_back))
+      return ret;
+    if (c->nested_fd >= 0 && copy_back >= c->nested_fd_offset + sizeof(u32))
+      memcpy(resp_buf + nested_at + c->nested_fd_offset, &c->nested_fd,
+             sizeof(c->nested_fd));
+    if (c->os_event_off >= 0 && copy_back >= c->os_event_off + sizeof(u64))
+      memcpy(resp_buf + nested_at + c->os_event_off, &c->os_event_val,
+             sizeof(c->os_event_val));
+    if (c->ctl_cmd == NVGPU_RM_TIME_CORRELATION &&
+        get_unaligned_le32(resp_buf + base + 28) == 0 /* NV_OK */)
+      nvgpu_rebase_time_correlation(nfd->dev, resp_buf + nested_at,
+                                    copy_back);
+
+    if (copy_to_user(user_nested, resp_buf + nested_at, copy_back))
+      ret = -EFAULT;
+  }
+
+  if (c->plan.n && r->deep_len > 0) {
+    /* Each segment RM writes goes back to its own pointer. */
+    u32 back = r->deep_len;
+    size_t at = nested_at + (size_t)r->nested_len;
+
+    if (nvgpu_resp_has(r->used, at, back) &&
+        nvgpu_deep_copy_back(&c->plan, resp_buf + at, back))
+      ret = -EFAULT;
+  } else if (c->deep_len > 0 && r->deep_len > 0) {
+    u32 copy_back = min(c->deep_len, r->deep_len);
+    size_t at = nested_at + (size_t)r->nested_len;
+
+    if (nvgpu_resp_has(r->used, at, copy_back) &&
+        copy_to_user((void __user *)c->deep_user_ptr, resp_buf + at,
+                     copy_back))
+      ret = -EFAULT;
+  }
+  return ret;
+}
+
 static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
                                    void __user *uarg, unsigned int sz) {
   struct NVOS54_PARAMETERS params;
+  struct nvgpu_rmctl c = {.nested_fd = -1, .os_event_off = -1};
   void __user *user_nested;
   u32 nested_size;
-  u32 ctl_cmd;
-  const struct nvgpu_v1v2_entry *rw;
-
-  /* A descriptor named inside the nested block, and where it sits. */
-  int nested_fd = -1;
-  u32 nested_fd_offset = 0;
-  int unix_fd_off;
-
-  /* An OS event named inside it (nvgpu_rm_os_event_in), and where. */
-  int os_event_off = -1;
-  u64 os_event_val = 0;
-
-  /* Second-level pointer carried alongside the nested block. */
-  u64 deep_user_ptr = 0;
-  u32 deep_ptr_offset = 0;
-  u32 deep_len = 0;
-
-  /* Or several, as deep segments, and the nested block they were sized from. */
-  const struct nvgpu_rm_deep_control *ctl_deep = NULL;
-  struct nvgpu_deep_plan plan = {0};
   u8 *nested_copy = NULL;
-
-  void *req_buf = NULL, *resp_buf = NULL;
+  u8 *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
-  struct nvgpu_ioctl_resp *resp;
   struct nvgpu_ioctl_reply r;
-  int req_total, resp_max, ret;
+  size_t req_total, resp_max, at;
+  long ret;
   bool proc;
 
   if (sz < sizeof(params))
@@ -532,19 +696,16 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   user_nested = (void __user *)(unsigned long)le64_to_cpu(params.params);
   nested_size = le32_to_cpu(params.paramsSize);
-  ctl_cmd = le32_to_cpu(params.cmd);
+  c.ctl_cmd = le32_to_cpu(params.cmd);
 
   if (nested_size > 1024 * 1024)
     return -EINVAL;
 
   /* Intercept multi-pointer commands that can't be forwarded */
-  {
-    long intercept_ret;
-    if (nvgpu_try_intercept_rm_control(nfd, ctl_cmd, uarg, user_nested,
-                                       nested_size, nfd->dev->driver_version,
-                                       &intercept_ret))
-      return intercept_ret;
-  }
+  if (nvgpu_try_intercept_rm_control(nfd, c.ctl_cmd, uarg, user_nested,
+                                     nested_size, nfd->dev->driver_version,
+                                     &ret))
+    return ret;
 
   /*
    * A size with no parameters. RM refuses it as it copies the parameters in
@@ -558,29 +719,10 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     return nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_INVALID_ARGUMENT);
 
   /*
-   * A second-level pointer, carried rather than rewritten.
-   *
-   * Some parameter blocks hold an NvP64 pointing at a buffer of the caller's.
-   * This used to be handled by swapping the command for an inline "V2"
-   * variant that has no pointer. That bound us to the struct layouts of one
-   * driver release: against any other it sent requests of the wrong size and
-   * shape, and some V2 variants are not served at all -- RM answered
-   * NV_ERR_INVALID_ARGUMENT to a command userspace had never asked for, and
-   * Vulkan failed to start.
-   *
-   * The backend already solves this one level up: it allocates a host buffer
-   * for the top-level pointer, copies the guest's bytes in, points the struct
-   * at it, and copies the result back. Doing the same one level deeper sends
-   * the caller's own command through untouched, and needs to know only where
-   * the pointer sits and how much it addresses. Both are properties of the
-   * layout that carries the pointer, which is the stable one.
-   */
-  /*
    * The nested block, read once: what every decision below is taken on --
    * the TSC refusal, the V1V2 count and pointer, the deep segments' sizes,
    * the descriptors in it -- and what is sent, whatever another thread of
-   * the caller writes meanwhile. (The TSC clock byte and the V1V2 block were
-   * each read apart from the bytes that were then sent.)
+   * the caller writes meanwhile.
    */
   if (user_nested && nested_size > 0) {
     nested_copy = kvmalloc(nested_size, GFP_KERNEL);
@@ -593,61 +735,20 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   /* A host TSC reading means nothing in the guest (nvgpu_rm_intercepts.h). */
-  if (ctl_cmd == NVGPU_RM_TIME_CORRELATION && nested_copy &&
+  if (c.ctl_cmd == NVGPU_RM_TIME_CORRELATION && nested_copy &&
       nvgpu_tci_is_tsc(nested_copy[NVGPU_TCI_CLK_ID])) {
     kvfree(nested_copy);
     return nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_NOT_SUPPORTED);
   }
 
-  rw = nested_copy ? nvgpu_find_deep_rewrite(ctl_cmd) : NULL;
-
-  /*
-   * Several pointers, each with what it addresses (nvgpu_deep_plan): the
-   * sizes the backend checks are computed from the same bytes they were
-   * planned from.
-   */
-  if (nested_copy && nvgpu_deep_segs_ok(nfd->dev))
-    ctl_deep = nvgpu_rm_deep_find(ctl_cmd);
-  if (ctl_deep) {
-    rw = NULL;
-    nvgpu_deep_plan(ctl_deep, nested_copy, nested_size, &plan);
-    if (plan.n) {
-      deep_ptr_offset = NVGPU_DEEP_SEGMENTED;
-      deep_len = plan.bytes;
-    }
-  }
-
-  if (rw && nested_size >= rw->v1_userptr_offset + 8) {
-    u32 count;
-
-    memcpy(&deep_user_ptr, nested_copy + rw->v1_userptr_offset, sizeof(u64));
-    memcpy(&count, nested_copy, sizeof(u32));
-
-    /*
-     * The leading field says how much the buffer holds: entries of eight
-     * bytes for the list-style commands, plain bytes for the caps tables.
-     */
-    if (!rw->info_style)
-      deep_len = count;
-    else if (check_mul_overflow(count, 8u, &deep_len))
-      deep_len = U32_MAX; /* too large, below: no deep block */
-    deep_ptr_offset = rw->v1_userptr_offset;
-
-    if (!deep_user_ptr || deep_len == 0 || deep_len > NVGPU_DEEP_MAX) {
-      deep_user_ptr = 0;
-      deep_ptr_offset = 0;
-      deep_len = 0;
-    }
-  }
-
-  /* ── Normal path (no V1→V2 rewrite) ── */
+  nvgpu_rmctl_plan_deep(nfd, nested_copy, nested_size, &c);
 
   /* The calling process after the blocks (nvgpu_proc_euid). */
   proc = nvgpu_proc_euid(nfd->dev);
   req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size +
-              deep_len + (proc ? sizeof(struct nvgpu_proc_id) : 0);
-  resp_max =
-      sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size + deep_len;
+              c.deep_len + (proc ? sizeof(struct nvgpu_proc_id) : 0);
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size +
+             c.deep_len;
 
   req_buf = kvmalloc(req_total, GFP_KERNEL);
   resp_buf = kvmalloc(resp_max, GFP_KERNEL);
@@ -658,142 +759,40 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
 
   req = (struct nvgpu_ioctl_req *)req_buf;
   nvgpu_ioctl_req_init(req, nfd->handle, cmd, sizeof(params), sizeof(params),
-                       nested_size, deep_ptr_offset, deep_len);
-
-  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+                       nested_size, c.deep_ptr_offset, c.deep_len);
+  at = sizeof(*req);
+  memcpy(req_buf + at, &params, sizeof(params));
+  at += sizeof(params);
 
   if (nested_copy) {
-    memcpy(req_buf + sizeof(*req) + sizeof(params), nested_copy, nested_size);
-
-    /*
-     * Exporting objects to a descriptor, importing them back and asking
-     * about an export name another of our open files inside the nested
-     * parameters. The backend knows that file by the handle it issued, not
-     * by our descriptor number, so swap one for the other here and swap it
-     * back on the way out -- userspace gets its own descriptor returned,
-     * which is what it passed in.
-     *
-     * A number that is not one of our files is refused here, never sent as
-     * it is: the backend reads the field as one of its handles, and handles
-     * are issued in order, so a small number is likely another process's
-     * control file -- and RM would import that process's exported memory
-     * into the caller's client. -1, which RM refuses itself (os.c), is the
-     * one value that passes unchanged.
-     */
-    unix_fd_off = nvgpu_rm_unix_fd_offset(ctl_cmd);
-    if (unix_fd_off >= 0 && nested_size >= unix_fd_off + sizeof(u32)) {
-      void *slot = req_buf + sizeof(*req) + sizeof(params) + unix_fd_off;
-      u32 handle;
-
-      memcpy(&nested_fd, slot, sizeof(nested_fd));
-      if (nested_fd != -1) {
-        if (nvgpu_handle_for_fd(nfd->dev, nested_fd, &handle)) {
-          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                              "virtio-gpu-nv: RM control 0x%x names fd %d, "
-                              "which is not one of our devices\n",
-                              ctl_cmd, nested_fd);
-          ret = -EBADF;
-          goto out;
-        }
-        memcpy(slot, &handle, sizeof(handle));
-        nested_fd_offset = unix_fd_off;
-      }
-    }
-
-    /*
-     * A parameter block too short to hold the field is the backend's to
-     * refuse; only one that holds it is translated.
-     */
-    os_event_off = nvgpu_rm_os_event_offset(ctl_cmd);
-    if (os_event_off >= 0 && nested_size >= os_event_off + sizeof(u64)) {
-      ret = nvgpu_rm_os_event_in(nfd->dev,
-                                 req_buf + sizeof(*req) + sizeof(params) +
-                                     os_event_off,
-                                 &os_event_val);
-      if (ret) {
-        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                            "virtio-gpu-nv: RM control 0x%x names OS event "
-                            "0x%llx, which is not one of our devices\n",
-                            ctl_cmd, os_event_val);
-        goto out;
-      }
-    } else {
-      os_event_off = -1;
-    }
-  }
-
-  if (plan.n) {
-    ret = nvgpu_deep_fill(&plan,
-                          req_buf + sizeof(*req) + sizeof(params) + nested_size);
+    memcpy(req_buf + at, nested_copy, nested_size);
+    ret = nvgpu_rmctl_translate_in(nfd, req_buf + at, nested_size, &c);
     if (ret)
       goto out;
-  } else if (deep_len > 0) {
-    if (copy_from_user(req_buf + sizeof(*req) + sizeof(params) + nested_size,
-                       (const void __user *)deep_user_ptr, deep_len)) {
+  }
+  at += nested_size;
+
+  if (c.plan.n) {
+    ret = nvgpu_deep_fill(&c.plan, req_buf + at);
+    if (ret)
+      goto out;
+  } else if (c.deep_len > 0) {
+    if (copy_from_user(req_buf + at, (const void __user *)c.deep_user_ptr,
+                       c.deep_len)) {
       ret = -EFAULT;
       goto out;
     }
   }
+  at += c.deep_len;
   if (proc)
-    nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sizeof(params) +
-                                     nested_size + deep_len);
+    nvgpu_proc_id_fill(nfd->dev, req_buf + at);
 
   ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
                              &r);
   if (ret < 0)
     goto out;
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = r.status;
-
-  /*
-   * RM's own verdict is in params.status, so a successful reply always
-   * carries the struct back. A failed one is a bare header: nothing to copy,
-   * and the caller's struct is left as it was rather than overwritten.
-   */
-  if (!nvgpu_resp_has(r.used, sizeof(*resp), sizeof(params)))
-    goto out;
-  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
-    ret = -EFAULT;
-    goto out;
-  }
-
-  if (user_nested && r.nested_len > 0) {
-    u32 copy_back = min(nested_size, r.nested_len);
-
-    if (!nvgpu_resp_has(r.used, sizeof(*resp) + sizeof(params), copy_back))
-      goto out;
-    if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
-      memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
-             &nested_fd, sizeof(nested_fd));
-    if (os_event_off >= 0 && copy_back >= os_event_off + sizeof(u64))
-      memcpy(resp_buf + sizeof(*resp) + sizeof(params) + os_event_off,
-             &os_event_val, sizeof(os_event_val));
-    if (ctl_cmd == NVGPU_RM_TIME_CORRELATION &&
-        get_unaligned_le32(resp_buf + sizeof(*resp) + 28) == 0 /* NV_OK */)
-      nvgpu_rebase_time_correlation(
-          nfd->dev, resp_buf + sizeof(*resp) + sizeof(params), copy_back);
-
-    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
-                     copy_back))
-      ret = -EFAULT;
-  }
-
-  if (plan.n && r.deep_len > 0) {
-    /* Each segment RM writes goes back to its own pointer. */
-    u32 back = r.deep_len;
-    size_t at = sizeof(*resp) + sizeof(params) + (size_t)r.nested_len;
-
-    if (nvgpu_resp_has(r.used, at, back) &&
-        nvgpu_deep_copy_back(&plan, resp_buf + at, back))
-      ret = -EFAULT;
-  } else if (deep_len > 0 && r.deep_len > 0) {
-    u32 copy_back = min(deep_len, r.deep_len);
-    size_t at = sizeof(*resp) + sizeof(params) + (size_t)r.nested_len;
-
-    if (nvgpu_resp_has(r.used, at, copy_back) &&
-        copy_to_user((void __user *)deep_user_ptr, resp_buf + at, copy_back))
-      ret = -EFAULT;
-  }
+  ret = nvgpu_rmctl_copy_back(nfd, uarg, user_nested, nested_size, resp_buf,
+                              &r, &c, r.status);
 
 out:
   kvfree(nested_copy);
@@ -885,6 +884,77 @@ out:
  * driver determines size from hClass.  We must look up the size ourselves
  * so we know how many bytes to copy_from_user.
  */
+/*
+ * The descriptor and the OS event an RM_ALLOC's parameters (`nested`, the
+ * request's copy) may name, translated: 0, or -EBADF for a descriptor that
+ * is not one of our files, or nvgpu_rm_os_event_in()'s refusal. The caller's
+ * values go into *event_fd (-1: none) and *os_event_val (*os_event: one was
+ * translated), for the reply.
+ *
+ * An event object names the file the event will be delivered on, and it
+ * names it inside these parameters rather than at a fixed place in the
+ * ioctl -- so the translation the device publishes for whole ioctls never
+ * sees it, and the backend was handed a descriptor number that means
+ * nothing in its process. RM looks it up, finds no event registered under
+ * it, and answers NV_ERR_OBJECT_NOT_FOUND.
+ *
+ * Userspace reports that as "Failed to allocate semaphore event" and
+ * abandons the device.
+ *
+ * NV0005_ALLOC_PARAMETERS keeps the descriptor in `data` at offset 16.
+ * Rewrite it the way the fixed-position path does: to the handle the
+ * backend issued for that file, which the backend turns back into one of
+ * its own descriptors.
+ */
+static int nvgpu_rm_alloc_translate_in(struct nvgpu_fd *nfd, u32 hclass,
+                                       void *nested, u32 nested_size,
+                                       int *event_fd, bool *os_event,
+                                       u64 *os_event_val) {
+  int ret;
+
+  if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
+      nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
+    memcpy(event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(*event_fd));
+    /* -1 is "no descriptor"; any other negative is refused, as below. */
+    if (*event_fd < -1)
+      return -EBADF;
+    if (*event_fd >= 0) {
+      u32 handle;
+
+      /*
+       * The descriptor is the one the event will be delivered on, so it is
+       * always one of our devices. Anything else would reach the backend as
+       * a number it reads as a handle of its own.
+       */
+      if (nvgpu_handle_for_fd(nfd->dev, *event_fd, &handle)) {
+        dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                            "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
+                            "names fd %d, which is not one of our devices\n",
+                            hclass, *event_fd);
+        return -EBADF;
+      }
+      memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
+    }
+  }
+
+  /* NV_EVENT_BUFFER's OS event, as for a waiter's (see there). */
+  if (hclass == NVGPU_CLASS_EVENT_BUFFER &&
+      nested_size >= NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64)) {
+    ret = nvgpu_rm_os_event_in(
+        nfd->dev, nested + NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
+        os_event_val);
+    if (ret) {
+      dev_dbg_ratelimited(&nfd->dev->vdev->dev,
+                          "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
+                          "0x%llx, which is not one of our devices\n",
+                          *os_event_val);
+      return ret;
+    }
+    *os_event = true;
+  }
+  return 0;
+}
+
 static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
                                  void __user *uarg, unsigned int sz,
                                  const void *pre) {
@@ -971,72 +1041,11 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       ret = -EFAULT;
       goto out;
     }
-
-    /*
-     * An event object names the file the event will be delivered on, and it
-     * names it inside these parameters rather than at a fixed place in the
-     * ioctl -- so the translation the device publishes for whole ioctls never
-     * sees it, and the backend was handed a descriptor number that means
-     * nothing in its process. RM looks it up, finds no event registered under
-     * it, and answers NV_ERR_OBJECT_NOT_FOUND.
-     *
-     * Userspace reports that as "Failed to allocate semaphore event" and
-     * abandons the device.
-     *
-     * NV0005_ALLOC_PARAMETERS keeps the descriptor in `data` at offset 16.
-     * Rewrite it the way the fixed-position path does: to the handle the
-     * backend issued for that file, which the backend turns back into one of
-     * its own descriptors.
-     */
-    {
-      u32 hclass = le32_to_cpu(params.hClass);
-
-      if ((hclass == NVGPU_CLASS_EVENT || hclass == NVGPU_CLASS_EVENT_OS_EVENT) &&
-          nested_size >= NVGPU_NV0005_DATA_OFFSET + sizeof(u32)) {
-        memcpy(&event_fd, nested + NVGPU_NV0005_DATA_OFFSET, sizeof(event_fd));
-        /* -1 is "no descriptor"; any other negative is refused, as below. */
-        if (event_fd < -1) {
-          ret = -EBADF;
-          goto out;
-        }
-        if (event_fd >= 0) {
-          u32 handle;
-
-          /*
-           * The descriptor is the one the event will be delivered on, so it
-           * is always one of our devices. Anything else would reach the
-           * backend as a number it reads as a handle of its own.
-           */
-          if (nvgpu_handle_for_fd(nfd->dev, event_fd, &handle)) {
-            dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                                "virtio-gpu-nv: RM_ALLOC of event class 0x%x "
-                                "names fd %d, which is not one of our "
-                                "devices\n",
-                                hclass, event_fd);
-            ret = -EBADF;
-            goto out;
-          }
-          memcpy(nested + NVGPU_NV0005_DATA_OFFSET, &handle, sizeof(handle));
-        }
-      }
-
-      /* NV_EVENT_BUFFER's OS event, as for a waiter's (see there). */
-      if (hclass == NVGPU_CLASS_EVENT_BUFFER &&
-          nested_size >=
-              NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64)) {
-        ret = nvgpu_rm_os_event_in(nfd->dev, nested +
-                                       NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET,
-                                   &os_event_val);
-        if (ret) {
-          dev_dbg_ratelimited(&nfd->dev->vdev->dev,
-                              "virtio-gpu-nv: NV_EVENT_BUFFER names OS event "
-                              "0x%llx, which is not one of our devices\n",
-                              os_event_val);
-          goto out;
-        }
-        os_event = true;
-      }
-    }
+    ret = nvgpu_rm_alloc_translate_in(nfd, le32_to_cpu(params.hClass), nested,
+                                      nested_size, &event_fd, &os_event,
+                                      &os_event_val);
+    if (ret)
+      goto out;
   }
 
   ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
