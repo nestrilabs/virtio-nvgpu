@@ -209,9 +209,12 @@ struct Args {
     /// A guest process presenting a frame sends a dozen requests one after
     /// another; one that arrives while the thread still looks costs the
     /// guest no kick (a VM exit) and this thread no wakeup. The price is
-    /// that much CPU after each burst: at most a core's worth under a
-    /// guest that never stops sending (DEPLOY.md, "Frame pacing").
-    #[arg(long, value_name = "US", default_value_t = 0)]
+    /// that much CPU after each burst, never while the guest is idle: at
+    /// most a core's worth under a guest that never stops sending. With the
+    /// guest's own reply spin it cost less host CPU in all than the kicks
+    /// and halt polling it replaces (DEPLOY.md, "Frame pacing"). At most
+    /// 1000.
+    #[arg(long, value_name = "US", default_value_t = 50)]
     queue_poll_us: u64,
 
     /// Allocate guest system memory with the coherency the guest asks for,
@@ -1749,13 +1752,11 @@ fn main() -> anyhow::Result<()> {
     )?;
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
-    if !nvgpu.queue_poll.is_zero() {
-        log::warn!(
-            "--queue-poll-us {}: the queue thread looks at the control ring that long after \
-             each drain",
-            nvgpu.queue_poll.as_micros()
-        );
-    }
+    log::info!(
+        "--queue-poll-us {}: the queue thread looks at the control ring that long after each \
+         drain",
+        nvgpu.queue_poll.as_micros()
+    );
     let backend = Arc::new(RwLock::new(nvgpu));
     if let Some(s) = &inject {
         let shared = backend.read().expect("backend lock").shared.clone();

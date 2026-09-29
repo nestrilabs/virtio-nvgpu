@@ -70,6 +70,13 @@
 #                       must be reserved); crosvm: transparent adds
 #                       --hugepages (MADV_HUGEPAGE)
 #   NVGPU_PREFAULT=0    nesbox: fault guest RAM in on first touch instead
+#   NVGPU_SLICE_US      the EEVDF slice of every VMM and backend thread, in
+#                       microseconds (chrt --other --sched-runtime; 100 to
+#                       100000, no privilege needed): a shorter slice than
+#                       the host's default (about 3 ms) gets a vCPU or the
+#                       queue thread back onto a busy CPU sooner after it
+#                       wakes, at the same share of the CPU. Default 100;
+#                       0 leaves the host's default
 #   NVGPU_CROSVM_CORE_SCHED=0  crosvm: --core-scheduling=false (its default
 #                       gives each vCPU a core-scheduling cookie of its own,
 #                       which idles the SMT sibling while a vCPU runs)
@@ -629,6 +636,19 @@ if [ -n "$VCPU_PINS" ]; then
 fi
 case $HUGEPAGES in '' | transparent | 2m | 1g) ;; *) die "NVGPU_HUGEPAGES=$HUGEPAGES: transparent, 2m or 1g" ;; esac
 case $PREFAULT in '' | 0 | 1) ;; *) die "NVGPU_PREFAULT=$PREFAULT: 0 or 1" ;; esac
+SLICE_US=${NVGPU_SLICE_US:-100}
+[[ $SLICE_US =~ ^[0-9]+$ ]] && { [ "$SLICE_US" = 0 ] || { [ "$SLICE_US" -ge 100 ] && [ "$SLICE_US" -le 100000 ]; }; } ||
+    die "NVGPU_SLICE_US=$SLICE_US: 0, or 100 to 100000"
+SLICE=()
+if [ "$SLICE_US" != 0 ]; then
+    # Inherited by every thread either process makes, and kept across the
+    # exec of what each runs (the jailer, unshare, setpriv).
+    if chrt --other --sched-runtime $((SLICE_US * 1000)) 0 true 2>/dev/null; then
+        SLICE=(chrt --other --sched-runtime $((SLICE_US * 1000)) 0)
+    else
+        echo "run-guest: this host takes no custom EEVDF slice (chrt --sched-runtime for SCHED_OTHER); the default slice stays" >&2
+    fi
+fi
 [ -x "$BACKEND_BIN" ] || die "no backend at $BACKEND_BIN (NVGPU_BACKEND)"
 [ -x "$VMM" ] || die "no VMM at $VMM (NVGPU_VMM)"
 [ -r "$KERNEL" ] || die "no guest kernel at $KERNEL (NVGPU_KERNEL)"
@@ -1243,6 +1263,7 @@ elif [ "$VMM_KIND" = crosvm ]; then
 else
     VMM_CMD=("${VMM_NETNS[@]}" "$VMM" "$CFG")
 fi
+VMM_CMD=("${SLICE[@]}" "${VMM_CMD[@]}")
 
 # ── The backend ──────────────────────────────────────────────────────────────
 #
@@ -1270,7 +1291,7 @@ done
 echo "backend: as $NVGPU_USER ($PRIV, $LAYOUT layout)${BACKEND_ARGS[*]:+, with ${BACKEND_ARGS[*]}}" >&2
 BACKEND_AFFINITY=()
 [ -z "$BACKEND_CPUS" ] || BACKEND_AFFINITY=(taskset -c "$BACKEND_CPUS")
-RUST_LOG=${RUST_LOG:-info} "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
+RUST_LOG=${RUST_LOG:-info} "${SLICE[@]}" "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
     "$BACKEND_EXE" --socket "$SOCK" "${BACKEND_ARGS[@]}" \
     {SLOT_FD}>&- > "$BLOG" 2>&1 &
 BACKEND=$!

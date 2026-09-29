@@ -96,7 +96,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 {
     echo "# $(date -Is) $WL $MODE on $MON (${HZ} Hz, workspace $WS), render:direct_scanout=$DS"
-    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-} load=${NVGPU_FP_LOAD:-} guest-pre=${NVGPU_FP_GUEST_PRE:-}"
+    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-} load=${NVGPU_FP_LOAD:-} guest-pre=${NVGPU_FP_GUEST_PRE:-} slice=${NVGPU_SLICE_US:-default}"
 } >>"$OUT/summary.txt"
 
 run_native() { # run_native N
