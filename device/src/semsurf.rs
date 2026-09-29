@@ -58,7 +58,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::hostfd::{IOC_RW, ioc};
 use crate::le;
-use crate::nvidia::NvidiaBackend;
+use crate::nvidia::{FdAccept, FdField, FdIn, FdNone, NvidiaBackend};
 #[cfg(test)]
 use crate::nvos::NV_ERR_INSUFFICIENT_PERMISSIONS;
 use crate::nvos::{
@@ -887,35 +887,37 @@ impl NvidiaBackend {
             .render_opened_by(handle, dri, self.handles.owner(handle));
     }
 
-    /// The host descriptor for the OS event a guest names at `field` (8
-    /// bytes, the guest's handle for the file) under client `h_client`:
-    /// `None` for 0 (no notification). EBADF for a number that is none of
-    /// our devices, EINVAL for one no live OS event of that client names.
+    /// The OS event a guest names at `at` of `block` (8 bytes, the guest's
+    /// handle for the file) under client `h_client`, and the field: `None`
+    /// for 0 (no notification). EBADF for a number that is none of our
+    /// devices, EINVAL for one no live OS event of that client names.
     pub(crate) fn os_event_fd(
         &self,
         h_client: u32,
-        field: &[u8],
-    ) -> Result<Option<std::os::fd::BorrowedFd<'_>>, Errno> {
-        let v = le::u64_at(field, 0).ok_or(libc::EINVAL)?;
-        if v == 0 {
-            return Ok(None);
-        }
-        let handle = u32::try_from(v).map_err(|_| libc::EBADF)?;
-        let fd = match self.handles.get(handle) {
-            Some((fd, crate::hostfd::HandleKind::Dev(_))) => fd,
-            _ => {
-                log::warn!("RM call names OS event handle {v:#x}, which is none of our devices");
-                return Err(libc::EBADF);
-            }
+        block: &[u8],
+        at: usize,
+    ) -> (FdField, Result<FdIn<'_>, Errno>) {
+        let f = FdField {
+            at,
+            width: 8,
+            accept: FdAccept::Device,
+            none: FdNone::Zero,
         };
-        if !self.semsurf.os_event_live(h_client, handle) {
-            log::warn!(
-                "RM call names handle {handle} as an OS event of client {h_client:#x}, and no \
-                 such event is live; refused"
-            );
-            return Err(libc::EINVAL);
-        }
-        Ok(Some(fd))
+        let v = match self.fd_field(block, f) {
+            Err(libc::EBADF) => {
+                log::warn!("RM call names an OS event by a handle that is none of our devices");
+                Err(libc::EBADF)
+            }
+            Ok(FdIn::File { handle, .. }) if !self.semsurf.os_event_live(h_client, handle) => {
+                log::warn!(
+                    "RM call names handle {handle} as an OS event of client {h_client:#x}, and no \
+                     such event is live; refused"
+                );
+                Err(libc::EINVAL)
+            }
+            v => v,
+        };
+        (f, v)
     }
 
     /// After a v1 RM call on `issuer` answered `resp` (`n` bytes): what it

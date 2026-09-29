@@ -204,13 +204,12 @@ impl VirtioGpuNvConfig {
         // ioctl here; otherwise it forwards the guest's own fd number, which
         // means nothing on the host. Publishing none of these is not a
         // degraded mode -- the backend then sees a raw guest fd where it
-        // expects one of its handles and refuses the call ("bad embedded
-        // handle 9", nvidia-smi reporting "Unable to determine the device
-        // handle for GPU0").
+        // expects one of its handles and refuses the call (EBADF, nvidia-smi
+        // reporting "Unable to determine the device handle for GPU0").
         //
         // The list has to agree with the backend's own, in
-        // `nvidia.rs::dispatch_fd_ioctl`, since that is what reads the
-        // rewritten field back out.
+        // `nvidia.rs::dispatch_fd_carrying` and `dispatch_map_memory`, since
+        // they read the rewritten field back out.
         //
         // Then the UVM commands that name a file (crate::uvmfd), marked
         // FDT_UVM, with their block sizes; where one of them sits depends on

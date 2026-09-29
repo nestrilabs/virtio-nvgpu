@@ -711,6 +711,79 @@ impl NvidiaBackend {
     }
 }
 
+/// A descriptor field of a block the guest sent: where it is, how wide,
+/// which of our handles may stand in it, and what "no descriptor" is there.
+///
+/// The guest driver turns the caller's descriptor into one of our handles,
+/// and the host must be handed our descriptor of that file in its place.
+/// Anything else in the field -- a number no handle of ours has, a handle of
+/// the wrong kind, a "none" the field does not take -- is refused, never
+/// forwarded: RM and UVM would look a number up among this process's
+/// descriptors, every guest process's files (R2, R5).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FdField {
+    pub(crate) at: usize,
+    /// 4, or 8 for a 64-bit field.
+    pub(crate) width: usize,
+    pub(crate) accept: FdAccept,
+    pub(crate) none: FdNone,
+}
+
+/// Which of our handles a descriptor field may name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FdAccept {
+    /// Any of our NVIDIA devices (RM takes the file as one of its own).
+    Device,
+    /// A control file (`/dev/nvidiactl`), the only kind RM's export and
+    /// import controls resolve (`nv_get_file_private(fd, NV_TRUE, ..)`).
+    ControlFile,
+    /// Exactly this kind.
+    Kind(HandleKind),
+}
+
+/// What says "no descriptor" in a descriptor field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FdNone {
+    /// -1, which the host is handed as it is.
+    MinusOne,
+    /// 0 (an OS event's field: no notification).
+    Zero,
+    /// Any negative value, left as the guest sent it (UVM's).
+    Negative,
+    /// Nothing: the field must name one of our files.
+    Never,
+}
+
+/// What a descriptor field holds.
+pub(crate) enum FdIn<'a> {
+    None,
+    File { handle: u32, fd: BorrowedFd<'a> },
+}
+
+/// Declare field `f` of block `b` a descriptor and put what
+/// [`NvidiaBackend::fd_field`] found in it: our descriptor of the file, or
+/// the field's "none" -- -1, or 0, as the guest sent it. A `Negative` "none"
+/// is not declared, and reaches the host as sent.
+pub(crate) fn declare_fd(
+    a: &mut Arena,
+    b: BufId,
+    f: FdField,
+    v: &FdIn<'_>,
+) -> std::result::Result<(), i32> {
+    match (v, f.none) {
+        (FdIn::None, FdNone::Negative) => Ok(()),
+        (FdIn::None, FdNone::MinusOne) => {
+            a.fd(b, f.at, f.width)?;
+            a.set_no_fd(b, f.at, -1)
+        }
+        (FdIn::None, _) => a.fd(b, f.at, f.width).map(|_| ()),
+        (FdIn::File { fd, .. }, _) => {
+            a.fd(b, f.at, f.width)?;
+            a.set_fd(b, f.at, *fd)
+        }
+    }
+}
+
 /// A placement the guest can hand back, and everything needed to undo it.
 ///
 /// This record is the extent's only owner. It used to share it with an
@@ -3581,43 +3654,30 @@ impl NvidiaBackend {
         // the host gets the descriptor this process holds for it, and the
         // reply the handle (the guest driver then restores the caller's own
         // descriptor over it).
-        if let Some(h_class) = class {
-            const NV0005_DATA: usize = 16;
-            // A block too short to hold the field is refused, as OS_UNIX's
-            // is: RM would read the descriptor from past what was sent --
-            // the zeroed slack after our buffer, descriptor 0 of this
-            // process (review 2026-09-29 1.17).
-            if matches!(h_class, 0x05 | 0x79) && nested_size < NV0005_DATA + 4 {
+        //
+        // A block too short to hold the field is refused, as OS_UNIX's is:
+        // RM would read the descriptor from past what was sent -- the zeroed
+        // slack after our buffer, descriptor 0 of this process (review
+        // 2026-09-29 1.17). -1, "no descriptor", goes as it is.
+        if let Some(h_class @ (0x05 | 0x79)) = class {
+            let f = FdField {
+                at: 16,
+                width: 4,
+                accept: FdAccept::Device,
+                none: FdNone::MinusOne,
+            };
+            let set = self.fd_field(nested_in, f).inspect_err(|&e| {
                 log::warn!(
-                    "event class {h_class:#x}: {nested_size} parameter bytes do not hold its \
-                     descriptor"
-                );
-                return fail(self, resp_buf, Status::IoctlFailed, libc::EINVAL);
-            }
-            if matches!(h_class, 0x05 | 0x79) {
-                let guest = le::i32_at(nested_in, NV0005_DATA).expect("checked above");
-                let set = match self.dev_fd(guest as u32) {
-                    Ok(fd) => a
-                        .fd(nb, NV0005_DATA, 4)
-                        .and_then(|_| a.set_fd(nb, NV0005_DATA, fd)),
-                    // -1, "no descriptor", goes as it is.
-                    Err(_) if guest == -1 => a
-                        .fd(nb, NV0005_DATA, 4)
-                        .and_then(|_| a.set_no_fd(nb, NV0005_DATA, -1)),
-                    // Anything else is refused, not forwarded: RM would
-                    // look the number up among every guest process's
-                    // files (R2).
-                    Err(_) => {
-                        log::warn!(
-                            "event class {h_class:#x}: no handle {guest} for the file this \
-                             event is to be delivered on"
-                        );
-                        return fail(self, resp_buf, Status::BadHandle, libc::EBADF);
+                    "event class {h_class:#x}: {}",
+                    if e == libc::EINVAL {
+                        format!("{nested_size} parameter bytes do not hold its descriptor")
+                    } else {
+                        "no handle of ours for the file this event is to be delivered on".into()
                     }
-                };
-                if let Err(e) = set {
-                    return fail(self, resp_buf, Status::IoctlFailed, e);
-                }
+                )
+            });
+            if let Err(e) = set.and_then(|v| declare_fd(&mut a, nb, f, &v)) {
+                return fail(self, resp_buf, Status::IoctlFailed, e);
             }
         }
 
@@ -3627,12 +3687,8 @@ impl NvidiaBackend {
         // for NV_EVENT_BUFFER a lookup that misses is a host oops, not a
         // refusal (semsurf.rs).
         if let Some((off, h_client)) = os_event {
-            let set = match self.os_event_fd(h_client, &nested_in[off..off + 8]) {
-                Ok(None) => a.fd(nb, off, 8).map(|_| ()),
-                Ok(Some(fd)) => a.fd(nb, off, 8).and_then(|_| a.set_fd(nb, off, fd)),
-                Err(e) => return fail(self, resp_buf, Status::IoctlFailed, e),
-            };
-            if let Err(e) = set {
+            let (f, set) = self.os_event_fd(h_client, nested_in, off);
+            if let Err(e) = set.and_then(|v| declare_fd(&mut a, nb, f, &v)) {
                 return fail(self, resp_buf, Status::IoctlFailed, e);
             }
         }
@@ -3645,25 +3701,23 @@ impl NvidiaBackend {
         if let Some(cmd) = cmd
             && let Some(crate::rmctl::UnixCtl::Fd { at }) = crate::rmctl::unix_control(cmd)
         {
-            let Some(guest) = le::i32_at(nested_in, at) else {
+            let f = FdField {
+                at,
+                width: 4,
+                accept: FdAccept::ControlFile,
+                none: FdNone::MinusOne,
+            };
+            let set = self.fd_field(nested_in, f).inspect_err(|&e| {
                 log::warn!(
-                    "RM control {cmd:#x}: {nested_size} parameter bytes do not hold its \
-                     descriptor"
-                );
-                return fail(self, resp_buf, Status::IoctlFailed, libc::EINVAL);
-            };
-            let set = if guest == -1 {
-                a.fd(nb, at, 4).and_then(|_| a.set_no_fd(nb, at, -1))
-            } else {
-                match self.ctl_fd(guest as u32) {
-                    Ok(fd) => a.fd(nb, at, 4).and_then(|_| a.set_fd(nb, at, fd)),
-                    Err(_) => {
-                        log::warn!("RM control {cmd:#x}: {guest} is no control file of this VM");
-                        return fail(self, resp_buf, Status::BadHandle, libc::EBADF);
+                    "RM control {cmd:#x}: {}",
+                    if e == libc::EINVAL {
+                        format!("{nested_size} parameter bytes do not hold its descriptor")
+                    } else {
+                        "its descriptor is no control file of this VM".into()
                     }
-                }
-            };
-            if let Err(e) = set {
+                )
+            });
+            if let Err(e) = set.and_then(|v| declare_fd(&mut a, nb, f, &v)) {
                 return fail(self, resp_buf, Status::IoctlFailed, e);
             }
         }
@@ -3674,24 +3728,26 @@ impl NvidiaBackend {
         // into one of our handles; the host gets the descriptor this process
         // holds, and the reply the guest's value.
         if let Some(off) = nested_fd_offset {
-            let Some(guest) = le::i32_at(nested_in, off) else {
-                log::warn!("ioctl {request:#x}: fd at {off} is outside {nested_size} nested bytes");
-                return fail(self, resp_buf, Status::InvalidMsgType, libc::EINVAL);
+            let f = FdField {
+                at: off,
+                width: 4,
+                accept: FdAccept::Device,
+                none: FdNone::Never,
             };
-            match self.dev_fd(guest as u32) {
-                Ok(fd) => {
-                    log::debug!("nvkms memFd: handle {guest} → host fd {}", fd.as_raw_fd());
-                    if let Err(e) = a.fd(nb, off, 4).and_then(|_| a.set_fd(nb, off, fd)) {
-                        return fail(self, resp_buf, Status::IoctlFailed, e);
-                    }
-                }
-                Err(_) => {
+            let set = self.fd_field(nested_in, f).inspect_err(|&e| {
+                if e == libc::EINVAL {
                     log::warn!(
-                        "nvkms memFd: no handle {guest}; the memory to import names a file we \
+                        "ioctl {request:#x}: fd at {off} is outside {nested_size} nested bytes"
+                    );
+                } else {
+                    log::warn!(
+                        "nvkms memFd: no handle of ours; the memory to import names a file we \
                          did not open"
                     );
-                    return fail(self, resp_buf, Status::BadHandle, 0);
                 }
+            });
+            if let Err(e) = set.and_then(|v| declare_fd(&mut a, nb, f, &v)) {
+                return fail(self, resp_buf, Status::IoctlFailed, e);
             }
         }
 
@@ -4507,32 +4563,28 @@ impl NvidiaBackend {
             _ => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY),
         };
 
-        let Some(embedded) = le::i32_at(param_in, fd_offset) else {
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
-        };
-
         // The field is a descriptor only when the caller put one there. -1 is
         // the caller saying it has none, which several of these ioctls allow --
         // NV_ESC_RM_ALLOC_MEMORY carries it for every allocation not being made
         // on another open file. It is forwarded as it stands, because that is
-        // what the host driver is being asked to read.
-        // Only -1: another negative number is no descriptor either, and
-        // RM would look it up among the backend's files (R5).
-        if embedded < -1 {
-            log::warn!("fd-carrying ioctl: descriptor field {embedded} refused");
-            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, libc::EBADF);
-        }
-        let host_embedded = if embedded == -1 {
-            None
-        } else {
-            match self.dev_fd(embedded as u32) {
-                Ok(fd) => Some(fd),
-                Err(_) => {
-                    log::warn!("fd-carrying ioctl: bad embedded handle {}", embedded as u32);
-                    return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
+        // what the host driver is being asked to read. Only -1: another
+        // negative number is no descriptor either.
+        let f = FdField {
+            at: fd_offset,
+            width: 4,
+            accept: FdAccept::Device,
+            none: FdNone::MinusOne,
+        };
+        let embedded = match self.fd_field(param_in, f) {
+            Ok(v) => v,
+            Err(e) => {
+                if e == libc::EBADF {
+                    log::warn!("fd-carrying ioctl {request:#x}: its descriptor is none of ours");
                 }
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
             }
         };
+        let none = matches!(embedded, FdIn::None);
 
         // The host's copy: the guest's block, the descriptor field declared
         // and holding our descriptor of the handle's file (or -1), and the
@@ -4540,20 +4592,13 @@ impl NvidiaBackend {
         let mut a = Arena::new();
         let built = self
             .top_block(&mut a, request, param_in, plan)
-            .and_then(|top| {
-                a.fd(top, fd_offset, 4)?;
-                match host_embedded {
-                    Some(fd) => a.set_fd(top, fd_offset, fd)?,
-                    None => a.set_no_fd(top, fd_offset, -1)?,
-                }
-                Ok(top)
-            });
+            .and_then(|top| declare_fd(&mut a, top, f, &embedded).map(|_| top));
         let top = match built {
             Ok(t) => t,
             Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
         };
         if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
-            if embedded == -1 {
+            if none {
                 log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
             } else {
                 log::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
@@ -4698,16 +4743,17 @@ impl NvidiaBackend {
 
         // --- Step 1: Translate embedded FD (guest handle → host fd) ---
 
-        let guest_fd_handle = le::u32_at(param_in, NVOS33_WITH_FD_FD).expect("checked above");
-
-        let host_map = match self.dev_fd(guest_fd_handle) {
-            Ok(fd) => fd,
-            Err(_) => {
-                log::warn!(
-                    "NV_ESC_RM_MAP_MEMORY: bad embedded FD handle {}",
-                    guest_fd_handle
-                );
-                return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
+        let f = FdField {
+            at: NVOS33_WITH_FD_FD,
+            width: 4,
+            accept: FdAccept::Device,
+            none: FdNone::Never,
+        };
+        let (guest_fd_handle, host_map) = match self.fd_field(param_in, f) {
+            Ok(FdIn::File { handle, fd }) => (handle, fd),
+            _ => {
+                log::warn!("NV_ESC_RM_MAP_MEMORY: its descriptor is none of our devices");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EBADF);
             }
         };
         let host_map_fd = host_map.as_raw_fd();
@@ -4728,9 +4774,11 @@ impl NvidiaBackend {
         let built = self
             .top_block(&mut a, request, param_in, plan)
             .and_then(|top| {
-                a.fd(top, NVOS33_WITH_FD_FD, 4)?;
-                a.set_fd(top, NVOS33_WITH_FD_FD, host_map)?;
-                Ok(top)
+                let file = FdIn::File {
+                    handle: guest_fd_handle,
+                    fd: host_map,
+                };
+                declare_fd(&mut a, top, f, &file).map(|_| top)
             });
         let top = match built {
             Ok(t) => t,
@@ -5280,34 +5328,33 @@ impl NvidiaBackend {
             return Ok(None);
         };
         let off = field.offset as usize;
-        let Some(value) = le::i32_at(params, off) else {
-            log::warn!(
-                "UVM command {cmd}: {} bytes, too short for its descriptor at {off}",
-                params.len()
-            );
-            return Err(libc::EINVAL);
-        };
-        if value < 0 {
-            return Ok(None);
-        }
-        let handle = value as u32;
         let want = match field.of {
             crate::uvmfd::FdOf::RmCtl => HandleKind::Dev(DeviceKind::Ctl),
             crate::uvmfd::FdOf::Uvm => HandleKind::Dev(DeviceKind::Uvm),
         };
-        match self.handles.get(handle) {
-            Some(_) if self.uvm_refused.contains(&handle) => {
+        let f = FdField {
+            at: off,
+            width: 4,
+            accept: FdAccept::Kind(want),
+            none: FdNone::Negative,
+        };
+        match self.fd_field(params, f) {
+            Ok(FdIn::None) => Ok(None),
+            Ok(FdIn::File { handle, .. }) if self.uvm_refused.contains(&handle) => {
                 log::warn!("UVM command {cmd}: names handle {handle}, a refused UVM file");
                 Err(libc::EBADF)
             }
-            Some((_, kind)) if kind == want => Ok(Some((off, handle))),
-            other => {
+            Ok(FdIn::File { handle, .. }) => Ok(Some((off, handle))),
+            Err(libc::EINVAL) => {
                 log::warn!(
-                    "UVM command {cmd}: descriptor field names handle {handle} ({:?}), not a \
-                     {want:?} of ours",
-                    other.map(|(_, k)| k)
+                    "UVM command {cmd}: {} bytes, too short for its descriptor at {off}",
+                    params.len()
                 );
-                Err(libc::EBADF)
+                Err(libc::EINVAL)
+            }
+            Err(e) => {
+                log::warn!("UVM command {cmd}: its descriptor field names no {want:?} of ours");
+                Err(e)
             }
         }
     }
@@ -5366,20 +5413,36 @@ impl NvidiaBackend {
         Err(libc::EPERM)
     }
 
-    /// The descriptor of `handle` when it is a control file
-    /// (`/dev/nvidiactl`), the only kind RM's export and import controls
-    /// resolve (`nv_get_file_private(fd, NV_TRUE, ..)`).
-    fn ctl_fd(&self, handle: u32) -> Result<BorrowedFd<'_>> {
-        match self.handles.get(handle) {
-            Some((fd, HandleKind::Dev(DeviceKind::Ctl))) => Ok(fd),
-            _ => Err(DeviceError::BadHandle(handle as u64)),
+    /// What the guest put in descriptor field `f` of `block`: its "none",
+    /// or a handle of ours `f` accepts and our descriptor of it. EINVAL for
+    /// a block too short to hold the field, EBADF for anything else. A
+    /// 32-bit field is read as a u32, -1 being `u32::MAX`, which no handle
+    /// is (handle_table.rs issues [1, i32::MAX]).
+    pub(crate) fn fd_field(&self, block: &[u8], f: FdField) -> std::result::Result<FdIn<'_>, i32> {
+        if !matches!(f.width, 4 | 8) {
+            return Err(libc::EINVAL);
         }
-    }
-
-    fn dev_fd(&self, handle: u32) -> Result<BorrowedFd<'_>> {
-        match self.handles.get(handle) {
-            Some((fd, HandleKind::Dev(_))) => Ok(fd),
-            _ => Err(DeviceError::BadHandle(handle as u64)),
+        let v = le::uint_at(block, f.at, f.width).ok_or(libc::EINVAL)?;
+        let sign = 1u64 << (8 * f.width - 1);
+        let none = match f.none {
+            FdNone::MinusOne => v == (sign << 1).wrapping_sub(1),
+            FdNone::Zero => v == 0,
+            FdNone::Negative => v & sign != 0,
+            FdNone::Never => false,
+        };
+        if none {
+            return Ok(FdIn::None);
+        }
+        let handle = u32::try_from(v).map_err(|_| libc::EBADF)?;
+        match (self.handles.get(handle), f.accept) {
+            (Some((fd, HandleKind::Dev(_))), FdAccept::Device)
+            | (Some((fd, HandleKind::Dev(DeviceKind::Ctl))), FdAccept::ControlFile) => {
+                Ok(FdIn::File { handle, fd })
+            }
+            (Some((fd, kind)), FdAccept::Kind(want)) if kind == want => {
+                Ok(FdIn::File { handle, fd })
+            }
+            _ => Err(libc::EBADF),
         }
     }
 
@@ -6902,6 +6965,61 @@ mod tests {
         let n = write_dri_section(&[dev("renderD128"), dev("renderD129")], &mut buf);
         assert_eq!(n, 4 + one);
         assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
+    }
+
+    /// Each descriptor field takes its own "none" and the handles it
+    /// accepts, and nothing else: a number no handle has, one of another
+    /// kind, or a block too short for the field.
+    #[test]
+    fn a_descriptor_field_takes_its_none_and_the_handles_it_accepts() {
+        let mut be = gated_backend();
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let gpu = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Gpu(0)));
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        let field = |accept, none, width| FdField {
+            at: 4,
+            width,
+            accept,
+            none,
+        };
+        let block = |v: u64| {
+            let mut b = vec![0xa5u8; 12];
+            b[4..12].copy_from_slice(&v.to_le_bytes());
+            b
+        };
+        let got = |be: &NvidiaBackend, f: FdField, v: u64| match be.fd_field(&block(v), f) {
+            Ok(FdIn::None) => Ok(None),
+            Ok(FdIn::File { handle, .. }) => Ok(Some(handle)),
+            Err(e) => Err(e),
+        };
+        let minus_one = u64::from(u32::MAX);
+        let dev = field(FdAccept::Device, FdNone::MinusOne, 4);
+        assert_eq!(got(&be, dev, minus_one), Ok(None));
+        assert_eq!(got(&be, dev, minus_one - 1), Err(libc::EBADF), "-2");
+        assert_eq!(got(&be, dev, gpu.into()), Ok(Some(gpu)));
+        assert_eq!(got(&be, dev, ctl.into()), Ok(Some(ctl)));
+        assert_eq!(got(&be, dev, render.into()), Err(libc::EBADF));
+        assert_eq!(got(&be, dev, 999), Err(libc::EBADF));
+        let only_ctl = field(FdAccept::ControlFile, FdNone::MinusOne, 4);
+        assert_eq!(got(&be, only_ctl, gpu.into()), Err(libc::EBADF));
+        assert_eq!(got(&be, only_ctl, ctl.into()), Ok(Some(ctl)));
+        let never = field(FdAccept::Device, FdNone::Never, 4);
+        assert_eq!(got(&be, never, minus_one), Err(libc::EBADF));
+        let uvm = field(
+            FdAccept::Kind(HandleKind::DriRender(0)),
+            FdNone::Negative,
+            4,
+        );
+        assert_eq!(got(&be, uvm, minus_one - 4), Ok(None));
+        assert_eq!(got(&be, uvm, render.into()), Ok(Some(render)));
+        assert_eq!(got(&be, uvm, gpu.into()), Err(libc::EBADF));
+        let event = field(FdAccept::Device, FdNone::Zero, 8);
+        assert_eq!(got(&be, event, 0), Ok(None));
+        assert_eq!(got(&be, event, gpu.into()), Ok(Some(gpu)));
+        assert_eq!(got(&be, event, 1 << 32 | u64::from(gpu)), Err(libc::EBADF));
+        let past = FdField { at: 9, ..dev };
+        assert!(matches!(be.fd_field(&block(0), past), Err(libc::EINVAL)));
+        be.teardown();
     }
 
     #[test]
