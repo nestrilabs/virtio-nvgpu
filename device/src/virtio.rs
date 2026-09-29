@@ -208,8 +208,8 @@ impl VirtioGpuNvConfig {
         // reporting "Unable to determine the device handle for GPU0").
         //
         // The list has to agree with the backend's own, in
-        // `nvidia.rs::dispatch_fd_carrying` and `dispatch_map_memory`, since
-        // they read the rewritten field back out.
+        // `dispatch_fd_carrying` (nvidia/rm.rs) and `dispatch_map_memory`
+        // (nvidia/rmmap.rs), since they read the rewritten field back out.
         //
         // Then the UVM commands that name a file (crate::uvmfd), marked
         // FDT_UVM, with their block sizes; where one of them sits depends on

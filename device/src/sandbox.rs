@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     /// On a host with the NVIDIA driver: what the backend reads and opens at
-    /// run time (nvidia.rs's node enumeration, GET_PROC_FILES and
+    /// run time (nvidia/hostnodes.rs's node enumeration, GET_PROC_FILES and
     /// GET_SYS_FILES, a guest's OPEN) stays reachable under the plan, and a
     /// path off it does not. Opens only; no ioctl reaches the driver.
     #[test]

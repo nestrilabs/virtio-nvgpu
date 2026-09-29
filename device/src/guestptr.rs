@@ -8,7 +8,7 @@
 //! -- and the host copies in from it and out to it on the guest's say-so:
 //! an arbitrary read and write of the VMM. Every forwarding path therefore
 //! either gives each pointer field an address of a buffer the backend owns
-//! (the nested and deep blocks, `nvidia.rs` `dispatch_nested`) or writes 0
+//! (the nested and deep blocks, `nvidia/rm.rs` `dispatch_nested`) or writes 0
 //! there, and restores what the caller had in the reply. What cannot be made
 //! safe that way is refused before it reaches the host.
 //!
@@ -517,7 +517,7 @@ pub const UVM_INIT_FLAGS_DISABLE_HMM: u64 = 0x1;
 /// (uvm_va_space_create, `flags & ~UVM_INIT_FLAGS_MASK`), so it is forced
 /// only where the host's table says the release takes it. Before that,
 /// DISABLE_HMM is the only switch, and ATS the other way in: the backend asks
-/// UVM afterwards whether the VA space has pageable access (nvidia.rs).
+/// UVM afterwards whether the VA space has pageable access (nvidia/uvm.rs).
 pub const UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
 /// UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE (uvm_types.h:67): the VA space
 /// is tied to no process's mm. Then any process may mmap the file
@@ -1851,7 +1851,7 @@ mod backend_tests {
     #[test]
     fn uvm_reaches_the_host_without_pageable_access_and_answers_with_the_callers_flags() {
         let (mut be, h) = backend(HandleKind::Dev(DeviceKind::Uvm));
-        // UVM blocks are sized by the host's release (nvidia.rs, uvm_size_ok).
+        // UVM blocks are sized by the host's release (nvidia/uvm.rs, uvm_size_ok).
         be.set_host_driver_version("610.57.04");
         let mut p = vec![0u8; 16];
         p[0..8].copy_from_slice(&0x2u64.to_le_bytes());

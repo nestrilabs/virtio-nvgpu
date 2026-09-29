@@ -103,6 +103,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use abi::ioctl::{NV_ESC_RM_ALLOC, NV_ESC_RM_ALLOC_MEMORY, NV_ESC_RM_VID_HEAP_CONTROL};
@@ -114,22 +115,25 @@ use protocol::messages::{
 
 use crate::hostfd;
 use crate::le;
-#[cfg(test)]
+use crate::nvidia::{IoctlOut, NvidiaBackend, V1, ioctl_arg_len};
 use crate::nvos::{
-    NV_ERR_NO_MEMORY, NVOS02_STATUS, NVOS02_WITH_FD_FD, NVOS32_ALLOC_OS_DESC_H_MEMORY,
-    NVOS32_STATUS, NVOS64_P_ALLOC_PARMS, NVOS64_P_RIGHTS_REQUESTED, NVOS64_STATUS, ROOT_CLASSES,
-};
-use crate::nvos::{
-    NV_OS_DESC_MEMORY_ALLOCATION_ATTR2, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR,
-    NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE, NV_OS_DESC_MEMORY_ALLOCATION_FLAGS,
-    NV_OS_DESC_MEMORY_ALLOCATION_LIMIT, NV_OS_DESC_MEMORY_ALLOCATION_SIZE,
-    NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVOS02_FLAGS, NVOS02_H_CLASS, NVOS02_H_OBJECT_NEW,
-    NVOS02_H_OBJECT_PARENT, NVOS02_H_ROOT, NVOS02_LIMIT, NVOS02_P_MEMORY, NVOS02_WITH_FD_SIZE,
-    NVOS32_ALLOC_OS_DESC_ATTR2, NVOS32_ALLOC_OS_DESC_DESCRIPTOR,
-    NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE, NVOS32_ALLOC_OS_DESC_LIMIT, NVOS32_FUNCTION,
+    self, NV_ERR_NO_MEMORY, NV_OK, NV_OS_DESC_MEMORY_ALLOCATION_ATTR2,
+    NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR_TYPE,
+    NV_OS_DESC_MEMORY_ALLOCATION_FLAGS, NV_OS_DESC_MEMORY_ALLOCATION_LIMIT,
+    NV_OS_DESC_MEMORY_ALLOCATION_SIZE, NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, NVOS00_H_OBJECT_OLD,
+    NVOS00_H_ROOT, NVOS00_SIZE, NVOS00_STATUS, NVOS02_FLAGS, NVOS02_H_CLASS, NVOS02_H_OBJECT_NEW,
+    NVOS02_H_OBJECT_PARENT, NVOS02_H_ROOT, NVOS02_LIMIT, NVOS02_P_MEMORY, NVOS02_STATUS,
+    NVOS02_WITH_FD_FD, NVOS02_WITH_FD_SIZE, NVOS32_ALLOC_OS_DESC_ATTR2,
+    NVOS32_ALLOC_OS_DESC_DESCRIPTOR, NVOS32_ALLOC_OS_DESC_DESCRIPTOR_TYPE,
+    NVOS32_ALLOC_OS_DESC_H_MEMORY, NVOS32_ALLOC_OS_DESC_LIMIT, NVOS32_FUNCTION,
     NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR, NVOS32_H_OBJECT_PARENT, NVOS32_H_ROOT, NVOS32_SIZE,
-    NVOS64_H_CLASS, NVOS64_H_OBJECT_PARENT, NVOS64_H_ROOT, NVOS64_PARAMS_SIZE, NVOS64_SIZE,
+    NVOS32_STATUS, NVOS54_CMD, NVOS54_H_CLIENT, NVOS54_H_OBJECT, NVOS54_SIZE, NVOS54_STATUS,
+    NVOS55_H_CLIENT, NVOS55_H_CLIENT_SRC, NVOS55_H_OBJECT, NVOS55_H_OBJECT_SRC, NVOS55_H_PARENT,
+    NVOS55_STATUS, NVOS64_H_CLASS, NVOS64_H_OBJECT_NEW, NVOS64_H_OBJECT_PARENT, NVOS64_H_ROOT,
+    NVOS64_P_ALLOC_PARMS, NVOS64_P_RIGHTS_REQUESTED, NVOS64_PARAMS_SIZE, NVOS64_SIZE,
+    NVOS64_STATUS, ROOT_CLASSES,
 };
+use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 use crate::sys::mem::{HostSpan, Reservation};
 
 /// A refusal: the errno the guest's ioctl returns.
@@ -1325,7 +1329,7 @@ impl OsDesc {
     /// UVM file `file` (charged to `owner`) mapped `(client, memory)` at
     /// `[base, base + len)` on `gpus` (MAP_EXTERNAL_ALLOCATION): every
     /// registration the memory holds is held by the mapping as well. The
-    /// caller says when UVM made it (nvidia.rs, `osdesc_uvm_after`).
+    /// caller says when UVM made it (`osdesc_uvm_after`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn uvm_mapped(
         &mut self,
@@ -1661,6 +1665,559 @@ pub(crate) mod test_ram {
     /// Whether any page of `[addr, addr+len)` is mapped in this process.
     pub fn mapped(addr: u64, len: u64) -> bool {
         crate::sys::mem::any_mapped(addr, len)
+    }
+}
+
+// ─────────────────────────── The backend ───────────────────────────
+
+impl NvidiaBackend {
+    /// One of the three calls that register memory the caller already has
+    /// -- ALLOC_MEMORY or RM_ALLOC of NV01_MEMORY_SYSTEM_OS_DESCRIPTOR,
+    /// VID_HEAP_CONTROL's ALLOC_OS_DESCRIPTOR -- sent with the
+    /// guest-physical pages behind it (`list`). `param_in` is the top-level
+    /// block (`outer_len` bytes) and, for RM_ALLOC, the class parameters
+    /// after it. RM is handed an address of this process's that maps
+    /// exactly those pages; the caller reads back its own. On RM's NV_OK the
+    /// reply carries the registration's id as its deep block.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_osdesc(
+        &mut self,
+        host_fd: RawFd,
+        request: u64,
+        outer_len: usize,
+        param_in: &[u8],
+        list: &[u8],
+    ) -> V1 {
+        use crate::osdesc::{self as od, Shape};
+        let Some(ram) = self
+            .guest_ram
+            .clone()
+            .filter(|_| self.session.v2 && self.config.allow_compute)
+        else {
+            log::warn!("OS descriptor page list from a guest never offered BCAP_OS_DESC; refused");
+            return Err(libc::EINVAL);
+        };
+        let cmd = request as u32;
+        let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
+        self.osdesc
+            .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
+        // Over a registration budget the answer is RM's own out-of-memory
+        // status at `.1` of the caller's block, the ioctl succeeding, as RM
+        // answers when it cannot pin (review 2026-09-29 parity #29): an
+        // errno read to libnvidia as a generic OS failure.
+        enum Refused {
+            Errno(i32),
+            Budget(usize),
+        }
+        let prepared = od::describe(cmd, outer, nested)
+            .map_err(Refused::Errno)
+            .and_then(|call| {
+                let runs = od::parse_runs(&call, list).map_err(Refused::Errno)?;
+                let resolved = od::resolve(&ram, &runs).map_err(Refused::Errno)?;
+                if self
+                    .osdesc
+                    .admit(self.current_handle, resolved.bytes(), resolved.vmas())
+                    .is_err()
+                {
+                    return Err(Refused::Budget(match call.shape {
+                        Shape::AllocMemory => NVOS02_STATUS,
+                        Shape::VidHeap => NVOS32_STATUS,
+                        Shape::RmAlloc => NVOS64_STATUS,
+                    }));
+                }
+                let pinned = resolved
+                    .map(call.in_page(), call.writable)
+                    .map_err(Refused::Errno)?;
+                Ok((call, pinned))
+            });
+        let (call, pinned) = match prepared {
+            Ok(p) => p,
+            Err(Refused::Budget(at)) => {
+                let out = nvos::with_status(param_in, at, NV_ERR_NO_MEMORY);
+                return Ok(IoctlOut::ok(out));
+            }
+            Err(Refused::Errno(e)) => return Err(e),
+        };
+        log::debug!(
+            "OS descriptor {cmd:#x}: {:#x} bytes of guest RAM at {:#x} of ours",
+            call.size,
+            pinned.addr
+        );
+
+        // What records the memory an escape makes (rmmem.rs) sees the call
+        // too: a handle made here is no longer whatever it named before.
+        let escape = hostfd::ioc_nr(cmd);
+        let mut seen = param_in.to_vec();
+        let rm_pending = self.rmmem.before(escape, &mut seen);
+
+        // The blocks the host is handed: the guest's, with the address RM
+        // pins declared and pointed at the backend's own mapping of exactly
+        // the pages named (osdesc.rs), and the caller's values in the reply.
+        let mut a = Arena::new();
+        let built = (|| -> std::result::Result<(BufId, Option<BufId>, usize, usize), i32> {
+            let top = a.block(outer, ioctl_arg_len(request, outer.len()))?;
+            match call.shape {
+                Shape::AllocMemory => {
+                    a.ptr(top, NVOS02_P_MEMORY)?;
+                    a.point_span(top, NVOS02_P_MEMORY, &pinned.span, pinned.at)?;
+                    // RM reads the descriptor only to arm a mapping of
+                    // NV01_MEMORY_SYSTEM (escape.c:415-431); a guest number
+                    // goes no further than here.
+                    a.fd(top, NVOS02_WITH_FD_FD, 4)?;
+                    a.set_no_fd(top, NVOS02_WITH_FD_FD, -1)?;
+                    Ok((top, None, NVOS02_STATUS, NVOS02_H_OBJECT_NEW))
+                }
+                Shape::VidHeap => {
+                    a.ptr(top, NVOS32_ALLOC_OS_DESC_DESCRIPTOR)?;
+                    a.point_span(
+                        top,
+                        NVOS32_ALLOC_OS_DESC_DESCRIPTOR,
+                        &pinned.span,
+                        pinned.at,
+                    )?;
+                    Ok((top, None, NVOS32_STATUS, NVOS32_ALLOC_OS_DESC_H_MEMORY))
+                }
+                Shape::RmAlloc => {
+                    let n = a.block(nested, nested.len())?;
+                    a.ptr(n, NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR)?;
+                    a.point_span(
+                        n,
+                        NV_OS_DESC_MEMORY_ALLOCATION_DESCRIPTOR,
+                        &pinned.span,
+                        pinned.at,
+                    )?;
+                    a.slot(top, NVOS64_P_ALLOC_PARMS, 8, SlotKind::Ptr, Restore::Yes)?;
+                    a.point(top, NVOS64_P_ALLOC_PARMS, n)?;
+                    // As guestptr::rm_escape: RM grants the default rights.
+                    a.slot(
+                        top,
+                        NVOS64_P_RIGHTS_REQUESTED,
+                        8,
+                        SlotKind::Ptr,
+                        Restore::Yes,
+                    )?;
+                    Ok((top, Some(n), NVOS64_STATUS, NVOS64_H_OBJECT_NEW))
+                }
+            }
+        })();
+        let (top, class_params, status_at, handle_at) = built?;
+        // The class parameters and the range RM pins live past the call: the
+        // arena holds the one, `pinned` the other.
+        if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
+            log::warn!("OS descriptor {cmd:#x}: the host refused the call (errno {errno})");
+            return Err(errno);
+        }
+
+        // The caller's own values back where ours were.
+        let mut out = a.reply(top)[..outer.len()].to_vec();
+        if let Some(n) = class_params {
+            out.extend_from_slice(&a.reply(n));
+        }
+        drop(a);
+        self.rmmem.after(rm_pending, &mut out);
+
+        // Both inside the block the host was handed, whose size the escape's
+        // number fixes (`ioctl_arg_len`).
+        let status = le::u32_at(&out, status_at);
+        let deep = if let (Some(NV_OK), Some(object)) = (status, le::u32_at(&out, handle_at)) {
+            let id = self.osdesc.add(
+                self.current_handle,
+                call.client,
+                object,
+                call.parent,
+                pinned,
+            );
+            log::debug!(
+                "OS descriptor {id}: {:#x} bytes as {:#x}/{:#x}",
+                call.size,
+                call.client,
+                object
+            );
+            if call.shape == Shape::RmAlloc {
+                self.rm_classes.add(NV01_MEMORY_SYSTEM_OS_DESCRIPTOR);
+            }
+            out.extend_from_slice(&id.to_le_bytes());
+            8
+        } else {
+            // Nothing made, nothing pinned by RM: the range goes now.
+            log::debug!("OS descriptor {cmd:#x}: RM answered {status:#x?}; nothing registered");
+            drop(pinned);
+            0
+        };
+        Ok(IoctlOut::deep(out, deep))
+    }
+
+    /// What RM freed, duplicated or made anew, from a successful reply's
+    /// parameters (`reply`), for the registrations that live through RM
+    /// objects (osdesc.rs).
+    pub(super) fn osdesc_observe(&mut self, escape: u32, reply: &[u8]) {
+        use abi::ioctl::*;
+        if self.osdesc.live() == 0 {
+            return;
+        }
+        let r = |o: usize| le::u32_at(reply, o);
+        // NVOS64 and NVOS02 alike: hRoot, hObjectParent, hObjectNew, hClass,
+        // ..., status.
+        const _: () = assert!(
+            NVOS64_H_ROOT == NVOS02_H_ROOT
+                && NVOS64_H_OBJECT_PARENT == NVOS02_H_OBJECT_PARENT
+                && NVOS64_H_OBJECT_NEW == NVOS02_H_OBJECT_NEW
+                && NVOS64_H_CLASS == NVOS02_H_CLASS
+                && NVOS64_STATUS == NVOS02_STATUS
+        );
+        match escape {
+            NV_ESC_RM_FREE if r(NVOS00_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(o)) = (r(NVOS00_H_ROOT), r(NVOS00_H_OBJECT_OLD)) {
+                    self.osdesc.freed(c, o);
+                }
+            }
+            NV_ESC_RM_DUP_OBJECT if r(NVOS55_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(p), Some(o), Some(sc), Some(so)) = (
+                    r(NVOS55_H_CLIENT),
+                    r(NVOS55_H_PARENT),
+                    r(NVOS55_H_OBJECT),
+                    r(NVOS55_H_CLIENT_SRC),
+                    r(NVOS55_H_OBJECT_SRC),
+                ) {
+                    self.osdesc.duplicated(sc, so, c, o, p);
+                }
+            }
+            // The parameters follow the NVOS54. A semaphore surface holding
+            // registered memory hands the caller duplicates of it
+            // (osdesc.rs, `SEMSURF_REF_MEMORY`): each holds it too.
+            NV_ESC_RM_CONTROL
+                if r(NVOS54_STATUS) == Some(NV_OK)
+                    && r(NVOS54_CMD) == Some(crate::osdesc::SEMSURF_REF_MEMORY) =>
+            {
+                if let (Some(c), Some(o)) = (r(NVOS54_H_CLIENT), r(NVOS54_H_OBJECT))
+                    && self.osdesc.holds(c, o)
+                {
+                    let out: Vec<u32> = [0, 4]
+                        .iter()
+                        .filter_map(|&at| r(NVOS54_SIZE + at))
+                        .collect();
+                    self.osdesc.referenced(c, o, &out);
+                }
+            }
+            // A zero hObjectNew is no handle: RM made the object under one it
+            // generated and, through ALLOC_MEMORY, never wrote back.
+            //
+            // A root class (NV01_ROOT and its kin) makes a new *client*
+            // named hObjectNew, and RM ignores hRoot: nothing of `c` was
+            // made, and forgetting `(c, o)` would release a registration RM
+            // still pins (review 2026-09-29 1.3).
+            NV_ESC_RM_ALLOC
+                if r(NVOS64_STATUS) == Some(NV_OK)
+                    && r(NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c)) => {}
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(NVOS64_STATUS) == Some(NV_OK) => {
+                if let (Some(c), Some(p), Some(o)) = (
+                    r(NVOS64_H_ROOT),
+                    r(NVOS64_H_OBJECT_PARENT),
+                    r(NVOS64_H_OBJECT_NEW),
+                ) && o != 0
+                {
+                    self.osdesc.reused(c, o);
+                    // An object RM keeps a duplicate of registered memory
+                    // for, in a client of its own (osdesc.rs,
+                    // `holding_fields`): the class parameters follow the
+                    // NVOS64.
+                    if escape == NV_ESC_RM_ALLOC
+                        && let Some(class) = r(NVOS64_H_CLASS)
+                    {
+                        let named: Vec<u32> = crate::osdesc::holding_fields(class)
+                            .iter()
+                            .filter_map(|&off| r(NVOS64_SIZE + off))
+                            .collect();
+                        if !named.is_empty() {
+                            self.osdesc.made_over(c, o, p, &named);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Free `clients` on `host_fd`, the file they were allocated on, if they
+    /// hold memory registered by its pages, and forget what they held. RM
+    /// lets go of the pages in the free (the file's own last close may be
+    /// later: the event pump holds a duplicate of a watched file), and only
+    /// then may the guest unpin them.
+    pub(crate) fn osdesc_end_clients(&mut self, host_fd: RawFd, clients: &[u32], why: &str) {
+        let holders = self.osdesc.clients();
+        let ending: Vec<u32> = clients
+            .iter()
+            .copied()
+            .filter(|c| holders.contains(c))
+            .collect();
+        if ending.is_empty() {
+            return;
+        }
+        let request = abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_FREE, NVOS00_SIZE as u32);
+        // Only a client RM says it freed is forgotten. One it would not free
+        // (on another file, or a failed call) may still hold the pages, and
+        // the guest must not be told it may unpin them: its registrations
+        // stay, released late -- by a later free RM does confirm, or with the
+        // session -- never early.
+        let mut freed = Vec::with_capacity(ending.len());
+        for &c in &ending {
+            // The client names itself.
+            let mut p = [0u8; NVOS00_SIZE];
+            for at in [NVOS00_H_ROOT, NVOS00_H_OBJECT_OLD] {
+                le::put_u32(&mut p, at, c).expect("in the block");
+            }
+            let mut a = Arena::new();
+            let top = a.small(&p);
+            let rc = match self.host_call(&mut a, host_fd, request, top) {
+                Ok(r) => r,
+                Err(e) => -e,
+            };
+            let status = le::u32_at(a.bytes(top), NVOS00_STATUS).expect("in the block");
+            if rc < 0 || status != NV_OK {
+                log::warn!(
+                    "{why}: freeing RM client {c:#x}, which holds registered guest memory: \
+                     rc {rc}, status {status:#x}; its registrations stay"
+                );
+                continue;
+            }
+            freed.push(c);
+        }
+        self.osdesc.forget_clients(&freed);
+    }
+
+    /// Whether RM control `param_in` (NVOS54 and its parameters) would hand
+    /// an object holding registered memory to an RM export descriptor or an
+    /// NV_MEMORY_EXPORT object: a duplicate the backend never sees made or
+    /// freed, which NVKMS, nvidia-drm or another RM client can import in
+    /// turn. Refused (EPERM) rather than followed.
+    pub(super) fn osdesc_export_refused(&self, param_in: &[u8]) -> bool {
+        if self.osdesc.live() == 0 {
+            return false;
+        }
+        let (Some(client), Some(cmd), Some(params)) = (
+            le::u32_at(param_in, NVOS54_H_CLIENT),
+            le::u32_at(param_in, NVOS54_CMD),
+            param_in.get(NVOS54_SIZE..),
+        ) else {
+            return false;
+        };
+        let Some(named) = crate::osdesc::exported(cmd, params) else {
+            return false;
+        };
+        match named.iter().find(|&&h| self.osdesc.holds(client, h)) {
+            Some(h) => {
+                log::warn!(
+                    "RM control {cmd:#x} refused: it exports {client:#x}/{h:#x}, which holds \
+                     guest memory registered by its pages"
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Before UVM command `cmd` (`params`, the block the host will get):
+    /// ALLOC_DEVICE_P2P of registered memory is refused (it is for video
+    /// memory, and its duplicate outlives a UVM_FREE while a CPU mapping of
+    /// the range holds it); a MAP_EXTERNAL_ALLOCATION of it, what the
+    /// mapping will hold once UVM has made it.
+    pub(super) fn osdesc_uvm_before(
+        &self,
+        cmd: u32,
+        params: &[u8],
+    ) -> std::result::Result<Option<crate::osdesc::UvmMap>, i32> {
+        use crate::osdesc::{UVM_ALLOC_DEVICE_P2P, UVM_MAP_EXTERNAL_ALLOCATION};
+        if self.osdesc.live() == 0 {
+            return Ok(None);
+        }
+        let (UVM_MAP_EXTERNAL_ALLOCATION | UVM_ALLOC_DEVICE_P2P) = cmd else {
+            return Ok(None);
+        };
+        // hClient and hMemory follow rmCtrlFd in both.
+        let Some(fd_off) = crate::uvmfd::field(self.driver, cmd).map(|f| f.offset as usize) else {
+            return Ok(None);
+        };
+        let rd64 = |o: usize| le::u64_at(params, o);
+        let (Some(client), Some(memory)) = (
+            le::u32_at(params, fd_off + 4),
+            le::u32_at(params, fd_off + 8),
+        ) else {
+            return Ok(None);
+        };
+        if !self.osdesc.holds(client, memory) {
+            return Ok(None);
+        }
+        if cmd == UVM_ALLOC_DEVICE_P2P {
+            log::warn!(
+                "UVM ALLOC_DEVICE_P2P of {client:#x}/{memory:#x} refused: guest memory \
+                 registered by its pages"
+            );
+            return Err(libc::EPERM);
+        }
+        let (base, len) = (rd64(0).unwrap_or(0), rd64(8).unwrap_or(0));
+        let file = self.current_handle;
+        self.osdesc
+            .uvm_admit(file, self.handles.owner(file), client, memory, base, len)?;
+        // UVM_MAP_EXTERNAL_ALLOCATION_PARAMS: base, length, offset, then
+        // perGpuAttributes[] at 24 (36 bytes each, the UUID first), and
+        // gpuAttributesCount just before rmCtrlFd.
+        const ATTRS: usize = 24;
+        const ATTR_SIZE: usize = 36;
+        let max = fd_off.saturating_sub(8 + ATTRS) / ATTR_SIZE;
+        let count = fd_off
+            .checked_sub(8)
+            .and_then(rd64)
+            .unwrap_or(0)
+            .min(max as u64) as usize;
+        let gpus = (0..count)
+            .filter_map(|i| {
+                let at = ATTRS + i * ATTR_SIZE;
+                params.get(at..at + 16)?.try_into().ok()
+            })
+            .collect();
+        Ok(Some(crate::osdesc::UvmMap {
+            base,
+            len,
+            gpus,
+            client,
+            memory,
+            // rmStatus, after rmCtrlFd, hClient and hMemory.
+            status_at: fd_off + 12,
+        }))
+    }
+
+    /// After UVM command `cmd` on the current handle: what it made, mapped,
+    /// unmapped or freed, for the registrations UVM external mappings hold
+    /// (osdesc.rs). `params` is the block the host was handed.
+    pub(super) fn osdesc_uvm_after(
+        &mut self,
+        cmd: u32,
+        params: &[u8],
+        map: Option<crate::osdesc::UvmMap>,
+        reply: Option<&[u8]>,
+    ) {
+        use crate::osdesc::{
+            UVM_CREATE_EXTERNAL_RANGE, UVM_MAP_EXTERNAL_ALLOCATION, UVM_UNMAP_EXTERNAL,
+        };
+        // UVM's own status, where the block keeps it; None when the call
+        // failed before UVM answered, or the reply is short.
+        let status = |at: usize| le::u32_at(reply?, at);
+        let handle = self.current_handle;
+        let word = |o: usize| le::u64_at(params, o).unwrap_or(0);
+        let size = params.len();
+        match cmd {
+            UVM_MAP_EXTERNAL_ALLOCATION => {
+                let Some(m) = map else { return };
+                // Held when UVM made it: NV_OK, or a failure of its wait for
+                // the page-table writes, after which it leaves every mapping
+                // up -- a channel's RC or ECC error, or the GPU gone
+                // (uvm_map_external_allocation, uvm_channel_get_status).
+                // Every other failure is answered before anything is mapped,
+                // or after tearing down what the call made; and with no
+                // answer at all the call never reached UVM. A mapping held
+                // that was never made lasts until its range is freed or its
+                // file closes (it lies in a recorded range, uvm_admit): late,
+                // not early.
+                const NV_ERR_ECC_ERROR: u32 = 0x0b;
+                const NV_ERR_GPU_IS_LOST: u32 = 0x0f;
+                const NV_ERR_RC_ERROR: u32 = 0x60;
+                if let Some(0 | NV_ERR_ECC_ERROR | NV_ERR_GPU_IS_LOST | NV_ERR_RC_ERROR) =
+                    status(m.status_at)
+                {
+                    let owner = self.handles.owner(handle);
+                    self.osdesc
+                        .uvm_mapped(handle, owner, m.base, m.len, &m.gpus, m.client, m.memory);
+                }
+            }
+            UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
+                let owner = self.handles.owner(handle);
+                self.osdesc
+                    .uvm_range_made_by(handle, word(0), word(8), owner);
+            }
+            crate::uvmmap::FREE if size >= 16 && status(size - 8) == Some(0) => {
+                self.osdesc.uvm_range_freed(handle, word(0));
+            }
+            // UVM_UNMAP_EXTERNAL_PARAMS: base, length, gpuUuid.
+            UVM_UNMAP_EXTERNAL if size >= 40 && status(size - 8) == Some(0) => {
+                if let Some(gpu) = params.get(16..32).and_then(|g| g.try_into().ok()) {
+                    self.osdesc.uvm_unmapped(handle, word(0), word(8), &gpu);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Take down, on UVM file `host_fd` (guest handle `handle`) while it is
+    /// still ours, every external mapping of registered memory it holds, and
+    /// forget its ranges: UVM_FREE of each recorded range holding one, then
+    /// UNMAP_EXTERNAL of what is left, GPU by GPU. Its last reference may be
+    /// dropped later than the close (the event pump holds a duplicate), so
+    /// the close itself says nothing of when UVM lets go. What will not come
+    /// down stays held until the session ends.
+    pub(crate) fn osdesc_uvm_close(&mut self, host_fd: RawFd, handle: u32, why: &str) {
+        use crate::osdesc::UVM_UNMAP_EXTERNAL;
+        for (base, len) in self.osdesc.uvm_ranges_held(handle) {
+            // UVM_FREE_PARAMS: base, then (before 590.44.01) length.
+            let ok = self.uvm_call(host_fd, crate::uvmmap::FREE, |b, size| {
+                b[0..8].copy_from_slice(&base.to_le_bytes());
+                if size >= 24 {
+                    b[8..16].copy_from_slice(&len.to_le_bytes());
+                }
+            });
+            if ok {
+                self.osdesc.uvm_range_freed(handle, base);
+            } else {
+                log::warn!("{why}: UVM_FREE of the external range at {base:#x} failed");
+            }
+        }
+        for (base, len, gpu) in self.osdesc.uvm_maps_held(handle) {
+            // UVM_UNMAP_EXTERNAL_PARAMS: base, length, gpuUuid.
+            let ok = self.uvm_call(host_fd, UVM_UNMAP_EXTERNAL, |b, _| {
+                b[0..8].copy_from_slice(&base.to_le_bytes());
+                b[8..16].copy_from_slice(&len.to_le_bytes());
+                b[16..32].copy_from_slice(&gpu);
+            });
+            if ok {
+                self.osdesc.uvm_unmapped(handle, base, len, &gpu);
+            } else {
+                log::warn!("{why}: UVM_UNMAP_EXTERNAL of {base:#x}+{len:#x} failed");
+            }
+        }
+        self.osdesc.uvm_file_closed(handle);
+    }
+
+    /// Call UVM command `cmd` on `host_fd` with the block the host's release
+    /// has for it, filled by `fill` (handed at least 40 bytes, and the
+    /// block's size): whether the ioctl and UVM (its status, `size - 8` into
+    /// the block, for every command called here) both succeeded.
+    pub(super) fn uvm_call(
+        &self,
+        host_fd: RawFd,
+        cmd: u32,
+        fill: impl FnOnce(&mut [u8], usize),
+    ) -> bool {
+        let Some(size) = self
+            .driver
+            .and_then(abi::schema::uvm_table)
+            .and_then(|t| t.lookup(cmd))
+            .map(|c| c.size as usize)
+            .filter(|&s| s >= 16)
+        else {
+            return false;
+        };
+        let mut b = vec![0u8; size.max(40)];
+        fill(&mut b, size);
+        // Exactly the block UVM copies each way for `cmd` on this release;
+        // none of the commands called here holds a pointer.
+        let mut a = Arena::new();
+        let top = a.small(&b[..size]);
+        let rc = self.host_call(&mut a, host_fd, u64::from(cmd), top);
+        rc == Ok(0) && a.bytes(top)[size - 8..size - 4] == [0; 4]
+    }
+
+    /// OP_OSDESC_REAP: the releases after `ack`, and forget those up to it.
+    pub(crate) fn osdesc_reap(&mut self, ack: u64) -> (u64, Vec<u64>) {
+        self.osdesc.reap(ack)
     }
 }
 

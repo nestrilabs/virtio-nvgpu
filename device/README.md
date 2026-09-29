@@ -44,7 +44,13 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 
 | file | contents |
 |---|---|
-| `src/nvidia.rs` | `NvidiaBackend`: the dispatcher. Opens, closes, v1 ioctls routed by handle kind, RM escapes with nested and deep blocks, mmap placement, GET_PROC/SYS_FILES, and the hooks every other module is called from |
+| `src/nvidia/mod.rs` | `NvidiaBackend`: the dispatcher and the VM's state. Every message's entry point, OPEN and CLOSE (one per-file teardown, `retire_handle`, for a CLOSE and the session's end), the host version and ABI profile, and the hooks every other module is called from |
+| `src/nvidia/v1.rs` | the v1 IOCTL: the request parsed once (`V1Request`, its deep block one of none, single, segments or page list), the route a handle's kind allows (`v1_route`), the flat DRM and NVKMS calls, and the reply serialised once from a typed result (`IoctlOut`, `write_v1`) |
+| `src/nvidia/rm.rs` | RM escapes: the gates (ABI profile, untranslated descriptors, the allowlist, pointers, sharing), parameter blocks behind a pointer with their deep blocks (`dispatch_nested`), and the one reader of the descriptor fields a guest names a file in (`FdField`) |
+| `src/nvidia/rmmap.rs` | RM_MAP_MEMORY, UPDATE_DEVICE_MAPPING_INFO and RM_UNMAP_MEMORY |
+| `src/nvidia/uvm.rs` | v1 UVM commands: sizes, the descriptor and RM client some name, pools and pageable access |
+| `src/nvidia/placement.rs` | MMAP and MUNMAP: window extents, the memory type each placement is mapped with, UVM pools in the aperture |
+| `src/nvidia/hostnodes.rs` | the host's DRM nodes (GET_DEV_INFO, render and card nodes per GPU) and the GET_PROC_FILES/GET_SYS_FILES streams |
 | `src/session.rs` | protocol v2: the session and its reset, HELLO, TIME_SYNC, WATCH, HOST_OP, and IOCTL2 split into prepare, execute and finish so the host ioctl runs without the backend's lock |
 | `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, re-homes GEM handles, and keeps each VM's framebuffer records |
 | `src/schema.rs` | ties the generated schema tables (`abi::schema`) to handle kinds |
@@ -144,7 +150,7 @@ Replies may not exceed their capacity or carry an address the host was
 handed.
 
 Nothing reaches a device: under `cfg(fuzzing)` every path the backend opens
-is `/dev/null` (`nvidia.rs`, `session.rs`, `semsurf.rs`, `hostfd.rs`), the
+is `/dev/null` (`nvidia/`, `session.rs`, `semsurf.rs`, `hostfd.rs`), the
 harness refuses to start where `/dev/nvidiactl` exists, and the script's
 sandbox has none.
 

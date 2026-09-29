@@ -52,7 +52,7 @@
 //!   or not, are bounded the same way before UVM is asked to make one:
 //!   a pool is host kernel memory from the moment it is made (F1).
 //!
-//! Pure bookkeeping: `nvidia.rs` makes the calls, observes UVM's replies, and
+//! Pure bookkeeping: `nvidia/uvm.rs` makes the calls, observes UVM's replies, and
 //! asks the VMM to place and withdraw.
 
 #![forbid(unsafe_code)]

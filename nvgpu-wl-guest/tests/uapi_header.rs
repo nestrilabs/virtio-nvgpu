@@ -4,6 +4,8 @@
 //! size and field offsets. The daemon and the guest module ship separately,
 //! and nothing else checks that they agree.
 
+#![forbid(unsafe_code)]
+
 use nvgpu_wl_guest::uapi::*;
 use protocol::cheader::Header;
 use std::mem::{offset_of, size_of};

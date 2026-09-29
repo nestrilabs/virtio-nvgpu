@@ -104,7 +104,7 @@ pub fn begin(msg: &[u8]) {
         s.taint.clear();
         // Every 8 bytes of the message, and every 5 to 7 bytes zero-extended:
         // a block cut short leaves the host reading the guest's low bytes
-        // over zeros of ours (nvidia.rs, dispatch_nested).
+        // over zeros of ours (nvidia/rm.rs, dispatch_nested).
         for i in 0..msg.len() {
             for n in 5..=8 {
                 let Some(w) = msg.get(i..i + n) else { break };
