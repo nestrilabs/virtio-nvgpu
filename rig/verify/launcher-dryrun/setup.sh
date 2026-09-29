@@ -13,7 +13,6 @@ chmod 0755 "$R"
 mkdir -p "$R"/{nix,bin,usr,proc,dev,etc,run,tmp,root,stubs,home} "$R"/rig/{bin,kernel,guest,logs}
 mount --rbind /nix "$R/nix"
 mount --rbind /bin "$R/bin"
-mount --rbind /usr "$R/usr"
 mount -t tmpfs tmpfs "$R/run"
 mkdir -p "$R/run/current-system"
 mount --rbind /run/current-system "$R/run/current-system"
@@ -33,6 +32,13 @@ nvgpu-vm0:x:0:
 root:x:0:
 EOF
 printf 'passwd: files\ngroup: files\nshadow: files\n' > "$R/etc/nsswitch.conf"
+# /usr of the chroot's own (root's, here): the new launcher starts again, as
+# root, with PATH=/usr/sbin:/usr/bin:...:/run/current-system/sw/bin, so the
+# stubs it must find go in /usr/sbin, and what it runs as root and checks is
+# root's (/nix is real root's, uid 65534 here).
+mkdir -p "$R/usr/bin" "$R/usr/sbin"
+ln -s /run/current-system/sw/bin/env "$R/usr/bin/env"
+cp "$(command -v systemd-socket-activate)" "$R/usr/bin/systemd-socket-activate"
 # pgrep: a slot's users "run nothing" (every user is uid 0 here, and this
 # shell would otherwise count).
 cat > "$R/stubs/pgrep" <<'EOF'
@@ -40,10 +46,18 @@ cat > "$R/stubs/pgrep" <<'EOF'
 case " $* " in *" -u nvgpu-vm"*) exit 1 ;; esac
 exec /run/current-system/sw/bin/pgrep "$@"
 EOF
-printf '#!/bin/sh\necho "jailer stub: $*"\nexit 0\n' > "$R/rig/bin/jailer"
+# chown, chgrp: every change of ownership the launcher makes, logged (one
+# uid maps here, so a chown to the backend's user changes nothing to see).
+for t in chown chgrp; do
+    printf '#!/bin/sh\necho "%s $*" >> /rig/logs/ownership.log\nexec /run/current-system/sw/bin/%s "$@"\n' "$t" "$t" > "$R/stubs/$t"
+done
+chmod 0755 "$R/stubs/"*
+cp "$R/stubs/"* "$R/usr/sbin/"
+cp "$D/jailer.sh" "$R/rig/bin/jailer"
 cp "$D/stubvmm" "$R/rig/bin/nesbox"
+cp "$D/stubvmm-dyn" "$R/rig/bin/nesbox-dyn"
 cp "$D/backend.sh" "$R/rig/bin/vhost-user-nvgpu"
-chmod 0755 "$R/stubs/pgrep" "$R/rig/bin/"*
+chmod 0755 "$R/rig/bin/"*
 echo kernel > "$R/rig/kernel/vmlinux"
 truncate -s 1M "$R/rig/guest/rootfs.ext4"
 cp "$OLD" "$R/rig/run-guest.old.sh"
