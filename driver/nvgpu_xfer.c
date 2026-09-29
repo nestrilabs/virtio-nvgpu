@@ -682,6 +682,152 @@ static void nvgpu_ctrl_poll_exit(struct nvgpu_device *dev) {
 }
 
 /*
+ * Put `r` on the control ring: executor budget first, for an executor-class
+ * request, then ring space. 0 once it is on the ring (and the device
+ * notified), with *t0 the time it went on; else -EINTR (a fatal signal while
+ * waiting), -ENODEV (the transport died) or the ring's error, with no budget
+ * held and nothing sent.
+ */
+static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
+                              u32 flags, u64 *t0) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  struct scatterlist *sgs[2] = {r->req->sg, r->resp->sg};
+  unsigned long irqf;
+  bool kick = false;
+  u32 units = 0;
+  int ret;
+
+  /*
+   * Executor-class requests can sit on the ring for seconds (a blocking
+   * commit, a modeset). Cap the slots they hold between them at half the ring
+   * less a margin, so inline requests -- RM calls, CLOSE, HOST_OP -- always
+   * find room.
+   */
+  if (flags & NVGPU_XF_EXECUTOR) {
+    bool took = false;
+
+    units = xf->indirect ? 1 : r->req->nents + r->resp->nents;
+    units = min_t(u32, units, xf->exec_budget);
+    /* The condition's last evaluation is the one that ended the wait, so
+     * `took` says whether units are held -- never on an error return. */
+    if (wait_event_killable(xf->exec_wq,
+                            (took = nvgpu_exec_take(xf, units)) ||
+                                READ_ONCE(xf->dead)))
+      return -EINTR;
+    if (!took)
+      return -ENODEV;
+    r->exec_units = units;
+  }
+
+  /*
+   * A full ring is a reason to wait, never to fail: requests that hold their
+   * slots for seconds are normal now. GFP_ATOMIC because the indirect table,
+   * if there is one, is allocated under the lock; if that allocation fails
+   * the ring falls back to direct slots, and max_sg keeps that possible.
+   */
+  for (;;) {
+    unsigned long gen;
+
+    spin_lock_irqsave(&xf->lock, irqf);
+    if (xf->dead) {
+      spin_unlock_irqrestore(&xf->lock, irqf);
+      ret = -ENODEV;
+      break;
+    }
+    *t0 = ktime_get_ns();
+    ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
+    if (!ret) {
+      kick = virtqueue_kick_prepare(dev->ctrl_vq);
+      spin_unlock_irqrestore(&xf->lock, irqf);
+      break;
+    }
+    gen = xf->space_gen;
+    spin_unlock_irqrestore(&xf->lock, irqf);
+
+    if (ret != -ENOSPC)
+      break;
+    if (wait_event_killable(xf->space_wq,
+                            READ_ONCE(xf->space_gen) != gen ||
+                                READ_ONCE(xf->dead))) {
+      ret = -EINTR;
+      break;
+    }
+  }
+  if (ret) {
+    nvgpu_exec_release(xf, units);
+    return ret;
+  }
+  if (kick)
+    virtqueue_notify(dev->ctrl_vq);
+  return 0;
+}
+
+/*
+ * An inline request's caller spins for its reply, up to rt_spin_us (and 1 ms
+ * at most), giving way when the scheduler wants the CPU. Replies are taken
+ * off the ring here while it spins, the interrupt off meanwhile
+ * (nvgpu_ctrl_poll_enter()).
+ */
+static void nvgpu_xfer_spin(struct nvgpu_device *dev, struct nvgpu_req *r) {
+  u32 spin_us = READ_ONCE(nvgpu_rt_spin_us);
+  u64 until;
+
+  if (!spin_us)
+    return;
+  until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
+  nvgpu_ctrl_poll_enter(dev);
+  while (!completion_done(&r->done) && !need_resched() &&
+         ktime_get_ns() < until) {
+    nvgpu_ctrl_poll(dev);
+    cpu_relax();
+  }
+  nvgpu_ctrl_poll_exit(dev);
+}
+
+/*
+ * Wait for the reply to `r` (request `id`, of type `msg_type`): 0 once it is
+ * answered, and `r` still the caller's. On a timeout or a fatal signal first,
+ * -ETIMEDOUT or -EINTR, and `r` is abandoned: the callback reaps and frees it
+ * when the device returns it.
+ */
+static int nvgpu_xfer_await(struct nvgpu_device *dev, struct nvgpu_req *r,
+                            u32 flags, u32 id, u32 msg_type) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  unsigned long irqf;
+  bool asleep;
+  long wret;
+
+  /* Already answered (usually, after a spin): no sleep to arrange. */
+  asleep = !completion_done(&r->done);
+  if (asleep)
+    nvgpu_ctrl_sleep_enter(dev);
+  wret = wait_for_completion_killable_timeout(
+      &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
+                                            : NVGPU_INLINE_TIMEOUT);
+  if (asleep)
+    nvgpu_ctrl_sleep_exit(dev);
+  if (wret > 0)
+    return 0;
+
+  spin_lock_irqsave(&xf->lock, irqf);
+  if (r->completed) {
+    spin_unlock_irqrestore(&xf->lock, irqf);
+    return 0;
+  }
+  /* Ours no longer: the callback reaps and frees it when it comes back. */
+  r->abandoned = true;
+  __module_get(THIS_MODULE);
+  spin_unlock_irqrestore(&xf->lock, irqf);
+  dev_warn_ratelimited(&dev->vdev->dev,
+                       "virtio-gpu-nv: request %u (msg_type %u) %s; its "
+                       "buffers stay with the transport until the device "
+                       "returns them\n",
+                       id, msg_type,
+                       wret ? "abandoned on a fatal signal" : "timed out");
+  return wret ? -EINTR : -ETIMEDOUT;
+}
+
+/*
  * The one path every request takes. See nvgpu_xfer() in nvgpu.h for the
  * contract; `sent` says whether the request reached the ring, which is what
  * the CLOSE helpers need to know to fall back to their async twins, and `tm`
@@ -691,14 +837,10 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                         struct nvgpu_tbuf *resp, u32 flags, u32 *used_len,
                         struct nvgpu_times *tm, bool *sent, u32 *req_id) {
   struct nvgpu_xfer *xf = dev->xfer;
-  struct scatterlist *sgs[2];
   struct nvgpu_msg_hdr hdr;
   struct nvgpu_req *r;
-  unsigned long irqf;
   u64 t0 = 0;
-  u32 units = 0, id;
-  long wret;
-  bool kick = false, asleep;
+  u32 id;
   int ret;
 
   if (sent)
@@ -752,122 +894,27 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
    * whatever the page held before. */
   nvgpu_tbuf_zero(resp, 0, resp->len);
 
-  sgs[0] = req->sg;
-  sgs[1] = resp->sg;
-
-  /*
-   * Executor-class requests can sit on the ring for seconds (a blocking
-   * commit, a modeset). Cap the slots they hold between them at half the ring
-   * less a margin, so inline requests -- RM calls, CLOSE, HOST_OP -- always
-   * find room.
-   */
-  if (flags & NVGPU_XF_EXECUTOR) {
-    bool took = false;
-
-    units = xf->indirect ? 1 : req->nents + resp->nents;
-    units = min_t(u32, units, xf->exec_budget);
-    /* The condition's last evaluation is the one that ended the wait, so
-     * `took` says whether units are held -- never on an error return. */
-    if (wait_event_killable(xf->exec_wq,
-                            (took = nvgpu_exec_take(xf, units)) ||
-                                READ_ONCE(xf->dead))) {
-      units = 0;
-      ret = -EINTR;
-      goto unsent;
+  ret = nvgpu_xfer_enqueue(dev, r, flags, &t0);
+  if (ret) {
+    kfree(r);
+    /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h.
+     * Unsent, the backend never saw the request, so what it would have
+     * consumed is released here, as the reaper does for a refused one. */
+    if (ret == -EINTR) {
+      nvgpu_release_consumed(dev, req);
+      nvgpu_tbuf_free(req);
+      nvgpu_tbuf_free(resp);
     }
-    if (!took) {
-      units = 0;
-      ret = -ENODEV;
-      goto unsent;
-    }
-    r->exec_units = units;
+    return ret;
   }
-
-  /*
-   * A full ring is a reason to wait, never to fail: requests that hold their
-   * slots for seconds are normal now. GFP_ATOMIC because the indirect table,
-   * if there is one, is allocated under the lock; if that allocation fails
-   * the ring falls back to direct slots, and max_sg keeps that possible.
-   */
-  for (;;) {
-    unsigned long gen;
-
-    spin_lock_irqsave(&xf->lock, irqf);
-    if (xf->dead) {
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      ret = -ENODEV;
-      goto unsent_units;
-    }
-    t0 = ktime_get_ns();
-    ret = virtqueue_add_sgs(dev->ctrl_vq, sgs, 1, 1, r, GFP_ATOMIC);
-    if (!ret) {
-      kick = virtqueue_kick_prepare(dev->ctrl_vq);
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      break;
-    }
-    gen = xf->space_gen;
-    spin_unlock_irqrestore(&xf->lock, irqf);
-
-    if (ret != -ENOSPC)
-      goto unsent_units;
-    if (wait_event_killable(xf->space_wq,
-                            READ_ONCE(xf->space_gen) != gen ||
-                                READ_ONCE(xf->dead))) {
-      ret = -EINTR;
-      goto unsent_units;
-    }
-  }
-
   if (sent)
     *sent = true;
-  if (kick)
-    virtqueue_notify(dev->ctrl_vq);
 
-  if (!(flags & NVGPU_XF_EXECUTOR)) {
-    u32 spin_us = READ_ONCE(nvgpu_rt_spin_us);
-
-    if (spin_us) {
-      u64 until = ktime_get_ns() + (u64)min(spin_us, 1000u) * NSEC_PER_USEC;
-
-      /* Replies are taken off the ring here while this caller spins, the
-       * interrupt off meanwhile (nvgpu_ctrl_poll_enter()). */
-      nvgpu_ctrl_poll_enter(dev);
-      while (!completion_done(&r->done) && !need_resched() &&
-             ktime_get_ns() < until) {
-        nvgpu_ctrl_poll(dev);
-        cpu_relax();
-      }
-      nvgpu_ctrl_poll_exit(dev);
-    }
-  }
-
-  /* Already answered (usually, after a spin): no sleep to arrange. */
-  asleep = !completion_done(&r->done);
-  if (asleep)
-    nvgpu_ctrl_sleep_enter(dev);
-  wret = wait_for_completion_killable_timeout(
-      &r->done, (flags & NVGPU_XF_EXECUTOR) ? NVGPU_EXECUTOR_TIMEOUT
-                                            : NVGPU_INLINE_TIMEOUT);
-  if (asleep)
-    nvgpu_ctrl_sleep_exit(dev);
-  if (wret <= 0) {
-    spin_lock_irqsave(&xf->lock, irqf);
-    if (!r->completed) {
-      /* Ours no longer: the callback reaps and frees it when it comes back. */
-      r->abandoned = true;
-      __module_get(THIS_MODULE);
-      spin_unlock_irqrestore(&xf->lock, irqf);
-      dev_warn_ratelimited(&dev->vdev->dev,
-                           "virtio-gpu-nv: request %u (msg_type %u) %s; its "
-                           "buffers stay with the transport until the device "
-                           "returns them\n",
-                           id, le32_to_cpu(hdr.msg_type),
-                           wret ? "abandoned on a fatal signal"
-                                : "timed out");
-      return wret ? -EINTR : -ETIMEDOUT;
-    }
-    spin_unlock_irqrestore(&xf->lock, irqf);
-  }
+  if (!(flags & NVGPU_XF_EXECUTOR))
+    nvgpu_xfer_spin(dev, r);
+  ret = nvgpu_xfer_await(dev, r, flags, id, le32_to_cpu(hdr.msg_type));
+  if (ret)
+    return ret; /* abandoned: `r` and the buffers are the transport's */
 
   ret = r->dead ? -ENODEV : 0;
   if (!ret)
@@ -900,20 +947,6 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
     tm->t1 = r->t1;
   }
   kfree(r);
-  return ret;
-
-unsent_units:
-  nvgpu_exec_release(xf, units);
-unsent:
-  kfree(r);
-  /* -EINTR hands the buffers to the transport, sent or not; see nvgpu.h.
-   * Unsent, the backend never saw the request, so what it would have
-   * consumed is released here, as the reaper does for a refused one. */
-  if (ret == -EINTR) {
-    nvgpu_release_consumed(dev, req);
-    nvgpu_tbuf_free(req);
-    nvgpu_tbuf_free(resp);
-  }
   return ret;
 }
 
