@@ -20,6 +20,7 @@ SD=$(dirname "$(readlink -f "$(type -P systemd-analyze)")")/..
 SYS_UNITS=$SD/lib/systemd/system:$SD/example/systemd/system
 for f in "$ROOT"/contrib/systemd/*@.service "$ROOT"/contrib/systemd/*@.socket; do
     sed -e "s|/usr/bin/vhost-user-nvgpu|$TRUE|g" -e "s|/usr/bin/crosvm|$TRUE|g" \
+        -e "s|/usr/libexec/virtio-nvgpu/nvgpu-pci-snapshot|$TRUE|g" \
         -e "s|/usr/bin/chrt|$CHRT|g" "$f" > "$W/$(basename "$f")"
 done
 units=()

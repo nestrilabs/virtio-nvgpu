@@ -1457,6 +1457,7 @@ impl InjectServer {
             shared: Arc::new(Shared {
                 registry,
                 uid,
+                vmm_uid: std::sync::atomic::AtomicU32::new(u32::MAX),
                 stop: AtomicBool::new(false),
                 peers: AtomicUsize::new(0),
                 next_peer: AtomicU64::new(1),
