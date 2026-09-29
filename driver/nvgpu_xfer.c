@@ -834,10 +834,8 @@ static int __nvgpu_gem_close(struct nvgpu_device *dev, u32 file, u32 gem,
       release(arg);
     return 0;
   }
-  req.io.hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req.io.hdr.handle = cpu_to_le32(file);
-  req.io.cmd = cpu_to_le32(DRM_IOCTL_GEM_CLOSE);
-  req.io.data_len = cpu_to_le32(sizeof(req.arg));
+  nvgpu_ioctl_req_init(&req.io, file, DRM_IOCTL_GEM_CLOSE, sizeof(req.arg), 0,
+                       0, 0, 0);
   req.arg.handle = gem;
   ret = nvgpu_call_holding(dev, &req, sizeof(req), &resp, sizeof(resp), 0,
                            &used, NULL, &sent, NULL, release, arg);
