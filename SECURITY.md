@@ -2667,7 +2667,7 @@ arms nothing, or arms wrongly, gets fewer reports on its own files; it
 reaches nobody else's, and the host descriptors are polled as before. A
 guest that does not negotiate it keeps a report per event.
 
-**`--queue-poll-us`** (off by default). The queue thread keeps looking at
+**`--queue-poll-us`** (default 50 µs; 0 turns it off). The queue thread keeps looking at
 the control ring for up to that long (capped at 1 ms) after draining it.
 It is CPU the backend spends for the guest, as the drain itself is: a guest
 that keeps sending keeps the thread busy either way, and the poll adds at
