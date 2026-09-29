@@ -28,23 +28,28 @@ let
       usePersistenced = false;
     }).override
       {
-        # The 64-bit libraries only; the guest runs no 32-bit clients.
-        disable32Bit = true;
+        # The 32-bit libraries too (the `lib32` output), for the guest's
+        # 32-bit clients -- Steam's, a 32-bit game's GL and Vulkan -- as
+        # NixOS's hardware.graphics.enable32Bit gives them.
+        disable32Bit = false;
       };
 
   # The EGL external platforms NVIDIA's libEGL loads for Wayland and GBM
   # surfaces (and X11, which nothing here uses but costs little). The same set,
   # and the same way of joining them, as nixos/modules/hardware/video/nvidia.nix
-  # for a >= 595 driver (no priority remediation).
-  eglPlatforms = pkgs.symlinkJoin {
-    name = "nvidia-egl-external-platforms";
-    paths = with pkgs; [
-      egl-wayland
-      egl-gbm
-      egl-wayland2
-      egl-x11
-    ];
-  };
+  # for a >= 595 driver (no priority remediation) -- for each width.
+  eglPlatformsFor =
+    p:
+    p.symlinkJoin {
+      name = "nvidia-egl-external-platforms${lib.optionalString p.stdenv.hostPlatform.is32bit "-x32"}";
+      paths = with p; [
+        egl-wayland
+        egl-gbm
+        egl-wayland2
+        egl-x11
+      ];
+    };
+  eglPlatforms = eglPlatformsFor pkgs;
 
   # What /run/opengl-driver points at. NixOS merges mesa in here too; the
   # guest must use the proprietary userspace only (no NVK, no llvmpipe
@@ -65,8 +70,26 @@ let
     ];
     ignoreCollisions = false;
   };
+  # What /run/opengl-driver-32 points at: NixOS's driversEnv32 for
+  # hardware.graphics.enable32Bit with the NVIDIA module (extraPackages32:
+  # nvidia_x11.lib32 and the i686 EGL platforms), again without mesa. The
+  # i686 loaders nixpkgs builds look there (addDriverRunpath's driverLink is
+  # /run/opengl-driver-32 on i686).
+  driversEnv32 = pkgs.buildEnv {
+    name = "nvgpu-opengl-driver-32-${version}";
+    paths = [
+      driver.lib32
+      (eglPlatformsFor pkgs.pkgsi686Linux)
+    ];
+    pathsToLink = [
+      "/lib"
+      "/share"
+      "/etc"
+    ];
+    ignoreCollisions = false;
+  };
 in
 {
-  inherit driver driversEnv eglPlatforms;
+  inherit driver driversEnv driversEnv32 eglPlatforms;
   bin = driver.bin;
 }

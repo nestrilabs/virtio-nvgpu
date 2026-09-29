@@ -112,6 +112,9 @@ setup_fs() {
 
     # /run is a fresh tmpfs: the names the loaders and PATH use live there.
     ln -sfn "$(readlink /etc/nvgpu/opengl-driver)" /run/opengl-driver
+    # The 32-bit userspace, for i686 loaders (an image from before it has none).
+    [ -L /etc/nvgpu/opengl-driver-32 ] &&
+        ln -sfn "$(readlink /etc/nvgpu/opengl-driver-32)" /run/opengl-driver-32
     mkdir -p /run/current-system
     ln -sfn "$(readlink /etc/nvgpu/sw)" /run/current-system/sw
     mkdir -p "$(dirname "$XDG_RUNTIME_DIR")"

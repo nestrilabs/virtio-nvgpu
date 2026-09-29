@@ -13,7 +13,7 @@
   # of this directory (under .rig/guest/flake) and builds that. Without
   # ./nvgpu-src the image is built without nvgpu-wl-guest and the verify
   # helpers, and says so in /etc/nvgpu/manifest.
-  description = "virtio-nvgpu guest root filesystem (NVIDIA 595.99.02 userspace + display test tools)";
+  description = "virtio-nvgpu guest root filesystem (NVIDIA 595.99.02 userspace, 64- and 32-bit, + display test tools)";
 
   # Pinned to the nixpkgs the rest of the rig was built with, so what comes
   # from the binary cache is what was checked.
@@ -72,6 +72,12 @@
 
       tools = import ./nix/tools.nix {
         inherit pkgs nvgpuSrc;
+        toolsSrc = ./tools;
+      };
+
+      # 32-bit clients and their userspace (probes/compat.sh).
+      tools32 = import ./nix/tools32.nix {
+        inherit pkgs;
         toolsSrc = ./tools;
       };
 
@@ -174,6 +180,7 @@
             weston-clients
             nvidia.bin # nvidia-smi
             tools
+            tools32 # nvgpu-drm-compat-32, nvgpu-rm-smoke-32, vulkaninfo-32, eglinfo-32
             qmlRunner
             blenderCuda # the GL/Vulkan UI, and Cycles on CUDA and OptiX
             cudaApps # nvgpu-nbody
@@ -190,10 +197,13 @@
       # nixpkgs' vulkan-loader, libglvnd and libgbm look for drivers under
       # /run/opengl-driver; our init scripts point that at this.
       openglDriver = nvidia.driversEnv;
+      # And /run/opengl-driver-32, for the i686 loaders (32-bit clients).
+      openglDriver32 = nvidia.driversEnv32;
 
       manifest = pkgs.writeText "nvgpu-manifest" ''
         nvidia-userspace ${nvidia.driver.version} ${nvidia.driver.out}
         opengl-driver ${openglDriver}
+        opengl-driver-32 ${openglDriver32}
         sw ${sw}
         nvgpu-wl-guest ${if nvgpu-wl-guest == null then "ABSENT (no ./nvgpu-src)" else "${nvgpu-wl-guest}"}
         verify-helpers ${if nvgpuSrc == null then "ABSENT (no ./nvgpu-src)" else "${tools}/libexec/nvgpu/verify"}
@@ -202,7 +212,7 @@
 
       guestRoot = pkgs.runCommand "nvgpu-guest-root"
         {
-          inherit sw openglDriver fontsConf manifest;
+          inherit sw openglDriver openglDriver32 fontsConf manifest;
           nvidiaBin = nvidia.bin;
           nvidiaOut = nvidia.driver.out;
           probes = ./probes;
@@ -224,6 +234,8 @@
           ln -s $sw           etc/nvgpu/sw
           ln -s $openglDriver etc/nvgpu/opengl-driver
           ln -s $openglDriver run/opengl-driver
+          ln -s $openglDriver32 etc/nvgpu/opengl-driver-32
+          ln -s $openglDriver32 run/opengl-driver-32
           cp $manifest etc/nvgpu/manifest
 
           ln -s $bash/bin/bash      bin/sh
@@ -308,7 +320,9 @@
           guestRoot
           sw
           openglDriver
+          openglDriver32
           tools
+          tools32
           weston-clients
           appsData
           blenderCuda
