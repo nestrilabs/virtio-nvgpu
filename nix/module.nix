@@ -60,6 +60,33 @@ let
           without `--diagnostic`; do not ship a configuration that needs it.
         '';
       };
+      windowMiB = mkOption {
+        type = types.nullOr (types.ints.between 256 65536);
+        default = null;
+        example = 16384;
+        description = ''
+          The VM's shared window in MiB (`--window-size`; null is the
+          backend's 1024): how much GPU memory the VM's processes can have
+          CPU-mapped at once. A multiple of 64; with `--allow-compute` at
+          most 64512 (window and UVM aperture share crosvm's 64 GiB region
+          cap), under nesbox at most 32768. The VMM takes the size from the
+          backend. Under crosvm, pages of the window the guest touches with
+          nothing placed there are the VMM's shared memory: size the VMM's
+          MemoryMax as guest RAM plus this (DEPLOY.md, "Sizing the window").
+        '';
+      };
+      windowOwnerShare = mkOption {
+        type = types.nullOr (types.ints.between 1 95);
+        default = null;
+        example = 90;
+        description = ''
+          The percent of each window zone one guest process may hold
+          (`--window-owner-share`; null is the backend's 50). From 88 one
+          process can take a zone down to its reserve, leaving the VM's
+          other processes the reserve alone: availability within this VM
+          only (SECURITY.md, "The window's size and share").
+        '';
+      };
       inject = {
         enable = mkEnableOption ''
           capture injection for this VM (SECURITY.md §18): the backend listens
@@ -182,6 +209,14 @@ in
         message = "services.virtio-nvgpu.vms.<n>.inject.helperUid: the capture helper must not be the VM's backend or VMM user";
       }
       {
+        # The backend refuses any other size at start; say it here, where
+        # the option was set.
+        assertion = lib.all (vm: vm.windowMiB == null || lib.mod vm.windowMiB 64 == 0) (
+          lib.attrValues cfg.vms
+        );
+        message = "services.virtio-nvgpu.vms.<n>.windowMiB: a multiple of 64 MiB";
+      }
+      {
         # The display paths and the semaphore-surface fences need NVKMS.
         assertion =
           !(lib.elem "nvidia" config.services.xserver.videoDrivers)
@@ -277,6 +312,14 @@ in
         environment = {
           NVGPU_BACKEND_ARGS = concatStringsSep " " (
             vm.extraArgs
+            ++ lib.optionals (vm.windowMiB != null) [
+              "--window-size"
+              (toString vm.windowMiB)
+            ]
+            ++ lib.optionals (vm.windowOwnerShare != null) [
+              "--window-owner-share"
+              (toString vm.windowOwnerShare)
+            ]
             ++ lib.optionals vm.inject.enable [
               "--inject-socket"
               "/run/nvgpu/vm${n}/inject.sock"

@@ -180,8 +180,9 @@ struct Args {
     /// takes at most 32 GiB.
     ///
     /// Growth goes mostly to the write-combining zone, where video memory
-    /// is mapped: the uncached zone stays at 32 MiB, the write-back zone
-    /// grows by an eighth (DEPLOY.md, "Sizing the window"). The VMM sizes
+    /// is mapped: the uncached zone stays at 32 MiB, and write-combining
+    /// and write-back split the rest 24:7 as in the default (16384: UC 32,
+    /// WC 12660, WB 3692; DEPLOY.md, "Sizing the window"). The VMM sizes
     /// its region from the backend (GET_SHMEM_CONFIG). What is CPU-mapped
     /// also takes BAR1, which the host's desktop and other VMs share.
     #[arg(long, value_name = "MIB", default_value_t = ZoneConfig::DEFAULT_MIB)]
@@ -887,6 +888,29 @@ impl NvGpuBackend {
         );
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
         release_gate(&version, allow_unmeasured)?;
+        // What the window lets this VM keep CPU-mapped of video memory goes
+        // through BAR1, which the desktop and every other VM share: said at
+        // start when one VM could take more than half of it (DEPLOY.md,
+        // "Sizing the window").
+        for g in &gpus {
+            let end = g
+                .pci_addr
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(g.pci_addr.len());
+            let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+            if let Some(bar1) = host::bar1_len(Path::new("/sys"), &addr)
+                && window.wc_size > bar1 / 2
+            {
+                log::warn!(
+                    "window: its write-combining zone ({} MiB) is more than half of GPU {addr}'s \
+                     BAR1 ({} MiB), which the host's desktop and every other VM on it map video \
+                     memory through too; one guest could leave them little",
+                    window.wc_size >> 20,
+                    bar1 >> 20
+                );
+            }
+        }
 
         let allow_compute = config.allow_compute;
         let mut nvidia = NvidiaBackend::with_zone_config(window);

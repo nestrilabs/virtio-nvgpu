@@ -211,14 +211,19 @@ impl ZoneConfig {
     /// bytes (0 without compute).
     ///
     /// How the zones grow past the default's 1 GiB (UC 32, WC 768, WB 224
-    /// MiB): the uncached zone stays at 32 MiB -- it holds registers (a
-    /// 64 KiB doorbell per channel user), whose number follows processes,
-    /// not how much memory they map -- and the write-back zone grows by an
-    /// eighth of what is added, the write-combining zone by the rest. A
-    /// write-back mapping that does not fit falls back to write-combining
-    /// (`NvidiaBackend::alloc_zone`), and never the other way. Below 1 GiB
-    /// all three shrink in proportion. At 1 GiB this is `default_1gib`
-    /// exactly. The numbers behind it are in DEPLOY.md, "Sizing the window".
+    /// MiB): the uncached zone stays at 32 MiB -- it holds registers, a
+    /// 64 KiB doorbell per channel user, whose number follows processes and
+    /// not how much memory they map (no workload measured has used half a
+    /// MiB of it) -- and the rest is split between write-combining and
+    /// write-back 24:7, as in the default, so WC takes 77 % of the growth.
+    /// WB keeps its proportion because the rig's heaviest applications use
+    /// it most (Blender held 86 MiB of WB to 35 MiB of WC), and a write-back
+    /// mapping that does not fit is placed write-combining
+    /// (`NvidiaBackend::alloc_zone`) -- correct, but slow to read -- and
+    /// never the other way: WC has to hold its own and WB's overflow. Below
+    /// 1 GiB all three shrink in proportion. At 1 GiB this is
+    /// `default_1gib` exactly. The measurements are in DEPLOY.md, "Sizing
+    /// the window".
     pub fn for_window(
         mib: u64,
         owner_percent: u8,
@@ -253,15 +258,13 @@ impl ZoneConfig {
                 Self::MAX_REGION_MIB
             ));
         }
+        // In MiB: UC a thirty-second up to its 32 MiB, and the rest split
+        // 24:7 between WC and WB as in the default, WB rounded down to 2 MiB.
         let d = Self::default_1gib();
-        let (uc, wb) = if mib >= Self::DEFAULT_MIB {
-            (d.uc_size, d.wb_size + (mib - Self::DEFAULT_MIB) * MIB / 8)
-        } else {
-            (
-                d.uc_size / Self::DEFAULT_MIB * mib,
-                d.wb_size / Self::DEFAULT_MIB * mib,
-            )
-        };
+        let (d_uc, d_wc, d_wb) = (d.uc_size / MIB, d.wc_size / MIB, d.wb_size / MIB);
+        let uc = (mib / 32).min(d_uc);
+        let wb = (mib - uc) * d_wb / (d_wc + d_wb) & !1;
+        let (uc, wb) = (uc * MIB, wb * MIB);
         let cfg = Self {
             uc_size: uc,
             wc_size: mib * MIB - uc - wb,
@@ -908,17 +911,18 @@ mod window_tests {
         );
     }
 
-    /// UC stays, WB takes an eighth of the growth, WC the rest; below the
-    /// default all three shrink in proportion. Every size allowed gives
-    /// whole 2 MiB zones that add up to it.
+    /// UC stays at 32 MiB, WC and WB split the rest 24:7 as in the default;
+    /// below the default all three shrink in proportion. Every size allowed
+    /// gives whole 2 MiB zones that add up to it.
     #[test]
     fn the_zones_grow_mostly_write_combining() {
         let at = |mib| zones(&ZoneConfig::for_window(mib, 50, 0).unwrap());
         assert_eq!(at(256), (8, 192, 56));
         assert_eq!(at(512), (16, 384, 112));
-        assert_eq!(at(4096), (32, 3456, 608));
-        assert_eq!(at(16384), (32, 14208, 2144));
-        assert_eq!(at(65536), (32, 57216, 8288));
+        assert_eq!(at(1024), (32, 768, 224));
+        assert_eq!(at(4096), (32, 3148, 916));
+        assert_eq!(at(16384), (32, 12660, 3692));
+        assert_eq!(at(65536), (32, 50714, 14790));
         for mib in (ZoneConfig::MIN_MIB..=65536).step_by(ZoneConfig::ALIGN_MIB as usize) {
             let c = ZoneConfig::for_window(mib, 50, 0).unwrap();
             assert!(c.zones_aligned(), "{mib}: {c:?}");

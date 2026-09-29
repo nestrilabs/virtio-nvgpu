@@ -38,6 +38,25 @@ pub fn driver_version(root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The length of BAR1 of the GPU at `pci_addr` (`0000:01:00.0`), from
+/// `<sysfs>/bus/pci/devices/<addr>/resource`: the aperture every CPU
+/// mapping of its video memory goes through, host-wide -- the desktop's,
+/// every VM's. `None` where sysfs does not say.
+pub fn bar1_len(sysfs: &Path, pci_addr: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(
+        sysfs
+            .join("bus/pci/devices")
+            .join(pci_addr)
+            .join("resource"),
+    )
+    .ok()?;
+    // One line per resource, "start end flags" in hex; BAR1 is the second.
+    let mut f = text.lines().nth(1)?.split_whitespace();
+    let hex = |s: Option<&str>| u64::from_str_radix(s?.trim_start_matches("0x"), 16).ok();
+    let (start, end) = (hex(f.next())?, hex(f.next())?);
+    (end > start).then(|| end - start + 1)
+}
+
 /// Every GPU the host driver owns, in PCI address order.
 ///
 /// The directory name under `gpus/` is the PCI address, and the minor number
@@ -122,6 +141,25 @@ mod tests {
             "NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.178.04  Tue Jul  7 12:18:12 UTC 2026\n",
         )]);
         assert_eq!(driver_version(f.path()).as_deref(), Some("580.178.04"));
+    }
+
+    /// An RTX 5090's resource file, BAR1 resized to 32 GiB; and what is
+    /// not there, or not a BAR, is nothing.
+    #[test]
+    fn bar1_is_the_second_resource() {
+        let f = Fixture::new(&[(
+            "bus/pci/devices/0000:01:00.0/resource",
+            "0x00000000d8000000 0x00000000dbffffff 0x0000000000040200\n\
+             0x000000f000000000 0x000000f7ffffffff 0x000000000014220c\n\
+             0x0000000000000000 0x0000000000000000 0x0000000000000000\n",
+        )]);
+        assert_eq!(bar1_len(f.path(), "0000:01:00.0"), Some(32 << 30));
+        assert_eq!(bar1_len(f.path(), "0000:02:00.0"), None);
+        let g = Fixture::new(&[(
+            "bus/pci/devices/0000:01:00.0/resource",
+            "0x1 0x2 0x0\n0x0 0x0 0x0\n",
+        )]);
+        assert_eq!(bar1_len(g.path(), "0000:01:00.0"), None);
     }
 
     #[test]
