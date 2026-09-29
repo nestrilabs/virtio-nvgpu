@@ -305,6 +305,120 @@ reserve).
   64 GiB MMIO window and refuses a window past 32 GiB. Both refuse at start,
   with the size named.
 
+## Frame pacing
+
+Measured on the rig (RTX 5090, 595.99.02, Ryzen 9 9950X, Hyprland 0.56.2,
+`render:direct_scanout` 0 unless said), 2026-09-29, with
+`rig/rig-framepace.sh` (rig/TESTING-RIG.md, "Frame pacing"): the same
+workload natively and in a nesbox guest (4 vCPUs, 4 GiB), fullscreen on a
+240 Hz monitor, MangoHud logging every frame's present interval, 20 s after
+a 6 s warm-up, three runs each, interleaved. "Stutter" is frames longer than
+1.5x the refresh period (6.25 ms), each a missed vblank; frames counted
+over all three runs. The loaded rows run a stress-ng host load through each
+run (32 workers at 60 %: every CPU busy, as on a desktop compiling or
+encoding). "Before" is `b693254`; "after" is this branch with its defaults.
+
+Frame times in ms (every FIFO run's mean is 4.166, its p50 4.16-4.17);
+stutter out of about 14,400 frames. Native was measured in each session,
+before / after:
+
+| workload | native p99 / p99.9 / stutter | VM before | VM after |
+|---|---|---|---|
+| vkcube, FIFO | 4.63 / 8.49 / 53; 4.52 / 8.32 / 23 | 4.83 / 8.43 / 30 | 4.64 / 8.40 / 34 |
+| vkcube, mailbox: mean (fps), p99, p99.9 | 0.096 (10,452), 0.281, 1.82; 0.094 (10,628), 0.261, 1.79 | 0.468 (2,138), 0.833, 1.31 | 0.267 (3,743), 0.432, 0.62 |
+| SuperTuxKart (GL), FIFO | 4.48 / 5.62 / 1; 4.46 / 5.22 / 0 | 4.50 / 5.19 / 0 | 4.44 / 4.90 / 0 |
+| vkcube in gamescope (guest only) | -- | 4.54 / 5.26 / 0 | 4.37 / 4.43 / 0 |
+| vkcube, FIFO, host loaded | 4.87 / 8.47 / 96; 5.73 / 8.54 / 121 | 5.68 / 8.44 / 88 | 5.11 / 8.46 / 72 |
+| SuperTuxKart, host loaded | 4.86 / 6.03 / 7; 4.90 / 6.03 / 8 | 5.20 / 6.60 / 38 | 4.72 / 5.88 / 5 |
+
+On an idle host the guest already paced as natively before this work; what
+it paid was per-frame cost, which a mailbox (uncapped) vkcube shows: 0.37 ms
+a frame more than natively, now 0.17 ms (the guest's three runs averaged
+0.22 to 0.30 ms a frame). With the host loaded, the guest missed five times as many vblanks
+as native SuperTuxKart; now fewer. The "before" loaded rows ran the same
+code as `b693254` with the counters added.
+
+**Where the time went.** A presented frame took 17 round trips to the
+backend (11 IOCTL2 -- the syncobj and semaphore-surface calls of explicit
+sync -- two fence WATCHes, two CLOSEs, two Wayland messages), each about
+15 µs from the guest's side, and RM posted 55-85 events a frame on the
+guest's device files, each forwarded as a record and most as a guest
+interrupt (18,000 a second under a mailbox vkcube), for descriptors no guest
+thread ever polled. The guest also kicked the event queue for every batch it
+handed back, and the queue thread slept between the requests of one
+present. Syncobj waits were not it: they were ready at the first poll or
+woken by their registration; none reached the registration caps
+(SECURITY.md §17) or fell back to the polling backoff, and the pump's 1 ms
+sweep found almost nothing. Nor was the present path: FIFO pacing on an idle
+host matched native, and so did gamescope's.
+
+**Under a host load**, the difference is scheduling: a vCPU, the queue thread
+or the event pump that wakes waits behind the host's ~3 ms EEVDF slice,
+and a frame's dozen of such wakeups make a missed vblank likely where the
+native game's one thread rarely misses. With the load confined to the other
+CCD the guest paced as natively (SuperTuxKart: no missed vblank in 14,400
+frames in the guest, one natively); with it everywhere, it missed 38 against native's 7.
+
+**What changed** (each measured separately, rig/TESTING-RIG.md):
+
+| change | where | effect |
+|---|---|---|
+| armed RM readiness | protocol (`GCAP_ARMS_READY`), backend pump, guest poll | the per-event records go (86,000 a second under a mailbox vkcube, not sent); throughput about the same |
+| `--queue-poll-us 50` (default) | backend | the ring is found busy for 78 % of requests: mailbox vkcube 2,300 -> 3,000 fps |
+| reply spin, 20 µs (`rt_spin_us`) | guest | with the poll, 3,000 -> 4,400 fps; with arming and the poll, a FIFO vkcube's VM threads took 64 % of a core instead of 89 % (the vCPUs no longer halt-poll between replies) |
+| fence WATCH from a work item (`async_fence_watch`) | guest | two round trips a frame off the presenting thread (4,400 -> about 4,500 fps, two runs) |
+| no event-queue kicks while it holds buffers | backend | 7,000 guest exits a second fewer under a mailbox vkcube |
+| 100 µs EEVDF slice (`NVGPU_SLICE_US`) | launcher | under load, SuperTuxKart's missed vblanks 22 -> 2 in 14,400 (native 7), p99 5.08 -> 4.77 ms |
+
+**Recommended configuration for a VM that runs games:**
+
+- The defaults of this branch: a 100 µs EEVDF slice for the VMM's and the
+  backend's threads (the backend sets its own, `--sched-slice-us 100`; the
+  rig launcher runs both under `chrt --other --sched-runtime 100000 0`,
+  `NVGPU_SLICE_US`; a VMM unit should put the same `chrt` in front of its
+  `ExecStart`), the backend's `--queue-poll-us 50`, and the guest module's
+  defaults (`rt_spin_us=20`, `arm_ready=1`, `async_fence_watch=1`).
+- **Do not pin or confine the vCPUs on a host whose other work can land on
+  the same CPUs.** Under the load above, `NVGPU_CPU_AFFINITY=8-15` (one CCD)
+  missed 166 vblanks where the free placement missed 28, and one pinned CPU
+  per vCPU (`NVGPU_VCPU_PINS`) missed 1,053 with p99 9 ms: a pinned vCPU
+  cannot escape a busy CPU. Pin only CPUs set aside for the guest -- an
+  isolated cpuset partition (root; nesbox's `vcpu_cgroup_fd`,
+  `io_cgroup_fd`), then `vcpu_pins` and `dedicated` -- which the confined-load
+  runs stand in for: there the guest paced as natively.
+- **Guest RAM on huge pages is already the case under nesbox**: it prefaults
+  guest RAM and collapses it into THP (`ShmemPmdMapped` covered all 4 GiB in
+  every run). `NVGPU_PREFAULT=0` brought 10 ms first-touch stalls back.
+  crosvm's `--hugepages` (`NVGPU_HUGEPAGES=transparent`) made no measurable
+  difference.
+- **crosvm**: its default per-vCPU core scheduling cost the most of any
+  setting tried -- under the load, SuperTuxKart missed 178 vblanks against
+  5 with `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`), and on an
+  idle host its mailbox p99 was 1.4 ms against 0.44. It is a side-channel
+  mitigation between the guest and host tasks on SMT siblings
+  (SECURITY.md §20): turn it off only on a single-tenant desktop. Even so
+  crosvm ran a mailbox vkcube at about 3,300 fps to nesbox's 4,500.
+- **vCPUs**: 2, 4 and 8 paced the same for these workloads; give a game what
+  it uses in parallel, no more.
+- **Direct scanout** (Hyprland `render:direct_scanout = 1`) scanned the
+  fullscreen guest window out directly in every run and removed the FIFO
+  vkcube's remaining missed vblanks (33 -> 0 in 9,600 frames; native 10 -> 4).
+- Fullscreen, and FIFO or mailbox as the game prefers: both pace as natively
+  now on an idle host; mailbox's cost per frame is what the table's
+  mailbox row shows.
+
+**What remains.** A frame still makes about 17 round trips, two of them now
+off the presenting thread (the explicit-sync plumbing is the application's
+own ioctls, each one the host's to run), and a mailbox vkcube's frame costs
+about 0.17 ms more than natively. Under a
+host load the guest now paces better than a native game that keeps the
+default slice (give the native game the same slice and the comparison
+would even out); isolation, not placement, is what removes the rest. The
+fence signal-to-queue latency the backend reports includes nvidia-drm's own
+timer-driven semaphore-surface signalling, the same natively. Not measured:
+vkmark, native gamescope (it cannot start inside the Claude sandbox), a
+120 or 165 Hz monitor, and games heavier than SuperTuxKart.
+
 ## Capture injection
 
 A guest application's screen share, zero-copy (ARCHITECTURE.md §17,
@@ -428,6 +542,9 @@ shows the diagnostic ones too.
 | `--wayland-max-conns N` | 64 | Wayland channels per VM |
 | `--wayland-shm-budget MIB` | 1024 | wl_shm buffer memory per VM |
 | `--wayland-queue-budget MIB` | 256 | unread compositor output per VM |
+| `--queue-poll-us US` | 50 | how long the queue thread keeps looking at the control ring after draining it (0 to 1000): requests that arrive meanwhile cost the guest no kick ("Frame pacing") |
+| `--sched-slice-us US` | 100 | every backend thread's EEVDF slice, set at start (100-100000; 0 keeps the host's ~3 ms): how soon the queue thread and the pump run again after waking on a busy host ("Frame pacing") |
+| `--pacing-stats SECS` | none | log the frame-pacing counters every SECS while the guest is busy (also `NVGPU_PACING_STATS`); they are logged once at teardown regardless |
 | `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection") |
 | `--inject-uid UID` | none | the only uid `--inject-socket` serves: the VM's capture helper |
 | `--rm-allowlist enforce` | `enforce` | the RM allowlist; `log` is diagnostic |

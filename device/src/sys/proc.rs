@@ -77,6 +77,49 @@ pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     cvt(unsafe { libc::kill(pid, sig) }).map(|_| ())
 }
 
+/// Give the calling thread SCHED_OTHER with an EEVDF slice of `slice_ns`
+/// (`sched_setattr(2)`'s `sched_runtime` for a fair policy, Linux 6.12 on;
+/// 100 µs to 100 ms, no privilege needed), at its current nice. Threads it
+/// makes afterwards inherit it. Its CPU share is unchanged: the slice only
+/// says how soon it runs again once it wakes and how long it may run then.
+pub fn set_sched_slice(slice_ns: u64) -> io::Result<()> {
+    // struct sched_attr, include/uapi/linux/sched/types.h (SCHED_ATTR_SIZE_VER0).
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        policy: u32,
+        flags: u64,
+        nice: i32,
+        priority: u32,
+        runtime: u64,
+        deadline: u64,
+        period: u64,
+    }
+    // SAFETY: no arguments; cannot fail.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let attr = SchedAttr {
+        size: size_of::<SchedAttr>() as u32,
+        policy: libc::SCHED_OTHER as u32,
+        flags: 0,
+        nice,
+        priority: 0,
+        runtime: slice_ns,
+        deadline: 0,
+        period: 0,
+    };
+    // SAFETY: the kernel reads `attr.size` bytes of `attr`, which is that
+    // large and lives across the call; pid 0 is the calling thread.
+    cvt_l(unsafe {
+        libc::syscall(
+            libc::SYS_sched_setattr,
+            0,
+            &attr as *const SchedAttr,
+            0u32,
+        )
+    })
+    .map(|_| ())
+}
+
 /// `umask(mode)`: the previous mask.
 pub fn umask(mode: u32) -> u32 {
     // SAFETY: integer argument; cannot fail.
@@ -537,5 +580,32 @@ pub mod testing {
         let _e = crate::sys::fd::eventfd(libc::EFD_CLOEXEC).map_err(|_| 5)?;
         let _ep = crate::sys::fd::epoll_create().map_err(|_| 5)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sched_tests {
+    /// The slice takes, on a thread of its own (the test harness's threads
+    /// keep theirs), where the kernel has custom slices; the thread's own
+    /// `/proc` entry says so.
+    #[test]
+    fn a_thread_takes_the_slice_it_asks_for() {
+        std::thread::spawn(|| match super::set_sched_slice(250_000) {
+            Ok(()) => {
+                let s = std::fs::read_to_string("/proc/thread-self/sched").unwrap_or_default();
+                let slice = s
+                    .lines()
+                    .find(|l| l.starts_with("se.slice"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().to_string());
+                if let Some(v) = slice {
+                    assert_eq!(v, "250000");
+                }
+            }
+            // A kernel before 6.12 takes no runtime for a fair policy.
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EINVAL)),
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -217,6 +217,16 @@ struct Args {
     #[arg(long, value_name = "US", default_value_t = 50)]
     queue_poll_us: u64,
 
+    /// The EEVDF slice of every backend thread, in microseconds (100 to
+    /// 100000; 0 keeps the host's default, about 3 ms). A shorter slice
+    /// gets the queue thread and the event pump back onto a busy CPU sooner
+    /// after they wake, at the same share of the CPU: on a loaded host it
+    /// is what keeps a guest's frames on their vblanks (DEPLOY.md, "Frame
+    /// pacing"). Set at start, before any thread exists, so all inherit it;
+    /// needs no privilege, and a kernel before 6.12 keeps its default.
+    #[arg(long, value_name = "US", default_value_t = 100)]
+    sched_slice_us: u64,
+
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
     ///
@@ -1545,6 +1555,15 @@ fn main() -> anyhow::Result<()> {
         window.wb_size >> 20,
         window.owner_percent
     );
+
+    // Before any thread exists, so that every one inherits it.
+    if args.sched_slice_us != 0 {
+        let us = args.sched_slice_us.clamp(100, 100_000);
+        match device::sys::proc::set_sched_slice(us * 1000) {
+            Ok(()) => log::info!("--sched-slice-us {us}: every backend thread's EEVDF slice"),
+            Err(e) => log::warn!("--sched-slice-us {us}: {e}; the host's default slice stays"),
+        }
+    }
 
     // Before any thread exists: capabilities are per thread
     // (device::posture, S-5).
