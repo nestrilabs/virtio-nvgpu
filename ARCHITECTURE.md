@@ -448,6 +448,20 @@ Protocol v2 carries more on the same wake — a fence's status, a flip event —
 and turns every wait a guest could otherwise ask a host thread to sit in into
 a poll, with the sleeping done in the guest (§10, §12).
 
+The opposite mistake is as easy to make. RM posts an event on a device file
+for every notifier a channel raises, dozens a frame in a render loop, and
+forwarding each one cost a record and, most of the time, a guest interrupt —
+18,000 a second under a mailbox vkcube — for descriptors no guest thread was
+polling. So a guest that says it can (`GCAP_ARMS_READY`) *arms* an RM
+device's readiness: its `poll` asks for the next report (`W_ARM`, sent from a
+work item) when it finds nothing pending or takes a report, and the backend
+sends one report per arm — at once for an event that came while unarmed,
+which it remembers, since polling RM's file takes the event's flag with it.
+The modeset device, whose readiness is NVKMS's event queue, and the Wayland
+channels keep a report per event. [`DEPLOY.md`](DEPLOY.md), "Frame
+pacing", has what this and the transport changes measured, and how to place
+a VM that runs games.
+
 ---
 
 ## 8. Versioning against a moving ABI
