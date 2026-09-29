@@ -68,7 +68,8 @@ struct RsI2Args {
     xflags: u32,
     compat: u8,
     kernel: u8,
-    reserved: u16,
+    karg: u8,
+    reserved: u8,
 }
 
 /// `struct nvgpu_rs_deep_ptr`.
@@ -598,6 +599,10 @@ pub unsafe extern "C" fn nvgpu_ioctl_modeset(nfd: *mut c_void, cmd: c_uint, uarg
 #[repr(C)]
 pub struct KStore {
     kernel: bool,
+    /// Buffer 0, the argument, is kernel memory: the DRM node's entry
+    /// copied it in (`nvgpu_i2_call.karg`); what it points at is the
+    /// caller's.
+    karg: bool,
     /// What `nvgpu_i2_hold()` was given (`struct nvgpu_rs_held *`), until it
     /// goes with the request.
     held: *mut c_void,
@@ -607,6 +612,11 @@ pub struct KStore {
 impl KStore {
     fn slot(&self, i: usize) -> Option<(*mut u8, usize)> {
         self.bufs.get(i).copied().filter(|(p, _)| !p.is_null())
+    }
+
+    /// Whether buffer `i`'s address is a kernel one (the C's `kb->kern`).
+    fn kern(&self, i: usize) -> bool {
+        self.kernel || (self.karg && i == 0)
     }
 }
 
@@ -626,7 +636,7 @@ impl Store for KStore {
     }
 
     fn fetch(&mut self, i: usize, uptr: u64) -> Result<(), Errno> {
-        let kernel = self.kernel;
+        let kernel = self.kern(i);
         copy_from(kernel, self.buf_mut(i), uptr)
     }
 
@@ -650,7 +660,7 @@ impl Store for KStore {
     }
 
     fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
-        let kernel = self.kernel;
+        let kernel = self.kern(i);
         let src = self.buf(i).get(start..end).ok_or(-EFAULT)?;
         copy_to(kernel, uptr.wrapping_add(start as u64), src)
     }
@@ -897,6 +907,7 @@ pub unsafe extern "C" fn nvgpu_rs_i2_ioctl(
     // 8 bytes, which is KState's alignment), zeroed, and ours alone.
     let st = unsafe { &mut *p };
     st.store.kernel = a.kernel != 0;
+    st.store.karg = a.karg != 0;
     let mut env = I2Env { call };
     let r = i2::run(&mut env, st, &set, &args);
     // SAFETY: `ret_out` is the caller's s32.
@@ -930,6 +941,18 @@ pub unsafe extern "C" fn nvgpu_rs_i2_has_schema(
         unsafe { core::slice::from_raw_parts(prefix.cast::<u8>(), prefix_len) }
     };
     i2::has_schema(&set, sclass, cmd, prefix)
+}
+
+/// `nvgpu_i2_native_cmd()`.
+///
+/// # Safety
+///
+/// `t` points at a filled `struct nvgpu_rs_tables`.
+#[no_mangle]
+pub unsafe extern "C" fn nvgpu_rs_i2_native_cmd(t: *const c_void, sclass: u32, cmd: u32) -> u32 {
+    // SAFETY: the caller's contract.
+    let set = unsafe { schema_set(t.cast()) };
+    i2::native_cmd(&set, sclass, cmd)
 }
 
 /// The state a hook was handed, or `None`.

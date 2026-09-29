@@ -58,7 +58,8 @@ struct nvgpu_rs_i2_args {
   u32 xflags;
   u8 compat; /* in_compat_syscall() */
   u8 kernel; /* nvgpu_i2_call.kernel */
-  u16 reserved;
+  u8 karg;   /* nvgpu_i2_call.karg */
+  u8 reserved;
 };
 
 /* struct nvgpu_rm_deep_control, widened. */
@@ -132,6 +133,8 @@ long nvgpu_rs_i2_ioctl(struct nvgpu_i2_call *call,
                        const struct nvgpu_rs_tables *t, s32 *ret_out);
 bool nvgpu_rs_i2_has_schema(const struct nvgpu_rs_tables *t, u32 sclass,
                             u32 cmd, const void *prefix, size_t prefix_len);
+u32 nvgpu_rs_i2_native_cmd(const struct nvgpu_rs_tables *t, u32 sclass,
+                           u32 cmd);
 /* The state is call->st while a hook runs; NULL is answered as the C does. */
 int nvgpu_rs_i2_add_dyn(void *st, u32 kind, u32 buf, u32 off, u32 len);
 int nvgpu_rs_i2_add_fd(void *st, u32 buf, u32 off, u32 handle, u32 flags);

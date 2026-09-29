@@ -696,12 +696,14 @@ static const struct nvgpu_i2_ops nvgpu_fence_i2_ops = {
 
 /*
  * One render-class call on `target` (a render handle; the call's results land
- * there). `arg` is a kernel buffer when `kernel`, else the caller's pointer.
- * A handle resolved as NVGPU_I2_FD_CONSUME but never handed to the
- * interpreter (the call failed before the hook ran) is closed here.
+ * there). `arg` is always kernel memory: with `built`, a struct the driver
+ * built, every address in it a kernel one; else the caller's argument as the
+ * DRM node's entry copied it in (struct nvgpu_drm_arg), every pointer in it
+ * the caller's. A handle resolved as NVGPU_I2_FD_CONSUME but never handed to
+ * the interpreter (the call failed before the hook ran) is closed here.
  */
 static long nvgpu_fence_call(struct nvgpu_fence_call *p, u32 target,
-                             unsigned int cmd, void *arg, bool kernel) {
+                             unsigned int cmd, void *arg, bool built) {
   struct nvgpu_i2_call call = {
       .dev = p->nfd->dev,
       .handle = target,
@@ -709,7 +711,8 @@ static long nvgpu_fence_call(struct nvgpu_fence_call *p, u32 target,
       .sclass = NVGPU_SCLASS_RENDER,
       .cmd = cmd,
       .uarg = (void __user __force *)arg,
-      .kernel = kernel,
+      .kernel = built,
+      .karg = !built,
       .ops = &nvgpu_fence_i2_ops,
       .priv = p,
   };
@@ -723,14 +726,6 @@ static long nvgpu_fence_call(struct nvgpu_fence_call *p, u32 target,
     p->in_ref = NULL;
   }
   return ret;
-}
-
-/* A flat argument into kernel memory: `cmd` must be the native one. */
-static int nvgpu_fence_copy_in(unsigned int cmd, unsigned int want,
-                               void *karg, const void __user *uarg) {
-  if (cmd != want)
-    return -EINVAL;
-  return copy_from_user(karg, uarg, _IOC_SIZE(cmd)) ? -EFAULT : 0;
 }
 
 /* ───────── syncobj waits, slept here ───────── */
@@ -1290,21 +1285,19 @@ static void nvgpu_sowait_release(struct nvgpu_sowait_wait *w) {
 #define NVGPU_SOWAIT_MAX_HANDLES 4096
 
 /*
- * SYNCOBJ_WAIT and SYNCOBJ_TIMELINE_WAIT. The argument may be an older,
- * shorter struct (before deadline_nsec, drm.h:1000-1016); like drm_ioctl we
- * zero what the caller did not send and copy back only what it did.
+ * SYNCOBJ_WAIT and SYNCOBJ_TIMELINE_WAIT, on the caller's argument as the
+ * DRM node's entry normalised it: an older, shorter struct (before
+ * deadline_nsec, drm.h:1000-1016) arrives zero-extended, as drm_ioctl()
+ * hands it over, and the entry copies back only what the caller sent.
  */
 static long nvgpu_sowait_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
-                               void __user *uarg) {
-  bool timeline = _IOC_NR(cmd) == _IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT);
-  unsigned int kcmd = timeline ? DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-                               : DRM_IOCTL_SYNCOBJ_WAIT;
+                               void *karg) {
+  bool timeline = cmd == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT;
   union {
     struct drm_syncobj_wait b;
     struct drm_syncobj_timeline_wait t;
   } a = {}, k;
-  struct nvgpu_sowait_wait w = {.p.nfd = nfd, .cmd = kcmd, .karg = &k};
-  size_t usize = _IOC_SIZE(cmd);
+  struct nvgpu_sowait_wait w = {.p.nfd = nfd, .cmd = cmd, .karg = &k};
   u64 uhandles, upoints = 0, deadline;
   u32 *handles = NULL;
   u64 *points = NULL;
@@ -1312,11 +1305,7 @@ static long nvgpu_sowait_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
   u32 flags;
   long ret;
 
-  if (_IOC_DIR(cmd) != (_IOC_READ | _IOC_WRITE) ||
-      usize > _IOC_SIZE(kcmd) || usize < 32)
-    return -EINVAL;
-  if (copy_from_user(&a, uarg, usize))
-    return -EFAULT;
+  memcpy(&a, karg, timeline ? sizeof(a.t) : sizeof(a.b));
   k = a;
   if (timeline) {
     uhandles = a.t.handles;
@@ -1391,8 +1380,7 @@ static long nvgpu_sowait_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
     else
       a.b.first_signaled = k.b.first_signaled;
   }
-  if (copy_to_user(uarg, &a, usize))
-    ret = -EFAULT;
+  memcpy(karg, &a, timeline ? sizeof(a.t) : sizeof(a.b));
 out:
   kvfree(handles);
   kvfree(points);
@@ -1437,14 +1425,13 @@ static long nvgpu_sowait_submitted(struct nvgpu_fd *nfd, u32 syncobj,
  * transfer goes to the host without the flag (the backend refuses it with).
  */
 static long nvgpu_fence_transfer(struct nvgpu_fd *nfd, unsigned int cmd,
-                                 void __user *uarg) {
+                                 void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd};
   struct drm_syncobj_transfer a;
   long ret;
 
-  ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_TRANSFER, &a, uarg);
-  if (ret)
-    return ret;
+  /* A copy: the flags sent are not the caller's, which go back unchanged. */
+  memcpy(&a, karg, sizeof(a));
   if (a.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
     if (a.flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT)
       return -EINVAL; /* drm_syncobj.c:446-449 */
@@ -1474,7 +1461,7 @@ static long nvgpu_fence_transfer(struct nvgpu_fd *nfd, unsigned int cmd,
  * destroyed or its file closed (nvgpu_sowait_forget()).
  */
 static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
-                                void __user *uarg) {
+                                void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd};
   struct drm_syncobj_eventfd a;
   struct nvgpu_sowait_sub *sub, *it;
@@ -1486,9 +1473,7 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   u64 id;
   long ret;
 
-  ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_EVENTFD, &a, uarg);
-  if (ret)
-    return ret;
+  memcpy(&a, karg, sizeof(a));
   if ((a.flags & ~DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) || a.pad)
     return -EINVAL; /* drm_syncobj.c:1472-1476 */
   ctx = eventfd_ctx_fdget(a.fd);
@@ -1584,21 +1569,15 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
  * host sync_file (EXPORT_SYNC_FILE) a proxy sync_file.
  */
 static long nvgpu_fence_handle_to_fd(struct nvgpu_fd *nfd, unsigned int cmd,
-                                     void __user *uarg) {
+                                     void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd};
-  struct drm_syncobj_handle a;
-  long ret;
+  struct drm_syncobj_handle *a = karg;
 
-  ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &a, uarg);
-  if (ret)
-    return ret;
-  p.want_kind = a.flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE
+  p.want_kind = a->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE
                     ? NVGPU_HK_SYNC_FILE
                     : NVGPU_HK_SYNCOBJ;
-  ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
-  if (copy_to_user(uarg, &a, sizeof(a)))
-    ret = -EFAULT;
-  return ret;
+  /* No pointer in it: a struct of the driver's as far as IOCTL2 goes. */
+  return nvgpu_fence_call(&p, nfd->handle, cmd, a, true);
 }
 
 /*
@@ -1610,7 +1589,7 @@ static long nvgpu_fence_handle_to_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  * (drm_syncobj.c:728-757 against :1560-1647), so that is what is sent.
  */
 static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
-                                     void __user *uarg) {
+                                     void *karg) {
   const u32 valid = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE |
                     DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE;
   struct nvgpu_fence_call p = {.nfd = nfd};
@@ -1619,9 +1598,8 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
   bool owned;
   long ret;
 
-  ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &a, uarg);
-  if (ret)
-    return ret;
+  /* Read once; the reply goes back into the caller's argument. */
+  memcpy(&a, karg, sizeof(a));
   if (a.pad || (a.flags & ~valid))
     return -EINVAL; /* drm_syncobj.c:897-901, before the rewrite hides it */
 
@@ -1666,31 +1644,27 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
   ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
   if (held)
     fput(held);
-  if (copy_to_user(uarg, &a, sizeof(a)))
-    ret = -EFAULT;
+  memcpy(karg, &a, sizeof(a));
   return ret;
 }
 
-bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd) {
+unsigned int nvgpu_fence_syncobj_cmd(unsigned int cmd) {
+  static const unsigned int native[] = {
+      DRM_IOCTL_SYNCOBJ_CREATE,          DRM_IOCTL_SYNCOBJ_DESTROY,
+      DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,    DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+      DRM_IOCTL_SYNCOBJ_WAIT,            DRM_IOCTL_SYNCOBJ_RESET,
+      DRM_IOCTL_SYNCOBJ_SIGNAL,          DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+      DRM_IOCTL_SYNCOBJ_QUERY,           DRM_IOCTL_SYNCOBJ_TRANSFER,
+      DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_EVENTFD,
+  };
+  unsigned int i;
+
   if (_IOC_TYPE(cmd) != DRM_IOCTL_BASE)
-    return false;
-  switch (_IOC_NR(cmd)) {
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_CREATE):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_RESET):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_SIGNAL):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_QUERY):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_EVENTFD):
-    return true;
-  default:
-    return false;
-  }
+    return 0;
+  for (i = 0; i < ARRAY_SIZE(native); i++)
+    if (_IOC_NR(native[i]) == _IOC_NR(cmd))
+      return native[i];
+  return 0;
 }
 
 /*
@@ -1700,41 +1674,43 @@ bool nvgpu_fence_is_syncobj_ioctl(unsigned int cmd) {
  * stays empty: nothing reaches drm_ioctl().
  */
 long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
-                               unsigned int cmd, unsigned long arg) {
-  void __user *uarg = (void __user *)arg;
+                               unsigned int cmd, void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd, .file = file};
 
   nvgpu_fence_reap();
-  switch (_IOC_NR(cmd)) {
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT):
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT):
-    return nvgpu_sowait_ioctl(nfd, cmd, uarg);
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD):
-    return nvgpu_fence_handle_to_fd(nfd, cmd, uarg);
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE):
-    return nvgpu_fence_fd_to_handle(nfd, cmd, uarg);
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER):
-    return nvgpu_fence_transfer(nfd, cmd, uarg);
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_EVENTFD):
-    return nvgpu_fence_eventfd(nfd, cmd, uarg);
-  case _IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY): {
+  switch (cmd) {
+  case DRM_IOCTL_SYNCOBJ_WAIT:
+  case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT:
+    return nvgpu_sowait_ioctl(nfd, cmd, karg);
+  case DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD:
+    return nvgpu_fence_handle_to_fd(nfd, cmd, karg);
+  case DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE:
+    return nvgpu_fence_fd_to_handle(nfd, cmd, karg);
+  case DRM_IOCTL_SYNCOBJ_TRANSFER:
+    return nvgpu_fence_transfer(nfd, cmd, karg);
+  case DRM_IOCTL_SYNCOBJ_EVENTFD:
+    return nvgpu_fence_eventfd(nfd, cmd, karg);
+  case DRM_IOCTL_SYNCOBJ_DESTROY: {
     struct drm_syncobj_destroy a;
     long ret;
 
     /* Read once: the handle whose subscribers go is the one destroyed. */
-    ret = nvgpu_fence_copy_in(cmd, DRM_IOCTL_SYNCOBJ_DESTROY, &a, uarg);
-    if (ret)
-      return ret;
+    memcpy(&a, karg, sizeof(a));
     ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
     if (!ret)
       nvgpu_sowait_forget(nfd, a.handle, false);
     return ret;
   }
+  case DRM_IOCTL_SYNCOBJ_CREATE:
+  case DRM_IOCTL_SYNCOBJ_RESET:
+  case DRM_IOCTL_SYNCOBJ_SIGNAL:
+  case DRM_IOCTL_SYNCOBJ_QUERY:
+  case DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL:
+    /* Handles and points, nothing to translate and nothing that waits; the
+     * arrays they point at are the caller's. */
+    return nvgpu_fence_call(&p, nfd->handle, cmd, karg, false);
   default:
-    /* CREATE, RESET, SIGNAL, QUERY, TIMELINE_SIGNAL: handles and points,
-     * nothing to translate and nothing that waits. */
-    return nvgpu_fence_call(&p, nfd->handle, cmd, (void __force *)uarg,
-                            false);
+    return -ENOTTY;
   }
 }
 
@@ -2023,17 +1999,15 @@ static void nvgpu_semsurf_mirror(struct nvgpu_fence_ctx *ctx,
                                  const struct nvgpu_semsurf_attach *a);
 
 static long nvgpu_semsurf_attach(struct nvgpu_fence_call *p, unsigned int cmd,
-                                 void __user *uarg) {
+                                 void *karg) {
   struct nvgpu_semsurf_attach a;
   struct nvgpu_fence_ctx *ctx;
   struct nvgpu_gem_object *ng;
   struct nvgpu_fd *target;
   u32 gem;
-  long ret;
+  long ret = 0;
 
-  ret = nvgpu_fence_copy_in(cmd, NVGPU_IOCTL_SEMSURF_ATTACH, &a, uarg);
-  if (ret)
-    return ret;
+  memcpy(&a, karg, sizeof(a));
   ctx = nvgpu_fence_ctx_lookup(p->file, a.fence_context_handle);
   if (!ctx)
     return -EINVAL;
@@ -2283,43 +2257,50 @@ static void nvgpu_semsurf_mirror(struct nvgpu_fence_ctx *ctx,
                         ret);
 }
 
+unsigned int nvgpu_fence_semsurf_cmd(unsigned int nr) {
+  switch (nr) {
+  case _IOC_NR(NVGPU_IOCTL_SEMSURF_CTX_CREATE):
+    return NVGPU_IOCTL_SEMSURF_CTX_CREATE;
+  case _IOC_NR(NVGPU_IOCTL_SEMSURF_CREATE):
+    return NVGPU_IOCTL_SEMSURF_CREATE;
+  case _IOC_NR(NVGPU_IOCTL_SEMSURF_WAIT):
+    return NVGPU_IOCTL_SEMSURF_WAIT;
+  case _IOC_NR(NVGPU_IOCTL_SEMSURF_ATTACH):
+    return NVGPU_IOCTL_SEMSURF_ATTACH;
+  }
+  return 0;
+}
+
 long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
-                               unsigned int cmd, void __user *uarg) {
+                               unsigned int cmd, void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd, .file = file};
   long ret;
 
   nvgpu_fence_reap();
-  switch (_IOC_NR(cmd)) {
-  case _IOC_NR(NVGPU_IOCTL_SEMSURF_CTX_CREATE):
+  switch (cmd) {
+  case NVGPU_IOCTL_SEMSURF_CTX_CREATE:
     /*
      * RM handles of the caller's own client and a size, no descriptor
-     * (nvkms-kapi-sync.c:182-306): forwarded from the caller's memory; the
-     * new context comes back as a GEM handle and gets its proxy (gem_out).
+     * (nvkms-kapi-sync.c:182-306): forwarded, the NVKMS block it points at
+     * read from the caller's memory; the new context comes back as a GEM
+     * handle and gets its proxy (gem_out).
      */
-    return nvgpu_fence_call(&p, nfd->handle, cmd, (void __force *)uarg, false);
+    return nvgpu_fence_call(&p, nfd->handle, cmd, karg, false);
 
-  case _IOC_NR(NVGPU_IOCTL_SEMSURF_CREATE): {
-    struct nvgpu_semsurf_create a;
+  case NVGPU_IOCTL_SEMSURF_CREATE: {
+    struct nvgpu_semsurf_create *a = karg;
 
-    ret = nvgpu_fence_copy_in(cmd, NVGPU_IOCTL_SEMSURF_CREATE, &a, uarg);
-    if (ret)
-      return ret;
     p.want_kind = NVGPU_HK_SYNC_FILE;
-    ret = nvgpu_semsurf_on_ctx(&p, cmd, &a, a.fence_context_handle);
-    if (copy_to_user(uarg, &a, sizeof(a)))
-      ret = -EFAULT;
-    return ret;
+    return nvgpu_semsurf_on_ctx(&p, cmd, a, a->fence_context_handle);
   }
 
-  case _IOC_NR(NVGPU_IOCTL_SEMSURF_WAIT): {
+  case NVGPU_IOCTL_SEMSURF_WAIT: {
     struct nvgpu_semsurf_wait a;
     struct nvgpu_fence_ctx *ctx;
     struct dma_fence *f;
     bool owned;
 
-    ret = nvgpu_fence_copy_in(cmd, NVGPU_IOCTL_SEMSURF_WAIT, &a, uarg);
-    if (ret)
-      return ret;
+    memcpy(&a, karg, sizeof(a));
     ctx = nvgpu_fence_ctx_lookup(file, a.fence_context_handle);
     if (!ctx)
       return -EINVAL;
@@ -2351,8 +2332,8 @@ long nvgpu_fence_semsurf_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
     return ret;
   }
 
-  case _IOC_NR(NVGPU_IOCTL_SEMSURF_ATTACH):
-    return nvgpu_semsurf_attach(&p, cmd, uarg);
+  case NVGPU_IOCTL_SEMSURF_ATTACH:
+    return nvgpu_semsurf_attach(&p, cmd, karg);
 
   default:
     return -ENOTTY;

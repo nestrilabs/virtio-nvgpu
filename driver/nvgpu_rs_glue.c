@@ -329,6 +329,14 @@ bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
                                 arg_prefix ? prefix_len : 0);
 }
 
+unsigned int nvgpu_i2_native_cmd(struct nvgpu_device *dev, u32 sclass,
+                                 unsigned int cmd) {
+  struct nvgpu_rs_tables t;
+
+  nvgpu_rs_tables_fill(dev, &t);
+  return nvgpu_rs_i2_native_cmd(&t, sclass, cmd);
+}
+
 long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
   struct nvgpu_device *dev = call->dev;
   struct nvgpu_rs_i2_args a = {
@@ -342,6 +350,7 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
       .xflags = call->xflags,
       .compat = in_compat_syscall(),
       .kernel = call->kernel,
+      .karg = call->karg,
   };
   struct nvgpu_rs_tables t;
   s32 ret_out = 0;

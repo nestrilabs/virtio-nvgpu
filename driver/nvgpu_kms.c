@@ -1661,9 +1661,11 @@ static const struct nvgpu_i2_ops nvgpu_kms_ops = {
 
 /* ───────── the ioctls ───────── */
 
+/* On the caller's argument as the DRM node's entry copied it in (`karg`, at
+ * the native size of `cmd`, the schema's own), its pointers the caller's. */
 static long nvgpu_kms_forward(struct nvgpu_kms_file *kf, struct file *filp,
                               struct drm_file *file, unsigned int cmd,
-                              void __user *uarg) {
+                              void *karg) {
   struct nvgpu_kms_call *kc;
   long ret;
   u32 h;
@@ -1684,7 +1686,8 @@ static long nvgpu_kms_forward(struct nvgpu_kms_file *kf, struct file *filp,
   kc->call.render = kf->nfd->handle;
   kc->call.sclass = NVGPU_SCLASS_KMS;
   kc->call.cmd = cmd;
-  kc->call.uarg = uarg;
+  kc->call.uarg = (void __user __force *)karg;
+  kc->call.karg = true;
   kc->call.ops = &nvgpu_kms_ops;
 
   ret = nvgpu_i2_ioctl(&kc->call);
@@ -1696,54 +1699,48 @@ static long nvgpu_kms_forward(struct nvgpu_kms_file *kf, struct file *filp,
 /* MAP_DUMB: the proxy's fake offset in this node; the mapping then reaches
  * the host's memory through the shared window like any proxy's. The offset is
  * zeroed on failure, as the core zeroes it (drm_dumb_buffers.c:283). */
-static long nvgpu_kms_map_dumb(struct drm_file *file, unsigned int cmd,
-                               void __user *uarg) {
-  struct drm_mode_map_dumb md;
+static long nvgpu_kms_map_dumb(struct drm_file *file, void *karg) {
+  struct drm_mode_map_dumb *md = karg;
+  u64 offset = 0;
   int ret;
 
-  if (_IOC_SIZE(cmd) != sizeof(md))
-    return -EINVAL;
-  if (copy_from_user(&md, uarg, sizeof(md)))
-    return -EFAULT;
-  ret = nvgpu_gem_mmap_offset(file, md.handle, &md.offset);
-  if (ret)
-    md.offset = 0;
-  if (copy_to_user(uarg, &md, sizeof(md)))
-    return -EFAULT;
+  ret = nvgpu_gem_mmap_offset(file, md->handle, &offset);
+  md->offset = ret ? 0 : offset;
   return ret;
 }
 
 /* DESTROY_DUMB is GEM_CLOSE by another name (drm_dumb_buffers.c:287). */
-static long nvgpu_kms_destroy_dumb(struct drm_file *file, unsigned int cmd,
-                                   void __user *uarg) {
-  struct drm_mode_destroy_dumb dd;
+static long nvgpu_kms_destroy_dumb(struct drm_file *file, void *karg) {
+  const struct drm_mode_destroy_dumb *dd = karg;
 
-  if (_IOC_SIZE(cmd) != sizeof(dd))
-    return -EINVAL;
-  if (copy_from_user(&dd, uarg, sizeof(dd)))
-    return -EFAULT;
-  return drm_gem_handle_delete(file, dd.handle);
+  return drm_gem_handle_delete(file, dd->handle);
 }
 
 /* The caps the core answers without DRIVER_MODESET (drm_ioctl.c:242-255),
  * which are about this node -- PRIME is ours, syncobjs ours or none -- not
  * the host's. */
-static bool nvgpu_kms_core_cap(unsigned int cmd, void __user *uarg) {
-  u64 cap;
+static bool nvgpu_kms_core_cap(const void *karg) {
+  u64 cap = ((const struct drm_get_cap *)karg)->capability;
 
-  if (_IOC_SIZE(cmd) != sizeof(struct drm_get_cap) ||
-      copy_from_user(&cap, uarg, sizeof(cap)))
-    return false;
   return cap == DRM_CAP_PRIME || cap == DRM_CAP_TIMESTAMP_MONOTONIC ||
          cap == DRM_CAP_SYNCOBJ || cap == DRM_CAP_SYNCOBJ_TIMELINE;
 }
 
+/*
+ * Everything this takes runs on the caller's argument normalised to the
+ * native struct, as drm_ioctl() does (nvgpu_drm_arg_in()): the dumb-buffer
+ * pair to this kernel's own, the rest to the KMS schema's entry for the
+ * number, which is the only command the host is sent.
+ */
 bool nvgpu_kms_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
                      long *ret) {
   struct drm_file *file = filp->private_data;
   struct nvgpu_fd *nfd = file ? file->driver_priv : NULL;
   struct nvgpu_kms_file *kf = nfd ? nfd->kms : NULL;
   void __user *uarg = (void __user *)arg;
+  struct nvgpu_drm_arg a;
+  unsigned int ncmd;
+  long r;
 
   if (!kf || _IOC_TYPE(cmd) != DRM_IOCTL_BASE)
     return false;
@@ -1768,20 +1765,41 @@ bool nvgpu_kms_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
   case NVGPU_KNR(DRM_IOCTL_SET_CLIENT_NAME):
     return false;
   case NVGPU_KNR(DRM_IOCTL_MODE_MAP_DUMB):
-    *ret = nvgpu_kms_map_dumb(file, cmd, uarg);
-    return true;
-  case NVGPU_KNR(DRM_IOCTL_MODE_DESTROY_DUMB):
-    *ret = nvgpu_kms_destroy_dumb(file, cmd, uarg);
-    return true;
-  case NVGPU_KNR(DRM_IOCTL_GET_CAP):
-    if (nvgpu_kms_core_cap(cmd, uarg))
-      return false;
+    ncmd = DRM_IOCTL_MODE_MAP_DUMB;
     break;
+  case NVGPU_KNR(DRM_IOCTL_MODE_DESTROY_DUMB):
+    ncmd = DRM_IOCTL_MODE_DESTROY_DUMB;
+    break;
+  default:
+    ncmd = nvgpu_i2_native_cmd(kf->dev, NVGPU_SCLASS_KMS, cmd);
+    if (!ncmd)
+      return false;
   }
 
-  if (!nvgpu_i2_has_schema(kf->dev, NVGPU_SCLASS_KMS, cmd, NULL, 0))
-    return false;
-  *ret = nvgpu_kms_forward(kf, filp, file, cmd, uarg);
+  r = nvgpu_drm_arg_in(&a, cmd, ncmd, uarg);
+  if (r) {
+    *ret = r;
+    return true;
+  }
+  switch (_IOC_NR(cmd)) {
+  case NVGPU_KNR(DRM_IOCTL_MODE_MAP_DUMB):
+    r = nvgpu_kms_map_dumb(file, a.k);
+    break;
+  case NVGPU_KNR(DRM_IOCTL_MODE_DESTROY_DUMB):
+    r = nvgpu_kms_destroy_dumb(file, a.k);
+    break;
+  case NVGPU_KNR(DRM_IOCTL_GET_CAP):
+    if (_IOC_SIZE(a.cmd) >= sizeof(struct drm_get_cap) &&
+        nvgpu_kms_core_cap(a.k)) {
+      /* The core's, which reads the caller's argument itself. */
+      nvgpu_drm_arg_drop(&a);
+      return false;
+    }
+    fallthrough;
+  default:
+    r = nvgpu_kms_forward(kf, filp, file, a.cmd, a.k);
+  }
+  *ret = nvgpu_drm_arg_out(&a, r);
   return true;
 }
 

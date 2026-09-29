@@ -1193,6 +1193,21 @@ pub fn has_schema(set: &SchemaSet<'_>, sclass: u32, cmd: u32, prefix: &[u8]) -> 
     set.lookup(sclass, cmd, prefix).is_some()
 }
 
+/// `nvgpu_i2_native_cmd()`: the command of the DRM-class entry numbered as
+/// `cmd` (by type and number; the one of exactly `cmd` if there is one, as
+/// [`run`] looks it up), which a caller's argument of another size or
+/// direction is normalised to before the call, as `drm_ioctl()` does; 0 if
+/// there is none. NVKMS's entries share one command, so never for those.
+pub fn native_cmd(set: &SchemaSet<'_>, sclass: u32, cmd: u32) -> u32 {
+    if sclass == SCLASS_MODESET {
+        return 0;
+    }
+    match set.lookup(sclass, cmd, &[]) {
+        Some((w, e)) => set.table(w).ioctls.get(e).map_or(0, |e| e.cmd),
+        None => 0,
+    }
+}
+
 /// `nvgpu_i2_ioctl()` from the gather on: run an ioctl through IOCTL2 --
 /// gather the caller's buffers, translate descriptor and GEM fields through
 /// the hooks, send, copy every OUT buffer back per the schema's copy-back

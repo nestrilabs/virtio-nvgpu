@@ -60,6 +60,7 @@ struct nvgpu_i2_kbuf {
   u32 parent, pbase;
   u64 sent;
   void __user *uptr;
+  bool kern; /* uptr is a kernel address (nvgpu_i2_call.kernel, .karg) */
 };
 
 /* A schema position the walk reached, with the caller's value there. */
@@ -91,6 +92,7 @@ struct nvgpu_i2_state {
   const struct nvgpu_stable *t;
   const struct nvgpu_sioctl *e;
   bool kernel; /* nvgpu_i2_call.kernel: every address is a kernel one */
+  bool karg;   /* nvgpu_i2_call.karg: the argument's is */
   u32 nbuf, nslot, nfd, ngem, ndyn, nfdo, ngemo;
   size_t in_bytes, out_bytes; /* request / reply data, padded */
   struct nvgpu_i2_kbuf buf[NVGPU_I2_MAX_BUFS];
@@ -163,6 +165,18 @@ bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
 
   return nvgpu_i2_lookup(nvgpu_i2_set(dev), sclass, cmd, arg_prefix,
                          prefix_len, &t) != NULL;
+}
+
+unsigned int nvgpu_i2_native_cmd(struct nvgpu_device *dev, u32 sclass,
+                                 unsigned int cmd) {
+  const struct nvgpu_stable *t;
+  const struct nvgpu_sioctl *e;
+
+  /* NVKMS's entries share one command and are told apart inside it. */
+  if (sclass == NVGPU_SCLASS_MODESET)
+    return 0;
+  e = nvgpu_i2_lookup(nvgpu_i2_set(dev), sclass, cmd, NULL, 0, &t);
+  return e ? e->cmd : 0;
 }
 
 /* ───────── the kernel copies ───────── */
@@ -253,6 +267,8 @@ static int nvgpu_i2_new_buf(struct nvgpu_device *dev,
   kb->len = len;
   kb->dir = dir;
   kb->uptr = uptr;
+  /* The argument is buffer 0: the first one the walk makes. */
+  kb->kern = st->kernel || (st->karg && !st->nbuf);
   if (len) {
     kb->k = kvzalloc(len, GFP_KERNEL);
     if (!kb->k)
@@ -265,9 +281,10 @@ static int nvgpu_i2_new_buf(struct nvgpu_device *dev,
    * A call the driver makes itself, on memory it built (nvgpu_i2_call.kernel):
    * the caller wrote every address in it. One in the user range is a user's
    * pointer that the driver copied along and forgot to replace -- which a
-   * kernel memcpy would follow at the caller's choice -- and is refused.
+   * kernel memcpy would follow at the caller's choice -- and is refused. The
+   * same holds for an argument the DRM node's entry copied in (.karg).
    */
-  if (st->kernel) {
+  if (kb->kern) {
     if (!nvgpu_i2_kernel_range(uptr, len))
       return -EFAULT;
     memcpy(kb->k, (const void __force *)uptr, len);
@@ -971,7 +988,7 @@ static int nvgpu_i2_copy_back(struct nvgpu_i2_call *call) {
     }
     if (end <= start)
       continue;
-    if (st->kernel) {
+    if (kb->kern) {
       if (nvgpu_i2_kernel_range(kb->uptr + start, end - start))
         memcpy((void __force *)kb->uptr + start, kb->k + start, end - start);
       else
@@ -1095,6 +1112,7 @@ long nvgpu_i2_ioctl(struct nvgpu_i2_call *call) {
   call->st = st;
   call->ret = 0;
   st->kernel = call->kernel;
+  st->karg = call->karg;
 
   ret = nvgpu_i2_gather(call);
   if (ret)

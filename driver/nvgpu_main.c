@@ -14,6 +14,7 @@
 
 #include <drm/drm.h>
 #include <linux/cdev.h>
+#include <linux/compat.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
@@ -725,11 +726,30 @@ static int nvgpu_release(struct inode *inode, struct file *filp) {
 
 /* ───────── file_operations tables ───────── */
 
+/*
+ * 32-bit processes. Every NVIDIA node answers them with its native handler:
+ * nvidia.ko's nvidia_fops, nvidia-modeset's nvkms_fops (x86-64 and arm64),
+ * nvidia-uvm's uvm_fops and uvm_tools_fops (x86-64) all set .compat_ioctl
+ * to their .unlocked_ioctl (nv.c:251-261, nvidia-modeset-linux.c:2015-2025,
+ * uvm.c:1074-1084, uvm_tools.c:2774-2784, 595.99.02), because RM, NVKMS and
+ * UVM parameter structs are fixed-width with 8-byte-aligned NvP64/NvU64
+ * fields, so a 32-bit caller's struct is the 64-bit one. So here:
+ * compat_ptr_ioctl(), the native handler with the pointer widened. A 32-bit
+ * caller can send no bytes a 64-bit one cannot (its pointers are below
+ * 4 GiB, which a 64-bit process's can be too), so the backend sees nothing
+ * new. What does differ is its address space, which caps what it can map:
+ * UVM's semaphore pools only above 4 GiB (nvgpu_mmap_uvm_check()), so a
+ * 32-bit UVM client gets its ioctls and not its pools -- 32-bit CUDA is gone
+ * natively too. The nvidia-caps nodes answer no ioctl at all, as nv-caps.c's
+ * do. Without these every 32-bit ioctl (Steam's client, a 32-bit game's GL
+ * and Vulkan driver) was -ENOTTY.
+ */
 static const struct file_operations nvgpu_gpu_fops = {
     .owner = THIS_MODULE,
     .open = nvgpu_gpu_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -739,6 +759,7 @@ static const struct file_operations nvgpu_ctl_fops = {
     .open = nvgpu_ctl_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -748,6 +769,7 @@ static const struct file_operations nvgpu_uvm_fops = {
     .open = nvgpu_uvm_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_uvm_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_poll,
 };
@@ -844,6 +866,7 @@ static const struct file_operations nvgpu_modeset_fops = {
     .open = nvgpu_modeset_open,
     .release = nvgpu_release,
     .unlocked_ioctl = nvgpu_modeset_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
     .mmap = nvgpu_mmap,
     .poll = nvgpu_modeset_poll,
 };
