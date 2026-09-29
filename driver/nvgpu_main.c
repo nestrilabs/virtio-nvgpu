@@ -1925,65 +1925,15 @@ static void nvgpu_caps_cleanup(struct nvgpu_device *dev) {
  */
 static unsigned long nvgpu_bound;
 
-static int nvgpu_probe(struct virtio_device *vdev) {
-  struct nvgpu_device *dev;
-  struct virtqueue_info vqs_info[] = {
-      {"control", nvgpu_ctrl_vq_cb},
-      {"event", nvgpu_event_vq_cb},
-  };
-  struct virtqueue *vqs[2];
-  dev_t gpu_devno;
-  int ret, i;
+/*
+ * What the VMM wrote into config space at device creation: the host driver's
+ * version, the GPUs, the descriptor-translation table. -EINVAL for a GPU
+ * count this driver cannot serve.
+ */
+static int nvgpu_probe_config(struct nvgpu_device *dev) {
+  struct virtio_device *vdev = dev->vdev;
+  u32 i;
 
-  if (test_and_set_bit(0, &nvgpu_bound)) {
-    dev_err(&vdev->dev,
-            "virtio-gpu-nv: a guest has one virtio-gpu-nv device, and this "
-            "is a second; not bound\n");
-    return -EBUSY;
-  }
-
-  /* Not devm: open files and objects may outlive remove(), and every one of
-   * them names this (see struct nvgpu_device's ref). */
-  dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-  if (!dev) {
-    clear_bit(0, &nvgpu_bound);
-    return -ENOMEM;
-  }
-  kobject_init(&dev->kobj, &nvgpu_dev_ktype);
-  INIT_LIST_HEAD(&dev->proc_bufs);
-
-  /* For the lines logged against it by whatever outlives remove(). */
-  get_device(&vdev->dev);
-  dev->vdev = vdev;
-  vdev->priv = dev;
-  INIT_LIST_HEAD(&dev->fds);
-  spin_lock_init(&dev->fds_lock);
-  xa_init(&dev->renders);
-  nvgpu_osdesc_init(dev);
-
-  /* Find virtqueues */
-  ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
-  if (ret) {
-    vdev->priv = NULL;
-    nvgpu_dev_put(dev);
-    clear_bit(0, &nvgpu_bound);
-    return ret;
-  }
-
-  dev->ctrl_vq = vqs[0];
-  dev->event_vq = vqs[1];
-
-  /*
-   * Request contexts, and somewhere for the host to put an event. Until the
-   * event queue had buffers it was negotiated and empty, so the host had no
-   * way to say a descriptor had become readable and the guest's poll() had
-   * nothing to report.
-   */
-  ret = nvgpu_xfer_init(dev);
-  if (ret)
-    goto err_vqs;
-
-  /* Read config space written by the VMM at device creation */
   virtio_cread_bytes(vdev, 0, dev->driver_version, 32);
   dev->driver_version[31] = '\0';
   dev->uvm = nvgpu_uvm_select(dev->driver_version);
@@ -1997,74 +1947,56 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   if (dev->num_gpus == 0 || dev->num_gpus > 248) {
     dev_err(&vdev->dev, "virtio-gpu-nv: bad num_gpus %u\n", dev->num_gpus);
-    ret = -EINVAL;
-    goto err_xfer;
+    return -EINVAL;
   }
 
   /* GPU info records */
-  {
-    u32 i;
-    for (i = 0; i < dev->num_gpus && i < 8; i++) {
-      size_t off = offsetof(struct virtio_gpu_nv_config, gpus[i]);
-      virtio_cread_bytes(vdev, off, &dev->gpu_slots[i],
-                         sizeof(dev->gpu_slots[i]));
+  for (i = 0; i < dev->num_gpus && i < 8; i++) {
+    size_t off = offsetof(struct virtio_gpu_nv_config, gpus[i]);
 
-      /* Safety: ensure pci_addr is NUL-terminated before logging */
-      dev->gpu_slots[i].pci_addr[15] = '\0';
-
-      dev_dbg(&vdev->dev,
-              "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
-              dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
-              le32_to_cpu(dev->gpu_slots[i].info_len));
-    }
+    virtio_cread_bytes(vdev, off, &dev->gpu_slots[i],
+                       sizeof(dev->gpu_slots[i]));
+    /* NUL-terminated before it is logged or compared. */
+    dev->gpu_slots[i].pci_addr[15] = '\0';
+    dev_dbg(&vdev->dev,
+            "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
+            dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
+            le32_to_cpu(dev->gpu_slots[i].info_len));
   }
 
   /* FD translation table */
   virtio_cread(vdev, struct virtio_gpu_nv_config, num_fd_translations,
                &dev->num_fd_translations);
-
   if (dev->num_fd_translations > 16)
     dev->num_fd_translations = 16;
-
   if (dev->num_fd_translations > 0) {
     size_t off = offsetof(struct virtio_gpu_nv_config, fd_translations);
+
     virtio_cread_bytes(vdev, off, dev->fd_translations,
                        dev->num_fd_translations *
                            sizeof(dev->fd_translations[0]));
   }
-
   dev_dbg(&vdev->dev, "virtio-gpu-nv: %u fd-translation ioctl(s) registered\n",
           dev->num_fd_translations);
+  return 0;
+}
 
-  /* Ensure virtio is running before we open devices */
-  virtio_device_ready(vdev);
-
-  /*
-   * The UVM aperture, before HELLO, which tells the backend how large it is.
-   * A VMM that offers none leaves UVM files unmappable, as they always were.
-   */
-  if (virtio_get_shm_region(vdev, &dev->uvm_aperture, NVGPU_SHM_ID_UVM))
-    dev_info(&vdev->dev, "virtio-gpu-nv: UVM aperture at %pa, %llu bytes\n",
-             &dev->uvm_aperture.addr, dev->uvm_aperture.len);
-  else
-    dev->uvm_aperture.len = 0;
-
-  /*
-   * Which protocol, before anything else is said: the answer sizes every
-   * request after it, and the DRM devices registered below advertise
-   * features (syncobjs) only a v2 backend with the right caps can serve.
-   */
-  nvgpu_xfer_hello(dev);
-  if ((dev->backend_caps & NVGPU_BCAP_UVM_MAP) &&
-      dev->uvm_aperture.len >= PAGE_SIZE)
-    nvgpu_region_check_wb(dev, &dev->uvm_aperture, "the UVM aperture");
+/*
+ * The "nvidia" class and the NVIDIA character devices: /dev/nvidia0..N-1,
+ * /dev/nvidiactl, /dev/nvidia-uvm and -tools when the backend serves compute,
+ * /dev/nvidia-modeset. On failure nothing of them is left.
+ */
+static int nvgpu_register_cdevs(struct nvgpu_device *dev) {
+  struct virtio_device *vdev = dev->vdev;
+  dev_t gpu_devno;
+  int ret, i = 0;
 
   /* Create device class once */
   nvgpu_class = class_create("nvidia");
   if (IS_ERR(nvgpu_class)) {
     ret = PTR_ERR(nvgpu_class);
     nvgpu_class = NULL;
-    goto err_ready;
+    return ret;
   }
 
   /* Set more open permissions to device node */
@@ -2146,13 +2078,75 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev_info(&vdev->dev,
            "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
            MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
+  return 0;
 
-  nvgpu_caps_init(dev);
+  /*
+   * Each label undoes what was set up before the step that jumped to it, in
+   * reverse order.
+   */
+err_modeset_region:
+  unregister_chrdev_region(dev->modeset_devno, 1);
+err_uvm_cdev:
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, dev->uvm_devno + 1);
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
+  device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
+  cdev_del(&dev->cdev_ctl);
+err_ctl_region:
+  unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
+err_gpu_cdevs:
+  for (i = i - 1; i >= 0; i--) {
+    cdev_del(&dev->cdev_gpu[i]);
+    device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));
+  }
+  unregister_chrdev_region(MKDEV(NV_MAJOR, 0), dev->num_gpus);
+err_class:
+  class_destroy(nvgpu_class);
+  nvgpu_class = NULL;
+  return ret;
+}
 
-  /* Create /proc/driver/nvidia/version */
-  ret = nvgpu_proc_init(dev);
-  if (ret)
-    goto err_proc;
+/*
+ * nvgpu_register_cdevs() undone, in the reverse of its order: for a probe
+ * that fails after it (remove() takes them down in its own order).
+ */
+static void nvgpu_unregister_cdevs(struct nvgpu_device *dev) {
+  int i;
+
+  device_destroy(nvgpu_class, dev->modeset_devno);
+  cdev_del(&dev->cdev_modeset);
+  unregister_chrdev_region(dev->modeset_devno, 1);
+  if (dev->uvm_registered) {
+    device_destroy(nvgpu_class, dev->uvm_devno);
+    device_destroy(nvgpu_class, dev->uvm_devno + 1);
+    cdev_del(&dev->cdev_uvm);
+    unregister_chrdev_region(dev->uvm_devno, 2);
+    dev->uvm_registered = false;
+  }
+  device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
+  cdev_del(&dev->cdev_ctl);
+  unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
+  for (i = (int)dev->num_gpus - 1; i >= 0; i--) {
+    cdev_del(&dev->cdev_gpu[i]);
+    device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));
+  }
+  unregister_chrdev_region(MKDEV(NV_MAJOR, 0), dev->num_gpus);
+  class_destroy(nvgpu_class);
+  nvgpu_class = NULL;
+}
+
+/*
+ * Everything after the character devices and /proc, none of it fatal: the
+ * window, the host's sysfs files and the fake PCI device, /sys/module, the
+ * DRM devices, and the Wayland and capture nodes.
+ */
+static void nvgpu_register_optional(struct nvgpu_device *dev) {
+  struct virtio_device *vdev = dev->vdev;
+  int ret;
 
   /*
    * Where device memory will appear. The VMM publishes it as a virtio shared
@@ -2201,6 +2195,104 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   ret = nvgpu_capture_init(dev);
   if (ret)
     dev_warn(&vdev->dev, "virtio-gpu-nv: /dev/nvgpu-capture: %d\n", ret);
+}
+
+static int nvgpu_probe(struct virtio_device *vdev) {
+  struct nvgpu_device *dev;
+  struct virtqueue_info vqs_info[] = {
+      {"control", nvgpu_ctrl_vq_cb},
+      {"event", nvgpu_event_vq_cb},
+  };
+  struct virtqueue *vqs[2];
+  int ret;
+
+  if (test_and_set_bit(0, &nvgpu_bound)) {
+    dev_err(&vdev->dev,
+            "virtio-gpu-nv: a guest has one virtio-gpu-nv device, and this "
+            "is a second; not bound\n");
+    return -EBUSY;
+  }
+
+  /* Not devm: open files and objects may outlive remove(), and every one of
+   * them names this (see struct nvgpu_device's ref). */
+  dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+  if (!dev) {
+    clear_bit(0, &nvgpu_bound);
+    return -ENOMEM;
+  }
+  kobject_init(&dev->kobj, &nvgpu_dev_ktype);
+  INIT_LIST_HEAD(&dev->proc_bufs);
+
+  /* For the lines logged against it by whatever outlives remove(). */
+  get_device(&vdev->dev);
+  dev->vdev = vdev;
+  vdev->priv = dev;
+  INIT_LIST_HEAD(&dev->fds);
+  spin_lock_init(&dev->fds_lock);
+  xa_init(&dev->renders);
+  nvgpu_osdesc_init(dev);
+
+  /* Find virtqueues */
+  ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
+  if (ret) {
+    vdev->priv = NULL;
+    nvgpu_dev_put(dev);
+    clear_bit(0, &nvgpu_bound);
+    return ret;
+  }
+
+  dev->ctrl_vq = vqs[0];
+  dev->event_vq = vqs[1];
+
+  /*
+   * Request contexts, and somewhere for the host to put an event. Until the
+   * event queue had buffers it was negotiated and empty, so the host had no
+   * way to say a descriptor had become readable and the guest's poll() had
+   * nothing to report.
+   */
+  ret = nvgpu_xfer_init(dev);
+  if (ret)
+    goto err_vqs;
+
+  ret = nvgpu_probe_config(dev);
+  if (ret)
+    goto err_xfer;
+
+  /* Ensure virtio is running before we open devices */
+  virtio_device_ready(vdev);
+
+  /*
+   * The UVM aperture, before HELLO, which tells the backend how large it is.
+   * A VMM that offers none leaves UVM files unmappable, as they always were.
+   */
+  if (virtio_get_shm_region(vdev, &dev->uvm_aperture, NVGPU_SHM_ID_UVM))
+    dev_info(&vdev->dev, "virtio-gpu-nv: UVM aperture at %pa, %llu bytes\n",
+             &dev->uvm_aperture.addr, dev->uvm_aperture.len);
+  else
+    dev->uvm_aperture.len = 0;
+
+  /*
+   * Which protocol, before anything else is said: the answer sizes every
+   * request after it, and the DRM devices registered below advertise
+   * features (syncobjs) only a v2 backend with the right caps can serve.
+   */
+  nvgpu_xfer_hello(dev);
+  if ((dev->backend_caps & NVGPU_BCAP_UVM_MAP) &&
+      dev->uvm_aperture.len >= PAGE_SIZE)
+    nvgpu_region_check_wb(dev, &dev->uvm_aperture, "the UVM aperture");
+
+  ret = nvgpu_register_cdevs(dev);
+  if (ret)
+    goto err_ready;
+
+  nvgpu_caps_init(dev);
+
+  /* Create /proc/driver/nvidia/version */
+  ret = nvgpu_proc_init(dev);
+  if (ret)
+    goto err_proc;
+
+  nvgpu_register_optional(dev);
 
   dev_info(&vdev->dev, "virtio-gpu-nv: %u GPU(s), driver %s\n", dev->num_gpus,
            dev->driver_version);
@@ -2208,38 +2300,12 @@ static int nvgpu_probe(struct virtio_device *vdev) {
 
   /*
    * Each label undoes what was set up before the step that jumped to it, in
-   * reverse order. The old ladder unregistered a modeset region it had never
-   * registered, and a /proc failure left the modeset, uvm and caps devices
-   * behind.
+   * reverse order.
    */
 err_proc:
   nvgpu_proc_cleanup(dev);
   nvgpu_caps_cleanup(dev);
-  device_destroy(nvgpu_class, dev->modeset_devno);
-  cdev_del(&dev->cdev_modeset);
-err_modeset_region:
-  unregister_chrdev_region(dev->modeset_devno, 1);
-err_uvm_cdev:
-  if (dev->uvm_registered) {
-    device_destroy(nvgpu_class, dev->uvm_devno);
-    device_destroy(nvgpu_class, dev->uvm_devno + 1);
-    cdev_del(&dev->cdev_uvm);
-    unregister_chrdev_region(dev->uvm_devno, 2);
-    dev->uvm_registered = false;
-  }
-  device_destroy(nvgpu_class, MKDEV(NV_MAJOR, NV_CTL_MINOR));
-  cdev_del(&dev->cdev_ctl);
-err_ctl_region:
-  unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
-err_gpu_cdevs:
-  for (i = i - 1; i >= 0; i--) {
-    cdev_del(&dev->cdev_gpu[i]);
-    device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));
-  }
-  unregister_chrdev_region(MKDEV(NV_MAJOR, 0), dev->num_gpus);
-err_class:
-  class_destroy(nvgpu_class);
-  nvgpu_class = NULL;
+  nvgpu_unregister_cdevs(dev);
 err_ready:
   nvgpu_xfer_quiesce(dev);
 err_xfer:
