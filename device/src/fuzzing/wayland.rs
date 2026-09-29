@@ -31,6 +31,11 @@
 //!
 //! - an engine holding more memory than its budgets allow
 //!   (`Engine::held_bytes`, after every operation);
+//! - a descriptor open between operations that no engine counts
+//!   (`Engine::held_fds`);
+//! - an engine whose count of what it has queued for the channel is not
+//!   what its queue holds, or that still counts something once it has
+//!   nothing more to take (the input limit is decided by that count);
 //! - more lease submits reaching the compositor than the throttle admitted,
 //!   or the throttle admitting more than its burst and rate allow, or still
 //!   refusing once the wait it named has passed.
@@ -416,12 +421,20 @@ impl Pair {
         ok
     }
 
-    /// Neither engine holds more than its budgets allow.
+    /// Neither engine holds more than its budgets allow, and what each
+    /// counts as queued for the channel is what its queue holds.
     fn check_memory(&self) {
         let (g, h) = (self.g.held_bytes(), self.h.held_bytes());
         assert!(h <= HOST_HELD, "the host engine holds {h} bytes");
         assert!(g <= GUEST_HELD, "the guest engine holds {g} bytes");
         assert!(self.streams.used() <= STREAM_BUDGET);
+        for (e, side) in [(&self.g, "guest"), (&self.h, "host")] {
+            assert_eq!(
+                e.channel_backlog(),
+                e.channel_backlog_recount(),
+                "the {side} engine's backlog disagrees with its queue"
+            );
+        }
     }
 
     /// Move everything queued on either side across until quiet (bounded),
@@ -432,6 +445,10 @@ impl Pair {
             loop {
                 let mut q = self.g.take_units_upto(1 << 20);
                 if q.is_empty() {
+                    // Nothing left to take is nothing left counted: a count
+                    // that outlives its queue blocks the app's input for
+                    // good (the 2026-09-29 review, S2).
+                    assert_eq!(self.g.channel_backlog(), 0, "a backlog with nothing queued");
                     break;
                 }
                 while !q.is_empty() {
@@ -455,8 +472,11 @@ impl Pair {
                 }
                 moved = true;
             }
+            assert_eq!(self.h.channel_backlog(), 0, "a backlog with nothing queued");
             drop(self.g.local_out().drain());
             drop(self.h.local_out().drain());
+            drop(self.g.take_closed_streams());
+            drop(self.h.take_closed_streams());
             if !moved {
                 break;
             }
@@ -550,6 +570,16 @@ pub fn run(data: &[u8]) {
                 }
             };
             p.check_memory();
+            // Every descriptor the run holds between operations is one an
+            // engine counts: an owner budgets descriptors by that count
+            // (the guest daemon's share of its limit among clients).
+            let held = p.g.held_fds() + p.h.held_fds();
+            let open = super::open_fds();
+            assert!(
+                open <= fds_before + held,
+                "{} descriptors open, {held} counted by the engines",
+                open - fds_before
+            );
             if !ok {
                 break;
             }

@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use wlwire::engine::{Blame, Engine, EngineConfig, Fatal, Local, Platform, Side};
 use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
-use wlwire::shm::ShmBudget;
+use wlwire::shm::{ShmBudget, ShmCharge};
 use wlwire::sys;
 
 use crate::hostfd::HandleKind;
@@ -117,9 +117,10 @@ pub struct WlConfig {
     /// The guest process the connection is for (quota.rs): what its queue
     /// is charged to. Set by the dispatcher.
     pub owner: crate::quota::Owner,
-    /// That process's shm budget, which every connection of it shares,
-    /// beside the VM's. Set by the dispatcher.
-    pub owner_shm: Option<Arc<ShmBudget>>,
+    /// That process's share of the VM's shm budget, which every connection
+    /// of it draws on in the VM's place ([`ShmShares`]). Set by the
+    /// dispatcher; without it a connection draws on the VM's alone.
+    pub owner_shm: Option<Arc<dyn ShmCharge>>,
 }
 
 impl WlConfig {
@@ -220,6 +221,94 @@ impl QueueBudget {
     }
 }
 
+/// The VM's shm budget as guest processes share it (quota.rs): what each
+/// may hold of its bytes and of its pool count, with the last part of both
+/// kept for processes that hold little.
+///
+/// A flat quarter each, with no reserve, let four processes -- one that
+/// forked three times -- take the whole VM's pools or bytes, at no cost to
+/// themselves (sparse buffers are charged by the pages they cover, never
+/// written), and every other process's first pool was then fatal to it (the
+/// 2026-09-29 review, S5). Now it takes four at their full share to reach
+/// the reserve, and a process holding at most the floor can still make its
+/// first pools and buffers out of that.
+#[derive(Debug)]
+pub struct ShmShares {
+    vm: Arc<ShmBudget>,
+    bytes: crate::quota::Share,
+    pools: crate::quota::Share,
+    /// (bytes, pools) each process holds.
+    held: Mutex<(crate::quota::Ledger, crate::quota::Ledger)>,
+}
+
+impl ShmShares {
+    pub fn new(vm: Arc<ShmBudget>) -> Self {
+        let (bytes, pools) = vm.limits();
+        Self {
+            vm,
+            bytes: crate::quota::Share::quarter(bytes, 1),
+            pools: crate::quota::Share::quarter(pools, 8),
+            held: Mutex::default(),
+        }
+    }
+
+    /// (bytes, pools) `o`'s connections hold.
+    pub fn held_by(&self, o: crate::quota::Owner) -> (u64, u64) {
+        let h = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        (h.0.held(o), h.1.held(o))
+    }
+
+    /// The split of the VM's bytes, for tests and logs.
+    pub fn byte_share(&self) -> crate::quota::Share {
+        self.bytes
+    }
+
+    /// What `o`'s connections draw on: the VM's budget, within `o`'s share.
+    pub fn for_owner(self: &Arc<Self>, o: crate::quota::Owner) -> Arc<dyn ShmCharge> {
+        Arc::new(OwnerShm {
+            shares: self.clone(),
+            owner: o,
+        })
+    }
+}
+
+struct OwnerShm {
+    shares: Arc<ShmShares>,
+    owner: crate::quota::Owner,
+}
+
+impl ShmCharge for OwnerShm {
+    fn take(&self, bytes: u64, pools: u64) -> bool {
+        let s = &*self.shares;
+        let mut held = s.held.lock().unwrap_or_else(|p| p.into_inner());
+        let (used, (max_bytes, max_pools)) = (s.vm.used(), s.vm.limits());
+        let ok = held
+            .0
+            .admits(&s.bytes, self.owner, bytes, used.0, max_bytes)
+            .and_then(|()| {
+                held.1
+                    .admits(&s.pools, self.owner, pools, used.1, max_pools)
+            })
+            .is_ok();
+        // The VM's own count is the outer bound, and atomic: another
+        // process's connection may have taken from it since `used`.
+        if !ok || !ShmCharge::take(&*s.vm, bytes, pools) {
+            return false;
+        }
+        held.0.charge(self.owner, bytes);
+        held.1.charge(self.owner, pools);
+        true
+    }
+
+    fn give(&self, bytes: u64, pools: u64) {
+        let s = &*self.shares;
+        let mut held = s.held.lock().unwrap_or_else(|p| p.into_inner());
+        ShmCharge::give(&*s.vm, bytes, pools);
+        held.0.refund(self.owner, bytes);
+        held.1.refund(self.owner, pools);
+    }
+}
+
 /// A guest process's share of the queue budget, as the engine's stream sinks
 /// draw on it: bytes a guest sends into a pipe the compositor's side has not
 /// read yet are host memory the guest decides, like its unread output.
@@ -248,6 +337,8 @@ pub struct WlLimits {
     /// Shm memory (what live buffers cover) and pool count, over every
     /// connection (`--wayland-shm-budget`).
     pub shm: Arc<ShmBudget>,
+    /// The same, as guest processes share it.
+    pub shm_shares: Arc<ShmShares>,
     /// Bytes queued for the guest, over every connection
     /// (`--wayland-queue-budget`).
     pub queue: Arc<QueueBudget>,
@@ -353,9 +444,11 @@ impl WlLimits {
     pub const DEFAULT_QUEUE_BYTES: usize = 256 << 20;
 
     pub fn new(max_conns: usize, shm_bytes: u64, queue_bytes: usize) -> Self {
+        let shm = Arc::new(ShmBudget::new(shm_bytes, Self::DEFAULT_SHM_POOLS));
         Self {
             max_conns,
-            shm: Arc::new(ShmBudget::new(shm_bytes, Self::DEFAULT_SHM_POOLS)),
+            shm_shares: Arc::new(ShmShares::new(shm.clone())),
+            shm,
             queue: Arc::new(QueueBudget::new(queue_bytes)),
             lease: Arc::new(LeaseThrottle::default()),
         }
@@ -557,9 +650,10 @@ impl WlConn {
             rewrites: None,
             synth_released: false,
         });
-        engine.set_shm_budget(cfg.limits.shm.clone());
-        if let Some(b) = &cfg.owner_shm {
-            engine.set_shm_budget(b.clone());
+        // A process's share takes from the VM's budget itself.
+        match &cfg.owner_shm {
+            Some(b) => engine.set_shm_budget(b.clone()),
+            None => engine.set_shm_budget(cfg.limits.shm.clone()),
         }
         engine.set_stream_budget(Arc::new(OwnerQueue {
             queue: cfg.limits.queue.clone(),
@@ -640,16 +734,16 @@ impl WlConn {
                 fail(
                     s,
                     &mut st,
-                    Fatal {
-                        object: 1,
-                        code: wlwire::engine::ERR_IMPLEMENTATION,
-                        message: format!(
+                    Fatal::new(
+                        Blame::Channel,
+                        1,
+                        wlwire::engine::ERR_IMPLEMENTATION,
+                        format!(
                             "{submits} lease submits in one frame, more than the {} the VM may \
                              make at once",
                             s.cfg.limits.lease.burst
                         ),
-                        blame: Blame::Channel,
-                    },
+                    ),
                 );
                 return Err(libc::EPROTO);
             }
@@ -841,14 +935,13 @@ fn fail(s: &Shared, st: &mut State, f: Fatal) {
         }
         Blame::Local => log::warn!("wayland: compositor protocol error, closing: {text:?}"),
     }
-    st.engine.drop_channel_output();
+    // Export mode: the host client is the one to tell, as libwayland would
+    // have, after whatever it already has (Engine::end_with).
+    let record = st.engine.end_with(&f);
     if st.engine.local_is_client() {
-        // Export mode: the host client is the one to tell, as libwayland
-        // would have.
-        st.engine.local_out().push(&f.display_error(), Vec::new());
         let _ = st.engine.local_out().flush(s.sock.as_raw_fd());
     }
-    push_final(s, st, f.record());
+    push_final(s, st, record);
     hangup(s, st, libc::EPROTO);
 }
 
@@ -904,6 +997,9 @@ fn reader(s: Arc<Shared>) {
                     Err(f) => fail(&s, &mut st, f),
                 }
             }
+            // Streams that ended: this loop polls afresh each time, so there
+            // is no registration to take out first.
+            drop(st.engine.take_closed_streams());
             (
                 st.engine.local_out_len() > 0,
                 st.engine.stream_interest(),
@@ -996,15 +1092,15 @@ fn reader(s: Arc<Shared>) {
                     fail(
                         &s,
                         &mut st,
-                        Fatal {
-                            object: 1,
-                            code: wlwire::engine::ERR_NO_MEMORY,
-                            message: format!(
+                        Fatal::new(
+                            Blame::Local,
+                            1,
+                            wlwire::engine::ERR_NO_MEMORY,
+                            format!(
                                 "more than {} file descriptors that no message takes",
                                 wlwire::wire::MAX_FDS_QUEUED
                             ),
-                            blame: Blame::Local,
-                        },
+                        ),
                     );
                     break;
                 }
@@ -1085,6 +1181,45 @@ pub(crate) fn export_state(c: &WlConn) -> (usize, bool) {
 mod budget_tests {
     use super::*;
     use crate::quota::Owner;
+
+    fn proc(tgid: u32) -> Owner {
+        Owner::Proc { tgid, start_ns: 1 }
+    }
+
+    /// Four processes at their full share of the VM's shm pools and bytes
+    /// leave the reserve, and a fifth still makes its first pools and
+    /// buffers out of it. Before, each process had a flat quarter and no
+    /// reserve: four took everything, and every other process's first pool
+    /// was refused, which is fatal to it (the 2026-09-29 review, S5).
+    #[test]
+    fn four_processes_at_their_share_leave_room_for_a_fifth() {
+        let limits = WlLimits::new(64, 1 << 30, 1 << 20);
+        let shares = &limits.shm_shares;
+        let (per_pool, per_byte) = (1024 / 4, (1u64 << 30) / 4);
+        for p in 1..=4 {
+            let b = shares.for_owner(proc(p));
+            let mut pools = 0;
+            while pools < per_pool + 1 && b.take(0, 1) {
+                pools += 1;
+            }
+            assert!(pools <= per_pool, "past a quarter of the pools");
+            let mut bytes = 0;
+            while bytes < per_byte + (1 << 20) && b.take(1 << 20, 0) {
+                bytes += 1 << 20;
+            }
+            assert!(bytes <= per_byte, "past a quarter of the bytes");
+        }
+        let (bytes, pools) = limits.shm.used();
+        assert!(pools <= 1024 - 64 && bytes <= (1 << 30) - (1 << 26));
+        // The fifth: its first pools and buffers, up to the floor.
+        let fifth = shares.for_owner(proc(5));
+        assert!(fifth.take(0, 1), "a fifth process's first pool");
+        assert!(fifth.take(8 << 20, 0), "and a buffer in it");
+        // What goes back goes back to the process and the VM both.
+        fifth.give(8 << 20, 1);
+        assert_eq!(shares.held_by(proc(5)), (0, 0));
+        assert_eq!(limits.shm.used(), (bytes, pools));
+    }
 
     /// A process whose channels are never read fills at most its share of
     /// the queue budget, so the connection that crosses the line is its own

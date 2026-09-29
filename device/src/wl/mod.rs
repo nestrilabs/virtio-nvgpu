@@ -18,8 +18,9 @@
 //!
 //! - `OPEN(DEV_WAYLAND, flags = WL_OPEN_CONNECT)` → [`WlConn::open`]; insert
 //!   the connection under a `HandleKind::Wayland` handle and watch the eventfd
-//!   it returns (`W_READY`, or the legacy EVENT_READY on the handle) -- it is
-//!   readable while the connection has something for the guest.
+//!   it returns the legacy way (EV_READY with the handle as cookie; never a
+//!   W_READY watch, which the guest module does not send, `serve.rs`) -- it
+//!   is readable while the connection has something for the guest.
 //! - `WL_SEND` → [`WlConn::send`] with a [`SendOps`] that PRIME-exports on a
 //!   guest file's render handle; reply `WlSendResp`.
 //! - `WL_RECV` → [`WlConn::recv`] with a [`RecvOps`] that adopts descriptors

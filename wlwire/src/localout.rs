@@ -62,6 +62,11 @@ impl LocalOut {
         self.bytes
     }
 
+    /// Descriptors not yet sent.
+    pub fn fds(&self) -> usize {
+        self.segs.iter().map(|s| s.fds.len()).sum()
+    }
+
     /// Write as much as the socket takes. `Ok(true)` when everything went.
     pub fn flush(&mut self, sock: RawFd) -> io::Result<bool> {
         while let Some(s) = self.segs.front_mut() {

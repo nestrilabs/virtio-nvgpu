@@ -158,6 +158,39 @@ pub fn peer_cred(sock: RawFd) -> Option<libc::ucred> {
     (r == 0).then_some(cred)
 }
 
+/// RLIMIT_NOFILE: (soft, hard).
+pub fn nofile_limit() -> io::Result<(u64, u64)> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into a live local.
+    cvt(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) })?;
+    Ok((r.rlim_cur, r.rlim_max))
+}
+
+/// Raise RLIMIT_NOFILE's soft limit to its hard limit, as compositors do
+/// (the soft limit exists for select(), which this process never calls).
+/// The soft limit after.
+pub fn raise_nofile() -> io::Result<u64> {
+    let (soft, hard) = nofile_limit()?;
+    if soft >= hard {
+        return Ok(soft);
+    }
+    set_nofile(hard, hard)?;
+    Ok(hard)
+}
+
+/// Set RLIMIT_NOFILE (a test scales it down this way).
+pub fn set_nofile(soft: u64, hard: u64) -> io::Result<()> {
+    let r = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: setrlimit reads one live rlimit.
+    cvt(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(|_| ())
+}
+
 /// Run `handler` on SIGINT and SIGTERM; it must be async-signal-safe (an
 /// atomic store).
 pub fn on_terminate(handler: extern "C" fn(libc::c_int)) {
@@ -166,4 +199,107 @@ pub fn on_terminate(handler: extern "C" fn(libc::c_int)) {
         // keeps async-signal-safe.
         unsafe { libc::signal(sig, handler as *const () as libc::sighandler_t) };
     }
+}
+
+/// `SO_PEERPIDFD` (Linux 6.5), which older libc crates do not name.
+const SO_PEERPIDFD: libc::c_int = 77;
+
+/// A pidfd for the process at the other end of a Unix socket: the one that
+/// connected, by `SO_PEERPIDFD`, which names that process and never another
+/// that later has its pid. On a kernel without it, `pidfd_open` of the pid
+/// SO_PEERCRED gives, which is right unless the pid was reused in between.
+/// `ESRCH`: the process is gone.
+pub fn peer_pidfd(sock: RawFd, pid: i32) -> io::Result<OwnedFd> {
+    let mut fd: libc::c_int = -1;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `fd`, a live local.
+    let r = unsafe {
+        libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if r == 0 && fd >= 0 {
+        // SAFETY: a descriptor the kernel just installed for this call.
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() != Some(libc::ENOPROTOOPT) {
+        return Err(e);
+    }
+    // SAFETY: integer arguments; the result is a new descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor pidfd_open just returned, known to nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// Whether the process behind `pidfd` has exited (a pidfd is readable from
+/// then on, zombie or reaped).
+pub fn pidfd_exited(pidfd: RawFd) -> bool {
+    let mut p = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live pollfd, no wait.
+    let r = unsafe { libc::poll(&mut p, 1, 0) };
+    r > 0 && p.revents & libc::POLLIN != 0
+}
+
+/// Connect to the Unix socket at `path` without waiting: a listener whose
+/// backlog is full says `WouldBlock` at once instead of stalling the
+/// caller's thread until it accepts.
+pub fn connect_nonblocking(path: &std::path::Path) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: an all-zero sockaddr_un is a valid value; the fields used are
+    // set.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+    }
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    // SAFETY: integer arguments.
+    let fd = cvt(unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    })?;
+    // SAFETY: a descriptor socket() just returned, known to nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: `addr` is a live sockaddr_un of at least `len` bytes, which
+    // the kernel only reads.
+    cvt(unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_un).cast(),
+            len,
+        )
+    })?;
+    Ok(fd.into())
+}
+
+/// A Unix listener at `path` with a backlog of `backlog`, for tests that
+/// need one that fills.
+pub fn listen_unix(
+    path: &std::path::Path,
+    backlog: i32,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    let l = std::os::unix::net::UnixListener::bind(path)?;
+    // SAFETY: integer arguments; listen() again only changes the backlog.
+    cvt(unsafe { libc::listen(l.as_raw_fd(), backlog) })?;
+    Ok(l)
 }

@@ -893,14 +893,18 @@ committed buffer until the compositor releases it, so what is copied then is
 exactly what the compositor may read, and the release is forwarded untouched,
 so the client's pacing stays the compositor's. The guest side only ever reads
 the client's pool, never maps it, so a client that shrinks its pool under the
-proxy gets short copies rather than a crash. The host's memory is charged to a
+proxy gets short copies rather than a crash, and its connection goes on: a
+copy is read as the channel takes it, and what it was counted at is given
+back however short it came. The host's memory is charged to a
 budget per connection, per guest process and per VM before it can be
 written, because it is
 memory the host's OOM killer would not count as the backend's. What is charged
 is what it can come to hold, not the pool's size: the host's copy of a pool is
 made at full size but empty, only the parts a live buffer covers are ever
 written, and those are charged when the buffer is made and freed again when
-the last buffer over them goes. A terminal like foot, which makes a 512 MiB
+the last buffer over them goes -- or, for a buffer destroyed while its surface
+still shows it, when the surface shows something else, since a compositor may
+read it until then. A terminal like foot, which makes a 512 MiB
 pool and scrolls by moving its buffer through it, holds what its buffer takes.
 
 **Bounded both ways.** The host compositor disconnects a client whose output
@@ -910,8 +914,17 @@ translated until the guest takes it, within a budget per connection, per guest
 process and per VM; a guest that stops reading loses the connection rather than
 the backend its memory, and a process that stops reading loses its own
 connection, never another process's. The guest daemon charges each client's
-connection to that client (NVGPU_WL_IOC_CONNECT_FOR), and holds at most 4 MiB
-a client has not read before it stops taking that client's output. The other way, the backend takes no more from the guest while a
+connection to that client's process (NVGPU_WL_IOC_CONNECT_FOR), which it holds
+by a pidfd from the accept: a client whose process has exited by the time the
+kernel has charged it is dropped, since the pid may have gone to another
+process. A guest kernel without CONNECT_FOR charges every connection to the
+daemon instead, and every client then shares the daemon's one share of the
+VM's channels. The daemon holds at most 4 MiB a client has not read,
+counting what its pipes' readers have not taken, before it stops taking
+that client's output. What it holds on clients' behalf in its one process --
+descriptors, and data waiting in pipes -- is shared among client processes
+as the backend shares a VM's budgets: a quarter each, with the last part
+kept for processes that hold little. The other way, the backend takes no more from the guest while a
 compositor that is not reading has too much waiting, and the daemon stops
 reading its client, so the client's own library buffer is where it waits. The
 number of channels one VM may have, and how often it may ask for a lease, are

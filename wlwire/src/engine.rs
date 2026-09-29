@@ -10,7 +10,9 @@
 //!
 //! Every message in either direction is parsed against the generated tables:
 //! the target object must exist and its opcode be known at the object's
-//! version, or the connection ends with a protocol error. That is not
+//! version (for an event from the host's compositor, known at all, as
+//! libwayland-client has it), or the connection ends with a protocol error,
+//! posted where libwayland-server would post it. That is not
 //! pedantry: descriptors travel beside the byte stream and are consumed by
 //! signature, so a message the proxy cannot parse is a message whose
 //! descriptors it cannot count. Parsing also drives the object table (see
@@ -31,11 +33,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::blob::{BlobJob, Blobs};
 use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
+use crate::job::Job;
 use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
 use crate::proto::{self, ArgKind, Dir, FdKind, IfaceId, RewriteKind, iface, op};
-use crate::shm::{Shm, ShmBudget, SyncJob};
+use crate::shm::{Shm, ShmCharge, SyncJob};
 use crate::stream::{ByteBudget, Interest, Streams};
 use crate::sys;
 use crate::wire::{self, At, MAX_MSG, MsgBuilder, Val, peek_header, put_word};
@@ -49,6 +52,9 @@ pub const ERR_IMPLEMENTATION: u32 = 3;
 pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
 /// `wl_shm.error.invalid_fd`.
 pub const ERR_SHM_INVALID_FD: u32 = 2;
+/// `wl_shm.error.invalid_stride`, which libwayland also posts for a pool
+/// size that is not positive.
+pub const ERR_SHM_INVALID_STRIDE: u32 = 1;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -78,6 +84,24 @@ impl Out {
             Out::Unit(u) => u.bytes(),
             Out::Shm(j) => j.remaining() as usize,
             Out::Blob(j) => j.remaining() as usize,
+        }
+    }
+
+    /// Descriptors this holds: a record's to go with it, a blob's source.
+    /// A commit's copy holds its pool, which is counted with the pools.
+    fn fds(&self) -> usize {
+        match self {
+            Out::Unit(u) => u.descs.iter().filter(|d| d.fd.is_some()).count(),
+            Out::Blob(_) => 1,
+            Out::Shm(_) => 0,
+        }
+    }
+
+    fn job_mut(&mut self) -> Option<&mut dyn Job> {
+        match self {
+            Out::Unit(_) => None,
+            Out::Shm(j) => Some(j),
+            Out::Blob(j) => Some(j),
         }
     }
 }
@@ -148,7 +172,8 @@ pub fn printable(s: &str, max: usize) -> String {
 }
 
 impl Fatal {
-    fn new(blame: Blame, object: u32, code: u32, message: impl Into<String>) -> Self {
+    /// `message` is made printable here, whoever made it.
+    pub fn new(blame: Blame, object: u32, code: u32, message: impl Into<String>) -> Self {
         Self {
             object,
             code,
@@ -296,6 +321,8 @@ pub struct Engine {
     out_channel: VecDeque<Out>,
     /// What `out_channel` will put on the channel, in bytes.
     out_bytes: usize,
+    /// Descriptors `out_channel` holds (`Out::fds`).
+    out_fds: usize,
     /// Past this many bytes for the channel, `from_local` stops.
     input_limit: Option<usize>,
     wl_bytes: Vec<u8>,
@@ -325,6 +352,7 @@ impl Engine {
             streams: Streams::new(host),
             out_channel: VecDeque::new(),
             out_bytes: 0,
+            out_fds: 0,
             input_limit,
             wl_bytes: Vec::new(),
             wl_descs: Vec::new(),
@@ -368,7 +396,7 @@ impl Engine {
     /// connection of a VM the same one, so the number of connections does not
     /// multiply what a guest can make the host hold. Called again, a further
     /// budget is added (a guest process's, beside the VM's).
-    pub fn set_shm_budget(&mut self, b: Arc<ShmBudget>) {
+    pub fn set_shm_budget(&mut self, b: Arc<dyn ShmCharge>) {
         self.blobs.add_budget(b.clone());
         self.shm.set_shared_budget(b);
     }
@@ -396,6 +424,24 @@ impl Engine {
             + self.out_local.len()
             + self.streams.held()
             + self.blobs.held() as usize
+    }
+
+    /// Descriptors this engine holds: shm pools, streams (open, and ended
+    /// ones not yet taken back), unfinished blobs, blobs still being sent,
+    /// and descriptors queued either way. What an owner running many
+    /// engines in one process counts against its descriptor limit.
+    pub fn held_fds(&self) -> usize {
+        self.shm.pool_fds() as usize
+            + self.streams.fds()
+            + self.blobs.incoming()
+            + self.out_fds
+            + self.wl_descs.iter().filter(|d| d.fd.is_some()).count()
+            + self.out_local.fds()
+    }
+
+    /// Bytes stream sinks hold for local readers that have not taken them.
+    pub fn stream_held(&self) -> usize {
+        self.streams.held()
     }
 
     /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
@@ -500,8 +546,23 @@ impl Engine {
     pub fn drop_channel_output(&mut self) {
         self.out_channel.clear();
         self.out_bytes = 0;
+        self.out_fds = 0;
         self.wl_bytes.clear();
         self.wl_descs.clear();
+    }
+
+    /// End the connection with `f`: nothing more goes to the channel, a
+    /// local client is told why with `wl_display.error` -- queued after
+    /// what it already has, so it lands after the last whole message and
+    /// never inside one that was partly written -- and the ERROR record for
+    /// the far side is returned, for the caller to send if the far side is
+    /// to know. What the local peer is owed still has to be flushed.
+    pub fn end_with(&mut self, f: &Fatal) -> Unit {
+        self.drop_channel_output();
+        if self.cfg.local == Local::Client {
+            self.out_local.push(&f.display_error(), Vec::new());
+        }
+        f.record()
     }
 
     /// The far side has gone (HANGUP received).
@@ -539,41 +600,49 @@ impl Engine {
             let Some(front) = self.out_channel.front_mut() else {
                 break;
             };
-            let next = match front {
-                Out::Unit(_) => None,
-                Out::Shm(j) => {
-                    let r = j.next_unit();
-                    if let Some((_, got)) = &r {
-                        self.shm.sync_bytes += *got as u64;
-                    }
-                    Some(r)
-                }
-                Out::Blob(j) => Some(j.next_unit()),
-            };
-            match next {
+            let shm = matches!(front, Out::Shm(_));
+            let fds = front.fds();
+            let Some(job) = front.job_mut() else {
                 // A record ready to go.
-                None => {
-                    let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
-                        unreachable!()
-                    };
-                    self.out_bytes -= u.bytes();
-                    n += u.bytes();
-                    out.push_back(u);
+                let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
+                    unreachable!()
+                };
+                self.out_bytes -= u.bytes();
+                self.out_fds -= fds;
+                n += u.bytes();
+                out.push_back(u);
+                continue;
+            };
+            // A job's next record. It was counted at what it had left to
+            // read, and is uncounted by what that goes down by -- not by what
+            // the step says it read, which on a short read is less (job.rs).
+            let before = job.remaining();
+            let step = job.next_unit();
+            let after = job.remaining().min(before);
+            self.out_bytes -= (before - after) as usize;
+            let done = step.is_none() || after == 0;
+            if let Some((u, got)) = step {
+                if shm {
+                    self.shm.sync_bytes += got as u64;
                 }
-                // A job's next record.
-                Some(Some((u, got))) => {
-                    self.out_bytes -= got;
-                    n += u.bytes();
-                    out.push_back(u);
-                }
-                // A job done, or cut short.
-                Some(None) => {
-                    let j = self.out_channel.pop_front().unwrap();
-                    self.out_bytes -= j.bytes();
-                }
+                n += u.bytes();
+                out.push_back(u);
+            }
+            if done {
+                // Done, or cut short: whatever it still claimed goes too.
+                self.out_channel.pop_front();
+                self.out_bytes -= after as usize;
+                self.out_fds -= fds;
             }
         }
         out
+    }
+
+    /// What [`Engine::channel_backlog`] should say, counted afresh from the
+    /// queue: for tests and the fuzzer, which hold the two equal.
+    #[doc(hidden)]
+    pub fn channel_backlog_recount(&self) -> usize {
+        self.out_channel.iter().map(Out::bytes).sum::<usize>() + self.wl_bytes.len()
     }
 
     pub fn has_channel_output(&self) -> bool {
@@ -626,6 +695,12 @@ impl Engine {
         self.streams.interest()
     }
 
+    /// Descriptors of streams that ended, for the caller to stop watching
+    /// before it drops them ([`Streams::take_closed`]).
+    pub fn take_closed_streams(&mut self) -> Vec<OwnedFd> {
+        self.streams.take_closed()
+    }
+
     pub fn stream_io(&mut self, id: u32, readable: bool, writable: bool) {
         let mut out = Vec::new();
         self.streams.io(id, readable, writable, &mut out);
@@ -641,6 +716,7 @@ impl Engine {
     fn push_out(&mut self, o: Out) {
         self.flush_wayland();
         self.out_bytes += o.bytes();
+        self.out_fds += o.fds();
         self.out_channel.push_back(o);
     }
 
@@ -651,9 +727,10 @@ impl Engine {
         let descs = std::mem::take(&mut self.wl_descs);
         let rec = record(frame::REC_WAYLAND, 0, descs.len() as u32, &self.wl_bytes);
         self.wl_bytes.clear();
-        let u = Unit { rec, descs };
+        let u = Out::Unit(Unit { rec, descs });
         self.out_bytes += u.bytes();
-        self.out_channel.push_back(Out::Unit(u));
+        self.out_fds += u.fds();
+        self.out_channel.push_back(u);
     }
 
     fn push_wayland(&mut self, msg: &[u8], descs: Vec<DescOut>) {
@@ -701,7 +778,7 @@ impl Engine {
             if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
                 break Err(Fatal::new(
                     Blame::Local,
-                    h.object,
+                    1,
                     ERR_INVALID_METHOD,
                     "bad message size",
                 ));
@@ -854,7 +931,15 @@ impl Engine {
             Blame::Channel
         };
         let h = peek_header(&msg).unwrap();
-        let err = |code: u32, m: String| Fatal::new(blame, h.object, code, m);
+        // Where libwayland-server posts it: the generic errors (an unknown
+        // object or opcode, bad arguments, a bad new id, out of memory, the
+        // implementation's own) on the display, `wl_display.error`'s object
+        // argument being 1 -- the client may not even know the object the
+        // message named, and then fails to dispatch the error at all -- and
+        // an interface's own errors, and a bad bind, on the object
+        // (wayland-server.c, wl_client_connection_data and registry_bind).
+        let err = |code: u32, m: String| Fatal::new(blame, 1, code, m);
+        let err_on = |code: u32, m: String| Fatal::new(blame, h.object, code, m);
 
         let obj = self
             .objects
@@ -873,7 +958,20 @@ impl Engine {
                 format!("{} has no {:?} opcode {}", ifc.name, dir, h.opcode),
             )
         })?;
-        if desc.since > obj.version {
+        // A request newer than its object is refused, as libwayland-server
+        // refuses it. An event is not checked by libwayland-client (only
+        // that its interface has the opcode), so one from the host's
+        // compositor is passed on as it would reach the client natively:
+        // killing the guest client for a compositor's mistake is not
+        // parity. One from a guest's compositor on its way to a host client
+        // (export mode) is still refused: the host client would call past
+        // the end of a listener made for the object's version, and what a
+        // guest can make a host process call is what must not cross (the
+        // 2026-09-29 review, C4). The message is parsed by its signature
+        // either way, so its descriptors are counted.
+        let from_host_compositor =
+            (self.cfg.side == Side::Host) == (self.cfg.local == Local::Server);
+        if desc.since > obj.version && !(dir == Dir::Event && from_host_compositor) {
             return Err(err(
                 ERR_INVALID_METHOD,
                 format!(
@@ -936,13 +1034,13 @@ impl Engine {
                         unreachable!()
                     };
                     let Some(&(id, max)) = self.registry.offered.get(&name) else {
-                        return Err(err(
+                        return Err(err_on(
                             ERR_INVALID_OBJECT,
                             format!("bind of global {name}, which was not offered"),
                         ));
                     };
                     if iface(id).name.as_bytes() != ifname || version == 0 || version > max {
-                        return Err(err(
+                        return Err(err_on(
                             ERR_INVALID_OBJECT,
                             format!(
                                 "bind of global {name} as {} v{version}; offered {} v{max}",
@@ -1040,8 +1138,8 @@ impl Engine {
                             let size = match args[2].val {
                                 Val::Int(s) if s > 0 => s as u64,
                                 _ => {
-                                    return Err(err(
-                                        ERR_INVALID_METHOD,
+                                    return Err(err_on(
+                                        ERR_SHM_INVALID_STRIDE,
                                         "invalid shm pool size".into(),
                                     ));
                                 }
@@ -1051,7 +1149,7 @@ impl Engine {
                             // not a file whose server decides how long a
                             // read takes (sys::is_shmem).
                             if !sys::is_shmem(fd.as_raw_fd()) {
-                                return Err(err(
+                                return Err(err_on(
                                     ERR_SHM_INVALID_FD,
                                     "an shm pool must be a memfd or a file on tmpfs".into(),
                                 ));
@@ -1234,7 +1332,7 @@ impl Engine {
                         // host process, and naming nothing -- unlike a dma-buf,
                         // whose placeholder only fails that one buffer.
                         None if class == FdKind::Syncobj => {
-                            return Err(err(
+                            return Err(err_on(
                                 ERR_SYNCOBJ_INVALID_TIMELINE,
                                 "import_timeline: the syncobj is not one of the virtio-nvgpu \
                                  device's (a timeline from another DRM device cannot reach \
@@ -1284,7 +1382,7 @@ impl Engine {
                             .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
                     }
                 }
-                (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) if client_side => {
+                (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) => {
                     if let Val::Object(b) = args[0].val {
                         self.shm.attach(obj_id, b);
                     }
@@ -1301,6 +1399,8 @@ impl Engine {
                     self.stats.commits += 1;
                     if client_side {
                         commit_sync = self.shm.commit(obj_id);
+                    } else {
+                        self.shm.commit_server(obj_id);
                     }
                 }
                 (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {

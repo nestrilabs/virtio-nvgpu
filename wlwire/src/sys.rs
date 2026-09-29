@@ -290,15 +290,21 @@ pub fn recv_with_fds(sock: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io:
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
-    // Room for more than libwayland ever sends at once, so nothing is
-    // truncated by us.
-    let mut cbuf = [0u64; 64];
+    // Room for what libwayland sends at most in one sendmsg, and no more:
+    // libwayland's own receiver is sized the same (`CLEN`), and a peer
+    // sending more gets MSG_CTRUNC and is refused, as it would be there. It
+    // also bounds what one read can add to this process's descriptors, which
+    // the guest daemon's budget counts on (daemon.rs, FD_SLACK).
+    let mut cbuf = [0u64; 16];
+    // SAFETY: arithmetic on an integer argument.
+    let clen = unsafe { libc::CMSG_SPACE((MAX_FDS_PER_SENDMSG * 4) as u32) } as usize;
+    assert!(clen <= std::mem::size_of_val(&cbuf));
     // SAFETY: an all-zero msghdr is a valid value; the fields used are set.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr().cast();
-    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+    msg.msg_controllen = clen as _;
     // SAFETY: the kernel writes at most `buf.len()` bytes through `iov` and
     // `msg_controllen` bytes into `cbuf`, both live for the call.
     let n = cvt_s(unsafe {

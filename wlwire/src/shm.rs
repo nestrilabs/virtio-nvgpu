@@ -21,7 +21,8 @@
 //!
 //! The client's descriptor is only ever read with `pread`, never mapped: a
 //! client that truncates its pool under us gets short copies, not a SIGBUS in
-//! the proxy.
+//! the proxy, and its connection goes on: what a copy was counted at on the
+//! channel's backlog is given back however short it came (`job.rs`).
 //!
 //! **What the server's side may hold.** Its memfds are the one place a peer
 //! decides how much memory the proxy commits: every `SHM_SYNC` is written into
@@ -33,8 +34,10 @@
 //! `SHM_SYNC` only ever writes inside a live buffer. A buffer is charged when
 //! it is made, for the pages it touches that no other live buffer of its pool
 //! already does (clients double-buffer in one pool, and overlap), and refused
-//! if that would pass a budget. When the last buffer over a page goes, the
-//! page is punched out of the memfd (`FALLOC_FL_PUNCH_HOLE`) and its charge
+//! if that would pass a budget. When the last buffer over a page goes -- a
+//! buffer destroyed while its surface shows it goes once the surface shows
+//! something else ([`Shm::forget`]) -- the page is punched out of the memfd
+//! (`FALLOC_FL_PUNCH_HOLE`) and its charge
 //! given back; the compositor, which maps the whole pool, reads zeros there,
 //! as it would from a client that punched its own pool. That is how foot runs:
 //! it makes a 512 MiB pool per window and scrolls by sliding one buffer
@@ -66,6 +69,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record_with};
+use crate::job::Job;
 use crate::sys;
 
 /// The largest pool the protocol can make or resize to: its size is an
@@ -274,18 +278,38 @@ impl ShmBudget {
     }
 }
 
+/// Something shm pools and their memory are charged to besides the
+/// connection's own limits: a [`ShmBudget`], or an owner's share of one
+/// (the backend's per-guest-process share of the VM's, which keeps a last
+/// part for processes that hold little). Both of a charge or neither.
+pub trait ShmCharge: Send + Sync {
+    /// `bytes` and `pools` more, or nothing.
+    fn take(&self, bytes: u64, pools: u64) -> bool;
+    /// `bytes` and `pools`, taken before, back.
+    fn give(&self, bytes: u64, pools: u64);
+}
+
+impl ShmCharge for ShmBudget {
+    fn take(&self, bytes: u64, pools: u64) -> bool {
+        ShmBudget::take(self, bytes, pools)
+    }
+    fn give(&self, bytes: u64, pools: u64) {
+        ShmBudget::give(self, bytes, pools)
+    }
+}
+
 /// One pool's share of its budgets: one pool of the count, and the bytes its
 /// live buffers cover. Made before the pool (so a refused pool never has a
 /// memfd), owned by it after, and given back by `Drop` -- once, whichever way
 /// the pool goes.
 pub struct Charge {
-    budgets: Vec<Arc<ShmBudget>>,
+    budgets: Vec<Arc<dyn ShmCharge>>,
     bytes: AtomicU64,
 }
 
 impl Charge {
     /// Take one pool from every budget, or from none.
-    fn take(budgets: Vec<Arc<ShmBudget>>) -> Result<Charge, ShmError> {
+    fn take(budgets: Vec<Arc<dyn ShmCharge>>) -> Result<Charge, ShmError> {
         for (i, b) in budgets.iter().enumerate() {
             if !b.take(0, 1) {
                 for done in &budgets[..i] {
@@ -367,6 +391,9 @@ struct Surface {
     damage_full: bool,
     damage_rows: Option<(u64, u64)>,
     buffers: HashSet<u32>,
+    /// The buffer this surface last committed, destroyed since: what the
+    /// compositor still shows, so its pages stay (see [`Shm::forget`]).
+    retired: Option<Buffer>,
 }
 
 /// Bytes one connection's live buffers may cover, in the server's side's
@@ -390,7 +417,7 @@ pub struct Shm {
     conn: Arc<ShmBudget>,
     /// Budgets shared with other connections: the VM's, and the guest
     /// process's the connection is for, if the owner of the engine set them.
-    shared: Vec<Arc<ShmBudget>>,
+    shared: Vec<Arc<dyn ShmCharge>>,
     pub sync_bytes: u64,
     pub syncs: u64,
 }
@@ -434,23 +461,43 @@ fn union(a: Option<(u64, u64)>, b: (u64, u64)) -> Option<(u64, u64)> {
 impl Shm {
     /// Drop whatever is known about object `id` (it was destroyed, or its id
     /// is being reused).
+    ///
+    /// A buffer destroyed while it is what a surface last committed is not
+    /// let go yet: `wl_buffer.destroy` leaves a pool's contents alone
+    /// natively, and a compositor that reads shm when it paints rather than
+    /// at commit (wlroots' pixman renderer) goes on reading those pages until
+    /// the surface commits something else. Punched now, it would paint
+    /// zeros (the 2026-09-29 review, C3). So the buffer, its pages and their
+    /// charge stay with the surface until its next attach is committed, or
+    /// the surface goes: one buffer per surface at most.
     pub fn forget(&mut self, id: u32) {
         self.pools.remove(&id);
-        if self.buffers.remove(&id).is_some() {
+        if let Some(buf) = self.buffers.remove(&id) {
+            let mut buf = Some(buf);
             for s in self.surfaces.values_mut() {
                 s.buffers.remove(&id);
                 if s.current == id {
                     s.current = 0;
+                    if let Some(b) = buf.take() {
+                        s.retired = Some(b);
+                    }
                 }
             }
         }
         self.surfaces.remove(&id);
     }
 
+    /// Pools this connection holds a descriptor for: every one charged to its
+    /// own count, which a pool leaves only when the last reference to it
+    /// (its id, a buffer made from it, a commit's copy) goes.
+    pub fn pool_fds(&self) -> u64 {
+        self.conn.used().1
+    }
+
     /// Draw on a budget other connections share too (the VM's, a guest
     /// process's), beside this connection's own and any set before. Pools
     /// already made keep what they were charged to.
-    pub fn set_shared_budget(&mut self, b: Arc<ShmBudget>) {
+    pub fn set_shared_budget(&mut self, b: Arc<dyn ShmCharge>) {
         self.shared.push(b);
     }
 
@@ -468,7 +515,7 @@ impl Shm {
     /// charged by the buffers made from it. `TooMany` if this connection or
     /// the VM is at its limit, and then nothing is taken.
     pub fn charge(&self) -> Result<Charge, ShmError> {
-        let mut budgets = vec![self.conn.clone()];
+        let mut budgets: Vec<Arc<dyn ShmCharge>> = vec![self.conn.clone()];
         budgets.extend(self.shared.iter().cloned());
         Charge::take(budgets)
     }
@@ -564,6 +611,17 @@ impl Shm {
         s.damage_rows = union(s.damage_rows, (a, b));
     }
 
+    /// `wl_surface.commit` on the server's side: only what the surface now
+    /// shows, for [`Shm::forget`].
+    pub fn commit_server(&mut self, surface: u32) {
+        if let Some(s) = self.surfaces.get_mut(&surface)
+            && let Some(b) = s.pending.take()
+        {
+            s.current = b;
+            s.retired = None;
+        }
+    }
+
     /// `wl_surface.commit` on the client's side: what the commit needs copied
     /// ahead of it, as a job the channel reads from when it has room
     /// ([`SyncJob`]), not as bytes read now.
@@ -571,6 +629,7 @@ impl Shm {
         let s = self.surfaces.get_mut(&surface)?;
         if let Some(b) = s.pending.take() {
             s.current = b;
+            s.retired = None;
             if b != 0 && self.buffers.contains_key(&b) {
                 s.buffers.insert(b);
             }
@@ -651,16 +710,17 @@ pub struct SyncJob {
     end: u64,
 }
 
-impl SyncJob {
+impl Job for SyncJob {
     /// Bytes still to read.
-    pub fn remaining(&self) -> u64 {
+    fn remaining(&self) -> u64 {
         self.end - self.off
     }
 
     /// The next record, and how many bytes of the buffer it carries; `None`
     /// once done, or where the client's file ends short (it truncated its
-    /// own pool: the compositor keeps what it had there).
-    pub fn next_unit(&mut self) -> Option<(Unit, usize)> {
+    /// own pool: the compositor keeps what it had there, and the rest of the
+    /// copy is not sent).
+    fn next_unit(&mut self) -> Option<(Unit, usize)> {
         if self.off >= self.end {
             return None;
         }

@@ -75,16 +75,13 @@ pub struct WlState {
     /// A refused OPEN was logged; cleared once a channel fits again, so a
     /// guest retrying in a loop costs one line, not one per try.
     cap_logged: bool,
-    /// Each guest process's shm budget, which all its connections share
-    /// (quota.rs): a quarter of the VM's bytes and pools. An entry no
-    /// connection holds any more goes at the next OPEN.
-    owner_shm: HashMap<crate::quota::Owner, Arc<wlwire::shm::ShmBudget>>,
 }
 
 /// A guest process's share of the VM's channels (quota.rs, W1): a quarter,
 /// with the last eighth kept for processes holding at most two. Its
-/// connections' shm is a quarter of the VM's, and their unread output half
-/// of the VM's queue budget (`QueueBudget`). The guest daemon charges each
+/// connections' shm is a quarter of the VM's, with the last sixteenth kept
+/// (`ShmShares`), and their unread output half of the VM's queue budget
+/// (`QueueBudget`). The guest daemon charges each
 /// connection to the client it is for, not to itself (NVGPU_WL_IOC_CONNECT_FOR).
 fn chan_share(max_conns: usize) -> crate::quota::Share {
     let m = max_conns as u64;
@@ -318,38 +315,14 @@ impl NvidiaBackend {
     fn wl_owner_budgets(&mut self, cfg: &mut WlConfig) {
         let owner = self.current_owner;
         cfg.owner = owner;
-        self.wl.owner_shm.retain(|_, b| Arc::strong_count(b) > 1);
-        if owner == crate::quota::Owner::Unknown {
-            cfg.owner_shm = None;
-            return;
-        }
-        let (bytes, pools) = self.wl.limits.shm.limits();
-        let b = self
-            .wl
-            .owner_shm
-            .entry(owner)
-            .or_insert_with(|| {
-                Arc::new(wlwire::shm::ShmBudget::new(
-                    (bytes / 4).max(1),
-                    (pools / 4).max(1),
-                ))
-            })
-            .clone();
-        cfg.owner_shm = Some(b);
+        cfg.owner_shm = (owner != crate::quota::Owner::Unknown)
+            .then(|| self.wl.limits.shm_shares.for_owner(owner));
     }
 
-    /// Guest processes with a shm budget of their own, and the most bytes
-    /// each may cover.
+    /// The VM's shm shares, for tests.
     #[cfg(test)]
-    pub(crate) fn wl_owner_shm(&self) -> (usize, u64) {
-        let max = self
-            .wl
-            .owner_shm
-            .values()
-            .map(|b| b.limits().0)
-            .max()
-            .unwrap_or(0);
-        (self.wl.owner_shm.len(), max)
+    pub(crate) fn wl_shm_shares(&self) -> Arc<crate::wl::conn::ShmShares> {
+        self.wl.limits.shm_shares.clone()
     }
 
     /// Replace descriptor classification, which needs real DRM nodes.

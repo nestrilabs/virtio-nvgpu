@@ -5,9 +5,11 @@
 //! each line at a level: `error` (the daemon cannot go on, or a call that
 //! should not fail did), `warn` (a client or the host ended a connection, a
 //! budget was hit), `info` (what the daemon is serving), `debug`. The level
-//! is `info` unless `NVGPU_WL_LOG` or `--log` says otherwise; lines a guest
-//! client can cause are also rate-limited (`daemon::LogLimit`), whatever the
-//! level.
+//! is `info` unless `NVGPU_WL_LOG` or `--log` says otherwise. Lines a guest
+//! client can cause, the accept failures it can bring about among them, are
+//! also rate-limited, per call site (`daemon::Logs`), whatever the level;
+//! what goes through `say` here unmetered is said once per run (start,
+//! configuration, a fatal error).
 
 #![forbid(unsafe_code)]
 

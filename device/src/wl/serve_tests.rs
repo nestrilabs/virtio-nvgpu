@@ -683,11 +683,12 @@ fn one_guest_process_cannot_take_every_wayland_channel() {
     }
     assert_eq!(mine, 4, "a quarter of 16");
     assert_eq!(open_for(&mut be, 7).0, -libc::EMFILE);
-    // All of its connections draw on one shm budget, a quarter of the VM's.
-    assert_eq!(be.wl_owner_shm(), (1, 1 << 28));
+    // All of its connections draw on the VM's shm within one share: a
+    // quarter, with the last sixteenth kept for processes that hold little.
+    let s = be.wl_shm_shares().byte_share();
+    assert_eq!((s.per_owner, s.reserve), (1 << 28, 1 << 26));
     let (st, h) = open_for(&mut be, 8);
     assert_eq!(st, 0, "another process still gets a window");
-    assert_eq!(be.wl_owner_shm().0, 2, "and a budget of its own");
     assert_eq!(
         be.handles.owner(h),
         crate::quota::Owner::Proc {

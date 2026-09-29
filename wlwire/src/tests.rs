@@ -644,8 +644,12 @@ impl Pair {
         p
     }
 
-    /// Move everything queued on either side across, until quiet.
+    /// Move everything queued on either side across, until quiet; and close
+    /// the streams either side ended, as its event loop would once it had
+    /// stopped watching them.
     fn pump(&mut self) {
+        drop(self.g.take_closed_streams());
+        drop(self.h.take_closed_streams());
         loop {
             let mut moved = false;
             let mut q = self.g.take_units();
@@ -870,6 +874,101 @@ fn unknown_objects_opcodes_and_versions_are_fatal() {
     assert!(e.message.contains("needs version 4"), "{}", e.message);
 }
 
+/// What an engine says it holds in descriptors is what it holds: the guest
+/// daemon shares its descriptor limit among clients by this count.
+#[test]
+fn an_engine_counts_the_descriptors_it_holds() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(2, "wl_shm", 2), (3, "wl_data_device_manager", 3)]);
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (0, 0));
+    p.client_sends(
+        &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(5)
+            .int(4096)
+            .finish()],
+        vec![sys::memfd(c"p", 4096).unwrap()],
+    )
+    .unwrap();
+    // The client's pool here; the memfd there, and the copy of it waiting
+    // for the compositor.
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (1, 2));
+    p.at_server();
+    assert_eq!(p.h.held_fds(), 1);
+    p.client_sends(
+        &[MsgBuilder::new(5, op::wl_shm_pool::REQ_DESTROY).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (0, 0));
+}
+
+/// Errors go where libwayland-server posts them: the generic ones on the
+/// display (object 1), a bad bind on the registry, and an interface's own
+/// on its object. Before, every error named the object the message did,
+/// so a client told "invalid object 99" could not dispatch the error at
+/// all (it knows no 99), and `no_memory` on `wl_shm` read as
+/// `wl_shm.error.invalid_fd` (the 2026-09-29 review, C2).
+#[test]
+fn errors_are_posted_on_the_object_libwayland_posts_them_on() {
+    let setup = || {
+        let mut p = Pair::new(Policy::default());
+        p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+        p.bind(1, "wl_compositor", 6, 3).unwrap();
+        p.bind(2, "wl_shm", 2, 4).unwrap();
+        p
+    };
+    let on = |e: Fatal| (e.object, e.code);
+    let mut p = setup();
+    let e = p.client_sends(&[MsgBuilder::new(99, 0).finish()], vec![]);
+    assert_eq!(on(e.unwrap_err()), (1, ERR_INVALID_OBJECT));
+    let mut p = setup();
+    let e = p.client_sends(&[MsgBuilder::new(3, 9).finish()], vec![]);
+    assert_eq!(on(e.unwrap_err()), (1, ERR_INVALID_METHOD));
+    let mut p = setup();
+    assert_eq!(
+        on(p.bind(7, "wl_seat", 1, 5).unwrap_err()),
+        (2, ERR_INVALID_OBJECT)
+    );
+    // A pool that is not memory: wl_shm's own invalid_fd, on wl_shm.
+    let mut p = setup();
+    let (_r, w) = sys::pipe().unwrap();
+    let e = p.client_sends(
+        &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(5)
+            .int(4096)
+            .finish()],
+        vec![w],
+    );
+    assert_eq!(on(e.unwrap_err()), (4, ERR_SHM_INVALID_FD));
+    // A buffer past the connection's budget: no_memory, on the display.
+    let mut p = setup();
+    let size = i32::MAX & !4095;
+    let e = p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(size)
+                .finish(),
+            MsgBuilder::new(5, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(6)
+                .int(0)
+                .int(4096)
+                .int(size / 16384)
+                .int(16384)
+                .uint(0)
+                .finish(),
+        ],
+        vec![sys::memfd(c"big", size as u64).unwrap()],
+    );
+    assert_eq!(on(e.unwrap_err()), (1, ERR_NO_MEMORY));
+    // And what a client is told is what the error says.
+    let f = Fatal::new(Blame::Local, 1, ERR_INVALID_OBJECT, "x");
+    let m = f.display_error();
+    assert_eq!(wire::peek_header(&m).unwrap().object, 1);
+    assert_eq!(u32::from_ne_bytes(m[8..12].try_into().unwrap()), 1);
+}
+
 #[test]
 fn a_request_on_a_destroyed_object_is_fatal_but_late_events_still_parse() {
     let mut p = Pair::new(Policy::default());
@@ -1008,6 +1107,251 @@ fn shm_contents_reach_the_host_memfd_at_commit_and_only_the_damage_after() {
         5,
         "the commits themselves still reach the compositor"
     );
+}
+
+/// An engine facing a client, on `side`, with wl_seat v1 bound as 3 from a
+/// compositor that offers v9.
+fn seat_v1(side: Side) -> Engine {
+    let mut e = Engine::new(EngineConfig {
+        side,
+        local: Local::Client,
+        policy: Policy::default(),
+        rewrites: None,
+        synth_released: false,
+    });
+    let mut plat = TestPlat::default();
+    let mut m = MsgBuilder::new(1, op::wl_display::REQ_GET_REGISTRY)
+        .new_id(2)
+        .finish();
+    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
+        .unwrap();
+    let g = MsgBuilder::new(2, op::wl_registry::EVT_GLOBAL)
+        .uint(1)
+        .string(Some("wl_seat"))
+        .uint(9)
+        .finish();
+    e.from_channel(&wayland_frame(&[g]), vec![], &mut plat)
+        .unwrap();
+    let mut m = MsgBuilder::new(2, op::wl_registry::REQ_BIND)
+        .uint(1)
+        .generic_new_id("wl_seat", 1, 3)
+        .finish();
+    e.from_local(&mut m, &mut VecDeque::new(), &mut plat)
+        .unwrap();
+    e
+}
+
+/// An event newer than its object's version is passed on from the host's
+/// compositor, as libwayland-client, which checks no version for events,
+/// would take it natively; before, the guest client was killed for the
+/// compositor's mistake. From a guest's compositor to a host client (export
+/// mode) it is still refused: a host process would call past the end of a
+/// listener made for the object's version (the 2026-09-29 review, C4).
+#[test]
+fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
+    let name = MsgBuilder::new(3, op::wl_seat::EVT_NAME)
+        .string(Some("seat0"))
+        .finish();
+    let mut g = seat_v1(Side::Guest);
+    g.from_channel(
+        &wayland_frame(std::slice::from_ref(&name)),
+        vec![],
+        &mut TestPlat::default(),
+    )
+    .unwrap();
+    let (msgs, _) = flatten(g.local_out().drain());
+    assert!(msgs.ends_with(&name));
+    let mut h = seat_v1(Side::Host);
+    let e = h
+        .from_channel(
+            &wayland_frame(std::slice::from_ref(&name)),
+            vec![],
+            &mut TestPlat::default(),
+        )
+        .unwrap_err();
+    assert!(e.message.contains("needs version 2"), "{}", e.message);
+    // A request newer than its object is refused either way.
+    let mut m = MsgBuilder::new(3, op::wl_seat::REQ_RELEASE).finish();
+    let e = g
+        .from_local(&mut m, &mut VecDeque::new(), &mut TestPlat::default())
+        .unwrap_err();
+    assert!(e.message.contains("needs version 5"), "{}", e.message);
+}
+
+/// A buffer destroyed while its surface still shows it keeps its pages in
+/// the compositor's pool until the surface commits something else, as
+/// natively (destroying a wl_buffer leaves the pool alone): a compositor
+/// that reads shm when it paints goes on reading them. Before, they were
+/// punched at the destroy, and it painted zeros (the 2026-09-29 review, C3).
+#[test]
+fn a_destroyed_buffer_keeps_its_pages_while_its_surface_shows_it() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    let page = pg() as i32;
+    let pixels: Vec<u8> = (0..2 * page as usize)
+        .map(|i| (i % 251) as u8 + 1)
+        .collect();
+    let buffer = |id: u32, offset: i32| {
+        MsgBuilder::new(5, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(id)
+            .int(offset)
+            .int(page / 4)
+            .int(1)
+            .int(page)
+            .uint(0)
+            .finish()
+    };
+    let show = |id: u32| {
+        vec![
+            MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
+                .object(id)
+                .int(0)
+                .int(0)
+                .finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish(),
+        ]
+    };
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(2 * page)
+                .finish(),
+            buffer(6, 0),
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(7)
+                .finish(),
+        ],
+        vec![memfd_with(&pixels)],
+    )
+    .unwrap();
+    let host = host_pool(&mut p);
+    p.client_sends(&show(6), vec![]).unwrap();
+    let first = &pixels[..page as usize];
+    assert_eq!(&read_all(&host)[..page as usize], first);
+    // Destroyed while shown: still there.
+    p.client_sends(
+        &[MsgBuilder::new(6, op::wl_buffer::REQ_DESTROY).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        &read_all(&host)[..page as usize],
+        first,
+        "punched while shown"
+    );
+    // A commit without an attach shows the same buffer still.
+    p.client_sends(
+        &[MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(&read_all(&host)[..page as usize], first);
+    // Another buffer shown: the first's pages go, and their charge.
+    p.client_sends(&[buffer(8, page)], vec![]).unwrap();
+    p.client_sends(&show(8), vec![]).unwrap();
+    assert!(read_all(&host)[..page as usize].iter().all(|&b| b == 0));
+    assert_eq!(allocated(&host), pg());
+    // And the surface going takes a shown, destroyed buffer with it.
+    p.client_sends(
+        &[
+            MsgBuilder::new(8, op::wl_buffer::REQ_DESTROY).finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_DESTROY).finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(allocated(&host), 0);
+}
+
+/// A client with wl_compositor (3), wl_shm (4) and a surface (5), whose
+/// 8 MiB buffer 7 in pool 6 it then truncates to `left` bytes behind the
+/// proxy's back before committing it; the commit, and a `wl_display.sync`
+/// after it, as they are taken.
+fn commit_a_truncated_pool(left: u64) -> Pair {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    let (stride, height) = (4096i32, 2048i32);
+    let pool = sys::memfd(c"pool", (stride * height) as u64).unwrap();
+    let keep = pool.try_clone().unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(5)
+                .finish(),
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(6)
+                .int(stride * height)
+                .finish(),
+            MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(7)
+                .int(0)
+                .int(stride / 4)
+                .int(height)
+                .int(stride)
+                .uint(0)
+                .finish(),
+        ],
+        vec![pool],
+    )
+    .unwrap();
+    p.at_server();
+    sys::ftruncate(keep.as_raw_fd(), left).unwrap();
+    let mut data = [
+        MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+            .object(7)
+            .int(0)
+            .int(0)
+            .finish(),
+        MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish(),
+        MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish(),
+    ]
+    .concat();
+    let mut fds = VecDeque::new();
+    for _ in 0..8 {
+        p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+        assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
+        p.pump();
+        assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
+    }
+    assert!(
+        data.is_empty(),
+        "{} bytes of input left untaken: the connection is wedged",
+        data.len()
+    );
+    p
+}
+
+/// A client that shrinks its own pool before a commit's copy is read gets a
+/// short copy, and nothing else happens to it: what the copy was counted at
+/// on the channel's backlog is given back however short the read came, so
+/// the backlog drains and its later requests are taken. Before, only the
+/// bytes read were given back, and the rest of the buffer stayed counted for
+/// good: past the input limit, the client's input was never read again
+/// (the 2026-09-29 review, S2).
+#[test]
+fn a_client_that_truncates_its_pool_gets_a_short_copy_and_is_not_wedged() {
+    for left in [0, 4096, 5 << 20] {
+        let mut p = commit_a_truncated_pool(left);
+        assert_eq!(p.g.channel_backlog(), 0, "left {left}");
+        assert!(!p.g.input_blocked());
+        let (msgs, _) = p.at_server();
+        let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish();
+        assert!(
+            msgs.ends_with(&sync),
+            "the sync after the commit reached the compositor (left {left})"
+        );
+        let (_, synced) = p.g.shm_stats();
+        assert_eq!(synced, left, "the copy is as long as the pool is");
+    }
 }
 
 #[test]
@@ -1634,6 +1978,7 @@ fn a_data_offer_pipe_becomes_a_stream_with_an_explicit_end() {
         }
         p.pump();
     }
+    p.pump();
     let mut buf = [0u8; 64];
     let n = sys::read(client_rd.as_raw_fd(), &mut buf).unwrap();
     assert_eq!(&buf[..n], b"hello from the host");

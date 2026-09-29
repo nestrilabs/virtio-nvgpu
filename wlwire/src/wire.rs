@@ -108,6 +108,10 @@ fn string(buf: &[u8], off: usize) -> Result<(Option<&[u8]>, usize), WireError> {
     }
     let end = off + 4 + len;
     let body = buf.get(off + 4..end).ok_or(WireError::Short)?;
+    // Terminated, and no NUL before the end: as libwayland's demarshaller
+    // has it too ("string has embedded nul", connection.c), and a string the
+    // proxy judges (an interface name bound or offered) must be the string
+    // the peer's C code reads, not a longer one it cut at the first NUL.
     if body[len - 1] != 0 || body[..len - 1].contains(&0) {
         return Err(WireError::BadString);
     }
