@@ -44,7 +44,8 @@ const POOL_DEPTH: usize = 4;
 /// by its base address: zero through its reach, its guard page `PROT_NONE`,
 /// owned by the pool alone.
 #[cfg(not(miri))]
-static POOL: Mutex<[Vec<usize>; POOL_PAGES + 1]> = Mutex::new([const { Vec::new() }; POOL_PAGES + 1]);
+static POOL: Mutex<[Vec<usize>; POOL_PAGES + 1]> =
+    Mutex::new([const { Vec::new() }; POOL_PAGES + 1]);
 
 pub struct GuardedBuf {
     base: *mut u8,
@@ -292,8 +293,14 @@ mod tests {
             drop(b);
             let mut c = GuardedBuf::new(len).expect("mapped");
             assert_eq!(c.len(), len);
-            assert!(c.as_slice().iter().all(|&x| x == 0), "len {len}: stale bytes");
-            assert!(c.with_slack().iter().all(|&x| x == 0), "len {len}: stale slack");
+            assert!(
+                c.as_slice().iter().all(|&x| x == 0),
+                "len {len}: stale bytes"
+            );
+            assert!(
+                c.with_slack().iter().all(|&x| x == 0),
+                "len {len}: stale slack"
+            );
             assert_eq!(c.mapped, ((len + SLACK).div_ceil(PAGE) + 1) * PAGE);
             // Only a test's other threads could have taken `first` meanwhile.
             let _ = first;
@@ -305,7 +312,9 @@ mod tests {
     fn the_pool_is_bounded_and_takes_no_large_buffers() {
         #[cfg(not(miri))]
         {
-            let many: Vec<_> = (0..3 * POOL_DEPTH).map(|_| GuardedBuf::new(200).unwrap()).collect();
+            let many: Vec<_> = (0..3 * POOL_DEPTH)
+                .map(|_| GuardedBuf::new(200).unwrap())
+                .collect();
             drop(many);
             let big = GuardedBuf::new(POOL_PAGES * PAGE).unwrap();
             let pages = big.mapped / PAGE - 1;

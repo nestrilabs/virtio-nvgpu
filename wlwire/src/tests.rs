@@ -464,7 +464,12 @@ fn a_packed_frame_carries_every_record_in_order() {
     let mut q = VecDeque::new();
     let mut want = Vec::new();
     for i in 0..40u32 {
-        let r = frame::record(frame::REC_SHM_SYNC, i, i * 3, &vec![i as u8; (i as usize) * 37]);
+        let r = frame::record(
+            frame::REC_SHM_SYNC,
+            i,
+            i * 3,
+            &vec![i as u8; (i as usize) * 37],
+        );
         want.extend_from_slice(&r);
         q.push_back(frame::Unit {
             rec: r,
