@@ -405,6 +405,83 @@ int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len) {
   return nvgpu_tbuf_copy(tb, off, NULL, NULL, len, NVGPU_TB_ZERO);
 }
 
+/* ───────── Frame-pacing counters ───────── */
+
+/*
+ * Per message type: calls and the sum of their round trips; for all of them
+ * two histograms in powers of two of a microsecond (bucket 0 under 1 us, the
+ * last everything past 2^(n-2) us): the round trip (request on the ring ->
+ * the callback that took the answer off), and the wake (that callback -> the
+ * caller running again), which is this guest's scheduler and the vCPU's.
+ * Relaxed atomics: a few increments against a VM exit per call.
+ */
+#define NVGPU_PACE_TYPES 18
+#define NVGPU_PACE_BUCKETS 18
+
+static struct {
+  atomic64_t calls[NVGPU_PACE_TYPES];
+  atomic64_t rtt_ns[NVGPU_PACE_TYPES];
+  atomic64_t rtt[NVGPU_PACE_BUCKETS];
+  atomic64_t wake[NVGPU_PACE_BUCKETS];
+  atomic64_t ctr[NVGPU_PACE_CTRS];
+} nvgpu_pace;
+
+void nvgpu_pace_inc(enum nvgpu_pace_ctr c) {
+  atomic64_inc(&nvgpu_pace.ctr[c]);
+}
+
+static unsigned int nvgpu_pace_bucket(u64 ns) {
+  u64 us = div_u64(ns, NSEC_PER_USEC);
+
+  return us ? min_t(unsigned int, fls64(us), NVGPU_PACE_BUCKETS - 1) : 0;
+}
+
+static void nvgpu_pace_call(u32 type, u64 t0, u64 t1, u64 t2) {
+  u32 i = type < NVGPU_PACE_TYPES ? type : 0;
+
+  if (!t0 || t1 < t0 || t2 < t1)
+    return;
+  atomic64_inc(&nvgpu_pace.calls[i]);
+  atomic64_add(t1 - t0, &nvgpu_pace.rtt_ns[i]);
+  atomic64_inc(&nvgpu_pace.rtt[nvgpu_pace_bucket(t1 - t0)]);
+  atomic64_inc(&nvgpu_pace.wake[nvgpu_pace_bucket(t2 - t1)]);
+}
+
+static int nvgpu_pace_get(char *buf, const struct kernel_param *kp) {
+  static const char *const ctr[NVGPU_PACE_CTRS] = {
+      "sowait_waits", "sowait_polls",  "sowait_sleeps",
+      "sowait_woken", "sowait_naps",   "sowait_overcap",
+      "ev_batches",   "ev_records",    "ev_legacy"};
+  int n = 0, i;
+
+  for (i = 0; i < NVGPU_PACE_TYPES; i++) {
+    s64 c = atomic64_read(&nvgpu_pace.calls[i]);
+
+    if (c)
+      n += scnprintf(buf + n, PAGE_SIZE - n, "type %d: %lld calls, rtt %lld ns mean\n",
+                     i, c, div64_s64(atomic64_read(&nvgpu_pace.rtt_ns[i]), c));
+  }
+  n += scnprintf(buf + n, PAGE_SIZE - n, "rtt_us_log2:");
+  for (i = 0; i < NVGPU_PACE_BUCKETS; i++)
+    n += scnprintf(buf + n, PAGE_SIZE - n, " %lld", atomic64_read(&nvgpu_pace.rtt[i]));
+  n += scnprintf(buf + n, PAGE_SIZE - n, "\nwake_us_log2:");
+  for (i = 0; i < NVGPU_PACE_BUCKETS; i++)
+    n += scnprintf(buf + n, PAGE_SIZE - n, " %lld", atomic64_read(&nvgpu_pace.wake[i]));
+  n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
+  for (i = 0; i < NVGPU_PACE_CTRS; i++)
+    n += scnprintf(buf + n, PAGE_SIZE - n, "%s %lld\n", ctr[i],
+                   atomic64_read(&nvgpu_pace.ctr[i]));
+  return n;
+}
+
+static const struct kernel_param_ops nvgpu_pace_ops = {
+    .get = nvgpu_pace_get,
+};
+/* Root only: the calls of every process in the guest, as they happen. */
+module_param_cb(pacing, &nvgpu_pace_ops, NULL, 0400);
+MODULE_PARM_DESC(pacing, "frame-pacing counters: round trips per message "
+                         "type, their latency, syncobj waits, events");
+
 /* ───────── Control queue ───────── */
 
 struct nvgpu_times {
@@ -635,6 +712,8 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
   }
 
   ret = r->dead ? -ENODEV : 0;
+  if (!ret)
+    nvgpu_pace_call(le32_to_cpu(hdr.msg_type), t0, r->t1, ktime_get_ns());
   /*
    * The backend echoes the id (0 only in the bare header of a transport
    * refusal, which answers a request it could not read). It is not used to
@@ -1732,6 +1811,7 @@ static void nvgpu_ev_record(struct nvgpu_device *dev, u32 kind, u64 cookie,
                             const void *payload, u32 len) {
   struct nvgpu_events *ev = dev->events;
 
+  nvgpu_pace_inc(NVGPU_PACE_EV_RECORDS);
   switch (kind) {
   case NVGPU_EV_DRM:
     nvgpu_ev_call(ev, NVGPU_EVKEY_HANDLE(cookie), kind, cookie, payload, len);
@@ -1742,6 +1822,7 @@ static void nvgpu_ev_record(struct nvgpu_device *dev, u32 kind, u64 cookie,
   case NVGPU_EV_READY:
     if (cookie <= U32_MAX) {
       /* A legacy watch: every opened handle has one, cookie == handle. */
+      nvgpu_pace_inc(NVGPU_PACE_EV_LEGACY);
       nvgpu_ev_call(ev, NVGPU_EVKEY_HANDLE(cookie), kind, cookie, payload,
                     len);
       nvgpu_event_deliver(dev, (u32)cookie);
@@ -1825,6 +1906,7 @@ static void nvgpu_event_dispatch(struct nvgpu_device *dev, const u8 *buf,
   p = buf + sizeof(*hdr);
   end = p + payload;
 
+  nvgpu_pace_inc(NVGPU_PACE_EV_BATCHES);
   spin_lock_irqsave(&ev->lock, flags);
   while ((size_t)(end - p) >= sizeof(struct nvgpu_ev_rec)) {
     const struct nvgpu_ev_rec *rec = (const void *)p;

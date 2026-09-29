@@ -5,7 +5,7 @@
 # the application's own frame times (MangoHud's `frametime`, the interval
 # between successive presents), per frame.
 #
-# Usage: rig/rig-framepace.sh <workload> <native|vm> <tag> [runs]
+# Usage: rig/rig-framepace.sh <workload> <native|vm> <tag> [runs [first]]
 #   workload  vkcube        vkcube, FIFO (vsync), native Wayland
 #             vkcube-mbox   vkcube --present_mode 1 (mailbox)
 #             vkmark        vkmark's `shading` scene, FIFO
@@ -16,7 +16,8 @@
 #   vm        rig/run-guest.sh --wayland-socket <session> run (the `run`
 #             probe), every one of its knobs (NVGPU_VCPUS, NVGPU_VMM_KIND,
 #             NVGPU_MEM_MIB, ...) as the environment has them
-#   runs      how many times, one after another (default 3)
+#   runs      how many times, one after another (default 3), numbered from
+#             first (default 1): interleaving native and vm runs of one tag
 #
 # Environment:
 #   NVGPU_FP_MON     the monitor (default DP-3): its active workspace takes
@@ -28,6 +29,9 @@
 #   NVGPU_FP_SECS    seconds logged (default 20)
 #   NVGPU_FP_BACKEND_ARGS  words for the backend (run-guest.sh's -- args)
 #   NVGPU_FP_FULLSCREEN=0  leave the window as the app made it
+#   NVGPU_FP_LOAD    stress-ng arguments for a host load that runs through
+#                    each run (a busy desktop, reproducibly), e.g.
+#                    "--cpu 32 --cpu-load 50"
 #
 # Nothing is typed or clicked into the session. Results: .rig/logs/fp/<tag>/
 # <workload>-<mode>-<n>.csv, the guest's console and backend logs beside them,
@@ -36,8 +40,8 @@ set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
 export NVGPU_RIG=$RIG
-[ $# -ge 3 ] || { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
-WL=$1 MODE=$2 TAG=$3 RUNS=${4:-3}
+[ $# -ge 3 ] || { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+WL=$1 MODE=$2 TAG=$3 RUNS=${4:-3} FIRST=${5:-1}
 MON=${NVGPU_FP_MON:-DP-3}
 WARM=${NVGPU_FP_WARM:-6}
 SECS=${NVGPU_FP_SECS:-20}
@@ -90,7 +94,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 {
     echo "# $(date -Is) $WL $MODE on $MON (${HZ} Hz, workspace $WS), render:direct_scanout=$DS"
-    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-}"
+    echo "# warm ${WARM}s, logged ${SECS}s; VM: vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-4096} vmm=${NVGPU_VMM_KIND:-nesbox} pins=${NVGPU_VCPU_PINS:-} affinity=${NVGPU_CPU_AFFINITY:-} io=${NVGPU_IO_AFFINITY:-} hugepages=${NVGPU_HUGEPAGES:-} backend=${NVGPU_FP_BACKEND_ARGS:-} load=${NVGPU_FP_LOAD:-}"
 } >>"$OUT/summary.txt"
 
 run_native() { # run_native N
@@ -113,14 +117,29 @@ run_native() { # run_native N
 
 run_vm() { # run_vm N
     local tag=fp-$TAG-$WL-$1 gcmd
-    gcmd="mkdir -p /tmp/fp; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(find /tmp/fp -maxdepth 1 -name \"*.csv\" ! -name \"*_summary.csv\" | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; tail -n 20 /tmp/fp/app.log; true"
+    gcmd="mkdir -p /tmp/fp; HOME=/root MANGOHUD_CONFIG='$MH,output_folder=/tmp/fp' timeout -s TERM -k 3 $TOTAL sh -c '$CMD' >/tmp/fp/app.log 2>&1; f=\$(find /tmp/fp -maxdepth 1 -name \"*.csv\" ! -name \"*_summary.csv\" | head -n 1); echo FP_CSV_BEGIN; cat \"\$f\"; echo FP_CSV_END; echo FP_PACING_BEGIN; cat /sys/module/virtio_gpu_nv/parameters/pacing 2>/dev/null; echo FP_PACING_END; tail -n 20 /tmp/fp/app.log; true"
     local extra=()
     [ -n "${NVGPU_FP_BACKEND_ARGS:-}" ] && read -r -a extra <<<"$NVGPU_FP_BACKEND_ARGS"
+    # How the host scheduled the VMM's and the backend's threads while the
+    # log runs (framepace-sched.py): the guest boots in about 10 s.
+    (
+        sleep $((WARM + 12))
+        pids=$(pgrep -n -x nesbox || pgrep -n -x crosvm)
+        pids="$pids $(pgrep -n -f 'vhost-user-nvgpu')"
+        python3 "$REPO/rig/framepace-sched.py" $((SECS > 6 ? SECS - 4 : 2)) $pids >"$OUT/$WL-vm-$1.sched.txt" 2>&1
+    ) &
     NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((TOTAL + 90))} \
         NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=$((TOTAL + 60)) nvgpu_cmd=$(printf %s "$gcmd" | base64 -w0) ${NVGPU_CMDLINE_EXTRA:-}" \
         "$REPO/rig/run-guest.sh" --wayland-socket "$SESSION" run "$tag" ${extra[@]+-- "${extra[@]}"} \
         >"$OUT/$WL-vm-$1.launcher.log" 2>&1
     tr -d '\r' <"$RIG/logs/$tag.console.log" | sed -n '/^FP_CSV_BEGIN/,/^FP_CSV_END/p' | sed '1d;$d' >"$OUT/$WL-vm-$1.csv"
+    # The two sides' pacing counters: the guest driver's, printed after the
+    # log, and the backend's teardown report (device::pacing).
+    {
+        tr -d '\r' <"$RIG/logs/$tag.console.log" | sed -n '/^FP_PACING_BEGIN/,/^FP_PACING_END/p' | sed '1d;$d' |
+            sed 's/^/guest: /'
+        grep -a 'pacing:' "$RIG/logs/$tag.backend.log" | sed 's/^.*\] //'
+    } >"$OUT/$WL-vm-$1.pacing.txt"
     cp "$RIG/logs/$tag.backend.log" "$OUT/$WL-vm-$1.backend.log" 2>/dev/null
     cp "$RIG/logs/$tag.console.log" "$OUT/$WL-vm-$1.console.log" 2>/dev/null
     [ -s "$OUT/$WL-vm-$1.csv" ] || rm -f "$OUT/$WL-vm-$1.csv"
@@ -155,16 +174,23 @@ place() {
 }
 
 files=()
-for n in $(seq 1 "$RUNS"); do
+for n in $(seq "$FIRST" $((FIRST + RUNS - 1))); do
     dpms on
     sleep 1
     echo "# run $n" >>"$OUT/placement.log"
     place &
+    load=
+    if [ -n "${NVGPU_FP_LOAD:-}" ]; then
+        # shellcheck disable=SC2086 # words for stress-ng
+        nix shell nixpkgs#stress-ng -c stress-ng $NVGPU_FP_LOAD --quiet >/dev/null 2>&1 &
+        load=$!
+    fi
     case $MODE in
         native) run_native "$n" ;;
         vm) run_vm "$n" ;;
         *) echo "mode: native or vm" >&2; exit 2 ;;
     esac
+    [ -z "$load" ] || { pkill -TERM -P "$load" 2>/dev/null; kill "$load" 2>/dev/null; pkill -x stress-ng 2>/dev/null; }
     wait
     dpms off
     f=$OUT/$WL-$MODE-$n.csv

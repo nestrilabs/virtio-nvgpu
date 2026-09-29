@@ -1315,6 +1315,9 @@ impl NvidiaBackend {
         // `--window-owner-share` are chosen by (DEPLOY.md), so it is kept
         // at the default log level.
         log::warn!("window use: {}", self.shm.usage_summary());
+        // What crossed the boundary, how often and how fast (pacing.rs):
+        // what frame pacing is judged by, at the same level.
+        crate::pacing::log_summary();
         if !self.abi_refused.is_empty() {
             let verb = if self.abi_policy == AbiPolicy::Enforce {
                 "refused"

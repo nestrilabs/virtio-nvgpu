@@ -56,6 +56,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
@@ -750,6 +751,13 @@ impl NvidiaBackend {
         let mut regs = std::mem::take(&mut self.syncobj_regs);
         let r = regs.watch_by(&HostSyncobj, self, render_fd, key, cookie, owner);
         self.syncobj_regs = regs;
+        let p = &crate::pacing::PACING;
+        match r {
+            Ok(Watched::New) => p.watch_new.fetch_add(1, Relaxed),
+            Ok(Watched::Joined(_)) => p.watch_joined.fetch_add(1, Relaxed),
+            Err(libc::EAGAIN) => p.watch_over_cap.fetch_add(1, Relaxed),
+            Err(_) => 0,
+        };
         match r? {
             Watched::New => Ok(vec![cookie, 0]),
             Watched::Joined(c) => Ok(vec![c, 1]),

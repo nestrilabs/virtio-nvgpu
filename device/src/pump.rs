@@ -63,7 +63,9 @@ use std::time::{Duration, Instant};
 
 use protocol::messages::*;
 
+use crate::pacing::PACING;
 use crate::privfd::PrivateFd;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Undelivered DRM event bytes per handle before the pump stops reading.
 ///
@@ -289,12 +291,14 @@ impl Outbox {
                     if !push_rec(&mut out, space, EV_READY, h as u64, &[]) {
                         break;
                     }
+                    PACING.ev_ready.fetch_add(1, Relaxed);
                     self.pop();
                 }
                 Key::Ready(c) => {
                     if !push_rec(&mut out, space, EV_READY, c, &[]) {
                         break;
                     }
+                    PACING.ev_ready.fetch_add(1, Relaxed);
                     self.pop();
                 }
                 Key::Fence(c) => {
@@ -306,6 +310,13 @@ impl Outbox {
                     p[8..].copy_from_slice(&ts.to_le_bytes());
                     if !push_rec(&mut out, space, EV_FENCE, c, &p) {
                         break;
+                    }
+                    PACING.ev_fence.fetch_add(1, Relaxed);
+                    if ts != 0 {
+                        let now = crate::session::monotonic_ns();
+                        if now >= ts {
+                            PACING.fence_delivery.record_ns(now - ts);
+                        }
                     }
                     self.fence.remove(&c);
                     self.pop();
@@ -350,6 +361,7 @@ impl Outbox {
                     };
                     let bytes = backlog[..take].to_vec();
                     push_rec(&mut out, space, EV_DRM, h as u64, &bytes);
+                    PACING.ev_drm.fetch_add(1, Relaxed);
                     self.drain_drm(h, take);
                     if self.drm_backlog(h) != 0 {
                         // More than this buffer holds: the rest keeps its place.
@@ -637,6 +649,7 @@ impl<Q: EventQueue> Pump<Q> {
             return false;
         }
 
+        let woke = Instant::now();
         for ev in events.iter().take(n) {
             // Copied out first: epoll_event is packed, so its field cannot be
             // borrowed.
@@ -645,6 +658,7 @@ impl<Q: EventQueue> Pump<Q> {
                 crate::sys::fd::eventfd_drain(self.wake.as_raw_fd());
                 continue;
             }
+            PACING.ev_edge.fetch_add(1, Relaxed);
             self.on_ready(data as u32);
         }
 
@@ -652,7 +666,9 @@ impl<Q: EventQueue> Pump<Q> {
             self.last_sweep = Instant::now();
             self.sweep();
         }
-        self.flush();
+        if self.flush() {
+            PACING.pump_delivery.since(woke);
+        }
         self.resume_drained();
         true
     }
@@ -820,29 +836,35 @@ impl<Q: EventQueue> Pump<Q> {
             }
             still
         });
+        PACING.sweeps.fetch_add(1, Relaxed);
+        PACING.ev_sweep.fetch_add(due.len() as u64, Relaxed);
         for h in due {
             self.on_ready(h);
         }
     }
 
     /// Fill posted buffers until the outbox is empty or the guest has none.
-    fn flush(&mut self) {
+    /// Whether anything went out.
+    fn flush(&mut self) -> bool {
         let mut asked = false;
+        let mut filled = false;
         while !self.outbox.is_empty() {
             let outbox = &mut self.outbox;
             match self.queue.fill(&mut |cap| outbox.build(cap)) {
-                Fill::Filled => {}
+                Fill::Filled => filled = true,
                 // What is waiting does not fit the buffers this guest posts.
                 // Wait for the next round rather than burn through them all.
-                Fill::Empty => return,
+                Fill::Empty => return filled,
                 Fill::NoBuffer => {
                     if asked || !self.queue.want_kick() {
-                        return;
+                        PACING.no_buffer.fetch_add(1, Relaxed);
+                        return filled;
                     }
                     asked = true;
                 }
             }
         }
+        filled
     }
 }
 

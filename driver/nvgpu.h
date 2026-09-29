@@ -450,6 +450,26 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);
 void nvgpu_fence_wake_waiters(void);
+
+/*
+ * Frame-pacing counters (nvgpu_xfer.c; ARCHITECTURE.md, "Frame pacing"):
+ * relaxed atomics, always kept, read as root from
+ * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
+ * nvgpu_fence.c count themselves here too.
+ */
+enum nvgpu_pace_ctr {
+  NVGPU_PACE_SW_WAITS,    /* SYNCOBJ_(TIMELINE_)WAITs with a timeout */
+  NVGPU_PACE_SW_POLLS,    /* host polls those made */
+  NVGPU_PACE_SW_SLEEPS,   /* sleeps until a registration fired */
+  NVGPU_PACE_SW_WOKEN,    /* ... that a registration ended */
+  NVGPU_PACE_SW_NAPS,     /* backoff naps (over the cap, or re-arming) */
+  NVGPU_PACE_SW_OVERCAP,  /* waits that fell back to polling */
+  NVGPU_PACE_EV_BATCHES,  /* event-queue buffers taken back */
+  NVGPU_PACE_EV_RECORDS,  /* records in them */
+  NVGPU_PACE_EV_LEGACY,   /* legacy readiness (RM event fds) among them */
+  NVGPU_PACE_CTRS
+};
+void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
 void nvgpu_dev_get(struct nvgpu_device *dev);
 /* Any context: the last put only frees memory. */
 void nvgpu_dev_put(struct nvgpu_device *dev);

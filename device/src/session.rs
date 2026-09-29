@@ -661,6 +661,7 @@ impl NvidiaBackend {
 
     fn serve_host_op(&mut self, payload: &[u8]) -> Result<Outcome, i32> {
         let req = read::<HostOpReq>(payload).ok_or(libc::EINVAL)?;
+        crate::pacing::PACING.host_op(req.op);
         // Releases of memory registered by its pages: a list, after the
         // fixed reply (osdesc.rs).
         if req.op == OP_OSDESC_REAP {
@@ -1024,6 +1025,7 @@ impl NvidiaBackend {
         // dropped under the backend mutex (closer.rs, S-33).
         crate::closer::close(target_fd);
         let stale = generation != self.session.generation;
+        crate::pacing::PACING.ioctl2(prepared.name(), prepared.result());
         // A lease a guest lessor revoked through us: whatever the lessee's
         // handle granted is gone on the host (kms.rs, "lease ends").
         let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);

@@ -196,6 +196,14 @@ struct Args {
     #[arg(long, value_name = "PERCENT", default_value_t = ZoneConfig::DEFAULT_OWNER_PERCENT)]
     window_owner_share: u8,
 
+    /// Log the frame-pacing counters (device::pacing: message rates, the
+    /// backend's service time per message type, how the guest's waits went,
+    /// how long events took to reach the event queue) every SECS seconds
+    /// while the guest is busy. They are always kept, and logged once at
+    /// teardown; NVGPU_PACING_STATS=SECS does the same as this.
+    #[arg(long, value_name = "SECS")]
+    pacing_stats: Option<u64>,
+
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
     ///
@@ -1001,6 +1009,9 @@ impl NvGpuBackend {
                 (chain, vring.epoch())
             };
             used = true;
+            // The backend's part of the guest's round trip starts here
+            // (device::pacing).
+            let t0 = std::time::Instant::now();
             let head = chain.head_index();
             let descs = chain.map(|d| (d.is_write_only(), d.addr(), d.len()));
             let (l, refused) = match layout(descs, self.max_req) {
@@ -1041,11 +1052,21 @@ impl NvGpuBackend {
                 },
             };
 
+            let msg_type = req
+                .get(..4)
+                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+            let pacing = &device::pacing::PACING;
             match self.serve(&req, taken.cap.min(self.max_resp)) {
-                Outcome::Reply(r) => self.shared.complete(vring, &taken, r),
+                Outcome::Reply(r) => {
+                    self.shared.complete(vring, &taken, r);
+                    pacing.served(msg_type, t0);
+                }
                 Outcome::Ioctl2(mut p) => match p.executor_key() {
                     Some(key) => {
                         let (shared, vring) = (self.shared.clone(), vring.clone());
+                        pacing
+                            .ioctl2_executor
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.shared.pool.submit(
                             key,
                             Box::new(move |cancelled| {
@@ -1056,6 +1077,7 @@ impl NvGpuBackend {
                                     shared.finish(p)
                                 };
                                 shared.complete(&vring, &taken, reply);
+                                device::pacing::PACING.served(msg_type, t0);
                             }),
                         );
                     }
@@ -1065,6 +1087,7 @@ impl NvGpuBackend {
                         p.execute();
                         let reply = self.shared.finish(p);
                         self.shared.complete(vring, &taken, reply);
+                        pacing.served(msg_type, t0);
                     }
                 },
             }
@@ -1611,6 +1634,19 @@ fn main() -> anyhow::Result<()> {
             "sandbox: DEGRADED: --sandbox=off: no network namespace, Landlock or seccomp; \
              a backend taken over is everything uid {euid} is. For diagnosis only"
         ),
+    }
+    // The counters' clock starts now; their periodic report, if asked for,
+    // on a thread of its own.
+    device::pacing::start();
+    let pacing_every = args.pacing_stats.or_else(|| {
+        std::env::var("NVGPU_PACING_STATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    if let Some(secs) = pacing_every.filter(|&s| s > 0) {
+        device::pacing::spawn_reporter(std::time::Duration::from_secs(secs))
+            .map_err(|e| anyhow::anyhow!("--pacing-stats: {e}"))?;
+        log::warn!("pacing: counters logged every {secs} s while the guest is busy");
     }
     if let Some((x, _)) = &wayland.export {
         x.start()

@@ -1088,6 +1088,7 @@ struct nvgpu_sowait_wait {
 
 /* The host's answer now: 0 ready, -ETIME not yet, or the call's error. */
 static long nvgpu_sowait_poll(struct nvgpu_sowait_wait *w) {
+  nvgpu_pace_inc(NVGPU_PACE_SW_POLLS);
   return nvgpu_fence_call(&w->p, w->p.nfd->handle, w->cmd, w->karg, true);
 }
 
@@ -1188,6 +1189,7 @@ static long nvgpu_sowait_nap(u32 us, bool forever, signed long left) {
   u64 ns = (u64)us * NSEC_PER_USEC;
   ktime_t t;
 
+  nvgpu_pace_inc(NVGPU_PACE_SW_NAPS);
   if (!forever)
     ns = min_t(u64, ns, jiffies_to_nsecs(left));
   t = ns_to_ktime(ns);
@@ -1217,6 +1219,10 @@ static long nvgpu_sowait_run(struct nvgpu_sowait_wait *w, s64 timeout_nsec) {
   bool rearmed_before = false;
   long ret;
 
+  if (timeout_nsec)
+    nvgpu_pace_inc(NVGPU_PACE_SW_WAITS);
+  if (polling)
+    nvgpu_pace_inc(NVGPU_PACE_SW_OVERCAP);
   for (;;) {
     ret = nvgpu_sowait_poll(w);
     if (ret != -ETIME || !timeout_nsec)
@@ -1243,6 +1249,7 @@ static long nvgpu_sowait_run(struct nvgpu_sowait_wait *w, s64 timeout_nsec) {
       if (nvgpu_sowait_arm(w)) {
         nvgpu_sowait_disarm(w);
         polling = true;
+        nvgpu_pace_inc(NVGPU_PACE_SW_OVERCAP);
         continue;
       }
       ret = nvgpu_sowait_poll(w);
@@ -1250,12 +1257,15 @@ static long nvgpu_sowait_run(struct nvgpu_sowait_wait *w, s64 timeout_nsec) {
         break;
       /* Or the device is going: the next poll then fails at once, and
        * remove() is not kept waiting on this ioctl (S-26). */
+      nvgpu_pace_inc(NVGPU_PACE_SW_SLEEPS);
       ret = wait_event_interruptible_timeout(
           nvgpu_sowait_wq,
           nvgpu_sowait_progress(w) || nvgpu_xfer_dead(w->p.nfd->dev),
           nvgpu_sowait_left(forever, end));
       if (ret < 0)
         break;
+      if (nvgpu_sowait_progress(w))
+        nvgpu_pace_inc(NVGPU_PACE_SW_WOKEN);
       nvgpu_sowait_mark_seen(w);
       continue;
     }

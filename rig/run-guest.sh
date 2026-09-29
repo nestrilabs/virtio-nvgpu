@@ -53,6 +53,26 @@
 #   NVGPU_BACKEND NVGPU_VMM NVGPU_KERNEL NVGPU_ROOTFS NVGPU_LOGS
 #                       override one path of whichever layout is in use
 #   NVGPU_VCPUS NVGPU_MEM_MIB   guest size (rig 4 / 4096, root 2 / 2048)
+#
+# Placement, for frame pacing (DEPLOY.md, "Frame pacing"; unset: the host
+# scheduler places everything, as before):
+#   NVGPU_CPU_AFFINITY  host CPUs the vCPU threads may run on, a list such as
+#                       8-15 (nesbox cpu_affinity; crosvm --cpu-affinity)
+#   NVGPU_VCPU_PINS     one host CPU per vCPU, in order, such as 8,9,10,11
+#                       (nesbox vcpu_pins; crosvm --cpu-affinity 0=8:1=9:..):
+#                       only for CPUs nothing else is scheduled on
+#   NVGPU_IO_AFFINITY   host CPUs for the VMM's other threads (nesbox
+#                       io_affinity); the backend's too unless
+#                       NVGPU_BACKEND_CPUS says otherwise
+#   NVGPU_BACKEND_CPUS  host CPUs for every backend thread (taskset)
+#   NVGPU_HUGEPAGES     nesbox: transparent (its default: prefaulted and
+#                       collapsed into THP), 2m or 1g (the hugetlb pool, which
+#                       must be reserved); crosvm: transparent adds
+#                       --hugepages (MADV_HUGEPAGE)
+#   NVGPU_PREFAULT=0    nesbox: fault guest RAM in on first touch instead
+#   NVGPU_CROSVM_CORE_SCHED=0  crosvm: --core-scheduling=false (its default
+#                       gives each vCPU a core-scheduling cookie of its own,
+#                       which idles the SMT sibling while a vCPU runs)
 #   NVGPU_TIMEOUT       seconds before the VMM is killed (180; 3600 interactive)
 #   NVGPU_CMDLINE_EXTRA appended to the guest kernel command line
 #   NVGPU_BEFORE_VMM    unprivileged only: a command run (bash -c) once the
@@ -576,6 +596,39 @@ LOGS=$(realpath -s -m -- "$LOGS")
 # As JSON numbers: "04" is not one.
 VCPUS=$((10#$VCPUS))
 MEM_MIB=$((10#$MEM_MIB))
+
+# Placement (the header's "Placement"). A CPU list is digits, commas and
+# ranges; each becomes the list of numbers the VMM's config takes.
+cpu_list() { # cpu_list NAME VALUE -> "8, 9, 10"
+    local v=$2 out=() parts part a b i
+    [[ $v =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || die "$1=$v: CPUs, as 0-3,8"
+    IFS=, read -r -a parts <<<"$v"
+    for part in "${parts[@]}"; do
+        a=${part%-*} b=${part#*-}
+        a=$((10#$a)) b=$((10#$b))
+        [ "$a" -le "$b" ] && [ "$b" -lt 4096 ] || die "$1=$v: $part is not a range of CPUs"
+        for ((i = a; i <= b; i++)); do out+=("$i"); done
+    done
+    local IFS=,
+    echo "${out[*]}" | sed 's/,/, /g'
+}
+CPU_AFFINITY=${NVGPU_CPU_AFFINITY:-}
+VCPU_PINS=${NVGPU_VCPU_PINS:-}
+IO_AFFINITY=${NVGPU_IO_AFFINITY:-}
+BACKEND_CPUS=${NVGPU_BACKEND_CPUS:-$IO_AFFINITY}
+HUGEPAGES=${NVGPU_HUGEPAGES:-}
+PREFAULT=${NVGPU_PREFAULT:-}
+CPU_AFFINITY_J= VCPU_PINS_J= IO_AFFINITY_J=
+[ -z "$CPU_AFFINITY" ] || CPU_AFFINITY_J=$(cpu_list NVGPU_CPU_AFFINITY "$CPU_AFFINITY")
+[ -z "$IO_AFFINITY" ] || IO_AFFINITY_J=$(cpu_list NVGPU_IO_AFFINITY "$IO_AFFINITY")
+[ -z "$BACKEND_CPUS" ] || cpu_list NVGPU_BACKEND_CPUS "$BACKEND_CPUS" >/dev/null
+if [ -n "$VCPU_PINS" ]; then
+    VCPU_PINS_J=$(cpu_list NVGPU_VCPU_PINS "$VCPU_PINS")
+    [ "$(echo "$VCPU_PINS_J" | tr ',' '\n' | wc -l)" = "$VCPUS" ] ||
+        die "NVGPU_VCPU_PINS=$VCPU_PINS: one CPU per vCPU ($VCPUS)"
+fi
+case $HUGEPAGES in '' | transparent | 2m | 1g) ;; *) die "NVGPU_HUGEPAGES=$HUGEPAGES: transparent, 2m or 1g" ;; esac
+case $PREFAULT in '' | 0 | 1) ;; *) die "NVGPU_PREFAULT=$PREFAULT: 0 or 1" ;; esac
 [ -x "$BACKEND_BIN" ] || die "no backend at $BACKEND_BIN (NVGPU_BACKEND)"
 [ -x "$VMM" ] || die "no VMM at $VMM (NVGPU_VMM)"
 [ -r "$KERNEL" ] || die "no guest kernel at $KERNEL (NVGPU_KERNEL)"
@@ -1079,6 +1132,18 @@ if [ "$VMM_KIND" = crosvm ]; then
         --serial "type=stdout,hardware=serial,num=1,earlycon"
         --vhost-user "type=nvgpu,socket=$SOCK,max-queue-size=256")
     [ "$CROSVM_NO_HP" = 0 ] || VMM_ARGS+=(--no-pci-hotplug-port)
+    if [ -n "$VCPU_PINS" ]; then
+        pins= i=0
+        for c in ${VCPU_PINS_J//,/ }; do pins+="${pins:+:}$i=$c"; i=$((i + 1)); done
+        VMM_ARGS+=(--cpu-affinity "$pins")
+    elif [ -n "$CPU_AFFINITY" ]; then
+        VMM_ARGS+=(--cpu-affinity "$CPU_AFFINITY")
+    fi
+    case $HUGEPAGES in
+        transparent) VMM_ARGS+=(--hugepages) ;;
+        2m | 1g) die "NVGPU_HUGEPAGES=$HUGEPAGES: crosvm takes only transparent (--hugepages)" ;;
+    esac
+    [ "${NVGPU_CROSVM_CORE_SCHED:-1}" = 1 ] || VMM_ARGS+=(--core-scheduling=false)
     VMM_ARGS+=(-p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
     case $DISK$SOCK in *,*) die "a comma in $DISK or $SOCK would split crosvm's option" ;; esac
     if [ "$CROSVM_SANDBOX" = on ]; then
@@ -1103,6 +1168,12 @@ if [ "$VMM_KIND" = crosvm ]; then
     } > "$CFG"
 else
 VMM_MARK=$CFG
+MACHINE_EXTRA=
+[ -z "$CPU_AFFINITY_J" ] || MACHINE_EXTRA+=", \"cpu_affinity\": [$CPU_AFFINITY_J]"
+[ -z "$VCPU_PINS_J" ] || MACHINE_EXTRA+=", \"vcpu_pins\": [$VCPU_PINS_J]"
+[ -z "$IO_AFFINITY_J" ] || MACHINE_EXTRA+=", \"io_affinity\": [$IO_AFFINITY_J]"
+[ -z "$HUGEPAGES" ] || MACHINE_EXTRA+=", \"hugepages\": \"$HUGEPAGES\""
+[ "$PREFAULT" != 0 ] || MACHINE_EXTRA+=", \"prefault\": false"
 cat > "$CFG" <<JSON
 {
   "boot-source": {
@@ -1112,7 +1183,7 @@ cat > "$CFG" <<JSON
   "drives": [
     { "drive_id": "rootfs", "path_on_host": $(json_str "$DISK"), "is_root_device": true, "is_read_only": false }
   ],
-  "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEM_MIB },
+  "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEM_MIB$MACHINE_EXTRA },
   "gpu-forward": { "socket": $(json_str "$SOCK") },
   "unshare-network": $VMM_OWN_NETNS$SHARES
 }
@@ -1197,7 +1268,9 @@ for a in ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}; do
     diag_prev=$a
 done
 echo "backend: as $NVGPU_USER ($PRIV, $LAYOUT layout)${BACKEND_ARGS[*]:+, with ${BACKEND_ARGS[*]}}" >&2
-RUST_LOG=${RUST_LOG:-info} "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
+BACKEND_AFFINITY=()
+[ -z "$BACKEND_CPUS" ] || BACKEND_AFFINITY=(taskset -c "$BACKEND_CPUS")
+RUST_LOG=${RUST_LOG:-info} "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" "${AS_BACKEND[@]}" \
     "$BACKEND_EXE" --socket "$SOCK" "${BACKEND_ARGS[@]}" \
     {SLOT_FD}>&- > "$BLOG" 2>&1 &
 BACKEND=$!
