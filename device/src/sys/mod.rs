@@ -22,6 +22,8 @@
 //!   `MAP_FIXED` checked to land inside a range that type owns; and
 //!   [`mem::HostSpan`], the only non-arena memory a pointer slot can name.
 //! - [`fd`], [`net`]: descriptors and sockets, returned as `OwnedFd`.
+//! - [`inherit`]: the listening sockets the backend is handed at exec
+//!   (socket activation, `--socket-fd`), claimed once each.
 //! - [`proc`]: identity, privileges, limits, Landlock and seccomp.
 //! - [`pod`]: the protocol's wire structs as bytes and back.
 //!
@@ -33,6 +35,7 @@
 pub mod block;
 pub mod fd;
 pub mod guarded;
+pub mod inherit;
 pub mod ioctl;
 pub mod mem;
 pub mod net;

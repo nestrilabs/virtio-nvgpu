@@ -1426,6 +1426,36 @@ impl Drop for InjectServer {
     }
 }
 
+impl InjectServer {
+    /// [`InjectServer::bind_idle`] for a socket someone else bound and
+    /// handed over already listening -- systemd's socket activation, whose
+    /// unit sets its path, owner, group and mode (contrib/systemd). `name`
+    /// is only for the log. The caller has checked `listener` is a
+    /// listening `AF_UNIX` `SOCK_SEQPACKET` socket.
+    pub fn from_listener(
+        listener: OwnedFd,
+        name: PathBuf,
+        uid: u32,
+        registry: Arc<Registry>,
+    ) -> Self {
+        crate::privfd::register(listener.as_raw_fd());
+        Self {
+            path: name,
+            shared: Arc::new(Shared {
+                registry,
+                uid,
+                stop: AtomicBool::new(false),
+                peers: AtomicUsize::new(0),
+                next_peer: AtomicU64::new(1),
+                conns: Mutex::new(HashMap::new()),
+            }),
+            listener: Arc::new(listener),
+            idle: Mutex::new(true),
+            thread: Mutex::new(None),
+        }
+    }
+}
+
 fn accept_loop(s: Arc<Shared>, l: Arc<OwnedFd>) {
     loop {
         let conn = crate::sys::net::accept(l.as_raw_fd());
