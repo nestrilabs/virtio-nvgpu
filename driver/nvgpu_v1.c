@@ -5,10 +5,10 @@
  * (nvgpu_rmio.c), the nvidia-drm GEM forwarder (nvgpu_drm.c) -- does the same
  * way, and the flat round trip of a block with no pointer in it
  * (nvgpu_ioctl_flat()), which the C parsers' flat escapes and the flat
- * nvidia-drm calls (nvgpu_drm.c, nvgpu_gem.c) both make. The Rust parsers' twins are
- * wire::ioctl_req_header(), wire::IoctlResp::parse() and rm.rs's flat path
- * (driver/rust/core), and the difftest compiles this file with the C
- * parsers, so both read a reply alike.
+ * nvidia-drm calls (nvgpu_drm.c, nvgpu_gem.c) both make. The Rust parsers'
+ * twins are wire::ioctl_req_header(), wire::IoctlResp::parse() and rm.rs's
+ * flat path (driver/rust/core), and the difftest compiles this file with the
+ * C parsers, so both read a reply alike.
  *
  * The status is sanitised here, once for every v1 path: a reply's status is
  * the backend's word on what the call returned, 0 or a negative errno.

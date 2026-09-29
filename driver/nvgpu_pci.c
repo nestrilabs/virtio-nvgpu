@@ -322,9 +322,9 @@ static void nvgpu_parse_dev_info_sizes(struct nvgpu_device *dev, const u8 *p,
 }
 
 /*
- * Section 1, one record: a GPU's config space ("bus/pci/devices/<addr>/config"),
- * kept for the fake PCI device at that address if the address is one of the
- * GPU slots the config space named. Other PCI sysfs files (vendor, device...)
+ * Section 1, one record: a GPU's config space
+ * ("bus/pci/devices/<addr>/config"), kept for the fake PCI device at that
+ * address if the address is one of the GPU slots the config space named. Other PCI sysfs files (vendor, device...)
  * the kernel makes itself once the pci_dev is registered; other paths are
  * skipped.
  */

@@ -436,7 +436,7 @@ static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
   ncmd = nvgpu_drm_driver_cmd(nr);
   if (!ncmd || !file) {
     /*
-     * Named rather than silently refused. An ioctl this stub does not answer
+     * Named rather than silently refused. An ioctl this node does not answer
      * is the ICD asking for something the node cannot do yet, and -ENOTTY on
      * its own turns up much later as a device that would not initialise.
      */
