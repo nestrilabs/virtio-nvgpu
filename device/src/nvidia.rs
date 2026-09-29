@@ -896,6 +896,27 @@ enum Deep<'a> {
 }
 
 impl<'a> Deep<'a> {
+    fn single(self) -> Option<(usize, &'a [u8])> {
+        match self {
+            Deep::Single { ptr, bytes } => Some((ptr, bytes)),
+            _ => None,
+        }
+    }
+
+    fn segments(self) -> Option<&'a [u8]> {
+        match self {
+            Deep::Segments(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn page_list(self) -> Option<&'a [u8]> {
+        match self {
+            Deep::PageList(b) => Some(b),
+            _ => None,
+        }
+    }
+
     fn bytes(self) -> &'a [u8] {
         match self {
             Deep::None => &[],
@@ -972,6 +993,43 @@ impl<'a> V1Request<'a> {
     }
 }
 
+/// Where a call's top-level block points at its parameters: the size of
+/// the top-level block, the offset of the pointer, and the offset of the
+/// size the host copies through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Nested {
+    outer_size: usize,
+    ptr_offset: usize,
+    size_offset: usize,
+    /// Byte offset, inside the parameters, of a descriptor the guest sent
+    /// as one of our handles and the host must see as one of our
+    /// descriptors. `None` for the RM and NVKMS calls, which name their
+    /// descriptors by command rather than by position.
+    fd_at: Option<usize>,
+}
+
+/// NVOS54 (RM_CONTROL): the parameters at `params`, `paramsSize` long.
+const RM_CONTROL_NESTED: Nested = Nested {
+    outer_size: NVOS54_SIZE,
+    ptr_offset: NVOS54_PARAMS,
+    size_offset: NVOS54_PARAMS_SIZE,
+    fd_at: None,
+};
+/// NVOS64 (RM_ALLOC): the class parameters at `pAllocParms`.
+const RM_ALLOC_NESTED: Nested = Nested {
+    outer_size: NVOS64_SIZE,
+    ptr_offset: NVOS64_P_ALLOC_PARMS,
+    size_offset: NVOS64_PARAMS_SIZE,
+    fd_at: None,
+};
+/// NvKmsIoctlParams: `{cmd, size, NvU64 address}`.
+const NVKMS_NESTED: Nested = Nested {
+    outer_size: 16,
+    ptr_offset: 8,
+    size_offset: 4,
+    fd_at: None,
+};
+
 /// Where a v1 IOCTL goes, once it is allowed at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum V1Route {
@@ -981,13 +1039,8 @@ enum V1Route {
     Uvm,
     /// nvidia-modeset, type 'm'.
     Nvkms,
-    /// An nvidia-drm GEM ioctl with an NVKMS parameter block behind a pointer:
-    /// (size of the outer struct, offset of the pointer, offset of its size).
-    DrmNested {
-        outer_size: usize,
-        ptr_offset: usize,
-        size_offset: usize,
-    },
+    /// An nvidia-drm GEM ioctl with an NVKMS parameter block behind a pointer.
+    DrmNested(Nested),
     /// A flat, pointer-free, fd-free ioctl the v1 guest sends on its render
     /// handle.
     DrmFlat,
@@ -1047,20 +1100,23 @@ fn v1_route(kind: HandleKind, cmd: u32, data_len: u32) -> std::result::Result<V1
         HandleKind::DriRender(_) => match cmd {
             DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY => sized(
                 32,
-                V1Route::DrmNested {
+                V1Route::DrmNested(Nested {
                     outer_size: 32,
                     ptr_offset: 8,
                     size_offset: 16,
-                },
+                    // Both NVKMS blocks begin with `int memFd`.
+                    fd_at: Some(0),
+                }),
             ),
             DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY
             | DRM_IOCTL_NVIDIA_GEM_EXPORT_DMABUF_MEMORY => sized(
                 24,
-                V1Route::DrmNested {
+                V1Route::DrmNested(Nested {
                     outer_size: 24,
                     ptr_offset: 8,
                     size_offset: 16,
-                },
+                    fd_at: Some(0),
+                }),
             ),
             DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET
             | DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY
@@ -2918,25 +2974,8 @@ impl NvidiaBackend {
 
     /// A v1 IOCTL whose reply may be at most `cap` bytes.
     fn serve_ioctl(&mut self, payload: &[u8], cap: usize) -> V1 {
-        let V1Request {
-            ireq,
-            params: param_in,
-            deep,
-            trailer,
-        } = V1Request::parse(payload)?;
-        let deep_in = match deep {
-            Deep::Single { ptr, bytes } => Some((ptr, bytes)),
-            _ => None,
-        };
-        let deep_segs = match deep {
-            Deep::Segments(b) => Some(b),
-            _ => None,
-        };
-        let page_list = match deep {
-            Deep::PageList(b) => Some(b),
-            _ => None,
-        };
-        let deep_bytes = deep.bytes();
+        let req = V1Request::parse(payload)?;
+        let (ireq, param_in, page_list) = (req.ireq, req.params, req.deep.page_list());
 
         // Room for the answer, before anything is asked of the host: a
         // success comes back with at least the top-level struct and nested
@@ -3012,184 +3051,196 @@ impl NvidiaBackend {
         }
 
         match route {
-            V1Route::Rm => {}
-            V1Route::Uvm => {
-                // nvidia-uvm works on the caller's address space, which is
-                // ours: only commands that cannot reach it go (guestptr.rs).
-                let tools = kind == HandleKind::Dev(DeviceKind::UvmTools);
-                if self.uvm_refused.contains(&self.current_handle) {
-                    log::warn!(
-                        "UVM ioctl {:#x} on handle {} refused: its VA space may have pageable \
-                         access",
-                        ireq.cmd,
-                        self.current_handle
-                    );
-                    return Err(libc::EPERM);
-                }
-                let init_flags_mask = self
-                    .driver
-                    .and_then(abi::schema::uvm_table)
-                    .map_or(0, |t| t.init_flags_mask);
-                let params = param_in;
-                let mut plan = crate::guestptr::uvm_gate(tools, ireq.cmd, params, init_flags_mask)?;
-                // Exactly the block the host's UVM copies each way
-                // (abi::schema::uvm_table, the table the guest sizes the
-                // call by): UVM's numbers carry no size, so a short block
-                // would have the host read and write past what the guest
-                // sent, and a long one is not this release's command.
-                self.uvm_size_ok(ireq.cmd, params.len())?;
-                // A semaphore pool is host kernel memory the moment UVM makes
-                // it: its length and the budgets are checked first, not only
-                // whether it may later be mapped (uvmmap.rs, F1).
-                self.uvm_maps
-                    .set_owner(self.current_handle, self.handles.owner(self.current_handle));
-                // UVM_ALLOC_SEMAPHORE_POOL_PARAMS: base, length, ..., rmStatus.
-                if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL
-                    && let Some(len) = le::u64_at(params, 8)
-                {
-                    // Refused in rmStatus, 8 bytes from the block's end, the
-                    // ioctl succeeding: UVM's own way to say it (review
-                    // 2026-09-29 parity #29).
-                    if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
-                        let status = match errno {
-                            libc::ENOMEM => NV_ERR_NO_MEMORY,
-                            _ => NV_ERR_INVALID_ARGUMENT,
-                        };
-                        let out = nvos::with_status(params, params.len() - 8, status);
-                        return Ok(IoctlOut::ok(out));
-                    }
-                }
-                // The descriptor some commands name another file by
-                // (uvmfd.rs): our handle, as the guest driver sent it, becomes
-                // our descriptor for the call and the handle again in the
-                // reply.
-                match self.uvm_fd_in(ireq.cmd, params) {
-                    Ok(Some((off, handle))) => plan
-                        .slots
-                        .push((off, crate::guestptr::TopSlot::Handle { handle, width: 4 })),
-                    Ok(None) => {}
-                    Err(errno) => return Err(errno),
-                }
-                // The RM client whose objects UVM would duplicate: one this
-                // VM made on the control file the call names (uvm_client_ok).
-                self.uvm_client_ok(ireq.cmd, params)?;
-                // Registered memory UVM would keep a duplicate of
-                // (osdesc.rs): refused, or followed.
-                let osdesc_map = self.osdesc_uvm_before(ireq.cmd, params)?;
-                let mut r = self.dispatch_simple(host_fd, request, params, &plan);
-                self.osdesc_uvm_after(ireq.cmd, params, osdesc_map, served(&r));
-                // UVM puts its NV_STATUS in the block, not in the ioctl's
-                // return; this is the only place it shows.
-                log::debug!(
-                    "UVM {:#x} on handle {}: reply block {:02x?}",
-                    ireq.cmd,
-                    self.current_handle,
-                    served(&r).unwrap_or(&[])
-                );
-                if ireq.cmd == crate::guestptr::UVM_INITIALIZE
-                    && init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS
-                        == 0
-                    && let Some(out) = served_mut(&mut r)
-                {
-                    self.uvm_pageable_off(host_fd, out);
-                }
-                self.uvm_observe(ireq.cmd, params, served(&r), init_flags_mask);
-                return r;
-            }
-            V1Route::DrmFlat => {
-                let r = self.dispatch_simple(
-                    host_fd,
-                    request,
-                    param_in,
-                    &crate::guestptr::Plan::default(),
-                );
-                // A fence context is a GEM object of the file, and counts
-                // against its cap until it is closed (semsurf.rs).
-                // drm_gem_close: the handle first.
-                if ireq.cmd == hostfd::DRM_IOCTL_GEM_CLOSE
-                    && served(&r).is_some()
-                    && let Some(gem) = le::u32_at(param_in, 0)
-                {
-                    self.semsurf.gem_closed(self.current_handle, gem);
-                    self.inject.gem_closed(self.current_handle, gem);
-                }
-                return r;
-            }
-            V1Route::Nvkms => {
-                // NVKMS multiplexes every operation through one ioctl number,
-                // so the number says nothing and the command inside says
-                // everything. v1 carries one flat block and no descriptor, so
-                // only commands the host's NVKMS table has with no pointer and
-                // no descriptor go this way, under the same policy as IOCTL2
-                // (nvkms.rs, which may rewrite the block); everything else
-                // needs IOCTL2. A command number is never trusted across
-                // driver versions: REGISTER_SURFACE is 16 in one release and
-                // 17 in the next.
-                let mut msg = param_in.to_vec();
-                let ok = request == u64::from(crate::schema::NVKMS_IOCTL_IOWR)
-                    && ireq.data_len == 16
-                    && deep_in.is_none();
-                let checked = if ok {
-                    self.recheck_granting_leases();
-                    self.nvkms.v1_before(self.current_handle, &mut msg)
-                } else {
-                    Err(libc::EINVAL)
-                };
-                if let Err(errno) = checked {
-                    log::warn!(
-                        "v1 NVKMS call {:#x} on handle {} refused ({errno})",
-                        le::u32_at(&msg, 0).unwrap_or(0),
-                        self.current_handle
-                    );
-                    return Err(errno);
-                }
-                // A dpy probed too recently is answered with the last reply
-                // (nvkms.rs, `dpy_probe`; S-8), laid out as the host's.
-                if self.nvkms.v1_cached(self.current_handle, &mut msg) {
-                    return Ok(IoctlOut::ok(msg));
-                }
-                let mut r = self.dispatch_nested(
-                    host_fd,
-                    request,
-                    &msg,
-                    &crate::guestptr::Plan::default(),
-                    16, // outer_size
-                    8,  // ptr_offset
-                    4,  // size_offset
-                    None,
-                    None,
-                    None,
-                );
-                // The one reply the policy rewrites (ALLOC_DEVICE's display
-                // coherency modes, nvkms.rs), laid out as `msg` was.
-                if let Some(out) = served_mut(&mut r) {
-                    self.nvkms.v1_after(out);
-                    self.nvkms.v1_record(self.current_handle, out);
-                }
-                return r;
-            }
-            V1Route::DrmNested {
-                outer_size,
-                ptr_offset,
-                size_offset,
-            } => {
+            V1Route::Rm => self.serve_rm_escape(host_fd, &req),
+            V1Route::Uvm => self.serve_uvm_v1(host_fd, kind, &req),
+            V1Route::DrmFlat => self.serve_drm_flat_v1(host_fd, &req),
+            V1Route::Nvkms => self.serve_nvkms_v1(host_fd, &req),
+            V1Route::DrmNested(layout) => {
                 log::debug!("drm ioctl nr={escape:#04x} ({} bytes in)", param_in.len());
-                return self.dispatch_nested(
+                self.dispatch_nested(
                     host_fd,
                     request,
                     param_in,
                     &crate::guestptr::Plan::default(),
-                    outer_size,
-                    ptr_offset,
-                    size_offset,
-                    deep_in,
-                    // Both NVKMS blocks begin with `int memFd`.
-                    Some(0),
-                    None,
-                );
+                    layout,
+                    req.deep,
+                )
             }
         }
+    }
 
+    /// A v1 UVM command, on a UVM or UVM-tools file.
+    fn serve_uvm_v1(&mut self, host_fd: RawFd, kind: HandleKind, req: &V1Request<'_>) -> V1 {
+        let (ireq, param_in) = (req.ireq, req.params);
+        let request = u64::from(ireq.cmd);
+        // nvidia-uvm works on the caller's address space, which is
+        // ours: only commands that cannot reach it go (guestptr.rs).
+        let tools = kind == HandleKind::Dev(DeviceKind::UvmTools);
+        if self.uvm_refused.contains(&self.current_handle) {
+            log::warn!(
+                "UVM ioctl {:#x} on handle {} refused: its VA space may have pageable \
+                 access",
+                ireq.cmd,
+                self.current_handle
+            );
+            return Err(libc::EPERM);
+        }
+        let init_flags_mask = self
+            .driver
+            .and_then(abi::schema::uvm_table)
+            .map_or(0, |t| t.init_flags_mask);
+        let params = param_in;
+        let mut plan = crate::guestptr::uvm_gate(tools, ireq.cmd, params, init_flags_mask)?;
+        // Exactly the block the host's UVM copies each way
+        // (abi::schema::uvm_table, the table the guest sizes the
+        // call by): UVM's numbers carry no size, so a short block
+        // would have the host read and write past what the guest
+        // sent, and a long one is not this release's command.
+        self.uvm_size_ok(ireq.cmd, params.len())?;
+        // A semaphore pool is host kernel memory the moment UVM makes
+        // it: its length and the budgets are checked first, not only
+        // whether it may later be mapped (uvmmap.rs, F1).
+        self.uvm_maps
+            .set_owner(self.current_handle, self.handles.owner(self.current_handle));
+        // UVM_ALLOC_SEMAPHORE_POOL_PARAMS: base, length, ..., rmStatus.
+        if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL
+            && let Some(len) = le::u64_at(params, 8)
+        {
+            // Refused in rmStatus, 8 bytes from the block's end, the
+            // ioctl succeeding: UVM's own way to say it (review
+            // 2026-09-29 parity #29).
+            if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
+                let status = match errno {
+                    libc::ENOMEM => NV_ERR_NO_MEMORY,
+                    _ => NV_ERR_INVALID_ARGUMENT,
+                };
+                let out = nvos::with_status(params, params.len() - 8, status);
+                return Ok(IoctlOut::ok(out));
+            }
+        }
+        // The descriptor some commands name another file by
+        // (uvmfd.rs): our handle, as the guest driver sent it, becomes
+        // our descriptor for the call and the handle again in the
+        // reply.
+        match self.uvm_fd_in(ireq.cmd, params) {
+            Ok(Some((off, handle))) => plan
+                .slots
+                .push((off, crate::guestptr::TopSlot::Handle { handle, width: 4 })),
+            Ok(None) => {}
+            Err(errno) => return Err(errno),
+        }
+        // The RM client whose objects UVM would duplicate: one this
+        // VM made on the control file the call names (uvm_client_ok).
+        self.uvm_client_ok(ireq.cmd, params)?;
+        // Registered memory UVM would keep a duplicate of
+        // (osdesc.rs): refused, or followed.
+        let osdesc_map = self.osdesc_uvm_before(ireq.cmd, params)?;
+        let mut r = self.dispatch_simple(host_fd, request, params, &plan);
+        self.osdesc_uvm_after(ireq.cmd, params, osdesc_map, served(&r));
+        // UVM puts its NV_STATUS in the block, not in the ioctl's
+        // return; this is the only place it shows.
+        log::debug!(
+            "UVM {:#x} on handle {}: reply block {:02x?}",
+            ireq.cmd,
+            self.current_handle,
+            served(&r).unwrap_or(&[])
+        );
+        if ireq.cmd == crate::guestptr::UVM_INITIALIZE
+            && init_flags_mask & crate::guestptr::UVM_INIT_FLAGS_DISABLE_PAGEABLE_ACCESS == 0
+            && let Some(out) = served_mut(&mut r)
+        {
+            self.uvm_pageable_off(host_fd, out);
+        }
+        self.uvm_observe(ireq.cmd, params, served(&r), init_flags_mask);
+        r
+    }
+
+    /// One of the flat nvidia-drm and DRM calls a v1 guest makes on its
+    /// render handle.
+    fn serve_drm_flat_v1(&mut self, host_fd: RawFd, req: &V1Request<'_>) -> V1 {
+        let (ireq, param_in) = (req.ireq, req.params);
+        let request = u64::from(ireq.cmd);
+        let r = self.dispatch_simple(
+            host_fd,
+            request,
+            param_in,
+            &crate::guestptr::Plan::default(),
+        );
+        // A fence context is a GEM object of the file, and counts
+        // against its cap until it is closed (semsurf.rs).
+        // drm_gem_close: the handle first.
+        if ireq.cmd == hostfd::DRM_IOCTL_GEM_CLOSE
+            && served(&r).is_some()
+            && let Some(gem) = le::u32_at(param_in, 0)
+        {
+            self.semsurf.gem_closed(self.current_handle, gem);
+            self.inject.gem_closed(self.current_handle, gem);
+        }
+        r
+    }
+
+    /// A v1 NVKMS call, on nvidia-modeset.
+    fn serve_nvkms_v1(&mut self, host_fd: RawFd, req: &V1Request<'_>) -> V1 {
+        let (ireq, param_in) = (req.ireq, req.params);
+        let request = u64::from(ireq.cmd);
+        let deep_in = req.deep.single();
+        // NVKMS multiplexes every operation through one ioctl number,
+        // so the number says nothing and the command inside says
+        // everything. v1 carries one flat block and no descriptor, so
+        // only commands the host's NVKMS table has with no pointer and
+        // no descriptor go this way, under the same policy as IOCTL2
+        // (nvkms.rs, which may rewrite the block); everything else
+        // needs IOCTL2. A command number is never trusted across
+        // driver versions: REGISTER_SURFACE is 16 in one release and
+        // 17 in the next.
+        let mut msg = param_in.to_vec();
+        let ok = request == u64::from(crate::schema::NVKMS_IOCTL_IOWR)
+            && ireq.data_len == 16
+            && deep_in.is_none();
+        let checked = if ok {
+            self.recheck_granting_leases();
+            self.nvkms.v1_before(self.current_handle, &mut msg)
+        } else {
+            Err(libc::EINVAL)
+        };
+        if let Err(errno) = checked {
+            log::warn!(
+                "v1 NVKMS call {:#x} on handle {} refused ({errno})",
+                le::u32_at(&msg, 0).unwrap_or(0),
+                self.current_handle
+            );
+            return Err(errno);
+        }
+        // A dpy probed too recently is answered with the last reply
+        // (nvkms.rs, `dpy_probe`; S-8), laid out as the host's.
+        if self.nvkms.v1_cached(self.current_handle, &mut msg) {
+            return Ok(IoctlOut::ok(msg));
+        }
+        let mut r = self.dispatch_nested(
+            host_fd,
+            request,
+            &msg,
+            &crate::guestptr::Plan::default(),
+            NVKMS_NESTED,
+            Deep::None,
+        );
+        // The one reply the policy rewrites (ALLOC_DEVICE's display
+        // coherency modes, nvkms.rs), laid out as `msg` was.
+        if let Some(out) = served_mut(&mut r) {
+            self.nvkms.v1_after(out);
+            self.nvkms.v1_record(self.current_handle, out);
+        }
+        r
+    }
+
+    /// A v1 RM escape, on an NVIDIA device file.
+    fn serve_rm_escape(&mut self, host_fd: RawFd, req: &V1Request<'_>) -> V1 {
+        use abi::ioctl::*;
+        let (ireq, param_in, trailer) = (req.ireq, req.params, req.trailer);
+        let (deep_in, deep_segs, deep_bytes) =
+            (req.deep.single(), req.deep.segments(), req.deep.bytes());
+        let request = u64::from(ireq.cmd);
+        let escape = hostfd::ioc_nr(ireq.cmd);
         // Only NVIDIA's own magic is described by the ABI tables.
         let host = self
             .driver
@@ -3230,8 +3281,6 @@ impl NvidiaBackend {
             }
         }
 
-        use abi::ioctl::*;
-
         // An escape the host's table says carries a descriptor, with no
         // translation here, would reach the host with the guest's number in
         // it -- naming whatever this process has open under that number --
@@ -3249,30 +3298,27 @@ impl NvidiaBackend {
         // (rmallow.rs). Whatever the ABI policy. The controls the backend
         // answers itself below (rmctl.rs) never reach RM and keep their own
         // answers; the page-list path's classes are held to it too.
-        if ioc_type == b'F' as u32 {
-            let answered_here = escape == NV_ESC_RM_CONTROL
-                && (crate::rmctl::unix_refused(param_in).is_some()
-                    || crate::rmctl::host_pid_control(param_in).is_some());
-            let sent = param_in;
-            if !answered_here
-                && let Err(r) = self.rmallow.check(escape, sent, ireq.data_len as usize)
-            {
-                return match r {
-                    crate::rmallow::Refusal::Errno(errno) => Err(errno),
-                    crate::rmallow::Refusal::Status { at, status } => {
-                        let mut out = nvos::with_status(sent, at, status);
-                        out.extend_from_slice(deep_bytes);
-                        Ok(IoctlOut::deep(out, deep_bytes.len()))
-                    }
-                };
-            }
+        let answered_here = escape == NV_ESC_RM_CONTROL
+            && (crate::rmctl::unix_refused(param_in).is_some()
+                || crate::rmctl::host_pid_control(param_in).is_some());
+        if !answered_here
+            && let Err(r) = self.rmallow.check(escape, param_in, ireq.data_len as usize)
+        {
+            return match r {
+                crate::rmallow::Refusal::Errno(errno) => Err(errno),
+                crate::rmallow::Refusal::Status { at, status } => {
+                    let mut out = nvos::with_status(param_in, at, status);
+                    out.extend_from_slice(deep_bytes);
+                    Ok(IoctlOut::deep(out, deep_bytes.len()))
+                }
+            };
         }
 
         // Memory registered by its pages rather than its address: its own
         // path, and the only one on which RM is handed an address for an OS
         // descriptor -- one of ours (osdesc.rs). Sent with an address alone,
         // the same calls are refused below.
-        if let Some(list) = page_list {
+        if let Some(list) = req.deep.page_list() {
             return self.dispatch_osdesc(host_fd, request, ireq.data_len as usize, param_in, list);
         }
 
@@ -3298,21 +3344,17 @@ impl NvidiaBackend {
         // name, judged on the parameters as the guest sent them. A refusal
         // is RM's own status in those parameters, and the host is not asked.
         self.current_proc = None;
-        let mut share_pending = crate::rmshare::Pending::default();
-        if ioc_type == b'F' as u32 {
-            let sent = param_in;
-            self.current_proc = self.rm_proc_id(escape, sent, trailer)?;
-            match self.rm_share_gate(escape, sent, self.current_proc) {
-                Ok(p) => share_pending = p,
-                Err(crate::rmshare::Refuse::Errno(errno)) => return Err(errno),
-                Err(crate::rmshare::Refuse::Status(status)) => {
-                    let at = crate::rmshare::status_at(escape).unwrap_or(0);
-                    let mut out = nvos::with_status(sent, at, status);
-                    out.extend_from_slice(deep_bytes);
-                    return Ok(IoctlOut::deep(out, deep_bytes.len()));
-                }
+        self.current_proc = self.rm_proc_id(escape, param_in, trailer)?;
+        let share_pending = match self.rm_share_gate(escape, param_in, self.current_proc) {
+            Ok(p) => p,
+            Err(crate::rmshare::Refuse::Errno(errno)) => return Err(errno),
+            Err(crate::rmshare::Refuse::Status(status)) => {
+                let at = crate::rmshare::status_at(escape).unwrap_or(0);
+                let mut out = nvos::with_status(param_in, at, status);
+                out.extend_from_slice(deep_bytes);
+                return Ok(IoctlOut::deep(out, deep_bytes.len()));
             }
-        }
+        };
 
         // What the memory an escape makes, duplicates, frees or GPU-maps is,
         // and the coherency rewrite (rmmem.rs): the host is handed a rewritten
@@ -3320,8 +3362,7 @@ impl NvidiaBackend {
         // the 48-byte NVOS64 form, the one the offsets are for.
         let rm_copy: Vec<u8>;
         let mut rm_pending = None;
-        let param_in: &[u8] = if ioc_type == b'F' as u32
-            && crate::rmmem::RmMem::watches(escape)
+        let param_in: &[u8] = if crate::rmmem::RmMem::watches(escape)
             && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48)
         {
             let mut v = param_in.to_vec();
@@ -3392,7 +3433,12 @@ impl NvidiaBackend {
             }
             NV_ESC_RM_CONTROL => {
                 let r = self.dispatch_nested(
-                    host_fd, request, param_in, &plan, 32, 16, 24, deep_in, None, deep_segs,
+                    host_fd,
+                    request,
+                    param_in,
+                    &plan,
+                    RM_CONTROL_NESTED,
+                    req.deep,
                 );
                 // Counted here rather than in the forwarder, which holds only a
                 // shared borrow. Only what RM served: the key is the guest's
@@ -3409,7 +3455,12 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             NV_ESC_RM_ALLOC => {
                 let r = self.dispatch_nested(
-                    host_fd, request, param_in, &plan, 48, 16, 32, deep_in, None, None,
+                    host_fd,
+                    request,
+                    param_in,
+                    &plan,
+                    RM_ALLOC_NESTED,
+                    req.deep,
                 );
                 // As for controls, only what RM made.
                 if let Some(class) = rm_served(served(&r), NVOS64_H_CLASS, NVOS64_STATUS) {
@@ -3440,9 +3491,7 @@ impl NvidiaBackend {
         }
         // What RM freed, duplicated or made anew, as registrations of memory
         // by its pages live through (osdesc.rs).
-        if ioc_type == b'F' as u32
-            && let Some(out) = served(&r)
-        {
+        if let Some(out) = served(&r) {
             self.osdesc_observe(escape, out);
             // A share RM took, for the duplicates it lets through.
             self.rm_share_after(escape, share_pending, out);
@@ -3467,25 +3516,24 @@ impl NvidiaBackend {
     /// only what the backend put there: an address of another block of the
     /// call, a descriptor of its own, or 0. The reply is a copy with the
     /// caller's values back in those fields.
-    #[allow(clippy::too_many_arguments)]
     fn dispatch_nested(
         &self,
         host_fd: RawFd,
         request: u64,
         param_in: &[u8],
         plan: &crate::guestptr::Plan<'_>,
-        outer_size: usize,
-        ptr_offset: usize,
-        size_offset: usize,
-        deep_in: Option<(usize, &[u8])>,
-        // Byte offset, inside the nested block, of a descriptor the guest
-        // sent as one of our handles and the host must see as one of our
-        // descriptors. `None` for the RM paths, which name their descriptors
-        // by command rather than by position.
-        nested_fd_offset: Option<usize>,
-        // A segmented deep block (deepseg.rs): RM_CONTROL only.
-        deep_segs: Option<&[u8]>,
+        layout: Nested,
+        // What follows the nested block: a single one, or segments
+        // (deepseg.rs, RM_CONTROL only).
+        deep: Deep<'_>,
     ) -> V1 {
+        let Nested {
+            outer_size,
+            ptr_offset,
+            size_offset,
+            fd_at: nested_fd_offset,
+        } = layout;
+        let (deep_in, deep_segs) = (deep.single(), deep.segments());
         if param_in.len() < outer_size {
             return Err(libc::EINVAL);
         }
