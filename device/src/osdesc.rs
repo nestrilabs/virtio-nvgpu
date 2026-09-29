@@ -1661,6 +1661,7 @@ pub(crate) mod test_ram {
     }
 
     /// Whether any page of `[addr, addr+len)` is mapped in this process.
+    #[cfg(feature = "vhost-user")]
     pub fn mapped(addr: u64, len: u64) -> bool {
         crate::sys::mem::any_mapped(addr, len)
     }

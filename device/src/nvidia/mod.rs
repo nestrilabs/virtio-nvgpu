@@ -396,11 +396,6 @@ impl NvidiaBackend {
         self.shm.total_size()
     }
 
-    /// Raw memfd fd (for KVM memslot creation).
-    pub fn shm_memfd_raw(&self) -> i32 {
-        self.shm.memfd_raw()
-    }
-
     /// Forward ioctls the ABI profile does not describe, instead of refusing
     /// them. Diagnostic only: it exists to find out what a workload needs.
     pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
