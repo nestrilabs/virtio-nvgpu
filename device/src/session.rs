@@ -397,7 +397,7 @@ impl xfer::Env for BackendEnv<'_> {
 
     /// Made by `prepare_ioctl2` before this Env exists (it needs the table
     /// mutably), so here it is only looked up.
-    fn kms_state(&self, target: u32) -> Option<Arc<xfer::KmsFileState>> {
+    fn kms_state(&self, target: u32) -> Option<Arc<crate::kms_state::KmsFileState>> {
         self.backend.kms_states.get(&target).cloned()
     }
 
@@ -957,7 +957,7 @@ impl NvidiaBackend {
             let vm = self.vm_kms.clone();
             self.kms_states
                 .entry(target)
-                .or_insert_with(|| Arc::new(xfer::KmsFileState::in_vm(vm)));
+                .or_insert_with(|| Arc::new(crate::kms_state::KmsFileState::in_vm(vm)));
             // Scanout checksums: our card or a lessee only (kms.rs).
             self.crc_gate(req.cmd, target, kind)?;
         }

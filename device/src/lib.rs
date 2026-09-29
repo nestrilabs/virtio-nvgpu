@@ -35,6 +35,7 @@ pub mod hostfd;
 mod i2_e2e;
 pub mod inject;
 pub mod kms;
+pub mod kms_state;
 pub mod le;
 pub mod mmap;
 pub mod nvidia;

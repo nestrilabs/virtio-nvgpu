@@ -52,9 +52,10 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/nvidia/placement.rs` | MMAP and MUNMAP: window extents, the memory type each placement is mapped with, UVM pools in the aperture |
 | `src/nvidia/hostnodes.rs` | the host's DRM nodes (GET_DEV_INFO, render and card nodes per GPU) and the GET_PROC_FILES/GET_SYS_FILES streams |
 | `src/session.rs` | protocol v2: the session and its reset, HELLO, TIME_SYNC, WATCH, HOST_OP, and IOCTL2 split into prepare, execute and finish so the host ioctl runs without the backend's lock |
-| `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, re-homes GEM handles, and keeps each VM's framebuffer records |
+| `src/xfer.rs` | the IOCTL2 interpreter: walks the backend's own schema over what the guest sent, refuses any disagreement, builds what the host kernel is handed, and re-homes GEM handles; its KMS stages check calls against `kms_state.rs` and record what they made |
 | `src/schema.rs` | ties the generated schema tables (`abi::schema`) to handle kinds |
 | `src/policy.rs` | `BackendHooks`: the judgements IOCTL2 leaves to its caller, routed to the KMS, fence and NVKMS sections |
+| `src/kms_state.rs` | what the backend keeps of a VM's KMS files: the framebuffers and property blobs each made, the blobs it was shown, framebuffers in use by calls in flight, connector probe times |
 | `src/kms.rs` | KMS properties classified by name, the host hotplug/lease uevent listener, lease re-checks, scanout checksums |
 | `src/nvkms.rs` | NVKMS and nvidia-drm grant policy: grant records, head gates for FLIP and SET_MODE, refusals and rewrites, run-time revocation checks |
 | `src/fence.rs` | syncobj waits turned into polls, and the shared, capped SYNCOBJ_EVENTFD registrations the guest sleeps on |

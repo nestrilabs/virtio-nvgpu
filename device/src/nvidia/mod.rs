@@ -41,6 +41,7 @@ use std::sync::Arc;
 use crate::error::{DeviceError, Result};
 use crate::handle_table::HandleTable;
 use crate::hostfd::{self, CardNode, HandleKind};
+use crate::kms_state::{KmsFileState, VmKms};
 use crate::le;
 use crate::nvkms::{self, NvkmsPolicy};
 use crate::nvos::{self, *};
@@ -52,7 +53,7 @@ use crate::session::{BackendConfig, MAX_XFER_DIRECT, Outcome, Reply, Session};
 use crate::shm::{ShmAllocator, ZoneConfig};
 use crate::sys::block::{Arena, BufId, Restore, SlotKind};
 use crate::sys::pod;
-use crate::xfer::{Hooks, KmsFileState, Sys, VmKms};
+use crate::xfer::{Hooks, Sys};
 
 // ============================================================
 // NvidiaBackend
@@ -188,7 +189,7 @@ pub struct NvidiaBackend {
     /// get the same number starts with nothing.
     pub(crate) kms_states: std::collections::HashMap<u32, Arc<KmsFileState>>,
     /// Every framebuffer those files made, VM-wide: the only ids a guest
-    /// may name as a scanout source (S-6, `xfer::KmsFileState`).
+    /// may name as a scanout source (S-6, `kms_state::KmsFileState`).
     pub(crate) vm_kms: Arc<VmKms>,
     /// The policy every IOCTL2 is checked against (see `policy.rs`).
     pub(crate) hooks: Arc<dyn Hooks>,
