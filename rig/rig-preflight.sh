@@ -310,11 +310,14 @@ fi
 # ── If it goes wrong (.rig/SAFETY-NOTES.md) ──────────────────────────────────
 section "recovery"
 avail_mib=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
-want_mib=$((${NVGPU_MEM_MIB:-4096} + 1024 + ${NVGPU_MEM_HEADROOM_MIB:-4096}))
+# The same sum run-guest.sh makes: guest RAM, the window (NVGPU_WINDOW_MIB),
+# and the headroom left for the desktop.
+window_mib=${NVGPU_WINDOW_MIB:-1024}
+want_mib=$((${NVGPU_MEM_MIB:-4096} + window_mib + ${NVGPU_MEM_HEADROOM_MIB:-4096}))
 if [ -z "$avail_mib" ]; then
     warn "cannot read MemAvailable"
 elif [ "$avail_mib" -lt "$want_mib" ]; then
-    warn "$avail_mib MiB available; run-guest.sh wants $want_mib (guest + 1 GiB window + desktop headroom) and will refuse"
+    warn "$avail_mib MiB available; run-guest.sh wants $want_mib (guest + ${window_mib} MiB window + desktop headroom) and will refuse"
 else
     ok "$avail_mib MiB available (a run wants $want_mib)"
 fi

@@ -22,7 +22,7 @@ run() { # run <launcher> <tag> [env...] [-- launcher args after the tag]
         NVGPU_OOM_SCORE_ADJ= NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 ${envs[@]+"${envs[@]}"} \
         bash "/rig/$l" probe "$tag" ${args[@]+"${args[@]}"} > "/rig/logs/$tag.launcher" 2>&1
     echo "  exit $?; launcher said:"
-    sed 's/^/    | /' "/rig/logs/$tag.launcher" | grep -v "^    | *$" | head -${LINES_SHOWN:-12}
+    sed 's/^/    | /' "/rig/logs/$tag.launcher" | grep -v "^    | *$" | head -n "${LINES_SHOWN:-12}"
 }
 others() { # start another VM's backend and VMM, as a stale-process pattern sees them
     mkdir -p /run/nvgpu.other
@@ -106,7 +106,7 @@ echo "== new: H7: a second run with a tag a live run holds"
 sleep 0.3
 run run-guest.new.sh dup
 wait
-echo "  (a root run's files carry its slot: $(cd /rig/logs && ls benign.vm0.* | tr '\n' ' '))"
+echo "  (a root run's files carry its slot: $(cd /rig/logs && printf '%s ' benign.vm0.*))"
 
 echo "== new: H2: a guest that floods its console, with NVGPU_LOG_MAX_MIB=1"
 LINES_SHOWN=2 run run-guest.new.sh flood NVGPU_LOG_MAX_MIB=1

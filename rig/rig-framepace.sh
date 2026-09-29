@@ -126,8 +126,10 @@ run_vm() { # run_vm N
     # log runs (framepace-sched.py): the guest boots in about 10 s.
     (
         sleep $((WARM + 12))
-        pids=$(pgrep -n -x nesbox || pgrep -n -x crosvm)
-        pids="$pids $(pgrep -n -f 'vhost-user-nvgpu')"
+        # This user's, and the backend as run-guest.sh starts it (the
+        # binary, then --socket): not another VM's, nor an editor's.
+        pids=$(pgrep -n -u "$(id -u)" -x nesbox || pgrep -n -u "$(id -u)" -x crosvm)
+        pids="$pids $(pgrep -n -u "$(id -u)" -f '^[^ ]*/vhost-user-nvgpu --socket ')"
         python3 "$REPO/rig/framepace-sched.py" $((SECS > 6 ? SECS - 4 : 2)) $pids >"$OUT/$WL-vm-$1.sched.txt" 2>&1
     ) &
     NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((TOTAL + 90))} \

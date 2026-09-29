@@ -86,7 +86,10 @@ run_vm() { # run_vm N
     # The backend's and the VMM's CPU, sampled; the console's section lines,
     # stamped as they arrive.
     for i in $(seq 1 100); do
-        be=$(pgrep -n -f 'vhost-user-nvgpu') && vmm=$(pgrep -n -x nesbox || pgrep -n -x crosvm) && break
+        # This user's, and the backend as run-guest.sh starts it (the
+        # binary, then --socket): not another VM's, nor an editor's.
+        be=$(pgrep -n -u "$(id -u)" -f '^[^ ]*/vhost-user-nvgpu --socket ') &&
+            vmm=$(pgrep -n -u "$(id -u)" -x nesbox || pgrep -n -u "$(id -u)" -x crosvm) && break
         sleep 0.2
     done
     (
