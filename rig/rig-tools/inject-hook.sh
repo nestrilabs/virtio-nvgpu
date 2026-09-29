@@ -17,6 +17,8 @@
 # timings at the end of the run.
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# shellcheck source=rig/lib.sh
+. "$REPO/rig/lib.sh"
 RIG=${NVGPU_RIG:-$REPO/.rig}
 : "${NVGPU_INJECT_SOCKET:?run with rig/run-guest.sh --inject}"
 : "${NVGPU_RUN_DIR:?run as the NVGPU_BEFORE_VMM of rig/run-guest.sh}"
@@ -25,18 +27,14 @@ BIN=${NVGPU_INJECT_TEST:-$RIG/bin/nvgpu-inject-test}
 [ -x "$BIN" ] || { echo "no $BIN: rig/rig-tools/build.sh" >&2; exit 1; }
 
 root=$(readlink "$RIG/guest/result") || { echo "no $RIG/guest/result: build the image" >&2; exit 1; }
-phys() { for b in "$HOME/.local/share/nix/root" ""; do [ -e "$b$1" ] && { echo "$b$1"; return; }; done; echo "$1"; }
-OD=$(readlink "$(phys "$root")/etc/nvgpu/opengl-driver")
+OD=$(readlink "$(rig_phys "$root")/etc/nvgpu/opengl-driver")
+rig_nv_env "$OD"
 
 export NIX_CONFIG=${NIX_CONFIG:-experimental-features = nix-command flakes}
 OUT=$NVGPU_RUN_DIR/inject.words
 rm -f "$OUT"
 # shellcheck disable=SC2086
-setsid nix shell "$OD" -c env \
-    LD_LIBRARY_PATH="$OD/lib" \
-    __EGL_VENDOR_LIBRARY_FILENAMES="$OD/share/glvnd/egl_vendor.d/10_nvidia.json" \
-    __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="$OD/share/egl/egl_external_platform.d" \
-    GBM_BACKENDS_PATH="$OD/lib/gbm" \
+setsid nix shell "$OD" -c env "${NV_ENV[@]}" \
     "$BIN" --socket "$NVGPU_INJECT_SOCKET" --out "$OUT" --hold "${NVGPU_INJECT_HOLD:-600}" \
     --pingpong "${NVGPU_INJECT_PINGPONG:-200}" ${NVGPU_INJECT_ARGS:-} </dev/null >"$LOG" 2>&1 &
 PID=$!

@@ -116,3 +116,31 @@ checkout to another binary). `0001`-`0006` are graphics only, with the frontend 
 as upstream has it; `0007`-`0009` add compute and jail the frontend, and change no other device's
 seccomp policy or minijail setting; `0010` is optional, for speed. What the main process checks:
 SECURITY.md §16.
+
+## Why each VMM carries its own checks
+
+nesbox's fork (`virtio-devices/src/nvgpu/fds.rs`, `aperture.rs` and `nvgpu.rs`, branch `virtio-nvgpu-v6`)
+and this series (the jailed frontend's checks in `0001` and `0008`, the main process's in `0007`) check the
+backend's mapping requests to the same limits: the descriptor kinds (NVIDIA major 195, DRM 226,
+`/dev/nvidia-uvm` minor 0 opened read-write, a `mincore` the kernel answers), whole pages inside the
+window and at most 16,384 placements, and UVM pools in [4 GiB, 32 TiB), at most 64 MiB each, 64 at once,
+on 2 MiB aperture boundaries. A crate shared by both VMMs was considered (the 2026-09-29 review) and not
+made:
+
+- What is the same is small: the constants and the descriptor classification, about 150 lines a side.
+  The rest follows each VMM's own address space and differs by design: nesbox moves a placement over a
+  `PROT_NONE` reservation with `mremap` and bounds its pools by its 1 GiB aperture; crosvm checks against
+  the BAR layout its transport reported, reserves the pool band up front, and counts pool bytes (256 MiB,
+  as the backend does). A shared crate would hold the constants and a few predicates, with each VMM's own
+  code around them.
+- Neither VMM can take it as a dependency: nesbox's branch is a fork of a public project, meant to go
+  upstream, that depends on nothing of this repository's; this series would carry it in `third_party/`.
+  Either way it would be a copy in each VMM, which is what there is now.
+- Within crosvm, the frontend's checks and the main process's are two on purpose: the main process does
+  not trust the jailed frontend, and checks each request again against its own record (both take their
+  constants from `vm_control/src/nvgpu.rs`). Within nesbox they are already in one place: `fds.rs` for
+  descriptors, `aperture.rs` for pools.
+
+What keeps the copies saying the same thing instead is `scripts/vmm-parity.py`: it reads each limit from
+each VMM's source and from the backend's, and `scripts/ci.sh deploy` fails when one differs (crosvm as
+this series has it; nesbox at `NESBOX_BRANCH`, from `NESBOX_SRC` or the rig's checkout).

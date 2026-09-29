@@ -62,5 +62,9 @@ echo kernel > "$R/rig/kernel/vmlinux"
 truncate -s 1M "$R/rig/guest/rootfs.ext4"
 cp "$OLD" "$R/rig/run-guest.old.sh"
 cp "$NEW" "$R/rig/run-guest.new.sh"
+# The new launcher's pieces, beside it, as an install has them.
+cp -r "$(dirname "$NEW")/launcher" "$R/rig/launcher"
+chmod 0755 "$R/rig/launcher"
+chmod 0644 "$R/rig/launcher/"*.sh
 cp "$D/inside.sh" "$R/inside.sh"
 exec chroot "$R" /run/current-system/sw/bin/bash /inside.sh

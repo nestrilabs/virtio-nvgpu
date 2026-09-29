@@ -19,6 +19,8 @@
 # the chroot store's copy when there is one (nix without root).
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=rig/lib.sh
+. "$REPO/rig/lib.sh"
 RIG=${NVGPU_RIG:-$REPO/.rig}
 LIVE=0
 NOUVM=0
@@ -35,9 +37,9 @@ done
 [ $# -gt 0 ] || { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 root=$(readlink "$RIG/guest/result") || { echo "no $RIG/guest/result: build the image" >&2; exit 1; }
-phys() { for b in "$HOME/.local/share/nix/root" ""; do [ -e "$b$1" ] && { echo "$b$1"; return; }; done; echo "$1"; }
-OD=$(readlink "$(phys "$root")/etc/nvgpu/opengl-driver")
-SW=$(readlink "$(phys "$root")/etc/nvgpu/sw")
+OD=$(readlink "$(rig_phys "$root")/etc/nvgpu/opengl-driver")
+SW=$(readlink "$(rig_phys "$root")/etc/nvgpu/sw")
+rig_nv_env "$OD"
 
 if [ "$LIVE" = 1 ]; then
     WL=${XDG_RUNTIME_DIR:-}/${WAYLAND_DISPLAY:-}
@@ -64,12 +66,8 @@ fi
 # nix shell makes the chroot store's paths visible; the image's sw env first.
 nix shell "${PKGS[@]}" -c ${PRE[@]+"${PRE[@]}"} env -u DISPLAY \
     XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=wayland-0 \
-    LD_LIBRARY_PATH="$OD/lib" \
-    VK_DRIVER_FILES="$OD/share/vulkan/icd.d/nvidia_icd.json" \
-    __EGL_VENDOR_LIBRARY_FILENAMES="$OD/share/glvnd/egl_vendor.d/10_nvidia.json" \
-    __GLX_VENDOR_LIBRARY_NAME=nvidia GBM_BACKENDS_PATH="$OD/lib/gbm" \
-    __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="$OD/share/egl/egl_external_platform.d" \
+    "${NV_ENV[@]}" \
     LIBVA_DRIVERS_PATH="$OD/lib/dri" \
     OCL_ICD_VENDORS="$OD/etc/OpenCL/vendors" \
-    FONTCONFIG_FILE="$(phys "$root")/etc/fonts/fonts.conf" \
+    FONTCONFIG_FILE="$(rig_phys "$root")/etc/fonts/fonts.conf" \
     timeout -s TERM -k 5 "$SECS" "$@"

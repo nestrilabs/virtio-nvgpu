@@ -31,6 +31,8 @@
 # the table.
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=rig/lib.sh
+. "$REPO/rig/lib.sh"
 RIG=${NVGPU_RIG:-$REPO/.rig}
 export NVGPU_RIG=$RIG
 [ $# -ge 2 ] || { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -58,8 +60,7 @@ stat_ticks() { # the utime + stime of a process, all its threads, in clock ticks
 }
 
 # The image's media and scripts, where the suite finds them natively.
-phys() { for b in "$HOME/.local/share/nix/root" ""; do [ -e "$b$1" ] && { echo "$b$1"; return; }; done; echo "$1"; }
-APPS=$(readlink "$(phys "$(readlink "$RIG/guest/result")")/opt/nvgpu/apps")
+APPS=$(readlink "$(rig_phys "$(readlink "$RIG/guest/result")")/opt/nvgpu/apps")
 
 run_native() { # run_native N
     # Without XDG_DATA_DIRS, as the guest's probes run: `nix shell` points it
@@ -78,18 +79,12 @@ run_vm() { # run_vm N
     [ -n "${NVGPU_BENCH_BACKEND_ARGS:-}" ] && read -r -a extra <<<"$NVGPU_BENCH_BACKEND_ARGS"
     local console=$RIG/logs/$tag.console.log
     rm -f "$console"
-    NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((BUDGET + 90))} \
-        NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=$((BUDGET + 60)) nvgpu_cmd=$(printf %s "$gcmd" | base64 -w0) ${NVGPU_CMDLINE_EXTRA:-}" \
-        "$REPO/rig/run-guest.sh" --wayland-socket "$WL" run "$tag" ${extra[@]+-- "${extra[@]}"} \
-        >"$OUT/vm-$1.launcher.log" 2>&1 &
+    rig_run_vm "$tag" "$WL" "$BUDGET" "$gcmd" ${extra[@]+"${extra[@]}"} >"$OUT/vm-$1.launcher.log" 2>&1 &
     local launcher=$! be= vmm= i
     # The backend's and the VMM's CPU, sampled; the console's section lines,
     # stamped as they arrive.
     for i in $(seq 1 100); do
-        # This user's, and the backend as run-guest.sh starts it (the
-        # binary, then --socket): not another VM's, nor an editor's.
-        be=$(pgrep -n -u "$(id -u)" -f '^[^ ]*/vhost-user-nvgpu --socket ') &&
-            vmm=$(pgrep -n -u "$(id -u)" -x nesbox || pgrep -n -u "$(id -u)" -x crosvm) && break
+        be=$(rig_backend_pid) && vmm=$(rig_vmm_pid) && break
         sleep 0.2
     done
     (
@@ -110,10 +105,7 @@ run_vm() { # run_vm N
     kill "$sampler" "$stamper" 2>/dev/null
     wait 2>/dev/null
     tr -d '\r' <"$console" | grep -a '^BENCH' | grep -av '^BENCH-SECTION\|^BENCH_PACING' >"$OUT/vm-$1.bench"
-    {
-        tr -d '\r' <"$console" | sed -n '/^BENCH_PACING_BEGIN/,/^BENCH_PACING_END/p' | sed '1d;$d' | sed 's/^/guest: /'
-        grep -a 'pacing:' "$RIG/logs/$tag.backend.log" | sed 's/^.*\] //'
-    } >"$OUT/vm-$1.pacing"
+    rig_pacing "$console" "$RIG/logs/$tag.backend.log" BENCH_PACING >"$OUT/vm-$1.pacing"
     python3 "$REPO/rig/bench-cpu.py" "$OUT/vm-$1.samples" "$OUT/vm-$1.sections" >"$OUT/vm-$1.cpu"
     cat "$OUT/vm-$1.cpu" >>"$OUT/vm-$1.bench"
     cp "$RIG/logs/$tag.backend.log" "$OUT/vm-$1.backend.log" 2>/dev/null

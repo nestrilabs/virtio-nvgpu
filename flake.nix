@@ -72,15 +72,6 @@
         ];
         # The tests run in checks.test, with the whole workspace.
         doCheck = false;
-        # The backend's units (the VMM templates name a VMM this package
-        # does not have).
-        postInstall = ''
-          for u in vhost-user-nvgpu@.service vhost-user-nvgpu@.socket vhost-user-nvgpu-inject@.socket; do
-            install -Dm0644 contrib/systemd/$u $out/lib/systemd/system/$u
-          done
-          substituteInPlace $out/lib/systemd/system/vhost-user-nvgpu@.service \
-            --replace-fail /usr/bin/vhost-user-nvgpu $out/bin/vhost-user-nvgpu
-        '';
         meta = {
           description = "vhost-user backend of the virtio-nvgpu device";
           license = lib.licenses.asl20;
@@ -113,6 +104,11 @@
       packages.${system} = {
         vhost-user-nvgpu = backend;
         nvgpu-wl-guest = wlGuest;
+        # The backend's units and their helper, contrib/systemd's for this
+        # backend (nix/units.nix; the NixOS module installs the same). The
+        # VMM templates are not among them: they name a VMM this flake does
+        # not build.
+        units = pkgs.callPackage ./nix/units.nix { inherit backend; };
         default = backend;
       };
 
@@ -144,9 +140,10 @@
           patchShebangs scripts/check-unsafe.sh
           scripts/check-unsafe.sh
         '';
-        inherit (self.packages.${system}) vhost-user-nvgpu nvgpu-wl-guest;
-        # nix/module.nix evaluated: its assertions refuse what they must,
-        # and its units say what contrib/systemd's do.
+        inherit (self.packages.${system}) vhost-user-nvgpu nvgpu-wl-guest units;
+        # nix/module.nix evaluated: its assertions refuse what they must, its
+        # units are contrib/systemd's, and its drop-ins set only what is per
+        # slot.
         module-eval = import ./nix/module-test.nix {
           inherit nixpkgs system;
           module = self.nixosModules.default;
