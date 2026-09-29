@@ -53,3 +53,5 @@ virtio-nvgpu-*.md
 
 # The worktree-local outputs of a build: modules, images.
 /.rig-out/
+# A worktree's own clones of the VMMs (nesbox, crosvm), for their patches.
+/.vmm-src/

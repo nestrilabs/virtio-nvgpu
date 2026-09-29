@@ -1,0 +1,287 @@
+From d1a44b44fb90bcd214ece5037d96ef333718873b Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Tue, 29 Sep 2026 13:31:05 +0000
+Subject: [PATCH] vm_control: prefault virtio-nvgpu's window mappings
+
+A guest's first touch of each page of a window mapping faulted out to KVM,
+about 3.1 us a page for BAR1 video memory (a PFNMAP): a fresh 64 MiB
+mapping was written at 1.3 GB/s against the host's 11. KVM_PRE_FAULT_MEMORY
+(Linux 6.11) maps the same pages from inside the kernel, about 0.13 us a
+page, but it is a vCPU's call and a running vCPU holds its lock in KVM_RUN.
+
+So the main process makes one more vCPU that never runs (an id past the
+ACPI tables', the supported CPUID, so the same TDP root), and a thread of
+its own prefaults each window mapping the nvgpu tube registered, after the
+mapping has been answered: a hint bounded to 1024 waiting ranges. A range
+withdrawn before its turn is refused by KVM and passed over; a hypervisor
+without the call (Vcpu::pre_fault_memory's default, ENOSYS) stops the thread.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ hypervisor/src/kvm/mod.rs         | 21 ++++++++
+ hypervisor/src/lib.rs             |  8 +++
+ kvm_sys/src/lib.rs                |  1 +
+ src/crosvm/sys/linux.rs           | 39 ++++++++++++++-
+ vm_control/src/sys/linux/nvgpu.rs | 83 +++++++++++++++++++++++++++++++
+ 5 files changed, 150 insertions(+), 2 deletions(-)
+
+diff --git a/hypervisor/src/kvm/mod.rs b/hypervisor/src/kvm/mod.rs
+index c165a28..3683eb4 100644
+--- a/hypervisor/src/kvm/mod.rs
++++ b/hypervisor/src/kvm/mod.rs
+@@ -1080,6 +1080,27 @@ impl Vcpu for KvmVcpu {
+         Ok(())
+     }
+ 
++    fn pre_fault_memory(&self, gpa: u64, size: u64) -> Result<()> {
++        let mut r = kvm_pre_fault_memory {
++            gpa,
++            size,
++            ..Default::default()
++        };
++        while r.size > 0 {
++            // SAFETY:
++            // KVM_PRE_FAULT_MEMORY reads and writes exactly this struct, which lives for the
++            // call; it moves `gpa` and `size` on by what it did before an interruption.
++            let ret = unsafe { ioctl_with_mut_ref(self, KVM_PRE_FAULT_MEMORY, &mut r) };
++            if ret < 0 {
++                let e = Error::last();
++                if e.errno() != libc::EINTR && e.errno() != libc::EAGAIN {
++                    return Err(e);
++                }
++            }
++        }
++        Ok(())
++    }
++
+     unsafe fn enable_raw_capability(&self, cap: u32, args: &[u64; 4]) -> Result<()> {
+         let kvm_cap = kvm_enable_cap {
+             cap,
+diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
+index 9324647..344b7ae 100644
+--- a/hypervisor/src/lib.rs
++++ b/hypervisor/src/lib.rs
+@@ -443,6 +443,14 @@ pub trait Vcpu: std::any::Any + Send + Sync {
+     /// Signals to the hypervisor that this Vcpu is being paused by userspace.
+     fn on_suspend(&self) -> Result<()>;
+ 
++    /// Populates the VM's second-level page tables for `[gpa, gpa + size)` ahead of the guest's
++    /// first access (KVM_PRE_FAULT_MEMORY), as far as the memory slots back it. Only through a
++    /// vCPU that is not running: a running one holds its own lock. ENOSYS where the hypervisor
++    /// has no such call.
++    fn pre_fault_memory(&self, _gpa: u64, _size: u64) -> Result<()> {
++        Err(base::Error::new(libc::ENOSYS))
++    }
++
+     /// Enables a hypervisor-specific extension on this Vcpu.  `cap` is a constant defined by the
+     /// hypervisor API (e.g., kvm.h).  `args` are the arguments for enabling the feature, if any.
+     ///
+diff --git a/kvm_sys/src/lib.rs b/kvm_sys/src/lib.rs
+index 65a359f..2cf7f6b 100644
+--- a/kvm_sys/src/lib.rs
++++ b/kvm_sys/src/lib.rs
+@@ -173,3 +173,4 @@ ioctl_iow_nr!(KVM_SET_ONE_REG, KVMIO, 0xac, kvm_one_reg);
+ ioctl_io_nr!(KVM_KVMCLOCK_CTRL, KVMIO, 0xad);
+ ioctl_iowr_nr!(KVM_GET_REG_LIST, KVMIO, 0xb0, kvm_reg_list);
+ ioctl_io_nr!(KVM_SMI, KVMIO, 0xb7);
++ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd5, kvm_pre_fault_memory);
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 6514967..6f909fd 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -4405,6 +4405,32 @@ fn run_control(
+     });
+     let vm_memory_control_client = VmMemoryClient::new(vm_memory_control_tube_2);
+     let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
++    // virtio-nvgpu's window mappings are prefaulted through one more vCPU, which never runs
++    // (vm_control::sys::linux::nvgpu::Prefaulter).
++    #[cfg(target_arch = "x86_64")]
++    let nvgpu_prefault = if vm_memory_control_tubes.iter().any(|t| t.policy.is_some()) {
++        let made = linux.vm.create_vcpu(linux.vcpu_count).and_then(|v| {
++            let cpuid = linux.vm.get_hypervisor().get_supported_cpuid()?;
++            v.set_cpuid(&cpuid)?;
++            Ok(v)
++        });
++        match made.map_err(anyhow::Error::from).and_then(|v| {
++            vm_control::sys::linux::nvgpu::Prefaulter::start(v).map_err(anyhow::Error::from)
++        }) {
++            Ok(tx) => {
++                info!("nvgpu: window mappings are prefaulted (KVM_PRE_FAULT_MEMORY)");
++                Some(tx)
++            }
++            Err(e) => {
++                warn!("nvgpu: no prefault vCPU ({:#}); the window faults in page by page", e);
++                None
++            }
++        }
++    } else {
++        None
++    };
++    #[cfg(not(target_arch = "x86_64"))]
++    let nvgpu_prefault = None;
+     let vm_memory_handler_thread = std::thread::Builder::new()
+         .name("vm_memory_handler_thread".into())
+         .spawn({
+@@ -4422,6 +4448,7 @@ fn run_control(
+                     gralloc,
+                     iommu_client,
+                     vm_memory_handler_control_for_thread,
++                    nvgpu_prefault,
+                 )
+             }
+         })
+@@ -5147,6 +5174,7 @@ fn vm_memory_handler_thread(
+     #[cfg(feature = "gpu")] mut gralloc: RutabagaGralloc,
+     mut iommu_client: Option<VmMemoryRequestIommuClient>,
+     handler_control: Tube,
++    nvgpu_prefault: Option<std::sync::mpsc::SyncSender<(u64, u64)>>,
+ ) -> anyhow::Result<()> {
+     #[derive(EventToken)]
+     enum Token {
+@@ -5163,7 +5191,10 @@ fn vm_memory_handler_thread(
+     let mut next_control_id = control_tubes.len();
+     for (id, socket) in control_tubes.iter_mut() {
+         if let Some(policy) = socket.policy.take() {
+-            restricted.insert(*id, NvgpuTubeState::new(policy));
++            restricted.insert(
++                *id,
++                NvgpuTubeState::new(policy).with_prefault(nvgpu_prefault.clone()),
++            );
+         }
+         wait_ctx
+             .add(socket.as_ref(), Token::VmControl { id: *id })
+@@ -5194,7 +5225,11 @@ fn vm_memory_handler_thread(
+                                 let id = next_control_id;
+                                 next_control_id += 1;
+                                 if let Some(policy) = socket.policy.take() {
+-                                    restricted.insert(id, NvgpuTubeState::new(policy));
++                                    restricted.insert(
++                                        id,
++                                        NvgpuTubeState::new(policy)
++                                            .with_prefault(nvgpu_prefault.clone()),
++                                    );
+                                 }
+                                 wait_ctx
+                                     .add(socket.get_read_notifier(), Token::VmControl { id })
+diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
+index 493392a..ab32722 100644
+--- a/vm_control/src/sys/linux/nvgpu.rs
++++ b/vm_control/src/sys/linux/nvgpu.rs
+@@ -715,6 +715,57 @@ pub struct NvgpuTubeState {
+     band: &'static Mutex<UvmBand>,
+     window_fd_check: fn(&SafeDescriptor, bool) -> Result<(), i32>,
+     uvm_fd_check: fn(&SafeDescriptor) -> Result<(), i32>,
++    /// Where each window mapping is sent to be prefaulted, if anywhere ([`Prefaulter`]).
++    prefault: Option<std::sync::mpsc::SyncSender<(u64, u64)>>,
++}
++
++/// Ranges waiting for the prefault thread, at most; past that a range is not prefaulted.
++pub const PREFAULT_QUEUE: usize = 1024;
++
++/// Fills in the guest's second-level page tables for each window mapping, ahead of its first
++/// touch.
++///
++/// A window mapping is in this process's address space at once, but KVM learns of it one fault
++/// at a time: every 4 KiB page's first access leaves the guest, about 3.1 us a page for BAR1
++/// video memory (a PFNMAP) on a Zen 5 host with Linux 7.2, so a guest wrote a fresh 64 MiB
++/// mapping at 1.3 GB/s against the host's 11. KVM_PRE_FAULT_MEMORY maps the same pages from
++/// inside the kernel, about 0.13 us a page, as a read fault would: video memory comes out
++/// writable, and the driver's system memory read-only, so a guest's first write of that still
++/// faults, once a page (its reads do not). It is a vCPU's call, and a vCPU in KVM_RUN -- where
++/// the guest's always are -- holds its own lock throughout, so it is made on `vcpu`: one more,
++/// that never runs (its APIC id is past every one the ACPI tables list, so the guest never
++/// starts it), given the supported CPUID as the others are, so it shares their TDP root. What it
++/// maps is only what the memory slots already back -- what the guest's own first access would
++/// map. It runs on a thread of its own after the mapping has been answered, so a map costs the
++/// guest nothing more; a guest that touches the range first takes the faults it always did, and
++/// a range withdrawn before its turn is refused by KVM (EFAULT) and passed over.
++pub struct Prefaulter;
++
++impl Prefaulter {
++    /// Start the thread; send it `(guest address, length)` pairs.
++    pub fn start<V: hypervisor::Vcpu + ?Sized + 'static>(
++        vcpu: std::sync::Arc<V>,
++    ) -> io::Result<std::sync::mpsc::SyncSender<(u64, u64)>> {
++        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, u64)>(PREFAULT_QUEUE);
++        std::thread::Builder::new()
++            .name("nvgpu_prefault".into())
++            .spawn(move || {
++                let mut refused = 0u64;
++                while let Ok((gpa, size)) = rx.recv() {
++                    if let Err(e) = vcpu.pre_fault_memory(gpa, size) {
++                        if e.errno() == libc::ENOSYS || e.errno() == libc::ENOTTY {
++                            warn!("nvgpu: KVM_PRE_FAULT_MEMORY unavailable ({}); not prefaulting", e);
++                            return;
++                        }
++                        refused += 1;
++                        if refused.is_power_of_two() {
++                            info!("nvgpu: prefault of {:#x}+{:#x}: {} ({} so far)", gpa, size, e, refused);
++                        }
++                    }
++                }
++            })?;
++        Ok(tx)
++    }
+ }
+ 
+ fn err_response(errno: i32) -> VmMemoryResponse {
+@@ -756,9 +807,16 @@ impl NvgpuTubeState {
+             band: &UVM_BAND,
+             window_fd_check: check_window_fd,
+             uvm_fd_check: check_uvm_fd,
++            prefault: None,
+         }
+     }
+ 
++    /// Prefault each window mapping from here on, through `tx` ([`Prefaulter`]).
++    pub fn with_prefault(mut self, tx: Option<std::sync::mpsc::SyncSender<(u64, u64)>>) -> Self {
++        self.prefault = tx;
++        self
++    }
++
+     /// Serve one request from this tube.
+     pub fn handle(
+         &mut self,
+@@ -800,6 +858,11 @@ impl NvgpuTubeState {
+                 if let VmMemoryResponse::RegisterMemory { region_id, .. } = response {
+                     self.window.insert(offset, len);
+                     self.window_ids.insert(*region_id, offset);
++                    // The guest address it was placed at, the length admitted: a hint, dropped
++                    // when the queue is full.
++                    if let Some(tx) = &self.prefault {
++                        let _ = tx.try_send((region_id.0 .0, len));
++                    }
+                 }
+             }
+             // Whatever the answer, the main process's own record of it is gone.
+@@ -1400,6 +1463,26 @@ mod tests {
+         }
+     }
+ 
++    /// A window mapping that was registered is handed to the prefault thread -- the guest
++    /// address it was given, the admitted length -- and one that failed or was refused is not.
++    #[test]
++    fn a_registered_window_mapping_and_only_that_is_prefaulted() {
++        let (tx, rx) = std::sync::mpsc::sync_channel(PREFAULT_QUEUE);
++        let mut s = state(true).with_prefault(Some(tx));
++        let page = base::pagesize() as u64;
++        assert_eq!(admit_ok(&mut s, register(4 * page, 0xc50, 0)), None);
++        // Failed on execution: nothing recorded, nothing prefaulted.
++        match s.admit(register(8 * page, page, 0)) {
++            Admission::Execute(_, pending) => s.note(pending, &err_response(libc::ENOMEM)),
++            _ => panic!("admitted"),
++        }
++        // Outside the window: refused before anything.
++        assert!(admit_ok(&mut s, register(1 << 40, page, 0)).is_some());
++        let sent: Vec<(u64, u64)> = rx.try_iter().collect();
++        let len = 0xc50u64.div_ceil(page) * page;
++        assert_eq!(sent, vec![(BAR_GPA + 4 * page, len)]);
++    }
++
+     #[test]
+     fn window_mappings_are_held_to_the_window() {
+         let mut s = state(true);
+-- 
+2.55.0
+
