@@ -1563,10 +1563,10 @@ impl Prepared {
 // ───────────────────────────── execution ─────────────────────────────
 
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xc040_64aa;
-const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xc00c_642d;
-const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xc00c_642e;
-const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409;
-const DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT: u32 = 0xc008_644e;
+use crate::hostfd::{
+    DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_NVIDIA_GEM_IDENTIFY_OBJECT, DRM_IOCTL_PRIME_FD_TO_HANDLE,
+    DRM_IOCTL_PRIME_HANDLE_TO_FD,
+};
 const DRM_CLOEXEC: u32 = libc::O_CLOEXEC as u32;
 const NV_GEM_OBJECT_NVKMS: u64 = 0;
 

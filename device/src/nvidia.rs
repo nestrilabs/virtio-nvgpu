@@ -815,7 +815,7 @@ enum V1Route {
 /// nr with a larger `_IOC_SIZE`.
 const DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x41, 32);
 const DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x49, 24);
-const DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4a, 16);
+use hostfd::DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET;
 const DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4b, 24);
 const DRM_IOCTL_NVIDIA_GEM_EXPORT_DMABUF_MEMORY: u32 = hostfd::ioc(hostfd::IOC_RW, b'd', 0x4d, 24);
 
@@ -6963,6 +6963,34 @@ mod tests {
             assert_eq!(parse_resp(&r).status, -libc::EPERM, "{kind:?}");
         }
         assert!(forwarded().is_empty());
+    }
+
+    /// The nvidia-drm commands the v1 route takes are the IOCTL2 schema's,
+    /// size included (gen/schema/nvidia_drm.py), where the schema has them.
+    #[test]
+    fn the_v1_render_commands_are_the_schemas_numbers() {
+        use crate::schema::{Class, DRM_TABLE};
+        for cmd in [
+            DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY,
+            DRM_IOCTL_NVIDIA_GEM_EXPORT_NVKMS_MEMORY,
+            DRM_IOCTL_NVIDIA_GEM_ALLOC_NVKMS_MEMORY,
+            DRM_IOCTL_NVIDIA_GEM_EXPORT_DMABUF_MEMORY,
+        ] {
+            let e = DRM_TABLE.lookup(Class::Render, cmd).expect("in the schema");
+            assert_eq!(e.cmd, cmd, "{}", e.name);
+            assert_eq!(e.size as usize, hostfd::ioc_size(cmd), "{}", e.name);
+        }
+        // Refused by absence from IOCTL2, which the v1 route still takes.
+        assert!(
+            DRM_TABLE
+                .lookup(Class::Render, DRM_IOCTL_NVIDIA_GEM_MAP_OFFSET)
+                .is_none()
+        );
+        assert!(
+            DRM_TABLE
+                .lookup(Class::Render, hostfd::DRM_IOCTL_GEM_CLOSE)
+                .is_none()
+        );
     }
 
     #[test]

@@ -278,6 +278,50 @@ mod tests {
         );
     }
 
+    /// The config space, field for field, and the constants of nvgpu_wire.h
+    /// this module holds, as the C header declares them (protocol's tests
+    /// check the rest of the header).
+    #[test]
+    fn config_space_is_laid_out_as_the_header_says() {
+        let h = protocol::cheader::Header::parse(include_str!("../../driver/nvgpu_wire.h"));
+        assert_eq!(h.define("VIRTIO_ID_GPU_NV"), u64::from(VIRTIO_ID_GPU_NV));
+        assert_eq!(h.define("NVGPU_FDT_UVM"), u64::from(crate::uvmfd::FDT_UVM));
+        macro_rules! fields {
+            ($t:ty, [$($f:ident),* $(,)?]) => {
+                (size_of::<$t>(), vec![$((stringify!($f).to_string(), offset_of!($t, $f))),*])
+            };
+        }
+        for (name, (size, fields)) in [
+            (
+                "virtio_gpu_nv_gpu_slot",
+                fields!(GpuSlot, [pci_addr, minor, info_len, padding, info_text]),
+            ),
+            (
+                "nvgpu_fd_translation_entry",
+                fields!(FdTranslation, [nr, payload_offset]),
+            ),
+            (
+                "virtio_gpu_nv_config",
+                fields!(
+                    VirtioGpuNvConfig,
+                    [
+                        driver_version,
+                        num_gpus,
+                        caps,
+                        gpu_device_ids,
+                        gpus,
+                        num_fd_translations,
+                        _pad,
+                        fd_translations,
+                    ]
+                ),
+            ),
+        ] {
+            let c = h.layout(name);
+            assert_eq!((c.size, &c.fields), (size, &fields), "struct {name}");
+        }
+    }
+
     /// Every field the driver reads by a fixed offset.
     #[test]
     fn field_offsets_are_where_the_driver_reads_them() {
