@@ -906,13 +906,19 @@ pub struct OsDesc {
     uvm_ranges: HashMap<u32, BTreeMap<u64, u64>>,
     uvm_range_count: usize,
     uvm_ranges_warned: bool,
+    /// The guest process each UVM file with recorded ranges is charged
+    /// to, and how many each process has recorded: a quarter of the VM's
+    /// bound each (review 2026-09-29 1.8).
+    uvm_range_files: HashMap<u32, crate::quota::Owner>,
+    uvm_ranges_by_owner: HashMap<crate::quota::Owner, usize>,
     per_file: HashMap<u32, (usize, u64)>,
     /// The guest process each file is charged to, and what each process
     /// holds (quota.rs): a process holds at most a file's budget, whatever
     /// number of files it has, and the VM's last sixteenth is kept for
     /// processes holding at most a sixty-fourth (B5).
     file_owners: HashMap<u32, crate::quota::Owner>,
-    per_owner: HashMap<crate::quota::Owner, (usize, u64)>,
+    /// Registrations, bytes and separately mapped runs.
+    per_owner: HashMap<crate::quota::Owner, (usize, u64, usize)>,
     bytes: u64,
     vmas: usize,
     /// (sequence, id), oldest first.
@@ -937,6 +943,8 @@ impl OsDesc {
             uvm_ranges: HashMap::new(),
             uvm_range_count: 0,
             uvm_ranges_warned: false,
+            uvm_range_files: HashMap::new(),
+            uvm_ranges_by_owner: HashMap::new(),
             per_file: HashMap::new(),
             file_owners: HashMap::new(),
             per_owner: HashMap::new(),
@@ -971,6 +979,16 @@ impl OsDesc {
         self.by_key.contains_key(&Key { client, object })
     }
 
+    /// `(client, object)` holds a registration, as far as `holds` is
+    /// concerned.
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&mut self, client: u32, object: u32) {
+        self.by_key
+            .entry(Key { client, object })
+            .or_default()
+            .push(u64::MAX);
+    }
+
     /// Guest file `file` is charged to `owner` (quota.rs).
     pub(crate) fn set_file_owner(&mut self, file: u32, owner: crate::quota::Owner) {
         if owner == crate::quota::Owner::Unknown {
@@ -986,7 +1004,7 @@ impl OsDesc {
         let (fregs, fbytes) = self.per_file.get(&file).copied().unwrap_or((0, 0));
         let l = &self.limits;
         let owner = self.file_owners.get(&file).copied().unwrap_or_default();
-        let (oregs, obytes) = self.per_owner.get(&owner).copied().unwrap_or((0, 0));
+        let (oregs, obytes, ovmas) = self.per_owner.get(&owner).copied().unwrap_or((0, 0, 0));
         let in_use = (self.regs.len() + self.released.len()) as u64;
         let share = |per_file: u64, per_vm: u64| crate::quota::Share {
             per_owner: per_file,
@@ -1017,6 +1035,21 @@ impl OsDesc {
             && self.bytes + bytes <= l.bytes_per_vm
         {
             "bytes for the guest process"
+        } else if crate::quota::admits(
+            // The separately mapped runs, a quarter each: one process's
+            // one-page runs took all of them, and every other process's
+            // registration failed (review 2026-09-29 1.8).
+            &crate::quota::Share::quarter(l.vmas_per_vm as u64, 16),
+            owner,
+            ovmas as u64,
+            vmas as u64,
+            self.vmas as u64,
+            l.vmas_per_vm as u64,
+        )
+        .is_err()
+            && self.vmas + vmas <= l.vmas_per_vm
+        {
+            "separate mappings for the guest process"
         } else if self.regs.len() + self.released.len() >= l.regs_per_vm {
             "registrations for the VM"
         } else if fregs >= l.regs_per_file {
@@ -1046,8 +1079,13 @@ impl OsDesc {
     ) -> u64 {
         let key = Key { client, object };
         // RM made a new object under this handle, so whatever was there
-        // before is gone.
-        self.drop_key(key);
+        // before is gone. Object 0 is no handle (RM made one it did not
+        // write back): a second registration answered so must not end the
+        // first while RM still pins its pages; both then live until their
+        // client goes (review 2026-09-29 1.19).
+        if object != 0 {
+            self.drop_key(key);
+        }
         let id = self.next_id;
         self.next_id += 1;
         let e = self.per_file.entry(file).or_default();
@@ -1058,6 +1096,7 @@ impl OsDesc {
             let o = self.per_owner.entry(owner).or_default();
             o.0 += 1;
             o.1 += pinned.bytes;
+            o.2 += pinned.vmas;
         }
         self.bytes += pinned.bytes;
         self.vmas += pinned.vmas;
@@ -1131,6 +1170,7 @@ impl OsDesc {
         if let Some(e) = self.per_owner.get_mut(&r.owner) {
             e.0 -= 1;
             e.1 -= r.bytes;
+            e.2 -= r.vmas;
             if e.0 == 0 {
                 self.per_owner.remove(&r.owner);
             }
@@ -1396,7 +1436,39 @@ impl OsDesc {
     /// UVM file `file` made an external range (CREATE_EXTERNAL_RANGE
     /// succeeded). Past the VM's bound it is not recorded, and a mapping of
     /// registered memory inside it is held until its file closes.
+    #[cfg(test)]
     pub(crate) fn uvm_range_made(&mut self, file: u32, base: u64, len: u64) {
+        self.uvm_range_made_by(file, base, len, crate::quota::Owner::Unknown);
+    }
+
+    /// [`OsDesc::uvm_range_made`], on a UVM file charged to guest process
+    /// `owner`, which may record only its share of the VM's bound: past
+    /// it, as past the VM's, the range is not recorded, and only that
+    /// process's mappings in it are affected (review 2026-09-29 1.8).
+    pub(crate) fn uvm_range_made_by(
+        &mut self,
+        file: u32,
+        base: u64,
+        len: u64,
+        owner: crate::quota::Owner,
+    ) {
+        let limit = self.limits.uvm_ranges_per_vm as u64;
+        let owner = *self.uvm_range_files.entry(file).or_insert(owner);
+        let mine = self.uvm_ranges_by_owner.get(&owner).copied().unwrap_or(0);
+        if let Err(crate::quota::Over::Owner | crate::quota::Over::Reserve) = crate::quota::admits(
+            &crate::quota::Share::quarter(limit, 16),
+            owner,
+            mine as u64,
+            1,
+            self.uvm_range_count as u64,
+            limit,
+        ) {
+            log::debug!(
+                "UVM external ranges: guest process {owner:?} has {mine} recorded; one more \
+                 is not"
+            );
+            return;
+        }
         if self.uvm_range_count >= self.limits.uvm_ranges_per_vm {
             if !self.uvm_ranges_warned {
                 self.uvm_ranges_warned = true;
@@ -1416,6 +1488,20 @@ impl OsDesc {
             .is_none()
         {
             self.uvm_range_count += 1;
+            *self.uvm_ranges_by_owner.entry(owner).or_default() += 1;
+        }
+    }
+
+    /// `n` of UVM file `file`'s recorded ranges are gone.
+    fn uvm_ranges_gone(&mut self, file: u32, n: usize) {
+        self.uvm_range_count -= n;
+        if let Some(&o) = self.uvm_range_files.get(&file)
+            && let Some(c) = self.uvm_ranges_by_owner.get_mut(&o)
+        {
+            *c -= n;
+            if *c == 0 {
+                self.uvm_ranges_by_owner.remove(&o);
+            }
         }
     }
 
@@ -1425,7 +1511,7 @@ impl OsDesc {
         let Some(len) = self.uvm_ranges.get_mut(&file).and_then(|m| m.remove(&base)) else {
             return;
         };
-        self.uvm_range_count -= 1;
+        self.uvm_ranges_gone(file, 1);
         self.drop_uvm_where(|h| h.file == Some(file) && h.within(base, len));
     }
 
@@ -1471,8 +1557,9 @@ impl OsDesc {
     /// and a later file under the same handle must not end it.
     pub(crate) fn uvm_file_closed(&mut self, file: u32) {
         if let Some(r) = self.uvm_ranges.remove(&file) {
-            self.uvm_range_count -= r.len();
+            self.uvm_ranges_gone(file, r.len());
         }
+        self.uvm_range_files.remove(&file);
         for h in &mut self.uvm {
             if h.file == Some(file) {
                 log::warn!(
@@ -1493,6 +1580,8 @@ impl OsDesc {
         self.uvm.clear();
         self.uvm_ranges.clear();
         self.uvm_range_count = 0;
+        self.uvm_range_files.clear();
+        self.uvm_ranges_by_owner.clear();
         let ids: Vec<u64> = self.regs.keys().copied().collect();
         for id in ids {
             self.release(id);
@@ -1927,6 +2016,21 @@ mod tests {
         assert_eq!(o.admit(2, PAGE, 0), Ok(()));
     }
 
+    /// Object 0 names nothing: a second registration keyed by it does not
+    /// end the first, and both go with their client (review 2026-09-29
+    /// 1.19).
+    #[test]
+    fn a_registration_under_no_handle_is_ended_by_nothing_but_its_client() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        o.add(1, 0xc1, 0, 0, pinned(&ram, &[(LOW, 1)]));
+        o.add(1, 0xc1, 0, 0, pinned(&ram, &[(LOW, 1)]));
+        assert_eq!(o.reap(0).1, Vec::<u64>::new());
+        assert_eq!(o.live(), 2);
+        o.forget_clients(&[0xc1]);
+        assert_eq!(o.reap(0).1.len(), 2);
+    }
+
     #[test]
     fn a_handle_made_again_ends_what_it_named() {
         let ram = ram();
@@ -2029,6 +2133,57 @@ mod tests {
         assert_eq!((o.live(), o.uvm_held()), (1, 1));
         o.clear();
         assert_eq!((o.live(), o.uvm_held(), o.unreaped()), (0, 0, 0));
+    }
+
+    /// One process's one-page runs, or its external ranges, take no more
+    /// than a quarter of the VM's: another process still registers, and
+    /// still has its ranges recorded (review 2026-09-29 1.8).
+    #[test]
+    fn one_process_takes_a_quarter_of_the_runs_and_the_ranges() {
+        let ram = ram();
+        let mut o = OsDesc::with_limits(Limits {
+            vmas_per_vm: 64,
+            uvm_ranges_per_vm: 64,
+            ..Limits::default()
+        });
+        let (a, b) = (
+            crate::quota::Owner::Proc {
+                tgid: 1,
+                start_ns: 1,
+            },
+            crate::quota::Owner::Proc {
+                tgid: 2,
+                start_ns: 1,
+            },
+        );
+        o.set_file_owner(1, a);
+        o.set_file_owner(2, b);
+        let mut n = 0u32;
+        // Two pages apart: two separately mapped runs each.
+        while o.admit(1, 2 * PAGE, 2).is_ok() {
+            n += 1;
+            o.add(1, 0xc1, n, 0, pinned(&ram, &[(LOW, 1), (HIGH, 1)]));
+            assert!(n <= 32);
+        }
+        assert_eq!(n, 8, "a quarter of the 64 runs");
+        assert_eq!(
+            o.admit(2, 2 * PAGE, 2),
+            Ok(()),
+            "another process still registers"
+        );
+
+        for i in 0..64u64 {
+            o.uvm_range_made_by(7, i << 20, 1 << 20, a);
+        }
+        assert_eq!(o.uvm_range_count, 16);
+        o.uvm_range_made_by(8, 1 << 40, 1 << 20, b);
+        assert_eq!(o.uvm_range_count, 17, "another process's range is recorded");
+        o.uvm_range_freed(7, 0);
+        o.uvm_range_made_by(7, 99 << 20, 1 << 20, a);
+        assert_eq!(o.uvm_range_count, 17, "freed, one more fits");
+        o.uvm_file_closed(7);
+        assert_eq!(o.uvm_range_count, 1);
+        assert!(!o.uvm_ranges_by_owner.contains_key(&a));
     }
 
     #[test]
@@ -2609,6 +2764,83 @@ mod backend_tests {
         assert_eq!(reap(&mut vm.be, 1), (1, vec![]));
     }
 
+    /// A new client whose handle is the number of a registration's object
+    /// is no new object of the registration's client: RM ignores hRoot for
+    /// the root classes, and the registration, still pinned by RM, stays
+    /// (review 2026-09-29 1.3).
+    #[test]
+    fn a_client_allocated_under_a_registrations_handle_leaves_it_registered() {
+        let mut vm = vm();
+        let gpu = vm.gpu;
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            gpu,
+            ALLOC_MEMORY,
+            &os02(GUEST_VA, PAGE, 7),
+            &[],
+            Some(&list(OSDESC_F_WRITE, &[(LOW + 5 * PAGE, 1)])),
+        );
+        assert_eq!(st, 0);
+        seen();
+        for class in crate::semsurf::ROOT_CLASSES {
+            let mut o = vec![0u8; 48];
+            put32(&mut o, 0, CLIENT);
+            put32(&mut o, 8, 0x5000_0001);
+            put32(&mut o, 12, class);
+            let ctl = vm.ctl;
+            let (st, ..) = ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &[], None);
+            assert_eq!(st, 0);
+        }
+        assert_eq!(vm.be.osdesc.live(), 1, "still registered");
+        assert_eq!(reap(&mut vm.be, 0), (0, vec![]), "nothing to unpin");
+        // Another class at that handle does end it: RM made a new object
+        // there, so the old one is gone.
+        let mut o = vec![0u8; 48];
+        put32(&mut o, 0, CLIENT);
+        put32(&mut o, 4, DEVICE);
+        put32(&mut o, 8, 0x5000_0001);
+        put32(&mut o, 12, 0x3e);
+        let ctl = vm.ctl;
+        let (st, ..) = ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &[], None);
+        assert_eq!(st, 0);
+        assert_eq!(reap(&mut vm.be, 0).1.len(), 1);
+    }
+
+    /// A registration whose reply would not fit what the guest posted is
+    /// refused before RM is asked, not after RM has pinned the pages
+    /// (review 2026-09-29 1.16).
+    #[test]
+    fn a_registration_with_no_room_for_its_reply_never_reaches_rm() {
+        let mut vm = vm();
+        let gpu = vm.gpu;
+        let mut body = Vec::new();
+        let outer = os02(GUEST_VA, PAGE, 7);
+        let l = list(OSDESC_F_WRITE, &[(LOW + 5 * PAGE, 1)]);
+        for v in [
+            ALLOC_MEMORY,
+            outer.len() as u32,
+            0,
+            0,
+            DEEP_PAGE_LIST,
+            l.len() as u32,
+        ] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+        body.extend_from_slice(&outer);
+        body.extend_from_slice(&l);
+        let mut req = Vec::new();
+        for v in [MsgType::Ioctl as u32, gpu, 0, 0x55] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req.extend_from_slice(&body);
+        // Room for the struct, not for the registration's id.
+        let mut resp = vec![0u8; size_of::<MsgHeader>() + size_of::<IoctlResp>() + 56 + 4];
+        vm.be.dispatch(&req, &mut resp);
+        assert_eq!(status(&resp), -libc::ENOSPC);
+        assert!(seen().is_empty(), "RM was never asked");
+        assert_eq!(vm.be.osdesc.live(), 0);
+    }
+
     /// Scattered pages across both regions, from an address inside its
     /// first page: RM is handed a range of the backend's own that maps those
     /// pages in list order, at the caller's offset, and reads the guest's
@@ -2903,7 +3135,7 @@ mod backend_tests {
             vmas_per_vm: 64,
             ..Limits::default()
         });
-        let (st, ..) = ioctl(
+        let (st, _, params, _) = ioctl(
             &mut vm.be,
             ctl,
             VID_HEAP,
@@ -2911,8 +3143,13 @@ mod backend_tests {
             &[],
             Some(&list(OSDESC_F_WRITE, &[(LOW, 3)])),
         );
-        assert_eq!(st, -libc::ENOMEM);
+        // RM's own out-of-memory answer in the caller's block, the ioctl
+        // succeeding (review 2026-09-29 parity #29).
+        assert_eq!(st, 0);
+        assert_eq!(rd32(&params, OS32_STATUS), crate::nvidia::NV_ERR_NO_MEMORY);
+        assert_eq!(rd64(&params, OS32_DESCRIPTOR), GUEST_VA, "the caller's own");
         assert!(seen().is_empty());
+        assert_eq!(vm.be.osdesc.live(), 0);
     }
 
     /// The file the client was allocated on closes: the backend frees the

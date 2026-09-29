@@ -247,11 +247,13 @@ impl VmKms {
 
     /// Forget every record: the session is gone, and with it every file.
     /// What is in use stays counted, and parked files parked, until the
-    /// calls still running from before let go.
+    /// calls still running from before let go. So do the retired marks:
+    /// a call made before the reset may still be running on a retired
+    /// file, and must record nothing when it finishes; each mark goes with
+    /// its file's last reference (review 2026-09-29 1.5).
     pub fn clear(&self) {
         let mut v = self.lock();
         v.owner.clear();
-        v.retired.clear();
         v.probed.clear();
         v.blobs.clear();
         v.seen_blobs.clear();
@@ -517,6 +519,8 @@ impl Drop for KmsFileState {
         let mut v = self.vm.lock();
         let me = self.serial;
         v.owner.retain(|_, s| *s != me);
+        v.blobs.retain(|_, s| *s != me);
+        v.seen_blobs.retain(|&(s, _, _), _| s != me);
         v.retired.remove(&me);
     }
 }
@@ -587,6 +591,14 @@ pub trait Hooks: Send + Sync {
     fn at_run<'a>(&'a self, p: &Prepared) -> Result<Option<RunGuard<'a>>, Errno> {
         let _ = p;
         Ok(None)
+    }
+
+    /// Whether a re-home may export `gem` of guest file `file` at all:
+    /// asked before the export; Err refuses the call. On the thread that
+    /// runs the call.
+    fn may_export(&self, file: u32, gem: u32) -> Result<(), Errno> {
+        let _ = (file, gem);
+        Ok(())
     }
 
     /// Whether a dma-buf a re-home has just exported may be imported
@@ -1641,6 +1653,20 @@ impl Prepared {
     /// otherwise, before the host sees the call. The kernel reads the id as
     /// a u32 whatever width it travels in (drm_framebuffer_lookup), so that
     /// is what is checked.
+    /// Whether `value` may be set on a property with `flags`: anything for
+    /// a property that is no blob; for a blob property (MODE_ID, GAMMA_LUT,
+    /// CTM, damage clips) none, or a blob this VM made or sees. Blob ids
+    /// are the device's, and a commit of another tenant's id would make
+    /// OBJ_GETPROPERTIES report it and GETPROPBLOB read it -- and a
+    /// TEST_ONLY commit alone says whether it exists and how large it is
+    /// (review 2026-09-29 1.9).
+    fn blob_usable(&self, flags: u32, value: u64) -> bool {
+        flags & DRM_MODE_PROP_BLOB == 0
+            || value == 0
+            || u32::try_from(value)
+                .is_ok_and(|id| self.kms.as_ref().is_some_and(|k| k.vm.blob_readable(id)))
+    }
+
     fn fb_usable(&mut self, id: u32) -> bool {
         match &self.kms {
             Some(k) => k.claim_scan_out(id, &mut self.fb_uses),
@@ -1742,13 +1768,16 @@ impl Prepared {
             // drm_mode_connector_set_property / drm_mode_obj_set_property:
             // prop_id @8 in both.
             let id = rd(self.bytes(0), 8, 4) as u32;
-            let name = self.prop_name(fd, id)?;
+            let (name, flags) = self.prop_info(fd, id)?;
             if self.hooks.prop_kind(trim(&name)) != PropKind::Plain {
                 return Err(libc::EINVAL);
             }
             // value @0: the same framebuffer rule as ATOMIC's, or the
             // legacy setter is the way round it (S-6).
             if Self::is_fb_prop(trim(&name)) && !self.fb_usable(rd(self.bytes(0), 0, 4) as u32) {
+                return Err(libc::EPERM);
+            }
+            if !self.blob_usable(flags, rd(self.bytes(0), 0, 8)) {
                 return Err(libc::EPERM);
             }
         }
@@ -1774,7 +1803,16 @@ impl Prepared {
                 .iter()
                 .position(|r| r.slot.is_none() && r.off == off);
             let out_rec = self.fence_outs.iter().position(|&(o, _)| o == off);
-            let name = self.prop_name(fd, id)?;
+            let (name, flags) = self.prop_info(fd, id)?;
+            if !self.blob_usable(flags, value) {
+                log::warn!(
+                    "ATOMIC on handle {} sets {} to blob {value}, which no file of this VM \
+                     made or sees; refused",
+                    self.target,
+                    String::from_utf8_lossy(trim(&name)),
+                );
+                return Err(libc::EPERM);
+            }
             if Self::is_fb_prop(trim(&name)) && !self.fb_usable(value as u32) {
                 log::warn!(
                     "ATOMIC on handle {} sets {} to framebuffer {}, which no file of this VM \
@@ -1824,16 +1862,12 @@ impl Prepared {
         Ok(())
     }
 
-    /// A property's name, by GETPROPERTY on the target file with every count
-    /// zero (drm_property.c:458: then neither pointer is written). Property
-    /// ids are device-global and fixed for the device's life, so the answer is
-    /// cached for the file. A property the host does not know is refused: the
-    /// host would refuse the call anyway, and "unknown" is not "plain".
-    fn prop_name(&self, fd: RawFd, id: u32) -> Result<[u8; 32], Errno> {
-        self.prop_info(fd, id).map(|(name, _)| name)
-    }
-
-    /// Property `id`'s name and flags, as `prop_name`.
+    /// A property's name and flags, by GETPROPERTY on the target file with
+    /// every count zero (drm_property.c:458: then neither pointer is
+    /// written). Property ids are device-global and fixed for the device's
+    /// life, so the answer is cached for the file. A property the host does
+    /// not know is refused: the host would refuse the call anyway, and
+    /// "unknown" is not "plain".
     fn prop_info(&self, fd: RawFd, id: u32) -> Result<([u8; 32], u32), Errno> {
         if let Some(n) = self
             .kms
@@ -1949,7 +1983,7 @@ impl Prepared {
                     h
                 } else {
                     let owner_fd = self.owners[&owner].as_raw_fd();
-                    let dmabuf = self.prime_export(owner_fd, gem)?;
+                    let dmabuf = self.prime_export(owner, owner_fd, gem)?;
                     let imported = self.prime_import(target_fd, dmabuf.as_raw_fd());
                     self.sys.close(dmabuf);
                     let h = imported?;
@@ -2158,7 +2192,7 @@ impl Prepared {
 
     fn move_to_render(&self, target_fd: RawFd, h: u32) -> Result<(u32, u64), Errno> {
         let render = self.render_fd.as_ref().ok_or(libc::EINVAL)?.as_raw_fd();
-        let dmabuf = self.prime_export(target_fd, h)?;
+        let dmabuf = self.prime_export(self.target, target_fd, h)?;
         let size = self.sys.size_of(dmabuf.as_raw_fd());
         let imported = self.prime_import(render, dmabuf.as_raw_fd());
         self.sys.close(dmabuf);
@@ -2180,7 +2214,10 @@ impl Prepared {
         crate::sys::block::flat(&*self.sys, fd, u64::from(cmd), a)
     }
 
-    fn prime_export(&self, fd: RawFd, gem: u32) -> Result<OwnedFd, Errno> {
+    /// `gem` of guest file `file` (host descriptor `fd`) as a dma-buf, if
+    /// the export gate lets it leave (exportgate.rs, through the hooks).
+    fn prime_export(&self, file: u32, fd: RawFd, gem: u32) -> Result<OwnedFd, Errno> {
+        self.hooks.may_export(file, gem)?;
         let mut b = [0u8; 12];
         wr(&mut b, 0, 4, u64::from(gem));
         wr(&mut b, 4, 4, u64::from(DRM_CLOEXEC));
@@ -3363,6 +3400,29 @@ mod tests {
         assert!(h.sys.k().gems.get(&KMS).is_none_or(|g| g.is_empty()));
     }
 
+    /// A fence context is never re-homed: the backend's hooks ask the one
+    /// export gate before the export (exportgate.rs; review 2026-09-29,
+    /// wayland S1 and R1).
+    #[test]
+    fn a_fence_context_is_never_rehomed() {
+        let semsurf = Arc::new(crate::semsurf::SemsurfPolicy::default());
+        semsurf.ctx_made_for_test(RENDER, 3);
+        let mut h = h();
+        h.hooks = crate::policy::BackendHooks::with_state(Default::default(), semsurf)
+            .with_inject_taint(Default::default());
+        h.sys
+            .k()
+            .object(RENDER, 3, 100, NV_GEM_OBJECT_NVKMS, 1 << 20);
+        let rq = Rq::new(ADDFB2)
+            .buf(104, Some(&addfb2(XRGB8888, [9, 0, 0, 0])))
+            .gem(0, 20, RENDER, 3);
+        let r = h.kms(&rq).unwrap();
+        assert_eq!(r.ret, -libc::EINVAL);
+        let log = h.sys.log();
+        assert!(!log.iter().any(|l| l.starts_with("export")), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("ioctl")), "{log:?}");
+    }
+
     #[test]
     fn an_object_that_is_not_nvkms_memory_never_reaches_addfb() {
         let h = h();
@@ -3772,6 +3832,30 @@ mod tests {
         assert!(!vm.made_here(44));
     }
 
+    /// A session reset while a KMS call is still running: the call
+    /// finishes on a retired file and records nothing, even though the
+    /// reset forgot every record; and whatever a file did record goes with
+    /// its last reference (review 2026-09-29 1.5).
+    #[test]
+    fn a_call_finishing_after_a_reset_records_no_blob_or_framebuffer() {
+        let vm = Arc::new(VmKms::new());
+        let f = KmsFileState::in_vm(vm.clone());
+        f.retire();
+        vm.clear();
+        f.add_blob(5);
+        f.saw_blobs(31, &[(7, 6)]);
+        f.add_fb(44);
+        assert!(!vm.blob_readable(5) && !vm.blob_readable(6));
+        assert!(!vm.made_here(44));
+
+        let g = KmsFileState::in_vm(vm.clone());
+        g.add_blob(8);
+        g.saw_blobs(31, &[(7, 9)]);
+        assert!(vm.blob_readable(8) && vm.blob_readable(9));
+        drop(g);
+        assert!(!vm.blob_readable(8) && !vm.blob_readable(9));
+    }
+
     #[test]
     fn a_framebuffer_leaves_the_vms_sources_before_rmfb_runs_and_returns_if_it_fails() {
         let h = h();
@@ -3985,6 +4069,40 @@ mod tests {
         // And what a file made or saw goes with it.
         h.kms.as_ref().unwrap().retire();
         assert!(!h.kms.as_ref().unwrap().vm.blob_readable(66));
+    }
+
+    /// A blob property may be set only to none or a blob this VM made or
+    /// sees: another tenant's MODE_ID committed to our own CRTC would be
+    /// reported back by OBJ_GETPROPERTIES and read by GETPROPBLOB, and a
+    /// TEST_ONLY commit alone tells whether an id exists (review 2026-09-29
+    /// 1.9).
+    #[test]
+    fn a_blob_property_takes_only_a_blob_this_vm_made_or_sees() {
+        let h = h();
+        {
+            let mut k = h.sys.k();
+            k.props.insert(20, "MODE_ID");
+            k.prop_flags.insert(20, DRM_MODE_PROP_BLOB);
+            k.props.insert(21, "ACTIVE");
+        }
+        let commit = |v: u64| h.kms(&atomic(&[(20, v), (21, 66)], &[2])).unwrap().ret;
+        assert_eq!(commit(66), -libc::EPERM, "another tenant's blob");
+        assert_eq!(commit(1 << 32 | 70), -libc::EPERM);
+        assert_eq!(commit(0), 0, "none");
+        h.kms.as_ref().unwrap().add_blob(66);
+        assert_eq!(commit(66), 0, "one of ours");
+        // The legacy setter, value @0 and prop_id @8.
+        let setprop = |v: u64| {
+            let a = arg(
+                24,
+                &[(0, 8, v), (8, 4, 20), (12, 4, 5), (16, 4, 0xcccc_cccc)],
+            );
+            h.kms(&Rq::new(iowr(0xba, 24)).buf(24, Some(&a)))
+                .unwrap()
+                .ret
+        };
+        assert_eq!(setprop(67), -libc::EPERM);
+        assert_eq!(setprop(66), 0);
     }
 
     // ── forced connector probes (S-8) ──

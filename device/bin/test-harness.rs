@@ -70,7 +70,14 @@ async fn main() -> anyhow::Result<()> {
         owner_percent: ZoneConfig::DEFAULT_OWNER_PERCENT,
     };
 
-    let backend = Arc::new(Mutex::new(NvidiaBackend::new(cfg)));
+    let mut nvidia = NvidiaBackend::new(cfg);
+    // The host's version, as the real transport reads it: with none, every
+    // RM escape is refused (the guest's CHECK_VERSION_STR teaches nothing).
+    match device::host::driver_version(std::path::Path::new("/proc/driver/nvidia")) {
+        Some(v) => nvidia.set_host_driver_version(&v),
+        None => tracing::warn!("no NVIDIA driver version: every RM escape will be refused"),
+    }
+    let backend = Arc::new(Mutex::new(nvidia));
 
     loop {
         tokio::select! {

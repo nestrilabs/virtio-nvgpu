@@ -77,31 +77,68 @@ pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     cvt(unsafe { libc::kill(pid, sig) }).map(|_| ())
 }
 
-/// Give the calling thread SCHED_OTHER with an EEVDF slice of `slice_ns`
-/// (`sched_setattr(2)`'s `sched_runtime` for a fair policy, Linux 6.12 on;
-/// 100 µs to 100 ms, no privilege needed), at its current nice. Threads it
-/// makes afterwards inherit it. Its CPU share is unchanged: the slice only
-/// says how soon it runs again once it wakes and how long it may run then.
-pub fn set_sched_slice(slice_ns: u64) -> io::Result<()> {
-    // struct sched_attr, include/uapi/linux/sched/types.h (SCHED_ATTR_SIZE_VER0).
-    #[repr(C)]
-    struct SchedAttr {
-        size: u32,
-        policy: u32,
-        flags: u64,
-        nice: i32,
-        priority: u32,
-        runtime: u64,
-        deadline: u64,
-        period: u64,
+/// struct sched_attr, include/uapi/linux/sched/types.h (SCHED_ATTR_SIZE_VER0).
+#[repr(C)]
+#[derive(Default)]
+struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+}
+
+/// The calling thread's scheduling attributes (`sched_getattr(2)`).
+fn sched_attr() -> io::Result<SchedAttr> {
+    let mut attr = SchedAttr::default();
+    // SAFETY: the kernel writes at most the size passed of `attr`, which is
+    // that large and lives across the call; pid 0 is the calling thread.
+    cvt_l(unsafe {
+        libc::syscall(
+            libc::SYS_sched_getattr,
+            0,
+            &mut attr as *mut SchedAttr,
+            size_of::<SchedAttr>() as u32,
+            0u32,
+        )
+    })?;
+    Ok(attr)
+}
+
+/// The calling thread's policy (SCHED_OTHER, SCHED_BATCH, ...).
+pub fn sched_policy() -> io::Result<u32> {
+    sched_attr().map(|a| a.policy)
+}
+
+/// The calling thread's EEVDF slice request, in ns (0 for none).
+pub fn sched_slice() -> io::Result<u64> {
+    sched_attr().map(|a| a.runtime)
+}
+
+/// Give the calling thread an EEVDF slice of `slice_ns` (`sched_setattr(2)`'s
+/// `sched_runtime` for a fair policy, Linux 6.12 on; 100 µs to 100 ms, no
+/// privilege needed), keeping its policy and nice. Threads it makes
+/// afterwards inherit it. Its CPU share is unchanged: the slice only says how
+/// soon it runs again once it wakes and how long it may run then.
+///
+/// Only a fair policy is touched: SCHED_OTHER, SCHED_BATCH and SCHED_IDLE
+/// keep theirs (a unit's `CPUSchedulingPolicy=batch` was reset to
+/// SCHED_OTHER, review 2026-09-29 2.3), and a real-time or deadline thread
+/// is left as it is: `Ok(false)`.
+pub fn set_sched_slice(slice_ns: u64) -> io::Result<bool> {
+    let cur = sched_attr()?;
+    let fair = [libc::SCHED_OTHER, libc::SCHED_BATCH, libc::SCHED_IDLE];
+    if !fair.iter().any(|&p| p as u32 == cur.policy) {
+        return Ok(false);
     }
-    // SAFETY: no arguments; cannot fail.
-    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
     let attr = SchedAttr {
         size: size_of::<SchedAttr>() as u32,
-        policy: libc::SCHED_OTHER as u32,
+        policy: cur.policy,
         flags: 0,
-        nice,
+        nice: cur.nice,
         priority: 0,
         runtime: slice_ns,
         deadline: 0,
@@ -109,8 +146,8 @@ pub fn set_sched_slice(slice_ns: u64) -> io::Result<()> {
     };
     // SAFETY: the kernel reads `attr.size` bytes of `attr`, which is that
     // large and lives across the call; pid 0 is the calling thread.
-    cvt_l(unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0u32) })
-        .map(|_| ())
+    cvt_l(unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0u32) })?;
+    Ok(true)
 }
 
 /// `umask(mode)`: the previous mask.
@@ -584,7 +621,8 @@ mod sched_tests {
     #[test]
     fn a_thread_takes_the_slice_it_asks_for() {
         std::thread::spawn(|| match super::set_sched_slice(250_000) {
-            Ok(()) => {
+            Ok(done) => {
+                assert!(done, "a fair policy");
                 let s = std::fs::read_to_string("/proc/thread-self/sched").unwrap_or_default();
                 let slice = s
                     .lines()
@@ -597,6 +635,46 @@ mod sched_tests {
             }
             // A kernel before 6.12 takes no runtime for a fair policy.
             Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EINVAL)),
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sched_policy_tests {
+    use super::*;
+
+    /// The slice keeps the thread's policy: a batch thread stays batch
+    /// (review 2026-09-29 2.3). In a thread of its own, since the policy
+    /// is the thread's.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sched_setattr")]
+    fn a_slice_keeps_a_fair_policy() {
+        std::thread::spawn(|| {
+            let batch = SchedAttr {
+                size: size_of::<SchedAttr>() as u32,
+                policy: libc::SCHED_BATCH as u32,
+                ..SchedAttr::default()
+            };
+            // SAFETY: as in `set_sched_slice`.
+            let r = unsafe {
+                libc::syscall(libc::SYS_sched_setattr, 0, &batch as *const SchedAttr, 0u32)
+            };
+            if r != 0 {
+                eprintln!("SKIPPED a_slice_keeps_a_fair_policy: no SCHED_BATCH here");
+                return;
+            }
+            match set_sched_slice(300_000) {
+                Ok(done) => assert!(done),
+                // A kernel before 6.12 refuses the runtime for a fair policy.
+                Err(e) => {
+                    eprintln!("SKIPPED a_slice_keeps_a_fair_policy: {e}");
+                    return;
+                }
+            }
+            assert_eq!(sched_policy().unwrap(), libc::SCHED_BATCH as u32);
+            assert_eq!(sched_slice().unwrap(), 300_000);
         })
         .join()
         .unwrap();

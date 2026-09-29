@@ -345,6 +345,22 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
             }
             plan.zeroed(OS64_RIGHTS);
         }
+        // The two older allocation escapes name a class too (NVOS05,
+        // NVOS39, hClass at 12 in both): the refused classes are refused
+        // there as on RM_ALLOC, not left to the allowlist alone (review
+        // 2026-09-29 1.18).
+        NV_ESC_RM_ALLOC_OBJECT | NV_ESC_RM_ALLOC_CONTEXT_DMA2 => {
+            let at = if escape == NV_ESC_RM_ALLOC_OBJECT {
+                abi::rmallow::NVOS05_H_CLASS
+            } else {
+                abi::rmallow::NVOS39_H_CLASS
+            };
+            let class = rd32(params, at).ok_or(libc::EINVAL)?;
+            if REFUSED_ALLOC_CLASSES.contains(&class) {
+                log::warn!("RM escape {escape:#04x} of class {class:#x} refused (guestptr.rs)");
+                return Err(libc::EPERM);
+            }
+        }
         NV_ESC_RM_CONTROL => {
             sized(OS54_SIZE)?;
             let ctl = rd32(params, OS54_CMD).unwrap_or(0);
@@ -723,6 +739,24 @@ mod tests {
         let mut p = vec![0u8; 48];
         put32(&mut p, OS64_CLASS, 0x3e);
         assert!(rm_escape(ALLOC, &p).is_ok(), "plain system memory");
+    }
+
+    /// ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 name a class too, and refuse the
+    /// same ones (review 2026-09-29 1.18).
+    #[test]
+    fn the_older_allocation_escapes_refuse_the_same_classes() {
+        let object = ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC_OBJECT, 20);
+        let dma = ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC_CONTEXT_DMA2, 56);
+        for (cmd, len) in [(object, 20), (dma, 56)] {
+            for class in REFUSED_ALLOC_CLASSES {
+                let mut p = vec![0u8; len];
+                put32(&mut p, 12, class);
+                assert_eq!(rm_escape(cmd, &p), Err(libc::EPERM), "class {class:#x}");
+            }
+            let mut p = vec![0u8; len];
+            put32(&mut p, 12, 0x3e);
+            assert!(rm_escape(cmd, &p).is_ok());
+        }
     }
 
     /// IMEX and fabric memory name an OS event by descriptor (pOsEvent), and

@@ -107,6 +107,10 @@ struct Entry {
     owner: Owner,
 }
 
+/// The largest handle issued: a descriptor field read as an i32 must not
+/// see it negative.
+const MAX_ISSUED: u32 = i32::MAX as u32;
+
 pub struct HandleTable {
     /// Where the search for the next free value starts.
     next: u32,
@@ -130,6 +134,10 @@ pub struct HandleTable {
 struct Closing {
     held: Ledger,
     total: u64,
+    /// Of those, modeset files, which count against the VM's and each
+    /// process's NVKMS opens too (review 2026-09-29 1.12).
+    modeset_held: Ledger,
+    modeset_total: u64,
 }
 
 impl Closing {
@@ -144,6 +152,7 @@ pub struct Closed<T> {
     item: Option<T>,
     closing: Arc<Mutex<Closing>>,
     owner: Owner,
+    modeset: bool,
 }
 
 impl<T> Drop for Closed<T> {
@@ -152,6 +161,10 @@ impl<T> Drop for Closed<T> {
         let mut c = Closing::lock(&self.closing);
         c.held.refund(self.owner, 1);
         c.total = c.total.saturating_sub(1);
+        if self.modeset {
+            c.modeset_held.refund(self.owner, 1);
+            c.modeset_total = c.modeset_total.saturating_sub(1);
+        }
     }
 }
 
@@ -231,12 +244,20 @@ impl HandleTable {
             }
             return Err(TableFull);
         }
-        // Terminates: fewer than 2^32 - 2 values are live, so some candidate
-        // is free, and in practice the first one almost always is.
+        // Handles are issued in [1, i32::MAX]. The guest's structs carry a
+        // handle in a descriptor field, where RM, UVM and the guest module
+        // read it as a signed int: a handle past i32::MAX reads as a
+        // negative descriptor there, and after 2^31 opens and closes every
+        // new file of the VM failed its event, fd and UVM registrations
+        // (review 2026-09-29 1.2).
+        //
+        // Terminates: at most MAX_HANDLES values are live, far fewer than
+        // i32::MAX, so some candidate is free, and in practice the first
+        // one almost always is.
         loop {
             let h = self.next;
-            self.next = self.next.wrapping_add(1);
-            if h == 0 || h == u32::MAX || self.table.contains_key(&h) {
+            self.next = if h >= MAX_ISSUED { 1 } else { h + 1 };
+            if h == 0 || h > MAX_ISSUED || self.table.contains_key(&h) {
                 continue;
             }
             self.table.insert(
@@ -321,18 +342,30 @@ impl HandleTable {
         self.table.get(&handle).is_some_and(|e| e.buried)
     }
 
-    /// `item` -- the descriptor of a handle just removed, charged to
-    /// `owner`, on its way to the closer -- counted against the table and
-    /// `owner`'s share until it is dropped.
-    pub fn closing<T>(&self, item: T, owner: Owner) -> Closed<T> {
+    /// `item` -- the descriptor of a handle of `kind` just removed,
+    /// charged to `owner`, on its way to the closer -- counted against the
+    /// table and `owner`'s share until it is dropped.
+    pub fn closing<T>(&self, item: T, owner: Owner, kind: HandleKind) -> Closed<T> {
+        let modeset = kind == HandleKind::Dev(protocol::messages::DeviceKind::Modeset);
         let mut c = Closing::lock(&self.closing);
         c.held.charge(owner, 1);
         c.total += 1;
+        if modeset {
+            c.modeset_held.charge(owner, 1);
+            c.modeset_total += 1;
+        }
         Closed {
             item: Some(item),
             closing: self.closing.clone(),
             owner,
+            modeset,
         }
+    }
+
+    /// Modeset files still closing: the VM's, and `owner`'s.
+    pub fn closing_modesets(&self, owner: Owner) -> (u64, u64) {
+        let c = Closing::lock(&self.closing);
+        (c.modeset_total, c.modeset_held.held(owner))
     }
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).
@@ -473,11 +506,25 @@ mod tests {
         let live = t.insert(make_fd(), CTL).unwrap();
         assert_eq!(live, 1);
         // Force the cursor to the top of the space.
-        t.next = u32::MAX - 1;
-        assert_eq!(t.insert(make_fd(), CTL).unwrap(), u32::MAX - 1);
-        // u32::MAX and 0 are never issued, and 1 is live: the next one is 2.
+        t.next = i32::MAX as u32 - 1;
+        assert_eq!(t.insert(make_fd(), CTL).unwrap(), i32::MAX as u32 - 1);
+        assert_eq!(t.insert(make_fd(), CTL).unwrap(), i32::MAX as u32);
+        // Nothing past i32::MAX, 0 is never issued, and 1 is live: the next
+        // one is 2.
         assert_eq!(t.insert(make_fd(), CTL).unwrap(), 2);
         assert!(t.kind(0).is_none() && t.kind(u32::MAX).is_none());
+    }
+
+    /// A handle is never negative as an i32: the guest's structs carry it
+    /// in descriptor fields read as signed ints (review 2026-09-29 1.2).
+    #[test]
+    fn no_handle_reads_as_a_negative_descriptor() {
+        let mut t = HandleTable::new();
+        for start in [0x8000_0000, u32::MAX - 1, u32::MAX, 0xC000_0000] {
+            t.next = start;
+            let h = t.insert(make_fd(), CTL).unwrap();
+            assert!((h as i32) > 0, "{start:#x} issued {h:#x}");
+        }
     }
 
     #[test]

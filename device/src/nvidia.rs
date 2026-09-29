@@ -137,6 +137,12 @@ impl Status {
     }
 }
 
+/// RM's own statuses for a refusal the backend makes in the status field,
+/// the ioctl itself succeeding (nvstatuscodes.h).
+pub(crate) const NV_ERR_NO_MEMORY: u32 = 0x51;
+pub(crate) const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+pub(crate) const NV_ERR_INVALID_ARGUMENT: u32 = 0x1f;
+
 /// A DRM render node the host owns, as the guest is told about it.
 #[derive(Clone, Debug)]
 pub(crate) struct DriDevice {
@@ -346,11 +352,16 @@ impl FileTree {
     }
 
     /// Read the tree, returning `(path relative to the root, contents)`.
+    /// `pci_config`: full config spaces the launcher snapshotted, by PCI
+    /// address ([`merge_pci_config`]).
     ///
     /// Only regular files, and only small ones: these trees are descriptive
     /// text, and anything large is either not one of them or not something a
     /// guest should be handed through a single response buffer.
-    fn collect(self) -> Vec<(String, Vec<u8>)> {
+    fn collect(
+        self,
+        pci_config: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Vec<(String, Vec<u8>)> {
         const MAX_FILE: u64 = 64 * 1024;
         match self {
             Self::Proc => {
@@ -386,7 +397,13 @@ impl FileTree {
                     let rel = format!("bus/pci/devices/{addr}/config");
                     let abs = std::path::Path::new("/sys").join(&rel);
                     match std::fs::read(&abs) {
-                        Ok(content) => Some((rel, content)),
+                        Ok(live) => {
+                            let content = pci_config
+                                .get(addr.as_ref())
+                                .and_then(|snap| merge_pci_config(&live, snap))
+                                .unwrap_or(live);
+                            Some((rel, content))
+                        }
                         Err(e) => {
                             log::warn!("sys: cannot read {}: {}", abs.display(), e);
                             None
@@ -396,6 +413,36 @@ impl FileTree {
                 .collect(),
         }
     }
+}
+
+/// The PCI config space the guest's fake device is given: the backend's own
+/// read of it (`live`) and, past it, a snapshot of the whole space the
+/// launcher took as root (`snap`, `--pci-config-dir`).
+///
+/// Linux gives a reader without CAP_SYS_ADMIN the first 64 bytes of a
+/// device's config (pci-sysfs.c, `pci_read_config`), and the backend never
+/// has it: the guest's device had no capability list and no PCIe extended
+/// capabilities, its capability pointer at 0x34 pointing into zeros, and
+/// nvidia-smi could not report the link (review 2026-09-29, parity #14).
+/// The snapshot is taken only if it is of this device -- vendor, device,
+/// class and subsystem as the live read has them -- and at most 4 KiB;
+/// the live bytes stay authoritative for what they cover. None otherwise.
+pub(crate) fn merge_pci_config(live: &[u8], snap: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: usize = 64;
+    const MAX: usize = 4096;
+    if live.len() > HEADER || snap.len() <= live.len() || snap.len() > MAX || live.len() < HEADER {
+        return None;
+    }
+    // Vendor and device; revision and class; subsystem vendor and id.
+    for r in [0..4, 8..12, 0x2c..0x30] {
+        if live[r.clone()] != snap[r] {
+            log::warn!("sys: the PCI config snapshot is of another device; not used");
+            return None;
+        }
+    }
+    let mut out = live.to_vec();
+    out.extend_from_slice(&snap[live.len()..]);
+    Some(out)
 }
 
 /// Walk `dir`, appending every readable regular file under it.
@@ -487,8 +534,9 @@ pub struct NvidiaBackend {
     /// carries the mapping closes, or when the session resets -- whichever
     /// comes first, and exactly once.
     pub(crate) active_maps: crate::mmap::MmapContext,
-    /// Host driver version, learned from the first successful
-    /// `NV_ESC_CHECK_VERSION_STR`.
+    /// Host driver version, as the transport read it from the driver
+    /// (`set_host_driver_version`). Never learned from a guest: the string
+    /// in CHECK_VERSION_STR's reply is the caller's in RM's relaxed mode.
     pub(crate) driver: Option<abi::version::DriverVersion>,
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
@@ -519,6 +567,13 @@ pub struct NvidiaBackend {
     pub(crate) live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Each GPU's whole PCI config space, by address, as the launcher
+    /// snapshotted it (`--pci-config-dir`); see [`merge_pci_config`].
+    pci_config: std::collections::HashMap<String, Vec<u8>>,
+    /// Whether RM escapes pass with no host version set: only the unit
+    /// tests' and fuzzers' fake RMs, which no release describes. Everything
+    /// else refuses them (`unversioned_ok`).
+    unversioned_for_test: bool,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
     /// and how often.
     ///
@@ -724,7 +779,7 @@ pub enum AbiPolicy {
 pub enum AbiCheck {
     /// The escape is known and the guest's parameter size matches.
     Ok,
-    /// No profile yet -- CHECK_VERSION_STR has not been seen.
+    /// No profile: no host version was set, or none was measured at it.
     NoProfile,
     /// The escape is not in this driver's table.
     UnknownEscape,
@@ -797,6 +852,14 @@ fn v1_route(kind: HandleKind, cmd: u32, data_len: u32) -> std::result::Result<V1
         HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) if ty == b'F' => Ok(V1Route::Rm),
         HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) if ty == 0 => Ok(V1Route::Uvm),
         HandleKind::Dev(DeviceKind::Modeset) if ty == b'm' => Ok(V1Route::Nvkms),
+        // Another type on an NVIDIA device gets the device's own answer
+        // (review 2026-09-29 parity #32): nvidia.ko's nv_validate_ioctls
+        // says EINVAL (nv.c:2488-2491), nvidia-modeset ENOTTY for any
+        // command but its one (nvidia-modeset-linux.c:1953-1955), and UVM
+        // ENOSYS for a command it has no route for (uvm_test.c).
+        HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) => Err(libc::EINVAL),
+        HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) => Err(libc::ENOSYS),
+        HandleKind::Dev(DeviceKind::Modeset) => Err(libc::ENOTTY),
         HandleKind::DriRender(_) => match cmd {
             DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY => sized(
                 32,
@@ -843,10 +906,11 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
     if buf.len() < 4 {
         return 0;
     }
-    let mut off = 0;
-    buf[off..off + 4].copy_from_slice(&(devices.len() as u32).to_le_bytes());
-    off += 4;
-
+    // The count is of the records that fit, written once they are known:
+    // a count of every device over fewer records had the guest parse the
+    // card section after them as DRI records (review 2026-09-29 2.6).
+    let mut off = 4;
+    let mut n = 0u32;
     for d in devices {
         // name_len, major, minor, slot_index, then the nine dev_info words.
         let need = 16 + 4 * NV_DEV_INFO_WORDS + d.name.len();
@@ -854,6 +918,7 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
             log::warn!("DRI section truncated at {}", d.name);
             break;
         }
+        n += 1;
         for v in [d.name.len() as u32, d.major, d.minor, d.slot_index]
             .into_iter()
             .chain(d.dev_info)
@@ -864,6 +929,7 @@ fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize {
         buf[off..off + d.name.len()].copy_from_slice(d.name.as_bytes());
         off += d.name.len();
     }
+    buf[..4].copy_from_slice(&n.to_le_bytes());
     off
 }
 
@@ -1067,6 +1133,8 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
+            unversioned_for_test: cfg!(any(test, fuzzing)),
+            pci_config: std::collections::HashMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: crate::tally::Tally::default(),
             rm_controls: crate::tally::Tally::default(),
@@ -1461,7 +1529,7 @@ impl NvidiaBackend {
                     drop(fd);
                     continue;
                 }
-                let fd = self.handles.closing(fd, owner);
+                let fd = self.handles.closing(fd, owner, kind);
                 match kms_fbs.remove(&h).filter(|f| !f.is_empty()) {
                     Some(fbs) => self.vm_kms.close_after(fbs, Box::new(fd)),
                     None => crate::closer::close(fd),
@@ -1790,7 +1858,11 @@ impl NvidiaBackend {
     /// them ([`nvkms::MODESET_SHARE`], B4).
     pub(crate) fn modeset_open_refused(&self, owner: crate::quota::Owner) -> Option<String> {
         let kind = HandleKind::Dev(DeviceKind::Modeset);
-        let (mut open, mut mine) = (0usize, 0usize);
+        // Files still closing are still open on the host: with the closer
+        // stalled on a modeset, one process looping open/close held far
+        // more than the cap (review 2026-09-29 1.12).
+        let (closing, closing_mine) = self.handles.closing_modesets(owner);
+        let (mut open, mut mine) = (closing as usize, closing_mine as usize);
         for h in self.handles.handles() {
             if self.handles.kind(h) == Some(kind) {
                 open += 1;
@@ -2222,6 +2294,12 @@ impl NvidiaBackend {
         }
 
         let length = size.max(4096);
+        // A size the guest kernel chose, refused before any arithmetic on
+        // it: no zone holds more than its own size.
+        if length > self.shm.largest_zone() {
+            log::warn!("mmap on handle {handle}: {length:#x} bytes is more than any zone holds");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOMEM);
+        }
         // An injected buffer's range is placed read-only, whichever of the
         // VM's files maps it (inject.rs): the guest's CPU does not write
         // into the host's capture buffers.
@@ -2396,7 +2474,7 @@ impl NvidiaBackend {
     /// The response is a bare stream of entries with **no message header** --
     /// the driver reads from the first byte of the buffer.
     fn handle_get_files(&mut self, tree: FileTree, resp_buf: &mut [u8]) -> usize {
-        let files = tree.collect();
+        let files = tree.collect(&self.pci_config);
         log::info!("{}: {} file(s)", tree.name(), files.len());
 
         let mut off = 0usize;
@@ -2535,10 +2613,10 @@ impl NvidiaBackend {
         if !crate::closer::slow(kind) {
             drop(fd);
         } else if fbs.is_empty() {
-            crate::closer::close(self.handles.closing(fd, owner));
+            crate::closer::close(self.handles.closing(fd, owner, kind));
         } else {
             self.vm_kms
-                .close_after(fbs, Box::new(self.handles.closing(fd, owner)));
+                .close_after(fbs, Box::new(self.handles.closing(fd, owner, kind)));
         }
         Ok(())
     }
@@ -2558,24 +2636,11 @@ impl NvidiaBackend {
     // IOCTL — top-level
     // ------------------------------------------------------------------
 
-    /// Learn the host driver version from a successful `NV_ESC_CHECK_VERSION_STR`
-    /// reply and select the ABI profile for it.
-    ///
-    /// Layout is `nv_ioctl_rm_api_version_t`: cmd (4), reply (4), then a
-    /// NUL-terminated 64-byte version string.
-    fn learn_driver_version(&mut self, param_buf: &[u8]) {
-        if self.driver.is_some() || param_buf.len() < 12 {
-            return;
-        }
-        let tail = &param_buf[8..];
-        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        let Ok(text) = std::str::from_utf8(&tail[..end]) else {
-            return;
-        };
-        let Some(v) = abi::version::DriverVersion::parse(text) else {
-            return;
-        };
-        self.set_driver_version(v);
+    /// GPU `addr`'s whole PCI config space, as a privileged launcher read it
+    /// (`--pci-config-dir`). Checked against the device's own header at each
+    /// GET_SYS_FILES ([`merge_pci_config`]).
+    pub fn set_pci_config(&mut self, addr: &str, config: Vec<u8>) {
+        self.pci_config.insert(addr.to_string(), config);
     }
 
     /// The host driver version, as the transport read it from the driver at
@@ -2596,6 +2661,12 @@ impl NvidiaBackend {
         }
     }
 
+    /// Whether an RM escape may pass with no host version set: in the unit
+    /// tests and fuzzers only, whose fake RMs no release describes.
+    fn unversioned_ok(&self) -> bool {
+        cfg!(any(test, fuzzing)) && self.unversioned_for_test
+    }
+
     fn set_driver_version(&mut self, v: abi::version::DriverVersion) {
         self.driver = Some(v);
         self.rmallow.set_driver(v);
@@ -2604,9 +2675,9 @@ impl NvidiaBackend {
         self.abi = abi::versions::table_for(v);
         match self.abi {
             Some(t) => log::debug!("host driver {v}: ABI profile selected, {} escapes", t.len()),
-            None => log::error!(
-                "host driver {v} has no measured ABI profile; every RM escape is refused"
-            ),
+            // `allow_unmeasured_release` may still pick the nearest; the
+            // transport refuses to start on this otherwise (release.rs).
+            None => log::warn!("host driver {v} has no measured ABI profile"),
         }
     }
 
@@ -2740,6 +2811,25 @@ impl NvidiaBackend {
             }
         }
 
+        // Room for the answer, before anything is asked of the host: a
+        // success comes back with at least the top-level struct and nested
+        // block (and a registration's 8-byte id), and one that did not fit
+        // was answered ENOSPC after RM had acted -- for a registration, with
+        // the pages pinned by RM and the guest unpinning them on the error
+        // (review 2026-09-29 1.16).
+        let least = size_of::<MsgHeader>()
+            + size_of::<IoctlResp>()
+            + nested_end
+            + if listed { 8 } else { 0 };
+        if resp_buf.len() < least {
+            log::warn!(
+                "ioctl cmd={:#x}: a reply of at least {least} bytes does not fit the {} posted",
+                ireq.cmd,
+                resp_buf.len()
+            );
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
+        }
+
         // How much of the response is the top-level struct. The driver copies
         // exactly this much back to userspace and reads any nested block after
         // it, so a wrong split corrupts one or the other.
@@ -2847,8 +2937,16 @@ impl NvidiaBackend {
                     .set_owner(self.current_handle, self.handles.owner(self.current_handle));
                 if ireq.cmd == crate::uvmmap::ALLOC_SEMAPHORE_POOL && params.len() >= 16 {
                     let len = u64::from_le_bytes(params[8..16].try_into().unwrap());
+                    // Refused in rmStatus, 8 bytes from the block's end, the
+                    // ioctl succeeding: UVM's own way to say it (review
+                    // 2026-09-29 parity #29).
                     if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
-                        return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                        let status = match errno {
+                            libc::ENOMEM => NV_ERR_NO_MEMORY,
+                            _ => NV_ERR_INVALID_ARGUMENT,
+                        };
+                        let out = crate::rmshare::refusal(params, params.len() - 8, status);
+                        return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
                 // The descriptor some commands name another file by
@@ -3023,14 +3121,19 @@ impl NvidiaBackend {
             // A known host with no profile: one no table was measured at,
             // which the transport refuses to start on (crate::release). Its
             // layouts are nobody's to guess.
-            AbiCheck::NoProfile if self.driver.is_some() => {
+            //
+            // No version at all is refused too: the transport reads it from
+            // the driver before any guest call, and a library user that set
+            // none (test-harness, an embedding VMM) used to learn it from
+            // the guest's CHECK_VERSION_STR, whose string RM leaves as the
+            // caller sent it -- the guest chose the ABI profile (review
+            // 2026-09-29 1.15).
+            AbiCheck::NoProfile if self.driver.is_none() && self.unversioned_ok() => false,
+            AbiCheck::NoProfile => {
                 log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
                 true
             }
-            // No version at all: only a backend built without the transport
-            // (the transport reads it from the driver before any guest
-            // calls), where the guest's CHECK_VERSION_STR teaches it.
-            AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
+            AbiCheck::Ok | AbiCheck::VariableLength => false,
         };
         if refuse {
             *self.abi_refused.entry(escape).or_insert(0) += 1;
@@ -3438,7 +3541,8 @@ impl NvidiaBackend {
             }
             if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
                 log::warn!("nested ioctl(0x{request:x}) no-params failed: errno={errno}");
-                return fail(self, resp_buf, Status::IoctlFailed, errno);
+                let back = a.reply(top)[..outer_size].to_vec();
+                return self.write_failed_resp(resp_buf, cookie, &back, errno);
             }
             let outer = &a.bytes(top)[..outer_size];
             if escape == 0x2a {
@@ -3495,7 +3599,18 @@ impl NvidiaBackend {
         if escape == 0x2B && outer_size >= 16 {
             let h_class = word(outer_in, 12);
             const NV0005_DATA: usize = 16;
-            if matches!(h_class, 0x05 | 0x79) && nested_size >= NV0005_DATA + 4 {
+            // A block too short to hold the field is refused, as OS_UNIX's
+            // is: RM would read the descriptor from past what was sent --
+            // the zeroed slack after our buffer, descriptor 0 of this
+            // process (review 2026-09-29 1.17).
+            if matches!(h_class, 0x05 | 0x79) && nested_size < NV0005_DATA + 4 {
+                log::warn!(
+                    "event class {h_class:#x}: {nested_size} parameter bytes do not hold its \
+                     descriptor"
+                );
+                return fail(self, resp_buf, Status::IoctlFailed, libc::EINVAL);
+            }
+            if matches!(h_class, 0x05 | 0x79) {
                 let guest =
                     i32::from_le_bytes(nested_in[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
                 let set = match self.dev_fd(guest as u32) {
@@ -3733,7 +3848,11 @@ impl NvidiaBackend {
         }
         if let Err(errno) = self.host_call(&mut a, host_fd, request, top) {
             log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
-            return fail(self, resp_buf, Status::IoctlFailed, errno);
+            // The block and its parameters as the host left them; no deep
+            // block, which the guest reads only from a success.
+            let mut back = a.reply(top)[..outer_size].to_vec();
+            back.extend_from_slice(&a.reply(nb));
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
 
         // RM reports two different things in two different places, and only
@@ -3820,16 +3939,44 @@ impl NvidiaBackend {
         let (outer, nested) = param_in.split_at(outer_len.min(param_in.len()));
         self.osdesc
             .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
-        let prepared = od::describe(cmd, outer, nested).and_then(|call| {
-            let runs = od::parse_runs(&call, list)?;
-            let resolved = od::resolve(&ram, &runs)?;
-            self.osdesc
-                .admit(self.current_handle, resolved.bytes(), resolved.vmas())?;
-            Ok((call, resolved.map(call.in_page(), call.writable)?))
-        });
+        // Over a registration budget the answer is RM's own out-of-memory
+        // status at `.1` of the caller's block, the ioctl succeeding, as RM
+        // answers when it cannot pin (review 2026-09-29 parity #29): an
+        // errno read to libnvidia as a generic OS failure.
+        enum Refused {
+            Errno(i32),
+            Budget(usize),
+        }
+        let prepared = od::describe(cmd, outer, nested)
+            .map_err(Refused::Errno)
+            .and_then(|call| {
+                let runs = od::parse_runs(&call, list).map_err(Refused::Errno)?;
+                let resolved = od::resolve(&ram, &runs).map_err(Refused::Errno)?;
+                if self
+                    .osdesc
+                    .admit(self.current_handle, resolved.bytes(), resolved.vmas())
+                    .is_err()
+                {
+                    return Err(Refused::Budget(match call.shape {
+                        Shape::AllocMemory => od::OS02_STATUS,
+                        Shape::VidHeap => od::OS32_STATUS,
+                        Shape::RmAlloc => od::OS64_STATUS,
+                    }));
+                }
+                let pinned = resolved
+                    .map(call.in_page(), call.writable)
+                    .map_err(Refused::Errno)?;
+                Ok((call, pinned))
+            });
         let (call, pinned) = match prepared {
             Ok(p) => p,
-            Err(e) => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e),
+            Err(Refused::Budget(at)) => {
+                let out = crate::rmshare::refusal(param_in, at, NV_ERR_NO_MEMORY);
+                return self.write_ioctl_resp(resp_buf, cookie, &out);
+            }
+            Err(Refused::Errno(e)) => {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, e);
+            }
         };
         log::debug!(
             "OS descriptor {cmd:#x}: {:#x} bytes of guest RAM at {:#x} of ours",
@@ -3973,6 +4120,14 @@ impl NvidiaBackend {
             // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
             // A zero hObjectNew is no handle: RM made the object under one it
             // generated and, through ALLOC_MEMORY, never wrote back.
+            //
+            // A root class (NV01_ROOT and its kin) makes a new *client*
+            // named hObjectNew, and RM ignores hRoot: nothing of `c` was
+            // made, and forgetting `(c, o)` would release a registration RM
+            // still pins (review 2026-09-29 1.3).
+            NV_ESC_RM_ALLOC
+                if r(40) == Some(0)
+                    && r(12).is_some_and(|c| crate::semsurf::ROOT_CLASSES.contains(&c)) => {}
             NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
                 if let (Some(c), Some(p), Some(o)) = (r(0), r(4), r(8))
                     && o != 0
@@ -4201,7 +4356,9 @@ impl NvidiaBackend {
                 }
             }
             UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
-                self.osdesc.uvm_range_made(handle, word(0), word(8));
+                let owner = self.handles.owner(handle);
+                self.osdesc
+                    .uvm_range_made_by(handle, word(0), word(8), owner);
             }
             crate::uvmmap::FREE if size >= 16 && status(size - 8) == Some(0) => {
                 self.osdesc.uvm_range_freed(handle, word(0));
@@ -4322,17 +4479,13 @@ impl NvidiaBackend {
         let rc = self.host_call(&mut a, host_fd, request, top);
         if let Err(errno) = rc {
             log::debug!("ioctl(0x{request:x}/0x{escape:02x}) failed: errno={errno}");
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let back = a.reply(top)[..n_in].to_vec();
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
         // The host's bytes, with the caller's values in every field the plan
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR
-            && (request >> 8) & 0xFF == u64::from(b'F')
-        {
-            self.learn_driver_version(&param_buf);
-        }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
@@ -4418,7 +4571,8 @@ impl NvidiaBackend {
             } else {
                 log::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
             }
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let back = a.reply(top)[..param_in.len()].to_vec();
+            return self.write_failed_resp(resp_buf, cookie, &back, errno);
         }
 
         // The guest's handle back in place of our descriptor. It is not
@@ -4634,19 +4788,28 @@ impl NvidiaBackend {
         let expected = self.rm_mapping_pgprot_before(h_client, h_memory);
         // A zero length can be given no extent; RM refuses it on its own,
         // and says so in `status`.
+        //
+        // A length no zone could hold -- up to u64::MAX, the guest's to
+        // choose -- is refused before any arithmetic on it. Either refusal
+        // is RM's own out-of-memory answer, NV_ERR_NO_MEMORY in the status
+        // with the ioctl succeeding, which is how libnvidia learns it ran
+        // out; a bare errno reads as a generic OS failure.
         let reserved = if asked == 0 {
             None
         } else {
-            match self.alloc_zone(asked, expected, owner) {
+            let got = if asked > self.shm.largest_zone() {
+                Err(DeviceError::Io(std::io::Error::other(format!(
+                    "{asked:#x} bytes is more than any zone holds"
+                ))))
+            } else {
+                self.alloc_zone(asked, expected, owner)
+            };
+            match got {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
-                    return self.write_error_resp(
-                        resp_buf,
-                        Status::IoctlFailed,
-                        cookie,
-                        libc::ENOMEM,
-                    );
+                    log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                    let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                    return self.write_ioctl_resp(resp_buf, cookie, &out);
                 }
             }
         };
@@ -4733,14 +4896,13 @@ impl NvidiaBackend {
                 match self.alloc_zone(length, pgprot, owner) {
                     Ok(r) => r,
                     Err(e) => {
-                        log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                        log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
                         self.undo_rm_map(host_fd, &param_buf, host_p_linear);
-                        return self.write_error_resp(
-                            resp_buf,
-                            Status::IoctlFailed,
-                            cookie,
-                            libc::ENOMEM,
-                        );
+                        // RM's out-of-memory answer, as for a refused
+                        // reservation (#29); the caller's own block.
+                        let out =
+                            crate::rmshare::refusal(param_in, STATUS_OFFSET, NV_ERR_NO_MEMORY);
+                        return self.write_ioctl_resp(resp_buf, cookie, &out);
                     }
                 }
             }
@@ -4758,19 +4920,23 @@ impl NvidiaBackend {
                     "NV_ESC_RM_MAP_MEMORY: no shared window, so device memory cannot be \
                      addressed by the guest"
                 );
-                Err(libc::ENOTSUP)
+                Err(NV_ERR_NOT_SUPPORTED)
             }
             Some(window) => window
                 .place(region.offset, length, host_map_fd, 0, writable)
                 .map_err(|e| {
                     log::error!("NV_ESC_RM_MAP_MEMORY: placing in the window failed: {}", e);
-                    libc::ENOMEM
+                    NV_ERR_NO_MEMORY
                 }),
         };
-        if let Err(errno) = placed {
+        // RM's statuses in the caller's own block, the ioctl succeeding, as
+        // RM answers a mapping it cannot make (#29): an errno reads to
+        // libnvidia as a generic OS failure.
+        if let Err(status) = placed {
             unreserve(self, Some(region));
             self.undo_rm_map(host_fd, &param_buf, host_p_linear);
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            let out = crate::rmshare::refusal(param_in, STATUS_OFFSET, status);
+            return self.write_ioctl_resp(resp_buf, cookie, &out);
         }
 
         log::debug!(
@@ -4957,7 +5123,11 @@ impl NvidiaBackend {
         let built = self
             .top_block(&mut a, request, param_in, &crate::guestptr::Plan::default())
             .and_then(|top| {
-                a.value(top, 16, 8, Restore::No)?;
+                // RM does not write NVOS34.pLinearAddress and nvidia.ko
+                // copies the block back, so the caller reads its own value,
+                // as on the not-found path and as L-6 did for
+                // UPDATE_DEVICE_MAPPING_INFO (review 2026-09-29 2.4).
+                a.value(top, 16, 8, Restore::Yes)?;
                 a.set_value(top, 16, entry.host_p_linear_address)?;
                 Ok(top)
             });
@@ -4974,7 +5144,7 @@ impl NvidiaBackend {
             self.active_maps.insert(entry.region.offset, entry);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
-        let mut param_buf = a.reply(top)[..param_in.len()].to_vec();
+        let param_buf = a.reply(top)[..param_in.len()].to_vec();
         drop(a);
 
         let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
@@ -4999,8 +5169,6 @@ impl NvidiaBackend {
             self.active_maps.insert(entry.region.offset, entry);
         }
 
-        // Zero pLinearAddress in response — guest doesn't need it
-        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
@@ -5017,7 +5185,9 @@ impl NvidiaBackend {
                 "UVM command {cmd:#x} refused: not in the UVM table of host driver {:?}",
                 self.driver
             );
-            return Err(libc::EPERM);
+            // UVM's own answer to a command it has no route for (uvm.c,
+            // uvm_test_ioctl), not a permission (parity #31).
+            return Err(libc::ENOSYS);
         };
         if len != c.size as usize {
             log::warn!(
@@ -5036,7 +5206,6 @@ impl NvidiaBackend {
     /// it says the space has it, or cannot say, the guest reads
     /// NV_ERR_NOT_SUPPORTED and the file takes nothing more.
     fn uvm_pageable_off(&mut self, host_fd: RawFd, resp_buf: &mut [u8], n: usize) {
-        const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
         let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
         // UVM_INITIALIZE_PARAMS {NvU64 flags; NV_STATUS rmStatus;}
         let st = body + 8;
@@ -5252,6 +5421,17 @@ impl NvidiaBackend {
         }
     }
 
+    /// The one gate every export of a guest GEM object asks
+    /// (exportgate.rs): HOST_OP PRIME_EXPORT and the Wayland dma-buf path
+    /// here, the IOCTL2 re-home through its hooks.
+    pub(crate) fn export_gate(&self) -> crate::exportgate::ExportGate<'_> {
+        crate::exportgate::ExportGate {
+            semsurf: &self.semsurf,
+            injected: Some(&self.inject),
+            taint: &self.inject_taint,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Response helpers
     // ------------------------------------------------------------------
@@ -5264,7 +5444,7 @@ impl NvidiaBackend {
         let hdr = MsgHeader {
             msg_type: self.current_msg as u32,
             handle,
-            status,
+            status: crate::session::wire_status(status),
             req_id: self.current_req_id,
         };
         write_struct(resp_buf, &hdr)
@@ -5289,6 +5469,39 @@ impl NvidiaBackend {
         param_out: &[u8],
         deep_len: usize,
     ) -> usize {
+        self.write_ioctl_resp_status(resp_buf, cookie, param_out, deep_len, 0)
+    }
+
+    /// A host call that failed with `errno`, answered as nvidia.ko answers
+    /// it: the errno, and the argument block as the host left it, which
+    /// nv.c copies out on every error but EFAULT (nv.c:2869-2878) and
+    /// drm_ioctl unconditionally. So a caller reads what RM wrote before
+    /// failing -- CHECK_VERSION_STR's reply word and RM's own version
+    /// string on a mismatch, which libnvidia prints (review 2026-09-29 2.1,
+    /// parity #23). The guest copies bytes that come with a negative
+    /// status (nvgpu_rmio.c).
+    fn write_failed_resp(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_out: &[u8],
+        errno: i32,
+    ) -> usize {
+        let errno = errno.saturating_abs();
+        if errno == 0 || errno == libc::EFAULT || param_out.is_empty() {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+        self.write_ioctl_resp_status(resp_buf, cookie, param_out, 0, -errno)
+    }
+
+    fn write_ioctl_resp_status(
+        &self,
+        resp_buf: &mut [u8],
+        cookie: u64,
+        param_out: &[u8],
+        deep_len: usize,
+        status: i32,
+    ) -> usize {
         let data_len = (self.current_data_len as usize).min(param_out.len());
         let deep_len = deep_len.min(param_out.len() - data_len);
         let nested_len = param_out.len() - data_len - deep_len;
@@ -5304,7 +5517,7 @@ impl NvidiaBackend {
             &MsgHeader {
                 msg_type: self.current_msg as u32,
                 handle: self.current_handle,
-                status: 0,
+                status: crate::session::wire_status(status),
                 req_id: self.current_req_id,
             },
         );
@@ -5333,7 +5546,7 @@ impl NvidiaBackend {
         errno: i32,
     ) -> usize {
         let e = if errno != 0 {
-            errno.abs()
+            errno.saturating_abs()
         } else {
             status.errno()
         };
@@ -5383,15 +5596,6 @@ mod abi_tests {
     use abi::ioctl::*;
 
     /// The exact reply the Tesla T4 gave to NV_ESC_CHECK_VERSION_STR on driver
-    /// 580.178.04, taken from gen/fixtures. Using the captured bytes rather
-    /// than a hand-built buffer keeps the parser honest about real padding.
-    fn t4_version_reply() -> Vec<u8> {
-        let mut b = vec![0u8; 72];
-        b[4] = 1; // reply = 1
-        b[8..18].copy_from_slice(b"580.178.04");
-        b
-    }
-
     fn backend() -> NvidiaBackend {
         NvidiaBackend::with_default_zones()
     }
@@ -5403,14 +5607,47 @@ mod abi_tests {
     }
 
     #[test]
-    fn learns_the_driver_version_from_a_real_reply() {
+    fn a_measured_version_selects_a_profile() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_host_driver_version("580.178.04");
         assert_eq!(
             b.driver,
             Some(abi::version::DriverVersion::new(580, 178, 4))
         );
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    /// The version is the host's, never the guest's: a CHECK_VERSION_STR
+    /// reply, whose string RM leaves as the caller sent it, teaches nothing,
+    /// and with no version set an RM escape is refused, not forwarded
+    /// unchecked (review 2026-09-29 1.15).
+    #[test]
+    fn with_no_host_version_no_rm_escape_passes_and_none_teaches_one() {
+        let mut b = backend();
+        b.unversioned_for_test = false;
+        b.set_host_ioctl_for_test(|_, _, arg| {
+            let (a, _) = arg.split();
+            a[4] = 1;
+            a[8..18].copy_from_slice(b"580.178.04");
+            0
+        });
+        let ctl = b.adopt_for_test(
+            std::fs::File::open("/dev/null").unwrap().into(),
+            HandleKind::Dev(DeviceKind::Ctl),
+        );
+        let mut req = Vec::new();
+        for v in [MsgType::Ioctl as u32, ctl, 0, 0] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        let cmd = abi::ioctl::_IOWR(NV_ESC_CHECK_VERSION_STR, 72) as u32;
+        for v in [cmd, 72, 72, 0, 0, 0] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req.extend_from_slice(&[0u8; 72]);
+        let mut resp = vec![0u8; 256];
+        b.dispatch(&req, &mut resp);
+        assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::EINVAL);
+        assert!(b.driver.is_none());
     }
 
     /// The property the tables exist for: an escape nobody described does not
@@ -5419,7 +5656,7 @@ mod abi_tests {
     #[test]
     fn an_escape_outside_the_profile_is_refused() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert!(b.abi.is_some());
 
         // 0x7f is not an NVIDIA escape and is in no profile.
@@ -5438,7 +5675,7 @@ mod abi_tests {
     #[test]
     fn a_descriptor_carrying_escape_with_no_translation_is_refused() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert!(b.untranslated_fd_escape(NV_ESC_EXPORT_TO_DMABUF_FD));
         for translated in [
             NV_ESC_REGISTER_FD,
@@ -5451,10 +5688,10 @@ mod abi_tests {
         }
     }
 
-    /// Before CHECK_VERSION_STR is answered there is no profile to check
-    /// against, and refusing then would refuse the call that establishes one.
+    /// With no version there is no profile to check against (and outside
+    /// the tests' fake RMs, `dispatch` refuses every RM escape then).
     #[test]
-    fn nothing_is_refused_before_the_version_is_known() {
+    fn nothing_is_checked_before_the_version_is_known() {
         let b = backend();
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
     }
@@ -5462,7 +5699,7 @@ mod abi_tests {
     #[test]
     fn accepts_the_sizes_the_t4_actually_sent() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         for (escape, size) in [
             (NV_ESC_RM_CONTROL, 32),
             (NV_ESC_RM_ALLOC, 48),
@@ -5485,7 +5722,7 @@ mod abi_tests {
         // The hand-written table had this at 48; 580 uses NVOS46_PARAMETERS_V580,
         // which is 64. This is the bug the ABI check exists to catch.
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert_eq!(
             b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
             AbiCheck::SizeMismatch {
@@ -5498,7 +5735,7 @@ mod abi_tests {
     #[test]
     fn variable_length_escapes_are_not_size_checked() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
         assert_eq!(
             b.check_abi(NV_ESC_CARD_INFO, 2304),
@@ -5509,18 +5746,9 @@ mod abi_tests {
     #[test]
     fn a_garbled_version_string_leaves_the_backend_unconfigured() {
         let mut b = backend();
-        let mut junk = vec![0u8; 72];
-        junk[8..12].copy_from_slice(b"oops");
-        b.learn_driver_version(&junk);
+        b.set_host_driver_version("oops");
         assert!(b.driver.is_none());
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
-    }
-
-    #[test]
-    fn a_short_reply_is_ignored_rather_than_panicking() {
-        let mut b = backend();
-        b.learn_driver_version(&[0u8; 4]);
-        assert!(b.driver.is_none());
     }
 }
 
@@ -6655,6 +6883,65 @@ mod tests {
         }
     }
 
+    /// CHECK_VERSION_STR that RM fails: the guest reads RM's reply word
+    /// and its version string with the errno, as nvidia.ko copies the block
+    /// out on failure, and libnvidia can say which versions disagree
+    /// (review 2026-09-29 2.1, parity #23). EFAULT copies nothing.
+    #[test]
+    fn a_failed_call_comes_back_with_the_block_as_the_host_left_it() {
+        use abi::ioctl::NV_ESC_CHECK_VERSION_STR;
+        fn mismatch(_: RawFd, _: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
+            let b = arg.bytes();
+            b[4] = 1;
+            b[8..72].fill(0);
+            b[8..17].copy_from_slice(b"595.99.02");
+            -libc::EINVAL
+        }
+        fn fault(_: RawFd, _: u64, _: &mut crate::sys::block::Arg<'_>) -> i32 {
+            -libc::EFAULT
+        }
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_nodes_for_test(Vec::new(), Vec::new());
+        be.set_host_ioctl_for_test(mismatch);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let check = hostfd::ioc(hostfd::IOC_RW, b'F', NV_ESC_CHECK_VERSION_STR, 72);
+        let mut p = vec![0u8; 72];
+        p[0] = b'1';
+        p[8..17].copy_from_slice(b"580.95.05");
+        let resp = v1_ioctl(&mut be, ctl, check, &p);
+        assert_eq!(parse_resp(&resp).status, -libc::EINVAL);
+        assert_eq!(resp[IOCTL_BODY + 4], 1, "RM's reply word");
+        assert_eq!(
+            &resp[IOCTL_BODY + 8..IOCTL_BODY + 17],
+            b"595.99.02",
+            "RM's version"
+        );
+        be.set_host_ioctl_for_test(fault);
+        let resp = v1_ioctl(&mut be, ctl, check, &p);
+        assert_eq!(parse_resp(&resp).status, -libc::EFAULT);
+        assert_eq!(resp.len(), size_of::<MsgHeader>(), "a bare header");
+    }
+
+    /// The DRI section's count is of the records written: a count of every
+    /// device over fewer records had the guest read the card section after
+    /// them as DRI records (review 2026-09-29 2.6).
+    #[test]
+    fn a_truncated_dri_section_counts_only_what_it_holds() {
+        let dev = |name: &str| DriDevice {
+            name: name.into(),
+            major: 226,
+            minor: 128,
+            slot_index: 0,
+            dev_info: [0; NV_DEV_INFO_WORDS],
+            dev_info_size: 0,
+        };
+        let one = 16 + 4 * NV_DEV_INFO_WORDS + "renderD128".len();
+        let mut buf = vec![0u8; 4 + one + 8];
+        let n = write_dri_section(&[dev("renderD128"), dev("renderD129")], &mut buf);
+        assert_eq!(n, 4 + one);
+        assert_eq!(u32::from_le_bytes(buf[..4].try_into().unwrap()), 1);
+    }
+
     #[test]
     fn v1_ioctls_are_refused_on_every_new_handle_kind() {
         let mut be = gated_backend();
@@ -6721,20 +7008,17 @@ mod tests {
         let m = hostfd::ioc(hostfd::IOC_RW, b'm', 0, 16);
         // RM's frontend and nvidia-modeset both dispatch on the number alone,
         // so a foreign type byte would reach them as one of their own
-        // commands, unchecked.
-        for (h, cmd) in [
-            (ctl, d),
-            (ctl, m),
-            (modeset, d),
-            (uvm, m),
-            (ctl, 0x3000_0001),
+        // commands, unchecked. Each is refused with the device's own answer
+        // to a command it does not know (parity #32).
+        for (h, cmd, errno) in [
+            (ctl, d, libc::EINVAL),
+            (ctl, m, libc::EINVAL),
+            (modeset, d, libc::ENOTTY),
+            (uvm, m, libc::ENOSYS),
+            (ctl, 0x3000_0001, libc::EINVAL),
         ] {
             let r = v1_ioctl(&mut be, h, cmd, &[0u8; 24]);
-            assert_eq!(
-                parse_resp(&r).status,
-                -libc::EPERM,
-                "handle {h} cmd {cmd:#x}"
-            );
+            assert_eq!(parse_resp(&r).status, -errno, "handle {h} cmd {cmd:#x}");
         }
         assert!(forwarded().is_empty());
     }
@@ -7054,6 +7338,37 @@ mod tests {
         assert_eq!(write_dev_info_sizes(&[dri(20)], &mut [0u8; 7]), 0);
     }
 
+    /// A launcher's snapshot of the whole config space extends the 64 bytes
+    /// an unprivileged read gets, only if it is of the same device (parity
+    /// #14).
+    #[test]
+    fn a_pci_config_snapshot_extends_the_live_header_of_its_own_device() {
+        let mut live = vec![0u8; 64];
+        live[0..4].copy_from_slice(&[0xde, 0x10, 0x85, 0x2b]);
+        live[8..12].copy_from_slice(&[0xa1, 0, 0, 3]);
+        live[0x2c..0x30].copy_from_slice(&[0x43, 0x10, 0x11, 0x22]);
+        live[0x34] = 0x60;
+        let mut snap = live.clone();
+        snap[4] = 0xff; // a status bit that moved since: the live one wins
+        snap.resize(4096, 0);
+        snap[0x60] = 0x10; // the PCIe capability
+        snap[0x100] = 0x01; // an extended capability
+        let m = merge_pci_config(&live, &snap).unwrap();
+        assert_eq!(m.len(), 4096);
+        assert_eq!(&m[..64], &live[..]);
+        assert_eq!((m[0x60], m[0x100]), (0x10, 0x01));
+        let mut other = snap.clone();
+        other[2] = 0x86;
+        assert_eq!(merge_pci_config(&live, &other), None, "another device");
+        assert_eq!(merge_pci_config(&live, &snap[..64]), None, "nothing more");
+        assert_eq!(merge_pci_config(&live, &vec![0u8; 8192]), None, "too long");
+        assert_eq!(
+            merge_pci_config(&snap, &snap),
+            None,
+            "the live read was whole"
+        );
+    }
+
     #[test]
     fn the_card_section_is_written_whole_or_not_at_all() {
         let cards = vec![CardNode {
@@ -7236,13 +7551,13 @@ mod tests {
         // DISCARD (80) came in 580.65.06; 535 has no such command.
         let (mut be, uvm) = uvm_backend("535.129.03");
         let r = v1_ioctl(&mut be, uvm, 80, &[0u8; 32]);
-        assert_eq!(parse_resp(&r).status, -libc::EPERM);
+        assert_eq!(parse_resp(&r).status, -libc::ENOSYS, "UVM's own answer");
         // And a host with no table refuses them all.
         let mut be = NvidiaBackend::for_test();
         be.set_host_ioctl_for_test(fake_uvm);
         let uvm = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Uvm));
         let r = v1_ioctl(&mut be, uvm, 34, &[0u8; 16]);
-        assert_eq!(parse_resp(&r).status, -libc::EPERM);
+        assert_eq!(parse_resp(&r).status, -libc::ENOSYS);
     }
 
     /// S-33: a display file's handle-table descriptor is closed by the
@@ -7901,6 +8216,32 @@ mod mapping_tests {
     /// window offset, find none, and leave the extent charged until the
     /// memory was freed; now the zone ends exactly where it started, and so
     /// does the host.
+    /// UNMAP_MEMORY gives the caller its own pLinearAddress back, found or
+    /// not: RM does not write it and nvidia.ko copies the block back
+    /// (review 2026-09-29 2.4). The found path zeroed it.
+    #[test]
+    fn an_unmap_gives_the_caller_its_own_address_back() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let (_, _, off) = e.map_as(ctl, p(1), VIDMEM);
+        let unmap = |e: &mut Env, linear: u64| {
+            let mut q = vec![0u8; 32];
+            put(&mut q, 0, CLIENT);
+            put(&mut q, 4, DEVICE);
+            put(&mut q, 8, VIDMEM);
+            q[16..24].copy_from_slice(&linear.to_le_bytes());
+            let back = e.call(ctl, NV_ESC_RM_UNMAP_MEMORY, &q, &[]);
+            (
+                rd(&back, 24),
+                u64::from_le_bytes(back[16..24].try_into().unwrap()),
+            )
+        };
+        assert_eq!(unmap(&mut e, off), (0, off), "found");
+        assert!(host_maps().is_empty());
+        let (_, again) = unmap(&mut e, off);
+        assert_eq!(again, off, "not found");
+    }
+
     #[test]
     fn an_unmap_by_the_address_an_update_gave_returns_the_zone_exactly() {
         let mut e = env();
@@ -8022,8 +8363,8 @@ mod mapping_tests {
         );
         assert_eq!(held, 2 * LEN);
 
-        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
-        assert_ne!(status, 0, "refused");
+        // RM's own out-of-memory answer, in the status (#29).
+        assert_eq!(e.map_as(ctl, p(1), VIDMEM), (0, NV_ERR_NO_MEMORY, 0));
         assert_eq!(host_maps().len(), 2, "RM was never asked");
         assert_eq!(e.be.shm_free_bytes(), free);
         assert_eq!(
@@ -8033,6 +8374,59 @@ mod mapping_tests {
         // Another process still maps.
         let other = process(&mut e, p(2));
         assert_eq!(e.map_as(other, p(2), VIDMEM).1, 0);
+    }
+
+    /// An NVOS33 length near u64::MAX, which any app may send, is refused
+    /// in RM's status before a reservation is tried: rounding it up to a
+    /// page overflowed, and the release profile aborted the backend for
+    /// every process of the VM (review 2026-09-29 1.1). The same for an
+    /// MMAP's size (1.10).
+    #[test]
+    fn a_map_length_near_u64_max_is_refused_not_aborted() {
+        let mut e = env();
+        let ctl = process(&mut e, p(1));
+        let empty = e.be.shm_free_bytes();
+        for len in [
+            u64::MAX,
+            0xFFFF_FFFF_FFFF_F001,
+            0xFFFF_FFFF_FFFF_F000,
+            1 << 40,
+        ] {
+            let fd =
+                e.be.adopt_for_test_as(memfd(), HandleKind::Dev(DeviceKind::Gpu(0)), p(1));
+            let mut q = vec![0u8; 56];
+            put(&mut q, 0, CLIENT);
+            put(&mut q, 4, DEVICE);
+            put(&mut q, 8, VIDMEM);
+            q[24..32].copy_from_slice(&len.to_le_bytes());
+            put(&mut q, 44, 0x0308_0002);
+            put(&mut q, 48, fd);
+            let (status, back) = e.call_raw(ctl, NV_ESC_RM_MAP_MEMORY, &q, &[]);
+            assert_eq!(status, 0, "{len:#x}");
+            assert_eq!(rd(&back, 40), NV_ERR_NO_MEMORY, "{len:#x}");
+            assert_eq!(back[24..32], len.to_le_bytes(), "the caller's own length");
+            assert_eq!(rd(&back, 48), fd, "the caller's own descriptor");
+        }
+        assert!(host_maps().is_empty(), "RM was never asked");
+        assert_eq!(e.be.shm_free_bytes(), empty);
+
+        // An MMAP of an unrecorded file, sized by the guest kernel.
+        for size in [u64::MAX, 0xFFFF_FFFF_FFFF_F001] {
+            let mut req = msg(MsgType::Mmap, e.ctl);
+            push(
+                &mut req,
+                &MmapReq {
+                    size,
+                    offset: 0,
+                    prot: 3,
+                    padding: 0,
+                },
+            );
+            let mut resp = vec![0u8; 64];
+            e.be.dispatch(&req, &mut resp);
+            assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::ENOMEM);
+        }
+        assert_eq!(e.be.shm_free_bytes(), empty);
     }
 
     /// RM maps with another type than expected: the reservation moves to
@@ -8056,8 +8450,11 @@ mod mapping_tests {
         assert_eq!(e.be.shm_free_bytes().1, wc0, "no write-combining kept");
         let placed = e.window.0.lock().unwrap().len();
 
-        let (status, _, _) = e.map_as(ctl, unknown, UCVID);
-        assert_ne!(status, 0, "no uncached extent left");
+        assert_eq!(
+            e.map_as(ctl, unknown, UCVID),
+            (0, NV_ERR_NO_MEMORY, 0),
+            "no uncached extent left: RM's own answer (#29)"
+        );
         assert_eq!(host_maps().len(), 2, "the third host mapping was undone");
         assert_eq!(e.be.shm_free_bytes().1, wc0, "the reservation went back");
         assert_eq!(e.window.0.lock().unwrap().len(), placed, "nothing placed");
@@ -8071,9 +8468,9 @@ mod mapping_tests {
         let ctl = process(&mut e, p(1));
         let empty = e.be.shm_free_bytes();
         PLACE_FAILS.with(|f| f.set(true));
-        let (status, _, _) = e.map_as(ctl, p(1), VIDMEM);
+        let refused = e.map_as(ctl, p(1), VIDMEM);
         PLACE_FAILS.with(|f| f.set(false));
-        assert_ne!(status, 0);
+        assert_eq!(refused, (0, NV_ERR_NO_MEMORY, 0), "RM's own answer (#29)");
         assert!(host_maps().is_empty(), "the host's mapping was undone");
         assert_eq!(e.be.shm_free_bytes(), empty);
         assert_eq!(
@@ -8330,6 +8727,29 @@ mod uvm_map_tests {
         fn calls(&self) -> Vec<Call> {
             std::mem::take(&mut *self.vmm.calls.lock().unwrap())
         }
+    }
+
+    /// A pool the budgets refuse is refused as UVM refuses one, in its
+    /// rmStatus with the ioctl succeeding, and UVM is never asked (review
+    /// 2026-09-29 parity #29).
+    #[test]
+    fn a_refused_pool_says_so_in_its_rm_status() {
+        let mut e = env(true);
+        let h = e.uvm();
+        HOST.with(|h| h.borrow_mut().clear());
+        let mut p = vec![0u8; POOL];
+        p[0..8].copy_from_slice(&X.to_le_bytes());
+        for (len, want) in [
+            (0u64, NV_ERR_INVALID_ARGUMENT),
+            (u64::MAX, NV_ERR_INVALID_ARGUMENT),
+        ] {
+            p[8..16].copy_from_slice(&len.to_le_bytes());
+            let r = e.ioctl(h, 68, &p);
+            assert_eq!(status(&r), 0, "{len:#x}");
+            let st = BODY + POOL - 8;
+            assert_eq!(u32::from_le_bytes(r[st..st + 4].try_into().unwrap()), want);
+        }
+        assert!(HOST.with(|h| h.borrow().is_empty()), "UVM was never asked");
     }
 
     #[test]
@@ -8851,6 +9271,26 @@ mod descriptor_field_tests {
         assert!(seen().is_empty());
     }
 
+    /// An event's parameters too short to hold its descriptor are refused,
+    /// not sent for RM to read the field from past them (review 2026-09-29
+    /// 1.17).
+    #[test]
+    fn an_event_block_too_short_for_its_descriptor_never_reaches_rm() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        for class in [0x05, 0x79] {
+            for len in [4, 16, 19] {
+                let (st, _) = alloc(&mut be, ctl, class, &vec![0u8; len]);
+                assert_eq!(st, -libc::EINVAL, "class {class:#x}, {len} bytes");
+            }
+        }
+        assert!(seen().is_empty());
+        let mut p = [0u8; 24];
+        p[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(alloc(&mut be, ctl, 0x05, &p).0, 0, "-1 passes");
+    }
+
     #[test]
     fn an_fd_carrying_escape_forwards_minus_one_and_refuses_other_negatives() {
         let mut be = NvidiaBackend::for_test();
@@ -9146,5 +9586,31 @@ mod closing_tests {
         assert!(r.is_err(), "64 host files are still open");
         assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
         assert!(be.handles.insert(devnull(), HandleKind::Eventfd).is_ok());
+    }
+
+    /// Modeset files still closing count against the NVKMS open caps: with
+    /// the closer stalled on a modeset, one process looping open/close held
+    /// far more than 64 host NVKMS opens (review 2026-09-29 1.12).
+    #[test]
+    fn modeset_files_still_closing_count_against_the_nvkms_caps() {
+        let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let p = crate::quota::Owner::Proc {
+            tgid: 77,
+            start_ns: 1,
+        };
+        let mut be = NvidiaBackend::for_test();
+        let modeset = HandleKind::Dev(DeviceKind::Modeset);
+        let (go, wait) = std::sync::mpsc::channel();
+        crate::closer::close(Hold(wait));
+        let mut n = 0;
+        while be.modeset_open_refused(p).is_none() {
+            let h = be.adopt_for_test_as(devnull(), modeset, p);
+            be.close_handle(h).unwrap();
+            n += 1;
+            assert!(n <= nvkms::MAX_MODESET_OPENS, "no cap while closing");
+        }
+        go.send(()).unwrap();
+        assert!(crate::closer::wait_idle(std::time::Duration::from_secs(5)));
+        assert_eq!(be.modeset_open_refused(p), None, "closed, the room is back");
     }
 }

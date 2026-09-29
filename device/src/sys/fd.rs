@@ -178,6 +178,44 @@ pub fn seek_data(fd: RawFd, off: u64) -> io::Result<u64> {
     }
 }
 
+/// What `statx(fd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC)` says of a
+/// descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedStat {
+    /// The file type bits of the mode (`S_IFMT`).
+    pub kind: u32,
+    /// The device a special file is, as (major, minor).
+    pub rdev: (u32, u32),
+    /// The device of the filesystem the file is on, as (major, minor).
+    pub dev: (u32, u32),
+}
+
+/// A descriptor's type, rdev and filesystem device, from the attributes the
+/// kernel has cached: AT_STATX_DONT_SYNC tells a network or FUSE filesystem
+/// not to ask its server (fs/fuse/dir.c, `fuse_update_get_attr`), so a
+/// descriptor from outside cannot make the caller wait on whoever serves
+/// it. `fstat` and `fstatfs` can.
+pub fn statx_cached(fd: RawFd) -> io::Result<CachedStat> {
+    // SAFETY: an all-zero `statx` is a valid value for statx to overwrite.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is a NUL-terminated empty string, and `st` a live,
+    // writable statx.
+    cvt(unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE,
+            &mut st,
+        )
+    })?;
+    Ok(CachedStat {
+        kind: u32::from(st.stx_mode) & libc::S_IFMT,
+        rdev: (st.stx_rdev_major, st.stx_rdev_minor),
+        dev: (st.stx_dev_major, st.stx_dev_minor),
+    })
+}
+
 /// `fstat(fd)`.
 pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     // SAFETY: an all-zero `stat` is a valid value for fstat to overwrite.
@@ -252,9 +290,62 @@ pub fn peer_cred(sock: RawFd) -> io::Result<libc::ucred> {
     Ok(cred)
 }
 
+/// An int socket option of `sock` (`getsockopt(SOL_SOCKET, opt)`).
+fn sock_int(sock: RawFd, opt: libc::c_int) -> io::Result<libc::c_int> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `v` and `len` are live locals of the sizes given.
+    cvt(unsafe {
+        libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            opt,
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(v)
+}
+
+/// The peers of this process's connected Unix sockets that are other
+/// processes: `SO_PEERCRED` of every descriptor that is an AF_UNIX socket,
+/// not listening, whose peer is not this process. A listener's
+/// `SO_PEERCRED` is whoever made it (systemd, for an inherited one), so
+/// listeners are left out.
+pub fn unix_peers() -> Vec<libc::ucred> {
+    let me = crate::sys::proc::pid();
+    crate::privfd::open_fds(&|_| false)
+        .into_iter()
+        .filter(|&fd| {
+            statx_cached(fd).is_ok_and(|s| s.kind == libc::S_IFSOCK)
+                && sock_int(fd, libc::SO_DOMAIN).is_ok_and(|d| d == libc::AF_UNIX)
+                && sock_int(fd, libc::SO_ACCEPTCONN).is_ok_and(|l| l == 0)
+        })
+        .filter_map(|fd| peer_cred(fd).ok())
+        .filter(|c| c.pid != 0 && c.pid != me)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener and a pair within this process are no peers of another
+    /// process: whatever this test process has open, none is ours.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sockets to scan")]
+    fn the_unix_peers_are_other_processes_only() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!("nvgpu-peers-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let l = UnixListener::bind(&path).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let c = UnixStream::connect(&path).unwrap();
+        let me = crate::sys::proc::pid();
+        assert!(unix_peers().iter().all(|c| c.pid != me));
+        drop((l, a, b, c));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn a_pipe_carries_bytes_and_closes_once() {
@@ -263,9 +354,15 @@ mod tests {
         let mut b = [0u8; 8];
         assert_eq!(read(&r, &mut b).unwrap(), 5);
         assert_eq!(&b[..5], b"nvgpu");
-        let n = w.as_raw_fd();
+        // Closed once: the read end sees EOF, or EAGAIN while a forked test
+        // child still holds a copy (testfd.rs). Asking whether the number
+        // was still open raced with other test threads reusing it.
+        set_nonblock(r.as_raw_fd()).unwrap();
         drop(w);
-        assert!(!is_open(n) || n == r.as_raw_fd());
+        match read(&r, &mut b) {
+            Ok(n) => assert_eq!(n, 0),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EAGAIN)),
+        }
     }
 
     #[test]

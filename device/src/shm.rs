@@ -100,7 +100,7 @@ impl Zone {
 
     /// First-fit. Returns an absolute offset, or `None` if no extent fits.
     fn alloc(&mut self, length: u64) -> Option<u64> {
-        let want = align_up(length, PAGE_SIZE);
+        let want = align_up(length, PAGE_SIZE)?;
         if want == 0 {
             return None;
         }
@@ -117,12 +117,14 @@ impl Zone {
     /// Returns false if the extent is not inside this zone or overlaps a range
     /// already free, which would mean a double free.
     fn free_extent(&mut self, offset: u64, length: u64) -> bool {
-        let want = align_up(length, PAGE_SIZE);
+        let Some(want) = align_up(length, PAGE_SIZE) else {
+            return false;
+        };
         if want == 0 || offset < self.base {
             return false;
         }
         let start = offset - self.base;
-        if start + want > self.size {
+        if start.checked_add(want).is_none_or(|end| end > self.size) {
             return false;
         }
 
@@ -423,7 +425,19 @@ impl ShmAllocator {
             PgprotKind::WriteBack => &mut self.wb,
         };
 
-        let want = align_up(length, PAGE_SIZE);
+        // A length the guest chose (an NVOS33's, an MMAP's) can be anything
+        // up to u64::MAX: one larger than the zone is refused here, before
+        // any arithmetic on it can overflow.
+        let Some(want) = align_up(length, PAGE_SIZE).filter(|&w| w <= zone.size) else {
+            zone.peak.refused_space += 1;
+            return Err(DeviceError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!(
+                    "SHM {pgprot:?} zone of {:#x} bytes cannot hold {length:#x}",
+                    zone.size
+                ),
+            )));
+        };
         let in_use = zone.size - zone.free_bytes();
         if let Err(why) = zone
             .held
@@ -517,7 +531,12 @@ impl ShmAllocator {
     /// allocator did, and why a second NVENC encode in one guest ran the
     /// write-combine zone out of space.
     pub fn free(&mut self, region: &ShmRegion) -> Result<()> {
-        let len = align_up(region.length, PAGE_SIZE);
+        let len = align_up(region.length, PAGE_SIZE).ok_or_else(|| {
+            DeviceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SHM free of a region of {:#x} bytes", region.length),
+            ))
+        })?;
 
         // Put the memfd back under this range before the extent can be handed
         // to another mapping; the guest keeps the whole window mapped, so the
@@ -636,12 +655,21 @@ impl ShmAllocator {
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
+
+    /// The size of the largest zone: no one extent can be longer.
+    pub fn largest_zone(&self) -> u64 {
+        self.uc.size.max(self.wc.size).max(self.wb.size)
+    }
 }
 
 const PAGE_SIZE: u64 = 4096;
 
-fn align_up(v: u64, align: u64) -> u64 {
-    (v + align - 1) & !(align - 1)
+/// `v` rounded up to a multiple of `align` (a power of two), or None when
+/// that does not fit in a u64. `v` is often a guest's number: the release
+/// profile aborts on overflow, so a plain `+` here let one app take the
+/// whole backend down (review 2026-09-29 1.1).
+fn align_up(v: u64, align: u64) -> Option<u64> {
+    Some(v.checked_add(align - 1)? & !(align - 1))
 }
 
 #[cfg(test)]
@@ -659,6 +687,48 @@ mod tests {
 
     fn small_alloc() -> ShmAllocator {
         ShmAllocator::new(small_cfg())
+    }
+
+    /// A guest's length near u64::MAX is refused, not rounded past the top
+    /// of a u64: the release profile aborts on overflow, and the backend
+    /// with it (review 2026-09-29 1.1).
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
+    fn a_length_near_u64_max_is_refused_not_overflowed() {
+        assert_eq!(align_up(u64::MAX, PAGE_SIZE), None);
+        assert_eq!(align_up(0xFFFF_FFFF_FFFF_F001, PAGE_SIZE), None);
+        assert_eq!(
+            align_up(0xFFFF_FFFF_FFFF_F000, PAGE_SIZE),
+            Some(0xFFFF_FFFF_FFFF_F000)
+        );
+        let mut a = small_alloc();
+        for len in [
+            u64::MAX,
+            u64::MAX - 4094,
+            0xFFFF_FFFF_FFFF_F001,
+            0xFFFF_FFFF_FFFF_F000,
+            1 << 63,
+            4096 * 4 + 1,
+        ] {
+            for pg in [
+                PgprotKind::Uncached,
+                PgprotKind::WriteCombine,
+                PgprotKind::WriteBack,
+            ] {
+                assert!(a.alloc(len, pg).is_err(), "{len:#x} in {pg:?}");
+            }
+        }
+        assert_eq!(a.free_bytes(), (4096 * 2, 4096 * 4, 4096 * 2));
+        assert!(!a.wc.free_extent(a.wc.base, u64::MAX));
+        assert!(!a.wc.free_extent(a.wc.base + 4096, u64::MAX - 8192));
+        let huge = ShmRegion {
+            offset: a.wc.base,
+            length: u64::MAX,
+            pgprot: PgprotKind::WriteCombine,
+        };
+        assert!(a.free(&huge).is_err());
+        // The whole zone is still one extent.
+        assert!(a.alloc(4096 * 4, PgprotKind::WriteCombine).is_ok());
     }
 
     /// One guest process maps at most half a zone, and the last eighth is
@@ -851,7 +921,10 @@ pub trait WindowPlacer: Send {
 /// cannot tell -- the mmap itself failing -- answers "writable", which is what
 /// every placement assumed before, and the placement then fails on its own.
 pub fn host_mapping_writable(fd: RawFd, len: u64, fd_offset: u64) -> bool {
-    let len = align_up(len.max(1), PAGE_SIZE) as usize;
+    // A length no mapping can have: the placement fails on its own.
+    let Some(len) = align_up(len.max(1), PAGE_SIZE).and_then(|l| usize::try_from(l).ok()) else {
+        return true;
+    };
     crate::sys::mem::probe_writable(fd, len, fd_offset).unwrap_or(true)
 }
 

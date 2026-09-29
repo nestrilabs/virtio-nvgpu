@@ -230,12 +230,17 @@ struct Args {
     queue_poll_us: u64,
 
     /// The EEVDF slice of every backend thread, in microseconds (100 to
-    /// 100000; 0 keeps the host's default, about 3 ms). A shorter slice
+    /// 100000; 0 keeps the slice the process started with: the host's
+    /// default, about 3 ms, or the launcher's). A shorter slice
     /// gets the queue thread and the event pump back onto a busy CPU sooner
     /// after they wake, at the same share of the CPU: on a loaded host it
     /// is what keeps a guest's frames on their vblanks (DEPLOY.md, "Frame
     /// pacing"). Set at start, before any thread exists, so all inherit it;
-    /// needs no privilege, and a kernel before 6.12 keeps its default.
+    /// needs no privilege, and a kernel before 6.12 keeps its default. The
+    /// policy stays as the launcher set it (SCHED_BATCH, SCHED_IDLE), and a
+    /// real-time one is left alone; 0 leaves whatever slice the launcher
+    /// gave (a launcher that sets one should pass it here too, as
+    /// rig/run-guest.sh passes NVGPU_SLICE_US).
     #[arg(long, value_name = "US", default_value_t = 100)]
     sched_slice_us: u64,
 
@@ -248,6 +253,16 @@ struct Args {
     /// caches memory the GPU does not snoop. Diagnostic.
     #[arg(long, hide = true)]
     keep_guest_coherency: bool,
+
+    /// A directory holding each GPU's whole PCI config space, one file per
+    /// GPU named by its PCI address (`0000:01:00.0`), as root read it from
+    /// `/sys/bus/pci/devices/<addr>/config`. The backend, unprivileged, gets
+    /// only the first 64 bytes of that file, so the guest's device has no
+    /// capability list without it (nvidia-smi cannot report the PCIe link).
+    /// Read once at start, before the sandbox; a file of another device, or
+    /// past 4 KiB, is ignored.
+    #[arg(long, value_name = "DIR")]
+    pci_config_dir: Option<PathBuf>,
 
     /// The process sandbox (device::sandbox): a network namespace of its
     /// own, Landlock confining it to the GPU's nodes and what it reads at
@@ -834,10 +849,42 @@ impl Shared {
         if let Err(e) = ring.add_used(t.head, written as u32) {
             log::warn!("add_used for chain {}: {e}", t.head);
         }
+        let signal = wants_interrupt(ring.get_queue_mut(), &*mem);
         drop(ring);
-        if let Err(e) = vring.signal_used_queue() {
+        if signal && let Err(e) = vring.signal_used_queue() {
             log::warn!("signal used queue: {e}");
         }
+    }
+}
+
+/// Whether the guest acked VIRTIO_F_NOTIFY_ON_EMPTY: then it is interrupted
+/// whatever it asked, as the device did before it honoured suppression.
+static NOTIFY_ON_EMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// VRING_AVAIL_F_NO_INTERRUPT (virtio 1.2 §2.7.7).
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+/// Whether the guest wants an interrupt for what was just added to `q`'s
+/// used ring, asked under the ring's lock right after `add_used`: with
+/// EVENT_IDX, once past its `used_event`; without, unless it set
+/// VRING_AVAIL_F_NO_INTERRUPT, which virtio-queue does not read. The device
+/// SHOULD honour both (virtio 1.2 §2.7.10). An error answers yes: a missed
+/// interrupt strands a waiter, an extra one costs only time. The backend
+/// signalled every completion before, so the guest's reply-poll path took
+/// an interrupt per reply however it asked (review 2026-09-29 2.2).
+fn wants_interrupt<M: GuestMemoryBackend>(q: &mut impl QueueT, mem: &M) -> bool {
+    use vm_memory::Bytes;
+    if NOTIFY_ON_EMPTY.load(Ordering::Relaxed) {
+        return true;
+    }
+    match q.needs_notification(mem) {
+        Err(_) | Ok(true) if q.event_idx_enabled() => true,
+        Err(_) => true,
+        Ok(false) => false,
+        // `needs_notification` fenced after the used-ring writes.
+        Ok(true) => mem
+            .read_obj::<u16>(GuestAddress(q.avail_ring()))
+            .map_or(true, |f| u16::from_le(f) & VRING_AVAIL_F_NO_INTERRUPT == 0),
     }
 }
 
@@ -878,8 +925,11 @@ impl EventQueue for VringEventQueue {
         if let Err(e) = ring.add_used(head, written as u32) {
             log::warn!("event queue add_used: {e}");
         }
+        let signal = wants_interrupt(ring.get_queue_mut(), &*mem);
         drop(ring);
-        let _ = self.vring.signal_used_queue();
+        if signal {
+            let _ = self.vring.signal_used_queue();
+        }
         if bytes.is_empty() {
             Fill::Empty
         } else {
@@ -896,6 +946,63 @@ impl EventQueue for VringEventQueue {
 // The backend
 // ---------------------------------------------------------------------------
 
+/// `--pci-config-dir`: each GPU's snapshot, by address, at most 4 KiB (a
+/// longer file is no config space). A GPU with no file is left out, and
+/// so is one that cannot be read, with a warning.
+fn read_pci_configs(dir: &Path, gpus: &[device::virtio::GpuSlot]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for g in gpus {
+        let end = g
+            .pci_addr
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(g.pci_addr.len());
+        let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+        let path = dir.join(&addr);
+        match std::fs::read(&path) {
+            Ok(b) if b.len() <= 4096 => {
+                log::info!(
+                    "--pci-config-dir: {} bytes of GPU {addr}'s config space",
+                    b.len()
+                );
+                out.push((addr, b));
+            }
+            Ok(b) => log::warn!(
+                "--pci-config-dir: {} is {} bytes, no config space; not used",
+                path.display(),
+                b.len()
+            ),
+            Err(e) => log::warn!("--pci-config-dir: {}: {e}", path.display()),
+        }
+    }
+    out
+}
+
+/// Have the inject server refuse the VMM's uid: the one other process this
+/// backend's Unix sockets are connected to at the first SET_MEM_TABLE (the
+/// vhost-user connection and the request channel). More than one uid there
+/// and none is refused, with a warning; the `--inject-uid` rule still holds.
+fn refuse_vmm_uid(s: &device::inject::InjectServer) {
+    let mut uids: Vec<u32> = device::sys::fd::unix_peers()
+        .iter()
+        .map(|c| c.uid)
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    match uids[..] {
+        [uid] => {
+            log::info!("inject: the VMM is uid {uid}; no helper of that uid is accepted");
+            s.refuse_uid(uid);
+        }
+        _ => log::warn!(
+            "inject: the VMM's uid is not certain (peers {uids:?}); only --inject-uid applies"
+        ),
+    }
+}
+
+/// Something to start once the process's descriptors are registered.
+type AfterScan = Box<dyn FnOnce() + Send + Sync>;
+
 struct NvGpuBackend {
     shared: Arc<Shared>,
     event_idx: bool,
@@ -906,6 +1013,12 @@ struct NvGpuBackend {
     mem_fds: Vec<RawFd>,
     /// Whether the library's own descriptors have been registered yet.
     scanned_fds: bool,
+    /// Threads that open descriptors of their own -- the Wayland export and
+    /// inject accept threads -- started only once the scan is done: a peer
+    /// or helper descriptor open at the scan was registered as the
+    /// backend's own for good, and once closed its number, handed back by
+    /// a later IOCTL2, was refused adoption (review 2026-09-29 1.14).
+    after_scan: Vec<AfterScan>,
     /// `--allow-compute`, for the regions GET_SHMEM_CONFIG reports.
     allow_compute: bool,
     /// The window the allocator was made with, which GET_SHMEM_CONFIG
@@ -996,6 +1109,7 @@ impl NvGpuBackend {
             max_resp: MAX_XFER_DIRECT as usize,
             mem_fds: Vec::new(),
             scanned_fds: false,
+            after_scan: Vec::new(),
             allow_compute,
             window,
             queue_poll: std::time::Duration::ZERO,
@@ -1188,6 +1302,29 @@ impl VhostUserBackendMut for NvGpuBackend {
         QUEUE_SIZE as usize
     }
 
+    /// An exit event for each ring worker, which `main` writes once the
+    /// connection is gone. With none (the trait's default) a worker never
+    /// leaves its epoll, and the daemon's handler joins it as it is dropped:
+    /// a backend whose VMM hung up -- before the rings started, say -- said
+    /// "backend exited" and then never did, and a socket-activated unit
+    /// stayed up with nothing accepting.
+    fn exit_event(
+        &self,
+        _thread_index: usize,
+    ) -> Option<(
+        vmm_sys_util::event::EventConsumer,
+        vmm_sys_util::event::EventNotifier,
+    )> {
+        use vmm_sys_util::event::{EventFlag, new_event_consumer_and_notifier};
+        match new_event_consumer_and_notifier(EventFlag::NONBLOCK | EventFlag::CLOEXEC) {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                log::error!("no exit event for a ring worker ({e}); it will not stop at exit");
+                None
+            }
+        }
+    }
+
     fn features(&self) -> u64 {
         // INDIRECT_DESC lets one ring slot describe a whole table of
         // descriptors (virtio-queue chain.rs:119-145 follows them), which is
@@ -1201,6 +1338,10 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn acked_features(&mut self, features: u64) {
+        NOTIFY_ON_EMPTY.store(
+            features & (1 << VIRTIO_F_NOTIFY_ON_EMPTY) != 0,
+            Ordering::Relaxed,
+        );
         let indirect = features & (1 << VIRTIO_RING_F_INDIRECT_DESC) != 0;
         let limit = if indirect {
             MAX_XFER_INDIRECT
@@ -1313,7 +1454,11 @@ impl VhostUserBackendMut for NvGpuBackend {
             }
             let be = self.shared.nvidia.lock().unwrap();
             let n = privfd::register_process_fds(&|fd| be.owns_fd(fd));
+            drop(be);
             log::info!("{n} descriptor(s) of the transport registered as the backend's own");
+            for start in self.after_scan.drain(..) {
+                start();
+            }
         }
         Ok(())
     }
@@ -1736,10 +1881,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Before any thread exists, so that every one inherits it.
+    // 0 keeps what the launcher or the host set; so does a policy that is
+    // not a fair one (device::sys::proc::set_sched_slice).
     if args.sched_slice_us != 0 {
         let us = args.sched_slice_us.clamp(100, 100_000);
         match device::sys::proc::set_sched_slice(us * 1000) {
-            Ok(()) => log::info!("--sched-slice-us {us}: every backend thread's EEVDF slice"),
+            Ok(true) => log::info!("--sched-slice-us {us}: every backend thread's EEVDF slice"),
+            Ok(false) => log::info!(
+                "--sched-slice-us {us}: not a fair scheduling policy; the launcher's stays"
+            ),
             Err(e) => log::warn!("--sched-slice-us {us}: {e}; the host's default slice stays"),
         }
     }
@@ -1849,7 +1999,7 @@ fn main() -> anyhow::Result<()> {
                 device::inject::MAX_BUFFERS,
                 device::inject::MAX_BYTES >> 20
             );
-            Some(s)
+            Some(Arc::new(s))
         }
         _ => None,
     };
@@ -1871,6 +2021,13 @@ fn main() -> anyhow::Result<()> {
     let nofile = posture::raise_nofile()
         .map_err(|e| log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"))
         .ok();
+
+    // Each GPU's whole PCI config space, as the launcher snapshotted it:
+    // read before the sandbox, which leaves the directory out of reach.
+    let pci_config: Vec<(String, Vec<u8>)> = match &args.pci_config_dir {
+        None => Vec::new(),
+        Some(dir) => read_pci_configs(dir, &host::gpu_slots(&args.proc_nvidia)),
+    };
 
     // The sandbox, while this is the only thread (device::sandbox).
     match args.sandbox {
@@ -1932,13 +2089,31 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--pacing-stats: {e}"))?;
         log::warn!("pacing: counters logged every {secs} s while the guest is busy");
     }
+    // The accept threads start once the transport's descriptors are
+    // registered (`NvGpuBackend::after_scan`): until then, connections wait
+    // in the listeners' backlog.
+    let mut after_scan: Vec<AfterScan> = Vec::new();
     if let Some((x, _)) = &wayland.export {
-        x.start()
-            .map_err(|e| anyhow::anyhow!("--wayland-export: accept thread: {e}"))?;
+        let x = x.clone();
+        after_scan.push(Box::new(move || {
+            if let Err(e) = x.start() {
+                log::error!("--wayland-export: accept thread: {e}");
+            }
+        }));
     }
     if let Some(s) = &inject {
-        s.start()
-            .map_err(|e| anyhow::anyhow!("--inject-socket: accept thread: {e}"))?;
+        let s = s.clone();
+        let own_uid_ok = args.allow_inject_self;
+        after_scan.push(Box::new(move || {
+            // The VMM is connected by now: its uid is never a helper's.
+            // A test rig runs all three as one user (--allow-inject-self).
+            if !own_uid_ok {
+                refuse_vmm_uid(&s);
+            }
+            if let Err(e) = s.start() {
+                log::error!("--inject-socket: accept thread: {e}");
+            }
+        }));
     }
     let config = BackendConfig {
         kms_card: args.kms_card,
@@ -1970,6 +2145,13 @@ fn main() -> anyhow::Result<()> {
         args.allow_unmeasured_release,
         window,
     )?;
+    nvgpu.after_scan = after_scan;
+    {
+        let mut be = nvgpu.shared.nvidia.lock().expect("nvidia lock");
+        for (addr, config) in pci_config {
+            be.set_pci_config(&addr, config);
+        }
+    }
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
     log::info!(
@@ -2453,6 +2635,121 @@ mod tests {
                 ("unmap", 2, 0, 0x40_0000, 0x20_0000, 0, false),
             ]
         );
+    }
+
+    /// The threads that open descriptors of their own start once the
+    /// process's descriptors are registered, never before: what they open is
+    /// then never taken for the backend's own (review 2026-09-29 1.14).
+    fn test_backend() -> NvGpuBackend {
+        NvGpuBackend {
+            shared: Arc::new(Shared {
+                nvidia: Mutex::new(NvidiaBackend::with_zone_config(ZoneConfig::default_256mib())),
+                mem: RwLock::new(None),
+                pool: ExecPool::default(),
+                pump: Mutex::new(PumpState::default()),
+            }),
+            event_idx: false,
+            config: VirtioGpuNvConfig::new("595.99.02", &[]),
+            max_req: MAX_XFER_DIRECT as usize,
+            max_resp: MAX_XFER_DIRECT as usize,
+            mem_fds: Vec::new(),
+            scanned_fds: false,
+            after_scan: Vec::new(),
+            allow_compute: false,
+            window: ZoneConfig::default_256mib(),
+            queue_poll: std::time::Duration::ZERO,
+        }
+    }
+
+    /// A VMM that connects and hangs up at once: the daemon returns, the
+    /// ring workers take their exit events, and dropping it -- which joins
+    /// them -- returns. It never did: the workers had no exit event.
+    #[test]
+    fn a_vmm_that_hangs_up_at_once_lets_the_backend_exit() {
+        let path = std::env::temp_dir().join(format!("nvgpu-exit-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut listener = vhost::vhost_user::Listener::new(&path, true).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let backend = Arc::new(RwLock::new(test_backend()));
+            let mut daemon = VhostUserDaemon::new(
+                "virtio-nvgpu-test".to_string(),
+                backend,
+                GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+            )
+            .unwrap();
+            let _ = daemon.start(&mut listener).and_then(|()| daemon.wait());
+            for h in daemon.get_epoll_handlers() {
+                h.send_exit_event();
+            }
+            drop(daemon);
+            let _ = tx.send(());
+        });
+        let exited = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_file(&path);
+        assert!(exited.is_ok(), "the ring workers never stopped");
+    }
+
+    #[test]
+    fn accept_threads_start_after_the_descriptor_scan() {
+        use std::sync::Mutex as StdMutex;
+        let mut be = test_backend();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s2 = seen.clone();
+        // Open before the scan, and so registered by it: the start sees
+        // that done. (A descriptor the start opens itself is no test here:
+        // the scan takes every other test thread's too, and one of those
+        // numbers may come back.)
+        let plumbing = device::sys::fd::eventfd(libc::EFD_CLOEXEC).unwrap();
+        let raw = plumbing.as_raw_fd();
+        be.after_scan.push(Box::new(move || {
+            s2.lock().unwrap().push(privfd::is_private(raw));
+        }));
+        assert!(seen.lock().unwrap().is_empty(), "not before the scan");
+        be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![true], "after it");
+        drop(plumbing);
+        be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "once");
+    }
+
+    /// The guest's interrupt suppression is honoured: without EVENT_IDX its
+    /// VRING_AVAIL_F_NO_INTERRUPT, with it its used_event (review
+    /// 2026-09-29 2.2).
+    #[test]
+    fn a_completion_interrupts_only_a_guest_that_asked() {
+        use virtio_queue::Queue;
+        use vm_memory::Bytes;
+        let mem = memory();
+        let (desc, avail, used) = (0x1000u64, 0x2000u64, 0x3000u64);
+        let mut q = Queue::new(16).unwrap();
+        q.set_size(16);
+        q.set_desc_table_address(Some(desc as u32), Some(0));
+        q.set_avail_ring_address(Some(avail as u32), Some(0));
+        q.set_used_ring_address(Some(used as u32), Some(0));
+        q.set_ready(true);
+        let flags = |f: u16| mem.write_obj(f.to_le(), GuestAddress(avail)).unwrap();
+
+        flags(0);
+        q.add_used(&mem, 0, 0).unwrap();
+        assert!(wants_interrupt(&mut q, &mem));
+        flags(VRING_AVAIL_F_NO_INTERRUPT);
+        q.add_used(&mem, 1, 0).unwrap();
+        assert!(!wants_interrupt(&mut q, &mem), "NO_INTERRUPT");
+
+        // EVENT_IDX: used_event sits after the avail ring's 16 entries.
+        q.set_event_idx(true);
+        let used_event = |v: u16| {
+            mem.write_obj(v.to_le(), GuestAddress(avail + 4 + 2 * 16))
+                .unwrap()
+        };
+        used_event(10);
+        q.add_used(&mem, 2, 0).unwrap();
+        assert!(!wants_interrupt(&mut q, &mem), "not yet past used_event");
+        used_event(3);
+        q.add_used(&mem, 3, 0).unwrap();
+        assert!(wants_interrupt(&mut q, &mem), "past it");
     }
 
     /// A vring's eventfds are in no handle table, so the private registry

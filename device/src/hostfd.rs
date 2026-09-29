@@ -9,9 +9,11 @@
 //!
 //! Classification of a descriptor that arrives from outside (an ioctl's fd out,
 //! a Wayland message) is by what the kernel says it is, never by what the guest
-//! or the compositor claimed: `fstat` for DRM nodes (and the node must be an
-//! nvidia-drm card node of our own GPU), `/proc/self/fd` for the anonymous
-//! inodes.
+//! or the compositor claimed: cached `statx` attributes for DRM nodes (and
+//! the node must be an nvidia-drm card node of our own GPU), the filesystem
+//! device against the kernel's own internal mounts, and `/proc/self/fd` for
+//! the anonymous inodes. Nothing asked can make the backend wait on a FUSE
+//! server ([`classify`]).
 
 #![forbid(unsafe_code)]
 
@@ -276,13 +278,25 @@ fn making_fd(fd: RawFd, cmd: u32, bytes: &[u8], fd_out: usize) -> io::Result<Own
 /// of it would wait on that process (review 2026-09-26, backend 13). A
 /// descriptor that is none of these is `Other`: the guest may hold it and
 /// close it, never use it.
+///
+/// Nor may the classification itself wait on such a process: `fstat` and
+/// `fstatfs` of a FUSE file whose attribute timeout is 0 ask its server, on
+/// the server's schedule, and the classifying thread held the backend's
+/// lock (review 2026-09-29, backend 1.7). So the attributes are the cached
+/// ones (`statx` with AT_STATX_DONT_SYNC), and the filesystem is told by
+/// its device: the anonymous-inode, shmem and hugetlbfs mounts are the
+/// kernel's own, one each (per huge page size) whatever the namespace, and
+/// their devices are learned from files made here ([`KnownFs`]). A dma-buf
+/// is told by what only the dma-buf file operations write into its
+/// `/proc/self/fdinfo` (`exp_name:`, dma-buf.c `dma_buf_show_fdinfo`),
+/// which asks no filesystem.
 pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
     let raw = fd.as_raw_fd();
-    let Ok(st) = crate::sys::fd::fstat(raw) else {
+    let Ok(st) = crate::sys::fd::statx_cached(raw) else {
         return HandleKind::Other;
     };
-    if st.st_mode & libc::S_IFMT == libc::S_IFCHR {
-        let (major, minor) = (libc::major(st.st_rdev), libc::minor(st.st_rdev));
+    if st.kind == libc::S_IFCHR {
+        let (major, minor) = st.rdev;
         if major == DRM_MAJOR
             && minor < DRM_PRIMARY_MINOR_LIMIT
             && let Some(i) = cards
@@ -296,13 +310,77 @@ pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
         // from outside, a tty -- is nothing the guest may reach through us.
         return HandleKind::Other;
     }
-    let Ok(fs) = crate::sys::fd::fstatfs_type(raw) else {
-        return HandleKind::Other;
-    };
+    let fs = KnownFs::get().magic_of(st.dev, raw);
     let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{raw}")) else {
         return HandleKind::Other;
     };
     kind_from_link(fs, &target.to_string_lossy())
+}
+
+/// The devices of the kernel's internal mounts a descriptor from outside
+/// may be on, learned once from files made here.
+struct KnownFs {
+    /// anon_inode_mnt: an eventfd's.
+    anon: Option<(u32, u32)>,
+    /// shm_mnt: a memfd's.
+    shm: Option<(u32, u32)>,
+    /// hugetlbfs's internal mounts, one per huge page size a memfd could be
+    /// made with here.
+    huge: Vec<(u32, u32)>,
+}
+
+impl KnownFs {
+    fn get() -> &'static KnownFs {
+        static KNOWN: std::sync::OnceLock<KnownFs> = std::sync::OnceLock::new();
+        KNOWN.get_or_init(|| {
+            let dev = |fd: io::Result<OwnedFd>| {
+                fd.ok()
+                    .and_then(|fd| crate::sys::fd::statx_cached(fd.as_raw_fd()).ok())
+                    .map(|st| st.dev)
+            };
+            let memfd =
+                |flags: u32| crate::sys::fd::memfd(c"nvgpu-fs-probe", libc::MFD_CLOEXEC | flags);
+            let mut huge: Vec<(u32, u32)> = [
+                libc::MFD_HUGETLB,
+                libc::MFD_HUGETLB | libc::MFD_HUGE_2MB,
+                libc::MFD_HUGETLB | libc::MFD_HUGE_1GB,
+            ]
+            .into_iter()
+            .filter_map(|f| dev(memfd(f)))
+            .collect();
+            huge.sort_unstable();
+            huge.dedup();
+            KnownFs {
+                anon: dev(new_eventfd()),
+                shm: dev(memfd(0)),
+                huge,
+            }
+        })
+    }
+
+    /// The filesystem magic of a file on device `dev`, as [`kind_from_link`]
+    /// takes it; 0 for none of the kernel's own.
+    fn magic_of(&self, dev: (u32, u32), fd: RawFd) -> i64 {
+        if Some(dev) == self.anon {
+            ANON_INODE_FS_MAGIC
+        } else if Some(dev) == self.shm {
+            TMPFS_MAGIC
+        } else if self.huge.contains(&dev) {
+            HUGETLBFS_MAGIC
+        } else if is_dmabuf_fdinfo(fd) {
+            DMA_BUF_MAGIC
+        } else {
+            0
+        }
+    }
+}
+
+/// Whether `/proc/self/fdinfo/<fd>` has the `exp_name:` line only a
+/// dma-buf's file operations write (dma-buf.c, `dma_buf_show_fdinfo`).
+/// Reading it asks no filesystem: the rest of the text is the VFS's own.
+fn is_dmabuf_fdinfo(fd: RawFd) -> bool {
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .is_ok_and(|t| t.lines().any(|l| l.starts_with("exp_name:")))
 }
 
 /// Filesystem magic numbers (include/uapi/linux/magic.h).
@@ -1097,6 +1175,74 @@ mod tests {
     /// tmpfs file whose `/proc/self/fd` link reads `/dmabuf:x/f`. It was
     /// classified a dma-buf; a FUSE file there would have had the backend's
     /// first read of it wait on its maker (review 2026-09-26, backend 13).
+    /// A tmpfs file of a peer's own, at `/memfd:x` in its namespace, is no
+    /// memfd: it is not on the kernel's shmem mount. It passed as one when
+    /// the filesystem was told by `fstatfs`'s magic, which every tmpfs
+    /// shares (review 2026-09-29, backend 1.7).
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri runs no processes")]
+    fn a_tmpfs_file_named_like_a_memfd_is_not_one() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("nvgpu-classify-m-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.display();
+        let script = format!(
+            "mount -t tmpfs none {d} && mkdir {d}/old && echo hi > '{d}/memfd:x' \
+             && exec 3<'{d}/memfd:x' && cd {d} && pivot_root . old && echo $$ && read x"
+        );
+        let child = Command::new("unshare")
+            .args(["-Urm", "sh", "-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            eprintln!("SKIPPED a_tmpfs_file_named_like_a_memfd_is_not_one: no unshare");
+            return;
+        };
+        let mut line = String::new();
+        let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
+        let Ok(pid) = line.trim().parse::<u32>() else {
+            eprintln!("SKIPPED a_tmpfs_file_named_like_a_memfd_is_not_one: no namespaces here");
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir(&dir);
+            return;
+        };
+        let f = std::fs::File::open(format!("/proc/{pid}/fd/3")).unwrap();
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
+        assert!(link.to_string_lossy().starts_with("/memfd:"), "{link:?}");
+        assert_eq!(classify(f.as_fd(), &[]), HandleKind::Other);
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A dma-buf is told by its fdinfo, with no filesystem asked: a udmabuf,
+    /// where /dev/udmabuf is open to us.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no /dev/udmabuf")]
+    fn a_udmabuf_classifies_as_a_dmabuf() {
+        let Ok(dev) = open_path("/dev/udmabuf", libc::O_RDWR) else {
+            eprintln!("SKIPPED a_udmabuf_classifies_as_a_dmabuf: no /dev/udmabuf");
+            return;
+        };
+        let memfd = crate::sys::fd::memfd(c"classify", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+            .unwrap();
+        crate::sys::fd::ftruncate(&memfd, 4096).unwrap();
+        crate::sys::fd::add_seals(&memfd, libc::F_SEAL_SHRINK).unwrap();
+        let d = crate::sys::ioctl::udmabuf_create(
+            dev.as_fd(),
+            memfd.as_fd(),
+            4096,
+            UDMABUF_FLAGS_CLOEXEC,
+        )
+        .unwrap();
+        assert_eq!(classify(d.as_fd(), &[]), HandleKind::Dmabuf);
+        assert!(!is_dmabuf_fdinfo(memfd.as_raw_fd()));
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "Miri runs no processes")]
     fn a_file_named_like_a_dmabuf_is_not_one() {

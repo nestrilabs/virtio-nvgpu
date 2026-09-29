@@ -152,11 +152,14 @@ impl MsgHeader {
 
     /// A failure response. `errno` is given as a positive number and stored
     /// negated, which is the one direction that is easy to get wrong.
+    ///
+    /// Saturating: `i32::MIN` has no positive twin, and `abs` aborts on it
+    /// under the release profile (review 2026-09-29 2.6).
     pub fn err(msg_type: MsgType, errno: i32) -> Self {
         Self {
             msg_type: msg_type as u32,
             handle: 0,
-            status: -errno.abs(),
+            status: -errno.saturating_abs(),
             req_id: 0,
         }
     }
@@ -1001,6 +1004,15 @@ const _: () = {
 mod tests {
     use super::*;
 
+    /// A failure's errno is stored negated, and `i32::MIN` does not abort
+    /// (review 2026-09-29 2.6).
+    #[test]
+    fn an_error_header_negates_any_errno() {
+        assert_eq!(MsgHeader::err(MsgType::Ioctl, 22).status, -22);
+        assert_eq!(MsgHeader::err(MsgType::Ioctl, -22).status, -22);
+        assert_eq!(MsgHeader::err(MsgType::Ioctl, i32::MIN).status, -i32::MAX);
+    }
+
     /// The deep-segment and UVM-aperture constants are the C header's:
     /// nothing else checks that the two halves agree on them.
     #[test]
@@ -1095,12 +1107,18 @@ mod tests {
             BCAP_PROC_EUID,
             BCAP_COMPUTE,
             BCAP_INJECT,
+            BCAP_ARMED_READY,
         ];
         assert_eq!(
             bcaps.iter().fold(0, |a, b| a | b).count_ones() as usize,
             bcaps.len()
         );
-        let gcaps = [GCAP_UVM_APERTURE, GCAP_PROC_ID, GCAP_PROC_EUID];
+        let gcaps = [
+            GCAP_UVM_APERTURE,
+            GCAP_PROC_ID,
+            GCAP_PROC_EUID,
+            GCAP_ARMS_READY,
+        ];
         assert_eq!(
             gcaps.iter().fold(0, |a, b| a | b).count_ones() as usize,
             gcaps.len()

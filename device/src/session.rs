@@ -470,9 +470,23 @@ pub(crate) fn hdr(t: MsgType, handle: u32, status: i32, req_id: u32) -> Vec<u8> 
     let mut b = Vec::with_capacity(HDR);
     b.extend_from_slice(&(t as u32).to_le_bytes());
     b.extend_from_slice(&handle.to_le_bytes());
-    b.extend_from_slice(&status.to_le_bytes());
+    b.extend_from_slice(&wire_status(status).to_le_bytes());
     b.extend_from_slice(&req_id.to_le_bytes());
     b
+}
+
+/// A reply's status as it may go on the wire: 0, or an errno the kernel
+/// knows (-1 to -MAX_ERRNO); anything else -- a positive value, which the
+/// guest's v1 paths hand straight to userspace as an ioctl's result -- is
+/// EPROTO, as the guest's IOCTL2 path already clamps it (review 2026-09-29
+/// parity #40, the backend's half).
+pub(crate) fn wire_status(status: i32) -> i32 {
+    const MAX_ERRNO: i32 = 4095;
+    if status == 0 || (-MAX_ERRNO..0).contains(&status) {
+        status
+    } else {
+        -libc::EPROTO
+    }
 }
 
 fn read<T: crate::sys::pod::Pod + Copy>(payload: &[u8]) -> Option<T> {
@@ -491,7 +505,12 @@ impl NvidiaBackend {
     /// A failure response to the message being served.
     pub(crate) fn error_reply(&self, errno: i32) -> Reply {
         Reply {
-            bytes: hdr(self.current_msg, 0, -errno.abs(), self.current_req_id),
+            bytes: hdr(
+                self.current_msg,
+                0,
+                -errno.saturating_abs(),
+                self.current_req_id,
+            ),
             ..Reply::default()
         }
     }
@@ -790,34 +809,12 @@ impl NvidiaBackend {
         let io = |e: std::io::Error| errno_of(&e);
         match op {
             HostOp::PrimeExport { file, gem } => {
-                // A fence context is counted against its file's and the
-                // session's caps until its GEM handle closes (semsurf.rs),
-                // and each holds a host kthread, a timer and an NVKMS
-                // duplicate. A dma-buf of it would keep all that alive past
-                // the close, uncounted, as often as the guest liked.
-                // Nothing needs one: the object has no pages to share
-                // (nv_fence_context_gem_ops has no sg table), and the guest
-                // driver refuses to export one itself
-                // (nvgpu_fence_ctx_export).
-                if self.semsurf.is_ctx(file, gem) {
-                    log::warn!(
-                        "PRIME export of GEM {gem} of handle {file}, a fence context; refused"
-                    );
-                    return Err(libc::EINVAL);
-                }
-                // An injected capture buffer stays the guest's to read: its
-                // dma-buf is the helper's, and exported it would bypass the
-                // open's bounds and read-only tracking, and could go to the
-                // host compositor (SECURITY.md §18).
-                if !self.inject.exportable_handle(file, gem) {
-                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
-                    return Err(libc::EINVAL);
-                }
+                // Not a fence context, not an injected capture buffer: the
+                // one gate every export path asks (exportgate.rs).
+                let gate = self.export_gate();
+                gate.may_export(file, gem)?;
                 let dmabuf = hostfd::prime_export(self.raw(file)?, gem).map_err(io)?;
-                if !crate::inject::exportable(&self.inject_taint, dmabuf.as_fd()) {
-                    log::warn!("PRIME export of GEM {gem} of handle {file}, injected; refused");
-                    return Err(libc::EINVAL);
-                }
+                self.export_gate().may_leave(dmabuf.as_fd())?;
                 let size = hostfd::dmabuf_size(dmabuf.as_raw_fd()).unwrap_or(0);
                 let h = self.insert(dmabuf, HandleKind::Dmabuf)?;
                 Ok((vec![h as u64, size], vec![h]))
@@ -982,6 +979,21 @@ impl NvidiaBackend {
             self.recheck_granting_leases();
         }
         let prepared = xfer::prepare(&BackendEnv { backend: self }, class, target, kind, payload)?;
+        // A fence context over memory registered by its pages (osdesc.rs)
+        // would be a holder of it the registration does not know: NVKMS
+        // duplicates the surface and kernel-maps its memory, and would go
+        // on writing into the pages after the guest unpinned them for
+        // another process. Refused, as the cheap fail-closed answer (review
+        // 2026-09-29 1.4).
+        if let Some((client, surface)) = crate::semsurf::SemsurfPolicy::ctx_surface(&prepared)
+            && self.osdesc.holds(client, surface)
+        {
+            log::warn!(
+                "SEMSURF_FENCE_CTX_CREATE on handle {target}: surface {client:#x}/{surface:#x} \
+                 holds memory registered by its pages; refused"
+            );
+            return Err(libc::EPERM);
+        }
         // The whole reply must fit what the guest posted, and that is known
         // now: response_len() is exact up to descriptors and GEM handles the
         // host might not produce. A call that ran and then could not answer
@@ -1242,6 +1254,12 @@ mod tests {
 
     #[test]
     fn v2_messages_are_refused_until_hello_as_an_old_backend_would() {
+        // (And a status is never one the guest could take for a result.)
+        assert_eq!(wire_status(0), 0);
+        assert_eq!(wire_status(-libc::EINVAL), -libc::EINVAL);
+        for bad in [1, 4096 * 2, -4096, i32::MIN, -i32::MAX] {
+            assert_eq!(wire_status(bad), -libc::EPROTO, "{bad}");
+        }
         let mut be = backend();
         let r = call(&mut be, MsgType::TimeSync, 0, &[]);
         assert_eq!(status(&r), -libc::EPROTO);
@@ -1686,6 +1704,62 @@ mod tests {
             host_op(&mut be, OP_PRIME_EXPORT, &[render as u64, 8]).0,
             -libc::ENOTTY
         );
+    }
+
+    /// A fence context over a semaphore surface that holds memory
+    /// registered by its pages never reaches the host: NVKMS would be a
+    /// holder of the pages the registration does not know (review
+    /// 2026-09-29 1.4). Another surface of the same client does.
+    #[test]
+    fn a_fence_context_over_registered_memory_is_refused() {
+        const CLIENT: u32 = 0xc1d0_0001;
+        let mut be = backend();
+        hello(&mut be, HELLO_F_FRESH);
+        let render = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+        be.semsurf.render_opened(render, 0);
+        be.semsurf.set_layout(
+            0,
+            crate::semsurf::Layout {
+                stride: 32,
+                max_submitted: 24,
+            },
+        );
+        be.semsurf.client_allocated(render, CLIENT);
+        be.osdesc.held_for_test(CLIENT, 0x5e5);
+        let ctx = |surface: u32| {
+            let mut block = [0u8; 16];
+            block[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+            block[4..8].copy_from_slice(&surface.to_le_bytes());
+            block[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            let mut arg = [0u8; 32];
+            arg[8..16].copy_from_slice(&0x7000u64.to_le_bytes());
+            arg[16..24].copy_from_slice(&16u64.to_le_bytes());
+            let mut p = Vec::new();
+            for v in [
+                crate::semsurf::SEMSURF_FENCE_CTX_CREATE,
+                0,
+                2,
+                0,
+                0,
+                0,
+                48,
+                render,
+            ] {
+                p.extend_from_slice(&v.to_le_bytes());
+            }
+            for n in [32u32, 16] {
+                p.extend_from_slice(&n.to_le_bytes());
+            }
+            p.extend_from_slice(&arg);
+            p.extend_from_slice(&block);
+            p
+        };
+        be.current_handle = render;
+        assert_eq!(
+            be.prepare_ioctl2(&ctx(0x5e5), 4096).err(),
+            Some(libc::EPERM)
+        );
+        assert!(be.prepare_ioctl2(&ctx(0x5e6), 4096).is_ok());
     }
 
     #[test]
