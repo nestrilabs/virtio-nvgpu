@@ -10,8 +10,9 @@ the fuzzing of branch `fuzz` (§13), the memory-safety structure of
 branch `dind` (§14), the review of `dind` for memory passing (§15), and the
 VMMs it runs under, nesbox and crosvm (§16); by the review of 2026-09-26
 (§17); by capture injection (§18); by the window's size and share, with the
-RM mapping fixes that came with them (§19); and by the frame-pacing changes
-(§20). It is written for the project's owner. The
+RM mapping fixes that came with them (§19); by the frame-pacing changes
+(§20); and by the performance work (§21). It is written for the project's
+owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
 
@@ -2709,3 +2710,91 @@ SMT sibling from running another task while a vCPU runs: a mitigation for
 cross-thread side channels (L1TF/MDS-class) between the guest and host
 tasks on the sibling. The launcher keeps crosvm's default; turn it off
 only where no other tenant shares the cores.
+
+## 21. Performance
+
+Branch `perf`. What was measured and changed is in BENCHMARKS.md; this
+section is what the changes do to the boundary. None lifts a cap or a
+check: every request is parsed, held to the allowlist and the tables, and
+refused exactly as before.
+
+**Reused guarded blocks** (`device/src/sys/guarded.rs`). The blocks the host
+driver reads and writes -- an RM call's parameter block and the block its
+pointer reaches, and every block of an IOCTL2 -- were each a fresh anonymous
+mapping with a `PROT_NONE` guard page behind a page of zeroed slack (§14),
+and were unmapped after the call. That cost six system calls and two TLB
+shootdowns a call, 8.8 of the 10.2 µs the backend spent on an RM control.
+Now a block of up to 16 pages (60 KiB of parameters) goes back, when it is
+dropped, to a pool of at most four per size -- 2.3 MiB in all, whatever the
+guest does -- and comes out again for the next block of its size. What
+makes that equal to a fresh mapping:
+
+- it is zeroed through its whole reach (the block and its slack, every byte
+  the host could have written: the guard page cannot have been) before it
+  enters the pool, so a block taken out is all zeros, as a fresh anonymous
+  mapping is. Nothing one call left -- the host's output, a driver's write
+  past the declared size into the slack -- reaches the next call, whichever
+  guest process makes it;
+- the guard page is the one `mmap` made and stays `PROT_NONE`: a gross
+  overrun still faults, in the call that made it;
+- the layout is the same (the block at the page's start, the slack, the
+  guard), so what a driver that touches a few bytes past a block finds is
+  what it found before: zeros;
+- a larger block, or one the pool has no room for, is mapped and unmapped as
+  before. Miri builds keep the heap stand-in and no pool.
+
+The pool is process memory the backend keeps mapped between calls; it is
+never visible to a guest, and it holds no guest data between calls.
+Tests: `a_reused_buffer_is_a_fresh_one` (dirty the reach, drop, take: all
+zero at every size up to 60 KiB) and `the_pool_is_bounded_and_takes_no_large_buffers`.
+
+**The Wayland proxy's copies** (`wlwire`). A committed `wl_shm` buffer's
+rows are now read straight into the record the guest daemon sends
+(`frame::record_with`, the same bytes as `frame::record`), and a frame is
+packed with one copy of its records instead of two. The bytes on the wire
+are unchanged, the backend parses every record as before, and nothing of
+the change is on the host's side of a check.
+
+**The guest's reply polling** (`driver/nvgpu_xfer.c`). While a caller spins
+for its reply (`rt_spin_us`, §20), the control queue's interrupt is off
+and the spinning callers take replies off the ring themselves; the last to
+stop spinning turns the interrupt back on and takes what arrived
+meanwhile. Guest-internal: the host sees fewer interrupts to deliver and
+nothing else. Every ring operation stays under the transport's lock, as the
+interrupt handler's always was; a caller that sleeps -- an executor-class
+request, or one that spun out -- is woken by the next spinner or by the
+interrupt, never by neither (the virtio core's `enable_cb` reports replies
+that arrived while it was off); and once the transport is dead (a reset, a
+removal) nothing here touches the queue.
+
+**Prefaulting the window** (nesbox `virtio-nvgpu-v5`, crosvm
+`patches/crosvm/0010`). A guest's first touch of each page placed in the
+window was a second-level page-table fault, about 3.1 µs a page for BAR1
+video memory. Each VMM now makes one more vCPU that never runs and, on a
+thread of its own, calls `KVM_PRE_FAULT_MEMORY` through it for each
+placement it has made, after answering it. What this adds and does not:
+
+- it maps only what the window's memory slot already backs, at the
+  addresses just placed -- what the guest's own first access would have
+  mapped, with the same permissions (KVM maps as a read fault would, so it
+  never makes a mapping writable that a guest write would not). It gives the
+  guest no memory, no address and no access it did not have;
+- the extra vCPU is not the guest's: its APIC id is past every one the ACPI
+  tables list, so the guest never starts it, nothing ever runs it (no
+  `KVM_RUN`), and an interrupt the guest sends it is never delivered to
+  anything. It shares the guest's TDP root (the same CPUID, so the same
+  paging depth), which is the point: nothing else about KVM's view of the VM
+  changes;
+- a range withdrawn before its turn is `PROT_NONE` reservation again, which
+  KVM refuses (EFAULT), and the thread moves on; withdrawing is unchanged,
+  and KVM's MMU notifiers still zap whatever was mapped when a placement is
+  taken away, prefaulted or not;
+- the work is bounded: at most 1,024 ranges wait, and past that a request is
+  dropped (the guest then faults those pages itself, as before). The CPU it
+  spends is about 0.13 µs a page placed, less than the faults it saves; a
+  guest that maps and unmaps in a loop makes it spend that, as it made the
+  placement thread spend its `mmap`s before;
+- crosvm does this in its main process, which is where window mappings are
+  made (patch 0007) and which holds the VM; the jailed frontend is
+  unchanged. nesbox does it in the VMM process; the call is an `ioctl`,
+  which both VMMs' filters already allow.

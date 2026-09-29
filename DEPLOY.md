@@ -167,7 +167,12 @@ and a network namespace of its own:
 Both need `/dev/kvm` for the VMM user, and both take the shared window's
 size from the backend (GET_SHMEM_CONFIG): crosvm always has, nesbox from
 branch `virtio-nvgpu-v4` (an older nesbox publishes 1 GiB whatever the
-backend's `--window-size` says, and every placement past it fails). Guest
+backend's `--window-size` says, and every placement past it fails). Both
+prefault what they place in the window -- nesbox from branch
+`virtio-nvgpu-v5`, crosvm with `patches/crosvm/0010` -- on a host kernel
+with `KVM_PRE_FAULT_MEMORY` (6.11 or later): without it a guest's first
+write to fresh video memory runs at about a tenth of the host's speed, one
+second-level fault a page (BENCHMARKS.md; SECURITY.md §21). Guest
 RAM is committed at boot. The window is the configured size (`--window-size`,
 1 GiB by default), and with compute the UVM aperture another 1 GiB; what
 the window costs in host memory depends on the VMM ("Sizing the window").

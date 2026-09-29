@@ -711,6 +711,34 @@ passed, 5 skipped, `compat` 12/0/0, `wayland` on the live Hyprland 13/0/1;
 with the Rust module, `stage1`, `render` with compute, `secneg` and
 `compat` the same. No Xid.
 
+## Benchmarks
+
+`rig/rig-bench.sh` runs the matrix of [`BENCHMARKS.md`](../BENCHMARKS.md)
+natively (`rig-native-run.sh`: the guest image's programs and NVIDIA
+userspace on the host, without `XDG_DATA_DIRS`, as the guest's probes run)
+or in a guest (`run-guest.sh run`), both against the headless sway, so
+nothing reaches a monitor and DP-3 stays off. The guest image carries the
+programs (`rig/guest-image/tools/nvgpu-bench.c`, `nvgpu-cubench.c`,
+`nvgpu-bench-suite.sh`); `rig/bench-stats.py` makes the table.
+
+```sh
+rig/rig-headless-sway.sh &                        # the compositor, in its own terminal
+export NVGPU_BENCH_GROUPS="micro cuda gpu video startup wl"
+rig/rig-bench.sh native n 3                       # three native runs
+NVGPU_COMPUTE=1 rig/rig-bench.sh vm g 3           # three in nesbox (cuda needs compute)
+NVGPU_COMPUTE=1 NVGPU_VMM_KIND=crosvm rig/rig-bench.sh vm c 3
+rig/bench-stats.py native='.rig/logs/bench/n/*.bench' nesbox='.rig/logs/bench/g/*.bench' \
+    crosvm='.rig/logs/bench/c/*.bench'
+# one figure's ablation: a backend flag, a guest module parameter
+NVGPU_BENCH_GROUPS=micro NVGPU_BENCH_BACKEND_ARGS="--queue-poll-us 0" rig/rig-bench.sh vm qp0 3
+```
+
+Each guest run also writes the backend's and the VMM's CPU per group
+(`vm-N.cpu`, from `/proc` every 100 ms), both sides' pacing counters
+(`vm-N.pacing`) and the backend's log. A run takes about four minutes;
+interleave native and guest runs, and build nothing meanwhile: a compile on
+the same CPUs moves every figure.
+
 ## What to keep from every run
 
 The launcher writes three files per run:
