@@ -58,6 +58,7 @@ pub mod schema;
 pub mod semsurf;
 pub mod session;
 pub mod shm;
+pub mod sockpath;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod tally;

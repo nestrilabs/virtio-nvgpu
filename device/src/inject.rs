@@ -63,7 +63,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1270,57 +1269,6 @@ impl crate::nvidia::NvidiaBackend {
 // The socket
 // ---------------------------------------------------------------------------
 
-/// Whether what is at the socket path may be replaced: a socket of ours
-/// and nothing else (as the export socket, wl/export.rs).
-fn may_replace(is_socket: bool, owner: u32, me: u32) -> io::Result<()> {
-    if !is_socket {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "inject path exists and is not a socket",
-        ));
-    }
-    if owner != me {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("inject path is a socket of uid {owner}, not ours"),
-        ));
-    }
-    Ok(())
-}
-
-/// Bind at `path` with no moment in which anyone else may connect: in a new
-/// directory only we can enter, made 0600 there, then renamed into place.
-fn bind_private(path: &Path) -> io::Result<OwnedFd> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
-        .to_string_lossy()
-        .into_owned();
-    let mut n = 0;
-    let dir = loop {
-        let d = parent.join(format!(".{name}.{}.{n}", std::process::id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&d) {
-            Ok(()) => break d,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 16 => n += 1,
-            Err(e) => return Err(e),
-        }
-    };
-    let inner = dir.join("s");
-    let r = (|| {
-        let l = crate::sys::net::seqpacket_listen(&inner, MAX_PEERS as i32)?;
-        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&inner, path)?;
-        Ok(l)
-    })();
-    let _ = std::fs::remove_file(&inner);
-    let _ = std::fs::remove_dir(&dir);
-    r
-}
-
 struct Shared {
     registry: Arc<Registry>,
     uid: u32,
@@ -1349,13 +1297,12 @@ impl InjectServer {
     /// sandbox, which leaves it no directory to make a socket in, and starts
     /// threads after ([`InjectServer::start`]).
     pub fn bind_idle(path: &Path, uid: u32, registry: Arc<Registry>) -> io::Result<Self> {
-        let me = crate::sys::proc::uid();
-        match std::fs::symlink_metadata(path) {
-            Ok(m) => may_replace(m.file_type().is_socket(), m.uid(), me)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let l = bind_private(path)?;
+        // As the export socket is (sockpath.rs): only a stale socket of ours
+        // is replaced, and nobody can connect before it is 0600.
+        crate::sockpath::check_replaceable(path, "inject")?;
+        let l = crate::sockpath::bind_private(path, |p| {
+            crate::sys::net::seqpacket_listen(p, MAX_PEERS as i32)
+        })?;
         crate::privfd::register(l.as_raw_fd());
         Ok(Self {
             path: path.to_path_buf(),
@@ -1479,14 +1426,12 @@ fn accept_loop(s: Arc<Shared>, l: Arc<OwnedFd>) {
         let conn = match conn {
             Ok(c) => c,
             Err(e) => {
-                match e.raw_os_error() {
-                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
-                        log::warn!("inject: accept: {e}");
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Some(libc::EINTR | libc::ECONNABORTED) => {}
+                if let Some(d) = crate::sockpath::accept_backoff(&e) {
+                    log::warn!("inject: accept: {e}");
+                    std::thread::sleep(d);
+                } else if !matches!(e.raw_os_error(), Some(libc::EINTR | libc::ECONNABORTED)) {
                     // The listener was shut down, or is gone.
-                    _ => return,
+                    return;
                 }
                 continue;
             }
@@ -1950,6 +1895,7 @@ mod tests {
     use super::fake::{FakeHost, Obj};
     use super::*;
     use protocol::inject::{INJ_REPLY_SIZE, InjHello, InjRelease};
+    use std::os::unix::fs::PermissionsExt;
 
     const XR24: u32 = fourcc(b'X', b'R', b'2', b'4');
     const NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
@@ -2817,12 +2763,5 @@ mod tests {
         assert!(roundtrip(&extra, &hello_bytes(), &[]).is_none());
         drop(conns);
         s.shutdown();
-    }
-
-    #[test]
-    fn only_a_socket_of_our_own_is_replaced() {
-        assert!(may_replace(true, 5, 5).is_ok());
-        assert!(may_replace(true, 6, 5).is_err());
-        assert!(may_replace(false, 5, 5).is_err());
     }
 }

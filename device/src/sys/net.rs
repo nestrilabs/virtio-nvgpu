@@ -136,7 +136,7 @@ fn unix_addr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::soc
 
 /// A close-on-exec `SOCK_SEQPACKET` Unix socket bound at `path` and
 /// listening with a backlog of `backlog`. The caller chooses where (a
-/// private directory, then a rename: inject.rs).
+/// private directory, then a rename: sockpath.rs).
 pub fn seqpacket_listen(path: &std::path::Path, backlog: i32) -> io::Result<OwnedFd> {
     let (sa, len) = unix_addr(path)?;
     // SAFETY: integer arguments.
