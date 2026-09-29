@@ -42,6 +42,12 @@
 #
 # Environment (all optional):
 #   NVGPU_COMPUTE=1     the same as --allow-compute
+#   NVGPU_WINDOW_MIB    the shared window in MiB (the backend's --window-size;
+#                       default 1024, a multiple of 64); the VMM takes the size
+#                       from the backend -- nesbox from virtio-nvgpu-v4, which
+#                       is checked for when this is set
+#   NVGPU_WINDOW_SHARE  the percent of each window zone one guest process may
+#                       hold (the backend's --window-owner-share; default 50)
 #   NVGPU_RIG           the rig directory (bin/ kernel/ guest/ logs/); default
 #                       the repo's .rig when not root
 #   NVGPU_BACKEND NVGPU_VMM NVGPU_KERNEL NVGPU_ROOTFS NVGPU_LOGS
@@ -99,7 +105,8 @@
 #                       nothing, where there is no systemd user manager, as in
 #                       the Claude sandbox)
 #   NVGPU_MEM_HEADROOM_MIB  host memory to leave free beyond the guest and the
-#                       1 GiB window, or the run is refused (default 4096)
+#                       window (NVGPU_WINDOW_MIB), or the run is refused
+#                       (default 4096)
 #   NVGPU_SKIP_MEM_CHECK=1  run even so
 #   NVGPU_OOM_SCORE_ADJ oom_score_adj for the launcher, backend and VMM
 #                       (default 1000: the OOM killer takes the VM before the
@@ -417,6 +424,17 @@ case $CROSVM_SANDBOX in on | off) ;; *) die "NVGPU_CROSVM_SANDBOX=$CROSVM_SANDBO
 # Compute is the backend's to serve and the probe's to expect: one switch for
 # both (rig/guest-image/probes/render.sh reads nvgpu_compute).
 [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
+# The window's size and per-process share: the backend's to take and to
+# check (it refuses what cannot be had), and the VMM's to follow. Passed only
+# when set, so an older backend named by NVGPU_BACKEND still starts.
+WINDOW_MIB=${NVGPU_WINDOW_MIB:-1024}
+[[ $WINDOW_MIB =~ ^[0-9]+$ ]] || die "NVGPU_WINDOW_MIB=$WINDOW_MIB: whole MiB"
+WINDOW_MIB=$((10#$WINDOW_MIB))
+[ -n "${NVGPU_WINDOW_MIB:-}" ] && BACKEND_ARGS+=(--window-size "$WINDOW_MIB")
+if [ -n "${NVGPU_WINDOW_SHARE:-}" ]; then
+    [[ $NVGPU_WINDOW_SHARE =~ ^[0-9]+$ ]] || die "NVGPU_WINDOW_SHARE=$NVGPU_WINDOW_SHARE: a percent"
+    BACKEND_ARGS+=(--window-owner-share "$NVGPU_WINDOW_SHARE")
+fi
 SANDBOX=${NVGPU_SANDBOX:-on}
 case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
 SANDBOX_GIVEN=0
@@ -635,12 +653,22 @@ if [ "$VMM_KIND" = crosvm ]; then
         die "--allow-compute: $VMM has no UVM aperture; build the virtio-nvgpu-compute" \
             "branch (patches/crosvm 0007-0009) or drop --allow-compute"
 fi
+# nesbox before virtio-nvgpu-v4 publishes a 1 GiB window whatever the backend
+# says, and every placement past it then fails on its own. v4 asks the backend
+# (GET_SHMEM_CONFIG), and the string it names that request by is in the binary.
+if [ "$VMM_KIND" = nesbox ] && [ "$WINDOW_MIB" != 1024 ] &&
+    ! grep -q VHOST_USER_GET_SHMEM_CONFIG "$VMM" 2>/dev/null; then
+    die "NVGPU_WINDOW_MIB=$WINDOW_MIB: $VMM takes no window size from the backend;" \
+        "build nesbox's virtio-nvgpu-v4 branch, or leave the window at 1024"
+fi
 mkdir -p "$LOGS"
 
 # ── The desktop shares this GPU and this memory ──────────────────────────────
 #
 # The VMM commits all of guest RAM at boot and the window can take up to
-# 1 GiB more; refuse a run that would leave the desktop less than the
+# its size more (under crosvm, pages of it the guest touches with nothing
+# placed there are the VMM's shared memory; nesbox leaves them PROT_NONE, so
+# this is the worst case); refuse a run that would leave the desktop less than the
 # headroom, rather than have the OOM killer choose. When it does have to
 # choose, it should take this run: the launcher, backend and VMM all inherit
 # this oom_score_adj (raising one's own needs no privilege).
@@ -648,9 +676,9 @@ HEADROOM_MIB=${NVGPU_MEM_HEADROOM_MIB:-4096}
 [[ $HEADROOM_MIB =~ ^[0-9]+$ ]] || die "NVGPU_MEM_HEADROOM_MIB=$HEADROOM_MIB: whole MiB"
 AVAIL_KIB=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
 if [[ $AVAIL_KIB =~ ^[0-9]+$ ]]; then
-    NEED_MIB=$((MEM_MIB + 1024 + 10#$HEADROOM_MIB))
+    NEED_MIB=$((MEM_MIB + WINDOW_MIB + 10#$HEADROOM_MIB))
     if [ $((AVAIL_KIB / 1024)) -lt "$NEED_MIB" ] && [ "${NVGPU_SKIP_MEM_CHECK:-}" != 1 ]; then
-        die "$((AVAIL_KIB / 1024)) MiB available; a ${MEM_MIB} MiB guest, its 1 GiB window and" \
+        die "$((AVAIL_KIB / 1024)) MiB available; a ${MEM_MIB} MiB guest, its ${WINDOW_MIB} MiB window and" \
             "${HEADROOM_MIB} MiB left for the desktop want ${NEED_MIB} (NVGPU_MEM_MIB smaller," \
             "or NVGPU_SKIP_MEM_CHECK=1)"
     fi
