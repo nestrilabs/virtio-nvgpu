@@ -39,6 +39,7 @@ use wlwire::frame::{self, Desc, DescOut, Unit};
 use wlwire::policy::{LeaseGate, Policy};
 use wlwire::sys;
 
+use crate::budget::{self, Owner, Share};
 use crate::log::{self, Level};
 
 use crate::channel::{Channel, Connector, HostInfo, Sent};
@@ -152,8 +153,18 @@ const _: () = assert!(RECV_BYTES >= frame::MIN_FRAME);
 /// replies it never reads grew the daemon until the guest's OOM killer took
 /// it and every client with it (W2). A native compositor drops only the
 /// stuck client, and so does this: after [`STUCK_FOR`] over the line.
+///
+/// What its stream sinks hold for its pipes' readers counts too: bytes the
+/// client asked for and is not reading, which it can make the host send as
+/// fast as a selection's owner writes them (they are also held to the
+/// daemon's [`STREAM_BUDGET`]).
 const LOCAL_OUT_MAX: usize = 4 << 20;
 const STUCK_FOR: Duration = Duration::from_secs(30);
+
+/// What the daemon holds for `c` that `c` has not read (LOCAL_OUT_MAX).
+fn unread(c: &Client) -> usize {
+    c.engine.local_out_len() + c.engine.stream_held()
+}
 
 /// Lines a client can cause (its protocol errors, its socket's): at most
 /// [`LOG_BURST`] each [`LOG_WINDOW`], a line the same as the one before is
@@ -271,6 +282,8 @@ struct Client {
     sock: UnixStream,
     chan: Box<dyn Channel>,
     engine: Engine,
+    /// Who what the daemon holds for this client is charged to.
+    owner: Owner,
     inbuf: Vec<u8>,
     infds: VecDeque<OwnedFd>,
     /// Frames the host has not taken yet.
@@ -302,7 +315,34 @@ pub struct Daemon {
     stop: Arc<AtomicBool>,
     totals: Arc<Mutex<Totals>>,
     log: LogLimit,
+    /// Descriptors clients may hold between them, and how they are shared.
+    fd_budget: u64,
+    fd_share: Share,
+    /// The listener is out of epoll until then: the daemon had no
+    /// descriptor to spare for another client.
+    listen_paused: Option<Instant>,
+    /// What stream sinks hold for readers, over every client.
+    stream_bytes: Arc<budget::Bytes>,
+    /// For owners the kernel cannot name.
+    next_conn: u64,
 }
+
+/// Descriptors the daemon keeps for itself, outside what clients may hold:
+/// stdio, epoll, the listener, the card and render nodes, the export
+/// channel, and headroom for the moment an accept has a socket and not yet a
+/// channel.
+const FD_OWN: u64 = 32;
+/// What one read of a client can add past what was counted before it: all
+/// one `recvmsg` takes (`wlwire::sys::recv_with_fds`, libwayland's most).
+const FD_SLACK: u64 = wlwire::wire::MAX_FDS_PER_SENDMSG as u64;
+/// What a client costs before it sends any: its socket and its channel.
+const FD_PER_CLIENT: u64 = 2;
+/// Bytes stream sinks may hold for readers that have not taken them, over
+/// every client (each connection's sinks are granted at most
+/// `wlwire::stream::SINK_TOTAL` besides).
+pub const STREAM_BUDGET: u64 = 64 << 20;
+/// How long the listener rests when the daemon is out of descriptors.
+const LISTEN_BACKOFF: Duration = Duration::from_millis(100);
 
 fn epoll_ctl(ep: RawFd, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
     crate::sys::epoll_ctl(ep, op, fd, events, token)
@@ -353,7 +393,16 @@ impl Daemon {
     pub fn new(cfg: Config, mut conn: Box<dyn Connector>) -> io::Result<Daemon> {
         let info = conn.info()?;
         let ep = crate::sys::epoll_create()?;
+        // What clients may hold: the descriptor limit (main raised it to the
+        // hard limit), less the daemon's own and one read's worth.
+        let (soft, _) = crate::sys::nofile_limit()?;
+        let fd_budget = soft.saturating_sub(FD_OWN + FD_SLACK);
         let mut d = Daemon {
+            fd_budget,
+            fd_share: Share::quarter(fd_budget, 8),
+            listen_paused: None,
+            stream_bytes: budget::Bytes::new(STREAM_BUDGET),
+            next_conn: 0,
             clock: Arc::new(AtomicI64::new(info.clock_offset_ns)),
             last_clock: Instant::now(),
             info,
@@ -460,11 +509,19 @@ impl Daemon {
     /// One wait and everything it woke.
     pub fn turn(&mut self, max_wait_ms: i32) -> io::Result<()> {
         let busy = self.clients.iter().flatten().any(|c| !c.tx.is_empty());
-        let timeout = if busy {
+        let mut timeout = if busy {
             5.min(max_wait_ms)
         } else {
             max_wait_ms
         };
+        if let Some(t) = self.listen_paused {
+            // Rounded up: the last part of a millisecond is a wait too.
+            let left = t
+                .saturating_duration_since(Instant::now())
+                .as_micros()
+                .div_ceil(1000) as i32;
+            timeout = if timeout < 0 { left } else { timeout.min(left) };
+        }
         let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 64];
         let n = match crate::sys::epoll_wait(self.ep.as_raw_fd(), &mut evs, timeout) {
             Ok(n) => n,
@@ -558,6 +615,7 @@ impl Daemon {
         for slot in touched {
             self.sync(slot);
         }
+        self.resume_listening();
         if self.last_clock.elapsed() >= self.cfg.clock_refresh {
             self.last_clock = Instant::now();
             if let Ok(i) = self.conn.info() {
@@ -585,7 +643,7 @@ impl Daemon {
         }
     }
 
-    fn add_client(&mut self, sock: UnixStream, chan: Box<dyn Channel>, local: Local) {
+    fn add_client(&mut self, sock: UnixStream, chan: Box<dyn Channel>, local: Local, owner: Owner) {
         if sock.set_nonblocking(true).is_err() {
             return;
         }
@@ -593,6 +651,10 @@ impl Daemon {
         // A guest compositor's output is paced by the channel too (export
         // mode): its peer is the host client, behind the channel.
         engine.set_input_limit(Some(wlwire::engine::CHANNEL_HIGH_WATER));
+        // What stream sinks hold for the client's readers comes out of the
+        // daemon's memory, and so out of one pool with a share per owner
+        // (the backend does the same with its queue budget).
+        engine.set_stream_budget(self.stream_bytes.for_owner(owner));
         engine.hello(self.hello_caps);
         let slot = match self.clients.iter().position(|c| c.is_none()) {
             Some(s) => s,
@@ -612,21 +674,26 @@ impl Daemon {
             base | SUB_SOCK,
         )
         .is_err()
-            || epoll_ctl(
-                ep,
-                libc::EPOLL_CTL_ADD,
-                chan.poll_fd(),
-                libc::EPOLLIN as u32,
-                base | SUB_CHAN,
-            )
-            .is_err()
         {
+            return;
+        }
+        if epoll_ctl(
+            ep,
+            libc::EPOLL_CTL_ADD,
+            chan.poll_fd(),
+            libc::EPOLLIN as u32,
+            base | SUB_CHAN,
+        )
+        .is_err()
+        {
+            let _ = epoll_ctl(ep, libc::EPOLL_CTL_DEL, sock.as_raw_fd(), 0, 0);
             return;
         }
         self.clients[slot] = Some(Client {
             sock,
             chan,
             engine,
+            owner,
             inbuf: Vec::new(),
             infds: VecDeque::new(),
             tx: VecDeque::new(),
@@ -643,36 +710,150 @@ impl Daemon {
         self.sync(slot);
     }
 
+    /// Descriptors every client holds between them, and those `o`'s clients
+    /// hold: each client's socket and channel, what it sent that no request
+    /// has taken yet, what waits for the host, and what its engine holds.
+    fn fds_in_use(&self, o: Option<Owner>) -> (u64, u64) {
+        let (mut all, mut mine) = (0, 0);
+        for c in self.clients.iter().flatten() {
+            let tx: usize = c.tx.iter().map(|(_, f)| f.iter().flatten().count()).sum();
+            let n = FD_PER_CLIENT + (c.infds.len() + tx + c.engine.held_fds()) as u64;
+            all += n;
+            if Some(c.owner) == o {
+                mine += n;
+            }
+        }
+        (all, mine)
+    }
+
+    /// May `o` hold `n` more descriptors?
+    fn fds_admit(&self, o: Owner, n: u64) -> Result<(), (budget::Over, u64)> {
+        let (all, mine) = self.fds_in_use(Some(o));
+        budget::admits(&self.fd_share, mine, n, all, self.fd_budget).map_err(|w| (w, mine))
+    }
+
+    /// Stop accepting for a while: out of descriptors, every accept fails at
+    /// once and the pending connection stays in the backlog, so the listener
+    /// would wake every wait.
+    fn pause_listening(&mut self) {
+        if self.listen_paused.is_some() {
+            return;
+        }
+        if let Some(l) = &self.listener {
+            let _ = epoll_ctl(
+                self.ep.as_raw_fd(),
+                libc::EPOLL_CTL_DEL,
+                l.as_raw_fd(),
+                0,
+                0,
+            );
+        }
+        self.listen_paused = Some(Instant::now() + LISTEN_BACKOFF);
+    }
+
+    fn resume_listening(&mut self) {
+        if self.listen_paused.is_none_or(|t| Instant::now() < t) {
+            return;
+        }
+        self.listen_paused = None;
+        if let Some(l) = &self.listener {
+            let _ = epoll_ctl(
+                self.ep.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                l.as_raw_fd(),
+                libc::EPOLLIN as u32,
+                TOK_LISTENER,
+            );
+        }
+    }
+
+    /// Turn a client away before it has a channel, telling it why.
+    fn refuse(s: &UnixStream, code: u32, why: String) {
+        let err = Fatal::new(Blame::Remote, 1, code, why);
+        let _ = sys::send_with_fds(s.as_raw_fd(), &err.display_error(), &[]);
+    }
+
     fn accept(&mut self) {
         loop {
+            if self.listen_paused.is_some() {
+                return;
+            }
+            // Room for one more client at all: otherwise it waits in the
+            // backlog until some other client lets go of descriptors.
+            if self.fds_in_use(None).0 + FD_PER_CLIENT > self.fd_budget {
+                self.log.say(
+                    Level::Warn,
+                    format!(
+                        "nvgpu-wl-guest: clients hold the daemon's {} descriptors; \
+                         not accepting for now",
+                        self.fd_budget
+                    ),
+                );
+                self.pause_listening();
+                return;
+            }
             let Some(l) = &self.listener else { return };
-            match l.accept() {
-                // Charged to the client, not to the daemon: each guest
-                // process holds only a share of the VM's channels and their
-                // budgets (NVGPU_WL_IOC_CONNECT_FOR).
-                Ok((s, _)) => match match peer_pid(&s) {
-                    Some(pid) => self.conn.connect_for(pid),
-                    None => self.conn.connect(uapi::CONNECT),
-                } {
-                    Ok(ch) => self.add_client(s, ch, Local::Client),
-                    Err(e) => {
-                        self.log.say(
-                            Level::Warn,
-                            format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"),
-                        );
-                        let err = Fatal::new(
-                            Blame::Remote,
-                            1,
-                            wlwire::engine::ERR_IMPLEMENTATION,
-                            format!("virtio-nvgpu: no host channel: {e}"),
-                        );
-                        let _ = sys::send_with_fds(s.as_raw_fd(), &err.display_error(), &[]);
-                    }
-                },
+            let s = match l.accept() {
+                Ok((s, _)) => s,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    log::say(Level::Error, &format!("nvgpu-wl-guest: accept: {e}"));
+                    // Out of descriptors or memory, the pending connection
+                    // stays in the backlog and every accept fails at once:
+                    // the listener rests rather than spin, and the line is
+                    // metered like any a client can cause.
+                    self.log
+                        .say(Level::Warn, format!("nvgpu-wl-guest: accept: {e}"));
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                    ) {
+                        self.pause_listening();
+                    }
                     return;
+                }
+            };
+            let owner = match peer_pid(&s) {
+                Some(pid) => Owner::Pid(pid),
+                None => {
+                    self.next_conn += 1;
+                    Owner::Conn(self.next_conn)
+                }
+            };
+            if let Err((why, held)) = self.fds_admit(owner, FD_PER_CLIENT) {
+                self.log.say(
+                    Level::Warn,
+                    format!(
+                        "nvgpu-wl-guest: {owner:?} holds {held} of the daemon's {} descriptors \
+                         ({why:?}); refusing its connection",
+                        self.fd_budget
+                    ),
+                );
+                Self::refuse(
+                    &s,
+                    wlwire::engine::ERR_NO_MEMORY,
+                    "virtio-nvgpu: too many descriptors held".into(),
+                );
+                continue;
+            }
+            // Charged to the client, not to the daemon: each guest process
+            // holds only a share of the VM's channels and their budgets
+            // (NVGPU_WL_IOC_CONNECT_FOR).
+            let ch = match owner {
+                Owner::Pid(pid) => self.conn.connect_for(pid),
+                Owner::Conn(_) => self.conn.connect(uapi::CONNECT),
+            };
+            match ch {
+                Ok(ch) => self.add_client(s, ch, Local::Client, owner),
+                Err(e) => {
+                    self.log.say(
+                        Level::Warn,
+                        format!("nvgpu-wl-guest: cannot open a channel to the host: {e}"),
+                    );
+                    Self::refuse(
+                        &s,
+                        wlwire::engine::ERR_IMPLEMENTATION,
+                        format!("virtio-nvgpu: no host channel: {e}"),
+                    );
                 }
             }
         }
@@ -688,7 +869,13 @@ impl Daemon {
                 Err(_) => return,
             };
             match UnixStream::connect(&target) {
-                Ok(s) => self.add_client(s, ch, Local::Server),
+                Ok(s) => {
+                    // Each is a host client, which the guest kernel cannot
+                    // name: an owner of its own.
+                    self.next_conn += 1;
+                    let owner = Owner::Conn(self.next_conn);
+                    self.add_client(s, ch, Local::Server, owner)
+                }
                 Err(e) => self.log.say(
                     Level::Warn,
                     format!(
@@ -753,8 +940,35 @@ impl Daemon {
                     break;
                 }
                 Ok(n) => {
+                    let got = fds.len();
                     c.inbuf.extend_from_slice(&buf[..n]);
                     c.infds.extend(fds);
+                    let owner = c.owner;
+                    // Descriptors come with the read, before anything can
+                    // refuse them: counted now, and past the owner's share
+                    // of the daemon's (budget.rs) the client is closed, as
+                    // one past libwayland's ring below. One read adds at
+                    // most FD_SLACK, which the budget leaves room for.
+                    let over = if got > 0 {
+                        self.fds_admit(owner, 0).err()
+                    } else {
+                        None
+                    };
+                    if let Some((why, held)) = over {
+                        let f = Fatal::new(
+                            Blame::Local,
+                            1,
+                            wlwire::engine::ERR_NO_MEMORY,
+                            format!(
+                                "the client's process holds {held} of the proxy's {} \
+                                 descriptors ({why:?})",
+                                self.fd_budget
+                            ),
+                        );
+                        self.fatal(slot, f);
+                        break;
+                    }
+                    let c = self.clients[slot].as_mut().unwrap();
                     if c.infds.len() > wlwire::wire::MAX_FDS_QUEUED {
                         // As libwayland does with a client that overflows
                         // its descriptor ring.
@@ -887,7 +1101,7 @@ impl Daemon {
             // until it does (LOCAL_OUT_MAX); sync stops watching the channel.
             // One being closed gets nothing more at all: whatever it was
             // told last (a wl_display.error) stays the last thing it reads.
-            if c.closing || c.engine.local_out_len() >= LOCAL_OUT_MAX {
+            if c.closing || unread(c) >= LOCAL_OUT_MAX {
                 return;
             }
             let r = match c.chan.recv(max, card, render) {
@@ -963,7 +1177,7 @@ impl Daemon {
         // The channel is read only while the client keeps up (W2), and a
         // client that stays that far behind is dropped, as a compositor
         // drops a client it cannot write to.
-        let behind = c.engine.local_out_len() >= LOCAL_OUT_MAX;
+        let behind = unread(c) >= LOCAL_OUT_MAX;
         let chan_want = if behind { 0 } else { libc::EPOLLIN as u32 };
         if behind {
             let since = *c.stuck_since.get_or_insert_with(Instant::now);
@@ -972,7 +1186,7 @@ impl Daemon {
                     Level::Warn,
                     format!(
                         "nvgpu-wl-guest: a client has not read {} bytes in {}s; closing it",
-                        c.engine.local_out_len(),
+                        unread(c),
                         STUCK_FOR.as_secs()
                     ),
                 );
@@ -1687,6 +1901,43 @@ mod tests {
         assert!(turns < 30, "{turns} turns in 300 ms after the client went");
         assert_eq!(watched(&d), 1, "only the listener is left in epoll");
         drop((rd, wr));
+    }
+
+    /// What stream sinks hold for a client that is not reading its pipe is
+    /// charged to the client's process in the daemon's stream budget, and
+    /// counts as unread for the stuck-client rule; it is given back when
+    /// the stream ends. Before, the daemon's sinks were unbudgeted: about
+    /// 15 MiB per connection, and a process could hold 16 connections (the
+    /// 2026-09-29 review, S6).
+    #[test]
+    fn what_sinks_hold_is_charged_to_the_clients_process() {
+        let (mut d, script, client) = with_an_offer("sinkbudget");
+        let (rd, wr) = sys::pipe().unwrap();
+        let recv = MsgBuilder::new(0xff00_0000, op::wl_data_offer::REQ_RECEIVE)
+            .string(Some("text/plain"))
+            .finish();
+        sys::send_with_fds(client.as_raw_fd(), &recv, &[wr.as_raw_fd()]).unwrap();
+        drop(wr);
+        d.turn(50).unwrap();
+        let id = the_client(&d).engine.stream_interest()[0].id;
+        let data = |_| Unit {
+            rec: frame::record(frame::REC_STREAM_DATA, id, 0, &[7u8; 60_000]),
+            descs: Vec::new(),
+        };
+        script.push((0..2).map(data).collect());
+        d.turn(50).unwrap();
+        let c = the_client(&d);
+        let held = c.engine.stream_held();
+        assert!(held > 0, "the pipe is full and the rest is held");
+        assert_eq!(d.stream_bytes.used(c.owner), (held as u64, held as u64));
+        assert_eq!(unread(c), c.engine.local_out_len() + held);
+        let owner = c.owner;
+        // The reader goes: the sink ends, and gives back what it held.
+        drop(rd);
+        for _ in 0..3 {
+            d.turn(50).unwrap();
+        }
+        assert_eq!(d.stream_bytes.used(owner), (0, 0));
     }
 
     /// Registrations in the daemon's epoll set (its fdinfo's `tfd:` lines).

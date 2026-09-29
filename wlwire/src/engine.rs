@@ -85,6 +85,16 @@ impl Out {
         }
     }
 
+    /// Descriptors this holds: a record's to go with it, a blob's source.
+    /// A commit's copy holds its pool, which is counted with the pools.
+    fn fds(&self) -> usize {
+        match self {
+            Out::Unit(u) => u.descs.iter().filter(|d| d.fd.is_some()).count(),
+            Out::Blob(_) => 1,
+            Out::Shm(_) => 0,
+        }
+    }
+
     fn job_mut(&mut self) -> Option<&mut dyn Job> {
         match self {
             Out::Unit(_) => None,
@@ -309,6 +319,8 @@ pub struct Engine {
     out_channel: VecDeque<Out>,
     /// What `out_channel` will put on the channel, in bytes.
     out_bytes: usize,
+    /// Descriptors `out_channel` holds (`Out::fds`).
+    out_fds: usize,
     /// Past this many bytes for the channel, `from_local` stops.
     input_limit: Option<usize>,
     wl_bytes: Vec<u8>,
@@ -338,6 +350,7 @@ impl Engine {
             streams: Streams::new(host),
             out_channel: VecDeque::new(),
             out_bytes: 0,
+            out_fds: 0,
             input_limit,
             wl_bytes: Vec::new(),
             wl_descs: Vec::new(),
@@ -409,6 +422,24 @@ impl Engine {
             + self.out_local.len()
             + self.streams.held()
             + self.blobs.held() as usize
+    }
+
+    /// Descriptors this engine holds: shm pools, streams (open, and ended
+    /// ones not yet taken back), unfinished blobs, blobs still being sent,
+    /// and descriptors queued either way. What an owner running many
+    /// engines in one process counts against its descriptor limit.
+    pub fn held_fds(&self) -> usize {
+        self.shm.pool_fds() as usize
+            + self.streams.fds()
+            + self.blobs.incoming()
+            + self.out_fds
+            + self.wl_descs.iter().filter(|d| d.fd.is_some()).count()
+            + self.out_local.fds()
+    }
+
+    /// Bytes stream sinks hold for local readers that have not taken them.
+    pub fn stream_held(&self) -> usize {
+        self.streams.held()
     }
 
     /// How many `wp_drm_lease_request_v1.submit` requests a frame from the
@@ -513,6 +544,7 @@ impl Engine {
     pub fn drop_channel_output(&mut self) {
         self.out_channel.clear();
         self.out_bytes = 0;
+        self.out_fds = 0;
         self.wl_bytes.clear();
         self.wl_descs.clear();
     }
@@ -567,12 +599,14 @@ impl Engine {
                 break;
             };
             let shm = matches!(front, Out::Shm(_));
+            let fds = front.fds();
             let Some(job) = front.job_mut() else {
                 // A record ready to go.
                 let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
                     unreachable!()
                 };
                 self.out_bytes -= u.bytes();
+                self.out_fds -= fds;
                 n += u.bytes();
                 out.push_back(u);
                 continue;
@@ -596,6 +630,7 @@ impl Engine {
                 // Done, or cut short: whatever it still claimed goes too.
                 self.out_channel.pop_front();
                 self.out_bytes -= after as usize;
+                self.out_fds -= fds;
             }
         }
         out
@@ -679,6 +714,7 @@ impl Engine {
     fn push_out(&mut self, o: Out) {
         self.flush_wayland();
         self.out_bytes += o.bytes();
+        self.out_fds += o.fds();
         self.out_channel.push_back(o);
     }
 
@@ -689,9 +725,10 @@ impl Engine {
         let descs = std::mem::take(&mut self.wl_descs);
         let rec = record(frame::REC_WAYLAND, 0, descs.len() as u32, &self.wl_bytes);
         self.wl_bytes.clear();
-        let u = Unit { rec, descs };
+        let u = Out::Unit(Unit { rec, descs });
         self.out_bytes += u.bytes();
-        self.out_channel.push_back(Out::Unit(u));
+        self.out_fds += u.fds();
+        self.out_channel.push_back(u);
     }
 
     fn push_wayland(&mut self, msg: &[u8], descs: Vec<DescOut>) {

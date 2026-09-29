@@ -874,6 +874,35 @@ fn unknown_objects_opcodes_and_versions_are_fatal() {
     assert!(e.message.contains("needs version 4"), "{}", e.message);
 }
 
+/// What an engine says it holds in descriptors is what it holds: the guest
+/// daemon shares its descriptor limit among clients by this count.
+#[test]
+fn an_engine_counts_the_descriptors_it_holds() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(2, "wl_shm", 2), (3, "wl_data_device_manager", 3)]);
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (0, 0));
+    p.client_sends(
+        &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(5)
+            .int(4096)
+            .finish()],
+        vec![sys::memfd(c"p", 4096).unwrap()],
+    )
+    .unwrap();
+    // The client's pool here; the memfd there, and the copy of it waiting
+    // for the compositor.
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (1, 2));
+    p.at_server();
+    assert_eq!(p.h.held_fds(), 1);
+    p.client_sends(
+        &[MsgBuilder::new(5, op::wl_shm_pool::REQ_DESTROY).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!((p.g.held_fds(), p.h.held_fds()), (0, 0));
+}
+
 /// Errors go where libwayland-server posts them: the generic ones on the
 /// display (object 1), a bad bind on the registry, and an interface's own
 /// on its object. Before, every error named the object the message did,

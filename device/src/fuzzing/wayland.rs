@@ -31,6 +31,8 @@
 //!
 //! - an engine holding more memory than its budgets allow
 //!   (`Engine::held_bytes`, after every operation);
+//! - a descriptor open between operations that no engine counts
+//!   (`Engine::held_fds`);
 //! - an engine whose count of what it has queued for the channel is not
 //!   what its queue holds, or that still counts something once it has
 //!   nothing more to take (the input limit is decided by that count);
@@ -568,6 +570,16 @@ pub fn run(data: &[u8]) {
                 }
             };
             p.check_memory();
+            // Every descriptor the run holds between operations is one an
+            // engine counts: an owner budgets descriptors by that count
+            // (the guest daemon's share of its limit among clients).
+            let held = p.g.held_fds() + p.h.held_fds();
+            let open = super::open_fds();
+            assert!(
+                open <= fds_before + held,
+                "{} descriptors open, {held} counted by the engines",
+                open - fds_before
+            );
             if !ok {
                 break;
             }

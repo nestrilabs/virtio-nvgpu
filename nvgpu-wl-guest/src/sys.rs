@@ -158,6 +158,39 @@ pub fn peer_cred(sock: RawFd) -> Option<libc::ucred> {
     (r == 0).then_some(cred)
 }
 
+/// RLIMIT_NOFILE: (soft, hard).
+pub fn nofile_limit() -> io::Result<(u64, u64)> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into a live local.
+    cvt(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) })?;
+    Ok((r.rlim_cur, r.rlim_max))
+}
+
+/// Raise RLIMIT_NOFILE's soft limit to its hard limit, as compositors do
+/// (the soft limit exists for select(), which this process never calls).
+/// The soft limit after.
+pub fn raise_nofile() -> io::Result<u64> {
+    let (soft, hard) = nofile_limit()?;
+    if soft >= hard {
+        return Ok(soft);
+    }
+    set_nofile(hard, hard)?;
+    Ok(hard)
+}
+
+/// Set RLIMIT_NOFILE (a test scales it down this way).
+pub fn set_nofile(soft: u64, hard: u64) -> io::Result<()> {
+    let r = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: setrlimit reads one live rlimit.
+    cvt(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }).map(|_| ())
+}
+
 /// Run `handler` on SIGINT and SIGTERM; it must be async-signal-safe (an
 /// atomic store).
 pub fn on_terminate(handler: extern "C" fn(libc::c_int)) {

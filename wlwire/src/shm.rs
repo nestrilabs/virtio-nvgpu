@@ -449,6 +449,13 @@ impl Shm {
         self.surfaces.remove(&id);
     }
 
+    /// Pools this connection holds a descriptor for: every one charged to its
+    /// own count, which a pool leaves only when the last reference to it
+    /// (its id, a buffer made from it, a commit's copy) goes.
+    pub fn pool_fds(&self) -> u64 {
+        self.conn.used().1
+    }
+
     /// Draw on a budget other connections share too (the VM's, a guest
     /// process's), beside this connection's own and any set before. Pools
     /// already made keep what they were charged to.

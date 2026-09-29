@@ -91,6 +91,16 @@ fn main() {
         }
     }
     log::set(level);
+    // Every client's descriptors pass through this one process: the soft
+    // limit (1024 in most sessions) is raised to the hard one, as
+    // compositors raise theirs, and what clients may hold of it is shared
+    // out among them (daemon.rs, budget.rs).
+    if let Err(e) = nvgpu_wl_guest::sys::raise_nofile() {
+        log::say(
+            Level::Warn,
+            &format!("nvgpu-wl-guest: cannot raise the descriptor limit: {e}"),
+        );
+    }
     let run = || -> Result<(), String> {
         let mut cfg = Config::new(socket_path(&socket)?);
         cfg.card = card;

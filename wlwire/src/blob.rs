@@ -181,6 +181,11 @@ impl Blobs {
         self.pending_bytes
     }
 
+    /// Unfinished blobs: a memfd each.
+    pub fn incoming(&self) -> usize {
+        self.incoming.len()
+    }
+
     /// Drop every unfinished blob (the connection is over).
     pub fn clear(&mut self) {
         self.incoming.clear();

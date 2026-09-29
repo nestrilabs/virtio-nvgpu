@@ -16,6 +16,7 @@
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod budget;
 pub mod channel;
 pub mod daemon;
 pub mod log;
