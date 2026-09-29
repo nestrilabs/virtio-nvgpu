@@ -1109,6 +1109,94 @@ fn shm_contents_reach_the_host_memfd_at_commit_and_only_the_damage_after() {
     );
 }
 
+/// A buffer destroyed while its surface still shows it keeps its pages in
+/// the compositor's pool until the surface commits something else, as
+/// natively (destroying a wl_buffer leaves the pool alone): a compositor
+/// that reads shm when it paints goes on reading them. Before, they were
+/// punched at the destroy, and it painted zeros (the 2026-09-29 review, C3).
+#[test]
+fn a_destroyed_buffer_keeps_its_pages_while_its_surface_shows_it() {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    let page = pg() as i32;
+    let pixels: Vec<u8> = (0..2 * page as usize)
+        .map(|i| (i % 251) as u8 + 1)
+        .collect();
+    let buffer = |id: u32, offset: i32| {
+        MsgBuilder::new(5, op::wl_shm_pool::REQ_CREATE_BUFFER)
+            .new_id(id)
+            .int(offset)
+            .int(page / 4)
+            .int(1)
+            .int(page)
+            .uint(0)
+            .finish()
+    };
+    let show = |id: u32| {
+        vec![
+            MsgBuilder::new(7, op::wl_surface::REQ_ATTACH)
+                .object(id)
+                .int(0)
+                .int(0)
+                .finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish(),
+        ]
+    };
+    p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(2 * page)
+                .finish(),
+            buffer(6, 0),
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(7)
+                .finish(),
+        ],
+        vec![memfd_with(&pixels)],
+    )
+    .unwrap();
+    let host = host_pool(&mut p);
+    p.client_sends(&show(6), vec![]).unwrap();
+    let first = &pixels[..page as usize];
+    assert_eq!(&read_all(&host)[..page as usize], first);
+    // Destroyed while shown: still there.
+    p.client_sends(
+        &[MsgBuilder::new(6, op::wl_buffer::REQ_DESTROY).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        &read_all(&host)[..page as usize],
+        first,
+        "punched while shown"
+    );
+    // A commit without an attach shows the same buffer still.
+    p.client_sends(
+        &[MsgBuilder::new(7, op::wl_surface::REQ_COMMIT).finish()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(&read_all(&host)[..page as usize], first);
+    // Another buffer shown: the first's pages go, and their charge.
+    p.client_sends(&[buffer(8, page)], vec![]).unwrap();
+    p.client_sends(&show(8), vec![]).unwrap();
+    assert!(read_all(&host)[..page as usize].iter().all(|&b| b == 0));
+    assert_eq!(allocated(&host), pg());
+    // And the surface going takes a shown, destroyed buffer with it.
+    p.client_sends(
+        &[
+            MsgBuilder::new(8, op::wl_buffer::REQ_DESTROY).finish(),
+            MsgBuilder::new(7, op::wl_surface::REQ_DESTROY).finish(),
+        ],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(allocated(&host), 0);
+}
+
 /// A client with wl_compositor (3), wl_shm (4) and a surface (5), whose
 /// 8 MiB buffer 7 in pool 6 it then truncates to `left` bytes behind the
 /// proxy's back before committing it; the commit, and a `wl_display.sync`

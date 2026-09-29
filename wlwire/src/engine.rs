@@ -1367,7 +1367,7 @@ impl Engine {
                             .map_err(|e| err(ERR_NO_MEMORY, format!("shm resize: {e:?}")))?;
                     }
                 }
-                (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) if client_side => {
+                (proto::WL_SURFACE, op::wl_surface::REQ_ATTACH) => {
                     if let Val::Object(b) = args[0].val {
                         self.shm.attach(obj_id, b);
                     }
@@ -1384,6 +1384,8 @@ impl Engine {
                     self.stats.commits += 1;
                     if client_side {
                         commit_sync = self.shm.commit(obj_id);
+                    } else {
+                        self.shm.commit_server(obj_id);
                     }
                 }
                 (proto::WP_DRM_LEASE_DEVICE_V1, op::wp_drm_lease_device_v1::REQ_RELEASE) => {

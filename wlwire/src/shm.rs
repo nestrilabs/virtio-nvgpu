@@ -34,8 +34,10 @@
 //! `SHM_SYNC` only ever writes inside a live buffer. A buffer is charged when
 //! it is made, for the pages it touches that no other live buffer of its pool
 //! already does (clients double-buffer in one pool, and overlap), and refused
-//! if that would pass a budget. When the last buffer over a page goes, the
-//! page is punched out of the memfd (`FALLOC_FL_PUNCH_HOLE`) and its charge
+//! if that would pass a budget. When the last buffer over a page goes -- a
+//! buffer destroyed while its surface shows it goes once the surface shows
+//! something else ([`Shm::forget`]) -- the page is punched out of the memfd
+//! (`FALLOC_FL_PUNCH_HOLE`) and its charge
 //! given back; the compositor, which maps the whole pool, reads zeros there,
 //! as it would from a client that punched its own pool. That is how foot runs:
 //! it makes a 512 MiB pool per window and scrolls by sliding one buffer
@@ -389,6 +391,9 @@ struct Surface {
     damage_full: bool,
     damage_rows: Option<(u64, u64)>,
     buffers: HashSet<u32>,
+    /// The buffer this surface last committed, destroyed since: what the
+    /// compositor still shows, so its pages stay (see [`Shm::forget`]).
+    retired: Option<Buffer>,
 }
 
 /// Bytes one connection's live buffers may cover, in the server's side's
@@ -456,13 +461,26 @@ fn union(a: Option<(u64, u64)>, b: (u64, u64)) -> Option<(u64, u64)> {
 impl Shm {
     /// Drop whatever is known about object `id` (it was destroyed, or its id
     /// is being reused).
+    ///
+    /// A buffer destroyed while it is what a surface last committed is not
+    /// let go yet: `wl_buffer.destroy` leaves a pool's contents alone
+    /// natively, and a compositor that reads shm when it paints rather than
+    /// at commit (wlroots' pixman renderer) goes on reading those pages until
+    /// the surface commits something else. Punched now, it would paint
+    /// zeros (the 2026-09-29 review, C3). So the buffer, its pages and their
+    /// charge stay with the surface until its next attach is committed, or
+    /// the surface goes: one buffer per surface at most.
     pub fn forget(&mut self, id: u32) {
         self.pools.remove(&id);
-        if self.buffers.remove(&id).is_some() {
+        if let Some(buf) = self.buffers.remove(&id) {
+            let mut buf = Some(buf);
             for s in self.surfaces.values_mut() {
                 s.buffers.remove(&id);
                 if s.current == id {
                     s.current = 0;
+                    if let Some(b) = buf.take() {
+                        s.retired = Some(b);
+                    }
                 }
             }
         }
@@ -593,6 +611,17 @@ impl Shm {
         s.damage_rows = union(s.damage_rows, (a, b));
     }
 
+    /// `wl_surface.commit` on the server's side: only what the surface now
+    /// shows, for [`Shm::forget`].
+    pub fn commit_server(&mut self, surface: u32) {
+        if let Some(s) = self.surfaces.get_mut(&surface)
+            && let Some(b) = s.pending.take()
+        {
+            s.current = b;
+            s.retired = None;
+        }
+    }
+
     /// `wl_surface.commit` on the client's side: what the commit needs copied
     /// ahead of it, as a job the channel reads from when it has room
     /// ([`SyncJob`]), not as bytes read now.
@@ -600,6 +629,7 @@ impl Shm {
         let s = self.surfaces.get_mut(&surface)?;
         if let Some(b) = s.pending.take() {
             s.current = b;
+            s.retired = None;
             if b != 0 && self.buffers.contains_key(&b) {
                 s.buffers.insert(b);
             }
