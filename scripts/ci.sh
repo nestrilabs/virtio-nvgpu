@@ -10,8 +10,9 @@
 #            the unsafe-confinement check, the NixOS module's patches against
 #            the patches they stand for, the scripts' syntax (and shellcheck
 #            of the launcher and its dry run), and the deployment:
-#            nix/module.nix evaluated with its assertions tried and its units
-#            compared with contrib/systemd's (checks.module-eval), those
+#            nix/module.nix evaluated with its assertions tried, the units it
+#            installs compared with contrib/systemd's and its drop-ins held
+#            to what is per slot (checks.module-eval), contrib/systemd's
 #            units through `systemd-analyze verify`, patches/crosvm applied
 #            in order to c0474109d64d (from CROSVM_SRC, or the rig's crosvm
 #            checkout; skipped, and said, where there is none), and, on a
@@ -119,8 +120,9 @@ scripts_syntax_check() {
     return $rc
 }
 
-# nix/module.nix evaluated: its assertions refuse what they must, and its
-# units say what contrib/systemd's do (nix/module-test.nix).
+# nix/module.nix evaluated: its assertions refuse what they must, the units
+# it installs say what contrib/systemd's do, and its drop-ins set only what
+# is per slot (nix/module-test.nix).
 module_eval_check() {
     nix build --no-link .#checks.x86_64-linux.module-eval
 }

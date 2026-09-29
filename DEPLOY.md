@@ -142,11 +142,16 @@ done
 
 On NixOS, [`nix/module.nix`](nix/module.nix) declares the pool, with fixed
 ids (`uidBase`, 64000 by default: slot N's backend user and group are
-64000+2N, its VMM user 64000+2N+1), the groups, the socket units and the
-unit (`services.virtio-nvgpu = { enable = true; package = ...; slots = 4;
-}`; the root flake's `nixosModules.default` sets the package). Its
-assertions refuse a slot's group with anyone else in it, a pool user with
-other groups, and another user on a pool id.
+64000+2N, its VMM user 64000+2N+1), and the groups, and installs the
+socket units and the unit below as they are, for its package
+([`nix/units.nix`](nix/units.nix); the root flake's `units` package is the
+same), with what is the configuration's -- flags, `memoryMax`, `tasksMax`,
+the Wayland socket, the inject socket's group -- in a drop-in per slot
+(`services.virtio-nvgpu = { enable = true; package = ...; slots = 4; }`;
+the root flake's `nixosModules.default` sets the package). Its flags are
+its own: it does not read `/etc/virtio-nvgpu/vmN.env`. Its assertions
+refuse a slot's group with anyone else in it, a pool user with other
+groups, and another user on a pool id.
 
 **The backend.** [`contrib/systemd/vhost-user-nvgpu@.service`](contrib/systemd/vhost-user-nvgpu@.service),
 instance N, runs `vhost-user-nvgpu` as `nvgpu-vmN` in a cgroup of its own

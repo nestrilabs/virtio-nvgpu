@@ -3,8 +3,9 @@
 # nix/module.nix, evaluated (the root flake's checks.module-eval; scripts/ci.sh
 # fast builds it):
 #
-# - a configuration that uses every option passes the module's assertions,
-#   and its units say what contrib/systemd's say (nix/unit-diff.py);
+# - a configuration that uses every option passes the module's assertions;
+#   the units it installs say what contrib/systemd's say (nix/unit-diff.py),
+#   and its drop-ins set only what is per slot, no hardening key;
 # - each configuration the module must refuse is refused, by the assertion
 #   meant to (the case names what its message must say).
 #
@@ -92,6 +93,12 @@ let
     imports = [
       helper
       (vm0 { })
+      {
+        services.virtio-nvgpu.extraArgs = [
+          "--queue-poll-us"
+          "50"
+        ];
+      }
     ];
   };
   good = goodSystem.config;
@@ -199,6 +206,10 @@ let
       config = [ { services.virtio-nvgpu.vms."0".extraArgs = [ "--window-size 2048" ]; } ];
       says = "no whitespace in it";
     };
+    "a global flag with a space" = {
+      config = [ { services.virtio-nvgpu.extraArgs = [ "--queue-poll-us 50" ]; } ];
+      says = "no whitespace in it";
+    };
     "a window not of 64 MiB steps" = {
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";
@@ -216,6 +227,21 @@ let
   goodFails = failing goodSystem;
 
   unit = n: builtins.unsafeDiscardStringContext good.systemd.units.${n}.text;
+  # The units the module installs (nix/units.nix).
+  units = lib.findFirst (
+    p: (p.name or "") == "virtio-nvgpu-units"
+  ) (throw "module-eval: the module installs no virtio-nvgpu-units") good.systemd.packages;
+  # What a backend drop-in may set (unit-diff.py --dropin).
+  dropinKeys = lib.concatStringsSep "," [
+    "Unit:Requires=vhost-user-nvgpu-inject@0.socket"
+    "Service:EnvironmentFile="
+    "Service:MemoryMax"
+    "Service:TasksMax"
+    "Service:ProtectHome=tmpfs"
+    "Service:BindReadOnlyPaths"
+    "env:NVGPU_BACKEND_ARGS"
+    "env:NVGPU_WAYLAND_ARGS"
+  ];
 in
 assert
   goodFails == [ ]
@@ -224,29 +250,36 @@ assert lib.all (x: x) (lib.mapAttrsToList check refused);
 pkgs.runCommand "virtio-nvgpu-module-eval"
   {
     nativeBuildInputs = [ pkgs.python3 ];
-    service = unit "vhost-user-nvgpu@.service";
-    socket = unit "vhost-user-nvgpu@.socket";
-    inject = unit "vhost-user-nvgpu-inject@0.socket";
     dropin = unit "vhost-user-nvgpu@0.service";
+    # A slot with no vms.<n>: the global settings reach it too.
+    dropin1 = unit "vhost-user-nvgpu@1.service";
+    inject = unit "vhost-user-nvgpu-inject@0.socket";
     passAsFile = [
-      "service"
-      "socket"
-      "inject"
       "dropin"
+      "dropin1"
+      "inject"
     ];
   }
   ''
     d=${../contrib/systemd}
-    python3 ${./unit-diff.py} $d/vhost-user-nvgpu@.service "$servicePath"
-    python3 ${./unit-diff.py} $d/vhost-user-nvgpu@.socket "$socketPath"
-    python3 ${./unit-diff.py} $d/vhost-user-nvgpu-inject@.socket "$injectPath" \
-      Description,ListenSequentialPacket,SocketGroup,Service
+    u=${units}/lib/systemd/system
+    for f in vhost-user-nvgpu@.service vhost-user-nvgpu@.socket vhost-user-nvgpu-inject@.socket; do
+      python3 ${./unit-diff.py} $d/$f $u/$f
+    done
+    grep -q '^ExecStart=${placeholder}/bin/vhost-user-nvgpu ' $u/vhost-user-nvgpu@.service
+    grep -q '^ExecStartPre=+${units}/libexec/virtio-nvgpu/nvgpu-pci-snapshot ' $u/vhost-user-nvgpu@.service
+    test -x ${units}/libexec/virtio-nvgpu/nvgpu-pci-snapshot
+    python3 ${./unit-diff.py} --dropin "$dropinPath" ${dropinKeys}
+    python3 ${./unit-diff.py} --dropin "$dropin1Path" ${dropinKeys}
+    python3 ${./unit-diff.py} --dropin "$injectPath" Socket:SocketGroup=nvgpu-cap0
     # The per-VM drop-in carries what the options asked for.
-    grep -q -- '--window-size 16384' "$dropinPath"
+    grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50 --allow-compute --window-size 16384' "$dropinPath"
+    grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
     grep -q -- '--inject-uid 950' "$dropinPath"
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"
     grep -q 'ProtectHome=tmpfs' "$dropinPath"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"
     grep -q 'Requires=vhost-user-nvgpu-inject@0.socket' "$dropinPath"
+    grep -q '^MemoryMax=2G' "$dropin1Path"
     touch $out
   ''

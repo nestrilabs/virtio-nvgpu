@@ -18,8 +18,9 @@
 # connects to /run/nvgpu/vmN/nvgpu.sock, which vhost-user-nvgpu@N.socket
 # binds, root's and open to that group, and hands to the backend (socket
 # activation): the backend's user owns neither the socket nor its directory.
-# The units are contrib/systemd's, said in Nix; scripts/ci.sh compares the
-# two. Nothing here starts a VMM: give its unit
+# The units are contrib/systemd's own (nix/units.nix), with what is this
+# configuration's in a drop-in per slot; nix/module-test.nix checks that a
+# drop-in sets no key but those. Nothing here starts a VMM: give its unit
 #   bindsTo = [ "vhost-user-nvgpu@N.service" ]; after = [ same ];
 # (bindsTo, not requires: a backend that dies on its own must take the VMM
 # with it) and User = "nvgpu-vmmN", or use contrib/systemd's
@@ -45,18 +46,14 @@ let
     listToAttrs
     nameValuePair
     mapAttrs'
-    escapeShellArgs
     concatStringsSep
     ;
 
   cfg = config.services.virtio-nvgpu;
   ids = genList toString cfg.slots;
 
-  # contrib/systemd/nvgpu-pci-snapshot, with the tools it calls.
-  pciSnapshot = pkgs.writeShellScript "nvgpu-pci-snapshot" ''
-    export PATH=${lib.makeBinPath [ pkgs.coreutils ]}
-    ${builtins.readFile ../contrib/systemd/nvgpu-pci-snapshot}
-  '';
+  # contrib/systemd's units and their helper, for this backend.
+  units = pkgs.callPackage ./units.nix { backend = cfg.package; };
 
   # Slot n's ids: the backend's uid and the group's gid are base+2n, the
   # VMM's uid base+2n+1.
@@ -95,6 +92,9 @@ let
     "nixbld"
   ];
   injecting = lib.filterAttrs (_: vm: vm.inject.enable) cfg.vms;
+  # Slot n's settings: its vms.<n>, or every option's default.
+  vmDefaults = (lib.evalModules { modules = [ vmOptions ]; }).config;
+  vmOf = n: cfg.vms.${n} or vmDefaults;
   loginUids = lib.filter (u: u != null) (
     lib.mapAttrsToList (_: u: if u.isNormalUser then u.uid else null) users
   );
@@ -236,7 +236,11 @@ in
     extraArgs = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "Backend flags for every VM.";
+      description = ''
+        Backend flags for every VM, before each VM's own
+        (`vms.<n>.extraArgs`); one word per flag or value, with no
+        whitespace in any.
+      '';
     };
 
     vms = mkOption {
@@ -299,10 +303,10 @@ in
         message = "services.virtio-nvgpu: the pool's users (nvgpu-vmN, nvgpu-vmmN) must have no extraGroups";
       }
       {
-        assertion = lib.all (vm: lib.all (a: builtins.match ".*[[:space:]].*" a == null) vm.extraArgs) (
-          lib.attrValues cfg.vms
+        assertion = lib.all (a: builtins.match ".*[[:space:]].*" a == null) (
+          cfg.extraArgs ++ lib.concatMap (vm: vm.extraArgs) (lib.attrValues cfg.vms)
         );
-        message = "services.virtio-nvgpu.vms.<n>.extraArgs: give each flag and value as a word of its own, with no whitespace in it";
+        message = "services.virtio-nvgpu.extraArgs, vms.<n>.extraArgs: give each flag and value as a word of its own, with no whitespace in it";
       }
       {
         assertion =
@@ -388,154 +392,79 @@ in
         ) ids
       );
 
-    # The vhost-user socket: root's, open to the slot's group, handed to the
-    # backend (contrib/systemd/vhost-user-nvgpu@.socket).
-    systemd.sockets = {
-      "vhost-user-nvgpu@" = {
-        description = "virtio-nvgpu vhost-user socket for VM %i";
-        socketConfig = {
-          ListenStream = "/run/nvgpu/vm%i/nvgpu.sock";
-          SocketUser = "root";
-          SocketGroup = "nvgpu-vm%i";
-          SocketMode = "0660";
-          DirectoryMode = "0711";
-          FileDescriptorName = "vhost-user";
-          Accept = false;
-          RemoveOnStop = true;
-        };
-      };
-    }
-    # The capture helper's, per VM that has one, open to its group
-    # (contrib/systemd/vhost-user-nvgpu-inject@.socket).
-    // mapAttrs' (
+    # The units are contrib/systemd's (nix/units.nix): the backend's
+    # template, its vhost-user socket (root's, open to the slot's group,
+    # handed to the backend) and the capture helper's socket. What is this
+    # configuration's is said per slot below, in drop-ins, and only in the
+    # keys nix/module-test.nix allows a drop-in (no hardening key).
+    systemd.packages = [ units ];
+
+    systemd.services = listToAttrs (
+      map (
+        n:
+        let
+          vm = vmOf n;
+        in
+        nameValuePair "vhost-user-nvgpu@${n}" (
+          {
+            overrideStrategy = "asDropin";
+            # systemd splits an unbraced $VAR at whitespace and takes quotes
+            # in it literally: hence one word per flag, and no spaces in any.
+            environment = {
+              NVGPU_BACKEND_ARGS = concatStringsSep " " (
+                cfg.extraArgs
+                ++ vm.extraArgs
+                ++ lib.optionals (vm.windowMiB != null) [
+                  "--window-size"
+                  (toString vm.windowMiB)
+                ]
+                ++ lib.optionals (vm.windowOwnerShare != null) [
+                  "--window-owner-share"
+                  (toString vm.windowOwnerShare)
+                ]
+                ++ lib.optionals vm.inject.enable [
+                  "--inject-uid"
+                  (toString vm.inject.helperUid)
+                ]
+              );
+              NVGPU_WAYLAND_ARGS = concatStringsSep " " (
+                lib.optionals (vm.wayland.socket != null) [
+                  "--wayland-socket"
+                  vm.wayland.socket
+                ]
+                ++ lib.optional vm.wayland.lease "--wayland-lease"
+              );
+            };
+            serviceConfig = {
+              # The flags are this configuration's alone: the unit's
+              # /etc/virtio-nvgpu/vmN.env is not read.
+              EnvironmentFile = "";
+              MemoryMax = cfg.memoryMax;
+              TasksMax = cfg.tasksMax;
+            }
+            // lib.optionalAttrs (vm.wayland.socket != null) {
+              # The one socket, and no other file of any home or runtime
+              # directory under /home.
+              ProtectHome = "tmpfs";
+              BindReadOnlyPaths = [ vm.wayland.socket ];
+            };
+            wantedBy = lib.optional vm.autoStart "multi-user.target";
+          }
+          // lib.optionalAttrs vm.inject.enable {
+            requires = [ "vhost-user-nvgpu-inject@${n}.socket" ];
+          }
+        )
+      ) ids
+    );
+
+    # The capture helper's socket, per VM that has one, opened to the
+    # helper's group.
+    systemd.sockets = mapAttrs' (
       n: vm:
       nameValuePair "vhost-user-nvgpu-inject@${n}" {
-        description = "virtio-nvgpu capture-injection socket for VM ${n}";
-        socketConfig = {
-          ListenSequentialPacket = "/run/nvgpu/vm${n}/inject.sock";
-          SocketUser = "root";
-          SocketGroup = vm.inject.helperGroup;
-          SocketMode = "0660";
-          DirectoryMode = "0711";
-          FileDescriptorName = "inject";
-          Accept = false;
-          RemoveOnStop = true;
-          Service = "vhost-user-nvgpu@${n}.service";
-        };
+        overrideStrategy = "asDropin";
+        socketConfig.SocketGroup = vm.inject.helperGroup;
       }
     ) injecting;
-
-    systemd.services = {
-      "vhost-user-nvgpu@" = {
-        description = "virtio-nvgpu vhost-user backend for VM %i";
-        requires = [ "vhost-user-nvgpu@%i.socket" ];
-        after = [
-          "systemd-modules-load.service"
-          "vhost-user-nvgpu@%i.socket"
-          "vhost-user-nvgpu-inject@%i.socket"
-        ];
-        environment.RUST_LOG = lib.mkDefault "warn";
-        serviceConfig = {
-          Type = "exec";
-          User = "nvgpu-vm%i";
-          Group = "nvgpu-vm%i";
-          SupplementaryGroups = [
-            "video"
-            "render"
-            "kvm"
-          ];
-          # No --socket: the socket is descriptor 3, from the socket unit.
-          # The GPUs' whole PCI config space, which sysfs gives the backend's
-          # own user only 64 bytes of: root snapshots it first ("+").
-          ExecStartPre = "+${pciSnapshot} /run/nvgpu/vm%i/pci";
-          ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} --pci-config-dir /run/nvgpu/vm%i/pci ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS";
-          UMask = "0077";
-
-          Restart = "no";
-          TimeoutStopSec = 10;
-
-          MemoryMax = cfg.memoryMax;
-          MemorySwapMax = 0;
-          TasksMax = cfg.tasksMax;
-          OOMScoreAdjust = 500;
-          LimitCORE = 0;
-
-          NoNewPrivileges = true;
-          CapabilityBoundingSet = "";
-          AmbientCapabilities = "";
-          RestrictSUIDSGID = true;
-          LockPersonality = true;
-          RestrictRealtime = true;
-          SystemCallArchitectures = "native";
-          MemoryDenyWriteExecute = true;
-          RestrictAddressFamilies = [
-            "AF_UNIX"
-            "AF_NETLINK"
-          ];
-          RestrictNamespaces = true;
-          KeyringMode = "private";
-          ProtectHostname = true;
-          ProtectKernelLogs = true;
-
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          PrivateTmp = true;
-          PrivateIPC = true;
-          PrivateNetwork = true;
-          ProtectKernelTunables = true;
-          ProtectKernelModules = true;
-          ProtectControlGroups = true;
-          ProtectProc = "invisible";
-          NoExecPaths = [ "/" ];
-          ExecPaths = [ "/nix/store" ];
-        };
-      };
-    }
-    // mapAttrs' (
-      n: vm:
-      nameValuePair "vhost-user-nvgpu@${n}" (
-        {
-          overrideStrategy = "asDropin";
-          # systemd splits an unbraced $VAR at whitespace and takes quotes in
-          # it literally: hence one word per flag, and no spaces in any.
-          environment = {
-            NVGPU_BACKEND_ARGS = concatStringsSep " " (
-              vm.extraArgs
-              ++ lib.optionals (vm.windowMiB != null) [
-                "--window-size"
-                (toString vm.windowMiB)
-              ]
-              ++ lib.optionals (vm.windowOwnerShare != null) [
-                "--window-owner-share"
-                (toString vm.windowOwnerShare)
-              ]
-              ++ lib.optionals vm.inject.enable [
-                "--inject-uid"
-                (toString vm.inject.helperUid)
-              ]
-            );
-            NVGPU_WAYLAND_ARGS = concatStringsSep " " (
-              lib.optionals (vm.wayland.socket != null) [
-                "--wayland-socket"
-                vm.wayland.socket
-              ]
-              ++ lib.optional vm.wayland.lease "--wayland-lease"
-            );
-          };
-          wantedBy = lib.optional vm.autoStart "multi-user.target";
-        }
-        // lib.optionalAttrs vm.inject.enable {
-          requires = [ "vhost-user-nvgpu-inject@${n}.socket" ];
-        }
-        // lib.optionalAttrs (vm.wayland.socket != null) {
-          # The one socket, and no other file of any home or runtime
-          # directory under /home.
-          serviceConfig = {
-            ProtectHome = "tmpfs";
-            BindReadOnlyPaths = [ vm.wayland.socket ];
-          };
-        }
-      )
-    ) cfg.vms;
   };
 }
