@@ -70,7 +70,11 @@ Environment=RUST_LOG=warn
 EnvironmentFile=-/etc/virtio-nvgpu/vm%i.env
 # No --socket: the socket is descriptor 3, from vhost-user-nvgpu@%i.socket.
 # $NVGPU_WAYLAND_ARGS, unset, is no argument at all.
-ExecStart=/usr/bin/vhost-user-nvgpu $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS
+# The GPUs' whole PCI config space, which sysfs gives the backend's own user
+# only 64 bytes of: root snapshots it first (the "+"), the backend reads it
+# once before its sandbox (nvgpu-pci-snapshot's header).
+ExecStartPre=+/usr/libexec/virtio-nvgpu/nvgpu-pci-snapshot /run/nvgpu/vm%i/pci
+ExecStart=/usr/bin/vhost-user-nvgpu --pci-config-dir /run/nvgpu/vm%i/pci $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS
 UMask=0077
 
 # A backend that stops takes its VM's device with it; the VMM must be

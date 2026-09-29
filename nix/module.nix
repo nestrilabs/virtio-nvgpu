@@ -32,6 +32,7 @@
 {
   config,
   lib,
+  pkgs,
   ...
 }:
 let
@@ -50,6 +51,12 @@ let
 
   cfg = config.services.virtio-nvgpu;
   ids = genList toString cfg.slots;
+
+  # contrib/systemd/nvgpu-pci-snapshot, with the tools it calls.
+  pciSnapshot = pkgs.writeShellScript "nvgpu-pci-snapshot" ''
+    export PATH=${lib.makeBinPath [ pkgs.coreutils ]}
+    ${builtins.readFile ../contrib/systemd/nvgpu-pci-snapshot}
+  '';
 
   # Slot n's ids: the backend's uid and the group's gid are base+2n, the
   # VMM's uid base+2n+1.
@@ -438,7 +445,10 @@ in
             "kvm"
           ];
           # No --socket: the socket is descriptor 3, from the socket unit.
-          ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS";
+          # The GPUs' whole PCI config space, which sysfs gives the backend's
+          # own user only 64 bytes of: root snapshots it first ("+").
+          ExecStartPre = "+${pciSnapshot} /run/nvgpu/vm%i/pci";
+          ExecStart = "${lib.getExe' cfg.package "vhost-user-nvgpu"} --pci-config-dir /run/nvgpu/vm%i/pci ${escapeShellArgs cfg.extraArgs} $NVGPU_BACKEND_ARGS $NVGPU_WAYLAND_ARGS";
           UMask = "0077";
 
           Restart = "no";

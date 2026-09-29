@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# nvgpu-pci-snapshot DIR: copy each NVIDIA GPU's whole PCI config space into
+# DIR/<address> for vhost-user-nvgpu --pci-config-dir.
+#
+# Run as root (ExecStartPre=+ in vhost-user-nvgpu@.service, or the rig's
+# root launcher): sysfs gives an unprivileged reader only the first 64 bytes
+# of a device's config space (drivers/pci/pci-sysfs.c, pci_read_config), and
+# the backend runs as its VM's own user, so without this the guest's PCI
+# device has no capabilities past the header (no PCIe link in nvidia-smi).
+# The backend reads the files once, before its sandbox, and ignores a file
+# that is not a GPU it serves or is over 4 KiB.
+set -eu
+dir=${1:?usage: nvgpu-pci-snapshot DIR}
+umask 022
+mkdir -p "$dir"
+chmod 0755 "$dir"
+for g in /proc/driver/nvidia/gpus/*; do
+    [ -d "$g" ] || continue
+    addr=${g##*/}
+    src=/sys/bus/pci/devices/$addr/config
+    [ -r "$src" ] || continue
+    # Written under a temporary name and renamed, so the backend never reads
+    # a half-written file.
+    cat "$src" > "$dir/.$addr.tmp"
+    mv -f "$dir/.$addr.tmp" "$dir/$addr"
+done

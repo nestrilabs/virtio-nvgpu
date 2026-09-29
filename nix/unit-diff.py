@@ -20,6 +20,7 @@ import sys
 # Keys whose values differ by design (their presence is still compared).
 VALUE_DIFFERS = {
     "ExecStart",  # the package's path; the module's extraArgs
+    "ExecStartPre",  # nvgpu-pci-snapshot from /usr/libexec, or the store
     "ExecPaths",  # /usr/bin/... and the libraries there, or /nix/store
     "Environment",
     "MemoryMax",  # services.virtio-nvgpu.memoryMax

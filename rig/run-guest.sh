@@ -709,6 +709,9 @@ case $PREFAULT in '' | 0 | 1) ;; *) die "NVGPU_PREFAULT=$PREFAULT: 0 or 1" ;; es
 SLICE_US=${NVGPU_SLICE_US:-100}
 [[ $SLICE_US =~ ^[0-9]+$ ]] && { [ "$SLICE_US" = 0 ] || { [ "$SLICE_US" -ge 100 ] && [ "$SLICE_US" -le 100000 ]; }; } ||
     die "NVGPU_SLICE_US=$SLICE_US: 0, or 100 to 100000"
+# The backend sets its own threads' slice too (--sched-slice-us, 0 keeps
+# what it inherits); both say the same.
+BACKEND_ARGS+=(--sched-slice-us "$SLICE_US")
 SLICE=()
 if [ "$SLICE_US" != 0 ]; then
     # Inherited by every thread either process makes, and kept across the
@@ -1109,7 +1112,9 @@ JAIL_BUILT=
 still_ours() {
     local cmd
     [ -n "$2" ] || return 1
-    cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    # The redirection's own failure (the process gone) is the shell's to
+    # report, so it is inside the braces the 2>/dev/null covers.
+    cmd=$({ tr '\0' ' ' < "/proc/$1/cmdline"; } 2>/dev/null) || return 1
     [[ $cmd == *"$2"* ]]
 }
 cleanup() {
@@ -1155,6 +1160,18 @@ if [ $PRIV = root ]; then
     chmod 0711 "$RUN"
     install -m 0755 "$BACKEND_BIN" "$RUN/vhost-user-nvgpu"
     BACKEND_EXE=$RUN/vhost-user-nvgpu
+    # The GPUs' whole PCI config space, which sysfs gives the backend's own
+    # user only 64 bytes of: root snapshots it, as the unit's ExecStartPre
+    # does (contrib/systemd/nvgpu-pci-snapshot), for --pci-config-dir.
+    mkdir -m 0755 "$RUN/pci"
+    for g in /proc/driver/nvidia/gpus/*; do
+        [ -d "$g" ] || continue
+        a=${g##*/}
+        [ -r "/sys/bus/pci/devices/$a/config" ] || continue
+        cat "/sys/bus/pci/devices/$a/config" > "$RUN/pci/$a"
+        chmod 0644 "$RUN/pci/$a"
+    done
+    BACKEND_ARGS+=(--pci-config-dir "$RUN/pci")
     # What binds the socket and execs the backend with it (systemd's, run
     # by root: root's alone).
     SOCKET_ACTIVATE=$(command -v systemd-socket-activate) ||
