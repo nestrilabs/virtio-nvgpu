@@ -1030,9 +1030,11 @@ impl NvidiaBackend {
         caller: Option<Caller>,
         named: Result<Vec<Named>, &'static str>,
     ) -> Result<(), u32> {
+        // RM's answer to parameters too short for what it reads (review
+        // 2026-09-29 2.6): not a permission.
         let named = named.map_err(|what| {
             log::warn!("{what}: parameters too short to hold the client they name; refused");
-            NV_ERR_INSUFFICIENT_PERMISSIONS
+            crate::nvidia::NV_ERR_INVALID_ARGUMENT
         })?;
         for n in named {
             // The caller's own client, as RM treats it: every rule passes.
@@ -2228,6 +2230,23 @@ mod backend_tests {
             Some(pid(10)),
         );
         assert_eq!(rm_status(&r, OS54_STATUS), 0);
+    }
+
+    /// Parameters too short to hold the client they name are RM's
+    /// INVALID_ARGUMENT, not a permission (review 2026-09-29 2.6).
+    #[test]
+    fn a_block_too_short_for_its_client_is_an_invalid_argument() {
+        let (mut be, f1, _) = vm(FULL);
+        be.set_rm_allowlist(crate::rmallow::Mode::Log);
+        let a = alloc_client(&mut be, f1, Some(pid(10)));
+        let outer = words(&[(0, a), (4, a), (8, 0xde7), (12, 0x80), (32, 6)], 48);
+        seen();
+        let r = call(&mut be, f1, ALLOC, &outer, &[0u8; 6], None);
+        assert_eq!(
+            rm_status(&r, OS64_STATUS),
+            crate::nvidia::NV_ERR_INVALID_ARGUMENT
+        );
+        assert!(!reached(0x2b));
     }
 
     #[test]
