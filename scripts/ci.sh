@@ -108,9 +108,10 @@ scripts_syntax_check() {
     for f in $(git ls-files '*.sh'); do
         bash -n "$f" || rc=1
     done
-    # The root launcher and what checks it: warnings are defects there.
+    # The root launcher (with the pieces it sources, -x) and what checks it:
+    # warnings are defects there.
     if command -v shellcheck >/dev/null; then
-        shellcheck -S warning -e SC1007 rig/run-guest.sh rig/verify/launcher-dryrun/*.sh \
+        shellcheck -x -S warning -e SC1007 rig/run-guest.sh rig/verify/launcher-dryrun/*.sh \
             scripts/verify-units.sh || rc=1
     else
         echo "shellcheck: skipped (none on PATH)" >&2
@@ -186,6 +187,7 @@ launcher_dryrun_check() {
         "ESC bytes on the launcher's output: 0"
         "jailer stub: environment clean"
         "is not root's (uid 65534)"
+        "the launcher's guest.sh /rig/launcher/guest.sh: /rig/launcher/guest.sh is writable by others"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
     )

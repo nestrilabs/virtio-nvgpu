@@ -71,6 +71,11 @@ echo "== new: a launcher in a directory another user can write (a checkout, say)
 mkdir -p /home/user && chmod 0777 /home/user && cp /rig/run-guest.new.sh /home/user/run-guest.sh
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 \
     bash /home/user/run-guest.sh probe checkout 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3
+echo "== new: a piece of the launcher (rig/launcher) someone else can write"
+chmod 0666 /rig/launcher/guest.sh
+env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 \
+    bash /rig/run-guest.new.sh probe piece 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3
+chmod 0644 /rig/launcher/guest.sh
 echo "== new: a file not root's (uid 65534 here: /proc/version, of a uid this namespace does not map)"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_KERNEL=/proc/version NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 \
     NVGPU_DIAGNOSTIC=1 bash /rig/run-guest.new.sh probe notroots 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3

@@ -103,9 +103,11 @@ need an Intel host with `KVM_X86_QUIRK_IGNORE_GUEST_PAT` on. Record which you ha
 - **As root, only root's files.** The launcher run as root refuses anything
   it would run, read or write that is not root's, or sits in a directory
   someone else can write -- itself included -- so it is not run from a user's
-  checkout: install a copy, `sudo install -D -o root -g root -m 0755
-  rig/run-guest.sh /root/bin/run-guest.sh`, with the tree it expects under
-  `/root` (the launcher's header), and name the layout:
+  checkout: install a copy of it and of its pieces beside it (`sudo install
+  -D -o root -g root -m 0755 -t /root/bin rig/run-guest.sh` and `sudo install
+  -D -o root -g root -m 0644 -t /root/bin/launcher rig/launcher/*.sh`; as
+  root it checks each piece before it reads it), with the tree it expects
+  under `/root` (the launcher's header), and name the layout:
   `sudo NVGPU_PREFIX=/root /root/bin/run-guest.sh …` (or `NVGPU_RIG=` a
   root-owned rig). The VMM runs jailed unless `NVGPU_VMM_JAIL=auto|off`, and
   `NVGPU_SANDBOX=off`, `NVGPU_ALLOW_ROOT_UNSAFE=1` and every diagnostic
