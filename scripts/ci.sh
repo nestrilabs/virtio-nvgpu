@@ -15,7 +15,11 @@
 #            to what is per slot (checks.module-eval), contrib/systemd's
 #            units through `systemd-analyze verify`, patches/crosvm applied
 #            in order to c0474109d64d (from CROSVM_SRC, or the rig's crosvm
-#            checkout; skipped, and said, where there is none), and, on a
+#            checkout; skipped, and said, where there is none), the limits
+#            crosvm (so patched) and nesbox (NESBOX_SRC, at NESBOX_BRANCH)
+#            hold the backend's requests to against the backend's own
+#            (scripts/vmm-parity.py; each skipped, and said, without its
+#            source), and, on a
 #            NixOS host with user namespaces, the launcher's dry run
 #            (rig/verify/launcher-dryrun). `deploy` runs that last part
 #            (from the scripts' syntax on) alone. The root flake's
@@ -113,7 +117,7 @@ scripts_syntax_check() {
     # warnings are defects there.
     if command -v shellcheck >/dev/null; then
         shellcheck -x -S warning -e SC1007 rig/run-guest.sh rig/verify/launcher-dryrun/*.sh \
-            scripts/verify-units.sh || rc=1
+            scripts/verify-units.sh scripts/ci.sh || rc=1
     else
         echo "shellcheck: skipped (none on PATH)" >&2
     fi
@@ -139,33 +143,83 @@ units_check() {
 # scratch index (no checkout): a series that no longer applies is found
 # here, not by the next person to build it.
 CROSVM_BASE=c0474109d64d
-crosvm_patches_check() {
-    local src=${CROSVM_SRC:-} c w p rc=0
-    if [ -z "$src" ]; then
-        for c in "${NVGPU_RIG:-.rig}/src/crosvm" "${NVGPU_RIG:-.rig}/src/crosvm-compute"; do
-            if [ -e "$c/.git" ] && git -C "$c" cat-file -e "$CROSVM_BASE^{commit}" 2>/dev/null; then
-                src=$c
-                break
-            fi
-        done
+# The crosvm checkout to apply it in: CROSVM_SRC, or the rig's; none prints
+# nothing.
+crosvm_src() {
+    local c
+    if [ -n "${CROSVM_SRC:-}" ]; then
+        echo "$CROSVM_SRC"
+        return
     fi
+    for c in "${NVGPU_RIG:-.rig}/src/crosvm" "${NVGPU_RIG:-.rig}/src/crosvm-compute"; do
+        if [ -e "$c/.git" ] && git -C "$c" cat-file -e "$CROSVM_BASE^{commit}" 2>/dev/null; then
+            echo "$c"
+            return
+        fi
+    done
+}
+
+# crosvm_series SRC W: the series applied to CROSVM_BASE of SRC, as the
+# index $W/index of the bare repository $W/git.
+crosvm_series() {
+    local src=$1 w=$2 p
+    git clone -q --bare --shared "$src" "$w/git" &&
+        GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git read-tree "$CROSVM_BASE" || return 1
+    for p in patches/crosvm/*.patch; do
+        GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git apply --cached -- "$p" || {
+            echo "crosvm patches: $p does not apply after the ones before it" >&2
+            return 1
+        }
+    done
+}
+
+crosvm_patches_check() {
+    local src w rc=0
+    src=$(crosvm_src)
     if [ -z "$src" ]; then
         echo "crosvm patches: skipped (no crosvm checkout with $CROSVM_BASE; set CROSVM_SRC)" >&2
         return 0
     fi
     w=$(mktemp -d)
-    if git clone -q --bare --shared "$src" "$w/git" &&
-        GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git read-tree "$CROSVM_BASE"; then
-        for p in patches/crosvm/*.patch; do
-            GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git apply --cached -- "$p" || {
-                echo "crosvm patches: $p does not apply after the ones before it" >&2
-                rc=1
-                break
-            }
+    crosvm_series "$src" "$w" || rc=1
+    rm -rf "$w"
+    return $rc
+}
+
+# The nesbox branch DEPLOY.md names, and the checkout to read it from:
+# NESBOX_SRC, or the rig's.
+NESBOX_BRANCH=${NESBOX_BRANCH:-virtio-nvgpu-v6}
+
+# The limits each VMM holds the backend's mapping requests to are the
+# backend's (scripts/vmm-parity.py): crosvm's as patches/crosvm has them,
+# nesbox's at NESBOX_BRANCH. A VMM whose source is not here is skipped, and
+# said.
+vmm_parity_check() {
+    local src w f tree args=() rc=0
+    w=$(mktemp -d)
+    src=$(crosvm_src)
+    if [ -z "$src" ]; then
+        echo "VMM limits: crosvm skipped (no crosvm checkout with $CROSVM_BASE; set CROSVM_SRC)" >&2
+    elif crosvm_series "$src" "$w" && tree=$(GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git write-tree); then
+        for f in vm_control/src/nvgpu.rs vm_control/src/sys/linux/nvgpu.rs; do
+            mkdir -p "$w/crosvm/$(dirname "$f")"
+            git --git-dir="$w/git" show "$tree:$f" > "$w/crosvm/$f" || rc=1
         done
+        args+=(--crosvm "$w/crosvm")
     else
         rc=1
     fi
+    src=${NESBOX_SRC:-${NVGPU_RIG:-.rig}/src/nesbox}
+    if [ -e "$src/.git" ] && git -C "$src" rev-parse -q --verify "$NESBOX_BRANCH^{commit}" >/dev/null; then
+        for f in virtio-devices/src/nvgpu.rs virtio-devices/src/nvgpu/aperture.rs virtio-devices/src/nvgpu/fds.rs; do
+            mkdir -p "$w/nesbox/$(dirname "$f")"
+            git -C "$src" show "$NESBOX_BRANCH:$f" > "$w/nesbox/$f" || rc=1
+        done
+        args+=(--nesbox "$w/nesbox")
+    else
+        echo "VMM limits: nesbox skipped (no nesbox checkout with $NESBOX_BRANCH; set NESBOX_SRC)" >&2
+    fi
+    [ $rc != 0 ] || python3 scripts/vmm-parity.py ${args[@]+"${args[@]}"} || rc=1
     rm -rf "$w"
     return $rc
 }
@@ -179,7 +233,7 @@ launcher_dryrun_check() {
     fi
     out=$(rig/verify/launcher-dryrun/run.sh 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
     # What the new launcher must do (rig/verify/launcher-dryrun/inside.sh).
-    local want=(
+    local expect=(
         "stub backend: LISTEN_FDS=1 LISTEN_FDNAMES=vhost-user LISTEN_PID is mine: yes"
         "ok: the run's directory stayed root's"
         "are for diagnosis only: NVGPU_DIAGNOSTIC=1 as well"
@@ -194,7 +248,7 @@ launcher_dryrun_check() {
         "WARNING: diagnostic flag --permissive-abi"
     )
     local w rc=0
-    for w in "${want[@]}"; do
+    for w in "${expect[@]}"; do
         grep -qF -- "$w" <<<"$out" || { echo "launcher dry run: no \"$w\"" >&2; rc=1; }
     done
     [ $rc = 0 ] || printf '%s\n' "$out" >&2
@@ -216,6 +270,7 @@ deploy() {
     step "NixOS module evaluated" module_eval_check
     step "systemd units" units_check
     step "patches/crosvm apply to $CROSVM_BASE" crosvm_patches_check
+    step "the VMMs' limits are the backend's" vmm_parity_check
     step "launcher dry run" launcher_dryrun_check
 }
 
