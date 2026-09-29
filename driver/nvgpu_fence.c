@@ -535,9 +535,8 @@ static int nvgpu_fence_merge(struct nvgpu_device *dev, const u32 *hs, u32 n,
       nvgpu_close_handle(dev, acc);
     if (ret)
       return ret;
-    if (!res[0] || res[0] > U32_MAX)
+    if (!nvgpu_res_u32(res[0], &acc))
       return -EPROTO;
-    acc = (u32)res[0];
   }
   *out = acc;
   return 0;
@@ -2081,7 +2080,7 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   struct nvgpu_device *dev = file->dev;
   struct nvgpu_rehome *r;
   u64 args[2], res[2];
-  u32 dmabuf;
+  u32 dmabuf, h;
   int ret, tries = 0;
 
 again:
@@ -2104,30 +2103,29 @@ again:
   ret = nvgpu_host_op(dev, NVGPU_OP_PRIME_EXPORT, args, 2, res, 2);
   if (ret)
     goto out_free;
-  if (!res[0] || res[0] > U32_MAX) {
+  if (!nvgpu_res_u32(res[0], &dmabuf)) {
     ret = -EPROTO;
     goto out_free;
   }
-  dmabuf = (u32)res[0];
   args[0] = file->handle;
   args[1] = dmabuf;
   ret = nvgpu_host_op(dev, NVGPU_OP_DMABUF_IMPORT, args, 2, res, 2);
   nvgpu_close_handle(dev, dmabuf);
   if (ret)
     goto out_free;
-  if (!res[0] || res[0] > U32_MAX) {
+  if (!nvgpu_res_u32(res[0], &h)) {
     ret = -EPROTO;
     goto out_free;
   }
-  r->borrowed = nvgpu_gem_proxy_find(file, (u32)res[0]);
-  if (!r->borrowed && nvgpu_gem_dying(file, (u32)res[0])) {
+  r->borrowed = nvgpu_gem_proxy_find(file, h);
+  if (!r->borrowed && nvgpu_gem_dying(file, h)) {
     /* Not ours to use or close: wait out the proxy's close, outside the
      * lock its free takes (nvgpu_fence_gem_free()), and import again. */
     kfree(r);
     mutex_unlock(&nvgpu_rehome_lock);
     if (++tries > 3)
       return -EAGAIN;
-    ret = nvgpu_gem_wait_gone(file, (u32)res[0]);
+    ret = nvgpu_gem_wait_gone(file, h);
     if (ret)
       return ret;
     goto again;
@@ -2135,7 +2133,7 @@ again:
   r->ng = ng;
   nvgpu_fd_get(file);
   r->file = file;
-  r->gem = (u32)res[0];
+  r->gem = h;
   hash_add(nvgpu_rehomes, &r->node, (unsigned long)ng);
   /* Under the lock; read by the proxy's free, which can only come after
    * the reference this caller holds on it is gone. */
@@ -2287,10 +2285,9 @@ static long nvgpu_semsurf_wait_signalled(struct nvgpu_fence_ctx *ctx,
   ret = nvgpu_host_op(ctx->dev, NVGPU_OP_SIGNALED_SYNC_FILE, NULL, 0, res, 1);
   if (ret)
     return ret;
-  if (!res[0] || res[0] > U32_MAX)
+  if (!nvgpu_res_u32(res[0], &p.in_handle))
     return -EPROTO;
   p.has_in = true;
-  p.in_handle = (u32)res[0];
   p.in_flags = NVGPU_I2_FD_CONSUME;
   return nvgpu_semsurf_ctx_call(&p, cmd, a, ctx);
 }

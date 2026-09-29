@@ -646,6 +646,11 @@ bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem) {
   return held;
 }
 
+void nvgpu_gem_close_unheld(struct nvgpu_fd *owner, u32 gem) {
+  if (!xa_load(&owner->gem_index, gem))
+    nvgpu_gem_close(owner->dev, owner->handle, gem);
+}
+
 /*
  * The host has closed the proxy's handle, or never will (the close was never
  * sent): the number is the host's to give out again, and an importer waiting
@@ -1158,9 +1163,7 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
 
   /* A size from the host's reply, which PAGE_ALIGN() must not wrap to 0. */
   if (size > SIZE_MAX - PAGE_SIZE + 1) {
-    /* Ours to close, unless a proxy (alive or dying) holds the number. */
-    if (!xa_load(&owner->gem_index, host_handle))
-      nvgpu_gem_close(owner->dev, owner->handle, host_handle);
+    nvgpu_gem_close_unheld(owner, host_handle);
     return ERR_PTR(-E2BIG);
   }
   size = PAGE_ALIGN(size);

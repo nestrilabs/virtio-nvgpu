@@ -727,6 +727,7 @@ static struct file *nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
   struct nvgpu_fd *nfd;
   struct file *rf;
   u64 args[2], res[3];
+  u32 gem;
   int ret;
 
   /*
@@ -754,13 +755,12 @@ again:
    * handle is a non-zero u32 (none can be closed that is not), and a size
    * is what a proxy can stand for (PAGE_ALIGN() must not wrap it).
    */
-  if (!res[0] || res[0] > U32_MAX) {
+  if (!nvgpu_res_u32(res[0], &gem)) {
     ret = -EPROTO;
     goto out;
   }
   if (!res[1] || res[1] > NVGPU_WL_MAX_IMPORT) {
-    if (!xa_load(&nfd->gem_index, (u32)res[0]))
-      nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    nvgpu_gem_close_unheld(nfd, gem);
     ret = -EPROTO;
     goto out;
   }
@@ -774,15 +774,13 @@ again:
    * third word, which reads as 0, NVKMS: the old answer.
    */
   if (res[2] > NVGPU_GEM_OBJECT_USERMEMORY) {
-    /* A handle the file already had is a proxy's to close, not ours. */
-    if (!xa_load(&nfd->gem_index, (u32)res[0]))
-      nvgpu_gem_close(dev, nfd->handle, (u32)res[0]);
+    nvgpu_gem_close_unheld(nfd, gem);
     ret = -EPROTO;
     goto out;
   }
   /* Owns the host GEM handle from here: closed on failure, or left to the
    * proxy that already stands for it. */
-  buf = nvgpu_dmabuf_from_host_buf(rf, (u32)res[0], res[1], (u32)res[2],
+  buf = nvgpu_dmabuf_from_host_buf(rf, gem, res[1], (u32)res[2],
                                    O_RDWR | O_CLOEXEC);
   ret = IS_ERR(buf) ? PTR_ERR(buf) : 0;
   /*
@@ -793,7 +791,7 @@ again:
    * that is really ours -- the backend's dma-buf is held until `out`.
    */
   if (ret == -EAGAIN) {
-    ret = nvgpu_gem_wait_gone(nfd, (u32)res[0]);
+    ret = nvgpu_gem_wait_gone(nfd, gem);
     if (!ret)
       goto again;
   }

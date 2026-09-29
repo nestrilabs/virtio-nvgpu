@@ -630,6 +630,13 @@ int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h);
 /* Whether a proxy, alive or dying, holds host GEM `gem` of backend handle
  * `render` (for the reaper, which has only the numbers). */
 bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem);
+/*
+ * Host GEM handle `gem` of `owner`'s render file, which a reply just named
+ * and nothing is to be made of: GEM_CLOSEd, unless a proxy (alive or dying)
+ * holds the number -- the host hands back the handle a file already has for
+ * an object -- which is then that proxy's to close and nobody else's (S-11).
+ */
+void nvgpu_gem_close_unheld(struct nvgpu_fd *owner, u32 gem);
 /* A proxy's fake mmap offset in this node (MAP_DUMB, GEM_MAP_OFFSET). */
 int nvgpu_gem_mmap_offset(struct drm_file *file, u32 guest_handle,
                           u64 *offset);

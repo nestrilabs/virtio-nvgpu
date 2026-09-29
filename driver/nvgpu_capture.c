@@ -114,21 +114,18 @@ again:
   if (ret < 0)
     return ERR_PTR(ret);
   /* A GEM handle is a non-zero u32 (none can be closed that is not). */
-  if (!res[0] || res[0] > U32_MAX)
+  if (!nvgpu_res_u32(res[0], &gem))
     return ERR_PTR(-EPROTO);
-  gem = (u32)res[0];
   /*
    * The rest checked before anything is made of it: a size a proxy can
    * stand for, NVKMS memory (nothing else is injected), and a whole
-   * description with planes it can name. A handle the file already had is
-   * a proxy's to close, not ours.
+   * description with planes it can name.
    */
   if (!res[1] || res[1] > NVGPU_CAPTURE_MAX_SIZE ||
       res[2] != NVGPU_GEM_OBJECT_NVKMS || tail != sizeof(info) ||
       !le32_to_cpu(info.nplanes) ||
       le32_to_cpu(info.nplanes) > NVGPU_CAPTURE_MAX_PLANES) {
-    if (!xa_load(&nfd->gem_index, gem))
-      nvgpu_gem_close(dev, nfd->handle, gem);
+    nvgpu_gem_close_unheld(nfd, gem);
     return ERR_PTR(-EPROTO);
   }
   /*
@@ -259,9 +256,8 @@ static long nvgpu_capture_open_syncobj_ioctl(struct nvgpu_capture_dev *cd,
   if (ret < 0)
     return ret;
   /* A syncobj handle is a non-zero u32 (idr_alloc from 1). */
-  if (!res[0] || res[0] > U32_MAX)
+  if (!nvgpu_res_u32(res[0], &a.handle))
     return -EPROTO;
-  a.handle = (u32)res[0];
   if (copy_to_user(uarg, &a, sizeof(a)))
     return -EFAULT;
   return 0;

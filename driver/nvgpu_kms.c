@@ -401,8 +401,7 @@ static int nvgpu_kms_open_card(struct nvgpu_kms_file *kf, bool as_master,
                          kf->dri->card_index, ret);
     return ret;
   }
-  h = (u32)res[0];
-  if (!h)
+  if (!nvgpu_res_u32(res[0], &h))
     return -EPROTO;
   if (!as_master) {
     args[0] = h;

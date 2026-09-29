@@ -1403,7 +1403,9 @@ static unsigned int nvgpu_reap_ioctl2(struct nvgpu_device *dev,
  */
 static unsigned int nvgpu_host_op_drop(struct nvgpu_device *dev, u32 op,
                                        u64 arg0, u64 res0) {
-  if (!res0 || res0 > U32_MAX)
+  u32 h;
+
+  if (!nvgpu_res_u32(res0, &h))
     return 0;
   switch (op) {
   case NVGPU_OP_PRIME_EXPORT:
@@ -1411,16 +1413,16 @@ static unsigned int nvgpu_host_op_drop(struct nvgpu_device *dev, u32 op,
   case NVGPU_OP_NEW_EVENTFD:
   case NVGPU_OP_SIGNALED_SYNC_FILE:
   case NVGPU_OP_OPEN_KMS:
-    __nvgpu_close_handle(dev, (u32)res0, true);
+    __nvgpu_close_handle(dev, h, true);
     return 1;
   case NVGPU_OP_DMABUF_IMPORT:
   case NVGPU_OP_INJECT_OPEN:
     /* A GEM handle in the render file named by the first argument -- unless
      * the file already had one for the buffer, which the host then returns
      * (drm_prime.c:306-310), and that is a proxy's to close (S-11). */
-    if (nvgpu_gem_handle_held(dev, (u32)arg0, (u32)res0))
+    if (nvgpu_gem_handle_held(dev, (u32)arg0, h))
       return 0;
-    __nvgpu_gem_close(dev, (u32)arg0, (u32)res0, true, NULL, NULL);
+    __nvgpu_gem_close(dev, (u32)arg0, h, true, NULL, NULL);
     return 1;
   default:
     return 0;
