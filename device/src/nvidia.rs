@@ -3983,6 +3983,14 @@ impl NvidiaBackend {
             // NVOS64 and NVOS02: hRoot, _, hObjectNew, ..., status at 40.
             // A zero hObjectNew is no handle: RM made the object under one it
             // generated and, through ALLOC_MEMORY, never wrote back.
+            //
+            // A root class (NV01_ROOT and its kin) makes a new *client*
+            // named hObjectNew, and RM ignores hRoot: nothing of `c` was
+            // made, and forgetting `(c, o)` would release a registration RM
+            // still pins (review 2026-09-29 1.3).
+            NV_ESC_RM_ALLOC
+                if r(40) == Some(0)
+                    && r(12).is_some_and(|c| crate::semsurf::ROOT_CLASSES.contains(&c)) => {}
             NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY if r(40) == Some(0) => {
                 if let (Some(c), Some(p), Some(o)) = (r(0), r(4), r(8))
                     && o != 0

@@ -1046,8 +1046,13 @@ impl OsDesc {
     ) -> u64 {
         let key = Key { client, object };
         // RM made a new object under this handle, so whatever was there
-        // before is gone.
-        self.drop_key(key);
+        // before is gone. Object 0 is no handle (RM made one it did not
+        // write back): a second registration answered so must not end the
+        // first while RM still pins its pages; both then live until their
+        // client goes (review 2026-09-29 1.19).
+        if object != 0 {
+            self.drop_key(key);
+        }
         let id = self.next_id;
         self.next_id += 1;
         let e = self.per_file.entry(file).or_default();
@@ -1927,6 +1932,21 @@ mod tests {
         assert_eq!(o.admit(2, PAGE, 0), Ok(()));
     }
 
+    /// Object 0 names nothing: a second registration keyed by it does not
+    /// end the first, and both go with their client (review 2026-09-29
+    /// 1.19).
+    #[test]
+    fn a_registration_under_no_handle_is_ended_by_nothing_but_its_client() {
+        let ram = ram();
+        let mut o = OsDesc::default();
+        o.add(1, 0xc1, 0, 0, pinned(&ram, &[(LOW, 1)]));
+        o.add(1, 0xc1, 0, 0, pinned(&ram, &[(LOW, 1)]));
+        assert_eq!(o.reap(0).1, Vec::<u64>::new());
+        assert_eq!(o.live(), 2);
+        o.forget_clients(&[0xc1]);
+        assert_eq!(o.reap(0).1.len(), 2);
+    }
+
     #[test]
     fn a_handle_made_again_ends_what_it_named() {
         let ram = ram();
@@ -2607,6 +2627,48 @@ mod backend_tests {
         assert_eq!(st, 0);
         assert_eq!(reap(&mut vm.be, 0), (1, vec![id]));
         assert_eq!(reap(&mut vm.be, 1), (1, vec![]));
+    }
+
+    /// A new client whose handle is the number of a registration's object
+    /// is no new object of the registration's client: RM ignores hRoot for
+    /// the root classes, and the registration, still pinned by RM, stays
+    /// (review 2026-09-29 1.3).
+    #[test]
+    fn a_client_allocated_under_a_registrations_handle_leaves_it_registered() {
+        let mut vm = vm();
+        let gpu = vm.gpu;
+        let (st, ..) = ioctl(
+            &mut vm.be,
+            gpu,
+            ALLOC_MEMORY,
+            &os02(GUEST_VA, PAGE, 7),
+            &[],
+            Some(&list(OSDESC_F_WRITE, &[(LOW + 5 * PAGE, 1)])),
+        );
+        assert_eq!(st, 0);
+        seen();
+        for class in crate::semsurf::ROOT_CLASSES {
+            let mut o = vec![0u8; 48];
+            put32(&mut o, 0, CLIENT);
+            put32(&mut o, 8, 0x5000_0001);
+            put32(&mut o, 12, class);
+            let ctl = vm.ctl;
+            let (st, ..) = ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &[], None);
+            assert_eq!(st, 0);
+        }
+        assert_eq!(vm.be.osdesc.live(), 1, "still registered");
+        assert_eq!(reap(&mut vm.be, 0), (0, vec![]), "nothing to unpin");
+        // Another class at that handle does end it: RM made a new object
+        // there, so the old one is gone.
+        let mut o = vec![0u8; 48];
+        put32(&mut o, 0, CLIENT);
+        put32(&mut o, 4, DEVICE);
+        put32(&mut o, 8, 0x5000_0001);
+        put32(&mut o, 12, 0x3e);
+        let ctl = vm.ctl;
+        let (st, ..) = ioctl(&mut vm.be, ctl, RM_ALLOC, &o, &[], None);
+        assert_eq!(st, 0);
+        assert_eq!(reap(&mut vm.be, 0).1.len(), 1);
     }
 
     /// Scattered pages across both regions, from an address inside its
