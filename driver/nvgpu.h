@@ -341,7 +341,7 @@ struct nvgpu_fd {
  * A GEM parameter struct that carries a userspace pointer, described well
  * enough to forward: where the pointer sits and where the length beside it
  * does. Both are u64. A struct with no pointer is not described here at all --
- * it goes through nvgpu_ioctl_simple(), which copies the whole thing.
+ * it goes through nvgpu_ioctl_flat_h(), which copies the whole thing.
  */
 struct nvgpu_gem_nested_desc {
   u32 size;        /* sizeof the parameter struct */

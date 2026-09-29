@@ -142,13 +142,15 @@ What the driver does read of a guest process's bytes -- the IOCTL2 walk,
 RM's nested blocks and deep segments, the descriptors in them, the ranges
 registered by their pages -- is where a memory-safety bug is a guest kernel
 compromise, and one guest app's way into another's. So those parsers have a
-Rust implementation (`driver/rust/`, built with `NVGPU_RUST=1` into a kernel
-with `CONFIG_RUST`): a `no_std` core without `unsafe` or a panic path,
+Rust implementation (`driver/rust/`), which is what the module is built
+with on any kernel with `CONFIG_RUST` (the guest kernel the project builds
+has it): a `no_std` core without `unsafe` or a panic path,
 which copies each byte of the caller's once and decides on that copy, around
 which one small file holds the `unsafe` FFI to the C that stays (transport,
 pinning, DRM/KMS hooks). The Rust build has passed the same hardware
-regression as the C. The C is kept, selectable (a kernel without Rust
-builds it), and a differential test runs the two on the same inputs.
+regression as the C. The C is kept, frozen, as the fallback (`NVGPU_RUST=0`,
+and what a kernel without Rust builds), and a differential test runs the two
+on the same inputs.
 
 **The backend** (`device/`, Apache-2.0, with no VMM in its dependency list)
 holds the real host descriptors, understands the ABI, translates what has to be
