@@ -491,8 +491,9 @@ pub struct NvidiaBackend {
     /// carries the mapping closes, or when the session resets -- whichever
     /// comes first, and exactly once.
     pub(crate) active_maps: crate::mmap::MmapContext,
-    /// Host driver version, learned from the first successful
-    /// `NV_ESC_CHECK_VERSION_STR`.
+    /// Host driver version, as the transport read it from the driver
+    /// (`set_host_driver_version`). Never learned from a guest: the string
+    /// in CHECK_VERSION_STR's reply is the caller's in RM's relaxed mode.
     pub(crate) driver: Option<abi::version::DriverVersion>,
     /// ABI profile selected for `driver`, if one exists.
     abi: Option<&'static [abi::versions::IoctlEntry]>,
@@ -523,6 +524,10 @@ pub struct NvidiaBackend {
     pub(crate) live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Whether RM escapes pass with no host version set: only the unit
+    /// tests' and fuzzers' fake RMs, which no release describes. Everything
+    /// else refuses them (`unversioned_ok`).
+    unversioned_for_test: bool,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
     /// and how often.
     ///
@@ -728,7 +733,7 @@ pub enum AbiPolicy {
 pub enum AbiCheck {
     /// The escape is known and the guest's parameter size matches.
     Ok,
-    /// No profile yet -- CHECK_VERSION_STR has not been seen.
+    /// No profile: no host version was set, or none was measured at it.
     NoProfile,
     /// The escape is not in this driver's table.
     UnknownEscape,
@@ -1071,6 +1076,7 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
+            unversioned_for_test: cfg!(any(test, fuzzing)),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: crate::tally::Tally::default(),
             rm_controls: crate::tally::Tally::default(),
@@ -2572,26 +2578,6 @@ impl NvidiaBackend {
     // IOCTL — top-level
     // ------------------------------------------------------------------
 
-    /// Learn the host driver version from a successful `NV_ESC_CHECK_VERSION_STR`
-    /// reply and select the ABI profile for it.
-    ///
-    /// Layout is `nv_ioctl_rm_api_version_t`: cmd (4), reply (4), then a
-    /// NUL-terminated 64-byte version string.
-    fn learn_driver_version(&mut self, param_buf: &[u8]) {
-        if self.driver.is_some() || param_buf.len() < 12 {
-            return;
-        }
-        let tail = &param_buf[8..];
-        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        let Ok(text) = std::str::from_utf8(&tail[..end]) else {
-            return;
-        };
-        let Some(v) = abi::version::DriverVersion::parse(text) else {
-            return;
-        };
-        self.set_driver_version(v);
-    }
-
     /// The host driver version, as the transport read it from the driver at
     /// start-up. Known before any guest asks, it tells HELLO whether an
     /// NVKMS schema exists for this host (`BCAP_NVKMS_TABLE`) -- which the
@@ -2610,6 +2596,12 @@ impl NvidiaBackend {
         }
     }
 
+    /// Whether an RM escape may pass with no host version set: in the unit
+    /// tests and fuzzers only, whose fake RMs no release describes.
+    fn unversioned_ok(&self) -> bool {
+        cfg!(any(test, fuzzing)) && self.unversioned_for_test
+    }
+
     fn set_driver_version(&mut self, v: abi::version::DriverVersion) {
         self.driver = Some(v);
         self.rmallow.set_driver(v);
@@ -2618,9 +2610,9 @@ impl NvidiaBackend {
         self.abi = abi::versions::table_for(v);
         match self.abi {
             Some(t) => log::debug!("host driver {v}: ABI profile selected, {} escapes", t.len()),
-            None => log::error!(
-                "host driver {v} has no measured ABI profile; every RM escape is refused"
-            ),
+            // `allow_unmeasured_release` may still pick the nearest; the
+            // transport refuses to start on this otherwise (release.rs).
+            None => log::warn!("host driver {v} has no measured ABI profile"),
         }
     }
 
@@ -3037,14 +3029,19 @@ impl NvidiaBackend {
             // A known host with no profile: one no table was measured at,
             // which the transport refuses to start on (crate::release). Its
             // layouts are nobody's to guess.
-            AbiCheck::NoProfile if self.driver.is_some() => {
+            //
+            // No version at all is refused too: the transport reads it from
+            // the driver before any guest call, and a library user that set
+            // none (test-harness, an embedding VMM) used to learn it from
+            // the guest's CHECK_VERSION_STR, whose string RM leaves as the
+            // caller sent it -- the guest chose the ABI profile (review
+            // 2026-09-29 1.15).
+            AbiCheck::NoProfile if self.driver.is_none() && self.unversioned_ok() => false,
+            AbiCheck::NoProfile => {
                 log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
                 true
             }
-            // No version at all: only a backend built without the transport
-            // (the transport reads it from the driver before any guest
-            // calls), where the guest's CHECK_VERSION_STR teaches it.
-            AbiCheck::Ok | AbiCheck::VariableLength | AbiCheck::NoProfile => false,
+            AbiCheck::Ok | AbiCheck::VariableLength => false,
         };
         if refuse {
             *self.abi_refused.entry(escape).or_insert(0) += 1;
@@ -4352,11 +4349,6 @@ impl NvidiaBackend {
         // declared; only what the guest sent goes back.
         let param_buf = a.reply(top)[..n_in].to_vec();
         drop(a);
-        if escape == abi::ioctl::NV_ESC_CHECK_VERSION_STR
-            && (request >> 8) & 0xFF == u64::from(b'F')
-        {
-            self.learn_driver_version(&param_buf);
-        }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
@@ -5427,15 +5419,6 @@ mod abi_tests {
     use abi::ioctl::*;
 
     /// The exact reply the Tesla T4 gave to NV_ESC_CHECK_VERSION_STR on driver
-    /// 580.178.04, taken from gen/fixtures. Using the captured bytes rather
-    /// than a hand-built buffer keeps the parser honest about real padding.
-    fn t4_version_reply() -> Vec<u8> {
-        let mut b = vec![0u8; 72];
-        b[4] = 1; // reply = 1
-        b[8..18].copy_from_slice(b"580.178.04");
-        b
-    }
-
     fn backend() -> NvidiaBackend {
         NvidiaBackend::with_default_zones()
     }
@@ -5447,14 +5430,47 @@ mod abi_tests {
     }
 
     #[test]
-    fn learns_the_driver_version_from_a_real_reply() {
+    fn a_measured_version_selects_a_profile() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_host_driver_version("580.178.04");
         assert_eq!(
             b.driver,
             Some(abi::version::DriverVersion::new(580, 178, 4))
         );
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
+    }
+
+    /// The version is the host's, never the guest's: a CHECK_VERSION_STR
+    /// reply, whose string RM leaves as the caller sent it, teaches nothing,
+    /// and with no version set an RM escape is refused, not forwarded
+    /// unchecked (review 2026-09-29 1.15).
+    #[test]
+    fn with_no_host_version_no_rm_escape_passes_and_none_teaches_one() {
+        let mut b = backend();
+        b.unversioned_for_test = false;
+        b.set_host_ioctl_for_test(|_, _, arg| {
+            let (a, _) = arg.split();
+            a[4] = 1;
+            a[8..18].copy_from_slice(b"580.178.04");
+            0
+        });
+        let ctl = b.adopt_for_test(
+            std::fs::File::open("/dev/null").unwrap().into(),
+            HandleKind::Dev(DeviceKind::Ctl),
+        );
+        let mut req = Vec::new();
+        for v in [MsgType::Ioctl as u32, ctl, 0, 0] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        let cmd = abi::ioctl::_IOWR(NV_ESC_CHECK_VERSION_STR, 72) as u32;
+        for v in [cmd, 72, 72, 0, 0, 0] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req.extend_from_slice(&[0u8; 72]);
+        let mut resp = vec![0u8; 256];
+        b.dispatch(&req, &mut resp);
+        assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::EINVAL);
+        assert!(b.driver.is_none());
     }
 
     /// The property the tables exist for: an escape nobody described does not
@@ -5463,7 +5479,7 @@ mod abi_tests {
     #[test]
     fn an_escape_outside_the_profile_is_refused() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert!(b.abi.is_some());
 
         // 0x7f is not an NVIDIA escape and is in no profile.
@@ -5482,7 +5498,7 @@ mod abi_tests {
     #[test]
     fn a_descriptor_carrying_escape_with_no_translation_is_refused() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert!(b.untranslated_fd_escape(NV_ESC_EXPORT_TO_DMABUF_FD));
         for translated in [
             NV_ESC_REGISTER_FD,
@@ -5495,10 +5511,10 @@ mod abi_tests {
         }
     }
 
-    /// Before CHECK_VERSION_STR is answered there is no profile to check
-    /// against, and refusing then would refuse the call that establishes one.
+    /// With no version there is no profile to check against (and outside
+    /// the tests' fake RMs, `dispatch` refuses every RM escape then).
     #[test]
-    fn nothing_is_refused_before_the_version_is_known() {
+    fn nothing_is_checked_before_the_version_is_known() {
         let b = backend();
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
     }
@@ -5506,7 +5522,7 @@ mod abi_tests {
     #[test]
     fn accepts_the_sizes_the_t4_actually_sent() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         for (escape, size) in [
             (NV_ESC_RM_CONTROL, 32),
             (NV_ESC_RM_ALLOC, 48),
@@ -5529,7 +5545,7 @@ mod abi_tests {
         // The hand-written table had this at 48; 580 uses NVOS46_PARAMETERS_V580,
         // which is 64. This is the bug the ABI check exists to catch.
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         assert_eq!(
             b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
             AbiCheck::SizeMismatch {
@@ -5542,7 +5558,7 @@ mod abi_tests {
     #[test]
     fn variable_length_escapes_are_not_size_checked() {
         let mut b = backend();
-        b.learn_driver_version(&t4_version_reply());
+        b.set_driver_version(abi::version::DriverVersion::new(580, 178, 4));
         // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
         assert_eq!(
             b.check_abi(NV_ESC_CARD_INFO, 2304),
@@ -5553,18 +5569,9 @@ mod abi_tests {
     #[test]
     fn a_garbled_version_string_leaves_the_backend_unconfigured() {
         let mut b = backend();
-        let mut junk = vec![0u8; 72];
-        junk[8..12].copy_from_slice(b"oops");
-        b.learn_driver_version(&junk);
+        b.set_host_driver_version("oops");
         assert!(b.driver.is_none());
         assert_eq!(b.check_abi(NV_ESC_RM_CONTROL, 32), AbiCheck::NoProfile);
-    }
-
-    #[test]
-    fn a_short_reply_is_ignored_rather_than_panicking() {
-        let mut b = backend();
-        b.learn_driver_version(&[0u8; 4]);
-        assert!(b.driver.is_none());
     }
 }
 

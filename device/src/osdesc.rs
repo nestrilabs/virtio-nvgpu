@@ -2183,7 +2183,7 @@ mod tests {
         assert_eq!(o.uvm_range_count, 17, "freed, one more fits");
         o.uvm_file_closed(7);
         assert_eq!(o.uvm_range_count, 1);
-        assert!(o.uvm_ranges_by_owner.get(&a).is_none());
+        assert!(!o.uvm_ranges_by_owner.contains_key(&a));
     }
 
     #[test]
