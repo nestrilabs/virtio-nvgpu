@@ -1265,6 +1265,29 @@ impl VhostUserBackendMut for NvGpuBackend {
         QUEUE_SIZE as usize
     }
 
+    /// An exit event for each ring worker, which `main` writes once the
+    /// connection is gone. With none (the trait's default) a worker never
+    /// leaves its epoll, and the daemon's handler joins it as it is dropped:
+    /// a backend whose VMM hung up -- before the rings started, say -- said
+    /// "backend exited" and then never did, and a socket-activated unit
+    /// stayed up with nothing accepting.
+    fn exit_event(
+        &self,
+        _thread_index: usize,
+    ) -> Option<(
+        vmm_sys_util::event::EventConsumer,
+        vmm_sys_util::event::EventNotifier,
+    )> {
+        use vmm_sys_util::event::{EventFlag, new_event_consumer_and_notifier};
+        match new_event_consumer_and_notifier(EventFlag::NONBLOCK | EventFlag::CLOEXEC) {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                log::error!("no exit event for a ring worker ({e}); it will not stop at exit");
+                None
+            }
+        }
+    }
+
     fn features(&self) -> u64 {
         // INDIRECT_DESC lets one ring slot describe a whole table of
         // descriptors (virtio-queue chain.rs:119-145 follows them), which is
@@ -2335,10 +2358,8 @@ mod tests {
     /// The threads that open descriptors of their own start once the
     /// process's descriptors are registered, never before: what they open is
     /// then never taken for the backend's own (review 2026-09-29 1.14).
-    #[test]
-    fn accept_threads_start_after_the_descriptor_scan() {
-        use std::sync::Mutex as StdMutex;
-        let mut be = NvGpuBackend {
+    fn test_backend() -> NvGpuBackend {
+        NvGpuBackend {
             shared: Arc::new(Shared {
                 nvidia: Mutex::new(NvidiaBackend::with_zone_config(ZoneConfig::default_256mib())),
                 mem: RwLock::new(None),
@@ -2355,7 +2376,43 @@ mod tests {
             allow_compute: false,
             window: ZoneConfig::default_256mib(),
             queue_poll: std::time::Duration::ZERO,
-        };
+        }
+    }
+
+    /// A VMM that connects and hangs up at once: the daemon returns, the
+    /// ring workers take their exit events, and dropping it -- which joins
+    /// them -- returns. It never did: the workers had no exit event.
+    #[test]
+    fn a_vmm_that_hangs_up_at_once_lets_the_backend_exit() {
+        let path = std::env::temp_dir().join(format!("nvgpu-exit-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut listener = vhost::vhost_user::Listener::new(&path, true).unwrap();
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let backend = Arc::new(RwLock::new(test_backend()));
+            let mut daemon = VhostUserDaemon::new(
+                "virtio-nvgpu-test".to_string(),
+                backend,
+                GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+            )
+            .unwrap();
+            let _ = daemon.start(&mut listener).and_then(|()| daemon.wait());
+            for h in daemon.get_epoll_handlers() {
+                h.send_exit_event();
+            }
+            drop(daemon);
+            let _ = tx.send(());
+        });
+        let exited = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_file(&path);
+        assert!(exited.is_ok(), "the ring workers never stopped");
+    }
+
+    #[test]
+    fn accept_threads_start_after_the_descriptor_scan() {
+        use std::sync::Mutex as StdMutex;
+        let mut be = test_backend();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let s2 = seen.clone();
         be.after_scan.push(Box::new(move || {
