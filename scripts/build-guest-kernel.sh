@@ -25,14 +25,17 @@
 # Rust (driver/rust/), which is the module's default on such a kernel
 # (driver/Makefile): the Rust passed the whole hardware regression on
 # 2026-09-26 and is the stronger boundary (SECURITY.md §6), so the kernel the
-# project ships a guest with is one it can build. It needs rustc, bindgen and
+# project ships a guest with is one it can build, and driver/
+# guest-kernel.defconfig records that build. It needs rustc, bindgen and
 # RUST_LIB_SRC in the environment: run it in scripts/guest-toolchain-rust
-# (the rig does: rig/rig-build-kernel-rust.sh).
+# (rig/rig-build-kernel-rust.sh does).
 #
 # NVGPU_RUST=0 builds a kernel without Rust and the module with its C
 # parsers instead -- the fallback, for a guest kernel that cannot have Rust,
-# and for testing it -- in either toolchain (the rig's C one is
-# .rig/kernel/toolchain). Its config is not recorded.
+# and for testing it -- in either toolchain. Its config is not recorded.
+# With NVGPU_RUST unset, a toolchain with no rustc and bindgen (the rig's C
+# one, .rig/kernel/toolchain, which .rig/build-kernel.sh runs this in) gets
+# that build too, and says so; NVGPU_RUST=1 insists on the Rust.
 #
 # CONFIG_ONLY=1 stops once the .config is made (and recorded, for the
 # default build): what a change to the options below needs, without building
@@ -52,7 +55,18 @@ if [ -n "$OUT" ]; then
     KMAKE+=(O="$OUT")
 fi
 KTREE="${OUT:-$SRC}"
-RUST="${NVGPU_RUST:-1}"
+RUST="${NVGPU_RUST:-}"
+if [ -z "$RUST" ]; then
+    if command -v rustc >/dev/null && command -v bindgen >/dev/null &&
+        [ -n "${RUST_LIB_SRC:-}" ]; then
+        RUST=1
+    else
+        RUST=0
+        echo "NOTE: no Rust toolchain here (rustc, bindgen, RUST_LIB_SRC): building" >&2
+        echo "      a kernel without Rust and the module with its C parsers, the" >&2
+        echo "      fallback. The default build is in scripts/guest-toolchain-rust." >&2
+    fi
+fi
 case "$RUST" in
 0 | 1) ;;
 *) echo "NVGPU_RUST must be 0 or 1" >&2; exit 2 ;;
