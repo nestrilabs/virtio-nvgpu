@@ -283,18 +283,28 @@ pub fn tables(d: &Dev) -> SchemaSet<'static> {
     }
 }
 
-/// An IOCTL2's buffers, over the shared world.
+/// An IOCTL2's buffers, over the shared world. With `karg`, buffer 0 -- the
+/// argument, which the DRM node's entry copied in -- is kernel memory, as
+/// the kernel's `KStore` has it (`nvgpu_rs.rs`: `kern()`, and
+/// `nvgpu_rs_copy_from()` / `_to()`): a plain copy, refused with -EFAULT for
+/// an address in the user half.
 pub struct RStore {
     w: Rc<RefCell<World>>,
     bufs: Vec<Option<Vec<u8>>>,
+    karg: bool,
 }
 
 impl RStore {
-    pub fn new(w: Rc<RefCell<World>>) -> RStore {
+    pub fn new(w: Rc<RefCell<World>>, karg: bool) -> RStore {
         RStore {
             w,
             bufs: vec![None; 256],
+            karg,
         }
+    }
+
+    fn kern(&self, i: usize) -> bool {
+        self.karg && i == 0
     }
 }
 
@@ -310,7 +320,18 @@ impl Store for RStore {
 
     fn fetch(&mut self, i: usize, uptr: u64) -> Result<(), Errno> {
         let w = self.w.clone();
+        let kern = self.kern(i);
         let b = self.bufs.get_mut(i).and_then(|b| b.as_mut()).ok_or(-22)?;
+        if kern {
+            if b.is_empty() {
+                return Ok(());
+            }
+            if World::user_range(uptr, b.len()) {
+                return Err(-14);
+            }
+            w.borrow_mut().kread(b, uptr);
+            return Ok(());
+        }
         if w.borrow_mut().copy_from_user(b, uptr) {
             Ok(())
         } else {
@@ -331,6 +352,17 @@ impl Store for RStore {
 
     fn copy_out(&mut self, i: usize, uptr: u64, start: usize, end: usize) -> Result<(), Errno> {
         let src = self.buf(i).get(start..end).ok_or(-14)?.to_vec();
+        if self.kern(i) {
+            let at = uptr.wrapping_add(start as u64);
+            if src.is_empty() {
+                return Ok(());
+            }
+            if World::user_range(at, src.len()) {
+                return Err(-14);
+            }
+            self.w.borrow_mut().kwrite(at, &src);
+            return Ok(());
+        }
         if self
             .w
             .borrow_mut()

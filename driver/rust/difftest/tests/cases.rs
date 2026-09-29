@@ -7,7 +7,7 @@
 use nvgpu_guest_difftest::cabi;
 use nvgpu_guest_difftest::renv::{BCAP_DEEP_SEGS, BCAP_OS_DESC, BCAP_PROC_ID};
 use nvgpu_guest_difftest::scen::{self, Call, DevSpec, Outcome, Scenario, FDS};
-use nvgpu_guest_difftest::world::{Ev, Hooks, World};
+use nvgpu_guest_difftest::world::{Ev, Hooks, World, KARG};
 
 const ARG: u64 = 0x7f00_0000_0000;
 const NESTED: u64 = 0x7f00_0001_0000;
@@ -531,6 +531,7 @@ fn getresources_copies_back_what_the_kernel_would() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert_eq!(o.ret, 0);
@@ -549,6 +550,80 @@ fn getresources_copies_back_what_the_kernel_would() {
     );
     assert_eq!(le32(mem(&o, ARG), 32), 1);
     assert_eq!(le32(mem(&o, ARG), 48), 1920);
+}
+
+fn i2_karg(cmd: u32, uarg: u64) -> Call {
+    Call::I2 {
+        sclass: 1,
+        cmd,
+        uarg,
+        render: 5,
+        xflags: 0,
+        karg: true,
+    }
+}
+
+#[test]
+fn an_argument_the_drm_entry_copied_in_is_read_and_written_as_kernel_memory() {
+    // .karg (the DRM node's entry normalised the caller's argument into a
+    // kernel copy, nvgpu_drm_arg_in()): buffer 0 is read from and written
+    // back to that kernel memory; what it points at is still the caller's.
+    // SYNCOBJ_CREATE: the handle comes back into the kernel copy.
+    let create = 0xc008_64bf;
+    let mut w = world();
+    w.hooks.mask = 0;
+    w.mem.insert(KARG, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+    w.canned = vec![i2_reply(0, 1, &[9, 0, 0, 0, 1, 0, 0, 0])];
+    let o = run(dev(0, vec![]), w, i2_karg(create, KARG));
+    assert_eq!(o.ret, 0);
+    assert_eq!(le32(&sends(&o)[0], 16), create);
+    assert_eq!(mem(&o, KARG), &[9, 0, 0, 0, 1, 0, 0, 0]);
+
+    // SYNCOBJ_QUERY: the handles read from, and the points written to, the
+    // caller's own memory; the argument itself goes back to the kernel copy.
+    let query = 0xc018_64cb;
+    let mut w = world();
+    w.hooks.mask = 0;
+    let mut arg = vec![0u8; 24];
+    put(&mut arg, 0, A, 8);
+    put(&mut arg, 8, B, 8);
+    put(&mut arg, 16, 2, 4);
+    w.mem.insert(KARG, arg.clone());
+    w.mem.insert(A, vec![1, 0, 0, 0, 2, 0, 0, 0]);
+    w.mem.insert(B, vec![0xee; 16]);
+    let mut data = arg.clone();
+    data.extend_from_slice(&[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    w.canned = vec![i2_reply(0, 3, &data)];
+    let o = run(dev(0, vec![]), w, i2_karg(query, KARG));
+    assert_eq!(o.ret, 0);
+    assert_eq!(mem(&o, B), &[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(mem(&o, KARG), &arg[..]);
+    assert_eq!(mem(&o, A), &[1, 0, 0, 0, 2, 0, 0, 0]);
+
+    // An argument .karg says is kernel memory, at a user address: the
+    // kernel copy refuses it (access_ok), nothing is sent.
+    let mut w = world();
+    w.hooks.mask = 0;
+    w.mem.insert(ARG, vec![0u8; 8]);
+    let o = run(dev(0, vec![]), w, i2_karg(create, ARG));
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+
+    // A pointer in it to the kernel half: the caller's, so copy_from_user()
+    // refuses it -- no kernel memory is read for a user's pointer.
+    let mut w = world();
+    w.hooks.mask = 0;
+    let mut arg = vec![0u8; 24];
+    put(&mut arg, 0, KARG + 0x1000, 8);
+    put(&mut arg, 8, B, 8);
+    put(&mut arg, 16, 2, 4);
+    w.mem.insert(KARG, arg.clone());
+    w.mem.insert(KARG + 0x1000, vec![1u8; 8]);
+    w.mem.insert(B, vec![0xee; 16]);
+    let o = run(dev(0, vec![]), w, i2_karg(query, KARG));
+    assert_eq!(o.ret, -14);
+    assert!(sends(&o).is_empty());
+    assert_eq!(mem(&o, KARG), &arg[..]);
 }
 
 /// Both implementations with kmalloc() bytes not zeroed but 0xaa, so a
@@ -771,6 +846,7 @@ fn a_field_of_a_width_the_generator_refuses_is_refused() {
                 uarg: ARG,
                 render: 5,
                 xflags: 0,
+                karg: false,
             },
         );
         assert_eq!(o.ret, -22, "{cmd:#x}");
@@ -814,6 +890,7 @@ fn a_failed_gem_proxy_closes_no_handle_another_proxy_owns() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert_eq!(o.ret, -12);
@@ -890,6 +967,7 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     let hooks: Vec<Hook> = o
@@ -949,6 +1027,7 @@ fn an_atomic_commit_reserves_its_crtcs_and_bridges_its_fences() {
             uarg: ARG,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     );
     assert!(o.world.events.contains(&Ev::Hook(Hook::AInFence {

@@ -95,6 +95,7 @@ extern "C" {
         render: u32,
         xflags: u32,
         kernel: bool,
+        karg: bool,
         mask: u32,
         ret_out: *mut i32,
     ) -> c_long;
@@ -163,6 +164,22 @@ pub unsafe extern "C" fn dt_copy_to_user(to: u64, from: *const u8, n: usize) -> 
     } else {
         -14
     }
+}
+
+/// # Safety
+/// C passes `n` writable bytes at `to`.
+#[no_mangle]
+pub unsafe extern "C" fn dt_kread(to: *mut u8, from: u64, n: usize) {
+    let dst = unsafe { std::slice::from_raw_parts_mut(to, n) };
+    with(|w| w.kread(dst, from));
+}
+
+/// # Safety
+/// C passes `n` readable bytes at `from`.
+#[no_mangle]
+pub unsafe extern "C" fn dt_kwrite(to: u64, from: *const u8, n: usize) {
+    let src = unsafe { std::slice::from_raw_parts(from, n) };
+    with(|w| w.kwrite(to, src));
 }
 
 /// # Safety

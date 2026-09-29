@@ -17,7 +17,7 @@ use crate::cabi;
 use crate::renv::{
     self, Dev, I2Env, RStore, BCAP_DEEP_SEGS, BCAP_OS_DESC, BCAP_PROC_EUID, BCAP_PROC_ID,
 };
-use crate::world::{Ev, Hooks, Rng, World};
+use crate::world::{Ev, Hooks, Rng, World, KARG};
 
 /// The device a scenario runs on.
 #[derive(Clone, Debug)]
@@ -42,13 +42,16 @@ pub enum Call {
     Uvm { cmd: u32, arg: u64 },
     /// `nvgpu_ioctl_modeset()` (a v1 backend's NVKMS command).
     Modeset { cmd: u32, arg: u64 },
-    /// `nvgpu_i2_ioctl()`.
+    /// `nvgpu_i2_ioctl()`. `karg`: `uarg` is a kernel address, the
+    /// argument as the DRM node's entry copied it in
+    /// (`nvgpu_i2_call.karg`), everything it points at the caller's.
     I2 {
         sclass: u32,
         cmd: u32,
         uarg: u64,
         render: u32,
         xflags: u32,
+        karg: bool,
     },
 }
 
@@ -171,6 +174,7 @@ pub fn run_rust(s: &Scenario) -> Outcome {
             uarg,
             render,
             xflags,
+            karg,
         } => {
             if !s.dev.v2 {
                 return Outcome {
@@ -182,7 +186,7 @@ pub fn run_rust(s: &Scenario) -> Outcome {
             let set = renv::tables(&d);
             let compat = w.compat;
             let shared = Rc::new(RefCell::new(w));
-            let mut st = Box::new(State::new(RStore::new(shared.clone())));
+            let mut st = Box::new(State::new(RStore::new(shared.clone(), karg)));
             let mut env = I2Env {
                 w: shared.clone(),
                 render,
@@ -254,6 +258,7 @@ pub fn run_c(s: &Scenario, world: World) -> Outcome {
             uarg,
             render,
             xflags,
+            karg,
         } => {
             let mask = world.hooks.mask;
             let mut call_ret = 0i32;
@@ -267,6 +272,7 @@ pub fn run_c(s: &Scenario, world: World) -> Outcome {
                     render,
                     xflags,
                     false,
+                    karg,
                     mask,
                     &mut call_ret,
                 )
@@ -923,7 +929,19 @@ pub fn gen_i2_from(mut r: Rng, seed: u64) -> Scenario {
     fill(
         &mut r, &mut m, &set, modeset, &mut arg, 0, e.field, e.nfield, 0,
     );
-    let uarg = if r.chance(1, 30) {
+    // Now and then the argument is the DRM node entry's kernel copy
+    // (.karg): buffer 0 read and written as kernel memory, what it points
+    // at the caller's -- or, rarely, a user address, which the kernel copy
+    // refuses (-EFAULT).
+    let karg = r.chance(1, 6);
+    let uarg = if karg {
+        if r.chance(1, 20) {
+            m.put(&mut r, arg)
+        } else {
+            m.world.mem.insert(KARG, arg);
+            KARG
+        }
+    } else if r.chance(1, 30) {
         m.hole()
     } else {
         m.put(&mut r, arg)
@@ -944,6 +962,7 @@ pub fn gen_i2_from(mut r: Rng, seed: u64) -> Scenario {
             uarg,
             render,
             xflags,
+            karg,
         },
     }
 }
@@ -1229,6 +1248,7 @@ pub fn gen_atomic_from(mut r: Rng, seed: u64) -> Scenario {
             uarg,
             render: 5,
             xflags: 0,
+            karg: false,
         },
     }
 }

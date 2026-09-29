@@ -5,6 +5,13 @@
 
 use std::collections::BTreeMap;
 
+/// Where the user half of the address space ends (x86-64's, and the shim's
+/// `DIFFTEST_USER_END`): memory the world maps above it is kernel memory.
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
+/// A kernel address for an argument the DRM node's entry copied in
+/// (`nvgpu_i2_call.karg`).
+pub const KARG: u64 = 0xffff_8880_0010_0000;
+
 /// Something one of the implementations did that the other must do too.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ev {
@@ -238,9 +245,41 @@ impl World {
         (off.checked_add(n)? <= r.len()).then_some((r, off))
     }
 
+    /// Whether `[addr, addr + n)` is all in the user half (the kernel's
+    /// `access_ok()`; the shim's has the same bound).
+    pub fn user_range(addr: u64, n: usize) -> bool {
+        addr < USER_END && (n as u64) <= USER_END - addr
+    }
+
+    /// A kernel address's bytes, as the kernel's plain copy reads them (the
+    /// `.kernel` / `.karg` paths). Kernel memory is the world's `mem` above
+    /// the user half; one the test did not map is a test bug.
+    pub fn kread(&mut self, dst: &mut [u8], src: u64) {
+        if dst.is_empty() {
+            return;
+        }
+        let (r, off) = self
+            .region(src, dst.len())
+            .unwrap_or_else(|| panic!("a kernel read of {src:#x} the test did not map"));
+        dst.copy_from_slice(&r[off..off + dst.len()]);
+    }
+
+    pub fn kwrite(&mut self, dst: u64, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+        let (r, off) = self
+            .region(dst, src.len())
+            .unwrap_or_else(|| panic!("a kernel write of {dst:#x} the test did not map"));
+        r[off..off + src.len()].copy_from_slice(src);
+    }
+
     pub fn copy_from_user(&mut self, dst: &mut [u8], src: u64) -> bool {
         if dst.is_empty() {
             return true;
+        }
+        if !Self::user_range(src, dst.len()) {
+            return false;
         }
         match self.region(src, dst.len()) {
             Some((r, off)) => {
@@ -254,6 +293,9 @@ impl World {
     pub fn copy_to_user(&mut self, dst: u64, src: &[u8]) -> bool {
         if src.is_empty() {
             return true;
+        }
+        if !Self::user_range(dst, src.len()) {
+            return false;
         }
         match self.region(dst, src.len()) {
             Some((r, off)) => {
