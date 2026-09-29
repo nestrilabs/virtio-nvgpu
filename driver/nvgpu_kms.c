@@ -667,18 +667,18 @@ int nvgpu_kms_open(struct nvgpu_dri_dev *dri, struct drm_file *file,
   return 0;
 }
 
-int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
-                         int o_flags) {
+struct file *nvgpu_adopt_drm_filp(struct file *tmpl, u32 kms_handle,
+                                  u32 kind, int o_flags) {
   struct nvgpu_fd *tnfd = tmpl ? nvgpu_drm_file_nfd(tmpl) : NULL;
   struct nvgpu_dri_dev *dri;
   struct nvgpu_device *dev;
   struct drm_file *tfile;
   struct file *f;
   bool consumed;
-  int fd, ret;
+  int ret;
 
   if (!tnfd)
-    return -EBADF;
+    return ERR_PTR(-EBADF);
   dev = tnfd->dev;
   tfile = tmpl->private_data;
   dri = tfile->minor->dev->dev_private;
@@ -705,14 +705,6 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
     goto close;
   }
 
-  /* The descriptor first, so that nothing can fail once the clone holds the
-   * handle but an fd_install(). */
-  fd = get_unused_fd_flags(o_flags & O_CLOEXEC);
-  if (fd < 0) {
-    ret = fd;
-    goto close;
-  }
-
   mutex_lock(&nvgpu_adopt_lock);
   nvgpu_adopt.dri = dri;
   nvgpu_adopt.handle = kms_handle;
@@ -732,18 +724,16 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
   mutex_unlock(&nvgpu_adopt_lock);
 
   if (IS_ERR(f)) {
-    put_unused_fd(fd);
     ret = PTR_ERR(f);
     /* Taken and then let go by the failed clone's own release. */
     if (consumed)
-      return ret == -EBADF ? -EIO : ret;
+      return ERR_PTR(ret == -EBADF ? -EIO : ret);
     goto close;
   }
   if (!consumed) {
     /* Our node's open always runs nvgpu_drm_open(), which either takes the
      * slot or fails; an open that did neither is not ours to hand out. */
     fput(f);
-    put_unused_fd(fd);
     ret = -EIO;
     goto close;
   }
@@ -756,12 +746,35 @@ int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
    * as a lessee's are (nvgpu_kms_ioctl()).
    */
   nvgpu_drm_drop_master(f);
-  fd_install(fd, f);
-  return fd;
+  return f;
 
 close:
   nvgpu_close_handle(dev, kms_handle);
-  return ret == -EBADF ? -EIO : ret;
+  return ERR_PTR(ret == -EBADF ? -EIO : ret);
+}
+
+int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
+                         int o_flags) {
+  struct nvgpu_fd *tnfd = tmpl ? nvgpu_drm_file_nfd(tmpl) : NULL;
+  struct file *f;
+  int fd;
+
+  if (!tnfd)
+    return -EBADF;
+  /* The descriptor first, so that nothing can fail once the clone holds the
+   * handle but an fd_install(). */
+  fd = get_unused_fd_flags(o_flags & O_CLOEXEC);
+  if (fd < 0) {
+    nvgpu_close_handle(tnfd->dev, kms_handle);
+    return fd;
+  }
+  f = nvgpu_adopt_drm_filp(tmpl, kms_handle, kind, o_flags);
+  if (IS_ERR(f)) {
+    put_unused_fd(fd);
+    return PTR_ERR(f);
+  }
+  fd_install(fd, f);
+  return fd;
 }
 
 /* ───────── events ───────── */

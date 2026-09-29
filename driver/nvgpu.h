@@ -193,6 +193,13 @@ struct nvgpu_device {
   /* Every open descriptor, so an event naming a handle can find its file. */
   struct list_head fds;
   spinlock_t fds_lock;
+  /*
+   * DRM files by render handle, from open until their last nvgpu_fd_put()
+   * -- past release, while proxies keep the render handle: the reaper asks
+   * whether a host GEM handle is a proxy's (nvgpu_gem_handle_held()), and a
+   * released file's proxies are just as alive as an open one's.
+   */
+  struct xarray renders;
 
   /* ── DRI device nodes ── */
 #define NVGPU_MAX_DRI_DEVS 8
@@ -418,6 +425,9 @@ struct nvgpu_gem_object {
   u8 caching;     /* NVGPU_MMAP_CACHE_*, from the placement's reply */
   bool read_only; /* the host maps it read-only (NVGPU_MMAP_F_READ_ONLY) */
   bool window_valid;
+  /* SEMSURF_FENCE_ATTACH moved it into another file at least once, so its
+   * free has re-homes to close (nvgpu_fence_gem_free()). */
+  bool rehomed;
 };
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
@@ -514,6 +524,17 @@ enum nvgpu_pace_ctr {
   NVGPU_PACE_CTRS
 };
 void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
+/*
+ * The module's own work queues (nvgpu_main.c), made at init and destroyed at
+ * exit after the driver is unregistered: destroy_workqueue() waits for an
+ * item still running, so no item returns into module text after it is gone
+ * -- which the system queues did not guarantee for items that hold no module
+ * reference, or drop the last one (S3, 2026-09-29). nvgpu_wq: short,
+ * high-priority items (W_ARM, a fence proxy's WATCH); nvgpu_long_wq: items
+ * that make round trips (a semaphore-surface wait's second half).
+ */
+extern struct workqueue_struct *nvgpu_wq;
+extern struct workqueue_struct *nvgpu_long_wq;
 void nvgpu_dev_get(struct nvgpu_device *dev);
 /* Any context: the last put only frees memory. */
 void nvgpu_dev_put(struct nvgpu_device *dev);
@@ -614,18 +635,17 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
                          u32 *owner, u32 *gem);
 /*
  * Host GEM @host_gem, just imported into the render handle of @drm_filp (a
- * DRM file of ours), as a new guest dma-buf descriptor (@o_flags: O_CLOEXEC |
- * O_RDWR), or -errno. @obj_type is the host's IDENTIFY answer for it
+ * DRM file of ours), as a new guest dma-buf (@o_flags: O_CLOEXEC | O_RDWR),
+ * not yet a descriptor: the caller installs it (dma_buf_fd(), or fd_install()
+ * of buf->file) once nothing else can fail, or dma_buf_put()s it. An ERR_PTR
+ * on failure. @obj_type is the host's IDENTIFY answer for it
  * (NVGPU_GEM_OBJECT_*), which a new proxy reports. Owns @host_gem unless it
- * returns -EBADF (not our file).
+ * returns -EBADF (not our file) or -EAGAIN (a dying proxy's handle: wait it
+ * out with nvgpu_gem_wait_gone() and import again).
  */
-/* The same, as the dma-buf itself (an ERR_PTR on failure), for a caller
- * that installs the descriptor only once nothing else can fail. */
 struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
                                            u32 host_gem, u64 size,
                                            u32 obj_type, int o_flags);
-int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           u32 obj_type, int o_flags);
 
 /* Guest handle in `file` -> the proxy itself, referenced (drop it with
  * drm_gem_object_put(&ng->base)), or NULL for anything that is not one. */
@@ -676,6 +696,14 @@ void nvgpu_kms_master_drop(struct drm_file *file);
  */
 int nvgpu_adopt_drm_file(struct file *tmpl, u32 kms_handle, u32 kind,
                          int o_flags);
+/*
+ * The same, as the new file itself (an ERR_PTR on failure, with the same
+ * ownership of `kms_handle`: ERR_PTR(-EBADF) exactly when `tmpl` is not a
+ * card file of ours), for a caller that installs its descriptor only once
+ * nothing else can fail (nvgpu_wl.c's RECV).
+ */
+struct file *nvgpu_adopt_drm_filp(struct file *tmpl, u32 kms_handle,
+                                  u32 kind, int o_flags);
 
 /* ───────── nvgpu_nvkms.c ───────── */
 
@@ -1002,9 +1030,9 @@ int nvgpu_close_handle(struct nvgpu_device *dev, u32 handle);
 int nvgpu_gem_close(struct nvgpu_device *dev, u32 file_handle, u32 gem);
 /* From any context: queued on a workqueue that holds a module reference. */
 void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle);
-/* A W_ARM of `handle`, sent from a work item: poll() cannot wait for it.
- * False if it could not be queued. */
-bool nvgpu_arm_ready_async(struct nvgpu_device *dev, u32 handle);
+/* A W_ARM of `nfd`'s handle, sent from a work item on nvgpu_wq: poll()
+ * cannot wait for it. False if it could not be queued. Process context. */
+bool nvgpu_arm_ready_async(struct nvgpu_fd *nfd);
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,
                            u32 gem);
 /* The same, and release(arg) once the host can no longer act on the close:

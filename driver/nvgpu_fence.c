@@ -147,9 +147,14 @@ static void nvgpu_fence_ev_kfree(struct nvgpu_fence_ev *e) { kfree(e); }
 struct nvgpu_host_fence {
   struct dma_fence base;
   struct nvgpu_device *dev;
-  /* The backend's sync_file. Open for as long as the proxy lives, signalled
-   * or not: a host consumer handed this fence later still needs it. */
+  /*
+   * The backend's sync_file. Open for as long as the proxy lives, signalled
+   * or not: a host consumer handed this fence later still needs it. Cleared
+   * (a failure handing it back to its caller) only before the WATCH is sent
+   * or queued, which reads it (nvgpu_host_fence_watch()).
+   */
   u32 handle;
+  u64 cookie; /* the WATCH's, which the consumer is registered under */
   struct nvgpu_fence_ev *ev;
   atomic_t signalled; /* the one EV_FENCE has been acted on */
 };
@@ -294,11 +299,26 @@ struct nvgpu_fence_watch_work {
 };
 
 /*
- * The proxy's WATCH, answered. One the backend refused signals the proxy
- * with the error now, as the synchronous path failed the call: a fence
- * nobody will ever report must not be waited on forever. The reference held
- * meanwhile keeps the proxy -- and so its handle, which its release closes
- * -- until the WATCH has gone out ahead of any CLOSE.
+ * A WATCH the backend refused, or that never reached it: a fence nobody will
+ * ever report must not be waited on forever, so it is signalled with the
+ * error now.
+ */
+static void nvgpu_host_fence_unwatched(struct nvgpu_host_fence *f, int ret) {
+  if (atomic_xchg(&f->signalled, 1))
+    return;
+  dev_warn_ratelimited(&f->dev->vdev->dev,
+                       "virtio-gpu-nv: the backend would not watch host "
+                       "fence %u: %d; signalled with the error\n",
+                       f->handle, ret);
+  dma_fence_set_error(&f->base, ret < 0 && ret >= -MAX_ERRNO ? ret : -EIO);
+  dma_fence_signal(&f->base);
+}
+
+/*
+ * The proxy's WATCH, answered. The reference held meanwhile keeps the proxy
+ * -- and so its handle, which its release closes -- until the WATCH has gone
+ * out ahead of any CLOSE; the handle is the proxy's for good by the time
+ * this was queued (nvgpu_host_fence_watch()).
  */
 static void nvgpu_fence_watch_fn(struct work_struct *work) {
   struct nvgpu_fence_watch_work *w =
@@ -307,25 +327,50 @@ static void nvgpu_fence_watch_fn(struct work_struct *work) {
   int ret = nvgpu_watch(f->dev, f->handle, NVGPU_W_FENCE | NVGPU_W_ONESHOT,
                         w->cookie);
 
-  if (ret && !atomic_xchg(&f->signalled, 1)) {
-    dev_warn_ratelimited(&f->dev->vdev->dev,
-                         "virtio-gpu-nv: the backend would not watch host "
-                         "fence %u: %d; signalled with the error\n",
-                         f->handle, ret);
-    dma_fence_set_error(&f->base, ret < 0 && ret >= -MAX_ERRNO ? ret : -EIO);
-    dma_fence_signal(&f->base);
-  }
+  if (ret)
+    nvgpu_host_fence_unwatched(f, ret);
   kfree(w);
   /* Last: it may be the proxy's release, and with it the module's
-   * reference (nvgpu_host_fence_release's comment has why that is safe). */
+   * reference; nvgpu_wq is destroyed at exit, which waits for this item to
+   * return before the module text goes. */
   dma_fence_put(&f->base);
 }
 
 /*
+ * Start watching the proxy's host fence: once it owns its handle for good --
+ * installed as a descriptor, or kept by its caller -- and not before (S5,
+ * 2026-09-29). Queued while a failure could still hand the handle back, the
+ * WATCH could reach the backend after the caller's CLOSE of the same handle,
+ * on another queue. A WATCH that fails signals the proxy with the error
+ * (nvgpu_host_fence_unwatched()), sent here or from the work item alike.
+ */
+static void nvgpu_host_fence_watch(struct nvgpu_host_fence *f) {
+  int ret;
+
+  if (READ_ONCE(nvgpu_async_fence_watch)) {
+    struct nvgpu_fence_watch_work *w = kmalloc(sizeof(*w), GFP_KERNEL);
+
+    if (w) {
+      INIT_WORK(&w->work, nvgpu_fence_watch_fn);
+      w->f = f;
+      w->cookie = f->cookie;
+      dma_fence_get(&f->base);
+      queue_work(nvgpu_wq, &w->work);
+      return;
+    }
+  }
+  ret = nvgpu_watch(f->dev, f->handle, NVGPU_W_FENCE | NVGPU_W_ONESHOT,
+                    f->cookie);
+  if (ret)
+    nvgpu_host_fence_unwatched(f, ret);
+}
+
+/*
  * A proxy dma_fence for host sync_file `handle`, with one reference, which
- * signals when the host's does. On failure `handle` is closed only if `own`;
- * an IOCTL2 fd_out hook passes false, because the interpreter closes what a
- * failing hook was given.
+ * will signal when the host's does -- once nvgpu_host_fence_watch() has been
+ * called, when the proxy owns the handle for good. On failure `handle` is
+ * closed only if `own`; an IOCTL2 fd_out hook passes false, because the
+ * interpreter closes what a failing hook was given.
  */
 static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
                                               u32 handle, bool own) {
@@ -375,9 +420,10 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
     goto put;
 
   /*
-   * Consumer first, WATCH second: once the backend watches, the report can
-   * come at once (a host fence that has already signalled), and it must find
-   * the consumer and the proxy in place.
+   * Consumer first, WATCH second (nvgpu_host_fence_watch()): once the
+   * backend watches, the report can come at once (a host fence that has
+   * already signalled), and it must find the consumer and the proxy in
+   * place.
    */
   cookie = nvgpu_ev_new_cookie(dev);
   ret = nvgpu_ev_register(dev, &e->c, NVGPU_EVKEY_COOKIE(cookie));
@@ -385,27 +431,7 @@ static struct dma_fence *nvgpu_host_fence_new(struct nvgpu_device *dev,
     goto put;
   nvgpu_dev_get(dev); /* the registration's, put at retire */
   e->registered = true;
-  if (READ_ONCE(nvgpu_async_fence_watch)) {
-    struct nvgpu_fence_watch_work *w = kmalloc(sizeof(*w), GFP_KERNEL);
-
-    if (w) {
-      INIT_WORK(&w->work, nvgpu_fence_watch_fn);
-      w->f = f;
-      w->cookie = cookie;
-      dma_fence_get(&f->base);
-      /* The proxy holds a module reference, and this work one on it. */
-      queue_work(system_highpri_wq, &w->work);
-      return &f->base;
-    }
-  }
-  ret = nvgpu_watch(dev, handle, NVGPU_W_FENCE | NVGPU_W_ONESHOT, cookie);
-  if (ret) {
-    dev_warn_ratelimited(&dev->vdev->dev,
-                         "virtio-gpu-nv: the backend would not watch host "
-                         "fence %u: %d\n",
-                         handle, ret);
-    goto put;
-  }
+  f->cookie = cookie;
   return &f->base;
 
 put:
@@ -447,6 +473,8 @@ static int nvgpu_host_fence_fd(struct nvgpu_device *dev, u32 handle,
     goto put;
   }
   fd_install(fd, sync->file);
+  /* The descriptor owns the handle now: nothing hands it back after this. */
+  nvgpu_host_fence_watch(container_of(base, struct nvgpu_host_fence, base));
   dma_fence_put(base); /* the sync_file holds its own */
   return fd;
 
@@ -724,6 +752,9 @@ static int nvgpu_fence_hook_fd_out(struct nvgpu_i2_call *call, u32 buf,
 
     if (IS_ERR(f))
       return PTR_ERR(f);
+    /* Kept by the call from here, whatever it returns: the handle is the
+     * proxy's for good (its release closes it), so it may be watched. */
+    nvgpu_host_fence_watch(container_of(f, struct nvgpu_host_fence, base));
     p->fence = f;
     *user_value = -1;
     return 0;
@@ -2106,6 +2137,9 @@ again:
   r->file = file;
   r->gem = (u32)res[0];
   hash_add(nvgpu_rehomes, &r->node, (unsigned long)ng);
+  /* Under the lock; read by the proxy's free, which can only come after
+   * the reference this caller holds on it is gone. */
+  WRITE_ONCE(ng->rehomed, true);
   *gem = r->gem;
   ret = 0;
   goto out;
@@ -2128,6 +2162,13 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
   HLIST_HEAD(gone);
   unsigned int bkt;
 
+  /*
+   * Most proxies were never attached a fence in another file: they need not
+   * wait on the one global mutex, which a re-home holds across two or three
+   * HOST_OPs -- every proxy free in the VM did (S6, 2026-09-29).
+   */
+  if (!READ_ONCE(ng->rehomed))
+    return;
   mutex_lock(&nvgpu_rehome_lock);
   hash_for_each_possible_safe(nvgpu_rehomes, r, tmp, node, (unsigned long)ng) {
     bool shared = false;
@@ -2314,7 +2355,7 @@ static void nvgpu_semsurf_defer_cb(struct dma_fence *f,
   struct nvgpu_semsurf_defer *d =
       container_of(cb, struct nvgpu_semsurf_defer, cb);
 
-  queue_work(system_unbound_wq, &d->work);
+  queue_work(nvgpu_long_wq, &d->work);
 }
 
 /* Takes its own reference on `f`. */

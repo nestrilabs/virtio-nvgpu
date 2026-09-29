@@ -1050,7 +1050,6 @@ enum nvgpu_close_what {
   NVGPU_CLOSE_HANDLE, /* CLOSE `handle` */
   NVGPU_CLOSE_GEM,    /* GEM_CLOSE `id` in the file `handle` */
   NVGPU_CLOSE_MUNMAP, /* MUNMAP mapping `id`, made through `handle` */
-  NVGPU_ARM_READY,    /* WATCH `handle` with NVGPU_W_ARM (not a close) */
 };
 
 struct nvgpu_close_work {
@@ -1183,10 +1182,6 @@ static void nvgpu_close_work_fn(struct work_struct *work) {
   case NVGPU_CLOSE_MUNMAP:
     __nvgpu_munmap(cw->dev, cw->handle, cw->id, false);
     break;
-  case NVGPU_ARM_READY:
-    /* A handle closed meanwhile answers EBADF, which is fine. */
-    nvgpu_watch(cw->dev, cw->handle, NVGPU_W_ARM, 0);
-    break;
   }
   kfree(cw);
   module_put(THIS_MODULE);
@@ -1215,7 +1210,10 @@ static bool nvgpu_queue_close(struct nvgpu_device *dev, u32 handle, u32 id,
                          "virtio-gpu-nv: no memory to release backend handle "
                          "%u (%s %u); it stays until the session resets\n",
                          handle,
-                         what == NVGPU_CLOSE_MUNMAP ? "mapping" : "gem", id);
+                         what == NVGPU_CLOSE_MUNMAP ? "mapping"
+                         : what == NVGPU_CLOSE_GEM  ? "gem"
+                                                    : "handle",
+                         id);
     goto unqueued;
   }
   INIT_WORK(&cw->work, nvgpu_close_work_fn);
@@ -1248,8 +1246,54 @@ void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle) {
   nvgpu_queue_close(dev, handle, 0, NVGPU_CLOSE_HANDLE, NULL, NULL);
 }
 
-bool nvgpu_arm_ready_async(struct nvgpu_device *dev, u32 handle) {
-  return nvgpu_queue_close(dev, handle, 0, NVGPU_ARM_READY, NULL, NULL);
+/*
+ * A W_ARM, from a work item on the module's own unordered queue (nvgpu_wq):
+ * on the transport's ordered one it waited behind every CLOSE, GEM_CLOSE,
+ * MUNMAP and reaper item any process had queued -- some of them a synchronous
+ * CLOSE and an osdesc reap of up to 64 HOST_OPs -- and another process's
+ * GPU wake-ups came that much later (S6, 2026-09-29). Nothing orders it
+ * against a CLOSE: the item holds the file, so the CLOSE comes after it.
+ *
+ * An arm that fails before it reaches the backend, or is refused by it,
+ * would leave `armed` set with no report ever to clear it, and every later
+ * poll would find it set and arm nothing: the file's RM event waits then ran
+ * to their timeouts (S1). So the file is made ready instead -- a spurious
+ * wake, after which the next poll arms again. Not for -EBADF (the handle is
+ * gone, as the file is) or -ETIMEDOUT (the request still reaches the
+ * backend and arms it).
+ */
+struct nvgpu_arm_work {
+  struct work_struct work;
+  struct nvgpu_fd *nfd;
+};
+
+static void nvgpu_arm_work_fn(struct work_struct *work) {
+  struct nvgpu_arm_work *w = container_of(work, struct nvgpu_arm_work, work);
+  struct nvgpu_fd *nfd = w->nfd;
+  int ret = nvgpu_watch(nfd->dev, nfd->handle, NVGPU_W_ARM, 0);
+
+  if (ret && ret != -EBADF && ret != -ETIMEDOUT) {
+    atomic_set(&nfd->armed, 0);
+    atomic_set(&nfd->pending, 1);
+    wake_up_interruptible(&nfd->wq);
+  }
+  kfree(w);
+  nvgpu_fd_put(nfd);
+}
+
+bool nvgpu_arm_ready_async(struct nvgpu_fd *nfd) {
+  struct nvgpu_arm_work *w;
+
+  if (nvgpu_xfer_dead(nfd->dev))
+    return false;
+  w = kmalloc(sizeof(*w), GFP_KERNEL);
+  if (!w)
+    return false;
+  INIT_WORK(&w->work, nvgpu_arm_work_fn);
+  nvgpu_fd_get(nfd);
+  w->nfd = nfd;
+  queue_work(nvgpu_wq, &w->work);
+  return true;
 }
 
 void nvgpu_gem_close_async(struct nvgpu_device *dev, u32 file_handle,

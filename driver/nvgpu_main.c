@@ -136,7 +136,7 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
    */
   if ((nfd->dev->backend_caps & NVGPU_BCAP_ARMED_READY) &&
       !atomic_xchg(&nfd->armed, 1) &&
-      !nvgpu_arm_ready_async(nfd->dev, nfd->handle))
+      !nvgpu_arm_ready_async(nfd))
     atomic_set(&nfd->armed, 0);
   return ready_now;
 }
@@ -647,6 +647,8 @@ static void nvgpu_dev_release(struct kobject *kobj) {
   struct nvgpu_device *dev = container_of(kobj, struct nvgpu_device, kobj);
 
   nvgpu_xfer_free(dev);
+  /* Empty: every DRM nvgpu_fd held the device until its last put. */
+  xa_destroy(&dev->renders);
   put_device(&dev->vdev->dev);
   kfree(dev);
 }
@@ -681,6 +683,9 @@ void nvgpu_fd_put(struct nvgpu_fd *nfd) {
 
   if (!refcount_dec_and_test(&nfd->ref))
     return;
+  /* Before the memory goes: nvgpu_gem_handle_held() looks it up. */
+  if (nfd->device_type >= NVGPU_DEV_DRI_BASE)
+    xa_cmpxchg(&dev->renders, nfd->handle, nfd, NULL, 0);
   nvgpu_close_handle(dev, nfd->handle);
   /* RM clients the file held are gone, and what they registered with them. */
   nvgpu_osdesc_reap(dev);
@@ -1998,6 +2003,7 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   vdev->priv = dev;
   INIT_LIST_HEAD(&dev->fds);
   spin_lock_init(&dev->fds_lock);
+  xa_init(&dev->renders);
   nvgpu_osdesc_init(dev);
 
   /* Find virtqueues */
@@ -2400,20 +2406,43 @@ static struct virtio_driver nvgpu_driver = {
     .remove = nvgpu_remove,
 };
 
-static int __init nvgpu_init(void)
-{
-    if (virtio_id != VIRTIO_ID_GPU_NV) {
-        id_table[0].device = virtio_id;
-        pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
-                virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
-    }
-    return register_virtio_driver(&nvgpu_driver);
+struct workqueue_struct *nvgpu_wq;
+struct workqueue_struct *nvgpu_long_wq;
+
+static void nvgpu_wq_destroy(void) {
+  /* The long queue first: its items may queue onto the short one. */
+  if (nvgpu_long_wq)
+    destroy_workqueue(nvgpu_long_wq);
+  if (nvgpu_wq)
+    destroy_workqueue(nvgpu_wq);
+  nvgpu_long_wq = NULL;
+  nvgpu_wq = NULL;
 }
 
-static void __exit nvgpu_exit(void)
-{
-    unregister_virtio_driver(&nvgpu_driver);
-    nvgpu_fence_drain();
+static int __init nvgpu_init(void) {
+  int ret;
+
+  if (virtio_id != VIRTIO_ID_GPU_NV) {
+    id_table[0].device = virtio_id;
+    pr_info("virtio-gpu-nv: binding virtio device id %u (default %u)\n",
+            virtio_id, (unsigned int)VIRTIO_ID_GPU_NV);
+  }
+  nvgpu_wq = alloc_workqueue("nvgpu", WQ_HIGHPRI, 0);
+  nvgpu_long_wq = alloc_workqueue("nvgpu-long", WQ_UNBOUND, 0);
+  if (!nvgpu_wq || !nvgpu_long_wq) {
+    nvgpu_wq_destroy();
+    return -ENOMEM;
+  }
+  ret = register_virtio_driver(&nvgpu_driver);
+  if (ret)
+    nvgpu_wq_destroy();
+  return ret;
+}
+
+static void __exit nvgpu_exit(void) {
+  unregister_virtio_driver(&nvgpu_driver);
+  nvgpu_wq_destroy();
+  nvgpu_fence_drain();
 }
 
 module_init(nvgpu_init);

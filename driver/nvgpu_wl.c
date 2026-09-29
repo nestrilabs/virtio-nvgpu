@@ -674,15 +674,15 @@ out:
 /* ── RECV ── */
 
 /*
- * A host DRM file (backend handle @handle of kind @kind) as a guest file.
- * The handle is closed here or owned by nvgpu_adopt_drm_file() from its call
- * on; either way the caller is done with it.
+ * A host DRM file (backend handle @handle of kind @kind) as a guest file, not
+ * yet installed (the caller does that once nothing else can fail). The
+ * handle is closed here or owned by nvgpu_adopt_drm_filp() from its call on;
+ * either way the caller is done with it.
  */
-static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
-                          u32 kind) {
+static struct file *nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd,
+                                   u32 handle, u32 kind) {
   struct nvgpu_fd *tn;
-  struct file *tmpl;
-  int fd;
+  struct file *tmpl, *f;
 
   tmpl = card_fd >= 0 ? fget(card_fd) : NULL;
   if (!tmpl) {
@@ -690,7 +690,7 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
                         "virtio-gpu-nv: wayland: a DRM file arrived with no "
                         "card template to clone; dropping it\n");
     nvgpu_close_handle(dev, handle);
-    return -EBADF;
+    return ERR_PTR(-EBADF);
   }
   /*
    * The handle is this device's backend's; a clone of another device's node
@@ -706,22 +706,24 @@ static int nvgpu_wl_adopt(struct nvgpu_device *dev, int card_fd, u32 handle,
                         "DRM file of this device; dropping a DRM file\n");
     fput(tmpl);
     nvgpu_close_handle(dev, handle);
-    return -EBADF;
+    return ERR_PTR(-EBADF);
   }
-  fd = nvgpu_adopt_drm_file(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
-  if (fd == -EBADF)
+  f = nvgpu_adopt_drm_filp(tmpl, handle, kind, O_RDWR | O_CLOEXEC);
+  if (f == ERR_PTR(-EBADF))
     nvgpu_close_handle(dev, handle);
   fput(tmpl);
-  return fd;
+  return f;
 }
 
 /*
  * Export mode: a host dma-buf (backend handle @handle) imported into the
  * render handle of the daemon's render file, as a guest proxy and a guest
- * dma-buf descriptor. The backend's dma-buf handle is closed either way.
+ * dma-buf's file, not yet installed. The backend's dma-buf handle is closed
+ * either way.
  */
-static int nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
-                           u32 handle) {
+static struct file *nvgpu_wl_import(struct nvgpu_device *dev, int render_fd,
+                                    u32 handle) {
+  struct dma_buf *buf = NULL;
   struct nvgpu_fd *nfd;
   struct file *rf;
   u64 args[2], res[3];
@@ -780,8 +782,9 @@ again:
   }
   /* Owns the host GEM handle from here: closed on failure, or left to the
    * proxy that already stands for it. */
-  ret = nvgpu_dmabuf_from_host(rf, (u32)res[0], res[1], (u32)res[2],
-                               O_RDWR | O_CLOEXEC);
+  buf = nvgpu_dmabuf_from_host_buf(rf, (u32)res[0], res[1], (u32)res[2],
+                                   O_RDWR | O_CLOEXEC);
+  ret = IS_ERR(buf) ? PTR_ERR(buf) : 0;
   /*
    * The host answered with a handle the file had for this buffer, and the
    * proxy that stood for it is on its way out, about to close it (S-11): a
@@ -798,8 +801,13 @@ out:
   if (rf)
     fput(rf);
   nvgpu_close_handle(dev, handle);
-  return ret;
+  /* The dma-buf's file holds the buffer: fput() it is dma_buf_put(). */
+  return ret ? ERR_PTR(ret) : buf->file;
 }
+
+static unsigned int nvgpu_wl_reap_recv_from(struct nvgpu_device *dev,
+                                            const struct nvgpu_tbuf *resp,
+                                            u32 used, u32 first);
 
 static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_device *dev = wf->wl->dev;
@@ -809,7 +817,8 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   struct nvgpu_wl_recv_req rr;
   struct nvgpu_wl_frame_hdr fh;
   struct nvgpu_tbuf *req = NULL, *resp = NULL;
-  int *installed = NULL;
+  struct file **files = NULL;
+  int *fds = NULL;
   u32 cap, max_desc, flen, ndesc = 0, used = 0, i;
   s32 status;
   long ret;
@@ -894,49 +903,66 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
     goto out;
   }
 
+  /*
+   * Each descriptor becomes a guest file under a reserved number, and is
+   * installed only once the frame and the reply are the caller's: a copy-out
+   * that faults takes back what it made with fput() and put_unused_fd(),
+   * never close_fd() by number -- another thread of the daemon may have
+   * closed that number and had it reused meanwhile, as capture's reply
+   * learnt (nvgpu_capture.c). A descriptor never reached (no memory, a
+   * reply that does not read) has its backend handle closed with the rest
+   * of the frame's (nvgpu_wl_reap_recv_from()): a lease among them would
+   * keep a compositor output leased until the session resets.
+   */
   ndesc = le16_to_cpu((__le16)fh.ndesc);
+  i = 0;
   if (ndesc) {
-    installed = kmalloc_array(ndesc, sizeof(*installed), GFP_KERNEL);
-    if (!installed) {
+    files = kcalloc(ndesc, sizeof(*files), GFP_KERNEL);
+    fds = kmalloc_array(ndesc, sizeof(*fds), GFP_KERNEL);
+    if (!files || !fds) {
       ret = -ENOMEM;
-      goto out;
+      goto out_reap;
     }
   }
   for (i = 0; i < ndesc; i++) {
     struct nvgpu_wl_desc d;
+    struct file *f = NULL;
     int fd = -1;
 
     ret = nvgpu_wl_desc_get(resp, H, i, &d);
     if (ret)
-      goto out_close;
-    if (!(d.flags & NVGPU_WL_DESC_F_INVALID)) {
-      switch (d.kind) {
-      case NVGPU_WL_DESC_DRM_FILE:
-        fd = nvgpu_wl_adopt(dev, x.card_fd, d.a, d.b);
-        break;
-      case NVGPU_WL_DESC_DMABUF:
-        fd = nvgpu_wl_import(dev, x.render_fd, d.a);
-        break;
-      default:
-        break;
+      goto out_reap;
+    if (!(d.flags & NVGPU_WL_DESC_F_INVALID) &&
+        (d.kind == NVGPU_WL_DESC_DRM_FILE || d.kind == NVGPU_WL_DESC_DMABUF)) {
+      fd = get_unused_fd_flags(O_CLOEXEC);
+      if (fd < 0) {
+        nvgpu_close_handle(dev, d.a);
+        f = ERR_PTR(fd);
+      } else if (d.kind == NVGPU_WL_DESC_DRM_FILE) {
+        f = nvgpu_wl_adopt(dev, x.card_fd, d.a, d.b);
+      } else {
+        f = nvgpu_wl_import(dev, x.render_fd, d.a);
       }
-      if (fd < 0 && (d.kind == NVGPU_WL_DESC_DRM_FILE ||
-                     d.kind == NVGPU_WL_DESC_DMABUF)) {
+      if (IS_ERR(f)) {
         dev_dbg_ratelimited(&dev->vdev->dev,
                             "virtio-gpu-nv: wayland: could not make a guest "
-                            "file of a host descriptor (kind %u): %d\n",
-                            d.kind, fd);
+                            "file of a host descriptor (kind %u): %ld\n",
+                            d.kind, PTR_ERR(f));
+        if (fd >= 0)
+          put_unused_fd(fd);
         d.flags |= NVGPU_WL_DESC_F_INVALID;
+        f = NULL;
         fd = -1;
       }
     }
-    /* Only descriptors installed here are ever reported as one. */
+    /* Only descriptors made here are ever reported as one. */
     d.fd = fd;
-    installed[i] = fd;
+    files[i] = f;
+    fds[i] = fd;
     ret = nvgpu_wl_desc_put(resp, H, i, &d);
     if (ret) {
       i++;
-      goto out_close;
+      goto out_reap;
     }
   }
 
@@ -951,16 +977,25 @@ static long nvgpu_wl_recv(struct nvgpu_wl_file *wf, void __user *uarg) {
   }
   if (wf->more)
     atomic_set(&wf->nfd.pending, 1);
-  if (!ret)
+  if (!ret) {
+    for (i = 0; i < ndesc; i++)
+      if (files[i])
+        fd_install(fds[i], files[i]);
     goto out;
+  }
   /* The caller never learnt the descriptors: take them back. */
-  i = ndesc;
-out_close:
-  while (i-- > 0)
-    if (installed[i] >= 0)
-      close_fd(installed[i]);
+  goto out_put;
+out_reap:
+  nvgpu_wl_reap_recv_from(dev, resp, used, i);
+out_put:
+  for (i = 0; files && i < ndesc; i++)
+    if (files[i]) {
+      fput(files[i]);
+      put_unused_fd(fds[i]);
+    }
 out:
-  kfree(installed);
+  kfree(files);
+  kfree(fds);
   if (req)
     nvgpu_tbuf_free(req);
   /* resp is wf->rbuf, kept for the next RECV (or the transport's now). */
@@ -1140,6 +1175,13 @@ int nvgpu_wl_init(struct nvgpu_device *dev) {
  */
 unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
                                 const struct nvgpu_tbuf *resp, u32 used) {
+  return nvgpu_wl_reap_recv_from(dev, resp, used, 0);
+}
+
+/* The same, for descriptors `first` onwards (a RECV that stopped there). */
+static unsigned int nvgpu_wl_reap_recv_from(struct nvgpu_device *dev,
+                                            const struct nvgpu_tbuf *resp,
+                                            u32 used, u32 first) {
   const size_t H = sizeof(struct nvgpu_msg_hdr);
   struct nvgpu_wl_frame_hdr fh;
   unsigned int n = 0;
@@ -1150,7 +1192,7 @@ unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
       le32_to_cpu((__le32)fh.magic) != NVGPU_WL_FRAME_MAGIC)
     return 0;
   ndesc = min_t(u32, le16_to_cpu((__le16)fh.ndesc), NVGPU_WL_MAX_DESC);
-  for (i = 0; i < ndesc; i++) {
+  for (i = first; i < ndesc; i++) {
     size_t at = H + sizeof(fh) + (size_t)i * sizeof(struct nvgpu_wl_desc);
     struct nvgpu_wl_desc d;
 

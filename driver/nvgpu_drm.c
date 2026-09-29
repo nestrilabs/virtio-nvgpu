@@ -620,20 +620,23 @@ int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h) {
  * proxy's, alive or dying: a number the host handed back for an object the
  * file already had, which is that proxy's to close and nobody else's. For
  * the reaper of abandoned replies, which knows only the numbers.
+ *
+ * Looked up in dev->renders, which keeps a file until its last reference,
+ * not in dev->fds, which loses it at release: a killed process's file is
+ * released while its proxies -- held by whoever it shared buffers with --
+ * live on, and a late reply naming one of their handles was taken for
+ * nobody's and closed under them (S2, 2026-09-29). The xarray's lock keeps
+ * the nvgpu_fd from being freed while its index is read (nvgpu_fd_put()
+ * erases it under that lock first).
  */
 bool nvgpu_gem_handle_held(struct nvgpu_device *dev, u32 render, u32 gem) {
   struct nvgpu_fd *nfd;
-  unsigned long flags;
-  bool held = false;
+  bool held;
 
-  spin_lock_irqsave(&dev->fds_lock, flags);
-  list_for_each_entry(nfd, &dev->fds, node) {
-    if (nfd->handle == render) {
-      held = xa_load(&nfd->gem_index, gem) != NULL;
-      break;
-    }
-  }
-  spin_unlock_irqrestore(&dev->fds_lock, flags);
+  xa_lock(&dev->renders);
+  nfd = xa_load(&dev->renders, render);
+  held = nfd && xa_load(&nfd->gem_index, gem) != NULL;
+  xa_unlock(&dev->renders);
   return held;
 }
 
@@ -1370,21 +1373,6 @@ struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
   return buf;
 }
 
-/* nvgpu_dmabuf_from_host_buf(), installed as a descriptor. */
-int nvgpu_dmabuf_from_host(struct file *drm_filp, u32 host_gem, u64 size,
-                           u32 obj_type, int o_flags) {
-  struct dma_buf *buf = nvgpu_dmabuf_from_host_buf(drm_filp, host_gem, size,
-                                                   obj_type, o_flags);
-  int fd;
-
-  if (IS_ERR(buf))
-    return PTR_ERR(buf);
-  fd = dma_buf_fd(buf, o_flags & O_CLOEXEC);
-  if (fd < 0)
-    dma_buf_put(buf);
-  return fd;
-}
-
 /*
  * There is no "guest handle -> host numbers" that lets go of the proxy (this
  * was nvgpu_gem_to_host()): the numbers are the proxy's only while it lives,
@@ -1752,11 +1740,17 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   nfd->handle = le32_to_cpu(resp->hdr.handle);
   nfd->drm_file = file;
   xa_init(&nfd->gem_index);
+  ret = xa_err(xa_store(&dev->renders, nfd->handle, nfd, GFP_KERNEL));
+  if (ret) {
+    nvgpu_close_handle(dev, nfd->handle);
+    goto err;
+  }
 
   /* A lease being adopted into this very open, or a card file that may
    * want the host's card later (nvgpu_kms.c). */
   ret = nvgpu_kms_open(dri, file, nfd);
   if (ret) {
+    xa_erase(&dev->renders, nfd->handle);
     nvgpu_close_handle(dev, nfd->handle);
     goto err;
   }
