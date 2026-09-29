@@ -2,8 +2,8 @@
 // protocol/src/inject.rs
 //
 // The capture-injection socket: a host helper hands the backend dma-bufs a
-// guest may then open (ARCHITECTURE.md, "Capture injection"; SECURITY.md
-// §18). Nothing here crosses the virtqueue: this is the host-side socket's
+// guest may then open (ARCHITECTURE.md and SECURITY.md, "Capture
+// injection"). Nothing here crosses the virtqueue: this is the host-side socket's
 // format, kept beside the wire format because the helper that speaks it is
 // built elsewhere (the NixOS side) and needs one normative description.
 //

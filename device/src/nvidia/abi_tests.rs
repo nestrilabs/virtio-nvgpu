@@ -30,7 +30,7 @@ fn a_measured_version_selects_a_profile() {
 /// The version is the host's, never the guest's: a CHECK_VERSION_STR
 /// reply, whose string RM leaves as the caller sent it, teaches nothing,
 /// and with no version set an RM escape is refused, not forwarded
-/// unchecked (review 2026-09-29 1.15).
+/// unchecked.
 #[test]
 fn with_no_host_version_no_rm_escape_passes_and_none_teaches_one() {
     let mut b = backend();

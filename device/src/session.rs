@@ -40,8 +40,8 @@ use crate::xfer;
 
 /// Request and response limits when the guest negotiated indirect
 /// descriptors: one descriptor then describes a table of up to 65535 entries
-/// (virtio-queue chain.rs:119-145), so a 4 MiB buffer built from page chunks
-/// fits whatever the ring size.
+/// (virtio-queue 0.18.0, src/chain.rs, :119-145), so a 4 MiB buffer built
+/// from page chunks fits whatever the ring size.
 pub const MAX_XFER_INDIRECT: u32 = 4 << 20;
 /// Without them every chunk costs a ring slot, and a 256-entry ring shared by
 /// every request in flight bounds what one request may take.
@@ -492,8 +492,7 @@ pub(crate) fn hdr(t: MsgType, handle: u32, status: i32, req_id: u32) -> Vec<u8> 
 /// A reply's status as it may go on the wire: 0, or an errno the kernel
 /// knows (-1 to -MAX_ERRNO); anything else -- a positive value, which the
 /// guest's v1 paths hand straight to userspace as an ioctl's result -- is
-/// EPROTO, as the guest's IOCTL2 path already clamps it (review 2026-09-29
-/// parity #40, the backend's half).
+/// EPROTO, as the guest's IOCTL2 path clamps it.
 pub(crate) fn wire_status(status: i32) -> i32 {
     const MAX_ERRNO: i32 = 4095;
     if status == 0 || (-MAX_ERRNO..0).contains(&status) {
@@ -971,8 +970,7 @@ impl NvidiaBackend {
         // would be a holder of it the registration does not know: NVKMS
         // duplicates the surface and kernel-maps its memory, and would go
         // on writing into the pages after the guest unpinned them for
-        // another process. Refused, as the cheap fail-closed answer (review
-        // 2026-09-29 1.4).
+        // another process. Refused, as the cheap fail-closed answer.
         if let Some((client, surface)) = crate::semsurf::SemsurfPolicy::ctx_surface(&prepared)
             && self.osdesc.holds(client, surface)
         {
@@ -1116,8 +1114,7 @@ impl NvidiaBackend {
                     (0, Vec::new())
                 }
                 // Charged to the process that asked, not to whichever one
-                // the queue thread served last (review 2026-09-26, backend
-                // 10).
+                // the queue thread served last.
                 Some(Ok(fd)) => match self
                     .handles
                     .insert_for(fd, HandleKind::DrmCard(card), k.owner)
@@ -1701,8 +1698,7 @@ mod tests {
 
     /// A fence context over a semaphore surface that holds memory
     /// registered by its pages never reaches the host: NVKMS would be a
-    /// holder of the pages the registration does not know (review
-    /// 2026-09-29 1.4). Another surface of the same client does.
+    /// holder of the pages the registration does not know. Another surface of the same client does.
     #[test]
     fn a_fence_context_over_registered_memory_is_refused() {
         const CLIENT: u32 = 0xc1d0_0001;

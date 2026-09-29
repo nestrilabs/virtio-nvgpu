@@ -275,7 +275,7 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng) {
   /*
    * Most proxies were never attached a fence in another file: they need not
    * wait on the one global mutex, which a re-home holds across two or three
-   * HOST_OPs -- every proxy free in the VM did (S6, 2026-09-29).
+   * HOST_OPs.
    */
   if (!READ_ONCE(ng->rehomed))
     return;

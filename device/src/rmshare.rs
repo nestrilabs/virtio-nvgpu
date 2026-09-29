@@ -977,8 +977,8 @@ impl NvidiaBackend {
         caller: Option<Caller>,
         named: Result<Vec<Named>, &'static str>,
     ) -> Result<(), u32> {
-        // RM's answer to parameters too short for what it reads (review
-        // 2026-09-29 2.6): not a permission.
+        // RM's answer to parameters too short for what it reads: not a
+        // permission.
         let named = named.map_err(|what| {
             log::warn!("{what}: parameters too short to hold the client they name; refused");
             NV_ERR_INVALID_ARGUMENT
@@ -2229,7 +2229,7 @@ mod backend_tests {
     }
 
     /// Parameters too short to hold the client they name are RM's
-    /// INVALID_ARGUMENT, not a permission (review 2026-09-29 2.6).
+    /// INVALID_ARGUMENT, not a permission.
     #[test]
     fn a_block_too_short_for_its_client_is_an_invalid_argument() {
         let (mut be, f1, _) = vm(FULL);

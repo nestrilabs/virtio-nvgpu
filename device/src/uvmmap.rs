@@ -27,7 +27,7 @@
 //!   unlimited stack rlimit (or one above about 96 TiB): x86 then starts
 //!   the mmap area near 21 TiB, inside the band, and nesbox's
 //!   `MAP_FIXED_NOREPLACE` can collide with a mapping of its own -- a
-//!   refusal, which says the address is taken (SECURITY.md §11, F3). crosvm
+//!   refusal, which says the address is taken (SECURITY.md, F3). crosvm
 //!   reserves the band before it maps anything, so there it never does.
 //! - **How much.** Placements per file and per VM, bytes per file and per
 //!   VM, and recorded ranges per file and per VM, all bounded.

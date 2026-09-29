@@ -333,9 +333,9 @@ impl FileTree {
 ///
 /// Linux gives a reader without CAP_SYS_ADMIN the first 64 bytes of a
 /// device's config (pci-sysfs.c, `pci_read_config`), and the backend never
-/// has it: the guest's device had no capability list and no PCIe extended
-/// capabilities, its capability pointer at 0x34 pointing into zeros, and
-/// nvidia-smi could not report the link (review 2026-09-29, parity #14).
+/// has it: without it the guest's device has no capability list and no
+/// PCIe extended capabilities, its capability pointer at 0x34 points into
+/// zeros, and nvidia-smi cannot report the link.
 /// The snapshot is taken only if it is of this device -- vendor, device,
 /// class and subsystem as the live read has them -- and at most 4 KiB;
 /// the live bytes stay authoritative for what they cover. None otherwise.
@@ -428,8 +428,8 @@ pub(super) fn write_dri_section(devices: &[DriDevice], buf: &mut [u8]) -> usize 
         return 0;
     }
     // The count is of the records that fit, written once they are known:
-    // a count of every device over fewer records had the guest parse the
-    // card section after them as DRI records (review 2026-09-29 2.6).
+    // a count of every device over fewer records would have the guest
+    // parse the card section after them as DRI records.
     let mut off = 4;
     let mut n = 0u32;
     for d in devices {

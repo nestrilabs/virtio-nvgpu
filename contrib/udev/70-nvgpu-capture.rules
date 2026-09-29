@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # /dev/nvgpu-capture*, where the guest's capture daemon opens the host
-# buffers the VM's capture helper injected (SECURITY.md §18).
+# buffers the VM's capture helper injected (SECURITY.md, "Capture injection").
 #
 # An open is how an injected screen-share buffer becomes a guest dma-buf,
 # given its id and token, which the helper tells the daemon alone. The module

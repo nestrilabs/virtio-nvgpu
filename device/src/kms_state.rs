@@ -68,7 +68,7 @@ pub(crate) const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 /// only after ([`VmKms::close_after`]). Without that, an id freed on
 /// another executor in between could be the next framebuffer anyone on the
 /// host made -- the kernel hands out the lowest free id -- and the call
-/// would show it (review 2026-09-26, backend 5).
+/// would show it.
 #[derive(Default)]
 pub struct VmKms {
     inner: Mutex<VmKmsInner>,
@@ -153,7 +153,7 @@ impl VmKms {
     /// calls still running from before let go. So do the retired marks:
     /// a call made before the reset may still be running on a retired
     /// file, and must record nothing when it finishes; each mark goes with
-    /// its file's last reference (review 2026-09-29 1.5).
+    /// its file's last reference.
     pub fn clear(&self) {
         let mut v = self.lock();
         v.owner.clear();
@@ -167,7 +167,7 @@ impl VmKms {
     /// see, as the host last reported it. Blob ids are the device's and a
     /// lease does not cover blobs (drm_mode_object_lease_required): read by
     /// number, any other VM's MODE_ID and damage clips, and the host
-    /// desktop's, were the guest's to read (review 2026-09-26, backend 12).
+    /// desktop's, would be the guest's to read.
     pub fn blob_readable(&self, id: u32) -> bool {
         let v = self.lock();
         v.blobs.contains_key(&id) || v.seen_blobs.values().any(|&b| b == id)
@@ -258,7 +258,7 @@ impl VmKms {
     /// The id is the guest's: the host's refusal takes the record back
     /// ([`VmKms::probe_refused`]), so only connectors the host serves stay
     /// recorded, and past [`PROBES_KEPT`] records the ones older than the
-    /// window, which say nothing, go first (review 2026-09-26, backend 6).
+    /// window, which say nothing, go first.
     pub fn may_probe(&self, card: u32, connector: u32, now: std::time::Instant) -> bool {
         let mut v = self.lock();
         if v.probed.len() >= PROBES_KEPT && !v.probed.contains_key(&(card, connector)) {

@@ -27,7 +27,7 @@
 #   --wayland-queue-budget MIB  unread compositor output per VM (default 256)
 #   --wayland-lease-interval S  seconds between lease requests (default 5)
 #
-# Capture injection (SECURITY.md §18; unprivileged runs only):
+# Capture injection (SECURITY.md, "Capture injection"; unprivileged runs only):
 #   --inject                    give the backend --inject-socket in the run's
 #                               directory (inject.sock), for peers of this
 #                               user's uid; NVGPU_INJECT_SOCKET names it to the

@@ -7,7 +7,7 @@
 # it, root's and open to that group alone (0660), in a directory of root's,
 # and hands it to the backend (socket activation). The backend's user owns
 # neither, so it can neither replace the socket nor intercept the VMM's
-# connection, whoever else runs as that user (SECURITY.md §22).
+# connection, whoever else runs as that user (SECURITY.md, "The backend's socket").
 #
 #   systemctl start vhost-user-nvgpu@0.service    # starts the socket too
 #   # then the VMM, as nvgpu-vmm0, with its vhost-user socket at

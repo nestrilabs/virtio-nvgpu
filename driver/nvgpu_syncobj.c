@@ -964,7 +964,7 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
  * size but the schema's, so a guest kernel whose drm_syncobj_* grew would
  * have every syncobj call fail -EINVAL at run time, with one warning line to
  * say why. Asserted here instead, at build time, number (and so size) and
- * all (the 2026-09-29 review, C3).
+ * all.
  */
 #define NVGPU_SYNCOBJ_SCHEMA(name)                                             \
   static_assert(DRM_IOCTL_##name == NVGPU_SCHEMA_CMD_##name,                  \

@@ -39,9 +39,9 @@ fn files_still_closing_count_against_the_handle_table() {
     assert!(be.handles.insert(devnull(), HandleKind::Eventfd).is_ok());
 }
 
-/// Modeset files still closing count against the NVKMS open caps: with
-/// the closer stalled on a modeset, one process looping open/close held
-/// far more than 64 host NVKMS opens (review 2026-09-29 1.12).
+/// Modeset files still closing count against the NVKMS open caps: else,
+/// with the closer stalled on a modeset, one process looping open/close
+/// would hold far more than 64 host NVKMS opens.
 #[test]
 fn modeset_files_still_closing_count_against_the_nvkms_caps() {
     let devnull = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };

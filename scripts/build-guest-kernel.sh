@@ -24,7 +24,8 @@
 # The kernel has CONFIG_RUST, and the module its untrusted-input parsers in
 # Rust (driver/rust/), which is the module's default on such a kernel
 # (driver/Makefile): the Rust passed the whole hardware regression on
-# 2026-09-26 and is the stronger boundary (SECURITY.md §6), so the kernel the
+# 2026-09-26 and is the stronger boundary (SECURITY.md, "Inside the
+# guest"), so the kernel the
 # project ships a guest with is one it can build, and driver/
 # guest-kernel.defconfig records that build. It needs rustc, bindgen and
 # RUST_LIB_SRC in the environment: run it in scripts/guest-toolchain-rust

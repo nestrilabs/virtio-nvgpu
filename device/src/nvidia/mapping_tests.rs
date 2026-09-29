@@ -584,8 +584,7 @@ impl Env {
 /// memory was freed; now the zone ends exactly where it started, and so
 /// does the host.
 /// UNMAP_MEMORY gives the caller its own pLinearAddress back, found or
-/// not: RM does not write it and nvidia.ko copies the block back
-/// (review 2026-09-29 2.4). The found path zeroed it.
+/// not: RM does not write it and nvidia.ko copies the block back.
 #[test]
 fn an_unmap_gives_the_caller_its_own_address_back() {
     let mut e = env();
@@ -730,7 +729,7 @@ fn a_refused_extent_leaves_no_host_mapping_and_no_charge() {
     );
     assert_eq!(held, 2 * LEN);
 
-    // RM's own out-of-memory answer, in the status (#29).
+    // RM's own out-of-memory answer, in the status.
     assert_eq!(e.map_as(ctl, p(1), VIDMEM), (0, NV_ERR_NO_MEMORY, 0));
     assert_eq!(host_maps().len(), 2, "RM was never asked");
     assert_eq!(e.be.shm_free_bytes(), free);
@@ -745,9 +744,8 @@ fn a_refused_extent_leaves_no_host_mapping_and_no_charge() {
 
 /// An NVOS33 length near u64::MAX, which any app may send, is refused
 /// in RM's status before a reservation is tried: rounding it up to a
-/// page overflowed, and the release profile aborted the backend for
-/// every process of the VM (review 2026-09-29 1.1). The same for an
-/// MMAP's size (1.10).
+/// page would overflow, and the release profile abort the backend for
+/// every process of the VM. The same for an MMAP's size.
 #[test]
 fn a_map_length_near_u64_max_is_refused_not_aborted() {
     let mut e = env();
@@ -820,7 +818,7 @@ fn a_mapping_rm_types_otherwise_moves_zone_or_is_undone() {
     assert_eq!(
         e.map_as(ctl, unknown, UCVID),
         (0, NV_ERR_NO_MEMORY, 0),
-        "no uncached extent left: RM's own answer (#29)"
+        "no uncached extent left: RM's own answer"
     );
     assert_eq!(host_maps().len(), 2, "the third host mapping was undone");
     assert_eq!(e.be.shm_free_bytes().1, wc0, "the reservation went back");
@@ -837,7 +835,7 @@ fn a_refused_placement_undoes_the_host_mapping_and_the_extent() {
     PLACE_FAILS.with(|f| f.set(true));
     let refused = e.map_as(ctl, p(1), VIDMEM);
     PLACE_FAILS.with(|f| f.set(false));
-    assert_eq!(refused, (0, NV_ERR_NO_MEMORY, 0), "RM's own answer (#29)");
+    assert_eq!(refused, (0, NV_ERR_NO_MEMORY, 0), "RM's own answer");
     assert!(host_maps().is_empty(), "the host's mapping was undone");
     assert_eq!(e.be.shm_free_bytes(), empty);
     assert_eq!(

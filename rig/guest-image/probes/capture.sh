@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Capture injection (SECURITY.md §18): host buffers the host's helper injected
+# Capture injection (SECURITY.md, "Capture injection"): host buffers the
+# host's helper injected
 # are opened here through /dev/nvgpu-capture, imported into EGL and Vulkan,
 # and every pixel checked against the pattern the host painted; the CPU gets
 # no writable mapping; a wrong token, a released id and a process without

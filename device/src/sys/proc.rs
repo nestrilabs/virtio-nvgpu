@@ -125,8 +125,8 @@ pub fn sched_slice() -> io::Result<u64> {
 /// soon it runs again once it wakes and how long it may run then.
 ///
 /// Only a fair policy is touched: SCHED_OTHER, SCHED_BATCH and SCHED_IDLE
-/// keep theirs (a unit's `CPUSchedulingPolicy=batch` was reset to
-/// SCHED_OTHER, review 2026-09-29 2.3), and a real-time or deadline thread
+/// keep theirs (a unit's `CPUSchedulingPolicy=batch` stays batch), and a
+/// real-time or deadline thread
 /// is left as it is: `Ok(false)`.
 pub fn set_sched_slice(slice_ns: u64) -> io::Result<bool> {
     let cur = sched_attr()?;
@@ -645,8 +645,8 @@ mod sched_tests {
 mod sched_policy_tests {
     use super::*;
 
-    /// The slice keeps the thread's policy: a batch thread stays batch
-    /// (review 2026-09-29 2.3). In a thread of its own, since the policy
+    /// The slice keeps the thread's policy: a batch thread stays batch. In
+    /// a thread of its own, since the policy
     /// is the thread's.
     #[test]
     #[cfg_attr(miri, ignore = "Miri has no sched_setattr")]

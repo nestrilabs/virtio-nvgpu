@@ -6,7 +6,8 @@
 //! no_new_privs, undumpable. That leaves it everything its uid has -- every
 //! file the uid can open, every socket it can connect to, every syscall the
 //! kernel offers -- and one process per VM maps all of that guest's RAM and
-//! parses everything the guest sends (SECURITY.md §4). This takes the rest
+//! parses everything the guest sends (SECURITY.md, "The backend
+//! process"). This takes the rest
 //! away, in four layers, each installed once, before the first guest message
 //! and before the process has a second thread:
 //!

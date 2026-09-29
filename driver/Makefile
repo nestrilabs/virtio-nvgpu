@@ -25,7 +25,8 @@ virtio_gpu_nv-y := nvgpu_main.o nvgpu_procfs.o nvgpu_pci.o nvgpu_schema.o \
 #             kernel dependency) into the module, and nvgpu_rs_glue.c, the C
 #             it calls. Needs a kernel built with CONFIG_RUST=y. The default
 #             wherever the kernel has Rust: it has passed the hardware
-#             regression, and it is the stronger boundary (SECURITY.md §6).
+#             regression, and it is the stronger boundary (SECURITY.md,
+#             "Inside the guest").
 #   the C     nvgpu_i2.c, nvgpu_rmio.c, nvgpu_atomic.c: the fallback for a
 #             kernel without Rust, and the difftest's oracle. Fixes only.
 #

@@ -867,7 +867,7 @@ out:
  * counter is a real answer rather than a stub, and it must not restart while
  * the module is loaded or two live files would claim the same id. Given at
  * open: assigned on first ask, two threads asking at once on a new file could
- * each be told a different one (the 2026-09-29 review, S8).
+ * each be told a different one.
  */
 static atomic64_t nvgpu_drm_next_unique_id = ATOMIC64_INIT(0);
 

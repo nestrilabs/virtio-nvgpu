@@ -42,7 +42,7 @@ TimeoutStopSec=30
 # (nesbox leaves the window PROT_NONE until something is placed there).
 #MemoryMax=
 # A VMM that must never beat the desktop to a CPU: a lower weight, or a
-# slice of its own (SECURITY.md §20).
+# slice of its own (SECURITY.md, "Frame pacing").
 #CPUWeight=50
 PrivateNetwork=yes
 PrivateTmp=yes

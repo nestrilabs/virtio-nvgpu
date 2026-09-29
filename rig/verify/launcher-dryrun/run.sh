@@ -9,15 +9,15 @@
 # should be -- then checks the root-only refusals (no layout named, a
 # diagnostic switch without NVGPU_DIAGNOSTIC=1, a path someone else can
 # write or does not belong to root -- the launcher's pieces, rig/launcher,
-# included -- no jailer) and what the 2026-09-29 review
-# asked of it (SECURITY.md §22): root binds the backend's socket and hands it
-# over, and never gives the run's directory to the backend's user (H1); a
+# included -- no jailer) and what a root run must do (SECURITY.md, "The
+# launcher as root"): root binds the backend's socket and hands it
+# over, and never gives the run's directory to the backend's user (VD-H1); a
 # diagnostic backend flag needs NVGPU_DIAGNOSTIC=1 and is said on the
-# terminal (H3); two runs cannot share a tag (H7); a guest flooding its
-# console fills at most NVGPU_LOG_MAX_MIB (H2); guest text reaches the
-# terminal without control characters (H5); and root starts again with a
+# terminal (VD-H3); two runs cannot share a tag (VD-H7); a guest flooding its
+# console fills at most NVGPU_LOG_MAX_MIB (VD-H2); guest text reaches the
+# terminal without control characters (VD-H5); and root starts again with a
 # clean environment, and puts no library that is not root's in the VMM's jail
-# (H6). The unprivileged half checks a rig run still gets to the VMM, still
+# (VD-H6). The unprivileged half checks a rig run still gets to the VMM, still
 # kills a stale backend of its own, and says a diagnostic flag aloud.
 #
 # Usage: rig/verify/launcher-dryrun/run.sh [OLD_LAUNCHER]

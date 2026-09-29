@@ -6,8 +6,8 @@
 # to nvgpu-vmN, the group of the VM's VMM user and no one else's; the
 # directory it is in is root's. Whoever listens here receives the guest's
 # memory, so it is never the backend user's to bind, rename or replace
-# (SECURITY.md §22). The service starts it (Requires=); a connection while
-# the backend is not running starts the backend.
+# (SECURITY.md, "The backend's socket"). The service starts it
+# (Requires=); a connection while the backend is not running starts the backend.
 
 [Unit]
 Description=virtio-nvgpu vhost-user socket for VM %i

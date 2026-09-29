@@ -1133,7 +1133,7 @@ fn sys_params_and_check_version_go_as_sent_and_come_back_as_answered() {
 /// CHECK_VERSION_STR that RM fails: the guest reads RM's reply word
 /// and its version string with the errno, as nvidia.ko copies the block
 /// out on failure, and libnvidia can say which versions disagree
-/// (review 2026-09-29 2.1, parity #23). EFAULT copies nothing.
+/// EFAULT copies nothing.
 #[test]
 fn a_failed_call_comes_back_with_the_block_as_the_host_left_it() {
     use abi::ioctl::NV_ESC_CHECK_VERSION_STR;
@@ -1170,8 +1170,8 @@ fn a_failed_call_comes_back_with_the_block_as_the_host_left_it() {
 }
 
 /// The DRI section's count is of the records written: a count of every
-/// device over fewer records had the guest read the card section after
-/// them as DRI records (review 2026-09-29 2.6).
+/// device over fewer records would have the guest read the card section
+/// after them as DRI records.
 #[test]
 fn a_truncated_dri_section_counts_only_what_it_holds() {
     let dev = |name: &str| DriDevice {
@@ -1339,7 +1339,7 @@ fn each_nvidia_device_takes_only_its_own_namespace() {
     // RM's frontend and nvidia-modeset both dispatch on the number alone,
     // so a foreign type byte would reach them as one of their own
     // commands, unchecked. Each is refused with the device's own answer
-    // to a command it does not know (parity #32).
+    // to a command it does not know.
     for (h, cmd, errno) in [
         (ctl, d, libc::EINVAL),
         (ctl, m, libc::EINVAL),
@@ -1669,8 +1669,7 @@ fn the_dev_info_sizes_follow_the_card_section_in_dri_order() {
 }
 
 /// A launcher's snapshot of the whole config space extends the 64 bytes
-/// an unprivileged read gets, only if it is of the same device (parity
-/// #14).
+/// an unprivileged read gets, only if it is of the same device.
 #[test]
 fn a_pci_config_snapshot_extends_the_live_header_of_its_own_device() {
     let mut live = vec![0u8; 64];

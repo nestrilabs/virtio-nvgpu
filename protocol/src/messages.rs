@@ -862,7 +862,7 @@ pub const OP_INJECT_OPEN: u32 = 12;
 /// `(render file, id, token[0..8], token[8..16]) -> (syncobj handle)`: a
 /// syncobj the capture helper injected (IMPORT_SYNCOBJ), imported into the
 /// render file, where the guest's handle is the host's number (fences are
-/// the host's, ARCHITECTURE.md §12). -ENOENT for an id that is not a live
+/// the host's, ARCHITECTURE.md, "Fences"). -ENOENT for an id that is not a live
 /// syncobj or a token that does not match. Only with [`BCAP_INJECT`].
 pub const OP_INJECT_OPEN_SYNCOBJ: u32 = 13;
 

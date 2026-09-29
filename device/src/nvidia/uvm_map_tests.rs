@@ -246,8 +246,7 @@ impl Env {
 }
 
 /// A pool the budgets refuse is refused as UVM refuses one, in its
-/// rmStatus with the ioctl succeeding, and UVM is never asked (review
-/// 2026-09-29 parity #29).
+/// rmStatus with the ioctl succeeding, and UVM is never asked.
 #[test]
 fn a_refused_pool_says_so_in_its_rm_status() {
     let mut e = env(true);

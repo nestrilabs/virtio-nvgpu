@@ -290,8 +290,7 @@ fn memacct_and_undefined_os_unix_controls_are_answered_without_rm() {
 }
 
 /// An event's parameters too short to hold its descriptor are refused,
-/// not sent for RM to read the field from past them (review 2026-09-29
-/// 1.17).
+/// not sent for RM to read the field from past them.
 #[test]
 fn an_event_block_too_short_for_its_descriptor_never_reaches_rm() {
     let mut be = NvidiaBackend::for_test();

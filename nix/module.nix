@@ -166,7 +166,7 @@ let
       };
       inject = {
         enable = mkEnableOption ''
-          capture injection for this VM (SECURITY.md §18): the socket unit
+          capture injection for this VM (SECURITY.md, "Capture injection"): the socket unit
           vhost-user-nvgpu-inject@N.socket binds /run/nvgpu/vmN/inject.sock,
           root's and open to `helperGroup`, and hands it to the backend, which
           serves only `helperUid` there. Give every VM a helper user of its

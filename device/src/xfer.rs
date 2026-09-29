@@ -205,7 +205,7 @@ impl Hooks for DefaultHooks {}
 
 /// What `Hooks::before` does unless overridden:
 /// - fence schemas are refused until FENCES decides how each may run (waits
-///   must not park a host thread, ARCHITECTURE.md §12);
+///   must not park a host thread, ARCHITECTURE.md, "Fences");
 /// - GRANT_PERMISSIONS and REVOKE_PERMISSIONS only of type MODESET (2): a
 ///   SUB_OWNER grant blanks every head on the GPU and hands the whole device
 ///   to the grantee, and nvidia-drm never looks at the lease to scope it
@@ -248,7 +248,7 @@ pub trait Finisher {
     /// Whether what the call did may still be recorded: false once the
     /// file it ran on has closed, or the session it ran in is gone -- a
     /// record made then would outlive what it describes, or land in a
-    /// session that knows nothing of it (review 2026-09-26, backend 9).
+    /// session that knows nothing of it.
     fn records(&self) -> bool {
         true
     }
@@ -715,7 +715,8 @@ struct Walk<'a> {
     slots: Vec<Slot>,
 }
 
-/// The largest response any session negotiates (ARCHITECTURE.md §10, with indirect
+/// The largest response any session negotiates (ARCHITECTURE.md, "Protocol
+/// v2", with indirect
 /// descriptors). IN bytes are bounded by the request that carries them; OUT-
 /// only buffers are allocated on the guest's word alone, so their total is
 /// bounded here, before the transport can compare `response_len()` with its
@@ -1242,8 +1243,7 @@ impl Prepared {
     /// CTM, damage clips) none, or a blob this VM made or sees. Blob ids
     /// are the device's, and a commit of another tenant's id would make
     /// OBJ_GETPROPERTIES report it and GETPROPBLOB read it -- and a
-    /// TEST_ONLY commit alone says whether it exists and how large it is
-    /// (review 2026-09-29 1.9).
+    /// TEST_ONLY commit alone says whether it exists and how large it is.
     fn blob_usable(&self, flags: u32, value: u64) -> bool {
         flags & DRM_MODE_PROP_BLOB == 0
             || value == 0
@@ -2987,8 +2987,7 @@ mod tests {
     }
 
     /// A fence context is never re-homed: the backend's hooks ask the one
-    /// export gate before the export (exportgate.rs; review 2026-09-29,
-    /// wayland S1 and R1).
+    /// export gate before the export (exportgate.rs).
     #[test]
     fn a_fence_context_is_never_rehomed() {
         let semsurf = Arc::new(crate::semsurf::SemsurfPolicy::default());
@@ -3421,7 +3420,7 @@ mod tests {
     /// A session reset while a KMS call is still running: the call
     /// finishes on a retired file and records nothing, even though the
     /// reset forgot every record; and whatever a file did record goes with
-    /// its last reference (review 2026-09-29 1.5).
+    /// its last reference.
     #[test]
     fn a_call_finishing_after_a_reset_records_no_blob_or_framebuffer() {
         let vm = Arc::new(VmKms::new());
@@ -3506,8 +3505,8 @@ mod tests {
     /// S-6's check and the host's lookup are not one step: an RMFB of the
     /// same id on another executor in between freed it, and the kernel
     /// hands the lowest free id to the next framebuffer anyone on the host
-    /// makes -- which the flip would then show. The RMFB now waits for the
-    /// flip (review 2026-09-26, backend 5).
+    /// makes -- which the flip would then show. The RMFB waits for the
+    /// flip.
     #[test]
     fn a_framebuffer_a_call_in_flight_named_is_not_removed_under_it() {
         let mut h = h();
@@ -3566,7 +3565,7 @@ mod tests {
         assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    // ── property blobs (review 2026-09-26, backend 12) ──
+    // ── property blobs ──
 
     fn getpropblob(id: u32) -> Rq {
         Rq::new(iowr(0xac, 16)).buf(16, Some(&arg(16, &[(0, 4, id as u64)])))
@@ -3660,8 +3659,7 @@ mod tests {
     /// A blob property may be set only to none or a blob this VM made or
     /// sees: another tenant's MODE_ID committed to our own CRTC would be
     /// reported back by OBJ_GETPROPERTIES and read by GETPROPBLOB, and a
-    /// TEST_ONLY commit alone tells whether an id exists (review 2026-09-29
-    /// 1.9).
+    /// TEST_ONLY commit alone tells whether an id exists.
     #[test]
     fn a_blob_property_takes_only_a_blob_this_vm_made_or_sees() {
         let h = h();

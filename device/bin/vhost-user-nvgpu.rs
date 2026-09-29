@@ -314,7 +314,7 @@ struct Args {
     wayland_export: Option<PathBuf>,
 
     /// Accept host buffers to inject into the guest here, from a capture
-    /// helper running as `--inject-uid` (SECURITY.md §18).
+    /// helper running as `--inject-uid` (SECURITY.md, "Capture injection").
     ///
     /// A SOCK_SEQPACKET socket, bound 0600 in a private directory and
     /// renamed into place; open it to the helper's group once it exists.
@@ -571,9 +571,11 @@ impl Drop for ExportGuard {
 /// A vring that counts the times it was stopped or moved.
 ///
 /// vhost-user stops a ring with GET_VRING_BASE, which only clears `ready`
-/// (vhost-user-backend handler.rs:446-465), and virtio-queue's `add_used`
-/// does not look at `ready` at all (queue.rs:441-477); after SET_VRING_ADDR
-/// the used index is reloaded from the guest (handler.rs:386-432). So a
+/// (vhost-user-backend 0.23.0, src/handler.rs `get_vring_base`, :446-465),
+/// and virtio-queue's `add_used` does not look at `ready` at all
+/// (virtio-queue 0.18.0, src/queue.rs, :441-477); after SET_VRING_ADDR the
+/// used index is reloaded from the guest (`set_vring_addr`, handler.rs
+/// :386-432). So a
 /// completion arriving late has nothing to stop it writing a stale head into
 /// whatever ring is there now. The epoch is that stop: every state change
 /// bumps it under the ring's own write lock, and a completion compares it
@@ -797,7 +799,7 @@ impl Shared {
     /// Unwatch on one thread could reach the pump ahead of the Watch an
     /// earlier call on another made, and the pump then held its duplicate
     /// of the closed file -- a DRM master, a lease -- for as long as the
-    /// session lasted (review 2026-09-26, backend 11).
+    /// session lasts.
     fn forward_from(&self, mut be: MutexGuard<'_, NvidiaBackend>) {
         let cmds = be.take_pump_cmds();
         if cmds.is_empty() {
@@ -866,9 +868,9 @@ const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 /// EVENT_IDX, once past its `used_event`; without, unless it set
 /// VRING_AVAIL_F_NO_INTERRUPT, which virtio-queue does not read. The device
 /// SHOULD honour both (virtio 1.2 §2.7.10). An error answers yes: a missed
-/// interrupt strands a waiter, an extra one costs only time. The backend
-/// signalled every completion before, so the guest's reply-poll path took
-/// an interrupt per reply however it asked (review 2026-09-29 2.2).
+/// interrupt strands a waiter, an extra one costs only time. Signalling
+/// every completion would cost the guest's reply-poll path an interrupt per
+/// reply however it asked.
 fn wants_interrupt<M: GuestMemoryBackend>(q: &mut impl QueueT, mem: &M) -> bool {
     use vm_memory::Bytes;
     if NOTIFY_ON_EMPTY.load(Ordering::Relaxed) {
@@ -1009,7 +1011,7 @@ struct NvGpuBackend {
     /// inject accept threads -- started only once the scan is done: a peer
     /// or helper descriptor open at the scan was registered as the
     /// backend's own for good, and once closed its number, handed back by
-    /// a later IOCTL2, was refused adoption (review 2026-09-29 1.14).
+    /// a later IOCTL2, would be refused adoption.
     after_scan: Vec<AfterScan>,
     /// `--allow-compute`, for the regions GET_SHMEM_CONFIG reports.
     allow_compute: bool,
@@ -1312,7 +1314,8 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     fn features(&self) -> u64 {
         // INDIRECT_DESC lets one ring slot describe a whole table of
-        // descriptors (virtio-queue chain.rs:119-145 follows them), which is
+        // descriptors (virtio-queue 0.18.0, src/chain.rs
+        // `switch_to_indirect_table`, :119-145, follows them), which is
         // what makes 4 MiB requests possible on a 256-entry ring. Without it
         // the guest keeps to 256 KiB.
         (1 << VIRTIO_F_VERSION_1)
@@ -1359,7 +1362,8 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     /// The guest reset the device. The rings' epochs have already moved (the
-    /// handler disables every ring first, handler.rs:279-290); this ends the
+    /// handler disables every ring first: vhost-user-backend 0.23.0,
+    /// src/handler.rs `reset_device`, :279-290); this ends the
     /// session, so a rebooted guest does not find the old one's host files
     /// still open -- DRM master still held, leases still granted.
     fn reset_device(&mut self) {
@@ -2487,7 +2491,7 @@ mod tests {
 
     /// What a thread hands the pump is handed over before the backend is let
     /// go, so the next thread to take the backend cannot get its own
-    /// instructions to the pump first (review 2026-09-26, backend 11).
+    /// instructions to the pump first.
     #[test]
     fn pump_instructions_are_handed_over_before_the_backend_is_let_go() {
         let shared = Arc::new(Shared {
@@ -2607,7 +2611,7 @@ mod tests {
 
     /// The threads that open descriptors of their own start once the
     /// process's descriptors are registered, never before: what they open is
-    /// then never taken for the backend's own (review 2026-09-29 1.14).
+    /// then never taken for the backend's own.
     fn test_backend() -> NvGpuBackend {
         NvGpuBackend {
             shared: Arc::new(Shared {
@@ -2683,8 +2687,7 @@ mod tests {
     }
 
     /// The guest's interrupt suppression is honoured: without EVENT_IDX its
-    /// VRING_AVAIL_F_NO_INTERRUPT, with it its used_event (review
-    /// 2026-09-29 2.2).
+    /// VRING_AVAIL_F_NO_INTERRUPT, with it its used_event.
     #[test]
     fn a_completion_interrupts_only_a_guest_that_asked() {
         use virtio_queue::Queue;

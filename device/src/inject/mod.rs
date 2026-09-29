@@ -22,7 +22,8 @@
 //! hands it over ([`InjectServer::from_listener`];
 //! contrib/systemd/vhost-user-nvgpu-inject@.socket). The backend
 //! cannot know whether the user consented to what the helper sends: the
-//! helper uid is trusted for that, and for nothing else (SECURITY.md §18).
+//! helper uid is trusted for that, and for nothing else (SECURITY.md,
+//! "Capture injection").
 //!
 //! **What is accepted.** Each plane's descriptor must be a dma-buf
 //! (`fstatfs`'s magic), and must import into a render file of this GPU,

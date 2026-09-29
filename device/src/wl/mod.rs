@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The host side of the Wayland proxy (protocol v2, ARCHITECTURE.md §14).
+//! The host side of the Wayland proxy (protocol v2; ARCHITECTURE.md, "The
+//! Wayland proxy").
 //!
 //! A guest client's connection is one backend handle of kind `Wayland`: a
 //! [`WlConn`], which owns one connection to the host compositor and runs the

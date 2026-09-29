@@ -1606,8 +1606,7 @@ fn a_gated_call_queued_before_its_grant_was_taken_back_never_reaches_the_host() 
 /// revoked what was granted through the file (nvidia-drm's postclose, and
 /// the backend's forget_handle), and a record made after would have the
 /// backend asking about a lease that is gone for as long as it runs, or
-/// carry an old session's grant into the new one (review 2026-09-26,
-/// backend 9).
+/// carry an old session's grant into the new one.
 #[test]
 fn a_grant_that_finishes_after_its_file_closed_records_nothing() {
     for reset in [false, true] {

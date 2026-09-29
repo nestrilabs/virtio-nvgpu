@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * virtio-gpu-nv: fences (ARCHITECTURE.md §12).
+ * virtio-gpu-nv: fences (ARCHITECTURE.md, "Fences").
  *
  * Every fence object a guest process holds is the host's. A semaphore-surface
  * fence is signalled by the host's RM from a GPU interrupt, a KMS out-fence by
@@ -318,8 +318,8 @@ static void nvgpu_fence_watch_fn(struct work_struct *work) {
 
 /*
  * Start watching the proxy's host fence: once it owns its handle for good --
- * installed as a descriptor, or kept by its caller -- and not before (S5,
- * 2026-09-29). Queued while a failure could still hand the handle back, the
+ * installed as a descriptor, or kept by its caller -- and not before.
+ * Queued while a failure could still hand the handle back, the
  * WATCH could reach the backend after the caller's CLOSE of the same handle,
  * on another queue. A WATCH that fails signals the proxy with the error
  * (nvgpu_host_fence_unwatched()), sent here or from the work item alike.

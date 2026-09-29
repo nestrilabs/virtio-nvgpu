@@ -248,7 +248,8 @@ root_vmm_user() {
 # run from it.
 root_run_dir() {
     # Root's, 0711, from the start to the end of the run, and never the
-    # backend user's (the header, and SECURITY.md §22): root binds the socket
+    # backend user's (the header, and SECURITY.md, "The backend's socket"):
+    # root binds the socket
     # in it and hands it to the backend, and the backend's user -- which may
     # have other live processes -- can neither rename the binary copied here nor
     # put a socket of its own where the VMM connects. The binary is copied

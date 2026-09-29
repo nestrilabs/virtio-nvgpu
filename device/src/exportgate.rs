@@ -11,10 +11,10 @@
 //!   (wl/serve.rs `TableSend`), which hands the dma-buf to the compositor;
 //! - an IOCTL2 re-home (xfer.rs), which imports it into a KMS file.
 //!
-//! Each used to carry its own subset of the checks, and the Wayland and
-//! IOCTL2 paths missed the fence-context one, so a guest got past the
-//! 2026-09-26 fix by the second door (review 2026-09-29, wayland S1 and R1).
-//! Every path now asks [`ExportGate`], before the export and after it:
+//! One gate, so that no path can miss a check another has: separate
+//! copies of the checks once let the Wayland and IOCTL2 paths export a
+//! fence context HOST_OP refused. Every path asks [`ExportGate`], before
+//! the export and after it:
 //!
 //! - **Before:** not a fence context (0x54). A context is counted against
 //!   its file's and the session's caps only until its GEM handle closes
@@ -29,7 +29,7 @@
 //! - **After:** the dma-buf is not an injected capture buffer's, by file
 //!   identity (inject/registry.rs `Taint`). That also catches an injected
 //!   object reached through another handle. A capture buffer is the guest's
-//!   to read, never the host's to show (SECURITY.md §18).
+//!   to read, never the host's to show (SECURITY.md, "Capture injection").
 //!
 //! A refusal is EINVAL on every path.
 

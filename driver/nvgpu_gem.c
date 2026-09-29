@@ -65,8 +65,8 @@ int nvgpu_gem_wait_gone(struct nvgpu_fd *owner, u32 h) {
  * Looked up in dev->renders, which keeps a file until its last reference,
  * not in dev->fds, which loses it at release: a killed process's file is
  * released while its proxies -- held by whoever it shared buffers with --
- * live on, and a late reply naming one of their handles was taken for
- * nobody's and closed under them (S2, 2026-09-29). The xarray's lock keeps
+ * live on, and a late reply naming one of their handles would be taken for
+ * nobody's and closed under them. The xarray's lock keeps
  * the nvgpu_fd from being freed while its index is read (nvgpu_fd_put()
  * erases it under that lock first).
  */

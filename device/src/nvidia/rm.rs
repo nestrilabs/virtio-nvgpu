@@ -162,8 +162,7 @@ impl NvidiaBackend {
             // the driver before any guest call, and a library user that set
             // none (test-harness, an embedding VMM) used to learn it from
             // the guest's CHECK_VERSION_STR, whose string RM leaves as the
-            // caller sent it -- the guest chose the ABI profile (review
-            // 2026-09-29 1.15).
+            // caller sent it -- the guest chose the ABI profile.
             AbiCheck::NoProfile if self.driver.is_none() && self.unversioned_ok() => false,
             AbiCheck::NoProfile => {
                 log::warn!("escape {escape:#04x}: host driver {host} has no ABI profile");
@@ -586,8 +585,8 @@ impl NvidiaBackend {
         //
         // A block too short to hold the field is refused, as OS_UNIX's is:
         // RM would read the descriptor from past what was sent -- the zeroed
-        // slack after our buffer, descriptor 0 of this process (review
-        // 2026-09-29 1.17). -1, "no descriptor", goes as it is.
+        // slack after our buffer, descriptor 0 of this process. -1, "no
+        // descriptor", goes as it is.
         if let Some(h_class @ (0x05 | 0x79)) = class {
             let f = FdField {
                 at: 16,

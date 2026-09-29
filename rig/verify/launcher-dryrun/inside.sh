@@ -84,9 +84,9 @@ mv /rig/bin/jailer /rig/bin/jailer.away
 run run-guest.new.sh nojailer
 mv /rig/bin/jailer.away /rig/bin/jailer
 
-# ── The 2026-09-29 review (SECURITY.md §22) ──────────────────────────────────
+# ── A root run: the socket, diagnostics, tags, the console, the terminal, the environment ──
 
-echo "== new: H1: root binds the socket and hands it over; the run's directory is never the backend user's"
+echo "== new: VD-H1: root binds the socket and hands it over; the run's directory is never the backend user's"
 : > /rig/logs/ownership.log
 LINES_SHOWN=4 run run-guest.new.sh h1
 grep -a '^stub backend' /rig/logs/h1.vm0.backend.log | sed 's/^/    /'
@@ -99,30 +99,30 @@ else
     echo "  ok: the run's directory stayed root's; only the socket and the disk copy went to the slot"
 fi
 
-echo "== new: H3: a diagnostic backend flag as root, without NVGPU_DIAGNOSTIC=1"
+echo "== new: VD-H3: a diagnostic backend flag as root, without NVGPU_DIAGNOSTIC=1"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 bash /rig/run-guest.new.sh probe h3a -- \
     --permissive-abi --keep-guest-coherency 2>&1 | sed 's/^/    | /' | head -3
-echo "== new: H3: with NVGPU_DIAGNOSTIC=1, each one is said on the terminal"
+echo "== new: VD-H3: with NVGPU_DIAGNOSTIC=1, each one is said on the terminal"
 LINES_SHOWN=40 run run-guest.new.sh h3b -- -- --allow-unmeasured-release --proc-nvidia /x |
     grep -E 'exit|diagnostic flag'
 
-echo "== new: H7: a second run with a tag a live run holds"
+echo "== new: VD-H7: a second run with a tag a live run holds"
 (flock 9; sleep 4) 9>>/rig/logs/dup.vm0.json &
 sleep 0.3
 run run-guest.new.sh dup
 wait
 echo "  (a root run's files carry its slot: $(cd /rig/logs && printf '%s ' benign.vm0.*))"
 
-echo "== new: H2: a guest that floods its console, with NVGPU_LOG_MAX_MIB=1"
+echo "== new: VD-H2: a guest that floods its console, with NVGPU_LOG_MAX_MIB=1"
 LINES_SHOWN=2 run run-guest.new.sh flood NVGPU_LOG_MAX_MIB=1
 echo "  console log: $(stat -c %s /rig/logs/flood.vm0.console.log) bytes; $(grep -ac 'the console log passed NVGPU_LOG_MAX_MIB=1; the VM was stopped' /rig/logs/flood.vm0.console.log) cap line"
 
-echo "== new: H5: a verdict line with a terminal escape sequence in it"
+echo "== new: VD-H5: a verdict line with a terminal escape sequence in it"
 LINES_SHOWN=40 run run-guest.new.sh esc | grep -E 'exit|probe:'
 echo "  ESC bytes on the launcher's output: $(grep -ac $'\033' /rig/logs/esc.launcher)"
 
-echo "== new: H6: a root launcher started with LD_LIBRARY_PATH, FOO_EVIL and a PATH of the user's"
+echo "== new: VD-H6: a root launcher started with LD_LIBRARY_PATH, FOO_EVIL and a PATH of the user's"
 LINES_SHOWN=2 run run-guest.new.sh h6 FOO_EVIL=1 LD_LIBRARY_PATH=/home/user
 grep -a '^jailer stub: environment\|^jailer stub: FOO_EVIL' /rig/logs/h6.vm0.console.log | sed 's/^/    /'
-echo "== new: H6: a VMM whose libraries are not root's (/nix is uid 65534 here)"
+echo "== new: VD-H6: a VMM whose libraries are not root's (/nix is uid 65534 here)"
 LINES_SHOWN=40 run run-guest.new.sh h6lib NVGPU_VMM=/rig/bin/nesbox-dyn | grep -E 'exit|library'

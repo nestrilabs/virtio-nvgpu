@@ -882,7 +882,7 @@ pub struct OsDesc {
     uvm_ranges_warned: bool,
     /// The guest process each UVM file with recorded ranges is charged
     /// to, and how many each process has recorded: a quarter of the VM's
-    /// bound each (review 2026-09-29 1.8).
+    /// bound each.
     uvm_range_files: HashMap<u32, crate::quota::Owner>,
     uvm_ranges_by_owner: HashMap<crate::quota::Owner, usize>,
     per_file: HashMap<u32, (usize, u64)>,
@@ -1009,8 +1009,8 @@ impl OsDesc {
             "bytes for the guest process"
         } else if crate::quota::admits(
             // The separately mapped runs, a quarter each: one process's
-            // one-page runs took all of them, and every other process's
-            // registration failed (review 2026-09-29 1.8).
+            // one-page runs could otherwise take all of them, and every
+            // other process's registration fail.
             &crate::quota::Share::quarter(l.vmas_per_vm as u64, 16),
             owner,
             ovmas as u64,
@@ -1054,7 +1054,7 @@ impl OsDesc {
         // before is gone. Object 0 is no handle (RM made one it did not
         // write back): a second registration answered so must not end the
         // first while RM still pins its pages; both then live until their
-        // client goes (review 2026-09-29 1.19).
+        // client goes.
         if object != 0 {
             self.drop_key(key);
         }
@@ -1416,7 +1416,7 @@ impl OsDesc {
     /// [`OsDesc::uvm_range_made`], on a UVM file charged to guest process
     /// `owner`, which may record only its share of the VM's bound: past
     /// it, as past the VM's, the range is not recorded, and only that
-    /// process's mappings in it are affected (review 2026-09-29 1.8).
+    /// process's mappings in it are affected.
     pub(crate) fn uvm_range_made_by(
         &mut self,
         file: u32,
@@ -1702,7 +1702,7 @@ impl NvidiaBackend {
             .set_file_owner(self.current_handle, self.handles.owner(self.current_handle));
         // Over a registration budget the answer is RM's own out-of-memory
         // status at `.1` of the caller's block, the ioctl succeeding, as RM
-        // answers when it cannot pin (review 2026-09-29 parity #29): an
+        // answers when it cannot pin: an
         // errno read to libnvidia as a generic OS failure.
         enum Refused {
             Errno(i32),
@@ -1904,7 +1904,7 @@ impl NvidiaBackend {
             // A root class (NV01_ROOT and its kin) makes a new *client*
             // named hObjectNew, and RM ignores hRoot: nothing of `c` was
             // made, and forgetting `(c, o)` would release a registration RM
-            // still pins (review 2026-09-29 1.3).
+            // still pins.
             NV_ESC_RM_ALLOC
                 if r(NVOS64_STATUS) == Some(NV_OK)
                     && r(NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c)) => {}
@@ -2547,8 +2547,7 @@ mod tests {
     }
 
     /// Object 0 names nothing: a second registration keyed by it does not
-    /// end the first, and both go with their client (review 2026-09-29
-    /// 1.19).
+    /// end the first, and both go with their client.
     #[test]
     fn a_registration_under_no_handle_is_ended_by_nothing_but_its_client() {
         let ram = ram();
@@ -2667,7 +2666,7 @@ mod tests {
 
     /// One process's one-page runs, or its external ranges, take no more
     /// than a quarter of the VM's: another process still registers, and
-    /// still has its ranges recorded (review 2026-09-29 1.8).
+    /// still has its ranges recorded.
     #[test]
     fn one_process_takes_a_quarter_of_the_runs_and_the_ranges() {
         let ram = ram();
@@ -2737,9 +2736,9 @@ mod tests {
 
     /// A mapping of registered memory is held until its range is freed or
     /// its file closes, so it must lie in a range the backend recorded: a
-    /// guest calling MAP_EXTERNAL_ALLOCATION anywhere else left holds that
-    /// nothing took down, and one process that filled the VM's bound with
-    /// them refused every other's (review 2026-09-26, backend 4).
+    /// guest calling MAP_EXTERNAL_ALLOCATION anywhere else would leave
+    /// holds that nothing takes down, and one process that filled the VM's
+    /// bound with them would refuse every other's.
     #[test]
     fn a_uvm_mapping_of_registered_memory_lies_in_a_recorded_range_and_a_process_share() {
         use crate::quota::Owner;
@@ -3296,8 +3295,7 @@ mod backend_tests {
 
     /// A new client whose handle is the number of a registration's object
     /// is no new object of the registration's client: RM ignores hRoot for
-    /// the root classes, and the registration, still pinned by RM, stays
-    /// (review 2026-09-29 1.3).
+    /// the root classes, and the registration, still pinned by RM, stays.
     #[test]
     fn a_client_allocated_under_a_registrations_handle_leaves_it_registered() {
         let mut vm = vm();
@@ -3337,8 +3335,7 @@ mod backend_tests {
     }
 
     /// A registration whose reply would not fit what the guest posted is
-    /// refused before RM is asked, not after RM has pinned the pages
-    /// (review 2026-09-29 1.16).
+    /// refused before RM is asked, not after RM has pinned the pages.
     #[test]
     fn a_registration_with_no_room_for_its_reply_never_reaches_rm() {
         let mut vm = vm();
@@ -3677,7 +3674,7 @@ mod backend_tests {
             Some(&list(OSDESC_F_WRITE, &[(LOW, 3)])),
         );
         // RM's own out-of-memory answer in the caller's block, the ioctl
-        // succeeding (review 2026-09-29 parity #29).
+        // succeeding.
         assert_eq!(st, 0);
         assert_eq!(rd32(&params, NVOS32_STATUS), NV_ERR_NO_MEMORY);
         assert_eq!(
@@ -4064,7 +4061,7 @@ mod backend_tests {
     /// leave every mapping up (an RC error here) -- until its range is
     /// freed. Refused (an invalid argument), UVM made nothing, and nothing
     /// is held; outside every range this file made, UVM would refuse it,
-    /// and it never gets there (review 2026-09-26, backend 4). One of memory
+    /// and it never gets there. One of memory
     /// nothing registered is not followed; ALLOC_DEVICE_P2P of registered
     /// memory never reaches UVM.
     #[test]

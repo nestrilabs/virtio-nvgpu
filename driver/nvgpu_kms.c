@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * virtio-gpu-nv: KMS on a guest DRM file (ARCHITECTURE.md §11).
+ * virtio-gpu-nv: KMS on a guest DRM file (ARCHITECTURE.md, "A guest DRM
+ * file, and KMS").
  *
  * Every guest DRM file stands in front of a host *render* file, which owns the
  * file's GEM objects and serves its render-node ioctls. Some files also have a
@@ -1500,7 +1501,7 @@ static int nvgpu_kms_vblank_done(struct nvgpu_kms_call *kc, u8 *b0) {
   /*
    * In slices, each ending with a look at the transport: once it is dead no
    * event will complete this, and remove()'s drm_dev_unplug() waits for the
-   * ioctl to leave (S7, 2026-09-29) -- 3 s of it, or a slice of it now.
+   * ioctl to leave -- 3 s of it, or a slice of it here.
    */
   deadline = jiffies + msecs_to_jiffies(NVGPU_KMS_VBLANK_WAIT_MS);
   for (;;) {

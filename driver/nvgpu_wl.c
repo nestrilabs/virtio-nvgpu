@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * virtio-gpu-nv: the /dev/nvgpu-wl misc device, the guest end of the Wayland
- * channel (ARCHITECTURE.md §14; UAPI in uapi/nvgpu_wl.h).
+ * channel (ARCHITECTURE.md, "The Wayland proxy"; UAPI in uapi/nvgpu_wl.h).
  *
  * The guest daemon (nvgpu-wl-guest) proxies guest Wayland clients to the host
  * compositor. It parses and translates everything itself; what it cannot do

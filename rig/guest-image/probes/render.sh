@@ -66,7 +66,7 @@ if [ "$egl_ok" = 1 ]; then pass "EGL: an NVIDIA EGL display initialised"; else f
 section "CUDA"
 if [ "$(arg compute 0)" = 1 ]; then
     # Context creation needs the UVM aperture (semaphore pools) and
-    # OS-descriptor memory by guest page (ARCHITECTURE.md §5); both are
+    # OS-descriptor memory by guest page (ARCHITECTURE.md, "How memory travels"); both are
     # served with --allow-compute, so any failure is one.
     if [ -c /dev/nvidia-uvm ]; then
         pass "/dev/nvidia-uvm is there (--allow-compute)"

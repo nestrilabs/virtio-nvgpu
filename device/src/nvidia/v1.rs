@@ -281,8 +281,8 @@ pub(super) fn v1_route(
         HandleKind::Dev(DeviceKind::Gpu(_) | DeviceKind::Ctl) if ty == b'F' => Ok(V1Route::Rm),
         HandleKind::Dev(DeviceKind::Uvm | DeviceKind::UvmTools) if ty == 0 => Ok(V1Route::Uvm),
         HandleKind::Dev(DeviceKind::Modeset) if ty == b'm' => Ok(V1Route::Nvkms),
-        // Another type on an NVIDIA device gets the device's own answer
-        // (review 2026-09-29 parity #32): nvidia.ko's nv_validate_ioctls
+        // Another type on an NVIDIA device gets the device's own answer:
+        // nvidia.ko's nv_validate_ioctls
         // says EINVAL (nv.c:2488-2491), nvidia-modeset ENOTTY for any
         // command but its one (nvidia-modeset-linux.c:1953-1955), and UVM
         // ENOSYS for a command it has no route for (uvm_test.c).
@@ -334,8 +334,7 @@ impl NvidiaBackend {
         // success comes back with at least the top-level struct and nested
         // block (and a registration's 8-byte id), and one that did not fit
         // was answered ENOSPC after RM had acted -- for a registration, with
-        // the pages pinned by RM and the guest unpinning them on the error
-        // (review 2026-09-29 1.16).
+        // the pages pinned by RM and the guest unpinning them on the error.
         let least = size_of::<MsgHeader>()
             + size_of::<IoctlResp>()
             + param_in.len()
@@ -522,7 +521,7 @@ impl NvidiaBackend {
 
         // NV_ESC_SYS_PARAMS and NV_ESC_CHECK_VERSION_STR go as the guest
         // sent them, and their answers come back as the host gave them
-        // (SECURITY.md §17). SYS_PARAMS carries the caller's memory block
+        // (SECURITY.md, "Fail closed"). SYS_PARAMS carries the caller's memory block
         // size, which RM keeps from its first caller and answers EBUSY for
         // any other; this once rewrote the block and made up a success. And
         // CHECK_VERSION_STR was rewritten to query mode ('2'), in which RM
@@ -557,8 +556,7 @@ impl NvidiaBackend {
     /// out on every error but EFAULT (nv.c:2869-2878) and drm_ioctl
     /// unconditionally. So a caller reads what RM wrote before failing --
     /// CHECK_VERSION_STR's reply word and RM's own version string on a
-    /// mismatch, which libnvidia prints (review 2026-09-29 2.1, parity
-    /// #23). The guest copies bytes that come with a negative status
+    /// mismatch, which libnvidia prints. The guest copies bytes that come with a negative status
     /// (nvgpu_rmio.c).
     pub(super) fn write_v1(&self, resp_buf: &mut [u8], r: V1) -> usize {
         let (param_out, deep_len, status) = match r {

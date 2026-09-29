@@ -987,8 +987,7 @@ impl State {
         };
         // The dpyId is the guest's: a record of every one it names, with
         // no reply because the host refused them, grew without bound. Past
-        // DPY_PROBES_KEPT the ones never answered go (review 2026-09-26,
-        // backend 6); a dpy the host has answered for keeps its limit.
+        // DPY_PROBES_KEPT the ones never answered go; a dpy the host has answered for keeps its limit.
         if self.dpy_probes.len() >= DPY_PROBES_KEPT && !self.dpy_probes.contains_key(&key) {
             self.dpy_probes.retain(|_, p| p.reply.is_some());
             if self.dpy_probes.len() >= DPY_PROBES_KEPT {

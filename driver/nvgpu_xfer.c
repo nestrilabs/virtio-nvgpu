@@ -959,10 +959,10 @@ void nvgpu_close_handle_async(struct nvgpu_device *dev, u32 handle) {
 
 /*
  * A W_ARM, from a work item on the module's own unordered queue (nvgpu_wq):
- * on the transport's ordered one it waited behind every CLOSE, GEM_CLOSE,
+ * on the transport's ordered one it would wait behind every CLOSE, GEM_CLOSE,
  * MUNMAP and reaper item any process had queued -- some of them a synchronous
  * CLOSE and an osdesc reap of up to 64 HOST_OPs -- and another process's
- * GPU wake-ups came that much later (S6, 2026-09-29). Nothing orders it
+ * GPU wake-ups would come that much later. Nothing orders it
  * against a CLOSE: the item holds the file, so the CLOSE comes after it.
  *
  * An arm that fails before it reaches the backend, or is refused by it,

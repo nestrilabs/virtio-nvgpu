@@ -1001,8 +1001,8 @@ impl NvidiaBackend {
     pub(crate) fn modeset_open_refused(&self, owner: crate::quota::Owner) -> Option<String> {
         let kind = HandleKind::Dev(DeviceKind::Modeset);
         // Files still closing are still open on the host: with the closer
-        // stalled on a modeset, one process looping open/close held far
-        // more than the cap (review 2026-09-29 1.12).
+        // stalled on a modeset, one process looping open/close would hold
+        // far more than the cap.
         let (closing, closing_mine) = self.handles.closing_modesets(owner);
         let (mut open, mut mine) = (closing as usize, closing_mine as usize);
         for h in self.handles.handles() {
@@ -1321,10 +1321,10 @@ mod descriptor_field_tests;
 #[cfg(test)]
 mod share_tests;
 
-/// Where a deep block's address may go (review 2026-09-26, backend 7).
+/// Where a deep block's address may go.
 #[cfg(test)]
 mod deep_tests;
 
-/// Descriptors on their way to the closer (review 2026-09-26, backend 14).
+/// Descriptors on their way to the closer.
 #[cfg(test)]
 mod closing_tests;

@@ -41,7 +41,7 @@ fn prot(writable: bool) -> i32 {
 /// runs, and a driver that then refuses leaves a hole (mm/vma.c,
 /// `vms_abort_munmap_vmas`): another thread's mmap may land in it -- a
 /// guarded block, a malloc arena -- and the range's owner later unmaps it
-/// whole, with that inside (review 2026-09-29 1.13). So the file is mapped
+/// whole, with that inside. So the file is mapped
 /// where the kernel chooses, and moved into place with
 /// `mremap(MREMAP_FIXED)`, which replaces the old range only once the new
 /// mapping exists.
@@ -605,7 +605,7 @@ mod tests {
 
     /// A file mapping the driver refuses leaves the range as it was, not a
     /// hole another thread's mmap could land in and the owner later unmap
-    /// (review 2026-09-29 1.13). The refusal must come from the driver's
+    /// The refusal must come from the driver's
     /// own mmap, after MAP_FIXED has dropped the old range: a dma-buf
     /// mapped past its end (dma-buf.c, `dma_buf_mmap_internal`), a
     /// one-page udmabuf here, where /dev/udmabuf is open to us.

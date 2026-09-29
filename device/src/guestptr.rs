@@ -318,8 +318,7 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         }
         // The two older allocation escapes name a class too (NVOS05,
         // NVOS39, hClass at 12 in both): the refused classes are refused
-        // there as on RM_ALLOC, not left to the allowlist alone (review
-        // 2026-09-29 1.18).
+        // there as on RM_ALLOC, not left to the allowlist alone.
         NV_ESC_RM_ALLOC_OBJECT | NV_ESC_RM_ALLOC_CONTEXT_DMA2 => {
             let at = if escape == NV_ESC_RM_ALLOC_OBJECT {
                 NVOS05_H_CLASS
@@ -723,7 +722,7 @@ mod tests {
     }
 
     /// ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 name a class too, and refuse the
-    /// same ones (review 2026-09-29 1.18).
+    /// same ones.
     #[test]
     fn the_older_allocation_escapes_refuse_the_same_classes() {
         let object = ioc(IOC_RW, b'F', NV_ESC_RM_ALLOC_OBJECT, 20);
@@ -1389,7 +1388,7 @@ mod backend_tests {
     /// across a pointer RM follows (FIFO_GET_CHANNELLIST's at 8 and 16, the
     /// deep one at 12) would have RM read four bytes of the guest's and four
     /// of our address as one pointer. 12 is no pointer RM follows, so the
-    /// block is not relocated at all (review 2026-09-26, backend 7): RM
+    /// block is not relocated at all: RM
     /// reads each of its two pointers as 0, no buffer, and nothing of ours.
     #[test]
     fn a_deep_pointer_across_a_pointer_rm_follows_never_reaches_rm() {

@@ -276,14 +276,14 @@ fn making_fd(fd: RawFd, cmd: u32, bytes: &[u8], fd_out: usize) -> io::Result<Own
 /// hugetlbfs for memfds. The link text alone is a path: a process of the
 /// backend's uid with a mount namespace of its own -- an export-mode peer --
 /// could hand over a FUSE file at `/dmabuf:x`, and the backend's first read
-/// of it would wait on that process (review 2026-09-26, backend 13). A
+/// of it would wait on that process. A
 /// descriptor that is none of these is `Other`: the guest may hold it and
 /// close it, never use it.
 ///
 /// Nor may the classification itself wait on such a process: `fstat` and
 /// `fstatfs` of a FUSE file whose attribute timeout is 0 ask its server, on
 /// the server's schedule, and the classifying thread held the backend's
-/// lock (review 2026-09-29, backend 1.7). So the attributes are the cached
+/// lock. So the attributes are the cached
 /// ones (`statx` with AT_STATX_DONT_SYNC), and the filesystem is told by
 /// its device: the anonymous-inode, shmem and hugetlbfs mounts are the
 /// kernel's own, one each (per huge page size) whatever the namespace, and
@@ -1170,13 +1170,12 @@ mod tests {
 
     /// A process of the backend's uid with a mount namespace of its own --
     /// an export-mode peer -- names its files as it likes: here a plain
-    /// tmpfs file whose `/proc/self/fd` link reads `/dmabuf:x/f`. It was
-    /// classified a dma-buf; a FUSE file there would have had the backend's
-    /// first read of it wait on its maker (review 2026-09-26, backend 13).
-    /// A tmpfs file of a peer's own, at `/memfd:x` in its namespace, is no
-    /// memfd: it is not on the kernel's shmem mount. It passed as one when
-    /// the filesystem was told by `fstatfs`'s magic, which every tmpfs
-    /// shares (review 2026-09-29, backend 1.7).
+    /// tmpfs file whose `/proc/self/fd` link reads `/dmabuf:x/f`. Taken by
+    /// its link it would be a dma-buf, and a FUSE file there would have the
+    /// backend's first read of it wait on its maker. A tmpfs file of a
+    /// peer's own, at `/memfd:x` in its namespace, is no memfd: it is not on
+    /// the kernel's shmem mount, though `fstatfs`'s magic, which every tmpfs
+    /// shares, would say it is.
     #[test]
     #[cfg_attr(miri, ignore = "Miri runs no processes")]
     fn a_tmpfs_file_named_like_a_memfd_is_not_one() {

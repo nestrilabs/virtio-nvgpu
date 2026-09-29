@@ -291,7 +291,7 @@ impl NvidiaBackend {
                         log::warn!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
                         self.undo_rm_map(host_fd, &param_buf, host_p_linear);
                         // RM's out-of-memory answer, as for a refused
-                        // reservation (#29); the caller's own block.
+                        // reservation; the caller's own block.
                         let out = nvos::with_status(param_in, NVOS33_STATUS, NV_ERR_NO_MEMORY);
                         return Ok(IoctlOut::ok(out));
                     }
@@ -321,7 +321,7 @@ impl NvidiaBackend {
                 }),
         };
         // RM's statuses in the caller's own block, the ioctl succeeding, as
-        // RM answers a mapping it cannot make (#29): an errno reads to
+        // RM answers a mapping it cannot make: an errno reads to
         // libnvidia as a generic OS failure.
         if let Err(status) = placed {
             unreserve(self, Some(region));
@@ -517,7 +517,7 @@ impl NvidiaBackend {
                 // RM does not write NVOS34.pLinearAddress and nvidia.ko
                 // copies the block back, so the caller reads its own value,
                 // as on the not-found path and as L-6 did for
-                // UPDATE_DEVICE_MAPPING_INFO (review 2026-09-29 2.4).
+                // UPDATE_DEVICE_MAPPING_INFO.
                 a.value(top, NVOS34_P_LINEAR_ADDRESS, 8, Restore::Yes)?;
                 a.set_value(top, NVOS34_P_LINEAR_ADDRESS, entry.host_p_linear_address)?;
                 Ok(top)

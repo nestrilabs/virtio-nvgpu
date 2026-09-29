@@ -51,8 +51,7 @@ impl NvidiaBackend {
             && let Some(len) = le::u64_at(params, 8)
         {
             // Refused in rmStatus, 8 bytes from the block's end, the
-            // ioctl succeeding: UVM's own way to say it (review
-            // 2026-09-29 parity #29).
+            // ioctl succeeding: UVM's own way to say it.
             if let Err(errno) = self.uvm_maps.admit_pool(self.current_handle, len) {
                 let status = match errno {
                     libc::ENOMEM => NV_ERR_NO_MEMORY,
@@ -113,7 +112,7 @@ impl NvidiaBackend {
                 self.driver
             );
             // UVM's own answer to a command it has no route for (uvm.c,
-            // uvm_test_ioctl), not a permission (parity #31).
+            // uvm_test_ioctl), not a permission.
             return Err(libc::ENOSYS);
         };
         if len != c.size as usize {
@@ -290,7 +289,7 @@ impl NvidiaBackend {
     /// control file `rmCtrlFd` names, which the guest driver translated from
     /// the caller's own descriptor. So the caller holds the file the client
     /// was made on -- the file RM's strict client validation keys every
-    /// other use of that client to (§11, R3). A zero client names nothing
+    /// other use of that client to (SECURITY.md, R3). A zero client names nothing
     /// (REGISTER_GPU without a partition sends -1 and 0), and passes.
     pub(super) fn uvm_client_ok(&self, cmd: u32, params: &[u8]) -> std::result::Result<(), i32> {
         let Some(field) = crate::uvmfd::field(self.driver, cmd) else {

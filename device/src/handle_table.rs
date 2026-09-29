@@ -125,15 +125,15 @@ pub struct HandleTable {
 /// closed: still open on the host, so still counted against the table and
 /// their process's share. Refunded as a handle was removed, they were
 /// counted nowhere, and a guest process opening and closing display files
-/// while the closer waited on a modeset queued them without bound, until
-/// the backend itself ran out of descriptors -- for every process of the VM
-/// (review 2026-09-26, backend 14).
+/// while the closer waits on a modeset would queue them without bound,
+/// until the backend itself ran out of descriptors -- for every process of
+/// the VM.
 ///
 /// Counts only, never refused from: what is closing already holds a slot.
 struct Closing {
     all: Pool,
     /// Of those, modeset files, which count against the VM's and each
-    /// process's NVKMS opens too (review 2026-09-29 1.12).
+    /// process's NVKMS opens too.
     modesets: Pool,
 }
 
@@ -234,8 +234,8 @@ impl HandleTable {
         // handle in a descriptor field, where RM, UVM and the guest module
         // read it as a signed int: a handle past i32::MAX reads as a
         // negative descriptor there, and after 2^31 opens and closes every
-        // new file of the VM failed its event, fd and UVM registrations
-        // (review 2026-09-29 1.2).
+        // new file of the VM would fail its event, fd and UVM
+        // registrations.
         //
         // Terminates: at most MAX_HANDLES values are live, far fewer than
         // i32::MAX, so some candidate is free, and in practice the first
@@ -503,7 +503,7 @@ mod tests {
     }
 
     /// A handle is never negative as an i32: the guest's structs carry it
-    /// in descriptor fields read as signed ints (review 2026-09-29 1.2).
+    /// in descriptor fields read as signed ints.
     #[test]
     fn no_handle_reads_as_a_negative_descriptor() {
         let mut t = HandleTable::new();

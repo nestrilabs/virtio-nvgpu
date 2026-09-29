@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Fences on the backend: what a guest's syncobj and semaphore-surface calls
 //! may do to a host thread, and the shared wait registrations that let the
-//! guest sleep on a syncobj point without one (ARCHITECTURE.md §12).
+//! guest sleep on a syncobj point without one (ARCHITECTURE.md, "Fences").
 //!
 //! Fence objects live on the host (Design A): a guest sync_file is a proxy for
 //! a host sync_file, a guest syncobj handle *is* the host handle in the file's
@@ -618,8 +618,8 @@ impl Registrations {
         // the pump's watch looks at the descriptor once when it is armed.
         // The handle is charged to the process too: a retired
         // registration's stays open for the grace, and uncharged, a
-        // process looping on signalled points filled the table past its
-        // share (review 2026-09-29 1.6).
+        // process looping on signalled points would fill the table past
+        // its share.
         let handle = table.publish(dup, cookie, owner)?;
         if let Err(e) = host.register(
             render_fd,
@@ -1343,7 +1343,7 @@ mod tests {
         };
         let h = be.publish(hostfd::new_eventfd().unwrap(), C1, p).unwrap();
         assert_eq!(be.handles.kind(h), Some(HandleKind::Eventfd));
-        // Charged to the process that asked (review 2026-09-29 1.6).
+        // Charged to the process that asked.
         assert_eq!(be.handles.owner(h), p);
         assert_eq!(be.handles.held_by(p), 1);
         let cmds = be.take_pump_cmds();

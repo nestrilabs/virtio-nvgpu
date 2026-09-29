@@ -666,8 +666,8 @@ const PAGE_SIZE: u64 = 4096;
 
 /// `v` rounded up to a multiple of `align` (a power of two), or None when
 /// that does not fit in a u64. `v` is often a guest's number: the release
-/// profile aborts on overflow, so a plain `+` here let one app take the
-/// whole backend down (review 2026-09-29 1.1).
+/// profile aborts on overflow, so a plain `+` here would let one app take
+/// the whole backend down.
 fn align_up(v: u64, align: u64) -> Option<u64> {
     Some(v.checked_add(align - 1)? & !(align - 1))
 }
@@ -691,7 +691,7 @@ mod tests {
 
     /// A guest's length near u64::MAX is refused, not rounded past the top
     /// of a u64: the release profile aborts on overflow, and the backend
-    /// with it (review 2026-09-29 1.1).
+    /// with it.
     #[test]
     #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
     fn a_length_near_u64_max_is_refused_not_overflowed() {

@@ -565,8 +565,8 @@ pub struct Pump<Q: EventQueue> {
     /// Handles whose one-shot watch fired, with the cookie its record may
     /// still be queued under. The cookie is the guest's: without this, a
     /// guest re-watching one signalled sync_file under a fresh cookie each
-    /// time, and posting no buffers, grew the outbox by a record a watch
-    /// with no bound (review 2026-09-29 1.11).
+    /// time, and posting no buffers, would grow the outbox by a record a
+    /// watch with no bound.
     fired: HashMap<u32, u64>,
     last_sweep: Instant,
     buf: Vec<u8>,
@@ -1422,7 +1422,7 @@ mod tests {
 
     /// A guest re-watching one signalled handle under a fresh cookie each
     /// time, and posting no buffers, queues one record, not one a watch;
-    /// and closing the handle takes it (review 2026-09-29 1.11).
+    /// and closing the handle takes it.
     #[test]
     fn re_watching_a_fired_handle_under_new_cookies_queues_no_more_records() {
         let q = FakeQueue::default();

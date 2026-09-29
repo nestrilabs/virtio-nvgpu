@@ -198,9 +198,9 @@ pub(crate) struct RmMem {
     /// free takes the records of everything RM frees with it: the objects
     /// under the one freed, however deep (resource server frees a subtree),
     /// most of which -- a device, a subdevice -- hold no memory of their
-    /// own. Without it their records outlived them, a guest process freeing
-    /// devices in a loop filled `objects`, and every other process's memory
-    /// went unrecorded (review 2026-09-26, backend 19).
+    /// own. Without it their records would outlive them, a guest process
+    /// freeing devices in a loop fill `objects`, and every other process's
+    /// memory go unrecorded.
     tree: Tree,
     /// Guest file handle -> what an ALLOC_MEMORY armed on it.
     armed: HashMap<u32, Mem>,

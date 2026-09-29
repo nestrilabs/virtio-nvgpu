@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The capture helper's socket of VM N (SECURITY.md §18; DEPLOY.md, "Capture
+# The capture helper's socket of VM N (SECURITY.md and DEPLOY.md, "Capture
 # injection"): bound by systemd, root's and open to the helper's group
 # alone, and handed to vhost-user-nvgpu@N.service as the descriptor named
 # "inject". The backend serves it only for its --inject-uid (SO_PEERCRED),

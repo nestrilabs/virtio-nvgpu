@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-or-later */
 /*
  * /dev/nvgpu-capture: open a host buffer the host's capture helper injected
- * (ARCHITECTURE.md, "Capture injection"; SECURITY.md §18).
+ * (ARCHITECTURE.md, "Capture injection"; SECURITY.md, "Capture injection").
  *
  * A screen share on the host is a stream of GPU buffers. The VM's capture
  * helper on the host hands each to the virtio-nvgpu backend, which answers

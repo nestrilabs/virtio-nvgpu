@@ -116,14 +116,13 @@ struct nvgpu_pci_slot {
  * `companion`. So the bus's sysdata is a whole one, embedded here, the rest
  * of it zero.
  *
- * It used to be mirrored, and a mirror goes wrong silently. First only
- * `domain`: everything after it was read as the NUMA node -- "0000" of the
- * PCI address string, 0x30303030 -- which oopsed in ___slab_alloc as soon as
- * CONFIG_NUMA was on. Then `domain` and `node` only, with `companion`,
- * `iommu` and `fwnode` falling on the address string and the config space
- * (the 2026-09-29 review, #19): harmless while nothing matched on them, and
- * a pointer of "0x...10de" to any IRQ domain that did. The module is x86-64
- * only (Kconfig), so the arch's own type is the one to use.
+ * A mirror of it goes wrong silently. With `domain` alone, everything after
+ * it reads as the NUMA node -- "0000" of the PCI address string, 0x30303030
+ * -- which oopses in ___slab_alloc as soon as CONFIG_NUMA is on. With
+ * `domain` and `node` only, `companion`, `iommu` and `fwnode` fall on the
+ * address string and the config space: harmless while nothing matches on
+ * them, and a pointer of "0x...10de" to any IRQ domain that does. The module
+ * is x86-64 only (Kconfig), so the arch's own type is the one to use.
  */
 struct nvgpu_pci_root {
   struct pci_sysdata sd; /* bus->sysdata; container_of() gets the rest */
@@ -555,7 +554,7 @@ void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
  * exit after the driver is unregistered: destroy_workqueue() waits for an
  * item still running, so no item returns into module text after it is gone
  * -- which the system queues did not guarantee for items that hold no module
- * reference, or drop the last one (S3, 2026-09-29). nvgpu_wq: short,
+ * reference, or drop the last one. nvgpu_wq: short,
  * high-priority items (W_ARM, a fence proxy's WATCH); nvgpu_long_wq: items
  * that make round trips (a semaphore-surface wait's second half).
  */
@@ -734,7 +733,8 @@ struct drm_gem_object *nvgpu_gem_prime_import(struct drm_device *dev,
 /* ───────── nvgpu_kms.c ───────── */
 
 /*
- * The KMS side of a guest DRM file (ARCHITECTURE.md §11). A file has one if it is an
+ * The KMS side of a guest DRM file (ARCHITECTURE.md, "A guest DRM file, and
+ * KMS"). A file has one if it is an
  * adopted host lease, or a primary-node file on a backend offering card nodes
  * (NVGPU_BCAP_KMS_CARD), whose host card file is then opened lazily. Called
  * from nvgpu_drm_open() once the render handle is open; consumes a pending
@@ -823,7 +823,8 @@ struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
 /* ───────── nvgpu_fence.c, nvgpu_syncobj.c, nvgpu_semsurf.c ───────── */
 
 /*
- * Fences live on the host (ARCHITECTURE.md §12): a guest sync_file this driver makes
+ * Fences live on the host (ARCHITECTURE.md, "Fences"): a guest sync_file this
+ * driver makes
  * wraps an nvgpu host fence, a proxy dma_fence for a host sync_file that
  * signals (with the host's error, if any) when the host's does
  * (nvgpu_fence.c); the syncobj ioctls are nvgpu_syncobj.c's, the

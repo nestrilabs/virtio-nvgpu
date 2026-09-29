@@ -136,7 +136,8 @@ impl BackendHooks {
     //
     // Syncobj and nvidia-drm fence calls (policy::FENCE) and ATOMIC's fence
     // properties. Fence objects are the host's and the guest holds proxies
-    // (ARCHITECTURE.md §12), so creating, exporting, importing and signalling them is
+    // (ARCHITECTURE.md, "Fences"), so creating, exporting, importing and
+    // signalling them is
     // forwarded as it is. A wait is not: forwarded as it stands it would park
     // a host thread for as long as the guest asked, so every wait becomes a
     // poll and the guest sleeps on a shared eventfd registration instead
@@ -200,7 +201,7 @@ impl Hooks for BackendHooks {
 
     /// A re-home exports no injected object: a capture buffer is the
     /// guest's to read, never a framebuffer of the host's display
-    /// (SECURITY.md §18).
+    /// (SECURITY.md, "Capture injection").
     fn exportable(&self, dmabuf: std::os::fd::BorrowedFd<'_>) -> bool {
         self.export_gate().may_leave(dmabuf).is_ok()
     }

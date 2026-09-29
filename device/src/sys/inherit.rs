@@ -4,7 +4,8 @@
 //! `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES`, numbered from 3 up) and
 //! `--socket-fd N`. Whoever started the backend bound them -- root, or
 //! systemd -- so the backend needs no writable directory for them, and its
-//! user never owns the directory their paths are in (SECURITY.md §22).
+//! user never owns the directory their paths are in (SECURITY.md, "The
+//! backend's socket").
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
