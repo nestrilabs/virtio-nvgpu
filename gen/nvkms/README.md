@@ -9,7 +9,7 @@ DRM ioctls across the VM boundary:
 - the offset of every user pointer, every fd and every GEM handle inside those
   structs, with the rule that says when the kernel reads it and how long the
   pointee is;
-- the fields the backend's NVKMS policy has to read or rewrite (ARCHITECTURE.md §13).
+- the fields the backend's NVKMS policy has to read or rewrite (ARCHITECTURE.md, "NVKMS").
 
 This is layout **data**, not the IOCTL2 schema. The schema generator reads these
 files and turns them into schema entries. The policy (which commands are

@@ -107,7 +107,7 @@ nothing about Ampere's channel classes.
 ## The IOCTL2 schema
 
 Protocol v2 sends an ioctl whose argument points at more memory, or names a
-descriptor or a GEM handle, as one IOCTL2 (ARCHITECTURE.md §10). The guest
+descriptor or a GEM handle, as one IOCTL2 (ARCHITECTURE.md, "Protocol v2"). The guest
 gathers the caller's buffers by a table; the backend walks its own copy of the
 same table over what it received and refuses anything that disagrees. The two
 copies must never differ, so they come from one source:
@@ -280,7 +280,8 @@ asks for it:
 - **workload**: named controls and classes for NVENC, NVDEC, Vulkan Video,
   graphics and compute paths, read from gVisor nvproxy's compute, utility,
   graphics and video lists as a hint before the application pass ran them
-  (SECURITY.md §12, "Added from the application pass").
+  (SECURITY.md, "The RM allowlist", and the application pass in its
+  review history).
 
 Controls RM hands to GSP-RM without a CPU-side table -- the GSS legacy ones
 (bit 15 of the command) and every control of an NV2081_BINAPI object -- have

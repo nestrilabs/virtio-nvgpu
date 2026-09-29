@@ -140,7 +140,7 @@ loss: its time over native's, or native's rate over its.
 
 Some rows are faster in a guest. Reading host-coherent system memory is
 uncached natively (0.67 GB/s) but cached in the guest, whose memory type
-for it is write-back by design (ARCHITECTURE.md §15). `vulkaninfo` and
+for it is write-back by design (ARCHITECTURE.md, "Memory types, and coherency"). `vulkaninfo` and
 `nvidia-smi` have more to enumerate on the host. glmark2's light scenes
 (tens of thousands of frames a second, a `glFinish` each) run up to 20%
 faster in a guest, which is not explained. And 10,000 GL draws a frame
@@ -190,14 +190,14 @@ Blender's Cycles, ffmpeg and vkmark.
 **1. Six system calls a call, in the backend** (fixed). Every RM call and
 every IOCTL2 built its parameter blocks as fresh guarded mappings -- a
 `PROT_NONE` page behind a page of zeroed slack, so a driver writing past a
-block faults at once (SECURITY.md §14) -- and unmapped them afterwards.
+block faults at once (SECURITY.md, "Memory safety") -- and unmapped them afterwards.
 `strace -c` of the backend serving 21,003 RM controls counted 42,019
 `mmap`, 42,008 `mprotect` and 42,006 `munmap` beside the 21,003 `ioctl`s,
 and in a process of many threads every `munmap` is a TLB shootdown. The
 backend took **10.2 µs** to serve an RM control the host driver answers in
 1.4 (`bench_rm_control_service`, a test that drives the real driver through
 the backend's own dispatch). Small blocks now come from a bounded pool,
-zeroed through their reach with the guard intact (SECURITY.md §21): **2.6
+zeroed through their reach with the guard intact (SECURITY.md, "Memory safety"): **2.6
 µs**. Every figure that crosses moved with it, a presented frame most of
 all, since it is a dozen IOCTL2s.
 
@@ -209,7 +209,7 @@ bare guest writing such a mapping (a small KVM program of our own), count
 the VMM at once, but into the guest's nested page tables one fault at a
 time. Both VMMs now prefault each placement with `KVM_PRE_FAULT_MEMORY`
 from a spare vCPU that never runs, 0.13 µs a page, after answering it
-(SECURITY.md §21). A fresh device-local mapping is now written at the host's
+(SECURITY.md, "Prefaulting the window"). A fresh device-local mapping is now written at the host's
 speed. System memory is prefaulted the same way, but the call maps as a
 read fault would, and KVM maps the driver's system memory read-only on a
 read fault: a guest's first **read** of it is now free, its first **write**
@@ -222,7 +222,7 @@ offers no call for, would change that.
 as an interrupt: the host signalled an eventfd, KVM injected, the guest's
 handler took the reply off the ring. Now, while callers spin and none sleeps,
 the spinners take replies off the ring themselves with the control queue's
-interrupt off; a caller that sleeps turns it back on first (SECURITY.md §21).
+interrupt off; a caller that sleeps turns it back on first (SECURITY.md, "Frame pacing").
 Three runs each, the same backend: an RM control from a guest 4.7 -> 3.4 µs,
 a mailbox Vulkan client +30%.
 
@@ -232,7 +232,7 @@ compositor: four times in the guest daemon, into the transport, out of it,
 into the compositor's memfd. Two of the daemon's are gone (266 frames a
 second before, 273-289 across the runs after). The rest
 is the design: a guest's pool is guest RAM, which the host compositor
-cannot map (ARCHITECTURE.md §14), so its pixels must travel, and a 4 MiB
+cannot map (ARCHITECTURE.md, "The Wayland proxy"), so its pixels must travel, and a 4 MiB
 frame is about 0.5 ms of the backend's queue thread.
 
 **5. The floor of a crossing.** A request that does almost nothing on the
@@ -256,7 +256,7 @@ they cost natively.
 
 **7. Placing memory is the VMM's** (inherent). Every CPU mapping of GPU
 memory is a request to the VMM, which owns guest physical space
-(ARCHITECTURE.md §5); every unmap is another, with a nested-page-table
+(ARCHITECTURE.md, "How memory travels"); every unmap is another, with a nested-page-table
 invalidation and a TLB shootdown of every vCPU before RM may free the
 memory. A 2 MiB map, touch and unmap costs a guest about 3 times what it
 costs natively; allocating and mapping 1 MiB of host-visible Vulkan memory,
@@ -278,7 +278,7 @@ answer never share a core. With `--core-scheduling=false`
 (`NVGPU_CROSVM_CORE_SCHED=0`, two runs, the same build) a mailbox Vulkan
 client went from 2,755 to 4,962 fps ("clear") and from 3,219 to 5,954
 ("cube"). That is a security trade for the deployment to make (DEPLOY.md,
-"Frame pacing"; SECURITY.md §20); the default stays. crosvm also does not prefault guest RAM: a guest's first
+"Frame pacing"; SECURITY.md, "Frame pacing"); the default stays. crosvm also does not prefault guest RAM: a guest's first
 touch of its own memory runs at 0.4 GB/s against nesbox's 8
 (`--hugepages` made no difference).
 

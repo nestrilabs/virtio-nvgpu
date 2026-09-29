@@ -1,7 +1,7 @@
 # Host compositor patches
 
 A guest reaches the host display through `wp_drm_lease_device_v1` (the lease mode: README, "Display";
-ARCHITECTURE.md §11): the host compositor leases a connector, its CRTC and planes, and the guest drives
+ARCHITECTURE.md, "A guest DRM file, and KMS"): the host compositor leases a connector, its CRTC and planes, and the guest drives
 them through the lease fd. Stock Hyprland only leases outputs the kernel marks non-desktop (VR headsets),
 so these patches let it lease a normal monitor too.
 
@@ -95,7 +95,7 @@ patch changes no headers, so the ABI is unchanged.
 `crosvm/` is a series of ten patches against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets
 crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; rig/TESTING-RIG.md,
 "crosvm"). All ten have run on an RTX 5090, graphics and compute, the frontend jailed; `0007` and `0010`
-were changed by the 2026-09-29 review (SECURITY.md §22) after that run, and `scripts/ci.sh deploy` checks
+were changed by the 2026-09-29 review (SECURITY.md, Appendix A) after that run, and `scripts/ci.sh deploy` checks
 that the series still applies:
 
 | Patch | What it does |
@@ -109,13 +109,13 @@ that the series still applies:
 | `0007-vm_control-hold-virtio-nvgpu-s-memory-tubes-and-map-.patch` | the main process holds virtio-nvgpu's two memory tubes to what the device needs, against the BAR layout it made itself (`vm_control::sys::linux::nvgpu`): the shared memory tube prepares only the window, maps only NVIDIA (major 195) and DRM (226) descriptors into it, opened to match, page-aligned, inside it, not overlapping, at most 16,384, and unmaps only its own; the ioevent tube registers ioevents only, at the device's own queue notification addresses. New requests `RegisterUvmPool`/`UnregisterUvmPool` place a UVM semaphore pool at the host address its file offset names, in [4 GiB, 32 TiB), from `/dev/nvidia-uvm` (major from `/proc/devices`, minor 0; no major, no pool) opened read-write, from a file whose `mincore` the kernel answers for crosvm, inside the aperture, not overlapping, at most 64 MiB, 64 pools and 256 MiB per device, pages checked with `mincore` before the slot; slot removed before the mapping; all withdrawn when the tube goes. `reserve_uvm_band` reserves the band `PROT_NONE` so pools are mapped over crosvm's own reservation only (UVM refuses an mremap'd mapping); a range a failed placement leaves unknown is never used again. Unit tests for every check |
 | `0008-devices-virtio-nvgpu-s-UVM-aperture-in-the-window-s-.patch` | more than one shared memory region per virtio-pci device (`VirtioDevice::get_extra_shared_memory_regions`, empty by default), each with its own capability at its own offset of the one BAR; the transport reports the layout, and the queue notification addresses, to the main process. The nvgpu frontend takes regions by id and publishes region 2, the UVM aperture, when the backend reports it (`--allow-compute`), checks each pool itself first and sends it as `RegisterUvmPool`; crosvm wires the restricted tubes, and reserves the band at the start of `run_config` when a device is of type nvgpu |
 | `0009-devices-run-the-nvgpu-vhost-user-frontend-in-a-jaile.patch` | with the sandbox on, the nvgpu vhost-user frontend runs in a minijail'd process of its own under `vhost_user_frontend_device.policy` (common device syscalls, `getrandom`, `prctl` names; `open` refused; no socket, no ioctl beyond vmm-swap's); a test forks the real frontend under the embedded policy against a fake backend and main process; `run --help` names the `nvgpu-uvm-aperture` for the launcher to detect. Other vhost-user types keep upstream's in-process frontend. No virtio device's control tube may ask for a hot-plug |
-| `0010-vm_control-prefault-virtio-nvgpu-s-window-mappings.patch` | the main process prefaults each window mapping it has made (`KVM_PRE_FAULT_MEMORY`, Linux 6.11 or later) through one spare vCPU that never runs, made only for an nvgpu device and only when KVM has the capability, before the guest's vCPUs, with an id past every guest vCPU's (so past every APIC id the ACPI tables list, `--host-cpu-topology` included); a hint on a thread of its own with a 1,024-range queue, which stops for good at the first ENOSYS, ENOTTY or EOPNOTSUPP. Performance only: without it the guest faults the pages in itself (SECURITY.md §21) |
+| `0010-vm_control-prefault-virtio-nvgpu-s-window-mappings.patch` | the main process prefaults each window mapping it has made (`KVM_PRE_FAULT_MEMORY`, Linux 6.11 or later) through one spare vCPU that never runs, made only for an nvgpu device and only when KVM has the capability, before the guest's vCPUs, with an id past every guest vCPU's (so past every APIC id the ACPI tables list, `--host-cpu-topology` included); a hint on a thread of its own with a 1,024-range queue, which stops for good at the first ENOSYS, ENOTTY or EOPNOTSUPP. Performance only: without it the guest faults the pages in itself (SECURITY.md, "Prefaulting the window") |
 
 To apply and build: the top of `rig/rig-build-crosvm.sh` (`CROSVM_SRC`, `CROSVM_OUT` build another
 checkout to another binary). `0001`-`0006` are graphics only, with the frontend in crosvm's main process
 as upstream has it; `0007`-`0009` add compute and jail the frontend, and change no other device's
 seccomp policy or minijail setting; `0010` is optional, for speed. What the main process checks:
-SECURITY.md §16.
+SECURITY.md, "The VMMs".
 
 ## Why each VMM carries its own checks
 
