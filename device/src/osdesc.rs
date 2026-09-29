@@ -980,10 +980,8 @@ impl OsDesc {
         let owner = self.file_owners.get(&file).copied().unwrap_or_default();
         let (oregs, obytes, ovmas) = self.per_owner.get(&owner).copied().unwrap_or((0, 0, 0));
         let in_use = (self.regs.len() + self.released.len()) as u64;
-        let share = |per_file: u64, per_vm: u64| crate::quota::Share {
-            per_owner: per_file,
-            reserve: per_vm / 16,
-            floor: per_vm / 64,
+        let share = |per_file: u64, per_vm: u64| {
+            crate::quota::Share::custom(per_file, per_vm / 16, per_vm / 64)
         };
         let why = if crate::quota::admits(
             &share(l.regs_per_file as u64, l.regs_per_vm as u64),

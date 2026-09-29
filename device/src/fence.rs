@@ -64,7 +64,7 @@ use crate::le;
 use crate::nvidia::NvidiaBackend;
 use crate::privfd::PrivateFd;
 use crate::pump::{PumpCmd, WatchMode};
-use crate::quota::{Ledger, Owner, Share};
+use crate::quota::{Charge, Owner, Pool, Share};
 use crate::sys::block::{Arena, BufId};
 use crate::xfer::Errno;
 
@@ -277,8 +277,9 @@ struct Reg {
     /// An orphan no handle names any more (its DESTROY ran, or its file
     /// closed): the numbers in its key may be another syncobj's or file's.
     detached: bool,
-    /// The guest process it is charged to.
-    owner: Owner,
+    /// Its slot, charged to the guest process that made it, given back
+    /// when it is dropped.
+    _charge: Charge,
     cookie: u64,
     /// The eventfd's handle, which the pump watches.
     handle: u32,
@@ -302,10 +303,8 @@ pub struct Registrations {
     /// only swept once fired; they keep their cap slot until then, since
     /// the kernel entry does too.
     orphans: Vec<Reg>,
-    cap: usize,
-    /// Each guest process's part of it, orphans included.
-    share: Share,
-    held: Ledger,
+    /// The cap, and each guest process's part of it, orphans included.
+    slots: Pool,
     /// Handles of fired registrations, closed once [`RETIRE_GRACE`] has
     /// passed. Bounded by how fast registrations fire.
     retired: VecDeque<(u32, Instant)>,
@@ -340,13 +339,14 @@ impl Registrations {
         Self {
             regs: HashMap::new(),
             orphans: Vec::new(),
-            cap,
-            share: if cap == REGISTRATION_CAP {
-                REGISTRATION_SHARE
-            } else {
-                Share::quarter(cap as u64, 1)
-            },
-            held: Ledger::default(),
+            slots: Pool::new(
+                cap as u64,
+                if cap == REGISTRATION_CAP {
+                    REGISTRATION_SHARE
+                } else {
+                    Share::quarter(cap as u64, 1)
+                },
+            ),
             retired: VecDeque::new(),
             grace: RETIRE_GRACE,
             exported: HashSet::new(),
@@ -356,7 +356,7 @@ impl Registrations {
 
     /// What guest process `o` holds, orphans included.
     pub fn held_by(&self, o: Owner) -> u64 {
-        self.held.held(o)
+        self.slots.held(o)
     }
 
     /// Whether syncobj handle `syncobj` of render handle `render` can only
@@ -442,7 +442,6 @@ impl Registrations {
     /// syncobj file with them, which may free the syncobj and its kernel
     /// entries), its handle after the grace, as a fired one's.
     fn drop_reg(&mut self, r: Reg, now: Instant) {
-        self.held.refund(r.owner, 1);
         self.retired.push_back((r.handle, now));
     }
 
@@ -580,23 +579,25 @@ impl Registrations {
             // and, worse, retire one another's guest bookkeeping.
             return Err(libc::EINVAL);
         }
-        let admits = |r: &Self| {
-            r.held
-                .admits(&r.share, owner, 1, r.len() as u64, r.cap as u64)
-        };
-        if admits(self).is_err() {
-            self.sweep();
-            if let Err(why) = admits(self) {
-                log::warn!(
-                    "syncobj wait registrations: guest process {owner:?} holds {}, the VM {} of {} \
-                     ({why:?}); it polls instead",
-                    self.held.held(owner),
-                    self.len(),
-                    self.cap
-                );
-                return Err(libc::EAGAIN);
+        let charge = match self.slots.try_take(owner, 1) {
+            Ok(c) => c,
+            Err(_) => {
+                self.sweep();
+                match self.slots.try_take(owner, 1) {
+                    Ok(c) => c,
+                    Err(why) => {
+                        log::warn!(
+                            "syncobj wait registrations: guest process {owner:?} holds {}, the \
+                             VM {} of {} ({why:?}); it polls instead",
+                            self.slots.held(owner),
+                            self.len(),
+                            self.slots.size()
+                        );
+                        return Err(libc::EAGAIN);
+                    }
+                }
             }
-        }
+        };
 
         // The kernel's only EINVAL here is a handle the file does not have
         // (drm_syncobj.c:694); SYNCOBJ_EVENTFD itself says ENOENT for that
@@ -630,13 +631,12 @@ impl Registrations {
             table.retire(handle);
             return Err(errno(&e));
         }
-        self.held.charge(owner, 1);
         self.regs.insert(
             key,
             Reg {
                 key,
                 detached: false,
-                owner,
+                _charge: charge,
                 cookie,
                 handle,
                 eventfd,
@@ -664,14 +664,12 @@ impl Registrations {
             .partition(|r| fired(r.eventfd.as_raw_fd()));
         self.orphans = live;
         for r in fired_orphans {
-            self.held.refund(r.owner, 1);
             self.retired.push_back((r.handle, now));
         }
     }
 
     fn retire(&mut self, key: &RegKey) {
         if let Some(r) = self.regs.remove(key) {
-            self.held.refund(r.owner, 1);
             self.retired.push_back((r.handle, Instant::now()));
         }
     }
@@ -696,7 +694,6 @@ impl Registrations {
         self.regs.clear();
         self.orphans.clear();
         self.retired.clear();
-        self.held.clear();
         self.exported.clear();
         self.importers.clear();
     }

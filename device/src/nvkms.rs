@@ -114,11 +114,8 @@ pub const MAX_MODESET_OPENS: usize = 64;
 /// the compositor and every EGL and Vulkan window-system path without one.
 /// A process holds at most 16, and the last 8 are kept for processes that
 /// hold at most 2.
-pub const MODESET_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: 16,
-    reserve: 8,
-    floor: 2,
-};
+pub const MODESET_SHARE: crate::quota::Share = crate::quota::Share::custom(16, 8, 2);
+const _: () = assert!(MODESET_SHARE.fits(MAX_MODESET_OPENS as u64));
 
 // NvKmsPermissionsType (nvkms-api.h) and nvidia-drm's own
 // (nv_drm_common_ioctl.h: MODESET 2, SUB_OWNER 3).

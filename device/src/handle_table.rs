@@ -52,11 +52,10 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex};
 
 use crate::error::{DeviceError, Result};
 use crate::hostfd::HandleKind;
-use crate::quota::{Ledger, Owner, Share};
+use crate::quota::{Charge, Over, Owner, Pool, Share};
 
 /// Most handles one session may hold at once.
 ///
@@ -103,8 +102,8 @@ struct Entry {
     kind: HandleKind,
     /// The host file was closed under the guest (`bury`).
     buried: bool,
-    /// The guest process it is charged to.
-    owner: Owner,
+    /// Its slot, charged to the guest process that caused it.
+    slot: Charge,
 }
 
 /// The largest handle issued: a descriptor field read as an i32 must not
@@ -115,12 +114,11 @@ pub struct HandleTable {
     /// Where the search for the next free value starts.
     next: u32,
     table: HashMap<u32, Entry>,
-    limit: usize,
-    /// What each guest process holds, and how much it may.
-    held: Ledger,
-    share: Share,
+    /// The table's slots, and each guest process's share of them: one for
+    /// every handle, and one for every descriptor still closing.
+    slots: Pool,
     /// Descriptors let go of here and handed to the closer, not yet closed.
-    closing: Arc<Mutex<Closing>>,
+    closing: Closing,
 }
 
 /// Descriptors the table let go of that the closer (closer.rs) has not yet
@@ -130,41 +128,37 @@ pub struct HandleTable {
 /// while the closer waited on a modeset queued them without bound, until
 /// the backend itself ran out of descriptors -- for every process of the VM
 /// (review 2026-09-26, backend 14).
-#[derive(Default)]
+///
+/// Counts only, never refused from: what is closing already holds a slot.
 struct Closing {
-    held: Ledger,
-    total: u64,
+    all: Pool,
     /// Of those, modeset files, which count against the VM's and each
     /// process's NVKMS opens too (review 2026-09-29 1.12).
-    modeset_held: Ledger,
-    modeset_total: u64,
+    modesets: Pool,
 }
 
 impl Closing {
-    fn lock(c: &Mutex<Closing>) -> std::sync::MutexGuard<'_, Closing> {
-        c.lock().unwrap_or_else(|e| e.into_inner())
+    fn new() -> Self {
+        let count = || Pool::new(u64::MAX, Share::custom(u64::MAX, 0, 0));
+        Closing {
+            all: count(),
+            modesets: count(),
+        }
     }
 }
 
 /// A descriptor on its way to the closer, still counted: `item` is dropped
-/// (closed) first, then the count goes.
+/// (closed) first, then its slot goes, then the closing counts.
 pub struct Closed<T> {
     item: Option<T>,
-    closing: Arc<Mutex<Closing>>,
-    owner: Owner,
-    modeset: bool,
+    _slot: Charge,
+    _closing: Charge,
+    _modeset: Option<Charge>,
 }
 
 impl<T> Drop for Closed<T> {
     fn drop(&mut self) {
         drop(self.item.take());
-        let mut c = Closing::lock(&self.closing);
-        c.held.refund(self.owner, 1);
-        c.total = c.total.saturating_sub(1);
-        if self.modeset {
-            c.modeset_held.refund(self.owner, 1);
-            c.modeset_total = c.modeset_total.saturating_sub(1);
-        }
     }
 }
 
@@ -179,10 +173,8 @@ impl HandleTable {
         Self {
             next: 1,
             table: HashMap::new(),
-            limit,
-            held: Ledger::default(),
-            share: Self::share_of(limit),
-            closing: Arc::default(),
+            slots: Pool::new(limit as u64, Self::share_of(limit)),
+            closing: Closing::new(),
         }
     }
 
@@ -193,12 +185,11 @@ impl HandleTable {
     /// Change the limit (from the backend's RLIMIT_NOFILE at start). Handles
     /// already issued stay; a lower limit refuses new ones until enough go.
     pub fn set_limit(&mut self, limit: usize) {
-        self.limit = limit;
-        self.share = Self::share_of(limit);
+        self.slots.resize(limit as u64, Self::share_of(limit));
     }
 
     pub fn limit(&self) -> usize {
-        self.limit
+        self.slots.size() as usize
     }
 
     /// Take ownership of `fd` and issue a handle for it, charged to no
@@ -218,32 +209,27 @@ impl HandleTable {
         kind: HandleKind,
         owner: Owner,
     ) -> std::result::Result<u32, TableFull> {
-        let (closing, closing_total) = {
-            let c = Closing::lock(&self.closing);
-            (c.held.held(owner), c.total)
-        };
-        if let Err(why) = crate::quota::admits(
-            &self.share,
-            owner,
-            self.held.held(owner) + closing,
-            1,
-            self.table.len() as u64 + closing_total,
-            self.limit as u64,
-        ) {
-            if why != crate::quota::Over::Pool {
-                log::warn!(
-                    "handle table: guest process {owner:?} holds {} of {} handles, {closing} \
-                     more still closing ({why:?}); refusing a {kind:?}",
-                    self.held.held(owner),
-                    self.limit
-                );
-            } else if closing_total > 0 {
-                log::warn!(
-                    "handle table: full, {closing_total} of it still closing; refusing a {kind:?}"
-                );
+        let slot = match self.slots.try_take(owner, 1) {
+            Ok(slot) => slot,
+            Err(why) => {
+                let (closing, closing_total) =
+                    (self.closing.all.held(owner), self.closing.all.in_use());
+                if why != Over::Pool {
+                    log::warn!(
+                        "handle table: guest process {owner:?} holds {} of {} handles, \
+                         {closing} more still closing ({why:?}); refusing a {kind:?}",
+                        self.slots.held(owner).saturating_sub(closing),
+                        self.limit()
+                    );
+                } else if closing_total > 0 {
+                    log::warn!(
+                        "handle table: full, {closing_total} of it still closing; refusing a \
+                         {kind:?}"
+                    );
+                }
+                return Err(TableFull);
             }
-            return Err(TableFull);
-        }
+        };
         // Handles are issued in [1, i32::MAX]. The guest's structs carry a
         // handle in a descriptor field, where RM, UVM and the guest module
         // read it as a signed int: a handle past i32::MAX reads as a
@@ -266,10 +252,9 @@ impl HandleTable {
                     fd,
                     kind,
                     buried: false,
-                    owner,
+                    slot,
                 },
             );
-            self.held.charge(owner, 1);
             return Ok(h);
         }
     }
@@ -296,12 +281,22 @@ impl HandleTable {
     /// The guest process `handle` is charged to; `Unknown` for none, or no
     /// such handle.
     pub fn owner(&self, handle: u32) -> Owner {
-        self.table.get(&handle).map_or(Owner::Unknown, |e| e.owner)
+        self.table
+            .get(&handle)
+            .map_or(Owner::Unknown, |e| e.slot.owner())
     }
 
-    /// Handles `owner` holds.
+    /// Handles `owner` holds, not counting its descriptors still closing
+    /// (none are charged to an unknown owner).
+    #[cfg(test)]
     pub fn held_by(&self, owner: Owner) -> u64 {
-        self.held.held(owner)
+        if owner == Owner::Unknown {
+            return 0;
+        }
+        self.table
+            .values()
+            .filter(|e| e.slot.owner() == owner)
+            .count() as u64
     }
 
     /// A duplicate of the descriptor, `O_CLOEXEC`, so a call can keep using
@@ -347,25 +342,18 @@ impl HandleTable {
     /// table and `owner`'s share until it is dropped.
     pub fn closing<T>(&self, item: T, owner: Owner, kind: HandleKind) -> Closed<T> {
         let modeset = kind == HandleKind::Dev(protocol::messages::DeviceKind::Modeset);
-        let mut c = Closing::lock(&self.closing);
-        c.held.charge(owner, 1);
-        c.total += 1;
-        if modeset {
-            c.modeset_held.charge(owner, 1);
-            c.modeset_total += 1;
-        }
         Closed {
             item: Some(item),
-            closing: self.closing.clone(),
-            owner,
-            modeset,
+            _slot: self.slots.hold(owner, 1),
+            _closing: self.closing.all.hold(owner, 1),
+            _modeset: modeset.then(|| self.closing.modesets.hold(owner, 1)),
         }
     }
 
     /// Modeset files still closing: the VM's, and `owner`'s.
     pub fn closing_modesets(&self, owner: Owner) -> (u64, u64) {
-        let c = Closing::lock(&self.closing);
-        (c.modeset_total, c.modeset_held.held(owner))
+        let m = &self.closing.modesets;
+        (m.in_use(), m.held(owner))
     }
 
     /// Remove `handle`, returning its descriptor (which closes when dropped).
@@ -374,7 +362,7 @@ impl HandleTable {
             .table
             .remove(&handle)
             .ok_or(DeviceError::BadHandle(handle as u64))?;
-        self.held.refund(e.owner, 1);
+        // Its slot goes with the entry.
         Ok((e.fd, e.kind))
     }
 
@@ -393,7 +381,6 @@ impl HandleTable {
         if count > 0 {
             log::info!("HandleTable::drain_all: closing {count} host fds");
         }
-        self.held.clear();
         for (handle, e) in self.table.drain() {
             log::debug!(
                 "  closing handle={handle} ({:?}) host_fd={}",

@@ -86,16 +86,10 @@ pub const POOL_BYTES_PER_FILE: u64 = 256 << 20;
 pub const POOL_BYTES_PER_VM: u64 = 1 << 30;
 /// A guest process's share of placements, of their bytes, of recorded
 /// pools and of their bytes (quota.rs, B5).
-pub const MAPS_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: MAPS_PER_FILE as u64,
-    reserve: 8,
-    floor: 2,
-};
-pub const BYTES_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: BYTES_PER_FILE,
-    reserve: 32 << 20,
-    floor: 8 << 20,
-};
+pub const MAPS_SHARE: crate::quota::Share = crate::quota::Share::custom(MAPS_PER_FILE as u64, 8, 2);
+pub const BYTES_SHARE: crate::quota::Share =
+    crate::quota::Share::custom(BYTES_PER_FILE, 32 << 20, 8 << 20);
+const _: () = assert!(MAPS_SHARE.fits(MAPS_PER_VM as u64) && BYTES_SHARE.fits(BYTES_PER_VM));
 pub const RANGES_SHARE: crate::quota::Share =
     crate::quota::Share::quarter(RANGES_PER_VM as u64, 16);
 pub const POOL_BYTES_SHARE: crate::quota::Share =

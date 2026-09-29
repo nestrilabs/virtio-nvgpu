@@ -98,11 +98,8 @@ pub const CTX_CAP_PER_SESSION: usize = 256;
 /// process holds at most 96, and the session's last 32 are kept for
 /// processes holding at most 16 -- so one that has its 96 cannot take
 /// another's first device's worth.
-pub const CTX_SHARE: crate::quota::Share = crate::quota::Share {
-    per_owner: 96,
-    reserve: 32,
-    floor: 16,
-};
+pub const CTX_SHARE: crate::quota::Share = crate::quota::Share::custom(96, 32, 16);
+const _: () = assert!(CTX_SHARE.fits(CTX_CAP_PER_SESSION as u64));
 /// `NV_EVENT_BUFFER`, and where its `notificationHandle` sits.
 pub const NV_EVENT_BUFFER: u32 = 0x90cd;
 const EVENT_BUFFER_NOTIFICATION_AT: usize = 40;

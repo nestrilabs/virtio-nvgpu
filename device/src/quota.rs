@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use protocol::messages::ProcId;
 
@@ -78,6 +79,24 @@ pub struct Share {
 }
 
 impl Share {
+    /// A split written out: at most `per_owner` to one owner, and the last
+    /// `reserve` units only to owners holding at most `floor`. A constant
+    /// made with it is checked against its pool with [`Share::fits`].
+    pub const fn custom(per_owner: u64, reserve: u64, floor: u64) -> Self {
+        Share {
+            per_owner,
+            reserve,
+            floor,
+        }
+    }
+
+    /// Whether this split means what it says of a pool of `size`: a share
+    /// and a reserve within the pool, and a floor within a share (above it,
+    /// the floor would say nothing: `per_owner` is checked first).
+    pub const fn fits(&self, size: u64) -> bool {
+        self.per_owner <= size && self.reserve <= size && self.floor <= self.per_owner
+    }
+
     /// The split every pool here uses unless it says otherwise: an owner
     /// takes at most a quarter of the pool, and the last sixteenth is kept
     /// for owners holding at most a sixty-fourth of it (at least `min_floor`,
@@ -224,6 +243,117 @@ impl Ledger {
     }
 }
 
+/// A pool of `size` units split among owners by a [`Share`], and what is
+/// taken of it.
+///
+/// What is taken is a [`Charge`], given back when the charge is dropped: it
+/// lives in whatever holds the resource -- a table entry, a registration, a
+/// descriptor on its way to be closed -- and goes when that does, on every
+/// path that ends it, a session's reset included. A charge may be dropped
+/// on another thread than the pool's (the closer's), so the counts are
+/// behind a lock of their own, which nothing holds while it calls out.
+#[derive(Debug)]
+pub struct Pool {
+    counts: Arc<Mutex<Counts>>,
+}
+
+#[derive(Debug)]
+struct Counts {
+    size: u64,
+    share: Share,
+    /// Every unit taken, an unknown owner's included.
+    in_use: u64,
+    held: Ledger,
+}
+
+fn lock(c: &Mutex<Counts>) -> MutexGuard<'_, Counts> {
+    c.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Pool {
+    pub fn new(size: u64, share: Share) -> Self {
+        Pool {
+            counts: Arc::new(Mutex::new(Counts {
+                size,
+                share,
+                in_use: 0,
+                held: Ledger::default(),
+            })),
+        }
+    }
+
+    /// A new size and split. What is taken stays taken: a pool made smaller
+    /// than that refuses until enough is given back.
+    pub fn resize(&self, size: u64, share: Share) {
+        let mut c = lock(&self.counts);
+        c.size = size;
+        c.share = share;
+    }
+
+    pub fn size(&self) -> u64 {
+        lock(&self.counts).size
+    }
+
+    /// Units taken, by every owner.
+    pub fn in_use(&self) -> u64 {
+        lock(&self.counts).in_use
+    }
+
+    /// Units `o` holds.
+    pub fn held(&self, o: Owner) -> u64 {
+        lock(&self.counts).held.held(o)
+    }
+
+    /// `n` units for `o`, if the pool and `o`'s share admit them.
+    pub fn try_take(&self, o: Owner, n: u64) -> Result<Charge, Over> {
+        let mut c = lock(&self.counts);
+        c.held.admits(&c.share, o, n, c.in_use, c.size)?;
+        Ok(self.charge(&mut c, o, n))
+    }
+
+    /// `n` units `o` holds whatever the pool says -- a descriptor still
+    /// open on the host, which has to be counted to be bounded -- counted
+    /// without asking.
+    pub fn hold(&self, o: Owner, n: u64) -> Charge {
+        let mut c = lock(&self.counts);
+        self.charge(&mut c, o, n)
+    }
+
+    fn charge(&self, c: &mut Counts, o: Owner, n: u64) -> Charge {
+        c.in_use = c.in_use.saturating_add(n);
+        c.held.charge(o, n);
+        Charge {
+            counts: self.counts.clone(),
+            owner: o,
+            n,
+        }
+    }
+}
+
+/// Units taken of a [`Pool`], given back when this is dropped.
+#[must_use = "a charge dropped at once gives its units straight back"]
+#[derive(Debug)]
+pub struct Charge {
+    counts: Arc<Mutex<Counts>>,
+    owner: Owner,
+    n: u64,
+}
+
+impl Charge {
+    /// Who the units are charged to.
+    pub fn owner(&self) -> Owner {
+        self.owner
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let mut c = lock(&self.counts);
+        c.in_use = c.in_use.saturating_sub(self.n);
+        c.held.refund(self.owner, self.n);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +453,49 @@ mod tests {
             admits(&s, p(2), s.floor, 4096, s.per_owner + s.floor, size),
             Err(Over::Reserve)
         );
+    }
+
+    #[test]
+    fn a_pool_counts_what_is_held_until_the_charge_goes() {
+        let pool = Pool::new(64, Share::quarter(64, 1));
+        let mine: Vec<Charge> = (0..16).map(|_| pool.try_take(p(1), 1).unwrap()).collect();
+        assert_eq!(pool.try_take(p(1), 1).unwrap_err(), Over::Owner);
+        let unknown = pool.try_take(Owner::Unknown, 40).unwrap();
+        assert_eq!((pool.in_use(), pool.held(p(1))), (56, 16));
+        assert_eq!(pool.held(Owner::Unknown), 0, "counted in the pool alone");
+        // What is already held is counted, past any share.
+        let over = pool.hold(p(1), 8);
+        assert_eq!((pool.in_use(), pool.held(p(1))), (64, 24));
+        assert_eq!(pool.try_take(p(2), 1).unwrap_err(), Over::Pool);
+        drop(over);
+        drop(unknown);
+        assert_eq!((pool.in_use(), pool.held(p(1))), (16, 16));
+        // Dropped anywhere, on any thread.
+        std::thread::spawn(move || drop(mine)).join().unwrap();
+        assert_eq!((pool.in_use(), pool.held(p(1))), (0, 0));
+        // A smaller pool refuses until enough is back.
+        let a = pool.try_take(p(3), 8).unwrap();
+        pool.resize(4, Share::quarter(4, 1));
+        assert_eq!(pool.try_take(p(4), 1).unwrap_err(), Over::Pool);
+        drop(a);
+        assert!(pool.try_take(p(4), 1).is_ok());
+    }
+
+    #[test]
+    fn the_shares_written_out_fit_their_pools() {
+        use crate::{nvkms, semsurf, uvmmap};
+        for (share, size) in [
+            (semsurf::CTX_SHARE, semsurf::CTX_CAP_PER_SESSION as u64),
+            (nvkms::MODESET_SHARE, nvkms::MAX_MODESET_OPENS as u64),
+            (uvmmap::MAPS_SHARE, uvmmap::MAPS_PER_VM as u64),
+            (uvmmap::BYTES_SHARE, uvmmap::BYTES_PER_VM),
+        ] {
+            assert!(share.fits(size), "{share:?} of {size}");
+            assert!(share.owners_to_exhaust(size) >= 2, "{share:?} of {size}");
+        }
+        assert!(!Share::custom(4, 1, 5).fits(64), "a floor above the share");
+        assert!(!Share::custom(65, 1, 1).fits(64));
+        assert_eq!(Share::custom(16, 4, 1), Share::quarter(64, 1));
     }
 
     #[test]
