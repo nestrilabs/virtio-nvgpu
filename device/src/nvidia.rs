@@ -3525,7 +3525,18 @@ impl NvidiaBackend {
         if escape == 0x2B && outer_size >= 16 {
             let h_class = word(outer_in, 12);
             const NV0005_DATA: usize = 16;
-            if matches!(h_class, 0x05 | 0x79) && nested_size >= NV0005_DATA + 4 {
+            // A block too short to hold the field is refused, as OS_UNIX's
+            // is: RM would read the descriptor from past what was sent --
+            // the zeroed slack after our buffer, descriptor 0 of this
+            // process (review 2026-09-29 1.17).
+            if matches!(h_class, 0x05 | 0x79) && nested_size < NV0005_DATA + 4 {
+                log::warn!(
+                    "event class {h_class:#x}: {nested_size} parameter bytes do not hold its \
+                     descriptor"
+                );
+                return fail(self, resp_buf, Status::IoctlFailed, libc::EINVAL);
+            }
+            if matches!(h_class, 0x05 | 0x79) {
                 let guest =
                     i32::from_le_bytes(nested_in[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
                 let set = match self.dev_fd(guest as u32) {
@@ -8972,6 +8983,26 @@ mod descriptor_field_tests {
             crate::rmctl::NV_ERR_NOT_SUPPORTED
         );
         assert!(seen().is_empty());
+    }
+
+    /// An event's parameters too short to hold its descriptor are refused,
+    /// not sent for RM to read the field from past them (review 2026-09-29
+    /// 1.17).
+    #[test]
+    fn an_event_block_too_short_for_its_descriptor_never_reaches_rm() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        for class in [0x05, 0x79] {
+            for len in [4, 16, 19] {
+                let (st, _) = alloc(&mut be, ctl, class, &vec![0u8; len]);
+                assert_eq!(st, -libc::EINVAL, "class {class:#x}, {len} bytes");
+            }
+        }
+        assert!(seen().is_empty());
+        let mut p = [0u8; 24];
+        p[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(alloc(&mut be, ctl, 0x05, &p).0, 0, "-1 passes");
     }
 
     #[test]
