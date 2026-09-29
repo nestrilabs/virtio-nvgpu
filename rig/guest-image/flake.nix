@@ -175,6 +175,9 @@
             libva-utils # vainfo
             clinfo
             clpeak
+            # Per-frame times, the same build natively and in the guest
+            # (rig/rig-framepace.sh).
+            mangohud
           ])
           ++ [
             weston-clients
