@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # The project's checks, in three tiers by what they need.
 #
-# Usage: scripts/ci.sh [fast|kernel|nightly|all]...   (default: fast)
+# Usage: scripts/ci.sh [fast|deploy|kernel|nightly|all]...   (default: fast)
 #
 #   fast     no GPU, no network beyond crates and the flake's nixpkgs,
 #            minutes: rustfmt, clippy with -D warnings over the workspace and
@@ -16,7 +16,8 @@
 #            in order to c0474109d64d (from CROSVM_SRC, or the rig's crosvm
 #            checkout; skipped, and said, where there is none), and, on a
 #            NixOS host with user namespaces, the launcher's dry run
-#            (rig/verify/launcher-dryrun). The root flake's
+#            (rig/verify/launcher-dryrun). `deploy` runs that last part
+#            (from the scripts' syntax on) alone. The root flake's
 #            checks.x86_64-linux runs the Rust half and the module's
 #            evaluation (`nix flake check`).
 #   kernel   the guest module, C and Rust parsers, against a guest kernel's
@@ -137,7 +138,7 @@ CROSVM_BASE=c0474109d64d
 crosvm_patches_check() {
     local src=${CROSVM_SRC:-} c w p rc=0
     if [ -z "$src" ]; then
-        for c in .rig/src/crosvm .rig/src/crosvm-compute; do
+        for c in "${NVGPU_RIG:-.rig}/src/crosvm" "${NVGPU_RIG:-.rig}/src/crosvm-compute"; do
             if [ -e "$c/.git" ] && git -C "$c" cat-file -e "$CROSVM_BASE^{commit}" 2>/dev/null; then
                 src=$c
                 break
@@ -201,6 +202,11 @@ fast() {
     step "cargo test (workspace, vhost-user)" test_check
     step "unsafe confinement" scripts/check-unsafe.sh
     step "patches/nixos match their sources" nixos_patches_check
+    deploy
+}
+
+# The deployment half of fast, alone (scripts/ci.sh deploy).
+deploy() {
     step "shell syntax" scripts_syntax_check
     step "NixOS module evaluated" module_eval_check
     step "systemd units" units_check
@@ -271,10 +277,11 @@ nightly() {
 for tier in "$@"; do
     case $tier in
     fast) fast ;;
+    deploy) deploy ;;
     kernel) kernel ;;
     nightly) nightly ;;
     all) fast; kernel; nightly ;;
-    *) echo "usage: scripts/ci.sh [fast|kernel|nightly|all]..." >&2; exit 2 ;;
+    *) echo "usage: scripts/ci.sh [fast|deploy|kernel|nightly|all]..." >&2; exit 2 ;;
     esac
 done
 
