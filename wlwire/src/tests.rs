@@ -1154,7 +1154,7 @@ fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
         .finish();
     let mut g = seat_v1(Side::Guest);
     g.from_channel(
-        &wayland_frame(&[name.clone()]),
+        &wayland_frame(std::slice::from_ref(&name)),
         vec![],
         &mut TestPlat::default(),
     )
@@ -1164,7 +1164,7 @@ fn an_event_newer_than_its_object_passes_only_from_the_hosts_compositor() {
     let mut h = seat_v1(Side::Host);
     let e = h
         .from_channel(
-            &wayland_frame(&[name.clone()]),
+            &wayland_frame(std::slice::from_ref(&name)),
             vec![],
             &mut TestPlat::default(),
         )

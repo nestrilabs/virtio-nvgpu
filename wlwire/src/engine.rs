@@ -10,7 +10,9 @@
 //!
 //! Every message in either direction is parsed against the generated tables:
 //! the target object must exist and its opcode be known at the object's
-//! version, or the connection ends with a protocol error. That is not
+//! version (for an event from the host's compositor, known at all, as
+//! libwayland-client has it), or the connection ends with a protocol error,
+//! posted where libwayland-server would post it. That is not
 //! pedantry: descriptors travel beside the byte stream and are consumed by
 //! signature, so a message the proxy cannot parse is a message whose
 //! descriptors it cannot count. Parsing also drives the object table (see

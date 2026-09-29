@@ -11,7 +11,8 @@ branch `dind` (§14), the review of `dind` for memory passing (§15), and the
 VMMs it runs under, nesbox and crosvm (§16); by the review of 2026-09-26
 (§17); by capture injection (§18); by the window's size and share, with the
 RM mapping fixes that came with them (§19); by the frame-pacing changes
-(§20); and by the performance work (§21). It is written for the project's
+(§20); by the performance work (§21); and by the review of 2026-09-29
+(§22). It is written for the project's
 owner. The
 code is the reference: where this document and the code disagree, the code
 is right.
@@ -513,7 +514,7 @@ removed, since nothing can say whether RM took it.
 | logs | unbounded; the launcher wrote them to an unrotated file | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
 | display caps | -- | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | the zones, first come first served | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth (§19); a mapping is charged to whoever opened the file it is armed on |
-| Wayland caps | -- | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools, shared by all its connections. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
+| Wayland caps | -- | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools (the last sixteenth kept for processes holding at most a sixty-fourth), shared by all its connections. In the guest daemon, per client process: a quarter of the descriptors it may hold for clients (its hard limit less 60) and of 64 MiB of stream-sink data, the last eighth of each kept for processes holding little. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
 | not capped | -- | Memory outside the Wayland and window budgets has no limit of the backend's own; the shipped unit (`contrib/systemd/vhost-user-nvgpu@.service`, DEPLOY.md) puts each backend in a cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and `OOMScoreAdjust=500`, the rig's launcher does not. Several VMs of one backend user share that user's host limits. |
 
 ### The backend's sandbox
@@ -694,7 +695,8 @@ most once a second per connector.
 **The Wayland proxy** (`wlwire/src/policy_table.rs`).
 
 - The allowlist has 42 globals: Hyprland's own set for clients it does not
-  trust without `wl_drm`, plus xdg-output, content-type and the lease device.
+  trust without `wl_drm`, plus `wl_output`, xdg-output, content-type and the
+  lease device.
   The lease device needs `--wayland-lease` and this GPU's device. The syncobj
   manager, which Hyprland's set also has, is offered only when fences are
   served.
@@ -1953,7 +1955,7 @@ since (below).
 | # | sev | finding | status | commit |
 |---|---|---|---|---|
 | 1 | high, cross-VM | ALLOC_OS_EVENT and FREE_OS_EVENT reached RM with the guest's hClient unchecked. RM keeps OS events in one host-wide list matched by (hClient, fd), checking neither against the caller (osapi.c allocate_os_event, free_os_event; os.c osUserHandleToKernelPtr), and every backend's descriptor numbers are small: a neighbour's client (handed out in sequence) let a guest free that VM's events or take the key its next one needs | fixed: the client must be one this VM allocated and has not freed (the semsurf client record, `rm_share_gate`), else NV_ERR_INSUFFICIENT_PERMISSIONS without RM. Not "made on the calling file": RM posts an event to the file the call is made on (nv_post_event, `event->nvfp`), the file the caller then polls, which is not the one its client was made on -- that rule would refuse every legitimate event | 9a9d3aa |
-| 2 | high, DoS | a fence context's GEM could be PRIME-exported (HOST_OP); the dma-buf kept the context -- a host kthread, a timer, an NVKMS duplicate -- alive after GEM_CLOSE gave its slot back to the caps | fixed: HOST_OP PRIME_EXPORT of a live fence context is refused (EINVAL). Nothing legitimate exports one: nvidia-drm's object has no sg table, Vulkan and EGL use a context only through 0x55-0x57, and the guest driver's own proxy refuses export (`nvgpu_fence_ctx_export`) | d7c41fc |
+| 2 | high, DoS | a fence context's GEM could be PRIME-exported (HOST_OP); the dma-buf kept the context -- a host kthread, a timer, an NVKMS duplicate -- alive after GEM_CLOSE gave its slot back to the caps | fixed on HOST_OP: PRIME_EXPORT of a live fence context is refused (EINVAL). Not on every path: the 2026-09-29 review found the Wayland proxy's PRIME export, of a GEM a DMABUF descriptor in WL_SEND names, made without this check (§22, S1). Nothing legitimate exports one: nvidia-drm's object has no sg table, Vulkan and EGL use a context only through 0x55-0x57, and the guest driver's own proxy refuses export (`nvgpu_fence_ctx_export`) | d7c41fc |
 | 3 | medium, app vs app | RM_FREE and FREE_OS_EVENT wiped the backend's records whatever RM answered: one guest process freeing another's client, which RM refuses, broke the owner's duplicates, fence contexts, OS events and grants | fixed: forgotten on NV_OK, or when the free came through the file that made the client (or the event) | 9a9d3aa |
 | 4 | medium, compute | UVM external mappings of registered memory were held whatever UVM answered and wherever they lay, against one VM-wide bound: holds nothing took down (pinned to the session's end), and one process filling the bound refused every other's | fixed: the mapping must lie in an external range the file made and the backend recorded (overflow-checked), or it is refused before UVM; held on NV_OK and on the failures of UVM's page-table wait, which leave mappings up (RC, ECC, GPU lost); a quarter of the bound per guest process; `UvmHold::within` does not wrap. The holds stay a list scanned per call, bounded by the cap | cf2c132 |
 | 5 | medium, cross-VM | S-6's framebuffer check and the ioctl were not one step: an RMFB, CLOSEFB or file close on another executor in between freed the id, and the kernel gives the lowest free id to the next framebuffer anyone makes | fixed: each id a call names is in use from its check to the end of its ioctl; RMFB/CLOSEFB wait for it on their own executor (5 s at most: past the check the kernel holds the framebuffer by reference), and a KMS file whose framebuffers are in use is parked and closed after the last such call (close, lease burial, reset). Not one per-VM lock: that would have the queue thread wait on a blocking commit | 3034888 |
@@ -2113,7 +2115,9 @@ a production guest runs it setgid `nvgpu-wl` or as an account of its own
 
 **Still open.** A client may still hold a sink's share
 of the queue budget by never reading its pipe, as it may hold a queue by
-never reading its socket; both are its own process's share.
+never reading its socket; both are its own process's share. That was the
+backend's side only: the guest daemon's sinks were unbudgeted until the
+2026-09-29 review (§22, S6).
 
 ---
 
@@ -2463,7 +2467,7 @@ the guest open anything the guest's daemon does not ask for.
 
 ### Tests and hardware
 
-24 unit tests (`inject::tests`: every rule above, the socket's framing,
+26 unit tests (`inject::tests`: every rule above, the socket's framing,
 uid and peer limits, release on hangup, two backends, a stalled import, the
 read-only placement through the dispatcher, the per-process open share),
 the protocol's own, and the `inject` fuzz target (packets, imports with
@@ -2799,3 +2803,93 @@ placement it has made, after answering it. What this adds and does not:
   made (patch 0007) and which holds the VM; the jailed frontend is
   unchanged. nesbox does it in the VMM process; the call is an `ioctl`,
   which both VMMs' filters already allow.
+
+---
+
+## 22. The 2026-09-29 review
+
+A review of the Wayland proxy, capture injection and the guest daemon at
+`416dc54`, each finding checked against the code before it was fixed, and
+the review's reproductions made tests that fail without their fix.
+
+### Wayland
+
+`wlwire`, `nvgpu-wl-guest` and `device/src/wl`, branch `fix29-wayland`. S1
+-- the Wayland path's PRIME export of a fence context's GEM (§17 row 2) --
+is the backend's, with the other export paths, and not in this branch.
+
+| # | severity | what | fix |
+|---|---|---|---|
+| S2 | medium | A client that truncated its own shm pool before a commit's copy was read left the rest of the buffer counted on the channel's backlog for good: the engine gave back only the bytes a short `pread` returned. Past the input limit the client's input was never read again, the daemon asked for `EPOLLIN` it would not read (376k turns in 500 ms), and after the client hung up its slot, its channel and the host's compositor client stayed. About eight short-lived processes held all 64 of a VM's channels. | The two lazy reads, a commit's copy and a blob's rest, are one `job::Job`, and the engine uncounts each step by what it takes off `remaining()`, whatever the step read (R2). The daemon asks for readability only while it takes input, and closes a client that hangs up while its input is not being taken. The fuzzer checks the backlog against the queue after every operation. `1302c78`, `bd4cbe4` |
+| S3 | medium | The daemon ran at the session's soft descriptor limit with only a per-connection cap: one client queueing about a thousand descriptors, or pools on a few connections, took every descriptor; every later client stayed unaccepted while the listener woke every wait and logged each failed accept (117,024 lines in 300 ms at a 128 limit), and every client that sent a descriptor was cut off by `MSG_CTRUNC`. | The soft limit is raised to the hard one. What clients may hold -- sockets, channels, queued descriptors, frames for the host, pools, streams, blobs (`Engine::held_fds`, a running count) -- is the limit less the daemon's own and one read's worth, shared among client processes a quarter each with the last eighth kept for processes that hold little (`budget.rs`, the rule of `quota.rs`); past its share a client is closed with `no_memory`, or refused on connecting. One read takes at most libwayland's 28 descriptors, as libwayland's own receiver does. Out of descriptors, accept rests 100 ms instead of spinning, and its line is metered. The daemon also reads a client four times a turn, not until empty, so the channel's replies are not held behind a megabyte of requests. The fuzzer checks that every descriptor open between operations is one the engines count. `a2fe967`, `ece759f` |
+| S4, S9 | medium-low | Streams were re-armed one-shot each time the slot was touched, even with no interest; epoll reports ERR and HUP regardless, so a clipboard pipe whose reader went away with nothing to write spun the daemon (250k turns in 500 ms) until the host's source moved. A sink's descriptor shares its file with the client, so closing it left its registration behind. | Streams are in epoll, level-triggered, only while there is interest. The engine keeps an ended stream's descriptor until its owner takes it (`take_closed_streams`), so the daemon takes it out of epoll while it is still open; a client's socket, channel and streams all leave epoll before it is dropped. `311a171` |
+| S5 | medium-low | A guest process's shm budget was a flat quarter of the VM's with no reserve: four processes (one forking three times) took every pool or byte at no cost to themselves -- sparse buffers are charged by the pages they cover -- and every other process's first pool was fatal to it. | `ShmShares`: the VM's budget shared through `quota::Share::quarter` and a `Ledger` for bytes and for pools, as `QueueBudget` shares the queue; a quarter each, the last sixteenth kept for processes holding at most a sixty-fourth (at least 8 pools). `9417596` |
+| S6 | low-medium | The daemon's stream sinks were unbudgeted: about 15 MiB per connection, 16 connections per process, the daemon's memory, which the guest OOM killer weighs against every app's display. | A 64 MiB daemon-wide budget for what sinks hold, shared among client processes as above; what a client's sinks hold counts toward the stuck-client rule. `a2fe967` |
+| S7 | low | CONNECT_FOR resolved the client by pid when asked, and a process it could not find fell back to a plain CONNECT charged to the daemon; a reused pid charged a stranger. | The daemon holds the client's process by a pidfd from the accept (`SO_PEERPIDFD`, or `pidfd_open` on a kernel without it) and drops a client whose process has exited before or during CONNECT_FOR: a pid is reused only after its process is gone, so a process alive after the ioctl is the one charged. `ESRCH` is refused, not charged to the daemon. Still so: a kernel without CONNECT_FOR (`ENOTTY`) charges every client to the daemon, which then holds one process's share of the VM's channels for all of them (ARCHITECTURE §14); `driver/uapi/nvgpu_wl.h` does not say so yet. `484b44c` |
+| S8 | low | `fatal()` flushed the client and then wrote `wl_display.error` straight to the socket: after a flush that stopped inside an event, a client reading meanwhile got the error in that event's arguments, and the channel went on being read after it. | `Engine::end_with` (R4) queues the error after what the client already has and returns the ERROR record for the far side; the backend's `fail` uses it too, and no `Fatal` is built by hand past `Fatal::new`. The daemon reads nothing more from the channel for a client it is closing. `a46807a` |
+| S10 | low | The daemon removed whatever was at its socket path and bound: a second daemon, or a guest compositor on `wayland-0`, lost its socket, and the first's exit removed the second's. | The name is taken as libwayland takes one: `<name>.lock` flocked first, and only then a leftover socket removed; a second daemon is refused, and the socket and lock go with the daemon that holds them. `484b44c` |
+| S11 | low | One log limit for the whole daemon: one client's errors used its burst and hid every other line. | A limit per call site, as the backend's. `484b44c` |
+| S12 | low | Export mode connected to the guest compositor blocking, on the daemon's one thread. | A non-blocking connect: a full backlog turns the host client away. `484b44c` |
+
+**Native parity.**
+
+- C2: errors are posted where libwayland-server posts them -- the generic
+  ones (`invalid_object`, `invalid_method`, `no_memory`, `implementation`)
+  on the display, a bad bind on the registry, an interface's own
+  (`wl_shm.invalid_fd`, `invalid_stride`, the syncobj manager's
+  `invalid_timeline`) on its object. Before, every error named the object the
+  message did: "invalid object 99" with object 99, which the client cannot
+  dispatch, and `no_memory` on `wl_shm`, which reads as `invalid_fd`. The
+  review had `invalid_method` on the resource; libwayland 1.26 posts it on
+  the display (`wl_client_connection_data`), and so does this. `4ac50f8`
+- C3: a buffer destroyed while its surface shows it keeps its pages in the
+  compositor's pool, and their charge, until the surface commits another
+  attach or goes -- `wl_buffer.destroy` leaves a pool alone natively, and a
+  compositor that reads shm when it paints (wlroots' pixman) painted zeros.
+  At most one buffer per surface. `566b34b`
+- C4, the two places the proxy was stricter than libwayland:
+  - an event newer than its object's version: libwayland-client checks no
+    version for events, so one from the host's compositor now passes, as it
+    would natively. One from a guest's compositor to a host client (export
+    mode) is still refused, on security grounds: the host client would call
+    past the end of a listener made for the object's version, a guest
+    steering a host process's calls. Requests stay checked, as
+    libwayland-server checks them. `7cee84c`
+  - a NUL inside a string: no longer stricter. libwayland 1.26's
+    demarshaller refuses it too ("string has embedded nul"); either way a
+    string the proxy judges -- an interface bound or offered -- must be the
+    one the peer's C code reads.
+
+**Documents.** Corrected where the review found them contradicted: §5's
+allowlist names `wl_output`; §17 row 2 says the fence-context fix held on
+HOST_OP and not on the Wayland path; §17's "still open" says it was the
+backend's sinks alone; §18 counts 26 `inject` tests; ARCHITECTURE §14 says a
+client that truncates its pool goes on, when a destroyed buffer's pages go,
+how the daemon charges a client and what it falls back to, and that the
+daemon shares its descriptors and sink memory among processes;
+`wlwire/protocols/README.md` says why three unallowed protocols are vendored;
+`nvgpu-wl-guest/src/log.rs`, `daemon.rs` (two frames per client, not one) and
+`device/src/wl/mod.rs` (the legacy watch only) match the code.
+
+**Tests and fuzzing.** Every fix above has a test that fails without it: the
+review's reproductions (`leak.rs` into `wlwire/src/tests.rs`, `spin.rs` into
+the daemon's tests, `nofile.rs` as `nvgpu-wl-guest/tests/nofile.rs`, which
+sets the test process's limit to 128 and puts the second client in a process
+of its own), and one per remaining finding. `wl_engine` gained two oracles:
+after every operation each engine's backlog is what its queue holds, and
+nothing once it has nothing left to take (S2 -- the fuzzer reaches it by
+itself, with a pool descriptor smaller than the pool says); and every
+descriptor open between operations is one the engines count in
+`held_fds` (what the daemon's budget counts, S3). Ten minutes each on
+2026-09-29 (`scripts/fuzz.sh run 600`): `wl_engine` 10.6 million runs,
+`wl_codec` 469 million, no finding. The loopback test
+(`scripts/wl-loopback-test.sh`, a headless sway and weston started by the
+test, real clients through the daemon and the backend's connection, directly
+and through the dispatcher) passes: an 8 MiB selection crosses each way in
+about 222 ms, as before.
+
+**Left for later** (the review's structure items): R5, one budget type for
+the three "all or none" charge loops and the per-owner policies (the daemon's
+`budget.rs` repeats `quota.rs`'s rule because it cannot link the backend);
+R3, the engine owning local input, which the backend reader's lease probe
+reading the raw input makes less than natural; R6-R9.
