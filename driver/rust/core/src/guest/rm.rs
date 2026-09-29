@@ -18,8 +18,8 @@
 use super::deep::{self, UserMem};
 use super::wire::{
     has, ioctl_req_header, le32, le64, put32, put64, sum, Errno, FillFrom, IoctlResp,
-    DEEP_SEGMENTED, EBADF, EFAULT, EINVAL, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX,
-    IOCTL_REQ_LEN, IOCTL_RESP_LEN, PROC_ID_LEN,
+    DEEP_SEGMENTED, EBADF, EFAULT, EINVAL, ENOMEM, ENOTTY, EPERM, IDLE_CHANNELS_MAX, IOCTL_REQ_LEN,
+    IOCTL_RESP_LEN, PROC_ID_LEN,
 };
 
 /// NV_IOCTL_MAGIC, the type byte of every RM escape.

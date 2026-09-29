@@ -1372,7 +1372,8 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  *   u64 pData     — USERSPACE pointer to the actual data buffer
  *
  * Same 2-level serialisation pattern as RM_CONTROL/RM_ALLOC.
- * The VMM side already handles pointer patching at offset 8 (see handler.rs).
+ * The backend gives the pointer at offset 8 a host address of its own for
+ * the call (device/src/nvidia.rs, the NVKMS v1 path).
  */
 
 /* NvKmsIoctlCommand: the one that names memory by a descriptor. */
@@ -1390,8 +1391,8 @@ struct nvidia_modeset_outer {
  * Forward one nvidia-modeset ioctl. The parameter block is an outer struct
  * holding a userspace pointer to the real payload, so both have to be copied.
  *
- * Called only from nvgpu_modeset_ioctl(), which has already checked the ioctl
- * type and size.
+ * Called only from nvgpu_modeset_ioctl(), which has checked the ioctl type;
+ * the number and size are checked here, as nvkms_ioctl checks them.
  */
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
                          void __user *uarg) {

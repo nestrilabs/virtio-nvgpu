@@ -596,7 +596,10 @@ fn an_argument_the_drm_entry_copied_in_is_read_and_written_as_kernel_memory() {
     w.canned = vec![i2_reply(0, 3, &data)];
     let o = run(dev(0, vec![]), w, i2_karg(query, KARG));
     assert_eq!(o.ret, 0);
-    assert_eq!(mem(&o, B), &[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        mem(&o, B),
+        &[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]
+    );
     assert_eq!(mem(&o, KARG), &arg[..]);
     assert_eq!(mem(&o, A), &[1, 0, 0, 0, 2, 0, 0, 0]);
 

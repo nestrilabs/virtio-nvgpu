@@ -5,21 +5,27 @@
 The guest module is the boundary between mutually untrusting apps in one VM,
 and between an app and the guest kernel. The code that reads what a guest
 process hands the module is where a memory-safety bug becomes a guest kernel
-compromise, so that code has a Rust implementation here, selected at build
-time:
+compromise, so that code has a Rust implementation here, and it is what a
+kernel with Rust gets:
 
 ```sh
-make -C driver KDIR=<a CONFIG_RUST=y kernel's build tree> NVGPU_RUST=1
+make -C driver KDIR=<a CONFIG_RUST=y kernel's build tree>      # the Rust
+make -C driver KDIR=<a kernel's build tree> NVGPU_RUST=0       # the C
 ```
 
-`NVGPU_RUST=0` (the default out of tree) builds the C (`nvgpu_i2.c`,
-`nvgpu_rmio.c`, `nvgpu_atomic.c`). In a kernel tree, `CONFIG_VIRTIO_GPU_NV_RUST`
-(Kconfig, depends on `CONFIG_RUST`) selects the Rust. `NVGPU_RUST=1` against a
-kernel without `CONFIG_RUST` is a build error, and the module records which it
-has (`modinfo -F parsers`). The Makefile refuses to link a `nvgpu_rs.o` that
-names a panic symbol. The Rust build has passed the hardware regression
-(below); the C stays the out-of-tree default and stays buildable -- it is the
-difftest's oracle, and what a kernel without Rust builds.
+Out of tree the Makefile takes the Rust when the target kernel has
+`CONFIG_RUST=y` and the C (`nvgpu_i2.c`, `nvgpu_rmio.c`, `nvgpu_atomic.c`)
+otherwise; in a kernel tree `CONFIG_VIRTIO_GPU_NV_RUST` (Kconfig, depends on
+`CONFIG_RUST`, `default y`) decides. `NVGPU_RUST=1` insists on the Rust (a
+build error against a kernel without `CONFIG_RUST`, and a plain one when no
+`rustc` is on `PATH`), `NVGPU_RUST=0` on the C, which the module then says at
+load on a kernel with Rust. The module records which it has (`modinfo -F
+parsers`). The Makefile refuses to link a `nvgpu_rs.o` that names a panic
+symbol. `scripts/build-guest-kernel.sh` builds a `CONFIG_RUST=y` kernel and
+the Rust module by default, and `driver/guest-kernel.defconfig` has
+`CONFIG_RUST=y`. The C stays buildable and frozen -- fixes only, no new
+parser features -- as the difftest's oracle and the fallback for a guest
+kernel that cannot have Rust.
 
 ## What is in Rust, and what is not
 
@@ -27,8 +33,9 @@ difftest's oracle, and what a kernel without Rust builds.
 |---|---|
 | `i2.rs` — the IOCTL2 schema walk, the request, the reply, copy-back by the kernel's fill rules | `nvgpu_i2.c` |
 | `schema.rs` — the tables' layout (the tables stay the generated C, read in place) and the entry lookup, which also names the native command a DRM caller's argument is normalised to (`i2::native_cmd`) | `nvgpu_i2_lookup()`, `nvgpu_i2_native_cmd()` |
-| `dispatch.rs` — which path an ioctl on a `/dev/nvidia*` file or a DRM file's driver range takes; UVM | `nvgpu_ioctl_fd()`, `nvgpu_uvm_ioctl()` |
-| `rm.rs` — flat escapes, RM_CONTROL (GET_BUILD_VERSION and TIME_CORRELATION intercepts, OS_UNIX and OS-event descriptors, V1V2 deep pointers, the clock rebase), RM_ALLOC (event descriptors, class sizes), IDLE_CHANNELS, descriptor translation at a fixed offset, a v1 backend's NVKMS commands | `nvgpu_rmio.c` |
+| `dispatch.rs` — which path an ioctl on a `/dev/nvidia*` file, or a DRM file's RM (non-`'d'`) ioctl, takes; UVM | `nvgpu_ioctl_fd()`, `nvgpu_uvm_ioctl_fd()` |
+| `rm.rs` — flat escapes, RM_CONTROL (GET_BUILD_VERSION and TIME_CORRELATION intercepts, OS_UNIX and OS-event descriptors, V1V2 deep pointers, the clock rebase), RM_ALLOC (event descriptors, class sizes), IDLE_CHANNELS, descriptor translation at a fixed offset, a v1 backend's NVKMS commands; the reply's header is `wire::IoctlResp::parse()`, the twin of `nvgpu_v1.c`'s (both builds) | `nvgpu_rmio.c` |
+| `schema.rs`'s `fd_kind_allowed()` — whether one of the module's files may stand in a descriptor field (the backend's `kind_allowed()`); the C (`nvgpu_fd_kind_allowed()`, `nvgpu_schema.c`) is what both builds run, this the twin the difftest holds it to | -- |
 | `deep.rs` — deep segments: the plan, the block, the copy-back | `nvgpu_deep_*()` |
 | `osdesc.rs` — which calls register memory by its pages, the range, the page runs, the request, the reply's id | `nvgpu_osdesc_describe()`, `_runs()`, `_register()` |
 | `atomic.rs` — an ATOMIC commit's object, property-count, property and value arrays: which CRTCs get flip events, what the commit teaches, which values are fences | `nvgpu_atomic.c` (was `nvgpu_kms_atomic()`) |
@@ -81,7 +88,11 @@ What stays C, and why:
   bytes left in the caller's memory, the same hooks called with the same
   arguments, the same handles closed and pages pinned and kept, the same
   lines logged. The C is built with UBSan trapping, and its allocations
-  carry canaries.
+  carry canaries. The world's address space is split where x86-64's is, so
+  the paths that read a kernel address -- IOCTL2's argument as the DRM
+  node's entry copied it in (`nvgpu_i2_call.karg`) -- run too: the C
+  through `nvgpu_i2_kread`/`_kwrite`, the Rust side through a store that
+  follows `KStore::kern()`.
 - `fuzz/` is cargo-fuzz (nightly, from fenix): `diff_rm` and `diff_i2` drive
   the differential test from libFuzzer's bytes, `i2_raw` feeds the Rust core
   raw bytes with debug assertions (overflow checks) on, `diff_atomic`
@@ -154,13 +165,28 @@ with more descriptors than the state holds is refused before it is sent;
 and the ATOMIC parse says commit/TEST_ONLY before any hook
 (`atomic::Env::begin`), which the Rust wrapper once said only after the
 parse -- so a hook reading it saw every commit as TEST_ONLY. The difftest
-records what each in-fence hook sees.
+records what each in-fence hook sees. That flag, `out->commit`, is the only
+source of commit-or-TEST_ONLY since the 2026-09-29 review: `nvgpu_kms.c`'s
+in-fence hook reads it through its context, where it once computed the same
+thing a second time from the same bytes.
 
-## When the Rust has passed
+From the 2026-09-29 review, in both: a v1 reply whose status is neither 0
+nor an errno is `-EPROTO`, with nothing of it read (`nvgpu_v1.c`,
+`wire::IoctlResp::parse`), where each path returned the raw status; and the
+C's large blocks are `kvmalloc`'d, as the Rust's always were.
 
-Delete `nvgpu_i2.c`, `nvgpu_rmio.c` and `nvgpu_atomic.c`, the `NVGPU_RUST` switch in
-`Makefile` (keep the Rust objects unconditionally), the `NVGPU_RUST`
-handling in `scripts/build-guest-kernel.sh` (always enable `CONFIG_RUST`),
-and `difftest/` (its `cases.rs` can become core unit tests against a fake
-world; `renv.rs`, `backend.rs` and `hooks.rs` are that world). The fuzz
-targets then drive the core alone.
+## Retiring the C
+
+The Rust has passed, and is the default wherever the kernel has Rust (the
+2026-09-29 review). The C stays for one more step: the fallback for a guest
+kernel without `CONFIG_RUST` (a distribution kernel, or a toolchain that
+does not match the kernel's), and the difftest's oracle. Once no supported
+guest kernel lacks Rust: delete `nvgpu_i2.c`, `nvgpu_rmio.c` and
+`nvgpu_atomic.c`, the `NVGPU_RUST` switch in `Makefile` (keep the Rust
+objects unconditionally), the `NVGPU_RUST=0` path in
+`scripts/build-guest-kernel.sh`, and `difftest/` (its `cases.rs` can become
+core unit tests against a fake world; `renv.rs`, `backend.rs` and
+`hooks.rs` are that world) -- after adding a smoke test that drives
+`nvgpu_rs.rs`, the FFI, which the difftest never did and where the one
+Rust-only bug was (the ATOMIC TEST_ONLY flag). The fuzz targets then drive
+the core alone.

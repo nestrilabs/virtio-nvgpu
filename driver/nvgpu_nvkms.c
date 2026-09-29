@@ -44,7 +44,8 @@
  *
  * Nothing here ever issues an ioctl of its own on a modeset file: the first
  * one makes it an "ioctl" file forever, useless as a grant or unicast file
- * (nvkms.c:1291-1342). v1 guests keep nvgpu_ioctl_modeset() in nvgpu_main.c.
+ * (nvkms.c:1291-1342). v1 guests keep nvgpu_ioctl_modeset() (nvgpu_rmio.c,
+ * or rm.rs's modeset_v1 in the Rust build).
  */
 
 #include <linux/dma-buf.h>

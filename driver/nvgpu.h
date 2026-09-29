@@ -435,7 +435,8 @@ struct nvgpu_gem_object {
 /* ───────── nvgpu_rmio.c, or nvgpu_rs.rs with NVGPU_RUST ─────────
  *
  * The protocol-v1 IOCTL message: an ioctl on a /dev/nvidia* file (or a DRM
- * file's driver range), a UVM command, and a v1 backend's NVKMS command.
+ * file's RM ioctl, of any type but 'd'), a UVM command, and a v1 backend's
+ * NVKMS command.
  */
 
 long nvgpu_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd, unsigned long arg);
@@ -499,11 +500,13 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
                              struct nvgpu_open_req_proc *r);
 /* The nvgpu_fd behind a character device or DRM file of ours, else NULL. */
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
+/* nvgpu_xfer.c: nothing sent will be answered (after a reset, remove()). */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);
+/* nvgpu_fence.c: every guest syncobj waiter looks again. */
 void nvgpu_fence_wake_waiters(void);
 
 /*
- * Frame-pacing counters (nvgpu_xfer.c; ARCHITECTURE.md, "Frame pacing"):
+ * Frame-pacing counters, nvgpu_xfer.c's (ARCHITECTURE.md, "Frame pacing"):
  * relaxed atomics, always kept, read as root from
  * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
  * nvgpu_fence.c count themselves here too.

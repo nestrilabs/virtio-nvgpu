@@ -316,7 +316,11 @@ mod tests {
             (0, SKIND_DEV_GPU, true),
             (247, SKIND_DEV_GPU, true),
             (0, SKIND_DEV_CTL, false),
-            (DEV_UVM, SKIND_DEV_GPU | SKIND_DEV_CTL | SKIND_DEV_MODESET, false),
+            (
+                DEV_UVM,
+                SKIND_DEV_GPU | SKIND_DEV_CTL | SKIND_DEV_MODESET,
+                false,
+            ),
             (DEV_UVM, hk(HK_DEV), true),
             (DEV_UVM_TOOLS, hk(HK_DEV), true),
             (DEV_MODESET, hk(HK_DEV), true),

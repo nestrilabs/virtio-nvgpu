@@ -4,8 +4,10 @@
  *
  * DRM device registration, the GEM proxies that stand in front of the host's
  * objects (mmap, vmap, dma-buf export, PRIME import), and the nvidia-drm
- * driver-range ioctls. Everything else a render node receives is forwarded
- * through nvgpu_ioctl_fd() in nvgpu_main.c like any other device's ioctls.
+ * driver-range ioctls. An RM ioctl (any type but 'd') a render node receives
+ * goes through nvgpu_ioctl_fd() like any other device's (nvgpu_rmio.c, or the
+ * Rust build's dispatch.rs); the core's are drm_ioctl()'s, or a KMS file's
+ * host card's (nvgpu_kms.c).
  */
 
 #include <drm/drm.h>
@@ -90,14 +92,15 @@ void nvgpu_drm_arg_drop(struct nvgpu_drm_arg *a) {
   a->k = NULL;
 }
 
-/* ───────── nvidia-drm stub — no DRM subsystem headers needed ───────── */
+/* ───────── nvidia-drm's driver range ───────── */
 
 /*
  * The largest nvidia-drm GEM parameter struct this driver forwards, and the
  * largest NVKMS block one of them may point at. The first is a stack buffer's
- * size, so it is small on purpose and BUILD_BUG_ON'd against the descriptors
- * that use it; the second only has to refuse a length field that is garbage,
- * since a real NVKMS memory-import block is a few hundred bytes.
+ * size, so it is small on purpose and checked against each descriptor that
+ * uses it when the call runs (nvgpu_ioctl_drm_gem_nested()); the second only
+ * has to refuse a length field that is garbage, since a real NVKMS
+ * memory-import block is a few hundred bytes.
  */
 #define NVGPU_GEM_OUTER_MAX 32
 #define NVGPU_GEM_NESTED_MAX (64 * 1024)
@@ -147,10 +150,12 @@ static int nvgpu_gem_proxy_create_new(struct drm_file *file,
  * forwarded to the host's render node rather than answered here -- the memory
  * is the host's and so is the object that names it.
  *
- * Nothing translates the handles in these structs. A GEM handle is per
- * drm_file, and each open of this node holds exactly one open of the host's
- * node (nvgpu_drm_open), so the handle the host issues is already scoped to
- * the file that will use it and means the same thing on both sides.
+ * Their GEM handles are translated: a handle the caller names is one of its
+ * proxies, forwarded as the proxy's host handle on the proxy's owner file,
+ * and a handle the host makes gets a proxy before the caller sees a number
+ * (nvgpu_ioctl_drm_gem_nested()). A GEM handle is per drm_file, and each
+ * open of this node holds one open of the host's node (nvgpu_drm_open), but
+ * a proxy may stand for another file's object -- an imported buffer.
  */
 #define DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY 0x01  /* abs nr 0x41 */
 #define DRM_NVIDIA_GEM_EXPORT_NVKMS_MEMORY 0x09  /* abs nr 0x49 */
@@ -561,7 +566,8 @@ static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
    * These two carry a pointer to an NVKMS parameter block. The guest's
    * address means nothing on the host, so the bytes travel alongside and the
    * backend gives them a host address before the call -- the same shape as
-   * nvidia-modeset, which is why both go through one forwarder.
+   * v1 nvidia-modeset's (nvgpu_ioctl_modeset()), though each has its own
+   * forwarder: this one also translates the GEM handle and the descriptor.
    */
   case DRM_NVIDIA_GEM_IMPORT_NVKMS_MEMORY:
     return nvgpu_ioctl_drm_gem_nested(nfd, file, cmd, k,
@@ -1844,30 +1850,19 @@ struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f) {
 }
 
 /*
- * The DRM core refuses to open a node whose fops do not declare
- * FOP_UNSIGNED_OFFSET:
- *
- *   if (WARN_ON_ONCE(!(filp->f_op->fop_flags & FOP_UNSIGNED_OFFSET)))
- *           return -EINVAL;            -- drm_open_helper(), drm_file.c
- *
- * DRM offsets are a mmap address space and are unsigned, so the core makes
- * every driver say so. Drivers that build their fops with DEFINE_DRM_GEM_FOPS
- * get it for free; ours are written out by hand and so must set it, or every
- * open of /dev/dri/renderD128 fails with EINVAL before .open is ever reached.
- *
- * Guarded because the flag postdates the kernels this module still builds
- * against; on those the check does not exist either.
- */
-/*
  * The DRM node's ioctl entry point.
  *
  * Three kinds of ioctl arrive on /dev/dri/renderD128:
  *
- *   driver range (DRM_COMMAND_BASE..END)  nvidia-drm's own -- GET_DEV_INFO and
- *                                         the two SUPPORTED probes. drm_ioctl()
- *                                         answers -EINVAL for these because we
- *                                         register no drm_ioctl_desc table, so
- *                                         they are taken here first.
+ *   driver range (DRM_COMMAND_BASE..END)  nvidia-drm's own
+ *                                         (nvgpu_drm_handle_ioctl(): the
+ *                                         GET_DEV_INFO layouts, the SUPPORTED
+ *                                         probes, the GEM calls, the unique
+ *                                         id, semaphore-surface fences).
+ *                                         drm_ioctl() answers -EINVAL for
+ *                                         these because we register no
+ *                                         drm_ioctl_desc table, so they are
+ *                                         taken here first.
  *   other type 'd'                        core DRM: VERSION, GET_UNIQUE, ...
  *                                         left to drm_ioctl().
  *   type 'F'                              NVIDIA RM, proxied to the host like
@@ -1990,10 +1985,10 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
 
 /*
  * Every ioctl inside drm_dev_enter(): remove() unplugs the node
- * (nvgpu_dri_cleanup()) after failing every waiter and before the transport
- * is freed, and waits there for any ioctl still inside, so none can reach a
- * transport that is going (S-26). A file opened before stays open and gets
- * -ENODEV.
+ * (nvgpu_dri_cleanup()) after failing every waiter, once the transport is
+ * dead (its state stays, dead, until the device's last reference), and waits
+ * there for any ioctl still inside (S-26). A file opened before stays open
+ * and gets -ENODEV.
  */
 static long nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
                                      unsigned long arg) {
@@ -2053,6 +2048,21 @@ static __poll_t nvgpu_drm_poll(struct file *filp,
   return drm_poll(filp, wait);
 }
 
+/*
+ * The DRM core refuses to open a node whose fops do not declare
+ * FOP_UNSIGNED_OFFSET:
+ *
+ *   if (WARN_ON_ONCE(!(filp->f_op->fop_flags & FOP_UNSIGNED_OFFSET)))
+ *           return -EINVAL;            -- drm_open_helper(), drm_file.c
+ *
+ * DRM offsets are a mmap address space and are unsigned, so the core makes
+ * every driver say so. Drivers that build their fops with DEFINE_DRM_GEM_FOPS
+ * get it for free; ours are written out by hand and so must set it, or every
+ * open of /dev/dri/renderD128 fails with EINVAL before .open is ever reached.
+ *
+ * Guarded because the flag postdates the kernels this module still builds
+ * against; on those the check does not exist either.
+ */
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
 #if defined(FOP_UNSIGNED_OFFSET)
@@ -2250,7 +2260,7 @@ void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
     /* The core owns the node and everything under it, including the sysfs
      * tree this used to build by hand. Unplugged, not just unregistered:
      * files opened before stay open, and from here every ioctl and mmap on
-     * them fails -ENODEV instead of reaching a transport about to be freed;
+     * them fails -ENODEV instead of reaching a dead transport;
      * this waits for any still inside (drm_dev_enter()). */
     drm_dev_unplug(dri->drm);
     drm_dev_put(dri->drm);

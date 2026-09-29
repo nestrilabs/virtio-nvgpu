@@ -228,7 +228,7 @@ impl IoctlResp {
             return Err(-EIO);
         }
         let status = le32(resp, 8).ok_or(-EIO)? as i32;
-        if status > 0 || status < -MAX_ERRNO {
+        if !(-MAX_ERRNO..=0).contains(&status) {
             return Err(-EPROTO);
         }
         if !has(used, 0, IOCTL_RESP_LEN) {

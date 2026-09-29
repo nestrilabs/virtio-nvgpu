@@ -49,10 +49,6 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_prime.h>
 
-#include "gen/nvgpu_rm_deep.h"
-#include "gen/nvgpu_rmalloc_classes.h"
-#include "gen/nvgpu_schema.h"
-#include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu.h"
 
 /*
@@ -286,7 +282,7 @@ int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle) {
   return ret;
 }
 
-/* ───────── UVM ioctl ───────── */
+/* ───────── ioctl entry points: RM nodes, UVM ───────── */
 
 static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
                         unsigned long arg) {
@@ -1565,7 +1561,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
   /* ── Section 1: sysfs files ─────────────────────────────────────── */
   while (p + 8 <= end) {
-    /* Fix: memcpy for unaligned u32 reads, matching nvgpu_proc_init style */
+    /* memcpy: the stream's fields are not aligned. */
     __le32 raw_path_len, raw_content_len;
     u32 path_len, content_len, copy_len;
     char path[256];
@@ -1585,7 +1581,7 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
       break;
     }
 
-    /* Safe path extraction — explicit memset, no {} initialiser */
+    /* NUL-terminated, however long the path the backend sent. */
     memset(path, 0, sizeof(path));
     copy_len = min(path_len, (u32)(sizeof(path) - 1));
     memcpy(path, p, copy_len);

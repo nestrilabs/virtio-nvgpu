@@ -124,7 +124,11 @@ fn fd_kinds_agree_everywhere() {
     for t in 0u32..1100 {
         for kinds in (0..32).map(|b| 1u32 << b).chain([0, u32::MAX]) {
             let c = unsafe { nvgpu_guest_difftest::cabi::nvgpu_fd_kind_allowed(t, kinds) };
-            assert_eq!(c, schema::fd_kind_allowed(t, kinds), "type {t} kinds {kinds:#x}");
+            assert_eq!(
+                c,
+                schema::fd_kind_allowed(t, kinds),
+                "type {t} kinds {kinds:#x}"
+            );
         }
     }
 }

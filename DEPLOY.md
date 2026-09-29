@@ -588,17 +588,30 @@ against: only for reproducing that failure.
 
 ## The guest
 
-**Kernel and module.** A Linux 7.2 guest kernel with the options
+**Kernel and module.** A Linux 7.2 x86-64 guest kernel with the options
 [`scripts/build-guest-kernel.sh`](scripts/build-guest-kernel.sh) sets (it
-builds the kernel and the module together), and the guest module
-`virtio_gpu_nv.ko`, built from [`driver/`](driver/) against it, C or Rust
-parsers ([`driver/README.md`](driver/README.md)). Its parameters:
+builds the kernel and the module together), `CONFIG_RUST=y` among them, and
+the guest module `virtio_gpu_nv.ko`, built from [`driver/`](driver/)
+against it. On a kernel with Rust the module's parsers of guest-process
+input are the Rust ones, the default; `NVGPU_RUST=0` builds the C ones
+instead, for a guest kernel that cannot have Rust (`modinfo -F parsers`
+says which, and a C module on a Rust kernel says so at load;
+[`driver/README.md`](driver/README.md)). One virtio-gpu-nv device per
+guest. Its parameters (`/sys/module/virtio_gpu_nv/parameters/`):
 
-| parameter | default | |
-|---|---|---|
-| `wl_mode` | `0660` | mode of `/dev/nvgpu-wl*`, created `root:root`; anything for "other" is refused |
-| `capture_mode` | `0660` | mode of `/dev/nvgpu-capture*` (only with `--inject-socket`), created `root:root`; anything for "other" is refused |
-| `virtio_id` | `45` | the virtio device ID to bind (another only for a VMM that cannot express 45) |
+| parameter | mode | default | |
+|---|---|---|---|
+| `wl_mode` | `0444` | `0660` | mode of `/dev/nvgpu-wl*`, created `root:root`; anything for "other" is refused |
+| `capture_mode` | `0444` | `0660` | mode of `/dev/nvgpu-capture*` (only with `--inject-socket`), created `root:root`; anything for "other" is refused |
+| `virtio_id` | `0444` | `45` | the virtio device ID to bind (another only for a VMM that cannot express 45) |
+| `arm_ready` | `0444` | `Y` | armed RM readiness, offered at HELLO ([Frame pacing](#frame-pacing)); `N` only to measure |
+| `rt_spin_us` | `0644` | `20` | microseconds a caller spins for its reply before sleeping; `0` never spins ([Frame pacing](#frame-pacing)) |
+| `async_fence_watch` | `0644` | `Y` | a fence proxy's WATCH from a work item ([Frame pacing](#frame-pacing)); `N` only to measure |
+| `pacing` | `0400` | -- | read-only, root only: the frame-pacing counters |
+
+The `0444` ones are set at load (on the kernel command line as
+`virtio_gpu_nv.<name>=`, or with `modprobe`); root may change the `0644`
+ones at run time, and there is no reason to outside a measurement.
 
 **NVIDIA userspace.** The host's own release, exactly: in the image, or
 mounted from a share `nvgpu-userspace` staged. The module makes the device
