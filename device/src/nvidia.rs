@@ -350,11 +350,16 @@ impl FileTree {
     }
 
     /// Read the tree, returning `(path relative to the root, contents)`.
+    /// `pci_config`: full config spaces the launcher snapshotted, by PCI
+    /// address ([`merge_pci_config`]).
     ///
     /// Only regular files, and only small ones: these trees are descriptive
     /// text, and anything large is either not one of them or not something a
     /// guest should be handed through a single response buffer.
-    fn collect(self) -> Vec<(String, Vec<u8>)> {
+    fn collect(
+        self,
+        pci_config: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Vec<(String, Vec<u8>)> {
         const MAX_FILE: u64 = 64 * 1024;
         match self {
             Self::Proc => {
@@ -390,7 +395,13 @@ impl FileTree {
                     let rel = format!("bus/pci/devices/{addr}/config");
                     let abs = std::path::Path::new("/sys").join(&rel);
                     match std::fs::read(&abs) {
-                        Ok(content) => Some((rel, content)),
+                        Ok(live) => {
+                            let content = pci_config
+                                .get(addr.as_ref())
+                                .and_then(|snap| merge_pci_config(&live, snap))
+                                .unwrap_or(live);
+                            Some((rel, content))
+                        }
                         Err(e) => {
                             log::warn!("sys: cannot read {}: {}", abs.display(), e);
                             None
@@ -400,6 +411,36 @@ impl FileTree {
                 .collect(),
         }
     }
+}
+
+/// The PCI config space the guest's fake device is given: the backend's own
+/// read of it (`live`) and, past it, a snapshot of the whole space the
+/// launcher took as root (`snap`, `--pci-config-dir`).
+///
+/// Linux gives a reader without CAP_SYS_ADMIN the first 64 bytes of a
+/// device's config (pci-sysfs.c, `pci_read_config`), and the backend never
+/// has it: the guest's device had no capability list and no PCIe extended
+/// capabilities, its capability pointer at 0x34 pointing into zeros, and
+/// nvidia-smi could not report the link (review 2026-09-29, parity #14).
+/// The snapshot is taken only if it is of this device -- vendor, device,
+/// class and subsystem as the live read has them -- and at most 4 KiB;
+/// the live bytes stay authoritative for what they cover. None otherwise.
+pub(crate) fn merge_pci_config(live: &[u8], snap: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: usize = 64;
+    const MAX: usize = 4096;
+    if live.len() > HEADER || snap.len() <= live.len() || snap.len() > MAX || live.len() < HEADER {
+        return None;
+    }
+    // Vendor and device; revision and class; subsystem vendor and id.
+    for r in [0..4, 8..12, 0x2c..0x30] {
+        if live[r.clone()] != snap[r] {
+            log::warn!("sys: the PCI config snapshot is of another device; not used");
+            return None;
+        }
+    }
+    let mut out = live.to_vec();
+    out.extend_from_slice(&snap[live.len()..]);
+    Some(out)
 }
 
 /// Walk `dir`, appending every readable regular file under it.
@@ -524,6 +565,9 @@ pub struct NvidiaBackend {
     pub(crate) live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Each GPU's whole PCI config space, by address, as the launcher
+    /// snapshotted it (`--pci-config-dir`); see [`merge_pci_config`].
+    pci_config: std::collections::HashMap<String, Vec<u8>>,
     /// Whether RM escapes pass with no host version set: only the unit
     /// tests' and fuzzers' fake RMs, which no release describes. Everything
     /// else refuses them (`unversioned_ok`).
@@ -1080,6 +1124,7 @@ impl NvidiaBackend {
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
             unversioned_for_test: cfg!(any(test, fuzzing)),
+            pci_config: std::collections::HashMap::new(),
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: crate::tally::Tally::default(),
             rm_controls: crate::tally::Tally::default(),
@@ -2419,7 +2464,7 @@ impl NvidiaBackend {
     /// The response is a bare stream of entries with **no message header** --
     /// the driver reads from the first byte of the buffer.
     fn handle_get_files(&mut self, tree: FileTree, resp_buf: &mut [u8]) -> usize {
-        let files = tree.collect();
+        let files = tree.collect(&self.pci_config);
         log::info!("{}: {} file(s)", tree.name(), files.len());
 
         let mut off = 0usize;
@@ -2580,6 +2625,13 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
     // IOCTL — top-level
     // ------------------------------------------------------------------
+
+    /// GPU `addr`'s whole PCI config space, as a privileged launcher read it
+    /// (`--pci-config-dir`). Checked against the device's own header at each
+    /// GET_SYS_FILES ([`merge_pci_config`]).
+    pub fn set_pci_config(&mut self, addr: &str, config: Vec<u8>) {
+        self.pci_config.insert(addr.to_string(), config);
+    }
 
     /// The host driver version, as the transport read it from the driver at
     /// start-up. Known before any guest asks, it tells HELLO whether an
@@ -7237,6 +7289,37 @@ mod tests {
         // ...and the empty card section is right before them.
         assert_eq!(read_struct::<u32>(&buf, n - 16), 0);
         assert_eq!(write_dev_info_sizes(&[dri(20)], &mut [0u8; 7]), 0);
+    }
+
+    /// A launcher's snapshot of the whole config space extends the 64 bytes
+    /// an unprivileged read gets, only if it is of the same device (parity
+    /// #14).
+    #[test]
+    fn a_pci_config_snapshot_extends_the_live_header_of_its_own_device() {
+        let mut live = vec![0u8; 64];
+        live[0..4].copy_from_slice(&[0xde, 0x10, 0x85, 0x2b]);
+        live[8..12].copy_from_slice(&[0xa1, 0, 0, 3]);
+        live[0x2c..0x30].copy_from_slice(&[0x43, 0x10, 0x11, 0x22]);
+        live[0x34] = 0x60;
+        let mut snap = live.clone();
+        snap[4] = 0xff; // a status bit that moved since: the live one wins
+        snap.resize(4096, 0);
+        snap[0x60] = 0x10; // the PCIe capability
+        snap[0x100] = 0x01; // an extended capability
+        let m = merge_pci_config(&live, &snap).unwrap();
+        assert_eq!(m.len(), 4096);
+        assert_eq!(&m[..64], &live[..]);
+        assert_eq!((m[0x60], m[0x100]), (0x10, 0x01));
+        let mut other = snap.clone();
+        other[2] = 0x86;
+        assert_eq!(merge_pci_config(&live, &other), None, "another device");
+        assert_eq!(merge_pci_config(&live, &snap[..64]), None, "nothing more");
+        assert_eq!(merge_pci_config(&live, &vec![0u8; 8192]), None, "too long");
+        assert_eq!(
+            merge_pci_config(&snap, &snap),
+            None,
+            "the live read was whole"
+        );
     }
 
     #[test]

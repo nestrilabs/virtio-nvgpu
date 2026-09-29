@@ -242,6 +242,16 @@ struct Args {
     #[arg(long, hide = true)]
     keep_guest_coherency: bool,
 
+    /// A directory holding each GPU's whole PCI config space, one file per
+    /// GPU named by its PCI address (`0000:01:00.0`), as root read it from
+    /// `/sys/bus/pci/devices/<addr>/config`. The backend, unprivileged, gets
+    /// only the first 64 bytes of that file, so the guest's device has no
+    /// capability list without it (nvidia-smi cannot report the PCIe link).
+    /// Read once at start, before the sandbox; a file of another device, or
+    /// past 4 KiB, is ignored.
+    #[arg(long, value_name = "DIR")]
+    pci_config_dir: Option<PathBuf>,
+
     /// The process sandbox (device::sandbox): a network namespace of its
     /// own, Landlock confining it to the GPU's nodes and what it reads at
     /// run time, a seccomp syscall allowlist, RLIMIT_CORE 0. Installed before
@@ -920,6 +930,38 @@ impl EventQueue for VringEventQueue {
 // ---------------------------------------------------------------------------
 // The backend
 // ---------------------------------------------------------------------------
+
+/// `--pci-config-dir`: each GPU's snapshot, by address, at most 4 KiB (a
+/// longer file is no config space). A GPU with no file is left out, and
+/// so is one that cannot be read, with a warning.
+fn read_pci_configs(dir: &Path, gpus: &[device::virtio::GpuSlot]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for g in gpus {
+        let end = g
+            .pci_addr
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(g.pci_addr.len());
+        let addr = String::from_utf8_lossy(&g.pci_addr[..end]).into_owned();
+        let path = dir.join(&addr);
+        match std::fs::read(&path) {
+            Ok(b) if b.len() <= 4096 => {
+                log::info!(
+                    "--pci-config-dir: {} bytes of GPU {addr}'s config space",
+                    b.len()
+                );
+                out.push((addr, b));
+            }
+            Ok(b) => log::warn!(
+                "--pci-config-dir: {} is {} bytes, no config space; not used",
+                path.display(),
+                b.len()
+            ),
+            Err(e) => log::warn!("--pci-config-dir: {}: {e}", path.display()),
+        }
+    }
+    out
+}
 
 /// Something to start once the process's descriptors are registered.
 type AfterScan = Box<dyn FnOnce() + Send + Sync>;
@@ -1734,6 +1776,13 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| log::warn!("RLIMIT_NOFILE: {e}; the handle table keeps its default size"))
         .ok();
 
+    // Each GPU's whole PCI config space, as the launcher snapshotted it:
+    // read before the sandbox, which leaves the directory out of reach.
+    let pci_config: Vec<(String, Vec<u8>)> = match &args.pci_config_dir {
+        None => Vec::new(),
+        Some(dir) => read_pci_configs(dir, &host::gpu_slots(&args.proc_nvidia)),
+    };
+
     // The sandbox, while this is the only thread (device::sandbox).
     match args.sandbox {
         mode @ (device::sandbox::Mode::On | device::sandbox::Mode::BestEffort) => {
@@ -1845,6 +1894,12 @@ fn main() -> anyhow::Result<()> {
         window,
     )?;
     nvgpu.after_scan = after_scan;
+    {
+        let mut be = nvgpu.shared.nvidia.lock().expect("nvidia lock");
+        for (addr, config) in pci_config {
+            be.set_pci_config(&addr, config);
+        }
+    }
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
     log::info!(
