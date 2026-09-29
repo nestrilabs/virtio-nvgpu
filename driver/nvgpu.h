@@ -427,6 +427,33 @@ long nvgpu_uvm_ioctl_fd(struct nvgpu_fd *nfd, unsigned int cmd,
 long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
                          void __user *uarg);
 
+/* ───────── nvgpu_v1.c: the v1 IOCTL exchange, both builds ───────── */
+
+/* A v1 IOCTL reply's header, as far as the device wrote it. */
+struct nvgpu_ioctl_reply {
+  s32 status; /* 0 or a -errno in [-MAX_ERRNO, -1]: the host call's result */
+  u32 used;   /* bytes the device wrote */
+  bool full;  /* the whole nvgpu_ioctl_resp is there; else the lengths are 0 */
+  u32 data_len;
+  u32 nested_len;
+  u32 deep_len;
+};
+void nvgpu_ioctl_req_init(struct nvgpu_ioctl_req *req, u32 handle, u32 cmd,
+                          u32 data_len, u32 nested_off, u32 nested_len,
+                          u32 deep_off, u32 deep_len);
+/*
+ * Read a reply of `used` bytes: 0 and *r, -EIO for less than a header, or
+ * -EPROTO for a status that is neither 0 nor an errno (nothing of it is to be
+ * read then).
+ */
+int nvgpu_ioctl_reply_parse(const void *resp, u32 used,
+                            struct nvgpu_ioctl_reply *r);
+/* nvgpu_send_recv_used() and nvgpu_ioctl_reply_parse(): a transport error,
+ * -EIO, -EPROTO, or 0 with the reply in *r. */
+int nvgpu_ioctl_exchange(struct nvgpu_device *dev, void *req, size_t req_len,
+                         void *resp, size_t resp_max,
+                         struct nvgpu_ioctl_reply *r);
+
 /* ───────── nvgpu_main.c ───────── */
 
 long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle, unsigned int cmd,

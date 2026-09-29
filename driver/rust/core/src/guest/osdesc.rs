@@ -382,9 +382,12 @@ pub fn register<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64, c: &Call) -> 
         }
         (Ok(_), None) => return -EIO,
     };
-    let Some(h) = IoctlResp::parse(resp.as_ref(), used) else {
-        env.unpin(pin);
-        return -EIO;
+    let h = match IoctlResp::parse(resp.as_ref(), used) {
+        Ok(h) => h,
+        Err(e) => {
+            env.unpin(pin);
+            return e;
+        }
     };
     let ret = h.status;
     if ret < 0 {

@@ -648,6 +648,94 @@ fn a_v1v2_count_that_wraps_carries_no_deep_block() {
 }
 
 #[test]
+fn a_status_that_is_not_an_errno_is_eproto_and_nothing_comes_back() {
+    // The backend's status is 0 or a -errno. Anything else was returned from
+    // the ioctl as it was -- a positive "result" no native driver gives, or
+    // an errno past MAX_ERRNO -- and the flat path copied the block back
+    // beside it. Now: -EPROTO, and the caller's memory as it was.
+    for bad in [1i32, 5, i32::MAX, -4096, i32::MIN] {
+        // A flat escape (nvgpu_ioctl_simple).
+        let mut w = world();
+        let arg = vec![0x11u8; 24];
+        w.mem.insert(ARG, arg.clone());
+        w.canned = vec![reply(bad, &[0x99; 24], &[], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x50, 24),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "flat, status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..], "flat, status {bad}");
+
+        // RM_CONTROL, whose struct and nested block come back on any status.
+        let mut w = world();
+        let call = control(0x2080_0101, vec![0x22; 16], &mut w);
+        let params = w.mem[&ARG].clone();
+        w.canned = vec![reply(bad, &[0x99; 32], &[0x98; 16], &[])];
+        let o = run(dev(0, vec![]), w, call);
+        assert_eq!(o.ret, -71, "control, status {bad}");
+        assert_eq!(mem(&o, ARG), &params[..]);
+        assert_eq!(mem(&o, NESTED), &[0x22; 16][..]);
+
+        // A descriptor at a fixed offset (nvgpu_ioctl_translate_fd).
+        let mut w = world();
+        let mut arg = vec![0u8; 56];
+        put(&mut arg, 48, 3, 4);
+        w.mem.insert(ARG, arg.clone());
+        w.canned = vec![reply(bad, &[0x99; 56], &[], &[])];
+        let o = run(
+            dev(0, vec![(0x27, 48)]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x27, 56),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "fd, status {bad}");
+        assert_eq!(mem(&o, ARG), &arg[..]);
+
+        // A v1 backend's NVKMS command.
+        let mut w = world();
+        let mut outer = vec![0u8; 16];
+        put(&mut outer, 0, 3, 4);
+        put(&mut outer, 4, 8, 4);
+        put(&mut outer, 8, NESTED, 8);
+        w.mem.insert(ARG, outer.clone());
+        w.mem.insert(NESTED, vec![0x33; 8]);
+        w.canned = vec![reply(bad, &[0x99; 16], &[0x98; 8], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Modeset {
+                cmd: ioc(3, 0x6d, 0, 16),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, -71, "nvkms, status {bad}");
+        assert_eq!(mem(&o, ARG), &outer[..]);
+        assert_eq!(mem(&o, NESTED), &[0x33; 8][..]);
+    }
+    // The errnos at either end still pass as they are.
+    for good in [-1i32, -4095] {
+        let mut w = world();
+        w.mem.insert(ARG, vec![0x11u8; 24]);
+        w.canned = vec![reply(good, &[], &[], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Fd {
+                cmd: ioc(3, b'F', 0x50, 24),
+                arg: ARG,
+            },
+        );
+        assert_eq!(o.ret, i64::from(good));
+    }
+}
+
+#[test]
 fn nvkms_takes_its_one_ioctl_only() {
     // Another size, or another number: -ENOTTY, as nvkms_ioctl, with nothing
     // read or written (the C read and wrote 16 bytes whatever the size).

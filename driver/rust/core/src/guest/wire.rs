@@ -218,26 +218,31 @@ pub struct IoctlResp {
 }
 
 impl IoctlResp {
-    /// The header of a reply the device wrote `used` bytes of, or `None`
-    /// when it wrote less than a header (the C paths' -EIO).
-    pub fn parse(resp: &[u8], used: u32) -> Option<IoctlResp> {
-        let used = usize::try_from(used).ok()?;
+    /// `nvgpu_ioctl_reply_parse()`: the header of a reply the device wrote
+    /// `used` bytes of; -EIO when it wrote less than a header, and -EPROTO
+    /// for a status that is neither 0 nor an errno in `[-MAX_ERRNO, -1]`,
+    /// which no native call returns (nothing of such a reply is read).
+    pub fn parse(resp: &[u8], used: u32) -> Result<IoctlResp, Errno> {
+        let used = usize::try_from(used).map_err(|_| -EIO)?;
         if !has(used, 0, HDR_LEN) {
-            return None;
+            return Err(-EIO);
         }
-        let status = le32(resp, 8)? as i32;
+        let status = le32(resp, 8).ok_or(-EIO)? as i32;
+        if status > 0 || status < -MAX_ERRNO {
+            return Err(-EPROTO);
+        }
         if !has(used, 0, IOCTL_RESP_LEN) {
-            return Some(IoctlResp {
+            return Ok(IoctlResp {
                 status,
                 ..IoctlResp::default()
             });
         }
-        Some(IoctlResp {
+        Ok(IoctlResp {
             status,
             full: true,
-            data_len: le32(resp, 16)?,
-            nested_len: le32(resp, 20)?,
-            deep_len: le32(resp, 24)?,
+            data_len: le32(resp, 16).ok_or(-EIO)?,
+            nested_len: le32(resp, 20).ok_or(-EIO)?,
+            deep_len: le32(resp, 24).ok_or(-EIO)?,
         })
     }
 }
@@ -286,10 +291,20 @@ mod tests {
         let mut r = [0u8; 28];
         r[8..12].copy_from_slice(&(-22i32).to_le_bytes());
         r[16] = 5;
-        assert_eq!(IoctlResp::parse(&r, 15), None);
+        assert_eq!(IoctlResp::parse(&r, 15), Err(-EIO));
         let h = IoctlResp::parse(&r, 16).unwrap();
         assert_eq!((h.status, h.full, h.data_len), (-22, false, 0));
         let h = IoctlResp::parse(&r, 28).unwrap();
         assert_eq!((h.status, h.full, h.data_len), (-22, true, 5));
+        // A status that is not an errno: -EPROTO, the payload unread.
+        for bad in [1i32, 5, i32::MAX, -MAX_ERRNO - 1, i32::MIN] {
+            r[8..12].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(IoctlResp::parse(&r, 28), Err(-EPROTO), "{bad}");
+            assert_eq!(IoctlResp::parse(&r, 16), Err(-EPROTO), "{bad}");
+        }
+        for good in [0i32, -1, -MAX_ERRNO] {
+            r[8..12].copy_from_slice(&good.to_le_bytes());
+            assert_eq!(IoctlResp::parse(&r, 28).map(|h| h.status), Ok(good));
+        }
     }
 }

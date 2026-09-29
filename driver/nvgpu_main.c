@@ -802,7 +802,7 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
-  u32 used;
+  struct nvgpu_ioctl_reply r;
   long ret;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
@@ -813,32 +813,17 @@ long nvgpu_ioctl_flat_h(struct nvgpu_device *dev, u32 handle,
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sz);
-  req->nested_offset = 0;
-  req->nested_len = 0;
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, handle, cmd, sz, 0, 0, 0, 0);
   memcpy(req_buf + sizeof(*req), kbuf, sz);
 
-  ret = nvgpu_send_recv_used(dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(dev, req_buf, req_total, resp_buf, resp_max, &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (long)(s32)le32_to_cpu((__le32)resp->hdr.status);
-  if (nvgpu_resp_has(used, 0, sizeof(*resp)) &&
-      le32_to_cpu(resp->data_len) >= sz &&
-      nvgpu_resp_has(used, sizeof(*resp), sz))
+  ret = r.status;
+  if (r.full && r.data_len >= sz &&
+      nvgpu_resp_has(r.used, sizeof(*resp), sz))
     memcpy(kbuf, resp_buf + sizeof(*resp), sz);
   else if (ret >= 0)
     /*

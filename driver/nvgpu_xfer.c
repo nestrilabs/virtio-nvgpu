@@ -1028,13 +1028,19 @@ int nvgpu_send_recv(struct nvgpu_device *dev, void *req, int req_len,
   return ret;
 }
 
-/* Status of a reply that must at least carry a header. */
+/*
+ * Status of a reply that must at least carry a header: 0 or a -errno, and
+ * -EPROTO for anything else, which no call of ours may return (as
+ * nvgpu_ioctl_reply_parse() and IOCTL2 have it).
+ */
 static int nvgpu_hdr_status(const void *resp, u32 used) {
   const struct nvgpu_msg_hdr *h = resp;
+  s32 status;
 
   if (used < sizeof(*h))
     return -EIO;
-  return (s32)le32_to_cpu(h->status);
+  status = (s32)le32_to_cpu(h->status);
+  return status > 0 || status < -MAX_ERRNO ? -EPROTO : status;
 }
 
 /* ───────── CLOSE, GEM_CLOSE and their async twins ───────── */

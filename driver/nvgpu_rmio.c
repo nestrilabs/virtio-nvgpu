@@ -144,27 +144,18 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf, *resp_buf;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
-  u32 used, data_len;
+  struct nvgpu_ioctl_reply r;
   int ret;
 
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sz);
-  req->nested_offset = 0;
-  req->nested_len = 0;
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sz, 0, 0, 0, 0);
 
   if (sz > 0) {
     if (pre)
@@ -177,35 +168,26 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   if (proc)
     nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sz);
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /*
    * Only what the device wrote. A failed call comes back as a bare header,
    * and before the used length was kept the bytes after it were whatever the
    * kmalloc'd buffer held -- guest kernel heap, copied out to userspace.
    */
-  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
-                 ? le32_to_cpu(resp->data_len)
-                 : 0;
-  if (sz > 0 && data_len && data_len <= sz &&
-      nvgpu_resp_has(used, sizeof(*resp), data_len)) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
+  if (sz > 0 && r.data_len && r.data_len <= sz &&
+      nvgpu_resp_has(r.used, sizeof(*resp), r.data_len)) {
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp), r.data_len))
       ret = -EFAULT;
   }
 
 out:
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -538,9 +520,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   int req_total, resp_max, ret;
   bool proc;
-  u32 used;
 
   if (sz < sizeof(params))
     return -EINVAL;
@@ -601,11 +583,11 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
    * each read apart from the bytes that were then sent.)
    */
   if (user_nested && nested_size > 0) {
-    nested_copy = kmalloc(nested_size, GFP_KERNEL);
+    nested_copy = kvmalloc(nested_size, GFP_KERNEL);
     if (!nested_copy)
       return -ENOMEM;
     if (copy_from_user(nested_copy, user_nested, nested_size)) {
-      kfree(nested_copy);
+      kvfree(nested_copy);
       return -EFAULT;
     }
   }
@@ -613,7 +595,7 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   /* A host TSC reading means nothing in the guest (nvgpu_rm_intercepts.h). */
   if (ctl_cmd == NVGPU_RM_TIME_CORRELATION && nested_copy &&
       nvgpu_tci_is_tsc(nested_copy[NVGPU_TCI_CLK_ID])) {
-    kfree(nested_copy);
+    kvfree(nested_copy);
     return nvgpu_set_nvos54_status(uarg, NVGPU_NV_ERR_NOT_SUPPORTED);
   }
 
@@ -667,24 +649,16 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   resp_max =
       sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size + deep_len;
 
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
-  req->nested_len = cpu_to_le32(nested_size);
-  req->deep_ptr_offset = cpu_to_le32(deep_ptr_offset);
-  req->deep_len = cpu_to_le32(deep_len);
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sizeof(params), sizeof(params),
+                       nested_size, deep_ptr_offset, deep_len);
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
@@ -764,34 +738,29 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
     nvgpu_proc_id_fill(nfd->dev, req_buf + sizeof(*req) + sizeof(params) +
                                      nested_size + deep_len);
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /*
    * RM's own verdict is in params.status, so a successful reply always
    * carries the struct back. A failed one is a bare header: nothing to copy,
    * and the caller's struct is left as it was rather than overwritten.
    */
-  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(params)))
+  if (!nvgpu_resp_has(r.used, sizeof(*resp), sizeof(params)))
     goto out;
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
     ret = -EFAULT;
     goto out;
   }
 
-  if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
-    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+  if (user_nested && r.nested_len > 0) {
+    u32 copy_back = min(nested_size, r.nested_len);
 
-    if (!nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back))
+    if (!nvgpu_resp_has(r.used, sizeof(*resp) + sizeof(params), copy_back))
       goto out;
     if (nested_fd >= 0 && copy_back >= nested_fd_offset + sizeof(u32))
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) + nested_fd_offset,
@@ -809,29 +778,27 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
       ret = -EFAULT;
   }
 
-  if (plan.n && le32_to_cpu(resp->deep_len) > 0) {
+  if (plan.n && r.deep_len > 0) {
     /* Each segment RM writes goes back to its own pointer. */
-    u32 back = le32_to_cpu(resp->deep_len);
-    size_t at = sizeof(*resp) + sizeof(params) +
-                (size_t)le32_to_cpu(resp->nested_len);
+    u32 back = r.deep_len;
+    size_t at = sizeof(*resp) + sizeof(params) + (size_t)r.nested_len;
 
-    if (nvgpu_resp_has(used, at, back) &&
+    if (nvgpu_resp_has(r.used, at, back) &&
         nvgpu_deep_copy_back(&plan, resp_buf + at, back))
       ret = -EFAULT;
-  } else if (deep_len > 0 && le32_to_cpu(resp->deep_len) > 0) {
-    u32 copy_back = min(deep_len, le32_to_cpu(resp->deep_len));
-    size_t at = sizeof(*resp) + sizeof(params) +
-                (size_t)le32_to_cpu(resp->nested_len);
+  } else if (deep_len > 0 && r.deep_len > 0) {
+    u32 copy_back = min(deep_len, r.deep_len);
+    size_t at = sizeof(*resp) + sizeof(params) + (size_t)r.nested_len;
 
-    if (nvgpu_resp_has(used, at, copy_back) &&
+    if (nvgpu_resp_has(r.used, at, copy_back) &&
         copy_to_user((void __user *)deep_user_ptr, resp_buf + at, copy_back))
       ret = -EFAULT;
   }
 
 out:
-  kfree(nested_copy);
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(nested_copy);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -851,8 +818,9 @@ static long nvgpu_ioctl_idle_channels(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_deep_plan plan;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   void *req_buf = NULL, *resp_buf = NULL;
-  u32 channel, count, used, data_len;
+  u32 channel, count;
   size_t req_total, resp_max;
   int ret;
 
@@ -876,53 +844,37 @@ static long nvgpu_ioctl_idle_channels(struct nvgpu_fd *nfd, unsigned int cmd,
 
   req_total = sizeof(*req) + sizeof(params) + plan.bytes;
   resp_max = sizeof(*resp) + sizeof(params);
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = 0;
-  req->nested_len = 0;
-  req->deep_ptr_offset = cpu_to_le32(NVGPU_DEEP_SEGMENTED);
-  req->deep_len = cpu_to_le32(plan.bytes);
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sizeof(params), 0, 0,
+                       NVGPU_DEEP_SEGMENTED, plan.bytes);
   memcpy(req_buf + sizeof(*req), params, sizeof(params));
   ret = nvgpu_deep_fill(&plan, req_buf + sizeof(*req) + sizeof(params));
   if (ret)
     goto out;
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /* RM only reads the arrays: the block, with RM's status, is all that
    * comes back. */
-  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
-                 ? le32_to_cpu(resp->data_len)
-                 : 0;
-  if (data_len && data_len <= sizeof(params) &&
-      nvgpu_resp_has(used, sizeof(*resp), data_len) &&
-      copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
+  if (r.data_len && r.data_len <= sizeof(params) &&
+      nvgpu_resp_has(r.used, sizeof(*resp), r.data_len) &&
+      copy_to_user(uarg, resp_buf + sizeof(*resp), r.data_len))
     ret = -EFAULT;
 
 out:
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -942,10 +894,10 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf = NULL, *resp_buf = NULL, *nested;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   int req_total, resp_max, ret;
   /* The event descriptor NV0005 names, once swapped for a handle. */
   int event_fd = -1;
-  u32 used;
   /* NV_EVENT_BUFFER's OS event, translated, and the caller's value. */
   bool os_event = false;
   u64 os_event_val = 0;
@@ -997,24 +949,16 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
               (nvgpu_proc_ids(nfd->dev) ? sizeof(struct nvgpu_proc_id) : 0);
   resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
 
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
-  req->nested_len = cpu_to_le32(nested_size);
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sizeof(params), sizeof(params),
+                       nested_size, 0, 0);
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
   if (nvgpu_proc_ids(nfd->dev))
@@ -1095,20 +1039,15 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /* As for RM_CONTROL: a failed reply is a bare header, nothing to copy. */
-  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(params)))
+  if (!nvgpu_resp_has(r.used, sizeof(*resp), sizeof(params)))
     goto out;
   if (caller_psize)
     memcpy(resp_buf + sizeof(*resp) +
@@ -1119,8 +1058,8 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
     goto out;
   }
 
-  if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
-    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+  if (user_alloc && r.nested_len > 0) {
+    u32 copy_back = min(nested_size, r.nested_len);
 
     if (os_event &&
         copy_back >= NVGPU_EVENT_BUFFER_NOTIFICATION_OFFSET + sizeof(u64))
@@ -1137,15 +1076,15 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
       memcpy(resp_buf + sizeof(*resp) + sizeof(params) +
                  NVGPU_NV0005_DATA_OFFSET,
              &event_fd, sizeof(event_fd));
-    if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(params), copy_back) &&
+    if (nvgpu_resp_has(r.used, sizeof(*resp) + sizeof(params), copy_back) &&
         copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
                      copy_back))
       ret = -EFAULT;
   }
 
 out:
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -1166,9 +1105,10 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
                                      const void *pre) {
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   void *req_buf = NULL, *resp_buf = NULL;
   int guest_fd;
-  u32 host_handle, used, data_len;
+  u32 host_handle;
   int req_total, resp_max, ret;
 
   if (sz < payload_offset + sizeof(guest_fd))
@@ -1177,8 +1117,8 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
   req_total = sizeof(*req) + sz;
   resp_max = sizeof(*resp) + sz;
 
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
@@ -1224,47 +1164,28 @@ static long nvgpu_ioctl_translate_fd(struct nvgpu_fd *nfd, unsigned int cmd,
            sizeof(host_handle));
   }
 
-  /* Build request header */
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sz);
-  req->nested_offset = 0;
-  req->nested_len = 0;
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sz, 0, 0, 0, 0);
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /* Write the (possibly modified) payload back to userspace */
-  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
-                 ? le32_to_cpu(resp->data_len)
-                 : 0;
-  if (ret == 0 && data_len > 0 && data_len <= sz &&
-      nvgpu_resp_has(used, sizeof(*resp), data_len)) {
-    if (data_len >= payload_offset + sizeof(guest_fd))
+  if (ret == 0 && r.data_len > 0 && r.data_len <= sz &&
+      nvgpu_resp_has(r.used, sizeof(*resp), r.data_len)) {
+    if (r.data_len >= payload_offset + sizeof(guest_fd))
       memcpy(resp_buf + sizeof(*resp) + payload_offset, &guest_fd,
              sizeof(guest_fd));
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp), data_len))
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp), r.data_len))
       ret = -EFAULT;
   }
 
 out:
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -1481,8 +1402,8 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   int req_total, resp_max, ret;
-  u32 used;
 
   /*
    * NVKMS takes one ioctl, NVKMS_IOCTL_CMD with exactly NvKmsIoctlParams
@@ -1510,24 +1431,16 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   req_total = sizeof(*req) + sizeof(outer) + nested_size;
   resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(outer) + nested_size;
 
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  req_buf = kvmalloc(req_total, GFP_KERNEL);
+  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
     ret = -ENOMEM;
     goto out;
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(outer));
-  req->nested_offset = cpu_to_le32(sizeof(outer));
-  req->nested_len = cpu_to_le32(nested_size);
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, sizeof(outer), sizeof(outer),
+                       nested_size, 0, 0);
 
   memcpy(req_buf + sizeof(*req), &outer, sizeof(outer));
 
@@ -1594,20 +1507,15 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
 
-  ret = nvgpu_send_recv_used(nfd->dev, req_buf, req_total, resp_buf, resp_max,
-                             &used);
+  ret = nvgpu_ioctl_exchange(nfd->dev, req_buf, req_total, resp_buf, resp_max,
+                             &r);
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
-    goto out;
-  }
-
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
 
   /* Write back outer struct -- if the device sent one back. */
-  if (!nvgpu_resp_has(used, sizeof(*resp), sizeof(outer)))
+  if (!nvgpu_resp_has(r.used, sizeof(*resp), sizeof(outer)))
     goto out;
   if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(outer))) {
     ret = -EFAULT;
@@ -1615,18 +1523,18 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   /* Write back nested params */
-  if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
-    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+  if (user_nested && r.nested_len > 0) {
+    u32 copy_back = min(nested_size, r.nested_len);
 
-    if (nvgpu_resp_has(used, sizeof(*resp) + sizeof(outer), copy_back) &&
+    if (nvgpu_resp_has(r.used, sizeof(*resp) + sizeof(outer), copy_back) &&
         copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(outer),
                      copy_back))
       ret = -EFAULT;
   }
 
 out:
-  kfree(req_buf);
-  kfree(resp_buf);
+  kvfree(req_buf);
+  kvfree(resp_buf);
   return ret;
 }
 
@@ -1812,6 +1720,7 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_ioctl_req *req = NULL;
   struct nvgpu_ioctl_resp *resp = NULL;
   struct nvgpu_osdesc_hdr *h;
+  struct nvgpu_ioctl_reply r;
   struct page **pages;
   size_t req_len, resp_len, params = c->outer_len + c->nested_len;
   u32 used, data_len, nested_len, deep_len;
@@ -1854,15 +1763,10 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
     ret = -ENOMEM;
     goto unpin;
   }
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(c->outer_len);
-  req->nested_offset = cpu_to_le32(c->nested_len ? c->outer_len : 0);
-  req->nested_len = cpu_to_le32(c->nested_len);
-  req->deep_ptr_offset = cpu_to_le32(NVGPU_DEEP_PAGE_LIST);
-  req->deep_len =
-      cpu_to_le32(sizeof(*h) + nruns * sizeof(struct nvgpu_osdesc_run));
+  nvgpu_ioctl_req_init(req, nfd->handle, cmd, c->outer_len,
+                       c->nested_len ? c->outer_len : 0, c->nested_len,
+                       NVGPU_DEEP_PAGE_LIST,
+                       sizeof(*h) + nruns * sizeof(struct nvgpu_osdesc_run));
   at = (u8 *)(req + 1);
   memcpy(at, c->outer, c->outer_len);
   memcpy(at + c->outer_len, c->nested, c->nested_len);
@@ -1882,19 +1786,16 @@ static long nvgpu_osdesc_register(struct nvgpu_fd *nfd, unsigned int cmd,
   }
   if (ret < 0)
     goto unpin;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
+  ret = nvgpu_ioctl_reply_parse(resp, used, &r);
+  if (ret < 0)
     goto unpin;
-  }
-  ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+  ret = r.status;
   if (ret < 0)
     goto unpin; /* refused before RM saw it */
 
-  data_len = nvgpu_resp_has(used, 0, sizeof(*resp))
-                 ? le32_to_cpu(resp->data_len)
-                 : 0;
-  nested_len = data_len ? le32_to_cpu(resp->nested_len) : 0;
-  deep_len = data_len ? le32_to_cpu(resp->deep_len) : 0;
+  data_len = r.data_len;
+  nested_len = data_len ? r.nested_len : 0;
+  deep_len = data_len ? r.deep_len : 0;
   if (deep_len == sizeof(u64) &&
       nvgpu_resp_has(used, sizeof(*resp) + data_len + nested_len, deep_len))
     id = get_unaligned_le64((u8 *)(resp + 1) + data_len + nested_len);

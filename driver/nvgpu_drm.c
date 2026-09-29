@@ -1494,6 +1494,7 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
+  struct nvgpu_ioctl_reply r;
   int req_total, resp_max, ret;
   u32 fwd_handle = nfd->handle;
   u32 caller_handle = 0;
@@ -1562,16 +1563,8 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   }
 
   req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(fwd_handle);
-  req->hdr.status = 0;
-  req->hdr.req_id = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(d->size);
-  req->nested_offset = cpu_to_le32(d->size);
-  req->nested_len = cpu_to_le32(nested_size);
-  req->deep_ptr_offset = 0;
-  req->deep_len = 0;
+  nvgpu_ioctl_req_init(req, fwd_handle, cmd, d->size, d->size, nested_size, 0,
+                       0);
 
   memcpy(req_buf + sizeof(*req), outer, d->size);
 
@@ -1621,20 +1614,14 @@ static long nvgpu_ioctl_drm_gem_nested(struct nvgpu_fd *nfd,
   }
   if (ret < 0)
     goto out;
-  if (!nvgpu_resp_has(used, 0, sizeof(resp->hdr))) {
-    ret = -EIO;
+  ret = nvgpu_ioctl_reply_parse(resp_buf, used, &r);
+  if (ret < 0)
     goto out;
-  }
 
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
-  if (nvgpu_resp_has(used, 0, sizeof(*resp))) {
-    data_len = le32_to_cpu(resp->data_len);
-    nested_len = le32_to_cpu(resp->nested_len);
-  } else {
-    data_len = 0;
-    nested_len = 0;
-  }
+  ret = r.status;
+  data_len = r.data_len;
+  nested_len = r.nested_len;
 
   /*
    * The outer struct carries the answer: GEM_IMPORT writes the new handle
