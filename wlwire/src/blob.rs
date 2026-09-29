@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_BLOB, Unit, record};
+use crate::job::Job;
 use crate::shm::ShmBudget;
 use crate::sys;
 
@@ -231,14 +232,14 @@ pub struct BlobJob {
     pos: u64,
 }
 
-impl BlobJob {
+impl Job for BlobJob {
     /// Bytes still to send.
-    pub fn remaining(&self) -> u64 {
+    fn remaining(&self) -> u64 {
         self.len - self.pos
     }
 
     /// The next BLOB record, and how many bytes it carries; `None` once done.
-    pub fn next_unit(&mut self) -> Option<(Unit, usize)> {
+    fn next_unit(&mut self) -> Option<(Unit, usize)> {
         if self.pos >= self.len {
             return None;
         }

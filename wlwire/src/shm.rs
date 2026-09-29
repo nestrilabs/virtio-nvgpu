@@ -21,7 +21,8 @@
 //!
 //! The client's descriptor is only ever read with `pread`, never mapped: a
 //! client that truncates its pool under us gets short copies, not a SIGBUS in
-//! the proxy.
+//! the proxy, and its connection goes on: what a copy was counted at on the
+//! channel's backlog is given back however short it came (`job.rs`).
 //!
 //! **What the server's side may hold.** Its memfds are the one place a peer
 //! decides how much memory the proxy commits: every `SHM_SYNC` is written into
@@ -66,6 +67,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::frame::{MAX_REC_PAYLOAD, REC_SHM_SYNC, Unit, record_with};
+use crate::job::Job;
 use crate::sys;
 
 /// The largest pool the protocol can make or resize to: its size is an
@@ -651,16 +653,17 @@ pub struct SyncJob {
     end: u64,
 }
 
-impl SyncJob {
+impl Job for SyncJob {
     /// Bytes still to read.
-    pub fn remaining(&self) -> u64 {
+    fn remaining(&self) -> u64 {
         self.end - self.off
     }
 
     /// The next record, and how many bytes of the buffer it carries; `None`
     /// once done, or where the client's file ends short (it truncated its
-    /// own pool: the compositor keeps what it had there).
-    pub fn next_unit(&mut self) -> Option<(Unit, usize)> {
+    /// own pool: the compositor keeps what it had there, and the rest of the
+    /// copy is not sent).
+    fn next_unit(&mut self) -> Option<(Unit, usize)> {
         if self.off >= self.end {
             return None;
         }

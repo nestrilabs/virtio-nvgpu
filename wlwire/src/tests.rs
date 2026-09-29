@@ -1010,6 +1010,94 @@ fn shm_contents_reach_the_host_memfd_at_commit_and_only_the_damage_after() {
     );
 }
 
+/// A client with wl_compositor (3), wl_shm (4) and a surface (5), whose
+/// 8 MiB buffer 7 in pool 6 it then truncates to `left` bytes behind the
+/// proxy's back before committing it; the commit, and a `wl_display.sync`
+/// after it, as they are taken.
+fn commit_a_truncated_pool(left: u64) -> Pair {
+    let mut p = Pair::new(Policy::default());
+    p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+    p.bind(1, "wl_compositor", 6, 3).unwrap();
+    p.bind(2, "wl_shm", 2, 4).unwrap();
+    let (stride, height) = (4096i32, 2048i32);
+    let pool = sys::memfd(c"pool", (stride * height) as u64).unwrap();
+    let keep = pool.try_clone().unwrap();
+    p.client_sends(
+        &[
+            MsgBuilder::new(3, op::wl_compositor::REQ_CREATE_SURFACE)
+                .new_id(5)
+                .finish(),
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(6)
+                .int(stride * height)
+                .finish(),
+            MsgBuilder::new(6, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(7)
+                .int(0)
+                .int(stride / 4)
+                .int(height)
+                .int(stride)
+                .uint(0)
+                .finish(),
+        ],
+        vec![pool],
+    )
+    .unwrap();
+    p.at_server();
+    sys::ftruncate(keep.as_raw_fd(), left).unwrap();
+    let mut data = [
+        MsgBuilder::new(5, op::wl_surface::REQ_ATTACH)
+            .object(7)
+            .int(0)
+            .int(0)
+            .finish(),
+        MsgBuilder::new(5, op::wl_surface::REQ_COMMIT).finish(),
+        MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish(),
+    ]
+    .concat();
+    let mut fds = VecDeque::new();
+    for _ in 0..8 {
+        p.g.from_local(&mut data, &mut fds, &mut p.gp).unwrap();
+        assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
+        p.pump();
+        assert_eq!(p.g.channel_backlog(), p.g.channel_backlog_recount());
+    }
+    assert!(
+        data.is_empty(),
+        "{} bytes of input left untaken: the connection is wedged",
+        data.len()
+    );
+    p
+}
+
+/// A client that shrinks its own pool before a commit's copy is read gets a
+/// short copy, and nothing else happens to it: what the copy was counted at
+/// on the channel's backlog is given back however short the read came, so
+/// the backlog drains and its later requests are taken. Before, only the
+/// bytes read were given back, and the rest of the buffer stayed counted for
+/// good: past the input limit, the client's input was never read again
+/// (the 2026-09-29 review, S2).
+#[test]
+fn a_client_that_truncates_its_pool_gets_a_short_copy_and_is_not_wedged() {
+    for left in [0, 4096, 5 << 20] {
+        let mut p = commit_a_truncated_pool(left);
+        assert_eq!(p.g.channel_backlog(), 0, "left {left}");
+        assert!(!p.g.input_blocked());
+        let (msgs, _) = p.at_server();
+        let sync = MsgBuilder::new(1, op::wl_display::REQ_SYNC)
+            .new_id(9)
+            .finish();
+        assert!(
+            msgs.ends_with(&sync),
+            "the sync after the commit reached the compositor (left {left})"
+        );
+        let (_, synced) = p.g.shm_stats();
+        assert_eq!(synced, left, "the copy is as long as the pool is");
+    }
+}
+
 #[test]
 fn a_pool_resize_grows_the_host_memfd_before_the_compositor_sees_it() {
     let mut p = Pair::new(Policy::default());

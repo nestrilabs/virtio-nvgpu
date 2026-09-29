@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::blob::{BlobJob, Blobs};
 use crate::frame::{self, Desc, DescOut, Hello, Unit, record};
+use crate::job::Job;
 use crate::localout::LocalOut;
 use crate::objects::{ObjError, Objects};
 use crate::policy::Policy;
@@ -78,6 +79,14 @@ impl Out {
             Out::Unit(u) => u.bytes(),
             Out::Shm(j) => j.remaining() as usize,
             Out::Blob(j) => j.remaining() as usize,
+        }
+    }
+
+    fn job_mut(&mut self) -> Option<&mut dyn Job> {
+        match self {
+            Out::Unit(_) => None,
+            Out::Shm(j) => Some(j),
+            Out::Blob(j) => Some(j),
         }
     }
 }
@@ -539,41 +548,46 @@ impl Engine {
             let Some(front) = self.out_channel.front_mut() else {
                 break;
             };
-            let next = match front {
-                Out::Unit(_) => None,
-                Out::Shm(j) => {
-                    let r = j.next_unit();
-                    if let Some((_, got)) = &r {
-                        self.shm.sync_bytes += *got as u64;
-                    }
-                    Some(r)
-                }
-                Out::Blob(j) => Some(j.next_unit()),
-            };
-            match next {
+            let shm = matches!(front, Out::Shm(_));
+            let Some(job) = front.job_mut() else {
                 // A record ready to go.
-                None => {
-                    let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
-                        unreachable!()
-                    };
-                    self.out_bytes -= u.bytes();
-                    n += u.bytes();
-                    out.push_back(u);
+                let Some(Out::Unit(u)) = self.out_channel.pop_front() else {
+                    unreachable!()
+                };
+                self.out_bytes -= u.bytes();
+                n += u.bytes();
+                out.push_back(u);
+                continue;
+            };
+            // A job's next record. It was counted at what it had left to
+            // read, and is uncounted by what that goes down by -- not by what
+            // the step says it read, which on a short read is less (job.rs).
+            let before = job.remaining();
+            let step = job.next_unit();
+            let after = job.remaining().min(before);
+            self.out_bytes -= (before - after) as usize;
+            let done = step.is_none() || after == 0;
+            if let Some((u, got)) = step {
+                if shm {
+                    self.shm.sync_bytes += got as u64;
                 }
-                // A job's next record.
-                Some(Some((u, got))) => {
-                    self.out_bytes -= got;
-                    n += u.bytes();
-                    out.push_back(u);
-                }
-                // A job done, or cut short.
-                Some(None) => {
-                    let j = self.out_channel.pop_front().unwrap();
-                    self.out_bytes -= j.bytes();
-                }
+                n += u.bytes();
+                out.push_back(u);
+            }
+            if done {
+                // Done, or cut short: whatever it still claimed goes too.
+                self.out_channel.pop_front();
+                self.out_bytes -= after as usize;
             }
         }
         out
+    }
+
+    /// What [`Engine::channel_backlog`] should say, counted afresh from the
+    /// queue: for tests and the fuzzer, which hold the two equal.
+    #[doc(hidden)]
+    pub fn channel_backlog_recount(&self) -> usize {
+        self.out_channel.iter().map(Out::bytes).sum::<usize>() + self.wl_bytes.len()
     }
 
     pub fn has_channel_output(&self) -> bool {
