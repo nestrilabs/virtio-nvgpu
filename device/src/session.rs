@@ -350,6 +350,9 @@ struct Ioctl2Call {
     generation: u64,
     req_id: u32,
     cap: usize,
+    /// The descriptor number the handle table held for `target` when the
+    /// call was prepared (`target_fd` is a duplicate of it).
+    table_fd: RawFd,
     /// When serving began, and how long preparing took (pacing report).
     t0: std::time::Instant,
     prep_ns: u64,
@@ -1008,6 +1011,9 @@ impl NvidiaBackend {
             return Err(libc::EMSGSIZE);
         }
         let (target_fd, _) = self.handles.dup(target).ok_or(libc::EBADF)?;
+        // The table's own descriptor for the target, which the duplicate
+        // shares a file with: see finish_ioctl2.
+        let table_fd = self.handles.get_raw(target).map_err(|_| libc::EBADF)?;
         // SYNCOBJ_DESTROY frees the number the moment it runs, and the next
         // import in this file gets it back: no watch may join a wait on the
         // old syncobj from here on (fence.rs, `Registrations::orphan`; S-13).
@@ -1025,6 +1031,7 @@ impl NvidiaBackend {
             generation: self.session.generation,
             req_id: self.current_req_id,
             cap,
+            table_fd,
             t0,
             prep_ns: u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
         })))
@@ -1047,16 +1054,31 @@ impl NvidiaBackend {
             generation,
             req_id,
             cap,
+            table_fd,
             t0,
             prep_ns,
             ..
         } = call;
         let (name, host_ns) = (prepared.name(), prepared.host_ns());
-        // Done with the host file; the handle table still has its own --
-        // unless a CLOSE raced the call, and then this is the last reference,
-        // dropped under the backend mutex (closer.rs, S-33).
-        crate::closer::close(target_fd);
         let stale = generation != self.session.generation;
+        // Done with the host file. The handle table still has its own --
+        // unless a CLOSE raced the call, and then this is the last reference,
+        // whose release can wait on a modeset (closer.rs, S-33): that one
+        // goes to the closer thread. Otherwise it is closed here, which only
+        // drops a reference: the table is not changing (the backend mutex is
+        // held), the session is the one the call was prepared in, and the
+        // handle still names the same unburied descriptor -- handles are not
+        // issued twice in a session (handle_table.rs), so that is the file
+        // the duplicate shares. The closer's queue and wakeup cost every
+        // call on a render node a few microseconds of the queue thread.
+        if !stale
+            && !self.handles.is_buried(target)
+            && self.handles.get_raw(target).ok() == Some(table_fd)
+        {
+            drop(target_fd);
+        } else {
+            crate::closer::close(target_fd);
+        }
         crate::pacing::PACING.ioctl2(prepared.name(), prepared.result());
         // A lease a guest lessor revoked through us: whatever the lessee's
         // handle granted is gone on the host (kms.rs, "lease ends").
