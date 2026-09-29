@@ -34,6 +34,50 @@ fn prot(writable: bool) -> i32 {
     libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 }
 }
 
+/// Map `len` bytes of `fd` from `off`, shared, over `[target, target +
+/// len)`, or leave that range as it was.
+///
+/// A `MAP_FIXED` mmap drops what was there before the driver's own mmap
+/// runs, and a driver that then refuses leaves a hole (mm/vma.c,
+/// `vms_abort_munmap_vmas`): another thread's mmap may land in it -- a
+/// guarded block, a malloc arena -- and the range's owner later unmaps it
+/// whole, with that inside (review 2026-09-29 1.13). So the file is mapped
+/// where the kernel chooses, and moved into place with
+/// `mremap(MREMAP_FIXED)`, which replaces the old range only once the new
+/// mapping exists.
+///
+/// # Safety
+///
+/// `[target, target + len)` must be a range the caller owns, page-aligned,
+/// that no Rust reference covers.
+unsafe fn map_over(target: *mut u8, len: usize, prot: i32, fd: RawFd, off: u64) -> io::Result<()> {
+    let off = libc::off_t::try_from(off).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: a new mapping at an address the kernel chooses.
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd, off) };
+    if p == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `p` is the mapping just made, of `len` bytes, and `target`
+    // the caller's range (the function's contract): the move replaces
+    // nothing else.
+    let moved = unsafe {
+        libc::mremap(
+            p,
+            len,
+            len,
+            libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+            target.cast::<libc::c_void>(),
+        )
+    };
+    if moved == libc::MAP_FAILED {
+        let e = io::Error::last_os_error();
+        // SAFETY: the mapping just made, still where the kernel put it.
+        unsafe { libc::munmap(p, len) };
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// One region of guest RAM as the vhost-user memory table gives it:
 /// guest-physical start, the backend's mapping of it, and its backing file
 /// and offset in that file.
@@ -304,25 +348,18 @@ impl Reservation {
         writable: bool,
     ) -> io::Result<()> {
         fixed_inside(self.len, at, len)?;
-        let off =
-            libc::off_t::try_from(off).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        // SAFETY: MAP_FIXED over `[at, at + len)` of this reservation
-        // (checked above), which this value owns and no Rust reference
-        // covers: nothing else of the process's is replaced.
-        let p = unsafe {
-            libc::mmap(
-                self.base.add(at).cast(),
+        // SAFETY: `[at, at + len)` of this reservation (checked above),
+        // which this value owns and no Rust reference covers: nothing else
+        // of the process's is replaced.
+        unsafe {
+            map_over(
+                self.base.add(at),
                 len,
                 prot(writable),
-                libc::MAP_SHARED | libc::MAP_FIXED,
                 fd.as_fd().as_raw_fd(),
                 off,
             )
-        };
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
         }
-        Ok(())
     }
 
     /// The whole range as a span the host may be handed.
@@ -426,24 +463,9 @@ impl Window {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         };
         fixed_inside(self.len, at, n)?;
-        let off =
-            libc::off_t::try_from(off).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        // SAFETY: MAP_FIXED over `[at, at + n)` of the window (checked),
-        // which this value owns and no Rust reference covers.
-        let p = unsafe {
-            libc::mmap(
-                self.base.add(at).cast(),
-                n,
-                prot,
-                libc::MAP_SHARED | libc::MAP_FIXED,
-                fd,
-                off,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        // SAFETY: `[at, at + n)` of the window (checked), which this value
+        // owns and no Rust reference covers.
+        unsafe { map_over(self.base.add(at), n, prot, fd, off) }
     }
 
     /// Place `len` bytes of `fd` from `off` at `at` in the window.
@@ -578,6 +600,42 @@ mod tests {
         let base = r.addr();
         drop(r);
         let _ = base;
+    }
+
+    /// A file mapping the driver refuses leaves the range as it was, not a
+    /// hole another thread's mmap could land in and the owner later unmap
+    /// (review 2026-09-29 1.13). The refusal must come from the driver's
+    /// own mmap, after MAP_FIXED has dropped the old range: a dma-buf
+    /// mapped past its end (dma-buf.c, `dma_buf_mmap_internal`), a
+    /// one-page udmabuf here, where /dev/udmabuf is open to us.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no file-backed mappings")]
+    fn a_refused_file_mapping_leaves_no_hole() {
+        let Ok(dev) = super::super::fd::open_path("/dev/udmabuf", libc::O_RDWR | libc::O_CLOEXEC)
+        else {
+            eprintln!("SKIPPED a_refused_file_mapping_leaves_no_hole: no /dev/udmabuf");
+            return;
+        };
+        let f = super::super::fd::memfd(c"t", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING).unwrap();
+        super::super::fd::ftruncate(&f, PAGE as u64).unwrap();
+        super::super::fd::add_seals(&f, libc::F_SEAL_SHRINK).unwrap();
+        let d =
+            super::super::ioctl::udmabuf_create(dev.as_fd(), f.as_fd(), PAGE as u64, 1).unwrap();
+        let r = Arc::new(Reservation::new(3 * PAGE).unwrap());
+        assert!(r.map_file(PAGE, PAGE, &d, PAGE as u64, false).is_err());
+        assert!(
+            any_mapped(r.addr() + PAGE as u64, PAGE as u64),
+            "the reservation still covers it"
+        );
+        let w = Window::new(3 * PAGE).unwrap();
+        assert!(
+            w.place(PAGE as u64, PAGE as u64, d.as_raw_fd(), PAGE as u64, false)
+                .is_err()
+        );
+        assert!(any_mapped(w.addr() + PAGE as u64, PAGE as u64));
+        assert_eq!(w.read_u32(PAGE as u64), 0, "the window's own memfd");
+        // Inside it, the same dma-buf maps.
+        r.map_file(PAGE, PAGE, &d, 0, false).unwrap();
     }
 
     #[test]
