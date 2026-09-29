@@ -819,10 +819,42 @@ impl Shared {
         if let Err(e) = ring.add_used(t.head, written as u32) {
             log::warn!("add_used for chain {}: {e}", t.head);
         }
+        let signal = wants_interrupt(ring.get_queue_mut(), &*mem);
         drop(ring);
-        if let Err(e) = vring.signal_used_queue() {
+        if signal && let Err(e) = vring.signal_used_queue() {
             log::warn!("signal used queue: {e}");
         }
+    }
+}
+
+/// Whether the guest acked VIRTIO_F_NOTIFY_ON_EMPTY: then it is interrupted
+/// whatever it asked, as the device did before it honoured suppression.
+static NOTIFY_ON_EMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// VRING_AVAIL_F_NO_INTERRUPT (virtio 1.2 §2.7.7).
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+/// Whether the guest wants an interrupt for what was just added to `q`'s
+/// used ring, asked under the ring's lock right after `add_used`: with
+/// EVENT_IDX, once past its `used_event`; without, unless it set
+/// VRING_AVAIL_F_NO_INTERRUPT, which virtio-queue does not read. The device
+/// SHOULD honour both (virtio 1.2 §2.7.10). An error answers yes: a missed
+/// interrupt strands a waiter, an extra one costs only time. The backend
+/// signalled every completion before, so the guest's reply-poll path took
+/// an interrupt per reply however it asked (review 2026-09-29 2.2).
+fn wants_interrupt<M: GuestMemoryBackend>(q: &mut impl QueueT, mem: &M) -> bool {
+    use vm_memory::Bytes;
+    if NOTIFY_ON_EMPTY.load(Ordering::Relaxed) {
+        return true;
+    }
+    match q.needs_notification(mem) {
+        Err(_) | Ok(true) if q.event_idx_enabled() => true,
+        Err(_) => true,
+        Ok(false) => false,
+        // `needs_notification` fenced after the used-ring writes.
+        Ok(true) => mem
+            .read_obj::<u16>(GuestAddress(q.avail_ring()))
+            .map_or(true, |f| u16::from_le(f) & VRING_AVAIL_F_NO_INTERRUPT == 0),
     }
 }
 
@@ -863,8 +895,11 @@ impl EventQueue for VringEventQueue {
         if let Err(e) = ring.add_used(head, written as u32) {
             log::warn!("event queue add_used: {e}");
         }
+        let signal = wants_interrupt(ring.get_queue_mut(), &*mem);
         drop(ring);
-        let _ = self.vring.signal_used_queue();
+        if signal {
+            let _ = self.vring.signal_used_queue();
+        }
         if bytes.is_empty() {
             Fill::Empty
         } else {
@@ -1196,6 +1231,10 @@ impl VhostUserBackendMut for NvGpuBackend {
     }
 
     fn acked_features(&mut self, features: u64) {
+        NOTIFY_ON_EMPTY.store(
+            features & (1 << VIRTIO_F_NOTIFY_ON_EMPTY) != 0,
+            Ordering::Relaxed,
+        );
         let indirect = features & (1 << VIRTIO_RING_F_INDIRECT_DESC) != 0;
         let limit = if indirect {
             MAX_XFER_INDIRECT
@@ -2264,6 +2303,44 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![false]);
         be.update_memory(GuestMemoryAtomic::new(memory())).unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1, "once");
+    }
+
+    /// The guest's interrupt suppression is honoured: without EVENT_IDX its
+    /// VRING_AVAIL_F_NO_INTERRUPT, with it its used_event (review
+    /// 2026-09-29 2.2).
+    #[test]
+    fn a_completion_interrupts_only_a_guest_that_asked() {
+        use virtio_queue::Queue;
+        use vm_memory::Bytes;
+        let mem = memory();
+        let (desc, avail, used) = (0x1000u64, 0x2000u64, 0x3000u64);
+        let mut q = Queue::new(16).unwrap();
+        q.set_size(16);
+        q.set_desc_table_address(Some(desc as u32), Some(0));
+        q.set_avail_ring_address(Some(avail as u32), Some(0));
+        q.set_used_ring_address(Some(used as u32), Some(0));
+        q.set_ready(true);
+        let flags = |f: u16| mem.write_obj(f.to_le(), GuestAddress(avail)).unwrap();
+
+        flags(0);
+        q.add_used(&mem, 0, 0).unwrap();
+        assert!(wants_interrupt(&mut q, &mem));
+        flags(VRING_AVAIL_F_NO_INTERRUPT);
+        q.add_used(&mem, 1, 0).unwrap();
+        assert!(!wants_interrupt(&mut q, &mem), "NO_INTERRUPT");
+
+        // EVENT_IDX: used_event sits after the avail ring's 16 entries.
+        q.set_event_idx(true);
+        let used_event = |v: u16| {
+            mem.write_obj(v.to_le(), GuestAddress(avail + 4 + 2 * 16))
+                .unwrap()
+        };
+        used_event(10);
+        q.add_used(&mem, 2, 0).unwrap();
+        assert!(!wants_interrupt(&mut q, &mem), "not yet past used_event");
+        used_event(3);
+        q.add_used(&mem, 3, 0).unwrap();
+        assert!(wants_interrupt(&mut q, &mem), "past it");
     }
 
     /// A vring's eventfds are in no handle table, so the private registry
