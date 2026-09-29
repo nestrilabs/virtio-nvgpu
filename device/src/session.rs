@@ -350,6 +350,9 @@ struct Ioctl2Call {
     generation: u64,
     req_id: u32,
     cap: usize,
+    /// When serving began, and how long preparing took (pacing report).
+    t0: std::time::Instant,
+    prep_ns: u64,
 }
 
 impl Ioctl2Call {
@@ -450,7 +453,14 @@ impl xfer::Finisher for BackendFinisher<'_> {
         if self.stale {
             return (0, HandleKind::Other);
         }
+        let tc = std::time::Instant::now();
         let kind = hostfd::classify(fd.as_fd(), self.cards);
+        crate::pacing::PACING.ioctl2_timed(
+            "(adopt: classify)",
+            u64::try_from(tc.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            0,
+            0,
+        );
         if kind.is_kms()
             && let Err(e) = hostfd::set_nonblock(fd.as_raw_fd())
         {
@@ -898,6 +908,7 @@ impl NvidiaBackend {
     }
 
     fn prepare_ioctl2(&mut self, payload: &[u8], cap: usize) -> Result<PendingIoctl2, i32> {
+        let t0 = std::time::Instant::now();
         let req = read::<Ioctl2Req>(payload).ok_or(libc::EINVAL)?;
         // The response's fixed part must fit before anything runs; the host
         // call cannot be taken back once it has.
@@ -1014,6 +1025,8 @@ impl NvidiaBackend {
             generation: self.session.generation,
             req_id: self.current_req_id,
             cap,
+            t0,
+            prep_ns: u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
         })))
     }
 
@@ -1034,8 +1047,11 @@ impl NvidiaBackend {
             generation,
             req_id,
             cap,
+            t0,
+            prep_ns,
             ..
         } = call;
+        let (name, host_ns) = (prepared.name(), prepared.host_ns());
         // Done with the host file; the handle table still has its own --
         // unless a CLOSE raced the call, and then this is the last reference,
         // dropped under the backend mutex (closer.rs, S-33).
@@ -1067,6 +1083,12 @@ impl NvidiaBackend {
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
+        crate::pacing::PACING.ioctl2_timed(
+            name,
+            u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            prep_ns,
+            host_ns,
+        );
         self.current_msg = MsgType::Ioctl2;
         self.current_req_id = req_id;
         if stale {

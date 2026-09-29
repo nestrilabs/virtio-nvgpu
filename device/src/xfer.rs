@@ -325,6 +325,8 @@ pub struct Prepared {
     sys: Arc<dyn Sys>,
     ret: i32,
     executed: bool,
+    /// How long the host ioctl itself took, for the pacing report.
+    host_ns: u64,
     /// Descriptors the host produced at schema positions, not yet adopted.
     fd_outs: Vec<(usize, usize, OwnedFd)>,
     /// (buf, off, gem in the render file, size) for the response.
@@ -395,6 +397,7 @@ pub fn prepare(
         sys: env.sys(),
         ret: -libc::ECANCELED,
         executed: false,
+        host_ns: 0,
         fd_outs: Vec::new(),
         gem_outs: Vec::new(),
     };
@@ -523,6 +526,12 @@ impl Prepared {
     /// The schema entry's name, for logs.
     pub fn name(&self) -> &'static str {
         self.entry.name
+    }
+
+    /// How long the host ioctl took (0 before it ran, or when a hook
+    /// answered it), for the pacing report.
+    pub fn host_ns(&self) -> u64 {
+        self.host_ns
     }
 
     /// Ask `Hooks::at_run` to check `revocations` again when the call runs (see
@@ -1174,9 +1183,11 @@ impl Prepared {
         let removing = self.forget_removed_fb();
         let sys = self.sys.clone();
         let top = self.bufs[0].id;
+        let t_host = std::time::Instant::now();
         let ret = self
             .arena
             .call(&*sys, target_fd, u64::from(self.entry.cmd), top);
+        self.host_ns = u64::try_from(t_host.elapsed().as_nanos()).unwrap_or(u64::MAX);
         // The host has the framebuffers it was named (or refused them).
         self.fb_uses.release();
         if let (Some((card, connector, at)), Some(k)) = (self.probing, &self.kms)

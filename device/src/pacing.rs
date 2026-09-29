@@ -222,6 +222,9 @@ pub struct Counters {
     pub ev_unarmed: AtomicU64,
     /// IOCTL2s by schema name.
     ioctl2_names: Mutex<BTreeMap<&'static str, [u64; 2]>>,
+    /// IOCTL2 time by schema name: calls, whole (request read to reply
+    /// built), preparing, the host ioctl; ns.
+    ioctl2_time: Mutex<BTreeMap<&'static str, [u64; 4]>>,
 }
 
 impl Counters {
@@ -253,6 +256,7 @@ impl Counters {
             arms: AtomicU64::new(0),
             ev_unarmed: AtomicU64::new(0),
             ioctl2_names: Mutex::new(BTreeMap::new()),
+            ioctl2_time: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -295,6 +299,20 @@ impl Counters {
         }
     }
 
+    /// Where an IOCTL2's time went: `whole_ns` from its request being read
+    /// to its reply being built, `prep_ns` of it preparing (the schema walk,
+    /// copies, descriptor and handle translation, policy), `host_ns` of it
+    /// the host ioctl itself.
+    pub fn ioctl2_timed(&self, name: &'static str, whole_ns: u64, prep_ns: u64, host_ns: u64) {
+        if let Ok(mut m) = self.ioctl2_time.lock() {
+            let e = m.entry(name).or_insert([0; 4]);
+            e[0] += 1;
+            e[1] = e[1].saturating_add(whole_ns);
+            e[2] = e[2].saturating_add(prep_ns);
+            e[3] = e[3].saturating_add(host_ns);
+        }
+    }
+
     pub fn snap(&self) -> Snap {
         let load = |a: &AtomicU64| a.load(Relaxed);
         Snap {
@@ -328,6 +346,11 @@ impl Counters {
             armed: [load(&self.arms), load(&self.ev_unarmed)],
             ioctl2_names: self
                 .ioctl2_names
+                .lock()
+                .map(|m| m.clone())
+                .unwrap_or_default(),
+            ioctl2_time: self
+                .ioctl2_time
                 .lock()
                 .map(|m| m.clone())
                 .unwrap_or_default(),
@@ -367,6 +390,8 @@ pub struct Snap {
     /// arms, legacy events while unarmed (not sent)
     pub armed: [u64; 2],
     pub ioctl2_names: BTreeMap<&'static str, [u64; 2]>,
+    /// calls, whole, preparing, host ioctl (ns), by name
+    pub ioctl2_time: BTreeMap<&'static str, [u64; 4]>,
 }
 
 /// The names the report gives message types (MsgType's wire values).
@@ -521,6 +546,34 @@ pub fn summary(prev: Option<&Snap>, now: &Snap, start: Instant) -> Vec<String> {
         }
         out.push(l);
     }
+    let mut times: Vec<(u64, &str, [u64; 4])> = now
+        .ioctl2_time
+        .iter()
+        .map(|(k, v)| {
+            let p = prev
+                .and_then(|p| p.ioctl2_time.get(k))
+                .copied()
+                .unwrap_or([0; 4]);
+            let d: [u64; 4] = std::array::from_fn(|i| v[i].saturating_sub(p[i]));
+            (d[1], *k, d)
+        })
+        .filter(|(_, _, d)| d[0] != 0)
+        .collect();
+    times.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    if !times.is_empty() {
+        let mut l = String::from("pacing: ioctl2 time, mean us whole/prepare/host:");
+        for (_, k, d) in times.iter().take(16) {
+            let n = d[0] as f64 * 1000.0;
+            let _ = write!(
+                l,
+                " {k}={:.1}/{:.1}/{:.1}",
+                d[1] as f64 / n,
+                d[2] as f64 / n,
+                d[3] as f64 / n
+            );
+        }
+        out.push(l);
+    }
     out
 }
 
@@ -654,5 +707,21 @@ mod tests {
         let lines = summary(Some(&a), &b, start).join("\n");
         assert!(lines.contains("wl_send="), "{lines}");
         assert!(!lines.contains(" ioctl2="), "{lines}");
+    }
+
+    #[test]
+    fn ioctl2_time_is_a_mean_per_name_over_the_interval() {
+        let c = Counters::new();
+        let start = Instant::now();
+        c.ioctl2_timed("SYNCOBJ_CREATE", 9_000, 1_000, 3_000);
+        let a = c.snap();
+        c.ioctl2_timed("SYNCOBJ_CREATE", 3_000, 1_000, 1_000);
+        c.ioctl2_timed("SYNCOBJ_CREATE", 5_000, 1_000, 1_000);
+        let whole = summary(None, &c.snap(), start).join("\n");
+        assert!(whole.contains("SYNCOBJ_CREATE=5.7/1.0/1.7"), "{whole}");
+        let part = summary(Some(&a), &c.snap(), start).join("\n");
+        assert!(part.contains("SYNCOBJ_CREATE=4.0/1.0/1.0"), "{part}");
+        let none = summary(Some(&c.snap()), &c.snap(), start).join("\n");
+        assert!(!none.contains("ioctl2 time"), "{none}");
     }
 }
