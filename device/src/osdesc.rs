@@ -906,13 +906,19 @@ pub struct OsDesc {
     uvm_ranges: HashMap<u32, BTreeMap<u64, u64>>,
     uvm_range_count: usize,
     uvm_ranges_warned: bool,
+    /// The guest process each UVM file with recorded ranges is charged
+    /// to, and how many each process has recorded: a quarter of the VM's
+    /// bound each (review 2026-09-29 1.8).
+    uvm_range_files: HashMap<u32, crate::quota::Owner>,
+    uvm_ranges_by_owner: HashMap<crate::quota::Owner, usize>,
     per_file: HashMap<u32, (usize, u64)>,
     /// The guest process each file is charged to, and what each process
     /// holds (quota.rs): a process holds at most a file's budget, whatever
     /// number of files it has, and the VM's last sixteenth is kept for
     /// processes holding at most a sixty-fourth (B5).
     file_owners: HashMap<u32, crate::quota::Owner>,
-    per_owner: HashMap<crate::quota::Owner, (usize, u64)>,
+    /// Registrations, bytes and separately mapped runs.
+    per_owner: HashMap<crate::quota::Owner, (usize, u64, usize)>,
     bytes: u64,
     vmas: usize,
     /// (sequence, id), oldest first.
@@ -937,6 +943,8 @@ impl OsDesc {
             uvm_ranges: HashMap::new(),
             uvm_range_count: 0,
             uvm_ranges_warned: false,
+            uvm_range_files: HashMap::new(),
+            uvm_ranges_by_owner: HashMap::new(),
             per_file: HashMap::new(),
             file_owners: HashMap::new(),
             per_owner: HashMap::new(),
@@ -996,7 +1004,7 @@ impl OsDesc {
         let (fregs, fbytes) = self.per_file.get(&file).copied().unwrap_or((0, 0));
         let l = &self.limits;
         let owner = self.file_owners.get(&file).copied().unwrap_or_default();
-        let (oregs, obytes) = self.per_owner.get(&owner).copied().unwrap_or((0, 0));
+        let (oregs, obytes, ovmas) = self.per_owner.get(&owner).copied().unwrap_or((0, 0, 0));
         let in_use = (self.regs.len() + self.released.len()) as u64;
         let share = |per_file: u64, per_vm: u64| crate::quota::Share {
             per_owner: per_file,
@@ -1027,6 +1035,21 @@ impl OsDesc {
             && self.bytes + bytes <= l.bytes_per_vm
         {
             "bytes for the guest process"
+        } else if crate::quota::admits(
+            // The separately mapped runs, a quarter each: one process's
+            // one-page runs took all of them, and every other process's
+            // registration failed (review 2026-09-29 1.8).
+            &crate::quota::Share::quarter(l.vmas_per_vm as u64, 16),
+            owner,
+            ovmas as u64,
+            vmas as u64,
+            self.vmas as u64,
+            l.vmas_per_vm as u64,
+        )
+        .is_err()
+            && self.vmas + vmas <= l.vmas_per_vm
+        {
+            "separate mappings for the guest process"
         } else if self.regs.len() + self.released.len() >= l.regs_per_vm {
             "registrations for the VM"
         } else if fregs >= l.regs_per_file {
@@ -1073,6 +1096,7 @@ impl OsDesc {
             let o = self.per_owner.entry(owner).or_default();
             o.0 += 1;
             o.1 += pinned.bytes;
+            o.2 += pinned.vmas;
         }
         self.bytes += pinned.bytes;
         self.vmas += pinned.vmas;
@@ -1146,6 +1170,7 @@ impl OsDesc {
         if let Some(e) = self.per_owner.get_mut(&r.owner) {
             e.0 -= 1;
             e.1 -= r.bytes;
+            e.2 -= r.vmas;
             if e.0 == 0 {
                 self.per_owner.remove(&r.owner);
             }
@@ -1412,6 +1437,37 @@ impl OsDesc {
     /// succeeded). Past the VM's bound it is not recorded, and a mapping of
     /// registered memory inside it is held until its file closes.
     pub(crate) fn uvm_range_made(&mut self, file: u32, base: u64, len: u64) {
+        self.uvm_range_made_by(file, base, len, crate::quota::Owner::Unknown);
+    }
+
+    /// [`OsDesc::uvm_range_made`], on a UVM file charged to guest process
+    /// `owner`, which may record only its share of the VM's bound: past
+    /// it, as past the VM's, the range is not recorded, and only that
+    /// process's mappings in it are affected (review 2026-09-29 1.8).
+    pub(crate) fn uvm_range_made_by(
+        &mut self,
+        file: u32,
+        base: u64,
+        len: u64,
+        owner: crate::quota::Owner,
+    ) {
+        let limit = self.limits.uvm_ranges_per_vm as u64;
+        let owner = *self.uvm_range_files.entry(file).or_insert(owner);
+        let mine = self.uvm_ranges_by_owner.get(&owner).copied().unwrap_or(0);
+        if let Err(crate::quota::Over::Owner | crate::quota::Over::Reserve) = crate::quota::admits(
+            &crate::quota::Share::quarter(limit, 16),
+            owner,
+            mine as u64,
+            1,
+            self.uvm_range_count as u64,
+            limit,
+        ) {
+            log::debug!(
+                "UVM external ranges: guest process {owner:?} has {mine} recorded; one more \
+                 is not"
+            );
+            return;
+        }
         if self.uvm_range_count >= self.limits.uvm_ranges_per_vm {
             if !self.uvm_ranges_warned {
                 self.uvm_ranges_warned = true;
@@ -1431,6 +1487,20 @@ impl OsDesc {
             .is_none()
         {
             self.uvm_range_count += 1;
+            *self.uvm_ranges_by_owner.entry(owner).or_default() += 1;
+        }
+    }
+
+    /// `n` of UVM file `file`'s recorded ranges are gone.
+    fn uvm_ranges_gone(&mut self, file: u32, n: usize) {
+        self.uvm_range_count -= n;
+        if let Some(&o) = self.uvm_range_files.get(&file)
+            && let Some(c) = self.uvm_ranges_by_owner.get_mut(&o)
+        {
+            *c -= n;
+            if *c == 0 {
+                self.uvm_ranges_by_owner.remove(&o);
+            }
         }
     }
 
@@ -1440,7 +1510,7 @@ impl OsDesc {
         let Some(len) = self.uvm_ranges.get_mut(&file).and_then(|m| m.remove(&base)) else {
             return;
         };
-        self.uvm_range_count -= 1;
+        self.uvm_ranges_gone(file, 1);
         self.drop_uvm_where(|h| h.file == Some(file) && h.within(base, len));
     }
 
@@ -1486,8 +1556,9 @@ impl OsDesc {
     /// and a later file under the same handle must not end it.
     pub(crate) fn uvm_file_closed(&mut self, file: u32) {
         if let Some(r) = self.uvm_ranges.remove(&file) {
-            self.uvm_range_count -= r.len();
+            self.uvm_ranges_gone(file, r.len());
         }
+        self.uvm_range_files.remove(&file);
         for h in &mut self.uvm {
             if h.file == Some(file) {
                 log::warn!(
@@ -1508,6 +1579,8 @@ impl OsDesc {
         self.uvm.clear();
         self.uvm_ranges.clear();
         self.uvm_range_count = 0;
+        self.uvm_range_files.clear();
+        self.uvm_ranges_by_owner.clear();
         let ids: Vec<u64> = self.regs.keys().copied().collect();
         for id in ids {
             self.release(id);
@@ -2059,6 +2132,57 @@ mod tests {
         assert_eq!((o.live(), o.uvm_held()), (1, 1));
         o.clear();
         assert_eq!((o.live(), o.uvm_held(), o.unreaped()), (0, 0, 0));
+    }
+
+    /// One process's one-page runs, or its external ranges, take no more
+    /// than a quarter of the VM's: another process still registers, and
+    /// still has its ranges recorded (review 2026-09-29 1.8).
+    #[test]
+    fn one_process_takes_a_quarter_of_the_runs_and_the_ranges() {
+        let ram = ram();
+        let mut o = OsDesc::with_limits(Limits {
+            vmas_per_vm: 64,
+            uvm_ranges_per_vm: 64,
+            ..Limits::default()
+        });
+        let (a, b) = (
+            crate::quota::Owner::Proc {
+                tgid: 1,
+                start_ns: 1,
+            },
+            crate::quota::Owner::Proc {
+                tgid: 2,
+                start_ns: 1,
+            },
+        );
+        o.set_file_owner(1, a);
+        o.set_file_owner(2, b);
+        let mut n = 0u32;
+        // Two pages apart: two separately mapped runs each.
+        while o.admit(1, 2 * PAGE, 2).is_ok() {
+            n += 1;
+            o.add(1, 0xc1, n, 0, pinned(&ram, &[(LOW, 1), (HIGH, 1)]));
+            assert!(n <= 32);
+        }
+        assert_eq!(n, 8, "a quarter of the 64 runs");
+        assert_eq!(
+            o.admit(2, 2 * PAGE, 2),
+            Ok(()),
+            "another process still registers"
+        );
+
+        for i in 0..64u64 {
+            o.uvm_range_made_by(7, i << 20, 1 << 20, a);
+        }
+        assert_eq!(o.uvm_range_count, 16);
+        o.uvm_range_made_by(8, 1 << 40, 1 << 20, b);
+        assert_eq!(o.uvm_range_count, 17, "another process's range is recorded");
+        o.uvm_range_freed(7, 0);
+        o.uvm_range_made_by(7, 99 << 20, 1 << 20, a);
+        assert_eq!(o.uvm_range_count, 17, "freed, one more fits");
+        o.uvm_file_closed(7);
+        assert_eq!(o.uvm_range_count, 1);
+        assert!(o.uvm_ranges_by_owner.get(&a).is_none());
     }
 
     #[test]

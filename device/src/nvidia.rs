@@ -4219,7 +4219,9 @@ impl NvidiaBackend {
                 }
             }
             UVM_CREATE_EXTERNAL_RANGE if size >= 24 && status(size - 8) == Some(0) => {
-                self.osdesc.uvm_range_made(handle, word(0), word(8));
+                let owner = self.handles.owner(handle);
+                self.osdesc
+                    .uvm_range_made_by(handle, word(0), word(8), owner);
             }
             crate::uvmmap::FREE if size >= 16 && status(size - 8) == Some(0) => {
                 self.osdesc.uvm_range_freed(handle, word(0));
