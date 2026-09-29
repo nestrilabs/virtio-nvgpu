@@ -79,6 +79,14 @@ run_native() { # run_native N
         env HEAVY_DIR="$REPO/rig/heavy" HEAVY_BENCH="${NVGPU_HEAVY_BENCH:-}" \
         bash "$REPO/rig/heavy/heavy-run.sh" "$WLD" "$d" \
         >"$OUT/$WLD-native-$1.log" 2>&1
+    # A game that aborts can leave a process behind that goes on rendering
+    # on the compositor (SuperTuxKart's Vulkan renderer did): anything still
+    # running from the image's programs is this run's, and would load the
+    # next one.
+    if pgrep -u "$(id -u)" -f '^/nix/store/[^ ]*-nvgpu-guest-sw/bin/' >/dev/null; then
+        echo "HEAVY-META leftover process(es) killed" >>"$OUT/$WLD-native-$1.log"
+        pkill -KILL -u "$(id -u)" -f '^/nix/store/[^ ]*-nvgpu-guest-sw/bin/'
+    fi
     grep -a '^HEAVY-META' "$OUT/$WLD-native-$1.log" >"$OUT/$WLD-native-$1.meta"
     [ -s "$d/frames.txt" ] && cp "$d/frames.txt" "$OUT/$WLD-native-$1.frames"
     rm -rf "${d:?}/home" "${d:?}/godot"
