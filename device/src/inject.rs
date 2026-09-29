@@ -1322,6 +1322,9 @@ fn bind_private(path: &Path) -> io::Result<OwnedFd> {
 struct Shared {
     registry: Arc<Registry>,
     uid: u32,
+    /// The VMM's uid, once known (u32::MAX until then): never a helper's,
+    /// even the one `uid` names (`InjectServer::refuse_uid`).
+    vmm_uid: std::sync::atomic::AtomicU32,
     stop: AtomicBool,
     peers: AtomicUsize,
     next_peer: AtomicU64,
@@ -1357,6 +1360,7 @@ impl InjectServer {
             shared: Arc::new(Shared {
                 registry,
                 uid,
+                vmm_uid: std::sync::atomic::AtomicU32::new(u32::MAX),
                 stop: AtomicBool::new(false),
                 peers: AtomicUsize::new(0),
                 next_peer: AtomicU64::new(1),
@@ -1366,6 +1370,13 @@ impl InjectServer {
             idle: Mutex::new(true),
             thread: Mutex::new(None),
         })
+    }
+
+    /// Refuse peers of `uid` -- the VMM's, as the transport learns it --
+    /// whatever `--inject-uid` says: a capture helper is a user of its own,
+    /// one per VM, and never the VMM (defence in depth for that rule).
+    pub fn refuse_uid(&self, uid: u32) {
+        self.shared.vmm_uid.store(uid, Ordering::Release);
     }
 
     /// Start accepting. Once.
@@ -1448,6 +1459,14 @@ fn accept_loop(s: Arc<Shared>, l: Arc<OwnedFd>) {
             }
         };
         match crate::sys::fd::peer_cred(conn.as_raw_fd()) {
+            Ok(c) if c.uid == s.vmm_uid.load(Ordering::Acquire) => {
+                log::warn!(
+                    "inject: refusing a connection from uid {} (pid {}): that is the VMM's uid",
+                    c.uid,
+                    c.pid
+                );
+                continue;
+            }
             Ok(c) if c.uid == s.uid => {}
             Ok(c) => {
                 log::warn!(
@@ -2698,6 +2717,17 @@ mod tests {
     #[test]
     fn a_peer_of_another_uid_is_hung_up_on() {
         let (path, _host, s) = server(crate::sys::proc::uid().wrapping_add(1));
+        let c = crate::sys::net::seqpacket_connect(&path).unwrap();
+        assert!(roundtrip(&c, &hello_bytes(), &[]).is_none());
+        s.shutdown();
+    }
+
+    /// A helper of the VMM's uid is refused even when `--inject-uid` names
+    /// it: one helper uid per VM, never the VMM's.
+    #[test]
+    fn a_peer_of_the_vmms_uid_is_hung_up_on() {
+        let (path, _host, s) = server(crate::sys::proc::uid());
+        s.refuse_uid(crate::sys::proc::uid());
         let c = crate::sys::net::seqpacket_connect(&path).unwrap();
         assert!(roundtrip(&c, &hello_bytes(), &[]).is_none());
         s.shutdown();

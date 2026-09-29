@@ -290,9 +290,62 @@ pub fn peer_cred(sock: RawFd) -> io::Result<libc::ucred> {
     Ok(cred)
 }
 
+/// An int socket option of `sock` (`getsockopt(SOL_SOCKET, opt)`).
+fn sock_int(sock: RawFd, opt: libc::c_int) -> io::Result<libc::c_int> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `v` and `len` are live locals of the sizes given.
+    cvt(unsafe {
+        libc::getsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            opt,
+            (&mut v as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(v)
+}
+
+/// The peers of this process's connected Unix sockets that are other
+/// processes: `SO_PEERCRED` of every descriptor that is an AF_UNIX socket,
+/// not listening, whose peer is not this process. A listener's
+/// `SO_PEERCRED` is whoever made it (systemd, for an inherited one), so
+/// listeners are left out.
+pub fn unix_peers() -> Vec<libc::ucred> {
+    let me = crate::sys::proc::pid();
+    crate::privfd::open_fds(&|_| false)
+        .into_iter()
+        .filter(|&fd| {
+            statx_cached(fd).is_ok_and(|s| s.kind == libc::S_IFSOCK)
+                && sock_int(fd, libc::SO_DOMAIN).is_ok_and(|d| d == libc::AF_UNIX)
+                && sock_int(fd, libc::SO_ACCEPTCONN).is_ok_and(|l| l == 0)
+        })
+        .filter_map(|fd| peer_cred(fd).ok())
+        .filter(|c| c.pid != 0 && c.pid != me)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener and a pair within this process are no peers of another
+    /// process: whatever this test process has open, none is ours.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sockets to scan")]
+    fn the_unix_peers_are_other_processes_only() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = std::env::temp_dir().join(format!("nvgpu-peers-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let l = UnixListener::bind(&path).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let c = UnixStream::connect(&path).unwrap();
+        let me = crate::sys::proc::pid();
+        assert!(unix_peers().iter().all(|c| c.pid != me));
+        drop((l, a, b, c));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn a_pipe_carries_bytes_and_closes_once() {

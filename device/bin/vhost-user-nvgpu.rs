@@ -963,6 +963,28 @@ fn read_pci_configs(dir: &Path, gpus: &[device::virtio::GpuSlot]) -> Vec<(String
     out
 }
 
+/// Have the inject server refuse the VMM's uid: the one other process this
+/// backend's Unix sockets are connected to at the first SET_MEM_TABLE (the
+/// vhost-user connection and the request channel). More than one uid there
+/// and none is refused, with a warning; the `--inject-uid` rule still holds.
+fn refuse_vmm_uid(s: &device::inject::InjectServer) {
+    let mut uids: Vec<u32> = device::sys::fd::unix_peers()
+        .iter()
+        .map(|c| c.uid)
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    match uids[..] {
+        [uid] => {
+            log::info!("inject: the VMM is uid {uid}; no helper of that uid is accepted");
+            s.refuse_uid(uid);
+        }
+        _ => log::warn!(
+            "inject: the VMM's uid is not certain (peers {uids:?}); only --inject-uid applies"
+        ),
+    }
+}
+
 /// Something to start once the process's descriptors are registered.
 type AfterScan = Box<dyn FnOnce() + Send + Sync>;
 
@@ -1880,7 +1902,13 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(s) = &inject {
         let s = s.clone();
+        let own_uid_ok = args.allow_inject_self;
         after_scan.push(Box::new(move || {
+            // The VMM is connected by now: its uid is never a helper's.
+            // A test rig runs all three as one user (--allow-inject-self).
+            if !own_uid_ok {
+                refuse_vmm_uid(&s);
+            }
             if let Err(e) = s.start() {
                 log::error!("--inject-socket: accept thread: {e}");
             }
