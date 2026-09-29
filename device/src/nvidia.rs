@@ -5875,6 +5875,75 @@ mod tests {
         );
     }
 
+    /// What the backend adds to an RM control, on the real driver: the same
+    /// cheap control (GPU_GET_ATTACHED_IDS on a root client) served through
+    /// `dispatch` and issued directly, each timed over many calls. A timing,
+    /// not a check: `cargo test --release -p device bench_rm_control_service
+    /// -- --ignored --nocapture` (BENCHMARKS.md).
+    #[test]
+    #[ignore]
+    fn bench_rm_control_service() {
+        if !nvidiactl_present() {
+            return;
+        }
+        let mut be = NvidiaBackend::for_test();
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&open_msg(DeviceKind::Ctl), &mut oresp);
+        let ctl = opened_handle(&oresp);
+        assert!(ctl > 0);
+        let ioctl = |be: &mut NvidiaBackend, nr: u32, params: &[u8], nested: &[u8], at: u32| {
+            let mut req = hdr(MsgType::Ioctl, ctl);
+            append(
+                &mut req,
+                &IoctlReq {
+                    cmd: abi::ioctl::_IOWR(nr, params.len() as u32) as u32,
+                    data_len: params.len() as u32,
+                    nested_offset: at,
+                    nested_len: nested.len() as u32,
+                    deep_ptr_offset: 0,
+                    deep_len: 0,
+                },
+            );
+            req.extend_from_slice(params);
+            req.extend_from_slice(nested);
+            let mut resp = vec![0u8; 1024];
+            be.dispatch(&req, &mut resp);
+            resp
+        };
+        // RM_ALLOC of a root client: NVOS64 with no parameters.
+        let mut alloc = [0u8; 48];
+        alloc[12..16].copy_from_slice(&0x41u32.to_le_bytes());
+        let r = ioctl(&mut be, abi::ioctl::NV_ESC_RM_ALLOC, &alloc, &[], 0);
+        assert_eq!(parse_resp(&r).status, 0);
+        let body = &r[size_of::<MsgHeader>() + size_of::<IoctlResp>()..];
+        let client = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        assert_eq!(u32::from_le_bytes(body[40..44].try_into().unwrap()), 0);
+        // NVOS54: hClient, hObject, cmd, flags, params (at 16), paramsSize, status.
+        let mut ctl54 = [0u8; 32];
+        ctl54[0..4].copy_from_slice(&client.to_le_bytes());
+        ctl54[4..8].copy_from_slice(&client.to_le_bytes());
+        ctl54[8..12].copy_from_slice(&0x0000_0201u32.to_le_bytes());
+        ctl54[24..28].copy_from_slice(&128u32.to_le_bytes());
+        let ids = [0u8; 128];
+        let n: u32 = std::env::var("NVGPU_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        for _ in 0..1000 {
+            ioctl(&mut be, abi::ioctl::NV_ESC_RM_CONTROL, &ctl54, &ids, 16);
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            let r = ioctl(&mut be, abi::ioctl::NV_ESC_RM_CONTROL, &ctl54, &ids, 16);
+            debug_assert_eq!(parse_resp(&r).status, 0);
+        }
+        // Natively the call takes about 1.4 us (nvgpu-bench rm-ctl).
+        eprintln!(
+            "RM_CONTROL GPU_GET_ATTACHED_IDS served in {:?} a call",
+            t0.elapsed() / n
+        );
+    }
+
     // ------------------------------------------------------------------
     // Real mapping round-trip
     //

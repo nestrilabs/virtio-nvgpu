@@ -16,6 +16,35 @@
 //! Only `sys` hands the buffer's address to anything: the rest of the crate
 //! reads and writes it as a slice, and gives it to the host as a block of a
 //! [`super::block::Arena`].
+//!
+//! **Small buffers are reused.** Making one is an `mmap` and an `mprotect`,
+//! and dropping it a `munmap`, which in a process of many threads is a TLB
+//! shootdown: together about 9 µs, six times the host's own cost of an RM
+//! control, on every call (BENCHMARKS.md). So a buffer of up to
+//! [`POOL_PAGES`] pages goes back to a small pool when it is dropped, zeroed
+//! through all of its reach (the buffer and its slack) with its guard page
+//! still `PROT_NONE`, and comes out again as exactly what a fresh anonymous
+//! mapping is: every byte zero, the same layout, the same guard. Nothing of
+//! one call reaches the next, whoever made it. The pool holds at most
+//! [`POOL_DEPTH`] buffers of each size, a few MiB at most, whatever the guest
+//! does; a buffer the pool has no room for is unmapped as before.
+
+#[cfg(not(miri))]
+use std::sync::Mutex;
+
+/// The largest buffer, in pages of buffer and slack, the pool keeps: blocks up
+/// to 60 KiB.
+#[cfg_attr(miri, allow(dead_code))]
+const POOL_PAGES: usize = 16;
+/// How many free buffers of each size the pool keeps.
+#[cfg_attr(miri, allow(dead_code))]
+const POOL_DEPTH: usize = 4;
+
+/// Free buffers by their page count (buffer and slack, not the guard), each
+/// by its base address: zero through its reach, its guard page `PROT_NONE`,
+/// owned by the pool alone.
+#[cfg(not(miri))]
+static POOL: Mutex<[Vec<usize>; POOL_PAGES + 1]> = Mutex::new([const { Vec::new() }; POOL_PAGES + 1]);
 
 pub struct GuardedBuf {
     base: *mut u8,
@@ -28,7 +57,8 @@ pub struct GuardedBuf {
 // anonymous private mmap made in `new` and is never handed out except as a
 // borrow of the GuardedBuf itself (`as_slice` through `&self`, `as_mut_slice`
 // and `as_mut_ptr` through `&mut self`), there is no Clone, and `Drop` unmaps
-// it exactly once. So moving the value to another thread moves the only way
+// it exactly once or hands it, zeroed, to the pool, which gives it to one
+// new GuardedBuf at most. So moving the value to another thread moves the only way
 // to reach those pages, and no other thread keeps an alias to them: the raw
 // pointer is only why the compiler cannot see that. Pages of an anonymous
 // mapping are not tied to the thread that created them.
@@ -97,6 +127,18 @@ impl GuardedBuf {
     fn mapped(len: usize) -> Option<Self> {
         let pages = (len + SLACK).div_ceil(PAGE);
         let mapped = (pages + 1) * PAGE;
+        if pages <= POOL_PAGES
+            && let Some(base) = POOL.lock().unwrap_or_else(|p| p.into_inner())[pages].pop()
+        {
+            // A mapping of this very layout that `Drop` zeroed and gave the
+            // pool, which gives each out once: this GuardedBuf owns it now.
+            return Some(Self {
+                base: base as *mut u8,
+                mapped,
+                offset: 0,
+                len,
+            });
+        }
         // SAFETY: a fresh anonymous mapping at an address the kernel chooses;
         // nothing else can refer to it yet.
         let base = unsafe {
@@ -180,12 +222,27 @@ impl Drop for GuardedBuf {
             // SAFETY: allocated in `new` with this layout, freed once.
             unsafe { std::alloc::dealloc(self.base, layout) };
         }
-        // SAFETY: the mapping made in `new`, unmapped exactly once; no borrow
-        // of `self` outlives it.
         #[cfg(not(miri))]
-        unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.mapped)
-        };
+        {
+            let pages = self.mapped / PAGE - 1;
+            if pages <= POOL_PAGES {
+                // Back to what a fresh mapping is before anyone else can have
+                // it: zero through the whole reach, which is everything the
+                // host could have written (the guard page cannot have been).
+                // SAFETY: `pages * PAGE` bytes from `base` are mapped
+                // read-write (the guard is the page after them), and nothing
+                // else refers to them: `&mut self` is the last borrow.
+                unsafe { std::ptr::write_bytes(self.base, 0, pages * PAGE) };
+                let mut pool = POOL.lock().unwrap_or_else(|p| p.into_inner());
+                if pool[pages].len() < POOL_DEPTH {
+                    pool[pages].push(self.base as usize);
+                    return;
+                }
+            }
+            // SAFETY: the mapping made in `new`, unmapped exactly once; no
+            // borrow of `self` outlives it, and the pool does not hold it.
+            unsafe { libc::munmap(self.base as *mut libc::c_void, self.mapped) };
+        }
     }
 }
 
@@ -221,6 +278,42 @@ mod tests {
             .join()
             .unwrap();
         assert_eq!(back, b"nvgp");
+    }
+
+    /// A buffer the host wrote all through its reach, dropped: whichever
+    /// buffer of that size comes next -- the same one from the pool or a fresh
+    /// mapping -- is zero everywhere, with its guard behind it.
+    #[test]
+    fn a_reused_buffer_is_a_fresh_one() {
+        for len in [1, 100, 4096, 5000, 40_000, 60 * 1024] {
+            let mut b = GuardedBuf::new(len).expect("mapped");
+            b.with_slack().fill(0xa5);
+            let first = b.base as usize;
+            drop(b);
+            let mut c = GuardedBuf::new(len).expect("mapped");
+            assert_eq!(c.len(), len);
+            assert!(c.as_slice().iter().all(|&x| x == 0), "len {len}: stale bytes");
+            assert!(c.with_slack().iter().all(|&x| x == 0), "len {len}: stale slack");
+            assert_eq!(c.mapped, ((len + SLACK).div_ceil(PAGE) + 1) * PAGE);
+            // Only a test's other threads could have taken `first` meanwhile.
+            let _ = first;
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "the pool is not built under Miri")]
+    fn the_pool_is_bounded_and_takes_no_large_buffers() {
+        #[cfg(not(miri))]
+        {
+            let many: Vec<_> = (0..3 * POOL_DEPTH).map(|_| GuardedBuf::new(200).unwrap()).collect();
+            drop(many);
+            let big = GuardedBuf::new(POOL_PAGES * PAGE).unwrap();
+            let pages = big.mapped / PAGE - 1;
+            assert!(pages > POOL_PAGES);
+            drop(big);
+            let pool = POOL.lock().unwrap();
+            assert!(pool.iter().all(|v| v.len() <= POOL_DEPTH));
+        }
     }
 
     #[test]
