@@ -135,6 +135,11 @@ static int arr(unsigned int nr, uint32_t h) {
   return io(RW, nr, sizeof(a), &a);
 }
 
+/* DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: without it the kernel answers
+ * -EINVAL for a syncobj that holds no fence yet (a reset one), not -ETIME
+ * (drm_syncobj_array_wait_timeout); with it, "not signalled" is -ETIME. */
+#define WAIT_FOR_SUBMIT (1u << 1)
+
 /* WAIT with timeout 0 on one handle, at `size` bytes: 0, -ETIME, ... */
 static int poll_wait(uint32_t h, unsigned int size, uint32_t *first) {
   struct {
@@ -147,6 +152,7 @@ static int poll_wait(uint32_t h, unsigned int size, uint32_t *first) {
   memset(&b.w, 0, size < sizeof(b.w) ? size : sizeof(b.w));
   b.w.handles = (uintptr_t)&h;
   b.w.count_handles = 1;
+  b.w.flags = WAIT_FOR_SUBMIT;
   b.w.first_signaled = 0x55;
   r = io(RW, NR_WAIT, size, &b);
   if (size <= sizeof(b.w) - 8 && b.w.deadline_nsec != 0xa5a5a5a5a5a5a5a5ull)
@@ -168,6 +174,7 @@ static int poll_tlwait(uint32_t h, unsigned int size) {
   b.w.handles = (uintptr_t)&h;
   b.w.points = (uintptr_t)&point;
   b.w.count_handles = 1;
+  b.w.flags = WAIT_FOR_SUBMIT;
   r = io(RW, NR_TLWAIT, size, &b);
   if (size <= sizeof(b.w) - 8 && b.w.deadline_nsec != 0xa5a5a5a5a5a5a5a5ull)
     check(0, "SYNCOBJ_TIMELINE_WAIT(%u) wrote past its struct", size);
