@@ -40,6 +40,8 @@
 # and a stats line per run (rig/framepace-stats.py) in summary.txt.
 set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=rig/lib.sh
+. "$REPO/rig/lib.sh"
 RIG=${NVGPU_RIG:-$REPO/.rig}
 export NVGPU_RIG=$RIG
 [ $# -ge 3 ] || { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -126,24 +128,15 @@ run_vm() { # run_vm N
     # log runs (framepace-sched.py): the guest boots in about 10 s.
     (
         sleep $((WARM + 12))
-        # This user's, and the backend as run-guest.sh starts it (the
-        # binary, then --socket): not another VM's, nor an editor's.
-        pids=$(pgrep -n -u "$(id -u)" -x nesbox || pgrep -n -u "$(id -u)" -x crosvm)
-        pids="$pids $(pgrep -n -u "$(id -u)" -f '^[^ ]*/vhost-user-nvgpu --socket ')"
+        pids=$(rig_vmm_pid)
+        pids="$pids $(rig_backend_pid)"
         python3 "$REPO/rig/framepace-sched.py" $((SECS > 6 ? SECS - 4 : 2)) $pids >"$OUT/$WL-vm-$1.sched.txt" 2>&1
     ) &
-    NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((TOTAL + 90))} \
-        NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=$((TOTAL + 60)) nvgpu_cmd=$(printf %s "$gcmd" | base64 -w0) ${NVGPU_CMDLINE_EXTRA:-}" \
-        "$REPO/rig/run-guest.sh" --wayland-socket "$SESSION" run "$tag" ${extra[@]+-- "${extra[@]}"} \
-        >"$OUT/$WL-vm-$1.launcher.log" 2>&1
+    rig_run_vm "$tag" "$SESSION" "$TOTAL" "$gcmd" ${extra[@]+"${extra[@]}"} >"$OUT/$WL-vm-$1.launcher.log" 2>&1
     tr -d '\r' <"$RIG/logs/$tag.console.log" | sed -n '/^FP_CSV_BEGIN/,/^FP_CSV_END/p' | sed '1d;$d' >"$OUT/$WL-vm-$1.csv"
     # The two sides' pacing counters: the guest driver's, printed after the
-    # log, and the backend's teardown report (device::pacing).
-    {
-        tr -d '\r' <"$RIG/logs/$tag.console.log" | sed -n '/^FP_PACING_BEGIN/,/^FP_PACING_END/p' | sed '1d;$d' |
-            sed 's/^/guest: /'
-        grep -a 'pacing:' "$RIG/logs/$tag.backend.log" | sed 's/^.*\] //'
-    } >"$OUT/$WL-vm-$1.pacing.txt"
+    # log, and the backend's teardown report.
+    rig_pacing "$RIG/logs/$tag.console.log" "$RIG/logs/$tag.backend.log" FP_PACING >"$OUT/$WL-vm-$1.pacing.txt"
     cp "$RIG/logs/$tag.backend.log" "$OUT/$WL-vm-$1.backend.log" 2>/dev/null
     cp "$RIG/logs/$tag.console.log" "$OUT/$WL-vm-$1.console.log" 2>/dev/null
     [ -s "$OUT/$WL-vm-$1.csv" ] || rm -f "$OUT/$WL-vm-$1.csv"

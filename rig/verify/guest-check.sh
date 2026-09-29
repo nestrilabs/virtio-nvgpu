@@ -9,9 +9,6 @@
 # Exit status is the number of checks that FAILED (warnings do not count).
 set -euo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=rig/verify/common.sh
-. "$here/common.sh"
 
 fails=0
 ok()   { printf '  ok    %s\n' "$1"; }
