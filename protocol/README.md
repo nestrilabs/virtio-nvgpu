@@ -13,7 +13,11 @@ layouts, request and response headers, and the ABI descriptions both sides read.
 Nothing here should contain logic.
 
 `src/messages.rs` is normative, and `driver/nvgpu_wire.h` mirrors it; both
-assert their sizes. It defines both protocols:
+assert their sizes, and the Rust tests read the C headers themselves
+(`src/cheader.rs`, test-only: integer defines, and structs' sizes and
+offsets as a C compiler lays them out) and hold the mirrors equal to them:
+`nvgpu_wire.h` in this crate's and `device`'s tests, `uapi/nvgpu_wl.h` in
+`nvgpu-wl-guest`'s. It defines both protocols:
 
 - **v1**: OPEN, IOCTL, MMAP, MUNMAP, CLOSE, the proc/sys file listings and the
   16-byte EVENT_READY — everything a guest needs to render and encode. IOCTL
