@@ -50,6 +50,9 @@ pub const ERR_IMPLEMENTATION: u32 = 3;
 pub const ERR_SYNCOBJ_INVALID_TIMELINE: u32 = 1;
 /// `wl_shm.error.invalid_fd`.
 pub const ERR_SHM_INVALID_FD: u32 = 2;
+/// `wl_shm.error.invalid_stride`, which libwayland also posts for a pool
+/// size that is not positive.
+pub const ERR_SHM_INVALID_STRIDE: u32 = 1;
 
 const CLOCK_MONOTONIC: u32 = 1;
 const CLOCK_MONOTONIC_RAW: u32 = 4;
@@ -736,7 +739,7 @@ impl Engine {
             if !(8..=MAX_MSG).contains(&size) || !size.is_multiple_of(4) {
                 break Err(Fatal::new(
                     Blame::Local,
-                    h.object,
+                    1,
                     ERR_INVALID_METHOD,
                     "bad message size",
                 ));
@@ -889,7 +892,15 @@ impl Engine {
             Blame::Channel
         };
         let h = peek_header(&msg).unwrap();
-        let err = |code: u32, m: String| Fatal::new(blame, h.object, code, m);
+        // Where libwayland-server posts it: the generic errors (an unknown
+        // object or opcode, bad arguments, a bad new id, out of memory, the
+        // implementation's own) on the display, `wl_display.error`'s object
+        // argument being 1 -- the client may not even know the object the
+        // message named, and then fails to dispatch the error at all -- and
+        // an interface's own errors, and a bad bind, on the object
+        // (wayland-server.c, wl_client_connection_data and registry_bind).
+        let err = |code: u32, m: String| Fatal::new(blame, 1, code, m);
+        let err_on = |code: u32, m: String| Fatal::new(blame, h.object, code, m);
 
         let obj = self
             .objects
@@ -971,13 +982,13 @@ impl Engine {
                         unreachable!()
                     };
                     let Some(&(id, max)) = self.registry.offered.get(&name) else {
-                        return Err(err(
+                        return Err(err_on(
                             ERR_INVALID_OBJECT,
                             format!("bind of global {name}, which was not offered"),
                         ));
                     };
                     if iface(id).name.as_bytes() != ifname || version == 0 || version > max {
-                        return Err(err(
+                        return Err(err_on(
                             ERR_INVALID_OBJECT,
                             format!(
                                 "bind of global {name} as {} v{version}; offered {} v{max}",
@@ -1075,8 +1086,8 @@ impl Engine {
                             let size = match args[2].val {
                                 Val::Int(s) if s > 0 => s as u64,
                                 _ => {
-                                    return Err(err(
-                                        ERR_INVALID_METHOD,
+                                    return Err(err_on(
+                                        ERR_SHM_INVALID_STRIDE,
                                         "invalid shm pool size".into(),
                                     ));
                                 }
@@ -1086,7 +1097,7 @@ impl Engine {
                             // not a file whose server decides how long a
                             // read takes (sys::is_shmem).
                             if !sys::is_shmem(fd.as_raw_fd()) {
-                                return Err(err(
+                                return Err(err_on(
                                     ERR_SHM_INVALID_FD,
                                     "an shm pool must be a memfd or a file on tmpfs".into(),
                                 ));
@@ -1269,7 +1280,7 @@ impl Engine {
                         // host process, and naming nothing -- unlike a dma-buf,
                         // whose placeholder only fails that one buffer.
                         None if class == FdKind::Syncobj => {
-                            return Err(err(
+                            return Err(err_on(
                                 ERR_SYNCOBJ_INVALID_TIMELINE,
                                 "import_timeline: the syncobj is not one of the virtio-nvgpu \
                                  device's (a timeline from another DRM device cannot reach \

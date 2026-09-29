@@ -874,6 +874,72 @@ fn unknown_objects_opcodes_and_versions_are_fatal() {
     assert!(e.message.contains("needs version 4"), "{}", e.message);
 }
 
+/// Errors go where libwayland-server posts them: the generic ones on the
+/// display (object 1), a bad bind on the registry, and an interface's own
+/// on its object. Before, every error named the object the message did,
+/// so a client told "invalid object 99" could not dispatch the error at
+/// all (it knows no 99), and `no_memory` on `wl_shm` read as
+/// `wl_shm.error.invalid_fd` (the 2026-09-29 review, C2).
+#[test]
+fn errors_are_posted_on_the_object_libwayland_posts_them_on() {
+    let setup = || {
+        let mut p = Pair::new(Policy::default());
+        p.registry(&[(1, "wl_compositor", 6), (2, "wl_shm", 2)]);
+        p.bind(1, "wl_compositor", 6, 3).unwrap();
+        p.bind(2, "wl_shm", 2, 4).unwrap();
+        p
+    };
+    let on = |e: Fatal| (e.object, e.code);
+    let mut p = setup();
+    let e = p.client_sends(&[MsgBuilder::new(99, 0).finish()], vec![]);
+    assert_eq!(on(e.unwrap_err()), (1, ERR_INVALID_OBJECT));
+    let mut p = setup();
+    let e = p.client_sends(&[MsgBuilder::new(3, 9).finish()], vec![]);
+    assert_eq!(on(e.unwrap_err()), (1, ERR_INVALID_METHOD));
+    let mut p = setup();
+    assert_eq!(
+        on(p.bind(7, "wl_seat", 1, 5).unwrap_err()),
+        (2, ERR_INVALID_OBJECT)
+    );
+    // A pool that is not memory: wl_shm's own invalid_fd, on wl_shm.
+    let mut p = setup();
+    let (_r, w) = sys::pipe().unwrap();
+    let e = p.client_sends(
+        &[MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+            .new_id(5)
+            .int(4096)
+            .finish()],
+        vec![w],
+    );
+    assert_eq!(on(e.unwrap_err()), (4, ERR_SHM_INVALID_FD));
+    // A buffer past the connection's budget: no_memory, on the display.
+    let mut p = setup();
+    let size = i32::MAX & !4095;
+    let e = p.client_sends(
+        &[
+            MsgBuilder::new(4, op::wl_shm::REQ_CREATE_POOL)
+                .new_id(5)
+                .int(size)
+                .finish(),
+            MsgBuilder::new(5, op::wl_shm_pool::REQ_CREATE_BUFFER)
+                .new_id(6)
+                .int(0)
+                .int(4096)
+                .int(size / 16384)
+                .int(16384)
+                .uint(0)
+                .finish(),
+        ],
+        vec![sys::memfd(c"big", size as u64).unwrap()],
+    );
+    assert_eq!(on(e.unwrap_err()), (1, ERR_NO_MEMORY));
+    // And what a client is told is what the error says.
+    let f = Fatal::new(Blame::Local, 1, ERR_INVALID_OBJECT, "x");
+    let m = f.display_error();
+    assert_eq!(wire::peek_header(&m).unwrap().object, 1);
+    assert_eq!(u32::from_ne_bytes(m[8..12].try_into().unwrap()), 1);
+}
+
 #[test]
 fn a_request_on_a_destroyed_object_is_fatal_but_late_events_still_parse() {
     let mut p = Pair::new(Policy::default());
