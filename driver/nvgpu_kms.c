@@ -1292,12 +1292,7 @@ static int nvgpu_kms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
     return -EBADF;
   o = nvgpu_fd_from_file(f);
   if (o && o->dev == kc->kf->dev &&
-      (((kinds & NVGPU_SKIND_DEV_MODESET) &&
-        o->device_type == NVGPU_DEV_MODESET) ||
-       ((kinds & NVGPU_SKIND_DEV_CTL) && o->device_type == NVGPU_DEV_CTL) ||
-       ((kinds & NVGPU_SKIND_DEV_GPU) && o->device_type < NVGPU_DEV_CTL) ||
-       ((kinds & NVGPU_SKIND(NVGPU_HK_DEV)) &&
-        o->device_type < NVGPU_DEV_DRI_BASE))) {
+      nvgpu_fd_kind_allowed(o->device_type, kinds)) {
     *handle = o->handle;
     ret = 0;
   }

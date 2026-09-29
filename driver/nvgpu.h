@@ -1135,6 +1135,13 @@ struct nvgpu_i2_call {
 int nvgpu_i2_hold(struct nvgpu_i2_call *call, void (*put)(void *obj),
                   void *obj);
 
+/*
+ * For an fd_in hook: whether a file of ours of `device_type` (NVGPU_DEV_*)
+ * may stand in a descriptor field that allows `kinds` (NVGPU_SKIND*), as the
+ * backend's schema::kind_allowed() decides it. nvgpu_schema.c.
+ */
+bool nvgpu_fd_kind_allowed(u32 device_type, u32 kinds);
+
 /* Is there a schema for this call? (Used to decide whether to intercept.) */
 bool nvgpu_i2_has_schema(struct nvgpu_device *dev, u32 sclass,
                          unsigned int cmd, const void *arg_prefix,

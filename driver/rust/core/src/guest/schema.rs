@@ -11,6 +11,52 @@
 
 use super::wire::le32;
 
+/// `NVGPU_HK_DEV`, `NVGPU_HK_DRI_RENDER`, `NVGPU_HK_WAYLAND`: the backend
+/// handle kinds a file of the module's own can be.
+pub const HK_DEV: u32 = 1;
+/// See [`HK_DEV`].
+pub const HK_DRI_RENDER: u32 = 2;
+/// See [`HK_DEV`].
+pub const HK_WAYLAND: u32 = 10;
+/// `NVGPU_SKIND_DEV_CTL`, `_MODESET`, `_GPU`: one device each.
+pub const SKIND_DEV_CTL: u32 = 1 << 16;
+/// See [`SKIND_DEV_CTL`].
+pub const SKIND_DEV_MODESET: u32 = 1 << 17;
+/// See [`SKIND_DEV_CTL`].
+pub const SKIND_DEV_GPU: u32 = 1 << 18;
+/// `NVGPU_DEV_*` (`nvgpu_wire.h`): what an open of the module's asked for.
+pub const DEV_CTL: u32 = 255;
+/// See [`DEV_CTL`].
+pub const DEV_UVM: u32 = 256;
+/// See [`DEV_CTL`].
+pub const DEV_UVM_TOOLS: u32 = 257;
+/// See [`DEV_CTL`].
+pub const DEV_MODESET: u32 = 258;
+/// See [`DEV_CTL`].
+pub const DEV_WAYLAND: u32 = 259;
+/// See [`DEV_CTL`].
+pub const DEV_DRI_BASE: u32 = 512;
+/// See [`DEV_CTL`].
+pub const DEV_DRI_CARD_BASE: u32 = 1024;
+
+/// `nvgpu_fd_kind_allowed()`: whether a file of the module's of
+/// `device_type` may stand in a descriptor field that allows `kinds` (an
+/// `FD_IN` mask) -- the backend's `schema::kind_allowed()` bit for bit: the
+/// handle kind's own bit (`1 << HK_*`), or the `SKIND_DEV_*` bit of the one
+/// device it is.
+pub fn fd_kind_allowed(device_type: u32, kinds: u32) -> bool {
+    let (hk, dev_bit) = match device_type {
+        t if t < DEV_CTL => (HK_DEV, SKIND_DEV_GPU),
+        DEV_CTL => (HK_DEV, SKIND_DEV_CTL),
+        DEV_MODESET => (HK_DEV, SKIND_DEV_MODESET),
+        DEV_UVM | DEV_UVM_TOOLS => (HK_DEV, 0),
+        DEV_WAYLAND => (HK_WAYLAND, 0),
+        t if (DEV_DRI_BASE..DEV_DRI_CARD_BASE).contains(&t) => (HK_DRI_RENDER, 0),
+        _ => return false,
+    };
+    kinds & (1u32 << hk) != 0 || kinds & dev_bit != 0
+}
+
 /// `NVGPU_SF_PTR`.
 pub const SF_PTR: u8 = 1;
 /// `NVGPU_SF_ARRAY`.
@@ -255,6 +301,38 @@ impl<'t> SchemaSet<'t> {
 )]
 mod tests {
     use super::*;
+
+    /// The host's kind_allowed (device/src/schema.rs), case by case: a
+    /// device bit admits that device and no other, HK_DEV any character
+    /// device, a DRM file of ours is its render handle.
+    #[test]
+    fn fd_kinds_are_the_hosts() {
+        let hk = |k: u32| 1u32 << k;
+        for (t, kinds, ok) in [
+            (DEV_MODESET, SKIND_DEV_MODESET, true),
+            (DEV_MODESET, SKIND_DEV_CTL, false),
+            (DEV_CTL, SKIND_DEV_CTL, true),
+            (DEV_CTL, SKIND_DEV_MODESET | SKIND_DEV_GPU, false),
+            (0, SKIND_DEV_GPU, true),
+            (247, SKIND_DEV_GPU, true),
+            (0, SKIND_DEV_CTL, false),
+            (DEV_UVM, SKIND_DEV_GPU | SKIND_DEV_CTL | SKIND_DEV_MODESET, false),
+            (DEV_UVM, hk(HK_DEV), true),
+            (DEV_UVM_TOOLS, hk(HK_DEV), true),
+            (DEV_MODESET, hk(HK_DEV), true),
+            (3, hk(HK_DEV), true),
+            (DEV_DRI_BASE, hk(HK_DEV), false),
+            (DEV_DRI_BASE, hk(HK_DRI_RENDER), true),
+            (DEV_DRI_BASE + 7, hk(HK_DRI_RENDER), true),
+            (DEV_DRI_CARD_BASE, hk(HK_DRI_RENDER), false),
+            (DEV_WAYLAND, hk(HK_DEV), false),
+            (DEV_WAYLAND, hk(HK_WAYLAND), true),
+            (260, u32::MAX, false),
+            (DEV_CTL, 0, false),
+        ] {
+            assert_eq!(fd_kind_allowed(t, kinds), ok, "type {t} kinds {kinds:#x}");
+        }
+    }
 
     pub(crate) fn io(cmd: u32, sclass: u32, nvkms_cmd: u32) -> SIoctl {
         SIoctl {

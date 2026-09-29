@@ -4,6 +4,7 @@
 
 use nvgpu_guest_core::guest::deep::{self, Control, Count, Ptr};
 use nvgpu_guest_core::guest::osdesc::{self, Described};
+use nvgpu_guest_core::guest::schema;
 use nvgpu_guest_core::guest::wire::{DEEP_SEGS_MAX, DEEP_SEGS_MAX_BYTES, OSDESC_MAX_PAGES};
 use nvgpu_guest_difftest::scen;
 use proptest::prelude::*;
@@ -115,8 +116,28 @@ proptest! {
     }
 }
 
+/// The descriptor-kind test the KMS and NVKMS hooks make
+/// (`nvgpu_fd_kind_allowed()`) and its Rust twin, over every device type
+/// and every single kind bit, none and all.
+#[test]
+fn fd_kinds_agree_everywhere() {
+    for t in 0u32..1100 {
+        for kinds in (0..32).map(|b| 1u32 << b).chain([0, u32::MAX]) {
+            let c = unsafe { nvgpu_guest_difftest::cabi::nvgpu_fd_kind_allowed(t, kinds) };
+            assert_eq!(c, schema::fd_kind_allowed(t, kinds), "type {t} kinds {kinds:#x}");
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
+
+    /// ... and on any pair.
+    #[test]
+    fn fd_kinds_agree_on_any_pair(t in any::<u32>(), kinds in any::<u32>()) {
+        let c = unsafe { nvgpu_guest_difftest::cabi::nvgpu_fd_kind_allowed(t, kinds) };
+        prop_assert_eq!(c, schema::fd_kind_allowed(t, kinds));
+    }
 
     #[test]
     fn rm_escapes_agree_on_any_seed(seed in any::<u64>()) {

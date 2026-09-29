@@ -119,16 +119,6 @@ static void nvgpu_nvkms_identify(struct nvgpu_i2_call *call) {
   nc->next_event = !strcmp(e->name, "NVKMS_GET_NEXT_EVENT");
 }
 
-/* One of our /dev/nvidia* character-device files of @type on this device. */
-static struct nvgpu_fd *nvgpu_nvkms_chardev(struct nvgpu_device *dev,
-                                            struct file *f, u32 type) {
-  struct nvgpu_fd *nfd = nvgpu_fd_from_file(f);
-
-  if (!nfd || nfd->dev != dev || nfd->device_type != type)
-    return NULL;
-  return nfd;
-}
-
 /*
  * A dma-buf of one of our GEM proxies, exported by the backend from the
  * proxy's owner file for this one call: the host's NVKMS imports it with
@@ -180,10 +170,10 @@ static int nvgpu_nvkms_fd_in(struct nvgpu_i2_call *call, u32 buf, u32 off,
   f = fget(user_value);
   if (!f)
     goto bad;
-  if (kinds & NVGPU_SKIND_DEV_MODESET)
-    nfd = nvgpu_nvkms_chardev(dev, f, NVGPU_DEV_MODESET);
-  if (!nfd && (kinds & NVGPU_SKIND_DEV_CTL))
-    nfd = nvgpu_nvkms_chardev(dev, f, NVGPU_DEV_CTL);
+  nfd = nvgpu_fd_from_file(f);
+  if (nfd && (nfd->dev != dev ||
+              !nvgpu_fd_kind_allowed(nfd->device_type, kinds)))
+    nfd = NULL;
   if (nfd) {
     *handle = nfd->handle;
     /*
