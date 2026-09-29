@@ -846,16 +846,6 @@ impl Rm for HostRm {
 
 // ─────────────────────────────── the backend ───────────────────────────────
 
-/// The params of a successful v1 IOCTL reply the backend wrote into `resp`
-/// (`n` bytes): past the header and `IoctlResp`, or `None` for a failure,
-/// which is a bare header.
-pub(crate) fn reply_params(resp: &[u8], n: usize) -> Option<&[u8]> {
-    use protocol::messages::{IoctlResp, MsgHeader};
-    let body = size_of::<MsgHeader>() + size_of::<IoctlResp>();
-    let status = le::i32_at(resp, std::mem::offset_of!(MsgHeader, status))?;
-    (status == 0 && n >= body).then(|| &resp[body..n.min(resp.len())])
-}
-
 impl NvidiaBackend {
     /// A render node was opened as `handle`: learn its GPU's semaphore
     /// layout if nothing has yet, and let 0x54 on it be judged by that.
@@ -920,16 +910,15 @@ impl NvidiaBackend {
         (f, v)
     }
 
-    /// After a v1 RM call on `issuer` answered `resp` (`n` bytes): what it
-    /// allocated or freed that the checks above rest on. `param_in` is what
-    /// the guest sent.
+    /// After a v1 RM call on `issuer` the host served with parameters
+    /// `reply` (none if it did not): what it allocated or freed that the
+    /// checks above rest on. `param_in` is what the guest sent.
     pub(crate) fn semsurf_track_rm(
         &self,
         escape: u32,
         issuer: u32,
         param_in: &[u8],
-        resp: &[u8],
-        n: usize,
+        reply: Option<&[u8]>,
     ) {
         use abi::ioctl::*;
         let word = le::u32_at;
@@ -937,7 +926,7 @@ impl NvidiaBackend {
             NV_ESC_RM_ALLOC => {
                 let is_client =
                     word(param_in, NVOS64_H_CLASS).is_some_and(|c| ROOT_CLASSES.contains(&c));
-                if let Some(out) = reply_params(resp, n).filter(|_| is_client)
+                if let Some(out) = reply.filter(|_| is_client)
                     && word(out, NVOS64_STATUS) == Some(0)
                     && let Some(h) = word(out, NVOS64_H_OBJECT_NEW).filter(|&h| h != 0)
                 {
@@ -962,8 +951,7 @@ impl NvidiaBackend {
                     word(param_in, NVOS00_H_ROOT),
                     word(param_in, NVOS00_H_OBJECT_OLD),
                 ) {
-                    let freed =
-                        reply_params(resp, n).and_then(|out| word(out, NVOS00_STATUS)) == Some(0);
+                    let freed = reply.and_then(|out| word(out, NVOS00_STATUS)) == Some(0);
                     if !freed && self.semsurf.issuer_of(root) != Some(issuer) {
                         log::debug!(
                             "RM_FREE of {root:#x}/{old:#x} through handle {issuer}, which did \
@@ -982,7 +970,7 @@ impl NvidiaBackend {
             // Status}: `fd` is our handle as the guest sent it (restored in
             // the reply), -1 for none.
             NV_ESC_ALLOC_OS_EVENT => {
-                if let Some(out) = reply_params(resp, n)
+                if let Some(out) = reply
                     && let (Some(c), Some(fd), Some(0)) = (
                         word(out, OS_EVENT_H_CLIENT),
                         word(out, OS_EVENT_FD),
@@ -1000,8 +988,7 @@ impl NvidiaBackend {
                     word(param_in, OS_EVENT_H_CLIENT),
                     word(param_in, OS_EVENT_FD),
                 ) {
-                    let freed =
-                        reply_params(resp, n).and_then(|out| word(out, OS_EVENT_STATUS)) == Some(0);
+                    let freed = reply.and_then(|out| word(out, OS_EVENT_STATUS)) == Some(0);
                     if freed || self.semsurf.os_event_issuer(c, fd) == Some(issuer) {
                         self.semsurf.os_event_freed(c, fd);
                     }
