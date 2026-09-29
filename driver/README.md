@@ -72,8 +72,9 @@ does (default `y` with `CONFIG_RUST`). `NVGPU_RUST=1` insists on the Rust,
 with Rust. The Rust passed the whole hardware regression on 2026-09-26 and
 is the stronger boundary (`SECURITY.md` §6); the C stays, frozen, as the
 fallback for a guest kernel without Rust and as the difftest's oracle, and
-`scripts/build-guest-kernel.sh` builds a Rust kernel and module unless given
-`NVGPU_RUST=0`. [`rust/README.md`](rust/README.md) has how to build and test
+`scripts/build-guest-kernel.sh` builds a Rust kernel and module in
+`scripts/guest-toolchain-rust` (and says it builds the C fallback in a
+toolchain without Rust, or with `NVGPU_RUST=0`). [`rust/README.md`](rust/README.md) has how to build and test
 each, and how to delete the C afterwards.
 
 One module, `virtio_gpu_nv.ko`, built from several objects (see `Makefile`;

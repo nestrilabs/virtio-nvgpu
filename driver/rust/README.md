@@ -22,7 +22,8 @@ build error against a kernel without `CONFIG_RUST`, and a plain one when no
 load on a kernel with Rust. The module records which it has (`modinfo -F
 parsers`). The Makefile refuses to link a `nvgpu_rs.o` that names a panic
 symbol. `scripts/build-guest-kernel.sh` builds a `CONFIG_RUST=y` kernel and
-the Rust module by default, and `driver/guest-kernel.defconfig` has
+the Rust module in `scripts/guest-toolchain-rust` (the C fallback, with a
+note, in a toolchain without Rust), and `driver/guest-kernel.defconfig` has
 `CONFIG_RUST=y`. The C stays buildable and frozen -- fixes only, no new
 parser features -- as the difftest's oracle and the fallback for a guest
 kernel that cannot have Rust.
