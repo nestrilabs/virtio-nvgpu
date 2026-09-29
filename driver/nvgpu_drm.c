@@ -138,7 +138,7 @@ static int nvgpu_gem_proxy_create_new(struct drm_file *file,
 #define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
 #define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
 #define DRM_NVIDIA_GET_DRM_FILE_UNIQUE_ID 0x18 /* abs nr 0x58 */
-/* Semaphore-surface fences, nvgpu_fence.c. */
+/* Semaphore-surface fences, nvgpu_semsurf.c. */
 #define DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE 0x14 /* abs nr 0x54 */
 #define DRM_NVIDIA_SEMSURF_FENCE_CREATE 0x15     /* abs nr 0x55 */
 #define DRM_NVIDIA_SEMSURF_FENCE_WAIT 0x16       /* abs nr 0x56 */
@@ -268,7 +268,7 @@ static long nvgpu_drm_get_dev_info(struct nvgpu_fd *nfd,
    *   supports_sync_fd   with fences on, the semsurf bit: nvidia-drm sets
    *   supports_semsurf   both from one condition, so no userspace has seen
    *                      one without the other, and 0x54..0x57 are forwarded
-   *                      (nvgpu_fence.c). With fences off (a v1 backend),
+   *                      (nvgpu_semsurf.c). With fences off (a v1 backend),
    *                      neither: 0x54 is not served, nor the PRIME fence
    *                      pair behind sync_fd (0x45, 0x46).
    *
@@ -524,7 +524,7 @@ static long nvgpu_drm_driver_ioctl(struct nvgpu_fd *nfd,
     put_unaligned(nfd->drm_unique_id, (u64 *)k);
     return 0;
 
-  /* Semaphore-surface fences: the host's objects, proxied (nvgpu_fence.c). */
+  /* Semaphore-surface fences: the host's objects, proxied (nvgpu_semsurf.c). */
   case DRM_NVIDIA_SEMSURF_FENCE_CTX_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_CREATE:
   case DRM_NVIDIA_SEMSURF_FENCE_WAIT:
@@ -1954,7 +1954,7 @@ static long __nvgpu_drm_unlocked_ioctl(struct file *filp, unsigned int cmd,
     }
 
     /*
-     * Syncobjs are the host's, in the file's render node (nvgpu_fence.c).
+     * Syncobjs are the host's, in the file's render node (nvgpu_syncobj.c).
      * Only with the backend serving them; otherwise the core answers, and
      * with DRIVER_SYNCOBJ cleared for this device it answers -EOPNOTSUPP.
      */

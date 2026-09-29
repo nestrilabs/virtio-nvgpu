@@ -525,14 +525,14 @@ u32 nvgpu_open_req_fill_proc(const struct nvgpu_device *dev,
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f);
 /* nvgpu_xfer.c: nothing sent will be answered (after a reset, remove()). */
 bool nvgpu_xfer_dead(struct nvgpu_device *dev);
-/* nvgpu_fence.c: every guest syncobj waiter looks again. */
+/* nvgpu_syncobj.c: every guest syncobj waiter looks again. */
 void nvgpu_fence_wake_waiters(void);
 
 /*
  * Frame-pacing counters, nvgpu_xfer.c's (ARCHITECTURE.md, "Frame pacing"):
  * relaxed atomics, always kept, read as root from
  * /sys/module/virtio_gpu_nv/parameters/pacing. The syncobj waits of
- * nvgpu_fence.c count themselves here too.
+ * nvgpu_syncobj.c count themselves here too.
  */
 enum nvgpu_pace_ctr {
   NVGPU_PACE_SW_WAITS,    /* SYNCOBJ_(TIMELINE_)WAITs with a timeout */
@@ -808,12 +808,14 @@ int nvgpu_hostfile_lookup(struct nvgpu_device *dev, int fd, u32 kind,
 struct file *nvgpu_hostfile_fget(struct nvgpu_device *dev, int fd, u32 kind,
                                  u32 *handle);
 
-/* ───────── nvgpu_fence.c ───────── */
+/* ───────── nvgpu_fence.c, nvgpu_syncobj.c, nvgpu_semsurf.c ───────── */
 
 /*
  * Fences live on the host (ARCHITECTURE.md §12): a guest sync_file this driver makes
  * wraps an nvgpu host fence, a proxy dma_fence for a host sync_file that
- * signals (with the host's error, if any) when the host's does.
+ * signals (with the host's error, if any) when the host's does
+ * (nvgpu_fence.c); the syncobj ioctls are nvgpu_syncobj.c's, the
+ * semaphore-surface ones nvgpu_semsurf.c's.
  */
 
 struct dma_fence;
@@ -938,7 +940,9 @@ unsigned int nvgpu_wl_reap_recv(struct nvgpu_device *dev,
  * state they share is nvgpu_xfer.h), nvgpu_i2.c (the schema-driven IOCTL2
  * interpreter),
  * nvgpu_hostfile.c (backend handles as guest files), nvgpu_kms.c,
- * nvgpu_fence.c, nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are nvgpu_wire.h.
+ * nvgpu_fence.c (with nvgpu_syncobj.c and nvgpu_semsurf.c; nvgpu_fence.h
+ * what they share), nvgpu_nvkms.c, nvgpu_wl.c. Wire layouts are
+ * nvgpu_wire.h.
  */
 
 struct nvgpu_xfer;

@@ -610,7 +610,7 @@ def next_event_valid(tables):
 
 def c_drm_cmds(t):
     """The DRM table's full ioctl numbers, by name, for the guest code that
-    builds a native command itself (the syncobj paths in nvgpu_fence.c, the
+    builds a native command itself (the syncobj paths in nvgpu_syncobj.c, the
     dumb-buffer pair in nvgpu_kms.c) to static_assert its kernel's numbers
     against: a guest kernel whose struct grew would otherwise have every such
     call refused at run time for its size, with only a warning to say why."""
