@@ -703,7 +703,13 @@ own), so it has guest runs only. In the guest it runs without
 `CAP_SYS_NICE`, as a user runs it: as root it asks for a realtime queue,
 whose RM control the allowlist refuses.
 
-Results are in DEPLOY.md, "Frame pacing".
+Results are in DEPLOY.md, "Frame pacing". The regression of branch
+`frame-timing` on its installed backend, image and modules (2026-09-29,
+nesbox, sandbox on, allowlist enforcing): `stage1` 6/0/0, `render` with
+compute 9/0/1 (cuda-smoke PASS), `secneg` (kms=none) ctl + render 10
+passed, 5 skipped, `compat` 12/0/0, `wayland` on the live Hyprland 13/0/1;
+with the Rust module, `stage1`, `render` with compute, `secneg` and
+`compat` the same. No Xid.
 
 ## What to keep from every run
 
