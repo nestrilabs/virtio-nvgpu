@@ -2427,6 +2427,22 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
   }
   drain_workqueue(xf->wq);
 
+  /*
+   * No event will come now either. What waits for one is ended as a lost GPU
+   * ends it: fences signalled with an error, and every poller of a file of
+   * this device woken to find EPOLLHUP | EPOLLERR (nvgpu_poll_mask() and the
+   * DRM and NVKMS polls ask nvgpu_xfer_dead()).
+   */
+  nvgpu_fence_device_dead(dev);
+  {
+    struct nvgpu_fd *nfd;
+
+    spin_lock_irqsave(&dev->fds_lock, flags);
+    list_for_each_entry(nfd, &dev->fds, node)
+      wake_up_interruptible_all(&nfd->wq);
+    spin_unlock_irqrestore(&dev->fds_lock, flags);
+  }
+
   if (ev)
     for (i = 0; i < NVGPU_EVENT_BUFS; i++) {
       kfree(ev->bufs[i]);

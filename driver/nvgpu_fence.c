@@ -1126,6 +1126,74 @@ void nvgpu_fence_file_release(struct nvgpu_fd *nfd) {
   nvgpu_fence_reap();
 }
 
+/*
+ * The transport is dead (nvgpu_xfer_reclaim()): no EV_FENCE or EV_READY will
+ * ever come for `dev`, so nothing waiting on one may go on waiting. A native
+ * GPU loss ends its fences with an error too; here:
+ *
+ *  - every host-fence proxy of the device not yet signalled is signalled
+ *    with -ENODEV, which a sync_file's poll, an IN_FENCE_FD and a
+ *    dma_fence_wait all see;
+ *  - every SYNCOBJ_EVENTFD subscriber of it is signalled, as the kernel
+ *    signals one when its point gets a fence -- the waiter then finds the
+ *    device gone on its next call;
+ *  - guest syncobj waiters are woken, and find nvgpu_xfer_dead().
+ *
+ * A proxy made afterwards fails its WATCH with -ENODEV and is signalled with
+ * that error then. Process context.
+ */
+void nvgpu_fence_device_dead(struct nvgpu_device *dev) {
+  struct nvgpu_host_fence *f;
+  struct nvgpu_sowait *s, *found;
+  unsigned long id, flags;
+  unsigned int bkt;
+
+  rcu_read_lock();
+  xa_for_each(&nvgpu_host_fences, id, f) {
+    if (f->dev != dev || !dma_fence_get_rcu(&f->base))
+      continue;
+    rcu_read_unlock();
+    if (!atomic_xchg(&f->signalled, 1)) {
+      dma_fence_set_error(&f->base, -ENODEV);
+      dma_fence_signal(&f->base);
+    }
+    dma_fence_put(&f->base);
+    rcu_read_lock();
+  }
+  rcu_read_unlock();
+
+  for (;;) {
+    struct nvgpu_sowait_sub *sub, *n;
+    LIST_HEAD(subs);
+
+    found = NULL;
+    spin_lock_irqsave(&nvgpu_sowait_lock, flags);
+    hash_for_each(nvgpu_sowaits, bkt, s, node) {
+      if (s->ev.dev == dev && s->subs_ref) {
+        found = s;
+        break;
+      }
+    }
+    if (found) {
+      atomic_set(&found->fired, 1);
+      list_splice_init(&found->subs, &subs);
+      list_for_each_entry(sub, &subs, node)
+        nvgpu_sowait_uncharge_locked(sub);
+      found->subs_ref = false;
+    }
+    spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
+    if (!found)
+      break;
+    list_for_each_entry_safe(sub, n, &subs, node) {
+      eventfd_signal(sub->ctx);
+      eventfd_ctx_put(sub->ctx);
+      kfree(sub);
+    }
+    nvgpu_sowait_put(found);
+  }
+  nvgpu_fence_wake_waiters();
+}
+
 void nvgpu_fence_drain(void) { nvgpu_fence_reap(); }
 
 /* One syncobj wait in progress. */

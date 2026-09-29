@@ -92,6 +92,8 @@
 /* How long a blocking WAIT_VBLANK waits: the core's own bound
  * (drm_vblank.c:1850), after which it answers -EBUSY. */
 #define NVGPU_KMS_VBLANK_WAIT_MS 3000
+/* ... looking every this often whether the transport has died. */
+#define NVGPU_KMS_VBLANK_SLICE_MS 50
 
 /*
  * user_data of the EVENT form a blocking WAIT_VBLANK is sent as: a tag in the
@@ -1481,6 +1483,7 @@ static void nvgpu_kms_reply_tv(struct nvgpu_device *dev, u8 *b0) {
  */
 static int nvgpu_kms_vblank_done(struct nvgpu_kms_call *kc, u8 *b0) {
   struct nvgpu_i2_call *call = &kc->call;
+  unsigned long deadline;
   long left;
 
   if (!kc->waiting) {
@@ -1493,8 +1496,28 @@ static int nvgpu_kms_vblank_done(struct nvgpu_kms_call *kc, u8 *b0) {
     put_unaligned_le64(kc->vbl_signal, b0 + 8);
     return 0;
   }
-  left = wait_for_completion_interruptible_timeout(
-      &kc->wait.done, msecs_to_jiffies(NVGPU_KMS_VBLANK_WAIT_MS));
+  /*
+   * In slices, each ending with a look at the transport: once it is dead no
+   * event will complete this, and remove()'s drm_dev_unplug() waits for the
+   * ioctl to leave (S7, 2026-09-29) -- 3 s of it, or a slice of it now.
+   */
+  deadline = jiffies + msecs_to_jiffies(NVGPU_KMS_VBLANK_WAIT_MS);
+  for (;;) {
+    long slice = min_t(long, (long)(deadline - jiffies),
+                       (long)msecs_to_jiffies(NVGPU_KMS_VBLANK_SLICE_MS));
+
+    left = slice > 0
+               ? wait_for_completion_interruptible_timeout(&kc->wait.done,
+                                                           slice)
+               : 0;
+    if (left || slice <= 0)
+      break;
+    if (nvgpu_xfer_dead(kc->kf->dev)) {
+      put_unaligned_le64(kc->vbl_signal, b0 + 8);
+      call->ret = -ENODEV;
+      return 0;
+    }
+  }
   if (left > 0) {
     /* Translated when it arrived. */
     put_unaligned_le32(kc->wait.ev.sequence, b0 + 4);

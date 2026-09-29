@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/poll.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -2030,6 +2031,25 @@ static long nvgpu_drm_compat_ioctl(struct file *filp, unsigned int cmd,
 }
 #endif
 
+/*
+ * drm_poll(), and once the backend is gone (nvgpu_xfer_dead()) EPOLLHUP |
+ * EPOLLERR: no host event will come for a flip or a vblank, and a reader must
+ * not sleep through that. The file's nvgpu_fd wait queue is the one
+ * nvgpu_xfer_reclaim() wakes.
+ */
+static __poll_t nvgpu_drm_poll(struct file *filp,
+                               struct poll_table_struct *wait) {
+  struct drm_file *file = filp->private_data;
+  struct nvgpu_fd *nfd = file ? file->driver_priv : NULL;
+
+  if (nfd) {
+    poll_wait(filp, &nfd->wq, wait);
+    if (nvgpu_xfer_dead(nfd->dev))
+      return EPOLLHUP | EPOLLERR;
+  }
+  return drm_poll(filp, wait);
+}
+
 static const struct file_operations nvgpu_drm_fops = {
     .owner = THIS_MODULE,
 #if defined(FOP_UNSIGNED_OFFSET)
@@ -2042,7 +2062,7 @@ static const struct file_operations nvgpu_drm_fops = {
     .compat_ioctl = nvgpu_drm_compat_ioctl,
 #endif
     .mmap = drm_gem_mmap,
-    .poll = drm_poll,
+    .poll = nvgpu_drm_poll,
     .read = drm_read,
     .llseek = noop_llseek,
 };

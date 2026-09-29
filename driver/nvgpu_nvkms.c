@@ -308,6 +308,9 @@ long nvgpu_nvkms_ioctl(struct nvgpu_fd *nfd, unsigned int cmd,
 __poll_t nvgpu_nvkms_poll(struct nvgpu_fd *nfd, struct file *filp,
                           struct poll_table_struct *wait) {
   poll_wait(filp, &nfd->wq, wait);
+  /* The backend is gone: no event will come (nvgpu_poll_mask()). */
+  if (nvgpu_xfer_dead(nfd->dev))
+    return EPOLLHUP | EPOLLERR;
   return atomic_read(&nfd->pending) != NVGPU_NVKMS_IDLE
              ? EPOLLIN | EPOLLPRI | EPOLLRDNORM
              : 0;

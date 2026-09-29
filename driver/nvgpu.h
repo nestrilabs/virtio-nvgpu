@@ -774,6 +774,9 @@ void nvgpu_fence_gem_free(struct nvgpu_gem_object *ng);
 void nvgpu_fence_file_release(struct nvgpu_fd *nfd);
 /* Retire the event consumers buried so far (remove(), module exit). */
 void nvgpu_fence_drain(void);
+/* The transport of `dev` is dead: signal its host fences with -ENODEV and
+ * its SYNCOBJ_EVENTFD subscribers, and wake its syncobj waiters. */
+void nvgpu_fence_device_dead(struct nvgpu_device *dev);
 
 /* ───────── nvgpu_capture.c ───────── */
 

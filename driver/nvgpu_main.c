@@ -102,6 +102,15 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
   poll_wait(filp, &nfd->wq, wait);
 
   /*
+   * The backend is gone (remove(), a reset): nothing will ever be reported
+   * again, and a poller must not sleep through that. A lost GPU is POLLHUP
+   * natively (nv.c:2319-2323); EPOLLERR as well, for a caller that only
+   * looks for errors. nvgpu_xfer_reclaim() wakes every waiter to see it.
+   */
+  if (nvgpu_xfer_dead(nfd->dev))
+    return EPOLLHUP | EPOLLERR;
+
+  /*
    * Taken, not read: a caller that polls without consuming would otherwise
    * find it ready every time, which is the spin this path exists to end. One
    * report per event.
@@ -125,7 +134,19 @@ static __poll_t nvgpu_poll_mask(struct file *filp,
   return ready_now;
 }
 
+/*
+ * nvidia.ko reports an RM event as POLLPRI | POLLIN (nv.c:2333), and a client
+ * may wait for either; with EPOLLIN alone, one polling for POLLPRI slept
+ * through events that had arrived. nvidia-modeset's is the same (below).
+ */
 static __poll_t nvgpu_poll(struct file *filp, struct poll_table_struct *wait) {
+  return nvgpu_poll_mask(filp, wait, EPOLLPRI | EPOLLIN);
+}
+
+/* /dev/nvidia-uvm-tools: uvm_tools_poll's POLLIN | POLLRDNORM
+ * (uvm_tools.c). /dev/nvidia-uvm itself has no .poll, as uvm_fops has none. */
+static __poll_t nvgpu_uvm_tools_poll(struct file *filp,
+                                     struct poll_table_struct *wait) {
   return nvgpu_poll_mask(filp, wait, EPOLLIN | EPOLLRDNORM);
 }
 
@@ -721,15 +742,22 @@ static int nvgpu_ctl_open(struct inode *inode, struct file *filp) {
   return nvgpu_open_common(inode, filp, NVGPU_DEV_CTL);
 }
 
+static const struct file_operations nvgpu_uvm_tools_fops;
+
 /*
  * One character device for both UVM nodes, told apart by minor, as
- * nvidia-uvm does: 0 is /dev/nvidia-uvm, 1 /dev/nvidia-uvm-tools, which the
- * backend opens as the host's own tools node (profilers, uvm_tools.c).
+ * nvidia-uvm numbers them: 0 is /dev/nvidia-uvm, 1 /dev/nvidia-uvm-tools,
+ * which the backend opens as the host's own tools node (profilers,
+ * uvm_tools.c). Each gets its own file_operations, as natively: the tools
+ * node's has no .mmap and has a .poll (uvm_tools_fops), the UVM node's the
+ * reverse (uvm_fops).
  */
 static int nvgpu_uvm_open(struct inode *inode, struct file *filp) {
-  return nvgpu_open_common(inode, filp,
-                           iminor(inode) == 1 ? NVGPU_DEV_UVM_TOOLS
-                                              : NVGPU_DEV_UVM);
+  if (iminor(inode) == 1) {
+    replace_fops(filp, fops_get(&nvgpu_uvm_tools_fops));
+    return nvgpu_open_common(inode, filp, NVGPU_DEV_UVM_TOOLS);
+  }
+  return nvgpu_open_common(inode, filp, NVGPU_DEV_UVM);
 }
 
 static int nvgpu_release(struct inode *inode, struct file *filp) {
@@ -780,6 +808,11 @@ static const struct file_operations nvgpu_ctl_fops = {
     .poll = nvgpu_poll,
 };
 
+/*
+ * No .poll: uvm_fops has none (uvm.c:1073-1082), so the VFS reports the file
+ * always ready, and a poll on it never became ready here -- the backend
+ * cannot epoll the host's UVM file either, and never reported it.
+ */
 static const struct file_operations nvgpu_uvm_fops = {
     .owner = THIS_MODULE,
     .open = nvgpu_uvm_open,
@@ -787,7 +820,16 @@ static const struct file_operations nvgpu_uvm_fops = {
     .unlocked_ioctl = nvgpu_uvm_ioctl,
     .compat_ioctl = compat_ptr_ioctl,
     .mmap = nvgpu_mmap,
-    .poll = nvgpu_poll,
+};
+
+/* uvm_tools_fops (uvm_tools.c:2773-2782): no .mmap. Installed by
+ * nvgpu_uvm_open() for minor 1. */
+static const struct file_operations nvgpu_uvm_tools_fops = {
+    .owner = THIS_MODULE,
+    .release = nvgpu_release,
+    .unlocked_ioctl = nvgpu_uvm_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
+    .poll = nvgpu_uvm_tools_poll,
 };
 
 /*
@@ -874,7 +916,8 @@ static const struct file_operations nvgpu_modeset_fops = {
 
 struct nvgpu_fd *nvgpu_fd_from_file(struct file *f) {
   if (f->f_op == &nvgpu_gpu_fops || f->f_op == &nvgpu_ctl_fops ||
-      f->f_op == &nvgpu_uvm_fops || f->f_op == &nvgpu_modeset_fops)
+      f->f_op == &nvgpu_uvm_fops || f->f_op == &nvgpu_uvm_tools_fops ||
+      f->f_op == &nvgpu_modeset_fops)
     return f->private_data;
   return nvgpu_drm_file_nfd(f);
 }
