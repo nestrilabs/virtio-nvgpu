@@ -70,6 +70,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/closer.rs` | `nvgpu-closer`: the last close of a display file, off every thread that must not wait |
 | `src/pump.rs` | the event pump: v1 EVENT_READY and v2 EVENT_DATA records, DRM event budgets, the level sweep |
 | `src/posture.rs` | refusing root and `CAP_SYS_ADMIN`, dropping capabilities, the socket's directory and path |
+| `src/sockpath.rs` | the sockets bound at a path the operator names (the Wayland export socket, the capture helper's): bound privately and renamed into place 0600, only a stale socket of ours replaced, and an accept loop that rests when out of descriptors |
 | `src/sandbox.rs` | the backend's own sandbox, applied before the first guest message: user and network namespaces, Landlock, the seccomp allowlist (SECURITY.md §4) |
 | `src/quota.rs` | guest processes' shares of the VM-wide budgets |
 | `src/error.rs` | the crate's error type |
