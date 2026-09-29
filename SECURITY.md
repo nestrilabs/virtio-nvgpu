@@ -2824,6 +2824,10 @@ placement it has made, after answering it. What this adds and does not:
 
 ## 22. The 2026-09-29 review
 
+A read-only review of `display-passthrough` at `416dc54`, in parts; each
+part's fixes are on a branch of their own. Its notes are in the rig
+(`.rig/notes/review-2026-09-29/`).
+
 A final review of the branch before it is merged, by area.
 
 ### VMMs and deployment
@@ -3075,10 +3079,6 @@ the three "all or none" charge loops and the per-owner policies (the daemon's
 `budget.rs` repeats `quota.rs`'s rule because it cannot link the backend);
 R3, the engine owning local input, which the backend reader's lease probe
 reading the raw input makes less than natural; R6-R9.
-
-A read-only review of `display-passthrough` at `416dc54`, in parts; each
-part's fixes are on a branch of their own. Its notes are in the rig
-(`.rig/notes/review-2026-09-29/`).
 
 ### Guest module
 
