@@ -162,6 +162,7 @@ echo "== the backend's flags"
 run poll NVGPU_QUEUE_POLL_US=10 NVGPU_FIFO_DISABLE_RATES=10,20,400,320
 has "poll" "--queue-poll-us 10"
 has "rates" "--fifo-disable-proc-rate 10 --fifo-disable-proc-burst 20 --fifo-disable-vm-rate 400 --fifo-disable-vm-burst 320"
+has "rates, told to the guest" "nvgpu_fifo_disable_rates=10,20,400,320"
 run pollbad NVGPU_QUEUE_POLL_US=5000
 has "a poll past 1000" "NVGPU_QUEUE_POLL_US=5000: 0 to 1000"
 run ratesbad NVGPU_FIFO_DISABLE_RATES=10,20

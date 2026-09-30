@@ -82,6 +82,11 @@ tuning_settings() {
             --fifo-disable-proc-burst "${BASH_REMATCH[2]}"
             --fifo-disable-vm-rate "${BASH_REMATCH[3]}"
             --fifo-disable-vm-burst "${BASH_REMATCH[4]}")
+        # For sec-negative's rate test, which expects the burst it was given.
+        case " $CMDLINE_EXTRA " in
+            *" nvgpu_fifo_disable_rates="*) ;;
+            *) CMDLINE_EXTRA="${CMDLINE_EXTRA:+$CMDLINE_EXTRA }nvgpu_fifo_disable_rates=$NVGPU_FIFO_DISABLE_RATES" ;;
+        esac
     fi
 
     # The VMM's RLIMIT_FSIZE, in MiB: bounds how far a VMM its guest has

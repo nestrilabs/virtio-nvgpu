@@ -901,12 +901,33 @@ static void t_disable_other_process(int ctl, uint32_t mine)
 	close(down[1]);
 }
 
+/* The per-process burst of DISABLE_CHANNELS the backend was given: the
+ * second of nvgpu_fifo_disable_rates=RATE,BURST,VM_RATE,VM_BURST on the
+ * guest's command line (the launcher's NVGPU_FIFO_DISABLE_RATES), else the
+ * backend's default, 40. */
+static int proc_burst(void)
+{
+	char line[4096] = {0};
+	FILE *f = fopen("/proc/cmdline", "r");
+	if (f) {
+		if (!fgets(line, sizeof(line), f))
+			line[0] = 0;
+		fclose(f);
+	}
+	const char *r = strstr(line, "nvgpu_fifo_disable_rates=");
+	int rate, burst;
+	if (r && sscanf(r, "nvgpu_fifo_disable_rates=%d,%d", &rate, &burst) == 2 && burst > 0)
+		return burst;
+	return 40;
+}
+
 /* T13: DISABLE_CHANNELS far past the per-process rate. Each call enables
  * no channels (numChannels 0), which RM does as a no-op; past the burst the
  * backend answers NV_ERR_NOT_SUPPORTED itself. PASS when RM answered the
- * first calls with something else and the backend then took over; a guest
- * whose calls all reach RM would let one process preempt the runlist every
- * VM shares as fast as it likes. Runs after T12, on the subdevice it made. */
+ * first calls -- three quarters of the burst at least -- with something
+ * else and the backend then took over; a guest whose calls all reach RM
+ * would let one process preempt the runlist every VM shares as fast as it
+ * likes. Runs after T12, on the subdevice it made. */
 static void t_disable_rate(int ctl, uint32_t mine)
 {
 	if (!mine) {
@@ -928,9 +949,11 @@ static void t_disable_rate(int ctl, uint32_t mine)
 		}
 		served++;
 	}
+	int least = proc_burst() * 3 / 4;
 	char how[96];
-	snprintf(how, sizeof(how), "%d served (RM's status 0x%llx), then refused", served, (long long)first);
-	if (refused_at && served >= 30)
+	snprintf(how, sizeof(how), "%d served (RM's status 0x%llx), then refused; at least %d wanted", served,
+		 (long long)first, least);
+	if (refused_at && served >= least)
 		pass("disable channels, rate", how);
 	else if (!refused_at)
 		fail("disable channels, rate", "400 back to back all reached RM");
