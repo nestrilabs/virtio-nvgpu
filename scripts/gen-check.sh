@@ -49,6 +49,7 @@ step "rmallow" python3 rmallow_extract.py check --cache "$CACHE/rmallow"
 step "nvkms" python3 nvkms_extract.py --cache "$CACHE/nvkms" check
 step "uvm" python3 uvm_extract.py --cache "$CACHE/uvm" check
 step "uvm scan" python3 uvm_extract.py --cache "$CACHE/uvm" scan
+step "nvabi_sizes self-test" python3 nvabi_sizes.py --self-test
 
 schema_check() {
     local out
