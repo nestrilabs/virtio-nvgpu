@@ -31,7 +31,11 @@ frontend, in a minijail with a user namespace of its own, even as root
 (`jail/src/helpers.rs`), so crosvm needs unprivileged user namespaces too,
 and a crosvm unit must not set `RestrictNamespaces=`. nesbox's jailer needs
 Linux 5.8 or later (it mounts a `/proc` of the jail's own with
-`hidepid=invisible`, `virtio-nvgpu-v6`).
+`hidepid=invisible`, `virtio-nvgpu-v6`). Keep `vm.max_map_count` at its
+default of 65,530 or above (NixOS sets 1,048,576): each VMM allows 16,384
+window placements, which can split the window into about 32,769 mappings,
+and a VMM near the limit stops its VM on a placement rather than leave a hole
+in the window.
 
 **The NVIDIA driver.** NVIDIA's **open** kernel modules, at a release the
 backend's tables were measured at (below), with **`nvidia_drm.modeset=1`**:
