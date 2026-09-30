@@ -346,12 +346,15 @@ struct nvgpu_fd {
    * DRM files only: syncobj handles this file's render handle is known to
    * hold, so a SYNCOBJ_DESTROY of one can be posted rather than waited for
    * (nvgpu_syncobj.c, "SYNCOBJ_DESTROY, posted"), and the count of
-   * synchronous DESTROYs that succeeded. Under so_lock; so_sync is read
-   * without it.
+   * synchronous DESTROYs that may have destroyed one. so_epoch counts the
+   * DESTROYs sent, so the subscribers one ends can be told from those of a
+   * later syncobj under the same number (nvgpu_sowait_forget()). Written
+   * under so_lock; so_sync and so_epoch are read without it.
    */
   struct mutex so_lock;
   struct xarray so_live;
   u32 so_sync;
+  u64 so_epoch;
 };
 
 /*
