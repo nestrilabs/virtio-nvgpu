@@ -263,6 +263,9 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
   ''
     d=${../contrib/systemd}
     u=${units}/lib/systemd/system
+    # The drop-in check refuses what it must (a second assignment on an
+    # Environment= line, a continuation, a key or value off the list).
+    python3 ${./unit-diff.py} --self-test
     for f in vhost-user-nvgpu@.service vhost-user-nvgpu@.socket vhost-user-nvgpu-inject@.socket; do
       python3 ${./unit-diff.py} $d/$f $u/$f
     done

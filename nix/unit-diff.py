@@ -4,6 +4,7 @@ and hold the module's drop-ins to the keys a drop-in may set.
 
     python3 unit-diff.py CONTRIB_UNIT MODULE_UNIT [KEY,KEY...]
     python3 unit-diff.py --dropin DROPIN SECTION:KEY[=VALUE],...,env:NAME,...
+    python3 unit-diff.py --self-test
 
 The first form fails when the two units say different things, key by key, in
 [Unit], [Service] and [Socket] (the optional list: more keys whose values
@@ -18,9 +19,14 @@ the list, or, where the list gives a value, any other value, or sets a
 variable (Environment=) the list does not name with env:NAME: what is per
 VM (the flags, the resource bounds, the Wayland socket) may be set there,
 and nothing that would loosen the unit's hardening. NixOS's own keys (the
-variables it gives every unit, its X- keys) are allowed.
+variables it gives every unit, its X- keys) are allowed. Every assignment
+on an Environment= line is checked, not only the first, and a line systemd
+would join with the next, or one with no "=", fails.
+
+The third runs the second against drop-ins that must fail.
 """
 
+import shlex
 import sys
 
 # Keys whose values differ by design (their presence is still compared).
@@ -85,13 +91,31 @@ def dropin(path, allowed, env):
             if line.startswith("[") and line.endswith("]"):
                 section = line[1:-1]
                 continue
+            # systemd joins a line ending in a backslash with the next, so
+            # what follows would be read as part of this key's value; NixOS
+            # never renders one. And a line with no "=" sets nothing this
+            # can name.
+            if line.endswith("\\") or "=" not in line:
+                bad.append(f"[{section}] {line}: not one KEY=VALUE line")
+                continue
             k, v = (x.strip() for x in line.split("=", 1))
             if k in ONE_SIDE:
                 continue
             if (section, k) == ("Service", "Environment"):
-                name = v.strip('"').split("=", 1)[0]
-                if name not in NIXOS_ENV | env:
-                    bad.append(f"[{section}] {k}={v}: not a variable a drop-in may set")
+                # One line may assign several variables, each a quoted or
+                # bare word (systemd.exec, Environment=): every one is
+                # checked, and a line that does not split is refused.
+                try:
+                    words = shlex.split(v)
+                except ValueError as e:
+                    bad.append(f"[{section}] {k}={v}: cannot be split into assignments ({e})")
+                    continue
+                if not words:
+                    bad.append(f"[{section}] {k}={v}: clears every variable")
+                for w in words:
+                    name = w.split("=", 1)[0]
+                    if name not in NIXOS_ENV | env:
+                        bad.append(f"[{section}] {k}={v}: {name} is not a variable a drop-in may set")
                 continue
             want = allowed.get((section, k), False)
             if want is False:
@@ -101,7 +125,48 @@ def dropin(path, allowed, env):
     return bad
 
 
+def self_test():
+    """The drop-in check against drop-ins that must fail and one that must
+    pass: every way found to set a variable or key past the list."""
+    import os
+    import tempfile
+
+    allowed = {("Service", "MemoryMax"): None, ("Service", "ProtectHome"): "tmpfs"}
+    env = {"NVGPU_BACKEND_ARGS"}
+    cases = {
+        # (text, must pass)
+        "allowed": ('[Service]\nEnvironment="NVGPU_BACKEND_ARGS=--a 1"\n'
+                    'Environment="PATH=/x"\nMemoryMax=2G\nProtectHome=tmpfs\n', True),
+        "a second assignment on the line": (
+            '[Service]\nEnvironment="NVGPU_BACKEND_ARGS=x" "LD_PRELOAD=/tmp/e.so"\n', False),
+        "a bare second assignment": (
+            "[Service]\nEnvironment=NVGPU_BACKEND_ARGS=x LD_PRELOAD=/tmp/e.so\n", False),
+        "an unbalanced quote": ('[Service]\nEnvironment="NVGPU_BACKEND_ARGS=x\n', False),
+        "a continuation": (
+            "[Service]\nEnvironment=NVGPU_BACKEND_ARGS=x \\\nLD_PRELOAD=/tmp/e.so\n", False),
+        "a line with no =": ("[Service]\nMemoryMax=2G\nNoNewPrivileges\n", False),
+        "a key off the list": ("[Service]\nNoNewPrivileges=no\n", False),
+        "another value": ("[Service]\nProtectHome=no\n", False),
+        "a variable off the list": ('[Service]\nEnvironment="LD_PRELOAD=/tmp/e.so"\n', False),
+        "every variable cleared": ("[Service]\nEnvironment=\n", False),
+    }
+    failed = []
+    with tempfile.TemporaryDirectory() as d:
+        for name, (text, ok) in cases.items():
+            p = os.path.join(d, "dropin.conf")
+            with open(p, "w") as f:
+                f.write(text)
+            bad = dropin(p, allowed, env)
+            if (not bad) != ok:
+                failed.append(f"{name}: {'refused' if bad else 'passed'} ({bad})")
+    for f in failed:
+        print(f"unit-diff self-test: {f}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
+
+
 def main():
+    if sys.argv[1] == "--self-test":
+        self_test()
     if sys.argv[1] == "--dropin":
         allowed, env = {}, set()
         for item in sys.argv[3].split(","):
