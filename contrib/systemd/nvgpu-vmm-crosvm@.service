@@ -10,7 +10,19 @@
 # quote in it quotes rather than being passed on; -p may be given once per
 # kernel parameter), the kernel last:
 #   NVGPU_CROSVM_ARGS=--cpus 4 --mem 4096 --block path=/var/lib/virtio-nvgpu/vm0/rootfs.ext4 -p root=/dev/vda -p rw /var/lib/virtio-nvgpu/vmlinux
-# The disk must be nvgpu-vmmN's to write.
+# The disk must be nvgpu-vmmN's to write. The tuning knobs (DEPLOY.md,
+# "Tuning") go in the same file, each with the default below:
+#   NVGPU_SLICE_US=100         the EEVDF slice of every VMM thread (0: the
+#                              host's own, about 3 ms)
+#   NVGPU_CORE_SCHED=per-vcpu  per-vcpu, vm, shared (one cookie with the
+#                              backend) or off (SECURITY.md, "The tuning
+#                              knobs")
+#   NVGPU_PREFAULT=1           guest RAM faulted in and on 2 MiB pages as the
+#                              VM starts (--prefault-memory, patches/crosvm
+#                              0011); 0 leaves it to the guest's first touch,
+#                              and suits a guest whose RAM a balloon is meant
+#                              to hand back early
+# contrib/systemd/nvgpu-vmm-exec applies them as it execs crosvm.
 #
 # crosvm's sandbox stays on: every device it emulates, and the nvgpu
 # frontend, is a process of its own in a minijail with user, pid, mount and
@@ -31,9 +43,14 @@ Type=exec
 User=nvgpu-vmm%i
 Group=nvgpu-vm%i
 SupplementaryGroups=kvm
+# The knobs' defaults; the file below overrides each it sets.
+Environment=NVGPU_SLICE_US=100 NVGPU_CORE_SCHED=per-vcpu NVGPU_PREFAULT=1
 EnvironmentFile=/etc/virtio-nvgpu/vmm%i.env
-# The 100 us EEVDF slice for every VMM thread (DEPLOY.md, "Frame pacing").
-ExecStart=/usr/bin/chrt --other --sched-runtime 100000 0 /usr/bin/crosvm run --vhost-user type=nvgpu,socket=/run/nvgpu/vm%i/nvgpu.sock,max-queue-size=256 --no-pci-hotplug-port --pivot-root /var/empty $NVGPU_CROSVM_ARGS
+ExecStart=/usr/libexec/virtio-nvgpu/nvgpu-vmm-exec crosvm /usr/bin/crosvm run --vhost-user type=nvgpu,socket=/run/nvgpu/vm%i/nvgpu.sock,max-queue-size=256 --no-pci-hotplug-port --pivot-root /var/empty $NVGPU_CROSVM_ARGS
+# NVGPU_CORE_SCHED=shared: the backend takes the cookie crosvm was exec'd
+# with. As root (+): the backend is another user's, and undumpable. Nothing
+# for any other mode.
+ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-vmm-exec join %i $MAINPID
 Restart=no
 TimeoutStopSec=30
 # Size this as guest RAM plus the backend's window (--window-size, 1 GiB by
@@ -47,8 +64,14 @@ TimeoutStopSec=30
 # A VMM its guest has taken over can grow any file it can write -- the
 # disk above all -- with ftruncate or fallocate until the file system is
 # full. RLIMIT_FSIZE bounds that, but also every memfd crosvm sizes: set it
-# no lower than the largest of the disk, guest RAM and the window.
+# no lower than the largest of the disk, guest RAM and the window (a VMM
+# that passes it is killed with SIGXFSZ). Unset by default.
 #LimitFSIZE=
+# A host C-state cap while this VM runs (DEPLOY.md, "Tuning"; off by
+# default, it costs power), in a drop-in:
+#   [Unit]
+#   Wants=nvgpu-cpu-latency@50.service
+#   After=nvgpu-cpu-latency@50.service
 PrivateNetwork=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

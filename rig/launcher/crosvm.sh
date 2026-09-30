@@ -112,7 +112,14 @@ crosvm_config() {
                 "first touch, on 4 KiB pages (build it with patches/crosvm)" >&2 ;;
         esac
     fi
-    [ "${NVGPU_CROSVM_CORE_SCHED:-1}" = 1 ] || VMM_ARGS+=(--core-scheduling=false)
+    # Core scheduling, as tuning_settings chose it (tuning.sh).
+    VMM_ARGS+=(${CROSVM_CORE_ARGS[@]+"${CROSVM_CORE_ARGS[@]}"})
+    if [ "$CORE_SCHED" = vm ]; then
+        case $CROSVM_HELP in
+            *--per-vm-core-scheduling*) ;;
+            *) die "NVGPU_CORE_SCHED=vm: $VMM has no --per-vm-core-scheduling" ;;
+        esac
+    fi
     VMM_ARGS+=(-p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
     case $DISK$SOCK in *,*) die "a comma in $DISK or $SOCK would split crosvm's option" ;; esac
     if [ "$CROSVM_SANDBOX" = on ]; then

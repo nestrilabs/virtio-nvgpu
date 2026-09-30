@@ -441,6 +441,11 @@ impl NvidiaBackend {
         self.rmallow.set_mode(mode);
     }
 
+    /// The FIFO_DISABLE_CHANNELS budgets (`--fifo-disable-*`), from now on.
+    pub fn set_channel_rates(&mut self, rates: crate::rmchan::Rates) {
+        self.rmchan = crate::rmchan::ChannelGate::with_rates(rates, std::time::Instant::now());
+    }
+
     /// Whether guest system memory is allocated GPU-coherent (the default;
     /// see rmmem.rs). Off leaves every allocation as the guest asked, which on
     /// an Intel host under KVM's default IGNORE_GUEST_PAT quirk means the

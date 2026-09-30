@@ -19,6 +19,7 @@ mount --rbind /run/current-system "$R/run/current-system"
 mount -t tmpfs tmpfs "$R/dev"
 for n in null zero urandom random; do touch "$R/dev/$n"; chmod 0666 "$R/dev/$n"; done  # plain files: this sandbox mounts nodev
 touch "$R/dev/kvm"; chmod 0666 "$R/dev/kvm"; ln -s /proc/self/fd "$R/dev/fd"
+touch "$R/dev/cpu_dma_latency"; chmod 0600 "$R/dev/cpu_dma_latency"  # a file: what is written is kept
 mount -t proc proc "$R/proc"
 chmod 1777 "$R/tmp"
 # A host file owned by real root: uid 65534 in here.

@@ -72,7 +72,10 @@ start_backend() {
     : > "$BLOG"
     exec {BLOG_W}> >(exec {SLOT_FD}>&- {TAG_FD}>&-; capped "$BLOG")
     BLOG_WRITER=$!
-    RUST_LOG=${RUST_LOG:-info} "${SLICE[@]}" "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" ${BIND[@]+"${BIND[@]}"} \
+    # BACKEND_PREFIX: the cookie shared with the VMM (tuning.sh,
+    # core_sched_anchor), given as the backend is exec'd.
+    RUST_LOG=${RUST_LOG:-info} ${BACKEND_PREFIX[@]+"${BACKEND_PREFIX[@]}"} "${SLICE[@]}" \
+        "${BACKEND_AFFINITY[@]}" "${BACKEND_NETNS[@]}" ${BIND[@]+"${BIND[@]}"} \
         "${AS_BACKEND[@]}" "$BACKEND_EXE" ${SOCKET_ARGS[@]+"${SOCKET_ARGS[@]}"} "${BACKEND_ARGS[@]}" \
         {SLOT_FD}>&- {TAG_FD}>&- >&"$BLOG_W" 2>&1 {BLOG_W}>&- &
     BACKEND=$!

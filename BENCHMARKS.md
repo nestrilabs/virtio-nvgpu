@@ -679,6 +679,43 @@ What each change did:
   keeps the guest's allocations what it asked for; `patches/linux/` has a
   draft host-kernel flag for it.
 
+### crosvm's core scheduling, by mode
+
+The launcher's and the units' `NVGPU_CORE_SCHED` (DEPLOY.md, "Tuning";
+SECURITY.md, "The tuning knobs") under crosvm, on the Steam-like image
+(`rig/heavy/extras.nix`; the kernel with THP and ntsync, compute on, 4
+vCPUs, 8 GiB), each workload's three modes interleaved and their order
+rotated each round, 2026-09-30. `per-vcpu` is crosvm's default, a cookie
+per vCPU; `shared` one cookie for the VMM and its backend, made before
+either starts; `off` none. Mean ± half the range of three runs (round 1 of
+gameloop and Heaven is left out: its `off` runs of both were disturbed --
+Heaven at 198 fps against 497 in every other round -- and a fourth round
+of both workloads stands in for it):
+
+| workload | mode | avg fps | 1% low | 0.1% low | p99 ms | IOCTL2 rtt µs | round trips of 64 µs or more | backend / VMM CPU |
+|---|---|---|---|---|---|---|---|---|
+| stk-vk (4K) | per-vcpu | 984 ± 21 | 255 ± 23 | 123 ± 18 | 3.04 ± 0.09 | 13.0 ± 0.6 | 7.1% | 38% / 165% |
+| | shared | 1,110 ± 32 | 359 ± 127 | 141 ± 66 | 1.79 ± 0.54 | 7.9 ± 0.5 | 2.5% | 40% / 168% |
+| | off | 1,130 ± 30 | 452 ± 60 | 183 ± 21 | 1.39 ± 0.11 | 7.4 ± 0.5 | 2.1% | 41% / 170% |
+| wine-heaven | per-vcpu | 433 ± 19 | 134 ± 4 | 81 ± 3 | 6.04 ± 0.35 | 22.1 ± 7.0 | 8.7% | 21% / 272% |
+| | shared | 492 ± 2 | 248 ± 18 | 110 ± 7 | 3.04 ± 0.13 | 8.8 ± 0.5 | 3.4% | 23% / 305% |
+| | off | 497 ± 1 | 255 ± 12 | 121 ± 10 | 3.04 ± 0.07 | 8.0 ± 0.8 | 2.4% | 23% / 307% |
+| gameloop | per-vcpu | 56.4 ± 0.6 | 40.8 ± 0.7 | 34.3 ± 2.2 | 23.00 ± 0.76 | 25.2 ± 5.1 | 24% | 4% / 358% |
+| | shared | 57.1 ± 0.2 | 47.9 ± 1.8 | 42.1 ± 6.0 | 19.58 ± 0.21 | 20.7 ± 1.9 | 23% | 4% / 355% |
+| | off | 57.8 ± 0.6 | 48.5 ± 2.9 | 38.1 ± 5.3 | 18.84 ± 0.52 | 21.2 ± 0.7 | 23% | 4% / 360% |
+
+The round trip and its tail (the guest's own counters, `rtt_us_log2`) are
+where `per-vcpu` costs: the backend thread that answers a vCPU is kept off
+that vCPU's core, and off every core another vCPU of the VM runs on. With
+one cookie for both, `shared` came within 0.5-0.8 µs of `off`, and
+recovered 86% (SuperTuxKart) and 92% (Heaven) of what `per-vcpu` costs the
+average frame rate, and 53-95% of the 1% lows, more than the "about two
+thirds" of the earlier trial (above, "The fixes"), which put the whole
+launcher under one `coresched` cookie for one run of each. gameloop, which
+keeps every vCPU busy with its own jobs and crosses little, moved within its
+spread in average and gained in its lows. The backend's CPU did not change.
+`per-vcpu` stays the default (a security choice: DEPLOY.md, "Tuning").
+
 ### What would close the rest
 
 In the order of what each would buy:
@@ -690,12 +727,11 @@ In the order of what each would buy:
    `patches/linux/README.md` has why nothing inside the project does it
    without changing what the guest's allocations are.
 2. **crosvm's core scheduling**, the rest of crosvm's gap (above): a
-   security choice for the deployment (DEPLOY.md, "Frame pacing"), not a
-   default to change here. One cookie for the VM and its backend together,
-   which keeps other tenants off the VM's cores but lets the VM and its own
-   backend share them, recovered part of it in the runs above; the
-   launcher does not offer it, and whether it is worth offering is the
-   user's call.
+   security choice for the deployment (DEPLOY.md, "Tuning"), not a
+   default to change here. One cookie for the VM and its backend together
+   (`NVGPU_CORE_SCHED=shared`), which keeps other tenants off the VM's
+   cores but lets the VM and its own backend share them, recovered 86-92%
+   of it ("crosvm's core scheduling, by mode", above).
 3. **The round trips left.** A SuperTuxKart Vulkan frame still waits for
    about ten IOCTL2s, one at a time, each using the last one's answer: 7 µs
    each under nesbox, of which the backend now spends 1.3-5. What else could
@@ -897,8 +933,9 @@ decide for the user.
 | `--allow-compute` for games | RT, DLSS and Frame Generation usable; without it, the layer | the UVM surface (SECURITY.md, "Compute is opt-in") |
 | guest haltpoll (`cpuidle_haltpoll.force=1` on the guest's command line) | futex hand-off 7.6 -> 0.95 µs; exits -47% in Heaven | Heaven -9% (a polling vCPU is not running a game thread); host CPU while the guest idles |
 | the host's SRSO mitigation (`spec_rstack_overflow=`; "IBPB on VMEXIT only" here) | not measured: an IBPB is in every one of the 15,000-55,000 exits a second above | the guest-to-host return-stack mitigation on this CPU |
-| a lower C-state limit on the host (`/dev/cpu_dma_latency`, or C3 disabled: 350 µs exit latency here) | not measured (the sandbox has neither) | power, heat |
-| crosvm `--core-scheduling=false` | 10-16% here, 16-50% above | the SMT side-channel mitigation between a vCPU and host tasks |
+| a lower C-state limit on the host (`/dev/cpu_dma_latency`, or C3 disabled: 350 µs exit latency here; `NVGPU_CPU_LATENCY_US`, DEPLOY.md, "Tuning") | not measured (it needs root) | power, heat |
+| crosvm `--core-scheduling=false` (`NVGPU_CORE_SCHED=off`) | 10-16% here, 16-50% above | the SMT side-channel mitigation between a vCPU and host tasks |
+| one core-scheduling cookie for the VM and its backend (`NVGPU_CORE_SCHED=shared`) | Heaven 433 -> 492 fps (off: 497), "Heavy workloads" | the VM's own backend may share a core with its vCPUs; other tasks still may not |
 | pinning vCPUs | none measured (7.9 µs hand-off, 57.0 fps) | worse under a host load unless the CPUs are set aside (DEPLOY.md, "Frame pacing") |
 
 ### What changed

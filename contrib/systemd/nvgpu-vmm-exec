@@ -1,0 +1,120 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# nvgpu-vmm-exec: the VMM units' tuning knobs (DEPLOY.md, "Tuning"; SECURITY.md,
+# "The tuning knobs"), read from the unit's environment and applied as the VMM
+# is exec'd, so that each is in force before the guest runs.
+#
+#   nvgpu-vmm-exec crosvm|nesbox VMM ARGS...
+#       ExecStart=: exec VMM ARGS (crosvm's ARGS start with "run") with
+#         NVGPU_SLICE_US    the EEVDF slice of every VMM thread, in us (chrt
+#                           --other --sched-runtime): 0, or 100 to 100000;
+#                           default 100
+#         NVGPU_CORE_SCHED  per-vcpu (crosvm's default), vm, shared or off
+#                           (nesbox's default): crosvm is told
+#                           --per-vm-core-scheduling for vm and
+#                           --core-scheduling=false for shared and off; for
+#                           vm under nesbox and shared under either, the VMM
+#                           is exec'd with a core-scheduling cookie of its own
+#                           (coresched new), which every thread and process
+#                           it makes inherits. nesbox has no per-vcpu
+#         NVGPU_PREFAULT    crosvm: 1 (default) passes --prefault-memory
+#                           (patches/crosvm 0011), 0 does not
+#   nvgpu-vmm-exec join N VMM_PID
+#       ExecStartPost=+ (root): with NVGPU_CORE_SCHED=shared, gives
+#       vhost-user-nvgpu@N.service's backend the cookie the VMM (VMM_PID, the
+#       unit's $MAINPID) was exec'd with, once the VMM has it; otherwise
+#       nothing. The backend's threads then share an SMT core with this VM's
+#       threads and no one else's. Until then it keeps its own (none), which
+#       lets it share a core with anything, as without this knob; the guest
+#       never runs outside its cookie.
+#
+# Anything else in those variables stops the unit: a VM does not start with a
+# knob it did not ask for.
+set -eu
+
+die() {
+    echo "nvgpu-vmm-exec: $*" >&2
+    exit 1
+}
+
+core_sched() {
+    CS=${NVGPU_CORE_SCHED:-$1}
+    case $CS in per-vcpu | vm | shared | off) ;; *) die "NVGPU_CORE_SCHED=$CS: per-vcpu, vm, shared or off" ;; esac
+}
+
+# The cookie of process $1, as coresched prints it ("... is 0x..."), or
+# nothing.
+cookie() {
+    c=$(coresched get -s "$1" 2>/dev/null) || return 0
+    echo "${c##* }"
+}
+
+[ $# -ge 1 ] || die "usage: nvgpu-vmm-exec crosvm|nesbox VMM ARGS... | join N VMM_PID"
+kind=$1
+shift
+case $kind in
+    crosvm | nesbox)
+        [ $# -ge 1 ] || die "no VMM to run"
+        slice=${NVGPU_SLICE_US:-100}
+        case $slice in '' | *[!0-9]*) die "NVGPU_SLICE_US=$slice: 0, or 100 to 100000" ;; esac
+        slice=$((slice + 0))
+        [ "$slice" = 0 ] || { [ "$slice" -ge 100 ] && [ "$slice" -le 100000 ]; } ||
+            die "NVGPU_SLICE_US=$slice: 0, or 100 to 100000"
+        pre=${NVGPU_PREFAULT:-1}
+        case $pre in 0 | 1) ;; *) die "NVGPU_PREFAULT=$pre: 0 or 1" ;; esac
+        vmm=$1
+        shift
+        if [ "$kind" = crosvm ]; then
+            core_sched per-vcpu
+            [ "${1:-}" = run ] || die "crosvm's arguments must start with run"
+            shift
+            flags=
+            case $CS in
+                vm) flags=--per-vm-core-scheduling ;;
+                shared | off) flags=--core-scheduling=false ;;
+            esac
+            [ "$pre" = 0 ] || flags="$flags --prefault-memory"
+            # The flags are fixed words (no whitespace in any): split here on
+            # purpose, before the unit's own arguments.
+            # shellcheck disable=SC2086
+            set -- "$vmm" run $flags "$@"
+        else
+            core_sched off
+            [ "$CS" != per-vcpu ] ||
+                die "NVGPU_CORE_SCHED=per-vcpu: nesbox makes no cookie per vCPU; vm or shared"
+            [ "$pre" = 1 ] ||
+                die "NVGPU_PREFAULT=0: nesbox's prefault is its config's (machine-config \"prefault\": false)"
+            set -- "$vmm" "$@"
+        fi
+        case $CS/$kind in
+            shared/* | vm/nesbox) set -- coresched new -- "$@" ;;
+        esac
+        [ "$slice" = 0 ] || set -- chrt --other --sched-runtime $((slice * 1000)) 0 "$@"
+        exec "$@"
+        ;;
+    join)
+        [ $# = 2 ] || die "usage: nvgpu-vmm-exec join N VMM_PID"
+        core_sched off
+        [ "$CS" = shared ] || exit 0
+        n=$1 vmm=$2
+        case $n$vmm in '' | *[!0-9]*) die "join: N and VMM_PID are numbers" ;; esac
+        be=$(systemctl show -P MainPID "vhost-user-nvgpu@$n.service")
+        [ -n "$be" ] && [ "$be" != 0 ] || die "vhost-user-nvgpu@$n.service has no main process"
+        # The unit's main process is exec'd through chrt and coresched: wait
+        # for the cookie coresched gives it.
+        i=0
+        while :; do
+            c=$(cookie "$vmm")
+            [ -z "$c" ] || [ "$c" = 0x0 ] || break
+            i=$((i + 1))
+            [ $i -lt 200 ] || die "the VMM (pid $vmm) has no core-scheduling cookie after 10 s"
+            sleep 0.05
+        done
+        coresched copy -s "$vmm" -d "$be" -t tgid ||
+            die "could not give the backend (pid $be) the VMM's cookie"
+        [ "$(cookie "$be")" = "$c" ] || die "the backend (pid $be) did not take the VMM's cookie"
+        echo "nvgpu-vmm-exec: the backend (pid $be) shares the VMM's core-scheduling cookie $c"
+        ;;
+    *) die "$kind: crosvm, nesbox or join" ;;
+esac

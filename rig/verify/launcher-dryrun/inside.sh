@@ -148,3 +148,7 @@ LINES_SHOWN=2 run run-guest.new.sh h6 FOO_EVIL=1 LD_LIBRARY_PATH=/home/user
 grep -a '^jailer stub: environment\|^jailer stub: FOO_EVIL' /rig/logs/h6.vm0.console.log | sed 's/^/    /'
 echo "== new: VD-H6: a VMM whose libraries are not root's (/nix is uid 65534 here)"
 LINES_SHOWN=40 run run-guest.new.sh h6lib NVGPU_VMM=/rig/bin/nesbox-dyn | grep -E 'exit|library'
+echo "== new: NVGPU_CPU_LATENCY_US=50: /dev/cpu_dma_latency written as hex text, held for the run"
+LINES_SHOWN=40 run run-guest.new.sh cstate NVGPU_CPU_LATENCY_US=50 | grep -E 'exit|C-states'
+sleep 0.3
+echo "  cpu_dma_latency: $(cat /dev/cpu_dma_latency); its holder: $(pgrep -f '^sleep 125$' >/dev/null && echo alive || echo gone)"

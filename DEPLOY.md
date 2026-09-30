@@ -164,6 +164,10 @@ its own: it does not read `/etc/virtio-nvgpu/vmN.env`. Its assertions
 refuse a slot's group with anyone else in it, a pool user with other
 groups, another user on a pool id, and a flag with whitespace, a quote, a
 backslash or a `%` in it (systemd would split, unquote or expand it).
+With `vms.<n>.vmm.kind` (`crosvm` or `nesbox`) and `vmmPackages` it runs the
+VM's VMM too, from contrib/systemd's template, with the VMM's arguments
+and its tuning settings ("Tuning") in a drop-in of its own instead of
+`vmmN.env`.
 
 A host that runs both these units and the rig's root launcher shares one
 pool between them: the launcher skips a slot whose socket unit listens,
@@ -412,7 +416,9 @@ a WC zone of 6,318 MiB, of which one process may hold 3,159 -- the heavy
 scene above needs 1,952 -- and a WB zone of 1,842. Blender's GL and
 Vulkan backends both ran the heavy scene at 8192 and 50% (BENCHMARKS.md,
 "Heavy workloads"); 4096 at 50% (1,574 MiB of WC a process) is too small
-for its GL backend. The default stays at 1 GiB because a window's size is
+for its GL backend. The launcher's `NVGPU_WINDOW_PRESET=creative` and the
+module's `windowPreset = "creative"` give this size. The default stays at
+1 GiB because a window's size is
 also what one VM may take from the host: up to its WC zone of the GPU's
 BAR1, shared with the desktop and every other VM (6.2 GiB of an RTX 5090's
 32 at 8192), and under crosvm up to the whole window in host memory (below).
@@ -588,11 +594,14 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   pages are the shmem policy's.
 - **crosvm**: its default per-vCPU core scheduling cost the most of any
   setting tried -- under the load, SuperTuxKart missed 178 vblanks against
-  5 with `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`), and on an
+  5 with `--core-scheduling=false` (`NVGPU_CORE_SCHED=off`), and on an
   idle host its mailbox p99 was 1.4 ms against 0.44. It is a side-channel
   mitigation between the guest and host tasks on SMT siblings
-  (SECURITY.md, "Frame pacing"): turn it off only on a single-tenant desktop. Even so
-  crosvm ran a mailbox vkcube at about 3,300 fps to nesbox's 4,500.
+  (SECURITY.md, "The tuning knobs"): turn it off only on a single-tenant
+  desktop, or share one cookie between the VM and its backend
+  (`NVGPU_CORE_SCHED=shared`, "Tuning"), which keeps every other task off
+  the guest's cores. Even so crosvm ran a mailbox vkcube at about 3,300 fps
+  to nesbox's 4,500.
 - **vCPUs**: 2, 4 and 8 paced the same for these workloads, but a game's
   throughput is the vCPUs it can use: a job-system engine ran 58 fps on 4,
   99 on 8 and 158 on 16, 7-10% under the same program on as many host CPUs,
@@ -627,6 +636,154 @@ fence signal-to-queue latency the backend reports includes nvidia-drm's own
 timer-driven semaphore-surface signalling, the same natively. Not measured:
 vkmark, native gamescope (it cannot start inside the Claude sandbox), a
 120 or 165 Hz monitor, and games heavier than SuperTuxKart.
+
+## Tuning
+
+Each setting here trades something -- host CPU, host power, memory, or a
+side-channel mitigation -- for frame rate or latency. Every one keeps
+today's behaviour unless it is set; what each gives up, and what still
+holds when it is on, is SECURITY.md's ("The tuning knobs"). The same
+setting has one name at each layer:
+
+| setting | backend or VMM | launcher (`rig/run-guest.sh`) | units (`/etc/virtio-nvgpu/`) | NixOS (`vms.<n>.`) | default |
+|---|---|---|---|---|---|
+| core scheduling | crosvm `--core-scheduling=false`, `--per-vm-core-scheduling`; `coresched` | `NVGPU_CORE_SCHED` | `NVGPU_CORE_SCHED` in `vmmN.env` | `vmm.coreScheduling` | crosvm `per-vcpu`, nesbox `off` |
+| the queue thread's poll | `--queue-poll-us` | `NVGPU_QUEUE_POLL_US` | `NVGPU_BACKEND_ARGS` in `vmN.env` | `queuePollUs` | 50 |
+| the backend's CPU quota | -- | -- | `CPUQuota=` in a drop-in | `cpuQuota` | none |
+| the EEVDF slice | `--sched-slice-us`; `chrt` for the VMM | `NVGPU_SLICE_US` | `NVGPU_SLICE_US` in `vmmN.env`, `--sched-slice-us` in `vmN.env` | `sliceUs` | 100 |
+| the window for creative applications | `--window-size 8192` | `NVGPU_WINDOW_PRESET=creative` | `NVGPU_BACKEND_ARGS` | `windowPreset = "creative"` | 1024 ("Sizing the window") |
+| guest RAM prefaulted | crosvm `--prefault-memory`; nesbox's `"prefault"` | `NVGPU_PREFAULT` | `NVGPU_PREFAULT` in `vmmN.env` (crosvm) | `vmm.prefaultMemory` | on |
+| the VMM's file-size limit | `RLIMIT_FSIZE` | `NVGPU_VMM_FSIZE_MIB` | `LimitFSIZE=` in a drop-in | `vmm.limitFSizeMiB` | none |
+| a host C-state cap | `/dev/cpu_dma_latency` | `NVGPU_CPU_LATENCY_US` (root) | `nvgpu-cpu-latency@US.service` | `vmm.cpuLatencyUs` | none |
+| channel-disable rates | `--fifo-disable-{proc,vm}-{rate,burst}` | `NVGPU_FIFO_DISABLE_RATES` | `NVGPU_BACKEND_ARGS` | `fifoDisable.*` | 50/40, 200/160 |
+| the guest's knobs | its kernel command line | `NVGPU_GUEST_*` | the VMM's `-p` / config | the VMM's arguments | "The guest" |
+| the Wayland daemon's surface buffers | `nvgpu-wl-guest --surface-buffers` | -- | -- | -- | 16 ("The guest") |
+
+The launcher's header lists its variables; `nix/module.nix` its options,
+whose assertions refuse what the backend or VMM would. The VMM units apply
+theirs through `contrib/systemd/nvgpu-vmm-exec` as they exec the VMM. With
+`vms.<n>.vmm.kind` (and `vmmPackages`) the NixOS module runs the VMM's
+unit itself, its settings in a drop-in, and `vmmN.env` is not read.
+
+**Core scheduling** (crosvm, and nesbox through `coresched`). Which host
+tasks may run on the SMT sibling of a CPU running a guest vCPU:
+
+- `per-vcpu`, crosvm's default: a core-scheduling cookie per vCPU thread.
+  Nothing else -- not another vCPU of the same VM, not the backend thread
+  answering it -- shares the core while a vCPU runs, so the sibling idles.
+- `vm`: one cookie for the whole VMM (crosvm `--per-vm-core-scheduling`;
+  nesbox under `coresched new`). The VM's own threads may share a core;
+  the backend and everything else may not.
+- `shared`: one cookie for the VMM and its backend, made before the guest runs
+  (the launcher starts both from a process holding it; the units exec the
+  VMM with a new one, and give it to the backend as root once the VMM has
+  it -- until then the backend has none, as without the setting). The
+  guest never runs outside it, and the backend's thread answering a vCPU
+  may run on that vCPU's sibling.
+- `off`, nesbox's default (nesbox sets no cookie): the host scheduler
+  places every thread anywhere.
+
+The rig (Ryzen 9 9950X; MDS, L1TF, TAA, MMIO and RFDS not affected, STIBP
+on) measured, under crosvm, three runs each, interleaved (BENCHMARKS.md,
+"crosvm's core scheduling, by mode"):
+
+| workload (crosvm, 4 vCPUs, 8 GiB) | `per-vcpu` | `shared` | `off` |
+|---|---|---|---|
+| SuperTuxKart, Vulkan, 4K: average fps / 1% low | 984 / 255 | 1,110 / 359 | 1,130 / 452 |
+| the same: an IOCTL2's round trip, from the guest | 13.0 µs | 7.9 µs | 7.4 µs |
+| Unigine Heaven under Wine (D3D11 on DXVK): average fps / 1% low | 433 / 134 | 492 / 248 | 497 / 255 |
+| `gameloop` (every vCPU busy with jobs): average fps / 1% low | 56.4 / 40.8 | 57.1 / 47.9 | 57.8 / 48.5 |
+
+`shared` recovered 86-92% of what `per-vcpu` costs the average frame rate
+and 91% of its round trip, and most of its 1% lows; the backend's CPU was
+the same in all three.
+
+`per-vcpu` stays the default. `shared` keeps every other VM and host task
+off the guest's cores, as `per-vcpu` does, and lets only this VM's own
+backend -- which holds only this VM's state -- onto them; take it where
+the frame rate matters and the host runs more than one tenant. `off` on a
+single-tenant desktop.
+
+**The queue thread's poll** (`--queue-poll-us`, default 50). After
+draining the control ring the backend's queue thread keeps looking at it
+this long, so a request that arrives meanwhile costs the guest no kick
+and the thread no wakeup: +30% on a mailbox vkcube. The price is up to a
+host core at 100% for a guest that sends every 50 µs -- about ten times
+the CPU the guest itself spends sending (about 40% of a core in the
+heavy workloads). On a host with many VMs, 10 or 0; or bound a VM's
+backend with a CPU quota (the unit's `CPUQuota=`, NixOS `cpuQuota`):
+held below what it needs, a backend answers its guest late, so size the
+quota from the backend's CPU in `rig/rig-heavy.sh`'s `.cpu` lines, not
+below it.
+
+**The EEVDF slice** (`--sched-slice-us`, `NVGPU_SLICE_US`, default 100).
+Every backend and VMM thread runs with a 100 µs slice instead of the
+host's ~3 ms, at the same weight: on a loaded host a woken vCPU or queue
+thread gets a CPU back sooner. Under a 32-worker host load SuperTuxKart's
+missed vblanks went from 22 to 2 in 14,400 frames. The host's other
+threads see up to about 100 µs more wake-up jitter under load, and are
+not starved. 0 keeps the host's slice; 100 to 100000 otherwise ("Frame
+pacing" has the measurement).
+
+**The window for creative applications**: "Sizing the window" (`creative`
+is 8192 MiB: up to 6.2 GiB of a 32 GiB BAR1 per VM, and under crosvm up to
+8 GiB of host memory in the VMM's cgroup).
+
+**Guest RAM prefaulted** (default on). nesbox prefaults guest RAM and
+collapses it into 2 MiB pages by default; crosvm does with
+`--prefault-memory` (`patches/crosvm/0011`), which the launcher and the
+crosvm unit pass. Off, a guest reaching memory it has not used since boot
+stalls on host page faults: crosvm's 0.1% low went from 80 fps to 35 in a
+4K game. On, all of guest RAM is committed as the VM starts, which undoes
+a balloon or free-page reporting meant to give memory back early: turn it
+off (`NVGPU_PREFAULT=0`, `vmm.prefaultMemory = false`, nesbox's
+`"prefault": false`) for a VM whose RAM is overcommitted that way.
+
+**The VMM's file-size limit** (`LimitFSIZE=`, none by default). A VMM its
+guest has taken over can grow any file it can write -- the disk above all
+-- with `ftruncate` or `fallocate` until the file system is full.
+`RLIMIT_FSIZE` bounds that, and also every memfd the VMM sizes: it must be
+at least the disk, guest RAM and the window (and, under the launcher, the
+console log cap), or the VMM is killed (`SIGXFSZ`) as it starts or when
+the guest writes its disk's last block. The launcher and the module refuse
+one below any of them. Size it per deployment: the largest of those, plus
+nothing.
+
+**A host C-state cap** (none by default). An idle host CPU sleeps in a
+deep C-state; waking from C3 took 350 µs on the rig, which a vCPU or queue
+thread woken by an event pays. `NVGPU_CPU_LATENCY_US=N` (the root
+launcher), `nvgpu-cpu-latency@N.service` wanted by a VMM unit, or
+`vmm.cpuLatencyUs` holds `/dev/cpu_dma_latency` at N µs while the VM runs,
+so no CPU enters a C-state slower to leave than that. The cost is the
+host's idle power and heat, on every core, for as long as a VM that wants
+it runs; the kernel takes the lowest of several requests. Not measured on
+the rig (it needs root): start at 50 and compare frame times with and
+without.
+
+**Channel-disable rates** (`--fifo-disable-{proc,vm}-{rate,burst}`, default
+50 a second per guest process after 40 at once, 200 per VM after 160).
+`NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` preempts the caller's channels off
+the GPU and with them the runlist every VM shares; the rates are how often
+one VM may make the others wait, and several times what any workload
+measured makes. The backend refuses rates outside 1 to 1000, a process's
+rate at or above the VM's, and a process's burst above the VM's less its
+reserve of 40 or at most 8. Raise them only for a workload whose log shows
+`FIFO_DISABLE_CHANNELS refused: ... over its rate`.
+
+**The host's SRSO mitigation: a host kernel choice, not a knob here.** On
+the rig's Zen 5 the kernel defaults `spec_rstack_overflow` to "IBPB on
+VMEXIT only" (`/sys/devices/system/cpu/vulnerabilities/spec_rstack_overflow`),
+and VMSCAPE's mitigation rides on it ("IBPB on VMEXIT"): every VM exit
+flushes the branch predictors. A whole exit, a CPUID round trip, took
+1.31 µs here with it, and Wine's 55,000 exits a second each pay it. The host kernel's
+command line decides it: `spec_rstack_overflow=off` drops the per-exit
+barrier (VMSCAPE then falls back to "IBPB before exit to userspace", on
+the exits the VMM handles itself), and `vmscape=off` drops that too. Off,
+a guest can train the return-address and branch predictors to steer the
+host kernel's (SRSO, CVE-2023-20569) and the VMM's (VMSCAPE,
+CVE-2025-40300) speculation after an exit and read host memory through a
+side channel. Leave both at their defaults on any host that runs a guest
+it does not trust; nothing in this project turns them off.
 
 ## Capture injection
 
@@ -833,6 +990,8 @@ shows the diagnostic ones too.
 | `--wayland-queue-budget MIB` | 256 | unread compositor output per VM |
 | `--queue-poll-us US` | 50 | how long the queue thread keeps looking at the control ring after draining it (0 to 1000): requests that arrive meanwhile cost the guest no kick ("Frame pacing") |
 | `--sched-slice-us US` | 100 | every backend thread's EEVDF slice, set at start (100-100000; 0 keeps the host's ~3 ms): how soon the queue thread and the pump run again after waking on a busy host ("Frame pacing") |
+| `--fifo-disable-proc-rate N`, `--fifo-disable-proc-burst N` | 50, 40 | FIFO_DISABLE_CHANNELS calls a second one guest process may make, and at once ("Tuning") |
+| `--fifo-disable-vm-rate N`, `--fifo-disable-vm-burst N` | 200, 160 | the same for the whole VM, the last 40 kept for quiet processes |
 | `--pacing-stats SECS` | none | log the frame-pacing counters every SECS while the guest is busy (also `NVGPU_PACING_STATS`); they are logged once at teardown regardless |
 | `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection"); the units hand the socket over instead |
 | `--inject-uid UID` | none | the only uid the inject socket serves: the VM's capture helper |
@@ -899,6 +1058,23 @@ The `0444` ones are set at load (on the kernel command line as
 `virtio_gpu_nv.<name>=`, or with `modprobe`); root may change the `0644`
 ones at run time, and there is no reason to outside a measurement.
 
+**The guest's tuning.** Each is a word of the guest kernel's command line
+(the VMM's `-p`, nesbox's `boot_args`); the rig's launcher adds it from its
+variable. None reaches the host: what each trades is the guest's own CPU.
+
+| setting | launcher | default | what it does |
+|---|---|---|---|
+| `cpuidle_haltpoll.force=1` | `NVGPU_GUEST_HALTPOLL=1` | off | an idle vCPU polls before it halts: a wakeup between vCPUs took 0.95 µs against 7.6, and KVM saw 47% fewer exits under Wine -- but a polling vCPU runs no other thread, and a D3D11 game under Wine lost 9%. **Not recommended**; it also keeps host CPUs busy while the guest idles |
+| `virtio_gpu_nv.rt_spin_us=N` | `NVGPU_GUEST_RT_SPIN_US` | 20 | how long a caller spins for its reply before sleeping (0 to 1000; "Frame pacing"). 20 saves an interrupt and a wakeup a call (idle guest: 5-6 µs a call against 18 at 0) and keeps the vCPU busy that long even when another guest task could run: with 4 hogs and 4 callers on 4 vCPUs the hogs lost about half. That is fairness inside one VM, not between VMs. Wine and the heavy workloads were neutral to 0 |
+| `virtio_gpu_nv.async_fence_watch=Y\|N` | `NVGPU_GUEST_ASYNC_FENCE_WATCH=1\|0` | Y | a fence proxy's WATCH from a work item: two round trips a frame off the presenting thread |
+| `transparent_hugepage=always\|madvise\|never` | `NVGPU_GUEST_THP` | always (the kernel's config) | the guest kernel's huge pages: `always` because a game's heap never asks for them (10% in the job-system loop) |
+
+The guest kernel `scripts/build-guest-kernel.sh` builds has transparent
+huge pages (`always`) and ntsync (`/dev/ntsync`, which Wine 10+ and Proton
+use: 11% in a D3D11 game, and half the halts) built in; the launcher's
+`NVGPU_GUEST_THP` is for measuring without them. The Wayland daemon's
+`--surface-buffers N` (below) is the guest's too.
+
 **NVIDIA userspace.** The host's own release, exactly: in the image, or
 mounted from a share `nvgpu-userspace` staged. The module makes the device
 nodes (`/dev/nvidiactl`, `/dev/nvidia0...`, `/dev/nvidia-modeset`,
@@ -936,8 +1112,15 @@ udevadm control --reload && udevadm trigger --subsystem-match=misc
 `nvgpu-wl-guest --help` lists its flags: `--socket`, `--device` (another
 `/dev/nvgpu-wl*`), `--card` (the guest card node leases are made as),
 `--export NAME` and `--render` (export mode, and the render node host
-clients' dma-bufs are imported into), and `--log` or `NVGPU_WL_LOG` for its
-log level (`info` by default).
+clients' dma-bufs are imported into), `--log` or `NVGPU_WL_LOG` for its
+log level (`info` by default), and `--surface-buffers N` (1 to 256,
+default 16): how many of one surface's `wl_shm` buffers have their damage
+tracked. A client that cycles through more (some toolkits keep a pool of
+them) has each buffer copied whole when it next shows it, not just what
+changed; each tracked buffer is visited at every commit, on the one thread
+every other application's messages wait on (64 cost about 3 µs a commit
+more than 16). Raise it for such a client, and not past what it cycles
+through.
 
 **The Vulkan layer, for a guest without compute.** Without
 `--allow-compute` the guest has no `/dev/nvidia-uvm`, and NVIDIA's Vulkan

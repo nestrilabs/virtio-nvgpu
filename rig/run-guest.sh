@@ -93,7 +93,9 @@
 #                       must be reserved); crosvm: transparent adds
 #                       --hugepages (MADV_HUGEPAGE)
 #   NVGPU_PREFAULT=0    fault guest RAM in on first touch instead (nesbox;
-#                       crosvm with patches/crosvm 0011, --prefault-memory)
+#                       crosvm with patches/crosvm 0011, --prefault-memory).
+#                       The default commits all of guest RAM at start, which
+#                       undoes a balloon meant to give memory back early
 #   NVGPU_SLICE_US      the EEVDF slice of every VMM and backend thread, in
 #                       microseconds (chrt --other --sched-runtime; 100 to
 #                       100000, no privilege needed): a shorter slice than
@@ -101,9 +103,8 @@
 #                       queue thread back onto a busy CPU sooner after it
 #                       wakes, at the same share of the CPU. Default 100;
 #                       0 leaves the host's default
-#   NVGPU_CROSVM_CORE_SCHED=0  crosvm: --core-scheduling=false (its default
-#                       gives each vCPU a core-scheduling cookie of its own,
-#                       which idles the SMT sibling while a vCPU runs)
+#   NVGPU_CROSVM_CORE_SCHED=0|1  the older spelling of NVGPU_CORE_SCHED=off
+#                       and per-vcpu, for crosvm (below)
 #   NVGPU_TIMEOUT       seconds before the VMM is killed (180; 3600 interactive)
 #   NVGPU_CMDLINE_EXTRA appended to the guest kernel command line
 #   NVGPU_BEFORE_VMM    unprivileged only: a command run (bash -c) once the
@@ -174,6 +175,37 @@
 #   NVGPU_KMS_CARD_FORCE=1  allow --kms-card although a Wayland compositor's
 #                       socket is still there (launcher/settings.sh)
 #
+# Tuning (launcher/tuning.sh; DEPLOY.md has each one's gain and cost,
+# SECURITY.md, "The tuning knobs", what each gives up; unset: as before):
+#   NVGPU_CORE_SCHED    per-vcpu, shared, vm or off: which tasks may share an
+#                       SMT core with the guest's vCPUs. per-vcpu (crosvm's
+#                       default): a cookie per vCPU, nothing else on its
+#                       sibling; vm: one cookie for the whole VMM (crosvm
+#                       --per-vm-core-scheduling; nesbox under coresched);
+#                       shared: one cookie for the VMM and its backend,
+#                       made before either starts (coresched, util-linux
+#                       2.40+); off (nesbox's default): no cookie. nesbox
+#                       has no per-vcpu
+#   NVGPU_QUEUE_POLL_US the backend's --queue-poll-us (0 to 1000; its
+#                       default 50): 0 or 10 on a host with many VMs
+#   NVGPU_FIFO_DISABLE_RATES  PROC_RATE,PROC_BURST,VM_RATE,VM_BURST: the
+#                       backend's --fifo-disable-* (default 50,40,200,160)
+#   NVGPU_WINDOW_PRESET creative: NVGPU_WINDOW_MIB=8192 unless that is set
+#                       (Blender, 3D editors; up to 6.2 GiB of BAR1, and
+#                       under crosvm up to 8 GiB of host memory)
+#   NVGPU_VMM_FSIZE_MIB the VMM's RLIMIT_FSIZE (prlimit), in MiB: at least the
+#                       disk, guest RAM, the window and NVGPU_LOG_MAX_MIB
+#   NVGPU_CPU_LATENCY_US  root: hold /dev/cpu_dma_latency at this many
+#                       microseconds while the VM runs (0 to 100000): host
+#                       CPUs stay out of deeper C-states, at a power cost
+#   NVGPU_GUEST_HALTPOLL=1  cpuidle_haltpoll.force=1 on the guest's command
+#                       line (not recommended: Wine lost 9%)
+#   NVGPU_GUEST_RT_SPIN_US  virtio_gpu_nv.rt_spin_us (0 to 1000; module
+#                       default 20)
+#   NVGPU_GUEST_ASYNC_FENCE_WATCH=0|1  virtio_gpu_nv.async_fence_watch
+#   NVGPU_GUEST_THP     always, madvise or never: transparent_hugepage= for
+#                       the guest kernel (the guest kernel's default: always)
+#
 # Exit status: the probe's NVGPU_PROBE_DONE verdict when it printed one (0
 # PASS, 1 FAIL); otherwise 0 when the console shows a PASS and no FAIL, 1 on
 # any FAIL line, 2 when it shows neither. 124 when the guest did not power
@@ -236,6 +268,9 @@
 #   common.sh        helpers: JSON strings, text fit for a terminal, the
 #                    capped log writer, CPU lists, still_ours
 #   settings.sh      the command line and the environment, checked
+#   tuning.sh        the tuning knobs (below): core scheduling, the
+#                    backend's poll and rates, the window preset, the VMM's
+#                    file-size limit, the C-state cap, the guest's knobs
 #   root.sh          what a root run alone does -- root's files, the slot,
 #                    the backend's and the VMM's users, the run's directory,
 #                    the VMM's jail, the socket opened to it -- and, in its
@@ -359,7 +394,7 @@ else
 fi
 LIB=${SELF%/*}/launcher
 declare -A PIECE
-for piece in common settings root unprivileged nesbox crosvm backend guest verdict; do
+for piece in common settings tuning root unprivileged nesbox crosvm backend guest verdict; do
     if [ $PRIV = root ]; then
         PIECE[$piece]=$(root_owned "$LIB/$piece.sh" "the launcher's $piece.sh")
     else
@@ -370,6 +405,8 @@ done
 . "${PIECE[common]}"
 # shellcheck source=launcher/settings.sh
 . "${PIECE[settings]}"
+# shellcheck source=launcher/tuning.sh
+. "${PIECE[tuning]}"
 # shellcheck source=launcher/root.sh
 . "${PIECE[root]}"
 # shellcheck source=launcher/unprivileged.sh
@@ -387,6 +424,7 @@ done
 
 # ── What is asked for ────────────────────────────────────────────────────────
 parse_args "$@"
+window_preset
 backend_settings
 name_run
 choose_layout
@@ -397,6 +435,7 @@ fi
 run_settings
 guest_settings
 check_inputs
+tuning_settings
 if [ $PRIV = root ]; then
     root_only_files
 fi
@@ -479,6 +518,9 @@ fi
 # ── Cleanup, however the run ends ────────────────────────────────────────────
 BACKEND=
 BACKEND_MARK=
+BACKEND_PREFIX=()
+CS_ANCHOR=
+CPU_LATENCY_PID=
 VMM_PID=
 VMM_MARK=
 RUN=
@@ -494,6 +536,7 @@ cleanup() {
     if [ -n "$BACKEND" ] && still_ours "$BACKEND" "${BACKEND_MARK:-}"; then
         kill "$BACKEND" 2>/dev/null || true
     fi
+    tuning_cleanup
     [ -z "$RUN" ] || rm -rf "$RUN"
     [ -z "$JAIL_BUILT" ] || rm -rf "$JAIL_BUILT"
     if [ -n "$DISK_COPY" ]; then
@@ -586,10 +629,12 @@ else
     nesbox_cmd
 fi
 VMM_CMD=("${SLICE[@]}" "${VMM_CMD[@]}")
+tuning_vmm_cmd
 
 # ── The backend ──────────────────────────────────────────────────────────────
 BLOG=$LOGS/$TAG.backend.log
 CONSOLE=$LOGS/$TAG.console.log
+cpu_latency_start
 start_backend
 await_socket
 if [ $PRIV = root ]; then

@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
 | 2026-09-30 | branch `knob-dmabuf`: `--allow-dmabuf-export` | stage1, compat, render and secneg with the switch off and on, nesbox, Rust module | "dma-buf export through RM" |
 | 2026-09-30 | branch `knob-vram` (`--vram-limit`) on display-passthrough | the limit as nvidia-smi, Vulkan and CUDA see it, allocations past it, stage1, compat, render and five applications with a limit, compat without | "Video memory limit" |
 | 2026-09-30 | branch `knob-rm`: opt-in RM groups (`--rm-allow-group`) and `--osdesc-populate`, under nesbox, C module | `secneg` with every group off and on (19 passed, 5 KMS skips each; T14-T16 answered by the allowlist off and by each group's rule on, a guest temperature reading with `thermal`); `render` with compute 9/0/1 at the defaults; nvidia-smi -q with `health` on; cuMemHostRegister of fresh memory with populate on and off, three boots each | "Opt-in RM groups" |
@@ -1125,6 +1126,25 @@ writes the exits, halts, halt polling and faults per second over a window of
 the run (`.kvmstat`). KVM answers `KVM_GET_STATS_FD` only in the process
 that made the VM, so nesbox must open them itself: its `virtio-nvgpu-v7`
 branch does with `NESBOX_HOLD_KVM_STATS=1`, which the harness sets.
+
+### crosvm's core-scheduling modes
+
+`NVGPU_CORE_SCHED` (rig/launcher/tuning.sh) set per run, under crosvm,
+on the Steam-like image, with each run's VMM and backend reaped inside
+the rig lock before the next (BENCHMARKS.md, "crosvm's core scheduling,
+by mode", has the results):
+
+```sh
+# per run, as one flock-wrapped command; round r rotates the modes' order
+NVGPU_VMM_KIND=crosvm NVGPU_ROOTFS=/tmp/rootfs.steam.ext4 NVGPU_COMPUTE=1 \
+    NVGPU_CORE_SCHED=shared rig/rig-heavy.sh wine-heaven vm cs-shared 1 "$r"
+```
+
+The launcher says `core scheduling: the backend and the VMM share one
+cookie (0x...)` for `shared`; `coresched get -s PID` on the backend and on
+crosvm shows the same cookie (rig/verify/launcher-dryrun/knobs.sh checks
+it with stubs). `per-vcpu` needs nothing (crosvm's default), `off` passes
+`--core-scheduling=false`.
 
 ## Wine start-up stalls
 

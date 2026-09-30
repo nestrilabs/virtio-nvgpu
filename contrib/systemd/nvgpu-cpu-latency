@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# nvgpu-cpu-latency US: hold the host's CPU wake-up latency at US
+# microseconds (0 to 100000) until stopped: /dev/cpu_dma_latency, written
+# and kept open (the kernel drops the request when it is closed). The
+# cpuidle governor then keeps every CPU out of C-states whose exit latency
+# is longer. nvgpu-cpu-latency@US.service runs it while any VM unit that
+# wants it runs (DEPLOY.md, "Tuning"; it costs the host power).
+set -eu
+us=${1:-}
+case $us in '' | *[!0-9]*) echo "nvgpu-cpu-latency: $us: 0 to 100000 microseconds" >&2; exit 1 ;; esac
+us=$((us + 0))
+[ "$us" -le 100000 ] || { echo "nvgpu-cpu-latency: $us: 0 to 100000 microseconds" >&2; exit 1; }
+exec 3>/dev/cpu_dma_latency
+# Hex text: four bytes would be read as a binary s32.
+printf '0x%08x' "$us" >&3
+echo "nvgpu-cpu-latency: CPU wake-up latency held at $us us"
+exec sleep infinity
