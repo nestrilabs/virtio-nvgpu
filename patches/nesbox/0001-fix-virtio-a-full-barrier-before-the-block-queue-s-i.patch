@@ -1,4 +1,4 @@
-From e67ee2abc0ff87f535a063ac4194f8c9a68c8463 Mon Sep 17 00:00:00 2001
+From 07e01b0d8ed99e114a79e1f10820c0b9f8999c5f Mon Sep 17 00:00:00 2001
 From: Jacob Root <jacob@otisroot.com>
 Date: Wed, 30 Sep 2026 10:31:29 +0000
 Subject: [PATCH] fix(virtio): a full barrier before the block queue's
@@ -12,16 +12,19 @@ of the handshake (Linux's virtqueue_enable_cb) is the mirror image: write
 `used_event`, full barrier, re-read the used index, sleep if nothing new.
 With only one side fenced, both can read the other's old value: the driver
 sees no new entry and sleeps, the device sees the old `used_event` and does
-not interrupt. The request is then complete in the ring and never reaped;
-the task that issued it sleeps uninterruptibly in I/O wait, and SIGKILL
-cannot take it, until some later request on the same queue happens to
-raise an interrupt. A guest whose other queues are busy may go on; one
-whose I/O all waits behind it stops.
+not interrupt. The request is then complete in the ring and never reaped,
+and with EVENT_IDX the queue stays that way: later completions no longer
+cross the used_event the driver is waiting at, so none of them interrupts
+either. Every task that reads or writes through that queue sleeps
+uninterruptibly in I/O wait, where SIGKILL cannot take it; the guest's
+other queues go on.
 
-It was seen as about one freshly booted guest in six stopping in its
-first minute, while ext4's lazy init and a large program's start-up load
-the disk from every CPU at once: journal, bitmap and page-cache reads
-blocked in io_schedule for good.
+It was seen as 6 of 40 freshly booted guests stopping in their first
+minute, while ext4's lazy init and a large program's start-up load the
+disk from every CPU at once: journal, bitmap and page-cache reads blocked
+in io_schedule for good, and a direct read issued afterwards from each CPU
+completing on every queue but one, where it joined them. With this
+change, 0 of 44 stopped.
 
 The kick direction already had its barrier (`set_used_no_notify`,
 `set_avail_event`); this is the same one for the interrupt direction, as
@@ -36,14 +39,14 @@ rounds; with it, none in ten.
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
- virtio-devices/src/common.rs | 105 +++++++++++++++++++++++++++++++++++
- 1 file changed, 105 insertions(+)
+ virtio-devices/src/common.rs | 106 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
 
 diff --git a/virtio-devices/src/common.rs b/virtio-devices/src/common.rs
-index 9358aa5..e0fd7ac 100644
+index 9358aa5..30ec501 100644
 --- a/virtio-devices/src/common.rs
 +++ b/virtio-devices/src/common.rs
-@@ -372,6 +372,19 @@ pub fn set_avail_event(mem: &GuestMemoryMmap, q: &QState, idx: u16) {
+@@ -372,6 +372,20 @@ pub fn set_avail_event(mem: &GuestMemoryMmap, q: &QState, idx: u16) {
  /// answers whether the batch passed it; without it, the answer is the avail
  /// ring's flag.
  pub fn used_needs_interrupt(mem: &GuestMemoryMmap, q: &QState, old: u16, new: u16) -> bool {
@@ -56,14 +59,15 @@ index 9358aa5..e0fd7ac 100644
 +    // the driver sees no new entries and sleeps, and we see a `used_event` it
 +    // has already moved and send no interrupt. The request is then complete
 +    // in the ring and its submitter waits for it forever, in uninterruptible
-+    // I/O sleep -- until some later request on the same queue happens to
-+    // interrupt. The mirror of the barrier in `set_used_no_notify` and
++    // I/O sleep -- and with `EVENT_IDX` so does everything after it on the
++    // queue, since later batches no longer cross the `used_event` the driver
++    // is waiting at. The mirror of the barrier in `set_used_no_notify` and
 +    // `set_avail_event`, for the other direction.
 +    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
      if !q.event_idx {
          return avail_wants_interrupt(mem, q);
      }
-@@ -1063,6 +1076,98 @@ mod queue_tests {
+@@ -1063,6 +1077,98 @@ mod queue_tests {
          assert!(!used_needs_interrupt(&m, &q, 3, 5));
      }
  
