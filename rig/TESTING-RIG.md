@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `integrate32`: the 2026-09-30 review's fixes (backend, guest module, Wayland, patches, deployment), the gVisor comparison, heavyfix and the fence-retire fix | Groups A and B under nesbox (C and Rust modules) and crosvm, the same probes on a KASAN+UBSAN+KFENCE+lockdep guest kernel with the unbind probe, and two batches of live applications | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `heavyfix` on `8fe984f`: IOCTL2 path, posted SYNCOBJ_DESTROY, the pump, crosvm `0011` | the heavy workloads before and after; stage1, compat, render (with and without compute), wayland and secneg under nesbox and crosvm, C parsers, and stage1, render and wayland with the Rust parsers | "Heavy workloads" |
 | 2026-09-29 | `492f29b` (branch `integrate30`): the review's fixes and the restructuring after them | Groups A and B under nesbox (C and Rust modules) and crosvm, and two batches of live applications | "Regression of the restructured tree" |
 | 2026-09-29 | the 2026-09-29 review's backend fixes | Groups A and B under nesbox and crosvm, and a batch of live applications | "Regression of the 2026-09-29 review's backend fixes" |
@@ -668,6 +669,31 @@ enforcing and the backend's sandbox on:
 | `lease` | 9/0/1 | 9/0/1 | 9/0/1 |
 | `vkdisplay` | 8/0/1 | 8/0/1 | 8/0/1 |
 | `secneg`, `kms=lease` | 6/0/0; KMS 15 passed | the same | the same |
+
+## Regression of the 2026-09-30 review
+
+2026-09-30, branch `integrate32`, with the backend, both guest modules and the
+image built from it, nesbox `virtio-nvgpu-v6`, and crosvm with the regenerated
+`0001`-`0011`. Counts are pass/fail/skip.
+
+| probe | nesbox, C | nesbox, Rust | nesbox, KASAN kernel | crosvm |
+|---|---|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 |
+| compat, with `nvgpu-syncobj-race` | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 |
+| render, and render with CUDA | 9/0/1, cuda-smoke ALL PASS | same | same | same |
+| map churn | 3/0/0 | 3/0/0 | 3/0/0 | 3/0/0 |
+| wayland | 13/0/1 | 13/0/1 | 13/0/1 | 13/0/1 |
+| secneg (T1-T13) | 13 passed, 5 skipped | same | same | same |
+| lease, vkdisplay, secneg with KMS | 9/0/1, 8/0/1, 18 passed | same | not run | same |
+| unbind under load | | | 7/0/0, no sanitizer report | |
+
+The compat probe's syncobj race first failed at full speed with EMFILE: a
+fired wait registration stayed charged to its process for a second after it
+fired, and a guest firing 16,000 a second reached its share of the handle
+table (fence.rs, pump.rs). The KASAN kernel, slower, passed. The Rust row's
+compat is from the fixed backend's own run; its other rows are from the
+backend before that fix. Live applications, nesbox: 18 checks passed, none
+failed; crosvm with `--allow-compute`: 23 passed, none failed.
 
 ## Regression of the restructured tree
 
