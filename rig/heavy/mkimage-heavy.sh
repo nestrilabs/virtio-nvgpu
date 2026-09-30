@@ -31,6 +31,8 @@ put() { # <local> <dir> <name> <mode>
 } >>"$CMDS"
 put "$HERE/heavy-run.sh" /opt/heavy heavy-run.sh 755
 put "$HERE/blender-eevee.py" /opt/heavy blender-eevee.py 644
+put "$HERE/hang-watch.sh" /opt/heavy hang-watch.sh 755
+put "$HERE/waits.py" /opt/heavy waits.py 644
 for f in "$HERE"/godot/*; do put "$f" /opt/heavy/godot "$(basename "$f")" 644; done
 while [ $# -gt 0 ]; do
     case $1 in

@@ -3,6 +3,10 @@
  * rmlog.so -- LD_PRELOAD: log the NVIDIA RM controls a program makes that
  * fail, and every NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS with its parameters,
  * the same natively and in a guest. Output: $RMLOG (appended), else stderr.
+ * RMLOG_REFUSE=0x2080110b[,...] answers those controls natively as a guest's
+ * RM allowlist does, without RM seeing them (NV_ERR_NOT_SUPPORTED, or the
+ * status in RMLOG_REFUSE_STATUS). RMLOG_ONLY_SCHED=1 sends DISABLE_CHANNELS
+ * on with bOnlyDisableScheduling set.
  *
  *   cc -O2 -shared -fPIC rmlog.c -o rmlog.so -ldl
  *   RMLOG=/tmp/rm.log LD_PRELOAD=$PWD/rmlog.so supertuxkart ...
@@ -68,13 +72,51 @@ __attribute__((constructor)) static void init(void) {
   say("rmlog: pid %d", getpid());
 }
 
+/* RMLOG_REFUSE: RM control numbers, comma-separated, answered as the
+ * backend's RM allowlist answers a refused one (device/src/rmallow.rs): the
+ * ioctl succeeds with status NV_ERR_NOT_SUPPORTED, and RM never sees it. */
+#define NV_ERR_NOT_SUPPORTED 0x56
+static int refused(uint32_t cmd) {
+  const char *s = getenv("RMLOG_REFUSE");
+  while (s && *s) {
+    char *end;
+    unsigned long v = strtoul(s, &end, 0);
+    if (end == s)
+      break;
+    if (v == cmd)
+      return 1;
+    s = *end == ',' ? end + 1 : end;
+  }
+  return 0;
+}
+
 int ioctl(int fd, unsigned long req, ...) {
   va_list ap;
   va_start(ap, req);
   void *arg = va_arg(ap, void *);
   va_end(ap);
-  int ret = real_ioctl(fd, req, arg);
-  if (_IOC_TYPE(req) == 'F' && _IOC_NR(req) == 0x2a && _IOC_SIZE(req) == sizeof(struct nvos54)) {
+  int is_ctl = _IOC_TYPE(req) == 'F' && _IOC_NR(req) == 0x2a &&
+               _IOC_SIZE(req) == sizeof(struct nvos54);
+  int ret;
+  if (is_ctl && refused(((struct nvos54 *)arg)->cmd)) {
+    /* RMLOG_REFUSE_STATUS: another answer, such as 0 (success, not done). */
+    const char *st = getenv("RMLOG_REFUSE_STATUS");
+    ((struct nvos54 *)arg)->status = st ? (uint32_t)strtoul(st, NULL, 0) : NV_ERR_NOT_SUPPORTED;
+    ret = 0;
+  } else {
+    /* RMLOG_ONLY_SCHED=1: a DISABLE_CHANNELS that disables goes to RM with
+     * bOnlyDisableScheduling set, so RM stops scheduling the channels but
+     * preempts nothing off the GPU. */
+    struct nvos54 *p = arg;
+    if (is_ctl && p->cmd == 0x2080110b && p->params &&
+        p->paramsSize >= sizeof(struct disable_channels) && getenv("RMLOG_ONLY_SCHED")) {
+      struct disable_channels *d = (void *)(uintptr_t)p->params;
+      if (d->bDisable)
+        d->bOnlyDisableScheduling = 1;
+    }
+    ret = real_ioctl(fd, req, arg);
+  }
+  if (is_ctl) {
     struct nvos54 *p = arg;
     if (p->cmd == 0x2080110b && p->params && p->paramsSize >= sizeof(struct disable_channels)) {
       struct disable_channels *d = (void *)(uintptr_t)p->params;
