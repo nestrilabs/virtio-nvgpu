@@ -1,0 +1,15 @@
+{
+    "file_format_version": "1.2.1",
+    "layer": {
+        "name": "VK_LAYER_NVGPU_no_uvm",
+        "type": "GLOBAL",
+        "library_path": "@LIB@",
+        "library_arch": "@ARCH@",
+        "api_version": "1.4.357",
+        "implementation_version": "1",
+        "description": "virtio-nvgpu: hide the NVIDIA device extensions a guest without compute cannot create a device with",
+        "disable_environment": {
+            "NVGPU_VK_NO_UVM_DISABLE": "1"
+        }
+    }
+}

@@ -499,8 +499,22 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   mitigation between the guest and host tasks on SMT siblings
   (SECURITY.md, "Frame pacing"): turn it off only on a single-tenant desktop. Even so
   crosvm ran a mailbox vkcube at about 3,300 fps to nesbox's 4,500.
-- **vCPUs**: 2, 4 and 8 paced the same for these workloads; give a game what
-  it uses in parallel, no more.
+- **vCPUs**: 2, 4 and 8 paced the same for these workloads, but a game's
+  throughput is the vCPUs it can use: a job-system engine ran 58 fps on 4,
+  99 on 8 and 158 on 16, 7-10% under the same program on as many host CPUs,
+  and a 4-vCPU guest is within a few percent of the program confined to 4
+  host CPUs (BENCHMARKS.md, "Steam-like games"). Give a modern game 8 or
+  more; a guest's vCPUs are host CPUs other work cannot have while the game
+  runs.
+- **The guest kernel**: transparent huge pages (`always`) and ntsync, as
+  `scripts/build-guest-kernel.sh` now sets them: without huge pages a
+  game's heap is all 4 KiB pages (10% in the job-system loop), and without
+  `/dev/ntsync` Wine and Proton fall back to slower synchronisation (11%
+  in a D3D11 game under Wine's own).
+- **Guest haltpoll** (`cpuidle_haltpoll.force=1` on the guest's command
+  line) makes a wakeup between vCPUs faster than natively (0.95 µs against
+  7.6 without it), but a polling vCPU runs no game thread: a D3D11 game
+  under Wine lost 9%. Not recommended by default.
 - **Direct scanout** (Hyprland `render:direct_scanout = 1`) scanned the
   fullscreen guest window out directly in every run and removed the FIFO
   vkcube's remaining missed vblanks (33 -> 0 in 9,600 frames; native 10 -> 4).
@@ -764,11 +778,40 @@ udevadm control --reload && udevadm trigger --subsystem-match=misc
 clients' dma-bufs are imported into), and `--log` or `NVGPU_WL_LOG` for its
 log level (`info` by default).
 
+**The Vulkan layer, for a guest without compute.** Without
+`--allow-compute` the guest has no `/dev/nvidia-uvm`, and NVIDIA's Vulkan
+driver there -- as natively without the UVM device -- still lists the
+extensions that need it (acceleration structures and every ray-tracing
+extension on them, `VK_NVX_binary_import` that DLSS uses,
+`VK_NV_cuda_kernel_launch`, `VK_NV_optical_flow` that Frame Generation
+uses) and reports their features, but fails `vkCreateDevice` with
+`VK_ERROR_INITIALIZATION_FAILED` when any of them is enabled. An
+application that enables what it is offered does not start: Godot's Vulkan
+renderer dies with SIGILL, and a D3D12 game through vkd3d-proton hangs
+(BENCHMARKS.md, "Steam-like games"). `VK_LAYER_NVGPU_no_uvm`
+([`nvgpu-vk-layer/`](nvgpu-vk-layer/)), an implicit layer, makes such a
+guest look like a driver without them: it drops them from the device's
+extension list, clears their features in `vkGetPhysicalDeviceFeatures2`,
+and answers a `vkCreateDevice` that asks for them with
+`VK_ERROR_EXTENSION_NOT_PRESENT` or `VK_ERROR_FEATURE_NOT_PRESENT`, so the
+application falls back (vkd3d-proton without DXR, a game without DLSS). It
+does nothing when `/dev/nvidia-uvm` exists, for another vendor's device, or
+with `NVGPU_VK_NO_UVM_DISABLE=1`, and it reaches nothing outside the
+process. Install its manifest where the guest's Vulkan loader searches for
+implicit layers, naming the library by its absolute path: `make PREFIX=/usr
+install` puts it in `/usr/share/vulkan/implicit_layer.d`, which every loader
+searches while `XDG_DATA_DIRS` is unset; nixpkgs' loader does not search
+`/etc/vulkan`, and on NixOS a package in the system profile is found through
+`XDG_DATA_DIRS`. The 64- and 32-bit builds of
+`rig/guest-image/nix/vk-layer.nix` carry `library_arch` in their manifests,
+so each loader takes its own.
+
 **What the image must contain**, then: the kernel and `virtio_gpu_nv.ko`
 loaded at boot; the host's NVIDIA userspace (Vulkan ICD, EGL and GBM
 vendors, `libcuda` and the video libraries if compute is served); the
 `video`, `render` and `nvgpu-wl` groups and the udev rule; `nvgpu-wl-guest`
-setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set; for
+setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set;
+`VK_LAYER_NVGPU_no_uvm` if the guest may run without compute; for
 capture injection, the capture daemon's account in `nvgpu-capture` and its
 udev rule; and applications run as unprivileged users in `video` and
 `render` only.

@@ -151,6 +151,25 @@ enable CONFIG_SYNC_FILE
 # ioremap_wc and pgprot_writecombine quietly fall back to UC.
 enable CONFIG_X86_PAT
 
+# What games want of a guest kernel (BENCHMARKS.md, "Steam-like games"),
+# none of it reaching the host:
+# - transparent huge pages, on for every process: x86_64's defconfig leaves
+#   THP out, so every guest page was 4 KiB under the host's 2 MiB ones, and
+#   a game's heap (malloc, which never asks for huge pages) walked two page
+#   tables of small pages on every TLB miss. madvise-only would leave games
+#   out; `always` with the default defrag (madvise) does not stall a fault
+#   on compaction.
+# - ntsync, the kernel's NT synchronisation objects, which Wine 10+ and
+#   Proton use through /dev/ntsync when it is there; without it Wine's
+#   events and mutexes go through its server, a round trip between
+#   processes -- a wakeup of another vCPU -- per wait.
+# - paravirtual spinlocks, the default for a KVM guest: a vCPU the host has
+#   preempted while holding a lock is not spun on.
+enable CONFIG_TRANSPARENT_HUGEPAGE
+enable CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
+enable CONFIG_NTSYNC
+enable CONFIG_PARAVIRT_SPINLOCKS
+
 # Not needed to run, needed to debug. The absence of tracefs cost a whole
 # diagnosis cycle once: a silent -EINVAL out of the DRM core had to be found by
 # reading the kernel source instead of asking the kernel.

@@ -26,6 +26,13 @@ The short version, on an RTX 5090 with the current code:
   loses 8-14% to explicit sync's eleven round trips a frame, and a frame
   that writes freshly allocated staging memory runs at a quarter of native
   speed, a page fault a page.
+- **Steam-like games** ([Steam-like games](#steam-like-games)): D3D11 and
+  D3D12 under Wine, a job-system engine and a native Vulkan game run within
+  a few percent of the same program on as many host CPUs as the guest has
+  vCPUs; what a 4-vCPU guest loses against the whole host is the other
+  CPUs. The frame-pacing measures cost no throughput. The guest kernel
+  lacked huge pages (10%) and ntsync (11-13% under Wine), and without compute a
+  game that enables ray tracing or DLSS did not start; both are fixed.
 
 [Table](#native-against-a-guest) ·
 [How it was measured](#how-it-was-measured) ·
@@ -33,6 +40,7 @@ The short version, on an RTX 5090 with the current code:
 [What remains](#what-remains-and-why) ·
 [What these numbers do not support](#what-these-numbers-do-not-support) ·
 [Heavy workloads](#heavy-workloads) ·
+[Steam-like games](#steam-like-games) ·
 [Earlier, on an RTX 3060](#earlier-an-rtx-3060-before-protocol-v2) ·
 [Re-taking these](#re-taking-these)
 
@@ -697,6 +705,226 @@ In the order of what each would buy:
 4. **The backend's CPU** is its queue thread polling the ring after each
    request (`--queue-poll-us`, 50 µs by default), which buys the round
    trips above; the pump's share is now small.
+
+## Steam-like games
+
+RTX 5090, 595.99.02, Ryzen 9 9950X, 2026-09-30. What a Steam game under
+Proton does that the heavy workloads above do not -- D3D11 and D3D12
+through DXVK and vkd3d-proton, Wine's threads and its synchronisation, a
+job system waking every core each frame -- measured the same way natively
+and in a guest (`rig/rig-heavy.sh`; rig/TESTING-RIG.md, "Proton-like and
+CPU-heavy workloads"). The code is `display-passthrough` at `8fe984f` with
+its backend and nesbox (holding KVM's statistics, `virtio-nvgpu-v7`), the
+rig's crosvm, a guest kernel of the rig's 7.2.7 config with THP (set to
+`madvise`, as the host has it, unless a row says otherwise) and ntsync
+built in, 4 vCPUs and 8 GiB unless a row says otherwise, `--allow-compute`,
+everything else at its default. Wine 11.16 (staging, WoW64), DXVK 2.7.1,
+vkd3d-proton 2.14.1, all unpaced against the rig's headless sway. Mean of
+three runs ± half their range unless a row says fewer; **native, 4 CPUs**
+is the program confined to the guest's CPU count (`taskset -c 0-3`).
+
+- `gameloop`: `nvgpu-gameloop`, a synthetic frame: four fork-join phases
+  of 64 jobs on as many threads as there are CPUs (particles integrated,
+  random reads through a 512 MiB heap), then 4,000 draws presented.
+- Godot D3D12: Godot 4.7.2's Windows build under Wine on vkd3d-proton,
+  the "draws" scene (20,000 meshes) at 1280x720.
+- Heaven: Unigine Heaven 4.0's 32-bit D3D11 build under Wine with DXVK,
+  1280x720, low, no tessellation, its demo camera.
+- Godot Vulkan: the same "draws" scene on Godot's Linux Vulkan renderer.
+- 0 A.D. 0.28 on Vulkan, four AIs; its frame time varies a great deal from
+  run to run (the AIs play differently), so its rows say little.
+
+Wine synchronises through its server in both columns here: the host has no
+`/dev/ntsync` loaded, and the guest's is removed for these runs.
+
+| workload | figure | native | native, 4 CPUs | nesbox | ×native (4 CPUs) | crosvm | ×native (4 CPUs) |
+|---|---|---|---|---|---|---|---|
+| gameloop | avg fps | 220.9 ± 26 | 60.2 (4 runs) | 58.3 ± 0.8 | 3.79 (1.03) | 52.2 ± 0.5 | 4.23 (1.15) |
+| | 1% / 0.1% low | 80.8 / 40.9 | 42.9 / 33.4 | 49.4 / 37.9 | | 36.0 / 28.4 | |
+| Godot D3D12 | avg fps | 70.7 ± 0.7 | 70.0 ± 1.4 | 68.7 ± 2.1 (2) | 1.03 (1.02) | 67.0 ± 0.5 (2) | 1.06 (1.04) |
+| | 1% / 0.1% low | 59.5 / 46.8 | 28.6 / 21.6 | 58.7 / 50.6 | | 48.2 / 34.2 | |
+| Heaven, D3D11 | avg fps | 589.6 ± 6.7 | 480.2 ± 4.5 | 476 (4 runs) | 1.24 (1.01) | 413.4 ± 25 (2) | 1.43 (1.16) |
+| | 1% / 0.1% low | 293 / 144 | 136 / 83 | 188 / 101 | | 109 / 62 | |
+| Godot Vulkan | avg fps | 111.8 ± 2.4 | 113.8 ± 1.3 | 106.8 ± 6.2 | 1.05 (1.07) | 101.6 ± 0.7 | 1.10 (1.12) |
+| 0 A.D. | avg fps | 1060 ± 132 | 1035 ± 348 | 1016 (1) | | 491 (1) | |
+
+A guest of 4 vCPUs is within a few percent of the same program on 4 host
+CPUs, and its lows are better than there (the host's 4 CPUs also serve the
+desktop and the compositor). What it loses against the host is the other 28
+CPUs: nothing a game runs on more than 4 threads can use them.
+
+### Where the time went
+
+**1. The guest's CPU count.** The same two programs with more vCPUs, each
+against native confined to as many CPUs (mean of two runs; guest RAM
+16 GiB at 16 vCPUs, 24 at 24):
+
+| CPUs | gameloop, native | gameloop, nesbox | Heaven, native | Heaven, nesbox |
+|---|---|---|---|---|
+| 4 | 60.2 | 58.3 | 480 | 476 |
+| 8 | 106.2 | 98.6 (-7%) | 581 | 494 (-15%) |
+| 16 | 140 ± 36 | 158.1 | 574 | 472 (-18%) |
+| 24 | 215.2 | 194.7 (-10%) | 590 | (below) |
+
+The job system scales in a guest as it does natively, 7-10% under it. Heaven
+does not: from 8 CPUs up it is bound by something per frame, not by CPUs,
+natively at about 580 and in a guest at about 480 (2 below).
+
+**2. Waking a thread on another vCPU.** `nvgpu-wakecost`, two threads on
+two CPUs handing a token through a futex, 20,000 round trips (µs):
+
+| | futex hand-off, p50 / p99 | spinning hand-off, p50 | one CPUID |
+|---|---|---|---|
+| native | 1.8-2.0 / 3.3-7.8 | 0.06 | 0.025 |
+| nesbox | 7.6 / 15-17 | 0.06 | 1.31 |
+| nesbox, vCPUs pinned (8-11) | 7.9-8.0 / 14 | 0.07-0.09 | 1.33 |
+| nesbox, guest haltpoll | 0.95 / 1.1-2.1 | 0.07 | 1.31 |
+| crosvm | 10.5-12.7 / 23-26 | 0.08-0.09 | 1.60 |
+
+A wakeup that finds the other vCPU halted costs it an exit, the host's wake
+and an entry: about four times native. A VM exit and entry here costs 1.3 µs
+(CPUID, which always exits): the host kernel issues an IBPB on every VM exit
+(its SRSO mitigation, "IBPB on VMEXIT only"; `vmscape` adds one on the way
+to user space). Wine without ntsync is made of such wakeups: its events and
+mutexes are round trips to the wineserver process. KVM's own counters
+(`rig/heavy/kvmstat.py`, 12 s windows, two runs each, per second over the 4
+vCPUs):
+
+| | exits | of them halts | halts the host's poll caught | host CPU in halt polling | avg fps |
+|---|---|---|---|---|---|
+| gameloop | 15,732 | 1,454 | 816 | 0.09 s/s | 58.0 |
+| Heaven, Wine server sync | 54,786 | 35,793 | 30,122 | 1.09 s/s | 485.3 |
+| Heaven, ntsync | 36,055 | 17,716 | 13,938 | 0.99 s/s | 538.7 |
+| Heaven, guest haltpoll | 29,151 | 3,697 | -- | (polling in the guest) | 441.5 |
+| Godot D3D12 | 9,992 | 3,605 | 610 | 0.04 s/s | 67.4 |
+
+Heaven halts a vCPU 36,000 times a second, and KVM's halt polling (200 µs)
+spends more than a host CPU catching them. ntsync halves the halts and gains
+11% (it is Wine's and Proton's own path when `/dev/ntsync` is there; the
+guest kernel now has it). Polling in the guest instead (`cpuidle_haltpoll.
+force=1`) removes nine halts in ten and makes a futex hand-off faster than
+natively, but Heaven loses 9% to it: a polling vCPU is one Wine's other
+runnable threads cannot have. It is not the default.
+
+Wine on X11 through a rootful Xwayland in the guest, as Proton runs a game
+on an X11 desktop, costs what its Wayland driver does: Heaven 476.0 fps
+against 462.5 on 4 host CPUs the same way, Godot D3D12 69.6 (one run)
+against 71.8 (two runs each otherwise).
+
+**3. Guest pages.** The guest kernel had no transparent huge pages at all
+(x86_64's defconfig leaves them out): every page of a game's heap was 4 KiB
+under the host's 2 MiB, and each TLB miss walked two page tables of small
+pages. With THP (`always`), `gameloop` went from 57.6 to 63.7 fps
+(two runs each), past native on 4 CPUs, whose heap the host maps in 4 KiB
+pages too (`madvise`, and malloc never asks). The guest kernel config now
+has THP, `always` by default; see "What changed".
+
+**4. What the frame-pacing measures cost.** The hypothesis was that the
+reply spin, the queue poll, the short slice and the fence watch, which cut
+stutter, cost a CPU-bound game throughput. One knob at a time against the
+defaults, nesbox, 4 vCPUs, avg fps (mean of two runs unless marked; `(1)`
+one, the other run of Godot D3D12 stopped, "What remains"):
+
+| knob | gameloop (1% low) | Heaven | Godot D3D12 |
+|---|---|---|---|
+| defaults | 57.6 (40.5) | 487.7 | 67.3 |
+| `rt_spin_us=0` | 58.0 (49.3) | 474.2 ± 21.5 | 70.1 (1) |
+| spin only while the vCPU has nothing else to run (a patch, not kept) | 57.7 (49.2) | 481.2 (1) | -- |
+| `--queue-poll-us 0` | 56.6 (46.1) | 474.4 | 69.7 |
+| the host's slice (`NVGPU_SLICE_US=0`) | 54.5 (34.7) | 488.2 | 67.3 |
+| `async_fence_watch=0` | 56.0 (40.0) | 484.8 | 69.1 |
+| `nopvspin` | 57.5 (50.0) | -- | -- |
+| vCPUs pinned to 8-11 | 57.0 (45.4) | 484.2 (1) | 69.1 (1) |
+| guest haltpoll | 58.1 (46.3) | 441.5 | 70.7 |
+| guest THP `always` | 63.7 (53.5) | 482.9 | 66.1 |
+| ntsync kept | -- | 552.2 | 69.1 |
+
+None of the pacing measures costs throughput beyond the runs' spread; the
+slice and the queue poll gain a little in the job system and Heaven, and
+the slice's absence costs the job system's lows. Huge pages help the job
+system's heap and not the Wine games, which spend their time elsewhere;
+ntsync is Heaven's largest single gain (+13%). The spin was the likeliest thief of a busy vCPU's time, and turning it
+off changes nothing measurable: a caller spins only while its own reply is
+on its way, a few microseconds a call, at a few hundred calls a frame. The
+patch that stops a spin as soon as another task is queued on the vCPU
+(including the lazy reschedule flag `need_resched()` does not read) is
+correct but bought nothing here, and is not kept.
+
+**5. crosvm** loses 10-16% more on these, as on the others (above, "Heavy
+workloads"): its per-vCPU core scheduling, and a futex hand-off of 11 µs
+against nesbox's 7.6.
+
+**6. Without compute, a game that enables what it is offered does not
+start.** Without `--allow-compute` there is no `/dev/nvidia-uvm` in the
+guest, and NVIDIA's driver there -- natively too, without the UVM device --
+lists every extension it lists with it (276), reports their features, and
+fails `vkCreateDevice` (`VK_ERROR_INITIALIZATION_FAILED`) with any of
+`VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
+`VK_KHR_ray_tracing_pipeline`, `VK_NVX_binary_import` (DLSS),
+`VK_NV_cuda_kernel_launch` or `VK_NV_optical_flow` (Frame Generation);
+`VK_NVX_image_view_handle` and `VK_NV_low_latency2` work. Godot's Vulkan
+renderer then dies with SIGILL; Godot's D3D12 through vkd3d-proton ran at
+36.7-40.0 fps where it runs at 68.7 with compute (5 runs), or hung (2).
+DXVK's D3D11 (Heaven) was unaffected. `VK_LAYER_NVGPU_no_uvm`
+([`nvgpu-vk-layer/`](nvgpu-vk-layer/); DEPLOY.md, "The guest") hides those
+extensions and their features without compute:
+
+| without compute | without the layer | with it |
+|---|---|---|
+| extensions listed | 276 | 260 |
+| `vkCreateDevice` with ray queries | -3 (initialization failed) | -7 (extension not present) |
+| Godot, Vulkan | SIGILL | 108.5 fps (104.9 with compute) |
+| Godot, D3D12 (vkd3d-proton) | 38.5 ± 0.2 fps, or hung | 69.8 ± 1.0 fps (2 runs) |
+
+NVIDIA's 32-bit Vulkan driver lists none of these extensions; the layer's
+32-bit build loads in 32-bit processes (`vulkaninfo-32`) and changes nothing
+there.
+
+With compute, ray tracing works in a guest: `nvgpu-rtprobe` (ray queries
+into 64 instances of 200,000 triangles, a ray a pixel of 1920x1080,
+submitted and waited for a frame) casts 7,331-7,579 Mrays/s against 8,807
+natively, the difference being the frame's submit-and-wait round trip
+(0.28 ms against 0.23), not the rays.
+
+### Choices for the deployment, measured
+
+None of these is changed here: each trades something the project does not
+decide for the user.
+
+| choice | gain measured | what it costs |
+|---|---|---|
+| more vCPUs (8-16 for a modern engine) | gameloop 58 -> 99 (8) -> 158 (16) fps | host CPUs the VM can occupy; nothing isolation-wise |
+| `--allow-compute` for games | RT, DLSS and Frame Generation usable; without it, the layer | the UVM surface (SECURITY.md, "Compute is opt-in") |
+| guest haltpoll (`cpuidle_haltpoll.force=1` on the guest's command line) | futex hand-off 7.6 -> 0.95 µs; exits -47% in Heaven | Heaven -9% (a polling vCPU is not running a game thread); host CPU while the guest idles |
+| the host's SRSO mitigation (`spec_rstack_overflow=`; "IBPB on VMEXIT only" here) | not measured: an IBPB is in every one of the 15,000-55,000 exits a second above | the guest-to-host return-stack mitigation on this CPU |
+| a lower C-state limit on the host (`/dev/cpu_dma_latency`, or C3 disabled: 350 µs exit latency here) | not measured (the sandbox has neither) | power, heat |
+| crosvm `--core-scheduling=false` | 10-16% here, 16-50% above | the SMT side-channel mitigation between a vCPU and host tasks |
+| pinning vCPUs | none measured (7.9 µs hand-off, 57.0 fps) | worse under a host load unless the CPUs are set aside (DEPLOY.md, "Frame pacing") |
+
+### What changed
+
+- **The guest kernel** (`scripts/build-guest-kernel.sh`,
+  `driver/guest-kernel.defconfig`): transparent huge pages, `always`;
+  ntsync; paravirtual spinlocks. All guest-internal.
+- **`VK_LAYER_NVGPU_no_uvm`**, above, in the guest image and in DEPLOY.md,
+  "The guest".
+- **The harness**: the workloads above, KVM's counters without perf
+  (nesbox `virtio-nvgpu-v7` holds each vCPU's statistics descriptor with
+  `NESBOX_HOLD_KVM_STATS=1`), `nvgpu-wakecost`, `nvgpu-rtprobe`.
+
+### What remains
+
+- **Wine without ntsync or fsync**, the server's round trips: a Proton
+  that finds `/dev/ntsync` (guest kernels built here now have it) or uses
+  fsync avoids them.
+- **Heaven's per-frame cost from 8 vCPUs up** (-15%): explicit sync's
+  round trips a present (above, "Heavy workloads", 2), with Wine's.
+- **Godot's D3D12 under Wine stops, now and then, in a freshly booted
+  guest**: 7 of about 35 such runs (with and without compute, with and
+  without the layer), none of 12 native, and none of 10 back to back in one
+  guest under `hang-watch.sh` (which dumps what a stopped program waits
+  on). Twice the killed process did not exit, which points below Wine. Not
+  diagnosed.
 
 ## Earlier: an RTX 3060, before protocol v2
 
