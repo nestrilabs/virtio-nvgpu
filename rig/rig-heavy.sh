@@ -64,6 +64,9 @@ echo "# $(date -Is) $WLD $MODE output=$OMODE vmm=${NVGPU_VMM_KIND:-nesbox} vcpus
 stat_ticks() { # utime + stime of processes, all their threads, in clock ticks
     local p t=0 x
     for p in "$@"; do
+        # No pid (a run whose backend never started): /proc//stat is
+        # /proc/stat, which is not a process's.
+        [ -n "$p" ] || continue
         x=$(awk '{ sub(/^.*\) /, ""); print $12 + $13 }' "/proc/$p/stat" 2>/dev/null) && t=$((t + x))
     done
     echo "$t"
