@@ -38,7 +38,13 @@ printf 'passwd: files\ngroup: files\nshadow: files\n' > "$R/etc/nsswitch.conf"
 # root's (/nix is real root's, uid 65534 here).
 mkdir -p "$R/usr/bin" "$R/usr/sbin"
 ln -s /run/current-system/sw/bin/env "$R/usr/bin/env"
-cp "$(command -v systemd-socket-activate)" "$R/usr/bin/systemd-socket-activate"
+# systemd-socket-activate, behind a wrapper that logs the umask it binds the
+# socket with.
+mkdir -p "$R/usr/lib"
+cp "$(command -v systemd-socket-activate)" "$R/usr/lib/systemd-socket-activate"
+printf '#!/bin/sh\necho "socket-activate umask $(umask)" >> /rig/logs/umask.log\nexec /usr/lib/systemd-socket-activate "$@"\n' \
+    > "$R/usr/bin/systemd-socket-activate"
+chmod 0755 "$R/usr/bin/systemd-socket-activate"
 # pgrep: a slot's users "run nothing" (every user is uid 0 here, and this
 # shell would otherwise count).
 cat > "$R/stubs/pgrep" <<'EOF'

@@ -115,6 +115,12 @@ else
     echo "  ok: the run's directory stayed root's; only the socket and the disk copy went to the slot"
 fi
 
+echo "== new: a root run started with umask 000 writes nothing others can write"
+: > /rig/logs/umask.log
+(umask 000; LINES_SHOWN=2 run run-guest.new.sh umask0)
+sed 's/^/    /' /rig/logs/umask.log
+echo "  the VMM's config and the console log: $(stat -c %a /rig/logs/umask0.vm0.json /rig/logs/umask0.vm0.console.log | tr '\n' ' ')"
+
 echo "== new: VD-H3: a diagnostic backend flag as root, without NVGPU_DIAGNOSTIC=1"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 bash /rig/run-guest.new.sh probe h3a -- \
     --permissive-abi --keep-guest-coherency 2>&1 | sed 's/^/    | /' | head -3

@@ -320,6 +320,11 @@ root_owned() {
 # be pointed elsewhere once the check has passed.
 if [ "$(id -u)" = 0 ]; then PRIV=root; else PRIV=user; fi
 if [ $PRIV = root ]; then
+    # What root creates -- the VMM's config, the logs, the backend's socket
+    # until it is opened to the VMM alone -- is written by no one else,
+    # whatever umask root was started with: a config another user could
+    # rewrite before the VMM reads it names what the VMM opens.
+    umask "$(printf '%04o' $((8#$(umask) | 8#022)))"
     SELF=$(root_owned "$0" "the launcher")
 else
     SELF=$(realpath -e -- "$0")

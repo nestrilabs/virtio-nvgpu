@@ -249,6 +249,8 @@ launcher_dryrun_check() {
         "the launcher's guest.sh /rig/launcher/guest.sh: /rig/launcher/guest.sh is writable by others"
         "verdict.sh read from /rig/real/verdict.sh"
         "slot 0 is systemd's (vhost-user-nvgpu@0.socket listens); skipping it"
+        "socket-activate umask 0022"
+        "the VMM's config and the console log: 644 644"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
     )
