@@ -44,8 +44,18 @@ TimeoutStopSec=30
 # A VMM that must never beat the desktop to a CPU: a lower weight, or a
 # slice of its own (SECURITY.md, "Frame pacing").
 #CPUWeight=50
+# A VMM its guest has taken over can grow any file it can write -- the
+# disk above all -- with ftruncate or fallocate until the file system is
+# full. RLIMIT_FSIZE bounds that, but also every memfd crosvm sizes: set it
+# no lower than the largest of the disk, guest RAM and the window.
+#LimitFSIZE=
 PrivateNetwork=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
+# Syscall-level only: nothing that mounts over /proc, which a /proc mounted
+# again inside minijail's user namespaces would then be refused.
+LockPersonality=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
