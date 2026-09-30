@@ -458,7 +458,12 @@ static int nvgpu_kms_get_handle(struct nvgpu_kms_file *kf,
   if (kf->adopted)
     return -ENODEV;
 
-  mutex_lock(&kf->lock);
+  /* Killable: another thread's first KMS call holds it across the opening
+   * calls below, each up to the transport's timeout. (master_set and
+   * master_drop take it plainly: DRM gives them no way to fail, and
+   * master_drop runs as the file is released, a killed process's too.) */
+  if (mutex_lock_killable(&kf->lock))
+    return -EINTR;
   if (!kf->handle) {
     master = drm_is_current_master(file);
     ret = nvgpu_kms_open_card(kf, master, &h, &was);

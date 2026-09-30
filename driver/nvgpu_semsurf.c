@@ -196,7 +196,12 @@ static int nvgpu_fence_rehome(struct nvgpu_gem_object *ng,
   int ret, tries = 0;
 
 again:
-  mutex_lock(&nvgpu_rehome_lock);
+  /* Killable: its holder may be in the two host calls below, which each
+   * wait up to the transport's timeout. The cleanup (nvgpu_fence_gem_free()),
+   * which can run as a killed process exits, takes it plainly: it holds it
+   * only for the table. */
+  if (mutex_lock_killable(&nvgpu_rehome_lock))
+    return -EINTR;
   hash_for_each_possible(nvgpu_rehomes, r, node, (unsigned long)ng) {
     if (r->ng == ng && r->file == file) {
       *gem = r->gem;
