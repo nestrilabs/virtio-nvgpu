@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `efdrace`: the event pump's lost wakeup (device/src/pump.rs) and `nvgpu-syncobj-race`'s LATE/LOST diagnosis | the owners phase under nesbox, C and Rust modules, with and without a widened race window and host and guest load, before and after the fix; the compat probe six times | "Syncobj eventfds that never fired" |
 | 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
 | 2026-09-30 | branch `knob-dmabuf`: `--allow-dmabuf-export` | stage1, compat, render and secneg with the switch off and on, nesbox, Rust module | "dma-buf export through RM" |
 | 2026-09-30 | branch `knob-vram` (`--vram-limit`) on display-passthrough | the limit as nvidia-smi, Vulkan and CUDA see it, allocations past it, stage1, compat, render and five applications with a limit, compat without | "Video memory limit" |
@@ -1246,6 +1247,56 @@ the tree) in fresh guests, three boots each way: the first registration of
 without. Registering the same buffer again cost within about 2 ms of the
 first, so the pin's own faults were never the cost; the flag stays off by
 default (DEPLOY.md, "Backend flags").
+
+## Syncobj eventfds that never fired
+
+The compat probe's `nvgpu-syncobj-race` failed 2 of about 16 runs,
+2026-09-30, both while other agents loaded the host, with one line per
+owner thread: `FAIL owner N: eventfd on handle H point P never fired` --
+six or all eight owners at once, each once, and the phase about a second
+short of its usual rounds (80 and 88 thousand, against 97 to 121). A lost
+wakeup, not a slow one: the event pump (device/src/pump.rs) drained its
+wake eventfd *after* taking its instructions, so the kick of a Watch
+queued between the last instruction taken and the drain went with the
+drain, and the pump slept with the Watch in its channel. Every owner that
+had sent its SYNCOBJ_EVENTFD's WATCH in that moment then slept on an
+eventfd the host had signalled, until one of them gave up and made some
+other call. The pump now drains the kick first (`Pump::step`), and
+`an_instruction_queued_as_the_pump_takes_its_instructions_wakes_its_next_wait`
+fails without that.
+
+The tool now tells the two apart: an eventfd not fired within
+`NVGPU_RACE_PATIENCE_MS` (1000) is waited for up to `NVGPU_RACE_DIAG_S`
+(30) seconds, and the failure says LATE (and when) or LOST, with the
+host's view of the point then (SYNCOBJ_QUERY, a TIMELINE_WAIT poll), the
+event records the guest took meanwhile and the other owners' eventfds
+that fired. Each phase prints its signal-to-fire latency.
+`NVGPU_RACE_OWNERS_ONLY=1` runs the first phase alone, for many runs in
+one guest: the second phase leaves registrations on exported syncobjs
+whose points never come, which count against the VM's pool for good
+(SECURITY.md, "Fences"), and after four runs of it every SYNCOBJ_EVENTFD
+in the VM says -ENOMEM.
+
+Runs of the owners phase (5 s, 8 threads) under nesbox, 2026-09-30; host
+load from stress-ng under the rig lock, guest load four busy loops.
+"Window" is a diagnostic build (not in the tree) that sleeps in the pump
+between the instructions and the old drain, as a preempted pump thread
+does:
+
+| backend | load | runs | stalled |
+|---|---|---|---|
+| rig's (c273c5d) | none, guest, host (64 CPU hogs, 12 GiB vm, disk), backend pinned to one CPU with two hogs | 91 (C) | 0 |
+| rig's + 100 us window | none | 30 (10 C, 20 Rust) | 2: every owner LOST for the full 5 s wait, the point signalled on the host, 0 event records to the guest |
+| rig's + 2 ms window | none | 3 (C) | 3, in the first two rounds |
+| fixed + 100 us window | none | 20 (Rust) | 0 |
+| fixed + 2 ms window | none | 5 (C) | 0 |
+| fixed | host and guest, pinned | 60 (40 C, 20 Rust), and the whole compat probe 6 times (3 C, 3 Rust, 32 CPU hogs) | 0 |
+
+Signal to eventfd, per 5 s phase: idle, p99 under 512 us and at most
+5 ms; four busy guest CPUs, p99 under 4 ms, at most 7 ms; the backend
+sharing one host CPU with two hogs, at most 15 ms; the host at a load of
+140 (64 hogs, memory, disk) with the guest busy, p99 under 16 to 65 ms,
+p99.9 under 262 ms, at most 240 ms. The one-second patience stands.
 
 ## What to keep from every run
 

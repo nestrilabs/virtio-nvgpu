@@ -30,6 +30,17 @@
  * With the module's pacing counters readable (root), the posted DESTROYs
  * the host refused ("posted_failed") must not have grown.
  *
+ * Every owner's eventfd must fire within the patience (NVGPU_RACE_PATIENCE_MS,
+ * default 1000). One that has not is waited for on, up to NVGPU_RACE_DIAG_S
+ * (default 30) seconds in all, and the failure says which it was: LATE
+ * (fired, and when) or LOST (never), with the syncobj's point as the host
+ * had it when the patience ran out (SYNCOBJ_QUERY, and a TIMELINE_WAIT poll)
+ * -- signalled there and not delivered, or never signalled -- and the event
+ * records the guest took meanwhile (the module's ev_records), and how many
+ * other owners' eventfds fired while it waited: a stall of the whole event
+ * path, or one wakeup lost. Each phase prints the distribution of the time
+ * from TIMELINE_SIGNAL to the eventfd firing.
+ *
  * Exit status: 0 if every check held, 1 otherwise. Raw ioctls, no libdrm.
  */
 #define _GNU_SOURCE
@@ -64,6 +75,12 @@ struct syncobj_timeline_array {
   uint64_t handles, points;
   uint32_t count_handles, flags;
 };
+struct syncobj_timeline_wait {
+  uint64_t handles, points;
+  int64_t timeout_nsec;
+  uint32_t count_handles, flags, first_signaled, pad;
+  uint64_t deadline_nsec;
+};
 struct syncobj_eventfd {
   uint32_t handle, flags;
   uint64_t point;
@@ -74,12 +91,14 @@ struct syncobj_eventfd {
 _Static_assert(sizeof(struct syncobj_handle) == 24, "syncobj_handle");
 _Static_assert(sizeof(struct syncobj_timeline_array) == 24, "timeline_array");
 _Static_assert(sizeof(struct syncobj_eventfd) == 24, "syncobj_eventfd");
+_Static_assert(sizeof(struct syncobj_timeline_wait) == 48, "timeline_wait");
 
 #define D(nr, type) _IOC(_IOC_READ | _IOC_WRITE, 'd', nr, sizeof(type))
 #define IOC_CREATE D(0xbf, struct syncobj_create)
 #define IOC_DESTROY D(0xc0, struct syncobj_destroy)
 #define IOC_H2FD D(0xc1, struct syncobj_handle)
 #define IOC_FD2H D(0xc2, struct syncobj_handle)
+#define IOC_TLWAIT D(0xca, struct syncobj_timeline_wait)
 #define IOC_QUERY D(0xcb, struct syncobj_timeline_array)
 #define IOC_TLSIGNAL D(0xcd, struct syncobj_timeline_array)
 #define IOC_EVENTFD D(0xcf, struct syncobj_eventfd)
@@ -151,18 +170,145 @@ static int tl(unsigned long cmd, uint32_t h, uint64_t *point) {
   return io(cmd, &a);
 }
 
-/* The eventfd subscribed to (h, point) fires within a second. */
-static int eventfd_fires(int efd) {
+static uint64_t now_ns(void) {
+  struct timespec t;
+
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+}
+
+/* How long an eventfd may take (NVGPU_RACE_PATIENCE_MS), and how long one
+ * that took longer is waited for to tell late from lost (NVGPU_RACE_DIAG_S). */
+static int patience_ms = 1000;
+static int diag_s = 30;
+
+/* Signal-to-fire times of the eventfds of a phase, in powers of two of a
+ * microsecond (bucket b: under 2^(b+1) us), and the slowest. */
+#define LAT_BUCKETS 32
+static atomic_long lat[LAT_BUCKETS];
+static _Atomic uint64_t lat_max_ns;
+/* Eventfds fired, all owners: what the others did while one waited. */
+static atomic_long fires;
+
+static void lat_record(uint64_t ns) {
+  uint64_t us = ns / 1000;
+  unsigned int b = 0;
+  uint64_t m = atomic_load(&lat_max_ns);
+
+  while (us > 1 && b < LAT_BUCKETS - 1) {
+    us >>= 1;
+    b++;
+  }
+  atomic_fetch_add(&lat[b], 1);
+  while (ns > m && !atomic_compare_exchange_weak(&lat_max_ns, &m, ns))
+    ;
+}
+
+/* The upper bound, in us, of the bucket holding quantile q of n. */
+static unsigned long long lat_quantile(long n, double q) {
+  long want = (long)(q * (double)n), sum = 0;
+
+  for (int b = 0; b < LAT_BUCKETS; b++) {
+    sum += atomic_load(&lat[b]);
+    if (sum > want)
+      return 2ull << b;
+  }
+  return 2ull << (LAT_BUCKETS - 1);
+}
+
+static void lat_report(const char *name) {
+  long n = 0, over = 0;
+
+  for (int b = 0; b < LAT_BUCKETS; b++) {
+    n += atomic_load(&lat[b]);
+    if (b >= 10) /* 1 ms and up */
+      over += atomic_load(&lat[b]);
+  }
+  if (!n)
+    return;
+  printf("INFO %s: eventfd signal->fire, %ld fired: p50<=%lluus p99<=%lluus "
+         "p99.9<=%lluus p99.99<=%lluus max=%.1fms, %ld over 1ms; log2 us:",
+         name, n, lat_quantile(n, 0.5), lat_quantile(n, 0.99),
+         lat_quantile(n, 0.999), lat_quantile(n, 0.9999),
+         (double)atomic_load(&lat_max_ns) / 1e6, over);
+  for (int b = 0; b < LAT_BUCKETS; b++)
+    if (atomic_load(&lat[b]))
+      printf(" [%d]=%ld", b, atomic_load(&lat[b]));
+  putchar('\n');
+  fflush(stdout);
+}
+
+static long pacing_ctr(const char *key);
+
+/* Poll `efd` until `deadline` (CLOCK_MONOTONIC ns): 1 readable, 0 not. */
+static int poll_until(int efd, uint64_t deadline) {
   struct pollfd p = {.fd = efd, .events = POLLIN};
-  uint64_t v;
   int r;
 
-  do
-    r = poll(&p, 1, 1000);
-  while (r < 0 && errno == EINTR);
-  if (r != 1)
-    return 0;
-  return read(efd, &v, sizeof(v)) == sizeof(v) && v >= 1;
+  for (;;) {
+    uint64_t t = now_ns();
+    int ms;
+
+    if (t >= deadline)
+      return 0;
+    ms = (int)((deadline - t + 999999) / 1000000);
+    r = poll(&p, 1, ms);
+    if (r == 1)
+      return 1;
+    if (r < 0 && errno != EINTR)
+      return 0;
+  }
+}
+
+/*
+ * The eventfd subscribed to (h, point) fires within the patience of `t0`,
+ * when the point was signalled. When it does not, it is waited for on, and
+ * the failure says what was found: late or lost, and the host's view of the
+ * point when the patience ran out. 0 for a failure not yet reported.
+ */
+static int eventfd_fires(int efd, unsigned int id, uint32_t h, uint64_t point,
+                         uint64_t t0) {
+  uint64_t v, t1, got = 0;
+  struct syncobj_timeline_wait w = {0};
+  long rec0, fires0, rec1;
+  int q, tw, fired;
+
+  if (poll_until(efd, t0 + (uint64_t)patience_ms * 1000000u)) {
+    t1 = now_ns();
+    atomic_fetch_add(&fires, 1);
+    lat_record(t1 - t0);
+    return read(efd, &v, sizeof(v)) == sizeof(v) && v >= 1;
+  }
+
+  /* Late or lost. What the host has, now. */
+  rec0 = pacing_ctr("ev_records");
+  fires0 = atomic_load(&fires);
+  q = tl(IOC_QUERY, h, &got);
+  w.handles = (uintptr_t)&h;
+  w.points = (uintptr_t)&point;
+  w.count_handles = 1;
+  tw = io(IOC_TLWAIT, &w); /* timeout 0: a poll */
+  fired = poll_until(efd, t0 + (uint64_t)diag_s * 1000000000u);
+  t1 = now_ns();
+  rec1 = pacing_ctr("ev_records");
+  if (fired) {
+    atomic_fetch_add(&fires, 1);
+    lat_record(t1 - t0);
+  }
+  fail("owner %u: eventfd on handle %u point %#llx %s %.1f ms after the "
+       "signal; at %d ms the host's point was %#llx (query %d, timeline "
+       "wait %d: %s), and until %s the guest took %ld event record(s) and "
+       "%ld other eventfd(s) fired",
+       id, h, (unsigned long long)point,
+       fired ? "LATE: fired" : "LOST: not fired", (double)(t1 - t0) / 1e6,
+       patience_ms, (unsigned long long)got, q, tw,
+       tw == 0 ? "signalled" : tw == -ETIME ? "not signalled" : "error",
+       fired ? "it fired" : "it gave up",
+       rec0 >= 0 && rec1 >= 0 ? rec1 - rec0 : -1L,
+       atomic_load(&fires) - fires0);
+  if (fired)
+    (void)!read(efd, &v, sizeof(v));
+  return 1; /* failed already, and said how */
 }
 
 struct owner {
@@ -180,6 +326,7 @@ static void owner_round(struct owner *o, uint64_t seq) {
   const uint64_t base = ((uint64_t)o->id << 40) | (seq << 2);
   uint64_t pt = base + 1, got = 0;
   uint32_t h = 0, h2 = 0;
+  uint64_t t0;
   int efd = -1, r;
 
   r = create(&h);
@@ -226,13 +373,14 @@ static void owner_round(struct owner *o, uint64_t seq) {
       goto out;
     }
     pt = base + 2;
+    t0 = now_ns();
     r = tl(IOC_TLSIGNAL, h, &pt);
     if (r) {
       if (o->strict || (r != -EINVAL && r != -ENOENT))
         fail("owner %u: signal of its handle %u: %d", o->id, h, r);
       goto out;
     }
-    if (o->strict && !eventfd_fires(efd))
+    if (o->strict && !eventfd_fires(efd, o->id, h, pt, t0))
       fail("owner %u: eventfd on handle %u point %#llx never fired", o->id, h,
            (unsigned long long)pt);
   }
@@ -306,34 +454,27 @@ static void *guesser_main(void *arg) {
   return NULL;
 }
 
+/* A counter of the module's pacing report, or -1 without it (not root). */
+static long pacing_ctr(const char *key) {
+  FILE *f = fopen("/sys/module/virtio_gpu_nv/parameters/pacing", "r");
+  char line[256], name[64];
+  long v = -1, x;
+
+  if (!f)
+    return -1;
+  while (fgets(line, sizeof(line), f))
+    if (sscanf(line, "%63s %ld", name, &x) == 2 && !strcmp(name, key)) {
+      v = x;
+      break;
+    }
+  fclose(f);
+  return v;
+}
+
 /* The module's "posted_failed" counter, or -1 without the pacing report. */
-static long posted_failed(void) {
-  FILE *f = fopen("/sys/module/virtio_gpu_nv/parameters/pacing", "r");
-  char line[256];
-  long v = -1;
+static long posted_failed(void) { return pacing_ctr("posted_failed"); }
 
-  if (!f)
-    return -1;
-  while (fgets(line, sizeof(line), f))
-    if (sscanf(line, "posted_failed %ld", &v) == 1)
-      break;
-  fclose(f);
-  return v;
-}
-
-static long posted(void) {
-  FILE *f = fopen("/sys/module/virtio_gpu_nv/parameters/pacing", "r");
-  char line[256];
-  long v = -1;
-
-  if (!f)
-    return -1;
-  while (fgets(line, sizeof(line), f))
-    if (sscanf(line, "posted %ld", &v) == 1)
-      break;
-  fclose(f);
-  return v;
-}
+static long posted(void) { return pacing_ctr("posted"); }
 
 static void phase(const char *name, int secs, int nowners, int nguessers) {
   struct owner *o = calloc(nowners, sizeof(*o));
@@ -342,6 +483,9 @@ static void phase(const char *name, int secs, int nowners, int nguessers) {
   int i, live = 0;
 
   atomic_store(&stop, 0);
+  for (i = 0; i < LAT_BUCKETS; i++)
+    atomic_store(&lat[i], 0);
+  atomic_store(&lat_max_ns, 0);
   atomic_store(&created, 0);
   atomic_store(&destroyed, 0);
   atomic_store(&stolen, 0);
@@ -386,6 +530,7 @@ static void phase(const char *name, int secs, int nowners, int nguessers) {
          iters, atomic_load(&created), atomic_load(&stolen),
          p0 >= 0 ? posted() - p0 : -1L);
   fflush(stdout);
+  lat_report(name);
   free(o);
   free(g);
 }
@@ -396,6 +541,14 @@ int main(int argc, char **argv) {
   const char *node = argc > 3 ? argv[3] : "/dev/dri/renderD128";
 
   setvbuf(stdout, NULL, _IOLBF, 0);
+  if (getenv("NVGPU_RACE_PATIENCE_MS"))
+    patience_ms = atoi(getenv("NVGPU_RACE_PATIENCE_MS"));
+  if (getenv("NVGPU_RACE_DIAG_S"))
+    diag_s = atoi(getenv("NVGPU_RACE_DIAG_S"));
+  if (patience_ms < 1)
+    patience_ms = 1;
+  if ((long)diag_s * 1000 < patience_ms)
+    diag_s = (patience_ms + 999) / 1000;
   dfd = open(node, O_RDWR | O_CLOEXEC);
   if (dfd < 0) {
     printf("FAIL open %s: %s\n", node, strerror(errno));
@@ -419,7 +572,14 @@ int main(int argc, char **argv) {
     }
   }
   phase("owners", secs, threads, 0);
-  phase("owners+guessers", secs, threads, threads / 2 ? threads / 2 : 1);
+  /* NVGPU_RACE_OWNERS_ONLY=1: the first phase alone, for running it many
+   * times in one VM. The second leaves registrations on syncobjs that got
+   * out (exported) and whose points never come, counted against the VM's
+   * pool for good (SECURITY.md, "Fences"): a few runs of it fill the pool,
+   * and every later SYNCOBJ_EVENTFD in the VM says -ENOMEM. */
+  if (!getenv("NVGPU_RACE_OWNERS_ONLY") ||
+      strcmp(getenv("NVGPU_RACE_OWNERS_ONLY"), "1"))
+    phase("owners+guessers", secs, threads, threads / 2 ? threads / 2 : 1);
   printf("%s nvgpu-syncobj-race: %d failure(s)\n",
          atomic_load(&fails) ? "FAIL" : "PASS", atomic_load(&fails));
   return atomic_load(&fails) ? 1 : 0;
