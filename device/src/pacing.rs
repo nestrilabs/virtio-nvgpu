@@ -220,6 +220,9 @@ pub struct Counters {
     /// interrupt, that did not have to be sent).
     pub arms: AtomicU64,
     pub ev_unarmed: AtomicU64,
+    /// Times the pump's wait returned: what every host event on a watched
+    /// descriptor costs the backend's CPU.
+    pub pump_wakes: AtomicU64,
     /// IOCTL2s by schema name.
     ioctl2_names: Mutex<BTreeMap<&'static str, [u64; 2]>>,
     /// IOCTL2 time by schema name: calls, whole (request read to reply
@@ -255,6 +258,7 @@ impl Counters {
             queue_polled: AtomicU64::new(0),
             arms: AtomicU64::new(0),
             ev_unarmed: AtomicU64::new(0),
+            pump_wakes: AtomicU64::new(0),
             ioctl2_names: Mutex::new(BTreeMap::new()),
             ioctl2_time: Mutex::new(BTreeMap::new()),
         }
@@ -343,7 +347,11 @@ impl Counters {
             no_buffer: load(&self.no_buffer),
             sweeps: load(&self.sweeps),
             kicks: [load(&self.event_kicks), load(&self.queue_polled)],
-            armed: [load(&self.arms), load(&self.ev_unarmed)],
+            armed: [
+                load(&self.arms),
+                load(&self.ev_unarmed),
+                load(&self.pump_wakes),
+            ],
             ioctl2_names: self
                 .ioctl2_names
                 .lock()
@@ -387,8 +395,8 @@ pub struct Snap {
     pub sweeps: u64,
     /// event-queue kicks, chains found by polling the control ring
     pub kicks: [u64; 2],
-    /// arms, legacy events while unarmed (not sent)
-    pub armed: [u64; 2],
+    /// arms, legacy events seen while unarmed (not sent), the pump's wakes
+    pub armed: [u64; 3],
     pub ioctl2_names: BTreeMap<&'static str, [u64; 2]>,
     /// calls, whole, preparing, host ioctl (ns), by name
     pub ioctl2_time: BTreeMap<&'static str, [u64; 4]>,
@@ -516,9 +524,11 @@ pub fn summary(prev: Option<&Snap>, now: &Snap, start: Instant) -> Vec<String> {
         rate(d(now.kicks[1], prev.map(|p| p.kicks[1]))),
     ));
     out.push(format!(
-        "pacing: legacy readiness: arms {:.0}/s, events nobody waited on {:.0}/s (not sent)",
+        "pacing: legacy readiness: arms {:.0}/s, events nobody waited on {:.0}/s (not sent); \
+         pump woke {:.0}/s",
         rate(d(now.armed[0], prev.map(|p| p.armed[0]))),
         rate(d(now.armed[1], prev.map(|p| p.armed[1]))),
+        rate(d(now.armed[2], prev.map(|p| p.armed[2]))),
     ));
     out.push(format!("pacing: fence signalled -> queued: {}", fd.fmt()));
     out.push(format!("pacing: pump woke -> queued: {}", pd.fmt()));

@@ -40,6 +40,24 @@
 //!   1 ms level sweep as the safety net for a missed edge. One-shot watches
 //!   are `EPOLLONESHOT` and never swept: a sync_file stays readable forever
 //!   once signalled, and sweeping it would report it forever.
+//! - **A pump woken for nobody.** An RM descriptor whose readiness the guest
+//!   arms ([`WatchMode::LegacyArmed`]) is in no epoll set: a Vulkan game's
+//!   driver posts over a hundred thousand events a second on descriptors
+//!   nobody in the guest waits on, and each woke the pump. Such a descriptor
+//!   is polled by the pump's own wait while it is armed, and by nothing at
+//!   all while it is not ([`Pump::wait`]). It cannot be moved in and out of
+//!   epoll instead: RM's `poll` clears a dataless event as it reports it
+//!   (open-gpu-kernel-modules 595.99.02, kernel-open/nvidia/nv.c
+//!   `nvidia_poll()`), and epoll polls a descriptor twice when it is added or
+//!   modified with an event pending -- once at the insert, once to collect it
+//!   (Linux 7.2.7, fs/eventpoll.c `ep_insert()` and `ep_modify()`, then
+//!   `ep_send_events()`) -- so an event arriving as it was re-armed
+//!   would be taken by the first poll and found by nobody, and a guest
+//!   waiting on it would wait for good. `poll(2)` polls each descriptor once
+//!   a pass and returns what that pass found, so every event RM clears is
+//!   one the pump reports. A wait polls every armed descriptor, so at most
+//!   [`POLLED_MAX`] watches are kept this way; one watched past that is in
+//!   the epoll set from its start and for its life, as all were before.
 //! - **A sweep that costs by the handle.** The sweep polls only handles
 //!   that were reported readable and may still be: the guest consumes RM
 //!   events one ioctl at a time, and a descriptor left readable after one
@@ -87,6 +105,13 @@ const REC: usize = size_of::<EvRec>();
 /// How often level-readable descriptors are re-checked, as a net under a
 /// missed edge. Not the notification path.
 const SWEEP: Duration = Duration::from_millis(1);
+
+/// Most [`WatchMode::LegacyArmed`] watches kept out of epoll and polled by
+/// the pump's wait while armed. The wait polls every armed one each time it
+/// returns, so without a bound a guest arming thousands of descriptors would
+/// make every wake of its pump cost thousands of polls. A game holds a few
+/// dozen RM descriptors.
+pub const POLLED_MAX: usize = 256;
 
 /// What a watch reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,9 +545,13 @@ struct Watched {
     /// [`WatchMode::LegacyArmed`]: the guest waits on it, so the next event
     /// is reported.
     armed: bool,
-    /// [`WatchMode::LegacyArmed`]: an event came while it was not armed. Its
-    /// descriptor's own readiness cannot say so afterwards -- polling RM's
-    /// file takes its dataless-event flag -- so this does.
+    /// [`WatchMode::LegacyArmed`]: out of epoll, polled by the wait while
+    /// armed (at most [`POLLED_MAX`] watches); else in epoll for its life.
+    polled: bool,
+    /// [`WatchMode::LegacyArmed`]: an event was taken from the descriptor
+    /// while it was not armed -- only the look when the watch starts takes
+    /// one -- so the descriptor's own readiness cannot say so afterwards
+    /// (polling RM's file takes its dataless-event flag), and this does.
     dirty: bool,
 }
 
@@ -568,6 +597,14 @@ pub struct Pump<Q: EventQueue> {
     /// time, and posting no buffers, would grow the outbox by a record a
     /// watch with no bound.
     fired: HashMap<u32, u64>,
+    /// Armed [`WatchMode::LegacyArmed`] handles kept out of epoll: the
+    /// descriptors the pump's wait polls besides its epoll set.
+    waiting: Vec<u32>,
+    /// Watches kept out of epoll (`Watched::polled`), at most [`POLLED_MAX`].
+    polled: usize,
+    /// That wait's `poll` array, kept between rounds: the epoll descriptor,
+    /// then one for each of `waiting`, in its order.
+    pollfds: Vec<libc::pollfd>,
     last_sweep: Instant,
     buf: Vec<u8>,
 }
@@ -605,6 +642,9 @@ impl<Q: EventQueue> Pump<Q> {
             paused: HashSet::new(),
             stale: HashSet::new(),
             fired: HashMap::new(),
+            waiting: Vec::new(),
+            polled: 0,
+            pollfds: Vec::new(),
             last_sweep: Instant::now(),
             buf: vec![0u8; DRM_READ_MAX],
         };
@@ -622,6 +662,10 @@ impl<Q: EventQueue> Pump<Q> {
     }
 
     fn arm(&self, handle: u32, w: &Watched) -> bool {
+        if w.polled {
+            // Never in epoll: the wait polls it while armed (Pump::wait).
+            return true;
+        }
         let events = if w.mode.oneshot() {
             libc::EPOLLIN | libc::EPOLLONESHOT
         } else {
@@ -649,7 +693,12 @@ impl<Q: EventQueue> Pump<Q> {
         let w = self.watches.remove(&handle)?;
         self.paused.remove(&handle);
         self.stale.remove(&handle);
-        self.ctl(libc::EPOLL_CTL_DEL, w.fd.as_raw_fd(), 0, 0);
+        self.waiting.retain(|&h| h != handle);
+        if w.polled {
+            self.polled -= 1;
+        } else {
+            self.ctl(libc::EPOLL_CTL_DEL, w.fd.as_raw_fd(), 0, 0);
+        }
         let mode = w.mode;
         crate::closer::close(w.fd);
         Some(mode)
@@ -673,19 +722,21 @@ impl<Q: EventQueue> Pump<Q> {
 
     fn step_with_timeout(&mut self, timeout_ms: i32) -> bool {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
-        let n = match crate::sys::fd::epoll_wait(self.epfd.as_raw_fd(), &mut events, timeout_ms) {
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => 0,
-            Err(e) => {
-                log::error!("event pump: epoll_wait: {e}");
-                return false;
-            }
+        let Some((n, armed_ready)) = self.wait(&mut events, timeout_ms) else {
+            return false;
         };
+        PACING.pump_wakes.fetch_add(1, Relaxed);
 
         // Instructions first: a descriptor closed on the queue thread must
         // leave the set before it can be reported again.
         if !self.apply_commands() {
             return false;
+        }
+        // What the wait took from armed descriptors: each is reported (or,
+        // if an instruction just now disarmed it, remembered), never dropped.
+        for h in armed_ready {
+            PACING.ev_edge.fetch_add(1, Relaxed);
+            self.on_ready(h);
         }
 
         let woke = Instant::now();
@@ -712,6 +763,75 @@ impl<Q: EventQueue> Pump<Q> {
         true
     }
 
+    /// Wait for the epoll set, and for every armed
+    /// [`WatchMode::LegacyArmed`] descriptor, up to `timeout_ms`: the epoll
+    /// events into `events` and their count, and the armed handles the wait
+    /// found ready -- each an event RM's `poll` has now cleared, which the
+    /// caller must report. `None` once the pump cannot wait at all.
+    ///
+    /// With nothing armed this is `epoll_wait`, as it always was. With
+    /// something armed it is one `poll(2)` over the epoll descriptor and the
+    /// armed ones, which polls each once a pass and returns what that pass
+    /// found (then a non-blocking `epoll_wait` if the set had events).
+    /// Unarmed, a descriptor is in neither, and its events wake nobody; RM
+    /// keeps them, and the next arm's own look finds them (`arm_legacy`).
+    fn wait(
+        &mut self,
+        events: &mut [libc::epoll_event],
+        timeout_ms: i32,
+    ) -> Option<(usize, Vec<u32>)> {
+        let epoll_wait = |events: &mut [libc::epoll_event], epfd: RawFd, t: i32| {
+            match crate::sys::fd::epoll_wait(epfd, events, t) {
+                Ok(n) => Some(n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => Some(0),
+                Err(e) => {
+                    log::error!("event pump: epoll_wait: {e}");
+                    None
+                }
+            }
+        };
+        let epfd = self.epfd.as_raw_fd();
+        if self.waiting.is_empty() {
+            return Some((epoll_wait(events, epfd, timeout_ms)?, Vec::new()));
+        }
+        let pollfd = |fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLPRI,
+            revents: 0,
+        };
+        self.pollfds.clear();
+        self.pollfds.push(pollfd(epfd));
+        for h in &self.waiting {
+            // Every handle in `waiting` is watched (an unwatch takes it out),
+            // so this is the pump's own descriptor, open; -1 is skipped.
+            let fd = self.watches.get(h).map_or(-1, |w| w.fd.as_raw_fd());
+            self.pollfds.push(pollfd(fd));
+        }
+        match crate::sys::fd::poll(&mut self.pollfds, timeout_ms) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Some((0, Vec::new())),
+            Err(e) => {
+                log::error!("event pump: poll: {e}");
+                return None;
+            }
+        }
+        let n = if self.pollfds[0].revents != 0 {
+            epoll_wait(events, epfd, 0)?
+        } else {
+            0
+        };
+        // Anything but nothing: a readable descriptor, and a hung-up or
+        // failed one too, which the guest must hear of to find out.
+        let ready = self
+            .waiting
+            .iter()
+            .zip(&self.pollfds[1..])
+            .filter(|(_, p)| p.fd >= 0 && p.revents != 0)
+            .map(|(&h, _)| h)
+            .collect();
+        Some((n, ready))
+    }
+
     fn apply_commands(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
@@ -726,13 +846,19 @@ impl<Q: EventQueue> Pump<Q> {
                     {
                         self.outbox.forget_cookie(c);
                     }
+                    // Decided once, as the watch starts: a descriptor is
+                    // put in epoll only now, before the guest can have
+                    // waited on it, never later (see the module's notes).
+                    let polled = mode == WatchMode::LegacyArmed && self.polled < POLLED_MAX;
                     let w = Watched {
                         fd: PrivateFd::new(fd),
                         mode,
                         armed: false,
+                        polled,
                         dirty: false,
                     };
                     if self.arm(handle, &w) {
+                        self.polled += usize::from(polled);
                         self.watches.insert(handle, w);
                         // An edge that fired before the watch existed is not
                         // coming back; look now.
@@ -787,12 +913,17 @@ impl<Q: EventQueue> Pump<Q> {
             return;
         }
         PACING.arms.fetch_add(1, Relaxed);
+        // The look that decides: one poll, which reports what it clears.
         if w.dirty || readable(w.fd.as_raw_fd()) {
             w.dirty = false;
             w.armed = false;
+            self.waiting.retain(|&h| h != handle);
             self.outbox.ready_legacy(handle);
-        } else {
+        } else if !w.armed {
             w.armed = true;
+            if w.polled {
+                self.waiting.push(handle);
+            }
         }
     }
 
@@ -801,11 +932,12 @@ impl<Q: EventQueue> Pump<Q> {
             return;
         };
         if w.mode == WatchMode::LegacyArmed {
-            // Once per arm. Not swept: an event while unarmed is
+            // Once per arm. Not swept: an event taken while unarmed is
             // remembered instead, and the arm looks at the descriptor too.
             if w.armed {
                 w.armed = false;
                 w.dirty = false;
+                self.waiting.retain(|&h| h != handle);
                 self.outbox.ready_legacy(handle);
             } else {
                 w.dirty = true;
@@ -1207,11 +1339,12 @@ mod tests {
     }
 
     /// Armed readiness (BCAP_ARMED_READY): an RM descriptor's events go
-    /// out once per arm. Nobody waiting, nothing is sent however many come;
-    /// the arm then reports at once what came meanwhile, and after a report
-    /// the next event waits for the next arm.
+    /// out once per arm. Nobody waiting, nothing is sent however many come,
+    /// and nothing looks at the descriptor, so the events stay in it; the
+    /// arm then reports at once what came meanwhile, and after a report the
+    /// next event waits for the next arm.
     #[test]
-    fn armed_readiness_reports_once_per_arm_and_remembers_what_came_unarmed() {
+    fn armed_readiness_reports_once_per_arm_and_leaves_unarmed_events_in_the_file() {
         let q = FakeQueue::default();
         let (mut pump, h) = Pump::new(q.clone()).unwrap();
         h.send(PumpCmd::SetV2(true));
@@ -1223,36 +1356,111 @@ mod tests {
         });
         q.post(16, EVENT_BUF_SIZE);
         pump.step_with_timeout(0);
-        // Nobody waits: a burst of events sends nothing, and is no sweep's.
+        // Nobody waits: a burst of events sends nothing, wakes nothing, and
+        // is no sweep's.
         for _ in 0..5 {
             write_all(&w, b"x");
-            pump.step_with_timeout(0);
         }
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let woke = pump.wait(&mut events, 0).map(|(n, ready)| (n, ready.len()));
+        assert_eq!(
+            woke,
+            Some((0, 0)),
+            "the descriptor is in nothing the pump waits on"
+        );
+        pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 0);
-        assert!(pump.stale.is_empty());
-        // Even drained on the host (RM's poll takes its dataless flag), the
-        // arm reports what came unarmed.
-        drain(&r);
+        assert!(pump.stale.is_empty() && pump.waiting.is_empty());
+        // The arm reports what came unarmed: it is still in the file.
         h.send(PumpCmd::Arm { handle: 12 });
         pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 1);
         // Reported: disarmed until the next arm.
+        drain(&r);
         write_all(&w, b"x");
         pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 0);
-        drain(&r);
         h.send(PumpCmd::Arm { handle: 12 });
         pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 1, "the event after the report");
-        // Armed with nothing new: the next event is reported, once.
+        // Armed with nothing new: the wait polls it, and the next event is
+        // reported, once.
+        drain(&r);
         h.send(PumpCmd::Arm { handle: 12 });
         pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 0);
+        assert_eq!(pump.waiting, vec![12]);
         write_all(&w, b"x");
         pump.step_with_timeout(0);
         write_all(&w, b"x");
         pump.step_with_timeout(0);
         assert_eq!(legacy_reports(&q, 12), 1);
+        assert!(pump.waiting.is_empty());
+    }
+
+    /// Past POLLED_MAX, an armed-readiness watch is in epoll from its start,
+    /// as every one was before: an event wakes the pump and is remembered
+    /// while nobody waits, and the arm reports it.
+    #[test]
+    fn armed_watches_past_the_bound_stay_in_epoll() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        pump.polled = POLLED_MAX;
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 9,
+            fd: r.try_clone().unwrap(),
+            mode: WatchMode::LegacyArmed,
+        });
+        q.post(16, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        assert!(!pump.watches[&9].polled);
+        write_all(&w, b"x");
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 9), 0);
+        assert!(pump.watches[&9].dirty, "the edge was seen, and remembered");
+        drain(&r);
+        h.send(PumpCmd::Arm { handle: 9 });
+        pump.step_with_timeout(0);
+        assert_eq!(legacy_reports(&q, 9), 1);
+        assert!(pump.waiting.is_empty());
+        h.send(PumpCmd::Unwatch { handle: 9 });
+        pump.step_with_timeout(0);
+        assert_eq!(pump.polled, POLLED_MAX, "an epoll watch was never counted");
+    }
+
+    /// An armed descriptor that becomes readable while the pump sleeps wakes
+    /// it: the wait polls it besides the epoll set.
+    #[test]
+    fn an_armed_descriptor_wakes_a_sleeping_pump() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let (r, w) = pipe();
+        h.send(PumpCmd::Watch {
+            handle: 5,
+            fd: r.try_clone().unwrap(),
+            mode: WatchMode::LegacyArmed,
+        });
+        q.post(16, EVENT_BUF_SIZE);
+        h.send(PumpCmd::Arm { handle: 5 });
+        pump.step_with_timeout(0);
+        assert_eq!(pump.waiting, vec![5]);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            write_all(&w, b"x");
+            w
+        });
+        let t = Instant::now();
+        pump.step_with_timeout(5_000);
+        assert!(
+            t.elapsed() < Duration::from_secs(4),
+            "woken by the event, not the timeout"
+        );
+        assert_eq!(legacy_reports(&q, 5), 1);
+        drop(writer.join());
+        drop(r);
     }
 
     /// A plain legacy watch (an older guest, the modeset device, a Wayland
