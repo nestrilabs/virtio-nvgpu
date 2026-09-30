@@ -235,6 +235,11 @@ impl NvidiaBackend {
             _ => crate::guestptr::rm_escape(ireq.cmd, &param_in[..outer_len]),
         };
         let plan = plan?;
+        // What the allocation parameters say the class really is, and the
+        // checks only they can decide (guestptr.rs `rm_alloc_params`).
+        if escape == NV_ESC_RM_ALLOC {
+            crate::guestptr::rm_alloc_params(&param_in[..outer_len], &param_in[outer_len..])?;
+        }
 
         // Sharing, duplicating and naming RM objects of another client
         // (rmshare.rs): the calling guest process, and what the call may

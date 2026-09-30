@@ -308,6 +308,45 @@ fn an_event_block_too_short_for_its_descriptor_never_reaches_rm() {
     assert_eq!(alloc(&mut be, ctl, 0x05, &p).0, 0, "-1 passes");
 }
 
+/// An NV01_EVENT is allocated by RM as the subclass its parameters name,
+/// and one naming a kernel callback never reaches RM: the allowlist's
+/// INVALID_CLASS by default, EPERM with the list only logging.
+#[test]
+fn an_nv01_event_naming_a_kernel_callback_never_reaches_rm() {
+    let nv0005 = |sub: u32| {
+        let mut p = [0u8; 24];
+        p[8..12].copy_from_slice(&sub.to_le_bytes());
+        p[16..20].copy_from_slice(&(-1i32).to_le_bytes());
+        p
+    };
+    for mode in [crate::rmallow::Mode::Enforce, crate::rmallow::Mode::Log] {
+        let mut be = NvidiaBackend::for_test();
+        be.set_host_ioctl_for_test(fake_rm);
+        be.set_host_driver_version("610.57.04");
+        be.set_rm_allowlist(mode);
+        let ctl = be.adopt_for_test(devnull(), HandleKind::Dev(DeviceKind::Ctl));
+        let _ = seen();
+        for sub in [0x78u32, 0x7e] {
+            let (st, back) = alloc(&mut be, ctl, 0x05, &nv0005(sub));
+            match mode {
+                crate::rmallow::Mode::Enforce => {
+                    assert_eq!(st, 0, "{sub:#x}");
+                    assert_eq!(
+                        status_at(&back, 40),
+                        crate::nvos::NV_ERR_INVALID_CLASS,
+                        "{sub:#x}"
+                    );
+                }
+                crate::rmallow::Mode::Log => assert_eq!(st, -libc::EPERM, "{sub:#x}"),
+            }
+        }
+        assert!(seen().is_empty(), "{mode:?}");
+        let (st, _) = alloc(&mut be, ctl, 0x05, &nv0005(0x79));
+        assert_eq!(st, 0);
+        assert_eq!(seen(), [(0x05 | 1 << 31, 0)]);
+    }
+}
+
 #[test]
 fn an_fd_carrying_escape_forwards_minus_one_and_refuses_other_negatives() {
     let mut be = NvidiaBackend::for_test();

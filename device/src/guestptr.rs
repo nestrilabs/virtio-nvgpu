@@ -228,6 +228,44 @@ pub const REFUSED_ALLOC_CLASSES: [u32; 12] = [
 /// ALLOC_MEMORY classes whose `pMemory` RM reads rather than writes.
 const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 4] = [0x71, 0x81, 0x82, 0x83];
 
+/// NV01_EVENT, a class RM never allocates as itself.
+pub const NV01_EVENT: u32 = 0x05;
+/// NV0005_ALLOC_PARAMETERS.hClass: the class an NV01_EVENT becomes.
+const NV0005_H_CLASS: usize = 8;
+
+/// The class RM_ALLOC of `class` makes, with `nested` the allocation
+/// parameters the guest sent. RM allocates an NV01_EVENT as the subclass its
+/// NV0005_ALLOC_PARAMETERS name (open-gpu-kernel-modules 595.99.02,
+/// src/nvidia/src/kernel/rmapi/rmapi_specific.c rmapiFixupAllocParams(): the
+/// external class is overwritten with `hClass` from the parameters, and any
+/// EventApi class is taken), so the class gates judge that one: an
+/// NV01_EVENT naming NV01_EVENT_KERNEL_CALLBACK is a kernel callback. A block
+/// too short to hold the subclass is judged as `class`: RM then reads the
+/// subclass as 0 from the zeroed slack past our copy (sys/guarded.rs), or
+/// has no parameters at all, and refuses either.
+pub(crate) fn rm_alloc_class(class: u32, nested: &[u8]) -> u32 {
+    match class {
+        NV01_EVENT => le::u32_at(nested, NV0005_H_CLASS).unwrap_or(class),
+        _ => class,
+    }
+}
+
+/// The checks on RM_ALLOC's allocation parameters (`nested`, as the guest
+/// sent them) that the top-level block alone cannot make. `outer` is the
+/// NVOS64 block: an NV01_EVENT whose subclass is refused is refused as that
+/// class ([`rm_alloc_class`]).
+pub(crate) fn rm_alloc_params(outer: &[u8], nested: &[u8]) -> Result<(), Errno> {
+    let Some(class) = le::u32_at(outer, NVOS64_H_CLASS) else {
+        return Err(libc::EINVAL);
+    };
+    let made = rm_alloc_class(class, nested);
+    if made != class && REFUSED_ALLOC_CLASSES.contains(&made) {
+        log::warn!("RM_ALLOC of NV01_EVENT as class {made:#x} refused (guestptr.rs)");
+        return Err(libc::EPERM);
+    }
+    Ok(())
+}
+
 /// Check a v1 RM escape's top-level block, `params` (the guest's, as sent),
 /// and say which of its fields the host must not be handed as sent: the
 /// plan the host's copy is built by (`Plan::declare`). `cmd` is the full
@@ -719,6 +757,38 @@ mod tests {
         let mut p = vec![0u8; 48];
         put32(&mut p, NVOS64_H_CLASS, 0x3e);
         assert!(rm_escape(ALLOC, &p).is_ok(), "plain system memory");
+    }
+
+    /// RM allocates an NV01_EVENT as the subclass in its parameters: one
+    /// naming a kernel callback is refused as the callback classes are.
+    #[test]
+    fn an_nv01_event_naming_a_refused_subclass_is_refused_as_that_class() {
+        let mut outer = vec![0u8; 48];
+        put32(&mut outer, NVOS64_H_CLASS, NV01_EVENT);
+        let nv0005 = |sub: u32| {
+            let mut p = vec![0u8; 24];
+            put32(&mut p, 8, sub);
+            p
+        };
+        for sub in [0x78, 0x7e] {
+            assert_eq!(rm_alloc_class(NV01_EVENT, &nv0005(sub)), sub);
+            assert_eq!(
+                rm_alloc_params(&outer, &nv0005(sub)),
+                Err(libc::EPERM),
+                "subclass {sub:#x}"
+            );
+        }
+        for sub in [0x05, 0x79] {
+            assert_eq!(rm_alloc_params(&outer, &nv0005(sub)), Ok(()));
+        }
+        // Too short to name one: judged as NV01_EVENT, which RM refuses
+        // for the subclass 0 it then reads.
+        assert_eq!(rm_alloc_class(NV01_EVENT, &[0x78; 11]), NV01_EVENT);
+        assert_eq!(rm_alloc_params(&outer, &[0x78; 11]), Ok(()));
+        // Only NV01_EVENT is rewritten.
+        put32(&mut outer, NVOS64_H_CLASS, 0x79);
+        assert_eq!(rm_alloc_class(0x79, &nv0005(0x78)), 0x79);
+        assert_eq!(rm_alloc_params(&outer, &nv0005(0x78)), Ok(()));
     }
 
     /// ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 name a class too, and refuse the
