@@ -50,7 +50,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use crate::error::{DeviceError, Result};
@@ -119,6 +119,9 @@ pub struct HandleTable {
     /// Inserts made so far: the next entry's `serial`.
     inserts: u64,
     table: HashMap<u32, Entry>,
+    /// The descriptor numbers `table` holds, for [`HandleTable::owns_fd`],
+    /// which every descriptor the host hands back is asked about.
+    fds: HashSet<RawFd>,
     /// The table's slots, and each guest process's share of them: one for
     /// every handle, and one for every descriptor still closing.
     slots: Pool,
@@ -179,6 +182,7 @@ impl HandleTable {
             next: 1,
             inserts: 0,
             table: HashMap::new(),
+            fds: HashSet::new(),
             slots: Pool::new(limit as u64, Self::share_of(limit)),
             closing: Closing::new(),
         }
@@ -253,6 +257,7 @@ impl HandleTable {
                 continue;
             }
             self.inserts += 1;
+            self.fds.insert(fd.as_raw_fd());
             self.table.insert(
                 h,
                 Entry {
@@ -327,7 +332,7 @@ impl HandleTable {
     /// is only adopted when it is not: adopting one we already hold would put
     /// it under two handles, and the second close would close someone else's.
     pub fn owns_fd(&self, fd: RawFd) -> bool {
-        self.table.values().any(|e| e.fd.as_raw_fd() == fd)
+        self.fds.contains(&fd)
     }
 
     /// Close the host file behind `handle` without ending the handle: the
@@ -343,7 +348,10 @@ impl HandleTable {
             .ok_or(DeviceError::BadHandle(handle as u64))?;
         e.kind = HandleKind::Other;
         e.buried = true;
-        Ok(std::mem::replace(&mut e.fd, stub))
+        self.fds.insert(stub.as_raw_fd());
+        let old = std::mem::replace(&mut e.fd, stub);
+        self.fds.remove(&old.as_raw_fd());
+        Ok(old)
     }
 
     /// Whether `handle`'s host file was closed under it (`bury`): a call on
@@ -377,6 +385,7 @@ impl HandleTable {
             .table
             .remove(&handle)
             .ok_or(DeviceError::BadHandle(handle as u64))?;
+        self.fds.remove(&e.fd.as_raw_fd());
         // Its slot goes with the entry.
         Ok((e.fd, e.kind))
     }
@@ -396,6 +405,7 @@ impl HandleTable {
         if count > 0 {
             log::info!("HandleTable::drain_all: closing {count} host fds");
         }
+        self.fds.clear();
         for (handle, e) in self.table.drain() {
             log::debug!(
                 "  closing handle={handle} ({:?}) host_fd={}",
@@ -638,5 +648,26 @@ mod tests {
         t.insert(fd, CTL).unwrap();
         assert!(t.owns_fd(raw));
         assert!(!t.owns_fd(-1));
+    }
+
+    /// What the table holds, by number, follows every way an entry's
+    /// descriptor changes: a bury's swap, a remove, a drain.
+    #[test]
+    fn the_descriptors_owned_follow_bury_remove_and_drain() {
+        let mut t = HandleTable::new();
+        let (a, b) = (make_fd(), make_fd());
+        let (ra, rb) = (a.as_raw_fd(), b.as_raw_fd());
+        let ha = t.insert(a, CTL).unwrap();
+        let hb = t.insert(b, CTL).unwrap();
+        let stub = make_fd();
+        let rs = stub.as_raw_fd();
+        let old = t.bury(ha, stub).unwrap();
+        assert!(!t.owns_fd(ra) && t.owns_fd(rs) && t.owns_fd(rb));
+        drop(old);
+        let (fd, _) = t.remove(hb).unwrap();
+        assert!(!t.owns_fd(rb));
+        drop(fd);
+        t.drain_all();
+        assert!(!t.owns_fd(rs));
     }
 }
