@@ -24,6 +24,15 @@
 #                              to hand back early
 # contrib/systemd/nvgpu-vmm-exec applies them as it execs crosvm.
 #
+# Pinned vCPUs (DEPLOY.md, "vCPU placement"; rig/pin-layout.sh prints a
+# layout for this host) go in the same variable, e.g. one thread of each of
+# 8 cores of one L3 domain, the guest told one thread a core:
+#   --cpu-affinity 0=8:1=9:2=10:3=11:4=12:5=13:6=14:7=15 --no-smt
+# and crosvm's other threads and its device processes on CPUAffinity=
+# below. Two vCPUs on one core's two threads (the guest told so: crosvm's
+# own default for an even count) need --per-vm-core-scheduling, or crosvm's
+# cookie per vCPU keeps them from ever running at once.
+#
 # crosvm's sandbox stays on: every device it emulates, and the nvgpu
 # frontend, is a process of its own in a minijail with user, pid, mount and
 # network namespaces, pivoted into an empty directory (/var/empty). So this
@@ -61,6 +70,9 @@ TimeoutStopSec=30
 # A VMM that must never beat the desktop to a CPU: a lower weight, or a
 # slice of its own (SECURITY.md, "Frame pacing").
 #CPUWeight=50
+# crosvm's threads but the vCPUs (which --cpu-affinity places), and every
+# device process it forks, for a VM whose vCPUs are pinned: off their CPUs.
+#CPUAffinity=24-31
 # A VMM its guest has taken over can grow any file it can write -- the
 # disk above all -- with ftruncate or fallocate until the file system is
 # full. RLIMIT_FSIZE bounds that, but also every memfd crosvm sizes: set it

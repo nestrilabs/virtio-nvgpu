@@ -88,13 +88,25 @@ crosvm_config() {
         --serial "type=stdout,hardware=serial,num=1,earlycon"
         --vhost-user "type=nvgpu,socket=$SOCK,max-queue-size=256")
     [ "$CROSVM_NO_HP" = 0 ] || VMM_ARGS+=(--no-pci-hotplug-port)
-    if [ -n "$VCPU_PINS" ]; then
+    # Placement (launcher/placement.sh). crosvm places only its vCPUs; its
+    # other threads, and every device process it forks, are where it was
+    # started (crosvm_cmd), so vCPUs given no placement of their own are
+    # handed the launcher's own CPUs back rather than inherit the I/O set.
+    if [ ${#VCPU_SETS_J[@]} -gt 0 ]; then
         pins= i=0
-        for c in ${VCPU_PINS_J//,/ }; do pins+="${pins:+:}$i=$c"; i=$((i + 1)); done
+        for s in "${VCPU_SETS_J[@]}"; do pins+="${pins:+:}$i=${s// /}"; i=$((i + 1)); done
         VMM_ARGS+=(--cpu-affinity "$pins")
     elif [ -n "$CPU_AFFINITY" ]; then
         VMM_ARGS+=(--cpu-affinity "$CPU_AFFINITY")
+    elif [ -n "$IO_AFFINITY" ]; then
+        VMM_ARGS+=(--cpu-affinity "$(taskset -pc $$ | sed 's/.*: //')")
     fi
+    # The guest's topology: crosvm tells an even number of vCPUs they are
+    # pairs of SMT siblings (vCPUs 2k and 2k+1) unless told --no-smt.
+    case $GUEST_SMT in
+        1) VMM_ARGS+=(--no-smt) ;;
+        2) [ $((VCPUS % 2)) = 0 ] || die "NVGPU_GUEST_SMT=2 under crosvm: an even NVGPU_VCPUS" ;;
+    esac
     case $HUGEPAGES in
         transparent) VMM_ARGS+=(--hugepages) ;;
         2m | 1g) die "NVGPU_HUGEPAGES=$HUGEPAGES: crosvm takes only transparent (--hugepages)" ;;
@@ -153,4 +165,7 @@ crosvm_cmd() {
     else
         VMM_CMD=("$VMM" "${VMM_ARGS[@]}")
     fi
+    # Its threads but the vCPUs, and its device processes, on the I/O set
+    # (nesbox's io_affinity); each vCPU sets its own (--cpu-affinity).
+    [ -z "$IO_AFFINITY" ] || VMM_CMD=(taskset -c "$IO_AFFINITY" "${VMM_CMD[@]}")
 }

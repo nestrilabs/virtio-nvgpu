@@ -24,6 +24,11 @@
 # contrib/systemd/nvgpu-vmm-exec applies them as it execs the jailer, which
 # the jailed nesbox inherits both from. nesbox's own prefault is its
 # config's (machine-config "prefault", on by default).
+# Pinned vCPUs (DEPLOY.md, "vCPU placement"; rig/pin-layout.sh prints a
+# layout for this host) are its config's "machine-config" keys:
+# "vcpu_pins" (a CPU, or with patches/nesbox/0002 a list of CPUs, per
+# vCPU), "threads_per_core" (what the guest is told) and "io_affinity"
+# (nesbox's other threads).
 #
 # nesbox's jailer (nesbox tools/jailer, Linux 5.8 or later) starts as root:
 # it makes the jail's mount namespace with a /proc of its own

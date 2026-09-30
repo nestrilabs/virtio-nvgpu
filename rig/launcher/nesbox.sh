@@ -30,8 +30,29 @@ nesbox_config() {
     VMM_MARK=$CFG
     MACHINE_EXTRA=
     [ -z "$CPU_AFFINITY_J" ] || MACHINE_EXTRA+=", \"cpu_affinity\": [$CPU_AFFINITY_J]"
-    [ -z "$VCPU_PINS_J" ] || MACHINE_EXTRA+=", \"vcpu_pins\": [$VCPU_PINS_J]"
-    [ -z "$IO_AFFINITY_J" ] || MACHINE_EXTRA+=", \"io_affinity\": [$IO_AFFINITY_J]"
+    if [ -n "$VCPU_PINS_J" ]; then
+        MACHINE_EXTRA+=", \"vcpu_pins\": [$VCPU_PINS_J]"
+    elif [ ${#VCPU_SETS_J[@]} -gt 0 ]; then
+        # A list of CPUs per vCPU: nesbox with patches/nesbox/0002, whose
+        # refusal of an empty one names it.
+        grep -q "a vcpu_pins entry names no CPU" "$VMM" 2>/dev/null ||
+            die "NVGPU_VCPU_PINS with a list per vCPU: $VMM takes one CPU per vCPU;" \
+                "build nesbox with patches/nesbox/0002"
+        local s sets=
+        for s in "${VCPU_SETS_J[@]}"; do sets+="${sets:+, }[$s]"; done
+        MACHINE_EXTRA+=", \"vcpu_pins\": [$sets]"
+    fi
+    [ -z "$GUEST_SMT" ] || MACHINE_EXTRA+=", \"threads_per_core\": $GUEST_SMT"
+    local io=$IO_AFFINITY_J
+    if [ -z "$io" ] && { [ -n "$VCPU_PINS_J" ] || [ ${#VCPU_SETS_J[@]} -gt 0 ]; }; then
+        # Pins and no I/O set: nesbox then leaves a worker a vCPU thread
+        # starts (the GPU window's) on that vCPU's own CPU, where the two
+        # take turns. The CPUs this launcher may use are the I/O set
+        # instead: where those threads would have been anyway.
+        io=$(taskset -pc $$ | sed 's/.*: //')
+        io=$(cpu_list "the launcher's CPUs" "$io") || exit 1
+    fi
+    [ -z "$io" ] || MACHINE_EXTRA+=", \"io_affinity\": [$io]"
     [ -z "$HUGEPAGES" ] || MACHINE_EXTRA+=", \"hugepages\": \"$HUGEPAGES\""
     [ "$PREFAULT" != 0 ] || MACHINE_EXTRA+=", \"prefault\": false"
     cat > "$CFG" <<JSON

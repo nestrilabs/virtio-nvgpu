@@ -1,0 +1,245 @@
+From c08de17305e7eb0038d061731b33cbe49ab14ed5 Mon Sep 17 00:00:00 2001
+From: Jacob Root <jacob@otisroot.com>
+Date: Wed, 30 Sep 2026 16:04:58 +0000
+Subject: [PATCH] feat(vmm): a vcpu_pins entry may be a list of host CPUs
+
+A pin could only be one host CPU. That is the right shape for CPUs set
+aside for the guest, and the only one threads_per_core = 2 and dedicated
+can keep their promises with, but it leaves out a placement between a pin
+and the shared cpu_affinity set: each vCPU on a core of its own, free to
+run on either of that core's threads. Such a vCPU still has a core no
+other vCPU of the box is placed on, and when the host puts a task on one
+thread it can take the other rather than wait.
+
+An entry is now a CPU or a list of CPUs (serde untagged): `[8, [9, 25]]`.
+A config of plain numbers parses as before and writes back as numbers.
+A list must name at least one CPU; single CPUs still may not repeat, while
+lists may overlap, since they place rather than reserve. threads_per_core
+= 2 and dedicated now require one CPU in every entry, which is what they
+always relied on.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ README.md             |   3 +-
+ vmm/src/bin/nesbox.rs |   2 +-
+ vmm/src/config.rs     | 130 ++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 117 insertions(+), 18 deletions(-)
+
+diff --git a/README.md b/README.md
+index de84b4f..ce8769d 100644
+--- a/README.md
++++ b/README.md
+@@ -266,7 +266,8 @@ What is missing is as important:
+ - **No snapshots** and no live migration.
+ - **CPU placement is the caller's.** vCPU threads can be confined to a set of
+   host CPUs with `cpu_affinity`, which places them but does not cap them, or
+-  pinned one to a CPU with `vcpu_pins`, optionally as sibling pairs with
++  pinned each to a CPU, or to a list of CPUs such as one core's threads, with
++  `vcpu_pins`, optionally (one CPU each) as sibling pairs with
+   `threads_per_core: 2`. `io_affinity` keeps the VMM's own threads, and the
+   kernel's vhost workers, off the guest's CPUs. `dedicated` tells KVM and the
+   guest that the pinned CPUs are the guest's alone: halting and spin-waiting
+diff --git a/vmm/src/bin/nesbox.rs b/vmm/src/bin/nesbox.rs
+index 33c8aab..1bc958a 100644
+--- a/vmm/src/bin/nesbox.rs
++++ b/vmm/src/bin/nesbox.rs
+@@ -524,7 +524,7 @@ fn main() -> Result<()> {
+         virtio_devices::affinity::cpu_set(&config.machine_config.cpu_affinity).or(started_on);
+     let placements: Vec<Option<libc::cpu_set_t>> = (0..vm.vcpus.len())
+         .map(|i| match config.machine_config.vcpu_pins.get(i) {
+-            Some(&cpu) => virtio_devices::affinity::cpu_set(&[cpu]),
++            Some(pin) => virtio_devices::affinity::cpu_set(pin.cpus()),
+             None => shared,
+         })
+         .collect();
+diff --git a/vmm/src/config.rs b/vmm/src/config.rs
+index 0095499..7efb57a 100644
+--- a/vmm/src/config.rs
++++ b/vmm/src/config.rs
+@@ -313,15 +313,18 @@ pub struct MachineConfig {
+     /// this end only carries it out, the same way `vcpu_count` works.
+     #[serde(default)]
+     pub cpu_affinity: Vec<usize>,
+-    /// One host CPU per vCPU, in vCPU order. Empty means no pins, and the
+-    /// vCPUs share `cpu_affinity` instead.
++    /// Where each vCPU runs, in vCPU order: one host CPU (`8`), or a list of
++    /// them (`[8, 24]`, both threads of one core). Empty means no pins, and
++    /// the vCPUs share `cpu_affinity` instead.
+     ///
+     /// A pin is only better than a set when nothing else runs on the pinned
+     /// CPU: a pinned vCPU cannot escape to an idle core when a host task lands
+     /// on its own. So this is for CPUs the host has set aside for the guest, and
+-    /// is what `dedicated` requires.
++    /// a single CPU per vCPU is what `dedicated` and `threads_per_core: 2`
++    /// require. A list per vCPU gives each vCPU a core of its own and lets it
++    /// move between that core's threads.
+     #[serde(default)]
+-    pub vcpu_pins: Vec<usize>,
++    pub vcpu_pins: Vec<VcpuPin>,
+     /// SMT threads per guest core: 1 or 2. With 2, vCPUs `2k` and `2k+1` are
+     /// told they are siblings, and must be pinned to two threads of one host
+     /// core for that to be true.
+@@ -395,6 +398,35 @@ pub struct MachineConfig {
+     pub prefault: bool,
+ }
+ 
++/// One vCPU's pin: a host CPU, or a list of host CPUs.
++///
++/// Untagged, so a config written when a pin could only be a number still
++/// parses, and still serializes as a number.
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(untagged)]
++pub enum VcpuPin {
++    Cpu(usize),
++    Cpus(Vec<usize>),
++}
++
++impl VcpuPin {
++    /// The CPUs this pin names.
++    pub fn cpus(&self) -> &[usize] {
++        match self {
++            VcpuPin::Cpu(cpu) => std::slice::from_ref(cpu),
++            VcpuPin::Cpus(cpus) => cpus,
++        }
++    }
++
++    /// The one CPU, when the pin names exactly one.
++    pub fn single(&self) -> Option<usize> {
++        match self.cpus() {
++            [cpu] => Some(*cpu),
++            _ => None,
++        }
++    }
++}
++
+ /// The page size behind guest RAM.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+ pub enum HugePages {
+@@ -461,18 +493,27 @@ impl MachineConfig {
+     /// guest told it has siblings it does not have, a vCPU left unpinned in a
+     /// box that promised the guest it was dedicated.
+     pub fn validate(&self) -> anyhow::Result<()> {
++        let single = self.vcpu_pins.iter().all(|p| p.single().is_some());
+         if !self.vcpu_pins.is_empty() {
+             anyhow::ensure!(
+                 self.vcpu_pins.len() == usize::from(self.vcpu_count),
+-                "vcpu_pins names {} CPUs for {} vCPUs",
++                "vcpu_pins names {} pins for {} vCPUs",
+                 self.vcpu_pins.len(),
+                 self.vcpu_count
+             );
+-            let mut sorted = self.vcpu_pins.clone();
+-            sorted.sort_unstable();
+-            sorted.dedup();
+             anyhow::ensure!(
+-                sorted.len() == self.vcpu_pins.len(),
++                self.vcpu_pins.iter().all(|p| !p.cpus().is_empty()),
++                "a vcpu_pins entry names no CPU, which would leave that vCPU nowhere to run"
++            );
++            // Single CPUs may not repeat: two vCPUs would share one. Lists
++            // may overlap; a list shared by every vCPU is `cpu_affinity`.
++            let mut singles: Vec<usize> =
++                self.vcpu_pins.iter().filter_map(VcpuPin::single).collect();
++            let named = singles.len();
++            singles.sort_unstable();
++            singles.dedup();
++            anyhow::ensure!(
++                singles.len() == named,
+                 "vcpu_pins names one CPU twice, so two vCPUs would share it"
+             );
+         }
+@@ -482,14 +523,14 @@ impl MachineConfig {
+             self.threads_per_core
+         );
+         anyhow::ensure!(
+-            self.threads_per_core == 1 || !self.vcpu_pins.is_empty(),
+-            "threads_per_core = 2 needs vcpu_pins: without them nothing keeps two \
+-             vCPUs on one host core"
++            self.threads_per_core == 1 || (!self.vcpu_pins.is_empty() && single),
++            "threads_per_core = 2 needs one CPU in each of vcpu_pins: without that \
++             nothing keeps two vCPUs on one host core"
+         );
+         anyhow::ensure!(
+-            !self.dedicated || !self.vcpu_pins.is_empty(),
+-            "dedicated needs vcpu_pins: a CPU cannot be dedicated to a vCPU that is \
+-             not pinned to it"
++            !self.dedicated || (!self.vcpu_pins.is_empty() && single),
++            "dedicated needs one CPU in each of vcpu_pins: a CPU cannot be dedicated \
++             to a vCPU that is not pinned to it alone"
+         );
+         for (name, fd) in [
+             ("vcpu_cgroup_fd", self.vcpu_cgroup_fd),
+@@ -575,11 +616,68 @@ mod machine_config_tests {
+     fn pinned(pins: &[usize]) -> MachineConfig {
+         MachineConfig {
+             vcpu_count: pins.len() as u8,
+-            vcpu_pins: pins.to_vec(),
++            vcpu_pins: pins.iter().copied().map(VcpuPin::Cpu).collect(),
+             ..MachineConfig::default()
+         }
+     }
+ 
++    /// A pin is a CPU or a list of CPUs, and a config of plain numbers
++    /// still parses and writes back as numbers.
++    #[test]
++    fn a_pin_is_a_cpu_or_a_list() {
++        let json = r#"{ "vcpu_count": 3, "vcpu_pins": [8, [9, 25], [10]] }"#;
++        let mc: MachineConfig = serde_json::from_str(json).expect("parses");
++        assert_eq!(mc.vcpu_pins[0], VcpuPin::Cpu(8));
++        assert_eq!(mc.vcpu_pins[1].cpus(), &[9, 25]);
++        assert_eq!(mc.vcpu_pins[1].single(), None);
++        assert_eq!(mc.vcpu_pins[2].single(), Some(10));
++        mc.validate().expect("a list per vCPU is valid");
++        let old: MachineConfig =
++            serde_json::from_str(r#"{ "vcpu_count": 2, "vcpu_pins": [2, 3] }"#).unwrap();
++        let back = serde_json::to_string(&old.vcpu_pins).unwrap();
++        assert_eq!(back, "[2,3]");
++        assert!(serde_json::from_str::<MachineConfig>(r#"{ "vcpu_pins": ["8"] }"#).is_err());
++    }
++
++    #[test]
++    fn a_pin_list_must_name_a_cpu() {
++        let mc: MachineConfig =
++            serde_json::from_str(r#"{ "vcpu_count": 2, "vcpu_pins": [[8, 24], []] }"#).unwrap();
++        let e = mc.validate().unwrap_err().to_string();
++        assert!(e.contains("names no CPU"), "{e}");
++    }
++
++    /// Lists may overlap (they place, they do not reserve); single CPUs
++    /// still may not repeat.
++    #[test]
++    fn lists_may_overlap_but_single_cpus_may_not_repeat() {
++        let mc: MachineConfig =
++            serde_json::from_str(r#"{ "vcpu_count": 3, "vcpu_pins": [[8, 24], [8, 24], 9] }"#)
++                .unwrap();
++        mc.validate().expect("overlapping lists");
++        let mc: MachineConfig =
++            serde_json::from_str(r#"{ "vcpu_count": 3, "vcpu_pins": [[8, 24], 9, 9] }"#).unwrap();
++        assert!(mc.validate().is_err());
++    }
++
++    /// Siblings and dedication are promises about one CPU per vCPU.
++    #[test]
++    fn siblings_and_dedication_need_one_cpu_per_vcpu() {
++        let lists = || -> MachineConfig {
++            serde_json::from_str(r#"{ "vcpu_count": 2, "vcpu_pins": [[8, 24], [9, 25]] }"#).unwrap()
++        };
++        let smt = MachineConfig {
++            threads_per_core: 2,
++            ..lists()
++        };
++        assert!(smt.validate().is_err());
++        let dedicated = MachineConfig {
++            dedicated: true,
++            ..lists()
++        };
++        assert!(dedicated.validate().is_err());
++    }
++
+     #[test]
+     fn pins_must_cover_every_vcpu_exactly_once() {
+         let mut short = pinned(&[2, 3]);
+-- 
+2.55.0
+

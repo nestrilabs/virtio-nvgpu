@@ -90,6 +90,7 @@ let
       ];
       osdescPopulate = true;
       dmabufExport = true;
+      backendCpus = "0-7,16-23";
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -485,6 +486,14 @@ let
       ];
       says = "at least the largest of the disk";
     };
+    "backend CPUs with a space" = {
+      config = [ { services.virtio-nvgpu.vms."0".backendCpus = "8 9"; } ];
+      says = "digits, commas and ranges";
+    };
+    "backend CPUs as all" = {
+      config = [ { services.virtio-nvgpu.vms."0".backendCpus = "all"; } ];
+      says = "digits, commas and ranges";
+    };
   };
   # Values an option's type refuses, before any assertion: that option of
   # vms."0", read, must throw, and read with the value beside it (a good
@@ -541,6 +550,7 @@ let
     "Service:MemoryMax"
     "Service:TasksMax"
     "Service:CPUQuota"
+    "Service:CPUAffinity"
     "Service:ProtectHome=tmpfs"
     "Service:BindReadOnlyPaths"
     "env:NVGPU_BACKEND_ARGS"
@@ -641,5 +651,9 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     grep -q 'NVGPU_SLICE_US=100' "$vmm2Path"
     grep -q 'NVGPU_VMM_CONFIG=/etc/virtio-nvgpu/vm2.json' "$vmm2Path"
     ! grep -q 'LimitFSIZE\|cpu-latency\|NVGPU_PREFAULT' "$vmm2Path"
+    # Placement only where asked: slot 0's backend on its CPUs, slot 1's
+    # wherever the host puts it.
+    grep -q '^CPUAffinity=0-7,16-23$' "$dropinPath"
+    ! grep -q 'CPUAffinity' "$dropin1Path"
     touch $out
   ''
