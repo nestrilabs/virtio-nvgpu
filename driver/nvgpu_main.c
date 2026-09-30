@@ -1504,6 +1504,7 @@ err_ready:
   nvgpu_xfer_quiesce(dev);
 err_xfer:
   vdev->config->reset(vdev);
+  virtio_synchronize_cbs(vdev); /* as in remove() */
   nvgpu_xfer_reclaim(dev);
 err_vqs:
   vdev->config->del_vqs(vdev);
@@ -1530,6 +1531,13 @@ static void nvgpu_remove(struct virtio_device *vdev) {
 
   nvgpu_xfer_quiesce(dev);
   vdev->config->reset(vdev);
+  /*
+   * A reset stops new callbacks; one already running on another CPU goes
+   * on, and reclaim is about to take its queues apart and free the event
+   * buffers it reads. virtio-pci's reset waits for its vectors itself;
+   * virtio-mmio's only writes the status register.
+   */
+  virtio_synchronize_cbs(vdev);
   nvgpu_xfer_reclaim(dev);
   /* Nothing answers now, and the backend ends the session (freeing every
    * client) when it sees the reset: the pages RM held are the guest's. */
