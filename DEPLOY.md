@@ -482,7 +482,9 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   cannot escape a busy CPU. Pin only CPUs set aside for the guest -- an
   isolated cpuset partition (root; nesbox's `vcpu_cgroup_fd`,
   `io_cgroup_fd`), then `vcpu_pins` and `dedicated` -- which the confined-load
-  runs stand in for: there the guest paced as natively.
+  runs stand in for: there the guest paced as natively. The topology-aware
+  layouts, and what they gain and cost with the desktop's load on the
+  other CCD, are in "vCPU placement".
 - **Guest RAM prefaulted and on huge pages**: nesbox prefaults guest RAM
   and collapses it into THP by default (`ShmemPmdMapped` covered all 4 GiB
   in every run), and crosvm does with `--prefault-memory`
@@ -533,6 +535,99 @@ fence signal-to-queue latency the backend reports includes nvidia-drm's own
 timer-driven semaphore-surface signalling, the same natively. Not measured:
 vkmark, native gamescope (it cannot start inside the Claude sandbox), a
 120 or 165 Hz monitor, and games heavier than SuperTuxKart.
+
+## vCPU placement
+
+Off by default: the host scheduler places every vCPU, VMM and backend
+thread, and the guest is told its VMM's own topology (nesbox: every vCPU a
+core; crosvm: vCPUs 2k and 2k+1 SMT siblings, for an even count). Placement
+changes where threads run, never what they may do (SECURITY.md, "vCPU
+placement").
+
+**The pieces, at each layer.** `rig/pin-layout.sh <vcpus> <layout>` prints
+a layout for this host in each place's words.
+
+| what | launcher (`rig/run-guest.sh`) | crosvm | nesbox (`machine-config`) | units / NixOS module |
+|---|---|---|---|---|
+| a layout from the host's topology | `NVGPU_PIN=cores\|smt\|spread\|l3\|core-sets[:l3=CPU][:avoid=LIST][:io=WHERE]` | (what it prints) | (what it prints) | (what it prints) |
+| one host CPU, or a CPU list, per vCPU | `NVGPU_VCPU_PINS=8,9,..` or `8,24:9,25:..` | `--cpu-affinity 0=8:1=9:..` | `"vcpu_pins": [8, 9, ..]`, or `[[8, 24], ..]` with `patches/nesbox/0002` | `NVGPU_CROSVM_ARGS`; the nesbox config |
+| one set for every vCPU | `NVGPU_CPU_AFFINITY=8-15` | `--cpu-affinity 8-15` | `"cpu_affinity"` | the same |
+| the VMM's other threads | `NVGPU_IO_AFFINITY` | started under it (`taskset`; the unit's `CPUAffinity=`) | `"io_affinity"` | `nvgpu-vmm-crosvm@.service` `CPUAffinity=` |
+| the backend's threads | `NVGPU_BACKEND_CPUS` (default: the I/O set) | -- | -- | `vhost-user-nvgpu@.service` `CPUAffinity=`; `vms.<n>.backendCpus` |
+| threads per guest core | `NVGPU_GUEST_SMT=1\|2` | `--no-smt` for 1 | `"threads_per_core"` | the same |
+
+The layouts read `/sys/devices/system/cpu`: each core's threads
+(`thread_siblings_list`), each L3 domain (`cache/index3`: a CCD on a
+Ryzen), and the host scheduler's preference (`amd_pstate_prefcore_ranking`,
+or `acpi_cppc/highest_perf`), which is where the desktop's busiest threads
+land. A layout takes the least-preferred L3 domain first and its
+least-preferred cores first, and never CPU 0's core unless `avoid=none`.
+On the rig's 9950X that is CCD1 (CPUs 8-15, 24-31):
+
+| layout | 8 vCPUs on | the guest is told |
+|---|---|---|
+| `cores` | 8-15, one thread of each core; 24-31 left idle | 8 cores |
+| `smt` | 10/26, 13/29, 14/30, 15/31 (vCPUs 2k, 2k+1 on one core) | 4 cores of 2 threads |
+| `spread` | 15, 6, 14, 7, 10, 1, 13, 4 (the CCDs in turn) | 8 cores |
+| `l3` | any of 8-15, 24-31 | the VMM's default |
+| `core-sets` | vCPU i on either thread of core 8+i | 8 cores |
+| `cores:io=siblings` | as `cores`; the VMM's other threads and the backend on 24-31 | 8 cores |
+| `cores:io=other` | as `cores`; those on CCD0 (0-7, 16-23) | 8 cores |
+| `smt:io=rest` | as `smt`; those on the four CCD1 cores it leaves (8, 9, 11, 12 and their siblings) | 4 cores of 2 threads |
+
+`io=` is `none` (the default: where the host puts them), `siblings`,
+`rest`, `other` or a CPU list.
+
+`smt` needs one core-scheduling cookie for the VM, not one per vCPU
+(crosvm's default), or a core's two vCPUs never run at once: the launcher
+asks for it (`NVGPU_CORE_SCHED=vm`) and refuses a cookie per vCPU with
+`smt`. A crosvm unit says `--per-vm-core-scheduling`. With pins and no I/O
+set, the launcher gives nesbox its own CPUs as the I/O set, so that the
+worker a vCPU thread starts for the GPU window does not stay on that
+vCPU's CPU.
+
+**Isolation.** A VM given whole cores -- `cores`, `smt`, `core-sets` --
+shares no core with another VM that is kept off them, which closes the
+SMT side channels between the two, and `l3` or a CCD of its own also
+keeps the L3 apart: more isolation than the default placement, not less.
+Pinning only places this VM; give each VM its own cores (`l3=`, `avoid=`)
+and keep host work off them. Two VMs pinned to the two threads of one core
+are the opposite: they share it all the time.
+
+**What each layout gains and costs** (BENCHMARKS.md, "vCPU pinning";
+nesbox, 8 vCPUs, the rig's 9950X, three runs or more a cell): on an idle
+host no layout changes much. `cores` is within 2% of unpinned in Heaven and
+gameloop and loses 6-8% in stk-vk and Godot. `smt` loses 3-8% of average fps
+(it runs 8 vCPUs on 4 cores) and has the best lows of any layout:
+Heaven's 1% / 0.1% lows 282 / 138 fps against 233 / 104 unpinned, and
+native's 296 / 144. With the desktop's load on CCD0 (every thread of it
+busy), `smt` is the only layout that keeps its lows -- Heaven 234 / 112
+against 175 / 65 unpinned and 122 / 46 with `cores`, gameloop's 0.1% low 67
+against 20 and 17 -- at an average within 3% of unpinned. What it has that
+`cores`, `l3` and `cores:io=siblings` do not is four whole idle cores on the
+vCPUs' own CCD, where the host puts what else must run (the compositor, the
+backend's queue thread); the same program natively does the same (on 8-15,
+Heaven's lows under the load 155 / 51; on `smt`'s CPUs 235 / 95). `spread`
+puts half its vCPUs on the loaded CCD (Heaven 193 fps), and `io=other` puts
+the backend there (an IOCTL2 takes 38-45 µs instead of 10). Pinning does
+not make a wakeup between vCPUs cheaper (a futex hand-off 7.8 µs unpinned,
+8.0 with `cores`, 8.7 between two `smt` siblings). A busy CCD0 costs even a
+native game confined to CCD1 3-14% of its average: the two CCDs share a
+power budget, which no placement changes.
+
+**Recommended, for a gaming VM on this host:** `NVGPU_PIN=smt` (8 vCPUs on
+four CCD1 cores, the guest told they are pairs; `rig/pin-layout.sh 8 smt`
+for crosvm and nesbox configs), when the desktop's own work -- a build, an
+encode, a browser -- can fill the other CCD. It trades 3-8% of average fps on
+an idle host for lows that hold under load, and it costs no isolation: the
+VM has four whole cores no other VM is placed on, and with one
+core-scheduling cookie for the VM (crosvm, and nesbox with
+`NVGPU_CORE_SCHED=vm`) no host task shares a core with a running vCPU
+either. `smt:io=rest` (the backend and the VMM's other threads on the four
+cores `smt` leaves) measured the same as `smt`. Keep the host's own
+work off CCD1 (a slice or cpuset of its own) for the full effect. On a host
+that is otherwise idle, the default -- nothing pinned -- is as good or
+better on average, and it stays the default.
 
 ## Capture injection
 

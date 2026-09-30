@@ -2069,6 +2069,54 @@ cross-thread side channels (L1TF/MDS-class) between the guest and host
 tasks on the sibling. The launcher keeps crosvm's default; turn it off
 only where no other tenant shares the cores.
 
+### vCPU placement
+
+`NVGPU_PIN` (the launcher's layouts), `NVGPU_GUEST_SMT`, a CPU list per
+vCPU in `NVGPU_VCPU_PINS` (nesbox with `patches/nesbox/0002`),
+`vms.<n>.backendCpus` in the NixOS module and the units' `CPUAffinity=`
+(DEPLOY.md, "vCPU placement") are placement: each says which host CPUs a
+thread may run on, and the guest's view of its own topology. None is on by
+default, none changes what any thread may do, and all are applied before
+the backend's sandbox and the VMM's jail, which are unchanged. The layouts
+read only sysfs (`/sys/devices/system/cpu`); the test tree that stands in
+for it (`NVGPU_SYSFS_CPU`) is refused as root.
+
+**What it does for isolation between VMs.** Two VMs whose vCPUs run on
+the two threads of one core share that core's L1 and L2 caches, branch
+predictors and execution ports, which is where SMT side channels
+(cross-thread L1TF, MDS and the Spectre-class predictor attacks) live; two
+VMs on different cores of one L3 domain still share the L3. A layout that
+gives a VM whole cores -- `cores` (the siblings left idle), `smt` (both
+threads, the VM's own) or `core-sets` -- means no other VM is placed on
+those cores' threads, and `l3`/a CCD of its own also keeps its L3 apart.
+That is more isolation than the default, where the host scheduler puts any
+thread on any CPU, not less; for a desktop running a game next to other
+VMs it is the cheapest cross-VM hardening there is. It holds only while the
+other VMs and the host are kept off those CPUs too: pinning places this
+VM's threads, it reserves nothing. What reserves is an isolated cpuset
+partition (nesbox `vcpu_cgroup_fd`), or giving every VM a layout of its
+own, disjoint cores, and host tasks another set.
+
+**Pinning to shared siblings does the opposite.** Two VMs given the two
+threads of one core -- `NVGPU_VCPU_PINS` written by hand, or two `smt`
+VMs whose cores the operator made overlap -- run side by side on one core
+by construction, where the default placement only sometimes would. The
+layouts never do this within a VM run, and they cannot see other VMs:
+the operator picks disjoint `l3=` and `avoid=` per VM.
+
+**Core scheduling.** crosvm's default cookie per vCPU keeps any other task
+off a vCPU's SMT sibling while it runs. With `smt` the VM's two vCPUs of
+one core must run together, so the launcher asks for one cookie per VM
+(`CORE_SCHED_DEFAULT=vm`, launcher/tuning.sh) and refuses a cookie per
+vCPU with it: the VM's own vCPUs may share a core, and every host task and
+every other VM is still kept off the core while one of them runs. Within
+the guest, two processes on sibling vCPUs share a core as they would on
+bare metal; the guest kernel's own mitigations are the guest's.
+
+**What the guest learns.** `NVGPU_GUEST_SMT=2` tells the guest which of its
+vCPUs are siblings, which shared-cache timing would show it anyway; the
+host's CPU numbers, L3 layout and ranking are not passed to it.
+
 **The guest's reply polling** (`driver/nvgpu_xfer.c`). While callers spin
 for their replies (`rt_spin_us`, above) and none sleeps for one, the control
 queue's interrupt is off and the spinning callers take replies off the ring
