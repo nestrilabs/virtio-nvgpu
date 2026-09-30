@@ -778,6 +778,158 @@ static void t_import_foreign_fd(int ctl, uint32_t client)
 		close(other);
 }
 
+/* T12, T13: NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS (device/src/rmchan.rs).
+ * NV2080_CTRL_FIFO_DISABLE_CHANNELS_PARAMS, 536 bytes in every release. */
+#define NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS 0x2080110bu
+#define NV20_SUBDEVICE_0 0x00002080u
+#define SUB_HANDLE 0x5b000001u
+#define NV_ERR_NOT_SUPPORTED 0x56u
+
+typedef struct {
+	uint8_t bDisable;
+	uint8_t _pad0[3];
+	uint32_t numChannels;
+	uint8_t bOnlyDisableScheduling;
+	uint8_t bRewindGpPut;
+	uint8_t _pad1[6];
+	uint64_t pRunlistPreemptEvent;
+	uint32_t hClientList[64];
+	uint32_t hChannelList[64];
+} disable_channels_params_t;
+
+_Static_assert(sizeof(disable_channels_params_t) == 536, "RM's size");
+
+/* A DISABLE_CHANNELS on `client`'s subdevice; RM's status (or the
+ * backend's), -1 for a failed ioctl. */
+static int64_t disable_channels(int fd, uint32_t client, disable_channels_params_t *p)
+{
+	nvos54_t c = {0};
+	c.hClient = client;
+	c.hObject = SUB_HANDLE;
+	c.cmd = NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS;
+	c.params = (uint64_t)(uintptr_t)p;
+	c.paramsSize = sizeof(*p);
+	if (ioctl(fd, NV_IOWR(NV_ESC_RM_CONTROL, sizeof(c)), &c) != 0)
+		return -1;
+	return c.status;
+}
+
+/* T12: channels named by another guest process's client, and a runlist
+ * preemption event. The backend lets a guest process disable only channels
+ * of its own clients -- GSP-RM itself checks no token on the list, and to it
+ * every guest process is the backend's -- and a preemption event only from
+ * the kernel, as RM does. Both refused with NV_ERR_INSUFFICIENT_PERMISSIONS
+ * before RM is asked; the first by RM itself (any other status) means the
+ * backend let it through. `mine` is a client of this process's with a
+ * device (client_with_vaspace). */
+static void t_disable_other_process(int ctl, uint32_t mine)
+{
+	if (!mine || alloc_object(ctl, mine, DEV_HANDLE, SUB_HANDLE, NV20_SUBDEVICE_0, 4) != 0) {
+		skip("disable channels, other process", "no client with a subdevice here");
+		return;
+	}
+	disable_channels_params_t p = {0};
+	p.bDisable = 1;
+	p.numChannels = 1;
+	p.hClientList[0] = mine;
+	p.hChannelList[0] = 0xc4a;
+	p.pRunlistPreemptEvent = POISON_PTR;
+	int64_t st = disable_channels(ctl, mine, &p);
+	if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+		pass("disable channels, event", "refused (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+	else {
+		char how[64];
+		snprintf(how, sizeof(how), "status 0x%llx", (long long)st);
+		fail("disable channels, event", how);
+	}
+
+	int up[2], down[2];
+	if (pipe(up) || pipe(down)) {
+		skip("disable channels, other process", "pipe failed");
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		skip("disable channels, other process", "fork failed");
+		return;
+	}
+	if (pid == 0) {
+		int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+		uint32_t c = fd >= 0 ? client_with_vaspace(fd) : 0;
+		char go;
+		if (write(up[1], &c, sizeof(c)) != sizeof(c))
+			_exit(1);
+		if (read(down[0], &go, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	uint32_t child = 0;
+	if (read(up[0], &child, sizeof(child)) != sizeof(child))
+		child = 0;
+	if (!child) {
+		skip("disable channels, other process", "the child could not make a client");
+	} else {
+		memset(&p, 0, sizeof(p));
+		p.bDisable = 1;
+		p.numChannels = 1;
+		p.hClientList[0] = child;
+		p.hChannelList[0] = 0xc4a;
+		st = disable_channels(ctl, mine, &p);
+		if (st == NV_ERR_INSUFFICIENT_PERMISSIONS)
+			pass("disable channels, other process", "refused by the backend (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+		else {
+			char how[112];
+			snprintf(how, sizeof(how),
+				 "status 0x%llx: RM was asked to stop another process's channels", (long long)st);
+			fail("disable channels, other process", how);
+		}
+	}
+	if (write(down[1], "x", 1) != 1)
+		kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(up[0]);
+	close(up[1]);
+	close(down[0]);
+	close(down[1]);
+}
+
+/* T13: DISABLE_CHANNELS far past the per-process rate. Each call enables
+ * no channels (numChannels 0), which RM does as a no-op; past the burst the
+ * backend answers NV_ERR_NOT_SUPPORTED itself. PASS when RM answered the
+ * first calls with something else and the backend then took over; a guest
+ * whose calls all reach RM would let one process preempt the runlist every
+ * VM shares as fast as it likes. Runs after T12, on the subdevice it made. */
+static void t_disable_rate(int ctl, uint32_t mine)
+{
+	if (!mine) {
+		skip("disable channels, rate", "no client with a subdevice here");
+		return;
+	}
+	disable_channels_params_t p = {0};
+	int64_t first = disable_channels(ctl, mine, &p);
+	if (first == NV_ERR_NOT_SUPPORTED || first < 0) {
+		skip("disable channels, rate", "RM does not take the call here: inconclusive");
+		return;
+	}
+	int served = 1, refused_at = 0;
+	for (int i = 1; i < 400; i++) {
+		int64_t st = disable_channels(ctl, mine, &p);
+		if (st == NV_ERR_NOT_SUPPORTED) {
+			refused_at = i;
+			break;
+		}
+		served++;
+	}
+	char how[96];
+	snprintf(how, sizeof(how), "%d served (RM's status 0x%llx), then refused", served, (long long)first);
+	if (refused_at && served >= 30)
+		pass("disable channels, rate", how);
+	else if (!refused_at)
+		fail("disable channels, rate", "400 back to back all reached RM");
+	else
+		fail("disable channels, rate", how);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -867,6 +1019,9 @@ int main(int argc, char **argv)
 	t_share_other_user(ctl, client, mine);
 	/* T11: an export descriptor that is not this process's own file. */
 	t_import_foreign_fd(ctl, client);
+	/* T12, T13: stopping channels -- another process's, and too often. */
+	t_disable_other_process(ctl, mine);
+	t_disable_rate(ctl, mine);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)
