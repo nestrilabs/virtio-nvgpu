@@ -78,8 +78,8 @@ def kvm_fds(pid):
                 continue
             if t.startswith("anon_inode:kvm-vcpu:"):
                 out.append((int(fd), "vcpu" + t.rsplit(":", 1)[1]))
-            elif t == "anon_inode:kvm-vcpu-stats":
-                out.append((int(fd), "stats"))
+            elif t.startswith("anon_inode:kvm-vcpu-stats:"):
+                out.append((int(fd), "stats" + t.rsplit(":", 1)[1]))
     except OSError:
         pass
     return out
@@ -103,7 +103,7 @@ class Stats:
                 self.desc.append((name, off))
 
     def read(self):
-        return {n: struct.unpack("Q", os.pread(self.fd, 8, self.data_off + off * 8))[0]
+        return {n: struct.unpack("Q", os.pread(self.fd, 8, self.data_off + off))[0]
                 for n, off in self.desc}
 
 
@@ -131,8 +131,9 @@ def main():
         time.sleep(a.delay)
         pidfd = syscall(SYS_PIDFD_OPEN, vmm, 0)
         stats = {}
-        for i, (fd, _) in enumerate(k for k in kvm_fds(vmm) if k[1] == "stats"):
-            stats["vcpu%d" % i] = Stats(syscall(SYS_PIDFD_GETFD, pidfd, fd, 0))
+        for fd, kind in kvm_fds(vmm):
+            if kind.startswith("stats"):
+                stats["vcpu%02d" % int(kind[5:])] = Stats(syscall(SYS_PIDFD_GETFD, pidfd, fd, 0))
         if not stats:
             raise RuntimeError("the VMM holds no KVM statistics descriptors "
                                "(nesbox: NESBOX_HOLD_KVM_STATS=1)")

@@ -206,7 +206,7 @@ wine_setup() { # <width> <height>
 wine_done() {
     # A program that failed can leave a dialog behind that would hold the
     # server up for good.
-    wineserver -k 2>/dev/null
+    timeout 10 wineserver -k 2>/dev/null
     timeout 15 wineserver -w 2>/dev/null || pkill -KILL -f 'wineserver|\.exe' 2>/dev/null
     [ -n "${XWL:-}" ] && kill "$XWL" 2>/dev/null
     true
@@ -227,7 +227,10 @@ wine_godot() { # <scene> <driver> <godot args...>
         setsid -w wine "$WIN/godot/Godot_v4.7.2-stable_win64.exe" \
         --path "Z:$OUT/godot" --rendering-driver "$drv" --rendering-method forward_plus "$@" \
         </dev/null >"$OUT/app.log" 2>&1
-    meta "exit=$? wall_s=$((SECONDS - t0))"
+    local rc=$?
+    meta "exit=$rc wall_s=$((SECONDS - t0))"
+    # What it said before it failed: a guest keeps nothing of its disk.
+    [ "$rc" = 0 ] || tail -n 40 "$OUT/app.log" | tr -d '\r' | sed 's/^/HEAVY-APP /'
     wine_done
     grep -a '^HEAVY_GODOT' "$OUT/app.log" | tr -d '\r' | sed 's/^/HEAVY-META /'
 }

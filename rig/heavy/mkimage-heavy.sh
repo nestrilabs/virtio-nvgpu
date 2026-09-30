@@ -54,6 +54,7 @@ put_tree() {
             printf 'symlink "%s/%s" "%s"\n' "$dst" "$p" "$l"
         done
         find . -mindepth 1 -type f -printf '%h\t%f\t%m\n' | LC_ALL=C sort | awk -F'\t' -v dst="$dst" -v src="$src" '
+            BEGIN { cur = "\001" }   # so the top directory is changed into too
             { d = ($1 == ".") ? "" : "/" substr($1, 3)
               if (d != cur) { printf "cd \"%s%s\"\n", dst, d; cur = d }
               printf "write \"%s%s/%s\" \"%s\"\n", src, d, $2, $2
@@ -81,7 +82,9 @@ while [ $# -gt 0 ]; do
             ;;
         --tree)
             IFS=: read -r src dst <<<"$2"
-            # Its parents first, as mkdir -p would.
+            # Its parents first, as mkdir -p would; from /, since debugfs
+            # makes "/x" in its working directory.
+            echo "cd /" >>"$CMDS"
             a=
             IFS=/ read -r -a parts <<<"${dst#/}"
             for c in "${parts[@]}"; do a+=/$c; echo "mkdir \"$a\"" >>"$CMDS"; done
