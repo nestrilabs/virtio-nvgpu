@@ -312,10 +312,90 @@ pub fn classify(fd: BorrowedFd<'_>, cards: &[CardNode]) -> HandleKind {
         return HandleKind::Other;
     }
     let fs = KnownFs::get().magic_of(st.dev, raw);
-    let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{raw}")) else {
-        return HandleKind::Other;
-    };
-    kind_from_link(fs, &target.to_string_lossy())
+    let mut buf = [0u8; LINK_BUF];
+    match fd_link(raw, &mut buf) {
+        Some(n) => kind_from_link(fs, &buf[..n]),
+        // No kept directory, or a text that may not have fit: the path, as
+        // it was always read.
+        None => match std::fs::read_link(format!("/proc/self/fd/{raw}")) {
+            Ok(target) => kind_from_link(fs, target.as_os_str().as_encoded_bytes()),
+            Err(_) => HandleKind::Other,
+        },
+    }
+}
+
+/// Room for any link text [`kind_from_link`] names a kind by: a memfd's is
+/// "/memfd:" and a name of at most 249 bytes and " (deleted)", a dma-buf's
+/// "/dmabuf:" and one of at most 32 (Linux 7.2.7, mm/memfd.c
+/// `MFD_NAME_MAX_LEN`, include/uapi/linux/dma-buf.h `DMA_BUF_NAME_LEN`). A
+/// longer text is read the slow way.
+const LINK_BUF: usize = 512;
+
+/// Descriptor `raw`'s `/proc/self/fd` link text, into `buf`, read through a
+/// descriptor of that directory kept open for it: no path is formatted, no
+/// memory allocated and `/proc/self` not walked again on each call, which on
+/// the IOCTL2 path was a third of classifying a syncobj or sync_file the host
+/// just made. `None` when the directory cannot be opened, the link cannot be
+/// read through it, or the text filled `buf` (it may be longer): the caller
+/// then reads the link by its path, as it always did.
+///
+/// The directory is `/proc/<pid>/fd`, whatever `/proc/self` was when it was
+/// opened: in a child forked after that it would be the parent's table. So
+/// it is kept with the fork generation it was opened in
+/// (`sys::proc::fork_generation`), and a child opens its own. It is held as
+/// one of the backend's own descriptors (`privfd`): no host call's answer
+/// can be adopted as it.
+fn fd_link(raw: RawFd, buf: &mut [u8; LINK_BUF]) -> Option<usize> {
+    static DIR: std::sync::Mutex<Option<(u64, crate::privfd::PrivateFd)>> =
+        std::sync::Mutex::new(None);
+    let mut name = [0u8; 12];
+    let name = fd_name(raw, &mut name)?;
+    let generation = crate::sys::proc::fork_generation();
+    let mut kept = DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.as_ref().is_none_or(|(g, _)| *g != generation) {
+        // A parent's, in a forked child: its number is not this process's
+        // to close -- the child may have closed it and opened something
+        // else there -- so it is let go of unclosed, and stays registered
+        // as the backend's own (refusing an adoption at that number, never
+        // allowing one).
+        if let Some((_, parents)) = kept.take() {
+            std::mem::forget(parents);
+        }
+        // O_PATH: the directory is only ever a base for readlinkat, which
+        // needs no read access to it.
+        let fd = crate::sys::fd::open(
+            c"/proc/self/fd",
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+        .ok()?;
+        *kept = Some((generation, crate::privfd::PrivateFd::new(fd)));
+    }
+    let (_, dir) = kept.as_ref()?;
+    match crate::sys::fd::readlinkat(dir, name, buf) {
+        Ok(n) if n < buf.len() => Some(n),
+        _ => None,
+    }
+}
+
+/// `raw` in decimal, NUL-terminated, in `out`; `None` for a negative number.
+fn fd_name(raw: RawFd, out: &mut [u8; 12]) -> Option<&std::ffi::CStr> {
+    let mut v = u32::try_from(raw).ok()?;
+    // u32::MAX is ten digits: they and the NUL fit.
+    let mut digits = [0u8; 10];
+    let mut n = 0;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for (i, d) in digits[..n].iter().rev().enumerate() {
+        out[i] = *d;
+    }
+    out[n] = 0;
+    std::ffi::CStr::from_bytes_with_nul(&out[..=n]).ok()
 }
 
 /// The devices of the kernel's internal mounts a descriptor from outside
@@ -391,20 +471,21 @@ const TMPFS_MAGIC: i64 = 0x0102_1994;
 const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
 
 /// The rest of [`classify`]: the filesystem `fs` a file is on, and within
-/// it the `/proc/self/fd` link text.
-fn kind_from_link(fs: i64, link: &str) -> HandleKind {
-    match (fs, link) {
-        (ANON_INODE_FS_MAGIC, "anon_inode:sync_file") => HandleKind::SyncFile,
+/// it the `/proc/self/fd` link text, byte for byte: every text named here is
+/// ASCII, so this matches exactly what its lossy UTF-8 conversion did.
+fn kind_from_link(fs: i64, link: impl AsRef<[u8]>) -> HandleKind {
+    match (fs, link.as_ref()) {
+        (ANON_INODE_FS_MAGIC, b"anon_inode:sync_file") => HandleKind::SyncFile,
         // drm_syncobj.c:673 names the file "syncobj_file"; the bare name is
         // accepted in case a kernel ever shortens it.
-        (ANON_INODE_FS_MAGIC, "anon_inode:syncobj_file" | "anon_inode:syncobj") => {
+        (ANON_INODE_FS_MAGIC, b"anon_inode:syncobj_file" | b"anon_inode:syncobj") => {
             HandleKind::Syncobj
         }
         // A kernel before the dma-buf filesystem.
-        (ANON_INODE_FS_MAGIC, "anon_inode:dmabuf") => HandleKind::Dmabuf,
-        (ANON_INODE_FS_MAGIC, "anon_inode:[eventfd]") => HandleKind::Eventfd,
-        (DMA_BUF_MAGIC, l) if l.starts_with("/dmabuf:") => HandleKind::Dmabuf,
-        (TMPFS_MAGIC | HUGETLBFS_MAGIC, l) if l.starts_with("/memfd:") => HandleKind::Memfd,
+        (ANON_INODE_FS_MAGIC, b"anon_inode:dmabuf") => HandleKind::Dmabuf,
+        (ANON_INODE_FS_MAGIC, b"anon_inode:[eventfd]") => HandleKind::Eventfd,
+        (DMA_BUF_MAGIC, l) if l.starts_with(b"/dmabuf:") => HandleKind::Dmabuf,
+        (TMPFS_MAGIC | HUGETLBFS_MAGIC, l) if l.starts_with(b"/memfd:") => HandleKind::Memfd,
         _ => HandleKind::Other,
     }
 }
@@ -1101,6 +1182,67 @@ mod tests {
             render_index: 0,
         };
         assert_eq!(classify(null.as_fd(), &[fake]), HandleKind::Other);
+    }
+
+    #[test]
+    fn a_descriptor_number_is_named_in_decimal() {
+        let mut b = [0u8; 12];
+        assert_eq!(fd_name(0, &mut b), Some(c"0"));
+        assert_eq!(fd_name(7, &mut b), Some(c"7"));
+        assert_eq!(fd_name(1_048_575, &mut b), Some(c"1048575"));
+        assert_eq!(fd_name(i32::MAX, &mut b), Some(c"2147483647"));
+        assert_eq!(fd_name(-1, &mut b), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no /proc/self/fd")]
+    fn the_kept_directory_reads_what_the_path_reads() {
+        let fds = [
+            new_eventfd().unwrap(),
+            crate::sys::fd::memfd(c"x", libc::MFD_CLOEXEC).unwrap(),
+            // The longest name memfd_create takes (MFD_NAME_MAX_LEN).
+            crate::sys::fd::memfd(
+                &std::ffi::CString::new("n".repeat(249)).unwrap(),
+                libc::MFD_CLOEXEC,
+            )
+            .unwrap(),
+            open_path("/dev/null", libc::O_RDONLY).unwrap(),
+        ];
+        for fd in &fds {
+            let raw = fd.as_raw_fd();
+            let mut buf = [0u8; LINK_BUF];
+            let n = fd_link(raw, &mut buf).expect("read through the kept directory");
+            let path = std::fs::read_link(format!("/proc/self/fd/{raw}")).unwrap();
+            assert_eq!(&buf[..n], path.as_os_str().as_encoded_bytes());
+        }
+        assert_eq!(classify(fds[2].as_fd(), &[]), HandleKind::Memfd);
+        // A number nothing holds reads as nothing, and classifies as Other.
+        let gone = fds[0].as_raw_fd();
+        drop(fds);
+        assert_eq!(fd_link(gone, &mut [0u8; LINK_BUF]), None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no fork")]
+    fn a_forked_child_reads_its_own_descriptor_table() {
+        use crate::sys::proc::testing::{End, forked};
+        // The parent's directory is open, and names the parent's table.
+        let parent = crate::sys::fd::memfd(c"parent", libc::MFD_CLOEXEC).unwrap();
+        assert!(fd_link(parent.as_raw_fd(), &mut [0u8; LINK_BUF]).is_some());
+        let generation = crate::sys::proc::fork_generation();
+        let end = forked(|| {
+            if crate::sys::proc::fork_generation() != generation + 1 {
+                return 2;
+            }
+            // A number the parent holds a memfd at is an eventfd here.
+            let e = new_eventfd().unwrap();
+            let at = crate::sys::fd::dup_at_least(&e, parent.as_raw_fd()).unwrap();
+            if at.as_raw_fd() != parent.as_raw_fd() {
+                return 3;
+            }
+            i32::from(classify(at.as_fd(), &[]) != HandleKind::Eventfd)
+        });
+        assert_eq!(end, End::Exit(0));
     }
 
     #[test]

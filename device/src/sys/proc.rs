@@ -45,6 +45,33 @@ pub fn pid() -> i32 {
     unsafe { libc::getpid() }
 }
 
+/// How many `fork`s made this process: 0 in the one that started the
+/// program, one more in each child. A pthread_atfork child handler counts
+/// them, registered by the first call, so a value cached with the count it
+/// was made under (a descriptor of `/proc/self/...`, which in a child still
+/// names the parent) is known stale without a system call; `getpid` costs a
+/// third of a microsecond here. A child forked before the first call has
+/// nothing cached to be stale.
+pub fn fork_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FORKS: AtomicU64 = AtomicU64::new(0);
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    extern "C" fn child() {
+        FORKS.fetch_add(1, Ordering::Relaxed);
+    }
+    REGISTER.call_once(|| {
+        // SAFETY: registers a handler that only increments an atomic, which
+        // is safe in a child of a multithreaded process; it is never
+        // unregistered, and the function lives as long as the program.
+        let r = unsafe { libc::pthread_atfork(None, None, Some(child)) };
+        // Without it every fork would go uncounted: a count that stays
+        // wrong is worse than none, so a failure to register (ENOMEM) ends
+        // the program the way an allocation failure does.
+        assert_eq!(r, 0, "pthread_atfork: {}", io::Error::from_raw_os_error(r));
+    });
+    FORKS.load(Ordering::Relaxed)
+}
+
 pub fn ppid() -> i32 {
     // SAFETY: no arguments; cannot fail.
     unsafe { libc::getppid() }

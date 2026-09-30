@@ -216,6 +216,22 @@ pub fn statx_cached(fd: RawFd) -> io::Result<CachedStat> {
     })
 }
 
+/// `readlinkat(dir, name, buf)`: how many bytes of the link's text were put
+/// in `buf`. The kernel cuts a text longer than `buf` short without saying
+/// so, so a count equal to `buf.len()` means the text may be longer.
+pub fn readlinkat(dir: impl AsFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `name` is NUL-terminated and `buf` a live, writable slice of
+    // the length given; the kernel writes at most that many bytes into it.
+    cvt_s(unsafe {
+        libc::readlinkat(
+            dir.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    })
+}
+
 /// `fstat(fd)`.
 pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     // SAFETY: an all-zero `stat` is a valid value for fstat to overwrite.
