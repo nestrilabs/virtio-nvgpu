@@ -158,7 +158,7 @@ pub struct NvidiaBackend {
     pub(crate) rm_classes: crate::tally::Tally,
     rm_controls: crate::tally::Tally,
     /// Which RM controls and classes reach the host at all (rmallow.rs).
-    rmallow: crate::rmallow::RmAllow,
+    pub(crate) rmallow: crate::rmallow::RmAllow,
     /// FIFO_DISABLE_CHANNELS: its preemption event and its rate (rmchan.rs).
     pub(crate) rmchan: crate::rmchan::ChannelGate,
     /// Every ioctl forwarded, by namespace and number.

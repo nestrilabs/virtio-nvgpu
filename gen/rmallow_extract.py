@@ -479,6 +479,93 @@ POINTER_NOT_FOLLOWED = {
         "NOT_SUPPORTED without reading pagingOps (mem_mapper.c)",
 }
 
+# Opt-in groups (`--rm-allow-group NAME`, device/src/rmgroup.rs): controls
+# and classes a deployment may add to the list by name, none of them on by
+# default. Each member is held to the list's own rules -- RM serves it to an
+# unprivileged caller, its size is the release's measured one, and a pointer
+# RM follows in it is one gen/rmctrl measured -- except the host fields named
+# in `forced`, which rmgroup.rs overwrites before RM sees them. A member the
+# default list already has, or one naming a host field not forced, fails the
+# render: the policy is wrong. Every member reaches RM only through its gate
+# in rmgroup.rs, whose tests fail on a member it has no rule for; SECURITY.md,
+# "Opt-in RM groups", says what each exposes.
+RM_GROUPS = {
+    # MangoHud, nvtop and NVML's temperatures on a host whose NVML reads them
+    # this way; rmgroup.rs lets only the read opcodes through.
+    "thermal": {
+        "controls": ["NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2"],
+        "classes": [],
+        "forced": {},
+    },
+    # nvidia-smi -q's ECC, InfoROM, retired-page and black-box queries: the
+    # ones gVisor's nvproxy serves that the default list does not, all read
+    # only (rig/TESTING-RIG.md has the trace they came from).
+    "health": {
+        "controls": [
+            "NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT",
+            "NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION",
+            "NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES",
+            "NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME",
+        ],
+        "classes": [],
+        "forced": {},
+    },
+    # The GPU memory limits of the backend's own cgroup; `cgroupFd` is always
+    # NV0000_CTRL_CMD_OS_UNIX_MEMACCT_CURRENT_PROCESS for RM.
+    "memacct": {
+        "controls": [
+            "NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS",
+            "NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL",
+        ],
+        "classes": [],
+        "forced": {"NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS": {"fd": ["cgroupFd"]}},
+    },
+    # The GT200_DEBUGGER controls gVisor's nvproxy serves and the default
+    # list lacks, and WRITE_MEMORY, the other half of READ_MEMORY: the
+    # memory's class asked of RM, the length capped, the buffer a table-sized
+    # deep segment. Needs --allow-compute.
+    "debug": {
+        "controls": [
+            "NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG",
+            "NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG",
+            "NV83DE_CTRL_CMD_DEBUG_READ_MEMORY",
+            "NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY",
+        ],
+        "classes": [],
+        "forced": {},
+    },
+    # Context-switched profiling of the caller's own context: the profiler
+    # objects bound to one, their reservations held to ctxsw, PMA streams into
+    # the caller's own memory, and register reads of the context's image.
+    # Left out, with the reasons in rmgroup.rs: device-wide profiling, the
+    # power features, PC sampling, HES and MMA boost, register writes, and the
+    # event buffers (FECS and video binds report every context of the
+    # binder's uid). Needs --allow-compute.
+    "profiling": {
+        "controls": [
+            "NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY",
+            "NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY",
+            "NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC",
+            "NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC",
+            "NVB0CC_CTRL_CMD_RESERVE_CCU_PROF",
+            "NVB0CC_CTRL_CMD_RELEASE_CCU_PROF",
+            "NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM",
+            "NVB0CC_CTRL_CMD_FREE_PMA_STREAM",
+            "NVB0CC_CTRL_CMD_BIND_PM_RESOURCES",
+            "NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES",
+            "NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT",
+            "NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS",
+            "NVB0CC_CTRL_CMD_GET_HS_CREDITS",
+            "NVB0CC_CTRL_CMD_SET_HS_CREDITS",
+            "NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL",
+            "NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING",
+            "NVB0CC_CTRL_CMD_EXEC_REG_OPS",
+        ],
+        "classes": ["MAXWELL_PROFILER_CONTEXT", "MAXWELL_PROFILER_DEVICE"],
+        "forced": {},
+    },
+}
+
 # Classes refused whatever else says (guestptr.rs REFUSED_ALLOC_CLASSES has
 # the reasons; OsDescMemory's 0x71 is let through only by osdesc.rs).
 DENY_CLASSES = {
@@ -1156,6 +1243,50 @@ def apply_policy(rel, observed):
     return allow, allow_cls, why_not, why_not_cls, cls_by_name
 
 
+def apply_groups(rel, allow, allow_cls):
+    """{group: ({cmd: row}, {class: name})}: what each opt-in group adds to
+    one release's list (RM_GROUPS), members the release lacks, or serves only
+    to a privileged caller, left out."""
+    ctl = {c["name"]: c for c in rel["controls"]}
+    cls = {}
+    for c in rel["classes"]:
+        cls.setdefault(c["name"], []).append(c)
+    followed = rmctrl_followed(rel["version"])
+    out = {}
+    for group, g in sorted(RM_GROUPS.items()):
+        controls, classes = {}, {}
+        for name in g["controls"]:
+            c = ctl.get(name)
+            if c is None or "user" not in c["privilege"]:
+                continue
+            if c["cmd"] in allow:
+                raise ExtractError(f"{rel['version']}: group {group}: {name} is on the "
+                                   "default list already")
+            forced = g["forced"].get(name, {})
+            loose = {k: sorted(set(v) - set(forced.get(k, []))) for k, v in c["host"].items()}
+            if any(loose.values()):
+                raise ExtractError(f"{rel['version']}: group {group}: {name} names a host "
+                                   f"{loose} its gate does not force")
+            if c["pointer"] and c["cmd"] not in followed:
+                raise ExtractError(f"{rel['version']}: group {group}: {name} holds a pointer "
+                                   "gen/rmctrl does not list")
+            controls[c["cmd"]] = {"name": name, "size": c["params_size"]}
+        for name in g["classes"]:
+            rows = [r for r in cls.get(name, []) if r["privilege"] == "user"
+                    and not r["debug_only"]]
+            if not rows:
+                continue
+            num = rows[0]["class"]
+            if num in allow_cls:
+                raise ExtractError(f"{rel['version']}: group {group}: class {name} is on "
+                                   "the default list already")
+            if name in DENY_CLASSES:
+                raise ExtractError(f"{rel['version']}: group {group}: class {name} is denied")
+            classes[num] = name
+        out[group] = (controls, classes)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Render
 # --------------------------------------------------------------------------
@@ -1196,9 +1327,17 @@ def render(data, observed):
     for n in WORKLOAD_CLASSES:
         if n not in every_cls:
             raise ExtractError(f"policy names class {n}, which no release measured has")
+    for group, g in RM_GROUPS.items():
+        for n in list(g["controls"]) + list(g["forced"]):
+            if n not in every:
+                raise ExtractError(f"group {group} names {n}, which no release measured has")
+        for n in g["classes"]:
+            if n not in every_cls:
+                raise ExtractError(f"group {group} names class {n}, which no release has")
     names, cls_names, releases = {}, {}, []
     for rel in data:
         allow, allow_cls, _, _, cls_by_name = apply_policy(rel, observed)
+        groups = apply_groups(rel, allow, allow_cls)
         for c in rel["controls"]:
             names.setdefault(c["cmd"], c["name"])
         for d in rel["deprecated"]:
@@ -1216,7 +1355,7 @@ def render(data, observed):
         unserved = sorted(c for c in observed["controls"] if c not in allow)
         unserved_cls = sorted(c for c in observed["classes"] if c not in allow_cls)
         releases.append({
-            "unserved": unserved, "unserved_cls": unserved_cls,
+            "unserved": unserved, "unserved_cls": unserved_cls, "groups": groups,
             "version": rel["version"], "allow": allow, "allow_cls": allow_cls,
             "vidheap": vh, "total_ctl": total_ctl,
             "total_cls": len({c["class"] for c in rel["classes"]}),
@@ -1242,6 +1381,20 @@ def render(data, observed):
         "    pub size: Option<u32>,",
         "}",
         "",
+        "/// What one opt-in group (`--rm-allow-group`) adds to a release's list:",
+        "/// its controls, at RM's size, and its classes, each sorted. A member",
+        "/// the release lacks is not here.",
+        "#[derive(Debug)]",
+        "pub struct Group {",
+        "    pub name: &'static str,",
+        "    pub controls: &'static [Control],",
+        "    pub classes: &'static [u32],",
+        "}",
+        "",
+        "/// Every opt-in group, by name (sorted); each release lists them all.",
+        "pub static GROUP_NAMES: &[&str] = &["
+        + ", ".join(rust_str(g) for g in sorted(RM_GROUPS)) + "];",
+        "",
         "/// One release's allowlist.",
         "#[derive(Debug)]",
         "pub struct Release {",
@@ -1262,6 +1415,9 @@ def render(data, observed):
         "    /// How many controls and classes the release exports in all.",
         "    pub total_controls: usize,",
         "    pub total_classes: usize,",
+        "    /// The opt-in groups, in GROUP_NAMES order: none of it is allowed",
+        "    /// unless the backend was started with the group.",
+        "    pub groups: &'static [Group],",
         "}",
         "",
         "/// The escapes' own blocks (nvos.h), the same in every release measured",
@@ -1300,6 +1456,22 @@ def render(data, observed):
         out.append("        unserved_classes: &[" + ", ".join(f"{c:#06x}" for c in r["unserved_cls"]) + "],")
         out.append(f"        total_controls: {r['total_ctl']},")
         out.append(f"        total_classes: {r['total_cls']},")
+        out.append("        groups: &[")
+        for g in sorted(r["groups"]):
+            gctl, gcls = r["groups"][g]
+            out.append("            Group {")
+            out.append(f"                name: {rust_str(g)},")
+            out.append("                controls: &[")
+            for cmd in sorted(gctl):
+                out.append(f"                    Control {{ cmd: {cmd:#010x}, "
+                           f"size: Some({gctl[cmd]['size']}) }}, // {gctl[cmd]['name']}")
+            out.append("                ],")
+            out.append("                classes: &[")
+            for num in sorted(gcls):
+                out.append(f"                    {num:#06x}, // {gcls[num]}")
+            out.append("                ],")
+            out.append("            },")
+        out.append("        ],")
         out.append("    },")
     out.append("];")
     out.append("")
@@ -1334,6 +1506,9 @@ def report(data, observed):
         for w in why_cls.values():
             creasons[w] = creasons.get(w, 0) + 1
         print("   refused classes: " + ", ".join(f"{k} {v}" for k, v in sorted(creasons.items())))
+        groups = apply_groups(rel, allow, allow_cls)
+        print("   opt-in groups: " + ", ".join(
+            f"{g} {len(c)}+{len(k)}" for g, (c, k) in sorted(groups.items())))
 
 
 def write_json(path, obj):

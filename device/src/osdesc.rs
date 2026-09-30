@@ -1738,6 +1738,15 @@ impl NvidiaBackend {
                 let pinned = resolved
                     .map(call.in_page(), call.writable)
                     .map_err(Refused::Errno)?;
+                // With `--osdesc-populate on`, faulted in with one call
+                // rather than one fault per page inside RM's pin: the same
+                // pages, the pin's writability. A failure leaves the
+                // faulting to the pin, as without it.
+                if self.config.osdesc_populate
+                    && let Err(e) = pinned.span.populate(call.writable)
+                {
+                    log::debug!("OS descriptor: populating {:#x} bytes: {e}", pinned.bytes);
+                }
                 Ok((call, pinned))
             });
         let (call, pinned) = match prepared {

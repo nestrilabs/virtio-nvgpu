@@ -101,6 +101,7 @@ static NO_RELEASE: Release = Release {
     unserved_classes: &[],
     total_controls: 0,
     total_classes: 0,
+    groups: &[],
 };
 
 /// The gate. One per backend: the host's release, the mode, and counts of
@@ -112,6 +113,9 @@ pub struct RmAllow {
     /// Whether `release` was measured at the host's exact version: only
     /// then are parameter sizes held to it.
     exact: bool,
+    /// The opt-in groups named at start (rmgroup.rs): their members are on
+    /// the list too.
+    groups: crate::rmgroup::Groups,
     refused_controls: crate::tally::Tally,
     refused_classes: crate::tally::Tally,
 }
@@ -130,6 +134,7 @@ impl RmAllow {
             mode,
             release: rmallow::RELEASES.last().expect("at least one release"),
             exact: false,
+            groups: Default::default(),
             refused_controls: Default::default(),
             refused_classes: Default::default(),
         }
@@ -137,6 +142,39 @@ impl RmAllow {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Add the members of opt-in `groups` to the list (rmgroup.rs).
+    pub fn set_groups(&mut self, groups: crate::rmgroup::Groups) {
+        self.groups = groups;
+    }
+
+    pub fn groups(&self) -> crate::rmgroup::Groups {
+        self.groups
+    }
+
+    /// The host release's list (for the start-up line).
+    pub fn release(&self) -> &'static Release {
+        self.release
+    }
+
+    /// Control `cmd` on the list: the release's own, or a member of a group
+    /// named. DEFERRED_API never carries a group's (see `control`).
+    fn entry(&self, cmd: u32) -> Option<&'static rmallow::Control> {
+        self.release.control(cmd).or_else(|| {
+            self.groups
+                .iter()
+                .find_map(|g| self.release.group(g.name())?.control(cmd))
+        })
+    }
+
+    /// Class `class` on the list, as `entry`.
+    fn listed_class(&self, class: u32) -> bool {
+        self.release.class(class)
+            || self
+                .groups
+                .iter()
+                .any(|g| self.release.group(g.name()).is_some_and(|r| r.class(class)))
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -252,7 +290,7 @@ impl RmAllow {
                 // Both sizes: which caller sends what is the question a
                 // size refusal raises.
                 let sent_size = le::u32_at(top_block, NVOS54_PARAMS_SIZE).unwrap_or(0);
-                let want = self.release.control(cmd).and_then(|e| e.size).unwrap_or(0);
+                let want = self.entry(cmd).and_then(|e| e.size).unwrap_or(0);
                 format!(
                     "sent with a parameter size RM does not take ({sent_size} bytes; RM takes {want})"
                 )
@@ -295,7 +333,7 @@ impl RmAllow {
                 },
             )
         };
-        let Some(entry) = self.release.control(cmd) else {
+        let Some(entry) = self.entry(cmd) else {
             return Err(unsupported(cmd));
         };
         // RM takes exactly its own size (resControlLookup); zero is a
@@ -332,7 +370,7 @@ impl RmAllow {
         if top.len() < status + 4 {
             return Err((What::Class(class), Refusal::Errno(libc::EINVAL)));
         }
-        if self.release.class(class) {
+        if self.listed_class(class) {
             Ok(())
         } else {
             Err((
@@ -350,7 +388,7 @@ impl RmAllow {
     fn event_subclass(&self, top: &[u8], params: &[u8]) -> Result<(), (What, Refusal)> {
         let class = le::u32_at(top, NVOS64_H_CLASS).unwrap_or(0);
         let made = crate::guestptr::rm_alloc_class(class, params);
-        if made == class || self.release.class(made) {
+        if made == class || self.listed_class(made) {
             return Ok(());
         }
         Err((

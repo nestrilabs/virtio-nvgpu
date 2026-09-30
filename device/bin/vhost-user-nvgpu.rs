@@ -184,6 +184,32 @@ struct Args {
     #[arg(long)]
     allow_compute: bool,
 
+    /// Add opt-in groups of RM controls and classes the default allowlist
+    /// leaves out, by name, comma-separated or the flag repeated: `thermal`
+    /// (THERMAL_SYSTEM_EXECUTE_V2's read opcodes: MangoHud's and nvtop's
+    /// temperatures), `health` (nvidia-smi -q's ECC, InfoROM, retired-page
+    /// and black-box queries), `memacct` (the GPU memory limits of this
+    /// backend's own cgroup), `debug` (GT200_DEBUGGER's debug modes and
+    /// memory reads and writes: cuda-gdb, compute-sanitizer) and `profiling`
+    /// (context-switched NVB0CC profiling of the caller's own context).
+    ///
+    /// None by default. Each member is held to what it is for, whatever the
+    /// guest sends (device::rmgroup; SECURITY.md, "Opt-in RM groups"), and
+    /// `debug` and `profiling` need --allow-compute.
+    #[arg(long, value_name = "NAME[,NAME...]")]
+    rm_allow_group: Vec<String>,
+
+    /// Fault in the pages of memory a guest registers by its pages
+    /// (cuMemHostRegister, VK_EXT_external_memory_host) with one
+    /// MADV_POPULATE_WRITE (MADV_POPULATE_READ for read-only memory) before
+    /// RM pins them, rather than page by page inside RM's pin: `off` (the
+    /// default) or `on`. The same pages either way, and no syscall the
+    /// sandbox does not already allow. On the rig `on` made a 1 GiB
+    /// registration about 5% slower, not faster (DEPLOY.md, "Backend
+    /// flags").
+    #[arg(long, value_name = "on|off", default_value = "off", value_parser = ["on", "off"])]
+    osdesc_populate: String,
+
     /// The shared window, in MiB: the guest-visible region device memory
     /// is mapped into, which bounds how much GPU memory this VM's
     /// processes can have CPU-mapped at once. A multiple of 64, at least
@@ -1608,6 +1634,21 @@ fn inject_uid_ok(uid: u32, own: u32, allow_self: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `--rm-allow-group` values as groups; a name no group has, or a group
+/// served only to compute without `--allow-compute`, refuses the start.
+fn rm_groups(values: &[String], compute: bool) -> anyhow::Result<device::rmgroup::Groups> {
+    let groups = device::rmgroup::Groups::parse(values.iter().map(String::as_str))
+        .map_err(|e| anyhow::anyhow!("refusing to start: --rm-allow-group {e}"))?;
+    if let Some(g) = groups.needing_compute().filter(|_| !compute) {
+        anyhow::bail!(
+            "refusing to start: --rm-allow-group {}: the group is served only with \
+             --allow-compute",
+            g.name()
+        );
+    }
+    Ok(groups)
+}
+
 /// Refuse the diagnostic flags without `--diagnostic`; announce them with it.
 fn check_diagnostic(args: &Args, env: bool) -> anyhow::Result<Vec<String>> {
     let flags = diagnostic_flags(args);
@@ -2105,8 +2146,10 @@ fn main() -> anyhow::Result<()> {
         // fence.rs): waits are polls here and sleeps in the guest.
         fences: true,
         allow_compute: args.allow_compute,
+        osdesc_populate: args.osdesc_populate == "on",
         ..BackendConfig::default()
     };
+    let rm_groups = rm_groups(&args.rm_allow_group, args.allow_compute)?;
     if config.allow_compute {
         log::info!(
             "--allow-compute: UVM, the UVM aperture and memory registered by its pages are served"
@@ -2130,6 +2173,11 @@ fn main() -> anyhow::Result<()> {
     nvgpu.after_scan = after_scan;
     {
         let mut be = nvgpu.shared.nvidia.lock().expect("nvidia lock");
+        if !rm_groups.is_empty() {
+            be.set_rm_groups(rm_groups);
+            // With the start-up line's tables: what the guest is held to.
+            log::warn!("{}", be.rm_groups_summary());
+        }
         for (addr, config) in pci_config {
             be.set_pci_config(&addr, config);
         }
@@ -2343,6 +2391,46 @@ mod tests {
 
     fn args(a: &[&str]) -> Args {
         Args::try_parse_from(std::iter::once("vhost-user-nvgpu").chain(a.iter().copied())).unwrap()
+    }
+
+    /// `--rm-allow-group`: none by default; names, comma-separated or
+    /// repeated; an unknown one, or debug or profiling without
+    /// --allow-compute, refuses the start. `--osdesc-populate`: off unless
+    /// said on.
+    #[test]
+    fn rm_groups_are_named_and_the_compute_ones_need_compute() {
+        use device::rmgroup::Group;
+        let a = args(&[]);
+        assert!(
+            super::rm_groups(&a.rm_allow_group, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(a.osdesc_populate, "off");
+        let a = args(&[
+            "--rm-allow-group",
+            "thermal,health",
+            "--rm-allow-group=memacct",
+        ]);
+        let g = super::rm_groups(&a.rm_allow_group, false).unwrap();
+        for x in [Group::Thermal, Group::Health, Group::Memacct] {
+            assert!(g.contains(x), "{x:?}");
+        }
+        assert!(!g.contains(Group::Debug));
+        let a = args(&["--rm-allow-group", "debug"]);
+        let e = super::rm_groups(&a.rm_allow_group, false).unwrap_err();
+        assert!(e.to_string().contains("--allow-compute"), "{e}");
+        assert!(
+            super::rm_groups(&a.rm_allow_group, true)
+                .unwrap()
+                .contains(Group::Debug)
+        );
+        let a = args(&["--rm-allow-group", "profiling,thermal"]);
+        assert!(super::rm_groups(&a.rm_allow_group, false).is_err());
+        let a = args(&["--rm-allow-group", "gpu-everything"]);
+        assert!(super::rm_groups(&a.rm_allow_group, true).is_err());
+        assert_eq!(args(&["--osdesc-populate", "on"]).osdesc_populate, "on");
+        assert!(Args::try_parse_from(["vhost-user-nvgpu", "--osdesc-populate", "maybe"]).is_err());
     }
 
     /// sd_listen_fds(3): nothing unless LISTEN_PID is this process; a lone

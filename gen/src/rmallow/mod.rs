@@ -69,6 +69,28 @@ impl Release {
     pub fn deferred(&self, cmd: u32) -> bool {
         self.deferred.binary_search(&cmd).is_ok()
     }
+
+    /// What opt-in group `name` adds to this release's list.
+    pub fn group(&self, name: &str) -> Option<&'static Group> {
+        let groups: &'static [Group] = self.groups;
+        groups.iter().find(|g| g.name == name)
+    }
+}
+
+impl Group {
+    /// The group's control `cmd`, if it has it.
+    pub fn control(&self, cmd: u32) -> Option<&'static Control> {
+        let controls: &'static [Control] = self.controls;
+        controls
+            .binary_search_by_key(&cmd, |c| c.cmd)
+            .ok()
+            .map(|i| &controls[i])
+    }
+
+    /// Whether the group has class `class`.
+    pub fn class(&self, class: u32) -> bool {
+        self.classes.binary_search(&class).is_ok()
+    }
 }
 
 /// RM's name for control `cmd`, in any release measured.
@@ -302,6 +324,55 @@ mod tests {
         ] {
             assert!(r.class(class), "{what} ({class:#x}) refused");
         }
+    }
+
+    /// The opt-in groups are apart from the default list: none of their
+    /// members is on it, each release lists every group, and each member
+    /// carries the size measured for its release.
+    #[test]
+    fn opt_in_groups_add_only_what_the_default_list_lacks() {
+        for r in RELEASES {
+            let names: Vec<&str> = r.groups.iter().map(|g| g.name).collect();
+            assert_eq!(names, GROUP_NAMES, "{}", r.version());
+            for g in r.groups {
+                assert!(g.controls.windows(2).all(|w| w[0].cmd < w[1].cmd));
+                assert!(g.classes.windows(2).all(|w| w[0] < w[1]));
+                for c in g.controls {
+                    assert!(r.control(c.cmd).is_none(), "{}: {:#x}", g.name, c.cmd);
+                    assert!(c.size.is_some(), "{}: {:#x}", g.name, c.cmd);
+                }
+                for &k in g.classes {
+                    assert!(!r.class(k), "{}: {k:#x}", g.name);
+                }
+            }
+        }
+        let (r, _) = release_for(DriverVersion::new(595, 99, 2)).unwrap();
+        let thermal = r.group("thermal").unwrap();
+        assert_eq!(
+            thermal.control(0x2080_0513).and_then(|c| c.size),
+            Some(1432)
+        );
+        let debug = r.group("debug").unwrap();
+        assert_eq!(debug.control(0x83de_0315).and_then(|c| c.size), Some(24));
+        assert_eq!(debug.control(0x83de_0316).and_then(|c| c.size), Some(24));
+        // Not a member: the debugger's register operations.
+        assert!(debug.control(0x83de_031d).is_none());
+        let prof = r.group("profiling").unwrap();
+        assert!(prof.class(0xb1cc) && prof.class(0xb2cc));
+        assert_eq!(prof.control(0xb0cc_010a).and_then(|c| c.size), Some(3980));
+        // Left out: the power features, PC sampling, the legacy profiler.
+        for cmd in [0xb0cc_0301, 0xb0cc_010b, 0x90cc_0301] {
+            assert!(prof.control(cmd).is_none(), "{cmd:#x}");
+        }
+        assert!(!prof.class(0x90cc) && !prof.class(0x90cd));
+        // MEMACCT from 610, GET_IMPL from 615.
+        assert!(r.group("memacct").unwrap().controls.is_empty());
+        let (r, _) = release_for(DriverVersion::new(615, 71, 9)).unwrap();
+        let m = r.group("memacct").unwrap();
+        assert_eq!(m.control(0x3d0e).and_then(|c| c.size), Some(1032));
+        assert_eq!(m.control(0x3d0f).and_then(|c| c.size), Some(4));
+        assert!(m.control(0x3d0d).is_none(), "never SET_LIMITS");
+        assert!(r.group("nonesuch").is_none());
     }
 
     #[test]

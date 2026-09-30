@@ -196,7 +196,7 @@ impl NvidiaBackend {
         // answers itself below (rmctl.rs) never reach RM and keep their own
         // answers; the page-list path's classes are held to it too.
         let answered_here = escape == NV_ESC_RM_CONTROL
-            && (crate::rmctl::unix_refused(param_in).is_some()
+            && (self.rm_unix_refused(param_in).is_some()
                 || crate::rmctl::host_pid_control(param_in).is_some());
         if !answered_here
             && let Err(r) = self.rmallow.check(escape, param_in, ireq.data_len as usize)
@@ -267,6 +267,33 @@ impl NvidiaBackend {
             out.extend_from_slice(deep_bytes);
             return Ok(IoctlOut::deep(out, deep_bytes.len()));
         }
+        // The opt-in allowlist groups' rules (rmgroup.rs); nothing without
+        // `--rm-allow-group`. A word the group forces goes to RM in place of
+        // the guest's, which the reply gets back.
+        let group_fix = match self.rm_group_gate(
+            host_fd,
+            escape,
+            param_in,
+            deep_segs.is_some(),
+            deep_in.is_some(),
+        ) {
+            Ok(fix) => fix,
+            Err(status) => {
+                let at = crate::rmshare::status_at(escape).unwrap_or(0);
+                let mut out = nvos::with_status(param_in, at, status);
+                out.extend_from_slice(deep_bytes);
+                return Ok(IoctlOut::deep(out, deep_bytes.len()));
+            }
+        };
+        let group_sent = param_in;
+        let group_copy: Vec<u8>;
+        let param_in: &[u8] = match group_fix {
+            Some(fix) => {
+                group_copy = crate::rmgroup::apply(param_in, fix);
+                &group_copy
+            }
+            None => param_in,
+        };
 
         // What the memory an escape makes, duplicates, frees or GPU-maps is,
         // and the coherency rewrite (rmmem.rs): the host is handed a rewritten
@@ -325,10 +352,10 @@ impl NvidiaBackend {
             }
             // OS_UNIX controls whose descriptors nothing translates, and
             // ones RM does not define (rmctl.rs): RM's NOT_SUPPORTED.
-            NV_ESC_RM_CONTROL if crate::rmctl::unix_refused(param_in).is_some() => {
+            NV_ESC_RM_CONTROL if self.rm_unix_refused(param_in).is_some() => {
                 log::warn!(
                     "RM control {} refused: it names a host descriptor nothing translates",
-                    crate::rmctl::unix_refused(param_in).unwrap_or_default()
+                    self.rm_unix_refused(param_in).unwrap_or_default()
                 );
                 let mut out = crate::rmctl::unsupported(param_in);
                 let deep = deep_in.map_or(&[][..], |(_, b)| b);
@@ -398,6 +425,11 @@ impl NvidiaBackend {
             }
         };
 
+        if let Some(fix) = group_fix
+            && let Some(out) = served_mut(&mut r)
+        {
+            crate::rmgroup::restore(out, fix, group_sent);
+        }
         // The reply's parameters, laid out as the request's were; none when
         // the call failed before RM ran, and then nothing is recorded.
         if let Some(p) = rm_pending
