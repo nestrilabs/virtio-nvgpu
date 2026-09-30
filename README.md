@@ -606,8 +606,10 @@ objects on the host, and is turned away before the host driver sees it:
 - RM's `EXPORT_TO_DMABUF_FD`, which installs the new dma-buf in the caller's
   descriptor table — the backend's (`EOPNOTSUPP`). NVIDIA's GBM export through
   RM and CUDA's `cuMemGetHandleForAddressRange` with a dma-buf handle fail as
-  they would on a driver without dma-buf export. Translating it is future work;
-  dma-buf export through the DRM render node is unaffected
+  they would on a driver without dma-buf export. `--allow-dmabuf-export` (off
+  by default) serves it as a guest dma-buf of the caller's own video memory
+  that never leaves the VM ([DEPLOY.md](DEPLOY.md), "dma-buf export through
+  RM"); dma-buf export through the DRM render node is unaffected either way
 - IMEX sessions and fabric memory (classes `0xf1`, `0xf9`, `0xfd`), which name
   an OS event by descriptor and need `/dev/nvidia-caps` files and host-wide
   fabric management that no VM should have (`EPERM`)

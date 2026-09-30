@@ -78,6 +78,7 @@ let
       extraArgs = [ "--allow-compute" ];
       windowMiB = 16384;
       windowOwnerShare = 90;
+      dmabufExport = true;
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -293,7 +294,8 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     # The per-VM drop-in carries what the options asked for.
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50 --allow-compute --window-size 16384' "$dropinPath"
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
-    grep -q -- '--inject-uid 950' "$dropinPath"
+    grep -q -- '--inject-uid 950 --allow-dmabuf-export' "$dropinPath"
+    if grep -q -- '--allow-dmabuf-export' "$dropin1Path"; then exit 1; fi
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"
     grep -q 'ProtectHome=tmpfs' "$dropinPath"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"

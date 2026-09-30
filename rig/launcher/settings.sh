@@ -16,12 +16,18 @@ parse_args() {
     COMPUTE=0
     INJECT=0
     [ "${NVGPU_COMPUTE:-0}" = 1 ] && COMPUTE=1
+    DMABUF_EXPORT=${NVGPU_DMABUF_EXPORT:-0}
+    case $DMABUF_EXPORT in 0 | 1) ;; *) die "NVGPU_DMABUF_EXPORT=$DMABUF_EXPORT: 0 or 1" ;; esac
     VMM_KIND=${NVGPU_VMM_KIND:-nesbox}
     POSITIONAL=()
     while [ $# -gt 0 ]; do
         case $1 in
             --allow-compute)
                 COMPUTE=1
+                shift
+                ;;
+            --allow-dmabuf-export)
+                DMABUF_EXPORT=1
                 shift
                 ;;
             --inject)
@@ -61,6 +67,7 @@ parse_args() {
                 for a in "$@"; do
                     case $a in
                         --allow-compute) COMPUTE=1 ;;
+                        --allow-dmabuf-export) DMABUF_EXPORT=1 ;;
                         *)
                             [ "$a" = --kms-card ] && KMS_CARD=1
                             BACKEND_ARGS+=("$a")
@@ -91,6 +98,9 @@ backend_settings() {
     # Compute is the backend's to serve and the probe's to expect: one switch
     # for both (rig/guest-image/probes/render.sh reads nvgpu_compute).
     [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
+    # RM's dma-buf export, the same way: one switch for the backend and for
+    # the render probe (nvgpu_dmabuf_export).
+    [ "$DMABUF_EXPORT" = 1 ] && BACKEND_ARGS+=(--allow-dmabuf-export)
     # The window's size and per-process share: the backend's to take and to
     # check (it refuses what cannot be had), and the VMM's to follow. Passed
     # only when set, so an older backend named by NVGPU_BACKEND still starts.
@@ -224,6 +234,10 @@ run_settings() {
     case " $CMDLINE_EXTRA " in
         *" nvgpu_compute="*) ;;
         *) CMDLINE_EXTRA="${CMDLINE_EXTRA:+$CMDLINE_EXTRA }nvgpu_compute=$COMPUTE" ;;
+    esac
+    case " $CMDLINE_EXTRA " in
+        *" nvgpu_dmabuf_export="*) ;;
+        *) CMDLINE_EXTRA="$CMDLINE_EXTRA nvgpu_dmabuf_export=$DMABUF_EXPORT" ;;
     esac
     # An interactive run (the shell probe, nvgpu_hold=1) needs the guest console
     # on this terminal: with stdin at /dev/null the guest's shell reads EOF at

@@ -33,6 +33,9 @@
 # its group, and hands it over; a drop-in here then says
 #   [Unit]
 #   Requires=vhost-user-nvgpu-inject@N.socket
+# RM's dma-buf export (DEPLOY.md, "dma-buf export through RM"; off by
+# default) is one more flag there, and needs nothing of the unit:
+#   NVGPU_BACKEND_ARGS="--allow-dmabuf-export"
 # The backend is assumed at /usr/bin; adjust the path (or use
 # nix/module.nix) as installed.
 #
