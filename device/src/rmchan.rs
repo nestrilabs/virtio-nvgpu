@@ -34,7 +34,8 @@
 //!   VM one of [`VM_RATE`] after [`VM_BURST`]. A process's bucket is charged
 //!   for every call it asks for, served or not. The last [`VM_RESERVE`] of
 //!   the VM's tokens go only to a process that has used at most
-//!   [`RESERVE_FLOOR`] of its own recently, so processes that ask past
+//!   [`RESERVE_FLOOR`] of its own recently, the call it is making included
+//!   (fewer before it), so processes that ask past
 //!   their rate cannot take the calls of one that makes a few (quota.rs has
 //!   the same split for pools); it takes four processes each at its whole
 //!   rate to reach the VM's. Every other field (`bDisable`,
@@ -84,7 +85,10 @@ pub const VM_BURST: f64 = 160.0;
 /// The last of the VM's tokens, kept for processes that have used little.
 pub const VM_RESERVE: f64 = 40.0;
 /// Tokens a process may have used, of its [`PROC_BURST`], and still take
-/// from the reserve.
+/// from the reserve, the call that takes it included -- as a quota.rs floor
+/// counts the request itself: a process that had used fewer than this
+/// before the call is served from the reserve, one that had used this
+/// many is not.
 pub const RESERVE_FLOOR: f64 = 8.0;
 /// Processes with a bucket past which the full ones are dropped (a full
 /// bucket is a new one), at most once every [`PRUNE_EVERY`].
@@ -434,10 +438,12 @@ mod tests {
         let secs = 25_000.0 * 400e-6;
         assert!(hogs as f64 <= VM_BURST + VM_RATE * secs, "{hogs}");
         assert!(g.vm.tokens < VM_RESERVE + 5.0, "{}", g.vm.tokens);
-        // The quiet process makes its few calls, every one of them served.
+        // The quiet process makes its few calls, every one of them served:
+        // RESERVE_FLOOR of them, and not one more from the reserve.
         for k in 0..RESERVE_FLOOR as usize {
             assert_eq!(g.check(proc(1), &p, 536, t), Ok(()), "call {k}");
         }
+        assert_eq!(g.check(proc(1), &p, 536, t), Err(Refused::VmRate));
     }
 
     #[test]
