@@ -1323,6 +1323,14 @@ that is live on the host, and binds the socket file alone. Under the jailer
 the network namespace is the unit's (a chrooted process gets no user
 namespace); `"unshare-network": true` is for unjailed runs.
 
+nesbox's `virtio-nvgpu-v7` (a measurement branch, not the one DEPLOY.md
+names) holds each vCPU's KVM statistics descriptor open when
+`NESBOX_HOLD_KVM_STATS=1` is in its environment, so the rig's
+`rig/heavy/kvmstat.py` can read exits and halts: an ancestor of the same
+uid takes a duplicate with pidfd_getfd, which Yama's ptrace scope 1 allows
+it and nothing else. A statistics descriptor reads this VM's counters and
+does nothing else; the guest never sees it. Off by default.
+
 ### crosvm
 
 `patches/crosvm/` (ten patches; `patches/README.md` says what each is):
@@ -1835,6 +1843,23 @@ must be one of the caller's own open control files (R1, R2), so it takes a
 file another process handed over, as it does natively. That the primary
 client of every RM call is one of the calling file's own is RM's strict
 client validation, which the backend checks the host has at start (R3).
+
+**Games' options in the guest kernel.** `scripts/build-guest-kernel.sh`
+turns on transparent huge pages (`always`), ntsync and paravirtual
+spinlocks (BENCHMARKS.md, "Steam-like games"). None reaches the host.
+`/dev/ntsync` (0666, as distributions ship it) is a guest kernel driver
+every guest process can open: synchronisation objects that live in the
+file a process opened, shared only by passing that descriptor, so it gives
+one guest process nothing of another's; it is more guest kernel code
+within a guest user's reach, which the guest kernel is trusted with
+anyway. Huge pages and PV spinlocks change how the guest uses its own RAM
+and CPUs.
+
+**`VK_LAYER_NVGPU_no_uvm`** (`nvgpu-vk-layer/`) is an implicit Vulkan
+layer in every guest Vulkan process: it removes extensions from what the
+driver lists, clears their feature bits and refuses a device that asks for
+them. It reaches nothing outside its process, and can only make the driver
+look smaller; `NVGPU_VK_NO_UVM_DISABLE=1` keeps it out of a process.
 
 ### The guest module's parsers
 

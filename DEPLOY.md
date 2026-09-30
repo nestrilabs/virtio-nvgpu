@@ -462,8 +462,22 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   mitigation between the guest and host tasks on SMT siblings
   (SECURITY.md, "Frame pacing"): turn it off only on a single-tenant desktop. Even so
   crosvm ran a mailbox vkcube at about 3,300 fps to nesbox's 4,500.
-- **vCPUs**: 2, 4 and 8 paced the same for these workloads; give a game what
-  it uses in parallel, no more.
+- **vCPUs**: 2, 4 and 8 paced the same for these workloads, but a game's
+  throughput is the vCPUs it can use: a job-system engine ran 58 fps on 4,
+  99 on 8 and 158 on 16, 7-10% under the same program on as many host CPUs,
+  and a 4-vCPU guest is within a few percent of the program confined to 4
+  host CPUs (BENCHMARKS.md, "Steam-like games"). Give a modern game 8 or
+  more; a guest's vCPUs are host CPUs other work cannot have while the game
+  runs.
+- **The guest kernel**: transparent huge pages (`always`) and ntsync, as
+  `scripts/build-guest-kernel.sh` now sets them: without huge pages a
+  game's heap is all 4 KiB pages (10% in the job-system loop), and without
+  `/dev/ntsync` Wine and Proton fall back to slower synchronisation (11%
+  in a D3D11 game under Wine's own).
+- **Guest haltpoll** (`cpuidle_haltpoll.force=1` on the guest's command
+  line) makes a wakeup between vCPUs faster than natively (0.95 µs against
+  7.6 without it), but a polling vCPU runs no game thread: a D3D11 game
+  under Wine lost 9%. Not recommended by default.
 - **Direct scanout** (Hyprland `render:direct_scanout = 1`) scanned the
   fullscreen guest window out directly in every run and removed the FIFO
   vkcube's remaining missed vblanks (33 -> 0 in 9,600 frames; native 10 -> 4).
