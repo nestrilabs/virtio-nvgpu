@@ -1412,7 +1412,9 @@ int nvgpu_dri_init(struct nvgpu_device *dev) {
     }
 
     dri->drm = drm;
-    dri->registered = true;
+    dri->render_minor = drm->render ? drm->render->index : -1;
+    dri->primary_minor = drm->primary ? drm->primary->index : -1;
+    WRITE_ONCE(dri->registered, true);
     dev_dbg(&dev->vdev->dev,
             "virtio-gpu-nv: registered render node for %s, host (%u:%u) "
             "gpu_id=0x%x\n",
@@ -1436,9 +1438,9 @@ void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
      * files opened before stay open, and from here every ioctl and mmap on
      * them fails -ENODEV instead of reaching a dead transport;
      * this waits for any still inside (drm_dev_enter()). */
+    WRITE_ONCE(dri->registered, false);
     drm_dev_unplug(dri->drm);
     drm_dev_put(dri->drm);
     dri->drm = NULL;
-    dri->registered = false;
   }
 }

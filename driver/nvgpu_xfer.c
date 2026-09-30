@@ -39,6 +39,7 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/rcupdate.h>
 #include <linux/scatterlist.h>
 #include <linux/seqlock.h>
 #include <linux/sizes.h>
@@ -276,7 +277,9 @@ void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
     return;
 
   spin_lock_irqsave(&xf->lock, flags);
-  units = nvgpu_ctrl_harvest(xf, vq, &freed);
+  /* A dead transport's queue is being taken apart, as nvgpu_ctrl_poll()
+   * finds too. */
+  units = xf->dead ? 0 : nvgpu_ctrl_harvest(xf, vq, &freed);
   spin_unlock_irqrestore(&xf->lock, flags);
   nvgpu_ctrl_harvested(xf, units, freed);
 }
@@ -423,9 +426,18 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
     unsigned long gen;
     int wret;
 
+    /*
+     * Held from the look at `dead` through the notify, which runs after the
+     * lock is dropped and so is the one touch of the queue `dead` under the
+     * lock does not cover: remove() frees the queue (del_vqs) once
+     * nvgpu_xfer_reclaim() is done, and reclaim waits out this section
+     * after marking the transport dead.
+     */
+    rcu_read_lock();
     spin_lock_irqsave(&xf->lock, irqf);
     if (xf->dead) {
       spin_unlock_irqrestore(&xf->lock, irqf);
+      rcu_read_unlock();
       ret = -ENODEV;
       break;
     }
@@ -434,10 +446,11 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
     if (!ret) {
       kick = virtqueue_kick_prepare(dev->ctrl_vq);
       spin_unlock_irqrestore(&xf->lock, irqf);
-      break;
+      break; /* still in the read section, for the notify */
     }
     gen = xf->space_gen;
     spin_unlock_irqrestore(&xf->lock, irqf);
+    rcu_read_unlock();
 
     if (ret != -ENOSPC)
       break;
@@ -466,6 +479,7 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
   }
   if (kick)
     virtqueue_notify(dev->ctrl_vq);
+  rcu_read_unlock();
   return 0;
 }
 
@@ -1762,6 +1776,9 @@ void nvgpu_xfer_reclaim(struct nvgpu_device *dev) {
   spin_lock_irqsave(&xf->lock, flags);
   xf->dead = true;
   spin_unlock_irqrestore(&xf->lock, flags);
+  /* An enqueuer that saw it alive may still be notifying the queue, after
+   * its unlock; remove() frees the queue after this returns. */
+  synchronize_rcu();
   wake_up_all(&xf->space_wq);
   wake_up_all(&xf->exec_wq);
   nvgpu_fence_wake_waiters();

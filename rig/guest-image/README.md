@@ -101,6 +101,7 @@ powers off. A watchdog powers off a probe that overruns its budget.
 | `capture.sh` | capture injection: injected buffers opened through `/dev/nvgpu-capture`, imported into EGL and Vulkan and checked pixel by pixel; no writable CPU mapping; wrong tokens and released ids refused; explicit sync | `--inject`, with `rig/rig-tools/inject-hook.sh` |
 | `apps.sh` | the application pass: real applications through the Wayland proxy, one slot each, watched from the host by `rig/rig-app-check.sh` | `--wayland-socket` |
 | `run.sh` | one command line, base64 in `nvgpu_cmd`, with the probes' environment and the module loaded | any mode |
+| `unbind.sh` | `remove()` under load: the driver unbound while `nvgpu-syncobj-race` threads are inside ioctls, their files closed after the device has gone, then `rmmod`; the kernel log must stay clean (strict on a KASAN kernel). `nvgpu_threads`, `nvgpu_before` (seconds of load first) | any mode |
 | `secneg.sh` | security negatives: `sec-negative.sh`, plus the KMS tests on the card or on a lease | any; KMS tests need a card or lease |
 | `shell.sh` | an interactive shell on `hvc0` | any |
 | `nodev.sh` | none: the image with **no** virtio-nvgpu device (QEMU/TCG, the rig's own smoke script). insmod/rmmod, the NVIDIA userspace failing cleanly (`nvidia-smi`, `vulkaninfo` finding the ICD, `cuda-smoke`), `nvgpu-wl-guest`, the module's probe-failure path on a virtio-rng decoy (`nvgpu_decoy=0` skips it). FAILs on purpose when a device is there | QEMU, no backend |
