@@ -69,6 +69,13 @@
 //!   open device file per millisecond -- a guest holding a thousand idle
 //!   nvidiactl files pinned a host core (S-21) -- and with nothing to sweep
 //!   the pump now sleeps until an event or a kick.
+//! - **A kick drained with its instruction left behind.** The backend
+//!   queues an instruction and then kicks the wake eventfd; the pump drains
+//!   that eventfd *before* it takes the instructions ([`Pump::step`]).
+//!   Drained after, a kick for an instruction queued in between went with
+//!   the drain, and the pump slept with the instruction in the channel until
+//!   some other kick -- a syncobj wait's Watch, and every guest waiter on its
+//!   point, asleep for as long as the guest made no other call.
 //! - **Latency when buffers run out.** A kick on the event queue (the guest
 //!   posting buffers) writes an eventfd this loop waits on, and the pump
 //!   enables notifications on the queue whenever it finds none posted -- with
@@ -641,6 +648,10 @@ pub struct Pump<Q: EventQueue> {
     pollfds: Vec<libc::pollfd>,
     last_sweep: Instant,
     buf: Vec<u8>,
+    /// Run in each round just after the instructions are taken (tests: an
+    /// instruction sent from another thread at that moment).
+    #[cfg(test)]
+    after_commands: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<Q: EventQueue + 'static> Pump<Q> {
@@ -681,6 +692,8 @@ impl<Q: EventQueue> Pump<Q> {
             pollfds: Vec::new(),
             last_sweep: Instant::now(),
             buf: vec![0u8; DRM_READ_MAX],
+            #[cfg(test)]
+            after_commands: None,
         };
         pump.ctl(
             libc::EPOLL_CTL_ADD,
@@ -761,10 +774,25 @@ impl<Q: EventQueue> Pump<Q> {
         };
         PACING.pump_wakes.fetch_add(1, Relaxed);
 
+        // The kick is taken before the instructions are, never after. A
+        // sender queues its instruction and then kicks; drained after the
+        // last instruction was taken, the kick of one queued in between is
+        // lost with the drain, the instruction stays in the channel, and
+        // the pump sleeps until some other kick -- a Watch whose eventfd has
+        // fired, and every guest waiter on it, left asleep. Drained first,
+        // a kick either comes with an instruction the loop below takes, or
+        // stays and wakes the next wait at once.
+        if events.iter().take(n).any(|ev| ({ ev.u64 }) == WAKE) {
+            crate::sys::fd::eventfd_drain(self.wake.as_raw_fd());
+        }
         // Instructions first: a descriptor closed on the queue thread must
         // leave the set before it can be reported again.
         if !self.apply_commands() {
             return false;
+        }
+        #[cfg(test)]
+        if let Some(f) = self.after_commands.as_mut() {
+            f();
         }
         // What the wait took from armed descriptors: each is reported (or,
         // if an instruction just now disarmed it, remembered), never dropped.
@@ -779,7 +807,7 @@ impl<Q: EventQueue> Pump<Q> {
             // borrowed.
             let data = { ev.u64 };
             if data == WAKE {
-                crate::sys::fd::eventfd_drain(self.wake.as_raw_fd());
+                // Drained already, before the instructions were taken.
                 continue;
             }
             PACING.ev_edge.fetch_add(1, Relaxed);
@@ -1703,6 +1731,58 @@ mod tests {
         h.send(PumpCmd::Unwatch { handle: 9 });
         pump.step_with_timeout(0);
         assert!(pump.outbox.is_empty());
+    }
+
+    /// nvgpu-syncobj-race's owners, every one asleep for a second on an
+    /// eventfd whose point the host had signalled (the compat probe, twice
+    /// in sixteen runs, with the host loaded): each owner's last WATCH was
+    /// queued while the pump was between taking its instructions and
+    /// draining its kick, the drain took those kicks, and the pump slept
+    /// with the Watches still in the channel -- until an owner, given up on
+    /// its eventfd, sent something else. The guest took no event record in
+    /// all that time, nor for thirty seconds when the owners waited on
+    /// (rig/guest-image/tools/syncobj-race.c's diagnosis). An instruction
+    /// queued at that moment must leave the pump's next wait woken.
+    #[test]
+    fn an_instruction_queued_as_the_pump_takes_its_instructions_wakes_its_next_wait() {
+        let q = FakeQueue::default();
+        q.post(4, EVENT_BUF_SIZE);
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        // A registration's eventfd, its point already signalled; its Watch
+        // is sent -- queued, then kicked -- just after the pump has taken
+        // the instructions of the round the SetV2 woke.
+        let efd = crate::hostfd::new_eventfd().unwrap();
+        write_all(&efd, &1u64.to_ne_bytes());
+        let cookie = 0xfeed_0000_0001;
+        let mut late = Some((h.clone(), efd.try_clone().unwrap()));
+        pump.after_commands = Some(Box::new(move || {
+            if let Some((h, fd)) = late.take() {
+                h.send(PumpCmd::Watch {
+                    handle: 4,
+                    fd,
+                    mode: WatchMode::Ready {
+                        cookie,
+                        oneshot: true,
+                        consume: false,
+                    },
+                });
+            }
+        }));
+        pump.step_with_timeout(0);
+        assert!(q.take().is_empty(), "the Watch came after this round's");
+        assert!(
+            readable(h.wake.as_raw_fd()),
+            "its kick is still there for the next wait"
+        );
+        let t = Instant::now();
+        pump.step_with_timeout(10_000);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the next wait returned at once, not at its timeout ({:?})",
+            t.elapsed()
+        );
+        assert_eq!(records(&q.take()[0]), vec![(EV_READY, cookie, vec![])]);
     }
 
     /// A hold whose drop a test can see: the count of `Arc` references.
