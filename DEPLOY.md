@@ -292,6 +292,51 @@ the backend as the socket's owner (the
 desktop user), which puts a compromised backend one step from the desktop
 session; the per-VM user above avoids that. `--wayland-lease` needs the
 patched Hyprland and a monitor marked `leasable` ([`patches/`](patches/)).
+
+**The lease, on the compositor's side.** Three knobs of the patched
+Hyprland, all off by default, which leave a `leasable` monitor as it was:
+any client of the compositor that sees the lease device may lease it, as
+often as it likes, until it lets go. Their full text is in
+[`patches/README.md`](patches/README.md), "Who may lease it, how often, and
+taking it back"; what each exposes is in SECURITY.md, "The host desktop".
+
+| monitor rule key or dispatcher | default | gain | cost |
+|---|---|---|---|
+| `lessee = USER` | any client | only the VM's backend (its per-VM user) is offered the monitor or may lease it; the desktop's own clients never see it | none, with a per-VM user; with the rig's launcher (the backend as the desktop user) it separates nothing |
+| `lease_interval = MS` | 0 | a monitor is released (a blocking modeset) at most once per interval, whoever asks | a lessee that lets go and asks again sooner is refused, and has to ask later |
+| `revokelease MONITOR` / `hl.dsp.revoke_lease` | none | the host takes a leased monitor back without stopping the VM | none: the guest sees its display go, as on an unplug |
+
+The recommended rule for a VM's monitor, with the backend running as
+`nvgpu-vm0`:
+
+```lua
+hl.monitor({ output = "DP-2", disabled = true, leasable = true, lessee = "nvgpu-vm0", lease_interval = 2000 })
+```
+
+```ini
+# hyprland.conf (0.56.2)
+monitor = DP-2, disable, leasable, 1, lessee, nvgpu-vm0, lease_interval, 2000
+```
+
+`disabled = true` keeps the desktop off the monitor, so a lease or its end
+never moves windows. With 2 s a guest compositor that restarts leases again
+at once, and a client that asks in a loop gets the monitor released once
+every 2 s at most; a second request within 2 s of the first is refused, and
+the guest has to ask again. The backend's own limit
+(`--wayland-lease-interval`) is per VM and holds only the VM; this one is
+per monitor and holds every client. To take the monitor back and keep it,
+withdraw the offer, then revoke:
+
+```sh
+hyprctl eval 'hl.monitor({ output = "DP-2", leasable = false }); hl.dispatch(hl.dsp.revoke_lease({ monitor = "DP-2" }))'
+# hyprlang: hyprctl keyword monitor DP-2, disable, leasable, 0 && hyprctl dispatch revokelease DP-2
+```
+
+`hyprctl monitors all` shows `lessee` (a uid, `any`, or `nobody` for a user
+name that did not resolve) and `leaseInterval` for each monitor. Hyprland's
+`permission` rules cannot stand in for `lessee`: they match a client by its
+executable, which the compositor cannot read for the backend (it is
+undumpable, and a per-VM user besides).
 Export mode admits only host clients of the backend's own uid, so there it
 is run as the owner of the export socket's directory; like the compositor VM
 it has not run on hardware.

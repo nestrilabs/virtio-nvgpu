@@ -648,7 +648,11 @@ most once a second per connector.
   A lease that has ended for good has its file closed and its NVKMS grants
   forgotten.
 - Lease submits are rate-limited per VM.
-- How long a lease is held is not limited. That is what a lease is for.
+- How long a lease is held is not limited. That is what a lease is for. The
+  host can take it back (`revokelease`, "The host desktop"). That is the
+  lessor's REVOKE_LEASE ioctl, so nvidia-drm also takes back the lessee's
+  NVKMS grants on those connectors, and the backend's lease check finds the
+  lease empty and closes its file (`kms.rs`, `lease_state`).
 
 ### The window's size and share
 
@@ -1632,6 +1636,53 @@ from the desktop, and taken back when the lease ends. With no monitor marked,
 Hyprland's behaviour is unchanged apart from protocol fixes
 (`patches/README.md`).
 
+By default a `leasable` monitor may be leased by **any** client of the
+compositor that can see the lease device: every unsandboxed host Wayland
+client of the desktop user, not only the VM's backend (clients that come
+through a security context never see the device). Nothing bounds how often,
+and each grant and each end is a blocking modeset inside a Wayland request.
+Three knobs of the patches, all off by default, narrow that
+(`patches/README.md`, "Who may lease it, how often, and taking it back";
+DEPLOY.md, "Per-VM users"):
+
+- **`lessee = USER`** (a monitor rule key). *Exposes:* nothing; it takes
+  away. Only clients whose connection's uid (`SO_PEERCRED`, read by
+  libwayland when the client connected) is that user's are sent the
+  monitor's connector, and a lease request is checked again at submit,
+  against the rule in force then. A name that does not resolve, or a number
+  that is not a uid, leases to nobody, never to anybody. *Still holds:* with
+  the backend as a per-VM user, the desktop's own clients cannot lease the
+  monitor at all. *Does not hold:* with the rig's launcher, which runs the
+  backend as the desktop user, it separates nothing. Every app in that VM
+  reaches the compositor as the backend, so every one may lease within what
+  the backend allows (`--wayland-lease`, its per-VM rate). A lease already
+  granted is not ended by a lessee change. Hyprland's own `permission`
+  rules were considered and cannot do this: they match a client's
+  executable through `/proc/<pid>/exe`, which the compositor cannot read
+  for an undumpable process or one of another uid, and the backend is both.
+- **`lease_interval = MS`** (a monitor rule key, up to an hour). *Exposes:*
+  nothing. A request that comes sooner than MS after the monitor was last
+  released for a lease, granted or not, gets `finished` before anything is
+  released, so a client asking in a loop costs one blocking modeset pair per
+  interval, not one per request. *Does not hold:* it is per monitor, not per
+  client, so a client asking often can make another's request, just after,
+  be refused; and it bounds the rate, not how long one lease is held.
+- **`revokelease [MONITOR]`** (hyprlang), **`hl.dsp.revoke_lease`** (Lua).
+  *Exposes:* nothing to any client: it is the desktop user's, through
+  `hyprctl` or a keybind. The kernel revokes the lease first
+  (`drmModeRevokeLease`), after which the lessee's file can no longer commit
+  to the CRTC; nothing is committed from inside the dispatcher. The monitor
+  is taken back from an idle callback with a blocking commit that carries no
+  buffer: it waits for a flip the lessee had already queued, then takes the
+  lessee's framebuffers off the primary and cursor planes, before the
+  desktop renders there again. Every lease end does the same. The lessee's
+  buffers themselves are the kernel's to keep alive while a plane shows them
+  (framebuffers are reference-counted). *Does not hold:* the offer stays, so a
+  lessee may ask again at once (subject to `lease_interval`); withdraw it
+  first (`leasable = false`) to keep the monitor. A lessee's queued flip that
+  waits on a fence that never signals holds the blocking commit until the
+  driver gives up, as it did before.
+
 **Export mode.** Host programs of the backend's uid become clients of the
 guest's compositor. Their dma-bufs are imported into the guest with their real
 type. One listener is allowed per export.
@@ -2363,10 +2414,11 @@ carries; Appendix C has their history.
       refusal of SHM_SYNC before commit (S-4).
     - No backpressure towards the compositor (S-18's optional item 3).
     - The lease cache is not cleared on compositor restart (S-30).
-    - The Hyprland patches have no lease debounce (S-9), and
-      `setLeaseOffered(false)` does not end an active lease. Short of ending
-      the VM or unplugging the monitor, the host cannot take a leased
-      monitor back.
+    - The Hyprland patches' lease debounce (`lease_interval`, S-9), their
+      restriction of who may lease (`lessee`) and the host's revoke
+      (`revokelease`) are opt-in, and have not yet run on hardware. With
+      the defaults any host client of the desktop user may lease a
+      `leasable` monitor, as often as it likes ("The host desktop").
     - A client may hold a stream sink's share of the queue budget by never
       reading its pipe, as it may hold a queue by never reading its socket;
       both are its own process's share (FW-4, WL-S6).
@@ -4159,7 +4211,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | S-6 | medium | KMS commits can scan out any host framebuffer | `19c3186` | fixed |
 | S-7 | medium | channels are full compositor clients, with no per-VM cap | `de95ad3` | **partly**: channel cap and queue budget done; per-interface object caps, a CONNECT rate limit and RLIMIT_NOFILE not |
 | S-8 | medium | forced EDID reads hold `nvkms_lock` from up to 16 executors | `429d57c` | **partly**: probes rate-limited; one executor lane per class and a lower ALLOC_DEVICE cap not done |
-| S-9 | medium | lease churn stalls the host compositor | `6e4c501` | fixed in the backend; the Hyprland-side debounce not done |
+| S-9 | medium | lease churn stalls the host compositor | `6e4c501` | fixed in the backend; the Hyprland-side debounce is a knob (`lease_interval`), off by default |
 | S-10 | medium | `/dev/nvgpu-wl` 0666; any guest user can ACCEPT host programs | `e1e26d7`, `de95ad3` | fixed |
 | S-11 | medium | a host GEM handle gets two guest owners | `f264599` | fixed; three edge cases open, not re-checked since (open item 12) |
 | S-12 | medium | a dead fence's consumer signals a reused id | `037c20f` | fixed |
