@@ -1,0 +1,278 @@
+From 49e71ad994a5185da8c3735c7c3ecefb156cfc23 Mon Sep 17 00:00:00 2001
+From: Jacob Root <me@rooty.dev>
+Date: Wed, 30 Sep 2026 00:28:35 +0000
+Subject: [PATCH] crosvm: --prefault-memory, guest RAM faulted in and on 2 MiB
+ pages
+
+A guest under crosvm stalled for a frame of 20-40 ms at a time, in bursts,
+where the same guest under nesbox did not: SuperTuxKart's 0.1% low at 4K
+was 35-37 fps against nesbox's 72-82. Guest RAM is a memfd, and crosvm
+leaves every page of it to the guest's first touch: a second-level fault
+and a host page fault that allocates and zeroes one 4 KiB page, each time a
+guest program reaches memory the guest has not used yet -- which a game
+does in bursts long after boot. Touching the guest's free memory from
+inside the guest first took the lows to nesbox's. And a memfd's huge pages
+are the host's shmem policy's, upstream's default `never` giving none, so
+every guest access also walked 4 KiB second-level pages.
+
+--prefault-memory starts a thread as the vCPUs start that
+MADV_POPULATE_WRITEs all of guest RAM (a page the guest reached first is
+left as it is; nothing is written), then MADV_COLLAPSEs it into 2 MiB pages
+one block at a time -- which a `never` host allows, and which over a whole
+range would stop at the first block it cannot allocate. It runs only once
+every device process is forked (minijail refuses to fork a process with a
+thread of its own), and not for a VM whose memory the host may not touch.
+An 8 GiB guest was faulted in after 1.0 s and all on 2 MiB pages after 2.5
+s, and the 0.1% low above went to 80. The cost is the whole of guest RAM
+committed as the VM starts.
+
+A 2 MiB page of the file can back guest RAM only where the host address is
+as far past a 2 MiB boundary as the file offset is. base's `align` for a
+file mapping now means exactly that (the address aligned relative to the
+offset; plain alignment for an aligned offset, as before), and with the
+option guest RAM regions of 2 MiB or more are mapped so: the region at
+1 MiB of guest memory is at offset 1 MiB of the file, and refused every
+collapse otherwise.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ base/src/sys/linux/mmap.rs |  11 +++-
+ src/crosvm/cmdline.rs      |   7 +++
+ src/crosvm/config.rs       |   4 ++
+ src/crosvm/sys/linux.rs    | 118 ++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 137 insertions(+), 3 deletions(-)
+
+diff --git a/base/src/sys/linux/mmap.rs b/base/src/sys/linux/mmap.rs
+index 836a0f6..0000182 100644
+--- a/base/src/sys/linux/mmap.rs
++++ b/base/src/sys/linux/mmap.rs
+@@ -299,13 +299,17 @@ impl MemoryMapping {
+             align
+         };
+ 
+-        // Add an address if an alignment is requested.
++        // Add an address if an alignment is requested. A file mapping is aligned relative to its
++        // offset (`addr % align == offset % align`), so that a block of the file on an `align`
++        // boundary -- a huge page -- is one at the same boundary of the mapping; for an offset on
++        // the boundary that is plain alignment.
+         let (addr, orig_addr, orig_size) = match align {
+             None | Some(0) => (addr, None, None),
+             Some(align) => {
+                 if !addr.is_null() || !align.is_power_of_two() {
+                     return Err(Error::InvalidAlignment);
+                 }
++                let phase = fd.map_or(0, |(_, offset)| offset & (align - 1));
+                 let orig_size = size + align as usize;
+                 let orig_addr = libc::mmap64(
+                     null_mut(),
+@@ -322,8 +326,11 @@ impl MemoryMapping {
+                 flags |= libc::MAP_FIXED;
+ 
+                 let mask = align - 1;
++                // The first address at or past `orig_addr` that is `phase` past a boundary: at
++                // most `mask` bytes in, so the mapping still ends inside the reservation.
++                let skip = phase.wrapping_sub(orig_addr as u64) & mask;
+                 (
+-                    (orig_addr.wrapping_add(mask as usize) as u64 & !mask) as *mut libc::c_void,
++                    orig_addr.wrapping_add(skip as usize),
+                     Some(orig_addr),
+                     Some(orig_size),
+                 )
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+index 21825e1..f5374be 100644
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -1690,6 +1690,12 @@ pub struct RunCommand {
+     ///       (default: "0 <current egid> 1")
+     pub pmem_ext2: Vec<PmemExt2Option>,
+ 
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    #[argh(switch)]
++    /// fault in all of guest RAM on a thread of its own as the VM starts, and collapse it into
++    /// 2 MiB pages, rather than on the guest's first touch of each page
++    pub prefault_memory: Option<bool>,
++
+     #[cfg(feature = "process-invariants")]
+     #[argh(option, arg_name = "PATH")]
+     /// shared read-only memory address for a serialized EmulatorProcessInvariants proto
+@@ -2490,6 +2496,7 @@ impl TryFrom<RunCommand> for super::config::Config {
+         #[cfg(any(target_os = "android", target_os = "linux"))]
+         {
+             cfg.lock_guest_memory = cmd.lock_guest_memory.unwrap_or_default();
++            cfg.prefault_memory = cmd.prefault_memory.unwrap_or_default();
+             cfg.boost_uclamp = cmd.boost_uclamp.unwrap_or_default();
+         }
+ 
+diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
+index 7d2bcdd..0ce8032 100644
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -727,6 +727,8 @@ pub struct Config {
+     #[cfg(any(target_os = "android", target_os = "linux"))]
+     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
+     pub pmems: Vec<PmemOption>,
++    #[cfg(any(target_os = "android", target_os = "linux"))]
++    pub prefault_memory: bool,
+     #[cfg(feature = "process-invariants")]
+     pub process_invariants_data_handle: Option<u64>,
+     #[cfg(feature = "process-invariants")]
+@@ -969,6 +971,8 @@ impl Default for Config {
+             #[cfg(any(target_os = "android", target_os = "linux"))]
+             pmem_ext2: Vec::new(),
+             pmems: Vec::new(),
++            #[cfg(any(target_os = "android", target_os = "linux"))]
++            prefault_memory: false,
+             #[cfg(feature = "process-invariants")]
+             process_invariants_data_handle: None,
+             #[cfg(feature = "process-invariants")]
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index bce0a0a..00eb496 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -1814,11 +1814,27 @@ fn create_guest_memory(
+     let guest_mem_layout = Arch::guest_memory_layout(components, arch_memory_layout, hypervisor)
+         .context("failed to create guest memory layout")?;
+ 
+-    let guest_mem_layout = punch_holes_in_guest_mem_layout_for_mappings(
++    let mut guest_mem_layout = punch_holes_in_guest_mem_layout_for_mappings(
+         guest_mem_layout,
+         &cfg.file_backed_mappings_ram,
+     )?;
+ 
++    // A 2 MiB page of the memory file can back guest RAM only where the host address is as far
++    // past a 2 MiB boundary as the file offset is (the guest address is too: the layout keeps it
++    // equal to the offset below 4 GiB, and whole huge pages past it above). The mapping is
++    // placed so (base's `align` of a file mapping); shmem would place it there by itself only
++    // when its huge page policy faults huge pages in, and a collapse is what gives a host whose
++    // policy is `never` huge pages at all.
++    if prefaults_memory(cfg) {
++        for (_, size, options) in guest_mem_layout.iter_mut() {
++            if is_prefaulted_ram(options) && *size >= PREFAULT_HUGE_PAGE && options.align == 0 {
++                options.align = PREFAULT_HUGE_PAGE;
++            }
++        }
++    } else if cfg.prefault_memory {
++        warn!("--prefault-memory: not for a VM whose memory the host may not touch; ignored");
++    }
++
+     let mut guest_mem = GuestMemory::new_with_options(&guest_mem_layout)
+         .context("failed to create guest memory")?;
+     let mut mem_policy = MemoryPolicy::empty();
+@@ -1849,6 +1865,100 @@ fn create_guest_memory(
+     Ok(guest_mem)
+ }
+ 
++/// Whether `--prefault-memory` applies to this VM (`create_guest_memory` says why not once).
++fn prefaults_memory(cfg: &Config) -> bool {
++    cfg.prefault_memory && !cfg.protection_type.isolates_memory()
++}
++
++/// The huge page size `--prefault-memory` collapses guest RAM into.
++const PREFAULT_HUGE_PAGE: u64 = 2 << 20;
++
++/// `MADV_POPULATE_WRITE` (Linux 5.14) and `MADV_COLLAPSE` (Linux 6.1).
++const MADV_POPULATE_WRITE: libc::c_int = 23;
++const MADV_COLLAPSE: libc::c_int = 25;
++
++/// Whether `--prefault-memory` fills a region: guest RAM, not a file the operator mapped in.
++fn is_prefaulted_ram(options: &MemoryRegionOptions) -> bool {
++    options.purpose == vm_memory::MemoryRegionPurpose::GuestMemoryRegion
++        && options.file_backed.is_none()
++}
++
++/// `--prefault-memory`: fault in all of guest RAM on a thread of its own, then collapse it into
++/// 2 MiB pages. Started as the vCPUs are, after every device process has been forked.
++///
++/// Without it every page of guest RAM is allocated and zeroed on the guest's first touch of it,
++/// a second-level fault and a host page fault each, one 4 KiB page at a time -- for as long as
++/// the guest keeps reaching memory it has not used yet, which a guest running a game does in
++/// bursts long after boot (a frame of 20-40 ms at a time). And guest memory is a memfd, whose
++/// huge pages the host's shmem policy decides: upstream's default, `never`, gives it none, so
++/// every guest access walks 4 KiB second-level pages.
++///
++/// `MADV_POPULATE_WRITE` allocates each page as a write would, without writing, so racing the
++/// booting guest is safe: a page the guest reached first is left as it is. `MADV_COLLAPSE` then
++/// turns what is present into 2 MiB pages whatever `shmem_enabled` says (except `deny`), copying
++/// where it has to; the guest sees the same memory throughout, as it does when khugepaged makes
++/// its rounds. One block at a time: over a whole range the kernel gives up at the first block
++/// it cannot find a huge page for. The cost is the whole of guest RAM committed as the VM starts
++/// rather than as the guest first uses it.
++fn spawn_guest_memory_prefault(guest_mem: GuestMemory) {
++    let spawned = std::thread::Builder::new()
++        .name("prefault".into())
++        .spawn(move || {
++            let started = std::time::Instant::now();
++            let ranges: Vec<(usize, usize)> = guest_mem
++                .regions()
++                .filter(|r| is_prefaulted_ram(&r.options))
++                .map(|r| (r.host_addr, r.size))
++                .collect();
++            for &(addr, size) in &ranges {
++                // SAFETY: a range of a mapping `guest_mem` keeps alive for as long as this thread
++                // holds it. POPULATE_WRITE writes nothing.
++                let ret =
++                    unsafe { libc::madvise(addr as *mut libc::c_void, size, MADV_POPULATE_WRITE) };
++                if ret != 0 {
++                    warn!(
++                        "prefault: guest RAM left to fault on first touch: {}",
++                        std::io::Error::last_os_error()
++                    );
++                    return;
++                }
++            }
++            let populated = started.elapsed();
++            let huge = PREFAULT_HUGE_PAGE as usize;
++            let (mut collapsed, mut refused) = (0usize, 0usize);
++            'ranges: for &(addr, size) in &ranges {
++                let mut block = addr.next_multiple_of(huge);
++                while block + huge <= addr + size {
++                    // SAFETY: as above; a collapse moves the contents into new pages and the
++                    // guest sees the same memory throughout.
++                    let ret =
++                        unsafe { libc::madvise(block as *mut libc::c_void, huge, MADV_COLLAPSE) };
++                    if ret == 0 {
++                        collapsed += 1;
++                    } else {
++                        let err = std::io::Error::last_os_error();
++                        refused += 1;
++                        // EINVAL: a kernel before 6.1, or a range it will not collapse at all.
++                        if err.raw_os_error() == Some(libc::EINVAL) {
++                            info!("prefault: guest RAM at {addr:#x} stays on small pages: {err}");
++                            continue 'ranges;
++                        }
++                    }
++                    block += huge;
++                }
++            }
++            info!(
++                "prefault: guest RAM faulted in after {populated:?}, collapsed after {:?}: \
++                 {} MiB on 2 MiB pages, {refused} blocks left small",
++                started.elapsed(),
++                collapsed * 2
++            );
++        });
++    if let Err(e) = spawned {
++        warn!("prefault: no thread, so guest RAM faults in on first touch: {e}");
++    }
++}
++
+ #[cfg(all(target_arch = "aarch64", feature = "geniezone"))]
+ fn run_gz(device_path: Option<&Path>, cfg: Config, components: VmComponents) -> Result<ExitState> {
+     use devices::GeniezoneKernelIrqChip;
+@@ -4297,6 +4407,12 @@ fn run_control(
+     #[cfg(not(target_arch = "x86_64"))]
+     let nvgpu_prefault = None;
+ 
++    // Here, with every device process forked: a process with a thread of its own cannot fork a
++    // jail (minijail refuses), and guest RAM is only reached once the vCPUs run.
++    if prefaults_memory(&cfg) {
++        spawn_guest_memory_prefault(linux.vm.get_memory().clone());
++    }
++
+     let (vcpu_pid_tid_sender, vcpu_pid_tid_receiver) = mpsc::channel();
+     for ((cpu_id, vcpu), vcpu_init) in vcpus.into_iter().enumerate().zip(linux.vcpu_init.drain(..))
+     {
+-- 
+2.55.0
+

@@ -99,6 +99,19 @@ crosvm_config() {
         transparent) VMM_ARGS+=(--hugepages) ;;
         2m | 1g) die "NVGPU_HUGEPAGES=$HUGEPAGES: crosvm takes only transparent (--hugepages)" ;;
     esac
+    # Guest RAM faulted in and collapsed into 2 MiB pages as the VM starts,
+    # as nesbox does by default (patches/crosvm 0011): without it a guest
+    # that reaches memory it has not used yet -- a game, long after boot --
+    # stalls for a frame of 20-40 ms at a time on host page faults, and
+    # every access walks 4 KiB pages. NVGPU_PREFAULT=0 leaves it to the
+    # first touch; a crosvm without the option is only noted.
+    if [ "$PREFAULT" != 0 ]; then
+        case $CROSVM_HELP in
+            *--prefault-memory*) VMM_ARGS+=(--prefault-memory) ;;
+            *) echo "run-guest: note: $VMM has no --prefault-memory; guest RAM faults in on" \
+                "first touch, on 4 KiB pages (build it with patches/crosvm)" >&2 ;;
+        esac
+    fi
     [ "${NVGPU_CROSVM_CORE_SCHED:-1}" = 1 ] || VMM_ARGS+=(--core-scheduling=false)
     VMM_ARGS+=(-p "${BOOT_ARGS#"$CONSOLE_ARGS "}")
     case $DISK$SOCK in *,*) die "a comma in $DISK or $SOCK would split crosvm's option" ;; esac

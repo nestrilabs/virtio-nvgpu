@@ -69,7 +69,8 @@
 #                       collapsed into THP), 2m or 1g (the hugetlb pool, which
 #                       must be reserved); crosvm: transparent adds
 #                       --hugepages (MADV_HUGEPAGE)
-#   NVGPU_PREFAULT=0    nesbox: fault guest RAM in on first touch instead
+#   NVGPU_PREFAULT=0    fault guest RAM in on first touch instead (nesbox;
+#                       crosvm with patches/crosvm 0011, --prefault-memory)
 #   NVGPU_SLICE_US      the EEVDF slice of every VMM and backend thread, in
 #                       microseconds (chrt --other --sched-runtime; 100 to
 #                       100000, no privilege needed): a shorter slice than
