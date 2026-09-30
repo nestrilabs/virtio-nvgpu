@@ -117,14 +117,13 @@ static long nvgpu_rmx_exchange(struct nvgpu_fd *nfd, unsigned int cmd,
   if (ret < 0)
     goto out;
   ret = r.status;
-  if (!r.full)
+  if (ret < 0)
     goto out;
-  /* The block comes back whole or not at all; a success without it is not
-   * one this side can use. */
-  if (r.data_len != sz || r.nested_len ||
+  /* A success brings the block back whole: one without it is not one this
+   * side can answer the caller with (its own bytes would read as RM's). */
+  if (!r.full || r.data_len != sz || r.nested_len ||
       !nvgpu_resp_has(r.used, sizeof(struct nvgpu_ioctl_resp), sz)) {
-    if (ret >= 0 && r.data_len)
-      ret = -EPROTO;
+    ret = -EPROTO;
     goto out;
   }
   memcpy(block, resp + sizeof(struct nvgpu_ioctl_resp), sz);

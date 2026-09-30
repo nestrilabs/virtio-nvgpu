@@ -750,6 +750,29 @@ shown with a synthetic snapshot, since the rig has no root: the guest's
 `lspci -vvv` reads `Capabilities: [40] Null` without it, and the snapshot's
 PCIe capability and link with it.
 
+## dma-buf export through RM
+
+`NVGPU_DMABUF_EXPORT=1` (or `--allow-dmabuf-export`) gives the backend the
+switch and the probes `nvgpu_dmabuf_export=1`: the render probe then runs
+`nvgpu-rm-dmabuf --loops 3`, and without it `--expect-refused`; secneg's
+T14-T17 run either way. 2026-09-30, branch `knob-dmabuf`, nesbox, the Rust
+module on the Rust kernel, sandbox on, `nvgpu_secneg_kms=none`:
+
+| probe | switch off | switch on |
+|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 |
+| compat | 13/0/0 | 13/0/0 |
+| render | 10/0/1; the export refused (EOPNOTSUPP) | 10/0/1; three exports made, 2 MiB each, imported by the render node as dma-buf objects, `mmap` refused (EOPNOTSUPP), the append form refused (`NV_ERR_NOT_SUPPORTED`) |
+| secneg | 16 passed, 6 skipped (T14 SKIP) | 17 passed, 5 skipped |
+
+In both, NVIDIA's EGL (`EGL_BAD_ALLOC`) and Vulkan (no memory type) refuse
+the dma-buf, as they do natively on the RTX 5090 with 595.99.02
+(`nvgpu-rm-dmabuf` run on the host: the same SKIPs, and `mmap` ENOTSUPP);
+CUDA offers no dma-buf export on a GeForce card, natively either, so
+`cuda-dmabuf` SKIPs. sec-negative run on the host shows why the backend
+checks the client: RM exports another process's video memory (T15 FAILs
+natively).
+
 ## Window size and share
 
 `NVGPU_WINDOW_MIB` and `NVGPU_WINDOW_SHARE` give the backend
