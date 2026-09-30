@@ -268,6 +268,24 @@ impl ChannelGate {
 
 // ─────────────────────────────── the backend ───────────────────────────────
 
+#[cfg(test)]
+std::thread_local! {
+    /// The time the backend's gate sees on this thread, when a test has
+    /// stopped it: a test counting calls against a rate must not depend on
+    /// how fast it runs (under Miri, or on a loaded machine, a burst takes
+    /// longer than one token's refill).
+    pub(crate) static FROZEN: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(t) = FROZEN.with(|f| f.get()) {
+        return t;
+    }
+    Instant::now()
+}
+
 impl crate::nvidia::NvidiaBackend {
     /// An RM_CONTROL's parameters as the guest sent them (the NVOS54 block
     /// and the nested one): `Err` is the status to answer a
@@ -289,7 +307,7 @@ impl crate::nvidia::NvidiaBackend {
             None => self.current_owner,
         };
         self.rmchan
-            .check(owner, ctl, size, Instant::now())
+            .check(owner, ctl, size, now())
             .map_err(|r| {
                 log::warn!("NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS refused: {}", r.why());
                 r.status()

@@ -2478,6 +2478,9 @@ mod backend_tests {
     #[test]
     fn only_the_callers_own_channels_are_disabled() {
         use crate::rmchan::{PROC_BURST, RUNLIST_PREEMPT_EVENT};
+        // The rate's clock stopped: the burst below is spent however long
+        // this test takes to make it.
+        crate::rmchan::FROZEN.with(|f| f.set(Some(std::time::Instant::now())));
         let (mut be, f1, f2) = vm(FULL);
         // The gates below alone: the test backend has no host release, so
         // the RM allowlist in front of them (rmallow.rs, which has the
