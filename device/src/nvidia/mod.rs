@@ -621,11 +621,14 @@ impl NvidiaBackend {
         crate::pacing::log_summary();
         // What `--vram-limit` is chosen by (DEPLOY.md), at the same level.
         if let Some((held, limit, refused)) = self.vram_usage() {
+            let (peak, one) = self.rmmem.vram.peaks();
             log::warn!(
-                "video memory: {} of {} MiB held at teardown, {refused} allocation(s) refused for \
-                 the limit",
-                held >> 20,
-                limit >> 20
+                "video memory: at most {} of {} MiB held, {} MiB by one process; {} MiB at \
+                 teardown; {refused} allocation(s) refused for the limit",
+                peak.div_ceil(1 << 20),
+                limit >> 20,
+                one.div_ceil(1 << 20),
+                held >> 20
             );
         }
         if self.rmchan.refused > 0 {

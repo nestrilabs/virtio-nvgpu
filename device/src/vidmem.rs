@@ -124,6 +124,9 @@ struct On {
     /// file's handle, slot).
     exports: HashMap<(u32, u32), Held>,
     refused: u64,
+    /// The most counted at once, and the most one process held.
+    peak: u64,
+    peak_one: u64,
 }
 
 /// The limit, when there is one, and what is counted against it.
@@ -151,7 +154,6 @@ pub(crate) enum Pending {
         status: usize,
         size: usize,
         want: u64,
-        status_in: usize,
         reserved: Option<Charge>,
         record: Option<Charge>,
     },
@@ -262,6 +264,8 @@ impl Vram {
             handles: HashMap::new(),
             exports: HashMap::new(),
             refused: 0,
+            peak: 0,
+            peak_one: 0,
         }));
         Ok(())
     }
@@ -284,6 +288,12 @@ impl Vram {
     /// Allocations refused for the limit so far.
     pub fn refused(&self) -> u64 {
         self.on.as_ref().map_or(0, |o| o.refused)
+    }
+
+    /// The most counted at once, and the most one process held: what a
+    /// limit is chosen by (DEPLOY.md, "Video memory limit").
+    pub fn peaks(&self) -> (u64, u64) {
+        self.on.as_ref().map_or((0, 0), |o| (o.peak, o.peak_one))
     }
 
     /// Whether `escape` is one `before` wants to see, beyond rmmem.rs's own.
@@ -333,7 +343,6 @@ impl Vram {
                     status: l.nvos64_status,
                     size,
                     want,
-                    status_in: l.nvos64_status,
                     reserved: None,
                     record: None,
                 }
@@ -376,7 +385,7 @@ impl Vram {
         }
         if let Pending::Alloc {
             want,
-            status_in,
+            status,
             reserved,
             record,
             ..
@@ -399,7 +408,7 @@ impl Vram {
                         o.limit >> 20,
                         o.bytes.held(owner)
                     );
-                    Err((*status_in, no_memory))
+                    Err((*status, no_memory))
                 }
             };
         }
@@ -441,9 +450,12 @@ impl Vram {
                 status,
                 size,
                 want,
+                reserved,
                 record,
-                ..
             } => {
+                // The reservation goes before RM's size is counted, so the
+                // peaks never hold both.
+                drop(reserved);
                 let (true, Some(c), Some(h)) = (
                     ok(status, reply),
                     le::u32_at(reply, client),
@@ -458,6 +470,8 @@ impl Vram {
                 // was admitted. Counted whatever the pool says: RM holds it.
                 let got = le::u64_at(reply, size).unwrap_or(want).max(want);
                 let mem = Arc::new(o.bytes.hold(owner, got));
+                o.peak = o.peak.max(o.bytes.in_use());
+                o.peak_one = o.peak_one.max(o.bytes.held(owner));
                 o.handles.insert(
                     (c, h),
                     Held {
@@ -666,7 +680,6 @@ impl On {
                 status: l.nvos32_status,
                 size,
                 want,
-                status_in: l.nvos32_status,
                 reserved: None,
                 record: None,
             };
@@ -1788,6 +1801,12 @@ mod backend_tests {
             "the refused two never reached RM"
         );
         assert_eq!(be.vram_usage(), Some((800 * MIB, 1024 * MIB, 2)));
+        free(&mut be, f, c, 0x100);
+        assert_eq!(
+            be.rmmem.vram.peaks(),
+            (800 * MIB, 400 * MIB),
+            "the teardown line's peaks outlive the memory"
+        );
     }
 
     /// RM frees an object's subtree, a client's objects, and the clients of
