@@ -278,7 +278,7 @@ impl NvidiaBackend {
             && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48)
         {
             let mut v = param_in.to_vec();
-            rm_pending = Some(self.rmmem.before(escape, &mut v));
+            rm_pending = Some(self.rmmem.before(escape, &mut v).charged_to(self.rm_caller()));
             rm_copy = v;
             &rm_copy
         } else {

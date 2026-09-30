@@ -287,11 +287,23 @@ fn now() -> Instant {
 }
 
 impl crate::nvidia::NvidiaBackend {
+    /// The guest process an RM escape is charged to: the caller when the
+    /// guest says which (rmshare.rs `rm_proc_id`), else the process that
+    /// opened the file.
+    pub(crate) fn rm_caller(&self) -> Owner {
+        match self.current_proc {
+            Some(c) => Owner::Proc {
+                tgid: c.tgid,
+                start_ns: c.start_ns,
+            },
+            None => self.current_owner,
+        }
+    }
+
     /// An RM_CONTROL's parameters as the guest sent them (the NVOS54 block
     /// and the nested one): `Err` is the status to answer a
     /// DISABLE_CHANNELS with, RM never called. Any other control passes.
-    /// Charged to the calling guest process when the guest says which
-    /// (rmshare.rs `rm_proc_id`), else to the process that opened the file.
+    /// Charged to [`Self::rm_caller`].
     pub(crate) fn rm_chan_gate(&mut self, params: &[u8]) -> Result<(), u32> {
         use crate::nvos::{NVOS54_CMD, NVOS54_PARAMS_SIZE, NVOS54_SIZE};
         if le::u32_at(params, NVOS54_CMD) != Some(CTRL_FIFO_DISABLE_CHANNELS) {
@@ -299,13 +311,7 @@ impl crate::nvidia::NvidiaBackend {
         }
         let size = le::u32_at(params, NVOS54_PARAMS_SIZE).unwrap_or(0);
         let ctl = params.get(NVOS54_SIZE..).unwrap_or(&[]);
-        let owner = match self.current_proc {
-            Some(c) => Owner::Proc {
-                tgid: c.tgid,
-                start_ns: c.start_ns,
-            },
-            None => self.current_owner,
-        };
+        let owner = self.rm_caller();
         self.rmchan
             .check(owner, ctl, size, now())
             .map_err(|r| {
