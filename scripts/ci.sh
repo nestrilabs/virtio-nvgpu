@@ -248,6 +248,7 @@ launcher_dryrun_check() {
         "is not root's (uid 65534)"
         "the launcher's guest.sh /rig/launcher/guest.sh: /rig/launcher/guest.sh is writable by others"
         "verdict.sh read from /rig/real/verdict.sh"
+        "slot 0 is systemd's (vhost-user-nvgpu@0.socket listens); skipping it"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
     )
