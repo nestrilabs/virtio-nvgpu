@@ -749,6 +749,9 @@ impl WlConn {
                 return Err(libc::EPROTO);
             }
         }
+        // What the reader thread polls by, to wake it only if this frame
+        // changes it.
+        let watched = (st.engine.stream_interest(), st.engine.input_blocked());
         // And the engine lets through no more than were counted: a submit
         // the count missed ends the connection instead of passing the rate.
         st.engine.allow_lease_submits(Some(submits));
@@ -767,9 +770,18 @@ impl WlConn {
             hangup(s, &mut st, e.raw_os_error().unwrap_or(libc::EIO));
         }
         let backlog = st.engine.local_out().len() as u32;
+        // New streams to watch, or ones wanting other events; output waiting
+        // for POLLOUT; or export mode's input taken again: the reader polls
+        // afresh. Otherwise it sleeps on: most frames (a commit and its
+        // damage) change none of these, and a wake-up per frame is a
+        // context switch and a handful of system calls on the present path.
+        let wake = backlog > 0
+            || st.closed
+            || (st.engine.stream_interest(), st.engine.input_blocked()) != watched;
         drop(st);
-        // New streams to watch, or output waiting for POLLOUT.
-        sys::eventfd_signal(s.wake.as_raw_fd());
+        if wake {
+            sys::eventfd_signal(s.wake.as_raw_fd());
+        }
         Ok(protocol::messages::WlSendResp {
             accepted: frame_bytes.len() as u32,
             backlog,
@@ -795,12 +807,17 @@ impl WlConn {
             max_desc as usize,
             true,
         );
-        let left: usize = st.to_guest.iter().map(|u| u.bytes()).sum();
-        s.cfg
-            .limits
-            .queue
-            .give(s.cfg.owner, st.to_guest_bytes - left);
-        st.to_guest_bytes = left;
+        // What the frame took off the queue: every unit it holds, its
+        // descriptors and its record, after the header. Counted from the
+        // frame, not by walking what is left, which under a guest that
+        // reads slowly is many thousands of units per WL_RECV.
+        let taken = f.len() - frame::FRAME_HDR_LEN;
+        s.cfg.limits.queue.give(s.cfg.owner, taken);
+        st.to_guest_bytes -= taken;
+        debug_assert_eq!(
+            st.to_guest_bytes,
+            st.to_guest.iter().map(|u| u.bytes()).sum::<usize>()
+        );
         for (i, fd) in fds.into_iter().enumerate() {
             let Some(fd) = fd else { continue };
             frame::patch_desc(&mut f, i, |d| match ops.adopt(fd, d.kind) {
