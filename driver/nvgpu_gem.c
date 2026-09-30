@@ -220,7 +220,10 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
     return -ENOTSUPP;
   }
 
-  mutex_lock(&ng->map_lock);
+  /* Killable: another mapper of the object holds it across the two host
+   * calls below, each up to the transport's timeout. */
+  if (mutex_lock_killable(&ng->map_lock))
+    return -EINTR;
   if (ng->window_valid) {
     mutex_unlock(&ng->map_lock);
     return 0;

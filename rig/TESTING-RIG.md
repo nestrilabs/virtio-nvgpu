@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `winehang`: `patches/nesbox/0001` (virtio-blk interrupt barrier), killable locks in the guest module, hang-watch | fresh-boot Wine/Godot D3D12 starts under nesbox with and without the patch; stage1, compat, render (with and without compute) and wayland on the patched nesbox | "Wine start-up stalls" |
 | 2026-09-30 | branch `integrate32`: the 2026-09-30 review's fixes (backend, guest module, Wayland, patches, deployment), the gVisor comparison, heavyfix and the fence-retire fix | Groups A and B under nesbox (C and Rust modules) and crosvm, the same probes on a KASAN+UBSAN+KFENCE+lockdep guest kernel with the unbind probe, and two batches of live applications | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `heavyfix` on `8fe984f`: IOCTL2 path, posted SYNCOBJ_DESTROY, the pump, crosvm `0011` | the heavy workloads before and after; stage1, compat, render (with and without compute), wayland and secneg under nesbox and crosvm, C parsers, and stage1, render and wayland with the Rust parsers | "Heavy workloads" |
 | 2026-09-29 | `492f29b` (branch `integrate30`): the review's fixes and the restructuring after them | Groups A and B under nesbox (C and Rust modules) and crosvm, and two batches of live applications | "Regression of the restructured tree" |
@@ -980,7 +981,9 @@ out at 60 s; the backend saw nothing but TIME_SYNC), and one SuperTuxKart
 start that opened three nodes and made no call. Neither came back in six
 more stage1 boots each way, 60 `vulkaninfo` start-ups each way in one guest,
 or some 40 other SuperTuxKart starts with the branch; nothing that reached
-the backend differed. Not explained. One more SuperTuxKart start (nesbox,
+the backend differed. Most likely nesbox's lost block-queue interrupt, found
+later ("Wine start-up stalls"): a first start in a fresh guest, stopped
+with no device call outstanding, only under nesbox. One more SuperTuxKart start (nesbox,
 the branch) quit at once with "Could not initialize display": its Wayland
 connection to the headless sway failed before any device call was made
 (only Wayland messages had crossed), which no change here touches.
@@ -1051,6 +1054,63 @@ writes the exits, halts, halt polling and faults per second over a window of
 the run (`.kvmstat`). KVM answers `KVM_GET_STATS_FD` only in the process
 that made the VM, so nesbox must open them itself: its `virtio-nvgpu-v7`
 branch does with `NESBOX_HOLD_KVM_STATS=1`, which the harness sets.
+
+## Wine start-up stalls
+
+Godot 4.7.2's Windows build on D3D12 (Wine 11 staging, vkd3d-proton
+2.14.1; `wine-godot-draws-d3d12`) stopped in one freshly booted nesbox
+guest in five to seven (7 of 35 for steamperf, 8 of 46 here), with or without `--allow-compute` and the Vulkan
+layer, never natively and never in ten runs back to back in one guest; a
+killed Wine process sometimes did not exit. The cause is nesbox's, not the
+device's: its virtio-blk worker decided whether to interrupt from the
+driver's `used_event` with no barrier after publishing the used index, so
+the guest could sleep on a completed request and never hear of it. Under
+`EVENT_IDX` that queue is then dead for good -- later completions no longer
+cross the `used_event` the guest waits at -- and every task that reads or
+writes through that CPU's queue sleeps in `io_schedule`, uninterruptible.
+[`patches/nesbox/0001`](../patches/nesbox/) is the barrier (the one crosvm
+has in `get_used_event()`), with a unit test that races the real ring code
+against the driver's side of the handshake: without the barrier it lost 1
+to 55 completions in each of five runs of a million rounds, with it none in
+ten. It is on nesbox `virtio-nvgpu-v7` in a local branch
+(`virtio-nvgpu-v7-blkfence`), not pushed.
+
+What showed it (rig/heavy/hang-watch.sh does all of this now): the kernel's
+blocked tasks at the stall were `jbd2/vda-8` (writing the journal
+superblock), `ext4lazyinit` (reading a block bitmap) and the Wine
+process's reads or page faults, all in `io_schedule` -- a disk that stopped,
+in the first minute after boot, while ext4's lazy init and Wine's first
+start (nothing in the page cache yet) read from every CPU at once, which is
+why a second run in the same guest never stalled. The backend had nothing
+outstanding (its pacing report: TIME_SYNC only), and no blocked stack had
+a frame of the guest module's. One direct 4 KiB read from each CPU afterwards
+completed on three queues and joined the D tasks on the fourth (CPU 3, 0
+and 3 in the three stalls with the poke). The old hang-watch printed
+nothing past STALL, since its own `pgrep` and `awk` could not be read from
+the disk; and `pgrep -f` or `/proc/<pid>/cmdline` of a task faulting on
+the dead queue waits behind its `mmap_lock`.
+
+Fresh boots of `wine-godot-draws-d3d12`, one start each, under a watcher
+that dumps the guest at a 40 s stall (steamperf's image, backend and THP
+guest kernel; only the VMM differs), 2026-09-30:
+
+| nesbox | runs | stalled |
+|---|---|---|
+| `virtio-nvgpu-v7` | 46 (20 alternating with the next row; the last 6 under this branch's hang-watch.sh, whose report came out for both of its stalls) | 8 |
+| `virtio-nvgpu-v7` + `patches/nesbox/0001` | 44 (20 alternating with the row above; 8 with this branch's backend and module) | 0 |
+
+The same patched nesbox with this branch's backend and module (below) ran
+stage1 6/0/0, compat 12/0/0, render 9/0/1, render with `--allow-compute`
+9/0/1 and wayland 11/0/3.
+
+Found auditing the guest module for the same stall, and fixed though not
+its cause: four mutexes held across a synchronous host call (a file's first
+KMS call, SYNCOBJ_DESTROY, the SEMSURF rehome, a GEM object's window
+placement) were taken uninterruptibly, so a killed second caller could sit
+in D for up to the transport's 30 or 60 s timeout; they are killable now.
+Every other wait a process can enter in the module already was killable or
+interruptible, bar `master_set`/`master_drop`'s lock, which DRM gives no
+way to fail.
 
 ## What to keep from every run
 

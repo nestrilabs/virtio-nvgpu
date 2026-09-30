@@ -1021,7 +1021,10 @@ static long nvgpu_so_destroy(struct nvgpu_fd *nfd, void *karg) {
 
   /* Read once: the handle whose subscribers go is the one destroyed. */
   memcpy(&a, karg, sizeof(a));
-  mutex_lock(&nfd->so_lock);
+  /* Killable: another DESTROY of this file holds it across its synchronous
+   * call below, up to the transport's timeout. */
+  if (mutex_lock_killable(&nfd->so_lock))
+    return -EINTR;
   /* Before the DESTROY is sent: a WATCH that reads this or later was sent
    * after it, and names whatever syncobj has the number then. */
   epoch = nfd->so_epoch + 1;

@@ -295,7 +295,8 @@ Two VMMs do this today, both with the UVM aperture, and both have run every
 graphics and compute path on the GPU. **nesbox**
 ([github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch
 `virtio-nvgpu-v6`, not yet merged upstream; its jail's changes over `v5`
-have not run on hardware) has its own frontend for the device. **crosvm** takes the ten patches in
+have not run on hardware; with [`patches/nesbox/`](patches/nesbox/), a
+block-queue fix no branch has yet) has its own frontend for the device. **crosvm** takes the ten patches in
 [`patches/crosvm/`](patches/crosvm/): a vhost-user device type `nvgpu` whose
 every mapping request the frontend checks against its region, the UVM
 aperture after the window in the window's BAR, and, with crosvm's sandbox

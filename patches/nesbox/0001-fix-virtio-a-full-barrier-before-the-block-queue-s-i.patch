@@ -1,0 +1,171 @@
+From 07e01b0d8ed99e114a79e1f10820c0b9f8999c5f Mon Sep 17 00:00:00 2001
+From: Jacob Root <jacob@otisroot.com>
+Date: Wed, 30 Sep 2026 10:31:29 +0000
+Subject: [PATCH] fix(virtio): a full barrier before the block queue's
+ interrupt decision
+
+The block worker publishes used entries and then reads what the driver
+asked for -- `used_event` with EVENT_IDX, the no-interrupt flag without --
+to decide whether to interrupt. Nothing ordered the two: x86 lets the
+used-index store sit in the store buffer past that load. The driver's side
+of the handshake (Linux's virtqueue_enable_cb) is the mirror image: write
+`used_event`, full barrier, re-read the used index, sleep if nothing new.
+With only one side fenced, both can read the other's old value: the driver
+sees no new entry and sleeps, the device sees the old `used_event` and does
+not interrupt. The request is then complete in the ring and never reaped,
+and with EVENT_IDX the queue stays that way: later completions no longer
+cross the used_event the driver is waiting at, so none of them interrupts
+either. Every task that reads or writes through that queue sleeps
+uninterruptibly in I/O wait, where SIGKILL cannot take it; the guest's
+other queues go on.
+
+It was seen as 6 of 40 freshly booted guests stopping in their first
+minute, while ext4's lazy init and a large program's start-up load the
+disk from every CPU at once: journal, bitmap and page-cache reads blocked
+in io_schedule for good, and a direct read issued afterwards from each CPU
+completing on every queue but one, where it joined them. With this
+change, 0 of 44 stopped.
+
+The kick direction already had its barrier (`set_used_no_notify`,
+`set_avail_event`); this is the same one for the interrupt direction, as
+the spec's memory-ordering rules and other VMMs (vhost's smp_mb in
+vhost_notify, QEMU's in virtio_should_notify) have it.
+
+The new test races the real push_used/used_needs_interrupt against a
+driver doing enable_cb's sequence on another thread: without the barrier
+it lost between 1 and 55 completions in each of five runs of a million
+rounds; with it, none in ten.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+ virtio-devices/src/common.rs | 106 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
+
+diff --git a/virtio-devices/src/common.rs b/virtio-devices/src/common.rs
+index 9358aa5..30ec501 100644
+--- a/virtio-devices/src/common.rs
++++ b/virtio-devices/src/common.rs
+@@ -372,6 +372,20 @@ pub fn set_avail_event(mem: &GuestMemoryMmap, q: &QState, idx: u16) {
+ /// answers whether the batch passed it; without it, the answer is the avail
+ /// ring's flag.
+ pub fn used_needs_interrupt(mem: &GuestMemoryMmap, q: &QState, old: u16, new: u16) -> bool {
++    // A full barrier between publishing the used index (`push_used`) and
++    // reading what the driver asked for, and it has to be one. The driver's
++    // side of the handshake is: write `used_event` (or clear the no-interrupt
++    // flag), full barrier, re-read the used index, and sleep if nothing new is
++    // there. x86 lets our used-index store sit in the store buffer past the
++    // load below, so without this both sides can read the other's old value:
++    // the driver sees no new entries and sleeps, and we see a `used_event` it
++    // has already moved and send no interrupt. The request is then complete
++    // in the ring and its submitter waits for it forever, in uninterruptible
++    // I/O sleep -- and with `EVENT_IDX` so does everything after it on the
++    // queue, since later batches no longer cross the `used_event` the driver
++    // is waiting at. The mirror of the barrier in `set_used_no_notify` and
++    // `set_avail_event`, for the other direction.
++    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+     if !q.event_idx {
+         return avail_wants_interrupt(mem, q);
+     }
+@@ -1063,6 +1077,98 @@ mod queue_tests {
+         assert!(!used_needs_interrupt(&m, &q, 3, 5));
+     }
+ 
++    /// The interrupt handshake, raced for real: the device publishes a used
++    /// entry and decides whether to interrupt, while the driver -- as Linux's
++    /// `virtqueue_enable_cb` does -- publishes the index it wants an interrupt
++    /// at, takes a full barrier and looks for new entries. Whatever the
++    /// interleaving, at least one of them must see the other's write: either
++    /// the driver finds the entry, or the device sends the interrupt. Neither
++    /// is a completion nobody will ever reap, which in a guest is a task stuck
++    /// in uninterruptible I/O sleep.
++    ///
++    /// This is the store-buffering shape, which x86 allows unless both sides
++    /// fence. Without the device's barrier, a million rounds lost between one
++    /// and fifty-five completions in each of five runs on an x86 desktop; with
++    /// it, none in ten.
++    #[test]
++    fn a_completion_is_never_both_unseen_and_uninterrupted() {
++        use std::sync::Arc;
++        use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
++
++        const ROUNDS: u32 = 1_000_000;
++        let m = Arc::new(mem());
++        let q = QState {
++            size: 8,
++            avail: 0x2000,
++            used: 0x3000,
++            event_idx: true,
++            ..Default::default()
++        };
++        let used_idx = GuestAddress(q.used + 2);
++        let used_event = GuestAddress(q.avail + 4 + 8 * 2);
++        let round = Arc::new(AtomicU32::new(0));
++        let driver_done = Arc::new(AtomicU32::new(0));
++        let driver_saw = Arc::new(AtomicU16::new(0));
++
++        let driver = {
++            let (m, round, done, saw) = (
++                m.clone(),
++                round.clone(),
++                driver_done.clone(),
++                driver_saw.clone(),
++            );
++            std::thread::spawn(move || {
++                for i in 1..=ROUNDS {
++                    while round.load(Ordering::Acquire) != i {
++                        std::hint::spin_loop();
++                    }
++                    let base = i as u16;
++                    // enable_cb: "interrupt me once the used index passes
++                    // `base`", then the barrier, then is anything there already?
++                    m.write_obj(u16::to_le(base), used_event).unwrap();
++                    std::sync::atomic::fence(Ordering::SeqCst);
++                    let now = u16::from_le(m.read_obj::<u16>(used_idx).unwrap());
++                    saw.store(now, Ordering::Relaxed);
++                    done.store(i, Ordering::Release);
++                }
++            })
++        };
++
++        let mut lost = 0u32;
++        let mut jitter = 0x2545_f491u32;
++        for i in 1..=ROUNDS {
++            let base = i as u16;
++            // Both sides agree nothing is outstanding; the driver's
++            // `used_event` is a stale one that asks for no interrupt at
++            // `base + 1`.
++            m.write_obj(u16::to_le(base), used_idx).unwrap();
++            m.write_obj(u16::to_le(base.wrapping_sub(1)), used_event)
++                .unwrap();
++            round.store(i, Ordering::Release);
++            // A few iterations' worth of drift either way, so the two sides'
++            // windows keep sliding across each other.
++            jitter ^= jitter << 13;
++            jitter ^= jitter >> 17;
++            jitter ^= jitter << 5;
++            for _ in 0..(jitter % 16) {
++                std::hint::spin_loop();
++            }
++            let new = push_used(&m, &q, 0, 0);
++            let interrupt = used_needs_interrupt(&m, &q, base, new);
++            while driver_done.load(Ordering::Acquire) != i {
++                std::hint::spin_loop();
++            }
++            if !interrupt && driver_saw.load(Ordering::Relaxed) == base {
++                lost += 1;
++            }
++        }
++        driver.join().unwrap();
++        assert_eq!(
++            lost, 0,
++            "{lost} of {ROUNDS} completions neither seen nor interrupted"
++        );
++    }
++
+     /// The device's half: it publishes the avail index it wants to hear about
+     /// next, past the used ring's entries.
+     #[test]
+-- 
+2.55.0
+

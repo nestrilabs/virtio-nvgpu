@@ -18,7 +18,8 @@
 #            to what is per slot (checks.module-eval), contrib/systemd's
 #            units through `systemd-analyze verify`, patches/crosvm applied
 #            in order to c0474109d64d (from CROSVM_SRC, or the rig's crosvm
-#            checkout; skipped, and said, where there is none), the limits
+#            checkout; skipped, and said, where there is none),
+#            patches/nesbox applied in order to NESBOX_BRANCH, the limits
 #            crosvm (so patched) and nesbox (NESBOX_SRC, at NESBOX_BRANCH)
 #            hold the backend's requests to against the backend's own
 #            (scripts/vmm-parity.py; each skipped, and said, without its
@@ -193,6 +194,32 @@ crosvm_patches_check() {
 # NESBOX_SRC, or the rig's.
 NESBOX_BRANCH=${NESBOX_BRANCH:-virtio-nvgpu-v6}
 
+# patches/nesbox (fixes not yet on NESBOX_BRANCH) applied in order to it, in
+# a scratch index, as patches/crosvm are.
+nesbox_patches_check() {
+    local src w p rc=0
+    src=${NESBOX_SRC:-${NVGPU_RIG:-.rig}/src/nesbox}
+    if ! [ -e "$src/.git" ] || ! git -C "$src" rev-parse -q --verify "$NESBOX_BRANCH^{commit}" >/dev/null; then
+        echo "nesbox patches: skipped (no nesbox checkout with $NESBOX_BRANCH; set NESBOX_SRC)" >&2
+        return 0
+    fi
+    w=$(mktemp -d)
+    if git clone -q --bare --shared "$src" "$w/git" &&
+        GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git read-tree "$(git -C "$src" rev-parse "$NESBOX_BRANCH")"; then
+        for p in patches/nesbox/*.patch; do
+            GIT_DIR=$w/git GIT_INDEX_FILE=$w/index git apply --cached -- "$p" || {
+                echo "nesbox patches: $p does not apply to $NESBOX_BRANCH after the ones before it" >&2
+                rc=1
+                break
+            }
+        done
+    else
+        rc=1
+    fi
+    rm -rf "$w"
+    return $rc
+}
+
 # The limits each VMM holds the backend's mapping requests to are the
 # backend's (scripts/vmm-parity.py): crosvm's as patches/crosvm has them,
 # nesbox's at NESBOX_BRANCH. A VMM whose source is not here is skipped, and
@@ -278,6 +305,7 @@ deploy() {
     step "NixOS module evaluated" module_eval_check
     step "systemd units" units_check
     step "patches/crosvm apply to $CROSVM_BASE" crosvm_patches_check
+    step "patches/nesbox apply to $NESBOX_BRANCH" nesbox_patches_check
     step "the VMMs' limits are the backend's" vmm_parity_check
     step "launcher dry run" launcher_dryrun_check
 }

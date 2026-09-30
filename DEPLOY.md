@@ -112,7 +112,7 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 
 | | nesbox | crosvm |
 |---|---|---|
-| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v6` (not yet merged upstream; `v5` and later size the window from the backend and prefault it, `v6` adds the jailer's own `/proc` and `/sys`) | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0011` (`0010` and `0011`, the window and guest RAM prefaults, are optional: performance only) |
+| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v6` (not yet merged upstream; `v5` and later size the window from the backend and prefault it, `v6` adds the jailer's own `/proc` and `/sys`) with [`patches/nesbox/`](patches/nesbox/) `0001`, which no branch has yet: without it a guest's block queue can lose a completion's interrupt for good, and everything that reads or writes the disk through that CPU stops, unkillable (rig/TESTING-RIG.md, "Wine start-up stalls") | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0011` (`0010` and `0011`, the window and guest RAM prefaults, are optional: performance only) |
 | graphics (Vulkan, GL, EGL, Vulkan Video) | run on hardware | run on hardware |
 | `--allow-compute` (CUDA, NVENC/NVDEC through CUDA, OpenCL) | run on hardware | run on hardware (needs `0007`-`0009`; its nvgpu frontend runs jailed) |
 | Wayland client of the host compositor, direct scanout | run on hardware | run on hardware |
