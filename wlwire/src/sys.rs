@@ -342,22 +342,49 @@ pub fn placeholder_fd() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// A descriptor's file type (`S_IFMT` bits) and device, from what the kernel
+/// has cached: `statx` with AT_STATX_DONT_SYNC, which a FUSE file answers
+/// without asking its server (Linux 7.2.7, fs/fuse/dir.c
+/// fuse_update_get_attr()). `fstat` and `fstatfs` of a FUSE file whose
+/// attribute timeout is 0 wait on the server, on its schedule; the proxy
+/// classifies a peer's descriptors on the one thread that serves every
+/// client (the guest daemon), or under the lock WL_SEND and WL_RECV take
+/// (the backend), so what a peer hands over must never make that wait.
+#[cfg(not(miri))]
+fn cached_stat(fd: RawFd) -> io::Result<(u32, (u32, u32))> {
+    // SAFETY: an all-zero statx is a valid value for statx to overwrite.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is a NUL-terminated empty string, and `st` a live,
+    // writable statx.
+    cvt(unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE,
+            &mut st,
+        )
+    })?;
+    Ok((
+        u32::from(st.stx_mode) & libc::S_IFMT,
+        (st.stx_dev_major, st.stx_dev_minor),
+    ))
+}
+
+/// Under Miri: `fstat`'s (Miri's files are its own).
+#[cfg(miri)]
+fn cached_stat(fd: RawFd) -> io::Result<(u32, (u32, u32))> {
+    let st = fstat(fd)?;
+    Ok((st.st_mode & libc::S_IFMT, (0, 0)))
+}
+
 pub fn is_fifo(fd: RawFd) -> bool {
-    fstat(fd)
-        .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFIFO)
-        .unwrap_or(false)
+    cached_stat(fd).is_ok_and(|(kind, _)| kind == libc::S_IFIFO)
 }
 
 pub fn is_regular(fd: RawFd) -> bool {
-    fstat(fd)
-        .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
-        .unwrap_or(false)
+    cached_stat(fd).is_ok_and(|(kind, _)| kind == libc::S_IFREG)
 }
-
-/// `statfs.f_type` of tmpfs (and of every memfd), and of hugetlbfs (a
-/// hugetlb memfd).
-const TMPFS_MAGIC: i64 = 0x0102_1994;
-const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
 
 /// A regular file whose pages are memory: a memfd, or a file on tmpfs or
 /// hugetlbfs. A `pread` of it never waits on anyone. A file on FUSE, NFS or a
@@ -365,22 +392,139 @@ const HUGETLBFS_MAGIC: i64 = 0x9584_58f6;
 /// reads shm pools and blobs on the thread that serves every other message
 /// of the connection -- in the backend, under the lock WL_SEND and WL_RECV
 /// take.
+///
+/// Told by the file's device, without asking its filesystem anything, not
+/// even `fstatfs` ([`cached_stat`]): a device is one superblock's, so a
+/// memfd is one on the kernel's internal shm (or hugetlbfs) mount, whose
+/// device is learned from memfds made here ([`memfd_devs`]), and any other
+/// file is memory if `/proc/self/mountinfo` lists a tmpfs or hugetlbfs
+/// mount of its device ([`memory_mount`]). A tmpfs mounted only in another
+/// mount namespace is not listed there, and its files are refused.
 #[cfg(not(miri))]
 pub fn is_shmem(fd: RawFd) -> bool {
-    // SAFETY: an all-zero statfs is a valid value for fstatfs to overwrite.
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a live, writable statfs.
-    if cvt(unsafe { libc::fstatfs(fd, &mut st) }).is_err() {
+    let Ok((kind, dev)) = cached_stat(fd) else {
         return false;
-    }
-    let magic = st.f_type as i64;
-    is_regular(fd) && (magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC)
+    };
+    kind == libc::S_IFREG
+        && (memfd_devs().contains(&dev)
+            || std::fs::read_to_string("/proc/self/mountinfo")
+                .is_ok_and(|mi| memory_mount(&mi, dev)))
 }
 
 /// Under Miri, whose "memfd" is a temporary file (above), and which has no
-/// `fstatfs`: any regular file.
+/// `/proc`: any regular file.
 #[cfg(miri)]
 pub fn is_shmem(fd: RawFd) -> bool {
-    let _ = (TMPFS_MAGIC, HUGETLBFS_MAGIC);
     is_regular(fd)
+}
+
+/// The devices of the kernel's internal mounts memfds live on: shm's, and
+/// hugetlbfs's for each huge page size a memfd can be made with here.
+#[cfg(not(miri))]
+fn memfd_devs() -> &'static [(u32, u32)] {
+    static DEVS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    DEVS.get_or_init(|| {
+        let mut devs: Vec<(u32, u32)> = [
+            0,
+            libc::MFD_HUGETLB,
+            libc::MFD_HUGETLB | libc::MFD_HUGE_2MB,
+            libc::MFD_HUGETLB | libc::MFD_HUGE_1GB,
+        ]
+        .into_iter()
+        .filter_map(|flags| {
+            // SAFETY: the name is NUL-terminated and outlives the call.
+            let fd = unsafe {
+                libc::memfd_create(c"nvgpu-wl-probe".as_ptr(), libc::MFD_CLOEXEC | flags)
+            };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: a descriptor memfd_create just returned, known to
+            // nothing else.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            cached_stat(fd.as_raw_fd()).ok().map(|(_, dev)| dev)
+        })
+        .collect();
+        devs.sort_unstable();
+        devs.dedup();
+        devs
+    })
+}
+
+/// Whether `mountinfo` (the text of `/proc/self/mountinfo`) lists a tmpfs
+/// or hugetlbfs mount of device `dev`. Each line is `ID PARENT MAJ:MIN ROOT
+/// MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTS`, whitespace
+/// in paths escaped as `\040`, so the first field that is `-` on its own
+/// ends the optional ones (Linux 7.2.7, Documentation/filesystems/proc.rst,
+/// "/proc/<pid>/mountinfo"). A FUSE file system's type is `fuse` or
+/// `fuse.<what it calls itself>`, never `tmpfs`, and it has a device of its
+/// own. Reading the list asks no mounted filesystem anything.
+fn memory_mount(mountinfo: &str, dev: (u32, u32)) -> bool {
+    let want = format!("{}:{}", dev.0, dev.1);
+    mountinfo.lines().any(|line| {
+        let mut f = line.split_ascii_whitespace();
+        f.nth(2) == Some(want.as_str())
+            && matches!(
+                f.skip_while(|&x| x != "-").nth(1),
+                Some("tmpfs" | "hugetlbfs")
+            )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_memory_mount_is_found_by_its_device_and_type() {
+        let mi = "\
+22 1 0:21 / /proc rw,nosuid shared:12 - proc proc rw
+36 22 0:32 / /dev/shm rw,nosuid shared:4 master:1 - tmpfs tmpfs rw,size=4096k
+37 22 0:33 / /dev/hugepages rw - hugetlbfs hugetlbfs rw,pagesize=2M
+40 36 0:44 / /mnt/a\\040-\\040b rw - fuse.tmpfs tmpfs rw,user_id=1000
+41 36 0:45 / /mnt/c rw - fuse tmpfs rw
+42 36 8:1 / /home rw - ext4 /dev/sda1 rw
+";
+        assert!(memory_mount(mi, (0, 32)));
+        assert!(memory_mount(mi, (0, 33)));
+        // A FUSE file system may call itself anything but "fuse.*", and its
+        // source anything at all.
+        assert!(!memory_mount(mi, (0, 44)));
+        assert!(!memory_mount(mi, (0, 45)));
+        assert!(!memory_mount(mi, (0, 21)));
+        assert!(!memory_mount(mi, (8, 1)));
+        // Not "0:3" as a prefix of "0:32".
+        assert!(!memory_mount(mi, (0, 3)));
+        assert!(!memory_mount(mi, (0, 99)));
+    }
+
+    /// A memfd is memory by its device alone; a pipe, an eventfd and a
+    /// directory are not memory at all.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd or /proc")]
+    fn memory_is_told_without_asking_the_files_filesystem() {
+        let m = memfd(c"t", 4096).unwrap();
+        assert!(is_shmem(m.as_raw_fd()) && is_regular(m.as_raw_fd()));
+        let (_, dev) = cached_stat(m.as_raw_fd()).unwrap();
+        assert!(memfd_devs().contains(&dev));
+        let (r, w) = pipe().unwrap();
+        assert!(is_fifo(r.as_raw_fd()) && is_fifo(w.as_raw_fd()));
+        assert!(!is_shmem(w.as_raw_fd()) && !is_regular(w.as_raw_fd()));
+        let e = eventfd().unwrap();
+        assert!(!is_shmem(e.as_raw_fd()) && !is_fifo(e.as_raw_fd()));
+        let d: OwnedFd = std::fs::File::open("/").unwrap().into();
+        assert!(!is_shmem(d.as_raw_fd()));
+        // A file on /dev/shm, where there is one: tmpfs by its mount.
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(format!("/dev/shm/wlwire-test-{}", std::process::id()))
+        {
+            let _ = std::fs::remove_file(format!("/dev/shm/wlwire-test-{}", std::process::id()));
+            let f: OwnedFd = f.into();
+            assert!(is_shmem(f.as_raw_fd()), "a /dev/shm file is tmpfs");
+        }
+    }
 }
