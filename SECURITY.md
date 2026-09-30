@@ -230,6 +230,14 @@ entry, which shows up as a failed workload with a warning of the form
 (or `RM class … refused`, `VID_HEAP_CONTROL function …`), rate-limited per
 call site, and a teardown summary of every refusal by name.
 
+A refusal the driver does not check fails a workload later, not at the
+call. NVIDIA's Vulkan driver goes on after a refused
+`NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` as if its channel had been stopped,
+and Blender's Vulkan backend then hangs in 10 of 24 guest runs -- and
+natively too, when the same refusal is made there (BENCHMARKS.md, "Heavy
+workloads"). The control stays refused; whether to let a guest stop its
+own channels is open.
+
 ### RM objects between guest processes
 
 RM keeps a user client's objects to the process that made it. Its one

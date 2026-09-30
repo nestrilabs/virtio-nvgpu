@@ -488,23 +488,48 @@ would be lost, and a guest waiting on it would hang.
   unconfined). It is the program's or the driver's, made likelier by fewer
   CPUs, not the device's. An aborted process can go on rendering; the
   harness kills what is left of a native run before the next.
-- **FIFO_DISABLE_CHANNELS is refused, and that is benign.** NVIDIA's Vulkan
-  driver brackets about half a millisecond of queue set-up with
-  `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` on its own client's 16 channels
-  (seen natively with `rig/heavy/rmlog.c`, an LD_PRELOAD logger of RM
-  controls). The RM allowlist refuses it, which the driver sees as
-  NV_ERR_NOT_SUPPORTED -- what CPU-RM itself answers on a GPU without
-  GSP -- and copes with. Thirty start-ups in one guest with it refused and
-  thirty with it forwarded (`--rm-allowlist=log`) all reached the race.
-  It stays refused.
-- **Blender's Vulkan backend hangs in a guest.** With the 16 GiB window,
-  4 of 8 guest runs under either VMM stopped after a frame, with nothing
-  crossing to the host but readiness arms until the watchdog; 0 of 5 native
-  runs did. Not explained; a probe that dumps the waiting threads' kernel
-  stacks after two minutes did not catch one in
-  three tries.
+- **Blender's Vulkan backend hangs because the RM allowlist refuses
+  FIFO_DISABLE_CHANNELS.** NVIDIA's Vulkan driver calls
+  `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` on its own client's channels: for
+  about half a millisecond of queue set-up at every Vulkan start (16
+  channels), and in Blender around each frame it starts, twice, on one
+  channel (disable, about a millisecond, enable; 20-22 calls a run, seen
+  natively with `rig/heavy/rmlog.c`, an LD_PRELOAD logger of RM controls).
+  The allowlist refuses it, the driver goes on as if it had been done, and
+  in 10 of 24 of Blender's runs a frame, nearly always the second, never
+  completes:
+  its main thread polls `/dev/nvidia0` every 10 ms for a GPU semaphore that
+  does not move, and nothing crosses to the host but readiness arms and
+  their reports, four a second (`rig/heavy/hang-watch.sh` dumped it on the
+  30th second without progress, rig/TESTING-RIG.md, "Heavy workloads").
+  The device is not in it: natively, the same refusal
+  (`RMLOG_REFUSE=0x2080110b`) hangs Blender at the same point, and
+  answering success without disabling anything hangs it as often, so the
+  driver needs the channel really stopped.
+
+  | Blender Vulkan, 16 GiB window, 8 frames a run | runs | hung |
+  |---|---|---|
+  | guest, nesbox, refused (the default) | 24 | 10 |
+  | guest, nesbox, forwarded (`--rm-allowlist=log`) | 10 | 0 |
+  | guest, crosvm, forwarded | 10 | 0 |
+  | native, refused by `rmlog.so` | 14 | 5 |
+  | native, answered success by `rmlog.so`, not done | 8 | 4 |
+  | native, sent with `bOnlyDisableScheduling` set (`RMLOG_ONLY_SCHED`) | 8 | 3 |
+  | native, forwarded (`rmlog.so` logging only) | 8 | 0 |
+
+  Round one's figures agree (4 of 8 guest runs under either VMM, 0 of 5
+  native). Stopping the channel's scheduling without taking it off the GPU
+  is not enough either. SuperTuxKart's start-ups cope with the refusal:
+  thirty in one guest refused and thirty forwarded all reached the race. It
+  stays refused until the user decides (below, "What would close the
+  rest").
+- **Blender's Vulkan backend at the default 1 GiB window crashes; it does
+  not hang.** Staging buffers it cannot map ("Unable to upload data to
+  vertex buffer via a staging buffer"), then a crash report, in 4 of 4
+  runs, none stalled (4, above).
 - **Godot's GL scene hung once as it exited** (1 of 8 guest runs, crosvm),
-  with no message crossing to the host until the watchdog. Not reproduced.
+  with no message crossing to the host until the watchdog. Not reproduced:
+  14 more runs under crosvm, each watched by `hang-watch.sh`, all exited.
 
 ### What would close the rest
 
@@ -519,8 +544,23 @@ In the order of what each would buy:
    allocation's page-size attribute, at the cost of rounding and of
    higher-order allocations that can fail under fragmentation; it belongs
    in the backend's RM allocation path (`device/src/nvidia/rm.rs`).
-2. **Find the Blender Vulkan hang** (a correctness item): the waiting
-   threads' stacks, and which event the guest waits for.
+2. **Let a guest disable its own channels** (a correctness item: Blender's
+   Vulkan hang, above). The user's decision, as every RM allowlist change
+   is. What forwarding would take: the backend already holds every client
+   DISABLE_CHANNELS names to the calling guest process
+   (`device/src/rmshare.rs`, `CONTROL_CLIENT_LISTS`; GSP-RM itself checks
+   no token there, so natively a process can name another's), so only the
+   caller's own channels could be stopped, and RM refuses a
+   `pRunlistPreemptEvent` from anything but a kernel client. What it would
+   open: a disable without `bOnlyDisableScheduling` takes the channels off
+   the GPU (open-gpu-kernel-modules 595.99.02,
+   `src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fifo.h`), a preemption
+   of the runlist they share with other VMs and host programs, which a
+   guest could then make as often as it liked -- as any native process
+   can, and the reason `RESTART_RUNLIST` stays out. Forcing
+   `bOnlyDisableScheduling` would avoid that, but does not stop the hang
+   (above). A per-process rate on the calls would bound it: Blender makes
+   four a frame, under two a second.
 3. **Cut the backend's cost per IOCTL2** (2: up to about 40 µs a frame, 5%
    at a thousand frames a second). A cheaper exact classification of
    exported descriptors (a `readlinkat` on a directory descriptor kept for

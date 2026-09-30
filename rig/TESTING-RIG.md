@@ -883,18 +883,43 @@ Known, and not ours:
   unconfined, and 1 of 20 in a guest. An aborted process can go on
   rendering on the compositor; `rig-heavy.sh` kills whatever is left of the
   image's programs after each native run, and says so in the run's log.
-- **The RM allowlist's refusal of `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS`
-  is benign.** Every Vulkan run logs it twice at start-up. The driver
-  brackets half a millisecond of queue set-up with it on its own channels
-  natively (`rig/heavy/rmlog.c`, an LD_PRELOAD logger of RM controls, shows
-  the calls), sees the refusal as NV_ERR_NOT_SUPPORTED, and copes: thirty
-  start-ups in one guest refused and thirty forwarded (`--rm-allowlist=log`)
-  all reached the race. It stays refused.
 
-Not explained yet: Blender's Vulkan backend (`blender-vk`, 16 GiB window)
-hung in 4 of 8 guest runs under either VMM, none of 5 native, with nothing
-but readiness arms crossing to the host (BENCHMARKS.md, "Heavy
-workloads").
+Known, and the RM allowlist's:
+
+- **Blender's Vulkan backend (`blender-vk`) hangs in 10 of 24 guest runs
+  because the allowlist refuses `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS`.**
+  NVIDIA's Vulkan driver disables and re-enables one of its own channels
+  around each frame it starts, and goes on the same way whether RM did it
+  or not; without it, a frame (nearly always the second) sometimes never
+  completes, and the main thread
+  polls `/dev/nvidia0` every 10 ms for good. The same refusal made natively
+  (`RMLOG_REFUSE`, below) hangs Blender the same way; forwarded
+  (`--rm-allowlist=log`, diagnostic only), no guest run hangs.
+  SuperTuxKart's start-ups call it too and cope (thirty refused, thirty
+  forwarded, all reached the race). Whether to allow it is open
+  (BENCHMARKS.md, "Heavy workloads").
+
+**A run that stops.** `rig/heavy/hang-watch.sh <workload> [runs]` (at
+`/opt/heavy` in the image) runs a workload in a loop and, when its app.log
+gains no `HEAVY_` line for `HANG_STALL` seconds (default 30: Blender prints
+one a frame; Godot prints one at the start and one at the end, so give it
+45), dumps what the program waits on -- every thread's state, kernel stack
+and blocking syscall, a poll's descriptors and a futex's word decoded
+(`rig/heavy/waits.py`) -- and the guest module's counters, kills it and
+starts the next run:
+
+```sh
+NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=900 nvgpu_cmd=$(printf %s \
+    'bash /opt/heavy/hang-watch.sh blender-vk 10' | base64 -w0)" \
+NVGPU_COMPUTE=1 NVGPU_WINDOW_MIB=16384 NVGPU_WINDOW_SHARE=90 NVGPU_ROOTFS=... \
+    rig/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" run hw1
+```
+
+`rig/heavy/rmlog.c` (LD_PRELOAD) logs the RM controls a program makes that
+fail, and every DISABLE_CHANNELS with its parameters; natively,
+`RMLOG_REFUSE=0x2080110b` answers those controls as the allowlist does
+without RM seeing them (`RMLOG_REFUSE_STATUS=0` answers success instead),
+which is how a refusal is told apart from the device.
 
 ## What to keep from every run
 
