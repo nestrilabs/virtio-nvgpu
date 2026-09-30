@@ -9,6 +9,7 @@
 #
 #   rmctrl_extract.py check   RM control pointers   (gen/rmctrl, nvgpu_rm_deep.h)
 #   rmallow_extract.py check  the RM allowlist      (gen/rmallow)
+#   vidmem_extract.py check   --vram-limit's fields (gen/vidmem)
 #   nvkms_extract.py check    NVKMS/nvidia-drm       (gen/nvkms)
 #   uvm_extract.py check      UVM blocks            (gen/uvm)
 #   uvm_extract.py scan       every published tag against the UVM ranges
@@ -46,6 +47,7 @@ step() {
 
 step "rmctrl" python3 rmctrl_extract.py check --cache "$CACHE/rmctrl"
 step "rmallow" python3 rmallow_extract.py check --cache "$CACHE/rmallow"
+step "vidmem" python3 vidmem_extract.py check --cache "$CACHE/rmallow"
 step "nvkms" python3 nvkms_extract.py --cache "$CACHE/nvkms" check
 step "uvm" python3 uvm_extract.py --cache "$CACHE/uvm" check
 step "uvm scan" python3 uvm_extract.py --cache "$CACHE/uvm" scan

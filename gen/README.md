@@ -18,6 +18,7 @@ There are several, each with its own generator:
 | `rmctrl/*.json` → `src/rmctrl/generated.rs`, `../driver/gen/nvgpu_rm_deep.h` | `rmctrl_extract.py` | where RM follows a pointer inside a control's parameters, and how much it copies through it, per release | [RM control pointers](#rm-control-pointers) |
 | `uvm/*.json` | `uvm_extract.py` | UVM parameter block sizes and descriptor offsets, per release | [UVM parameter blocks](#uvm-parameter-blocks) |
 | `rmallow/*.json` → `src/rmallow/generated.rs` | `rmallow_extract.py` | the RM allowlist: which controls and classes a guest may reach, per release | [RM allowlist](#rm-allowlist) |
+| `vidmem/*.json` → `src/vidmem/generated.rs` | `vidmem_extract.py` | what `--vram-limit` reads and rewrites: allocation sizes, the FB_GET_INFO lists and indices, the OS_UNIX export and import blocks, per release | [Video memory limit](#video-memory-limit) |
 | `../driver/gen/nvgpu_rmalloc_classes.h`, `nvgpu_v1v2_rewrites.h` | `nvgpu_gen.py` | the guest module's RM class and rewrite tables | — |
 
 The profiles key off a range of releases; the NVKMS, nvidia-drm, RM control and
@@ -89,7 +90,8 @@ table whose range holds it (the last one ends at the newest `uvm/*.json`),
 and an ABI profile no newer than `MEASURED_THROUGH` in `src/versions/mod.rs`.
 So measuring a release is: `rmallow_extract.py extract`, `nvkms_extract.py
 extract`, `uvm_extract.py extract` (and `scan`), `rmctrl_extract.py extract`,
-the renders, `schema_gen.py`, and moving `MEASURED_THROUGH` once gVisor's
+`vidmem_extract.py extract` (without it `--vram-limit` is refused on the
+release), the renders, `schema_gen.py`, and moving `MEASURED_THROUGH` once gVisor's
 nvproxy (or a capture in `fixtures/`) shows the frontend escapes unchanged --
 or a new profile if they moved. Until then `--allow-unmeasured-release
 --diagnostic` runs the host on the nearest older tables, without compute,
@@ -250,6 +252,31 @@ would get. Besides the six measured releases (the three ABI profiles,
 595.99.02, 610.57.04 and 615.71.09), `VERSIONS` has the four where it found a
 change (550.40.53, 565.57.01, 580.65.06, 590.44.01). Sources are
 cached in `$UVM_EXTRACT_CACHE` (default `$TMPDIR/ogkm-uvm`).
+
+## Video memory limit
+
+`vidmem_extract.py` measures, per release, every field and constant the
+backend's `--vram-limit` accounting reads or writes (`device/src/vidmem.rs`):
+the size in `NV_MEMORY_ALLOCATION_PARAMS`, VID_HEAP_CONTROL's allocating,
+freeing and INFO functions, ALLOC_MEMORY's limit, the lists of
+`NV2080_CTRL_CMD_FB_GET_INFO` and `_V2`, the FB_INFO indices it rewrites,
+the OS_UNIX export and import blocks, and the attribute bits and command
+numbers they are read with. A C probe compiled against the release's SDK
+headers prints each, as for the allowlist's `OS_BLOCKS`, from the same
+fetched sources (`rmallow_extract.py`'s cache). Nothing is carried between
+releases, and the backend takes a limit only on a release measured exactly:
+the indices move (HEAP_RECLAIMABLE is 0x3c in 595.99.02, 0x44 in 615.71.09,
+absent from 610.57.04) and so does V2's block (436 bytes in 535.129.03,
+1028 after).
+
+```sh
+./vidmem_extract.py all      # fetch + measure every release, render
+./vidmem_extract.py check    # re-measure and fail if gen/vidmem/ is stale
+./vidmem_extract.py render   # gen/vidmem/*.json -> src/vidmem/generated.rs
+```
+
+`render` is pure Python; the Rust test
+`the_checked_in_table_is_what_the_extractor_renders` runs it.
 
 ## RM allowlist
 

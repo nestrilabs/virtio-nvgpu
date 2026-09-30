@@ -59,6 +59,7 @@ backend in production: [`DEPLOY.md`](../DEPLOY.md).
 | `src/fence.rs` | syncobj waits turned into polls, and the shared, capped SYNCOBJ_EVENTFD registrations the guest sleeps on |
 | `src/semsurf.rs` | semaphore-surface fence contexts (nvidia-drm 0x54): index bound by the host's layout, the VM's RM clients (with the guest process that made each, and the grants RM took for their objects, for `rmshare.rs`), per-file and per-session caps; OS events named inside RM parameters |
 | `src/rmmem.rs` | records of RM system memory and doorbells, the coherency rewrite, and the Intel guest-PAT warning |
+| `src/vidmem.rs` | `--vram-limit`: the video memory a VM allocates, counted per allocation to its maker and refused past the limit, and the FB_GET_INFO, VID_HEAP_CONTROL INFO and ALLOC_MEMORY replies rewritten to it, at the host release's measured layout (`abi::vidmem`) |
 | `src/rmallow.rs` | the RM allowlist: default deny for RM controls and classes, per host release, from `gen/rmallow` (SECURITY.md, "The RM allowlist") |
 | `src/nvos.rs` | RM's escape ABI as the backend reads it: every field offset of the escapes' own blocks (measured per release in `gen/rmallow`, `abi::rmallow::nvos`), the nv-ioctl.h wrappers, the classes named in more than one place, and RM's statuses |
 | `src/le.rs` | little-endian words of a byte block read and written by offset, `None` past the end rather than a panic |

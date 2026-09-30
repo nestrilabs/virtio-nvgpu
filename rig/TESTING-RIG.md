@@ -993,7 +993,10 @@ connection to the headless sway failed before any device call was made
 fail, and every DISABLE_CHANNELS with its parameters; natively,
 `RMLOG_REFUSE=0x2080110b` answers those controls as the allowlist does
 without RM seeing them (`RMLOG_REFUSE_STATUS=0` answers success instead),
-which is how a refusal is told apart from the device.
+which is how a refusal is told apart from the device. `RMLOG_ALL=1` logs
+every control (with FB_GET_INFO's and _V2's index/value lists), every
+RM_ALLOC's class and every VID_HEAP_CONTROL's function instead: how the
+controls `--vram-limit` rewrites were found ("Video memory limit").
 
 ### Proton-like and CPU-heavy workloads
 
