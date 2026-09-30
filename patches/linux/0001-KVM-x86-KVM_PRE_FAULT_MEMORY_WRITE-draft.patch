@@ -1,0 +1,124 @@
+From: Jacob Root <me@rooty.dev>
+Subject: [PATCH DRAFT] KVM: x86: KVM_PRE_FAULT_MEMORY_WRITE, a prefault that maps
+ for write
+
+NOT APPLIED ANYWHERE. A draft for the host kernel, against Linux 7.2.7;
+patches/linux/README.md says what has and has not been done with it.
+
+KVM_PRE_FAULT_MEMORY maps memory as a stage-2 read fault would. A read
+fault maps a page writable only when GUP-fast can prove the host mapping
+writable (virt/kvm/kvm_main.c hva_to_pfn_fast(), then the FOLL_WRITE
+retry in hva_to_pfn_slow()), and with CONFIG_SECRETMEM GUP-fast refuses
+every order-0 folio whose ->mapping is NULL (mm/gup.c
+gup_fast_folio_allowed()) -- which is every page a driver hands userspace
+with vm_insert_page(), such as the NVIDIA driver's system memory
+(kernel-open/nvidia/nv-mmap.c nvidia_mmap_sysmem()). A VMM that places
+such a mapping in guest memory and prefaults it gets it mapped read-only,
+and the guest's first write to each page takes a second, slow stage-2
+fault: a guest writing freshly allocated GPU staging memory writes it at
+1 GB/s where the host writes it at 20.
+
+A write-intent flag lets the VMM ask for the mapping the guest's own write
+would have made: writable wherever the host mapping is writable (the slow
+GUP path takes FOLL_WRITE and succeeds for these pages), breaking CoW and
+dirtying the page in the dirty log as a guest write would. Userspace
+probes for it: an unknown flag is EINVAL, as every flag is today.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
+---
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -475,6 +475,8 @@
+ 
+ #define KVM_HAVE_MMU_RWLOCK
+ 
++#define KVM_ARCH_PRE_FAULT_MEMORY_FLAGS	KVM_PRE_FAULT_MEMORY_WRITE
++
+ struct kvm_mmu_page;
+ struct kvm_page_fault;
+ 
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5073,6 +5073,22 @@
+ 		direct_bits = gfn_to_gpa(kvm_gfn_direct_bits(vcpu->kvm));
+ 
+ 	/*
++	 * A write fault maps the page writable if the host mapping allows it,
++	 * and with it breaks CoW and dirties the page in the dirty log, as a
++	 * guest write would.  A read fault maps a page writable only when
++	 * GUP-fast can prove it writable (hva_to_pfn_fast()), and GUP-fast
++	 * refuses some pages outright -- with CONFIG_SECRETMEM, every order-0
++	 * folio without a mapping, which is what a driver's vm_insert_page()
++	 * gives userspace -- so the first guest write to each such page would
++	 * take a second fault.  Private memory is prefaulted as it is.
++	 */
++	if (range->flags & KVM_PRE_FAULT_MEMORY_WRITE) {
++		if (error_code & PFERR_PRIVATE_ACCESS)
++			return -EINVAL;
++		error_code |= PFERR_WRITE_MASK;
++	}
++
++	/*
+ 	 * Shadow paging uses GVA for kvm page fault, so restrict to
+ 	 * two-dimensional paging.
+ 	 */
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -6529,7 +6529,15 @@
+ will fail with `EOPNOTSUPP` even if `KVM_CHECK_EXTENSION` reports
+ the capability to be present.
+ 
+-`flags` must currently be zero.
++`flags` is zero, or on x86 KVM_PRE_FAULT_MEMORY_WRITE: memory is then
++mapped as if the vCPU had generated a stage-2 *write* fault -- writable
++wherever the host mapping is writable, breaking CoW and marking the pages
++dirty in the dirty log, as a guest write would.  Without it a page that the
++host could map writable may still be mapped read-only, e.g. one GUP-fast
++cannot check, and the guest's first write to it then faults again.  A
++read-only memslot fails with ENOENT, and private memory with EINVAL.
++Another flag, or KVM_PRE_FAULT_MEMORY_WRITE on another architecture, fails
++with EINVAL, so a VMM can probe for it.
+ 
+ 4.144 KVM_S390_KEYOP
+ --------------------
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -2614,6 +2614,10 @@
+ #ifdef CONFIG_KVM_GENERIC_PRE_FAULT_MEMORY
+ long kvm_arch_vcpu_pre_fault_memory(struct kvm_vcpu *vcpu,
+ 				    struct kvm_pre_fault_memory *range);
++/* The KVM_PRE_FAULT_MEMORY_* flags an architecture accepts. */
++#ifndef KVM_ARCH_PRE_FAULT_MEMORY_FLAGS
++#define KVM_ARCH_PRE_FAULT_MEMORY_FLAGS	0
++#endif
+ #endif
+ 
+ #endif
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1670,4 +1670,7 @@
+ 	__u64 padding[5];
+ };
+ 
++/* Map as a write fault would: writable where the host mapping allows it. */
++#define KVM_PRE_FAULT_MEMORY_WRITE	(1ULL << 0)
++
+ #endif /* __LINUX_KVM_H */
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -4338,7 +4338,7 @@
+ 	long r;
+ 	u64 full_size;
+ 
+-	if (range->flags)
++	if (range->flags & ~KVM_ARCH_PRE_FAULT_MEMORY_FLAGS)
+ 		return -EINVAL;
+ 
+ 	if (!PAGE_ALIGNED(range->gpa) ||
