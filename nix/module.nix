@@ -152,6 +152,23 @@ let
           only (SECURITY.md, "The window's size and share").
         '';
       };
+      vramLimitMiB = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 8192;
+        description = ''
+          The video memory this VM may allocate, in MiB (`--vram-limit`;
+          null, the default, is no limit): an allocation past it is refused
+          with RM's own out-of-memory status, and nvidia-smi, NVML, Vulkan
+          and CUDA in the guest are told it as the GPU's size. One guest
+          process holds at most `windowOwnerShare` percent of it. At least
+          64. What RM allocates on the VM's behalf (channels, page tables),
+          what nvidia-uvm migrates for CUDA managed memory and nvidia-drm's
+          own allocations are not counted: a bound on the VM's ordinary
+          workload, not a hard partition (DEPLOY.md, "Video memory limit";
+          SECURITY.md, "Video memory limit").
+        '';
+      };
       wayland = {
         socket = mkOption {
           type = types.nullOr (types.strMatching "^/[^[:space:]]+$");
@@ -381,6 +398,13 @@ in
         message = "services.virtio-nvgpu.vms.<n>.windowMiB: a multiple of 64 MiB";
       }
       {
+        # The backend refuses a smaller limit at start.
+        assertion = lib.all (vm: vm.vramLimitMiB == null || vm.vramLimitMiB >= 64) (
+          lib.attrValues cfg.vms
+        );
+        message = "services.virtio-nvgpu.vms.<n>.vramLimitMiB: at least 64 MiB";
+      }
+      {
         # The display paths and the semaphore-surface fences need NVKMS.
         assertion =
           !(lib.elem "nvidia" config.services.xserver.videoDrivers)
@@ -444,6 +468,10 @@ in
                 ++ lib.optionals (vm.windowOwnerShare != null) [
                   "--window-owner-share"
                   (toString vm.windowOwnerShare)
+                ]
+                ++ lib.optionals (vm.vramLimitMiB != null) [
+                  "--vram-limit"
+                  (toString vm.vramLimitMiB)
                 ]
                 ++ lib.optionals vm.inject.enable [
                   "--inject-uid"

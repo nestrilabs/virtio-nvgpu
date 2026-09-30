@@ -208,6 +208,26 @@ struct Args {
     #[arg(long, value_name = "PERCENT", default_value_t = ZoneConfig::DEFAULT_OWNER_PERCENT)]
     window_owner_share: u8,
 
+    /// Hold this VM to MIB of video memory: an RM allocation that would take
+    /// its processes past it is refused with RM's own NV_ERR_NO_MEMORY, and
+    /// nvidia-smi, NVML, Vulkan (heap size and VK_EXT_memory_budget) and
+    /// CUDA are told the limit as the GPU's size and what is left of it as
+    /// free. One guest process holds at most `--window-owner-share` percent
+    /// of it. At least 64.
+    ///
+    /// Unset (the default), a VM can allocate as much of the GPU's video
+    /// memory as RM gives it, as before, and nothing is rewritten. Counted:
+    /// what the guest allocates by name (RM_ALLOC and VID_HEAP_CONTROL
+    /// video memory, with its duplicates, exports and imports); not what RM
+    /// allocates on its own account for channels, contexts and page tables,
+    /// nor what nvidia-uvm migrates for CUDA managed memory, nor nvidia-drm's
+    /// own allocations (GEM_ALLOC_NVKMS_MEMORY, dumb buffers): a bound on a
+    /// VM's ordinary workload, not a hard partition against a hostile guest
+    /// (SECURITY.md, "Video memory limit"). Needs a host release gen/
+    /// measured exactly.
+    #[arg(long, value_name = "MIB")]
+    vram_limit: Option<u64>,
+
     /// Log the frame-pacing counters (device::pacing: message rates, the
     /// backend's service time per message type, how the guest's waits went,
     /// how long events took to reach the event queue) every SECS seconds
@@ -2139,6 +2159,10 @@ fn main() -> anyhow::Result<()> {
         if args.keep_guest_coherency {
             be.set_guest_coherency(false);
         }
+        if let Some(mib) = args.vram_limit {
+            be.set_vram_limit(mib, args.window_owner_share)
+                .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
+        }
         // Every guest process's descriptors are this process's: the whole
         // of the hard limit, taken before the sandbox, sizes the handle
         // table (B1).
@@ -2337,6 +2361,27 @@ mod tests {
             );
         }
         assert!(super::window_config(&args(&["--window-size", "65536"])).is_ok());
+    }
+
+    /// `--vram-limit` is off unless given, and then takes a size in MiB.
+    #[test]
+    fn vram_limit_is_off_unless_given() {
+        assert_eq!(args(&[]).vram_limit, None);
+        assert_eq!(args(&["--vram-limit", "4096"]).vram_limit, Some(4096));
+        let parse = |a: &[&str]| {
+            Args::try_parse_from(std::iter::once("vhost-user-nvgpu").chain(a.iter().copied()))
+        };
+        assert!(parse(&["--vram-limit", "-1"]).is_err());
+        assert!(parse(&["--vram-limit", "4G"]).is_err());
+        // The backend takes it on a release gen/ measured, and not below
+        // the minimum.
+        let mut be = NvidiaBackend::with_zone_config(ZoneConfig::default_1gib());
+        be.set_host_driver_version("595.99.02");
+        assert!(be.set_vram_limit(32, 50).is_err());
+        assert!(be.set_vram_limit(4096, 50).is_ok());
+        let mut be = NvidiaBackend::with_zone_config(ZoneConfig::default_1gib());
+        be.set_host_driver_version("600.1.0");
+        assert!(be.set_vram_limit(4096, 50).is_err());
     }
 
     use super::*;

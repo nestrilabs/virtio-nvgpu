@@ -752,6 +752,98 @@ It is the operator's choice for a VM that runs one heavy application.
   guest RAM plus the window (DEPLOY.md). Only a guest kernel touches such
   pages; no guest driver path does.
 
+### Video memory limit
+
+Every guest process's RM calls are the backend's on the host, so RM sees one
+client process per VM, and gives it video memory until the GPU has none:
+without a limit one VM can take all of it, and the host's desktop and every
+other VM on the GPU then fail their allocations. The window bounds only what
+a VM has CPU-mapped at once ("The window's size and share"). `--vram-limit
+<MiB>` (off by default; `device/src/vidmem.rs`) is a per-VM bound on what the
+VM allocates, so one VM can no longer exhaust video memory for the others --
+except through what the next paragraphs list as not counted. It is a new
+isolation property between VMs, and loosens nothing: with the flag unset
+nothing is counted and no reply is touched, and with it set a guest can do
+strictly less than without.
+
+**What is counted and refused.** Physical video memory the guest allocates by
+name: RM_ALLOC of NV01_MEMORY_LOCAL_USER, the one video-memory class the RM
+allowlist lets a guest make, and VID_HEAP_CONTROL's allocating functions
+where RM makes that class (LOCATION_VIDMEM and not VIRTUAL; ANY and PCI
+become system memory). Virtual allocations and system memory have no video
+memory behind them and are not counted. An allocation that would take the VM
+past its limit, or a guest process past `--window-owner-share` percent of it
+(`quota::Share::percent`, as the window: half by default, the last eighth
+kept for processes holding at most a sixteenth), is refused before RM sees it
+with RM's own NV_ERR_NO_MEMORY in the caller's block, the ioctl succeeding --
+what an allocation RM cannot back returns natively, so the drivers above turn
+it into VK_ERROR_OUT_OF_DEVICE_MEMORY and CUDA_ERROR_OUT_OF_MEMORY. A block
+too short to hold the size is refused with NV_ERR_INVALID_PARAM_STRUCT, and
+an RM_ALLOC of the class in the 32-byte NVOS21 form, which the accounting
+does not see (only `--rm-allowlist=log` or `--permissive-abi` let one that
+far), with EINVAL. The size admitted is the one asked for (TILED_PITCH_HEIGHT:
+RM's own height times pitch); the size counted is RM's, from the reply, so
+the limit can be passed by one allocation's rounding to its page size.
+
+**Whose it is, and how long.** A charge is the maker's, and one per
+allocation: a duplicate (NV_ESC_RM_DUP_OBJECT), an OS_UNIX export slot
+(EXPORT_OBJECT_TO_FD, EXPORT_OBJECTS_TO_FD) and a handle imported from one
+(IMPORT_OBJECT_FROM_FD, IMPORT_OBJECTS_FROM_FD) share it and keep it alive,
+so memory that outlives its first handle through any of them stays counted.
+It goes when the last of them does: RM_FREE of the object or of anything RM
+frees with it (rmmem.rs's tree of what the VM made), VID_HEAP_CONTROL FREE
+and HW_FREE, RM_FREE of the client, the close of the file the client lives
+on or of the export descriptor, and the session's reset. The records --
+handles and export slots of counted memory -- are a pool of 262,144 per VM,
+a quarter per guest process; a duplicate, export or import past a process's
+part is refused as an allocation past the limit is, so the table cannot be
+grown with duplicates that need no video memory.
+
+**What it tells the guest, and how.** nvidia-smi, NVML and CUDA read video
+memory sizes from NV2080_CTRL_CMD_FB_GET_INFO_V2, and the Vulkan driver (heap
+size, VK_EXT_memory_budget) from the V1 control, whose list the guest sends
+behind its pointer; measured on the rig with `rig/heavy/rmlog.c`. With a
+limit, their sizes (RAM_SIZE, TOTAL_RAM_SIZE, HEAP_SIZE, MAPPABLE_HEAP_SIZE,
+USABLE_RAM_SIZE) are rewritten to at most the limit and their free amounts
+(HEAP_FREE, LARGEST_FREE_REGION, HEAP_RECLAIMABLE) to at most what the VM has
+left of it; VID_HEAP_CONTROL INFO's `total`, `free` and largest free region,
+and ALLOC_MEMORY's limit for NV01_MEMORY_LOCAL_USER, the same. The rewrite is
+parity-sensitive, so it is narrow: only replies RM answered NV_OK, only at
+RM's exact parameter size, only indices and offsets measured for the host's
+exact release (gen/vidmem_extract.py; the backend refuses to start with a
+limit on a release it did not measure -- HEAP_RECLAIMABLE's index is 0x3c in
+595.99.02, 0x44 in 615.71.09 and absent in 610.57.04), a list read no further
+than RM's maximum and the bytes there are, and a value only ever lowered
+(`min` with what RM said), never raised. It is a bound on allocation, not on
+information: the GPU's real size is still in what the guest can read
+elsewhere (the FB region list, BAR1's size, the device id), as it was.
+
+**What is not counted.** A VM can still take video memory beyond its limit
+through what RM allocates on its behalf rather than by name, which no call
+the backend sees sizes: channels' and contexts' buffers (graphics, compute
+and copy engines' context state), GPU page tables of its VA spaces, GSP-side
+state, event and notifier buffers. What nvidia-uvm migrates into video
+memory for CUDA's managed allocations (only with `--allow-compute`) is
+allocated by UVM's own kernel client. Two explicit paths are not counted
+either, because they allocate through NVKMS's kernel client rather than an
+RM call of the VM's, and following them means following GEM handles, PRIME
+exports and imports and NVKMS registrations through the IOCTL2 path, which
+this does not yet do: nvidia-drm's GEM_ALLOC_NVKMS_MEMORY on a render node
+(what the guest's GBM uses for scanout-capable buffers) and CREATE_DUMB on a
+card node (compositor-VM and lease modes); and memory kept alive past every
+RM handle and export descriptor the VM holds -- by a GEM object imported
+from an export descriptor (GEM_IMPORT_NVKMS_MEMORY), or an NVKMS surface
+registered from one -- stops counting when the last of those goes, though
+it lives until the GEM object or surface does. **A guest with a render node
+can therefore still allocate past its limit, through nvidia-drm**, bounded
+only by the VM's other caps (GEM objects and surfaces by the handle table
+and NVKMS's, channels by RM's own limits). None of these is a way into
+another VM's memory: the limit is about availability. So a limit per VM is
+not a hard partition of the GPU against a hostile guest; it holds a VM's
+ordinary workload (Vulkan, GL and CUDA allocate through RM) to its budget,
+and tells it so. Leave headroom between the sum of the limits and the GPU's
+memory.
+
 ---
 
 ## 5. The backend process
@@ -948,6 +1040,7 @@ files and sockets, the user's files, the network, other processes.
 | channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used fewer than 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
 | display caps | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth ("The window's size and share"); a mapping is charged to whoever opened the file it is armed on |
+| video memory | none by default. With `--vram-limit`, what the VM allocates by name is held to it, `--window-owner-share` percent per guest process with the last eighth kept for processes holding at most a sixteenth, and 262,144 records of it per VM, a quarter per process; not what RM allocates on the VM's behalf ("Video memory limit") |
 | Wayland caps | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools (the last sixteenth kept for processes holding at most a sixty-fourth), shared by all its connections. In the guest daemon, per client process: a quarter of the descriptors it may hold for clients (its hard limit less 60) and of 64 MiB of stream-sink data, the last eighth of each kept for processes holding little. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
 | not capped | Memory outside the Wayland and window budgets has no limit of the backend's own; the shipped unit (`contrib/systemd/vhost-user-nvgpu@.service`, DEPLOY.md) puts each backend in a cgroup of its own with `MemoryMax`, `MemorySwapMax=0`, `TasksMax` and `OOMScoreAdjust=500`, the rig's launcher does not. Several VMs of one backend user share that user's host limits. |
 
@@ -2234,6 +2327,8 @@ replaces to the same strength:
 - the Wayland allowlist, descriptor classes and budgets;
 - every cap in "Resource caps", and each guest process's share of the
   VM-wide ones;
+- with `--vram-limit`, the video memory a VM allocates by name, and what
+  RM's replies tell it of the GPU's memory ("Video memory limit");
 - that a descriptor RM resolves in the backend (NV0000's OS_UNIX
   controls, the event and fd-carrying escapes) is one of the caller's own
   files, or the call does not reach RM;
@@ -2322,6 +2417,12 @@ carries; Appendix C has their history.
    (B1), but the handle table, blobs, pools, streams and adopted compositor
    files do not yet draw from one descriptor budget (S-16, S-7). A guest
    process that forks enough can still take a pool, a share at a time.
+   Video memory is bounded per VM only with `--vram-limit`, and then not
+   what RM allocates on the VM's behalf, nor nvidia-drm's own allocations
+   (GEM_ALLOC_NVKMS_MEMORY, CREATE_DUMB), nor what a GEM object or NVKMS
+   surface keeps alive past the VM's last RM handle of it ("Video memory
+   limit"): following GEM handles through the IOCTL2 path is what would
+   close the last two.
 6. **Registered guest memory is released by a list of holders.** The
    backend tells the guest to unpin memory registered by its pages only
    when the RM objects, duplicates and UVM external mappings holding it are

@@ -447,6 +447,55 @@ A games VM uses a few tens of MiB of it.
   64 GiB MMIO window and refuses a window past 32 GiB. Both refuse at start,
   with the size named.
 
+## Video memory limit
+
+Without a limit a VM allocates as much of the GPU's video memory as RM
+gives it: the window bounds only what it has CPU-mapped at once, so one VM
+can take all of it, and the host's desktop and the other VMs then fail
+their allocations. `--vram-limit MIB` holds the VM to MIB (on NixOS
+`services.virtio-nvgpu.vms."N".vramLimitMiB`; the rig's launcher,
+`NVGPU_VRAM_LIMIT`). Off by default, and then nothing below applies.
+
+- **What it does.** Video memory the guest allocates by name -- what
+  `vkAllocateMemory` in a device-local heap, `cuMemAlloc` and GL's buffers
+  and textures come down to -- is counted at the size RM gives it, and an
+  allocation past the limit is refused before RM sees it, as RM refuses one
+  it cannot back: Vulkan returns `VK_ERROR_OUT_OF_DEVICE_MEMORY`, CUDA
+  `CUDA_ERROR_OUT_OF_MEMORY`, as on a smaller GPU. One guest process holds
+  at most `--window-owner-share` percent of the limit (half by default),
+  with the last eighth kept for processes that hold little, as in the
+  window; a VM for one application wants the share raised with it.
+- **What the guest sees.** nvidia-smi's "FB Memory Usage" (Total the limit,
+  Reserved 0, Used what the VM holds, Free the rest), NVML, Vulkan's
+  device-local heap and its `VK_EXT_memory_budget` budget, and CUDA's
+  `cuDeviceTotalMem` and `cuMemGetInfo` all say the limit, and games that
+  size their streaming from the budget size it to the VM. Free is never
+  more than the host has free. A limit above the GPU's memory shows the
+  GPU's.
+- **What it gains.** One VM can no longer exhaust the GPU's memory for the
+  host and the other VMs by allocating it (SECURITY.md, "Video memory
+  limit").
+- **What it costs.** A guest that asks for more than its limit fails where
+  it would have run. Memory RM allocates on the VM's behalf -- channels'
+  and contexts' buffers, page tables, GSP's -- and what nvidia-uvm migrates
+  for CUDA managed memory are not counted, nor nvidia-drm's own
+  allocations (`GEM_ALLOC_NVKMS_MEMORY`, dumb buffers), nor memory a GEM
+  object or an NVKMS surface keeps alive after the VM freed its last RM
+  handle of it. So a limit holds a VM's ordinary workload to its budget
+  but is not a hard partition against a hostile guest (SECURITY.md, "Video
+  memory limit"): leave headroom between the sum of the limits and the
+  GPU's memory. With a limit, each RM control's parameters
+  are copied once more in the backend to be looked at.
+- **Choosing it.** The backend logs, when the VM stops, `video memory: at
+  most X of Y MiB held, Z MiB by one process; ...`, and each refusal as
+  `video memory: N bytes for guest process ... refused`. On the rig (RTX
+  5090, 595.99.02) a CUDA context alone holds 498 MiB before its first
+  `cuMemAlloc`; the peaks the applications reached are in rig/TESTING-RIG.md,
+  "Video memory limit".
+- **Where it runs.** Only on a host release gen/ measured exactly
+  (`gen/vidmem_extract.py`): the replies it rewrites move between releases,
+  and the backend refuses to start with a limit on any other.
+
 ## Frame pacing
 
 Measured on the rig (RTX 5090, 595.99.02, Ryzen 9 9950X, Hyprland 0.56.2,
@@ -708,7 +757,8 @@ shows the diagnostic ones too.
 | `--socket-fd N` | none | serve the vhost-user socket already listening on descriptor N, bound by whoever started the backend (the root launcher does this) |
 | `--allow-compute` | off | serve CUDA and other compute: `/dev/nvidia-uvm`, the UVM aperture, memory registered by its pages. Graphics, Vulkan Video and display need none of it |
 | `--window-size MIB` | 1024 | the shared window: how much GPU memory the VM's processes can have CPU-mapped at once. A multiple of 64, at least 256; with `--allow-compute` at most 64512 (window and aperture share crosvm's 64 GiB region cap), else 65536; nesbox takes at most 32768. Refused at start otherwise ("Sizing the window") |
-| `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md, "The window's size and share") |
+| `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md, "The window's size and share"). The same percent of `--vram-limit` |
+| `--vram-limit MIB` | none | hold the VM to MIB of video memory, at least 64: allocations past it fail as on a smaller GPU, and nvidia-smi, NVML, Vulkan and CUDA in the guest are told it as the GPU's size ("Video memory limit") |
 | `--kms-card` | off | compositor-VM mode: offer the host's card nodes to the guest. Only for a host with no compositor of its own. Not run on hardware |
 | `--wayland-socket PATH` | none | the host compositor's socket, for the Wayland proxy |
 | `--wayland-lease` | off | offer the compositor's `wp_drm_lease_device_v1` (this GPU's card only) |

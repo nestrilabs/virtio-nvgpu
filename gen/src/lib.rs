@@ -13,3 +13,4 @@ pub mod schema;
 pub mod types;
 pub mod version;
 pub mod versions;
+pub mod vidmem;

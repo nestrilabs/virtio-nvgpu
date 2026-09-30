@@ -1,0 +1,146 @@
+{
+ "format": "virtio-nvgpu/vidmem/1",
+ "version": "610.57.04",
+ "abi": "x86_64 LP64",
+ "source": {
+  "tag": "610.57.04",
+  "commit": "e4a5faa2567f28c8eabe0ebb6422b6d0abcf37eb",
+  "url": "https://codeload.github.com/NVIDIA/open-gpu-kernel-modules/tar.gz/refs/tags/610.57.04",
+  "tarball_sha256": "619d7b5ce1f79c3211afdbf87d02b2174d268b10d005c5b8f994be22299be681",
+  "files": 1057
+ },
+ "blocks": {
+  "NV_MEMORY_ALLOCATION_PARAMS": {
+   "sizeof": 128,
+   "flags": 8,
+   "attr": 24,
+   "size": 64
+  },
+  "NVOS02_PARAMETERS": {
+   "sizeof": 48,
+   "hRoot": 0,
+   "hClass": 12,
+   "limit": 32,
+   "status": 40
+  },
+  "NVOS32_PARAMETERS": {
+   "sizeof": 184,
+   "hRoot": 0,
+   "hObjectParent": 4,
+   "function": 8,
+   "status": 20,
+   "total": 24,
+   "free": 32,
+   "data.AllocSize.hMemory": 44,
+   "data.AllocSize.flags": 52,
+   "data.AllocSize.attr": 56,
+   "data.AllocSize.size": 88,
+   "data.AllocSizeRange.hMemory": 44,
+   "data.AllocSizeRange.flags": 52,
+   "data.AllocSizeRange.attr": 56,
+   "data.AllocSizeRange.size": 80,
+   "data.AllocTiledPitchHeight.hMemory": 44,
+   "data.AllocTiledPitchHeight.flags": 52,
+   "data.AllocTiledPitchHeight.attr": 64,
+   "data.AllocTiledPitchHeight.size": 88,
+   "data.AllocTiledPitchHeight.height": 56,
+   "data.AllocTiledPitchHeight.pitch": 60,
+   "data.Free.hMemory": 44,
+   "data.HwFree.hResourceHandle": 40,
+   "data.Info.size": 56
+  },
+  "NVOS54_PARAMETERS": {
+   "sizeof": 32,
+   "hClient": 0,
+   "cmd": 8,
+   "paramsSize": 24,
+   "status": 28
+  },
+  "NVOS64_PARAMETERS": {
+   "sizeof": 48,
+   "hRoot": 0,
+   "hObjectNew": 8,
+   "hClass": 12,
+   "status": 40
+  },
+  "NV2080_CTRL_FB_GET_INFO_PARAMS": {
+   "sizeof": 16,
+   "fbInfoListSize": 0,
+   "fbInfoList": 8
+  },
+  "NV2080_CTRL_FB_GET_INFO_V2_PARAMS": {
+   "sizeof": 1028,
+   "fbInfoListSize": 0,
+   "fbInfoList": 4
+  },
+  "NV2080_CTRL_FB_INFO": {
+   "sizeof": 8,
+   "index": 0,
+   "data": 4
+  },
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS": {
+   "sizeof": 24,
+   "object.type": 0,
+   "object.data.rmObject.hObject": 12,
+   "fd": 16,
+   "flags": 20
+  },
+  "NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS": {
+   "sizeof": 20,
+   "fd": 0,
+   "object.type": 4,
+   "object.data.rmObject.hParent": 12,
+   "object.data.rmObject.hObject": 16
+  },
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS": {
+   "sizeof": 2128,
+   "fd": 0,
+   "objects": 76,
+   "numObjects": 2124,
+   "index": 2126
+  },
+  "NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_FROM_FD_PARAMS": {
+   "sizeof": 652,
+   "fd": 0,
+   "hParent": 4,
+   "objects": 8,
+   "numObjects": 648,
+   "index": 650
+  }
+ },
+ "constants": {
+  "NV_OK": 0,
+  "NV_ERR_NO_MEMORY": 81,
+  "NV01_MEMORY_LOCAL_USER": 64,
+  "NV2080_CTRL_CMD_FB_GET_INFO": 545264385,
+  "NV2080_CTRL_CMD_FB_GET_INFO_V2": 545264387,
+  "NV2080_CTRL_FB_INFO_MAX_LIST_SIZE": 128,
+  "NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE": 7,
+  "NV2080_CTRL_FB_INFO_INDEX_TOTAL_RAM_SIZE": 8,
+  "NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE": 9,
+  "NV2080_CTRL_FB_INFO_INDEX_MAPPABLE_HEAP_SIZE": 10,
+  "NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE": 22,
+  "NV2080_CTRL_FB_INFO_INDEX_USABLE_RAM_SIZE": 32,
+  "NV2080_CTRL_FB_INFO_INDEX_LARGEST_FREE_REGION_SIZE_KB": 18,
+  "NV2080_CTRL_FB_INFO_INDEX_HEAP_RECLAIMABLE": null,
+  "NVOS32_FUNCTION_ALLOC_SIZE": 2,
+  "NVOS32_FUNCTION_ALLOC_TILED_PITCH_HEIGHT": 6,
+  "NVOS32_FUNCTION_ALLOC_SIZE_RANGE": 14,
+  "NVOS32_FUNCTION_FREE": 3,
+  "NVOS32_FUNCTION_INFO": 5,
+  "NVOS32_FUNCTION_HW_FREE": 20,
+  "NVOS32_ALLOC_FLAGS_VIRTUAL": 524288,
+  "NVOS32_ATTR_LOCATION_VIDMEM": 0,
+  "NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD": 15621,
+  "NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD": 15622,
+  "NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD": 15627,
+  "NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD": 15628,
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE_RM": 1,
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_MAX_OBJECTS": 512,
+  "NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_TO_FD_MAX_OBJECTS": 128,
+  "NVOS32_ATTR_LOCATION_SHIFT": 25,
+  "NVOS32_ATTR_LOCATION_MASK": 3,
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD_SHIFT": 0,
+  "NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_FLAGS_EMPTY_FD_MASK": 1
+ }
+}

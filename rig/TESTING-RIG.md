@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `knob-vram` (`--vram-limit`) on display-passthrough | the limit as nvidia-smi, Vulkan and CUDA see it, allocations past it, stage1, compat, render and five applications with a limit, compat without | "Video memory limit" |
 | 2026-09-30 | branch `integrate35` (display-passthrough after this row): everything above plus the Steam-like workloads' guest changes and `patches/nesbox/0001`; the binaries installed in `.rig/` | Groups A and B under the patched nesbox (C and Rust modules) and crosvm, two batches of live applications: all passed (apps 18/0 and 23/0) | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `winehang`: `patches/nesbox/0001` (virtio-blk interrupt barrier), killable locks in the guest module, hang-watch | fresh-boot Wine/Godot D3D12 starts under nesbox with and without the patch; stage1, compat, render (with and without compute) and wayland on the patched nesbox | "Wine start-up stalls" |
 | 2026-09-30 | branch `integrate32`: the 2026-09-30 review's fixes (backend, guest module, Wayland, patches, deployment), the gVisor comparison, heavyfix and the fence-retire fix | Groups A and B under nesbox (C and Rust modules) and crosvm, the same probes on a KASAN+UBSAN+KFENCE+lockdep guest kernel with the unbind probe, and two batches of live applications | "Regression of the 2026-09-30 review" |
@@ -788,6 +789,46 @@ map with `SHM WriteCombine zone: guest process ... holds 0x18000000 of
 0x30000000 bytes and may not take 0x200000 more (Owner)`, every unmap having
 missed; the fixed one ran 400/400 with the WC peak at 2 MiB.
 
+## Video memory limit
+
+`NVGPU_VRAM_LIMIT` gives the backend `--vram-limit` (DEPLOY.md, "Video
+memory limit"). Which controls report video memory was measured natively
+with `rig/heavy/rmlog.c` and `RMLOG_ALL=1`:
+
+| program | control | FB_INFO indices |
+|---|---|---|
+| `nvidia-smi -q -d MEMORY` | FB_GET_INFO_V2 | TOTAL_RAM_SIZE (Total), HEAP_SIZE (Total less Reserved), HEAP_FREE (Free) |
+| `vulkaninfo` | FB_GET_INFO (V1; the guest sends its list as a deep block) | RAM_SIZE (the device-local heap), USABLE_RAM_SIZE, HEAP_FREE (the budget) |
+| CUDA (`cuDeviceTotalMem`, `cuMemGetInfo`) | FB_GET_INFO_V2 | TOTAL_RAM_SIZE, HEAP_SIZE, HEAP_FREE, FB_TAX_SIZE_KB, HEAP_RECLAIMABLE |
+
+```sh
+NVGPU_VRAM_LIMIT=4096 NVGPU_COMPUTE=1 NVGPU_CMDLINE_EXTRA="nvgpu_cmd=$(printf %s \
+  'nvidia-smi -q -d MEMORY; vulkaninfo | grep -A3 "memoryHeaps\[0\]"; cuda-smoke' | base64 -w0)" \
+  rig/run-guest.sh run vram4g
+NVGPU_VRAM_LIMIT=2048 NVGPU_COMPUTE=1 NVGPU_CMDLINE_EXTRA="nvgpu_cmd=$(printf %s \
+  'nvgpu-map-churn 32 64; cuda-smoke 0x10000000' | base64 -w0)" rig/run-guest.sh run vram2g
+```
+
+Results (RTX 5090, 595.99.02, 2026-09-30, nesbox, sandbox on, allowlist
+enforcing, the knob-vram backend):
+
+| run | result |
+|---|---|
+| 4096 MiB: `nvidia-smi`, `-q -d MEMORY` | `0MiB / 4096MiB`; Total 4096, Reserved 0, Used 0, Free 4096 MiB |
+| 4096 MiB: `vulkaninfo` | device-local heap 4.00 GiB, budget 3.99 GiB (the host's 31.84 GiB and 26.97 GiB before the V1 control was rewritten too) |
+| 4096 MiB: `cuda-smoke` | `device 0: NVIDIA GeForce RTX 5090, sm_120, 4096 MiB`, all PASS |
+| 2048 MiB: `nvgpu-map-churn 32 64` | RM status 0x51 at the 17th allocation: 16 x 64 MiB, the process's half of the limit; exit 1, no other error |
+| 2048 MiB: `cuda-smoke 0x10000000` | `FAIL cuMemAlloc: 2 (CUDA_ERROR_OUT_OF_MEMORY)` for 1 GiB, the context holding 498 MiB; the next `cuda-smoke` (256 MiB) ALL PASS, and `nvidia-smi` after reads 0 used |
+| 8192 MiB: `stage1`; `render` with compute | 6/0/0; 9/0/1 |
+| 8192 MiB: vkmark, blender, blendervk, stk in one VM (headless sway) | 14/0/0, every window captured; the teardown line: at most 1549 of 8192 MiB held, 1549 by one process, none refused |
+| `compat`, twice each: the rig's backend, knob-vram without a limit, with 8192 | base 13/0/0 twice; without 12/1/0 then 13/0/0; with 13/0/0 twice |
+
+The one failure without a limit is `nvgpu-drm-compat`'s signalled
+EXPORT_SYNC_FILE check, and an 8192 run in the first batch failed
+`nvgpu-syncobj-race` ("eventfd ... never fired"): both fence races, and the
+second fails from time to time on the rig's own backend too (`z5nb-compat`,
+`z1nb-compat`); nothing a limit changes is on those paths.
+
 ## Frame pacing
 
 `rig/rig-framepace.sh` runs one workload natively (`rig-native-run.sh
@@ -993,7 +1034,10 @@ connection to the headless sway failed before any device call was made
 fail, and every DISABLE_CHANNELS with its parameters; natively,
 `RMLOG_REFUSE=0x2080110b` answers those controls as the allowlist does
 without RM seeing them (`RMLOG_REFUSE_STATUS=0` answers success instead),
-which is how a refusal is told apart from the device.
+which is how a refusal is told apart from the device. `RMLOG_ALL=1` logs
+every control (with FB_GET_INFO's and _V2's index/value lists), every
+RM_ALLOC's class and every VID_HEAP_CONTROL's function instead: how the
+controls `--vram-limit` rewrites were found ("Video memory limit").
 
 ### Proton-like and CPU-heavy workloads
 

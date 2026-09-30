@@ -48,6 +48,11 @@
 #                       is checked for when it is not 1024
 #   NVGPU_WINDOW_SHARE  the percent of each window zone one guest process may
 #                       hold (the backend's --window-owner-share; default 50)
+#   NVGPU_VRAM_LIMIT    the video memory the VM may allocate, in MiB (the
+#                       backend's --vram-limit; unset: no limit). nvidia-smi,
+#                       Vulkan and CUDA in the guest see it as the GPU's size;
+#                       one guest process holds at most NVGPU_WINDOW_SHARE
+#                       percent of it
 #   NVGPU_RIG           the rig directory (bin/ kernel/ guest/ logs/); default
 #                       the repo's .rig when not root
 #   NVGPU_BACKEND NVGPU_VMM NVGPU_KERNEL NVGPU_ROOTFS NVGPU_LOGS

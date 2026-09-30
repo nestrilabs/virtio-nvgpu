@@ -155,6 +155,7 @@ The file tables of [`device/README.md`](device/README.md) and
 | RM's ABI as the backend reads it | `device/src/nvos.rs` (escape field offsets, measured per release), `le.rs` (bounded little-endian reads) |
 | protocol v2 and IOCTL2 | `device/src/session.rs`, `xfer.rs`, `schema.rs`, `policy.rs`; KMS state in `kms_state.rs` and `kms.rs`; NVKMS in `nvkms.rs`; fences in `fence.rs` and `semsurf.rs` |
 | per-process shares | `device/src/quota.rs`: a `Share` of each pool per guest process, and a `Pool` whose units are a `Charge` given back when whatever holds them drops it |
+| the video memory limit | `device/src/vidmem.rs` (`--vram-limit`: what a VM allocates, charged per allocation to its maker, and the FB_GET_INFO replies rewritten to it), with the frees it follows from `rmmem.rs`'s tree of RM objects |
 | capture injection | `device/src/inject/`, `protocol/src/inject.rs`, the guest's `driver/nvgpu_capture.c` |
 | sockets bound at a path, and handed over | `device/src/sockpath.rs` (export and inject sockets), `device/src/sys/inherit.rs` (socket activation, `--socket-fd`) |
 | the Wayland proxy | `wlwire/` (the engine both ends run, the codec, frames, streams, blobs, lazy reads `job.rs`, local input `localin.rs`, all-or-none budgets `budget.rs`), `device/src/wl/` (the host half), `nvgpu-wl-guest/` (the guest daemon, with its own per-client budgets in `budget.rs`) |
@@ -262,7 +263,9 @@ the region from that answer. It has three zones, one per memory type --
 uncached for registers, write-combining for video memory, write-back for
 system memory -- and each guest process may hold only a share of each
 (`--window-owner-share`, half by default), so one process cannot starve the
-others of mappings (DEPLOY.md, "Sizing the window").
+others of mappings (DEPLOY.md, "Sizing the window"). The window bounds what is mapped, not what is
+allocated: `--vram-limit`, off by default, bounds that per VM (DEPLOY.md,
+"Video memory limit").
 
 An RM mapping is known to the guest by two addresses in turn. RM_MAP_MEMORY
 returns a cookie -- here the window offset, never the host's address -- and
