@@ -156,6 +156,7 @@ The file tables of [`device/README.md`](device/README.md) and
 | protocol v2 and IOCTL2 | `device/src/session.rs`, `xfer.rs`, `schema.rs`, `policy.rs`; KMS state in `kms_state.rs` and `kms.rs`; NVKMS in `nvkms.rs`; fences in `fence.rs` and `semsurf.rs` |
 | per-process shares | `device/src/quota.rs`: a `Share` of each pool per guest process, and a `Pool` whose units are a `Charge` given back when whatever holds them drops it |
 | capture injection | `device/src/inject/`, `protocol/src/inject.rs`, the guest's `driver/nvgpu_capture.c` |
+| RM's dma-buf export (`--allow-dmabuf-export`) | `device/src/rmexport.rs` (the checks and the budgets), `device/src/nvidia/dmabuf.rs` (the escape served), the export gate's `GuestOnly` (`device/src/exportgate.rs`), the guest's `driver/nvgpu_rmexport.c` |
 | sockets bound at a path, and handed over | `device/src/sockpath.rs` (export and inject sockets), `device/src/sys/inherit.rs` (socket activation, `--socket-fd`) |
 | the Wayland proxy | `wlwire/` (the engine both ends run, the codec, frames, streams, blobs, lazy reads `job.rs`, local input `localin.rs`, all-or-none budgets `budget.rs`), `device/src/wl/` (the host half), `nvgpu-wl-guest/` (the guest daemon, with its own per-client budgets in `budget.rs`) |
 | the wire | `protocol/src/messages.rs` (Rust), `driver/nvgpu_wire.h` (C), held equal by `protocol/src/cheader.rs`, which reads the C header in the tests |

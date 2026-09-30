@@ -212,6 +212,10 @@ static int nvgpu_gem_place_in_window(struct nvgpu_gem_object *ng) {
   /* Acquire: the placement's fields below are read after this says so. */
   if (smp_load_acquire(&ng->window_valid))
     return 0;
+  /* Memory no CPU maps (nvgpu_rmexport.c): the node's mmap, the dma-buf's,
+   * a kernel mapping and a guest device's DMA address all end here. */
+  if (ng->no_cpu)
+    return -EOPNOTSUPP;
 
   if (!ng->dev->window.len) {
     dev_warn_once(&ng->dev->vdev->dev,
@@ -825,6 +829,38 @@ struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
   buf = drm_gem_prime_handle_to_dmabuf(file->minor->dev, file, handle,
                                        o_flags & (O_CLOEXEC | O_RDWR));
   drm_gem_handle_delete(file, handle);
+  return buf;
+}
+
+/*
+ * Host GEM @host_gem of @owner -- a render file no guest drm_file stands for
+ * (nvgpu_render_open_headless()) -- just made by the host's import of a
+ * dma-buf RM exported, as a proxy on @drm and a guest dma-buf of it, not yet
+ * a descriptor. Neither maps for any CPU or guest device (no_cpu). The export
+ * is the object's own, with no handle in any file: the dma-buf alone holds
+ * the proxy, the proxy @owner. A guest render file that imports the
+ * descriptor gets this proxy (nvgpu_gem_prime_import()), as for any dma-buf
+ * of ours.
+ *
+ * @host_gem is new -- a dma-buf just made is in no host file -- so no proxy
+ * can stand for it: this owns it from the call, and a -EEXIST or -EAGAIN
+ * (a backend answering with a number some proxy has) leaves it to that proxy.
+ */
+struct dma_buf *nvgpu_dmabuf_from_headless(struct drm_device *drm,
+                                           struct nvgpu_fd *owner,
+                                           u32 host_gem, u64 size,
+                                           u32 obj_type, int o_flags) {
+  struct nvgpu_gem_object *ng;
+  struct dma_buf *buf;
+
+  ng = nvgpu_gem_proxy_new(drm, owner, host_gem, size, obj_type);
+  if (IS_ERR(ng))
+    return ERR_CAST(ng);
+  ng->no_cpu = true;
+  buf = ng->base.funcs->export(&ng->base, o_flags & (O_CLOEXEC | O_RDWR));
+  /* The dma-buf's own reference, or none: the proxy is freed, which closes
+   * the host handle and puts @owner. */
+  drm_gem_object_put(&ng->base);
   return buf;
 }
 

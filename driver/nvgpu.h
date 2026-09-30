@@ -453,6 +453,10 @@ struct nvgpu_gem_object {
   /* SEMSURF_FENCE_ATTACH moved it into another file at least once, so its
    * free has re-homes to close (nvgpu_fence_gem_free()). */
   bool rehomed;
+  /* No CPU or guest-device view of its memory: a dma-buf RM exported
+   * (nvgpu_rmexport.c), which the host maps for no CPU either
+   * (nv_dma_buf_mmap). Never placed in the window. */
+  bool no_cpu;
 };
 
 #define to_nvgpu_gem(o) container_of(o, struct nvgpu_gem_object, base)
@@ -630,6 +634,17 @@ int nvgpu_dri_init(struct nvgpu_device *dev);
 void nvgpu_dri_cleanup(struct nvgpu_device *dev);
 /* The nvgpu_fd of a DRM file of this driver, else NULL. */
 struct nvgpu_fd *nvgpu_drm_file_nfd(struct file *f);
+/* A host render file of @dri's node with no guest file in front of it, for
+ * proxies to live in (nvgpu_rmexport.c); one reference, or an ERR_PTR. */
+struct nvgpu_fd *nvgpu_render_open_headless(struct nvgpu_dri_dev *dri);
+
+/* ───────── nvgpu_rmexport.c ───────── */
+
+/* Whether @cmd on @nfd is RM's EXPORT_TO_DMABUF_FD on a GPU file, served by
+ * the backend (NVGPU_BCAP_DMABUF_EXPORT), and so nvgpu_rm_dmabuf_export()'s. */
+bool nvgpu_rm_dmabuf_export_ours(const struct nvgpu_fd *nfd, unsigned int cmd);
+long nvgpu_rm_dmabuf_export(struct nvgpu_fd *nfd, unsigned int cmd,
+                            void __user *uarg);
 /* A DRM file of ours the caller just opened stops being the guest device's
  * master, if it had become it. */
 void nvgpu_drm_drop_master(struct file *f);
@@ -733,6 +748,16 @@ int nvgpu_dmabuf_to_host(struct nvgpu_device *dev, struct dma_buf *buf,
  * out with nvgpu_gem_wait_gone() and import again).
  */
 struct dma_buf *nvgpu_dmabuf_from_host_buf(struct file *drm_filp,
+                                           u32 host_gem, u64 size,
+                                           u32 obj_type, int o_flags);
+/*
+ * Host GEM @host_gem of @owner, a headless render file
+ * (nvgpu_render_open_headless()), as a guest dma-buf on @drm that no CPU
+ * maps, not yet a descriptor (nvgpu_gem.c). Owns @host_gem, but for -EEXIST
+ * and -EAGAIN, a number a proxy already has.
+ */
+struct dma_buf *nvgpu_dmabuf_from_headless(struct drm_device *drm,
+                                           struct nvgpu_fd *owner,
                                            u32 host_gem, u64 size,
                                            u32 obj_type, int o_flags);
 

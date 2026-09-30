@@ -282,7 +282,14 @@ int nvgpu_handle_for_fd(struct nvgpu_device *dev, int guest_fd, u32 *handle) {
 
 static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
                         unsigned long arg) {
-  return nvgpu_ioctl_fd(filp->private_data, cmd, arg);
+  struct nvgpu_fd *nfd = filp->private_data;
+
+  /* RM's dma-buf export, where the backend serves it: a guest dma-buf to
+   * install, which no parser path makes (nvgpu_rmexport.c). Otherwise it
+   * goes on as it always has, and the backend refuses it. */
+  if (nvgpu_rm_dmabuf_export_ours(nfd, cmd))
+    return nvgpu_rm_dmabuf_export(nfd, cmd, (void __user *)arg);
+  return nvgpu_ioctl_fd(nfd, cmd, arg);
 }
 
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
