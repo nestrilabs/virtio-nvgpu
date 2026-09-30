@@ -59,6 +59,10 @@ pub struct Config {
     pub render: Option<PathBuf>,
     /// Refresh the clock offset this often.
     pub clock_refresh: Duration,
+    /// Buffers a surface collects shm damage for (`--surface-buffers`;
+    /// wlwire's `SURFACE_BUFFERS` by default, at most
+    /// `MAX_SURFACE_BUFFERS`).
+    pub surface_buffers: usize,
 }
 
 impl Config {
@@ -69,6 +73,7 @@ impl Config {
             card: None,
             render: None,
             clock_refresh: Duration::from_secs(5),
+            surface_buffers: wlwire::shm::SURFACE_BUFFERS,
         }
     }
 }
@@ -732,6 +737,7 @@ impl Daemon {
             return;
         }
         let mut engine = Engine::new(self.engine_config(local));
+        engine.set_surface_buffers(self.cfg.surface_buffers);
         // A guest compositor's output is paced by the channel too (export
         // mode): its peer is the host client, behind the channel.
         engine.set_input_limit(Some(wlwire::engine::CHANNEL_HIGH_WATER));

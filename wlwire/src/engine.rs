@@ -408,6 +408,13 @@ impl Engine {
         self.shm.set_shared_budget(b);
     }
 
+    /// Collect shm damage for the last `n` buffers of each surface (client
+    /// side; `shm.rs`, held to 1..=`MAX_SURFACE_BUFFERS`). Before the
+    /// connection's first commit.
+    pub fn set_surface_buffers(&mut self, n: usize) {
+        self.shm.set_surface_buffers(n);
+    }
+
     /// Charge what stream sinks hold for their readers to `b` as well: the
     /// backend's queue budget, by guest process. Called again, a further one.
     pub fn set_stream_budget(&mut self, b: Arc<dyn ByteBudget>) {

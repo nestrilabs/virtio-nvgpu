@@ -385,7 +385,7 @@ struct Surface {
     damage_full: bool,
     damage_rows: Option<(u64, u64)>,
     /// Client side: the buffers this surface has shown, most recent last,
-    /// at most [`SURFACE_BUFFERS`]. A commit's damage is added to each, since
+    /// at most [`Shm::surface_buffers`]. A commit's damage is added to each, since
     /// a client repaints a buffer by what changed since it last showed it;
     /// the oldest past the limit is let go, and copied whole when next shown.
     buffers: VecDeque<u32>,
@@ -402,13 +402,22 @@ struct Surface {
 /// bounds the sum.
 pub const MAX_POOL_BYTES: u64 = 512 << 20;
 
-/// Buffers a surface collects damage for (client side): what a client cycles
-/// through, two or three and a few more for some toolkits, and not what a
-/// client could make it, since every commit visits each of them: unbounded,
-/// a client that shows one surface 20,000 buffers in turn makes each of its
-/// commits cost the guest daemon a millisecond, on the one thread every
-/// other application's messages wait on.
+/// Buffers a surface collects damage for (client side), by default: what a
+/// client cycles through, two or three and a few more for some toolkits,
+/// and not what a client could make it, since every commit visits each of
+/// them: unbounded, a client that shows one surface 20,000 buffers in turn
+/// makes each of its commits cost the guest daemon a millisecond, on the
+/// one thread every other application's messages wait on. A client that
+/// cycles through more gets each of its buffers copied whole when next
+/// shown, not only its damage. The guest daemon's `--surface-buffers`
+/// sets another, up to [`MAX_SURFACE_BUFFERS`].
 pub const SURFACE_BUFFERS: usize = 16;
+
+/// The most buffers a surface may be set to collect damage for
+/// ([`Shm::set_surface_buffers`]): each is visited at every commit, so this
+/// bounds what one commit costs the daemon (64 measured about 3 µs more
+/// than 16 a commit; 256, four times that).
+pub const MAX_SURFACE_BUFFERS: usize = 256;
 
 /// Pools one connection may hold at once, on either side: each is a
 /// descriptor here (our memfd, or the client's own), and a toolkit makes a
@@ -424,6 +433,9 @@ pub struct Shm {
     /// Budgets shared with other connections: the VM's, and the guest
     /// process's the connection is for, if the owner of the engine set them.
     shared: Budgets<dyn ShmCharge>,
+    /// Buffers a surface collects damage for ([`SURFACE_BUFFERS`] unless
+    /// set).
+    surface_buffers: usize,
     pub sync_bytes: u64,
     pub syncs: u64,
 }
@@ -436,6 +448,7 @@ impl Default for Shm {
             surfaces: HashMap::new(),
             conn: Arc::new(ShmBudget::new(MAX_POOL_BYTES, MAX_POOLS)),
             shared: Budgets::default(),
+            surface_buffers: SURFACE_BUFFERS,
             sync_bytes: 0,
             syncs: 0,
         }
@@ -535,6 +548,19 @@ impl Shm {
     /// (its id, a buffer made from it, a commit's copy) goes.
     pub fn pool_fds(&self) -> u64 {
         self.conn.used().1
+    }
+
+    /// Collect damage for the last `n` buffers each surface showed, held to
+    /// 1..=[`MAX_SURFACE_BUFFERS`]; set before the connection's first
+    /// commit (a surface that already holds more lets the oldest go at its
+    /// next one).
+    pub fn set_surface_buffers(&mut self, n: usize) {
+        self.surface_buffers = n.clamp(1, MAX_SURFACE_BUFFERS);
+    }
+
+    /// Buffers a surface collects damage for.
+    pub fn surface_buffers(&self) -> usize {
+        self.surface_buffers
     }
 
     /// Draw on a budget other connections share too (the VM's, a guest
@@ -680,7 +706,7 @@ impl Shm {
             if b != 0 && self.buffers.contains_key(&b) {
                 s.buffers.retain(|&x| x != b);
                 s.buffers.push_back(b);
-                if s.buffers.len() > SURFACE_BUFFERS {
+                if s.buffers.len() > self.surface_buffers {
                     evicted = s.buffers.pop_front();
                 }
             }
@@ -931,6 +957,39 @@ mod surface_tests {
         shm.attach(7, 100);
         assert_eq!(commit(&mut shm, 7), Some((100, 0, ROWS * row)));
         assert_eq!(named_by(&shm, 7), SURFACE_BUFFERS);
+    }
+
+    /// With `set_surface_buffers`, a surface collects damage for that many:
+    /// a client cycling through 32 buffers has only its damage copied at
+    /// 32, and each buffer whole at the default 16. Held to 1..=256.
+    #[test]
+    fn the_surface_buffer_count_is_settable_and_bounded() {
+        let row = sys::page_size() / ROWS;
+        for (n, cycle, copies_whole) in [(SURFACE_BUFFERS, 32u32, true), (32, 32, false)] {
+            let mut shm = shm();
+            shm.set_surface_buffers(n);
+            for id in 0..cycle {
+                buffer(&mut shm, 100 + id, 0);
+            }
+            // Two rounds: the first shows each buffer for the first time.
+            for round in 0..2 {
+                for id in 0..cycle {
+                    shm.damage_buffer(7, 0, 1);
+                    shm.attach(7, 100 + id);
+                    let got = commit(&mut shm, 7);
+                    if round == 1 {
+                        let whole = got == Some((100 + id, 0, ROWS * row));
+                        assert_eq!(whole, copies_whole, "n {n}, buffer {id}: {got:?}");
+                    }
+                }
+            }
+            assert_eq!(shm.surfaces[&7].buffers.len(), n.min(cycle as usize));
+        }
+        let mut shm = shm();
+        shm.set_surface_buffers(0);
+        assert_eq!(shm.surface_buffers(), 1);
+        shm.set_surface_buffers(usize::MAX);
+        assert_eq!(shm.surface_buffers(), MAX_SURFACE_BUFFERS);
     }
 
     /// A buffer destroyed while its surface shows it stays with that

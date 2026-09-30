@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! nvgpu-wl-guest [--socket NAME|PATH] [--device PATH] [--card PATH]
 //!                [--export NAME|PATH] [--render PATH] [--log LEVEL]
+//!                [--surface-buffers N]
 //!
 //! Normal mode: serve `--socket` (default `wayland-0` in `$XDG_RUNTIME_DIR`)
 //! and proxy every client to the host compositor. `--export NAME`: proxy the
@@ -31,7 +32,7 @@ fn socket_path(s: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(dir).join(s))
 }
 
-const USAGE: &str = "usage: nvgpu-wl-guest [--socket NAME|PATH] [--device PATH] [--card PATH] [--export NAME|PATH] [--render PATH] [--log LEVEL]";
+const USAGE: &str = "usage: nvgpu-wl-guest [--socket NAME|PATH] [--device PATH] [--card PATH] [--export NAME|PATH] [--render PATH] [--log LEVEL] [--surface-buffers N]";
 
 const HELP: &str = "\
 The guest half of virtio-nvgpu's Wayland proxy: guest applications connect to
@@ -53,7 +54,23 @@ nvgpu-wl group (setgid; DEPLOY.md, \"The guest\").
                       instead of serving guest clients
   --log LEVEL         error, warn, info or debug [default: info, or
                       $NVGPU_WL_LOG]
+  --surface-buffers N the wl_shm buffers of one surface whose damage is
+                      tracked, 1 to 256 [default: 16]: a client that cycles
+                      through more has each buffer copied whole when next
+                      shown, not only what changed. Every commit visits
+                      each one, on the thread all clients share (DEPLOY.md,
+                      \"The guest\")
   -h, --help          this text";
+
+/// `--surface-buffers`: 1 to wlwire's `MAX_SURFACE_BUFFERS`, and nothing
+/// else.
+fn parse_surface_buffers(v: &str) -> Result<usize, String> {
+    let max = wlwire::shm::MAX_SURFACE_BUFFERS;
+    match v.parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => Ok(n),
+        _ => Err(format!("--surface-buffers {v:?}: 1 to {max}")),
+    }
+}
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -66,6 +83,7 @@ fn main() {
     let mut card = None;
     let mut render = None;
     let mut export = None;
+    let mut surface_buffers = wlwire::shm::SURFACE_BUFFERS;
     let mut level = match std::env::var("NVGPU_WL_LOG") {
         Ok(v) => Level::parse(&v).unwrap_or_else(|| {
             eprintln!("nvgpu-wl-guest: NVGPU_WL_LOG={v:?} is not a level; using info");
@@ -83,6 +101,12 @@ fn main() {
             "--render" => render = Some(PathBuf::from(val())),
             "--export" => export = Some(val()),
             "--log" => level = Level::parse(&val()).unwrap_or_else(|| usage()),
+            "--surface-buffers" => {
+                surface_buffers = parse_surface_buffers(&val()).unwrap_or_else(|e| {
+                    eprintln!("nvgpu-wl-guest: {e}");
+                    usage()
+                })
+            }
             "-h" | "--help" => {
                 println!("{USAGE}\n\n{HELP}");
                 return;
@@ -106,6 +130,7 @@ fn main() {
         cfg.card = card;
         cfg.render = render;
         cfg.export_to = export.as_deref().map(socket_path).transpose()?;
+        cfg.surface_buffers = surface_buffers;
         let path = device.clone();
         let mut d = Daemon::new(cfg.clone(), Box::new(DevConnector { path: device })).map_err(
             |e| match e.kind() {
@@ -145,5 +170,18 @@ fn main() {
     if let Err(e) = run() {
         log::say(Level::Error, &format!("nvgpu-wl-guest: {e}"));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn surface_buffers_are_held_to_their_bounds() {
+        assert_eq!(super::parse_surface_buffers("16"), Ok(16));
+        assert_eq!(super::parse_surface_buffers("1"), Ok(1));
+        assert_eq!(super::parse_surface_buffers("256"), Ok(256));
+        for bad in ["0", "257", "-1", "", "16x", "99999999999999999999999"] {
+            assert!(super::parse_surface_buffers(bad).is_err(), "{bad}");
+        }
     }
 }
