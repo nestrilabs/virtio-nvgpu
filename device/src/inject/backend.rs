@@ -15,7 +15,6 @@ use protocol::inject::InjectInfo;
 use super::MAX_OPENS;
 use super::registry::{FileId, Registry, overlaps};
 use crate::hostfd;
-use crate::privfd::PrivateFd;
 use crate::quota::{Ledger, Owner, Share};
 
 /// One GEM handle INJECT_OPEN made in a guest file's render file.
@@ -89,8 +88,10 @@ impl BackendInject {
     }
 
     /// Record a handle INJECT_OPEN made (or found: an import of an object
-    /// the file holds gives its handle again), charged to `owner`. EAGAIN
-    /// past the VM's or the owner's share.
+    /// the file holds gives its handle again), charged to `owner`, with the
+    /// hold on the taint set the caller took for it before the import. EAGAIN
+    /// past the VM's or the owner's share. The hold is the record's from
+    /// here, or given back if the handle was recorded already or is refused.
     pub fn record(
         &mut self,
         render: u32,
@@ -98,17 +99,22 @@ impl BackendInject {
         offset: u64,
         size: u64,
         owner: Owner,
-        dmabuf: Option<&PrivateFd>,
+        taint: Option<FileId>,
     ) -> Result<(), i32> {
+        let give_back = |s: &Self| {
+            if let Some(r) = &s.registry {
+                r.taint().release(taint);
+            }
+        };
         if self.opens.contains_key(&(render, gem)) {
+            give_back(self);
             return Ok(());
         }
-        self.admits(owner)?;
+        if let Err(e) = self.admits(owner) {
+            give_back(self);
+            return Err(e);
+        }
         self.ledger.charge(owner, 1);
-        let taint = match (&self.registry, dmabuf) {
-            (Some(r), Some(d)) => r.taint().hold(d),
-            _ => None,
-        };
         self.opens.insert(
             (render, gem),
             OpenRec {
@@ -199,8 +205,20 @@ impl crate::nvidia::NvidiaBackend {
         let owner = self.current_owner;
         // The share first: a refusal must leave the file as it was.
         self.inject.admits(owner)?;
-        let (render, _) = self.handles.get(file).ok_or(libc::EBADF)?;
-        let errno = |e: io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+        // And the hold on the taint set before the import: a handle of the
+        // object is never in the guest's file untainted, and with no hold to
+        // be had (out of descriptors to keep its dma-buf by) there is no
+        // import. Given back on every refusal below.
+        let taint = reg.taint().hold(&opened.dmabuf).ok_or_else(|| {
+            log::warn!("INJECT_OPEN of id {id}: no hold on the taint set; refused");
+            libc::EMFILE
+        })?;
+        let refuse = |e: i32| {
+            reg.taint().release(Some(taint));
+            e
+        };
+        let (render, _) = self.handles.get(file).ok_or(libc::EBADF).map_err(refuse)?;
+        let errno = |e: io::Error| refuse(e.raw_os_error().unwrap_or(libc::EIO));
         let gem = host
             .prime_import(render, opened.dmabuf.as_fd())
             .map_err(errno)?;
@@ -213,12 +231,12 @@ impl crate::nvidia::NvidiaBackend {
             Ok(hostfd::NV_GEM_OBJECT_NVKMS) => {}
             t => {
                 log::warn!("INJECT_OPEN of id {id}: the import identifies as {t:?}");
-                return Err(libc::EIO);
+                return Err(refuse(libc::EIO));
             }
         }
         let offset = host.map_offset(render, gem).map_err(errno)?;
         self.inject
-            .record(file, gem, offset, opened.size, owner, Some(&opened.dmabuf))?;
+            .record(file, gem, offset, opened.size, owner, Some(taint))?;
         log::debug!("INJECT_OPEN of id {id}: GEM {gem} of render handle {file}");
         Ok((
             vec![

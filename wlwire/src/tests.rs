@@ -1968,6 +1968,34 @@ fn an_icc_file_is_sent_from_its_offset_and_the_offset_becomes_zero() {
     let a = wire::parse(d, &msgs).unwrap();
     assert_eq!(a[1].val, Val::Uint(0));
     assert_eq!(read_all(&fds[0]), b"ICCPROFILE");
+
+    // A guest that says another offset over the channel (its kernel is not
+    // trusted): the compositor still gets the sealed copy with offset 0,
+    // never an offset past the copy's end.
+    let m = MsgBuilder::new(4, op::wp_image_description_creator_icc_v1::REQ_SET_ICC_FILE)
+        .uint(1 << 20)
+        .uint(10)
+        .finish();
+    let mut q = VecDeque::from([
+        frame::Unit {
+            rec: frame::record(frame::REC_BLOB, 9, 0, b"ICCPROFILE"),
+            descs: vec![],
+        },
+        frame::Unit {
+            rec: frame::record(frame::REC_WAYLAND, 0, 1, &m),
+            descs: vec![DescOut::plain(Desc {
+                a: 9,
+                c: 10,
+                ..Desc::new(frame::DESC_BLOB)
+            })],
+        },
+    ]);
+    let (f, fds) = frame::pack(&mut q, 1 << 20, 256, false);
+    p.h.from_channel(&f, fds, &mut TestPlat::default()).unwrap();
+    let (msgs, fds) = p.at_server();
+    let msg = split(&msgs).pop().unwrap();
+    assert_eq!(wire::parse(d, &msg).unwrap()[1].val, Val::Uint(0));
+    assert_eq!(read_all(&fds[0]), b"ICCPROFILE");
 }
 
 #[test]

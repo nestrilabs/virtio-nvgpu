@@ -17,7 +17,10 @@
 //! buffer that is two frames old repaints two frames' damage, but reports only
 //! one). Buffer-space damage is used as rows; surface-space damage, which
 //! would need scale, transform and viewport to map back, counts as the whole
-//! buffer. A buffer seen for the first time is copied whole.
+//! buffer. A buffer seen for the first time is copied whole, and so is one
+//! its surface has shown [`SURFACE_BUFFERS`] others since: damage is
+//! collected for that many per surface, so that a commit costs as many
+//! steps, not one per buffer the client ever made.
 //!
 //! The client's descriptor is only ever read with `pread`, never mapped: a
 //! client that truncates its pool under us gets short copies, not a SIGBUS in
@@ -63,7 +66,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,6 +356,11 @@ pub struct Buffer {
     synced: bool,
     /// Rows [a, b) that may differ from what was last copied.
     dirty: Option<(u64, u64)>,
+    /// The surfaces that name this buffer: as the one they show
+    /// (`Surface::current`), or among those their damage is collected for
+    /// (`Surface::buffers`). What [`Shm::forget`] visits, rather than every
+    /// surface of the connection.
+    surfaces: HashSet<u32>,
 }
 
 impl Buffer {
@@ -376,7 +384,11 @@ struct Surface {
     current: u32,
     damage_full: bool,
     damage_rows: Option<(u64, u64)>,
-    buffers: HashSet<u32>,
+    /// Client side: the buffers this surface has shown, most recent last,
+    /// at most [`SURFACE_BUFFERS`]. A commit's damage is added to each, since
+    /// a client repaints a buffer by what changed since it last showed it;
+    /// the oldest past the limit is let go, and copied whole when next shown.
+    buffers: VecDeque<u32>,
     /// The buffer this surface last committed, destroyed since: what the
     /// compositor still shows, so its pages stay (see [`Shm::forget`]).
     retired: Option<Buffer>,
@@ -389,6 +401,14 @@ struct Surface {
 /// memory. The VM-wide budget (`--wayland-shm-budget` on the backend) is what
 /// bounds the sum.
 pub const MAX_POOL_BYTES: u64 = 512 << 20;
+
+/// Buffers a surface collects damage for (client side): what a client cycles
+/// through, two or three and a few more for some toolkits, and not what a
+/// client could make it, since every commit visits each of them: unbounded,
+/// a client that shows one surface 20,000 buffers in turn makes each of its
+/// commits cost the guest daemon a millisecond, on the one thread every
+/// other application's messages wait on.
+pub const SURFACE_BUFFERS: usize = 16;
 
 /// Pools one connection may hold at once, on either side: each is a
 /// descriptor here (our memfd, or the client's own), and a toolkit makes a
@@ -456,12 +476,20 @@ impl Shm {
     /// zeros. So the buffer, its pages and their charge stay with the
     /// surface until its next attach is committed, or the surface goes: one
     /// buffer per surface at most.
+    ///
+    /// Only the surfaces that name the buffer are visited (`Buffer::surfaces`),
+    /// not every surface: a peer that made thousands of surfaces must not
+    /// make every buffer it destroys cost as many steps.
     pub fn forget(&mut self, id: u32) {
         self.pools.remove(&id);
-        if let Some(buf) = self.buffers.remove(&id) {
+        if let Some(mut buf) = self.buffers.remove(&id) {
+            let linked = std::mem::take(&mut buf.surfaces);
             let mut buf = Some(buf);
-            for s in self.surfaces.values_mut() {
-                s.buffers.remove(&id);
+            for sid in linked {
+                let Some(s) = self.surfaces.get_mut(&sid) else {
+                    continue;
+                };
+                s.buffers.retain(|&b| b != id);
                 if s.current == id {
                     s.current = 0;
                     if let Some(b) = buf.take() {
@@ -470,7 +498,36 @@ impl Shm {
                 }
             }
         }
-        self.surfaces.remove(&id);
+        if let Some(s) = self.surfaces.remove(&id) {
+            for b in s.buffers.iter().chain(std::iter::once(&s.current)) {
+                if let Some(buf) = self.buffers.get_mut(b) {
+                    buf.surfaces.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Surface `surface` no longer names buffer `buffer`, unless it still
+    /// shows it or collects damage for it.
+    fn unlink(&mut self, surface: u32, buffer: u32) {
+        let named = self
+            .surfaces
+            .get(&surface)
+            .is_some_and(|s| s.current == buffer || s.buffers.contains(&buffer));
+        if !named && let Some(b) = self.buffers.get_mut(&buffer) {
+            b.surfaces.remove(&surface);
+        }
+    }
+
+    /// Surface `surface` shows buffer `b` from this commit on, in place of
+    /// `old`.
+    fn show(&mut self, surface: u32, old: u32, b: u32) {
+        if let Some(buf) = self.buffers.get_mut(&b) {
+            buf.surfaces.insert(surface);
+        }
+        if old != b {
+            self.unlink(surface, old);
+        }
     }
 
     /// Pools this connection holds a descriptor for: every one charged to its
@@ -578,6 +635,7 @@ impl Shm {
                 height,
                 synced: false,
                 dirty: None,
+                surfaces: HashSet::new(),
             },
         );
         Ok(())
@@ -604,8 +662,9 @@ impl Shm {
         if let Some(s) = self.surfaces.get_mut(&surface)
             && let Some(b) = s.pending.take()
         {
-            s.current = b;
+            let old = std::mem::replace(&mut s.current, b);
             s.retired = None;
+            self.show(surface, old, b);
         }
     }
 
@@ -615,12 +674,28 @@ impl Shm {
     pub fn commit(&mut self, surface: u32) -> Option<SyncJob> {
         let s = self.surfaces.get_mut(&surface)?;
         if let Some(b) = s.pending.take() {
-            s.current = b;
+            let old = std::mem::replace(&mut s.current, b);
             s.retired = None;
+            let mut evicted = None;
             if b != 0 && self.buffers.contains_key(&b) {
-                s.buffers.insert(b);
+                s.buffers.retain(|&x| x != b);
+                s.buffers.push_back(b);
+                if s.buffers.len() > SURFACE_BUFFERS {
+                    evicted = s.buffers.pop_front();
+                }
+            }
+            self.show(surface, old, b);
+            if let Some(e) = evicted {
+                // This surface's damage is no longer collected for it, so
+                // whatever it next shows is copied whole.
+                if let Some(buf) = self.buffers.get_mut(&e) {
+                    buf.synced = false;
+                    buf.dirty = None;
+                }
+                self.unlink(surface, e);
             }
         }
+        let s = self.surfaces.get_mut(&surface)?;
         let full = std::mem::take(&mut s.damage_full);
         let rows = s.damage_rows.take();
         for id in &s.buffers {
@@ -792,5 +867,262 @@ mod extents_tests {
             ext.remove(a, b);
         }
         assert!(ext.steps.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    /// Rows per test buffer, each a page long over one page of the pool.
+    const ROWS: u64 = 8;
+    const PAGES: u64 = 4;
+
+    /// A client-side `Shm` with pool 1 of `PAGES` pages.
+    fn shm() -> Shm {
+        let mut shm = Shm::default();
+        let size = PAGES * sys::page_size();
+        let fd = sys::memfd(c"t", size).unwrap();
+        let charge = shm.charge().unwrap();
+        shm.add_pool(1, fd, size, charge, false);
+        shm
+    }
+
+    /// Buffer `id` over page `page` of pool 1, `ROWS` rows of it, as the
+    /// engine makes one: whatever the id named before is forgotten first.
+    fn buffer(shm: &mut Shm, id: u32, page: u64) {
+        shm.forget(id);
+        let pg = sys::page_size();
+        let stride = (pg / ROWS) as i32;
+        shm.add_buffer(1, id, (page * pg) as i32, ROWS as i32, stride)
+            .unwrap();
+    }
+
+    fn commit(shm: &mut Shm, s: u32) -> Option<(u32, u64, u64)> {
+        shm.commit(s).map(|j| (j.buffer, j.off, j.end))
+    }
+
+    fn named_by(shm: &Shm, s: u32) -> usize {
+        shm.buffers
+            .values()
+            .filter(|b| b.surfaces.contains(&s))
+            .count()
+    }
+
+    /// A surface collects damage for its last `SURFACE_BUFFERS` buffers,
+    /// not for every buffer it ever showed; one it let go is copied whole
+    /// when shown again.
+    #[test]
+    fn a_surface_collects_damage_for_a_bounded_number_of_buffers() {
+        let mut shm = shm();
+        let row = sys::page_size() / ROWS;
+        for id in 100..1100 {
+            buffer(&mut shm, id, 0);
+            shm.attach(7, id);
+            assert_eq!(commit(&mut shm, 7), Some((id, 0, ROWS * row)));
+        }
+        assert_eq!(shm.surfaces[&7].buffers.len(), SURFACE_BUFFERS);
+        assert_eq!(named_by(&shm, 7), SURFACE_BUFFERS);
+        // One still collected, not damaged since it was shown: no copy.
+        shm.attach(7, 1099 - 3);
+        assert_eq!(commit(&mut shm, 7), None);
+        // One let go long ago: all of it, damage or none.
+        shm.attach(7, 100);
+        assert_eq!(commit(&mut shm, 7), Some((100, 0, ROWS * row)));
+        assert_eq!(named_by(&shm, 7), SURFACE_BUFFERS);
+    }
+
+    /// A buffer destroyed while its surface shows it stays with that
+    /// surface; the thousand other surfaces are not visited for it, and a
+    /// buffer no surface named goes at once.
+    #[test]
+    fn forget_visits_only_the_surfaces_that_name_the_buffer() {
+        let mut shm = shm();
+        for s in 1000..2000 {
+            shm.damage_surface(s);
+        }
+        buffer(&mut shm, 100, 0);
+        buffer(&mut shm, 101, 1);
+        shm.attach(7, 100);
+        assert!(commit(&mut shm, 7).is_some());
+        let pg = sys::page_size();
+        assert_eq!(shm.conn.used().0, 2 * pg);
+        shm.forget(101);
+        assert_eq!(shm.conn.used().0, pg, "a buffer nothing shows goes at once");
+        shm.forget(100);
+        assert_eq!(shm.conn.used().0, pg, "a shown one stays with its surface");
+        assert!(shm.surfaces[&7].retired.is_some());
+        assert_eq!(shm.surfaces[&7].current, 0);
+        shm.forget(7);
+        assert_eq!(shm.conn.used().0, 0);
+    }
+
+    /// The bookkeeping as it was before the list was bounded, for one
+    /// surface: every buffer it ever showed collects its damage. A buffer
+    /// is retired when the very object the surface's last commit showed is
+    /// destroyed -- not a later buffer given the same id (which the
+    /// compositor does not show, and which the old walk over every surface
+    /// took for it).
+    struct RefBuf {
+        /// Which object, of the ids given out over time.
+        obj: u64,
+        synced: bool,
+        dirty: Option<(u64, u64)>,
+    }
+
+    #[derive(Default)]
+    struct Ref {
+        bufs: HashMap<u32, RefBuf>,
+        next_obj: u64,
+        pending: Option<u32>,
+        current: u32,
+        /// The object `current` named when it was committed, if it was one.
+        shows: Option<u64>,
+        full: bool,
+        rows: Option<(u64, u64)>,
+        shown: HashSet<u32>,
+        /// The page the retired buffer holds, if there is one.
+        retired: Option<u64>,
+        /// The page each live buffer holds.
+        pages: HashMap<u32, u64>,
+    }
+
+    impl Ref {
+        fn create(&mut self, id: u32, page: u64) {
+            self.forget(id);
+            self.next_obj += 1;
+            let b = RefBuf {
+                obj: self.next_obj,
+                synced: false,
+                dirty: None,
+            };
+            self.bufs.insert(id, b);
+            self.pages.insert(id, page);
+        }
+
+        fn forget(&mut self, id: u32) {
+            if let Some(RefBuf { obj, .. }) = self.bufs.remove(&id) {
+                self.shown.remove(&id);
+                let page = self.pages.remove(&id);
+                if self.shows == Some(obj) {
+                    self.current = 0;
+                    self.shows = None;
+                    self.retired = page;
+                }
+            }
+        }
+
+        fn forget_surface(&mut self) {
+            self.retired = None;
+            self.pending = None;
+            self.current = 0;
+            self.shows = None;
+            self.full = false;
+            self.rows = None;
+            self.shown.clear();
+        }
+
+        fn commit(&mut self) -> Option<(u32, u64, u64)> {
+            if let Some(b) = self.pending.take() {
+                self.current = b;
+                self.shows = self.bufs.get(&b).map(|x| x.obj);
+                self.retired = None;
+                if b != 0 && self.bufs.contains_key(&b) {
+                    self.shown.insert(b);
+                }
+            }
+            let full = std::mem::take(&mut self.full);
+            let rows = self.rows.take();
+            for id in &self.shown {
+                let b = self.bufs.get_mut(id).unwrap();
+                if let Some(d) = if full { Some((0, ROWS)) } else { rows } {
+                    b.dirty = union(b.dirty, d);
+                }
+            }
+            let cur = self.current;
+            let b = self.bufs.get_mut(&cur)?;
+            let range = if !b.synced {
+                Some((0, ROWS))
+            } else {
+                b.dirty.take()
+            };
+            (b.synced, b.dirty) = (true, None);
+            let (y0, y1) = range?;
+            let (y0, y1) = (y0.min(ROWS), y1.min(ROWS));
+            if y0 >= y1 {
+                return None;
+            }
+            let row = sys::page_size() / ROWS;
+            Some((cur, y0 * row, y1 * row))
+        }
+
+        fn charged(&self) -> u64 {
+            let pages: HashSet<u64> = self.pages.values().chain(&self.retired).copied().collect();
+            pages.len() as u64 * sys::page_size()
+        }
+    }
+
+    /// Against the unbounded bookkeeping, over random buffers, attaches,
+    /// damage, commits and destroys on one surface: with no more buffer ids
+    /// than the list holds, every commit copies exactly what it copied; with
+    /// more, at least that. Pages are held and let go the same either way.
+    #[test]
+    #[cfg_attr(miri, ignore = "randomized: too slow under Miri, and safe code")]
+    fn bounded_damage_copies_what_unbounded_did_or_more() {
+        for ids in [SURFACE_BUFFERS as u64, 3 * SURFACE_BUFFERS as u64] {
+            let mut seed: u64 = 0x9e37_79b9_7f4a_7c15 ^ ids;
+            let mut rand = |n: u64| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 33) % n
+            };
+            let (mut shm, mut r) = (shm(), Ref::default());
+            for _ in 0..50_000 {
+                let id = 100 + rand(ids) as u32;
+                match rand(8) {
+                    0 => {
+                        let page = rand(PAGES);
+                        r.create(id, page);
+                        buffer(&mut shm, id, page);
+                    }
+                    1 => {
+                        r.forget(id);
+                        shm.forget(id);
+                    }
+                    2 => {
+                        let b = if rand(8) == 0 { 0 } else { id };
+                        r.pending = Some(b);
+                        shm.attach(7, b);
+                    }
+                    3 => {
+                        let (y, h) = (rand(ROWS + 2) as i32 - 1, rand(ROWS) as i32);
+                        let a = y.max(0) as u64;
+                        let b = (y as i64 + h.max(0) as i64).max(0) as u64;
+                        r.rows = union(r.rows, (a, b));
+                        shm.damage_buffer(7, y, h);
+                    }
+                    4 => {
+                        r.full = true;
+                        shm.damage_surface(7);
+                    }
+                    5 if rand(16) == 0 => {
+                        r.forget_surface();
+                        shm.forget(7);
+                    }
+                    _ => {
+                        let (want, got) = (r.commit(), commit(&mut shm, 7));
+                        if ids as usize <= SURFACE_BUFFERS {
+                            assert_eq!(got, want);
+                        } else if let Some((b, o, e)) = want {
+                            let (gb, go, ge) = got.expect("a copy the unbounded one made");
+                            assert!(gb == b && go <= o && ge >= e, "{got:?} short of {want:?}");
+                        }
+                    }
+                }
+                assert_eq!(shm.conn.used().0, r.charged());
+            }
+        }
     }
 }

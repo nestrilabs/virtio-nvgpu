@@ -241,16 +241,6 @@ pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     Ok(st)
 }
 
-/// `fstatfs(fd)`'s `f_type`: the magic number of the filesystem the file
-/// is on.
-pub fn fstatfs_type(fd: RawFd) -> io::Result<i64> {
-    // SAFETY: an all-zero `statfs` is a valid value for fstatfs to overwrite.
-    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a live, writable statfs.
-    cvt(unsafe { libc::fstatfs(fd, &mut st) })?;
-    Ok(st.f_type as i64)
-}
-
 /// `epoll_create1(EPOLL_CLOEXEC)`.
 pub fn epoll_create() -> io::Result<OwnedFd> {
     // SAFETY: integer arguments.

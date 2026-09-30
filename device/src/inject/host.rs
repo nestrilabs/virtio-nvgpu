@@ -12,8 +12,10 @@ use crate::hostfd;
 /// What injection asks of the host kernel, behind a trait so the rules can
 /// be tested against a fake nvidia-drm.
 pub trait InjectHost: Send + Sync {
-    /// Whether `fd` is a dma-buf: `fstatfs`'s `f_type` is the dma-buf
-    /// filesystem's magic.
+    /// Whether `fd` is a dma-buf, as `hostfd::classify` tells one: by what
+    /// the kernel says without asking the file's filesystem (its cached
+    /// attributes, and the `exp_name:` line only a dma-buf's fdinfo has), so
+    /// a helper that passes a FUSE file makes the check wait on nobody.
     fn is_dmabuf(&self, fd: BorrowedFd<'_>) -> bool;
     /// A dma-buf's size (its `lseek` end).
     fn dmabuf_size(&self, fd: BorrowedFd<'_>) -> io::Result<u64>;
@@ -76,7 +78,7 @@ impl SysInjectHost {
 
 impl InjectHost for SysInjectHost {
     fn is_dmabuf(&self, fd: BorrowedFd<'_>) -> bool {
-        crate::sys::fd::fstatfs_type(fd.as_raw_fd()).is_ok_and(|t| t == hostfd::DMA_BUF_MAGIC)
+        hostfd::classify(fd, &[]) == hostfd::HandleKind::Dmabuf
     }
     fn dmabuf_size(&self, fd: BorrowedFd<'_>) -> io::Result<u64> {
         hostfd::dmabuf_size(fd.as_raw_fd())

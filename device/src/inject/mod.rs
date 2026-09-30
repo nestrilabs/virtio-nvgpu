@@ -26,7 +26,8 @@
 //! "Capture injection").
 //!
 //! **What is accepted.** Each plane's descriptor must be a dma-buf
-//! (`fstatfs`'s magic), and must import into a render file of this GPU,
+//! (`hostfd::classify`, which asks no filesystem, so a FUSE file stalls
+//! nothing), and must import into a render file of this GPU,
 //! opened for the purpose and held by the backend, as nvidia-drm memory:
 //! GEM_IDENTIFY_OBJECT says NVKMS, which a dma-buf of another device (an
 //! iGPU's, a udmabuf, a v4l2 frame) does not -- nvidia-drm imports those as
