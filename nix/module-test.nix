@@ -210,6 +210,21 @@ let
       config = [ { services.virtio-nvgpu.extraArgs = [ "--queue-poll-us 50" ]; } ];
       says = "no whitespace in it";
     };
+    "a flag with a quote" = {
+      config = [ { services.virtio-nvgpu.vms."0".extraArgs = [ "\"--allow-compute" ]; } ];
+      says = "no quote, backslash or %";
+    };
+    "a flag with a specifier" = {
+      config = [ { services.virtio-nvgpu.extraArgs = [ "--queue-poll-us=%i" ]; } ];
+      says = "no quote, backslash or %";
+    };
+    "a Wayland socket with a colon" = {
+      config = [
+        helper
+        (vm0 { wayland.socket = "/run/user/1000/wayland-1:/etc"; })
+      ];
+      says = "no quote, backslash, % or colon";
+    };
     "a window not of 64 MiB steps" = {
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";

@@ -95,6 +95,18 @@ let
   # Slot n's settings: its vms.<n>, or every option's default.
   vmDefaults = (lib.evalModules { modules = [ vmOptions ]; }).config;
   vmOf = n: cfg.vms.${n} or vmDefaults;
+  # A word systemd passes on as it is: an unbraced $VAR in ExecStart= is
+  # split at whitespace and each word unquoted (quotes and backslashes taken
+  # as quoting), and an Environment= value has its % specifiers expanded.
+  plainWord =
+    a:
+    builtins.match ".*[[:space:]].*" a == null
+    && !(lib.any (c: lib.hasInfix c a) [
+      "\""
+      "'"
+      "\\"
+      "%"
+    ]);
   loginUids = lib.filter (u: u != null) (
     lib.mapAttrsToList (_: u: if u.isNormalUser then u.uid else null) users
   );
@@ -303,10 +315,20 @@ in
         message = "services.virtio-nvgpu: the pool's users (nvgpu-vmN, nvgpu-vmmN) must have no extraGroups";
       }
       {
-        assertion = lib.all (a: builtins.match ".*[[:space:]].*" a == null) (
+        assertion = lib.all plainWord (
           cfg.extraArgs ++ lib.concatMap (vm: vm.extraArgs) (lib.attrValues cfg.vms)
         );
-        message = "services.virtio-nvgpu.extraArgs, vms.<n>.extraArgs: give each flag and value as a word of its own, with no whitespace in it";
+        message = "services.virtio-nvgpu.extraArgs, vms.<n>.extraArgs: give each flag and value as a word of its own, with no whitespace in it, and no quote, backslash or % (systemd would unquote or expand them)";
+      }
+      {
+        # The socket's path goes into the same variable, and into
+        # BindReadOnlyPaths=, where a colon would name a second path.
+        assertion = lib.all (
+          vm:
+          vm.wayland.socket == null
+          || (plainWord vm.wayland.socket && !(lib.hasInfix ":" vm.wayland.socket))
+        ) (lib.attrValues cfg.vms);
+        message = "services.virtio-nvgpu.vms.<n>.wayland.socket: a path with no quote, backslash, % or colon";
       }
       {
         assertion =
@@ -408,8 +430,9 @@ in
         nameValuePair "vhost-user-nvgpu@${n}" (
           {
             overrideStrategy = "asDropin";
-            # systemd splits an unbraced $VAR at whitespace and takes quotes
-            # in it literally: hence one word per flag, and no spaces in any.
+            # systemd splits an unbraced $VAR at whitespace and unquotes each
+            # word, and expands % specifiers in the value: hence one word per
+            # flag, and no space, quote, backslash or % in any (plainWord).
             environment = {
               NVGPU_BACKEND_ARGS = concatStringsSep " " (
                 cfg.extraArgs
