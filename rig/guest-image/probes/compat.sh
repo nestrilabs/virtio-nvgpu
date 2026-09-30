@@ -9,6 +9,10 @@
 #           32-byte one, SYNCOBJ_WAIT / TIMELINE_WAIT from before
 #           deadline_nsec; each against the native size (the module
 #           normalises the argument as drm_ioctl() does)
+#   threads nvgpu-syncobj-race: eight threads of one file creating,
+#           importing, signalling, subscribing to and destroying syncobjs,
+#           then the same with guessers destroying numbers at random; every
+#           object destroyed exactly once, no answer for another's object
 #   32-bit  the same tool built i686; nvgpu-rm-smoke-32 (an RM client on
 #           /dev/nvidiactl: alloc, two controls, free; and a DRM ioctl),
 #           whose RESULT line must be the 64-bit build's; vulkaninfo-32
@@ -42,6 +46,15 @@ tool() {
 
 section "DRM ioctl sizes (64-bit)"
 tool "nvgpu-drm-compat" nvgpu-drm-compat "$NODE"
+
+# Posted SYNCOBJ_DESTROYs (driver/nvgpu_syncobj.c) against creates, imports,
+# eventfds and other threads' destroys of the same numbers.
+section "syncobjs from many threads of one file"
+if command -v nvgpu-syncobj-race >/dev/null; then
+    tool "nvgpu-syncobj-race" nvgpu-syncobj-race 5 8 "$NODE"
+else
+    fail "no nvgpu-syncobj-race in this image (rebuild it: mkimage.sh)"
+fi
 
 section "32-bit processes"
 if ! command -v nvgpu-rm-smoke-32 >/dev/null; then

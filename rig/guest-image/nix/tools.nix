@@ -15,6 +15,8 @@
 #                            and Vulkan, pixels and read-only mappings checked
 #   bin/nvgpu-drm-compat     DRM ioctls whose struct grew, at older, native and
 #                            newer sizes (SYNCOBJ_HANDLE_TO_FD's 16 bytes, ...)
+#   bin/nvgpu-syncobj-race   syncobjs made, imported, signalled, subscribed to
+#                            and destroyed by many threads of one file at once
 #   bin/nvgpu-rm-smoke       an RM client (alloc, controls, free) and a DRM
 #                            ioctl; tools32.nix builds both of these 32-bit too
 #   bin/nvgpu-bench          Vulkan, GL, RM and wl_shm microbenchmarks (BENCHMARKS.md)
@@ -67,6 +69,7 @@ pkgs.stdenv.mkDerivation {
     $CC $CFLAGS nvgpu-capture-import.c -o nvgpu-capture-import -lEGL -lGLESv2 \
       $(pkg-config --cflags --libs vulkan)
     $CC $CFLAGS drm-compat.c -o nvgpu-drm-compat
+    $CC $CFLAGS -pthread syncobj-race.c -o nvgpu-syncobj-race
     $CC $CFLAGS rm-smoke.c -o nvgpu-rm-smoke
 
     glslangValidator -V --vn bench_vs nvgpu-bench.vert -o bench-vs.h
@@ -92,7 +95,7 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff egl-fence gl-then-vk \
-      nvgpu-capture-import nvgpu-map-churn nvgpu-drm-compat nvgpu-rm-smoke nvgpu-bench nvgpu-cubench
+      nvgpu-capture-import nvgpu-map-churn nvgpu-drm-compat nvgpu-syncobj-race nvgpu-rm-smoke nvgpu-bench nvgpu-cubench
     install -Dm755 -t $out/lib libnvgpu-shim.so
     install -Dm755 nvgpu-bench-suite.sh $out/bin/nvgpu-bench-suite
     if [ -n "$verifySrc" ]; then
