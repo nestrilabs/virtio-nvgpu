@@ -9,7 +9,8 @@
 # should be -- then checks the root-only refusals (no layout named, a
 # diagnostic switch without NVGPU_DIAGNOSTIC=1, a path someone else can
 # write or does not belong to root -- the launcher's pieces, rig/launcher,
-# included -- no jailer) and what a root run must do (SECURITY.md, "The
+# included, each read by the path the check resolved, not through a link
+# someone else could repoint -- no jailer) and what a root run must do (SECURITY.md, "The
 # launcher as root"): root binds the backend's socket and hands it
 # over, and never gives the run's directory to the backend's user (VD-H1); a
 # diagnostic backend flag needs NVGPU_DIAGNOSTIC=1 and is said on the

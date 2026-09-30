@@ -76,6 +76,17 @@ chmod 0666 /rig/launcher/guest.sh
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 \
     bash /rig/run-guest.new.sh probe piece 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3
 chmod 0644 /rig/launcher/guest.sh
+echo "== new: a piece reached through a link in a directory someone else can write"
+# The check passes (what the link names is root's), and the launcher must
+# then read what it checked, not whatever the link names by then.
+mkdir -p /rig/real && cp /rig/launcher/verdict.sh /rig/real/verdict.sh
+echo 'echo "verdict.sh read from ${BASH_SOURCE[0]}" >&2' >> /rig/real/verdict.sh
+mv /rig/launcher/verdict.sh /rig/launcher/verdict.sh.away
+ln -s /home/user/verdict-link /rig/launcher/verdict.sh
+ln -s /rig/real/verdict.sh /home/user/verdict-link
+LINES_SHOWN=60 run run-guest.new.sh viadir | grep -E 'exit|verdict.sh read from'
+rm /rig/launcher/verdict.sh /home/user/verdict-link
+mv /rig/launcher/verdict.sh.away /rig/launcher/verdict.sh
 echo "== new: a file not root's (uid 65534 here: /proc/version, of a uid this namespace does not map)"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_KERNEL=/proc/version NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 \
     NVGPU_DIAGNOSTIC=1 bash /rig/run-guest.new.sh probe notroots 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3

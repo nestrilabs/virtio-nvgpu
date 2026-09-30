@@ -315,7 +315,9 @@ root_owned() {
 #
 # Found beside this file, through its resolved path. As root, this file and
 # each piece are root_owned first: whoever could change one could have root
-# run what they liked.
+# run what they liked. Each is read by the path the check resolved it to:
+# a link on the way there may be in a directory someone else can write, and
+# be pointed elsewhere once the check has passed.
 if [ "$(id -u)" = 0 ]; then PRIV=root; else PRIV=user; fi
 if [ $PRIV = root ]; then
     SELF=$(root_owned "$0" "the launcher")
@@ -323,29 +325,32 @@ else
     SELF=$(realpath -e -- "$0")
 fi
 LIB=${SELF%/*}/launcher
-if [ $PRIV = root ]; then
-    for piece in common settings root unprivileged nesbox crosvm backend guest verdict; do
-        root_owned "$LIB/$piece.sh" "the launcher's $piece.sh" >/dev/null
-    done
-fi
+declare -A PIECE
+for piece in common settings root unprivileged nesbox crosvm backend guest verdict; do
+    if [ $PRIV = root ]; then
+        PIECE[$piece]=$(root_owned "$LIB/$piece.sh" "the launcher's $piece.sh")
+    else
+        PIECE[$piece]=$LIB/$piece.sh
+    fi
+done
 # shellcheck source=launcher/common.sh
-. "$LIB/common.sh"
+. "${PIECE[common]}"
 # shellcheck source=launcher/settings.sh
-. "$LIB/settings.sh"
+. "${PIECE[settings]}"
 # shellcheck source=launcher/root.sh
-. "$LIB/root.sh"
+. "${PIECE[root]}"
 # shellcheck source=launcher/unprivileged.sh
-. "$LIB/unprivileged.sh"
+. "${PIECE[unprivileged]}"
 # shellcheck source=launcher/nesbox.sh
-. "$LIB/nesbox.sh"
+. "${PIECE[nesbox]}"
 # shellcheck source=launcher/crosvm.sh
-. "$LIB/crosvm.sh"
+. "${PIECE[crosvm]}"
 # shellcheck source=launcher/backend.sh
-. "$LIB/backend.sh"
+. "${PIECE[backend]}"
 # shellcheck source=launcher/guest.sh
-. "$LIB/guest.sh"
+. "${PIECE[guest]}"
 # shellcheck source=launcher/verdict.sh
-. "$LIB/verdict.sh"
+. "${PIECE[verdict]}"
 
 # ── What is asked for ────────────────────────────────────────────────────────
 parse_args "$@"

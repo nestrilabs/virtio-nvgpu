@@ -247,6 +247,7 @@ launcher_dryrun_check() {
         "jailer stub: environment clean"
         "is not root's (uid 65534)"
         "the launcher's guest.sh /rig/launcher/guest.sh: /rig/launcher/guest.sh is writable by others"
+        "verdict.sh read from /rig/real/verdict.sh"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
     )
