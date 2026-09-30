@@ -123,7 +123,9 @@ dump() {
 prog_pid() {
     local q
     for q in $(timeout -s KILL 10 pgrep -f "$1"); do
-        case $(cat "/proc/$q/comm" 2>/dev/null) in bash | sh | timeout) ;; *) echo "$q"; return ;; esac
+        # Gone since (Wine's launcher execs and exits), or a zombie.
+        readlink "/proc/$q/exe" >/dev/null 2>&1 || continue
+        case $(cat "/proc/$q/comm" 2>/dev/null) in bash | sh | timeout | setsid) ;; *) echo "$q"; return ;; esac
     done
 }
 

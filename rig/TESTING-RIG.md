@@ -998,7 +998,7 @@ which is how a refusal is told apart from the device.
 
 Godot 4.7.2's Windows build on D3D12 (Wine 11 staging, vkd3d-proton
 2.14.1; `wine-godot-draws-d3d12`) stopped in one freshly booted nesbox
-guest in five to seven (7 of 35 for steamperf, 6 of 40 here), with or without `--allow-compute` and the Vulkan
+guest in five to seven (7 of 35 for steamperf, 8 of 46 here), with or without `--allow-compute` and the Vulkan
 layer, never natively and never in ten runs back to back in one guest; a
 killed Wine process sometimes did not exit. The cause is nesbox's, not the
 device's: its virtio-blk worker decided whether to interrupt from the
@@ -1029,13 +1029,13 @@ nothing past STALL, since its own `pgrep` and `awk` could not be read from
 the disk; and `pgrep -f` or `/proc/<pid>/cmdline` of a task faulting on
 the dead queue waits behind its `mmap_lock`.
 
-Fresh boots of `wine-godot-draws-d3d12` under `rig/heavy/hang-watch.sh`'s
-precursor (steamperf's image, backend and THP guest kernel; only the VMM
-differs), 2026-09-30:
+Fresh boots of `wine-godot-draws-d3d12`, one start each, under a watcher
+that dumps the guest at a 40 s stall (steamperf's image, backend and THP
+guest kernel; only the VMM differs), 2026-09-30:
 
 | nesbox | runs | stalled |
 |---|---|---|
-| `virtio-nvgpu-v7` | 40 (20 of them alternating with the next row) | 6 |
+| `virtio-nvgpu-v7` | 46 (20 alternating with the next row; the last 6 under this branch's hang-watch.sh, whose report came out for both of its stalls) | 8 |
 | `virtio-nvgpu-v7` + `patches/nesbox/0001` | 44 (20 alternating with the row above; 8 with this branch's backend and module) | 0 |
 
 The same patched nesbox with this branch's backend and module (below) ran
