@@ -16,12 +16,16 @@
 //! deferred -- a v1 guest has one completion shared by every waiter, and a
 //! response arriving out of order would wake the wrong one.
 //!
-//! IOCTL2 is split in three so the host ioctl runs without the backend mutex:
-//! [`NvidiaBackend::serve`] validates and prepares under it and hands back a
-//! [`PendingIoctl2`]; the transport runs [`PendingIoctl2::execute`] inline or on
+//! IOCTL2 is split in three so a call that may wait runs without the backend
+//! mutex: [`NvidiaBackend::serve`] validates and prepares under it and hands
+//! back a [`PendingIoctl2`]; the transport runs [`PendingIoctl2::execute`] on
 //! the target file's executor with no lock held; [`NvidiaBackend::finish_ioctl2`]
 //! adopts what the host produced and builds the response, under the mutex
-//! again.
+//! again. A call the schema says never waits -- every render-node call but a
+//! few -- runs all three under the one hold of the mutex, on the queue
+//! thread, and on the handle table's own descriptor: nothing can close it
+//! while the mutex is held, so it needs no duplicate of its own
+//! (`serve_ioctl2`).
 
 #![forbid(unsafe_code)]
 
@@ -339,9 +343,11 @@ fn open_card(path: &str) -> Result<OwnedFd, i32> {
 /// An IOCTL2 between `prepare` and `finish`.
 struct Ioctl2Call {
     prepared: xfer::Prepared,
-    /// A duplicate of the target's descriptor: the call owns it for as long
-    /// as it runs, so a CLOSE racing it cannot pull the file away.
-    target_fd: OwnedFd,
+    /// For a call that runs on an executor, a duplicate of the target's
+    /// descriptor: the call owns it for as long as it runs, so a CLOSE racing
+    /// it cannot pull the file away. None for one that runs inline, under
+    /// the backend mutex, on `table_fd` (`serve_ioctl2`).
+    target_fd: Option<OwnedFd>,
     target: u32,
     /// Who what the call makes is charged to (quota.rs), taken when it was
     /// served: the target may be closed before it finishes.
@@ -373,8 +379,19 @@ impl Ioctl2Call {
         Reply::error(MsgType::Ioctl2, self.req_id, libc::ECANCELED)
     }
 
+    /// Run it on its own duplicate. A call without one is an inline call,
+    /// which only `serve_ioctl2` runs, under the mutex: here it is left
+    /// unrun, and answered as cancelled.
     fn execute(&mut self) {
-        let ret = self.prepared.execute(self.target_fd.as_raw_fd());
+        let Some(fd) = &self.target_fd else {
+            log::error!(
+                "IOCTL2 {} on handle {}: an inline call reached an executor; not run",
+                self.prepared.name(),
+                self.target
+            );
+            return;
+        };
+        let ret = self.prepared.execute(fd.as_raw_fd());
         log::debug!(
             "IOCTL2 {:#x} on handle {}: host returned {ret}",
             self.prepared.cmd(),
@@ -903,8 +920,22 @@ impl NvidiaBackend {
         }
     }
 
+    /// A call that never waits runs here and now, with `&mut self` -- the
+    /// backend mutex -- held from its preparing to its finishing: the handle
+    /// table cannot change in between, so the descriptor the table holds for
+    /// the target is the one the call was prepared against, and it is used
+    /// as it is. The duplicate an executor call takes, and closes after, is
+    /// two system calls, a tenth of a render call's backend time; and the
+    /// queue thread, which would have waited for the call anyway, takes the
+    /// mutex once rather than twice. What waits for this is only the other
+    /// holders of the mutex, for the few microseconds such a call takes on
+    /// the host.
     fn serve_ioctl2(&mut self, payload: &[u8], cap: usize) -> Outcome {
         match self.prepare_ioctl2(payload, cap) {
+            Ok(PendingIoctl2(Pending::Ioctl2(mut call))) if !call.executor => {
+                call.prepared.execute(call.table_fd);
+                Outcome::Reply(self.finish_ioctl2(PendingIoctl2(Pending::Ioctl2(call))))
+            }
             Ok(p) => Outcome::Ioctl2(p),
             Err(e) => Outcome::Reply(self.error_reply(e)),
         }
@@ -1010,10 +1041,16 @@ impl NvidiaBackend {
             );
             return Err(libc::EMSGSIZE);
         }
-        let (target_fd, _) = self.handles.dup(target).ok_or(libc::EBADF)?;
-        // The table's own descriptor for the target, which the duplicate
-        // shares a file with: see finish_ioctl2.
+        let executor = prepared.wants_executor() || class != SchemaClass::Render;
+        // The table's own descriptor for the target, which an executor
+        // call's duplicate shares a file with (see finish_ioctl2), and on
+        // which an inline call runs (see serve_ioctl2).
         let table_fd = self.handles.get_raw(target).map_err(|_| libc::EBADF)?;
+        let target_fd = if executor {
+            Some(self.handles.dup(target).ok_or(libc::EBADF)?.0)
+        } else {
+            None
+        };
         // SYNCOBJ_DESTROY frees the number the moment it runs, and the next
         // import in this file gets it back: no watch may join a wait on the
         // old syncobj from here on (fence.rs, `Registrations::orphan`; S-13).
@@ -1021,7 +1058,6 @@ impl NvidiaBackend {
         // a holder other than its file (fence.rs, `before_ioctl2`).
         self.syncobj_regs
             .before_ioctl2(target, prepared.name(), prepared.buffer(0));
-        let executor = prepared.wants_executor() || class != SchemaClass::Render;
         Ok(PendingIoctl2(Pending::Ioctl2(Ioctl2Call {
             prepared,
             target_fd,
@@ -1071,13 +1107,16 @@ impl NvidiaBackend {
         // issued twice in a session (handle_table.rs), so that is the file
         // the duplicate shares. The closer's queue and wakeup cost every
         // call on a render node a few microseconds of the queue thread.
-        if !stale
-            && !self.handles.is_buried(target)
-            && self.handles.get_raw(target).ok() == Some(table_fd)
-        {
-            drop(target_fd);
-        } else {
-            crate::closer::close(target_fd);
+        // An inline call has none: it ran on the table's own descriptor.
+        if let Some(target_fd) = target_fd {
+            if !stale
+                && !self.handles.is_buried(target)
+                && self.handles.get_raw(target).ok() == Some(table_fd)
+            {
+                drop(target_fd);
+            } else {
+                crate::closer::close(target_fd);
+            }
         }
         crate::pacing::PACING.ioctl2(prepared.name(), prepared.result());
         // A lease a guest lessor revoked through us: whatever the lessee's
