@@ -274,20 +274,28 @@ impl NvidiaBackend {
         // the 48-byte NVOS64 form, the one the offsets are for.
         let rm_copy: Vec<u8>;
         let mut rm_pending = None;
-        let param_in: &[u8] = if crate::rmmem::RmMem::watches(escape)
-            && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48)
-        {
-            let mut v = param_in.to_vec();
-            rm_pending = Some(
-                self.rmmem
+        let param_in: &[u8] =
+            if self.rmmem.watching(escape) && (escape != NV_ESC_RM_ALLOC || ireq.data_len == 48) {
+                let mut v = param_in.to_vec();
+                let mut p = self
+                    .rmmem
                     .before(escape, &mut v)
-                    .charged_to(self.rm_caller()),
-            );
-            rm_copy = v;
-            &rm_copy
-        } else {
-            param_in
-        };
+                    .charged_to(self.rm_caller());
+                // Video memory past `--vram-limit` (vidmem.rs): RM's own status
+                // in the caller's block, and RM is not asked.
+                if let Err((at, status)) = self.rmmem.admit(&mut p) {
+                    let mut out = nvos::with_status(param_in, at, status);
+                    out.extend_from_slice(deep_bytes);
+                    return Ok(IoctlOut::deep(out, deep_bytes.len()));
+                }
+                rm_pending = Some(p);
+                rm_copy = v;
+                &rm_copy
+            } else if self.rmmem.vram.refuses_unseen(escape, param_in) {
+                return Err(libc::EINVAL);
+            } else {
+                param_in
+            };
 
         let mut r = match escape {
             // ---------------------------------------------------------------

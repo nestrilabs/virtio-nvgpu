@@ -73,6 +73,7 @@ mod testing;
 pub mod userspace;
 pub mod uvmfd;
 pub mod uvmmap;
+pub mod vidmem;
 pub mod virtio;
 #[cfg(feature = "vhost-user")]
 pub mod vring;

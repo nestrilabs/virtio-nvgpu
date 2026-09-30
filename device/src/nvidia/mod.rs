@@ -443,6 +443,32 @@ impl NvidiaBackend {
         self.nvkms.set_coherent_display(coherent);
     }
 
+    /// `--vram-limit`: hold the VM to `mib` MiB of video memory, one guest
+    /// process to `owner_percent` of it (vidmem.rs). After
+    /// `set_host_driver_version`: the replies rewritten are the host
+    /// release's, and a release gen/vidmem_extract.py did not measure takes
+    /// no limit.
+    pub fn set_vram_limit(
+        &mut self,
+        mib: u64,
+        owner_percent: u8,
+    ) -> std::result::Result<(), crate::vidmem::LimitError> {
+        self.rmmem.vram.set_limit(mib, owner_percent, self.driver)?;
+        log::info!(
+            "--vram-limit {mib}: this VM's video memory allocations are held to {mib} MiB, one \
+             guest process to {owner_percent}% of it, and nvidia-smi, NVML, Vulkan and CUDA are \
+             told so"
+        );
+        Ok(())
+    }
+
+    /// Video memory counted against `--vram-limit`: (bytes held, the limit,
+    /// allocations refused), when there is a limit.
+    pub fn vram_usage(&self) -> Option<(u64, u64, u64)> {
+        let v = &self.rmmem.vram;
+        v.limit().map(|l| (v.in_use(), l, v.refused()))
+    }
+
     /// What the backend was started with: compositor-VM mode, the Wayland
     /// sockets, which schemas exist.
     pub fn set_config(&mut self, config: BackendConfig) {
@@ -593,6 +619,15 @@ impl NvidiaBackend {
         // What crossed the boundary, how often and how fast (pacing.rs):
         // what frame pacing is judged by, at the same level.
         crate::pacing::log_summary();
+        // What `--vram-limit` is chosen by (DEPLOY.md), at the same level.
+        if let Some((held, limit, refused)) = self.vram_usage() {
+            log::warn!(
+                "video memory: {} of {} MiB held at teardown, {refused} allocation(s) refused for \
+                 the limit",
+                held >> 20,
+                limit >> 20
+            );
+        }
         if self.rmchan.refused > 0 {
             log::warn!(
                 "NvidiaBackend::teardown: {} FIFO_DISABLE_CHANNELS call(s) answered without RM \

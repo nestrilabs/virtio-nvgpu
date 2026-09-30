@@ -171,6 +171,9 @@ pub(crate) struct Pending {
     record: Record,
     /// The guest process what is recorded is charged to.
     owner: Owner,
+    /// What the call does to video memory counted against `--vram-limit`
+    /// (vidmem.rs).
+    vram: crate::vidmem::Pending,
 }
 
 impl Pending {
@@ -227,6 +230,9 @@ pub(crate) struct RmMem {
     /// Guest file handle -> what an ALLOC_MEMORY armed on it.
     armed: HashMap<u32, Mem>,
     full_warned: bool,
+    /// Video memory held to `--vram-limit` (vidmem.rs), whose handles go
+    /// with the objects this tree says RM freed.
+    pub(crate) vram: crate::vidmem::Vram,
 }
 
 impl Default for RmMem {
@@ -238,6 +244,7 @@ impl Default for RmMem {
             tree: Tree::default(),
             armed: HashMap::new(),
             full_warned: false,
+            vram: crate::vidmem::Vram::default(),
         }
     }
 }
@@ -347,6 +354,19 @@ impl RmMem {
         )
     }
 
+    /// Whether this backend's `before` and `after` want to see `escape`:
+    /// [`RmMem::watches`], and RM_CONTROL under a video memory limit.
+    pub(crate) fn watching(&self, escape: u32) -> bool {
+        Self::watches(escape) || self.vram.watches(escape)
+    }
+
+    /// Admit what a call `before` looked at asks of the video memory limit,
+    /// charged to its owner; `Err` is where RM's refusal goes in the
+    /// top-level block and which status it is (vidmem.rs).
+    pub(crate) fn admit(&mut self, p: &mut Pending) -> Result<(), (usize, u32)> {
+        self.vram.admit(&mut p.vram, p.owner)
+    }
+
     /// Whether guest system memory is made coherent (see the module docs).
     pub(crate) fn set_coherent(&mut self, on: bool) {
         self.coherent = on;
@@ -374,6 +394,8 @@ impl RmMem {
     /// ([`crate::semsurf::SemsurfPolicy::forget_handle`]).
     pub(crate) fn forget_fd(&mut self, handle: u32, gone: &[u32]) {
         self.armed.remove(&handle);
+        self.vram.forget_fd(handle);
+        self.vram.forget_clients(gone);
         if gone.is_empty() {
             return;
         }
@@ -386,6 +408,7 @@ impl RmMem {
         self.objects.clear();
         self.armed.clear();
         self.tree = Tree::default();
+        self.vram.clear();
     }
 
     /// COHERENCY for a new system-memory allocation asking for `asked`:
@@ -529,6 +552,7 @@ impl RmMem {
             NV_ESC_RM_FREE if params.len() >= NVOS00_SIZE => p.record = Record::Free,
             _ => {}
         }
+        p.vram = self.vram.before(escape, params);
         p
     }
 
@@ -602,7 +626,14 @@ impl RmMem {
 
     /// The reply to a call `before` looked at: put the caller's bits back and
     /// record what succeeded. `reply` has the same layout as the parameters.
-    pub(crate) fn after(&mut self, p: Pending, reply: &mut [u8]) {
+    pub(crate) fn after(&mut self, mut p: Pending, reply: &mut [u8]) {
+        let vram = self.vram.after(std::mem::take(&mut p.vram), p.owner, reply);
+        if let Some((c, h)) = vram.freed {
+            self.free_subtree(c, h);
+        }
+        for (c, h, parent) in vram.made {
+            self.tree.link(c, h, parent, p.owner);
+        }
         for (off, mask, bits) in p.restore {
             if let Some(w) = le::u32_at(reply, off) {
                 let _ = le::put_u32(reply, off, (w & !mask) | bits);
@@ -664,13 +695,20 @@ impl RmMem {
                     // The client, and with it everything it held.
                     self.objects.retain(|&(c, _), _| c != root);
                     self.tree.forget_clients(|c| c == root);
+                    self.vram.forget_clients(&[root]);
                 } else {
                     // The object, and everything RM frees under it.
-                    for h in self.tree.take_subtree(root, old) {
-                        self.objects.remove(&(root, h));
-                    }
+                    self.free_subtree(root, old);
                 }
             }
+        }
+    }
+
+    /// RM freed (client, handle) and everything under it.
+    fn free_subtree(&mut self, client: u32, handle: u32) {
+        for h in self.tree.take_subtree(client, handle) {
+            self.objects.remove(&(client, h));
+            self.vram.forget(client, h);
         }
     }
 
