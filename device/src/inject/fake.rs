@@ -31,7 +31,7 @@ pub struct Obj {
 struct St {
     /// inode -> object.
     objs: HashMap<u64, Obj>,
-    /// dma-bufs, by inode (fstatfs says so).
+    /// dma-bufs, by inode (what `hostfd::classify` says on a real host).
     dmabufs: HashSet<u64>,
     /// A descriptor of each object's own dma-buf, what an export of a
     /// self-import gives back.

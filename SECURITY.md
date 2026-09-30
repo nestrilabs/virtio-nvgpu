@@ -1572,7 +1572,19 @@ clipboard (`wl_data_device_manager` and primary selection are on the list).
   through the per-site rate limit (FW-5).
 - A shm pool must be a regular file on tmpfs or hugetlbfs, or the client gets
   `wl_shm.error.invalid_fd`; a client's blob from anything else is sent as an
-  invalid descriptor (FW-6).
+  invalid descriptor (FW-6). That, and whether a stream's descriptor is a
+  pipe, is told without asking the file's filesystem: its cached type and
+  device (`statx` with AT_STATX_DONT_SYNC), a memfd by the kernel's own shm
+  device and any other file by a tmpfs or hugetlbfs mount of its device in
+  `/proc/self/mountinfo` (`wlwire::sys::is_shmem`). A FUSE file handed over
+  by a guest app (to the guest daemon, which serves every app), or by a host
+  client of the compositor (a pipe for a guest's selection, to the backend),
+  stalls nothing; a tmpfs mounted only in another mount namespace is
+  refused.
+- A surface collects damage for the last 16 buffers it showed, and a
+  destroyed buffer visits only the surfaces that show it: a commit or a
+  destroy costs the daemon a bounded number of steps, however many buffers
+  and surfaces a client makes.
 - In the guest daemon, a client's descriptors and stream-sink data are held
   to its process's share of the daemon's budgets, and a client is held by a
   pidfd from its accept and dropped if its process exits before or during
@@ -1630,11 +1642,11 @@ against a fake nvidia-drm, and the `inject` fuzz target):
   (exactly one), at most 8 per packet (`MSG_CTRUNC` ends the connection);
   a malformed packet ends the connection, a refused request is answered
   with its errno.
-- Each plane's descriptor is a dma-buf (`fstatfs`'s magic, not the link
-  text a FUSE file could imitate: FB-13). The `fstatfs` itself is answered
-  by a FUSE server on its own schedule, so a helper that passes a FUSE file
-  can stall its own connection's thread, and nothing else: no guest message
-  waits on it (below).
+- Each plane's descriptor is a dma-buf, told as the rest of the backend
+  tells one (`hostfd::classify`): by its cached attributes and the
+  `exp_name:` line only a dma-buf's fdinfo has, not the link text a FUSE
+  file could imitate (FB-13), and without asking any filesystem, so a
+  helper that passes a FUSE file stalls nothing.
 - It imports (PRIME_FD_TO_HANDLE) into a render file of this GPU list the
   backend opens for the purpose, GEM_IDENTIFY_OBJECT there says **NVKMS**,
   and the import is a **self-import**: exported back from the backend's
@@ -2342,11 +2354,6 @@ carries; Appendix C has their history.
     made from it) can be exported after its id and every open are gone; a
     real portal stream has not been injected by the project
     (`rig/rig-tools/portal-identify.sh` checks one, for the owner to run).
-    The dma-buf check on a helper's descriptor is `fstatfs`, which a FUSE
-    server answers on its own schedule: a helper can stall its own
-    connection's thread (not a guest message, and not another helper's
-    connection), where the rest of the backend no longer asks a filesystem
-    (BE-1.7).
 18. **The VMMs and the deployment.**
     - crosvm pins the device's ioevents to BAR0's first address: a guest
       kernel that moves BAR0 before the driver binds has its ioevents
@@ -2477,8 +2484,7 @@ In priority order. Cost is a judgement, not a measurement.
     (BE-1.20); request fields restored in the reply as the native driver
     returns them (BE-2.5); the generators' scans for host fields in class
     parameters and UVM descriptor fields (BE-1.19); the network layer's
-    check by namespace rather than by interface list (BE-1.20); the capture
-    helper's dma-buf check without `fstatfs` (open item 17).
+    check by namespace rather than by interface list (BE-1.20).
 
 ---
 

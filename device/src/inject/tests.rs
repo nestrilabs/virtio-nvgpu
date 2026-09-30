@@ -885,3 +885,29 @@ fn no_more_than_max_peers_at_once() {
     drop(conns);
     s.shutdown();
 }
+
+/// The real host tells a helper's dma-buf the way the rest of the backend
+/// tells one (`hostfd::classify`), asking no filesystem: memory, pipes,
+/// eventfds and files are refused, and a udmabuf (where /dev/udmabuf is
+/// open to us) is taken. `fstatfs`, which a FUSE server answers on its own
+/// schedule, is not asked.
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no memfd or /dev/udmabuf")]
+fn the_real_hosts_dmabuf_check_asks_no_filesystem() {
+    let h = SysInjectHost::for_this_host();
+    let memfd = crate::sys::fd::memfd(c"inject", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        .unwrap();
+    crate::sys::fd::ftruncate(&memfd, 4096).unwrap();
+    let (r, _w) = std::io::pipe().unwrap();
+    let file: OwnedFd = std::fs::File::open("/proc/self/status").unwrap().into();
+    for fd in [memfd.as_fd(), r.as_fd(), file.as_fd()] {
+        assert!(!h.is_dmabuf(fd));
+    }
+    let Ok(dev) = crate::sys::fd::open_path("/dev/udmabuf", libc::O_RDWR) else {
+        eprintln!("SKIPPED the udmabuf half: no /dev/udmabuf");
+        return;
+    };
+    crate::sys::fd::add_seals(&memfd, libc::F_SEAL_SHRINK).unwrap();
+    let d = crate::sys::ioctl::udmabuf_create(dev.as_fd(), memfd.as_fd(), 4096, 1).unwrap();
+    assert!(h.is_dmabuf(d.as_fd()));
+}
