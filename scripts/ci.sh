@@ -280,6 +280,8 @@ launcher_dryrun_check() {
         "the VMM's config and the console log: 644 644"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
+        "cpu_dma_latency: 0x00000032; its holder: gone"
+        "knobs: all "
     )
     local w rc=0
     for w in "${expect[@]}"; do
