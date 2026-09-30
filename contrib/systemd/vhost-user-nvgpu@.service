@@ -93,6 +93,11 @@ MemorySwapMax=0
 TasksMax=256
 OOMScoreAdjust=500
 LimitCORE=0
+# Where the backend's threads run, for a VM whose vCPUs are pinned
+# (DEPLOY.md, "vCPU placement"): the idle SMT siblings of the vCPUs' cores,
+# or another L3 domain; rig/pin-layout.sh prints a layout's (nix/module.nix:
+# vms.<n>.backendCpus). Unset, wherever the host scheduler puts them.
+#CPUAffinity=24-31
 
 # Privileges: none to begin with (the backend also drops them itself and
 # refuses to start as root or with CAP_SYS_ADMIN).

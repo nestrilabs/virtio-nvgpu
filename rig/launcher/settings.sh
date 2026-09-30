@@ -263,21 +263,10 @@ guest_settings() {
     VCPUS=$((10#$VCPUS))
     MEM_MIB=$((10#$MEM_MIB))
 
-    CPU_AFFINITY=${NVGPU_CPU_AFFINITY:-}
-    VCPU_PINS=${NVGPU_VCPU_PINS:-}
-    IO_AFFINITY=${NVGPU_IO_AFFINITY:-}
-    BACKEND_CPUS=${NVGPU_BACKEND_CPUS:-$IO_AFFINITY}
+    # Where the threads run, and the guest's topology (launcher/placement.sh).
+    placement_settings
     HUGEPAGES=${NVGPU_HUGEPAGES:-}
     PREFAULT=${NVGPU_PREFAULT:-}
-    CPU_AFFINITY_J= VCPU_PINS_J= IO_AFFINITY_J=
-    [ -z "$CPU_AFFINITY" ] || CPU_AFFINITY_J=$(cpu_list NVGPU_CPU_AFFINITY "$CPU_AFFINITY")
-    [ -z "$IO_AFFINITY" ] || IO_AFFINITY_J=$(cpu_list NVGPU_IO_AFFINITY "$IO_AFFINITY")
-    [ -z "$BACKEND_CPUS" ] || cpu_list NVGPU_BACKEND_CPUS "$BACKEND_CPUS" >/dev/null
-    if [ -n "$VCPU_PINS" ]; then
-        VCPU_PINS_J=$(cpu_list NVGPU_VCPU_PINS "$VCPU_PINS")
-        [ "$(echo "$VCPU_PINS_J" | tr ',' '\n' | wc -l)" = "$VCPUS" ] ||
-            die "NVGPU_VCPU_PINS=$VCPU_PINS: one CPU per vCPU ($VCPUS)"
-    fi
     case $HUGEPAGES in '' | transparent | 2m | 1g) ;; *) die "NVGPU_HUGEPAGES=$HUGEPAGES: transparent, 2m or 1g" ;; esac
     case $PREFAULT in '' | 0 | 1) ;; *) die "NVGPU_PREFAULT=$PREFAULT: 0 or 1" ;; esac
     SLICE_US=${NVGPU_SLICE_US:-100}

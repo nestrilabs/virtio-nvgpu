@@ -78,6 +78,7 @@ let
       extraArgs = [ "--allow-compute" ];
       windowMiB = 16384;
       windowOwnerShare = 90;
+      backendCpus = "0-7,16-23";
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -229,6 +230,14 @@ let
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";
     };
+    "backend CPUs with a space" = {
+      config = [ { services.virtio-nvgpu.vms."0".backendCpus = "8 9"; } ];
+      says = "digits, commas and ranges";
+    };
+    "backend CPUs as all" = {
+      config = [ { services.virtio-nvgpu.vms."0".backendCpus = "all"; } ];
+      says = "digits, commas and ranges";
+    };
   };
   check =
     name: c:
@@ -252,6 +261,7 @@ let
     "Service:EnvironmentFile="
     "Service:MemoryMax"
     "Service:TasksMax"
+    "Service:CPUAffinity"
     "Service:ProtectHome=tmpfs"
     "Service:BindReadOnlyPaths"
     "env:NVGPU_BACKEND_ARGS"
@@ -299,5 +309,9 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"
     grep -q 'Requires=vhost-user-nvgpu-inject@0.socket' "$dropinPath"
     grep -q '^MemoryMax=2G' "$dropin1Path"
+    # Placement only where asked: slot 0's backend on its CPUs, slot 1's
+    # wherever the host puts it.
+    grep -q '^CPUAffinity=0-7,16-23$' "$dropinPath"
+    ! grep -q 'CPUAffinity' "$dropin1Path"
     touch $out
   ''

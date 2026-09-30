@@ -121,7 +121,7 @@ scripts_syntax_check() {
     # warnings are defects there.
     if command -v shellcheck >/dev/null; then
         shellcheck -x -S warning -e SC1007 rig/run-guest.sh rig/verify/launcher-dryrun/*.sh \
-            scripts/verify-units.sh scripts/ci.sh || rc=1
+            rig/pin-layout.sh rig/verify/placement-test.sh scripts/verify-units.sh scripts/ci.sh || rc=1
     else
         echo "shellcheck: skipped (none on PATH)" >&2
     fi
@@ -280,6 +280,9 @@ launcher_dryrun_check() {
         "the VMM's config and the console log: 644 644"
         "the stale backend: killed"
         "WARNING: diagnostic flag --permissive-abi"
+        "placement keys in a default run's config: 0"
+        "\"vcpu_pins\": [1, 3], \"threads_per_core\": 2, \"io_affinity\": [0, 2]"
+        "pins alone, the I/O set is the launcher's CPUs: yes"
     )
     local w rc=0
     for w in "${expect[@]}"; do
@@ -307,6 +310,7 @@ deploy() {
     step "patches/crosvm apply to $CROSVM_BASE" crosvm_patches_check
     step "patches/nesbox apply to $NESBOX_BRANCH" nesbox_patches_check
     step "the VMMs' limits are the backend's" vmm_parity_check
+    step "launcher placement layouts" rig/verify/placement-test.sh
     step "launcher dry run" launcher_dryrun_check
 }
 

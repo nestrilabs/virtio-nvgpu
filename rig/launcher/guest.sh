@@ -42,6 +42,7 @@ console_over() {
 # its timeout.
 run_guest() {
     echo "guest:   $PROBE on $(basename -- "$DISK"), $VCPUS vCPU / $MEM_MIB MiB, ${TIMEOUT}s" >&2
+    [ -z "$PLACEMENT" ] || echo "placement: $PLACEMENT" >&2
     if [ "$VMM_JAIL" = on ]; then
         echo "vmm:     as $VMM_USER under $JAILER, jail $JAIL_ROOT, own network namespace" >&2
     fi

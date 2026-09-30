@@ -152,6 +152,21 @@ let
           only (SECURITY.md, "The window's size and share").
         '';
       };
+      backendCpus = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "24-31";
+        description = ''
+          Host CPUs every thread of this VM's backend runs on (the unit's
+          `CPUAffinity=`; null: wherever the host scheduler puts them), a
+          list such as `0-7,16-23`. For a VM whose vCPUs are pinned
+          (DEPLOY.md, "vCPU placement"): the idle SMT siblings of its
+          cores, or the other L3 domain, keep the queue thread and the
+          executors off the vCPUs' own CPUs. `rig/pin-layout.sh` prints
+          a layout's value. Placement only: the backend's sandbox and
+          limits are the same.
+        '';
+      };
       wayland = {
         socket = mkOption {
           type = types.nullOr (types.strMatching "^/[^[:space:]]+$");
@@ -381,6 +396,16 @@ in
         message = "services.virtio-nvgpu.vms.<n>.windowMiB: a multiple of 64 MiB";
       }
       {
+        # CPUAffinity= takes more (spaces, "all"), and a word it cannot
+        # parse it ignores with a warning: one form only, checked here.
+        assertion = lib.all (
+          vm:
+          vm.backendCpus == null
+          || builtins.match "[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*" vm.backendCpus != null
+        ) (lib.attrValues cfg.vms);
+        message = "services.virtio-nvgpu.vms.<n>.backendCpus: CPUs as a list such as 0-7,16-23 (digits, commas and ranges)";
+      }
+      {
         # The display paths and the semaphore-surface fences need NVKMS.
         assertion =
           !(lib.elem "nvidia" config.services.xserver.videoDrivers)
@@ -464,6 +489,9 @@ in
               EnvironmentFile = "";
               MemoryMax = cfg.memoryMax;
               TasksMax = cfg.tasksMax;
+            }
+            // lib.optionalAttrs (vm.backendCpus != null) {
+              CPUAffinity = vm.backendCpus;
             }
             // lib.optionalAttrs (vm.wayland.socket != null) {
               # The one socket, and no other file of any home or runtime

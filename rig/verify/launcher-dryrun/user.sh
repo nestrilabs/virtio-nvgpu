@@ -27,6 +27,29 @@ env -i PATH="$PATH" HOME="$HOME" XDG_RUNTIME_DIR="$X" NVGPU_RIG="$R" NVGPU_SKIP_
     NVGPU_VMM_NETNS=0 bash "$L" probe usr 2>&1 | sed 's/^/    | /'
 echo "  rc ${PIPESTATUS[0]}; the stale backend: $(kill -0 $STALE 2>/dev/null && echo alive || echo killed)"
 kill "$STALE" 2>/dev/null
+# Nothing placed unless asked: the config carries no placement key.
+echo "  placement keys in a default run's config: $(grep -co 'vcpu_pins\|threads_per_core\|cpu_affinity\|io_affinity' "$R/logs/usr.json")"
+echo "== unprivileged: NVGPU_PIN=smt:io=other on a fake host (two SMT cores, two L3 domains)"
+T=$R/sysfs
+mkdir -p "$T"
+echo 0-3 >"$T/online"
+for c in 0 1 2 3; do
+    mkdir -p "$T/cpu$c/topology" "$T/cpu$c/cache/index3"
+    echo "$((c % 2)),$((c % 2 + 2))" >"$T/cpu$c/topology/thread_siblings_list"
+    echo 3 >"$T/cpu$c/cache/index3/level"
+    echo "$((c % 2)),$((c % 2 + 2))" >"$T/cpu$c/cache/index3/shared_cpu_list"
+done
+env -i PATH="$PATH" HOME="$HOME" XDG_RUNTIME_DIR="$X" NVGPU_RIG="$R" NVGPU_SKIP_MEM_CHECK=1 NVGPU_TIMEOUT=3 \
+    NVGPU_VMM_NETNS=0 NVGPU_VCPUS=2 NVGPU_PIN=smt:io=other NVGPU_SYSFS_CPU="$T" bash "$L" probe usrpin 2>&1 |
+    grep 'placement:' | sed 's/^/    | /'
+echo "  the config's machine-config: $(grep -o '"machine-config": {[^}]*}' "$R/logs/usrpin.json")"
+# Pins alone: the workers vCPU threads start go to the launcher's own CPUs,
+# not to a vCPU's.
+env -i PATH="$PATH" HOME="$HOME" XDG_RUNTIME_DIR="$X" NVGPU_RIG="$R" NVGPU_SKIP_MEM_CHECK=1 NVGPU_TIMEOUT=3 \
+    NVGPU_VMM_NETNS=0 NVGPU_VCPUS=2 NVGPU_VCPU_PINS=0,1 bash "$L" probe usrpins >/dev/null 2>&1
+echo "  pins alone, the I/O set is the launcher's CPUs: $(grep -o '"io_affinity": \[[0-9, ]*\]' "$R/logs/usrpins.json" |
+    tr -d ' ' | grep -qx "\"io_affinity\":\[$(taskset -pc $$ | sed 's/.*: //' | tr -d ' ' |
+        awk -F, '{ for (i = 1; i <= NF; i++) { n = split($i, r, "-"); a = r[1]; b = (n > 1 ? r[2] : r[1]); for (j = a; j <= b; j++) printf "%s%d", (o++ ? "," : ""), j } }')\]" && echo yes || echo no)"
 echo "== unprivileged: a diagnostic flag is said on the terminal"
 env -i PATH="$PATH" HOME="$HOME" XDG_RUNTIME_DIR="$X" NVGPU_RIG="$R" NVGPU_SKIP_MEM_CHECK=1 NVGPU_TIMEOUT=3 \
     NVGPU_VMM_NETNS=0 bash "$L" probe usrdiag -- --permissive-abi 2>&1 | grep 'diagnostic flag' | sed 's/^/    | /'

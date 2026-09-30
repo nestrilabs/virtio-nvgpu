@@ -14,7 +14,10 @@
 # "/run/nvgpu/vmN/nvgpu.sock" }, and "unshare-network": false -- nesbox
 # cannot make a user namespace once chrooted, so the network namespace is
 # this unit's (PrivateNetwork=). The disk it names must be nvgpu-vmmN's to
-# write.
+# write. Pinned vCPUs (DEPLOY.md, "vCPU placement"; rig/pin-layout.sh prints
+# a layout for this host) are its "machine-config" keys: "vcpu_pins" (a CPU,
+# or with patches/nesbox/0002 a list of CPUs, per vCPU), "threads_per_core"
+# (what the guest is told) and "io_affinity" (nesbox's other threads).
 #
 # nesbox's jailer (nesbox tools/jailer, Linux 5.8 or later) starts as root:
 # it makes the jail's mount namespace with a /proc of its own

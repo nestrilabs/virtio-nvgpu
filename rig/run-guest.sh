@@ -54,17 +54,41 @@
 #                       override one path of whichever layout is in use
 #   NVGPU_VCPUS NVGPU_MEM_MIB   guest size (rig 4 / 4096, root 2 / 2048)
 #
-# Placement, for frame pacing (DEPLOY.md, "Frame pacing"; unset: the host
-# scheduler places everything, as before):
+# Placement (DEPLOY.md, "vCPU placement"; unset: the host scheduler places
+# everything and the guest is told its VMM's default topology, as before;
+# launcher/placement.sh):
+#   NVGPU_PIN           a layout worked out from this host's topology (SMT
+#                       cores, L3 domains, the scheduler's preferred cores,
+#                       read from sysfs): cores (one thread of each of
+#                       NVGPU_VCPUS whole cores, in one L3 domain where they
+#                       fit), smt (both threads of NVGPU_VCPUS/2 cores, the
+#                       guest told so), spread (cores, alternating L3
+#                       domains), l3 (one set, a whole L3 domain) or
+#                       core-sets (vCPU i on either thread of core i); then
+#                       :l3=CPU (that CPU's domain first), :avoid=LIST (CPUs
+#                       whose cores no vCPU takes; default 0, avoid=none),
+#                       :io=none|siblings|other|LIST (the VMM's other threads
+#                       and the backend). The pieces below, given too, win
+#                       over what it says for each. rig/pin-layout.sh prints
+#                       a layout without running anything
 #   NVGPU_CPU_AFFINITY  host CPUs the vCPU threads may run on, a list such as
 #                       8-15 (nesbox cpu_affinity; crosvm --cpu-affinity)
 #   NVGPU_VCPU_PINS     one host CPU per vCPU, in order, such as 8,9,10,11
-#                       (nesbox vcpu_pins; crosvm --cpu-affinity 0=8:1=9:..):
-#                       only for CPUs nothing else is scheduled on
+#                       (nesbox vcpu_pins; crosvm --cpu-affinity 0=8:1=9:..),
+#                       or a CPU list per vCPU, colon-separated, such as
+#                       8,24:9,25 (nesbox needs patches/nesbox/0002): only
+#                       for CPUs nothing else is scheduled on
 #   NVGPU_IO_AFFINITY   host CPUs for the VMM's other threads (nesbox
-#                       io_affinity); the backend's too unless
-#                       NVGPU_BACKEND_CPUS says otherwise
+#                       io_affinity; crosvm started under taskset, its
+#                       vCPUs then placing themselves); the backend's too
+#                       unless NVGPU_BACKEND_CPUS says otherwise
 #   NVGPU_BACKEND_CPUS  host CPUs for every backend thread (taskset)
+#   NVGPU_GUEST_SMT     1 or 2: the guest is told each core has that many
+#                       threads (nesbox threads_per_core; crosvm --no-smt for
+#                       1). 2 needs one CPU per vCPU, vCPUs 2k and 2k+1 on
+#                       one host core's two threads (checked), and a
+#                       core-scheduling cookie shared by the VM's vCPUs.
+#                       Unset: nesbox tells one, crosvm two for an even count
 #   NVGPU_HUGEPAGES     nesbox: transparent (its default: prefaulted and
 #                       collapsed into THP), 2m or 1g (the hugetlb pool, which
 #                       must be reserved); crosvm: transparent adds
@@ -213,6 +237,8 @@
 #   common.sh        helpers: JSON strings, text fit for a terminal, the
 #                    capped log writer, CPU lists, still_ours
 #   settings.sh      the command line and the environment, checked
+#   placement.sh     where the threads run and the guest's CPU topology:
+#                    NVGPU_PIN's layouts from the host's topology
 #   root.sh          what a root run alone does -- root's files, the slot,
 #                    the backend's and the VMM's users, the run's directory,
 #                    the VMM's jail, the socket opened to it -- and, in its
@@ -336,7 +362,7 @@ else
 fi
 LIB=${SELF%/*}/launcher
 declare -A PIECE
-for piece in common settings root unprivileged nesbox crosvm backend guest verdict; do
+for piece in common settings placement root unprivileged nesbox crosvm backend guest verdict; do
     if [ $PRIV = root ]; then
         PIECE[$piece]=$(root_owned "$LIB/$piece.sh" "the launcher's $piece.sh")
     else
@@ -347,6 +373,8 @@ done
 . "${PIECE[common]}"
 # shellcheck source=launcher/settings.sh
 . "${PIECE[settings]}"
+# shellcheck source=launcher/placement.sh
+. "${PIECE[placement]}"
 # shellcheck source=launcher/root.sh
 . "${PIECE[root]}"
 # shellcheck source=launcher/unprivileged.sh
@@ -374,6 +402,7 @@ fi
 run_settings
 guest_settings
 check_inputs
+placement_core_sched_check
 if [ $PRIV = root ]; then
     root_only_files
 fi
