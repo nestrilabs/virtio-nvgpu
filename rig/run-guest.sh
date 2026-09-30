@@ -70,7 +70,9 @@
 #                       must be reserved); crosvm: transparent adds
 #                       --hugepages (MADV_HUGEPAGE)
 #   NVGPU_PREFAULT=0    fault guest RAM in on first touch instead (nesbox;
-#                       crosvm with patches/crosvm 0011, --prefault-memory)
+#                       crosvm with patches/crosvm 0011, --prefault-memory).
+#                       The default commits all of guest RAM at start, which
+#                       undoes a balloon meant to give memory back early
 #   NVGPU_SLICE_US      the EEVDF slice of every VMM and backend thread, in
 #                       microseconds (chrt --other --sched-runtime; 100 to
 #                       100000, no privilege needed): a shorter slice than

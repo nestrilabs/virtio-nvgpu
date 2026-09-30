@@ -1239,7 +1239,16 @@ jailer as root and the unit's network namespace; `nvgpu-vmm-crosvm@.service`,
 says `BindsTo=` its backend, so it stops with it. Both set
 `LockPersonality=`, `RestrictSUIDSGID=` and `SystemCallArchitectures=native`,
 and the nesbox one `ProtectKernelModules=` and `ProtectKernelLogs=`; neither
-has run on hardware.
+has run on hardware. Both exec the VMM through `nvgpu-vmm-exec`, which
+applies the tuning knobs from the unit's environment ("The tuning knobs")
+and execs `chrt`, `coresched` and the VMM with nothing else of its own in
+between; it refuses a value it does not know, so the VM does not start. Its
+`join` runs as root from an `ExecStartPost=+` (only with `shared` core
+scheduling does it do anything): it reads the backend's main pid from
+systemd and gives it the VMM's cookie, and takes no other input than the
+unit's instance number and `$MAINPID`. `nvgpu-cpu-latency@.service` runs as
+root, which `/dev/cpu_dma_latency` needs, with no capabilities, no network,
+a read-only file system and a device policy of that node alone.
 
 The backend's unit runs it as `nvgpu-vmN` with no capabilities, in a cgroup
 of its own (`MemoryMax`, `MemorySwapMax=0`, `TasksMax`,
@@ -1267,7 +1276,13 @@ exist, is a pool or shared group, or holds anyone but the helper; one helper
 or group for two VMs; anyone else in a slot's group; pool users with other
 groups; another user on a pool id; a flag with whitespace, a quote, a
 backslash or a `%` (systemd would split, unquote or expand it on the way to
-the backend), and a Wayland socket path with any of those or a colon.
+the backend), and a Wayland socket path with any of those or a colon; and,
+for the tuning options, what the backend or the VMM would refuse at start
+(the channel-disable budgets' shape, a flag both rendered and in
+`extraArgs`, a file-size limit below the disk, guest RAM or the window, a
+VMM setting with no VMM, `per-vcpu` for nesbox). With `vms.<n>.vmm.kind` it
+runs the VMM's template too, its arguments and knobs in a drop-in held to
+its own keys (no `vmmN.env`).
 `checks.module-eval` tries each with a configuration it must refuse,
 compares the units it installs with `contrib/systemd`'s, and holds each
 drop-in to the keys and variables that are per slot, every assignment of an
@@ -2062,12 +2077,13 @@ the default one). The backend sets its own threads' slice from
 a fair policy the launcher or unit chose and leaving a real-time one alone;
 a launcher with a slice of its own passes it there too (BE-2.3). Nothing in the
 guest can change it.
-crosvm's `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`) gives up
+crosvm's `--core-scheduling=false` (`NVGPU_CORE_SCHED=off`) gives up
 the per-vCPU core-scheduling cookies crosvm sets by default, which keep an
 SMT sibling from running another task while a vCPU runs: a mitigation for
 cross-thread side channels (L1TF/MDS-class) between the guest and host
 tasks on the sibling. The launcher keeps crosvm's default; turn it off
-only where no other tenant shares the cores.
+only where no other tenant shares the cores. The modes between the two,
+and what each leaves open, are "The tuning knobs", below.
 
 **The guest's reply polling** (`driver/nvgpu_xfer.c`). While callers spin
 for their replies (`rt_spin_us`, above) and none sleeps for one, the control
@@ -2147,6 +2163,105 @@ replaces to the same strength:
   while it waits on them. At most 256 such watches of a VM are kept out of
   epoll (`POLLED_MAX`), so that no wake costs thousands of polls; any past
   that are in the epoll set for their life, as all were before.
+
+### The tuning knobs
+
+Branch `knob-deploy`. DEPLOY.md, "Tuning" has each setting's names at every
+layer (backend or VMM, the rig's launcher, the units, the NixOS module),
+its default, gain and cost; this is what each opens and what still holds.
+Every one keeps today's behaviour unless it is set: the launcher's command
+lines, the units' `ExecStart=` processes and the module's drop-ins are what
+they were with each at its default (rig/verify/launcher-dryrun/knobs.sh and
+nix/module-test.nix check both). The launcher, the units' helper
+(`contrib/systemd/nvgpu-vmm-exec`) and the module each refuse a value
+outside its range rather than drop it, and the backend checks its own
+flags again at start.
+
+- **Core scheduling** (`NVGPU_CORE_SCHED`, `vmm.coreScheduling`: per-vcpu,
+  vm, shared, off). A core-scheduling cookie lets a task share an SMT core
+  only with tasks of the same cookie; it is the mitigation for cross-thread
+  side channels on a shared core (L1TF/MDS-class leaks, and on a CPU not
+  affected by those, as the rig's Zen 5 is, cache, TLB and port-contention
+  timing). crosvm's default gives each vCPU a cookie of its own. `vm` lets
+  the VM's own threads share a core with each other, which exposes nothing
+  across a boundary: they are one guest. `shared` lets this VM's backend
+  onto its cores as well: the backend is the VM's own host process, holding
+  that VM's state, its host GPU files and (in the Wayland modes) its
+  connection to the compositor; a guest that could mount a side channel
+  against it on a shared core learns what the backend handles for that
+  guest, and what the host driver and compositor code it runs leaves in
+  shared microarchitectural state. Every other VM and host task still
+  cannot run on the guest's cores. The cookie is made before either
+  process runs guest-controlled work: under the launcher both are exec'd
+  with it (copied from a sleep that holds it), and under the units the VMM
+  is exec'd with a new one and the backend, which runs as another user and
+  is undumpable, is given it by a root `ExecStartPost=` once the VMM has
+  it; until then the backend has no cookie, as without the setting, and
+  the guest never runs outside the VM's. A backend that restarts takes the
+  VMM with it (`BindsTo=`), so it is never in a VM's cookie it was not
+  started for. `off` gives up the mitigation: any host task may share a
+  core with a vCPU. nesbox sets no cookie of its own (its default is
+  `off`, as before this branch); `vm` and `shared` give it one through
+  `coresched` and nesbox is unchanged. `per-vcpu` it cannot have.
+- **The queue thread's poll** (`--queue-poll-us`, `queuePollUs`) and **the
+  backend's CPU quota** (`CPUQuota=`, `cpuQuota`): host CPU spent for one
+  guest. A guest can keep up to a host core busy through the poll, as
+  through its requests; a quota bounds that per VM, and a backend under
+  its quota answers only its own guest late. Nothing about what a request
+  may do changes.
+- **The EEVDF slice** (`--sched-slice-us`, `NVGPU_SLICE_US`, `sliceUs`):
+  how soon a woken thread runs, not its share of the CPU (the weight is
+  the default). Unprivileged; it changes nothing about what a thread may
+  do. See also "Frame pacing", above.
+- **The creative window** (`NVGPU_WINDOW_PRESET=creative`, `windowPreset`):
+  8192 MiB, the same window as `--window-size 8192`, with what "What a
+  larger window costs the host" says: up to its WC zone (6.2 GiB) of the
+  GPU's BAR1 per VM and, under crosvm, up to 8 GiB of host memory in the
+  VMM's cgroup. The per-process share, the zones' reserves and the
+  placement checks are as for any window.
+- **Guest RAM prefaulted** (`NVGPU_PREFAULT`, `vmm.prefaultMemory`; on by
+  default, as before): commits all of guest RAM at start. Off gives back
+  nothing but host memory that a balloon or free-page reporting could
+  return; no guest-visible behaviour changes.
+- **The VMM's file-size limit** (`NVGPU_VMM_FSIZE_MIB`, `LimitFSIZE=`,
+  `vmm.limitFSizeMiB`): a tightening, off by default. A VMM its guest has
+  taken over can then grow no file past it; the checks that it covers the
+  disk, guest RAM, the window and the console log cap keep it from killing
+  a VM that behaves.
+- **A host C-state cap** (`NVGPU_CPU_LATENCY_US`,
+  `nvgpu-cpu-latency@US.service`, `vmm.cpuLatencyUs`): a host power
+  setting, off by default. The descriptor that holds it is a process of
+  its own (the launcher's, or the unit's, root's with no capabilities, no
+  network, a read-only file system and only `/dev/cpu_dma_latency` in its
+  device policy): neither the backend nor the VMM inherits it, so a guest
+  that took either over cannot change the host's C-states through it.
+- **Channel-disable rates** (`--fifo-disable-{proc,vm}-{rate,burst}`,
+  `NVGPU_FIFO_DISABLE_RATES`, `fifoDisable.*`): how often one VM may
+  preempt the runlist every VM shares ("The RM allowlist",
+  FIFO_DISABLE_CHANNELS), a latency channel from one VM to the others.
+  Raising them widens it, to at most 1,000 disables a second per VM; the
+  shape the defaults have still holds whatever the values (a process's rate
+  below the VM's, the VM's reserve of 40 kept for processes that have made
+  at most 8, each process's burst within the VM's less that reserve), so
+  one process cannot take a VM's whole budget and the VM's bounds it
+  against the others. Everything else about the call -- the caller's own
+  clients and channels only, no preemption event, its exact size -- is
+  unchanged.
+- **The guest's knobs** (`NVGPU_GUEST_*`: haltpoll, `rt_spin_us`,
+  `async_fence_watch`, THP): words of the guest's own kernel command line.
+  They change how the guest spends its vCPUs; the host sees more or fewer
+  exits and interrupts from the same VM, nothing it would not see from a
+  guest configured so by its owner.
+- **The Wayland daemon's surface buffers** (`nvgpu-wl-guest
+  --surface-buffers`, 1 to 256): the per-commit work one client can cost
+  the guest daemon's one thread, which every other application of the
+  session waits on. The cap is 256 so that no setting brings back the
+  unbounded list a client could grow to a millisecond a commit.
+- **Not a knob: the host's SRSO and VMSCAPE mitigations** (IBPB on VM
+  exit). A host kernel command-line choice (`spec_rstack_overflow=off`,
+  `vmscape=off`), which DEPLOY.md, "Tuning" describes and nothing here
+  changes: off, a guest can steer the host kernel's and the VMM's
+  speculation after an exit and read host memory through a side channel.
 
 ---
 
@@ -3947,7 +4062,8 @@ weigh against being one more thing that differs from upstream. What does
 close crosvm's remaining gap to nesbox is its per-vCPU core scheduling
 (`NVGPU_CROSVM_CORE_SCHED=0`); that stays on by default, a security choice
 (DEPLOY.md, "Frame pacing"), and BENCHMARKS.md, "Heavy workloads" has what
-it costs and a middle way for the deployment to weigh.
+it costs and a middle way for the deployment to weigh (since offered as
+`NVGPU_CORE_SCHED=shared`: "The tuning knobs").
 
 Proposed, not made: a host kernel flag for `KVM_PRE_FAULT_MEMORY` that maps
 for write (`patches/linux/`, a draft applied nowhere).
