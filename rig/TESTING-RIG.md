@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `integrate35` (display-passthrough after this row): everything above plus the Steam-like workloads' guest changes and `patches/nesbox/0001`; the binaries installed in `.rig/` | Groups A and B under the patched nesbox (C and Rust modules) and crosvm, two batches of live applications: all passed (apps 18/0 and 23/0) | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `winehang`: `patches/nesbox/0001` (virtio-blk interrupt barrier), killable locks in the guest module, hang-watch | fresh-boot Wine/Godot D3D12 starts under nesbox with and without the patch; stage1, compat, render (with and without compute) and wayland on the patched nesbox | "Wine start-up stalls" |
 | 2026-09-30 | branch `integrate32`: the 2026-09-30 review's fixes (backend, guest module, Wayland, patches, deployment), the gVisor comparison, heavyfix and the fence-retire fix | Groups A and B under nesbox (C and Rust modules) and crosvm, the same probes on a KASAN+UBSAN+KFENCE+lockdep guest kernel with the unbind probe, and two batches of live applications | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `heavyfix` on `8fe984f`: IOCTL2 path, posted SYNCOBJ_DESTROY, the pump, crosvm `0011` | the heavy workloads before and after; stage1, compat, render (with and without compute), wayland and secneg under nesbox and crosvm, C parsers, and stage1, render and wayland with the Rust parsers | "Heavy workloads" |
