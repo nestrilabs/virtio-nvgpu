@@ -227,12 +227,14 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
   for (i = 0; i < dev->num_dri_devs && n < NVGPU_WL_MAX_DEVMAP; i++) {
     struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
 
-    if (!dri->registered || !dri->drm || !dri->drm->render)
+    /* Not dri->drm: remove() may put it under us (a file of this node
+     * stays open across remove()). */
+    if (!READ_ONCE(dri->registered) || dri->render_minor < 0)
       continue;
     h->dev[n].host_major = dri->major;
     h->dev[n].host_minor = dri->minor;
     h->dev[n].guest_major = DRM_MAJOR;
-    h->dev[n].guest_minor = dri->drm->render->index;
+    h->dev[n].guest_minor = dri->render_minor;
     h->dev[n].flags = NVGPU_WL_DEV_RENDER;
     n++;
   }
@@ -243,12 +245,12 @@ static long nvgpu_wl_hello(struct nvgpu_wl_file *wf, void __user *uarg) {
     if (c->render_index >= (u32)dev->num_dri_devs)
       continue;
     dri = &dev->dri_devs[c->render_index];
-    if (!dri->registered || !dri->drm || !dri->drm->primary)
+    if (!READ_ONCE(dri->registered) || dri->primary_minor < 0)
       continue;
     h->dev[n].host_major = c->major;
     h->dev[n].host_minor = c->minor;
     h->dev[n].guest_major = DRM_MAJOR;
-    h->dev[n].guest_minor = dri->drm->primary->index;
+    h->dev[n].guest_minor = dri->primary_minor;
     h->dev[n].flags = NVGPU_WL_DEV_CARD;
     n++;
   }

@@ -73,6 +73,11 @@ struct nvgpu_dri_dev {
   /* The registered DRM device, which owns the node and its sysfs tree. */
   struct drm_device *drm;
   bool registered;
+  /* Its nodes' minors (-1: none), kept at registration for readers that
+   * may race remove() -- a Wayland HELLO -- and so must not follow `drm`,
+   * which remove() puts. */
+  int render_minor;
+  int primary_minor;
   u32 index;
   /* Index into nvgpu_device.cards of this device's host card node, or -1. */
   int card_index;
