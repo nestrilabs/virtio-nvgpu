@@ -204,12 +204,6 @@
    "fd": null
   },
   {
-   "name": "TOOLS_FLUSH_EVENTS",
-   "cmd": 67,
-   "size": 4,
-   "fd": null
-  },
-  {
    "name": "ALLOC_SEMAPHORE_POOL",
    "cmd": 68,
    "size": 9248,
@@ -258,7 +252,6 @@
  ],
  "absent": [
   "ALLOC_DEVICE_P2P",
-  "CLEAR_ALL_ACCESS_COUNTERS",
   "DISCARD"
  ]
 }

@@ -169,12 +169,6 @@
    "fd": null
   },
   {
-   "name": "TOOLS_FLUSH_EVENTS",
-   "cmd": 67,
-   "size": 4,
-   "fd": null
-  },
-  {
    "name": "ALLOC_SEMAPHORE_POOL",
    "cmd": 68,
    "size": 9248,
@@ -229,12 +223,6 @@
     "offset": 40,
     "of": "rmctl"
    }
-  },
-  {
-   "name": "CLEAR_ALL_ACCESS_COUNTERS",
-   "cmd": 79,
-   "size": 4,
-   "fd": null
   },
   {
    "name": "DISCARD",

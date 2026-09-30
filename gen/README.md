@@ -33,8 +33,10 @@ Two halves, with different risk:
   follows gVisor's `nvproxy` upstream.
 
 The ABI profiles key off **ranges, not points**: a driver release between two
-known versions selects the lower profile rather than requiring a new row. The
-other tables do not: the backend starts only on a release every table was
+known versions selects the lower profile rather than requiring a new row, up
+to the release gVisor records one of its escape blocks changing at (the
+535.129.03 profile stops at 550; `Profile::until` in `src/versions/mod.rs`).
+The other tables do not: the backend starts only on a release every table was
 measured at (DEPLOY.md, "The exact-measured-release rule"), so a new host
 release still needs its NVKMS, RM control, UVM and allowlist tables ("A new
 host release", below).

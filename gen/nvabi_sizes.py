@@ -12,6 +12,7 @@ structs they mirror, so natural alignment reproduces the driver's ABI.
 
     ./nvabi_sizes.py --gvisor ~/forks/gvisor NVOS46_PARAMETERS_V580
     ./nvabi_sizes.py --gvisor ~/forks/gvisor --json NVOS54_PARAMETERS ...
+    ./nvabi_sizes.py --self-test
 """
 
 import argparse
@@ -37,6 +38,9 @@ PRIMITIVES = {
 ARRAY_RE = re.compile(r"^\[([A-Za-z0-9_]+)\](.+)$")
 FIELD_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([][A-Za-z0-9_.*]+)\s*$")
 EMBED_RE = re.compile(r"^\s*(_|structs\.HostLayout)\s+(structs\.HostLayout)?\s*$")
+# A type named alone: an embedded struct, whose fields are laid out in place
+# (gVisor writes a release's variant as the base struct plus new fields).
+EMBEDDED_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
 CONST_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9a-fA-F]+|\d+)\s*$")
 
 
@@ -65,8 +69,17 @@ def load(gvisor: Path):
                 if not line.strip() or EMBED_RE.match(line):
                     continue
                 fm = FIELD_RE.match(line)
+                em = EMBEDDED_RE.match(line)
                 if fm:
                     fields.append((fm.group(1), fm.group(2)))
+                elif em:
+                    # C lays an embedded struct out as a member of its type:
+                    # aligned as a whole, with its own tail padding.
+                    fields.append((em.group(1), em.group(1)))
+                else:
+                    # A line dropped here would make every size after it
+                    # short, silently: better no size than a wrong one.
+                    sys.exit(f"{path.name}: {name}: cannot parse field {line.strip()!r}")
             structs[name] = fields
 
         # type X uint32  -> primitive alias
@@ -114,7 +127,69 @@ def layout(name, structs, consts, stack=()):
     return off, align
 
 
+SELF_TEST = """
+package nvgpu
+
+type BASE struct {
+	_       structs.HostLayout
+	A       uint64
+	B       uint32
+}
+
+// A release's variant: the base struct, embedded, and a field after it.
+type BASE_V2 struct {
+	_ structs.HostLayout
+	BASE
+	C uint32
+}
+
+type ARR struct {
+	X [N]uint16
+	Y P64
+}
+
+const N = 3
+"""
+
+SELF_TEST_BAD = """
+package nvgpu
+
+type BAD struct {
+	A uint32 `tag:"x"`
+}
+"""
+
+
+def self_test():
+    """Lay out a small fake pkg/abi/nvgpu, as a test of the parser: an
+    embedded struct keeps its own tail padding, and a field this parser
+    cannot read stops it rather than being dropped."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "pkg" / "abi" / "nvgpu"
+        src.mkdir(parents=True)
+        (src / "t.go").write_text(SELF_TEST)
+        structs, consts = load(Path(d))
+        got = {n: layout(n, structs, consts)[0] for n in ("BASE", "BASE_V2", "ARR")}
+        # BASE: 8 + 4, padded to 16. BASE_V2: all of BASE, then C: 20,
+        # padded to 24. ARR: 6, padded to 8, then 8.
+        want = {"BASE": 16, "BASE_V2": 24, "ARR": 16}
+        if got != want:
+            sys.exit(f"self-test: {got} != {want}")
+        (src / "t.go").write_text(SELF_TEST_BAD)
+        r = subprocess.run([sys.executable, __file__, "--gvisor", d, "BAD"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 or "cannot parse" not in r.stderr:
+            sys.exit(f"self-test: an unreadable field was not refused: {r.stderr!r}")
+    print("nvabi_sizes: self-test passed")
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("--gvisor", required=True, type=Path)
     ap.add_argument("--json", action="store_true")

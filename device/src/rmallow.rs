@@ -199,7 +199,11 @@ impl RmAllow {
             // NVOS64 in every release measured (the ABI profile refuses any
             // other size); a shorter block has no status word where RM's is
             // and is refused as too short.
-            NV_ESC_RM_ALLOC => self.class(top_block, NVOS64_H_CLASS, NVOS64_STATUS),
+            // The class RM makes, too: an NV01_EVENT is allocated as the
+            // subclass its parameters name (guestptr.rs `rm_alloc_class`).
+            NV_ESC_RM_ALLOC => self
+                .class(top_block, NVOS64_H_CLASS, NVOS64_STATUS)
+                .and_then(|()| self.event_subclass(top_block, params)),
             NV_ESC_RM_ALLOC_MEMORY => self.class(top_block, NVOS02_H_CLASS, NVOS02_STATUS),
             NV_ESC_RM_ALLOC_OBJECT => self.class(top_block, NVOS05_H_CLASS, NVOS05_STATUS),
             NV_ESC_RM_ALLOC_CONTEXT_DMA2 => self.class(top_block, NVOS39_H_CLASS, NVOS39_STATUS),
@@ -339,6 +343,23 @@ impl RmAllow {
                 },
             ))
         }
+    }
+
+    /// An NV01_EVENT's subclass, which RM allocates in its place, must be on
+    /// the list as well; RM's answer for one it does not take.
+    fn event_subclass(&self, top: &[u8], params: &[u8]) -> Result<(), (What, Refusal)> {
+        let class = le::u32_at(top, NVOS64_H_CLASS).unwrap_or(0);
+        let made = crate::guestptr::rm_alloc_class(class, params);
+        if made == class || self.release.class(made) {
+            return Ok(());
+        }
+        Err((
+            What::Class(made),
+            Refusal::Status {
+                at: NVOS64_STATUS,
+                status: NV_ERR_INVALID_CLASS,
+            },
+        ))
     }
 
     /// The teardown report: what was refused (or, in log mode, would have
@@ -520,6 +541,48 @@ mod tests {
             g.check(NV_ESC_RM_ALLOC, &with_class(32, 0x3e), 32),
             Err(Refusal::Errno(libc::EINVAL))
         );
+    }
+
+    /// RM allocates an NV01_EVENT as the subclass its NV0005 parameters
+    /// name, so the subclass is held to the list too: NV01_EVENT_OS_EVENT
+    /// is on it, NV01_EVENT_KERNEL_CALLBACK is not.
+    #[test]
+    fn an_nv01_event_is_judged_as_the_subclass_rm_allocates() {
+        let mut g = gate();
+        let event = |sub: Option<u32>| {
+            let mut b = with_class(NVOS64_SIZE, 0x05);
+            if let Some(sub) = sub {
+                let mut p = [0u8; 24];
+                p[8..12].copy_from_slice(&sub.to_le_bytes());
+                b.extend_from_slice(&p);
+            }
+            b
+        };
+        assert_eq!(
+            g.check(NV_ESC_RM_ALLOC, &event(Some(0x79)), NVOS64_SIZE),
+            Ok(())
+        );
+        assert_eq!(
+            g.check(NV_ESC_RM_ALLOC, &event(Some(0x05)), NVOS64_SIZE),
+            Ok(())
+        );
+        for sub in [0x78, 0x7e, 0x402c] {
+            assert_eq!(
+                g.check(NV_ESC_RM_ALLOC, &event(Some(sub)), NVOS64_SIZE),
+                Err(Refusal::Status {
+                    at: NVOS64_STATUS,
+                    status: NV_ERR_INVALID_CLASS
+                }),
+                "subclass {sub:#x}"
+            );
+            assert_eq!(g.refused_classes.get(sub), Some(1), "{sub:#x}");
+        }
+        // No parameters: RM has no subclass to take, and refuses it itself.
+        assert_eq!(g.check(NV_ESC_RM_ALLOC, &event(None), NVOS64_SIZE), Ok(()));
+        // Another class's parameters are not read as NV0005's.
+        let mut b = with_class(NVOS64_SIZE, 0x3e);
+        b.extend_from_slice(&[0x78; 24]);
+        assert_eq!(g.check(NV_ESC_RM_ALLOC, &b, NVOS64_SIZE), Ok(()));
     }
 
     #[test]

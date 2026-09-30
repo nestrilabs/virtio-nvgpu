@@ -462,6 +462,23 @@ HOST_FIELD_IGNORED = {
         "(cliresCtrlCmdGpuAcctGetAccountingState); otherwise the GPU's state",
 }
 
+# Allowed controls whose parameters hold a pointer that gen/rmctrl does not
+# list, because RM never follows it: each with where that is so. Every other
+# allowed control with a pointer must be one gen/rmctrl measured, so that the
+# backend relocates or zeroes it (guestptr.rs `scrub_control`). The rule is
+# gVisor nvproxy's (a control it forwards as bytes has no pointer field), held
+# here to the controls this list lets through.
+POINTER_NOT_FOLLOWED = {
+    "NV0000_CTRL_CMD_GPU_GET_ID_INFO":
+        "szName is never read (gpu_mgr.c gpumgrGetGpuIdInfo)",
+    "NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS":
+        "pRunlistPreemptEvent is taken only from a kernel client, and rmchan.rs "
+        "refuses one that is not NULL",
+    "NV00FE_CTRL_CMD_SUBMIT_PAGING_OPERATIONS":
+        "535.129.03 only: memmapperCtrlCmdSubmitPagingOperations_IMPL answers "
+        "NOT_SUPPORTED without reading pagingOps (mem_mapper.c)",
+}
+
 # Classes refused whatever else says (guestptr.rs REFUSED_ALLOC_CLASSES has
 # the reasons; OsDescMemory's 0x71 is let through only by osdesc.rs).
 DENY_CLASSES = {
@@ -1025,6 +1042,16 @@ def read_observed(path=OBSERVED):
     return got
 
 
+def rmctrl_followed(version):
+    """The controls gen/rmctrl measured RM following a pointer in, at
+    `version` (the relocated, the zeroed and the refused alike)."""
+    path = HERE / "rmctrl" / f"{version}.json"
+    if not path.exists():
+        raise ExtractError(f"{path} missing: run gen/rmctrl_extract.py for {version}")
+    d = json.loads(path.read_text())
+    return {c["cmd"] for c in d["controls"]} | {c["cmd"] for c in d["refused"]}
+
+
 def apply_policy(rel, observed):
     """(allowed controls {cmd: row}, allowed classes {class: row}, refused
     reasons {cmd: why}) for one release's measurement."""
@@ -1103,6 +1130,18 @@ def apply_policy(rel, observed):
             allow[cmd] = {"name": f"GSS_LEGACY_{cmd:#010x}",
                           "size": GSS_LEGACY_SIZES.get(rel["version"], {}).get(cmd)}
         # else: a control this release does not have (it came later).
+    # A control let through with a pointer RM follows that the backend does
+    # not know of would reach RM with the guest's address, one of the
+    # backend's to RM.
+    followed = rmctrl_followed(rel["version"])
+    for cmd in allow:
+        c = ctl.get(cmd)
+        if (c and c["pointer"] and cmd not in followed
+                and c["name"] not in POINTER_NOT_FOLLOWED):
+            raise ExtractError(
+                f"{rel['version']}: {c['name']} is allowed and its parameters hold a "
+                "pointer gen/rmctrl does not list: measure it there, or say in "
+                "POINTER_NOT_FOLLOWED why RM never follows it")
     # An observed call RM serves an unprivileged caller in this release
     # must be allowed: one refused here would be a policy bug.
     for cmd in observed["controls"]:
