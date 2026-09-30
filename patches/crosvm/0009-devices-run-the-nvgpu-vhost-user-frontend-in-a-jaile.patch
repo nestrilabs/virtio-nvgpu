@@ -1,7 +1,7 @@
-From 236cbfd82db65338dbe203cda58e17fa7df5810a Mon Sep 17 00:00:00 2001
+From cc77766cccf8f8232119182fd20c37db2251075d Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
-Subject: [PATCH] devices: run the nvgpu vhost-user frontend in a jailed
+Subject: [PATCH 09/11] devices: run the nvgpu vhost-user frontend in a jailed
  process
 
 A vhost-user frontend runs in crosvm's main process: the virtqueues are the
@@ -90,7 +90,7 @@ index f23055f..7e0afd8 100644
  pub use self::DeviceType::Pvclock;
  
 diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
-index a9db5cd..dc3af3b 100644
+index cfdef03..9941f59 100644
 --- a/devices/src/virtio/vhost_user_frontend/mod.rs
 +++ b/devices/src/virtio/vhost_user_frontend/mod.rs
 @@ -435,8 +435,19 @@ impl VirtioDevice for VhostUserFrontend {
@@ -115,10 +115,10 @@ index a9db5cd..dc3af3b 100644
  
      fn device_type(&self) -> DeviceType {
 diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
-index 0c1b7bc..99c2d12 100644
+index 57cfe7b..91419b7 100644
 --- a/devices/src/virtio/virtio_pci_device.rs
 +++ b/devices/src/virtio/virtio_pci_device.rs
-@@ -1547,7 +1547,9 @@ impl Suspendable for VirtioPciDevice {
+@@ -1551,7 +1551,9 @@ impl Suspendable for VirtioPciDevice {
      }
  }
  
@@ -129,7 +129,7 @@ index 0c1b7bc..99c2d12 100644
      vm_memory_client: VmMemoryClient,
      alloc: Alloc,
      mappings: BTreeMap<u64, VmMemoryRegionId>,
-@@ -1556,7 +1558,7 @@ struct VmRequester {
+@@ -1560,7 +1562,7 @@ struct VmRequester {
  }
  
  impl VmRequester {
@@ -901,10 +901,10 @@ index 169d38e..9e2cb5a 100644
      pub fn execute(
          &self,
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
-index 1b0c27b..3b3315b 100644
+index 496f7b3..ab4af51 100644
 --- a/vm_control/src/sys/linux/nvgpu.rs
 +++ b/vm_control/src/sys/linux/nvgpu.rs
-@@ -2157,6 +2157,29 @@ mod tests {
+@@ -2182,6 +2182,29 @@ mod tests {
          );
      }
  

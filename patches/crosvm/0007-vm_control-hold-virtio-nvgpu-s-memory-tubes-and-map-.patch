@@ -1,8 +1,8 @@
-From 09a6d6b307bdbfbf7fc2b118cecef75388dfaa7d Mon Sep 17 00:00:00 2001
+From 4f49b5fbf1ee97b485d919d7a47e9cb022491600 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
-Subject: [PATCH] vm_control: hold virtio-nvgpu's memory tubes, and map UVM
- pools
+Subject: [PATCH 07/11] vm_control: hold virtio-nvgpu's memory tubes, and map
+ UVM pools
 
 virtio-nvgpu's memory requests reach the main process over its two
 VmMemoryRequest tubes. Nothing the device process says is taken on trust:
@@ -20,8 +20,10 @@ else a VmMemoryRequest can ask -- another allocation, a guest physical
 address, a non-descriptor source, ballooning, ioevents -- is refused. The
 ioevent tube may register ioevents and nothing else, and only at the
 device's own queue notification addresses (the layout reports them), any
-length, each once: anywhere else a compromised device process could take
-another device's doorbell, or any MMIO address of the VM.
+length, each once, and no further than the settings BAR's 4 KiB
+notification area whatever queue count the backend reported: anywhere else
+a compromised device process could take another device's doorbell, its own
+MSI-X table, or any MMIO address of the VM.
 
 Two new requests place CUDA's UVM semaphore pools in region 2, the UVM
 aperture: RegisterUvmPool maps a UVM file at the host address that is its
@@ -61,8 +63,8 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
  vm_control/src/lib.rs              |   60 +
  vm_control/src/nvgpu.rs            |   26 +
  vm_control/src/sys/linux.rs        |   23 +-
- vm_control/src/sys/linux/nvgpu.rs  | 2207 ++++++++++++++++++++++++++++
- 6 files changed, 2355 insertions(+), 1 deletion(-)
+ vm_control/src/sys/linux/nvgpu.rs  | 2232 ++++++++++++++++++++++++++++
+ 6 files changed, 2380 insertions(+), 1 deletion(-)
  create mode 100644 vm_control/src/nvgpu.rs
  create mode 100644 vm_control/src/sys/linux/nvgpu.rs
 
@@ -301,10 +303,10 @@ index c3594f3..4992ece 100644
              };
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
 new file mode 100644
-index 0000000..1b0c27b
+index 0000000..496f7b3
 --- /dev/null
 +++ b/vm_control/src/sys/linux/nvgpu.rs
-@@ -0,0 +1,2207 @@
+@@ -0,0 +1,2232 @@
 +// Copyright 2026 The ChromiumOS Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -435,6 +437,12 @@ index 0000000..1b0c27b
 +/// The distance between two queues' notification addresses (virtio-pci's
 +/// `notify_off_multiplier`, as crosvm's transport sets it).
 +pub const NOTIFY_OFF_MULTIPLIER: u64 = 4;
++
++/// The size of the notification area of a virtio-pci settings BAR (crosvm's transport's
++/// `NOTIFICATION_SIZE`): no queue's notification address lies past it, however many queues the
++/// backend reports. Past it are the rest of the settings BAR (the MSI-X table among it) and then
++/// other devices' MMIO, which a device's ioevents must never cover.
++pub const NOTIFY_AREA_SIZE: u64 = 0x1000;
 +
 +/// The two regions, checked.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1043,6 +1051,8 @@ index 0000000..1b0c27b
 +                Role::SharedMemory(regions)
 +            }
 +            NvgpuTubePolicy::IoEvents(notify) => {
++                // The queue count behind the length is the backend's to report.
++                let notify = notify.map(|(base, len)| (base, len.min(NOTIFY_AREA_SIZE)));
 +                if notify.is_none() {
 +                    error!(
 +                        "nvgpu: no queue notification addresses were reported; every ioevent \
@@ -1966,6 +1976,23 @@ index 0000000..1b0c27b
 +            register: false,
 +        });
 +        assert_eq!(ioevent_run(&mut s, r, true), Some(libc::EPERM));
++
++        // However many queues the backend reported, no further than the notification area:
++        // past it are the MSI-X table and other devices' MMIO.
++        let mut wide =
++            NvgpuTubeState::new(NvgpuTubePolicy::IoEvents(Some((NOTIFY, 0x1_0000))));
++        assert_eq!(
++            ioevent_run(&mut wide, ioevent(NOTIFY + NOTIFY_AREA_SIZE - 4, true), true),
++            None
++        );
++        for addr in [NOTIFY + NOTIFY_AREA_SIZE, NOTIFY + 0x3000, NOTIFY + 0xfffc] {
++            assert_eq!(
++                ioevent_run(&mut wide, ioevent(addr, true), true),
++                Some(libc::EPERM),
++                "{:#x}",
++                addr
++            );
++        }
 +
 +        // No addresses reported: no ioevents.
 +        let mut none = NvgpuTubeState::new(NvgpuTubePolicy::IoEvents(None));

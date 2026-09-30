@@ -1375,7 +1375,10 @@ nothing.
 - *Its ioevent tube* registers and unregisters ioevents, nothing else, and
   only at the device's own queue notification addresses in its settings BAR
   (as the transport laid it out, reported with the shared memory layout),
-  any length, each registered once and unregistered only where it is.
+  any length, each registered once and unregistered only where it is. The
+  addresses end with the settings BAR's 4 KiB notification area, whatever
+  queue count the backend reported: past it are the device's MSI-X table and
+  then other devices' MMIO (MP-1).
   Upstream lets any device's tube register an ioevent anywhere, and much
   more -- register memory anywhere, balloon.
 - *Its shared memory tube* may prepare region 1, the window -- the window

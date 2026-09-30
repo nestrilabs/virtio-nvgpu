@@ -1,7 +1,7 @@
-From fda664a5ebea07cf6d0c90847f9f1c6c3cd9030f Mon Sep 17 00:00:00 2001
+From 57d8ecde57eef613b023412a0409d4ca5c4d3bf7 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Tue, 29 Sep 2026 13:31:05 +0000
-Subject: [PATCH] vm_control: prefault virtio-nvgpu's window mappings
+Subject: [PATCH 10/11] vm_control: prefault virtio-nvgpu's window mappings
 
 A guest's first touch of each page of a window mapping faulted out to KVM,
 about 3.1 us a page for BAR1 video memory (a PFNMAP): a fresh 64 MiB
@@ -210,7 +210,7 @@ index 6514967..bce0a0a 100644
                                  wait_ctx
                                      .add(socket.get_read_notifier(), Token::VmControl { id })
 diff --git a/vm_control/src/sys/linux/nvgpu.rs b/vm_control/src/sys/linux/nvgpu.rs
-index 3b3315b..075f289 100644
+index ab4af51..237e0b1 100644
 --- a/vm_control/src/sys/linux/nvgpu.rs
 +++ b/vm_control/src/sys/linux/nvgpu.rs
 @@ -50,6 +50,7 @@ use std::sync::Mutex;
@@ -221,7 +221,7 @@ index 3b3315b..075f289 100644
  use base::warn;
  use base::AsRawDescriptor;
  use base::MappedRegion;
-@@ -715,6 +716,81 @@ pub struct NvgpuTubeState {
+@@ -721,6 +722,81 @@ pub struct NvgpuTubeState {
      band: &'static Mutex<UvmBand>,
      window_fd_check: fn(&SafeDescriptor, bool) -> Result<(), i32>,
      uvm_fd_check: fn(&SafeDescriptor) -> Result<(), i32>,
@@ -303,7 +303,7 @@ index 3b3315b..075f289 100644
  }
  
  fn err_response(errno: i32) -> VmMemoryResponse {
-@@ -756,9 +832,16 @@ impl NvgpuTubeState {
+@@ -764,9 +840,16 @@ impl NvgpuTubeState {
              band: &UVM_BAND,
              window_fd_check: check_window_fd,
              uvm_fd_check: check_uvm_fd,
@@ -320,7 +320,7 @@ index 3b3315b..075f289 100644
      /// Serve one request from this tube.
      pub fn handle(
          &mut self,
-@@ -800,6 +883,11 @@ impl NvgpuTubeState {
+@@ -808,6 +891,11 @@ impl NvgpuTubeState {
                  if let VmMemoryResponse::RegisterMemory { region_id, .. } = response {
                      self.window.insert(offset, len);
                      self.window_ids.insert(*region_id, offset);
@@ -332,7 +332,7 @@ index 3b3315b..075f289 100644
                  }
              }
              // Whatever the answer, the main process's own record of it is gone.
-@@ -1401,6 +1489,53 @@ mod tests {
+@@ -1409,6 +1497,53 @@ mod tests {
          }
      }
  

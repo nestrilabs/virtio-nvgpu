@@ -1,7 +1,8 @@
-From 659d1c806251a56fd576cc25ec99d7fe531fa10c Mon Sep 17 00:00:00 2001
+From d6b77261b3d9c71053dce095abfc67075e4d5944 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Sat, 26 Sep 2026 06:09:50 +0000
-Subject: [PATCH 8/9] devices: virtio-nvgpu's UVM aperture, in the window's BAR
+Subject: [PATCH 08/11] devices: virtio-nvgpu's UVM aperture, in the window's
+ BAR
 
 A virtio-pci device can now publish more than one shared memory region:
 VirtioDevice::get_extra_shared_memory_regions (empty by default, so no other
@@ -14,7 +15,8 @@ id (virtio_get_shm_region), so its driver needs nothing new. The transport
 reports the layout it allocated -- from the main process, before the device
 is moved into a process of its own -- for the main process to hold the
 device's requests to (vm_control's SharedMemoryBarLayout), with the queue
-notification addresses of its settings BAR for the ioevent tube.
+notification addresses of its settings BAR for the ioevent tube (no more
+than its 4 KiB notification area, whatever queue count the backend reports).
 
 The nvgpu vhost-user frontend publishes region 2, the UVM aperture (at most
 1 GiB), after the window when the backend's GET_SHMEM_CONFIG reports it,
@@ -43,10 +45,10 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
  .../src/virtio/vhost_user_frontend/handler.rs | 456 +++++++++++++++---
  devices/src/virtio/vhost_user_frontend/mod.rs | 112 ++++-
  devices/src/virtio/virtio_device.rs           | 112 +++++
- devices/src/virtio/virtio_pci_device.rs       | 131 ++++-
+ devices/src/virtio/virtio_pci_device.rs       | 135 +++++-
  src/crosvm/sys/linux.rs                       | 170 ++++++-
  src/crosvm/sys/linux/device_helpers.rs        |   4 +
- 7 files changed, 873 insertions(+), 113 deletions(-)
+ 7 files changed, 877 insertions(+), 113 deletions(-)
 
 diff --git a/devices/src/virtio/mod.rs b/devices/src/virtio/mod.rs
 index fd3f42d..f23055f 100644
@@ -714,7 +716,7 @@ index bca22b3..61bb140 100644
  
      fn req(shm_offset: u64, len: u64, fd_offset: u64) -> VhostUserMMap {
 diff --git a/devices/src/virtio/vhost_user_frontend/mod.rs b/devices/src/virtio/vhost_user_frontend/mod.rs
-index 2eae2ab..a9db5cd 100644
+index 2eae2ab..cfdef03 100644
 --- a/devices/src/virtio/vhost_user_frontend/mod.rs
 +++ b/devices/src/virtio/vhost_user_frontend/mod.rs
 @@ -40,6 +40,7 @@ use vmm_vhost::VringConfigData;
@@ -848,7 +850,7 @@ index 2eae2ab..a9db5cd 100644
 +        let Some((offsets, _)) = shared_memory_bar_layout(&regions, u64::MAX) else {
 +            error!(
 +                "shared memory regions of {} bytes have no layout",
-+                regions.iter().map(|r| r.length).sum::<u64>()
++                regions.iter().fold(0u64, |a, r| a.saturating_add(r.length))
 +            );
 +            return;
 +        };
@@ -1037,7 +1039,7 @@ index 4b65748..2bd2c00 100644
 +    }
 +}
 diff --git a/devices/src/virtio/virtio_pci_device.rs b/devices/src/virtio/virtio_pci_device.rs
-index 644ea40..0c1b7bc 100644
+index 644ea40..57cfe7b 100644
 --- a/devices/src/virtio/virtio_pci_device.rs
 +++ b/devices/src/virtio/virtio_pci_device.rs
 @@ -13,6 +13,7 @@ use anyhow::Context;
@@ -1114,7 +1116,7 @@ index 644ea40..0c1b7bc 100644
 +            // Checked when the BAR was allocated, before this.
 +            let (offsets, _) = shared_memory_bar_layout(&regions, MAX_SHARED_MEMORY_REGION_SIZE)
 +                .ok_or(PciDeviceError::SharedMemoryRegionTooLarge(
-+                    regions.iter().map(|r| r.length).sum(),
++                    regions.iter().fold(0u64, |a, r| a.saturating_add(r.length)),
 +                    MAX_SHARED_MEMORY_REGION_SIZE,
 +                ))?;
 +            for (region, offset) in regions.iter().zip(offsets) {
@@ -1171,7 +1173,7 @@ index 644ea40..0c1b7bc 100644
          let config = PciBarConfiguration::new(
              SHMEM_BAR_NUM,
              bar_size,
-@@ -1145,6 +1180,36 @@ where
+@@ -1145,6 +1180,40 @@ where
              .device
              .set_shared_memory_mapper(vm_requester);
  
@@ -1182,9 +1184,13 @@ index 644ea40..0c1b7bc 100644
 +                .config_regs
 +                .get_bar_addr(virtio_pci_device.settings_bar);
 +            let notify = (settings != 0).then(|| {
++                // The queue count is the device's (a vhost-user backend's) to report; the
++                // notification area ends where it ends, before the MSI-X table.
 +                (
 +                    settings + NOTIFICATION_BAR_OFFSET,
-+                    virtio_pci_device.queues.len() as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
++                    (virtio_pci_device.queues.len() as u64)
++                        .saturating_mul(u64::from(NOTIFY_OFF_MULTIPLIER))
++                        .min(NOTIFICATION_SIZE),
 +                )
 +            });
 +            let layout = SharedMemoryBarLayout {
@@ -1208,7 +1214,7 @@ index 644ea40..0c1b7bc 100644
          vec![config]
      };
      let mut ranges = vec![];
-@@ -1565,6 +1630,26 @@ impl SharedMemoryMapper for VmRequester {
+@@ -1565,6 +1634,26 @@ impl SharedMemoryMapper for VmRequester {
              .context("unregister_memory failed")
      }
  

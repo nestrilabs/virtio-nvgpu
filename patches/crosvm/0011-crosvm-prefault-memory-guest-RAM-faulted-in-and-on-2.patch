@@ -1,8 +1,8 @@
-From 49e71ad994a5185da8c3735c7c3ecefb156cfc23 Mon Sep 17 00:00:00 2001
+From 7ba63b85effa020199be413921ed4ffc68e23e30 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Wed, 30 Sep 2026 00:28:35 +0000
-Subject: [PATCH] crosvm: --prefault-memory, guest RAM faulted in and on 2 MiB
- pages
+Subject: [PATCH 11/11] crosvm: --prefault-memory, guest RAM faulted in and on
+ 2 MiB pages
 
 A guest under crosvm stalled for a frame of 20-40 ms at a time, in bursts,
 where the same guest under nesbox did not: SuperTuxKart's 0.1% low at 4K
@@ -37,14 +37,14 @@ collapse otherwise.
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
- base/src/sys/linux/mmap.rs |  11 +++-
+ base/src/sys/linux/mmap.rs |  43 +++++++++++++-
  src/crosvm/cmdline.rs      |   7 +++
  src/crosvm/config.rs       |   4 ++
  src/crosvm/sys/linux.rs    | 118 ++++++++++++++++++++++++++++++++++++-
- 4 files changed, 137 insertions(+), 3 deletions(-)
+ 4 files changed, 169 insertions(+), 3 deletions(-)
 
 diff --git a/base/src/sys/linux/mmap.rs b/base/src/sys/linux/mmap.rs
-index 836a0f6..0000182 100644
+index 836a0f6..e9349fe 100644
 --- a/base/src/sys/linux/mmap.rs
 +++ b/base/src/sys/linux/mmap.rs
 @@ -299,13 +299,17 @@ impl MemoryMapping {
@@ -79,6 +79,45 @@ index 836a0f6..0000182 100644
                      Some(orig_addr),
                      Some(orig_size),
                  )
+@@ -1402,6 +1409,38 @@ mod tests {
+         unsafe { libc::munmap(p, 4 * ps) };
+     }
+ 
++    /// A file mapping asked for an alignment is placed as far past a boundary as its file offset
++    /// is -- plain alignment for an offset on a boundary, as before -- and maps the file's bytes
++    /// at that offset; an anonymous one is plainly aligned.
++    #[test]
++    fn an_aligned_file_mapping_keeps_its_offset_phase() {
++        use std::os::unix::fs::FileExt;
++        let ps = pagesize() as u64;
++        let align = 2u64 << 20;
++        let f = tempfile().unwrap();
++        f.set_len(4 * align).unwrap();
++        for offset in [0, ps, align / 2, align, align + 3 * ps] {
++            f.write_all_at(&offset.to_le_bytes(), offset).unwrap();
++            let m = MemoryMappingBuilder::new(align as usize)
++                .from_file(&f)
++                .offset(offset)
++                .align(align)
++                .build()
++                .unwrap();
++            assert_eq!(
++                m.as_ptr() as u64 % align,
++                offset % align,
++                "offset {offset:#x}"
++            );
++            assert_eq!(m.read_obj::<u64>(0).unwrap(), offset);
++        }
++        let anon = MemoryMappingBuilder::new(align as usize)
++            .align(align)
++            .build()
++            .unwrap();
++        assert_eq!(anon.as_ptr() as u64 % align, 0);
++    }
++
+     /// A hugetlbfs file never goes into an arena: its mapping would be a huge page long.
+     #[test]
+     fn arena_refuses_a_hugetlbfs_file() {
 diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
 index 21825e1..f5374be 100644
 --- a/src/crosvm/cmdline.rs
