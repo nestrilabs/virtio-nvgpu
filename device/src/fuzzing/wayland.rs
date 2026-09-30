@@ -600,8 +600,10 @@ pub fn run(data: &[u8]) {
 }
 
 /// The channel's frame decoder and the Wayland wire decoder alone: a frame
-/// is decoded and walked record by record; the rest is a message decoded
-/// against a signature picked by the first bytes.
+/// is decoded and walked record by record; the rest is walked as a stream of
+/// messages (`wire::Messages`), scanned for lease-device globals as the
+/// backend's reader scans the compositor's bytes (`probe::lease_globals`),
+/// and decoded as one message against a signature picked by the first bytes.
 pub fn codec(data: &[u8]) {
     let mut b = Bytes::new(data);
     let f = b.chunk(1 << 16);
@@ -624,6 +626,21 @@ pub fn codec(data: &[u8]) {
     }
     let m = &msgs[b.u8() as usize % msgs.len()];
     let msg = b.rest();
+    // The same bytes as a stream of messages: each whole one yielded is
+    // exactly its size, a bad size ends the walk, and what was yielded and
+    // what is left are the input. Then as the compositor's input the
+    // reader thread scans for lease devices before the engine
+    // (`probe::lease_globals`): one name per message at most.
+    let mut walk = wlwire::wire::Messages::new(msg);
+    let mut whole = 0;
+    for r in &mut walk {
+        let Ok((h, bytes)) = r else { break };
+        assert_eq!(bytes.len(), h.size as usize);
+        assert!((8..=wlwire::wire::MAX_MSG).contains(&bytes.len()));
+        whole += 1;
+    }
+    assert_eq!(walk.consumed() + walk.rest().len(), msg.len());
+    assert!(crate::wl::probe::lease_globals(msg).len() <= whole);
     if let Some(h) = wlwire::wire::peek_header(msg) {
         let _ = h;
         if let Ok(args) = wlwire::wire::parse(m, msg) {
