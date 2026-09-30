@@ -102,6 +102,11 @@ backend_settings() {
         [[ $NVGPU_WINDOW_SHARE =~ ^[0-9]+$ ]] || die "NVGPU_WINDOW_SHARE=$NVGPU_WINDOW_SHARE: a percent"
         BACKEND_ARGS+=(--window-owner-share "$NVGPU_WINDOW_SHARE")
     fi
+    # The VM's video memory (the backend's --vram-limit; off unless set).
+    if [ -n "${NVGPU_VRAM_LIMIT:-}" ]; then
+        [[ $NVGPU_VRAM_LIMIT =~ ^[0-9]+$ ]] || die "NVGPU_VRAM_LIMIT=$NVGPU_VRAM_LIMIT: whole MiB"
+        BACKEND_ARGS+=(--vram-limit "$((10#$NVGPU_VRAM_LIMIT))")
+    fi
     SANDBOX=${NVGPU_SANDBOX:-on}
     case $SANDBOX in on | off) ;; *) die "NVGPU_SANDBOX=$SANDBOX: on or off" ;; esac
     SANDBOX_GIVEN=0

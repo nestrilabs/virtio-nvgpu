@@ -78,6 +78,7 @@ let
       extraArgs = [ "--allow-compute" ];
       windowMiB = 16384;
       windowOwnerShare = 90;
+      vramLimitMiB = 8192;
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -229,6 +230,10 @@ let
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";
     };
+    "a video memory limit below the backend's" = {
+      config = [ { services.virtio-nvgpu.vms."0".vramLimitMiB = 32; } ];
+      says = "at least 64 MiB";
+    };
   };
   check =
     name: c:
@@ -294,6 +299,7 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50 --allow-compute --window-size 16384' "$dropinPath"
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
     grep -q -- '--inject-uid 950' "$dropinPath"
+    grep -q -- '--window-owner-share 90 --vram-limit 8192' "$dropinPath"
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"
     grep -q 'ProtectHome=tmpfs' "$dropinPath"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"

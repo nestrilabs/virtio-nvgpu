@@ -26,7 +26,9 @@
 # flag goes there. A VM for one heavy application might say
 #   NVGPU_BACKEND_ARGS="--window-size 16384 --window-owner-share 90"
 # (DEPLOY.md, "Sizing the window": the VMM follows the size, and under
-# crosvm its MemoryMax must cover guest RAM plus the window). For capture
+# crosvm its MemoryMax must cover guest RAM plus the window), and one held
+# to 8 GiB of the GPU's video memory adds --vram-limit 8192 (DEPLOY.md,
+# "Video memory limit"). For capture
 # injection (DEPLOY.md, "Capture injection") that file says
 #   NVGPU_BACKEND_ARGS="--inject-uid UID"
 # and vhost-user-nvgpu-inject@N.socket binds the helper's socket, open to
