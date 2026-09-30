@@ -1,4 +1,4 @@
-From 22ce776a4b577c82c406bced6633aea9d29a6490 Mon Sep 17 00:00:00 2001
+From 358103fa918ce82c28f79bad3db38e0f1dbe0ef4 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Fri, 25 Sep 2026 03:37:06 +0000
 Subject: [PATCH] drm-lease: let desktop monitors be leased, and send released
@@ -55,6 +55,17 @@ Protocol fixes on the way, all of which affect VR leases too:
   connector advertised again.
 - The lease resource holds its protocol directly, so destroying a lease still
   revokes it after the client released the device object.
+- Connectors advertised when a client binds the device are made after the
+  device has its weak self pointer, so they know their device: done follows
+  withdrawn for them, and destroying one removes it. Before, every client that
+  bound the device left its connector objects in the compositor for good.
+- Requests and connectors, like leases, hold the protocol directly: a
+  disconnecting client's device object is destroyed before them (libwayland
+  goes by id), and one released first no longer strands them either.
+- A connector must come from the device object the request was made on
+  (wrong_device), so one lease cannot name a monitor twice through two
+  bindings of the global; a monitor named twice is refused before anything
+  is released.
 
 hyprctl monitors reports leasable and leased.
 
@@ -71,7 +82,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 
 Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
 ---
- hyprtester/src/tests/main/monitor_rules.cpp   |  27 +++
+ hyprtester/src/tests/main/monitor_rules.cpp   |  27 ++
  src/config/legacy/ConfigManager.cpp           |  18 +-
  .../lua/bindings/LuaBindingsConfigRules.cpp   |   5 +
  src/config/shared/monitor/MonitorRule.cpp     |   3 +-
@@ -80,12 +91,12 @@ Claude-Session: https://claude.ai/code/session_0119BJfiAjA3VRAtdz3uU35x
  src/config/shared/monitor/Parser.cpp          |  16 ++
  src/config/shared/monitor/Parser.hpp          |   1 +
  src/debug/HyprCtl.cpp                         |  16 +-
- src/output/Monitor.cpp                        | 116 +++++++++++
+ src/output/Monitor.cpp                        | 116 +++++++++
  src/output/Monitor.hpp                        |   5 +-
- src/protocols/DRMLease.cpp                    | 196 +++++++++++++++---
- src/protocols/DRMLease.hpp                    |  16 +-
- tests/config/MonitorParser.cpp                |  36 ++++
- 14 files changed, 423 insertions(+), 43 deletions(-)
+ src/protocols/DRMLease.cpp                    | 231 +++++++++++++++---
+ src/protocols/DRMLease.hpp                    |  20 +-
+ tests/config/MonitorParser.cpp                |  36 +++
+ 14 files changed, 458 insertions(+), 47 deletions(-)
 
 diff --git a/hyprtester/src/tests/main/monitor_rules.cpp b/hyprtester/src/tests/main/monitor_rules.cpp
 index c1dfb92d..503fcf02 100644
@@ -530,10 +541,10 @@ index 945fecd1..ac5e3d86 100644
          // IMonitorQueryable / IMonitorArrangeable
          virtual MONITORID                   id() const override;
 diff --git a/src/protocols/DRMLease.cpp b/src/protocols/DRMLease.cpp
-index fef975bd..ec4fcf2a 100644
+index fef975bd..48635ac1 100644
 --- a/src/protocols/DRMLease.cpp
 +++ b/src/protocols/DRMLease.cpp
-@@ -25,63 +25,91 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
+@@ -25,63 +25,92 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
  
      m_parent    = request->m_parent;
      m_requested = request->m_requested;
@@ -558,8 +569,9 @@ index fef975bd..ec4fcf2a 100644
 +    for (auto const& c : m_requested) {
 +        // a withdrawn connector (unplugged, or its monitor stopped being leasable) may still be named in a request: the protocol says to
 +        // answer that with finished and no fd
-+        if (!c || c->m_dead || !c->m_monitor || c->m_monitor->m_isBeingLeased) {
-+            LOGM(Log::ERR, "Rejecting lease: no monitor, or monitor is withdrawn or already leased for {}", (c && c->m_monitor ? c->m_monitor->m_name : "null"));
++        if (!c || c->m_dead || !c->m_monitor || c->m_monitor->m_isBeingLeased || std::ranges::find(m_monitors, c->m_monitor) != m_monitors.end()) {
++            LOGM(Log::ERR, "Rejecting lease: no monitor, or monitor is withdrawn, already leased or named twice for {}",
++                 (c && c->m_monitor ? c->m_monitor->m_name : "null"));
 +            reject({});
              return;
          }
@@ -649,7 +661,7 @@ index fef975bd..ec4fcf2a 100644
      });
  
      LOGM(Log::DEBUG, "Granting lease, sending fd {}", m_lease->leaseFD);
-@@ -91,14 +119,62 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
+@@ -91,22 +120,74 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
      close(m_lease->leaseFD);
  }
  
@@ -713,7 +725,51 @@ index fef975bd..ec4fcf2a 100644
  }
  
  CDRMLeaseRequestResource::CDRMLeaseRequestResource(WP<CDRMLeaseDeviceResource> parent_, SP<CWpDrmLeaseRequestV1> resource_) : m_parent(parent_), m_resource(resource_) {
-@@ -188,13 +264,24 @@ CDRMLeaseConnectorResource::CDRMLeaseConnectorResource(WP<CDRMLeaseDeviceResourc
+     if UNLIKELY (!good())
+         return;
+ 
++    // Not through m_parent: a client that disconnects has its objects destroyed in id order, the device (a lower id) before this
++    // request, and one that releases the device may keep the request. Either way the request must still leave m_requests.
++    m_protocol = leaseForParent(m_parent);
++
+     m_resource->setOnDestroy([this](CWpDrmLeaseRequestV1* r) {
+-        if (const auto LEASE = leaseForParent(m_parent); LEASE)
++        if (const auto LEASE = m_protocol.lock(); LEASE)
+             LEASE->destroyResource(this);
+     });
+ 
+@@ -129,7 +210,10 @@ CDRMLeaseRequestResource::CDRMLeaseRequestResource(WP<CDRMLeaseDeviceResource> p
+             return;
+         }
+ 
+-        if (std::ranges::find(LEASE->m_connectors.begin(), LEASE->m_connectors.end(), CONNECTOR) == LEASE->m_connectors.end()) {
++        // the connector must have been advertised by the device object this request came from, not by another binding of the
++        // global: two bindings each hold a connector for the same monitor, which would otherwise name it twice in one lease
++        if (!CONNECTOR || CONNECTOR->m_parent != m_parent ||
++            std::ranges::find(LEASE->m_connectors.begin(), LEASE->m_connectors.end(), CONNECTOR) == LEASE->m_connectors.end()) {
+             m_resource->error(WP_DRM_LEASE_REQUEST_V1_ERROR_WRONG_DEVICE, "Connector requested for wrong device");
+             return;
+         }
+@@ -176,25 +260,41 @@ CDRMLeaseConnectorResource::CDRMLeaseConnectorResource(WP<CDRMLeaseDeviceResourc
+     if UNLIKELY (!good())
+         return;
+ 
++    // Not through m_parent: when a client disconnects, libwayland destroys its own objects (the device) before the ones we created
++    // (connectors), and a client may release the device and keep its connectors. Looked up through m_parent, every such connector
++    // would stay in m_connectors, with its monitor listener, for the rest of the session.
++    m_protocol = leaseForParent(m_parent);
++
+     m_resource->setOnDestroy([this](CWpDrmLeaseConnectorV1* r) {
+-        if (const auto LEASE = leaseForParent(m_parent); LEASE)
++        if (const auto LEASE = m_protocol.lock(); LEASE)
+             LEASE->destroyResource(this);
+     });
+     m_resource->setDestroy([this](CWpDrmLeaseConnectorV1* r) {
+-        if (const auto LEASE = leaseForParent(m_parent); LEASE)
++        if (const auto LEASE = m_protocol.lock(); LEASE)
+             LEASE->destroyResource(this);
+     });
+ 
      m_resource->setData(this);
  
      m_listeners.destroyMonitor = Event::bus()->m_events.monitor.destroyMon.listen([this](PHLMONITOR m) {
@@ -741,7 +797,7 @@ index fef975bd..ec4fcf2a 100644
  bool CDRMLeaseConnectorResource::good() {
      return m_resource->resource();
  }
-@@ -218,6 +305,9 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
+@@ -218,6 +318,9 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
              PROTO::lease.at(m_deviceName)->destroyResource(this);
      });
      m_resource->setRelease([this](CWpDrmLeaseDeviceV1* r) {
@@ -751,7 +807,23 @@ index fef975bd..ec4fcf2a 100644
          if (PROTO::lease.contains(m_deviceName))
              PROTO::lease.at(m_deviceName)->destroyResource(this);
      });
-@@ -259,14 +349,18 @@ bool CDRMLeaseDeviceResource::good() {
+@@ -246,6 +349,15 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
+ 
+     LOGM(Log::DEBUG, "Sending DRMFD {} to new lease device", fd.get());
+     m_resource->sendDrmFd(fd.get());
++    m_drmFdSent = true;
++}
++
++void CDRMLeaseDeviceResource::advertise() {
++    // Called by bindManager once m_self is set, not from the constructor: each connector keeps a weak pointer to this device, and one
++    // made while m_self was still empty never finds its device (or the protocol) again, so it could not send done after withdrawn,
++    // and destroying it would not remove it from m_connectors.
++    if (!m_drmFdSent)
++        return;
+ 
+     for (auto const& m : PROTO::lease.at(m_deviceName)->m_offeredOutputs) {
+         if (m)
+@@ -259,14 +371,22 @@ bool CDRMLeaseDeviceResource::good() {
      return m_resource->resource();
  }
  
@@ -761,6 +833,10 @@ index fef975bd..ec4fcf2a 100644
 +}
 +
 +bool CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
++    // readvertise runs from an idle callback, by which time the monitor may have lost its output
++    if (!monitor || !monitor->m_output)
++        return false;
++
      if (std::ranges::find_if(m_connectorsSent, [monitor](const auto& e) { return e && !e->m_dead && e->m_monitor == monitor; }) != m_connectorsSent.end())
 -        return;
 +        return false;
@@ -773,7 +849,7 @@ index fef975bd..ec4fcf2a 100644
      }
  
      RESOURCE->m_parent = m_self;
-@@ -280,6 +374,8 @@ void CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
+@@ -280,6 +400,8 @@ void CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
      m_resource->sendConnector(RESOURCE->m_resource.get());
  
      RESOURCE->sendData();
@@ -782,7 +858,15 @@ index fef975bd..ec4fcf2a 100644
  }
  
  CDRMLeaseProtocol::CDRMLeaseProtocol(const wl_interface* iface, const int& ver, const std::string& name, SP<Aquamarine::IBackendImplementation> backend_) :
-@@ -352,6 +448,44 @@ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
+@@ -310,6 +432,7 @@ void CDRMLeaseProtocol::bindManager(wl_client* client, void* data, uint32_t ver,
+     }
+ 
+     RESOURCE->m_self = RESOURCE;
++    RESOURCE->advertise();
+ }
+ 
+ void CDRMLeaseProtocol::destroyResource(CDRMLeaseDeviceResource* resource) {
+@@ -352,6 +475,44 @@ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
      }
  }
  
@@ -828,7 +912,7 @@ index fef975bd..ec4fcf2a 100644
      return m_deviceName;
  }
 diff --git a/src/protocols/DRMLease.hpp b/src/protocols/DRMLease.hpp
-index 603453c0..e10b700a 100644
+index 603453c0..51b87bf5 100644
 --- a/src/protocols/DRMLease.hpp
 +++ b/src/protocols/DRMLease.hpp
 @@ -32,10 +32,20 @@ class CDRMLeaseResource {
@@ -852,7 +936,15 @@ index 603453c0..e10b700a 100644
  };
  
  class CDRMLeaseRequestResource {
-@@ -59,6 +69,7 @@ class CDRMLeaseConnectorResource {
+@@ -50,6 +60,7 @@ class CDRMLeaseRequestResource {
+ 
+   private:
+     SP<CWpDrmLeaseRequestV1> m_resource;
++    WP<CDRMLeaseProtocol>    m_protocol; // held directly: the device object can go first (release, or a disconnect)
+ };
+ 
+ class CDRMLeaseConnectorResource {
+@@ -59,6 +70,7 @@ class CDRMLeaseConnectorResource {
  
      bool                                  good();
      void                                  sendData();
@@ -860,17 +952,34 @@ index 603453c0..e10b700a 100644
  
      WP<CDRMLeaseConnectorResource>        m_self;
      WP<CDRMLeaseDeviceResource>           m_parent;
-@@ -80,7 +91,8 @@ class CDRMLeaseDeviceResource {
+@@ -67,6 +79,7 @@ class CDRMLeaseConnectorResource {
+ 
+   private:
+     SP<CWpDrmLeaseConnectorV1> m_resource;
++    WP<CDRMLeaseProtocol>      m_protocol; // held directly: the device object can go first (release, or a disconnect)
+ 
+     struct {
+         CHyprSignalListener destroyMonitor;
+@@ -80,7 +93,9 @@ class CDRMLeaseDeviceResource {
      CDRMLeaseDeviceResource(std::string deviceName, SP<CWpDrmLeaseDeviceV1> resource_);
  
      bool                                        good();
 -    void                                        sendConnector(PHLMONITOR monitor);
++    void                                        advertise();
 +    bool                                        sendConnector(PHLMONITOR monitor);
 +    void                                        sendDone();
  
      std::vector<WP<CDRMLeaseConnectorResource>> m_connectorsSent;
  
-@@ -100,6 +112,8 @@ class CDRMLeaseProtocol : public IWaylandProtocol {
+@@ -89,6 +104,7 @@ class CDRMLeaseDeviceResource {
+ 
+   private:
+     SP<CWpDrmLeaseDeviceV1> m_resource;
++    bool                    m_drmFdSent = false;
+ 
+     friend class CDRMLeaseProtocol;
+ };
+@@ -100,6 +116,8 @@ class CDRMLeaseProtocol : public IWaylandProtocol {
      virtual void                           bindManager(wl_client* client, void* data, uint32_t ver, uint32_t id);
  
      void                                   offer(PHLMONITOR monitor);
