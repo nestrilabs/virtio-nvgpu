@@ -1466,6 +1466,32 @@ fn the_same_object_mapped_twice_is_released_by_the_second_munmap() {
     assert_eq!(be.shm_free_bytes(), empty);
 }
 
+/// A placement mapped u32::MAX times is refused one more MMAP, not
+/// counted past it: the count is the guest kernel's to raise, and an
+/// overflow would abort the backend.
+#[test]
+fn a_placement_mapped_u32_max_times_is_refused_another() {
+    let mut be = gated_backend();
+    be.set_window(Box::new(FakeWindow::default()));
+    let h = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+    let a = mmap(&mut be, h, 0x2000);
+    be.live_maps.get_mut(&a.mapping_id).unwrap().refs = u32::MAX;
+    let mut req = hdr(MsgType::Mmap, h as u64);
+    append(
+        &mut req,
+        &MmapReq {
+            size: 4096,
+            offset: 0x2000,
+            prot: 3,
+            padding: 0,
+        },
+    );
+    let mut resp = vec![0u8; 64];
+    be.dispatch(&req, &mut resp);
+    assert_eq!(parse_resp(&resp).status, -libc::ENOMEM);
+    assert_eq!(be.live_maps[&a.mapping_id].refs, u32::MAX);
+}
+
 /// An MMAP of a file already placed, asking for more than the placement
 /// holds, is refused: the guest maps what it asked for from the
 /// placement's offset, so the rest would be the window's next extents --
