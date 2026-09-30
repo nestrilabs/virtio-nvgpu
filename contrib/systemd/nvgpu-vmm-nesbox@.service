@@ -44,6 +44,20 @@ TimeoutStopSec=30
 # A VMM that must never beat the desktop to a CPU: a lower weight, or a
 # slice of its own (SECURITY.md, "Frame pacing").
 #CPUWeight=50
+# A VMM its guest has taken over can grow any file it can write -- the
+# disk above all -- with ftruncate or fallocate until the file system is
+# full. RLIMIT_FSIZE bounds that, but also every memfd the VMM sizes: set it
+# no lower than the largest of the disk, guest RAM and the window.
+#LimitFSIZE=
 PrivateNetwork=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
+# What neither the jailer nor nesbox uses. (Not UMask=, which would make
+# the directories the jailer creates for nesbox's binds its own alone, nor
+# ProtectKernelTunables= or ProtectControlGroups=, until a run on hardware
+# shows the jailer writes nothing under /sys.)
+LockPersonality=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+ProtectKernelModules=yes
+ProtectKernelLogs=yes

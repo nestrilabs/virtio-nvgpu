@@ -76,9 +76,25 @@ chmod 0666 /rig/launcher/guest.sh
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 NVGPU_DIAGNOSTIC=1 \
     bash /rig/run-guest.new.sh probe piece 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3
 chmod 0644 /rig/launcher/guest.sh
+echo "== new: a piece reached through a link in a directory someone else can write"
+# The check passes (what the link names is root's), and the launcher must
+# then read what it checked, not whatever the link names by then.
+mkdir -p /rig/real && cp /rig/launcher/verdict.sh /rig/real/verdict.sh
+echo 'echo "verdict.sh read from ${BASH_SOURCE[0]}" >&2' >> /rig/real/verdict.sh
+mv /rig/launcher/verdict.sh /rig/launcher/verdict.sh.away
+ln -s /home/user/verdict-link /rig/launcher/verdict.sh
+ln -s /rig/real/verdict.sh /home/user/verdict-link
+LINES_SHOWN=60 run run-guest.new.sh viadir | grep -E 'exit|verdict.sh read from'
+rm /rig/launcher/verdict.sh /home/user/verdict-link
+mv /rig/launcher/verdict.sh.away /rig/launcher/verdict.sh
 echo "== new: a file not root's (uid 65534 here: /proc/version, of a uid this namespace does not map)"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_KERNEL=/proc/version NVGPU_SKIP_MEM_CHECK=1 NVGPU_ALLOW_ROOT_UNSAFE=1 \
     NVGPU_DIAGNOSTIC=1 bash /rig/run-guest.new.sh probe notroots 2>&1 | sed 's/^/    | /' | grep -v WARNING | head -3
+echo "== new: slot 0's socket unit listens (contrib/systemd's VM 0)"
+mkdir -p /run/nvgpu/vm0
+python3 -c 'import socket; socket.socket(socket.AF_UNIX).bind("/run/nvgpu/vm0/nvgpu.sock")'
+run run-guest.new.sh unitslot | grep -E 'exit|slot'
+rm -rf /run/nvgpu
 echo "== new: NVGPU_VMM_JAIL defaults to on: no jailer, no run"
 mv /rig/bin/jailer /rig/bin/jailer.away
 run run-guest.new.sh nojailer
@@ -98,6 +114,12 @@ if grep -q '/run/nvgpu\.[^/ ]*$' /rig/logs/ownership.log; then
 else
     echo "  ok: the run's directory stayed root's; only the socket and the disk copy went to the slot"
 fi
+
+echo "== new: a root run started with umask 000 writes nothing others can write"
+: > /rig/logs/umask.log
+(umask 000; LINES_SHOWN=2 run run-guest.new.sh umask0)
+sed 's/^/    /' /rig/logs/umask.log
+echo "  the VMM's config and the console log: $(stat -c %a /rig/logs/umask0.vm0.json /rig/logs/umask0.vm0.console.log | tr '\n' ' ')"
 
 echo "== new: VD-H3: a diagnostic backend flag as root, without NVGPU_DIAGNOSTIC=1"
 env -i PATH=$PATH NVGPU_RIG=/rig NVGPU_SKIP_MEM_CHECK=1 bash /rig/run-guest.new.sh probe h3a -- \

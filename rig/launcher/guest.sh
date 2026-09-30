@@ -81,12 +81,15 @@ run_guest() {
     # console_watch: the guest writes the console log; past LOG_MAX bytes the VM
     # is stopped (TERM to the VMM's timeout) and the log cut back, so no guest
     # fills the filesystem. What a guest writes between two looks is cut too
-    # (console_over again once the VMM is gone).
+    # (console_over again once the VMM is gone). The VMM is this shell's
+    # child, not the watcher's: once it has exited and been reaped its pid
+    # may be another process's, which the watcher neither watches nor
+    # signals (still_ours).
     (
         exec {SLOT_FD}>&- {TAG_FD}>&-
-        while kill -0 "$VMM_PID" 2>/dev/null; do
+        while still_ours "$VMM_PID" "$VMM_MARK"; do
             if console_over; then
-                kill -TERM "$VMM_PID" 2>/dev/null
+                still_ours "$VMM_PID" "$VMM_MARK" && kill -TERM "$VMM_PID" 2>/dev/null
                 break
             fi
             sleep 0.5

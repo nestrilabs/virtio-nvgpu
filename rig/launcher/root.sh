@@ -25,9 +25,12 @@
 # under nesbox's jailer, in group nvgpu-vmN and no other: the backend's socket
 # is made 0660 in that group, which is how the VMM reaches it and all it
 # reaches of the backend's. A slot is free when no run holds its lock
-# (/run/nvgpu-slots/N.lock) and neither of its users has a live process; the
-# first free one is taken, and none free stops the run. Pools are counted from
-# nvgpu-vm0 up to the first missing user, at most NVGPU_VM_SLOTS.
+# (/run/nvgpu-slots/N.lock), neither of its users has a live process, and
+# contrib/systemd's socket unit for VM N is not listening (the units use the
+# same users and take no lock: on a host that runs both, start a unit only
+# for a slot no launcher holds); the first free one is taken, and none free
+# stops the run. Pools are counted from nvgpu-vm0 up to the first missing
+# user, at most NVGPU_VM_SLOTS.
 #
 # Which user the backend is: slot N's nvgpu-vmN. With --wayland-socket it is
 # the socket's owner instead -- the backend is then a client of that user's
@@ -120,6 +123,13 @@ take_slot() {
         if pgrep -u "nvgpu-vm$i" >/dev/null ||
             { id "nvgpu-vmm$i" >/dev/null 2>&1 && pgrep -u "nvgpu-vmm$i" >/dev/null; }; then
             echo "run-guest: slot $i is unlocked but its users still run something; skipping it" >&2
+            continue
+        fi
+        # The same users are VM i's under contrib/systemd's units, which take
+        # no lock here, and whose backend runs only once its VMM connects:
+        # while the socket unit listens, the slot is that VM's.
+        if [ -e "/run/nvgpu/vm$i/nvgpu.sock" ]; then
+            echo "run-guest: slot $i is systemd's (vhost-user-nvgpu@$i.socket listens); skipping it" >&2
             continue
         fi
         SLOT=$i

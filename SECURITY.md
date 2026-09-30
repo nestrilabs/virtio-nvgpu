@@ -132,7 +132,7 @@ each call is validated:
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | **Allow-listed** per release ("The RM allowlist"): 97 of 222 reach RM, on RM_ALLOC, ALLOC_MEMORY, ALLOC_OBJECT, ALLOC_CONTEXT_DMA2 and by VID_HEAP_CONTROL function; the rest are answered INVALID_CLASS without RM. **12 are refused** on RM_ALLOC, ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 whatever the list says (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`), and ALLOC_MEMORY refuses the four of them whose `pMemory` RM reads (`REFUSED_ALLOC_MEMORY_CLASSES`). An NV01_EVENT is held to both as the subclass its parameters name, which RM allocates in its place (`rm_alloc_class`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event and a header buffer of the caller's (`hBufferHeader`): one RM allocates itself comes back with its pages' host physical addresses. |
 | **RM_SHARE, RM_DUP_OBJECT, and a second client named in parameters** | NV04 share and dup; 2 NV0000 share controls; 7 classes and 21 controls that name another client | Shares go to RM only when they narrow or grant inside the VM; the rest are **refused**. A duplicate's two clients must be this VM's, made by one guest process, unless the source was shared with the destination (RM's rule, guest processes for the backend's). A second client named in class or control parameters must be this VM's and pass RM's rule for that field, with guest processes and euids. A guest that does not say which process and euid make each call gets neither. Below, "RM objects between guest processes". |
 | **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | With an address alone, **refused**. Without `--allow-compute`, with pages too. With it, and the guest-physical pages behind it (BCAP_OS_DESC), **table-sized**: only the user-virtual-address descriptor type, a page list covering exactly what RM pins, every page in guest RAM, and RM handed the backend's own mapping of exactly those pages (below). |
-| **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | Without `--allow-compute` (the default), **0**: the open is **refused** before the host is asked, and the guest has no node. With it, **31** of 610.57.04's 38 (35 to 37 on the older releases measured: 37 on 580 through 595.99.02, the rig's), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages, and every file is put in multi-process sharing mode, which takes pageable access away on every release and ties the VA space to no process. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**, and so are the two whose effect is the host's: TOOLS_FLUSH_EVENTS (the host-wide tools queue) and CLEAR_ALL_ACCESS_COUNTERS (the GPUs' own counters, which every tenant's migrations read). |
+| **nvidia-uvm**, `/dev/nvidia-uvm` | 38 commands | Without `--allow-compute` (the default), **0**: the open is **refused** before the host is asked, and the guest has no node. With it, **31** of 610.57.04's 38 (35 to 37 on the releases before 610 measured: 37 on 580 through 595.99.02, the rig's; 31 on 610.43.02), **table-sized** on both sides from `gen/uvm/`. Pageable access is forced off at UVM_INITIALIZE, so the GPU cannot fault in the backend's pages, and every file is put in multi-process sharing mode, which takes pageable access away on every release and ties the VA space to no process. The 6 descriptor fields are translated. Every command that copies through, pins or populates CPU memory is **refused**, and so are the two whose effect is the host's: TOOLS_FLUSH_EVENTS (the host-wide tools queue) and CLEAR_ALL_ACCESS_COUNTERS (the GPUs' own counters, which every tenant's migrations read). |
 | **nvidia-uvm tools**, `/dev/nvidia-uvm-tools` | 7 | **0**: without `--allow-compute` the open is **refused**; with it the file opens, and every ioctl on it is **refused**. |
 | **NVKMS**, `/dev/nvidia-modeset` | one ioctl carrying 66 commands (610.57.04) | 56 to 61 per release, **schema-authoritative** over IOCTL2. v1 carries only the commands with no pointer and no descriptor. 7 are **refused** by name, 3 run only with `--kms-card`, and 7 are gated on grants outside it. Everything else is in "NVKMS, KMS and leases". At most 64 opens per VM, and 16 per guest process (the VM's last 8 kept for processes holding at most 2). |
 | **nvidia-drm and DRM core on a host render node** | 24 nvidia-drm ioctls (21 render-allowed), plus the core's render-allowed ones | v1: 6 full ioctl numbers. IOCTL2: 28 render-class entries (12 syncobj, 16 nvidia-drm), **schema-authoritative**. GEM_IMPORT_USERSPACE_MEMORY, GEM_FLINK and GEM_OPEN are **refused** on every handle. SEMSURF_FENCE_CTX_CREATE's index must lie inside the surface, and its client must be one this VM allocated, with at most 64 contexts per file, 96 per guest process and 256 per VM, the last 32 kept for processes holding at most 16 (`device/src/semsurf.rs`). Every argument buffer is at least `_IOC_SIZE` and guarded. |
@@ -260,9 +260,10 @@ preempts the channels off the GPU, a preemption of the runlist they share
 with every other VM and host program, which natively any process may make as
 often as it likes. So the gate has a rate: a token bucket per guest process
 (50 calls a second after a burst of 40) and one per VM (200 a second after
-160), a process charged for every call it asks for, served or not. The
-VM's last 40 tokens go only to a process that has used at most 8 of its
-own, so processes asking past their rate cannot take the calls of one that
+160), a process charged for every call that reaches the rate, one the
+VM's bucket then refuses included (a call refused for its size, its event
+or its clients takes no token). The VM's last 40 tokens go only to a
+process that has used fewer than 8 of its own, so processes asking past their rate cannot take the calls of one that
 makes a few; it takes four processes at their whole rate to reach the VM's.
 A call over the rate is answered NV_ERR_NOT_SUPPORTED, RM not called: what
 CPU-RM answers for this control on a GPU without GSP, and what the driver
@@ -476,7 +477,7 @@ what the backend does with it. Default is off.
 | path | without `--allow-compute` (default) | with it |
 |---|---|---|
 | OPEN of `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools` | **refused** (ENODEV) before any host open; the guest makes neither node and does not register the `nvidia-uvm` major | opened on the host |
-| UVM ioctls (`uvm_gate`, `device/src/guestptr.rs`) | unreachable: no UVM file exists | 31 of 610.57.04's 38 (35 to 37 on older releases), table-sized; the tools device's all refused |
+| UVM ioctls (`uvm_gate`, `device/src/guestptr.rs`) | unreachable: no UVM file exists | 31 of 610.57.04's 38 (35 to 37 on the releases before 610), table-sized; the tools device's all refused |
 | UVM multi-process sharing mode, forced at UVM_INITIALIZE | unreachable | on every UVM file |
 | range groups (CREATE/DESTROY/SET_RANGE_GROUP, PREVENT/ALLOW_MIGRATION_RANGE_GROUPS, MIGRATE_RANGE_GROUP) | unreachable | forwarded on releases that have them |
 | UVM descriptor fields (`device/src/uvmfd.rs`) | unreachable | translated |
@@ -764,7 +765,7 @@ It is the operator's choice for a VM that runs one heavy application.
 | | what the backend opens |
 |---|---|
 | device files | `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-modeset` and this GPU's render nodes; `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools` only with `--allow-compute`; `/dev/dri/card*` (`--kms-card` only, through OPEN_KMS; a plain OPEN of a card is refused); lessee files received from the compositor, which must classify as a lease of this GPU; and `/dev/udmabuf` |
-| other files | `/proc/driver/nvidia`, each GPU's PCI directory in sysfs, the `--pci-config-dir` snapshot (read before the sandbox), memfds for shm pools, blobs and a sealed page, and readlink of `/proc/self/fd` (through an `O_PATH` descriptor of the directory, kept) and `/proc/self/fdinfo` |
+| other files | `/proc/driver/nvidia`, each GPU's PCI directory in sysfs, the `--pci-config-dir` snapshot (read before the sandbox), memfds for shm pools, blobs and a sealed page, readlink of `/proc/self/fd` (through an `O_PATH` descriptor of the directory, kept), and reads of `/proc/self/fdinfo` |
 | vhost-user socket | a listening socket handed to it (systemd's socket activation, or `--socket-fd`: "The backend's socket"); else by default `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` in a 0700 directory, refused if the directory is anyone else's, where a file already at the path is removed only if it is a socket of the backend's uid, and anything else stops the start (`device/src/posture.rs`) |
 | other sockets | with `--wayland-socket`, one connection to the compositor per channel plus a probe connection; with `--wayland-export`, a listener created 0600 that admits only peers of the backend's uid, with 16 pending; with `--inject-socket`, a `SOCK_SEQPACKET` listener (created 0600 and opened to the capture helper's group by root after start, or handed over by the socket unit) that serves only `--inject-uid`, four connections at once ("Capture injection") |
 | netlink | `NETLINK_KOBJECT_UEVENT`, receive only, with `--kms-card` or `--wayland-lease` |
@@ -939,7 +940,7 @@ files and sockets, the user's files, the network, other processes.
 | handles | 65,536 per VM, or what RLIMIT_NOFILE backs (half of the hard limit less 1,024 kept for the backend's own); a quarter per guest process, the last sixteenth kept for processes holding at most a sixty-fourth (`device/src/quota.rs`) |
 | RM counters | counted only when RM said NV_OK, at most 4,096 keys (`device/src/tally.rs`) |
 | logs | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
-| channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used at most 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
+| channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used fewer than 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
 | display caps | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth ("The window's size and share"); a mapping is charged to whoever opened the file it is armed on |
 | Wayland caps | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools (the last sixteenth kept for processes holding at most a sixty-fourth), shared by all its connections. In the guest daemon, per client process: a quarter of the descriptors it may hold for clients (its hard limit less 60) and of 64 MiB of stream-sink data, the last eighth of each kept for processes holding little. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
@@ -1100,7 +1101,9 @@ jailer (chrooted into a jail image built for the run, a mount namespace of
 its own, no supplementary groups, no_new_privs). The backend's socket is
 0660 in the slot's group, so the VMM reaches it and nobody else does. Both
 run in network namespaces of their own. A slot is free when no launcher
-holds its lock and neither user has a live process. Where there is no pool
+holds its lock, neither user has a live process, and `contrib/systemd`'s
+socket unit for VM N is not listening (the units use the same users and
+take no lock: start one only for a slot no launcher holds). Where there is no pool
 the launcher falls back to the one user `nvgpu`, and without a jailer to a
 root VMM, each with a warning. A uid of its own per VM separates two VMs'
 host processes by the kernel's oldest rules, independent of anything this
@@ -1195,13 +1198,18 @@ for a single desktop (VD-H1).
   the binaries (the jailer and virtiofsd too), kernel, rootfs, share, jail
   image and logs directory, and every directory above them, must be root's
   and writable by no one else (a sticky one aside), and are used by their
-  resolved paths; every library it puts in the VMM's jail must be root's;
+  resolved paths, the launcher's own pieces too; every library it puts in
+  the VMM's jail must be root's. Nothing it creates is writable by others,
+  whatever umask it was started with (it ORs in 022): not the VMM's config
+  between writing it and the VMM reading it, and not the backend's socket
+  before it is opened to the slot's group;
 - starts again under `env -i` with its own variables (`RUST_LOG`, `TERM`,
   `NESBOX_VIRTIOFSD`, checked as a path, the two the desktop warnings read)
   and a PATH of root's directories. The first shell still runs with what
   sudo let through: keep sudo's `env_reset`;
-- takes a slot only when neither of its users runs anything, holds the
-  slot's lock, and kills nothing by pattern. A pool run's files carry its
+- takes a slot only when neither of its users runs anything and no
+  systemd socket unit listens for it, holds the slot's lock, and kills
+  nothing by pattern. A pool run's files carry its
   slot (`<tag>.vmN`), and a run whose `<tag>.json` another live run holds is
   refused, in every mode;
 - runs the backend through `setpriv` with no capabilities and
@@ -1227,7 +1235,10 @@ deploy`).
 helper's socket, and two VMM templates (`nvgpu-vmm-nesbox@.service`, the
 jailer as root and the unit's network namespace; `nvgpu-vmm-crosvm@.service`,
 `nvgpu-vmmN` with its sandbox on, so no `RestrictNamespaces=`). A VMM unit
-says `BindsTo=` its backend, so it stops with it.
+says `BindsTo=` its backend, so it stops with it. Both set
+`LockPersonality=`, `RestrictSUIDSGID=` and `SystemCallArchitectures=native`,
+and the nesbox one `ProtectKernelModules=` and `ProtectKernelLogs=`; neither
+has run on hardware.
 
 The backend's unit runs it as `nvgpu-vmN` with no capabilities, in a cgroup
 of its own (`MemoryMax`, `MemorySwapMax=0`, `TasksMax`,
@@ -1251,9 +1262,13 @@ uidBase+2N and uidBase+2N+1, group uidBase+2N), and its assertions refuse: a
 helper uid of any slot or of a login user; a helper group that does not
 exist, is a pool or shared group, or holds anyone but the helper; one helper
 or group for two VMs; anyone else in a slot's group; pool users with other
-groups; another user on a pool id. `checks.module-eval` tries each with a
-configuration it must refuse, and compares the units it installs with
-`contrib/systemd`'s. The Wayland flags come from the environment file
+groups; another user on a pool id; a flag with whitespace, a quote, a
+backslash or a `%` (systemd would split, unquote or expand it on the way to
+the backend), and a Wayland socket path with any of those or a colon.
+`checks.module-eval` tries each with a configuration it must refuse,
+compares the units it installs with `contrib/systemd`'s, and holds each
+drop-in to the keys and variables that are per slot, every assignment of an
+`Environment=` line included. The Wayland flags come from the environment file
 (`$NVGPU_WAYLAND_ARGS` beside `$NVGPU_BACKEND_ARGS`; `vms.<n>.wayland`), since
 systemd lets `EnvironmentFile=` override `Environment=`.
 
@@ -2074,7 +2089,8 @@ replaces to the same strength:
   driver). Anything else goes synchronously and gets the host's own error,
   so a process still sees every failure it would natively. The backend's
   accounting is unchanged, since what it receives is unchanged; a posted
-  request that fails there anyway is logged and counted (`posted_failed`).
+  request the host fails anyway is logged and counted by the guest's
+  transport (`posted_failed`, `driver/nvgpu_xfer.c`).
 - *The pump waits on an armed RM descriptor with `poll(2)`, and on an
   unarmed one not at all* (`pump.rs Pump::wait`). Such descriptors used to
   sit in the pump's epoll set whether armed or not, and a Vulkan game's
@@ -2088,7 +2104,9 @@ replaces to the same strength:
   too, so every event RM clears is one the pump reports. An unarmed
   descriptor's events stay in RM, where the next arm finds them. What is
   polled, and on whose behalf, is as before: the guest's own handles, only
-  while it waits on them.
+  while it waits on them. At most 256 such watches of a VM are kept out of
+  epoll (`POLLED_MAX`), so that no wake costs thousands of polls; any past
+  that are in the epoll set for their life, as all were before.
 
 ---
 

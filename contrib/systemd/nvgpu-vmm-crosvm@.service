@@ -6,8 +6,9 @@
 # has run crosvm only unprivileged, as the desktop user.
 #
 # In /etc/virtio-nvgpu/vmmN.env, the rest of crosvm's command line, one word
-# per option and value (systemd splits the variable at whitespace and takes
-# no quotes; -p may be given once per kernel parameter), the kernel last:
+# per option and value (systemd splits the variable at whitespace, and a
+# quote in it quotes rather than being passed on; -p may be given once per
+# kernel parameter), the kernel last:
 #   NVGPU_CROSVM_ARGS=--cpus 4 --mem 4096 --block path=/var/lib/virtio-nvgpu/vm0/rootfs.ext4 -p root=/dev/vda -p rw /var/lib/virtio-nvgpu/vmlinux
 # The disk must be nvgpu-vmmN's to write.
 #
@@ -43,8 +44,18 @@ TimeoutStopSec=30
 # A VMM that must never beat the desktop to a CPU: a lower weight, or a
 # slice of its own (SECURITY.md, "Frame pacing").
 #CPUWeight=50
+# A VMM its guest has taken over can grow any file it can write -- the
+# disk above all -- with ftruncate or fallocate until the file system is
+# full. RLIMIT_FSIZE bounds that, but also every memfd crosvm sizes: set it
+# no lower than the largest of the disk, guest RAM and the window.
+#LimitFSIZE=
 PrivateNetwork=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
+# Syscall-level only: nothing that mounts over /proc, which a /proc mounted
+# again inside minijail's user namespaces would then be refused.
+LockPersonality=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
