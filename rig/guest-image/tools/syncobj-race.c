@@ -209,6 +209,17 @@ static void owner_round(struct owner *o, uint64_t seq) {
     struct syncobj_eventfd e = {.handle = h, .point = base + 2, .fd = efd};
 
     r = io(IOC_EVENTFD, &e);
+    /*
+     * With guessers about, a subscription whose syncobj a guesser destroyed
+     * before its point was signalled never fires; the syncobj lives on
+     * (exported, so imported: the backend cannot tell it is unreachable),
+     * and so does its host registration, charged to this process until the
+     * file closes. After 256 of those the process's share is spent and
+     * SYNCOBJ_EVENTFD says -ENOMEM, the kernel's own answer when it cannot
+     * make an entry -- this process's doing, and no other's.
+     */
+    if (r == -ENOMEM && !o->strict)
+      goto out;
     if (r) {
       if (o->strict || (r != -EINVAL && r != -ENOENT))
         fail("owner %u: SYNCOBJ_EVENTFD on its handle %u: %d", o->id, h, r);
