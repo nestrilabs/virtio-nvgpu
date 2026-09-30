@@ -322,6 +322,18 @@ asks for it:
   (SECURITY.md, "The RM allowlist", and the application pass in its
   review history).
 
+**Opt-in groups** (`RM_GROUPS`, `--rm-allow-group`): named sets of controls
+and classes a deployment may add, none by default. `render` gives each
+release every group, with each member it has and serves an unprivileged
+caller at its measured size (`Release::groups`), and fails if a member is on
+the default list already, names a host field its gate does not force, or
+holds a pointer gen/rmctrl does not list. The backend lets a member through
+only with its group named, and only past its rule in
+`device/src/rmgroup.rs` (SECURITY.md, "Opt-in RM groups").
+`GUEST_SEGMENTED` in `rmctrl_extract.py` puts the debug group's two
+single-pointer controls in the guest's deep-segment table, so their buffer is
+sized by RM's rule.
+
 Controls RM hands to GSP-RM without a CPU-side table -- the GSS legacy ones
 (bit 15 of the command) and every control of an NV2081_BINAPI object -- have
 no name or size in the open sources; only the observed ones are allowed, by

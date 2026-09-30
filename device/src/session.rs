@@ -74,6 +74,11 @@ pub struct BackendConfig {
     /// (BCAP_OS_DESC). Off by default: graphics, video and display need none
     /// of them (SECURITY.md, "Compute").
     pub allow_compute: bool,
+    /// Fault memory registered by its pages in with one MADV_POPULATE_*
+    /// before RM pins it (`--osdesc-populate on`, osdesc.rs), instead of
+    /// leaving it to the pin page by page. Off by default: on the rig it
+    /// made registration slower, not faster (DEPLOY.md, "Backend flags").
+    pub osdesc_populate: bool,
 }
 
 impl BackendConfig {

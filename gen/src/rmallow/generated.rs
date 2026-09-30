@@ -16,6 +16,19 @@ pub struct Control {
     pub size: Option<u32>,
 }
 
+/// What one opt-in group (`--rm-allow-group`) adds to a release's list:
+/// its controls, at RM's size, and its classes, each sorted. A member
+/// the release lacks is not here.
+#[derive(Debug)]
+pub struct Group {
+    pub name: &'static str,
+    pub controls: &'static [Control],
+    pub classes: &'static [u32],
+}
+
+/// Every opt-in group, by name (sorted); each release lists them all.
+pub static GROUP_NAMES: &[&str] = &["debug", "health", "memacct", "profiling", "thermal"];
+
 /// One release's allowlist.
 #[derive(Debug)]
 pub struct Release {
@@ -36,6 +49,9 @@ pub struct Release {
     /// How many controls and classes the release exports in all.
     pub total_controls: usize,
     pub total_classes: usize,
+    /// The opt-in groups, in GROUP_NAMES order: none of it is allowed
+    /// unless the backend was started with the group.
+    pub groups: &'static [Group],
 }
 
 /// The escapes' own blocks (nvos.h), the same in every release measured
@@ -481,6 +497,65 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[0xc96f, 0xca6f, 0xcab5, 0xcd40, 0xce97, 0xcec0, 0xcfb0, 0xcfb7, 0xcffa],
         total_controls: 1132,
         total_classes: 145,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                ],
+                classes: &[
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
     Release {
         version: (580, 178, 4),
@@ -834,6 +909,71 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[],
         total_controls: 1357,
         total_classes: 209,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                    Control { cmd: 0xb0cc0115, size: Some(124) }, // NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL
+                    Control { cmd: 0xb0cc0116, size: Some(194) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING
+                    Control { cmd: 0xb0cc0119, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_CCU_PROF
+                    Control { cmd: 0xb0cc011a, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_CCU_PROF
+                ],
+                classes: &[
+                    0xb1cc, // MAXWELL_PROFILER_CONTEXT
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                    Control { cmd: 0x20800513, size: Some(1432) }, // NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
     Release {
         version: (595, 71, 5),
@@ -1187,6 +1327,71 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[],
         total_controls: 1349,
         total_classes: 209,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                    Control { cmd: 0xb0cc0115, size: Some(124) }, // NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL
+                    Control { cmd: 0xb0cc0116, size: Some(194) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING
+                    Control { cmd: 0xb0cc0119, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_CCU_PROF
+                    Control { cmd: 0xb0cc011a, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_CCU_PROF
+                ],
+                classes: &[
+                    0xb1cc, // MAXWELL_PROFILER_CONTEXT
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                    Control { cmd: 0x20800513, size: Some(1432) }, // NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
     Release {
         version: (595, 99, 2),
@@ -1540,6 +1745,71 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[],
         total_controls: 1349,
         total_classes: 209,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                    Control { cmd: 0xb0cc0115, size: Some(124) }, // NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL
+                    Control { cmd: 0xb0cc0116, size: Some(194) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING
+                    Control { cmd: 0xb0cc0119, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_CCU_PROF
+                    Control { cmd: 0xb0cc011a, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_CCU_PROF
+                ],
+                classes: &[
+                    0xb1cc, // MAXWELL_PROFILER_CONTEXT
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                    Control { cmd: 0x20800513, size: Some(1432) }, // NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
     Release {
         version: (610, 57, 4),
@@ -1896,6 +2166,72 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[],
         total_controls: 1370,
         total_classes: 222,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                    Control { cmd: 0x00003d0e, size: Some(1032) }, // NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                    Control { cmd: 0xb0cc0115, size: Some(124) }, // NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL
+                    Control { cmd: 0xb0cc0116, size: Some(194) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING
+                    Control { cmd: 0xb0cc0119, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_CCU_PROF
+                    Control { cmd: 0xb0cc011a, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_CCU_PROF
+                ],
+                classes: &[
+                    0xb1cc, // MAXWELL_PROFILER_CONTEXT
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                    Control { cmd: 0x20800513, size: Some(1432) }, // NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
     Release {
         version: (615, 71, 9),
@@ -2254,6 +2590,73 @@ pub static RELEASES: &[Release] = &[
         unserved_classes: &[],
         total_controls: 1389,
         total_classes: 224,
+        groups: &[
+            Group {
+                name: "debug",
+                controls: &[
+                    Control { cmd: 0x83de0307, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_MMU_DEBUG
+                    Control { cmd: 0x83de0315, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_READ_MEMORY
+                    Control { cmd: 0x83de0316, size: Some(24) }, // NV83DE_CTRL_CMD_DEBUG_WRITE_MEMORY
+                    Control { cmd: 0x83de031f, size: Some(4) }, // NV83DE_CTRL_CMD_DEBUG_SET_MODE_ERRBAR_DEBUG
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "health",
+                controls: &[
+                    Control { cmd: 0x20800133, size: Some(8) }, // NV2080_CTRL_CMD_GPU_QUERY_ECC_CONFIGURATION
+                    Control { cmd: 0x20800157, size: Some(0) }, // NV2080_CTRL_CMD_GPU_QUERY_INFOROM_ECC_SUPPORT
+                    Control { cmd: 0x20801322, size: Some(2056) }, // NV2080_CTRL_CMD_FB_GET_OFFLINED_PAGES
+                    Control { cmd: 0x90e70113, size: Some(16) }, // NV90E7_CTRL_CMD_BBX_GET_LAST_FLUSH_TIME
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "memacct",
+                controls: &[
+                    Control { cmd: 0x00003d0e, size: Some(1032) }, // NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_LIMITS
+                    Control { cmd: 0x00003d0f, size: Some(4) }, // NV0000_CTRL_OS_UNIX_CMD_MEMACCT_GET_IMPL
+                ],
+                classes: &[
+                ],
+            },
+            Group {
+                name: "profiling",
+                controls: &[
+                    Control { cmd: 0xb0cc0101, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0102, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_HWPM_LEGACY
+                    Control { cmd: 0xb0cc0103, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0104, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_PM_AREA_SMPC
+                    Control { cmd: 0xb0cc0105, size: Some(56) }, // NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM
+                    Control { cmd: 0xb0cc0106, size: Some(4) }, // NVB0CC_CTRL_CMD_FREE_PMA_STREAM
+                    Control { cmd: 0xb0cc0107, size: Some(0) }, // NVB0CC_CTRL_CMD_BIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0108, size: Some(0) }, // NVB0CC_CTRL_CMD_UNBIND_PM_RESOURCES
+                    Control { cmd: 0xb0cc0109, size: Some(48) }, // NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT
+                    Control { cmd: 0xb0cc010a, size: Some(3980) }, // NVB0CC_CTRL_CMD_EXEC_REG_OPS
+                    Control { cmd: 0xb0cc010d, size: Some(4) }, // NVB0CC_CTRL_CMD_GET_TOTAL_HS_CREDITS
+                    Control { cmd: 0xb0cc010e, size: Some(256) }, // NVB0CC_CTRL_CMD_SET_HS_CREDITS
+                    Control { cmd: 0xb0cc010f, size: Some(256) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS
+                    Control { cmd: 0xb0cc0115, size: Some(124) }, // NVB0CC_CTRL_CMD_GET_CHIPLET_HS_CREDIT_POOL
+                    Control { cmd: 0xb0cc0116, size: Some(194) }, // NVB0CC_CTRL_CMD_GET_HS_CREDITS_MAPPING
+                    Control { cmd: 0xb0cc0119, size: Some(1) }, // NVB0CC_CTRL_CMD_RESERVE_CCU_PROF
+                    Control { cmd: 0xb0cc011a, size: Some(0) }, // NVB0CC_CTRL_CMD_RELEASE_CCU_PROF
+                ],
+                classes: &[
+                    0xb1cc, // MAXWELL_PROFILER_CONTEXT
+                    0xb2cc, // MAXWELL_PROFILER_DEVICE
+                ],
+            },
+            Group {
+                name: "thermal",
+                controls: &[
+                    Control { cmd: 0x20800513, size: Some(1432) }, // NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2
+                ],
+                classes: &[
+                ],
+            },
+        ],
     },
 ];
 

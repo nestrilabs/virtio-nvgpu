@@ -42,6 +42,15 @@
 #
 # Environment (all optional):
 #   NVGPU_COMPUTE=1     the same as --allow-compute
+#   NVGPU_RM_ALLOW_GROUP  opt-in RM allowlist groups, comma-separated
+#                       (the backend's --rm-allow-group: thermal, health,
+#                       memacct, debug, profiling; none by default; debug
+#                       and profiling need compute; SECURITY.md, "Opt-in RM
+#                       groups")
+#   NVGPU_OSDESC_POPULATE=1  fault registered guest memory in with one
+#                       MADV_POPULATE before RM pins it, not page by page
+#                       inside the pin (the backend's --osdesc-populate on;
+#                       off by default: no faster on the rig)
 #   NVGPU_WINDOW_MIB    the shared window in MiB (the backend's --window-size;
 #                       default 1024, a multiple of 64); the VMM takes the size
 #                       from the backend -- nesbox from virtio-nvgpu-v4, which

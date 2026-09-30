@@ -141,6 +141,38 @@ impl HostSpan {
         )
     }
 
+    /// Fault every page of the span into this process now, for writing if
+    /// `write` (MADV_POPULATE_WRITE, else MADV_POPULATE_READ; Linux 5.14):
+    /// what a pin of it would fault in one page at a time. A kernel without
+    /// them answers EINVAL, and the pin then does the faulting as before.
+    pub fn populate(&self, write: bool) -> io::Result<()> {
+        // <linux/mman.h>; not in every libc crate release.
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        const MADV_POPULATE_WRITE: libc::c_int = 23;
+        if self.len == 0 {
+            return Ok(());
+        }
+        let page = PAGE as u64;
+        // madvise takes a page-aligned start; the span's first page is
+        // mapped as a whole (it is part of a mapping).
+        let start = self.base & !(page - 1);
+        let len = (self.base + self.len as u64 - start) as usize;
+        let advice = if write {
+            MADV_POPULATE_WRITE
+        } else {
+            MADV_POPULATE_READ
+        };
+        // SAFETY: madvise with a populate advice only faults pages in; the
+        // range lies in mappings `keep` holds for as long as `self` lives,
+        // and it reads or writes no memory through a Rust reference.
+        let r = unsafe { libc::madvise(start as *mut libc::c_void, len, advice) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// The regions of guest RAM the vhost-user memory table gave, as
     /// `(guest-physical start, span, backing file and offset)`: vm-memory
     /// keeps each region mapped for as long as `mem` lives, and every span
@@ -637,6 +669,61 @@ mod tests {
         assert_eq!(w.read_u32(PAGE as u64), 0, "the window's own memfd");
         // Inside it, the same dma-buf maps.
         r.map_file(PAGE, PAGE, &d, 0, false).unwrap();
+    }
+
+    /// Pages of a span present in this process's page tables, of `n`
+    /// (/proc/self/pagemap, bit 63; mincore says only whether the file has
+    /// the page).
+    fn resident(span: &HostSpan, n: usize) -> usize {
+        use std::os::unix::fs::FileExt;
+        let map = std::fs::File::open("/proc/self/pagemap").unwrap();
+        let mut v = vec![0u8; 8 * n];
+        map.read_exact_at(&mut v, span.addr() / PAGE as u64 * 8)
+            .unwrap();
+        v.chunks(8)
+            .filter(|e| u64::from_le_bytes((*e).try_into().unwrap()) >> 63 != 0)
+            .count()
+    }
+
+    /// The OS-descriptor range a guest registers (osdesc.rs) is faulted in
+    /// whole by `populate`, for writing only where it is mapped writable:
+    /// read-only guest memory stays read-only.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create")]
+    fn populate_faults_a_span_in_with_its_own_writability() {
+        const N: usize = 64;
+        let f = super::super::fd::memfd(c"t", libc::MFD_CLOEXEC).unwrap();
+        super::super::fd::ftruncate(&f, (N * PAGE) as u64).unwrap();
+        for writable in [true, false] {
+            let r = Arc::new(Reservation::new(N * PAGE).unwrap());
+            r.map_file(0, N * PAGE, &f, 0, writable).unwrap();
+            let span = r.span();
+            assert_eq!(resident(&span, N), 0, "a fresh mapping has nothing in");
+            match span.populate(writable) {
+                Ok(()) => assert_eq!(resident(&span, N), N),
+                // Before Linux 5.14: the pin faults them in, as without.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    eprintln!("populate: this kernel has no MADV_POPULATE_*");
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            if !writable {
+                assert!(
+                    span.populate(true).is_err(),
+                    "a read-only mapping is not faulted in for writing"
+                );
+            }
+        }
+        assert!(r_empty().populate(true).is_ok());
+    }
+
+    fn r_empty() -> HostSpan {
+        HostSpan {
+            base: 0,
+            len: 0,
+            keep: Arc::new(()),
+        }
     }
 
     #[test]

@@ -128,7 +128,7 @@ each call is validated:
 | entry point | host has | what reaches the host |
 |---|---|---|
 | **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Only on GPU and control handles (`v1_route`, `device/src/nvidia/v1.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused**, and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
-| **RM_CONTROL** commands | 1,370 controls | **Allow-listed** per release ("The RM allowlist"): 216 of 1,370 (and 30 GSP pass-through numbers seen on hardware) reach RM; the rest are answered NOT_SUPPORTED, or INVALID_PARAM_STRUCT for a size other than RM's, without RM. 3 controls whose pointers the tables cannot name one by one are **refused** whatever the list says (none is on it). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. NV0000's OS_UNIX controls (0x3dxx): the six that name a control file by descriptor (export, import, export info) get the backend's descriptor of the caller's own control file, and any other number is **refused** (EBADF), as is a descriptor field too short to hold; MEMACCT's cgroup descriptor and every OS_UNIX command RM does not define are answered NOT_SUPPORTED without RM (R1). |
+| **RM_CONTROL** commands | 1,370 controls | **Allow-listed** per release ("The RM allowlist"): 216 of 1,370 (and 30 GSP pass-through numbers seen on hardware) reach RM; the rest are answered NOT_SUPPORTED, or INVALID_PARAM_STRUCT for a size other than RM's, without RM. 3 controls whose pointers the tables cannot name one by one are **refused** whatever the list says (none is on it). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. NV0000's OS_UNIX controls (0x3dxx): the six that name a control file by descriptor (export, import, export info) get the backend's descriptor of the caller's own control file, and any other number is **refused** (EBADF), as is a descriptor field too short to hold; MEMACCT's cgroup descriptor and every OS_UNIX command RM does not define are answered NOT_SUPPORTED without RM (R1). `--rm-allow-group` (none by default) adds named groups, each member held to a rule of its own before RM ("Opt-in RM groups"). |
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | **Allow-listed** per release ("The RM allowlist"): 97 of 222 reach RM, on RM_ALLOC, ALLOC_MEMORY, ALLOC_OBJECT, ALLOC_CONTEXT_DMA2 and by VID_HEAP_CONTROL function; the rest are answered INVALID_CLASS without RM. **12 are refused** on RM_ALLOC, ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 whatever the list says (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`), and ALLOC_MEMORY refuses the four of them whose `pMemory` RM reads (`REFUSED_ALLOC_MEMORY_CLASSES`). An NV01_EVENT is held to both as the subclass its parameters name, which RM allocates in its place (`rm_alloc_class`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event and a header buffer of the caller's (`hBufferHeader`): one RM allocates itself comes back with its pages' host physical addresses. |
 | **RM_SHARE, RM_DUP_OBJECT, and a second client named in parameters** | NV04 share and dup; 2 NV0000 share controls; 7 classes and 21 controls that name another client | Shares go to RM only when they narrow or grant inside the VM; the rest are **refused**. A duplicate's two clients must be this VM's, made by one guest process, unless the source was shared with the destination (RM's rule, guest processes for the backend's). A second client named in class or control parameters must be this VM's and pass RM's rule for that field, with guest processes and euids. A guest that does not say which process and euid make each call gets neither. Below, "RM objects between guest processes". |
 | **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | With an address alone, **refused**. Without `--allow-compute`, with pages too. With it, and the guest-physical pages behind it (BCAP_OS_DESC), **table-sized**: only the user-virtual-address descriptor type, a page list covering exactly what RM pins, every page in guest RAM, and RM handed the backend's own mapping of exactly those pages (below). |
@@ -367,6 +367,63 @@ closed: it gets no duplicate between two clients except by a recorded grant,
 and names no client but the caller's own (logged once a session). One that
 says the process but not the euid has every token rule held to the process.
 
+### Opt-in RM groups
+
+`--rm-allow-group NAME[,NAME...]` adds named groups of controls and classes
+to "The RM allowlist", none by default: with no group named the list and
+every answer are as above. Each group's members are measured per release
+like the rest (`RM_GROUPS` in `gen/rmallow_extract.py`; a member a release
+lacks, or serves only to a privileged caller, is not added there), held to
+the same rules -- RM serves it to an unprivileged caller, its size is RM's,
+every pointer RM follows in it is one gen/rmctrl measured -- and then to a
+rule of its own in `device/src/rmgroup.rs`, checked on every host before RM
+is asked; a refusal is RM's status in the block, logged with its reason.
+None of it reaches DEFERRED_API. The start-up line after the tables names
+the groups served and what each adds on the host's release. They came from
+comparing the list with gVisor's nvproxy (its master at `5f20848`), which
+serves most of them to every container with the compute or utility
+capability; where gVisor's handling is stricter, so is this.
+
+| group | members | what reaches RM, and to whom | what still holds |
+|---|---|---|---|
+| `thermal` | THERMAL_SYSTEM_EXECUTE_V2 (580 and later) | the GPU's temperatures and sensor ranges, to every guest process: a reading of load that other tenants' work moves, as natively for any host process | only the eight read opcodes ctrl2080thermal.h defines (targets, providers, sensors and their ranges, GET_STATUS_SENSOR_READING) in at most 32 instructions; API version 1.0 and RM's instruction size, because RM hands a call with any other to GSP-RM whole (`subdeviceCtrlCmdThermalSystemExecuteV2_IMPL`), where an opcode the header does not name could be a set |
+| `health` | QUERY_INFOROM_ECC_SUPPORT, QUERY_ECC_CONFIGURATION, FB_GET_OFFLINED_PAGES, BBX_GET_LAST_FLUSH_TIME | nvidia-smi -q's ECC mode, InfoROM, retired pages and black-box flush time: the host GPU's health, to every guest process | read only, no field of the guest's reaches RM but the size. The other `nvidia-smi -q` queries the default list refuses (GET_PIDS, GET_PID_INFO, PERFMON_UTIL_SAMPLES, ECC_GET_CLIENT_EXPOSED_COUNTERS, FB_GET_REMAPPED_ROWS, three GSS legacy numbers) name host processes or are not served by gVisor either, and stay refused |
+| `memacct` | MEMACCT_GET_LIMITS (610 and later), MEMACCT_GET_IMPL (615) | the GPU memory limits and usage of the backend's own cgroup: this VM's, with the units | `cgroupFd` is always NV0000_CTRL_CMD_OS_UNIX_MEMACCT_CURRENT_PROCESS (-1) for RM, and the caller reads back its own value, as gVisor does: no guest number names a descriptor in the backend. SET_LIMITS stays refused |
+| `debug` | GT200_DEBUGGER's SET_MODE_MMU_DEBUG, SET_MODE_ERRBAR_DEBUG, READ_MEMORY, WRITE_MEMORY | a debugger's reads and writes of memory objects of its own client, and its debug modes, for cuda-gdb and compute-sanitizer; needs `--allow-compute` | the call's client made by the calling guest process (rmshare.rs's Process rule; the debugged client was held to RM's DEBUG rule when the debugger was made); the buffer a deep segment of exactly `length` bytes, which the backend relocates and deepseg.rs sizes by RM's own rule; `length` at most 256 KiB (RM takes up to 4 GiB, gVisor caps it at 1 GiB); and RM asked the memory's class first (CLIENT_GET_HANDLE_INFO, on the same file, under the same hold of the backend's lock): only NV01_MEMORY_SYSTEM and NV01_MEMORY_LOCAL_USER, and for reads memory registered by its pages. RM itself reads and writes through any Memory object here (`_nv83deCtrlCmdDebugAccessMemory`), NV01_MEMORY_LOCAL_PRIVILEGED -- the GPU's register aperture, on the default list for Vulkan -- included, and would write registered pages the guest mapped read-only. The modes act on the debugged context; whether GSP-RM keeps them to it is not in the open sources |
+| `profiling` | NVB0CC's reservations, PMA streams, bind, credits and EXEC_REG_OPS; MAXWELL_PROFILER_CONTEXT, MAXWELL_PROFILER_DEVICE; needs `--allow-compute` | performance counters of the caller's own context, for Nsight and CUPTI | a device profiler only with a context to bind to, of a client of the calling process (a device-wide one counts every tenant's work); every HWPM, SMPC and CCU reservation and every PMA stream context-switched; no PMA wait (RM spins for its whole GPU timeout); a PMA stream only into system or video memory of the caller's client (the class asked as for `debug`); EXEC_REG_OPS reads only, of the context's register image (the GR_CTX types). And RM's own rule on top: an unprivileged caller without CAP_PERFMON profiles nothing unless nvidia.ko was loaded with `NVreg_RmProfilingAdminOnly=0` (`profilerBaseQueryCapabilities_IMPL`) |
+
+**Left out, even as a knob.** Each of these is refused whatever group is
+named, because it cannot be held to the caller:
+
+- **Register writes** (EXEC_REG_OPS of a write op, and every GLOBAL, FB or
+  DEVICE register): GSP-RM decides whether a write stays in the context,
+  and its source is not published. A profiler that must program counters
+  by register write does not work under the group; one that reads them
+  from its PMA stream does.
+- **The event buffers** (NV_EVENT_BUFFER and its controls, the FECS and
+  video binds): their records are every context of the binder's uid
+  (`fecs_event_list.c`, `bAllUsers` off), which is every guest process of
+  the VM and every VM of that backend user.
+- **The power features and dynamic MMA boost** (NVB0CC and NV90CC
+  POWER_REQUEST_FEATURES, DISABLE_DYNAMIC_MMA_BOOST): GPU-wide clocks and
+  power, other tenants' performance.
+- **PC sampling, HES and the legacy GF100_PROFILER**: no context parameter
+  to hold them to.
+- **The debugger's EXEC_REG_OPS, READ/WRITE_SURFACE and batch memory
+  controls**: register operations, or a CPU pointer per operation with no
+  fixed place (gen/rmctrl refuses them).
+- **MEMACCT_SET_LIMITS**: a host cgroup's limits.
+
+**Tested.** `device/src/rmgroup/tests.rs`: every member has a rule at its
+measured size, and with no group nothing changes on any release; each rule
+through the backend against a test RM (a set opcode, another API version,
+the register aperture, another process's client, a length past the cap, a
+device-wide profiler and the rest refused, RM not asked; the forced cgroup
+descriptor). On the rig (595.99.02, RTX 5090), `rig/verify/sec-negative.c`
+T14-T16 with every group off and on: off, the allowlist's NOT_SUPPORTED;
+on, each refusal with its rule's status and RM not asked; and with
+`thermal` on, a temperature reading from the guest (48 C).
+
 ### Memory registered by its pages
 
 RM registers memory a caller already has by CPU address, and pins what that
@@ -388,7 +445,14 @@ bounds it:
   byte (`limit + 1` bytes on), in runs of whole pages, at most 8,192 runs and
   4 GiB, with the writability the call asks RM for; the backend maps
   read-only memory read-only. The caller's offset in its first page is kept,
-  and RM refuses an unaligned one as it does natively.
+  and RM refuses an unaligned one as it does natively. With
+  `--osdesc-populate on` (off by default), before RM pins them the backend
+  faults exactly those pages into its range with one madvise:
+  MADV_POPULATE_WRITE for a writable
+  registration, MADV_POPULATE_READ for a read-only one, which the kernel
+  refuses to fault for writing through a read-only mapping. The pages and
+  their writability are the pin's own, and madvise was on the sandbox's
+  syscall list already.
 - **Only a virtual address.** The descriptor type must be the user virtual
   address. A physical address, a page array, I/O memory, a dma-buf by
   descriptor and the kernel-only types are refused whatever came with them.

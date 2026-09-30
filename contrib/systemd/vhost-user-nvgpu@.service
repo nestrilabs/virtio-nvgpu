@@ -28,7 +28,9 @@
 # (DEPLOY.md, "Sizing the window": the VMM follows the size, and under
 # crosvm its MemoryMax must cover guest RAM plus the window), and one held
 # to 8 GiB of the GPU's video memory adds --vram-limit 8192 (DEPLOY.md,
-# "Video memory limit"). For capture
+# "Video memory limit"). Opt-in RM allowlist groups go there too, as
+#   NVGPU_BACKEND_ARGS="--rm-allow-group thermal,health"
+# (DEPLOY.md, "Opt-in RM groups"; none by default). For capture
 # injection (DEPLOY.md, "Capture injection") that file says
 #   NVGPU_BACKEND_ARGS="--inject-uid UID"
 # and vhost-user-nvgpu-inject@N.socket binds the helper's socket, open to

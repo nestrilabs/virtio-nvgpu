@@ -930,6 +930,175 @@ static void t_disable_rate(int ctl, uint32_t mine)
 		fail("disable channels, rate", how);
 }
 
+/* T14-T16: the opt-in RM groups (--rm-allow-group, device/src/rmgroup.rs).
+ * Which groups the backend serves is said on the guest's command line
+ * (nvgpu_rm_groups=a,b; rig/guest-image/probes/secneg.sh passes it on): a
+ * group not served is refused by the allowlist (NV_ERR_NOT_SUPPORTED); a
+ * served one's rule refuses before RM with its own status, which the test
+ * names. Each request below is sent on an object RM would answer
+ * differently (the subdevice is no debugger or profiler), so a status other
+ * than the one named means RM was asked. */
+#define NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2 0x20800513u
+#define NV83DE_CTRL_CMD_DEBUG_READ_MEMORY 0x83de0315u
+#define NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY 0xb0cc0101u
+#define NVB0CC_CTRL_CMD_EXEC_REG_OPS 0xb0cc010au
+#define NV01_MEMORY_LOCAL_PRIVILEGED 0x0000003fu
+#define MAXWELL_PROFILER_DEVICE 0x0000b2ccu
+#define NV_ERR_INVALID_ARGUMENT 0x1fu
+#define PRIV_HANDLE 0x3f000001u
+#define PROF_HANDLE 0xb2c00001u
+
+/* NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS (ctrl2080thermal.h). */
+typedef struct {
+	uint32_t result, executed, opcode;
+	uint32_t operands[8];
+} thermal_instr_t;
+
+typedef struct {
+	uint32_t clientAPIVersion, clientAPIRevision, clientInstructionSizeOf;
+	uint32_t executeFlags, successfulInstructions, instructionListSize;
+	thermal_instr_t instructionList[32];
+} thermal_params_t;
+
+_Static_assert(sizeof(thermal_params_t) == 1432, "RM's size");
+
+/* NV83DE_CTRL_DEBUG_READ_MEMORY_PARAMS. */
+typedef struct {
+	uint32_t hMemory, length;
+	uint64_t offset, buffer;
+} debug_memory_params_t;
+
+/* NVB0CC_CTRL_EXEC_REG_OPS_PARAMS, with NV2080_CTRL_GPU_REG_OP. */
+typedef struct {
+	uint8_t regOp, regType, regStatus, regQuad;
+	uint32_t regGroupMask, regSubGroupMask, regOffset;
+	uint32_t regValueHi, regValueLo, regAndNMaskHi, regAndNMaskLo;
+} reg_op_t;
+
+typedef struct {
+	uint32_t regOpCount, mode;
+	uint8_t bPassed, bDirect, _pad[2];
+	reg_op_t regOps[124];
+} reg_ops_params_t;
+
+_Static_assert(sizeof(reg_ops_params_t) == 3980, "RM's size");
+
+/* Whether the guest's command line says the backend serves `group`. */
+static int group_on(const char *group)
+{
+	static char line[4096];
+	if (!line[0]) {
+		FILE *f = fopen("/proc/cmdline", "r");
+		if (!f || !fgets(line, sizeof(line), f))
+			line[0] = ' ';
+		if (f)
+			fclose(f);
+	}
+	const char *g = strstr(line, "nvgpu_rm_groups=");
+	if (!g)
+		return 0;
+	g += strlen("nvgpu_rm_groups=");
+	size_t n = strlen(group);
+	while (*g && *g != ' ' && *g != '\n') {
+		if (!strncmp(g, group, n) && (g[n] == ',' || g[n] == ' ' || g[n] == '\n' || !g[n]))
+			return 1;
+		while (*g && *g != ',' && *g != ' ' && *g != '\n')
+			g++;
+		if (*g == ',')
+			g++;
+	}
+	return 0;
+}
+
+static int64_t control(int fd, uint32_t client, uint32_t object, uint32_t cmd, void *p, uint32_t size)
+{
+	nvos54_t c = {0};
+	c.hClient = client;
+	c.hObject = object;
+	c.cmd = cmd;
+	c.params = (uint64_t)(uintptr_t)p;
+	c.paramsSize = size;
+	if (ioctl(fd, NV_IOWR(NV_ESC_RM_CONTROL, sizeof(c)), &c) != 0)
+		return -1;
+	return c.status;
+}
+
+/* PASS when `st` is what the backend answers: `want` with `group` served,
+ * the allowlist's NV_ERR_NOT_SUPPORTED without it. */
+static void expect_group(const char *name, const char *group, int64_t st, uint32_t want)
+{
+	uint32_t expect = group_on(group) ? want : NV_ERR_NOT_SUPPORTED;
+	char how[128];
+	snprintf(how, sizeof(how), "group %s %s: status 0x%llx (want 0x%x)", group,
+		 group_on(group) ? "on" : "off", (long long)st, expect);
+	if (st == (int64_t)expect)
+		pass(name, how);
+	else
+		fail(name, how);
+}
+
+static void t_rm_groups(int ctl, uint32_t mine)
+{
+	if (!mine) {
+		skip("rm groups", "no client with a subdevice here");
+		return;
+	}
+	/* T14: a thermal instruction list with an opcode the header does not
+	 * name among read ones (RM would take it to GSP-RM), and one with the
+	 * temperature reading alone, which RM serves when the group is on. */
+	thermal_params_t th = {0};
+	th.clientAPIVersion = 1;
+	th.clientInstructionSizeOf = sizeof(thermal_instr_t);
+	th.instructionListSize = 2;
+	th.instructionList[0].opcode = 0x1500;
+	th.instructionList[1].opcode = 0x2000;
+	int64_t st = control(ctl, mine, SUB_HANDLE, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, &th, sizeof(th));
+	expect_group("thermal, a set opcode", "thermal", st, NV_ERR_INSUFFICIENT_PERMISSIONS);
+	th.instructionListSize = 1;
+	th.clientAPIVersion = 2;
+	st = control(ctl, mine, SUB_HANDLE, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, &th, sizeof(th));
+	expect_group("thermal, another API", "thermal", st, NV_ERR_INVALID_ARGUMENT);
+	th.clientAPIVersion = 1;
+	st = control(ctl, mine, SUB_HANDLE, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, &th, sizeof(th));
+	printf("  INFO  %-28s status 0x%llx, sensor 0 reads %d\n", "thermal, a reading", (long long)st,
+	       (int)th.instructionList[0].operands[1]);
+
+	/* T15: the debugger's memory read, of the GPU's register aperture
+	 * (NV01_MEMORY_LOCAL_PRIVILEGED, which RM lets any client make), and
+	 * past the length cap. */
+	int64_t made = alloc_object(ctl, mine, DEV_HANDLE, PRIV_HANDLE, NV01_MEMORY_LOCAL_PRIVILEGED, 0);
+	/* Room for the length past the cap: the guest module sends a deep
+	 * segment of `length` bytes from it whatever the backend then says. */
+	static uint8_t buf[(256u << 10) + 4096];
+	debug_memory_params_t dm = {PRIV_HANDLE, 64, 0, (uint64_t)(uintptr_t)buf};
+	if (made != 0) {
+		skip("debug, register aperture", "no NV01_MEMORY_LOCAL_PRIVILEGED here");
+	} else {
+		st = control(ctl, mine, SUB_HANDLE, NV83DE_CTRL_CMD_DEBUG_READ_MEMORY, &dm, sizeof(dm));
+		expect_group("debug, register aperture", "debug", st, NV_ERR_INSUFFICIENT_PERMISSIONS);
+	}
+	dm.length = (256u << 10) + 1;
+	st = control(ctl, mine, SUB_HANDLE, NV83DE_CTRL_CMD_DEBUG_READ_MEMORY, &dm, sizeof(dm));
+	expect_group("debug, past the cap", "debug", st, NV_ERR_INVALID_ARGUMENT);
+
+	/* T16: profiling -- a device-wide profiler, a reservation that is not
+	 * context-switched, a register write. RM refuses the first itself too
+	 * unless the host lets anyone profile (RmProfilingAdminOnly=0), so it
+	 * is shown, not judged; the backend's log says which refused it. */
+	st = alloc_object(ctl, mine, SUB_HANDLE, PROF_HANDLE, MAXWELL_PROFILER_DEVICE, 8);
+	printf("  INFO  %-28s status 0x%llx (0x1b: refused, 0x22: not served)\n",
+	       "profiling, device-wide", (long long)st);
+	uint8_t ctxsw = 0;
+	st = control(ctl, mine, SUB_HANDLE, NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY, &ctxsw, 1);
+	expect_group("profiling, not ctxsw", "profiling", st, NV_ERR_INSUFFICIENT_PERMISSIONS);
+	static reg_ops_params_t ro;
+	ro.regOpCount = 1;
+	ro.regOps[0].regOp = 1; /* WRITE_32 */
+	ro.regOps[0].regType = 1; /* GR_CTX */
+	st = control(ctl, mine, SUB_HANDLE, NVB0CC_CTRL_CMD_EXEC_REG_OPS, &ro, sizeof(ro));
+	expect_group("profiling, register write", "profiling", st, NV_ERR_INSUFFICIENT_PERMISSIONS);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -1022,6 +1191,8 @@ int main(int argc, char **argv)
 	/* T12, T13: stopping channels -- another process's, and too often. */
 	t_disable_other_process(ctl, mine);
 	t_disable_rate(ctl, mine);
+	/* T14-T16: the opt-in RM groups, on or off. */
+	t_rm_groups(ctl, mine);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)

@@ -71,6 +71,8 @@ pub struct FakeRm {
     next_client: u32,
     next_object: u32,
     seen: Vec<Call>,
+    /// The parameters of the last RM_CONTROL RM served, as it read them.
+    pub last_params: Vec<u8>,
     controls: Option<BTreeSet<u32>>,
     classes: Option<BTreeSet<u32>>,
     hook: Option<Hook>,
@@ -341,6 +343,36 @@ impl FakeRm {
     }
 }
 
+/// An RM_CONTROL RM served: its parameters, as RM read them, kept for the
+/// test ([`FakeRm::last_params`]); and CLIENT_GET_HANDLE_INFO's CLASSID
+/// answered from the tree, as cliresCtrlCmdClientGetHandleInfo_IMPL does.
+fn control_params(arg: &mut crate::sys::block::Arg<'_>) -> u32 {
+    let (b, mut others) = arg.split();
+    let (Some(client), Some(cmd), Some(p), Some(size)) = (
+        u32_at(b, NVOS54_H_CLIENT),
+        u32_at(b, NVOS54_CMD),
+        crate::le::u64_at(b, NVOS54_PARAMS),
+        u32_at(b, NVOS54_PARAMS_SIZE),
+    ) else {
+        return NV_OK;
+    };
+    let params = others.read(p, size as usize).unwrap_or_default();
+    let mut status = NV_OK;
+    if cmd == 0x0d02 && u32_at(&params, 4) == Some(2) {
+        let class = u32_at(&params, 0)
+            .and_then(|h| with(|rm| rm.object(client, h).ok()))
+            .map(|o| o.class);
+        match class {
+            Some(c) => {
+                others.write(p + 8, &u64::from(c).to_le_bytes());
+            }
+            None => status = NV_ERR_OBJECT_NOT_FOUND,
+        }
+    }
+    with(|rm| rm.last_params = params);
+    status
+}
+
 /// Where an escape's block holds its status.
 fn status_at(nr: u32) -> Option<(usize, usize)> {
     Some(match nr {
@@ -377,7 +409,15 @@ fn serve(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
     if hostfd::ioc_size(request) != size {
         return -libc::EINVAL;
     }
-    match with(|rm| rm.escape(nr, a)) {
+    let control = nr == NV_ESC_RM_CONTROL;
+    let mut status = with(|rm| rm.escape(nr, a));
+    if control && status == Some(NV_OK) {
+        status = Some(control_params(arg));
+    }
+    let Some(a) = arg.bytes().get_mut(..size) else {
+        return -libc::EINVAL;
+    };
+    match status {
         Some(status) => {
             put_u32(a, at, status);
             0
