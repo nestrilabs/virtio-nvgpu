@@ -96,6 +96,7 @@ struct nvgpu_req {
   bool completed;
   bool abandoned;
   bool dead; /* reclaimed after a device reset: never answered */
+  bool posted; /* nvgpu_xfer_post(): abandoned from the start */
 };
 
 /* ───────── Frame-pacing counters ───────── */
@@ -145,7 +146,8 @@ static int nvgpu_pace_get(char *buf, const struct kernel_param *kp) {
       "sowait_waits", "sowait_polls",  "sowait_sleeps",
       "sowait_woken", "sowait_naps",   "sowait_overcap",
       "ev_batches",   "ev_records",    "ev_legacy",
-      "ev_legacy_set", "rm_polls",     "rm_polls_ready"};
+      "ev_legacy_set", "rm_polls",     "rm_polls_ready",
+      "posted",       "posted_failed"};
   int n = 0, i;
 
   for (i = 0; i < NVGPU_PACE_TYPES; i++) {
@@ -634,6 +636,63 @@ static int __nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
 int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                struct nvgpu_tbuf *resp, u32 flags, u32 *used_len) {
   return __nvgpu_xfer(dev, req, resp, flags, used_len, NULL, NULL, NULL);
+}
+
+/*
+ * As __nvgpu_xfer() up to the ring, and then the caller walks away: the
+ * request is abandoned before it is added, so whichever path takes its
+ * answer off the ring -- the interrupt, a spinner, reclaim after a reset --
+ * hands it to the reaper (nvgpu_req_reap_work()), which frees it. Set under
+ * no lock, but before the add, which is made under xf->lock as every
+ * harvest is.
+ */
+int nvgpu_xfer_post(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
+                    struct nvgpu_tbuf *resp, u32 flags) {
+  struct nvgpu_xfer *xf = dev->xfer;
+  struct nvgpu_msg_hdr hdr;
+  struct nvgpu_req *r;
+  u64 t0 = 0;
+  u32 id;
+  int ret;
+
+  if (!xf)
+    return -ENODEV;
+  if (!req || !resp || req->len < sizeof(hdr) || !dev->v2 ||
+      (flags & NVGPU_XF_EXECUTOR))
+    return -EINVAL;
+  if (req->nents > xf->max_sg || resp->nents > xf->max_sg ||
+      req->len > dev->max_req)
+    return -E2BIG;
+
+  r = kzalloc(sizeof(*r), GFP_KERNEL);
+  if (!r)
+    return -ENOMEM;
+  r->dev = dev;
+  r->req = req;
+  r->resp = resp;
+  init_completion(&r->done);
+  INIT_WORK(&r->work, nvgpu_req_reap_work);
+  r->abandoned = true;
+  r->posted = true;
+
+  do {
+    id = (u32)atomic_inc_return(&xf->next_id);
+  } while (!id);
+  nvgpu_tbuf_read(req, 0, &hdr, sizeof(hdr));
+  hdr.req_id = cpu_to_le32(id);
+  nvgpu_tbuf_write(req, 0, &hdr, sizeof(hdr));
+  nvgpu_tbuf_zero(resp, 0, resp->len);
+
+  /* The reaper's reference, as an abandoning waiter takes one. */
+  __module_get(THIS_MODULE);
+  ret = nvgpu_xfer_enqueue(dev, r, flags, &t0);
+  if (ret) {
+    module_put(THIS_MODULE);
+    kfree(r);
+    return ret;
+  }
+  nvgpu_pace_inc(NVGPU_PACE_POSTED);
+  return 0;
 }
 
 /*
@@ -1213,6 +1272,36 @@ static unsigned int nvgpu_reap_osdesc(struct nvgpu_device *dev,
  * CREATE_LEASE, that is a host lessee holding a CRTC nobody can lease again.
  * So everything it names is closed here, from process context.
  */
+/*
+ * A posted request's answer. Its sender proved it could not fail (for a
+ * SYNCOBJ_DESTROY, that the file holds the handle), so a failure here means
+ * that proof was wrong and the guest process was told 0 for a call the host
+ * refused: worth a line, and a counter the pacing report shows. It makes
+ * nothing and consumes nothing, so there is nothing to release.
+ */
+static void nvgpu_reap_posted(struct nvgpu_device *dev, struct nvgpu_req *r,
+                              u32 used, const struct nvgpu_msg_hdr *qh,
+                              const struct nvgpu_msg_hdr *ah) {
+  s32 status = (s32)le32_to_cpu(ah->status), host = 0;
+  struct nvgpu_i2_rhead rh;
+
+  if (!status && le32_to_cpu(qh->msg_type) == NVGPU_MSG_IOCTL2) {
+    if (nvgpu_resp_has(used, 0, sizeof(rh)) &&
+        !nvgpu_tbuf_read(r->resp, 0, &rh, sizeof(rh)))
+      host = (s32)le32_to_cpu(rh.resp.ret);
+    else
+      host = -EPROTO;
+  }
+  if (!status && !host)
+    return;
+  nvgpu_pace_inc(NVGPU_PACE_POSTED_FAILED);
+  dev_warn_ratelimited(&dev->vdev->dev,
+                       "virtio-gpu-nv: posted request %u (msg_type %u) "
+                       "failed: status %d, host %d\n",
+                       le32_to_cpu(qh->req_id), le32_to_cpu(qh->msg_type),
+                       status, host);
+}
+
 static void nvgpu_req_reap(struct nvgpu_req *r) {
   struct nvgpu_device *dev = r->dev;
   u32 used = min_t(u32, r->used_len, r->resp->len);
@@ -1223,6 +1312,10 @@ static void nvgpu_req_reap(struct nvgpu_req *r) {
       nvgpu_tbuf_read(r->resp, 0, &ah, sizeof(ah)) ||
       nvgpu_tbuf_read(r->req, 0, &qh, sizeof(qh)))
     return;
+  if (r->posted) {
+    nvgpu_reap_posted(dev, r, used, &qh, &ah);
+    return;
+  }
   /*
    * A registration of the caller's pages, answered after its waiter left: the
    * pins it kept for it are this reply's to settle (nvgpu_osdesc.c). Before

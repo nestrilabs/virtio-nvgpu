@@ -898,6 +898,124 @@ static long nvgpu_fence_handle_to_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  * SIGNAL on a binary syncobj or TIMELINE_SIGNAL of the point on a timeline
  * (drm_syncobj.c:728-757 against :1560-1647), so that is what is sent.
  */
+/* ───────── SYNCOBJ_DESTROY, posted ───────── */
+
+/*
+ * A native SYNCOBJ_DESTROY fails only for a non-zero pad or a handle the
+ * file does not hold (-EINVAL; Linux 7.2.7, drivers/gpu/drm/drm_syncobj.c
+ * drm_syncobj_destroy_ioctl() and drm_syncobj_destroy()). NVIDIA's EGL and Vulkan Wayland paths destroy two
+ * syncobjs a frame, each a round trip the presenting thread waited for. So
+ * a DESTROY this file can prove will succeed is posted instead
+ * (nvgpu_xfer_post()): answered 0 at once, on the ring ahead of anything
+ * sent after it, and served by the backend exactly as a waited-for one --
+ * its registrations orphaned, its reply reaped. Anything else goes
+ * synchronously, as before, and gets the host's own answer.
+ *
+ * The proof is nfd->so_live: every handle this file was given by a
+ * SYNCOBJ_CREATE or a syncobj FD_TO_HANDLE and has not destroyed since.
+ * Invariant, in the ring's order: a handle in so_live is live on the host
+ * after every request already on the ring. It holds because
+ *
+ *  - a posted DESTROY takes its handle out of so_live and goes on the ring
+ *    in one step under so_lock, so no other DESTROY of the number can come
+ *    between the two: a concurrent one of the same number finds it gone,
+ *    goes synchronously, and is answered after the posted one ran, as
+ *    natively the second of two destroys fails;
+ *  - a synchronous DESTROY (of a handle so_live does not hold -- one that
+ *    was never ours, or one a create has not been noted for yet) runs under
+ *    so_lock too, and one that succeeds bumps so_sync;
+ *  - a create notes its handle only if so_sync has not moved since before it
+ *    was sent: if it has, a synchronous DESTROY may have taken the new
+ *    handle between the host's answer and the note, so the handle is left
+ *    out (a later DESTROY of it then goes synchronously, which is only
+ *    slower);
+ *  - nothing else destroys a handle of a live file: its close ends them all
+ *    together, and so_live with it.
+ *
+ * so_live may leave out handles that are live (it takes no memory to be
+ * wrong that way); it never holds one that is not.
+ */
+static u32 nvgpu_so_sync_seen(struct nvgpu_fd *nfd) {
+  return READ_ONCE(nfd->so_sync);
+}
+
+static void nvgpu_so_note(struct nvgpu_fd *nfd, u32 handle, u32 sync_seen) {
+  if (!handle)
+    return;
+  mutex_lock(&nfd->so_lock);
+  /* No memory is no proof: the handle then goes synchronously. */
+  if (nfd->so_sync == sync_seen)
+    xa_store(&nfd->so_live, handle, xa_mk_value(1), GFP_KERNEL);
+  mutex_unlock(&nfd->so_lock);
+}
+
+/* The DESTROY the interpreter would build -- the header, one buffer length,
+ * the 8-byte argument -- put on the ring without a waiter. */
+static int nvgpu_so_post_destroy(struct nvgpu_fd *nfd,
+                                 const struct drm_syncobj_destroy *a) {
+  struct nvgpu_device *dev = nfd->dev;
+  struct nvgpu_i2_head h;
+  struct nvgpu_tbuf *req, *resp;
+  __le32 blen = cpu_to_le32(sizeof(*a));
+  int ret;
+
+  BUILD_BUG_ON(sizeof(*a) != 8);
+  req = nvgpu_tbuf_alloc(sizeof(h) + 4 + sizeof(*a), GFP_KERNEL);
+  resp = nvgpu_tbuf_alloc(sizeof(struct nvgpu_i2_rhead) + sizeof(*a),
+                          GFP_KERNEL);
+  if (!req || !resp) {
+    ret = -ENOMEM;
+    goto fail;
+  }
+  nvgpu_i2_head_init(&h, nfd->handle, DRM_IOCTL_SYNCOBJ_DESTROY, nfd->handle,
+                     1, sizeof(*a));
+  ret = nvgpu_tbuf_write(req, 0, &h, sizeof(h));
+  if (!ret)
+    ret = nvgpu_tbuf_write(req, sizeof(h), &blen, 4);
+  if (!ret)
+    ret = nvgpu_tbuf_write(req, sizeof(h) + 4, a, sizeof(*a));
+  if (!ret)
+    ret = nvgpu_xfer_post(dev, req, resp, 0);
+  if (!ret)
+    return 0; /* the transport's now */
+fail:
+  if (req)
+    nvgpu_tbuf_free(req);
+  if (resp)
+    nvgpu_tbuf_free(resp);
+  return ret;
+}
+
+static long nvgpu_so_destroy(struct nvgpu_fd *nfd, void *karg) {
+  struct nvgpu_fence_call p = {.nfd = nfd};
+  struct drm_syncobj_destroy a;
+  long ret;
+
+  /* Read once: the handle whose subscribers go is the one destroyed. */
+  memcpy(&a, karg, sizeof(a));
+  mutex_lock(&nfd->so_lock);
+  if (!a.pad && a.handle && xa_erase(&nfd->so_live, a.handle)) {
+    ret = nvgpu_so_post_destroy(nfd, &a);
+    if (!ret) {
+      mutex_unlock(&nfd->so_lock);
+      nvgpu_sowait_forget(nfd, a.handle, false);
+      return 0;
+    }
+    /* Not sent (no memory, the device gone): still live, and the
+     * synchronous call below says what the host says. */
+    xa_store(&nfd->so_live, a.handle, xa_mk_value(1), GFP_KERNEL);
+  }
+  ret = nvgpu_fence_call(&p, nfd->handle, DRM_IOCTL_SYNCOBJ_DESTROY, &a, true);
+  if (!ret) {
+    WRITE_ONCE(nfd->so_sync, nfd->so_sync + 1);
+    xa_erase(&nfd->so_live, a.handle);
+  }
+  mutex_unlock(&nfd->so_lock);
+  if (!ret)
+    nvgpu_sowait_forget(nfd, a.handle, false);
+  return ret;
+}
+
 static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
                                      void *karg) {
   const u32 valid = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE |
@@ -905,6 +1023,7 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_fence_call p = {.nfd = nfd};
   struct drm_syncobj_handle a;
   struct file *held = NULL;
+  u32 sync_seen = 0;
   bool owned;
   long ret;
 
@@ -949,11 +1068,15 @@ static long nvgpu_fence_fd_to_handle(struct nvgpu_fd *nfd, unsigned int cmd,
     if (IS_ERR(held))
       return -EINVAL;
     p.has_in = true;
+    sync_seen = nvgpu_so_sync_seen(nfd);
   }
 
   ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
   if (held)
     fput(held);
+  /* A syncobj file imported: a new handle in this file. */
+  if (!ret && held)
+    nvgpu_so_note(nfd, a.handle, sync_seen);
   memcpy(karg, &a, sizeof(a));
   return ret;
 }
@@ -1025,18 +1148,16 @@ long nvgpu_fence_syncobj_ioctl(struct nvgpu_fd *nfd, struct drm_file *file,
     return nvgpu_fence_transfer(nfd, cmd, karg);
   case DRM_IOCTL_SYNCOBJ_EVENTFD:
     return nvgpu_fence_eventfd(nfd, cmd, karg);
-  case DRM_IOCTL_SYNCOBJ_DESTROY: {
-    struct drm_syncobj_destroy a;
-    long ret;
+  case DRM_IOCTL_SYNCOBJ_DESTROY:
+    return nvgpu_so_destroy(nfd, karg);
+  case DRM_IOCTL_SYNCOBJ_CREATE: {
+    u32 seen = nvgpu_so_sync_seen(nfd);
+    long ret = nvgpu_fence_call(&p, nfd->handle, cmd, karg, false);
 
-    /* Read once: the handle whose subscribers go is the one destroyed. */
-    memcpy(&a, karg, sizeof(a));
-    ret = nvgpu_fence_call(&p, nfd->handle, cmd, &a, true);
     if (!ret)
-      nvgpu_sowait_forget(nfd, a.handle, false);
+      nvgpu_so_note(nfd, ((struct drm_syncobj_create *)karg)->handle, seen);
     return ret;
   }
-  case DRM_IOCTL_SYNCOBJ_CREATE:
   case DRM_IOCTL_SYNCOBJ_RESET:
   case DRM_IOCTL_SYNCOBJ_SIGNAL:
   case DRM_IOCTL_SYNCOBJ_QUERY:

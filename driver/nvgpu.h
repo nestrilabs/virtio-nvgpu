@@ -341,6 +341,16 @@ struct nvgpu_fd {
    * than grow a second one (which would GEM_CLOSE it twice).
    */
   struct xarray gem_index;
+  /*
+   * DRM files only: syncobj handles this file's render handle is known to
+   * hold, so a SYNCOBJ_DESTROY of one can be posted rather than waited for
+   * (nvgpu_syncobj.c, "SYNCOBJ_DESTROY, posted"), and the count of
+   * synchronous DESTROYs that succeeded. Under so_lock; so_sync is read
+   * without it.
+   */
+  struct mutex so_lock;
+  struct xarray so_live;
+  u32 so_sync;
 };
 
 /*
@@ -546,6 +556,8 @@ enum nvgpu_pace_ctr {
   NVGPU_PACE_EV_LEGACY_SET, /* ... that set `pending` (it was clear) */
   NVGPU_PACE_POLLS,       /* poll()s of an RM descriptor */
   NVGPU_PACE_POLLS_READY, /* ... that took a pending report */
+  NVGPU_PACE_POSTED,      /* requests posted, no caller waiting (DESTROY) */
+  NVGPU_PACE_POSTED_FAILED, /* ... that the device answered with a failure */
   NVGPU_PACE_CTRS
 };
 void nvgpu_pace_inc(enum nvgpu_pace_ctr c);
@@ -1017,6 +1029,19 @@ int nvgpu_tbuf_zero(struct nvgpu_tbuf *tb, size_t off, size_t len);
  */
 int nvgpu_xfer(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
                struct nvgpu_tbuf *resp, u32 flags, u32 *used_len);
+
+/*
+ * Put one request on the ring and do not wait for its answer: 0 once it is
+ * there, the buffers then the transport's, which frees them when the device
+ * gives them back (and warns if the answer was a failure: a caller posts
+ * only what it has proven cannot fail). It keeps its place in the ring's
+ * order, ahead of everything anyone sends after it. On an error nothing was
+ * sent and the buffers are the caller's -- -EINTR too, unlike nvgpu_xfer().
+ * Only for a request that makes nothing and consumes nothing: no reply is
+ * read, so nothing in one would be taken up.
+ */
+int nvgpu_xfer_post(struct nvgpu_device *dev, struct nvgpu_tbuf *req,
+                    struct nvgpu_tbuf *resp, u32 flags);
 
 /*
  * One request from plain kernel buffers, for the fixed-size and v1 messages.

@@ -676,8 +676,11 @@ void nvgpu_fd_put(struct nvgpu_fd *nfd) {
   if (!refcount_dec_and_test(&nfd->ref))
     return;
   /* Before the memory goes: nvgpu_gem_handle_held() looks it up. */
-  if (nfd->device_type >= NVGPU_DEV_DRI_BASE)
+  if (nfd->device_type >= NVGPU_DEV_DRI_BASE) {
     xa_cmpxchg(&dev->renders, nfd->handle, nfd, NULL, 0);
+    xa_destroy(&nfd->so_live);
+    mutex_destroy(&nfd->so_lock);
+  }
   nvgpu_close_handle(dev, nfd->handle);
   /* RM clients the file held are gone, and what they registered with them. */
   nvgpu_osdesc_reap(dev);

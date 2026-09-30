@@ -918,6 +918,8 @@ static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   nfd->handle = le32_to_cpu(resp->hdr.handle);
   nfd->drm_file = file;
   xa_init(&nfd->gem_index);
+  mutex_init(&nfd->so_lock);
+  xa_init(&nfd->so_live);
   ret = xa_err(xa_store(&dev->renders, nfd->handle, nfd, GFP_KERNEL));
   if (ret) {
     nvgpu_close_handle(dev, nfd->handle);
