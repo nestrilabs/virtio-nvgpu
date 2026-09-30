@@ -13,6 +13,8 @@
 #               is CMD's, 124 when it ran that long
 #   --no-uvm    without /dev/nvidia-uvm, as a guest without --allow-compute
 #               has it (bubblewrap: a /dev of its own with the other nodes)
+#   NVGPU_NATIVE_PKGS  more store paths to make visible, words (what a guest
+#               image has beyond its own programs: rig/heavy/extras.nix's)
 #
 # Needs a built image (.rig/guest/result) and, without --live,
 # rig/rig-headless-sway.sh running. The image's store paths are read from
@@ -34,7 +36,7 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-[ $# -gt 0 ] || { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -gt 0 ] || { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 root=$(readlink "$RIG/guest/result") || { echo "no $RIG/guest/result: build the image" >&2; exit 1; }
 OD=$(readlink "$(rig_phys "$root")/etc/nvgpu/opengl-driver")
@@ -55,6 +57,8 @@ trap 'rm -rf "$RT"' EXIT
 export NIX_CONFIG=${NIX_CONFIG:-experimental-features = nix-command flakes}
 PRE=()
 PKGS=("$SW" "$OD")
+# shellcheck disable=SC2206 # words
+[ -n "${NVGPU_NATIVE_PKGS:-}" ] && PKGS+=($NVGPU_NATIVE_PKGS)
 if [ "$NOUVM" = 1 ]; then
     PKGS+=(nixpkgs#bubblewrap)
     PRE=(bwrap --dev-bind / / --dev /dev)

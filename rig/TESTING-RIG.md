@@ -923,6 +923,67 @@ fail, and every DISABLE_CHANNELS with its parameters; natively,
 without RM seeing them (`RMLOG_REFUSE_STATUS=0` answers success instead),
 which is how a refusal is told apart from the device.
 
+### Proton-like and CPU-heavy workloads
+
+What a Steam game under Proton does that the games above do not -- D3D11
+and D3D12 through DXVK and vkd3d-proton, Wine's threads and its
+synchronisation, many worker threads a frame -- comes from programs the
+guest image does not carry: `rig/heavy/extras.nix` builds them from the
+image's own nixpkgs (Wine 11 staging in WoW64 mode, DXVK, 0 A.D., and the
+rig's `nvgpu-gameloop`, `nvgpu-rtprobe` and `nvgpu-wakecost`), and
+`mkimage-heavy.sh --closure` puts that closure into a copy of the image, with
+the Windows programs and a Wine prefix beside it (`--tree`):
+
+```sh
+X=$(nix build --no-link --print-out-paths -f rig/heavy/extras.nix)
+# the prefix: wineboot once, then DXVK's and vkd3d-proton's DLLs into
+# system32 (x64) and syswow64 (x86); Godot's and Unigine Heaven's Windows
+# builds under win/godot and win/heaven (innoextract of its installer)
+rig/heavy/mkimage-heavy.sh .rig/guest/rootfs.ext4 /tmp/rootfs.steam.ext4 --grow 12000 \
+    --closure "$X:/opt/heavy/extras" --tree "$WIN:/opt/heavy/win" \
+    --tree "$PREFIX:/opt/heavy/wine/prefix"
+NVGPU_HEAVY_EXTRAS=$X NVGPU_HEAVY_WIN=$WIN NVGPU_HEAVY_WINE_PREFIX=$PREFIX \
+    rig/rig-heavy.sh wine-heaven native h 3
+NVGPU_ROOTFS=/tmp/rootfs.steam.ext4 NVGPU_COMPUTE=1 rig/rig-heavy.sh wine-heaven vm hg 3
+```
+
+- `gameloop`: `nvgpu-gameloop` (rig/heavy/gameloop.c), a synthetic frame --
+  four fork-join phases of 64 jobs on as many threads as the process has
+  CPUs (particles integrated, random reads through a 512 MiB heap), then
+  4,000 draws presented through Vulkan's Wayland WSI, unpaced. Every phase
+  wakes every worker, which is what makes a guest's vCPU wakeups show.
+- `wine-godot-draws-d3d12`, `wine-godot-draws-vk`, `wine-godot-gpu-d3d12`:
+  Godot 4.7.2's Windows build under Wine on vkd3d-proton (D3D12) or
+  winevulkan, the same scenes as `godot-draws` and `godot-gpu`.
+- `wine-heaven`: Unigine Heaven 4.0's 32-bit D3D11 build under Wine with
+  DXVK, its demo camera, 1280x720, low, no tessellation; MangoHud's frame
+  times.
+- `0ad`: 0 A.D. 0.28 on its Vulkan renderer, four Petra AIs on a generated
+  map, observed; MangoHud as a Vulkan layer only (its GL hook crashes the
+  game).
+- `probe-vk`: the Vulkan device extensions listed, and `nvgpu-rtprobe`: a
+  device with `VK_KHR_ray_query` and a compute shader casting a ray a pixel
+  into 64 instances of 200,000 triangles.
+- `wakecost`: `nvgpu-wakecost`, two threads on two CPUs handing a token
+  through a futex (and spinning), and one CPUID.
+
+Wine synchronises through ntsync where the kernel has it (`/dev/ntsync`,
+`CONFIG_NTSYNC`), else through its server. The host here has no
+`/dev/ntsync` loaded, so native runs use the server, and a guest run
+removes the guest's `/dev/ntsync` so that both sides do the same;
+`NVGPU_HEAVY_ENV=HEAVY_WINE_NTSYNC=1` keeps it. `NVGPU_HEAVY_ENV` passes
+`VAR=value,...` to heavy-run.sh both ways (`HEAVY_THP=always` sets a
+guest's transparent huge pages for the run).
+
+**KVM's counters.** perf needs `kernel.perf_event_paranoid` of 2 or less and
+tracefs needs root; neither is available here. `NVGPU_HEAVY_KVMSTAT=1` runs
+the launcher under `rig/heavy/kvmstat.py`, which takes duplicates of the
+VMM's KVM statistics descriptors (pidfd_getfd, allowed to an ancestor) and
+writes the exits, halts, halt polling and faults per second over a window of
+the run (`.kvmstat`). KVM answers `KVM_GET_STATS_FD` only in the process
+that made the VM, so nesbox must open them itself: its `virtio-nvgpu-v7`
+branch does with `NESBOX_HOLD_KVM_STATS=1`, which the harness sets.
+
 ## What to keep from every run
 
 The launcher writes three files per run:

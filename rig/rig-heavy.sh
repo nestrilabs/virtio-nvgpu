@@ -9,7 +9,10 @@
 # Usage: rig/rig-heavy.sh <workload> <native|vm> <tag> [runs [first]]
 #   workload  one of rig/heavy/heavy-run.sh's (stk-ultra, stk-vk,
 #             stk-low, godot-gpu, godot-draws, godot-draws-gl, blender-gl,
-#             blender-vk, vk-stream, vk-stream-pool)
+#             blender-vk, vk-stream, vk-stream-pool; and from
+#             rig/heavy/extras.nix and HEAVY_WIN: gameloop,
+#             wine-godot-draws-d3d12, wine-godot-draws-vk,
+#             wine-godot-gpu-d3d12, wine-heaven, 0ad, probe-vk, wakecost)
 #   native    rig/rig-native-run.sh: the guest image's programs and NVIDIA
 #             userspace on the host (NVGPU_HEAVY_NATIVE_CPUS=0-3 confines it
 #             to as many CPUs as the guest has, with taskset)
@@ -21,6 +24,8 @@
 # Environment:
 #   NVGPU_HEAVY_BACKEND_ARGS  words for the backend (run-guest.sh's --)
 #   NVGPU_HEAVY_GUEST_PRE     a guest shell command run first
+#   NVGPU_HEAVY_ENV           VAR=value,... for heavy-run.sh, natively and in
+#                             a guest (HEAVY_THP=always, GL_THREADS=8, ...)
 #   NVGPU_HEAVY_MODE          the headless output's mode for the run
 #                             (default: the workload's, below)
 #   NVGPU_HEAVY_PERF=1        vm: perf record the backend and the VMM while
@@ -29,6 +34,15 @@
 #   NVGPU_PACING_STATS        the backend's periodic pacing report (default 5 s)
 #   NVGPU_HEAVY_BENCH         native: the nvgpu-bench for vk-stream (a guest
 #                             image carries its own, mkimage-heavy.sh --file)
+#   NVGPU_HEAVY_EXTRAS        native: rig/heavy/extras.nix's store path (an
+#                             image has it at /opt/heavy/extras)
+#   NVGPU_HEAVY_WIN           native: the Windows programs' directory
+#                             (heavy-run.sh's HEAVY_WIN; /opt/heavy/win)
+#   NVGPU_HEAVY_WINE_PREFIX   native: the Wine prefix (/opt/heavy/wine/prefix)
+#   NVGPU_HEAVY_KVMSTAT=1     vm: KVM's counters for a window of the run
+#                             (rig/heavy/kvmstat.py; .kvmstat), from
+#                             NVGPU_HEAVY_KVMSTAT_DELAY s after the VMM
+#                             starts (14) for NVGPU_HEAVY_KVMSTAT_SECS (12)
 #
 # Results: $NVGPU_RIG/logs/heavy/<tag>/<workload>-<mode>-<n>.{frames,meta},
 # for a guest also .cpu (backend and VMM CPU over the run), .pacing, and the
@@ -37,7 +51,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RIG=${NVGPU_RIG:-$REPO/.rig}
 export NVGPU_RIG=$RIG
-[ $# -ge 3 ] || { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 WLD=$1 MODE=$2 TAG=$3 RUNS=${4:-3} FIRST=${5:-1}
 OUT=${NVGPU_HEAVY_OUT:-$RIG/logs/heavy}/$TAG
 mkdir -p "$OUT"
@@ -50,6 +64,10 @@ case $WLD in
     stk-low | godot-draws | godot-draws-gl) DMODE=1280x720 BUDGET=240 ;;
     blender-gl | blender-vk) DMODE=1920x1080 BUDGET=600 ;;
     vk-stream | vk-stream-pool) DMODE=1920x1080 BUDGET=120 ;;
+    gameloop | wine-godot-draws-d3d12 | wine-godot-draws-vk | wine-heaven) DMODE=1280x720 BUDGET=240 ;;
+    wine-godot-gpu-d3d12) DMODE=3840x2160 BUDGET=240 ;;
+    0ad) DMODE=1280x720 BUDGET=300 ;;
+    probe-vk | wakecost) DMODE=1920x1080 BUDGET=120 ;;
     *) echo "unknown workload $WLD" >&2; exit 2 ;;
 esac
 OMODE=${NVGPU_HEAVY_MODE:-$DMODE}
@@ -59,7 +77,7 @@ swaymsg_() {
 swaymsg_ output HEADLESS-1 mode "$OMODE@60Hz" >/dev/null ||
     { echo "could not set the headless output to $OMODE" >&2; exit 1; }
 
-echo "# $(date -Is) $WLD $MODE output=$OMODE vmm=${NVGPU_VMM_KIND:-nesbox} vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-8192} backend=${NVGPU_BACKEND:-default} rootfs=${NVGPU_ROOTFS:-default} args=[${NVGPU_HEAVY_BACKEND_ARGS:-}] pre=[${NVGPU_HEAVY_GUEST_PRE:-}] native-cpus=${NVGPU_HEAVY_NATIVE_CPUS:-all}" >>"$OUT/summary.txt"
+echo "# $(date -Is) $WLD $MODE output=$OMODE vmm=${NVGPU_VMM_KIND:-nesbox} vcpus=${NVGPU_VCPUS:-4} mem=${NVGPU_MEM_MIB:-8192} backend=${NVGPU_BACKEND:-default} rootfs=${NVGPU_ROOTFS:-default} args=[${NVGPU_HEAVY_BACKEND_ARGS:-}] pre=[${NVGPU_HEAVY_GUEST_PRE:-}] env=[${NVGPU_HEAVY_ENV:-}] cmdline=[${NVGPU_CMDLINE_EXTRA:-}] native-cpus=${NVGPU_HEAVY_NATIVE_CPUS:-all}" >>"$OUT/summary.txt"
 
 stat_ticks() { # utime + stime of processes, all their threads, in clock ticks
     local p t=0 x
@@ -75,10 +93,17 @@ vmm_pids() { pgrep -x nesbox; pgrep -x crosvm; }
 run_native() { # run_native N
     local d=$OUT/$WLD-native-$1.d pre=()
     [ -n "${NVGPU_HEAVY_NATIVE_CPUS:-}" ] && pre=(taskset -c "$NVGPU_HEAVY_NATIVE_CPUS")
-    "$REPO/rig/rig-native-run.sh" --timeout "$BUDGET" -- ${pre[@]+"${pre[@]}"} \
-        env HEAVY_DIR="$REPO/rig/heavy" HEAVY_BENCH="${NVGPU_HEAVY_BENCH:-}" \
+    NVGPU_NATIVE_PKGS=${NVGPU_HEAVY_EXTRAS:-} \
+        "$REPO/rig/rig-native-run.sh" --timeout "$BUDGET" -- ${pre[@]+"${pre[@]}"} \
+        env ${NVGPU_HEAVY_ENV:+${NVGPU_HEAVY_ENV//,/ }} HEAVY_DIR="$REPO/rig/heavy" HEAVY_BENCH="${NVGPU_HEAVY_BENCH:-}" \
+        HEAVY_EXTRAS="${NVGPU_HEAVY_EXTRAS:-}" HEAVY_WIN="${NVGPU_HEAVY_WIN:-}" \
+        HEAVY_WINE_PREFIX="${NVGPU_HEAVY_WINE_PREFIX:-}" \
         bash "$REPO/rig/heavy/heavy-run.sh" "$WLD" "$d" \
         >"$OUT/$WLD-native-$1.log" 2>&1
+    # Wine's server outlives the program by a few seconds.
+    [ -n "${NVGPU_HEAVY_WINE_PREFIX:-}" ] &&
+        NVGPU_NATIVE_PKGS=${NVGPU_HEAVY_EXTRAS:-} "$REPO/rig/rig-native-run.sh" --timeout 20 -- \
+            env WINEPREFIX="$NVGPU_HEAVY_WINE_PREFIX" "${NVGPU_HEAVY_EXTRAS:-}/bin/wineserver" -k >/dev/null 2>&1
     # A game that aborts can leave a process behind that goes on rendering
     # on the compositor (SuperTuxKart 1.5 on Vulkan can): anything still
     # running from the image's programs is this run's, and would load the
@@ -94,14 +119,17 @@ run_native() { # run_native N
 
 run_vm() { # run_vm N
     local tag=heavy-$TAG-$WLD-$1 gcmd extra=() logs=${NVGPU_LOGS:-$RIG/logs}
-    gcmd="${NVGPU_HEAVY_GUEST_PRE:-true}; bash /opt/heavy/heavy-run.sh $WLD /tmp/heavy; echo HEAVY_FRAMES_BEGIN; gzip -c /tmp/heavy/frames.txt 2>/dev/null | base64 -w 0; echo; echo HEAVY_FRAMES_END; echo HEAVY_PACING_BEGIN; cat /sys/module/virtio_gpu_nv/parameters/pacing 2>/dev/null; echo HEAVY_PACING_END; tail -n 30 /tmp/heavy/app.log; true"
+    gcmd="${NVGPU_HEAVY_GUEST_PRE:-true}; ${NVGPU_HEAVY_ENV:+export ${NVGPU_HEAVY_ENV//,/ };} bash /opt/heavy/heavy-run.sh $WLD /tmp/heavy; echo HEAVY_FRAMES_BEGIN; gzip -c /tmp/heavy/frames.txt 2>/dev/null | base64 -w 0; echo; echo HEAVY_FRAMES_END; echo HEAVY_PACING_BEGIN; cat /sys/module/virtio_gpu_nv/parameters/pacing 2>/dev/null; echo HEAVY_PACING_END; tail -n 30 /tmp/heavy/app.log; true"
     [ -n "${NVGPU_HEAVY_BACKEND_ARGS:-}" ] && read -r -a extra <<<"$NVGPU_HEAVY_BACKEND_ARGS"
-    local console=$logs/$tag.console.log
+    local console=$logs/$tag.console.log kvm=()
     rm -f "$console"
+    [ "${NVGPU_HEAVY_KVMSTAT:-0}" = 1 ] &&
+        kvm=(env NESBOX_HOLD_KVM_STATS=1 python3 "$REPO/rig/heavy/kvmstat.py" --out "$OUT/$WLD-vm-$1.kvmstat"
+            --delay "${NVGPU_HEAVY_KVMSTAT_DELAY:-14}" --secs "${NVGPU_HEAVY_KVMSTAT_SECS:-12}" --)
     NVGPU_MEM_MIB=${NVGPU_MEM_MIB:-8192} NVGPU_PACING_STATS=${NVGPU_PACING_STATS:-5} \
         NVGPU_TIMEOUT=${NVGPU_TIMEOUT:-$((BUDGET + 120))} \
         NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=$((BUDGET + 90)) nvgpu_cmd=$(printf %s "$gcmd" | base64 -w0) ${NVGPU_CMDLINE_EXTRA:-}" \
-        "$REPO/rig/run-guest.sh" --wayland-socket "$SOCK" run "$tag" ${extra[@]+-- "${extra[@]}"} \
+        ${kvm[@]+"${kvm[@]}"} "$REPO/rig/run-guest.sh" --wayland-socket "$SOCK" run "$tag" ${extra[@]+-- "${extra[@]}"} \
         >"$OUT/$WLD-vm-$1.launcher.log" 2>&1 &
     local launcher=$! be='' vmm=''
     for _ in $(seq 1 150); do
@@ -170,6 +198,10 @@ for n in $(seq "$FIRST" $((FIRST + RUNS - 1))); do
     fi
     grep -a 'stk:\|done\|first frame\|BENCH' "$OUT/$WLD-$MODE-$n.meta" 2>/dev/null | sed 's/^/    /' | tee -a "$OUT/summary.txt"
     [ -f "$OUT/$WLD-$MODE-$n.cpu" ] && sed 's/^/    /' "$OUT/$WLD-$MODE-$n.cpu" | tee -a "$OUT/summary.txt"
+    grep -a 'guest-rates\|HEAVY_GAMELOOP done\|wine-\|HEAVY_RT\|HEAVY_WAKE' "$OUT/$WLD-$MODE-$n.meta" 2>/dev/null | sed 's/^/    /' | tee -a "$OUT/summary.txt"
+    [ -f "$OUT/$WLD-$MODE-$n.kvmstat" ] &&
+        grep -E 'window=| (exits|halt_exits|irq_exits|io_exits|mmio_exits|halt_wakeup|halt_successful_poll|pf_taken) ' \
+            "$OUT/$WLD-$MODE-$n.kvmstat" | sed 's/^/    /' | tee -a "$OUT/summary.txt"
     sleep 2
 done
 swaymsg_ output HEADLESS-1 mode 1920x1080@60Hz >/dev/null
