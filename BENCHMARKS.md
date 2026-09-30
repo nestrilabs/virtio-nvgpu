@@ -31,7 +31,7 @@ The short version, on an RTX 5090 with the current code:
   a few percent of the same program on as many host CPUs as the guest has
   vCPUs; what a 4-vCPU guest loses against the whole host is the other
   CPUs. The frame-pacing measures cost no throughput. The guest kernel
-  lacked huge pages (10%) and ntsync (11% under Wine), and without compute a
+  lacked huge pages (10%) and ntsync (11-13% under Wine), and without compute a
   game that enables ray tracing or DLSS did not start; both are fixed.
 
 [Table](#native-against-a-guest) ·
@@ -694,9 +694,9 @@ natively, but Heaven loses 9% to it: a polling vCPU is one Wine's other
 runnable threads cannot have. It is not the default.
 
 Wine on X11 through a rootful Xwayland in the guest, as Proton runs a game
-on an X11 desktop, costs what its Wayland driver does: Heaven 472.7 fps
-against 481.1 on 4 host CPUs the same way, Godot D3D12 69.6 against 73.4
-(one run each).
+on an X11 desktop, costs what its Wayland driver does: Heaven 476.0 fps
+against 462.5 on 4 host CPUs the same way, Godot D3D12 69.6 (one run)
+against 71.8 (two runs each otherwise).
 
 **3. Guest pages.** The guest kernel had no transparent huge pages at all
 (x86_64's defconfig leaves them out): every page of a game's heap was 4 KiB
@@ -709,24 +709,28 @@ has THP, `always` by default; see "What changed".
 **4. What the frame-pacing measures cost.** The hypothesis was that the
 reply spin, the queue poll, the short slice and the fence watch, which cut
 stutter, cost a CPU-bound game throughput. One knob at a time against the
-defaults, nesbox, 4 vCPUs (mean of two runs; Heaven one):
+defaults, nesbox, 4 vCPUs, avg fps (mean of two runs unless marked; `(1)`
+one, the other run of Godot D3D12 stopped, "What remains"):
 
-| knob | gameloop avg / 1% low | Heaven avg |
-|---|---|---|
-| defaults | 57.6 / 40.5 | 488.2 |
-| `rt_spin_us=0` | 58.0 / 49.3 | 495.7 |
-| spin only while the vCPU has nothing else to run (a patch, not kept) | 57.7 / 49.2 | 481.2 |
-| `--queue-poll-us 0` | 56.6 / 46.1 | 467.4 |
-| the host's slice (`NVGPU_SLICE_US=0`) | 54.5 / 34.7 | 490.2 |
-| `async_fence_watch=0` | 56.0 / 40.0 | 485.2 |
-| `nopvspin` | 57.5 / 50.0 | -- |
-| vCPUs pinned to 8-11 | 57.0 / 45.4 | 484.2 |
-| guest haltpoll | 58.1 / 46.3 | 441.5 |
-| guest THP `always` | 63.7 / 53.5 | 490.0 |
+| knob | gameloop (1% low) | Heaven | Godot D3D12 |
+|---|---|---|---|
+| defaults | 57.6 (40.5) | 487.7 | 67.3 |
+| `rt_spin_us=0` | 58.0 (49.3) | 474.2 ± 21.5 | 70.1 (1) |
+| spin only while the vCPU has nothing else to run (a patch, not kept) | 57.7 (49.2) | 481.2 (1) | -- |
+| `--queue-poll-us 0` | 56.6 (46.1) | 474.4 | 69.7 |
+| the host's slice (`NVGPU_SLICE_US=0`) | 54.5 (34.7) | 488.2 | 67.3 |
+| `async_fence_watch=0` | 56.0 (40.0) | 484.8 | 69.1 |
+| `nopvspin` | 57.5 (50.0) | -- | -- |
+| vCPUs pinned to 8-11 | 57.0 (45.4) | 484.2 (1) | 69.1 (1) |
+| guest haltpoll | 58.1 (46.3) | 441.5 | 70.7 |
+| guest THP `always` | 63.7 (53.5) | 482.9 | 66.1 |
+| ntsync kept | -- | 552.2 | 69.1 |
 
 None of the pacing measures costs throughput beyond the runs' spread; the
-slice and the queue poll gain a little, and the slice's absence costs the
-lows. The spin was the likeliest thief of a busy vCPU's time, and turning it
+slice and the queue poll gain a little in the job system and Heaven, and
+the slice's absence costs the job system's lows. Huge pages help the job
+system's heap and not the Wine games, which spend their time elsewhere;
+ntsync is Heaven's largest single gain (+13%). The spin was the likeliest thief of a busy vCPU's time, and turning it
 off changes nothing measurable: a caller spins only while its own reply is
 on its way, a few microseconds a call, at a few hundred calls a frame. The
 patch that stops a spin as soon as another task is queued on the vCPU
