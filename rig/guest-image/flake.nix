@@ -52,6 +52,18 @@
       };
 
       blenderCuda = import ./nix/blender-cuda.nix { inherit pkgs; };
+      # VK_LAYER_NVGPU_no_uvm, both classes (DEPLOY.md, "The guest").
+      vkLayer =
+        if nvgpuSrc == null then null else import ./nix/vk-layer.nix { inherit pkgs; src = "${nvgpuSrc}/nvgpu-vk-layer"; };
+      vkLayer32 =
+        if nvgpuSrc == null then
+          null
+        else
+          import ./nix/vk-layer.nix {
+            pkgs = pkgs.pkgsi686Linux;
+            src = "${nvgpuSrc}/nvgpu-vk-layer";
+            arch = "32";
+          };
 
       # Qt Quick's own runtime (the `qml` tool), wrapped like an app so it
       # finds the Wayland platform plugin and QtQuick's QML modules.
@@ -216,6 +228,7 @@
       guestRoot = pkgs.runCommand "nvgpu-guest-root"
         {
           inherit sw openglDriver openglDriver32 fontsConf manifest;
+          vkLayers = lib.concatStringsSep " " (lib.filter (x: x != null) [ vkLayer vkLayer32 ]);
           nvidiaBin = nvidia.bin;
           nvidiaOut = nvidia.driver.out;
           probes = ./probes;
@@ -285,6 +298,12 @@
             ln -s $nvidiaBin/share/nvidia/nvidia-application-profiles-rc etc/nvidia/
           fi
 
+          # Implicit Vulkan layers the loader finds without XDG_DATA_DIRS.
+          mkdir -p etc/vulkan/implicit_layer.d
+          for l in $vkLayers; do
+            ln -s $l/share/vulkan/implicit_layer.d/*.json etc/vulkan/implicit_layer.d/
+          done
+
           # Login shell environment for shell.sh and anything interactive.
           cat > etc/profile <<'EOF'
           [ -r /opt/nvgpu/env.sh ] && . /opt/nvgpu/env.sh
@@ -334,6 +353,7 @@
           ;
         nvidia-userspace = nvidia.driver;
       }
-      // lib.optionalAttrs (nvgpu-wl-guest != null) { inherit nvgpu-wl-guest; };
+      // lib.optionalAttrs (nvgpu-wl-guest != null) { inherit nvgpu-wl-guest; }
+      // lib.optionalAttrs (vkLayer != null) { inherit vkLayer vkLayer32; };
     };
 }

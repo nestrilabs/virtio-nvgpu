@@ -141,6 +141,7 @@ for m in $members; do
     tar -C "$REPO" --exclude=target --exclude='*.rs.bk' -cf - "$m" | tar -C "$FLAKE/nvgpu-src" -xf -
 done
 cp -a "$REPO"/rig/verify/*.sh "$REPO"/rig/verify/*.c "$FLAKE/nvgpu-src/rig/verify/"
+cp -a "$REPO/nvgpu-vk-layer" "$FLAKE/nvgpu-src/"
 
 log "nix build (log: $LOGDIR/build.log)"
 if ! nix build "path:$FLAKE#guestRoot" --out-link "$G/result" --print-build-logs \

@@ -727,11 +727,36 @@ udevadm control --reload && udevadm trigger --subsystem-match=misc
 clients' dma-bufs are imported into), and `--log` or `NVGPU_WL_LOG` for its
 log level (`info` by default).
 
+**The Vulkan layer, for a guest without compute.** Without
+`--allow-compute` the guest has no `/dev/nvidia-uvm`, and NVIDIA's Vulkan
+driver there -- as natively without the UVM device -- still lists the
+extensions that need it (acceleration structures and every ray-tracing
+extension on them, `VK_NVX_binary_import` that DLSS uses,
+`VK_NV_cuda_kernel_launch`, `VK_NV_optical_flow` that Frame Generation
+uses) and reports their features, but fails `vkCreateDevice` with
+`VK_ERROR_INITIALIZATION_FAILED` when any of them is enabled. An
+application that enables what it is offered does not start: Godot's Vulkan
+renderer dies with SIGILL, and a D3D12 game through vkd3d-proton hangs
+(BENCHMARKS.md, "Steam-like games"). `VK_LAYER_NVGPU_no_uvm`
+([`nvgpu-vk-layer/`](nvgpu-vk-layer/)), an implicit layer, makes such a
+guest look like a driver without them: it drops them from the device's
+extension list, clears their features in `vkGetPhysicalDeviceFeatures2`,
+and answers a `vkCreateDevice` that asks for them with
+`VK_ERROR_EXTENSION_NOT_PRESENT` or `VK_ERROR_FEATURE_NOT_PRESENT`, so the
+application falls back (vkd3d-proton without DXR, a game without DLSS). It
+does nothing when `/dev/nvidia-uvm` exists, for another vendor's device, or
+with `NVGPU_VK_NO_UVM_DISABLE=1`, and it reaches nothing outside the
+process. Install it where every Vulkan loader looks, with the manifest
+naming the library by its absolute path (`make PREFIX=/usr install`, or the
+64- and 32-bit builds of `rig/guest-image/nix/vk-layer.nix`, whose
+manifests carry `library_arch` so each loader takes its own).
+
 **What the image must contain**, then: the kernel and `virtio_gpu_nv.ko`
 loaded at boot; the host's NVIDIA userspace (Vulkan ICD, EGL and GBM
 vendors, `libcuda` and the video libraries if compute is served); the
 `video`, `render` and `nvgpu-wl` groups and the udev rule; `nvgpu-wl-guest`
-setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set; for
+setgid `nvgpu-wl`, started per session with `XDG_RUNTIME_DIR` set;
+`VK_LAYER_NVGPU_no_uvm` if the guest may run without compute; for
 capture injection, the capture daemon's account in `nvgpu-capture` and its
 udev rule; and applications run as unprivileged users in `video` and
 `render` only.
