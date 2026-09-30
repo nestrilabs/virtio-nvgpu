@@ -9,7 +9,9 @@ so these patches let it lease a normal monitor too.
 of the dev box, Hyprland 0.56.2 at `efb50993` from its flake, and carried every lease stage on an RTX 5090
 (rig/TESTING-RIG.md, "Group B"): a desktop monitor leased to a guest, driven with KMS and `VK_KHR_display`,
 and taken back after each lease. The `e368c13c` pair builds and passes Hyprland's and aquamarine's own
-tests, and has not run as a desktop.
+tests, and has not run as a desktop. The later additions to both Hyprland patches (`lessee`,
+`lease_interval`, `revokelease`, and clearing the planes when a lease ends; below) build and pass
+Hyprland's unit tests, and have not yet run as a desktop or carried a lease.
 
 | Patch | Against | What it does |
 |---|---|---|
@@ -62,21 +64,80 @@ monitorv2 {
 
 `leasable` defaults to `false`. With no leasable monitor, Hyprland's behaviour is unchanged apart from the
 protocol fixes listed in the Hyprland commit message. You can change `leasable` at runtime: that withdraws
-or offers the connector without a modeset. `hyprctl monitors all` shows `leasable` and `leased`.
+or offers the connector without a modeset. `hyprctl monitors all` shows `leasable`, `leased`, `lessee` and
+`leaseInterval`.
+
+### Who may lease it, how often, and taking it back
+
+Two more monitor rule keys, both off by default, and a dispatcher:
+
+| key or dispatcher | default | what it does |
+|---|---|---|
+| `lessee` | unset: any client that sees the lease device | only clients connected as this user (a name, or a uid) are offered the monitor's connector or may lease it. Checked when the connector is advertised and again at submit, against the uid the kernel reported when the client connected (`SO_PEERCRED`). A name that does not resolve leases to nobody, and is a config error |
+| `lease_interval` | `0` (no limit) | the least time, in milliseconds (at most 3,600,000), from one lease of the monitor to the next. A request that comes sooner gets `finished` before anything is released, so it costs no modeset |
+| `revokelease [MONITOR]` (hyprlang), `hl.dsp.revoke_lease({ monitor = ... })` (Lua) | none | revokes the lease on that monitor, or every lease without one, and sends the client `finished`; the monitor comes back as when a lessee lets go |
+
+```lua
+-- only the VM's backend (it runs as nvgpu-vm0) may lease DP-2, at most once every 2 s
+hl.monitor({ output = "DP-2", disabled = true, leasable = true, lessee = "nvgpu-vm0", lease_interval = 2000 })
+
+-- take DP-2 back from a keybind, and keep it: withdraw the offer first, then revoke
+hl.bind("SUPER + SHIFT + L", function()
+    hl.monitor({ output = "DP-2", leasable = false })
+    hl.dispatch(hl.dsp.revoke_lease({ monitor = "DP-2" }))
+end)
+```
+
+In the 0.56.2 patch's hyprlang config (the `e368c13c` patch has only the Lua config):
+
+```ini
+monitor = DP-2, disable, leasable, 1, lessee, nvgpu-vm0, lease_interval, 2000
+
+monitorv2 {
+    output = DP-2
+    disabled = 1
+    leasable = 1
+    lessee = nvgpu-vm0
+    lease_interval = 2000
+}
+
+# hyprctl keyword monitor DP-2, disable, leasable, 0 && hyprctl dispatch revokelease DP-2
+```
+
+- **`lessee`** is a uid, not a program: the compositor cannot identify the backend by its binary (it is
+  undumpable, so `/proc/<pid>/exe` is unreadable to the compositor, as it is across uids), which is why
+  Hyprland's `permission` rules cannot gate the lease device. It separates the VM from the desktop's own
+  clients only when the backend runs as a user of its own (DEPLOY.md, "Per-VM users"); the rig's launcher
+  runs it as the desktop user, and then `lessee` separates nothing. Every guest app reaches the compositor
+  as the backend, so every app in that VM may lease (the backend's `--wayland-lease` still decides whether
+  any may). A lessee change takes effect at once: connectors are withdrawn from clients no longer allowed
+  and advertised to ones now allowed. A lease already granted stays until it ends or is revoked.
+- **`lease_interval`** is counted from each request that gets as far as releasing the monitor, granted or
+  not. It does not delay a request: the client gets `finished` and may ask again later. The backend has its
+  own per-VM rate (`--wayland-lease-interval`); this one holds for every client, per monitor.
+- **Revoking** leaves the monitor offered. A lessee that asks again gets it again, subject to
+  `lease_interval`; withdraw the offer first (`leasable = false`) to keep it. A lease of several monitors is
+  revoked whole. Revoking does not commit: the kernel revokes the lease (the lessee can no longer commit to
+  the CRTC), then the monitor is taken back from an idle callback as in step 5 below.
 
 ## What happens during a lease
 
-1. A client submits a lease request for the monitor's connector.
+1. A client submits a lease request for the monitor's connector. It is refused (`finished`, nothing
+   released) if the monitor is not offered to that client (`lessee`) or was leased less than
+   `lease_interval` ago.
 2. Hyprland releases the monitor as if it had been unplugged. Workspaces and focus move to another monitor,
    and frame scheduling and queued commits stop. Then a blocking commit disables the output, so the CRTC and
    planes are off and our last flip has completed.
 3. Hyprland creates the lease from the connector's current CRTC and sends the lease fd.
 4. While the lease is active, nothing in Hyprland commits to that output. Rule reloads, DPMS, output
    management and aquamarine state requests are all refused or skipped.
-5. The lease ends in one of three ways: the client destroys the lease, the lessee closes every copy of the
-   fd (the kernel sends a `LEASE=1` uevent and aquamarine runs `scanLeases`), or the monitor is unplugged,
-   which revokes the lease. Hyprland then reconnects the monitor with its current rule, using a full modeset
-   as on hotplug.
+5. The lease ends in one of four ways: the client destroys the lease, the lessee closes every copy of the
+   fd (the kernel sends a `LEASE=1` uevent and aquamarine runs `scanLeases`), the monitor is unplugged,
+   which revokes the lease, or the host revokes it (`revokelease`). Hyprland then takes the monitor back
+   from an idle callback: first a blocking commit with no buffer, which waits for a flip the lessee still
+   had queued and takes the lessee's framebuffers off the primary and cursor planes (a modeset that enables
+   the output replaces only the primary's; aquamarine touches the cursor plane only when the cursor
+   changes), then a reconnect with the monitor's current rule, a full modeset as on hotplug.
 
 ## Applying
 

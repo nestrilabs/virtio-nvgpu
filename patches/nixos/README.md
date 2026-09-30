@@ -115,6 +115,58 @@ monitorv2 {
 wayland.windowManager.hyprland.settings.monitor = [ "DP-2, disable, leasable, 1" ];
 ```
 
+### Who may lease it, and how often
+
+With only `leasable`, any program of the desktop user may lease the monitor,
+not only the VM. Two more keys narrow that; both are off by default, which is
+the behaviour above:
+
+- `lessee`: the user the VM's backend runs as. Only that user's clients are
+  offered the monitor, or may lease it. With `services.virtio-nvgpu.vms."0"`
+  the backend runs as `nvgpu-vm0`. A name that does not exist leases to
+  nobody.
+- `lease_interval`: the least time between two leases of the monitor, in
+  milliseconds; a request that comes sooner is refused before the desktop
+  lets go of the monitor.
+
+Recommended, for VM 0:
+
+```lua
+hl.monitor({ output = "DP-2", disabled = true, leasable = true, lessee = "nvgpu-vm0", lease_interval = 2000 })
+```
+
+```ini
+monitor = DP-2, disable, leasable, 1, lessee, nvgpu-vm0, lease_interval, 2000
+```
+
+```nix
+wayland.windowManager.hyprland.settings.monitor = [ "DP-2, disable, leasable, 1, lessee, nvgpu-vm0, lease_interval, 2000" ];
+```
+
+`lessee` only separates the VM from the desktop when the backend runs as a
+user of its own, as the NixOS module does; with the rig's launcher, which runs
+it as the desktop user, it separates nothing.
+
+To take the monitor back while the VM runs, a dispatcher revokes the lease
+(`revokelease DP-2` in hyprlang, `hl.dsp.revoke_lease({ monitor = "DP-2" })`
+in Lua, or every lease without a monitor). The monitor stays offered, so
+withdraw the offer first to keep it:
+
+```sh
+hyprctl eval 'hl.monitor({ output = "DP-2", leasable = false }); hl.dispatch(hl.dsp.revoke_lease({ monitor = "DP-2" }))'
+# hyprland.conf: hyprctl keyword monitor DP-2, disable, leasable, 0 && hyprctl dispatch revokelease DP-2
+```
+
+or bind it to a key:
+
+```nix
+wayland.windowManager.hyprland.settings.bind = [ "SUPER SHIFT, L, revokelease, DP-2" ];
+```
+
+These are Hyprland settings, not options of this module: the module only
+builds the patched Hyprland. [`../README.md`](../README.md), "Who may lease
+it, how often, and taking it back", has the full text.
+
 Unpatched Hyprland reports `leasable` as a config error (in Lua, in
 `monitorv2`, and after a mode in `monitor =`), and silently ignores
 `monitor = X, disable, leasable, 1`: change the config in the same rebuild
@@ -135,9 +187,12 @@ hyprctl version | head -3
 #   Hyprland 0.56.2 ... at commit efb50993...: upstream's commit either way,
 #   since the patch is applied at build time; the next checks tell them apart.
 
-hyprctl monitors all | grep -E '^Monitor|disabled:|leasable:|leased:'
+hyprctl monitors all | grep -E '^Monitor|disabled:|leasable:|leased:|lessee:|leaseInterval:'
 #   every monitor has "leasable:" and "leased:" lines (unpatched Hyprland has neither);
-#   the chosen one shows disabled: true / leasable: true / leased: false
+#   the chosen one shows disabled: true / leasable: true / leased: false, and with the
+#   recommended rule lessee: <nvgpu-vm0's uid> / leaseInterval: 2000 (a build of the
+#   patch from before 2026-09-30 has no lessee: line; "lessee: nobody" means the user
+#   name did not resolve)
 
 H=$(readlink -f /proc/$(pgrep -f -o 'Hyprland-wrapped|/bin/Hyprland')/exe)
 P=$(echo "$H" | cut -d/ -f1-4)
@@ -167,3 +222,9 @@ NixOS module:
 
 The 0.56.2 build has run as a live desktop compositor and carried every lease
 stage of [`rig/TESTING-RIG.md`](../../rig/TESTING-RIG.md) ("Group B").
+
+The patch was then extended (2026-09-30: `lessee`, `lease_interval`,
+`revokelease`, and clearing the planes when a lease ends). That version builds
+with the Hyprland flake at `efb50993` and the patched aquamarine, and passes
+282 unit tests (one, resolving a user name, skipped where the build has no
+user database); it has not yet run as a desktop or carried a lease.

@@ -1,4 +1,4 @@
-From ef2436471ef35eb3795bc95a4271ae75e4f95a2e Mon Sep 17 00:00:00 2001
+From b6b56e372faa1fe00bfb4ff7e5933805845927d0 Mon Sep 17 00:00:00 2001
 From: Jacob Root <me@rooty.dev>
 Date: Fri, 25 Sep 2026 03:37:06 +0000
 Subject: [PATCH] drm-lease: let desktop monitors be leased, and send released
@@ -65,7 +65,41 @@ Protocol fixes on the way, all of which affect VR leases too:
   bindings of the global; a monitor named twice is refused before anything
   is released.
 
-hyprctl monitors reports leasable and leased.
+Who may lease a monitor, how often, and taking it back. With only
+leasable, any client that sees the lease device may lease the monitor, as
+often as it likes, until it lets go. Two more rule keys and a dispatcher
+narrow that; all are off by default, which is the behaviour above:
+
+- lessee: a user name or a uid. Only clients whose connection's uid (the
+  SO_PEERCRED libwayland keeps) is that user's are sent the monitor's
+  connector, and a submit is checked again against the rule in force then.
+  A name that does not resolve, or a number that is not a uid, leases to
+  nobody, and is a config error. Hyprland's permission rules cannot do
+  this for a sandboxed lessee: they match /proc/<pid>/exe, which the
+  compositor cannot read for an undumpable process or one of another uid.
+- lease_interval: milliseconds, at most an hour. A request sooner than
+  that after the monitor was last released for a lease (granted or not) is
+  answered finished before anything is released, so asking in a loop costs
+  one release per interval instead of one per request.
+- hl.dsp.revoke_lease({ monitor = ... }), or every lease without a
+  monitor: terminate() the lease (the kernel revokes it) and tell the client
+  (finished). The monitor stays offered; withdraw it first (leasable =
+  false) to keep it.
+
+The offer and its lessee follow the rule on every rule check, even when the
+rest of the rule cannot be applied or the monitor is leased, so a narrowed
+lessee takes effect at once. A lease already granted stays until it ends or
+is revoked.
+
+When a lease ends, for any reason, the monitor is now first committed off
+with no buffer, a blocking modeset, before it is reconnected: that waits for
+a flip the lessee still had queued, and takes the lessee's framebuffers off
+the primary and the cursor plane. The reconnect's modeset replaced only the
+primary's; aquamarine touches the cursor plane only when the cursor
+changes, so a lessee's cursor image could stay on the desktop.
+
+hyprctl monitors reports leasable, leased, lessee (a uid, any or nobody)
+and leaseInterval.
 
 Aquamarine still reassigns a disabled connector's CRTC on hotplug rechecks
 (recheckCRTCs), which can hand a leased CRTC to another connector; that needs
@@ -73,24 +107,29 @@ a small aquamarine change carried separately.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
- hyprtester/src/tests/main/monitor_rules.cpp   |  27 ++
- .../lua/bindings/LuaBindingsConfigRules.cpp   |   5 +
- src/config/shared/monitor/MonitorRule.cpp     |   3 +-
- src/config/shared/monitor/MonitorRule.hpp     |   4 +
- .../shared/monitor/MonitorRuleManager.cpp     |   7 +
- src/ipc/s1/Commands.cpp                       |  23 +-
- src/output/Monitor.cpp                        | 117 +++++++++
- src/output/Monitor.hpp                        |   5 +-
- src/protocols/DRMLease.cpp                    | 231 +++++++++++++++---
- src/protocols/DRMLease.hpp                    |  20 +-
- tests/config/MonitorParser.cpp                |  21 ++
- 11 files changed, 415 insertions(+), 48 deletions(-)
+ hyprtester/src/tests/main/monitor_rules.cpp   |  57 +++
+ .../lua/bindings/LuaBindingsConfigRules.cpp   |  13 +
+ .../lua/bindings/LuaBindingsDispatchers.cpp   |  24 ++
+ src/config/shared/actions/ConfigActions.cpp   |  17 +
+ src/config/shared/actions/ConfigActions.hpp   |   3 +
+ src/config/shared/monitor/MonitorRule.cpp     |  23 +-
+ src/config/shared/monitor/MonitorRule.hpp     |  23 ++
+ .../shared/monitor/MonitorRuleManager.cpp     |   9 +
+ src/config/shared/monitor/Parser.cpp          |  55 +++
+ src/config/shared/monitor/Parser.hpp          |   2 +
+ src/ipc/s1/Commands.cpp                       |  34 +-
+ src/output/Monitor.cpp                        | 132 +++++++
+ src/output/Monitor.hpp                        |   9 +-
+ src/protocols/DRMLease.cpp                    | 324 +++++++++++++++---
+ src/protocols/DRMLease.hpp                    |  27 +-
+ tests/config/MonitorParser.cpp                | 128 +++++++
+ 16 files changed, 828 insertions(+), 52 deletions(-)
 
 diff --git a/hyprtester/src/tests/main/monitor_rules.cpp b/hyprtester/src/tests/main/monitor_rules.cpp
-index c1dfb92d..503fcf02 100644
+index c1dfb92d..760dfc60 100644
 --- a/hyprtester/src/tests/main/monitor_rules.cpp
 +++ b/hyprtester/src/tests/main/monitor_rules.cpp
-@@ -121,3 +121,30 @@ TEST_CASE(monitorMirrorAppliedWhenTargetAppears) {
+@@ -121,3 +121,60 @@ TEST_CASE(monitorMirrorAppliedWhenTargetAppears) {
      ASSERT(waitForMirror(TEST_MIRROR_SOURCE, *RECREATED_TARGET_ID), true);
      EXPECT(monitorBlock(TEST_MIRROR_SOURCE, false).empty(), true);
  }
@@ -121,11 +160,41 @@ index c1dfb92d..503fcf02 100644
 +    OK(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', leasable = false })"));
 +    ASSERT(waitForMonitorBlockContains("HEADLESS-2", "leasable: false"), true);
 +}
++
++TEST_CASE(monitorLeaseLesseeAndIntervalAreApplied) {
++    // As above, the plumbing only: the keys parse, take the soft path and are reported. Which clients get the connector, and the
++    // interval's refusal, are in the unit tests (leaseAllowedFor, leaseTooSoon); a real lease needs a DRM device.
++    CScopeGuard guard = {[]() { getFromSocket("/reload"); }};
++
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "lessee: any");
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "leaseInterval: 0");
++
++    OK(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', leasable = true, lessee = '0', lease_interval = 2000 })"));
++    ASSERT(waitForMonitorBlockContains("HEADLESS-2", "lessee: 0"), true);
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "leaseInterval: 2000");
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "disabled: false");
++
++    // a user that does not exist leases to nobody, not to everybody
++    getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', lessee = 'no-such-user-hyprtester' })");
++    ASSERT(waitForMonitorBlockContains("HEADLESS-2", "lessee: nobody"), true);
++
++    OK(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', lessee = '', lease_interval = 0 })"));
++    ASSERT(waitForMonitorBlockContains("HEADLESS-2", "lessee: any"), true);
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "leaseInterval: 0");
++}
++
++TEST_CASE(revokeLeaseWithoutALeaseReportsIt) {
++    // nothing is leased on a headless output: the dispatcher says so and changes nothing
++    EXPECT_CONTAINS(getFromSocket("/dispatch hl.dsp.revoke_lease({ monitor = 'HEADLESS-2' })"), "not leased");
++    EXPECT_CONTAINS(getFromSocket("/dispatch hl.dsp.revoke_lease()"), "No active DRM lease");
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "leased: false");
++    EXPECT_CONTAINS(monitorBlock("HEADLESS-2"), "disabled: false");
++}
 diff --git a/src/config/lua/bindings/LuaBindingsConfigRules.cpp b/src/config/lua/bindings/LuaBindingsConfigRules.cpp
-index cc6108ff..ecb3a327 100644
+index cc6108ff..c1c59d8e 100644
 --- a/src/config/lua/bindings/LuaBindingsConfigRules.cpp
 +++ b/src/config/lua/bindings/LuaBindingsConfigRules.cpp
-@@ -175,6 +175,11 @@ namespace {
+@@ -175,6 +175,19 @@ namespace {
               p.rule().m_maxAvgLuminance = sc<int>(*sc<const Config::INTEGER*>(v->data()));
               return true;
           }},
@@ -134,29 +203,162 @@ index cc6108ff..ecb3a327 100644
 +             p.rule().m_leasable = *sc<const Config::BOOL*>(v->data());
 +             return true;
 +         }},
++        // a user name or a uid (a number is taken as a uid); "" for any client
++        {"lessee", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); },
++         [](ILuaConfigValue* v, CMonitorRuleParser& p) { return p.parseLessee(*sc<const Config::STRING*>(v->data())); }},
++        {"lease_interval", []() -> ILuaConfigValue* { return new CLuaConfigInt(0, 0, LEASE_INTERVAL_MAX_MS); },
++         [](ILuaConfigValue* v, CMonitorRuleParser& p) {
++             p.rule().m_leaseInterval = sc<uint32_t>(*sc<const Config::INTEGER*>(v->data()));
++             return true;
++         }},
      };
  
      static_assert(sizeof(Internal::WINDOW_RULE_EFFECT_DESCS) / sizeof(Internal::SWindowRuleEffectDesc) == Internal::WE::WINDOW_RULE_EFFECT_LAST_STATIC - 1);
+diff --git a/src/config/lua/bindings/LuaBindingsDispatchers.cpp b/src/config/lua/bindings/LuaBindingsDispatchers.cpp
+index 963c68d9..18db32d0 100644
+--- a/src/config/lua/bindings/LuaBindingsDispatchers.cpp
++++ b/src/config/lua/bindings/LuaBindingsDispatchers.cpp
+@@ -239,6 +239,15 @@ static int dsp_releaseInputCapture(lua_State* L) {
+     return Internal::checkResult(L, CA::releaseInputCapture());
+ }
+ 
++static int dsp_revokeLease(lua_State* L) {
++    if (lua_isnil(L, lua_upvalueindex(1)))
++        return Internal::checkResult(L, CA::revokeLease());
++
++    // looked up when it runs, not when the bind is made: a monitor can come and go in between
++    PHLMONITOR mon = State::monitorState()->query().relativeTo(Desktop::focusState()->monitor()).configString(lua_tostring(L, lua_upvalueindex(1))).run();
++    return Internal::checkResult(L, CA::revokeLease(mon));
++}
++
+ static int hlExecCmd(lua_State* L) {
+     const auto proc = Check::string(L, 1);
+ 
+@@ -364,6 +373,20 @@ static int hlReleaseInputCapture(lua_State* L) {
+     return 1;
+ }
+ 
++// hl.dsp.revoke_lease() or hl.dsp.revoke_lease({ monitor = "DP-2" })
++static int hlRevokeLease(lua_State* L) {
++    std::optional<std::string> monStr;
++    if (lua_istable(L, 1))
++        monStr = Internal::tableOptMonitorSelector(L, 1, "monitor", "hl.dsp.revoke_lease");
++
++    if (monStr)
++        lua_pushstring(L, monStr->c_str());
++    else
++        lua_pushnil(L);
++    lua_pushcclosure(L, dsp_revokeLease, 1);
++    return 1;
++}
++
+ static int dsp_sendShortcut(lua_State* L) {
+     const auto        modMask = Keybinds::modMaskFromString(lua_tostring(L, lua_upvalueindex(1)));
+     const std::string key     = lua_tostring(L, lua_upvalueindex(2));
+@@ -1367,6 +1390,7 @@ void Internal::registerDispatcherBindings(lua_State* L) {
+         Internal::setFn(L, "force_renderer_reload", hlForceRendererReload);
+         Internal::setFn(L, "force_idle", hlForceIdle);
+         Internal::setFn(L, "release_input_capture", hlReleaseInputCapture);
++        Internal::setFn(L, "revoke_lease", hlRevokeLease);
+         Internal::setFn(L, "focus", hlFocus);
+         Internal::setFn(L, "no_op", hlNoop);
+     }
+diff --git a/src/config/shared/actions/ConfigActions.cpp b/src/config/shared/actions/ConfigActions.cpp
+index abc2058b..bd3d6517 100644
+--- a/src/config/shared/actions/ConfigActions.cpp
++++ b/src/config/shared/actions/ConfigActions.cpp
+@@ -29,6 +29,7 @@
+ #include "../../../protocols/IdleNotify.hpp"
+ #include "../../../protocols/GlobalShortcuts.hpp"
+ #include "../../../protocols/InputCapture.hpp"
++#include "../../../protocols/DRMLease.hpp"
+ #include "../../../event/EventBus.hpp"
+ #include "../../../helpers/MiscFunctions.hpp"
+ #include "../../../managers/XWaylandManager.hpp"
+@@ -1814,3 +1815,19 @@ ActionResult Actions::releaseInputCapture() {
+     PROTO::inputCapture->forceRelease();
+     return {};
+ }
++
++ActionResult Actions::revokeLease(std::optional<PHLMONITOR> mon) {
++    if (mon.has_value() && !mon.value())
++        return actionError("No such monitor", eActionErrorLevel::ERROR, eActionErrorCode::NOT_FOUND);
++
++    size_t revoked = 0;
++    for (auto const& [name, lease] : PROTO::lease) {
++        if (lease)
++            revoked += lease->revoke(mon.value_or(nullptr));
++    }
++
++    if (revoked == 0)
++        return actionError(mon.has_value() ? std::format("{} is not leased", mon.value()->m_name) : "No active DRM lease", eActionErrorLevel::INFO, eActionErrorCode::NO_TARGET);
++
++    return {};
++}
+diff --git a/src/config/shared/actions/ConfigActions.hpp b/src/config/shared/actions/ConfigActions.hpp
+index 75da21f5..73eb7452 100644
+--- a/src/config/shared/actions/ConfigActions.hpp
++++ b/src/config/shared/actions/ConfigActions.hpp
+@@ -107,6 +107,9 @@ namespace Config::Actions {
+     ActionResult moveIntoOrCreateGroup(Math::eDirection dir, std::optional<PHLWINDOW> window = std::nullopt /* Active */);
+ 
+     ActionResult releaseInputCapture();
++    // Revoke the DRM lease on a monitor (every active lease when none is given). The monitor stays offered: withdraw it first (leasable =
++    // false) to keep the lessee from taking it again.
++    ActionResult revokeLease(std::optional<PHLMONITOR> mon = std::nullopt);
+ 
+     class CActionState {
+       public:
 diff --git a/src/config/shared/monitor/MonitorRule.cpp b/src/config/shared/monitor/MonitorRule.cpp
-index cbc7da61..ce4cf9f5 100644
+index cbc7da61..7b51fab9 100644
 --- a/src/config/shared/monitor/MonitorRule.cpp
 +++ b/src/config/shared/monitor/MonitorRule.cpp
-@@ -26,8 +26,9 @@ eMonitorRuleComparisonResult CMonitorRule::compare(const CMonitorRule& other) co
+@@ -26,9 +26,30 @@ eMonitorRuleComparisonResult CMonitorRule::compare(const CMonitorRule& other) co
      const auto SAME_AUTO_DIR  = m_autoDir == other.m_autoDir;
      const auto SAME_RESERVED  = m_reservedArea == other.m_reservedArea;
      const auto SAME_MIRROR    = m_mirrorOf == other.m_mirrorOf;
-+    const auto SAME_LEASABLE  = m_leasable == other.m_leasable; // only changes what the lease device offers, never needs a modeset
++    // only change what the lease device offers and to whom, never need a modeset
++    const auto SAME_LEASABLE = m_leasable == other.m_leasable && m_lessee == other.m_lessee && m_leaseInterval == other.m_leaseInterval;
  
 -    if (!SAME_CM || !SAME_POS || !SAME_TRANSFORM || !SAME_AUTO_DIR || !SAME_RESERVED || !SAME_MIRROR)
 +    if (!SAME_CM || !SAME_POS || !SAME_TRANSFORM || !SAME_AUTO_DIR || !SAME_RESERVED || !SAME_MIRROR || !SAME_LEASABLE)
          return COMPARISON_SOFT_MISMATCH;
  
      return COMPARISON_FULL_MATCH;
+ }
++
++bool Config::leaseAllowedFor(const std::optional<uid_t>& lessee, uid_t clientUid) {
++    if (!lessee)
++        return true;
++
++    // LEASE_NOBODY is also the uid libwayland reports when it could not read the peer's credentials
++    return *lessee != LEASE_NOBODY && *lessee == clientUid;
++}
++
++bool Config::leaseTooSoon(uint32_t intervalMs, const std::optional<std::chrono::steady_clock::time_point>& last, std::chrono::steady_clock::time_point now) {
++    if (intervalMs == 0 || !last)
++        return false;
++
++    // a clock that went backwards (it cannot, it is steady) would read as too soon rather than wrap
++    if (now < *last)
++        return true;
++
++    return now - *last < std::chrono::milliseconds(intervalMs);
++}
 diff --git a/src/config/shared/monitor/MonitorRule.hpp b/src/config/shared/monitor/MonitorRule.hpp
-index b5ebb482..b625a839 100644
+index b5ebb482..2a232922 100644
 --- a/src/config/shared/monitor/MonitorRule.hpp
 +++ b/src/config/shared/monitor/MonitorRule.hpp
-@@ -67,5 +67,9 @@ namespace Config {
+@@ -3,6 +3,8 @@
+ #include <string>
+ #include <optional>
+ #include <cstdint>
++#include <chrono>
++#include <sys/types.h>
+ #include <xf86drmMode.h>
+ 
+ #include "../../../helpers/math/Math.hpp"
+@@ -67,5 +69,26 @@ namespace Config {
  
          drmModeModeInfo    m_drmMode = {};
          std::optional<int> m_vrr;
@@ -164,40 +366,163 @@ index b5ebb482..b625a839 100644
 +        // Offer this output through wp_drm_lease_device_v1 like a non-desktop (VR) output, while still using it as a normal monitor.
 +        // While a lease is active Hyprland lets go of the output entirely; see CMonitor::releaseForLease().
 +        bool m_leasable = false;
++
++        // Who may lease it: unset, any client that can see the lease device; otherwise only clients of this uid (their SO_PEERCRED uid, as
++        // libwayland reports it). LEASE_NOBODY, which no process has, is what a user name that does not resolve becomes.
++        std::optional<uid_t> m_lessee;
++
++        // The least time from one lease grant on this output to the next, in milliseconds; 0 for no limit. A request that comes sooner is
++        // refused (finished) before anything is released, so it costs no modeset.
++        uint32_t m_leaseInterval = 0;
      };
++
++    inline constexpr uid_t    LEASE_NOBODY          = static_cast<uid_t>(-1);
++    inline constexpr uint32_t LEASE_INTERVAL_MAX_MS = 3'600'000;
++
++    // Whether a client of this uid may lease an output whose rule names this lessee.
++    bool leaseAllowedFor(const std::optional<uid_t>& lessee, uid_t clientUid);
++
++    // Whether a lease granted at `now` would follow the previous grant on the same output (`last`) by less than intervalMs.
++    bool leaseTooSoon(uint32_t intervalMs, const std::optional<std::chrono::steady_clock::time_point>& last, std::chrono::steady_clock::time_point now);
  };
 diff --git a/src/config/shared/monitor/MonitorRuleManager.cpp b/src/config/shared/monitor/MonitorRuleManager.cpp
-index 0cbe9fdb..56936a26 100644
+index 0cbe9fdb..55235ee5 100644
 --- a/src/config/shared/monitor/MonitorRuleManager.cpp
 +++ b/src/config/shared/monitor/MonitorRuleManager.cpp
-@@ -141,6 +141,13 @@ void CMonitorRuleManager::ensureMonitorStatus() {
+@@ -141,6 +141,15 @@ void CMonitorRuleManager::ensureMonitorStatus() {
  
          auto rule = get(m);
  
++        // The lease offer, and who it is for, follow the rule at once, whether or not the rest of the rule applies (a mode it cannot
++        // set, or a lease in the way): a lessee that was changed must not keep its old reach until the next successful modeset.
++        m->setLeaseOffered(rule);
++
 +        // A leased monitor keeps its old rule until the lease ends: applying one commits, and the lessee owns the CRTC.
-+        // CMonitor::onLeaseEnded() reconnects it, which applies whatever rule is current then. Only the lease offer follows along now.
-+        if (m->m_isBeingLeased) {
-+            m->setLeaseOffered(rule.m_leasable);
++        // CMonitor::onLeaseEnded() reconnects it, which applies whatever rule is current then.
++        if (m->m_isBeingLeased)
 +            continue;
-+        }
 +
          bool mustApplySoft = false;
  
          // check if mirror matches first of all
+diff --git a/src/config/shared/monitor/Parser.cpp b/src/config/shared/monitor/Parser.cpp
+index 87b27800..8cf15be0 100644
+--- a/src/config/shared/monitor/Parser.cpp
++++ b/src/config/shared/monitor/Parser.cpp
+@@ -8,6 +8,10 @@
+ #include <string>
+ #include <algorithm>
+ #include <format>
++#include <charconv>
++#include <vector>
++#include <pwd.h>
++#include <unistd.h>
+ 
+ using namespace Config;
+ using namespace Hyprutils::String;
+@@ -283,6 +287,57 @@ bool CMonitorRuleParser::parseICC(const std::string& val) {
+     return true;
+ }
+ 
++bool CMonitorRuleParser::parseLessee(const std::string& value) {
++    // empty: any client that can see the lease device, as without the key
++    if (value.empty()) {
++        m_rule.m_lessee.reset();
++        return true;
++    }
++
++    // Anything that does not name a real uid leases to nobody rather than to anyone: a typo must not open the monitor up
++    m_rule.m_lessee = LEASE_NOBODY;
++
++    if (std::ranges::all_of(value, [](char c) { return c >= '0' && c <= '9'; })) {
++        uint64_t uid         = 0;
++        const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), uid);
++        if (ec != std::errc{} || ptr != value.data() + value.size() || uid >= LEASE_NOBODY) {
++            m_error += "invalid lessee ";
++            return false;
++        }
++
++        m_rule.m_lessee = sc<uid_t>(uid);
++        return true;
++    }
++
++    // a user name, resolved once here rather than at every bind
++    long bufSize = sysconf(_SC_GETPW_R_SIZE_MAX);
++    if (bufSize <= 0)
++        bufSize = 16384;
++
++    std::vector<char> buf(sc<size_t>(bufSize));
++    passwd            pw     = {};
++    passwd*           result = nullptr;
++    if (getpwnam_r(value.c_str(), &pw, buf.data(), buf.size(), &result) != 0 || !result || result->pw_uid == LEASE_NOBODY) {
++        m_error += "invalid lessee (no such user) ";
++        return false;
++    }
++
++    m_rule.m_lessee = result->pw_uid;
++    return true;
++}
++
++bool CMonitorRuleParser::parseLeaseInterval(const std::string& value) {
++    uint64_t ms          = 0;
++    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), ms);
++    if (value.empty() || ec != std::errc{} || ptr != value.data() + value.size() || ms > LEASE_INTERVAL_MAX_MS) {
++        m_error += "invalid lease_interval ";
++        return false;
++    }
++
++    m_rule.m_leaseInterval = sc<uint32_t>(ms);
++    return true;
++}
++
+ void CMonitorRuleParser::setDisabled() {
+     m_rule.m_disabled = true;
+ }
+diff --git a/src/config/shared/monitor/Parser.hpp b/src/config/shared/monitor/Parser.hpp
+index 1b3fce14..802dd8e4 100644
+--- a/src/config/shared/monitor/Parser.hpp
++++ b/src/config/shared/monitor/Parser.hpp
+@@ -20,6 +20,8 @@ namespace Config {
+         bool                       parseSDRSaturation(const std::string& value);
+         bool                       parseVRR(const std::string& value);
+         bool                       parseICC(const std::string& value);
++        bool                       parseLessee(const std::string& value);        // a uid or a user name; empty for any
++        bool                       parseLeaseInterval(const std::string& value); // milliseconds, 0 to LEASE_INTERVAL_MAX_MS
+ 
+         void                       setDisabled();
+         void                       setMirror(const std::string& value);
 diff --git a/src/ipc/s1/Commands.cpp b/src/ipc/s1/Commands.cpp
-index b3d7a72d..d1d74737 100644
+index b3d7a72d..2ae00f2a 100644
 --- a/src/ipc/s1/Commands.cpp
 +++ b/src/ipc/s1/Commands.cpp
-@@ -256,6 +256,8 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
+@@ -208,6 +208,15 @@ std::string                                                       CCommandFormat
+     return format == eHyprCtlOutputFormat::FORMAT_JSON ? std::format("[{}]", reasonStr) : reasonStr;
+ }
+ 
++// who may lease the monitor, from the rule that last offered it: any, nobody (a lessee that did not resolve), or a uid
++static std::string lesseeToString(const PHLMONITOR& m) {
++    if (!m->m_leaseLessee)
++        return "any";
++    if (*m->m_leaseLessee == Config::LEASE_NOBODY)
++        return "nobody";
++    return std::to_string(*m->m_leaseLessee);
++}
++
+ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) {
+     std::string result;
+     if (!m->m_output || m->m_id == -1)
+@@ -256,6 +265,10 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
      "directScanoutTo": "{:x}",
      "directScanoutBlockedBy": {},
      "disabled": {},
 +    "leasable": {},
 +    "leased": {},
++    "lessee": "{}",
++    "leaseInterval": {},
      "currentFormat": "{}",
      "mirrorOf": "{}",
      "availableModes": [{}],
-@@ -288,10 +290,11 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
+@@ -288,10 +301,11 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
              sc<int>(m->m_reservedArea.right()), sc<int>(m->m_reservedArea.bottom()), m->m_scale, sc<int>(m->m_transform), tf(m == Desktop::focusState()->monitor()),
              tf(m->m_dpmsStatus), tf(m->m_output->state->state().adaptiveSync), rc<uint64_t>(m->m_solitaryClient.get()), getSolitaryBlockedReason(m, format),
              tf(m->m_tearingState.activelyTearing), getTearingBlockedReason(m, format), rc<uint64_t>(m->m_lastScanout.get()), getDSBlockedReason(m, format), tf(m->m_enabled),
@@ -205,7 +530,7 @@ index b3d7a72d..d1d74737 100644
 -            (NCMType::toString(m->m_cmType)), (m->m_sdrBrightness), (m->m_sdrSaturation), (m->m_sdrMinLuminance), (m->m_sdrMaxLuminance), tf(!m->shouldUseSoftwareCursors()),
 -            StringUtils::backendStr(m->m_output->getBackend()->type()), tf(m->m_output->parsedEDID.hdrMetadata.has_value()),
 -            tf(m->m_output->parsedEDID.chromaticityCoords.has_value()), tf(m->m_output->parsedEDID.supportsBT2020), tf(m->m_output->vrrCapable));
-+            tf(m->m_activeMonitorRule.m_leasable), tf(m->m_isBeingLeased), formatToString(m->m_output->state->state().drmFormat),
++            tf(m->m_activeMonitorRule.m_leasable), tf(m->m_isBeingLeased), lesseeToString(m), m->m_leaseInterval, formatToString(m->m_output->state->state().drmFormat),
 +            m->m_mirrorOf ? std::format("{}", m->m_mirrorOf->m_id) : "none", availableModesForOutput(m, format), (NCMType::toString(m->m_cmType)), (m->m_sdrBrightness),
 +            (m->m_sdrSaturation), (m->m_sdrMinLuminance), (m->m_sdrMaxLuminance), tf(!m->shouldUseSoftwareCursors()), StringUtils::backendStr(m->m_output->getBackend()->type()),
 +            tf(m->m_output->parsedEDID.hdrMetadata.has_value()), tf(m->m_output->parsedEDID.chromaticityCoords.has_value()), tf(m->m_output->parsedEDID.supportsBT2020),
@@ -213,16 +538,16 @@ index b3d7a72d..d1d74737 100644
  
      } else {
          result += std::format(
-@@ -299,7 +302,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
+@@ -299,7 +313,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
              "special workspace: {} ({})\n\treserved: {} {} {} {}\n\tscale: {}\n\ttransform: {}\n\tfocused: {}\n\t"
              "dpmsStatus: {}\n\tvrr: {}\n\tsolitary: {:x}\n\tsolitaryBlockedBy: {}\n\tactivelyTearing: {}\n\ttearingBlockedBy: {}\n\tdirectScanoutTo: "
              "{:x}\n\tdirectScanoutBlockedBy: {}\n\tdisabled: "
 -            "{}\n\tcurrentFormat: {}\n\tmirrorOf: "
-+            "{}\n\tleasable: {}\n\tleased: {}\n\tcurrentFormat: {}\n\tmirrorOf: "
++            "{}\n\tleasable: {}\n\tleased: {}\n\tlessee: {}\n\tleaseInterval: {}\n\tcurrentFormat: {}\n\tmirrorOf: "
              "{}\n\tavailableModes: {}\n\tcolorManagementPreset: {}\n\tsdrBrightness: {}\n\tsdrSaturation: {}\n\tsdrMinLuminance: {}\n\tsdrMaxLuminance: "
              "{}\n\thardwareCursorsInUse: {}\n\thardwareDetails:\n\t\tbackend: {}\n\t\thdr: {}\n\t\tchroma: {}\n\t\tbt2020: {}\n\t\tvrrCapable: {}\n\n",
              m->m_name, m->m_id, sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_refreshRate, sc<int>(m->m_position.x), sc<int>(m->m_position.y), m->m_shortDescription,
-@@ -309,11 +312,11 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
+@@ -309,11 +323,11 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
              sc<int>(m->m_reservedArea.left()), sc<int>(m->m_reservedArea.top()), sc<int>(m->m_reservedArea.right()), sc<int>(m->m_reservedArea.bottom()), m->m_scale,
              sc<int>(m->m_transform), yn(m == Desktop::focusState()->monitor()), sc<int>(m->m_dpmsStatus), m->m_output->state->state().adaptiveSync,
              rc<uint64_t>(m->m_solitaryClient.get()), getSolitaryBlockedReason(m, format), m->m_tearingState.activelyTearing, getTearingBlockedReason(m, format),
@@ -231,16 +556,16 @@ index b3d7a72d..d1d74737 100644
 -            (m->m_sdrSaturation), (m->m_sdrMinLuminance), (m->m_sdrMaxLuminance), (!m->shouldUseSoftwareCursors()), StringUtils::backendStr(m->m_output->getBackend()->type()),
 -            yn(m->m_output->parsedEDID.hdrMetadata.has_value()), yn(m->m_output->parsedEDID.chromaticityCoords.has_value()), yn(m->m_output->parsedEDID.supportsBT2020),
 -            yn(m->m_output->vrrCapable));
-+            rc<uint64_t>(m->m_lastScanout.get()), getDSBlockedReason(m, format), !m->m_enabled, m->m_activeMonitorRule.m_leasable, m->m_isBeingLeased,
-+            formatToString(m->m_output->state->state().drmFormat), m->m_mirrorOf ? std::format("{}", m->m_mirrorOf->m_id) : "none", availableModesForOutput(m, format),
-+            (NCMType::toString(m->m_cmType)), (m->m_sdrBrightness), (m->m_sdrSaturation), (m->m_sdrMinLuminance), (m->m_sdrMaxLuminance), (!m->shouldUseSoftwareCursors()),
-+            StringUtils::backendStr(m->m_output->getBackend()->type()), yn(m->m_output->parsedEDID.hdrMetadata.has_value()),
++            rc<uint64_t>(m->m_lastScanout.get()), getDSBlockedReason(m, format), !m->m_enabled, m->m_activeMonitorRule.m_leasable, m->m_isBeingLeased, lesseeToString(m),
++            m->m_leaseInterval, formatToString(m->m_output->state->state().drmFormat), m->m_mirrorOf ? std::format("{}", m->m_mirrorOf->m_id) : "none",
++            availableModesForOutput(m, format), (NCMType::toString(m->m_cmType)), (m->m_sdrBrightness), (m->m_sdrSaturation), (m->m_sdrMinLuminance), (m->m_sdrMaxLuminance),
++            (!m->shouldUseSoftwareCursors()), StringUtils::backendStr(m->m_output->getBackend()->type()), yn(m->m_output->parsedEDID.hdrMetadata.has_value()),
 +            yn(m->m_output->parsedEDID.chromaticityCoords.has_value()), yn(m->m_output->parsedEDID.supportsBT2020), yn(m->m_output->vrrCapable));
      }
  
      return result;
 diff --git a/src/output/Monitor.cpp b/src/output/Monitor.cpp
-index 259cdc6e..f2d17d06 100644
+index 259cdc6e..146bf1b0 100644
 --- a/src/output/Monitor.cpp
 +++ b/src/output/Monitor.cpp
 @@ -114,6 +114,12 @@ CMonitor::~CMonitor() {
@@ -273,7 +598,7 @@ index 259cdc6e..f2d17d06 100644
          m_listeners.frame.reset();
 +
 +        // a monitor disabled here can still be handed to a lessee, which is the "only for the VM" setup
-+        setLeaseOffered(monitorRule.m_leasable);
++        setLeaseOffered(monitorRule);
          return;
      }
  
@@ -281,7 +606,7 @@ index 259cdc6e..f2d17d06 100644
  
      setMirror(m_activeMonitorRule.m_mirrorOf);
  
-+    setLeaseOffered(m_activeMonitorRule.m_leasable);
++    setLeaseOffered(m_activeMonitorRule);
 +
      return true;
  }
@@ -304,19 +629,25 @@ index 259cdc6e..f2d17d06 100644
  
          m_events.modeChanged.emit();
  
-+        setLeaseOffered(m_activeMonitorRule.m_leasable);
++        setLeaseOffered(m_activeMonitorRule);
 +
          return true;
      }
  
-@@ -2317,6 +2341,89 @@ void CMonitor::commitDPMSState(bool state) {
+@@ -2317,6 +2341,104 @@ void CMonitor::commitDPMSState(bool state) {
          g_pHyprRenderer->damageMonitor(m_self.lock());
  }
  
-+void CMonitor::setLeaseOffered(bool offered) {
++void CMonitor::setLeaseOffered(const Config::CMonitorRule& rule) {
 +    // HMDs keep the upstream behaviour: onConnect offers them and only their destruction withdraws them
 +    if (!m_output || m_output->nonDesktop)
 +        return;
++
++    const bool offered = rule.m_leasable;
++
++    // offer() also re-checks which bindings of the lease device may see the output, so a lessee change takes effect now
++    m_leaseLessee   = rule.m_lessee;
++    m_leaseInterval = rule.m_leaseInterval;
 +
 +    bool found = false;
 +    for (auto const& [name, lease] : PROTO::lease) {
@@ -392,6 +723,15 @@ index 259cdc6e..f2d17d06 100644
 +        if (const auto& STATE = PMONITOR->m_output->state->state(); !STATE.mode && !STATE.customMode)
 +            PMONITOR->m_output->state->setMode(PMONITOR->m_currentMode ? PMONITOR->m_currentMode : PMONITOR->m_output->preferredMode());
 +
++        // The lessee may still have a flip queued (a lease revoked from hyprctl ends whenever the user says, not when the lessee is done),
++        // and may have left its framebuffers on the planes it held: the primary, which our modeset replaces, and the cursor, which it does
++        // not (aquamarine only touches the cursor plane when the cursor changes). A commit with no buffer is a blocking modeset: the kernel
++        // lets the lessee's last flip complete, then takes both planes off the CRTC. Only then does onConnect render to it again.
++        PMONITOR->m_output->state->resetExplicitFences();
++        PMONITOR->m_output->state->setEnabled(false);
++        if (!PMONITOR->m_state.commit())
++            LOG(Log::WARN, "Couldn't clear {} after its lease, reconfiguring it anyway", PMONITOR->m_name);
++
 +        PMONITOR->onConnect(false);
 +    });
 +}
@@ -399,7 +739,7 @@ index 259cdc6e..f2d17d06 100644
  void CMonitor::debugLastPresentation(const std::string& message) {
      LOG(Log::TRACE, "{} (last presentation {} - {} fps)", message, m_lastPresentationTimer.getMillis(),
          m_lastPresentationTimer.getMillis() > 0 ? 1000.0f / m_lastPresentationTimer.getMillis() : 0.0f);
-@@ -2597,6 +2704,13 @@ void CMonitorState::ensureBufferPresent() {
+@@ -2597,6 +2719,13 @@ void CMonitorState::ensureBufferPresent() {
  }
  
  bool CMonitorState::commit() {
@@ -413,7 +753,7 @@ index 259cdc6e..f2d17d06 100644
      if (m_owner->m_commitCoordinator->deferStateCommit())
          return true;
  
-@@ -2612,6 +2726,9 @@ bool CMonitorState::commit() {
+@@ -2612,6 +2741,9 @@ bool CMonitorState::commit() {
  }
  
  bool CMonitorState::test() {
@@ -424,38 +764,64 @@ index 259cdc6e..f2d17d06 100644
          return false;
  
 diff --git a/src/output/Monitor.hpp b/src/output/Monitor.hpp
-index f8187852..0ef12df3 100644
+index f8187852..fdc37494 100644
 --- a/src/output/Monitor.hpp
 +++ b/src/output/Monitor.hpp
-@@ -124,7 +124,7 @@ namespace Monitor {
+@@ -124,7 +124,11 @@ namespace Monitor {
          bool                        m_ratsScheduled = false;
          CTimer                      m_lastPresentationTimer;
  
 -        bool                        m_isBeingLeased = false;
 +        bool                        m_isBeingLeased = false; // releaseForLease() .. onLeaseEnded(): the lessee owns the output, nothing may commit to it
++        // from the rule that last offered the output for leasing (setLeaseOffered); see Config::CMonitorRule::m_lessee and m_leaseInterval
++        std::optional<uid_t>                                 m_leaseLessee;
++        uint32_t                                             m_leaseInterval = 0;
++        std::optional<std::chrono::steady_clock::time_point> m_lastLeaseGrant; // when a lease request last got as far as releasing the output
  
          Config::CMonitorRule        m_activeMonitorRule;
  
-@@ -289,6 +289,9 @@ namespace Monitor {
+@@ -289,6 +293,9 @@ namespace Monitor {
          void         onCursorMovedOnMonitor();
          void         setDPMS(bool on);
          bool         shouldUseSoftwareCursors();
-+        void         setLeaseOffered(bool offered); // DRM leasing, see protocols/DRMLease.cpp
++        void         setLeaseOffered(const Config::CMonitorRule& rule); // DRM leasing, see protocols/DRMLease.cpp
 +        bool         releaseForLease();
 +        void         onLeaseEnded();
  
          // IMonitorQueryable / IMonitorArrangeable
          virtual MONITORID                   id() const override;
 diff --git a/src/protocols/DRMLease.cpp b/src/protocols/DRMLease.cpp
-index 61433df2..033c9a2c 100644
+index 61433df2..e11160b6 100644
 --- a/src/protocols/DRMLease.cpp
 +++ b/src/protocols/DRMLease.cpp
-@@ -25,63 +25,92 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
+@@ -19,69 +19,131 @@ static SP<CDRMLeaseProtocol> leaseForParent(const WP<CDRMLeaseDeviceResource>& p
+     return IT == PROTO::lease.end() ? nullptr : IT->second;
+ }
+ 
++static uid_t clientUid(wl_client* client) {
++    // libwayland reads SO_PEERCRED once, when the client connects, so this is the uid that opened the connection, whatever the
++    // process has become since
++    uid_t uid = Config::LEASE_NOBODY;
++    if (client)
++        wl_client_get_credentials(client, nullptr, &uid, nullptr);
++    return uid;
++}
++
++// whether this client may lease the monitor: its rule names no lessee, or names this client's uid
++static bool clientMayLease(wl_client* client, const PHLMONITOR& monitor) {
++    return monitor && Config::leaseAllowedFor(monitor->m_leaseLessee, clientUid(client));
++}
++
+ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRequestResource> request) : m_resource(resource_) {
+     if UNLIKELY (!good())
+         return;
  
      m_parent    = request->m_parent;
      m_requested = request->m_requested;
 +    // held directly: the client may release the device object and keep the lease, and destroying the lease must still revoke it
 +    m_protocol = leaseForParent(m_parent);
++
++    const auto NOW = std::chrono::steady_clock::now();
  
      m_resource->setOnDestroy([this](CWpDrmLeaseV1* r) {
 -        if (const auto LEASE = leaseForParent(m_parent); LEASE)
@@ -484,6 +850,20 @@ index 61433df2..033c9a2c 100644
 -    }
  
 -    // grant the lease if it is seemingly valid
++        // the connector was advertised under the monitor's rule at the time; the rule may have changed since
++        if (!clientMayLease(m_resource->client(), c->m_monitor.lock())) {
++            LOG(Log::ERR, "Rejecting lease: {} is not leasable by uid {}", c->m_monitor->m_name, clientUid(m_resource->client()));
++            reject({});
++            return;
++        }
++
++        // lease_interval: refused before anything is released, so a client asking too often costs no modeset
++        if (Config::leaseTooSoon(c->m_monitor->m_leaseInterval, c->m_monitor->m_lastLeaseGrant, NOW)) {
++            LOG(Log::ERR, "Rejecting lease: {} was leased less than {} ms ago", c->m_monitor->m_name, c->m_monitor->m_leaseInterval);
++            reject({});
++            return;
++        }
++
 +        m_monitors.emplace_back(c->m_monitor);
 +    }
  
@@ -505,6 +885,9 @@ index 61433df2..033c9a2c 100644
 +    for (auto const& m : m_monitors) {
 +        const auto MON        = m.lock();
 +        const bool WAS_DRIVEN = MON->m_enabled;
++
++        // counted from here, granted or not: releasing is the modeset lease_interval is there to space out
++        MON->m_lastLeaseGrant = NOW;
 +
 +        if (!MON->releaseForLease()) {
 +            LOG(Log::ERR, "Rejecting lease: couldn't release {}", MON->m_name);
@@ -567,7 +950,7 @@ index 61433df2..033c9a2c 100644
      });
  
      LOG(Log::DEBUG, "Granting lease, sending fd {}", m_lease->leaseFD);
-@@ -91,22 +120,74 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
+@@ -91,22 +153,92 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
      close(m_lease->leaseFD);
  }
  
@@ -616,6 +999,24 @@ index 61433df2..033c9a2c 100644
      return m_resource->resource();
  }
  
++bool CDRMLeaseResource::holds(const PHLMONITOR& monitor) const {
++    return m_lease && m_lease->active && (!monitor || std::ranges::find(m_monitors, monitor) != m_monitors.end());
++}
++
++bool CDRMLeaseResource::revoke() {
++    if (!m_lease || !m_lease->active)
++        return false;
++
++    LOG(Log::DEBUG, "Revoking lease {} on request", m_lease->lesseeID);
++
++    // The same path as the client destroying its lease, except that the client is told (finished). terminate() revokes it in the kernel
++    // (drmModeRevokeLease), after which the lessee can no longer commit to the CRTC; a flip it already queued still completes, and its
++    // framebuffers stay on the planes until we commit. aquamarine then emits destroy, onLeaseGone runs, and the monitor is reconfigured
++    // from an idle callback that first waits out that flip and clears the planes (CMonitor::onLeaseEnded). Nothing here commits.
++    m_lease->terminate();
++    return true;
++}
++
  CDRMLeaseResource::~CDRMLeaseResource() {
 -    // destroy in this order to ensure listener gets called
 +    // The client destroyed wp_drm_lease_v1 (or went away): revoke the lease and give the outputs back. Revoke explicitly rather than
@@ -644,7 +1045,7 @@ index 61433df2..033c9a2c 100644
              LEASE->destroyResource(this);
      });
  
-@@ -129,7 +210,10 @@ CDRMLeaseRequestResource::CDRMLeaseRequestResource(WP<CDRMLeaseDeviceResource> p
+@@ -129,7 +261,10 @@ CDRMLeaseRequestResource::CDRMLeaseRequestResource(WP<CDRMLeaseDeviceResource> p
              return;
          }
  
@@ -656,7 +1057,7 @@ index 61433df2..033c9a2c 100644
              m_resource->error(WP_DRM_LEASE_REQUEST_V1_ERROR_WRONG_DEVICE, "Connector requested for wrong device");
              return;
          }
-@@ -176,25 +260,41 @@ CDRMLeaseConnectorResource::CDRMLeaseConnectorResource(WP<CDRMLeaseDeviceResourc
+@@ -176,25 +311,41 @@ CDRMLeaseConnectorResource::CDRMLeaseConnectorResource(WP<CDRMLeaseDeviceResourc
      if UNLIKELY (!good())
          return;
  
@@ -703,7 +1104,17 @@ index 61433df2..033c9a2c 100644
  bool CDRMLeaseConnectorResource::good() {
      return m_resource->resource();
  }
-@@ -218,6 +318,9 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
+@@ -209,7 +360,8 @@ void CDRMLeaseConnectorResource::sendData() {
+     m_resource->sendDone();
+ }
+ 
+-CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWpDrmLeaseDeviceV1> resource_) : m_deviceName(deviceName_), m_resource(resource_) {
++CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWpDrmLeaseDeviceV1> resource_) :
++    m_deviceName(deviceName_), m_resource(resource_), m_clientUid(clientUid(resource_->client())) {
+     if UNLIKELY (!good())
+         return;
+ 
+@@ -218,6 +370,9 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
              PROTO::lease.at(m_deviceName)->destroyResource(this);
      });
      m_resource->setRelease([this](CWpDrmLeaseDeviceV1* r) {
@@ -713,7 +1124,7 @@ index 61433df2..033c9a2c 100644
          if (PROTO::lease.contains(m_deviceName))
              PROTO::lease.at(m_deviceName)->destroyResource(this);
      });
-@@ -246,6 +349,15 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
+@@ -246,6 +401,15 @@ CDRMLeaseDeviceResource::CDRMLeaseDeviceResource(std::string deviceName_, SP<CWp
  
      LOG(Log::DEBUG, "Sending DRMFD {} to new lease device", fd.get());
      m_resource->sendDrmFd(fd.get());
@@ -729,11 +1140,30 @@ index 61433df2..033c9a2c 100644
  
      for (auto const& m : PROTO::lease.at(m_deviceName)->m_offeredOutputs) {
          if (m)
-@@ -259,14 +371,22 @@ bool CDRMLeaseDeviceResource::good() {
+@@ -259,14 +423,44 @@ bool CDRMLeaseDeviceResource::good() {
      return m_resource->resource();
  }
  
 -void CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
++bool CDRMLeaseDeviceResource::mayLease(const PHLMONITOR& monitor) const {
++    // a monitor whose rule names a lessee is not even advertised to anyone else: they never get a connector to name in a request
++    return monitor && Config::leaseAllowedFor(monitor->m_leaseLessee, m_clientUid);
++}
++
++bool CDRMLeaseDeviceResource::withdrawConnector(const PHLMONITOR& monitor) {
++    bool sent = false;
++
++    for (auto const& c : m_connectorsSent) {
++        if (!c || c->m_dead || c->m_monitor != monitor)
++            continue;
++
++        c->withdraw();
++        sent = true;
++    }
++
++    return sent;
++}
++
 +void CDRMLeaseDeviceResource::sendDone() {
 +    m_resource->sendDone();
 +}
@@ -741,6 +1171,9 @@ index 61433df2..033c9a2c 100644
 +bool CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
 +    // readvertise runs from an idle callback, by which time the monitor may have lost its output
 +    if (!monitor || !monitor->m_output)
++        return false;
++
++    if (!mayLease(monitor))
 +        return false;
 +
      if (std::ranges::find_if(m_connectorsSent, [monitor](const auto& e) { return e && !e->m_dead && e->m_monitor == monitor; }) != m_connectorsSent.end())
@@ -755,7 +1188,7 @@ index 61433df2..033c9a2c 100644
      }
  
      RESOURCE->m_parent = m_self;
-@@ -280,6 +400,8 @@ void CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
+@@ -280,6 +474,8 @@ void CDRMLeaseDeviceResource::sendConnector(PHLMONITOR monitor) {
      m_resource->sendConnector(RESOURCE->m_resource.get());
  
      RESOURCE->sendData();
@@ -764,7 +1197,7 @@ index 61433df2..033c9a2c 100644
  }
  
  CDRMLeaseProtocol::CDRMLeaseProtocol(const wl_interface* iface, const int& ver, const std::string& name, SP<Aquamarine::IBackendImplementation> backend_) :
-@@ -310,6 +432,7 @@ void CDRMLeaseProtocol::bindManager(wl_client* client, void* data, uint32_t ver,
+@@ -310,6 +506,7 @@ void CDRMLeaseProtocol::bindManager(wl_client* client, void* data, uint32_t ver,
      }
  
      RESOURCE->m_self = RESOURCE;
@@ -772,10 +1205,48 @@ index 61433df2..033c9a2c 100644
  }
  
  void CDRMLeaseProtocol::destroyResource(CDRMLeaseDeviceResource* resource) {
-@@ -352,6 +475,44 @@ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
-     }
- }
+@@ -333,8 +530,15 @@ void CDRMLeaseProtocol::destroyResource(CDRMLeaseResource* resource) {
  
+ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
+     std::erase_if(m_offeredOutputs, [](const auto& e) { return e.expired(); });
+-    if (std::ranges::find(m_offeredOutputs.begin(), m_offeredOutputs.end(), monitor) != m_offeredOutputs.end())
++    if (std::ranges::find(m_offeredOutputs.begin(), m_offeredOutputs.end(), monitor) != m_offeredOutputs.end()) {
++        // Already offered: the rule may have named another lessee since. Bindings that may no longer lease it lose their connector (a
++        // lease they already hold stays, as with any withdrawal), and ones that now may get one.
++        for (auto const& m : m_managers) {
++            if (m->mayLease(monitor) ? m->sendConnector(monitor) : m->withdrawConnector(monitor))
++                m->sendDone();
++        }
+         return;
++    }
+ 
+     if (monitor->m_output->getBackend()->type() != Aquamarine::AQ_BACKEND_DRM)
+         return;
+@@ -347,8 +551,50 @@ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
+     m_offeredOutputs.emplace_back(monitor);
+ 
+     for (auto const& m : m_managers) {
+-        m->sendConnector(monitor);
+-        m->m_resource->sendDone();
++        // a binding the monitor's lessee rule leaves out gets nothing, not even done
++        if (m->sendConnector(monitor))
++            m->m_resource->sendDone();
++    }
++}
++
++size_t CDRMLeaseProtocol::revoke(const PHLMONITOR& monitor) {
++    size_t revoked = 0;
++
++    // a copy: revoking runs the lease's destroy handlers
++    const auto LEASES = m_leases;
++    for (auto const& l : LEASES) {
++        if (l && l->holds(monitor) && l->revoke())
++            ++revoked;
++    }
++
++    return revoked;
++}
++
 +void CDRMLeaseProtocol::readvertise(PHLMONITOR monitor) {
 +    // "Upon destruction, the compositor should advertise the connector for leasing again": clients that destroyed their connector object
 +    // while leasing get a fresh one; the others already hold a live one and get nothing
@@ -799,35 +1270,25 @@ index 61433df2..033c9a2c 100644
 +
 +    // existing leases on it stay as they are, per protocol
 +    for (auto const& m : m_managers) {
-+        bool sent = false;
-+
-+        for (auto const& c : m->m_connectorsSent) {
-+            if (!c || c->m_dead || c->m_monitor != monitor)
-+                continue;
-+
-+            c->withdraw();
-+            sent = true;
-+        }
-+
-+        if (sent)
++        if (m->withdrawConnector(monitor))
 +            m->sendDone();
-+    }
-+}
-+
- std::string CDRMLeaseProtocol::getDeviceName() {
-     return m_deviceName;
+     }
  }
+ 
 diff --git a/src/protocols/DRMLease.hpp b/src/protocols/DRMLease.hpp
-index 603453c0..51b87bf5 100644
+index 603453c0..fc40192d 100644
 --- a/src/protocols/DRMLease.hpp
 +++ b/src/protocols/DRMLease.hpp
-@@ -32,10 +32,20 @@ class CDRMLeaseResource {
+@@ -32,10 +32,23 @@ class CDRMLeaseResource {
  
      struct {
          CHyprSignalListener destroyLease;
 +        CHyprSignalListener destroyMonitor;
      } m_listeners;
  
++    bool holds(const PHLMONITOR& monitor) const;
++    bool revoke();
++
    private:
 +    void              reject(const std::vector<PHLMONITOR>& released);
 +    void              onLeaseGone();
@@ -842,7 +1303,7 @@ index 603453c0..51b87bf5 100644
  };
  
  class CDRMLeaseRequestResource {
-@@ -50,6 +60,7 @@ class CDRMLeaseRequestResource {
+@@ -50,6 +63,7 @@ class CDRMLeaseRequestResource {
  
    private:
      SP<CWpDrmLeaseRequestV1> m_resource;
@@ -850,7 +1311,7 @@ index 603453c0..51b87bf5 100644
  };
  
  class CDRMLeaseConnectorResource {
-@@ -59,6 +70,7 @@ class CDRMLeaseConnectorResource {
+@@ -59,6 +73,7 @@ class CDRMLeaseConnectorResource {
  
      bool                                  good();
      void                                  sendData();
@@ -858,7 +1319,7 @@ index 603453c0..51b87bf5 100644
  
      WP<CDRMLeaseConnectorResource>        m_self;
      WP<CDRMLeaseDeviceResource>           m_parent;
-@@ -67,6 +79,7 @@ class CDRMLeaseConnectorResource {
+@@ -67,6 +82,7 @@ class CDRMLeaseConnectorResource {
  
    private:
      SP<CWpDrmLeaseConnectorV1> m_resource;
@@ -866,39 +1327,55 @@ index 603453c0..51b87bf5 100644
  
      struct {
          CHyprSignalListener destroyMonitor;
-@@ -80,7 +93,9 @@ class CDRMLeaseDeviceResource {
+@@ -80,7 +96,11 @@ class CDRMLeaseDeviceResource {
      CDRMLeaseDeviceResource(std::string deviceName, SP<CWpDrmLeaseDeviceV1> resource_);
  
      bool                                        good();
 -    void                                        sendConnector(PHLMONITOR monitor);
 +    void                                        advertise();
++    bool                                        mayLease(const PHLMONITOR& monitor) const;
 +    bool                                        sendConnector(PHLMONITOR monitor);
++    bool                                        withdrawConnector(const PHLMONITOR& monitor);
 +    void                                        sendDone();
  
      std::vector<WP<CDRMLeaseConnectorResource>> m_connectorsSent;
  
-@@ -89,6 +104,7 @@ class CDRMLeaseDeviceResource {
+@@ -89,6 +109,8 @@ class CDRMLeaseDeviceResource {
  
    private:
      SP<CWpDrmLeaseDeviceV1> m_resource;
 +    bool                    m_drmFdSent = false;
++    uid_t                   m_clientUid = sc<uid_t>(-1); // the bound client's, from its socket credentials
  
      friend class CDRMLeaseProtocol;
  };
-@@ -100,6 +116,8 @@ class CDRMLeaseProtocol : public IWaylandProtocol {
+@@ -100,6 +122,9 @@ class CDRMLeaseProtocol : public IWaylandProtocol {
      virtual void                           bindManager(wl_client* client, void* data, uint32_t ver, uint32_t id);
  
      void                                   offer(PHLMONITOR monitor);
 +    void                                   withdraw(PHLMONITOR monitor);
 +    void                                   readvertise(PHLMONITOR monitor);
++    size_t                                 revoke(const PHLMONITOR& monitor); // null: every active lease; returns how many were revoked
  
      SP<Aquamarine::IBackendImplementation> getBackend();
      std::string                            getDeviceName();
 diff --git a/tests/config/MonitorParser.cpp b/tests/config/MonitorParser.cpp
-index d64da058..c2d6a6fd 100644
+index d64da058..f5a62f54 100644
 --- a/tests/config/MonitorParser.cpp
 +++ b/tests/config/MonitorParser.cpp
-@@ -248,3 +248,24 @@ TEST(Config, monitorParserSetMirror) {
+@@ -2,6 +2,11 @@
+ 
+ #include <gtest/gtest.h>
+ 
++#include <chrono>
++#include <string>
++#include <vector>
++#include <pwd.h>
++
+ using namespace Config;
+ 
+ TEST(Config, monitorParserName) {
+@@ -248,3 +253,126 @@ TEST(Config, monitorParserSetMirror) {
      parser.setMirror("HDMI-A-1");
      EXPECT_EQ(parser.rule().m_mirrorOf, "HDMI-A-1");
  }
@@ -922,6 +1399,108 @@ index d64da058..c2d6a6fd 100644
 +    // a hard change alongside it still wins
 +    b.m_disabled = true;
 +    EXPECT_EQ(a.compare(b), COMPARISON_NO_MATCH);
++}
++
++TEST(Config, monitorRuleLeasesToAnyoneWithoutALimitByDefault) {
++    // without lessee and lease_interval a leasable output behaves as before they existed
++    CMonitorRuleParser parser("DP-1");
++    EXPECT_FALSE(parser.rule().m_lessee.has_value());
++    EXPECT_EQ(parser.rule().m_leaseInterval, 0u);
++    EXPECT_TRUE(leaseAllowedFor(parser.rule().m_lessee, 1000));
++    EXPECT_TRUE(leaseAllowedFor(parser.rule().m_lessee, 0));
++}
++
++TEST(Config, monitorParserLessee) {
++    CMonitorRuleParser p1("DP-1");
++    EXPECT_TRUE(p1.parseLessee("1001"));
++    EXPECT_EQ(p1.rule().m_lessee, std::optional<uid_t>(1001));
++    EXPECT_TRUE(p1.parseLessee("0"));
++    EXPECT_EQ(p1.rule().m_lessee, std::optional<uid_t>(0));
++    EXPECT_TRUE(p1.parseLessee("")); // empty: back to any client
++    EXPECT_FALSE(p1.rule().m_lessee.has_value());
++    EXPECT_FALSE(p1.getError().has_value());
++}
++
++TEST(Config, monitorParserLesseeByName) {
++    // a user name is resolved when parsed; a build sandbox may have no user database at all
++    if (!getpwnam("root"))
++        GTEST_SKIP() << "no user database here";
++
++    CMonitorRuleParser p("DP-1");
++    EXPECT_TRUE(p.parseLessee("root"));
++    EXPECT_EQ(p.rule().m_lessee, std::optional<uid_t>(0));
++    EXPECT_FALSE(p.getError().has_value());
++}
++
++TEST(Config, monitorParserLesseeThatDoesNotResolveLeasesToNobody) {
++    // a typo must close the monitor, not open it to every client
++    const std::vector<std::string> BAD = {"no-such-user-hyprland-test", "4294967295", "99999999999", "-1", "10 01"};
++    for (const auto& bad : BAD) {
++        CMonitorRuleParser p("DP-1");
++        EXPECT_FALSE(p.parseLessee(bad)) << bad;
++        EXPECT_EQ(p.rule().m_lessee, std::optional<uid_t>(LEASE_NOBODY)) << bad;
++        EXPECT_TRUE(p.getError().has_value()) << bad;
++        EXPECT_FALSE(leaseAllowedFor(p.rule().m_lessee, 1000)) << bad;
++        EXPECT_FALSE(leaseAllowedFor(p.rule().m_lessee, LEASE_NOBODY)) << bad;
++    }
++}
++
++TEST(Config, leaseIsAllowedOnlyForTheLesseeUid) {
++    EXPECT_TRUE(leaseAllowedFor(std::optional<uid_t>(1001), 1001));
++    EXPECT_FALSE(leaseAllowedFor(std::optional<uid_t>(1001), 1000));
++    EXPECT_FALSE(leaseAllowedFor(std::optional<uid_t>(1001), 0)); // root is not special
++    // LEASE_NOBODY is also what a client whose credentials could not be read reads as
++    EXPECT_FALSE(leaseAllowedFor(std::optional<uid_t>(LEASE_NOBODY), LEASE_NOBODY));
++}
++
++TEST(Config, monitorParserLeaseInterval) {
++    CMonitorRuleParser p1("DP-1");
++    EXPECT_TRUE(p1.parseLeaseInterval("2000"));
++    EXPECT_EQ(p1.rule().m_leaseInterval, 2000u);
++    EXPECT_TRUE(p1.parseLeaseInterval("0"));
++    EXPECT_EQ(p1.rule().m_leaseInterval, 0u);
++    EXPECT_TRUE(p1.parseLeaseInterval(std::to_string(LEASE_INTERVAL_MAX_MS)));
++    EXPECT_FALSE(p1.getError().has_value());
++
++    const std::vector<std::string> BAD = {"", "-1", "1.5", "2s", "3600001", "18446744073709551616"};
++    for (const auto& bad : BAD) {
++        CMonitorRuleParser p("DP-1");
++        EXPECT_FALSE(p.parseLeaseInterval(bad)) << bad;
++        EXPECT_EQ(p.rule().m_leaseInterval, 0u) << bad;
++        EXPECT_TRUE(p.getError().has_value()) << bad;
++    }
++}
++
++TEST(Config, leaseIntervalSpacesGrantsOnOneOutput) {
++    const auto T0 = std::chrono::steady_clock::now();
++    using std::chrono::milliseconds;
++
++    // no limit, or no grant yet
++    EXPECT_FALSE(leaseTooSoon(0, T0, T0));
++    EXPECT_FALSE(leaseTooSoon(1000, std::nullopt, T0));
++
++    EXPECT_TRUE(leaseTooSoon(1000, T0, T0));
++    EXPECT_TRUE(leaseTooSoon(1000, T0, T0 + milliseconds(999)));
++    EXPECT_FALSE(leaseTooSoon(1000, T0, T0 + milliseconds(1000)));
++    EXPECT_FALSE(leaseTooSoon(1000, T0, T0 + milliseconds(5000)));
++
++    // a time before the last grant never reads as long enough ago
++    EXPECT_TRUE(leaseTooSoon(1000, T0, T0 - milliseconds(1)));
++}
++
++TEST(Config, monitorRuleLeaseKeysAreSoftChanges) {
++    // who may lease and how often only change what the lease device offers: never a modeset
++    CMonitorRule a;
++    CMonitorRule b;
++    b.m_lessee = 1001;
++    EXPECT_EQ(a.compare(b), COMPARISON_SOFT_MISMATCH);
++
++    b                 = a;
++    b.m_leaseInterval = 1000;
++    EXPECT_EQ(a.compare(b), COMPARISON_SOFT_MISMATCH);
++
++    b = a;
++    EXPECT_EQ(a.compare(b), COMPARISON_FULL_MATCH);
 +}
 -- 
 2.55.0
