@@ -464,6 +464,9 @@ struct Kernel {
     fbs: Vec<(u32, u32)>,
     /// The timeout_nsec a SYNCOBJ_WAIT reached the host with.
     wait_timeout: Option<i64>,
+    /// "e2e-render"'s syncobj handles, and the object each names (the
+    /// memfd behind the syncobj file it was imported from, or its own).
+    syncobjs: BTreeMap<u32, String>,
     /// What "e2e-kms"'s lease looks like to GET_LEASE now.
     lease: LeaseState,
     /// GET_LEASE calls, and GETRESOURCES calls asking after the lease, kept
@@ -520,6 +523,9 @@ const ADDFB2: u32 = 0xc068_64b8;
 const CREATE_LEASE: u32 = 0xc018_64c6;
 const GRANT: u32 = 0xc00c_6452;
 const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
+const SYNCOBJ_CREATE: u32 = 0xc008_64bf;
+const SYNCOBJ_DESTROY: u32 = 0xc008_64c0;
+const SYNCOBJ_FD_TO_HANDLE: u32 = 0xc018_64c2;
 const SYNCOBJ_EVENTFD: u32 = 0xc018_64cf;
 const NVKMS: u32 = schema::NVKMS_IOCTL_IOWR;
 const LUT: usize = 6144;
@@ -694,6 +700,30 @@ fn main_ioctl(k: &mut Kernel, file: &str, cmd: u32, arg: &mut Arg<'_>) -> i32 {
             ("e2e-render", SYNCOBJ_WAIT) => {
                 k.wait_timeout = Some(peek(arg, top, 8, 8) as i64);
                 -libc::ETIME
+            }
+            // drm_syncobj_create_ioctl and drm_syncobj_fd_to_handle_ioctl
+            // (a syncobj file): a new handle, the lowest free (idr, from 1).
+            ("e2e-render", SYNCOBJ_CREATE) | ("e2e-render", SYNCOBJ_FD_TO_HANDLE) => {
+                let obj = if cmd == SYNCOBJ_CREATE {
+                    format!("created-{}", k.calls.len())
+                } else {
+                    assert_eq!(peek(arg, top, 4, 4), 0, "a syncobj file, not a sync_file");
+                    file_of(peek(arg, top, 8, 4) as i32)
+                };
+                let n = (1..).find(|n| !k.syncobjs.contains_key(n)).unwrap();
+                k.syncobjs.insert(n, obj);
+                poke(arg, top, 0, 4, u64::from(n));
+                0
+            }
+            // drm_syncobj_destroy_ioctl: EINVAL for a handle the file does
+            // not have (drm_syncobj.c:1311-1317).
+            ("e2e-render", SYNCOBJ_DESTROY) => {
+                let n = peek(arg, top, 0, 4) as u32;
+                if k.syncobjs.remove(&n).is_some() {
+                    0
+                } else {
+                    -libc::EINVAL
+                }
             }
             // drm_setmaster_ioctl / drm_dropmaster_ioctl on a card: no
             // argument at all, only the answer.
@@ -1299,6 +1329,14 @@ fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number(
         fn register(&self, _: RawFd, _: u32, _: u64, _: u32, _: RawFd) -> std::io::Result<()> {
             Ok(())
         }
+        fn available(
+            &self,
+            _: RawFd,
+            _: std::os::fd::BorrowedFd<'_>,
+            _: u64,
+        ) -> std::io::Result<bool> {
+            Ok(false)
+        }
     }
     fn watch(w: &mut World, key: RegKey, cookie: u64) -> Result<Watched, i32> {
         let mut regs = std::mem::take(&mut w.be.syncobj_regs);
@@ -1321,10 +1359,10 @@ fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number(
     let mut a = vec![0u8; 8];
     wr(&mut a, 0, 4, 3);
     w.mem.put(0x1000, &a);
-    // Whatever the host answers (this one has no syncobjs at all).
+    // Whatever the host answers (this one never made syncobj 3).
     assert_eq!(
         w.call_in(schema::Class::Render, render, DESTROY, 0x1000, 0),
-        Ok(-libc::ENOTTY)
+        Ok(-libc::EINVAL)
     );
     assert_eq!(watch(&mut w, key, c(3)), Ok(Watched::New));
     assert_eq!(w.be.syncobj_regs.len(), 2, "the orphan keeps its slot");
@@ -1336,6 +1374,80 @@ fn a_destroyed_syncobjs_wait_is_never_joined_by_the_next_syncobj_of_that_number(
     w.be.close_handle(render).unwrap();
     assert_eq!(watch(&mut w, key, c(4)), Ok(Watched::New));
     assert_eq!(w.be.syncobj_regs.len(), 1);
+}
+
+/// The backend follows a syncobj through the IOCTL2s that make and end
+/// the ways to it (fence.rs, `Reach`): a registration on a syncobj that was
+/// exported and imported back outlives the handle it was made on, and goes
+/// with the last one -- not before, even when the import consumed the file
+/// it came through.
+#[test]
+fn a_syncobj_imported_back_keeps_its_registrations_until_its_last_handle_goes() {
+    use crate::fence::{RegKey, SyncobjHost, Watched};
+    struct Host;
+    impl SyncobjHost for Host {
+        fn syncobj_file(&self, _: RawFd, _: u32) -> std::io::Result<OwnedFd> {
+            Ok(memfd(c"e2e-ours"))
+        }
+        fn register(&self, _: RawFd, _: u32, _: u64, _: u32, _: RawFd) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn available(
+            &self,
+            _: RawFd,
+            _: std::os::fd::BorrowedFd<'_>,
+            _: u64,
+        ) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+    let mut w = world();
+    w.be.syncobj_host = Arc::new(Host);
+    let render = w.render;
+    let class = schema::Class::Render;
+    w.mem.put(0x1000, &[0u8; 8]);
+    assert_eq!(w.call_in(class, render, SYNCOBJ_CREATE, 0x1000, 0), Ok(0));
+    let h = rd(w.mem.get(0x1000), 0, 4) as u32;
+    let key = RegKey {
+        render,
+        syncobj: h,
+        point: 9,
+        flags: 0,
+    };
+    let mut regs = std::mem::take(&mut w.be.syncobj_regs);
+    assert_eq!(
+        regs.watch(&Host, &mut w.be, -1, key, (1 << 32) | 1),
+        Ok(Watched::New)
+    );
+    w.be.syncobj_regs = regs;
+    // The export's syncobj file, as HANDLE_TO_FD would leave it in the
+    // table (the finish classifies a real one; a memfd is not).
+    let file =
+        w.be.adopt_for_test(memfd(c"e2e-syncobj"), HandleKind::Syncobj);
+    w.be.syncobj_regs.exported(render, h, file);
+    // FD_TO_HANDLE of it through guest fd 6, which the call consumes.
+    w.hooks.fds.insert(6, (file, I2_FD_CONSUME));
+    let mut a = vec![0u8; 24];
+    wr(&mut a, 8, 4, 6);
+    w.mem.put(0x2000, &a);
+    assert_eq!(
+        w.call_in(class, render, SYNCOBJ_FD_TO_HANDLE, 0x2000, 0),
+        Ok(0)
+    );
+    let h2 = rd(w.mem.get(0x2000), 0, 4) as u32;
+    assert_ne!(h2, h);
+    assert!(w.be.handles.kind(file).is_none(), "consumed");
+    assert_eq!(w.be.syncobj_regs.len(), 1);
+    let destroy = |w: &mut World, n: u32| {
+        let mut d = vec![0u8; 8];
+        wr(&mut d, 0, 4, u64::from(n));
+        w.mem.put(0x3000, &d);
+        w.call_in(class, render, SYNCOBJ_DESTROY, 0x3000, 0)
+    };
+    assert_eq!(destroy(&mut w, h), Ok(0));
+    assert_eq!(w.be.syncobj_regs.len(), 1, "handle {h2} still reaches it");
+    assert_eq!(destroy(&mut w, h2), Ok(0));
+    assert!(w.be.syncobj_regs.is_empty(), "gone with the last handle");
 }
 
 // ───────────────────────────── NVKMS ─────────────────────────────

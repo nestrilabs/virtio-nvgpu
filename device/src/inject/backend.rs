@@ -270,17 +270,16 @@ impl crate::nvidia::NvidiaBackend {
                 io::Error::from_raw_os_error(*e)
             )
         })?;
-        // The file now holds a syncobj someone else holds too: its handles'
-        // wait registrations wait out their firing rather than go with a
-        // DESTROY (fence.rs, `Registrations::before_ioctl2`), as after any
-        // import of a syncobj file.
-        self.syncobj_regs
-            .before_ioctl2(file, "SYNCOBJ_FD_TO_HANDLE", None);
         let (render, _) = self.handles.get(file).ok_or(libc::EBADF)?;
         let h = reg
             .host()
             .syncobj_import(render, syncobj.as_fd())
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        // The handle names a syncobj the helper holds too, for as long as
+        // it likes: the wait registrations on it wait out their firing
+        // rather than go when the guest's last way to it does (fence.rs,
+        // `Reach`).
+        self.syncobj_regs.foreign_handle(file, h);
         log::debug!("INJECT_OPEN_SYNCOBJ of id {id}: handle {h} of render handle {file}");
         Ok(u64::from(h))
     }

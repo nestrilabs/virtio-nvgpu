@@ -306,6 +306,7 @@ fn a_dmabuf_is_exported_only_on_a_render_handle_of_the_session() {
     let mut ops = TableSend {
         handles: &t,
         gate: gate(&semsurf, &taint),
+        syncobjs: Vec::new(),
     };
     let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
     assert_eq!(e(ops.prime_export(ev, 1)), Some(libc::EBADF));
@@ -339,6 +340,7 @@ fn a_fence_context_never_goes_to_the_compositor() {
     let mut ops = TableSend {
         handles: &t,
         gate: gate(&semsurf, &taint),
+        syncobjs: Vec::new(),
     };
     let e = |r: std::io::Result<OwnedFd>| r.unwrap_err().raw_os_error();
     assert_eq!(e(ops.prime_export(render, 7)), Some(libc::EINVAL));
@@ -400,6 +402,7 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
     let mut ops = TableSend {
         handles: &t,
         gate: gate(&semsurf, &taint),
+        syncobjs: Vec::new(),
     };
     let fd = ops.syncobj(so).unwrap();
     let link = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
@@ -410,6 +413,9 @@ fn a_syncobj_for_the_compositor_must_be_a_syncobj_handle_of_the_session() {
             Some(libc::EBADF)
         );
     }
+    // Noted, for the wait registrations: the compositor may hold it until
+    // the channel closes (fence.rs, `Reach`).
+    assert_eq!(ops.syncobjs, vec![so]);
 }
 
 #[test]
