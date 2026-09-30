@@ -231,8 +231,8 @@ wine_godot() { # <scene> <driver> <godot args...>
     meta "exit=$rc wall_s=$((SECONDS - t0))"
     # What it said before it failed: a guest keeps nothing of its disk.
     [ "$rc" = 0 ] || tail -n 40 "$OUT/app.log" | tr -d '\r' | sed 's/^/HEAVY-APP /'
-    wine_done
     grep -a '^HEAVY_GODOT' "$OUT/app.log" | tr -d '\r' | sed 's/^/HEAVY-META /'
+    wine_done
 }
 
 wine_heaven() {
@@ -254,8 +254,10 @@ wine_heaven() {
                 -extern_define "RELEASE,LANGUAGE_EN,QUALITY_$q,TESSELLATION_$tess"
     ) >"$OUT/app.log" 2>&1
     meta "exit=$? wall_s=$((SECONDS - t0)) quality=$q tessellation=$tess size=$size"
-    wine_done
+    # The frames first: MangoHud wrote them as the program ended, whatever
+    # Wine's teardown does next.
     mangohud_on && mh_tail $((HEAVY_SECS * 1000))
+    wine_done
 }
 
 zeroad() {
