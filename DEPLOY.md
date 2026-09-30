@@ -108,7 +108,7 @@ A new NVIDIA release is refused until it is measured. Before upgrading a host:
 
 | | nesbox | crosvm |
 |---|---|---|
-| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v6` (not yet merged upstream; `v5` and later size the window from the backend and prefault it, `v6` adds the jailer's own `/proc` and `/sys`) | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0010` (`0010`, the prefault, is optional: performance only) |
+| where | [github.com/nestrilabs/nesbox](https://github.com/nestrilabs/nesbox), branch `virtio-nvgpu-v6` (not yet merged upstream; `v5` and later size the window from the backend and prefault it, `v6` adds the jailer's own `/proc` and `/sys`) | upstream crosvm `c0474109d64d` with [`patches/crosvm/`](patches/crosvm/) `0001`-`0011` (`0010` and `0011`, the window and guest RAM prefaults, are optional: performance only) |
 | graphics (Vulkan, GL, EGL, Vulkan Video) | run on hardware | run on hardware |
 | `--allow-compute` (CUDA, NVENC/NVDEC through CUDA, OpenCL) | run on hardware | run on hardware (needs `0007`-`0009`; its nvgpu frontend runs jailed) |
 | Wayland client of the host compositor, direct scanout | run on hardware | run on hardware |
@@ -324,6 +324,13 @@ the backend logs the same line, `window use:`, when the VM stops):
 | vkmark | 0.1 | 2.5 | 14.2 | 2 |
 | Chromium, animation | 0.1 | 2.5 | 23.2 | 4 |
 | render probe with CUDA | 0.1 | 2.0 | 54.0 | 40 |
+| Blender EEVEE, GL, heavy scene | 0.1 | 1952.0 | 90.8 | 72.1 |
+| Blender EEVEE, Vulkan, heavy scene | 0.1 | 994.5 | 89.7 | 256 |
+
+The heavy scenes are BENCHMARKS.md's ("Heavy workloads": 150 subdivided
+meshes, ray tracing and volumetrics, 64 samples at 1920x1080), with a 16 GiB
+window at 90%; at the default window Blender is refused its mappings
+(`SHM WriteCombine zone: guest process ... may not take`) and segfaults.
 
 UC never passed half a MiB, so it does not grow. Every application here used
 more write-back than write-combining, and Blender's 86 MiB is three quarters
@@ -344,6 +351,18 @@ from the VM's other processes the chance to map much at once
 (SECURITY.md, "The window's size and share": from 88 %, one process can leave the others only the
 reserve).
 
+**A VM for creative applications** (Blender, a 3D editor, a large scene
+in an engine's editor) wants `--window-size 8192` at the default share:
+a WC zone of 6,318 MiB, of which one process may hold 3,159 -- the heavy
+scene above needs 1,952 -- and a WB zone of 1,842. Blender's GL and
+Vulkan backends both ran the heavy scene at 8192 and 50% (BENCHMARKS.md,
+"Heavy workloads"); 4096 at 50% (1,574 MiB of WC a process) is too small
+for its GL backend. The default stays at 1 GiB because a window's size is
+also what one VM may take from the host: up to its WC zone of the GPU's
+BAR1, shared with the desktop and every other VM (6.2 GiB of an RTX 5090's
+32 at 8192), and under crosvm up to the whole window in host memory (below).
+A games VM uses a few tens of MiB of it.
+
 **What it costs the host.**
 
 - *BAR1.* Video memory a guest maps is mapped through the GPU's BAR1, which
@@ -362,7 +381,11 @@ reserve).
   faulted in and charged, like guest RAM, to the VMM's cgroup, up to the
   window's size. No guest driver path does that, but a guest kernel can, so
   under crosvm size the VMM's `MemoryMax` as guest RAM plus the window (plus
-  its own overhead).
+  its own overhead). Guest RAM itself is committed whole as the VM starts
+  under both VMMs as the launcher runs them (nesbox's prefault, crosvm's
+  `--prefault-memory`, `patches/crosvm/0011`), not as the guest first
+  touches it; `NVGPU_PREFAULT=0` turns that off for either, at the cost of
+  frame-time stalls in a guest that reaches new memory long after boot.
 - *Address space.* crosvm puts the window and the UVM aperture in one BAR,
   the next power of two above both (16 GiB plus the aperture is a 32 GiB
   BAR) and refuses past 64 GiB; nesbox puts each in a BAR of its own in a
@@ -450,11 +473,15 @@ frames in the guest, one natively); with it everywhere, it missed 38 against nat
   isolated cpuset partition (root; nesbox's `vcpu_cgroup_fd`,
   `io_cgroup_fd`), then `vcpu_pins` and `dedicated` -- which the confined-load
   runs stand in for: there the guest paced as natively.
-- **Guest RAM on huge pages is already the case under nesbox**: it prefaults
-  guest RAM and collapses it into THP (`ShmemPmdMapped` covered all 4 GiB in
-  every run). `NVGPU_PREFAULT=0` brought 10 ms first-touch stalls back.
-  crosvm's `--hugepages` (`NVGPU_HUGEPAGES=transparent`) made no measurable
-  difference.
+- **Guest RAM prefaulted and on huge pages**: nesbox prefaults guest RAM
+  and collapses it into THP by default (`ShmemPmdMapped` covered all 4 GiB
+  in every run), and crosvm does with `--prefault-memory`
+  (`patches/crosvm/0011`), which the launcher passes. `NVGPU_PREFAULT=0`
+  brings the first-touch stalls back: 10 ms frames under nesbox, and under
+  crosvm bursts of 20-40 ms frames long after boot that halved a 4K game's
+  0.1% low (BENCHMARKS.md, "Heavy workloads"). crosvm's `--hugepages`
+  (`NVGPU_HUGEPAGES=transparent`) alone makes no difference: a memfd's huge
+  pages are the shmem policy's.
 - **crosvm**: its default per-vCPU core scheduling cost the most of any
   setting tried -- under the load, SuperTuxKart missed 178 vblanks against
   5 with `--core-scheduling=false` (`NVGPU_CROSVM_CORE_SCHED=0`), and on an

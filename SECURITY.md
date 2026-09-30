@@ -764,7 +764,7 @@ It is the operator's choice for a VM that runs one heavy application.
 | | what the backend opens |
 |---|---|
 | device files | `/dev/nvidiaN`, `/dev/nvidiactl`, `/dev/nvidia-modeset` and this GPU's render nodes; `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools` only with `--allow-compute`; `/dev/dri/card*` (`--kms-card` only, through OPEN_KMS; a plain OPEN of a card is refused); lessee files received from the compositor, which must classify as a lease of this GPU; and `/dev/udmabuf` |
-| other files | `/proc/driver/nvidia`, each GPU's PCI directory in sysfs, the `--pci-config-dir` snapshot (read before the sandbox), memfds for shm pools, blobs and a sealed page, and readlink of `/proc/self/fd` and `/proc/self/fdinfo` |
+| other files | `/proc/driver/nvidia`, each GPU's PCI directory in sysfs, the `--pci-config-dir` snapshot (read before the sandbox), memfds for shm pools, blobs and a sealed page, and readlink of `/proc/self/fd` (through an `O_PATH` descriptor of the directory, kept) and `/proc/self/fdinfo` |
 | vhost-user socket | a listening socket handed to it (systemd's socket activation, or `--socket-fd`: "The backend's socket"); else by default `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` in a 0700 directory, refused if the directory is anyone else's, where a file already at the path is removed only if it is a socket of the backend's uid, and anything else stops the start (`device/src/posture.rs`) |
 | other sockets | with `--wayland-socket`, one connection to the compositor per channel plus a probe connection; with `--wayland-export`, a listener created 0600 that admits only peers of the backend's uid, with 16 pending; with `--inject-socket`, a `SOCK_SEQPACKET` listener (created 0600 and opened to the capture helper's group by root after start, or handed over by the socket unit) that serves only `--inject-uid`, four connections at once ("Capture injection") |
 | netlink | `NETLINK_KOBJECT_UEVENT`, receive only, with `--kms-card` or `--wayland-lease` |
@@ -1325,7 +1325,7 @@ namespace); `"unshare-network": true` is for unjailed runs.
 
 ### crosvm
 
-`patches/crosvm/` (ten patches; `patches/README.md` says what each is):
+`patches/crosvm/` (eleven patches; `patches/README.md` says what each is):
 every request is bounds-checked against the region the backend reported
 (overflow-checked, page-aligned offsets, overlaps refused, unmaps must name a
 live mapping, reset unmaps all); GPU and external maps are refused for the
@@ -1494,6 +1494,25 @@ placement it has made, after answering it. What this adds and does not:
   made (patch 0007) and which holds the VM; the jailed frontend is
   unchanged. nesbox does it in the VMM process; the call is an `ioctl`,
   which both VMMs' filters already allow.
+
+### Guest RAM under crosvm
+
+`--prefault-memory` (`patches/crosvm/0011`), which the launcher passes when
+the binary has it, brings crosvm to what nesbox does by default
+(BENCHMARKS.md, "Heavy workloads": without it a game in a crosvm guest
+stalled on host page faults). Guest RAM is faulted in
+(`MADV_POPULATE_WRITE`) and collapsed into 2 MiB pages (`MADV_COLLAPSE`) by
+a thread of crosvm's main process as the vCPUs start. It touches only the
+memory crosvm already maps as guest RAM, writes nothing (a page the guest
+reached first stays as it is), and gives the guest nothing it could not
+reach; the collapse moves contents between pages the way khugepaged does.
+It runs after every device process is forked, so no jail inherits the
+thread. The cost is host memory: all of guest RAM is committed as the VM
+starts, not as the guest first uses it, which a VMM unit's `MemoryMax` must
+allow for already (it bounds what the guest could touch anyway). File
+mappings are placed so their address is as far past a 2 MiB boundary as
+their offset (`0011`'s change to base's `align`), which changes where, not
+what, is mapped. `NVGPU_PREFAULT=0` leaves it off.
 
 ### The GPU's PCI address
 
@@ -2009,6 +2028,64 @@ first and takes whatever arrived while it was off (the virtio core's
 sleeper is woken by the interrupt, never by a spinner, so a spinner whose
 vCPU the host deschedules delays only itself. Once the transport is dead (a
 reset, a removal) nothing here touches the queue.
+
+**Heavy workloads** (branch `heavyfix`; BENCHMARKS.md, "Heavy
+workloads"). Four changes to the per-frame path, each holding what it
+replaces to the same strength:
+
+- *Classifying a descriptor the host made* (`hostfd::classify`) reads its
+  `/proc/self/fd` link with `readlinkat` through an `O_PATH` descriptor of
+  that directory kept for it, into a stack buffer, instead of formatting
+  and resolving the path. The same text is matched against the same names
+  (byte for byte; the names are ASCII, so exactly what the lossy
+  conversion matched); a text that fills the 512-byte buffer, a directory
+  that cannot be opened and a link that cannot be read through it all fall
+  back to the path, and whatever cannot be read is still `Other`. The
+  kept descriptor is registered as the backend's own (`privfd`), so no host
+  call's answer can be adopted as it, and it is keyed by a fork count
+  (`sys::proc::fork_generation`, a pthread_atfork handler): in a forked
+  child, `/proc/self` as resolved in the parent would name the parent's
+  table, so the child opens its own (and leaves the parent's number
+  unclosed: it may be something else there now).
+- *An IOCTL2 the schema says never waits* -- every render-node call but a
+  few, all the syncobj calls -- runs from preparing to finishing under the
+  one hold of the backend mutex that serving it takes, on the handle
+  table's own descriptor for the target (`session.rs serve_ioctl2`). The
+  duplicate it used to take was there so a CLOSE racing the host call could
+  not pull the file away while the mutex was released; with the mutex held
+  throughout, no CLOSE, bury or reset can change the table, so the
+  descriptor is the one the call was checked against. Executor calls keep
+  their duplicate and run unlocked as before, and a call without a
+  duplicate that reached an executor would be answered as cancelled, never
+  run on a bare number. What changes is who waits: the mutex's other
+  holders, for the few microseconds such a call takes on the host.
+- *A SYNCOBJ_DESTROY the guest can prove will succeed is posted*
+  (`driver/nvgpu_syncobj.c`, "SYNCOBJ_DESTROY, posted"): the calling
+  process is answered 0 at once and the request goes on the control ring
+  ahead of anything sent after it, where the backend serves it exactly as
+  a waited-for one -- the same IOCTL2, the same checks, its registrations
+  orphaned, its reply reaped by the transport. Natively only a non-zero pad
+  or a handle the file does not hold fails; the guest posts only for a zero
+  pad and a handle its per-file map says the file holds, and that map never
+  holds one the host does not (the invariant and why it holds are in the
+  driver). Anything else goes synchronously and gets the host's own error,
+  so a process still sees every failure it would natively. The backend's
+  accounting is unchanged, since what it receives is unchanged; a posted
+  request that fails there anyway is logged and counted (`posted_failed`).
+- *The pump waits on an armed RM descriptor with `poll(2)`, and on an
+  unarmed one not at all* (`pump.rs Pump::wait`). Such descriptors used to
+  sit in the pump's epoll set whether armed or not, and a Vulkan game's
+  driver woke the pump 150,000 times a second for events nobody waited on.
+  They cannot be moved in and out of epoll, because RM's `poll` clears a
+  dataless event as it reports it and epoll polls twice when a descriptor
+  is added or modified with an event pending: an event arriving as the
+  descriptor was re-armed would be lost, and a guest waiting on it would
+  wait until its timeout. `poll(2)` polls each descriptor once a pass and
+  returns what that pass found, and the arm's own look is a single poll
+  too, so every event RM clears is one the pump reports. An unarmed
+  descriptor's events stay in RM, where the next arm finds them. What is
+  polled, and on whose behalf, is as before: the guest's own handles, only
+  while it waits on them.
 
 ---
 
@@ -3795,6 +3872,30 @@ passed), and the live app batch (glxgears, vkmark, stk, chromeanim) 11/0/0.
 The PCI config path was shown with a synthetic snapshot (the rig has no
 root): the guest's `lspci -vvv` reads `Capabilities: [40] Null` without it
 and the snapshot's PCIe capability and link with it.
+
+### A.13 Heavy workloads, the fixes (`heavyfix`)
+
+Branch `heavyfix`: the fixes for what BENCHMARKS.md, "Heavy workloads"
+measured. What each does at the boundary is in Part I -- "Frame pacing"
+(descriptor classification through a kept directory, render calls under one
+hold of the mutex without a duplicate, the guest's posted SYNCOBJ_DESTROY,
+the pump's `poll(2)` for armed RM descriptors) and "Guest RAM under crosvm"
+(`patches/crosvm/0011`). None lifts a cap or a check, and none changes what
+the backend accepts: the classification matches the same texts, every call
+is parsed and refused as before, and the backend receives the same DESTROY
+whether or not the guest waits for it.
+
+Tried and not kept: a crosvm option turning off the kernel PIT's
+re-injection, which KVM pairs with an AVIC inhibit. It made no measurable
+difference to crosvm's round trips or frame rates, so it adds nothing to
+weigh against being one more thing that differs from upstream. What does
+close crosvm's remaining gap to nesbox is its per-vCPU core scheduling
+(`NVGPU_CROSVM_CORE_SCHED=0`); that stays on by default, a security choice
+(DEPLOY.md, "Frame pacing"), and BENCHMARKS.md, "Heavy workloads" has what
+it costs and a middle way for the deployment to weigh.
+
+Proposed, not made: a host kernel flag for `KVM_PRE_FAULT_MEMORY` that maps
+for write (`patches/linux/`, a draft applied nowhere).
 
 ## Appendix B. Against `dev`
 

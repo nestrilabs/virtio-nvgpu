@@ -92,9 +92,9 @@ patch changes no headers, so the ABI is unchanged.
 
 # crosvm
 
-`crosvm/` is a series of ten patches against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets
+`crosvm/` is a series of eleven patches against upstream crosvm (`c0474109d64d`, 2026-09-25) that lets
 crosvm be the VMM, as the frontend of `vhost-user-nvgpu` (README.md, "What a VMM must do"; rig/TESTING-RIG.md,
-"crosvm"). All ten have run on an RTX 5090, graphics and compute, the frontend jailed; `0007` and `0010`
+"crosvm"). All eleven have run on an RTX 5090, graphics and compute, the frontend jailed; `0007` and `0010`
 were changed by the 2026-09-29 review (SECURITY.md, Appendix A) after that run, and `scripts/ci.sh deploy` checks
 that the series still applies:
 
@@ -110,12 +110,19 @@ that the series still applies:
 | `0008-devices-virtio-nvgpu-s-UVM-aperture-in-the-window-s-.patch` | more than one shared memory region per virtio-pci device (`VirtioDevice::get_extra_shared_memory_regions`, empty by default), each with its own capability at its own offset of the one BAR; the transport reports the layout, and the queue notification addresses, to the main process. The nvgpu frontend takes regions by id and publishes region 2, the UVM aperture, when the backend reports it (`--allow-compute`), checks each pool itself first and sends it as `RegisterUvmPool`; crosvm wires the restricted tubes, and reserves the band at the start of `run_config` when a device is of type nvgpu |
 | `0009-devices-run-the-nvgpu-vhost-user-frontend-in-a-jaile.patch` | with the sandbox on, the nvgpu vhost-user frontend runs in a minijail'd process of its own under `vhost_user_frontend_device.policy` (common device syscalls, `getrandom`, `prctl` names; `open` refused; no socket, no ioctl beyond vmm-swap's); a test forks the real frontend under the embedded policy against a fake backend and main process; `run --help` names the `nvgpu-uvm-aperture` for the launcher to detect. Other vhost-user types keep upstream's in-process frontend. No virtio device's control tube may ask for a hot-plug |
 | `0010-vm_control-prefault-virtio-nvgpu-s-window-mappings.patch` | the main process prefaults each window mapping it has made (`KVM_PRE_FAULT_MEMORY`, Linux 6.11 or later) through one spare vCPU that never runs, made only for an nvgpu device and only when KVM has the capability, before the guest's vCPUs, with an id past every guest vCPU's (so past every APIC id the ACPI tables list, `--host-cpu-topology` included); a hint on a thread of its own with a 1,024-range queue, which stops for good at the first ENOSYS, ENOTTY or EOPNOTSUPP. Performance only: without it the guest faults the pages in itself (SECURITY.md, "Prefaulting the window") |
+| `0011-crosvm-prefault-memory-guest-RAM-faulted-in-and-on-2.patch` | `--prefault-memory`: a thread of the main process, started with the vCPUs (after every device process is forked), faults in all of guest RAM (`MADV_POPULATE_WRITE`) and collapses it into 2 MiB pages (`MADV_COLLAPSE`, which a `shmem_enabled=never` host allows), as nesbox does by default; base's `align` for a file mapping aligns the address relative to the file offset, which the guest RAM region at 1 MiB needs to take huge pages. Performance only: without it the guest stalls on host page faults for memory it reaches the first time, long after boot (BENCHMARKS.md, "Heavy workloads") |
 
 To apply and build: the top of `rig/rig-build-crosvm.sh` (`CROSVM_SRC`, `CROSVM_OUT` build another
 checkout to another binary). `0001`-`0006` are graphics only, with the frontend in crosvm's main process
 as upstream has it; `0007`-`0009` add compute and jail the frontend, and change no other device's
-seccomp policy or minijail setting; `0010` is optional, for speed. What the main process checks:
-SECURITY.md, "The VMMs".
+seccomp policy or minijail setting; `0010` and `0011` are optional, for speed (the launcher passes
+`0011`'s option when the binary has it). What the main process checks: SECURITY.md,
+"The VMMs".
+
+# Linux
+
+`linux/` holds drafts for the host kernel, applied nowhere: a cost measured here that has no fix inside
+the project. [`linux/README.md`](linux/README.md) says what each is and how far it has been taken.
 
 ## Why each VMM carries its own checks
 

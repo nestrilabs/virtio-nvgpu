@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `heavyfix` on `8fe984f`: IOCTL2 path, posted SYNCOBJ_DESTROY, the pump, crosvm `0011` | the heavy workloads before and after; stage1, compat, render (with and without compute), wayland and secneg under nesbox and crosvm, C parsers, and stage1, render and wayland with the Rust parsers | "Heavy workloads" |
 | 2026-09-29 | `492f29b` (branch `integrate30`): the review's fixes and the restructuring after them | Groups A and B under nesbox (C and Rust modules) and crosvm, and two batches of live applications | "Regression of the restructured tree" |
 | 2026-09-29 | the 2026-09-29 review's backend fixes | Groups A and B under nesbox and crosvm, and a batch of live applications | "Regression of the 2026-09-29 review's backend fixes" |
 | 2026-09-29 | branch `perf` (nesbox `virtio-nvgpu-v5`, crosvm with `0010`) | Groups A and B under both VMMs, C and Rust modules, the benchmarks, part of the application pass | "Benchmarks" |
@@ -258,7 +259,7 @@ NVGPU_VMM_KIND=crosvm NVGPU_APPS_EXTRA=nvgpu_user=1 rig/rig-app-check.sh \
 ```
 
 Build crosvm from upstream (c0474109d64d, 2026-09-25) with the whole series,
-all ten patches of `patches/crosvm/` (patches/README.md says what each is
+all eleven patches of `patches/crosvm/` (patches/README.md says what each is
 for; `scripts/ci.sh deploy` checks they still apply), on a branch of its
 own:
 
@@ -298,6 +299,14 @@ starts the main process in a user and network namespace of its own
 `--disable-sandbox`, and says so at the top of the console log; the
 frontend is then in the main process, and the main process's checks
 (SECURITY.md, "The VMMs") still hold.
+
+The launcher passes `--prefault-memory` (`0011`) whenever the binary has
+it, and says on the terminal when it does not: guest RAM faulted in and on
+2 MiB pages as the VM starts, as nesbox does (`NVGPU_PREFAULT=0` leaves it
+out; the console log has crosvm's `prefault:` line with how much went
+huge). Without it a game in a crosvm guest stalls for a frame of 20-40 ms
+whenever it reaches memory the guest has not used yet (BENCHMARKS.md,
+"Heavy workloads").
 
 Not under crosvm yet: a virtiofs share, and the root layout.
 
@@ -916,6 +925,39 @@ NVGPU_CMDLINE_EXTRA="nvgpu_wl=1 nvgpu_timeout=900 nvgpu_cmd=$(printf %s \
 NVGPU_COMPUTE=1 NVGPU_WINDOW_MIB=16384 NVGPU_WINDOW_SHARE=90 NVGPU_ROOTFS=... \
     rig/run-guest.sh --wayland-socket "$(cat .rig/run/headless-sway.socket)" run hw1
 ```
+
+**The fixes' runs** (branch `heavyfix`, BENCHMARKS.md, "Heavy workloads",
+"The fixes"). The pacing report says what each change does: the guest's
+`posted` and `posted_failed` (SYNCOBJ_DESTROYs sent without waiting, and any
+the host then refused -- none in any run), `pump woke N/s` on the backend's
+`legacy readiness` line, and crosvm's `prefault:` line in the console log
+(how long guest RAM took, and how much went on 2 MiB pages). The regression
+subset with the branch's backend, guest module and crosvm, sandbox on,
+allowlist enforcing, 2026-09-30:
+
+| probe | nesbox, C parsers | crosvm, C parsers | nesbox, Rust parsers |
+|---|---|---|---|
+| stage1 | 6/0/0 (7 boots; one more stalled, below) | 6/0/0 | 6/0/0 |
+| compat | 12/0/0 | 12/0/0 | -- |
+| render | 9/0/1 | 9/0/1 | 9/0/1 |
+| render, `--allow-compute` | 9/0/1 | 9/0/1 | -- |
+| wayland (headless sway) | 11/0/3 | 11/0/3 | 11/0/3 |
+| secneg, `kms=none` | 3/0/1 | 3/0/1 | -- |
+
+Counts are pass/fail/skip. The images were round one's heavy and base
+images with the branch's module put in (`mkimage.sh --module-only`), so
+`secneg` ran the tests that image has, not `8fe984f`'s T12 and T13.
+
+Two starts under nesbox with the branch stalled before any device call:
+one stage1 whose `vulkaninfo` never opened a device node (guest-check timed
+out at 60 s; the backend saw nothing but TIME_SYNC), and one SuperTuxKart
+start that opened three nodes and made no call. Neither came back in six
+more stage1 boots each way, 60 `vulkaninfo` start-ups each way in one guest,
+or some 40 other SuperTuxKart starts with the branch; nothing that reached
+the backend differed. Not explained. One more SuperTuxKart start (nesbox,
+the branch) quit at once with "Could not initialize display": its Wayland
+connection to the headless sway failed before any device call was made
+(only Wayland messages had crossed), which no change here touches.
 
 `rig/heavy/rmlog.c` (LD_PRELOAD) logs the RM controls a program makes that
 fail, and every DISABLE_CHANNELS with its parameters; natively,

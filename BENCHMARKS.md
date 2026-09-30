@@ -285,9 +285,10 @@ answer never share a core. With `--core-scheduling=false`
 (`NVGPU_CROSVM_CORE_SCHED=0`, two runs, the same build) a mailbox Vulkan
 client went from 2,755 to 4,962 fps ("clear") and from 3,219 to 5,954
 ("cube"). That is a security trade for the deployment to make (DEPLOY.md,
-"Frame pacing"; SECURITY.md, "Frame pacing"); the default stays. crosvm also does not prefault guest RAM: a guest's first
-touch of its own memory runs at 0.4 GB/s against nesbox's 8
-(`--hugepages` made no difference).
+"Frame pacing"; SECURITY.md, "Frame pacing"); the default stays. crosvm did
+not prefault guest RAM either: a guest's first touch of its own memory ran at
+0.4 GB/s against nesbox's 8 (`--hugepages` made no difference); with
+`patches/crosvm/0011` it does ("Heavy workloads").
 
 ## What remains, and why
 
@@ -404,6 +405,9 @@ DP-3 at 3840x2160 and 240 Hz, vsync on, through Hyprland's composition
 frame missed a vblank either way.
 
 ### Where the time went
+
+Round one's diagnosis; what has been fixed of it since is in "The fixes",
+below.
 
 **1. GPU-bound frames run at native speed.** At 4-5 ms a frame a guest
 under nesbox is within 1% of native, and so are its lows; on a monitor it
@@ -555,35 +559,144 @@ would be lost, and a guest waiting on it would hang.
   their 20 s and exited. Still unexplained; at one in eight, 36 clean runs
   would happen by chance about one time in 120.
 
+### The fixes
+
+Branch `heavyfix`, on `display-passthrough` at `8fe984f`, 2026-09-30. The
+same harness, host and guest (4 vCPUs, 8 GiB, `--allow-compute`, 4K and
+720p against the headless sway). **Before** is `8fe984f`'s backend with
+round one's guest module and crosvm (`0001`-`0010`); **after** is the
+branch's backend, its guest module and crosvm with `0011`. Five runs of
+each, before and after interleaved. The rig was shared with another
+agent's work throughout, and about one run in seven ran at a fraction of
+its cell's rate with a frame time varying twice as much; a run under 90%
+of its cell's median rate is left out, the rule applied alike to every
+cell ("runs kept"). The IOCTL2 round trip is the guest's mean (`pacing`,
+type 10).
+
+| workload | VMM | runs kept, before / after | avg fps, before | after | 1% / 0.1% low, before | after | IOCTL2 round trip, µs, before | after |
+|---|---|---|---|---|---|---|---|---|
+| SuperTuxKart 4K ultra, GL | nesbox | 5 of 5 / 4 of 4 | 198.0 ± 9.3 | 196.6 ± 5.1 | 127.7 / 73.9 | 121.8 / 69.2 | 14.4 | 16.6 |
+| SuperTuxKart 4K ultra, GL | crosvm | 5 of 5 / 5 of 5 | 197.3 ± 8.5 | 198.9 ± 4.4 | 104.8 / 42.1 | 123.7 / 72.1 | 22.3 | 18.4 |
+| Godot SDFGI 4K | nesbox | 4 of 5 / 4 of 5 | 230.8 ± 1.0 | 225.7 ± 11.8 | 182.0 / 146.1 | 164.5 / 134.8 | 10.0 | 10.9 |
+| Godot SDFGI 4K | crosvm | 5 of 5 / 4 of 5 | 220.7 ± 11.3 | 224.8 ± 7.4 | 121.4 / 85.8 | 129.1 / 97.0 | 17.8 | 18.2 |
+| SuperTuxKart 4K, Vulkan | nesbox | 4 of 5 / 3 of 5 | 1124.8 ± 53.0 | 1177.2 ± 37.4 | 441.3 / 181.6 | 479.8 / 196.4 | 8.3 | 7.9 |
+| SuperTuxKart 4K, Vulkan | crosvm | 4 of 5 / 4 of 5 | 943.9 ± 68.4 | 990.3 ± 75.5 | 262.6 / 133.1 | 252.2 / 121.6 | 12.3 | 11.0 |
+| SuperTuxKart 720p, GL | nesbox | 5 of 5 / 5 of 5 | 1055.8 ± 37.2 | 1072.4 ± 13.1 | 492.5 / 238.6 | 516.0 / 243.6 | 8.0 | 7.5 |
+| SuperTuxKart 720p, GL | crosvm | 4 of 5 / 4 of 5 | 958.0 ± 23.6 | 932.9 ± 36.6 | 306.8 / 151.8 | 303.0 / 163.7 | 11.8 | 15.5 |
+
+The GPU-bound rows under nesbox are the same before and after within that
+spread: in the first two rounds, which nothing disturbed, SuperTuxKart's
+lows were 139-141 / 80-82 fps both ways and Godot's 191-193 / 170-176.
+The CPU-bound rows gained 2-5% where the round trips got cheaper; crosvm at
+720p on GL is within its spread either way, and its mean round trip there
+is dominated by a tail its core scheduling makes (below).
+
+What each change did:
+
+- **crosvm's stalls were guest RAM faulting in** (5, above). crosvm left
+  every page of guest RAM to the guest's first touch -- a host page fault
+  that allocates and zeroes one 4 KiB page of the memfd, and a second-level
+  fault -- and a game reaches memory its guest has not used for a long time
+  after boot. Touching the guest's free memory from inside the guest before
+  the race took SuperTuxKart's 0.1% low from 39-44 fps to 72-81, nesbox's
+  (three runs each way). `patches/crosvm/0011` (`--prefault-memory`, passed
+  by the launcher) faults guest RAM in and collapses it into 2 MiB pages as
+  the VM starts, as nesbox does: an 8 GiB guest in 1.0 s, all of it on
+  2 MiB pages after 2.5 s. For that the guest RAM region at 1 MiB had to be
+  mapped as far past a 2 MiB boundary as its file offset, or every collapse
+  of it was refused.
+- **What is left of crosvm's gap is its core scheduling.** With `0011`
+  crosvm's IOCTL2 round trip is still 12.0 µs against nesbox's 7.1 in a
+  stk-vk run, with a long tail (45,500 round trips over 64 µs against 2,700),
+  and Godot's lows stay below nesbox's. With `--core-scheduling=false`
+  (`NVGPU_CROSVM_CORE_SCHED=0`) they match: the round trip 6.8 µs and the
+  tail nesbox's, SuperTuxKart on Vulkan 1,186-1,200 fps with a 1% low of
+  458-513 (nesbox 1,217-1,247 and 526-551), Godot's 1% and 0.1% lows
+  192 and 172 (nesbox 187 and 171). One cookie for the VM and its backend
+  together (`coresched new --` around the launcher, crosvm's own off) gave
+  1,110-1,130 fps and one Godot run of each kind (lows 186/169 and
+  155/113): between the two. The default stays; see "What would close the
+  rest".
+- **The PIT, and AVIC, did not matter.** crosvm's kernel irqchip creates a
+  PIT that re-injects missed ticks, and KVM inhibits AVIC for the whole VM
+  while it does (nesbox makes no PIT). Turning re-injection off
+  (`KVM_REINJECT_CONTROL`, a patch tried and dropped) changed neither the
+  round trip nor the frame rate (stk-vk 1,200 against 1,184-1,194, core
+  scheduling off both ways).
+- **The backend's IOCTL2 path** (2): stk-vk's calls, backend time in µs
+  (whole / preparing / the host ioctl), round one's backend against this
+  one's:
+
+  | call | before | after |
+  |---|---|---|
+  | SYNCOBJ_CREATE | 2.5 / 0.8 / 0.8 | 1.4 / 0.3 / 0.8 |
+  | SYNCOBJ_DESTROY | 2.3 / 0.7 / 0.7 | 1.4 / 0.3 / 0.7 |
+  | SYNCOBJ_TRANSFER | 2.2 / 0.6 / 0.8 | 1.3 / 0.2 / 0.8 |
+  | SYNCOBJ_HANDLE_TO_FD | 6.6 / 0.8 / 1.4 | 4.6-5.4 / 0.3-0.4 / 1.4-1.6 |
+  | SYNCOBJ_FD_TO_HANDLE | 3.4 / 1.5 / 0.7 | 2.3-2.6 / 1.0-1.1 / 0.6-0.7 |
+  | SYNCOBJ_TIMELINE_WAIT | 4.1 / 1.3 / 1.4 | 2.5-3.2 / 0.7-0.9 / 1.3-1.5 |
+  | NV_SEMSURF_FENCE_CREATE | 9.4 / 1.1 / 4.1 | 6.7-7.8 / 0.5-0.6 / 3.4-3.9 |
+  | NV_SEMSURF_FENCE_WAIT | 6.2 / 1.7 / 3.2 | 4.8-6.0 / 1.2-1.5 / 2.7-3.5 |
+  | classifying an adopted descriptor | 2.8 | 1.8-2.1 |
+  | IOCTL2 service, mean | 4.6 | 3.4-3.9 |
+
+  Two changes: a call that never waits (every one above) runs under one
+  hold of the backend mutex on the handle table's own descriptor instead
+  of a duplicate taken and closed around it -- `dup` and `close` were
+  0.64 µs of every call on this host, whose syscalls cost 0.25-0.4 µs each
+  (`pti=on`) -- and an adopted descriptor's `/proc/self/fd` link is read
+  through a directory descriptor kept for it, with no allocation (1.51 ->
+  1.11 µs in a microbenchmark; the `readlinkat` itself is 0.7 of it, and a
+  `getpid` to check the directory's owner would have been 0.28 more, so a
+  fork count does that).
+- **SYNCOBJ_DESTROY posted** (3): the guest answers a DESTROY it can prove
+  will succeed at once and posts it, 2.3 a frame for SuperTuxKart on
+  Vulkan (107,858 in a run, none failed on the host), so the presenting
+  thread waits for 10.4 round trips a frame instead of 12.7.
+- **The pump** (6): armed RM descriptors are waited on with `poll(2)`
+  while armed and not at all otherwise, which loses no event (the module
+  notes in `device/src/pump.rs` say why epoll could not). The pump woke
+  5,600-7,600 times a second for SuperTuxKart on Vulkan, against 144,000-
+  196,000 events it used to wake for; the backend's CPU went from 42-43%
+  to 40-41% of a core (three runs each, the rest of the change set the
+  same), and frame rates were unchanged. The wakeups were cheap; most of
+  the backend's CPU is its queue thread, which polls the ring after each
+  request by design (`--queue-poll-us`).
+- **The window** (4): Blender's heavy scene at `--window-size 8192` and
+  the default share ran on both backends, 2.74 s a frame on GL and 2.79
+  on Vulkan (one run each), with 1,952 and 995 MiB of the 6,318 MiB WC zone
+  in use by the one process and nothing refused. The default stays at
+  1 GiB, with the sizing in DEPLOY.md, "Sizing the window".
+- **Fresh system memory** (3) is unchanged: no fix inside the project
+  keeps the guest's allocations what it asked for; `patches/linux/` has a
+  draft host-kernel flag for it.
+
 ### What would close the rest
 
 In the order of what each would buy:
 
 1. **Map fresh system memory writable up front** (3: 3.7 times on
-   streaming). Either a host kernel whose `KVM_PRE_FAULT_MEMORY` can map for
-   write, or whose GUP-fast accepts a driver's unmapped order-0 folio for a
-   non-pinning get; or RM allocating host-visible system memory in 64 KiB
-   pages or larger, which the driver then allocates as compound pages that
-   GUP-fast accepts. The last could be the backend's, by rewriting the
-   allocation's page-size attribute, at the cost of rounding and of
-   higher-order allocations that can fail under fragmentation; it belongs
-   in the backend's RM allocation path (`device/src/nvidia/rm.rs`).
-2. **Cut the backend's cost per IOCTL2** (2: up to about 40 µs a frame, 5%
-   at a thousand frames a second). A cheaper exact classification of
-   exported descriptors (a `readlinkat` on a directory descriptor kept for
-   `/proc/self/fd`, 0.3 µs of the readlink's 1.0 in a microbenchmark, and no
-   allocation), and a leaner prepare and finish for the schema's plain
-   syncobj calls.
-3. **Post the calls whose answer nothing waits for.** SYNCOBJ_DESTROY's
-   only failure is a bad handle; sent without waiting, as closes already
-   are (`nvgpu_close_handle_async()`), it would save two round trips a frame
-   (about 10 µs). A guest driver and protocol change.
-4. **crosvm's stalls** (5): not core scheduling; the next step is to see
-   what its vCPU threads wait on during one.
-5. **Size the window for the workload** (4): a desktop VM that runs
-   creative applications wants 4 GiB or more.
-6. **Quiet the pump** (6): host CPU rather than frame time, and only with
-   the double-poll race solved.
+   streaming). A host kernel whose `KVM_PRE_FAULT_MEMORY` can map for
+   write: `patches/linux/0001` is a draft of that flag, applied nowhere,
+   and the VMMs would pass it for writable placements.
+   `patches/linux/README.md` has why nothing inside the project does it
+   without changing what the guest's allocations are.
+2. **crosvm's core scheduling**, the rest of crosvm's gap (above): a
+   security choice for the deployment (DEPLOY.md, "Frame pacing"), not a
+   default to change here. One cookie for the VM and its backend together,
+   which keeps other tenants off the VM's cores but lets the VM and its own
+   backend share them, recovered part of it in the runs above; the
+   launcher does not offer it, and whether it is worth offering is the
+   user's call.
+3. **The round trips left.** A SuperTuxKart Vulkan frame still waits for
+   about ten IOCTL2s, one at a time, each using the last one's answer: 7 µs
+   each under nesbox, of which the backend now spends 1.3-5. What else could
+   be posted is only what cannot fail, and the other syncobj calls can
+   (TRANSFER of a point with no fence, a WAIT's timeout); CREATE and the
+   exports return what the next call needs.
+4. **The backend's CPU** is its queue thread polling the ring after each
+   request (`--queue-poll-us`, 50 µs by default), which buys the round
+   trips above; the pump's share is now small.
 
 ## Earlier: an RTX 3060, before protocol v2
 
