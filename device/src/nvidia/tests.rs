@@ -1466,6 +1466,32 @@ fn the_same_object_mapped_twice_is_released_by_the_second_munmap() {
     assert_eq!(be.shm_free_bytes(), empty);
 }
 
+/// A placement mapped u32::MAX times is refused one more MMAP, not
+/// counted past it: the count is the guest kernel's to raise, and an
+/// overflow would abort the backend.
+#[test]
+fn a_placement_mapped_u32_max_times_is_refused_another() {
+    let mut be = gated_backend();
+    be.set_window(Box::new(FakeWindow::default()));
+    let h = be.adopt_for_test(devnull(), HandleKind::DriRender(0));
+    let a = mmap(&mut be, h, 0x2000);
+    be.live_maps.get_mut(&a.mapping_id).unwrap().refs = u32::MAX;
+    let mut req = hdr(MsgType::Mmap, h as u64);
+    append(
+        &mut req,
+        &MmapReq {
+            size: 4096,
+            offset: 0x2000,
+            prot: 3,
+            padding: 0,
+        },
+    );
+    let mut resp = vec![0u8; 64];
+    be.dispatch(&req, &mut resp);
+    assert_eq!(parse_resp(&resp).status, -libc::ENOMEM);
+    assert_eq!(be.live_maps[&a.mapping_id].refs, u32::MAX);
+}
+
 /// An MMAP of a file already placed, asking for more than the placement
 /// holds, is refused: the guest maps what it asked for from the
 /// placement's offset, so the rest would be the window's next extents --
@@ -1696,6 +1722,51 @@ fn a_pci_config_snapshot_extends_the_live_header_of_its_own_device() {
         None,
         "the live read was whole"
     );
+}
+
+/// What a config space says of the host alone -- MSI's message address
+/// and data, the Device Serial Number -- is blanked; the capability lists
+/// and everything else in them are the guest's as they were.
+#[test]
+fn host_only_pci_config_fields_are_blanked_and_the_lists_still_walk() {
+    use super::hostnodes::mask_host_only;
+    let mut cfg = vec![0u8; 4096];
+    cfg[0x34] = 0x60;
+    // MSI, 64-bit, at 0x60, then PCIe at 0x78.
+    cfg[0x60..0x64].copy_from_slice(&[0x05, 0x78, 0x80, 0x00]);
+    cfg[0x64..0x6c].copy_from_slice(&0xfee0_1000u64.to_le_bytes());
+    cfg[0x6c..0x6e].copy_from_slice(&0x4041u16.to_le_bytes());
+    cfg[0x78..0x7c].copy_from_slice(&[0x10, 0x00, 0x02, 0x00]);
+    cfg[0x8c..0x90].copy_from_slice(&0x0047_3d04u32.to_le_bytes()); // link caps
+    // AER at 0x100, then the serial at 0x140.
+    cfg[0x100..0x104].copy_from_slice(&(0x0001u32 | 1 << 16 | 0x140 << 20).to_le_bytes());
+    cfg[0x104..0x108].copy_from_slice(&0x10u32.to_le_bytes());
+    cfg[0x140..0x144].copy_from_slice(&(0x0003u32 | 1 << 16).to_le_bytes());
+    cfg[0x144..0x14c].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+    let before = cfg.clone();
+    mask_host_only(&mut cfg);
+    assert_eq!(&cfg[0x64..0x6e], &[0u8; 10], "MSI address and data");
+    assert_eq!(&cfg[0x144..0x14c], &[0u8; 8], "the serial");
+    let mut expect = before.clone();
+    expect[0x64..0x6e].fill(0);
+    expect[0x144..0x14c].fill(0);
+    assert_eq!(cfg, expect, "nothing else");
+    // A 32-bit MSI: its data word is at 8.
+    let mut cfg = vec![0u8; 256];
+    cfg[0x34] = 0x50;
+    cfg[0x50..0x54].copy_from_slice(&[0x05, 0x00, 0x00, 0x00]);
+    cfg[0x54..0x5a].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+    mask_host_only(&mut cfg);
+    assert_eq!(&cfg[0x54..0x5a], &[0u8; 6]);
+    // A list that loops, or points outside, ends; a 64-byte read has none.
+    let mut cfg = vec![0u8; 4096];
+    cfg[0x34] = 0x40;
+    cfg[0x40..0x42].copy_from_slice(&[0x01, 0x40]);
+    cfg[0x100..0x104].copy_from_slice(&(0x0001u32 | 0x100 << 20).to_le_bytes());
+    mask_host_only(&mut cfg);
+    let mut header = vec![0u8; 64];
+    header[0x34] = 0x60;
+    mask_host_only(&mut header);
 }
 
 #[test]

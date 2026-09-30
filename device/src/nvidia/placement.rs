@@ -167,6 +167,15 @@ impl NvidiaBackend {
         // An id the guest's vmas count on, the same one for every MMAP of this
         // mapping: RM_UNMAP_MEMORY then leaves the extent alone until the last
         // of them is gone (see `MmapEntry::mapping_id`).
+        // The guest kernel counts references, and one that never unmaps
+        // could take this count past u32::MAX: refused there, as mmap(2)
+        // refuses a mapping past the process's count, not wrapped (a wrapped
+        // count lets an early MUNMAP release a mapped extent) and not
+        // overflowed (an abort, the whole VM's GPU).
+        if entry.refs == u32::MAX {
+            log::warn!("mmap: the mapping at {offset:#x} is mapped u32::MAX times; refused");
+            return self.write_error(resp_buf, libc::ENOMEM);
+        }
         let id = if entry.mapping_id != 0 {
             entry.mapping_id
         } else {
@@ -463,7 +472,14 @@ impl NvidiaBackend {
                 );
                 return self.write_error(resp_buf, libc::EACCES);
             }
-            live.refs += 1;
+            // As `handle_mmap`'s count.
+            let Some(refs) = live.refs.checked_add(1) else {
+                log::warn!(
+                    "mmap on handle {handle}: placement {id} mapped u32::MAX times; refused"
+                );
+                return self.write_error(resp_buf, libc::ENOMEM);
+            };
+            live.refs = refs;
             let (offset, length) = (live.region.offset, live.length);
             let (pgprot, writable) = (live.region.pgprot, live.writable);
             return self.write_mmap_resp(

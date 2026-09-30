@@ -191,7 +191,12 @@ pub fn clock_ns(clock: libc::clockid_t) -> u64 {
     };
     // SAFETY: `ts` is a live local timespec the kernel writes.
     unsafe { libc::clock_gettime(clock, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    // Saturating: CLOCK_REALTIME is the host administrator's to set, before
+    // 1970 or past 2554, and overflow checks would end the backend on it.
+    u64::try_from(ts.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
 /// End the process now, with no unwinding and no exit handlers.

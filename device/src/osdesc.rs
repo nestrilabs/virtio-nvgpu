@@ -972,6 +972,17 @@ impl OsDesc {
         }
     }
 
+    /// Guest file `file` closed. Its owner goes unless a registration made
+    /// on it is still live (then `release` drops it with the last one): a
+    /// call refused before it registered anything set it too, and a loop of
+    /// open, refused registration, close would otherwise grow the map for
+    /// the session.
+    pub(crate) fn file_closed(&mut self, file: u32) {
+        if !self.per_file.contains_key(&file) {
+            self.file_owners.remove(&file);
+        }
+    }
+
     /// Whether a registration of `bytes`, mapped in `vmas` pieces, fits on
     /// guest file `file`. ENOMEM if not.
     pub(crate) fn admit(&self, file: u32, bytes: u64, vmas: usize) -> Result<(), Errno> {
@@ -3242,6 +3253,36 @@ mod backend_tests {
             rd64(&r, h + 8),
             (0..n).map(|i| rd64(&r, at + 8 * i)).collect(),
         )
+    }
+
+    /// A file whose registration was refused before anything was
+    /// registered leaves no owner behind when it closes: a loop of open,
+    /// refused registration, close does not grow the backend's memory.
+    #[test]
+    fn a_closed_file_with_no_registration_keeps_no_owner() {
+        let mut vm = vm();
+        let owner = crate::quota::Owner::Proc {
+            tgid: 1,
+            start_ns: 1,
+        };
+        for i in 0..64u32 {
+            let null = std::fs::File::open("/dev/null").unwrap().into();
+            let h = vm
+                .be
+                .adopt_for_test_as(null, HandleKind::Dev(DeviceKind::Gpu(0)), owner);
+            // A page list that describes nothing: refused.
+            let (st, ..) = ioctl(
+                &mut vm.be,
+                h,
+                ALLOC_MEMORY,
+                &os02(GUEST_VA, 3 * PAGE, 7),
+                &[],
+                Some(&[0u8; 8]),
+            );
+            assert_ne!(st, 0, "{i}");
+            vm.be.close_handle(h).unwrap();
+        }
+        assert!(vm.be.osdesc.file_owners.is_empty());
     }
 
     /// Three pages in a row of low RAM: RM is handed the backend's own

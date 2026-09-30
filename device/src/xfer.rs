@@ -1683,9 +1683,15 @@ impl Prepared {
             if v < 0 {
                 continue;
             }
+            // The backend's own descriptors (privfd.rs) too, here and not
+            // only in `finish_with`: a descriptor claimed now is closed by
+            // the `gems_out` error path or a drop before finish, and one of
+            // those would be the socket or memory the VM runs on. The
+            // handle table's are checked at finish, under the mutex.
             let ours = v > i64::from(i32::MAX)
                 || v == i64::from(target_fd)
-                || self.held_fds().any(|fd| i64::from(fd) == v);
+                || self.held_fds().any(|fd| i64::from(fd) == v)
+                || crate::privfd::is_private(v as RawFd);
             if ours {
                 log::error!(
                     "IOCTL2 {}: the host left {v} at a descriptor-out field, which is \
@@ -2907,6 +2913,23 @@ mod tests {
         // Still open: not adopted, and not closed either.
         assert!(crate::sys::fd::is_open(fd));
         drop(held);
+        // One of the backend's own (privfd.rs) is never claimed at all,
+        // whatever the finisher knows: a claim is closed by a drop before
+        // finish.
+        let own = crate::privfd::PrivateFd::new(File::open("/dev/null").unwrap().into());
+        let fd = own.as_raw_fd();
+        h.sys.on_ioctl(move |_, _, _, arg| {
+            let top = arg.addr();
+            poke(arg, top, 20, 4, fd as u64);
+            0
+        });
+        let mut fin = Fin::default();
+        let r = h
+            .run_with(SchemaClass::Kms, KMS, &create_lease(), &mut fin)
+            .unwrap();
+        assert!(r.fds.is_empty() && fin.adopted.is_empty());
+        assert!(crate::sys::fd::is_open(fd));
+        drop(own);
     }
 
     // ── GEM in ──

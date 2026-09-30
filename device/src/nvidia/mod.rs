@@ -1100,6 +1100,7 @@ impl NvidiaBackend {
         // whenever the file's last reference goes, and only then is the guest
         // told it may unpin them (osdesc.rs).
         self.osdesc_end_clients(fd.as_raw_fd(), &gone_clients, why);
+        self.osdesc.file_closed(handle);
         self.rmmem.forget_fd(handle, &gone_clients);
         self.dri_maps.retain(|(h, _), _| *h != handle);
         let fbs = self.forget_kms_state(handle);

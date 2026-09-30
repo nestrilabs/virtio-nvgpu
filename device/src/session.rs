@@ -359,6 +359,8 @@ struct Ioctl2Call {
     /// The descriptor number the handle table held for `target` when the
     /// call was prepared (`target_fd` is a duplicate of it).
     table_fd: RawFd,
+    /// The table entry `target` named then (`HandleTable::serial`).
+    serial: Option<u64>,
     /// When serving began, and how long preparing took (pacing report).
     t0: std::time::Instant,
     prep_ns: u64,
@@ -1046,6 +1048,7 @@ impl NvidiaBackend {
         // call's duplicate shares a file with (see finish_ioctl2), and on
         // which an inline call runs (see serve_ioctl2).
         let table_fd = self.handles.get_raw(target).map_err(|_| libc::EBADF)?;
+        let serial = self.handles.serial(target);
         let target_fd = if executor {
             Some(self.handles.dup(target).ok_or(libc::EBADF)?.0)
         } else {
@@ -1068,6 +1071,7 @@ impl NvidiaBackend {
             req_id: self.current_req_id,
             cap,
             table_fd,
+            serial,
             t0,
             prep_ns: u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
         })))
@@ -1090,7 +1094,7 @@ impl NvidiaBackend {
             generation,
             req_id,
             cap,
-            table_fd,
+            serial,
             t0,
             prep_ns,
             ..
@@ -1103,16 +1107,14 @@ impl NvidiaBackend {
         // goes to the closer thread. Otherwise it is closed here, which only
         // drops a reference: the table is not changing (the backend mutex is
         // held), the session is the one the call was prepared in, and the
-        // handle still names the same unburied descriptor -- handles are not
-        // issued twice in a session (handle_table.rs), so that is the file
-        // the duplicate shares. The closer's queue and wakeup cost every
+        // handle still names the same unburied table entry -- the entry's
+        // serial, not the handle's number, which the table issues again
+        // once its space wraps, or the descriptor's, which the kernel reuses
+        // at once -- so that is the file the duplicate shares. The closer's queue and wakeup cost every
         // call on a render node a few microseconds of the queue thread.
         // An inline call has none: it ran on the table's own descriptor.
         if let Some(target_fd) = target_fd {
-            if !stale
-                && !self.handles.is_buried(target)
-                && self.handles.get_raw(target).ok() == Some(table_fd)
-            {
+            if !stale && !self.handles.is_buried(target) && self.handles.serial(target) == serial {
                 drop(target_fd);
             } else {
                 crate::closer::close(target_fd);

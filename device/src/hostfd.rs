@@ -1218,9 +1218,26 @@ mod tests {
         assert_eq!(classify(fds[2].as_fd(), &[]), HandleKind::Memfd);
     }
 
+    /// Run in a copy of the test binary with one test thread: the child
+    /// takes locks -- the kept directory's, privfd's set, `KnownFs`'s
+    /// OnceLock -- which another test thread of this process could hold as
+    /// it forks, and a lock held then stays held in the child for good.
     #[test]
     #[cfg_attr(miri, ignore = "Miri has no fork")]
     fn a_forked_child_reads_its_own_descriptor_table() {
+        const ALONE: &str = "NVGPU_TEST_FORK_ALONE";
+        const NAME: &str = "hostfd::tests::a_forked_child_reads_its_own_descriptor_table";
+        if std::env::var_os(ALONE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--test-threads=1"])
+                .env(ALONE, "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{text}");
+            assert!(text.contains("1 passed"), "{text}");
+            return;
+        }
         use crate::sys::proc::testing::{End, forked};
         // The parent's directory is open, and names the parent's table.
         let parent = crate::sys::fd::memfd(c"parent", libc::MFD_CLOEXEC).unwrap();
@@ -1230,9 +1247,14 @@ mod tests {
             if crate::sys::proc::fork_generation() != generation + 1 {
                 return 2;
             }
-            // A number the parent holds a memfd at is an eventfd here.
+            // A number the parent holds a memfd at is an eventfd here. The
+            // child closed all but 0-2, so the eventfd may be there already.
             let e = new_eventfd().unwrap();
-            let at = crate::sys::fd::dup_at_least(&e, parent.as_raw_fd()).unwrap();
+            let at = if e.as_raw_fd() == parent.as_raw_fd() {
+                e
+            } else {
+                crate::sys::fd::dup_at_least(&e, parent.as_raw_fd()).unwrap()
+            };
             if at.as_raw_fd() != parent.as_raw_fd() {
                 return 3;
             }

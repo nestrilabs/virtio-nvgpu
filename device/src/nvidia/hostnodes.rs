@@ -310,10 +310,11 @@ impl FileTree {
                     let abs = std::path::Path::new("/sys").join(&rel);
                     match std::fs::read(&abs) {
                         Ok(live) => {
-                            let content = pci_config
+                            let mut content = pci_config
                                 .get(addr.as_str())
                                 .and_then(|snap| merge_pci_config(&live, snap))
                                 .unwrap_or(live);
+                            mask_host_only(&mut content);
                             Some((rel, content))
                         }
                         Err(e) => {
@@ -355,6 +356,73 @@ pub(crate) fn merge_pci_config(live: &[u8], snap: &[u8]) -> Option<Vec<u8>> {
     let mut out = live.to_vec();
     out.extend_from_slice(&snap[live.len()..]);
     Some(out)
+}
+
+/// Blank what a GPU's config space says of the host alone, in place:
+/// the MSI capability's message address and data -- the host CPU's local
+/// APIC an interrupt is aimed at, and the host's vector -- and the Device
+/// Serial Number capability's serial, a hardware identifier. Both are past
+/// the 64 bytes any host user may read (pci-sysfs.c `pci_read_config`),
+/// which is where only a privileged launcher's snapshot brings them from
+/// (`--pci-config-dir`). Nothing in the guest uses them: no guest driver
+/// binds the device (its config writes are refused, nvgpu_pci.c), and
+/// what the snapshot is for -- the capability lists, the PCIe link -- is
+/// left as it is, headers included, so both lists still walk.
+pub(crate) fn mask_host_only(cfg: &mut [u8]) {
+    const CAP_PTR: usize = 0x34;
+    const CAP_ID_MSI: u8 = 0x05;
+    const PCI_MSI_FLAGS_64BIT: u16 = 0x80;
+    const EXT_CAP_ID_DSN: u32 = 0x0003;
+    let blank = |cfg: &mut [u8], at: usize, len: usize| {
+        if let Some(b) = at.checked_add(len).and_then(|end| cfg.get_mut(at..end)) {
+            b.fill(0);
+        }
+    };
+    // The standard list: 48 capabilities at most in 256 bytes, each at a
+    // dword-aligned offset past the header (pci.c `__pci_find_next_cap_ttl`).
+    let mut at = cfg.get(CAP_PTR).map_or(0, |&p| usize::from(p & !3));
+    for _ in 0..48 {
+        if !(0x40..0x100).contains(&at) {
+            break;
+        }
+        let (Some(&id), Some(&next)) = (cfg.get(at), cfg.get(at + 1)) else {
+            break;
+        };
+        if id == CAP_ID_MSI {
+            let flags = cfg
+                .get(at + 2..at + 4)
+                .map_or(0, |f| u16::from_le_bytes([f[0], f[1]]));
+            // Address (and its upper half), then the data word.
+            if flags & PCI_MSI_FLAGS_64BIT != 0 {
+                blank(cfg, at + 4, 8);
+                blank(cfg, at + 12, 2);
+            } else {
+                blank(cfg, at + 4, 4);
+                blank(cfg, at + 8, 2);
+            }
+        }
+        at = usize::from(next & !3);
+    }
+    // The extended list, from 0x100: at most (4096 - 256) / 8 headers
+    // (pci.c `pci_find_next_ext_capability`).
+    let mut at = 0x100usize;
+    for _ in 0..(4096 - 256) / 8 {
+        let Some(h) = cfg.get(at..at + 4) else {
+            break;
+        };
+        let header = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+        if header == 0 || header == u32::MAX {
+            break;
+        }
+        if header & 0xffff == EXT_CAP_ID_DSN {
+            blank(cfg, at + 4, 8);
+        }
+        let next = (header >> 20) as usize & !3;
+        if next < 0x100 {
+            break;
+        }
+        at = next;
+    }
 }
 
 /// Walk `dir`, appending every readable regular file under it.

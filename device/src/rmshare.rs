@@ -109,6 +109,12 @@ pub const CTRL_SHARE_OBJECT: u32 = 0x0000_0d06;
 /// list included.
 pub const GRANT_CAP: usize = 4096;
 
+/// Each guest process's part of [`GRANT_CAP`]: a list and its grants count
+/// against the process that made the object's client, so one process
+/// sharing its objects in a loop cannot leave every other process of the
+/// VM unable to share at all (quota.rs, `Share::quarter`).
+const GRANT_SHARE: crate::quota::Share = crate::quota::Share::quarter(GRANT_CAP as u64, 16);
+
 /// An `RS_SHARE_POLICY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -701,14 +707,45 @@ impl Ownership {
     }
 
     /// Whether share `p` of `(owner, object)` could take the lists past
-    /// [`GRANT_CAP`]: a new list, or a new grant in one.
+    /// [`GRANT_CAP`], or the share of it of the guest process that made
+    /// `owner` ([`GRANT_SHARE`]): a new list, or a new grant in one.
     pub fn full_for(&self, owner: u32, object: u32, p: &Policy) -> bool {
-        self.grant_count >= GRANT_CAP
-            && (!self.grants.contains_key(&(owner, object))
-                || (p.kind == RS_SHARE_TYPE_CLIENT
-                    && p.target != owner
-                    && p.action & (RS_SHARE_ACTION_FLAG_REVOKE | RS_SHARE_ACTION_FLAG_REQUIRE)
-                        == 0))
+        let adds = !self.grants.contains_key(&(owner, object))
+            || (p.kind == RS_SHARE_TYPE_CLIENT
+                && p.target != owner
+                && p.action & (RS_SHARE_ACTION_FLAG_REVOKE | RS_SHARE_ACTION_FLAG_REQUIRE) == 0);
+        if !adds {
+            return false;
+        }
+        let who = self.maker(owner);
+        let held = self
+            .grants
+            .iter()
+            .filter(|&(&(c, _), _)| self.maker(c) == who)
+            .map(|(_, l)| 1 + l.len() as u64)
+            .sum();
+        crate::quota::admits(
+            &GRANT_SHARE,
+            who,
+            held,
+            1,
+            self.grant_count as u64,
+            GRANT_CAP as u64,
+        )
+        .is_err()
+    }
+
+    /// The guest process that made `client`, as a quota owner: unknown
+    /// when the guest did not say, and then only the session's cap holds.
+    fn maker(&self, client: u32) -> crate::quota::Owner {
+        self.owners
+            .get(&client)
+            .map_or(crate::quota::Owner::Unknown, |c| {
+                crate::quota::Owner::Proc {
+                    tgid: c.tgid,
+                    start_ns: c.start_ns,
+                }
+            })
     }
 
     /// Whether the list RM checks `dst`'s use of `(src, obj)` against grants
@@ -2472,12 +2509,44 @@ mod backend_tests {
         );
     }
 
+    /// One guest process recording share lists in a loop takes its share
+    /// of GRANT_CAP, not all of it: another process still shares its own.
+    #[test]
+    #[cfg_attr(miri, ignore = "fills a cap of thousands: too slow under Miri")]
+    fn one_process_sharing_in_a_loop_leaves_room_for_anothers() {
+        let (mut be, f1, f2) = vm(FULL);
+        let a = alloc_client(&mut be, f1, Some(pid(10)));
+        let b = alloc_client(&mut be, f2, Some(pid(20)));
+        rm::with(|rm| {
+            for i in 0..GRANT_CAP as u32 {
+                rm.alloc(a, DEVICE, 0x10_0000 + i, NV01_MEMORY_SYSTEM)
+                    .unwrap();
+            }
+        });
+        let mut refused = 0;
+        for i in 0..GRANT_CAP as u32 {
+            let p = share(a, 0x10_0000 + i, RS_SHARE_TYPE_PID, 0, 0);
+            let r = call(&mut be, f1, SHARE, &p, &[], None);
+            if rm_status(&r, NVOS57_STATUS) == NV_ERR_INSUFFICIENT_RESOURCES {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, GRANT_CAP - GRANT_CAP / 4, "past its quarter");
+        // Forwarded, whatever RM then makes of it.
+        let p = share(b, 0x55, RS_SHARE_TYPE_CLIENT, 0, a);
+        let r = call(&mut be, f2, SHARE, &p, &[], None);
+        assert_ne!(rm_status(&r, NVOS57_STATUS), NV_ERR_INSUFFICIENT_RESOURCES);
+    }
+
     /// FIFO_DISABLE_CHANNELS through the backend: the clients it names are
     /// the calling process's own (this module), and its preemption event
     /// and rate are rmchan.rs's. Each refusal is RM's status, RM not called.
     #[test]
     fn only_the_callers_own_channels_are_disabled() {
         use crate::rmchan::{PROC_BURST, RUNLIST_PREEMPT_EVENT};
+        // The rate's clock stopped: the burst below is spent however long
+        // this test takes to make it.
+        crate::rmchan::FROZEN.with(|f| f.set(Some(std::time::Instant::now())));
         let (mut be, f1, f2) = vm(FULL);
         // The gates below alone: the test backend has no host release, so
         // the RM allowlist in front of them (rmallow.rs, which has the

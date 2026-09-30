@@ -472,6 +472,33 @@ fn an_extent_under_a_live_guest_mapping_is_not_reused_after_rm_unmap() {
     assert_eq!(e.be.shm_free_bytes(), empty);
 }
 
+/// An RM mapping mmapped u32::MAX times is refused one more MMAP, not
+/// counted past it (placement.rs `handle_mmap`).
+#[test]
+fn an_rm_mapping_mapped_u32_max_times_is_refused_another() {
+    let mut e = env();
+    let (fd, _) = e.map(VIDMEM);
+    e.mmap(fd);
+    e.be.active_maps.find_by_fd_handle_mut(fd).unwrap().refs = u32::MAX;
+    let mut req = msg(MsgType::Mmap, fd);
+    push(
+        &mut req,
+        &MmapReq {
+            size: LEN,
+            offset: 0,
+            prot: 3,
+            padding: 0,
+        },
+    );
+    let mut resp = vec![0u8; 64];
+    e.be.dispatch(&req, &mut resp);
+    assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::ENOMEM);
+    assert_eq!(
+        e.be.active_maps.find_by_fd_handle(fd).unwrap().refs,
+        u32::MAX
+    );
+}
+
 #[test]
 fn an_rm_mapping_nobody_still_maps_is_released_at_rm_unmap() {
     let mut e = env();

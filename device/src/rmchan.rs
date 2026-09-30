@@ -34,7 +34,8 @@
 //!   VM one of [`VM_RATE`] after [`VM_BURST`]. A process's bucket is charged
 //!   for every call it asks for, served or not. The last [`VM_RESERVE`] of
 //!   the VM's tokens go only to a process that has used at most
-//!   [`RESERVE_FLOOR`] of its own recently, so processes that ask past
+//!   [`RESERVE_FLOOR`] of its own recently, the call it is making included
+//!   (fewer before it), so processes that ask past
 //!   their rate cannot take the calls of one that makes a few (quota.rs has
 //!   the same split for pools); it takes four processes each at its whole
 //!   rate to reach the VM's. Every other field (`bDisable`,
@@ -84,7 +85,10 @@ pub const VM_BURST: f64 = 160.0;
 /// The last of the VM's tokens, kept for processes that have used little.
 pub const VM_RESERVE: f64 = 40.0;
 /// Tokens a process may have used, of its [`PROC_BURST`], and still take
-/// from the reserve.
+/// from the reserve, the call that takes it included -- as a quota.rs floor
+/// counts the request itself: a process that had used fewer than this
+/// before the call is served from the reserve, one that had used this
+/// many is not.
 pub const RESERVE_FLOOR: f64 = 8.0;
 /// Processes with a bucket past which the full ones are dropped (a full
 /// bucket is a new one), at most once every [`PRUNE_EVERY`].
@@ -268,12 +272,42 @@ impl ChannelGate {
 
 // ─────────────────────────────── the backend ───────────────────────────────
 
+#[cfg(test)]
+std::thread_local! {
+    /// The time the backend's gate sees on this thread, when a test has
+    /// stopped it: a test counting calls against a rate must not depend on
+    /// how fast it runs (under Miri, or on a loaded machine, a burst takes
+    /// longer than one token's refill).
+    pub(crate) static FROZEN: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(t) = FROZEN.with(|f| f.get()) {
+        return t;
+    }
+    Instant::now()
+}
+
 impl crate::nvidia::NvidiaBackend {
+    /// The guest process an RM escape is charged to: the caller when the
+    /// guest says which (rmshare.rs `rm_proc_id`), else the process that
+    /// opened the file.
+    pub(crate) fn rm_caller(&self) -> Owner {
+        match self.current_proc {
+            Some(c) => Owner::Proc {
+                tgid: c.tgid,
+                start_ns: c.start_ns,
+            },
+            None => self.current_owner,
+        }
+    }
+
     /// An RM_CONTROL's parameters as the guest sent them (the NVOS54 block
     /// and the nested one): `Err` is the status to answer a
     /// DISABLE_CHANNELS with, RM never called. Any other control passes.
-    /// Charged to the calling guest process when the guest says which
-    /// (rmshare.rs `rm_proc_id`), else to the process that opened the file.
+    /// Charged to [`Self::rm_caller`].
     pub(crate) fn rm_chan_gate(&mut self, params: &[u8]) -> Result<(), u32> {
         use crate::nvos::{NVOS54_CMD, NVOS54_PARAMS_SIZE, NVOS54_SIZE};
         if le::u32_at(params, NVOS54_CMD) != Some(CTRL_FIFO_DISABLE_CHANNELS) {
@@ -281,19 +315,11 @@ impl crate::nvidia::NvidiaBackend {
         }
         let size = le::u32_at(params, NVOS54_PARAMS_SIZE).unwrap_or(0);
         let ctl = params.get(NVOS54_SIZE..).unwrap_or(&[]);
-        let owner = match self.current_proc {
-            Some(c) => Owner::Proc {
-                tgid: c.tgid,
-                start_ns: c.start_ns,
-            },
-            None => self.current_owner,
-        };
-        self.rmchan
-            .check(owner, ctl, size, Instant::now())
-            .map_err(|r| {
-                log::warn!("NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS refused: {}", r.why());
-                r.status()
-            })
+        let owner = self.rm_caller();
+        self.rmchan.check(owner, ctl, size, now()).map_err(|r| {
+            log::warn!("NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS refused: {}", r.why());
+            r.status()
+        })
     }
 }
 
@@ -410,10 +436,12 @@ mod tests {
         let secs = 25_000.0 * 400e-6;
         assert!(hogs as f64 <= VM_BURST + VM_RATE * secs, "{hogs}");
         assert!(g.vm.tokens < VM_RESERVE + 5.0, "{}", g.vm.tokens);
-        // The quiet process makes its few calls, every one of them served.
+        // The quiet process makes its few calls, every one of them served:
+        // RESERVE_FLOOR of them, and not one more from the reserve.
         for k in 0..RESERVE_FLOOR as usize {
             assert_eq!(g.check(proc(1), &p, 536, t), Ok(()), "call {k}");
         }
+        assert_eq!(g.check(proc(1), &p, 536, t), Err(Refused::VmRate));
     }
 
     #[test]

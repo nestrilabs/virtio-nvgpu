@@ -75,6 +75,7 @@ use crate::nvos::{
     NVOS64_H_OBJECT_NEW, NVOS64_H_OBJECT_PARENT, NVOS64_H_ROOT, NVOS64_SIZE, NVOS64_STATUS,
     ROOT_CLASSES,
 };
+use crate::quota::{Charge, Owner, Pool, Share};
 use crate::shm::PgprotKind;
 
 const NV01_CONTEXT_DMA: u32 = 0x02;
@@ -109,7 +110,15 @@ pub(crate) const COHERENCY_WRITE_BACK: u8 = 5;
 
 /// A guest cannot make the table grow without bound: objects past this are
 /// not recorded, and their mappings fall back to the old classification.
+/// The records and the tree's links are each a pool of this many, shared
+/// out among guest processes (quota.rs, `Share::quarter`): one process
+/// duplicating its own memory in a loop fills its share, not the table, so
+/// another's memory is still recorded and its GPU mappings still snoop.
 const MAX_OBJECTS: usize = 1 << 18;
+
+fn records_pool() -> Pool {
+    Pool::new(MAX_OBJECTS as u64, Share::quarter(MAX_OBJECTS as u64, 16))
+}
 
 /// hObjectParent, at 4 in NVOS64, NVOS32 and NVOS02 alike, and NVOS55's
 /// hParent.
@@ -160,6 +169,16 @@ pub(crate) struct Pending {
     /// (offset, mask, the caller's bits): at most two words per call.
     restore: Vec<(usize, u32, u32)>,
     record: Record,
+    /// The guest process what is recorded is charged to.
+    owner: Owner,
+}
+
+impl Pending {
+    /// Charge what this call records to `owner`, the calling process.
+    pub(crate) fn charged_to(mut self, owner: Owner) -> Self {
+        self.owner = owner;
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -193,7 +212,10 @@ enum Record {
 #[derive(Debug)]
 pub(crate) struct RmMem {
     coherent: bool,
-    objects: HashMap<(u32, u32), Mem>,
+    /// Each record charged to the guest process that made or duplicated
+    /// the object, from `records`.
+    objects: HashMap<(u32, u32), (Mem, Charge)>,
+    records: Pool,
     /// Which object each object RM made for this VM was made under, so a
     /// free takes the records of everything RM frees with it: the objects
     /// under the one freed, however deep (resource server frees a subtree),
@@ -212,6 +234,7 @@ impl Default for RmMem {
         Self {
             coherent: true,
             objects: HashMap::new(),
+            records: records_pool(),
             tree: Tree::default(),
             armed: HashMap::new(),
             full_warned: false,
@@ -220,30 +243,49 @@ impl Default for RmMem {
 }
 
 /// Every object's parent, by (hClient, handle), and each parent's children.
-#[derive(Debug, Default)]
+/// A set, not a list: one parent may have up to [`MAX_OBJECTS`] children,
+/// and each free unlinks one, under the backend mutex -- a scan per free
+/// would make a guest process freeing its objects one by one cost the VM
+/// quadratic time.
+#[derive(Debug)]
 struct Tree {
-    parent: HashMap<(u32, u32), u32>,
-    children: HashMap<(u32, u32), Vec<u32>>,
+    /// Each link charged to the guest process that made the object.
+    parent: HashMap<(u32, u32), (u32, Charge)>,
+    children: HashMap<(u32, u32), std::collections::HashSet<u32>>,
+    links: Pool,
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Tree {
+            parent: HashMap::new(),
+            children: HashMap::new(),
+            links: records_pool(),
+        }
+    }
 }
 
 impl Tree {
-    /// `(c, h)` was made under `p`. Past [`MAX_OBJECTS`] links nothing
-    /// more is linked: a later free then leaves those records behind, as
-    /// before, until their client goes.
-    fn link(&mut self, c: u32, h: u32, p: u32) {
+    /// `(c, h)` was made under `p` by `owner`. Past the pool, or `owner`'s
+    /// share of it, nothing more is linked: a later free then leaves those
+    /// records behind, as before, until their client goes.
+    fn link(&mut self, c: u32, h: u32, p: u32, owner: Owner) {
         self.unlink(c, h);
-        if h == p || self.parent.len() >= MAX_OBJECTS {
+        if h == p {
             return;
         }
-        self.parent.insert((c, h), p);
-        self.children.entry((c, p)).or_default().push(h);
+        let Ok(charge) = self.links.try_take(owner, 1) else {
+            return;
+        };
+        self.parent.insert((c, h), (p, charge));
+        self.children.entry((c, p)).or_default().insert(h);
     }
 
     fn unlink(&mut self, c: u32, h: u32) {
-        if let Some(p) = self.parent.remove(&(c, h))
+        if let Some((p, _)) = self.parent.remove(&(c, h))
             && let Some(v) = self.children.get_mut(&(c, p))
         {
-            v.retain(|&x| x != h);
+            v.remove(&h);
             if v.is_empty() {
                 self.children.remove(&(c, p));
             }
@@ -316,7 +358,7 @@ impl RmMem {
 
     /// What (hClient, handle) is, if this backend saw it made.
     pub(crate) fn lookup(&self, client: u32, handle: u32) -> Option<Mem> {
-        self.objects.get(&(client, handle)).copied()
+        self.objects.get(&(client, handle)).map(|(m, _)| *m)
     }
 
     /// What an ALLOC_MEMORY armed on guest file `handle`, if anything.
@@ -588,9 +630,9 @@ impl RmMem {
                     // memory, and semsurf.rs keeps the client set.
                     return;
                 }
-                self.set(c, h, mem);
+                self.set(c, h, mem, p.owner);
                 if let Some(parent) = le::u32_at(reply, PARENT) {
-                    self.tree.link(c, h, parent);
+                    self.tree.link(c, h, parent, p.owner);
                 }
                 if let (Some(fd), Some(m)) = (armed_on, mem) {
                     self.armed.insert(fd, m);
@@ -602,9 +644,13 @@ impl RmMem {
                 }
                 let get = |o| le::u32_at(reply, o).unwrap_or(0);
                 let src = self.lookup(get(NVOS55_H_CLIENT_SRC), get(NVOS55_H_OBJECT_SRC));
-                self.set(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), src);
-                self.tree
-                    .link(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), get(PARENT));
+                self.set(get(NVOS55_H_CLIENT), get(NVOS55_H_OBJECT), src, p.owner);
+                self.tree.link(
+                    get(NVOS55_H_CLIENT),
+                    get(NVOS55_H_OBJECT),
+                    get(PARENT),
+                    p.owner,
+                );
             }
             Record::Free => {
                 if le::u32_at(reply, NVOS00_STATUS) != Some(0) {
@@ -628,25 +674,25 @@ impl RmMem {
         }
     }
 
-    fn set(&mut self, client: u32, handle: u32, mem: Option<Mem>) {
-        match mem {
-            None => {
-                self.objects.remove(&(client, handle));
+    fn set(&mut self, client: u32, handle: u32, mem: Option<Mem>, owner: Owner) {
+        // Whatever the handle named before is gone, its charge with it.
+        self.objects.remove(&(client, handle));
+        let Some(m) = mem else {
+            return;
+        };
+        match self.records.try_take(owner, 1) {
+            Ok(charge) => {
+                self.objects.insert((client, handle), (m, charge));
             }
-            Some(m) => {
-                if self.objects.len() >= MAX_OBJECTS
-                    && !self.objects.contains_key(&(client, handle))
-                {
-                    if !self.full_warned {
-                        self.full_warned = true;
-                        log::warn!(
-                            "RM memory records: {MAX_OBJECTS} objects; later ones are not \
-                             recorded and map with the old write-combining guess"
-                        );
-                    }
-                    return;
+            Err(why) => {
+                if !self.full_warned {
+                    self.full_warned = true;
+                    log::warn!(
+                        "RM memory records: guest process {owner:?} is at its share of the \
+                         {MAX_OBJECTS} ({why:?}); its later objects are not recorded and map \
+                         with the old write-combining guess"
+                    );
                 }
-                self.objects.insert((client, handle), m);
             }
         }
     }
@@ -1048,6 +1094,75 @@ mod tests {
             m.lookup(CLIENT, 0x30).map(Mem::pgprot),
             Some(PgprotKind::Uncached)
         );
+    }
+
+    /// One guest process duplicating its own system memory in a loop fills
+    /// its share of the records and of the tree's links, not the tables:
+    /// another process's memory allocated after is still recorded, and its
+    /// GPU mapping still snoops.
+    #[test]
+    fn one_process_duplicating_its_memory_leaves_room_for_anothers() {
+        let (attacker, victim) = (
+            Owner::Proc {
+                tgid: 10,
+                start_ns: 1,
+            },
+            Owner::Proc {
+                tgid: 20,
+                start_ns: 2,
+            },
+        );
+        let run_as =
+            |m: &mut RmMem, o: Owner, escape: u32, params: &[u8], status: Option<usize>| {
+                let mut host = params.to_vec();
+                let p = m.before(escape, &mut host).charged_to(o);
+                let seen = host.clone();
+                if let Some(s) = status {
+                    put(&mut host, s, 0);
+                }
+                m.after(p, &mut host);
+                seen
+            };
+        let mut m = RmMem::default();
+        let mut a = sysmem_alloc(0x40, 0, 0);
+        put(&mut a, NVOS64_H_ROOT, 0xa);
+        run_as(&mut m, attacker, NV_ESC_RM_ALLOC, &a, Some(NVOS64_STATUS));
+        let mut d = vec![0u8; NVOS55_SIZE];
+        put(&mut d, NVOS55_H_CLIENT, 0xa);
+        put(&mut d, NVOS55_H_CLIENT_SRC, 0xa);
+        put(&mut d, NVOS55_H_OBJECT_SRC, 0x40);
+        put(&mut d, NVOS55_H_PARENT, 0xde7);
+        let share = MAX_OBJECTS as u64 / 4;
+        for i in 0..share as u32 + 100 {
+            put(&mut d, NVOS55_H_OBJECT, 0x10_0000 + i);
+            run_as(
+                &mut m,
+                attacker,
+                NV_ESC_RM_DUP_OBJECT,
+                &d,
+                Some(NVOS55_STATUS),
+            );
+        }
+        assert_eq!(m.records.held(attacker), share);
+        assert_eq!(m.tree.links.held(attacker), share);
+        let req = sysmem_alloc(0x10, 0, 0);
+        run_as(&mut m, victim, NV_ESC_RM_ALLOC, &req, Some(NVOS64_STATUS));
+        assert!(m.lookup(CLIENT, 0x10).is_some(), "the victim's is recorded");
+        let seen = run_as(
+            &mut m,
+            victim,
+            NV_ESC_RM_MAP_MEMORY_DMA,
+            &map_dma(0x10, 1),
+            None,
+        );
+        assert_eq!(rd32(&seen, NVOS46_FLAGS), Some(0x11), "and snoops");
+        // Freeing the attacker's client gives its share back.
+        let mut f = vec![0u8; NVOS00_SIZE];
+        put(&mut f, NVOS00_H_ROOT, 0xa);
+        put(&mut f, NVOS00_H_OBJECT_OLD, 0xa);
+        run_as(&mut m, attacker, NV_ESC_RM_FREE, &f, Some(NVOS00_STATUS));
+        assert_eq!(m.records.held(attacker), 0);
+        assert_eq!(m.tree.links.held(attacker), 0);
     }
 
     #[test]
