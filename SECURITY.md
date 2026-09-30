@@ -307,8 +307,8 @@ things before RM sees the call (`device/src/rmshare.rs`):
   process of the backend's user, other VMs' backends included), GPU,
   SMC_PARTITION, FM_CLIENT, a type RM does not define, or CLIENT naming any
   other client is refused. The share lists RM modifies, and the CLIENT
-  grants in them, are recorded, at most 4,096 together a session; past that
-  a share is refused, a revoke that would start a list included.
+  grants in them, are recorded, at most 4,096 together a session and a
+  quarter of that per guest process; past that a share is refused, a revoke that would start a list included.
 - **Duplicating.** NV_ESC_RM_DUP_OBJECT's destination and source clients must
   both be clients this VM allocated and has not freed. Then RM's own rule, with
   guest processes for the backend's: the two clients were made by one guest
@@ -938,6 +938,7 @@ files and sockets, the user's files, the network, other processes.
 |---|---|
 | threads | the transport; one pump, which sweeps only handles it has reported readable; up to 16 executors; one closer thread for display files; one reader per Wayland channel (at most the channel cap, 64 by default); short-lived close threads; one export accept thread and one hotplug thread in those modes |
 | handles | 65,536 per VM, or what RLIMIT_NOFILE backs (half of the hard limit less 1,024 kept for the backend's own); a quarter per guest process, the last sixteenth kept for processes holding at most a sixty-fourth (`device/src/quota.rs`) |
+| RM memory records | 262,144 records, and as many parent links, per VM; a quarter each per guest process (`device/src/rmmem.rs`) |
 | RM counters | counted only when RM said NV_OK, at most 4,096 keys (`device/src/tally.rs`) |
 | logs | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
 | channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used fewer than 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
@@ -1254,7 +1255,9 @@ login user it would remove that user's shared memory), and
 `SystemCallFilter=` (the backend installs its own allowlist). Its
 `ExecStartPre=` runs `nvgpu-pci-snapshot` as root, which copies the GPUs' PCI
 config space for `--pci-config-dir`; the backend uses a snapshot only if it
-is of the same device.
+is of the same device, and blanks what only the host should see before the
+guest reads it: the MSI capability's address and data, and the device serial
+number, with the capability lists still walking.
 
 The NixOS module (`nix/module.nix`) installs these units, with what is per
 slot in a drop-in. Its pool has fixed ids (`uidBase`, 64000: slot N is
