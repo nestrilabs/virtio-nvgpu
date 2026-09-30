@@ -134,8 +134,10 @@ topo_cores() {
 #              runs); avoid=none uses every core
 #   io=WHERE   the VMM's other threads and the backend: none (default:
 #              where the host puts them), siblings (the idle threads of the
-#              vCPUs' cores; cores and spread only), other (every CPU
-#              outside the vCPUs' L3 domains), or a CPU list
+#              vCPUs' cores; cores and spread only), rest (the whole cores
+#              of the vCPUs' L3 domains no vCPU has: smt at 8 vCPUs leaves
+#              4 of a 9950X CCD's 8), other (every CPU outside the vCPUs'
+#              L3 domains), or a CPU list
 pin_layout() {
     local spec=$1 layout opt first_l3= io=none avoid=0 want
     layout=${spec%%:*}
@@ -150,7 +152,7 @@ pin_layout() {
             l3=*) first_l3=${opt#l3=}; [[ $first_l3 =~ ^[0-9]+$ ]] || die "NVGPU_PIN: $opt: a CPU" ;;
             avoid=*) avoid=${opt#avoid=} ;;
             io=*) io=${opt#io=} ;;
-            *) die "NVGPU_PIN: $opt: l3=CPU, avoid=LIST or io=none|siblings|other|LIST" ;;
+            *) die "NVGPU_PIN: $opt: l3=CPU, avoid=LIST or io=none|siblings|rest|other|LIST" ;;
         esac
     done
     topo_read
@@ -267,6 +269,19 @@ pin_layout() {
             case $layout in cores | spread) ;; *) die "NVGPU_PIN=$spec: io=siblings: $layout leaves no thread of its cores idle" ;; esac
             [ ${#idle[@]} -gt 0 ] || die "NVGPU_PIN=$spec: io=siblings: these cores have no second thread"
             PIN_IO=$(compact_cpus "${idle[*]}")
+            ;;
+        rest)
+            # The cores of the vCPUs' L3 domains no vCPU has: whole cores
+            # sharing the vCPUs' L3, none of them a vCPU's sibling.
+            local -A taken=() indoms=()
+            local rest=() d c
+            for c in "${used[@]}"; do taken[${CORE_OF[$c]}]=1; done
+            for d in "${doms[@]}"; do indoms[$d]=1; done
+            for c in $TOPO_CPUS; do
+                [ -n "${indoms[${L3_OF[$c]}]:-}" ] && [ -z "${taken[${CORE_OF[$c]}]:-}" ] && rest+=("$c")
+            done
+            [ ${#rest[@]} -gt 0 ] || die "NVGPU_PIN=$spec: io=rest: the vCPUs take every core of their L3 domains"
+            PIN_IO=$(compact_cpus "${rest[*]}")
             ;;
         other)
             local -A mine=()

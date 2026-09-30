@@ -67,7 +67,7 @@
 #                       core-sets (vCPU i on either thread of core i); then
 #                       :l3=CPU (that CPU's domain first), :avoid=LIST (CPUs
 #                       whose cores no vCPU takes; default 0, avoid=none),
-#                       :io=none|siblings|other|LIST (the VMM's other threads
+#                       :io=none|siblings|rest|other|LIST (the VMM's other threads
 #                       and the backend). The pieces below, given too, win
 #                       over what it says for each. rig/pin-layout.sh prints
 #                       a layout without running anything

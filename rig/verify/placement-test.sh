@@ -92,6 +92,8 @@ check "core-sets: a core per vCPU" "pins=[14,30 15,31] aff= io= be= smt=1" zen5 
 check "io=siblings" "io=24-31 be=24-31" zen5 8 NVGPU_PIN=cores:io=siblings
 check "io=other" "io=0-7,16-23 be=0-7,16-23" zen5 8 NVGPU_PIN=cores:io=other
 check "io=LIST" "io=2,3 be=2,3" zen5 4 NVGPU_PIN=cores:io=2,3
+check "io=rest: CCD1's cores smt leaves" "io=8-9,11-12,24-25,27-28 be=8-9,11-12,24-25,27-28" zen5 8 NVGPU_PIN=smt:io=rest
+check "io=rest with every core taken" "refused: NVGPU_PIN=cores:io=rest: io=rest: the vCPUs take every core" zen5 8 NVGPU_PIN=cores:io=rest
 check "l3=CPU takes that CCD first" "pins=[1 17 4 20 6 22 7 23]" zen5 8 NVGPU_PIN=smt:l3=0
 check "16 cores need CPU 0's" "refused: NVGPU_PIN=cores: 16 whole cores wanted, this host has 15" zen5 16 NVGPU_PIN=cores
 check "avoid=none" "pins=[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]" zen5 16 NVGPU_PIN=cores:avoid=none
