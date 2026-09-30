@@ -884,20 +884,22 @@ Known, and not ours:
   rendering on the compositor; `rig-heavy.sh` kills whatever is left of the
   image's programs after each native run, and says so in the run's log.
 
-Known, and the RM allowlist's:
+Fixed, and how to see it again:
 
-- **Blender's Vulkan backend (`blender-vk`) hangs in 10 of 24 guest runs
-  because the allowlist refuses `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS`.**
+- **Blender's Vulkan backend (`blender-vk`) hung in 10 of 24 guest runs
+  while the allowlist refused `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS`.**
   NVIDIA's Vulkan driver disables and re-enables one of its own channels
   around each frame it starts, and goes on the same way whether RM did it
   or not; without it, a frame (nearly always the second) sometimes never
-  completes, and the main thread
-  polls `/dev/nvidia0` every 10 ms for good. The same refusal made natively
-  (`RMLOG_REFUSE`, below) hangs Blender the same way; forwarded
-  (`--rm-allowlist=log`, diagnostic only), no guest run hangs.
-  SuperTuxKart's start-ups call it too and cope (thirty refused, thirty
-  forwarded, all reached the race). Whether to allow it is open
-  (BENCHMARKS.md, "Heavy workloads").
+  completed, and the main thread polled `/dev/nvidia0` every 10 ms for
+  good. The same refusal made natively (`RMLOG_REFUSE`, below) hangs
+  Blender the same way. The control is allowed now, with a gate of its own
+  (SECURITY.md, "The RM allowlist"): 24 runs under nesbox and 10 under
+  crosvm, none hung. The gate's refusals show in the backend's log
+  (`FIFO_DISABLE_CHANNELS refused: ...`) and at teardown; the rig's
+  workloads make none. `sec-negative` T12 and T13 fire the refusals from a
+  guest (another process's client, a preemption event, and 400 calls back
+  to back).
 
 **A run that stops.** `rig/heavy/hang-watch.sh <workload> [runs]` (at
 `/opt/heavy` in the image) runs a workload in a loop and, when its app.log

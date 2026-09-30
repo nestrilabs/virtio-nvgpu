@@ -505,6 +505,8 @@ T4-T6 need a KMS or lease file, `--kms`):
 | T9 | `DUP same process` | **positive control**: the same duplicate between two clients of one process, on two files | **made** -- a FAIL here is the backend refusing what RM allows, and makes T8 inconclusive | S-35 |
 | T10 | `second client of another user` | a device sharing the VA space of a client another guest user (uid 65534) made; needs root in the guest | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS`; RM's own refusal counts as a FAIL, since the backend let it through. Its control, a device sharing this process's own client, must not be refused | S-35 |
 | T11 | `import from a foreign fd` | NV0000 OS_UNIX IMPORT_OBJECTS_FROM_FD naming a number not open here, and a file not the device's | EBADF before RM is asked | R1 |
+| T12 | `disable channels, event`, `disable channels, other process` | FIFO_DISABLE_CHANNELS with a `pRunlistPreemptEvent`, and naming a forked child's client | both refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS`; another status for the second means RM was asked to stop another process's channels (SECURITY.md, "The RM allowlist") | -- |
+| T13 | `disable channels, rate` | 400 no-op FIFO_DISABLE_CHANNELS (no channels) back to back | RM answers the first 40 or so, then the backend's per-process rate, `NV_ERR_NOT_SUPPORTED`; all 400 reaching RM is a FAIL | -- |
 
 T8 and T10 need a guest module that says which process and euid make each
 call (BCAP_PROC_ID, BCAP_PROC_EUID); without it both are refused anyway.

@@ -69,7 +69,7 @@ What is still open, in brief ("Open items and residual risk" has the whole
 list):
 
 - `RM_CONTROL` and `RM_ALLOC` are allow-listed per release, default deny, and
-  enforcing by default: 215 of 610.57.04's 1,370 controls (plus 30 GSP
+  enforcing by default: 216 of 610.57.04's 1,370 controls (plus 30 GSP
   pass-through numbers seen on hardware) and 97 of its 222 classes reach RM.
   The list was built from 106 hardware runs and NVIDIA's sources, and has run
   enforcing through the rig's regression and the application pass (Vulkan,
@@ -128,7 +128,7 @@ each call is validated:
 | entry point | host has | what reaches the host |
 |---|---|---|
 | **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Only on GPU and control handles (`v1_route`, `device/src/nvidia/v1.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused**, and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
-| **RM_CONTROL** commands | 1,370 controls | **Allow-listed** per release ("The RM allowlist"): 215 of 1,370 (and 30 GSP pass-through numbers seen on hardware) reach RM; the rest are answered NOT_SUPPORTED, or INVALID_PARAM_STRUCT for a size other than RM's, without RM. 3 controls whose pointers the tables cannot name one by one are **refused** whatever the list says (none is on it). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. NV0000's OS_UNIX controls (0x3dxx): the six that name a control file by descriptor (export, import, export info) get the backend's descriptor of the caller's own control file, and any other number is **refused** (EBADF), as is a descriptor field too short to hold; MEMACCT's cgroup descriptor and every OS_UNIX command RM does not define are answered NOT_SUPPORTED without RM (R1). |
+| **RM_CONTROL** commands | 1,370 controls | **Allow-listed** per release ("The RM allowlist"): 216 of 1,370 (and 30 GSP pass-through numbers seen on hardware) reach RM; the rest are answered NOT_SUPPORTED, or INVALID_PARAM_STRUCT for a size other than RM's, without RM. 3 controls whose pointers the tables cannot name one by one are **refused** whatever the list says (none is on it). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. NV0000's OS_UNIX controls (0x3dxx): the six that name a control file by descriptor (export, import, export info) get the backend's descriptor of the caller's own control file, and any other number is **refused** (EBADF), as is a descriptor field too short to hold; MEMACCT's cgroup descriptor and every OS_UNIX command RM does not define are answered NOT_SUPPORTED without RM (R1). |
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | **Allow-listed** per release ("The RM allowlist"): 97 of 222 reach RM, on RM_ALLOC, ALLOC_MEMORY, ALLOC_OBJECT, ALLOC_CONTEXT_DMA2 and by VID_HEAP_CONTROL function; the rest are answered INVALID_CLASS without RM. **12 are refused** on RM_ALLOC, ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 whatever the list says (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`), and ALLOC_MEMORY refuses the four of them whose `pMemory` RM reads (`REFUSED_ALLOC_MEMORY_CLASSES`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event. |
 | **RM_SHARE, RM_DUP_OBJECT, and a second client named in parameters** | NV04 share and dup; 2 NV0000 share controls; 7 classes and 21 controls that name another client | Shares go to RM only when they narrow or grant inside the VM; the rest are **refused**. A duplicate's two clients must be this VM's, made by one guest process, unless the source was shared with the destination (RM's rule, guest processes for the backend's). A second client named in class or control parameters must be this VM's and pass RM's rule for that field, with guest processes and euids. A guest that does not say which process and euid make each call gets neither. Below, "RM objects between guest processes". |
 | **memory named by CPU address** (OS descriptors through RM_ALLOC, ALLOC_MEMORY and VID_HEAP_CONTROL) | 3 paths | With an address alone, **refused**. Without `--allow-compute`, with pages too. With it, and the guest-physical pages behind it (BCAP_OS_DESC), **table-sized**: only the user-virtual-address descriptor type, a page list covering exactly what RM pins, every page in guest RAM, and RM handed the backend's own mapping of exactly those pages (below). |
@@ -169,7 +169,8 @@ release:
    host-PID controls (answered by `rmctl.rs` as before), ACPI methods,
    IMEX subscription, cgroup limits.
 4. A workload asks for it: observed across the rig's 106 runs (all 156
-   controls and 33 classes); every user-callable control of an object the
+   controls and 33 classes), the application pass and the heavy workloads
+   (FIFO_DISABLE_CHANNELS, below); every user-callable control of an object the
    guest itself made and RM confines to it (channel, group, context share,
    graphics context, memory, VA space, mapper, semaphore surface, context
    DMA), less MAKE_REALTIME and RESTART_RUNLIST, which reach other clients'
@@ -181,16 +182,16 @@ release:
 
 | release | controls allowed / exported | classes allowed / defined |
 |---|---|---|
-| 535.129.03 | 211 / 1,132 | 68 / 145 |
-| 580.178.04 | 215 / 1,357 | 94 / 209 |
-| 595.71.05, 595.99.02 | 215 / 1,349 | 94 / 209 |
-| 610.57.04 | 215 / 1,370 | 97 / 222 |
-| 615.71.09 | 217 / 1,389 | 97 / 224 |
+| 535.129.03 | 212 / 1,132 | 68 / 145 |
+| 580.178.04 | 216 / 1,357 | 94 / 209 |
+| 595.71.05, 595.99.02 | 216 / 1,349 | 94 / 209 |
+| 610.57.04 | 216 / 1,370 | 97 / 222 |
+| 615.71.09 | 218 / 1,389 | 97 / 224 |
 
 Each release also allows the 30 observed controls RM passes to GSP-RM with
-no CPU-side table (below); the backend's start-up line counts them in (245
+no CPU-side table (below); the backend's start-up line counts them in (246
 of 1,349 controls on 595.99.02). Of the ~750 controls RM would serve an
-unprivileged caller in 610.57.04, the list keeps 215:
+unprivileged caller in 610.57.04, the list keeps 216:
 `NV2080_CTRL_CMD_GPU_SET_POWER`, `GPU_EXEC_REG_OPS`,
 `PERF_RATED_TDP_SET_CONTROL` and several hundred more that any host user
 process may call are refused. A host between two releases uses the older
@@ -231,12 +232,57 @@ entry, which shows up as a failed workload with a warning of the form
 call site, and a teardown summary of every refusal by name.
 
 A refusal the driver does not check fails a workload later, not at the
-call. NVIDIA's Vulkan driver goes on after a refused
-`NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` as if its channel had been stopped,
-and Blender's Vulkan backend then hangs in 10 of 24 guest runs -- and
-natively too, when the same refusal is made there (BENCHMARKS.md, "Heavy
-workloads"). The control stays refused; whether to let a guest stop its
-own channels is open.
+call: the one below is how that was found.
+
+**FIFO_DISABLE_CHANNELS.** `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` is
+allowed, with a gate of its own (`device/src/rmchan.rs`). NVIDIA's Vulkan
+driver stops its own channels with it around queue set-up and, in Blender,
+around each frame it starts, and goes on the same way whatever RM answers.
+Refused, Blender's Vulkan backend hung in 10 of 24 guest runs; natively,
+the same refusal made by an LD_PRELOAD shim hung 5 of 14, a success
+answered without the call 4 of 8, and the call forwarded none of 8
+(BENCHMARKS.md, "Heavy workloads", has the table). Every field:
+
+| field | handling |
+|---|---|
+| `hClientList[numChannels]` | each client must be the calling guest process's own (`rmshare.rs`, `CONTROL_CLIENT_LISTS`, `Rule::Process`); another VM's or another guest process's is refused with RM's NV_ERR_INSUFFICIENT_PERMISSIONS, RM not called. GSP-RM checks no token here (open-gpu-kernel-modules 595.99.02, src/nvidia/src/kernel/gpu/fifo/kernel_fifo_ctrl.c `subdeviceCtrlCmdFifoDisableChannels_IMPL` sends the parameters on as they are), so natively a process could name any client whose handle it knew |
+| `numChannels` | at most 64 (the lists' length); more refuses the call whole (NV_ERR_INVALID_ARGUMENT) |
+| `hChannelList[numChannels]` | looked up by RM under the matching client, so only the caller's own channels |
+| `pRunlistPreemptEvent` | must be NULL, else NV_ERR_INSUFFICIENT_PERMISSIONS without RM: RM takes it only from a kernel client and refuses a user one the same way |
+| `bDisable`, `bOnlyDisableScheduling`, `bRewindGpPut` | flags on the caller's own channels; forwarded |
+| the size | 536 bytes, measured in every release; the allowlist holds it on a release measured exactly and the gate on every host |
+
+The control never reaches RM inside a DEFERRED_API bundle: RM defers only
+its own few, and the allowlist refuses a bundle of anything else.
+
+What it costs other tenants: a disable without `bOnlyDisableScheduling`
+preempts the channels off the GPU, a preemption of the runlist they share
+with every other VM and host program, which natively any process may make as
+often as it likes. So the gate has a rate: a token bucket per guest process
+(50 calls a second after a burst of 40) and one per VM (200 a second after
+160), a process charged for every call it asks for, served or not. The
+VM's last 40 tokens go only to a process that has used at most 8 of its
+own, so processes asking past their rate cannot take the calls of one that
+makes a few; it takes four processes at their whole rate to reach the VM's.
+A call over the rate is answered NV_ERR_NOT_SUPPORTED, RM not called: what
+CPU-RM answers for this control on a GPU without GSP, and what the driver
+was seen to go on from. The busiest workload measured natively makes a
+small fraction of it (BENCHMARKS.md, "Heavy workloads"); a process refused
+for its rate may hang as Blender did, so the rate is for a guest that
+misuses the call, not for one that uses it. As with the per-process
+shares ("Resource caps"), the gate tells apart only the processes the guest
+kernel does: a process that forks gets a bucket a child, and enough
+children take the VM's rate from its other processes -- a denial within the
+VM that the guest's own process limits bound. Against other VMs the VM's
+bucket holds whatever the guest does.
+
+gVisor's nvproxy (its master at `5f20848`, 2026-09-30) has allowed the control
+since its first ABI, 535.104.05, to every container with the compute or
+utility capability (pkg/sentry/devices/nvproxy/version.go,
+frontend.go `ctrlSubdevFIFODisableChannels`): it takes RM's size exactly
+and refuses a non-NULL `pRunlistPreemptEvent` (EINVAL), and checks neither
+the clients the lists name nor a rate. Both of those are the backend's
+alone.
 
 ### RM objects between guest processes
 
@@ -893,6 +939,7 @@ files and sockets, the user's files, the network, other processes.
 | handles | 65,536 per VM, or what RLIMIT_NOFILE backs (half of the hard limit less 1,024 kept for the backend's own); a quarter per guest process, the last sixteenth kept for processes holding at most a sixty-fourth (`device/src/quota.rs`) |
 | RM counters | counted only when RM said NV_OK, at most 4,096 keys (`device/src/tally.rs`) |
 | logs | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
+| channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used at most 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
 | display caps | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth ("The window's size and share"); a mapping is charged to whoever opened the file it is armed on |
 | Wayland caps | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools (the last sixteenth kept for processes holding at most a sixty-fourth), shared by all its connections. In the guest daemon, per client process: a quarter of the descriptors it may hold for clients (its hard limit less 60) and of 64 MiB of stream-sink data, the last eighth of each kept for processes holding little. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
@@ -2028,7 +2075,7 @@ Every open item, in rough order of weight. Each names the finding ids it
 carries; Appendix C has their history.
 
 1. **RM_CONTROL and RM_ALLOC are allow-listed, and what is allowed is still
-   a host surface.** 215 of 610.57.04's 1,370 controls and 97 of its 222
+   a host surface.** 216 of 610.57.04's 1,370 controls and 97 of its 222
    classes reach RM ("The RM allowlist"); each is checked by RM as it would
    check a user process without admin rights, and a bug in any of them is a
    host bug. The list covers what 106 hardware runs and the application pass
