@@ -57,21 +57,32 @@ pub struct IoctlEntry {
 /// A supported driver version and the table it selects.
 struct Profile {
     version: DriverVersion,
+    /// The first release the profile no longer describes, when that comes
+    /// before the next profile: an escape's block changed there. `None`:
+    /// it holds up to the next profile (or [`MEASURED_THROUGH`]).
+    until: Option<DriverVersion>,
     table: fn() -> &'static [IoctlEntry],
 }
 
 /// Profiles in ascending version order.
 static PROFILES: &[Profile] = &[
+    // gVisor's nvproxy records the 535 branch unchanged through 535.309.01
+    // and 545.23.06 unchanged from it; 550.40.07 grows UNMAP_MEMORY_DMA
+    // to 48 bytes and adds WAIT_OPEN_COMPLETE, 570.86.15 grows
+    // EXPORT_TO_DMABUF_FD, and 580.65.06 MAP_MEMORY_DMA.
     Profile {
         version: DriverVersion::new(535, 129, 3),
+        until: Some(DriverVersion::new(550, 0, 0)),
         table: v535_129_03::table,
     },
     Profile {
         version: DriverVersion::new(580, 178, 4),
+        until: None,
         table: v580_178_04::table,
     },
     Profile {
         version: DriverVersion::new(595, 71, 5),
+        until: None,
         table: v595_71_05::table,
     },
 ];
@@ -99,15 +110,18 @@ fn profile_for(v: DriverVersion) -> Option<&'static Profile> {
 ///
 /// Profiles key off **ranges, not points**: a release between two known
 /// versions selects the lower profile, which is what keeps the per-release cost
-/// small. A version older than every profile has no table and returns `None`
-/// -- guessing downwards would mean forwarding ioctls whose layout we have
-/// never seen -- and so does one newer than [`MEASURED_THROUGH`], for the
-/// same reason upwards.
+/// small -- but only up to the release its layouts are known to change at
+/// (`Profile::until`). A version older than every profile has no table and
+/// returns `None` -- guessing downwards would mean forwarding ioctls whose
+/// layout we have never seen -- and so does one past its profile's range or
+/// newer than [`MEASURED_THROUGH`], for the same reason upwards.
 pub fn table_for(v: DriverVersion) -> Option<&'static [IoctlEntry]> {
     if v > MEASURED_THROUGH {
         return None;
     }
-    profile_for(v).map(|p| (p.table)())
+    profile_for(v)
+        .filter(|p| p.until.is_none_or(|u| v < u))
+        .map(|p| (p.table)())
 }
 
 /// The nearest profile at or below `v`, measured through `v` or not: what
@@ -149,9 +163,34 @@ mod tests {
 
     #[test]
     fn version_between_profiles_selects_the_lower_one() {
-        // 570.x sits between the 535 and 580 profiles.
-        let t = table_for(DriverVersion::new(570, 86, 15)).expect("falls back to 535");
-        assert!(std::ptr::eq(t, v535_129_03::table()));
+        // Later 535 releases, and 545, have 535.129.03's blocks.
+        for v in [
+            DriverVersion::new(535, 309, 1),
+            DriverVersion::new(545, 23, 6),
+        ] {
+            let t = table_for(v).expect("falls back to 535");
+            assert!(std::ptr::eq(t, v535_129_03::table()), "{v}");
+        }
+        // Between 580.178.04 and 595.71.05 nothing changed either.
+        let t = table_for(DriverVersion::new(590, 48, 1)).expect("falls back to 580");
+        assert!(std::ptr::eq(t, v580_178_04::table()));
+    }
+
+    /// From 550 on the 535 profile's blocks are not the host's: those
+    /// releases have no measured profile, only a nearest one, and the
+    /// start-up summary says so (device/src/release.rs `Coverage`).
+    #[test]
+    fn a_version_past_its_profiles_range_has_no_table_but_a_nearest_one() {
+        for v in [
+            DriverVersion::new(550, 40, 7),
+            DriverVersion::new(570, 195, 3),
+            DriverVersion::new(580, 126, 9),
+        ] {
+            assert!(table_for(v).is_none(), "{v}");
+            assert!(!is_supported(v));
+            let t = nearest_table_for(v).expect("the 535 profile");
+            assert!(std::ptr::eq(t, v535_129_03::table()), "{v}");
+        }
     }
 
     #[test]
