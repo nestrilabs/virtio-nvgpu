@@ -794,7 +794,7 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_sowait_owner *owner;
   struct nvgpu_sowait *s;
   struct eventfd_ctx *ctx;
-  bool now = false, drop = false;
+  bool now = false, drop = false, charged = false;
   unsigned long flags;
   u64 id;
   long ret;
@@ -830,7 +830,8 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
     now = true;
   } else {
     sub->owner = nvgpu_sowait_charge_locked(&owner);
-    if (sub->owner) {
+    charged = sub->owner != NULL;
+    if (charged) {
       list_add_tail(&sub->node, &s->subs);
       if (!s->subs_ref) {
         refcount_inc(&s->ref);
@@ -839,8 +840,16 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
   spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
+  /*
+   * From here a listed `sub` is no longer ours to look at: the delivery
+   * (EV_READY, from an interrupt) or a DESTROY's forget on another thread
+   * may take it off the list and free it at any moment. What the charge
+   * said was read under the lock; reading sub->owner here instead read
+   * freed memory, found the NULL the uncharge had left, and freed the sub
+   * -- and put its eventfd -- a second time.
+   */
   kfree(owner); /* unless the charge took it */
-  if (!now && !sub->owner) {
+  if (!now && !charged) {
     /* Over the caller's share of the guest's subscribers. */
     kfree(sub);
     eventfd_ctx_put(ctx);
