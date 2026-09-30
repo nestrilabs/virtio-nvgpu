@@ -58,3 +58,42 @@ reaching secretmem (a secretmem folio is unmapped before its mapping is
 cleared, and GUP-fast re-checks the PTE after taking the reference). That
 helps every such driver mapping, not only prefaults, but it is in `mm/gup.c`,
 whose conservatism is deliberate, and it would be much harder to argue safe.
+
+**Reviewed (2026-09-30, against the 7.2.7 source; not booted).** Whether the
+flag lets a VMM write what it may only read:
+
+- *Read-only memslot*: the write fault's `__gfn_to_hva_many()` returns
+  `KVM_HVA_ERR_RO_BAD`, the fault `RET_PF_EMULATE`, the ioctl `ENOENT`;
+  nothing is mapped.
+- *A host mapping without write permission* (`PROT_READ`, a file opened
+  read-only, an `mprotect`ed range, a sealed memfd): GUP is asked for
+  `FOLL_WRITE` and never `FOLL_FORCE`, so it fails (`EFAULT`); a
+  `VM_PFNMAP` whose entry is present and read-only gives
+  `KVM_PFN_ERR_RO_FAULT` (`ENOENT`). A placement withdrawn and put back
+  read-only between the request and the prefault is judged by what is
+  mapped at the time of the call, not by what the VMM asked for.
+- *CoW, KSM, the zero page*: the write breaks CoW or the merge, as a guest
+  write or the VMM's own write to its own mapping would. No page is written.
+- *userfaultfd write-protect*: the fault is delivered to the handler, as a
+  guest write's would be.
+- *Private memory (guest_memfd, TDX, SEV-SNP)*: refused (`EINVAL`) before
+  any fault. A guest_memfd-only slot's shared pages take their writability
+  from the slot (`kvm_mmu_faultin_pfn_gmem()`), not from the flag.
+- *Write-tracked gfns* (shadowed guest page tables, KVMGT): the write fault
+  stops at `page_fault_handle_page_track()` (`RET_PF_WRITE_PROTECTED`),
+  which the prefault counts as done: nothing is made writable.
+- *Nested*: a vCPU in guest mode is not on the TDP MMU, and the ioctl
+  refuses it (`EOPNOTSUPP`), flag or not.
+
+So the flag gives a VMM no access its own mapping and the memslot do not
+already give it, and gives the guest nothing its own first write would not.
+What it does change: the page is dirtied (in the dirty log, and for a
+shared file mapping, in the page cache, so it is written back), and with a
+dirty ring the entries go to the ring of the vCPU the ioctl runs on, which
+only `KVM_RUN` drains; a never-run prefault vCPU over a dirty-logged slot
+would overflow its ring (a `WARN_ON_ONCE`, then entries overwritten). That
+is upstream's behaviour for a read prefault that maps a writable page too,
+and neither VMM logs the window's pages; the draft's `api.rst` now says so.
+The risk of applying it is a kernel change never booted: three lines on a
+path taken only with the flag set (with `flags` 0 the code is unchanged),
+reviewed by reading, not by `tools/testing/selftests/kvm` runs.

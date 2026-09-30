@@ -42,7 +42,7 @@ diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
 diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
 --- a/arch/x86/kvm/mmu/mmu.c
 +++ b/arch/x86/kvm/mmu/mmu.c
-@@ -5073,6 +5073,22 @@
+@@ -5073,6 +5073,23 @@
  		direct_bits = gfn_to_gpa(kvm_gfn_direct_bits(vcpu->kvm));
  
  	/*
@@ -53,7 +53,8 @@ diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
 +	 * refuses some pages outright -- with CONFIG_SECRETMEM, every order-0
 +	 * folio without a mapping, which is what a driver's vm_insert_page()
 +	 * gives userspace -- so the first guest write to each such page would
-+	 * take a second fault.  Private memory is prefaulted as it is.
++	 * take a second fault.  Private memory has no host mapping for the
++	 * flag to be about, so the flag is refused there.
 +	 */
 +	if (range->flags & KVM_PRE_FAULT_MEMORY_WRITE) {
 +		if (error_code & PFERR_PRIVATE_ACCESS)
@@ -68,7 +69,7 @@ diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
 diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
 --- a/Documentation/virt/kvm/api.rst
 +++ b/Documentation/virt/kvm/api.rst
-@@ -6529,7 +6529,15 @@
+@@ -6529,7 +6529,22 @@
  will fail with `EOPNOTSUPP` even if `KVM_CHECK_EXTENSION` reports
  the capability to be present.
  
@@ -79,9 +80,16 @@ diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
 +dirty in the dirty log, as a guest write would.  Without it a page that the
 +host could map writable may still be mapped read-only, e.g. one GUP-fast
 +cannot check, and the guest's first write to it then faults again.  A
-+read-only memslot fails with ENOENT, and private memory with EINVAL.
-+Another flag, or KVM_PRE_FAULT_MEMORY_WRITE on another architecture, fails
-+with EINVAL, so a VMM can probe for it.
++read-only memslot fails with ENOENT, and a host mapping that does not
++allow writing with EFAULT, or with ENOENT for a VM_PFNMAP entry that is
++present and read-only: GUP is asked for FOLL_WRITE, never FOLL_FORCE, so
++the flag gives no write access the VMM's own mapping does not have.
++Private memory fails with EINVAL.  Another flag, or
++KVM_PRE_FAULT_MEMORY_WRITE on another architecture, fails with EINVAL, so
++a VMM can probe for it: probe on a range the other EINVAL causes (an
++unaligned or wrapping range, an alias, private memory) cannot apply to.
++With a dirty ring, each page is pushed to the ring of the vCPU the ioctl is
++issued on, and nothing but KVM_RUN on that vCPU acts on a full ring.
  
  4.144 KVM_S390_KEYOP
  --------------------
