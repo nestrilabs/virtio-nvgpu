@@ -33,8 +33,11 @@
 # its group, and hands it over; a drop-in here then says
 #   [Unit]
 #   Requires=vhost-user-nvgpu-inject@N.socket
-# The backend is assumed at /usr/bin; adjust the path (or use
-# nix/module.nix) as installed.
+# The tuning flags (DEPLOY.md, "Tuning") go in NVGPU_BACKEND_ARGS too:
+# --queue-poll-us (default 50; 0 or 10 on a host with many VMs),
+# --sched-slice-us (default 100) and --fifo-disable-{proc,vm}-{rate,burst}
+# (default 50, 40, 200 and 160). The backend is assumed at /usr/bin; adjust
+# the path (or use nix/module.nix) as installed.
 #
 # What the unit adds to the backend's own sandbox (device/src/sandbox.rs):
 # a cgroup of the VM's own with a memory and task bound and the OOM killer's
@@ -88,6 +91,11 @@ TimeoutStopSec=10
 # output (--wayland-queue-budget, 256 MiB): raise MemoryMax with them.
 MemoryMax=2G
 MemorySwapMax=0
+# The queue thread's poll (--queue-poll-us) keeps up to a core busy while a
+# guest sends without pause; a quota bounds what one VM's backend takes of
+# the host (DEPLOY.md, "Tuning"). Unset by default: a backend held to less
+# than it needs answers its guest late.
+#CPUQuota=50%
 # Up to 16 executors, one reader per Wayland channel (64 by default), the
 # transport, pump, closer and hotplug threads.
 TasksMax=256

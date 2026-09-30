@@ -14,7 +14,16 @@
 # "/run/nvgpu/vmN/nvgpu.sock" }, and "unshare-network": false -- nesbox
 # cannot make a user namespace once chrooted, so the network namespace is
 # this unit's (PrivateNetwork=). The disk it names must be nvgpu-vmmN's to
-# write.
+# write. The tuning knobs (DEPLOY.md, "Tuning") go in the same file, each
+# with the default below:
+#   NVGPU_SLICE_US=100     the EEVDF slice of every VMM thread (0: the
+#                          host's own, about 3 ms)
+#   NVGPU_CORE_SCHED=off   off (nesbox makes no core-scheduling cookie), vm
+#                          (one for the whole VMM) or shared (one with the
+#                          backend; SECURITY.md, "The tuning knobs")
+# contrib/systemd/nvgpu-vmm-exec applies them as it execs the jailer, which
+# the jailed nesbox inherits both from. nesbox's own prefault is its
+# config's (machine-config "prefault", on by default).
 #
 # nesbox's jailer (nesbox tools/jailer, Linux 5.8 or later) starts as root:
 # it makes the jail's mount namespace with a /proc of its own
@@ -32,10 +41,14 @@ After=vhost-user-nvgpu@%i.service
 
 [Service]
 Type=exec
+# The knobs' defaults; the file below overrides each it sets.
+Environment=NVGPU_SLICE_US=100 NVGPU_CORE_SCHED=off
 EnvironmentFile=/etc/virtio-nvgpu/vmm%i.env
-# The 100 us EEVDF slice for every VMM thread (DEPLOY.md, "Frame pacing");
-# the uid and gid by name, which the jailer takes as numbers.
-ExecStart=/bin/sh -c 'exec chrt --other --sched-runtime 100000 0 jailer --config "$NVGPU_VMM_CONFIG" --jail-root "$NVGPU_JAIL_ROOT" --uid "$(id -u nvgpu-vmm%i)" --gid "$(getent group nvgpu-vm%i | cut -d: -f3)"'
+# The uid and gid by name, which the jailer takes as numbers.
+ExecStart=/bin/sh -c 'exec /usr/libexec/virtio-nvgpu/nvgpu-vmm-exec nesbox jailer --config "$NVGPU_VMM_CONFIG" --jail-root "$NVGPU_JAIL_ROOT" --uid "$(id -u nvgpu-vmm%i)" --gid "$(getent group nvgpu-vm%i | cut -d: -f3)"'
+# NVGPU_CORE_SCHED=shared: the backend takes the cookie the jailer was
+# exec'd with; nothing for any other mode.
+ExecStartPost=+/usr/libexec/virtio-nvgpu/nvgpu-vmm-exec join %i $MAINPID
 Restart=no
 TimeoutStopSec=30
 # Guest RAM is committed at boot; size this as guest RAM plus about 256 MiB
@@ -47,8 +60,14 @@ TimeoutStopSec=30
 # A VMM its guest has taken over can grow any file it can write -- the
 # disk above all -- with ftruncate or fallocate until the file system is
 # full. RLIMIT_FSIZE bounds that, but also every memfd the VMM sizes: set it
-# no lower than the largest of the disk, guest RAM and the window.
+# no lower than the largest of the disk, guest RAM and the window (a VMM
+# that passes it is killed with SIGXFSZ). Unset by default.
 #LimitFSIZE=
+# A host C-state cap while this VM runs (DEPLOY.md, "Tuning"; off by
+# default, it costs power), in a drop-in:
+#   [Unit]
+#   Wants=nvgpu-cpu-latency@50.service
+#   After=nvgpu-cpu-latency@50.service
 PrivateNetwork=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

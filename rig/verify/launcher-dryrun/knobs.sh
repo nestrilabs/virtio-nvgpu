@@ -208,6 +208,73 @@ echo "== NVGPU_PREFAULT=0"
 run noprefault NVGPU_PREFAULT=0 -- --vmm crosvm
 hasnt "crosvm not told to prefault" "--prefault-memory"
 
+echo "== the units' helper (contrib/systemd/nvgpu-vmm-exec)"
+H=$(dirname "$L")/../contrib/systemd/nvgpu-vmm-exec
+vx() { # vx [ENV=...]... -- ARGS: the helper's output, with a stub VMM
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done
+    shift
+    OUT=$(env -i PATH="$R/bin:$PATH" ${envs[@]+"${envs[@]}"} sh "$H" "$@" 2>&1)
+}
+cat > "$R/bin/vmmstub" <<'EOF'
+#!/bin/sh
+echo "stub vmm: argv: $*"
+echo "stub vmm: cookie $(coresched get -s $$ 2>&1 | sed 's/.* //')"
+echo "stub vmm: slice $(chrt -p $$ | sed -n 's/.*runtime parameter: //p')"
+EOF
+chmod 0755 "$R/bin/vmmstub"
+vx -- crosvm vmmstub run --x
+has "units, crosvm defaults: prefault, no core flag" "stub vmm: argv: run --prefault-memory --x"
+has "units, crosvm defaults: no cookie of its own" "stub vmm: cookie 0x0"
+has "units, crosvm defaults: the 100 us slice" "stub vmm: slice 100000"
+vx NVGPU_SLICE_US=250 -- crosvm vmmstub run --x
+has "units: NVGPU_SLICE_US=250" "stub vmm: slice 250000"
+vx NVGPU_CORE_SCHED=off NVGPU_PREFAULT=0 -- crosvm vmmstub run --x
+has "units, crosvm off, no prefault" "stub vmm: argv: run --core-scheduling=false --x"
+vx NVGPU_CORE_SCHED=vm -- crosvm vmmstub run --x
+has "units, crosvm vm" "stub vmm: argv: run --per-vm-core-scheduling --prefault-memory --x"
+vx NVGPU_CORE_SCHED=shared -- crosvm vmmstub run --x
+has "units, crosvm shared: crosvm's own off" "stub vmm: argv: run --core-scheduling=false --prefault-memory --x"
+hasnt "units, crosvm shared: a cookie from its exec" "stub vmm: cookie 0x0"
+vx -- nesbox vmmstub --config c
+has "units, nesbox defaults" "stub vmm: argv: --config c"
+has "units, nesbox defaults: no cookie" "stub vmm: cookie 0x0"
+vx NVGPU_CORE_SCHED=vm -- nesbox vmmstub --config c
+hasnt "units, nesbox vm: a cookie of its own" "stub vmm: cookie 0x0"
+for refusal in "NVGPU_CORE_SCHED=per-vcpu:nesbox:nesbox makes no cookie per vCPU" \
+    "NVGPU_PREFAULT=0:nesbox:nesbox's prefault is its config's" \
+    "NVGPU_CORE_SCHED=sometimes:crosvm:per-vcpu, vm, shared or off" \
+    "NVGPU_SLICE_US=50:crosvm:0, or 100 to 100000" \
+    "NVGPU_SLICE_US=1e3:crosvm:0, or 100 to 100000" \
+    "NVGPU_PREFAULT=yes:crosvm:0 or 1"; do
+    IFS=: read -r e k says <<<"$refusal"
+    if [ "$k" = crosvm ]; then vx "$e" -- crosvm vmmstub run; else vx "$e" -- nesbox vmmstub; fi
+    has "units: $e refused ($k)" "$says"
+    hasnt "units: $e: the VMM not run" "stub vmm: argv"
+done
+# join: a backend (a sleep with no cookie) takes the VMM's, as root would
+# give it; systemctl answers with the backend's pid.
+sleep 30 &
+BE=$!
+coresched new -- sleep 30 &
+VM=$!
+printf '#!/bin/sh\necho %s\n' "$BE" > "$R/bin/systemctl"
+chmod 0755 "$R/bin/systemctl"
+sleep 0.2
+vx -- join 0 "$VM"
+hasnt "units, join: nothing without shared" "shares"
+vx NVGPU_CORE_SCHED=shared -- join 0 "$VM"
+has "units, join: the backend takes the VMM's cookie" "shares the VMM's core-scheduling cookie"
+n=$((n + 1))
+if [ "$(coresched get -s "$BE" | sed 's/.* //')" = "$(coresched get -s "$VM" | sed 's/.* //')" ]; then
+    echo "  ok: units, join: one cookie"
+else
+    echo "  FAIL: units, join: the backend's cookie is not the VMM's"
+    bad=$((bad + 1))
+fi
+kill "$BE" "$VM" 2>/dev/null
+wait "$BE" "$VM" 2>/dev/null
+
 if [ "$bad" = 0 ]; then
     echo "knobs: all $n checks passed"
 else

@@ -7,7 +7,10 @@
 #   the units it installs say what contrib/systemd's say (nix/unit-diff.py),
 #   and its drop-ins set only what is per slot, no hardening key;
 # - each configuration the module must refuse is refused, by the assertion
-#   meant to (the case names what its message must say).
+#   meant to (the case names what its message must say), and each value an
+#   option's type must refuse is (typeRefused);
+# - the tuning knobs reach the backend's and the VMMs' drop-ins as they
+#   should, and a slot left at its defaults has the drop-in it had.
 #
 # Nothing is built but the comparison: the package is a placeholder whose
 # path alone reaches the units.
@@ -21,6 +24,8 @@ let
   inherit (nixpkgs) lib;
 
   placeholder = pkgs.runCommand "vhost-user-nvgpu-placeholder" { } "mkdir -p $out/bin";
+  crosvmPkg = pkgs.runCommand "crosvm-placeholder" { } "mkdir -p $out/bin";
+  nesboxPkg = pkgs.runCommand "nesbox-placeholder" { } "mkdir -p $out/bin";
   base = {
     services.virtio-nvgpu = {
       enable = true;
@@ -87,16 +92,61 @@ let
         helperUid = 950;
         helperGroup = "nvgpu-cap0";
       };
+      queuePollUs = 10;
+      sliceUs = 200;
+      cpuQuota = "50%";
+      fifoDisable = {
+        procRate = 10;
+        procBurst = 20;
+        vmRate = 400;
+        vmBurst = 320;
+      };
+      vmm = {
+        kind = "crosvm";
+        crosvmArgs = [
+          "--cpus"
+          "4"
+          "--mem"
+          "4096"
+          "/var/lib/virtio-nvgpu/vmlinux"
+        ];
+        coreScheduling = "shared";
+        prefaultMemory = false;
+        guestMemMiB = 4096;
+        diskMiB = 8192;
+        limitFSizeMiB = 16384;
+        cpuLatencyUs = 50;
+      };
     } extra;
+  };
+  # A nesbox VM with a preset window and its own cookie.
+  vm2 = {
+    services.virtio-nvgpu.vms."2" = {
+      windowPreset = "creative";
+      vmm = {
+        kind = "nesbox";
+        nesboxConfig = "/etc/virtio-nvgpu/vm2.json";
+        jailRoot = "/var/lib/virtio-nvgpu/jail";
+        coreScheduling = "vm";
+      };
+    };
+  };
+  vmmPackages = {
+    services.virtio-nvgpu.vmmPackages = {
+      crosvm = crosvmPkg;
+      nesbox = nesboxPkg;
+    };
   };
   goodSystem = system' {
     imports = [
       helper
       (vm0 { })
+      vm2
+      vmmPackages
       {
         services.virtio-nvgpu.extraArgs = [
-          "--queue-poll-us"
-          "50"
+          "--wayland-max-conns"
+          "32"
         ];
       }
     ];
@@ -229,7 +279,196 @@ let
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";
     };
+    "a flag an option renders, in extraArgs too" = {
+      config = [
+        {
+          services.virtio-nvgpu.extraArgs = [
+            "--queue-poll-us"
+            "50"
+          ];
+          services.virtio-nvgpu.vms."0".queuePollUs = 10;
+        }
+      ];
+      says = "the backend refuses a flag given twice";
+    };
+    "a window flag in a VM's extraArgs and its option" = {
+      config = [
+        {
+          services.virtio-nvgpu.vms."0" = {
+            extraArgs = [ "--window-size=2048" ];
+            windowPreset = "creative";
+          };
+        }
+      ];
+      says = "the backend refuses a flag given twice";
+    };
+    "a preset and a size" = {
+      config = [
+        {
+          services.virtio-nvgpu.vms."0" = {
+            windowMiB = 2048;
+            windowPreset = "creative";
+          };
+        }
+      ];
+      says = "a preset or windowMiB, not both";
+    };
+    "a process's disable rate at the VM's" = {
+      config = [ { services.virtio-nvgpu.vms."0".fifoDisable.procRate = 200; } ];
+      says = "procRate below vmRate";
+    };
+    "a process's disable burst past the VM's less its reserve" = {
+      config = [ { services.virtio-nvgpu.vms."0".fifoDisable.procBurst = 121; } ];
+      says = "procRate below vmRate";
+    };
+    "a process's disable burst within the reserve's floor" = {
+      config = [ { services.virtio-nvgpu.vms."0".fifoDisable.procBurst = 8; } ];
+      says = "procRate below vmRate";
+    };
+    "a VMM knob with no VMM" = {
+      config = [ { services.virtio-nvgpu.vms."0".vmm.coreScheduling = "off"; } ];
+      says = "set vmm.kind";
+    };
+    "a C-state cap with no VMM" = {
+      config = [ { services.virtio-nvgpu.vms."0".vmm.cpuLatencyUs = 50; } ];
+      says = "set vmm.kind";
+    };
+    "crosvm with no package" = {
+      config = [
+        {
+          services.virtio-nvgpu.vms."0".vmm = {
+            kind = "crosvm";
+            crosvmArgs = [ "/k" ];
+          };
+        }
+      ];
+      says = "vmmPackages.crosvm, vmmPackages.nesbox) is not set";
+    };
+    "crosvm with no arguments" = {
+      config = [
+        vmmPackages
+        { services.virtio-nvgpu.vms."0".vmm.kind = "crosvm"; }
+      ];
+      says = "crosvm takes crosvmArgs";
+    };
+    "nesbox with no config" = {
+      config = [
+        vmmPackages
+        { services.virtio-nvgpu.vms."0".vmm.kind = "nesbox"; }
+      ];
+      says = "nesbox nesboxConfig and jailRoot";
+    };
+    "nesbox per vCPU" = {
+      config = [
+        vmmPackages
+        vm2
+        { services.virtio-nvgpu.vms."2".vmm.coreScheduling = lib.mkForce "per-vcpu"; }
+      ];
+      says = "nesbox makes no core-scheduling cookie per vCPU";
+    };
+    "nesbox without prefault" = {
+      config = [
+        vmmPackages
+        vm2
+        { services.virtio-nvgpu.vms."2".vmm.prefaultMemory = false; }
+      ];
+      says = "its prefault is its config's";
+    };
+    "a crosvm argument with a space" = {
+      config = [
+        vmmPackages
+        {
+          services.virtio-nvgpu.vms."0".vmm = {
+            kind = "crosvm";
+            crosvmArgs = [ "--mem 4096" ];
+          };
+        }
+      ];
+      says = "one word each";
+    };
+    "a file size limit with nothing to hold it to" = {
+      config = [
+        vmmPackages
+        vm2
+        { services.virtio-nvgpu.vms."2".vmm.limitFSizeMiB = 65536; }
+      ];
+      says = "give guestMemMiB and diskMiB too";
+    };
+    "a file size limit below the disk" = {
+      config = [
+        vmmPackages
+        vm2
+        {
+          services.virtio-nvgpu.vms."2".vmm = {
+            limitFSizeMiB = 8192;
+            guestMemMiB = 4096;
+            diskMiB = 10000;
+          };
+        }
+      ];
+      says = "at least the largest of the disk";
+    };
+    "a file size limit below guest RAM" = {
+      config = [
+        vmmPackages
+        vm2
+        {
+          services.virtio-nvgpu.vms."2".vmm = {
+            limitFSizeMiB = 9000;
+            guestMemMiB = 16384;
+            diskMiB = 4096;
+          };
+        }
+      ];
+      says = "at least the largest of the disk";
+    };
+    "a file size limit below the preset's window" = {
+      config = [
+        vmmPackages
+        vm2
+        {
+          services.virtio-nvgpu.vms."2".vmm = {
+            limitFSizeMiB = 6000;
+            guestMemMiB = 4096;
+            diskMiB = 4096;
+          };
+        }
+      ];
+      says = "at least the largest of the disk";
+    };
   };
+  # Values an option's type refuses, before any assertion: that option of
+  # vms."0", read, must throw, and read with the value beside it (a good
+  # one) must not -- so that the case fails for its value, not for
+  # something else of the configuration.
+  typeRefused = {
+    "a poll past 1000 us" = [ [ "queuePollUs" ] 1001 1000 ];
+    "a slice below 100 us" = [ [ "sliceUs" ] 50 0 ];
+    "a slice past 100 ms" = [ [ "sliceUs" ] 100001 100000 ];
+    "a CPU quota that is not a percentage" = [ [ "cpuQuota" ] "50" "50%" ];
+    "a disable rate past 1000" = [ [ "fifoDisable" "vmRate" ] 1001 1000 ];
+    "a disable rate of 0" = [ [ "fifoDisable" "procRate" ] 0 1 ];
+    "a preset it does not know" = [ [ "windowPreset" ] "huge" "creative" ];
+    "a core-scheduling mode it does not know" = [ [ "vmm" "coreScheduling" ] "sometimes" "shared" ];
+    "a C-state cap past 100 ms" = [ [ "vmm" "cpuLatencyUs" ] 100001 0 ];
+    "a VMM it does not know" = [ [ "vmm" "kind" ] "qemu" "nesbox" ];
+  };
+  checkType =
+    name: c:
+    let
+      path = lib.elemAt c 0;
+      read =
+        v:
+        (builtins.tryEval (
+          builtins.deepSeq (lib.getAttrFromPath path
+            (eval {
+              services.virtio-nvgpu.vms."0" = lib.setAttrByPath path v;
+            }).services.virtio-nvgpu.vms."0"
+          ) true
+        )).success;
+    in
+    (!(read (lib.elemAt c 1)) || throw "module-eval: \"${name}\" was accepted; its option's type must refuse it")
+    && (read (lib.elemAt c 2) || throw "module-eval: \"${name}\": the good value beside it was refused too");
   check =
     name: c:
     let
@@ -252,16 +491,32 @@ let
     "Service:EnvironmentFile="
     "Service:MemoryMax"
     "Service:TasksMax"
+    "Service:CPUQuota"
     "Service:ProtectHome=tmpfs"
     "Service:BindReadOnlyPaths"
     "env:NVGPU_BACKEND_ARGS"
     "env:NVGPU_WAYLAND_ARGS"
+  ];
+  # What a VMM drop-in may set: the VMM's arguments, its knobs, its file
+  # size limit and the C-state cap it wants (vm 0's, 50 us).
+  vmmDropinKeys = lib.concatStringsSep "," [
+    "Unit:Wants=nvgpu-cpu-latency@50.service"
+    "Unit:After=nvgpu-cpu-latency@50.service"
+    "Service:EnvironmentFile="
+    "Service:LimitFSIZE"
+    "env:NVGPU_SLICE_US"
+    "env:NVGPU_CORE_SCHED"
+    "env:NVGPU_PREFAULT"
+    "env:NVGPU_CROSVM_ARGS"
+    "env:NVGPU_VMM_CONFIG"
+    "env:NVGPU_JAIL_ROOT"
   ];
 in
 assert
   goodFails == [ ]
   || throw "module-eval: the full configuration fails: ${lib.concatStringsSep "; " goodFails}";
 assert lib.all (x: x) (lib.mapAttrsToList check refused);
+assert lib.all (x: x) (lib.mapAttrsToList checkType typeRefused);
 pkgs.runCommand "virtio-nvgpu-module-eval"
   {
     nativeBuildInputs = [ pkgs.python3 ];
@@ -269,10 +524,16 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     # A slot with no vms.<n>: the global settings reach it too.
     dropin1 = unit "vhost-user-nvgpu@1.service";
     inject = unit "vhost-user-nvgpu-inject@0.socket";
+    vmm0 = unit "nvgpu-vmm-crosvm@0.service";
+    vmm2 = unit "nvgpu-vmm-nesbox@2.service";
+    dropin2 = unit "vhost-user-nvgpu@2.service";
     passAsFile = [
       "dropin"
       "dropin1"
+      "dropin2"
       "inject"
+      "vmm0"
+      "vmm2"
     ];
   }
   ''
@@ -281,23 +542,50 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     # The drop-in check refuses what it must (a second assignment on an
     # Environment= line, a continuation, a key or value off the list).
     python3 ${./unit-diff.py} --self-test
-    for f in vhost-user-nvgpu@.service vhost-user-nvgpu@.socket vhost-user-nvgpu-inject@.socket; do
+    for f in vhost-user-nvgpu@.service vhost-user-nvgpu@.socket vhost-user-nvgpu-inject@.socket \
+      nvgpu-vmm-crosvm@.service nvgpu-vmm-nesbox@.service nvgpu-cpu-latency@.service; do
       python3 ${./unit-diff.py} $d/$f $u/$f
     done
+    # The helpers the VMM units and the C-state cap run, from the store.
+    grep -q '^ExecStart=${units}/libexec/virtio-nvgpu/nvgpu-vmm-exec crosvm ${crosvmPkg}/bin/crosvm run ' $u/nvgpu-vmm-crosvm@.service
+    grep -q '^ExecStartPost=+${units}/libexec/virtio-nvgpu/nvgpu-vmm-exec join ' $u/nvgpu-vmm-crosvm@.service
+    grep -q 'nvgpu-vmm-exec nesbox ${nesboxPkg}/bin/jailer ' $u/nvgpu-vmm-nesbox@.service
+    grep -q '^ExecStart=${units}/libexec/virtio-nvgpu/nvgpu-cpu-latency %i' $u/nvgpu-cpu-latency@.service
+    test -x ${units}/libexec/virtio-nvgpu/nvgpu-vmm-exec
+    test -x ${units}/libexec/virtio-nvgpu/nvgpu-cpu-latency
     grep -q '^ExecStart=${placeholder}/bin/vhost-user-nvgpu ' $u/vhost-user-nvgpu@.service
     grep -q '^ExecStartPre=+${units}/libexec/virtio-nvgpu/nvgpu-pci-snapshot ' $u/vhost-user-nvgpu@.service
     test -x ${units}/libexec/virtio-nvgpu/nvgpu-pci-snapshot
     python3 ${./unit-diff.py} --dropin "$dropinPath" ${dropinKeys}
     python3 ${./unit-diff.py} --dropin "$dropin1Path" ${dropinKeys}
+    python3 ${./unit-diff.py} --dropin "$dropin2Path" ${dropinKeys}
     python3 ${./unit-diff.py} --dropin "$injectPath" Socket:SocketGroup=nvgpu-cap0
+    python3 ${./unit-diff.py} --dropin "$vmm0Path" ${vmmDropinKeys}
+    python3 ${./unit-diff.py} --dropin "$vmm2Path" ${vmmDropinKeys}
     # The per-VM drop-in carries what the options asked for.
-    grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50 --allow-compute --window-size 16384' "$dropinPath"
-    grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
+    grep -q -- 'NVGPU_BACKEND_ARGS=--wayland-max-conns 32 --allow-compute --window-size 16384' "$dropinPath"
+    grep -q -- 'NVGPU_BACKEND_ARGS=--wayland-max-conns 32"' "$dropin1Path"
     grep -q -- '--inject-uid 950' "$dropinPath"
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"
     grep -q 'ProtectHome=tmpfs' "$dropinPath"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"
     grep -q 'Requires=vhost-user-nvgpu-inject@0.socket' "$dropinPath"
     grep -q '^MemoryMax=2G' "$dropin1Path"
+    # The tuning knobs: each where it goes, and none on a slot with the
+    # defaults.
+    grep -q -- '--queue-poll-us 10 --sched-slice-us 200 --fifo-disable-proc-rate 10 --fifo-disable-proc-burst 20 --fifo-disable-vm-rate 400 --fifo-disable-vm-burst 320' "$dropinPath"
+    grep -q '^CPUQuota=50%' "$dropinPath"
+    ! grep -q 'CPUQuota\|--sched-slice-us\|--fifo-disable' "$dropin1Path"
+    grep -q -- 'NVGPU_BACKEND_ARGS=--wayland-max-conns 32 --window-size 8192"' "$dropin2Path"
+    grep -q 'NVGPU_CORE_SCHED=shared' "$vmm0Path"
+    grep -q 'NVGPU_PREFAULT=0' "$vmm0Path"
+    grep -q 'NVGPU_SLICE_US=200' "$vmm0Path"
+    grep -q 'NVGPU_CROSVM_ARGS=--cpus 4 --mem 4096 /var/lib/virtio-nvgpu/vmlinux' "$vmm0Path"
+    grep -q '^LimitFSIZE=16384M' "$vmm0Path"
+    grep -q '^Wants=nvgpu-cpu-latency@50.service' "$vmm0Path"
+    grep -q 'NVGPU_CORE_SCHED=vm' "$vmm2Path"
+    grep -q 'NVGPU_SLICE_US=100' "$vmm2Path"
+    grep -q 'NVGPU_VMM_CONFIG=/etc/virtio-nvgpu/vm2.json' "$vmm2Path"
+    ! grep -q 'LimitFSIZE\|cpu-latency\|NVGPU_PREFAULT' "$vmm2Path"
     touch $out
   ''

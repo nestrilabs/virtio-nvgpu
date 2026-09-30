@@ -33,6 +33,7 @@ import sys
 VALUE_DIFFERS = {
     "ExecStart",  # the backend's path: /usr/bin, or the store
     "ExecStartPre",  # nvgpu-pci-snapshot from /usr/libexec, or the store
+    "ExecStartPost",  # nvgpu-vmm-exec from /usr/libexec, or the store
     "ExecPaths",  # the backend's path
 }
 # Keys only one side has, by design: NixOS's own.
