@@ -503,6 +503,13 @@ impl Engine {
                 let Some(desc) = iface(ifc).messages(Dir::Request).get(h.opcode as usize) else {
                     continue;
                 };
+                // Only a new_id makes an object to follow: a frame's commits,
+                // attaches and damage need no parse here (the engine parses
+                // each once more, and with a lease device offered this runs
+                // on every frame).
+                if !desc.args.iter().any(|a| a.kind == ArgKind::NewId) {
+                    continue;
+                }
                 let Ok(args) = wire::parse(desc, m) else {
                     continue;
                 };
