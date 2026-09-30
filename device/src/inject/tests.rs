@@ -658,7 +658,10 @@ fn nothing_injected_is_kept_without_its_taint() {
     let view = file.try_clone().unwrap();
     let render = be.adopt_for_test(file, HandleKind::DriRender(0));
     set(true);
-    assert_eq!(inject_open(&mut be, render, id, &token, 10).0, -libc::EMFILE);
+    assert_eq!(
+        inject_open(&mut be, render, id, &token, 10).0,
+        -libc::EMFILE
+    );
     assert_eq!(host.handles_in(view.as_fd()), 0, "nothing imported");
     assert_eq!(be.inject.opens(), 0);
     set(false);
@@ -672,7 +675,10 @@ fn nothing_injected_is_kept_without_its_taint() {
     reg.release(1, id).unwrap();
     assert!(!reg.taint().is_empty(), "the open holds it");
     call(&mut be, MsgType::Close, render, &[]);
-    assert!(reg.taint().is_empty(), "a second open's hold was given back");
+    assert!(
+        reg.taint().is_empty(),
+        "a second open's hold was given back"
+    );
 }
 
 #[test]
@@ -943,8 +949,8 @@ fn no_more_than_max_peers_at_once() {
 #[cfg_attr(miri, ignore = "Miri has no memfd or /dev/udmabuf")]
 fn the_real_hosts_dmabuf_check_asks_no_filesystem() {
     let h = SysInjectHost::for_this_host();
-    let memfd = crate::sys::fd::memfd(c"inject", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
-        .unwrap();
+    let memfd =
+        crate::sys::fd::memfd(c"inject", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING).unwrap();
     crate::sys::fd::ftruncate(&memfd, 4096).unwrap();
     let (r, _w) = std::io::pipe().unwrap();
     let file: OwnedFd = std::fs::File::open("/proc/self/status").unwrap().into();

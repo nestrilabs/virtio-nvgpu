@@ -964,10 +964,16 @@ mod surface_tests {
     /// destroyed -- not a later buffer given the same id (which the
     /// compositor does not show, and which the old walk over every surface
     /// took for it).
+    struct RefBuf {
+        /// Which object, of the ids given out over time.
+        obj: u64,
+        synced: bool,
+        dirty: Option<(u64, u64)>,
+    }
+
     #[derive(Default)]
     struct Ref {
-        /// id -> (object, synced, dirty rows)
-        bufs: HashMap<u32, (u64, bool, Option<(u64, u64)>)>,
+        bufs: HashMap<u32, RefBuf>,
         next_obj: u64,
         pending: Option<u32>,
         current: u32,
@@ -986,12 +992,17 @@ mod surface_tests {
         fn create(&mut self, id: u32, page: u64) {
             self.forget(id);
             self.next_obj += 1;
-            self.bufs.insert(id, (self.next_obj, false, None));
+            let b = RefBuf {
+                obj: self.next_obj,
+                synced: false,
+                dirty: None,
+            };
+            self.bufs.insert(id, b);
             self.pages.insert(id, page);
         }
 
         fn forget(&mut self, id: u32) {
-            if let Some((obj, ..)) = self.bufs.remove(&id) {
+            if let Some(RefBuf { obj, .. }) = self.bufs.remove(&id) {
                 self.shown.remove(&id);
                 let page = self.pages.remove(&id);
                 if self.shows == Some(obj) {
@@ -1015,7 +1026,7 @@ mod surface_tests {
         fn commit(&mut self) -> Option<(u32, u64, u64)> {
             if let Some(b) = self.pending.take() {
                 self.current = b;
-                self.shows = self.bufs.get(&b).map(|x| x.0);
+                self.shows = self.bufs.get(&b).map(|x| x.obj);
                 self.retired = None;
                 if b != 0 && self.bufs.contains_key(&b) {
                     self.shown.insert(b);
@@ -1026,13 +1037,17 @@ mod surface_tests {
             for id in &self.shown {
                 let b = self.bufs.get_mut(id).unwrap();
                 if let Some(d) = if full { Some((0, ROWS)) } else { rows } {
-                    b.2 = union(b.2, d);
+                    b.dirty = union(b.dirty, d);
                 }
             }
             let cur = self.current;
             let b = self.bufs.get_mut(&cur)?;
-            let range = if !b.1 { Some((0, ROWS)) } else { b.2.take() };
-            (b.1, b.2) = (true, None);
+            let range = if !b.synced {
+                Some((0, ROWS))
+            } else {
+                b.dirty.take()
+            };
+            (b.synced, b.dirty) = (true, None);
             let (y0, y1) = range?;
             let (y0, y1) = (y0.min(ROWS), y1.min(ROWS));
             if y0 >= y1 {
