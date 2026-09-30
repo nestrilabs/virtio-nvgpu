@@ -26,7 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
-| 2026-09-30 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy` and `efdrace` merged | stage1, compat, render (with and without compute), secneg and wayland under nesbox, every knob off and every knob on, C module after the dma-buf merge and C and Rust modules after the last | "Regression of the knobs merge" |
+| 2026-09-30 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy`, `efdrace` and `orphanfix` merged | stage1, compat (with syncobj-race's orphan phase), render (with and without compute), secneg and wayland under nesbox, every knob off and every knob on, C module after the dma-buf merge and C and Rust modules after `efdrace` and after `orphanfix` | "Regression of the knobs merge" |
 | 2026-09-30 | branch `orphanfix` (efdrace's pump fix plus wait registrations let go with their syncobj) | `nvgpu-syncobj-race` phase 2 five times in one guest, then fresh processes, eight orphan-making processes, the whole tool twice more, drm-compat; the same under the previous backend; the compat probe; phase 2 natively on the host | "Orphan wait registrations" |
 | 2026-09-30 | branch `efdrace`: the event pump's lost wakeup (device/src/pump.rs) and `nvgpu-syncobj-race`'s LATE/LOST diagnosis | the owners phase under nesbox, C and Rust modules, with and without a widened race window and host and guest load, before and after the fix; the compat probe six times | "Syncobj eventfds that never fired" |
 | 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
@@ -701,6 +701,14 @@ the device as 8192 MiB, and the backend's log ends with at most 514 of
 8192 MiB of video memory held, a window of 8192 MiB, and the backend and
 the VMM sharing one core-scheduling cookie. The compat probe's
 signal-to-eventfd latency was p99 under 512 us in all four `0032494` sets.
+
+After the `orphanfix` merge (`2e631d6`: wait registrations let go with
+their syncobj, and `nvgpu-syncobj-race`'s third phase), the same four sets
+again, on a fresh image with the new tool: every count as `0032494`'s
+above, in all four. The compat probe's orphan phase passed in each (six
+runs of 256 orphans, every one of the 512 registrations let go with its
+syncobj, then a fresh process subscribed 64 times), and the owners'
+signal-to-eventfd p99 was under 512 us.
 
 Between the two: after the `knob-deploy` merge (`fe0cd73`) every probe
 passed off and on but secneg on, whose T13 wanted 30 calls served before
