@@ -1486,10 +1486,10 @@ long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
     if (le32_to_cpu(outer.cmd) == NVGPU_NVKMS_REGISTER_SURFACE &&
         nested_size >= NVGPU_NVKMS_SURFACE_FD_OFFSET + sizeof(u64)) {
       u8 *nested = req_buf + sizeof(*req) + sizeof(outer);
-      u32 use_fd;
 
-      memcpy(&use_fd, nested + 4, sizeof(use_fd));
-      if (le32_to_cpu((__le32)use_fd)) {
+      /* useFd is an NvBool, one byte (NvU8): the three after it are padding,
+       * which NVKMS never reads and a caller need not clear. */
+      if (nested[4]) {
         s32 guest_fd;
         u32 handle;
 

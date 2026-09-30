@@ -854,6 +854,43 @@ fn nvkms_takes_its_one_ioctl_only() {
 }
 
 #[test]
+fn register_surface_reads_use_fd_as_the_one_byte_it_is() {
+    // NvKmsRegisterSurfaceRequest: useFd (NvBool, one byte) at 4, padding at
+    // 5..8, planes[0] at 16. Padding with useFd clear names no descriptor:
+    // the handle goes out as the caller wrote it. With useFd set, the fd
+    // (3, one of ours) becomes its backend handle.
+    for (use_fd, pad, want) in [(0u64, 0xabcdefu64, 3u32), (1, 0, 101), (1, 0xab, 101)] {
+        let mut w = world();
+        let mut outer = vec![0u8; 16];
+        put(&mut outer, 0, 16, 4);
+        put(&mut outer, 4, 24, 4);
+        put(&mut outer, 8, NESTED, 8);
+        let mut nested = vec![0u8; 24];
+        put(&mut nested, 4, use_fd, 1);
+        put(&mut nested, 5, pad, 3);
+        put(&mut nested, 16, 3, 4);
+        w.mem.insert(ARG, outer);
+        w.mem.insert(NESTED, nested);
+        w.canned = vec![reply(0, &[0u8; 16], &[0u8; 24], &[])];
+        let o = run(
+            dev(0, vec![]),
+            w,
+            Call::Modeset {
+                cmd: ioc(3, 0x6d, 0, 16),
+                arg: ARG,
+            },
+        );
+        let s = sends(&o);
+        assert_eq!(s.len(), 1, "useFd {use_fd} pad {pad:#x}: {:?}", o.ret);
+        assert_eq!(
+            le32(payload(&s[0]), 16 + 16),
+            want,
+            "useFd {use_fd} pad {pad:#x}"
+        );
+    }
+}
+
+#[test]
 fn a_field_of_a_width_the_generator_refuses_is_refused() {
     // A descriptor 2 bytes wide (the C put 4 bytes back over it), and a GEM
     // handle 2 bytes wide: -EINVAL before anything is sent.
