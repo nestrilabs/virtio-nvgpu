@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `knob-rm`: opt-in RM groups (`--rm-allow-group`) and `--osdesc-populate`, under nesbox, C module | `secneg` with every group off and on (19 passed, 5 KMS skips each; T14-T16 answered by the allowlist off and by each group's rule on, a guest temperature reading with `thermal`); `render` with compute 9/0/1 at the defaults; nvidia-smi -q with `health` on; cuMemHostRegister of fresh memory with populate on and off, three boots each | "Opt-in RM groups" |
 | 2026-09-30 | branch `integrate35` (display-passthrough after this row): everything above plus the Steam-like workloads' guest changes and `patches/nesbox/0001`; the binaries installed in `.rig/` | Groups A and B under the patched nesbox (C and Rust modules) and crosvm, two batches of live applications: all passed (apps 18/0 and 23/0) | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `winehang`: `patches/nesbox/0001` (virtio-blk interrupt barrier), killable locks in the guest module, hang-watch | fresh-boot Wine/Godot D3D12 starts under nesbox with and without the patch; stage1, compat, render (with and without compute) and wayland on the patched nesbox | "Wine start-up stalls" |
 | 2026-09-30 | branch `integrate32`: the 2026-09-30 review's fixes (backend, guest module, Wayland, patches, deployment), the gVisor comparison, heavyfix and the fence-retire fix | Groups A and B under nesbox (C and Rust modules) and crosvm, the same probes on a KASAN+UBSAN+KFENCE+lockdep guest kernel with the unbind probe, and two batches of live applications | "Regression of the 2026-09-30 review" |
@@ -1112,6 +1113,50 @@ in D for up to the transport's 30 or 60 s timeout; they are killable now.
 Every other wait a process can enter in the module already was killable or
 interruptible, bar `master_set`/`master_drop`'s lock, which DRM gives no
 way to fail.
+
+## Opt-in RM groups
+
+`NVGPU_RM_ALLOW_GROUP=thermal,health,memacct,debug,profiling` (with
+`NVGPU_COMPUTE=1`, which `debug` and `profiling` need) serves the groups and
+puts `nvgpu_rm_groups=` on the guest's command line, where
+`sec-negative.c`'s T14-T16 read which to expect:
+
+```sh
+NVGPU_COMPUTE=1 NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none rig/run-guest.sh secneg rg-off
+NVGPU_COMPUTE=1 NVGPU_RM_ALLOW_GROUP=thermal,health,memacct,debug,profiling \
+  NVGPU_CMDLINE_EXTRA=nvgpu_secneg_kms=none rig/run-guest.sh secneg rg-on
+```
+
+On 2026-09-30 (branch `knob-rm`, nesbox, the C module, an image with the
+branch's module and sec-negative): both 19 passed and 5 KMS skips. Off,
+T14-T16 are the allowlist's NOT_SUPPORTED; on, a thermal set opcode and
+another thermal API version, a debugger read of the register aperture and
+one past the length cap, a reservation that is not context-switched and a
+register write each come back with their rule's status (0x1b or 0x1f)
+without RM, the device-wide profiler 0x1b, and a temperature reading comes
+back from RM (48 C). The backend's log names each refusal's reason.
+`nvidia-smi -q` with `health` on shows ECC, retired pages and remapped rows
+as N/A, as it does natively on this GPU, where RM answers those queries
+NOT_SUPPORTED; natively traced (an LD_PRELOAD logging every control), the
+rig's nvidia-smi and nvtop read temperatures through controls the default
+list already has, and never THERMAL_SYSTEM_EXECUTE_V2. `memacct` adds
+nothing on 595.99.02.
+
+Not run: cuda-gdb, because nixpkgs' cuda-gdb 13.2 and 13.3 both abort
+natively on this host inside the debugged process at debugger start
+(`libprotobuf FATAL ... GeneratedDatabase()->Add`), before any RM call; and
+Nsight (`ncu`, `nsys`), because the host loads nvidia.ko with
+`RmProfilingAdminOnly=1`, under which RM refuses an unprivileged profiler,
+natively as in a guest.
+
+**`--osdesc-populate`.** `/opt/nvgpu/verify/bin/hostreg1` (a
+cuMemHostRegister of 1 GiB, then 256 MiB, of freshly written memory; not in
+the tree) in fresh guests, three boots each way: the first registration of
+1 GiB took 53.2, 47.0 and 49.2 ms with the populate and 48.4, 43.3 and
+50.0 ms without; of 256 MiB 13.0 to 13.3 ms with it and 11.7 to 12.4 ms
+without. Registering the same buffer again cost within about 2 ms of the
+first, so the pin's own faults were never the cost; the flag stays off by
+default (DEPLOY.md, "Backend flags").
 
 ## What to keep from every run
 

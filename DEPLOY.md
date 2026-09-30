@@ -652,6 +652,28 @@ an application, which gets the daemon's dma-bufs through PipeWire.
 - The helper's timestamps are the host's `CLOCK_MONOTONIC`, not the
   guest's: stamp frames on arrival, or keep an offset of the daemon's own.
 
+## Opt-in RM groups
+
+`--rm-allow-group NAME[,NAME...]` (rig: `NVGPU_RM_ALLOW_GROUP`; NixOS:
+`vms.<n>.rmAllowGroups`) adds groups of RM controls the default allowlist
+refuses, none by default. Each is held to a rule of its own before RM sees
+it; SECURITY.md, "Opt-in RM groups", has what each exposes and what still
+holds, and what was left out even as a group. The backend's start-up line
+after the tables names the groups it serves and what each adds on the
+host's release.
+
+| group | gain | cost |
+|---|---|---|
+| `thermal` | temperatures through THERMAL_SYSTEM_EXECUTE_V2 (host 580 and later), for an NVML, MangoHud or nvtop that reads them that way; on the rig's 595.99.02 NVML reads them through controls the default list has, and this group changes nothing a tool shows | every guest process reads the GPU's temperatures, which other tenants' load moves |
+| `health` | `nvidia-smi -q`'s ECC mode, InfoROM, retired pages and black-box flush time (N/A, as natively, on a GPU without ECC or InfoROM) | the host GPU's health, to every guest process |
+| `memacct` | the GPU memory limits and use of the backend's cgroup (host 610 and later) | this VM's own GPU memory use, to its processes; nothing on older hosts |
+| `debug` | cuda-gdb's and compute-sanitizer's debugger memory reads and writes (at most 256 KiB a call) and debug modes; needs `--allow-compute` | a debugger over the caller's own memory objects; the modes act on the debugged context inside GSP-RM |
+| `profiling` | context-switched Nsight and CUPTI counters of the caller's own context; needs `--allow-compute`, and a host whose nvidia.ko has `NVreg_RmProfilingAdminOnly=0` (RM refuses an unprivileged profiler otherwise, as it does natively); register writes are refused, so a profiler that programs counters that way does not work | the caller's own context's counters; a host that sets `RmProfilingAdminOnly=0` opens profiling to every host user too |
+
+The backend refuses to start with a name it does not know, or with `debug`
+or `profiling` and no `--allow-compute`; the NixOS module says the same at
+evaluation.
+
 ## Backend flags
 
 `vhost-user-nvgpu --help` has each one's full text; `--diagnostic --help`
@@ -678,6 +700,8 @@ shows the diagnostic ones too.
 | `--inject-socket PATH` | none | accept screen-share buffers here from the VM's capture helper (with `--inject-uid`; "Capture injection"); the units hand the socket over instead |
 | `--inject-uid UID` | none | the only uid the inject socket serves: the VM's capture helper |
 | `--rm-allowlist enforce` | `enforce` | the RM allowlist; `log` is diagnostic |
+| `--rm-allow-group NAME[,NAME...]` | none | add opt-in groups to the RM allowlist: `thermal`, `health`, `memacct`, `debug`, `profiling` ("Opt-in RM groups") |
+| `--osdesc-populate on` | `off` | fault memory a guest registers by its pages (cuMemHostRegister, VK_EXT_external_memory_host) into the backend with one `MADV_POPULATE_WRITE` (`_READ` for read-only memory) before RM pins it, instead of page by page inside the pin (rig: `NVGPU_OSDESC_POPULATE=1`; NixOS: `vms.<n>.osdescPopulate`). Gain: none measured. Cost: on the rig (nesbox, RTX 5090, 595.99.02) the first cuMemHostRegister of fresh guest memory took 49.8 ms for 1 GiB and 13.2 ms for 256 MiB with it, 47.2 and 12.2 ms without (three boots each): the pin finds guest RAM's pages cheap to fault, and the populate walks them once more. For a host where a pin's faults are costlier |
 | `--sandbox on` | `on` | the process sandbox; `best-effort` and `off` are diagnostic |
 | `--diagnostic` | off | allow the diagnostic flags below (or `NVGPU_DIAGNOSTIC=1`) |
 
