@@ -1101,7 +1101,9 @@ jailer (chrooted into a jail image built for the run, a mount namespace of
 its own, no supplementary groups, no_new_privs). The backend's socket is
 0660 in the slot's group, so the VMM reaches it and nobody else does. Both
 run in network namespaces of their own. A slot is free when no launcher
-holds its lock and neither user has a live process. Where there is no pool
+holds its lock, neither user has a live process, and `contrib/systemd`'s
+socket unit for VM N is not listening (the units use the same users and
+take no lock: start one only for a slot no launcher holds). Where there is no pool
 the launcher falls back to the one user `nvgpu`, and without a jailer to a
 root VMM, each with a warning. A uid of its own per VM separates two VMs'
 host processes by the kernel's oldest rules, independent of anything this
@@ -1196,13 +1198,18 @@ for a single desktop (VD-H1).
   the binaries (the jailer and virtiofsd too), kernel, rootfs, share, jail
   image and logs directory, and every directory above them, must be root's
   and writable by no one else (a sticky one aside), and are used by their
-  resolved paths; every library it puts in the VMM's jail must be root's;
+  resolved paths, the launcher's own pieces too; every library it puts in
+  the VMM's jail must be root's. Nothing it creates is writable by others,
+  whatever umask it was started with (it ORs in 022): not the VMM's config
+  between writing it and the VMM reading it, and not the backend's socket
+  before it is opened to the slot's group;
 - starts again under `env -i` with its own variables (`RUST_LOG`, `TERM`,
   `NESBOX_VIRTIOFSD`, checked as a path, the two the desktop warnings read)
   and a PATH of root's directories. The first shell still runs with what
   sudo let through: keep sudo's `env_reset`;
-- takes a slot only when neither of its users runs anything, holds the
-  slot's lock, and kills nothing by pattern. A pool run's files carry its
+- takes a slot only when neither of its users runs anything and no
+  systemd socket unit listens for it, holds the slot's lock, and kills
+  nothing by pattern. A pool run's files carry its
   slot (`<tag>.vmN`), and a run whose `<tag>.json` another live run holds is
   refused, in every mode;
 - runs the backend through `setpriv` with no capabilities and
@@ -1228,7 +1235,10 @@ deploy`).
 helper's socket, and two VMM templates (`nvgpu-vmm-nesbox@.service`, the
 jailer as root and the unit's network namespace; `nvgpu-vmm-crosvm@.service`,
 `nvgpu-vmmN` with its sandbox on, so no `RestrictNamespaces=`). A VMM unit
-says `BindsTo=` its backend, so it stops with it.
+says `BindsTo=` its backend, so it stops with it. Both set
+`LockPersonality=`, `RestrictSUIDSGID=` and `SystemCallArchitectures=native`,
+and the nesbox one `ProtectKernelModules=` and `ProtectKernelLogs=`; neither
+has run on hardware.
 
 The backend's unit runs it as `nvgpu-vmN` with no capabilities, in a cgroup
 of its own (`MemoryMax`, `MemorySwapMax=0`, `TasksMax`,
@@ -1252,9 +1262,13 @@ uidBase+2N and uidBase+2N+1, group uidBase+2N), and its assertions refuse: a
 helper uid of any slot or of a login user; a helper group that does not
 exist, is a pool or shared group, or holds anyone but the helper; one helper
 or group for two VMs; anyone else in a slot's group; pool users with other
-groups; another user on a pool id. `checks.module-eval` tries each with a
-configuration it must refuse, and compares the units it installs with
-`contrib/systemd`'s. The Wayland flags come from the environment file
+groups; another user on a pool id; a flag with whitespace, a quote, a
+backslash or a `%` (systemd would split, unquote or expand it on the way to
+the backend), and a Wayland socket path with any of those or a colon.
+`checks.module-eval` tries each with a configuration it must refuse,
+compares the units it installs with `contrib/systemd`'s, and holds each
+drop-in to the keys and variables that are per slot, every assignment of an
+`Environment=` line included. The Wayland flags come from the environment file
 (`$NVGPU_WAYLAND_ARGS` beside `$NVGPU_BACKEND_ARGS`; `vms.<n>.wayland`), since
 systemd lets `EnvironmentFile=` override `Environment=`.
 

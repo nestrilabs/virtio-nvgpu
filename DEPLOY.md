@@ -158,7 +158,13 @@ the Wayland socket, the inject socket's group -- in a drop-in per slot
 the root flake's `nixosModules.default` sets the package). Its flags are
 its own: it does not read `/etc/virtio-nvgpu/vmN.env`. Its assertions
 refuse a slot's group with anyone else in it, a pool user with other
-groups, and another user on a pool id.
+groups, another user on a pool id, and a flag with whitespace, a quote, a
+backslash or a `%` in it (systemd would split, unquote or expand it).
+
+A host that runs both these units and the rig's root launcher shares one
+pool between them: the launcher skips a slot whose socket unit listens,
+but a unit takes no launcher lock, so start one only for a slot no
+launcher run holds.
 
 **The backend.** [`contrib/systemd/vhost-user-nvgpu@.service`](contrib/systemd/vhost-user-nvgpu@.service),
 instance N, runs `vhost-user-nvgpu` as `nvgpu-vmN` in a cgroup of its own
