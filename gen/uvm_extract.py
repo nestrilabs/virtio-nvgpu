@@ -70,7 +70,7 @@ VERSIONS = {
     "535.129.03": "ABI profile",
     "550.40.53": "UVM_MAX_GPUS_V2 (256): MAP_EXTERNAL_ALLOCATION and "
                  "ALLOC_SEMAPHORE_POOL grow",
-    "565.57.01": "ALLOC_DEVICE_P2P and CLEAR_ALL_ACCESS_COUNTERS appear",
+    "565.57.01": "ALLOC_DEVICE_P2P appears",
     "580.65.06": "DISCARD appears",
     "580.178.04": "ABI profile",
     "590.44.01": "FREE loses length, UNREGISTER_CHANNEL loses gpuUuid",
@@ -115,7 +115,6 @@ COMMANDS = [
     ("MIGRATE", None, None),
     ("MAP_DYNAMIC_PARALLELISM_REGION", None, None),
     ("UNMAP_EXTERNAL", None, None),
-    ("TOOLS_FLUSH_EVENTS", None, None),
     ("ALLOC_SEMAPHORE_POOL", None, None),
     ("CLEAN_UP_ZOMBIE_RESOURCES", None, None),
     ("PAGEABLE_MEM_ACCESS_ON_GPU", None, None),
@@ -124,7 +123,6 @@ COMMANDS = [
     ("MAP_EXTERNAL_SPARSE", None, None),
     ("MM_INITIALIZE", "uvmFd", "uvm"),
     ("ALLOC_DEVICE_P2P", "rmCtrlFd", "rmctl"),
-    ("CLEAR_ALL_ACCESS_COUNTERS", None, None),
     ("DISCARD", None, None),
 ]
 

@@ -626,7 +626,6 @@ const UVM_ALLOWED: &[u32] = &[
     51, // MIGRATE
     65, // MAP_DYNAMIC_PARALLELISM_REGION
     66, // UNMAP_EXTERNAL
-    67, // TOOLS_FLUSH_EVENTS
     68, // ALLOC_SEMAPHORE_POOL
     69, // CLEAN_UP_ZOMBIE_RESOURCES
     70, // PAGEABLE_MEM_ACCESS_ON_GPU (a query)
@@ -635,7 +634,6 @@ const UVM_ALLOWED: &[u32] = &[
     74, // MAP_EXTERNAL_SPARSE
     75, // MM_INITIALIZE
     78, // ALLOC_DEVICE_P2P
-    79, // CLEAR_ALL_ACCESS_COUNTERS
     80, // DISCARD
 ];
 
@@ -647,6 +645,12 @@ const UVM_ALLOWED: &[u32] = &[
 /// UVM device everything not in [`UVM_ALLOWED`] -- among them
 /// TOOLS_READ/WRITE_PROCESS_MEMORY (copy through `buffer`),
 /// TOOLS_GET_PROCESSOR_UUID_TABLE(_V2) (copies out to `tablePtr`),
+/// TOOLS_FLUSH_EVENTS (waits on the host's one tools event queue, every
+/// process's, and serves only the tools device, uvm_tools.c
+/// uvm_api_tools_flush_events()), CLEAR_ALL_ACCESS_COUNTERS (clears the
+/// access counters of every GPU the file registered, which are the GPU's
+/// own and steer every tenant's migrations, uvm_gpu_access_counters.c
+/// uvm_api_clear_all_access_counters()),
 /// QUERY_RESIDENCY (two user arrays), POPULATE_PAGEABLE (faults in pages of
 /// the calling process, the backend, uvm_populate_pageable.c:194-226),
 /// the UVM-Lite commands, and the test ioctls.
@@ -1114,6 +1118,17 @@ mod tests {
             for c in t.cmds {
                 assert!(allowed.contains(&c.cmd), "{} {}", t.name, c.name);
             }
+        }
+    }
+
+    /// Two commands whose effect is the host's, not the file's: a flush of
+    /// the host-wide tools event queue, and a clear of the GPUs' access
+    /// counters, which every tenant's migrations read.
+    #[test]
+    fn uvm_commands_that_reach_past_the_callers_va_space_are_refused() {
+        let p = vec![0u8; 64];
+        for cmd in [67, 79] {
+            assert_eq!(uvm_gate(false, cmd, &p, 0x7), Err(libc::EPERM), "{cmd}");
         }
     }
 

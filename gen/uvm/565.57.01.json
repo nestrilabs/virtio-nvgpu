@@ -1,7 +1,7 @@
 {
  "format": "virtio-nvgpu/uvm-params/1",
  "driver_version": "565.57.01",
- "why": "ALLOC_DEVICE_P2P and CLEAR_ALL_ACCESS_COUNTERS appear",
+ "why": "ALLOC_DEVICE_P2P appears",
  "source": {
   "tag": "565.57.01",
   "url": "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/565.57.01/",
@@ -204,12 +204,6 @@
    "fd": null
   },
   {
-   "name": "TOOLS_FLUSH_EVENTS",
-   "cmd": 67,
-   "size": 4,
-   "fd": null
-  },
-  {
    "name": "ALLOC_SEMAPHORE_POOL",
    "cmd": 68,
    "size": 9248,
@@ -264,12 +258,6 @@
     "offset": 40,
     "of": "rmctl"
    }
-  },
-  {
-   "name": "CLEAR_ALL_ACCESS_COUNTERS",
-   "cmd": 79,
-   "size": 4,
-   "fd": null
   }
  ],
  "absent": [
