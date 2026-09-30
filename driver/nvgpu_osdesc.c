@@ -58,6 +58,28 @@ struct nvgpu_osdesc {
   bool write;
 };
 
+/*
+ * An id a reap named before its registration's reply had been read: another
+ * thread freed the object first. The registration looks here when it
+ * records its pins (nvgpu_osdesc_released_early()), and unpins at once.
+ *
+ * A list, one entry per such registration in flight, and not a ring of the
+ * last few: with a fixed ring, 65 registrations racing their own frees
+ * pushed the oldest id out, and that registration's pins were kept under an
+ * id no reap would ever name again -- pinned after RM had let go, after the
+ * process had exited, until the device went. Each entry is taken out by the
+ * record it waits for; one that never comes (a backend reaping an id it
+ * never gave) stays, so the list is capped far above any number of
+ * registrations a guest can have in flight at once, and past the cap the
+ * oldest goes, as the ring's did.
+ */
+struct nvgpu_osdesc_early {
+  struct list_head node;
+  u64 id;
+};
+
+#define NVGPU_OSDESC_EARLY_MAX (1u << 20)
+
 /* A late reply the reaper read before the waiter handed its pins over. */
 struct nvgpu_osdesc_late {
   struct list_head node;
@@ -73,6 +95,7 @@ void nvgpu_osdesc_init(struct nvgpu_device *dev) {
   mutex_init(&dev->osdesc_lock);
   INIT_LIST_HEAD(&dev->osdescs);
   INIT_LIST_HEAD(&dev->osdesc_late);
+  INIT_LIST_HEAD(&dev->osdesc_early);
 }
 
 void nvgpu_osdesc_unpin(struct page **pages, unsigned long n, bool write) {
@@ -91,15 +114,48 @@ static void nvgpu_osdesc_free(struct nvgpu_osdesc *d) {
  * osdesc_lock.
  */
 static bool nvgpu_osdesc_released_early(struct nvgpu_device *dev, u64 id) {
-  unsigned int i;
+  struct nvgpu_osdesc_early *e;
 
-  for (i = 0; i < NVGPU_OSDESC_EARLY; i++) {
-    if (dev->osdesc_early[i] == id) {
-      dev->osdesc_early[i] = 0;
+  list_for_each_entry(e, &dev->osdesc_early, node) {
+    if (e->id == id) {
+      list_del(&e->node);
+      dev->osdesc_nearly--;
+      kfree(e);
       return true;
     }
   }
   return false;
+}
+
+/* A reap named `id`, whose registration has not recorded its pins yet: it
+ * will look (nvgpu_osdesc_released_early()). Under osdesc_lock. */
+static void nvgpu_osdesc_note_early(struct nvgpu_device *dev, u64 id) {
+  struct nvgpu_osdesc_early *e = kmalloc(sizeof(*e), GFP_KERNEL);
+
+  if (dev->osdesc_nearly >= NVGPU_OSDESC_EARLY_MAX) {
+    struct nvgpu_osdesc_early *old = list_first_entry(
+        &dev->osdesc_early, struct nvgpu_osdesc_early, node);
+
+    dev_warn_ratelimited(&dev->vdev->dev,
+                         "virtio-gpu-nv: %u registrations reaped before "
+                         "they were recorded; forgetting %llu\n",
+                         dev->osdesc_nearly, old->id);
+    list_del(&old->node);
+    dev->osdesc_nearly--;
+    kfree(old);
+  }
+  if (!e) {
+    /* Nothing to tell it by: its pins stay until remove(), as
+     * nvgpu_osdesc_record() keeps them without memory of its own. */
+    dev_warn_ratelimited(&dev->vdev->dev,
+                         "virtio-gpu-nv: no memory to note that registration "
+                         "%llu is gone; its pages stay pinned\n",
+                         id);
+    return;
+  }
+  e->id = id;
+  list_add_tail(&e->node, &dev->osdesc_early);
+  dev->osdesc_nearly++;
 }
 
 /*
@@ -332,11 +388,8 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
         }
       }
       /* Its registration's reply has not been read yet: it will look. */
-      if (!found) {
-        dev->osdesc_early[dev->osdesc_early_next] = id;
-        dev->osdesc_early_next =
-            (dev->osdesc_early_next + 1) % NVGPU_OSDESC_EARLY;
-      }
+      if (!found)
+        nvgpu_osdesc_note_early(dev, id);
     }
     dev->osdesc_ack = last;
     if (n < NVGPU_OSDESC_REAP_MAX)
@@ -358,15 +411,23 @@ void nvgpu_osdesc_reap(struct nvgpu_device *dev) {
 void nvgpu_osdesc_release_all(struct nvgpu_device *dev) {
   struct nvgpu_osdesc *d, *tmp;
   struct nvgpu_osdesc_late *l, *ltmp;
+  struct nvgpu_osdesc_early *e, *etmp;
   LIST_HEAD(done);
   LIST_HEAD(late);
+  LIST_HEAD(early);
 
   mutex_lock(&dev->osdesc_lock);
   dev->osdesc_dead = true;
   list_splice_init(&dev->osdescs, &done);
   list_splice_init(&dev->osdesc_late, &late);
+  list_splice_init(&dev->osdesc_early, &early);
+  dev->osdesc_nearly = 0;
   WRITE_ONCE(dev->osdesc_count, 0);
   mutex_unlock(&dev->osdesc_lock);
+  list_for_each_entry_safe(e, etmp, &early, node) {
+    list_del(&e->node);
+    kfree(e);
+  }
   list_for_each_entry_safe(d, tmp, &done, node) {
     list_del(&d->node);
     nvgpu_osdesc_free(d);

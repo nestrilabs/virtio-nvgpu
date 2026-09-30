@@ -251,9 +251,10 @@ struct nvgpu_device {
   struct list_head osdesc_late;
   unsigned int osdesc_count;
   u64 osdesc_ack;
-#define NVGPU_OSDESC_EARLY 64
-  u64 osdesc_early[NVGPU_OSDESC_EARLY];
-  unsigned int osdesc_early_next;
+  /* Ids a reap named before their registration's reply was read (struct
+   * nvgpu_osdesc_early), each taken out by that registration's record. */
+  struct list_head osdesc_early;
+  unsigned int osdesc_nearly;
   bool osdesc_dead;
 
   /* /proc/driver/nvidia's files' data (nvgpu_procfs.c, struct nvgpu_proc_buf). */
