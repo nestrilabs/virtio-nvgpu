@@ -501,7 +501,7 @@ mod tests {
     /// A memfd is memory by its device alone; a pipe, an eventfd and a
     /// directory are not memory at all.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri has no memfd or /proc")]
+    #[cfg(not(miri))] // Miri has no memfd or /proc, and no memfd_devs.
     fn memory_is_told_without_asking_the_files_filesystem() {
         let m = memfd(c"t", 4096).unwrap();
         assert!(is_shmem(m.as_raw_fd()) && is_regular(m.as_raw_fd()));
