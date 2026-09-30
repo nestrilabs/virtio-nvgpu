@@ -259,6 +259,16 @@ impl Registry {
             self.drop_unheld(&mut own, gpu, gem);
             return Err(e);
         }
+        let dmabuf = fds.into_iter().next().expect("nplanes >= 1");
+        // No id without its hold on the taint set: an injected object no
+        // export refuses (out of descriptors to keep its dma-buf by, say)
+        // is refused instead, never kept untainted.
+        let Some(taint) = self.taint.hold(&dmabuf) else {
+            drop(st);
+            self.drop_unheld(&mut own, gpu, gem);
+            log::warn!("inject: no hold on the taint set for an IMPORT's buffer; refused");
+            return Err(libc::EMFILE);
+        };
         let id = next_id(&mut st);
         let info = InjectInfo {
             width: imp.width,
@@ -271,10 +281,8 @@ impl Registry {
             flags: imp.flags,
             reserved: 0,
         };
-        let dmabuf = fds.into_iter().next().expect("nplanes >= 1");
         *own.held.entry((gpu, gem)).or_insert(0) += 1;
         st.bytes += size;
-        let taint = self.taint.hold(&dmabuf);
         st.live.insert(
             id,
             Injected {
@@ -286,7 +294,7 @@ impl Registry {
                 gem,
                 size,
                 offset,
-                taint,
+                taint: Some(taint),
             },
         );
         log::debug!(
@@ -596,6 +604,9 @@ fn same_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> bool {
 #[derive(Debug, Default)]
 pub struct Taint {
     held: Mutex<HashMap<FileId, (PrivateFd, u32)>>,
+    /// Tests: every hold fails, as with no descriptor left to keep one by.
+    #[cfg(test)]
+    pub(crate) refuse_holds: std::sync::atomic::AtomicBool,
 }
 
 impl Taint {
@@ -603,8 +614,14 @@ impl Taint {
         self.held.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Hold `fd`'s file; `None` if it has no identity (then nothing is held).
+    /// Hold `fd`'s file; `None` if it has no identity, or no descriptor is
+    /// left to keep it by (then nothing is held, and the caller refuses
+    /// what it was for).
     pub fn hold(&self, fd: &PrivateFd) -> Option<FileId> {
+        #[cfg(test)]
+        if self.refuse_holds.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let id = file_id(fd.as_fd())?;
         let mut m = self.lock();
         if let Some(e) = m.get_mut(&id) {

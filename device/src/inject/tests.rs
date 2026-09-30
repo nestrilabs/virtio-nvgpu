@@ -627,6 +627,54 @@ fn an_injected_buffer_is_never_exported() {
     assert!(reg.taint().is_empty());
 }
 
+/// An injected object is never held untainted: an IMPORT, or an
+/// INJECT_OPEN, whose hold on the taint set cannot be had (no descriptor
+/// left to keep the dma-buf by) is refused, and nothing of it is kept --
+/// no id, and no handle in the guest's file. Before, both went ahead
+/// untainted, and the open's handle could be re-homed into a KMS file once
+/// the helper released the id.
+#[test]
+fn nothing_injected_is_kept_without_its_taint() {
+    let host = Arc::new(FakeHost::new(1));
+    let reg = Arc::new(Registry::new(host.clone()));
+    let set = |on| {
+        reg.taint()
+            .refuse_holds
+            .store(on, std::sync::atomic::Ordering::Relaxed)
+    };
+    set(true);
+    let closes = host.closes();
+    let r = reg.import(1, &rgb(32, 32), vec![host.dmabuf(obj(4096 * 4, 0))]);
+    assert_eq!(r, Err(libc::EMFILE));
+    assert_eq!((reg.live(), reg.bytes()), (0, 0));
+    assert_eq!(host.closes(), closes + 1, "the backend's import let go");
+
+    set(false);
+    let (id, token) = reg
+        .import(1, &rgb(32, 32), vec![host.dmabuf(obj(4096 * 4, 0))])
+        .unwrap();
+    let mut be = v2_backend(Some(reg.clone()));
+    let file = host.render_file(0);
+    let view = file.try_clone().unwrap();
+    let render = be.adopt_for_test(file, HandleKind::DriRender(0));
+    set(true);
+    assert_eq!(inject_open(&mut be, render, id, &token, 10).0, -libc::EMFILE);
+    assert_eq!(host.handles_in(view.as_fd()), 0, "nothing imported");
+    assert_eq!(be.inject.opens(), 0);
+    set(false);
+
+    // Opened twice, one record and one hold: once the id and the file go,
+    // nothing is left tainted.
+    for _ in 0..2 {
+        assert_eq!(inject_open(&mut be, render, id, &token, 10).0, 0);
+    }
+    assert_eq!(be.inject.opens(), 1);
+    reg.release(1, id).unwrap();
+    assert!(!reg.taint().is_empty(), "the open holds it");
+    call(&mut be, MsgType::Close, render, &[]);
+    assert!(reg.taint().is_empty(), "a second open's hold was given back");
+}
+
 #[test]
 fn a_syncobj_is_injected_opened_with_its_token_and_released() {
     let (host, reg) = setup();
