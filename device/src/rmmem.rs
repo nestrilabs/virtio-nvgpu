@@ -220,10 +220,14 @@ impl Default for RmMem {
 }
 
 /// Every object's parent, by (hClient, handle), and each parent's children.
+/// A set, not a list: one parent may have up to [`MAX_OBJECTS`] children,
+/// and each free unlinks one, under the backend mutex -- a scan per free
+/// would make a guest process freeing its objects one by one cost the VM
+/// quadratic time.
 #[derive(Debug, Default)]
 struct Tree {
     parent: HashMap<(u32, u32), u32>,
-    children: HashMap<(u32, u32), Vec<u32>>,
+    children: HashMap<(u32, u32), std::collections::HashSet<u32>>,
 }
 
 impl Tree {
@@ -236,14 +240,14 @@ impl Tree {
             return;
         }
         self.parent.insert((c, h), p);
-        self.children.entry((c, p)).or_default().push(h);
+        self.children.entry((c, p)).or_default().insert(h);
     }
 
     fn unlink(&mut self, c: u32, h: u32) {
         if let Some(p) = self.parent.remove(&(c, h))
             && let Some(v) = self.children.get_mut(&(c, p))
         {
-            v.retain(|&x| x != h);
+            v.remove(&h);
             if v.is_empty() {
                 self.children.remove(&(c, p));
             }
