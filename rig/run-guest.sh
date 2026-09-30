@@ -236,7 +236,12 @@ set -euo pipefail
 # names, would be run or loaded all the same (sudo -E, an env_keep rule).
 # So root starts again with only this launcher's own variables, RUST_LOG,
 # TERM, NESBOX_VIRTIOFSD (checked below like any path) and the two the
-# live-desktop warnings read, and a PATH of root's directories.
+# live-desktop warnings read, and a PATH of root's directories. What bash
+# takes from the environment before this line runs -- the `bash` the #!
+# line finds on PATH, BASH_ENV, SHELLOPTS, functions exported as
+# BASH_FUNC_* -- no line here can undo: start it as root only through
+# something that drops those (sudo's default env_reset does; `sudo -E`
+# with a rule that keeps them does not).
 CLEAN_PATH=/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin
 if [ "$EUID" = 0 ]; then
     KEEP=(HOME=/root "PATH=$CLEAN_PATH")
