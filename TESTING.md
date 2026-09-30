@@ -507,6 +507,10 @@ T4-T6 need a KMS or lease file, `--kms`):
 | T11 | `import from a foreign fd` | NV0000 OS_UNIX IMPORT_OBJECTS_FROM_FD naming a number not open here, and a file not the device's | EBADF before RM is asked | R1 |
 | T12 | `disable channels, event`, `disable channels, other process` | FIFO_DISABLE_CHANNELS with a `pRunlistPreemptEvent`, and naming a forked child's client | both refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS`; another status for the second means RM was asked to stop another process's channels (SECURITY.md, "The RM allowlist") | -- |
 | T13 | `disable channels, rate` | 400 no-op FIFO_DISABLE_CHANNELS (no channels) back to back | RM answers the first 40 or so, then the backend's per-process rate, `NV_ERR_NOT_SUPPORTED`; all 400 reaching RM is a FAIL | -- |
+| T14 | `dma-buf export, own memory` | **control**: EXPORT_TO_DMABUF_FD of video memory of this process's own client, then a CPU mapping of the dma-buf | with `--allow-dmabuf-export`, **made**, and the mapping refused; without, the escape refused (EOPNOTSUPP), a SKIP (SECURITY.md, "dma-buf export through RM") | S-15 |
+| T15 | `dma-buf export, other process` | a forked child makes a client with video memory; the parent exports it through its own GPU file | refused before RM, `NV_ERR_INSUFFICIENT_PERMISSIONS` (RM itself would export it: natively this FAILs) | -- |
+| T16 | `dma-buf export, closed object` | export video memory of this process's own, freed first | no dma-buf made | -- |
+| T17 | `dma-buf export, double` | the append form: a second export into T14's dma-buf, and into a descriptor that is no dma-buf | refused before RM (`NV_ERR_NOT_SUPPORTED`) | S-15 |
 
 T8 and T10 need a guest module that says which process and euid make each
 call (BCAP_PROC_ID, BCAP_PROC_EUID); without it both are refused anyway.
