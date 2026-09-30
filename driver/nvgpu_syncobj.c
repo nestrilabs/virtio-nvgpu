@@ -923,7 +923,9 @@ static long nvgpu_fence_handle_to_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  *    natively the second of two destroys fails;
  *  - a synchronous DESTROY (of a handle so_live does not hold -- one that
  *    was never ours, or one a create has not been noted for yet) runs under
- *    so_lock too, and one that succeeds bumps so_sync;
+ *    so_lock too, and one that may have destroyed anything bumps so_sync:
+ *    one that succeeded, and one whose answer never came (abandoned on a
+ *    fatal signal or a timeout, it still runs on the host);
  *  - a create notes its handle only if so_sync has not moved since before it
  *    was sent: if it has, a synchronous DESTROY may have taken the new
  *    handle between the host's answer and the note, so the handle is left
@@ -1006,7 +1008,17 @@ static long nvgpu_so_destroy(struct nvgpu_fd *nfd, void *karg) {
     xa_store(&nfd->so_live, a.handle, xa_mk_value(1), GFP_KERNEL);
   }
   ret = nvgpu_fence_call(&p, nfd->handle, DRM_IOCTL_SYNCOBJ_DESTROY, &a, true);
-  if (!ret) {
+  /*
+   * Counted as a destroy whenever it may have been one, not only when the
+   * answer says so: a DESTROY abandoned on a fatal signal or a timeout
+   * (-EINTR, -ETIMEDOUT) still runs on the host, and one whose reply was
+   * malformed ran too. Uncounted, a create answered with this number just
+   * before would be noted after it, and so_live would hold a handle the
+   * host no longer does. Only -EINVAL -- the host's answer for a pad or a
+   * handle it does not hold, or a refusal before sending -- destroyed
+   * nothing.
+   */
+  if (ret != -EINVAL) {
     WRITE_ONCE(nfd->so_sync, nfd->so_sync + 1);
     xa_erase(&nfd->so_live, a.handle);
   }
