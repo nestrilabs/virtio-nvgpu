@@ -244,6 +244,31 @@ struct Args {
     #[arg(long, value_name = "US", default_value_t = 100)]
     sched_slice_us: u64,
 
+    /// NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS calls a second one guest process
+    /// may make once its burst is spent (1 to 1000, below
+    /// `--fifo-disable-vm-rate`). A disable preempts the caller's channels
+    /// off the GPU and with them the runlist every VM shares, so the rate is
+    /// how often one VM may make the others wait (SECURITY.md, "The RM
+    /// allowlist"); the default is several times what any workload measured
+    /// makes. A call past it is answered as RM without GSP answers it.
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    fifo_disable_proc_rate: u32,
+
+    /// The disables one guest process may make back to back (9 to 1000, at
+    /// most `--fifo-disable-vm-burst` less the VM's reserve of 40).
+    #[arg(long, value_name = "N", default_value_t = 40)]
+    fifo_disable_proc_burst: u32,
+
+    /// The disables a second the whole VM may make once its burst is spent
+    /// (2 to 1000): what bounds one VM against every other.
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    fifo_disable_vm_rate: u32,
+
+    /// The disables the whole VM may make back to back (up to 1000), the
+    /// last 40 of them kept for processes that have made few.
+    #[arg(long, value_name = "N", default_value_t = 160)]
+    fifo_disable_vm_burst: u32,
+
     /// Allocate guest system memory with the coherency the guest asks for,
     /// instead of GPU-coherent (write-back, snooped).
     ///
@@ -1869,6 +1894,18 @@ fn main() -> anyhow::Result<()> {
         window.owner_percent
     );
 
+    let rates = channel_rates(&args)?;
+    if rates != device::rmchan::Rates::default() {
+        log::warn!(
+            "FIFO_DISABLE_CHANNELS: {} a second per guest process after {} at once, {} a \
+             second for the VM after {} (not the defaults)",
+            rates.proc_rate,
+            rates.proc_burst,
+            rates.vm_rate,
+            rates.vm_burst
+        );
+    }
+
     // Before any thread exists, so that every one inherits it.
     // 0 keeps what the launcher or the host set; so does a policy that is
     // not a fair one (device::sys::proc::set_sched_slice).
@@ -2145,6 +2182,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(n) = nofile {
             be.set_nofile(n);
         }
+        be.set_channel_rates(rates);
     }
     // Past a millisecond it is a core spent for nothing a kick would not do.
     nvgpu.queue_poll = std::time::Duration::from_micros(args.queue_poll_us.min(1000));
@@ -2276,6 +2314,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The FIFO_DISABLE_CHANNELS budgets `--fifo-disable-*` ask for, or why
+/// they cannot be had (device::rmchan::Rates::new).
+fn channel_rates(args: &Args) -> anyhow::Result<device::rmchan::Rates> {
+    device::rmchan::Rates::new(
+        args.fifo_disable_proc_rate,
+        args.fifo_disable_proc_burst,
+        args.fifo_disable_vm_rate,
+        args.fifo_disable_vm_burst,
+    )
+    .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     /// GET_SHMEM_CONFIG: the window as region 1, and the UVM aperture as
@@ -2337,6 +2387,48 @@ mod tests {
             );
         }
         assert!(super::window_config(&args(&["--window-size", "65536"])).is_ok());
+    }
+
+    /// `--fifo-disable-*`: the defaults are rmchan.rs's; others within its
+    /// bounds are taken, the rest stop the start.
+    #[test]
+    fn fifo_disable_rates_follow_the_flags() {
+        assert_eq!(
+            super::channel_rates(&args(&[])).unwrap(),
+            device::rmchan::Rates::default()
+        );
+        let r = super::channel_rates(&args(&[
+            "--fifo-disable-proc-rate",
+            "10",
+            "--fifo-disable-proc-burst",
+            "20",
+            "--fifo-disable-vm-rate",
+            "400",
+            "--fifo-disable-vm-burst",
+            "320",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (r.proc_rate, r.proc_burst, r.vm_rate, r.vm_burst),
+            (10.0, 20.0, 400.0, 320.0)
+        );
+        for bad in [
+            &["--fifo-disable-proc-rate", "0"][..],
+            &["--fifo-disable-vm-rate", "1001"],
+            &["--fifo-disable-vm-burst", "100000"],
+            &["--fifo-disable-proc-rate", "200"],
+            &["--fifo-disable-proc-burst", "150"],
+            &["--fifo-disable-proc-burst", "8"],
+        ] {
+            let e = super::channel_rates(&args(bad)).unwrap_err().to_string();
+            assert!(
+                e.starts_with("refusing to start: --fifo-disable-"),
+                "{bad:?}: {e}"
+            );
+        }
+        assert!(
+            Args::try_parse_from(["vhost-user-nvgpu", "--fifo-disable-vm-rate", "-1"]).is_err()
+        );
     }
 
     use super::*;

@@ -31,7 +31,9 @@
 //!   every other VM and host program. Natively any process may do that as
 //!   often as it likes; here each guest process gets a token bucket of
 //!   [`PROC_RATE`] calls a second after a burst of [`PROC_BURST`], and the
-//!   VM one of [`VM_RATE`] after [`VM_BURST`]. A process's bucket is charged
+//!   VM one of [`VM_RATE`] after [`VM_BURST`] (the defaults; the backend's
+//!   `--fifo-disable-*` flags set others within [`Rates::new`]'s bounds).
+//!   A process's bucket is charged
 //!   for every call it asks for, served or not. The last [`VM_RESERVE`] of
 //!   the VM's tokens go only to a process that has used at most
 //!   [`RESERVE_FLOOR`] of its own recently, the call it is making included
@@ -101,9 +103,90 @@ pub const PROC_CAP: usize = 1024;
 
 // The budgets fit together: a process's burst and rate within the VM's, the
 // reserve within the VM's burst, the floor within a process's burst.
+// Rates::new holds rates given on the command line to the same.
 const _: () = assert!(PROC_BURST <= VM_BURST - VM_RESERVE);
 const _: () = assert!(PROC_RATE < VM_RATE);
 const _: () = assert!(RESERVE_FLOOR < PROC_BURST && RESERVE_FLOOR < VM_RESERVE);
+
+/// The most calls a second a process's or the VM's bucket may be given
+/// (`--fifo-disable-proc-rate`, `--fifo-disable-vm-rate`): each call past
+/// `bOnlyDisableScheduling` preempts a runlist every other VM shares, so
+/// even the loosest setting stays a bound: five times the default VM rate.
+pub const MAX_RATE: u32 = 1000;
+/// The most calls a bucket may hold back to back (`--fifo-disable-*-burst`).
+pub const MAX_BURST: u32 = 1000;
+
+/// The token buckets' sizes: calls a second once a burst is spent, and the
+/// burst, for each guest process and for the VM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rates {
+    pub proc_rate: f64,
+    pub proc_burst: f64,
+    pub vm_rate: f64,
+    pub vm_burst: f64,
+}
+
+impl Default for Rates {
+    fn default() -> Self {
+        Rates {
+            proc_rate: PROC_RATE,
+            proc_burst: PROC_BURST,
+            vm_rate: VM_RATE,
+            vm_burst: VM_BURST,
+        }
+    }
+}
+
+impl Rates {
+    /// Rates from the command line, held to what the defaults keep: each
+    /// rate at least 1 and at most [`MAX_RATE`], each burst at most
+    /// [`MAX_BURST`]; a process's rate below the VM's; a process's burst
+    /// above [`RESERVE_FLOOR`] and within the VM's less its
+    /// [`VM_RESERVE`], so that the reserve still serves a quiet process
+    /// and no one process can take the VM's whole burst.
+    pub fn new(
+        proc_rate: u32,
+        proc_burst: u32,
+        vm_rate: u32,
+        vm_burst: u32,
+    ) -> Result<Self, String> {
+        for (name, v, max) in [
+            ("--fifo-disable-proc-rate", proc_rate, MAX_RATE),
+            ("--fifo-disable-vm-rate", vm_rate, MAX_RATE),
+            ("--fifo-disable-proc-burst", proc_burst, MAX_BURST),
+            ("--fifo-disable-vm-burst", vm_burst, MAX_BURST),
+        ] {
+            if v == 0 || v > max {
+                return Err(format!("{name} {v}: 1 to {max}"));
+            }
+        }
+        if proc_rate >= vm_rate {
+            return Err(format!(
+                "--fifo-disable-proc-rate {proc_rate} must be below --fifo-disable-vm-rate {vm_rate}: \
+                 one process may not take the whole VM's rate"
+            ));
+        }
+        let (pb, vb) = (f64::from(proc_burst), f64::from(vm_burst));
+        if pb <= RESERVE_FLOOR {
+            return Err(format!(
+                "--fifo-disable-proc-burst {proc_burst}: more than {RESERVE_FLOOR}, the calls a \
+                 quiet process may take from the VM's reserve"
+            ));
+        }
+        if pb > vb - VM_RESERVE {
+            return Err(format!(
+                "--fifo-disable-proc-burst {proc_burst} must be at most --fifo-disable-vm-burst \
+                 {vm_burst} less the VM's reserve of {VM_RESERVE}"
+            ));
+        }
+        Ok(Rates {
+            proc_rate: f64::from(proc_rate),
+            proc_burst: pb,
+            vm_rate: f64::from(vm_rate),
+            vm_burst: vb,
+        })
+    }
+}
 
 /// Why a call was answered here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +249,7 @@ impl Bucket {
 /// The budgets of one VM's calls.
 #[derive(Debug)]
 pub struct ChannelGate {
+    rates: Rates,
     vm: Bucket,
     procs: HashMap<Owner, Bucket>,
     pruned: Instant,
@@ -175,8 +259,14 @@ pub struct ChannelGate {
 
 impl ChannelGate {
     pub fn new(now: Instant) -> Self {
+        Self::with_rates(Rates::default(), now)
+    }
+
+    /// A gate with buckets of `rates` (`--fifo-disable-*`).
+    pub fn with_rates(rates: Rates, now: Instant) -> Self {
         ChannelGate {
-            vm: Bucket::full(VM_BURST, now),
+            rates,
+            vm: Bucket::full(rates.vm_burst, now),
             procs: HashMap::new(),
             pruned: now,
             refused: 0,
@@ -213,7 +303,8 @@ impl ChannelGate {
         if le::u64_at(params, RUNLIST_PREEMPT_EVENT) != Some(0) {
             return Err(Refused::PreemptEvent);
         }
-        self.vm.refill(VM_RATE, VM_BURST, now);
+        let r = self.rates;
+        self.vm.refill(r.vm_rate, r.vm_burst, now);
         // A process's bucket is charged for every call it asks for, served
         // or not: one that asks past its rate stays empty, and so out of the
         // VM's reserve, whatever the VM itself had left for it.
@@ -238,12 +329,12 @@ impl ChannelGate {
                 let b = self
                     .procs
                     .entry(owner)
-                    .or_insert_with(|| Bucket::full(PROC_BURST, now));
-                b.refill(PROC_RATE, PROC_BURST, now);
+                    .or_insert_with(|| Bucket::full(r.proc_burst, now));
+                b.refill(r.proc_rate, r.proc_burst, now);
                 if b.tokens < 1.0 {
                     return Err(Refused::ProcRate);
                 }
-                let used = PROC_BURST - b.tokens;
+                let used = r.proc_burst - b.tokens;
                 b.tokens -= 1.0;
                 used
             }
@@ -258,9 +349,10 @@ impl ChannelGate {
     /// Drop the buckets that have refilled: a full bucket and none are the
     /// same.
     fn prune(&mut self, now: Instant) {
+        let r = self.rates;
         self.procs.retain(|_, b| {
-            b.refill(PROC_RATE, PROC_BURST, now);
-            b.tokens < PROC_BURST
+            b.refill(r.proc_rate, r.proc_burst, now);
+            b.tokens < r.proc_burst
         });
     }
 
@@ -486,5 +578,69 @@ mod tests {
         let later = t + Duration::from_secs(60);
         assert_eq!(g.check(proc(9999), &p, 536, later), Ok(()));
         assert_eq!(g.tracked(), 1);
+    }
+
+    #[test]
+    fn rates_from_the_command_line_are_held_to_the_defaults_shape() {
+        let d = Rates::default();
+        assert_eq!(Rates::new(50, 40, 200, 160), Ok(d));
+        // Tighter and looser, within the bounds.
+        assert!(Rates::new(1, 9, 2, 49).is_ok());
+        assert!(Rates::new(MAX_RATE - 1, MAX_BURST - 40, MAX_RATE, MAX_BURST).is_ok());
+        for (pr, pb, vr, vb, says) in [
+            (0, 40, 200, 160, "1 to"),
+            (50, 40, 0, 160, "1 to"),
+            (50, 0, 200, 160, "1 to"),
+            (50, 40, 200, 0, "1 to"),
+            (50, 40, MAX_RATE + 1, 160, "1 to"),
+            (50, 40, 200, MAX_BURST + 1, "1 to"),
+            (u32::MAX, 40, 200, 160, "1 to"),
+            // One process may not have the whole VM's rate or burst.
+            (200, 40, 200, 160, "below"),
+            (300, 40, 200, 160, "below"),
+            (50, 121, 200, 160, "less the VM's reserve"),
+            (50, 160, 200, 160, "less the VM's reserve"),
+            // A process's burst must exceed what the reserve serves.
+            (50, 8, 200, 160, "quiet process"),
+        ] {
+            let e = Rates::new(pr, pb, vr, vb).expect_err(says);
+            assert!(e.contains(says), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_gate_keeps_the_rates_it_was_given() {
+        let t = Instant::now();
+        let p = params(0);
+        // A tighter process burst: 10 at once, then refused.
+        let r = Rates::new(5, 10, 100, 60).unwrap();
+        let mut g = ChannelGate::with_rates(r, t);
+        for _ in 0..10 {
+            assert_eq!(g.check(proc(1), &p, 536, t), Ok(()));
+        }
+        assert_eq!(g.check(proc(1), &p, 536, t), Err(Refused::ProcRate));
+        // A token back after 1 / 5 s, not 1 / PROC_RATE.
+        let soon = t + Duration::from_secs_f64(1.1 / PROC_RATE);
+        assert_eq!(g.check(proc(1), &p, 536, soon), Err(Refused::ProcRate));
+        let later = t + Duration::from_secs_f64(1.1 / 5.0);
+        assert_eq!(g.check(proc(1), &p, 536, later), Ok(()));
+        // The VM's burst: 60 at once over many processes, less the reserve
+        // for any process that has used more than the floor.
+        let mut g = ChannelGate::with_rates(r, t);
+        let mut ok = 0;
+        for _ in 0..1000 {
+            if g.check(Owner::Unknown, &p, 536, t).is_ok() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 60);
+        // A looser one: the default refuses the 41st call of a process, this
+        // does not.
+        let r = Rates::new(100, 200, 400, 400).unwrap();
+        let mut g = ChannelGate::with_rates(r, t);
+        for k in 0..200 {
+            assert_eq!(g.check(proc(1), &p, 536, t), Ok(()), "call {k}");
+        }
+        assert_eq!(g.check(proc(1), &p, 536, t), Err(Refused::ProcRate));
     }
 }
