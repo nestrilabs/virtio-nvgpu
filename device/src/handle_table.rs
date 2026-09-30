@@ -319,6 +319,13 @@ impl HandleTable {
             .count() as u64
     }
 
+    /// What `owner` is charged: its handles and its descriptors still
+    /// closing.
+    #[cfg(test)]
+    pub fn charged_to(&self, owner: Owner) -> u64 {
+        self.slots.held(owner)
+    }
+
     /// A duplicate of the descriptor, `O_CLOEXEC`, so a call can keep using
     /// it after the table lock is dropped even if the guest closes the handle
     /// meanwhile.

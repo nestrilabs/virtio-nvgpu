@@ -59,6 +59,17 @@ use crate::xfer::{Hooks, Sys};
 // NvidiaBackend
 // ============================================================
 
+/// What a handle's end does to the pump's watch of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// Stop watching, and drop whatever was not yet sent: nobody is left to
+    /// hear it (a CLOSE, a session's end).
+    Unwatch,
+    /// Report what was not yet sent, and keep the descriptor until it is
+    /// ([`PumpCmd::Retire`]).
+    KeepReport,
+}
+
 pub struct NvidiaBackend {
     /// The message being served, so a response can echo its type, and the
     /// handle it named, so handlers need not thread either through.
@@ -724,7 +735,7 @@ impl NvidiaBackend {
             log::info!("release_all: closing {} host file(s)", handles.len());
         }
         for h in handles {
-            let _ = self.retire_handle(h, "session end");
+            let _ = self.retire_handle(h, "session end", End::Unwatch);
         }
         for (_, k) in self.kms_states.drain() {
             k.retire();
@@ -1048,10 +1059,21 @@ impl NvidiaBackend {
 
     fn handle_close(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         let _ = payload;
-        match self.close_handle(self.current_handle) {
+        let r = self.close_handle(self.current_handle);
+        // A render file's close drops the registrations on its syncobjs.
+        self.reap_syncobj_regs();
+        match r {
             Ok(()) => self.write_hdr(resp_buf, 0, 0),
             Err(_) => self.write_error(resp_buf, libc::EBADF),
         }
+    }
+
+    /// Hand back the handles of wait registrations that fired or never
+    /// will (fence.rs), now rather than at the next watch.
+    pub(crate) fn reap_syncobj_regs(&mut self) {
+        let mut regs = std::mem::take(&mut self.syncobj_regs);
+        regs.reap(self);
+        self.syncobj_regs = regs;
     }
 
     /// Close one handle, and everything that exists only because of it.
@@ -1065,12 +1087,22 @@ impl NvidiaBackend {
     /// guest file may still have one mapped (see [`LiveMap`]). Only the lookup
     /// that would hand the placement to a new mmap on this handle goes.
     pub(crate) fn close_handle(&mut self, handle: u32) -> Result<()> {
-        self.retire_handle(handle, "close")
+        self.retire_handle(handle, "close", End::Unwatch)
+    }
+
+    /// Close one-shot handle `handle` -- a syncobj wait registration's
+    /// eventfd (fence.rs) -- keeping the report its guest waiters sleep for
+    /// ([`PumpCmd::Retire`]): the descriptor, still counted against the
+    /// table and its process as one closing, goes when the pump has sent
+    /// that report, not a fixed time later.
+    pub(crate) fn retire_reported(&mut self, handle: u32) -> Result<()> {
+        self.retire_handle(handle, "retire", End::KeepReport)
     }
 
     /// Everything a handle's end does, whatever ends it (`why`): a CLOSE, or
     /// the session's (`release_all`), which does the VM-wide parts first.
-    fn retire_handle(&mut self, handle: u32, why: &str) -> Result<()> {
+    /// `end` says what becomes of what the pump has for it.
+    fn retire_handle(&mut self, handle: u32, why: &str, end: End) -> Result<()> {
         let owner = self.handles.owner(handle);
         let (fd, kind) = self.handles.remove(handle)?;
         // Its UVM pools leave the VMM while `fd` is still open here, so the
@@ -1112,8 +1144,16 @@ impl NvidiaBackend {
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
         self.inject.file_closed(handle);
-        self.pump_cmds.push(PumpCmd::Unwatch { handle });
         log::debug!("{why} of handle {handle} ({kind:?})");
+        if end == End::KeepReport && !crate::closer::slow(kind) {
+            let hold = self.handles.closing(fd, owner, kind);
+            self.pump_cmds.push(PumpCmd::Retire {
+                handle,
+                hold: Box::new(hold),
+            });
+            return Ok(());
+        }
+        self.pump_cmds.push(PumpCmd::Unwatch { handle });
         // A display file's last close can wait on a modeset; not here, on
         // the queue thread under the backend mutex (closer.rs, S-33). One
         // whose framebuffers a call in flight names closes after it (S-6).

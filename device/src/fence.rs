@@ -57,7 +57,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::{Duration, Instant};
 
 use crate::hostfd::{self, HandleKind, IOC_RW, ioc};
 use crate::le;
@@ -78,18 +77,6 @@ pub const REGISTRATION_CAP: usize = 1024;
 /// What one guest process may hold of [`REGISTRATION_CAP`] (quota.rs): a
 /// quarter, the last sixteenth kept for processes holding at most 16.
 pub const REGISTRATION_SHARE: Share = Share::quarter(REGISTRATION_CAP as u64, 16);
-
-/// How long a fired registration's eventfd handle outlives the registration.
-///
-/// Closing a handle unwatches it in the pump, and an unwatch drops whatever
-/// the pump had not yet reported for it (`pump::Outbox::forget`). A
-/// registration is seen to have fired when its eventfd is readable -- which
-/// may be a moment *before* the pump has read that readiness and queued the
-/// EV_READY every guest waiter on the cookie sleeps for. Closing then would
-/// lose their wakeup. The pump reports within one round of its loop, far
-/// under this; after it, the one-shot watch is gone and the close is only a
-/// close.
-pub const RETIRE_GRACE: Duration = Duration::from_secs(1);
 
 /// `DRM_SYNCOBJ_WAIT_FLAGS_*`, include/uapi/drm/drm.h:1002-1005.
 pub const WAIT_FOR_SUBMIT: u32 = 1 << 1;
@@ -267,7 +254,8 @@ pub trait RegTable {
     /// the pump report it once, as EV_READY with `cookie`, when it becomes
     /// readable.
     fn publish(&mut self, eventfd: OwnedFd, cookie: u64, owner: Owner) -> Result<u32, Errno>;
-    /// Take that handle back.
+    /// Take that handle back: the registration fired, or never will. Its
+    /// report, if it fired, still reaches every waiter on its cookie.
     fn retire(&mut self, handle: u32);
 }
 
@@ -305,10 +293,20 @@ pub struct Registrations {
     orphans: Vec<Reg>,
     /// The cap, and each guest process's part of it, orphans included.
     slots: Pool,
-    /// Handles of fired registrations, closed once [`RETIRE_GRACE`] has
-    /// passed. Bounded by how fast registrations fire.
-    retired: VecDeque<(u32, Instant)>,
-    grace: Duration,
+    /// Handles of registrations that fired, or never will, not yet handed
+    /// back: at the next call that reaches the table ([`Registrations::reap`]).
+    /// Each was a registration's, so there are never more than the cap.
+    ///
+    /// A handle is not simply closed: an unwatch drops whatever the pump had
+    /// not yet sent for it (`pump::Outbox::forget`), and a registration is
+    /// seen to have fired when its eventfd is readable -- which may be a
+    /// moment *before* the pump has read that readiness, and longer before
+    /// the EV_READY every guest waiter on the cookie sleeps for has gone out.
+    /// [`RegTable::retire`] keeps that report, and the descriptor, counted,
+    /// until it has (`pump::PumpCmd::Retire`). A fixed grace instead kept
+    /// every fired handle charged to its process for a second: at the rate a
+    /// busy process fires them, more than its whole share of the table.
+    retired: VecDeque<u32>,
     /// Syncobj handles a render file exported as a syncobj file
     /// (SYNCOBJ_HANDLE_TO_FD without EXPORT_SYNC_FILE): whoever holds the
     /// file can keep the syncobj alive and import it anywhere.
@@ -348,7 +346,6 @@ impl Registrations {
                 },
             ),
             retired: VecDeque::new(),
-            grace: RETIRE_GRACE,
             exported: HashSet::new(),
             importers: HashSet::new(),
         }
@@ -420,13 +417,12 @@ impl Registrations {
         }
         let Some(h) = word(arg, 0) else { return };
         let private = self.private(render, h);
-        let now = Instant::now();
         let (gone, kept): (Vec<Reg>, Vec<Reg>) = std::mem::take(&mut self.orphans)
             .into_iter()
             .partition(|r| private && !r.detached && r.key.render == render && r.key.syncobj == h);
         self.orphans = kept;
         for r in gone {
-            self.drop_reg(r, now);
+            self.drop_reg(r);
         }
         // The number is the host's to give out again, to a syncobj of its own.
         for r in self.orphans.iter_mut() {
@@ -440,15 +436,9 @@ impl Registrations {
     /// A registration nothing will ever fire again, dropped: its slot and
     /// its owner's charge back at once, its descriptors closed now (our
     /// syncobj file with them, which may free the syncobj and its kernel
-    /// entries), its handle after the grace, as a fired one's.
-    fn drop_reg(&mut self, r: Reg, now: Instant) {
-        self.retired.push_back((r.handle, now));
-    }
-
-    /// A different grace before fired handles are closed (tests).
-    pub fn with_grace(mut self, grace: Duration) -> Self {
-        self.grace = grace;
-        self
+    /// entries), its handle at the next reap, as a fired one's.
+    fn drop_reg(&mut self, r: Reg) {
+        self.retired.push_back(r.handle);
     }
 
     /// Registrations that have not been seen to fire, orphans included.
@@ -476,7 +466,6 @@ impl Registrations {
     /// on syncobjs only the file could reach are dropped, as the file's
     /// close frees the syncobjs; the rest are orphaned.
     pub fn orphan_file(&mut self, render: u32) {
-        let now = Instant::now();
         let importer = self.importers.remove(&render);
         let keys: Vec<RegKey> = self
             .regs
@@ -500,7 +489,7 @@ impl Registrations {
             });
         self.orphans = kept;
         for r in gone {
-            self.drop_reg(r, now);
+            self.drop_reg(r);
         }
         for r in self.orphans.iter_mut().filter(|r| r.key.render == render) {
             r.detached = true;
@@ -551,7 +540,24 @@ impl Registrations {
         cookie: u64,
         owner: Owner,
     ) -> Result<Watched, Errno> {
-        self.reap(table, Instant::now());
+        // What earlier calls retired, before this one takes a handle; what
+        // this one retires (a fired registration it replaces, the sweep's),
+        // after.
+        self.reap(table);
+        let r = self.watch_new(host, table, render_fd, key, cookie, owner);
+        self.reap(table);
+        r
+    }
+
+    fn watch_new(
+        &mut self,
+        host: &dyn SyncobjHost,
+        table: &mut dyn RegTable,
+        render_fd: RawFd,
+        key: RegKey,
+        cookie: u64,
+        owner: Owner,
+    ) -> Result<Watched, Errno> {
         if key.flags & !WAIT_AVAILABLE != 0 {
             return Err(libc::EINVAL);
         }
@@ -616,10 +622,10 @@ impl Registrations {
         // Watched before it is registered: the kernel may signal it inside
         // the ioctl (a point already signalled, drm_syncobj.c:1447-1453), and
         // the pump's watch looks at the descriptor once when it is armed.
-        // The handle is charged to the process too: a retired
-        // registration's stays open for the grace, and uncharged, a
-        // process looping on signalled points would fill the table past
-        // its share.
+        // The handle is charged to the process too, and a retired
+        // registration's stays charged until the pump has sent its report:
+        // uncharged, a process looping on signalled points while the guest
+        // took no events would fill the table past its share.
         let handle = table.publish(dup, cookie, owner)?;
         if let Err(e) = host.register(
             render_fd,
@@ -647,7 +653,7 @@ impl Registrations {
     }
 
     /// Forget every registration that has fired. Their slots are free at
-    /// once; their handles close after the grace.
+    /// once; their handles go at the next reap.
     pub fn sweep(&mut self) {
         let done: Vec<RegKey> = self
             .regs
@@ -658,31 +664,33 @@ impl Registrations {
         for k in done {
             self.retire(&k);
         }
-        let now = Instant::now();
         let (fired_orphans, live): (Vec<Reg>, Vec<Reg>) = std::mem::take(&mut self.orphans)
             .into_iter()
             .partition(|r| fired(r.eventfd.as_raw_fd()));
         self.orphans = live;
         for r in fired_orphans {
-            self.retired.push_back((r.handle, now));
+            self.retired.push_back(r.handle);
         }
     }
 
     fn retire(&mut self, key: &RegKey) {
         if let Some(r) = self.regs.remove(key) {
-            self.retired.push_back((r.handle, Instant::now()));
+            self.retired.push_back(r.handle);
         }
     }
 
-    /// Close the handles of registrations retired at least a grace ago.
-    fn reap(&mut self, table: &mut dyn RegTable, now: Instant) {
-        while let Some(&(h, at)) = self.retired.front() {
-            if now.duration_since(at) < self.grace {
-                break;
-            }
-            self.retired.pop_front();
+    /// Hand back the handles of registrations that fired, or never will
+    /// ([`RegTable::retire`]).
+    pub fn reap(&mut self, table: &mut dyn RegTable) {
+        while let Some(h) = self.retired.pop_front() {
             table.retire(h);
         }
+    }
+
+    /// Handles retired and not yet handed back (tests).
+    #[cfg(test)]
+    pub fn retired_for_test(&self) -> usize {
+        self.retired.len()
     }
 
     /// The session is gone: drop every registration without touching the
@@ -736,7 +744,7 @@ impl RegTable for NvidiaBackend {
         // CLOSE of it by a confused guest would have freed the number; only an
         // eventfd is ours to close.
         if self.handles.kind(handle) == Some(HandleKind::Eventfd) {
-            let _ = self.close_handle(handle);
+            let _ = self.retire_reported(handle);
         }
     }
 }
@@ -912,7 +920,7 @@ mod tests {
     #[test]
     fn a_fired_registration_is_replaced_rather_than_joined() {
         let (host, mut t) = (Host::default(), Table::default());
-        let mut r = Registrations::default().with_grace(Duration::ZERO);
+        let mut r = Registrations::default();
         assert_eq!(
             r.watch(&host, &mut t, 3, key(1, 5, 0), C1),
             Ok(Watched::New)
@@ -927,26 +935,10 @@ mod tests {
         );
         assert_eq!(t.watched, vec![(1, C1), (2, C2)]);
         assert_eq!(r.len(), 1);
-        // The old handle closes on the next call, the grace (zero here)
-        // having passed.
-        assert!(t.retired.is_empty());
-        r.watch(&host, &mut t, 3, key(1, 5, 0), C3).unwrap();
+        // The old handle goes back in the call that replaced it; its report
+        // is the table's to keep (`RegTable::retire`).
         assert_eq!(t.retired, vec![1]);
-    }
-
-    #[test]
-    fn a_fired_handle_stays_open_until_the_pump_has_had_its_chance() {
-        // Closing unwatches, and an unwatch drops a report the pump has not
-        // queued yet -- the wakeup every waiter on the cookie sleeps for.
-        let (host, mut t) = (Host::default(), Table::default());
-        let mut r = Registrations::default();
-        r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
-        host.fire(0);
-        r.watch(&host, &mut t, 3, key(1, 5, 0), C2).unwrap();
-        r.watch(&host, &mut t, 3, key(2, 5, 0), C3).unwrap();
-        assert!(t.retired.is_empty(), "within the grace nothing is closed");
-        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
-        assert_eq!(t.retired, vec![1]);
+        assert_eq!(r.retired_for_test(), 0);
     }
 
     #[test]
@@ -978,7 +970,7 @@ mod tests {
             Ok(Watched::New)
         );
         assert_eq!(r.len(), 2);
-        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
+        r.reap(&mut t);
         assert_eq!(t.retired, vec![2]);
     }
 
@@ -1051,8 +1043,8 @@ mod tests {
         host.fire(0);
         r.sweep();
         assert!(r.is_empty());
-        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
-        assert_eq!(t.retired, vec![1], "its handle closes after the grace");
+        r.reap(&mut t);
+        assert_eq!(t.retired, vec![1], "its handle is handed back");
         let mut r = Registrations::default();
         r.watch(&host, &mut t, 3, key(1, 5, 0), C1).unwrap();
         r.orphan(20, 1);
@@ -1142,8 +1134,8 @@ mod tests {
             Ok(Watched::New),
             "its share is free at once"
         );
-        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
-        assert_eq!(t.retired, vec![1], "its handle closes after the grace");
+        r.reap(&mut t);
+        assert_eq!(t.retired, vec![1], "its handle is handed back");
     }
 
     #[test]
@@ -1328,7 +1320,7 @@ mod tests {
         r.sweep();
         r.clear();
         assert!(r.is_empty());
-        r.reap(&mut t, Instant::now() + RETIRE_GRACE);
+        r.reap(&mut t);
         assert!(t.retired.is_empty());
     }
 
@@ -1361,10 +1353,122 @@ mod tests {
         ));
         be.retire(h);
         assert_eq!(be.handles.kind(h), None);
+        // Its report kept, and its slot until the pump lets it go.
+        assert_eq!(be.handles.held_by(p), 0);
+        assert_eq!(be.handles.charged_to(p), 1);
+        let cmds = be.take_pump_cmds();
+        assert!(matches!(
+            cmds.as_slice(),
+            [PumpCmd::Retire { handle, .. }] if *handle == h
+        ));
+        drop(cmds);
+        assert_eq!(be.handles.charged_to(p), 0);
+    }
+
+    /// nvgpu-syncobj-race's owner round, on the backend's table: SYNCOBJ_
+    /// EVENTFD on a fresh syncobj, its point signalled, HANDLE_TO_FD and the
+    /// guest's CLOSE of that file, the posted DESTROY. The process holds a
+    /// few objects at a time, so it may make as many rounds as it likes. A
+    /// fired registration's handle used to stay a second after it was seen
+    /// fired, charged to the process: at the rate the probe fires them
+    /// (16 thousand a second) that was its whole quarter of the table, and
+    /// both SYNCOBJ_EVENTFD and HANDLE_TO_FD said EMFILE. Now it goes when
+    /// the next call finds it fired, and its charge when the pump has sent
+    /// its report.
+    #[test]
+    fn a_process_firing_registrations_fast_holds_only_what_is_unfired_or_unsent() {
+        let host = Host::default();
+        let mut be = NvidiaBackend::for_test();
+        // A quarter of it, 1024, per process; REGISTRATION_SHARE is 256.
+        be.handles.set_limit(4096);
+        let p = Owner::Proc {
+            tgid: 148,
+            start_ns: 1,
+        };
+        let render = be.adopt_for_test_as(devnull(), HandleKind::DriRender(0), p);
+        let mut regs = std::mem::take(&mut be.syncobj_regs);
+        let mut peak = (0, 0);
+        for round in 0..4096u64 {
+            let key = RegKey {
+                render,
+                syncobj: 1 + (round % 9) as u32,
+                point: round + 1,
+                flags: 0,
+            };
+            let before = be.handles.held_by(p);
+            // SYNCOBJ_CREATE runs on the host alone. SYNCOBJ_EVENTFD: a
+            // registration, and its eventfd's handle.
+            assert_eq!(
+                regs.watch_by(&host, &mut be, 3, key, (1 << 32) | (round + 1), p),
+                Ok(Watched::New),
+                "round {round}: held {}",
+                be.handles.held_by(p)
+            );
+            if round == 0 {
+                assert_eq!(be.handles.held_by(p), before + 1);
+            }
+            // The point signalled: the kernel writes the eventfd.
+            host.fire(round as usize);
+            // HANDLE_TO_FD (drm_syncobj_handle: handle @0, flags @4): a
+            // syncobj file, adopted for the guest, which closes it at once.
+            let arg = [key.syncobj.to_le_bytes(), [0; 4]].concat();
+            regs.before_ioctl2(render, "SYNCOBJ_HANDLE_TO_FD", Some(&arg));
+            let file = be.adopt_for_test_as(devnull(), HandleKind::Syncobj, p);
+            be.close_handle(file).unwrap();
+            // The posted DESTROY. Exported, so the registration is an
+            // orphan now, swept once it is found fired.
+            let d = key.syncobj.to_le_bytes();
+            regs.before_ioctl2(render, "SYNCOBJ_DESTROY", Some(&d));
+            regs.after_ioctl2(render, "SYNCOBJ_DESTROY", Some(&d), Some(0));
+            if round == 0 {
+                assert_eq!(be.handles.held_by(p), before + 1, "until swept");
+            }
+            peak.0 = peak.0.max(be.handles.held_by(p));
+            peak.1 = peak.1.max(be.handles.charged_to(p));
+            // The pump sends the reports it was handed.
+            drop(be.take_pump_cmds());
+            assert_eq!(be.handles.charged_to(p), be.handles.held_by(p));
+        }
+        // The render file, the share's worth of registrations not yet
+        // swept, and the one the round made.
+        let most = 1 + REGISTRATION_SHARE.per_owner + 1;
+        assert!(peak.0 <= most, "{} handles held", peak.0);
+        assert!(peak.1 <= most + 1, "{} charged", peak.1);
+        be.syncobj_regs = regs;
+    }
+
+    /// A DESTROY that drops a registration (its syncobj only the file
+    /// could reach) hands its handle back then, not at the next watch.
+    #[test]
+    fn a_dropped_registrations_handle_goes_back_with_the_destroy() {
+        let host = Host::default();
+        let mut be = NvidiaBackend::for_test();
+        let p = Owner::Proc {
+            tgid: 9,
+            start_ns: 1,
+        };
+        let render = be.adopt_for_test_as(devnull(), HandleKind::DriRender(0), p);
+        let mut regs = std::mem::take(&mut be.syncobj_regs);
+        let key = RegKey {
+            render,
+            syncobj: 1,
+            point: 5,
+            flags: 0,
+        };
+        regs.watch_by(&host, &mut be, 3, key, C1, p).unwrap();
+        let d = 1u32.to_le_bytes();
+        regs.before_ioctl2(render, "SYNCOBJ_DESTROY", Some(&d));
+        regs.after_ioctl2(render, "SYNCOBJ_DESTROY", Some(&d), Some(0));
+        be.syncobj_regs = regs;
+        assert_eq!(be.handles.held_by(p), 2);
+        be.take_pump_cmds();
+        be.reap_syncobj_regs();
+        assert_eq!(be.handles.held_by(p), 1, "the render file only");
         assert!(matches!(
             be.take_pump_cmds().as_slice(),
-            [PumpCmd::Unwatch { handle }] if *handle == h
+            [PumpCmd::Retire { .. }]
         ));
+        assert_eq!(be.handles.charged_to(p), 1);
     }
 
     #[test]

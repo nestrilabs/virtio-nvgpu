@@ -21,7 +21,9 @@
 //! - **Unbounded memory.** Readiness and fence records are coalesced per
 //!   cookie, and a one-shot record not yet delivered goes when its handle is
 //!   watched under another cookie or closed ([`Pump::fired`]), so their
-//!   number is bounded by the number of handles. DRM bytes
+//!   number is bounded by the number of handles. A retired handle's record
+//!   ([`PumpCmd::Retire`]) outlives the handle, but not what the handle was
+//!   charged, which it keeps until it is sent. DRM bytes
 //!   are bounded per handle by [`DRM_BUDGET`]: over it the pump stops reading
 //!   that file and takes it out of epoll, so the host kernel's own per-file
 //!   `event_space` (4 KiB, drm_file.c:158) applies backpressure to whoever
@@ -170,6 +172,15 @@ pub enum PumpCmd {
     /// Stop watching, and drop whatever this handle still had queued: the
     /// consumer on the guest side is gone.
     Unwatch { handle: u32 },
+    /// The backend let go of one-shot handle `handle` -- a syncobj wait
+    /// registration's eventfd, fired or dead (fence.rs) -- whose guest
+    /// waiters are still there. Unlike [`PumpCmd::Unwatch`] its report is
+    /// kept: one the pump has not read yet is read now, and `hold` -- the
+    /// handle's descriptor and what it is charged, `HandleTable::closing` --
+    /// stays until that report has gone to the guest or been dropped. So a
+    /// retired handle costs its process nothing once its record is out, and
+    /// an undelivered record is still counted against it.
+    Retire { handle: u32, hold: Box<dyn Send> },
     /// Whether the session speaks v2 (EVENT_DATA) or v1 (EVENT_READY only).
     SetV2(bool),
     /// The session was reset: every watch and every queued record goes.
@@ -204,6 +215,9 @@ pub struct Outbox {
     fence: HashMap<u64, (i32, u64)>,
     hotplug: HashMap<u32, u32>,
     drm: HashMap<u32, Vec<u8>>,
+    /// What a retired handle's queued record keeps (`PumpCmd::Retire`), by
+    /// cookie: dropped when that record is sent or dropped.
+    holds: HashMap<u64, Vec<Box<dyn Send>>>,
 }
 
 impl Outbox {
@@ -218,6 +232,7 @@ impl Outbox {
             self.fence.clear();
             self.hotplug.clear();
             self.drm.clear();
+            self.holds.clear();
             self.order.retain(|k| matches!(k, Key::Legacy(_)));
             self.queued.retain(|k| matches!(k, Key::Legacy(_)));
         }
@@ -297,6 +312,7 @@ impl Outbox {
         if let Some(c) = cookie {
             gone.extend([Key::Ready(c), Key::Fence(c)]);
             self.fence.remove(&c);
+            self.holds.remove(&c);
         }
         self.drm.remove(&handle);
         for k in &gone {
@@ -310,15 +326,33 @@ impl Outbox {
     pub fn forget_cookie(&mut self, cookie: u64) {
         let gone = [Key::Ready(cookie), Key::Fence(cookie)];
         self.fence.remove(&cookie);
+        self.holds.remove(&cookie);
         for k in &gone {
             self.queued.remove(k);
         }
         self.order.retain(|k| !gone.contains(k));
     }
 
+    /// Keep `hold` until the record queued under `cookie` is sent or
+    /// dropped; drop it now if none is.
+    pub fn hold(&mut self, cookie: u64, hold: Box<dyn Send>) {
+        if self.queued.contains(&Key::Ready(cookie)) || self.queued.contains(&Key::Fence(cookie)) {
+            self.holds.entry(cookie).or_default().push(hold);
+        }
+    }
+
+    /// Records a retired handle's hold keeps (tests).
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.holds.values().map(Vec::len).sum()
+    }
+
     fn pop(&mut self) {
         if let Some(k) = self.order.pop_front() {
             self.queued.remove(&k);
+            if let Key::Ready(c) | Key::Fence(c) = k {
+                self.holds.remove(&c);
+            }
         }
     }
 
@@ -877,6 +911,7 @@ impl<Q: EventQueue> Pump<Q> {
                         self.outbox.forget_cookie(c);
                     }
                 }
+                Ok(PumpCmd::Retire { handle, hold }) => self.retire(handle, hold),
                 Ok(PumpCmd::SetV2(v2)) => self.outbox.set_v2(v2),
                 Ok(PumpCmd::Reset) => {
                     for h in self.watches.keys().copied().collect::<Vec<_>>() {
@@ -890,6 +925,20 @@ impl<Q: EventQueue> Pump<Q> {
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
+        }
+    }
+
+    /// [`PumpCmd::Retire`]: a readiness not read yet is reported now (the
+    /// descriptor is one-shot and not drained, so it is still readable if
+    /// it ever fired), whatever is left of the watch ends, and `hold` stays
+    /// with the record, if one is queued.
+    fn retire(&mut self, handle: u32, hold: Box<dyn Send>) {
+        self.on_ready_if_readable(handle);
+        // Never fired: nothing to report, ever.
+        self.unwatch(handle);
+        match self.fired.remove(&handle) {
+            Some(c) => self.outbox.hold(c, hold),
+            None => drop(hold),
         }
     }
 
@@ -1654,6 +1703,121 @@ mod tests {
         h.send(PumpCmd::Unwatch { handle: 9 });
         pump.step_with_timeout(0);
         assert!(pump.outbox.is_empty());
+    }
+
+    /// A hold whose drop a test can see: the count of `Arc` references.
+    fn hold() -> (Arc<()>, Box<dyn Send>) {
+        let a = Arc::new(());
+        (a.clone(), Box::new(a))
+    }
+
+    fn ready_oneshot(h: &PumpHandle, handle: u32, cookie: u64) -> OwnedFd {
+        let efd = crate::hostfd::new_eventfd().unwrap();
+        h.send(PumpCmd::Watch {
+            handle,
+            fd: efd.try_clone().unwrap(),
+            mode: WatchMode::Ready {
+                cookie,
+                oneshot: true,
+                consume: false,
+            },
+        });
+        efd
+    }
+
+    /// A syncobj wait registration's eventfd is retired as soon as it is
+    /// seen to have fired -- possibly before the pump has read it. Its
+    /// report still goes out, and what the handle held stays until it has.
+    #[test]
+    fn a_retired_handles_report_goes_out_and_its_hold_stays_until_it_has() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let efd = ready_oneshot(&h, 4, 0xc0ffee);
+        pump.step_with_timeout(0);
+        // Fired, and retired before the pump has looked.
+        write_all(&efd, &1u64.to_ne_bytes());
+        let (seen, held) = hold();
+        h.send(PumpCmd::Retire {
+            handle: 4,
+            hold: held,
+        });
+        pump.step_with_timeout(0);
+        assert!(pump.watches.is_empty() && pump.fired.is_empty());
+        assert_eq!(pump.outbox.held(), 1, "no buffer yet: the record waits");
+        assert_eq!(Arc::strong_count(&seen), 2, "and so does the hold");
+        q.post(1, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        assert_eq!(records(&q.take()[0]), vec![(EV_READY, 0xc0ffee, vec![])]);
+        assert_eq!(Arc::strong_count(&seen), 1, "sent: the hold is gone");
+        assert_eq!(pump.outbox.held(), 0);
+
+        // Reported already, and sent: nothing to keep.
+        let efd = ready_oneshot(&h, 5, 0xbeef);
+        write_all(&efd, &1u64.to_ne_bytes());
+        q.post(1, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        assert_eq!(q.take().len(), 1);
+        let (seen, held) = hold();
+        h.send(PumpCmd::Retire {
+            handle: 5,
+            hold: held,
+        });
+        pump.step_with_timeout(0);
+        assert_eq!(Arc::strong_count(&seen), 1);
+        assert!(pump.fired.is_empty());
+    }
+
+    /// One that never fired (its syncobj freed with it) has nothing to
+    /// report, ever: its watch ends and its hold goes at once.
+    #[test]
+    fn a_retired_handle_that_never_fired_keeps_nothing() {
+        let q = FakeQueue::default();
+        let (mut pump, h) = Pump::new(q.clone()).unwrap();
+        h.send(PumpCmd::SetV2(true));
+        let _efd = ready_oneshot(&h, 6, 1 << 33);
+        let (seen, held) = hold();
+        h.send(PumpCmd::Retire {
+            handle: 6,
+            hold: held,
+        });
+        q.post(1, EVENT_BUF_SIZE);
+        pump.step_with_timeout(0);
+        assert!(pump.watches.is_empty() && pump.outbox.is_empty());
+        assert!(q.take().is_empty());
+        assert_eq!(Arc::strong_count(&seen), 1);
+    }
+
+    /// Whatever drops a held record drops its hold too: the record is the
+    /// only thing it is kept for.
+    #[test]
+    fn a_held_record_dropped_any_way_drops_its_hold() {
+        for how in 0..3 {
+            let q = FakeQueue::default();
+            let (mut pump, h) = Pump::new(q.clone()).unwrap();
+            h.send(PumpCmd::SetV2(true));
+            let efd = ready_oneshot(&h, 7, 1 << 34);
+            write_all(&efd, &1u64.to_ne_bytes());
+            let (seen, held) = hold();
+            h.send(PumpCmd::Retire {
+                handle: 7,
+                hold: held,
+            });
+            pump.step_with_timeout(0);
+            assert_eq!(Arc::strong_count(&seen), 2);
+            match how {
+                0 => h.send(PumpCmd::Reset),
+                1 => h.send(PumpCmd::SetV2(false)),
+                // The cookie watched again on another handle, then closed.
+                _ => {
+                    let _efd = ready_oneshot(&h, 8, 1 << 34);
+                    h.send(PumpCmd::Unwatch { handle: 8 });
+                }
+            }
+            pump.step_with_timeout(0);
+            assert_eq!(Arc::strong_count(&seen), 1, "case {how}");
+            assert_eq!(pump.outbox.held(), 0);
+        }
     }
 
     #[test]

@@ -1133,6 +1133,7 @@ impl NvidiaBackend {
                 prepared.buffer(0),
                 prepared.result(),
             );
+            self.reap_syncobj_regs();
         }
         let nodes = self.host_nodes();
         let target_live = self.handles.kind(target).is_some() && !self.handles.is_buried(target);
