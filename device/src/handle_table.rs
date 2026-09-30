@@ -104,6 +104,9 @@ struct Entry {
     buried: bool,
     /// Its slot, charged to the guest process that caused it.
     slot: Charge,
+    /// Which insert made it: unlike the handle's number, never issued again
+    /// (the number space wraps after 2^31 inserts; this one does not).
+    serial: u64,
 }
 
 /// The largest handle issued: a descriptor field read as an i32 must not
@@ -113,6 +116,8 @@ const MAX_ISSUED: u32 = i32::MAX as u32;
 pub struct HandleTable {
     /// Where the search for the next free value starts.
     next: u32,
+    /// Inserts made so far: the next entry's `serial`.
+    inserts: u64,
     table: HashMap<u32, Entry>,
     /// The table's slots, and each guest process's share of them: one for
     /// every handle, and one for every descriptor still closing.
@@ -172,6 +177,7 @@ impl HandleTable {
     pub fn with_limit(limit: usize) -> Self {
         Self {
             next: 1,
+            inserts: 0,
             table: HashMap::new(),
             slots: Pool::new(limit as u64, Self::share_of(limit)),
             closing: Closing::new(),
@@ -246,6 +252,7 @@ impl HandleTable {
             if h == 0 || h > MAX_ISSUED || self.table.contains_key(&h) {
                 continue;
             }
+            self.inserts += 1;
             self.table.insert(
                 h,
                 Entry {
@@ -253,6 +260,7 @@ impl HandleTable {
                     kind,
                     buried: false,
                     slot,
+                    serial: self.inserts,
                 },
             );
             return Ok(h);
@@ -266,6 +274,13 @@ impl HandleTable {
             .get(&handle)
             .map(|e| e.fd.as_raw_fd())
             .ok_or(DeviceError::BadHandle(handle as u64))
+    }
+
+    /// Which insert made `handle`'s entry: two entries a handle number
+    /// named at different times, with the number space wrapped in between,
+    /// have different serials. `None` for no such handle.
+    pub fn serial(&self, handle: u32) -> Option<u64> {
+        self.table.get(&handle).map(|e| e.serial)
     }
 
     /// The descriptor and its kind.
@@ -512,6 +527,20 @@ mod tests {
             let h = t.insert(make_fd(), CTL).unwrap();
             assert!((h as i32) > 0, "{start:#x} issued {h:#x}");
         }
+    }
+
+    /// A number issued again after the space wrapped names a new entry, and
+    /// its serial says so, whatever descriptor number it holds.
+    #[test]
+    fn a_number_issued_again_has_a_new_serial() {
+        let mut t = HandleTable::new();
+        let h = t.insert(make_fd(), CTL).unwrap();
+        let first = t.serial(h).unwrap();
+        t.remove(h).unwrap();
+        t.next = h;
+        assert_eq!(t.insert(make_fd(), CTL).unwrap(), h, "the number again");
+        assert_ne!(t.serial(h), Some(first));
+        assert_eq!(t.serial(h + 1), None);
     }
 
     #[test]
