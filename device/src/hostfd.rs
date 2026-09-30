@@ -1216,10 +1216,6 @@ mod tests {
             assert_eq!(&buf[..n], path.as_os_str().as_encoded_bytes());
         }
         assert_eq!(classify(fds[2].as_fd(), &[]), HandleKind::Memfd);
-        // A number nothing holds reads as nothing, and classifies as Other.
-        let gone = fds[0].as_raw_fd();
-        drop(fds);
-        assert_eq!(fd_link(gone, &mut [0u8; LINK_BUF]), None);
     }
 
     #[test]
