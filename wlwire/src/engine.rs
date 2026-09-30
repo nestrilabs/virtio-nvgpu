@@ -1299,12 +1299,23 @@ impl Engine {
                                 self.stats.dmabufs += 1;
                                 plat.dmabuf_in(&d, tfd).ok()
                             }
-                            FdKind::Blob { size_arg, .. } => {
+                            FdKind::Blob {
+                                size_arg,
+                                offset_arg,
+                            } => {
                                 if d.c != uint(size_arg) as u64 {
                                     return Err(err(
                                         ERR_IMPLEMENTATION,
                                         "blob size disagrees with message".into(),
                                     ));
+                                }
+                                // The copy is the bytes from the offset on,
+                                // so it is read from 0 -- whatever the far
+                                // side says. A guest's offset would name
+                                // bytes past the sealed copy's end to the
+                                // compositor, which some map and read.
+                                if let Some(o) = offset_arg {
+                                    edits.push((args[o as usize].off, 0));
                                 }
                                 Some(
                                     self.blobs.take(d.a, d.c).map_err(|e| {
