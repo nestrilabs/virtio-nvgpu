@@ -196,13 +196,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateInstance(const VkInstanceCreat
       .feat2_khr = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2KHR"),
       .props = (PFN_vkGetPhysicalDeviceProperties)gipa(*out, "vkGetPhysicalDeviceProperties"),
   };
+  int kept = 0;
   pthread_mutex_lock(&lock);
-  for (int i = 0; i < MAXI; i++)
+  for (int i = 0; i < MAXI && !kept; i++)
     if (!insts[i].key) {
       insts[i] = in;
-      break;
+      kept = 1;
     }
   pthread_mutex_unlock(&lock);
+  /* An instance the layer cannot track would get its calls answered by
+   * nothing: refuse it whole, as the driver refuses what it cannot keep. */
+  if (!kept) {
+    if (in.destroy)
+      in.destroy(*out, alloc);
+    *out = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
   return VK_SUCCESS;
 }
 
@@ -280,7 +289,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_GetPhysicalDeviceFeatures2KHR(VkPhysical
   struct inst *in = inst_of(pd);
   if (!in)
     return;
-  (in->feat2_khr ? in->feat2_khr : in->feat2)(pd, f);
+  in->feat2_khr(pd, f);
   if (filtered(in, pd))
     scrub(f);
 }
@@ -329,13 +338,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(VkPhysicalDevice pd,
   struct dev d = {.key = key_of(*out),
                   .gdpa = gdpa,
                   .destroy = (PFN_vkDestroyDevice)gdpa(*out, "vkDestroyDevice")};
+  int kept = 0;
   pthread_mutex_lock(&lock);
-  for (int i = 0; i < MAXD; i++)
+  for (int i = 0; i < MAXD && !kept; i++)
     if (!devs[i].key) {
       devs[i] = d;
-      break;
+      kept = 1;
     }
   pthread_mutex_unlock(&lock);
+  if (!kept) {
+    if (d.destroy)
+      d.destroy(*out, alloc);
+    *out = VK_NULL_HANDLE;
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
   return VK_SUCCESS;
 }
 
@@ -371,13 +387,17 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_gipa(VkInstance instance, 
   HOOK(CreateInstance);
   HOOK(DestroyInstance);
   HOOK(EnumerateDeviceExtensionProperties);
-  HOOK(GetPhysicalDeviceFeatures2);
-  HOOK(GetPhysicalDeviceFeatures2KHR);
   HOOK(CreateDevice);
   HOOK(DestroyDevice);
   if (!instance)
     return NULL;
   struct inst *in = inst_of(instance);
+  /* Only where the next layer has one: an instance of Vulkan 1.0 without
+   * VK_KHR_get_physical_device_properties2 is told there is none. */
+  if (in && in->feat2)
+    HOOK(GetPhysicalDeviceFeatures2);
+  if (in && in->feat2_khr)
+    HOOK(GetPhysicalDeviceFeatures2KHR);
   return in ? in->gipa(instance, name) : NULL;
 }
 
