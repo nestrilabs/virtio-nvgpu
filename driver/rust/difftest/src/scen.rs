@@ -562,7 +562,12 @@ pub fn gen_rm_from(mut r: Rng, seed: u64) -> Scenario {
             put(&mut outer, 0, 4, u64::from(cmd));
             put(&mut outer, 4, 4, u64::from(size));
             let mut nested = r.bytes(size.min(4096) as usize);
-            put(&mut nested, 4, 4, r.below(3));
+            // useFd, one byte, and the padding after it, which is not
+            // read (garbage in it must not make useFd true).
+            put(&mut nested, 4, 1, r.below(3));
+            if r.chance(1, 3) {
+                put(&mut nested, 5, 3, r.below(1 << 24));
+            }
             put(&mut nested, 16, 4, some_fd(&mut r) as u64);
             let p = if r.chance(1, 8) {
                 0

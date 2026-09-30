@@ -291,8 +291,10 @@ void nvgpu_ctrl_vq_cb(struct virtqueue *vq) {
  * A caller that sleeps for its reply (an executor-class request, or one that
  * spun out) never depends on a spinner: it turns the interrupt back on
  * before it sleeps (nvgpu_ctrl_sleep_enter()), and no spinner turns it off
- * while it sleeps. A spinner whose vCPU the host deschedules, or that this
- * kernel preempts, delays only itself. The last spinner out turns the
+ * while it sleeps; so does a caller waiting for ring space or executor
+ * budget, which only replies taken off the ring give back. A spinner whose
+ * vCPU the host deschedules, or that this kernel preempts, delays only
+ * itself. The last spinner out turns the
  * interrupt back on and takes whatever arrived meanwhile.
  */
 static void nvgpu_ctrl_poll_enter(struct nvgpu_device *dev) {
@@ -387,15 +389,24 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
    * find room.
    */
   if (flags & NVGPU_XF_EXECUTOR) {
-    bool took = false;
+    bool took;
+    int wret = 0;
 
     units = xf->indirect ? 1 : r->req->nents + r->resp->nents;
     units = min_t(u32, units, xf->exec_budget);
     /* The condition's last evaluation is the one that ended the wait, so
-     * `took` says whether units are held -- never on an error return. */
-    if (wait_event_killable(xf->exec_wq,
-                            (took = nvgpu_exec_take(xf, units)) ||
-                                READ_ONCE(xf->dead)))
+     * `took` says whether units are held -- never on an error return. The
+     * units come back only as replies are taken off the ring, so the waiter
+     * is a sleeper meanwhile (see the ring-space wait below). */
+    took = nvgpu_exec_take(xf, units);
+    if (!took && !READ_ONCE(xf->dead)) {
+      nvgpu_ctrl_sleep_enter(dev);
+      wret = wait_event_killable(xf->exec_wq,
+                                 (took = nvgpu_exec_take(xf, units)) ||
+                                     READ_ONCE(xf->dead));
+      nvgpu_ctrl_sleep_exit(dev);
+    }
+    if (wret)
       return -EINTR;
     if (!took)
       return -ENODEV;
@@ -410,6 +421,7 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
    */
   for (;;) {
     unsigned long gen;
+    int wret;
 
     spin_lock_irqsave(&xf->lock, irqf);
     if (xf->dead) {
@@ -429,9 +441,21 @@ static int nvgpu_xfer_enqueue(struct nvgpu_device *dev, struct nvgpu_req *r,
 
     if (ret != -ENOSPC)
       break;
-    if (wait_event_killable(xf->space_wq,
-                            READ_ONCE(xf->space_gen) != gen ||
-                                READ_ONCE(xf->dead))) {
+    /*
+     * Room comes back only as replies are taken off the ring. While callers
+     * spin the interrupt is off and they take them -- but a spinner the
+     * scheduler preempted takes nothing until it runs again, and a ring
+     * full of posted or abandoned requests has no waiter of its own to
+     * turn the interrupt on. So this waiter is a sleeper too
+     * (nvgpu_ctrl_sleep_enter()): the interrupt is on, and whatever came
+     * back meanwhile is taken now, while it waits.
+     */
+    nvgpu_ctrl_sleep_enter(dev);
+    wret = wait_event_killable(xf->space_wq,
+                               READ_ONCE(xf->space_gen) != gen ||
+                                   READ_ONCE(xf->dead));
+    nvgpu_ctrl_sleep_exit(dev);
+    if (wret) {
       ret = -EINTR;
       break;
     }

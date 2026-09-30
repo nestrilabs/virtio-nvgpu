@@ -47,6 +47,10 @@ struct nvgpu_sowait {
    * `render` (a DESTROY or the file's close ends its subscribers). */
   u32 render;
   u32 syncobj;
+  /* The file's so_epoch before its WATCH was sent: a DESTROY sent after
+   * that (a later epoch) may have ended the syncobj it names, one sent
+   * after its WATCH ran cannot have (nvgpu_sowait_forget()). */
+  u64 epoch;
   refcount_t ref;
   atomic_t fired;
   struct list_head subs; /* nvgpu_sowait_sub, under nvgpu_sowait_lock */
@@ -229,7 +233,7 @@ static void nvgpu_sowait_deliver(struct nvgpu_ev_consumer *c, u32 kind,
 /* A new registration object for `cookie`, registered and hashed. */
 static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
                                              u64 cookie, u32 render,
-                                             u32 syncobj) {
+                                             u32 syncobj, u64 epoch) {
   struct nvgpu_sowait *s;
   unsigned long flags;
   int ret;
@@ -243,6 +247,7 @@ static struct nvgpu_sowait *nvgpu_sowait_new(struct nvgpu_device *dev,
   s->cookie = cookie;
   s->render = render;
   s->syncobj = syncobj;
+  s->epoch = epoch;
   refcount_set(&s->ref, 1);
   INIT_LIST_HEAD(&s->subs);
   ret = nvgpu_ev_register(dev, &s->ev.c, NVGPU_EVKEY_COOKIE(cookie));
@@ -290,13 +295,15 @@ static struct nvgpu_sowait *nvgpu_sowait_get(struct nvgpu_fd *nfd,
                                              u32 syncobj, u64 point,
                                              u32 flags) {
   struct nvgpu_device *dev = nfd->dev;
+  /* Before the WATCH goes: see struct nvgpu_sowait's `epoch`. */
+  u64 epoch = READ_ONCE(nfd->so_epoch);
   struct nvgpu_sowait *s, *t;
   u64 args[5], res[2];
   u64 cookie;
   int ret;
 
   cookie = nvgpu_ev_new_cookie(dev);
-  s = nvgpu_sowait_new(dev, cookie, nfd->handle, syncobj);
+  s = nvgpu_sowait_new(dev, cookie, nfd->handle, syncobj, epoch);
   if (IS_ERR(s))
     return s;
   args[0] = nfd->handle;
@@ -316,7 +323,7 @@ static struct nvgpu_sowait *nvgpu_sowait_get(struct nvgpu_fd *nfd,
   if (res[0] <= U32_MAX)
     return ERR_PTR(-EPROTO); /* a legacy handle's cookie: not a registration */
   t = nvgpu_sowait_find(dev, res[0]);
-  return t ? t : nvgpu_sowait_new(dev, res[0], nfd->handle, syncobj);
+  return t ? t : nvgpu_sowait_new(dev, res[0], nfd->handle, syncobj, epoch);
 }
 
 /*
@@ -327,8 +334,16 @@ static struct nvgpu_sowait *nvgpu_sowait_get(struct nvgpu_fd *nfd,
  * backend drops or orphans the registrations themselves; a guest waiter
  * inside SYNCOBJ_WAIT holds its own references and finds out on its next
  * poll.
+ *
+ * Only registrations whose WATCH may have named the destroyed syncobj: made
+ * before the DESTROY was sent (an epoch before `before`, the DESTROY's own).
+ * The host gives the number to the next syncobj the moment the DESTROY
+ * runs, and a thread that makes one and subscribes to it before this runs
+ * -- a posted DESTROY returns at once -- has registrations under the same
+ * (file, number) that are the new syncobj's, and keep their subscribers.
  */
-static void nvgpu_sowait_forget(struct nvgpu_fd *nfd, u32 syncobj, bool all) {
+static void nvgpu_sowait_forget(struct nvgpu_fd *nfd, u32 syncobj, bool all,
+                                u64 before) {
   struct nvgpu_sowait_sub *sub, *n;
   struct nvgpu_sowait *s, *found;
   unsigned long flags;
@@ -341,7 +356,8 @@ static void nvgpu_sowait_forget(struct nvgpu_fd *nfd, u32 syncobj, bool all) {
     spin_lock_irqsave(&nvgpu_sowait_lock, flags);
     hash_for_each(nvgpu_sowaits, bkt, s, node) {
       if (s->ev.dev == nfd->dev && s->render == nfd->handle &&
-          (all || s->syncobj == syncobj) && s->subs_ref) {
+          (all || (s->syncobj == syncobj && s->epoch < before)) &&
+          s->subs_ref) {
         found = s;
         break;
       }
@@ -364,7 +380,7 @@ static void nvgpu_sowait_forget(struct nvgpu_fd *nfd, u32 syncobj, bool all) {
 }
 
 void nvgpu_fence_file_release(struct nvgpu_fd *nfd) {
-  nvgpu_sowait_forget(nfd, 0, true);
+  nvgpu_sowait_forget(nfd, 0, true, U64_MAX);
   nvgpu_fence_reap();
 }
 
@@ -778,7 +794,7 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
   struct nvgpu_sowait_owner *owner;
   struct nvgpu_sowait *s;
   struct eventfd_ctx *ctx;
-  bool now = false, drop = false;
+  bool now = false, drop = false, charged = false;
   unsigned long flags;
   u64 id;
   long ret;
@@ -814,7 +830,8 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
     now = true;
   } else {
     sub->owner = nvgpu_sowait_charge_locked(&owner);
-    if (sub->owner) {
+    charged = sub->owner != NULL;
+    if (charged) {
       list_add_tail(&sub->node, &s->subs);
       if (!s->subs_ref) {
         refcount_inc(&s->ref);
@@ -823,8 +840,16 @@ static long nvgpu_fence_eventfd(struct nvgpu_fd *nfd, unsigned int cmd,
     }
   }
   spin_unlock_irqrestore(&nvgpu_sowait_lock, flags);
+  /*
+   * From here a listed `sub` is no longer ours to look at: the delivery
+   * (EV_READY, from an interrupt) or a DESTROY's forget on another thread
+   * may take it off the list and free it at any moment. What the charge
+   * said was read under the lock; reading sub->owner here instead read
+   * freed memory, found the NULL the uncharge had left, and freed the sub
+   * -- and put its eventfd -- a second time.
+   */
   kfree(owner); /* unless the charge took it */
-  if (!now && !sub->owner) {
+  if (!now && !charged) {
     /* Over the caller's share of the guest's subscribers. */
     kfree(sub);
     eventfd_ctx_put(ctx);
@@ -923,7 +948,9 @@ static long nvgpu_fence_handle_to_fd(struct nvgpu_fd *nfd, unsigned int cmd,
  *    natively the second of two destroys fails;
  *  - a synchronous DESTROY (of a handle so_live does not hold -- one that
  *    was never ours, or one a create has not been noted for yet) runs under
- *    so_lock too, and one that succeeds bumps so_sync;
+ *    so_lock too, and one that may have destroyed anything bumps so_sync:
+ *    one that succeeded, and one whose answer never came (abandoned on a
+ *    fatal signal or a timeout, it still runs on the host);
  *  - a create notes its handle only if so_sync has not moved since before it
  *    was sent: if it has, a synchronous DESTROY may have taken the new
  *    handle between the host's answer and the note, so the handle is left
@@ -989,16 +1016,21 @@ fail:
 static long nvgpu_so_destroy(struct nvgpu_fd *nfd, void *karg) {
   struct nvgpu_fence_call p = {.nfd = nfd};
   struct drm_syncobj_destroy a;
+  u64 epoch;
   long ret;
 
   /* Read once: the handle whose subscribers go is the one destroyed. */
   memcpy(&a, karg, sizeof(a));
   mutex_lock(&nfd->so_lock);
+  /* Before the DESTROY is sent: a WATCH that reads this or later was sent
+   * after it, and names whatever syncobj has the number then. */
+  epoch = nfd->so_epoch + 1;
+  WRITE_ONCE(nfd->so_epoch, epoch);
   if (!a.pad && a.handle && xa_erase(&nfd->so_live, a.handle)) {
     ret = nvgpu_so_post_destroy(nfd, &a);
     if (!ret) {
       mutex_unlock(&nfd->so_lock);
-      nvgpu_sowait_forget(nfd, a.handle, false);
+      nvgpu_sowait_forget(nfd, a.handle, false, epoch);
       return 0;
     }
     /* Not sent (no memory, the device gone): still live, and the
@@ -1006,13 +1038,23 @@ static long nvgpu_so_destroy(struct nvgpu_fd *nfd, void *karg) {
     xa_store(&nfd->so_live, a.handle, xa_mk_value(1), GFP_KERNEL);
   }
   ret = nvgpu_fence_call(&p, nfd->handle, DRM_IOCTL_SYNCOBJ_DESTROY, &a, true);
-  if (!ret) {
+  /*
+   * Counted as a destroy whenever it may have been one, not only when the
+   * answer says so: a DESTROY abandoned on a fatal signal or a timeout
+   * (-EINTR, -ETIMEDOUT) still runs on the host, and one whose reply was
+   * malformed ran too. Uncounted, a create answered with this number just
+   * before would be noted after it, and so_live would hold a handle the
+   * host no longer does. Only -EINVAL -- the host's answer for a pad or a
+   * handle it does not hold, or a refusal before sending -- destroyed
+   * nothing.
+   */
+  if (ret != -EINVAL) {
     WRITE_ONCE(nfd->so_sync, nfd->so_sync + 1);
     xa_erase(&nfd->so_live, a.handle);
   }
   mutex_unlock(&nfd->so_lock);
   if (!ret)
-    nvgpu_sowait_forget(nfd, a.handle, false);
+    nvgpu_sowait_forget(nfd, a.handle, false, epoch);
   return ret;
 }
 

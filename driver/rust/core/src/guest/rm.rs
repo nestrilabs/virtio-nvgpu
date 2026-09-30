@@ -1099,7 +1099,9 @@ fn modeset_v1_inner<E: Env + ?Sized>(env: &mut E, cmd: u32, uarg: u64) -> Result
         env.copy_from_user(part(r, at, nz)?, user_nested)?;
         // REGISTER_SURFACE names its memory by descriptor when useFd is set.
         if le32(&outer, 0) == Some(NVKMS_REGISTER_SURFACE) && nz >= NVKMS_SURFACE_FD_OFFSET + 8 {
-            let use_fd = le32(r, at + 4).unwrap_or(0);
+            // useFd is an NvBool, one byte: the three after it are padding,
+            // which NVKMS never reads.
+            let use_fd = r.get(at + 4).copied().unwrap_or(0);
             if use_fd != 0 {
                 let fd = le32(r, at + NVKMS_SURFACE_FD_OFFSET).unwrap_or(0) as i32;
                 match env.handle_for_fd(fd) {
