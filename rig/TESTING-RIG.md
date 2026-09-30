@@ -26,6 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy` and `efdrace` merged | stage1, compat, render (with and without compute), secneg and wayland under nesbox, every knob off and every knob on, C module after the dma-buf merge and C and Rust modules after the last | "Regression of the knobs merge" |
 | 2026-09-30 | branch `efdrace`: the event pump's lost wakeup (device/src/pump.rs) and `nvgpu-syncobj-race`'s LATE/LOST diagnosis | the owners phase under nesbox, C and Rust modules, with and without a widened race window and host and guest load, before and after the fix; the compat probe six times | "Syncobj eventfds that never fired" |
 | 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
 | 2026-09-30 | branch `knob-dmabuf`: `--allow-dmabuf-export` | stage1, compat, render and secneg with the switch off and on, nesbox, Rust module | "dma-buf export through RM" |
@@ -659,6 +660,56 @@ rig/rig-tools/portal-identify.sh                   # the picker appears
 # running `run-guest.sh --inject ... ` is $XDG_RUNTIME_DIR/nvgpu-run.*/inject.sock):
 rig/rig-tools/portal-identify.sh --inject "$XDG_RUNTIME_DIR"/nvgpu-run.*/inject.sock
 ```
+
+## Regression of the knobs merge
+
+2026-09-30, branch `integrate36`: display-passthrough with the knob branches
+merged in turn, the backend, both guest modules and the image built from
+each merge that passed CI (`.rig/cache/knobmerge/<rev>`), the installed
+nesbox (with `patches/nesbox/0001`), wayland against the headless sway, and
+secneg with `nvgpu_secneg_kms=none`. **Off** is every knob at its default.
+**On** is `NVGPU_COMPUTE=1 NVGPU_RM_ALLOW_GROUP=thermal,health,debug,profiling
+NVGPU_DMABUF_EXPORT=1 NVGPU_VRAM_LIMIT=8192`, and after the `knob-deploy`
+merge the tuning knobs too: `NVGPU_CORE_SCHED=shared NVGPU_QUEUE_POLL_US=10
+NVGPU_FIFO_DISABLE_RATES=10,20,400,320 NVGPU_WINDOW_PRESET=creative
+NVGPU_VMM_FSIZE_MIB=32768 NVGPU_GUEST_RT_SPIN_US=50
+NVGPU_GUEST_ASYNC_FENCE_WATCH=1 NVGPU_GUEST_THP=madvise
+NVGPU_GUEST_HALTPOLL=1`. Compute is on in every "on" run, so it has no
+separate render row. Counts are pass/fail/skip; secneg's are
+sec-negative's own.
+
+| probe | `d813908` (to `knob-dmabuf`), C, off | the same, on | `0032494` (all merged), C, off | C, on | Rust, off | Rust, on |
+|---|---|---|---|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 |
+| compat | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 |
+| render | 10/0/1 | 11/0/1 | 10/0/1 | 11/0/1 | 10/0/1 | 11/0/1 |
+| render, `NVGPU_COMPUTE=1` | 10/0/1, cuda-smoke ALL PASS | -- | 10/0/1, the same | -- | 10/0/1, the same | -- |
+| secneg | 22 passed, 6 skipped | 23 passed, 5 skipped | 22 passed, 6 skipped | 23 passed, 5 skipped | 22 passed, 6 skipped | 23 passed, 5 skipped |
+| wayland | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 |
+
+Off, secneg's skips are the five KMS tests and T17, the dma-buf export's
+control, whose escape is refused; T14-T16 are the allowlist's
+NOT_SUPPORTED, and T18-T20 refused. On, T14-T16 come back with each rule's
+status (0x1b or 0x1f) without RM and a temperature reading of 41 to 48 C,
+T17 exports the process's own memory (no CPU mapping of it), T18-T20 are
+refused, and T13 is served 20 times, the burst it was given, then refused.
+The render probe on adds `nvgpu-rm-dmabuf --loops 3` (three exports,
+imported by the render node; EGL and Vulkan SKIP as natively) and
+`cuda-dmabuf` (SKIP: no dma-buf export on a GeForce card); cuda-smoke sees
+the device as 8192 MiB, and the backend's log ends with at most 514 of
+8192 MiB of video memory held, a window of 8192 MiB, and the backend and
+the VMM sharing one core-scheduling cookie. The compat probe's
+signal-to-eventfd latency was p99 under 512 us in all four `0032494` sets.
+
+Between the two: after the `knob-deploy` merge (`fe0cd73`) every probe
+passed off and on but secneg on, whose T13 wanted 30 calls served before
+the refusal, the default burst's three quarters, and got the 20 it was
+configured for; T13 now reads the burst from `nvgpu_fifo_disable_rates=`,
+which the launcher puts on the guest's command line (`cb2d358`). There,
+with the Rust module and every knob on, compat's `nvgpu-syncobj-race`
+failed once, all eight owners' eventfds never firing: the pump's lost
+wakeup `efdrace` fixes ("Syncobj eventfds that never fired"), which
+`0032494` has.
 
 ## Regression of the merged tree
 
