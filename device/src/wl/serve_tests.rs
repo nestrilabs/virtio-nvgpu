@@ -318,10 +318,13 @@ fn gate<'a>(
     semsurf: &'a crate::semsurf::SemsurfPolicy,
     taint: &'a crate::inject::SharedTaint,
 ) -> crate::exportgate::ExportGate<'a> {
+    static GUEST_ONLY: std::sync::LazyLock<crate::exportgate::GuestOnly> =
+        std::sync::LazyLock::new(Default::default);
     crate::exportgate::ExportGate {
         semsurf,
         injected: None,
         taint,
+        guest_only: &GUEST_ONLY,
     }
 }
 

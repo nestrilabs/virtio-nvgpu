@@ -184,6 +184,21 @@ struct Args {
     #[arg(long)]
     allow_compute: bool,
 
+    /// Serve RM's EXPORT_TO_DMABUF_FD: a guest process's own video memory
+    /// as a dma-buf (CUDA's cuMemGetHandleForAddressRange with a dma-buf
+    /// handle, NVIDIA's GBM through RM), in one call of at most 128 handles,
+    /// of an RM client the calling guest process made, within a per-VM
+    /// budget of 256 exports and 8 GiB. The guest gets a dma-buf of its own
+    /// that its render nodes import and it can pass to its own processes; it
+    /// cannot be CPU-mapped, and it never leaves the VM: no export of it
+    /// reaches the host compositor, a KMS file or a host dma-buf handle.
+    ///
+    /// Off by default, and the escape refused: it reaches nvidia.ko's
+    /// dma-buf exporter, which nothing else here does (SECURITY.md,
+    /// "dma-buf export through RM"; DEPLOY.md, "Backend flags").
+    #[arg(long)]
+    allow_dmabuf_export: bool,
+
     /// The shared window, in MiB: the guest-visible region device memory
     /// is mapped into, which bounds how much GPU memory this VM's
     /// processes can have CPU-mapped at once. A multiple of 64, at least
@@ -2105,8 +2120,14 @@ fn main() -> anyhow::Result<()> {
         // fence.rs): waits are polls here and sleeps in the guest.
         fences: true,
         allow_compute: args.allow_compute,
+        allow_dmabuf_export: args.allow_dmabuf_export,
         ..BackendConfig::default()
     };
+    if config.allow_dmabuf_export {
+        log::info!(
+            "--allow-dmabuf-export: RM's EXPORT_TO_DMABUF_FD is served; its dma-bufs stay in the VM"
+        );
+    }
     if config.allow_compute {
         log::info!(
             "--allow-compute: UVM, the UVM aperture and memory registered by its pages are served"

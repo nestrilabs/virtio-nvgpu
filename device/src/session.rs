@@ -74,6 +74,13 @@ pub struct BackendConfig {
     /// (BCAP_OS_DESC). Off by default: graphics, video and display need none
     /// of them (SECURITY.md, "Compute").
     pub allow_compute: bool,
+    /// Serve RM's EXPORT_TO_DMABUF_FD (`--allow-dmabuf-export`): a guest
+    /// process's own video memory as a dma-buf, for the guest's own
+    /// importers, never leaving the VM (rmexport.rs; BCAP_DMABUF_EXPORT).
+    /// Off by default, and the escape refused (SECURITY.md, "dma-buf export
+    /// through RM"). Set through `NvidiaBackend::allow_dmabuf_export`,
+    /// which marks the export gate too.
+    pub allow_dmabuf_export: bool,
 }
 
 impl BackendConfig {
@@ -99,6 +106,9 @@ impl BackendConfig {
         }
         if self.allow_compute {
             caps |= BCAP_COMPUTE;
+        }
+        if self.allow_dmabuf_export {
+            caps |= BCAP_DMABUF_EXPORT;
         }
         caps
     }

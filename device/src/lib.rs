@@ -55,6 +55,7 @@ mod replay;
 pub mod rmallow;
 pub mod rmchan;
 pub mod rmctl;
+pub mod rmexport;
 pub mod rmmem;
 pub mod rmshare;
 pub mod sandbox;

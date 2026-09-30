@@ -421,6 +421,34 @@ pub struct ProcId {
     pub euid: u32,
 }
 
+/// What follows the [`ProcId`] of an `NV_ESC_EXPORT_TO_DMABUF_FD` IOCTL
+/// ([`BCAP_DMABUF_EXPORT`]): the render file the new dma-buf is imported
+/// into on the host, one the calling guest process opened. The backend
+/// answers with the block RM left, its `fd` field -1 (the guest writes its
+/// own descriptor there), and, when RM made the dma-buf, a
+/// [`DmabufExportResp`] after it as the reply's deep block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DmabufExportReq {
+    /// The render file's handle.
+    pub render: u32,
+    /// Zero.
+    pub reserved: u32,
+}
+
+/// The dma-buf an `NV_ESC_EXPORT_TO_DMABUF_FD` made, as the GEM object it
+/// is in the render file [`DmabufExportReq`] named.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DmabufExportResp {
+    /// The GEM handle, in that render file.
+    pub gem: u32,
+    /// `GEM_IDENTIFY_OBJECT`'s answer for it: `NV_GEM_OBJECT_DMABUF`.
+    pub object_type: u32,
+    /// The dma-buf's size.
+    pub size: u64,
+}
+
 /// Response payload for `MsgType::Ioctl`, following a `MsgHeader`.
 ///
 /// Layout: `MsgHeader` | `IoctlResp` | `data_len` bytes | `nested_len` bytes |
@@ -615,6 +643,11 @@ pub const BCAP_INJECT: u32 = 1 << 11;
 /// OPEN makes, RM's event queue) is reported once per [`W_ARM`], not once
 /// per host event. Offered only to a guest that said [`GCAP_ARMS_READY`].
 pub const BCAP_ARMED_READY: u32 = 1 << 12;
+/// RM's `NV_ESC_EXPORT_TO_DMABUF_FD` is served (`--allow-dmabuf-export`), in
+/// the form [`DmabufExportReq`] says, to a guest that sends the calling
+/// process ([`BCAP_PROC_ID`]). Without it the backend refuses the escape, and
+/// the guest forwards it as it always has.
+pub const BCAP_DMABUF_EXPORT: u32 = 1 << 13;
 
 /// `HelloReq::guest_caps` bits.
 ///
@@ -973,6 +1006,8 @@ const _: () = {
     assert!(size_of::<EvFence>() == 16);
     assert!(size_of::<EvHotplug>() == 8);
     assert!(size_of::<CardRecord>() == 16);
+    assert!(size_of::<DmabufExportReq>() == 8);
+    assert!(size_of::<DmabufExportResp>() == 16);
 };
 
 #[cfg(test)]
@@ -1045,6 +1080,7 @@ mod tests {
         ("NVGPU_BCAP_COMPUTE", BCAP_COMPUTE as u64),
         ("NVGPU_BCAP_INJECT", BCAP_INJECT as u64),
         ("NVGPU_BCAP_ARMED_READY", BCAP_ARMED_READY as u64),
+        ("NVGPU_BCAP_DMABUF_EXPORT", BCAP_DMABUF_EXPORT as u64),
         ("NVGPU_GCAP_UVM_APERTURE", GCAP_UVM_APERTURE as u64),
         ("NVGPU_GCAP_PROC_ID", GCAP_PROC_ID as u64),
         ("NVGPU_GCAP_PROC_EUID", GCAP_PROC_EUID as u64),
@@ -1206,6 +1242,18 @@ mod tests {
                 [path_len, content_len]
             ),
             mirror!("nvgpu_proc_id", false, ProcId, [start_ns, tgid, euid]),
+            mirror!(
+                "nvgpu_dmabuf_export_req",
+                false,
+                DmabufExportReq,
+                [render, reserved]
+            ),
+            mirror!(
+                "nvgpu_dmabuf_export_resp",
+                false,
+                DmabufExportResp,
+                [gem, object_type, size]
+            ),
             mirror!(
                 "nvgpu_hello_req",
                 false,

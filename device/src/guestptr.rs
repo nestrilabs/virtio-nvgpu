@@ -357,10 +357,11 @@ pub(crate) fn rm_escape(cmd: u32, params: &[u8]) -> Result<Plan<'static>, Errno>
         // turns either into a guest descriptor, so the export leaked a
         // descriptor pinning video memory in this process per call and
         // handed the guest a number that meant nothing to it (S-15). Refused
-        // until there is a consumer to translate it for; NVIDIA's GBM and
-        // CUDA's dma-buf export take this path, and fail as on a driver
-        // without dma-buf support. Whatever the ABI policy: this check runs
-        // before any profile is known.
+        // here: NVIDIA's GBM and CUDA's dma-buf export take this path, and
+        // fail as on a driver without dma-buf support. With
+        // `--allow-dmabuf-export` the backend serves the translated form
+        // before this is reached (nvidia/dmabuf.rs). Whatever the ABI
+        // policy: this check runs before any profile is known.
         NV_ESC_EXPORT_TO_DMABUF_FD => {
             log::warn!(
                 "EXPORT_TO_DMABUF_FD refused: the dma-buf it makes would be the \

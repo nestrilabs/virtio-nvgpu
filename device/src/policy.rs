@@ -45,6 +45,9 @@ pub struct BackendHooks {
     semsurf: Arc<SemsurfPolicy>,
     /// Capture injection: the dma-bufs no re-home may export (inject/).
     inject_taint: crate::inject::SharedTaint,
+    /// `--allow-dmabuf-export`: RM's dma-bufs, which stay in the VM
+    /// (exportgate.rs).
+    guest_only: crate::exportgate::GuestOnly,
 }
 
 impl BackendHooks {
@@ -66,7 +69,14 @@ impl BackendHooks {
             nvkms,
             semsurf,
             inject_taint: Default::default(),
+            guest_only: Default::default(),
         }
+    }
+
+    /// With the backend's mark of the exporter that stays in the VM.
+    pub fn with_guest_only(mut self, g: crate::exportgate::GuestOnly) -> Self {
+        self.guest_only = g;
+        self
     }
 
     fn export_gate(&self) -> crate::exportgate::ExportGate<'_> {
@@ -74,6 +84,7 @@ impl BackendHooks {
             semsurf: &self.semsurf,
             injected: None,
             taint: &self.inject_taint,
+            guest_only: &self.guest_only,
         }
     }
 

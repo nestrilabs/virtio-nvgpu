@@ -78,6 +78,8 @@ pod! {
     OsDescHdr { nruns, flags }
     OsDescRun { gpa, pages, reserved }
     ProcId { start_ns, tgid, euid }
+    DmabufExportReq { render, reserved }
+    DmabufExportResp { gem, object_type, size }
     IoctlResp { data_len, nested_len, deep_len }
     MmapReq { size, offset, prot, padding }
     MmapResp { guest_phys_addr, size, mapping_id, caching, flags, reserved }

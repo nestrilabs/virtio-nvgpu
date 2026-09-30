@@ -367,6 +367,10 @@ impl Vm {
             c.kms_card = cfg & CFG_KMS_CARD != 0;
             c.fences = cfg & CFG_FENCES != 0;
         }
+        // RM's dma-buf export needs the calling process: on with it.
+        if cfg & CFG_PROC_ID != 0 {
+            be.allow_dmabuf_export();
+        }
         if cfg & CFG_RAM != 0 {
             be.set_guest_ram(Some(guest_ram()));
         }

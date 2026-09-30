@@ -178,6 +178,12 @@ impl NvidiaBackend {
             }
         }
 
+        // With --allow-dmabuf-export, EXPORT_TO_DMABUF_FD in the form the
+        // guest translates (nvidia/dmabuf.rs); refused just below otherwise.
+        if self.serves_dmabuf_export(escape) {
+            return self.serve_dmabuf_export(host_fd, req);
+        }
+
         // An escape the host's table says carries a descriptor, with no
         // translation here, would reach the host with the guest's number in
         // it -- naming whatever this process has open under that number --
