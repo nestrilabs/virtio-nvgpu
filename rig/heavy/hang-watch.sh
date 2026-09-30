@@ -79,6 +79,6 @@ for i in $(seq 1 "$RUNS"); do
         break
     done
     wait "$rp" 2>/dev/null
-    echo "HANGWATCH run $i end $(date +%s) stalls=$hangs"
+    echo "HANGWATCH run $i end $(date +%s) stalls=$hangs last: $(grep -a HEAVY_ "$OUT/app.log" 2>/dev/null | tail -n 1 | grep -ao 'HEAVY_.*')"
 done
 echo "HANGWATCH total runs=$RUNS stalls=$hangs"

@@ -529,7 +529,9 @@ would be lost, and a guest waiting on it would hang.
   runs, none stalled (4, above).
 - **Godot's GL scene hung once as it exited** (1 of 8 guest runs, crosvm),
   with no message crossing to the host until the watchdog. Not reproduced:
-  14 more runs under crosvm, each watched by `hang-watch.sh`, all exited.
+  36 more runs under crosvm, each watched by `hang-watch.sh`, all rendered
+  their 20 s and exited. Still unexplained; at one in eight, 36 clean runs
+  would happen by chance about one time in 120.
 
 ### What would close the rest
 
