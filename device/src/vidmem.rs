@@ -51,11 +51,12 @@
 //! when the last of those goes. SECURITY.md, "Video memory limit", has what
 //! this leaves a VM able to do.
 //!
-//! **What the guest is told.** nvidia-smi and NVML read video memory sizes
-//! from NV2080_CTRL_CMD_FB_GET_INFO_V2, and so do the Vulkan driver (heap
-//! size and VK_EXT_memory_budget) and CUDA (cuMemGetInfo): measured with
-//! rig/heavy/rmlog.c on the rig. The guest module turns the V1 control into
-//! V2, so V2 is the one to rewrite. With a limit, its sizes -- RAM_SIZE,
+//! **What the guest is told.** nvidia-smi, NVML and CUDA (cuMemGetInfo,
+//! cuDeviceTotalMem) read video memory sizes from
+//! NV2080_CTRL_CMD_FB_GET_INFO_V2, and the Vulkan driver (heap size and
+//! VK_EXT_memory_budget) from the V1 NV2080_CTRL_CMD_FB_GET_INFO, whose
+//! list the guest sends behind its pointer: measured with rig/heavy/rmlog.c
+//! on the rig. Both are rewritten. With a limit, their sizes -- RAM_SIZE,
 //! TOTAL_RAM_SIZE, HEAP_SIZE, MAPPABLE_HEAP_SIZE, USABLE_RAM_SIZE -- say no
 //! more than the limit, and its free ones -- HEAP_FREE, LARGEST_FREE_REGION
 //! and HEAP_RECLAIMABLE -- no more than what the VM has left of it; each is
@@ -181,8 +182,11 @@ pub(crate) enum Pending {
         at: Vec<(usize, Arc<Charge>)>,
         records: Vec<Charge>,
     },
-    /// Replies to rewrite.
-    FbInfo,
+    /// Replies to rewrite: FB_GET_INFO (the list after the parameters,
+    /// where its pointer's block goes) or _V2 (the list inside them).
+    FbInfo {
+        v1: bool,
+    },
     HeapInfo,
     AllocMemoryLimit,
 }
@@ -541,7 +545,7 @@ impl Vram {
                     out.made.push((client, h, parent));
                 }
             }
-            Pending::FbInfo => o.rewrite_fb_info(reply),
+            Pending::FbInfo { v1 } => o.rewrite_fb_info(reply, v1),
             Pending::HeapInfo => o.rewrite_heap_info(reply),
             Pending::AllocMemoryLimit => {
                 if ok(l.nvos02_status, reply)
@@ -705,8 +709,10 @@ impl On {
         let word = |at: usize| le::u32_at(p, at);
         let half = |at: usize| le::uint_at(p, at, 2).map(|v| v as u32);
         let counted = |h: u32| self.handles.get(&(client, h)).map(|x| x.mem.clone());
-        if cmd == l.nv2080_ctrl_cmd_fb_get_info_v2 {
-            return Pending::FbInfo;
+        if cmd == l.nv2080_ctrl_cmd_fb_get_info_v2 || cmd == l.nv2080_ctrl_cmd_fb_get_info {
+            return Pending::FbInfo {
+                v1: cmd == l.nv2080_ctrl_cmd_fb_get_info,
+            };
         }
         if cmd == l.nv0000_ctrl_cmd_os_unix_export_object_to_fd
             && size == l.unix_export_object_to_fd_sizeof
@@ -817,22 +823,37 @@ impl On {
         (clamp(limit), clamp(limit.saturating_sub(used)))
     }
 
-    /// NV2080_CTRL_CMD_FB_GET_INFO_V2's reply: the NVOS54 block, then the
-    /// list RM filled in.
-    fn rewrite_fb_info(&self, reply: &mut [u8]) {
+    /// NV2080_CTRL_CMD_FB_GET_INFO's or _V2's reply: the NVOS54 block, its
+    /// parameters, and for V1 the block its list pointer addressed, which
+    /// the guest sends and gets back after them (nvidia/rm.rs
+    /// NvidiaBackend::dispatch_nested). Each entry RM filled in is read
+    /// where the release puts it, and the count is bounded by RM's maximum
+    /// and by the bytes there are.
+    fn rewrite_fb_info(&self, reply: &mut [u8], v1: bool) {
         let l = self.l;
+        let (size, count_at) = if v1 {
+            (l.fb_get_info_sizeof, l.fb_get_info_fb_info_list_size)
+        } else {
+            (l.fb_get_info_v2_sizeof, l.fb_get_info_v2_fb_info_list_size)
+        };
         if le::u32_at(reply, l.nvos54_status) != Some(l.nv_ok)
-            || le::u32_at(reply, l.nvos54_params_size) != Some(l.fb_get_info_v2_sizeof as u32)
+            || le::u32_at(reply, l.nvos54_params_size) != Some(size as u32)
         {
             return;
         }
         let base = l.nvos54_sizeof;
-        let Some(p) = reply.get_mut(base..base + l.fb_get_info_v2_sizeof) else {
+        let Some(n) = le::u32_at(reply, base + count_at) else {
             return;
         };
-        let n = le::u32_at(p, l.fb_get_info_v2_fb_info_list_size)
-            .unwrap_or(0)
-            .min(l.nv2080_ctrl_fb_info_max_list_size) as usize;
+        let n = n.min(l.nv2080_ctrl_fb_info_max_list_size) as usize;
+        let (list, end) = if v1 {
+            (base + size, reply.len())
+        } else {
+            (base + l.fb_get_info_v2_fb_info_list, base + size)
+        };
+        let Some(p) = reply.get_mut(list..end) else {
+            return;
+        };
         let (limit, free) = self.kib();
         let sizes = [
             l.nv2080_ctrl_fb_info_index_ram_size,
@@ -847,7 +868,10 @@ impl On {
             l.nv2080_ctrl_fb_info_index_heap_reclaimable,
         ];
         for i in 0..n {
-            let e = l.fb_get_info_v2_fb_info_list + i * l.fb_info_sizeof;
+            let e = i * l.fb_info_sizeof;
+            if e + l.fb_info_sizeof > p.len() {
+                break;
+            }
             let (Some(index), Some(data)) = (
                 le::u32_at(p, e + l.fb_info_index),
                 le::u32_at(p, e + l.fb_info_data),
@@ -1444,6 +1468,58 @@ mod tests {
                 run(&mut big, p(2), NV_ESC_RM_CONTROL, &req, l.nvos54_status, 0).unwrap();
             assert_eq!(fb_data(l, &reply, 0), 33_389_568);
             assert_eq!(fb_data(l, &reply, 5), 28_344_768);
+        }
+    }
+
+    /// FB_GET_INFO, as the Vulkan driver asks for its heap and budget: the
+    /// list is the block its pointer addressed, after the 16 bytes of
+    /// parameters, and is rewritten there, as far as it goes.
+    #[test]
+    fn fb_get_info_v1_is_rewritten_in_the_block_after_its_parameters() {
+        for (l, ver) in layouts() {
+            let mut v = vram(4096, ver);
+            alloc(&mut v, l, p(1), 0x10, 96 * MIB).unwrap();
+            let list = [
+                (l.nv2080_ctrl_fb_info_index_ram_size, 33_389_568),
+                (l.nv2080_ctrl_fb_info_index_usable_ram_size, 33_011_840),
+                (l.nv2080_ctrl_fb_info_index_heap_free, 28_280_000),
+                (0xb, 512),
+            ];
+            let mut params = vec![0u8; l.fb_get_info_sizeof];
+            put_u32(
+                &mut params,
+                l.fb_get_info_fb_info_list_size,
+                list.len() as u32,
+            );
+            let mut deep = vec![0u8; list.len() * l.fb_info_sizeof];
+            for (i, (index, data)) in list.iter().enumerate() {
+                put_u32(&mut deep, i * l.fb_info_sizeof + l.fb_info_index, *index);
+                put_u32(&mut deep, i * l.fb_info_sizeof + l.fb_info_data, *data);
+            }
+            let mut req = control(l, l.nv2080_ctrl_cmd_fb_get_info, &params);
+            let mut pend = v.before(NV_ESC_RM_CONTROL, &req);
+            v.admit(&mut pend, p(2)).unwrap();
+            req.extend_from_slice(&deep);
+            let full = req.len();
+            v.after(pend, p(2), &mut req);
+            let data = |r: &[u8], i: usize| {
+                let e = l.nvos54_sizeof + l.fb_get_info_sizeof + i * l.fb_info_sizeof;
+                u32_at(r, e + l.fb_info_data).unwrap()
+            };
+            let got: Vec<u32> = (0..list.len()).map(|i| data(&req, i)).collect();
+            assert_eq!(got, vec![4096 << 10, 4096 << 10, 4000 << 10, 512], "{ver}");
+            assert_eq!(req.len(), full);
+            // A count past the block the guest sent reads no further.
+            let mut req = control(l, l.nv2080_ctrl_cmd_fb_get_info, &params);
+            put_u32(
+                &mut req,
+                l.nvos54_sizeof + l.fb_get_info_fb_info_list_size,
+                1000,
+            );
+            let pend = v.before(NV_ESC_RM_CONTROL, &req);
+            req.extend_from_slice(&deep[..l.fb_info_sizeof + 4]);
+            v.after(pend, p(2), &mut req);
+            assert_eq!(data(&req, 0), 4096 << 10);
         }
     }
 

@@ -63,6 +63,11 @@
    "hClass": 12,
    "status": 40
   },
+  "NV2080_CTRL_FB_GET_INFO_PARAMS": {
+   "sizeof": 16,
+   "fbInfoListSize": 0,
+   "fbInfoList": 8
+  },
   "NV2080_CTRL_FB_GET_INFO_V2_PARAMS": {
    "sizeof": 1028,
    "fbInfoListSize": 0,
@@ -107,6 +112,7 @@
   "NV_OK": 0,
   "NV_ERR_NO_MEMORY": 81,
   "NV01_MEMORY_LOCAL_USER": 64,
+  "NV2080_CTRL_CMD_FB_GET_INFO": 545264385,
   "NV2080_CTRL_CMD_FB_GET_INFO_V2": 545264387,
   "NV2080_CTRL_FB_INFO_MAX_LIST_SIZE": 128,
   "NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE": 7,

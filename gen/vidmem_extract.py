@@ -8,7 +8,7 @@ Vulkan and CUDA size video memory from (device/src/vidmem.rs). Every field it
 reads or writes for that is measured here, per release, from NVIDIA's SDK
 headers at the tag, by compiling a probe: the memory classes' allocation
 parameters, VID_HEAP_CONTROL's allocating, freeing and INFO functions,
-ALLOC_MEMORY's limit, NV2080_CTRL_CMD_FB_GET_INFO_V2's list, the OS_UNIX
+ALLOC_MEMORY's limit, NV2080_CTRL_CMD_FB_GET_INFO's and _V2's lists, the OS_UNIX
 export and import controls, and the constants those are read with (the
 control and function numbers, the FB_INFO indices, the attribute bits).
 Nothing is carried from one release to another: the backend uses the
@@ -66,6 +66,7 @@ BLOCKS = {
     ],
     "NVOS54_PARAMETERS": ["hClient", "cmd", "paramsSize", "status"],
     "NVOS64_PARAMETERS": ["hRoot", "hObjectNew", "hClass", "status"],
+    "NV2080_CTRL_FB_GET_INFO_PARAMS": ["fbInfoListSize", "fbInfoList"],
     "NV2080_CTRL_FB_GET_INFO_V2_PARAMS": ["fbInfoListSize", "fbInfoList"],
     "NV2080_CTRL_FB_INFO": ["index", "data"],
     "NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS": [
@@ -83,7 +84,8 @@ BLOCKS = {
 CONSTANTS = [
     "NV_OK", "NV_ERR_NO_MEMORY",
     "NV01_MEMORY_LOCAL_USER",
-    "NV2080_CTRL_CMD_FB_GET_INFO_V2", "NV2080_CTRL_FB_INFO_MAX_LIST_SIZE",
+    "NV2080_CTRL_CMD_FB_GET_INFO", "NV2080_CTRL_CMD_FB_GET_INFO_V2",
+    "NV2080_CTRL_FB_INFO_MAX_LIST_SIZE",
     "NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE", "NV2080_CTRL_FB_INFO_INDEX_TOTAL_RAM_SIZE",
     "NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE", "NV2080_CTRL_FB_INFO_INDEX_MAPPABLE_HEAP_SIZE",
     "NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE", "NV2080_CTRL_FB_INFO_INDEX_USABLE_RAM_SIZE",
