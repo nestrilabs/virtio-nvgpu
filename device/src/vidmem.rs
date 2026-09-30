@@ -44,12 +44,14 @@
 //! **What is not.** Memory RM allocates for a VM on its own account:
 //! channels' and contexts' buffers, page tables, GSP's, the error notifiers,
 //! and what nvidia-uvm migrates into video memory for CUDA's managed
-//! allocations (UVM allocates through a kernel client of its own). Memory
-//! kept alive past every RM handle and export descriptor by a kernel client
-//! the backend does not follow -- an nvidia-drm GEM object imported from an
-//! export descriptor, an NVKMS surface registered from one -- stops counting
-//! when the last of those goes. SECURITY.md, "Video memory limit", has what
-//! this leaves a VM able to do.
+//! allocations (UVM allocates through a kernel client of its own). What
+//! nvidia-drm allocates through NVKMS's kernel client (GEM_ALLOC_NVKMS_MEMORY,
+//! CREATE_DUMB), and memory kept alive past every RM handle and export
+//! descriptor by one -- a GEM object imported from an export descriptor, an
+//! NVKMS surface registered from one -- which stops counting when the last
+//! of those goes: following them means following GEM handles through the
+//! IOCTL2 path. SECURITY.md, "Video memory limit", has what this leaves a VM
+//! able to do.
 //!
 //! **What the guest is told.** nvidia-smi, NVML and CUDA (cuMemGetInfo,
 //! cuDeviceTotalMem) read video memory sizes from

@@ -162,10 +162,11 @@ let
           with RM's own out-of-memory status, and nvidia-smi, NVML, Vulkan
           and CUDA in the guest are told it as the GPU's size. One guest
           process holds at most `windowOwnerShare` percent of it. At least
-          64. What RM allocates on the VM's behalf (channels, page tables)
-          and what nvidia-uvm migrates for CUDA managed memory are not
-          counted (DEPLOY.md, "Video memory limit"; SECURITY.md, "Video
-          memory limit").
+          64. What RM allocates on the VM's behalf (channels, page tables),
+          what nvidia-uvm migrates for CUDA managed memory and nvidia-drm's
+          own allocations are not counted: a bound on the VM's ordinary
+          workload, not a hard partition (DEPLOY.md, "Video memory limit";
+          SECURITY.md, "Video memory limit").
         '';
       };
       wayland = {

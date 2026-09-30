@@ -220,8 +220,11 @@ struct Args {
     /// what the guest allocates by name (RM_ALLOC and VID_HEAP_CONTROL
     /// video memory, with its duplicates, exports and imports); not what RM
     /// allocates on its own account for channels, contexts and page tables,
-    /// nor what nvidia-uvm migrates for CUDA managed memory (SECURITY.md,
-    /// "Video memory limit"). Needs a host release gen/ measured exactly.
+    /// nor what nvidia-uvm migrates for CUDA managed memory, nor nvidia-drm's
+    /// own allocations (GEM_ALLOC_NVKMS_MEMORY, dumb buffers): a bound on a
+    /// VM's ordinary workload, not a hard partition against a hostile guest
+    /// (SECURITY.md, "Video memory limit"). Needs a host release gen/
+    /// measured exactly.
     #[arg(long, value_name = "MIB")]
     vram_limit: Option<u64>,
 
