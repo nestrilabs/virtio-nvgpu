@@ -332,6 +332,7 @@ static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
 #define NVGPU_BCAP_COMPUTE (1u << 10)    /* UVM served (--allow-compute)        */
 #define NVGPU_BCAP_INJECT (1u << 11)     /* injected host buffers (INJECT_OPEN) */
 #define NVGPU_BCAP_ARMED_READY (1u << 12) /* legacy readiness once per W_ARM  */
+#define NVGPU_BCAP_DMABUF_EXPORT (1u << 13) /* EXPORT_TO_DMABUF_FD served     */
 
 /* HELLO guest_caps */
 #define NVGPU_GCAP_UVM_APERTURE (1u << 0) /* region NVGPU_SHM_ID_UVM found */
@@ -359,6 +360,27 @@ struct nvgpu_proc_id {
   __le32 tgid;     /* task_tgid_nr(), initial PID namespace     */
   __le32 euid;     /* current_euid(), initial user namespace, with
                       NVGPU_BCAP_PROC_EUID; 0 otherwise */
+} __packed;
+
+/*
+ * With NVGPU_BCAP_DMABUF_EXPORT: an NVGPU_MSG_IOCTL of RM's
+ * NV_ESC_EXPORT_TO_DMABUF_FD on a GPU file carries, after its block, the
+ * calling process and then this -- the render file the new dma-buf is
+ * imported into on the host, one the caller opened. The reply is the block
+ * RM left, its fd -1, and when RM made the dma-buf an
+ * nvgpu_dmabuf_export_resp after it as the deep block: the GEM object it is
+ * in that render file, which the guest makes a proxy and a guest dma-buf of
+ * (driver/nvgpu_rmexport.c; device/src/rmexport.rs).
+ */
+struct nvgpu_dmabuf_export_req {
+  __le32 render;   /* the render file's handle */
+  __le32 reserved; /* 0 */
+} __packed;
+
+struct nvgpu_dmabuf_export_resp {
+  __le32 gem;         /* in that render file */
+  __le32 object_type; /* NVGPU_GEM_OBJECT_DMABUF */
+  __le64 size;
 } __packed;
 
 /*

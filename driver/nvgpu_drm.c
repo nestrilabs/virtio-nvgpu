@@ -871,6 +871,68 @@ out:
  */
 static atomic64_t nvgpu_drm_next_unique_id = ATOMIC64_INIT(0);
 
+/*
+ * A host render file of @dri's node with no guest drm_file in front of it:
+ * where the host imports a dma-buf RM exported for the calling process
+ * (nvgpu_rmexport.c), so that a proxy has an owner to live in. Opened as the
+ * caller, whose handle share it is charged to; indexed in dev->renders like
+ * any render file's, for the proxies' bookkeeping, and closed by the last
+ * nvgpu_fd_put() -- the caller's, or the last proxy's. Nothing but proxies
+ * ever names it: no process holds it, it takes no ioctl, and no event is
+ * routed to it (it is in no dev->fds list).
+ */
+struct nvgpu_fd *nvgpu_render_open_headless(struct nvgpu_dri_dev *dri) {
+  struct nvgpu_device *dev = dri->dev;
+  struct nvgpu_open_req_proc *reqp;
+  struct nvgpu_open_resp *resp;
+  struct nvgpu_fd *nfd;
+  u32 req_len;
+  int ret;
+
+  nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
+  reqp = kzalloc(sizeof(*reqp), GFP_KERNEL);
+  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+  if (!nfd || !reqp || !resp) {
+    ret = -ENOMEM;
+    goto err;
+  }
+  nfd->dev = dev;
+  nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
+  refcount_set(&nfd->ref, 1);
+
+  reqp->req.hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
+  reqp->req.device_type = cpu_to_le32(nfd->device_type);
+  reqp->req.flags = cpu_to_le32(O_RDWR);
+  req_len = nvgpu_open_req_fill_proc(dev, reqp);
+  ret = nvgpu_send_recv(dev, reqp, req_len, resp, sizeof(*resp));
+  if (ret < 0)
+    goto err;
+  if ((s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
+    ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+    goto err;
+  }
+  nfd->handle = le32_to_cpu(resp->hdr.handle);
+  xa_init(&nfd->gem_index);
+  mutex_init(&nfd->so_lock);
+  xa_init(&nfd->so_live);
+  ret = xa_err(xa_store(&dev->renders, nfd->handle, nfd, GFP_KERNEL));
+  if (ret) {
+    nvgpu_close_handle(dev, nfd->handle);
+    goto err;
+  }
+  /* Put by the last nvgpu_fd_put(). */
+  nvgpu_dev_get(dev);
+  kfree(reqp);
+  kfree(resp);
+  return nfd;
+
+err:
+  kfree(nfd);
+  kfree(reqp);
+  kfree(resp);
+  return ERR_PTR(ret);
+}
+
 static int nvgpu_drm_open(struct drm_device *drm, struct drm_file *file) {
   struct nvgpu_dri_dev *dri = drm->dev_private;
   struct nvgpu_device *dev;

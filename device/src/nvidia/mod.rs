@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+mod dmabuf;
 mod hostnodes;
 mod placement;
 mod rm;
@@ -248,6 +249,13 @@ pub struct NvidiaBackend {
     /// The injected objects' dma-bufs, which no export may hand out
     /// (inject/registry.rs, `Taint`); shared with the IOCTL2 hooks.
     pub(crate) inject_taint: crate::inject::SharedTaint,
+    /// With `--allow-dmabuf-export`: RM's dma-bufs, which stay in the VM
+    /// (exportgate.rs); shared with the IOCTL2 hooks.
+    pub(crate) guest_only: crate::exportgate::GuestOnly,
+    /// The exports EXPORT_TO_DMABUF_FD made, against their budgets
+    /// (rmexport.rs), and what is asked of the host after RM made one.
+    pub(crate) rm_exports: crate::rmexport::RmExports,
+    pub(crate) export_host: Arc<dyn crate::rmexport::ExportHost>,
 }
 
 /// A fake host driver for tests: what the forwarding paths hand the host,
@@ -339,6 +347,7 @@ impl NvidiaBackend {
         let nvkms = Arc::new(NvkmsPolicy::new());
         let semsurf = Arc::new(SemsurfPolicy::new());
         let inject_taint = crate::inject::SharedTaint::default();
+        let guest_only = crate::exportgate::GuestOnly::default();
         Self {
             window: None,
             dri_maps: std::collections::HashMap::new(),
@@ -377,8 +386,12 @@ impl NvidiaBackend {
             vm_kms: Arc::default(),
             syncobj_regs: crate::fence::Registrations::default(),
             hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone())
+                .with_guest_only(guest_only.clone())
                 .with_inject_taint(inject_taint.clone()),
             inject_taint,
+            guest_only,
+            rm_exports: crate::rmexport::RmExports::default(),
+            export_host: Arc::new(crate::rmexport::SysExportHost),
             nvkms,
             semsurf,
             xfer_sys: Arc::new(crate::xfer::HostSys),
@@ -472,7 +485,19 @@ impl NvidiaBackend {
     /// What the backend was started with: compositor-VM mode, the Wayland
     /// sockets, which schemas exist.
     pub fn set_config(&mut self, config: BackendConfig) {
+        if config.allow_dmabuf_export {
+            self.allow_dmabuf_export();
+        }
         self.config = config;
+    }
+
+    /// `--allow-dmabuf-export`: RM's EXPORT_TO_DMABUF_FD served, and its
+    /// dma-bufs kept in the VM from here on (rmexport.rs, exportgate.rs).
+    /// For the life of the backend: the mark cannot be taken back, so no
+    /// dma-buf made while it was on can leave after.
+    pub fn allow_dmabuf_export(&mut self) {
+        let _ = self.guest_only.set(crate::rmexport::RM_EXPORTER);
+        self.config.allow_dmabuf_export = true;
     }
 
     pub fn config(&self) -> &BackendConfig {
@@ -1182,6 +1207,7 @@ impl NvidiaBackend {
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
         self.inject.file_closed(handle);
+        self.rm_exports.file_closed(handle);
         log::debug!("{why} of handle {handle} ({kind:?})");
         if end == End::KeepReport && !crate::closer::slow(kind) {
             let hold = self.handles.closing(fd, owner, kind);
@@ -1313,6 +1339,7 @@ impl NvidiaBackend {
             semsurf: &self.semsurf,
             injected: Some(&self.inject),
             taint: &self.inject_taint,
+            guest_only: &self.guest_only,
         }
     }
 

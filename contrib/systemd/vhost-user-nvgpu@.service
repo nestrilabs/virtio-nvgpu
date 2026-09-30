@@ -30,8 +30,11 @@
 # to 8 GiB of the GPU's video memory adds --vram-limit 8192 (DEPLOY.md,
 # "Video memory limit"). Opt-in RM allowlist groups go there too, as
 #   NVGPU_BACKEND_ARGS="--rm-allow-group thermal,health"
-# (DEPLOY.md, "Opt-in RM groups"; none by default). For capture
-# injection (DEPLOY.md, "Capture injection") that file says
+# (DEPLOY.md, "Opt-in RM groups"; none by default), and RM's dma-buf
+# export (DEPLOY.md, "dma-buf export through RM"; off by default), which
+# needs nothing of the unit, as
+#   NVGPU_BACKEND_ARGS="--allow-dmabuf-export"
+# For capture injection (DEPLOY.md, "Capture injection") that file says
 #   NVGPU_BACKEND_ARGS="--inject-uid UID"
 # and vhost-user-nvgpu-inject@N.socket binds the helper's socket, open to
 # its group, and hands it over; a drop-in here then says

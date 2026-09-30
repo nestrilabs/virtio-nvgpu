@@ -127,7 +127,7 @@ each call is validated:
 
 | entry point | host has | what reaches the host |
 |---|---|---|
-| **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Only on GPU and control handles (`v1_route`, `device/src/nvidia/v1.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused**, and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
+| **RM escapes**, type `F`, on `/dev/nvidiactl` and `/dev/nvidiaN` | -- | Only on GPU and control handles (`v1_route`, `device/src/nvidia/v1.rs`). The profile is chosen at start from `/proc/driver/nvidia/version`. **21 of 23 / 22 of 24** reach the host, **size-checked** except the three variable-length ones (CARD_INFO, ATTACH_GPUS_TO_FD, NUMA_INFO), which pass with no size check: EXPORT_TO_DMABUF_FD is **refused** (served with `--allow-dmabuf-export`: "dma-buf export through RM"), and IDLE_CHANNELS goes for one channel with its three array pointers zeroed, or for a list of at most 4,096 with the arrays as deep segments the backend sizes itself (a list without them is **refused**). XFER_CMD, I2C_ACCESS, ACCESS_REGISTRY, GET_EVENT_DATA and ADD_VBLANK_CALLBACK are **refused** under any ABI policy, `--permissive-abi` included. Pointer fields in the top-level blocks are zeroed. |
 | **RM_CONTROL** commands | 1,370 controls | **Allow-listed** per release ("The RM allowlist"): 216 of 1,370 (and 30 GSP pass-through numbers seen on hardware) reach RM; the rest are answered NOT_SUPPORTED, or INVALID_PARAM_STRUCT for a size other than RM's, without RM. 3 controls whose pointers the tables cannot name one by one are **refused** whatever the list says (none is on it). 12 that list other clients' host PIDs are answered by the backend with RM's own "insufficient permissions" (`device/src/rmctl.rs`). For the 47 whose parameters hold pointers RM follows (measured per release, `gen/src/rmctrl/generated.rs`), each pointer is relocated to a guarded buffer or zeroed. Several of one control go as deep segments, each **table-sized**: its length is computed from the parameters RM is handed, as RM computes it, and must match exactly, at most 1 MiB in all. The ACPI-method controls and four others (`ZEROED_CONTROLS`) are never relocated. REGISTER_WAITER's OS-event descriptor is translated and must name a live event. NV0000's OS_UNIX controls (0x3dxx): the six that name a control file by descriptor (export, import, export info) get the backend's descriptor of the caller's own control file, and any other number is **refused** (EBADF), as is a descriptor field too short to hold; MEMACCT's cgroup descriptor and every OS_UNIX command RM does not define are answered NOT_SUPPORTED without RM (R1). `--rm-allow-group` (none by default) adds named groups, each member held to a rule of its own before RM ("Opt-in RM groups"). |
 | **RM_ALLOC** classes | 227 distinct numbers in `g_allclasses.h` | **Allow-listed** per release ("The RM allowlist"): 97 of 222 reach RM, on RM_ALLOC, ALLOC_MEMORY, ALLOC_OBJECT, ALLOC_CONTEXT_DMA2 and by VID_HEAP_CONTROL function; the rest are answered INVALID_CLASS without RM. **12 are refused** on RM_ALLOC, ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 whatever the list says (OS-descriptor memory 0x71 named by address, kernel callbacks 0x78, 0x7e, 0x92 and 0x9010, memory lists 0x81-0x83, FB segments 0xc1, IMEX and fabric memory 0xf1, 0xf9 and 0xfd; `REFUSED_ALLOC_CLASSES`, `device/src/guestptr.rs`), and ALLOC_MEMORY refuses the four of them whose `pMemory` RM reads (`REFUSED_ALLOC_MEMORY_CLASSES`). An NV01_EVENT is held to both as the subclass its parameters name, which RM allocates in its place (`rm_alloc_class`). pRightsRequested is zeroed. NV_EVENT_BUFFER must name a live OS event and a header buffer of the caller's (`hBufferHeader`): one RM allocates itself comes back with its pages' host physical addresses. |
 | **RM_SHARE, RM_DUP_OBJECT, and a second client named in parameters** | NV04 share and dup; 2 NV0000 share controls; 7 classes and 21 controls that name another client | Shares go to RM only when they narrow or grant inside the VM; the rest are **refused**. A duplicate's two clients must be this VM's, made by one guest process, unless the source was shared with the destination (RM's rule, guest processes for the backend's). A second client named in class or control parameters must be this VM's and pass RM's rule for that field, with guest processes and euids. A guest that does not say which process and euid make each call gets neither. Below, "RM objects between guest processes". |
@@ -582,6 +582,95 @@ graphics-only guest; with `--allow-compute` it runs. Hiding those extensions
 in the guest (a Vulkan layer) would make such apps fall back instead; not
 done.
 
+### dma-buf export through RM
+
+RM's `EXPORT_TO_DMABUF_FD` is **refused** by default, as it has been since
+S-15 (EOPNOTSUPP, whatever the ABI policy). `--allow-dmabuf-export` serves
+it; DEPLOY.md, "dma-buf export through RM", has what that gains and costs.
+
+**What RM does, and does not check.** nvidia.ko serves the escape on a GPU
+file (`nv_dma_buf_export`): with `fd` -1 it duplicates `handles[]` of client
+`hClient` into an RM-internal client, makes a dma-buf of them, and installs
+it in the caller's descriptor table; with `fd` >= 0 it looks that number up
+in the caller's table and appends to the dma-buf there.
+`RmDmabufVerifyMemHandle` checks that each handle is Memory of this GPU,
+video memory on a discrete GPU, page-aligned and inside the object. It never
+checks that `hClient` is the caller's: the client is looked up by handle
+(`serverGetClientUnderLock`), and the duplicate is made at kernel privilege
+(`RMAPI_GPU_LOCK_INTERNAL`). Natively on the RTX 5090, a process given
+another process's client and memory handles exports that process's video
+memory (sec-negative's T18, run on the host: *accepted*). Every guest
+process is the backend on the host, and client handles are sequential; so
+the backend is what decides whose memory may be named.
+
+**What the backend holds it to** (`device/src/rmexport.rs`,
+`device/src/nvidia/dmabuf.rs`, each with unit tests against a fake RM and a
+fake nvidia-drm):
+
+- The calling process's own memory. `hClient` must be a client this VM
+  allocated and the calling guest process made (the same record the
+  duplicate rule reads, "RM objects between guest processes"). A guest that
+  does not say which process calls (no BCAP_PROC_ID) gets no export. The
+  handles RM then resolves are that client's alone, and RM's own checks
+  hold for them; memory another process shared into the client by RM's
+  rules is the caller's to use already, natively too.
+- One call, the whole dma-buf: `fd` -1, `index` 0, `numObjects` equal to
+  `totalObjects` and at most 128, `totalSize` the sum of the sizes (checked
+  arithmetic). The append form is **refused**: RM would look the guest's
+  number up in the backend's table, and a dma-buf built in parts cannot be
+  imported until it is whole. `mappingType` FORCE_PCIE (which skips the
+  IOMMU for the importer) and `bAllowMmap` are **refused**.
+- Budgets: 256 exports and 8 GiB per VM, a quarter of the count and half the
+  bytes per guest process, charged before RM is asked and given back when
+  the guest closes the object or its file. Each export also holds one render
+  file of the host's, charged to the process as any handle is. With
+  `--vram-limit`, memory an export keeps alive after the guest freed its
+  RM handles is no longer counted against the limit, so the export budget
+  bounds how far past it that goes ("Video memory limit").
+- What RM made is claimed from a descriptor slot declared -1 going in, never
+  a descriptor the backend already holds; checked to be nvidia.ko's dma-buf
+  (its `exp_name`, `nv_dmabuf`, which only the exporter sets) of `totalSize`
+  bytes; imported at once (PRIME_FD_TO_HANDLE) into a render file the
+  calling process opened, where GEM_IDENTIFY_OBJECT must call it a dma-buf
+  object; and closed. The guest gets the GEM handle, never a descriptor of
+  the backend's or a backend handle of the dma-buf. Any failure after RM
+  made it closes it, and with the last reference RM undoes the export
+  (`nv_dma_buf_release`).
+- It never leaves the VM. While the switch is on, the export gate
+  (`device/src/exportgate.rs`) refuses every
+  dma-buf whose exporter is RM's, on every path out: HOST_OP PRIME_EXPORT, a
+  Wayland buffer for the host compositor, an IOCTL2 re-home into a KMS file.
+  An export of the object from any file is that very dma-buf, so the check
+  needs no record and catches it through any handle. So no injected,
+  tainted or fence-context object can leave through it either: nothing of
+  it leaves at all, and what it is made of is the caller's own client's
+  memory.
+
+**What the guest can do with it.** The guest module installs a guest
+dma-buf in the caller's table (`driver/nvgpu_rmexport.c`): the proxy of the
+GEM object in a render file of its own opened for the purpose, charged to
+the caller. The guest's render nodes import it (any guest process it is
+passed to can), and it identifies as a dma-buf object, so NVIDIA's userspace
+takes it as it takes the same dma-buf natively -- which on the RTX 5090,
+natively as well, is to refuse it in EGL (`EGL_BAD_ALLOC`) and Vulkan (no
+memory type). **Not:** map it for any CPU (the proxy is never placed in the
+window: EOPNOTSUPP, as nvidia.ko's own is mapped by no CPU on a discrete
+GPU), attach a guest device to it, send it to the host compositor (the
+Wayland proxy's client sees the buffer fail), scan it out, append to it, or
+name another process's or another VM's memory with it.
+
+**What it adds to the host.** nvidia.ko's dma-buf exporter (`nv-dmabuf.c`:
+create, and the attach and map of the backend's own import into the render
+file, which maps the memory through BAR1 on a GPU without static BAR1) and
+RM's internal duplicate. Only for a guest process's own memory, within the
+budgets, and with no importer but nvidia-drm of the same host; the
+compositor, KMS and other devices never see these dma-bufs. Guest-side, one
+C file that reads the block's descriptor field and nothing else; the block
+is the backend's to parse. Tested in the guest by sec-negative's T17-T20
+(own memory, another process's, a freed object, a second export into one
+dma-buf) with the switch on and off, and by `nvgpu-rm-dmabuf` in the render
+probe.
+
 ### The UVM aperture
 
 A CUDA context needs a UVM semaphore pool mapped at its own address, and UVM
@@ -896,9 +985,11 @@ this does not yet do: nvidia-drm's GEM_ALLOC_NVKMS_MEMORY on a render node
 (what the guest's GBM uses for scanout-capable buffers) and CREATE_DUMB on a
 card node (compositor-VM and lease modes); and memory kept alive past every
 RM handle and export descriptor the VM holds -- by a GEM object imported
-from an export descriptor (GEM_IMPORT_NVKMS_MEMORY), or an NVKMS surface
-registered from one -- stops counting when the last of those goes, though
-it lives until the GEM object or surface does. **A guest with a render node
+from an export descriptor (GEM_IMPORT_NVKMS_MEMORY), an NVKMS surface
+registered from one, or, with `--allow-dmabuf-export`, a dma-buf of RM's
+and the GEM object the backend imports it as ("dma-buf export through RM":
+at most the export budget, 8 GiB a VM) -- stops counting when the last of
+those goes, though it lives until the GEM object, surface or dma-buf does. **A guest with a render node
 can therefore still allocate past its limit, through nvidia-drm**, bounded
 only by the VM's other caps (GEM objects and surfaces by the handle table
 and NVKMS's, channels by RM's own limits). None of these is a way into
@@ -2543,7 +2634,8 @@ carries; Appendix C has their history.
     (S-5). PID namespaces are left to the launcher, and the host-PID controls
     are answered by the backend (S-24). EXPORT_TO_DMABUF_FD is refused, so
     NVIDIA's GBM RM export path and `cuMemGetHandleForAddressRange(DMA_BUF)`
-    fail (S-15).
+    fail (S-15), unless `--allow-dmabuf-export` serves it ("dma-buf export
+    through RM").
 11. **Untranslated descriptors.** Some RM controls carry a descriptor that
     nothing translates: CLIENT_SUBSCRIBE_TO_IMEX_CHANNEL's devDescriptor, the
     NV00E0 export and NV00FD ATTACH_GPU devDescriptors, and NV00FD
@@ -2734,7 +2826,9 @@ In priority order. Cost is a judgement, not a measurement.
      active lease;
    - forcing non-privileged RM clients, as a second
      fence against a privileged backend;
-   - translating EXPORT_TO_DMABUF_FD, once something needs it.
+   - EXPORT_TO_DMABUF_FD is served, off by default, with
+     `--allow-dmabuf-export` ("dma-buf export through RM"); its append form
+     and exports of it out of the VM stay refused.
 9. **Parse, don't patch: the rest ("Memory safety").** The data rewrites
    that are still edits of the host's copy (the coherency attributes, NVKMS
    policy, fence waits) made declared values; RM's top-level blocks as typed
@@ -4382,7 +4476,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | S-12 | medium | a dead fence's consumer signals a reused id | `037c20f` | fixed |
 | S-13 | medium | a destroyed syncobj's wait registration is joined | `2e4c715` | fixed |
 | S-14 | medium | NVKMS gates checked at prepare, not at run | `5baeb66` | fixed; the GET_LEASE check at run time not done |
-| S-15 | medium | EXPORT_TO_DMABUF_FD forwarded raw | `db4d736` | fixed by refusal; translation is future work |
+| S-15 | medium | EXPORT_TO_DMABUF_FD forwarded raw | `db4d736` | fixed by refusal; translated, kept in the VM, with `--allow-dmabuf-export` |
 | S-16 | low | blobs hold memfds with no count limit | `86553c1` | **partly**: count cap done; one descriptor budget and RLIMIT_NOFILE not |
 | S-17 | low | RM counter maps grow without bound | `d773f45` | fixed |
 | S-18 | low | no per-session channel limit | `de95ad3` | fixed; its optional item 3, backpressure towards the compositor, not done (open item 13) |

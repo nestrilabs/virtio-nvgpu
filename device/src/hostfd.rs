@@ -464,6 +464,17 @@ fn is_dmabuf_fdinfo(fd: RawFd) -> bool {
         .is_ok_and(|t| t.lines().any(|l| l.starts_with("exp_name:")))
 }
 
+/// The exporter of dma-buf `fd`: the `exp_name:` line of its fdinfo, which
+/// the exporting module sets and nothing else changes (dma-buf.c,
+/// `dma_buf_show_fdinfo`; DMA_BUF_SET_NAME sets `name`, another line). None
+/// for anything that is not a dma-buf.
+pub fn dmabuf_exporter(fd: RawFd) -> Option<String> {
+    let t = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+    t.lines()
+        .find_map(|l| l.strip_prefix("exp_name:"))
+        .map(|v| v.trim().to_string())
+}
+
 /// Filesystem magic numbers (include/uapi/linux/magic.h).
 const ANON_INODE_FS_MAGIC: i64 = 0x0904_1934;
 pub(crate) const DMA_BUF_MAGIC: i64 = 0x444d_4142;
@@ -1398,6 +1409,10 @@ mod tests {
         .unwrap();
         assert_eq!(classify(d.as_fd(), &[]), HandleKind::Dmabuf);
         assert!(!is_dmabuf_fdinfo(memfd.as_raw_fd()));
+        // Its exporter, by the line only the exporter writes; a memfd has
+        // none.
+        assert_eq!(dmabuf_exporter(d.as_raw_fd()).as_deref(), Some("udmabuf"));
+        assert_eq!(dmabuf_exporter(memfd.as_raw_fd()), None);
     }
 
     #[test]

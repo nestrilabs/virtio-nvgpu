@@ -79,6 +79,13 @@ pub struct BackendConfig {
     /// leaving it to the pin page by page. Off by default: on the rig it
     /// made registration slower, not faster (DEPLOY.md, "Backend flags").
     pub osdesc_populate: bool,
+    /// Serve RM's EXPORT_TO_DMABUF_FD (`--allow-dmabuf-export`): a guest
+    /// process's own video memory as a dma-buf, for the guest's own
+    /// importers, never leaving the VM (rmexport.rs; BCAP_DMABUF_EXPORT).
+    /// Off by default, and the escape refused (SECURITY.md, "dma-buf export
+    /// through RM"). Set through `NvidiaBackend::allow_dmabuf_export`,
+    /// which marks the export gate too.
+    pub allow_dmabuf_export: bool,
 }
 
 impl BackendConfig {
@@ -104,6 +111,9 @@ impl BackendConfig {
         }
         if self.allow_compute {
             caps |= BCAP_COMPUTE;
+        }
+        if self.allow_dmabuf_export {
+            caps |= BCAP_DMABUF_EXPORT;
         }
         caps
     }

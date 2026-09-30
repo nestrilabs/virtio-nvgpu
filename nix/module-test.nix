@@ -84,6 +84,7 @@ let
         "debug"
       ];
       osdescPopulate = true;
+      dmabufExport = true;
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -311,6 +312,8 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
     grep -q -- '--inject-uid 950' "$dropinPath"
     grep -q -- '--window-owner-share 90 --vram-limit 8192' "$dropinPath"
+    grep -q -- '--osdesc-populate on --allow-dmabuf-export' "$dropinPath"
+    if grep -q -- '--allow-dmabuf-export' "$dropin1Path"; then exit 1; fi
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"
     grep -q 'ProtectHome=tmpfs' "$dropinPath"
     grep -q 'BindReadOnlyPaths=/run/user/1000/wayland-1' "$dropinPath"

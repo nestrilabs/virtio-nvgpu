@@ -40,6 +40,14 @@
 #                               device. The probe is told which, as
 #                               nvgpu_compute=0|1 on the kernel command line.
 #
+# RM's dma-buf export (off by default; SECURITY.md, "dma-buf export through
+# RM"):
+#   --allow-dmabuf-export       serve RM's EXPORT_TO_DMABUF_FD: a guest
+#                               process's own video memory as a guest
+#                               dma-buf, which never leaves the VM. The probe
+#                               is told which, as nvgpu_dmabuf_export=0|1 on
+#                               the kernel command line.
+#
 # Environment (all optional):
 #   NVGPU_COMPUTE=1     the same as --allow-compute
 #   NVGPU_RM_ALLOW_GROUP  opt-in RM allowlist groups, comma-separated
@@ -51,6 +59,7 @@
 #                       MADV_POPULATE before RM pins it, not page by page
 #                       inside the pin (the backend's --osdesc-populate on;
 #                       off by default: no faster on the rig)
+#   NVGPU_DMABUF_EXPORT=1  the same as --allow-dmabuf-export (0 or 1)
 #   NVGPU_WINDOW_MIB    the shared window in MiB (the backend's --window-size;
 #                       default 1024, a multiple of 64); the VMM takes the size
 #                       from the backend -- nesbox from virtio-nvgpu-v4, which

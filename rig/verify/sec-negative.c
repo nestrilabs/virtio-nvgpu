@@ -31,6 +31,13 @@
  * carries its own control (a device sharing this process's own client).
  * T8 and T10 need a guest module that says which process makes each call
  * (BCAP_PROC_ID, BCAP_PROC_EUID); without it both are refused too.
+ * T14-T16 are the opt-in RM groups (--rm-allow-group): with the group
+ * served, its rule's own status; without, the allowlist's NOT_SUPPORTED.
+ * T17-T20 are RM's dma-buf export: T17 is their control, which exports the
+ * process's own video memory where the backend serves it
+ * (--allow-dmabuf-export) and SKIPs where it refuses the escape; T18-T20
+ * (another process's memory, a freed object, a second export into one
+ * dma-buf) must be refused either way.
  *
  * Build:  see sec-negative.sh (gcc, libdrm headers, no other deps).
  */
@@ -44,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1099,6 +1107,255 @@ static void t_rm_groups(int ctl, uint32_t mine)
 	expect_group("profiling, register write", "profiling", st, NV_ERR_INSUFFICIENT_PERMISSIONS);
 }
 
+/* ---- RM's dma-buf export (--allow-dmabuf-export) ------------------------ */
+
+/* NVOS00_PARAMETERS (nvos.h): RM_FREE. */
+typedef struct {
+	uint32_t hRoot;
+	uint32_t hObjectParent;
+	uint32_t hObjectOld;
+	uint32_t status;
+} nvos00_t;
+
+#define NV_ESC_RM_FREE 0x29
+#define NV_ESC_EXPORT_TO_DMABUF_FD 0xD9
+#define NV20_SUBDEVICE_0 0x00002080u
+#define NV01_MEMORY_LOCAL_USER 0x00000040u
+#define XD_SUB_HANDLE 0x5ddd0e01u
+#define XD_MEM_HANDLE 0x3e300e01u
+#define XD_SIZE (2u << 20)
+#define NV_OK 0u
+
+/* The GPU file every export is made on: registered with `ctl` as NVIDIA's
+ * userspace does, for the device allocation. */
+static int xd_gpu = -1;
+
+/* A client on `fd` with a device, a subdevice and XD_SIZE of video memory
+ * (XD_MEM_HANDLE); the client, or 0. NV_MEMORY_ALLOCATION_PARAMS is 128
+ * bytes from 550 on, 120 before: owner at 0, attr at 24, size at 64. */
+static uint32_t client_with_vidmem(int fd)
+{
+	int gpu = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+	if (gpu < 0 || ioctl(gpu, NV_IOWR(NV_ESC_REGISTER_FD, sizeof(int)), &fd) != 0) {
+		if (gpu >= 0)
+			close(gpu);
+		return 0;
+	}
+	close(gpu);
+	uint32_t c = alloc_client(fd);
+	if (!c || alloc_object(fd, c, c, DEV_HANDLE, NV01_DEVICE_0, NV0080_ALLOC_PARAMETERS_SIZE) ||
+	    alloc_object(fd, c, DEV_HANDLE, XD_SUB_HANDLE, NV20_SUBDEVICE_0, 4))
+		return 0;
+	uint8_t p[128] = {0};
+	uint32_t owner = XD_MEM_HANDLE, attr = (2u << 23) | (2u << 27);
+	uint64_t size = XD_SIZE;
+	memcpy(p + 0, &owner, 4);
+	memcpy(p + 24, &attr, 4);
+	memcpy(p + 64, &size, 8);
+	for (uint32_t len = 128; len >= 120; len -= 8) {
+		nvos64_t a = {0};
+		a.hRoot = c;
+		a.hObjectParent = DEV_HANDLE;
+		a.hObjectNew = XD_MEM_HANDLE;
+		a.hClass = NV01_MEMORY_LOCAL_USER;
+		a.pAllocParms = (uint64_t)(uintptr_t)p;
+		a.paramsSize = len;
+		if (ioctl(fd, NV_IOWR(NV_ESC_RM_ALLOC, sizeof(a)), &a) == 0 && a.status == 0)
+			return c;
+	}
+	return 0;
+}
+
+/* EXPORT_TO_DMABUF_FD of XD_SIZE of `mem` of `client`, with `fd_in` (-1 for
+ * a new dma-buf, else the append form), on the GPU file: 0 with the fd RM's
+ * answer put in *fd (-1 if none) and its status in *status, or -errno for
+ * the ioctl. 2608 bytes from 570 on, 2600 before; the host takes one. */
+static int xd_export(uint32_t client, uint32_t mem, int fd_in, int *fd, uint32_t *status)
+{
+	uint8_t b[2608];
+	uint32_t one = 1;
+	uint64_t total = XD_SIZE;
+	int r = -EINVAL;
+
+	*fd = -1;
+	*status = 0;
+	for (int wide = 1; wide >= 0; wide--) {
+		size_t len = wide ? 2608 : 2600;
+		size_t handles = wide ? 36 : 32, sizes = wide ? 1576 : 1568;
+		size_t st = wide ? 2600 : 2592;
+		memset(b, 0, sizeof(b));
+		memcpy(b, &fd_in, 4);
+		memcpy(b + 4, &client, 4);
+		memcpy(b + 8, &one, 4);
+		memcpy(b + 12, &one, 4);
+		memcpy(b + 24, &total, 8);
+		memcpy(b + handles, &mem, 4);
+		memcpy(b + sizes, &total, 8);
+		if (ioctl(xd_gpu, NV_IOWR(NV_ESC_EXPORT_TO_DMABUF_FD, len), b) != 0) {
+			r = -errno;
+			if (r == -EINVAL)
+				continue;
+			return r;
+		}
+		memcpy(status, b + st, 4);
+		memcpy(fd, b, 4);
+		if (*status != NV_OK || *fd == fd_in)
+			*fd = -1;
+		return 0;
+	}
+	return r;
+}
+
+/* T17, the control for T18-T20, and what the guest can do with an export.
+ * With --allow-dmabuf-export the process's own video memory exports as a
+ * dma-buf (FAIL when refused for any reason but the switch), which no CPU
+ * maps. Without it the escape is refused (EOPNOTSUPP), and T18-T20 check
+ * that their requests are refused all the same. Returns whether the
+ * backend serves the export. */
+static int t_dmabuf_export_own(uint32_t mine)
+{
+	int fd;
+	uint32_t st;
+
+	if (!mine) {
+		skip("dma-buf export, own memory", "no client with video memory here");
+		return 0;
+	}
+	int r = xd_export(mine, XD_MEM_HANDLE, -1, &fd, &st);
+	if (r == -EOPNOTSUPP) {
+		skip("dma-buf export, own memory", "the backend does not serve it "
+						     "(--allow-dmabuf-export off): refused");
+		return 0;
+	}
+	if (r || st != NV_OK || fd < 0) {
+		char how[96];
+		snprintf(how, sizeof(how), "refused: ioctl %d, status %#x", r, st);
+		fail("dma-buf export, own memory", how);
+		return 0;
+	}
+	void *m = mmap(NULL, XD_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+	if (m != MAP_FAILED) {
+		munmap(m, XD_SIZE);
+		fail("dma-buf export, own memory", "made, and a CPU mapping of it was too");
+	} else {
+		pass("dma-buf export, own memory", "made (control); no CPU mapping of it");
+	}
+	close(fd);
+	return 1;
+}
+
+/* T18: a forked child makes a client with video memory; the parent, knowing
+ * the handles, exports the child's memory through its own GPU file. RM
+ * would (it checks nothing of whose hClient is); the backend refuses any
+ * client but the calling process's own. */
+static void t_dmabuf_export_other_process(void)
+{
+	int up[2], down[2];
+	if (pipe(up) || pipe(down)) {
+		skip("dma-buf export, other process", "pipe failed");
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		skip("dma-buf export, other process", "fork failed");
+		return;
+	}
+	if (pid == 0) {
+		int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+		uint32_t c = fd >= 0 ? client_with_vidmem(fd) : 0;
+		char go;
+		if (write(up[1], &c, sizeof(c)) != sizeof(c))
+			_exit(1);
+		if (read(down[0], &go, 1) < 0)
+			_exit(1);
+		_exit(0);
+	}
+	uint32_t child = 0;
+	if (read(up[0], &child, sizeof(child)) != sizeof(child))
+		child = 0;
+	if (!child) {
+		skip("dma-buf export, other process", "the child could not make video memory");
+	} else {
+		int fd;
+		uint32_t st;
+		int r = xd_export(child, XD_MEM_HANDLE, -1, &fd, &st);
+		if (r == 0 && st == NV_OK && fd >= 0) {
+			fail("dma-buf export, other process", "accepted (another process's memory)");
+			close(fd);
+		} else if (r == 0 && st == NV_ERR_INSUFFICIENT_PERMISSIONS) {
+			pass("dma-buf export, other process", "refused (NV_ERR_INSUFFICIENT_PERMISSIONS)");
+		} else {
+			pass("dma-buf export, other process", "refused");
+		}
+	}
+	if (write(down[1], "x", 1) != 1)
+		kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(up[0]);
+	close(up[1]);
+	close(down[0]);
+	close(down[1]);
+}
+
+/* T19: video memory of this process's own, freed, then exported: RM finds
+ * no object, and no dma-buf is made. */
+static void t_dmabuf_export_closed(int ctl)
+{
+	uint32_t c = client_with_vidmem(ctl);
+	if (!c) {
+		skip("dma-buf export, closed object", "no client with video memory here");
+		return;
+	}
+	nvos00_t f = {.hRoot = c, .hObjectParent = DEV_HANDLE, .hObjectOld = XD_MEM_HANDLE};
+	if (ioctl(ctl, NV_IOWR(NV_ESC_RM_FREE, sizeof(f)), &f) != 0 || f.status) {
+		skip("dma-buf export, closed object", "the memory could not be freed");
+		return;
+	}
+	int fd;
+	uint32_t st;
+	int r = xd_export(c, XD_MEM_HANDLE, -1, &fd, &st);
+	if (r == 0 && st == NV_OK && fd >= 0) {
+		fail("dma-buf export, closed object", "a dma-buf of freed memory was made");
+		close(fd);
+	} else {
+		pass("dma-buf export, closed object", "refused");
+	}
+}
+
+/* T20: a second export into one dma-buf (the append form, `fd` >= 0): into
+ * the one T17's export made, and into a descriptor that is no dma-buf. The
+ * backend would have RM look the number up in its own table; refused. */
+static void t_dmabuf_export_double(uint32_t mine, int serves)
+{
+	int fd = -1, fd2;
+	uint32_t st;
+
+	if (!mine) {
+		skip("dma-buf export, double", "no client with video memory here");
+		return;
+	}
+	if (serves && (xd_export(mine, XD_MEM_HANDLE, -1, &fd, &st) || fd < 0)) {
+		fail("dma-buf export, double", "the first export was refused");
+		return;
+	}
+	int other = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	int into[2] = {fd >= 0 ? fd : other, other};
+	int bad = 0;
+	for (int i = 0; i < 2; i++) {
+		int r = xd_export(mine, XD_MEM_HANDLE, into[i], &fd2, &st);
+		if (r == 0 && st == NV_OK)
+			bad = 1;
+	}
+	if (bad)
+		fail("dma-buf export, double", "an export into an existing descriptor was taken");
+	else
+		pass("dma-buf export, double", "refused");
+	if (fd >= 0)
+		close(fd);
+	if (other >= 0)
+		close(other);
+}
+
 static int open_first(const char *const *paths)
 {
 	for (; *paths; paths++) {
@@ -1193,6 +1450,14 @@ int main(int argc, char **argv)
 	t_disable_rate(ctl, mine);
 	/* T14-T16: the opt-in RM groups, on or off. */
 	t_rm_groups(ctl, mine);
+	/* T17-T20: RM's dma-buf export -- the control, another process's
+	 * memory, a freed object, a second export into one dma-buf. */
+	xd_gpu = open("/dev/nvidia0", O_RDWR | O_CLOEXEC);
+	uint32_t vid = client_with_vidmem(ctl);
+	int serves = t_dmabuf_export_own(vid);
+	t_dmabuf_export_other_process();
+	t_dmabuf_export_closed(ctl);
+	t_dmabuf_export_double(vid, serves);
 
 	printf("\n%d passed, %d failed, %d skipped\n", passes, fails, skips);
 	if (fails)

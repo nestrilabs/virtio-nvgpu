@@ -68,6 +68,11 @@ works too, but without `nvgpu-wl-guest` and the verify helpers
   `vk-acquire-display` (`vkGetDrmDisplayEXT` → `vkAcquireDrmDisplayEXT` →
   display-plane surface → N presented frames), `cuda-smoke` (CUDA driver API:
   a 16 MiB round trip and a PTX-JIT kernel, `libcuda` dlopen()ed, no toolkit),
+  `nvgpu-rm-dmabuf` (RM's EXPORT_TO_DMABUF_FD of video memory, then the
+  dma-buf's size, a refused CPU mapping, a render node's import, EGL and
+  Vulkan imports, and a refused second export into it: the backend's
+  `--allow-dmabuf-export`), `cuda-dmabuf` (the same through CUDA's
+  `cuMemGetHandleForAddressRange`, where CUDA offers dma-buf export at all),
   `nvgpu-poweroff`. `/opt/nvgpu/libnvgpu-shim.so` is an `LD_PRELOAD` that
   (a) opens the lease fd for the path `/dev/dri/lease`, so `kmscube -D`,
   `drm_info` and `modetest -D` drive a lease, and (b) makes `modetest -D PATH`
@@ -91,7 +96,7 @@ powers off. A watchdog powers off a probe that overruns its budget.
 | probe | TESTING.md | launch with |
 |---|---|---|
 | `stage1.sh` | 1 (+0.1): HELLO v2, nodes, `guest-check.sh` | any mode |
-| `render.sh` | `nvidia-smi -L`/`-q`, `vulkaninfo --summary`, `eglinfo -B` per platform, `cuda-smoke` | any mode |
+| `render.sh` | `nvidia-smi -L`/`-q`, `vulkaninfo --summary`, `eglinfo -B` per platform, `cuda-smoke`, `nvgpu-rm-dmabuf` (made with `nvgpu_dmabuf_export=1`, refused without) | any mode |
 | `wayland.sh` | 3 (+8.1): daemon, `wayland-info`, `vkcube --wsi wayland` under `WAYLAND_DEBUG` (modifiers, syncobj use), weston/mesa-demos EGL clients (two fullscreen: direct-scanout candidates), shm clients | `--wayland-socket` |
 | `lease.sh` | 4 (+9 round trip): `nvgpu-lease --list`, `lease-flip` on the lease fd, `drm_info`, `modetest`, `kmscube` on it, a second lease | `--wayland-socket … --wayland-lease` |
 | `vkdisplay.sh` | 5: `vk-acquire-display` on the lease (or the card), then `vkcube --wsi display` | as lease, or `--kms-card` |

@@ -30,15 +30,28 @@
 //!   identity (inject/registry.rs `Taint`). That also catches an injected
 //!   object reached through another handle. A capture buffer is the guest's
 //!   to read, never the host's to show (SECURITY.md, "Capture injection").
+//! - **After**, with `--allow-dmabuf-export`: the dma-buf is not one RM's
+//!   EXPORT_TO_DMABUF_FD made, by its exporter ([`GuestOnly`]). Those are
+//!   the guest's own video memory, for the guest's own importers, and stay
+//!   in the VM (rmexport.rs): the object a guest file holds of one exports
+//!   as that very dma-buf, so this catches it on every path and through any
+//!   handle, with no record to outlive or miss.
 //!
 //! A refusal is EINVAL on every path.
 
 #![forbid(unsafe_code)]
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::{Arc, OnceLock};
 
 use crate::inject::{BackendInject, SharedTaint};
 use crate::semsurf::SemsurfPolicy;
+
+/// The exporter whose dma-bufs no export may hand on, once set: RM's
+/// (`rmexport::RM_EXPORTER`) while `--allow-dmabuf-export` is on. Shared with
+/// the IOCTL2 hooks, which run off the backend's lock; unset, nothing is
+/// asked of any dma-buf.
+pub type GuestOnly = Arc<OnceLock<&'static str>>;
 
 /// What an export of a guest GEM object is checked against.
 pub struct ExportGate<'a> {
@@ -48,6 +61,8 @@ pub struct ExportGate<'a> {
     pub injected: Option<&'a BackendInject>,
     /// The injected capture buffers' dma-bufs.
     pub taint: &'a SharedTaint,
+    /// The exporter that stays in the VM.
+    pub guest_only: &'a GuestOnly,
 }
 
 impl ExportGate<'_> {
@@ -75,6 +90,57 @@ impl ExportGate<'_> {
             log::warn!("export of an injected capture buffer's dma-buf; refused");
             return Err(libc::EINVAL);
         }
+        if let Some(&stays) = self.guest_only.get()
+            && crate::hostfd::dmabuf_exporter(dmabuf.as_raw_fd()).as_deref() == Some(stays)
+        {
+            log::warn!("export of a dma-buf RM's EXPORT_TO_DMABUF_FD made ({stays}); refused");
+            return Err(libc::EINVAL);
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    /// A dma-buf of some exporter, where /dev/udmabuf is open to us.
+    fn udmabuf() -> Option<std::os::fd::OwnedFd> {
+        let dev = crate::sys::fd::open_path("/dev/udmabuf", libc::O_RDWR).ok()?;
+        let memfd =
+            crate::sys::fd::memfd(c"gate", libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING).ok()?;
+        crate::sys::fd::ftruncate(&memfd, 4096).ok()?;
+        crate::sys::fd::add_seals(&memfd, libc::F_SEAL_SHRINK).ok()?;
+        crate::sys::ioctl::udmabuf_create(dev.as_fd(), memfd.as_fd(), 4096, 1).ok()
+    }
+
+    /// With an exporter marked as staying, its dma-bufs are refused and no
+    /// other file is; unmarked (the switch off), nothing is asked.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no /dev/udmabuf")]
+    fn a_guest_only_exporter_never_leaves() {
+        let Some(d) = udmabuf() else {
+            eprintln!("SKIPPED a_guest_only_exporter_never_leaves: no /dev/udmabuf");
+            return;
+        };
+        let semsurf = SemsurfPolicy::new();
+        let taint = SharedTaint::default();
+        let gate = |g| ExportGate {
+            semsurf: &semsurf,
+            injected: None,
+            taint: &taint,
+            guest_only: g,
+        };
+        let off = GuestOnly::default();
+        assert_eq!(gate(&off).may_leave(d.as_fd()), Ok(()));
+        let on = GuestOnly::default();
+        on.set("udmabuf").unwrap();
+        assert_eq!(gate(&on).may_leave(d.as_fd()), Err(libc::EINVAL));
+        let other = GuestOnly::default();
+        other.set(crate::rmexport::RM_EXPORTER).unwrap();
+        assert_eq!(gate(&other).may_leave(d.as_fd()), Ok(()));
+        let memfd = crate::sys::fd::memfd(c"not-a-dmabuf", libc::MFD_CLOEXEC).unwrap();
+        assert_eq!(gate(&on).may_leave(memfd.as_fd()), Ok(()));
     }
 }

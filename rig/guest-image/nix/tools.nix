@@ -23,6 +23,10 @@
 #                            ioctl; tools32.nix builds both of these 32-bit too
 #   bin/nvgpu-bench          Vulkan, GL, RM and wl_shm microbenchmarks (BENCHMARKS.md)
 #   bin/nvgpu-cubench        CUDA driver-API microbenchmarks, libcuda dlopen()ed
+#   bin/nvgpu-rm-dmabuf      RM's EXPORT_TO_DMABUF_FD of video memory, imported
+#                            back (DRM, EGL, Vulkan): --allow-dmabuf-export
+#   bin/cuda-dmabuf          the same through cuMemGetHandleForAddressRange,
+#                            where CUDA offers it; libcuda dlopen()ed
 #   bin/nvgpu-bench-suite    the matrix of BENCHMARKS.md, as BENCH lines
 #   libexec/nvgpu/verify/{sec-negative,lease-flip}   (only with nvgpuSrc)
 {
@@ -86,6 +90,9 @@ pkgs.stdenv.mkDerivation {
     $CC $CFLAGS -I. nvgpu-bench.c xdg-shell-protocol.c -o nvgpu-bench \
       -lEGL -lGLESv2 $(pkg-config --cflags --libs vulkan wayland-client)
     $CC $CFLAGS nvgpu-cubench.c -o nvgpu-cubench -ldl
+    $CC $CFLAGS -Wno-unused-function rm-dmabuf.c -o nvgpu-rm-dmabuf -lEGL -lGLESv2 \
+      $(pkg-config --cflags --libs vulkan)
+    $CC $CFLAGS cuda-dmabuf.c -o cuda-dmabuf -ldl $(pkg-config --cflags --libs vulkan)
 
     if [ -n "$verifySrc" ]; then
       $CC -O2 -Wall -Wextra $(pkg-config --cflags libdrm) $verifySrc/sec-negative.c \
@@ -98,7 +105,8 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 -t $out/bin nvgpu-lease vk-acquire-display cuda-smoke nvgpu-poweroff egl-fence gl-then-vk \
-      nvgpu-capture-import nvgpu-map-churn nvgpu-drm-compat nvgpu-syncobj-race nvgpu-spin-cost nvgpu-rm-smoke nvgpu-bench nvgpu-cubench
+      nvgpu-capture-import nvgpu-map-churn nvgpu-drm-compat nvgpu-syncobj-race nvgpu-spin-cost nvgpu-rm-smoke nvgpu-bench nvgpu-cubench \
+      nvgpu-rm-dmabuf cuda-dmabuf
     install -Dm755 -t $out/lib libnvgpu-shim.so
     install -Dm755 nvgpu-bench-suite.sh $out/bin/nvgpu-bench-suite
     if [ -n "$verifySrc" ]; then
@@ -112,6 +120,7 @@ pkgs.stdenv.mkDerivation {
   postFixup = ''
     patchelf --add-rpath /run/opengl-driver/lib $out/bin/cuda-smoke
     patchelf --add-rpath /run/opengl-driver/lib $out/bin/nvgpu-cubench
+    patchelf --add-rpath /run/opengl-driver/lib $out/bin/cuda-dmabuf
   '';
   meta.description = "virtio-nvgpu guest test helpers";
 }

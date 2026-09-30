@@ -206,6 +206,19 @@ let
           no slower (DEPLOY.md, "Backend flags").
         '';
       };
+      dmabufExport = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Serve RM's EXPORT_TO_DMABUF_FD (`--allow-dmabuf-export`; DEPLOY.md,
+          "dma-buf export through RM"): a guest process's own video memory
+          as a dma-buf, for the guest's own importers only. It never leaves
+          the VM, no CPU maps it, and a VM holds at most 256 of them and
+          8 GiB. Off, the escape is refused, and NVIDIA's GBM export through
+          RM and CUDA's dma-buf export fail as on a driver without dma-buf
+          support (SECURITY.md, "dma-buf export through RM").
+        '';
+      };
       wayland = {
         socket = mkOption {
           type = types.nullOr (types.strMatching "^/[^[:space:]]+$");
@@ -538,6 +551,7 @@ in
                   "--osdesc-populate"
                   "on"
                 ]
+                ++ lib.optional vm.dmabufExport "--allow-dmabuf-export"
               );
               NVGPU_WAYLAND_ARGS = concatStringsSep " " (
                 lib.optionals (vm.wayland.socket != null) [

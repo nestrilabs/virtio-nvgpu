@@ -9,6 +9,9 @@
 #                    work. Otherwise (0, the default) the guest must have no
 #                    UVM device, CUDA must fail cleanly, and everything else
 #                    must work without it.
+#   nvgpu_dmabuf_export=1  the backend runs with --allow-dmabuf-export
+#                    (NVGPU_DMABUF_EXPORT=1): RM's dma-buf export must work;
+#                    otherwise (0, the default) it must be refused.
 . /opt/nvgpu/probe-common.sh
 probe_init render 170
 
@@ -97,6 +100,24 @@ else
     else
         fail "cuda-smoke: exit $rc without --allow-compute (a crash, a hang, or a failure past context creation)"
     fi
+fi
+
+section "dma-buf export through RM"
+# RM's EXPORT_TO_DMABUF_FD (--allow-dmabuf-export; SECURITY.md, "dma-buf
+# export through RM"). With the switch: the process's own video memory as a
+# guest dma-buf, three times over, imported by the render node, never CPU-
+# mapped; NVIDIA's EGL and Vulkan take none natively on a discrete GPU, and
+# a refusal of theirs is a SKIP (nvgpu-rm-dmabuf). Without it: refused, as
+# on a driver with no dma-buf export. CUDA's own export only where CUDA
+# offers it at all (not on a GeForce card), and only with compute.
+if [ "$(arg dmabuf_export 0)" = 1 ]; then
+    step "nvgpu-rm-dmabuf --loops 3 (own video memory, exported and imported)" 90 \
+        nvgpu-rm-dmabuf --loops 3
+    if [ "$(arg compute 0)" = 1 ]; then
+        step "cuda-dmabuf --loops 3 (cuMemGetHandleForAddressRange)" 90 cuda-dmabuf --loops 3
+    fi
+else
+    step "nvgpu-rm-dmabuf --expect-refused (the switch off)" 60 nvgpu-rm-dmabuf --expect-refused
 fi
 
 section "vkcube"

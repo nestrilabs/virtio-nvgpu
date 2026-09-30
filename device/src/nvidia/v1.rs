@@ -69,6 +69,8 @@ pub(super) struct V1Request<'a> {
     /// What follows the blocks: the calling process, from a guest that says
     /// (rmshare.rs).
     pub(super) trailer: &'a [u8],
+    /// The most the reply may be.
+    pub(super) cap: usize,
 }
 
 /// What follows a v1 IOCTL's nested block.
@@ -129,7 +131,7 @@ impl<'a> V1Request<'a> {
     /// only on the three calls that register memory. Either is refused
     /// rather than ignored, so a guest never believes pointers were carried
     /// that were not.
-    fn parse(payload: &'a [u8]) -> std::result::Result<Self, i32> {
+    fn parse(payload: &'a [u8], cap: usize) -> std::result::Result<Self, i32> {
         use abi::ioctl::*;
         let ireq = pod::read::<IoctlReq>(payload, 0).ok_or(libc::EPROTO)?;
         // The guest sends the top-level struct and the block any pointer in
@@ -185,6 +187,7 @@ impl<'a> V1Request<'a> {
             params: &body[..nested_end],
             deep,
             trailer: &body[want..],
+            cap,
         })
     }
 }
@@ -327,7 +330,7 @@ impl NvidiaBackend {
 
     /// A v1 IOCTL whose reply may be at most `cap` bytes.
     pub(super) fn serve_ioctl(&mut self, payload: &[u8], cap: usize) -> V1 {
-        let req = V1Request::parse(payload)?;
+        let req = V1Request::parse(payload, cap)?;
         let (ireq, param_in, page_list) = (req.ireq, req.params, req.deep.page_list());
 
         // Room for the answer, before anything is asked of the host: a
@@ -441,6 +444,7 @@ impl NvidiaBackend {
         {
             self.semsurf.gem_closed(self.current_handle, gem);
             self.inject.gem_closed(self.current_handle, gem);
+            self.rm_exports.gem_closed(self.current_handle, gem);
         }
         r
     }

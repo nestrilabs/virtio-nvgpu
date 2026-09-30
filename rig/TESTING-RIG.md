@@ -26,8 +26,8 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
+| 2026-09-30 | branch `knob-dmabuf`: `--allow-dmabuf-export` | stage1, compat, render and secneg with the switch off and on, nesbox, Rust module | "dma-buf export through RM" |
 | 2026-09-30 | branch `knob-vram` (`--vram-limit`) on display-passthrough | the limit as nvidia-smi, Vulkan and CUDA see it, allocations past it, stage1, compat, render and five applications with a limit, compat without | "Video memory limit" |
-
 | 2026-09-30 | branch `knob-rm`: opt-in RM groups (`--rm-allow-group`) and `--osdesc-populate`, under nesbox, C module | `secneg` with every group off and on (19 passed, 5 KMS skips each; T14-T16 answered by the allowlist off and by each group's rule on, a guest temperature reading with `thermal`); `render` with compute 9/0/1 at the defaults; nvidia-smi -q with `health` on; cuMemHostRegister of fresh memory with populate on and off, three boots each | "Opt-in RM groups" |
 | 2026-09-30 | branch `integrate35` (display-passthrough after this row): everything above plus the Steam-like workloads' guest changes and `patches/nesbox/0001`; the binaries installed in `.rig/` | Groups A and B under the patched nesbox (C and Rust modules) and crosvm, two batches of live applications: all passed (apps 18/0 and 23/0) | "Regression of the 2026-09-30 review" |
 | 2026-09-30 | branch `winehang`: `patches/nesbox/0001` (virtio-blk interrupt barrier), killable locks in the guest module, hang-watch | fresh-boot Wine/Godot D3D12 starts under nesbox with and without the patch; stage1, compat, render (with and without compute) and wayland on the patched nesbox | "Wine start-up stalls" |
@@ -752,6 +752,30 @@ The guest's PCI config space from a root snapshot (`--pci-config-dir`) was
 shown with a synthetic snapshot, since the rig has no root: the guest's
 `lspci -vvv` reads `Capabilities: [40] Null` without it, and the snapshot's
 PCIe capability and link with it.
+
+## dma-buf export through RM
+
+`NVGPU_DMABUF_EXPORT=1` (or `--allow-dmabuf-export`) gives the backend the
+switch and the probes `nvgpu_dmabuf_export=1`: the render probe then runs
+`nvgpu-rm-dmabuf --loops 3`, and without it `--expect-refused`; secneg's
+T17-T20 run either way (T14-T17 on the branch, before the merge with the
+RM groups' T14-T16). 2026-09-30, branch `knob-dmabuf`, nesbox, the Rust
+module on the Rust kernel, sandbox on, `nvgpu_secneg_kms=none`:
+
+| probe | switch off | switch on |
+|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 |
+| compat | 13/0/0 | 13/0/0 |
+| render | 10/0/1; the export refused (EOPNOTSUPP) | 10/0/1; three exports made, 2 MiB each, imported by the render node as dma-buf objects, `mmap` refused (EOPNOTSUPP), the append form refused (`NV_ERR_NOT_SUPPORTED`) |
+| secneg | 16 passed, 6 skipped (the control, T17, SKIP) | 17 passed, 5 skipped |
+
+In both, NVIDIA's EGL (`EGL_BAD_ALLOC`) and Vulkan (no memory type) refuse
+the dma-buf, as they do natively on the RTX 5090 with 595.99.02
+(`nvgpu-rm-dmabuf` run on the host: the same SKIPs, and `mmap` ENOTSUPP);
+CUDA offers no dma-buf export on a GeForce card, natively either, so
+`cuda-dmabuf` SKIPs. sec-negative run on the host shows why the backend
+checks the client: RM exports another process's video memory (T18 FAILs
+natively).
 
 ## Window size and share
 

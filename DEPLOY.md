@@ -768,6 +768,47 @@ The backend refuses to start with a name it does not know, or with `debug`
 or `profiling` and no `--allow-compute`; the NixOS module says the same at
 evaluation.
 
+## dma-buf export through RM
+
+`--allow-dmabuf-export` (the NixOS module's `vms.<n>.dmabufExport`, the
+launcher's `NVGPU_DMABUF_EXPORT=1`). **Off by default**, and then RM's
+`EXPORT_TO_DMABUF_FD` is refused as it always was.
+
+**What it does.** A guest process may export video memory of its own RM
+client as a dma-buf, the way CUDA's `cuMemGetHandleForAddressRange` with a
+dma-buf handle and NVIDIA's GBM export through RM ask nvidia.ko to. The
+guest gets a dma-buf of its own device: its render nodes import it, it can
+be passed to another guest process (which can import it too), and NVIDIA's
+userspace in the guest takes it as it takes the same dma-buf natively.
+
+**What it does not.** The dma-buf never leaves the VM: it cannot be sent to
+the host compositor as a Wayland buffer (the client sees
+`zwp_linux_buffer_params_v1.failed`), made a framebuffer on a lease or card,
+or handed out as a host dma-buf. No CPU maps it (as natively on a discrete
+GPU: `mmap` fails, EOPNOTSUPP in the guest, ENOTSUPP natively). One call
+makes the whole dma-buf, of at most 128 allocations: the append form
+(`fd` >= 0), which CUDA uses only past 128 allocations, is refused. Only
+memory of a client the calling process made. A VM holds at most 256
+exports and 8 GiB of them at once, a process a quarter of the count and
+half the bytes; past that the export fails with
+`NV_ERR_INSUFFICIENT_RESOURCES`.
+
+**Gain.** Workloads that export video memory through RM stop failing as on
+a driver without dma-buf export. On the rig's RTX 5090 (595.99.02) that is
+less than it sounds: CUDA offers no dma-buf export on a GeForce card
+(`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` is 0, natively too), and NVIDIA's
+EGL and Vulkan take no dma-buf of RM's on a discrete GPU natively either
+(`EGL_BAD_ALLOC`; no memory type for it). What works there is the export
+itself and a render node's import of it; the rest is where the host's own
+driver takes it.
+
+**Cost.** nvidia.ko's dma-buf exporter becomes reachable from the guest
+(`nv-dmabuf.c`: the export, and the attach and map of the backend's own
+import of it into the render file), and each live export holds a render
+file of the host's, its import, and BAR1 space while mapped on a GPU
+without static BAR1 (SECURITY.md, "dma-buf export through RM"). Needs
+nothing of the units or the sandbox.
+
 ## Backend flags
 
 `vhost-user-nvgpu --help` has each one's full text; `--diagnostic --help`
@@ -778,6 +819,7 @@ shows the diagnostic ones too.
 | `--socket PATH` | `$XDG_RUNTIME_DIR/nvgpu/nvgpu.sock` | the vhost-user socket; whoever connects gets the guest's memory. A file already there is removed only if it is this uid's socket. Not with the units: systemd binds the socket and hands it over (`LISTEN_FDS`, descriptors named `vhost-user` and `inject`) |
 | `--socket-fd N` | none | serve the vhost-user socket already listening on descriptor N, bound by whoever started the backend (the root launcher does this) |
 | `--allow-compute` | off | serve CUDA and other compute: `/dev/nvidia-uvm`, the UVM aperture, memory registered by its pages. Graphics, Vulkan Video and display need none of it |
+| `--allow-dmabuf-export` | off | serve RM's `EXPORT_TO_DMABUF_FD`: a guest process's own video memory as a guest dma-buf that never leaves the VM ("dma-buf export through RM") |
 | `--window-size MIB` | 1024 | the shared window: how much GPU memory the VM's processes can have CPU-mapped at once. A multiple of 64, at least 256; with `--allow-compute` at most 64512 (window and aperture share crosvm's 64 GiB region cap), else 65536; nesbox takes at most 32768. Refused at start otherwise ("Sizing the window") |
 | `--window-owner-share PERCENT` | 50 | the percent of each window zone one guest process may hold, 1-95. From 88 one process can take a zone down to its reserve (SECURITY.md, "The window's size and share"). The same percent of `--vram-limit` |
 | `--vram-limit MIB` | none | hold the VM to MIB of video memory, at least 64: allocations past it fail as on a smaller GPU, and nvidia-smi, NVML, Vulkan and CUDA in the guest are told it as the GPU's size ("Video memory limit") |
@@ -944,9 +986,9 @@ as root by default and is not a model for a production image.
 - **The compositor-VM and export modes, and hotplug**, until they have run
   on hardware.
 - MIG and SR-IOV; `cudaMallocManaged` and full unified memory.
-- RM's `EXPORT_TO_DMABUF_FD` (dma-buf export through RM: NVIDIA's GBM export
-  through RM, CUDA's `cuMemGetHandleForAddressRange` with a dma-buf handle),
-  IMEX sessions and fabric memory, nvidia-drm's
+- RM's `EXPORT_TO_DMABUF_FD` without `--allow-dmabuf-export`, and with it
+  its append form and any export of it out of the VM ("dma-buf export
+  through RM"); IMEX sessions and fabric memory, nvidia-drm's
   `GEM_IMPORT_USERSPACE_MEMORY`, DRM `GEM_FLINK`/`GEM_OPEN`: refused.
 - Vulkan ray tracing without `--allow-compute`: NVIDIA's driver lists the
   extensions but cannot create a device with them, natively as well; an app

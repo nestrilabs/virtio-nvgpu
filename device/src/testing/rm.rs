@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Test-only: a host RM with an object tree, for the backend's RM tests.
 //!
-//! Installed as a backend's host ioctl, it answers the five escapes the
-//! backend's RM gates sit in front of -- RM_ALLOC, RM_CONTROL, RM_FREE,
-//! RM_DUP_OBJECT, RM_SHARE -- as resserv does (NVIDIA's
+//! Installed as a backend's host ioctl, it answers the escapes the
+//! backend's RM gates sit in front of -- RM_ALLOC, RM_CONTROL (its
+//! parameters kept, [`FakeRm::last_params`], and CLIENT_GET_HANDLE_INFO's
+//! class answered from the tree), RM_FREE, RM_DUP_OBJECT, RM_SHARE, and
+//! EXPORT_TO_DMABUF_FD (`FakeRm::export`) -- as resserv does (NVIDIA's
 //! src/nvidia/src/libraries/resserv): a client unknown to it is
 //! INVALID_OBJECT_HANDLE, an object unknown in a known client is
 //! OBJECT_NOT_FOUND, a new handle already in use is INSERT_DUPLICATE_NAME,
@@ -25,7 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::RawFd;
 
 use abi::ioctl::{
-    NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL, NV_ESC_RM_DUP_OBJECT, NV_ESC_RM_FREE, NV_ESC_RM_SHARE,
+    NV_ESC_EXPORT_TO_DMABUF_FD, NV_ESC_RM_ALLOC, NV_ESC_RM_CONTROL, NV_ESC_RM_DUP_OBJECT,
+    NV_ESC_RM_FREE, NV_ESC_RM_SHARE,
 };
 
 use crate::hostfd;
@@ -333,6 +336,49 @@ impl FakeRm {
         Some(status.unwrap_or(NV_OK))
     }
 
+    /// EXPORT_TO_DMABUF_FD's block `a` (either layout), as nv_dma_buf_export
+    /// makes a new dma-buf (`fd` -1): no check of whose `hClient` is, each
+    /// handle an object of it that is no client, and the dma-buf a memfd
+    /// named `nv_dmabuf` of `totalSize` bytes, its number written to `fd`.
+    /// The append form is refused as for a dma-buf already whole
+    /// (NV_ERR_INVALID_ARGUMENT). The status.
+    fn export(&mut self, a: &mut [u8]) -> Option<u32> {
+        let l = crate::rmexport::Layout::for_len(a.len())?;
+        let (fd, client) = (crate::le::i32_at(a, 0)?, u32_at(a, 4)?);
+        let num = u32_at(a, 12)?;
+        let first = u32_at(a, l.handles)?;
+        self.seen(NV_ESC_EXPORT_TO_DMABUF_FD, client, first, num);
+        let call = Call {
+            nr: NV_ESC_EXPORT_TO_DMABUF_FD,
+            client,
+            object: first,
+            key: num,
+        };
+        if fd != -1 || num == 0 || num > 128 {
+            return Some(NV_ERR_INVALID_ARGUMENT);
+        }
+        if let Err(s) = self.client(client) {
+            return Some(s);
+        }
+        for i in 0..num as usize {
+            let h = u32_at(a, l.handles + i * 4)?;
+            match self.object(client, h) {
+                Ok(o) if !ROOT_CLASSES.contains(&o.class) => {}
+                Ok(_) => return Some(NV_ERR_INVALID_OBJECT_HANDLE),
+                Err(s) => return Some(s),
+            }
+        }
+        if let Err(s) = self.hook(&call) {
+            return Some(s);
+        }
+        let size = crate::le::u64_at(a, 24)?;
+        let m = crate::sys::fd::memfd(&export_name(), libc::MFD_CLOEXEC).ok()?;
+        crate::sys::fd::ftruncate(&m, size).ok()?;
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(m);
+        a[0..4].copy_from_slice(&raw.to_le_bytes());
+        Some(NV_OK)
+    }
+
     fn seen(&mut self, nr: u32, client: u32, object: u32, key: u32) {
         self.seen.push(Call {
             nr,
@@ -373,6 +419,30 @@ fn control_params(arg: &mut crate::sys::block::Arg<'_>) -> u32 {
     status
 }
 
+/// The name of this thread's export memfds: `nv_dmabuf` and the thread, so
+/// a test counting the ones still open counts its own
+/// ([`open_exports`]).
+pub fn export_name() -> std::ffi::CString {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::thread_local! {
+        static ME: u64 = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let me = ME.with(|m| *m);
+    std::ffi::CString::new(format!("nv_dmabuf-{me}-")).expect("no NUL")
+}
+
+/// How many of this thread's export memfds this process has open.
+pub fn open_exports() -> usize {
+    let want = format!("/memfd:{}", export_name().to_string_lossy());
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| {
+            d.filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                .filter(|l| l.to_string_lossy().starts_with(&want))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 /// Where an escape's block holds its status.
 fn status_at(nr: u32) -> Option<(usize, usize)> {
     Some(match nr {
@@ -393,6 +463,22 @@ fn serve(_: RawFd, request: u64, arg: &mut crate::sys::block::Arg<'_>) -> i32 {
     let nr = hostfd::ioc_nr(request);
     if hostfd::ioc_type(request) != b'F' {
         return 0;
+    }
+    if nr == NV_ESC_EXPORT_TO_DMABUF_FD {
+        let size = hostfd::ioc_size(request);
+        let (Some(a), Some(l)) = (
+            arg.bytes().get_mut(..size),
+            crate::rmexport::Layout::for_len(size),
+        ) else {
+            return -libc::EINVAL;
+        };
+        return match with(|rm| rm.export(a)) {
+            Some(status) => {
+                put_u32(a, l.status, status);
+                0
+            }
+            None => -libc::EINVAL,
+        };
     }
     let Some((size, at)) = status_at(nr) else {
         return 0;
