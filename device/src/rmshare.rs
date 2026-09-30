@@ -2472,23 +2472,65 @@ mod backend_tests {
         );
     }
 
+    /// FIFO_DISABLE_CHANNELS through the backend: the clients it names are
+    /// the calling process's own (this module), and its preemption event
+    /// and rate are rmchan.rs's. Each refusal is RM's status, RM not called.
     #[test]
-    fn channels_of_another_vms_clients_are_not_disabled() {
-        let (mut be, f1, _) = vm(FULL);
-        // This module's gate alone: the RM allowlist in front of it
-        // (rmallow.rs) refuses these calls first, and is tested there.
+    fn only_the_callers_own_channels_are_disabled() {
+        use crate::rmchan::{PROC_BURST, RUNLIST_PREEMPT_EVENT};
+        let (mut be, f1, f2) = vm(FULL);
+        // The gates below alone: the test backend has no host release, so
+        // the RM allowlist in front of them (rmallow.rs, which has the
+        // control and its size) is set to forward.
         be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let a = alloc_client(&mut be, f1, Some(pid(10)));
+        let a2 = alloc_client(&mut be, f1, Some(pid(10)));
+        let b = alloc_client(&mut be, f2, Some(pid(20)));
         let ctl = words(&[(0, a), (4, 0x2080), (8, 0x2080_110b), (24, 536)], 32);
-        let list = |c: u32| words(&[(4, 1), (24, c), (280, 0xc4a)], 536);
+        let list = |cs: &[u32]| {
+            let mut w = vec![(4, cs.len() as u32)];
+            for (i, &c) in cs.iter().enumerate() {
+                w.push((24 + 4 * i, c));
+                w.push((280 + 4 * i, 0xc4a));
+            }
+            words(&w, 536)
+        };
+        let refused = |be: &mut NvidiaBackend, p: &[u8], by: u32, status: u32| {
+            seen();
+            let r = call(be, f1, CONTROL, &ctl, p, Some(pid(by)));
+            assert_eq!(rm_status(&r, NVOS54_STATUS), status);
+            assert!(!reached(0x2a), "RM was not to be called");
+        };
+        // Another VM's client (one this VM never allocated).
+        refused(&mut be, &list(&[HOST]), 10, NV_ERR_INSUFFICIENT_PERMISSIONS);
+        // Another guest process's client in this VM, alone or after the
+        // caller's own.
+        refused(&mut be, &list(&[b]), 10, NV_ERR_INSUFFICIENT_PERMISSIONS);
+        refused(&mut be, &list(&[a, b]), 10, NV_ERR_INSUFFICIENT_PERMISSIONS);
+        // The caller's client, called by another process of the VM.
+        refused(&mut be, &list(&[a2]), 20, NV_ERR_INSUFFICIENT_PERMISSIONS);
+        // A count past the list's 64 entries: refused whole.
+        let mut over = list(&[a]);
+        over[4..8].copy_from_slice(&65u32.to_le_bytes());
+        refused(&mut be, &over, 10, NV_ERR_INVALID_ARGUMENT);
+        // A preemption event: RM's answer to a user client, without RM.
+        let mut ev = list(&[a]);
+        ev[RUNLIST_PREEMPT_EVENT..RUNLIST_PREEMPT_EVENT + 8]
+            .copy_from_slice(&0xffff_8880_1234_0000u64.to_le_bytes());
+        refused(&mut be, &ev, 10, NV_ERR_INSUFFICIENT_PERMISSIONS);
+        // The caller's own clients: to RM, up to its burst...
+        for i in 0..PROC_BURST as usize {
+            seen();
+            let r = call(&mut be, f1, CONTROL, &ctl, &list(&[a, a2]), Some(pid(10)));
+            assert_eq!(rm_status(&r, NVOS54_STATUS), 0, "call {i}");
+            assert!(reached(0x2a));
+        }
+        // ...then over its rate, answered as the allowlist answers.
+        refused(&mut be, &list(&[a]), 10, crate::nvos::NV_ERR_NOT_SUPPORTED);
+        // Another process's own calls are its own budget.
+        let ctl_b = words(&[(0, b), (4, 0x2080), (8, 0x2080_110b), (24, 536)], 32);
         seen();
-        let r = call(&mut be, f1, CONTROL, &ctl, &list(HOST), Some(pid(10)));
-        assert_eq!(
-            rm_status(&r, NVOS54_STATUS),
-            NV_ERR_INSUFFICIENT_PERMISSIONS
-        );
-        assert!(!reached(0x2a));
-        let r = call(&mut be, f1, CONTROL, &ctl, &list(a), Some(pid(10)));
+        let r = call(&mut be, f2, CONTROL, &ctl_b, &list(&[b]), Some(pid(20)));
         assert_eq!(rm_status(&r, NVOS54_STATUS), 0);
         assert!(reached(0x2a));
     }

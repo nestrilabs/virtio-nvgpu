@@ -252,6 +252,16 @@ impl NvidiaBackend {
                 return Ok(IoctlOut::deep(out, deep_bytes.len()));
             }
         };
+        // A guest stopping its own channels: no preemption event, RM's size,
+        // and a rate per guest process and per VM (rmchan.rs). Its clients
+        // were the share gate's, just above.
+        if escape == NV_ESC_RM_CONTROL
+            && let Err(status) = self.rm_chan_gate(param_in)
+        {
+            let mut out = nvos::with_status(param_in, NVOS54_STATUS, status);
+            out.extend_from_slice(deep_bytes);
+            return Ok(IoctlOut::deep(out, deep_bytes.len()));
+        }
 
         // What the memory an escape makes, duplicates, frees or GPU-maps is,
         // and the coherency rewrite (rmmem.rs): the host is handed a rewritten

@@ -148,6 +148,8 @@ pub struct NvidiaBackend {
     rm_controls: crate::tally::Tally,
     /// Which RM controls and classes reach the host at all (rmallow.rs).
     rmallow: crate::rmallow::RmAllow,
+    /// FIFO_DISABLE_CHANNELS: its preemption event and its rate (rmchan.rs).
+    pub(crate) rmchan: crate::rmchan::ChannelGate,
     /// Every ioctl forwarded, by namespace and number.
     ///
     /// There are three namespaces, not one, and that is the point of counting
@@ -338,6 +340,7 @@ impl NvidiaBackend {
             rm_classes: crate::tally::Tally::default(),
             rm_controls: crate::tally::Tally::default(),
             rmallow: crate::rmallow::RmAllow::default(),
+            rmchan: crate::rmchan::ChannelGate::new(std::time::Instant::now()),
             ioctls_by_ns: std::collections::BTreeMap::new(),
             pump_cmds: Vec::new(),
             created: Vec::new(),
@@ -579,6 +582,13 @@ impl NvidiaBackend {
         // What crossed the boundary, how often and how fast (pacing.rs):
         // what frame pacing is judged by, at the same level.
         crate::pacing::log_summary();
+        if self.rmchan.refused > 0 {
+            log::warn!(
+                "NvidiaBackend::teardown: {} FIFO_DISABLE_CHANNELS call(s) answered without RM \
+                 (rmchan.rs)",
+                self.rmchan.refused
+            );
+        }
         if !self.abi_refused.is_empty() {
             let verb = if self.abi_policy == AbiPolicy::Enforce {
                 "refused"

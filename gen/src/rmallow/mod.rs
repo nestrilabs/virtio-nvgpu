@@ -161,7 +161,7 @@ mod tests {
     fn every_observed_control_and_class_is_allowed_in_every_release() {
         let controls = observed("controls ");
         let classes = observed("classes ");
-        assert_eq!(controls.len(), 162);
+        assert_eq!(controls.len(), 163);
         assert_eq!(classes.len(), 33);
         for r in RELEASES {
             // What a release lacks, or refuses an unprivileged caller itself

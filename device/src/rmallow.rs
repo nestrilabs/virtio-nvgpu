@@ -435,6 +435,46 @@ mod tests {
         assert_eq!(between.check(NV_ESC_RM_CONTROL, &b, 32), Ok(()));
     }
 
+    /// FIFO_DISABLE_CHANNELS (rmchan.rs): allowed on every release measured,
+    /// at RM's 536 bytes and no other size, and never bundled into a
+    /// DEFERRED_API, which would run it past rmchan.rs's gate.
+    #[test]
+    fn disable_channels_is_allowed_at_rms_size_and_never_deferred() {
+        use crate::rmchan::{CTRL_FIFO_DISABLE_CHANNELS, PARAMS_SIZE};
+        for (maj, min, pat) in [
+            (535, 129, 3),
+            (580, 178, 4),
+            (595, 71, 5),
+            (595, 99, 2),
+            (610, 57, 4),
+            (615, 71, 9),
+        ] {
+            let mut g = RmAllow::new(Mode::Enforce);
+            g.set_driver(DriverVersion::new(maj, min, pat));
+            let ok = nvos54(CTRL_FIFO_DISABLE_CHANNELS, &[0u8; PARAMS_SIZE]);
+            assert_eq!(g.check(NV_ESC_RM_CONTROL, &ok, 32), Ok(()), "{maj}.{min}");
+            for len in [PARAMS_SIZE - 8, PARAMS_SIZE + 8] {
+                let b = nvos54(CTRL_FIFO_DISABLE_CHANNELS, &vec![0u8; len]);
+                assert_eq!(
+                    g.check(NV_ESC_RM_CONTROL, &b, 32),
+                    Err(Refusal::Status {
+                        at: 28,
+                        status: NV_ERR_INVALID_PARAM_STRUCT
+                    }),
+                    "{maj}.{min} {len}"
+                );
+            }
+            let mut bundle = vec![0u8; 64];
+            bundle[4..8].copy_from_slice(&CTRL_FIFO_DISABLE_CHANNELS.to_le_bytes());
+            for d in DEFERRED_API_CONTROLS {
+                assert!(
+                    g.check(NV_ESC_RM_CONTROL, &nvos54(d, &bundle), 32).is_err(),
+                    "{maj}.{min}: {d:#x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_deferred_api_bundle_is_held_to_the_same_list() {
         let mut g = RmAllow::new(Mode::Enforce);

@@ -218,6 +218,13 @@ pub fn rm_share(b: &mut Bytes) {
     let _ = rmctl::unix_control(cmd);
     let _ = rmctl::unix_refused(params);
     let _ = rmctl::unsupported(params);
+    // FIFO_DISABLE_CHANNELS' gate, the size said being the class word.
+    let mut g = crate::rmchan::ChannelGate::new(std::time::Instant::now());
+    let owner = crate::quota::Owner::Proc {
+        tgid: cmd,
+        start_ns: 0,
+    };
+    let _ = g.check(owner, params, class, std::time::Instant::now());
 }
 
 /// NVKMS on a v1 message: the policy's in-place checks and rewrites.

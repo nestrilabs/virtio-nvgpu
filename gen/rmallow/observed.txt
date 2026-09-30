@@ -13,7 +13,7 @@ classes 0x00da 0x00de 0x00fe 0x2080 0x2081 0x50a0 0x83de 0x902d
 classes 0x9067 0x9072 0x9096 0x90e7 0x90f1 0xa06c 0xc661 0xc96f
 classes 0xca6f 0xcab5 0xcb33 0xcd40 0xce97 0xcec0 0xcfb0 0xcfb7
 classes 0xcffa
-# controls: 162 (156 from the 106 runs, 6 from the application pass below)
+# controls: 163 (156 from the 106 runs, 6 from the application pass and 1 from the heavy workloads below)
 controls 0x00000102 0x0000013a 0x000001f0 0x00000201 0x00000202 0x00000204 0x00000205 0x00000214
 controls 0x00000215 0x00000216 0x0000021b 0x00000275 0x00000279 0x0000027b 0x00000288 0x00000289
 controls 0x00000301 0x00000a04 0x00000b02 0x00000d01 0x00000d04 0x00003d05 0x00003d06 0x00730101
@@ -41,3 +41,9 @@ controls 0xa06f0104 0xc36f0108 0xc36f010a 0xcb330101
 controls 0x20808163 0x20808164 0x20808165
 # CUDA runtime initialisation (cudart), OpenCL: clock domains and clocks.
 controls 0x20809001 0x2080a026 0x2080a084
+# 2026-09-30, the heavy workloads (BENCHMARKS.md, "Heavy workloads"): NVIDIA's
+# Vulkan driver stops its own channels around queue set-up and around each
+# frame Blender starts, and hangs without it. Its clients are held to the
+# calling guest process (device/src/rmshare.rs), its preemption event must
+# be NULL and its rate is bounded (device/src/rmchan.rs).
+controls 0x2080110b

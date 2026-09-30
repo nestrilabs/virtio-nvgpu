@@ -53,6 +53,7 @@ pub mod release;
 #[cfg(test)]
 mod replay;
 pub mod rmallow;
+pub mod rmchan;
 pub mod rmctl;
 pub mod rmmem;
 pub mod rmshare;
