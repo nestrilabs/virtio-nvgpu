@@ -457,6 +457,10 @@ static struct sg_table *nvgpu_dmabuf_map(struct dma_buf_attachment *attach,
   dma_addr_t addr;
   int ret, idx;
 
+  /* One segment, whose length is an unsigned int: a larger object (a
+   * window of more than 4 GiB) would be handed over truncated. */
+  if (obj->size > UINT_MAX)
+    return ERR_PTR(-E2BIG);
   /* Not after remove(): the window is the device's. */
   if (!drm_dev_enter(obj->dev, &idx))
     return ERR_PTR(-ENODEV);
@@ -608,7 +612,10 @@ static struct nvgpu_gem_object *nvgpu_gem_proxy_new(struct drm_device *drm,
 
   ng = kzalloc(sizeof(*ng), GFP_KERNEL);
   if (!ng) {
-    nvgpu_gem_close(owner->dev, owner->handle, host_handle);
+    /* An import's number may be another import's proxy's, made meanwhile
+     * (the host hands the same buffer the same handle, drm_prime.c:306-310):
+     * closed only if no proxy holds it, as above (S-11). */
+    nvgpu_gem_close_unheld(owner, host_handle);
     return ERR_PTR(-ENOMEM);
   }
 
