@@ -746,10 +746,14 @@ and answers a `vkCreateDevice` that asks for them with
 application falls back (vkd3d-proton without DXR, a game without DLSS). It
 does nothing when `/dev/nvidia-uvm` exists, for another vendor's device, or
 with `NVGPU_VK_NO_UVM_DISABLE=1`, and it reaches nothing outside the
-process. Install it where every Vulkan loader looks, with the manifest
-naming the library by its absolute path (`make PREFIX=/usr install`, or the
-64- and 32-bit builds of `rig/guest-image/nix/vk-layer.nix`, whose
-manifests carry `library_arch` so each loader takes its own).
+process. Install its manifest where the guest's Vulkan loader searches for
+implicit layers, naming the library by its absolute path: `make PREFIX=/usr
+install` puts it in `/usr/share/vulkan/implicit_layer.d`, which every loader
+searches while `XDG_DATA_DIRS` is unset; nixpkgs' loader does not search
+`/etc/vulkan`, and on NixOS a package in the system profile is found through
+`XDG_DATA_DIRS`. The 64- and 32-bit builds of
+`rig/guest-image/nix/vk-layer.nix` carry `library_arch` in their manifests,
+so each loader takes its own.
 
 **What the image must contain**, then: the kernel and `virtio_gpu_nv.ko`
 loaded at boot; the host's NVIDIA userspace (Vulkan ICD, EGL and GBM

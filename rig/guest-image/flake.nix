@@ -298,10 +298,11 @@
             ln -s $nvidiaBin/share/nvidia/nvidia-application-profiles-rc etc/nvidia/
           fi
 
-          # Implicit Vulkan layers the loader finds without XDG_DATA_DIRS.
-          mkdir -p etc/vulkan/implicit_layer.d
+          # Implicit Vulkan layers: nixpkgs' loader searches XDG_DATA_DIRS,
+          # which is unset here, so its default, /usr/share (not /etc/vulkan).
+          mkdir -p usr/share/vulkan/implicit_layer.d
           for l in $vkLayers; do
-            ln -s $l/share/vulkan/implicit_layer.d/*.json etc/vulkan/implicit_layer.d/
+            ln -s $l/share/vulkan/implicit_layer.d/*.json usr/share/vulkan/implicit_layer.d/
           done
 
           # Login shell environment for shell.sh and anything interactive.
