@@ -1832,9 +1832,12 @@ mod backend_tests {
         // (rmallow.rs) refuses these calls first, and is tested there.
         be.set_rm_allowlist(crate::rmallow::Mode::Log);
         let outer = nvos64(CLIENT, 0x5b, NV_EVENT_BUFFER, 0x7000, 72);
+        // Over a buffer the caller made: one RM makes itself is refused
+        // whatever the event (guestptr.rs `rm_alloc_params`).
         let with = |event: u64| {
             let mut n = [0u8; 72];
             n[40..48].copy_from_slice(&event.to_le_bytes());
+            n[60..64].copy_from_slice(&0x5b00_0001u32.to_le_bytes());
             n
         };
         for event in [999, u64::from(ctl), 0xffff_ffff_8100_0000] {
@@ -1843,8 +1846,8 @@ mod backend_tests {
         }
         assert_eq!(
             status(&v1(&mut be, ctl, ALLOC, &outer, &[])),
-            -libc::EINVAL,
-            "no parameters: RM would read them wherever the guest's pointer lands here"
+            -libc::EPERM,
+            "no parameters: no buffer of the caller's is named"
         );
         assert!(seen().is_empty(), "none of those reached the host");
 
@@ -1855,6 +1858,12 @@ mod backend_tests {
         let r = v1(&mut be, ctl, ALLOC, &outer, &with(u64::from(ctl)));
         assert_eq!(status(&r), 0);
         assert_eq!(seen(), vec![(0xce, host_fd), (NV_EVENT_BUFFER, host_fd)]);
+        // On a live event too, a buffer RM would make itself never reaches
+        // it: it would hand back the pages' host physical addresses.
+        let mut own = with(u64::from(ctl));
+        own[60..64].fill(0);
+        assert_eq!(status(&v1(&mut be, ctl, ALLOC, &outer, &own)), -libc::EPERM);
+        assert!(seen().is_empty());
         // A second-level pointer aimed at the field would overwrite the
         // translated event with an address of ours after the check.
         let r = v1_deep(

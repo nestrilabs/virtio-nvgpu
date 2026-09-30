@@ -232,6 +232,8 @@ const REFUSED_ALLOC_MEMORY_CLASSES: [u32; 4] = [0x71, 0x81, 0x82, 0x83];
 pub const NV01_EVENT: u32 = 0x05;
 /// NV0005_ALLOC_PARAMETERS.hClass: the class an NV01_EVENT becomes.
 const NV0005_H_CLASS: usize = 8;
+/// NV_EVENT_BUFFER_ALLOC_PARAMETERS.hBufferHeader.
+const EVENT_BUFFER_H_BUFFER_HEADER: usize = 60;
 
 /// The class RM_ALLOC of `class` makes, with `nested` the allocation
 /// parameters the guest sent. RM allocates an NV01_EVENT as the subclass its
@@ -252,8 +254,20 @@ pub(crate) fn rm_alloc_class(class: u32, nested: &[u8]) -> u32 {
 
 /// The checks on RM_ALLOC's allocation parameters (`nested`, as the guest
 /// sent them) that the top-level block alone cannot make. `outer` is the
-/// NVOS64 block: an NV01_EVENT whose subclass is refused is refused as that
-/// class ([`rm_alloc_class`]).
+/// NVOS64 block.
+///
+/// - An NV01_EVENT whose subclass is refused is refused as that class
+///   ([`rm_alloc_class`]).
+/// - An NV_EVENT_BUFFER with no `hBufferHeader` has RM allocate its three
+///   buffers itself and map them for the caller, and on Linux that "mapping"
+///   is the pages' host physical address, which RM writes into
+///   `bufferHeader`, `recordBuffer` and `vardataBuffer` for the caller to
+///   read (open-gpu-kernel-modules 595.99.02,
+///   src/nvidia/src/kernel/rmapi/event_buffer.c eventbufferConstruct_IMPL()
+///   and _allocAndMapMemory(); kernel-open/nvidia/nv-usermap.c
+///   nv_alloc_user_mapping()). Only buffers the caller allocated itself,
+///   named by handle, go to RM. A block too short to hold the handle is
+///   refused too: RM would read 0 there.
 pub(crate) fn rm_alloc_params(outer: &[u8], nested: &[u8]) -> Result<(), Errno> {
     let Some(class) = le::u32_at(outer, NVOS64_H_CLASS) else {
         return Err(libc::EINVAL);
@@ -261,6 +275,15 @@ pub(crate) fn rm_alloc_params(outer: &[u8], nested: &[u8]) -> Result<(), Errno> 
     let made = rm_alloc_class(class, nested);
     if made != class && REFUSED_ALLOC_CLASSES.contains(&made) {
         log::warn!("RM_ALLOC of NV01_EVENT as class {made:#x} refused (guestptr.rs)");
+        return Err(libc::EPERM);
+    }
+    if class == crate::semsurf::NV_EVENT_BUFFER
+        && le::u32_at(nested, EVENT_BUFFER_H_BUFFER_HEADER).is_none_or(|h| h == 0)
+    {
+        log::warn!(
+            "RM_ALLOC of NV_EVENT_BUFFER refused: with no hBufferHeader RM hands back its \
+             buffers' host physical addresses"
+        );
         return Err(libc::EPERM);
     }
     Ok(())
@@ -789,6 +812,21 @@ mod tests {
         put32(&mut outer, NVOS64_H_CLASS, 0x79);
         assert_eq!(rm_alloc_class(0x79, &nv0005(0x78)), 0x79);
         assert_eq!(rm_alloc_params(&outer, &nv0005(0x78)), Ok(()));
+    }
+
+    /// An event buffer RM allocates itself comes back with its pages' host
+    /// physical addresses: only one over the caller's own memory goes.
+    #[test]
+    fn an_event_buffer_rm_would_allocate_itself_is_refused() {
+        let mut outer = vec![0u8; 48];
+        put32(&mut outer, NVOS64_H_CLASS, crate::semsurf::NV_EVENT_BUFFER);
+        let mut p = vec![0u8; 72];
+        assert_eq!(rm_alloc_params(&outer, &p), Err(libc::EPERM));
+        put32(&mut p, 60, 0xcafe_0001);
+        assert_eq!(rm_alloc_params(&outer, &p), Ok(()));
+        // Cut short of the handle: RM would read 0 from past the copy.
+        assert_eq!(rm_alloc_params(&outer, &p[..60]), Err(libc::EPERM));
+        assert_eq!(rm_alloc_params(&outer, &[]), Err(libc::EPERM));
     }
 
     /// ALLOC_OBJECT and ALLOC_CONTEXT_DMA2 name a class too, and refuse the
