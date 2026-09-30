@@ -78,6 +78,11 @@ let
       extraArgs = [ "--allow-compute" ];
       windowMiB = 16384;
       windowOwnerShare = 90;
+      rmAllowGroups = [
+        "thermal"
+        "debug"
+      ];
+      osdescPopulate = true;
       wayland = {
         socket = "/run/user/1000/wayland-1";
         lease = true;
@@ -225,6 +230,10 @@ let
       ];
       says = "no quote, backslash, % or colon";
     };
+    "a debug group without compute" = {
+      config = [ { services.virtio-nvgpu.vms."1".rmAllowGroups = [ "debug" ]; } ];
+      says = "debug and profiling need --allow-compute";
+    };
     "a window not of 64 MiB steps" = {
       config = [ { services.virtio-nvgpu.vms."0".windowMiB = 1000; } ];
       says = "a multiple of 64 MiB";
@@ -292,6 +301,8 @@ pkgs.runCommand "virtio-nvgpu-module-eval"
     python3 ${./unit-diff.py} --dropin "$injectPath" Socket:SocketGroup=nvgpu-cap0
     # The per-VM drop-in carries what the options asked for.
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50 --allow-compute --window-size 16384' "$dropinPath"
+    grep -q -- '--rm-allow-group thermal,debug --osdesc-populate on' "$dropinPath"
+    if grep -q -- '--rm-allow-group\|--osdesc-populate' "$dropin1Path"; then exit 1; fi
     grep -q -- 'NVGPU_BACKEND_ARGS=--queue-poll-us 50"' "$dropin1Path"
     grep -q -- '--inject-uid 950' "$dropinPath"
     grep -q -- 'NVGPU_WAYLAND_ARGS=--wayland-socket /run/user/1000/wayland-1 --wayland-lease' "$dropinPath"

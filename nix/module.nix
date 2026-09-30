@@ -152,6 +152,43 @@ let
           only (SECURITY.md, "The window's size and share").
         '';
       };
+      rmAllowGroups = mkOption {
+        type = types.listOf (
+          types.enum [
+            "thermal"
+            "health"
+            "memacct"
+            "debug"
+            "profiling"
+          ]
+        );
+        default = [ ];
+        example = [
+          "thermal"
+          "health"
+        ];
+        description = ''
+          Opt-in groups of RM controls and classes the default allowlist
+          leaves out (`--rm-allow-group`; none by default): `thermal`
+          (temperatures for MangoHud and nvtop), `health` (nvidia-smi -q's
+          ECC, InfoROM, retired-page and black-box queries), `memacct` (this
+          backend's own cgroup's GPU memory limits), `debug` (cuda-gdb's
+          debugger memory access) and `profiling` (context-switched
+          profiling of the caller's own context). `debug` and `profiling`
+          need `--allow-compute`. Each is held to what it is for; SECURITY.md,
+          "Opt-in RM groups", says what each exposes.
+        '';
+      };
+      osdescPopulate = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Fault memory the guest registers by its pages in with one
+          MADV_POPULATE before RM pins it (`--osdesc-populate on`); false,
+          the default, leaves it to RM's pin, page by page, which measured
+          no slower (DEPLOY.md, "Backend flags").
+        '';
+      };
       wayland = {
         socket = mkOption {
           type = types.nullOr (types.strMatching "^/[^[:space:]]+$");
@@ -381,6 +418,22 @@ in
         message = "services.virtio-nvgpu.vms.<n>.windowMiB: a multiple of 64 MiB";
       }
       {
+        # The backend refuses to start with these without compute; say it
+        # here, where the option was set.
+        assertion = lib.all (
+          n:
+          let
+            vm = vmOf n;
+          in
+          !(lib.any (g: lib.elem g vm.rmAllowGroups) [
+            "debug"
+            "profiling"
+          ])
+          || lib.elem "--allow-compute" (cfg.extraArgs ++ vm.extraArgs)
+        ) ids;
+        message = "services.virtio-nvgpu.vms.<n>.rmAllowGroups: debug and profiling need --allow-compute in that VM's extraArgs (or services.virtio-nvgpu.extraArgs)";
+      }
+      {
         # The display paths and the semaphore-surface fences need NVKMS.
         assertion =
           !(lib.elem "nvidia" config.services.xserver.videoDrivers)
@@ -448,6 +501,14 @@ in
                 ++ lib.optionals vm.inject.enable [
                   "--inject-uid"
                   (toString vm.inject.helperUid)
+                ]
+                ++ lib.optionals (vm.rmAllowGroups != [ ]) [
+                  "--rm-allow-group"
+                  (concatStringsSep "," vm.rmAllowGroups)
+                ]
+                ++ lib.optionals vm.osdescPopulate [
+                  "--osdesc-populate"
+                  "on"
                 ]
               );
               NVGPU_WAYLAND_ARGS = concatStringsSep " " (

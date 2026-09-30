@@ -91,6 +91,20 @@ backend_settings() {
     # Compute is the backend's to serve and the probe's to expect: one switch
     # for both (rig/guest-image/probes/render.sh reads nvgpu_compute).
     [ "$COMPUTE" = 1 ] && BACKEND_ARGS+=(--allow-compute)
+    # Opt-in RM allowlist groups (the backend's --rm-allow-group; names it
+    # knows, comma-separated; debug and profiling need compute, which the
+    # backend checks) and the populate before an OS-descriptor pin (off
+    # unless 1). Passed only when set, so an older backend still starts.
+    if [ -n "${NVGPU_RM_ALLOW_GROUP:-}" ]; then
+        [[ $NVGPU_RM_ALLOW_GROUP =~ ^[a-z]+(,[a-z]+)*$ ]] ||
+            die "NVGPU_RM_ALLOW_GROUP=$NVGPU_RM_ALLOW_GROUP: group names, comma-separated"
+        BACKEND_ARGS+=(--rm-allow-group "$NVGPU_RM_ALLOW_GROUP")
+    fi
+    case ${NVGPU_OSDESC_POPULATE:-} in
+        '' | 0) ;;
+        1) BACKEND_ARGS+=(--osdesc-populate on) ;;
+        *) die "NVGPU_OSDESC_POPULATE=$NVGPU_OSDESC_POPULATE: 0 or 1" ;;
+    esac
     # The window's size and per-process share: the backend's to take and to
     # check (it refuses what cannot be had), and the VMM's to follow. Passed
     # only when set, so an older backend named by NVGPU_BACKEND still starts.
@@ -224,6 +238,13 @@ run_settings() {
     case " $CMDLINE_EXTRA " in
         *" nvgpu_compute="*) ;;
         *) CMDLINE_EXTRA="${CMDLINE_EXTRA:+$CMDLINE_EXTRA }nvgpu_compute=$COMPUTE" ;;
+    esac
+    # The groups the backend serves, for the probes that test them
+    # (rig/verify/sec-negative.c).
+    case " $CMDLINE_EXTRA " in
+        *" nvgpu_rm_groups="*) ;;
+        *) [ -z "${NVGPU_RM_ALLOW_GROUP:-}" ] ||
+            CMDLINE_EXTRA="${CMDLINE_EXTRA:+$CMDLINE_EXTRA }nvgpu_rm_groups=$NVGPU_RM_ALLOW_GROUP" ;;
     esac
     # An interactive run (the shell probe, nvgpu_hold=1) needs the guest console
     # on this terminal: with stdin at /dev/null the guest's shell reads EOF at
