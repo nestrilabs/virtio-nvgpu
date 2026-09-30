@@ -6,7 +6,10 @@
  * RMLOG_REFUSE=0x2080110b[,...] answers those controls natively as a guest's
  * RM allowlist does, without RM seeing them (NV_ERR_NOT_SUPPORTED, or the
  * status in RMLOG_REFUSE_STATUS). RMLOG_ONLY_SCHED=1 sends DISABLE_CHANNELS
- * on with bOnlyDisableScheduling set.
+ * on with bOnlyDisableScheduling set. RMLOG_ALL=1 logs every RM control
+ * (and the index/value pairs of NV2080_CTRL_CMD_FB_GET_INFO and _V2), every
+ * RM_ALLOC's class and every VID_HEAP_CONTROL's function, served or not:
+ * which controls a program reads memory sizes from.
  *
  *   cc -O2 -shared -fPIC rmlog.c -o rmlog.so -ldl
  *   RMLOG=/tmp/rm.log LD_PRELOAD=$PWD/rmlog.so supertuxkart ...
@@ -90,6 +93,45 @@ static int refused(uint32_t cmd) {
   return 0;
 }
 
+struct nvos64 { /* NVOS64_PARAMETERS */
+  uint32_t hRoot, hObjectParent, hObjectNew, hClass;
+  uint64_t pAllocParms, pRightsRequested;
+  uint32_t paramsSize, flags, status, pad;
+};
+
+/* RMLOG_ALL: every control, allocation and heap call, after RM ran. */
+static void log_all(unsigned long req, void *arg, int ret) {
+  if (_IOC_TYPE(req) != 'F')
+    return;
+  unsigned nr = _IOC_NR(req);
+  if (nr == 0x2a && _IOC_SIZE(req) == sizeof(struct nvos54)) {
+    struct nvos54 *p = arg;
+    say("ALL control %#x ret %d status 0x%x size %u hObject %#x", p->cmd, ret, p->status,
+        p->paramsSize, p->hObject);
+    /* NV2080_CTRL_CMD_FB_GET_INFO_V2: fbInfoListSize, then (index, data). */
+    if (p->cmd == 0x20801303 && p->params && p->paramsSize >= 4) {
+      const uint32_t *w = (const uint32_t *)(uintptr_t)p->params;
+      uint32_t n = w[0];
+      for (uint32_t i = 0; i < n && 8 + 8 * i <= p->paramsSize && i < 128; i++)
+        say("ALL   fbinfo index %#x data %u", w[1 + 2 * i], w[2 + 2 * i]);
+    }
+    /* NV2080_CTRL_CMD_FB_GET_INFO: fbInfoListSize, then a pointer to the list. */
+    if (p->cmd == 0x20801301 && p->params && p->paramsSize >= 16) {
+      const uint32_t *w = (const uint32_t *)(uintptr_t)p->params;
+      const uint32_t *l = (const uint32_t *)(uintptr_t) * (const uint64_t *)(w + 2);
+      for (uint32_t i = 0; l && i < w[0] && i < 128; i++)
+        say("ALL   fbinfo(v1) index %#x data %u", l[2 * i], l[2 * i + 1]);
+    }
+  } else if (nr == 0x2b && _IOC_SIZE(req) == sizeof(struct nvos64)) {
+    struct nvos64 *p = arg;
+    say("ALL alloc class %#x ret %d status 0x%x size %u", p->hClass, ret, p->status,
+        p->paramsSize);
+  } else if (nr == 0x4a) {
+    const uint32_t *w = arg; /* NVOS32: hRoot, hObjectParent, function, ... status at 20 */
+    say("ALL vidheap function %u ret %d status 0x%x", w[2], ret, w[5]);
+  }
+}
+
 int ioctl(int fd, unsigned long req, ...) {
   va_list ap;
   va_start(ap, req);
@@ -116,7 +158,9 @@ int ioctl(int fd, unsigned long req, ...) {
     }
     ret = real_ioctl(fd, req, arg);
   }
-  if (is_ctl) {
+  if (getenv("RMLOG_ALL")) {
+    log_all(req, arg, ret);
+  } else if (is_ctl) {
     struct nvos54 *p = arg;
     if (p->cmd == 0x2080110b && p->params && p->paramsSize >= sizeof(struct disable_channels)) {
       struct disable_channels *d = (void *)(uintptr_t)p->params;
