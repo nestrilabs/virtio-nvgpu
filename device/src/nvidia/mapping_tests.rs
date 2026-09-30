@@ -493,7 +493,10 @@ fn an_rm_mapping_mapped_u32_max_times_is_refused_another() {
     let mut resp = vec![0u8; 64];
     e.be.dispatch(&req, &mut resp);
     assert_eq!(read_struct::<MsgHeader>(&resp, 0).status, -libc::ENOMEM);
-    assert_eq!(e.be.active_maps.find_by_fd_handle(fd).unwrap().refs, u32::MAX);
+    assert_eq!(
+        e.be.active_maps.find_by_fd_handle(fd).unwrap().refs,
+        u32::MAX
+    );
 }
 
 #[test]

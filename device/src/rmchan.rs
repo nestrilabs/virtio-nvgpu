@@ -316,12 +316,10 @@ impl crate::nvidia::NvidiaBackend {
         let size = le::u32_at(params, NVOS54_PARAMS_SIZE).unwrap_or(0);
         let ctl = params.get(NVOS54_SIZE..).unwrap_or(&[]);
         let owner = self.rm_caller();
-        self.rmchan
-            .check(owner, ctl, size, now())
-            .map_err(|r| {
-                log::warn!("NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS refused: {}", r.why());
-                r.status()
-            })
+        self.rmchan.check(owner, ctl, size, now()).map_err(|r| {
+            log::warn!("NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS refused: {}", r.why());
+            r.status()
+        })
     }
 }
 

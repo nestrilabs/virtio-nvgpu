@@ -1112,16 +1112,17 @@ mod tests {
                 start_ns: 2,
             },
         );
-        let run_as = |m: &mut RmMem, o: Owner, escape: u32, params: &[u8], status: Option<usize>| {
-            let mut host = params.to_vec();
-            let p = m.before(escape, &mut host).charged_to(o);
-            let seen = host.clone();
-            if let Some(s) = status {
-                put(&mut host, s, 0);
-            }
-            m.after(p, &mut host);
-            seen
-        };
+        let run_as =
+            |m: &mut RmMem, o: Owner, escape: u32, params: &[u8], status: Option<usize>| {
+                let mut host = params.to_vec();
+                let p = m.before(escape, &mut host).charged_to(o);
+                let seen = host.clone();
+                if let Some(s) = status {
+                    put(&mut host, s, 0);
+                }
+                m.after(p, &mut host);
+                seen
+            };
         let mut m = RmMem::default();
         let mut a = sysmem_alloc(0x40, 0, 0);
         put(&mut a, NVOS64_H_ROOT, 0xa);
@@ -1134,7 +1135,13 @@ mod tests {
         let share = MAX_OBJECTS as u64 / 4;
         for i in 0..share as u32 + 100 {
             put(&mut d, NVOS55_H_OBJECT, 0x10_0000 + i);
-            run_as(&mut m, attacker, NV_ESC_RM_DUP_OBJECT, &d, Some(NVOS55_STATUS));
+            run_as(
+                &mut m,
+                attacker,
+                NV_ESC_RM_DUP_OBJECT,
+                &d,
+                Some(NVOS55_STATUS),
+            );
         }
         assert_eq!(m.records.held(attacker), share);
         assert_eq!(m.tree.links.held(attacker), share);

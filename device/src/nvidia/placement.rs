@@ -474,7 +474,9 @@ impl NvidiaBackend {
             }
             // As `handle_mmap`'s count.
             let Some(refs) = live.refs.checked_add(1) else {
-                log::warn!("mmap on handle {handle}: placement {id} mapped u32::MAX times; refused");
+                log::warn!(
+                    "mmap on handle {handle}: placement {id} mapped u32::MAX times; refused"
+                );
                 return self.write_error(resp_buf, libc::ENOMEM);
             };
             live.refs = refs;

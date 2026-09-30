@@ -740,9 +740,11 @@ impl Ownership {
     fn maker(&self, client: u32) -> crate::quota::Owner {
         self.owners
             .get(&client)
-            .map_or(crate::quota::Owner::Unknown, |c| crate::quota::Owner::Proc {
-                tgid: c.tgid,
-                start_ns: c.start_ns,
+            .map_or(crate::quota::Owner::Unknown, |c| {
+                crate::quota::Owner::Proc {
+                    tgid: c.tgid,
+                    start_ns: c.start_ns,
+                }
             })
     }
 
@@ -2517,7 +2519,8 @@ mod backend_tests {
         let b = alloc_client(&mut be, f2, Some(pid(20)));
         rm::with(|rm| {
             for i in 0..GRANT_CAP as u32 {
-                rm.alloc(a, DEVICE, 0x10_0000 + i, NV01_MEMORY_SYSTEM).unwrap();
+                rm.alloc(a, DEVICE, 0x10_0000 + i, NV01_MEMORY_SYSTEM)
+                    .unwrap();
             }
         });
         let mut refused = 0;
