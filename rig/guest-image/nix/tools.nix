@@ -16,7 +16,9 @@
 #   bin/nvgpu-drm-compat     DRM ioctls whose struct grew, at older, native and
 #                            newer sizes (SYNCOBJ_HANDLE_TO_FD's 16 bytes, ...)
 #   bin/nvgpu-syncobj-race   syncobjs made, imported, signalled, subscribed to
-#                            and destroyed by many threads of one file at once
+#                            and destroyed by many threads of one file at once;
+#                            then processes leaving orphan subscriptions, one
+#                            after another, each getting as far as the first
 #   bin/nvgpu-spin-cost      what reply spinning (rt_spin_us) costs CPU-bound
 #                            threads beside a caller, and saves the caller
 #   bin/nvgpu-rm-smoke       an RM client (alloc, controls, free) and a DRM

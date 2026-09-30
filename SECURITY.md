@@ -137,7 +137,7 @@ each call is validated:
 | **NVKMS**, `/dev/nvidia-modeset` | one ioctl carrying 66 commands (610.57.04) | 56 to 61 per release, **schema-authoritative** over IOCTL2. v1 carries only the commands with no pointer and no descriptor. 7 are **refused** by name, 3 run only with `--kms-card`, and 7 are gated on grants outside it. Everything else is in "NVKMS, KMS and leases". At most 64 opens per VM, and 16 per guest process (the VM's last 8 kept for processes holding at most 2). |
 | **nvidia-drm and DRM core on a host render node** | 24 nvidia-drm ioctls (21 render-allowed), plus the core's render-allowed ones | v1: 6 full ioctl numbers. IOCTL2: 28 render-class entries (12 syncobj, 16 nvidia-drm), **schema-authoritative**. GEM_IMPORT_USERSPACE_MEMORY, GEM_FLINK and GEM_OPEN are **refused** on every handle. SEMSURF_FENCE_CTX_CREATE's index must lie inside the surface, and its client must be one this VM allocated, with at most 64 contexts per file, 96 per guest process and 256 per VM, the last 32 kept for processes holding at most 16 (`device/src/semsurf.rs`). Every argument buffer is at least `_IOC_SIZE` and guarded. |
 | **DRM KMS on a host card or lease file** | the KMS core | 49 KMS-class entries, **schema-authoritative**, only on card handles (`--kms-card`) and lease handles. See "NVKMS, KMS and leases". |
-| **HOST_OP** (backend-made host calls on the guest's behalf) | -- | 13 ops, each argument checked against the handle kind it must be: PRIME export and import on render files, sync_file merge (at most 5), eventfd, a signalled sync_file (by `/dev/udmabuf` when needed), a syncobj wait registration (at most 1,024 per VM), fd kind, close-many, OPEN_KMS and DROP_IF_MASTER, which are `--kms-card` only, and INJECT_OPEN and INJECT_OPEN_SYNCOBJ, which need `--inject-socket` and a live id's token ("Capture injection"). OSDESC_REAP calls nothing on the host: it reads which registrations of guest memory RM has let go of. No export leaves the backend of a live fence context, an injected object or a handle INJECT_OPEN made (`device/src/exportgate.rs`, asked by PRIME export, the Wayland proxy and the IOCTL2 re-home). |
+| **HOST_OP** (backend-made host calls on the guest's behalf) | -- | 13 ops, each argument checked against the handle kind it must be: PRIME export and import on render files, sync_file merge (at most 5), eventfd, a signalled sync_file (by `/dev/udmabuf` when needed), a syncobj wait registration (at most 1,024 per VM, a quarter per guest process), fd kind, close-many, OPEN_KMS and DROP_IF_MASTER, which are `--kms-card` only, and INJECT_OPEN and INJECT_OPEN_SYNCOBJ, which need `--inject-socket` and a live id's token ("Capture injection"). OSDESC_REAP calls nothing on the host: it reads which registrations of guest memory RM has let go of. No export leaves the backend of a live fence context, an injected object or a handle INJECT_OPEN made (`device/src/exportgate.rs`, asked by PRIME export, the Wayland proxy and the IOCTL2 re-home). |
 | **mmap** | per device | Device, render, card and lease handles only. Each placement carries the host's memory type and whether it is writable, so a read-only host page is mapped read-only in the guest. A UVM file maps only a semaphore pool the same file was seen to create, asked for exactly, into the UVM aperture (below); anything else on it is **refused** before the VMM is asked. |
 | **any other ioctl type** | -- | **Refused** (EPERM). |
 
@@ -1193,7 +1193,7 @@ files and sockets, the user's files, the network, other processes.
 | RM counters | counted only when RM said NV_OK, at most 4,096 keys (`device/src/tally.rs`) |
 | logs | every call site limited to a burst of 50 and 10 a second (`device/src/ratelimit.rs`) |
 | channel disables | FIFO_DISABLE_CHANNELS at 50 a second per guest process after a burst of 40, and 200 a second per VM after 160, the last 40 kept for processes that have used fewer than 8; at most 1,024 processes with a bucket not yet refilled (`device/src/rmchan.rs`, "The RM allowlist") |
-| display caps | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations; semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
+| display caps | 64 NVKMS opens, 16 per guest process; 1,024 syncobj wait registrations, a quarter per guest process, the last sixteenth kept for processes holding at most 16, each let go with the last handle, file or Wayland channel of the guest's that reaches its syncobj (`device/src/fence.rs`, A.14); semaphore-surface contexts at 64 per file, 96 per guest process and 256 per VM; 4 KiB of undelivered DRM events per handle, past which the host's own backpressure applies |
 | window | each zone (by default UC 32 MiB, WC 768 MiB, WB 224 MiB; `--window-size`) at most half per guest process (`--window-owner-share`), the last eighth kept for processes holding at most a sixteenth ("The window's size and share"); a mapping is charged to whoever opened the file it is armed on |
 | video memory | none by default. With `--vram-limit`, what the VM allocates by name is held to it, `--window-owner-share` percent per guest process with the last eighth kept for processes holding at most a sixteenth, and 262,144 records of it per VM, a quarter per process; not what RM allocates on the VM's behalf ("Video memory limit") |
 | Wayland caps | 64 channels per VM. Shm: 1 GiB and 1,024 pools per VM, and 512 MiB and 256 pools per connection; the bytes are what live buffers cover (page-rounded, overlaps once), not pool sizes, since a pool's memfd is sparse, SHM_SYNC writes only inside a live buffer, and pages no live buffer covers are punched out. Unread output: 256 MiB per VM and 64 MiB per connection, half the VM's per guest process (the last quarter kept for processes holding at most a quarter). Per guest process -- the client a daemon connection is for (NVGPU_WL_IOC_CONNECT_FOR), else the opener -- a quarter of the channels (the last eighth kept for processes with at most two) and a quarter of the shm bytes and pools (the last sixteenth kept for processes holding at most a sixty-fourth), shared by all its connections. In the guest daemon, per client process: a quarter of the descriptors it may hold for clients (its hard limit less 60) and of 64 MiB of stream-sink data, the last eighth of each kept for processes holding little. 16 unfinished blobs per connection. 131,072 objects per connection. Lease submits: one per 5 s on average, 3 at once. Four are flags: the channel count (`--wayland-max-conns`), the shm byte budget (`--wayland-shm-budget`), the queue budget (`--wayland-queue-budget`) and the lease interval (`--wayland-lease-interval`). The 1,024 pools per VM and the burst of 3 are fixed. |
@@ -2125,10 +2125,10 @@ nothing else: the helper must treat every point as a hint, bound its own
 waits, and never forward the guest's release points to anything that trusts
 them. The guest's waits are the VM's ordinary syncobj waits, turned into
 polls and counted against the 1024 wait registrations per VM and a quarter
-per guest process ("Resource caps"; `device/src/fence.rs`); the render file
-is marked as one that imported a syncobj, so its registrations wait out
-their firing rather than go with a DESTROY, as for any syncobj someone else
-holds. Each INJECT_OPEN_SYNCOBJ makes a new handle in the caller's file, as
+per guest process ("Resource caps"; `device/src/fence.rs`); the handle is
+marked as naming a syncobj the helper holds, so the registrations on it
+wait out their firing rather than go with the guest's last handle to it, as
+for any syncobj someone outside the backend may hold. Each INJECT_OPEN_SYNCOBJ makes a new handle in the caller's file, as
 SYNCOBJ_FD_TO_HANDLE and SYNCOBJ_CREATE do, which the guest can already make
 without bound ("Resource caps").
 
@@ -2804,12 +2804,21 @@ carries; Appendix C has their history.
       re-poll a joined wait's point before it signals the eventfd.
     - An 0x57 attach is mirrored into the guest's reservation object, but
       export mode is not bridged (L-1).
-    - A process that forks children to make orphan wait registrations on
-      shared syncobjs and exit can still fill the VM's pool; the cost is
-      polling latency for the VM's other waits, not host memory.
+    - Wait registrations are let go with the last way the guest had to
+      their syncobj (A.14), not with the process that made them: a process
+      that keeps a syncobj reachable -- a handle, a syncobj file, a Wayland
+      channel it was sent over -- while children it forked register on it
+      and exit keeps their registrations counted, each child's against its
+      own share, until it lets go or it exits. Four such children fill the
+      VM's pool but its reserve (`Share::owners_to_exhaust`, as for every
+      pool, and the guest's process limits bound it), and the VM's other
+      processes' SYNCOBJ_EVENTFD then says -ENOMEM and their waits poll.
+      A registration on a syncobj the capture helper holds, or one the
+      compositor sent, waits out its firing.
 15. **Fairness within a VM.** One queue thread serves every inline host
-    call, and 16 executors every file (B6). Fence wait registrations,
-    rmshare grants, rmmem records and the lease throttle are VM-wide (B7):
+    call, and 16 executors every file (B6). Rmshare grants, rmmem records
+    and the lease throttle are VM-wide (B7), fence wait registrations VM-wide
+    with a quarter per process:
     each is a degradation (polling, a refused share, a write-combining
     guess), not a denial of the device.
 16. **The guest module.** `osdesc_early` is a ring of 64: a reap that names
@@ -4379,6 +4388,106 @@ it costs and a middle way for the deployment to weigh (since offered as
 Proposed, not made: a host kernel flag for `KVM_PRE_FAULT_MEMORY` that maps
 for write (`patches/linux/`, a draft applied nowhere).
 
+### A.14 Wait registrations outliving their process (`orphanfix`)
+
+Found by the `efdrace` branch's runs of `nvgpu-syncobj-race`: four runs of
+its second phase in one VM (threads destroying random syncobj numbers while
+others subscribe to points on them) left the VM's 1,024 syncobj wait
+registrations full for good, and every later SYNCOBJ_EVENTFD in the VM, of
+every process, said -ENOMEM. App against app: one guest process, run a few
+times, denied the others a native call.
+
+**Why.** A registration holds a syncobj file of the backend's own, so that
+its kernel entry can end only by firing, which the backend sees; without
+that, destroy-and-reimport would leave uncounted entries on a syncobj the
+guest keeps alive elsewhere. Only a syncobj "that never left its render
+file" had its registrations dropped at its DESTROY or its file's close; any
+other kept them as orphans, counted against the process that made them,
+until they fired. The probe exports and imports syncobjs on its file, which
+marked the whole file as an importer, so every registration on it was such
+an orphan. When the guessers destroyed a handle before its point came,
+nothing but the backend's own file held that syncobj any more, so nobody
+could ever signal the point: the orphan waited for good. The process's
+exit closed its files, but a closed importer's orphans were kept, still
+charged to a process that no longer existed. Each run left a process's
+share (256), the fourth run's what was left above the reserve, and every
+later run its floor of the reserve (16), until nothing was left.
+
+**Fix** (`device/src/fence.rs`, `Reach`). The backend follows every way
+the guest has to each host syncobj: a handle in one of its render files
+(SYNCOBJ_CREATE, SYNCOBJ_FD_TO_HANDLE of a syncobj file, INJECT_OPEN_SYNCOBJ;
+ended by SYNCOBJ_DESTROY or the file's close), a syncobj file in the handle
+table (SYNCOBJ_HANDLE_TO_FD; ended by its close, an `I2_FD_CONSUME`, a reply
+never delivered), and a Wayland channel it was sent over (ended by the
+channel's close, with which the compositor drops its import). Every call
+that makes or ends one runs inline on the queue thread under the backend
+lock, in the guest's order, so this is the host's own picture, an import
+counted before the file it came through is consumed. When the last of them
+goes, only the backend's files hold the syncobj and nobody can signal it:
+its registrations are let go, and closing the backend's files frees the
+syncobj and, with it, the kernel's entries on it (drm_syncobj.c:528-541)
+-- what happens natively when a process's last reference to a syncobj
+goes, which is where a native eventfd registration on it ends too. So a
+process's registrations, orphans included, count against its own share
+only while its syncobjs are reachable, and all of them go when it exits,
+closing its files.
+
+Two exceptions keep a registration counted until it fires. One whose point
+already has a fence is on that fence now, not on the syncobj's list
+(drm_syncobj.c:1419-1456), and outlives the syncobj; before letting go, the
+backend asks the host through one of the session's render files (a
+zero-timeout TIMELINE_WAIT with WAIT_AVAILABLE on a handle imported from its
+own syncobj file for the question and destroyed after, in one step under the
+backend lock, so no guest call sees the number taken: calls the guest can
+make itself). And one on a syncobj
+something outside may hold -- the capture helper's, or a syncobj file the
+backend did not make -- is never let go before it fires. One syncobj's
+registrations go together, so none is uncounted while another of the
+backend's files still holds the syncobj up; a question the host cannot
+answer, or no DRM file open to ask through, leaves them counted until the
+next call that has one (every SYNCOBJ_WATCH has one). A timeout for points
+that never come was not added: natively an entry on a live syncobj never
+times out, and one on an unreachable syncobj is now let go when it becomes
+unreachable, not later.
+
+No limit was relaxed: the cap (1,024), the share (a quarter) and the
+reserve (the last sixteenth, for processes holding at most 16) are as they
+were. The bookkeeping is one map entry per watched, exported or imported
+syncobj handle and per syncobj file the backend made, each one a host
+object the guest already holds, and one record per syncobj sent to the
+compositor with a registration on it, forgotten once nothing is registered
+on it.
+
+**Residual** (open item 14): a live process that keeps a syncobj reachable
+while children it forked register on it and exit keeps their
+registrations, each child's against its own share; a registration on the
+capture helper's syncobj, or one the compositor sent, waits out its firing;
+one on a point whose fence was taken off the syncobj since (a RESET) is on
+that fence, and is let go uncounted until the fence signals (the fences a
+guest can put in a syncobj signal within 5 s: semaphore-surface fences time
+out, nvidia-drm-fence.c:1443-1446). Unchanged, and a parity matter: the
+guest module lets go of a userspace SYNCOBJ_EVENTFD when the handle it
+subscribed through is destroyed, even if another handle keeps the syncobj.
+
+**Tests.** `device/src/fence.rs`: orphans let go with the last handle and
+file, with the render file's close, with a process's exit on the backend's
+table (eight runs, each getting its whole share), with a Wayland channel's
+close; kept while a fence holds them, while the host cannot be asked,
+while the helper's; a number whose end went unseen; the per-process bound
+and the light-user reserve with orphans. `device/src/i2_e2e.rs`: the same
+through the IOCTL2 path, an import consuming its file. The guest:
+`nvgpu-syncobj-race` phase 3 ("orphans") runs processes one after another,
+each making orphans on exported and imported syncobjs until -ENOMEM, and
+requires each to get as far as the first and a fresh process then to
+subscribe; on the previous backend, after five runs of phase 2, the first
+gets 16 and the fourth none. Phase 2 had stopped short at -ENOMEM before
+the fix, so it barely exported or imported; now that it does, its check
+that an owner's handle never shows the owner's own older object proved too
+strict -- native runs on the host's render node show that too, when an
+owner whose number a guesser took exports and imports what now has it --
+and it fails only on a point the owner has not signalled yet. Hardware:
+rig/TESTING-RIG.md, "Orphan wait registrations".
+
 ## Appendix B. Against `dev`
 
 `dev` at `50ff74a`, the branch this work started from, against the code
@@ -4636,7 +4745,7 @@ deployment, Wayland, guest-module, backend and parity parts.
 | R4 | low | SEMSURF_FENCE_CTX_CREATE accepts any client of the VM | -- | open, native strength (open item 8) |
 | R5 | low | negative descriptor values other than -1 forwarded | `fc7a58b` | fixed |
 | B6 | low | one queue thread and 16 executors serve every file | -- | open (open item 15) |
-| B7 | low | fence waits, rmshare grants, rmmem records and the lease throttle are VM-wide | -- | open (open item 15) |
+| B7 | low | fence waits, rmshare grants, rmmem records and the lease throttle are VM-wide | -- | open (open item 15); fence waits have a quarter per process and go with their syncobj (A.14) |
 | W4 | low | every guest app reaches the host compositor as the backend | -- | open (open item 13) |
 
 ### Fuzzing (A.4) and `dind` (A.5)

@@ -758,9 +758,9 @@ fn a_guest_opens_an_injected_syncobj_into_its_render_file() {
     assert_ne!(h, 0);
     let (fd, _) = be.handles.get(render).unwrap();
     assert_eq!(host.syncobjs_in(fd), 1);
-    // The file is an importer now: its syncobjs' registrations are not
-    // dropped by a DESTROY (fence.rs).
-    assert!(!be.syncobj_regs.is_private_for_test(render, h as u32));
+    // The helper holds it too: registrations on it are not let go when the
+    // guest's last way to it goes (fence.rs, `Reach`).
+    assert!(be.syncobj_regs.is_foreign_for_test(render, h as u32));
     // Not on a file that is not a render file.
     let sync = be.adopt_for_test(host.not_dmabuf(), HandleKind::SyncFile);
     assert_eq!(open(&mut be, sync, &token).0, -libc::EBADF);

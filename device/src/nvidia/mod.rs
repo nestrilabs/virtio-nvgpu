@@ -209,6 +209,8 @@ pub struct NvidiaBackend {
     pub(crate) hooks: Arc<dyn Hooks>,
     /// Shared syncobj wait registrations (HOST_OP SYNCOBJ_WATCH, fence.rs).
     pub(crate) syncobj_regs: crate::fence::Registrations,
+    /// The host calls those registrations make (a fake in tests).
+    pub(crate) syncobj_host: Arc<dyn crate::fence::SyncobjHost + Send + Sync>,
     /// Its NVKMS section's state, which also gates v1 NVKMS calls and hears
     /// of the host version, the mode and every handle closed (nvkms.rs).
     pub(crate) nvkms: Arc<NvkmsPolicy>,
@@ -385,6 +387,7 @@ impl NvidiaBackend {
             kms_states: std::collections::HashMap::new(),
             vm_kms: Arc::default(),
             syncobj_regs: crate::fence::Registrations::default(),
+            syncobj_host: Arc::new(crate::fence::HostSyncobj),
             hooks: BackendHooks::with_state(nvkms.clone(), semsurf.clone())
                 .with_guest_only(guest_only.clone())
                 .with_inject_taint(inject_taint.clone()),
@@ -1128,7 +1131,8 @@ impl NvidiaBackend {
     fn handle_close(&mut self, payload: &[u8], resp_buf: &mut [u8]) -> usize {
         let _ = payload;
         let r = self.close_handle(self.current_handle);
-        // A render file's close drops the registrations on its syncobjs.
+        // A close that let go of registrations (fence.rs) hands their
+        // handles back now.
         self.reap_syncobj_regs();
         match r {
             Ok(()) => self.write_hdr(resp_buf, 0, 0),
@@ -1206,9 +1210,18 @@ impl NvidiaBackend {
         let fbs = self.forget_kms_state(handle);
         // A render file's syncobj numbers die with it and a later file may
         // get the same handle number: its waits must never join these (S-13).
-        if matches!(kind, HandleKind::DriRender(_)) {
-            self.syncobj_regs.orphan_file(handle);
+        // And a syncobj's registrations are let go with the last way the
+        // guest had to it -- a render file's handles, a syncobj file, a
+        // Wayland channel's imports (fence.rs, `Reach`) -- asked through this
+        // file while it is still open, if it is a render file.
+        match kind {
+            HandleKind::DriRender(_) => self.syncobj_regs.orphan_file(handle),
+            HandleKind::Syncobj => self.syncobj_regs.file_closed(handle),
+            _ => {}
         }
+        self.syncobj_regs.channel_closed(handle);
+        let probe = matches!(kind, HandleKind::DriRender(_)).then(|| fd.as_raw_fd());
+        self.settle_syncobj_regs(probe);
         self.wl_forget(handle);
         self.nvkms.forget_handle(handle);
         self.inject.file_closed(handle);

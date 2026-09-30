@@ -12,7 +12,9 @@
 #   threads nvgpu-syncobj-race: eight threads of one file creating,
 #           importing, signalling, subscribing to and destroying syncobjs,
 #           then the same with guessers destroying numbers at random; every
-#           object destroyed exactly once, no answer for another's object
+#           object destroyed exactly once, no answer for another's object;
+#           then processes leaving orphan subscriptions one after another,
+#           none left short by the ones before
 #   32-bit  the same tool built i686; nvgpu-rm-smoke-32 (an RM client on
 #           /dev/nvidiactl: alloc, two controls, free; and a DRM ioctl),
 #           whose RESULT line must be the 64-bit build's; vulkaninfo-32

@@ -27,6 +27,7 @@ enforcing:
 | date | tree | what ran | section |
 |---|---|---|---|
 | 2026-09-30 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy` and `efdrace` merged | stage1, compat, render (with and without compute), secneg and wayland under nesbox, every knob off and every knob on, C module after the dma-buf merge and C and Rust modules after the last | "Regression of the knobs merge" |
+| 2026-09-30 | branch `orphanfix` (efdrace's pump fix plus wait registrations let go with their syncobj) | `nvgpu-syncobj-race` phase 2 five times in one guest, then fresh processes, eight orphan-making processes, the whole tool twice more, drm-compat; the same under the previous backend; the compat probe; phase 2 natively on the host | "Orphan wait registrations" |
 | 2026-09-30 | branch `efdrace`: the event pump's lost wakeup (device/src/pump.rs) and `nvgpu-syncobj-race`'s LATE/LOST diagnosis | the owners phase under nesbox, C and Rust modules, with and without a widened race window and host and guest load, before and after the fix; the compat probe six times | "Syncobj eventfds that never fired" |
 | 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
 | 2026-09-30 | branch `knob-dmabuf`: `--allow-dmabuf-export` | stage1, compat, render and secneg with the switch off and on, nesbox, Rust module | "dma-buf export through RM" |
@@ -1326,7 +1327,8 @@ that fired. Each phase prints its signal-to-fire latency.
 one guest: the second phase leaves registrations on exported syncobjs
 whose points never come, which count against the VM's pool for good
 (SECURITY.md, "Fences"), and after four runs of it every SYNCOBJ_EVENTFD
-in the VM says -ENOMEM.
+in the VM says -ENOMEM. (Fixed by `orphanfix`: "Orphan wait
+registrations", below.)
 
 Runs of the owners phase (5 s, 8 threads) under nesbox, 2026-09-30; host
 load from stress-ng under the rig lock, guest load four busy loops.
@@ -1348,6 +1350,41 @@ Signal to eventfd, per 5 s phase: idle, p99 under 512 us and at most
 sharing one host CPU with two hogs, at most 15 ms; the host at a load of
 140 (64 hogs, memory, disk) with the guest busy, p99 under 16 to 65 ms,
 p99.9 under 262 ms, at most 240 ms. The one-second patience stands.
+
+## Orphan wait registrations
+
+Branch `orphanfix`, 2026-09-30, under nesbox with the C module; the
+backend built from the branch, the image with the tool's phase 3
+(SECURITY.md, A.14, has the cause and the fix). One guest ran, in order:
+`nvgpu-syncobj-race 5 8` with phase 3 skipped five times (phases 1 and 2),
+the owners phase alone as a fresh process, phase 3 alone with eight
+orphan-making processes, the whole tool twice more (phase 3 six processes
+each time), the owners phase again, and `nvgpu-drm-compat` (64- and 32-bit).
+
+| backend | phase 2 (rounds, handles) | fresh owners after it | phase 3: orphans per process | fresh process after phase 3 |
+|---|---|---|---|---|
+| previous (efdrace's `be-fix`) | 55k/57k, 32k/34k, 24k/26k, 17k/19k, 16k/17k: stopped short at -ENOMEM, barely an import | passed, on the reserve | 16, 16, 16, then 0 (-ENOMEM on the first SYNCOBJ_EVENTFD, even on syncobjs let go at once) | -ENOMEM; the whole tool after it: every owner's SYNCOBJ_EVENTFD -ENOMEM |
+| `orphanfix` | 126k-140k rounds, 202k-219k handles (about 75k imports each) | passed | 256 (its share) in each of 8, then 6 and 6 | 64 of 64; every later phase passed |
+
+The compat probe on a fresh guest passed, 13/0/0. The earlier A/B of ten
+runs of phases 1 and 2 alone: the previous backend ran out after eight (the
+ninth's owners phase, a fresh process, -ENOMEM on every SYNCOBJ_EVENTFD:
+three runs of 256, one of 192, four of 16, 1,024 in all).
+
+Once phase 2 went on past -ENOMEM, its check that an owner's handle never
+shows the owner's own older object failed in about one run in five. The
+same tool on the host's own render node (no guest, no backend) failed
+every run, several times each in 2.3 million rounds: an owner whose number
+a guesser took exports and imports what now has it, and the import lands
+on the lowest free number, another owner's. The check now fails only on a
+point the owner has not signalled yet; native runs pass (3 of 3), and so
+does phase 3 natively, where nothing refuses (4,096 orphans each).
+
+A registration the backend lets go is asked about first when its point
+might have a fence (`HostSyncobj::available`, a handle imported into a
+render file of the session and destroyed in the same step): the ignored
+test `the_host_says_whether_a_point_has_a_fence_and_leaves_no_handle` in
+`device/src/fence.rs` checks that on the host's render node, and passed.
 
 ## What to keep from every run
 

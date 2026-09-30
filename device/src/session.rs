@@ -1139,16 +1139,28 @@ impl NvidiaBackend {
         // A lease a guest lessor revoked through us: whatever the lessee's
         // handle granted is gone on the host (kms.rs, "lease ends").
         let revoked_lease = prepared.name() == "REVOKE_LEASE" && prepared.result() == Some(0);
-        // A destroyed syncobj only its file could reach: its wait
-        // registrations go with it (fence.rs, `after_ioctl2`).
-        if !stale && prepared.name() == "SYNCOBJ_DESTROY" {
+        // What the call did to the ways to a syncobj (fence.rs, `Reach`):
+        // a CREATE's or an import's new handle, a DESTROY's end of one --
+        // after which a syncobj nothing reaches has its registrations let
+        // go. Before the finish closes an `I2_FD_CONSUME` syncobj file, so
+        // that an import is counted before the file it came through goes.
+        let syncobj_call = !stale && crate::fence::changes_reach(name);
+        let mut export = None;
+        if syncobj_call {
+            // drm_syncobj_handle { handle @0, flags @4, fd @8 }: the one
+            // descriptor an FD_TO_HANDLE takes.
+            let file = prepared
+                .fd_in_handles()
+                .find(|&(buf, off, _)| buf == 0 && off == 8)
+                .map(|(_, _, h)| h);
             self.syncobj_regs.after_ioctl2(
                 target,
-                prepared.name(),
+                name,
                 prepared.buffer(0),
                 prepared.result(),
+                file,
             );
-            self.reap_syncobj_regs();
+            export = crate::fence::exported_handle(name, prepared.buffer(0), prepared.result());
         }
         let nodes = self.host_nodes();
         let target_live = self.handles.kind(target).is_some() && !self.handles.is_buried(target);
@@ -1162,6 +1174,20 @@ impl NvidiaBackend {
         };
         let body = prepared.finish_with(&mut fin);
         let created = fin.created;
+        if syncobj_call {
+            // An export's syncobj file, once it has a handle (none if the
+            // table was full: then it closed, and nothing holds it).
+            if let Some(n) = export
+                && let Some(&file) = created
+                    .iter()
+                    .find(|&&h| self.handles.kind(h) == Some(HandleKind::Syncobj))
+            {
+                self.syncobj_regs.exported(target, n, file);
+            }
+            let probe = self.handles.get_raw(target).ok();
+            self.settle_syncobj_regs(probe);
+            self.reap_syncobj_regs();
+        }
         crate::pacing::PACING.ioctl2_timed(
             name,
             u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),

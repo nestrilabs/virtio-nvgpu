@@ -23,9 +23,24 @@
  *     touches its handles, so every call must succeed, natively and here.
  *  2. owners and guessers: the same, while other threads DESTROY numbers at
  *     random. An owner's call on a handle a guesser took may then fail --
- *     with the kernel's own errno -- but every object is destroyed exactly
- *     once: the successful DESTROYs of all threads add up to the handles
- *     made, and afterwards no number is live.
+ *     with the kernel's own errno -- or answer for whatever object has the
+ *     number now, but every object is destroyed exactly once: the
+ *     successful DESTROYs of all threads add up to the handles made, and
+ *     afterwards no number is live.
+ *
+ *  3. orphans: one process after another (NVGPU_RACE_ORPHAN_RUNS, default
+ *     6; 0 skips the phase), each on a DRM file of its own, first
+ *     subscribes to a point nobody will signal on syncobjs only it holds,
+ *     destroying each at once (let go with it: never refused), then makes
+ *     orphans until SYNCOBJ_EVENTFD says -ENOMEM: a syncobj exported and
+ *     imported back, a subscription through the first handle to a point
+ *     that never comes, the first handle destroyed -- the import keeps the
+ *     syncobj, and the subscription's host registration, alive. Then it
+ *     exits without cleaning up. Each must get as far as the first did: its
+ *     exit let go of everything it made, and its registrations only ever
+ *     counted against its own share. A fresh process must then still
+ *     subscribe. These orphans once outlived their process, and a few runs
+ *     of phase 2 left SYNCOBJ_EVENTFD -ENOMEM for every process of the VM.
  *
  * With the module's pacing counters readable (root), the posted DESTROYs
  * the host refused ("posted_failed") must not have grown.
@@ -56,6 +71,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -343,10 +359,19 @@ static void owner_round(struct owner *o, uint64_t seq) {
       fail("owner %u: signal/query of its handle %u: %d", o->id, h, r);
     goto out;
   }
-  /* Another object under our number would carry another point. A guesser
-   * could have destroyed ours and another owner made its own under the
-   * number meanwhile -- which answers with that owner's point, not ours. */
-  if (got != pt && (o->strict || (got >> 40) == o->id))
+  /*
+   * Another object under our number would carry another point. With
+   * guessers about, a guesser may have destroyed ours and some other object
+   * got the number -- another owner's, or one of our own from an earlier
+   * round: an owner whose number a guesser took goes on as if the object
+   * now under it were its own, exports it and imports it back, and an
+   * import lands on the lowest free number, ours among them. Native Linux
+   * does exactly that (every run of this phase on the host's own render
+   * node shows a few). What no object can carry is a point of ours we have
+   * not signalled yet.
+   */
+  if (o->strict ? got != pt
+                : (got >> 40) == o->id && (got & ((1ull << 40) - 1)) > (pt & ((1ull << 40) - 1)))
     fail("owner %u: handle %u queried point %#llx, signalled %#llx", o->id, h,
          (unsigned long long)got, (unsigned long long)pt);
 
@@ -357,11 +382,11 @@ static void owner_round(struct owner *o, uint64_t seq) {
 
     r = io(IOC_EVENTFD, &e);
     /*
-     * With guessers about, a subscription whose syncobj a guesser destroyed
-     * before its point was signalled never fires; the syncobj lives on
-     * (exported, so imported: the backend cannot tell it is unreachable),
-     * and so does its host registration, charged to this process until the
-     * file closes. After 256 of those the process's share is spent and
+     * With guessers about, a subscription whose handle a guesser destroyed
+     * before its point was signalled never fires. Its host registration
+     * lasts as long as something of this process still reaches the
+     * syncobj (another handle a guesser has not taken yet), charged to
+     * this process; with 256 of those at once its share is spent and
      * SYNCOBJ_EVENTFD says -ENOMEM, the kernel's own answer when it cannot
      * make an entry -- this process's doing, and no other's.
      */
@@ -535,6 +560,181 @@ static void phase(const char *name, int secs, int nowners, int nguessers) {
   free(g);
 }
 
+/* What one orphans child did: subscriptions made on syncobjs let go at
+ * once, orphans made, and the errno that stopped each (0: not stopped). */
+struct orphan_report {
+  int private_made, private_err;
+  int orphans_made, orphans_err;
+};
+
+/* A point nobody signals. */
+#define NEVER_POINT (1ull << 62)
+
+/* SYNCOBJ_EVENTFD on (h, point) with a fresh eventfd, closed after: the
+ * subscription lives on in the kernel (the module's, the backend's). */
+static int subscribe(uint32_t h, uint64_t point) {
+  struct syncobj_eventfd e = {.handle = h, .point = point};
+  int r;
+
+  e.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (e.fd < 0)
+    return -errno;
+  r = io(IOC_EVENTFD, &e);
+  close(e.fd);
+  return r;
+}
+
+/* The child's work, on a DRM file of its own: never returns. */
+static void orphan_child(const char *node, int wfd, int private_rounds,
+                         int max_orphans) {
+  struct orphan_report rep = {0};
+  int i, r;
+
+  dfd = open(node, O_RDWR | O_CLOEXEC);
+  if (dfd < 0) {
+    rep.private_err = rep.orphans_err = -errno;
+    goto out;
+  }
+  /* Private: the handle is the only way to the syncobj, and its DESTROY
+   * lets go of the subscription with it. */
+  for (i = 0; i < private_rounds; i++) {
+    uint32_t h;
+
+    r = create(&h);
+    if (!r)
+      r = subscribe(h, NEVER_POINT + (uint64_t)i);
+    destroy(h);
+    if (r) {
+      rep.private_err = r;
+      break;
+    }
+    rep.private_made++;
+  }
+  /* Orphans: exported and imported back, then the handle subscribed
+   * through destroyed. */
+  for (i = 0; i < max_orphans; i++) {
+    struct syncobj_handle x = {.fd = -1};
+    uint32_t h;
+
+    r = create(&h);
+    if (r) {
+      rep.orphans_err = r;
+      break;
+    }
+    x.handle = h;
+    r = io(IOC_H2FD, &x);
+    if (!r) {
+      x.handle = 0;
+      r = io(IOC_FD2H, &x);
+      close(x.fd);
+    }
+    if (!r)
+      r = subscribe(h, NEVER_POINT + (uint64_t)i);
+    destroy(h);
+    if (r) {
+      rep.orphans_err = r;
+      break;
+    }
+    rep.orphans_made++;
+  }
+out:
+  (void)!write(wfd, &rep, sizeof(rep));
+  /* No cleanup: the exit closes the file, the imports with it. */
+  _exit(0);
+}
+
+/* Whether environment variable `name` is "1". */
+static int only(const char *name) {
+  const char *v = getenv(name);
+
+  return v && !strcmp(v, "1");
+}
+
+/* One child, waited for. 0 and its report, or -1. */
+static int orphan_run(const char *node, int private_rounds, int max_orphans,
+                      struct orphan_report *rep) {
+  int p[2], st;
+  pid_t pid;
+  ssize_t n;
+
+  if (pipe2(p, O_CLOEXEC))
+    return -1;
+  pid = fork();
+  if (pid < 0) {
+    close(p[0]);
+    close(p[1]);
+    return -1;
+  }
+  if (!pid) {
+    close(p[0]);
+    orphan_child(node, p[1], private_rounds, max_orphans);
+  }
+  close(p[1]);
+  n = read(p[0], rep, sizeof(*rep));
+  close(p[0]);
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+    ;
+  /* The guest closes a dead process's files on its own time; give the
+   * backend a moment to see them go. */
+  usleep(200 * 1000);
+  return n == (ssize_t)sizeof(*rep) ? 0 : -1;
+}
+
+/*
+ * Phase 3 (see the top). A fresh process must get as far as the first:
+ * the share is the backend's per process (a quarter of its 1,024), less
+ * whatever other processes of the VM hold meanwhile, so a little slack.
+ */
+static void orphans_phase(const char *node) {
+  const char *e = getenv("NVGPU_RACE_ORPHAN_RUNS");
+  int runs = e ? atoi(e) : 6, first = -1, i, f0 = atomic_load(&fails);
+  struct orphan_report rep;
+
+  if (e && !strcmp(e, "0")) {
+    printf("INFO orphans: skipped (NVGPU_RACE_ORPHAN_RUNS=0)\n");
+    return;
+  }
+  if (runs < 2)
+    runs = 2;
+  for (i = 0; i < runs; i++) {
+    if (orphan_run(node, 512, 4096, &rep)) {
+      fail("orphans: run %d: no report from its process", i + 1);
+      return;
+    }
+    printf("INFO orphans: run %d: %d let go with their syncobj (%d), %d "
+           "orphans before %d\n",
+           i + 1, rep.private_made, rep.private_err, rep.orphans_made,
+           rep.orphans_err);
+    if (rep.private_err)
+      fail("orphans: run %d: SYNCOBJ_EVENTFD on a syncobj only it held "
+           "failed %d after %d, each destroyed at once",
+           i + 1, rep.private_err, rep.private_made);
+    /* -ENOMEM: its share spent; 0: none refused (natively, no cap). */
+    if (rep.orphans_err && rep.orphans_err != -ENOMEM)
+      fail("orphans: run %d: its orphans stopped at %d with %d, not "
+           "-ENOMEM (its share spent)",
+           i + 1, rep.orphans_made, rep.orphans_err);
+    if (first < 0) {
+      first = rep.orphans_made;
+      if (first < 16)
+        fail("orphans: run 1 made only %d", first);
+    } else if (rep.orphans_made < first - first / 8) {
+      fail("orphans: run %d made %d orphans, the first %d: what the runs "
+           "before made outlived them",
+           i + 1, rep.orphans_made, first);
+    }
+  }
+  /* A fresh process, subscribing and nothing else. */
+  if (orphan_run(node, 64, 0, &rep) || rep.private_err ||
+      rep.private_made != 64)
+    fail("orphans: a fresh process's SYNCOBJ_EVENTFD failed %d after %d",
+         rep.private_err, rep.private_made);
+  printf("%s orphans: %d runs of %d orphans each, then a fresh process "
+         "subscribed %d times\n",
+         atomic_load(&fails) != f0 ? "FAIL" : "PASS", runs, first,
+         rep.private_made);
+}
+
 int main(int argc, char **argv) {
   int secs = argc > 1 ? atoi(argv[1]) : 5;
   int threads = argc > 2 ? atoi(argv[2]) : 8;
@@ -571,15 +771,18 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+  /* NVGPU_RACE_ORPHANS_ONLY=1: phase 3 alone. */
+  if (only("NVGPU_RACE_ORPHANS_ONLY")) {
+    orphans_phase(node);
+    goto done;
+  }
   phase("owners", secs, threads, 0);
-  /* NVGPU_RACE_OWNERS_ONLY=1: the first phase alone, for running it many
-   * times in one VM. The second leaves registrations on syncobjs that got
-   * out (exported) and whose points never come, counted against the VM's
-   * pool for good (SECURITY.md, "Fences"): a few runs of it fill the pool,
-   * and every later SYNCOBJ_EVENTFD in the VM says -ENOMEM. */
-  if (!getenv("NVGPU_RACE_OWNERS_ONLY") ||
-      strcmp(getenv("NVGPU_RACE_OWNERS_ONLY"), "1"))
+  /* NVGPU_RACE_OWNERS_ONLY=1: the first phase alone. */
+  if (!only("NVGPU_RACE_OWNERS_ONLY")) {
     phase("owners+guessers", secs, threads, threads / 2 ? threads / 2 : 1);
+    orphans_phase(node);
+  }
+done:
   printf("%s nvgpu-syncobj-race: %d failure(s)\n",
          atomic_load(&fails) ? "FAIL" : "PASS", atomic_load(&fails));
   return atomic_load(&fails) ? 1 : 0;

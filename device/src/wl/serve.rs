@@ -159,6 +159,9 @@ pub(super) struct TableSend<'a> {
     /// What may leave the backend: no fence context, no injected capture
     /// buffer (exportgate.rs), the same gate HOST_OP PRIME_EXPORT asks.
     pub(super) gate: crate::exportgate::ExportGate<'a>,
+    /// Syncobj handles duplicated for the compositor: it may hold and
+    /// signal their syncobjs until the channel closes (fence.rs, `Reach`).
+    pub(super) syncobjs: Vec<u32>,
 }
 
 impl SendOps for TableSend<'_> {
@@ -197,7 +200,11 @@ impl SendOps for TableSend<'_> {
     /// so a number naming any other kind of file would hand it that file.
     fn syncobj(&mut self, handle: u32) -> io::Result<OwnedFd> {
         match self.handles.get(handle) {
-            Some((fd, HandleKind::Syncobj)) => fd.try_clone_to_owned(),
+            Some((fd, HandleKind::Syncobj)) => {
+                let dup = fd.try_clone_to_owned()?;
+                self.syncobjs.push(handle);
+                Ok(dup)
+            }
             _ => {
                 log::warn!("wayland: a syncobj names handle {handle}, which is not a syncobj");
                 Err(io::Error::from_raw_os_error(libc::EBADF))
@@ -512,8 +519,14 @@ impl NvidiaBackend {
         let mut ops = TableSend {
             handles: &self.handles,
             gate: self.export_gate(),
+            syncobjs: Vec::new(),
         };
-        let resp = conn.send(frame_bytes, &mut ops)?;
+        let resp = conn.send(frame_bytes, &mut ops);
+        // Whether or not the frame went: a duplicate may have.
+        for file in std::mem::take(&mut ops.syncobjs) {
+            self.syncobj_regs.sent(file, handle);
+        }
+        let resp = resp?;
         Ok(Reply::ok(
             MsgType::WlSend,
             handle,
