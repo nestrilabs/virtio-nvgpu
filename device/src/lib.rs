@@ -12,6 +12,7 @@ pub mod handle_table;
 pub mod host;
 pub mod mmap;
 pub mod nvidia;
+pub mod posture;
 pub mod replay;
 pub mod shm;
 pub mod userspace;

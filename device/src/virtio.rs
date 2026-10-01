@@ -329,7 +329,10 @@ mod tests {
             .collect();
         let cfg = VirtioGpuNvConfig::new("615.71.09", &many);
         let n = cfg.num_gpus;
-        assert_eq!(n as usize, MAX_GPUS, "claimed more GPUs than it can describe");
+        assert_eq!(
+            n as usize, MAX_GPUS,
+            "claimed more GPUs than it can describe"
+        );
     }
 
     #[test]

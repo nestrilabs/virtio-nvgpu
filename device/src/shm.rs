@@ -350,12 +350,20 @@ impl ShmAllocator {
 
     /// Free bytes remaining in each zone, as `(uc, wc, wb)`.
     pub fn free_bytes(&self) -> (u64, u64, u64) {
-        (self.uc.free_bytes(), self.wc.free_bytes(), self.wb.free_bytes())
+        (
+            self.uc.free_bytes(),
+            self.wc.free_bytes(),
+            self.wb.free_bytes(),
+        )
     }
 
     /// Largest single allocation each zone could still satisfy.
     pub fn largest_free(&self) -> (u64, u64, u64) {
-        (self.uc.largest_free(), self.wc.largest_free(), self.wb.largest_free())
+        (
+            self.uc.largest_free(),
+            self.wc.largest_free(),
+            self.wb.largest_free(),
+        )
     }
 
     pub fn map_host_fd(&self, shm_offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
@@ -610,8 +618,14 @@ pub trait WindowPlacer: Send {
     /// position in a file. A DRM object is the exception: GEM_MAP_OFFSET hands
     /// out a file offset and the memory is only reachable by mapping the node
     /// there.
-    fn place(&self, shm_offset: u64, len: u64, fd: RawFd, fd_offset: u64, writable: bool)
-        -> Result<()>;
+    fn place(
+        &self,
+        shm_offset: u64,
+        len: u64,
+        fd: RawFd,
+        fd_offset: u64,
+        writable: bool,
+    ) -> Result<()>;
 
     /// Return a range to empty. Not an unmap: leaving a hole would let a later
     /// access reach no mapping at all in a range the memory slot still covers.

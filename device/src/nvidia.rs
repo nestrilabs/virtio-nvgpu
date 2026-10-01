@@ -31,6 +31,33 @@ const NVOS54_TOTAL: usize = 32;
 /// `NV_OK`. Every other value is a refusal of some kind.
 const NV_OK: u32 = 0;
 
+/// UVM's ioctl number for UVM_INITIALIZE (nvidia-uvm/uvm_linux_ioctl.h). Its
+/// block is `flags: u64` then `rmStatus: u32`.
+const UVM_INITIALIZE_CMD: u64 = 0x3000_0001;
+/// UVM_INIT_FLAGS_* (nvidia-uvm/uvm_types.h).
+const UVM_INIT_DISABLE_HMM: u64 = 0x1;
+const UVM_INIT_MULTI_PROCESS_SHARING_MODE: u64 = 0x2;
+/// From 610.43.02 only; older UVM refuses the call with any bit it does not
+/// know (uvm_va_space.c, `flags & ~UVM_INIT_FLAGS_MASK`).
+const UVM_INIT_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
+const UVM_PAGEABLE_FLAG_SINCE: abi::version::DriverVersion =
+    abi::version::DriverVersion::new(610, 43, 2);
+
+/// The flags UVM_INITIALIZE goes to the host with, whatever the guest asked.
+///
+/// Every guest process's UVM file is opened by the backend, so a VA space UVM
+/// ties to the caller's mm would be tied to the backend's, and with HMM or
+/// pageable access the GPU could fault in the backend's own pages. Sharing
+/// mode ties the VA space to no mm, and the other bits turn HMM and pageable
+/// access off where the host release has them.
+pub fn uvm_init_flags(host: abi::version::DriverVersion) -> u64 {
+    let mut f = UVM_INIT_DISABLE_HMM | UVM_INIT_MULTI_PROCESS_SHARING_MODE;
+    if host >= UVM_PAGEABLE_FLAG_SINCE {
+        f |= UVM_INIT_DISABLE_PAGEABLE_ACCESS;
+    }
+    f
+}
+
 /// The host path an `Open` refers to.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
@@ -303,7 +330,6 @@ fn collect_into(
 // NvidiaBackend
 // ============================================================
 
-
 pub struct NvidiaBackend {
     /// The message being served, so a response can echo its type, and the
     /// handle it named, so handlers need not thread either through.
@@ -349,6 +375,11 @@ pub struct NvidiaBackend {
     live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Whether `/dev/nvidia-uvm` and `-uvm-tools` may be opened. Off by
+    /// default: UVM's calls are forwarded without a table of their sizes,
+    /// and six of them carry a descriptor number this backend does not
+    /// translate, so the host would read it in this process's own table.
+    allow_uvm: bool,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
     /// and how often.
     ///
@@ -437,6 +468,7 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
+            allow_uvm: false,
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
@@ -478,6 +510,33 @@ impl NvidiaBackend {
     /// there is no address in the guest that names it.
     /// Forward ioctls the ABI profile does not describe, instead of refusing
     /// them. Diagnostic only: it exists to find out what a workload needs.
+    /// Serve opens of the UVM devices (`--allow-uvm-unsafe`).
+    pub fn set_allow_uvm(&mut self, on: bool) {
+        if on {
+            log::warn!(
+                "UVM served: its calls go to the host without a size table, and the \
+                 descriptor numbers six of them carry are not translated"
+            );
+        }
+        self.allow_uvm = on;
+    }
+
+    /// The host driver's release, from the host itself: the ABI profile is
+    /// chosen from it before the first guest message, so no guest ioctl is
+    /// ever served without one. Refused when no profile covers the release.
+    pub fn set_host_driver_version(
+        &mut self,
+        v: abi::version::DriverVersion,
+    ) -> std::result::Result<(), String> {
+        let Some(t) = abi::versions::table_for(v) else {
+            return Err(format!("host driver {v} is older than every ABI profile"));
+        };
+        self.driver = Some(v);
+        self.abi = Some(t);
+        log::info!("host driver {v}: ABI profile selected, {} escapes", t.len());
+        Ok(())
+    }
+
     pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
         if policy == AbiPolicy::Permissive {
             log::warn!(
@@ -631,7 +690,12 @@ impl NvidiaBackend {
         // fds. A guest process that exits without unmapping is the normal
         // case, not an error -- most of the mappings in a captured trace are
         // still live when the process ends.
-        let leftovers: Vec<_> = self.active_maps.drain().into_iter().map(|e| e.region).collect();
+        let leftovers: Vec<_> = self
+            .active_maps
+            .drain()
+            .into_iter()
+            .map(|e| e.region)
+            .collect();
         for region in leftovers {
             if let Err(e) = self.shm.free(&region) {
                 log::warn!(
@@ -706,6 +770,16 @@ impl NvidiaBackend {
         }
         let req = read_struct::<OpenReq>(payload, 0);
 
+        if !self.allow_uvm
+            && matches!(
+                DeviceKind::from_device_type(req.device_type),
+                Some(DeviceKind::Uvm | DeviceKind::UvmTools)
+            )
+        {
+            log::warn!("open of a UVM device refused: UVM is not served (--allow-uvm-unsafe)");
+            return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
+        }
+
         let path = match device_path_with(req.device_type, &self.dri_devices()) {
             Ok(p) => p,
             Err(e) => {
@@ -767,7 +841,10 @@ impl NvidiaBackend {
             return self.map_unrecorded(req.size, req.offset, resp_buf);
         }
 
-        let entry = match self.active_maps.find_by_fd_handle(self.current_handle as u64) {
+        let entry = match self
+            .active_maps
+            .find_by_fd_handle(self.current_handle as u64)
+        {
             Some(e) => e,
             None => {
                 // Bookkeeping here records what RM_MAP_MEMORY armed, and that
@@ -843,7 +920,9 @@ impl NvidiaBackend {
         // system memory, and a GPU device carries the card's own.
         let kind = self.handle_kinds.get(&handle).copied();
         let pgprot = match kind {
-            Some(DeviceKind::Gpu(_)) | Some(DeviceKind::Dri(_)) => crate::shm::PgprotKind::WriteCombine,
+            Some(DeviceKind::Gpu(_)) | Some(DeviceKind::Dri(_)) => {
+                crate::shm::PgprotKind::WriteCombine
+            }
             _ => crate::shm::PgprotKind::WriteBack,
         };
 
@@ -969,7 +1048,10 @@ impl NvidiaBackend {
         // there faults the VMM rather than the guest.
         if let Some(window) = self.window.as_ref() {
             if let Err(e) = window.withdraw(live.region.offset, live.length) {
-                log::warn!("munmap {}: the window would not give it back: {e}", req.mapping_id);
+                log::warn!(
+                    "munmap {}: the window would not give it back: {e}",
+                    req.mapping_id
+                );
             }
         }
         self.active_maps.remove(live.region.offset);
@@ -1275,8 +1357,7 @@ impl NvidiaBackend {
         // refers to, back to back. The handlers below already expect that
         // layout, so the two lengths only need adding up here.
         let body = &payload[size_of::<IoctlReq>()..];
-        let want =
-            ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
+        let want = ireq.data_len as usize + ireq.nested_len as usize + ireq.deep_len as usize;
         if body.len() < want {
             log::warn!(
                 "ioctl cmd={:#x}: guest promised {want} bytes and sent {}",
@@ -1375,7 +1456,6 @@ impl NvidiaBackend {
             if param_in.len() >= 4 {
                 let nvkms_cmd = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
                 log::debug!("NVKMS cmd={nvkms_cmd} (0x{nvkms_cmd:x})");
-
             }
             // REGISTER_SURFACE carries one of our handles where NVKMS expects a
             // descriptor, because a guest's descriptor number means nothing
@@ -1455,6 +1535,28 @@ impl NvidiaBackend {
         // commands -- nvidia-drm's DMABUF_SUPPORTED is nr 0x4f, which is
         // NV_ESC_RM_UNMAP_MEMORY here -- so anything that is not RM is handed
         // to the host as it arrived rather than matched against this table.
+        // UVM_INITIALIZE goes with the backend's flags, not the guest's
+        // (uvm_init_flags). Before the host release is known nothing says which
+        // bits it takes, so the call is refused: a CUDA client learns the
+        // release on nvidiactl before it opens UVM.
+        if request == UVM_INITIALIZE_CMD {
+            let Some(host) = self.driver else {
+                log::warn!("UVM_INITIALIZE before the host driver release is known; refused");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+            };
+            if param_in.len() < 16 {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
+            let asked = u64::from_le_bytes(param_in[0..8].try_into().unwrap());
+            let flags = uvm_init_flags(host);
+            if asked != flags {
+                log::info!("UVM_INITIALIZE: guest asked flags {asked:#x}, sent {flags:#x}");
+            }
+            let mut p = param_in.to_vec();
+            p[0..8].copy_from_slice(&flags.to_le_bytes());
+            return self.dispatch_simple(cookie, host_fd, request, &p, resp_buf);
+        }
+
         if ioc_type != b'F' as u32 {
             return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
         }
@@ -1480,13 +1582,8 @@ impl NvidiaBackend {
                 self.dispatch_unmap_memory(cookie, host_fd, request, param_in, resp_buf)
             }
 
-            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self.dispatch_update_device_mapping_info(
-                cookie,
-                host_fd,
-                request,
-                param_in,
-                resp_buf,
-            ),
+            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self
+                .dispatch_update_device_mapping_info(cookie, host_fd, request, param_in, resp_buf),
 
             // ---------------------------------------------------------------
             // RM control requires nested handling
@@ -1603,7 +1700,12 @@ impl NvidiaBackend {
             let mut host_guard = match crate::guarded::GuardedBuf::new(nested_size) {
                 Some(b) => b,
                 None => {
-                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM)
+                    return self.write_error_resp(
+                        resp_buf,
+                        Status::IoctlFailed,
+                        cookie,
+                        libc::ENOMEM,
+                    );
                 }
             };
             host_guard.as_mut_slice().copy_from_slice(nested_in);
@@ -1627,8 +1729,9 @@ impl NvidiaBackend {
                 let h_class = u32::from_le_bytes(outer[12..16].try_into().unwrap());
                 const NV0005_DATA: usize = 16;
                 if matches!(h_class, 0x05 | 0x79) && host_buf.len() >= NV0005_DATA + 4 {
-                    let guest_handle_val =
-                        i32::from_le_bytes(host_buf[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap());
+                    let guest_handle_val = i32::from_le_bytes(
+                        host_buf[NV0005_DATA..NV0005_DATA + 4].try_into().unwrap(),
+                    );
                     match self.handles.get_raw(guest_handle_val as u64) {
                         Ok(real_fd) => {
                             saved_nested_handle = Some((NV0005_DATA, guest_handle_val));
@@ -1717,12 +1820,9 @@ impl NvidiaBackend {
                     i32::from_le_bytes(host_buf[off..off + 4].try_into().unwrap());
                 match self.handles.get_raw(guest_handle_val as u64) {
                     Ok(real_fd) => {
-                        log::debug!(
-                            "nvkms memFd: handle {guest_handle_val} → host fd {real_fd}"
-                        );
+                        log::debug!("nvkms memFd: handle {guest_handle_val} → host fd {real_fd}");
                         saved_nested_handle = Some((off, guest_handle_val));
-                        host_buf[off..off + 4]
-                            .copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        host_buf[off..off + 4].copy_from_slice(&(real_fd as i32).to_le_bytes());
                     }
                     Err(_) => {
                         log::warn!(
@@ -1824,9 +1924,8 @@ impl NvidiaBackend {
                         .try_into()
                         .unwrap(),
                 );
-                let status = u32::from_le_bytes(
-                    outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap(),
-                );
+                let status =
+                    u32::from_le_bytes(outer[NVOS54_STATUS..NVOS54_STATUS + 4].try_into().unwrap());
                 if status == NV_OK {
                     log::info!(
                         "RM_CONTROL cmd=0x{:08x} paramsSize={} -> NV_OK",
@@ -1961,7 +2060,7 @@ impl NvidiaBackend {
         if escape == 0xd2 && param_buf.len() >= 4 {
             // Try Cmd='2' first (query mode in newer drivers)
             param_buf[0] = b'2'; // Cmd = '2'
-                                 // Leave other fields as-is, call host
+            // Leave other fields as-is, call host
         }
 
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
@@ -2137,7 +2236,8 @@ impl NvidiaBackend {
         // what the host driver is being asked to read.
         if embedded < 0 {
             let mut param_buf = param_in.to_vec();
-            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+            let rc =
+                unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 log::warn!("ioctl(0x{request:x}) with no embedded fd failed: errno={errno}");
@@ -2630,10 +2730,13 @@ impl NvidiaBackend {
         _cookie: u64,
         errno: i32,
     ) -> usize {
-        let e = if errno != 0 { errno.abs() } else { status.errno() };
+        let e = if errno != 0 {
+            errno.abs()
+        } else {
+            status.errno()
+        };
         self.write_hdr(resp_buf, 0, -e)
     }
-
 }
 
 /// Close whatever the guest left open.
@@ -2657,7 +2760,6 @@ impl Drop for NvidiaBackend {
 // ============================================================
 // Serialisation helpers
 // ============================================================
-
 
 fn read_struct<T: Copy>(buf: &[u8], offset: usize) -> T {
     assert!(buf.len() >= offset + size_of::<T>());
@@ -2701,10 +2803,24 @@ mod abi_tests {
     }
 
     #[test]
+    fn uvm_initialize_always_gets_sharing_mode_and_no_hmm() {
+        use abi::version::DriverVersion as V;
+        // 595 takes 0x1 and 0x2 (mask 0x3); 610.43.02 adds 0x4.
+        assert_eq!(uvm_init_flags(V::new(595, 104, 2)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(580, 178, 4)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(610, 43, 1)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(610, 43, 2)), 0x7);
+        assert_eq!(uvm_init_flags(V::new(615, 71, 9)), 0x7);
+    }
+
+    #[test]
     fn learns_the_driver_version_from_a_real_reply() {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
-        assert_eq!(b.driver, Some(abi::version::DriverVersion::new(580, 178, 4)));
+        assert_eq!(
+            b.driver,
+            Some(abi::version::DriverVersion::new(580, 178, 4))
+        );
         assert!(b.abi.is_some(), "580.178.04 must select a profile");
     }
 
@@ -2765,7 +2881,10 @@ mod abi_tests {
         b.learn_driver_version(&t4_version_reply());
         assert_eq!(
             b.check_abi(NV_ESC_RM_MAP_MEMORY_DMA, 48),
-            AbiCheck::SizeMismatch { expected: 64, actual: 48 }
+            AbiCheck::SizeMismatch {
+                expected: 64,
+                actual: 48
+            }
         );
     }
 
@@ -2774,7 +2893,10 @@ mod abi_tests {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
         // CARD_INFO is an array; the T4 sent 2304 bytes in one call.
-        assert_eq!(b.check_abi(NV_ESC_CARD_INFO, 2304), AbiCheck::VariableLength);
+        assert_eq!(
+            b.check_abi(NV_ESC_CARD_INFO, 2304),
+            AbiCheck::VariableLength
+        );
     }
 
     #[test]
@@ -2916,6 +3038,27 @@ mod tests {
         let mut resp = vec![0u8; 64];
         be.dispatch(&req, &mut resp);
         assert!(is_err(&resp, Status::InvalidDevice));
+    }
+
+    #[test]
+    fn uvm_is_not_opened_unless_served() {
+        let mut be = NvidiaBackend::for_test();
+        for kind in [DeviceKind::Uvm, DeviceKind::UvmTools] {
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&open_msg(kind), &mut resp);
+            assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
+        }
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    #[test]
+    fn a_release_older_than_every_profile_is_refused() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        assert!(be.set_host_driver_version(V::new(470, 0, 0)).is_err());
+        assert!(be.driver.is_none());
+        assert!(be.set_host_driver_version(V::new(595, 104, 2)).is_ok());
+        assert_eq!(be.driver, Some(V::new(595, 104, 2)));
     }
 
     #[test]
@@ -3138,7 +3281,9 @@ mod tests {
         // dispatch path should reach the host ioctl — so we expect either
         // IoctlFailed (host rejected it) or Ok (unlikely without valid handles).
         // The key thing: it should NOT be BadHandle, proving FD translation worked.
-        assert_ne!(r.status, -Status::BadHandle.errno(),
+        assert_ne!(
+            r.status,
+            -Status::BadHandle.errno(),
             "FD translation should have succeeded"
         );
     }
@@ -3193,7 +3338,12 @@ mod tests {
             be.dispatch(&req, &mut resp);
             assert_eq!(parse_resp(&resp).status, 0, "open /dev/nvidiactl");
             let ctl = opened_handle(&resp);
-            let mut c = Self { be, ctl, gpu: 0, cookie: 2 };
+            let mut c = Self {
+                be,
+                ctl,
+                gpu: 0,
+                cookie: 2,
+            };
             // The driver always issues these two before allocating a client.
             // Without them the device allocation is refused with
             // NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
@@ -3303,7 +3453,9 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             let n = self.be.dispatch(&req, &mut resp);
             assert!(n > 0, "alloc class {class:#x}: empty response");
-            assert_eq!(parse_resp(&resp).status, 0,
+            assert_eq!(
+                parse_resp(&resp).status,
+                0,
                 "alloc class {class:#x}: transport status"
             );
             let body = IOCTL_BODY;
@@ -3377,8 +3529,7 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(rh.status, 0,
-            );
+            assert_eq!(rh.status, 0,);
             let body = IOCTL_BODY;
             let out = &resp[body..body + 56];
             let rm = u32::from_le_bytes(out[40..44].try_into().unwrap());
@@ -3453,8 +3604,7 @@ mod tests {
             let mut resp = vec![0u8; 4096];
             self.be.dispatch(&req, &mut resp);
             let rh = parse_resp(&resp);
-            assert_eq!(rh.status, 0,
-            );
+            assert_eq!(rh.status, 0,);
             let body = IOCTL_BODY;
             let rm = u32::from_le_bytes(resp[body + 24..body + 28].try_into().unwrap());
             assert_eq!(rm, 0, "unmap: RM status {rm:#x}");
@@ -3473,7 +3623,10 @@ mod tests {
         let (off, len, linear) = c.map(client, sub, mem, 65536, fd);
         assert_eq!(len, 65536, "mapped length");
         assert_ne!(linear, 0, "pLinearAddress should be the SHM offset");
-        assert_eq!(linear, off, "pLinearAddress must be the SHM offset the guest sees");
+        assert_eq!(
+            linear, off,
+            "pLinearAddress must be the SHM offset the guest sees"
+        );
 
         // The SHM window now aliases GPU registers. Reading must not fault.
         let base = c.be.shm_base_ptr();
@@ -3581,5 +3734,4 @@ mod tests {
         );
         c.be.teardown();
     }
-
 }

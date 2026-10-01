@@ -18,8 +18,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use device::userspace::{
-    load_manifest, loaded_driver_version, resolve, retarget, staged_driver_version, Capability,
-    DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH,
+    Capability, DEFAULT_MANIFEST, DEFAULT_SEARCH_PATHS, LOADED_VERSION_PATH, load_manifest,
+    loaded_driver_version, resolve, retarget, staged_driver_version,
 };
 use std::path::{Path, PathBuf};
 
@@ -35,7 +35,11 @@ struct Args {
     stage: Option<PathBuf>,
 
     /// Which capabilities to carry: utility, compute, graphics, video.
-    #[arg(long, value_delimiter = ',', default_value = "utility,compute,graphics,video")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "utility,compute,graphics,video"
+    )]
     caps: Vec<String>,
 
     /// List every file, not just the totals.
@@ -124,7 +128,11 @@ fn main() -> Result<()> {
 
     if args.verbose {
         for r in &found {
-            println!("  {:<10} {}", r.entry.kind.to_string(), r.guest_path.display());
+            println!(
+                "  {:<10} {}",
+                r.entry.kind.to_string(),
+                r.guest_path.display()
+            );
         }
     }
 
