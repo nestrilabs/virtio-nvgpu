@@ -31,6 +31,33 @@ const NVOS54_TOTAL: usize = 32;
 /// `NV_OK`. Every other value is a refusal of some kind.
 const NV_OK: u32 = 0;
 
+/// UVM's ioctl number for UVM_INITIALIZE (nvidia-uvm/uvm_linux_ioctl.h). Its
+/// block is `flags: u64` then `rmStatus: u32`.
+const UVM_INITIALIZE_CMD: u64 = 0x3000_0001;
+/// UVM_INIT_FLAGS_* (nvidia-uvm/uvm_types.h).
+const UVM_INIT_DISABLE_HMM: u64 = 0x1;
+const UVM_INIT_MULTI_PROCESS_SHARING_MODE: u64 = 0x2;
+/// From 610.43.02 only; older UVM refuses the call with any bit it does not
+/// know (uvm_va_space.c, `flags & ~UVM_INIT_FLAGS_MASK`).
+const UVM_INIT_DISABLE_PAGEABLE_ACCESS: u64 = 0x4;
+const UVM_PAGEABLE_FLAG_SINCE: abi::version::DriverVersion =
+    abi::version::DriverVersion::new(610, 43, 2);
+
+/// The flags UVM_INITIALIZE goes to the host with, whatever the guest asked.
+///
+/// Every guest process's UVM file is opened by the backend, so a VA space UVM
+/// ties to the caller's mm would be tied to the backend's, and with HMM or
+/// pageable access the GPU could fault in the backend's own pages. Sharing
+/// mode ties the VA space to no mm, and the other bits turn HMM and pageable
+/// access off where the host release has them.
+pub fn uvm_init_flags(host: abi::version::DriverVersion) -> u64 {
+    let mut f = UVM_INIT_DISABLE_HMM | UVM_INIT_MULTI_PROCESS_SHARING_MODE;
+    if host >= UVM_PAGEABLE_FLAG_SINCE {
+        f |= UVM_INIT_DISABLE_PAGEABLE_ACCESS;
+    }
+    f
+}
+
 /// The host path an `Open` refers to.
 ///
 /// The wire encoding is one flat `u32`: a GPU is its own minor number and the
@@ -348,6 +375,11 @@ pub struct NvidiaBackend {
     live_maps: std::collections::HashMap<u32, LiveMap>,
     /// Whether an ioctl the profile does not describe is refused or forwarded.
     abi_policy: AbiPolicy,
+    /// Whether `/dev/nvidia-uvm` and `-uvm-tools` may be opened. Off by
+    /// default: UVM's calls are forwarded without a table of their sizes,
+    /// and six of them carry a descriptor number this backend does not
+    /// translate, so the host would read it in this process's own table.
+    allow_uvm: bool,
     /// Every `RM_ALLOC` class and `RM_CONTROL` command a workload asked for,
     /// and how often.
     ///
@@ -436,6 +468,7 @@ impl NvidiaBackend {
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             abi_policy: AbiPolicy::default(),
+            allow_uvm: false,
             abi_refused: std::collections::BTreeMap::new(),
             rm_classes: std::collections::BTreeMap::new(),
             rm_controls: std::collections::BTreeMap::new(),
@@ -477,6 +510,33 @@ impl NvidiaBackend {
     /// there is no address in the guest that names it.
     /// Forward ioctls the ABI profile does not describe, instead of refusing
     /// them. Diagnostic only: it exists to find out what a workload needs.
+    /// Serve opens of the UVM devices (`--allow-uvm-unsafe`).
+    pub fn set_allow_uvm(&mut self, on: bool) {
+        if on {
+            log::warn!(
+                "UVM served: its calls go to the host without a size table, and the \
+                 descriptor numbers six of them carry are not translated"
+            );
+        }
+        self.allow_uvm = on;
+    }
+
+    /// The host driver's release, from the host itself: the ABI profile is
+    /// chosen from it before the first guest message, so no guest ioctl is
+    /// ever served without one. Refused when no profile covers the release.
+    pub fn set_host_driver_version(
+        &mut self,
+        v: abi::version::DriverVersion,
+    ) -> std::result::Result<(), String> {
+        let Some(t) = abi::versions::table_for(v) else {
+            return Err(format!("host driver {v} is older than every ABI profile"));
+        };
+        self.driver = Some(v);
+        self.abi = Some(t);
+        log::info!("host driver {v}: ABI profile selected, {} escapes", t.len());
+        Ok(())
+    }
+
     pub fn set_abi_policy(&mut self, policy: AbiPolicy) {
         if policy == AbiPolicy::Permissive {
             log::warn!(
@@ -709,6 +769,16 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, 0);
         }
         let req = read_struct::<OpenReq>(payload, 0);
+
+        if !self.allow_uvm
+            && matches!(
+                DeviceKind::from_device_type(req.device_type),
+                Some(DeviceKind::Uvm | DeviceKind::UvmTools)
+            )
+        {
+            log::warn!("open of a UVM device refused: UVM is not served (--allow-uvm-unsafe)");
+            return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, libc::ENODEV);
+        }
 
         let path = match device_path_with(req.device_type, &self.dri_devices()) {
             Ok(p) => p,
@@ -1465,6 +1535,28 @@ impl NvidiaBackend {
         // commands -- nvidia-drm's DMABUF_SUPPORTED is nr 0x4f, which is
         // NV_ESC_RM_UNMAP_MEMORY here -- so anything that is not RM is handed
         // to the host as it arrived rather than matched against this table.
+        // UVM_INITIALIZE goes with the backend's flags, not the guest's
+        // (uvm_init_flags). Before the host release is known nothing says which
+        // bits it takes, so the call is refused: a CUDA client learns the
+        // release on nvidiactl before it opens UVM.
+        if request == UVM_INITIALIZE_CMD {
+            let Some(host) = self.driver else {
+                log::warn!("UVM_INITIALIZE before the host driver release is known; refused");
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EPERM);
+            };
+            if param_in.len() < 16 {
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+            }
+            let asked = u64::from_le_bytes(param_in[0..8].try_into().unwrap());
+            let flags = uvm_init_flags(host);
+            if asked != flags {
+                log::info!("UVM_INITIALIZE: guest asked flags {asked:#x}, sent {flags:#x}");
+            }
+            let mut p = param_in.to_vec();
+            p[0..8].copy_from_slice(&flags.to_le_bytes());
+            return self.dispatch_simple(cookie, host_fd, request, &p, resp_buf);
+        }
+
         if ioc_type != b'F' as u32 {
             return self.dispatch_simple(cookie, host_fd, request, param_in, resp_buf);
         }
@@ -2711,6 +2803,17 @@ mod abi_tests {
     }
 
     #[test]
+    fn uvm_initialize_always_gets_sharing_mode_and_no_hmm() {
+        use abi::version::DriverVersion as V;
+        // 595 takes 0x1 and 0x2 (mask 0x3); 610.43.02 adds 0x4.
+        assert_eq!(uvm_init_flags(V::new(595, 104, 2)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(580, 178, 4)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(610, 43, 1)), 0x3);
+        assert_eq!(uvm_init_flags(V::new(610, 43, 2)), 0x7);
+        assert_eq!(uvm_init_flags(V::new(615, 71, 9)), 0x7);
+    }
+
+    #[test]
     fn learns_the_driver_version_from_a_real_reply() {
         let mut b = backend();
         b.learn_driver_version(&t4_version_reply());
@@ -2935,6 +3038,27 @@ mod tests {
         let mut resp = vec![0u8; 64];
         be.dispatch(&req, &mut resp);
         assert!(is_err(&resp, Status::InvalidDevice));
+    }
+
+    #[test]
+    fn uvm_is_not_opened_unless_served() {
+        let mut be = NvidiaBackend::for_test();
+        for kind in [DeviceKind::Uvm, DeviceKind::UvmTools] {
+            let mut resp = vec![0u8; 64];
+            be.dispatch(&open_msg(kind), &mut resp);
+            assert_eq!(parse_resp(&resp).status, -libc::ENODEV, "{kind:?}");
+        }
+        assert_eq!(be.handles.len(), 0);
+    }
+
+    #[test]
+    fn a_release_older_than_every_profile_is_refused() {
+        use abi::version::DriverVersion as V;
+        let mut be = NvidiaBackend::for_test();
+        assert!(be.set_host_driver_version(V::new(470, 0, 0)).is_err());
+        assert!(be.driver.is_none());
+        assert!(be.set_host_driver_version(V::new(595, 104, 2)).is_ok());
+        assert_eq!(be.driver, Some(V::new(595, 104, 2)));
     }
 
     #[test]

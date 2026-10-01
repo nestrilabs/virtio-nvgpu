@@ -1949,8 +1949,12 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
    * _IOC_SIZE() returns 0x3000 which is the max buffer, not the
    * actual struct size. Use the real struct sizes instead.
    *
-   * UVM_INITIALIZE     (nr=1): flags:u64 + rmStatus:u32 + pad = 16 bytes
-   * UVM_MM_INITIALIZE  (nr=2): uvmFd:s32 + rmStatus:u32        =  8 bytes
+   * UVM_INITIALIZE     (nr=1):  flags:u64 + rmStatus:u32 + pad = 16 bytes
+   * UVM_DEINITIALIZE   (nr=2):  no parameters; UVM returns 0    =  0 bytes
+   * UVM_MM_INITIALIZE  (nr=75): uvmFd:s32 + rmStatus:u32        =  8 bytes
+   *
+   * (nvidia-uvm/uvm_linux_ioctl.h and uvm_ioctl.h; UVM_IOCTL_BASE(i) is i
+   * on Linux.)
    *
    * For all other UVM ioctls we use 0x3000 as an upper bound since
    * we don't know their sizes — the host driver will only read what
@@ -1962,6 +1966,9 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
       sz = 16;
       break; /* UVM_INITIALIZE        */
     case 2:
+      sz = 0;
+      break; /* UVM_DEINITIALIZE      */
+    case 75:
       sz = 8;
       break; /* UVM_MM_INITIALIZE     */
     default:
@@ -1974,10 +1981,8 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
     return -EINVAL;
 
   /*
-   * UVM_MM_INITIALIZE passes arg=0 (NULL) because the uvmFd is
-   * embedded in the ioctl struct on some driver versions, or the
-   * kernel side doesn't need userspace params at all.
-   * Forward with a zeroed buffer — host will fill rmStatus.
+   * A call with no argument (UVM_DEINITIALIZE is made that way) is
+   * forwarded with a zeroed buffer of the size above.
    */
   if (arg == 0) {
     /*
@@ -2019,15 +2024,14 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
     return ret;
   }
 
-  /* UVM_INITIALIZE: inject MULTI_PROCESS_SHARING_MODE flag */
-  if (nr == 1) {
-    u64 flags;
-    if (copy_from_user(&flags, uarg, sizeof(flags)))
-      return -EFAULT;
-    flags |= (1ULL << 2);
-    if (copy_to_user(uarg, &flags, sizeof(flags)))
-      return -EFAULT;
-  }
+  /*
+   * UVM_INITIALIZE's flags are the backend's to decide: it sends the host
+   * MULTI_PROCESS_SHARING_MODE with HMM and pageable access off, whatever is
+   * asked here (device/src/nvidia.rs, uvm_init_flags). This side used to OR
+   * in bit 2 for sharing mode, which is DISABLE_PAGEABLE_ACCESS on 610.43.02
+   * and later and unknown, so refused, before; and it wrote the result back
+   * into the caller's buffer.
+   */
 
   return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
 }

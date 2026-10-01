@@ -76,6 +76,15 @@ struct Args {
     /// do otherwise; never for a guest you do not trust.
     #[arg(long)]
     allow_root_unsafe: bool,
+
+    /// Serve `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, which CUDA needs.
+    ///
+    /// Off by default. UVM's calls are forwarded without a table of their
+    /// sizes, and six of them carry a descriptor number that is not
+    /// translated, so the host reads it in the backend's own descriptor
+    /// table. Compute is served properly from v0.2.
+    #[arg(long)]
+    allow_uvm_unsafe: bool,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -322,7 +331,11 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(proc_nvidia: &Path, abi_policy: device::nvidia::AbiPolicy) -> anyhow::Result<Self> {
+    fn new(
+        proc_nvidia: &Path,
+        abi_policy: device::nvidia::AbiPolicy,
+        allow_uvm: bool,
+    ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -337,7 +350,13 @@ impl NvGpuBackend {
         log::info!("host driver {version}, {} GPU(s)", gpus.len());
 
         let mut nvidia = NvidiaBackend::with_default_zones();
+        let release = abi::version::DriverVersion::parse(&version)
+            .ok_or_else(|| anyhow::anyhow!("host driver version {version:?} does not parse"))?;
+        nvidia
+            .set_host_driver_version(release)
+            .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
         nvidia.set_abi_policy(abi_policy);
+        nvidia.set_allow_uvm(allow_uvm);
 
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
@@ -584,6 +603,7 @@ fn main() -> anyhow::Result<()> {
     let backend = Arc::new(RwLock::new(NvGpuBackend::new(
         &args.proc_nvidia,
         abi_policy,
+        args.allow_uvm_unsafe,
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
