@@ -852,18 +852,18 @@ gameloop and loses 6-8% in stk-vk and Godot. `smt` loses 3-8% of average fps
 (it runs 8 vCPUs on 4 cores) and has the best lows of any layout:
 Heaven's 1% / 0.1% lows 282 / 138 fps against 233 / 104 unpinned, and
 native's 296 / 144. With the desktop's load on CCD0 (every thread of it
-busy), `smt` is the only layout that keeps its lows -- Heaven 234 / 112
-against 175 / 65 unpinned and 122 / 46 with `cores`, gameloop's 0.1% low 67
-against 20 and 17 -- at an average within 3% of unpinned. What it has that
+busy), `smt` is the only layout that keeps its lows -- Heaven 234 / 113
+against 176 / 66 unpinned and 122 / 46 with `cores`, gameloop's 0.1% low 76
+against 20 and 18 -- at an average within 3% of unpinned. What it has that
 `cores`, `l3` and `cores:io=siblings` do not is four whole idle cores on the
 vCPUs' own CCD, where the host puts what else must run (the compositor, the
 backend's queue thread); the same program natively does the same (on 8-15,
 Heaven's lows under the load 155 / 51; on `smt`'s CPUs 235 / 95). `spread`
 puts half its vCPUs on the loaded CCD (Heaven 193 fps), and `io=other` puts
-the backend there (an IOCTL2 takes 38-45 µs instead of 10). Pinning does
+the backend there (an IOCTL2 takes 25-45 µs instead of 11-26). Pinning does
 not make a wakeup between vCPUs cheaper (a futex hand-off 7.8 µs unpinned,
 8.0 with `cores`, 8.7 between two `smt` siblings). A busy CCD0 costs even a
-native game confined to CCD1 3-14% of its average: the two CCDs share a
+native game confined to CCD1 7-14% of its average: the two CCDs share a
 power budget, which no placement changes.
 
 **Recommended, for a gaming VM on this host:** `NVGPU_PIN=smt` (8 vCPUs on
@@ -875,7 +875,13 @@ VM has four whole cores no other VM is placed on, and with one
 core-scheduling cookie for the VM (crosvm, and nesbox with
 `NVGPU_CORE_SCHED=vm`) no host task shares a core with a running vCPU
 either. `smt:io=rest` (the backend and the VMM's other threads on the four
-cores `smt` leaves) measured the same as `smt`. Keep the host's own
+cores `smt` leaves) measured the same as `smt`; telling the guest the truth
+about its siblings is part of the gain (Heaven's lows under the load 234 /
+113 told, 176 / 68 with the same pins told 8 cores). Six vCPUs on six whole
+cores (`cores:io=rest`) keeps some average where a game uses few threads
+and loses the lows: what holds them is no idle thread on a vCPU's core and
+free cores beside them, not a core per vCPU. At 16 vCPUs, which fill CCD1,
+no layout wins; leave such a guest unpinned. Keep the host's own
 work off CCD1 (a slice or cpuset of its own) for the full effect. On a host
 that is otherwise idle, the default -- nothing pinned -- is as good or
 better on average, and it stays the default.

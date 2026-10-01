@@ -33,6 +33,11 @@ The short version, on an RTX 5090 with the current code:
   CPUs. The frame-pacing measures cost no throughput. The guest kernel
   lacked huge pages (10%) and ntsync (11-13% under Wine), and without compute a
   game that enables ray tracing or DLSS did not start; both are fixed.
+- **vCPU pinning** ([vCPU pinning](#vcpu-pinning)): on an idle host no
+  layout beats the host scheduler by much; with the desktop's load on the
+  other CCD, 8 vCPUs on four whole cores of CCD1, both threads each and the
+  guest told so, keep the lows the unpinned guest loses (Heaven's 0.1% low
+  113 against 66), for 3-8% of the average when the host is idle.
 
 [Table](#native-against-a-guest) ·
 [How it was measured](#how-it-was-measured) ·
@@ -41,6 +46,7 @@ The short version, on an RTX 5090 with the current code:
 [What these numbers do not support](#what-these-numbers-do-not-support) ·
 [Heavy workloads](#heavy-workloads) ·
 [Steam-like games](#steam-like-games) ·
+[vCPU pinning](#vcpu-pinning) ·
 [Earlier, on an RTX 3060](#earlier-an-rtx-3060-before-protocol-v2) ·
 [Re-taking these](#re-taking-these)
 
@@ -936,7 +942,7 @@ decide for the user.
 | a lower C-state limit on the host (`/dev/cpu_dma_latency`, or C3 disabled: 350 µs exit latency here; `NVGPU_CPU_LATENCY_US`, DEPLOY.md, "Tuning") | not measured (it needs root) | power, heat |
 | crosvm `--core-scheduling=false` (`NVGPU_CORE_SCHED=off`) | 10-16% here, 16-50% above | the SMT side-channel mitigation between a vCPU and host tasks |
 | one core-scheduling cookie for the VM and its backend (`NVGPU_CORE_SCHED=shared`) | Heaven 433 -> 492 fps (off: 497), "Heavy workloads" | the VM's own backend may share a core with its vCPUs; other tasks still may not |
-| pinning vCPUs | none measured (7.9 µs hand-off, 57.0 fps) | worse under a host load unless the CPUs are set aside (DEPLOY.md, "Frame pacing") |
+| pinning vCPUs (`NVGPU_PIN=smt`, 4 cores × 2 threads on CCD1) | lows that hold with the other CCD loaded: Heaven 234 / 113 against 176 / 66 ("vCPU pinning") | 3-8% of the average on an idle host; nothing in isolation (the VM's cores are its own) |
 
 ### What changed
 
@@ -962,6 +968,319 @@ decide for the user.
   guest under `hang-watch.sh` (which dumps what a stopped program waits
   on). Twice the killed process did not exit, which points below Wine. Not
   diagnosed.
+
+## vCPU pinning
+
+RTX 5090, 595.99.02, Ryzen 9 9950X, 2026-09-30 and 10-01. Where a guest's
+vCPUs, its VMM's other threads and the backend run, laid out from the
+host's topology by the launcher's `NVGPU_PIN` (DEPLOY.md, "vCPU
+placement"), against the host scheduler placing everything (the default).
+The 9950X has two CCDs of 8 cores, each core two threads (CPU n and n+16)
+and each CCD an L3 of its own; the host scheduler prefers CCD0's cores
+(`amd_pstate_prefcore_ranking` 206-236 against CCD1's 166-201), so the
+layouts take CCD1 first. The earlier finding -- "no gain, worse under a host
+load" -- pinned 4 vCPUs to 8-11 one to a CPU with the load on every CPU;
+this measures the layouts a desktop would use, with the desktop's load
+where it lands.
+
+The workloads of "Steam-like games" (gameloop, Heaven and Godot D3D12 under
+Wine without ntsync) and SuperTuxKart on Vulkan at 3840x2160 (`stk-vk`, the
+CPU-bound Vulkan game of "Heavy workloads"), by `rig/rig-heavy.sh` against
+the rig's headless sway; and `nvgpu-wakecost`'s futex hand-off between
+guest CPUs 0 and 1, and 0 and 2. The guest: 8 vCPUs, 8 GiB, steamperf's
+image and THP+ntsync guest kernel, `--allow-compute`, nesbox
+`virtio-nvgpu-v7` with `patches/nesbox/0001` (the rig's), steamperf's
+backend, everything else at its default (the 100 µs slice included).
+**CCD0 loaded** is `stress-ng --cpu 16 --taskset 0-7,16-23` (matrix
+products) for the whole run: every thread of CCD0 busy, CCD1 idle, as a
+desktop compiling or encoding on the cores the scheduler prefers. Three
+runs a cell or more, interleaved with every other cell; the mean of them
+(half their range is within 3% of the average in most cells, and up to 9%
+for `spread` and `cores:io=siblings`). A run during which the host was
+busy with something else -- another agent's build, which the rig's own
+process list cannot see but its load average can (each run logs both, and
+a load average over 25 is left out) -- is not counted, and the cells it
+hit were run again. **IOCTL2** is the guest's mean round trip of the call
+explicit sync makes about 11 of a presented frame (its pacing counters,
+type 10). Native rows are the same program on the whole host and
+confined with `taskset` to the CPUs a layout gives the vCPUs.
+
+| layout | 8 vCPUs on (CCD1 is 8-15, 24-31) | the guest is told |
+|---|---|---|
+| unpinned | wherever the host scheduler puts them | 8 cores (nesbox's default) |
+| `cores` | 8-15, one thread of each core | 8 cores |
+| `smt` | 10/26, 13/29, 14/30, 15/31: vCPUs 2k and 2k+1 on one core | 4 cores of 2 threads |
+| `spread` | 15, 6, 14, 7, 10, 1, 13, 4 (the CCDs in turn) | 8 cores |
+| `cores:io=other` | as `cores`; the backend and the VMM's other threads on CCD0 | 8 cores |
+| `cores:io=siblings` | as `cores`; those on 24-31 | 8 cores |
+
+**gameloop**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 236.8 (88 / 38) | 134.8 (72 / 44) | -- |
+| native on 8-15 | 103.8 (67 / 39) | 92.3 (29 / 16) | -- |
+| native on smt's 8 CPUs | 100.2 (88 / 81) | 92.9 (79 / 64) | -- |
+| native on spread's 8 CPUs | 112.0 (78 / 52) | 53.8 (36 / 20) | -- |
+| unpinned | 99.0 (62 / 39) | 86.3 (44 / 20) | 23.0 / 25.8 |
+| `cores` (8-15) | 99.2 (80 / 57) | 86.4 (29 / 18) | 23.1 / 25.5 |
+| `smt` (4 cores × 2, told) | 92.2 (83 / 78) | 88.3 (79 / 76) | 22.7 / 23.6 |
+| `spread` | 104.4 (72 / 48) | 63.4 (38 / 18) | 15.4 / 35.1 |
+| `cores:io=other` | 99.2 (78 / 45) | 84.4 (28 / 18) | 15.1 / 44.9 |
+| `cores:io=siblings` | 95.8 (77 / 56) | 83.6 (29 / 18) | 23.9 / 26.2 |
+
+**SuperTuxKart, Vulkan (`stk-vk`)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 1490.6 (406 / 163) | 1336.5 (361 / 138) | -- |
+| native on 8-15 | 1496.2 (394 / 158) | 1336.7 (357 / 141) | -- |
+| native on smt's 8 CPUs | 1473.8 (384 / 151) | 1306.6 (350 / 135) | -- |
+| native on spread's 8 CPUs | 1539.7 (399 / 159) | 1312.5 (343 / 129) | -- |
+| unpinned | 1188.3 (496 / 197) | 962.4 (364 / 145) | 7.7 / 10.6 |
+| `cores` (8-15) | 1092.3 (453 / 190) | 910.9 (341 / 132) | 10.5 / 14.3 |
+| `smt` (4 cores × 2, told) | 1150.2 (498 / 202) | 987.2 (377 / 160) | 7.6 / 9.7 |
+| `spread` | 1143.4 (487 / 202) | 901.1 (260 / 121) | 8.5 / 11.2 |
+| `cores:io=other` | 1138.3 (476 / 195) | 807.1 (197 / 70) | 8.0 / 25.2 |
+| `cores:io=siblings` | 1063.0 (465 / 196) | 908.0 (367 / 149) | 12.1 / 15.4 |
+
+**Heaven (Wine, D3D11)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 589.7 (296 / 144) | 500.7 (218 / 85) | -- |
+| native on 8-15 | 565.6 (249 / 119) | 487.3 (155 / 51) | -- |
+| native on smt's 8 CPUs | 545.8 (271 / 135) | 490.2 (235 / 95) | -- |
+| native on spread's 8 CPUs | 519.6 (186 / 108) | 412.2 (118 / 56) | -- |
+| unpinned | 486.3 (233 / 104) | 408.6 (176 / 66) | 11.4 / 14.7 |
+| `cores` (8-15) | 494.8 (254 / 118) | 417.7 (122 / 46) | 13.8 / 17.8 |
+| `smt` (4 cores × 2, told) | 448.3 (282 / 138) | 398.5 (234 / 113) | 7.0 / 10.9 |
+| `spread` | 442.3 (208 / 92) | 192.5 (78 / 35) | 8.9 / 19.3 |
+| `cores:io=other` | 496.1 (244 / 100) | 433.2 (124 / 38) | 8.0 / 38.1 |
+| `cores:io=siblings` | 479.7 (251 / 105) | 416.6 (121 / 44) | 15.1 / 17.2 |
+
+**Godot D3D12 (Wine)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 72.1 (63 / 56) | 61.9 (44 / 27) | -- |
+| native on 8-15 | 67.7 (46 / 33) | 62.3 (40 / 26) | -- |
+| native on smt's 8 CPUs | 69.7 (49 / 34) | 64.9 (46 / 34) | -- |
+| native on spread's 8 CPUs | 68.0 (36 / 25) | 60.5 (27 / 21) | -- |
+| unpinned | 69.4 (56 / 38) | 61.4 (42 / 26) | 17.5 / 20.8 |
+| `cores` (8-15) | 65.3 (55 / 45) | 59.7 (38 / 27) | 19.1 / 21.4 |
+| `smt` (4 cores × 2, told) | 65.0 (57 / 41) | 59.8 (47 / 35) | 17.5 / 20.5 |
+| `spread` | 68.4 (56 / 40) | 47.6 (18 / 16) | 15.4 / 26.9 |
+| `cores:io=other` | 67.7 (54 / 39) | 61.3 (37 / 21) | 12.9 / 40.0 |
+| `cores:io=siblings` | 67.1 (55 / 37) | 60.6 (33 / 15) | 20.0 / 21.9 |
+
+**futex hand-off** (µs, p50 / p99; guest CPUs 0,1 and 0,2)
+
+| | idle, 0,1 | idle, 0,2 | CCD0 loaded, 0,1 | loaded, 0,2 |
+|---|---|---|---|---|
+| native, all 32 CPUs | 2.59 / 4.0 | 2.26 / 4.1 | 668.17 / 1336.1 | 1000.60 / 2002.0 |
+| unpinned | 7.77 / 13.8 | 7.76 / 13.8 | 9.23 / 17.4 | 9.34 / 18.7 |
+| `cores` (8-15) | 7.97 / 14.0 | 8.02 / 14.0 | 9.11 / 17.4 | 9.23 / 18.4 |
+| `smt` (4 cores × 2, told) | 8.74 / 15.0 | 7.97 / 14.1 | 9.76 / 16.7 | 9.07 / 18.1 |
+| `spread` | 9.73 / 16.3 | 8.18 / 14.1 | 16.07 / 400.1 | 9.15 / 16.8 |
+| `cores:io=other` | 7.90 / 14.0 | 7.99 / 14.1 | 9.28 / 22.9 | 9.13 / 22.2 |
+| `cores:io=siblings` | 7.96 / 13.5 | 7.99 / 14.0 | 9.05 / 16.3 | 9.21 / 17.0 |
+
+**What it shows.**
+
+- **On an idle host no layout wins much.** `cores` is within 2% of
+  unpinned in Heaven and gameloop and loses 6-8% in stk-vk and Godot (the
+  backend's queue thread is free to land on a vCPU's idle sibling, and was
+  seen there: an IOCTL2 takes 10.5 µs against 7.7).
+  `smt` runs 8 vCPUs on 4 cores and loses 3-8% of the average, but has the
+  best lows of any layout: Heaven's 1% / 0.1% lows 282 / 138 against 233 /
+  104 unpinned and native's 296 / 144; gameloop's 0.1% low 78 against 39.
+- **With CCD0 loaded, only `smt` keeps its lows**, at an average within
+  3% of unpinned: Heaven 234 / 113 (unpinned 176 / 66, `cores` 122 / 46),
+  gameloop 79 / 76 (44 / 20, 29 / 18), Godot 47 / 35 (42 / 26, 38 / 27),
+  stk-vk 377 / 160 (364 / 145, 341 / 132).
+- **What `smt` has is free whole cores on the vCPUs' CCD.** Its 4 vCPU
+  cores have no idle thread, and CCD1's other 4 cores are idle: when CCD0 is
+  full, what else must run -- the compositor, the backend's queue thread,
+  the host's own threads -- goes to those. `cores`, `cores:io=siblings` and
+  `l3` leave idle sibling threads on the vCPUs' own cores, and that is where
+  it lands. The same program natively does exactly this: on 8-15, Heaven's
+  lows under the load are 155 / 51; on `smt`'s 8 CPUs, 235 / 95.
+- **`spread` puts half its vCPUs on the loaded CCD** (Heaven 193 fps,
+  Godot 48), and **`io=other` puts the backend there**: an IOCTL2 takes
+  25-45 µs instead of 11-26 unpinned, and stk-vk drops 16%.
+- **A busy CCD0 costs even CCD1's games** 7-14% of their average,
+  natively too (Heaven confined to 8-15: 566 -> 487): the two CCDs share a
+  package power budget and its boost clocks. No placement changes that.
+- **Pinning does not make a wakeup between vCPUs cheaper**: a futex
+  hand-off takes 7.8 µs unpinned, 8.0 with `cores`, 8.7 between two `smt`
+  siblings (8.0 across cores) and 9.7 across CCDs with `spread`; natively
+  2.3-2.6. What it costs is the halted vCPU's exit and the host's wake, not
+  where the vCPU is. (Natively under the load the program's own threads are
+  pinned to CPUs 0 and 1, which the load holds, hence the milliseconds.)
+
+**More layouts at 8 vCPUs, and 6 vCPUs on whole cores** (three runs a
+cell; `smt` repeated from above):
+
+**gameloop**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| `smt` (4 cores × 2, told) | 92.2 (83 / 78) | 88.3 (79 / 76) | 22.7 / 23.6 |
+| `smt:io=rest` | 93.9 (84 / 81) | 87.5 (72 / 55) | 22.7 / 25.7 |
+| `l3` (any of 8-15, 24-31) | 96.7 (68 / 54) | 86.2 (35 / 21) | 22.7 / 25.3 |
+| 6 vCPUs, `cores:io=rest` (6 whole cores; I/O on the other 2) | 77.1 (48 / 27) | 71.4 (28 / 16) | 22.5 / 23.0 |
+
+**SuperTuxKart, Vulkan (`stk-vk`)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| `smt` (4 cores × 2, told) | 1150.2 (498 / 202) | 987.2 (377 / 160) | 7.6 / 9.7 |
+| `smt:io=rest` | 1147.3 (506 / 204) | 995.2 (353 / 144) | 7.3 / 9.1 |
+| `l3` (any of 8-15, 24-31) | 1148.0 (507 / 200) | 954.7 (349 / 145) | 8.4 / 11.0 |
+| 6 vCPUs, `cores:io=rest` (6 whole cores; I/O on the other 2) | 1152.0 (463 / 192) | 1010.8 (355 / 132) | 7.3 / 8.7 |
+
+**Heaven (Wine, D3D11)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| `smt` (4 cores × 2, told) | 448.3 (282 / 138) | 398.5 (234 / 113) | 7.0 / 10.9 |
+| `smt:io=rest` | 442.0 (255 / 120) | 396.7 (208 / 91) | 7.5 / 10.4 |
+| `l3` (any of 8-15, 24-31) | 467.2 (255 / 124) | 407.2 (172 / 59) | 11.5 / 14.4 |
+| 6 vCPUs, `cores:io=rest` (6 whole cores; I/O on the other 2) | 485.8 (214 / 110) | 417.6 (132 / 52) | 7.1 / 9.9 |
+
+**Godot D3D12 (Wine)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| `smt` (4 cores × 2, told) | 65.0 (57 / 41) | 59.8 (47 / 35) | 17.5 / 20.5 |
+| `smt:io=rest` | 66.9 (56 / 42) | 61.5 (46 / 34) | 16.8 / 18.1 |
+| `l3` (any of 8-15, 24-31) | 68.7 (57 / 43) | 61.6 (36 / 17) | 18.2 / 21.8 |
+
+- **`smt:io=rest`** (the backend and the VMM's other threads on the four
+  cores `smt` leaves) measures as `smt` does, within the runs' spread:
+  those cores are where the host put them anyway.
+- **`l3`** (every vCPU free on any of CCD1's 16 threads) has unpinned's
+  average and loses its lows under the load, as `cores` does.
+- **6 vCPUs on 6 whole cores** (`cores:io=rest` at 6: each vCPU a core of
+  its own, the backend and the VMM's threads on the other two) has the best
+  average of these where a game uses few threads (Heaven 486 idle, stk-vk
+  1,152), loses 16% where it scales with cores (gameloop), and loses the
+  lows, idle and loaded (Heaven under the load 132 / 52 against `smt`'s 234
+  / 113): six idle sibling threads on the vCPUs' cores are where the host's
+  stragglers land. A whole core per vCPU is not what keeps the lows; no
+  idle thread on a vCPU's core, and free cores beside them, is.
+
+**16 vCPUs** (CCD1 is exactly 16 threads, so no layout leaves a free core
+on it; three runs a cell):
+
+**gameloop**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 236.8 (88 / 38) | 134.8 (72 / 44) | -- |
+| native on 0-15 | 176.7 (99 / 66) | 89.6 (49 / 40) | -- |
+| native on 8-15, 24-31 | 162.6 (104 / 69) | 136.0 (51 / 28) | -- |
+| 16 vCPUs, unpinned | 164.0 (85 / 45) | 125.1 (58 / 35) | 18.3 / 27.1 |
+| 16, `cores:avoid=none` (0-15) | 166.0 (61 / 36) | 93.5 (39 / 24) | 18.1 / 34.0 |
+| 16, `smt` (8-15, 24-31, told) | 150.3 (117 / 95) | 107.3 (37 / 29) | 22.8 / 35.7 |
+| 16, `l3` (any of 8-15, 24-31) | 146.7 (118 / 91) | 123.7 (56 / 37) | 24.2 / 27.2 |
+
+**Heaven (Wine, D3D11)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 589.7 (296 / 144) | 500.7 (218 / 85) | -- |
+| native on 0-15 | 585.9 (283 / 151) | 395.0 (99 / 29) | -- |
+| native on 8-15, 24-31 | 549.4 (248 / 117) | 500.9 (203 / 76) | -- |
+| 16 vCPUs, unpinned | 458.3 (229 / 109) | 365.1 (110 / 49) | 12.5 / 19.4 |
+| 16, `cores:avoid=none` (0-15) | 430.2 (181 / 90) | 194.7 (59 / 30) | 14.4 / 51.9 |
+| 16, `smt` (8-15, 24-31, told) | 447.2 (213 / 101) | 320.8 (103 / 54) | 15.4 / 29.5 |
+| 16, `l3` (any of 8-15, 24-31) | 444.1 (223 / 108) | 359.5 (140 / 60) | 15.1 / 21.6 |
+
+**Godot D3D12 (Wine)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| native, all 32 CPUs | 72.1 (63 / 56) | 61.9 (44 / 27) | -- |
+| native on 0-15 | 69.1 (45 / 36) | 62.5 (42 / 26) | -- |
+| native on 8-15, 24-31 | 64.6 (48 / 44) | 61.6 (42 / 31) | -- |
+| 16 vCPUs, unpinned | 67.1 (46 / 29) | 59.2 (37 / 19) | 19.4 / 22.2 |
+| 16, `cores:avoid=none` (0-15) | 64.6 (48 / 37) | 39.8 (17 / 15) | 16.2 / 30.9 |
+| 16, `smt` (8-15, 24-31, told) | 65.0 (50 / 38) | 58.0 (39 / 27) | 20.3 / 23.7 |
+| 16, `l3` (any of 8-15, 24-31) | 64.4 (41 / 34) | 61.2 (46 / 34) | 35.0 / 23.2 |
+
+At 16 vCPUs nothing wins clearly. `smt` and `l3` on CCD1 have the best
+idle lows (gameloop's 0.1% low 95 and 91 against 45 unpinned) at 2-11% less
+average; under the load `l3` keeps unpinned's average with somewhat better
+lows in Godot and Heaven, and `smt`, with no core left free, loses its
+lead. One thread of each of all 16 cores (`cores:avoid=none`) collapses
+under the load, half of it on the busy CCD (Heaven 195 fps). Unpinned stays
+the choice for a 16-vCPU guest on this host.
+
+**The guest's topology, and crosvm** (three runs a cell):
+
+**gameloop**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| unpinned | 99.0 (62 / 39) | 86.3 (44 / 20) | 23.0 / 25.8 |
+| `smt` (4 cores × 2, told) | 92.2 (83 / 78) | 88.3 (79 / 76) | 22.7 / 23.6 |
+| `smt`, told 8 cores | 93.8 (84 / 78) | 88.4 (78 / 72) | 21.3 / 22.7 |
+| crosvm, unpinned | 82.8 (52 / 40) | 62.0 (21 / 13) | 28.8 / 37.1 |
+| crosvm, unpinned, told 8 cores | 78.2 (39 / 34) | 64.7 (26 / 15) | 27.8 / 39.5 |
+| crosvm, `cores` | 92.2 (45 / 28) | 80.7 (38 / 28) | 30.1 / 39.9 |
+
+**Heaven (Wine, D3D11)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| unpinned | 486.3 (233 / 104) | 408.6 (176 / 66) | 11.4 / 14.7 |
+| `smt` (4 cores × 2, told) | 448.3 (282 / 138) | 398.5 (234 / 113) | 7.0 / 10.9 |
+| `smt`, told 8 cores | 432.2 (248 / 117) | 384.7 (176 / 68) | 9.0 / 11.1 |
+| crosvm, unpinned | 326.4 (124 / 75) | 278.8 (101 / 60) | 35.3 / 39.9 |
+| crosvm, unpinned, told 8 cores | 332.7 (124 / 75) | 255.8 (79 / 38) | 37.4 / 41.9 |
+| crosvm, `cores` | 396.0 (130 / 76) | 346.0 (92 / 43) | 46.9 / 59.5 |
+
+**Godot D3D12 (Wine)**
+
+| | idle: avg fps (1% / 0.1% low) | CCD0 loaded | IOCTL2 µs, idle / loaded |
+|---|---|---|---|
+| unpinned | 69.4 (56 / 38) | 61.4 (42 / 26) | 17.5 / 20.8 |
+| `smt` (4 cores × 2, told) | 65.0 (57 / 41) | 59.8 (47 / 35) | 17.5 / 20.5 |
+| `smt`, told 8 cores | 67.5 (57 / 44) | 60.9 (47 / 36) | 17.8 / 18.7 |
+
+**futex hand-off** (µs, p50 / p99; guest CPUs 0,1 and 0,2)
+
+| | idle, 0,1 | idle, 0,2 | CCD0 loaded, 0,1 | loaded, 0,2 |
+|---|---|---|---|---|
+| unpinned | 7.77 / 13.8 | 7.76 / 13.8 | 9.23 / 17.4 | 9.34 / 18.7 |
+| `smt` (4 cores × 2, told) | 8.74 / 15.0 | 7.97 / 14.1 | 9.76 / 16.7 | 9.07 / 18.1 |
+| `smt`, told 8 cores | 8.78 / 14.9 | 7.99 / 13.6 | 9.75 / 16.6 | 9.24 / 16.5 |
+
+- **Telling the guest the truth about siblings** (`smt` against the same
+  pins with the guest told 8 cores, `NVGPU_GUEST_SMT=1`) helps where the
+  guest has more runnable threads than cores: Heaven 448 (282 / 138) against
+  432 (248 / 117), and under the load 399 (234 / 113) against 385 (176 /
+  68). gameloop and Godot are the same either way, and so is a futex
+  hand-off. The guest's scheduler spreads Wine's threads across cores
+  before it doubles up on siblings only when it knows which are siblings.
+- **crosvm** runs this host's Heaven at 326 fps unpinned against nesbox's
+  486, with an IOCTL2 of 35 µs against 11 (its frontend is a process of its
+  own, and each vCPU has a core-scheduling cookie of its own: "Heavy
+  workloads" and "Steam-like games" above). `cores` gains it 21% (396 fps)
+  but not the lows. Its default tells an unpinned guest that vCPUs 0-1,
+  2-3, ... are SMT siblings, which they are not; telling it 8 cores instead
+  (`NVGPU_GUEST_SMT=1`, `--no-smt`) gains nothing (Heaven 333 fps,
+  gameloop 78 against 83). `smt` under
+  crosvm needs one cookie for the VM (`NVGPU_CORE_SCHED=vm`) and was not
+  measured here.
+
+**Recommended** (DEPLOY.md, "vCPU placement"): for a gaming VM on this
+host, `NVGPU_PIN=smt` when the desktop's own work may fill the other CCD --
+3-8% of the average on an idle host traded for lows that hold under load,
+at no cost in isolation (the VM has four whole cores of its own). Nothing
+pinned remains the default.
 
 ## Earlier: an RTX 3060, before protocol v2
 
