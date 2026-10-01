@@ -26,7 +26,7 @@ enforcing:
 
 | date | tree | what ran | section |
 |---|---|---|---|
-| 2026-09-30 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy`, `efdrace` and `orphanfix` merged | stage1, compat (with syncobj-race's orphan phase), render (with and without compute), secneg and wayland under nesbox, every knob off and every knob on, C module after the dma-buf merge and C and Rust modules after `efdrace` and after `orphanfix` | "Regression of the knobs merge" |
+| 2026-10-01 | branch `integrate36`: display-passthrough with `knob-hypr`, `knob-vram`, `knob-rm`, `knob-dmabuf`, `knob-deploy`, `efdrace`, `orphanfix` and `knob-pin` merged | stage1, compat (with syncobj-race's orphan phase), render (with and without compute), secneg and wayland, every knob off and every knob on (`NVGPU_PIN=smt` among them), under nesbox with the C and Rust modules and under crosvm; the two batches of live applications, knobs off: all passed (apps 18/0 and 23/0) | "Regression of the knobs merge" |
 | 2026-09-30 | branch `orphanfix` (efdrace's pump fix plus wait registrations let go with their syncobj) | `nvgpu-syncobj-race` phase 2 five times in one guest, then fresh processes, eight orphan-making processes, the whole tool twice more, drm-compat; the same under the previous backend; the compat probe; phase 2 natively on the host | "Orphan wait registrations" |
 | 2026-09-30 | branch `efdrace`: the event pump's lost wakeup (device/src/pump.rs) and `nvgpu-syncobj-race`'s LATE/LOST diagnosis | the owners phase under nesbox, C and Rust modules, with and without a widened race window and host and guest load, before and after the fix; the compat probe six times | "Syncobj eventfds that never fired" |
 | 2026-09-30 | branch `knob-deploy` (the tuning knobs) on `c273c5d`, its launcher with steamperf's backend, kernel and image and the rig's crosvm | crosvm core scheduling per-vcpu, shared and off on stk-vk, gameloop and wine-heaven, three runs each, interleaved | "crosvm's core-scheduling modes" |
@@ -664,8 +664,8 @@ rig/rig-tools/portal-identify.sh --inject "$XDG_RUNTIME_DIR"/nvgpu-run.*/inject.
 
 ## Regression of the knobs merge
 
-2026-09-30, branch `integrate36`: display-passthrough with the knob branches
-merged in turn, the backend, both guest modules and the image built from
+2026-09-30 and 2026-10-01, branch `integrate36`: display-passthrough with
+the knob branches merged in turn, the backend, both guest modules and the image built from
 each merge that passed CI (`.rig/cache/knobmerge/<rev>`), the installed
 nesbox (with `patches/nesbox/0001`), wayland against the headless sway, and
 secneg with `nvgpu_secneg_kms=none`. **Off** is every knob at its default.
@@ -709,6 +709,40 @@ above, in all four. The compat probe's orphan phase passed in each (six
 runs of 256 orphans, every one of the 512 registrations let go with its
 syncobj, then a fresh process subscribed 64 times), and the owners'
 signal-to-eventfd p99 was under 512 us.
+
+**Last, `f41249a`** (with `knob-pin` at `7e8943c`), on 2026-10-01: the
+same sets under nesbox, and the full set under the rig's crosvm
+(`.rig/bin/crosvm`), C module; "on" now adds `NVGPU_PIN=smt` (4 vCPUs on
+14/30 and 15/31, two cores of CCD1, the guest told 2 threads a core:
+nesbox's `vcpu_pins` and `threads_per_core`, crosvm's `--cpu-affinity
+0=14:1=30:2=15:3=31`) beside `NVGPU_CORE_SCHED=shared` (one cookie for
+the VMM and the backend; crosvm's own `--core-scheduling=false`). The
+installed nesbox has `patches/nesbox/0001` only; `smt` pins one CPU a
+vCPU and needs no `0002`.
+
+| probe | nesbox C off | nesbox C on | nesbox Rust off | nesbox Rust on | crosvm C off | crosvm C on |
+|---|---|---|---|---|---|---|
+| stage1 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 | 6/0/0 |
+| compat (orphan phase PASS in each) | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 | 13/0/0 |
+| render | 10/0/1 | 11/0/1 | 10/0/1 | 11/0/1 | 10/0/1 | 11/0/1, cuda-smoke ALL PASS |
+| render, `NVGPU_COMPUTE=1` | 10/0/1 | -- | 10/0/1 | -- | 10/0/1, cuda-smoke ALL PASS | -- |
+| secneg | 22 passed, 6 skipped | 23 passed, 5 skipped | 22 / 6 | 23 / 5 | 22 / 6 | 23 / 5 |
+| wayland (headless sway) | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 | 11/0/3 |
+
+Live applications on the live Hyprland, knobs off, `f41249a`'s backend
+and C image (`rig/rig-app-check.sh --live`, each batch one boot under the
+rig lock, DP-3 powered per slot and off after, `dpmsStatus: 0` at the
+end): nesbox with glxgears, gamescope, GTK, Qt, Firefox, mpv, vkmark,
+SuperTuxKart (116 fps), Blender (EEVEE frame in 7.0 s) and a Chromium
+animation, 18 passed and none failed; crosvm with `NVGPU_COMPUTE=1`,
+CUDA (n-body), Cycles on CUDA and OptiX, NVENC (H.264, HEVC, AV1), mpv
+with VA-API (all three clips) and mpv, 23 passed and none failed. A
+first attempt at both batches gave the launcher `NVGPU_LOGS` outside
+`.rig/logs`, where the harness reads the console from: it never saw an
+`APP_START`, so DP-3 stayed off through every slot, and mpv (both VMMs)
+and Blender (nesbox) then waited on frames a powered-down output never
+asked for (mpv killed at its slot's end, 137; Blender printed nothing);
+run as above, both batches passed whole, and mpv and Blender alone too.
 
 Between the two: after the `knob-deploy` merge (`fe0cd73`) every probe
 passed off and on but secneg on, whose T13 wanted 30 calls served before
