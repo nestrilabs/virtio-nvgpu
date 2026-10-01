@@ -66,6 +66,14 @@ struct Args {
     /// is not a way to run one.
     #[arg(long)]
     permissive_abi: bool,
+
+    /// Serve a guest although the backend runs as root or with CAP_SYS_ADMIN.
+    ///
+    /// The host driver takes a guest's privilege from the backend's, so every
+    /// guest process is then an RM administrator. For a test rig that cannot
+    /// do otherwise; never for a guest you do not trust.
+    #[arg(long)]
+    allow_root_unsafe: bool,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -554,6 +562,9 @@ impl VhostUserBackendMut for NvGpuBackend {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    // Before any device is opened: the host driver judges every guest call by
+    // this process's credentials (device::posture).
+    device::posture::enforce(args.allow_root_unsafe)?;
 
     log::info!(
         "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}",

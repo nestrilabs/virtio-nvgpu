@@ -10,8 +10,15 @@
 #   /root/logs/<tag>.console.log   the guest console
 #   /root/logs/<tag>.json          the config this run used
 #
-# Run it on the GPU box. It expects the tree laid out as:
-#   /root/vhost-user-nvgpu          backend binary
+# Run it on the GPU box, as root (nesbox wants it). The backend itself runs
+# as NVGPU_USER, an unprivileged user that can open /dev/nvidia* and the
+# GPU's render node (the render group): it refuses to start as root, because
+# the host driver would make every guest process an RM administrator.
+#
+# It expects the tree laid out as:
+#   $NVGPU_BACKEND                  backend binary, default
+#                                   /usr/local/bin/vhost-user-nvgpu (not
+#                                   under /root: NVGPU_USER must reach it)
 #   /root/nesbox/target/release/nesbox
 #   /root/kernel/vmlinux, /root/guest/rootfs.ext4
 set -euo pipefail
@@ -20,6 +27,8 @@ PROBE=${1:?usage: run-guest.sh <probe-name> [tag]}
 TAG=${2:-$(date +%H%M%S)}
 LOGS=/root/logs
 SOCK=/tmp/nvgpu.sock
+NVGPU_USER=${NVGPU_USER:?set NVGPU_USER to the unprivileged user the backend runs as}
+NVGPU_BACKEND=${NVGPU_BACKEND:-/usr/local/bin/vhost-user-nvgpu}
 mkdir -p "$LOGS"
 
 # A stale socket makes the VMM connect to a backend that is no longer there,
@@ -45,7 +54,10 @@ cat > "$LOGS/$TAG.json" <<JSON
 }
 JSON
 
-RUST_LOG=${RUST_LOG:-info} /root/vhost-user-nvgpu --socket "$SOCK" \
+# setpriv drops to the user with its own groups; the socket it makes is the
+# user's, which root's VMM connects to.
+RUST_LOG=${RUST_LOG:-info} setpriv --reuid="$NVGPU_USER" --regid="$NVGPU_USER" --init-groups \
+    "$NVGPU_BACKEND" --socket "$SOCK" \
     > "$LOGS/$TAG.backend.log" 2>&1 &
 BACKEND=$!
 trap 'kill $BACKEND 2>/dev/null || true' EXIT
