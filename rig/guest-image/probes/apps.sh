@@ -257,12 +257,12 @@ let t = 0;
   t++; requestAnimationFrame(f); })();
 </script>
 HTML
-            slot firefox dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile "$HOME/ffprofile" --new-instance file:///tmp/page.html
+            slot firefox dbus env MOZ_ENABLE_WAYLAND=1 firefox --name nvgpu-firefox --no-remote --profile "$HOME/ffprofile" --new-instance file:///tmp/page.html
             ;;
         ffsupport)
             # Firefox's own account of its graphics (about:support, Graphics):
             # the compositor, WebGL renderer, and what it blocklisted.
-            slot ffsupport dbus env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile "$HOME/ffprofile" --new-instance about:support
+            slot ffsupport dbus env MOZ_ENABLE_WAYLAND=1 firefox --name nvgpu-firefox --no-remote --profile "$HOME/ffprofile" --new-instance about:support
             ;;
         chromeanim)
             # Steady rendering and nothing else: does Chromium keep presenting?
@@ -278,12 +278,12 @@ let t = 0;
   t++; document.title = 'frame ' + t; requestAnimationFrame(f); })();
 </script>
 HTML
-            slot chromeanim dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium2" --ozone-platform=wayland \
+            slot chromeanim dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium2" --class=nvgpu-chromium --ozone-platform=wayland \
                 --no-first-run --no-default-browser-check --enable-logging=stderr file:///tmp/cpage.html
             say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromeanim.log)"
             ;;
         chromentp)
-            slot chromentp dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium3" --ozone-platform=wayland \
+            slot chromentp dbus chromium $NOSANDBOX --user-data-dir="$HOME/chromium3" --class=nvgpu-chromium --ozone-platform=wayland \
                 --no-first-run --no-default-browser-check --enable-logging=stderr
             say "chromium GL errors: $(grep -ac 'incomplete: 0x00000000\|eglCreateSync failed' /tmp/apps/chromentp.log)"
             grep -aE 'ERROR' /tmp/apps/chromentp.log | grep -avE 'dbus|crashpad' | head -n 3 | cut -c1-200 | sed 's/^/    /'
@@ -298,7 +298,7 @@ HTML
             ( sleep 30; p=$(pgrep -f 'type=gpu-process' | head -n 1)
               [ -n "$p" ] && awk '{split($1,a,"-"); if (strtonum("0x" a[1]) < 0x80000000) print}' "/proc/$p/maps" > /tmp/gpumaps
               [ -n "$p" ] && head -c 4000 "/proc/$p/maps" > /tmp/gpumaps.head ) &
-            slot chromegpu dbus "${tr[@]}" chromium $NOSANDBOX --user-data-dir="$HOME/chromium" --ozone-platform=wayland \
+            slot chromegpu dbus "${tr[@]}" chromium $NOSANDBOX --user-data-dir="$HOME/chromium" --class=nvgpu-chromium --ozone-platform=wayland \
                 --no-first-run --no-default-browser-check --enable-logging=stderr \
                 --vmodule='*/gpu/*=1,*/ui/gl/*=1,*dawn*=2,*webgpu*=2' $(arg chromeflags "" | tr ',' ' ') chrome://gpu
             l=$(grep -anE 'incomplete: 0x00000000|MakeFromBackendTexture|eglCreateSync failed' /tmp/apps/chromegpu.log | head -n 1 | cut -d: -f1)

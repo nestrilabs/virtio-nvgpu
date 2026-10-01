@@ -105,7 +105,7 @@ if [ "$LIVE" = 1 ]; then
     CLASSES+='|[Gg]odot.*|org\.godotengine\..*|[Bb]lender|gimp.*|[Gg]imp.*|org\.gimp\..*|org\.inkscape\.Inkscape|[Ii]nkscape'
     CLASSES+='|krita|org\.kde\.krita|libreoffice.*|soffice.*|org\.gnome\.TextEditor|org\.gnome\.Calculator'
     CLASSES+='|io\.github\.Qalculate.*|qalculate.*|org\.qt-project\..*|qml.*|nvgpu-.*|[Ee]lectron|[Ee]lement.*'
-    CLASSES+='|mpv|glmark2.*|vkmark|vkcube.*|foot|weston-.*|xterm|XTerm|xeyes|XEyes|eglgears.*|es2gears.*|glxgears'
+    CLASSES+='|mpv|glmark2.*|vkmark|vkcube.*|com\.github\.vkmark\..*|com\.github\.glmark2\..*|\.supertuxkart-wrapped|foot|weston-.*|xterm|XTerm|xeyes|XEyes|eglgears.*|es2gears.*|glxgears'
     CLASSES=${NVGPU_LIVE_CLASSES:-$CLASSES}
     RULE=nvgpu-guest-apps
     lua_rule() { hyprctl eval "$1" >>"$OUT/hyprctl.log" 2>&1; }
