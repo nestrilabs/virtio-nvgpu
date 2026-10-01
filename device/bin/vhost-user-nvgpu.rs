@@ -19,16 +19,16 @@
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use device::host;
 use device::nvidia::NvidiaBackend;
-use protocol::messages::{MsgHeader, MsgType};
-use device::virtio::{VirtioGpuNvConfig, NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV};
 use device::shm::WindowPlacer;
+use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig};
+use protocol::messages::{MsgHeader, MsgType};
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
     VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
@@ -38,7 +38,9 @@ use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, Vrin
 use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueOwnedT;
-use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap};
+use vm_memory::{
+    Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
+};
 
 /// The driver calls `virtio_find_vqs(vdev, 2, ...)` and fails probe on the
 /// error from that call, so offering fewer is fatal before config is read.
@@ -148,17 +150,15 @@ fn event_ready_bytes(handle: u32) -> Vec<u8> {
 /// Returns false when the guest has posted none, which is the normal state of
 /// a guest whose driver predates this queue having a use -- and a reason to
 /// drop the notification rather than to fail.
-fn push_event(
-    vring: &VringRwLock,
-    mem: &GuestMemoryAtomic<GuestMemoryMmap>,
-    handle: u32,
-) -> bool {
+fn push_event(vring: &VringRwLock, mem: &GuestMemoryAtomic<GuestMemoryMmap>, handle: u32) -> bool {
     let guard = mem.memory();
     let mut vr = vring.get_mut();
     let Ok(mut avail) = vr.get_queue_mut().iter(guard.clone()) else {
         return false;
     };
-    let Some(chain) = avail.next() else { return false };
+    let Some(chain) = avail.next() else {
+        return false;
+    };
     let head = chain.head_index();
     drop(vr);
 
@@ -197,18 +197,17 @@ fn push_event(
 /// event, which happens through an ioctl this thread never sees. Re-arming on
 /// a timer costs a duplicate notification at worst, and the guest answers one
 /// by waking, finding nothing, and waiting again.
-fn event_pump(
-    rx: Receiver<Watch>,
-    vring: VringRwLock,
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
-) {
+fn event_pump(rx: Receiver<Watch>, vring: VringRwLock, mem: GuestMemoryAtomic<GuestMemoryMmap>) {
     // How often to re-check a descriptor that is still readable. See the
     // sweep below; this is a safety net, not the notification path.
     const SWEEP: Duration = Duration::from_millis(1);
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
-        log::error!("event pump: epoll_create1: {}", std::io::Error::last_os_error());
+        log::error!(
+            "event pump: epoll_create1: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
     let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
@@ -386,7 +385,10 @@ impl NvGpuBackend {
         for (handle, fd) in added {
             let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if dup < 0 {
-                log::warn!("watch on handle {handle}: dup: {}", std::io::Error::last_os_error());
+                log::warn!(
+                    "watch on handle {handle}: dup: {}",
+                    std::io::Error::last_os_error()
+                );
                 continue;
             }
             let _ = tx.send(Watch::Add(handle, unsafe { OwnedFd::from_raw_fd(dup) }));
@@ -491,7 +493,10 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     fn set_backend_req_fd(&mut self, backend: Backend) {
         log::info!("window: request channel open; device memory is now mappable");
-        self.nvidia.lock().unwrap().set_window(Box::new(VhostWindow(backend)));
+        self.nvidia
+            .lock()
+            .unwrap()
+            .set_window(Box::new(VhostWindow(backend)));
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -576,7 +581,10 @@ fn main() -> anyhow::Result<()> {
     } else {
         device::nvidia::AbiPolicy::Enforce
     };
-    let backend = Arc::new(RwLock::new(NvGpuBackend::new(&args.proc_nvidia, abi_policy)?));
+    let backend = Arc::new(RwLock::new(NvGpuBackend::new(
+        &args.proc_nvidia,
+        abi_policy,
+    )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.
     let mut daemon = VhostUserDaemon::new(

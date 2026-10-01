@@ -68,9 +68,7 @@ impl MmapContext {
     /// arrives on, which works because a host fd is single-use for mapping, so
     /// at most one mapping exists per fd.
     pub fn find_by_fd_handle(&self, fd_handle: u64) -> Option<&MmapEntry> {
-        self.entries
-            .values()
-            .find(|e| e.map_fd_handle == fd_handle)
+        self.entries.values().find(|e| e.map_fd_handle == fd_handle)
     }
 
     /// Take every mapping, leaving the table empty. Used at teardown, where a

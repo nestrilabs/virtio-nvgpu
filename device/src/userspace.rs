@@ -95,13 +95,20 @@ pub fn loaded_driver_version(path: &Path) -> Option<String> {
 pub fn staged_driver_version(found: &[Resolved]) -> Option<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for r in found {
-        if let Some(v) = r.host_path.file_name().and_then(|n| version_in(&n.to_string_lossy())) {
+        if let Some(v) = r
+            .host_path
+            .file_name()
+            .and_then(|n| version_in(&n.to_string_lossy()))
+        {
             *counts.entry(v).or_default() += 1;
         }
     }
     // Ties broken by the higher version, so the answer is stable rather than
     // whichever the map happened to yield first.
-    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))).map(|(v, _)| v)
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(v, _)| v)
 }
 
 /// The first `N.N.N` (or longer) dotted number in `s`, where every component
@@ -574,7 +581,9 @@ pub fn resolve(
                 // Merge the categories of a repeated entry into the one that
                 // is kept, so the record says every capability the file serves.
                 if let Some(prev) = found.iter_mut().find(|r| r.guest_path == guest_path) {
-                    prev.entry.categories.extend(entry.categories.iter().cloned());
+                    prev.entry
+                        .categories
+                        .extend(entry.categories.iter().cloned());
                     continue;
                 }
                 if staged.insert(guest_path.clone()) {
@@ -633,12 +642,17 @@ pub fn soname(path: &Path) -> Option<String> {
     // Infallible by construction: every caller below indexes into a buffer it
     // has already read to an exact, known size.
     let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let u32at = |b: &[u8], o: usize| {
-        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-    };
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
     let u64at = |b: &[u8], o: usize| {
         u64::from_le_bytes([
-            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
         ])
     };
 
@@ -717,7 +731,9 @@ pub fn soname(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{loaded_driver_version, staged_driver_version, version_in, Entry, FileKind, Resolved};
+    use super::{
+        Entry, FileKind, Resolved, loaded_driver_version, staged_driver_version, version_in,
+    };
     use std::collections::BTreeSet as TestSet;
 
     fn resolved(host_name: &str) -> Resolved {
@@ -737,14 +753,25 @@ mod tests {
         let mut cats = TestSet::new();
         cats.insert("compute".to_string());
         let entries = vec![
-            Entry { name: "libcuda.so.595.91.07".into(), kind: FileKind::Lib, categories: cats.clone() },
+            Entry {
+                name: "libcuda.so.595.91.07".into(),
+                kind: FileKind::Lib,
+                categories: cats.clone(),
+            },
             // Unversioned on disk, so it must survive untouched.
-            Entry { name: "nvidia_icd.json".into(), kind: FileKind::Json, categories: cats.clone() },
+            Entry {
+                name: "nvidia_icd.json".into(),
+                kind: FileKind::Json,
+                categories: cats.clone(),
+            },
         ];
         let out = super::retarget(&entries, "595.91.07", "595.99.02");
         assert_eq!(out[0].name, "libcuda.so.595.99.02");
         assert_eq!(out[0].categories, cats, "capability must survive the swap");
-        assert_eq!(out[1].name, "nvidia_icd.json", "an unversioned name is not rewritten");
+        assert_eq!(
+            out[1].name, "nvidia_icd.json",
+            "an unversioned name is not rewritten"
+        );
     }
 
     #[test]
@@ -769,8 +796,15 @@ mod tests {
     fn the_gcc_version_on_the_second_line_is_not_mistaken_for_the_driver() {
         // "gcc version 15.2.0" is dotted and comes second; the driver version
         // is on the first line, so a find_map over lines must take that one.
-        assert_eq!(version_in("GCC version:  gcc version 15.2.0 (Ubuntu)"), Some("15.2.0".into()));
-        assert_eq!(version_in("libcuda.so.1"), None, "so.1 is not a driver version");
+        assert_eq!(
+            version_in("GCC version:  gcc version 15.2.0 (Ubuntu)"),
+            Some("15.2.0".into())
+        );
+        assert_eq!(
+            version_in("libcuda.so.1"),
+            None,
+            "so.1 is not a driver version"
+        );
         assert_eq!(version_in("libcuda.so.595.99.02"), Some("595.99.02".into()));
         assert_eq!(version_in("no digits here"), None);
     }
@@ -835,7 +869,10 @@ mod tests {
     fn firmware_and_modprobe_are_host_only() {
         let e = sample();
         assert!(e[0].is_host_only(), "GSP firmware must not reach a guest");
-        assert!(e[1].is_host_only(), "nvidia-modprobe must not reach a guest");
+        assert!(
+            e[1].is_host_only(),
+            "nvidia-modprobe must not reach a guest"
+        );
         assert!(!e[2].is_host_only());
     }
 
@@ -848,8 +885,14 @@ mod tests {
                 .map(|x| x.name.as_str())
                 .collect()
         };
-        assert_eq!(names(&[Capability::Utility]), ["nvidia-smi", "libnvidia-ml.so.615.71.09"]);
-        assert_eq!(names(&[Capability::Video]), ["libnvidia-encode.so.615.71.09"]);
+        assert_eq!(
+            names(&[Capability::Utility]),
+            ["nvidia-smi", "libnvidia-ml.so.615.71.09"]
+        );
+        assert_eq!(
+            names(&[Capability::Video]),
+            ["libnvidia-encode.so.615.71.09"]
+        );
         assert!(names(&[Capability::Compute]).contains(&"libcuda.so.615.71.09"));
     }
 
@@ -916,7 +959,12 @@ mod tests {
         );
 
         assert_eq!(found.len(), 1, "libcuda staged {} times", found.len());
-        assert_eq!(missing.len(), 1, "the absent file was reported {} times", missing.len());
+        assert_eq!(
+            missing.len(),
+            1,
+            "the absent file was reported {} times",
+            missing.len()
+        );
     }
 
     /// The categories of a repeated entry belong to the one that is kept --
@@ -933,7 +981,11 @@ mod tests {
         );
         let cuda = &found[0].entry;
         assert!(cuda.categories.contains("cuda"));
-        assert!(cuda.categories.contains("vulkan"), "categories were {:?}", cuda.categories);
+        assert!(
+            cuda.categories.contains("vulkan"),
+            "categories were {:?}",
+            cuda.categories
+        );
     }
 
     #[test]
@@ -946,7 +998,9 @@ mod tests {
         );
         assert_eq!(found.len(), 1);
         assert!(
-            missing.iter().any(|e| e.name.starts_with("libnvidia-encode")),
+            missing
+                .iter()
+                .any(|e| e.name.starts_with("libnvidia-encode")),
             "an absent file should be reported, not silently dropped"
         );
     }
@@ -1031,7 +1085,10 @@ mod tests {
     #[test]
     fn a_manifest_that_is_not_an_array_is_rejected() {
         assert!(parse_manifest("{}").is_err());
-        assert!(parse_manifest("[{\"type\": \"LIB\"}]").is_err(), "an entry with no name");
+        assert!(
+            parse_manifest("[{\"type\": \"LIB\"}]").is_err(),
+            "an entry with no name"
+        );
     }
 
     /// A directory of empty files, removed on drop.

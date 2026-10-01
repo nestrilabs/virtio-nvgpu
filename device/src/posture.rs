@@ -134,13 +134,7 @@ fn drop_all() -> io::Result<()> {
     let data = [Data::default(); 2];
     // SAFETY: capset reads one header and two data words, which both live for
     // the call; pid 0 is this thread.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &header as *const Header,
-            data.as_ptr(),
-        )
-    };
+    let r = unsafe { libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr()) };
     if r != 0 {
         return Err(io::Error::last_os_error());
     }
