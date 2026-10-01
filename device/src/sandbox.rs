@@ -307,6 +307,29 @@ fn only_loopback() -> io::Result<bool> {
     Ok(interfaces()?.iter().all(|n| n == "lo"))
 }
 
+/// Whether AppArmor would let this process make a user namespace it cannot
+/// use. With `kernel.apparmor_restrict_unprivileged_userns` set (Ubuntu
+/// 23.10 and later), an unconfined process's `unshare(CLONE_NEWUSER)`
+/// succeeds and the namespace it gets grants no capability, so writing its
+/// uid map fails -- after the process is already in it, where it cannot be
+/// left. Read the switch first. A process under a profile of its own may be
+/// allowed `userns`, and is left to try.
+fn userns_restricted() -> bool {
+    let sysctl =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
+    let label = std::fs::read_to_string("/proc/self/attr/apparmor/current")
+        .or_else(|_| std::fs::read_to_string("/proc/self/attr/current"))
+        .ok();
+    userns_restricted_by(sysctl.as_deref(), label.as_deref())
+}
+
+fn userns_restricted_by(sysctl: Option<&str>, label: Option<&str>) -> bool {
+    let on = sysctl.is_some_and(|s| s.trim() == "1");
+    let unconfined =
+        label.is_none_or(|l| l.trim().trim_end_matches('\0').starts_with("unconfined"));
+    on && unconfined
+}
+
 fn private_network() -> Layer {
     match only_loopback() {
         Ok(true) => {
@@ -316,6 +339,17 @@ fn private_network() -> Layer {
         }
         Ok(false) => {}
         Err(e) => return Layer::Degraded(format!("cannot read /proc/self/net/dev: {e}")),
+    }
+    if userns_restricted() {
+        return Layer::Degraded(
+            "no network namespace: AppArmor restricts unprivileged user namespaces \
+             (kernel.apparmor_restrict_unprivileged_userns = 1) and the backend runs \
+             unconfined, so a namespace it made would grant no capability and its uid map \
+             could not be written; the backend keeps the host's network. Start it in one \
+             (unshare --net as root, PrivateNetwork=yes), or under an AppArmor profile that \
+             allows userns, to close this"
+                .into(),
+        );
     }
     let (uid, gid) = (crate::sys::proc::euid(), crate::sys::proc::egid());
     if let Err(e) = crate::sys::proc::unshare(CLONE_NEWUSER | CLONE_NEWNET) {
@@ -925,6 +959,20 @@ fn verify(r: &mut Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AppArmor switch on, unconfined: restricted. Off, absent, or under
+    /// a profile of its own: left to try.
+    #[test]
+    fn apparmor_userns_restriction_is_read_before_unsharing() {
+        assert!(userns_restricted_by(Some("1\n"), Some("unconfined\n")));
+        assert!(userns_restricted_by(Some("1\n"), None));
+        assert!(!userns_restricted_by(Some("0\n"), Some("unconfined\n")));
+        assert!(!userns_restricted_by(None, Some("unconfined\n")));
+        assert!(!userns_restricted_by(
+            Some("1\n"),
+            Some("vhost-user-nvgpu (enforce)\n")
+        ));
+    }
     use std::os::unix::net::{UnixListener, UnixStream};
 
     use crate::sys::proc::testing::{End, forked};
