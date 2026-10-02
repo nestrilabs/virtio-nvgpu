@@ -169,23 +169,44 @@ def parse_case(label, block):
     return dict(type=ptype, ptrs=ptrs), None
 
 
-def probe_source(entries):
+def header_index(ogkm):
+    """Map every macro the control headers define to the header defining it.
+
+    The probe asks each case label for its value, under `#ifdef`, so a label
+    whose header is not included compiles to nothing and the control is left
+    out of the table -- forwarded, with the guest's pointer still in it. The
+    include list is therefore derived from the labels rather than from the
+    `#include` lines of `embedded_param_copy.c`, which name only some of them.
+    """
+    base = os.path.join(ogkm, INC)
+    idx = {}
+    for dirpath, _, names in os.walk(os.path.join(base, "ctrl")):
+        for n in names:
+            if not n.endswith(".h"):
+                continue
+            path = os.path.join(dirpath, n)
+            rel = os.path.relpath(path, base)
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = re.match(r"\s*#\s*define\s+(\w+)[\s(]", line)
+                    if m:
+                        idx.setdefault(m.group(1), rel)
+    return idx
+
+
+def probe_source(entries, hdrs):
     """A C program printing each entry's numbers, one line per pointer."""
-    hdrs = sorted(set(re.findall(r'#include\s+"(ctrl/[^"]+)"', open_src_text)))
     out = ["#include <stddef.h>", "#include <stdio.h>", '#include "nvtypes.h"']
     out += [f'#include "{h}"' for h in hdrs]
     out.append("int main(void) {")
     for e in entries:
-        lab, guard = e["label"], e["guard"]
-        g = []
-        if guard:
-            g.append(f"#if {'!' if guard.startswith('!') else ''}defined({guard.lstrip('!')})")
-        g.append(f"#ifdef {lab}")
+        lab = e["label"]
+        g = [f"#ifdef {lab}"]
         if e.get("refuse"):
-            g.append(f'  printf("R %#x\\n", (unsigned){lab});')
+            g.append(f'  printf("R %#x {lab}\\n", (unsigned){lab});')
         else:
             t = e["type"]
-            g.append(f'  printf("C %#x %zu %zu\\n", (unsigned){lab}, sizeof({t}), (size_t){len(e["ptrs"])});')
+            g.append(f'  printf("C %#x %zu %zu {lab}\\n", (unsigned){lab}, sizeof({t}), (size_t){len(e["ptrs"])});')
             for i, p in enumerate(e["ptrs"]):
                 kind, val = p["count"]
                 if kind == "fixed":
@@ -200,8 +221,6 @@ def probe_source(entries):
                     f'(unsigned){lab}, offsetof({t}, {p["field"]}), (size_t)({co}), (size_t)({cw}), (size_t)({es}));'
                 )
         g.append("#endif")
-        if guard:
-            g.append("#endif")
         out += g
     out.append("  return 0;\n}")
     return "\n".join(out)
@@ -221,14 +240,41 @@ def main():
     entries = []
     for label, guard, block in cases(body):
         desc, why = parse_case(label, block)
-        if desc:
+        if guard:
+            # The case compiles into RM only when an RM build flag is set, and
+            # nothing in the published headers says whether the shipped driver
+            # was built with it. Whether RM dereferences these pointers is
+            # therefore unknown, so the control is refused rather than
+            # described. NV2080_CTRL_CMD_FB_GET_AMAP_CONF is the one that
+            # reaches a guest: it sits under USE_AMAPLIB.
+            entries.append(
+                dict(label=label, guard=guard, refuse=True, why=f"case is under #ifdef {guard}")
+            )
+        elif desc:
             entries.append(dict(label=label, guard=guard, **desc))
         else:
             entries.append(dict(label=label, guard=guard, refuse=True, why=why))
 
+    # Every label the probe will ask for, and the header that defines it. A
+    # label no header defines is one this release does not have; a label a
+    # header defines must reach the table, and the check after the probe runs
+    # says so.
+    idx = header_index(a.ogkm)
+    hdrs = sorted(set(re.findall(r'#include\s+"(ctrl/[^"]+)"', open_src_text)))
+    for e in entries:
+        h = idx.get(e["label"])
+        if h:
+            hdrs.append(h)
+        if not e.get("refuse"):
+            t = idx.get(e["type"] + "_MESSAGE_ID")
+            if t:
+                hdrs.append(t)
+    hdrs = sorted(set(hdrs))
+    defined = {e["label"] for e in entries if e["label"] in idx}
+
     with tempfile.TemporaryDirectory() as d:
         c = os.path.join(d, "probe.c")
-        open(c, "w").write(probe_source(entries))
+        open(c, "w").write(probe_source(entries, hdrs))
         exe = os.path.join(d, "probe")
         cc = [a.cc, "-w", "-I", os.path.join(a.ogkm, INC), "-I", os.path.join(a.ogkm, "src/common/inc"), c, "-o", exe]
         r = subprocess.run(cc, capture_output=True, text=True)
@@ -243,9 +289,9 @@ def main():
         if not f:
             continue
         if f[0] == "R":
-            rows.append(dict(cmd=int(f[1], 16), refuse=True))
+            rows.append(dict(cmd=int(f[1], 16), label=f[2], refuse=True))
         elif f[0] == "C":
-            cur = dict(cmd=int(f[1], 16), size=int(f[2]), ptrs=[])
+            cur = dict(cmd=int(f[1], 16), size=int(f[2]), label=f[4], ptrs=[])
             rows.append(cur)
         elif f[0] == "P":
             cur["ptrs"].append(
@@ -260,6 +306,21 @@ def main():
                     fixed=int(f[10]),
                 )
             )
+    # A control the release defines and the probe did not print is one the
+    # table would be missing and the backend would forward with the guest's
+    # pointer still in it. That is the failure this whole table exists to
+    # prevent, so it stops here rather than producing a table with a hole in
+    # it. It happened: NV2080_CTRL_CMD_FB_GET_AMAP_CONF (0x20801336) was in
+    # none of the first five tables, because no header the probe included
+    # defined its label.
+    seen = {r["label"] for r in rows}
+    missing = [l for l in sorted(defined) if l not in seen]
+    if missing:
+        sys.exit(
+            "these controls are defined by the release and did not reach the "
+            "table:\n  " + "\n  ".join(missing)
+        )
+
     ident = "v" + a.version.replace(".", "_")
     print("// Generated by gen/rmctrl_extract.py -- do not edit by hand.")
     print("//")
