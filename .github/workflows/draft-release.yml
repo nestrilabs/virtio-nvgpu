@@ -51,6 +51,9 @@ jobs:
 
           if [ -n "$draft" ]; then
             old=$(gh api "repos/$REPO/releases/$draft" --jq '.body // ""')
+            # A PATCH without tag_name leaves a draft untagged, so send the
+            # one it has: a tag picked by hand survives, a lost one is guessed.
+            tag=$(gh api "repos/$REPO/releases/$draft" --jq .tag_name)
             # Keep what was written above the marker; a draft without one is
             # all hand-written, so keep it whole.
             top=$(printf '%s\n' "$old" | tr -d '\r' | awk -v m="$marker" '$0 == m { exit } { print }')
@@ -58,17 +61,20 @@ jobs:
             top=''
           fi
 
+          if [[ "$last" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            next="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+          else
+            next=v0.1.0
+          fi
+
           body=$(printf '%s\n%s\n\n%s\n\n%s\n' "$top" "$marker" "$since" "$commits")
 
           if [ -n "$draft" ]; then
-            gh api -X PATCH "repos/$REPO/releases/$draft" -f body="$body" >/dev/null
-            echo "updated draft $draft"
+            case "$tag" in untagged-*|'') tag=$next ;; esac
+            gh api -X PATCH "repos/$REPO/releases/$draft" \
+              -f tag_name="$tag" -f target_commitish="$BRANCH" -f body="$body" >/dev/null
+            echo "updated draft $draft ($tag)"
           else
-            if [[ "$last" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              next="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
-            else
-              next=v0.1.0
-            fi
             gh api -X POST "repos/$REPO/releases" \
               -f tag_name="$next" -f target_commitish="$BRANCH" -f name="$next" \
               -F draft=true -f body="$body" >/dev/null
